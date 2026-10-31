@@ -508,6 +508,9 @@ constexpr uint32_t PARALLEL_DELTA_STRIDE = 0xFA;
 // The widest record a merge section may give (the patcher sizes a record buffer by it): the
 // widest real record is 36 bytes, and every stride from 0xFA up to here is a section kind.
 static constexpr uint32_t MAX_RECORD_STRIDE = 0xFF;
+// The patcher writes a MATCH run's rewritten records this many bytes at a time.
+static constexpr size_t RECORD_BATCH_BYTES = size_t(16) << 10;
+static_assert(RECORD_BATCH_BYTES >= MAX_RECORD_STRIDE, "a batch holds at least one record");
 struct ParallelDeltaFile { PatchFileId fid, parent; uint32_t value_stride, remap_kind; };
 static constexpr ParallelDeltaFile PARALLEL_DELTA_FILES[] = {
     {PatchFileId::ADDR_POSTCODES, PatchFileId::ADDR_POINTS, 4, 2},
@@ -561,6 +564,99 @@ inline void close_patch_outputs(std::initializer_list<std::pair<FILE*, std::stri
 // by old_id, each id once; the patcher reads the legs where they sit
 // (parse_parent_id_remap).
 static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
+
+// --- Reading a part of the patch ---
+
+// How a SectionReader words its refusal of a read past its end.
+enum class PastEnd {
+    TRUNCATED,     // "Truncated <name>"
+    MALFORMED,     // "Malformed <name>", as the part's other faults are
+    TRUNCATED_AT,  // "Truncated <name>: need <n> bytes for <what> at offset <pos> (size <size>)"
+};
+
+// Reads a part of the patch at data[pos, size) front to back, moving the
+// caller's pos past each value it reads, and refuses a read that would pass
+// size. A length is checked in 64 bits before it narrows to size_t: a 32-bit
+// build would wrap a length the patch gives (a u64, or a count times its item
+// size) into one the part has.
+class SectionReader {
+public:
+    SectionReader(const char* data, size_t size, size_t& pos, const char* name, PastEnd past_end = PastEnd::TRUNCATED)
+        : data_(data), size_(size), pos_(pos), name_(name), past_end_(past_end) {}
+
+    // Refuses unless the next n bytes are there.
+    void require(uint64_t n, const char* what = "bytes") const {
+        if (pos_ > size_ || n > size_ - pos_) refuse_past_end(name_, past_end_, n, what, pos_, size_);
+    }
+    // The next n bytes, where they sit.
+    const char* take(uint64_t n, const char* what = "bytes") {
+        require(n, what);
+        const char* p = data_ + pos_;
+        pos_ += static_cast<size_t>(n);
+        return p;
+    }
+    // The next count items of item bytes each, where they sit.
+    const char* take_items(uint32_t count, size_t item, const char* what = "items") {
+        return take(uint64_t{count} * item, what);
+    }
+    uint8_t u8() { return value<uint8_t>("u8"); }
+    uint16_t u16() { return value<uint16_t>("u16"); }
+    uint32_t u32() { return value<uint32_t>("u32"); }
+    uint64_t u64() { return value<uint64_t>("u64"); }
+    // A u32 as a varint (write_varint). One longer than 5 bytes, or of 2^32
+    // or more, is malformed.
+    uint32_t varint() {
+        uint32_t v = 0;
+        for (uint32_t bit = 0; bit < 35; bit += 7) {
+            if (pos_ >= size_) refuse_past_end(name_, past_end_, 1, "varint", pos_, size_);
+            const uint8_t byte = static_cast<uint8_t>(data_[pos_++]);
+            if (bit == 28 && (byte & 0x70)) malformed();
+            v |= static_cast<uint32_t>(byte & 0x7F) << bit;
+            if (!(byte & 0x80)) return v;
+        }
+        malformed();
+    }
+    // A NUL-terminated string, where it sits.
+    const char* cstring() {
+        const void* nul = pos_ < size_ ? memchr(data_ + pos_, '\0', size_ - pos_) : nullptr;
+        if (!nul) refuse_past_end(name_, past_end_, uint64_t{left()} + 1, "string", pos_, size_);
+        const char* s = data_ + pos_;
+        pos_ = static_cast<size_t>(static_cast<const char*>(nul) - data_) + 1;
+        return s;
+    }
+    size_t left() const { return pos_ < size_ ? size_ - pos_ : 0; }
+    bool at_end() const { return pos_ == size_; }
+    [[noreturn]] void malformed() const { refuse_malformed(name_); }
+
+private:
+    template <typename T>
+    T value(const char* what) {
+        T v;
+        memcpy(&v, take(sizeof v, what), sizeof v);
+        return v;
+    }
+    // The refusals are out of line and given the reader's fields rather than
+    // the reader, so a read that fits keeps them in registers (an offset
+    // fixup's varints are read per record).
+    [[noreturn, gnu::cold, gnu::noinline]] static void refuse_malformed(const char* name) {
+        throw std::runtime_error(std::string("Malformed ") + name);
+    }
+    [[noreturn, gnu::cold, gnu::noinline]] static void refuse_past_end(const char* name, PastEnd past_end, uint64_t n,
+                                                                        const char* what, size_t pos, size_t size) {
+        if (past_end == PastEnd::MALFORMED) refuse_malformed(name);
+        std::string refusal = std::string("Truncated ") + name;
+        if (past_end == PastEnd::TRUNCATED_AT)
+            refusal += ": need " + std::to_string(n) + " bytes for " + what + " at offset " + std::to_string(pos) +
+                       " (size " + std::to_string(size) + ")";
+        throw std::runtime_error(refusal);
+    }
+
+    const char* data_;
+    size_t size_;
+    size_t& pos_;
+    const char* name_;
+    PastEnd past_end_;
+};
 
 // --- Client file set (v4) ---
 // The files a client holds for a variant: everything in the variant dir except
@@ -626,36 +722,26 @@ inline void append_client_files(std::vector<char>& out, const std::vector<Client
 // Parses the section at data[pos, size) and advances pos past it. The names come sorted, each
 // once; an inline file's bytes stay where they sit.
 inline std::vector<ClientFile> parse_client_files(const char* data, size_t size, size_t& pos) {
-    auto take = [&](size_t n) {
-        if (n > size - pos) throw std::runtime_error("Truncated client file list");
-        const char* p = data + pos;
-        pos += n;
-        return p;
-    };
-    auto take_into = [&](void* dst, size_t n) { memcpy(dst, take(n), n); };
-    uint32_t marker = 0, n = 0;
-    take_into(&marker, 4);
-    if (marker != CLIENT_FILES_MARKER) throw std::runtime_error("Patch has no client file list");
-    take_into(&n, 4);
+    SectionReader in(data, size, pos, "client file list");
+    if (in.u32() != CLIENT_FILES_MARKER) throw std::runtime_error("Patch has no client file list");
+    const uint32_t n = in.u32();
     if (n > MAX_CLIENT_FILES) throw std::runtime_error("Too many client files: " + std::to_string(n));
-    if ((size_t)n * 11 > size - pos) throw std::runtime_error("Truncated client file list");  // 11 = smallest entry
+    in.require(uint64_t{n} * 11);  // 11 = smallest entry
     std::vector<ClientFile> files(n);
     for (size_t i = 0; i < files.size(); i++) {
         ClientFile& f = files[i];
-        uint16_t len = 0;
-        take_into(&len, 2);
+        const uint16_t len = in.u16();
         if (len > MAX_CLIENT_FILE_NAME) throw std::runtime_error("Client file name too long: " + std::to_string(len) + " bytes");
-        f.name.assign(take(len), len);
+        f.name.assign(in.take(len), len);
         if (!is_client_file(f.name)) throw std::runtime_error("Bad client file name: " + f.name);
         if (i > 0 && !(files[i - 1].name < f.name)) throw std::runtime_error("Client file listed out of order or twice: " + f.name);
-        uint8_t is_inline = 0;
-        take_into(&f.size, 8);
-        take_into(&is_inline, 1);
+        f.size = in.u64();
+        const uint8_t is_inline = in.u8();
         if (is_inline != (is_inline_client_file(f.name) ? 1 : 0))
             throw std::runtime_error("Bad client file entry: " + f.name);
         if (!is_inline) continue;
         if (f.size > MAX_INLINE_CLIENT_FILE_BYTES) throw std::runtime_error("Inline client file too large: " + f.name);
-        f.bytes = take(size_t(f.size));
+        f.bytes = in.take(f.size);
     }
     return files;
 }
@@ -688,19 +774,12 @@ inline void append_old_file_sizes(std::vector<char>& out, const std::string& old
 // Reads the sizes at data[pos, size), advances pos past them and checks each
 // against cur_dir (require_old_file_size).
 inline void check_old_file_sizes(const char* data, size_t size, size_t& pos, const std::string& cur_dir) {
-    auto take = [&](void* dst, size_t n) {
-        if (pos > size || n > size - pos) throw std::runtime_error("Truncated old file sizes");
-        memcpy(dst, data + pos, n);
-        pos += n;
-    };
-    uint32_t n = 0;
-    take(&n, 4);
+    SectionReader in(data, size, pos, "old file sizes");
+    const uint32_t n = in.u32();
     for (uint32_t i = 0; i < n; i++) {
-        uint32_t id = 0;
-        uint64_t old_size = 0;
-        take(&id, 4);
-        take(&old_size, 8);
-        if (id >= static_cast<uint32_t>(PatchFileId::COUNT)) throw std::runtime_error("Malformed old file sizes");
+        const uint32_t id = in.u32();
+        const uint64_t old_size = in.u64();
+        if (id >= static_cast<uint32_t>(PatchFileId::COUNT)) in.malformed();
         require_old_file_size(cur_dir, patch_file_names[id], old_size);
     }
 }
@@ -1033,26 +1112,16 @@ struct ParentIdRemap {
 
 // Reads the section at data[pos, size) and advances pos past it.
 inline ParentIdRemap parse_parent_id_remap(const char* data, size_t size, size_t& pos) {
-    auto take = [&](uint64_t n) {
-        if (pos > size || n > size - pos) throw std::runtime_error("Truncated POI parent-id remap");
-        const char* p = data + pos;
-        pos += static_cast<size_t>(n);
-        return p;
-    };
-    auto count = [&] {
-        uint32_t n;
-        memcpy(&n, take(4), 4);
-        return n;
-    };
+    SectionReader in(data, size, pos, "POI parent-id remap");
     auto leg = [&] {
-        const uint32_t n = count();
-        return SortedTable<RemapPair>(take(uint64_t{n} * sizeof(RemapPair)), n, "POI parent-id remap");
+        const uint32_t n = in.u32();
+        return SortedTable<RemapPair>(in.take_items(n, sizeof(RemapPair)), n, "POI parent-id remap");
     };
     ParentIdRemap r;
     r.admin = leg();
     r.street = leg();
-    r.n_postcode = count();
-    take(uint64_t{r.n_postcode} * sizeof(RemapPair));
+    r.n_postcode = in.u32();
+    in.take_items(r.n_postcode, sizeof(RemapPair));
     return r;
 }
 
@@ -1212,37 +1281,35 @@ inline void append_cell_list_delta(std::vector<char>& out, const CellLists& old_
 template <typename Cells, typename Entries, typename Remap, typename OutCells, typename OutEntries>
 uint64_t stream_cell_index(Cells&& cells, Entries&& entries, AscendingIds added, AscendingIds removed, Remap remap,
                            const char* delta, size_t delta_size, OutCells out_cells, OutEntries out_entries) {
-    auto malformed = [] { throw std::runtime_error("Malformed cell list delta"); };
     auto bad_index = [] { throw std::runtime_error("Malformed cell index"); };
 
     size_t pos = 0;
-    auto take = [&](void* dst, size_t n) {
-        if (delta_size - pos < n) malformed();
-        if (n) memcpy(dst, delta + pos, n);  // an empty list's data() may be null
-        pos += n;
-    };
-    uint32_t n_gone;
-    take(&n_gone, 4);
-    if ((delta_size - pos) / 8 < n_gone) malformed();
-    AscendingIds gone(delta + pos, n_gone, "cell list delta");
-    pos += (size_t)n_gone * 8;
-    uint32_t n_set, set_i = 0;
-    take(&n_set, 4);
+    SectionReader in(delta, delta_size, pos, "cell list delta", PastEnd::MALFORMED);
+    const uint32_t n_gone = in.u32();
+    AscendingIds gone(in.take_items(n_gone, 8), n_gone, "cell list delta");
+    const uint32_t n_set = in.u32();
+    uint32_t set_i = 0;
 
     // The next changed cell from the delta, read in cell order.
     constexpr uint64_t NONE = ~0ull;
     uint64_t set_cid = NONE, prev_set = 0;
     std::vector<uint32_t> lost, gained;
+    // An empty list's data() may be null, which memcpy may not get.
+    auto ids_into = [](std::vector<uint32_t>& ids, const char* p, uint32_t n) {
+        ids.resize(n);
+        if (n) memcpy(ids.data(), p, size_t{n} * 4);
+    };
     auto next_set = [&] {
         if (set_i == n_set) { set_cid = NONE; return; }
-        uint32_t nl, ng;
-        take(&set_cid, 8); take(&nl, 4); take(&ng, 4);
-        if ((set_i > 0 && set_cid <= prev_set) || set_cid == NONE) malformed();
+        set_cid = in.u64();
+        const uint32_t nl = in.u32(), ng = in.u32();
+        if ((set_i > 0 && set_cid <= prev_set) || set_cid == NONE) in.malformed();
         // A list holds at most 0xFFFF ids (its u16 count), so a cell loses or gains at most as many.
-        if (nl > 0xFFFF || ng > 0xFFFF || (delta_size - pos) / 4 < (size_t)nl + ng) malformed();
-        lost.resize(nl); gained.resize(ng);
-        take(lost.data(), (size_t)nl * 4);
-        take(gained.data(), (size_t)ng * 4);
+        if (nl > 0xFFFF || ng > 0xFFFF) in.malformed();
+        const char* lost_at = in.take_items(nl, 4);
+        const char* gained_at = in.take_items(ng, 4);
+        ids_into(lost, lost_at, nl);
+        ids_into(gained, gained_at, ng);
         prev_set = set_cid;
         set_i++;
     };
@@ -1327,7 +1394,7 @@ uint64_t stream_cell_index(Cells&& cells, Entries&& entries, AscendingIds added,
     }
     removed.require_ascending();
     gone.require_ascending();
-    if (pos != delta_size) malformed();
+    if (!in.at_end()) in.malformed();
     return written;
 }
 
@@ -1395,19 +1462,16 @@ inline void append_geo_list_delta(std::vector<char>& out, uint64_t cell_id,
 // planet).
 inline PatchRef scan_geo_list_deltas(const char* data, size_t size, size_t& pos, uint32_t count) {
     const size_t start = pos;
+    SectionReader in(data, size, pos, "geo entry delta", PastEnd::MALFORMED);
     uint64_t prev = 0;
     for (uint32_t i = 0; i < count; i++) {
-        if (size - pos < 12) throw std::runtime_error("Malformed geo entry delta");
-        uint64_t cid;
-        uint16_t nl, ng;
-        memcpy(&cid, data + pos, 8); memcpy(&nl, data + pos + 8, 2); memcpy(&ng, data + pos + 10, 2);
+        const uint64_t cid = in.u64();
+        uint16_t nl = in.u16();
+        const uint16_t ng = in.u16();
         if (nl == GEO_LIST_REPLACE) nl = 0;
-        if (i > 0 && cid <= prev) throw std::runtime_error("Malformed geo entry delta");
+        if (i > 0 && cid <= prev) in.malformed();
         prev = cid;
-        pos += 12;
-        const size_t ids = ((size_t)nl + ng) * 4;
-        if (size - pos < ids) throw std::runtime_error("Malformed geo entry delta");
-        pos += ids;
+        in.take_items(uint32_t{nl} + ng, 4);
     }
     return {start, pos - start};
 }
@@ -1558,20 +1622,6 @@ inline void write_varint(std::vector<char>& buf, uint32_t value) {
         value >>= 7;
     }
     buf.push_back(static_cast<char>(value));
-}
-
-// Reads a varint that stays inside data[0, size): a truncated or overlong
-// value, or one of 2^32 or more, throws "Malformed <what>".
-inline uint32_t read_varint_bounded(const char* data, size_t& pos, size_t size, const char* what) {
-    uint32_t result = 0;
-    for (uint32_t bit = 0; bit < 35; bit += 7) {
-        if (pos >= size) throw std::runtime_error(std::string("Malformed ") + what);
-        uint8_t byte = static_cast<uint8_t>(data[pos++]);
-        if (bit == 28 && (byte & 0x70)) throw std::runtime_error(std::string("Malformed ") + what);
-        result |= static_cast<uint32_t>(byte & 0x7F) << bit;
-        if (!(byte & 0x80)) return result;
-    }
-    throw std::runtime_error(std::string("Malformed ") + what);
 }
 
 inline uint32_t zigzag32(uint32_t v) { return (v << 1) ^ (0u - (v >> 31)); }
@@ -1780,36 +1830,26 @@ inline uint32_t string_index_at(const char* list, uint32_t i) {
 // section, a sorted tier's sort strictly, and both index lists ascend
 // strictly.
 inline StringTierEdit parse_string_tier_edit(const char* data, size_t size, size_t& pos) {
-    auto malformed = [] { throw std::runtime_error("Malformed strings section"); };
-    auto take = [&](uint64_t n) {
-        if (pos > size || n > size - pos) throw std::runtime_error("Truncated strings section");
-        const char* p = data + pos;
-        pos += static_cast<size_t>(n);
-        return p;
-    };
-    auto u32 = [&] { uint32_t v; memcpy(&v, take(4), 4); return v; };
-    auto u64 = [&] { uint64_t v; memcpy(&v, take(8), 8); return v; };
+    SectionReader in(data, size, pos, "strings section");
     StringTierEdit e;
-    e.old_hash = u64();
-    e.new_hash = u64();
-    e.n_added = u32();
-    e.n_deleted = u32();
-    const uint32_t order = u32();
-    if (order != STRING_TIER_SORTED && order != STRING_TIER_INDEXED) malformed();
+    e.old_hash = in.u64();
+    e.new_hash = in.u64();
+    e.n_added = in.u32();
+    e.n_deleted = in.u32();
+    const uint32_t order = in.u32();
+    if (order != STRING_TIER_SORTED && order != STRING_TIER_INDEXED) in.malformed();
     e.sorted = order == STRING_TIER_SORTED;
     e.added = data + pos;
     const char* prev = nullptr;
     for (uint32_t i = 0; i < e.n_added; i++) {
-        const void* end = memchr(data + pos, '\0', size - pos);
-        if (!end) throw std::runtime_error("Truncated strings section");
-        if (e.sorted && prev && strcmp(prev, data + pos) >= 0) malformed();
-        prev = data + pos;
-        pos = static_cast<size_t>(static_cast<const char*>(end) - data) + 1;
+        const char* added = in.cstring();
+        if (e.sorted && prev && strcmp(prev, added) >= 0) in.malformed();
+        prev = added;
     }
     auto ascending = [&](uint32_t n) {
-        const char* list = take(uint64_t{n} * 4);
+        const char* list = in.take_items(n, 4);
         for (uint32_t i = 1; i < n; i++)
-            if (string_index_at(list, i) <= string_index_at(list, i - 1)) malformed();
+            if (string_index_at(list, i) <= string_index_at(list, i - 1)) in.malformed();
         return list;
     };
     if (!e.sorted) e.added_at = ascending(e.n_added);
@@ -1899,20 +1939,20 @@ public:
     // offsets [tier_start, tier_end). Tiers are added in offset order: the
     // table refuses a run that steps back.
     void add_sent_tier(const char* data, size_t size, uint32_t n_runs, uint32_t tier_start, uint32_t tier_end) {
-        auto malformed = [] { throw std::runtime_error("Malformed string runs"); };
-        if (n_runs > size / 3) malformed();  // a run is at least 3 bytes
         size_t pos = 0;
+        SectionReader in(data, size, pos, "string runs", PastEnd::MALFORMED);
+        if (n_runs > size / 3) in.malformed();  // a run is at least 3 bytes
         uint64_t prev_end = tier_start;
         uint32_t shift = 0;
         for (uint32_t i = 0; i < n_runs; i++) {
-            uint64_t start = prev_end + read_varint_bounded(data, pos, size, "string runs");
-            uint64_t end = start + read_varint_bounded(data, pos, size, "string runs");
-            shift += unzigzag32(read_varint_bounded(data, pos, size, "string runs"));
-            if (end == start || end > tier_end) malformed();
+            const uint64_t start = prev_end + in.varint();
+            const uint64_t end = start + in.varint();
+            shift += unzigzag32(in.varint());
+            if (end == start || end > tier_end) in.malformed();
             runs_.append({static_cast<uint32_t>(start), static_cast<uint32_t>(end), shift});
             prev_end = end;
         }
-        if (pos != size) malformed();
+        if (!in.at_end()) in.malformed();
     }
     // Every tier is in: maps the runs for lookups, with the moved strings'
     // pairs (the strings section's, where it sits).
@@ -2125,38 +2165,31 @@ struct StringsSection {
 
 // Parses the section at data[pos, size) and advances pos past it.
 inline StringsSection parse_strings_section(const char* data, size_t size, size_t& pos) {
-    auto malformed = [] { throw std::runtime_error("Malformed strings section"); };
-    auto take = [&](uint64_t n) {
-        if (pos > size || n > size - pos) throw std::runtime_error("Truncated strings section");
-        const char* p = data + pos;
-        pos += static_cast<size_t>(n);
-        return p;
-    };
-    auto u32 = [&] { uint32_t v; memcpy(&v, take(4), 4); return v; };
-    if (u32() != STRINGS_TIERED_MARKER) throw std::runtime_error("Patch has no strings section");
+    SectionReader in(data, size, pos, "strings section");
+    if (in.u32() != STRINGS_TIERED_MARKER) throw std::runtime_error("Patch has no strings section");
     StringsSection s;
     for (int t = 0; t < STRING_TIER_COUNT; t++) {
-        uint32_t old_size = u32(), new_size = u32();
+        const uint32_t old_size = in.u32(), new_size = in.u32();
         if ((uint64_t)s.old_base[t] + old_size > UINT32_MAX || (uint64_t)s.new_base[t] + new_size > UINT32_MAX)
-            malformed();
+            in.malformed();
         s.old_base[t + 1] = s.old_base[t] + old_size;
         s.new_base[t + 1] = s.new_base[t] + new_size;
     }
-    s.shipped = u32();
-    s.sent = u32();
-    if ((s.shipped | s.sent) >> STRING_TIER_COUNT || (s.shipped & s.sent)) malformed();
+    s.shipped = in.u32();
+    s.sent = in.u32();
+    if ((s.shipped | s.sent) >> STRING_TIER_COUNT || (s.shipped & s.sent)) in.malformed();
     for (int t = 0; t < STRING_TIER_COUNT; t++) {
         if (s.sent >> t & 1) {
             SentStringRuns& r = s.runs[t];
-            r.n_runs = u32();
-            r.size = u32();
-            r.data = take(r.size);
+            r.n_runs = in.u32();
+            r.size = in.u32();
+            r.data = in.take(r.size);
             continue;
         }
         if (s.shipped >> t & 1) s.edits[t] = parse_string_tier_edit(data, size, pos);
     }
-    const uint32_t n_pairs = u32();
-    s.pairs = SortedTable<RemapPair>(take(uint64_t{n_pairs} * sizeof(RemapPair)), n_pairs, "strings section");
+    const uint32_t n_pairs = in.u32();
+    s.pairs = SortedTable<RemapPair>(in.take_items(n_pairs, sizeof(RemapPair)), n_pairs, "strings section");
     return s;
 }
 
@@ -2341,7 +2374,7 @@ private:
     static constexpr uint32_t END = 0xFFFFFFFFu;  // also NO_DATA
 
     static uint32_t read(const char* data, size_t& pos, size_t size) {
-        return read_varint_bounded(data, pos, size, "fixups");
+        return SectionReader(data, size, pos, "fixups", PastEnd::MALFORMED).varint();
     }
     void next_run() {
         if (runs_left_ == 0) { run_start_ = run_end_ = END; return; }
