@@ -8,6 +8,7 @@
 // Patch format: custom binary, zstd-compressed as a whole for transport.
 //
 // Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META] [--string-pairs-max N]
+//                      [--string-fixup-bytes-max N]
 //
 // GCPATCH v8: with --identity, street / interp / addr records match across
 // days by the server-side identity sidecars <META>/{street,interp,addr}.slot.u32
@@ -526,17 +527,20 @@ static bool try_emit_copy_old(std::vector<char>& patch, uint32_t fid,
 // for the moved strings the strings section didn't send as pairs (more than
 // its cap), whose old offsets the patcher's remap keeps. The merges' records
 // that hold them carry their new values as string fixups (string_fixups_of),
-// and the side files' values that hold them arrive as changes.
+// each merge's within fixup_limits, and the side files' values that hold them
+// arrive as changes.
 class PatcherStringRemap {
 public:
-    PatcherStringRemap(const SortedU32Map& full, std::vector<SortedU32Map::Pair> unsent)
-        : full_(full), unsent_(std::move(unsent)) {}
+    PatcherStringRemap(const SortedU32Map& full, std::vector<SortedU32Map::Pair> unsent, StringFixupLimits fixup_limits)
+        : full_(full), unsent_(std::move(unsent)), fixup_limits_(fixup_limits) {}
     uint32_t map(uint32_t v) const { return unsent_.find(v) ? v : full_.map(v); }
     bool sent_every_pair() const { return unsent_.size() == 0; }
+    StringFixupLimits fixup_limits() const { return fixup_limits_; }
 
 private:
     const SortedU32Map& full_;
     SortedU32Map unsent_;
+    StringFixupLimits fixup_limits_;
 };
 
 // A merge's string fixups: the new value of each string field of its MATCH
@@ -544,10 +548,11 @@ private:
 // string the strings section didn't send as a pair does (a MATCH record is
 // the old one with the diff's remap). Reads the original old file, which the
 // merge remapped in its own copy, and the new one in order, and only when
-// the strings section left pairs out.
+// the strings section left pairs out. Refuses fixups past the limits, which
+// the section's header could not give.
 static StringFixups string_fixups_of(const FileMergeResult& r, const std::string& old_dir, const std::string& new_dir,
                                      const PatcherStringRemap& strings) {
-    StringFixups fixups;
+    StringFixups fixups(r.name, strings.fixup_limits());
     const std::vector<size_t> fields = string_field_offsets(r.id);
     if (strings.sent_every_pair() || fields.empty() || r.old_size == 0 || r.new_size == 0) return fixups;
     MappedFile old_m = mmap_file(old_dir + "/" + r.name), new_m = mmap_file(new_dir + "/" + r.name);
@@ -608,8 +613,7 @@ static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r, 
     patch.insert(patch.end(), f.runs.begin(), f.runs.end());
     patch.insert(patch.end(), f.values.begin(), f.values.end());
     const StringFixups string_fixups = string_fixups_of(r, old_dir, new_dir, strings);
-    const uint32_t n_string_fixups = string_fixups.count();
-    const uint32_t string_fixups_size = static_cast<uint32_t>(string_fixups.bytes().size());
+    const uint32_t n_string_fixups = string_fixups.count(), string_fixups_size = string_fixups.size();
     wv(&n_string_fixups, 4); wv(&string_fixups_size, 4);
     patch.insert(patch.end(), string_fixups.bytes().begin(), string_fixups.bytes().end());
     if (n_string_fixups > 0)
@@ -720,7 +724,8 @@ static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uin
 
 static int run(int argc, char* argv[]) {
     const char* usage =
-        "Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META] [--string-pairs-max N]";
+        "Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META] [--string-pairs-max N]"
+        " [--string-fixup-bytes-max N]";
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << usage << std::endl;
         return 1;
@@ -730,17 +735,25 @@ static int run(int argc, char* argv[]) {
     // The most moved strings the strings section sends as pairs; more go as
     // string fixups. Lower for tests.
     uint32_t string_pairs_max = STRING_PAIRS_MAX;
+    // The most a merge's string fixups may hold. Lower for tests.
+    StringFixupLimits string_fixup_limits;
+    // An option's value of 0 to max, in out; false (said) when it is not one.
+    auto u32_option = [](const std::string& option, const std::string& n, uint32_t max, uint32_t& out) {
+        if (n.empty() || n.size() > 10 || n.find_first_not_of("0123456789") != std::string::npos || std::stoull(n) > max) {
+            std::cerr << option << " takes 0 to " << max << ", not " << n << std::endl;
+            return false;
+        }
+        out = static_cast<uint32_t>(std::stoull(n));
+        return true;
+    };
     for (int a = 5; a < argc; a++) {
         const std::string arg = argv[a];
         if (arg == "--identity" && a + 2 < argc) { id_old_meta = argv[a + 1]; id_new_meta = argv[a + 2]; a += 2; }
         else if (arg == "--string-pairs-max" && a + 1 < argc) {
-            const std::string n = argv[++a];
-            if (n.empty() || n.size() > 10 || n.find_first_not_of("0123456789") != std::string::npos ||
-                std::stoull(n) > STRING_PAIRS_MAX) {
-                std::cerr << "--string-pairs-max takes 0 to " << STRING_PAIRS_MAX << ", not " << n << std::endl;
-                return 1;
-            }
-            string_pairs_max = static_cast<uint32_t>(std::stoull(n));
+            if (!u32_option(arg, argv[++a], STRING_PAIRS_MAX, string_pairs_max)) return 1;
+        }
+        else if (arg == "--string-fixup-bytes-max" && a + 1 < argc) {
+            if (!u32_option(arg, argv[++a], UINT32_MAX, string_fixup_limits.bytes)) return 1;
         }
         else { std::cerr << "Unknown argument " << arg << std::endl << usage << std::endl; return 1; }
     }
@@ -895,7 +908,7 @@ static int run(int argc, char* argv[]) {
         std::cerr << std::endl;
         unsent_string_pairs.swap(stats.unsent_pairs);
     }
-    const PatcherStringRemap patcher_strings(str_remap, std::move(unsent_string_pairs));
+    const PatcherStringRemap patcher_strings(str_remap, std::move(unsent_string_pairs), string_fixup_limits);
     for (int t = 0; t < 5; t++) {
         unmap_file(old_tier_maps[t]);
         unmap_file(new_tier_maps[t]);
