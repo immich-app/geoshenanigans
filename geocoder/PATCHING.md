@@ -233,16 +233,19 @@ geocoder-patch <current-dir> <patch-file> -o <output-dir>
 
 The patch tool:
 - Reads old files front to back through `pread` (sequential readahead) and
-  writes each new file in one streaming pass; only the old string tiers,
-  probed at random, and the decompressed patch are mmapped. Long unchanged
-  runs and unchanged files are copied in the kernel (`copy_file_range`), or
-  through `pread` where the kernel, the filesystem or a seccomp profile
-  refuses that
-- Peak anonymous memory: about 10 MiB for `planet/full`; everything else is
-  reclaimable page cache
-- Runs on one core inside a 1 GiB memory limit (page cache included): one
+  writes each new file in one streaming pass; only the decompressed patch,
+  each old string tier while it rebuilds it, and the remap runs it spills to
+  its scratch dir are mmapped. Long unchanged runs and unchanged files are
+  copied in the kernel (`copy_file_range`), or through `pread` where the
+  kernel, the filesystem or a seccomp profile refuses that
+- Peak anonymous memory: about 1 MiB, or 2 MiB in low-memory mode (an
+  encoded installed set, see `builder/PATCHING.md`), for every variant and
+  whatever the patch; everything else is reclaimable page cache.
+  Its scratch dir, which holds the decompressed patch, is under `$TMPDIR`:
+  keep that on disk, since a RAM-backed one counts against memory
+- Runs on one core inside a 32 MiB memory limit (page cache included): one
   day of `planet/full` takes about 4 minutes, `europe/full` about 1.5 minutes
   on an SSD. On a slow disk it is disk-bound: it reads the old variant and
-  writes the new one, about twice the variant's size in IO
+  writes the new one, two to three times the variant's size in IO
 - Needs free space for the new copy of the variant (it never patches in place)
 - Produces byte-identical output to a fresh build

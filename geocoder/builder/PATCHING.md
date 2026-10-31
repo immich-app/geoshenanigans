@@ -536,9 +536,11 @@ End marker: 0xFFFFFFFF (u32)
 
 | Operation | Europe | Planet |
 |-----------|--------|--------|
-| Patch application, 1 core, cold cache (`full`, one day) | **81s** | **241s** |
-| Patch peak anonymous memory | **5 MiB** | **12 MiB** |
-| Patch memory limit tested (page cache included) | 1 GiB | 1 GiB |
+| Patch application, 1 core, cold cache (`full`, one day; plain / low-memory) | **48 s / 78 s** | **137 s / 215 s** |
+| The same in a 32 MiB memory limit (page cache included) | 84 s / 88 s | 243 s / 240 s |
+| Patch peak anonymous memory (plain / low-memory) | **0.83 / 1.61 MiB** | **0.66 / 1.84 MiB** |
+
+Measured from 2026-10-18 to 10-19 with GCPATCH v12; see "Patcher memory and speed" above.
 
 One deterministic `build-index` run writes the planet and every continent in
 about 5 minutes on 64 cores, and `geocoder-diff` makes the patches of all 126
