@@ -5,6 +5,7 @@
 #include "gcs_codec.h"
 #include "gc_addr.h"
 
+#include <cerrno>
 #include <csignal>
 #include <cstring>
 #include <filesystem>
@@ -25,6 +26,7 @@
 
 using namespace gcs;
 using gctest::exit_status_in_child;
+using gctest::refusal_of;
 
 namespace {
 
@@ -97,15 +99,6 @@ std::map<std::string, std::vector<char>> dir_files(const std::string& dir) {
     return files;
 }
 
-bool throws_runtime(const std::function<void()>& fn, const char* message) {
-    try {
-        fn();
-    } catch (const std::runtime_error& e) {
-        return std::string(e.what()).find(message) != std::string::npos;
-    }
-    return false;
-}
-
 // In a child: at most `headroom` more bytes of address space, so a size taken
 // from an unchecked count fails at once (none under ASan, whose shadow
 // mappings need far more).
@@ -124,17 +117,14 @@ void cap_address_space(size_t headroom) {
 #endif
 }
 
-// 2 if body throws a runtime_error naming `message`, 3 (the error printed) if
-// another one, 0 if none.
-int error_code(const std::function<void()>& body, const char* message) {
-    try {
-        body();
-    } catch (const std::runtime_error& e) {
-        if (std::string(e.what()).find(message) != std::string::npos) return 2;
-        std::fprintf(stderr, "    unexpected error: %s\n", e.what());
-        return 3;
-    }
-    return 0;
+// For a child's exit status: 2 if body is refused with `refusal`, 3 (the
+// refusal printed) if with another, 0 if it returns.
+int refusal_code(const std::function<void()>& body, const std::string& refusal) {
+    const std::string got = refusal_of(body);
+    if (got.empty()) return 0;
+    if (got == refusal) return 2;
+    std::fprintf(stderr, "    unexpected refusal: %s\n", got.c_str());
+    return 3;
 }
 
 // A synthetic POI set: points, small and big polygons, closed and open rings,
@@ -381,7 +371,8 @@ TEST(gcs_way_parents_rejects_a_value_past_24_bits) {
     side::U24Enc enc(dir.path());
     enc.state = {1};
     const std::vector<uint8_t> bytes = u32s({0xFFFFFF});
-    CHECK(throws_runtime([&] { enc.write(0, bytes.data(), bytes.size()); }, "does not fit 24 bits"));
+    CHECK_EQ(refusal_of([&] { enc.write(0, bytes.data(), bytes.size()); }),
+             std::string("gcs: way_parents value 16777215 does not fit 24 bits"));
 }
 
 TEST(gcs_dictionary_round_trip_renumbers_in_value_order) {
@@ -419,10 +410,10 @@ TEST(gcs_dictionary_decoder_rejects_a_dict_past_the_manifest) {
     };
     const Case cases[] = {
         {2, 2, 0, nullptr},
-        {2, 3, 0, "way_postcodes.dict size"},
+        {2, 3, 0, "gcs: way_postcodes.dict size"},
         {0xFFFE, 0xFFFE, 0, nullptr},
-        {0xFFFF, 0xFFFF, 0, "past a u16 index"},
-        {0, 0, uint64_t(64) << 20, "way_postcodes.dict size"},
+        {0xFFFF, 0xFFFF, 0, "gcs: way_postcodes: 65535 dictionary values, past a u16 index"},
+        {0, 0, uint64_t(64) << 20, "gcs: way_postcodes.dict size"},
     };
     for (const Case& c : cases) {
         ScratchDir dir("gcs-test");
@@ -437,7 +428,7 @@ TEST(gcs_dictionary_decoder_rejects_a_dict_past_the_manifest) {
 
         const int status = exit_status_in_child(
             [&] {
-                return error_code(
+                return refusal_code(
                     [&] {
                         Manifest m;
                         m.set("way_postcodes.n", ids.size());
@@ -465,14 +456,14 @@ TEST(gcs_dictionary_encoder_writes_fewer_than_0xffff_values) {
         side::DictEnc enc(dir.path(), "way_postcodes");
         enc.state = {1};
 
-        const int status = error_code(
+        const int status = refusal_code(
             [&] {
                 enc.write(0, bytes.data(), bytes.size());
                 const Manifest m = finish_all(enc);
                 side::DictDec dec(dir.path(), "way_postcodes", m);
                 if (decode_all(dec)[0] != bytes) throw std::runtime_error("decodes to other values");
             },
-            "too many distinct values");
+            "gcs: way_postcodes: too many distinct values for a u16 index");
 
         CHECK_EQ(status, distinct == 0xFFFE ? 0 : 2);
     }
@@ -524,9 +515,9 @@ TEST(gcs_poi_decoder_rejects_blocks_the_encoder_never_writes) {
         const char* error;  // nullptr: decodes
     };
     const Case cases[] = {{0, 14, nullptr},
-                          {1, 10, "block with no stored vertex"},
-                          {0, 10, "block with no stored vertex"},
-                          {0, 10 + (uint64_t(4) << 32), "more vertices than a record holds"}};
+                          {1, 10, "gcs: poi 0: block with no stored vertex"},
+                          {0, 10, "gcs: poi 0: block with no stored vertex"},
+                          {0, 10 + (uint64_t(4) << 32), "gcs: poi 0: block of more vertices than a record holds"}};
     for (const Case& c : cases) {
         ScratchDir dir("gcs-test");
         std::vector<uint8_t> rec = le(7, 8);
@@ -544,7 +535,7 @@ TEST(gcs_poi_decoder_rejects_blocks_the_encoder_never_writes) {
             CHECK(decode_all(dec)[1].size() == 14);
             continue;
         }
-        CHECK(throws_runtime([&] { dec.step(); }, c.error));
+        CHECK_EQ(refusal_of([&] { dec.step(); }), std::string(c.error));
         CHECK(dec.out[0].size() == 0);
     }
 }
@@ -752,7 +743,7 @@ TEST(gcs_addr_encoder_refuses_a_stream_ending_inside_an_escaped_footprint) {
     enc.write(0, s.points.data(), s.points.size());
     enc.write(1, s.verts.data(), s.verts.size() - 1);
 
-    CHECK(throws_runtime([&] { finish_all(enc); }, "stream ends inside a footprint"));
+    CHECK_EQ(refusal_of([&] { finish_all(enc); }), std::string("gcs: addr_vertices: stream ends inside a footprint"));
 }
 
 TEST(gcs_addr_decoder_rejects_a_footprint_count_past_its_record) {
@@ -769,14 +760,14 @@ TEST(gcs_addr_decoder_rejects_a_footprint_count_past_its_record) {
             write_bytes(dir.path() + "/addr_vertices.abs2", bytes);
             const int status = exit_status_in_child(
                 [&] {
-                    return error_code(
+                    return refusal_code(
                         [&] {
                             Manifest m;
                             m.set("addr.n", 1);
                             addr::Dec dec(dir.path(), m);
                             while (dec.step()) {}
                         },
-                        "bad count");
+                        "gcs: addr 0: bad count");
                 },
                 5);
             CHECK_EQ(status, count == 5 ? 0 : 2);
@@ -796,6 +787,10 @@ TEST(gcs_addr_decoder_refuses_a_footprint_past_the_end_before_reading_it) {
          {std::pair<uint64_t, size_t>{uint64_t(1) << 20, 30}, {0xFFFFFFFF, 30}, {0x40000000, 10}}) {
         std::vector<uint8_t> bytes{0x20};
         uv(bytes, count);
+        // The footprint starts past its tag and count.
+        const std::string refusal = "gcs: " + dir.path() + "/addr_vertices.abs2: unexpected end of file at " +
+                                    std::to_string(bytes.size()) + " (need 10 + " + std::to_string(count) + " x 4 bytes, " +
+                                    std::to_string(payload) + " left)";
         bytes.resize(bytes.size() + payload);
         write_bytes(dir.path() + "/addr_vertices.abs2", bytes);
         const int status = exit_status_in_child(
@@ -804,7 +799,7 @@ TEST(gcs_addr_decoder_refuses_a_footprint_past_the_end_before_reading_it) {
                 Manifest m;
                 m.set("addr.n", 1);
                 addr::Dec dec(dir.path(), m);
-                const int code = error_code([&] { while (dec.step()) {} }, "unexpected end of file");
+                const int code = refusal_code([&] { while (dec.step()) {} }, refusal);
                 return dec.A->buf.size() > READ_BUF + 64 ? 4 : code;
             },
             5);
@@ -830,7 +825,8 @@ TEST(gcs_encoders_refuse_a_unit_past_the_end_of_its_file) {
         enc.expect = {rec.size(), ten.size()};
         enc.write(0, rec.data(), rec.size());
 
-        CHECK(throws_runtime([&] { enc.write(1, ten.data(), ten.size()); }, "runs past the end of input 1"));
+        CHECK_EQ(refusal_of([&] { enc.write(1, ten.data(), ten.size()); }),
+                 std::string("gcs: addr: a unit of 10 + 1073741824 x 4 bytes at 0 runs past the end of input 1 (10 bytes left)"));
     }
     {
         std::vector<uint8_t> poly(24, 0);
@@ -840,7 +836,8 @@ TEST(gcs_encoders_refuse_a_unit_past_the_end_of_its_file) {
         enc.state = {1};
         enc.expect = {ten.size()};
 
-        CHECK(throws_runtime([&] { enc.write(0, ten.data(), ten.size()); }, "runs past the end of input 0"));
+        CHECK_EQ(refusal_of([&] { enc.write(0, ten.data(), ten.size()); }),
+                 std::string("gcs: admin: a unit of 10 + 1073741824 x 4 bytes at 0 runs past the end of input 0 (10 bytes left)"));
     }
     {
         std::vector<uint8_t> rec(36, 0);
@@ -851,7 +848,8 @@ TEST(gcs_encoders_refuse_a_unit_past_the_end_of_its_file) {
         enc.expect = {rec.size(), ten.size()};
         enc.write(0, rec.data(), rec.size());
 
-        CHECK(throws_runtime([&] { enc.write(1, ten.data(), ten.size()); }, "runs past the end of input 1"));
+        CHECK_EQ(refusal_of([&] { enc.write(1, ten.data(), ten.size()); }),
+                 std::string("gcs: poi: a unit of 10 + 1073741824 x 4 bytes at 0 runs past the end of input 1 (10 bytes left)"));
     }
 }
 
@@ -877,7 +875,7 @@ TEST(gcs_reader_rejects_a_varint_past_64_bits) {
                 CHECK(r.uv() == ~uint64_t(0));
                 CHECK(r.eof());
             } else {
-                CHECK(throws_runtime([&] { r.uv(); }, "bad varint"));
+                CHECK_EQ(refusal_of([&] { r.uv(); }), "gcs: " + path + ": bad varint");
             }
         }
     }
@@ -895,15 +893,15 @@ TEST(gcs_gxc_decoder_rejects_list_and_address_counts_before_using_them) {
         const char* error;             // nullptr: decodes
     };
     const Case cases[] = {
-        {1, 1, {1, 4, 0}, {2}, 2, nullptr},                                                    // a valid row
-        {1, 0, {MAX, 0}, {}, 0, "list too long"},                                              // street count - 1 = 2^64 - 1
-        {3, 0, {0xFFFF, 0}, {}, 0, "list too long"},                                           // street count 65536
-        {0, 1, {}, {uint64_t(1) << 40}, 0, "bad address list"},                                // state 1, 2^40 ids
-        {0, 1, {}, {0}, 0, "bad address list"},                                                // state 1, no ids
-        {0, 2, {}, {3, 1, uint64_t(1) << 40, 0}, 3, "bad address list"},                       // state 2, index gap 2^40
-        {0, 2, {}, {1, 1, 0, uint64_t(1) << 40}, 1, "bad address list"},                       // state 2, 2^40 copies
-        {0, 2, {}, {1, 2, 0, 0, 0, 0}, 1, "bad address list"},                                 // state 2, more repeats than ids
-        {0, 3, {}, {1, MAX, 0}, 1, "bad address list"},                                        // state 3, count - 1 = 2^64 - 1
+        {1, 1, {1, 4, 0}, {2}, 2, nullptr},                                                   // a valid row
+        {1, 0, {MAX, 0}, {}, 0, "gcs: gxc: list too long"},                                  // street count - 1 = 2^64 - 1
+        {3, 0, {0xFFFF, 0}, {}, 0, "gcs: gxc: list too long"},                               // street count 65536
+        {0, 1, {}, {uint64_t(1) << 40}, 0, "gcs: gxc: bad address list at row 0"},            // state 1, 2^40 ids
+        {0, 1, {}, {0}, 0, "gcs: gxc: bad address list at row 0"},                            // state 1, no ids
+        {0, 2, {}, {3, 1, uint64_t(1) << 40, 0}, 3, "gcs: gxc: bad address list at row 0"},   // state 2, index gap 2^40
+        {0, 2, {}, {1, 1, 0, uint64_t(1) << 40}, 1, "gcs: gxc: bad address list at row 0"},   // state 2, 2^40 copies
+        {0, 2, {}, {1, 2, 0, 0, 0, 0}, 1, "gcs: gxc: bad address list at row 0"},             // state 2, more repeats than ids
+        {0, 3, {}, {1, MAX, 0}, 1, "gcs: gxc: bad address list at row 0"},                    // state 3, count - 1 = 2^64 - 1
     };
     for (const Case& c : cases) {
         ScratchDir dir("gcs-test");
@@ -921,7 +919,7 @@ TEST(gcs_gxc_decoder_rejects_list_and_address_counts_before_using_them) {
         const int status = exit_status_in_child(
             [&] {
                 cap_address_space(size_t(4) << 30);
-                return error_code(
+                return refusal_code(
                     [&] {
                         Manifest m;
                         m.set("gxc.rows", 1);
@@ -974,11 +972,11 @@ void write_gxc(const std::string& dir, const std::vector<GxcRow>& rows, const st
 }
 
 // Decodes the set at dir to the end in a child: 0 when it decodes, 2 when it
-// fails with error, 3 with another.
-int gxc_decode_error(const std::string& dir, uint64_t rows, uint64_t addr_ids, const char* error) {
+// is refused with `refusal`, 3 with another.
+int gxc_decode_refusal(const std::string& dir, uint64_t rows, uint64_t addr_ids, const std::string& refusal) {
     return exit_status_in_child(
         [&] {
-            return error_code(
+            return refusal_code(
                 [&] {
                     Manifest m;
                     m.set("gxc.rows", rows);
@@ -989,7 +987,7 @@ int gxc_decode_error(const std::string& dir, uint64_t rows, uint64_t addr_ids, c
                     for (auto& st : dec.state) st = 1;
                     while (dec.step()) {}
                 },
-                error);
+                refusal);
         },
         20);
 }
@@ -1013,19 +1011,19 @@ TEST(gcs_gxc_decoder_rejects_ids_past_u32_and_the_id_count) {
     const uint64_t MAX = ~uint64_t(0), U32 = uint64_t(1) << 32;
     const Case cases[] = {
         {{{1 | 1 << 2, {2}}, {1 | 3 << 2, {0, 0, zz64(-1)}}}, {0, zz64(1), 1, zz64(0xFFFFFFFC), 1}, 2, nullptr},  // valid ids
-        {{{1, {}}}, {0, zz64(int64_t(U32))}, 0, "list id past u32"},                             // street first id 2^32
-        {{{1, {}}, {1, {}}}, {0, zz64(1), 0, zz64(INT64_MAX)}, 0, "list id past u32"},           // 1 + 2^63 - 1
-        {{{1, {}}}, {1, zz64(int64_t(U32 - 1)), 0}, 0, "list id past u32"},                      // 2^32 - 1 + 1
-        {{{3 << 2, {MAX, 0, zz64(0)}}, {1 << 2, {1}}}, {}, 0, "bad address list"},               // advance 2^64 - 1
-        {{{3 << 2, {1, 0, zz64(int64_t(U32))}}}, {}, 1, "bad address list"},                     // first id 2^32
-        {{{3 << 2, {0, 0, zz64(5)}}}, {}, 0, "bad address list"},                                // past the count
-        {{{3 << 2, {U32 + 1, 0, zz64(0)}}}, {}, U32 + 1, "address id count"},                    // count 2^32 + 1
+        {{{1, {}}}, {0, zz64(int64_t(U32))}, 0, "gcs: gxc: list id past u32"},                         // street first id 2^32
+        {{{1, {}}, {1, {}}}, {0, zz64(1), 0, zz64(INT64_MAX)}, 0, "gcs: gxc: list id past u32"},       // 1 + 2^63 - 1
+        {{{1, {}}}, {1, zz64(int64_t(U32 - 1)), 0}, 0, "gcs: gxc: list id past u32"},                  // 2^32 - 1 + 1
+        {{{3 << 2, {MAX, 0, zz64(0)}}, {1 << 2, {1}}}, {}, 0, "gcs: gxc: bad address list at row 0"},  // advance 2^64 - 1
+        {{{3 << 2, {1, 0, zz64(int64_t(U32))}}}, {}, 1, "gcs: gxc: bad address list at row 0"},        // first id 2^32
+        {{{3 << 2, {0, 0, zz64(5)}}}, {}, 0, "gcs: gxc: bad address list at row 0"},                   // past the count
+        {{{3 << 2, {U32 + 1, 0, zz64(0)}}}, {}, U32 + 1, "gcs: gxc: address id count"},                // count 2^32 + 1
     };
     for (const Case& c : cases) {
         ScratchDir dir("gcs-test");
         write_gxc(dir.path(), c.rows, c.street);
 
-        const int status = gxc_decode_error(dir.path(), c.rows.size(), c.addr_ids, c.error ? c.error : "");
+        const int status = gxc_decode_refusal(dir.path(), c.rows.size(), c.addr_ids, c.error ? c.error : "");
 
         CHECK_EQ(status, c.error ? 2 : 0);
     }
@@ -1046,18 +1044,20 @@ TEST(gcs_gxc_rows_out_of_cell_order_are_rejected) {
         const char* error;  // nullptr: decodes
     };
     const Case cases[] = {
-        {{{0, {}}, {3 << 6, {(1 << 20) - 4}}}, {C}, nullptr},                                        // escaped step 2^20
-        {blocks, {C, C + (uint64_t(128) << 27)}, nullptr},                                           // past its previous row
-        {{{0, {}}, {3 << 6, {MAX}}}, {C}, "cell step past the last cell id"},                        // 2^64 - 1 + 4
-        {{{0, {}}, {3 << 6, {(uint64_t(1) << 37) - 4}}}, {C}, "cell step past the last cell id"},     // 2^37
-        {{{0, {}}, {0, {}}}, {LAST}, "cell step past the last cell id"},                             // from the last cell id
-        {blocks, {C, C + (uint64_t(127) << 27)}, "starts at or before the row before it"},          // at its previous row's
+        // escaped step 2^20; a block past its previous row
+        {{{0, {}}, {3 << 6, {(1 << 20) - 4}}}, {C}, nullptr},
+        {blocks, {C, C + (uint64_t(128) << 27)}, nullptr},
+        // 2^64 - 1 + 4; 2^37; from the last cell id; a block at its previous row's cell
+        {{{0, {}}, {3 << 6, {MAX}}}, {C}, "gcs: gxc: cell step past the last cell id at row 1"},
+        {{{0, {}}, {3 << 6, {(uint64_t(1) << 37) - 4}}}, {C}, "gcs: gxc: cell step past the last cell id at row 1"},
+        {{{0, {}}, {0, {}}}, {LAST}, "gcs: gxc: cell step past the last cell id at row 1"},
+        {blocks, {C, C + (uint64_t(127) << 27)}, "gcs: gxc: block 1 starts at or before the row before it"},
     };
     for (const Case& c : cases) {
         ScratchDir dir("gcs-test");
         write_gxc(dir.path(), c.rows, {}, c.cells);
 
-        const int status = gxc_decode_error(dir.path(), c.rows.size(), 0, c.error ? c.error : "");
+        const int status = gxc_decode_refusal(dir.path(), c.rows.size(), 0, c.error ? c.error : "");
 
         CHECK_EQ(status, c.error ? 2 : 0);
     }
@@ -1072,12 +1072,12 @@ TEST(gcs_gxc_rows_out_of_cell_order_are_rejected) {
             for (int t = 0; t < 3; t++) geo.insert(geo.end(), none.begin(), none.end());
         }
 
-        const int status = error_code(
+        const int status = refusal_code(
             [&] {
                 enc.write(0, geo.data(), geo.size());
                 finish_all(enc);
             },
-            "rows out of order");
+            "gcs: gxc: rows out of order at 128");
 
         CHECK_EQ(status, sorted ? 0 : 2);
     }
@@ -1087,8 +1087,16 @@ TEST(gcs_ways_decoder_rejects_codes_wider_than_the_encoder_writes) {
     // One street way of two nodes, its block 2 wf bytes then (wl + wg) bits:
     // a first coordinate past 4 bytes or deltas past 32 bits are refused
     // instead of shifting a u32 past its width; the widest valid code decodes.
-    struct Case { int wf, wl, wg; bool valid; };
-    const Case cases[] = {{4, 32, 32, true}, {0, 0, 0, true}, {5, 0, 0, false}, {7, 0, 0, false}, {0, 33, 0, false}, {4, 32, 63, false}};
+    struct Case {
+        int wf, wl, wg;
+        const char* refusal;  // nullptr: decodes
+    };
+    const Case cases[] = {{4, 32, 32, nullptr},
+                          {0, 0, 0, nullptr},
+                          {5, 0, 0, "gcs: street: way 0 has a bad code 0xa000"},
+                          {7, 0, 0, "gcs: street: way 0 has a bad code 0xe000"},
+                          {0, 33, 0, "gcs: street: way 0 has a bad code 0x21"},
+                          {4, 32, 63, "gcs: street: way 0 has a bad code 0x8fe0"}};
     for (const Case& c : cases) {
         ScratchDir dir("gcs-test");
         const uint16_t cnt = 2, code = uint16_t(c.wl | c.wg << 6 | c.wf << 13);
@@ -1099,7 +1107,7 @@ TEST(gcs_ways_decoder_rejects_codes_wider_than_the_encoder_writes) {
         write_bytes(dir.path() + "/street.name", le(7, 4));
         const int status = exit_status_in_child(
             [&] {
-                return error_code(
+                return refusal_code(
                     [&] {
                         Manifest m;
                         m.set("street.ways", 1);
@@ -1109,10 +1117,10 @@ TEST(gcs_ways_decoder_rejects_codes_wider_than_the_encoder_writes) {
                         dec.state = {1, 1};
                         while (dec.step()) {}
                     },
-                    "bad code");
+                    c.refusal ? c.refusal : "");
             },
             5);
-        CHECK_EQ(status, c.valid ? 0 : 2);
+        CHECK_EQ(status, c.refusal ? 2 : 0);
     }
 }
 
@@ -1157,14 +1165,14 @@ TEST(gcs_ways_decoder_rejects_bytes_past_the_end_of_a_column) {
             }
             const int status = exit_status_in_child(
                 [&] {
-                    return error_code(
+                    return refusal_code(
                         [&] {
                             ways::Dec dec(bad.path(), street, m);
                             for (auto& st : dec.state) st = 1;
                             while (dec.step())
                                 for (auto& q : dec.out) q.pop(q.size());
                         },
-                        "not fully consumed");
+                        "gcs: " + fam + ": columns not fully consumed");
                 },
                 20);
             if (status != 2) std::printf("    %s.%s: exit %d\n", fam.c_str(), column.c_str(), status);
@@ -1196,10 +1204,13 @@ TEST(gcs_ways_decoder_rejects_a_way_starting_past_node_u32) {
         m = finish_all(enc);
     }
     m.set("street.nodes", UINT32_MAX + m.num("street.nodes"));
+    size_t second_with_nodes = 0;
+    for (size_t w = 0, with_nodes = 0; w < s.ways.size() / 12 && with_nodes < 2; w++)
+        if (rd16(&s.ways[12 * w + 4]) && ++with_nodes == 2) second_with_nodes = w;
 
     const int status = exit_status_in_child(
         [&] {
-            return error_code(
+            return refusal_code(
                 [&] {
                     ways::Dec dec(dir.path(), true, m);
                     dec.node_off = UINT32_MAX;
@@ -1207,7 +1218,7 @@ TEST(gcs_ways_decoder_rejects_a_way_starting_past_node_u32) {
                     while (dec.step())
                         for (auto& q : dec.out) q.pop(q.size());
                 },
-                "starts past node");
+                "gcs: street: way " + std::to_string(second_with_nodes) + " starts past node 4294967295");
         },
         20);
 
@@ -1222,39 +1233,40 @@ std::vector<uint32_t> u24_values() {
     return v;
 }
 
-// 0: the error reached the catch naming the file (mode 3, no limit: every
-// byte is in the file); 3: an error without the file's path; 4: no error;
-// 5, 6: mode 3's file is wrong; 8: an error in mode 3.
+// 0: the write is refused with the error naming its file, too large for
+// the limit (mode 3, no limit: every byte is in the file); 3: another
+// refusal; 4: none; 5, 6: mode 3's file is wrong; 8: a refusal in mode 3.
 int writer_case(int mode, const std::string& dir) {
-    try {
-        if (mode == 0 || mode == 3) {  // U24Enc: its last buffer goes out in finish()
+    const bool u24 = mode == 0 || mode == 3;
+    const std::string file = dir + (u24 ? "/way_parents.u24" : "/output");
+    const std::vector<uint32_t> v = u24_values();
+    const std::string refusal = refusal_of([&] {
+        if (u24) {  // U24Enc: its last buffer goes out in finish()
             side::U24Enc enc(dir);
-            const std::vector<uint32_t> v = u24_values();
             enc.state[0] = 1;
             enc.write(0, v.data(), v.size() * 4);
             enc.state[0] = 2;
             Manifest m;
             enc.finish(m);
-            if (mode == 3) {
-                Reader r(dir + "/way_parents.u24");
-                if (r.size() != 3 * v.size()) return 5;
-                for (uint32_t x : v) {
-                    const uint8_t* b = r.take(3);
-                    if ((uint32_t(b[0]) | uint32_t(b[1]) << 8 | uint32_t(b[2]) << 16) != x) return 6;
-                }
-                return 0;
-            }
         } else {  // a writer whose finish() fails (1), or whose put() fails writing straight through (2)
-            Writer w(dir + "/output", 48 << 10);
+            Writer w(file, 48 << 10);
             std::vector<uint8_t> bytes(mode == 1 ? 40000 : 100000);
             w.put(bytes.data(), bytes.size());
             w.finish();
         }
-    } catch (const std::runtime_error& e) {
-        if (mode == 3) return 8;
-        return std::string(e.what()).find(dir) != std::string::npos ? 0 : 3;
+    });
+    if (mode != 3) {
+        if (refusal.empty()) return 4;
+        return refusal == "gcs: write " + file + ": " + std::strerror(EFBIG) ? 0 : 3;
     }
-    return 4;
+    if (!refusal.empty()) return 8;
+    Reader r(file);
+    if (r.size() != 3 * v.size()) return 5;
+    for (uint32_t x : v) {
+        const uint8_t* b = r.take(3);
+        if ((uint32_t(b[0]) | uint32_t(b[1]) << 8 | uint32_t(b[2]) << 16) != x) return 6;
+    }
+    return 0;
 }
 
 }  // namespace
@@ -1296,12 +1308,12 @@ TEST(gcs_reader_rejects_a_unit_past_what_its_buffer_holds) {
 
     const int status = exit_status_in_child(
         [&] {
-            return error_code(
+            return refusal_code(
                 [&] {
                     Reader r(path);
                     r.take(r.unit_size(10, 0x3FFFFFFD, 4));
                 },
-                "does not fit in memory");
+                "gcs: " + path + ": a unit of 4294967294 bytes at 0 does not fit in memory");
         },
         20);
 
