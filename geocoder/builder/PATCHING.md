@@ -166,8 +166,9 @@ keep it so:
   string tier's edit, the moved-string pairs, the parent-id legs, the secondary remap pairs, the
   cell list and geo entry deltas, the sparse and parallel deltas' changes, and the offset and
   string fixups. Each is ascending, by the key the format below gives it, and the patcher
-  refuses one that steps back. The lists it looks keys up in (the moved-string pairs, the
-  parent-id legs, the secondary remap) are searched where they sit (`SortedTable`: a binary
+  refuses one that steps back, except the offset fixups: it doesn't check their delta-coded
+  indices for a repeat or a 32-bit wrap. The lists it looks keys up in (the moved-string pairs,
+  the parent-id legs, the secondary remap) are searched where they sit (`SortedTable`: a binary
   search narrowed by a directory of at most 4096 sampled keys, TABLE_DIRECTORY_KEYS, and a 4 KiB
   key filter); the others are read once, front to back, as the walk or replay they serve
   reaches them.
