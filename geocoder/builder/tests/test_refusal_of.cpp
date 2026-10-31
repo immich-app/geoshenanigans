@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "child_process.h"
 #include "test_framework.h"
 
 using gctest::refusal_of;
@@ -30,4 +31,15 @@ TEST(refusal_of_lets_an_exception_of_another_type_through) {
              std::string("not a logic error"));
     CHECK_EQ(refusal_of<std::logic_error>([] { refusal_of([] { throw std::logic_error("not a runtime error"); }); }),
              std::string("not a runtime error"));
+}
+
+TEST(refusal_of_lets_a_refusal_without_a_message_through) {
+    // As "" it would pass a check that the call returned.
+    const int status = gctest::exit_status_in_child(
+        [] {
+            refusal_of([] { throw std::runtime_error(""); });
+            return 0;
+        },
+        5);
+    CHECK_EQ(status, gctest::EXCEPTION_ESCAPED);
 }
