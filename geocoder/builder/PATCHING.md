@@ -499,7 +499,9 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   record's), one left over at the end, and bytes past the last ("Malformed
   string fixups"). A file without string fields carries 0 and 0; the
   low-memory mode refuses anything else in a child stream ("Encoded set: a
-  child stream with string fixups").
+  child stream with string fixups"). The diff refuses a merge whose fixups
+  would pass the header's u32s, or skip more slots between two than a varint
+  holds ("String fixups of <file>: more than ...").
 
 Cell Changes: marker 0xFFFFFFFB/FA/F5/F4 (geo/admin/poi/place) + n_added (u32)
   + n_removed (u32) + [cell_id:u64] × n_added + [cell_id:u64] × n_removed
@@ -513,8 +515,8 @@ Secondary ID Remap: marker 0xFFFFFFF6 (u32) + n_files (u32)
   remap)
   (v11) Each file's pairs ascending by old_id, each id once. The patcher
   reads them where they sit as the file's remap pairs and refuses a list out
-  of order, a second list with pairs for a file, and street_ways pairs when
-  the parent-id remap's street leg has some.
+  of order, a second list with pairs for a file (replayed or sent unchanged),
+  and street_ways pairs when the parent-id remap's street leg has some.
 
 Geo Entry Deltas (street / addr / interp entries): marker 0xFFFFFFF0 (u32)
   + file_id (u32) + count (u32), then per cell in cell order:

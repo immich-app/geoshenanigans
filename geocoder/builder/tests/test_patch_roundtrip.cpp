@@ -535,16 +535,11 @@ TEST(patch_round_trip_rebuilds_a_cell_index_without_its_records) {
 }
 
 // A postcode the new day moves to another tier, "10115" from the core tier to
-// the postcode tier, past the strings section's pairs (--string-pairs-max 0):
-// the patcher's string remap keeps its old offset. The address whose
-// housenumber names it, a MATCH record, takes its new offset as a string
-// fixup, and addr_postcodes (a parallel delta along the addresses, remap kind
-// 2) and postcode_centroids (a sparse delta, kind 3) take it as a change each.
-// With the pair sent instead, neither has a change. "A" moves within the core
-// tier (a run of the remap) and "20095" stays where it was.
-TEST(patch_round_trip_sends_moved_postcodes_past_the_pair_table_as_changes) {
+// the postcode tier, named by an address's housenumber, addr_postcodes and
+// postcode_centroids. "A" moves within the core tier (a run of the remap) and
+// "20095" stays where it was.
+static void put_moved_postcode(BuildDir& old_d, BuildDir& new_d) {
     constexpr uint32_t OLD_POSTCODE = 0, NEW_POSTCODE = 2, KEPT_POSTCODE = 8, OLD_NAME = 6, NEW_NAME = 0;
-    BuildDir old_d, new_d;
     old_d["strings_core.bin"] = {'1', '0', '1', '1', '5', 0, 'A', 0};
     new_d["strings_core.bin"] = {'A', 0};
     old_d["strings_postcode.bin"] = {'2', '0', '0', '9', '5', 0};
@@ -571,6 +566,17 @@ TEST(patch_round_trip_sends_moved_postcodes_past_the_pair_table_as_changes) {
     };
     old_d["postcode_centroids.bin"] = centroids(OLD_POSTCODE);
     new_d["postcode_centroids.bin"] = centroids(NEW_POSTCODE);
+}
+
+// The moved postcode (put_moved_postcode) past the strings section's pairs
+// (--string-pairs-max 0): the patcher's string remap keeps its old offset.
+// The address whose housenumber names it, a MATCH record, takes its new
+// offset as a string fixup, and addr_postcodes (a parallel delta along the
+// addresses, remap kind 2) and postcode_centroids (a sparse delta, kind 3)
+// take it as a change each. With the pair sent instead, neither has a change.
+TEST(patch_round_trip_sends_moved_postcodes_past_the_pair_table_as_changes) {
+    BuildDir old_d, new_d;
+    put_moved_postcode(old_d, new_d);
 
     const RoundTrip fixed = round_trip(old_d, new_d, {}, {"--string-pairs-max", "0"});
     CHECK(fixed.mismatches.empty());
@@ -582,6 +588,37 @@ TEST(patch_round_trip_sends_moved_postcodes_past_the_pair_table_as_changes) {
     CHECK(!logged(paired, "string fixups"));
     CHECK(logged(paired, "addr_postcodes.bin: parallel delta along addr_points.bin, 0 inserted, 0 changes"));
     CHECK(logged(paired, "postcode_centroids.bin: sparse delta 0 changes"));
+}
+
+// The moved postcode's string fixup takes 2 bytes. Under a limit of 2
+// (--string-fixup-bytes-max, lower for tests) it round-trips; under 1 the
+// diff refuses it, and no patch is written: a merge section's header gives
+// its fixups' size as a u32, which fixups past the real limit would wrap,
+// and the patcher refuse the section. A limit past a u32 is refused.
+TEST(patch_diff_refuses_string_fixups_past_the_sections_limit) {
+    BuildDir old_d, new_d;
+    put_moved_postcode(old_d, new_d);
+    const RoundTrip at_limit = round_trip(old_d, new_d, {}, {"--string-pairs-max", "0", "--string-fixup-bytes-max", "2"});
+    CHECK(at_limit.mismatches.empty());
+    CHECK(logged(at_limit, "addr_points.bin: 1 string fixups (2 bytes)"));
+
+    ScratchDir dir("patch-diff-string-fixup-limit");
+    const std::string& root = dir.path();
+    const std::string patch = root + "/p.gcpatch";
+    REQUIRE(write_dir(root + "/old", old_d));
+    REQUIRE(write_dir(root + "/new", new_d));
+    auto diff_refusal = [&](const std::string& limit, const std::string& log) {
+        const bool ran = run({GEOCODER_DIFF_BIN, root + "/old", root + "/new", "-o", patch, "--string-pairs-max", "0",
+                              "--string-fixup-bytes-max", limit}, log);
+        const std::vector<char> text = read_file(log);
+        return ran ? std::string() : std::string(text.begin(), text.end());
+    };
+    CHECK(diff_refusal("1", root + "/past.log").find("String fixups of addr_points.bin: more than the section's 1 bytes") !=
+          std::string::npos);
+    CHECK(!std::filesystem::exists(patch));
+    CHECK(diff_refusal("4294967296", root + "/option.log").find("--string-fixup-bytes-max takes 0 to 4294967295, not 4294967296") !=
+          std::string::npos);
+    CHECK(!std::filesystem::exists(patch));
 }
 
 // The second cell of each identity round trip lists only records the day
