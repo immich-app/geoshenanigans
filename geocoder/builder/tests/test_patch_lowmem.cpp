@@ -203,22 +203,79 @@ void put_cells(BuildDir& d, const std::string& prefix, const CellLists& lists) {
     d[prefix + "_entries.bin"] = entries;
 }
 
-// Street ways of two nodes each, named by names, in one geo cell; with the
-// identity sidecar (record i is entity i) for a diff's --identity.
-void put_named_ways(BuildDir& d, BuildDir& meta, const std::vector<uint32_t>& names) {
-    put_geo(d, {{0, {0}}}, static_cast<uint32_t>(names.size()));
+// Street ways of two nodes each, named by names, in one geo cell that lists
+// entity 0's way; with the identity sidecar for a diff's --identity: record i
+// is entity entities[i] (by default entity i), its nodes placed by its entity.
+void put_named_ways(BuildDir& d, BuildDir& meta, const std::vector<uint32_t>& names, std::vector<uint32_t> entities = {}) {
+    if (entities.empty())
+        for (uint32_t w = 0; w < names.size(); w++) entities.push_back(w);
+    const uint32_t first = static_cast<uint32_t>(std::find(entities.begin(), entities.end(), 0u) - entities.begin());
+    put_geo(d, {{0, {first}}}, static_cast<uint32_t>(names.size()));
     std::vector<char> ways, nodes, slots;
     for (uint32_t w = 0; w < names.size(); w++) {
         append(ways, 2 * w);
         append(ways, uint16_t{2});
         append(ways, uint16_t{0});
         append(ways, names[w]);
-        for (const double v : {47.0, 8.0, 47.001, 8.001}) append(nodes, static_cast<float>(v + w * 1e-5));
-        append(slots, w);
+        for (const double v : {47.0, 8.0, 47.001, 8.001}) append(nodes, static_cast<float>(v + entities[w] * 1e-5));
+        append(slots, entities[w]);
     }
     d["street_ways.bin"] = ways;
     d["street_nodes.bin"] = nodes;
     meta["street.slot.u32"] = slots;
+}
+
+// 2 × moved + kept street ways, record i entity i, and the new day's with
+// the first 2 × moved swapped in pairs: by the identity sidecars every even
+// one of those and the kept ways stay in order, and each odd one moves on
+// its own, so no codec queue grows with the moves (moves in one reversed run
+// would delete one long run of old ways, whose nodes --threads decodes
+// ahead). 100 address points lie on entity 0's way. Into old and new, and
+// their sidecars. An entity's name is its parity, so the street file
+// changes.
+void put_moved_ways(BuildDir& old_d, BuildDir& new_d, BuildDir& old_meta, BuildDir& new_meta, uint32_t moved, uint32_t kept) {
+    std::vector<uint32_t> entities, new_entities;
+    for (uint32_t w = 0; w < 2 * moved + kept; w++) {
+        entities.push_back(w);
+        new_entities.push_back(w < 2 * moved ? w ^ 1 : w);
+    }
+    auto names_of = [](const std::vector<uint32_t>& e) {
+        std::vector<uint32_t> names;
+        for (const uint32_t w : e) names.push_back(w % 2);
+        return names;
+    };
+    put_named_ways(old_d, old_meta, names_of(entities), entities);
+    put_named_ways(new_d, new_meta, names_of(new_entities), new_entities);
+    std::vector<Addr> addrs;
+    for (uint32_t i = 0; i < 100; i++) addrs.push_back({47.0f + static_cast<float>(i) * 1e-4f, {}});
+    put_addrs(old_d, addrs);
+    put_addrs(new_d, addrs);
+    std::vector<char>& points = new_d["addr_points.bin"];
+    for (size_t at = ADDR_POINT_PARENT_WAY_ID_OFF; at < points.size(); at += ADDR_POINT_STRIDE) put_at(points, at, 1u);
+}
+
+// n POIs, points without names, and the new day's with new ids: each record
+// goes as deleted and inserted, and the diff's secondary matching (by name
+// and category) pairs every old one with its new one; into old and new.
+void put_changed_pois(BuildDir& old_d, BuildDir& new_d, uint32_t n) {
+    std::vector<Poi> old_pois, new_pois;
+    for (uint32_t i = 0; i < n; i++) {
+        old_pois.push_back({i, {}});
+        new_pois.push_back({uint64_t{n} + i, {}});
+    }
+    put_pois(old_d, old_pois);
+    put_pois(new_d, new_pois);
+}
+
+// The secondary remap's head as the diff writes it, up to the POI records'
+// pair count: no street, address or interp pairs, then poi_pairs.
+std::vector<char> secondary_remap_head(uint32_t poi_pairs) {
+    std::vector<char> head;
+    for (const uint32_t w : {SECONDARY_REMAP_MARKER, 5u, static_cast<uint32_t>(PatchFileId::STREET_WAYS), 0u,
+                             static_cast<uint32_t>(PatchFileId::ADDR_POINTS), 0u, static_cast<uint32_t>(PatchFileId::INTERP_WAYS), 0u,
+                             static_cast<uint32_t>(PatchFileId::POI_RECORDS), poi_pairs})
+        append(head, w);
+    return head;
 }
 
 // A tool's log: exit status 0, and its output.
@@ -982,6 +1039,34 @@ TEST(patch_heap_stays_flat_as_record_runs_grow) {
     }, 200000).empty());
 }
 
+// n POIs that change and keep their relaxed key: n secondary-matched pairs,
+// which the patcher reads where they sit in the patch.
+TEST(patch_heap_stays_flat_as_records_move) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        BuildDir old_d, new_d;
+        put_changed_pois(old_d, new_d, n);
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        return patch_holds(c, secondary_remap_head(n), std::to_string(n) + " secondary-matched POIs");
+    }, 10000).empty());
+}
+
+// n street ways moved by the identity sidecars, with addresses on the
+// streets: the parent-id remap's street leg of n moved ways, which the
+// patcher reads where it sits in the patch as the street remap's pairs.
+// 200,000 ways kept in order (2.4 MB) fill --threads' codec rings at n as
+// at 10 n.
+TEST(patch_heap_stays_flat_as_streets_move) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        BuildDir old_d, new_d, old_meta, new_meta;
+        put_moved_ways(old_d, new_d, old_meta, new_meta, n, 200000);
+        if (std::string e = prepare(c, old_d, new_d, old_meta, new_meta); !e.empty()) return e;
+        // No admin pairs, then the street leg.
+        std::vector<char> legs;
+        for (const uint32_t w : {POI_PARENT_REMAP_MARKER, 0u, n}) append(legs, w);
+        return patch_holds(c, legs, std::to_string(n) + " moved street ways");
+    }, 10000).empty());
+}
+
 // The POI string tier in record order (GCPATCH v9): the new pool moves a name
 // out of sorted order (zoo cafe bank -> zoo bank cafe tea), so the tier's
 // diff sends new indices and a moved-string pair, and the encoded POI records
@@ -1695,6 +1780,66 @@ TEST(patch_refuses_cell_changes_out_of_order_and_a_second_or_foreign_delta) {
         {"foreign-geo-delta", insert_at(street_delta, head({GEO_ENTRY_DELTA_MARKER, poi, 0})), "Malformed geo entry delta for file 17"},
         {"second-cell-index-delta", insert_at(poi_delta, poi_delta_section), "Malformed cell index delta: a second one for poi_entries.bin"},
         {"foreign-cell-index-delta", insert_at(poi_delta, head({CELL_INDEX_DELTA_MARKER, 999, 0, 0})), "Malformed cell index delta for file 999"},
+    };
+    for (const Case& e : cases) {
+        std::vector<char> edited = raw;
+        e.edit(edited);
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// A file's secondary pairs out of order or with an old id twice, a second
+// list of them, and street pairs in the secondary remap as well as in the
+// parent-id remap's street leg are refused in every mode. The patch as made
+// (20 secondary-matched POIs, 20 moved street ways with addresses) applies.
+TEST(patch_refuses_remap_pairs_out_of_order_or_twice_and_street_pairs_in_both_remaps) {
+    ScratchDir dir("patch-remap-pairs");
+    BuildDir old_d, new_d, old_meta, new_meta;
+    put_moved_ways(old_d, new_d, old_meta, new_meta, 20, 0);
+    put_changed_pois(old_d, new_d, 20);
+    const LowMemCase c{dir.path(), "pairs"};
+    REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    std::vector<char> legs;
+    for (const uint32_t w : {POI_PARENT_REMAP_MARKER, 0u, 20u}) append(legs, w);
+    REQUIRE(find_once(raw, legs) != std::string::npos);
+    const size_t head = find_once(raw, secondary_remap_head(20));
+    REQUIRE(head != std::string::npos);
+    // Where the secondary remap's file count, its street pair count and the
+    // POIs' first pair sit, and where the section ends (the place nodes' empty
+    // list).
+    const size_t n_files = head + 4, street_pairs = head + 12, poi_pairs = head + 40, end = poi_pairs + 20 * 8 + 8;
+
+    using Edit = std::function<void(std::vector<char>&)>;
+    struct Case {
+        std::string name;
+        Edit edit;
+        std::string refusal;
+    };
+    const Case cases[] = {
+        {"out-of-order", [&](std::vector<char>& p) {
+             std::swap_ranges(p.begin() + poi_pairs, p.begin() + poi_pairs + 8, p.begin() + poi_pairs + 8);
+         }, "Malformed secondary remap"},
+        {"old-id-twice", [&](std::vector<char>& p) {
+             std::copy(p.begin() + poi_pairs, p.begin() + poi_pairs + 4, p.begin() + poi_pairs + 8);
+         }, "Malformed secondary remap"},
+        {"second-list", [&](std::vector<char>& p) {
+             put_at(p, n_files, 6u);
+             std::vector<char> list;
+             for (const uint32_t w : {static_cast<uint32_t>(PatchFileId::POI_RECORDS), 1u, 0u, 0u}) append(list, w);
+             p.insert(p.begin() + end, list.begin(), list.end());
+         }, "Malformed secondary remap: a second one for poi_records.bin"},
+        {"street-pairs-in-both", [&](std::vector<char>& p) {
+             put_at(p, street_pairs, 1u);
+             std::vector<char> pair;
+             for (const uint32_t w : {0u, 1u}) append(pair, w);
+             p.insert(p.begin() + street_pairs + 4, pair.begin(), pair.end());
+         }, "Malformed secondary remap: street_ways.bin's moved pairs came in the POI parent-id remap already"},
     };
     for (const Case& e : cases) {
         std::vector<char> edited = raw;
