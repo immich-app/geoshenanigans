@@ -518,6 +518,20 @@ TEST(patch_round_trip_keeps_the_place_ids_of_unchanged_place_nodes) {
     CHECK(round_trip(old_d, new_d).mismatches.empty());
 }
 
+// An admin, POI or place cell index in dirs that hold none of its records
+// (admin polygons, POI records, place nodes) still comes as a cell index
+// delta, which the patcher needs to rebuild it: a cell's list changes and a
+// cell is added.
+TEST(patch_round_trip_rebuilds_a_cell_index_without_its_records) {
+    for (const std::string prefix : {"admin", "poi", "place"}) {
+        BuildDir old_d, new_d;
+        std::tie(old_d[prefix + "_cells.bin"], old_d[prefix + "_entries.bin"]) = write_cell_lists({{CELL, {0, 1}}});
+        std::tie(new_d[prefix + "_cells.bin"], new_d[prefix + "_entries.bin"]) = write_cell_lists({{CELL, {0, 2}}, {CELL_2, {1}}});
+
+        CHECK(round_trip(old_d, new_d).mismatches.empty());
+    }
+}
+
 // The second cell of each identity round trip lists only records the day
 // kept, so no correction rebuilds it: the derived remaps (MATCH, REPLACE and
 // the moved pairs) alone must give its new lists. The logged identity stats
