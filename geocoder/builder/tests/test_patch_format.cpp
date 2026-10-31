@@ -346,9 +346,9 @@ TEST(patch_format_section_marker_values) {
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v10 = no entry corrections (a cell index delta for
-    // every admin / POI / place index). The patcher accepts this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(10));
+    // diff/patch tools. v11 = remap pairs ascending by old id, each file's
+    // street pairs in one section. The patcher accepts this version only.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(11));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
@@ -2385,20 +2385,18 @@ TEST(patch_format_longest_increasing_subsequence) {
 
 // --- record id remap ---
 
-TEST(patch_format_record_remap_matches_and_secondary_pairs) {
-    // MATCH runs map kept records; unmatched ones map to NONE; a secondary
-    // match overrides (the last one for an id wins); ids past the old file
-    // and pairs for them are ignored.
+TEST(patch_format_record_remap_matches_and_moved_pairs) {
+    // MATCH runs map kept records; unmatched ones map to NONE; a moved
+    // record's pair overrides the runs; ids past the old file and pairs for
+    // them map to nothing.
     RecordRemap rm(10, scratch_tables());
     rm.add_match(0, 0, 3);    // 0..2 → 0..2
     rm.add_match(3, 3, 1);    // extends the run
     rm.add_match(6, 9, 10);   // 6..9 → 9..12, clipped at the old size
     rm.finish_runs();
-    rm.add_pair(4, 50);
-    rm.add_pair(1, 60);
-    rm.add_pair(1, 61);
-    rm.add_pair(12, 7);
-    rm.finish();
+    const std::vector<char> pairs = pair_bytes({{1, 61}, {4, 50}, {12, 7}});
+    rm.set_pairs(pair_table(pairs));
+    CHECK(rm.has_pairs());
     CHECK_EQ(rm.run_count(), size_t(2));
     const uint32_t N = RecordRemap::NONE;
     const std::vector<uint32_t> want = {0, 61, 2, 3, 50, N, 9, 10, 11, 12};
@@ -2415,9 +2413,8 @@ TEST(patch_format_record_remap_lookup_with_a_hint_matches_the_index) {
     rm.add_match(12, 20, 8);
     rm.add_match(30, 2, 3);
     rm.finish_runs();
-    rm.add_pair(3, 99);
-    rm.add_pair(25, 7);
-    rm.finish();
+    const std::vector<char> pairs = pair_bytes({{3, 99}, {25, 7}});
+    rm.set_pairs(pair_table(pairs));
     CHECK(!rm.empty());
     for (size_t start : {size_t(0), size_t(1), size_t(2), size_t(50)}) {
         size_t hint = start, back = start;

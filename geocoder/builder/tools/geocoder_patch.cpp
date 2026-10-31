@@ -517,6 +517,15 @@ static int run(int argc, char* argv[]) {
         const std::optional<RemapPair> p = t.find(old_id);
         return p ? p->to : old_id;
     };
+    // The section that gave the street ways' moved pairs, the parent-id
+    // remap's street leg or the secondary remap: a patch gives them in one.
+    const char* street_pairs_from = nullptr;
+    auto take_street_pairs = [&](const char* section) {
+        if (street_pairs_from)
+            throw std::runtime_error(std::string("Malformed ") + section + ": street_ways.bin's moved pairs came in the " +
+                                     street_pairs_from + " already");
+        street_pairs_from = section;
+    };
 
     // Where each replayed file's merge sequence sits in the patch (v8 side
     // files replay along it).
@@ -578,19 +587,19 @@ static int run(int argc, char* argv[]) {
             continue;
         }
         if (file_id == SECONDARY_REMAP_MARKER) {
-            // Secondary matches extend the remap of a file already replayed
-            // (the diff emits them after the merges); a file sent unchanged
-            // has no remap and keeps its ids.
+            // Secondary matches complete the remap of a file already replayed
+            // (the diff emits them after the merges), read where they sit; a
+            // file sent unchanged has no remap and keeps its ids.
             uint32_t nf = patch.u32();
             for (uint32_t f = 0; f < nf; f++) {
                 uint32_t fid = patch.u32(), np = patch.u32();
-                const char* pairs = patch.take_items(np, 8, "secondary remap");
+                SortedTable<RemapPair> pairs(patch.take_items(np, sizeof(RemapPair), "secondary remap"), np, "secondary remap");
+                if (np > 0 && fid == (uint32_t)PatchFileId::STREET_WAYS) take_street_pairs("secondary remap");
                 auto it = record_remaps.find(fid);
-                for (uint32_t i = 0; i < np; i++) {
-                    uint32_t o, n;
-                    memcpy(&o, pairs + (size_t)i * 8, 4);
-                    memcpy(&n, pairs + (size_t)i * 8 + 4, 4);
-                    if (it != record_remaps.end()) it->second.add_pair(o, n);
+                if (np > 0 && it != record_remaps.end()) {
+                    if (it->second.has_pairs())
+                        throw std::runtime_error(std::string("Malformed secondary remap: a second one for ") + patch_file_names[fid]);
+                    it->second.set_pairs(std::move(pairs));
                 }
                 std::cerr << "  Secondary remap " << fid << ": " << np << " pairs" << std::endl;
             }
@@ -598,6 +607,7 @@ static int run(int argc, char* argv[]) {
         }
         if (file_id == POI_PARENT_REMAP_MARKER) {
             ParentIdRemap r = parse_parent_id_remap(P, patch_size, pos);
+            if (!r.street.empty()) take_street_pairs("POI parent-id remap");
             poi_admin_remap = std::move(r.admin);
             poi_street_remap = std::move(r.street);
             std::cerr << "  POI parent-id remap: admin_pairs=" << poi_admin_remap.size()
@@ -1113,12 +1123,9 @@ static int run(int argc, char* argv[]) {
         if (jc) close_joint_child(jc, fname);
 
         if (track) remap.finish_runs();
-        if (track && file_id == (uint32_t)PatchFileId::STREET_WAYS) {
-            // The moved ways' pairs (parent-id remap, street leg) complete
-            // the street remap the address replay reads.
-            poi_street_remap.for_each([&](RemapPair p) { remap.add_pair(p.from, p.to); });
-            remap.finish();
-        }
+        // The moved ways' pairs (parent-id remap, street leg) complete the
+        // street remap the address replay reads.
+        if (track && file_id == (uint32_t)PatchFileId::STREET_WAYS) remap.set_pairs(poi_street_remap);
         if (track) {
             std::cerr << "  " << fname << ": " << written << " bytes (remap of " << n_old_records << " records, "
                       << remap.run_count() << " runs)" << section_io() << std::endl;
@@ -1145,7 +1152,6 @@ static int run(int argc, char* argv[]) {
         std::cerr << "Entry pipeline (lean streaming)..." << std::endl;
 
         // A file sent unchanged has no remap: its ids keep their values.
-        for (auto& kv : record_remaps) kv.second.finish();
         const RecordRemap no_remap;
         auto remap_of = [&](PatchFileId fid) -> const RecordRemap& {
             auto it = record_remaps.find((uint32_t)fid);

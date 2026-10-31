@@ -195,7 +195,7 @@ for planet/poi/all's 12.8M.
 1. Decompress zstd
 2. Read the strings section → rebuild each shipped tier from the dir's own old tier + additions/deletions in one walk, which also derives its remap runs and hashes the old tier as it reads it and the new one as it writes it (a stale old tier is named as such even when the edit doesn't fit it); take the sent runs of unshipped tiers and the moved-string pairs as they come
 3. For each data file: apply string remap + offset fixups to old, replay merge sequence → output file, track ID mapping from MATCH ops
-4. Read secondary ID remaps → merge into derived ID mappings
+4. Read secondary ID remaps → each replayed file's moved pairs, read where they sit, beside its derived ID mappings
 5. Read cell changes (added/removed cell IDs) and the per-cell entry deltas
 6. Rebuild geo_cells and the street / addr / interp entry files in one pass over the old geo index: each cell's lists with their IDs remapped, corrected by the cell's delta
 7. Rebuild the admin / POI / place cell indexes from their ID remaps + cell changes, corrected by the Cell Index Delta
@@ -315,7 +315,7 @@ v8 data patch that day; applying the delta also needs memory for the whole
 old file (1.0 GB for poi.fst). Rebuilding costs no download and two to three
 and a half minutes of one core.
 
-## Patch Format (.gcpatch, version 10)
+## Patch Format (.gcpatch, version 11)
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
 pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
@@ -325,9 +325,9 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=10 (u32) + flags=0 (u32)
-  (a v10 patcher accepts only v10 patches; the v8, v9 and v10 changes are
-  marked below)
+Header: "GCPATCH\0" (8) + version=11 (u32) + flags=0 (u32)
+  (a v11 patcher accepts only v11 patches; the v8 to v11 changes are marked
+  below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   + n × {name_len:u16, name, size:u64, inline:u8, [bytes] if inline}
@@ -372,7 +372,9 @@ Parent-id remap: marker 0xFFFFFFF3 (u32)
   moved and secondary-matched ones; the patcher derives the rest of the
   street remap from the street_ways replay)
   Each leg ascending by old, each id once. The patcher reads the legs where
-  they sit and refuses one out of order.
+  they sit and refuses one out of order. (v11) The street leg is the street
+  remap's pairs as it sits, and a patch whose secondary remap gives
+  street_ways pairs as well is refused.
 
 Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64) + ...
   (the patcher refuses an old file of another size, 0 meaning absent)
@@ -425,6 +427,10 @@ Secondary ID Remap: marker 0xFFFFFFF6 (u32) + n_files (u32)
   Recovers old→new mappings for modified records (matched by relaxed key)
   (v8: the street_ways list is empty when its pairs went in the parent-id
   remap)
+  (v11) Each file's pairs ascending by old_id, each id once. The patcher
+  reads them where they sit as the file's remap pairs and refuses a list out
+  of order, a second list with pairs for a file, and street_ways pairs when
+  the parent-id remap's street leg has some.
 
 Geo Entry Deltas (street / addr / interp entries): marker 0xFFFFFFF0 (u32)
   + file_id (u32) + count (u32), then per cell in cell order:

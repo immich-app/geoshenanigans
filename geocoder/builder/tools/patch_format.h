@@ -191,7 +191,11 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // v10: no entry corrections. Every admin / POI / place cell index the old dir
 // holds or the new one lists comes as a cell index delta, and the diff refuses
 // a new index the patcher couldn't rebuild byte for byte.
-static constexpr uint32_t GCPATCH_VERSION = 10;
+// v11: each file's secondary remap pairs come ascending by old id, each id
+// once, and the street ways' moved pairs come in the parent-id remap or the
+// secondary remap, never both, so the patcher reads every remap pair where it
+// sits in the patch.
+static constexpr uint32_t GCPATCH_VERSION = 11;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -364,6 +368,10 @@ static constexpr EntriesFiles CELL_INDEX_ENTRIES_FILES = {PatchFileId::ADMIN_ENT
 // Both diff and patch tools must apply these to their derived remaps for consistent results.
 // Format: marker(4), n_files(4),
 //   for each: file_id(4), n_pairs(4), [(old_id:u32, new_id:u32)] × n_pairs
+// Each file's pairs ascending by old_id, each id once (v11); the patcher
+// reads them where they sit and refuses a file's pairs out of order or given
+// twice, and street_ways pairs when the parent-id remap's street leg has
+// some.
 static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 
 // The strings section, read by position right after the old file sizes
@@ -1524,13 +1532,14 @@ private:
 // --- Record id remap (patcher) ---
 
 // Old → new record ids of a replayed data file: the MATCH runs of its merge
-// sequence plus the diff's secondary matches. Strategy-2 slots keep these
+// sequence plus the moved records' pairs (the diff's secondary matches, or
+// the street leg of the parent-id remap). Strategy-2 slots keep these
 // to long runs of one shift: a few MB where the patcher used to write a
 // 4-byte-per-record scratch file (~1 GB for planet/full) and read it at
 // random from the entry pipeline, page-cache thrash on a 1 GiB client. The
-// runs spill to a ScratchTable as the replay makes them, so a reorder day's
-// many cost the heap nothing; lookups start once finish_runs() has mapped
-// them.
+// runs spill to a ScratchTable as the replay makes them, and the pairs are
+// read where they sit in the patch, so a reorder day's many cost the heap
+// nothing; lookups start once finish_runs() has mapped the runs.
 class RecordRemap {
 public:
     static constexpr uint32_t NONE = 0xFFFFFFFFu;
@@ -1557,18 +1566,10 @@ public:
         open_ = {};
         runs_.finish();
     }
-    // A secondary match: old_id now maps to new_id; the last one for an id wins.
-    void add_pair(uint32_t old_id, uint32_t new_id) {
-        if (old_id < n_old_) pairs_.push_back({old_id, new_id});
-    }
-    void finish() {
-        std::stable_sort(pairs_.begin(), pairs_.end(),
-                         [](const auto& a, const auto& b) { return a.first < b.first; });
-        std::vector<std::pair<uint32_t, uint32_t>> last;
-        for (size_t i = 0; i < pairs_.size(); i++)
-            if (i + 1 == pairs_.size() || pairs_[i + 1].first != pairs_[i].first) last.push_back(pairs_[i]);
-        pairs_.swap(last);
-    }
+    // The moved records: each pair's old id maps to its new id, whatever
+    // the runs say. Ids past the old file map to nothing.
+    void set_pairs(SortedTable<RemapPair> pairs) { pairs_ = std::move(pairs); }
+    bool has_pairs() const { return !pairs_.empty(); }
 
     size_t size() const { return n_old_; }
     size_t run_count() const { return runs_.size() + (open_.count > 0); }
@@ -1577,22 +1578,14 @@ public:
     // run or the next (spatially sorted references) skip the search.
     uint32_t lookup(uint32_t o, size_t& hint) const {
         if (o >= n_old_) return NONE;
-        if (!pairs_.empty()) {
-            auto p = std::lower_bound(pairs_.begin(), pairs_.end(), std::make_pair(o, 0u),
-                                      [](const auto& a, const auto& b) { return a.first < b.first; });
-            if (p != pairs_.end() && p->first == o) return p->second;
-        }
+        if (const std::optional<RemapPair> p = pairs_.find(o)) return p->to;
         return through_run(o, runs_.table().floor(o, hint));
     }
     // The new id of old record `old`, or NONE when it wasn't kept.
     uint32_t operator[](size_t old) const {
         if (old >= n_old_) return NONE;
-        uint32_t o = static_cast<uint32_t>(old);
-        if (!pairs_.empty()) {
-            auto p = std::lower_bound(pairs_.begin(), pairs_.end(), std::make_pair(o, 0u),
-                                      [](const auto& a, const auto& b) { return a.first < b.first; });
-            if (p != pairs_.end() && p->first == o) return p->second;
-        }
+        const uint32_t o = static_cast<uint32_t>(old);
+        if (const std::optional<RemapPair> p = pairs_.find(o)) return p->to;
         return through_run(o, runs_.table().floor(o));
     }
 
@@ -1609,7 +1602,7 @@ private:
     uint32_t n_old_ = 0;
     Run open_{0, 0, 0};  // the run the replay may still extend
     ScratchTable<Run> runs_;
-    std::vector<std::pair<uint32_t, uint32_t>> pairs_;
+    SortedTable<RemapPair> pairs_;
 };
 
 // --- Varint encoding for delta-compressed fixup tables and string runs ---
