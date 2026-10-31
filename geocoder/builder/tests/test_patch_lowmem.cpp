@@ -2024,6 +2024,91 @@ TEST(patch_refuses_string_fixups_on_a_deleted_record_left_over_or_in_a_child_str
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
+// Offset fixups the replay never reaches, refused in every mode. Ten POIs
+// with blocks, POI 4's a vertex longer on the new day, so the POI merge
+// shifts the later POIs' vertex_offset in a run of offset fixups; the merge
+// given
+//   value: a value for record 10, past the old file's records,
+//   run: a run 1000 records past the last one,
+//   byte: a byte past the last run,
+//   child: a byte in the runs of the POI vertices' merge, without a run (a
+//     file without offset fields, which the low-memory mode replays as the
+//     POIs' child stream).
+// The patch as made applies.
+TEST(patch_refuses_offset_fixups_left_over_or_in_a_child_stream) {
+    ScratchDir dir("patch-offset-fixups");
+    std::mt19937 rng(20261031);
+    const std::vector<Poi> pois = pois_of(rng, 10, 3, false);
+    std::vector<Poi> grown = pois;
+    grown[4].block.insert(grown[4].block.end(), {1, 2, 3, 4});
+    BuildDir old_d, new_d;
+    put_pois(old_d, pois);
+    put_pois(new_d, grown);
+    const LowMemCase c{dir.path(), "offsets"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    auto u32_at = [&](size_t p) { uint32_t v; memcpy(&v, raw.data() + p, 4); return v; };
+    // A merge section by its head: file, stride, old and new size. Its offset
+    // fixups' run and value counts and sizes follow, then the runs and values.
+    auto merge_at = [&](PatchFileId fid, uint32_t stride, uint64_t old_size, uint64_t new_size) {
+        std::vector<char> head;
+        append(head, static_cast<uint32_t>(fid));
+        append(head, stride);
+        append(head, old_size);
+        append(head, new_size);
+        return find_once(raw, head);
+    };
+    const size_t records =
+        merge_at(PatchFileId::POI_RECORDS, static_cast<uint32_t>(POI_RECORD_STRIDE), 10 * POI_RECORD_STRIDE, 10 * POI_RECORD_STRIDE);
+    REQUIRE(records != std::string::npos);
+    REQUIRE(u32_at(records + 24) >= 1);   // runs
+    REQUIRE(u32_at(records + 28) == 0);   // values
+    const size_t vertices = merge_at(PatchFileId::POI_VERTICES, 1, 10 * 22, 10 * 22 + 4);
+    REQUIRE(vertices != std::string::npos);
+    // bytes after the last of a section's runs or values, counted as one
+    // fixup more or not.
+    enum Stream { RUNS, VALUES };
+    auto add = [](std::vector<char>& p, size_t section, Stream stream, const std::vector<char>& bytes, bool counted) {
+        uint32_t count, size, runs_size;
+        const size_t count_at = section + 24 + 4 * stream, size_at = section + 32 + 4 * stream;
+        memcpy(&count, p.data() + count_at, 4);
+        memcpy(&size, p.data() + size_at, 4);
+        memcpy(&runs_size, p.data() + section + 32, 4);
+        const size_t end = section + 40 + runs_size + (stream == VALUES ? size : 0);
+        if (counted) put_at(p, count_at, count + 1);
+        put_at(p, size_at, static_cast<uint32_t>(size + bytes.size()));
+        p.insert(p.begin() + static_cast<std::ptrdiff_t>(end), bytes.begin(), bytes.end());
+    };
+
+    using Edit = std::function<void(std::vector<char>&)>;
+    struct Case {
+        std::string name;
+        Edit edit;
+        std::vector<std::string> modes;
+        std::string refusal;
+    };
+    // A value: record 10 (from record 0), offset 0. A run: 1000 records skipped
+    // (varint E8 07), one record, no change of the shift.
+    const Case cases[] = {
+        {"value", [&](std::vector<char>& p) { add(p, records, VALUES, {10, 0}, true); }, ALL_MODES, "Malformed offset fixups"},
+        {"run", [&](std::vector<char>& p) { add(p, records, RUNS, {'\xE8', 7, 1, 0}, true); }, ALL_MODES, "Malformed offset fixups"},
+        {"byte", [&](std::vector<char>& p) { add(p, records, RUNS, {0}, false); }, ALL_MODES, "Malformed offset fixups"},
+        {"child", [&](std::vector<char>& p) { add(p, vertices, RUNS, {0}, false); }, {"plain"}, "Malformed offset fixups"},
+        {"child", [&](std::vector<char>& p) { add(p, vertices, RUNS, {0}, false); }, ENCODED_MODES,
+         "Encoded set: a child stream with offset fixups"},
+    };
+    for (const Case& e : cases) {
+        std::vector<char> edited = raw;
+        e.edit(edited);
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, e.modes, patch, e.name, e.refusal).empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
 // A stale old core tier, which the patcher reads before anything checks it:
 // with a letter changed, or with a NUL lost so that the old pool holds one
 // string fewer and the edit's last deleted index lies past it, it's refused in
