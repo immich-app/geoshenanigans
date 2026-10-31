@@ -2323,6 +2323,58 @@ TEST(patch_format_strings_section_refuses_moved_strings_out_of_order_or_twice) {
     }
 }
 
+TEST(patch_format_strings_section_sends_no_pair_past_its_cap) {
+    // One shipped tier "a b c" → "c b a" (indexed): its edit keeps "c", and
+    // "a" and "b" leave it as two pairs. Under a cap of 2 they are sent; under
+    // a cap of 1 neither is, and both come back unsent, ascending: the
+    // patcher's remap then keeps their old offsets, which the merges' string
+    // fixups give new values.
+    const std::string o = pool_in_order({"a", "b", "c"}), n = pool_in_order({"c", "b", "a"});
+    std::array<StringTierPools, STRING_TIER_COUNT> tiers{};
+    tiers[0] = {o.data(), o.size(), n.data(), n.size()};
+    const std::vector<std::pair<uint32_t, uint32_t>> moved = {{0, 4}, {2, 2}, {4, 0}};
+    std::vector<char> sent, unsent;
+    const StringsSectionStats at_cap = append_strings_section(sent, tiers, 1, 0, moved, 2);
+    const StringsSectionStats past_cap = append_strings_section(unsent, tiers, 1, 0, moved, 1);
+    CHECK_EQ(at_cap.n_pairs, 2u);
+    CHECK(at_cap.unsent_pairs.empty());
+    CHECK_EQ(past_cap.n_pairs, 0u);
+    const std::vector<std::pair<uint32_t, uint32_t>> a_and_b = {{0, 4}, {2, 2}};
+    CHECK(past_cap.unsent_pairs == a_and_b);
+    CHECK_EQ(unsent.size(), sent.size() - 2 * sizeof(RemapPair));
+    for (const auto& [buf, a, b] : {std::tuple{&sent, 4u, 2u}, std::tuple{&unsent, 0u, 2u}}) {
+        size_t pos = 0;
+        const StringsSection s = parse_strings_section(buf->data(), buf->size(), pos);
+        StringRemap remap(scratch_tables());
+        load_string_remap(s, remap, [&](int t) { CHECK(rebuild(o, s.edits[t], s.place(t), remap).pool == n); });
+        CHECK_EQ(remap.lookup(0), a);
+        CHECK_EQ(remap.lookup(2), b);
+        CHECK_EQ(remap.lookup(4), 0u);
+    }
+}
+
+TEST(patch_format_strings_section_refuses_more_pairs_than_its_cap) {
+    // A section of no tier and STRING_PAIRS_MAX pairs parses; one more is
+    // refused before the pairs are read.
+    std::vector<char> buf;
+    std::array<StringTierPools, STRING_TIER_COUNT> none{};
+    append_strings_section(buf, none, 0, 0, std::vector<std::pair<uint32_t, uint32_t>>());
+    buf.resize(buf.size() - 4);
+    auto with_pairs = [&](uint32_t n) {
+        std::vector<char> b = buf;
+        b.insert(b.end(), reinterpret_cast<const char*>(&n), reinterpret_cast<const char*>(&n) + 4);
+        for (uint32_t i = 0; i < n; i++)
+            for (const uint32_t w : {2 * i, 2 * i + 1}) b.insert(b.end(), reinterpret_cast<const char*>(&w), reinterpret_cast<const char*>(&w) + 4);
+        return b;
+    };
+    auto parses = [](const std::vector<char>& b) {
+        size_t pos = 0;
+        return refusal_of([&] { parse_strings_section(b.data(), b.size(), pos); });
+    };
+    CHECK_EQ(parses(with_pairs(STRING_PAIRS_MAX)), std::string());
+    CHECK_EQ(parses(with_pairs(STRING_PAIRS_MAX + 1)), std::string("Malformed strings section"));
+}
+
 TEST(patch_format_strings_section_rejects_bad_masks) {
     std::vector<char> buf;
     std::array<StringTierPools, STRING_TIER_COUNT> none{};

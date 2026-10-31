@@ -197,7 +197,9 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // sits in the patch.
 // v12: every merge section carries string fixups after its offset fixups,
 // the new values of the string fields of its MATCH records that the patcher's
-// string remap would leave wrong, read in record order.
+// string remap would leave wrong, read in record order. The strings section
+// carries at most STRING_PAIRS_MAX moved-string pairs: a patch that moves more
+// strings sends none, and fixups instead.
 static constexpr uint32_t GCPATCH_VERSION = 12;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
@@ -401,7 +403,9 @@ static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 //           (encode_string_tier_runs),
 //   n_pairs u32, (old u32, new u32) × n_pairs: surviving strings no tier's
 //     edit keeps, which changed tier or order (ascending by old, each string
-//     once), for every old tier the dir ships or references.
+//     once), for every old tier the dir ships or references; at most
+//     STRING_PAIRS_MAX. With more, n_pairs is 0 and the records that hold
+//     them carry their new values (string fixups, StringFixupReader).
 // The patcher reads every list where it sits in the patch.
 // A tier neither shipped nor referenced sends nothing: no lookup lands in it.
 static constexpr uint32_t STRINGS_TIERED_MARKER = 0xFFFFFFF6;
@@ -883,6 +887,11 @@ static constexpr size_t SCRATCH_TABLE_BUF = 64 << 10;
 // most this (a longer string goes alone), and hashes and gives back its old
 // pool in steps of at least this: 64 KiB.
 static constexpr size_t STRING_WALK_PIECE = 64 << 10;
+// The most moved-string pairs a strings section carries (512 KiB of them),
+// which the patcher looks up at random where they sit. A normal day moves a
+// few hundred strings; a day that moves more sends them as string fixups,
+// which the replays read in record order.
+static constexpr uint32_t STRING_PAIRS_MAX = 65536;
 
 // n fixed-width records read where they sit, sorted strictly ascending by
 // the u32 each starts with. The constructor checks the order in one sweep,
@@ -2039,10 +2048,13 @@ struct StringTierPools {
     size_t new_size = 0;
 };
 
-// What append_strings_section wrote, for the diff's log.
+// What append_strings_section wrote, for the diff's log, and the moved
+// strings it didn't send as pairs (more than its cap), ascending by old: the
+// records that hold them carry their new values as string fixups.
 struct StringsSectionStats {
     uint32_t sent = 0, n_pairs = 0;
     std::array<uint32_t, STRING_TIER_COUNT> n_added{}, n_deleted{}, n_runs{}, runs_bytes{};
+    std::vector<std::pair<uint32_t, uint32_t>> unsent_pairs;
 };
 
 // The tiers that hold strings but aren't shipped: the only ones whose runs
@@ -2060,11 +2072,13 @@ inline uint32_t unshipped_string_tiers(const std::array<StringTierPools, STRING_
 // such as the diff's per-string remap); the tiers' edits are made from it, so
 // a survivor it misses is deleted and added. Each tier the dir looks up keeps
 // what its edit can (kept_strings); the other survivors out of it, which
-// changed tier or order, are sent as pairs.
+// changed tier or order, are sent as pairs, unless there are more than
+// pairs_max of them: then none is, and they come back as unsent_pairs.
 template <typename Moved>
 StringsSectionStats append_strings_section(std::vector<char>& out,
                                            const std::array<StringTierPools, STRING_TIER_COUNT>& tiers,
-                                           uint32_t shipped, uint32_t referenced, const Moved& moved) {
+                                           uint32_t shipped, uint32_t referenced, const Moved& moved,
+                                           uint32_t pairs_max = STRING_PAIRS_MAX) {
     auto put = [&](const void* p, size_t n) { out.insert(out.end(), (const char*)p, (const char*)p + n); };
     std::array<uint32_t, STRING_TIER_COUNT + 1> old_base{}, new_base{};
     for (int t = 0; t < STRING_TIER_COUNT; t++) {
@@ -2127,6 +2141,7 @@ StringsSectionStats append_strings_section(std::vector<char>& out,
     }
 
     std::sort(pairs.begin(), pairs.end());
+    if (pairs.size() > pairs_max) stats.unsent_pairs.swap(pairs);
     stats.n_pairs = static_cast<uint32_t>(pairs.size());
     put(&stats.n_pairs, 4);
     for (const auto& [og, ng] : pairs) { put(&og, 4); put(&ng, 4); }
@@ -2183,6 +2198,7 @@ inline StringsSection parse_strings_section(const char* data, size_t size, size_
         if (s.shipped >> t & 1) s.edits[t] = parse_string_tier_edit(data, size, pos);
     }
     const uint32_t n_pairs = in.u32();
+    if (n_pairs > STRING_PAIRS_MAX) in.malformed();
     s.pairs = SortedTable<RemapPair>(in.take_items(n_pairs, sizeof(RemapPair)), n_pairs, "strings section");
     return s;
 }

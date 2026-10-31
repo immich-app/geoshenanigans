@@ -183,8 +183,8 @@ for planet/poi/all's 12.8M.
 
 **Diff tool:**
 1. Build string-level diff (per tier, keep the longest run of common strings in the same order, every one of them in a sorted tier; emit the other old strings as deleted and the other new ones as added, with their new index unless the new tier is sorted)
-2. Build string remap (old string pool offsets → new, derived from string diff)
-3. For each data file: apply string remap to old, match records by content hash (for ways/admin: also fix node_offset/vertex_offset fields), build merge sequence (MATCH/INSERT/DELETE at record stride)
+2. Build string remap (old string pool offsets → new, derived from string diff); the surviving strings no tier's edit keeps go as pairs, at most 65,536 of them (v12: with more, none does, and step 3 sends their values)
+3. For each data file: apply string remap to old, match records by content hash (for ways/admin: also fix node_offset/vertex_offset fields), build merge sequence (MATCH/INSERT/DELETE at record stride); past the pairs' cap, the MATCH records' fields that hold a moved string go as string fixups, and the side files' values that hold one as changes
 4. For coordinate files (nodes/vertices): derive merge from parent way/polygon merge — verify node blocks match before COPY, INSERT if nodes changed
 5. Derive ID remaps from merge sequences (MATCH ops define old→new record correspondence)
 6. **Secondary matching**: For DELETE/INSERT records in merge sequences, match by relaxed key (name + node_count for ways, street + housenumber for addrs, etc.) to recover ID mappings for modified-but-same-entity records
@@ -193,7 +193,7 @@ for planet/poi/all's 12.8M.
 
 **Patch tool:**
 1. Decompress zstd
-2. Read the strings section → rebuild each shipped tier from the dir's own old tier + additions/deletions in one walk, which also derives its remap runs and hashes the old tier as it reads it and the new one as it writes it (a stale old tier is named as such even when the edit doesn't fit it); take the sent runs of unshipped tiers and the moved-string pairs as they come
+2. Read the strings section → rebuild each shipped tier from the dir's own old tier + additions/deletions in one walk, which also derives its remap runs and hashes the old tier as it reads it and the new one as it writes it (a stale old tier is named as such even when the edit doesn't fit it); take the sent runs of unshipped tiers and the moved-string pairs as they come (v12: past 65,536 moved strings the patch sends no pair, and the merge sections carry the moved strings' new values for the fields that hold them, read in record order)
 3. For each data file: apply string remap (or a string fixup) + offset fixups to old, replay merge sequence → output file, track ID mapping from MATCH ops
 4. Read secondary ID remaps → each replayed file's moved pairs, read where they sit, beside its derived ID mappings
 5. Read cell changes (added/removed cell IDs) and the per-cell entry deltas
@@ -363,7 +363,12 @@ Strings: marker 0xFFFFFFF6 (u32)
   strings no tier's edit keeps: they changed tier, or (v9) the POI tier's
   order moved them; out of a shipped or referenced tier; ascending by
   old_off, each string once. The patcher reads them where they sit and
-  refuses one out of order)
+  refuses one out of order) (v12) At most 65,536 (STRING_PAIRS_MAX), which
+  the patcher looks up at random; it refuses more. A patch that moves more
+  strings sends n_pairs 0, and the patcher's remap leaves their old offsets
+  as they were: the merge sections' string fixups give the MATCH records'
+  fields that hold them their new values, and the sparse and parallel deltas
+  send the side-file values that hold them as changes.
 
 Parent-id remap: marker 0xFFFFFFF3 (u32)
   + n_admin (u32) + [(old:u32, new:u32)] × n_admin
@@ -385,7 +390,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     way_postcodes, addr_postcodes, interp_postcodes), rebuilt along its
     parent's merge: parent_file_id u32, value_stride u32 = 4, remap_kind u32,
     n_inserted u32 + [value u32], n_changes u32 + [(pos u32, value u32)].
-    MATCH / REPLACE copy the old value (remapped), INSERT takes the next
+    MATCH / REPLACE copy the old value (remapped as the patcher remaps:
+    without the moved strings past the pairs' cap, v12), INSERT takes the next
     inserted value, DELETE skips one; then the changes overwrite positions
     of the new file. A parent sent unchanged counts as one MATCH.
   stride=0xFB: cell list delta for <name>_cells.bin + <name>_entries.bin
