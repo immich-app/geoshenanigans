@@ -161,17 +161,17 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 geocoder-patch's own memory doesn't grow with the data or the patch, in either mode. Three rules
 keep it so:
 
-- **Lists are ascending and read in place.** Every list in a patch is read where it sits in the
-  decompressed patch, which the patcher maps, and none is copied whole: the cell changes, each
-  string tier's edit, the moved-string pairs, the parent-id legs, the secondary remap pairs, the
-  cell list and geo entry deltas, the sparse and parallel deltas' changes, and the offset and
-  string fixups. Each is ascending, by the key the format below gives it, and the patcher
-  refuses one that steps back, except the offset fixups: it doesn't check their delta-coded
-  indices for a repeat or a 32-bit wrap. The lists it looks keys up in (the moved-string pairs,
-  the parent-id legs, the secondary remap) are searched where they sit (`SortedTable`: a binary
-  search narrowed by a directory of at most 4096 sampled keys, TABLE_DIRECTORY_KEYS, and a 4 KiB
-  key filter); the others are read once, front to back, as the walk or replay they serve
-  reaches them.
+- **Lists are ascending and read in place.** Every list in a patch that grows with the data is
+  read where it sits in the decompressed patch, which the patcher maps, and none is copied whole:
+  the cell changes, each string tier's edit, the moved-string pairs, the parent-id legs, the
+  secondary remap pairs, the cell list and geo entry deltas, the sparse and parallel deltas'
+  changes, and the offset and string fixups. Each is ascending, by the key the format below
+  gives it, and the patcher refuses one that steps back, except the offset fixups: it doesn't
+  check their delta-coded indices for a repeat or a 32-bit wrap. The lists it looks keys up in
+  (the moved-string pairs, the parent-id legs, the secondary remap) are searched where they sit
+  (`SortedTable`: a binary search narrowed by a directory of at most 4096 sampled keys,
+  TABLE_DIRECTORY_KEYS, and a 4 KiB key filter); the others are read once, front to back, as the
+  walk or replay they serve reaches them.
 - **Remap runs spill.** The string and record remap runs the patcher derives (from each string
   tier's walk and each file's replay) go through a 64 KiB buffer (SCRATCH_TABLE_BUF) to files in
   its scratch dir, 12 bytes a run, which it maps and searches like the lists above. One day of
