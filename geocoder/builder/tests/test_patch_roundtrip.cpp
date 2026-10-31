@@ -148,9 +148,10 @@ struct RoundTrip {
     std::string log;
 };
 
-// Diffs old -> new, applies the patch to old and compares the patched dir
-// with new. Prints the tools' log on a mismatch.
-RoundTrip round_trip(const BuildDir& old_files, const BuildDir& new_files, const Identity& identity = {}) {
+// Diffs old -> new (with diff_options), applies the patch to old and
+// compares the patched dir with new. Prints the tools' log on a mismatch.
+RoundTrip round_trip(const BuildDir& old_files, const BuildDir& new_files, const Identity& identity = {},
+                     const std::vector<std::string>& diff_options = {}) {
     ScratchDir dir("patch-roundtrip");
     const std::string old_dir = dir.path() + "/old", new_dir = dir.path() + "/new", out_dir = dir.path() + "/out";
     const std::string old_meta = dir.path() + "/old-meta", new_meta = dir.path() + "/new-meta";
@@ -158,6 +159,7 @@ RoundTrip round_trip(const BuildDir& old_files, const BuildDir& new_files, const
     const bool by_identity = !identity.old_keys.empty() || !identity.new_keys.empty();
     std::vector<std::string> diff = {GEOCODER_DIFF_BIN, old_dir, new_dir, "-o", patch};
     if (by_identity) diff.insert(diff.end(), {"--identity", old_meta, new_meta});
+    diff.insert(diff.end(), diff_options.begin(), diff_options.end());
     RoundTrip r;
     auto& bad = r.mismatches;
     if (!write_dir(old_dir, old_files) || !write_dir(new_dir, new_files) ||
@@ -530,6 +532,56 @@ TEST(patch_round_trip_rebuilds_a_cell_index_without_its_records) {
 
         CHECK(round_trip(old_d, new_d).mismatches.empty());
     }
+}
+
+// A postcode the new day moves to another tier, "10115" from the core tier to
+// the postcode tier, past the strings section's pairs (--string-pairs-max 0):
+// the patcher's string remap keeps its old offset. The address whose
+// housenumber names it, a MATCH record, takes its new offset as a string
+// fixup, and addr_postcodes (a parallel delta along the addresses, remap kind
+// 2) and postcode_centroids (a sparse delta, kind 3) take it as a change each.
+// With the pair sent instead, neither has a change. "A" moves within the core
+// tier (a run of the remap) and "20095" stays where it was.
+TEST(patch_round_trip_sends_moved_postcodes_past_the_pair_table_as_changes) {
+    constexpr uint32_t OLD_POSTCODE = 0, NEW_POSTCODE = 2, KEPT_POSTCODE = 8, OLD_NAME = 6, NEW_NAME = 0;
+    BuildDir old_d, new_d;
+    old_d["strings_core.bin"] = {'1', '0', '1', '1', '5', 0, 'A', 0};
+    new_d["strings_core.bin"] = {'A', 0};
+    old_d["strings_postcode.bin"] = {'2', '0', '0', '9', '5', 0};
+    new_d["strings_postcode.bin"] = {'1', '0', '1', '1', '5', 0, '2', '0', '0', '9', '5', 0};
+    old_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{{48.0f, 11.0f, OLD_NAME, OLD_NAME, NO_DATA, NO_DATA, 0},
+                                                               {48.1f, 11.0f, OLD_POSTCODE, OLD_NAME, NO_DATA, NO_DATA, 0},
+                                                               {48.2f, 11.0f, NO_DATA, NO_DATA, NO_DATA, NO_DATA, 0}});
+    new_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{{48.0f, 11.0f, NEW_NAME, NEW_NAME, NO_DATA, NO_DATA, 0},
+                                                               {48.1f, 11.0f, NEW_POSTCODE, NEW_NAME, NO_DATA, NO_DATA, 0},
+                                                               {48.2f, 11.0f, NO_DATA, NO_DATA, NO_DATA, NO_DATA, 0}});
+    old_d["addr_vertices.bin"] = new_d["addr_vertices.bin"] = {};
+    old_d["addr_postcodes.bin"] = bytes_of(std::vector<uint32_t>{OLD_POSTCODE, KEPT_POSTCODE, NO_DATA});
+    new_d["addr_postcodes.bin"] = bytes_of(std::vector<uint32_t>{NEW_POSTCODE, KEPT_POSTCODE, NO_DATA});
+    // lat, lng, postcode, country code and padding
+    auto centroids = [&](uint32_t moved) {
+        std::vector<char> out;
+        for (const auto& [lat, postcode] : {std::pair<float, uint32_t>{52.5f, moved}, {53.5f, KEPT_POSTCODE}}) {
+            append(out, lat);
+            append(out, 13.4f);
+            append(out, postcode);
+            append(out, uint32_t{'D' | 'E' << 8});
+        }
+        return out;
+    };
+    old_d["postcode_centroids.bin"] = centroids(OLD_POSTCODE);
+    new_d["postcode_centroids.bin"] = centroids(NEW_POSTCODE);
+
+    const RoundTrip fixed = round_trip(old_d, new_d, {}, {"--string-pairs-max", "0"});
+    CHECK(fixed.mismatches.empty());
+    CHECK(logged(fixed, "addr_points.bin: 1 string fixups ("));
+    CHECK(logged(fixed, "addr_postcodes.bin: parallel delta along addr_points.bin, 0 inserted, 1 changes"));
+    CHECK(logged(fixed, "postcode_centroids.bin: sparse delta 1 changes"));
+    const RoundTrip paired = round_trip(old_d, new_d);
+    CHECK(paired.mismatches.empty());
+    CHECK(!logged(paired, "string fixups"));
+    CHECK(logged(paired, "addr_postcodes.bin: parallel delta along addr_points.bin, 0 inserted, 0 changes"));
+    CHECK(logged(paired, "postcode_centroids.bin: sparse delta 0 changes"));
 }
 
 // The second cell of each identity round trip lists only records the day

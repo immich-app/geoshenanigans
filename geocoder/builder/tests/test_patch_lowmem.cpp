@@ -267,6 +267,59 @@ void put_changed_pois(BuildDir& old_d, BuildDir& new_d, uint32_t n) {
     put_pois(new_d, new_pois);
 }
 
+// n POIs, points, each named by a POI name of its own and without street or
+// postcode, and the POI string tier of their names, the new day's in reverse
+// order, every POI but `dropped` (if one is) kept; into old and new. The
+// tier's edit keeps the last name and moves the other n - 1, which leave it
+// as moved-string pairs or, past the strings section's cap, as the string
+// fixups of the POIs that keep them. n even: no name stays where it was.
+void put_reversed_poi_names(BuildDir& old_d, BuildDir& new_d, uint32_t n, std::optional<uint32_t> dropped = std::nullopt) {
+    constexpr uint32_t NAME = 12;  // "poi 0000000\0"
+    auto name = [](uint32_t i) {
+        char b[16];
+        std::snprintf(b, sizeof b, "poi %07u", i);
+        return std::string(b, NAME);
+    };
+    std::string old_pool, new_pool;
+    std::vector<Poi> old_pois, new_pois;
+    std::vector<uint32_t> old_names, new_names;
+    for (uint32_t i = 0; i < n; i++) {
+        old_pool += name(i);
+        new_pool += name(n - 1 - i);
+        old_pois.push_back({i, {}});
+        old_names.push_back(i * NAME);
+        if (dropped == i) continue;
+        new_pois.push_back({i, {}});
+        new_names.push_back((n - 1 - i) * NAME);
+    }
+    put_pois(old_d, old_pois, old_names);
+    put_pois(new_d, new_pois, new_names);
+    for (BuildDir* d : {&old_d, &new_d}) {
+        std::vector<char>& records = (*d)["poi_records.bin"];
+        for (size_t at = 0; at < records.size(); at += POI_RECORD_STRIDE) {
+            put_at(records, at + POI_RECORD_PARENT_STREET_ID_OFF, NO);
+            put_at(records, at + POI_RECORD_PARENT_POSTCODE_ID_OFF, NO);
+        }
+    }
+    old_d["strings_poi.bin"].assign(old_pool.begin(), old_pool.end());
+    new_d["strings_poi.bin"].assign(new_pool.begin(), new_pool.end());
+}
+
+// The diff options that send every moved string as a string fixup.
+const std::vector<std::string> NO_STRING_PAIRS = {"--string-pairs-max", "0"};
+
+// The head of a POI records merge section of old_n records to new_n without
+// offset fixups, up to its string fixups' count.
+std::vector<char> poi_merge_head(uint32_t old_n, uint32_t new_n, uint32_t string_fixups) {
+    std::vector<char> head;
+    append(head, static_cast<uint32_t>(PatchFileId::POI_RECORDS));
+    append(head, static_cast<uint32_t>(POI_RECORD_STRIDE));
+    append(head, uint64_t{old_n} * POI_RECORD_STRIDE);
+    append(head, uint64_t{new_n} * POI_RECORD_STRIDE);
+    for (const uint32_t w : {0u, 0u, 0u, 0u, string_fixups}) append(head, w);
+    return head;
+}
+
 // The secondary remap's head as the diff writes it, up to the POI records'
 // pair count: no street, address or interp pairs, then poi_pairs.
 std::vector<char> secondary_remap_head(uint32_t poi_pairs) {
@@ -336,16 +389,18 @@ struct LowMemCase {
     std::string log() const { return dir("log"); }
 };
 
-// Writes old and new (and their sidecars when given), diffs them, and
-// encodes both with geocoder-gc. Empty on success, else what failed.
+// Writes old and new (and their sidecars when given), diffs them (with
+// diff_options), and encodes both with geocoder-gc. Empty on success, else
+// what failed.
 std::string prepare(const LowMemCase& c, const BuildDir& old_d, const BuildDir& new_d, const BuildDir& old_meta = {},
-                    const BuildDir& new_meta = {}) {
+                    const BuildDir& new_meta = {}, const std::vector<std::string>& diff_options = {}) {
     if (!write_dir(c.dir("old"), old_d) || !write_dir(c.dir("new"), new_d)) return "fixture not written";
     std::vector<std::string> diff = {GEOCODER_DIFF_BIN, c.dir("old"), c.dir("new"), "-o", c.patch()};
     if (!old_meta.empty()) {
         if (!write_dir(c.dir("old-meta"), old_meta) || !write_dir(c.dir("new-meta"), new_meta)) return "sidecars not written";
         diff.insert(diff.end(), {"--identity", c.dir("old-meta"), c.dir("new-meta")});
     }
+    diff.insert(diff.end(), diff_options.begin(), diff_options.end());
     for (const auto& words : {diff, {GEOCODER_GC_BIN, "encode", c.dir("old"), c.dir("old.enc")},
                               {GEOCODER_GC_BIN, "encode", c.dir("new"), c.dir("new.enc")}}) {
         auto r = run_tool(words, c.log());
@@ -987,6 +1042,20 @@ TEST(patch_heap_stays_flat_as_strings_move) {
     }, 5000).empty());
 }
 
+// n POIs, each named by its own POI name, and the new day's names in reverse
+// order, sent past the strings section's pairs (--string-pairs-max 0): the
+// tier's edit moves n - 1 names, and the POI merge carries the n - 1 string
+// fixups of the POIs that keep them, which the patcher reads in record order
+// where they sit in the patch.
+TEST(patch_heap_stays_flat_as_strings_move_past_the_pair_table) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        BuildDir old_d, new_d;
+        put_reversed_poi_names(old_d, new_d, n);
+        if (std::string e = prepare(c, old_d, new_d, {}, {}, NO_STRING_PAIRS); !e.empty()) return e;
+        return patch_holds(c, poi_merge_head(n, n, n - 1), std::to_string(n - 1) + " POI name fixups");
+    }, 5000).empty());
+}
+
 // n strings in the core tier, which sorts, and the new day without every
 // second one: each string kept after the first moves by its own amount, so
 // the patcher derives n / 2 - 1 string remap runs, which it spills to its
@@ -1065,6 +1134,37 @@ TEST(patch_heap_stays_flat_as_streets_move) {
         for (const uint32_t w : {POI_PARENT_REMAP_MARKER, 0u, n}) append(legs, w);
         return patch_holds(c, legs, std::to_string(n) + " moved street ways");
     }, 10000).empty());
+}
+
+// The diff sends the moved strings as pairs up to its cap and as string
+// fixups past it (GCPATCH v12): 99 moved POI names go as 99 pairs under a cap
+// of 99, and as the POI merge's 99 string fixups, with no pair, under a cap of
+// 98. Both patches apply in every mode.
+TEST(patch_diff_sends_moved_strings_as_string_fixups_past_the_pair_cap) {
+    ScratchDir dir("lowmem-pair-cap");
+    constexpr uint32_t MOVED = 99;
+    BuildDir old_d, new_d;
+    put_reversed_poi_names(old_d, new_d, MOVED + 1);
+    struct Cap {
+        uint32_t max, pairs, fixups;
+    };
+    for (const Cap cap : {Cap{MOVED, MOVED, 0}, Cap{MOVED - 1, 0, MOVED}}) {
+        const LowMemCase c{dir.path(), "cap" + std::to_string(cap.max)};
+        REQUIRE(prepare(c, old_d, new_d, {}, {}, {"--string-pairs-max", std::to_string(cap.max)}).empty());
+        CHECK_EQ(patch_holds(c, poi_merge_head(MOVED + 1, MOVED + 1, cap.fixups), "POI merge"), std::string());
+        // The patcher's log: the strings section's pairs, and the POI merge's
+        // fixups when it has any.
+        const LogCheck sent = [cap](const std::string& log) -> std::string {
+            const std::string pairs = ", " + std::to_string(cap.pairs) + " moved-string pairs\n";
+            const std::string fixups = ", " + std::to_string(cap.fixups) + " string fixups)";
+            if (log.find(pairs) == std::string::npos) return "no \"" + pairs + "\"";
+            if ((log.find(" string fixups") != std::string::npos) != (cap.fixups > 0)) return "string fixups: " + log;
+            if (cap.fixups > 0 && log.find(fixups) == std::string::npos) return "no \"" + fixups + "\"";
+            return "";
+        };
+
+        CHECK(apply_modes(c, ALL_MODES, sent).bad.empty());
+    }
 }
 
 // The POI string tier in record order (GCPATCH v9): the new pool moves a name
@@ -1852,6 +1952,74 @@ TEST(patch_refuses_remap_pairs_out_of_order_or_twice_and_street_pairs_in_both_re
         REQUIRE(write_patch(c, patch, edited));
 
         CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// String fixups the replay can't take are refused in every mode: 10 POIs
+// whose names move past the strings section's pairs, the new day without POI
+// 1, so the POI merge carries the fixups of POIs 0 and 2 to 8, and
+//   deleted: the first moved to POI 1's name, which the replay deletes,
+//   left-over: one more, past the last POI,
+//   child: one in the merge of the POI vertices, a file without string
+//     fields, which the low-memory mode replays as the POIs' child stream.
+// The patch as made applies.
+TEST(patch_refuses_string_fixups_on_a_deleted_record_left_over_or_in_a_child_stream) {
+    ScratchDir dir("patch-string-fixups");
+    BuildDir old_d, new_d;
+    put_reversed_poi_names(old_d, new_d, 10, 1);
+    const LowMemCase c{dir.path(), "fixups"};
+    REQUIRE(prepare(c, old_d, new_d, {}, {}, NO_STRING_PAIRS).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    const size_t head = find_once(raw, poi_merge_head(10, 9, 8));
+    REQUIRE(head != std::string::npos);
+    // The POI merge's string fixups: their count, their size, then POI 0's
+    // (slot 0: no slot skipped).
+    const size_t n_at = head + 40, first = n_at + 8;
+    REQUIRE(raw[first] == 0);
+    // The POI vertices' merge: empty on both days, no offset or string fixups.
+    std::vector<char> child;
+    append(child, static_cast<uint32_t>(PatchFileId::POI_VERTICES));
+    append(child, 1u);
+    append(child, uint64_t{0});
+    append(child, uint64_t{0});
+    for (int k = 0; k < 6; k++) append(child, 0u);
+    const size_t child_at = find_once(raw, child);
+    REQUIRE(child_at != std::string::npos);
+    // One fixup more at the end of a section's string fixups (count at n_at,
+    // size after it): slot 0 or the 128th past the last, value unchanged.
+    auto add_fixup = [](std::vector<char>& p, size_t n_at, char skipped) {
+        uint32_t n, size;
+        memcpy(&n, p.data() + n_at, 4);
+        memcpy(&size, p.data() + n_at + 4, 4);
+        put_at(p, n_at, n + 1);
+        put_at(p, n_at + 4, size + 2);
+        const std::vector<char> fixup = {skipped, 0};
+        p.insert(p.begin() + static_cast<std::ptrdiff_t>(n_at + 8 + size), fixup.begin(), fixup.end());
+    };
+
+    using Edit = std::function<void(std::vector<char>&)>;
+    struct Case {
+        std::string name;
+        Edit edit;
+        std::vector<std::string> modes;
+        std::string refusal;
+    };
+    const Case cases[] = {
+        {"deleted", [&](std::vector<char>& p) { p[first] = 3; }, ALL_MODES, "Malformed string fixups"},
+        {"left-over", [&](std::vector<char>& p) { add_fixup(p, n_at, 0x7F); }, ALL_MODES, "Malformed string fixups"},
+        {"child", [&](std::vector<char>& p) { add_fixup(p, child_at + 40, 0); }, {"plain"}, "Malformed string fixups"},
+        {"child", [&](std::vector<char>& p) { add_fixup(p, child_at + 40, 0); }, ENCODED_MODES,
+         "Encoded set: a child stream with string fixups"},
+    };
+    for (const Case& e : cases) {
+        std::vector<char> edited = raw;
+        e.edit(edited);
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, e.modes, patch, e.name, e.refusal).empty());
     }
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
