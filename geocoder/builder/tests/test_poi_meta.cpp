@@ -9,6 +9,7 @@
 using gc::id_alloc::ObjectType;
 using gc::id_alloc::SidecarSlot;
 using gc::id_alloc::SLOT_FLAG_TOMBSTONE;
+using gctest::refusal_of;
 
 static PoiRecord poi(PoiCategory category, uint8_t tier) {
     PoiRecord pr{};
@@ -103,13 +104,8 @@ TEST(select_poi_tier_without_slot_table_filters_by_record_tier) {
 TEST(select_poi_tier_throws_when_slot_table_is_not_parallel) {
     const std::vector<PoiRecord> records = {poi(PoiCategory::HOTEL, 1), poi(PoiCategory::ZOO, 3)};
     const std::vector<SidecarSlot> slots = {live_slot(1)};
-    bool threw = false;
-    try {
-        select_poi_tier(records, slots, ALL);
-    } catch (const std::runtime_error&) {
-        threw = true;
-    }
-    CHECK(threw);
+    CHECK_EQ(refusal_of([&] { select_poi_tier(records, slots, ALL); }),
+             std::string("POI slot table not parallel to poi_records"));
 }
 
 // --- poi_meta_categories ---

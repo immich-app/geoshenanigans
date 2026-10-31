@@ -15,6 +15,8 @@
 #include "scratch_dir.h"
 #include "test_framework.h"
 
+using gctest::refusal_of;
+
 namespace {
 
 constexpr uint32_t T0 = 1783502088;
@@ -371,11 +373,6 @@ TEST(apply_writes_the_header_the_options_ask_for) {
 
     in.required_features.push_back("HistoricalInformation");
     write_test_pbf(opt.input, {node(1, 1)}, 5, in);
-    bool threw = false;
-    try {
-        apply_changes(opt);
-    } catch (const std::runtime_error&) {
-        threw = true;
-    }
-    CHECK(threw);
+    CHECK_EQ(refusal_of([&] { apply_changes(opt); }),
+             std::string("input PBF requires unsupported feature HistoricalInformation (history files are not supported)"));
 }

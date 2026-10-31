@@ -13,6 +13,8 @@
 
 #include "test_framework.h"
 
+using gctest::refusal_of;
+
 namespace {
 
 struct Rec {
@@ -103,15 +105,12 @@ TEST(parallel_for_visits_every_index_once) {
 }
 
 TEST(parallel_for_rethrows_a_worker_exception) {
-    bool thrown = false;
-    try {
-        parallel_for(100, [](size_t b, size_t, unsigned) {
-            if (b == 0) throw std::runtime_error("boom");
-        }, 4);
-    } catch (const std::runtime_error&) {
-        thrown = true;
-    }
-    CHECK(thrown);
+    CHECK_EQ(refusal_of([] {
+                 parallel_for(100, [](size_t b, size_t, unsigned) {
+                     if (b == 0) throw std::runtime_error("boom");
+                 }, 4);
+             }),
+             std::string("boom"));
 }
 
 TEST(parallel_for_runs_every_range_at_once) {
@@ -180,15 +179,12 @@ TEST(parallel_for_each_visits_every_index_once) {
 }
 
 TEST(parallel_for_each_rethrows_a_worker_exception) {
-    bool thrown = false;
-    try {
-        parallel_for_each(100, [](size_t i, unsigned) {
-            if (i == 42) throw std::runtime_error("boom");
-        }, 4);
-    } catch (const std::runtime_error&) {
-        thrown = true;
-    }
-    CHECK(thrown);
+    CHECK_EQ(refusal_of([] {
+                 parallel_for_each(100, [](size_t i, unsigned) {
+                     if (i == 42) throw std::runtime_error("boom");
+                 }, 4);
+             }),
+             std::string("boom"));
 }
 
 TEST(parallel_ordered_consumes_in_index_order) {
@@ -247,8 +243,7 @@ TEST(parallel_stream_works_every_value_once) {
 TEST(parallel_stream_rethrows_from_either_side) {
     for (bool in_next : {true, false}) {
         size_t produced = 0;
-        bool thrown = false;
-        try {
+        const std::string refusal = refusal_of([&] {
             parallel_stream<size_t>([&]() -> std::optional<size_t> {
                 if (in_next && produced == 10) throw std::runtime_error("next");
                 if (produced == 1000) return std::nullopt;
@@ -256,10 +251,8 @@ TEST(parallel_stream_rethrows_from_either_side) {
             }, [&](size_t& v, unsigned) {
                 if (!in_next && v == 10) throw std::runtime_error("work");
             }, 4);
-        } catch (const std::runtime_error&) {
-            thrown = true;
-        }
-        CHECK(thrown);
+        });
+        CHECK_EQ(refusal, std::string(in_next ? "next" : "work"));
         CHECK(produced < 1000);
     }
 }
@@ -267,8 +260,7 @@ TEST(parallel_stream_rethrows_from_either_side) {
 TEST(parallel_ordered_rethrows_from_either_side) {
     for (bool in_produce : {true, false}) {
         size_t consumed = 0;
-        bool thrown = false;
-        try {
+        const std::string refusal = refusal_of([&] {
             parallel_ordered(1000, [&](size_t i) {
                 if (in_produce && i == 10) throw std::runtime_error("produce");
                 return i;
@@ -276,10 +268,8 @@ TEST(parallel_ordered_rethrows_from_either_side) {
                 if (!in_produce && i == 10) throw std::runtime_error("consume");
                 consumed++;
             }, 4);
-        } catch (const std::runtime_error&) {
-            thrown = true;
-        }
-        CHECK(thrown);
+        });
+        CHECK_EQ(refusal, std::string(in_produce ? "produce" : "consume"));
         CHECK_EQ(consumed, size_t(10));
     }
 }
@@ -303,23 +293,13 @@ TEST(parallel_chain_walk_throws_the_serial_walks_error) {
     std::vector<ChainRecord> records;
     walk_chain(bytes, 0, bytes.size(), records);
     bytes[records[2000].offset] = 0;
-    std::string expect;
-    try {
+    const std::string expect = refusal_of([&] {
         std::vector<ChainRecord> out;
         walk_chain(bytes, 0, bytes.size(), out);
-    } catch (const std::runtime_error& e) {
-        expect = e.what();
-    }
-    REQUIRE(!expect.empty());
-    for (size_t stripes : {size_t(2), size_t(40), size_t(3000)}) {
-        std::string got;
-        try {
-            chain_walk(bytes, stripes, 8);
-        } catch (const std::runtime_error& e) {
-            got = e.what();
-        }
-        CHECK_EQ(got, expect);
-    }
+    });
+    REQUIRE(expect == "bad record at " + std::to_string(records[2000].offset));
+    for (size_t stripes : {size_t(2), size_t(40), size_t(3000)})
+        CHECK_EQ(refusal_of([&] { chain_walk(bytes, stripes, 8); }), expect);
 }
 
 TEST(parallel_for_dynamic_visits_every_index_once) {
@@ -340,15 +320,12 @@ TEST(parallel_for_dynamic_visits_every_index_once) {
 }
 
 TEST(parallel_for_dynamic_rethrows_a_worker_exception) {
-    bool thrown = false;
-    try {
-        parallel_for_dynamic(100, 10, [](size_t b, size_t, unsigned) {
-            if (b == 50) throw std::runtime_error("boom");
-        }, 4);
-    } catch (const std::runtime_error&) {
-        thrown = true;
-    }
-    CHECK(thrown);
+    CHECK_EQ(refusal_of([] {
+                 parallel_for_dynamic(100, 10, [](size_t b, size_t, unsigned) {
+                     if (b == 50) throw std::runtime_error("boom");
+                 }, 4);
+             }),
+             std::string("boom"));
 }
 
 TEST(parallel_sort_matches_std_sort_for_any_thread_count) {

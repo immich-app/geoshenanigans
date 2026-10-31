@@ -13,6 +13,8 @@
 
 #include "test_framework.h"
 
+using gctest::refusal_of;
+
 // Read a NUL-terminated C string out of the pool buffer at `off`.
 static std::string read_at(const StringPool& p, uint32_t off) {
     const std::vector<char>& d = p.data();
@@ -121,13 +123,8 @@ TEST(string_pool_release_index_hands_back_the_table_keeps_data_and_refuses_inter
     CHECK_EQ(entries, size_t(1));
     CHECK_EQ(kept, 0u);
     CHECK_EQ(read_at(p, 0), std::string("kept"));
-    bool thrown = false;
-    try {
-        p.intern("late");
-    } catch (const std::logic_error&) {
-        thrown = true;
-    }
-    CHECK(thrown);
+    CHECK_EQ(refusal_of<std::logic_error>([&] { p.intern("late"); }),
+             std::string("StringPool::intern after release_index"));
     CHECK_EQ(p.data().size(), size_t(5));
 }
 
