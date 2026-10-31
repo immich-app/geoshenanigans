@@ -1256,8 +1256,14 @@ TEST(patch_lowmem_refuses_counts_and_lengths_that_wrap_32_bits) {
     REQUIRE(at != std::string::npos);
     auto u32_at = [&](size_t p) { uint32_t v; memcpy(&v, raw.data() + p, 4); return v; };
     auto u64_at = [&](size_t p) { uint64_t v; memcpy(&v, raw.data() + p, 8); return v; };
-    // The merge: fixup counts and sizes, fixups, the sequence's length, its ops.
-    const size_t seq_len_at = at + 40 + u32_at(at + 32) + u32_at(at + 36), seq = seq_len_at + 8;
+    // A merge section's sequence length: after its offset fixups' counts and
+    // sizes, the fixups, its string fixups' count and size, and those.
+    auto seq_len_at_of = [&](size_t section) {
+        const size_t string_fixups = section + 40 + u32_at(section + 32) + u32_at(section + 36);
+        return string_fixups + 8 + u32_at(string_fixups + 4);
+    };
+    // The merge: its sequence's length, its ops.
+    const size_t seq_len_at = seq_len_at_of(at), seq = seq_len_at + 8;
     const size_t seq_end = seq + u64_at(seq_len_at);
     std::map<uint8_t, size_t> count_at;  // each kind's first run: where its count is
     for (size_t p = seq; p < seq_end;) {
@@ -1270,9 +1276,7 @@ TEST(patch_lowmem_refuses_counts_and_lengths_that_wrap_32_bits) {
     // replacement's (or a copy's) data length.
     REQUIRE(u32_at(seq_end) == static_cast<uint32_t>(PatchFileId::STREET_NODES));
     const uint32_t child_stride = u32_at(seq_end + 4);
-    const size_t child_len_at = child_stride == 0 || child_stride == COPY_OLD_STRIDE
-                                    ? seq_end + 28
-                                    : seq_end + 40 + u32_at(seq_end + 32) + u32_at(seq_end + 36);
+    const size_t child_len_at = child_stride == 0 || child_stride == COPY_OLD_STRIDE ? seq_end + 28 : seq_len_at_of(seq_end);
     struct Edit {
         std::string name;
         size_t at;
@@ -1344,14 +1348,14 @@ TEST(patch_lowmem_refuses_a_parent_and_child_replayed_out_of_step) {
         append(ops, count);
         if (data) ops.insert(ops.end(), data, data + size_t{count} * stride);
     };
-    // The merge section of a file of `size` bytes on both days, without offset fixups.
+    // The merge section of a file of `size` bytes on both days, without offset or string fixups.
     auto merge = [](PatchFileId fid, uint32_t stride, uint64_t size, const std::vector<char>& ops) {
         std::vector<char> s;
         append(s, static_cast<uint32_t>(fid));
         append(s, stride);
         append(s, size);
         append(s, size);
-        for (int k = 0; k < 4; k++) append(s, uint32_t{0});
+        for (int k = 0; k < 6; k++) append(s, uint32_t{0});
         append(s, static_cast<uint64_t>(ops.size()));
         s.insert(s.end(), ops.begin(), ops.end());
         return s;

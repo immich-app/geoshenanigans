@@ -195,7 +195,10 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // once, and the street ways' moved pairs come in the parent-id remap or the
 // secondary remap, never both, so the patcher reads every remap pair where it
 // sits in the patch.
-static constexpr uint32_t GCPATCH_VERSION = 11;
+// v12: every merge section carries string fixups after its offset fixups,
+// the new values of the string fields of its MATCH records that the patcher's
+// string remap would leave wrong, read in record order.
+static constexpr uint32_t GCPATCH_VERSION = 12;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -2387,6 +2390,86 @@ private:
     const char* values_;
     size_t values_size_, values_pos_ = 0;
     uint32_t values_left_, value_idx_ = END, value_ = 0;
+};
+
+// --- String fixups (v12) ---
+//
+// A moved string the strings section sends no pair for keeps its old offset
+// through the patcher's string remap, the tiers' runs. Each merge section
+// carries, after its offset fixups, the new value of every string field of
+// its MATCH records that the remap would leave wrong: n_string_fixups u32,
+// string_fixups_size u32, then per fixup varints of (slots skipped since the
+// previous fixup, zigzag change of the value), from slot 0 and value 0. A
+// field's slot is its record's old index × the file's string fields
+// (string_field_offsets) + its index among them, so a replay reads the fixups
+// in order as it rewrites its MATCH records, and a file without string fields
+// carries none.
+
+// A merge section's string fixups as the diff writes them, slot by slot in
+// ascending order.
+class StringFixups {
+public:
+    void add(uint64_t slot, uint32_t value) {
+        if (slot < from_ || slot - from_ > UINT32_MAX) throw std::logic_error("String fixups out of slot order");
+        write_varint(bytes_, static_cast<uint32_t>(slot - from_));
+        write_varint(bytes_, zigzag32(value - value_));
+        from_ = slot + 1;
+        value_ = value;
+        count_++;
+    }
+    uint32_t count() const { return count_; }
+    const std::vector<char>& bytes() const { return bytes_; }
+
+private:
+    std::vector<char> bytes_;
+    uint32_t count_ = 0, value_ = 0;
+    uint64_t from_ = 0;  // the first slot the next fixup may have
+};
+
+// Reads a merge section's string fixups where they sit, as its replay
+// rewrites the string fields of its MATCH records slot by slot: fixes(slot) is
+// whether the next fixup is that slot's, and take() gives its value. A fixup
+// for a slot the replay passed without matching (a deleted or replaced
+// record's), one left at the end, and bytes past the last are malformed.
+class StringFixupReader {
+public:
+    StringFixupReader(const char* data, size_t size, uint32_t n) : data_(data), size_(size), left_(n) { next(); }
+
+    bool fixes(uint64_t slot) {
+        if (slot_ > slot) return false;
+        if (slot_ < slot) malformed();
+        return true;
+    }
+    uint32_t take() {
+        const uint32_t value = value_;
+        next();
+        return value;
+    }
+    // The replay is over: every fixup was taken, and nothing follows them.
+    void finish() const {
+        if (slot_ != END || pos_ != size_) malformed();
+    }
+
+private:
+    static constexpr uint64_t END = UINT64_MAX;
+
+    [[noreturn, gnu::cold, gnu::noinline]] static void malformed() { throw std::runtime_error("Malformed string fixups"); }
+    void next() {
+        if (left_ == 0) {
+            slot_ = END;
+            return;
+        }
+        left_--;
+        SectionReader in(data_, size_, pos_, "string fixups", PastEnd::MALFORMED);
+        slot_ = from_ + in.varint();
+        from_ = slot_ + 1;
+        value_ += unzigzag32(in.varint());
+    }
+
+    const char* data_;
+    size_t size_, pos_ = 0;
+    uint32_t left_, value_ = 0;
+    uint64_t slot_ = END, from_ = 0;
 };
 
 // --- Grid coordinate for fingerprinting ---

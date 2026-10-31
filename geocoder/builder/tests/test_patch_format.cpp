@@ -346,9 +346,10 @@ TEST(patch_format_section_marker_values) {
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v11 = remap pairs ascending by old id, each file's
-    // street pairs in one section. The patcher accepts this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(11));
+    // diff/patch tools. v12 = at most STRING_PAIRS_MAX moved-string pairs,
+    // more as the merge sections' string fixups. The patcher accepts this
+    // version only.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(12));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
@@ -835,6 +836,80 @@ TEST(patch_format_offset_fixups_reject_truncated_runs) {
         for (uint32_t i = 0; i < 3; i++) reader.apply(i, 0);
     };
     CHECK_EQ(refusal_of(walk), std::string("Malformed fixups"));
+}
+
+// --- string fixups ---
+
+// Each slot's value as a replay that visits `slots` (ascending) takes it:
+// the fixup's where one is given, else none; then the end is checked.
+static std::vector<std::optional<uint32_t>> take_string_fixups(const std::vector<char>& bytes, uint32_t n,
+                                                               const std::vector<uint64_t>& slots) {
+    StringFixupReader reader(bytes.data(), bytes.size(), n);
+    std::vector<std::optional<uint32_t>> out;
+    for (const uint64_t slot : slots) out.push_back(reader.fixes(slot) ? std::optional<uint32_t>(reader.take()) : std::nullopt);
+    reader.finish();
+    return out;
+}
+
+TEST(patch_format_string_fixups_round_trip) {
+    // The first slot, its neighbours, a far one and slots past 32 bits;
+    // values that rise, fall, wrap and are NO_DATA.
+    const std::map<uint64_t, uint32_t> fixed = {{0, 7}, {1, 3}, {2, 0xFFFFFFF0u}, {9, 5}, {100000, 5},
+                                                {0xFFFFFFFEull, 0}, {0x100000004ull, NO_OFFSET}};
+    StringFixups f;
+    for (const auto& [slot, value] : fixed) f.add(slot, value);
+    CHECK_EQ(f.count(), uint32_t(fixed.size()));
+    std::vector<uint64_t> slots;
+    std::vector<std::optional<uint32_t>> expect;
+    for (uint64_t slot = 0; slot <= 0x100000005ull; slot = slot < 100001 || slot >= 0xFFFFFFFDull ? slot + 1 : 0xFFFFFFFDull) {
+        slots.push_back(slot);
+        const auto it = fixed.find(slot);
+        expect.push_back(it == fixed.end() ? std::nullopt : std::optional<uint32_t>(it->second));
+    }
+    CHECK(take_string_fixups(f.bytes(), f.count(), slots) == expect);
+
+    // 20,000 at random, every slot visited.
+    std::mt19937 rng(20261031);
+    StringFixups random;
+    std::map<uint64_t, uint32_t> random_fixed;
+    for (uint64_t slot = rng() % 3; random_fixed.size() < 20000; slot += 1 + (rng() % 8 == 0 ? rng() % 1000 : rng() % 3)) {
+        random_fixed[slot] = static_cast<uint32_t>(rng());
+        random.add(slot, random_fixed[slot]);
+    }
+    slots.clear();
+    expect.clear();
+    for (uint64_t slot = 0; slot <= random_fixed.rbegin()->first + 2; slot++) {
+        slots.push_back(slot);
+        const auto it = random_fixed.find(slot);
+        expect.push_back(it == random_fixed.end() ? std::nullopt : std::optional<uint32_t>(it->second));
+    }
+    CHECK(take_string_fixups(random.bytes(), random.count(), slots) == expect);
+}
+
+TEST(patch_format_string_fixups_refuse_a_slot_passed_a_fixup_left_over_and_bytes_past_the_last) {
+    // Records of three string fields: fixups for record 1's first (slot 3)
+    // and record 2's last (slot 8).
+    StringFixups f;
+    f.add(3, 30);
+    f.add(8, 80);
+    const std::vector<uint64_t> every = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+    auto replay = [](const std::vector<char>& bytes, uint32_t n, const std::vector<uint64_t>& slots) {
+        return refusal_of([&] { take_string_fixups(bytes, n, slots); });
+    };
+    CHECK_EQ(replay(f.bytes(), 2, every), std::string());
+    // A replay that deletes record 1 passes slot 3 without matching it.
+    CHECK_EQ(replay(f.bytes(), 2, {0, 1, 2, 6, 7, 8}), std::string("Malformed string fixups"));
+    // One that ends after record 1 leaves slot 8's.
+    CHECK_EQ(replay(f.bytes(), 2, {0, 1, 2, 3, 4, 5}), std::string("Malformed string fixups"));
+    // A byte past the last, a last cut short, and a count past the bytes.
+    std::vector<char> longer = f.bytes(), shorter = f.bytes();
+    longer.push_back(0);
+    shorter.pop_back();
+    CHECK_EQ(replay(longer, 2, every), std::string("Malformed string fixups"));
+    CHECK_EQ(replay(shorter, 2, every), std::string("Malformed string fixups"));
+    CHECK_EQ(replay(f.bytes(), 3, every), std::string("Malformed string fixups"));
+    // The diff writes them in slot order only, each slot once.
+    CHECK_EQ(refusal_of<std::logic_error>([&] { f.add(8, 1); }), std::string("String fixups out of slot order"));
 }
 
 // --- ascending ids, sections by entries file ---

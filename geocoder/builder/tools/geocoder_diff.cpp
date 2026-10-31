@@ -553,6 +553,9 @@ static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r,
     wv(&f.n_runs, 4); wv(&f.n_values, 4); wv(&runs_size, 4); wv(&values_size, 4);
     patch.insert(patch.end(), f.runs.begin(), f.runs.end());
     patch.insert(patch.end(), f.values.begin(), f.values.end());
+    // No string fixups: every moved string goes as a pair.
+    const uint32_t n_string_fixups = 0, string_fixups_size = 0;
+    wv(&n_string_fixups, 4); wv(&string_fixups_size, 4);
     uint64_t ss = r.seq.data.size();
     wv(&ss, 8);
     patch.insert(patch.end(), r.seq.data.begin(), r.seq.data.end());

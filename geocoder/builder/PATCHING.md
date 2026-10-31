@@ -194,7 +194,7 @@ for planet/poi/all's 12.8M.
 **Patch tool:**
 1. Decompress zstd
 2. Read the strings section → rebuild each shipped tier from the dir's own old tier + additions/deletions in one walk, which also derives its remap runs and hashes the old tier as it reads it and the new one as it writes it (a stale old tier is named as such even when the edit doesn't fit it); take the sent runs of unshipped tiers and the moved-string pairs as they come
-3. For each data file: apply string remap + offset fixups to old, replay merge sequence → output file, track ID mapping from MATCH ops
+3. For each data file: apply string remap (or a string fixup) + offset fixups to old, replay merge sequence → output file, track ID mapping from MATCH ops
 4. Read secondary ID remaps → each replayed file's moved pairs, read where they sit, beside its derived ID mappings
 5. Read cell changes (added/removed cell IDs) and the per-cell entry deltas
 6. Rebuild geo_cells and the street / addr / interp entry files in one pass over the old geo index: each cell's lists with their IDs remapped, corrected by the cell's delta
@@ -315,7 +315,7 @@ v8 data patch that day; applying the delta also needs memory for the whole
 old file (1.0 GB for poi.fst). Rebuilding costs no download and two to three
 and a half minutes of one core.
 
-## Patch Format (.gcpatch, version 11)
+## Patch Format (.gcpatch, version 12)
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
 pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
@@ -325,8 +325,8 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=11 (u32) + flags=0 (u32)
-  (a v11 patcher accepts only v11 patches; the v8 to v11 changes are marked
+Header: "GCPATCH\0" (8) + version=12 (u32) + flags=0 (u32)
+  (a v12 patcher accepts only v12 patches; the v8 to v12 changes are marked
   below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
@@ -395,6 +395,7 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     most ids)
   otherwise (a record stride, at most 0xFF, MAX_RECORD_STRIDE): n_runs (u32)
     + n_values (u32) + runs_size (u32) + values_size (u32) + runs + values
+    + n_string_fixups (u32, v12) + string_fixups_size (u32) + string fixups
     + seq_size (u64) + merge ops
   Ops: MATCH(count:u32) | INSERT(count:u32, data) | DELETE(count:u32)
     | REPLACE(count:u32, data) (v8: the same entities with new bytes, written
@@ -416,6 +417,18 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   the previous run, run length, zigzag change of the shift); the patcher adds
   the run's shift to every old offset in it except NO_DATA ones. values lists
   the NO_DATA records given an offset as varint (index delta, offset).
+  String fixups (v12, StringFixupReader in tools/patch_format.h): each MATCH
+  record's string field (string_field_offsets) that holds a moved string the
+  strings section sends no pair for gets its new value here, in record
+  order. A field's slot is its record's old index × the file's string fields
+  + its index among them; a fixup is varints of (slots skipped since the
+  previous fixup, zigzag change of the value), from slot 0 and value 0. The
+  patcher takes a slot's fixup instead of remapping the field, and refuses a
+  fixup for a slot the replay passes without matching (a deleted or replaced
+  record's), one left over at the end, and bytes past the last ("Malformed
+  string fixups"). A file without string fields carries 0 and 0; the
+  low-memory mode refuses anything else in a child stream ("Encoded set: a
+  child stream with string fixups").
 
 Cell Changes: marker 0xFFFFFFFB/FA/F5/F4 (geo/admin/poi/place) + n_added (u32)
   + n_removed (u32) + [cell_id:u64] × n_added + [cell_id:u64] × n_removed
