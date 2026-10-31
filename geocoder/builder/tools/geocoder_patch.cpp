@@ -529,6 +529,9 @@ static int run(int argc, char* argv[]) {
                                      street_pairs_from + " already");
         street_pairs_from = section;
     };
+    // The files a secondary remap gave pairs for, replayed or sent unchanged:
+    // a patch gives a file's pairs in one list.
+    std::unordered_set<uint32_t> secondary_pairs_for;
 
     // Where each replayed file's merge sequence sits in the patch (v8 side
     // files replay along it).
@@ -592,17 +595,20 @@ static int run(int argc, char* argv[]) {
         if (file_id == SECONDARY_REMAP_MARKER) {
             // Secondary matches complete the remap of a file already replayed
             // (the diff emits them after the merges), read where they sit; a
-            // file sent unchanged has no remap and keeps its ids.
+            // file sent unchanged has no remap and keeps its ids. A second
+            // list with pairs for a file is refused either way.
             uint32_t nf = patch.u32();
             for (uint32_t f = 0; f < nf; f++) {
                 uint32_t fid = patch.u32(), np = patch.u32();
                 SortedTable<RemapPair> pairs(patch.take_items(np, sizeof(RemapPair), "secondary remap"), np, "secondary remap");
-                if (np > 0 && fid == (uint32_t)PatchFileId::STREET_WAYS) take_street_pairs("secondary remap");
-                auto it = record_remaps.find(fid);
-                if (np > 0 && it != record_remaps.end()) {
-                    if (it->second.has_pairs())
-                        throw std::runtime_error(std::string("Malformed secondary remap: a second one for ") + patch_file_names[fid]);
-                    it->second.set_pairs(std::move(pairs));
+                if (np > 0) {
+                    if (!secondary_pairs_for.insert(fid).second)
+                        throw std::runtime_error("Malformed secondary remap: a second one for " +
+                                                 (fid < (uint32_t)PatchFileId::COUNT ? std::string(patch_file_names[fid])
+                                                                                     : "file " + std::to_string(fid)));
+                    if (fid == (uint32_t)PatchFileId::STREET_WAYS) take_street_pairs("secondary remap");
+                    auto it = record_remaps.find(fid);
+                    if (it != record_remaps.end()) it->second.set_pairs(std::move(pairs));
                 }
                 std::cerr << "  Secondary remap " << fid << ": " << np << " pairs" << std::endl;
             }

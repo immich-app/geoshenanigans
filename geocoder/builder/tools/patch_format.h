@@ -374,8 +374,9 @@ static constexpr EntriesFiles CELL_INDEX_ENTRIES_FILES = {PatchFileId::ADMIN_ENT
 // Format: marker(4), n_files(4),
 //   for each: file_id(4), n_pairs(4), [(old_id:u32, new_id:u32)] × n_pairs
 // Each file's pairs ascending by old_id, each id once (v11); the patcher
-// reads them where they sit and refuses a file's pairs out of order or given
-// twice, and street_ways pairs when the parent-id remap's street leg has
+// reads them where they sit and refuses a file's pairs out of order or with
+// an old id twice, a second list with pairs for a file (replayed or sent
+// unchanged), and street_ways pairs when the parent-id remap's street leg has
 // some.
 static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 
