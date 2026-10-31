@@ -896,7 +896,7 @@ static int run(int argc, char* argv[]) {
         const size_t fixup_off =
             (file_id == (uint32_t)PatchFileId::POI_RECORDS) ? POI_RECORD_VERTEX_OFFSET_OFF :
             (file_id == (uint32_t)PatchFileId::ADDR_POINTS)  ? ADDR_POINT_VERTEX_OFFSET_OFF : (size_t)0;
-        if (has_fixups && fixup_off + 4 > actual_stride) throw std::runtime_error("Malformed fixups");
+        if (has_fixups && fixup_off + 4 > actual_stride) throw std::runtime_error("Malformed offset fixups");
         // String fixups: the new values of the MATCH records' string fields
         // that hold a string the strings section moved without a pair, read
         // in record order (a slot per string field).

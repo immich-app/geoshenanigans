@@ -785,6 +785,42 @@ static std::vector<uint32_t> replay(const std::vector<uint32_t>& old_offsets, co
     return out;
 }
 
+// Offset fixups as given, whatever they hold: runs of (records skipped since
+// the previous run's end, length, change of the shift) and values of (index
+// delta, offset).
+struct FixupRun {
+    uint32_t skipped, length;
+    int32_t shift_change;
+};
+static OffsetFixups fixups_of(const std::vector<FixupRun>& runs, const std::vector<std::pair<uint32_t, uint32_t>>& values) {
+    OffsetFixups f;
+    for (const FixupRun& r : runs) {
+        write_varint(f.runs, r.skipped);
+        write_varint(f.runs, r.length);
+        write_varint(f.runs, zigzag32(static_cast<uint32_t>(r.shift_change)));
+        f.n_runs++;
+    }
+    for (const auto& [delta, offset] : values) {
+        write_varint(f.values, delta);
+        write_varint(f.values, offset);
+        f.n_values++;
+    }
+    return f;
+}
+
+// Every record of a file of n_records, each with an offset, through reader.
+static void walk(OffsetFixupReader& reader, uint32_t n_records) {
+    for (uint32_t i = 0; i < n_records; i++) reader.apply(i, 100 * i);
+}
+
+// The refusal of a walk of f, or "".
+static std::string refusal_of_walk(const OffsetFixups& f, uint32_t n_records) {
+    return refusal_of([&] {
+        auto reader = reader_of(f);
+        walk(reader, n_records);
+    });
+}
+
 TEST(patch_format_offset_fixups_round_trip) {
     struct Case { const char* name; std::vector<uint32_t> old_offsets, fixed; uint32_t runs, values; };
     const Case cases[] = {
@@ -814,6 +850,61 @@ TEST(patch_format_offset_fixups_skip_records_the_merge_drops) {
     for (uint32_t i : {1u, 3u, 6u}) CHECK_EQ(reader.apply(i, old_offsets[i]), fixed[i]);
 }
 
+TEST(patch_format_offset_fixups_round_trip_at_the_edges) {
+    // Record 0 given an offset, then runs of one record each.
+    const std::vector<uint32_t> old_offsets = {NO_OFFSET, 0, 4, 8};
+    const std::vector<uint32_t> fixed = {7, 1, 6, 11};
+    auto f = encode_fixed(old_offsets, fixed);
+    CHECK_EQ(f.n_values, uint32_t(1));
+    CHECK_EQ(f.n_runs, uint32_t(3));
+    CHECK(replay(old_offsets, f) == fixed);
+    // A run of one record at record 0.
+    f = encode_fixed({0, 4}, {3, 4});
+    CHECK_EQ(f.n_runs, uint32_t(1));
+    CHECK(replay({0, 4}, f) == std::vector<uint32_t>({3, 4}));
+
+    // The last record index, 0xFFFFFFFE, of a file of 2^32 - 1 records (by
+    // hand: the encoder would take an offset per record): a run of one record
+    // at record 0 and one at the last, values for records 1 and 0xFFFFFFFD.
+    f = fixups_of({{0, 1, 3}, {0xFFFFFFFDu, 1, 2}}, {{1, 7}, {0xFFFFFFFCu, 9}});
+    auto reader = reader_of(f);
+    CHECK_EQ(reader.apply(0, 10), uint32_t(13));
+    CHECK_EQ(reader.apply(1, NO_OFFSET), uint32_t(7));
+    CHECK_EQ(reader.apply(0xFFFFFFFDu, NO_OFFSET), uint32_t(9));
+    CHECK_EQ(reader.apply(0xFFFFFFFEu, 20), uint32_t(25));
+    // The first value at the last record index.
+    f = fixups_of({}, {{0xFFFFFFFEu, 9}});
+    reader = reader_of(f);
+    CHECK_EQ(reader.apply(0xFFFFFFFEu, NO_OFFSET), uint32_t(9));
+}
+
+// encode_offset_fixups writes nothing the reader refuses: files of records
+// with and without offsets, shifted in runs, losing their blocks or given
+// one, replayed record by record or only some records (the merge's kept
+// ones).
+TEST(patch_format_offset_fixups_encode_only_what_the_reader_takes) {
+    std::mt19937 rng(20261031);
+    for (int round = 0; round < 2000; round++) {
+        const uint32_t n = rng() % 64;
+        std::vector<uint32_t> old_offsets(n), fixed(n);
+        uint32_t shift = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            if (rng() % 6 == 0) shift = rng() % 3 == 0 ? 0 : static_cast<uint32_t>(rng());
+            const bool no_data = rng() % 4 == 0;
+            old_offsets[i] = no_data ? NO_OFFSET : 16 * i;
+            if (no_data) fixed[i] = rng() % 2 ? NO_OFFSET : static_cast<uint32_t>(rng() % 1000);
+            else fixed[i] = rng() % 10 == 0 ? NO_OFFSET : 16 * i + shift;
+        }
+        const OffsetFixups f = encode_fixed(old_offsets, fixed);
+        CHECK(replay(old_offsets, f) == fixed);
+        auto reader = reader_of(f);
+        bool kept_right = true;
+        for (uint32_t i = 0; i < n; i++)
+            if (rng() % 3 == 0) kept_right = reader.apply(i, old_offsets[i]) == fixed[i] && kept_right;
+        CHECK(kept_right);
+    }
+}
+
 TEST(patch_format_offset_fixups_one_edit_is_one_run) {
     // An edit at record 500000 moves every later block by the same amount;
     // the patch carries that as one run of a few bytes, not 500000 entries.
@@ -831,11 +922,43 @@ TEST(patch_format_offset_fixups_one_edit_is_one_run) {
 TEST(patch_format_offset_fixups_reject_truncated_runs) {
     auto f = encode_fixed({0, 5, 9}, {3, 5, 12});
     f.runs.pop_back();
-    auto walk = [&] {
-        auto reader = reader_of(f);
-        for (uint32_t i = 0; i < 3; i++) reader.apply(i, 0);
-    };
-    CHECK_EQ(refusal_of(walk), std::string("Malformed fixups"));
+    CHECK_EQ(refusal_of_walk(f, 3), std::string("Malformed offset fixups"));
+}
+
+// A value index that repeats (a delta of 0 after the first), or that passes
+// the last record index (0xFFFFFFFE; summed in 32 bits it would wrap, or
+// reach NO_DATA), is refused when the replay reads it, not skipped.
+TEST(patch_format_offset_fixups_refuse_a_value_index_that_repeats_or_passes_32_bits) {
+    const std::string malformed = "Malformed offset fixups";
+    // The first value may be record 0's, the others ascend.
+    CHECK_EQ(refusal_of_walk(fixups_of({}, {{0, 7}, {3, 8}}), 10), std::string());
+    // Record 0's twice, record 3's twice.
+    CHECK_EQ(refusal_of_walk(fixups_of({}, {{0, 7}, {0, 8}}), 10), malformed);
+    CHECK_EQ(refusal_of_walk(fixups_of({}, {{3, 7}, {0, 8}}), 10), malformed);
+    // Past 32 bits (2^32 + 1), and at 0xFFFFFFFF, after a value or first.
+    CHECK_EQ(refusal_of_walk(fixups_of({}, {{3, 7}, {0xFFFFFFFEu, 8}}), 10), malformed);
+    CHECK_EQ(refusal_of_walk(fixups_of({}, {{3, 7}, {0xFFFFFFFCu, 8}}), 10), malformed);
+    CHECK_EQ(refusal_of_walk(fixups_of({}, {{0xFFFFFFFFu, 7}, {0, 8}}), 10), malformed);
+}
+
+// A run of no records, or one whose start or end passes the last record
+// index (summed in 32 bits its start would wrap to before the previous run's
+// end, or its end to before its start), is refused when the replay reads it,
+// not skipped.
+TEST(patch_format_offset_fixups_refuse_an_empty_run_or_a_run_past_32_bits) {
+    const std::string malformed = "Malformed offset fixups";
+    // Runs of one record, each right after the one before, then a longer one.
+    CHECK_EQ(refusal_of_walk(fixups_of({{2, 1, 4}, {0, 1, -4}, {0, 6, 1}}, {}), 10), std::string());
+    // A run of no records, first or after another.
+    CHECK_EQ(refusal_of_walk(fixups_of({{2, 0, 4}}, {}), 10), malformed);
+    CHECK_EQ(refusal_of_walk(fixups_of({{0, 4, 3}, {1, 0, 1}}, {}), 10), malformed);
+    // A start past 32 bits (2^32 + 2, and 0xFFFFFFFF with its end at 2^32).
+    CHECK_EQ(refusal_of_walk(fixups_of({{0, 4, 3}, {0xFFFFFFFEu, 2, 1}}, {}), 10), malformed);
+    CHECK_EQ(refusal_of_walk(fixups_of({{0, 4, 3}, {0xFFFFFFFBu, 1, 1}}, {}), 10), malformed);
+    // An end past 32 bits (2^32 + 4); one right after the last record index,
+    // 0xFFFFFFFE, ends a run of every record.
+    CHECK_EQ(refusal_of_walk(fixups_of({{5, 0xFFFFFFFFu, 3}}, {}), 10), malformed);
+    CHECK_EQ(refusal_of_walk(fixups_of({{0, 0xFFFFFFFFu, 3}}, {}), 10), std::string());
 }
 
 // --- string fixups ---

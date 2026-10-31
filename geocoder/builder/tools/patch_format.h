@@ -2360,7 +2360,11 @@ OffsetFixups encode_offset_fixups(const std::vector<uint32_t>& old_offsets, Fixe
     return out;
 }
 
-// Applies encoded OffsetFixups to old records visited in ascending order.
+// Applies encoded OffsetFixups to old records visited in ascending order,
+// read where they sit. Anything encode_offset_fixups never writes is
+// malformed: a value index that doesn't ascend (only the first value's delta
+// may be 0), a run of no records, and a run or value index past the last u32
+// record index (each bound summed in 64 bits).
 class OffsetFixupReader {
 public:
     OffsetFixupReader(const char* runs, size_t runs_size, uint32_t n_runs,
@@ -2381,23 +2385,32 @@ public:
     }
 
 private:
-    static constexpr uint32_t END = 0xFFFFFFFFu;  // also NO_DATA
+    // NO_DATA, past every record index, and the start of no run: a run may
+    // end there (after record END - 1), but no run or value starts there.
+    static constexpr uint32_t END = 0xFFFFFFFFu;
 
-    static uint32_t read(const char* data, size_t& pos, size_t size) {
-        return SectionReader(data, size, pos, "fixups", PastEnd::MALFORMED).varint();
-    }
+    [[noreturn, gnu::cold, gnu::noinline]] static void malformed() { throw std::runtime_error("Malformed offset fixups"); }
     void next_run() {
         if (runs_left_ == 0) { run_start_ = run_end_ = END; return; }
         runs_left_--;
-        run_start_ = run_end_ + read(runs_, runs_pos_, runs_size_);
-        run_end_ = run_start_ + read(runs_, runs_pos_, runs_size_);
-        shift_ += unzigzag32(read(runs_, runs_pos_, runs_size_));
+        SectionReader in(runs_, runs_size_, runs_pos_, "offset fixups", PastEnd::MALFORMED);
+        const uint64_t start = uint64_t{run_end_} + in.varint();
+        const uint32_t length = in.varint();
+        if (length == 0 || start + length > END) malformed();
+        run_start_ = static_cast<uint32_t>(start);
+        run_end_ = static_cast<uint32_t>(start + length);
+        shift_ += unzigzag32(in.varint());
     }
     void next_value() {
         if (values_left_ == 0) { value_idx_ = END; return; }
         values_left_--;
-        value_idx_ = (value_idx_ == END ? 0 : value_idx_) + read(values_, values_pos_, values_size_);
-        value_ = read(values_, values_pos_, values_size_);
+        SectionReader in(values_, values_size_, values_pos_, "offset fixups", PastEnd::MALFORMED);
+        const bool first = value_idx_ == END;
+        const uint32_t delta = in.varint();
+        const uint64_t idx = (first ? 0 : uint64_t{value_idx_}) + delta;
+        if ((delta == 0 && !first) || idx >= END) malformed();
+        value_idx_ = static_cast<uint32_t>(idx);
+        value_ = in.varint();
     }
 
     const char* runs_;

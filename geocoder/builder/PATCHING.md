@@ -166,9 +166,8 @@ keep it so:
   the cell changes, each string tier's edit, the moved-string pairs, the parent-id legs, the
   secondary remap pairs, the cell list and geo entry deltas, the sparse and parallel deltas'
   changes, and the offset and string fixups. Each is ascending, by the key the format below
-  gives it, and the patcher refuses one that steps back, except the offset fixups: it doesn't
-  check their delta-coded indices for a repeat or a 32-bit wrap. The lists it looks keys up in
-  (the moved-string pairs, the parent-id legs, the secondary remap) are searched where they sit
+  gives it, and the patcher refuses one that steps back. The lists it looks keys up in (the
+  moved-string pairs, the parent-id legs, the secondary remap) are searched where they sit
   (`SortedTable`: a binary search narrowed by a directory of at most 4096 sampled keys,
   TABLE_DIRECTORY_KEYS, and a 4 KiB key filter); the others are read once, front to back, as the
   walk or replay they serve reaches them.
@@ -480,7 +479,11 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   OffsetFixups in tools/patch_format.h): runs of varint (records skipped since
   the previous run, run length, zigzag change of the shift); the patcher adds
   the run's shift to every old offset in it except NO_DATA ones. values lists
-  the NO_DATA records given an offset as varint (index delta, offset).
+  the NO_DATA records given an offset as varint (index delta, offset), the
+  first delta from record 0. A run holds at least one record, value indices
+  ascend (only the first delta may be 0), and every record index a run or
+  value gives lies below 0xFFFFFFFF (NO_DATA). The patcher refuses anything
+  else ("Malformed offset fixups").
   String fixups (v12, StringFixupReader in tools/patch_format.h): each MATCH
   record's string field (string_field_offsets) that holds a moved string the
   strings section sends no pair for gets its new value here, in record
