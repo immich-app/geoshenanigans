@@ -188,7 +188,7 @@ for planet/poi/all's 12.8M.
 4. For coordinate files (nodes/vertices): derive merge from parent way/polygon merge — verify node blocks match before COPY, INSERT if nodes changed
 5. Derive ID remaps from merge sequences (MATCH ops define old→new record correspondence)
 6. **Secondary matching**: For DELETE/INSERT records in merge sequences, match by relaxed key (name + node_count for ways, street + housenumber for addrs, etc.) to recover ID mappings for modified-but-same-entity records
-7. Derive each cell's entry list from the old one (IDs remapped) and the cell changes, and compare it with the new one: street / addr / interp cells that differ go out as per-cell lost / gained ids (Geo Entry Deltas), the admin / POI / place cell indexes as a Cell Index Delta (whole-cell Entry Corrections where the new layout can't be rebuilt)
+7. Derive each cell's entry list from the old one (IDs remapped) and the cell changes, and compare it with the new one: street / addr / interp cells that differ go out as per-cell lost / gained ids (Geo Entry Deltas), the admin / POI / place cell indexes as a Cell Index Delta (v10: the diff refuses a new index whose layout the patcher can't rebuild byte for byte)
 8. Package everything, compress whole patch with zstd for transport
 
 **Patch tool:**

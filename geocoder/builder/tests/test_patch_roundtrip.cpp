@@ -11,6 +11,7 @@
 #include <iterator>
 #include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "merge_sequence.h"
@@ -807,4 +808,44 @@ TEST(patch_diff_refuses_a_dir_of_more_client_files_than_a_patch_may_list) {
     CHECK(std::string(text.begin(), text.end()).find("Too many client files: 1025") != std::string::npos);
     CHECK(!std::filesystem::exists(patch));
     CHECK(round_trip(json_files(1), json_files(1024)).mismatches.empty());
+}
+
+// A new admin, POI or place cell index whose empty list is NO_DATA (the geo
+// index's layout, not the one write_cell_lists writes and the patcher's
+// rebuild gives) fails the diff, and no patch is written: the patcher could
+// not rebuild it. The same lists in the builder's layout, the empty one a
+// zero count, round-trip.
+TEST(patch_diff_refuses_a_cell_index_with_a_no_data_list) {
+    const std::pair<std::string, BuildDir> indexes[] = {
+        {"admin", {}},
+        {"poi", {{"poi_records.bin", bytes_of(std::vector<PoiRecord>{poi(NAME_2), poi(NAME_4)})}}},
+        {"place", {{"place_nodes.bin", bytes_of(std::vector<PlaceNode>{place(NAME_2), place(NAME_4)})}}},
+    };
+    for (const auto& [prefix, records] : indexes) {
+        ScratchDir dir("patch-diff-cell-layout");
+        const std::string& root = dir.path();
+        const std::string patch = root + "/p.gcpatch", log = root + "/tools.log";
+        BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+        for (const auto& [name, bytes] : records) old_d[name] = new_d[name] = bytes;
+        put_cell_index(old_d, prefix, {0, 1});
+        BuildDir no_data = new_d;
+        // CELL lists 0 and 1, CELL_2 none.
+        std::tie(new_d[prefix + "_cells.bin"], new_d[prefix + "_entries.bin"]) = write_cell_lists({{CELL, {0, 1}}, {CELL_2, {}}});
+        auto& cells = no_data[prefix + "_cells.bin"];
+        append(cells, CELL);
+        append(cells, uint32_t{0});
+        append(cells, CELL_2);
+        append(cells, NO_DATA);
+        no_data[prefix + "_entries.bin"] = entry_list({0, 1});
+        REQUIRE(write_dir(root + "/old", old_d));
+        REQUIRE(write_dir(root + "/new", no_data));
+
+        CHECK(!run({GEOCODER_DIFF_BIN, root + "/old", root + "/new", "-o", patch}, log));
+
+        const std::vector<char> text = read_file(log);
+        CHECK(std::string(text.begin(), text.end()).find("Cell index " + prefix + " has a layout write_cell_lists can't reproduce") !=
+              std::string::npos);
+        CHECK(!std::filesystem::exists(patch));
+        CHECK(round_trip(old_d, new_d).mismatches.empty());
+    }
 }

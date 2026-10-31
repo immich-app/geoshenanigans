@@ -1700,14 +1700,6 @@ static int run(int argc, char* argv[]) {
     auto new_ae_m = mmap_file(new_dir + "/addr_entries.bin");
     auto new_ie_m = mmap_file(new_dir + "/interp_entries.bin");
 
-    // The entry list at `off`, read like the patcher reads it.
-    auto parse_ids = [](const char* data, size_t data_size, uint32_t off) {
-        ByteSpan entries{data, data_size};
-        std::vector<uint32_t> ids;
-        read_entry_list(entries, off, ids);
-        return ids;
-    };
-
     size_t old_nc = old_geo_m.size / 20;
     size_t new_nc = new_geo_m.size / 20;
     std::cerr << "  Streaming entry corrections: " << old_nc << " old cells, " << new_nc
@@ -1743,62 +1735,34 @@ static int run(int argc, char* argv[]) {
     log_time("Streaming entry corrections", t1);
     log_rss("geo corrections");
 
-    // Corrections for a cell index the patcher rebuilds from an id remap
-    // (admin / POI / place): a per-cell delta from the rebuilt lists, or, for
-    // a layout write_cell_lists can't reproduce, every cell whose rebuilt
-    // list differs with its new list.
-    auto emit_cell_corrections = [&](PatchFileId entries_fid, const std::string& prefix,
+    // The delta from a cell index as the patcher rebuilds it from an id remap
+    // (admin / POI / place) to the new one, for every index the old or the new
+    // dir holds. The patcher writes write_cell_lists layout: a new index in
+    // any other can't be rebuilt, and the diff never silently falls back.
+    auto emit_cell_index_delta = [&](PatchFileId entries_fid, const std::string& prefix,
                                      const std::unordered_map<uint32_t,uint32_t>& rm,
                                      const std::vector<uint64_t>& added, const std::vector<uint64_t>& removed) {
-        auto old_c = read_file(old_dir + "/" + prefix + "_cells.bin");
-        auto old_e = read_file(old_dir + "/" + prefix + "_entries.bin");
-        auto derived = rebuild_cells_from_remap(old_c, old_e, rm, added, removed);
-        auto new_c = read_file(new_dir + "/" + prefix + "_cells.bin");
-        auto new_e = read_file(new_dir + "/" + prefix + "_entries.bin");
+        const std::string cells = "/" + prefix + "_cells.bin", entries = "/" + prefix + "_entries.bin";
+        struct stat st;
+        if (stat((old_dir + cells).c_str(), &st) != 0 && stat((new_dir + cells).c_str(), &st) != 0) return;
+        auto new_c = read_file(new_dir + cells);
+        auto new_e = read_file(new_dir + entries);
         auto new_lists = parse_cell_lists(new_c, new_e);
-        if (write_cell_lists(new_lists) == std::make_pair(new_c, new_e)) {
-            std::vector<char> payload;
-            append_cell_list_delta(payload, parse_cell_lists(derived.cells_data, derived.entries_data), new_lists);
-            SEC("celldelta:" << prefix);
-            uint32_t marker = CELL_INDEX_DELTA_MARKER, file = static_cast<uint32_t>(entries_fid);
-            uint64_t size = payload.size();
-            wval(patch, &marker, 4); wval(patch, &file, 4); wval(patch, &size, 8);
-            patch.insert(patch.end(), payload.begin(), payload.end());
-            std::cerr << "  " << prefix << "_entries.bin: cell index delta (" << size << " bytes)" << std::endl;
-            return;
-        }
-        auto parse = [&](const std::vector<char>& cells, const std::vector<char>& entries)
-            -> std::unordered_map<uint64_t, std::vector<uint32_t>> {
-            std::unordered_map<uint64_t, std::vector<uint32_t>> m;
-            for (size_t i = 0; i < cells.size() / 12; i++) {
-                uint64_t cid; memcpy(&cid, cells.data()+i*12, 8);
-                uint32_t off; memcpy(&off, cells.data()+i*12+8, 4);
-                m[cid] = parse_ids(entries.data(), entries.size(), off);
-            }
-            return m;
-        };
-        auto dm = parse(derived.cells_data, derived.entries_data);
-        auto nm = parse(new_c, new_e);
-        std::vector<char> buf; buf.resize(12, 0); uint32_t dc = 0;
-        for (auto& [cid, nids] : nm) {
-            auto it = dm.find(cid); auto* dids = it != dm.end() ? &it->second : nullptr;
-            bool differs = !dids ? !nids.empty() : (dids->size() != nids.size()) ||
-                          (!dids->empty() && memcmp(dids->data(), nids.data(), dids->size()*4) != 0);
-            if (differs) { wval(buf, &cid, 8); uint16_t c = nids.size(); wval(buf, &c, 2);
-                if (!nids.empty()) buf.insert(buf.end(), (const char*)nids.data(), (const char*)nids.data()+nids.size()*4); dc++; }
-        }
-        for (auto& [cid, dids] : dm) { if (!nm.count(cid) && !dids.empty()) { wval(buf, &cid, 8); uint16_t c = 0; wval(buf, &c, 2); dc++; } }
-        SEC("corr:" << prefix);
-        uint32_t marker = ENTRY_CORRECTION_MARKER, file = static_cast<uint32_t>(entries_fid);
-        memcpy(buf.data(), &marker, 4); memcpy(buf.data()+4, &file, 4); memcpy(buf.data()+8, &dc, 4);
-        patch.insert(patch.end(), buf.begin(), buf.end());
-        std::cerr << "  " << prefix << "_entries.bin: " << dc << " cell corrections (" << buf.size()-12 << " bytes)" << std::endl;
+        if (write_cell_lists(new_lists) != std::make_pair(new_c, new_e))
+            throw std::runtime_error("Cell index " + prefix + " has a layout write_cell_lists can't reproduce");
+        auto derived = rebuild_cells_from_remap(read_file(old_dir + cells), read_file(old_dir + entries), rm, added, removed);
+        std::vector<char> payload;
+        append_cell_list_delta(payload, parse_cell_lists(derived.cells_data, derived.entries_data), new_lists);
+        SEC("celldelta:" << prefix);
+        uint32_t marker = CELL_INDEX_DELTA_MARKER, file = static_cast<uint32_t>(entries_fid);
+        uint64_t size = payload.size();
+        wval(patch, &marker, 4); wval(patch, &file, 4); wval(patch, &size, 8);
+        patch.insert(patch.end(), payload.begin(), payload.end());
+        std::cerr << "  " << prefix << "_entries.bin: cell index delta (" << size << " bytes)" << std::endl;
     };
-    emit_cell_corrections(PatchFileId::ADMIN_ENTRIES, "admin", ad_rm_d, a_added, a_removed);
-    if (res_poi_r.old_size > 0 || res_poi_r.new_size > 0)
-        emit_cell_corrections(PatchFileId::POI_ENTRIES, "poi", poi_rm_d, p_added, p_removed);
-    if (res_place_n.old_size > 0 || res_place_n.new_size > 0)
-        emit_cell_corrections(PatchFileId::PLACE_ENTRIES, "place", place_rm_d, pl_added, pl_removed);
+    emit_cell_index_delta(PatchFileId::ADMIN_ENTRIES, "admin", ad_rm_d, a_added, a_removed);
+    emit_cell_index_delta(PatchFileId::POI_ENTRIES, "poi", poi_rm_d, p_added, p_removed);
+    emit_cell_index_delta(PatchFileId::PLACE_ENTRIES, "place", place_rm_d, pl_added, pl_removed);
 
     log_time("Entry corrections", t1);
     // No CELL_FLAGS section: every cell whose street / addr / interp list

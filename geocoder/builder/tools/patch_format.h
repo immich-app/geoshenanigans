@@ -336,9 +336,10 @@ static constexpr uint32_t ENTRY_CORRECTION_MARKER = 0xFFFFFFF8;
 
 // Cell index delta marker: 0xFFFFFFF7
 // An admin / POI / place cell index the patcher rebuilds from its id remap,
-// corrected per cell instead of by ENTRY_CORRECTION: a corrected cell costs
-// the ids it lost and gained, not its whole list. Sent when write_cell_lists
-// reproduces the new index byte for byte.
+// corrected per cell: a corrected cell costs the ids it lost and gained, not
+// its whole list. Sent for every index the old or the new dir holds; the
+// patcher writes the new index in write_cell_lists layout, so the diff
+// refuses a new index that layout doesn't reproduce byte for byte.
 // Format: marker(4), file_id(4) = the entries file, payload_size(u64),
 //   append_cell_list_delta(rebuilt → new) bytes.
 // At most one per file of CELL_INDEX_ENTRIES_FILES.
