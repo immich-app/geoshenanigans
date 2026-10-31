@@ -233,11 +233,11 @@ geocoder-patch <current-dir> <patch-file> -o <output-dir>
 
 The patch tool:
 - Reads old files front to back through `pread` (sequential readahead) and
-  writes each new file in one streaming pass; only the decompressed patch,
-  each old string tier while it rebuilds it, and the remap runs it spills to
-  its scratch dir are mmapped. Long unchanged runs and unchanged files are
-  copied in the kernel (`copy_file_range`), or through `pread` where the
-  kernel, the filesystem or a seccomp profile refuses that
+  writes each new file in one streaming pass; only the patch and its
+  decompressed copy, each old string tier while it rebuilds it, and the remap
+  runs it spills to its scratch dir are mmapped. Long unchanged runs and
+  unchanged files are copied in the kernel (`copy_file_range`), or through
+  `pread` where the kernel, the filesystem or a seccomp profile refuses that
 - Peak anonymous memory: about 1 MiB, or 2 MiB in low-memory mode (an
   encoded installed set, see `builder/PATCHING.md`), for every variant and
   whatever the patch; everything else is reclaimable page cache.
