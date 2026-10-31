@@ -450,8 +450,8 @@ Secondary ID Remap: marker 0xFFFFFFF6 (u32) + n_files (u32)
   remap)
   (v11) Each file's pairs ascending by old_id, each id once. The patcher
   reads them where they sit as the file's remap pairs and refuses a list out
-  of order, a second list with pairs for a file, and street_ways pairs when
-  the parent-id remap's street leg has some.
+  of order, a second list with pairs for a file (replayed or sent unchanged),
+  and street_ways pairs when the parent-id remap's street leg has some.
 
 Geo Entry Deltas (street / addr / interp entries): marker 0xFFFFFFF0 (u32)
   + file_id (u32) + count (u32), then per cell in cell order:
