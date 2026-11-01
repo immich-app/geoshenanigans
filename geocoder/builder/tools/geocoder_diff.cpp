@@ -880,14 +880,20 @@ static int run(int argc, char* argv[]) {
         return {m, false};
     };
     // Every record file the merges read, old and new, is refused before it is
-    // diffed when it holds more records than a patch can index.
+    // diffed when it holds more records than a patch can index. Its size is
+    // the first non-empty one of the dir's own and its siblings', as the
+    // merges' loads find it, but from stat: a mapping's is narrowed to a 32-bit
+    // size_t, and 0 for a file that can't be mapped.
     for (const MergedFile& f : MERGED_FILES) {
         const char* name = patch_file_names[static_cast<uint32_t>(f.id)];
-        auto size_in = [&](const std::string& dir) {
-            MappedFile m = try_load_with_fallback(dir, name, f.siblings).first;
-            const uint64_t size = m.size;
-            unmap_file(m);
-            return size;
+        auto size_in = [&](const std::string& dir) -> uint64_t {
+            std::vector<std::string> paths{dir + "/" + name};
+            for (const char* sibling : f.siblings) paths.push_back(dir + "/" + sibling + name);
+            for (const std::string& path : paths) {
+                struct stat st;
+                if (stat(path.c_str(), &st) == 0 && st.st_size > 0) return static_cast<uint64_t>(st.st_size);
+            }
+            return 0;
         };
         const uint64_t old_size = size_in(old_dir), new_size = size_in(new_dir);
         require_merge_records(name, old_size, new_size, f.stride_of(new_size), file_records_max);

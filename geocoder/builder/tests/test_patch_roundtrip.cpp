@@ -720,6 +720,37 @@ TEST(patch_diff_refuses_a_record_file_past_the_limit) {
     CHECK(refused_with(refusal("option", two, three, "4294967295"), "--file-records-max takes 0 to 4294967294, not 4294967295"));
 }
 
+// The diff sizes a record file for the limit by the file, not by a mapping of
+// it: a new addr_vertices.bin one byte past FILE_RECORDS_MAX (sparse), in a
+// diff whose address space is capped below it so the file can't be mapped, is
+// refused by name and no patch is written. (A 32-bit build's size_t can't
+// hold a mapping of it either.)
+TEST(patch_diff_refuses_a_record_file_past_the_limit_it_cannot_map) {
+#ifdef __SANITIZE_ADDRESS__
+    std::printf("    SKIP a capped address space: the sanitizers' shadow memory needs more\n");
+#else
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(OLD_POOL);
+    old_d["addr_points.bin"] = new_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{addr_point(NAME_2, NO_DATA)});
+    new_d["addr_vertices.bin"] = {};
+    ScratchDir dir("patch-diff-unmappable");
+    const std::string root = dir.path(), patch = root + "/p.gcpatch", log = root + "/diff.log";
+    REQUIRE(write_dir(root + "/old", old_d) && write_dir(root + "/new", new_d));
+    std::filesystem::resize_file(root + "/new/addr_vertices.bin", uint64_t(FILE_RECORDS_MAX) + 1);
+    const bool ran = run({"/bin/sh", "-c", "ulimit -v 2097152 && exec \"$0\" \"$@\"", GEOCODER_DIFF_BIN, root + "/old",
+                          root + "/new", "-o", patch},
+                         log);
+    const std::vector<char> text = read_file(log);
+    const std::string said(text.begin(), text.end());
+    const bool refused = said.find("New addr_vertices.bin holds 4294967295 records, more than the 4294967294 a patch can index") !=
+                         std::string::npos;
+    if (!refused)
+        std::printf("    the capped diff (exit %s) ends: %s\n", ran ? "0" : "non-zero",
+                    said.substr(said.size() > 300 ? said.size() - 300 : 0).c_str());
+    CHECK(!ran && refused);
+    CHECK(!std::filesystem::exists(patch));
+#endif
+}
+
 // The second cell of each identity round trip lists only records the day
 // kept, so no correction rebuilds it: the derived remaps (MATCH, REPLACE and
 // the moved pairs) alone must give its new lists. The logged identity stats
