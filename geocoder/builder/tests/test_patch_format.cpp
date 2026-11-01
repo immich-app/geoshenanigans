@@ -895,37 +895,74 @@ TEST(patch_format_offset_fixups_round_trip_at_the_edges) {
     CHECK_EQ(refusal_of([&] { reader.finish(0xFFFFFFFFu); }), std::string());
 }
 
+// What the patcher's MATCH replay writes for a run of old records from
+// record first on, given their old offsets: apply's offset for each record
+// the fixups reach (OffsetFixupReader::reach), the old one for the rest.
+static std::vector<uint32_t> replay_run(OffsetFixupReader& reader, uint64_t first, const std::vector<uint32_t>& old_offsets) {
+    const uint32_t count = static_cast<uint32_t>(old_offsets.size());
+    const uint32_t fixed_records = OffsetFixupReader::reach(first, count);
+    std::vector<uint32_t> out;
+    for (uint32_t k = 0; k < count; k++)
+        out.push_back(k < fixed_records ? reader.apply(static_cast<uint32_t>(first + k), old_offsets[k]) : old_offsets[k]);
+    return out;
+}
+
+// A MATCH run reaches the records below the last u32 record index,
+// 0xFFFFFFFE, wherever it starts and however long it is: none past it, whose
+// u32 index would be END (0xFFFFFFFF, NO_DATA) or wrap onto record 0 on.
+TEST(patch_format_offset_fixups_reach_a_run_up_to_the_last_index) {
+    const uint64_t past = 0xFFFFFFFFu;
+    CHECK_EQ(OffsetFixupReader::reach(0, 0), uint32_t(0));
+    CHECK_EQ(OffsetFixupReader::reach(0, 5), uint32_t(5));
+    CHECK_EQ(OffsetFixupReader::reach(7, 0xFFFFFFF0u), uint32_t(0xFFFFFFF0u));
+    // A run of every u32 record index, and the same run a record later.
+    CHECK_EQ(OffsetFixupReader::reach(0, 0xFFFFFFFFu), uint32_t(0xFFFFFFFFu));
+    CHECK_EQ(OffsetFixupReader::reach(1, 0xFFFFFFFFu), uint32_t(0xFFFFFFFEu));
+    // Runs that end at the last index or cross it.
+    CHECK_EQ(OffsetFixupReader::reach(past - 3, 3), uint32_t(3));
+    CHECK_EQ(OffsetFixupReader::reach(past - 3, 5), uint32_t(3));
+    CHECK_EQ(OffsetFixupReader::reach(past - 1, 0xFFFFFFFFu), uint32_t(1));
+    // Runs from END on, including those whose first index wraps a u32.
+    CHECK_EQ(OffsetFixupReader::reach(past, 1), uint32_t(0));
+    CHECK_EQ(OffsetFixupReader::reach(past + 1, 5), uint32_t(0));
+    CHECK_EQ(OffsetFixupReader::reach((uint64_t{1} << 32) + 2, 5), uint32_t(0));
+    CHECK_EQ(OffsetFixupReader::reach(UINT64_MAX, 0xFFFFFFFFu), uint32_t(0));
+}
+
 // A file of more than 0xFFFFFFFF records (by hand again) has records at and
 // past 0xFFFFFFFF (NO_DATA), which no run or value reaches: the encoder
 // takes one only unmoved (else past_last_index), so the replay leaves its
 // offset, or its NO_DATA, as it is, after runs and values it read or skipped
-// (a merge that drops the records between).
+// (a merge that drops the records between), whether its MATCH run starts
+// there or crosses the last index.
 TEST(patch_format_offset_fixups_leave_records_past_the_last_index_as_they_are) {
     // A run of record 0 (shift 3), a value for record 1 and a run of the last
     // record index, 0xFFFFFFFE (shift 5).
     const OffsetFixups f = fixups_of({{0, 1, 3}, {0xFFFFFFFDu, 1, 2}}, {{1, 7}});
     const uint64_t past = 0xFFFFFFFFu;
-    // What a replay of the records (index, old offset) given writes, "-" for
-    // NO_DATA, then its end in a file of 2^32 + 2 records; or its refusal.
-    auto replay_of = [&](const std::vector<std::pair<uint64_t, uint32_t>>& records) {
+    // What a replay of the MATCH runs (first record index, its records' old
+    // offsets) given writes, "-" for NO_DATA, then its end in a file of
+    // 2^32 + 2 records; or its refusal.
+    auto replay_of = [&](const std::vector<std::pair<uint64_t, std::vector<uint32_t>>>& runs) {
         std::string out;
         const std::string refusal = refusal_of([&] {
             auto reader = reader_of(f);
-            for (const auto& [idx, old] : records) {
-                const uint32_t fixed = reader.apply(idx, old);
-                out += (out.empty() ? "" : " ") + (fixed == NO_OFFSET ? std::string("-") : std::to_string(fixed));
-            }
+            for (const auto& [first, old_offsets] : runs)
+                for (const uint32_t fixed : replay_run(reader, first, old_offsets))
+                    out += (out.empty() ? "" : " ") + (fixed == NO_OFFSET ? std::string("-") : std::to_string(fixed));
             reader.finish(past + 3);
         });
         return refusal.empty() ? out : refusal;
     };
-    // Every record from the last index on, with offsets and without.
-    CHECK_EQ(replay_of({{0, 10}, {1, NO_OFFSET}, {past - 1, 20}, {past, NO_OFFSET}, {past + 1, 30}, {past + 2, NO_OFFSET}}),
+    // Every record from the last index on, with offsets and without, in a
+    // run across the last index and in runs of their own.
+    CHECK_EQ(replay_of({{0, {10, NO_OFFSET}}, {past - 1, {20, NO_OFFSET, 30, NO_OFFSET}}}), std::string("13 7 25 - 30 -"));
+    CHECK_EQ(replay_of({{0, {10, NO_OFFSET}}, {past - 1, {20}}, {past, {NO_OFFSET}}, {past + 1, {30}}, {past + 2, {NO_OFFSET}}}),
              std::string("13 7 25 - 30 -"));
-    CHECK_EQ(replay_of({{0, 10}, {1, NO_OFFSET}, {past - 1, 20}, {past, 30}}), std::string("13 7 25 30"));
+    CHECK_EQ(replay_of({{0, {10, NO_OFFSET}}, {past - 1, {20, 30}}}), std::string("13 7 25 30"));
     // A replay from record 0 straight past 0xFFFFFFFF, which reads neither
     // the value nor the second run.
-    CHECK_EQ(replay_of({{0, 10}, {past + 1, 30}, {past + 2, NO_OFFSET}}), std::string("13 30 -"));
+    CHECK_EQ(replay_of({{0, {10}}, {past + 1, {30, NO_OFFSET}}}), std::string("13 30 -"));
 }
 
 // encode_offset_fixups writes nothing the reader refuses: files of records

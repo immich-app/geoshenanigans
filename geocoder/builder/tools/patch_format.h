@@ -2419,7 +2419,8 @@ OffsetFixups encode_offset_fixups(const std::vector<uint32_t>& old_offsets, Fixe
 // over (finish), a run or value past the old file's records or bytes past
 // the last of either. A record past the last u32 record index (of a file of
 // more than 0xFFFFFFFF records) keeps its offset: no run or value reaches
-// it, and the encoder refuses one there that moves (past_last_index).
+// it, and the encoder refuses one there that moves (past_last_index). The
+// replay leaves such records out of apply (reach), once per MATCH run.
 class OffsetFixupReader {
 public:
     OffsetFixupReader(const char* runs, size_t runs_size, uint32_t n_runs,
@@ -2430,11 +2431,18 @@ public:
         next_value();
     }
 
-    // Record idx's offset after the fixups, given its old offset. A record
-    // past the last u32 record index keeps it, checked before the value
-    // search: an exhausted value index sits at END, which is such a record's.
-    uint32_t apply(uint64_t idx, uint32_t old) {
-        if (idx >= END) return old;
+    // How many of a MATCH run's count records, from old record first on,
+    // the fixups reach: those below the last u32 record index, which the
+    // replay hands apply. The rest keep their offsets: as a u32, the index
+    // of one is END (an exhausted value index's) or wraps onto record 0 on,
+    // whose value or run apply would give it.
+    static uint32_t reach(uint64_t first, uint32_t count) {
+        if (first >= END) return 0;
+        return END - first < count ? static_cast<uint32_t>(END - first) : count;
+    }
+    // Record idx's offset after the fixups, given its old offset; idx below
+    // END, as reach gives them.
+    uint32_t apply(uint32_t idx, uint32_t old) {
         while (value_idx_ < idx) next_value();
         if (value_idx_ == idx) {
             if (old != END) malformed();
