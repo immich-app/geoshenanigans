@@ -707,6 +707,16 @@ TEST(patch_diff_refuses_a_record_file_past_the_limit) {
                                                {{"admin_polygons.bin", std::vector<char>(2 * ADMIN_POLYGON_STRIDE, 0)}}};
     CHECK(refused_with(refusal("borrowed", poi_tier, poi_tier, "2", "/poi/major", admins),
                        "Old admin_polygons.bin holds 3 records, more than the 2 a patch can index"));
+    // Address points that aren't whole 28-byte points merge at stride 16, as
+    // an empty file's do, and the patcher counts a section's records at its
+    // stride: 3 old and 2 new (48 and 32 bytes, 1 point each at 28) round-trip
+    // under 3 and are refused under 2.
+    BuildDir addrs_16_old = with_pool(OLD_POOL), addrs_16_new = with_pool(OLD_POOL);
+    addrs_16_old["addr_points.bin"] = std::vector<char>(3 * 16, 0);
+    addrs_16_new["addr_points.bin"] = std::vector<char>(2 * 16, 0);
+    CHECK(round_trip(addrs_16_old, addrs_16_new, {}, {"--file-records-max", "3"}).mismatches.empty());
+    CHECK(refused_with(refusal("stride-16", addrs_16_old, addrs_16_new, "2"),
+                       "Old addr_points.bin holds 3 records, more than the 2 a patch can index"));
     CHECK(refused_with(refusal("option", two, three, "4294967295"), "--file-records-max takes 0 to 4294967294, not 4294967295"));
 }
 

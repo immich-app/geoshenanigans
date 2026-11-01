@@ -732,28 +732,39 @@ static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uin
 static constexpr std::initializer_list<const char*> FULL_SIBLINGS = {"../full/", "../../full/"};
 static constexpr std::initializer_list<const char*> Q25_SIBLINGS = {"../../quality/q2.5/", "../quality/q2.5/"};
 
-// The record files the merges read, by their merge sections' strides (a
-// byte stream's is 1, a node's lat and lng 8), and the siblings a variant
-// without its own borrows them from.
+// The stride addr_points.bin merges at, by its size: an empty or absent one,
+// or one that isn't whole address points, goes out as stride 16, as patches
+// have always sent it.
+static size_t addr_points_stride(uint64_t size) {
+    return size % ADDR_POINT_STRIDE == 0 && size > 0 ? ADDR_POINT_STRIDE : 16;
+}
+template <size_t STRIDE>
+static size_t fixed_stride(uint64_t) {
+    return STRIDE;
+}
+
+// The record files the merges read, by the stride their merge sections give
+// for a new file of its size (a byte stream's is 1, a node's lat and lng 8),
+// and the siblings a variant without its own borrows them from.
 struct MergedFile {
     PatchFileId id;
-    size_t stride;
+    size_t (*stride_of)(uint64_t new_size);
     std::initializer_list<const char*> siblings;
 };
 static constexpr MergedFile MERGED_FILES[] = {
-    {PatchFileId::STREET_WAYS, WAY_HEADER_STRIDE, FULL_SIBLINGS},
-    {PatchFileId::STREET_NODES, 8, FULL_SIBLINGS},
-    {PatchFileId::INTERP_WAYS, INTERP_WAY_STRIDE, {}},
-    {PatchFileId::INTERP_NODES, 8, {}},
-    {PatchFileId::ADDR_POINTS, ADDR_POINT_STRIDE, {}},
-    {PatchFileId::ADDR_VERTICES, 1, {}},
-    {PatchFileId::ADMIN_POLYGONS, ADMIN_POLYGON_STRIDE, Q25_SIBLINGS},
-    {PatchFileId::ADMIN_VERTICES, 1, Q25_SIBLINGS},
-    {PatchFileId::POI_RECORDS, POI_RECORD_STRIDE, {}},
-    {PatchFileId::POI_VERTICES, 1, {}},
-    {PatchFileId::PLACE_NODES, PLACE_NODE_STRIDE, {}},
-    {PatchFileId::POSTAL_POLYGONS, ADMIN_POLYGON_STRIDE, {}},
-    {PatchFileId::POSTAL_VERTICES, 1, {}},
+    {PatchFileId::STREET_WAYS, fixed_stride<WAY_HEADER_STRIDE>, FULL_SIBLINGS},
+    {PatchFileId::STREET_NODES, fixed_stride<8>, FULL_SIBLINGS},
+    {PatchFileId::INTERP_WAYS, fixed_stride<INTERP_WAY_STRIDE>, {}},
+    {PatchFileId::INTERP_NODES, fixed_stride<8>, {}},
+    {PatchFileId::ADDR_POINTS, addr_points_stride, {}},
+    {PatchFileId::ADDR_VERTICES, fixed_stride<1>, {}},
+    {PatchFileId::ADMIN_POLYGONS, fixed_stride<ADMIN_POLYGON_STRIDE>, Q25_SIBLINGS},
+    {PatchFileId::ADMIN_VERTICES, fixed_stride<1>, Q25_SIBLINGS},
+    {PatchFileId::POI_RECORDS, fixed_stride<POI_RECORD_STRIDE>, {}},
+    {PatchFileId::POI_VERTICES, fixed_stride<1>, {}},
+    {PatchFileId::PLACE_NODES, fixed_stride<PLACE_NODE_STRIDE>, {}},
+    {PatchFileId::POSTAL_POLYGONS, fixed_stride<ADMIN_POLYGON_STRIDE>, {}},
+    {PatchFileId::POSTAL_VERTICES, fixed_stride<1>, {}},
 };
 
 static int run(int argc, char* argv[]) {
@@ -878,7 +889,8 @@ static int run(int argc, char* argv[]) {
             unmap_file(m);
             return size;
         };
-        require_merge_records(name, size_in(old_dir), size_in(new_dir), f.stride, file_records_max);
+        const uint64_t old_size = size_in(old_dir), new_size = size_in(new_dir);
+        require_merge_records(name, old_size, new_size, f.stride_of(new_size), file_records_max);
     }
     // A shipped tier is rebuilt from the client's own old file, so both
     // sides come from the dir itself. The others are only remapped through
@@ -1055,16 +1067,10 @@ static int run(int argc, char* argv[]) {
         double gs = now_ms();
         auto old_m = mmap_file_rw(old_dir + "/addr_points.bin");
         auto new_m = mmap_file(new_dir + "/addr_points.bin");
-        // An empty or absent addr_points.bin goes out as stride 16, as
-        // patches have always sent it. We can only run the merge if old
-        // and new have the same stride, so a dir that gains or loses its
-        // address points can't be patched.
-        auto detect_addr_stride = [](size_t sz) -> size_t {
-            if (sz % ADDR_POINT_STRIDE == 0 && sz > 0) return ADDR_POINT_STRIDE;
-            return 16;
-        };
-        size_t old_stride = detect_addr_stride(old_m.size);
-        size_t new_stride = detect_addr_stride(new_m.size);
+        // We can only run the merge if old and new have the same stride, so
+        // a dir that gains or loses its address points can't be patched.
+        size_t old_stride = addr_points_stride(old_m.size);
+        size_t new_stride = addr_points_stride(new_m.size);
         if (old_stride != new_stride) {
             std::cerr << "  addr_points: stride mismatch (old=" << old_stride
                       << ", new=" << new_stride << ") — cannot patch" << std::endl;
