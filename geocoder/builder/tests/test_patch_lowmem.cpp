@@ -442,21 +442,24 @@ const std::vector<std::string> ENCODED_MODES = {"sync", "threads"};
 const std::vector<std::string> ALL_MODES = {"plain", "sync", "threads"};
 
 // The patcher's command line applying patch to c's old dir ("plain") or
-// encoded set ("sync", "threads") into out.
-std::vector<std::string> patch_words(const LowMemCase& c, const std::string& mode, const std::string& patch, const std::string& out) {
+// encoded set ("sync", "threads") into out, with options.
+std::vector<std::string> patch_words(const LowMemCase& c, const std::string& mode, const std::string& patch, const std::string& out,
+                                     const std::vector<std::string>& options = {}) {
     std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir(mode == "plain" ? "old" : "old.enc"), patch, "-o", out};
     if (mode == "threads") words.push_back("--threads");
+    words.insert(words.end(), options.begin(), options.end());
     return words;
 }
 
-// patch (an edit of c's, named name) applied in each of modes: every mode in
-// which the patcher doesn't refuse it with `refusal`, and what it did instead,
-// printed.
+// patch (an edit of c's, named name) applied in each of modes, the patcher
+// given options: every mode in which the patcher doesn't refuse it with
+// `refusal`, and what it did instead, printed.
 std::vector<std::string> not_refused(const LowMemCase& c, const std::vector<std::string>& modes, const std::string& patch,
-                                     const std::string& name, const std::string& refusal) {
+                                     const std::string& name, const std::string& refusal,
+                                     const std::vector<std::string>& options = {}) {
     std::vector<std::string> bad;
     for (const std::string& mode : modes) {
-        const ToolRun r = run_tool(patch_words(c, mode, patch, c.dir(name + ".out." + mode)), c.log());
+        const ToolRun r = run_tool(patch_words(c, mode, patch, c.dir(name + ".out." + mode), options), c.log());
         if (!r.ok && logged(r, refusal)) continue;
         bad.push_back(name + " (" + mode + "): " + (r.ok ? "applied" : r.log));
         std::printf("    %s\n", bad.back().c_str());
@@ -501,9 +504,10 @@ struct Applied {
 
 // The patch applied in each of modes ("plain": to the old dir, compared with
 // the new dir; "sync" and "threads": to the old encoded set, compared with
-// the new encoded set), the patcher under the heap shim; check runs on each
-// log. Every mismatch, printed.
-Applied apply_modes(const LowMemCase& c, const std::vector<std::string>& modes, const LogCheck& check = {}) {
+// the new encoded set), the patcher under the heap shim and given options;
+// check runs on each log. Every mismatch, printed.
+Applied apply_modes(const LowMemCase& c, const std::vector<std::string>& modes, const LogCheck& check = {},
+                    const std::vector<std::string>& options = {}) {
     Applied a;
     // The patcher writes only into an empty dir: a case applied again starts
     // from none.
@@ -512,7 +516,7 @@ Applied apply_modes(const LowMemCase& c, const std::vector<std::string>& modes, 
         const bool plain = mode == "plain";
         const std::string out = c.dir("out." + mode);
         std::filesystem::remove(c.log());
-        const auto [ok, heap_peak] = gctest::run_with_heap_peak(patch_words(c, mode, c.patch(), out), c.log());
+        const auto [ok, heap_peak] = gctest::run_with_heap_peak(patch_words(c, mode, c.patch(), out, options), c.log());
         const std::vector<char> text = read_file(c.log());
         const std::string log(text.begin(), text.end());
         if (heap_peak) a.heap_peaks[mode] = *heap_peak;
@@ -2209,6 +2213,140 @@ TEST(patch_refuses_a_second_pair_list_or_street_pairs_in_both_remaps_for_unchang
         CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
     }
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// A second POI parent-id remap is refused in every mode, whichever comes
+// first: an empty one (no pair in any leg) before or after the one the diff
+// made (its street leg the 20 moved street ways with addresses), or that one
+// twice. The patch as made applies.
+TEST(patch_refuses_a_second_parent_id_remap) {
+    ScratchDir dir("patch-second-parent-remap");
+    BuildDir old_d, new_d, old_meta, new_meta;
+    put_moved_ways(old_d, new_d, old_meta, new_meta, 20, 0);
+    put_changed_pois(old_d, new_d, 20);
+    const LowMemCase c{dir.path(), "parent"};
+    REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    std::vector<char> legs, empty;
+    for (const uint32_t w : {POI_PARENT_REMAP_MARKER, 0u, 20u}) append(legs, w);
+    for (const uint32_t w : {POI_PARENT_REMAP_MARKER, 0u, 0u, 0u}) append(empty, w);
+    const size_t at = find_once(raw, legs);
+    REQUIRE(at != std::string::npos);
+    // The section's end: past its marker, the admin and street counts, the
+    // street pairs and the postcode count.
+    const size_t end = at + 12 + 20 * 8 + 4;
+    const std::vector<char> made(raw.begin() + at, raw.begin() + end);
+
+    struct Case {
+        std::string name;
+        size_t at;
+        std::vector<char> section;
+    };
+    const Case cases[] = {{"empty-before", at, empty}, {"empty-after", end, empty}, {"twice", end, made}};
+    for (const Case& e : cases) {
+        std::vector<char> edited = raw;
+        edited.insert(edited.begin() + e.at, e.section.begin(), e.section.end());
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, "Malformed POI parent-id remap: a second one").empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// Secondary pairs for a file the patcher keeps no record remap of are refused
+// in every mode: a list of one pair for admin_polygons.bin (whose pairs go in
+// the parent-id remap) or for file 37, past every file (PatchFileId::COUNT).
+// Empty lists for them pass, as the diff's own empty lists do: that patch, and
+// the patch as made (20 secondary-matched POIs, 20 moved street ways with
+// addresses), apply.
+TEST(patch_refuses_secondary_pairs_for_a_file_without_a_record_remap) {
+    ScratchDir dir("patch-foreign-pairs");
+    BuildDir old_d, new_d, old_meta, new_meta;
+    put_moved_ways(old_d, new_d, old_meta, new_meta, 20, 0);
+    put_changed_pois(old_d, new_d, 20);
+    const LowMemCase c{dir.path(), "foreign"};
+    REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    const size_t head = find_once(raw, secondary_remap_head(20));
+    REQUIRE(head != std::string::npos);
+    // Where the secondary remap's file count sits, and where it ends (after
+    // the POIs' pairs and the place nodes' empty list).
+    const size_t n_files = head + 4, end = head + 40 + 20 * 8 + 8;
+    const uint32_t admin = static_cast<uint32_t>(PatchFileId::ADMIN_POLYGONS), past = static_cast<uint32_t>(PatchFileId::COUNT);
+    // The patch with lists (file id, pair count, pairs) after the five the
+    // diff wrote.
+    auto with_lists = [&](uint32_t n, std::initializer_list<uint32_t> words) {
+        std::vector<char> p = raw, lists;
+        put_at(p, n_files, 5 + n);
+        for (const uint32_t w : words) append(lists, w);
+        p.insert(p.begin() + end, lists.begin(), lists.end());
+        return p;
+    };
+
+    struct Case {
+        std::string name;
+        std::vector<char> patch;
+        std::string refusal;
+    };
+    const Case cases[] = {
+        {"admin", with_lists(1, {admin, 1, 0, 1}), "Malformed secondary remap: pairs for admin_polygons.bin, which has none"},
+        {"past-every-file", with_lists(1, {past, 1, 0, 1}), "Malformed secondary remap: pairs for file 37, which has none"},
+    };
+    for (const Case& e : cases) {
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, e.patch));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    REQUIRE(write_patch(c, c.patch(), with_lists(2, {admin, 0, past, 0})));
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// A merge section of more records than the patcher's limit (--file-records-max,
+// FILE_RECORDS_MAX: the u32 record indices' own, lower for tests) is refused
+// in every mode before it is replayed, by its file and day: ten POIs, four of
+// them points, and the new day's with an eleventh, a polygon, under a limit
+// of 10 (the new POI records), the other way round under 10 too (the old
+// ones), and under one less than the new day's vertex bytes (the POIs' child
+// stream, a byte a record, which the low-memory mode replays with its parent).
+// Under the most records a file of either patch holds (those vertex bytes),
+// both patches apply.
+TEST(patch_refuses_a_merge_section_of_more_records_than_its_limit) {
+    ScratchDir dir("patch-file-records");
+    std::mt19937 rng(20261101);
+    const std::vector<Poi> ten = pois_of(rng, 10, 0, true);
+    std::vector<Poi> eleven = ten;
+    eleven.push_back({10, block(rng, 4)});
+    BuildDir small, large;
+    put_pois(small, ten);
+    put_pois(large, eleven);
+    const LowMemCase grows{dir.path(), "grows"}, shrinks{dir.path(), "shrinks"};
+    REQUIRE(prepare(grows, small, large).empty());
+    REQUIRE(prepare(shrinks, large, small).empty());
+    const uint64_t vertices = large["poi_vertices.bin"].size();
+    auto limit = [](uint64_t n) { return std::vector<std::string>{"--file-records-max", std::to_string(n)}; };
+    auto refusal = [](const char* side, const char* file, uint64_t n, uint64_t max) {
+        return std::string(side) + " " + file + " holds " + std::to_string(n) + " records, more than the " + std::to_string(max) +
+               " a patch can index";
+    };
+
+    struct Case {
+        const LowMemCase& c;
+        std::string name;
+        uint64_t limit;
+        std::string refusal;
+    };
+    const Case cases[] = {
+        {grows, "new-records", 10, refusal("New", "poi_records.bin", 11, 10)},
+        {shrinks, "old-records", 10, refusal("Old", "poi_records.bin", 11, 10)},
+        {grows, "new-vertices", vertices - 1, refusal("New", "poi_vertices.bin", vertices, vertices - 1)},
+    };
+    for (const Case& e : cases) CHECK(not_refused(e.c, ALL_MODES, e.c.patch(), e.name, e.refusal, limit(e.limit)).empty());
+    for (const LowMemCase& c : {grows, shrinks}) CHECK(apply_modes(c, ALL_MODES, {}, limit(vertices)).bad.empty());
 }
 
 // String fixups the replay can't take are refused in every mode: 10 POIs

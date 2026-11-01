@@ -661,6 +661,96 @@ TEST(patch_diff_refuses_offset_fixups_past_the_sections_limit) {
     CHECK(!std::filesystem::exists(patch));
 }
 
+// A record file of more records than the diff's limit (--file-records-max,
+// FILE_RECORDS_MAX: the u32 record indices' own, lower for tests) is refused
+// before it is diffed, by its name and day, and no patch is written: street
+// ways of 2 and 3 records, either way round, under a limit of 2; their nodes
+// (8 bytes a record), 2 and 4, under 3; and the admin polygons a POI tier
+// borrows from its quality/q2.5 sibling, 3 and 2, under 2. Under 3 the ways
+// round-trip. A limit past FILE_RECORDS_MAX is refused.
+TEST(patch_diff_refuses_a_record_file_past_the_limit) {
+    const NodeCoord x{10.0f, 20.0f}, y{11.0f, 21.0f}, z{12.0f, 22.0f}, w{13.0f, 23.0f};
+    BuildDir two = with_pool(OLD_POOL), three = with_pool(OLD_POOL), four_nodes = with_pool(OLD_POOL);
+    two["street_ways.bin"] = bytes_of(std::vector<WayHeader>{{0, 1, 0, NAME_2}, {1, 1, 0, NAME_4}});
+    two["street_nodes.bin"] = bytes_of(std::vector<NodeCoord>{x, y});
+    three["street_ways.bin"] = bytes_of(std::vector<WayHeader>{{0, 1, 0, NAME_2}, {1, 1, 0, NAME_4}, {2, 1, 0, NAME_4}});
+    three["street_nodes.bin"] = bytes_of(std::vector<NodeCoord>{x, y, z});
+    four_nodes["street_ways.bin"] = bytes_of(std::vector<WayHeader>{{0, 1, 0, NAME_2}, {1, 3, 0, NAME_4}});
+    four_nodes["street_nodes.bin"] = bytes_of(std::vector<NodeCoord>{x, y, z, w});
+    const RoundTrip at_limit = round_trip(two, three, {}, {"--file-records-max", "3"});
+    CHECK(at_limit.mismatches.empty());
+
+    ScratchDir dir("patch-diff-file-records");
+    const std::string& root = dir.path();
+    // The diff of old_d to new_d (in root/<name>/old and new, or in their
+    // poi/major dirs with the q2.5 sibling `sibling`) under `limit`: its log
+    // when it refused, else "", and whether it wrote no patch.
+    auto refusal = [&](const std::string& name, const BuildDir& old_d, const BuildDir& new_d, const std::string& limit,
+                       const std::string& variant = "", const std::pair<BuildDir, BuildDir>& sibling = {}) {
+        const std::string at = root + "/" + name, patch = at + "/p.gcpatch", log = at + "/diff.log";
+        REQUIRE(write_dir(at + "/old" + variant, old_d) && write_dir(at + "/new" + variant, new_d));
+        if (!variant.empty()) REQUIRE(write_dir(at + "/old/quality/q2.5", sibling.first) && write_dir(at + "/new/quality/q2.5", sibling.second));
+        const bool ran =
+            run({GEOCODER_DIFF_BIN, at + "/old" + variant, at + "/new" + variant, "-o", patch, "--file-records-max", limit}, log);
+        const std::vector<char> text = read_file(log);
+        return std::pair(ran ? std::string() : std::string(text.begin(), text.end()), !std::filesystem::exists(patch));
+    };
+    auto refused_with = [](const std::pair<std::string, bool>& r, const std::string& why) {
+        return r.first.find(why) != std::string::npos && r.second;
+    };
+    CHECK(refused_with(refusal("grows", two, three, "2"), "New street_ways.bin holds 3 records, more than the 2 a patch can index"));
+    CHECK(refused_with(refusal("shrinks", three, two, "2"), "Old street_ways.bin holds 3 records, more than the 2 a patch can index"));
+    CHECK(refused_with(refusal("nodes", two, four_nodes, "3"), "New street_nodes.bin holds 4 records, more than the 3 a patch can index"));
+    BuildDir poi_tier;
+    poi_tier["poi_records.bin"] = std::vector<char>(POI_RECORD_STRIDE, 0);
+    const std::pair<BuildDir, BuildDir> admins{{{"admin_polygons.bin", std::vector<char>(3 * ADMIN_POLYGON_STRIDE, 0)}},
+                                               {{"admin_polygons.bin", std::vector<char>(2 * ADMIN_POLYGON_STRIDE, 0)}}};
+    CHECK(refused_with(refusal("borrowed", poi_tier, poi_tier, "2", "/poi/major", admins),
+                       "Old admin_polygons.bin holds 3 records, more than the 2 a patch can index"));
+    // Address points that aren't whole 28-byte points merge at stride 16, as
+    // an empty file's do, and the patcher counts a section's records at its
+    // stride: 3 old and 2 new (48 and 32 bytes, 1 point each at 28) round-trip
+    // under 3 and are refused under 2.
+    BuildDir addrs_16_old = with_pool(OLD_POOL), addrs_16_new = with_pool(OLD_POOL);
+    addrs_16_old["addr_points.bin"] = std::vector<char>(3 * 16, 0);
+    addrs_16_new["addr_points.bin"] = std::vector<char>(2 * 16, 0);
+    CHECK(round_trip(addrs_16_old, addrs_16_new, {}, {"--file-records-max", "3"}).mismatches.empty());
+    CHECK(refused_with(refusal("stride-16", addrs_16_old, addrs_16_new, "2"),
+                       "Old addr_points.bin holds 3 records, more than the 2 a patch can index"));
+    CHECK(refused_with(refusal("option", two, three, "4294967295"), "--file-records-max takes 0 to 4294967294, not 4294967295"));
+}
+
+// The diff sizes a record file for the limit by the file, not by a mapping of
+// it: a new addr_vertices.bin one byte past FILE_RECORDS_MAX (sparse), in a
+// diff whose address space is capped below it so the file can't be mapped, is
+// refused by name and no patch is written. (A 32-bit build's size_t can't
+// hold a mapping of it either.)
+TEST(patch_diff_refuses_a_record_file_past_the_limit_it_cannot_map) {
+#ifdef __SANITIZE_ADDRESS__
+    std::printf("    SKIP a capped address space: the sanitizers' shadow memory needs more\n");
+#else
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(OLD_POOL);
+    old_d["addr_points.bin"] = new_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{addr_point(NAME_2, NO_DATA)});
+    new_d["addr_vertices.bin"] = {};
+    ScratchDir dir("patch-diff-unmappable");
+    const std::string root = dir.path(), patch = root + "/p.gcpatch", log = root + "/diff.log";
+    REQUIRE(write_dir(root + "/old", old_d) && write_dir(root + "/new", new_d));
+    std::filesystem::resize_file(root + "/new/addr_vertices.bin", uint64_t(FILE_RECORDS_MAX) + 1);
+    const bool ran = run({"/bin/sh", "-c", "ulimit -v 2097152 && exec \"$0\" \"$@\"", GEOCODER_DIFF_BIN, root + "/old",
+                          root + "/new", "-o", patch},
+                         log);
+    const std::vector<char> text = read_file(log);
+    const std::string said(text.begin(), text.end());
+    const bool refused = said.find("New addr_vertices.bin holds 4294967295 records, more than the 4294967294 a patch can index") !=
+                         std::string::npos;
+    if (!refused)
+        std::printf("    the capped diff (exit %s) ends: %s\n", ran ? "0" : "non-zero",
+                    said.substr(said.size() > 300 ? said.size() - 300 : 0).c_str());
+    CHECK(!ran && refused);
+    CHECK(!std::filesystem::exists(patch));
+#endif
+}
+
 // The second cell of each identity round trip lists only records the day
 // kept, so no correction rebuilds it: the derived remaps (MATCH, REPLACE and
 // the moved pairs) alone must give its new lists. The logged identity stats

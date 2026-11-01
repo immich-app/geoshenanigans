@@ -375,10 +375,22 @@ static constexpr EntriesFiles CELL_INDEX_ENTRIES_FILES = {PatchFileId::ADMIN_ENT
 //   for each: file_id(4), n_pairs(4), [(old_id:u32, new_id:u32)] × n_pairs
 // Each file's pairs ascending by old_id, each id once (v11); the patcher
 // reads them where they sit and refuses a file's pairs out of order or with
-// an old id twice, a second list with pairs for a file (replayed or sent
-// unchanged), and street_ways pairs when the parent-id remap's street leg has
-// some.
+// an old id twice, pairs for a file not in REMAPPED_RECORD_FILES, a second
+// list with pairs for a file (replayed or sent unchanged), and street_ways
+// pairs when the parent-id remap's street leg has some.
 static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
+
+// The record files whose old → new record ids the patcher keeps (RecordRemap)
+// for the entry pipeline's geo, POI and place indexes: the secondary remap
+// gives pairs for these and no other (the admin polygons' go in the parent-id
+// remap).
+static constexpr PatchFileId REMAPPED_RECORD_FILES[] = {PatchFileId::STREET_WAYS, PatchFileId::ADDR_POINTS,
+                                                        PatchFileId::INTERP_WAYS, PatchFileId::POI_RECORDS,
+                                                        PatchFileId::PLACE_NODES};
+inline bool is_remapped_record_file(uint32_t fid) {
+    return std::find(std::begin(REMAPPED_RECORD_FILES), std::end(REMAPPED_RECORD_FILES), static_cast<PatchFileId>(fid)) !=
+           std::end(REMAPPED_RECORD_FILES);
+}
 
 // The strings section, read by position right after the old file sizes
 // (UNSECTIONED_OLD_FILES). Its marker shares 0xFFFFFFF6 with
@@ -520,6 +532,32 @@ constexpr uint32_t PARALLEL_DELTA_STRIDE = 0xFA;
 // The widest record a merge section may give (the patcher sizes a record buffer by it): the
 // widest real record is 36 bytes, and every stride from 0xFA up to here is a section kind.
 static constexpr uint32_t MAX_RECORD_STRIDE = 0xFF;
+// The most records a merge section's old or new file may hold: record indices are u32s below
+// NO_DATA (0xFFFFFFFF) in the diff's id remaps and secondary matches and in the patcher's
+// RecordRemap, so a file of more would wrap them. A byte stream's records are its bytes. Lower for
+// tests (--file-records-max).
+static constexpr uint32_t FILE_RECORDS_MAX = 0xFFFFFFFE;
+
+// Refuses a merge of `file` whose old or new file (of old_size and new_size bytes) holds more than
+// max records of stride bytes: the diff before it diffs the file, the patcher before it replays the
+// section.
+inline void require_merge_records(const std::string& file, uint64_t old_size, uint64_t new_size, uint64_t stride,
+                                  uint32_t max) {
+    for (const auto& [side, size] : {std::pair<const char*, uint64_t>{"Old", old_size}, {"New", new_size}})
+        if (size / stride > max)
+            throw std::runtime_error(std::string(side) + " " + file + " holds " + std::to_string(size / stride) +
+                                     " records, more than the " + std::to_string(max) + " a patch can index");
+}
+
+// A tool option's value of 0 to max, in out; false (said) when it is not one.
+inline bool u32_option(const std::string& option, const std::string& n, uint32_t max, uint32_t& out) {
+    if (n.empty() || n.size() > 10 || n.find_first_not_of("0123456789") != std::string::npos || std::stoull(n) > max) {
+        std::cerr << option << " takes 0 to " << max << ", not " << n << std::endl;
+        return false;
+    }
+    out = static_cast<uint32_t>(std::stoull(n));
+    return true;
+}
 // The patcher writes a MATCH run's rewritten records this many bytes at a time.
 static constexpr size_t RECORD_BATCH_BYTES = size_t(16) << 10;
 static_assert(RECORD_BATCH_BYTES >= MAX_RECORD_STRIDE, "a batch holds at least one record");

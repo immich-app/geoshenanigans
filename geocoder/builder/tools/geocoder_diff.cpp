@@ -8,7 +8,7 @@
 // Patch format: custom binary, zstd-compressed as a whole for transport.
 //
 // Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META] [--string-pairs-max N]
-//                      [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N]
+//                      [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N] [--file-records-max N]
 //
 // GCPATCH v8: with --identity, street / interp / addr records match across
 // days by the server-side identity sidecars <META>/{street,interp,addr}.slot.u32
@@ -726,10 +726,51 @@ static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uin
     return mask;
 }
 
+// Where a variant without its own street ways and nodes (the admin and POI
+// variants) or admin polygons and vertices (the POI tiers) borrows its
+// sibling's, in the order tried (try_load_with_fallback).
+static constexpr std::initializer_list<const char*> FULL_SIBLINGS = {"../full/", "../../full/"};
+static constexpr std::initializer_list<const char*> Q25_SIBLINGS = {"../../quality/q2.5/", "../quality/q2.5/"};
+
+// The stride addr_points.bin merges at, by its size: an empty or absent one,
+// or one that isn't whole address points, goes out as stride 16, as patches
+// have always sent it.
+static size_t addr_points_stride(uint64_t size) {
+    return size % ADDR_POINT_STRIDE == 0 && size > 0 ? ADDR_POINT_STRIDE : 16;
+}
+template <size_t STRIDE>
+static size_t fixed_stride(uint64_t) {
+    return STRIDE;
+}
+
+// The record files the merges read, by the stride their merge sections give
+// for a new file of its size (a byte stream's is 1, a node's lat and lng 8),
+// and the siblings a variant without its own borrows them from.
+struct MergedFile {
+    PatchFileId id;
+    size_t (*stride_of)(uint64_t new_size);
+    std::initializer_list<const char*> siblings;
+};
+static constexpr MergedFile MERGED_FILES[] = {
+    {PatchFileId::STREET_WAYS, fixed_stride<WAY_HEADER_STRIDE>, FULL_SIBLINGS},
+    {PatchFileId::STREET_NODES, fixed_stride<8>, FULL_SIBLINGS},
+    {PatchFileId::INTERP_WAYS, fixed_stride<INTERP_WAY_STRIDE>, {}},
+    {PatchFileId::INTERP_NODES, fixed_stride<8>, {}},
+    {PatchFileId::ADDR_POINTS, addr_points_stride, {}},
+    {PatchFileId::ADDR_VERTICES, fixed_stride<1>, {}},
+    {PatchFileId::ADMIN_POLYGONS, fixed_stride<ADMIN_POLYGON_STRIDE>, Q25_SIBLINGS},
+    {PatchFileId::ADMIN_VERTICES, fixed_stride<1>, Q25_SIBLINGS},
+    {PatchFileId::POI_RECORDS, fixed_stride<POI_RECORD_STRIDE>, {}},
+    {PatchFileId::POI_VERTICES, fixed_stride<1>, {}},
+    {PatchFileId::PLACE_NODES, fixed_stride<PLACE_NODE_STRIDE>, {}},
+    {PatchFileId::POSTAL_POLYGONS, fixed_stride<ADMIN_POLYGON_STRIDE>, {}},
+    {PatchFileId::POSTAL_VERTICES, fixed_stride<1>, {}},
+};
+
 static int run(int argc, char* argv[]) {
     const char* usage =
         "Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META] [--string-pairs-max N]"
-        " [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N]";
+        " [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N] [--file-records-max N]";
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << usage << std::endl;
         return 1;
@@ -743,15 +784,8 @@ static int run(int argc, char* argv[]) {
     // Lower for tests.
     StringFixupLimits string_fixup_limits;
     OffsetFixupLimits offset_fixup_limits;
-    // An option's value of 0 to max, in out; false (said) when it is not one.
-    auto u32_option = [](const std::string& option, const std::string& n, uint32_t max, uint32_t& out) {
-        if (n.empty() || n.size() > 10 || n.find_first_not_of("0123456789") != std::string::npos || std::stoull(n) > max) {
-            std::cerr << option << " takes 0 to " << max << ", not " << n << std::endl;
-            return false;
-        }
-        out = static_cast<uint32_t>(std::stoull(n));
-        return true;
-    };
+    // The most records a merged file may hold. Lower for tests.
+    uint32_t file_records_max = FILE_RECORDS_MAX;
     for (int a = 5; a < argc; a++) {
         const std::string arg = argv[a];
         if (arg == "--identity" && a + 2 < argc) { id_old_meta = argv[a + 1]; id_new_meta = argv[a + 2]; a += 2; }
@@ -763,6 +797,9 @@ static int run(int argc, char* argv[]) {
         }
         else if (arg == "--offset-fixup-bytes-max" && a + 1 < argc) {
             if (!u32_option(arg, argv[++a], UINT32_MAX, offset_fixup_limits.bytes)) return 1;
+        }
+        else if (arg == "--file-records-max" && a + 1 < argc) {
+            if (!u32_option(arg, argv[++a], FILE_RECORDS_MAX, file_records_max)) return 1;
         }
         else { std::cerr << "Unknown argument " << arg << std::endl << usage << std::endl; return 1; }
     }
@@ -842,6 +879,25 @@ static int run(int argc, char* argv[]) {
         }
         return {m, false};
     };
+    // Every record file the merges read, old and new, is refused before it is
+    // diffed when it holds more records than a patch can index. Its size is
+    // the first non-empty one of the dir's own and its siblings', as the
+    // merges' loads find it, but from stat: a mapping's is narrowed to a 32-bit
+    // size_t, and 0 for a file that can't be mapped.
+    for (const MergedFile& f : MERGED_FILES) {
+        const char* name = patch_file_names[static_cast<uint32_t>(f.id)];
+        auto size_in = [&](const std::string& dir) -> uint64_t {
+            std::vector<std::string> paths{dir + "/" + name};
+            for (const char* sibling : f.siblings) paths.push_back(dir + "/" + sibling + name);
+            for (const std::string& path : paths) {
+                struct stat st;
+                if (stat(path.c_str(), &st) == 0 && st.st_size > 0) return static_cast<uint64_t>(st.st_size);
+            }
+            return 0;
+        };
+        const uint64_t old_size = size_in(old_dir), new_size = size_in(new_dir);
+        require_merge_records(name, old_size, new_size, f.stride_of(new_size), file_records_max);
+    }
     // A shipped tier is rebuilt from the client's own old file, so both
     // sides come from the dir itself. The others are only remapped through
     // and may be borrowed; a newly shipped one is sent whole at the end.
@@ -1017,16 +1073,10 @@ static int run(int argc, char* argv[]) {
         double gs = now_ms();
         auto old_m = mmap_file_rw(old_dir + "/addr_points.bin");
         auto new_m = mmap_file(new_dir + "/addr_points.bin");
-        // An empty or absent addr_points.bin goes out as stride 16, as
-        // patches have always sent it. We can only run the merge if old
-        // and new have the same stride, so a dir that gains or loses its
-        // address points can't be patched.
-        auto detect_addr_stride = [](size_t sz) -> size_t {
-            if (sz % ADDR_POINT_STRIDE == 0 && sz > 0) return ADDR_POINT_STRIDE;
-            return 16;
-        };
-        size_t old_stride = detect_addr_stride(old_m.size);
-        size_t new_stride = detect_addr_stride(new_m.size);
+        // We can only run the merge if old and new have the same stride, so
+        // a dir that gains or loses its address points can't be patched.
+        size_t old_stride = addr_points_stride(old_m.size);
+        size_t new_stride = addr_points_stride(new_m.size);
         if (old_stride != new_stride) {
             std::cerr << "  addr_points: stride mismatch (old=" << old_stride
                       << ", new=" << new_stride << ") — cannot patch" << std::endl;
@@ -1172,10 +1222,8 @@ static int run(int argc, char* argv[]) {
     bool street_from_fallback = false;
     std::thread t_street([&]() {
         double gs = now_ms();
-        auto [old_w, ow_fb] = try_load_with_fallback_rw(old_dir, "street_ways.bin",
-                                                         {"../full/", "../../full/"});
-        auto [new_w, nw_fb] = try_load_with_fallback(new_dir, "street_ways.bin",
-                                                      {"../full/", "../../full/"});
+        auto [old_w, ow_fb] = try_load_with_fallback_rw(old_dir, "street_ways.bin", FULL_SIBLINGS);
+        auto [new_w, nw_fb] = try_load_with_fallback(new_dir, "street_ways.bin", FULL_SIBLINGS);
         street_from_fallback = (ow_fb || nw_fb);
         const bool unchanged = !street_from_fallback && sent_unchanged(old_w.data, old_w.size, new_w.data, new_w.size);
         std::pair<std::vector<uint32_t>, std::vector<uint32_t>> street_ids;
@@ -1202,10 +1250,8 @@ static int run(int argc, char* argv[]) {
         }
 
         remap_string_fields(old_w.data, old_w.size, PatchFileId::STREET_WAYS, way_stride, str_remap);
-        auto [old_n, _on_fb] = try_load_with_fallback(old_dir, "street_nodes.bin",
-                                                       {"../full/", "../../full/"});
-        auto [new_n, _nn_fb] = try_load_with_fallback(new_dir, "street_nodes.bin",
-                                                       {"../full/", "../../full/"});
+        auto [old_n, _on_fb] = try_load_with_fallback(old_dir, "street_nodes.bin", FULL_SIBLINGS);
+        auto [new_n, _nn_fb] = try_load_with_fallback(new_dir, "street_nodes.bin", FULL_SIBLINGS);
         madvise(const_cast<char*>(old_n.data), old_n.size, MADV_SEQUENTIAL);
         madvise(const_cast<char*>(new_n.data), new_n.size, MADV_SEQUENTIAL);
         // Fixup node_offsets
@@ -1335,10 +1381,8 @@ static int run(int argc, char* argv[]) {
     bool admin_from_fallback = false;
     std::thread t_admin([&]() {
         double gs = now_ms();
-        auto [old_data, old_fb] = try_load_with_fallback_rw(old_dir, "admin_polygons.bin",
-                                                             {"../../quality/q2.5/", "../quality/q2.5/"});
-        auto [new_data, new_fb] = try_load_with_fallback_rw(new_dir, "admin_polygons.bin",
-                                                             {"../../quality/q2.5/", "../quality/q2.5/"});
+        auto [old_data, old_fb] = try_load_with_fallback_rw(old_dir, "admin_polygons.bin", Q25_SIBLINGS);
+        auto [new_data, new_fb] = try_load_with_fallback_rw(new_dir, "admin_polygons.bin", Q25_SIBLINGS);
         admin_from_fallback = (old_fb || new_fb);
         // Zero only actual padding bytes (14-15), preserve place_type_override at byte 13
         for (size_t i = 0; i + admin_stride <= old_data.size; i += admin_stride)
@@ -1348,10 +1392,8 @@ static int run(int argc, char* argv[]) {
         remap_string_fields(old_data.data, old_data.size, PatchFileId::ADMIN_POLYGONS, admin_stride, str_remap);
         // admin_vertices.bin lives next to admin_polygons.bin in every
         // build mode, so it follows the same fallback resolution.
-        auto [old_v, _ov_fb] = try_load_with_fallback(old_dir, "admin_vertices.bin",
-                                                       {"../../quality/q2.5/", "../quality/q2.5/"});
-        auto [new_v, _nv_fb] = try_load_with_fallback(new_dir, "admin_vertices.bin",
-                                                       {"../../quality/q2.5/", "../quality/q2.5/"});
+        auto [old_v, _ov_fb] = try_load_with_fallback(old_dir, "admin_vertices.bin", Q25_SIBLINGS);
+        auto [new_v, _nv_fb] = try_load_with_fallback(new_dir, "admin_vertices.bin", Q25_SIBLINGS);
         madvise(const_cast<char*>(old_v.data), old_v.size, MADV_SEQUENTIAL);
         madvise(const_cast<char*>(new_v.data), new_v.size, MADV_SEQUENTIAL);
         size_t n = old_data.size / admin_stride;
