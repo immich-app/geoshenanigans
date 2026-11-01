@@ -726,6 +726,12 @@ static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uin
     return mask;
 }
 
+// Where a variant without its own street ways and nodes (the admin and POI
+// variants) or admin polygons and vertices (the POI tiers) borrows its
+// sibling's, in the order tried (try_load_with_fallback).
+static constexpr std::initializer_list<const char*> FULL_SIBLINGS = {"../full/", "../../full/"};
+static constexpr std::initializer_list<const char*> Q25_SIBLINGS = {"../../quality/q2.5/", "../quality/q2.5/"};
+
 static int run(int argc, char* argv[]) {
     const char* usage =
         "Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META] [--string-pairs-max N]"
@@ -1172,10 +1178,8 @@ static int run(int argc, char* argv[]) {
     bool street_from_fallback = false;
     std::thread t_street([&]() {
         double gs = now_ms();
-        auto [old_w, ow_fb] = try_load_with_fallback_rw(old_dir, "street_ways.bin",
-                                                         {"../full/", "../../full/"});
-        auto [new_w, nw_fb] = try_load_with_fallback(new_dir, "street_ways.bin",
-                                                      {"../full/", "../../full/"});
+        auto [old_w, ow_fb] = try_load_with_fallback_rw(old_dir, "street_ways.bin", FULL_SIBLINGS);
+        auto [new_w, nw_fb] = try_load_with_fallback(new_dir, "street_ways.bin", FULL_SIBLINGS);
         street_from_fallback = (ow_fb || nw_fb);
         const bool unchanged = !street_from_fallback && sent_unchanged(old_w.data, old_w.size, new_w.data, new_w.size);
         std::pair<std::vector<uint32_t>, std::vector<uint32_t>> street_ids;
@@ -1202,10 +1206,8 @@ static int run(int argc, char* argv[]) {
         }
 
         remap_string_fields(old_w.data, old_w.size, PatchFileId::STREET_WAYS, way_stride, str_remap);
-        auto [old_n, _on_fb] = try_load_with_fallback(old_dir, "street_nodes.bin",
-                                                       {"../full/", "../../full/"});
-        auto [new_n, _nn_fb] = try_load_with_fallback(new_dir, "street_nodes.bin",
-                                                       {"../full/", "../../full/"});
+        auto [old_n, _on_fb] = try_load_with_fallback(old_dir, "street_nodes.bin", FULL_SIBLINGS);
+        auto [new_n, _nn_fb] = try_load_with_fallback(new_dir, "street_nodes.bin", FULL_SIBLINGS);
         madvise(const_cast<char*>(old_n.data), old_n.size, MADV_SEQUENTIAL);
         madvise(const_cast<char*>(new_n.data), new_n.size, MADV_SEQUENTIAL);
         // Fixup node_offsets
@@ -1335,10 +1337,8 @@ static int run(int argc, char* argv[]) {
     bool admin_from_fallback = false;
     std::thread t_admin([&]() {
         double gs = now_ms();
-        auto [old_data, old_fb] = try_load_with_fallback_rw(old_dir, "admin_polygons.bin",
-                                                             {"../../quality/q2.5/", "../quality/q2.5/"});
-        auto [new_data, new_fb] = try_load_with_fallback_rw(new_dir, "admin_polygons.bin",
-                                                             {"../../quality/q2.5/", "../quality/q2.5/"});
+        auto [old_data, old_fb] = try_load_with_fallback_rw(old_dir, "admin_polygons.bin", Q25_SIBLINGS);
+        auto [new_data, new_fb] = try_load_with_fallback_rw(new_dir, "admin_polygons.bin", Q25_SIBLINGS);
         admin_from_fallback = (old_fb || new_fb);
         // Zero only actual padding bytes (14-15), preserve place_type_override at byte 13
         for (size_t i = 0; i + admin_stride <= old_data.size; i += admin_stride)
@@ -1348,10 +1348,8 @@ static int run(int argc, char* argv[]) {
         remap_string_fields(old_data.data, old_data.size, PatchFileId::ADMIN_POLYGONS, admin_stride, str_remap);
         // admin_vertices.bin lives next to admin_polygons.bin in every
         // build mode, so it follows the same fallback resolution.
-        auto [old_v, _ov_fb] = try_load_with_fallback(old_dir, "admin_vertices.bin",
-                                                       {"../../quality/q2.5/", "../quality/q2.5/"});
-        auto [new_v, _nv_fb] = try_load_with_fallback(new_dir, "admin_vertices.bin",
-                                                       {"../../quality/q2.5/", "../quality/q2.5/"});
+        auto [old_v, _ov_fb] = try_load_with_fallback(old_dir, "admin_vertices.bin", Q25_SIBLINGS);
+        auto [new_v, _nv_fb] = try_load_with_fallback(new_dir, "admin_vertices.bin", Q25_SIBLINGS);
         madvise(const_cast<char*>(old_v.data), old_v.size, MADV_SEQUENTIAL);
         madvise(const_cast<char*>(new_v.data), new_v.size, MADV_SEQUENTIAL);
         size_t n = old_data.size / admin_stride;
