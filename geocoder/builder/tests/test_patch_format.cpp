@@ -335,7 +335,6 @@ TEST(patch_format_section_marker_values) {
     CHECK_EQ(CELL_CHANGES_ADMIN_MARKER, uint32_t(0xFFFFFFFA));
     CHECK_EQ(CELL_CHANGES_POI_MARKER, uint32_t(0xFFFFFFF5));
     CHECK_EQ(CELL_CHANGES_PLACE_MARKER, uint32_t(0xFFFFFFF4));
-    CHECK_EQ(ENTRY_CORRECTION_MARKER, uint32_t(0xFFFFFFF8));
     CHECK_EQ(GEO_ENTRY_DELTA_MARKER, uint32_t(0xFFFFFFF0));
     CHECK_EQ(CELL_INDEX_DELTA_MARKER, uint32_t(0xFFFFFFF7));
     CHECK_EQ(SECONDARY_REMAP_MARKER, uint32_t(0xFFFFFFF6));
@@ -347,10 +346,9 @@ TEST(patch_format_section_marker_values) {
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v9 = string tiers in any order (each shipped tier's
-    // order word; an indexed tier sends its added strings' new indices). The
-    // patcher accepts this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(9));
+    // diff/patch tools. v10 = no entry corrections (a cell index delta for
+    // every admin / POI / place index). The patcher accepts this version only.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(10));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }

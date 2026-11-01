@@ -8,9 +8,10 @@
 //
 // Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--threads]
 //
-// Reads GCPATCH v9 ( REPLACE runs, street remap derived from the
+// Reads GCPATCH v10 ( REPLACE runs, street remap derived from the
 // street_ways replay, PARALLEL_DELTA_STRIDE side files, unmapped ids dropped
-// from street / addr / interp cell lists).
+// from street / addr / interp cell lists, a cell index delta for every admin /
+// POI / place index).
 //
 // Low-memory mode: when <current-dir> is an encoded installed set (it has a
 // gc.manifest, see gcs_patch.h), the encoded families' old files are decoded
@@ -351,14 +352,6 @@ private:
     size_t dropped_ = 0;  // a page multiple
 };
 
-// The ids as a vector, for the materialised rebuild a patch with entry
-// corrections takes.
-static std::vector<uint64_t> ids_vector(AscendingIds ids) {
-    std::vector<uint64_t> v;
-    for (; !ids.done(); ids.pop()) v.push_back(ids.front());
-    return v;
-}
-
 static int run(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << "Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--threads]" << std::endl;
@@ -515,8 +508,6 @@ static int run(int argc, char* argv[]) {
     CellChanges geo_cells, admin_cells, poi_cells, place_cells;
     EntriesFileSections geo_deltas("geo entry delta", GEO_ENTRIES_FILES);
     EntriesFileSections cell_index_deltas("cell index delta", CELL_INDEX_ENTRIES_FILES);
-    struct CellCorr { uint64_t cell_id; std::vector<uint32_t> ids; };
-    std::unordered_map<uint32_t, std::vector<CellCorr>> entry_corrections;
     // POI parent-id remap (from POI_PARENT_REMAP_MARKER), read where it sits.
     // Applied during POI_RECORDS MATCH replay to byte 32 of each record
     // alongside the str_remap on its string fields.
@@ -621,19 +612,6 @@ static int run(int argc, char* argv[]) {
             cell_index_deltas.add(fid, {pos, static_cast<size_t>(n)});
             patch.take(n, "cell index delta");
             std::cerr << "  Cell index delta " << fid << ": " << n << " bytes" << std::endl;
-            continue;
-        }
-        if (file_id == ENTRY_CORRECTION_MARKER) {
-            uint32_t fid = patch.u32(), c = patch.u32();
-            auto& list = entry_corrections[fid];
-            for (uint32_t i = 0; i < c; i++) {
-                uint64_t cid; memcpy(&cid, patch.take(8, "cell id"), 8);
-                uint16_t ec; memcpy(&ec, patch.take(2, "entry count"), 2);
-                std::vector<uint32_t> ids(ec);
-                if (ec > 0) memcpy(ids.data(), patch.take_items(ec, 4, "entry ids"), (size_t)ec * 4);
-                list.push_back({cid, std::move(ids)});
-            }
-            std::cerr << "  Entry corrections " << fid << ": " << c << std::endl;
             continue;
         }
 
@@ -1332,119 +1310,43 @@ static int run(int argc, char* argv[]) {
         log_phase("  Geo entries complete", t_entry);
         }  // geo walk
 
-        // Writes a rebuilt cell index; a cell the diff corrected takes the
-        // shipped id list instead of its rebuilt one.
-        auto write_corrected_cells = [&](const char* label, PatchFileId entries_fid,
-                                         const std::vector<char>& cells, const std::vector<char>& entries,
-                                         const std::string& cells_name, const std::string& entries_name) {
-            constexpr uint32_t no_data = 0xFFFFFFFF;
-            size_t n = cells.size() / 12;
-            auto ecit = entry_corrections.find((uint32_t)entries_fid);
-            if (ecit == entry_corrections.end()) {
-                if (!write_file(out_path(cells_name), cells) || !write_file(out_path(entries_name), entries))
-                    throw std::runtime_error("Cannot write " + cells_name);
-                std::cerr << "  " << label << ": " << n << " cells rebuilt" << std::endl;
-                return;
-            }
-            std::unordered_map<uint64_t, const std::vector<uint32_t>*> corr;
-            for (auto& c : ecit->second) corr[c.cell_id] = &c.ids;
-            FILE* fc = open_out(cells_name);
-            FILE* fe = open_out(entries_name);
-            uint32_t wpos = 0;
-            for (size_t i = 0; i < n; i++) {
-                uint64_t cid; memcpy(&cid, cells.data() + i * 12, 8);
-                fwrite(&cid, 8, 1, fc);
-                auto cit = corr.find(cid);
-                if (cit != corr.end()) {
-                    uint32_t off = cit->second->empty() ? no_data : wpos;
-                    fwrite(&off, 4, 1, fc);
-                    if (!cit->second->empty()) {
-                        uint16_t c = cit->second->size();
-                        fwrite(&c, 2, 1, fe); fwrite(cit->second->data(), 4, c, fe);
-                        wpos += 2 + c * 4;
-                    }
-                } else {
-                    uint32_t old_off; memcpy(&old_off, cells.data() + i * 12 + 8, 4);
-                    if (old_off != no_data && old_off + 2 <= entries.size()) {
-                        fwrite(&wpos, 4, 1, fc);
-                        uint16_t c; memcpy(&c, entries.data() + old_off, 2);
-                        fwrite(entries.data() + old_off, 1, 2 + c * 4, fe);
-                        wpos += 2 + c * 4;
-                    } else {
-                        fwrite(&no_data, 4, 1, fc);
-                    }
-                }
-            }
-            close_patch_outputs({{fc, cells_name}, {fe, entries_name}});
-            std::cerr << "  " << label << ": " << n << " cells, " << corr.size() << " corrections" << std::endl;
-        };
-
-        // An admin / POI / place index the diff sent a cell index delta for
-        // (every current build) is rebuilt and corrected in one streaming
-        // pass over the old files, holding one cell at a time. Returns false
-        // when there is no delta and the materialised rebuild + corrections
-        // has to run instead.
-        auto stream_rebuild = [&](const char* label, PatchFileId entries_fid, const std::string& prefix,
-                                  const CellChanges& changes, auto remap) -> bool {
-            const PatchRef* delta = cell_index_deltas.find(entries_fid);
-            if (!delta) return false;
-            advise_sequential(changes);
-            advise_sequential(P + delta->pos, delta->size);
-            SequentialFileReader old_c(cur_dir + "/" + prefix + "_cells.bin");
-            SequentialFileReader old_e(cur_dir + "/" + prefix + "_entries.bin");
-            FILE* fc = open_out(prefix + "_cells.bin");
-            FILE* fe = open_out(prefix + "_entries.bin");
-            size_t n_out = 0;
-            stream_cell_index(old_c, old_e, changes.added, changes.removed, remap, P + delta->pos, delta->size,
-                              [&](const char* p, size_t len) { fwrite(p, 1, len, fc); n_out += len; },
-                              [&](const char* p, size_t len) { fwrite(p, 1, len, fe); });
-            close_patch_outputs({{fc, prefix + "_cells.bin"}, {fe, prefix + "_entries.bin"}});
-            log_rewinds(old_c);
-            log_rewinds(old_e);
-            std::cerr << "  " << label << ": " << n_out / 12 << " cells, cell index delta" << std::endl;
-            return true;
-        };
-
-        // Admin: small, use existing rebuild + corrections
-        {
-            // The admin leg of the parent-id remap, as the diff used it.
-            auto admin_remap = [&](uint32_t id) { return poi_remap_lookup(poi_admin_remap, id); };
-            if (!stream_rebuild("Admin", PatchFileId::ADMIN_ENTRIES, "admin", admin_cells, admin_remap)) {
-                std::unordered_map<uint32_t,uint32_t> ad_rm;
-                poi_admin_remap.for_each([&](RemapPair p) { ad_rm[p.from] = p.to; });
-                auto old_ac = read_file(cur_dir + "/admin_cells.bin");
-                auto old_adme = read_file(cur_dir + "/admin_entries.bin");
-                auto admin = rebuild_cells_from_remap(old_ac, old_adme, ad_rm, ids_vector(admin_cells.added),
-                                                      ids_vector(admin_cells.removed));
-                write_corrected_cells("Admin", PatchFileId::ADMIN_ENTRIES, admin.cells_data,
-                                      admin.entries_data, "admin_cells.bin", "admin_entries.bin");
-            }
-            log_phase("  Admin", t_entry);
-        }
-
-        // POI and place: ids move by the replay's record remap file, read in
-        // place by the streaming pass (by id, so not as a sequential stream).
-        auto rebuild_by_record_remap = [&](const char* label, PatchFileId records_fid, PatchFileId entries_fid,
-                                           const std::string& prefix, const CellChanges& changes) {
-            const RecordRemap& rm = remap_of(records_fid);
-            auto record_remap = [&rm](uint32_t id) { uint32_t v = rm[id]; return v == 0xFFFFFFFFu ? id : v; };
-            if (!stream_rebuild(label, entries_fid, prefix, changes, record_remap)) {
-                std::unordered_map<uint32_t,uint32_t> rm_map;
-                for (uint32_t i = 0; i < rm.size(); i++)
-                    if (rm[i] != 0xFFFFFFFFu) rm_map[i] = rm[i];
-                const std::vector<uint64_t> added = ids_vector(changes.added), removed = ids_vector(changes.removed);
-                auto old_c = read_file(cur_dir + "/" + prefix + "_cells.bin");
-                auto old_e = read_file(cur_dir + "/" + prefix + "_entries.bin");
-                if (!old_c.empty() || !added.empty() || !removed.empty() || !rm_map.empty()) {
-                    auto rebuilt = rebuild_cells_from_remap(old_c, old_e, rm_map, added, removed);
-                    write_corrected_cells(label, entries_fid, rebuilt.cells_data, rebuilt.entries_data,
-                                          prefix + "_cells.bin", prefix + "_entries.bin");
-                }
+        // An admin / POI / place index the old dir holds or the new one lists
+        // is rebuilt and corrected by its cell index delta in one streaming
+        // pass over the old files, holding one cell at a time.
+        auto rebuild_cell_index = [&](const char* label, PatchFileId entries_fid, const std::string& prefix,
+                                      const CellChanges& changes, auto remap) {
+            const std::string cells_name = prefix + "_cells.bin", entries_name = prefix + "_entries.bin";
+            struct stat st;
+            if (const PatchRef* delta = cell_index_deltas.find(entries_fid)) {
+                advise_sequential(changes);
+                advise_sequential(P + delta->pos, delta->size);
+                SequentialFileReader old_c(cur_dir + "/" + cells_name);
+                SequentialFileReader old_e(cur_dir + "/" + entries_name);
+                FILE* fc = open_out(cells_name);
+                FILE* fe = open_out(entries_name);
+                size_t n_out = 0;
+                stream_cell_index(old_c, old_e, changes.added, changes.removed, remap, P + delta->pos, delta->size,
+                                  [&](const char* p, size_t len) { fwrite(p, 1, len, fc); n_out += len; },
+                                  [&](const char* p, size_t len) { fwrite(p, 1, len, fe); });
+                close_patch_outputs({{fc, cells_name}, {fe, entries_name}});
+                log_rewinds(old_c);
+                log_rewinds(old_e);
+                std::cerr << "  " << label << ": " << n_out / 12 << " cells, cell index delta" << std::endl;
+            } else if (listed.count(cells_name) || stat((cur_dir + "/" + cells_name).c_str(), &st) == 0) {
+                throw std::runtime_error("Patch has no cell index delta for " + prefix);
             }
             log_phase((std::string("  ") + label).c_str(), t_entry);
         };
-        rebuild_by_record_remap("POI", PatchFileId::POI_RECORDS, PatchFileId::POI_ENTRIES, "poi", poi_cells);
-        rebuild_by_record_remap("Place", PatchFileId::PLACE_NODES, PatchFileId::PLACE_ENTRIES, "place", place_cells);
+        // Admin ids move by the admin leg of the parent-id remap, as the diff used it.
+        rebuild_cell_index("Admin", PatchFileId::ADMIN_ENTRIES, "admin", admin_cells,
+                           [&](uint32_t id) { return poi_remap_lookup(poi_admin_remap, id); });
+        // POI and place ids move by their replay's record remap, read in place
+        // by the streaming pass (by id, so not as a sequential stream).
+        auto record_remap = [&](PatchFileId records_fid) {
+            return [&rm = remap_of(records_fid)](uint32_t id) { uint32_t v = rm[id]; return v == 0xFFFFFFFFu ? id : v; };
+        };
+        rebuild_cell_index("POI", PatchFileId::POI_ENTRIES, "poi", poi_cells, record_remap(PatchFileId::POI_RECORDS));
+        rebuild_cell_index("Place", PatchFileId::PLACE_ENTRIES, "place", place_cells, record_remap(PatchFileId::PLACE_NODES));
     }
 
     unmap_file(patch_map);

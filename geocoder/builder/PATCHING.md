@@ -188,7 +188,7 @@ for planet/poi/all's 12.8M.
 4. For coordinate files (nodes/vertices): derive merge from parent way/polygon merge — verify node blocks match before COPY, INSERT if nodes changed
 5. Derive ID remaps from merge sequences (MATCH ops define old→new record correspondence)
 6. **Secondary matching**: For DELETE/INSERT records in merge sequences, match by relaxed key (name + node_count for ways, street + housenumber for addrs, etc.) to recover ID mappings for modified-but-same-entity records
-7. Derive each cell's entry list from the old one (IDs remapped) and the cell changes, and compare it with the new one: street / addr / interp cells that differ go out as per-cell lost / gained ids (Geo Entry Deltas), the admin / POI / place cell indexes as a Cell Index Delta (whole-cell Entry Corrections where the new layout can't be rebuilt)
+7. Derive each cell's entry list from the old one (IDs remapped) and the cell changes, and compare it with the new one: street / addr / interp cells that differ go out as per-cell lost / gained ids (Geo Entry Deltas), the admin / POI / place cell indexes as a Cell Index Delta (v10: the diff refuses a new index whose layout the patcher can't rebuild byte for byte)
 8. Package everything, compress whole patch with zstd for transport
 
 **Patch tool:**
@@ -198,7 +198,7 @@ for planet/poi/all's 12.8M.
 4. Read secondary ID remaps → merge into derived ID mappings
 5. Read cell changes (added/removed cell IDs) and the per-cell entry deltas
 6. Rebuild geo_cells and the street / addr / interp entry files in one pass over the old geo index: each cell's lists with their IDs remapped, corrected by the cell's delta
-7. Rebuild the admin / POI / place cell indexes from their ID remaps + cell changes, corrected by the Cell Index Delta (or Entry Corrections)
+7. Rebuild the admin / POI / place cell indexes from their ID remaps + cell changes, corrected by the Cell Index Delta
 
 ## Known Issues
 
@@ -315,7 +315,7 @@ v8 data patch that day; applying the delta also needs memory for the whole
 old file (1.0 GB for poi.fst). Rebuilding costs no download and two to three
 and a half minutes of one core.
 
-## Patch Format (.gcpatch, version 9)
+## Patch Format (.gcpatch, version 10)
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
 pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
@@ -325,9 +325,9 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=9 (u32) + flags=0 (u32)
-  (a v9 patcher accepts only v9 patches; the v8 and v9 changes are marked
-  below)
+Header: "GCPATCH\0" (8) + version=10 (u32) + flags=0 (u32)
+  (a v10 patcher accepts only v10 patches; the v8, v9 and v10 changes are
+  marked below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   + n × {name_len:u16, name, size:u64, inline:u8, [bytes] if inline}
@@ -435,14 +435,17 @@ Geo Entry Deltas (street / addr / interp entries): marker 0xFFFFFFF0 (u32)
   and drops out of the derived list. At most one per entries file; the
   patcher refuses another file or a second one.
 
-Entry Corrections: marker 0xFFFFFFF8 (u32) + file_id (u32) + count (u32)
-  + [(cell_id:u64, entry_count:u16, [id:u32] × entry_count)] × count
-
 Cell Index Delta: marker 0xFFFFFFF7 (u32) + file_id (u32, the entries file)
   + payload_size (u64) + the cell list delta from the rebuilt admin / POI /
-  place index to the new one (same layout as stride=0xFB); replaces Entry
-  Corrections for that file. At most one per entries file; the patcher
-  refuses another file or a second one.
+  place index to the new one (same layout as stride=0xFB). At most one per
+  entries file; the patcher refuses another file or a second one. (v10) One
+  for every index the old or new dir holds: the patcher refuses a patch
+  without the delta of an index its dir holds or the patch lists ("Patch has
+  no cell index delta for <prefix>"). The patcher writes the index in the
+  builder's layout (each cell's list at the next offset, an empty one as a
+  zero count), and the diff refuses a new index in any other ("Cell index
+  <prefix> has a layout write_cell_lists can't reproduce"); Entry
+  Corrections (marker 0xFFFFFFF8, whole lists for such an index) are gone.
 
 End marker: 0xFFFFFFFF (u32)
 ```

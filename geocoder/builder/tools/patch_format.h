@@ -188,7 +188,10 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // word: a sorted tier's added strings go where they sort, an indexed one sends
 // each added string's new index, and a string its order moves travels as a
 // pair.
-static constexpr uint32_t GCPATCH_VERSION = 9;
+// v10: no entry corrections. Every admin / POI / place cell index the old dir
+// holds or the new one lists comes as a cell index delta, and the diff refuses
+// a new index the patcher couldn't rebuild byte for byte.
+static constexpr uint32_t GCPATCH_VERSION = 10;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -326,19 +329,12 @@ static constexpr uint32_t CELL_CHANGES_ADMIN_MARKER = 0xFFFFFFFA;
 static constexpr uint32_t CELL_CHANGES_POI_MARKER = 0xFFFFFFF5;
 static constexpr uint32_t CELL_CHANGES_PLACE_MARKER = 0xFFFFFFF4;
 
-// Entry correction marker: 0xFFFFFFF8
-// Cell-level diff of entries: lists cells whose entries differ between derived and new.
-// Format: marker(4), file_id(4), count(4),
-//   for each: cell_id(8), entry_count(2), [id(4)] * entry_count
-// cell_id is the S2 cell id (u64), NOT an array position — the patcher
-// binary-searches the cells file for it.
-static constexpr uint32_t ENTRY_CORRECTION_MARKER = 0xFFFFFFF8;
-
 // Cell index delta marker: 0xFFFFFFF7
 // An admin / POI / place cell index the patcher rebuilds from its id remap,
-// corrected per cell instead of by ENTRY_CORRECTION: a corrected cell costs
-// the ids it lost and gained, not its whole list. Sent when write_cell_lists
-// reproduces the new index byte for byte.
+// corrected per cell: a corrected cell costs the ids it lost and gained, not
+// its whole list. Sent for every index the old or the new dir holds; the
+// patcher writes the new index in write_cell_lists layout, so the diff
+// refuses a new index that layout doesn't reproduce byte for byte.
 // Format: marker(4), file_id(4) = the entries file, payload_size(u64),
 //   append_cell_list_delta(rebuilt → new) bytes.
 // At most one per file of CELL_INDEX_ENTRIES_FILES.
@@ -1127,9 +1123,11 @@ inline ParentIdRemap parse_parent_id_remap(const char* data, size_t size, size_t
 
 // --- Cell index rebuild ---
 
-// Admin, POI and place cell index rebuild: 12-byte cells (cell_id u64,
-// entry_offset u32) over (count u16, ids u32[]) entries. An id's top bit is
-// INTERIOR_FLAG, so the remap is keyed by the bare id and the flag carried over.
+// Admin, POI and place cell index rebuild, as the diff derives the index the
+// patcher rebuilds (stream_cell_index gives the same lists): 12-byte cells
+// (cell_id u64, entry_offset u32) over (count u16, ids u32[]) entries. An
+// id's top bit is INTERIOR_FLAG, so the remap is keyed by the bare id and the
+// flag carried over.
 struct RebuiltCells {
     std::vector<char> cells_data;
     std::vector<char> entries_data;
