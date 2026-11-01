@@ -329,7 +329,7 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0, uint64_t
     const std::vector<uint32_t> old_to_new = renumber_runs(order, starts, threads);
     order = {};
     starts = {};
-    renumber_cell_pairs(data.sorted_addr_cells, [&](uint32_t id) { return old_to_new[id]; }, threads);
+    renumber_onto_survivors(data.sorted_addr_cells, old_to_new, threads);
     std::cerr << "  Addr points sorted: " << n << std::endl;
 }
 
@@ -476,7 +476,7 @@ inline std::vector<uint32_t> sort_ways(ParsedData& data, unsigned threads = 0, u
     free_beside(std::move(data.street_nodes));
     data.ways = std::move(new_ways);
     data.street_nodes = std::move(repacked.items);
-    renumber_cell_pairs(data.sorted_way_cells, [&](uint32_t id) { return old_to_new[id]; }, threads);
+    renumber_onto_survivors(data.sorted_way_cells, old_to_new, threads);
     std::cerr << "  Ways sorted: " << n << " (" << (n - kept) << " duplicates removed)" << std::endl;
     return old_to_new;
 }

@@ -1,6 +1,8 @@
-// The serial deterministic-ordering steps as of d77ab8e, verbatim: the
-// byte layout the parallel steps in reorder.h and parsed_data.h must
-// reproduce for any input and thread count (test_reorder.cpp).
+// The serial deterministic-ordering steps as of d77ab8e, verbatim save one
+// change: the addr and way steps list each survivor once per cell, as the
+// interp step did. They give the byte layout the parallel steps in
+// reorder.h and parsed_data.h must reproduce for any input and thread count
+// (test_reorder.cpp).
 #pragma once
 
 #include <numeric>
@@ -309,6 +311,7 @@ inline void reorder_addr_points(ParsedData& data) {
             p.item_id = dedup_remap[old_to_new[p.item_id]];
         auto cmp = cell_item_less;
         std::sort(data.sorted_addr_cells.begin(), data.sorted_addr_cells.end(), cmp);
+        erase_repeated_pairs(data.sorted_addr_cells);
         std::cerr << "  Addr points sorted: " << n << std::endl;
     }
 }
@@ -402,6 +405,7 @@ inline void reorder_ways(ParsedData& data) {
         for (auto& p : data.sorted_way_cells) p.item_id = old_to_new[p.item_id];
         auto cmp = cell_item_less;
         std::sort(data.sorted_way_cells.begin(), data.sorted_way_cells.end(), cmp);
+        erase_repeated_pairs(data.sorted_way_cells);
         // Remap way_parent_ids + way_postcode_ids: reorder + dedup
         auto remap_way_vec = [&](std::vector<uint32_t>& vec) {
             if (vec.size() != n) return;
