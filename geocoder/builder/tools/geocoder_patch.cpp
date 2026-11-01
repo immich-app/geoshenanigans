@@ -1023,7 +1023,7 @@ static int run(int argc, char* argv[]) {
                     uint32_t old_off = 0, new_off = 0;
                     if (has_fixups) {
                         memcpy(&old_off, rec + fixup_off, 4);
-                        new_off = fixups.apply(static_cast<uint32_t>(old_rec + k), old_off);
+                        new_off = fixups.apply(uint64_t(old_rec) + k, old_off);
                     }
                     bool has_fixup = new_off != old_off;
                     if (has_fixup) modified = true;

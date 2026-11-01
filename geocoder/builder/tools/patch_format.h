@@ -2417,7 +2417,9 @@ OffsetFixups encode_offset_fixups(const std::vector<uint32_t>& old_offsets, Fixe
 // records theirs), a run of no records, a run or value index past the last
 // u32 record index (each bound summed in 64 bits), and, once the replay is
 // over (finish), a run or value past the old file's records or bytes past
-// the last of either.
+// the last of either. A record past the last u32 record index (of a file of
+// more than 0xFFFFFFFF records) keeps its offset: no run or value reaches
+// it, and the encoder refuses one there that moves (past_last_index).
 class OffsetFixupReader {
 public:
     OffsetFixupReader(const char* runs, size_t runs_size, uint32_t n_runs,
@@ -2428,8 +2430,11 @@ public:
         next_value();
     }
 
-    // Record idx's offset after the fixups, given its old offset.
-    uint32_t apply(uint32_t idx, uint32_t old) {
+    // Record idx's offset after the fixups, given its old offset. A record
+    // past the last u32 record index keeps it, checked before the value
+    // search: an exhausted value index sits at END, which is such a record's.
+    uint32_t apply(uint64_t idx, uint32_t old) {
+        if (idx >= END) return old;
         while (value_idx_ < idx) next_value();
         if (value_idx_ == idx) {
             if (old != END) malformed();
@@ -2451,8 +2456,9 @@ public:
     }
 
 private:
-    // NO_DATA, past every record index, and the start of no run: a run may
-    // end there (after record END - 1), but no run or value starts there.
+    // NO_DATA, past every record index a run or value gives, and the start
+    // of no run: a run may end there (after record END - 1), but no run or
+    // value starts there.
     static constexpr uint32_t END = 0xFFFFFFFFu;
 
     [[noreturn, gnu::cold, gnu::noinline]] static void malformed() { throw std::runtime_error("Malformed offset fixups"); }

@@ -490,7 +490,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   stream carries none: the low-memory mode refuses a count or a byte of them
   there ("Encoded set: a child stream with offset fixups"). The diff refuses
   a merge whose offset fixups would pass the header's u32s, or move a record
-  past the last u32 record index ("Offset fixups of <file>: ...").
+  past the last u32 record index ("Offset fixups of <file>: ..."), so the
+  patcher leaves the offset of a record at or past 0xFFFFFFFF as it is.
   String fixups (v12, StringFixupReader in tools/patch_format.h): each MATCH
   record's string field (string_field_offsets) that holds a moved string the
   strings section sends no pair for gets its new value here, in record
