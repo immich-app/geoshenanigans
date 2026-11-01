@@ -1,44 +1,183 @@
-name: 'Tiles Deploy'
+name: Tiles Deploy
 on:
   workflow_dispatch:
     inputs:
-      file_name:
-        description: 'The name of the file to deploy, defaults to newest file'
-        required: false
       environment:
-        description: 'Deployment environment'
+        description: 'Environment to deploy to'
         required: true
-        default: prod
+        default: dev
         type: choice
         options:
           - dev
           - prod
+      build:
+        description: 'Protomaps build to deploy (YYYYMMDD), defaults to the newest'
+        required: false
+        type: string
+      runner:
+        description: 'Runner for the download and upload (needs ~200 GB of free disk)'
+        required: false
+        default: pokedex-massive
+        type: string
+
+permissions: {}
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.inputs.environment }}
+  group: tiles-deploy-${{ inputs.environment }}
   cancel-in-progress: false
 
 env:
-  tofu_version: '1.11.6'
-  tg_version: '1.0.0'
+  TFVARS: deployment/modules/cloudflare/tiles-worker/tiles.${{ inputs.environment }}.tfvars.json
+  # The tiles schema major version map-styles' @protomaps/basemaps release targets. Builds of another major
+  # break the styles, so they only deploy after the styles move to a matching release.
+  TILES_MAJOR_VERSION: 4
 
 jobs:
-  deploy:
-    name: Deploy Tiles, Data & Worker
-    runs-on: mich
-    env:
-      ENVIRONMENT: ${{ github.event.inputs.environment }}
-      OP_SERVICE_ACCOUNT_TOKEN: ${{ github.event.inputs.environment == 'prod' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
+  resolve:
+    name: Resolve build
+    runs-on: ubuntu-latest
+    # Activation commits the new key to main, so deploys run from main only.
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
     outputs:
-      KEY: ${{ steps.latest_build.outputs.KEY }}
+      key: ${{ steps.build.outputs.key }}
+      live: ${{ steps.build.outputs.live }}
+      md5: ${{ steps.build.outputs.md5 }}
+      prefix: ${{ steps.build.outputs.prefix }}
+      sha: ${{ steps.build.outputs.sha }}
+    steps:
+      # Main as it is now, not at dispatch: a deploy queued behind another must see that one's activation commit.
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Pick build
+        id: build
+        env:
+          ENVIRONMENT: ${{ inputs.environment }}
+          REQUESTED: ${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          builds=$(curl -fsSL https://build-metadata.protomaps.dev/builds.json)
+          major_of='.version | split(".")[0]'
+          if [ -z "$REQUESTED" ]; then
+            key=$(jq -r --arg major "$TILES_MAJOR_VERSION" \
+              "[.[] | select(($major_of) == \$major) | .key] | sort | last // empty | rtrimstr(\".pmtiles\")" <<<"$builds")
+            if [ -z "$key" ]; then
+              echo "::error::builds.json has no $TILES_MAJOR_VERSION.x build"
+              exit 1
+            fi
+            newer=$(jq -r --arg major "$TILES_MAJOR_VERSION" --arg key "$key.pmtiles" \
+              "[.[] | select(($major_of) != \$major and .key > \$key)] | max_by(.key) // empty | \"\\(.key) (tiles \\(.version))\"" <<<"$builds")
+            if [ -n "$newer" ]; then
+              echo "::warning::protomaps has a newer build in another tiles major, $newer; the styles need upgrading for it"
+            fi
+          else
+            key=$REQUESTED
+          fi
+          if ! [[ "$key" =~ ^[0-9]{8}$ ]]; then
+            echo "::error::Build must be a YYYYMMDD key, got '$key'"
+            exit 1
+          fi
+          build=$(jq -c --arg name "$key.pmtiles" '.[] | select(.key == $name)' <<<"$builds")
+          if [ -z "$build" ]; then
+            echo "::error::$key isn't in builds.json; protomaps only keeps recent builds"
+            exit 1
+          fi
+          version=$(jq -r .version <<<"$build")
+          if [ "${version%%.*}" != "$TILES_MAJOR_VERSION" ]; then
+            echo "::error::$key has tiles schema $version; the styles target $TILES_MAJOR_VERSION.x"
+            exit 1
+          fi
+          live=$(jq -r .pmtiles_deployment_key "$TFVARS")
+          # Each environment publishes into its own area of the bucket (see tiles-cleanup.sh). One still reading
+          # another's area moves to its own when this deploy activates.
+          if [ "$ENVIRONMENT" = prod ]; then
+            prefix=""
+          else
+            prefix="$ENVIRONMENT/"
+          fi
+          # Publishing drops every directory table but the live one, so main and the worker have to agree on it.
+          served=$(deployment/scripts/tiles-served-key.sh "$ENVIRONMENT")
+          if [ "$served" != "$live" ]; then
+            echo "::error::$ENVIRONMENT serves $served but main records $live; finish or revert that activation first"
+            exit 1
+          fi
+          if [ "$key" = "$live" ]; then
+            echo "::error::$key is already live in $ENVIRONMENT"
+            exit 1
+          fi
+          # Don't publish over a key another environment's worker may read from this part of the bucket: one main
+          # says reads here, or one whose served key differs from main's (after a failed activation it may still
+          # read either part). The same build in another environment's own part is fine, e.g. dev then prod.
+          for other in deployment/modules/cloudflare/tiles-worker/tiles.*.tfvars.json; do
+            other_env=$(basename "$other" .tfvars.json)
+            other_env=${other_env#tiles.}
+            if [ "$other_env" = "$ENVIRONMENT" ]; then
+              continue
+            fi
+            other_served=$(deployment/scripts/tiles-served-key.sh "$other_env")
+            other_live=$(jq -r .pmtiles_deployment_key "$other")
+            if { [ "$(jq -r .storage_prefix "$other")" = "$prefix" ] && { [ "$key" = "$other_live" ] || [ "$key" = "$other_served" ]; }; } ||
+              { [ "$other_served" != "$other_live" ] && [ "$key" = "$other_served" ]; }; then
+              echo "::error::$other_env may be serving $key from the same part of the bucket; deploy a different build"
+              exit 1
+            fi
+          done
+          {
+            echo "key=$key"
+            echo "live=$live"
+            echo "prefix=$prefix"
+            echo "md5=$(jq -r .md5sum <<<"$build")"
+            echo "sha=$(git rev-parse HEAD)"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Deploying $key to $ENVIRONMENT"
+            echo "- live now: $live"
+            echo "- tiles version: $version, $(jq -r '.size / 1e9 | floor' <<<"$build") GB"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish ${{ needs.resolve.outputs.key }}
+    needs: resolve
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 480
+    permissions:
+      contents: read
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ inputs.environment == 'prod' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
+      DEPLOYMENT_KEY: ${{ needs.resolve.outputs.key }}
+      LIVE_KEY: ${{ needs.resolve.outputs.live }}
+      STORAGE_PREFIX: ${{ needs.resolve.outputs.prefix }}
+      D1_ENV: ${{ inputs.environment }}
+      TIGRIS_ENDPOINT: https://fly.storage.tigris.dev
+      TIGRIS_BUCKET: tiles-geo
+      STYLES_DIR: ${{ github.workspace }}/map-styles/dist
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          submodules: 'recursive'
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
-      - name: Setup Node (tiles)
-        uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+      - id: token
+        uses: immich-app/devtools/actions/create-workflow-token@df46d635b905e618b88fc4c95baa920aeb30b309 # create-workflow-token-action-v3.0.1
+        with:
+          client-id: ${{ secrets.PUSH_O_MATIC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PUSH_O_MATIC_APP_KEY }}
+          permission-contents: read
+
+      - name: Setup Mise
+        uses: immich-app/devtools/actions/use-mise@caac7f7e4298458a14238959504f411fc6cc7f06 # use-mise-action-v3.2.3
+        with:
+          github_token: ${{ steps.token.outputs.token }}
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: './tiles/.nvmrc'
 
@@ -46,138 +185,163 @@ jobs:
         working-directory: ./tiles
         run: npm ci
 
-      - name: Build tiles worker
-        working-directory: ./tiles
-        run: npm run build
-
-      - name: Install map-styles dependencies
-        working-directory: ./map-styles
-        run: npm ci
-
       - name: Build map styles
         working-directory: ./map-styles
-        run: npm run build
+        run: npm ci && npm run build
 
-      - name: Install 1Password CLI
-        uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
-
-      - name: Install Terragrunt
-        uses: eLco/setup-terragrunt@2c5116f8979bb261072ef57c97ac026cd9c27434 # v1.0.3
-        with:
-          terragrunt_version: ${{ env.tg_version }}
-
-      - name: Install OpenTofu
-        uses: opentofu/setup-opentofu@fc711fa910b93cba0f3fbecaafc9f42fd0c411cb # v2
-        with:
-          tofu_version: ${{ env.tofu_version }}
-          tofu_wrapper: false
-
-      - name: Apply tiles module (D1, Tigris, D1 proxy)
-        working-directory: deployment/modules/cloudflare/tiles
+      - name: Download build
         env:
-          TF_VAR_tiles_build_dir: "${{ github.workspace }}/tiles/dist"
-        run: op run --env-file="${{ github.workspace }}/deployment/.env" -- terragrunt apply --non-interactive
-
-      - name: Read tiles module outputs
-        working-directory: deployment/modules/cloudflare/tiles
+          MD5: ${{ needs.resolve.outputs.md5 }}
         run: |
-          d1_proxy_token=$(op run --env-file="${{ github.workspace }}/deployment/.env" -- terragrunt output -raw d1_proxy_token)
-          d1_proxy_url=$(op run --env-file="${{ github.workspace }}/deployment/.env" -- terragrunt output -raw d1_proxy_url)
-          tigris_bucket=$(op run --env-file="${{ github.workspace }}/deployment/.env" -- terragrunt output -raw tigris_bucket_name)
-          echo "::add-mask::$d1_proxy_token"
-          {
-            echo "D1_PROXY_TOKEN=$d1_proxy_token"
-            echo "D1_PROXY_URL=$d1_proxy_url"
-            echo "TIGRIS_BUCKET=$tigris_bucket"
-          } >> "$GITHUB_ENV"
-
-      - name: Install aria2
-        run: sudo apt-get update && sudo apt-get install aria2 -y
-
-      - name: Resolve latest pmtiles build key
-        id: latest_build
-        env:
-          FILE_NAME: ${{ github.event.inputs.file_name }}
-        run: |
-          if [ -z "$FILE_NAME" ]; then
-            build=$(curl -s https://build-metadata.protomaps.dev/builds.json | jq -r 'map(.key) | sort | last')
-          else
-            build=$FILE_NAME
+          set -euo pipefail
+          dir="$RUNNER_TEMP/tiles"
+          mkdir -p "$dir"
+          PMTILES_FILE_PATH="$dir/$DEPLOYMENT_KEY.pmtiles"
+          echo "PMTILES_FILE_PATH=$PMTILES_FILE_PATH" >> "$GITHUB_ENV"
+          free_gib=$(df --output=avail -B1G "$dir" | tail -1 | tr -d ' ')
+          if [ "$free_gib" -lt 200 ]; then
+            echo "::error::$free_gib GiB free in $dir; a planet build needs ~140 GB plus headroom"
+            exit 1
           fi
-          build=${build%.pmtiles}
-          echo "KEY=$build"
-          echo "KEY=$build" >> "$GITHUB_OUTPUT"
+          rclone copyto --http-url https://build.protomaps.com ":http:$DEPLOYMENT_KEY.pmtiles" "$PMTILES_FILE_PATH" \
+            --multi-thread-streams 16 --multi-thread-cutoff 256M --stats 1m --stats-one-line
+          # builds.json has base64 md5 digests.
+          expected=$(base64 -d <<<"$MD5" | od -An -v -tx1 | tr -d ' \n')
+          actual=$(md5sum "$PMTILES_FILE_PATH" | cut -d' ' -f1)
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::md5 mismatch for $DEPLOYMENT_KEY.pmtiles: expected $expected, got $actual"
+            exit 1
+          fi
 
-      - name: Download latest pmtiles
+      - name: Read D1 proxy credentials
+        run: deployment/scripts/tiles-d1-proxy-credentials.sh
+
+      # The runner may have queued for a while; publishing drops every directory table but LIVE_KEY's.
+      - name: Check live deployment
         run: |
-          aria2c --continue=true -s16 -x16 -j16 --summary-interval=10 \
-            --remote-time=true --file-allocation=none \
-            "https://build.protomaps.com/${{ steps.latest_build.outputs.KEY }}.pmtiles" \
-            -d "${{ github.workspace }}/tiles-data" -o tiles.pmtiles
+          served=$(deployment/scripts/tiles-served-key.sh "$ENVIRONMENT")
+          if [ "$served" != "$LIVE_KEY" ]; then
+            echo "::error::$ENVIRONMENT now serves $served, not $LIVE_KEY"
+            exit 1
+          fi
 
-      - name: Resolve Tigris credentials
-        run: |
-          tigris_key_id=$(op read 'op://tf/TIGRIS_ADMIN_KEY_ID/password')
-          tigris_access_key=$(op read 'op://tf/TIGRIS_ADMIN_ACCESS_KEY/password')
-          echo "::add-mask::$tigris_key_id"
-          echo "::add-mask::$tigris_access_key"
-          {
-            echo "TIGRIS_KEY_ID=$tigris_key_id"
-            echo "TIGRIS_ACCESS_KEY=$tigris_access_key"
-          } >> "$GITHUB_ENV"
+      - name: Publish tiles and styles
+        working-directory: ./tiles
+        run: op run --env-file="$GITHUB_WORKSPACE/deployment/tiles-deploy.env" -- npm run deploy:publish
 
-      - name: Setup Rclone (Tigris)
-        uses: AnimMouse/setup-rclone@26ef2133e09fd383329a1d4c1fbe6a71db1976c9 # v1.12.0
-        with:
-          disable_base64: true
-          rclone_config: |
-            [tigris]
-            type = s3
-            provider = Other
-            region = auto
-            endpoint = https://fly.storage.tigris.dev
-            access_key_id = ${{ env.TIGRIS_KEY_ID }}
-            secret_access_key = ${{ env.TIGRIS_ACCESS_KEY }}
-
-      - name: Upload styles to Tigris
-        run: |
-          rclone copy ./map-styles/dist/ \
-            "tigris:${{ env.TIGRIS_BUCKET }}/${{ steps.latest_build.outputs.KEY }}/styles/" \
-            --s3-no-check-bucket \
-            --include "*.json"
-
-      - name: Warm D1 and upload tile chunks to Tigris
+      - name: Verify deployment
         working-directory: ./tiles
         env:
-          PMTILES_FILE_PATH: "${{ github.workspace }}/tiles-data/tiles.pmtiles"
-          DEPLOYMENT_KEY: ${{ steps.latest_build.outputs.KEY }}
-          TIGRIS_ENDPOINT: https://fly.storage.tigris.dev
-        run: npm run d1:warm
+          VERIFY_SAMPLES: 20000
+        run: op run --env-file="$GITHUB_WORKSPACE/deployment/tiles-deploy.env" -- npm run deploy:verify
 
-      - name: Bump pmtiles_deployment_key
-        env:
-          TFVARS_FILE: "deployment/modules/cloudflare/tiles-worker/tiles.${{ env.ENVIRONMENT }}.tfvars.json"
+  activate:
+    name: Activate ${{ needs.resolve.outputs.key }} in ${{ inputs.environment }}
+    needs: [resolve, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Shared with the deploy job in tiles-worker.yml so the two never apply the same state at once.
+    concurrency:
+      group: tiles-apply-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      ENVIRONMENT: ${{ inputs.environment }}
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ inputs.environment == 'prod' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
+      DEPLOYMENT_KEY: ${{ needs.resolve.outputs.key }}
+      LIVE_KEY: ${{ needs.resolve.outputs.live }}
+      STORAGE_PREFIX: ${{ needs.resolve.outputs.prefix }}
+      D1_ENV: ${{ inputs.environment }}
+      TIGRIS_ENDPOINT: https://fly.storage.tigris.dev
+      TIGRIS_BUCKET: tiles-geo
+    steps:
+      - id: token
+        uses: immich-app/devtools/actions/create-workflow-token@df46d635b905e618b88fc4c95baa920aeb30b309 # create-workflow-token-action-v3.0.1
+        with:
+          client-id: ${{ secrets.PUSH_O_MATIC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PUSH_O_MATIC_APP_KEY }}
+          permission-contents: write
+
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          token: ${{ steps.token.outputs.token }}
+          persist-credentials: true
+
+      - name: Setup Mise
+        uses: immich-app/devtools/actions/use-mise@caac7f7e4298458a14238959504f411fc6cc7f06 # use-mise-action-v3.2.3
+        with:
+          github_token: ${{ steps.token.outputs.token }}
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: './tiles/.nvmrc'
+
+      - name: Build tiles worker
+        working-directory: ./tiles
+        run: npm ci && npm run build
+
+      - name: Read D1 proxy credentials
+        run: deployment/scripts/tiles-d1-proxy-credentials.sh
+
+      # A retried activation may come after another publish dropped this build's table, or after cleanup.
+      - name: Check published data
+        working-directory: ./tiles
+        run: op run --env-file="$GITHUB_WORKSPACE/deployment/tiles-deploy.env" -- npm run deploy:check
+
+      # Main records what each environment serves before the worker flips, so the nightly cleanup and the next
+      # deploy from main both keep the new data even if the apply below fails.
+      - name: Commit deployment key
         run: |
-          sed -i -E 's/"pmtiles_deployment_key": "(.*)"/"pmtiles_deployment_key": "${{ steps.latest_build.outputs.KEY }}"/' \
-            "$TFVARS_FILE"
+          set -euo pipefail
+          git config user.name 'immich-push-o-matic[bot]'
+          git config user.email '179150890+immich-push-o-matic[bot]@users.noreply.github.com'
+          recorded=$(jq -r .pmtiles_deployment_key "$TFVARS")
+          # A re-run after a failed apply finds its own commit already on main.
+          if [ "$recorded" = "$DEPLOYMENT_KEY" ]; then
+            echo "main already records $DEPLOYMENT_KEY for $ENVIRONMENT"
+            exit 0
+          fi
+          if [ "$recorded" != "$LIVE_KEY" ]; then
+            echo "::error::main now records $recorded for $ENVIRONMENT, not $LIVE_KEY; not overwriting it"
+            exit 1
+          fi
+          jq --arg key "$DEPLOYMENT_KEY" --arg prefix "$STORAGE_PREFIX" \
+            '.pmtiles_deployment_key = $key | .storage_prefix = $prefix' "$TFVARS" > "$RUNNER_TEMP/tfvars.json"
+          mv "$RUNNER_TEMP/tfvars.json" "$TFVARS"
+          git add "$TFVARS"
+          git commit -m "chore(tiles): deploy $DEPLOYMENT_KEY to $ENVIRONMENT"
+          for _ in 1 2 3; do
+            git push origin HEAD:main && exit 0
+            git pull --rebase origin main
+          done
+          exit 1
 
-      - name: Apply tiles-worker module (flip worker DEPLOYMENT_KEY)
+      - name: Apply tiles worker
         working-directory: deployment/modules/cloudflare/tiles-worker
         env:
-          TF_VAR_tiles_build_dir: "${{ github.workspace }}/tiles/dist"
-        run: op run --env-file="${{ github.workspace }}/deployment/.env" -- terragrunt apply --non-interactive
+          TF_VAR_tiles_build_dir: ${{ github.workspace }}/tiles/dist
+        run: op run --env-file="$GITHUB_WORKSPACE/deployment/.env" -- terragrunt run --non-interactive -- apply -auto-approve
 
-      - name: Generate commit token
-        id: generate-token
-        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3
-        with:
-          app-id: ${{ secrets.PUSH_O_MATIC_APP_ID }}
-          private-key: ${{ secrets.PUSH_O_MATIC_APP_KEY }}
-
-      - name: Commit updated deployment key
-        uses: EndBug/add-and-commit@290ea2c423ad77ca9c62ae0f5b224379612c0321 # v10.0.0
-        with:
-          add: deployment/modules/cloudflare/tiles-worker/tiles.${{ env.ENVIRONMENT }}.tfvars.json
-          message: "chore: bump ${{ env.ENVIRONMENT }} tiles deployment key to ${{ steps.latest_build.outputs.KEY }}"
-          push: true
-          github_token: ${{ steps.generate-token.outputs.token }}
+      - name: Check live endpoint
+        run: |
+          set -euo pipefail
+          host=$([ "$ENVIRONMENT" = prod ] && echo tiles.immich.cloud || echo "tiles.$ENVIRONMENT.immich.cloud")
+          for _ in $(seq 1 30); do
+            served=$(deployment/scripts/tiles-served-key.sh "$ENVIRONMENT" || true)
+            if [ "$served" = "$DEPLOYMENT_KEY" ]; then
+              break
+            fi
+            echo "https://$host serves '$served', waiting for $DEPLOYMENT_KEY"
+            sleep 10
+          done
+          if [ "$served" != "$DEPLOYMENT_KEY" ]; then
+            echo "::error::https://$host still serves '$served'"
+            exit 1
+          fi
+          for path in v1/0/0/0.mvt v1/14/8473/5557.mvt v1/style/light v1/style/dark v1/style/black; do
+            curl -fsS -o /dev/null -w "$path %{http_code} %{size_download} bytes\n" "https://$host/$path"
+          done
+          echo "- https://$host now serves $DEPLOYMENT_KEY" >> "$GITHUB_STEP_SUMMARY"
