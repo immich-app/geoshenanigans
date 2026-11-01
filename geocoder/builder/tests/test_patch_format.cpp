@@ -20,6 +20,7 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -810,24 +811,26 @@ static OffsetFixups fixups_of(const std::vector<FixupRun>& runs, const std::vect
     return f;
 }
 
-// Every record of a file of n_records, each with an offset, through reader.
-static void walk(OffsetFixupReader& reader, uint32_t n_records) {
-    for (uint32_t i = 0; i < n_records; i++) reader.apply(i, 100 * i);
+// Every record of a file of n_records through reader: those in no_data
+// without an offset (NO_DATA), as the records values name are, the others
+// each with one.
+static void walk(OffsetFixupReader& reader, uint32_t n_records, const std::set<uint32_t>& no_data) {
+    for (uint32_t i = 0; i < n_records; i++) reader.apply(i, no_data.count(i) ? NO_OFFSET : 100 * i);
 }
 
 // The refusal of a walk of f, or "".
-static std::string refusal_of_walk(const OffsetFixups& f, uint32_t n_records) {
+static std::string refusal_of_walk(const OffsetFixups& f, uint32_t n_records, const std::set<uint32_t>& no_data = {}) {
     return refusal_of([&] {
         auto reader = reader_of(f);
-        walk(reader, n_records);
+        walk(reader, n_records, no_data);
     });
 }
 
 // The refusal of a replay of f, or "": the walk, then its end.
-static std::string refusal_of_replay(const OffsetFixups& f, uint32_t n_records) {
+static std::string refusal_of_replay(const OffsetFixups& f, uint32_t n_records, const std::set<uint32_t>& no_data = {}) {
     return refusal_of([&] {
         auto reader = reader_of(f);
-        walk(reader, n_records);
+        walk(reader, n_records, no_data);
         reader.finish(n_records);
     });
 }
@@ -945,15 +948,43 @@ TEST(patch_format_offset_fixups_reject_truncated_runs) {
 // reach NO_DATA), is refused when the replay reads it, not skipped.
 TEST(patch_format_offset_fixups_refuse_a_value_index_that_repeats_or_passes_32_bits) {
     const std::string malformed = "Malformed offset fixups";
+    // Records 0 and 3 have no offsets.
+    const std::set<uint32_t> no_data = {0, 3};
     // The first value may be record 0's, the others ascend.
-    CHECK_EQ(refusal_of_walk(fixups_of({}, {{0, 7}, {3, 8}}), 10), std::string());
+    CHECK_EQ(refusal_of_walk(fixups_of({}, {{0, 7}, {3, 8}}), 10, no_data), std::string());
     // Record 0's twice, record 3's twice.
-    CHECK_EQ(refusal_of_walk(fixups_of({}, {{0, 7}, {0, 8}}), 10), malformed);
-    CHECK_EQ(refusal_of_walk(fixups_of({}, {{3, 7}, {0, 8}}), 10), malformed);
+    CHECK_EQ(refusal_of_walk(fixups_of({}, {{0, 7}, {0, 8}}), 10, no_data), malformed);
+    CHECK_EQ(refusal_of_walk(fixups_of({}, {{3, 7}, {0, 8}}), 10, no_data), malformed);
     // Past 32 bits (2^32 + 1), and at 0xFFFFFFFF, after a value or first.
-    CHECK_EQ(refusal_of_walk(fixups_of({}, {{3, 7}, {0xFFFFFFFEu, 8}}), 10), malformed);
-    CHECK_EQ(refusal_of_walk(fixups_of({}, {{3, 7}, {0xFFFFFFFCu, 8}}), 10), malformed);
-    CHECK_EQ(refusal_of_walk(fixups_of({}, {{0xFFFFFFFFu, 7}, {0, 8}}), 10), malformed);
+    CHECK_EQ(refusal_of_walk(fixups_of({}, {{3, 7}, {0xFFFFFFFEu, 8}}), 10, no_data), malformed);
+    CHECK_EQ(refusal_of_walk(fixups_of({}, {{3, 7}, {0xFFFFFFFCu, 8}}), 10, no_data), malformed);
+    CHECK_EQ(refusal_of_walk(fixups_of({}, {{0xFFFFFFFFu, 7}, {0, 8}}), 10, no_data), malformed);
+}
+
+// A value for a record with an offset is refused when the replay reaches
+// it, not taken: encode_offset_fixups gives values only to records without
+// one (NO_DATA), which runs pass over.
+TEST(patch_format_offset_fixups_refuse_a_value_for_a_record_with_an_offset) {
+    const std::string malformed = "Malformed offset fixups";
+    // Values for records 0 and 3: without offsets they take them; with one,
+    // either is refused.
+    const OffsetFixups values = fixups_of({}, {{0, 7}, {3, 8}});
+    CHECK_EQ(refusal_of_replay(values, 10, {0, 3}), std::string());
+    CHECK_EQ(refusal_of_walk(values, 10, {3}), malformed);
+    CHECK_EQ(refusal_of_walk(values, 10, {0}), malformed);
+    // Record 3 in a run of records 2-5: a run passes over it without an
+    // offset, but its value is refused once it has one.
+    const OffsetFixups in_run = fixups_of({{2, 4, 5}}, {{3, 8}});
+    CHECK_EQ(refusal_of_replay(in_run, 10, {3}), std::string());
+    CHECK_EQ(refusal_of_walk(in_run, 10), malformed);
+    // The value of a record the merge drops is never checked against its
+    // offset, which the replay doesn't read.
+    CHECK_EQ(refusal_of([&] {
+                 auto reader = reader_of(in_run);
+                 for (uint32_t i : {0u, 2u, 4u}) reader.apply(i, 100 * i);
+                 reader.finish(10);
+             }),
+             std::string());
 }
 
 // A run of no records, or one whose start or end passes the last record
@@ -984,20 +1015,22 @@ TEST(patch_format_offset_fixups_refuse_values_runs_or_bytes_the_replay_never_rea
     const std::string malformed = "Malformed offset fixups";
     // Runs of records 1-2 and 9, values of records 0 and 9: a file of 10
     // records, but not of 9 (or none, which leaves every one).
+    // Records 0 and 9, which the values name, have no offsets.
     const OffsetFixups within = fixups_of({{1, 2, 5}, {6, 1, 1}}, {{0, 7}, {9, 8}});
-    CHECK_EQ(refusal_of_replay(within, 10), std::string());
-    CHECK_EQ(refusal_of_replay(within, 9), malformed);
-    CHECK_EQ(refusal_of_replay(within, 0), malformed);
+    const std::set<uint32_t> no_data = {0, 9};
+    CHECK_EQ(refusal_of_replay(within, 10, no_data), std::string());
+    CHECK_EQ(refusal_of_replay(within, 9, no_data), malformed);
+    CHECK_EQ(refusal_of_replay(within, 0, no_data), malformed);
     // The runs alone, past a file of 9 records; a run past the file after
     // one in it; a value past it after one in it.
     CHECK_EQ(refusal_of_replay(fixups_of({{1, 2, 5}, {6, 1, 1}}, {}), 9), malformed);
     CHECK_EQ(refusal_of_replay(fixups_of({{1, 2, 5}, {1000, 1, 1}}, {}), 10), malformed);
-    CHECK_EQ(refusal_of_replay(fixups_of({}, {{4, 7}, {6, 8}}), 10), malformed);
+    CHECK_EQ(refusal_of_replay(fixups_of({}, {{4, 7}, {6, 8}}), 10, {4}), malformed);
     // Records the merge drops: a replay that never asks for records 1-2 and
     // 9 leaves their fixups, within the file.
     CHECK_EQ(refusal_of([&] {
                  auto reader = reader_of(within);
-                 for (uint32_t i : {0u, 3u, 8u}) reader.apply(i, 100 * i);
+                 for (uint32_t i : {0u, 3u, 8u}) reader.apply(i, no_data.count(i) ? NO_OFFSET : 100 * i);
                  reader.finish(10);
              }),
              std::string());
@@ -1006,8 +1039,8 @@ TEST(patch_format_offset_fixups_refuse_values_runs_or_bytes_the_replay_never_rea
         OffsetFixups longer = within, bare;
         (runs ? longer.runs : longer.values).push_back(0);
         (runs ? bare.runs : bare.values).push_back(0);
-        CHECK_EQ(refusal_of_replay(longer, 10), malformed);
-        CHECK_EQ(refusal_of_replay(bare, 10), malformed);
+        CHECK_EQ(refusal_of_replay(longer, 10, no_data), malformed);
+        CHECK_EQ(refusal_of_replay(bare, 10, no_data), malformed);
     }
 }
 

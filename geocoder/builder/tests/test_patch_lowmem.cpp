@@ -2279,11 +2279,13 @@ TEST(patch_refuses_string_fixups_on_a_deleted_record_left_over_or_in_a_child_str
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
-// Offset fixups the replay never reaches, refused in every mode. Ten POIs
-// with blocks, POI 4's a vertex longer on the new day, so the POI merge
-// shifts the later POIs' vertex_offset in a run of offset fixups; the merge
-// given
+// Offset fixups the replay never reaches or can't take, refused in every
+// mode. Ten POIs with blocks, POI 4's a vertex longer on the new day, so the
+// POI merge shifts the later POIs' vertex_offset in a run of offset fixups;
+// the merge given
 //   value: a value for record 10, past the old file's records,
+//   offset: a value for record 3, which has an offset (values give records
+//     without one theirs),
 //   run: a run 1000 records past the last one,
 //   byte: a byte past the last run,
 //   child: a byte in the runs of the POI vertices' merge, without a run (a
@@ -2343,10 +2345,11 @@ TEST(patch_refuses_offset_fixups_left_over_or_in_a_child_stream) {
         std::vector<std::string> modes;
         std::string refusal;
     };
-    // A value: record 10 (from record 0), offset 0. A run: 1000 records skipped
-    // (varint E8 07), one record, no change of the shift.
+    // A value: record 10 or 3 (from record 0), offset 0. A run: 1000 records
+    // skipped (varint E8 07), one record, no change of the shift.
     const Case cases[] = {
         {"value", [&](std::vector<char>& p) { add(p, records, VALUES, {10, 0}, true); }, ALL_MODES, "Malformed offset fixups"},
+        {"offset", [&](std::vector<char>& p) { add(p, records, VALUES, {3, 0}, true); }, ALL_MODES, "Malformed offset fixups"},
         {"run", [&](std::vector<char>& p) { add(p, records, RUNS, {'\xE8', 7, 1, 0}, true); }, ALL_MODES, "Malformed offset fixups"},
         {"byte", [&](std::vector<char>& p) { add(p, records, RUNS, {0}, false); }, ALL_MODES, "Malformed offset fixups"},
         {"child", [&](std::vector<char>& p) { add(p, vertices, RUNS, {0}, false); }, {"plain"}, "Malformed offset fixups"},

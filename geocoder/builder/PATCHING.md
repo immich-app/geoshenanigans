@@ -481,13 +481,14 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   the run's shift to every old offset in it except NO_DATA ones. values lists
   the NO_DATA records given an offset as varint (index delta, offset), the
   first delta from record 0. A run holds at least one record, value indices
-  ascend (only the first delta may be 0), and every record index a run or
-  value gives lies below 0xFFFFFFFF (NO_DATA). Once the replay is over, the
-  runs and values it didn't reach (a deleted or replaced record's) lie within
-  the old file's records, and no byte follows the last of either. The patcher
-  refuses anything else ("Malformed offset fixups"). A child stream carries
-  none: the low-memory mode refuses a count or a byte of them there
-  ("Encoded set: a child stream with offset fixups").
+  ascend (only the first delta may be 0), a value's record has no offset of
+  its own (NO_DATA; checked as the replay reaches it), and every record index
+  a run or value gives lies below 0xFFFFFFFF (NO_DATA). Once the replay is
+  over, the runs and values it didn't reach (a deleted or replaced record's)
+  lie within the old file's records, and no byte follows the last of either.
+  The patcher refuses anything else ("Malformed offset fixups"). A child
+  stream carries none: the low-memory mode refuses a count or a byte of them
+  there ("Encoded set: a child stream with offset fixups").
   String fixups (v12, StringFixupReader in tools/patch_format.h): each MATCH
   record's string field (string_field_offsets) that holds a moved string the
   strings section sends no pair for gets its new value here, in record

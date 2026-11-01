@@ -2371,10 +2371,11 @@ OffsetFixups encode_offset_fixups(const std::vector<uint32_t>& old_offsets, Fixe
 // Applies encoded OffsetFixups to old records visited in ascending order,
 // read where they sit. Anything encode_offset_fixups never writes is
 // malformed: a value index that doesn't ascend (only the first value's delta
-// may be 0), a run of no records, a run or value index past the last u32
-// record index (each bound summed in 64 bits), and, once the replay is over
-// (finish), a run or value past the old file's records or bytes past the last
-// of either.
+// may be 0), a value for a record with an offset (values give NO_DATA
+// records theirs), a run of no records, a run or value index past the last
+// u32 record index (each bound summed in 64 bits), and, once the replay is
+// over (finish), a run or value past the old file's records or bytes past
+// the last of either.
 class OffsetFixupReader {
 public:
     OffsetFixupReader(const char* runs, size_t runs_size, uint32_t n_runs,
@@ -2388,7 +2389,10 @@ public:
     // Record idx's offset after the fixups, given its old offset.
     uint32_t apply(uint32_t idx, uint32_t old) {
         while (value_idx_ < idx) next_value();
-        if (value_idx_ == idx) return value_;
+        if (value_idx_ == idx) {
+            if (old != END) malformed();
+            return value_;
+        }
         if (old == END) return old;
         while (run_end_ <= idx) next_run();
         return idx >= run_start_ ? old + shift_ : old;
