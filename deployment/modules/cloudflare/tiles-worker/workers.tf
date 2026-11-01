@@ -18,9 +18,12 @@ resource "cloudflare_workers_script" "tiles" {
     text = var.env
   }
 
-  plain_text_binding {
-    name = "TIGRIS_BUCKET"
-    text = data.terraform_remote_state.tiles_state.outputs.tigris_bucket_name
+  dynamic "plain_text_binding" {
+    for_each = var.storage_prefix == "" ? [] : [var.storage_prefix]
+    content {
+      name = "STORAGE_PREFIX"
+      text = plain_text_binding.value
+    }
   }
 
   secret_text_binding {
@@ -39,7 +42,7 @@ resource "cloudflare_workers_script" "tiles" {
   }
 
   d1_database_binding {
-    database_id = data.terraform_remote_state.tiles_state.outputs.d1_database_id
+    database_id = var.env != "prod" ? data.terraform_remote_state.tiles_state.outputs.d1_dev_database : data.terraform_remote_state.tiles_state.outputs.d1_global_database
     name        = "D1_GLOBAL"
   }
 

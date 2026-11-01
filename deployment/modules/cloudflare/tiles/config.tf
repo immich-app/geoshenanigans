@@ -1,4 +1,7 @@
 terraform {
+  backend "pg" {
+    schema_name = "prod_cloudflare_tiles"
+  }
   required_version = "~> 1.9"
 
   required_providers {
@@ -10,7 +13,8 @@ terraform {
       source = "tigrisdata/tigris"
     }
     random = {
-      source = "hashicorp/random"
+      source  = "hashicorp/random"
+      version = "3.9.1"
     }
   }
 }
