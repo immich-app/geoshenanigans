@@ -661,6 +661,55 @@ TEST(patch_diff_refuses_offset_fixups_past_the_sections_limit) {
     CHECK(!std::filesystem::exists(patch));
 }
 
+// A record file of more records than the diff's limit (--file-records-max,
+// FILE_RECORDS_MAX: the u32 record indices' own, lower for tests) is refused
+// before it is diffed, by its name and day, and no patch is written: street
+// ways of 2 and 3 records, either way round, under a limit of 2; their nodes
+// (8 bytes a record), 2 and 4, under 3; and the admin polygons a POI tier
+// borrows from its quality/q2.5 sibling, 3 and 2, under 2. Under 3 the ways
+// round-trip. A limit past FILE_RECORDS_MAX is refused.
+TEST(patch_diff_refuses_a_record_file_past_the_limit) {
+    const NodeCoord x{10.0f, 20.0f}, y{11.0f, 21.0f}, z{12.0f, 22.0f}, w{13.0f, 23.0f};
+    BuildDir two = with_pool(OLD_POOL), three = with_pool(OLD_POOL), four_nodes = with_pool(OLD_POOL);
+    two["street_ways.bin"] = bytes_of(std::vector<WayHeader>{{0, 1, 0, NAME_2}, {1, 1, 0, NAME_4}});
+    two["street_nodes.bin"] = bytes_of(std::vector<NodeCoord>{x, y});
+    three["street_ways.bin"] = bytes_of(std::vector<WayHeader>{{0, 1, 0, NAME_2}, {1, 1, 0, NAME_4}, {2, 1, 0, NAME_4}});
+    three["street_nodes.bin"] = bytes_of(std::vector<NodeCoord>{x, y, z});
+    four_nodes["street_ways.bin"] = bytes_of(std::vector<WayHeader>{{0, 1, 0, NAME_2}, {1, 3, 0, NAME_4}});
+    four_nodes["street_nodes.bin"] = bytes_of(std::vector<NodeCoord>{x, y, z, w});
+    const RoundTrip at_limit = round_trip(two, three, {}, {"--file-records-max", "3"});
+    CHECK(at_limit.mismatches.empty());
+
+    ScratchDir dir("patch-diff-file-records");
+    const std::string& root = dir.path();
+    // The diff of old_d to new_d (in root/<name>/old and new, or in their
+    // poi/major dirs with the q2.5 sibling `sibling`) under `limit`: its log
+    // when it refused, else "", and whether it wrote no patch.
+    auto refusal = [&](const std::string& name, const BuildDir& old_d, const BuildDir& new_d, const std::string& limit,
+                       const std::string& variant = "", const std::pair<BuildDir, BuildDir>& sibling = {}) {
+        const std::string at = root + "/" + name, patch = at + "/p.gcpatch", log = at + "/diff.log";
+        REQUIRE(write_dir(at + "/old" + variant, old_d) && write_dir(at + "/new" + variant, new_d));
+        if (!variant.empty()) REQUIRE(write_dir(at + "/old/quality/q2.5", sibling.first) && write_dir(at + "/new/quality/q2.5", sibling.second));
+        const bool ran =
+            run({GEOCODER_DIFF_BIN, at + "/old" + variant, at + "/new" + variant, "-o", patch, "--file-records-max", limit}, log);
+        const std::vector<char> text = read_file(log);
+        return std::pair(ran ? std::string() : std::string(text.begin(), text.end()), !std::filesystem::exists(patch));
+    };
+    auto refused_with = [](const std::pair<std::string, bool>& r, const std::string& why) {
+        return r.first.find(why) != std::string::npos && r.second;
+    };
+    CHECK(refused_with(refusal("grows", two, three, "2"), "New street_ways.bin holds 3 records, more than the 2 a patch can index"));
+    CHECK(refused_with(refusal("shrinks", three, two, "2"), "Old street_ways.bin holds 3 records, more than the 2 a patch can index"));
+    CHECK(refused_with(refusal("nodes", two, four_nodes, "3"), "New street_nodes.bin holds 4 records, more than the 3 a patch can index"));
+    BuildDir poi_tier;
+    poi_tier["poi_records.bin"] = std::vector<char>(POI_RECORD_STRIDE, 0);
+    const std::pair<BuildDir, BuildDir> admins{{{"admin_polygons.bin", std::vector<char>(3 * ADMIN_POLYGON_STRIDE, 0)}},
+                                               {{"admin_polygons.bin", std::vector<char>(2 * ADMIN_POLYGON_STRIDE, 0)}}};
+    CHECK(refused_with(refusal("borrowed", poi_tier, poi_tier, "2", "/poi/major", admins),
+                       "Old admin_polygons.bin holds 3 records, more than the 2 a patch can index"));
+    CHECK(refused_with(refusal("option", two, three, "4294967295"), "--file-records-max takes 0 to 4294967294, not 4294967295"));
+}
+
 // The second cell of each identity round trip lists only records the day
 // kept, so no correction rebuilds it: the derived remaps (MATCH, REPLACE and
 // the moved pairs) alone must give its new lists. The logged identity stats

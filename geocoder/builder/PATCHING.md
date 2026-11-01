@@ -181,11 +181,11 @@ keep it so:
   patch, which the patcher checks against the bytes left in its section first (`SectionReader`),
   or has a cap it refuses past: 65,536 moved-string pairs (STRING_PAIRS_MAX), 1024 client files
   (MAX_CLIENT_FILES) of names at most 255 bytes, a record stride below 0x100
-  (MAX_RECORD_STRIDE), secondary remap pairs for the five remapped record files only, 0xFFFF lost
-  and 0xFFFF gained ids per cell list, a child stream at most 4 MiB ahead of its parent
-  (MAX_DECODER_SKEW), fewer than 0xFFFF values in a `.dict`, and, on the `zstd` command, an 8 MiB
-  zstd window (PATCH_ZSTD_WINDOW_LOG). The encoders take what they're given in pieces of at most
-  64 KiB (ENCODER_PIECE).
+  (MAX_RECORD_STRIDE), 0xFFFFFFFE records in a merged file (FILE_RECORDS_MAX), secondary remap
+  pairs for the five remapped record files only, 0xFFFF lost and 0xFFFF gained ids per cell list,
+  a child stream at most 4 MiB ahead of its parent (MAX_DECODER_SKEW), fewer than 0xFFFF values
+  in a `.dict`, and, on the `zstd` command, an 8 MiB zstd window (PATCH_ZSTD_WINDOW_LOG). The
+  encoders take what they're given in pieces of at most 64 KiB (ENCODER_PIECE).
 
 The heap tests in `tests/test_patch_lowmem.cpp` hold the patcher to these rules: each grows one
 structure tenfold, applies the patch in plain, low-memory and `--threads` mode, and fails when
@@ -462,6 +462,11 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     + n_values (u32) + runs_size (u32) + values_size (u32) + runs + values
     + n_string_fixups (u32, v12) + string_fixups_size (u32) + string fixups
     + seq_size (u64) + merge ops
+    The old and new files each hold at most 0xFFFFFFFE records of the stride
+    (FILE_RECORDS_MAX; a byte stream's records are its bytes), so every record
+    index is a u32 below NO_DATA: the diff refuses a record file with more
+    before it diffs it, and the patcher a merge section that gives one ("Old
+    <file> holds <n> records, more than the 4294967294 a patch can index").
   Ops: MATCH(count:u32) | INSERT(count:u32, data) | DELETE(count:u32)
     | REPLACE(count:u32, data) (v8: the same entities with new bytes, written
     like an INSERT, mapped old → new like a MATCH)

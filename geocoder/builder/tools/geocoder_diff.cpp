@@ -8,7 +8,7 @@
 // Patch format: custom binary, zstd-compressed as a whole for transport.
 //
 // Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META] [--string-pairs-max N]
-//                      [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N]
+//                      [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N] [--file-records-max N]
 //
 // GCPATCH v8: with --identity, street / interp / addr records match across
 // days by the server-side identity sidecars <META>/{street,interp,addr}.slot.u32
@@ -732,10 +732,34 @@ static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uin
 static constexpr std::initializer_list<const char*> FULL_SIBLINGS = {"../full/", "../../full/"};
 static constexpr std::initializer_list<const char*> Q25_SIBLINGS = {"../../quality/q2.5/", "../quality/q2.5/"};
 
+// The record files the merges read, by their merge sections' strides (a
+// byte stream's is 1, a node's lat and lng 8), and the siblings a variant
+// without its own borrows them from.
+struct MergedFile {
+    PatchFileId id;
+    size_t stride;
+    std::initializer_list<const char*> siblings;
+};
+static constexpr MergedFile MERGED_FILES[] = {
+    {PatchFileId::STREET_WAYS, WAY_HEADER_STRIDE, FULL_SIBLINGS},
+    {PatchFileId::STREET_NODES, 8, FULL_SIBLINGS},
+    {PatchFileId::INTERP_WAYS, INTERP_WAY_STRIDE, {}},
+    {PatchFileId::INTERP_NODES, 8, {}},
+    {PatchFileId::ADDR_POINTS, ADDR_POINT_STRIDE, {}},
+    {PatchFileId::ADDR_VERTICES, 1, {}},
+    {PatchFileId::ADMIN_POLYGONS, ADMIN_POLYGON_STRIDE, Q25_SIBLINGS},
+    {PatchFileId::ADMIN_VERTICES, 1, Q25_SIBLINGS},
+    {PatchFileId::POI_RECORDS, POI_RECORD_STRIDE, {}},
+    {PatchFileId::POI_VERTICES, 1, {}},
+    {PatchFileId::PLACE_NODES, PLACE_NODE_STRIDE, {}},
+    {PatchFileId::POSTAL_POLYGONS, ADMIN_POLYGON_STRIDE, {}},
+    {PatchFileId::POSTAL_VERTICES, 1, {}},
+};
+
 static int run(int argc, char* argv[]) {
     const char* usage =
         "Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META] [--string-pairs-max N]"
-        " [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N]";
+        " [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N] [--file-records-max N]";
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << usage << std::endl;
         return 1;
@@ -749,15 +773,8 @@ static int run(int argc, char* argv[]) {
     // Lower for tests.
     StringFixupLimits string_fixup_limits;
     OffsetFixupLimits offset_fixup_limits;
-    // An option's value of 0 to max, in out; false (said) when it is not one.
-    auto u32_option = [](const std::string& option, const std::string& n, uint32_t max, uint32_t& out) {
-        if (n.empty() || n.size() > 10 || n.find_first_not_of("0123456789") != std::string::npos || std::stoull(n) > max) {
-            std::cerr << option << " takes 0 to " << max << ", not " << n << std::endl;
-            return false;
-        }
-        out = static_cast<uint32_t>(std::stoull(n));
-        return true;
-    };
+    // The most records a merged file may hold. Lower for tests.
+    uint32_t file_records_max = FILE_RECORDS_MAX;
     for (int a = 5; a < argc; a++) {
         const std::string arg = argv[a];
         if (arg == "--identity" && a + 2 < argc) { id_old_meta = argv[a + 1]; id_new_meta = argv[a + 2]; a += 2; }
@@ -769,6 +786,9 @@ static int run(int argc, char* argv[]) {
         }
         else if (arg == "--offset-fixup-bytes-max" && a + 1 < argc) {
             if (!u32_option(arg, argv[++a], UINT32_MAX, offset_fixup_limits.bytes)) return 1;
+        }
+        else if (arg == "--file-records-max" && a + 1 < argc) {
+            if (!u32_option(arg, argv[++a], FILE_RECORDS_MAX, file_records_max)) return 1;
         }
         else { std::cerr << "Unknown argument " << arg << std::endl << usage << std::endl; return 1; }
     }
@@ -848,6 +868,18 @@ static int run(int argc, char* argv[]) {
         }
         return {m, false};
     };
+    // Every record file the merges read, old and new, is refused before it is
+    // diffed when it holds more records than a patch can index.
+    for (const MergedFile& f : MERGED_FILES) {
+        const char* name = patch_file_names[static_cast<uint32_t>(f.id)];
+        auto size_in = [&](const std::string& dir) {
+            MappedFile m = try_load_with_fallback(dir, name, f.siblings).first;
+            const uint64_t size = m.size;
+            unmap_file(m);
+            return size;
+        };
+        require_merge_records(name, size_in(old_dir), size_in(new_dir), f.stride, file_records_max);
+    }
     // A shipped tier is rebuilt from the client's own old file, so both
     // sides come from the dir itself. The others are only remapped through
     // and may be borrowed; a newly shipped one is sent whole at the end.

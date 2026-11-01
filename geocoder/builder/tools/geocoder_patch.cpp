@@ -6,7 +6,7 @@
 // (copy_file_range). Output streams via fwrite (never accumulate), the entry
 // pipeline goes cell-by-cell. Target: <1 GiB peak RSS for planet.
 //
-// Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--threads]
+// Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--threads] [--file-records-max N]
 //
 // Reads GCPATCH v12 (REPLACE runs, street remap derived from the
 // street_ways replay, PARALLEL_DELTA_STRIDE side files, unmapped ids dropped
@@ -145,7 +145,7 @@ struct JointChild {
     size_t scan_q = 0;    // hint(): the sequence position past the next MATCH op found
     uint64_t scan_t = 0;  // and that op's old offset
 
-    void parse(const char* p, size_t size, size_t at, uint32_t want_fid) {
+    void parse(const char* p, size_t size, size_t at, uint32_t want_fid, uint32_t file_records_max) {
         P = p;
         SectionReader in(P, size, at, "patch: child section");
         fid = in.u32();
@@ -165,6 +165,7 @@ struct JointChild {
         } else if (stride == SPARSE_DELTA_STRIDE || stride == CELL_LIST_DELTA_STRIDE || stride == PARALLEL_DELTA_STRIDE) {
             throw std::runtime_error("Encoded set: unexpected section kind for a child stream");
         } else {
+            require_merge_records(patch_file_names[fid], old_size, new_size, stride, file_records_max);
             const uint32_t n_runs = in.u32(), n_values = in.u32(), runs_size = in.u32(), values_size = in.u32();
             if (n_runs || n_values || runs_size || values_size)
                 throw std::runtime_error("Encoded set: a child stream with offset fixups");
@@ -357,7 +358,8 @@ private:
 
 static int run(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
-        std::cerr << "Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--threads]" << std::endl;
+        std::cerr << "Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--threads] [--file-records-max N]"
+                  << std::endl;
         return 1;
     }
     std::string cur_dir = argv[1], patch_path = argv[2], out_dir = argv[4];
@@ -366,14 +368,19 @@ static int run(int argc, char* argv[]) {
     // first one is freed, and the heap keeps their pages), and the heap top is trimmed early.
     mallopt(M_MMAP_THRESHOLD, 128 << 10);
     mallopt(M_TRIM_THRESHOLD, 256 << 10);
+    // The most records a merged file may hold. Lower for tests.
+    uint32_t file_records_max = FILE_RECORDS_MAX;
     for (int i = 5; i < argc; i++) {
-        std::string a = argv[i];
-        if (a != "--threads") {
+        const std::string a = argv[i];
+        if (a == "--threads") {
+            gcs::store().threads = true;
+            mallopt(M_ARENA_MAX, 1);  // one heap for the codec threads too
+        } else if (a == "--file-records-max" && i + 1 < argc) {
+            if (!u32_option(a, argv[++i], FILE_RECORDS_MAX, file_records_max)) return 1;
+        } else {
             std::cerr << "Unknown option " << a << std::endl;
             return 1;
         }
-        gcs::store().threads = true;
-        mallopt(M_ARENA_MAX, 1);  // one heap for the codec threads too
     }
     ensure_dir(out_dir);
     // Output files are truncated while the current files are still
@@ -545,7 +552,7 @@ static int run(int argc, char* argv[]) {
     // record, then its child bytes. The child section (at `at`) must follow the parent's.
     auto open_joint_child = [&](uint32_t parent_fid, FILE* parent_out, size_t at) {
         std::unique_ptr<JointChild> jc(new JointChild());
-        jc->parse(P, patch_size, at, joint_child_of(parent_fid));
+        jc->parse(P, patch_size, at, joint_child_of(parent_fid), file_records_max);
         const char* cname = patch_file_names[jc->fid];
         require_old_file_size(cur_dir, cname, jc->old_size);
         jc->old.reset(new SequentialFileReader(cur_dir + "/" + cname));
@@ -879,6 +886,7 @@ static int run(int argc, char* argv[]) {
         // The record buffer below is sized by it.
         if (stride > MAX_RECORD_STRIDE) throw std::runtime_error(std::string("Malformed record stride: ") + fname);
         size_t actual_stride = stride;
+        require_merge_records(fname, old_size, new_size, actual_stride, file_records_max);
 
         // Records with string offset fields are rewritten one at a time.
         const std::vector<size_t> string_fields = string_field_offsets(static_cast<PatchFileId>(file_id));
