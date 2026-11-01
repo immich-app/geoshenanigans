@@ -176,8 +176,9 @@ Planet b → c (2026-10-28), planet/full, one core, cold, no swap, disk at
 
 At 1 GiB plain mode takes 1825 s for the planet maximum set (full, poi/all, quality/uncapped),
 and low-memory mode 910 s. A patch that moves many POI strings, like the first one after POI
-names went into record order, needs about 33 B per moved string in either mode: about 418 MiB
-for planet/poi/all's 12.8M.
+names went into record order (12.8M on planet/poi/all), costs no memory per moved string: the
+strings section holds at most 65,536 moved-string pairs (`STRING_PAIRS_MAX`), and past that the
+moved values come as string fixups the replay reads in record order (see How Patching Works).
 
 ### How Patching Works
 
