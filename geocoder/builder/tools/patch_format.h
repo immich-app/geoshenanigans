@@ -2328,10 +2328,45 @@ void load_string_remap(const StringsSection& s, StringRemap& remap, OnShipped on
 struct OffsetFixups {
     uint32_t n_runs = 0, n_values = 0;
     std::vector<char> runs, values;
+    // A record past the last u32 record index (0xFFFFFFFE) moved, which no
+    // run or value can give: encode_offset_fixups stopped there, and
+    // check_offset_fixups refuses them.
+    bool past_last_index = false;
     bool empty() const { return n_runs == 0 && n_values == 0; }
 };
 
-// fixed_at(i): record i's offset after the fixup passes.
+// The most a merge section's offset fixups may hold: its header gives the
+// count and byte size of their runs and of their values as u32s. Lower for
+// tests.
+struct OffsetFixupLimits {
+    uint32_t count = UINT32_MAX;
+    uint32_t bytes = UINT32_MAX;
+};
+
+// Refuses the offset fixups of the merge of `file` (named in the refusal)
+// that its section's header can't give: more runs or values than the limits'
+// count, more bytes of runs or of values than their bytes (the header's u32s
+// would wrap, and the patcher refuse the section), or a record moved past
+// the last u32 record index. The diff checks them as it writes the section,
+// on its main thread: they are encoded on the merge threads, where a throw
+// would end the process.
+inline void check_offset_fixups(const OffsetFixups& f, const std::string& file, OffsetFixupLimits limits = {}) {
+    auto refuse = [&](const std::string& why) { throw std::runtime_error("Offset fixups of " + file + ": " + why); };
+    if (f.past_last_index) refuse("a record past the last u32 record index moved");
+    auto at_most = [&](uint64_t n, uint32_t limit, const char* what) {
+        if (n > limit) refuse("more than the section's " + std::to_string(limit) + " " + what);
+    };
+    at_most(f.n_runs, limits.count, "runs");
+    at_most(f.n_values, limits.count, "values");
+    at_most(f.runs.size(), limits.bytes, "bytes of runs");
+    at_most(f.values.size(), limits.bytes, "bytes of values");
+}
+
+// fixed_at(i): record i's offset after the fixup passes, for each record i
+// of old_offsets (a size_t: a file may hold more than a u32 indexes). Each
+// run starts and each value sits at a record index of its own below
+// 0xFFFFFFFF (NO_DATA), so neither count wraps its u32; a record past them
+// that moves stops the encoding (past_last_index).
 template <typename FixedAt>
 OffsetFixups encode_offset_fixups(const std::vector<uint32_t>& old_offsets, FixedAt fixed_at) {
     constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
@@ -2348,8 +2383,15 @@ OffsetFixups encode_offset_fixups(const std::vector<uint32_t>& old_offsets, Fixe
         prev_shift = shift;
         open = false;
     };
-    for (uint32_t i = 0; i < old_offsets.size(); i++) {
-        uint32_t old = old_offsets[i], fixed = fixed_at(i);
+    for (size_t at = 0; at < old_offsets.size(); at++) {
+        const uint32_t old = old_offsets[at], fixed = fixed_at(at);
+        if (at >= NO_DATA && (old == NO_DATA ? fixed != NO_DATA : fixed != old)) {
+            out.past_last_index = true;
+            break;
+        }
+        // Below NO_DATA wherever the record moved; a record past it that
+        // didn't only closes the open run.
+        const uint32_t i = static_cast<uint32_t>(at);
         if (old == NO_DATA) {
             if (fixed != NO_DATA) {
                 write_varint(out.values, i - prev_value);
@@ -2368,7 +2410,17 @@ OffsetFixups encode_offset_fixups(const std::vector<uint32_t>& old_offsets, Fixe
     return out;
 }
 
-// Applies encoded OffsetFixups to old records visited in ascending order.
+// Applies encoded OffsetFixups to old records visited in ascending order,
+// read where they sit. Anything encode_offset_fixups never writes is
+// malformed: a value index that doesn't ascend (only the first value's delta
+// may be 0), a value for a record with an offset (values give NO_DATA
+// records theirs), a run of no records, a run or value index past the last
+// u32 record index (each bound summed in 64 bits), and, once the replay is
+// over (finish), a run or value past the old file's records or bytes past
+// the last of either. A record past the last u32 record index (of a file of
+// more than 0xFFFFFFFF records) keeps its offset: no run or value reaches
+// it, and the encoder refuses one there that moves (past_last_index). The
+// replay leaves such records out of apply (reach), once per MATCH run.
 class OffsetFixupReader {
 public:
     OffsetFixupReader(const char* runs, size_t runs_size, uint32_t n_runs,
@@ -2379,33 +2431,66 @@ public:
         next_value();
     }
 
-    // Record idx's offset after the fixups, given its old offset.
+    // How many of a MATCH run's count records, from old record first on,
+    // the fixups reach: those below the last u32 record index, which the
+    // replay hands apply. The rest keep their offsets: as a u32, the index
+    // of one is END (an exhausted value index's) or wraps onto record 0 on,
+    // whose value or run apply would give it.
+    static uint32_t reach(uint64_t first, uint32_t count) {
+        if (first >= END) return 0;
+        return END - first < count ? static_cast<uint32_t>(END - first) : count;
+    }
+    // Record idx's offset after the fixups, given its old offset; idx below
+    // END, as reach gives them.
     uint32_t apply(uint32_t idx, uint32_t old) {
         while (value_idx_ < idx) next_value();
-        if (value_idx_ == idx) return value_;
+        if (value_idx_ == idx) {
+            if (old != END) malformed();
+            return value_;
+        }
         if (old == END) return old;
         while (run_end_ <= idx) next_run();
         return idx >= run_start_ ? old + shift_ : old;
     }
+    // The replay is over: the runs and values it didn't reach (a deleted or
+    // replaced record's) lie within the old file's n_old_records, and nothing
+    // follows the last of either.
+    void finish(uint64_t n_old_records) {
+        for (; value_idx_ != END; next_value())
+            if (value_idx_ >= n_old_records) malformed();
+        for (; run_start_ != END; next_run())
+            if (run_end_ > n_old_records) malformed();
+        if (runs_pos_ != runs_size_ || values_pos_ != values_size_) malformed();
+    }
 
 private:
-    static constexpr uint32_t END = 0xFFFFFFFFu;  // also NO_DATA
+    // NO_DATA, past every record index a run or value gives, and the start
+    // of no run: a run may end there (after record END - 1), but no run or
+    // value starts there.
+    static constexpr uint32_t END = 0xFFFFFFFFu;
 
-    static uint32_t read(const char* data, size_t& pos, size_t size) {
-        return SectionReader(data, size, pos, "fixups", PastEnd::MALFORMED).varint();
-    }
+    [[noreturn, gnu::cold, gnu::noinline]] static void malformed() { throw std::runtime_error("Malformed offset fixups"); }
     void next_run() {
         if (runs_left_ == 0) { run_start_ = run_end_ = END; return; }
         runs_left_--;
-        run_start_ = run_end_ + read(runs_, runs_pos_, runs_size_);
-        run_end_ = run_start_ + read(runs_, runs_pos_, runs_size_);
-        shift_ += unzigzag32(read(runs_, runs_pos_, runs_size_));
+        SectionReader in(runs_, runs_size_, runs_pos_, "offset fixups", PastEnd::MALFORMED);
+        const uint64_t start = uint64_t{run_end_} + in.varint();
+        const uint32_t length = in.varint();
+        if (length == 0 || start + length > END) malformed();
+        run_start_ = static_cast<uint32_t>(start);
+        run_end_ = static_cast<uint32_t>(start + length);
+        shift_ += unzigzag32(in.varint());
     }
     void next_value() {
         if (values_left_ == 0) { value_idx_ = END; return; }
         values_left_--;
-        value_idx_ = (value_idx_ == END ? 0 : value_idx_) + read(values_, values_pos_, values_size_);
-        value_ = read(values_, values_pos_, values_size_);
+        SectionReader in(values_, values_size_, values_pos_, "offset fixups", PastEnd::MALFORMED);
+        const bool first = value_idx_ == END;
+        const uint32_t delta = in.varint();
+        const uint64_t idx = (first ? 0 : uint64_t{value_idx_}) + delta;
+        if ((delta == 0 && !first) || idx >= END) malformed();
+        value_idx_ = static_cast<uint32_t>(idx);
+        value_ = in.varint();
     }
 
     const char* runs_;

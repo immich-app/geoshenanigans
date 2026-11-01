@@ -8,7 +8,7 @@
 // Patch format: custom binary, zstd-compressed as a whole for transport.
 //
 // Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META] [--string-pairs-max N]
-//                      [--string-fixup-bytes-max N]
+//                      [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N]
 //
 // GCPATCH v8: with --identity, street / interp / addr records match across
 // days by the server-side identity sidecars <META>/{street,interp,addr}.slot.u32
@@ -316,8 +316,8 @@ static void fixup_interp_offsets(char* old_data, size_t old_size,
 // old_offsets holds the field from before the pass.
 static OffsetFixups collect_offset_fixups(
         const std::vector<uint32_t>& old_offsets, const char* fixed, size_t stride, size_t field) {
-    return encode_offset_fixups(old_offsets, [&](uint32_t i) {
-        uint32_t off; memcpy(&off, fixed + (size_t)i * stride + field, 4);
+    return encode_offset_fixups(old_offsets, [&](size_t i) {
+        uint32_t off; memcpy(&off, fixed + i * stride + field, 4);
         return off;
     });
 }
@@ -428,7 +428,7 @@ static OffsetFixups identity_offset_fixups(const std::vector<uint32_t>& old_offs
             fixed[i] = old == NO_DATA ? NO_DATA : old + last;
         }
     }
-    return encode_offset_fixups(old_offsets, [&](uint32_t i) { return fixed[i]; });
+    return encode_offset_fixups(old_offsets, [&](size_t i) { return fixed[i]; });
 }
 
 // The identity merge of one record family: the merge, the moved records'
@@ -582,9 +582,12 @@ static StringFixups string_fixups_of(const FileMergeResult& r, const std::string
     return fixups;
 }
 
-// Serialize a pre-computed merge result into the patch buffer
+// Serialize a pre-computed merge result into the patch buffer. Refuses
+// offset fixups past offset_limits, which the section's header could not
+// give, before writing a byte of the section.
 static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r, const std::string& old_dir,
-                            const std::string& new_dir, const PatcherStringRemap& strings) {
+                            const std::string& new_dir, const PatcherStringRemap& strings,
+                            OffsetFixupLimits offset_limits) {
     auto wv = [&](const void* data, size_t size) {
         patch.insert(patch.end(), (const char*)data, (const char*)data + size);
     };
@@ -606,6 +609,7 @@ static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r, 
     uint32_t fid = static_cast<uint32_t>(r.id);
     uint32_t st = static_cast<uint32_t>(r.stride);
     const OffsetFixups& f = r.fixups;
+    check_offset_fixups(f, r.name, offset_limits);
     uint32_t runs_size = static_cast<uint32_t>(f.runs.size());
     uint32_t values_size = static_cast<uint32_t>(f.values.size());
     wv(&fid, 4); wv(&st, 4); wv(&r.old_size, 8); wv(&r.new_size, 8);
@@ -725,7 +729,7 @@ static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uin
 static int run(int argc, char* argv[]) {
     const char* usage =
         "Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META] [--string-pairs-max N]"
-        " [--string-fixup-bytes-max N]";
+        " [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N]";
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << usage << std::endl;
         return 1;
@@ -735,8 +739,10 @@ static int run(int argc, char* argv[]) {
     // The most moved strings the strings section sends as pairs; more go as
     // string fixups. Lower for tests.
     uint32_t string_pairs_max = STRING_PAIRS_MAX;
-    // The most a merge's string fixups may hold. Lower for tests.
+    // The most a merge's string fixups, and its offset fixups, may hold.
+    // Lower for tests.
     StringFixupLimits string_fixup_limits;
+    OffsetFixupLimits offset_fixup_limits;
     // An option's value of 0 to max, in out; false (said) when it is not one.
     auto u32_option = [](const std::string& option, const std::string& n, uint32_t max, uint32_t& out) {
         if (n.empty() || n.size() > 10 || n.find_first_not_of("0123456789") != std::string::npos || std::stoull(n) > max) {
@@ -754,6 +760,9 @@ static int run(int argc, char* argv[]) {
         }
         else if (arg == "--string-fixup-bytes-max" && a + 1 < argc) {
             if (!u32_option(arg, argv[++a], UINT32_MAX, string_fixup_limits.bytes)) return 1;
+        }
+        else if (arg == "--offset-fixup-bytes-max" && a + 1 < argc) {
+            if (!u32_option(arg, argv[++a], UINT32_MAX, offset_fixup_limits.bytes)) return 1;
         }
         else { std::cerr << "Unknown argument " << arg << std::endl << usage << std::endl; return 1; }
     }
@@ -1671,28 +1680,28 @@ static int run(int argc, char* argv[]) {
     // v8: street ways go before addresses, whose parent_way_id the patcher
     // remaps through the street replay's remap. The parent seqs stay alive
     // for the side files (PARALLEL_DELTA_STRIDE).
-    serialize_merge(patch, res_ways, old_dir, new_dir, patcher_strings);
-    serialize_merge(patch, res_nodes, old_dir, new_dir, patcher_strings);
+    serialize_merge(patch, res_ways, old_dir, new_dir, patcher_strings, offset_fixup_limits);
+    serialize_merge(patch, res_nodes, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     { std::vector<char>().swap(res_nodes.seq.data); }
-    serialize_merge(patch, res_interp_w, old_dir, new_dir, patcher_strings);
-    serialize_merge(patch, res_interp_n, old_dir, new_dir, patcher_strings);
+    serialize_merge(patch, res_interp_w, old_dir, new_dir, patcher_strings, offset_fixup_limits);
+    serialize_merge(patch, res_interp_n, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     { std::vector<char>().swap(res_interp_n.seq.data); }
-    serialize_merge(patch, res_addr, old_dir, new_dir, patcher_strings);
+    serialize_merge(patch, res_addr, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     // res_addr_v is built in t_addr only when the dir has address points;
     // without them it keeps stride=0 and old/new sizes 0, which we treat as
     // "not built" → fall through to the emit_raw(ADDR_VERTICES) call later
     // in the section pipeline. stride=1 marks a byte-merge ready to ship.
     if (res_addr_v.stride == 1) {
-        serialize_merge(patch, res_addr_v, old_dir, new_dir, patcher_strings);
+        serialize_merge(patch, res_addr_v, old_dir, new_dir, patcher_strings, offset_fixup_limits);
         { std::vector<char>().swap(res_addr_v.seq.data); }
     }
-    serialize_merge(patch, res_admin_p, old_dir, new_dir, patcher_strings);
-    serialize_merge(patch, res_admin_v, old_dir, new_dir, patcher_strings);
+    serialize_merge(patch, res_admin_p, old_dir, new_dir, patcher_strings, offset_fixup_limits);
+    serialize_merge(patch, res_admin_v, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     { std::vector<char>().swap(res_admin_v.seq.data); }
-    serialize_merge(patch, res_poi_r, old_dir, new_dir, patcher_strings);
-    serialize_merge(patch, res_poi_v, old_dir, new_dir, patcher_strings);
+    serialize_merge(patch, res_poi_r, old_dir, new_dir, patcher_strings, offset_fixup_limits);
+    serialize_merge(patch, res_poi_v, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     { std::vector<char>().swap(res_poi_v.seq.data); }
-    serialize_merge(patch, res_place_n, old_dir, new_dir, patcher_strings);
+    serialize_merge(patch, res_place_n, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     malloc_trim(0); // return freed heap to OS
     log_rss("serialize");
     double t0 = now_ms();
@@ -2275,8 +2284,8 @@ static int run(int argc, char* argv[]) {
             FileMergeResult rv = {PatchFileId::POSTAL_VERTICES, "postal_vertices.bin", 1,
                                   old_v.size, new_v.size, std::move(vseq), {}, {}, {}};
             log_merge(rp); log_merge(rv);
-            serialize_merge(patch, rp, old_dir, new_dir, patcher_strings);
-            serialize_merge(patch, rv, old_dir, new_dir, patcher_strings);
+            serialize_merge(patch, rp, old_dir, new_dir, patcher_strings, offset_fixup_limits);
+            serialize_merge(patch, rv, old_dir, new_dir, patcher_strings, offset_fixup_limits);
         }
         unmap_file(old_p); unmap_file(new_p); unmap_file(old_v); unmap_file(new_v);
         if (!mergeable) {
