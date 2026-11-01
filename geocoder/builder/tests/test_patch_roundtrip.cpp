@@ -621,6 +621,46 @@ TEST(patch_diff_refuses_string_fixups_past_the_sections_limit) {
     CHECK(!std::filesystem::exists(patch));
 }
 
+// Street ways named 2 and 4, the first a node longer on the new day: the
+// node fixup moves the second way's node_offset from 1 to 2, a run of one
+// record, 3 bytes of offset fixups.
+TEST(patch_diff_refuses_offset_fixups_past_the_sections_limit) {
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(OLD_POOL);
+    const NodeCoord x{10.0f, 20.0f}, y{11.0f, 21.0f}, z{12.0f, 22.0f};
+    old_d["street_ways.bin"] = bytes_of(std::vector<WayHeader>{{0, 1, 0, NAME_2}, {1, 1, 0, NAME_4}});
+    new_d["street_ways.bin"] = bytes_of(std::vector<WayHeader>{{0, 2, 0, NAME_2}, {2, 1, 0, NAME_4}});
+    old_d["street_nodes.bin"] = bytes_of(std::vector<NodeCoord>{x, y});
+    new_d["street_nodes.bin"] = bytes_of(std::vector<NodeCoord>{x, z, y});
+    // Under a limit of 3 (--offset-fixup-bytes-max, lower for tests) they
+    // round-trip.
+    const RoundTrip at_limit = round_trip(old_d, new_d, {}, {"--offset-fixup-bytes-max", "3"});
+    CHECK(at_limit.mismatches.empty());
+    CHECK(logged(at_limit, "street_ways.bin: seq="));
+    CHECK(logged(at_limit, " fixup_runs=1 fixup_values=0 fixup_bytes=3 "));
+
+    // Under 2 the diff refuses them, and no patch is written: a merge
+    // section's header gives its fixups' sizes as u32s, which fixups past the
+    // real limit would wrap, and the patcher refuse the section. A limit past
+    // a u32 is refused.
+    ScratchDir dir("patch-diff-offset-fixup-limit");
+    const std::string& root = dir.path();
+    const std::string patch = root + "/p.gcpatch";
+    REQUIRE(write_dir(root + "/old", old_d));
+    REQUIRE(write_dir(root + "/new", new_d));
+    auto diff_refusal = [&](const std::string& limit, const std::string& log) {
+        const bool ran =
+            run({GEOCODER_DIFF_BIN, root + "/old", root + "/new", "-o", patch, "--offset-fixup-bytes-max", limit}, log);
+        const std::vector<char> text = read_file(log);
+        return ran ? std::string() : std::string(text.begin(), text.end());
+    };
+    CHECK(diff_refusal("2", root + "/past.log")
+              .find("Offset fixups of street_ways.bin: more than the section's 2 bytes of runs") != std::string::npos);
+    CHECK(!std::filesystem::exists(patch));
+    CHECK(diff_refusal("4294967296", root + "/option.log").find("--offset-fixup-bytes-max takes 0 to 4294967295, not 4294967296") !=
+          std::string::npos);
+    CHECK(!std::filesystem::exists(patch));
+}
+
 // The second cell of each identity round trip lists only records the day
 // kept, so no correction rebuilds it: the derived remaps (MATCH, REPLACE and
 // the moved pairs) alone must give its new lists. The logged identity stats

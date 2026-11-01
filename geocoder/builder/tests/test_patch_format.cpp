@@ -770,7 +770,7 @@ TEST(patch_format_old_file_sizes_cover_the_files_no_section_names) {
 static constexpr uint32_t NO_OFFSET = 0xFFFFFFFFu;
 
 static OffsetFixups encode_fixed(const std::vector<uint32_t>& old_offsets, const std::vector<uint32_t>& fixed) {
-    return encode_offset_fixups(old_offsets, [&](uint32_t i) { return fixed[i]; });
+    return encode_offset_fixups(old_offsets, [&](size_t i) { return fixed[i]; });
 }
 
 static OffsetFixupReader reader_of(const OffsetFixups& f) {
@@ -1042,6 +1042,45 @@ TEST(patch_format_offset_fixups_refuse_values_runs_or_bytes_the_replay_never_rea
         CHECK_EQ(refusal_of_replay(longer, 10, no_data), malformed);
         CHECK_EQ(refusal_of_replay(bare, 10, no_data), malformed);
     }
+}
+
+// Offset fixups a merge section's header can't give are refused, naming the
+// file: more runs or values than the limits' count, more bytes of runs or of
+// values than their bytes (lower for tests; the header gives each as a u32,
+// which fixups past the real limits would wrap), or a record moved past the
+// last u32 record index, which the encoder can't give. At the limits they
+// pass.
+TEST(patch_format_offset_fixups_refuse_one_past_the_sections_limits) {
+    auto refusal = [](const OffsetFixups& f, OffsetFixupLimits limits) {
+        return refusal_of([&] { check_offset_fixups(f, "street_ways.bin", limits); });
+    };
+    const std::string past = "Offset fixups of street_ways.bin: more than the section's ";
+    // Two runs (records 1 and 3-4, 6 bytes) and a value (record 5, 2 bytes),
+    // as encoded; one run (3 bytes) and two values (records 0 and 5, 4 bytes).
+    const OffsetFixups runs = encode_fixed({0, 4, 8, 12, 16, NO_OFFSET}, {0, 5, 8, 14, 18, 7});
+    const OffsetFixups values = encode_fixed({NO_OFFSET, 4, 8, 12, 16, NO_OFFSET}, {3, 5, 8, 12, 16, 7});
+    CHECK_EQ(runs.n_runs, uint32_t(2));
+    CHECK_EQ(runs.runs.size(), size_t(6));
+    CHECK_EQ(runs.n_values, uint32_t(1));
+    CHECK_EQ(runs.values.size(), size_t(2));
+    CHECK_EQ(values.n_runs, uint32_t(1));
+    CHECK_EQ(values.runs.size(), size_t(3));
+    CHECK_EQ(values.n_values, uint32_t(2));
+    CHECK_EQ(values.values.size(), size_t(4));
+    for (const OffsetFixups* f : {&runs, &values}) {
+        CHECK_EQ(refusal(*f, {}), std::string());
+        CHECK_EQ(refusal(*f, {2, 6}), std::string());
+    }
+    CHECK_EQ(refusal(runs, {1, 6}), past + "1 runs");
+    CHECK_EQ(refusal(values, {1, 6}), past + "1 values");
+    CHECK_EQ(refusal(runs, {2, 5}), past + "5 bytes of runs");
+    CHECK_EQ(refusal(values, {2, 3}), past + "3 bytes of values");
+    // None at all, under limits of 0.
+    CHECK_EQ(refusal(OffsetFixups{}, {0, 0}), std::string());
+    OffsetFixups unindexed = runs;
+    unindexed.past_last_index = true;
+    CHECK_EQ(refusal(unindexed, {}),
+             std::string("Offset fixups of street_ways.bin: a record past the last u32 record index moved"));
 }
 
 // --- string fixups ---

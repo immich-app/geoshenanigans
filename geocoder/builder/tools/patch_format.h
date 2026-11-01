@@ -2328,10 +2328,45 @@ void load_string_remap(const StringsSection& s, StringRemap& remap, OnShipped on
 struct OffsetFixups {
     uint32_t n_runs = 0, n_values = 0;
     std::vector<char> runs, values;
+    // A record past the last u32 record index (0xFFFFFFFE) moved, which no
+    // run or value can give: encode_offset_fixups stopped there, and
+    // check_offset_fixups refuses them.
+    bool past_last_index = false;
     bool empty() const { return n_runs == 0 && n_values == 0; }
 };
 
-// fixed_at(i): record i's offset after the fixup passes.
+// The most a merge section's offset fixups may hold: its header gives the
+// count and byte size of their runs and of their values as u32s. Lower for
+// tests.
+struct OffsetFixupLimits {
+    uint32_t count = UINT32_MAX;
+    uint32_t bytes = UINT32_MAX;
+};
+
+// Refuses the offset fixups of the merge of `file` (named in the refusal)
+// that its section's header can't give: more runs or values than the limits'
+// count, more bytes of runs or of values than their bytes (the header's u32s
+// would wrap, and the patcher refuse the section), or a record moved past
+// the last u32 record index. The diff checks them as it writes the section,
+// on its main thread: they are encoded on the merge threads, where a throw
+// would end the process.
+inline void check_offset_fixups(const OffsetFixups& f, const std::string& file, OffsetFixupLimits limits = {}) {
+    auto refuse = [&](const std::string& why) { throw std::runtime_error("Offset fixups of " + file + ": " + why); };
+    if (f.past_last_index) refuse("a record past the last u32 record index moved");
+    auto at_most = [&](uint64_t n, uint32_t limit, const char* what) {
+        if (n > limit) refuse("more than the section's " + std::to_string(limit) + " " + what);
+    };
+    at_most(f.n_runs, limits.count, "runs");
+    at_most(f.n_values, limits.count, "values");
+    at_most(f.runs.size(), limits.bytes, "bytes of runs");
+    at_most(f.values.size(), limits.bytes, "bytes of values");
+}
+
+// fixed_at(i): record i's offset after the fixup passes, for each record i
+// of old_offsets (a size_t: a file may hold more than a u32 indexes). Each
+// run starts and each value sits at a record index of its own below
+// 0xFFFFFFFF (NO_DATA), so neither count wraps its u32; a record past them
+// that moves stops the encoding (past_last_index).
 template <typename FixedAt>
 OffsetFixups encode_offset_fixups(const std::vector<uint32_t>& old_offsets, FixedAt fixed_at) {
     constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
@@ -2348,8 +2383,15 @@ OffsetFixups encode_offset_fixups(const std::vector<uint32_t>& old_offsets, Fixe
         prev_shift = shift;
         open = false;
     };
-    for (uint32_t i = 0; i < old_offsets.size(); i++) {
-        uint32_t old = old_offsets[i], fixed = fixed_at(i);
+    for (size_t at = 0; at < old_offsets.size(); at++) {
+        const uint32_t old = old_offsets[at], fixed = fixed_at(at);
+        if (at >= NO_DATA && (old == NO_DATA ? fixed != NO_DATA : fixed != old)) {
+            out.past_last_index = true;
+            break;
+        }
+        // Below NO_DATA wherever the record moved; a record past it that
+        // didn't only closes the open run.
+        const uint32_t i = static_cast<uint32_t>(at);
         if (old == NO_DATA) {
             if (fixed != NO_DATA) {
                 write_varint(out.values, i - prev_value);
