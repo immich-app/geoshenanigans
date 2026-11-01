@@ -1008,95 +1008,104 @@ static int run(int argc, char* argv[]) {
                     old_rec += count; new_rec += count; old_bytes += run_bytes;
                     continue;
                 }
-                for (uint32_t k = 0; k < count; k++) {
-                    const uint64_t rec_off = old_bytes + uint64_t(k) * actual_stride;
-                    if (jc) jc->hint();
-                    const char* rec = old.at(rec_off, actual_stride);
+                // The offset fixups reach the run's records below the last u32 record index
+                // (OffsetFixupReader::reach); any past it, in a file of more than 0xFFFFFFFF records,
+                // keep their offsets. Checked once per run, not per record: the records go through the
+                // loop below in at most two parts, those the fixups reach with them, the rest without.
+                const uint32_t reached = has_fixups ? OffsetFixupReader::reach(old_rec, count) : 0;
+                for (uint32_t k = 0; k < count;) {
+                    const bool fix = k < reached;
+                    const uint32_t part_end = fix ? reached : count;
+                    for (; k < part_end; k++) {
+                        const uint64_t rec_off = old_bytes + uint64_t(k) * actual_stride;
+                        if (jc) jc->hint();
+                        const char* rec = old.at(rec_off, actual_stride);
 
-                    bool modified = false;
-                    // Check if this record needs any modification
-                    if (!remap_offs.empty() || needs_padding) modified = true;
-                    // POI records: byte-32 parent_poly_id shifts with the
-                    // admin id-space. (name_id/parent_street_id/parent_postcode_id
-                    // are string offsets handled by remap_offs, which already
-                    // set modified=true above.)
-                    if (file_id == (uint32_t)PatchFileId::POI_RECORDS &&
-                        !poi_admin_remap.empty())
-                        modified = true;
-                    // PlaceNode parent_poly_id (byte 16) shifts with admin id-space.
-                    if (file_id == (uint32_t)PatchFileId::PLACE_NODES &&
-                        actual_stride >= 20 && !poi_admin_remap.empty())
-                        modified = true;
-                    // AddrPoint parent_way_id (byte 16) shifts with street id-space.
-                    if (file_id == (uint32_t)PatchFileId::ADDR_POINTS &&
-                        actual_stride >= 20 && (street_rm || !poi_street_remap.empty()))
-                        modified = true;
-                    uint32_t old_off = 0, new_off = 0;
-                    if (has_fixups) {
-                        memcpy(&old_off, rec + fixup_off, 4);
-                        new_off = fixups.apply(uint64_t(old_rec) + k, old_off);
-                    }
-                    bool has_fixup = new_off != old_off;
-                    if (has_fixup) modified = true;
-
-                    if (modified) {
-                        memcpy(rec_buf.data(), rec, actual_stride);
-                        // Apply padding zeroing
-                        if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24)
-                            memset(rec_buf.data() + 14, 0, 2); // preserve place_type_override at byte 13
-                        // Apply string remap, or the field's string fixup
-                        const uint64_t slot = uint64_t(old_rec + k) * remap_offs.size();
-                        for (size_t f = 0; f < remap_offs.size(); f++) {
-                            const size_t off = remap_offs[f];
-                            uint32_t v; memcpy(&v, rec_buf.data() + off, 4);
-                            uint32_t nv = string_fixups.fixes(slot + f) ? string_fixups.take() : str_remap.lookup(v, remap_hints[f]);
-                            if (nv != v) memcpy(rec_buf.data() + off, &nv, 4);
+                        bool modified = false;
+                        // Check if this record needs any modification
+                        if (!remap_offs.empty() || needs_padding) modified = true;
+                        // POI records: byte-32 parent_poly_id shifts with the
+                        // admin id-space. (name_id/parent_street_id/parent_postcode_id
+                        // are string offsets handled by remap_offs, which already
+                        // set modified=true above.)
+                        if (file_id == (uint32_t)PatchFileId::POI_RECORDS &&
+                            !poi_admin_remap.empty())
+                            modified = true;
+                        // PlaceNode parent_poly_id (byte 16) shifts with admin id-space.
+                        if (file_id == (uint32_t)PatchFileId::PLACE_NODES &&
+                            actual_stride >= 20 && !poi_admin_remap.empty())
+                            modified = true;
+                        // AddrPoint parent_way_id (byte 16) shifts with street id-space.
+                        if (file_id == (uint32_t)PatchFileId::ADDR_POINTS &&
+                            actual_stride >= 20 && (street_rm || !poi_street_remap.empty()))
+                            modified = true;
+                        uint32_t old_off = 0, new_off = 0;
+                        if (fix) {
+                            memcpy(&old_off, rec + fixup_off, 4);
+                            new_off = fixups.apply(static_cast<uint32_t>(old_rec + k), old_off);
                         }
-                        // Apply POI parent_poly_id remap (byte 32, admin
-                        // polygon index). Bytes 24/28 (parent_street_id,
-                        // parent_postcode_id) are string offsets and are
-                        // handled by the str_remap pass via remap_offs
-                        // above — NOT here. Mirrors geocoder_diff.cpp.
-                        if (file_id == (uint32_t)PatchFileId::POI_RECORDS) {
-                            constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
-                            if (actual_stride >= 36 && !poi_admin_remap.empty()) {
-                                uint32_t pp; memcpy(&pp, rec_buf.data() + POI_RECORD_PARENT_POLY_ID_OFF, 4);
+                        bool has_fixup = new_off != old_off;
+                        if (has_fixup) modified = true;
+
+                        if (modified) {
+                            memcpy(rec_buf.data(), rec, actual_stride);
+                            // Apply padding zeroing
+                            if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24)
+                                memset(rec_buf.data() + 14, 0, 2); // preserve place_type_override at byte 13
+                            // Apply string remap, or the field's string fixup
+                            const uint64_t slot = uint64_t(old_rec + k) * remap_offs.size();
+                            for (size_t f = 0; f < remap_offs.size(); f++) {
+                                const size_t off = remap_offs[f];
+                                uint32_t v; memcpy(&v, rec_buf.data() + off, 4);
+                                uint32_t nv = string_fixups.fixes(slot + f) ? string_fixups.take() : str_remap.lookup(v, remap_hints[f]);
+                                if (nv != v) memcpy(rec_buf.data() + off, &nv, 4);
+                            }
+                            // Apply POI parent_poly_id remap (byte 32, admin
+                            // polygon index). Bytes 24/28 (parent_street_id,
+                            // parent_postcode_id) are string offsets and are
+                            // handled by the str_remap pass via remap_offs
+                            // above — NOT here. Mirrors geocoder_diff.cpp.
+                            if (file_id == (uint32_t)PatchFileId::POI_RECORDS) {
+                                constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
+                                if (actual_stride >= 36 && !poi_admin_remap.empty()) {
+                                    uint32_t pp; memcpy(&pp, rec_buf.data() + POI_RECORD_PARENT_POLY_ID_OFF, 4);
+                                    if (pp != NO_DATA) {
+                                        uint32_t npp = poi_remap_lookup(poi_admin_remap, pp);
+                                        if (npp != pp) memcpy(rec_buf.data() + POI_RECORD_PARENT_POLY_ID_OFF, &npp, 4);
+                                    }
+                                }
+                            }
+                            // PlaceNode parent_poly_id at byte 16 (20-byte stride).
+                            if (file_id == (uint32_t)PatchFileId::PLACE_NODES &&
+                                actual_stride >= 20 && !poi_admin_remap.empty()) {
+                                constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
+                                uint32_t pp; memcpy(&pp, rec_buf.data() + PLACE_NODE_PARENT_POLY_ID_OFF, 4);
                                 if (pp != NO_DATA) {
                                     uint32_t npp = poi_remap_lookup(poi_admin_remap, pp);
-                                    if (npp != pp) memcpy(rec_buf.data() + POI_RECORD_PARENT_POLY_ID_OFF, &npp, 4);
+                                    if (npp != pp) memcpy(rec_buf.data() + PLACE_NODE_PARENT_POLY_ID_OFF, &npp, 4);
                                 }
                             }
-                        }
-                        // PlaceNode parent_poly_id at byte 16 (20-byte stride).
-                        if (file_id == (uint32_t)PatchFileId::PLACE_NODES &&
-                            actual_stride >= 20 && !poi_admin_remap.empty()) {
-                            constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
-                            uint32_t pp; memcpy(&pp, rec_buf.data() + PLACE_NODE_PARENT_POLY_ID_OFF, 4);
-                            if (pp != NO_DATA) {
-                                uint32_t npp = poi_remap_lookup(poi_admin_remap, pp);
-                                if (npp != pp) memcpy(rec_buf.data() + PLACE_NODE_PARENT_POLY_ID_OFF, &npp, 4);
-                            }
-                        }
-                        // AddrPoint parent_way_id at byte 16 (20+ stride).
-                        if (file_id == (uint32_t)PatchFileId::ADDR_POINTS &&
-                            actual_stride >= 20 && (street_rm || !poi_street_remap.empty())) {
-                            constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
-                            uint32_t pw; memcpy(&pw, rec_buf.data() + ADDR_POINT_PARENT_WAY_ID_OFF, 4);
-                            if (pw != NO_DATA) {
-                                uint32_t npw;
-                                if (street_rm) {
-                                    npw = street_rm->lookup(pw, street_hint);
-                                    if (npw == RecordRemap::NONE) npw = pw;
-                                } else {
-                                    npw = poi_remap_lookup(poi_street_remap, pw);
+                            // AddrPoint parent_way_id at byte 16 (20+ stride).
+                            if (file_id == (uint32_t)PatchFileId::ADDR_POINTS &&
+                                actual_stride >= 20 && (street_rm || !poi_street_remap.empty())) {
+                                constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
+                                uint32_t pw; memcpy(&pw, rec_buf.data() + ADDR_POINT_PARENT_WAY_ID_OFF, 4);
+                                if (pw != NO_DATA) {
+                                    uint32_t npw;
+                                    if (street_rm) {
+                                        npw = street_rm->lookup(pw, street_hint);
+                                        if (npw == RecordRemap::NONE) npw = pw;
+                                    } else {
+                                        npw = poi_remap_lookup(poi_street_remap, pw);
+                                    }
+                                    if (npw != pw) memcpy(rec_buf.data() + ADDR_POINT_PARENT_WAY_ID_OFF, &npw, 4);
                                 }
-                                if (npw != pw) memcpy(rec_buf.data() + ADDR_POINT_PARENT_WAY_ID_OFF, &npw, 4);
                             }
+                            if (has_fixup) memcpy(rec_buf.data() + fixup_off, &new_off, 4);
+                            write_record(rec_buf.data());
+                        } else {
+                            write_record(rec);  // no modification needed: the record as read
                         }
-                        if (has_fixup) memcpy(rec_buf.data() + fixup_off, &new_off, 4);
-                        write_record(rec_buf.data());
-                    } else {
-                        write_record(rec);  // no modification needed: the record as read
                     }
                 }
                 flush_batch();
