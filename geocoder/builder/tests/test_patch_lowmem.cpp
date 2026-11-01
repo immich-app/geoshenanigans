@@ -2251,6 +2251,57 @@ TEST(patch_refuses_a_second_parent_id_remap) {
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
+// Secondary pairs for a file the patcher keeps no record remap of are refused
+// in every mode: a list of one pair for admin_polygons.bin (whose pairs go in
+// the parent-id remap) or for file 37, past every file (PatchFileId::COUNT).
+// Empty lists for them pass, as the diff's own empty lists do: that patch, and
+// the patch as made (20 secondary-matched POIs, 20 moved street ways with
+// addresses), apply.
+TEST(patch_refuses_secondary_pairs_for_a_file_without_a_record_remap) {
+    ScratchDir dir("patch-foreign-pairs");
+    BuildDir old_d, new_d, old_meta, new_meta;
+    put_moved_ways(old_d, new_d, old_meta, new_meta, 20, 0);
+    put_changed_pois(old_d, new_d, 20);
+    const LowMemCase c{dir.path(), "foreign"};
+    REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    const size_t head = find_once(raw, secondary_remap_head(20));
+    REQUIRE(head != std::string::npos);
+    // Where the secondary remap's file count sits, and where it ends (after
+    // the POIs' pairs and the place nodes' empty list).
+    const size_t n_files = head + 4, end = head + 40 + 20 * 8 + 8;
+    const uint32_t admin = static_cast<uint32_t>(PatchFileId::ADMIN_POLYGONS), past = static_cast<uint32_t>(PatchFileId::COUNT);
+    // The patch with lists (file id, pair count, pairs) after the five the
+    // diff wrote.
+    auto with_lists = [&](uint32_t n, std::initializer_list<uint32_t> words) {
+        std::vector<char> p = raw, lists;
+        put_at(p, n_files, 5 + n);
+        for (const uint32_t w : words) append(lists, w);
+        p.insert(p.begin() + end, lists.begin(), lists.end());
+        return p;
+    };
+
+    struct Case {
+        std::string name;
+        std::vector<char> patch;
+        std::string refusal;
+    };
+    const Case cases[] = {
+        {"admin", with_lists(1, {admin, 1, 0, 1}), "Malformed secondary remap: pairs for admin_polygons.bin, which has none"},
+        {"past-every-file", with_lists(1, {past, 1, 0, 1}), "Malformed secondary remap: pairs for file 37, which has none"},
+    };
+    for (const Case& e : cases) {
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, e.patch));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    REQUIRE(write_patch(c, c.patch(), with_lists(2, {admin, 0, past, 0})));
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
 // String fixups the replay can't take are refused in every mode: 10 POIs
 // whose names move past the strings section's pairs, the new day without POI
 // 1, so the POI merge carries the fixups of POIs 0 and 2 to 8, and

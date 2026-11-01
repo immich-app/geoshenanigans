@@ -596,17 +596,21 @@ static int run(int argc, char* argv[]) {
         if (file_id == SECONDARY_REMAP_MARKER) {
             // Secondary matches complete the remap of a file already replayed
             // (the diff emits them after the merges), read where they sit; a
-            // file sent unchanged has no remap and keeps its ids. A second
-            // list with pairs for a file is refused either way.
+            // file sent unchanged has no remap and keeps its ids. Pairs for a
+            // file the patcher keeps no remap of, and a second list with pairs
+            // for a file, are refused either way.
             uint32_t nf = patch.u32();
             for (uint32_t f = 0; f < nf; f++) {
                 uint32_t fid = patch.u32(), np = patch.u32();
                 SortedTable<RemapPair> pairs(patch.take_items(np, sizeof(RemapPair), "secondary remap"), np, "secondary remap");
                 if (np > 0) {
-                    if (!secondary_pairs_for.insert(fid).second)
-                        throw std::runtime_error("Malformed secondary remap: a second one for " +
+                    if (!is_remapped_record_file(fid))
+                        throw std::runtime_error("Malformed secondary remap: pairs for " +
                                                  (fid < (uint32_t)PatchFileId::COUNT ? std::string(patch_file_names[fid])
-                                                                                     : "file " + std::to_string(fid)));
+                                                                                     : "file " + std::to_string(fid)) +
+                                                 ", which has none");
+                    if (!secondary_pairs_for.insert(fid).second)
+                        throw std::runtime_error(std::string("Malformed secondary remap: a second one for ") + patch_file_names[fid]);
                     if (fid == (uint32_t)PatchFileId::STREET_WAYS) take_street_pairs("secondary remap");
                     auto it = record_remaps.find(fid);
                     if (it != record_remaps.end()) it->second.set_pairs(std::move(pairs));
@@ -935,11 +939,7 @@ static int run(int argc, char* argv[]) {
 
         // Record the old → new record ids of the files whose remap the entry
         // pipeline reads back (geo, POI and place indexes).
-        bool track = file_id == (uint32_t)PatchFileId::STREET_WAYS ||
-                     file_id == (uint32_t)PatchFileId::ADDR_POINTS ||
-                     file_id == (uint32_t)PatchFileId::INTERP_WAYS ||
-                     file_id == (uint32_t)PatchFileId::POI_RECORDS ||
-                     file_id == (uint32_t)PatchFileId::PLACE_NODES;
+        const bool track = is_remapped_record_file(file_id);
         RecordRemap remap(track ? static_cast<uint32_t>(n_old_records) : 0, tmpdir);
         // v8: addresses' parent_way_id moves by the street replay's remap
         // (MATCH / REPLACE runs plus the parent-id remap's moved pairs).

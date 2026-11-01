@@ -181,10 +181,11 @@ keep it so:
   patch, which the patcher checks against the bytes left in its section first (`SectionReader`),
   or has a cap it refuses past: 65,536 moved-string pairs (STRING_PAIRS_MAX), 1024 client files
   (MAX_CLIENT_FILES) of names at most 255 bytes, a record stride below 0x100
-  (MAX_RECORD_STRIDE), 0xFFFF lost and 0xFFFF gained ids per cell list, a child stream at most
-  4 MiB ahead of its parent (MAX_DECODER_SKEW), fewer than 0xFFFF values in a `.dict`, and, on
-  the `zstd` command, an 8 MiB zstd window (PATCH_ZSTD_WINDOW_LOG). The encoders take what
-  they're given in pieces of at most 64 KiB (ENCODER_PIECE).
+  (MAX_RECORD_STRIDE), secondary remap pairs for the five remapped record files only, 0xFFFF lost
+  and 0xFFFF gained ids per cell list, a child stream at most 4 MiB ahead of its parent
+  (MAX_DECODER_SKEW), fewer than 0xFFFF values in a `.dict`, and, on the `zstd` command, an 8 MiB
+  zstd window (PATCH_ZSTD_WINDOW_LOG). The encoders take what they're given in pieces of at most
+  64 KiB (ENCODER_PIECE).
 
 The heap tests in `tests/test_patch_lowmem.cpp` hold the patcher to these rules: each grows one
 structure tenfold, applies the patch in plain, low-memory and `--threads` mode, and fails when
@@ -522,6 +523,10 @@ Secondary ID Remap: marker 0xFFFFFFF6 (u32) + n_files (u32)
   reads them where they sit as the file's remap pairs and refuses a list out
   of order, a second list with pairs for a file (replayed or sent unchanged),
   and street_ways pairs when the parent-id remap's street leg has some.
+  The files are those whose record remap the patcher keeps
+  (REMAPPED_RECORD_FILES: street_ways, addr_points, interp_ways, poi_records,
+  place_nodes); it refuses pairs for any other ("Malformed secondary remap:
+  pairs for <file>, which has none") and passes over an empty list.
 
 Geo Entry Deltas (street / addr / interp entries): marker 0xFFFFFFF0 (u32)
   + file_id (u32) + count (u32), then per cell in cell order:

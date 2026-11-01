@@ -375,10 +375,22 @@ static constexpr EntriesFiles CELL_INDEX_ENTRIES_FILES = {PatchFileId::ADMIN_ENT
 //   for each: file_id(4), n_pairs(4), [(old_id:u32, new_id:u32)] × n_pairs
 // Each file's pairs ascending by old_id, each id once (v11); the patcher
 // reads them where they sit and refuses a file's pairs out of order or with
-// an old id twice, a second list with pairs for a file (replayed or sent
-// unchanged), and street_ways pairs when the parent-id remap's street leg has
-// some.
+// an old id twice, pairs for a file not in REMAPPED_RECORD_FILES, a second
+// list with pairs for a file (replayed or sent unchanged), and street_ways
+// pairs when the parent-id remap's street leg has some.
 static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
+
+// The record files whose old → new record ids the patcher keeps (RecordRemap)
+// for the entry pipeline's geo, POI and place indexes: the secondary remap
+// gives pairs for these and no other (the admin polygons' go in the parent-id
+// remap).
+static constexpr PatchFileId REMAPPED_RECORD_FILES[] = {PatchFileId::STREET_WAYS, PatchFileId::ADDR_POINTS,
+                                                        PatchFileId::INTERP_WAYS, PatchFileId::POI_RECORDS,
+                                                        PatchFileId::PLACE_NODES};
+inline bool is_remapped_record_file(uint32_t fid) {
+    return std::find(std::begin(REMAPPED_RECORD_FILES), std::end(REMAPPED_RECORD_FILES), static_cast<PatchFileId>(fid)) !=
+           std::end(REMAPPED_RECORD_FILES);
+}
 
 // The strings section, read by position right after the old file sizes
 // (UNSECTIONED_OLD_FILES). Its marker shares 0xFFFFFFF6 with
