@@ -15,10 +15,25 @@
 #include <cmath>
 #include <cstdio>
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace gctest {
+
+// What the call threw as an E, or "" when it returned. An exception of
+// another type, or an E without a message, goes on to the runner, which
+// fails the test with it: "" only ever means the call returned.
+template <class E = std::runtime_error>
+std::string refusal_of(const std::function<void()>& call) {
+    try {
+        call();
+    } catch (const E& e) {
+        if (!*e.what()) throw;
+        return e.what();
+    }
+    return "";
+}
 
 struct Test {
     const char* name;

@@ -4,7 +4,6 @@
 #include "osc_reader.h"
 
 #include <cstdio>
-#include <functional>
 #include <string>
 #include <vector>
 #include <zlib.h>
@@ -12,16 +11,9 @@
 #include "scratch_dir.h"
 #include "test_framework.h"
 
-namespace {
+using gctest::refusal_of;
 
-bool throws(const std::function<void()>& fn) {
-    try {
-        fn();
-    } catch (const std::exception&) {
-        return true;
-    }
-    return false;
-}
+namespace {
 
 std::string write_file(const ScratchDir& dir, const std::string& name, const std::string& text, bool gzip) {
     std::string path = dir.path() + "/" + name;
@@ -121,30 +113,34 @@ TEST(osc_coordinates_round_like_osmium) {
         {"1e2", 1000000000},       {".5", 5000000},           {"12.3456789999", 123456790},
     };
     for (const Case& c : cases) CHECK_EQ(osc::parse_coordinate(c.text), c.value);
-    CHECK(throws([] { osc::parse_coordinate("abc"); }));
-    CHECK(throws([] { osc::parse_coordinate("1.0x"); }));
-    CHECK(throws([] { osc::parse_coordinate(""); }));
-    CHECK(throws([] { osc::parse_coordinate("300"); }));
+    CHECK_EQ(refusal_of([] { osc::parse_coordinate("abc"); }), std::string("wrong format for coordinate: 'abc'"));
+    CHECK_EQ(refusal_of([] { osc::parse_coordinate("1.0x"); }), std::string("characters after coordinate: 'x'"));
+    CHECK_EQ(refusal_of([] { osc::parse_coordinate(""); }), std::string("wrong format for coordinate: ''"));
+    CHECK_EQ(refusal_of([] { osc::parse_coordinate("300"); }), std::string("wrong format for coordinate: '300'"));
 }
 
 TEST(osc_timestamps_parse_like_osmium) {
     CHECK_EQ(osc::parse_timestamp("2026-07-08T09:14:48Z"), uint32_t(1783502088));
     CHECK_EQ(osc::parse_timestamp("2026-07-08T09:14:48.75Z"), uint32_t(1783502088));
-    CHECK(throws([] { osc::parse_timestamp("2026-07-08T09:14:48"); }));
-    CHECK(throws([] { osc::parse_timestamp("2026-13-08T09:14:48Z"); }));
-    CHECK(throws([] { osc::parse_timestamp("2026-07-08T09:14:48Zx"); }));
-    CHECK(throws([] { osc::parse_timestamp("2026-07-08 09:14:48Z"); }));
+    CHECK_EQ(refusal_of([] { osc::parse_timestamp("2026-07-08T09:14:48"); }),
+             std::string("can not parse timestamp: '2026-07-08T09:14:48'"));
+    CHECK_EQ(refusal_of([] { osc::parse_timestamp("2026-13-08T09:14:48Z"); }),
+             std::string("can not parse timestamp: '2026-13-08T09:14:48Z'"));
+    CHECK_EQ(refusal_of([] { osc::parse_timestamp("2026-07-08T09:14:48Zx"); }),
+             std::string("can not parse timestamp: garbage after timestamp"));
+    CHECK_EQ(refusal_of([] { osc::parse_timestamp("2026-07-08 09:14:48Z"); }),
+             std::string("can not parse timestamp: '2026-07-08 09:14:48Z'"));
 }
 
 TEST(osc_ids_and_counters_parse_like_osmium) {
     CHECK_EQ(osc::parse_id("-5"), int64_t(-5));
     CHECK_EQ(osc::parse_id("13000000000"), int64_t(13000000000));
-    CHECK(throws([] { osc::parse_id(" 5"); }));
-    CHECK(throws([] { osc::parse_id("5x"); }));
+    CHECK_EQ(refusal_of([] { osc::parse_id(" 5"); }), std::string("illegal id: ' 5'"));
+    CHECK_EQ(refusal_of([] { osc::parse_id("5x"); }), std::string("illegal id: '5x'"));
     CHECK_EQ(osc::parse_u32("-1", "version"), uint32_t(0));
     CHECK_EQ(osc::parse_u32("4294967294", "version"), uint32_t(4294967294u));
-    CHECK(throws([] { osc::parse_u32("4294967295", "version"); }));
-    CHECK(throws([] { osc::parse_u32("-2", "version"); }));
+    CHECK_EQ(refusal_of([] { osc::parse_u32("4294967295", "version"); }), std::string("illegal version: '4294967295'"));
+    CHECK_EQ(refusal_of([] { osc::parse_u32("-2", "version"); }), std::string("illegal version: '-2'"));
 }
 
 TEST(osc_reader_reads_sections_visibility_and_first_lists) {
@@ -201,34 +197,38 @@ TEST(osc_reader_reports_the_first_bad_file_in_file_order) {
     std::string good = write_file(dir, "good.osc", kChange, false);
     std::string bad1 = write_file(dir, "bad1.osc", "<osmChange version=\"0.5\"></osmChange>\n", false);
     std::string bad2 = write_file(dir, "bad2.osc", "<osmChange version=\"0.6\"><create>\n", false);
-    for (unsigned threads : {1u, 4u}) {
-        std::string what;
-        try {
-            read_change_files({good, bad1, bad2}, kOscChunkBytes, threads);
-        } catch (const std::exception& e) {
-            what = e.what();
-        }
-        CHECK(what.find(bad1) == 0);
-    }
+    for (unsigned threads : {1u, 4u})
+        CHECK_EQ(refusal_of([&] { read_change_files({good, bad1, bad2}, kOscChunkBytes, threads); }),
+                 bad1 + ": osmChange/osm version must be 0.6");
 }
 
 TEST(osc_reader_rejects_malformed_structure) {
     ScratchDir dir("osc-test");
-    const char* bad[] = {
-        "<osmChange version=\"0.6\"><create><node id=\"1\"/></osmChange>\n",
-        "<osmChange version=\"0.6\"><create><create><node id=\"1\"/></create></create></osmChange>\n",
-        "<osmChange version=\"0.5\"><create><node id=\"1\"/></create></osmChange>\n",
-        "<osmChange version=\"0.6\"><create><node id=\"1\"/></create>\n",
-        "<osm version=\"0.6\"><create><node id=\"1\"/></create></osm>\n",
-        "<osmChange version=\"0.6\"><!-- c --><create><node id=\"1\"/></create></osmChange>\n",
-        "<osmChange version=\"0.6\"><create><node id=\"1\"><nd ref=\"1\"/></node></create></osmChange>\n",
-        "<osmChange version=\"0.6\"><create><relation id=\"1\"><member ref=\"1\"/></relation></create></osmChange>\n",
-        "<?xml version='1.0' encoding='ISO-8859-1'?><osmChange version=\"0.6\"></osmChange>\n",
-        "<osmChange version=\"0.6\"><?pi x?></osmChange>\n",
+    // A structure error names the file; an error inside a run of objects
+    // does not.
+    const std::string path = dir.path() + "/bad.osc";
+    const std::pair<const char*, std::string> bad[] = {
+        {"<osmChange version=\"0.6\"><create><node id=\"1\"/></osmChange>\n", path + ": mismatched root close tag"},
+        {"<osmChange version=\"0.6\"><create><create><node id=\"1\"/></create></create></osmChange>\n",
+         path + ": <create>/<modify>/<delete> only allowed directly in <osmChange>"},
+        {"<osmChange version=\"0.5\"><create><node id=\"1\"/></create></osmChange>\n",
+         path + ": osmChange/osm version must be 0.6"},
+        {"<osmChange version=\"0.6\"><create><node id=\"1\"/></create>\n", path + ": missing root close tag (truncated file?)"},
+        {"<osm version=\"0.6\"><create><node id=\"1\"/></create></osm>\n",
+         path + ": <create>/<modify>/<delete> only allowed directly in <osmChange>"},
+        {"<osmChange version=\"0.6\"><!-- c --><create><node id=\"1\"/></create></osmChange>\n",
+         "OSC: comments, CDATA and DOCTYPE are not supported"},
+        {"<osmChange version=\"0.6\"><create><node id=\"1\"><nd ref=\"1\"/></node></create></osmChange>\n",
+         "OSC: unknown element <nd> in an object"},
+        {"<osmChange version=\"0.6\"><create><relation id=\"1\"><member ref=\"1\"/></relation></create></osmChange>\n",
+         "Unknown type on relation <member>"},
+        {"<?xml version='1.0' encoding='ISO-8859-1'?><osmChange version=\"0.6\"></osmChange>\n",
+         "OSC: only UTF-8 files are supported"},
+        {"<osmChange version=\"0.6\"><?pi x?></osmChange>\n", "OSC: processing instruction after the start of the file"},
     };
-    for (const char* text : bad) {
-        std::string path = write_file(dir, "bad.osc", text, false);
-        CHECK(throws([&] { read_change_files({path}, kOscChunkBytes, 2); }));
+    for (const auto& [text, refusal] : bad) {
+        REQUIRE(write_file(dir, "bad.osc", text, false) == path);
+        CHECK_EQ(refusal_of([&] { read_change_files({path}, kOscChunkBytes, 2); }), refusal);
     }
 }
 

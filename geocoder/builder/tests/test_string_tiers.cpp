@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+using gctest::refusal_of;
+
 // For test_patch_format.cpp, which can't include parsed_data.h beside
 // patch_format.h.
 std::vector<std::string> builder_string_tier_files() {
@@ -281,7 +283,6 @@ TEST(order_poi_strings_leaves_a_build_without_poi_names_alone) {
 TEST(order_poi_strings_refuses_a_pool_that_is_not_the_tiers) {
     ParsedData d = poi_build({{"zoo", 1}});
     d.string_pool.mutable_data().push_back('x');
-    bool threw = false;
-    try { order_poi_strings_by_record(d); } catch (const std::logic_error&) { threw = true; }
-    CHECK(threw);
+    CHECK_EQ(refusal_of<std::logic_error>([&] { order_poi_strings_by_record(d); }),
+             std::string("order_poi_strings_by_record: the pool is not the tiers back to back"));
 }

@@ -15,6 +15,7 @@
 #include "test_framework.h"
 
 using namespace gc::id_alloc;
+using gctest::refusal_of;
 
 // allocate_all over a list of identities, in list order.
 static std::vector<uint32_t> allocate_list(IdAllocator& a, const std::vector<SlotIdentity>& ids,
@@ -275,13 +276,8 @@ TEST(allocate_without_tier_leaves_slot_bytes_as_before) {
 TEST(allocate_all_runs_once_per_allocator) {
     IdAllocator a;
     allocate_list(a, {{ObjectType::OSM_WAY, 42}});
-    bool thrown = false;
-    try {
-        allocate_list(a, {{ObjectType::OSM_WAY, 43}});
-    } catch (const std::logic_error&) {
-        thrown = true;
-    }
-    CHECK(thrown);
+    CHECK_EQ(refusal_of<std::logic_error>([&] { allocate_list(a, {{ObjectType::OSM_WAY, 43}}); }),
+             std::string("IdAllocator::allocate_all called twice"));
 }
 
 TEST(repeated_identity_reclaims_the_lowest_slot_for_the_first_record) {

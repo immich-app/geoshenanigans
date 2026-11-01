@@ -5,6 +5,8 @@
 
 #include "test_framework.h"
 
+using gctest::refusal_of;
+
 TEST(grow_addr_points_grows_every_parallel_array_and_returns_the_first_slot) {
     ParsedData d;
     CHECK_EQ(grow_addr_points(d, 2), size_t(0));
@@ -25,11 +27,6 @@ TEST(grow_addr_points_refuses_parallel_arrays_of_different_lengths) {
     ParsedData d;
     grow_addr_points(d, 2);
     d.addr_cells.pop_back();
-    bool thrown = false;
-    try {
-        grow_addr_points(d, 1);
-    } catch (const std::logic_error&) {
-        thrown = true;
-    }
-    CHECK(thrown);
+    CHECK_EQ(refusal_of<std::logic_error>([&] { grow_addr_points(d, 1); }),
+             std::string("addr_points and its parallel arrays differ in length"));
 }

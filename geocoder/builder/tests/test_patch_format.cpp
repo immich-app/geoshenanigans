@@ -31,15 +31,7 @@
 #include "test_framework.h"
 #include "types.h"
 
-// What the call threw as a runtime_error, or "" when it returned.
-static std::string refusal_of(const std::function<void()>& call) {
-    try {
-        call();
-    } catch (const std::runtime_error& e) {
-        return e.what();
-    }
-    return "";
-}
+using gctest::refusal_of;
 
 // --- write_varint / SectionReader::varint round-trip ---
 

@@ -13,6 +13,8 @@
 #include "test_framework.h"
 #include "types.h"
 
+using gctest::refusal_of;
+
 namespace {
 
 std::vector<char> sidecar_bytes(const std::vector<uint32_t>& keys) {
@@ -49,15 +51,6 @@ private:
     bool active_ = false;
 };
 
-bool repeats_a_key(const std::vector<uint32_t>& old_key) {
-    try {
-        old_index_of_new(old_key, {old_key[0]});
-    } catch (const std::runtime_error&) {
-        return true;
-    }
-    return false;
-}
-
 }  // namespace
 
 TEST(identity_keys_need_one_key_per_record) {
@@ -89,26 +82,28 @@ TEST(old_index_of_new_takes_memory_by_record_count_not_key) {
     // Keys up to 0xFFFFFFFE: a table indexed by key would take 16 GiB.
     const uint32_t far = 0xFFFFFFFEu;
     std::vector<uint32_t> two, mixed;
-    bool fits = true;
+    std::string refusal;
     {
         AddressSpaceCap cap(size_t(2) << 30);
         REQUIRE(cap.active());
-        try {
+        refusal = refusal_of<std::bad_alloc>([&] {
             two = old_index_of_new({far, 17}, {17, far, 2, NO_DATA});
             mixed = old_index_of_new({5, 0, far, NO_DATA, 1}, {far, 1, 5, 7, NO_DATA, 0});
-        } catch (const std::bad_alloc&) {
-            fits = false;
-        }
+        });
     }
-    CHECK(fits);
+    CHECK_EQ(refusal, std::string());
     CHECK(two == std::vector<uint32_t>({1, 0, NO_DATA, NO_DATA}));
     CHECK(mixed == std::vector<uint32_t>({2, 4, 0, NO_DATA, NO_DATA, 1}));
 }
 
 TEST(old_index_of_new_rejects_a_repeated_key) {
-    CHECK(repeats_a_key({0, 0}));
-    CHECK(repeats_a_key({1, NO_DATA, 1}));
-    CHECK(repeats_a_key({100, 2, 100}));
-    CHECK(!repeats_a_key({1, NO_DATA, NO_DATA}));
-    CHECK(!repeats_a_key({100, 2, 101}));
+    auto refusal = [](const std::vector<uint32_t>& old_key) {
+        return refusal_of([&] { old_index_of_new(old_key, {old_key[0]}); });
+    };
+    const std::string repeated = "Identity sidecar repeats a key";
+    CHECK_EQ(refusal({0, 0}), repeated);
+    CHECK_EQ(refusal({1, NO_DATA, 1}), repeated);
+    CHECK_EQ(refusal({100, 2, 100}), repeated);
+    CHECK_EQ(refusal({1, NO_DATA, NO_DATA}), std::string());
+    CHECK_EQ(refusal({100, 2, 101}), std::string());
 }

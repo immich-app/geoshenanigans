@@ -7,6 +7,8 @@
 
 #include "test_framework.h"
 
+using gctest::refusal_of;
+
 namespace {
 
 // Text-like bytes that compress, as PBF blocks do.
@@ -36,16 +38,6 @@ std::string zlib_uncompress(const std::string& z, size_t raw_size) {
     return raw;
 }
 
-template <class Fn>
-bool throws_runtime_error(Fn fn) {
-    try {
-        fn();
-    } catch (const std::runtime_error&) {
-        return true;
-    }
-    return false;
-}
-
 }  // namespace
 
 TEST(zlib_inflate_gives_the_bytes_zlib_compressed) {
@@ -68,14 +60,16 @@ TEST(zlib_inflate_reports_fewer_bytes_than_its_room) {
 TEST(zlib_inflate_rejects_data_past_its_room_and_corrupt_data) {
     const std::string z = zlib_compress(sample(500), 6);
     std::string small(499, '\0');
-    CHECK(throws_runtime_error([&] { zlib_inflate(z, small.data(), small.size()); }));
+    CHECK_EQ(refusal_of([&] { zlib_inflate(z, small.data(), small.size()); }),
+             std::string("zlib data inflates past its raw size"));
 
     std::string corrupt = z;
     corrupt[corrupt.size() / 2] ^= 0x5a;
     corrupt[corrupt.size() / 2 + 1] ^= 0xa5;
     std::string out(500, '\0');
-    CHECK(throws_runtime_error([&] { zlib_inflate(corrupt, out.data(), out.size()); }));
-    CHECK(throws_runtime_error([&] { zlib_inflate(std::string_view(), out.data(), out.size()); }));
+    CHECK_EQ(refusal_of([&] { zlib_inflate(corrupt, out.data(), out.size()); }), std::string("zlib data is corrupt"));
+    CHECK_EQ(refusal_of([&] { zlib_inflate(std::string_view(), out.data(), out.size()); }),
+             std::string("zlib data is corrupt"));
 }
 
 TEST(zlib_deflate_output_inflates_through_zlib_at_every_level) {
@@ -88,11 +82,5 @@ TEST(zlib_deflate_output_inflates_through_zlib_at_every_level) {
 }
 
 TEST(zlib_deflate_rejects_levels_past_twelve) {
-    bool thrown = false;
-    try {
-        zlib_deflate("x", 13);
-    } catch (const std::invalid_argument&) {
-        thrown = true;
-    }
-    CHECK(thrown);
+    CHECK_EQ(refusal_of<std::invalid_argument>([] { zlib_deflate("x", 13); }), std::string("zlib level 13"));
 }

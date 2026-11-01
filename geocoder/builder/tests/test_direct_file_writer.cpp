@@ -11,6 +11,8 @@
 #include "scratch_dir.h"
 #include "test_framework.h"
 
+using gctest::refusal_of;
+
 namespace {
 
 std::string read_file(const std::string& path) {
@@ -137,15 +139,12 @@ TEST(direct_writer_reports_a_span_past_the_end_of_its_file) {
     for (long before : {0L, 9000L}) {
         ScratchDir dir("direct-writer-test");
         DirectFileWriter sut(dir.path() + "/out.bin", true, 8192, 2);
-        bool threw = false;
-        try {
-            if (before) sut.append(std::string(size_t(before), 'a'));
-            sut.append_from(source.fd, 29990, 11, source.path);
-            sut.append(std::string(20000, 'b'));
-            sut.finish();
-        } catch (const std::runtime_error&) {
-            threw = true;
-        }
-        CHECK(threw);
+        CHECK_EQ(refusal_of([&] {
+                     if (before) sut.append(std::string(size_t(before), 'a'));
+                     sut.append_from(source.fd, 29990, 11, source.path);
+                     sut.append(std::string(20000, 'b'));
+                     sut.finish();
+                 }),
+                 "Unexpected end of " + source.path);
     }
 }

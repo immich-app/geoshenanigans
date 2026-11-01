@@ -6,14 +6,14 @@
 #include <fcntl.h>
 #include <cstdio>
 #include <cstring>
-#include <functional>
-#include <stdexcept>
 #include <string>
 #include <unistd.h>
 #include <vector>
 
 #include "scratch_dir.h"
 #include "test_framework.h"
+
+using gctest::refusal_of;
 
 namespace {
 
@@ -31,15 +31,6 @@ struct ByteFile {
     }
     bool same(const char* p, uint64_t off, size_t n) const { return std::memcmp(p, bytes.data() + off, n) == 0; }
 };
-
-bool throws_runtime(const std::function<void()>& fn, const char* message) {
-    try {
-        fn();
-    } catch (const std::runtime_error& e) {
-        return std::string(e.what()).find(message) != std::string::npos;
-    }
-    return false;
-}
 
 }  // namespace
 
@@ -83,8 +74,8 @@ TEST(sequential_reader_reads_to_the_end_and_throws_one_byte_past_it) {
     ByteFile file(1000);
     SequentialFileReader sut(file.path, 64);
     CHECK(file.same(sut.at(988, 12), 988, 12));
-    CHECK(throws_runtime([&] { sut.at(989, 12); }, "Read past end"));
-    CHECK(throws_runtime([&] { sut.read(1000, nullptr, 1); }, "Read past end"));
+    CHECK_EQ(refusal_of([&] { sut.at(989, 12); }), "Read past end of " + file.path);
+    CHECK_EQ(refusal_of([&] { sut.read(1000, nullptr, 1); }), "Read past end of " + file.path);
 }
 
 TEST(sequential_reader_zero_byte_view_at_the_end_needs_no_read) {
@@ -163,7 +154,7 @@ TEST(sequential_reader_copy_range_appends_at_the_output_position) {
     }
     int scratch = ::open(out_path.c_str(), O_WRONLY);
     REQUIRE(scratch >= 0);
-    CHECK(throws_runtime([&] { sut.copy_range(990, 11, scratch); }, "Read past end"));
+    CHECK_EQ(refusal_of([&] { sut.copy_range(990, 11, scratch); }), "Read past end of " + file.path);
     ::close(scratch);
 }
 
@@ -226,7 +217,7 @@ TEST(copy_in_kernel_retries_short_copies_and_interrupts) {
 
 TEST(copy_in_kernel_throws_on_other_errors) {
     auto no_space = [](uint64_t, size_t) -> ssize_t { errno = ENOSPC; return -1; };
-    CHECK(throws_runtime([&] { copy_in_kernel(0, 8, no_space, "fake"); }, "Cannot copy fake"));
+    CHECK_EQ(refusal_of([&] { copy_in_kernel(0, 8, no_space, "fake"); }), "Cannot copy fake: " + std::string(std::strerror(ENOSPC)));
 }
 
 namespace {
@@ -281,8 +272,8 @@ TEST(append_old_range_throws_when_the_flush_before_a_copy_fails) {
     FILE* out = std::fopen("/dev/full", "wb");
     REQUIRE(out != nullptr);
     std::fputc('<', out);
-    CHECK(throws_runtime([&] { append_old_range(old, out, 0, COPY_RANGE_MIN_BYTES, "full.bin"); },
-                         "Cannot write full.bin"));
+    CHECK_EQ(refusal_of([&] { append_old_range(old, out, 0, COPY_RANGE_MIN_BYTES, "full.bin"); }),
+             std::string("Cannot write full.bin"));
     std::fclose(out);
 }
 
@@ -314,8 +305,8 @@ TEST(read_fully_throws_on_an_early_end_or_an_error) {
     char dst[8];
     auto early_end = [](char*, size_t, uint64_t) -> ssize_t { return 0; };
     auto io_error = [](char*, size_t, uint64_t) -> ssize_t { errno = EIO; return -1; };
-    CHECK(throws_runtime([&] { read_fully(dst, 8, 0, early_end, "fake"); }, "Unexpected end of fake"));
-    CHECK(throws_runtime([&] { read_fully(dst, 8, 0, io_error, "fake"); }, "Cannot read fake"));
+    CHECK_EQ(refusal_of([&] { read_fully(dst, 8, 0, early_end, "fake"); }), std::string("Unexpected end of fake"));
+    CHECK_EQ(refusal_of([&] { read_fully(dst, 8, 0, io_error, "fake"); }), "Cannot read fake: " + std::string(std::strerror(EIO)));
 }
 
 TEST(sequential_reader_grows_its_default_window_for_the_largest_cell_list) {
@@ -411,7 +402,7 @@ TEST(sequential_reader_stream_source_reads_only_forward) {
     VirtualFile v(file.bytes, 64);
     SequentialFileReader sut(v.path, 64);
     sut.at(500, 10);
-    CHECK(throws_runtime([&] { sut.at(100, 10); }, "Backward read of stream /virtual/old.bin"));
+    CHECK_EQ(refusal_of([&] { sut.at(100, 10); }), std::string("Backward read of stream /virtual/old.bin"));
 }
 
 TEST(sequential_reader_stream_source_throws_when_it_ends_early) {
@@ -420,13 +411,14 @@ TEST(sequential_reader_stream_source_throws_when_it_ends_early) {
     virtual_file_sizes()[v.path] = 200;  // the patch expects more than the decoder has
     SequentialFileReader sut(v.path, 64);
     CHECK(file.same(sut.at(0, 100), 0, 100));
-    CHECK(throws_runtime([&] { sut.at(100, 50); }, "Unexpected end of /virtual/old.bin"));
+    CHECK_EQ(refusal_of([&] { sut.at(100, 50); }), std::string("Unexpected end of /virtual/old.bin"));
 }
 
 TEST(sequential_reader_stream_source_needs_a_registered_size) {
     ByteFile file(100);
     VirtualFile v(file.bytes, 64, false);
-    CHECK(throws_runtime([&] { SequentialFileReader sut(v.path); }, "No size registered for stream /virtual/old.bin"));
+    CHECK_EQ(refusal_of([&] { SequentialFileReader sut(v.path); }),
+             std::string("No size registered for stream /virtual/old.bin"));
 }
 
 TEST(sequential_reader_appends_a_stream_source_range_through_its_window) {
@@ -458,7 +450,7 @@ TEST(sequential_reader_skip_to_drops_a_stream_source_s_bytes_unread) {
     CHECK(VirtualFile::source->read_bytes - consumed <= 64);  // nothing between 64 and 700 was read
     sut.skip_to(600);  // behind the stream: nothing to drop
     CHECK_EQ(VirtualFile::source->skipped, 700 - consumed);
-    CHECK(throws_runtime([&] { sut.skip_to(1001); }, "Read past end of /virtual/old.bin"));
+    CHECK_EQ(refusal_of([&] { sut.skip_to(1001); }), std::string("Read past end of /virtual/old.bin"));
 }
 
 TEST(sequential_reader_skip_to_reads_past_bytes_a_source_cannot_drop) {
