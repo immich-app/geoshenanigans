@@ -2410,11 +2410,7 @@ private:
     static constexpr uint32_t END = 0xFFFFFFFFu;
 
     [[noreturn, gnu::cold, gnu::noinline]] static void malformed() { throw std::runtime_error("Malformed offset fixups"); }
-    // next_run and next_value stay out of line, as the replay calls them (once
-    // per run or value): copies inlined into finish() grow geocoder-patch's one
-    // translation unit enough to change how GCC inlines its codecs, and bc
-    // planet/full ran up to 1.1% slower.
-    [[gnu::noinline]] void next_run() {
+    void next_run() {
         if (runs_left_ == 0) { run_start_ = run_end_ = END; return; }
         runs_left_--;
         SectionReader in(runs_, runs_size_, runs_pos_, "offset fixups", PastEnd::MALFORMED);
@@ -2425,7 +2421,7 @@ private:
         run_end_ = static_cast<uint32_t>(start + length);
         shift_ += unzigzag32(in.varint());
     }
-    [[gnu::noinline]] void next_value() {
+    void next_value() {
         if (values_left_ == 0) { value_idx_ = END; return; }
         values_left_--;
         SectionReader in(values_, values_size_, values_pos_, "offset fixups", PastEnd::MALFORMED);
