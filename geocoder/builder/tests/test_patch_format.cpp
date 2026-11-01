@@ -346,9 +346,10 @@ TEST(patch_format_section_marker_values) {
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v11 = remap pairs ascending by old id, each file's
-    // street pairs in one section. The patcher accepts this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(11));
+    // diff/patch tools. v12 = at most STRING_PAIRS_MAX moved-string pairs,
+    // more as the merge sections' string fixups. The patcher accepts this
+    // version only.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(12));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
@@ -835,6 +836,122 @@ TEST(patch_format_offset_fixups_reject_truncated_runs) {
         for (uint32_t i = 0; i < 3; i++) reader.apply(i, 0);
     };
     CHECK_EQ(refusal_of(walk), std::string("Malformed fixups"));
+}
+
+// --- string fixups ---
+
+// Each slot's value as a replay that visits `slots` (ascending) takes it:
+// the fixup's where one is given, else none; then the end is checked.
+static std::vector<std::optional<uint32_t>> take_string_fixups(const std::vector<char>& bytes, uint32_t n,
+                                                               const std::vector<uint64_t>& slots) {
+    StringFixupReader reader(bytes.data(), bytes.size(), n);
+    std::vector<std::optional<uint32_t>> out;
+    for (const uint64_t slot : slots) out.push_back(reader.fixes(slot) ? std::optional<uint32_t>(reader.take()) : std::nullopt);
+    reader.finish();
+    return out;
+}
+
+TEST(patch_format_string_fixups_round_trip) {
+    // The first slot, its neighbours, a far one and slots past 32 bits;
+    // values that rise, fall, wrap and are NO_DATA.
+    const std::map<uint64_t, uint32_t> fixed = {{0, 7}, {1, 3}, {2, 0xFFFFFFF0u}, {9, 5}, {100000, 5},
+                                                {0xFFFFFFFEull, 0}, {0x100000004ull, NO_OFFSET}};
+    StringFixups f;
+    for (const auto& [slot, value] : fixed) f.add(slot, value);
+    CHECK_EQ(f.count(), uint32_t(fixed.size()));
+    std::vector<uint64_t> slots;
+    std::vector<std::optional<uint32_t>> expect;
+    for (uint64_t slot = 0; slot <= 0x100000005ull; slot = slot < 100001 || slot >= 0xFFFFFFFDull ? slot + 1 : 0xFFFFFFFDull) {
+        slots.push_back(slot);
+        const auto it = fixed.find(slot);
+        expect.push_back(it == fixed.end() ? std::nullopt : std::optional<uint32_t>(it->second));
+    }
+    CHECK(take_string_fixups(f.bytes(), f.count(), slots) == expect);
+
+    // 20,000 at random, every slot visited.
+    std::mt19937 rng(20261031);
+    StringFixups random;
+    std::map<uint64_t, uint32_t> random_fixed;
+    for (uint64_t slot = rng() % 3; random_fixed.size() < 20000; slot += 1 + (rng() % 8 == 0 ? rng() % 1000 : rng() % 3)) {
+        random_fixed[slot] = static_cast<uint32_t>(rng());
+        random.add(slot, random_fixed[slot]);
+    }
+    slots.clear();
+    expect.clear();
+    for (uint64_t slot = 0; slot <= random_fixed.rbegin()->first + 2; slot++) {
+        slots.push_back(slot);
+        const auto it = random_fixed.find(slot);
+        expect.push_back(it == random_fixed.end() ? std::nullopt : std::optional<uint32_t>(it->second));
+    }
+    CHECK(take_string_fixups(random.bytes(), random.count(), slots) == expect);
+}
+
+TEST(patch_format_string_fixups_refuse_a_slot_passed_a_fixup_left_over_and_bytes_past_the_last) {
+    // Records of three string fields: fixups for record 1's first (slot 3)
+    // and record 2's last (slot 8).
+    StringFixups f;
+    f.add(3, 30);
+    f.add(8, 80);
+    const std::vector<uint64_t> every = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+    auto replay = [](const std::vector<char>& bytes, uint32_t n, const std::vector<uint64_t>& slots) {
+        return refusal_of([&] { take_string_fixups(bytes, n, slots); });
+    };
+    CHECK_EQ(replay(f.bytes(), 2, every), std::string());
+    // A replay that deletes record 1 passes slot 3 without matching it.
+    CHECK_EQ(replay(f.bytes(), 2, {0, 1, 2, 6, 7, 8}), std::string("Malformed string fixups"));
+    // One that ends after record 1 leaves slot 8's.
+    CHECK_EQ(replay(f.bytes(), 2, {0, 1, 2, 3, 4, 5}), std::string("Malformed string fixups"));
+    // A byte past the last, a last cut short, and a count past the bytes.
+    std::vector<char> longer = f.bytes(), shorter = f.bytes();
+    longer.push_back(0);
+    shorter.pop_back();
+    CHECK_EQ(replay(longer, 2, every), std::string("Malformed string fixups"));
+    CHECK_EQ(replay(shorter, 2, every), std::string("Malformed string fixups"));
+    CHECK_EQ(replay(f.bytes(), 3, every), std::string("Malformed string fixups"));
+    // The diff writes them in slot order only, each slot once.
+    CHECK_EQ(refusal_of<std::logic_error>([&] { f.add(8, 1); }), std::string("String fixups out of slot order"));
+}
+
+// The section's header gives the fixups' count and byte size as u32s, which a
+// merge of big enough files would pass. Under lower limits, a fixup past
+// either is refused before a byte of it is written, and the fixups before it
+// read back as they were; one that fits the room left still goes in. So is
+// one that skips more slots than a u32 varint holds, after one that skips
+// the most.
+TEST(patch_format_string_fixups_refuse_one_past_the_sections_limits) {
+    using Taken = std::vector<std::optional<uint32_t>>;
+    // At most 2 fixups.
+    StringFixups counted("test.bin", {2, UINT32_MAX});
+    counted.add(0, 1);
+    counted.add(1, 2);
+    CHECK_EQ(refusal_of([&] { counted.add(2, 3); }), std::string("String fixups of test.bin: more than the section's 2 fixups"));
+    CHECK_EQ(counted.count(), 2u);
+    CHECK_EQ(counted.size(), 4u);
+    CHECK(take_string_fixups(counted.bytes(), counted.count(), {0, 1, 2}) == Taken({1u, 2u, std::nullopt}));
+
+    // At most 6 bytes: fixups of a byte for the slots skipped and one for the
+    // value's change, but 64 up zigzags to 128, two bytes.
+    StringFixups sized("test.bin", {UINT32_MAX, 6});
+    sized.add(0, 1);
+    sized.add(1, 2);
+    const std::string past_6_bytes = "String fixups of test.bin: more than the section's 6 bytes";
+    CHECK_EQ(refusal_of([&] { sized.add(2, 66); }), past_6_bytes);
+    CHECK_EQ(sized.size(), 4u);
+    sized.add(2, 3);
+    CHECK_EQ(refusal_of([&] { sized.add(3, 4); }), past_6_bytes);
+    CHECK_EQ(sized.count(), 3u);
+    CHECK_EQ(sized.size(), 6u);
+    CHECK_EQ(sized.bytes().size(), size_t{6});
+    CHECK(take_string_fixups(sized.bytes(), sized.count(), {0, 1, 2, 3}) == Taken({1u, 2u, 3u, std::nullopt}));
+
+    // A skip of UINT32_MAX slots, then one more than that.
+    StringFixups skipping;
+    const uint64_t far = 1 + uint64_t{UINT32_MAX}, too_far = far + 1 + uint64_t{UINT32_MAX} + 1;
+    skipping.add(0, 1);
+    skipping.add(far, 2);
+    CHECK_EQ(refusal_of([&] { skipping.add(too_far, 3); }),
+             std::string("String fixups of a merge: more than 4294967295 slots skipped between two"));
+    CHECK(take_string_fixups(skipping.bytes(), skipping.count(), {0, far, too_far}) == Taken({1u, 2u, std::nullopt}));
 }
 
 // --- ascending ids, sections by entries file ---
@@ -2246,6 +2363,58 @@ TEST(patch_format_strings_section_refuses_moved_strings_out_of_order_or_twice) {
         pos = 0;
         CHECK_EQ(refusal_of([&] { parse_strings_section(bad->data(), bad->size(), pos); }), std::string("Malformed strings section"));
     }
+}
+
+TEST(patch_format_strings_section_sends_no_pair_past_its_cap) {
+    // One shipped tier "a b c" → "c b a" (indexed): its edit keeps "c", and
+    // "a" and "b" leave it as two pairs. Under a cap of 2 they are sent; under
+    // a cap of 1 neither is, and both come back unsent, ascending: the
+    // patcher's remap then keeps their old offsets, which the merges' string
+    // fixups give new values.
+    const std::string o = pool_in_order({"a", "b", "c"}), n = pool_in_order({"c", "b", "a"});
+    std::array<StringTierPools, STRING_TIER_COUNT> tiers{};
+    tiers[0] = {o.data(), o.size(), n.data(), n.size()};
+    const std::vector<std::pair<uint32_t, uint32_t>> moved = {{0, 4}, {2, 2}, {4, 0}};
+    std::vector<char> sent, unsent;
+    const StringsSectionStats at_cap = append_strings_section(sent, tiers, 1, 0, moved, 2);
+    const StringsSectionStats past_cap = append_strings_section(unsent, tiers, 1, 0, moved, 1);
+    CHECK_EQ(at_cap.n_pairs, 2u);
+    CHECK(at_cap.unsent_pairs.empty());
+    CHECK_EQ(past_cap.n_pairs, 0u);
+    const std::vector<std::pair<uint32_t, uint32_t>> a_and_b = {{0, 4}, {2, 2}};
+    CHECK(past_cap.unsent_pairs == a_and_b);
+    CHECK_EQ(unsent.size(), sent.size() - 2 * sizeof(RemapPair));
+    for (const auto& [buf, a, b] : {std::tuple{&sent, 4u, 2u}, std::tuple{&unsent, 0u, 2u}}) {
+        size_t pos = 0;
+        const StringsSection s = parse_strings_section(buf->data(), buf->size(), pos);
+        StringRemap remap(scratch_tables());
+        load_string_remap(s, remap, [&](int t) { CHECK(rebuild(o, s.edits[t], s.place(t), remap).pool == n); });
+        CHECK_EQ(remap.lookup(0), a);
+        CHECK_EQ(remap.lookup(2), b);
+        CHECK_EQ(remap.lookup(4), 0u);
+    }
+}
+
+TEST(patch_format_strings_section_refuses_more_pairs_than_its_cap) {
+    // A section of no tier and STRING_PAIRS_MAX pairs parses; one more is
+    // refused before the pairs are read.
+    std::vector<char> buf;
+    std::array<StringTierPools, STRING_TIER_COUNT> none{};
+    append_strings_section(buf, none, 0, 0, std::vector<std::pair<uint32_t, uint32_t>>());
+    buf.resize(buf.size() - 4);
+    auto with_pairs = [&](uint32_t n) {
+        std::vector<char> b = buf;
+        b.insert(b.end(), reinterpret_cast<const char*>(&n), reinterpret_cast<const char*>(&n) + 4);
+        for (uint32_t i = 0; i < n; i++)
+            for (const uint32_t w : {2 * i, 2 * i + 1}) b.insert(b.end(), reinterpret_cast<const char*>(&w), reinterpret_cast<const char*>(&w) + 4);
+        return b;
+    };
+    auto parses = [](const std::vector<char>& b) {
+        size_t pos = 0;
+        return refusal_of([&] { parse_strings_section(b.data(), b.size(), pos); });
+    };
+    CHECK_EQ(parses(with_pairs(STRING_PAIRS_MAX)), std::string());
+    CHECK_EQ(parses(with_pairs(STRING_PAIRS_MAX + 1)), std::string("Malformed strings section"));
 }
 
 TEST(patch_format_strings_section_rejects_bad_masks) {

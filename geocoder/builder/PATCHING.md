@@ -176,15 +176,16 @@ Planet b → c (2026-10-28), planet/full, one core, cold, no swap, disk at
 
 At 1 GiB plain mode takes 1825 s for the planet maximum set (full, poi/all, quality/uncapped),
 and low-memory mode 910 s. A patch that moves many POI strings, like the first one after POI
-names went into record order, needs about 33 B per moved string in either mode: about 418 MiB
-for planet/poi/all's 12.8M.
+names went into record order (12.8M on planet/poi/all), costs no memory per moved string: the
+strings section holds at most 65,536 moved-string pairs (`STRING_PAIRS_MAX`), and past that the
+moved values come as string fixups the replay reads in record order (see How Patching Works).
 
 ### How Patching Works
 
 **Diff tool:**
 1. Build string-level diff (per tier, keep the longest run of common strings in the same order, every one of them in a sorted tier; emit the other old strings as deleted and the other new ones as added, with their new index unless the new tier is sorted)
-2. Build string remap (old string pool offsets → new, derived from string diff)
-3. For each data file: apply string remap to old, match records by content hash (for ways/admin: also fix node_offset/vertex_offset fields), build merge sequence (MATCH/INSERT/DELETE at record stride)
+2. Build string remap (old string pool offsets → new, derived from string diff); the surviving strings no tier's edit keeps go as pairs, at most 65,536 of them (v12: with more, none does, and step 3 sends their values)
+3. For each data file: apply string remap to old, match records by content hash (for ways/admin: also fix node_offset/vertex_offset fields), build merge sequence (MATCH/INSERT/DELETE at record stride); past the pairs' cap, the MATCH records' fields that hold a moved string go as string fixups, and the side files' values that hold one as changes
 4. For coordinate files (nodes/vertices): derive merge from parent way/polygon merge — verify node blocks match before COPY, INSERT if nodes changed
 5. Derive ID remaps from merge sequences (MATCH ops define old→new record correspondence)
 6. **Secondary matching**: For DELETE/INSERT records in merge sequences, match by relaxed key (name + node_count for ways, street + housenumber for addrs, etc.) to recover ID mappings for modified-but-same-entity records
@@ -193,8 +194,8 @@ for planet/poi/all's 12.8M.
 
 **Patch tool:**
 1. Decompress zstd
-2. Read the strings section → rebuild each shipped tier from the dir's own old tier + additions/deletions in one walk, which also derives its remap runs and hashes the old tier as it reads it and the new one as it writes it (a stale old tier is named as such even when the edit doesn't fit it); take the sent runs of unshipped tiers and the moved-string pairs as they come
-3. For each data file: apply string remap + offset fixups to old, replay merge sequence → output file, track ID mapping from MATCH ops
+2. Read the strings section → rebuild each shipped tier from the dir's own old tier + additions/deletions in one walk, which also derives its remap runs and hashes the old tier as it reads it and the new one as it writes it (a stale old tier is named as such even when the edit doesn't fit it); take the sent runs of unshipped tiers and the moved-string pairs as they come (v12: past 65,536 moved strings the patch sends no pair, and the merge sections carry the moved strings' new values for the fields that hold them, read in record order)
+3. For each data file: apply string remap (or a string fixup) + offset fixups to old, replay merge sequence → output file, track ID mapping from MATCH ops
 4. Read secondary ID remaps → each replayed file's moved pairs, read where they sit, beside its derived ID mappings
 5. Read cell changes (added/removed cell IDs) and the per-cell entry deltas
 6. Rebuild geo_cells and the street / addr / interp entry files in one pass over the old geo index: each cell's lists with their IDs remapped, corrected by the cell's delta
@@ -315,7 +316,7 @@ v8 data patch that day; applying the delta also needs memory for the whole
 old file (1.0 GB for poi.fst). Rebuilding costs no download and two to three
 and a half minutes of one core.
 
-## Patch Format (.gcpatch, version 11)
+## Patch Format (.gcpatch, version 12)
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
 pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
@@ -325,8 +326,8 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=11 (u32) + flags=0 (u32)
-  (a v11 patcher accepts only v11 patches; the v8 to v11 changes are marked
+Header: "GCPATCH\0" (8) + version=12 (u32) + flags=0 (u32)
+  (a v12 patcher accepts only v12 patches; the v8 to v12 changes are marked
   below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
@@ -363,7 +364,12 @@ Strings: marker 0xFFFFFFF6 (u32)
   strings no tier's edit keeps: they changed tier, or (v9) the POI tier's
   order moved them; out of a shipped or referenced tier; ascending by
   old_off, each string once. The patcher reads them where they sit and
-  refuses one out of order)
+  refuses one out of order) (v12) At most 65,536 (STRING_PAIRS_MAX), which
+  the patcher looks up at random; it refuses more. A patch that moves more
+  strings sends n_pairs 0, and the patcher's remap leaves their old offsets
+  as they were: the merge sections' string fixups give the MATCH records'
+  fields that hold them their new values, and the sparse and parallel deltas
+  send the side-file values that hold them as changes.
 
 Parent-id remap: marker 0xFFFFFFF3 (u32)
   + n_admin (u32) + [(old:u32, new:u32)] × n_admin
@@ -385,7 +391,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     way_postcodes, addr_postcodes, interp_postcodes), rebuilt along its
     parent's merge: parent_file_id u32, value_stride u32 = 4, remap_kind u32,
     n_inserted u32 + [value u32], n_changes u32 + [(pos u32, value u32)].
-    MATCH / REPLACE copy the old value (remapped), INSERT takes the next
+    MATCH / REPLACE copy the old value (remapped as the patcher remaps:
+    without the moved strings past the pairs' cap, v12), INSERT takes the next
     inserted value, DELETE skips one; then the changes overwrite positions
     of the new file. A parent sent unchanged counts as one MATCH.
   stride=0xFB: cell list delta for <name>_cells.bin + <name>_entries.bin
@@ -395,6 +402,7 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     most ids)
   otherwise (a record stride, at most 0xFF, MAX_RECORD_STRIDE): n_runs (u32)
     + n_values (u32) + runs_size (u32) + values_size (u32) + runs + values
+    + n_string_fixups (u32, v12) + string_fixups_size (u32) + string fixups
     + seq_size (u64) + merge ops
   Ops: MATCH(count:u32) | INSERT(count:u32, data) | DELETE(count:u32)
     | REPLACE(count:u32, data) (v8: the same entities with new bytes, written
@@ -416,6 +424,20 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   the previous run, run length, zigzag change of the shift); the patcher adds
   the run's shift to every old offset in it except NO_DATA ones. values lists
   the NO_DATA records given an offset as varint (index delta, offset).
+  String fixups (v12, StringFixupReader in tools/patch_format.h): each MATCH
+  record's string field (string_field_offsets) that holds a moved string the
+  strings section sends no pair for gets its new value here, in record
+  order. A field's slot is its record's old index × the file's string fields
+  + its index among them; a fixup is varints of (slots skipped since the
+  previous fixup, zigzag change of the value), from slot 0 and value 0. The
+  patcher takes a slot's fixup instead of remapping the field, and refuses a
+  fixup for a slot the replay passes without matching (a deleted or replaced
+  record's), one left over at the end, and bytes past the last ("Malformed
+  string fixups"). A file without string fields carries 0 and 0; the
+  low-memory mode refuses anything else in a child stream ("Encoded set: a
+  child stream with string fixups"). The diff refuses a merge whose fixups
+  would pass the header's u32s, or skip more slots between two than a varint
+  holds ("String fixups of <file>: more than ...").
 
 Cell Changes: marker 0xFFFFFFFB/FA/F5/F4 (geo/admin/poi/place) + n_added (u32)
   + n_removed (u32) + [cell_id:u64] × n_added + [cell_id:u64] × n_removed

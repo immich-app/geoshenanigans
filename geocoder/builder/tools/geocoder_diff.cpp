@@ -7,7 +7,8 @@
 //
 // Patch format: custom binary, zstd-compressed as a whole for transport.
 //
-// Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META]
+// Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META] [--string-pairs-max N]
+//                      [--string-fixup-bytes-max N]
 //
 // GCPATCH v8: with --identity, street / interp / addr records match across
 // days by the server-side identity sidecars <META>/{street,interp,addr}.slot.u32
@@ -522,10 +523,68 @@ static bool try_emit_copy_old(std::vector<char>& patch, uint32_t fid,
     return true;
 }
 
+// The string remap as the patcher applies it: the diff's per-string map, but
+// for the moved strings the strings section didn't send as pairs (more than
+// its cap), whose old offsets the patcher's remap keeps. The merges' records
+// that hold them carry their new values as string fixups (string_fixups_of),
+// each merge's within fixup_limits, and the side files' values that hold them
+// arrive as changes.
+class PatcherStringRemap {
+public:
+    PatcherStringRemap(const SortedU32Map& full, std::vector<SortedU32Map::Pair> unsent, StringFixupLimits fixup_limits)
+        : full_(full), unsent_(std::move(unsent)), fixup_limits_(fixup_limits) {}
+    uint32_t map(uint32_t v) const { return unsent_.find(v) ? v : full_.map(v); }
+    bool sent_every_pair() const { return unsent_.size() == 0; }
+    StringFixupLimits fixup_limits() const { return fixup_limits_; }
+
+private:
+    const SortedU32Map& full_;
+    SortedU32Map unsent_;
+    StringFixupLimits fixup_limits_;
+};
+
+// A merge's string fixups: the new value of each string field of its MATCH
+// records that the patcher's string remap maps elsewhere, which only a moved
+// string the strings section didn't send as a pair does (a MATCH record is
+// the old one with the diff's remap). Reads the original old file, which the
+// merge remapped in its own copy, and the new one in order, and only when
+// the strings section left pairs out. Refuses fixups past the limits, which
+// the section's header could not give.
+static StringFixups string_fixups_of(const FileMergeResult& r, const std::string& old_dir, const std::string& new_dir,
+                                     const PatcherStringRemap& strings) {
+    StringFixups fixups(r.name, strings.fixup_limits());
+    const std::vector<size_t> fields = string_field_offsets(r.id);
+    if (strings.sent_every_pair() || fields.empty() || r.old_size == 0 || r.new_size == 0) return fixups;
+    MappedFile old_m = mmap_file(old_dir + "/" + r.name), new_m = mmap_file(new_dir + "/" + r.name);
+    if (old_m.size != r.old_size || new_m.size != r.new_size)
+        throw std::runtime_error("String fixups of " + r.name + ": the files are not the ones merged");
+    madvise(const_cast<char*>(old_m.data), old_m.size, MADV_SEQUENTIAL);
+    madvise(const_cast<char*>(new_m.data), new_m.size, MADV_SEQUENTIAL);
+    uint64_t oi = 0, ni = 0;
+    for_each_merge_op(r.seq, r.stride, [&](uint8_t op, uint32_t count, const char*) {
+        if (op == OP_MATCH_RUN) {
+            for (uint64_t k = 0; k < count; k++) {
+                const char* o = old_m.data + (oi + k) * r.stride;
+                const char* n = new_m.data + (ni + k) * r.stride;
+                for (size_t f = 0; f < fields.size(); f++) {
+                    uint32_t ov, nv;
+                    memcpy(&ov, o + fields[f], 4);
+                    memcpy(&nv, n + fields[f], 4);
+                    if (strings.map(ov) != nv) fixups.add((oi + k) * fields.size() + f, nv);
+                }
+            }
+        }
+        if (op != OP_INSERT_RUN) oi += count;
+        if (op != OP_DELETE_RUN) ni += count;
+    });
+    unmap_file(old_m);
+    unmap_file(new_m);
+    return fixups;
+}
+
 // Serialize a pre-computed merge result into the patch buffer
-static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r,
-                            const std::string& old_dir = "",
-                            const std::string& new_dir = "") {
+static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r, const std::string& old_dir,
+                            const std::string& new_dir, const PatcherStringRemap& strings) {
     auto wv = [&](const void* data, size_t size) {
         patch.insert(patch.end(), (const char*)data, (const char*)data + size);
     };
@@ -553,6 +612,13 @@ static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r,
     wv(&f.n_runs, 4); wv(&f.n_values, 4); wv(&runs_size, 4); wv(&values_size, 4);
     patch.insert(patch.end(), f.runs.begin(), f.runs.end());
     patch.insert(patch.end(), f.values.begin(), f.values.end());
+    const StringFixups string_fixups = string_fixups_of(r, old_dir, new_dir, strings);
+    const uint32_t n_string_fixups = string_fixups.count(), string_fixups_size = string_fixups.size();
+    wv(&n_string_fixups, 4); wv(&string_fixups_size, 4);
+    patch.insert(patch.end(), string_fixups.bytes().begin(), string_fixups.bytes().end());
+    if (n_string_fixups > 0)
+        std::cerr << "  " << r.name << ": " << n_string_fixups << " string fixups (" << string_fixups_size << " bytes)"
+                  << std::endl;
     uint64_t ss = r.seq.data.size();
     wv(&ss, 8);
     patch.insert(patch.end(), r.seq.data.begin(), r.seq.data.end());
@@ -657,15 +723,39 @@ static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uin
 }
 
 static int run(int argc, char* argv[]) {
+    const char* usage =
+        "Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META] [--string-pairs-max N]"
+        " [--string-fixup-bytes-max N]";
     if (argc < 5 || std::string(argv[3]) != "-o") {
-        std::cerr << "Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META]" << std::endl;
+        std::cerr << usage << std::endl;
         return 1;
     }
     std::string old_dir = argv[1], new_dir = argv[2], patch_path = argv[4];
     std::string id_old_meta, id_new_meta;
+    // The most moved strings the strings section sends as pairs; more go as
+    // string fixups. Lower for tests.
+    uint32_t string_pairs_max = STRING_PAIRS_MAX;
+    // The most a merge's string fixups may hold. Lower for tests.
+    StringFixupLimits string_fixup_limits;
+    // An option's value of 0 to max, in out; false (said) when it is not one.
+    auto u32_option = [](const std::string& option, const std::string& n, uint32_t max, uint32_t& out) {
+        if (n.empty() || n.size() > 10 || n.find_first_not_of("0123456789") != std::string::npos || std::stoull(n) > max) {
+            std::cerr << option << " takes 0 to " << max << ", not " << n << std::endl;
+            return false;
+        }
+        out = static_cast<uint32_t>(std::stoull(n));
+        return true;
+    };
     for (int a = 5; a < argc; a++) {
-        if (std::string(argv[a]) == "--identity" && a + 2 < argc) { id_old_meta = argv[a + 1]; id_new_meta = argv[a + 2]; a += 2; }
-        else { std::cerr << "Unknown argument " << argv[a] << std::endl; return 1; }
+        const std::string arg = argv[a];
+        if (arg == "--identity" && a + 2 < argc) { id_old_meta = argv[a + 1]; id_new_meta = argv[a + 2]; a += 2; }
+        else if (arg == "--string-pairs-max" && a + 1 < argc) {
+            if (!u32_option(arg, argv[++a], STRING_PAIRS_MAX, string_pairs_max)) return 1;
+        }
+        else if (arg == "--string-fixup-bytes-max" && a + 1 < argc) {
+            if (!u32_option(arg, argv[++a], UINT32_MAX, string_fixup_limits.bytes)) return 1;
+        }
+        else { std::cerr << "Unknown argument " << arg << std::endl << usage << std::endl; return 1; }
     }
     // A family's keys from one day's sidecar (see identity_keys). A sidecar
     // that is not one key per record is rejected with a warning: the family
@@ -790,6 +880,7 @@ static int run(int argc, char* argv[]) {
     // own old files reference send their shift runs; scanning is skipped when
     // every non-empty tier is shipped (the full variants).
     SEC("strings");
+    std::vector<std::pair<uint32_t, uint32_t>> unsent_string_pairs;
     {
         std::array<StringTierPools, STRING_TIER_COUNT> tiers;
         uint32_t tier_ends[STRING_TIER_COUNT];
@@ -799,7 +890,7 @@ static int run(int argc, char* argv[]) {
         }
         const uint32_t referenced =
             unshipped_string_tiers(tiers, shipped) == 0 ? 0 : referenced_string_tiers_of(old_dir, tier_ends);
-        const StringsSectionStats stats = append_strings_section(patch, tiers, shipped, referenced, str_remap);
+        StringsSectionStats stats = append_strings_section(patch, tiers, shipped, referenced, str_remap, string_pairs_max);
         for (int t = 0; t < STRING_TIER_COUNT; t++) {
             if (stats.sent >> t & 1)
                 std::cerr << "  " << STRING_TIER_FILES[t] << ": " << stats.n_runs[t] << " shift runs ("
@@ -810,8 +901,14 @@ static int run(int argc, char* argv[]) {
         }
         std::cerr << "  String remap: shipped tiers 0x" << std::hex << shipped << ", newly shipped 0x"
                   << tier_files.newly_shipped << ", referenced 0x" << referenced << std::dec << ", "
-                  << stats.n_pairs << " moved-string pairs" << std::endl;
+                  << stats.n_pairs << " moved-string pairs";
+        if (!stats.unsent_pairs.empty())
+            std::cerr << ", " << stats.unsent_pairs.size() << " moved strings past the " << string_pairs_max
+                      << "-pair cap sent as string fixups";
+        std::cerr << std::endl;
+        unsent_string_pairs.swap(stats.unsent_pairs);
     }
+    const PatcherStringRemap patcher_strings(str_remap, std::move(unsent_string_pairs), string_fixup_limits);
     for (int t = 0; t < 5; t++) {
         unmap_file(old_tier_maps[t]);
         unmap_file(new_tier_maps[t]);
@@ -1574,28 +1671,28 @@ static int run(int argc, char* argv[]) {
     // v8: street ways go before addresses, whose parent_way_id the patcher
     // remaps through the street replay's remap. The parent seqs stay alive
     // for the side files (PARALLEL_DELTA_STRIDE).
-    serialize_merge(patch, res_ways, old_dir, new_dir);
-    serialize_merge(patch, res_nodes, old_dir, new_dir);
+    serialize_merge(patch, res_ways, old_dir, new_dir, patcher_strings);
+    serialize_merge(patch, res_nodes, old_dir, new_dir, patcher_strings);
     { std::vector<char>().swap(res_nodes.seq.data); }
-    serialize_merge(patch, res_interp_w, old_dir, new_dir);
-    serialize_merge(patch, res_interp_n, old_dir, new_dir);
+    serialize_merge(patch, res_interp_w, old_dir, new_dir, patcher_strings);
+    serialize_merge(patch, res_interp_n, old_dir, new_dir, patcher_strings);
     { std::vector<char>().swap(res_interp_n.seq.data); }
-    serialize_merge(patch, res_addr, old_dir, new_dir);
+    serialize_merge(patch, res_addr, old_dir, new_dir, patcher_strings);
     // res_addr_v is built in t_addr only when the dir has address points;
     // without them it keeps stride=0 and old/new sizes 0, which we treat as
     // "not built" → fall through to the emit_raw(ADDR_VERTICES) call later
     // in the section pipeline. stride=1 marks a byte-merge ready to ship.
     if (res_addr_v.stride == 1) {
-        serialize_merge(patch, res_addr_v, old_dir, new_dir);
+        serialize_merge(patch, res_addr_v, old_dir, new_dir, patcher_strings);
         { std::vector<char>().swap(res_addr_v.seq.data); }
     }
-    serialize_merge(patch, res_admin_p, old_dir, new_dir);
-    serialize_merge(patch, res_admin_v, old_dir, new_dir);
+    serialize_merge(patch, res_admin_p, old_dir, new_dir, patcher_strings);
+    serialize_merge(patch, res_admin_v, old_dir, new_dir, patcher_strings);
     { std::vector<char>().swap(res_admin_v.seq.data); }
-    serialize_merge(patch, res_poi_r, old_dir, new_dir);
-    serialize_merge(patch, res_poi_v, old_dir, new_dir);
+    serialize_merge(patch, res_poi_r, old_dir, new_dir, patcher_strings);
+    serialize_merge(patch, res_poi_v, old_dir, new_dir, patcher_strings);
     { std::vector<char>().swap(res_poi_v.seq.data); }
-    serialize_merge(patch, res_place_n, old_dir, new_dir);
+    serialize_merge(patch, res_place_n, old_dir, new_dir, patcher_strings);
     malloc_trim(0); // return freed heap to OS
     log_rss("serialize");
     double t0 = now_ms();
@@ -1843,8 +1940,10 @@ static int run(int argc, char* argv[]) {
     // remap_kind:
     //   0 = none                  (raw byte compare)
     //   1 = admin polygon idx     (res_admin_p.id_remap, NO_DATA passthrough)
-    //   2 = string pool offset    (str_remap)
-    //   3 = postcode_centroid     (16B struct, str_remap on bytes 8-11 only)
+    //   2 = string pool offset    (patcher_strings)
+    //   3 = postcode_centroid     (16B struct, patcher_strings on bytes 8-11 only)
+    // String offsets are remapped as the patcher will remap them, so a moved
+    // string the strings section sends no pair for arrives as a change.
     auto emit_sparse_delta = [&](PatchFileId fid, const char* fname,
                                   uint32_t value_stride, uint32_t remap_kind) {
         SEC("sparse:" << fname);
@@ -1939,8 +2038,8 @@ static int run(int argc, char* argv[]) {
         // The changed positions are found on every core (planet addr_postcodes:
         // 179M string remap lookups), then emitted in order.
         if (remap_kind == 3) {
-            // 16-byte postcode_centroid: str_remap on bytes 8-11 (postcode_id),
-            // raw compare on bytes 0-7 (lat/lng) and 12-15 (cc + pad).
+            // 16-byte postcode_centroid: the string remap on bytes 8-11
+            // (postcode_id), raw compare on bytes 0-7 (lat/lng) and 12-15 (cc + pad).
             auto changed = [&](size_t pos) {
                 const char* np = new_m.data + pos * 16;
                 if (pos >= old_n) return true;
@@ -1950,7 +2049,7 @@ static int run(int argc, char* argv[]) {
                     uint32_t old_pid; memcpy(&old_pid, op + 8, 4);
                     uint32_t new_pid; memcpy(&new_pid, np + 8, 4);
                     if (old_pid != NO_DATA) {
-                        old_pid = str_remap.map(old_pid);
+                        old_pid = patcher_strings.map(old_pid);
                     }
                     d = (old_pid != new_pid);
                 }
@@ -1969,7 +2068,7 @@ static int run(int argc, char* argv[]) {
                         uint32_t r = res_admin_p.id_remap[old_val];
                         if (r != NO_DATA) remapped = r;
                     } else if (remap_kind == 2) {
-                        remapped = str_remap.map(old_val);
+                        remapped = patcher_strings.map(old_val);
                     }
                 }
                 return remapped != new_val;
@@ -2053,7 +2152,7 @@ static int run(int argc, char* argv[]) {
                 if (v < res_admin_p.id_remap.size() && res_admin_p.id_remap[v] != NO_DATA) return res_admin_p.id_remap[v];
                 return v;
             }
-            if (f.remap_kind == 2) return str_remap.map(v);
+            if (f.remap_kind == 2) return patcher_strings.map(v);
             return v;
         };
         std::vector<uint32_t> ins;
@@ -2176,8 +2275,8 @@ static int run(int argc, char* argv[]) {
             FileMergeResult rv = {PatchFileId::POSTAL_VERTICES, "postal_vertices.bin", 1,
                                   old_v.size, new_v.size, std::move(vseq), {}, {}, {}};
             log_merge(rp); log_merge(rv);
-            serialize_merge(patch, rp, old_dir, new_dir);
-            serialize_merge(patch, rv, old_dir, new_dir);
+            serialize_merge(patch, rp, old_dir, new_dir, patcher_strings);
+            serialize_merge(patch, rv, old_dir, new_dir, patcher_strings);
         }
         unmap_file(old_p); unmap_file(new_p); unmap_file(old_v); unmap_file(new_v);
         if (!mergeable) {

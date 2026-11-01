@@ -8,10 +8,11 @@
 //
 // Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--threads]
 //
-// Reads GCPATCH v10 ( REPLACE runs, street remap derived from the
+// Reads GCPATCH v12 (REPLACE runs, street remap derived from the
 // street_ways replay, PARALLEL_DELTA_STRIDE side files, unmapped ids dropped
 // from street / addr / interp cell lists, a cell index delta for every admin /
-// POI / place index).
+// POI / place index, remap pairs ascending, and the MATCH records' string
+// fixups).
 //
 // Low-memory mode: when <current-dir> is an encoded installed set (it has a
 // gc.manifest, see gcs_patch.h), the encoded families' old files are decoded
@@ -167,6 +168,8 @@ struct JointChild {
             const uint32_t n_runs = in.u32(), n_values = in.u32(), runs_size = in.u32(), values_size = in.u32();
             if (n_runs || n_values) throw std::runtime_error("Encoded set: a child stream with offset fixups");
             in.take(uint64_t{runs_size} + values_size);
+            const uint32_t n_string_fixups = in.u32(), string_fixups_size = in.u32();
+            if (n_string_fixups || string_fixups_size) throw std::runtime_error("Encoded set: a child stream with string fixups");
             const uint64_t ss = in.u64();
             seq = q = at;
             in.take(ss);
@@ -900,9 +903,14 @@ static int run(int argc, char* argv[]) {
             (file_id == (uint32_t)PatchFileId::POI_RECORDS) ? POI_RECORD_VERTEX_OFFSET_OFF :
             (file_id == (uint32_t)PatchFileId::ADDR_POINTS)  ? ADDR_POINT_VERTEX_OFFSET_OFF : (size_t)0;
         if (has_fixups && fixup_off + 4 > actual_stride) throw std::runtime_error("Malformed fixups");
+        // String fixups: the new values of the MATCH records' string fields
+        // that hold a string the strings section moved without a pair, read
+        // in record order (a slot per string field).
+        const uint32_t n_string_fixups = patch.u32(), string_fixups_size = patch.u32();
+        StringFixupReader string_fixups(patch.take(string_fixups_size, "string fixups"), string_fixups_size, n_string_fixups);
 
         std::vector<size_t> remap_offs;
-        if (!str_remap.empty()) remap_offs = string_fields;
+        if (!str_remap.empty() || n_string_fixups > 0) remap_offs = string_fields;
         // A run hint per field: a field whose offsets ascend in record order
         // (POI names, the POI tier's order) mostly skips the run search.
         std::vector<size_t> remap_hints(remap_offs.size(), 0);
@@ -1025,11 +1033,12 @@ static int run(int argc, char* argv[]) {
                         // Apply padding zeroing
                         if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24)
                             memset(rec_buf.data() + 14, 0, 2); // preserve place_type_override at byte 13
-                        // Apply string remap
+                        // Apply string remap, or the field's string fixup
+                        const uint64_t slot = uint64_t(old_rec + k) * remap_offs.size();
                         for (size_t f = 0; f < remap_offs.size(); f++) {
                             const size_t off = remap_offs[f];
                             uint32_t v; memcpy(&v, rec_buf.data() + off, 4);
-                            uint32_t nv = str_remap.lookup(v, remap_hints[f]);
+                            uint32_t nv = string_fixups.fixes(slot + f) ? string_fixups.take() : str_remap.lookup(v, remap_hints[f]);
                             if (nv != v) memcpy(rec_buf.data() + off, &nv, 4);
                         }
                         // Apply POI parent_poly_id remap (byte 32, admin
@@ -1124,6 +1133,7 @@ static int run(int argc, char* argv[]) {
                 throw std::runtime_error(std::string("Malformed merge sequence: ") + fname);
             }
         }
+        string_fixups.finish();
         close_patch_outputs({{outf, fname}});
         log_rewinds(old);
         if (jc) close_joint_child(jc, fname);
@@ -1132,12 +1142,14 @@ static int run(int argc, char* argv[]) {
         // The moved ways' pairs (parent-id remap, street leg) complete the
         // street remap the address replay reads.
         if (track && file_id == (uint32_t)PatchFileId::STREET_WAYS) remap.set_pairs(poi_street_remap);
+        const std::string fixed_strings =
+            n_string_fixups > 0 ? ", " + std::to_string(n_string_fixups) + " string fixups" : std::string();
         if (track) {
             std::cerr << "  " << fname << ": " << written << " bytes (remap of " << n_old_records << " records, "
-                      << remap.run_count() << " runs)" << section_io() << std::endl;
+                      << remap.run_count() << " runs" << fixed_strings << ")" << section_io() << std::endl;
             record_remaps[file_id] = std::move(remap);
         } else {
-            std::cerr << "  " << fname << ": " << written << " bytes" << section_io() << std::endl;
+            std::cerr << "  " << fname << ": " << written << " bytes" << fixed_strings << section_io() << std::endl;
         }
         // Release patch pages used by this section
         madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
