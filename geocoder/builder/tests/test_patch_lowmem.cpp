@@ -56,18 +56,20 @@ constexpr uint64_t ADDR_ENCODER_HOLD = ENCODER_PIECE + 10 + 4 * uint64_t(ABS2_MA
 // tenfold in the one structure it varies, which the patcher reads in place.
 constexpr uint64_t HEAP_GROWTH_SLACK = 256 << 10;
 // How many times a heap test applies its case with --threads at each size:
-// THREADS_HEAP_RUNS, and up to THREADS_HEAP_MAX_RUNS while no codec state
-// (codec_state) came up at both sizes and the check fails. A family's
-// encoder thread starts on the patcher's first write and drains its rings as
-// the scheduler runs it; when it runs later than the patcher writes a few
-// pieces, each ring and the buffer the thread swaps with it grow to 128 KiB,
-// and its own queue after them, so one run of a case can peak up to 1 MB
-// above another, quiet or loaded, at any size (the streets family: 1.08 to
-// 2.10 MB from 10,000 to 2,000,000 moved ways). The codec report lines show
-// which state a run ended in; runs in one state still differ, by up to
-// 470 KB in the streets family.
+// THREADS_HEAP_RUNS, and up to THREADS_HEAP_MAX_RUNS while the check fails
+// and no codec state (codec_state) came up at both sizes, or none that did
+// has THREADS_STATE_RUNS runs at each. A family's encoder thread starts on
+// the patcher's first write and drains its rings as the scheduler runs it;
+// when it runs later than the patcher writes a few pieces, each ring and the
+// buffer the thread swaps with it grow to 128 KiB, and its own queue after
+// them, so one run of a case can peak up to 1 MB above another, quiet or
+// loaded, at any size (the streets family: 1.08 to 2.10 MB from 10,000 to
+// 2,000,000 moved ways). The codec report lines show which state a run ended
+// in; runs in one state still differ, by up to 470 KB in the streets family,
+// past the slack, so one run at each size in a state can fail it alone.
 constexpr int THREADS_HEAP_RUNS = 7;
 constexpr int THREADS_HEAP_MAX_RUNS = 35;
+constexpr size_t THREADS_STATE_RUNS = 2;
 
 template <typename T>
 void append(std::vector<char>& out, const T& v) {
@@ -558,17 +560,20 @@ struct ThreadsRun {
 };
 
 // heap_flat's check of the --threads runs at n and at 10 n so far: its
-// failures (none: the heap peak stayed flat), and whether more runs would
-// leave them as they are (settled). The runs are compared within each codec
+// failures (none: the heap peak stayed flat), and whether they stand
+// (settled) or both sizes run again. The runs are compared within each codec
 // state that came up at both sizes, so that the state the scheduler left a
 // run in stays out of the comparison: the peak grew if in every such state
 // the least at 10 n is past the slack above the greatest at n, as growth
-// lifts every run at 10 n, whatever its state. That is settled. Only when no
-// state came up at both sizes are all the runs at 10 n held to the slack
-// above all those at n; a failure there can be the scheduler's alone (no run
-// at n filled its rings, every run at 10 n did), so it is not settled: both
-// sizes run again until a state comes up at both or the runs as a whole
-// pass.
+// lifts every run at 10 n, whatever its state. That is settled once one of
+// those states has THREADS_STATE_RUNS runs at each size, as one run at each
+// size can fail a state on its spread alone. Only when no state came up at
+// both sizes are the runs at 10 n held to the slack above those at n as a
+// whole, the first THREADS_HEAP_RUNS of each size; a failure there can be
+// the scheduler's alone (no run at n filled its rings, every run at 10 n
+// did), so it is not settled: both sizes run again until a state comes up at
+// both. Later runs stay out of the whole, as they would only widen it until
+// it passed, clearing growth that moves every run at 10 n into a new state.
 struct ThreadsCheck {
     std::vector<std::string> failures;
     bool settled;
@@ -582,7 +587,7 @@ ThreadsCheck threads_check(const std::vector<ThreadsRun>& runs_n, const std::vec
             by_state[s][r.state].push_back(r.peak);
             all[s].push_back(r.peak);
         }
-    ThreadsCheck c{{}, true};
+    ThreadsCheck c{{}, false};
     bool shared = false;
     for (const auto& [state, at_n] : by_state[0]) {
         const auto at_10n = by_state[1].find(state);
@@ -591,11 +596,14 @@ ThreadsCheck threads_check(const std::vector<ThreadsRun>& runs_n, const std::vec
         const std::string grew = peak_grew("threads, codec state [" + state + "]", at_n, at_10n->second, n);
         if (grew.empty()) return {{}, true};
         c.failures.push_back(grew);
+        c.settled |= std::min(at_n.size(), at_10n->second.size()) >= THREADS_STATE_RUNS;
     }
-    if (shared || all[0].empty() || all[1].empty()) return c;
+    if (shared) return c;
+    if (all[0].empty() || all[1].empty()) return {{}, true};
+    for (std::vector<uint64_t>& peaks : all) peaks.resize(std::min(peaks.size(), size_t(THREADS_HEAP_RUNS)));
     if (const std::string grew = peak_grew("threads", all[0], all[1], n); !grew.empty())
-        c = {{grew + ", and no codec state came up at both sizes"}, false};
-    return c;
+        return {{grew + ", and no codec state came up at both sizes"}, false};
+    return {{}, true};
 }
 
 // The case at n and at 10 n, each applied in every mode: each output as
@@ -1007,13 +1015,19 @@ TEST(codec_state_rounds_the_peaks_of_each_threaded_codec) {
     CHECK_EQ(codec_state("encode poi: queue peaks 5 B\n"), std::string());
 }
 
-// threads_check on made-up runs (peaks in KiB, codec states a and b):
+// threads_check on made-up runs (peaks in KiB, codec states a, b and c):
 //   512 KiB of growth in the state both sizes' runs end in fails, settled,
 //   and an eighth run at n in another state 384 KiB higher leaves it failed,
 //   though it would pass the runs as a whole;
+//   when the growth moved every run at 10 n into a state of its own (c), it
+//   still fails, unsettled: the runs as a whole are the first 7 at each
+//   size, without that eighth run;
 //   runs at n that never filled their rings (a) against runs at 10 n that
 //   all did (b) fail unsettled, and pass once a run at n ends in b;
-//   growth past the difference between the states still fails then;
+//   growth past the difference between the states still fails then, settled
+//   once b has two runs at each size;
+//   a failure in the only state both sizes share, with one run in it at
+//   each, is unsettled;
 //   the peak stays flat if it does so in one state both sizes share;
 //   runs in states that never meet are held to the slack as a whole.
 TEST(heap_threads_check_tells_growth_from_the_scheduler) {
@@ -1035,13 +1049,17 @@ TEST(heap_threads_check_tells_growth_from_the_scheduler) {
     CHECK(failed(threads_check(grown_n, grown_10n, N), true));
     CHECK(failed(threads_check(plus(grown_n, runs({{1408, 1}}, "b")), plus(grown_10n, runs({{1536, 1}}, "a")), N), true));
     CHECK(passed(threads_check(runs({{1024, 7}, {1408, 1}}, ""), runs({{1536, 8}}, ""), N)));
+    CHECK(failed(threads_check(plus(grown_n, runs({{1408, 1}}, "b")), runs({{1536, 8}}, "c"), N), false));
 
     const auto empty_n = runs({{1212, 7}}, "a"), full_10n = runs({{1872, 7}}, "b");
     CHECK(failed(threads_check(empty_n, full_10n, N), false));
     CHECK(passed(threads_check(plus(empty_n, runs({{1900, 1}}, "b")), plus(full_10n, runs({{1872, 1}}, "b")), N)));
     const auto grown_full_10n = runs({{2384, 8}}, "b");
-    CHECK(failed(threads_check(plus(empty_n, runs({{1900, 1}}, "b")), grown_full_10n, N), true));
+    CHECK(failed(threads_check(plus(empty_n, runs({{1900, 1}}, "b")), grown_full_10n, N), false));
+    CHECK(failed(threads_check(plus(empty_n, runs({{1900, 2}}, "b")), grown_full_10n, N), true));
 
+    CHECK(failed(threads_check(plus(runs({{1212, 1}}, "a"), runs({{1900, 6}}, "b")),
+                               plus(runs({{1600, 1}}, "a"), runs({{1872, 6}}, "c")), N), false));
     CHECK(passed(threads_check(plus(runs({{1212, 6}}, "a"), runs({{1900, 1}}, "b")),
                                plus(runs({{1300, 6}}, "a"), runs({{2300, 1}}, "b")), N)));
     CHECK(passed(threads_check(runs({{1000, 7}}, "a"), runs({{1200, 7}}, "b"), N)));
