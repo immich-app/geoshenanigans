@@ -156,29 +156,86 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
   is the new encoded set, geocoder-gc's encoding of the new dir; `--threads` gives each codec a
   thread
 
-### Low-memory mode: memory and speed
+### Patcher memory and speed
 
-The tool's own memory stays at 2–4 MiB anon whatever the limit. That is the default build, which
-decompresses the patch with libzstd into a file it maps: no window buffer. One built with
-`-DGEOCODER_PATCH_LIBZSTD=OFF` runs the `zstd` command for it, a child of about 11.5 MiB peak RSS
-beside the tool (its 8 MiB window among it, which the diff pins and the command is held to).
-Below about 1 GiB (page cache included) a planet update gets slower, not bigger: the mapped inputs
-drop out of the page cache and are read again.
-Planet b → c (2026-10-28), planet/full, one core, cold, no swap, disk at
-100 MB/s:
+geocoder-patch's own memory doesn't grow with the data or the patch, in either mode. Three rules
+keep it so:
 
-| Memory limit | Low-memory mode | Read |
-|---|---|---|
-| 1 GiB | 716 s | 13.3 GB |
-| 256 MiB | 1015 s | 17.1 GB |
-| 128 MiB | 1376 s | 21.5 GB |
-| 32 MiB | over 1800 s (about 100 min) | |
+- **Lists are ascending and read in place.** Every list in a patch that grows with the data is
+  read where it sits in the decompressed patch, which the patcher maps, and none is copied whole:
+  the cell changes, each string tier's edit, the moved-string pairs, the parent-id legs, the
+  secondary remap pairs, the cell list and geo entry deltas, the sparse and parallel deltas'
+  changes, and the offset and string fixups. Each is ascending, by the key the format below
+  gives it, and the patcher refuses one that steps back, except the offset fixups: it doesn't
+  check their delta-coded indices for a repeat or a 32-bit wrap. The lists it looks keys up in
+  (the moved-string pairs, the parent-id legs, the secondary remap) are searched where they sit
+  (`SortedTable`: a binary search narrowed by a directory of at most 4096 sampled keys,
+  TABLE_DIRECTORY_KEYS, and a 4 KiB key filter); the others are read once, front to back, as the
+  walk or replay they serve reaches them.
+- **Remap runs spill.** The string and record remap runs the patcher derives (from each string
+  tier's walk and each file's replay) go through a 64 KiB buffer (SCRATCH_TABLE_BUF) to files in
+  its scratch dir, 12 bytes a run, which it maps and searches like the lists above. One day of
+  planet/full writes 0.44 MiB of them, the transition of planet/poi/all (below) 13.8 MiB. The
+  scratch dir is under `$TMPDIR`, beside the decompressed patch: point `$TMPDIR` at disk, since
+  a RAM-backed one (tmpfs) counts against the memory limit.
+- **No count is used without a cap.** A count read from the patch either sizes a read of the
+  patch, which the patcher checks against the bytes left in its section first (`SectionReader`),
+  or has a cap it refuses past: 65,536 moved-string pairs (STRING_PAIRS_MAX), 1024 client files
+  (MAX_CLIENT_FILES) of names at most 255 bytes, a record stride below 0x100
+  (MAX_RECORD_STRIDE), 0xFFFF lost and 0xFFFF gained ids per cell list, a child stream at most
+  4 MiB ahead of its parent (MAX_DECODER_SKEW), fewer than 0xFFFF values in a `.dict`, and, on
+  the `zstd` command, an 8 MiB zstd window (PATCH_ZSTD_WINDOW_LOG). The encoders take what
+  they're given in pieces of at most 64 KiB (ENCODER_PIECE).
 
-At 1 GiB plain mode takes 1825 s for the planet maximum set (full, poi/all, quality/uncapped),
-and low-memory mode 910 s. A patch that moves many POI strings, like the first one after POI
-names went into record order (12.8M on planet/poi/all), costs no memory per moved string: the
-strings section holds at most 65,536 moved-string pairs (`STRING_PAIRS_MAX`), and past that the
-moved values come as string fixups the replay reads in record order (see How Patching Works).
+The heap tests in `tests/test_patch_lowmem.cpp` hold the patcher to these rules: each grows one
+structure tenfold, applies the patch in plain, low-memory and `--threads` mode, and fails when
+the output differs or the heap peak grows by more than 256 KiB (HEAP_GROWTH_SLACK).
+
+Measured on planet from 2026-10-18 to 10-19 (GCPATCH v12), for a normal day and for the
+transition (the first patch after POI names went into record order, which moves 12.8M of
+planet/poi/all's strings), every one of the 126 variant dirs in both modes: no run's heap peaks
+above 2.11 MiB or its anonymous memory (sampled every 20 ms) above 2.12 MiB, and no transition
+run's heap is more than 31 KiB above the same dir's normal day. The v9 tools before this work
+(2026-10-28) took 532.5 MiB of heap for the transition of planet/poi/all. The planet maximum
+set, one run at a time, one core, cold cache, no memory limit (the peaks are from the 126-dir
+runs):
+
+| planet | Day | Patch | Mode | Heap peak, v9 → v12 | Anon peak | Time | Read |
+|---|---|---|---|---|---|---|---|
+| full | normal¹ | 3.30 MiB | plain | 2.83 → 0.51 MiB | 0.66 MiB | 137 s | 29.1 GiB |
+| | | | low-memory | 4.08 → 1.77 MiB | 1.84 MiB | 215 s | 12.4 GiB |
+| poi/all | normal | 0.88 MiB | plain | 0.99 → 0.58 MiB | 1.00 MiB | 8.0 s | 1.95 GiB |
+| | | | low-memory | 2.33 → 2.10 MiB | 2.08 MiB | 12.7 s | 1.82 GiB |
+| poi/all | transition | 112.1 MiB | plain | 532.5 → 0.58 MiB | 1.00 MiB | 10.4 s | 2.06 GiB |
+| | | | low-memory | 532.5 → 2.10 MiB | 2.08 MiB | 14.9 s | 1.93 GiB |
+| quality/uncapped | normal¹ | 2.29 MiB | plain | 0.16 → 0.16 MiB | 0.33 MiB | 2.7 s | 1.66 GiB |
+| | | | low-memory | 1.79 → 1.78 MiB | 2.02 MiB | 8.7 s | 1.66 GiB |
+
+¹ planet/full and the quality dirs hold no POI names: the transition sends them the normal day's
+patch, byte for byte.
+
+These are the default build's figures: it decompresses the patch with libzstd into a file it
+maps, with no window buffer. One built with `-DGEOCODER_PATCH_LIBZSTD=OFF` runs the `zstd`
+command for it, a child that allocates 11.3 MiB beside the tool (its 8 MiB window among it,
+which the diff pins and the command is held to).
+
+In a 32 MiB memory limit (page cache included, no swap) an update gets slower, not bigger: the
+mapped inputs drop out of the page cache and are read again. The same runs, and europe/full, in
+32 MiB:
+
+| Variant | Day | Mode | No limit | 32 MiB | Read in 32 MiB | Major faults |
+|---|---|---|---|---|---|---|
+| planet/full | normal | plain | 137 s | 243 s | 30.9 GiB | 14,984 |
+| | | low-memory | 215 s | 240 s | 19.0 GiB | 35,328 |
+| planet/poi/all | transition | plain | 10.4 s | 19.2 s | 2.97 GiB | 14,253 |
+| | | low-memory | 14.9 s | 25.3 s | 2.90 GiB | 14,596 |
+| europe/full | normal | plain | 47.6 s | 83.9 s | 10.5 GiB | 22 |
+| | | low-memory | 77.6 s | 88.5 s | 8.81 GiB | 22 |
+
+On a disk held to 100 MB/s read and write and 150 reads a second, planet/poi/all's transition
+takes 238 s plain and 242 s in low-memory mode in 32 MiB. planet/full's normal day in
+low-memory mode takes 693 s in 1 GiB, where it reads no more than without a limit (12.4 GiB),
+and 1450 s in 32 MiB (19.2 GiB).
 
 ### How Patching Works
 
@@ -482,9 +539,11 @@ End marker: 0xFFFFFFFF (u32)
 
 | Operation | Europe | Planet |
 |-----------|--------|--------|
-| Patch application, 1 core, cold cache (`full`, one day) | **81s** | **241s** |
-| Patch peak anonymous memory | **5 MiB** | **12 MiB** |
-| Patch memory limit tested (page cache included) | 1 GiB | 1 GiB |
+| Patch application, 1 core, cold cache (`full`, one day; plain / low-memory) | **48 s / 78 s** | **137 s / 215 s** |
+| The same in a 32 MiB memory limit (page cache included) | 84 s / 88 s | 243 s / 240 s |
+| Patch peak anonymous memory (plain / low-memory) | **0.83 / 1.61 MiB** | **0.66 / 1.84 MiB** |
+
+Measured from 2026-10-18 to 10-19 with GCPATCH v12; see "Patcher memory and speed" above.
 
 One deterministic `build-index` run writes the planet and every continent in
 about 5 minutes on 64 cores, and `geocoder-diff` makes the patches of all 126
