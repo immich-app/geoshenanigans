@@ -41,13 +41,13 @@ static std::string refusal_of(const std::function<void()>& call) {
     return "";
 }
 
-// --- write_varint / read_varint_bounded round-trip ---
+// --- write_varint / SectionReader::varint round-trip ---
 
 static uint32_t varint_roundtrip(uint32_t value) {
     std::vector<char> buf;
     write_varint(buf, value);
     size_t pos = 0;
-    uint32_t got = read_varint_bounded(buf.data(), pos, buf.size(), "varint");
+    uint32_t got = SectionReader(buf.data(), buf.size(), pos, "varint").varint();
     // read must consume exactly the bytes that write produced.
     return (pos == buf.size()) ? got : 0xDEADBEEFu;
 }
@@ -123,10 +123,17 @@ TEST(patch_format_varint_sequence_in_one_buffer) {
     std::vector<char> buf;
     for (uint32_t v : vals) write_varint(buf, v);
     size_t pos = 0;
+    SectionReader in(buf.data(), buf.size(), pos, "varint");
     for (uint32_t v : vals) {
-        CHECK_EQ(read_varint_bounded(buf.data(), pos, buf.size(), "varint"), v);
+        CHECK_EQ(in.varint(), v);
     }
     CHECK_EQ(pos, buf.size());
+}
+
+// A part of the patch whose faults are all malformed (as the runs are), read
+// from data[pos, size).
+static SectionReader runs_reader(const char* data, size_t size, size_t& pos) {
+    return SectionReader(data, size, pos, "runs", PastEnd::MALFORMED);
 }
 
 TEST(patch_format_bounded_varint_rejects_truncated_and_overlong_values) {
@@ -134,14 +141,14 @@ TEST(patch_format_bounded_varint_rejects_truncated_and_overlong_values) {
     write_varint(buf, 300000u);
     for (size_t cut = 0; cut < buf.size(); cut++) {
         size_t pos = 0;
-        CHECK_EQ(refusal_of([&] { read_varint_bounded(buf.data(), pos, cut, "runs"); }), std::string("Malformed runs"));
+        CHECK_EQ(refusal_of([&] { runs_reader(buf.data(), cut, pos).varint(); }), std::string("Malformed runs"));
     }
     size_t pos = 0;
-    CHECK_EQ(read_varint_bounded(buf.data(), pos, buf.size(), "runs"), 300000u);
+    CHECK_EQ(runs_reader(buf.data(), buf.size(), pos).varint(), 300000u);
     CHECK_EQ(pos, buf.size());
     const char overlong[6] = {'\x80', '\x80', '\x80', '\x80', '\x80', '\x01'};
     pos = 0;
-    CHECK_EQ(refusal_of([&] { read_varint_bounded(overlong, pos, sizeof(overlong), "runs"); }), std::string("Malformed runs"));
+    CHECK_EQ(refusal_of([&] { runs_reader(overlong, sizeof(overlong), pos).varint(); }), std::string("Malformed runs"));
 }
 
 TEST(patch_format_bounded_varint_rejects_bits_past_32) {
@@ -149,11 +156,128 @@ TEST(patch_format_bounded_varint_rejects_bits_past_32) {
     // must not wrap to a small value (5 + 2^32 would read as 5).
     const char too_big[5] = {'\x85', '\x80', '\x80', '\x80', '\x10'};
     size_t pos = 0;
-    CHECK_EQ(refusal_of([&] { read_varint_bounded(too_big, pos, sizeof(too_big), "runs"); }), std::string("Malformed runs"));
+    CHECK_EQ(refusal_of([&] { runs_reader(too_big, sizeof(too_big), pos).varint(); }), std::string("Malformed runs"));
     std::vector<char> max;
     write_varint(max, 0xFFFFFFFFu);
     pos = 0;
-    CHECK_EQ(read_varint_bounded(max.data(), pos, max.size(), "runs"), 0xFFFFFFFFu);
+    CHECK_EQ(runs_reader(max.data(), max.size(), pos).varint(), 0xFFFFFFFFu);
+}
+
+// --- SectionReader ---
+
+// One read of each kind, and the bytes it reads.
+struct PartRead {
+    std::vector<char> bytes;
+    std::function<void(SectionReader&)> read;
+};
+
+static std::vector<PartRead> part_reads() {
+    std::vector<char> varint;
+    write_varint(varint, 0xFFFFFFFFu);
+    return {
+        {std::vector<char>(1, 'x'), [](SectionReader& in) { in.u8(); }},
+        {std::vector<char>(2, 'x'), [](SectionReader& in) { in.u16(); }},
+        {std::vector<char>(4, 'x'), [](SectionReader& in) { in.u32(); }},
+        {std::vector<char>(8, 'x'), [](SectionReader& in) { in.u64(); }},
+        {std::vector<char>(5, 'x'), [](SectionReader& in) { in.take(5); }},
+        {std::vector<char>(12, 'x'), [](SectionReader& in) { in.take_items(3, 4); }},
+        {varint, [](SectionReader& in) { in.varint(); }},
+        {{'a', 'b', '\0'}, [](SectionReader& in) { in.cstring(); }},
+    };
+}
+
+// Three bytes already read, then the read's bytes: none of the arithmetic
+// starts at offset 0.
+static std::vector<char> behind_three_bytes(const std::vector<char>& bytes) {
+    std::vector<char> part = {'p', 'r', 'e'};
+    part.insert(part.end(), bytes.begin(), bytes.end());
+    return part;
+}
+
+TEST(section_reader_reads_a_part_to_its_exact_end) {
+    for (const PartRead& r : part_reads()) {
+        const std::vector<char> part = behind_three_bytes(r.bytes);
+        size_t pos = 3;
+        SectionReader in(part.data(), part.size(), pos, "test part");
+        CHECK_EQ(refusal_of([&] { in.require(r.bytes.size()); r.read(in); }), std::string());
+        CHECK_EQ(pos, part.size());
+        CHECK(in.at_end());
+        CHECK_EQ(in.left(), size_t{0});
+        // Nothing is still there to read.
+        CHECK_EQ(refusal_of([&] {
+            in.require(0);
+            CHECK(in.take(0) == part.data() + part.size());
+            in.take_items(0, 8);
+        }), std::string());
+        CHECK_EQ(pos, part.size());
+    }
+}
+
+TEST(section_reader_refuses_a_read_one_byte_past_its_end) {
+    for (const PartRead& r : part_reads()) {
+        std::vector<char> part = behind_three_bytes(r.bytes);
+        part.pop_back();
+        size_t pos = 3;
+        SectionReader in(part.data(), part.size(), pos, "test part");
+        CHECK_EQ(refusal_of([&] { in.require(r.bytes.size()); }), std::string("Truncated test part"));
+        CHECK_EQ(pos, size_t{3});
+        CHECK_EQ(refusal_of([&] { r.read(in); }), std::string("Truncated test part"));
+    }
+}
+
+TEST(section_reader_refuses_lengths_that_wrap) {
+    const std::vector<char> part(16, 'x');
+    size_t pos = 8;
+    SectionReader in(part.data(), part.size(), pos, "test part");
+    const uint64_t wrapping[] = {
+        UINT64_MAX,
+        UINT64_MAX - 7,                // pos + n wraps to 0
+        uint64_t{SIZE_MAX} - 7,        // and in size_t
+        (uint64_t{1} << 32) + 4,       // a 32-bit size_t narrows it to 4
+    };
+    for (uint64_t n : wrapping) {
+        CHECK_EQ(refusal_of([&] { in.require(n); }), std::string("Truncated test part"));
+        CHECK_EQ(refusal_of([&] { in.take(n); }), std::string("Truncated test part"));
+    }
+    // Counts whose bytes pass 32 bits: (2^30 + 1) * 4 is 2^32 + 4.
+    CHECK_EQ(refusal_of([&] { in.take_items((1u << 30) + 1, 4); }), std::string("Truncated test part"));
+    CHECK_EQ(refusal_of([&] { in.take_items(UINT32_MAX, 8); }), std::string("Truncated test part"));
+    CHECK_EQ(pos, size_t{8});
+    CHECK(in.take(8) == part.data() + 8);
+
+    // Past the part's end, size - pos wraps: not even nothing is there to read.
+    size_t past = part.size() + 1;
+    SectionReader beyond(part.data(), part.size(), past, "test part");
+    CHECK_EQ(beyond.left(), size_t{0});
+    CHECK(!beyond.at_end());
+    CHECK_EQ(refusal_of([&] { beyond.require(0); }), std::string("Truncated test part"));
+    CHECK_EQ(refusal_of([&] { beyond.take(0); }), std::string("Truncated test part"));
+    CHECK_EQ(refusal_of([&] { beyond.varint(); }), std::string("Truncated test part"));
+    CHECK_EQ(refusal_of([&] { beyond.cstring(); }), std::string("Truncated test part"));
+    CHECK_EQ(past, part.size() + 1);
+}
+
+TEST(section_reader_words_its_refusals_as_past_end_says) {
+    const std::vector<char> part(6, 'x');
+    auto refusal = [&](PastEnd past_end, const std::function<void(SectionReader&)>& read) {
+        size_t pos = 2;
+        SectionReader in(part.data(), part.size(), pos, "test part", past_end);
+        return refusal_of([&] { read(in); });
+    };
+    auto past = [](SectionReader& in) { in.take(5, "the field"); };
+    CHECK_EQ(refusal(PastEnd::TRUNCATED, past), std::string("Truncated test part"));
+    CHECK_EQ(refusal(PastEnd::MALFORMED, past), std::string("Malformed test part"));
+    CHECK_EQ(refusal(PastEnd::TRUNCATED_AT, past), std::string("Truncated test part: need 5 bytes for the field at offset 2 (size 6)"));
+    CHECK_EQ(refusal(PastEnd::TRUNCATED_AT, [](SectionReader& in) { in.u64(); }),
+             std::string("Truncated test part: need 8 bytes for u64 at offset 2 (size 6)"));
+    // Its other faults are malformed however a part words its end.
+    const std::vector<char> overlong = {'\x80', '\x80', '\x80', '\x80', '\x80', '\x01'};
+    for (PastEnd past_end : {PastEnd::TRUNCATED, PastEnd::MALFORMED, PastEnd::TRUNCATED_AT}) {
+        CHECK_EQ(refusal(past_end, [](SectionReader& in) { in.malformed(); }), std::string("Malformed test part"));
+        size_t pos = 0;
+        SectionReader in(overlong.data(), overlong.size(), pos, "test part", past_end);
+        CHECK_EQ(refusal_of([&] { in.varint(); }), std::string("Malformed test part"));
+    }
 }
 
 // --- to_grid quantiser ---
