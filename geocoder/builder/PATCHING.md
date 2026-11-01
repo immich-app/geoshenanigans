@@ -436,7 +436,8 @@ Parent-id remap: marker 0xFFFFFFF3 (u32)
   Each leg ascending by old, each id once. The patcher reads the legs where
   they sit and refuses one out of order. (v11) The street leg is the street
   remap's pairs as it sits, and a patch whose secondary remap gives
-  street_ways pairs as well is refused.
+  street_ways pairs as well is refused. At most one such section: the
+  patcher refuses a second ("Malformed POI parent-id remap: a second one").
 
 Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64) + ...
   (the patcher refuses an old file of another size, 0 meaning absent)

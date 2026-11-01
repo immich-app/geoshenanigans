@@ -2211,6 +2211,46 @@ TEST(patch_refuses_a_second_pair_list_or_street_pairs_in_both_remaps_for_unchang
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
+// A second POI parent-id remap is refused in every mode, whichever comes
+// first: an empty one (no pair in any leg) before or after the one the diff
+// made (its street leg the 20 moved street ways with addresses), or that one
+// twice. The patch as made applies.
+TEST(patch_refuses_a_second_parent_id_remap) {
+    ScratchDir dir("patch-second-parent-remap");
+    BuildDir old_d, new_d, old_meta, new_meta;
+    put_moved_ways(old_d, new_d, old_meta, new_meta, 20, 0);
+    put_changed_pois(old_d, new_d, 20);
+    const LowMemCase c{dir.path(), "parent"};
+    REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    std::vector<char> legs, empty;
+    for (const uint32_t w : {POI_PARENT_REMAP_MARKER, 0u, 20u}) append(legs, w);
+    for (const uint32_t w : {POI_PARENT_REMAP_MARKER, 0u, 0u, 0u}) append(empty, w);
+    const size_t at = find_once(raw, legs);
+    REQUIRE(at != std::string::npos);
+    // The section's end: past its marker, the admin and street counts, the
+    // street pairs and the postcode count.
+    const size_t end = at + 12 + 20 * 8 + 4;
+    const std::vector<char> made(raw.begin() + at, raw.begin() + end);
+
+    struct Case {
+        std::string name;
+        size_t at;
+        std::vector<char> section;
+    };
+    const Case cases[] = {{"empty-before", at, empty}, {"empty-after", end, empty}, {"twice", end, made}};
+    for (const Case& e : cases) {
+        std::vector<char> edited = raw;
+        edited.insert(edited.begin() + e.at, e.section.begin(), e.section.end());
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, "Malformed POI parent-id remap: a second one").empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
 // String fixups the replay can't take are refused in every mode: 10 POIs
 // whose names move past the strings section's pairs, the new day without POI
 // 1, so the POI merge carries the fixups of POIs 0 and 2 to 8, and

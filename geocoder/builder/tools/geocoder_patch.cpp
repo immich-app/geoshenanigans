@@ -516,6 +516,7 @@ static int run(int argc, char* argv[]) {
     // alongside the str_remap on its string fields.
     SortedTable<RemapPair> poi_admin_remap;
     SortedTable<RemapPair> poi_street_remap;
+    bool saw_parent_remap = false;  // a patch gives one
     auto poi_remap_lookup = [](const SortedTable<RemapPair>& t, uint32_t old_id) {
         const std::optional<RemapPair> p = t.find(old_id);
         return p ? p->to : old_id;
@@ -615,6 +616,8 @@ static int run(int argc, char* argv[]) {
             continue;
         }
         if (file_id == POI_PARENT_REMAP_MARKER) {
+            if (saw_parent_remap) throw std::runtime_error("Malformed POI parent-id remap: a second one");
+            saw_parent_remap = true;
             ParentIdRemap r = parse_parent_id_remap(P, patch_size, pos);
             if (!r.street.empty()) take_street_pairs("POI parent-id remap");
             poi_admin_remap = std::move(r.admin);
