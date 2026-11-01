@@ -240,7 +240,10 @@ The patch tool:
   `pread` where the kernel, the filesystem or a seccomp profile refuses that
 - Peak anonymous memory: about 1 MiB, or 2 MiB in low-memory mode (an
   encoded installed set, see `builder/PATCHING.md`), for every variant and
-  whatever the patch; everything else is reclaimable page cache.
+  whatever the patch; everything else is reclaimable page cache. That is the
+  default build, which decompresses the patch with libzstd; one built with
+  `-DGEOCODER_PATCH_LIBZSTD=OFF` also runs a `zstd` child that allocates
+  about 11.3 MiB beside it.
   Its scratch dir, which holds the decompressed patch, is under `$TMPDIR`:
   keep that on disk, since a RAM-backed one counts against memory
 - Runs on one core inside a 32 MiB memory limit (page cache included): one
