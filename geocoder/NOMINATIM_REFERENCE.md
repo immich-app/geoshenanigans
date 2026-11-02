@@ -149,7 +149,7 @@ Where Nominatim's rank adjustment matters:
 | get_label_tag() check 2-3 (place/linked_place extratags) | place_type_override field on AdminPolygon (from the linked place node, else the boundary's linked_place / place tags) | ✅ Implemented |
 | get_label_tag() check 4 (ADMIN_LABELS rank//2) | rank_to_field() function | ✅ Implemented |
 | get_label_tag() check 5 (category[1] for place=* entities) | place_type_override covers this — boundary=place entities get place_type set | ✅ Implemented |
-| find_linked_place() node linking | Builder: label role member, wikidata match, the boundary's own place tag, then name match (`link_places_by_name`), in Nominatim's order; a linked place node is hidden from place results | ✅ Implemented |
+| find_linked_place() node linking | Builder: label role member, wikidata match, the boundary's own place tag, then name match (`link_places_by_name`), in Nominatim's order; a linked place node is hidden from place results, except in admin-minimal when that set leaves its boundary out (L9-L11, place areas below rank 16): nothing there stands for the node | ✅ Implemented |
 | Rank adjustment for nested boundaries | At query time on the polygons containing the point, then smallest-area-wins per field | ✅ Implemented — containment judged by admin level and area |
 | boundary=place entities (e.g., Washington DC) | Extracted in builder with admin_level=15 + place_type_override | ✅ Implemented |
 | Place node fallback (nearest city/town/village) | place_nodes.bin + find_places() with wide search | ✅ Implemented — place nodes are indexed at the admin cell level (L10); the query cell and its 8 neighbours cover ~30 km |

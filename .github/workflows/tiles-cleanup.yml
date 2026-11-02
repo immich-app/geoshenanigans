@@ -1,28 +1,48 @@
-name: 'Tiles Cleanup'
+name: Tiles Cleanup
 on:
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Only list what would be deleted'
+        required: false
+        default: true
+        type: boolean
   schedule:
-    # Every day at midnight
-    - cron: '0 0 * * *'
+    - cron: '0 3 * * *'
+
+permissions: {}
 
 concurrency:
   group: ${{ github.workflow }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
-  cleanup_tiles:
-    name: Cleanup Tiles & Styles
-    defaults:
-      run:
-        working-directory: 'deployment'
+  cleanup:
+    name: Cleanup ${{ matrix.environment }}
+    # Main's tfvars say what's live; on another branch they could be stale.
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    outputs:
-      KEY: ${{ steps.latest_build.outputs.KEY }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [dev, prod]
+    # The environment's deploy lock (tiles-deploy.yml): only that environment publishes into its area, so nothing
+    # is deleted while a deploy is in flight.
+    concurrency:
+      group: tiles-deploy-${{ matrix.environment }}
+      cancel-in-progress: false
     env:
-      RCLONE_CONFIG: ${{ github.workspace }}/rclone.conf
+      OP_SERVICE_ACCOUNT_TOKEN: ${{ matrix.environment == 'prod' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Main as it is once the lock is held, with history so the script can find the previous deployment.
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
 
       - id: token
         uses: immich-app/devtools/actions/create-workflow-token@df46d635b905e618b88fc4c95baa920aeb30b309 # create-workflow-token-action-v3.0.1
@@ -36,20 +56,8 @@ jobs:
         with:
           github_token: ${{ steps.token.outputs.token }}
 
-      - name: Configure Rclone
+      - name: Delete old deployments
         env:
-          ACCESS_KEY_ID: ${{ secrets.CLOUDFLARE_TILES_R2_KV_TOKEN_ID }}
-          SECRET_ACCESS_KEY: ${{ secrets.CLOUDFLARE_TILES_R2_KV_TOKEN_HASHED_VALUE }}
-        run: |
-          cat > "$RCLONE_CONFIG" <<EOF
-          [r2]
-          type = s3
-          provider = Cloudflare
-          region = auto
-          endpoint = https://601adaaa1eab190cdfe2945f9a6c89d0.r2.cloudflarestorage.com
-          access_key_id = $ACCESS_KEY_ID
-          secret_access_key = $SECRET_ACCESS_KEY
-          EOF
-
-      - name: Cleanup all non-latest tiles
-        run: ./scripts/r2-cleanup.sh
+          ENVIRONMENT: ${{ matrix.environment }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run && '--dry-run' || '' }}
+        run: op run --env-file=deployment/tiles-deploy.env -- deployment/scripts/tiles-cleanup.sh "$ENVIRONMENT" ${DRY_RUN:+"$DRY_RUN"}

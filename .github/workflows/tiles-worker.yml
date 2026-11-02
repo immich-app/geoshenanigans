@@ -45,6 +45,11 @@ jobs:
         run: npm run test:cov
         if: ${{ !cancelled() }}
 
+      - name: Test tiles cleanup script
+        working-directory: .
+        run: deployment/scripts/tiles-cleanup.test.sh
+        if: ${{ !cancelled() }}
+
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -155,6 +160,10 @@ jobs:
     name: Deploy Terragrunt
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    # Shared with the activate job in tiles-deploy.yml so the two never apply the same state at once.
+    concurrency:
+      group: tiles-apply-${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
+      cancel-in-progress: false
     env:
       ENVIRONMENT: ${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
     steps:
@@ -173,13 +182,32 @@ jobs:
         with:
           github_token: ${{ steps.token.outputs.token }}
 
+      # A delayed or re-run job from an older commit would switch the worker back to a deployment key whose
+      # directory table a later deploy may have dropped. Main's key is the one to serve; a newer run applies it.
+      - name: Check deployment key is current
+        id: key
+        run: |
+          set -euo pipefail
+          tfvars="deployment/modules/cloudflare/tiles-worker/tiles.$ENVIRONMENT.tfvars.json"
+          git fetch --quiet --depth=1 origin main
+          here=$(jq -r .pmtiles_deployment_key "$tfvars")
+          main=$(git show "FETCH_HEAD:$tfvars" | jq -r .pmtiles_deployment_key)
+          if [ "$here" = "$main" ]; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::This commit deploys $ENVIRONMENT tiles $here but main now has $main; skipping the apply"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: 'Get build artifact'
+        if: steps.key.outputs.current == 'true'
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: tiles-build-output
           path: "${{ github.workspace }}/dist"
 
       - name: Deploy All
+        if: steps.key.outputs.current == 'true'
         working-directory: ${{ github.workspace }}/deployment
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ github.ref == 'refs/heads/main' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}

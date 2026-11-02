@@ -1,5 +1,13 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "extends": ["local>immich-app/.github:renovate-config"],
-  "schedule": "on tuesday"
+  "schedule": "on tuesday",
+  "packageRules": [
+    {
+      "description": "Style upgrades need matching sprites on static.immich.cloud and ship with the next tiles deploy, so they are done on purpose rather than in the grouped npm updates",
+      "matchPackageNames": ["@protomaps/basemaps"],
+      "groupName": null,
+      "dependencyDashboardApproval": true
+    }
+  ]
 }

@@ -1726,6 +1726,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             //   - admin polygons (and their vertex bytes) admin_minimal_keeps
             //     leaves out: L9 borough, L10 quarter-area, L11 admin-postal,
             //     and L15 place areas ranked below 16.
+            //   - those boundaries' claims on place nodes: a node one of them
+            //     claims answers here as a place, since nothing here stands
+            //     for it (an L9 or L10 boundary claims Banja Luka, Mildura and
+            //     many Dutch villages).
             // Re-simplifies the kept polygons at q2.5 and writes them to its
             // own stable slots so the on-disk admin_polygons.bin / admin_vertices.bin
             // are self-contained — admin-minimal does NOT share polygon
@@ -1757,8 +1761,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                         place_remap[i] = static_cast<uint32_t>(filtered_places.size());
                         PlaceNode pn = d.place_nodes[i];
                         // Parents in this dir's own polygon slots (NO_DATA when
-                        // the parent polygon isn't kept), like every other id here.
-                        remap_place_parent(pn, poly_remap);
+                        // the parent polygon isn't kept), like every other id
+                        // here; a node whose claimant isn't kept is shown.
+                        remap_place_parent_unhiding_orphans(pn, poly_remap);
                         filtered_places.push_back(pn);
                     }
                 }
