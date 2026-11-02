@@ -396,7 +396,7 @@ enum class PoiCategory : uint8_t {
     // rank_search==30, geometry not line-like). Its default tier is below
     // every POI dir, so only a wikipedia or wikidata tag makes one a POI
     // (classify_poi).
-    UNNAMED_RANK30 = 170,
+    GENERIC_RANK30 = 170,
 
     UNKNOWN = 255
 };
@@ -518,7 +518,7 @@ inline uint8_t poi_get_default_tier(PoiCategory cat) {
             return 3;
         // Generic rank-30 feature: below every POI dir until a wikipedia or
         // wikidata tag lifts it into poi/all.
-        case PoiCategory::UNNAMED_RANK30:
+        case PoiCategory::GENERIC_RANK30:
             return 4;
         default: return 0;
     }
@@ -722,7 +722,7 @@ inline const char* poi_category_label(PoiCategory cat) {
         // an occasional OSM tagging that we don't special-case
         // bubbles up to the client (e.g. a named office=ngo or
         // amenity=studio).
-        case PoiCategory::UNNAMED_RANK30: return "feature";
+        case PoiCategory::GENERIC_RANK30: return "feature";
         default: return "unknown";
     }
 }

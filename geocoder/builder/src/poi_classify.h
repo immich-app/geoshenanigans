@@ -95,7 +95,7 @@ inline std::optional<PoiClassification> classify_poi(
     }
     // landuse — only named landuse polygons get indexed.
     // Note: landuse is deliberately NOT in the trigger list
-    // of the UNNAMED_RANK30 fallback below, so residential/
+    // of the GENERIC_RANK30 fallback below, so residential/
     // industrial zones don't flood the index.
     if (cat == PoiCategory::UNKNOWN && t_landuse) {
         if (std::strcmp(t_landuse, "forest") == 0) cat = PoiCategory::WOOD;
@@ -336,7 +336,7 @@ inline std::optional<PoiClassification> classify_poi(
             t_man_made || t_craft || t_office || t_waterway ||
             t_natural || t_aeroway || t_railway || t_power ||
             t_shop) {
-            cat = PoiCategory::UNNAMED_RANK30;
+            cat = PoiCategory::GENERIC_RANK30;
         }
     }
 

@@ -101,7 +101,7 @@ TEST(poi_classify_keeps_a_generic_feature_only_with_a_wiki_tag) {
     for (const Tags& t : {wikidata, wikipedia}) {
         auto c = classify(t);
         REQUIRE(c.has_value());
-        CHECK_EQ(uint8_t(c->category), uint8_t(PoiCategory::UNNAMED_RANK30));
+        CHECK_EQ(uint8_t(c->category), uint8_t(PoiCategory::GENERIC_RANK30));
         CHECK_EQ(int(c->tier), int(POI_MAX_SHIPPED_TIER));
     }
 }

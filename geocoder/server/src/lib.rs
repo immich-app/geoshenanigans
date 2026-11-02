@@ -572,7 +572,7 @@ pub fn poi_category_to_osm_class(cat: u8) -> Option<&'static str> {
         235..=240 => Some("leisure"),
         // Shop sub-categories (241..=253)
         241..=253 => Some("shop"),
-        // UNNAMED_RANK30=170 never surfaces (by definition generic).
+        // GENERIC_RANK30=170 never surfaces (by definition generic).
         // (POWER_PLANT=150 is excluded explicitly above.)
         _ => None,
     }
@@ -2919,7 +2919,7 @@ impl Index {
         let pois = self.find_pois(lat, lng);
         // Landmark: name of the smallest contained polygon POI whose
         // category is a surfaceable landmark class (filters out
-        // admin-level area labels, generic UNNAMED_RANK30 and very
+        // admin-level area labels, GENERIC_RANK30 and very
         // large natural / boundary features). find_pois already
         // sorts contained polygons first by area ascending, so the
         // first qualifying hit is the most specific enclosing
@@ -5472,7 +5472,7 @@ mod pure_helper_tests {
         // arm precedes the 142..=152 landuse band.
         assert_eq!(poi_category_to_osm_class(150), None);
         assert_eq!(poi_category_to_osm_class(160), Some("office"));
-        // NOTE: UNNAMED_RANK30=170 -> None (generic filler).
+        // NOTE: GENERIC_RANK30=170 -> None (generic filler).
         assert_eq!(poi_category_to_osm_class(170), None);
         assert_eq!(poi_category_to_osm_class(171), Some("amenity"));
         assert_eq!(poi_category_to_osm_class(179), Some("amenity"));
