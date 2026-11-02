@@ -572,7 +572,7 @@ pub fn poi_category_to_osm_class(cat: u8) -> Option<&'static str> {
         235..=240 => Some("leisure"),
         // Shop sub-categories (241..=253)
         241..=253 => Some("shop"),
-        // UNNAMED_RANK30=170 never surfaces (by definition generic).
+        // GENERIC_RANK30=170 never surfaces (by definition generic).
         // (POWER_PLANT=150 is excluded explicitly above.)
         _ => None,
     }
@@ -1309,7 +1309,8 @@ impl Index {
         let total = m.len() / std::mem::size_of::<PoiRecord>() as u64;
         if (idx as u64) >= total { return None; }
         let pr = m.read_at::<PoiRecord>(idx as u64);
-        if pr.name_id == NO_DATA && pr.vertex_offset == NO_DATA { return None; }
+        // The builder ships no unnamed POI, so a nameless record is a tombstone.
+        if pr.name_id == NO_DATA { return None; }
         Some(pr)
     }
 
@@ -1671,7 +1672,7 @@ impl Index {
             })),
             "poi": poi_primary.map(|(d, p)| serde_json::json!({
                 "dist_m": to_m(d),
-                "name": if p.name_id != NO_DATA { self.get_string(p.name_id) } else { "" },
+                "name": self.get_string(p.name_id),
                 "parent_street": if p.parent_street_id != NO_DATA { self.get_string(p.parent_street_id) } else { "" },
                 "vertex_count": p.vertex_count,
                 "category": p.category,
@@ -2294,21 +2295,6 @@ impl Index {
                 if poi.parent_street_id == NO_DATA {
                     return;
                 }
-                // Always require a name on the winning POI. Unnamed
-                // POIs (UNNAMED_RANK30 and name-less specific-category
-                // rows) would only surface their parent_street as the
-                // road — which drifts the result away from the user's
-                // actual nearest street. SF query (37.7749,-122.4194):
-                // a waste_basket at dist=0 currently shifts `road`
-                // from Market Street (the real nearest) to South Van
-                // Ness via the bin's parent_street. Dropping unnamed
-                // candidates keeps the primary selection aligned with
-                // human-recognisable features. (We still index them
-                // for the `places[]` layer because they can provide
-                // landmark context in rural areas.)
-                if poi.name_id == NO_DATA {
-                    return;
-                }
 
                 // Compute distance²: inside the polygon → 0;
                 // otherwise min distance to any edge; for point POIs,
@@ -2400,7 +2386,6 @@ impl Index {
                 let is_interior = c == cell && (id & INTERIOR_FLAG) != 0;
                 let poi_id = (id & ID_MASK) as u32;
                 let Some(poi) = self.poi_record(poi_id) else { return; };
-                if poi.name_id == NO_DATA { return; }
                 let name = self.get_string(poi.name_id);
                 if name.is_empty() { return; }
 
@@ -2934,7 +2919,7 @@ impl Index {
         let pois = self.find_pois(lat, lng);
         // Landmark: name of the smallest contained polygon POI whose
         // category is a surfaceable landmark class (filters out
-        // admin-level area labels, generic UNNAMED_RANK30 and very
+        // admin-level area labels, GENERIC_RANK30 and very
         // large natural / boundary features). find_pois already
         // sorts contained polygons first by area ascending, so the
         // first qualifying hit is the most specific enclosing
@@ -3184,7 +3169,7 @@ impl Index {
                 let (_, poi) = poi_primary.unwrap();
                 let is_highway_poi = (poi.flags & POI_FLAG_HIGHWAY) != 0;
                 let use_poi_name = is_highway_poi && poi.vertex_count > 0 && poi_dist == 0.0;
-                if use_poi_name && poi.name_id != NO_DATA {
+                if use_poi_name {
                     road = Some(self.get_string(poi.name_id));
                 } else if poi.parent_street_id != NO_DATA {
                     road = Some(self.get_string(poi.parent_street_id));
@@ -5487,7 +5472,7 @@ mod pure_helper_tests {
         // arm precedes the 142..=152 landuse band.
         assert_eq!(poi_category_to_osm_class(150), None);
         assert_eq!(poi_category_to_osm_class(160), Some("office"));
-        // NOTE: UNNAMED_RANK30=170 -> None (generic filler).
+        // NOTE: GENERIC_RANK30=170 -> None (generic filler).
         assert_eq!(poi_category_to_osm_class(170), None);
         assert_eq!(poi_category_to_osm_class(171), Some("amenity"));
         assert_eq!(poi_category_to_osm_class(179), Some("amenity"));
@@ -7420,6 +7405,24 @@ mod admin_scan_tests {
 
         assert!(!idx.poi_chain_contains_query(&poi(0), Q.0, Q.1));
         assert!(idx.poi_chain_contains_query(&poi(1), Q.0, Q.1));
+    }
+
+    #[test]
+    fn a_nameless_poi_record_is_a_tombstone_point_or_polygon() {
+        let mut idx = admin_index(&[]);
+        let poi = |name_id: u32, vertex_offset: u32| {
+            let vertex_count: u32 = if vertex_offset == NO_DATA { 0 } else { 4 };
+            [&0f32.to_le_bytes()[..], &0f32.to_le_bytes(), &vertex_offset.to_le_bytes(), &vertex_count.to_le_bytes(),
+             &name_id.to_le_bytes(), &[0u8, 3, 0, 1], &0u32.to_le_bytes(), &NO_DATA.to_le_bytes(), &NO_DATA.to_le_bytes()]
+                .concat()
+        };
+        let records = [poi(0, NO_DATA), poi(0, 0), poi(NO_DATA, NO_DATA), poi(NO_DATA, 0)];
+        assert!(records.iter().all(|r| r.len() == std::mem::size_of::<PoiRecord>()));
+        idx.poi_records = Some(FileBytes::Owned(records.concat()));
+
+        let live: Vec<bool> = (0..4).map(|i| idx.poi_record(i).is_some()).collect();
+
+        assert_eq!(live, [true, true, false, false]);
     }
 
     #[test]

@@ -340,7 +340,7 @@ std::string random_string(Rng& r) {
 }
 
 // A string pool with every kind of reference: valid starts, NO_DATA, offsets
-// inside a string, past the pool, and strings only unshipped POIs use.
+// inside a string and past the pool.
 void fill_strings(ParsedData& d, uint64_t seed, size_t n_strings, size_t n_refs) {
     Rng r(seed);
     std::vector<uint32_t> offs;
@@ -368,7 +368,7 @@ void fill_strings(ParsedData& d, uint64_t seed, size_t n_strings, size_t n_refs)
         p.name_id = ref();
         p.parent_street_id = ref();
         p.parent_postcode_id = ref();
-        p.tier = static_cast<uint8_t>(1 + r.below(5));
+        p.tier = static_cast<uint8_t>(1 + r.below(POI_MAX_SHIPPED_TIER));
         d.poi_records.push_back(p);
         if (i % 4 == 0) {
             InterpWay iw{};

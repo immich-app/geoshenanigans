@@ -7,11 +7,23 @@
 #include <optional>
 #include "types.h"
 
+// The name a POI node goes by: name:en, else name. An empty value names
+// nothing, and a node without a name makes no POI: an unnamed POI could only
+// surface its parent street as the road, which drifts the answer off the
+// nearest street (San Francisco 37.7749,-122.4194: a waste basket at 0 m
+// turned Market Street into South Van Ness).
+inline const char* poi_name(const char* name_en, const char* name) {
+    if (name_en && name_en[0]) return name_en;
+
+    return name && name[0] ? name : nullptr;
+}
+
 // POI classification: maps a node/way's raw OSM tag values to a
 // (category, tier, flags) triple (PoiClassification, defined in types.h),
-// or nullopt when nothing matches. Pure function of its tag arguments (no
-// shared state) — lifted out of main()'s node/way passes, which call it
-// identically.
+// or nullopt when nothing matches or no POI dir ships the tier (a generic
+// rank-30 feature without a wikipedia or wikidata tag). Pure function of its
+// tag arguments (no shared state) — lifted out of main()'s node/way passes,
+// which call it identically.
 inline std::optional<PoiClassification> classify_poi(
     const char* t_tourism, const char* t_historic, const char* t_boundary,
     const char* t_amenity, const char* t_leisure, const char* t_natural,
@@ -82,11 +94,9 @@ inline std::optional<PoiClassification> classify_poi(
         else if (std::strcmp(t_boundary, "forest") == 0) cat = PoiCategory::WOOD;
     }
     // landuse — only named landuse polygons get indexed.
-    // Note: classify_poi still falls through for unnamed
-    // features to UNNAMED_RANK30 below, but landuse is
-    // deliberately NOT in that fallback's trigger list so
-    // unnamed residential/industrial zones don't flood
-    // the index.
+    // Note: landuse is deliberately NOT in the trigger list
+    // of the GENERIC_RANK30 fallback below, so residential/
+    // industrial zones don't flood the index.
     if (cat == PoiCategory::UNKNOWN && t_landuse) {
         if (std::strcmp(t_landuse, "forest") == 0) cat = PoiCategory::WOOD;
         else if (std::strcmp(t_landuse, "meadow") == 0) cat = PoiCategory::MEADOW;
@@ -317,19 +327,16 @@ inline std::optional<PoiClassification> classify_poi(
     }
 
     // Fallback: any rank-30 addressable feature that didn't
-    // hit a specific PoiCategory above. Mirrors Nominatim's
-    // reverse.py DataLayer.POI filter (class_ NOT IN
-    // ('place', 'building'), rank_search==30) which drives
-    // the Moscow vending_machine / SF waste_basket / Sydney
-    // toilets / Paris clock primary selections. UNNAMED_RANK30
-    // entries carry no name_id but still have a parent_street
-    // that surfaces as `road` when they win primary contest.
+    // hit a specific PoiCategory above (Nominatim's reverse.py
+    // DataLayer.POI filter: class_ NOT IN ('place', 'building'),
+    // rank_search==30). Only a wikipedia or wikidata tag lifts
+    // one into a POI dir (below).
     if (cat == PoiCategory::UNKNOWN) {
         if (t_amenity || t_tourism || t_historic || t_leisure ||
             t_man_made || t_craft || t_office || t_waterway ||
             t_natural || t_aeroway || t_railway || t_power ||
             t_shop) {
-            cat = PoiCategory::UNNAMED_RANK30;
+            cat = PoiCategory::GENERIC_RANK30;
         }
     }
 
@@ -353,6 +360,7 @@ inline std::optional<PoiClassification> classify_poi(
         flags |= POI_FLAG_HIGHWAY;
     }
     if ((flags & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA)) && tier > 1) tier--;
+    if (tier > POI_MAX_SHIPPED_TIER) return std::optional<PoiClassification>{};
 
     return PoiClassification{cat, tier, flags};
 }

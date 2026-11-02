@@ -39,23 +39,16 @@ TEST(string_home_tier_picks_the_most_widely_downloaded_consumer_tier) {
         {STR_TIER_BIT_POI | STR_TIER_BIT_POSTCODE, 0},
         {STR_TIER_BIT_POI | STR_TIER_BIT_CORE, 0},
         {STR_TIER_BIT_CORE | STR_TIER_BIT_STREET | STR_TIER_BIT_ADDR, 0},
-        // Strings no shipped record uses (no record, or only POI candidates
-        // no tier ships) aren't written; shared with a shipped consumer, they
-        // live where that one needs.
+        // A string no record uses isn't written.
         {0, STR_TIER_NONE},
-        {STR_TIER_BIT_UNSHIPPED, STR_TIER_NONE},
-        {STR_TIER_BIT_UNSHIPPED | STR_TIER_BIT_STREET, 1},
-        {STR_TIER_BIT_UNSHIPPED | STR_TIER_BIT_POI, 4},
         // A way's original name alone isn't written either; beside a shipped
         // consumer it weighs as a street name.
         {STR_TIER_BIT_WAY_ORIG_NAME, STR_TIER_NONE},
-        {STR_TIER_BIT_WAY_ORIG_NAME | STR_TIER_BIT_UNSHIPPED, STR_TIER_NONE},
         {STR_TIER_BIT_WAY_ORIG_NAME | STR_TIER_BIT_STREET, 1},
         {STR_TIER_BIT_WAY_ORIG_NAME | STR_TIER_BIT_CORE, 0},
         {STR_TIER_BIT_WAY_ORIG_NAME | STR_TIER_BIT_POI, 0},
         {STR_TIER_BIT_WAY_ORIG_NAME | STR_TIER_BIT_ADDR, 1},
         {STR_TIER_BIT_WAY_ORIG_NAME | STR_TIER_BIT_POSTCODE, 3},
-        {STR_TIER_BIT_WAY_ORIG_NAME | STR_TIER_BIT_UNSHIPPED | STR_TIER_BIT_POI, 0},
     };
     for (const auto& c : cases) CHECK_EQ(string_home_tier(c.mask), c.tier);
 }
@@ -146,10 +139,9 @@ std::string tiers_back_to_back(const ParsedData& d) {
 
 }  // namespace
 
-TEST(order_poi_strings_lays_names_out_by_their_first_shipped_record) {
-    const uint8_t unshipped = POI_MAX_SHIPPED_TIER + 1;
-    ParsedData d = poi_build({{"zoo", 1}, {"cafe", 3}, {"zoo", 2}, {"bank", unshipped}, {"", 1},
-                              {"bank", 3}, {"apple", unshipped}, {"Main", 1}, {"cafe", 1}},
+TEST(order_poi_strings_lays_names_out_by_their_first_record) {
+    ParsedData d = poi_build({{"zoo", 1}, {"cafe", 3}, {"zoo", 2}, {"", 1},
+                              {"bank", 3}, {"Main", 1}, {"cafe", 1}},
                              {"Main"});
     REQUIRE(tier_bytes(d, STR_TIER_POI) == std::string("bank\0cafe\0zoo\0", 14));
     const std::vector<std::string> names = poi_names(d);
@@ -158,13 +150,11 @@ TEST(order_poi_strings_lays_names_out_by_their_first_shipped_record) {
 
     order_poi_strings_by_record(d);
 
-    // The unshipped record names bank first but doesn't place it; Main is a
-    // core name, apple no tier's.
+    // cafe's home is tier 1 (its last record); Main is a core name.
     CHECK(tier_bytes(d, STR_TIER_POI) == std::string("zoo\0cafe\0bank\0", 14));
     CHECK(d.poi_tier_string_ends == (std::array<uint32_t, POI_MAX_SHIPPED_TIER + 1>{0, 9, 9, 14}));
     CHECK(poi_names(d) == names);
     CHECK_EQ(d.poi_records[0].name_id, bases[STR_TIER_POI]);
-    CHECK_EQ(d.poi_records[6].name_id, NO_DATA);
     CHECK(tier_bytes(d, 0) == core);
     CHECK(d.strings_tier_bases == bases);
     const std::vector<char>& pool = d.string_pool.data();
@@ -187,12 +177,11 @@ TEST(order_poi_strings_matches_a_serial_walk_for_any_thread_count) {
     auto rnd = [&](uint32_t n) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33) % n; };
     std::vector<std::pair<std::string, uint8_t>> names;
     for (int i = 0; i < 300000; i++)
-        names.push_back({rnd(50) == 0 ? "" : "poi " + std::to_string(rnd(60000)), static_cast<uint8_t>(1 + rnd(4))});
+        names.push_back({rnd(50) == 0 ? "" : "poi " + std::to_string(rnd(60000)), static_cast<uint8_t>(1 + rnd(3))});
     const ParsedData before = poi_build(names, {"poi 7", "poi 8"});
 
-    // By home tier (the lowest tier of a shipped record naming it), each name
-    // at the first record of its home tier, then the ones no shipped record
-    // names.
+    // By home tier (the lowest tier of a record naming it), each name at the
+    // first record of its home tier, then the ones no record names.
     const uint32_t base = before.strings_tier_bases[STR_TIER_POI];
     const std::vector<char>& old_tier = before.strings_tiers[STR_TIER_POI];
     std::string want;
@@ -205,7 +194,7 @@ TEST(order_poi_strings_matches_a_serial_walk_for_any_thread_count) {
     };
     std::unordered_map<uint32_t, uint8_t> home;
     for (const auto& pr : before.poi_records)
-        if (pr.tier <= POI_MAX_SHIPPED_TIER && pr.name_id != NO_DATA && pr.name_id >= base) {
+        if (pr.name_id != NO_DATA && pr.name_id >= base) {
             auto [it, fresh] = home.emplace(pr.name_id, pr.tier);
             if (!fresh) it->second = std::min(it->second, pr.tier);
         }
@@ -241,18 +230,17 @@ TEST(poi_dir_strings_hold_the_names_of_the_dirs_pois) {
     uint64_t seed = 37;
     auto rnd = [&](uint32_t n) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33) % n; };
     std::vector<std::pair<std::string, uint8_t>> names;
-    for (int i = 0; i < 20000; i++) names.push_back({"poi " + std::to_string(rnd(5000)), static_cast<uint8_t>(rnd(5))});
+    for (int i = 0; i < 20000; i++) names.push_back({"poi " + std::to_string(rnd(5000)), static_cast<uint8_t>(rnd(4))});
     ParsedData d = poi_build(names);
     // Before the ordering every dir ships the whole tier.
     CHECK_EQ(poi_dir_strings(d, 1).size(), d.strings_tiers[STR_TIER_POI].size());
     order_poi_strings_by_record(d);
     const uint32_t base = d.strings_tier_bases[STR_TIER_POI];
     std::unordered_map<uint32_t, uint8_t> home;
-    for (const auto& pr : d.poi_records)
-        if (pr.tier <= POI_MAX_SHIPPED_TIER) {
-            auto [it, fresh] = home.emplace(pr.name_id, pr.tier);
-            if (!fresh) it->second = std::min(it->second, pr.tier);
-        }
+    for (const auto& pr : d.poi_records) {
+        auto [it, fresh] = home.emplace(pr.name_id, pr.tier);
+        if (!fresh) it->second = std::min(it->second, pr.tier);
+    }
     for (uint8_t t = 0; t <= POI_MAX_SHIPPED_TIER; t++) {
         const std::string_view head = poi_dir_strings(d, t);
         CHECK(std::string_view(d.strings_tiers[STR_TIER_POI].data(), head.size()) == head);
@@ -269,7 +257,7 @@ TEST(poi_dir_strings_hold_the_names_of_the_dirs_pois) {
     CHECK_EQ(poi_dir_strings(d, POI_MAX_SHIPPED_TIER).size(), d.strings_tiers[STR_TIER_POI].size());
 }
 
-TEST(order_poi_strings_puts_names_no_shipped_record_uses_last) {
+TEST(order_poi_strings_puts_names_no_record_uses_last) {
     // Partitioning never leaves such a name; the order stays a permutation.
     ParsedData d;
     const std::string bytes("a\0b\0c\0", 6);
@@ -298,6 +286,21 @@ TEST(order_poi_strings_refuses_a_pool_that_is_not_the_tiers) {
     d.string_pool.mutable_data().push_back('x');
     CHECK_EQ(refusal_of<std::logic_error>([&] { order_poi_strings_by_record(d); }),
              std::string("order_poi_strings_by_record: the pool is not the tiers back to back"));
+}
+
+TEST(order_poi_strings_refuses_a_poi_of_a_tier_no_dir_ships) {
+    // classify_poi gives no POI such a tier; its name would have no place.
+    ParsedData d = poi_build({{"zoo", 1}, {"bank", POI_MAX_SHIPPED_TIER + 1}});
+    CHECK_EQ(refusal_of<std::logic_error>([&] { order_poi_strings_by_record(d); }),
+             std::string("order_poi_strings_by_record: a POI of a tier no dir ships"));
+}
+
+TEST(order_poi_strings_refuses_a_poi_of_a_tier_no_dir_ships_with_no_poi_names) {
+    // Its name is a boundary's too, so it lives in core and the POI tier is empty.
+    ParsedData d = poi_build({{"Main", POI_MAX_SHIPPED_TIER + 1}}, {"Main"});
+    CHECK(d.strings_tiers[STR_TIER_POI].empty());
+    CHECK_EQ(refusal_of<std::logic_error>([&] { order_poi_strings_by_record(d); }),
+             std::string("order_poi_strings_by_record: a POI of a tier no dir ships"));
 }
 
 // --- partition_strings_into_tiers ---
