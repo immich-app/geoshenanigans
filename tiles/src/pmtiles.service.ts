@@ -23,6 +23,10 @@ export class DirectoryString {
 
     const lines = this.entry.split(':');
     for (const line of lines) {
+      // Every segment ends with ':', so the last one is empty.
+      if (line === '') {
+        continue;
+      }
       const parts = line.split('|');
       if (parts.length === 2) {
         tileIdStart = fromRadix64(parts[0]);

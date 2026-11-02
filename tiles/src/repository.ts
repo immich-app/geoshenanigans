@@ -33,8 +33,8 @@ export class CloudflareD1Repository implements IDatabaseRepository {
     metric
       .durationField('duration')
       .addTag('query', query)
-      .addTag('served_by_region', resp.meta.served_by_region as string)
-      .addTag('served_by_primary', (resp.meta.served_by_primary as boolean).toString())
+      .addTag('served_by_region', String(resp.meta.served_by_region))
+      .addTag('served_by_primary', String(resp.meta.served_by_primary))
       .intField('rows_read', resp.meta.rows_read)
       .intField('sql_duration', resp.meta.duration)
       .intField('count', 1);
@@ -64,6 +64,7 @@ export class TigrisStorageRepository implements IStorageRepository {
     private bucketKey: string,
     private deploymentKey: string,
     private metrics: IMetricsRepository,
+    private storagePrefix = '',
   ) {
     this.client = new S3Client({
       region: 'auto',
@@ -81,7 +82,7 @@ export class TigrisStorageRepository implements IStorageRepository {
     const metric = Metric.create('tigris_storage_get');
     const command = new GetObjectCommand({
       Bucket: this.bucketKey,
-      Key: this.deploymentKey + '/' + args.key,
+      Key: `${this.storagePrefix}${this.deploymentKey}/${args.key}`,
       Range: range ? `bytes=${range.offset}-${range.offset + range.length - 1}` : undefined,
     });
     const response = await this.client.send(command);
