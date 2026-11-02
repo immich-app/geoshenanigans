@@ -15,9 +15,10 @@ on:
         required: false
         type: string
       runner:
+        # pokedex-giant is the one large runner (750 GiB scratch); the nightly geocoder build holds it around 06:20 UTC.
         description: 'Runner for the download and upload (needs ~200 GB of free disk)'
         required: false
-        default: pokedex-massive
+        default: pokedex-giant
         type: string
 
 permissions: {}
