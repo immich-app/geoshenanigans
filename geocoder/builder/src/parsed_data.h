@@ -205,8 +205,9 @@ constexpr uint8_t STR_TIER_BIT_POSTCODE = 1 << 3;  // postcode strings (any cons
 constexpr uint8_t STR_TIER_BIT_POI      = 1 << 4;  // poi_records.name_id
 // Strings of POI candidates no POI tier ships (tier > POI_MAX_SHIPPED_TIER).
 constexpr uint8_t STR_TIER_BIT_UNSHIPPED = 1 << 5;
-// string_home_tier for a string only unshipped records use: it isn't written
-// (planet: 2.4M names, 53 MiB of strings_poi.bin no output referenced).
+// string_home_tier for a string no shipped record uses, such as an unshipped
+// POI's name (planet: 2.4M, 53 MiB) or an addr:street value the parent
+// street replaced: it isn't written.
 constexpr uint8_t STR_TIER_NONE = 0xFF;
 
 constexpr size_t STR_TIER_COUNT = 5;
@@ -228,11 +229,12 @@ constexpr size_t STR_TIER_POI = 4;
 // downloads them (core: every mode; postcode: admin and up; street:
 // no-addresses and up; addr: full only), so the most widely downloaded
 // consumer tier serves every consumer. The poi tier ships with any mode, so a
-// string a POI shares with anything outside core needs core.
+// string a POI shares with anything outside core needs core. A string no
+// shipped record uses has no home.
 inline uint8_t string_home_tier(uint8_t mask) {
-    if (mask == STR_TIER_BIT_UNSHIPPED) return STR_TIER_NONE;
     mask &= static_cast<uint8_t>(~STR_TIER_BIT_UNSHIPPED);
-    if (mask == 0 || (mask & STR_TIER_BIT_CORE)) return 0;
+    if (mask == 0) return STR_TIER_NONE;
+    if (mask & STR_TIER_BIT_CORE) return 0;
     if (mask & STR_TIER_BIT_POI) return (mask & ~STR_TIER_BIT_POI) ? 0 : 4;
     if (mask & STR_TIER_BIT_POSTCODE) return 3;
     if (mask & STR_TIER_BIT_STREET) return 1;
@@ -570,9 +572,9 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
         }, threads);
     }
 
-    // Each tier's string offsets in alphabetical order. Strings only
-    // unshipped records use aren't written; their references become NO_DATA
-    // below like any offset missing from the layout.
+    // Each tier's string offsets in alphabetical order. Strings no shipped
+    // record uses aren't written; unshipped records' references to them
+    // become NO_DATA below like any offset missing from the layout.
     std::array<std::vector<uint32_t>, STR_TIER_COUNT> sorted;
     {
         const std::vector<uint32_t> offsets = starts.ones(threads);

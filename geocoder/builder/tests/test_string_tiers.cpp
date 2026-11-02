@@ -1,4 +1,5 @@
-// Unit tests for string_home_tier and string_starts (parsed_data.h).
+// Unit tests for string_home_tier, string_starts, order_poi_strings_by_record
+// and partition_strings_into_tiers (parsed_data.h).
 #include "parsed_data.h"
 
 #include "test_framework.h"
@@ -21,7 +22,6 @@ TEST(string_home_tier_picks_the_most_widely_downloaded_consumer_tier) {
     // Tier indices: 0 core, 1 street, 2 addr, 3 postcode, 4 poi.
     struct Case { uint8_t mask; uint8_t tier; };
     const Case cases[] = {
-        {0, 0},
         {STR_TIER_BIT_CORE, 0},
         {STR_TIER_BIT_STREET, 1},
         {STR_TIER_BIT_ADDR, 2},
@@ -38,8 +38,10 @@ TEST(string_home_tier_picks_the_most_widely_downloaded_consumer_tier) {
         {STR_TIER_BIT_POI | STR_TIER_BIT_POSTCODE, 0},
         {STR_TIER_BIT_POI | STR_TIER_BIT_CORE, 0},
         {STR_TIER_BIT_CORE | STR_TIER_BIT_STREET | STR_TIER_BIT_ADDR, 0},
-        // Strings only POI candidates no tier ships use aren't written;
-        // shared with a shipped consumer, they live where that one needs.
+        // Strings no shipped record uses (no record, or only POI candidates
+        // no tier ships) aren't written; shared with a shipped consumer, they
+        // live where that one needs.
+        {0, STR_TIER_NONE},
         {STR_TIER_BIT_UNSHIPPED, STR_TIER_NONE},
         {STR_TIER_BIT_UNSHIPPED | STR_TIER_BIT_STREET, 1},
         {STR_TIER_BIT_UNSHIPPED | STR_TIER_BIT_POI, 4},
@@ -285,4 +287,20 @@ TEST(order_poi_strings_refuses_a_pool_that_is_not_the_tiers) {
     d.string_pool.mutable_data().push_back('x');
     CHECK_EQ(refusal_of<std::logic_error>([&] { order_poi_strings_by_record(d); }),
              std::string("order_poi_strings_by_record: the pool is not the tiers back to back"));
+}
+
+// --- partition_strings_into_tiers ---
+
+TEST(partition_writes_no_string_no_record_uses) {
+    // An addr:street value parent linking replaced by its street's name:
+    // still in the pool, but no record holds it.
+    ParsedData d;
+    d.string_pool.intern("Viale Bonatelli 43, 25032 Chiari (BS)");
+    AdminPolygon ap{};
+    ap.name_id = d.string_pool.intern("Chiari");
+    d.admin_polygons.push_back(ap);
+    partition_strings_into_tiers(d);
+    CHECK(tiers_back_to_back(d) == std::string("Chiari\0", 7));
+    CHECK_EQ(d.strings_tier_bases[STR_TIER_COUNT], 7u);
+    CHECK_EQ(d.admin_polygons[0].name_id, 0u);
 }

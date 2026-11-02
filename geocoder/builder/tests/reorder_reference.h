@@ -1,6 +1,7 @@
-// The serial deterministic-ordering steps as of d77ab8e, verbatim save one
-// change: the addr and way steps list each survivor once per cell, as the
-// interp step did. They give the byte layout the parallel steps in
+// The serial deterministic-ordering steps as of d77ab8e, verbatim save two
+// changes: the addr and way steps list each survivor once per cell, as the
+// interp step did, and a string no record uses gets no tier
+// (string_home_tier). They give the byte layout the parallel steps in
 // reorder.h and parsed_data.h must reproduce for any input and thread count
 // (test_reorder.cpp).
 #pragma once
@@ -81,8 +82,9 @@ inline void partition_strings_into_tiers(ParsedData& data) {
         return string_home_tier(it != tier_mask.end() ? it->second : 0);
     };
 
-    // Strings only unshipped records use aren't written; their references
-    // become NO_DATA below like any offset missing from the layout.
+    // Strings no shipped record uses aren't written; unshipped records'
+    // references to them become NO_DATA below like any offset missing from
+    // the layout.
     strings.erase(std::remove_if(strings.begin(), strings.end(),
                                  [&](const auto& s) { return home_tier(s.first) == STR_TIER_NONE; }),
                   strings.end());
