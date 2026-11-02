@@ -131,8 +131,6 @@ impl Geo {
         }
         let (admin_cells, admin_entries) = cell_files(admin);
         let nodes: Vec<u8> = self.nodes.iter().flat_map(node_bytes).collect();
-        let (place_cells, place_entries) =
-            cell_files(self.nodes.iter().enumerate().map(|(i, p)| (cell(p.lat, p.lng), i as u32)).collect());
         let end = self.strings.len();
         let tiers: Vec<String> = (0..STR_TIER_COUNT)
             .map(|t| format!("{{\"start\": {}, \"end\": {end}}}", if t == 0 { 0 } else { end }))
@@ -140,7 +138,7 @@ impl Geo {
         let mut files = vec![
             ("admin_polygons.bin", polygons), ("admin_vertices.bin", vertices),
             ("admin_cells.bin", admin_cells), ("admin_entries.bin", admin_entries),
-            ("place_nodes.bin", nodes), ("place_cells.bin", place_cells), ("place_entries.bin", place_entries),
+            ("place_nodes.bin", nodes),
             ("strings_core.bin", self.strings.clone()),
             ("strings_layout.json", format!("{{\"tiers\": [{}]}}", tiers.join(", ")).into_bytes()),
         ];

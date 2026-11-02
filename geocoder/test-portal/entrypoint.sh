@@ -64,10 +64,11 @@ else
         # Everything comes from the admin-minimal/ subdir (filtered: admin
         # polygon IDs in [L2..L8], place types in {city,town,village,hamlet}):
         # its own polygons re-simplified at q2.5, cell index, place_nodes,
-        # core strings and layout.
+        # core strings and layout. The server derives the place index from
+        # place_nodes.bin at its first load.
         admin_minimal_files="admin_cells.bin admin_entries.bin
                              admin_polygons.bin admin_vertices.bin
-                             place_cells.bin place_entries.bin place_nodes.bin
+                             place_nodes.bin
                              strings_core.bin strings_layout.json"
         echo "Downloading admin-minimal mode files..."
         for f in $admin_minimal_files; do
@@ -86,7 +87,7 @@ else
                     addr_entries.bin addr_points.bin addr_vertices.bin addr_postcodes.bin
                     interp_entries.bin interp_ways.bin interp_nodes.bin interp_postcodes.bin
                     admin_cells.bin admin_entries.bin admin_parents.bin
-                    place_cells.bin place_entries.bin place_nodes.bin
+                    place_nodes.bin
                     postcode_centroids.bin postcode_centroid_cells.bin postcode_centroid_entries.bin
                     way_parents.bin way_postcodes.bin
                     strings_core.bin strings_street.bin strings_addr.bin

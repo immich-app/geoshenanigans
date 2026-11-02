@@ -39,13 +39,16 @@ A complete geocoder index for a given region and configuration consists of files
 
 | Mode | Files | Description |
 |------|-------|-------------|
-| `full/` | 24 files (+4 optional) | Streets + addresses + interpolation + admin + postcodes |
-| `no-addresses/` | 16 files (+3 optional) | Streets + admin + postcodes (no address points) |
-| `admin/` | 8 files (+3 optional) | Admin cell indexes + place nodes + postcodes |
-| `admin-minimal/` | 9 files | Admin levels 2-8 + place nodes, with its own q2.5 polygons (takes the place of the quality dir, so pick q2.5) |
+| `full/` | 22 files (+4 optional) | Streets + addresses + interpolation + admin + postcodes |
+| `no-addresses/` | 14 files (+3 optional) | Streets + admin + postcodes (no address points) |
+| `admin/` | 6 files (+3 optional) | Admin cell indexes + place nodes + postcodes |
+| `admin-minimal/` | 7 files | Admin levels 2-8 + place nodes, with its own q2.5 polygons (takes the place of the quality dir, so pick q2.5) |
 
 Optional files are written only when the data has them; see `optional_files`
 under configurations.json below.
+
+No dir ships the place nodes' cell index: the first load of an index dir
+derives it from `place_nodes.bin` into `<dir>/derived/` (see Fresh Install).
 
 ### Quality directory (pick one)
 
@@ -78,7 +81,7 @@ The entry point for all clients:
 ```json
 {
   "build_version": 2,
-  "patch_version": 12,
+  "patch_version": 13,
   "latest": "2026-04-10",
   "previous": "2026-04-09",
   "oldest_indexes": "2026-04-08",
@@ -109,7 +112,7 @@ files belong to each axis value), constraints, presets, and the flat
   "schema_version": 1,
   "build": {
     "version": 15,
-    "patch_version": 12,
+    "patch_version": 13,
     "date": "2026-04-10",
     "previous": "2026-04-09",
     "built_at": "2026-04-10T09:00:14Z",
@@ -157,6 +160,21 @@ the `.bin` files, because the server can't load a region without them.
 6. Store build_version, patch_version, and date locally
 ```
 
+The first load of the dir (the server, the node binding, `grid_query`)
+derives the place index from `place_nodes.bin` into `<dir>/derived/`:
+`place_cells.idx`, `place_entries.idx` and `place_index.json`, which records
+what they were derived from (place_nodes.bin's size, mtime, inode and
+sha256, and the cell level). Planet admin (4.1M place nodes) takes about a
+second on one core, with a heap peak of 5.4 MiB. Later loads map them while
+`place_nodes.bin` keeps its stat, or its sha256 when the files were copied.
+Where `<dir>` can't be written, the index goes to a private dir under
+`$TMPDIR` instead, one per user and dataset dir
+(`geocoder-place-index-<uid>-<sha256 of the dir's path>`, mode 0700; a load
+refuses one another user owns or can open), checked the same way.
+A pack or an image that bundles a dataset only has to load it once when it
+is built: the `derived/` that load writes comes along, and loads from the
+copy use it as is.
+
 ### Daily Update (patching)
 
 ```
@@ -187,7 +205,8 @@ string tier it rebuilds, and the tool fails when one differs. A size check
 only catches a file from another build when its size changed; the string
 tiers' hashes are the content check. The server combines a mode dir with a
 quality or poi dir by global string offsets, so patch every selected dir to
-the same date and swap the whole set in together.
+the same date and swap the whole set in together. The first load of the
+patched set derives its place index again.
 
 ### Version Mismatch
 

@@ -468,7 +468,7 @@ static bool same_bytes(const char* a, size_t an, const char* b, size_t bn) {
 // whatever the string remap makes of its fields. Its merge is then one MATCH
 // of every record with no id remap and no secondary pairs, so the entry
 // corrections, the street remap of the addresses, the side files and the
-// POI / place cell indexes start from the ids the patcher keeps.
+// POI cell index start from the ids the patcher keeps.
 static bool sent_unchanged(const char* a, size_t an, const char* b, size_t bn) {
     return an > 0 && same_bytes(a, an, b, bn);
 }
@@ -1567,7 +1567,7 @@ static int run(int argc, char* argv[]) {
     });
 
     // Group 6: cell changes
-    std::vector<uint64_t> g_added, g_removed, a_added, a_removed, p_added, p_removed, pl_added, pl_removed;
+    std::vector<uint64_t> g_added, g_removed, a_added, a_removed, p_added, p_removed;
     std::thread t_cells([&]() {
         double gs = now_ms();
         auto diff_cells = [](const std::string& old_path, const std::string& new_path,
@@ -1582,7 +1582,6 @@ static int run(int argc, char* argv[]) {
         diff_cells(old_dir + "/geo_cells.bin", new_dir + "/geo_cells.bin", 20, g_added, g_removed);
         diff_cells(old_dir + "/admin_cells.bin", new_dir + "/admin_cells.bin", 12, a_added, a_removed);
         diff_cells(old_dir + "/poi_cells.bin", new_dir + "/poi_cells.bin", 12, p_added, p_removed);
-        diff_cells(old_dir + "/place_cells.bin", new_dir + "/place_cells.bin", 12, pl_added, pl_removed);
         log_time("  group:cell_changes", gs);
     });
 
@@ -1616,19 +1615,12 @@ static int run(int argc, char* argv[]) {
         // files are in slot order, not (type, name, lat, lng) order. The
         // key-sorted merge this replaced re-sent nearly the whole file daily
         // (planet: 3.1M of 4.1M places secondary-matched).
+        // No id remap: no file the patch rebuilds holds place node ids (the
+        // place cell index ships in no dir).
         auto pn_seq = unchanged ? match_all(old_data.size / place_stride)
                                 : build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, place_stride);
-        auto soft = secondary_match_from_merge(pn_seq, old_data.data, old_data.size,
-            new_data.data, new_data.size, place_stride,
-            [](const char* rec) -> uint64_t {
-                uint32_t name_id; memcpy(&name_id, rec + 8, 4);
-                uint8_t place_type = static_cast<uint8_t>(rec[12]);
-                return ((uint64_t)name_id << 8) | place_type;
-            });
-        auto id_rm = derive_id_remap_from_merge(pn_seq, old_data.size / place_stride, place_stride);
-        for (auto& [o,n] : soft) if (o < id_rm.size()) id_rm[o] = n;
         res_place_n = {PatchFileId::PLACE_NODES, "place_nodes.bin", place_stride,
-                       old_data.size, new_data.size, pn_seq, {}, std::move(soft), std::move(id_rm)};
+                       old_data.size, new_data.size, pn_seq, {}};
         log_merge(res_place_n);
         if (old_data.data) unmap_file(old_data);
         if (new_data.data) unmap_file(new_data);
@@ -1772,17 +1764,7 @@ static int run(int argc, char* argv[]) {
             if (vec[i] != NO_DATA) poi_rm_d[i] = vec[i];
         for (auto& [o,n] : res_poi_r.secondary_matches) poi_rm_d[o] = n;
     }
-    std::unordered_map<uint32_t,uint32_t> place_rm_d;
-    if (res_place_n.old_size > 0 || res_place_n.new_size > 0) {
-        auto vec = derive_id_remap_from_merge(
-            res_place_n.seq,
-            res_place_n.old_size / place_stride, place_stride);
-        place_rm_d.reserve(vec.size());
-        for (uint32_t i = 0; i < vec.size(); i++)
-            if (vec[i] != NO_DATA) place_rm_d[i] = vec[i];
-        for (auto& [o,n] : res_place_n.secondary_matches) place_rm_d[o] = n;
-    }
-    log_time("Admin+POI+Place remap", t0);
+    log_time("Admin+POI remap", t0);
 
     // old_geo no longer needed as a vector — streaming corrections use mmap directly
 
@@ -1800,18 +1782,13 @@ static int run(int argc, char* argv[]) {
       wval(patch, &marker, 4); wval(patch, &na, 4); wval(patch, &nr, 4);
       for (auto c : p_added) wval(patch, &c, 8); for (auto c : p_removed) wval(patch, &c, 8);
       std::cerr << "  POI cell changes: +" << na << " -" << nr << std::endl; }
-    { uint32_t marker = CELL_CHANGES_PLACE_MARKER, na = pl_added.size(), nr = pl_removed.size();
-      wval(patch, &marker, 4); wval(patch, &na, 4); wval(patch, &nr, 4);
-      for (auto c : pl_added) wval(patch, &c, 8); for (auto c : pl_removed) wval(patch, &c, 8);
-      std::cerr << "  Place cell changes: +" << na << " -" << nr << std::endl; }
 
     // Emit secondary remap section (from merge results, no re-reads)
     std::cerr << "  Secondary matches: ways=" << res_ways.secondary_matches.size()
               << " addr=" << res_addr.secondary_matches.size()
               << " interp=" << res_interp_w.secondary_matches.size()
               << " admin=" << res_admin_p.secondary_matches.size()
-              << " poi=" << res_poi_r.secondary_matches.size()
-              << " place=" << res_place_n.secondary_matches.size() << std::endl;
+              << " poi=" << res_poi_r.secondary_matches.size() << std::endl;
     SEC("secondary_remap");
     { uint32_t marker = SECONDARY_REMAP_MARKER; wval(patch, &marker, 4);
       auto emit_remap = [&](PatchFileId fid, const std::unordered_map<uint32_t,uint32_t>& rm) {
@@ -1820,13 +1797,12 @@ static int run(int argc, char* argv[]) {
           append_remap_pairs(patch, rm);
       };
       // Admin pairs travel in the parent-id remap instead.
-      uint32_t n_files = 5; wval(patch, &n_files, 4);
+      uint32_t n_files = 4; wval(patch, &n_files, 4);
       // v8: street pairs already went in the parent-id remap.
       emit_remap(PatchFileId::STREET_WAYS, street_pairs_in_parent_remap ? no_pairs : res_ways.secondary_matches);
       emit_remap(PatchFileId::ADDR_POINTS, res_addr.secondary_matches);
       emit_remap(PatchFileId::INTERP_WAYS, res_interp_w.secondary_matches);
       emit_remap(PatchFileId::POI_RECORDS, res_poi_r.secondary_matches);
-      emit_remap(PatchFileId::PLACE_NODES, res_place_n.secondary_matches);
     }
 
     // --- Streaming entry corrections ---
@@ -1888,7 +1864,7 @@ static int run(int argc, char* argv[]) {
     log_rss("geo corrections");
 
     // The delta from a cell index as the patcher rebuilds it from an id remap
-    // (admin / POI / place) to the new one, for every index the old or the new
+    // (admin / POI) to the new one, for every index the old or the new
     // dir holds. The patcher writes write_cell_lists layout: a new index in
     // any other can't be rebuilt, and the diff never silently falls back.
     auto emit_cell_index_delta = [&](PatchFileId entries_fid, const std::string& prefix,
@@ -1914,7 +1890,6 @@ static int run(int argc, char* argv[]) {
     };
     emit_cell_index_delta(PatchFileId::ADMIN_ENTRIES, "admin", ad_rm_d, a_added, a_removed);
     emit_cell_index_delta(PatchFileId::POI_ENTRIES, "poi", poi_rm_d, p_added, p_removed);
-    emit_cell_index_delta(PatchFileId::PLACE_ENTRIES, "place", place_rm_d, pl_added, pl_removed);
 
     log_time("Entry corrections", t1);
     // No CELL_FLAGS section: every cell whose street / addr / interp list

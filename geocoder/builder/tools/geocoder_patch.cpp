@@ -8,11 +8,11 @@
 //
 // Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--threads] [--file-records-max N]
 //
-// Reads GCPATCH v12 (REPLACE runs, street remap derived from the
+// Reads GCPATCH v13 (REPLACE runs, street remap derived from the
 // street_ways replay, PARALLEL_DELTA_STRIDE side files, unmapped ids dropped
 // from street / addr / interp cell lists, a cell index delta for every admin /
-// POI / place index, remap pairs ascending, and the MATCH records' string
-// fixups).
+// POI index and none for places, remap pairs ascending, and the MATCH records'
+// string fixups).
 //
 // Low-memory mode: when <current-dir> is an encoded installed set (it has a
 // gc.manifest, see gcs_patch.h), the encoded families' old files are decoded
@@ -515,7 +515,7 @@ static int run(int argc, char* argv[]) {
     std::unordered_map<uint32_t, RecordRemap> record_remaps;
     // The rebuilds' cell changes and per-cell corrections, read in place
     // as their walks reach them.
-    CellChanges geo_cells, admin_cells, poi_cells, place_cells;
+    CellChanges geo_cells, admin_cells, poi_cells;
     EntriesFileSections geo_deltas("geo entry delta", GEO_ENTRIES_FILES);
     EntriesFileSections cell_index_deltas("cell index delta", CELL_INDEX_ENTRIES_FILES);
     // POI parent-id remap (from POI_PARENT_REMAP_MARKER), read where it sits.
@@ -593,7 +593,6 @@ static int run(int argc, char* argv[]) {
         if (file_id == CELL_CHANGES_GEO_MARKER) { geo_cells = read_cell_changes("Geo"); continue; }
         if (file_id == CELL_CHANGES_ADMIN_MARKER) { admin_cells = read_cell_changes("Admin"); continue; }
         if (file_id == CELL_CHANGES_POI_MARKER) { poi_cells = read_cell_changes("POI"); continue; }
-        if (file_id == CELL_CHANGES_PLACE_MARKER) { place_cells = read_cell_changes("Place"); continue; }
         if (file_id == GEO_ENTRY_DELTA_MARKER) {
             uint32_t fid = patch.u32(), c = patch.u32();
             geo_deltas.add(fid, scan_geo_list_deltas(P, patch_size, pos, c));
@@ -946,7 +945,7 @@ static int run(int argc, char* argv[]) {
         auto child_bytes = [&](const char* rec) { return child_bytes_of(file_id, rec, *jc); };
 
         // Record the old → new record ids of the files whose remap the entry
-        // pipeline reads back (geo, POI and place indexes).
+        // pipeline reads back (geo and POI indexes).
         const bool track = is_remapped_record_file(file_id);
         RecordRemap remap(track ? static_cast<uint32_t>(n_old_records) : 0, tmpdir);
         // v8: addresses' parent_way_id moves by the street replay's remap
@@ -1355,7 +1354,7 @@ static int run(int argc, char* argv[]) {
         log_phase("  Geo entries complete", t_entry);
         }  // geo walk
 
-        // An admin / POI / place index the old dir holds or the new one lists
+        // An admin / POI index the old dir holds or the new one lists
         // is rebuilt and corrected by its cell index delta in one streaming
         // pass over the old files, holding one cell at a time.
         auto rebuild_cell_index = [&](const char* label, PatchFileId entries_fid, const std::string& prefix,
@@ -1385,13 +1384,10 @@ static int run(int argc, char* argv[]) {
         // Admin ids move by the admin leg of the parent-id remap, as the diff used it.
         rebuild_cell_index("Admin", PatchFileId::ADMIN_ENTRIES, "admin", admin_cells,
                            [&](uint32_t id) { return poi_remap_lookup(poi_admin_remap, id); });
-        // POI and place ids move by their replay's record remap, read in place
-        // by the streaming pass (by id, so not as a sequential stream).
-        auto record_remap = [&](PatchFileId records_fid) {
-            return [&rm = remap_of(records_fid)](uint32_t id) { uint32_t v = rm[id]; return v == 0xFFFFFFFFu ? id : v; };
-        };
-        rebuild_cell_index("POI", PatchFileId::POI_ENTRIES, "poi", poi_cells, record_remap(PatchFileId::POI_RECORDS));
-        rebuild_cell_index("Place", PatchFileId::PLACE_ENTRIES, "place", place_cells, record_remap(PatchFileId::PLACE_NODES));
+        // POI ids move by their replay's record remap, read in place by the
+        // streaming pass (by id, so not as a sequential stream).
+        rebuild_cell_index("POI", PatchFileId::POI_ENTRIES, "poi", poi_cells,
+                           [&rm = remap_of(PatchFileId::POI_RECORDS)](uint32_t id) { uint32_t v = rm[id]; return v == 0xFFFFFFFFu ? id : v; });
     }
 
     unmap_file(patch_map);
