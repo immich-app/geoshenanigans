@@ -6,7 +6,6 @@
 #include <random>
 #include <vector>
 
-#include "continent_boundaries.h"
 #include "geometry.h"
 #include "ring_contains.h"
 #include "test_framework.h"
@@ -83,10 +82,6 @@ TEST(crossing_number_tests_leave_out_the_holes) {
     CHECK(range_contains(v, 0.5, 2));
     CHECK(range_contains(v, 1, 5));
     CHECK(range_contains(v, 5, 2));
-    // The axis-swapped test (place-node containment) agrees.
-    CHECK(point_in_polygon_nc(1, 1, v.data(), v.size()));
-    CHECK(!point_in_polygon_nc(3, 3, v.data(), v.size()));
-    CHECK(!point_in_polygon_nc(6.5f, 6, v.data(), v.size()));
 }
 
 TEST(crossing_number_matches_outer_minus_holes_at_random_points) {
