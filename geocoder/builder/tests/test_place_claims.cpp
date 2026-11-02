@@ -170,3 +170,42 @@ TEST(place_claims_subset_without_the_claimant_names_no_boundary) {
     CHECK_EQ(visible.parent_poly_id, NO_DATA);
     CHECK_EQ(visible._pad1, 0);
 }
+
+TEST(place_claims_admin_minimal_shows_a_node_whose_claimant_it_leaves_out) {
+    // admin-minimal's remap: polygon 0 (an L8) ships in slot 0, polygon 1 (an
+    // L9 or L10) is left out.
+    const std::vector<uint32_t> minimal{0, NO_DATA};
+
+    // The claimant ships: the node stays hidden, its label point.
+    PlaceNode shipped = place(10, 0);
+    shipped._pad1 = PLACE_FLAG_HIDDEN | PLACE_FLAG_LABEL_OF;
+    remap_place_parent_unhiding_orphans(shipped, minimal);
+    CHECK_EQ(shipped.parent_poly_id, 0u);
+    CHECK_EQ(shipped._pad1, PLACE_FLAG_HIDDEN | PLACE_FLAG_LABEL_OF);
+    CHECK(place_node_hidden(shipped));
+
+    // The claimant is left out: nothing stands for the node, which answers as
+    // a place again, under its own name.
+    PlaceNode orphan = place(11, 1);
+    orphan._pad1 = PLACE_FLAG_HIDDEN | PLACE_FLAG_LABEL_OF;
+    remap_place_parent_unhiding_orphans(orphan, minimal);
+    CHECK_EQ(orphan.parent_poly_id, NO_DATA);
+    CHECK_EQ(orphan._pad1, 0);
+    CHECK_EQ(orphan.name_id, 11u);
+    CHECK(!place_node_hidden(orphan));
+
+    // Claimed by a boundary without a polygon (its parent is the containing
+    // polygon, left out here): hidden in every set.
+    PlaceNode no_polygon = place(12, 1);
+    no_polygon._pad1 = PLACE_FLAG_HIDDEN;
+    remap_place_parent_unhiding_orphans(no_polygon, minimal);
+    CHECK_EQ(no_polygon.parent_poly_id, NO_DATA);
+    CHECK_EQ(no_polygon._pad1, PLACE_FLAG_HIDDEN);
+    CHECK(place_node_hidden(no_polygon));
+
+    PlaceNode visible = place(13, 1);
+    remap_place_parent_unhiding_orphans(visible, minimal);
+    CHECK_EQ(visible.parent_poly_id, NO_DATA);
+    CHECK_EQ(visible._pad1, 0);
+    CHECK(!place_node_hidden(visible));
+}

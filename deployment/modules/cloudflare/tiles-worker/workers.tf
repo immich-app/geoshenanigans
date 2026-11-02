@@ -18,6 +18,14 @@ resource "cloudflare_workers_script" "tiles" {
     text = var.env
   }
 
+  dynamic "plain_text_binding" {
+    for_each = var.storage_prefix == "" ? [] : [var.storage_prefix]
+    content {
+      name = "STORAGE_PREFIX"
+      text = plain_text_binding.value
+    }
+  }
+
   secret_text_binding {
     name = "VMETRICS_API_TOKEN"
     text = var.vmetrics_api_token
