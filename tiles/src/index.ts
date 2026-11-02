@@ -36,6 +36,8 @@ type PMTilesTileParams = PMTilesParams & {
   z: string;
   x: string;
   y: string;
+  // From ?v=, which the TileJSON adds so each deployment's tiles have their own URLs.
+  deploymentKey?: string;
 };
 
 type PMTilesJsonParams = PMTilesParams & {
@@ -61,6 +63,53 @@ enum Header {
   CONTENT_TYPE = 'Content-Type',
   CONTENT_ENCODING = 'Content-Encoding',
   SERVER_TIMING = 'Server-Timing',
+  ETAG = 'ETag',
+  IF_NONE_MATCH = 'If-None-Match',
+  CACHE_REVISION = 'Tiles-Cache-Revision',
+}
+
+// Bump when the body the worker sends for the same URL and deployment changes (e.g. the TileJSON), so the CDN cache
+// stops returning responses stored before that change. Cache headers don't need it: CDN hits get the current policy's.
+const CACHE_REVISION = '2';
+
+const DAY_SECONDS = 60 * 60 * 24;
+// What points clients at a deployment (TileJSON, styles) is rechecked every few minutes, so a deploy reaches them
+// quickly; an unchanged one costs a bodiless 304.
+const POINTER_CACHE = 'public, max-age=300';
+
+export type CachePolicy = { cacheControl: string; etag?: string };
+
+/**
+ * How long clients keep a response. A tile URL with ?v=<live key> never changes, so it's immutable. Anything else
+ * can change with the next deployment: it carries the live key as its ETag, so clients revalidate it cheaply (a 304
+ * while the deployment is unchanged) once it goes stale.
+ */
+export function cachePolicy(params: PMTilesParams, liveDeploymentKey: string): CachePolicy {
+  const etag = `"${liveDeploymentKey}"`;
+  switch (params.requestType) {
+    case 'tile': {
+      const requested = (params as PMTilesTileParams).deploymentKey;
+      if (requested === undefined) {
+        // Shown straight from cache for up to 30 days, refreshed in the background once a day old.
+        return { cacheControl: `public, max-age=${DAY_SECONDS}, stale-while-revalidate=${30 * DAY_SECONDS}`, etag };
+      }
+      // Another key comes from a client whose TileJSON predates a deploy: it gets the live tile, kept only until that
+      // TileJSON is rechecked.
+      return requested === liveDeploymentKey
+        ? { cacheControl: `public, max-age=${365 * DAY_SECONDS}, immutable` }
+        : { cacheControl: POINTER_CACHE };
+    }
+    case 'json':
+    case 'style':
+      return { cacheControl: POINTER_CACHE, etag };
+    default:
+      return { cacheControl: `public, max-age=${31 * DAY_SECONDS}` };
+  }
+}
+
+/** Whether an If-None-Match header names the ETag, weak or strong ("*" is left to a full response). */
+export function etagMatches(ifNoneMatch: string | null, etag: string): boolean {
+  return (ifNoneMatch ?? '').split(',').some((tag) => tag.trim().replace(/^W\//, '') === etag);
 }
 
 export function parseUrl(request: Request): PMTilesParams {
@@ -72,7 +121,16 @@ export function parseUrl(request: Request): PMTilesParams {
   const x = matches?.groups?.X;
   const y = matches?.groups?.Y;
   if (version && z && x && y) {
-    return { requestType: 'tile', version, z, x, y, url } as PMTilesTileParams;
+    const deploymentKey = url.searchParams.get('v');
+    return {
+      requestType: 'tile',
+      version,
+      z,
+      x,
+      y,
+      url,
+      ...(deploymentKey && /^\d{8}$/.test(deploymentKey) && { deploymentKey }),
+    } as PMTilesTileParams;
   } else if (style) {
     return { requestType: 'style', style, url, version } as PMTilesStyleParams;
   } else if (version) {
@@ -87,7 +145,6 @@ async function handleRequest(
   deferredRepository: CloudflareDeferredRepository,
   metrics: IMetricsRepository,
 ) {
-  const d1Repository = new CloudflareD1Repository(env.D1_GLOBAL, metrics);
   const cacheResponse = async (response: Response): Promise<Response> => {
     if (!response.body) {
       throw new Error('Response body is undefined');
@@ -135,11 +192,49 @@ async function handleRequest(
 
   const pmTilesParams = parseUrl(request);
 
+  const policy = cachePolicy(pmTilesParams, env.DEPLOYMENT_KEY);
+  const respHeaders = new Headers();
+  respHeaders.set(Header.CACHE_CONTROL, policy.cacheControl);
+  if (policy.etag) {
+    respHeaders.set(Header.ETAG, policy.etag);
+  }
+  respHeaders.set(Header.ACCESS_CONTROL_ALLOW_ORIGIN, '*');
+  respHeaders.set(Header.VARY, 'Origin');
+  respHeaders.set(Header.PMTILES_DEPLOYMENT_KEY, env.DEPLOYMENT_KEY);
+  respHeaders.set(Header.CACHE_REVISION, CACHE_REVISION);
+
+  // A successful response the client already has from the live deployment (its ETag) becomes a bodiless 304.
+  const conditional = (response: Response): Response => {
+    if (
+      !policy.etag ||
+      response.status !== 200 ||
+      !etagMatches(request.headers.get(Header.IF_NONE_MATCH), policy.etag)
+    ) {
+      return response;
+    }
+    void response.body?.cancel();
+    metrics.push(
+      Metric.create('tiles_not_modified')
+        .addTag('deployment_key', env.DEPLOYMENT_KEY)
+        .addTag('request_type', pmTilesParams.requestType ?? 'unknown')
+        .intField('count', 1),
+    );
+    const headers = new Headers(response.headers);
+    headers.delete(Header.CONTENT_ENCODING);
+    headers.delete(Header.CONTENT_TYPE);
+    headers.delete('Content-Length');
+    return new Response(null, { status: 304, headers });
+  };
+
   const cache = caches.default;
   const cached = await metrics.monitorAsyncFunction({ name: 'match_request_from_cdn' }, (url) => cache.match(url))(
     request.url,
   );
-  if (cached && cached.headers.get(Header.PMTILES_DEPLOYMENT_KEY) === env.DEPLOYMENT_KEY) {
+  if (
+    cached &&
+    cached.headers.get(Header.PMTILES_DEPLOYMENT_KEY) === env.DEPLOYMENT_KEY &&
+    cached.headers.get(Header.CACHE_REVISION) === CACHE_REVISION
+  ) {
     const metric = Metric.create('tiles_cdn_hit')
       .addTag('deployment_key', env.DEPLOYMENT_KEY)
       .addTag('request_type', pmTilesParams.requestType ?? 'unknown')
@@ -151,12 +246,16 @@ async function handleRequest(
     }
     metrics.push(metric);
     const cacheHeaders = new Headers(cached.headers);
+    // The stored copy keeps the headers it was stored with (and Cloudflare raises short max-ages to the zone's browser
+    // cache TTL on hits), so clients get the current policy's instead.
+    cacheHeaders.set(Header.CACHE_CONTROL, policy.cacheControl);
+    if (policy.etag) {
+      cacheHeaders.set(Header.ETAG, policy.etag);
+    } else {
+      cacheHeaders.delete(Header.ETAG);
+    }
     const encodeBody = cacheHeaders.has('content-encoding') ? 'manual' : 'automatic';
-    return new Response(cached.body, {
-      headers: cacheHeaders,
-      status: cached.status,
-      encodeBody,
-    });
+    return conditional(new Response(cached.body, { headers: cacheHeaders, status: cached.status, encodeBody }));
   }
 
   if (!globalThis.memCache) {
@@ -164,6 +263,7 @@ async function handleRequest(
   }
 
   const memCacheRepository = new MemCacheRepository(globalThis.memCache);
+  const d1Repository = new CloudflareD1Repository(env.D1_GLOBAL, metrics);
 
   const tigrisStorageRepository = new TigrisStorageRepository(
     env.TIGRIS_KEY_ID,
@@ -180,39 +280,34 @@ async function handleRequest(
     d1Repository,
   );
 
-  const respHeaders = new Headers();
-  respHeaders.set(Header.CACHE_CONTROL, `public, max-age=${60 * 60 * 24 * 31}`);
-  respHeaders.set(Header.ACCESS_CONTROL_ALLOW_ORIGIN, '*');
-  respHeaders.set(Header.VARY, 'Origin');
-  respHeaders.set(Header.PMTILES_DEPLOYMENT_KEY, env.DEPLOYMENT_KEY);
-
   try {
     if (pmTilesParams.requestType === 'tile') {
-      const { z, x, y, version } = pmTilesParams as PMTilesTileParams;
-      return await metrics.monitorAsyncFunction({ name: 'tile_request', tags: { z, version } }, handleTileRequest)(
-        z,
-        x,
-        y,
-        pmTilesService,
-        respHeaders,
+      const { z, x, y, version, deploymentKey } = pmTilesParams as PMTilesTileParams;
+      const tags = { z, version, url: deploymentKey ? 'versioned' : 'unversioned' };
+      return conditional(
+        await metrics.monitorAsyncFunction({ name: 'tile_request', tags }, handleTileRequest)(
+          z,
+          x,
+          y,
+          pmTilesService,
+          respHeaders,
+        ),
       );
     }
 
     if (pmTilesParams.requestType === 'json') {
       const { version } = pmTilesParams as PMTilesJsonParams;
-      return await metrics.monitorAsyncFunction(
-        { name: 'json_request', tags: { version } },
-        handleJsonRequest,
-      )(respHeaders);
+      return conditional(
+        await metrics.monitorAsyncFunction({ name: 'json_request', tags: { version } }, handleJsonRequest)(respHeaders),
+      );
     }
 
     if (pmTilesParams.requestType === 'style') {
       const { style } = pmTilesParams as PMTilesStyleParams;
       console.log('style');
-      return await metrics.monitorAsyncFunction(
-        { name: 'style_request', tags: { style } },
-        handleStyleRequest,
-      )(respHeaders);
+      return conditional(
+        await metrics.monitorAsyncFunction({ name: 'style_request', tags: { style } }, handleStyleRequest)(respHeaders),
+      );
     }
   } catch (e: any) {
     console.error(e);
