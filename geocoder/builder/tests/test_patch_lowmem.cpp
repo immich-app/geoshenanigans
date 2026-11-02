@@ -742,6 +742,33 @@ TEST(patch_lowmem_drops_the_lists_of_removed_cells) {
     CHECK(apply_both_modes(c, decoder_peaks_at_most("gxc", DECODER_HOLD)).empty());
 }
 
+// The first nightly without unnamed POIs tombstoned 24,543 contiguous planet
+// poi/all records in place. The POIs after the run stay one MATCH run, so
+// the patch carries the run's tombstones but not those POIs, and the dead
+// POIs' vertex bytes are dropped as the shared decoder produces them.
+TEST(patch_lowmem_replays_a_long_run_of_tombstones) {
+    ScratchDir dir("lowmem-tombstones");
+    std::mt19937 rng(20261102);
+    constexpr uint32_t HEAD = 1000, DEAD = 12000, TAIL = 8000;
+    const auto pois = pois_of(rng, HEAD + DEAD + TAIL, 0, true);
+    auto today = pois;
+    for (uint32_t i = HEAD; i < HEAD + DEAD; i++) today[i] = {0, {}};
+    BuildDir old_d, new_d;
+    put_pois(old_d, pois);
+    put_pois(new_d, today);
+    std::vector<char>& records = new_d["poi_records.bin"];
+    for (size_t at = size_t(HEAD) * POI_RECORD_STRIDE; at < size_t(HEAD + DEAD) * POI_RECORD_STRIDE; at += POI_RECORD_STRIDE)
+        for (size_t field : {POI_RECORD_NAME_ID_OFF, POI_RECORD_PARENT_STREET_ID_OFF, POI_RECORD_PARENT_POSTCODE_ID_OFF,
+                             POI_RECORD_PARENT_POLY_ID_OFF})
+            put_at(records, at + field, NO);
+    const LowMemCase c{dir.path(), "tombstones"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+
+    CHECK(raw_patch(c).size() < size_t(DEAD + TAIL / 2) * POI_RECORD_STRIDE);
+    CHECK(apply_modes(c, {"plain"}).bad.empty());
+    CHECK(apply_both_modes(c, decoder_peaks_at_most("poi", DECODER_HOLD)).empty());
+}
+
 // An encoded set whose two address files are empty: the diff sends
 // addr_points.bin's (empty) merge with the streets after it and
 // addr_vertices.bin later, as a full replacement. An empty parent has no

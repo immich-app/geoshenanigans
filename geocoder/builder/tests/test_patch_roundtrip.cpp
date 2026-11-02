@@ -414,6 +414,42 @@ BuildDir poi_polygons(bool drop) {
     return {{"poi_records.bin", bytes_of(records)}, {"poi_vertices.bin", vertices}};
 }
 
+// n polygon POIs, POI i's vertex block holding i; the slots [dead, dead +
+// dead_n) hold strategy-2 tombstones instead, as a day's in-place deaths
+// leave them, and the vertex stream lacks their blocks.
+BuildDir pois_with_dead_run(uint32_t n, uint32_t dead, uint32_t dead_n) {
+    std::vector<PoiRecord> records;
+    std::vector<char> vertices;
+    for (uint32_t i = 0; i < n; i++) {
+        if (i >= dead && i < dead + dead_n) {
+            PoiRecord tombstone{};
+            tombstone.vertex_offset = NO_DATA;
+            tombstone.name_id = NO_DATA;
+            records.push_back(tombstone);
+            continue;
+        }
+        PoiRecord p = poi(NO_DATA);
+        p.lat = 48.0f + static_cast<float>(i) * 1e-4f;
+        p.vertex_offset = static_cast<uint32_t>(vertices.size());
+        p.vertex_count = 1;
+        records.push_back(p);
+        vertices.resize(vertices.size() + 10);
+        append(vertices, i);
+    }
+    return {{"poi_records.bin", bytes_of(records)}, {"poi_vertices.bin", vertices}};
+}
+
+// The record counts by op of the diff's merge of file `name` ("m/i/d/r=..."
+// of its log line), printed; "" without one.
+std::string merge_records(const RoundTrip& r, const std::string& name) {
+    const size_t line = r.log.find(name + ": seq=");
+    const size_t at = line == std::string::npos ? line : r.log.find("recs ", line);
+    if (at == std::string::npos) return "";
+    const std::string recs = r.log.substr(at + 5, r.log.find('\n', at) - at - 5);
+    std::printf("    %s merge records %s\n", name.c_str(), recs.c_str());
+    return recs;
+}
+
 // The runs of one file's merge sequence: MATCH kept, DELETE gone, MATCH rest.
 std::vector<char> match_delete_match(uint32_t kept, uint32_t gone, uint32_t rest) {
     std::vector<char> runs;
@@ -509,6 +545,18 @@ TEST(patch_round_trip_keeps_the_poi_ids_of_unchanged_poi_records) {
     put_cell_index(new_d, "poi", {0, 1});
 
     CHECK(round_trip(old_d, new_d).mismatches.empty());
+}
+
+// The first nightly without unnamed POIs tombstoned 24,543 contiguous planet
+// poi/all records in place: the POIs after the run stay MATCHed (their
+// vertex offsets fixed up) instead of going as DELETE + INSERT.
+TEST(patch_round_trip_matches_the_pois_after_a_long_run_of_tombstones) {
+    constexpr uint32_t HEAD = 1000, DEAD = 12000, TAIL = 5000;
+    auto r = round_trip(pois_with_dead_run(HEAD + DEAD + TAIL, HEAD, 0), pois_with_dead_run(HEAD + DEAD + TAIL, HEAD, DEAD));
+
+    CHECK(r.mismatches.empty());
+    CHECK_EQ(merge_records(r, "poi_records.bin"), "m/i/d/r=" + std::to_string(HEAD + TAIL) + "/" + std::to_string(DEAD) +
+                                                      "/" + std::to_string(DEAD) + "/0");
 }
 
 // Place nodes come without a cell index (a client derives theirs at load).
