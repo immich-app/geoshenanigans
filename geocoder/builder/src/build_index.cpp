@@ -1692,7 +1692,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
 
         };
         auto write_places = [&] {
-            // Write place node files into each mode directory (so diff/patch can find them)
+            // Write place node files into each mode directory (so diff/patch can find them). Their
+            // cell index ships in no dir: a client derives it from place_nodes.bin when it loads
+            // the dir (server/src/place_index.rs).
             if (!d.place_nodes.empty()) {
                 auto write_place_files = [&](const std::string& dir) {
                     ensure_dir(dir);
@@ -1705,8 +1707,6 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                     }
                     emit_strategy2_sidecar(dir + "/place_nodes.osm_ids",
                                             d.place_sidecar_blob, d.place_osm_ids);
-                    write_cell_index_sorted(dir + "/place_cells.bin", dir + "/place_entries.bin",
-                                            d.sorted_place_cells);
                 };
 
                 if (multi_output) {
@@ -1716,8 +1716,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 } else {
                     write_place_files(base_dir);
                 }
-                std::cerr << "  Place nodes: " << d.place_nodes.size() << " nodes, "
-                          << count_cells(d.sorted_place_cells) << " cells" << std::endl;
+                std::cerr << "  Place nodes: " << d.place_nodes.size() << " nodes" << std::endl;
             }
         };
         auto write_admin_minimal = [&] {
@@ -1746,15 +1745,13 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 std::vector<uint32_t> poly_remap;
                 write_admin_minimal_polygons(d, mdir, region_prev, kAdminMinimalEpsilonScale, poly_remap);
 
-                // 2. place_nodes filter + ID remap. Keep types 0=city, 1=town,
-                //    2=village, 4=hamlet.
+                // 2. place_nodes filter. Keep types 0=city, 1=town, 2=village,
+                //    4=hamlet.
                 std::vector<PlaceNode> filtered_places;
                 filtered_places.reserve(d.place_nodes.size());
-                std::vector<uint32_t> place_remap(d.place_nodes.size(), NO_DATA);
                 for (size_t i = 0; i < d.place_nodes.size(); i++) {
                     uint8_t pt = d.place_nodes[i].place_type;
                     if (pt == 0 || pt == 1 || pt == 2 || pt == 4) {
-                        place_remap[i] = static_cast<uint32_t>(filtered_places.size());
                         PlaceNode pn = d.place_nodes[i];
                         // Parents in this dir's own polygon slots (NO_DATA when
                         // the parent polygon isn't kept), like every other id here.
@@ -1770,19 +1767,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                     if (!f) throw std::runtime_error("failed to write " + mdir + "/place_nodes.bin");
                 }
 
-                // 3. Rebuild place cell index with the place_remap (ascending,
-                //    so the filtered table stays in canonical order).
-                std::vector<CellItemPair> filtered_place_cells;
-                for (const auto& p : d.sorted_place_cells) {
-                    if (p.item_id < place_remap.size()
-                        && place_remap[p.item_id] != NO_DATA) {
-                        filtered_place_cells.push_back({p.cell_id, place_remap[p.item_id]});
-                    }
-                }
-                write_cell_index_sorted(mdir + "/place_cells.bin", mdir + "/place_entries.bin",
-                                        filtered_place_cells);
-
-                // 4. Its own admin cell index (compute_admin_index_cells),
+                // 3. Its own admin cell index (compute_admin_index_cells),
                 //    against the new polygon ID space. Preserves the
                 //    high-bit INTERIOR_FLAG used by the cell index format
                 //    (polys that fully contain a cell vs. just intersect it).
@@ -1797,7 +1782,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 parallel_sort(kept_cells.begin(), kept_cells.end(), cell_item_less);
                 write_cell_index_sorted(mdir + "/admin_cells.bin", mdir + "/admin_entries.bin", kept_cells);
 
-                // 5. Core strings + layout: admin and place names all live in core.
+                // 4. Core strings + layout: admin and place names all live in core.
                 {
                     const auto& core = d.strings_tiers[0];
                     std::ofstream f(mdir + "/" + STR_TIER_FILENAMES[0], std::ios::binary);

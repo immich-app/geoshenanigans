@@ -313,7 +313,7 @@ TEST(patch_format_stride_sentinels_no_collision_with_real_strides) {
         2,   // entry count prefix (u16)
         4,   // u32 id arrays (entries, parents, postcodes)
         8,   // NodeCoord, cell_id
-        12,  // WayHeader / admin_cells / poi_cells / place_cells
+        12,  // WayHeader / admin_cells / poi_cells
         16,  // postcode_centroid value_stride, empty addr_points
         20,  // PlaceNode / geo_cell
         24,  // InterpWay / AdminPolygon
@@ -335,7 +335,6 @@ TEST(patch_format_section_marker_values) {
     CHECK_EQ(CELL_CHANGES_GEO_MARKER, uint32_t(0xFFFFFFFB));
     CHECK_EQ(CELL_CHANGES_ADMIN_MARKER, uint32_t(0xFFFFFFFA));
     CHECK_EQ(CELL_CHANGES_POI_MARKER, uint32_t(0xFFFFFFF5));
-    CHECK_EQ(CELL_CHANGES_PLACE_MARKER, uint32_t(0xFFFFFFF4));
     CHECK_EQ(GEO_ENTRY_DELTA_MARKER, uint32_t(0xFFFFFFF0));
     CHECK_EQ(CELL_INDEX_DELTA_MARKER, uint32_t(0xFFFFFFF7));
     CHECK_EQ(SECONDARY_REMAP_MARKER, uint32_t(0xFFFFFFF6));
@@ -347,19 +346,18 @@ TEST(patch_format_section_marker_values) {
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v12 = at most STRING_PAIRS_MAX moved-string pairs,
-    // more as the merge sections' string fixups. The patcher accepts this
+    // diff/patch tools. v13 = no place cell index. The patcher accepts this
     // version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(12));
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(13));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
 
 TEST(patch_format_fileid_count_and_names_aligned) {
     // The names table must have exactly COUNT entries (one per PatchFileId).
-    CHECK_EQ(static_cast<uint32_t>(PatchFileId::COUNT), uint32_t(37));
+    CHECK_EQ(static_cast<uint32_t>(PatchFileId::COUNT), uint32_t(35));
     const size_t n_names = sizeof(patch_file_names) / sizeof(patch_file_names[0]);
-    CHECK_EQ(n_names, size_t(37));
+    CHECK_EQ(n_names, size_t(35));
     // Spot-check that index lines up with the enum value.
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::STRINGS)]) == "strings.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::POI_RECORDS)]) == "poi_records.bin");

@@ -200,7 +200,11 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // string remap would leave wrong, read in record order. The strings section
 // carries at most STRING_PAIRS_MAX moved-string pairs: a patch that moves more
 // strings sends none, and fixups instead.
-static constexpr uint32_t GCPATCH_VERSION = 12;
+// v13: no place cell index. No dir ships one (a client derives it from
+// place_nodes.bin when it loads the dir), so no patch carries its cell changes,
+// its cell index delta or the place nodes' secondary remap pairs, which only
+// that index's rebuild read; the file ids after PLACE_NODES move down two.
+static constexpr uint32_t GCPATCH_VERSION = 13;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -225,37 +229,35 @@ enum class PatchFileId : uint32_t {
     POI_CELLS = 16,
     POI_ENTRIES = 17,
     PLACE_NODES = 18,
-    PLACE_CELLS = 19,
-    PLACE_ENTRIES = 20,
     // Secondary parallel arrays (SPARSE_DELTA_FILES), the postcode
     // centroid index (a cell list delta) and the postal polygons, which
     // merge like the admin ones.
-    ADDR_POSTCODES = 21,
-    ADMIN_PARENTS = 22,
-    WAY_PARENTS = 23,
-    WAY_POSTCODES = 24,
-    POSTCODE_CENTROIDS = 25,
-    POSTCODE_CENTROID_CELLS = 26,
-    POSTCODE_CENTROID_ENTRIES = 27,
-    POSTAL_POLYGONS = 28,
-    POSTAL_VERTICES = 29,
+    ADDR_POSTCODES = 19,
+    ADMIN_PARENTS = 20,
+    WAY_PARENTS = 21,
+    WAY_POSTCODES = 22,
+    POSTCODE_CENTROIDS = 23,
+    POSTCODE_CENTROID_CELLS = 24,
+    POSTCODE_CENTROID_ENTRIES = 25,
+    POSTAL_POLYGONS = 26,
+    POSTAL_VERTICES = 27,
     // addr_points polygon footprints introduced by commit aaf050b
     // (build_version bump 8→9), byte-merged along addr_points like the
     // other vertex streams.
-    ADDR_VERTICES = 30,
+    ADDR_VERTICES = 28,
     // Per-tier strings files (build_version 14). Replaces the single
     // STRINGS=0 slot. They travel in the strings section
     // (STRINGS_TIERED_MARKER); a tier the old dir lacks comes whole in a
     // full-replacement section.
-    STRINGS_CORE = 31,
-    STRINGS_STREET = 32,
-    STRINGS_ADDR = 33,
-    STRINGS_POSTCODE = 34,
-    STRINGS_POI = 35,
+    STRINGS_CORE = 29,
+    STRINGS_STREET = 30,
+    STRINGS_ADDR = 31,
+    STRINGS_POSTCODE = 32,
+    STRINGS_POI = 33,
     // Per-segment TIGER ZIP sidecar (u32 string offset per interp way,
     // NO_DATA for OSM interpolations; absent on builds without TIGER).
-    INTERP_POSTCODES = 36,
-    COUNT = 37
+    INTERP_POSTCODES = 34,
+    COUNT = 35
 };
 
 static const char* patch_file_names[] = {
@@ -264,7 +266,7 @@ static const char* patch_file_names[] = {
     "geo_cells.bin", "street_entries.bin", "addr_entries.bin", "interp_entries.bin",
     "admin_cells.bin", "admin_entries.bin",
     "poi_records.bin", "poi_vertices.bin", "poi_cells.bin", "poi_entries.bin",
-    "place_nodes.bin", "place_cells.bin", "place_entries.bin",
+    "place_nodes.bin",
     "addr_postcodes.bin", "admin_parents.bin", "way_parents.bin", "way_postcodes.bin",
     "postcode_centroids.bin", "postcode_centroid_cells.bin", "postcode_centroid_entries.bin",
     "postal_polygons.bin", "postal_vertices.bin",
@@ -336,10 +338,9 @@ static constexpr uint32_t SECTION_END_MARKER = 0xFFFFFFFFu;
 static constexpr uint32_t CELL_CHANGES_GEO_MARKER = 0xFFFFFFFB;
 static constexpr uint32_t CELL_CHANGES_ADMIN_MARKER = 0xFFFFFFFA;
 static constexpr uint32_t CELL_CHANGES_POI_MARKER = 0xFFFFFFF5;
-static constexpr uint32_t CELL_CHANGES_PLACE_MARKER = 0xFFFFFFF4;
 
 // Cell index delta marker: 0xFFFFFFF7
-// An admin / POI / place cell index the patcher rebuilds from its id remap,
+// An admin / POI cell index the patcher rebuilds from its id remap,
 // corrected per cell: a corrected cell costs the ids it lost and gained, not
 // its whole list. Sent for every index the old or the new dir holds; the
 // patcher writes the new index in write_cell_lists layout, so the diff
@@ -362,11 +363,11 @@ static constexpr uint16_t GEO_LIST_REPLACE = 0xFFFF;
 
 // The entries files the geo walk derives and corrects, and those of the
 // cell indexes rebuilt from an id remap.
-using EntriesFiles = std::array<PatchFileId, 3>;
-static constexpr EntriesFiles GEO_ENTRIES_FILES = {PatchFileId::STREET_ENTRIES, PatchFileId::ADDR_ENTRIES,
-                                                   PatchFileId::INTERP_ENTRIES};
-static constexpr EntriesFiles CELL_INDEX_ENTRIES_FILES = {PatchFileId::ADMIN_ENTRIES, PatchFileId::POI_ENTRIES,
-                                                          PatchFileId::PLACE_ENTRIES};
+template <size_t N>
+using EntriesFiles = std::array<PatchFileId, N>;
+static constexpr EntriesFiles<3> GEO_ENTRIES_FILES = {PatchFileId::STREET_ENTRIES, PatchFileId::ADDR_ENTRIES,
+                                                      PatchFileId::INTERP_ENTRIES};
+static constexpr EntriesFiles<2> CELL_INDEX_ENTRIES_FILES = {PatchFileId::ADMIN_ENTRIES, PatchFileId::POI_ENTRIES};
 
 // Secondary ID remap marker: 0xFFFFFFF6
 // Additional old→new ID mappings for modified records (recovered by relaxed key matching).
@@ -381,12 +382,11 @@ static constexpr EntriesFiles CELL_INDEX_ENTRIES_FILES = {PatchFileId::ADMIN_ENT
 static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 
 // The record files whose old → new record ids the patcher keeps (RecordRemap)
-// for the entry pipeline's geo, POI and place indexes: the secondary remap
-// gives pairs for these and no other (the admin polygons' go in the parent-id
+// for the entry pipeline's geo and POI indexes: the secondary remap gives
+// pairs for these and no other (the admin polygons' go in the parent-id
 // remap).
 static constexpr PatchFileId REMAPPED_RECORD_FILES[] = {PatchFileId::STREET_WAYS, PatchFileId::ADDR_POINTS,
-                                                        PatchFileId::INTERP_WAYS, PatchFileId::POI_RECORDS,
-                                                        PatchFileId::PLACE_NODES};
+                                                        PatchFileId::INTERP_WAYS, PatchFileId::POI_RECORDS};
 inline bool is_remapped_record_file(uint32_t fid) {
     return std::find(std::begin(REMAPPED_RECORD_FILES), std::end(REMAPPED_RECORD_FILES), static_cast<PatchFileId>(fid)) !=
            std::end(REMAPPED_RECORD_FILES);
@@ -806,7 +806,7 @@ inline std::vector<ClientFile> parse_client_files(const char* data, size_t size,
 static constexpr PatchFileId UNSECTIONED_OLD_FILES[] = {
     PatchFileId::GEO_CELLS, PatchFileId::STREET_ENTRIES, PatchFileId::ADDR_ENTRIES, PatchFileId::INTERP_ENTRIES,
     PatchFileId::ADMIN_CELLS, PatchFileId::ADMIN_ENTRIES, PatchFileId::POI_CELLS, PatchFileId::POI_ENTRIES,
-    PatchFileId::PLACE_CELLS, PatchFileId::PLACE_ENTRIES, PatchFileId::POSTCODE_CENTROID_ENTRIES,
+    PatchFileId::POSTCODE_CENTROID_ENTRIES,
 };
 
 inline void append_old_file_sizes(std::vector<char>& out, const std::string& old_dir) {
@@ -844,9 +844,10 @@ struct PatchRef {
 // The sections of one kind the diff sends at most once per entries file
 // (GEO_ENTRIES_FILES, CELL_INDEX_ENTRIES_FILES), in one fixed slot per file:
 // a section for another file, or a second one for a file, is malformed.
+template <size_t N>
 class EntriesFileSections {
 public:
-    EntriesFileSections(const char* kind, const EntriesFiles& files) : kind_(kind), files_(files) {}
+    EntriesFileSections(const char* kind, const EntriesFiles<N>& files) : kind_(kind), files_(files) {}
 
     void add(uint32_t fid, PatchRef ref) {
         const size_t slot = slot_of(fid);
@@ -866,8 +867,8 @@ private:
     }
 
     const char* kind_;
-    EntriesFiles files_;
-    std::array<std::optional<PatchRef>, std::tuple_size<EntriesFiles>::value> refs_;
+    EntriesFiles<N> files_;
+    std::array<std::optional<PatchRef>, N> refs_;
 };
 
 // u64 cell ids read where they sit, front to back by one walk: a cell change
@@ -1182,7 +1183,7 @@ inline ParentIdRemap parse_parent_id_remap(const char* data, size_t size, size_t
 
 // --- Cell index rebuild ---
 
-// Admin, POI and place cell index rebuild, as the diff derives the index the
+// Admin and POI cell index rebuild, as the diff derives the index the
 // patcher rebuilds (stream_cell_index gives the same lists): 12-byte cells
 // (cell_id u64, entry_offset u32) over (count u16, ids u32[]) entries. An
 // id's top bit is INTERIOR_FLAG, so the remap is keyed by the bare id and the

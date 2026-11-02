@@ -511,21 +511,19 @@ TEST(patch_round_trip_keeps_the_poi_ids_of_unchanged_poi_records) {
     CHECK(round_trip(old_d, new_d).mismatches.empty());
 }
 
-TEST(patch_round_trip_keeps_the_place_ids_of_unchanged_place_nodes) {
+// Place nodes come without a cell index (a client derives theirs at load).
+TEST(patch_round_trip_keeps_place_nodes_without_a_cell_index) {
     BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
     old_d["place_nodes.bin"] = new_d["place_nodes.bin"] = bytes_of(std::vector<PlaceNode>{place(NAME_2), place(NAME_4)});
-    put_cell_index(old_d, "place", {0, 1});
-    put_cell_index(new_d, "place", {0, 1});
 
     CHECK(round_trip(old_d, new_d).mismatches.empty());
 }
 
-// An admin, POI or place cell index in dirs that hold none of its records
-// (admin polygons, POI records, place nodes) still comes as a cell index
-// delta, which the patcher needs to rebuild it: a cell's list changes and a
-// cell is added.
+// An admin or POI cell index in dirs that hold none of its records (admin
+// polygons, POI records) still comes as a cell index delta, which the patcher
+// needs to rebuild it: a cell's list changes and a cell is added.
 TEST(patch_round_trip_rebuilds_a_cell_index_without_its_records) {
-    for (const std::string prefix : {"admin", "poi", "place"}) {
+    for (const std::string prefix : {"admin", "poi"}) {
         BuildDir old_d, new_d;
         std::tie(old_d[prefix + "_cells.bin"], old_d[prefix + "_entries.bin"]) = write_cell_lists({{CELL, {0, 1}}});
         std::tie(new_d[prefix + "_cells.bin"], new_d[prefix + "_entries.bin"]) = write_cell_lists({{CELL, {0, 2}}, {CELL_2, {1}}});
@@ -1043,7 +1041,7 @@ TEST(patch_diff_refuses_a_dir_of_more_client_files_than_a_patch_may_list) {
     CHECK(round_trip(json_files(1), json_files(1024)).mismatches.empty());
 }
 
-// A new admin, POI or place cell index whose empty list is NO_DATA (the geo
+// A new admin or POI cell index whose empty list is NO_DATA (the geo
 // index's layout, not the one write_cell_lists writes and the patcher's
 // rebuild gives) fails the diff, and no patch is written: the patcher could
 // not rebuild it. The same lists in the builder's layout, the empty one a
@@ -1052,7 +1050,6 @@ TEST(patch_diff_refuses_a_cell_index_with_a_no_data_list) {
     const std::pair<std::string, BuildDir> indexes[] = {
         {"admin", {}},
         {"poi", {{"poi_records.bin", bytes_of(std::vector<PoiRecord>{poi(NAME_2), poi(NAME_4)})}}},
-        {"place", {{"place_nodes.bin", bytes_of(std::vector<PlaceNode>{place(NAME_2), place(NAME_4)})}}},
     };
     for (const auto& [prefix, records] : indexes) {
         ScratchDir dir("patch-diff-cell-layout");
