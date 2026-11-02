@@ -1606,8 +1606,8 @@ static int run(int argc, char* argv[]) {
         // parent_poly_id (byte 16-19) is a
         // foreign id into admin_polygons.bin and shifts day-over-day with
         // the admin id-space. Without rewriting it the merge sees
-        // byte-different records for every place_node whose containing
-        // admin polygon's id moved.
+        // byte-different records for every place_node whose claiming
+        // boundary's polygon id moved.
         if (old_data.size > 0) {
             admin_remap_future.wait();
             remap_id_field(old_data.data, old_data.size, place_stride, 16, res_admin_p.id_remap);

@@ -366,13 +366,9 @@ pub struct PlaceNode {
     pub place_type: u8,
     pub _pad1: u8,
     pub _pad2: u16,
-    /// Smallest admin polygon (by area) that contains this place node
-    /// centroid, computed at build time. Used to gate nearest-place
-    /// fallback: a quarter/neighbourhood candidate is only returned if
-    /// the query point is inside the polygon referenced here. Mirrors
-    /// Nominatim's insert_addresslines containment check at indexing.
-    /// 0xFFFFFFFF means "no containing admin polygon found" — fall back
-    /// to radius-only matching.
+    /// With PLACE_FLAG_LABEL_OF in `_pad1`: the polygon of the boundary
+    /// that claims the node, which place search labels with it. Else
+    /// `NO_DATA`. Reverse geocoding doesn't read it.
     pub parent_poly_id: u32,
 }
 

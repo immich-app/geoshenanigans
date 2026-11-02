@@ -1040,103 +1040,6 @@ static void parallel_sort_and_build(std::vector<std::vector<CellItemPair>>& thre
     merge_pair_lists(thread_pairs, sorted_out);
 }
 
-// Place-node addressline containment: for each place node, record the smallest-area
-// admin polygon containing its centroid (gates the server's nearest-place fallback).
-static void compute_place_node_containment(ParsedData& data, const BuildConfig& cfg,
-                std::chrono::steady_clock::time_point& _pt, CpuTicks& _cpu) {
-    unsigned int num_threads = cfg.num_threads;
-    if (!data.place_nodes.empty() && !data.admin_polygons.empty()) {
-        auto _pn_t = std::chrono::steady_clock::now();
-        std::cerr << "Computing place-node parent admin polygons ("
-                  << data.place_nodes.size() << " nodes)..." << std::endl;
-
-        // Precompute candidate sets sorted by ascending area so we can
-        // pick the smallest containing polygon with a single PIP pass.
-        // The cell_to_admin map has (INTERIOR_FLAG | poly_id) values —
-        // strip the flag before indexing.
-        parallel_for_dynamic(data.place_nodes.size(), kItemGrain, [&](size_t begin, size_t end, unsigned) {
-            std::vector<uint32_t> cand;
-            for (size_t i = begin; i < end; i++) {
-                auto& pn = data.place_nodes[i];
-                pn.parent_poly_id = 0xFFFFFFFFu;
-                // Compute the node's S2 cell at the admin level
-                // and fetch candidate polygons covering it.
-                S2CellId cell = S2CellId(
-                    S2LatLng::FromDegrees(pn.lat, pn.lng))
-                    .parent(kAdminCellLevel);
-                auto it = data.cell_to_admin.find(cell.id());
-                if (it == data.cell_to_admin.end()) continue;
-                cand.clear();
-                cand.reserve(it->second.size());
-                for (uint32_t id : it->second) {
-                    cand.push_back(id & ID_MASK);
-                }
-                // Sort candidates by ascending area so the first
-                // PIP hit is the smallest containing polygon. Break
-                // exact-area ties by admin osm_id: AdminPolygon.area
-                // is float32, so distinct polygons routinely share an
-                // area value, and an area-only sort leaves their order
-                // to the (non-deterministic) cell_to_admin iteration
-                // order — making parent_poly_id flip between same-PBF
-                // builds (~33k place nodes / 1.1 MiB churn). osm_id is
-                // build-invariant and unique, giving a total order.
-                std::sort(cand.begin(), cand.end(),
-                          [&](uint32_t a, uint32_t b) {
-                    const auto& pa = data.admin_polygons[a];
-                    const auto& pb = data.admin_polygons[b];
-                    if (pa.area != pb.area) return pa.area < pb.area;
-                    // osm_id tiebreak (build-invariant total order); guard
-                    // the parallel-array access like every other site and
-                    // fall back to the (still-unique) poly index if the
-                    // sidecar isn't aligned.
-                    if (data.admin_osm_ids.size() == data.admin_polygons.size())
-                        return data.admin_osm_ids[a] < data.admin_osm_ids[b];
-                    return a < b;
-                });
-                // Pick the smallest containing admin polygon at
-                // a rank level matching this place node's type.
-                // Mirrors Nominatim's `current_boundary` cascading
-                // gate: a place=neighbourhood node must be inside
-                // the suburb-level boundary (admin_level >= 8),
-                // not just inside the country. This prevents a
-                // neighbourhood node 800m from the query (but
-                // in the same country/state) from being accepted
-                // when the query is in a different suburb.
-                //
-                // For city/town/village (pt 0-2): parent at L3+
-                // For suburb/hamlet (pt 3-4): parent at L6+
-                // For neighbourhood/quarter (pt 5-6): parent at L9+
-                uint8_t pt = pn.place_type;
-                uint8_t min_parent_al = (pt <= 2) ? 3 : (pt <= 4) ? 6 : 9;
-                for (uint32_t poly_id : cand) {
-                    const auto& p = data.admin_polygons[poly_id];
-                    if (p.admin_level < min_parent_al) continue;
-                    if (p.admin_level > 10) continue; // skip postcode/place markers
-                    const NodeCoord* verts =
-                        &data.admin_vertices[p.vertex_offset];
-                    if (point_in_polygon_nc(pn.lat, pn.lng,
-                                            verts, p.vertex_count)) {
-                        pn.parent_poly_id = poly_id;
-                        break;
-                    }
-                }
-            }
-
-        }, num_threads);
-        size_t contained_count = parallel_count(data.place_nodes.size(),
-            [&](size_t i) { return data.place_nodes[i].parent_poly_id != 0xFFFFFFFFu; }, num_threads);
-
-        double _pn_elapsed = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - _pn_t).count();
-        std::cerr << "Place-node containment: "
-                  << contained_count << "/"
-                  << data.place_nodes.size() << " nodes linked to a "
-                  << "parent admin polygon in " << _pn_elapsed << "s"
-                  << std::endl;
-        log_phase("Place-node containment", _pt, _cpu);
-    }
-}
-
 // find_linked_place step 4: name-based linking of admin boundaries to place nodes
 // (Nominatim find_linked_place name-match fallback).
 static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
@@ -4868,12 +4771,11 @@ static int run(int argc, char* argv[]) {
         // an area value, and cell_to_admin's in-memory order is
         // non-deterministic (S2 cover drain + Sort #1 remap, never re-sorted),
         // so the tie winner flipped between same-PBF builds (~33k way parents
-        // + ~33k place parents of churn). Sort each cell's candidate list by
+        // of churn). Sort each cell's candidate list by
         // admin osm_id (build-invariant, unique, kept aligned by Sort #1) so
         // the first-of-equal-area winner is stable. write_cell_index re-sorts
         // by raw poly_id at write time, so the on-disk layout is unaffected;
-        // this order only governs the parent tie-breaks. (Place-node uses its
-        // own (area, osm_id) candidate sort.)
+        // this order only governs the parent tie-breaks.
         if (data.admin_osm_ids.size() == data.admin_polygons.size()) {
             for_each_admin_cell_list(data, num_threads, [&](std::vector<uint32_t>& ids) {
                 std::sort(ids.begin(), ids.end(), [&](uint32_t x, uint32_t y) {
@@ -4882,8 +4784,7 @@ static int run(int argc, char* argv[]) {
                 });
             });
         }
-
-        compute_place_node_containment(data, cfg, _pt, _cpu);
+        log_phase("Admin polygon order", _pt, _cpu);
 
         link_places_by_name(data, cfg, _pt, _cpu);
 

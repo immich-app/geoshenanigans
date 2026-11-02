@@ -84,7 +84,8 @@ pub fn cc_str(cc: &[u8; 2]) -> &str {
     std::str::from_utf8(cc).unwrap_or("")
 }
 
-/// Country of a record through its containing polygon (place nodes, POIs).
+/// Country of a record through its parent polygon: a POI's containing one, a place node's
+/// claiming boundary (NO_DATA unless the node is its label).
 pub fn parent_cc(geo: &Index, parent: u32) -> [u8; 2] {
     let n = record_count::<AdminPolygon>(&geo.admin_polygons);
     if parent == NO_DATA || parent >= n {
