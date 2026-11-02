@@ -2,6 +2,8 @@
 name = "query-server"
 version = "0.1.0"
 edition = "2021"
+# File::lock (server/src/place_index.rs) is stable from 1.89.
+rust-version = "1.89"
 
 # Library: pure geocoding logic, used by both the HTTP binary and the
 # napi binding (geocoder/node). Lives in src/lib.rs.

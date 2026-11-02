@@ -2,6 +2,8 @@
 name = "geocoder-node"
 version = "0.1.0"
 edition = "2021"
+# File::lock (server/src/place_index.rs) is stable from 1.89.
+rust-version = "1.89"
 
 [lib]
 crate-type = ["cdylib"]
