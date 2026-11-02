@@ -106,6 +106,7 @@ async function handleRequest(
   }
   const innerRequest = new Request(innerUrl(pmTilesParams, env.DEPLOYMENT_KEY), {
     headers: {
+      [Header.CONTINENT]: request.cf?.continent ?? '',
       [Header.METRIC_TAGS]: encodeMetricTags(metricTags),
       // The cache negotiates the body's encoding (tiles are stored gzipped) as it would for the client.
       [Header.ACCEPT_ENCODING]: request.headers.get(Header.ACCEPT_ENCODING) ?? '',

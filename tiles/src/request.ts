@@ -44,8 +44,9 @@ export enum Header {
   ETAG = 'ETag',
   IF_NONE_MATCH = 'If-None-Match',
   ACCEPT_ENCODING = 'Accept-Encoding',
-  // Set by the gateway on the inner request: the tags for Tiles' metrics, which Tiles can't work out itself
-  // (request.cf is undefined there). Request headers aren't part of the cache key.
+  // Set by the gateway on the inner request: the client's continent and the tags for Tiles' metrics, neither of which
+  // Tiles can see itself (request.cf is undefined there). Request headers aren't part of the cache key.
+  CONTINENT = 'X-Continent',
   METRIC_TAGS = 'X-Metric-Tags',
 }
 

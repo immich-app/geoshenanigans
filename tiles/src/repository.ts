@@ -54,6 +54,40 @@ export class MemCacheRepository implements IMemCacheRepository {
   }
 }
 
+export enum TigrisEndpoint {
+  T3 = 'https://t3.storage.dev',
+  FLY = 'https://fly.storage.tigris.dev',
+}
+
+// Continents where t3.storage.dev reaches Tigris faster; elsewhere fly.storage.tigris.dev does.
+const T3_CONTINENTS = new Set(['EU', 'NA', 'AS']);
+
+/** The Tigris endpoint for a request from the given continent (unknown ones get the Fly endpoint). */
+export function tigrisEndpoint(continent: string | null | undefined): TigrisEndpoint {
+  return continent && T3_CONTINENTS.has(continent) ? TigrisEndpoint.T3 : TigrisEndpoint.FLY;
+}
+
+// One client per endpoint for the isolate's lifetime, so requests after the first skip building one.
+const s3Clients = new Map<string, S3Client>();
+
+export function s3Client(endpoint: TigrisEndpoint, keyId: string, accessKey: string): S3Client {
+  const cacheKey = `${endpoint}|${keyId}`;
+  let client = s3Clients.get(cacheKey);
+  if (!client) {
+    client = new S3Client({
+      region: 'auto',
+      credentials: {
+        accessKeyId: keyId,
+        secretAccessKey: accessKey,
+      },
+      endpoint,
+      forcePathStyle: false,
+    });
+    s3Clients.set(cacheKey, client);
+  }
+  return client;
+}
+
 export class TigrisStorageRepository implements IStorageRepository {
   private client: S3Client;
   constructor(
@@ -63,21 +97,14 @@ export class TigrisStorageRepository implements IStorageRepository {
     private deploymentKey: string,
     private metrics: IMetricsRepository,
     private storagePrefix = '',
+    private endpoint = TigrisEndpoint.FLY,
   ) {
-    this.client = new S3Client({
-      region: 'auto',
-      credentials: {
-        accessKeyId: keyId,
-        secretAccessKey: accessKey,
-      },
-      endpoint: 'https://fly.storage.tigris.dev',
-      forcePathStyle: false,
-    });
+    this.client = s3Client(endpoint, keyId, accessKey);
   }
 
   private async getS3Object(args: { key?: string; range?: { offset: number; length: number } }) {
     const { range } = args;
-    const metric = Metric.create('tigris_storage_get');
+    const metric = Metric.create('tigris_storage_get').addTag('endpoint', new URL(this.endpoint).hostname);
     const command = new GetObjectCommand({
       Bucket: this.bucketKey,
       Key: `${this.storagePrefix}${this.deploymentKey}/${args.key}`,

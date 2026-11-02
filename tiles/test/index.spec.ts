@@ -5,7 +5,14 @@ import { IDatabaseRepository, IMemCacheRepository, IMetricsRepository, IStorageR
 import { DirectoryString, PMTilesService } from '../src/pmtiles.service';
 import { JsonResponse } from '../src/pmtiles/types';
 import { fromRadix64, toRadix64 } from '../src/pmtiles/utils';
-import { InfluxMetricsProvider, Metric, TigrisStorageRepository } from '../src/repository';
+import {
+  InfluxMetricsProvider,
+  Metric,
+  s3Client,
+  TigrisEndpoint,
+  tigrisEndpoint,
+  TigrisStorageRepository,
+} from '../src/repository';
 import { CACHE_REVISION, decodeMetricTags, encodeMetricTags, innerUrl, parseInnerUrl } from '../src/request';
 import { EDGE_CACHE } from '../src/tiles';
 
@@ -225,6 +232,28 @@ describe('inner URL', () => {
   });
 });
 
+describe('tigrisEndpoint', () => {
+  it.each`
+    continent | endpoint
+    ${'EU'}   | ${TigrisEndpoint.T3}
+    ${'NA'}   | ${TigrisEndpoint.T3}
+    ${'AS'}   | ${TigrisEndpoint.T3}
+    ${'SA'}   | ${TigrisEndpoint.FLY}
+    ${'OC'}   | ${TigrisEndpoint.FLY}
+    ${'AF'}   | ${TigrisEndpoint.FLY}
+    ${'AN'}   | ${TigrisEndpoint.FLY}
+    ${''}     | ${TigrisEndpoint.FLY}
+    ${null}   | ${TigrisEndpoint.FLY}
+  `('reads from $endpoint for continent $continent', ({ continent, endpoint }) => {
+    expect(tigrisEndpoint(continent)).toBe(endpoint);
+  });
+
+  it('keeps one client per endpoint', () => {
+    expect(s3Client(TigrisEndpoint.T3, 'id', 'secret')).toBe(s3Client(TigrisEndpoint.T3, 'id', 'secret'));
+    expect(s3Client(TigrisEndpoint.T3, 'id', 'secret')).not.toBe(s3Client(TigrisEndpoint.FLY, 'id', 'secret'));
+  });
+});
+
 /** Collects the metrics the worker pushes, by name. */
 function captureMetrics() {
   const pushed: Metric[] = [];
@@ -303,7 +332,7 @@ describe('gateway', () => {
     ]);
   });
 
-  it("passes on the client's metric tags and accepted encodings, and nothing else it sent", async () => {
+  it("passes on the client's continent, metric tags and accepted encodings, and nothing else it sent", async () => {
     const { calls } = await fetchGateway('/v1/1/2/3.mvt', {
       headers: {
         Origin: 'https://photos.example.org',
@@ -314,6 +343,7 @@ describe('gateway', () => {
       cf: { continent: 'OC', colo: 'SYD', asOrganization: 'Société Générale' },
     });
     const headers = Object.fromEntries(calls[0].headers);
+    expect(headers['x-continent']).toBe('OC');
     expect(decodeMetricTags(headers['x-metric-tags'])).toEqual({
       continent: 'OC',
       colo: 'SYD',
@@ -323,7 +353,7 @@ describe('gateway', () => {
       url: 'unversioned',
     });
     expect(headers['accept-encoding']).toBe('gzip, br');
-    expect(Object.keys(headers).sort()).toEqual(['accept-encoding', 'x-metric-tags']);
+    expect(Object.keys(headers).sort()).toEqual(['accept-encoding', 'x-continent', 'x-metric-tags']);
   });
 
   it('answers other methods and unknown URLs itself', async () => {
@@ -430,11 +460,16 @@ describe('Tiles', () => {
   const tilesRequest = (url: string, headers: Record<string, string> = {}, deploymentKey = key) =>
     new Request(innerUrl(parseUrl(new Request(`https://tiles.example${url}`)), deploymentKey), { headers });
 
-  // Stands in for Tigris: tile 0 is the gzipped bytes of "tile 0".
+  // Stands in for Tigris: tile 0 is the gzipped bytes of "tile 0", and each read records the endpoint it used.
   const mockStorage = () => {
-    vi.spyOn(TigrisStorageRepository.prototype, 'getRangeAsStream').mockImplementation(async () =>
-      new Blob(['tile 0']).stream().pipeThrough(new CompressionStream('gzip')),
-    );
+    const endpoints: string[] = [];
+    vi.spyOn(TigrisStorageRepository.prototype, 'getRangeAsStream').mockImplementation(async function (
+      this: TigrisStorageRepository,
+    ) {
+      endpoints.push((this as unknown as { endpoint: string }).endpoint);
+      return new Blob(['tile 0']).stream().pipeThrough(new CompressionStream('gzip'));
+    });
+    return endpoints;
   };
 
   beforeAll(async () => {
@@ -469,6 +504,18 @@ describe('Tiles', () => {
     expect(response.headers.get('Content-Encoding')).toBe('gzip');
     expect(response.headers.get('Cache-Tag')).toBe(`tiles,deploy-${key},type-tile`);
     expect(new TextDecoder().decode(await response.arrayBuffer())).toBe('tile 0');
+  });
+
+  it.each`
+    continent | endpoint
+    ${'EU'}   | ${TigrisEndpoint.T3}
+    ${'SA'}   | ${TigrisEndpoint.FLY}
+    ${''}     | ${TigrisEndpoint.FLY}
+  `('reads tiles for $continent from $endpoint', async ({ continent, endpoint }) => {
+    const endpoints = mockStorage();
+    const response = await exports.Tiles.fetch(tilesRequest('/v1/0/0/0.mvt', { 'X-Continent': continent }));
+    await response.body?.cancel();
+    expect(endpoints).toEqual([endpoint]);
   });
 
   it.each`

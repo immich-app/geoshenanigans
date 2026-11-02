@@ -7,6 +7,7 @@ import {
   InfluxMetricsProvider,
   MemCacheRepository,
   Metric,
+  tigrisEndpoint,
   TigrisStorageRepository,
 } from './repository';
 import {
@@ -104,6 +105,7 @@ async function handleRequest(request: Request, env: WorkerEnv, metrics: IMetrics
     deploymentKey,
     metrics,
     env.STORAGE_PREFIX,
+    tigrisEndpoint(request.headers.get(Header.CONTINENT)),
   );
 
   const handleTileRequest = async (z: string, x: string, y: string, pmTiles: PMTilesService) => {
