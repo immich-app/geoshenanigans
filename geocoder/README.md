@@ -157,7 +157,7 @@ in [PATCHING.md](PATCHING.md) and `builder/configurations.template.json`.
 | `admin_polygons.bin`, `admin_vertices.bin` | Admin polygon metadata and vertices (per quality variant) |
 | `admin_parents.bin` | Per admin polygon: the next larger polygon containing it |
 | `postal_polygons.bin`, `postal_vertices.bin` | Postal code boundaries (per quality variant, where they exist) |
-| `place_cells.bin`, `place_entries.bin`, `place_nodes.bin` | Place nodes (city, town, village, suburb, ...) and their cell index |
+| `place_nodes.bin` | Place nodes (city, town, village, suburb, ...); the first load derives their cell index into `derived/` |
 | `postcode_centroids.bin`, `postcode_centroid_cells.bin`, `postcode_centroid_entries.bin` | Postcode centroids and their cell index |
 | `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin` | Points of interest and their cell index |
 | `strings_core.bin`, `strings_street.bin`, `strings_addr.bin`, `strings_postcode.bin`, `strings_poi.bin` | Deduplicated string pool, in five tiers so each variant ships only the strings it uses |
