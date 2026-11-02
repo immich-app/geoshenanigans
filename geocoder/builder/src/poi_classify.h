@@ -9,9 +9,10 @@
 
 // POI classification: maps a node/way's raw OSM tag values to a
 // (category, tier, flags) triple (PoiClassification, defined in types.h),
-// or nullopt when nothing matches. Pure function of its tag arguments (no
-// shared state) — lifted out of main()'s node/way passes, which call it
-// identically.
+// or nullopt when nothing matches or no POI dir ships the tier (a generic
+// rank-30 feature without a wikipedia or wikidata tag). Pure function of its
+// tag arguments (no shared state) — lifted out of main()'s node/way passes,
+// which call it identically.
 inline std::optional<PoiClassification> classify_poi(
     const char* t_tourism, const char* t_historic, const char* t_boundary,
     const char* t_amenity, const char* t_leisure, const char* t_natural,
@@ -317,13 +318,10 @@ inline std::optional<PoiClassification> classify_poi(
     }
 
     // Fallback: any rank-30 addressable feature that didn't
-    // hit a specific PoiCategory above. Mirrors Nominatim's
-    // reverse.py DataLayer.POI filter (class_ NOT IN
-    // ('place', 'building'), rank_search==30) which drives
-    // the Moscow vending_machine / SF waste_basket / Sydney
-    // toilets / Paris clock primary selections. UNNAMED_RANK30
-    // entries carry no name_id but still have a parent_street
-    // that surfaces as `road` when they win primary contest.
+    // hit a specific PoiCategory above (Nominatim's reverse.py
+    // DataLayer.POI filter: class_ NOT IN ('place', 'building'),
+    // rank_search==30). Only a wikipedia or wikidata tag lifts
+    // one into a POI dir (below).
     if (cat == PoiCategory::UNKNOWN) {
         if (t_amenity || t_tourism || t_historic || t_leisure ||
             t_man_made || t_craft || t_office || t_waterway ||
@@ -353,6 +351,7 @@ inline std::optional<PoiClassification> classify_poi(
         flags |= POI_FLAG_HIGHWAY;
     }
     if ((flags & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA)) && tier > 1) tier--;
+    if (tier > POI_MAX_SHIPPED_TIER) return std::optional<PoiClassification>{};
 
     return PoiClassification{cat, tier, flags};
 }

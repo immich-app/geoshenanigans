@@ -391,21 +391,18 @@ enum class PoiCategory : uint8_t {
 
     // Generic rank-30 node (amenity/shop/tourism/historic/leisure/man_made/
     // craft/office/waterway/natural/aeroway/railway/power) that didn't
-    // match a specific PoiCategory above. Mirrors Nominatim's reverse.py
+    // match a specific PoiCategory above: Nominatim's reverse.py
     // DataLayer.POI filter (class_ NOT IN ('place', 'building'),
-    // rank_search==30, geometry not line-like) — every such node is a
-    // primary-feature candidate in _find_closest_street_or_pois, which
-    // drives the Moscow vending_machine / SF waste_basket / Sydney
-    // toilets / Paris clock primary selections. Typically unnamed; we
-    // still store the category so the server can surface the POI's
-    // parent_street as the road.
+    // rank_search==30, geometry not line-like). Its default tier is below
+    // every POI dir, so only a wikipedia or wikidata tag makes one a POI
+    // (classify_poi).
     UNNAMED_RANK30 = 170,
 
     UNKNOWN = 255
 };
 
-// Highest POI tier a poi/<tier> dir ships (poi/all); tier 4 (generic rank-30
-// features) stays in the build only.
+// Highest POI tier a poi/<tier> dir ships (poi/all). classify_poi gives no
+// POI a higher one; a tombstone can remember one from an older build.
 constexpr uint8_t POI_MAX_SHIPPED_TIER = 3;
 
 // POI tier: 1=major, 2=notable, 3=everything. Returns 0 for unknown categories.
@@ -519,8 +516,8 @@ inline uint8_t poi_get_default_tier(PoiCategory cat) {
         case PoiCategory::RESERVOIR: case PoiCategory::RECREATION_GROUND:
         case PoiCategory::MILITARY: case PoiCategory::RELIGIOUS_LANDUSE:
             return 3;
-        // Generic rank-30 unnamed node — lowest priority for display/
-        // ranking but eligible as a primary-feature candidate.
+        // Generic rank-30 feature: below every POI dir until a wikipedia or
+        // wikidata tag lifts it into poi/all.
         case PoiCategory::UNNAMED_RANK30:
             return 4;
         default: return 0;

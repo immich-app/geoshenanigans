@@ -87,3 +87,19 @@ TEST(poi_classify_highway_flag) {
         CHECK((c->flags & POI_FLAG_HIGHWAY) != 0);
     }
 }
+
+TEST(poi_classify_keeps_a_generic_feature_only_with_a_wiki_tag) {
+    // amenity=car_sharing takes no specific category: a generic rank-30
+    // feature, which no POI dir ships unless a wiki tag lifts it into poi/all.
+    Tags plain; plain.amenity = "car_sharing";
+    CHECK(!classify(plain).has_value());
+
+    Tags wikidata = plain; wikidata.wikidata = "Q1";
+    Tags wikipedia = plain; wikipedia.wikipedia = "en:Carsharing";
+    for (const Tags& t : {wikidata, wikipedia}) {
+        auto c = classify(t);
+        REQUIRE(c.has_value());
+        CHECK_EQ(uint8_t(c->category), uint8_t(PoiCategory::UNNAMED_RANK30));
+        CHECK_EQ(int(c->tier), int(POI_MAX_SHIPPED_TIER));
+    }
+}
