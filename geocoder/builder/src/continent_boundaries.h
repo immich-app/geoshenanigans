@@ -12,7 +12,6 @@
 #include <utility>
 
 #include "ring_contains.h"
-#include "types.h"
 
 struct ContinentPolygon {
     std::string name;
@@ -53,18 +52,3 @@ private:
     const std::vector<std::pair<double,double>>& poly_;
     RingEdgeBuckets buckets_;
 };
-
-// NodeCoord-based overload — used by the build_index place-node
-// containment pass against packed admin polygon vertices.
-inline bool point_in_polygon_nc(float lat, float lng,
-                                const NodeCoord* verts, size_t n) {
-    bool inside = false;
-    for (size_t i = 0, j = n - 1; i < n; j = i++) {
-        float yi = verts[i].lat, xi = verts[i].lng;
-        float yj = verts[j].lat, xj = verts[j].lng;
-        if (((yi > lat) != (yj > lat)) &&
-            (lng < (xj - xi) * (lat - yi) / (yj - yi) + xi))
-            inside = !inside;
-    }
-    return inside;
-}

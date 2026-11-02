@@ -3,10 +3,6 @@
 // spec: coord_key determinism + collision-resolution at the nanodegree grid,
 // polygon_area shoelace magnitude/winding-insensitivity, and the
 // Douglas-Peucker simplify_polygon / simplify_polygon_epsilon variants.
-//
-// NOTE: point_in_polygon_nc is NOT defined in geometry.h (it lives in
-// continent_boundaries.h), so it is intentionally not tested here — this file
-// covers the geometry.h module exactly.
 #include "geometry.h"
 
 #include <cmath>
