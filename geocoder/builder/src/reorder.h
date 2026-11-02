@@ -105,6 +105,19 @@ void renumber_cell_pairs(std::vector<CellItemPair>& pairs, Renumber renumber, un
         parallel_sort(pairs.begin(), pairs.end(), cell_item_less, threads);
 }
 
+// renumber_cell_pairs through a dedup's old_to_new, listing each survivor
+// once per cell: duplicates that shared a cell would otherwise each leave it
+// a pair there. Equal pairs sit side by side once sorted.
+inline void renumber_onto_survivors(std::vector<CellItemPair>& pairs, const std::vector<uint32_t>& old_to_new,
+                                    unsigned threads) {
+    renumber_cell_pairs(pairs, [&](uint32_t id) { return old_to_new[id]; }, threads);
+    pairs.erase(std::unique(pairs.begin(), pairs.end(),
+                            [](const CellItemPair& a, const CellItemPair& b) {
+                                return a.cell_id == b.cell_id && a.item_id == b.item_id;
+                            }),
+                pairs.end());
+}
+
 // Whether the arrays a reorder step moves its records into (`bytes` of
 // them) fault in beside its sort of n Keys (the keys, the merge's copy of
 // them and the order): `headroom` holds both. Else each is made after the
@@ -316,7 +329,7 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0, uint64_t
     const std::vector<uint32_t> old_to_new = renumber_runs(order, starts, threads);
     order = {};
     starts = {};
-    renumber_cell_pairs(data.sorted_addr_cells, [&](uint32_t id) { return old_to_new[id]; }, threads);
+    renumber_onto_survivors(data.sorted_addr_cells, old_to_new, threads);
     std::cerr << "  Addr points sorted: " << n << std::endl;
 }
 
@@ -463,7 +476,7 @@ inline std::vector<uint32_t> sort_ways(ParsedData& data, unsigned threads = 0, u
     free_beside(std::move(data.street_nodes));
     data.ways = std::move(new_ways);
     data.street_nodes = std::move(repacked.items);
-    renumber_cell_pairs(data.sorted_way_cells, [&](uint32_t id) { return old_to_new[id]; }, threads);
+    renumber_onto_survivors(data.sorted_way_cells, old_to_new, threads);
     std::cerr << "  Ways sorted: " << n << " (" << (n - kept) << " duplicates removed)" << std::endl;
     return old_to_new;
 }
@@ -587,17 +600,7 @@ inline void reorder_interps(ParsedData& data, unsigned threads = 0) {
     if (have_interp_pc) data.interp_postcode_ids = std::move(new_pc);
     data.interp_ways = std::move(new_interps);
     data.interp_nodes = std::move(repacked.items);
-    renumber_cell_pairs(data.sorted_interp_cells, [&](uint32_t id) { return old_to_new[id]; }, threads);
-    // Dedup now-identical (cell_id, item_id) pairs: when two duplicate
-    // interps in the same cell collapse to one survivor their cell
-    // entries become identical, which would otherwise list the survivor
-    // twice per cell.
-    data.sorted_interp_cells.erase(
-        std::unique(data.sorted_interp_cells.begin(), data.sorted_interp_cells.end(),
-                    [](const CellItemPair& a, const CellItemPair& b) {
-                        return a.cell_id == b.cell_id && a.item_id == b.item_id;
-                    }),
-        data.sorted_interp_cells.end());
+    renumber_onto_survivors(data.sorted_interp_cells, old_to_new, threads);
     std::cerr << "  Interps sorted: " << data.interp_ways.size()
               << " (" << (n - kept) << " duplicates removed)" << std::endl;
 }

@@ -1,6 +1,8 @@
-// The serial deterministic-ordering steps as of d77ab8e, verbatim: the
-// byte layout the parallel steps in reorder.h and parsed_data.h must
-// reproduce for any input and thread count (test_reorder.cpp).
+// The serial deterministic-ordering steps as of d77ab8e, verbatim save one
+// change: the addr and way steps list each survivor once per cell, as the
+// interp step did. They give the byte layout the parallel steps in
+// reorder.h and parsed_data.h must reproduce for any input and thread count
+// (test_reorder.cpp).
 #pragma once
 
 #include <numeric>
@@ -9,6 +11,16 @@
 
 namespace reorder_ref {
 
+// Dedup now-identical (cell_id, item_id) pairs: when two duplicate records
+// in the same cell collapse to one survivor their cell entries become
+// identical, which would otherwise list the survivor twice per cell.
+inline void erase_repeated_pairs(std::vector<CellItemPair>& pairs) {
+    pairs.erase(std::unique(pairs.begin(), pairs.end(),
+                            [](const CellItemPair& a, const CellItemPair& b) {
+                                return a.cell_id == b.cell_id && a.item_id == b.item_id;
+                            }),
+                pairs.end());
+}
 
 // Partition the string pool in `data` into 5 per-consumer tiers, sorting
 // alphabetically within each, and remap all record name_id fields to the
@@ -299,6 +311,7 @@ inline void reorder_addr_points(ParsedData& data) {
             p.item_id = dedup_remap[old_to_new[p.item_id]];
         auto cmp = cell_item_less;
         std::sort(data.sorted_addr_cells.begin(), data.sorted_addr_cells.end(), cmp);
+        erase_repeated_pairs(data.sorted_addr_cells);
         std::cerr << "  Addr points sorted: " << n << std::endl;
     }
 }
@@ -392,6 +405,7 @@ inline void reorder_ways(ParsedData& data) {
         for (auto& p : data.sorted_way_cells) p.item_id = old_to_new[p.item_id];
         auto cmp = cell_item_less;
         std::sort(data.sorted_way_cells.begin(), data.sorted_way_cells.end(), cmp);
+        erase_repeated_pairs(data.sorted_way_cells);
         // Remap way_parent_ids + way_postcode_ids: reorder + dedup
         auto remap_way_vec = [&](std::vector<uint32_t>& vec) {
             if (vec.size() != n) return;
@@ -510,16 +524,7 @@ inline void reorder_interps(ParsedData& data) {
         for (auto& p : data.sorted_interp_cells) p.item_id = old_to_new[p.item_id];
         auto cmp = cell_item_less;
         std::sort(data.sorted_interp_cells.begin(), data.sorted_interp_cells.end(), cmp);
-        // Dedup now-identical (cell_id, item_id) pairs: when two duplicate
-        // interps in the same cell collapse to one survivor their cell
-        // entries become identical, which would otherwise list the survivor
-        // twice per cell.
-        data.sorted_interp_cells.erase(
-            std::unique(data.sorted_interp_cells.begin(), data.sorted_interp_cells.end(),
-                        [](const CellItemPair& a, const CellItemPair& b) {
-                            return a.cell_id == b.cell_id && a.item_id == b.item_id;
-                        }),
-            data.sorted_interp_cells.end());
+        erase_repeated_pairs(data.sorted_interp_cells);
         std::cerr << "  Interps sorted: " << data.interp_ways.size()
                   << " (" << interp_deduped << " duplicates removed)" << std::endl;
     }

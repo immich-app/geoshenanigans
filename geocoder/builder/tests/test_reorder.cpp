@@ -222,6 +222,11 @@ bool same_pairs(const std::vector<CellItemPair>& a, const std::vector<CellItemPa
     return true;
 }
 
+// Two copies of one record: cell 7 lists both, cells 5 and 9 one each.
+const std::vector<CellItemPair> kTwoCopiesCells = {{5, 0}, {7, 0}, {7, 1}, {9, 1}};
+// The copies folded into record 0, listed once in each of their cells.
+const std::vector<CellItemPair> kFoldedCells = {{5, 0}, {7, 0}, {9, 0}};
+
 void check_same_records(const ParsedData& a, const ParsedData& b) {
     CHECK(same_bytes(a.addr_points, b.addr_points));
     CHECK(same_bytes(a.addr_osm_ids, b.addr_osm_ids));
@@ -475,6 +480,40 @@ TEST(reorder_steps_match_on_tiny_inputs) {
         Shape s;
         s.n = n;
         check_steps_match_reference(5 + n, s);
+    }
+}
+
+TEST(reorder_addr_points_lists_folded_copies_once_per_cell) {
+    for (unsigned threads : kThreadCounts) {
+        ParsedData d;
+        AddrPoint a{};
+        a.lat = 1.5f;
+        a.lng = -2.25f;
+        a.housenumber_id = 3;
+        a.street_id = 4;
+        a.parent_way_id = NO_DATA;
+        a.vertex_offset = NO_DATA;
+        d.addr_points = {a, a};
+        d.sorted_addr_cells = kTwoCopiesCells;
+        reorder_addr_points(d, threads);
+        CHECK_EQ(d.addr_points.size(), size_t(1));
+        CHECK(same_pairs(d.sorted_addr_cells, kFoldedCells));
+    }
+}
+
+TEST(reorder_ways_lists_folded_copies_once_per_cell) {
+    for (unsigned threads : kThreadCounts) {
+        ParsedData d;
+        d.street_nodes = {{1.5f, -2.25f}, {3.0f, 0.0f}, {1.5f, -2.25f}, {3.0f, 0.0f}};
+        WayHeader w{};
+        w.node_count = 2;
+        w.name_id = 4;
+        d.ways = {w, w};
+        d.ways[1].node_offset = 2;
+        d.sorted_way_cells = kTwoCopiesCells;
+        reorder_ways(d, threads);
+        CHECK_EQ(d.ways.size(), size_t(1));
+        CHECK(same_pairs(d.sorted_way_cells, kFoldedCells));
     }
 }
 
