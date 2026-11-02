@@ -3,10 +3,10 @@
 //! builds one.
 use crate::build::{build_all, held_subs, index_meta, BuildOpts};
 use crate::constants::SUB_INDEXES;
-use crate::model::{PLACE_FLAG_HIDDEN, PLACE_FLAG_LABEL_OF};
+use crate::model::PLACE_FLAG_LABEL_OF;
 use query_server::{
     cell_id_at_level, AdminPolygon, Index, PlaceNode, PoiRecord, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE,
-    DEFAULT_STREET_CELL_LEVEL, NO_DATA, STR_TIER_COUNT,
+    DEFAULT_STREET_CELL_LEVEL, NO_DATA, PLACE_FLAG_HIDDEN, STR_TIER_COUNT,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};

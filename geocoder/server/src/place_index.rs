@@ -1,7 +1,8 @@
-//! The place index: the place nodes of each admin cell (the cell, at the admin cell level, of a
-//! node's point), laid out as the builder lays out a cell index (builder/src/cell_index_io.h): a
-//! cells file of rows, ascending by cell (u64 cell id, u32 offset of its list in the entries
-//! file), and an entries file of the lists (u16 count, then the node ids, ascending).
+//! The place index: the visible place nodes (`PlaceNode::is_visible`, the ones reverse geocoding
+//! reads) of each admin cell (the cell, at the admin cell level, of a node's point), laid out as
+//! the builder lays out a cell index (builder/src/cell_index_io.h): a cells file of rows,
+//! ascending by cell (u64 cell id, u32 offset of its list in the entries file), and an entries
+//! file of the lists (u16 count, then the node ids, ascending).
 //!
 //! Datasets don't ship it. `open` derives it from place_nodes.bin the first time a dataset loads,
 //! into DERIVED_DIR beside the dataset's files (or, where those can't be written, into a private
@@ -27,12 +28,11 @@ pub const ENTRIES_FILE: &str = "place_entries.idx";
 /// nodes (place_nodes.bin's stamp and sha256). Written last, so it names only a complete index.
 pub const SOURCE_FILE: &str = "place_index.json";
 /// The derivation's version: an index another version derived is derived again.
-const FORMAT: u64 = 1;
+const FORMAT: u64 = 2;
 /// Sort memory: the (cell, id) pairs past this many bytes go to sorted runs on disk, merged at
 /// the end, so a derivation's heap stays within a few MiB on planet.
 pub const RUN_BYTES: usize = 4 << 20;
 const NODE_BYTES: usize = std::mem::size_of::<PlaceNode>();
-const NAME_ID_AT: usize = 8;
 /// Place nodes read at once.
 const READ_NODES: usize = 1 << 14;
 /// The buffer of each sorted run while the runs merge, and of each file written.
@@ -327,9 +327,23 @@ fn read_nodes(mut nodes: impl Read, mut f: impl FnMut(&[u8])) -> Result<(), Fail
     }
 }
 
+/// The place node of its NODE_BYTES in place_nodes.bin.
+fn place_node(bytes: &[u8]) -> PlaceNode {
+    let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+    PlaceNode {
+        lat: f32::from_bits(u32_at(0)),
+        lng: f32::from_bits(u32_at(4)),
+        name_id: u32_at(8),
+        place_type: bytes[12],
+        _pad1: bytes[13],
+        _pad2: u16::from_le_bytes([bytes[14], bytes[15]]),
+        parent_poly_id: u32_at(16),
+    }
+}
+
 /// Derives the place index of the place nodes `nodes` reads (place_nodes.bin's bytes) at
-/// `cell_level` into `cells` and `entries`: a (cell, id) pair for each node but the tombstones
-/// (name_id NO_DATA, which Index::place_node reads as none), sorted in runs of at most
+/// `cell_level` into `cells` and `entries`: a (cell, id) pair for each visible node (the others,
+/// tombstones and hidden nodes, Index::place_node reads as none), sorted in runs of at most
 /// `run_bytes`; with more than one run, each goes to `spill_dir` and the runs merge. Returns the
 /// sha256 of the nodes read.
 pub(crate) fn derive(nodes: impl Read, cell_level: u64, run_bytes: usize, spill_dir: &Path, cells: impl Write,
@@ -342,15 +356,13 @@ pub(crate) fn derive(nodes: impl Read, cell_level: u64, run_bytes: usize, spill_
     let mut spill_error = None;
     read_nodes(nodes, |bytes| {
         sha.update(bytes);
-        for node in bytes.chunks_exact(NODE_BYTES) {
+        for node in bytes.chunks_exact(NODE_BYTES).map(place_node) {
             let id = next_id;
             next_id += 1;
-            if spill_error.is_some() || u32::from_le_bytes(node[NAME_ID_AT..NAME_ID_AT + 4].try_into().unwrap()) == NO_DATA {
+            if spill_error.is_some() || !node.is_visible() {
                 continue;
             }
-            let lat = f32::from_le_bytes(node[0..4].try_into().unwrap());
-            let lng = f32::from_le_bytes(node[4..8].try_into().unwrap());
-            run.push((cell_id_at_level(lat as f64, lng as f64, cell_level), id as u32));
+            run.push((cell_id_at_level(node.lat as f64, node.lng as f64, cell_level), id as u32));
             if run.len() == run_pairs {
                 match Run::spill(&mut run, spill_dir, runs.len()) {
                     Ok(spilled) => runs.push(spilled),
@@ -526,10 +538,9 @@ mod tests {
     /// The index of `nodes` as the builder writes one: each named node's id in its cell's list.
     fn builders_index(nodes: &[u8]) -> (Vec<u8>, Vec<u8>) {
         let mut lists: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
-        for (id, node) in nodes.chunks_exact(NODE_BYTES).enumerate() {
-            let word = |at: usize| u32::from_le_bytes(node[at..at + 4].try_into().unwrap());
-            if word(NAME_ID_AT) != NO_DATA {
-                let cell = cell_id_at_level(f32::from_bits(word(0)) as f64, f32::from_bits(word(4)) as f64, DEFAULT_ADMIN_CELL_LEVEL);
+        for (id, node) in nodes.chunks_exact(NODE_BYTES).map(place_node).enumerate() {
+            if node.name_id != NO_DATA {
+                let cell = cell_id_at_level(node.lat as f64, node.lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
                 lists.entry(cell).or_default().push(id as u32);
             }
         }
