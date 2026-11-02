@@ -226,6 +226,28 @@ TEST(build_merge_seq_matches_past_tombstones_behind_a_changed_record) {
     }
 }
 
+TEST(build_merge_seq_lands_no_far_jump_on_copies_of_a_tombstone) {
+    // Yesterday's tombstones in front of unchanged records; past a long
+    // run of zeroed slots the new side holds tombstones of the same kind,
+    // further than 10,000 records ahead. Copies of a tombstone place
+    // nothing: landing on them would re-send the unchanged records.
+    const std::string t = tombstones(16, '\xff');
+    auto got = merge_of(t + numbered(0, TAIL) + t, numbered(0, TAIL) + tombstones(DEAD, '\0') + t);
+    std::vector<Op> want = {{OP_DELETE_RUN, 16, ""}, {OP_MATCH_RUN, TAIL, ""}, {OP_DELETE_RUN, 16, ""},
+                            {OP_INSERT_RUN, DEAD + 16, tombstones(DEAD, '\0') + t}};
+    CHECK(got == want);
+}
+
+TEST(build_merge_seq_jumps_far_to_a_tombstone_the_records_after_it_place) {
+    // Past the dead run, a tombstone followed by unchanged records: they
+    // place it, so the jump onto it still goes further than 10,000 records.
+    auto got = merge_of(numbered(1000000, DEAD) + tombstones(1, '\xff') + numbered(0, TAIL),
+                        tombstones(DEAD, '\0') + tombstones(1, '\xff') + numbered(0, TAIL));
+    std::vector<Op> want = {{OP_DELETE_RUN, DEAD, ""}, {OP_INSERT_RUN, DEAD, tombstones(DEAD, '\0')},
+                            {OP_MATCH_RUN, 1 + TAIL, ""}};
+    CHECK(got == want);
+}
+
 TEST(build_merge_seq_still_matches_the_tombstones_both_days_hold) {
     // A run of yesterday's tombstones behind a deleted record: the window
     // reaching past it doesn't make it an insert.

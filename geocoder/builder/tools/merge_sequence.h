@@ -284,8 +284,9 @@ inline MergeSequence build_merge_seq(
     // side carried 39K tombstones; fresh old sides have none, which hid
     // this). Dead slots need no anchoring — they replay fine as plain
     // DELETE/INSERT.
+    constexpr size_t REACH = 10000;
     RecordJumpIndex new_index(new_data, use_hash ? new_n : 0, stride);
-    JumpWindow window(new_data, use_hash ? new_n : 0, stride, 10000);
+    JumpWindow window(new_data, use_hash ? new_n : 0, stride, REACH);
 
     while (oi < old_n && ni < new_n) {
         const char* op = old_data + oi * stride;
@@ -321,12 +322,20 @@ inline MergeSequence build_merge_seq(
             // one after the target. Two duplicates in a row (a pair of POIs
             // that changed slots) satisfied next_aligns and re-sent 4172
             // unchanged records of an oceania POI tier.
+            // Past REACH records, which only a run of identical records lets
+            // the window span, the run must not be copies of this record
+            // alone: they place nothing, and old tombstones landing on new
+            // ones there would re-send every unchanged record in between.
             constexpr size_t FAR_JUMP = 16;
             auto run_follows = [&](uint32_t cand) -> bool {
                 if (cand - ni <= FAR_JUMP) return true;
-                for (size_t j = 1; j < FAR_JUMP && oi + j < old_n && cand + j < new_n; j++)
-                    if (memcmp(old_data + (oi + j) * stride, new_data + (cand + j) * stride, stride) != 0) return false;
-                return true;
+                bool placed = cand - ni < REACH;
+                for (size_t j = 1; j < FAR_JUMP && oi + j < old_n && cand + j < new_n; j++) {
+                    const char* o = old_data + (oi + j) * stride;
+                    if (memcmp(o, new_data + (cand + j) * stride, stride) != 0) return false;
+                    placed = placed || memcmp(o, op, stride) != 0;
+                }
+                return placed;
             };
             if (best_ni != UINT32_MAX && best_ni > ni && next_aligns(best_ni) && run_follows(best_ni)) {
                 flush_match(); flush_del();
