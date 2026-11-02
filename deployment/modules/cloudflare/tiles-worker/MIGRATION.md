@@ -23,12 +23,19 @@ Do this right before merging, for dev and prod, while no tiles deploy is running
 group is idle). Run it from `deployment/modules/cloudflare/tiles-worker` with this branch checked out:
 
 ```sh
+set -euo pipefail
 export ENVIRONMENT=dev  # then prod
-# The backup holds the worker's secrets: keep it out of the repo.
-op run --env-file=../../../.env -- terragrunt run -- state pull > ~/"tiles-worker-$ENVIRONMENT.tfstate.backup"
-op run --env-file=../../../.env -- terragrunt run -- state rm 'cloudflare_workers_domain.tiles'
+OP_VAULT=tf_prod        # a 1Password vault only maintainers can read
+tg() { op run --env-file=../../../.env -- terragrunt run -- "$@"; }
+
+# The state holds the worker's secrets (Tigris key, metrics token), so it streams straight into 1Password and never
+# touches disk. With pipefail, a failed pull or upload stops the script before any state rm.
+tg state pull | op document create - --vault "$OP_VAULT" \
+  --title "tiles-worker-$ENVIRONMENT state before provider v5" --file-name "tiles-worker-$ENVIRONMENT.tfstate"
+
+tg state rm 'cloudflare_workers_domain.tiles'
 # prod only:
-op run --env-file=../../../.env -- terragrunt run -- state rm 'cloudflare_workers_domain.tiles_prod[0]'
+tg state rm 'cloudflare_workers_domain.tiles_prod[0]'
 ```
 
 Then re-run the PR's Plan Terragrunt jobs. Each environment should import its domains (1 in dev, 2 in prod), update
@@ -42,5 +49,11 @@ deploys until the merge.
 ## Afterwards
 
 Once both environments have applied, the `cloudflare_workers_custom_domains` data source and the `import` block in
-`workers.tf` can be deleted. To go back to v4, revert the module and push the backup with
-`terragrunt run -- state push -force <backup>`: v4 can't read state written by v5.
+`workers.tf` can be deleted. To go back to v4, revert the module and stream the backup back, again without a plaintext
+copy (v4 can't read state written by v5):
+
+```sh
+op document get "tiles-worker-$ENVIRONMENT state before provider v5" --vault "$OP_VAULT" | tg state push -force -
+```
+
+Delete the 1Password document once both environments have applied v5 and you no longer need the way back.
