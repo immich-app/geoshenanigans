@@ -286,20 +286,30 @@ void compute_way_parent_polygons(ParsedData& data, unsigned int num_threads) {
 
         struct PostalVote { uint32_t pid; uint32_t votes; float area; };
         struct Candidates {
-            std::vector<uint32_t> admins, postals;
+            uint64_t cell = 0;
+            std::vector<uint32_t> admins, postals;  // the centroid cell's
+            std::vector<PackedLocation> samples;
+            std::vector<uint64_t> other_cells;      // samples' cells past the centroid's
+            std::vector<uint32_t> sample_postals;
             std::vector<std::pair<uint32_t, uint32_t>> scratch;
             std::vector<PostalVote> postal_votes;
+        };
+        auto add_postals = [&](S2CellId cell, std::vector<uint32_t>& postals) {
+            for_each_admin_candidate(data, cell, [&](uint32_t id, const AdminPolygon& p) {
+                if (p.admin_level == 11) postals.push_back(id & ID_MASK);
+            });
         };
         walk_items_by_cell<Candidates>(order, num_threads,
             [&](S2CellId cell, Candidates& c) {
                 // Admin levels <= 10 compete for the parent chain, postal
                 // boundaries (11) for the postcode.
+                c.cell = cell.id();
                 c.admins.clear();
                 c.postals.clear();
                 for_each_admin_candidate(data, cell, [&](uint32_t id, const AdminPolygon& p) {
                     if (p.admin_level <= 10) c.admins.push_back(id);
-                    else if (p.admin_level == 11) c.postals.push_back(id & ID_MASK);
                 });
+                add_postals(cell, c.postals);
                 rank_candidates(c.admins, more_specific, c.scratch);
             },
             [&](uint32_t i, Candidates& c) {
@@ -332,28 +342,46 @@ void compute_way_parent_polygons(ParsedData& data, unsigned int num_threads) {
                 // `ST_Distance(way, poly_centroid)` closer than pure
                 // centroid containment.
                 // Votes count sampled vertices (every step-th, to bound
-                // work on huge ways), for the postal polygons of the
-                // centroid's cell. Polygons holding at least one sample
-                // vote in listed order: std::sort breaks (votes, area)
-                // ties by input order.
-                auto& postal_votes = c.postal_votes;
-                postal_votes.clear();
+                // work on huge ways). A postal polygon holding a sample is
+                // listed in that sample's own cell, which needn't be the
+                // centroid's.
                 uint8_t samples = cnt < 16 ? cnt : 16;
                 uint32_t step = cnt > samples ? cnt / samples : 1;
-                for (uint32_t pid : c.postals) {
+                c.samples.clear();
+                c.other_cells.clear();
+                for (uint32_t k = 0; k < cnt; k += step) {
+                    const auto& nd = data.street_nodes[w.node_offset + k];
+                    c.samples.push_back(point_e7(nd.lat, nd.lng));
+                    const uint64_t cell = admin_link_cell(c.samples.back()).id();
+                    if (cell != c.cell) c.other_cells.push_back(cell);
+                }
+                const std::vector<uint32_t>* postals = &c.postals;
+                if (!c.other_cells.empty()) {
+                    std::sort(c.other_cells.begin(), c.other_cells.end());
+                    c.other_cells.erase(std::unique(c.other_cells.begin(), c.other_cells.end()), c.other_cells.end());
+                    c.sample_postals = c.postals;
+                    for (uint64_t cell : c.other_cells) add_postals(S2CellId(cell), c.sample_postals);
+                    std::sort(c.sample_postals.begin(), c.sample_postals.end());
+                    c.sample_postals.erase(std::unique(c.sample_postals.begin(), c.sample_postals.end()),
+                                           c.sample_postals.end());
+                    postals = &c.sample_postals;
+                }
+                auto& postal_votes = c.postal_votes;
+                postal_votes.clear();
+                for (uint32_t pid : *postals) {
                     uint32_t votes = 0;
-                    for (uint32_t k = 0; k < cnt; k += step) {
-                        const auto& nd = data.street_nodes[w.node_offset + k];
-                        if (rings.contains(pid, point_e7(nd.lat, nd.lng))) votes++;
-                    }
+                    for (const PackedLocation& p : c.samples)
+                        if (rings.contains(pid, p)) votes++;
                     if (votes > 0) postal_votes.push_back({pid, votes, data.admin_polygons[pid].area});
                 }
-                // Sort: highest votes first, tiebreak by smaller area
-                // (more specific).
+                // Highest votes first, then the smaller area (more
+                // specific), then the lower osm id, whichever cells listed
+                // the polygons.
                 std::sort(postal_votes.begin(), postal_votes.end(),
-                    [](const PostalVote& a, const PostalVote& b) {
+                    [&](const PostalVote& a, const PostalVote& b) {
                         if (a.votes != b.votes) return a.votes > b.votes;
-                        return a.area < b.area;
+                        if (a.area != b.area) return a.area < b.area;
+                        return data.admin_osm_ids[a.pid] < data.admin_osm_ids[b.pid];
                     });
                 if (!postal_votes.empty()) {
                     data.way_postcode_ids[i] = data.admin_polygons[postal_votes[0].pid].name_id;

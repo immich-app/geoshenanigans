@@ -1,7 +1,8 @@
 // The builder's admin links (admin_links.h) on the polygons' exact rings:
 // a ring S2 won't take as a loop still gets its candidates, a point one e7
-// step inside one of two neighbours links to that one, and the candidates
-// don't depend on how a ring is written down.
+// step inside one of two neighbours links to that one, a street's postal
+// votes reach the cells of its vertices, and the candidates don't depend on
+// how a ring is written down.
 #include "admin_links.h"
 
 #include <algorithm>
@@ -62,6 +63,23 @@ struct Admins {
         CpuTicks cpu = CpuTicks::now();
         compute_poi_parent_polygons(data, 1, std::move(order), t, cpu);
     }
+
+    // A street way through these vertices, at f32 as the build holds them.
+    void add_way(const Ring& vertices) {
+        WayHeader w{};
+        w.node_offset = static_cast<uint32_t>(data.street_nodes.size());
+        w.node_count = static_cast<uint16_t>(vertices.size());
+        w.name_id = NO_DATA;
+        for (const PackedLocation& v : vertices)
+            data.street_nodes.push_back({static_cast<float>(v.lat()), static_cast<float>(v.lon())});
+        data.ways.push_back(w);
+    }
+
+    bool listed(PackedLocation p, uint32_t pid) const {
+        auto it = data.cell_to_admin.find(admin_link_cell(p).id());
+        return it != data.cell_to_admin.end() &&
+               std::any_of(it->second.begin(), it->second.end(), [&](uint32_t id) { return (id & ID_MASK) == pid; });
+    }
 };
 
 // The ring from its k-th vertex on, the same ring written from another start.
@@ -119,6 +137,26 @@ TEST(a_poi_one_step_inside_one_of_two_neighbours_links_to_that_one) {
     for (size_t i = 0; i < want.size(); i++) {
         CHECK_EQ(a.data.poi_records[i].parent_poly_id, want[i]);
         CHECK_EQ(a.data.poi_records[i].parent_postcode_id, NO_DATA);
+    }
+}
+
+TEST(a_streets_postcode_is_the_postal_polygon_holding_most_of_its_vertices_wherever_its_centroid_lies) {
+    // Level-10 cells meet along the equator here. Two of the street's three
+    // vertices lie in a postal polygon wholly north of it; the third vertex
+    // and the vertex average lie south of it, in another postal polygon or
+    // in none.
+    const Ring street{at(0.010, 0.03), at(0.012, 0.03), at(-0.060, 0.03)};
+    const PackedLocation centroid = at((0.010 + 0.012 - 0.060) / 3, 0.03);
+    for (const bool south_polygon : {false, true}) {
+        Admins a;
+        const uint32_t north = a.add(11, closed({at(0.005, 0.02), at(0.005, 0.04), at(0.015, 0.04), at(0.015, 0.02)}));
+        if (south_polygon) a.add(11, closed({at(-0.07, 0.02), at(-0.07, 0.04), at(-0.005, 0.04), at(-0.005, 0.02)}));
+        a.add_way(street);
+        a.map();
+        CHECK(a.listed(street[0], north));
+        CHECK(!a.listed(centroid, north));
+        compute_way_parent_polygons(a.data, 1);
+        CHECK_EQ(a.data.way_postcode_ids[0], a.data.admin_polygons[north].name_id);
     }
 }
 
