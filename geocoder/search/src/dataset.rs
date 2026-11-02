@@ -8,7 +8,7 @@
 use crate::build::{self, build_held, has_extra_names, has_sub_index, has_unfinished_publish, held_subs, sub_index_files, BuildOpts, Contended, HeldIndexDir};
 use crate::constants::*;
 use crate::reader::SearchIndex;
-use query_server::Index;
+use query_server::{FileStamp, Index};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -31,29 +31,10 @@ pub const DATASET_FILES: [&str; 7] = [
 /// The sha256 (hex) of each dataset file present, by name.
 pub type Fingerprint = BTreeMap<String, String>;
 
-/// A file's stat when it was hashed: its hash is reused while the file keeps it. Patches write
-/// new files (a new inode and mtime), so a patched file is always hashed again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Stamp {
-    size: u64,
-    mtime_ns: u128,
-    ino: u64,
-}
-
-impl Stamp {
-    fn of(m: &std::fs::Metadata) -> Stamp {
-        let mtime_ns = m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
-        #[cfg(unix)]
-        let ino = std::os::unix::fs::MetadataExt::ino(m);
-        #[cfg(not(unix))]
-        let ino = 0;
-        Stamp { size: m.len(), mtime_ns, ino }
-    }
-}
-
-/// The stat of each dataset file present, by name.
+/// The stat of each dataset file present, by name. A file's hash is reused while it keeps its
+/// stamp: a patched file is always hashed again.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Stamps(BTreeMap<String, Stamp>);
+pub struct Stamps(BTreeMap<String, FileStamp>);
 
 impl Stamps {
     /// The stamps of the dataset files in `dir`.
@@ -62,7 +43,7 @@ impl Stamps {
         for name in DATASET_FILES {
             match std::fs::metadata(dir.join(name)) {
                 Ok(m) => {
-                    out.insert(name.to_string(), Stamp::of(&m));
+                    out.insert(name.to_string(), FileStamp::of(&m));
                 }
                 Err(e) if e.kind() == ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
@@ -88,17 +69,14 @@ pub fn load<T>(dir: &Path, load: impl FnOnce() -> Result<T, String>) -> Result<(
 /// Hashes of dataset files, each with the stat it was taken at; kept beside an index
 /// (HASH_CACHE_FILE) so opening it does not read the dataset again.
 #[derive(Default)]
-pub struct HashCache(BTreeMap<String, (Stamp, String)>);
+pub struct HashCache(BTreeMap<String, (FileStamp, String)>);
 
 impl HashCache {
     /// The cache at `path`; empty when it is missing or unreadable.
     pub fn load(path: &Path) -> HashCache {
         let Ok(text) = std::fs::read_to_string(path) else { return HashCache::default() };
         let Ok(Value::Object(files)) = serde_json::from_str::<Value>(&text) else { return HashCache::default() };
-        let entry = |v: &Value| -> Option<(Stamp, String)> {
-            let stamp = Stamp { size: v["size"].as_u64()?, mtime_ns: v["mtime_ns"].as_str()?.parse().ok()?, ino: v["ino"].as_u64()? };
-            Some((stamp, v["sha256"].as_str()?.to_string()))
-        };
+        let entry = |v: &Value| Some((FileStamp::from_json(v)?, v["sha256"].as_str()?.to_string()));
         HashCache(files.iter().filter_map(|(name, v)| Some((name.clone(), entry(v)?))).collect())
     }
 
@@ -106,7 +84,11 @@ impl HashCache {
         let files: serde_json::Map<String, Value> = self
             .0
             .iter()
-            .map(|(name, (s, sha))| (name.clone(), json!({"size": s.size, "mtime_ns": s.mtime_ns.to_string(), "ino": s.ino, "sha256": sha})))
+            .map(|(name, (stamp, sha))| {
+                let mut entry = stamp.to_json();
+                entry["sha256"] = json!(sha);
+                (name.clone(), entry)
+            })
             .collect();
         std::fs::write(path, serde_json::to_string_pretty(&Value::Object(files)).unwrap())
     }
@@ -400,7 +382,7 @@ mod tests {
         let (_, origin) = open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap();
 
         assert_eq!(origin, Origin::Current);
-        assert_eq!(Stamp::of(&std::fs::metadata(index.join("places.fst")).unwrap()), Stamp::of(&built));
+        assert_eq!(FileStamp::of(&std::fs::metadata(index.join("places.fst")).unwrap()), FileStamp::of(&built));
     }
 
     #[test]
@@ -638,14 +620,14 @@ mod tests {
         let index = ds.0.join("search");
         with_poi(["Testville", "Otherton"], "Old Mill").write(&ds.0);
         build_subs(&ds.0, &index, SUB_INDEXES).unwrap();
-        let poi = Stamp::of(&std::fs::metadata(index.join("poi.fst")).unwrap());
+        let poi = FileStamp::of(&std::fs::metadata(index.join("poi.fst")).unwrap());
 
         build_subs(&ds.0, &index, &["places"]).unwrap();
 
         let (geo, stamps) = load_dataset(&ds.0);
         let (idx, origin) = open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap();
         assert_eq!(origin, Origin::Current);
-        assert_eq!(Stamp::of(&std::fs::metadata(index.join("poi.fst")).unwrap()), poi);
+        assert_eq!(FileStamp::of(&std::fs::metadata(index.join("poi.fst")).unwrap()), poi);
         assert_eq!((names(&idx, "testville"), names(&idx, "old mill")), (vec!["Testville".to_string()], vec!["Old Mill".to_string()]));
     }
 

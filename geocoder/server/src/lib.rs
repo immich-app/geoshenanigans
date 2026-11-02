@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 mod admin_geometry;
 pub use admin_geometry::{AdminGeometry, AdminPoint, PipMemo};
+mod file_stamp;
+pub use file_stamp::FileStamp;
 #[cfg(test)]
 mod scratch_dir;
 
