@@ -137,6 +137,12 @@ build's compress step.
 A component's `optional_files` are written only when the data has them
 (`interp_postcodes.bin` in TIGER regions, `postal_*` where postal
 boundaries exist); a client skips any that are absent from `files`.
+
+A component's `variants` add one more component, picked by the whole
+selection: the first variant whose `when` names the selection's value on
+every axis it lists (a variant without `when` takes any selection). Its
+`component` is resolved like an axis component, `files`, `optional_files`,
+`replaces` and all.
 `strings_layout.json` and `poi_meta.json` are listed and compressed like
 the `.bin` files, because the server can't load a region without them.
 
@@ -149,8 +155,9 @@ the `.bin` files, because the server can't load a region without them.
 2. Choose a date >= oldest_indexes (typically use latest)
 3. GET builds/{date}/configurations.json
 4. Choose region (e.g. europe), mode (e.g. full), quality (e.g. q1), and POI tier (e.g. notable)
-5. Download every file the selected components list (their `files`, the
-   `optional_files` that appear in `files`, minus any `replaces`), each as
+5. Download every file the selected components and the variants they pick
+   list (their `files`, the `optional_files` that appear in `files`, minus
+   any `replaces`), each as
    <path>.zst, decompress, and check it against its sha256:
    - builds/{date}/europe/full/…          (24 files + up to 4 optional)
    - builds/{date}/europe/quality/q1/…    (2 files + up to 2 optional)

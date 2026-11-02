@@ -124,6 +124,24 @@ class ResolveTest(unittest.TestCase):
                                  "planet/small/shared.json"])
         self.assertEqual(optional, {"planet/small/opt.bin"})
 
+    def test_takes_the_first_variant_the_selection_matches(self):
+        cfg = {"components": {
+            "mode.small": {"files": ["{region}/small/a.bin"],
+                           "variants": [{"when": {"mode": "small", "poi_tier": "none"}, "component": "small/alone"},
+                                        {"component": "small/beside"},
+                                        {"component": "small/never"}]},
+            "small/alone": {"files": ["{region}/small/b.bin"]},
+            "small/beside": {"files": ["{region}/small-poi/b.bin"], "replaces": ["{region}/small/a.bin"]},
+            "small/never": {"files": ["{region}/never.bin"]},
+            "poi_tier.major": {"files": ["{region}/poi/{poi_tier}/p.bin"]},
+        }}
+
+        alone, _ = sut.resolve(cfg, dict(self.SEL, poi_tier="none"))
+        beside, _ = sut.resolve(cfg, dict(self.SEL, poi_tier="major"))
+
+        self.assertEqual(alone, ["planet/small/a.bin", "planet/small/b.bin"])
+        self.assertEqual(beside, ["planet/poi/major/p.bin", "planet/small-poi/b.bin"])
+
     def test_links_a_set_without_a_missing_optional_file_but_not_without_a_required_one(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = os.path.join(tmp, "out")

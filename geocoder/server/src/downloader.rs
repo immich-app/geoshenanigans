@@ -65,6 +65,19 @@ pub struct Component {
     /// sidecars, postal boundaries). Absent from the manifest = skip.
     #[serde(default)]
     pub optional_files: Vec<String>,
+    /// Components of which the selection takes one more: the first whose
+    /// `when` it matches.
+    #[serde(default)]
+    pub variants: Vec<Variant>,
+}
+
+/// A component a selection takes when it has every axis value `when` names
+/// (an empty `when`: any selection).
+#[derive(Deserialize, Debug, Clone)]
+pub struct Variant {
+    #[serde(default)]
+    pub when: BTreeMap<String, String>,
+    pub component: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -85,8 +98,26 @@ pub struct RegionSelection {
     pub poi_tier: String,
 }
 
-/// Resolved file set for a single region after walking components +
-/// applying `replaces`. Each path is relative to the build root (e.g.
+impl RegionSelection {
+    /// The selection's value on an axis of configurations.axes.
+    pub fn axis(&self, name: &str) -> Option<&str> {
+        match name {
+            "region" => Some(&self.region),
+            "mode" => Some(&self.mode),
+            "quality" => Some(&self.quality),
+            "poi_tier" => Some(&self.poi_tier),
+            _ => None,
+        }
+    }
+
+    fn matches(&self, when: &BTreeMap<String, String>) -> bool {
+        when.iter().all(|(axis, value)| self.axis(axis) == Some(value.as_str()))
+    }
+}
+
+/// Resolved file set for a single region after walking components (and
+/// the variant of each the selection matches) + applying `replaces`. Each
+/// path is relative to the build root (e.g.
 /// "europe/full/admin_cells.bin"); look up sizes/hashes in
 /// configurations.files.
 pub struct ResolvedFiles {
@@ -131,6 +162,9 @@ pub fn resolve_files(cfg: &Configurations, sel: &RegionSelection) -> ResolvedFil
             files.push(path);
         }
         for r in &c.replaces { replaced.insert(substitute(r, sel)); }
+        if let Some(v) = c.variants.iter().find(|v| sel.matches(&v.when)) {
+            visit(cfg, sel, &v.component, seen, files, optional, replaced);
+        }
     }
 
     for cid in &component_ids {
@@ -399,6 +433,7 @@ mod tests {
             replaces: replaces.iter().map(|s| s.to_string()).collect(),
             extends: extends.map(|s| s.to_string()),
             optional_files: Vec::new(),
+            variants: Vec::new(),
         }
     }
 
@@ -509,6 +544,36 @@ mod tests {
         let c = cfg(vec![("something.else", component(&["x.bin"], &[], None))]);
         let s = sel("eu", "full", "q2.5", "none");
         assert!(resolve_files(&c, &s).paths.is_empty());
+    }
+
+    #[test]
+    fn resolve_files_takes_the_first_variant_the_selection_matches() {
+        let c = Configurations {
+            build: BuildMeta { date: "2026-01-01".into() },
+            components: serde_json::from_value(serde_json::json!({
+                "mode.small": {
+                    "files": ["{region}/small/a.bin"],
+                    "variants": [
+                        { "when": { "mode": "small", "poi_tier": "none" }, "component": "small/alone" },
+                        { "component": "small/beside" },
+                        { "component": "small/never" }
+                    ]
+                },
+                "small/alone": { "files": ["{region}/small/b.bin"] },
+                "small/beside": {
+                    "files": ["{region}/small-poi/b.bin"],
+                    "replaces": ["{region}/small/a.bin"]
+                },
+                "small/never": { "files": ["{region}/never.bin"] },
+                "poi_tier.major": { "files": ["{region}/poi/{poi_tier}/p.bin"] }
+            })).unwrap(),
+            files: BTreeMap::new(),
+        };
+
+        assert_eq!(resolve_files(&c, &sel("eu", "small", "q2.5", "none")).paths,
+                   vec!["eu/small/a.bin".to_string(), "eu/small/b.bin".to_string()]);
+        assert_eq!(resolve_files(&c, &sel("eu", "small", "q2.5", "major")).paths,
+                   vec!["eu/poi/major/p.bin".to_string(), "eu/small-poi/b.bin".to_string()]);
     }
 
     #[test]
