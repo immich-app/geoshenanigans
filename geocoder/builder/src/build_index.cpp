@@ -61,6 +61,7 @@
 #include "string_dict.h"
 #include "vertex_pack.h"
 #include "memory_limit.h"
+#include "output_dir.h"
 #include "write_schedule.h"
 
 
@@ -2410,6 +2411,7 @@ static std::pair<size_t, std::future<void>> grow_beside(std::vector<T>& out, con
 static int run(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
+        std::cerr << "  <output-dir> must be new or empty" << std::endl;
         std::cerr << std::endl;
         std::cerr << "Options:" << std::endl;
         std::cerr << "  --street-level N       S2 cell level for streets (default: 17)" << std::endl;
@@ -2500,6 +2502,7 @@ static int run(int argc, char* argv[]) {
             input_files.push_back(arg);
         }
     }
+    require_new_or_empty_output_dir(output_dir);
 
     // Set global simplification mode
     kSimplifyMode = simplify_mode;
