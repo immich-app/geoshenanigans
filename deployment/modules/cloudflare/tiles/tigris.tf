@@ -8,9 +8,12 @@ resource "tigris_bucket" "tiles_geo" {
   default_storage_tier = "STANDARD"
   enable_snapshot      = false
 
+  # Matches the bucket as Tigris has it: ams appeared on 2026-11-02 and Tigris no longer accepts hkg for new dual
+  # configurations, so any change to this list is refused until hkg goes.
   location {
     type = "dual"
     regions = [
+      "ams",
       "fra",
       "gru",
       "hkg",
