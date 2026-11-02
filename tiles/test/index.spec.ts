@@ -404,9 +404,18 @@ describe('gateway', () => {
       tiles: () => new Response('Tile not found', { status: 404, headers: { 'Cache-Control': 'no-store' } }),
     });
     expect(response.status).toBe(404);
-    expect(response.headers.has('Cache-Control')).toBe(false);
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
     expect(response.headers.has('ETag')).toBe(false);
     expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
+  });
+
+  it('keeps a failure from Tiles uncached by clients', async () => {
+    const { response } = await fetchGateway('/v1/1/0/0.mvt', {
+      tiles: () => new Response('Internal Server Error', { status: 500, headers: { 'Cache-Control': 'no-store' } }),
+    });
+    expect(response.status).toBe(500);
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+    expect(response.headers.has('ETag')).toBe(false);
   });
 
   it('counts responses the cache answered as CDN hits, with their cache status', async () => {

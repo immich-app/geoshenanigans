@@ -145,7 +145,9 @@ async function handleRequest(
     respHeaders.set(Header.CF_CACHE_STATUS, response.headers.get(Header.CF_CACHE_STATUS)!);
   }
   if (response.status !== 200) {
-    // A missing tile or a failure isn't kept by clients, as it isn't by the edge.
+    // A missing tile or a failure isn't kept by clients, as it isn't by the edge. Without an explicit policy a 404 is
+    // open to heuristic caching.
+    respHeaders.set(Header.CACHE_CONTROL, 'no-store');
     return new Response(response.body, { headers: respHeaders, status: response.status });
   }
   respHeaders.set(Header.CACHE_CONTROL, policy.cacheControl);
