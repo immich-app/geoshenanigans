@@ -12,6 +12,9 @@ use std::sync::Arc;
 
 mod admin_geometry;
 pub use admin_geometry::{AdminGeometry, AdminPoint, PipMemo};
+mod file_stamp;
+pub use file_stamp::FileStamp;
+mod place_index;
 #[cfg(test)]
 mod scratch_dir;
 
@@ -370,6 +373,18 @@ pub struct PlaceNode {
     /// that claims the node, which place search labels with it. Else
     /// `NO_DATA`. Reverse geocoding doesn't read it.
     pub parent_poly_id: u32,
+}
+
+/// PlaceNode._pad1 bit: a node a boundary claims. It keeps its name, the boundary's label for
+/// place search, but reverse geocoding skips it.
+pub const PLACE_FLAG_HIDDEN: u8 = 0x02;
+
+impl PlaceNode {
+    /// Whether reverse geocoding reads the node: it has a name (it is no tombstone) and is not
+    /// hidden.
+    pub fn is_visible(&self) -> bool {
+        self.name_id != NO_DATA && self._pad1 & PLACE_FLAG_HIDDEN == 0
+    }
 }
 
 // POI category metadata — loaded from poi_meta.json (written by builder)
@@ -1007,6 +1022,8 @@ pub struct Index {
     pub poi_vertices: Option<FileBytes>,
     pub poi_meta: PoiMeta,
     pub place_nodes: Option<FileBytes>,
+    // The place index of place_nodes, which the dataset doesn't ship: derived from it at load
+    // (place_index.rs).
     pub place_cells: Option<FileBytes>,
     pub place_entries: Option<FileBytes>,
     // Parent chain files (Nominatim-style address walk)
@@ -1128,7 +1145,12 @@ pub struct GeoCellOffsets {
 
 pub fn mmap_file(path: &str) -> Result<FileBytes, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path, e))?;
-    let mmap = unsafe { Mmap::map(&file).map_err(|e| format!("Failed to mmap {}: {}", path, e))? };
+    mmap_opened(&file, path)
+}
+
+/// `file`, opened at `path`, mapped as `mmap_file` maps one.
+fn mmap_opened(file: &File, path: &str) -> Result<FileBytes, String> {
+    let mmap = unsafe { Mmap::map(file).map_err(|e| format!("Failed to mmap {}: {}", path, e))? };
     // MADV_RANDOM disables kernel readahead.  All our access patterns are
     // random index lookups (cell binary search, polygon vertex slices,
     // string offsets) — readahead pulls in 32 pages of neighbours per
@@ -1174,6 +1196,20 @@ fn mmap_group(dir: &str, names: &[&str]) -> Result<Vec<Option<FileBytes>>, Strin
     Ok(maps)
 }
 
+/// The place nodes of the index in `dir` mapped, and their place index at `cell_level`
+/// (`place_index::open`, which derives it at the first load); neither without place_nodes.bin.
+fn load_place_nodes(dir: &str, cell_level: u64) -> Result<(Option<FileBytes>, Option<place_index::PlaceIndex>), String> {
+    let path = format!("{}/place_nodes.bin", dir);
+    let file = match File::open(&path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((None, None)),
+        Err(e) => return Err(format!("Failed to open {}: {}", path, e)),
+    };
+    let nodes = mmap_opened(&file, &path)?;
+    let index = place_index::open(std::path::Path::new(dir), &file, cell_level)?;
+    Ok((Some(nodes), Some(index)))
+}
+
 impl Index {
     pub fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
         // Distance budget used by the primary-feature selection. The
@@ -1210,9 +1246,11 @@ impl Index {
         let [poi_cells, poi_entries, poi_records, poi_vertices]: [Option<FileBytes>; 4] =
             mmap_group(dir, &["poi_cells.bin", "poi_entries.bin", "poi_records.bin", "poi_vertices.bin"])?
                 .try_into().map_err(|_| "poi group arity")?;
-        let [place_nodes, place_cells, place_entries]: [Option<FileBytes>; 3] =
-            mmap_group(dir, &["place_nodes.bin", "place_cells.bin", "place_entries.bin"])?
-                .try_into().map_err(|_| "place group arity")?;
+        let (place_nodes, place_index) = load_place_nodes(dir, admin_cell_level)?;
+        let (place_cells, place_entries) = match place_index {
+            Some(index) => (Some(index.cells), Some(index.entries)),
+            None => (None, None),
+        };
         let [postal_polygons, postal_vertices]: [Option<FileBytes>; 2] =
             mmap_group(dir, &["postal_polygons.bin", "postal_vertices.bin"])?
                 .try_into().map_err(|_| "postal group arity")?;
@@ -1299,9 +1337,7 @@ impl Index {
         let total = m.len() / std::mem::size_of::<PlaceNode>() as u64;
         if (idx as u64) >= total { return None; }
         let pn = m.read_at::<PlaceNode>(idx as u64);
-        // _pad1 bit 1: a node a boundary claims (hidden, keeps its name for search)
-        if pn.name_id == NO_DATA || pn._pad1 & 0x02 != 0 { return None; }
-        Some(pn)
+        pn.is_visible().then_some(pn)
     }
 
     pub fn poi_record(&self, idx: u32) -> Option<PoiRecord> {
@@ -3734,19 +3770,21 @@ mod query_tests {
             }
             admin_pairs.push((cell((s + n) / 2.0, (w + e) / 2.0), id as u32));
         }
-        let (mut records, mut place_pairs) = (Vec::new(), Vec::new());
-        for (id, &(lat, lng, node, place_type)) in nodes.iter().enumerate() {
+        let mut records = Vec::new();
+        for &(lat, lng, node, place_type) in nodes {
             records.extend_from_slice(&lat.to_le_bytes());
             records.extend_from_slice(&lng.to_le_bytes());
             u32s(&mut records, &[name(node)]);
             records.extend_from_slice(&[place_type, 0, 0, 0]);
             u32s(&mut records, &[NO_DATA]);
-            place_pairs.push((cell(lat, lng), id as u32));
         }
         assert_eq!(polygons.len(), boundaries.len() * std::mem::size_of::<AdminPolygon>());
         assert_eq!(records.len(), nodes.len() * std::mem::size_of::<PlaceNode>());
         let (admin_cells, admin_entries) = cell_index(admin_pairs);
-        let (place_cells, place_entries) = cell_index(place_pairs);
+        // Derived as a load derives it; a few nodes fit one run, so nothing spills.
+        let (mut place_cells, mut place_entries) = (Vec::new(), Vec::new());
+        place_index::derive(&records[..], DEFAULT_ADMIN_CELL_LEVEL, place_index::RUN_BYTES, &std::env::temp_dir(),
+                            &mut place_cells, &mut place_entries).unwrap();
         let end = strings.len() as u32;
         Index {
             geo_cells: None,
@@ -3770,8 +3808,8 @@ mod query_tests {
             poi_vertices: None,
             poi_meta: PoiMeta::from_json("{}"),
             place_nodes: Some(FileBytes::Owned(records)),
-            place_cells: Some(place_cells),
-            place_entries: Some(place_entries),
+            place_cells: Some(FileBytes::Owned(place_cells)),
+            place_entries: Some(FileBytes::Owned(place_entries)),
             way_parents: None,
             admin_parents: None,
             addr_postcodes: None,
@@ -3813,7 +3851,7 @@ mod query_tests {
             records[offset..offset + bytes.len()].copy_from_slice(bytes);
             idx
         };
-        let (hidden, nameless) = (with(13, &[0x02]), with(8, &NO_DATA.to_le_bytes()));
+        let (hidden, nameless) = (with(13, &[PLACE_FLAG_HIDDEN]), with(8, &NO_DATA.to_le_bytes()));
 
         let got = answer(&hidden, -77.8494, 166.768);
 
@@ -6590,6 +6628,30 @@ mod query_path_tests {
             self
         }
 
+        /// A place node a boundary claims, which keeps its name for place search: hidden.
+        fn claimed_place(&mut self, name: &str, place_type: u8, north_m: f64, east_m: f64) -> &mut Self {
+            self.place(name, place_type, north_m, east_m);
+            self.place_nodes.last_mut().unwrap()._pad1 = PLACE_FLAG_HIDDEN;
+            self
+        }
+
+        /// A tombstone: the slot of a place node gone since an earlier build.
+        fn tombstone(&mut self) -> &mut Self {
+            self.place_nodes.push(PlaceNode { lat: 0.0, lng: 0.0, name_id: NO_DATA, place_type: 0, _pad1: 0, _pad2: 0, parent_poly_id: NO_DATA });
+            self
+        }
+
+        /// The place index the builder wrote beside place_nodes.bin when datasets shipped it:
+        /// each place node but the tombstones in the admin cell of its point.
+        fn builders_place_index(&self) -> (Vec<u8>, Vec<u8>) {
+            let mut lists: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+            for (id, pn) in self.place_nodes.iter().enumerate().filter(|(_, pn)| pn.name_id != NO_DATA) {
+                let cell = cell_id_at_level(pn.lat as f64, pn.lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
+                lists.entry(cell).or_default().push(id as u32);
+            }
+            cell_files(&lists)
+        }
+
         /// A named street through points given as (north, east) metres.
         fn street(&mut self, name: &str, points_m: &[(f64, f64)]) -> &mut Self {
             let name_id = self.string(name);
@@ -6637,19 +6699,16 @@ mod query_path_tests {
 
             if !self.place_nodes.is_empty() {
                 let mut nodes = Vec::new();
-                let mut place_cells: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
-                for (id, pn) in self.place_nodes.iter().enumerate() {
+                for pn in &self.place_nodes {
                     nodes.extend_from_slice(&pn.lat.to_le_bytes());
                     nodes.extend_from_slice(&pn.lng.to_le_bytes());
                     nodes.extend_from_slice(&pn.name_id.to_le_bytes());
-                    nodes.extend_from_slice(&[pn.place_type, 0, 0, 0]);
+                    nodes.extend_from_slice(&[pn.place_type, pn._pad1]);
+                    nodes.extend_from_slice(&pn._pad2.to_le_bytes());
                     nodes.extend_from_slice(&pn.parent_poly_id.to_le_bytes());
-                    let cell = cell_id_at_level(pn.lat as f64, pn.lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
-                    place_cells.entry(cell).or_default().push(id as u32);
                 }
                 assert_eq!(nodes.len(), self.place_nodes.len() * std::mem::size_of::<PlaceNode>());
-                let (cells, entries) = cell_files(&place_cells);
-                files.extend([("place_nodes.bin", nodes), ("place_cells.bin", cells), ("place_entries.bin", entries)]);
+                files.push(("place_nodes.bin", nodes));
             }
 
             if !self.streets.is_empty() {
@@ -6694,16 +6753,122 @@ mod query_path_tests {
             files
         }
 
+        /// Writes the files into `dir` the way a patch replaces one: a new file renamed over it.
+        fn write(&self, dir: &std::path::Path) {
+            for (name, bytes) in self.files() {
+                let new = dir.join(format!("{name}.new"));
+                std::fs::write(&new, bytes).unwrap();
+                std::fs::rename(&new, dir.join(name)).unwrap();
+            }
+        }
+
         /// Writes the files into a fresh directory and loads them. The
         /// directory is removed once loaded; the maps keep the bytes.
         fn load(&self) -> Index {
             let dir = ScratchDir::new();
-            for (name, bytes) in self.files() {
-                std::fs::write(dir.path().join(name), bytes).unwrap();
-            }
-            Index::load(dir.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL,
-                        DEFAULT_SEARCH_DISTANCE).unwrap()
+            self.write(dir.path());
+            load_dir(dir.path())
         }
+    }
+
+    fn load_dir(dir: &std::path::Path) -> Index {
+        Index::load(dir.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap()
+    }
+
+    /// The bytes of the place index loading the dataset in `dir` derived there.
+    fn derived_place_index(dir: &std::path::Path) -> (Vec<u8>, Vec<u8>) {
+        let derived = dir.join("derived");
+        (std::fs::read(derived.join("place_cells.idx")).unwrap(), std::fs::read(derived.join("place_entries.idx")).unwrap())
+    }
+
+    /// Testland with Oldtown, a village 1 km north and east of the origin, a tombstone, and
+    /// Lowfield, a hamlet 20 km south of it in another admin cell.
+    fn oldtown() -> TestIndex {
+        let mut index = TestIndex::new();
+        index.place("Oldtown", 2, 1_000.0, 1_000.0).tombstone().place("Lowfield", 4, -20_000.0, 0.0);
+        index
+    }
+
+    #[test]
+    fn a_dataset_without_a_place_index_finds_its_places() {
+        let dir = ScratchDir::new();
+        oldtown().write(dir.path());
+        assert!(!dir.path().join("place_cells.bin").exists() && !dir.path().join("place_entries.bin").exists());
+
+        let index = load_dir(dir.path());
+
+        assert_eq!(address_at(&index, 1_000.0, 1_100.0)["village"], "Oldtown");
+        assert_eq!(address_at(&index, -20_000.0, 100.0)["hamlet"], "Lowfield");
+    }
+
+    #[test]
+    fn the_derived_place_index_is_the_one_the_builder_wrote() {
+        let dir = ScratchDir::new();
+        let dataset = oldtown();
+        dataset.write(dir.path());
+
+        load_dir(dir.path());
+
+        let (cells, entries) = dataset.builders_place_index();
+        assert_eq!(cells.len(), 2 * 12, "the fixture's places sit in two cells");
+        assert_eq!(derived_place_index(dir.path()), (cells, entries));
+    }
+
+    #[test]
+    fn a_hidden_place_node_is_not_in_the_derived_entries() {
+        let dir = ScratchDir::new();
+        let mut dataset = oldtown();
+        dataset.claimed_place("Claimed", 2, 1_000.0, 1_000.0).claimed_place("Far", 2, 60_000.0, 0.0);
+        dataset.write(dir.path());
+        assert_eq!(dataset.builders_place_index().0.len(), 3 * 12, "one claimed node beside Oldtown, one in a cell of its own");
+
+        load_dir(dir.path());
+
+        assert_eq!(derived_place_index(dir.path()), oldtown().builders_place_index());
+    }
+
+    #[test]
+    fn a_replaced_place_nodes_file_is_derived_again() {
+        let dir = ScratchDir::new();
+        oldtown().write(dir.path());
+        load_dir(dir.path());
+        let mut moved = TestIndex::new();
+        moved.place("Newtown", 2, -20_000.0, 0.0);
+
+        moved.write(dir.path());
+        let index = load_dir(dir.path());
+
+        assert_eq!(address_at(&index, -20_000.0, 100.0)["village"], "Newtown");
+        assert_eq!(address_at(&index, 1_000.0, 1_100.0).get("village"), None);
+        assert_eq!(derived_place_index(dir.path()), moved.builders_place_index());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_place_index_copied_with_its_dataset_is_used_as_is() {
+        use std::os::unix::fs::MetadataExt;
+        // As a dataset an image ships, derived when the image was built: every file a copy, of
+        // a new inode.
+        let (built, copied) = (ScratchDir::new(), ScratchDir::new());
+        oldtown().write(built.path());
+        load_dir(built.path());
+        let derived = copied.path().join("derived");
+        std::fs::create_dir(&derived).unwrap();
+        for dir in ["", "derived"] {
+            for entry in std::fs::read_dir(built.path().join(dir)).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_file() {
+                    std::fs::copy(&path, copied.path().join(dir).join(path.file_name().unwrap())).unwrap();
+                }
+            }
+        }
+        let inodes = || ["place_cells.idx", "place_entries.idx"].map(|name| std::fs::metadata(derived.join(name)).unwrap().ino());
+        let copies = inodes();
+
+        let index = load_dir(copied.path());
+
+        assert_eq!(address_at(&index, 1_000.0, 1_100.0)["village"], "Oldtown");
+        assert_eq!(inodes(), copies, "the copy was derived again");
     }
 
     /// The address dict of the answer at `north_m`, `east_m` from the origin.

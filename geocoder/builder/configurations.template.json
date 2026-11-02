@@ -2,7 +2,7 @@
   "schema_version": 1,
   "build": {
     "version": 17,
-    "patch_version": 12
+    "patch_version": 13
   },
   "axes": {
     "region": {
@@ -171,8 +171,6 @@
         "{region}/admin-minimal/admin_entries.bin",
         "{region}/admin-minimal/admin_polygons.bin",
         "{region}/admin-minimal/admin_vertices.bin",
-        "{region}/admin-minimal/place_cells.bin",
-        "{region}/admin-minimal/place_entries.bin",
         "{region}/admin-minimal/place_nodes.bin",
         "{region}/admin-minimal/strings_core.bin",
         "{region}/admin-minimal/strings_layout.json"
@@ -188,8 +186,6 @@
       "files": [
         "{region}/admin/admin_cells.bin",
         "{region}/admin/admin_entries.bin",
-        "{region}/admin/place_cells.bin",
-        "{region}/admin/place_entries.bin",
         "{region}/admin/place_nodes.bin",
         "{region}/admin/strings_core.bin",
         "{region}/admin/strings_layout.json",
@@ -210,8 +206,6 @@
         "{region}/no-addresses/admin_cells.bin",
         "{region}/no-addresses/admin_entries.bin",
         "{region}/no-addresses/admin_parents.bin",
-        "{region}/no-addresses/place_cells.bin",
-        "{region}/no-addresses/place_entries.bin",
         "{region}/no-addresses/place_nodes.bin",
         "{region}/no-addresses/way_parents.bin",
         "{region}/no-addresses/way_postcodes.bin",
@@ -242,8 +236,6 @@
         "{region}/full/admin_cells.bin",
         "{region}/full/admin_entries.bin",
         "{region}/full/admin_parents.bin",
-        "{region}/full/place_cells.bin",
-        "{region}/full/place_entries.bin",
         "{region}/full/place_nodes.bin",
         "{region}/full/way_parents.bin",
         "{region}/full/way_postcodes.bin",

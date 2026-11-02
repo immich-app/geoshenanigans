@@ -10,13 +10,6 @@ pub const POI_BIT: u32 = 1 << 31;
 pub const PLACE_NODE_TYPES: [&str; 7] = ["city", "town", "village", "suburb", "hamlet", "neighbourhood", "quarter"];
 /// PlaceNode._pad1 bit: parent_poly_id is the boundary that claims (hides) this node.
 pub const PLACE_FLAG_LABEL_OF: u8 = 0x01;
-/// PlaceNode._pad1 bit: a node a boundary claims; hidden from reverse geocoding, but it keeps its
-/// name_id (the boundary's label name for search).
-pub const PLACE_FLAG_HIDDEN: u8 = 0x02;
-
-pub fn is_hidden(pn: &query_server::PlaceNode) -> bool {
-    pn.name_id == query_server::NO_DATA || pn._pad1 & PLACE_FLAG_HIDDEN != 0
-}
 /// AdminPolygon._pad2 bit: the boundary's largest ring (its one search entity).
 pub const POLY_FLAG_PRIMARY_RING: u8 = 0x01;
 /// PoiRecord.flags bit: a secondary ring of a multi-ring POI (not searchable on its own).

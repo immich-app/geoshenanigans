@@ -1,12 +1,13 @@
-// The binding: reverse geocoding finds nothing off the globe. Place search uses an index shipped
-// beside its dataset as is, rebuilds one shipped for other files, builds a missing one on the
-// device, and refuses files replaced under a loaded geocoder.
+// The binding: the first load derives the place index, and reverse geocoding finds nothing off
+// the globe. Place search uses an index shipped beside its dataset as is, rebuilds one shipped
+// for other files, builds a missing one on the device, and refuses files replaced under a loaded
+// geocoder.
 //
 //   cargo build --release && node --test test/*.test.mjs
 //
 // GEOCODER_NODE overrides the addon path (default: this crate's release build).
 import assert from 'node:assert/strict';
-import { cpSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
@@ -47,8 +48,6 @@ function writeDataset(dir, names) {
     'admin_cells.bin': Buffer.alloc(0),
     'admin_entries.bin': Buffer.alloc(0),
     'place_nodes.bin': nodes,
-    'place_cells.bin': Buffer.alloc(0),
-    'place_entries.bin': Buffer.alloc(0),
     'strings_core.bin': Buffer.concat(strings),
     'strings_layout.json': JSON.stringify({ tiers }),
   };
@@ -66,6 +65,15 @@ const dataset = (names) => {
   mkdirSync(dir);
   return writeDataset(dir, names);
 };
+
+test('the first load derives the place index the dataset does not ship', async () => {
+  const dir = dataset(['Testville', 'Otherton']);
+
+  const geocoder = Geocoder.load(dir);
+
+  assert.equal(JSON.parse(await geocoder.reverseGeocode(10.2, 20.5)).address.town, 'Testville');
+  assert.ok(existsSync(join(dir, 'derived', 'place_index.json')));
+});
 
 test('reverse geocoding off the globe finds nothing', async () => {
   const geocoder = Geocoder.load(dataset(['Testville', 'Otherton']));

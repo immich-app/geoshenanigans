@@ -333,7 +333,7 @@ std::vector<char> poi_merge_head(uint32_t old_n, uint32_t new_n, uint32_t string
 // pair count: no street, address or interp pairs, then poi_pairs.
 std::vector<char> secondary_remap_head(uint32_t poi_pairs) {
     std::vector<char> head;
-    for (const uint32_t w : {SECONDARY_REMAP_MARKER, 5u, static_cast<uint32_t>(PatchFileId::STREET_WAYS), 0u,
+    for (const uint32_t w : {SECONDARY_REMAP_MARKER, 4u, static_cast<uint32_t>(PatchFileId::STREET_WAYS), 0u,
                              static_cast<uint32_t>(PatchFileId::ADDR_POINTS), 0u, static_cast<uint32_t>(PatchFileId::INTERP_WAYS), 0u,
                              static_cast<uint32_t>(PatchFileId::POI_RECORDS), poi_pairs})
         append(head, w);
@@ -1938,11 +1938,11 @@ TEST(patch_refuses_too_many_client_files_a_long_name_or_one_listed_twice) {
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
-// A patch with the cell index delta of an admin, POI or place index cut out
-// is refused in every mode, whether the old and the new dir hold the index
-// (admin), only the new one, which the patch lists (POI), or only the old one
-// (place): without it the patcher would rebuild the index uncorrected. Each
-// patch as made applies.
+// A patch with the cell index delta of an admin or POI index cut out is
+// refused in every mode, whether the old and the new dir hold the index
+// (admin), only the new one, which the patch lists, or only the old one (POI):
+// without it the patcher would rebuild the index uncorrected. Each patch as
+// made applies.
 TEST(patch_refuses_a_patch_without_the_delta_of_a_cell_index) {
     ScratchDir dir("patch-no-cell-index-delta");
     std::mt19937 rng(20261031);
@@ -1952,27 +1952,23 @@ TEST(patch_refuses_a_patch_without_the_delta_of_a_cell_index) {
         new_cells[cell_id(k)] = {k % 7 + 1};
     }
     const auto pois = pois_of(rng, 40, 0, true);
-    std::vector<char> places;
-    for (uint32_t i = 0; i < 40; i++)
-        for (const uint32_t w : {i, i, NO, NO, NO}) append(places, w);
     struct Case {
-        std::string prefix;
+        std::string name, prefix;
         PatchFileId entries;
         bool in_old, in_new;
     };
     const Case cases[] = {
-        {"admin", PatchFileId::ADMIN_ENTRIES, true, true},
-        {"poi", PatchFileId::POI_ENTRIES, false, true},
-        {"place", PatchFileId::PLACE_ENTRIES, true, false},
+        {"admin", "admin", PatchFileId::ADMIN_ENTRIES, true, true},
+        {"poi-new", "poi", PatchFileId::POI_ENTRIES, false, true},
+        {"poi-old", "poi", PatchFileId::POI_ENTRIES, true, false},
     };
     for (const Case& e : cases) {
         BuildDir old_d, new_d;
         put_pois(old_d, pois);
         put_pois(new_d, pois);
-        old_d["place_nodes.bin"] = new_d["place_nodes.bin"] = places;
         if (e.in_old) put_cells(old_d, e.prefix, old_cells);
         if (e.in_new) put_cells(new_d, e.prefix, new_cells);
-        const LowMemCase c{dir.path(), e.prefix};
+        const LowMemCase c{dir.path(), e.name};
         REQUIRE(prepare(c, old_d, new_d).empty());
         const std::vector<char> raw = raw_patch(c);
         REQUIRE(!raw.empty());
@@ -1992,6 +1988,66 @@ TEST(patch_refuses_a_patch_without_the_delta_of_a_cell_index) {
         CHECK(not_refused(c, ALL_MODES, patch, "cut", "Patch has no cell index delta for " + e.prefix).empty());
         CHECK(apply_modes(c, ALL_MODES).bad.empty());
     }
+}
+
+// The first patch after datasets stopped shipping a place index: from an old
+// dir that holds place_cells.bin and place_entries.bin to a new dir of the same
+// place nodes, one of them changed, without them. The patch reads neither, so
+// it applies, in every mode, to the old dir as it is and to the old dir
+// without them.
+TEST(patch_to_a_dir_without_a_place_index_applies_to_an_old_dir_with_or_without_one) {
+    ScratchDir dir("patch-place-index-gone");
+    std::vector<char> old_places, new_places;
+    for (uint32_t i = 0; i < 40; i++) {
+        for (const uint32_t w : {i, i, NO, NO, NO}) append(old_places, w);
+        for (const uint32_t w : {i, i == 7 ? 99 : i, NO, NO, NO}) append(new_places, w);
+    }
+    CellLists place_lists;
+    for (uint32_t k = 0; k < 20; k++) place_lists[cell_id(k)] = {k, k + 20};
+    BuildDir with_index, without_index, new_d;
+    with_index["place_nodes.bin"] = without_index["place_nodes.bin"] = old_places;
+    put_cells(with_index, "place", place_lists);
+    new_d["place_nodes.bin"] = new_places;
+    const LowMemCase made{dir.path(), "with-index"}, stripped{dir.path(), "without-index"};
+    REQUIRE(prepare(made, with_index, new_d).empty());
+    REQUIRE(prepare(stripped, without_index, new_d).empty());
+    std::filesystem::copy_file(made.patch(), stripped.patch(), std::filesystem::copy_options::overwrite_existing);
+
+    CHECK(apply_modes(made, ALL_MODES).bad.empty());
+    CHECK(apply_modes(stripped, ALL_MODES).bad.empty());
+}
+
+// 0xFFFFFFF4 marked the place cell changes until v13: now it is no section's
+// marker, and the patcher refuses it as a file it doesn't know, in every mode.
+// The patch as made applies.
+TEST(patch_refuses_the_old_place_cell_changes_marker_as_an_unknown_file) {
+    ScratchDir dir("patch-place-cell-changes");
+    std::mt19937 rng(20261102);
+    CellLists old_cells, new_cells;
+    for (uint32_t k = 0; k < 30; k++) old_cells[cell_id(k)] = {k % 7};
+    for (uint32_t k = 0; k < 20; k++) new_cells[cell_id(k)] = {k % 7 + 1};
+    for (uint32_t k = 40; k < 50; k++) new_cells[cell_id(k)] = {2};
+    const auto pois = pois_of(rng, 40, 0, true);
+    BuildDir old_d, new_d;
+    put_pois(old_d, pois);
+    put_pois(new_d, pois);
+    put_cells(old_d, "poi", old_cells);
+    put_cells(new_d, "poi", new_cells);
+    const LowMemCase c{dir.path(), "place-cells"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    std::vector<char> raw = raw_patch(c), poi_changes, place_changes;
+    REQUIRE(!raw.empty());
+    for (const uint32_t w : {CELL_CHANGES_POI_MARKER, 10u, 10u}) append(poi_changes, w);
+    // As the diff wrote one for a region without place nodes: no cell added or removed.
+    for (const uint32_t w : {0xFFFFFFF4u, 0u, 0u}) append(place_changes, w);
+    const size_t at = find_once(raw, poi_changes);
+    REQUIRE(at != std::string::npos);
+    raw.insert(raw.begin() + static_cast<std::ptrdiff_t>(at), place_changes.begin(), place_changes.end());
+    const std::string patch = c.dir("place-cell-changes.gcpatch");
+    REQUIRE(write_patch(c, patch, raw));
+
+    CHECK(not_refused(c, ALL_MODES, patch, "place-cell-changes", "Unknown file 4294967284").empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
 // Cell changes out of order (two ids of one list swapped: the geo index's
@@ -2105,9 +2161,8 @@ TEST(patch_refuses_remap_pairs_out_of_order_or_twice_and_street_pairs_in_both_re
     const size_t head = find_once(raw, secondary_remap_head(20));
     REQUIRE(head != std::string::npos);
     // Where the secondary remap's file count, its street pair count and the
-    // POIs' first pair sit, and where the section ends (the place nodes' empty
-    // list).
-    const size_t n_files = head + 4, street_pairs = head + 12, poi_pairs = head + 40, end = poi_pairs + 20 * 8 + 8;
+    // POIs' first pair sit, and where the section ends (after the POIs' pairs).
+    const size_t n_files = head + 4, street_pairs = head + 12, poi_pairs = head + 40, end = poi_pairs + 20 * 8;
 
     using Edit = std::function<void(std::vector<char>&)>;
     struct Case {
@@ -2123,7 +2178,7 @@ TEST(patch_refuses_remap_pairs_out_of_order_or_twice_and_street_pairs_in_both_re
              std::copy(p.begin() + poi_pairs, p.begin() + poi_pairs + 4, p.begin() + poi_pairs + 8);
          }, "Malformed secondary remap"},
         {"second-list", [&](std::vector<char>& p) {
-             put_at(p, n_files, 6u);
+             put_at(p, n_files, 5u);
              std::vector<char> list;
              for (const uint32_t w : {static_cast<uint32_t>(PatchFileId::POI_RECORDS), 1u, 0u, 0u}) append(list, w);
              p.insert(p.begin() + end, list.begin(), list.end());
@@ -2148,8 +2203,8 @@ TEST(patch_refuses_remap_pairs_out_of_order_or_twice_and_street_pairs_in_both_re
 
 // A second list with pairs for a file sent unchanged, which no replay gives a
 // remap to take them, is refused in every mode as one for a replayed file is:
-// for POI records, address points or place nodes, in the secondary remap or
-// in a second one. So are street pairs in the secondary remap as well as in
+// for POI records or address points, in the secondary remap or in a second
+// one. So are street pairs in the secondary remap as well as in
 // the parent-id remap's street leg when the street ways go unchanged. The
 // patch as made (every file unchanged) applies.
 TEST(patch_refuses_a_second_pair_list_or_street_pairs_in_both_remaps_for_unchanged_files) {
@@ -2158,15 +2213,11 @@ TEST(patch_refuses_a_second_pair_list_or_street_pairs_in_both_remaps_for_unchang
     const auto pois = pois_of(rng, 20, 0, true);
     std::vector<Addr> addrs;
     for (uint32_t i = 0; i < 10; i++) addrs.push_back({47.0f + static_cast<float>(i) * 1e-4f, {}});
-    std::vector<char> places;
-    for (uint32_t i = 0; i < 5; i++)
-        for (const uint32_t w : {i, i, NO, NO, NO}) append(places, w);
     BuildDir old_d, new_d;
     for (BuildDir* d : {&old_d, &new_d}) {
         put_geo(*d, {{0, {0}}}, 10);
         put_addrs(*d, addrs);
         put_pois(*d, pois);
-        (*d)["place_nodes.bin"] = places;
     }
     const LowMemCase c{dir.path(), "unchanged"};
     REQUIRE(prepare(c, old_d, new_d).empty());
@@ -2179,10 +2230,10 @@ TEST(patch_refuses_a_second_pair_list_or_street_pairs_in_both_remaps_for_unchang
         return b;
     };
     const uint32_t street = static_cast<uint32_t>(PatchFileId::STREET_WAYS), addr = static_cast<uint32_t>(PatchFileId::ADDR_POINTS),
-                   poi = static_cast<uint32_t>(PatchFileId::POI_RECORDS), place = static_cast<uint32_t>(PatchFileId::PLACE_NODES);
+                   poi = static_cast<uint32_t>(PatchFileId::POI_RECORDS);
     // Each file the edits give pairs for goes unchanged: its section's head
     // (file id, COPY_OLD_STRIDE, old and new sizes, no fixups).
-    for (const uint32_t fid : {street, addr, poi, place}) {
+    for (const uint32_t fid : {street, addr, poi}) {
         const uint64_t size = old_d[patch_file_names[fid]].size();
         std::vector<char> copied = words({fid, COPY_OLD_STRIDE});
         append(copied, size);
@@ -2195,9 +2246,9 @@ TEST(patch_refuses_a_second_pair_list_or_street_pairs_in_both_remaps_for_unchang
     REQUIRE(parent != std::string::npos && head != std::string::npos && parent < head);
     // Where the parent-id remap's street pair count, and the secondary
     // remap's file count and street pair count sit, and where the secondary
-    // remap ends (after the place nodes' empty list).
-    const size_t parent_street_pairs = parent + 8, n_files = head + 4, street_pairs = head + 12, end = head + 48;
-    REQUIRE(std::vector<char>(raw.begin() + head + 40, raw.begin() + end) == words({place, 0}));
+    // remap ends (after the POI records' empty list).
+    const size_t parent_street_pairs = parent + 8, n_files = head + 4, street_pairs = head + 12, end = head + 40;
+    REQUIRE(std::vector<char>(raw.begin() + head + 32, raw.begin() + end) == words({poi, 0}));
 
     using Edit = std::function<void(std::vector<char>&)>;
     auto insert_at = [](std::vector<char>& p, size_t at, const std::vector<char>& b) { p.insert(p.begin() + at, b.begin(), b.end()); };
@@ -2205,7 +2256,7 @@ TEST(patch_refuses_a_second_pair_list_or_street_pairs_in_both_remaps_for_unchang
     // id 0 to new id 1).
     auto two_lists = [&](uint32_t fid) -> Edit {
         return [&, fid](std::vector<char>& p) {
-            put_at(p, n_files, 7u);
+            put_at(p, n_files, 6u);
             insert_at(p, end, words({fid, 1, 0, 1, fid, 1, 0, 1}));
         };
     };
@@ -2217,10 +2268,9 @@ TEST(patch_refuses_a_second_pair_list_or_street_pairs_in_both_remaps_for_unchang
     const Case cases[] = {
         {"poi-lists", two_lists(poi), "Malformed secondary remap: a second one for poi_records.bin"},
         {"addr-lists", two_lists(addr), "Malformed secondary remap: a second one for addr_points.bin"},
-        {"place-lists", two_lists(place), "Malformed secondary remap: a second one for place_nodes.bin"},
         // A list for the POIs, then a second secondary remap with another.
         {"poi-second-remap", [&](std::vector<char>& p) {
-             put_at(p, n_files, 6u);
+             put_at(p, n_files, 5u);
              insert_at(p, end, words({poi, 1, 0, 1, SECONDARY_REMAP_MARKER, 1, poi, 1, 0, 1}));
          }, "Malformed secondary remap: a second one for poi_records.bin"},
         // A pair in each remap's street list, the later one's first.
@@ -2284,7 +2334,8 @@ TEST(patch_refuses_a_second_parent_id_remap) {
 
 // Secondary pairs for a file the patcher keeps no record remap of are refused
 // in every mode: a list of one pair for admin_polygons.bin (whose pairs go in
-// the parent-id remap) or for file 37, past every file (PatchFileId::COUNT).
+// the parent-id remap), for place_nodes.bin (no index the patcher rebuilds
+// holds place node ids) or for file 35, past every file (PatchFileId::COUNT).
 // Empty lists for them pass, as the diff's own empty lists do: that patch, and
 // the patch as made (20 secondary-matched POIs, 20 moved street ways with
 // addresses), apply.
@@ -2300,14 +2351,15 @@ TEST(patch_refuses_secondary_pairs_for_a_file_without_a_record_remap) {
     const size_t head = find_once(raw, secondary_remap_head(20));
     REQUIRE(head != std::string::npos);
     // Where the secondary remap's file count sits, and where it ends (after
-    // the POIs' pairs and the place nodes' empty list).
-    const size_t n_files = head + 4, end = head + 40 + 20 * 8 + 8;
-    const uint32_t admin = static_cast<uint32_t>(PatchFileId::ADMIN_POLYGONS), past = static_cast<uint32_t>(PatchFileId::COUNT);
-    // The patch with lists (file id, pair count, pairs) after the five the
+    // the POIs' pairs).
+    const size_t n_files = head + 4, end = head + 40 + 20 * 8;
+    const uint32_t admin = static_cast<uint32_t>(PatchFileId::ADMIN_POLYGONS), place = static_cast<uint32_t>(PatchFileId::PLACE_NODES),
+                   past = static_cast<uint32_t>(PatchFileId::COUNT);
+    // The patch with lists (file id, pair count, pairs) after the four the
     // diff wrote.
     auto with_lists = [&](uint32_t n, std::initializer_list<uint32_t> words) {
         std::vector<char> p = raw, lists;
-        put_at(p, n_files, 5 + n);
+        put_at(p, n_files, 4 + n);
         for (const uint32_t w : words) append(lists, w);
         p.insert(p.begin() + end, lists.begin(), lists.end());
         return p;
@@ -2320,7 +2372,8 @@ TEST(patch_refuses_secondary_pairs_for_a_file_without_a_record_remap) {
     };
     const Case cases[] = {
         {"admin", with_lists(1, {admin, 1, 0, 1}), "Malformed secondary remap: pairs for admin_polygons.bin, which has none"},
-        {"past-every-file", with_lists(1, {past, 1, 0, 1}), "Malformed secondary remap: pairs for file 37, which has none"},
+        {"place", with_lists(1, {place, 1, 0, 1}), "Malformed secondary remap: pairs for place_nodes.bin, which has none"},
+        {"past-every-file", with_lists(1, {past, 1, 0, 1}), "Malformed secondary remap: pairs for file 35, which has none"},
     };
     for (const Case& e : cases) {
         const std::string patch = c.dir(e.name + ".gcpatch");
@@ -2329,7 +2382,7 @@ TEST(patch_refuses_secondary_pairs_for_a_file_without_a_record_remap) {
         CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
     }
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
-    REQUIRE(write_patch(c, c.patch(), with_lists(2, {admin, 0, past, 0})));
+    REQUIRE(write_patch(c, c.patch(), with_lists(3, {admin, 0, place, 0, past, 0})));
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
