@@ -195,7 +195,8 @@ cargo build --release --manifest-path server/Cargo.toml
 ### Run
 
 ```bash
-# Create index from PBF file
+# Create index from PBF file, into a new or empty output-dir (it refuses any other:
+# an earlier build's files left there would be published as this one's)
 ./build/build-index output-dir input.osm.pbf [input2.osm.pbf ...]
 
 # Start the server

@@ -61,6 +61,7 @@
 #include "string_dict.h"
 #include "vertex_pack.h"
 #include "memory_limit.h"
+#include "output_dir.h"
 #include "write_schedule.h"
 
 
@@ -1725,6 +1726,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             //   - admin polygons (and their vertex bytes) admin_minimal_keeps
             //     leaves out: L9 borough, L10 quarter-area, L11 admin-postal,
             //     and L15 place areas ranked below 16.
+            //   - those boundaries' claims on place nodes: a node one of them
+            //     claims answers here as a place, since nothing here stands
+            //     for it (an L9 or L10 boundary claims Banja Luka, Mildura and
+            //     many Dutch villages).
             // Re-simplifies the kept polygons at q2.5 and writes them to its
             // own stable slots so the on-disk admin_polygons.bin / admin_vertices.bin
             // are self-contained — admin-minimal does NOT share polygon
@@ -1754,8 +1759,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                     if (pt == 0 || pt == 1 || pt == 2 || pt == 4) {
                         PlaceNode pn = d.place_nodes[i];
                         // Parents in this dir's own polygon slots (NO_DATA when
-                        // the parent polygon isn't kept), like every other id here.
-                        remap_place_parent(pn, poly_remap);
+                        // the parent polygon isn't kept), like every other id
+                        // here; a node whose claimant isn't kept is shown.
+                        remap_place_parent_unhiding_orphans(pn, poly_remap);
                         filtered_places.push_back(pn);
                     }
                 }
@@ -2405,6 +2411,7 @@ static std::pair<size_t, std::future<void>> grow_beside(std::vector<T>& out, con
 static int run(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
+        std::cerr << "  <output-dir> must be new or empty" << std::endl;
         std::cerr << std::endl;
         std::cerr << "Options:" << std::endl;
         std::cerr << "  --street-level N       S2 cell level for streets (default: 17)" << std::endl;
@@ -2495,6 +2502,7 @@ static int run(int argc, char* argv[]) {
             input_files.push_back(arg);
         }
     }
+    require_new_or_empty_output_dir(output_dir);
 
     // Set global simplification mode
     kSimplifyMode = simplify_mode;

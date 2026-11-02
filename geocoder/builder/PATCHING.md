@@ -139,7 +139,9 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 ```
 
 ### Tools
-- **build-index** (`src/build_index.cpp`): Builder with deterministic ordering
+- **build-index** (`src/build_index.cpp`): Builder with deterministic ordering. It builds into a
+  new or empty output dir and refuses any other, since every file there is diffed and published
+  as the build's
 - **geocoder-diff** (`tools/geocoder_diff.cpp`): Compares two builds, produces `.gcpatch`
 - **geocoder-patch** (`tools/geocoder_patch.cpp`): Applies patch, produces new build. It links
   the static libzstd (`libzstd.a`) and decompresses the patch in process;

@@ -740,6 +740,9 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
 // tier moves; a name no record uses (none in a build) goes last, in its old
 // order. Every record's tier is one a dir ships (classify_poi).
 inline void order_poi_strings_by_record(ParsedData& data, unsigned threads = 0) {
+    std::vector<PoiRecord>& records = data.poi_records;
+    if (parallel_any(records.size(), [&](size_t i) { return records[i].tier > POI_MAX_SHIPPED_TIER; }, threads))
+        throw std::logic_error("order_poi_strings_by_record: a POI of a tier no dir ships");
     std::vector<char>& tier = data.strings_tiers[STR_TIER_POI];
     if (tier.empty()) return;
 
@@ -754,9 +757,6 @@ inline void order_poi_strings_by_record(ParsedData& data, unsigned threads = 0) 
     auto name_of = [&](uint32_t off) {
         return off == NO_DATA || off < base ? RankedBits::npos : starts.index(off - base);
     };
-    std::vector<PoiRecord>& records = data.poi_records;
-    if (parallel_any(records.size(), [&](size_t i) { return records[i].tier > POI_MAX_SHIPPED_TIER; }, threads))
-        throw std::logic_error("order_poi_strings_by_record: a POI of a tier no dir ships");
 
     std::vector<std::atomic<uint8_t>> home(n);
     std::vector<std::atomic<uint32_t>> first(n);

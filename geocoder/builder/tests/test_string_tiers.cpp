@@ -295,6 +295,14 @@ TEST(order_poi_strings_refuses_a_poi_of_a_tier_no_dir_ships) {
              std::string("order_poi_strings_by_record: a POI of a tier no dir ships"));
 }
 
+TEST(order_poi_strings_refuses_a_poi_of_a_tier_no_dir_ships_with_no_poi_names) {
+    // Its name is a boundary's too, so it lives in core and the POI tier is empty.
+    ParsedData d = poi_build({{"Main", POI_MAX_SHIPPED_TIER + 1}}, {"Main"});
+    CHECK(d.strings_tiers[STR_TIER_POI].empty());
+    CHECK_EQ(refusal_of<std::logic_error>([&] { order_poi_strings_by_record(d); }),
+             std::string("order_poi_strings_by_record: a POI of a tier no dir ships"));
+}
+
 // --- partition_strings_into_tiers ---
 
 TEST(partition_writes_no_string_no_record_uses) {

@@ -4,7 +4,9 @@
 // and carries PLACE_FLAG_HIDDEN, which every reverse lookup skips like a
 // nameless node, and, when its boundary has a polygon, PLACE_FLAG_LABEL_OF
 // with parent_poly_id naming that polygon: place search uses the node as the
-// boundary's label point and name.
+// boundary's label point and name. admin-minimal, which keeps boundaries by
+// level, shows a node whose claimant it leaves out: nothing there stands for
+// it.
 #pragma once
 
 #include <algorithm>
@@ -173,4 +175,16 @@ inline size_t hide_name_linked_place_nodes(std::vector<PlaceNode>& nodes, std::v
 inline void remap_place_parent(PlaceNode& pn, const std::vector<uint32_t>& remap) {
     pn.parent_poly_id = pn.parent_poly_id < remap.size() ? remap[pn.parent_poly_id] : NO_DATA;
     if (pn.parent_poly_id == NO_DATA) pn._pad1 &= ~PLACE_FLAG_LABEL_OF;
+}
+
+// remap_place_parent for admin-minimal, which keeps boundaries by level
+// (admin_minimal_keeps: L2-L8 and the place areas down to rank 16): a node
+// whose claimant it leaves out (an orphan) is a place again, as if
+// unclaimed, so a city, town or village that an L9 or L10 boundary claims
+// still answers there. A node hidden for a claimant without a polygon (no
+// PLACE_FLAG_LABEL_OF) stays hidden, as in every set.
+inline void remap_place_parent_unhiding_orphans(PlaceNode& pn, const std::vector<uint32_t>& remap) {
+    const bool claimed = (pn._pad1 & PLACE_FLAG_LABEL_OF) != 0;
+    remap_place_parent(pn, remap);
+    if (claimed && pn.parent_poly_id == NO_DATA) pn._pad1 &= ~PLACE_FLAG_HIDDEN;
 }

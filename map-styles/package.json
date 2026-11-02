@@ -12,7 +12,7 @@
     "dev:tunnel": "concurrently \"npm run watch\" \"npm run serve:tunnel\""
   },
   "devDependencies": {
-    "@protomaps/basemaps": "^5.0.2",
+    "@protomaps/basemaps": "5.5.1",
     "@types/node": "^24.19.2",
     "concurrently": "^10.0.0",
     "http-server": "^14.1.1",

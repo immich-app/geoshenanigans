@@ -4,7 +4,7 @@ terraform {
   extra_arguments custom_vars {
     commands = get_terraform_commands_that_need_vars()
     arguments = [
-      "-var-file=tiles.tfvars.json",
+      "-var-file=tiles.${local.env}.tfvars.json",
     ]
   }
 
