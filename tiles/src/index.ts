@@ -68,11 +68,14 @@ enum Header {
   CACHE_REVISION = 'Tiles-Cache-Revision',
 }
 
-// Bump when what the worker sends for the same URL and deployment changes (e.g. headers or the TileJSON), so the
-// CDN cache stops returning responses stored before that change.
+// Bump when the body the worker sends for the same URL and deployment changes (e.g. the TileJSON), so the CDN cache
+// stops returning responses stored before that change. Cache headers don't need it: CDN hits get the current policy's.
 const CACHE_REVISION = '2';
 
 const DAY_SECONDS = 60 * 60 * 24;
+// What points clients at a deployment (TileJSON, styles) is rechecked every few minutes, so a deploy reaches them
+// quickly; an unchanged one costs a bodiless 304.
+const POINTER_CACHE = 'public, max-age=300';
 
 export type CachePolicy = { cacheControl: string; etag?: string };
 
@@ -90,14 +93,15 @@ export function cachePolicy(params: PMTilesParams, liveDeploymentKey: string): C
         // Shown straight from cache for up to 30 days, refreshed in the background once a day old.
         return { cacheControl: `public, max-age=${DAY_SECONDS}, stale-while-revalidate=${30 * DAY_SECONDS}`, etag };
       }
-      // Another key comes from a client whose TileJSON predates a deploy: it gets the live tile, kept only briefly.
+      // Another key comes from a client whose TileJSON predates a deploy: it gets the live tile, kept only until that
+      // TileJSON is rechecked.
       return requested === liveDeploymentKey
         ? { cacheControl: `public, max-age=${365 * DAY_SECONDS}, immutable` }
-        : { cacheControl: 'public, max-age=3600' };
+        : { cacheControl: POINTER_CACHE };
     }
     case 'json':
     case 'style':
-      return { cacheControl: 'public, max-age=3600', etag };
+      return { cacheControl: POINTER_CACHE, etag };
     default:
       return { cacheControl: `public, max-age=${31 * DAY_SECONDS}` };
   }
@@ -242,6 +246,14 @@ async function handleRequest(
     }
     metrics.push(metric);
     const cacheHeaders = new Headers(cached.headers);
+    // The stored copy keeps the headers it was stored with (and Cloudflare raises short max-ages to the zone's browser
+    // cache TTL on hits), so clients get the current policy's instead.
+    cacheHeaders.set(Header.CACHE_CONTROL, policy.cacheControl);
+    if (policy.etag) {
+      cacheHeaders.set(Header.ETAG, policy.etag);
+    } else {
+      cacheHeaders.delete(Header.ETAG);
+    }
     const encodeBody = cacheHeaders.has('content-encoding') ? 'manual' : 'automatic';
     return conditional(new Response(cached.body, { headers: cacheHeaders, status: cached.status, encodeBody }));
   }
