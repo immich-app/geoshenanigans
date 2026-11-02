@@ -342,7 +342,9 @@ jobs:
             echo "::error::https://$host still serves '$served'"
             exit 1
           fi
-          for path in v1/0/0/0.mvt v1/14/8473/5557.mvt v1/style/light v1/style/dark v1/style/black; do
+          # Clients follow the TileJSON to versioned tile URLs; the unversioned form keeps working.
+          curl -fsS "https://$host/v1.json" | jq -e --arg key "$DEPLOYMENT_KEY" '.tiles[0] | endswith("?v=" + $key)' >/dev/null
+          for path in "v1/0/0/0.mvt?v=$DEPLOYMENT_KEY" v1/0/0/0.mvt v1/14/8473/5557.mvt v1/style/light v1/style/dark v1/style/black; do
             curl -fsS -o /dev/null -w "$path %{http_code} %{size_download} bytes\n" "https://$host/$path"
           done
           echo "- https://$host now serves $DEPLOYMENT_KEY" >> "$GITHUB_STEP_SUMMARY"

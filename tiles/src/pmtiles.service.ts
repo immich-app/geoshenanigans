@@ -103,7 +103,7 @@ export class PMTilesService {
         `${url.port ? `:${url.port}` : ''}` +
         `/v${version}` +
         '/{z}/{x}/{y}' +
-        '.mvt',
+        `.mvt?v=${this.source.getDeploymentKey()}`,
     ];
     return json;
   }
