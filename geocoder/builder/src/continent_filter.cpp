@@ -4,6 +4,7 @@
 #include "parsed_data.h"
 #include "parallel.h"
 #include "ranked_bits.h"
+#include "string_subset.h"
 #include "subset_copy.h"
 
 #include <algorithm>
@@ -529,23 +530,10 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     for (const auto& [key, _acc] : out.postcode_accum) add_used(postcode_key_pc(key));
 
     // The kept strings, ascending by planet offset, back to back.
-    const RankedBits kept(old_sp.size(), used_bits);
+    StringSubset kept(old_sp, used_bits);
     std::vector<std::atomic<uint64_t>>().swap(used_bits);
-    const std::vector<uint32_t> kept_offsets = kept.ones();
-    const std::vector<uint32_t> new_offsets = parallel_offsets<uint32_t>(kept_offsets.size(), [&](size_t k) {
-        return static_cast<uint32_t>(std::strlen(old_sp.data() + kept_offsets[k]) + 1);
-    });
-    auto& new_sp = out.string_pool.mutable_data();
-    new_sp.clear();
-    parallel_resize(new_sp, new_offsets.back());
-    parallel_for(kept_offsets.size(), [&](size_t b, size_t e, unsigned) {
-        for (size_t k = b; k < e; k++)
-            std::memcpy(new_sp.data() + new_offsets[k], old_sp.data() + kept_offsets[k], new_offsets[k + 1] - new_offsets[k]);
-    });
-    auto remap_or_sentinel = [&](uint32_t off) -> uint32_t {
-        size_t k = kept.index(off);
-        return k == RankedBits::npos ? NO_DATA : new_offsets[k];
-    };
+    out.string_pool.mutable_data() = kept.take_bytes();
+    auto remap_or_sentinel = [&](uint32_t off) { return kept.offset_of(off); };
     parallel_each(out.ways, [&](WayHeader& w) { w.name_id = remap_or_sentinel(w.name_id); });
     parallel_each(out.addr_points, [&](AddrPoint& a) {
         a.housenumber_id = remap_or_sentinel(a.housenumber_id);

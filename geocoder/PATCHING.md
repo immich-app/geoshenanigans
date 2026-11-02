@@ -13,6 +13,7 @@ builds/
       no-addresses/    ...
       admin/           ...
       admin-minimal/   ...
+      admin-minimal-poi/ ...
       quality/
         uncapped/      admin_polygons.bin.zst + admin_vertices.bin.zst (+ postal_*.bin.zst) + patch.gcpatch
         q0.2/          ...
@@ -42,10 +43,14 @@ A complete geocoder index for a given region and configuration consists of files
 | `full/` | 22 files (+4 optional) | Streets + addresses + interpolation + admin + postcodes |
 | `no-addresses/` | 14 files (+3 optional) | Streets + admin + postcodes (no address points) |
 | `admin/` | 6 files (+3 optional) | Admin cell indexes + place nodes + postcodes |
-| `admin-minimal/` | 7 files | Admin levels 2-8 + place nodes, with its own q2.5 polygons (takes the place of the quality dir, so pick q2.5) |
+| `admin-minimal/` | 7 files | Admin levels 2-8 + place nodes, with its own q2.5 polygons (takes the place of the quality dir, so pick q2.5) and only the core strings its records name. For POI tier `none` |
+| `admin-minimal-poi/` | 7 files | The same, on the shared polygon slots and core strings that a POI tier's parent polygons and names point into (a dropped polygon's slot holds a tombstone). The admin-minimal mode's dir beside a POI tier |
 
 Optional files are written only when the data has them; see `optional_files`
-under configurations.json below.
+under configurations.json below. The admin-minimal mode picks its dir by the
+POI tier (its component's `variants`, below): `admin-minimal/`'s strings and
+polygon ids are its own, so no other dir's offsets or ids can be read
+against it.
 
 No dir ships the place nodes' cell index: the first load of an index dir
 derives it from `place_nodes.bin` into `<dir>/derived/` (see Fresh Install).

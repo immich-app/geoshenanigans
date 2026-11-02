@@ -1848,7 +1848,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                         std::ofstream f(poi_dir + "/" + STR_TIER_FILENAMES[STR_TIER_POI], std::ios::binary);
                         f.write(names.data(), static_cast<std::streamsize>(names.size()));
                     }
-                    write_strings_layout(poi_dir, d);
+                    write_strings_layout(poi_dir, d.strings_tier_bases);
 
                     // Write poi_meta.json (category metadata for the server)
                     {

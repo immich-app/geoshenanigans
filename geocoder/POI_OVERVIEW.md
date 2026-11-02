@@ -90,7 +90,7 @@ A client picks: **region** + **mode** + **quality** + **POI tier** (all independ
 | Full | 9.0 GiB | Streets + addresses + interpolation + admin cells + place nodes + postcodes |
 | No-addresses | 3.8 GiB | Streets + admin cells + place nodes + postcodes (no address points or interpolation) |
 | Admin | 110 MiB | Admin boundary cell index + place nodes + postcodes |
-| Admin-minimal | 220 MiB | Admin levels 2-8 + place nodes, with its own q2.5 polygons (no quality dir needed) |
+| Admin-minimal | 220 MiB | Admin levels 2-8 + place nodes, with its own q2.5 polygons (no quality dir needed); with a POI tier its `admin-minimal-poi/` dir, on the shared polygon ids and strings |
 
 Sizes are zstd downloads. Except for admin-minimal, a mode dir holds no
 boundary polygons: those come from the quality dir.

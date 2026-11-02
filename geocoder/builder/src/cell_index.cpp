@@ -1,6 +1,7 @@
 #include "cell_index.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <fstream>
@@ -32,6 +33,7 @@
 #include "ring_contains.h"
 #include "s2_helpers.h"
 #include "strategy2_remap.h"
+#include "string_subset.h"
 #include "vertex_pack.h"
 #include "write_schedule.h"
 
@@ -42,22 +44,32 @@
 
 // Write strings_layout.json — records each tier's [start, end) in the
 // global string-offset space so the server can route a global offset to
-// the right tier file. Same content regardless of which subset of tier
-// files a given dir contains.
-void write_strings_layout(const std::string& dir, const ParsedData& data) {
+// the right tier file. Same content in every dir of the shared strings,
+// whichever of the tier files it holds.
+void write_strings_layout(const std::string& dir, const std::array<uint32_t, STR_TIER_COUNT + 1>& bases) {
     std::ofstream f(dir + "/strings_layout.json");
     f << "{\n  \"tiers\": [\n";
     for (size_t t = 0; t < STR_TIER_COUNT; t++) {
         f << "    {\"name\": \"" << STR_TIER_NAMES[t]
           << "\", \"file\": \"" << STR_TIER_FILENAMES[t]
-          << "\", \"start\": " << data.strings_tier_bases[t]
-          << ", \"end\": " << data.strings_tier_bases[t + 1] << "}";
+          << "\", \"start\": " << bases[t]
+          << ", \"end\": " << bases[t + 1] << "}";
         if (t + 1 < STR_TIER_COUNT) f << ",";
         f << "\n";
     }
     f << "  ]\n}\n";
     f.flush();
     if (!f) throw std::runtime_error("failed to write " + dir + "/strings_layout.json");
+}
+
+// The layout of a dir whose strings are a core of its own: every other tier
+// empty at the core's end, so no offset into another dir's strings resolves
+// against it.
+static std::array<uint32_t, STR_TIER_COUNT + 1> core_only_strings_layout(size_t core_size) {
+    std::array<uint32_t, STR_TIER_COUNT + 1> bases;
+    bases.fill(static_cast<uint32_t>(core_size));
+    bases[0] = 0;
+    return bases;
 }
 
 // "<region>/<mode>" of an output dir, to tell apart the phase lines of
@@ -863,7 +875,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     // name_id into the correct tier file. Written unconditionally into
     // every directory that contains a strings_*.bin so the server can
     // load from any mode/opt-in dir without cross-dir discovery.
-    write_strings_layout(output_dir, data);
+    write_strings_layout(output_dir, data.strings_tier_bases);
 
     // Write postcode centroid index (optional files)
     // Validate each centroid's postcode against the country's pattern
@@ -1362,144 +1374,188 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
     // stay in the parent directory.
 }
 
-void write_admin_minimal_polygons(const ParsedData& data,
-                                  const std::string& output_dir,
-                                  const std::string& prev_dir,
-                                  double epsilon_scale,
-                                  std::vector<uint32_t>& id_remap) {
-    ensure_dir(output_dir);
+// --- admin-minimal ---
 
-    // Collect old indices we want to keep (admin_minimal_keeps).
-    id_remap.assign(data.admin_polygons.size(), NO_DATA);
-    std::vector<uint32_t> kept_idx;
-    kept_idx.reserve(data.admin_polygons.size() / 2);
+// The polygons admin-minimal keeps (admin_minimal_keeps) that keep a shape at
+// its scale: each one's id in the shared slots, ascending, and its bytes.
+struct AdminMinimalPolygons {
+    std::vector<uint32_t> ids;
+    std::vector<PackedPolygon> packed;
+};
+
+static AdminMinimalPolygons pack_admin_minimal_polygons(const ParsedData& data, double epsilon_scale,
+                                                        const std::string& region_dir) {
+    std::vector<uint32_t> kept;
+    kept.reserve(data.admin_polygons.size() / 2);
     for (size_t i = 0; i < data.admin_polygons.size(); i++) {
         const auto& p = data.admin_polygons[i];
-        if (admin_minimal_keeps(p.admin_level, p.place_type_override)) kept_idx.push_back(static_cast<uint32_t>(i));
+        if (admin_minimal_keeps(p.admin_level, p.place_type_override)) kept.push_back(static_cast<uint32_t>(i));
     }
-
-    // Parallel simplification of just the kept polygons.
-    std::vector<PackedPolygon> packed(kept_idx.size());
-    parallel_for_dynamic(kept_idx.size(), 1, [&](size_t begin, size_t end, unsigned) {
+    std::vector<PackedPolygon> packed(kept.size());
+    parallel_for_dynamic(kept.size(), 1, [&](size_t begin, size_t end, unsigned) {
         for (size_t k = begin; k < end; k++)
-            packed[k] = pack_admin_polygon(data, data.admin_polygons[kept_idx[k]], epsilon_scale);
+            packed[k] = pack_admin_polygon(data, data.admin_polygons[kept[k]], epsilon_scale);
     });
-    std::cerr << "  Admin-minimal hole topology (" << output_dir << "): " << hole_topology(packed) << std::endl;
+    std::cerr << "  Admin-minimal hole topology (" << region_dir << "): " << hole_topology(packed) << std::endl;
 
-    // Survivors keep stable slots in admin-minimal's own numbering and
-    // sidecar, like the full set's (apply_strategy2_admins). A dense
-    // renumbering shifted every later id whenever one kept polygon came or
-    // went, re-sending ~459K parent ids (3.5 MiB raw) every planet day.
+    AdminMinimalPolygons out;
+    for (size_t k = 0; k < kept.size(); k++) {
+        if (packed[k].bytes.empty()) continue;
+        out.ids.push_back(kept[k]);
+        out.packed.push_back(std::move(packed[k]));
+    }
+    return out;
+}
+
+// Where a dir puts admin-minimal's polygons: slot_of[shared id] (NO_DATA for
+// one it leaves out) among `count` slots.
+struct AdminMinimalSlots {
+    std::vector<uint32_t> slot_of;
+    size_t count = 0;
+};
+
+// admin-minimal/'s own stable slots, carried through its own sidecar like the
+// full set's (apply_strategy2_admins). A dense renumbering shifted every later
+// id whenever one kept polygon came or went, re-sending ~459K parent ids
+// (3.5 MiB raw) every planet day.
+static AdminMinimalSlots own_admin_minimal_slots(const ParsedData& data, const AdminMinimalPolygons& kept,
+                                                 const std::string& region_prev, const std::string& dir) {
     using namespace gc::id_alloc;
     IdAllocator alloc;
-    if (!prev_dir.empty()) alloc.load_previous(prev_dir + "/admin-minimal/admin_polygons.osm_ids");
-    std::vector<size_t> drawn;  // kept polygons with a shape left after simplifying
-    for (size_t k = 0; k < kept_idx.size(); k++)
-        if (!packed[k].bytes.empty()) drawn.push_back(k);
-    const std::vector<uint32_t> drawn_slots = alloc.allocate_all(drawn.size(), [&](size_t j) {
-        size_t old_id = kept_idx[drawn[j]];
-        return admin_identity(old_id < data.admin_osm_ids.size() ? data.admin_osm_ids[old_id] : 0);
+    if (!region_prev.empty()) alloc.load_previous(region_prev + "/admin-minimal/admin_polygons.osm_ids");
+    const std::vector<uint32_t> slots = alloc.allocate_all(kept.ids.size(), [&](size_t k) {
+        const uint32_t id = kept.ids[k];
+        return admin_identity(id < data.admin_osm_ids.size() ? data.admin_osm_ids[id] : 0);
     });
     alloc.finalize();
-    std::vector<size_t> kept_at_slot(alloc.total_slots(), SIZE_MAX);
-    for (size_t j = 0; j < drawn.size(); j++) kept_at_slot[drawn_slots[j]] = drawn[j];
+    IdAllocator::write_sidecar(dir + "/admin_polygons.osm_ids", alloc.slots());
 
-    // Vertex bytes in slot order, so offsets ascend with ids.
-    std::vector<AdminPolygon> new_polys(alloc.total_slots(), admin_polygon_tombstone());
-    const size_t kept = drawn.size();
+    AdminMinimalSlots out{std::vector<uint32_t>(data.admin_polygons.size(), NO_DATA), alloc.total_slots()};
+    for (size_t k = 0; k < kept.ids.size(); k++) out.slot_of[kept.ids[k]] = slots[k];
+    return out;
+}
+
+// The shared slots of the quality dirs, which POI parent_poly_ids name: each
+// polygon at its own id.
+static AdminMinimalSlots shared_admin_minimal_slots(const ParsedData& data, const AdminMinimalPolygons& kept) {
+    AdminMinimalSlots out{std::vector<uint32_t>(data.admin_polygons.size(), NO_DATA), data.admin_polygons.size()};
+    for (uint32_t id : kept.ids) out.slot_of[id] = id;
+    return out;
+}
+
+// The core strings a dir ships, their layout, and the subset its records'
+// names move into (none: they keep their shared offsets).
+struct AdminMinimalStrings {
+    const std::vector<char>& core;
+    std::array<uint32_t, STR_TIER_COUNT + 1> bases;
+    const StringSubset* subset = nullptr;
+
+    uint32_t name(uint32_t shared) const { return subset ? subset->offset_of(shared) : shared; }
+};
+
+// The core strings admin-minimal's records name: its polygons' and its place
+// nodes', in the order of the shared core.
+static StringSubset admin_minimal_names(const ParsedData& data, const AdminMinimalPolygons& kept) {
+    const std::vector<char>& core = data.strings_tiers[0];
+    std::vector<std::atomic<uint64_t>> used(core.size() / 64 + 1);
+    auto use = [&](uint32_t name) {
+        if (name == NO_DATA) return;
+        if (name >= core.size())
+            throw std::logic_error("admin-minimal names string " + std::to_string(name) + " outside the core strings (" +
+                                   std::to_string(core.size()) + " bytes)");
+        mark_bit(used, name);
+    };
+    parallel_for(kept.ids.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t k = b; k < e; k++) use(data.admin_polygons[kept.ids[k]].name_id);
+    });
+    parallel_for(data.place_nodes.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++)
+            if (admin_minimal_keeps_place(data.place_nodes[i].place_type)) use(data.place_nodes[i].name_id);
+    });
+    return StringSubset(core, used);
+}
+
+// One admin-minimal dir: the polygons at their slots, the place nodes it
+// keeps with parents in those slots, the admin cell index over them, and its
+// core strings.
+static void write_admin_minimal_dir(const ParsedData& data, const std::string& dir, const AdminMinimalPolygons& kept,
+                                    const AdminMinimalSlots& slots, const AdminMinimalStrings& strings) {
+    // Vertex bytes in slot order, so offsets ascend with ids; the builder's
+    // tombstone (the reader's "no polygon") at a slot without one.
+    std::vector<size_t> kept_at_slot(slots.count, SIZE_MAX);
+    for (size_t k = 0; k < kept.ids.size(); k++) kept_at_slot[slots.slot_of[kept.ids[k]]] = k;
+    std::vector<AdminPolygon> polygons(slots.count, admin_polygon_tombstone());
     size_t vertex_bytes = 0;
-    for (size_t slot = 0; slot < kept_at_slot.size(); slot++) {
-        size_t k = kept_at_slot[slot];
+    for (size_t slot = 0; slot < slots.count; slot++) {
+        const size_t k = kept_at_slot[slot];
         if (k == SIZE_MAX) continue;
 
-        AdminPolygon np = data.admin_polygons[kept_idx[k]];
-        np.vertex_offset = static_cast<uint32_t>(vertex_bytes);
-        np.vertex_count = packed[k].vertex_count;
-        np.area = packed[k].area;
-        np.hole_count = packed[k].hole_count;
-        id_remap[kept_idx[k]] = static_cast<uint32_t>(slot);
-        new_polys[slot] = np;
-        vertex_bytes += packed[k].bytes.size();
+        AdminPolygon p = data.admin_polygons[kept.ids[k]];
+        p.vertex_offset = static_cast<uint32_t>(vertex_bytes);
+        p.vertex_count = kept.packed[k].vertex_count;
+        p.area = kept.packed[k].area;
+        p.hole_count = kept.packed[k].hole_count;
+        p.name_id = strings.name(p.name_id);
+        polygons[slot] = p;
+        vertex_bytes += kept.packed[k].bytes.size();
     }
+    write_binary_file(dir + "/admin_polygons.bin", reinterpret_cast<const char*>(polygons.data()),
+                      polygons.size() * sizeof(AdminPolygon));
+    write_packed_polygons(dir + "/admin_vertices.bin", slots.count, [&](size_t slot) -> const std::vector<uint8_t>* {
+        return kept_at_slot[slot] == SIZE_MAX ? nullptr : &kept.packed[kept_at_slot[slot]].bytes;
+    });
 
-    write_binary_file(output_dir + "/admin_polygons.bin",
-                      reinterpret_cast<const char*>(new_polys.data()),
-                      new_polys.size() * sizeof(AdminPolygon));
-    write_packed_polygons(output_dir + "/admin_vertices.bin", kept_at_slot.size(),
-        [&](size_t slot) -> const std::vector<uint8_t>* {
-            return kept_at_slot[slot] == SIZE_MAX ? nullptr : &packed[kept_at_slot[slot]].bytes;
+    // Parents in this dir's slots (NO_DATA when the parent polygon isn't
+    // kept), like every other id here; a node whose claimant isn't kept is
+    // shown.
+    std::vector<PlaceNode> places;
+    places.reserve(data.place_nodes.size());
+    for (const PlaceNode& node : data.place_nodes) {
+        if (!admin_minimal_keeps_place(node.place_type)) continue;
+        PlaceNode pn = node;
+        remap_place_parent_unhiding_orphans(pn, slots.slot_of);
+        pn.name_id = strings.name(pn.name_id);
+        places.push_back(pn);
+    }
+    write_binary_file(dir + "/place_nodes.bin", reinterpret_cast<const char*>(places.data()),
+                      places.size() * sizeof(PlaceNode));
+
+    // Its admin cell index (compute_admin_index_cells), in its slots, each
+    // id's INTERIOR_FLAG kept.
+    std::vector<CellItemPair> cells = parallel_collect<CellItemPair>(data.admin_minimal_index_cells.size(),
+        [&](size_t k, std::vector<CellItemPair>& out) {
+            const CellItemPair& p = data.admin_minimal_index_cells[k];
+            const uint32_t id = p.item_id & ID_MASK;
+            const uint32_t slot = id < slots.slot_of.size() ? slots.slot_of[id] : NO_DATA;
+            if (slot != NO_DATA) out.push_back({p.cell_id, slot | (p.item_id & INTERIOR_FLAG)});
         });
-    IdAllocator::write_sidecar(output_dir + "/admin_polygons.osm_ids", alloc.slots());
+    // Own slots renumber the ids: each cell's back in canonical order (the
+    // shared slots keep it).
+    parallel_sort(cells.begin(), cells.end(), cell_item_less);
+    write_cell_index_sorted(dir + "/admin_cells.bin", dir + "/admin_entries.bin", cells);
 
-    std::cerr << "  Admin-minimal polygons: " << kept << " kept in " << new_polys.size()
-              << " slots (of " << data.admin_polygons.size() << "), "
-              << vertex_bytes / 1024 / 1024 << " MiB packed vertices"
-              << std::endl;
+    write_binary_file(dir + "/" + STR_TIER_FILENAMES[0], strings.core.data(), strings.core.size());
+    write_strings_layout(dir, strings.bases);
+
+    std::cerr << "  " << dir_label(dir) << ": " << kept.ids.size() << " polygons in " << slots.count
+              << " slots (of " << data.admin_polygons.size() << "), " << vertex_bytes / 1024 / 1024
+              << " MiB packed vertices, " << places.size() << " place nodes (of " << data.place_nodes.size()
+              << "), " << count_cells(cells) << " cells (of " << count_cells(data.admin_index_cells) << "), "
+              << strings.core.size() << " bytes of core strings" << std::endl;
 }
 
 void write_admin_minimal(const ParsedData& data, const std::string& region_dir, const std::string& region_prev,
                          double epsilon_scale) {
-    std::string mdir = region_dir + "/admin-minimal";
-    ensure_dir(mdir);
+    const AdminMinimalPolygons kept = pack_admin_minimal_polygons(data, epsilon_scale, region_dir);
 
-    // 1. Filter + re-simplify + pack admin polygons. q2.5 only —
-    //    admin-minimal isn't tiered by quality. Returns a remap
-    //    from full polygon IDs to admin-minimal's own stable slots
-    //    (or NO_DATA for dropped polygons), used below to rewrite
-    //    the cell index.
-    std::vector<uint32_t> poly_remap;
-    write_admin_minimal_polygons(data, mdir, region_prev, epsilon_scale, poly_remap);
+    const std::string own_dir = region_dir + "/admin-minimal";
+    ensure_dir(own_dir);
+    const StringSubset names = admin_minimal_names(data, kept);
+    write_admin_minimal_dir(data, own_dir, kept, own_admin_minimal_slots(data, kept, region_prev, own_dir),
+                            {names.bytes(), core_only_strings_layout(names.bytes().size()), &names});
 
-    // 2. place_nodes filter. Keep types 0=city, 1=town, 2=village,
-    //    4=hamlet.
-    std::vector<PlaceNode> filtered_places;
-    filtered_places.reserve(data.place_nodes.size());
-    for (size_t i = 0; i < data.place_nodes.size(); i++) {
-        uint8_t pt = data.place_nodes[i].place_type;
-        if (pt == 0 || pt == 1 || pt == 2 || pt == 4) {
-            PlaceNode pn = data.place_nodes[i];
-            // Parents in this dir's own polygon slots (NO_DATA when
-            // the parent polygon isn't kept), like every other id
-            // here; a node whose claimant isn't kept is shown.
-            remap_place_parent_unhiding_orphans(pn, poly_remap);
-            filtered_places.push_back(pn);
-        }
-    }
-    {
-        std::ofstream f(mdir + "/place_nodes.bin", std::ios::binary);
-        f.write(reinterpret_cast<const char*>(filtered_places.data()),
-                filtered_places.size() * sizeof(PlaceNode));
-        f.flush();
-        if (!f) throw std::runtime_error("failed to write " + mdir + "/place_nodes.bin");
-    }
-
-    // 3. Its own admin cell index (compute_admin_index_cells),
-    //    against the new polygon ID space. Preserves the
-    //    high-bit INTERIOR_FLAG used by the cell index format
-    //    (polys that fully contain a cell vs. just intersect it).
-    std::vector<CellItemPair> kept_cells = parallel_collect<CellItemPair>(data.admin_minimal_index_cells.size(),
-        [&](size_t k, std::vector<CellItemPair>& out) {
-            const CellItemPair& p = data.admin_minimal_index_cells[k];
-            const uint32_t poly_id = p.item_id & ID_MASK;
-            const uint32_t new_id = poly_id < poly_remap.size() ? poly_remap[poly_id] : NO_DATA;
-            if (new_id != NO_DATA) out.push_back({p.cell_id, new_id | (p.item_id & INTERIOR_FLAG)});
-        });
-    // The slots renumber: each cell's ids back in canonical order.
-    parallel_sort(kept_cells.begin(), kept_cells.end(), cell_item_less);
-    write_cell_index_sorted(mdir + "/admin_cells.bin", mdir + "/admin_entries.bin", kept_cells);
-
-    // 4. Core strings + layout: admin and place names all live in core.
-    {
-        const auto& core = data.strings_tiers[0];
-        std::ofstream f(mdir + "/" + STR_TIER_FILENAMES[0], std::ios::binary);
-        f.write(core.data(), core.size());
-        f.flush();
-        if (!f) throw std::runtime_error("failed to write " + mdir + "/" + STR_TIER_FILENAMES[0]);
-    }
-    write_strings_layout(mdir, data);
-
-    std::cerr << "  Admin-minimal: " << filtered_places.size()
-              << " place nodes (of " << data.place_nodes.size() << "), "
-              << count_cells(kept_cells) << " cells (of "
-              << count_cells(data.admin_index_cells) << ")" << std::endl;
+    const std::string poi_dir = region_dir + "/admin-minimal-poi";
+    ensure_dir(poi_dir);
+    write_admin_minimal_dir(data, poi_dir, kept, shared_admin_minimal_slots(data, kept),
+                            {data.strings_tiers[0], data.strings_tier_bases});
 }

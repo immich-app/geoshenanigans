@@ -106,6 +106,25 @@ class BuildSearchIndexesTest(unittest.TestCase):
         self.assertEqual(self.run_main(), 1)
 
 
+class TemplateTest(unittest.TestCase):
+    MINIMAL_FILES = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_vertices.bin",
+                     "place_nodes.bin", "strings_core.bin", "strings_layout.json"]
+
+    def test_admin_minimal_takes_its_poi_dir_beside_a_poi_tier(self):
+        # admin-minimal/ holds strings of its own, which a POI tier's names and parent polygons don't
+        # point into: beside a POI tier the mode takes admin-minimal-poi/, on the shared slots and strings.
+        with open(TEMPLATE) as f:
+            cfg = json.load(f)
+        for poi_tier in cfg["axes"]["poi_tier"]["values"]:
+            sel = {"region": "planet", "mode": "admin-minimal", "quality": "q2.5", "poi_tier": poi_tier}
+            paths, _ = sut.resolve(cfg, sel)
+            own, poi = "planet/admin-minimal/", "planet/admin-minimal-poi/"
+            dir_, other = (own, poi) if poi_tier == "none" else (poi, own)
+
+            self.assertEqual([p[len(dir_):] for p in paths if p.startswith(dir_)], self.MINIMAL_FILES, poi_tier)
+            self.assertEqual([p for p in paths if p.startswith(other) or p.startswith("planet/quality/")], [], poi_tier)
+
+
 class ResolveTest(unittest.TestCase):
     CFG = {"components": {
         "mode.small": {"files": ["{region}/small/a.bin", "{region}/small/shared.json"],
