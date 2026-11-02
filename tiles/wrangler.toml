@@ -28,5 +28,7 @@ database_id = "c60521e7-59bd-4186-81e7-9a676edf9b75"
 [vars]
 DEPLOYMENT_KEY = "20250818"
 ENVIRONMENT = "production"
-# Where clients reach the worker; TileJSON and dev styles point here rather than at the requested host.
-PUBLIC_URL = "http://localhost:8787"
+# Where clients reach the worker; TileJSON and dev styles point here rather than at the requested host. This is the
+# deployed tiles-dev origin; for `npm run dev`, set PUBLIC_URL=http://localhost:8787 in .dev.vars (gitignored), which
+# wrangler applies locally only.
+PUBLIC_URL = "https://tiles.dev.immich.cloud"
