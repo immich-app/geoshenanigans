@@ -1720,90 +1720,11 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 std::cerr << "  Place nodes: " << d.place_nodes.size() << " nodes" << std::endl;
             }
         };
-        auto write_admin_minimal = [&] {
-            // Write admin-minimal tier — smallest useful deployable. Drops:
-            //   - place_nodes with place_type ∈ {SUBURB=3, NEIGHBOURHOOD=5, QUARTER=6}
-            //   - admin polygons (and their vertex bytes) admin_minimal_keeps
-            //     leaves out: L9 borough, L10 quarter-area, L11 admin-postal,
-            //     and L15 place areas ranked below 16.
-            //   - those boundaries' claims on place nodes: a node one of them
-            //     claims answers here as a place, since nothing here stands
-            //     for it (an L9 or L10 boundary claims Banja Luka, Mildura and
-            //     many Dutch villages).
-            // Re-simplifies the kept polygons at q2.5 and writes them to its
-            // own stable slots so the on-disk admin_polygons.bin / admin_vertices.bin
-            // are self-contained — admin-minimal does NOT share polygon
-            // files with quality/q2.5/. It also carries its own core strings
-            // and layout, so a client never needs another dir (or a patch for
-            // one) to resolve its names.
+        auto write_admin_minimal_set = [&] {
             // Written for a region without admin polygons too: every
             // configuration of the region lists the tier's files.
-            if (multi_output && !d.place_nodes.empty()) {
-                std::string mdir = base_dir + "/admin-minimal";
-                ensure_dir(mdir);
-
-                // 1. Filter + re-simplify + pack admin polygons. q2.5 only —
-                //    admin-minimal isn't tiered by quality. Returns a remap
-                //    from full polygon IDs to admin-minimal's own stable slots
-                //    (or NO_DATA for dropped polygons), used below to rewrite
-                //    the cell index.
-                std::vector<uint32_t> poly_remap;
-                write_admin_minimal_polygons(d, mdir, region_prev, kAdminMinimalEpsilonScale, poly_remap);
-
-                // 2. place_nodes filter. Keep types 0=city, 1=town, 2=village,
-                //    4=hamlet.
-                std::vector<PlaceNode> filtered_places;
-                filtered_places.reserve(d.place_nodes.size());
-                for (size_t i = 0; i < d.place_nodes.size(); i++) {
-                    uint8_t pt = d.place_nodes[i].place_type;
-                    if (pt == 0 || pt == 1 || pt == 2 || pt == 4) {
-                        PlaceNode pn = d.place_nodes[i];
-                        // Parents in this dir's own polygon slots (NO_DATA when
-                        // the parent polygon isn't kept), like every other id
-                        // here; a node whose claimant isn't kept is shown.
-                        remap_place_parent_unhiding_orphans(pn, poly_remap);
-                        filtered_places.push_back(pn);
-                    }
-                }
-                {
-                    std::ofstream f(mdir + "/place_nodes.bin", std::ios::binary);
-                    f.write(reinterpret_cast<const char*>(filtered_places.data()),
-                            filtered_places.size() * sizeof(PlaceNode));
-                    f.flush();
-                    if (!f) throw std::runtime_error("failed to write " + mdir + "/place_nodes.bin");
-                }
-
-                // 3. Its own admin cell index (compute_admin_index_cells),
-                //    against the new polygon ID space. Preserves the
-                //    high-bit INTERIOR_FLAG used by the cell index format
-                //    (polys that fully contain a cell vs. just intersect it).
-                std::vector<CellItemPair> kept_cells = parallel_collect<CellItemPair>(d.admin_minimal_index_cells.size(),
-                    [&](size_t k, std::vector<CellItemPair>& out) {
-                        const CellItemPair& p = d.admin_minimal_index_cells[k];
-                        const uint32_t poly_id = p.item_id & ID_MASK;
-                        const uint32_t new_id = poly_id < poly_remap.size() ? poly_remap[poly_id] : NO_DATA;
-                        if (new_id != NO_DATA) out.push_back({p.cell_id, new_id | (p.item_id & INTERIOR_FLAG)});
-                    });
-                // The slots renumber: each cell's ids back in canonical order.
-                parallel_sort(kept_cells.begin(), kept_cells.end(), cell_item_less);
-                write_cell_index_sorted(mdir + "/admin_cells.bin", mdir + "/admin_entries.bin", kept_cells);
-
-                // 4. Core strings + layout: admin and place names all live in core.
-                {
-                    const auto& core = d.strings_tiers[0];
-                    std::ofstream f(mdir + "/" + STR_TIER_FILENAMES[0], std::ios::binary);
-                    f.write(core.data(), core.size());
-                    f.flush();
-                    if (!f) throw std::runtime_error("failed to write " + mdir + "/" + STR_TIER_FILENAMES[0]);
-                }
-                write_strings_layout(mdir, d);
-
-                std::cerr << "  Admin-minimal: " << filtered_places.size()
-                          << " place nodes (of " << d.place_nodes.size() << "), "
-                          << count_cells(kept_cells) << " cells (of "
-                          << count_cells(d.admin_index_cells) << ")" << std::endl;
-            }
-
+            if (multi_output && !d.place_nodes.empty())
+                write_admin_minimal(d, base_dir, region_prev, kAdminMinimalEpsilonScale);
         };
         auto write_poi_tiers = [&] {
             // Write POI tier variants
@@ -1968,7 +1889,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             {"modes", write_modes, costs.modes},
             {"quality variants", write_quality_dirs, costs.quality},
             {"place files", write_places, costs.places},
-            {"admin-minimal", write_admin_minimal, costs.admin_minimal},
+            {"admin-minimal", write_admin_minimal_set, costs.admin_minimal},
             {"poi tiers", write_poi_tiers, costs.poi_tiers},
         };
         auto run_stage = [&](const Stage& stage) {

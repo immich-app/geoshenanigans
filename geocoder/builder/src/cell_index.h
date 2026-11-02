@@ -81,3 +81,21 @@ void write_admin_minimal_polygons(const ParsedData& data,
                                   const std::string& prev_dir,
                                   double epsilon_scale,
                                   std::vector<uint32_t>& id_remap);
+
+// Writes <region_dir>/admin-minimal, the smallest useful set. Drops:
+//   - place_nodes with place_type ∈ {SUBURB=3, NEIGHBOURHOOD=5, QUARTER=6}
+//   - admin polygons (and their vertex bytes) admin_minimal_keeps
+//     leaves out: L9 borough, L10 quarter-area, L11 admin-postal,
+//     and L15 place areas ranked below 16.
+//   - those boundaries' claims on place nodes: a node one of them
+//     claims answers here as a place, since nothing here stands
+//     for it (an L9 or L10 boundary claims Banja Luka, Mildura and
+//     many Dutch villages).
+// Re-simplifies the kept polygons at epsilon_scale and writes them to its
+// own stable slots (region_prev's admin-minimal sidecar) so the on-disk
+// admin_polygons.bin / admin_vertices.bin are self-contained — admin-minimal
+// does NOT share polygon files with quality/q2.5/. It also carries its own
+// core strings and layout, so a client never needs another dir (or a patch
+// for one) to resolve its names.
+void write_admin_minimal(const ParsedData& data, const std::string& region_dir, const std::string& region_prev,
+                         double epsilon_scale);

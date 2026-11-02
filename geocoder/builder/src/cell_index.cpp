@@ -25,6 +25,7 @@
 #include "id_allocator.h"
 #include "keyhole_pack.h"
 #include "parallel.h"
+#include "place_claims.h"
 #include "polygon_rings.h"
 #include "postcode_validation.h"
 #include "ranked_bits.h"
@@ -1434,4 +1435,71 @@ void write_admin_minimal_polygons(const ParsedData& data,
               << " slots (of " << data.admin_polygons.size() << "), "
               << vertex_bytes / 1024 / 1024 << " MiB packed vertices"
               << std::endl;
+}
+
+void write_admin_minimal(const ParsedData& data, const std::string& region_dir, const std::string& region_prev,
+                         double epsilon_scale) {
+    std::string mdir = region_dir + "/admin-minimal";
+    ensure_dir(mdir);
+
+    // 1. Filter + re-simplify + pack admin polygons. q2.5 only —
+    //    admin-minimal isn't tiered by quality. Returns a remap
+    //    from full polygon IDs to admin-minimal's own stable slots
+    //    (or NO_DATA for dropped polygons), used below to rewrite
+    //    the cell index.
+    std::vector<uint32_t> poly_remap;
+    write_admin_minimal_polygons(data, mdir, region_prev, epsilon_scale, poly_remap);
+
+    // 2. place_nodes filter. Keep types 0=city, 1=town, 2=village,
+    //    4=hamlet.
+    std::vector<PlaceNode> filtered_places;
+    filtered_places.reserve(data.place_nodes.size());
+    for (size_t i = 0; i < data.place_nodes.size(); i++) {
+        uint8_t pt = data.place_nodes[i].place_type;
+        if (pt == 0 || pt == 1 || pt == 2 || pt == 4) {
+            PlaceNode pn = data.place_nodes[i];
+            // Parents in this dir's own polygon slots (NO_DATA when
+            // the parent polygon isn't kept), like every other id
+            // here; a node whose claimant isn't kept is shown.
+            remap_place_parent_unhiding_orphans(pn, poly_remap);
+            filtered_places.push_back(pn);
+        }
+    }
+    {
+        std::ofstream f(mdir + "/place_nodes.bin", std::ios::binary);
+        f.write(reinterpret_cast<const char*>(filtered_places.data()),
+                filtered_places.size() * sizeof(PlaceNode));
+        f.flush();
+        if (!f) throw std::runtime_error("failed to write " + mdir + "/place_nodes.bin");
+    }
+
+    // 3. Its own admin cell index (compute_admin_index_cells),
+    //    against the new polygon ID space. Preserves the
+    //    high-bit INTERIOR_FLAG used by the cell index format
+    //    (polys that fully contain a cell vs. just intersect it).
+    std::vector<CellItemPair> kept_cells = parallel_collect<CellItemPair>(data.admin_minimal_index_cells.size(),
+        [&](size_t k, std::vector<CellItemPair>& out) {
+            const CellItemPair& p = data.admin_minimal_index_cells[k];
+            const uint32_t poly_id = p.item_id & ID_MASK;
+            const uint32_t new_id = poly_id < poly_remap.size() ? poly_remap[poly_id] : NO_DATA;
+            if (new_id != NO_DATA) out.push_back({p.cell_id, new_id | (p.item_id & INTERIOR_FLAG)});
+        });
+    // The slots renumber: each cell's ids back in canonical order.
+    parallel_sort(kept_cells.begin(), kept_cells.end(), cell_item_less);
+    write_cell_index_sorted(mdir + "/admin_cells.bin", mdir + "/admin_entries.bin", kept_cells);
+
+    // 4. Core strings + layout: admin and place names all live in core.
+    {
+        const auto& core = data.strings_tiers[0];
+        std::ofstream f(mdir + "/" + STR_TIER_FILENAMES[0], std::ios::binary);
+        f.write(core.data(), core.size());
+        f.flush();
+        if (!f) throw std::runtime_error("failed to write " + mdir + "/" + STR_TIER_FILENAMES[0]);
+    }
+    write_strings_layout(mdir, data);
+
+    std::cerr << "  Admin-minimal: " << filtered_places.size()
+              << " place nodes (of " << data.place_nodes.size() << "), "
+              << count_cells(kept_cells) << " cells (of "
+              << count_cells(data.admin_index_cells) << ")" << std::endl;
 }
