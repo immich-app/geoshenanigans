@@ -1,6 +1,8 @@
-// Unit tests for string_home_tier and string_starts (parsed_data.h).
+// Unit tests for string_home_tier, string_starts, order_poi_strings_by_record
+// and partition_strings_into_tiers (parsed_data.h).
 #include "parsed_data.h"
 
+#include "reorder.h"
 #include "test_framework.h"
 
 #include <iterator>
@@ -21,7 +23,6 @@ TEST(string_home_tier_picks_the_most_widely_downloaded_consumer_tier) {
     // Tier indices: 0 core, 1 street, 2 addr, 3 postcode, 4 poi.
     struct Case { uint8_t mask; uint8_t tier; };
     const Case cases[] = {
-        {0, 0},
         {STR_TIER_BIT_CORE, 0},
         {STR_TIER_BIT_STREET, 1},
         {STR_TIER_BIT_ADDR, 2},
@@ -38,11 +39,23 @@ TEST(string_home_tier_picks_the_most_widely_downloaded_consumer_tier) {
         {STR_TIER_BIT_POI | STR_TIER_BIT_POSTCODE, 0},
         {STR_TIER_BIT_POI | STR_TIER_BIT_CORE, 0},
         {STR_TIER_BIT_CORE | STR_TIER_BIT_STREET | STR_TIER_BIT_ADDR, 0},
-        // Strings only POI candidates no tier ships use aren't written;
-        // shared with a shipped consumer, they live where that one needs.
+        // Strings no shipped record uses (no record, or only POI candidates
+        // no tier ships) aren't written; shared with a shipped consumer, they
+        // live where that one needs.
+        {0, STR_TIER_NONE},
         {STR_TIER_BIT_UNSHIPPED, STR_TIER_NONE},
         {STR_TIER_BIT_UNSHIPPED | STR_TIER_BIT_STREET, 1},
         {STR_TIER_BIT_UNSHIPPED | STR_TIER_BIT_POI, 4},
+        // A way's original name alone isn't written either; beside a shipped
+        // consumer it weighs as a street name.
+        {STR_TIER_BIT_WAY_ORIG_NAME, STR_TIER_NONE},
+        {STR_TIER_BIT_WAY_ORIG_NAME | STR_TIER_BIT_UNSHIPPED, STR_TIER_NONE},
+        {STR_TIER_BIT_WAY_ORIG_NAME | STR_TIER_BIT_STREET, 1},
+        {STR_TIER_BIT_WAY_ORIG_NAME | STR_TIER_BIT_CORE, 0},
+        {STR_TIER_BIT_WAY_ORIG_NAME | STR_TIER_BIT_POI, 0},
+        {STR_TIER_BIT_WAY_ORIG_NAME | STR_TIER_BIT_ADDR, 1},
+        {STR_TIER_BIT_WAY_ORIG_NAME | STR_TIER_BIT_POSTCODE, 3},
+        {STR_TIER_BIT_WAY_ORIG_NAME | STR_TIER_BIT_UNSHIPPED | STR_TIER_BIT_POI, 0},
     };
     for (const auto& c : cases) CHECK_EQ(string_home_tier(c.mask), c.tier);
 }
@@ -285,4 +298,70 @@ TEST(order_poi_strings_refuses_a_pool_that_is_not_the_tiers) {
     d.string_pool.mutable_data().push_back('x');
     CHECK_EQ(refusal_of<std::logic_error>([&] { order_poi_strings_by_record(d); }),
              std::string("order_poi_strings_by_record: the pool is not the tiers back to back"));
+}
+
+// --- partition_strings_into_tiers ---
+
+TEST(partition_writes_no_string_no_record_uses) {
+    // An addr:street value parent linking replaced by its street's name:
+    // still in the pool, but no record holds it.
+    ParsedData d;
+    d.string_pool.intern("Viale Bonatelli 43, 25032 Chiari (BS)");
+    AdminPolygon ap{};
+    ap.name_id = d.string_pool.intern("Chiari");
+    d.admin_polygons.push_back(ap);
+    partition_strings_into_tiers(d);
+    CHECK(tiers_back_to_back(d) == std::string("Chiari\0", 7));
+    CHECK_EQ(d.strings_tier_bases[STR_TIER_COUNT], 7u);
+    CHECK_EQ(d.admin_polygons[0].name_id, 0u);
+}
+
+TEST(partition_writes_no_original_name_of_a_way) {
+    // A way named by name:en keeps its original name only for the addr:street
+    // match; an original name that is also a way's name stays.
+    ParsedData d;
+    WayHeader translated{}, untranslated{};
+    translated.name_id = d.string_pool.intern("Hrushevskoho Street");
+    untranslated.name_id = d.string_pool.intern("淡路坂");
+    d.ways = {translated, untranslated};
+    d.way_orig_name_ids = {d.string_pool.intern("вулиця Грушевського"), untranslated.name_id};
+    partition_strings_into_tiers(d);
+    const std::string street = std::string("Hrushevskoho Street") + '\0' + "淡路坂" + '\0';
+    CHECK(tiers_back_to_back(d) == street);
+    CHECK(tier_bytes(d, 1) == street);
+    CHECK(d.way_orig_name_ids.empty());
+}
+
+TEST(partition_keeps_a_string_a_way_s_original_name_shares_where_a_street_name_would) {
+    // Zulu names a POI and is a translated way's original name, 7 a house
+    // number and another's. Equidistant POIs go to the first in record order,
+    // and the records sort on their strings' offsets: Zulu stays in core, so
+    // its POI still comes before Alpha's.
+    ParsedData d;
+    WayHeader way{};
+    way.name_id = d.string_pool.intern("Main Street");
+    d.ways = {way, way};
+    d.way_orig_name_ids = {d.string_pool.intern("Zulu"), d.string_pool.intern("7")};
+    for (const char* name : {"Alpha", "Zulu"}) {
+        PoiRecord pr{};
+        pr.name_id = d.string_pool.intern(name);
+        pr.vertex_offset = NO_DATA;
+        pr.parent_street_id = way.name_id;
+        pr.tier = 1;
+        d.poi_records.push_back(pr);
+    }
+    AddrPoint a{};
+    a.street_id = way.name_id;
+    a.housenumber_id = d.string_pool.intern("7");
+    a.vertex_offset = NO_DATA;
+    d.addr_points.push_back(a);
+    partition_strings_into_tiers(d);
+    CHECK(tier_bytes(d, 0) == std::string("Zulu\0", 5));
+    CHECK(tier_bytes(d, 1) == std::string("7\0Main Street\0", 14));
+    CHECK(tier_bytes(d, 2).empty());
+    CHECK(tier_bytes(d, STR_TIER_POI) == std::string("Alpha\0", 6));
+    std::vector<float> elevations;
+    std::vector<uint32_t> qids;
+    reorder_pois(d, elevations, qids, {});
+    CHECK(poi_names(d) == std::vector<std::string>({"Zulu", "Alpha"}));
 }
