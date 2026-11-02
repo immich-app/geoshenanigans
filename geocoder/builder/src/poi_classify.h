@@ -7,11 +7,11 @@
 #include <optional>
 #include "types.h"
 
-// The name a POI goes by: name:en, else name. An empty value names nothing,
-// and a node, way or relation without a name makes no POI: an unnamed POI
-// could only surface its parent street as the road, which drifts the answer
-// off the nearest street (San Francisco 37.7749,-122.4194: a waste basket at
-// 0 m turned Market Street into South Van Ness).
+// The name a POI node goes by: name:en, else name. An empty value names
+// nothing, and a node without a name makes no POI: an unnamed POI could only
+// surface its parent street as the road, which drifts the answer off the
+// nearest street (San Francisco 37.7749,-122.4194: a waste basket at 0 m
+// turned Market Street into South Van Ness).
 inline const char* poi_name(const char* name_en, const char* name) {
     if (name_en && name_en[0]) return name_en;
 

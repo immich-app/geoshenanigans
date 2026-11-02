@@ -2812,7 +2812,8 @@ static int run(int argc, char* argv[]) {
                             continue;
                         }
                         if (poi_cat != PoiCategory::UNKNOWN) {
-                            const char* r_name = poi_name(rel.tag("name:en"), rel.tag("name"));
+                            const char* r_name = rel.tag("name:en");
+                            if (!r_name) r_name = rel.tag("name");
                             if (r_name) {
                                 uint8_t flags = 0;
                                 if (rel.tag("wikipedia")) flags |= POI_FLAG_WIKIPEDIA;
@@ -3611,8 +3612,7 @@ static int run(int argc, char* argv[]) {
                     }
 
                     // Closed way POI polygons
-                    const char* t_poi_name = poi_name(t.name_en, t.name);
-                    if (has_poi_tags && t_poi_name && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
+                    if (has_poi_tags && t_best_name && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
                         auto cls = classify_poi(t.tourism, t.historic, t.boundary,
                             t.amenity, t.leisure, t.natural, t.railway, t.aeroway,
                             t.man_made, t.building, t.craft, t.power, t.place, t.waterway,
@@ -3662,7 +3662,7 @@ static int run(int argc, char* argv[]) {
                             if (t.wikidata && t.wikidata[0] == 'Q') {
                                 way_qid = static_cast<uint32_t>(std::strtoul(t.wikidata + 1, nullptr, 10));
                             }
-                            local.poi_ways.push_back({pr, local.strings.add(t_poi_name), std::move(verts), way_ele, way_qid, way_id});
+                            local.poi_ways.push_back({pr, local.strings.add(t_best_name), std::move(verts), way_ele, way_qid, way_id});
                         }
                     }
 
