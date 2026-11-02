@@ -79,6 +79,7 @@ add_executable(build-index
     src/pbf_reader.cpp
     src/s2_helpers.cpp
     src/admin_cover.cpp
+    src/admin_links.cpp
     src/ring_assembly.cpp
     src/continent_filter.cpp
     src/continent_boundaries.cpp
@@ -228,6 +229,7 @@ add_executable(geocoder-s2-tests
     tests/test_main.cpp
     ${GEOCODER_S2_TEST_SRCS}
     src/admin_cover.cpp
+    src/admin_links.cpp
     src/cell_index.cpp
     src/s2_helpers.cpp
 )
