@@ -214,6 +214,47 @@ private:
     unsigned bits_ = 0;
 };
 
+// How far build_merge_seq looks ahead for an old record's counterpart:
+// `runs` runs of identical new records from the cursor. A distinct record
+// is a run of its own, so the window is the 10,000 records it always was,
+// but a run of identical records takes one slot however long it is: a jump
+// over it re-sends what compresses to nothing. A day's in-place deaths
+// leave such runs, strategy-2 tombstones being all alike. The first nightly
+// without unnamed POIs tombstoned 24,543 contiguous planet poi/all records;
+// the cursor stayed on the first tombstone while the old run was deleted,
+// every later old record's counterpart then sat past a window of records,
+// and the rest of the file went as DELETE + INSERT (a 155 MB patch where a
+// normal day's is 0.9 MB). Counting runs, rather than skipping the run at the
+// cursor, also reaches past tombstones when the cursor stopped on a changed
+// record in front of them.
+class JumpWindow {
+public:
+    JumpWindow(const char* data, size_t n, size_t stride, size_t runs, unsigned threads = 0)
+        : n_(n), runs_(runs), run_starts_((n + 63) / 64) {
+        parallel_for(run_starts_.size(), [&](size_t b, size_t e, unsigned) {
+            for (size_t w = b; w < e; w++)
+                for (size_t j = w * 64; j < std::min(n, w * 64 + 64); j++)
+                    if (j == 0 || memcmp(data + j * stride, data + (j - 1) * stride, stride) != 0)
+                        run_starts_[w] |= uint64_t(1) << (j % 64);
+        }, threads);
+    }
+
+    // The end of the window from record `at`, which never moves back.
+    size_t end(size_t at) {
+        if (at >= hi_) { lo_ = at; hi_ = at + 1; inside_ = 0; }
+        for (; lo_ < at; lo_++) inside_ -= starts_run(lo_ + 1);
+        while (hi_ < n_ && inside_ + starts_run(hi_) < runs_) inside_ += starts_run(hi_++);
+        return hi_;
+    }
+
+private:
+    size_t starts_run(size_t j) const { return run_starts_[j / 64] >> (j % 64) & 1; }
+
+    size_t n_, runs_;
+    std::vector<uint64_t> run_starts_;     // bit j: record j differs from record j - 1
+    size_t lo_ = 0, hi_ = 0, inside_ = 0;  // inside_: the run starts in (lo_, hi_)
+};
+
 // Record merge of one data file: walk old (string remap already applied) and
 // new in parallel, comparing records by their stride bytes.
 inline MergeSequence build_merge_seq(
@@ -244,6 +285,7 @@ inline MergeSequence build_merge_seq(
     // this). Dead slots need no anchoring — they replay fine as plain
     // DELETE/INSERT.
     RecordJumpIndex new_index(new_data, use_hash ? new_n : 0, stride);
+    JumpWindow window(new_data, use_hash ? new_n : 0, stride, 10000);
 
     while (oi < old_n && ni < new_n) {
         const char* op = old_data + oi * stride;
@@ -254,7 +296,7 @@ inline MergeSequence build_merge_seq(
             match_run++;
             oi++; ni++;
         } else if (use_hash) {
-            uint32_t best_ni = new_index.first_equal(op, ni, ni + 10000);
+            uint32_t best_ni = new_index.first_equal(op, ni, window.end(ni));
             // Overshoot guard: with duplicate record content the smallest
             // in-window match can be a LATER duplicate than this record's
             // true counterpart (e.g. when the counterpart was already

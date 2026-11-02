@@ -63,10 +63,33 @@ std::string records(const std::string& labels) {
     return out;
 }
 
-std::vector<Op> record_merge(const std::string& old_labels, const std::string& new_labels) {
-    std::string o = records(old_labels), n = records(new_labels);
+std::vector<Op> merge_of(const std::string& o, const std::string& n) {
     return ops_of(build_merge_seq(o.data(), o.size(), n.data(), n.size(), 12), 12);
 }
+
+std::vector<Op> record_merge(const std::string& old_labels, const std::string& new_labels) {
+    return merge_of(records(old_labels), records(new_labels));
+}
+
+// n distinct 12-byte records numbered from first, none of them a tombstone.
+std::string numbered(uint32_t first, uint32_t n) {
+    std::string out;
+    for (uint32_t i = 0; i < n; i++) {
+        std::string rec(12, 'r');
+        const uint32_t v = first + i;
+        std::memcpy(&rec[0], &v, 4);
+        out += rec;
+    }
+    return out;
+}
+
+// n tombstones, all alike: zeroed records, which the jump index leaves out,
+// or (fill 0xff) records of NO_DATA ids like a POI's, which it holds.
+std::string tombstones(uint32_t n, char fill) { return std::string(size_t(n) * 12, fill); }
+
+// The first nightly without unnamed POIs tombstoned 24,543 contiguous planet
+// poi/all records in place, behind and ahead of unchanged ones.
+constexpr uint32_t HEAD = 100, DEAD = 24543, TAIL = 5000;
 
 }  // namespace
 
@@ -147,6 +170,71 @@ TEST(build_merge_seq_jumps_over_inserted_records) {
     auto got = record_merge(body, "ABCDEFGHIJKLMNOPQRST" + body);
     std::vector<Op> want = {{OP_INSERT_RUN, 20, records("ABCDEFGHIJKLMNOPQRST")}, {OP_MATCH_RUN, 30, ""}};
     CHECK(got == want);
+}
+
+TEST(jump_window_holds_a_run_of_identical_records_as_one) {
+    // Records of three values in runs of random length, the window asked
+    // for from a cursor that only moves forward, its end checked against
+    // counting the runs from the cursor.
+    constexpr size_t STRIDE = 12;
+    std::mt19937 rng(14);
+    for (size_t n : {size_t(1), size_t(70), size_t(5000)}) {
+        std::string data;
+        while (data.size() < n * STRIDE) {
+            const std::string rec(STRIDE, static_cast<char>('a' + rng() % 3));
+            for (size_t k = rng() % 3 == 0 ? rng() % 200 : 1; k-- > 0 && data.size() < n * STRIDE;) data += rec;
+        }
+        for (size_t runs : {size_t(1), size_t(4), size_t(100)}) {
+            for (unsigned threads : {1u, 5u}) {
+                JumpWindow window(data.data(), n, STRIDE, runs, threads);
+                for (size_t at = 0; at < n; at += rng() % 40) {
+                    size_t end = at + 1;
+                    for (size_t seen = 1; end < n; end++) {
+                        const bool starts = data.compare(end * STRIDE, STRIDE, data, (end - 1) * STRIDE, STRIDE) != 0;
+                        if (starts && seen == runs) break;
+                        seen += starts;
+                    }
+                    CHECK_EQ(window.end(at), end);
+                }
+            }
+        }
+    }
+}
+
+TEST(build_merge_seq_matches_the_records_after_a_long_run_of_tombstones) {
+    // While the dead run is deleted the cursor waits on the first
+    // tombstone; the records after the run must still be found from there.
+    for (char fill : {'\0', '\xff'}) {
+        auto got = merge_of(numbered(0, HEAD) + numbered(1000000, DEAD) + numbered(HEAD, TAIL),
+                            numbered(0, HEAD) + tombstones(DEAD, fill) + numbered(HEAD, TAIL));
+        std::vector<Op> want = {{OP_MATCH_RUN, HEAD, ""}, {OP_DELETE_RUN, DEAD, ""},
+                                {OP_INSERT_RUN, DEAD, tombstones(DEAD, fill)}, {OP_MATCH_RUN, TAIL, ""}};
+        CHECK(got == want);
+    }
+}
+
+TEST(build_merge_seq_matches_past_tombstones_behind_a_changed_record) {
+    // The record in front of the dead run changed as well, so the cursor
+    // waits on its new version, not on a tombstone.
+    for (char fill : {'\0', '\xff'}) {
+        auto got = merge_of(numbered(0, HEAD) + numbered(2000000, 1) + numbered(1000000, DEAD) + numbered(HEAD, TAIL),
+                            numbered(0, HEAD) + numbered(3000000, 1) + tombstones(DEAD, fill) + numbered(HEAD, TAIL));
+        std::vector<Op> want = {{OP_MATCH_RUN, HEAD, ""}, {OP_DELETE_RUN, 1 + DEAD, ""},
+                                {OP_INSERT_RUN, 1 + DEAD, numbered(3000000, 1) + tombstones(DEAD, fill)},
+                                {OP_MATCH_RUN, TAIL, ""}};
+        CHECK(got == want);
+    }
+}
+
+TEST(build_merge_seq_still_matches_the_tombstones_both_days_hold) {
+    // A run of yesterday's tombstones behind a deleted record: the window
+    // reaching past it doesn't make it an insert.
+    for (char fill : {'\0', '\xff'}) {
+        auto got = merge_of(numbered(2000000, 1) + tombstones(DEAD, fill) + numbered(0, TAIL),
+                            tombstones(DEAD, fill) + numbered(0, TAIL));
+        std::vector<Op> want = {{OP_DELETE_RUN, 1, ""}, {OP_MATCH_RUN, DEAD + TAIL, ""}};
+        CHECK(got == want);
+    }
 }
 
 TEST(for_each_merge_op_steps_over_inline_records) {
