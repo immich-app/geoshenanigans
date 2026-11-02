@@ -4,10 +4,20 @@ on:
   schedule:
     - cron: '17 3 * * 0'  # Weekly on Sunday at 3:17 UTC
   workflow_dispatch:
+    inputs:
+      force:
+        description: 'Re-extract the newest dump even if latest.json already holds it'
+        required: false
+        type: boolean
+        default: false
 
 env:
   S3_BUCKET: geoshenanigans-reverse-geocoding
   S3_ENDPOINT: https://t3.storage.dev
+  # Fewest unique QIDs a published file may hold. The 2026-06 dump had 34.0M
+  # items with sitelinks; a file under this (the 20261001 one held 0) means
+  # the dump was read in part, and is neither published nor kept as current.
+  MIN_QIDS: 20000000
 
 permissions:
   contents: read
@@ -23,12 +33,14 @@ jobs:
 
       - name: Install tools
         run: |
-          curl -sL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
+          set -euo pipefail
+          curl -sSfL "https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz" \
             -o /tmp/s5cmd.tar.gz
           sudo tar xzf /tmp/s5cmd.tar.gz -C /usr/local/bin s5cmd
 
       - name: Configure credentials
         run: |
+          set -euo pipefail
           echo "AWS_ACCESS_KEY_ID=$KEY" >> "$GITHUB_ENV"
           echo "AWS_SECRET_ACCESS_KEY=$SECRET" >> "$GITHUB_ENV"
         env:
@@ -37,13 +49,16 @@ jobs:
 
       - name: Find latest Wikidata dump
         id: dump
+        env:
+          FORCE: ${{ inputs.force || false }}
         run: |
+          set -euo pipefail
           # Find the latest available dump date that has the wb_items_per_site file
-          DATES=$(curl -sL "https://dumps.wikimedia.org/wikidatawiki/" | grep -oP 'href="(\d{8})/"' | grep -oP '\d{8}' | sort -r)
+          DATES=$(curl -sSfL "https://dumps.wikimedia.org/wikidatawiki/" | grep -oP 'href="(\d{8})/"' | grep -oP '\d{8}' | sort -r || true)
           LATEST=""
           for DATE in $DATES; do
             URL="https://dumps.wikimedia.org/wikidatawiki/$DATE/wikidatawiki-${DATE}-wb_items_per_site.sql.gz"
-            STATUS=$(curl -sI "$URL" 2>/dev/null | head -1 | awk '{print $2}')
+            STATUS=$(curl -s -o /dev/null -I -w '%{http_code}' "$URL" || true)
             if [ "$STATUS" = "200" ]; then
               LATEST="$DATE"
               echo "Found available dump: $DATE"
@@ -58,13 +73,24 @@ jobs:
           echo "Latest dump: $LATEST"
           echo "date=$LATEST" >> "$GITHUB_OUTPUT"
 
-          # Check if we already have this version cached
+          # Skip only if latest.json already holds this dump with a full
+          # file under its own key (the path builds download): a dump
+          # extracted to too few entries (20261001 gave 0) is extracted
+          # again on the next run instead of standing as current.
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 3"
           EXISTING=$($S5 cat "s3://$S3_BUCKET/geocoder/wikidata/latest.json" 2>/dev/null || echo '{}')
-          EXISTING_DATE=$(echo "$EXISTING" | jq -r '.dump_date // ""' 2>/dev/null)
-          if [ "$EXISTING_DATE" = "$LATEST" ]; then
-            echo "Already up to date (dump $LATEST)"
+          EXISTING_DATE=$(echo "$EXISTING" | jq -r '.dump_date // ""' 2>/dev/null || echo "")
+          EXISTING_ENTRIES=$(echo "$EXISTING" | jq -r '.entries // 0 | floor' 2>/dev/null || echo 0)
+          EXISTING_PATH=$(echo "$EXISTING" | jq -r '.path // ""' 2>/dev/null || echo "")
+          if [ "$FORCE" = "true" ]; then
+            echo "Re-extracting $LATEST on request (current: $EXISTING_DATE, $EXISTING_ENTRIES entries)"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [ "$EXISTING_DATE" = "$LATEST" ] && [ "$EXISTING_ENTRIES" -ge "$MIN_QIDS" ] && [ -n "$EXISTING_PATH" ]; then
+            echo "Already up to date (dump $LATEST, $EXISTING_ENTRIES entries, $EXISTING_PATH)"
             echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ "$EXISTING_DATE" = "$LATEST" ]; then
+            echo "::warning::latest.json holds dump $LATEST with $EXISTING_ENTRIES entries (need $MIN_QIDS) at path '$EXISTING_PATH', re-extracting"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
           else
             echo "New dump available: $LATEST (current: $EXISTING_DATE)"
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -75,18 +101,21 @@ jobs:
         env:
           DUMP_DATE: ${{ steps.dump.outputs.date }}
         run: |
+          set -euo pipefail
           URL="https://dumps.wikimedia.org/wikidatawiki/$DUMP_DATE/wikidatawiki-${DUMP_DATE}-wb_items_per_site.sql.gz"
           echo "Downloading $URL..."
           START=$(date +%s)
-          curl -sL "$URL" -o /tmp/wb_items_per_site.sql.gz
+          curl -sSfL "$URL" -o /tmp/wb_items_per_site.sql.gz
           SIZE=$(stat -c%s /tmp/wb_items_per_site.sql.gz)
           echo "Downloaded: $((SIZE / 1024 / 1024)) MiB in $(($(date +%s) - START))s"
 
+          # Exits non-zero, writing nothing, on no rows or under MIN_QIDS.
           echo "Extracting sitelinks..."
           START=$(date +%s)
           python3 geocoder/builder/tools/extract_wikidata_sitelinks.py \
             /tmp/wb_items_per_site.sql.gz \
-            -o /tmp/qid_sitelinks.bin
+            -o /tmp/qid_sitelinks.bin \
+            --min-qids "$MIN_QIDS"
           echo "Extraction completed in $(($(date +%s) - START))s"
           echo "Output: $(stat -c%s /tmp/qid_sitelinks.bin) bytes ($(( $(stat -c%s /tmp/qid_sitelinks.bin) / 6 )) entries)"
 
@@ -95,21 +124,36 @@ jobs:
         env:
           DUMP_DATE: ${{ steps.dump.outputs.date }}
         run: |
+          set -euo pipefail
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5"
 
-          # Upload dated version
-          $S5 cp /tmp/qid_sitelinks.bin "s3://$S3_BUCKET/geocoder/wikidata/$DUMP_DATE/qid_sitelinks.bin"
+          # Check the file before it goes anywhere: whole 6-byte records, and
+          # at least MIN_QIDS of them.
+          SIZE=$(stat -c%s /tmp/qid_sitelinks.bin)
+          ENTRIES=$((SIZE / 6))
+          if [ $((SIZE % 6)) -ne 0 ] || [ "$ENTRIES" -lt "$MIN_QIDS" ]; then
+            echo "::error::qid_sitelinks.bin is $SIZE bytes ($ENTRIES entries, need $MIN_QIDS in whole 6-byte records); not uploading"
+            exit 1
+          fi
 
-          # Update latest.json
+          # Each extraction gets a key of its own, then latest.json names it:
+          # a build reading the current latest.json keeps finding the file
+          # and size it names, even while a re-extraction of the same dump
+          # uploads, and whether or not this run gets to replace latest.json.
+          KEY="wikidata/$DUMP_DATE/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/qid_sitelinks.bin"
+          $S5 cp /tmp/qid_sitelinks.bin "s3://$S3_BUCKET/geocoder/$KEY"
+
           jq -n \
             --arg dump_date "$DUMP_DATE" \
+            --arg path "$KEY" \
             --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-            --argjson entries "$(( $(stat -c%s /tmp/qid_sitelinks.bin) / 6 ))" \
-            --argjson size_bytes "$(stat -c%s /tmp/qid_sitelinks.bin)" \
-            '{dump_date: $dump_date, entries: $entries, size_bytes: $size_bytes, updated_at: $updated_at}' \
-            | $S5 pipe "s3://$S3_BUCKET/geocoder/wikidata/latest.json"
+            --argjson entries "$ENTRIES" \
+            --argjson size_bytes "$SIZE" \
+            '{dump_date: $dump_date, path: $path, entries: $entries, size_bytes: $size_bytes, updated_at: $updated_at}' \
+            > /tmp/latest.json
+          $S5 cp /tmp/latest.json "s3://$S3_BUCKET/geocoder/wikidata/latest.json"
 
-          echo "Uploaded to s3://$S3_BUCKET/geocoder/wikidata/$DUMP_DATE/"
+          echo "Uploaded to s3://$S3_BUCKET/geocoder/$KEY"
           $S5 cat "s3://$S3_BUCKET/geocoder/wikidata/latest.json" | jq .
 
       - name: Summary
@@ -118,6 +162,7 @@ jobs:
           DUMP_DATE: ${{ steps.dump.outputs.date }}
           SKIP: ${{ steps.dump.outputs.skip }}
         run: |
+          set -euo pipefail
           echo "## Wikidata Sitelinks Update" >> "$GITHUB_STEP_SUMMARY"
           if [ "$SKIP" = "true" ]; then
             echo "Already up to date (dump $DUMP_DATE)" >> "$GITHUB_STEP_SUMMARY"
