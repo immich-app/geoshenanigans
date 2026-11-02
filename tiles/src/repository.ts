@@ -257,26 +257,28 @@ export class Metric {
   }
 }
 
-export class CloudflareMetricsRepository implements IMetricsRepository {
-  private readonly defaultTags: { [key: string]: string };
+/** Tags for every metric of a client request: where it reached Cloudflare and which site it came from. */
+export function requestTags(request: Request<unknown, IncomingRequestCfProperties>): { [key: string]: string } {
+  // Origin is "null" from sandboxed or file:// pages, which isn't a URL.
+  const url = URL.parse(request.headers.get('origin') ?? '') ?? new URL('http://missing.url');
+  const apexDomain = parseDomain(url.hostname).domain ?? url.hostname;
+  const protocol = url.protocol;
 
+  return {
+    continent: request.cf?.continent ?? '',
+    colo: request.cf?.colo ?? '',
+    asOrg: request.cf?.asOrganization ?? '',
+    apexDomain,
+    protocol,
+  };
+}
+
+export class CloudflareMetricsRepository implements IMetricsRepository {
   constructor(
     private operationPrefix: string,
-    request: Request<unknown, IncomingRequestCfProperties>,
+    private readonly defaultTags: { [key: string]: string },
     private metricsProviders: IMetricsProviderRepository[],
-  ) {
-    const url = new URL(request.headers.get('origin') ?? 'http://missing.url');
-    const apexDomain = parseDomain(url.hostname).domain ?? url.hostname;
-    const protocol = url.protocol;
-
-    this.defaultTags = {
-      continent: request.cf?.continent ?? '',
-      colo: request.cf?.colo ?? '',
-      asOrg: request.cf?.asOrganization ?? '',
-      apexDomain,
-      protocol,
-    };
-  }
+  ) {}
 
   monitorAsyncFunction<T extends AsyncFn>(
     operation: Operation,

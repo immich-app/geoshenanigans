@@ -26,7 +26,12 @@ export interface IDeferredRepository {
 export type AsyncFn = (...args: any[]) => Promise<any>;
 export type Class = { new (...args: any[]): any };
 export type Operation = { name: string; tags?: { [key: string]: string } };
-export type Options = { monitorInvocations?: boolean; acceptedErrors?: Class[] };
+export type Options = {
+  monitorInvocations?: boolean;
+  acceptedErrors?: Class[];
+  // Tags that depend on what the call returned, e.g. the cache status of a response.
+  resultTags?: (result: any) => { [key: string]: string };
+};
 
 export interface IMetricsRepository {
   monitorAsyncFunction<T extends AsyncFn>(

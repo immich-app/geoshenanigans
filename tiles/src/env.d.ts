@@ -1,6 +1,9 @@
-interface WorkerEnv extends Omit<Env, 'ENVIRONMENT' | 'DEPLOYMENT_KEY'> {
+interface WorkerEnv extends Omit<Env, 'ENVIRONMENT' | 'DEPLOYMENT_KEY' | 'PUBLIC_URL'> {
   ENVIRONMENT: string;
   DEPLOYMENT_KEY: string;
+  // The worker's canonical origin (e.g. https://tiles.immich.cloud), which TileJSON and dev styles point clients at:
+  // cached responses are shared by every host the worker answers on.
+  PUBLIC_URL: string;
   // Prepended to object keys in the tiles-geo bucket; unset in prod, "dev/" in dev.
   STORAGE_PREFIX?: string;
   VMETRICS_API_TOKEN: string;

@@ -4,6 +4,21 @@ main = "src/index.ts"
 compatibility_date = "2026-11-01"
 compatibility_flags = ["nodejs_compat"]
 
+# Same cache setup as the deployed worker (deployment/modules/cloudflare/tiles-worker): the default export is an
+# uncached gateway in front of the cached Tiles entrypoint. Cached responses outlive code-only deploys; the gateway puts
+# the deployment key in their URLs, so a data deploy starts a fresh set.
+[cache]
+enabled = true
+cross_version_cache = true
+
+[exports.default]
+type = "worker"
+cache = { enabled = false }
+
+[exports.Tiles]
+type = "worker"
+cache = { enabled = true }
+
 [[d1_databases]]
 binding = "D1_GLOBAL"
 database_name = "tiles"
@@ -13,3 +28,5 @@ database_id = "c60521e7-59bd-4186-81e7-9a676edf9b75"
 [vars]
 DEPLOYMENT_KEY = "20250818"
 ENVIRONMENT = "production"
+# Where clients reach the worker; TileJSON and dev styles point here rather than at the requested host.
+PUBLIC_URL = "http://localhost:8787"

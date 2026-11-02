@@ -95,17 +95,11 @@ export class PMTilesService {
     return JSON.parse(query.results[0].entry as string);
   }
 
-  async getJsonResponse(version: string, url: URL): Promise<JsonResponse> {
+  /** The TileJSON, with tile URLs under publicUrl (the worker's canonical origin) for this deployment. */
+  async getJsonResponse(version: string, publicUrl: string): Promise<JsonResponse> {
     const json = await this.getJson();
-    json.tiles = [
-      `${url.protocol}//` +
-        url.hostname +
-        `${url.port ? `:${url.port}` : ''}` +
-        `/v${version}` +
-        '/{z}/{x}/{y}' +
-        `.mvt?v=${this.source.getDeploymentKey()}`,
-    ];
-    return json;
+    const tiles = [`${publicUrl}/v${version}/{z}/{x}/{y}.mvt?v=${this.source.getDeploymentKey()}`];
+    return { ...json, tiles };
   }
 
   async getTile(z: number, x: number, y: number): Promise<ReadableStream | undefined> {
