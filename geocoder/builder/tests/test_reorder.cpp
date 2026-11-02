@@ -571,6 +571,32 @@ TEST(permute_admin_polygons_moves_vertices_and_osm_ids_with_each_polygon) {
     }
 }
 
+TEST(permute_admin_polygons_moves_each_polygons_exact_rings_with_it) {
+    for (unsigned threads : kThreadCounts) {
+        ParsedData d;
+        for (int32_t i = 0; i < 4; i++) {
+            AdminPolygon p{};
+            p.name_id = static_cast<uint32_t>(i);
+            d.admin_polygons.push_back(p);
+            std::vector<std::vector<PackedLocation>> holes(static_cast<size_t>(i % 2), {{i, 1}, {i, 2}, {i, 1}});
+            d.admin_exact_rings.append({{i, 0}, {i, 5}, {i + 5, 5}, {i, 0}}, holes);
+        }
+        const auto vertices = d.admin_exact_rings.vertices;
+        const auto rings = d.admin_exact_rings.rings;
+        permute_admin_polygons(d, {2, 0, 3, 1}, threads);
+        // Only the polygons' entries move.
+        CHECK(d.admin_exact_rings.vertices == vertices);
+        CHECK(d.admin_exact_rings.rings.size() == rings.size());
+        for (uint32_t k = 0; k < 4; k++) {
+            const auto& polygon = d.admin_exact_rings.polygons[k];
+            const int32_t was = static_cast<int32_t>(d.admin_polygons[k].name_id);
+            CHECK_EQ(polygon.ring_count, uint32_t(1 + was % 2));
+            const RingSpan& outer = d.admin_exact_rings.rings_of(k)[0];
+            CHECK_EQ(d.admin_exact_rings.vertices[outer.begin].lat_e7, was);
+        }
+    }
+}
+
 TEST(repack_and_first_set_per_run_fill_the_buffers_they_are_given) {
     const std::vector<uint32_t> src = {10, 11, 12, 13, 14, 15};
     auto count = [](size_t i) { return size_t(i % 3); };

@@ -202,6 +202,7 @@ add_executable(geocoder-tests
 target_include_directories(geocoder-tests PRIVATE src tools tests)
 target_compile_definitions(geocoder-tests PRIVATE
     GEOCODER_TEMPLATE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/configurations.template.json"
+    GEOCODER_TESTDATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/../testdata"
     GEOCODER_DIFF_BIN="$<TARGET_FILE:geocoder-diff>"
     GEOCODER_PATCH_BIN="$<TARGET_FILE:geocoder-patch>"
     GEOCODER_GC_BIN="$<TARGET_FILE:geocoder-gc>"

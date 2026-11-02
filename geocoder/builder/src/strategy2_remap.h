@@ -20,8 +20,8 @@ inline void remap_index(uint32_t& v, const std::vector<uint32_t>& remap) {
 }
 
 // remap_index_flagged: index field that may carry the high-bit
-// INTERIOR_FLAG (cell-to-record entries set during the S2-covering
-// pass). Mask the flag off, remap the index, then re-OR the flag —
+// INTERIOR_FLAG (cell-to-record entries set by the coverings of the
+// records). Mask the flag off, remap the index, then re-OR the flag —
 // mirroring the deterministic-sort pass's handling of the same arrays.
 inline void remap_index_flagged(uint32_t& v, const std::vector<uint32_t>& remap) {
     uint32_t flag = v & INTERIOR_FLAG;

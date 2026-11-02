@@ -26,7 +26,7 @@
 // outer ring's minus the holes' (the connector terms cancel exactly).
 // AdminPolygon::hole_count says how many excursions follow the outer ring;
 // split_rings recovers the rings for the passes that need them one by one
-// (S2 covering, simplification, interior points).
+// (S2 covering, simplification).
 #pragma once
 
 #include <algorithm>
@@ -120,16 +120,6 @@ bool split_rings(const P* v, uint32_t n, uint16_t holes, std::vector<RingSpan>& 
     return true;
 }
 
-// Number of vertices of the outer ring of a keyhole range (all n when it has
-// no holes or doesn't parse).
-template <class P>
-uint32_t outer_ring_count(const P* v, uint32_t n, uint16_t holes) {
-    if (holes == 0) return n;
-    std::vector<RingSpan> spans;
-    split_rings(v, n, holes, spans);
-    return spans.front().count;
-}
-
 // Twice the signed shoelace area of a closed ring, in degrees squared.
 template <class P>
 double signed_area2(const std::vector<P>& ring) {
@@ -160,17 +150,17 @@ inline bool ring_contains_latlng(const std::vector<LatLng>& ring, double lat, do
 // first vertex when no stretch has width (a degenerate ring). Returns
 // (lat, lng).
 template <class P>
-LatLng interior_point(const P* v, const std::vector<RingSpan>& rings) {
-    const RingSpan& outer = rings.front();
+LatLng interior_point(const P* v, const RingSpan* rings, size_t ring_count) {
+    const RingSpan& outer = rings[0];
     double lo = std::numeric_limits<double>::infinity(), hi = -lo;
     for (uint32_t k = 0; k < outer.count; k++) {
         lo = std::min(lo, ring_lat(v[outer.begin + k]));
         hi = std::max(hi, ring_lat(v[outer.begin + k]));
     }
     const double centre = (lo + hi) / 2;
-    for (const RingSpan& r : rings)
-        for (uint32_t k = 0; k < r.count; k++) {
-            const double y = ring_lat(v[r.begin + k]);
+    for (const RingSpan* r = rings; r != rings + ring_count; ++r)
+        for (uint32_t k = 0; k < r->count; k++) {
+            const double y = ring_lat(v[r->begin + k]);
             if (y <= centre) {
                 if (y > lo) lo = y;
             } else if (y < hi) {
@@ -180,10 +170,10 @@ LatLng interior_point(const P* v, const std::vector<RingSpan>& rings) {
     const double scan = (lo + hi) / 2;
 
     std::vector<double> crossings;
-    for (const RingSpan& r : rings)
-        for (uint32_t k = 1; k < r.count; k++) {
-            const double y0 = ring_lat(v[r.begin + k - 1]), y1 = ring_lat(v[r.begin + k]);
-            const double x0 = ring_lng(v[r.begin + k - 1]), x1 = ring_lng(v[r.begin + k]);
+    for (const RingSpan* r = rings; r != rings + ring_count; ++r)
+        for (uint32_t k = 1; k < r->count; k++) {
+            const double y0 = ring_lat(v[r->begin + k - 1]), y1 = ring_lat(v[r->begin + k]);
+            const double x0 = ring_lng(v[r->begin + k - 1]), x1 = ring_lng(v[r->begin + k]);
             if ((y0 > scan && y1 > scan) || (y0 < scan && y1 < scan)) continue;
             if (y0 == y1) continue;
             if (y0 == scan && y1 < scan) continue;  // downward edge leaves out its start
@@ -203,12 +193,9 @@ LatLng interior_point(const P* v, const std::vector<RingSpan>& rings) {
     return best;
 }
 
-// interior_point of a polygon's keyhole range.
 template <class P>
-LatLng polygon_interior_point(const P* v, uint32_t n, uint16_t holes) {
-    std::vector<RingSpan> spans;
-    split_rings(v, n, holes, spans);
-    return interior_point(v, spans);
+LatLng interior_point(const P* v, const std::vector<RingSpan>& rings) {
+    return interior_point(v, rings.data(), rings.size());
 }
 
 // For each closed ring of a relation, the index of the ring immediately

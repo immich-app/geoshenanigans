@@ -812,6 +812,7 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
         std::vector<std::pair<uint32_t, uint32_t>> linked_nodes;
         const double max_dist_deg = 0.5;
         const double max_dist_sq = max_dist_deg * max_dist_deg;
+        const AdminRings countries = border_country_rings(data, num_threads);
 
         for (unsigned int t = 0; t < num_threads; t++) {
             nl_workers.emplace_back([&]() {
@@ -825,7 +826,7 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                     // find_linked_place only runs for boundary=administrative,
                     // so postal boundaries never link (or hide) place nodes.
                     if (poly.admin_level < 8 || poly.admin_level > 10) continue;
-                    if (poly.vertex_count == 0) continue;
+                    if (data.admin_exact_rings.polygons[i].ring_count == 0) continue;
                     if (poly.name_id == NO_DATA) continue;
                     const char* bnd_name = pool_data.data() + poly.name_id;
                     if (!bnd_name[0]) continue;
@@ -837,18 +838,22 @@ static void link_places_by_name(ParsedData& data, const BuildConfig& cfg,
                     // the country from the polygon centroid's admin cell.
                     uint16_t bnd_cc = poly.country_code;
 
-                    // The outer ring's vertex average (holes follow it).
-                    const NodeCoord* ring = &data.admin_vertices[poly.vertex_offset];
-                    const uint32_t ring_count = outer_ring_count(ring, poly.vertex_count, poly.hole_count);
-                    double sum_lat = 0.0, sum_lng = 0.0;
+                    // The exact outer ring's vertex average, each vertex once
+                    // (a closed ring repeats its first), summed in integers:
+                    // the same point whatever the ring's rotation.
+                    const RingSpan& outer = data.admin_exact_rings.rings_of(static_cast<uint32_t>(i))[0];
+                    const PackedLocation* ring = data.admin_exact_rings.vertices.data() + outer.begin;
+                    uint32_t ring_count = outer.count;
+                    if (ring_count > 1 && ring[0] == ring[ring_count - 1]) ring_count--;
+                    int64_t sum_lat = 0, sum_lng = 0;
                     for (uint32_t v = 0; v < ring_count; v++) {
-                        sum_lat += ring[v].lat;
-                        sum_lng += ring[v].lng;
+                        sum_lat += ring[v].lat_e7;
+                        sum_lng += ring[v].lon_e7;
                     }
-                    double clat = sum_lat / ring_count;
-                    double clng = sum_lng / ring_count;
+                    double clat = static_cast<double>(sum_lat) / ring_count / 1e7;
+                    double clng = static_cast<double>(sum_lng) / ring_count / 1e7;
 
-                    if (bnd_cc == 0) bnd_cc = country_code_at_point(data, clat, clng);
+                    if (bnd_cc == 0) bnd_cc = country_code_at_point(data, countries, clat, clng);
                     uint8_t bnd_rank = admin_rank_address(bnd_cc, poly.admin_level);
                     if (bnd_rank == 0) continue;  // not in this country's address chain
 
@@ -1581,6 +1586,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // points and admin polygons they read: their sums are integers, merged
     // in any order, and a point's country rests on area and code, not slot.
     timed_phase("    planet: postcode centroids", [&] { collect_postcode_centroids(data); });
+    // Gone before the strategy-2 remap takes its budget from what the build
+    // holds: the exact rings never reach the remap, which would have to
+    // follow them, nor the write phase.
+    free_storage(data.admin_exact_rings);
 
     // Strategy-2 remap for the planet region runs synchronously HERE — before
     // the planet write launches and before continent filtering reads the
@@ -2156,14 +2165,19 @@ static int run(int argc, char* argv[]) {
         if (!tiger_data_path.empty())
             tiger_csvs = std::async(std::launch::async, find_tiger_csvs, tiger_data_path);
 
-        // Create thread pool for concurrent admin polygon S2 covering
         std::cerr << "Using " << num_threads << " worker threads." << std::endl;
-        AdminCoverPool admin_pool(num_threads);
+        // The candidate map's cells of each input's admin polygons, covered
+        // beside the rest of the work (admin_candidate_cells).
+        std::vector<std::future<std::vector<CellItemPair>>> admin_cells_pending;
 
         // The last input's way geometries, freed beside the admin linking.
         WayGeometries spent_geometries;
         for (const auto& input_file : input_files) {
             std::cerr << "Processing " << input_file << "..." << std::endl;
+            // This input's polygons append to the exact rings the last one's
+            // covering reads.
+            for (auto& cells : admin_cells_pending) cells.wait();
+            const uint32_t first_admin = static_cast<uint32_t>(data.admin_polygons.size());
 
             // --- Pass 1: collect relation members for parallel admin assembly ---
             std::cerr << "  Pass 1: scanning relations..." << std::endl;
@@ -3616,7 +3630,7 @@ static int run(int argc, char* argv[]) {
                             if (pto == 0) pto = cwa.fallback_place_type;
                             const char* cc = cwa.country_code.empty() ? nullptr : cwa.country_code.c_str();
                             add_admin_polygon(data, cwa.vertices, cwa.name.c_str(),
-                                              cwa.admin_level, cc, &admin_pool, pto,
+                                              cwa.admin_level, cc, pto,
                                               cwa.way_id);
                             closed_way_admin_count++;
                         }
@@ -3902,10 +3916,12 @@ static int run(int argc, char* argv[]) {
                         uint16_t hole_count = 0;
                         uint8_t halvings = 0;  // SimplifiedRings::halvings
                         bool nests = true;
+                        // The exact rings, rotated as canonicalize_ring_rotation puts them.
+                        std::vector<PackedLocation> outer;
+                        std::vector<std::vector<PackedLocation>> holes;
                         std::string name;
                         uint8_t admin_level;
                         std::string country_code;
-                        float area;
                         uint8_t place_type_override;
                         int64_t relation_id;
                         uint16_t ring_index;
@@ -3942,9 +3958,8 @@ static int run(int argc, char* argv[]) {
                                     pp.hole_count = s.holes;
                                     pp.halvings = s.halvings;
                                     pp.nests = s.nests;
-                                    if (pp.simplified.size() >= 3) {
-                                        pp.area = polygon_area(pp.simplified);
-                                    }
+                                    pp.outer = std::move(ar.vertices);
+                                    pp.holes = std::move(ar.holes);
                                     pp.name = std::move(ar.name);
                                     pp.admin_level = ar.admin_level;
                                     pp.country_code = std::move(ar.country_code);
@@ -3965,8 +3980,8 @@ static int run(int argc, char* argv[]) {
                     log_phase("    Admin: parallel simplify", _pt, _cpu);
 
                     // Append the rings of 3+ vertices, in order, on every core,
-                    // then hand them all to the S2 pool: a loop appending and
-                    // submitting them one by one took one core seconds.
+                    // with their exact rings: a loop appending them one by one
+                    // took one core seconds.
                     const std::vector<uint32_t> kept = parallel_filter(prepared.size(),
                         [&](size_t i) { return prepared[i].simplified.size() >= 3; }, num_threads);
                     std::vector<std::string_view> names(kept.size());
@@ -3974,10 +3989,25 @@ static int run(int argc, char* argv[]) {
                     const std::vector<uint32_t> name_ids = data.string_pool.intern_all(names, num_threads);
                     const std::vector<size_t> vertex_at = parallel_offsets<size_t>(kept.size(),
                         [&](size_t k) { return prepared[kept[k]].simplified.size(); }, num_threads);
+                    const std::vector<size_t> ring_at = parallel_offsets<size_t>(kept.size(),
+                        [&](size_t k) { return 1 + prepared[kept[k]].holes.size(); }, num_threads);
+                    const std::vector<size_t> exact_at = parallel_offsets<size_t>(kept.size(), [&](size_t k) {
+                        const auto& pp = prepared[kept[k]];
+                        size_t n = pp.outer.size();
+                        for (const auto& h : pp.holes) n += h.size();
+                        return n;
+                    }, num_threads);
+                    AdminExactRings& exact = data.admin_exact_rings;
+                    if (exact.polygons.size() != data.admin_polygons.size())
+                        throw std::logic_error("admin exact rings out of step with the polygons");
+                    if (exact.vertices.size() + exact_at.back() > UINT32_MAX || exact.rings.size() + ring_at.back() > UINT32_MAX)
+                        throw std::length_error("admin exact rings past 2^32 vertices or rings");
                     const size_t poly_base = grow_by(data.admin_polygons, kept.size());
                     const size_t vertex_base = grow_by(data.admin_vertices, vertex_at.back());
                     grow_by(data.admin_osm_ids, kept.size());
-                    std::vector<AdminCoverPool::WorkItem> cover(kept.size());
+                    grow_by(exact.polygons, kept.size());
+                    const size_t ring_base = grow_by(exact.rings, ring_at.back());
+                    const size_t exact_base = grow_by(exact.vertices, exact_at.back());
                     parallel_for(kept.size(), [&](size_t begin, size_t end, unsigned) {
                         for (size_t k = begin; k < end; k++) {
                             auto& pp = prepared[kept[k]];
@@ -3987,13 +4017,24 @@ static int run(int argc, char* argv[]) {
                                 data.admin_vertices[vertex_offset + v] = {static_cast<float>(lat), static_cast<float>(lng)};
                             }
 
+                            uint32_t ring = static_cast<uint32_t>(ring_base + ring_at[k]);
+                            size_t at = exact_base + exact_at[k];
+                            exact.polygons[poly_base + k] = {ring, static_cast<uint32_t>(1 + pp.holes.size())};
+                            auto put = [&](std::vector<PackedLocation>& r) {
+                                exact.rings[ring++] = {static_cast<uint32_t>(at), static_cast<uint32_t>(r.size())};
+                                at = std::copy(r.begin(), r.end(), exact.vertices.begin() + at) - exact.vertices.begin();
+                                std::vector<PackedLocation>().swap(r);
+                            };
+                            put(pp.outer);
+                            for (auto& h : pp.holes) put(h);
+
                             AdminPolygon poly{};
                             poly.vertex_offset = vertex_offset;
                             poly.vertex_count = static_cast<uint32_t>(pp.simplified.size());
                             poly.name_id = name_ids[k];
                             poly.admin_level = pp.admin_level;
                             poly.place_type_override = pp.place_type_override;
-                            poly.area = pp.area;
+                            poly.area = exact.area(static_cast<uint32_t>(poly_base + k));
                             poly.hole_count = pp.hole_count;
                             const char* cc = pp.country_code.empty() ? nullptr : pp.country_code.c_str();
                             poly.country_code = (cc && cc[0] && cc[1])
@@ -4008,16 +4049,18 @@ static int run(int argc, char* argv[]) {
                             // The type byte keeps relation ids from colliding
                             // with closed-way ids (which use OSM_WAY + way_id).
                             data.admin_osm_ids[poly_base + k] = admin_ring_id(pp.relation_id, pp.ring_index);
-
-                            cover[k] = {static_cast<uint32_t>(poly_base + k), std::move(pp.simplified), pp.hole_count};
+                            std::vector<std::pair<double,double>>().swap(pp.simplified);
                         }
                     }, num_threads);
-                    admin_pool.submit_all(std::move(cover));
+                    admin_cells_pending.push_back(std::async(std::launch::async,
+                        [&exact, from = first_admin, to = static_cast<uint32_t>(data.admin_polygons.size()), num_threads] {
+                            return admin_candidate_cells(exact, from, to, num_threads);
+                        }));
 
                     std::cerr << "  Parallel admin assembly complete: "
                               << total_admin_rings << " polygon rings from "
                               << data.collected_relations.size() << " relations." << std::endl;
-                    log_phase("    Admin: append + submit S2", _pt, _cpu);
+                    log_phase("    Admin: append", _pt, _cpu);
 
                     // Free collected admin data
                     data.collected_relations.clear();
@@ -4257,6 +4300,7 @@ static int run(int argc, char* argv[]) {
         log_mem("data.admin_polygons",               vec_bytes(data.admin_polygons));
         log_mem("data.admin_osm_ids",                vec_bytes(data.admin_osm_ids));
         log_mem("data.admin_vertices",               vec_bytes(data.admin_vertices));
+        log_mem("data.admin_exact_rings.vertices",   vec_bytes(data.admin_exact_rings.vertices));
         log_mem("data.cell_to_admin (approx)",       map_bytes_approx(data.cell_to_admin));
         log_mem("data.admin_parent_ids",             vec_bytes(data.admin_parent_ids));
         log_mem("data.poi_records",                  vec_bytes(data.poi_records));
@@ -4288,14 +4332,18 @@ static int run(int argc, char* argv[]) {
         // buffer faulted in meanwhile.
         auto admin_vertex_buffer = vector_beside<NodeCoord>(data.admin_vertices.size());
 
-        // Drain admin polygon thread pool (may still be processing)
-        std::cerr << "Waiting for admin polygon S2 covering to complete..." << std::endl;
-        admin_pool.wait_idle();
-        log_phase("    Admin: S2 covering wait", _pt, _cpu);
-        // Nothing else fills cell_to_admin while parsing: take the map whole.
-        data.cell_to_admin = admin_pool.drain();
-        log_phase("    Admin: S2 covering merge", _pt, _cpu);
-        std::cerr << "Admin polygon S2 covering complete (" << data.cell_to_admin.size() << " cells)." << std::endl;
+        std::cerr << "Waiting for the admin candidate cells..." << std::endl;
+        std::vector<CellItemPair> admin_cells;
+        for (auto& pending : admin_cells_pending) {
+            std::vector<CellItemPair> cells = pending.get();
+            if (admin_cells.empty()) admin_cells = std::move(cells);
+            else admin_cells.insert(admin_cells.end(), cells.begin(), cells.end());
+        }
+        admin_cells_pending.clear();
+        log_phase("    Admin: candidate cells wait", _pt, _cpu);
+        data.cell_to_admin = admin_candidate_map(std::move(admin_cells), num_threads);
+        log_phase("    Admin: candidate map", _pt, _cpu);
+        std::cerr << "Admin candidate map complete (" << data.cell_to_admin.size() << " cells)." << std::endl;
 
         // Sort admin polygons largest-first (by vertex count descending).
         // This ensures the work-stealing loops in S2 computation and quality

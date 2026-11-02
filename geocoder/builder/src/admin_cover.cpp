@@ -11,6 +11,8 @@
 #include <s2/s2latlng.h>
 #include <s2/s2latlng_rect.h>
 
+#include "exact_pip.h"
+#include "geometry.h"
 #include "ring_contains.h"
 
 namespace {
@@ -67,6 +69,68 @@ void add_piece_cells(const S2Point& a, const S2Point& b, int level, S1ChordAngle
     }
 }
 
+// Appends the cells within reach of the straight edge from (lat1, lng1) to
+// (lat2, lng2), whose points are a and b, followed in straight_edge_pieces
+// pieces.
+void add_edge_cells(double lat1, double lng1, const S2Point& a, double lat2, double lng2, const S2Point& b,
+                    int level, S1ChordAngle reach, double sin_reach, std::vector<uint64_t>& out) {
+    const uint32_t pieces = straight_edge_pieces(lat1, lng1, lat2, lng2);
+    S2Point from = a;
+    for (uint32_t k = 1; k <= pieces; k++) {
+        const double t = static_cast<double>(k) / pieces;
+        const S2Point to = k == pieces ? b : point_of(lat1 + t * (lat2 - lat1), lng1 + t * (lng2 - lng1));
+        add_piece_cells(from, to, level, reach, sin_reach, out);
+        from = to;
+    }
+}
+
+// The cells of a polygon from the cells within reach of its edges
+// (`boundary`, any order, repeats allowed): those, flagged false, and every
+// other cell inside, flagged true, as contains(cell centre) says. A cell no
+// edge comes near is wholly inside or wholly outside, and its centre far
+// enough from every edge for the ray cast to tell which. The ray cast puts
+// nothing outside the vertices' bounds inside, so the cells start from those.
+template <class Contains>
+AdminRingCells classify_cells(std::vector<uint64_t> boundary, const S2LatLngRect& bounds, int level,
+                              Contains contains) {
+    std::sort(boundary.begin(), boundary.end());
+    boundary.erase(std::unique(boundary.begin(), boundary.end()), boundary.end());
+
+    std::vector<uint64_t> interior;
+    std::vector<S2CellId> pending;
+    bounds.GetCellUnionBound(&pending);
+    for (S2CellId& id : pending)
+        if (id.level() > level) id = id.parent(level);
+    std::sort(pending.begin(), pending.end());
+    pending.erase(std::unique(pending.begin(), pending.end()), pending.end());
+    while (!pending.empty()) {
+        const S2CellId id = pending.back();
+        pending.pop_back();
+        const auto near = std::lower_bound(boundary.begin(), boundary.end(), id.range_min().id());
+        if (near != boundary.end() && *near <= id.range_max().id()) {
+            if (id.level() == level) continue;
+            for (S2CellId child = id.child_begin(); child != id.child_end(); child = child.next())
+                if (bounds.MayIntersect(S2Cell(child))) pending.push_back(child);
+            continue;
+        }
+        if (!contains(S2Cell(id).GetCenter())) continue;
+        for (S2CellId cell = id.child_begin(level); cell != id.child_end(level); cell = cell.next())
+            interior.push_back(cell.id());
+    }
+    std::sort(interior.begin(), interior.end());
+
+    // The two lists share no cell.
+    AdminRingCells out;
+    out.reserve(boundary.size() + interior.size());
+    for (size_t x = 0, y = 0; x < boundary.size() || y < interior.size();) {
+        if (y == interior.size() || (x < boundary.size() && boundary[x] < interior[y]))
+            out.emplace_back(boundary[x++], false);
+        else
+            out.emplace_back(interior[y++], true);
+    }
+    return out;
+}
+
 }  // namespace
 
 uint32_t straight_edge_pieces(double lat1, double lng1, double lat2, double lng2) {
@@ -104,11 +168,10 @@ S2LatLngRect admin_ring_bounds(const NodeCoord* verts, uint32_t n) {
                         S2LatLng::FromDegrees(std::min(lat_hi, 90.0f), std::min(lng_hi, 180.0f)));
 }
 
-AdminRingCells admin_ring_cells(const NodeCoord* verts, uint32_t n, int level) {
-    AdminRingCells out;
-    if (n == 0) return out;
-    const S1ChordAngle reach = S1ChordAngle::Radians(ADMIN_COVER_REACH_RAD);
-    const double sin_reach = std::sin(ADMIN_COVER_REACH_RAD);
+AdminRingCells admin_ring_cells(const NodeCoord* verts, uint32_t n, int level, double reach_rad) {
+    if (n == 0) return {};
+    const S1ChordAngle reach = S1ChordAngle::Radians(reach_rad);
+    const double sin_reach = std::sin(reach_rad);
 
     // Every cell within reach of an edge. A point the ray cast puts inside is
     // within ADMIN_COVER_READER_SLACK_DEG of the ring's straight edges or
@@ -118,64 +181,73 @@ AdminRingCells admin_ring_cells(const NodeCoord* verts, uint32_t n, int level) {
     for (uint32_t i = 0, j = n - 1; i < n; j = i++) {
         const double lat1 = verts[j].lat, lng1 = verts[j].lng, lat2 = verts[i].lat, lng2 = verts[i].lng;
         if (lat1 == lat2 && lng1 == lng2) continue;
-        S2Point a = to;
+        const S2Point a = to;
         to = point_of(lat2, lng2);
-        const uint32_t pieces = straight_edge_pieces(lat1, lng1, lat2, lng2);
-        for (uint32_t k = 1; k <= pieces; k++) {
-            const double t = static_cast<double>(k) / pieces;
-            const S2Point b = k == pieces ? to : point_of(lat1 + t * (lat2 - lat1), lng1 + t * (lng2 - lng1));
-            add_piece_cells(a, b, level, reach, sin_reach, boundary);
-            a = b;
-        }
+        add_edge_cells(lat1, lng1, a, lat2, lng2, to, level, reach, sin_reach, boundary);
     }
-    std::sort(boundary.begin(), boundary.end());
-    boundary.erase(std::unique(boundary.begin(), boundary.end()), boundary.end());
 
-    // The cells no edge comes near are wholly inside the ring or wholly
-    // outside, and their centres are far enough from every edge for the ray
-    // cast to tell which. The ray cast puts nothing outside the vertices'
-    // bounds inside, so the cells start from those.
-    const S2LatLngRect bounds = admin_ring_bounds(verts, n);
     std::unique_ptr<RingEdgeIndex> edges;
-    auto contains = [&](const S2Point& p) {
+    return classify_cells(std::move(boundary), admin_ring_bounds(verts, n), level, [&](const S2Point& p) {
         const S2LatLng ll(p);
         const float lat = static_cast<float>(ll.lat().degrees()), lng = static_cast<float>(ll.lng().degrees());
         if (n < kMinIndexedRingVertices) return ring_contains(verts, n, lat, lng);
         if (!edges) edges = std::make_unique<RingEdgeIndex>(verts, n);
         return edges->contains(lat, lng);
-    };
-    std::vector<uint64_t> interior;
-    std::vector<S2CellId> pending;
-    bounds.GetCellUnionBound(&pending);
-    for (S2CellId& id : pending)
-        if (id.level() > level) id = id.parent(level);
-    std::sort(pending.begin(), pending.end());
-    pending.erase(std::unique(pending.begin(), pending.end()), pending.end());
-    while (!pending.empty()) {
-        const S2CellId id = pending.back();
-        pending.pop_back();
-        const auto near = std::lower_bound(boundary.begin(), boundary.end(), id.range_min().id());
-        if (near != boundary.end() && *near <= id.range_max().id()) {
-            if (id.level() == level) continue;
-            for (S2CellId child = id.child_begin(); child != id.child_end(); child = child.next())
-                if (bounds.MayIntersect(S2Cell(child))) pending.push_back(child);
-            continue;
-        }
-        if (!contains(S2Cell(id).GetCenter())) continue;
-        for (S2CellId cell = id.child_begin(level); cell != id.child_end(level); cell = cell.next())
-            interior.push_back(cell.id());
-    }
-    std::sort(interior.begin(), interior.end());
+    });
+}
 
-    // The two lists share no cell.
-    out.reserve(boundary.size() + interior.size());
-    for (size_t x = 0, y = 0; x < boundary.size() || y < interior.size();) {
-        if (y == interior.size() || (x < boundary.size() && boundary[x] < interior[y]))
-            out.emplace_back(boundary[x++], false);
-        else
-            out.emplace_back(interior[y++], true);
+AdminRingCells admin_ring_cells(const PackedLocation* verts, const RingSpan* rings, uint32_t ring_count, int level,
+                                double reach_rad) {
+    if (ring_count == 0 || rings[0].count == 0) return {};
+    const S1ChordAngle reach = S1ChordAngle::Radians(reach_rad);
+    const double sin_reach = std::sin(reach_rad);
+
+    // Every cell within reach of an edge: a point inside lies inside the
+    // straight edges or on them, and they lie within the chord tolerance of
+    // their pieces. Past that the reach covers the e7 rounding of the cell
+    // centres classify_cells tests.
+    std::vector<uint64_t> boundary;
+    int32_t lat_lo = INT32_MAX, lat_hi = INT32_MIN, lng_lo = INT32_MAX, lng_hi = INT32_MIN;
+    for (uint32_t r = 0; r < ring_count; r++) {
+        const PackedLocation* v = verts + rings[r].begin;
+        const uint32_t n = rings[r].count;
+        if (n == 0) continue;
+        S2Point prev = point_of(v[n - 1].lat(), v[n - 1].lon());
+        for (uint32_t i = 0, j = n - 1; i < n; j = i++) {
+            lat_lo = std::min(lat_lo, v[i].lat_e7), lat_hi = std::max(lat_hi, v[i].lat_e7);
+            lng_lo = std::min(lng_lo, v[i].lon_e7), lng_hi = std::max(lng_hi, v[i].lon_e7);
+            if (v[i] == v[j]) continue;
+            const S2Point here = point_of(v[i].lat(), v[i].lon());
+            if (static_cast<uint64_t>(coord_key(v[j])) < static_cast<uint64_t>(coord_key(v[i])))
+                add_edge_cells(v[j].lat(), v[j].lon(), prev, v[i].lat(), v[i].lon(), here, level, reach, sin_reach,
+                               boundary);
+            else
+                add_edge_cells(v[i].lat(), v[i].lon(), here, v[j].lat(), v[j].lon(), prev, level, reach, sin_reach,
+                               boundary);
+            prev = here;
+        }
     }
-    return out;
+    const S2LatLngRect bounds(
+        S2LatLng::FromDegrees(std::max(lat_lo / 1e7, -90.0), std::max(lng_lo / 1e7, -180.0)),
+        S2LatLng::FromDegrees(std::min(lat_hi / 1e7, 90.0), std::min(lng_hi / 1e7, 180.0)));
+
+    std::vector<std::unique_ptr<ExactRingEdgeIndex>> edges(ring_count);
+    return classify_cells(std::move(boundary), bounds, level, [&](const S2Point& p) {
+        const S2LatLng ll(p);
+        const PackedLocation q = point_e7(ll.lat().degrees(), ll.lng().degrees());
+        bool inside = false;
+        for (uint32_t r = 0; r < ring_count; r++) {
+            const PackedLocation* v = verts + rings[r].begin;
+            const uint32_t n = rings[r].count;
+            if (n < kMinIndexedRingVertices) {
+                inside ^= exact_ring_contains(v, n, q);
+                continue;
+            }
+            if (!edges[r]) edges[r] = std::make_unique<ExactRingEdgeIndex>(v, n);
+            inside ^= edges[r]->contains(q);
+        }
+        return inside;
+    });
 }
 
 bool admin_cell_routed(uint64_t cell, const std::function<bool(uint64_t)>& holds) {
