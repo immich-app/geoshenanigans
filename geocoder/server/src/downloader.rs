@@ -65,6 +65,19 @@ pub struct Component {
     /// sidecars, postal boundaries). Absent from the manifest = skip.
     #[serde(default)]
     pub optional_files: Vec<String>,
+    /// Components of which the selection takes one more: the first whose
+    /// `when` it matches.
+    #[serde(default)]
+    pub variants: Vec<Variant>,
+}
+
+/// A component a selection takes when it has every axis value `when` names
+/// (an empty `when`: any selection).
+#[derive(Deserialize, Debug, Clone)]
+pub struct Variant {
+    #[serde(default)]
+    pub when: BTreeMap<String, String>,
+    pub component: String,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -85,8 +98,26 @@ pub struct RegionSelection {
     pub poi_tier: String,
 }
 
-/// Resolved file set for a single region after walking components +
-/// applying `replaces`. Each path is relative to the build root (e.g.
+impl RegionSelection {
+    /// The selection's value on an axis of configurations.axes.
+    pub fn axis(&self, name: &str) -> Option<&str> {
+        match name {
+            "region" => Some(&self.region),
+            "mode" => Some(&self.mode),
+            "quality" => Some(&self.quality),
+            "poi_tier" => Some(&self.poi_tier),
+            _ => None,
+        }
+    }
+
+    fn matches(&self, when: &BTreeMap<String, String>) -> bool {
+        when.iter().all(|(axis, value)| self.axis(axis) == Some(value.as_str()))
+    }
+}
+
+/// Resolved file set for a single region after walking components (and
+/// the variant of each the selection matches) + applying `replaces`. Each
+/// path is relative to the build root (e.g.
 /// "europe/full/admin_cells.bin"); look up sizes/hashes in
 /// configurations.files.
 pub struct ResolvedFiles {
@@ -131,6 +162,9 @@ pub fn resolve_files(cfg: &Configurations, sel: &RegionSelection) -> ResolvedFil
             files.push(path);
         }
         for r in &c.replaces { replaced.insert(substitute(r, sel)); }
+        if let Some(v) = c.variants.iter().find(|v| sel.matches(&v.when)) {
+            visit(cfg, sel, &v.component, seen, files, optional, replaced);
+        }
     }
 
     for cid in &component_ids {
@@ -399,6 +433,7 @@ mod tests {
             replaces: replaces.iter().map(|s| s.to_string()).collect(),
             extends: extends.map(|s| s.to_string()),
             optional_files: Vec::new(),
+            variants: Vec::new(),
         }
     }
 
@@ -512,6 +547,36 @@ mod tests {
     }
 
     #[test]
+    fn resolve_files_takes_the_first_variant_the_selection_matches() {
+        let c = Configurations {
+            build: BuildMeta { date: "2026-01-01".into() },
+            components: serde_json::from_value(serde_json::json!({
+                "mode.small": {
+                    "files": ["{region}/small/a.bin"],
+                    "variants": [
+                        { "when": { "mode": "small", "poi_tier": "none" }, "component": "small/alone" },
+                        { "component": "small/beside" },
+                        { "component": "small/never" }
+                    ]
+                },
+                "small/alone": { "files": ["{region}/small/b.bin"] },
+                "small/beside": {
+                    "files": ["{region}/small-poi/b.bin"],
+                    "replaces": ["{region}/small/a.bin"]
+                },
+                "small/never": { "files": ["{region}/never.bin"] },
+                "poi_tier.major": { "files": ["{region}/poi/{poi_tier}/p.bin"] }
+            })).unwrap(),
+            files: BTreeMap::new(),
+        };
+
+        assert_eq!(resolve_files(&c, &sel("eu", "small", "q2.5", "none")).paths,
+                   vec!["eu/small/a.bin".to_string(), "eu/small/b.bin".to_string()]);
+        assert_eq!(resolve_files(&c, &sel("eu", "small", "q2.5", "major")).paths,
+                   vec!["eu/poi/major/p.bin".to_string(), "eu/small-poi/b.bin".to_string()]);
+    }
+
+    #[test]
     fn resolve_files_marks_optional_files() {
         let mut full = component(&["{region}/full/admin_cells.bin"], &[], None);
         full.optional_files = vec!["{region}/full/interp_postcodes.bin".to_string()];
@@ -528,20 +593,28 @@ mod tests {
         assert!(!resolved.optional.contains("europe/full/admin_cells.bin"));
     }
 
-    // Index::load needs strings_layout.json in every region dir and
-    // PoiMeta::load reads poi_meta.json; a selection that resolves without
-    // them downloads GiBs into a dir that can never load.
-    #[test]
-    fn template_selections_include_load_sidecars() {
+    /// The template, as JSON and as the downloader reads it.
+    fn template() -> (serde_json::Value, Configurations) {
         let v: serde_json::Value = serde_json::from_str(include_str!("../../builder/configurations.template.json")).unwrap();
         let c = Configurations {
             build: BuildMeta { date: "2026-01-01".into() },
             components: serde_json::from_value(v["components"].clone()).unwrap(),
             files: BTreeMap::new(),
         };
-        let names = |key: &str| -> Vec<String> {
-            v["axes"][key]["values"].as_object().unwrap().keys().cloned().collect()
-        };
+        (v, c)
+    }
+
+    fn axis_values(v: &serde_json::Value, axis: &str) -> Vec<String> {
+        v["axes"][axis]["values"].as_object().unwrap().keys().cloned().collect()
+    }
+
+    // Index::load needs strings_layout.json in every region dir and
+    // PoiMeta::load reads poi_meta.json; a selection that resolves without
+    // them downloads GiBs into a dir that can never load.
+    #[test]
+    fn template_selections_include_load_sidecars() {
+        let (v, c) = template();
+        let names = |key: &str| axis_values(&v, key);
         for mode in names("mode") {
             for poi_tier in names("poi_tier") {
                 let s = sel("europe", &mode, "q2.5", &poi_tier);
@@ -551,6 +624,30 @@ mod tests {
                 assert!(has("admin_cells.bin"), "{}/{} lacks admin_cells.bin", mode, poi_tier);
                 assert_eq!(has("poi_meta.json"), poi_tier != "none", "{}/{} poi_meta.json", mode, poi_tier);
             }
+        }
+    }
+
+    // admin-minimal/ holds strings of its own, which a POI tier's names and
+    // parent polygons don't point into: beside a POI tier the mode takes
+    // admin-minimal-poi/, on the shared slots and strings.
+    #[test]
+    fn template_admin_minimal_takes_its_poi_dir_beside_a_poi_tier() {
+        let (v, c) = template();
+        let files = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_vertices.bin",
+                     "place_nodes.bin", "strings_core.bin", "strings_layout.json"];
+        for poi_tier in axis_values(&v, "poi_tier") {
+            let paths = resolve_files(&c, &sel("europe", "admin-minimal", "q2.5", &poi_tier)).paths;
+            let (dir, other) = if poi_tier == "none" {
+                ("europe/admin-minimal/", "europe/admin-minimal-poi/")
+            } else {
+                ("europe/admin-minimal-poi/", "europe/admin-minimal/")
+            };
+            let in_dir: Vec<&str> = paths.iter().filter_map(|p| p.strip_prefix(dir)).collect();
+            assert_eq!(in_dir, files, "{}", poi_tier);
+            let stray: Vec<&String> = paths.iter()
+                .filter(|p| p.starts_with(other) || p.starts_with("europe/quality/"))
+                .collect();
+            assert!(stray.is_empty(), "{}: {:?}", poi_tier, stray);
         }
     }
 

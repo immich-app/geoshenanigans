@@ -573,8 +573,8 @@ End marker: 0xFFFFFFFF (u32)
 Measured from 2026-10-18 to 10-19 with GCPATCH v12; see "Patcher memory and speed" above.
 
 One deterministic `build-index` run writes the planet and every continent in
-about 5 minutes on 64 cores, and `geocoder-diff` makes the patches of all 126
-variant dirs in about 6 minutes on the same box (see `OPTIMIZATION_LOG.md`).
+about 5 minutes on 64 cores, and `geocoder-diff` makes the patches of all the
+variant dirs (126 then) in about 6 minutes on the same box (see `OPTIMIZATION_LOG.md`).
 
 ## TODO (Priority Order)
 

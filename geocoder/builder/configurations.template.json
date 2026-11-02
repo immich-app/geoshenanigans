@@ -166,6 +166,20 @@
   ],
   "components": {
     "mode.admin-minimal": {
+      "variants": [
+        {
+          "when": {
+            "poi_tier": "none"
+          },
+          "component": "dir.admin-minimal"
+        },
+        {
+          "component": "dir.admin-minimal-poi"
+        }
+      ]
+    },
+    "dir.admin-minimal": {
+      "description": "Admin minimal without POIs: its own polygon slots and only the core strings its records name.",
       "files": [
         "{region}/admin-minimal/admin_cells.bin",
         "{region}/admin-minimal/admin_entries.bin",
@@ -174,6 +188,24 @@
         "{region}/admin-minimal/place_nodes.bin",
         "{region}/admin-minimal/strings_core.bin",
         "{region}/admin-minimal/strings_layout.json"
+      ],
+      "replaces": [
+        "{region}/quality/{quality}/admin_polygons.bin",
+        "{region}/quality/{quality}/admin_vertices.bin",
+        "{region}/quality/{quality}/postal_polygons.bin",
+        "{region}/quality/{quality}/postal_vertices.bin"
+      ]
+    },
+    "dir.admin-minimal-poi": {
+      "description": "Admin minimal beside a POI tier: the shared polygon slots and core strings, which the POI tier's parent polygons and names point into.",
+      "files": [
+        "{region}/admin-minimal-poi/admin_cells.bin",
+        "{region}/admin-minimal-poi/admin_entries.bin",
+        "{region}/admin-minimal-poi/admin_polygons.bin",
+        "{region}/admin-minimal-poi/admin_vertices.bin",
+        "{region}/admin-minimal-poi/place_nodes.bin",
+        "{region}/admin-minimal-poi/strings_core.bin",
+        "{region}/admin-minimal-poi/strings_layout.json"
       ],
       "replaces": [
         "{region}/quality/{quality}/admin_polygons.bin",

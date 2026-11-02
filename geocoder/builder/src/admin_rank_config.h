@@ -97,3 +97,17 @@ inline bool admin_minimal_keeps(uint8_t admin_level, uint8_t place_type) {
 
     return admin_level == 15 && rank > 0 && rank <= 16;
 }
+
+// Admin-minimal's place nodes: cities, towns, villages and hamlets; no
+// suburbs, neighbourhoods or quarters.
+inline bool admin_minimal_keeps_place(uint8_t place_type) {
+    switch (static_cast<PlaceType>(place_type)) {
+    case PlaceType::CITY:
+    case PlaceType::TOWN:
+    case PlaceType::VILLAGE:
+    case PlaceType::HAMLET:
+        return true;
+    default:
+        return false;
+    }
+}

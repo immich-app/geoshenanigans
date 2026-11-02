@@ -106,6 +106,25 @@ class BuildSearchIndexesTest(unittest.TestCase):
         self.assertEqual(self.run_main(), 1)
 
 
+class TemplateTest(unittest.TestCase):
+    MINIMAL_FILES = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_vertices.bin",
+                     "place_nodes.bin", "strings_core.bin", "strings_layout.json"]
+
+    def test_admin_minimal_takes_its_poi_dir_beside_a_poi_tier(self):
+        # admin-minimal/ holds strings of its own, which a POI tier's names and parent polygons don't
+        # point into: beside a POI tier the mode takes admin-minimal-poi/, on the shared slots and strings.
+        with open(TEMPLATE) as f:
+            cfg = json.load(f)
+        for poi_tier in cfg["axes"]["poi_tier"]["values"]:
+            sel = {"region": "planet", "mode": "admin-minimal", "quality": "q2.5", "poi_tier": poi_tier}
+            paths, _ = sut.resolve(cfg, sel)
+            own, poi = "planet/admin-minimal/", "planet/admin-minimal-poi/"
+            dir_, other = (own, poi) if poi_tier == "none" else (poi, own)
+
+            self.assertEqual([p[len(dir_):] for p in paths if p.startswith(dir_)], self.MINIMAL_FILES, poi_tier)
+            self.assertEqual([p for p in paths if p.startswith(other) or p.startswith("planet/quality/")], [], poi_tier)
+
+
 class ResolveTest(unittest.TestCase):
     CFG = {"components": {
         "mode.small": {"files": ["{region}/small/a.bin", "{region}/small/shared.json"],
@@ -123,6 +142,24 @@ class ResolveTest(unittest.TestCase):
         self.assertEqual(paths, ["planet/quality/base.bin", "planet/small/a.bin", "planet/small/opt.bin",
                                  "planet/small/shared.json"])
         self.assertEqual(optional, {"planet/small/opt.bin"})
+
+    def test_takes_the_first_variant_the_selection_matches(self):
+        cfg = {"components": {
+            "mode.small": {"files": ["{region}/small/a.bin"],
+                           "variants": [{"when": {"mode": "small", "poi_tier": "none"}, "component": "small/alone"},
+                                        {"component": "small/beside"},
+                                        {"component": "small/never"}]},
+            "small/alone": {"files": ["{region}/small/b.bin"]},
+            "small/beside": {"files": ["{region}/small-poi/b.bin"], "replaces": ["{region}/small/a.bin"]},
+            "small/never": {"files": ["{region}/never.bin"]},
+            "poi_tier.major": {"files": ["{region}/poi/{poi_tier}/p.bin"]},
+        }}
+
+        alone, _ = sut.resolve(cfg, dict(self.SEL, poi_tier="none"))
+        beside, _ = sut.resolve(cfg, dict(self.SEL, poi_tier="major"))
+
+        self.assertEqual(alone, ["planet/small/a.bin", "planet/small/b.bin"])
+        self.assertEqual(beside, ["planet/poi/major/p.bin", "planet/small-poi/b.bin"])
 
     def test_links_a_set_without_a_missing_optional_file_but_not_without_a_required_one(self):
         with tempfile.TemporaryDirectory() as tmp:

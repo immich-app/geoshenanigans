@@ -111,6 +111,7 @@ TEST(simplified_variants_find_a_polygon_where_their_holes_gave_way) {
     ap.admin_level = 2;
     ap.area = 1;
     ap.hole_count = 1;
+    ap.name_id = data.string_pool.intern("Country");
     data.admin_polygons.push_back(ap);
     data.admin_osm_ids.push_back((static_cast<uint64_t>(gc::id_alloc::ObjectType::OSM_RELATION) << 56) | (7 << 16));
 
@@ -119,14 +120,15 @@ TEST(simplified_variants_find_a_polygon_where_their_holes_gave_way) {
     Cells cells = cover_polygon(base, 1);
     std::sort(cells.begin(), cells.end());
 
+    partition_strings_into_tiers(data);
+
     const TempDir tmp;
-    const std::string q25 = (tmp.path / "q2.5").string(), minimal = (tmp.path / "admin-minimal").string();
+    const std::string q25 = (tmp.path / "q2.5").string();
     write_quality_variant(data, tmp.path.string(), q25, 2.5);
-    std::vector<uint32_t> remap;
-    write_admin_minimal_polygons(data, minimal, "", 2.5, remap);
+    write_admin_minimal(data, tmp.path.string(), "", 2.5);
 
     const std::unique_ptr<S2Loop> enclave = loop_of(hole);
-    for (const std::string& dir : {q25, minimal}) {
+    for (const std::string& dir : {q25, (tmp.path / "admin-minimal").string(), (tmp.path / "admin-minimal-poi").string()}) {
         const std::vector<NodeCoord> variant = written_range(dir);
         REQUIRE(variant.size() < range.size());  // the bulge simplified away
         size_t deep = 0;
