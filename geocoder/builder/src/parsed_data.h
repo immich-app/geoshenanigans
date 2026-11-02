@@ -205,6 +205,9 @@ constexpr uint8_t STR_TIER_BIT_POSTCODE = 1 << 3;  // postcode strings (any cons
 constexpr uint8_t STR_TIER_BIT_POI      = 1 << 4;  // poi_records.name_id
 // Strings of POI candidates no POI tier ships (tier > POI_MAX_SHIPPED_TIER).
 constexpr uint8_t STR_TIER_BIT_UNSHIPPED = 1 << 5;
+// way_orig_name_ids: no file holds them (only the addr:street match, before
+// the partition, reads them).
+constexpr uint8_t STR_TIER_BIT_WAY_ORIG_NAME = 1 << 6;
 // string_home_tier for a string no shipped record uses, such as an unshipped
 // POI's name (planet: 2.4M, 53 MiB) or an addr:street value the parent
 // street replaced: it isn't written.
@@ -231,9 +234,17 @@ constexpr size_t STR_TIER_POI = 4;
 // consumer tier serves every consumer. The poi tier ships with any mode, so a
 // string a POI shares with anything outside core needs core. A string no
 // shipped record uses has no home.
+//
+// A way's original name ships nothing, yet beside a shipped consumer it
+// weighs as a street name. Records sort on their strings' offsets
+// (reorder_pois, reorder_addr_points) and the reader takes the first of
+// equidistant POIs (find_nearest_poi_with_parent), so a shared string moving
+// tier, a POI's name from core to the poi tier, could change an answer.
 inline uint8_t string_home_tier(uint8_t mask) {
     mask &= static_cast<uint8_t>(~STR_TIER_BIT_UNSHIPPED);
-    if (mask == 0) return STR_TIER_NONE;
+    if ((mask & ~STR_TIER_BIT_WAY_ORIG_NAME) == 0) return STR_TIER_NONE;
+    if (mask & STR_TIER_BIT_WAY_ORIG_NAME)
+        mask = static_cast<uint8_t>((mask & ~STR_TIER_BIT_WAY_ORIG_NAME) | STR_TIER_BIT_STREET);
     if (mask & STR_TIER_BIT_CORE) return 0;
     if (mask & STR_TIER_BIT_POI) return (mask & ~STR_TIER_BIT_POI) ? 0 : 4;
     if (mask & STR_TIER_BIT_POSTCODE) return 3;
@@ -547,9 +558,8 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
         mark_each(data.admin_polygons.size(), [&](size_t i) { mark(data.admin_polygons[i].name_id, STR_TIER_BIT_CORE); });
         mark_each(data.place_nodes.size(), [&](size_t i) { mark(data.place_nodes[i].name_id, STR_TIER_BIT_CORE); });
 
-        // Ways' original names aren't marked: only the addr:street match,
-        // before this, reads them.
         mark_each(data.ways.size(), [&](size_t i) { mark(data.ways[i].name_id, STR_TIER_BIT_STREET); });
+        mark_each(data.way_orig_name_ids.size(), [&](size_t i) { mark(data.way_orig_name_ids[i], STR_TIER_BIT_WAY_ORIG_NAME); });
         mark_each(data.addr_points.size(), [&](size_t i) {
             mark(data.addr_points[i].street_id, STR_TIER_BIT_STREET);
             mark(data.addr_points[i].housenumber_id, STR_TIER_BIT_ADDR);

@@ -58,6 +58,7 @@ inline void partition_strings_into_tiers(ParsedData& data) {
     for (const auto& pn : data.place_nodes)    mark(pn.name_id, STR_TIER_BIT_CORE);
 
     for (const auto& w : data.ways)            mark(w.name_id, STR_TIER_BIT_STREET);
+    for (uint32_t id : data.way_orig_name_ids) mark(id, STR_TIER_BIT_WAY_ORIG_NAME);
     for (const auto& a : data.addr_points)     mark(a.street_id, STR_TIER_BIT_STREET);
     for (const auto& iw : data.interp_ways)    mark(iw.street_id, STR_TIER_BIT_STREET);
     auto shipped = [](const PoiRecord& pr) { return pr.tier <= POI_MAX_SHIPPED_TIER; };
