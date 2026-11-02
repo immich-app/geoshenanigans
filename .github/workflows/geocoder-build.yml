@@ -341,13 +341,16 @@ jobs:
           WIKIDATA_LATEST=$(curl -sL --fail --connect-timeout 30 --max-time 60 "$S3_PUBLIC_URL/geocoder/wikidata/latest.json" 2>/dev/null || echo '{}')
           WD_DATE=$(echo "$WIKIDATA_LATEST" | jq -r '.dump_date // ""' 2>/dev/null || echo "")
           WD_SIZE=$(echo "$WIKIDATA_LATEST" | jq -r '.size_bytes // 0' 2>/dev/null || echo 0)
-          if [ -z "$WD_DATE" ]; then
-            echo "::error::[wikidata] No sitelinks data at $S3_PUBLIC_URL/geocoder/wikidata/latest.json — refusing to build a planet index without POI sitelink counts"
+          # The extraction's own key (Update Wikidata Sitelinks never
+          # overwrites a file a latest.json has named).
+          WD_PATH=$(echo "$WIKIDATA_LATEST" | jq -r '.path // ""' 2>/dev/null || echo "")
+          if ! [[ "$WD_DATE" =~ ^[0-9]{8}$ && "$WD_PATH" =~ ^wikidata/${WD_DATE}/[0-9]+-[0-9]+/qid_sitelinks\.bin$ ]]; then
+            echo "::error::[wikidata] No sitelinks file named by $S3_PUBLIC_URL/geocoder/wikidata/latest.json (dump '$WD_DATE', path '$WD_PATH') — refusing to build a planet index without POI sitelink counts; rerun Update Wikidata Sitelinks"
             exit 1
           fi
           echo "[wikidata] Found sitelinks from $WD_DATE ($WD_SIZE bytes), downloading..."
           curl -sL --fail --connect-timeout 30 --max-time 600 -o "$WORKDIR/qid_sitelinks.bin" \
-            "$S3_PUBLIC_URL/geocoder/wikidata/$WD_DATE/qid_sitelinks.bin" || true
+            "$S3_PUBLIC_URL/geocoder/$WD_PATH" || true
           WD_GOT=$(stat -c%s "$WORKDIR/qid_sitelinks.bin" 2>/dev/null || echo 0)
           if [ "$WD_GOT" -le 1000 ] || [ "$WD_GOT" != "$WD_SIZE" ]; then
             echo "::error::[wikidata] Sitelinks for dump $WD_DATE (named by wikidata/latest.json) missing or empty: got $WD_GOT bytes, latest.json says $WD_SIZE — refusing to build a planet index without POI sitelink counts; rerun Update Wikidata Sitelinks"

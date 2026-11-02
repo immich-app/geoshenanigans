@@ -74,20 +74,22 @@ jobs:
           echo "date=$LATEST" >> "$GITHUB_OUTPUT"
 
           # Skip only if latest.json already holds this dump with a full
-          # file: a dump extracted to too few entries (20261001 gave 0) is
-          # extracted again on the next run instead of standing as current.
+          # file under its own key (the path builds download): a dump
+          # extracted to too few entries (20261001 gave 0) is extracted
+          # again on the next run instead of standing as current.
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 3"
           EXISTING=$($S5 cat "s3://$S3_BUCKET/geocoder/wikidata/latest.json" 2>/dev/null || echo '{}')
           EXISTING_DATE=$(echo "$EXISTING" | jq -r '.dump_date // ""' 2>/dev/null || echo "")
           EXISTING_ENTRIES=$(echo "$EXISTING" | jq -r '.entries // 0 | floor' 2>/dev/null || echo 0)
+          EXISTING_PATH=$(echo "$EXISTING" | jq -r '.path // ""' 2>/dev/null || echo "")
           if [ "$FORCE" = "true" ]; then
             echo "Re-extracting $LATEST on request (current: $EXISTING_DATE, $EXISTING_ENTRIES entries)"
             echo "skip=false" >> "$GITHUB_OUTPUT"
-          elif [ "$EXISTING_DATE" = "$LATEST" ] && [ "$EXISTING_ENTRIES" -ge "$MIN_QIDS" ]; then
-            echo "Already up to date (dump $LATEST, $EXISTING_ENTRIES entries)"
+          elif [ "$EXISTING_DATE" = "$LATEST" ] && [ "$EXISTING_ENTRIES" -ge "$MIN_QIDS" ] && [ -n "$EXISTING_PATH" ]; then
+            echo "Already up to date (dump $LATEST, $EXISTING_ENTRIES entries, $EXISTING_PATH)"
             echo "skip=true" >> "$GITHUB_OUTPUT"
           elif [ "$EXISTING_DATE" = "$LATEST" ]; then
-            echo "::warning::latest.json holds dump $LATEST with $EXISTING_ENTRIES entries (under $MIN_QIDS), re-extracting"
+            echo "::warning::latest.json holds dump $LATEST with $EXISTING_ENTRIES entries (need $MIN_QIDS) at path '$EXISTING_PATH', re-extracting"
             echo "skip=false" >> "$GITHUB_OUTPUT"
           else
             echo "New dump available: $LATEST (current: $EXISTING_DATE)"
@@ -134,20 +136,24 @@ jobs:
             exit 1
           fi
 
-          # Upload dated version, then point latest.json at it: the builds
-          # read latest.json, so it only names a file that is already there.
-          $S5 cp /tmp/qid_sitelinks.bin "s3://$S3_BUCKET/geocoder/wikidata/$DUMP_DATE/qid_sitelinks.bin"
+          # Each extraction gets a key of its own, then latest.json names it:
+          # a build reading the current latest.json keeps finding the file
+          # and size it names, even while a re-extraction of the same dump
+          # uploads, and whether or not this run gets to replace latest.json.
+          KEY="wikidata/$DUMP_DATE/$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/qid_sitelinks.bin"
+          $S5 cp /tmp/qid_sitelinks.bin "s3://$S3_BUCKET/geocoder/$KEY"
 
           jq -n \
             --arg dump_date "$DUMP_DATE" \
+            --arg path "$KEY" \
             --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             --argjson entries "$ENTRIES" \
             --argjson size_bytes "$SIZE" \
-            '{dump_date: $dump_date, entries: $entries, size_bytes: $size_bytes, updated_at: $updated_at}' \
+            '{dump_date: $dump_date, path: $path, entries: $entries, size_bytes: $size_bytes, updated_at: $updated_at}' \
             > /tmp/latest.json
           $S5 cp /tmp/latest.json "s3://$S3_BUCKET/geocoder/wikidata/latest.json"
 
-          echo "Uploaded to s3://$S3_BUCKET/geocoder/wikidata/$DUMP_DATE/"
+          echo "Uploaded to s3://$S3_BUCKET/geocoder/$KEY"
           $S5 cat "s3://$S3_BUCKET/geocoder/wikidata/latest.json" | jq .
 
       - name: Summary
