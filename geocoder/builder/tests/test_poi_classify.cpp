@@ -1,8 +1,10 @@
-// Table-driven tests for classify_poi (poi_classify.h) — the OSM-tag →
-// (category, tier, flags) mapping encodes hundreds of Nominatim-parity
-// decisions and previously had zero unit coverage (only validated via full
-// planet builds + grid diffs).
+// Table-driven tests for classify_poi and poi_name (poi_classify.h) — the
+// OSM-tag → (category, tier, flags) mapping encodes hundreds of
+// Nominatim-parity decisions and previously had zero unit coverage (only
+// validated via full planet builds + grid diffs).
 #include "poi_classify.h"
+
+#include <string>
 
 #include "test_framework.h"
 
@@ -102,4 +104,18 @@ TEST(poi_classify_keeps_a_generic_feature_only_with_a_wiki_tag) {
         CHECK_EQ(uint8_t(c->category), uint8_t(PoiCategory::UNNAMED_RANK30));
         CHECK_EQ(int(c->tier), int(POI_MAX_SHIPPED_TIER));
     }
+}
+
+TEST(poi_name_of_an_unnamed_node_is_none) {
+    // OSM carries empty values: a shop=bakery node tagged name= is no POI,
+    // whatever its category.
+    CHECK(poi_name(nullptr, nullptr) == nullptr);
+    CHECK(poi_name(nullptr, "") == nullptr);
+    CHECK(poi_name("", "") == nullptr);
+    CHECK(poi_name("", nullptr) == nullptr);
+
+    CHECK_EQ(std::string(poi_name(nullptr, "Fournil du Verger")), "Fournil du Verger");
+    CHECK_EQ(std::string(poi_name("", "Fournil du Verger")), "Fournil du Verger");
+    CHECK_EQ(std::string(poi_name("Orchard Bakery", "Fournil du Verger")), "Orchard Bakery");
+    CHECK_EQ(std::string(poi_name("Orchard Bakery", "")), "Orchard Bakery");
 }

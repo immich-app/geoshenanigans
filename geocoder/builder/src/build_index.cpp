@@ -2812,9 +2812,8 @@ static int run(int argc, char* argv[]) {
                             continue;
                         }
                         if (poi_cat != PoiCategory::UNKNOWN) {
-                            const char* poi_name = rel.tag("name:en");
-                            if (!poi_name) poi_name = rel.tag("name");
-                            if (poi_name) {
+                            const char* r_name = poi_name(rel.tag("name:en"), rel.tag("name"));
+                            if (r_name) {
                                 uint8_t flags = 0;
                                 if (rel.tag("wikipedia")) flags |= POI_FLAG_WIKIPEDIA;
                                 if (rel.tag("wikidata"))  flags |= POI_FLAG_WIKIDATA;
@@ -2848,7 +2847,7 @@ static int run(int argc, char* argv[]) {
                                 if (r_wd && r_wd[0] == 'Q') {
                                     cpr.qid = static_cast<uint32_t>(std::strtoul(r_wd + 1, nullptr, 10));
                                 }
-                                cpr.name = poi_name;
+                                cpr.name = r_name;
                                 // Relation-level addr tags (see CollectedPoiRelation
                                 // header for rationale — rank-30 rows with
                                 // addr:housenumber become AddrPoints too).
@@ -3127,11 +3126,7 @@ static int run(int argc, char* argv[]) {
                         // Prefer name:en when present (user-facing English-only mode)
                         const char* best_name = (n_name_en && n_name_en[0]) ? n_name_en : n_name;
 
-                        // POI node extraction. Nominatim's rank-30 POI
-                        // set (reverse.py _find_closest_street_or_pois)
-                        // includes unnamed amenity/shop/tourism/etc.
-                        // nodes — we emit those as UNNAMED_RANK30 so
-                        // they compete for the primary contest.
+                        // POI node extraction.
                         {
                             auto cls = classify_poi(n_tourism, n_historic, n_boundary,
                                 n_amenity, n_leisure, n_natural, n_railway, n_aeroway,
@@ -3139,14 +3134,8 @@ static int run(int argc, char* argv[]) {
                                 n_office,
                                 n_wikipedia, n_wikidata,
                                 n_highway, n_shop, n_landuse);
-                            // Unnamed specific-category POIs are still
-                            // noise in the display path (e.g. unnamed
-                            // ATTRACTION / MONUMENT — no useful road to
-                            // surface). Only index unnamed rows when the
-                            // fallback UNNAMED_RANK30 is what hit, since
-                            // those are exactly the Nominatim-style
-                            // "unclassified rank-30" contenders.
-                            if (cls && (best_name || cls->category == PoiCategory::UNNAMED_RANK30)) {
+                            const char* name = poi_name(n_name_en, n_name);
+                            if (cls && name) {
                                 PoiRecord pr{};
                                 pr.lat = static_cast<float>(lat);
                                 pr.lng = static_cast<float>(lng);
@@ -3158,8 +3147,7 @@ static int run(int argc, char* argv[]) {
                                 pr.flags = cls->flags;
                                 tl_node_data->poi_records.push_back(pr);
                                 tl_node_data->poi_osm_node_ids.push_back(id);
-                                tl_node_data->poi_names.push_back((best_name && best_name[0])
-                                    ? tl_node_data->strings.add(best_name) : StringDict::kNone);
+                                tl_node_data->poi_names.push_back(tl_node_data->strings.add(name));
                                 float ele_val = 0;
                                 if (n_ele) { char* end; ele_val = std::strtof(n_ele, &end); if (end == n_ele) ele_val = 0; }
                                 tl_node_data->poi_elevations.push_back(ele_val);
@@ -3316,10 +3304,6 @@ static int run(int argc, char* argv[]) {
                     const auto& local = ntld[k];
                     for (size_t j = begin; j < end; j++, at++) {
                         auto pr = local.poi_records[j];
-                        // Empty name → NO_DATA sentinel. UNNAMED_RANK30
-                        // POIs come in nameless; the server reads name_id
-                        // == NO_DATA to surface parent_street as `road`
-                        // instead of the POI's (missing) own name.
                         pr.name_id = name_ids[k](local.poi_names[j]);
                         data.poi_records[poi_base + at] = pr;
                         // Strategy-2 stable identity: node-sourced POI.
@@ -3627,7 +3611,8 @@ static int run(int argc, char* argv[]) {
                     }
 
                     // Closed way POI polygons
-                    if (has_poi_tags && t_best_name && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
+                    const char* t_poi_name = poi_name(t.name_en, t.name);
+                    if (has_poi_tags && t_poi_name && refs_size >= 4 && refs_data[0] == refs_data[refs_size-1] && all_valid) {
                         auto cls = classify_poi(t.tourism, t.historic, t.boundary,
                             t.amenity, t.leisure, t.natural, t.railway, t.aeroway,
                             t.man_made, t.building, t.craft, t.power, t.place, t.waterway,
@@ -3677,7 +3662,7 @@ static int run(int argc, char* argv[]) {
                             if (t.wikidata && t.wikidata[0] == 'Q') {
                                 way_qid = static_cast<uint32_t>(std::strtoul(t.wikidata + 1, nullptr, 10));
                             }
-                            local.poi_ways.push_back({pr, local.strings.add(t_best_name), std::move(verts), way_ele, way_qid, way_id});
+                            local.poi_ways.push_back({pr, local.strings.add(t_poi_name), std::move(verts), way_ele, way_qid, way_id});
                         }
                     }
 

@@ -7,6 +7,17 @@
 #include <optional>
 #include "types.h"
 
+// The name a POI goes by: name:en, else name. An empty value names nothing,
+// and a node, way or relation without a name makes no POI: an unnamed POI
+// could only surface its parent street as the road, which drifts the answer
+// off the nearest street (San Francisco 37.7749,-122.4194: a waste basket at
+// 0 m turned Market Street into South Van Ness).
+inline const char* poi_name(const char* name_en, const char* name) {
+    if (name_en && name_en[0]) return name_en;
+
+    return name && name[0] ? name : nullptr;
+}
+
 // POI classification: maps a node/way's raw OSM tag values to a
 // (category, tier, flags) triple (PoiClassification, defined in types.h),
 // or nullopt when nothing matches or no POI dir ships the tier (a generic
@@ -83,11 +94,9 @@ inline std::optional<PoiClassification> classify_poi(
         else if (std::strcmp(t_boundary, "forest") == 0) cat = PoiCategory::WOOD;
     }
     // landuse — only named landuse polygons get indexed.
-    // Note: classify_poi still falls through for unnamed
-    // features to UNNAMED_RANK30 below, but landuse is
-    // deliberately NOT in that fallback's trigger list so
-    // unnamed residential/industrial zones don't flood
-    // the index.
+    // Note: landuse is deliberately NOT in the trigger list
+    // of the UNNAMED_RANK30 fallback below, so residential/
+    // industrial zones don't flood the index.
     if (cat == PoiCategory::UNKNOWN && t_landuse) {
         if (std::strcmp(t_landuse, "forest") == 0) cat = PoiCategory::WOOD;
         else if (std::strcmp(t_landuse, "meadow") == 0) cat = PoiCategory::MEADOW;
