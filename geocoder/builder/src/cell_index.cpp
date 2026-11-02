@@ -334,6 +334,7 @@ static void apply_strategy2_places(ParsedData& data, const std::string& prev_dir
     PlaceNode tomb_pn{};
     std::memset(&tomb_pn, 0, sizeof(tomb_pn));
     tomb_pn.name_id = NO_DATA;
+    tomb_pn.parent_poly_id = NO_DATA;
     reorder_by_remap(data.place_nodes, remap, n_new, tomb_pn);
     reorder_by_remap(data.place_osm_ids, remap, n_new, uint64_t(0));
 
@@ -463,8 +464,7 @@ void emit_strategy2_sidecar(const std::string& path,
 void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir, RunOrder order, MemoryBudget* budget) {
     const std::string label = "      strategy2 " + prev_dir.substr(prev_dir.find_last_of('/') + 1) + ": ";
     // Admins first: their remap reaches into the way, POI and place arrays
-    // the other passes reorder (a value remap commutes with a reorder, but
-    // a place tombstone's parent is 0, not NO_DATA). The other passes touch
+    // the other passes reorder. The other passes touch
     // disjoint arrays and run at once; the addr points' parent ways follow
     // the streets afterwards, which commutes with the addrs' reorder (an
     // addr tombstone's parent way is NO_DATA).
