@@ -547,8 +547,9 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
         mark_each(data.admin_polygons.size(), [&](size_t i) { mark(data.admin_polygons[i].name_id, STR_TIER_BIT_CORE); });
         mark_each(data.place_nodes.size(), [&](size_t i) { mark(data.place_nodes[i].name_id, STR_TIER_BIT_CORE); });
 
+        // Ways' original names aren't marked: only the addr:street match,
+        // before this, reads them.
         mark_each(data.ways.size(), [&](size_t i) { mark(data.ways[i].name_id, STR_TIER_BIT_STREET); });
-        mark_each(data.way_orig_name_ids.size(), [&](size_t i) { mark(data.way_orig_name_ids[i], STR_TIER_BIT_STREET); });
         mark_each(data.addr_points.size(), [&](size_t i) {
             mark(data.addr_points[i].street_id, STR_TIER_BIT_STREET);
             mark(data.addr_points[i].housenumber_id, STR_TIER_BIT_ADDR);

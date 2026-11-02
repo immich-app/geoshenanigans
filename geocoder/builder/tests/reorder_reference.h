@@ -1,7 +1,7 @@
 // The serial deterministic-ordering steps as of d77ab8e, verbatim save two
 // changes: the addr and way steps list each survivor once per cell, as the
-// interp step did, and a string no record uses gets no tier
-// (string_home_tier). They give the byte layout the parallel steps in
+// interp step did, and the string partition writes only the strings a
+// shipped record uses. They give the byte layout the parallel steps in
 // reorder.h and parsed_data.h must reproduce for any input and thread count
 // (test_reorder.cpp).
 #pragma once
@@ -58,7 +58,6 @@ inline void partition_strings_into_tiers(ParsedData& data) {
     for (const auto& pn : data.place_nodes)    mark(pn.name_id, STR_TIER_BIT_CORE);
 
     for (const auto& w : data.ways)            mark(w.name_id, STR_TIER_BIT_STREET);
-    for (uint32_t id : data.way_orig_name_ids) mark(id, STR_TIER_BIT_STREET);
     for (const auto& a : data.addr_points)     mark(a.street_id, STR_TIER_BIT_STREET);
     for (const auto& iw : data.interp_ways)    mark(iw.street_id, STR_TIER_BIT_STREET);
     auto shipped = [](const PoiRecord& pr) { return pr.tier <= POI_MAX_SHIPPED_TIER; };

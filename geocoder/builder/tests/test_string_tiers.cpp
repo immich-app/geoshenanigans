@@ -304,3 +304,19 @@ TEST(partition_writes_no_string_no_record_uses) {
     CHECK_EQ(d.strings_tier_bases[STR_TIER_COUNT], 7u);
     CHECK_EQ(d.admin_polygons[0].name_id, 0u);
 }
+
+TEST(partition_writes_no_original_name_of_a_way) {
+    // A way named by name:en keeps its original name only for the addr:street
+    // match; an original name that is also a way's name stays.
+    ParsedData d;
+    WayHeader translated{}, untranslated{};
+    translated.name_id = d.string_pool.intern("Hrushevskoho Street");
+    untranslated.name_id = d.string_pool.intern("淡路坂");
+    d.ways = {translated, untranslated};
+    d.way_orig_name_ids = {d.string_pool.intern("вулиця Грушевського"), untranslated.name_id};
+    partition_strings_into_tiers(d);
+    const std::string street = std::string("Hrushevskoho Street") + '\0' + "淡路坂" + '\0';
+    CHECK(tiers_back_to_back(d) == street);
+    CHECK(tier_bytes(d, 1) == street);
+    CHECK(d.way_orig_name_ids.empty());
+}
