@@ -375,6 +375,18 @@ pub struct PlaceNode {
     pub parent_poly_id: u32,
 }
 
+/// PlaceNode._pad1 bit: a node a boundary claims. It keeps its name, the boundary's label for
+/// place search, but reverse geocoding skips it.
+pub const PLACE_FLAG_HIDDEN: u8 = 0x02;
+
+impl PlaceNode {
+    /// Whether reverse geocoding reads the node: it has a name (it is no tombstone) and is not
+    /// hidden.
+    pub fn is_visible(&self) -> bool {
+        self.name_id != NO_DATA && self._pad1 & PLACE_FLAG_HIDDEN == 0
+    }
+}
+
 // POI category metadata — loaded from poi_meta.json (written by builder)
 pub struct PoiMeta {
     pub categories: std::collections::HashMap<u8, PoiCategoryMeta>,
@@ -1325,9 +1337,7 @@ impl Index {
         let total = m.len() / std::mem::size_of::<PlaceNode>() as u64;
         if (idx as u64) >= total { return None; }
         let pn = m.read_at::<PlaceNode>(idx as u64);
-        // _pad1 bit 1: a node a boundary claims (hidden, keeps its name for search)
-        if pn.name_id == NO_DATA || pn._pad1 & 0x02 != 0 { return None; }
-        Some(pn)
+        pn.is_visible().then_some(pn)
     }
 
     pub fn poi_record(&self, idx: u32) -> Option<PoiRecord> {
@@ -3841,7 +3851,7 @@ mod query_tests {
             records[offset..offset + bytes.len()].copy_from_slice(bytes);
             idx
         };
-        let (hidden, nameless) = (with(13, &[0x02]), with(8, &NO_DATA.to_le_bytes()));
+        let (hidden, nameless) = (with(13, &[PLACE_FLAG_HIDDEN]), with(8, &NO_DATA.to_le_bytes()));
 
         let got = answer(&hidden, -77.8494, 166.768);
 

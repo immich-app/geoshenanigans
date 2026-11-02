@@ -146,7 +146,7 @@ impl<'a> PlacesSource<'a> {
         let link = link_buf.as_mut_slice();
         for i in 0..n_place_nodes {
             let pn = place_node_raw(geo, i);
-            if is_hidden(&pn) && pn._pad1 & PLACE_FLAG_LABEL_OF != 0 && pn.parent_poly_id < n_poly {
+            if !pn.is_visible() && pn._pad1 & PLACE_FLAG_LABEL_OF != 0 && pn.parent_poly_id < n_poly {
                 let l = &mut link[pn.parent_poly_id as usize];
                 if *l == NO_DATA {
                     *l = i;
