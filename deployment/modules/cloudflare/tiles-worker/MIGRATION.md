@@ -26,12 +26,19 @@ group is idle). Run it from `deployment/modules/cloudflare/tiles-worker` with th
 set -euo pipefail
 export ENVIRONMENT=dev  # then prod
 OP_VAULT=tf_prod        # a 1Password vault only maintainers can read
+BACKUP="tiles-worker-$ENVIRONMENT state before provider v5"
 tg() { op run --env-file=../../../.env -- terragrunt run -- "$@"; }
 
 # The state holds the worker's secrets (Tigris key, metrics token), so it streams straight into 1Password and never
-# touches disk. With pipefail, a failed pull or upload stops the script before any state rm.
-tg state pull | op document create - --vault "$OP_VAULT" \
-  --title "tiles-worker-$ENVIRONMENT state before provider v5" --file-name "tiles-worker-$ENVIRONMENT.tfstate"
+# touches disk. With pipefail, a failed pull or upload stops the script before any state rm. The pull needs
+# --no-masking: op run otherwise replaces the injected secrets in the output, and the state holds the same values.
+op run --no-masking --env-file=../../../.env -- terragrunt run -- state pull |
+  op document create - --vault "$OP_VAULT" --title "$BACKUP" --file-name "tiles-worker-$ENVIRONMENT.tfstate"
+# A masked backup would only show itself on rollback, so check it now.
+if op document get "$BACKUP" --vault "$OP_VAULT" | grep -q 'concealed by 1Password'; then
+  echo "the backup is masked; fix it before removing anything from state" >&2
+  exit 1
+fi
 
 tg state rm 'cloudflare_workers_domain.tiles'
 # prod only:
@@ -53,7 +60,7 @@ Once both environments have applied, the `cloudflare_workers_custom_domains` dat
 copy (v4 can't read state written by v5):
 
 ```sh
-op document get "tiles-worker-$ENVIRONMENT state before provider v5" --vault "$OP_VAULT" | tg state push -force -
+op document get "$BACKUP" --vault "$OP_VAULT" | tg state push -force -
 ```
 
 Delete the 1Password document once both environments have applied v5 and you no longer need the way back.
