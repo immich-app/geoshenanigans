@@ -1,8 +1,9 @@
-// The serial deterministic-ordering steps as of d77ab8e, verbatim save two
+// The serial deterministic-ordering steps as of d77ab8e, verbatim save three
 // changes: the addr and way steps list each survivor once per cell, as the
-// interp step did, and the string partition writes only the strings a
-// shipped record uses. They give the byte layout the parallel steps in
-// reorder.h and parsed_data.h must reproduce for any input and thread count
+// interp step did, the string partition writes only the strings a shipped
+// record uses, and it takes every POI record as shipped (no POI has a tier no
+// dir ships). They give the byte layout the parallel steps in reorder.h and
+// parsed_data.h must reproduce for any input and thread count
 // (test_reorder.cpp).
 #pragma once
 
@@ -61,9 +62,7 @@ inline void partition_strings_into_tiers(ParsedData& data) {
     for (uint32_t id : data.way_orig_name_ids) mark(id, STR_TIER_BIT_WAY_ORIG_NAME);
     for (const auto& a : data.addr_points)     mark(a.street_id, STR_TIER_BIT_STREET);
     for (const auto& iw : data.interp_ways)    mark(iw.street_id, STR_TIER_BIT_STREET);
-    auto shipped = [](const PoiRecord& pr) { return pr.tier <= POI_MAX_SHIPPED_TIER; };
-    for (const auto& pr : data.poi_records)
-        mark(pr.parent_street_id, shipped(pr) ? STR_TIER_BIT_STREET : STR_TIER_BIT_UNSHIPPED);
+    for (const auto& pr : data.poi_records)    mark(pr.parent_street_id, STR_TIER_BIT_STREET);
 
     for (const auto& a : data.addr_points) mark(a.housenumber_id, STR_TIER_BIT_ADDR);
 
@@ -71,20 +70,17 @@ inline void partition_strings_into_tiers(ParsedData& data) {
     for (uint32_t pc : data.interp_postcode_ids) mark(pc, STR_TIER_BIT_POSTCODE);
     for (uint32_t pc : data.addr_postcode_ids) mark(pc, STR_TIER_BIT_POSTCODE);
     for (const auto& [key, _acc] : data.postcode_accum) mark(postcode_key_pc(key), STR_TIER_BIT_POSTCODE);
-    for (const auto& pr : data.poi_records)
-        mark(pr.parent_postcode_id, shipped(pr) ? STR_TIER_BIT_POSTCODE : STR_TIER_BIT_UNSHIPPED);
+    for (const auto& pr : data.poi_records)    mark(pr.parent_postcode_id, STR_TIER_BIT_POSTCODE);
 
-    for (const auto& pr : data.poi_records)
-        mark(pr.name_id, shipped(pr) ? STR_TIER_BIT_POI : STR_TIER_BIT_UNSHIPPED);
+    for (const auto& pr : data.poi_records)    mark(pr.name_id, STR_TIER_BIT_POI);
 
     auto home_tier = [&](uint32_t old_off) -> uint8_t {
         auto it = tier_mask.find(old_off);
         return string_home_tier(it != tier_mask.end() ? it->second : 0);
     };
 
-    // Strings no shipped record uses aren't written; unshipped records'
-    // references to them become NO_DATA below like any offset missing from
-    // the layout.
+    // Strings no shipped record uses aren't written (an offset missing from
+    // the layout becomes NO_DATA below).
     strings.erase(std::remove_if(strings.begin(), strings.end(),
                                  [&](const auto& s) { return home_tier(s.first) == STR_TIER_NONE; }),
                   strings.end());

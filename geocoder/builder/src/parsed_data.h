@@ -203,14 +203,11 @@ constexpr uint8_t STR_TIER_BIT_STREET   = 1 << 1;  // ways, addr_point.street_id
 constexpr uint8_t STR_TIER_BIT_ADDR     = 1 << 2;  // addr housenumbers
 constexpr uint8_t STR_TIER_BIT_POSTCODE = 1 << 3;  // postcode strings (any consumer)
 constexpr uint8_t STR_TIER_BIT_POI      = 1 << 4;  // poi_records.name_id
-// Strings of POI candidates no POI tier ships (tier > POI_MAX_SHIPPED_TIER).
-constexpr uint8_t STR_TIER_BIT_UNSHIPPED = 1 << 5;
 // way_orig_name_ids: no file holds them (only the addr:street match, before
 // the partition, reads them).
-constexpr uint8_t STR_TIER_BIT_WAY_ORIG_NAME = 1 << 6;
-// string_home_tier for a string no shipped record uses, such as an unshipped
-// POI's name (planet: 2.4M, 53 MiB) or an addr:street value the parent
-// street replaced: it isn't written.
+constexpr uint8_t STR_TIER_BIT_WAY_ORIG_NAME = 1 << 5;
+// string_home_tier for a string no shipped record uses, such as an
+// addr:street value the parent street replaced: it isn't written.
 constexpr uint8_t STR_TIER_NONE = 0xFF;
 
 constexpr size_t STR_TIER_COUNT = 5;
@@ -241,7 +238,6 @@ constexpr size_t STR_TIER_POI = 4;
 // equidistant POIs (find_nearest_poi_with_parent), so a shared string moving
 // tier, a POI's name from core to the poi tier, could change an answer.
 inline uint8_t string_home_tier(uint8_t mask) {
-    mask &= static_cast<uint8_t>(~STR_TIER_BIT_UNSHIPPED);
     if ((mask & ~STR_TIER_BIT_WAY_ORIG_NAME) == 0) return STR_TIER_NONE;
     if (mask & STR_TIER_BIT_WAY_ORIG_NAME)
         mask = static_cast<uint8_t>((mask & ~STR_TIER_BIT_WAY_ORIG_NAME) | STR_TIER_BIT_STREET);
@@ -553,8 +549,6 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
                 for (size_t i = b; i < e; i++) mark_one(i);
             }, threads);
         };
-        auto shipped = [](const PoiRecord& pr) { return pr.tier <= POI_MAX_SHIPPED_TIER; };
-
         mark_each(data.admin_polygons.size(), [&](size_t i) { mark(data.admin_polygons[i].name_id, STR_TIER_BIT_CORE); });
         mark_each(data.place_nodes.size(), [&](size_t i) { mark(data.place_nodes[i].name_id, STR_TIER_BIT_CORE); });
 
@@ -573,9 +567,9 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
 
         mark_each(data.poi_records.size(), [&](size_t i) {
             const auto& pr = data.poi_records[i];
-            mark(pr.parent_street_id, shipped(pr) ? STR_TIER_BIT_STREET : STR_TIER_BIT_UNSHIPPED);
-            mark(pr.parent_postcode_id, shipped(pr) ? STR_TIER_BIT_POSTCODE : STR_TIER_BIT_UNSHIPPED);
-            mark(pr.name_id, shipped(pr) ? STR_TIER_BIT_POI : STR_TIER_BIT_UNSHIPPED);
+            mark(pr.parent_street_id, STR_TIER_BIT_STREET);
+            mark(pr.parent_postcode_id, STR_TIER_BIT_POSTCODE);
+            mark(pr.name_id, STR_TIER_BIT_POI);
         });
 
         parallel_for(n, [&](size_t b, size_t e, unsigned) {
@@ -584,8 +578,8 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
     }
 
     // Each tier's string offsets in alphabetical order. Strings no shipped
-    // record uses aren't written; unshipped records' references to them
-    // become NO_DATA below like any offset missing from the layout.
+    // record uses aren't written (an offset missing from the layout becomes
+    // NO_DATA below).
     std::array<std::vector<uint32_t>, STR_TIER_COUNT> sorted;
     {
         const std::vector<uint32_t> offsets = starts.ones(threads);
@@ -735,14 +729,14 @@ inline void partition_strings_into_tiers(ParsedData& data, unsigned threads = 0)
 
 // Lays the POI tier out in POI record order, so a reader walking the records
 // (the place search build) reads their names front to back instead of all
-// over the tier. A name's home is the lowest POI tier of a shipped record
-// using it; the names of each home tier sit together, lowest tier first, each
-// where the first record of its home tier using it sits in the records'
-// final order. So the names of the POIs of tier <= t are the head of the
-// tier (poi_tier_string_ends[t]). Run once the records stop moving (strategy
-// 2). Each name keeps its one copy and the tier its size, so no offset outside
-// the tier moves; a name no shipped record uses (none in a build) goes last,
-// in its old order.
+// over the tier. A name's home is the lowest POI tier of a record using it;
+// the names of each home tier sit together, lowest tier first, each where the
+// first record of its home tier using it sits in the records' final order. So
+// the names of the POIs of tier <= t are the head of the tier
+// (poi_tier_string_ends[t]). Run once the records stop moving (strategy 2).
+// Each name keeps its one copy and the tier its size, so no offset outside the
+// tier moves; a name no record uses (none in a build) goes last, in its old
+// order. Every record's tier is one a dir ships (classify_poi).
 inline void order_poi_strings_by_record(ParsedData& data, unsigned threads = 0) {
     std::vector<char>& tier = data.strings_tiers[STR_TIER_POI];
     if (tier.empty()) return;
@@ -759,6 +753,8 @@ inline void order_poi_strings_by_record(ParsedData& data, unsigned threads = 0) 
         return off == NO_DATA || off < base ? RankedBits::npos : starts.index(off - base);
     };
     std::vector<PoiRecord>& records = data.poi_records;
+    if (parallel_any(records.size(), [&](size_t i) { return records[i].tier > POI_MAX_SHIPPED_TIER; }, threads))
+        throw std::logic_error("order_poi_strings_by_record: a POI of a tier no dir ships");
 
     std::vector<std::atomic<uint8_t>> home(n);
     std::vector<std::atomic<uint32_t>> first(n);
@@ -768,12 +764,9 @@ inline void order_poi_strings_by_record(ParsedData& data, unsigned threads = 0) 
             first[s].store(NO_DATA, std::memory_order_relaxed);
         }
     }, threads);
-    auto shipped_name = [&](size_t i) {
-        return records[i].tier <= POI_MAX_SHIPPED_TIER ? name_of(records[i].name_id) : RankedBits::npos;
-    };
     parallel_for(records.size(), [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++) {
-            const size_t s = shipped_name(i);
+            const size_t s = name_of(records[i].name_id);
             if (s == RankedBits::npos) continue;
             uint8_t seen = home[s].load(std::memory_order_relaxed);
             while (records[i].tier < seen && !home[s].compare_exchange_weak(seen, records[i].tier, std::memory_order_relaxed)) {}
@@ -781,7 +774,7 @@ inline void order_poi_strings_by_record(ParsedData& data, unsigned threads = 0) 
     }, threads);
     parallel_for(records.size(), [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++) {
-            const size_t s = shipped_name(i);
+            const size_t s = name_of(records[i].name_id);
             if (s == RankedBits::npos || records[i].tier != home[s].load(std::memory_order_relaxed)) continue;
             uint32_t seen = first[s].load(std::memory_order_relaxed);
             while (i < seen && !first[s].compare_exchange_weak(seen, static_cast<uint32_t>(i), std::memory_order_relaxed)) {}
