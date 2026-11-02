@@ -6628,6 +6628,13 @@ mod query_path_tests {
             self
         }
 
+        /// A place node a boundary claims, which keeps its name for place search: hidden.
+        fn claimed_place(&mut self, name: &str, place_type: u8, north_m: f64, east_m: f64) -> &mut Self {
+            self.place(name, place_type, north_m, east_m);
+            self.place_nodes.last_mut().unwrap()._pad1 = PLACE_FLAG_HIDDEN;
+            self
+        }
+
         /// A tombstone: the slot of a place node gone since an earlier build.
         fn tombstone(&mut self) -> &mut Self {
             self.place_nodes.push(PlaceNode { lat: 0.0, lng: 0.0, name_id: NO_DATA, place_type: 0, _pad1: 0, _pad2: 0, parent_poly_id: NO_DATA });
@@ -6696,7 +6703,8 @@ mod query_path_tests {
                     nodes.extend_from_slice(&pn.lat.to_le_bytes());
                     nodes.extend_from_slice(&pn.lng.to_le_bytes());
                     nodes.extend_from_slice(&pn.name_id.to_le_bytes());
-                    nodes.extend_from_slice(&[pn.place_type, 0, 0, 0]);
+                    nodes.extend_from_slice(&[pn.place_type, pn._pad1]);
+                    nodes.extend_from_slice(&pn._pad2.to_le_bytes());
                     nodes.extend_from_slice(&pn.parent_poly_id.to_le_bytes());
                 }
                 assert_eq!(nodes.len(), self.place_nodes.len() * std::mem::size_of::<PlaceNode>());
@@ -6804,6 +6812,19 @@ mod query_path_tests {
         let (cells, entries) = dataset.builders_place_index();
         assert_eq!(cells.len(), 2 * 12, "the fixture's places sit in two cells");
         assert_eq!(derived_place_index(dir.path()), (cells, entries));
+    }
+
+    #[test]
+    fn a_hidden_place_node_is_not_in_the_derived_entries() {
+        let dir = ScratchDir::new();
+        let mut dataset = oldtown();
+        dataset.claimed_place("Claimed", 2, 1_000.0, 1_000.0).claimed_place("Far", 2, 60_000.0, 0.0);
+        dataset.write(dir.path());
+        assert_eq!(dataset.builders_place_index().0.len(), 3 * 12, "one claimed node beside Oldtown, one in a cell of its own");
+
+        load_dir(dir.path());
+
+        assert_eq!(derived_place_index(dir.path()), oldtown().builders_place_index());
     }
 
     #[test]
