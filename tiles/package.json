@@ -20,7 +20,7 @@
     "deploy:check": "node --import=tsx src/deploy/check.ts"
   },
   "devDependencies": {
-    "@cloudflare/vitest-plugin": "^1.0.0",
+    "@cloudflare/vitest-plugin": "^1.5.0",
     "@eslint/compat": "^2.0.0",
     "@eslint/eslintrc": "^3.3.3",
     "@eslint/js": "^9.39.2",
@@ -37,7 +37,7 @@
     "typescript": "npm:@typescript/typescript6@^6.0.2",
     "vite-node": "^6.0.0",
     "vite-plugin-node-polyfills": "^0.28.0",
-    "wrangler": "^4.0.0"
+    "wrangler": "^4.156.2"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.862.0",
