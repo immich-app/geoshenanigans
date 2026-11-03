@@ -2951,6 +2951,36 @@ TEST(patch_heap_stays_flat_as_arc_vertices_are_replaced_whole) {
     }, 1024).empty());
 }
 
+// The low-memory admin family (layout B of admin_vertices.bin) is gone: an
+// encoded set whose gc.manifest names it is refused by the patcher in either
+// encoded mode and by geocoder-gc's decode, never read as a set without it.
+// The parent took the family, and applied the patch beside it.
+TEST(patch_lowmem_refuses_a_manifest_naming_the_admin_family) {
+    ScratchDir dir("lowmem-admin-family");
+    std::mt19937 rng(20261103);
+    const auto pois = pois_of(rng, 40, 0, true);
+    auto edited = pois;
+    std::fill(edited[10].block.begin() + 10, edited[10].block.end(), 0);
+    BuildDir old_d, new_d;
+    put_pois(old_d, pois);
+    put_pois(new_d, edited);
+    const LowMemCase c{dir.path(), "admin-family"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::string manifest = c.dir("old.enc") + "/gc.manifest";
+    const std::vector<char> was = read_file(manifest);
+    std::string text(was.begin(), was.end());
+    const size_t at = text.find("gc.families poi\n");
+    REQUIRE(at != std::string::npos);
+    text.replace(at, 16, "gc.families poi,admin\n");
+    REQUIRE(write_file(manifest, std::vector<char>(text.begin(), text.end())));
+    const std::string refusal = "unknown family admin in gc.manifest";
+
+    CHECK(not_refused(c, ENCODED_MODES, c.patch(), "admin-family", refusal).empty());
+    const ToolRun decoded = run_tool({GEOCODER_GC_BIN, "decode", c.dir("old.enc"), c.dir("old.dec")}, c.log());
+    CHECK(!decoded.ok);
+    CHECK(logged(decoded, refusal));
+}
+
 // v14's parent-id remap is its street leg alone: one carrying v13's three
 // (an admin leg before the street leg, a postcode leg after it), empty or
 // with an admin pair, is refused in every mode, its stray words read as a

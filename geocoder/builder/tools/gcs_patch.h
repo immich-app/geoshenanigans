@@ -28,7 +28,6 @@ static const std::vector<FamilyDesc>& families() {
         {"interp_postcodes", {"interp_postcodes.bin"}},
         {"gxc", {"geo_cells.bin", "street_entries.bin", "addr_entries.bin", "interp_entries.bin"}},
         {"addr", {"addr_points.bin", "addr_vertices.bin"}},
-        {"admin", {"admin_vertices.bin"}},
         {"poi", {"poi_records.bin", "poi_vertices.bin"}},
     };
     return f;
@@ -140,7 +139,6 @@ struct Store {
             else if (f == "way_postcodes" || f == "interp_postcodes") d = new side::DictDec(s, f, old_m);
             else if (f == "gxc") d = new gxc::Dec(s, old_m);
             else if (f == "addr") d = new addr::Dec(s, old_m);
-            else if (f == "admin") d = new poly::AdminDec(s);
             else if (f == "poi") d = new poly::PoiDec(s, old_m);
             else die("no decoder for %s", f.c_str());
             dec[size_t(fi)].reset(d);
@@ -163,8 +161,7 @@ struct Store {
                 auto it = expect_out.find("addr_points.bin");
                 if (it == expect_out.end()) die("addr: the patch lists no addr_points.bin size");
                 e = new addr::Enc(o, it->second);
-            } else if (f == "admin") e = new poly::AdminEnc(o);
-            else if (f == "poi") e = new poly::PoiEnc(o);
+            } else if (f == "poi") e = new poly::PoiEnc(o);
             else die("no encoder for %s", f.c_str());
             for (size_t p = 0; p < F.today.size(); p++) {
                 auto it = expect_out.find(F.today[p]);

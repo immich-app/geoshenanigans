@@ -135,14 +135,16 @@ int refusal_code(const std::function<void()>& body, const std::string& refusal) 
 struct PoiSet {
     std::vector<uint8_t> recs, verts;
 };
-PoiSet poi_set(std::mt19937& rng) {
+// A POI: a point (vc 0), or a polygon of vc vertices of w u16s, its ring
+// closed (the last vertex the first) or open.
+struct PoiSpec {
+    uint32_t vc;
+    int w;
+    bool closed;
+};
+PoiSet poi_set(const std::vector<PoiSpec>& specs, std::mt19937& rng) {
     PoiSet s;
-    struct Spec { uint32_t vc; int w; bool closed; };
-    const Spec specs[] = {{0, 0, false},    {3000, 2, false},  {5, 2, true},      {2000, 4, true},   {0, 0, false},
-                          {7, 4, false},    {4096, 2, true},   {1, 2, false},     {2500, 4, false},  {0, 0, false},
-                          {2, 2, true},     {70000, 2, false}, {17000, 2, true},  {70000, 4, false}, {17000, 4, true},
-                          {9000, 2, false}, {65538, 2, false}, {65537, 4, false}, {65536, 2, false}};
-    for (const Spec& sp : specs) {
+    for (const PoiSpec& sp : specs) {
         uint8_t r[36];
         for (auto& b : r) b = uint8_t(rng());
         if (!sp.vc) {
@@ -170,6 +172,13 @@ PoiSet poi_set(std::mt19937& rng) {
     }
     return s;
 }
+PoiSet poi_set(std::mt19937& rng) {
+    return poi_set({{0, 0, false},    {3000, 2, false},  {5, 2, true},      {2000, 4, true},   {0, 0, false},
+                    {7, 4, false},    {4096, 2, true},   {1, 2, false},     {2500, 4, false},  {0, 0, false},
+                    {2, 2, true},     {70000, 2, false}, {17000, 2, true},  {70000, 4, false}, {17000, 4, true},
+                    {9000, 2, false}, {65538, 2, false}, {65537, 4, false}, {65536, 2, false}},
+                   rng);
+}
 
 // Encodes a POI set record by record (each record, then its vertex block, in
 // odd-sized pieces) into dir; returns the manifest.
@@ -187,59 +196,6 @@ Manifest encode_poi(const PoiSet& s, const std::string& dir, std::mt19937& rng) 
         vp += bs;
     }
     return finish_all(enc);
-}
-
-// A synthetic admin set: admin_polygons.bin records (24 bytes, the vertex
-// offset and count first) and their vertex blocks (a 10-byte header and vc
-// vertices of w u16s).
-struct AdminSpec {
-    uint32_t vc;
-    int w;
-};
-struct AdminSet {
-    std::vector<uint8_t> polys, verts;
-};
-AdminSet admin_set(const std::vector<AdminSpec>& specs, std::mt19937& rng) {
-    AdminSet s;
-    for (const AdminSpec& sp : specs) {
-        uint8_t r[24];
-        for (auto& b : r) b = uint8_t(rng());
-        if (!sp.vc) {
-            wr32(r, NO);
-            wr32(r + 4, 0);
-        } else {
-            wr32(r, uint32_t(s.verts.size()));
-            wr32(r + 4, sp.vc);
-            uint8_t h[10];
-            for (auto& b : h) b = uint8_t(rng());
-            h[0] = sp.w == 4 ? 3 : uint8_t(rng() % 3);
-            s.verts.insert(s.verts.end(), h, h + 10);
-            for (uint32_t k = 0; k < sp.vc; k++) {
-                uint8_t v[8];
-                for (auto& b : v) b = uint8_t(rng());
-                s.verts.insert(s.verts.end(), v, v + 2 * sp.w);
-            }
-        }
-        s.polys.insert(s.polys.end(), r, r + 24);
-    }
-    return s;
-}
-
-// Writes the set's admin_polygons.bin into dir.
-void write_admin_polygons(const AdminSet& s, const std::string& dir) {
-    Writer pw(dir + "/admin_polygons.bin");
-    pw.put(s.polys);
-    pw.finish();
-}
-
-// Writes the set's admin_polygons.bin into dir and encodes its vertices, fed
-// in odd-sized pieces.
-void encode_admin(const AdminSet& s, const std::string& dir, std::mt19937& rng) {
-    write_admin_polygons(s, dir);
-    poly::AdminEnc enc(dir);
-    enc.state = {1};
-    write_in_pieces(enc, 0, s.verts, rng, 997);
-    finish_all(enc);
 }
 
 // Sets big_block() for one scope.
@@ -540,71 +496,37 @@ TEST(gcs_poi_decoder_rejects_blocks_the_encoder_never_writes) {
     }
 }
 
-TEST(gcs_admin_round_trip_in_memory_and_by_planes) {
-    // Blocks past the default big_block() (40000 x 8 B, 70000 x 4 B and
-    // 33000 x 8 B) go plane by plane (the header through the sequential
-    // writer, the planes through positional writers on the shared fd, the
-    // sequential writer moved past them): between small blocks, and first,
-    // last and back to back. Both paths write the same files and decode to
-    // the input.
-    const std::vector<std::vector<AdminSpec>> orders = {
-        {{0, 0}, {3, 2}, {40000, 4}, {5, 4}, {0, 0}, {70000, 2}, {1, 2}, {17, 4}, {33000, 4}, {2, 2}, {0, 0}, {9, 2}},
-        {{40000, 4}, {3, 2}, {70000, 2}, {70000, 2}, {0, 0}, {33000, 4}}};
-    std::mt19937 rng(20261027);
-    for (const auto& specs : orders) {
-        const AdminSet s = admin_set(specs, rng);
-        ScratchDir mem("gcs-test"), planes("gcs-test");
-        {
-            std::mt19937 feed(1);
-            encode_admin(s, mem.path(), feed);
-        }
-        {
-            BigBlock small(64);
-            std::mt19937 feed(2);
-            encode_admin(s, planes.path(), feed);
-        }
-        const auto files = dir_files(mem.path());
-        CHECK(!files.at("admin_vertices.B").empty());
-        CHECK(files == dir_files(planes.path()));
-        for (size_t b : {big_block(), size_t(64)}) {
-            BigBlock bb(b);
-            poly::AdminDec dec(mem.path());
-            CHECK(decode_all(dec)[0] == s.verts);
-        }
-    }
-}
-
 TEST(gcs_encoder_queues_one_large_write_a_piece_at_a_time) {
-    // admin_vertices.bin of 1 MiB and of 10 MiB, each in one write (as the
-    // patcher's FILE passes on an INSERT stretch), of small blocks, blocks
-    // just under big_block() (taken whole) and just past it (plane by plane):
-    // at both sizes the queue peaks at no more than a piece of the write
-    // (64 KiB) and a block taken whole (256 KiB), and the files are those of
-    // a write in odd-sized pieces. The patch's file size is given, so a unit
-    // is checked against the bytes left from where it starts.
+    // poi_vertices.bin of 1 MiB and of 10 MiB, each in one write after the
+    // records (as the patcher's FILE passes a long write), of small blocks,
+    // blocks just under big_block() (taken whole) and just past it (plane by
+    // plane): at both sizes the vertices' queue peaks at no more than a piece
+    // of the write (64 KiB) and a block taken whole (256 KiB), and the files
+    // are those of a write in odd-sized pieces. The patch's file sizes are
+    // given, so a unit is checked against the bytes left from where it starts.
     const uint32_t whole = uint32_t((big_block() - 10) / 8), planes = whole + 2;
     std::mt19937 rng(20261030);
     for (const size_t mib : {1, 10}) {
-        std::vector<AdminSpec> specs;
+        std::vector<PoiSpec> specs;
         for (size_t k = 0, bytes = 0; bytes < (mib << 20); k++) {
-            const AdminSpec sp = k % 64 == 7    ? AdminSpec{whole, 4}
-                                 : k % 64 == 40 ? AdminSpec{planes, 4}
-                                                : AdminSpec{1 + uint32_t(rng() % 500), k % 2 ? 4 : 2};
+            const PoiSpec sp = k % 64 == 7    ? PoiSpec{whole, 4, false}
+                               : k % 64 == 40 ? PoiSpec{planes, 4, k % 128 == 40}
+                                              : PoiSpec{1 + uint32_t(rng() % 500), k % 2 ? 4 : 2, k % 3 == 0};
             specs.push_back(sp);
             bytes += 10 + size_t(sp.vc) * 2 * size_t(sp.w);
         }
-        const AdminSet s = admin_set(specs, rng);
+        const PoiSet s = poi_set(specs, rng);
         ScratchDir one("gcs-test"), pieces("gcs-test");
-        write_admin_polygons(s, one.path());
-        poly::AdminEnc enc(one.path());
-        enc.state = {1};
-        enc.expect = {s.verts.size()};
-        enc.write(0, s.verts.data(), s.verts.size());
-        std::printf("    %zu MiB in one write: queue peak %zu B\n", mib, enc.peak(0));
-        CHECK(enc.peak(0) <= size_t(320) << 10);
+        poly::PoiEnc enc(one.path());
+        enc.state = {1, 1};
+        enc.expect = {s.recs.size(), s.verts.size()};
+        enc.write(0, s.recs.data(), s.recs.size());
+        enc.write(1, s.verts.data(), s.verts.size());
+        std::printf("    %zu MiB in one write: queue peak %zu B\n", mib, enc.peak(1));
+        CHECK(enc.peak(1) <= size_t(320) << 10);
         finish_all(enc);
         std::mt19937 feed(1);
-        encode_admin(s, pieces.path(), feed);
+        encode_poi(s, pieces.path(), feed);
         CHECK(dir_files(one.path()) == dir_files(pieces.path()));
     }
 }
@@ -707,7 +629,7 @@ TEST(gcs_addr_encoder_holds_at_most_a_piece_and_the_largest_abs2_footprint) {
     // bytes of that: 47,676 B of footprints before the largest put its last
     // 2 bytes at the start of a piece, so the queue holds the rest of it and
     // then that whole piece (another of the largest follows), 64 KiB +
-    // 280,004 B, past the 320 KiB an admin or POI encoder may hold.
+    // 280,004 B, past the 320 KiB a POI encoder may hold.
     const size_t largest = 10 + 4 * size_t(addr::ABS2_MAX_VERTICES);
     std::mt19937 rng(20261030);
     const AddrSet s = addr_set({{5000, 1, false, 65536},
@@ -810,7 +732,7 @@ TEST(gcs_addr_decoder_refuses_a_footprint_past_the_end_before_reading_it) {
 }
 
 TEST(gcs_encoders_refuse_a_unit_past_the_end_of_its_file) {
-    // A footprint, admin polygon or POI block of 2^30 vertices (10 + 4 x 2^30
+    // A footprint or POI block of 2^30 vertices (10 + 4 x 2^30
     // bytes, which a 32-bit size_t wraps to 10) whose file the patch gives as
     // ten bytes: refused as those bytes come, not waited for while the queue
     // takes the rest of the file.
@@ -827,17 +749,6 @@ TEST(gcs_encoders_refuse_a_unit_past_the_end_of_its_file) {
 
         CHECK_EQ(refusal_of([&] { enc.write(1, ten.data(), ten.size()); }),
                  std::string("gcs: addr: a unit of 10 + 1073741824 x 4 bytes at 0 runs past the end of input 1 (10 bytes left)"));
-    }
-    {
-        std::vector<uint8_t> poly(24, 0);
-        wr32(&poly[4], 0x40000000);
-        write_bytes(dir.path() + "/admin_polygons.bin", poly);
-        poly::AdminEnc enc(dir.path());
-        enc.state = {1};
-        enc.expect = {ten.size()};
-
-        CHECK_EQ(refusal_of([&] { enc.write(0, ten.data(), ten.size()); }),
-                 std::string("gcs: admin: a unit of 10 + 1073741824 x 4 bytes at 0 runs past the end of input 0 (10 bytes left)"));
     }
     {
         std::vector<uint8_t> rec(36, 0);
