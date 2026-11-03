@@ -1,9 +1,9 @@
 // admin_arcs.h: the arc topology (junctions, cuts, canonical arcs, refs), the
 // arcs' keys and Hilbert presentation order, their slots, the minimal set, the
-// tiers (simplifying, the snap, validity, the crossing repair, nesting), the
-// arc stage's dirs and its per-polygon rings following each admin permute. In
-// the sanitized suite: the topology's scatter and partition passes, the
-// minimal chains and the repair grid index their arrays directly.
+// tiers (simplifying, the snap, validity, the crossing repair, nesting, the e7
+// grid), the arc stage's dirs and its per-polygon rings following each admin
+// permute. In the sanitized suite: the topology's scatter and partition
+// passes, the minimal chains and the repair grid index their arrays directly.
 #include "admin_arcs.h"
 
 #include <algorithm>
@@ -1064,7 +1064,7 @@ TEST(the_repair_gives_back_the_vertices_a_crossing_needs_and_leaves_raw_crossing
 
 // --- Nesting ---
 
-TEST(a_hole_simplifying_leaves_outside_gets_vertices_back_and_one_the_snap_crosses_counts_as_introduced) {
+TEST(a_hole_simplifying_leaves_outside_gets_vertices_back_and_one_the_snap_crosses_keeps_the_e7_grid) {
     const int32_t s = 100000;
     // The outer ring bows 3000 out round a hole: straightened, it leaves the
     // hole outside, crossing nothing, until the bow comes back.
@@ -1072,7 +1072,8 @@ TEST(a_hole_simplifying_leaves_outside_gets_vertices_back_and_one_the_snap_cross
                                pt(s, 40000), pt(s, 0)});
     const Ring hole = closed({pt(s + 1000, 48000), pt(s + 1000, 52000), pt(s + 2000, 52000), pt(s + 2000, 48000)});
     // A hole 4 under its outer ring's slanted edge, both on single raw
-    // edges: snapped to the grid they cross, with no vertex to give back.
+    // edges: snapped to the grid they cross, with no vertex to give back,
+    // so both rings keep OSM's own grid.
     const int32_t at = 1000000;
     const Ring outer_snapped = closed({pt(at, 0), pt(at + 100049, 0), pt(at + 100149, s), pt(at, s)});
     const Ring hole_snapped =
@@ -1089,9 +1090,13 @@ TEST(a_hole_simplifying_leaves_outside_gets_vertices_back_and_one_the_snap_cross
     CHECK(state.counts.nesting_restored >= 1);
     const Ring kept = points_of(stored_of(arcs, store, simplified_tier(), state, arc_through(arcs, store, outer[4])));
     CHECK(std::find(kept.begin(), kept.end(), outer[4]) != kept.end());
-    CHECK_EQ(state.counts.rings_nest_introduced, size_t(1));
-    CHECK_EQ(state.counts.crossings_left, size_t(2));
-    CHECK_EQ(state.counts.unrepairable_segments, size_t(3));
+    for (const Ring* ring : {&outer_snapped, &hole_snapped}) {
+        const Ring stored = points_of(stored_of(arcs, store, simplified_tier(), state, arc_through(arcs, store, (*ring)[1])));
+        CHECK(same_closed_ring(stored.data(), uint32_t(stored.size()), ring->data(), uint32_t(ring->size())));
+    }
+    CHECK_EQ(state.counts.rings_nest_introduced, size_t(0));
+    CHECK_EQ(state.counts.crossings_left, size_t(0));
+    CHECK_EQ(state.counts.unrepairable_segments, size_t(0));
     CHECK_EQ(state.counts.raw_crossings, size_t(2));
 }
 
@@ -1575,4 +1580,70 @@ TEST(each_polygons_arc_rings_follow_it_through_the_admin_permutes) {
     CHECK(refusal_of<std::logic_error>([&] { permute_admin_polygons(d, {2, 1, 0}, 1); }).find("out of step") !=
           std::string::npos);
     CHECK(d.admin_osm_ids == osm_ids);
+}
+
+// --- The e7 grid ---
+
+TEST(a_polygon_kept_on_the_e7_grid_keeps_its_junctions_there_in_its_neighbours_arcs) {
+    const int32_t s = 100000, at = 1000000;
+    // The snapped hole above, its outer ring's slanted edge shared with a
+    // neighbour whose far corners sit off the 1.1 m grid.
+    const PackedLocation low = pt(at + 100049, 0), high = pt(at + 100149, s);
+    const Ring outer = closed({pt(at, 0), low, high, pt(at, s)});
+    const Ring hole = closed({pt(at + 99000, 90000), pt(at + 100135, 90000), pt(at + 100135, 90600), pt(at + 99000, 90600)});
+    const Ring neighbour = closed({low, pt(at + 200037, 0), pt(at + 200037, s), high});
+    const AdminExactRings store = store_of({{outer, {hole}}, {neighbour, {}}});
+    const AdminArcs arcs = build_admin_arcs(store, {false, false}, "", 1);
+    const ArcTierState& state = arcs.tiers[0];
+    CHECK_EQ(state.counts.rings_nest_introduced, size_t(0));
+    // The polygon's arcs as OSM has them.
+    const uint32_t shared = arc_through(arcs, store, pt(at, s));
+    for (const PackedLocation& p : {pt(at, s), hole[1]}) {
+        const uint32_t a = arc_through(arcs, store, p);
+        CHECK(points_of(stored_of(arcs, store, simplified_tier(), state, a)) == vertices_of(store, arcs.arcs[a]));
+    }
+    CHECK(shared != UINT32_MAX);
+    // The neighbour's own arc: its ends the polygon's junctions as they are,
+    // its corners snapped.
+    const uint32_t own = arc_through(arcs, store, pt(at + 200037, 0));
+    const Ring raw = vertices_of(store, arcs.arcs[own]);
+    const Ring stored = points_of(stored_of(arcs, store, simplified_tier(), state, own));
+    REQUIRE(stored.size() == raw.size());
+    CHECK(stored.front() == raw.front() && stored.back() == raw.back());
+    for (size_t i = 1; i + 1 < raw.size(); i++) CHECK(stored[i] == pt(floordiv_snap(raw[i].lat_e7), floordiv_snap(raw[i].lon_e7)));
+    // Their blocks keep OSM's grid, the chains close, and the rings come back.
+    const AdminArcBlocks blocks = encode_admin_arcs(arcs, store, 1);
+    const ArcBlocks& simplified = blocks.tiers[0];
+    for (uint32_t a = 0; a < arcs.arcs.size(); a++) {
+        arc_blocks::DecodedArc d;
+        REQUIRE(arc_blocks::decode_arc(simplified.data(a), simplified.bytes_of(a), d));
+        CHECK_EQ(int(d.k), 0);
+        CHECK(d.vertices == points_of(stored_of(arcs, store, simplified_tier(), state, a)));
+    }
+    for (uint32_t p = 0; p < 2; p++) {
+        const std::vector<Ring> rings = decoded_rings(blocks, ArcSet::Full, 0, blocks.polygons[p]);
+        for (uint32_t k = 0; k < rings.size(); k++)
+            CHECK(rings[k] == stored_ring(arcs, store, 0, store.polygons[p].first_ring + k));
+    }
+}
+
+TEST(arcs_away_from_a_polygon_on_the_e7_grid_keep_the_tiers_grid) {
+    const int32_t s = 100000, at = 1000000;
+    const Ring outer = closed({pt(at, 0), pt(at + 100049, 0), pt(at + 100149, s), pt(at, s)});
+    const Ring hole = closed({pt(at + 99000, 90000), pt(at + 100135, 90000), pt(at + 100135, 90600), pt(at + 99000, 90600)});
+    const AdminExactRings store = store_of({{outer, {hole}}, {island(3000000, 3000000, 20000, 24, 7), {}}});
+    const AdminArcs arcs = build_admin_arcs(store, {false, true}, "", 1);
+    const AdminArcBlocks blocks = encode_admin_arcs(arcs, store, 1);
+    auto k_of = [&](size_t t, uint32_t a) {
+        arc_blocks::DecodedArc d;
+        REQUIRE(arc_blocks::decode_arc(blocks.tiers[t].data(a), blocks.tiers[t].bytes_of(a), d));
+        return int(d.k);
+    };
+    CHECK_EQ(k_of(0, arc_through(arcs, store, outer[1])), 0);
+    CHECK_EQ(k_of(0, arc_through(arcs, store, hole[1])), 0);
+    const uint32_t island_arc = arc_through(arcs, store, store.vertices[store.rings[2].begin]);
+    CHECK_EQ(k_of(0, island_arc), 2);
+    CHECK_EQ(k_of(1, island_arc), 0);
+    REQUIRE(arcs.minimal.arcs.size() == 1);
+    CHECK_EQ(k_of(2, 0), 2);
 }
