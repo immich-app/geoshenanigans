@@ -195,6 +195,7 @@ enable_testing()
 file(GLOB GEOCODER_TEST_SRCS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
 add_executable(geocoder-tests
     ${GEOCODER_TEST_SRCS}
+    src/admin_arcs.cpp
     src/ring_assembly.cpp
     src/interpolation.cpp
     src/pbf_reader.cpp

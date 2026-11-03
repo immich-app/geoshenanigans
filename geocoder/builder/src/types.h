@@ -207,6 +207,13 @@ static constexpr double ADMIN_LINK_SLACK_DEG = 1e-7;
 static constexpr double ADMIN_LINK_REACH_RAD =
     ADMIN_COVER_CHORD_TOLERANCE_RAD + ADMIN_LINK_SLACK_DEG * (3.14159265358979323846 / 180.0);
 
+// --- Admin arcs (admin_arcs.h) ---
+
+// The arc topology's coordinate-hash partitions of the vertices: its junction
+// pass sorts each partition's neighbour lists on one thread, small enough to
+// sort in cache and with no merge.
+static constexpr uint32_t kArcPartitions = 4096;
+
 // --- Index mode ---
 
 enum class IndexMode { Full, NoAddresses, AdminOnly };
