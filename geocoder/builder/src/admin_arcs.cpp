@@ -824,7 +824,12 @@ std::string tier_summary(const ArcTier& tier, const ArcTierCounts& c) {
     }
     line << c.kept_vertices << " raw vertices kept, " << c.stored_vertices << " stored once snapped, "
          << c.single_point_arcs << " arcs of one point; validity: " << c.validity_rounds << " rounds, "
-         << c.validity_restored << " vertices back, " << c.degenerate_rings << " degenerate rings\n";
+         << c.validity_restored << " vertices back, " << c.degenerate_rings << " degenerate rings; repair: "
+         << c.crossings_simplified << " crossings from simplifying, " << c.repair_rounds << " rounds, "
+         << c.repair_restored << " vertices back to crossings, " << c.nesting_restored
+         << " to polygons not nesting, " << c.crossings_left << " crossings left, "
+         << c.unrepairable_segments << " unrepairable segments, " << c.raw_crossings
+         << " raw crossings; rings_nest: " << c.rings_nest_introduced << " polygons introduced\n";
     return line.str();
 }
 
@@ -856,8 +861,11 @@ AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>
     minimal.slot_counts = slots.counts;
     log_phase("      Admin arcs: minimal set", t, cpu);
 
+    const std::vector<bool> nests_exact = exact_rings_nest(store, threads);
+    arcs.rings_nest_raw = static_cast<size_t>(std::count(nests_exact.begin(), nests_exact.end(), false));
+    log_phase("      Admin arcs: exact nesting", t, cpu);
     for (const ArcTier& tier : kArcTiers) {
-        arcs.tiers.push_back(build_arc_tier(arcs, store, tier, threads, [&](const char* step) {
+        arcs.tiers.push_back(build_arc_tier(arcs, store, tier, nests_exact, threads, [&](const char* step) {
             log_phase((std::string("      Admin arcs: ") + tier.dir + " " + step).c_str(), t, cpu);
         }));
         log_phase((std::string("      Admin arcs: ") + tier.dir).c_str(), t, cpu);
@@ -875,6 +883,7 @@ AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>
          << " vertices), " << m.refs << " refs over " << m.rings << " rings of " << m.polygons << " polygons; "
          << m.core_arcs << " full arcs in " << m.joined_junctions << " full junctions joined, " << m.duplicate_keys
          << " duplicate keys; " << slot_summary(minimal.slot_counts, minimal.planet_sidecar.size()) << "\n";
+    line << "  Admin arcs rings_nest raw: " << arcs.rings_nest_raw << " polygons whose exact rings don't nest\n";
     for (size_t k = 0; k < kArcTierCount; k++) line << tier_summary(kArcTiers[k], arcs.tiers[k].counts);
     std::cerr << line.str();
     return arcs;

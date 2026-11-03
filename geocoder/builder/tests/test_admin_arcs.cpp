@@ -1,9 +1,9 @@
 // admin_arcs.h: the arc topology (junctions, cuts, canonical arcs, refs), the
 // arcs' keys and Hilbert presentation order, their slots, the minimal set, the
-// tiers (simplifying, the snap, validity), the arc stage's dirs and its
-// per-polygon rings following each admin permute. In the sanitized suite: the
-// topology's scatter and partition passes and the minimal chains index their
-// arrays directly.
+// tiers (simplifying, the snap, validity, the crossing repair, nesting), the
+// arc stage's dirs and its per-polygon rings following each admin permute. In
+// the sanitized suite: the topology's scatter and partition passes, the
+// minimal chains and the repair grid index their arrays directly.
 #include "admin_arcs.h"
 
 #include <algorithm>
@@ -730,7 +730,7 @@ Ring points_of(const std::vector<StoredVertex>& stored) {
 }
 
 ArcTierState tier_of(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier, unsigned threads = 1) {
-    return build_arc_tier(arcs, store, tier, threads);
+    return build_arc_tier(arcs, store, tier, exact_rings_nest(store, threads), threads);
 }
 
 // The full set's arc holding vertex p, or none.
@@ -873,7 +873,7 @@ TEST(the_exact_tier_stores_every_raw_vertex_as_it_is) {
     CHECK_EQ(state.counts.stored_vertices, vertices);
     CHECK_EQ(state.counts.stored_vertices, arcs.counts.arc_vertices);
     CHECK_EQ(state.counts.single_point_arcs, size_t(1));
-    CHECK_EQ(state.counts.degenerate_rings + state.counts.validity_restored, size_t(0));
+    CHECK_EQ(state.counts.crossings_left + state.counts.degenerate_rings + state.counts.validity_restored, size_t(0));
     // The simplified tier has the one-point ring as degenerate.
     CHECK_EQ(arcs.tiers[0].counts.degenerate_rings, size_t(1));
 }
@@ -932,6 +932,109 @@ TEST(a_ring_simplified_to_no_area_gets_its_most_straying_vertex_back) {
         middles += std::count(v.begin(), v.end(), pt(100, 50000)) + std::count(v.begin(), v.end(), pt(-100, 50000));
     }
     CHECK_EQ(middles, size_t(1));
+}
+
+// --- Repair ---
+
+TEST(the_repair_gives_back_the_vertices_a_crossing_needs_and_leaves_raw_crossings_alone) {
+    // A border bowing 3000 (under the 37.5 m tolerance) round an island that
+    // reaches 1000 past the straight line: simplified, the border crosses it.
+    const int32_t s = 100000;
+    const Ring border = {pt(0, 0), pt(0, 40000), pt(3000, 45000), pt(3000, 55000), pt(0, 60000), pt(0, s)};
+    Ring above = border, below = border;
+    above.insert(above.end(), {pt(s, s), pt(s, 0)});
+    below.insert(below.end(), {pt(-s, s), pt(-s, 0)});
+    std::reverse(below.begin(), below.end());
+    const Ring isle = closed({pt(-1000, 48000), pt(-1000, 52000), pt(2000, 52000), pt(2000, 48000)});
+    // Two squares whose edges cross as OSM has them, with wiggles to drop.
+    const Ring x = closed({pt(200000, 0), pt(200000, s), pt(300000, s), pt(300200, 30000), pt(300000, 0), pt(250000, -150)});
+    const Ring y = closed({pt(250000, 50000), pt(350000, 50000), pt(350000, 150000), pt(250000, 150000), pt(250100, 100000)});
+    const std::vector<Polygon> polygons = {{closed(above), {}}, {closed(below), {}}, {isle, {}}, {x, {}}, {y, {}}};
+    const AdminExactRings store = store_of(polygons);
+    const AdminArcs arcs = build_arc_topology(store, 1);
+    const ArcTierState state = tier_of(arcs, store, simplified_tier());
+    CHECK(state.counts.crossings_simplified >= 2);
+    CHECK(state.counts.repair_restored >= 1);
+    CHECK_EQ(state.counts.crossings_left, size_t(0));
+    CHECK_EQ(state.counts.raw_crossings, size_t(2));
+    const uint32_t a = arc_through(arcs, store, pt(3000, 45000));
+    const Ring kept = points_of(stored_of(arcs, store, simplified_tier(), state, a));
+    CHECK(std::find(kept.begin(), kept.end(), pt(3000, 45000)) != kept.end());
+    // The crossing squares keep what they keep alone.
+    for (const Ring& square : {x, y}) {
+        const AdminExactRings alone = store_of({{square, {}}});
+        const AdminArcs alone_arcs = build_arc_topology(alone, 1);
+        const ArcTierState alone_state = tier_of(alone_arcs, alone, simplified_tier());
+        const uint32_t here = arc_through(arcs, store, square[0]);
+        CHECK(points_of(stored_of(arcs, store, simplified_tier(), state, here)) ==
+              points_of(stored_of(alone_arcs, alone, simplified_tier(), alone_state, 0)));
+    }
+}
+
+// --- Nesting ---
+
+TEST(a_hole_simplifying_leaves_outside_gets_vertices_back_and_one_the_snap_crosses_counts_as_introduced) {
+    const int32_t s = 100000;
+    // The outer ring bows 3000 out round a hole: straightened, it leaves the
+    // hole outside, crossing nothing, until the bow comes back.
+    const Ring outer = closed({pt(0, 0), pt(0, s), pt(s, s), pt(s, 60000), pt(s + 3000, 55000), pt(s + 3000, 45000),
+                               pt(s, 40000), pt(s, 0)});
+    const Ring hole = closed({pt(s + 1000, 48000), pt(s + 1000, 52000), pt(s + 2000, 52000), pt(s + 2000, 48000)});
+    // A hole 4 under its outer ring's slanted edge, both on single raw
+    // edges: snapped to the grid they cross, with no vertex to give back.
+    const int32_t at = 1000000;
+    const Ring outer_snapped = closed({pt(at, 0), pt(at + 100049, 0), pt(at + 100149, s), pt(at, s)});
+    const Ring hole_snapped =
+        closed({pt(at + 99000, 90000), pt(at + 100135, 90000), pt(at + 100135, 90600), pt(at + 99000, 90600)});
+    // A hole across its outer ring as OSM has it.
+    const Ring outer_raw = closed({pt(300000, 0), pt(300000, s), pt(400000, s), pt(400000, 0)});
+    const Ring hole_raw = closed({pt(390000, 40000), pt(390000, 60000), pt(410000, 60000), pt(410000, 40000)});
+    const AdminExactRings store =
+        store_of({{outer, {hole}}, {outer_snapped, {hole_snapped}}, {outer_raw, {hole_raw}}});
+    const std::vector<bool> nests = exact_rings_nest(store, 1);
+    CHECK(nests == std::vector<bool>({true, true, false}));
+    const AdminArcs arcs = build_arc_topology(store, 1);
+    const ArcTierState state = build_arc_tier(arcs, store, simplified_tier(), nests, 1);
+    CHECK(state.counts.nesting_restored >= 1);
+    const Ring kept = points_of(stored_of(arcs, store, simplified_tier(), state, arc_through(arcs, store, outer[4])));
+    CHECK(std::find(kept.begin(), kept.end(), outer[4]) != kept.end());
+    CHECK_EQ(state.counts.rings_nest_introduced, size_t(1));
+    CHECK_EQ(state.counts.crossings_left, size_t(2));
+    CHECK_EQ(state.counts.unrepairable_segments, size_t(3));
+    CHECK_EQ(state.counts.raw_crossings, size_t(2));
+}
+
+// --- The stage ---
+
+TEST(every_tier_is_the_same_whatever_the_threads) {
+    std::vector<Polygon> cells = grid(9, 8, 71, 3000);
+    std::mt19937_64 rng(72);
+    std::vector<bool> in_minimal;
+    for (size_t k = 0; k < cells.size(); k++) in_minimal.push_back(rng() % 3 != 0);
+    for (int k = 0; k < 6; k++) {
+        cells.push_back({island(4000 + 3000 * k, 5500 + 2000 * k, 400, 12, 80 + k), {}});
+        in_minimal.push_back(k % 2 == 0);
+    }
+    const AdminExactRings store = store_of(cells);
+    const AdminArcs one = build_admin_arcs(store, in_minimal, "", 1);
+    REQUIRE(one.tiers.size() == kArcTierCount);
+    for (unsigned threads : {3u, 8u}) {
+        const AdminArcs again = build_admin_arcs(store, in_minimal, "", threads);
+        bool same = again.minimal.refs == one.minimal.refs && again.minimal.parts == one.minimal.parts;
+        for (size_t t = 0; t < kArcTierCount; t++) {
+            same = same && again.tiers[t].kept == one.tiers[t].kept;
+            const size_t n = kArcTiers[t].set == ArcSet::Full ? one.arcs.size() : one.minimal.arcs.size();
+            for (uint32_t a = 0; a < n; a++)
+                same = same && points_of(stored_of(again, store, kArcTiers[t], again.tiers[t], a)) ==
+                                   points_of(stored_of(one, store, kArcTiers[t], one.tiers[t], a));
+            same = same && again.tiers[t].counts.stored_vertices == one.tiers[t].counts.stored_vertices &&
+                   again.tiers[t].counts.crossings_left == one.tiers[t].counts.crossings_left;
+        }
+        CHECK(same);
+    }
+    CHECK(one.minimal.counts.arcs > 0);
+    CHECK(one.tiers[2].counts.stored_vertices < one.tiers[0].counts.stored_vertices);
+    CHECK(one.tiers[0].counts.stored_vertices < one.tiers[1].counts.stored_vertices);
 }
 
 // --- The stage's dirs ---

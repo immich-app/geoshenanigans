@@ -14,8 +14,9 @@
 // a full junction is one only for other polygons' rings. Each set has its
 // tiers (kArcTiers): the exact tier stores every raw vertex, a simplified tier
 // the vertices Douglas-Peucker keeps of each arc, snapped to its grid, with
-// vertices given back where a ring would degenerate. build-index runs the
-// arc stage (build_admin_arcs) only with --arcs-out.
+// vertices given back where a ring would degenerate, two simplified segments
+// cross or a polygon's rings stop nesting. build-index runs the arc stage
+// (build_admin_arcs) only with --arcs-out.
 #pragma once
 
 #include <algorithm>
@@ -251,6 +252,14 @@ struct ArcTierCounts {
     int validity_rounds = 0;
     size_t validity_restored = 0;
     size_t degenerate_rings = 0;  // under 3 vertices or of no area, after every round
+    size_t crossings_simplified = 0;  // segment pairs simplification made meet, before the repair
+    int repair_rounds = 0;
+    size_t repair_restored = 0;
+    size_t nesting_restored = 0;  // vertices given back to polygons whose rings stopped nesting
+    size_t crossings_left = 0;
+    size_t unrepairable_segments = 0;  // in a crossing left, with no dropped vertex
+    size_t raw_crossings = 0;  // segment pairs meeting whose raw spans already meet
+    size_t rings_nest_introduced = 0;  // polygons whose rings nest in exact, not here
 };
 
 // What a tier holds: the keep marks of a simplified tier (empty for one that
@@ -279,6 +288,7 @@ struct AdminArcs {
     MinimalArcs minimal;
     // Parallel to kArcTiers.
     std::vector<ArcTierState> tiers;
+    size_t rings_nest_raw = 0;  // polygons whose exact rings don't nest (rings_nest)
 };
 
 // A minimal arc's vertices in its order, read through its parts' views.
@@ -353,17 +363,27 @@ std::string arc_sidecar_path(const std::string& region_dir, ArcSet set);
 MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& store,
                                const std::vector<bool>& in_minimal, unsigned threads);
 
+// The polygons of the store whose exact rings nest (rings_nest): true for
+// one with no holes.
+std::vector<bool> exact_rings_nest(const AdminExactRings& store, unsigned threads);
+
 // Tier `tier` of its set of `arcs`. A simplified tier keeps each arc's ends
 // and the vertices Douglas-Peucker keeps at the tier's tolerance in degrees at
 // the arc's first latitude (meters_to_degrees), capped at cap_factor times
 // the square root of the smallest area of a ring of the set that uses the
-// arc; an arc whose ends meet keeps at least 4. It then gives vertices back
-// to a ring of under 3 vertices or of no area once snapped: the farthest
+// arc; an arc whose ends meet keeps at least 4. It then gives vertices back:
+// to a ring of under 3 vertices or of no area once snapped, the farthest
 // dropped one of its arc that strays most, for up to kArcValidityRounds
-// rounds. A tier with no tolerance keeps everything and counts nothing.
+// rounds; and for up to kArcRepairRounds rounds, where two snapped segments
+// meet away from a shared end but their raw spans don't, the farthest dropped
+// one of each span, and to a polygon whose rings nest exactly
+// (`nests_exact`, exact_rings_nest) but not once stored, the farthest dropped
+// one of each span of a ring whose box holds a vertex of another ring. A
+// tier with no tolerance keeps everything and counts nothing.
 // `phase_done` is told as each step ends.
 ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
-                            unsigned threads, const std::function<void(const char*)>& phase_done = {});
+                            const std::vector<bool>& nests_exact, unsigned threads,
+                            const std::function<void(const char*)>& phase_done = {});
 
 // A vertex a tier stores: at `raw` among its arc's raw vertices, snapped.
 struct StoredVertex {

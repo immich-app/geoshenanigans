@@ -227,6 +227,11 @@ static constexpr double kArcCapFactor = 0.1;
 static constexpr int32_t kSimplifiedGridE7 = 100;
 // Rounds that give a degenerate simplified ring vertices back.
 static constexpr int kArcValidityRounds = 64;
+// Rounds that give vertices back where simplified segments cross or a
+// polygon's rings stop nesting, and the grid they find crossings on, in e7
+// units: 0.02 degrees.
+static constexpr int kArcRepairRounds = 60;
+static constexpr int64_t kArcRepairCellE7 = 200000;
 
 // A boundary tier: the arcs of one set at one tolerance and grid. A tier
 // with no tolerance stores every raw vertex as OSM has it: no simplifying,
