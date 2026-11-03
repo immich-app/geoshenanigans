@@ -63,6 +63,8 @@ export class PMTilesService {
     private memCache: IMemCacheRepository,
     private metrics: IMetricsRepository,
     private db: IDatabaseRepository,
+    // Added to the d1_lookup metric.
+    private lookupTags: { [key: string]: string } = {},
   ) {}
 
   /**
@@ -107,7 +109,7 @@ export class PMTilesService {
     }
     const tileId = zxyToTileId(z, x, y);
 
-    const dbLookup = await this.metrics.monitorAsyncFunction({ name: 'd1_lookup' }, (tileId) =>
+    const dbLookup = await this.metrics.monitorAsyncFunction({ name: 'd1_lookup', tags: this.lookupTags }, (tileId) =>
       this.db.query(
         `SELECT * FROM cache_entries_${this.source.getDeploymentKey()} WHERE startTileId <= ? ORDER BY startTileId DESC LIMIT 1`,
         tileId,

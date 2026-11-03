@@ -19,6 +19,7 @@ import {
   PMTilesParams,
   PMTilesStyleParams,
   PMTilesTileParams,
+  rayColo,
 } from './request';
 
 declare global {
@@ -119,7 +120,10 @@ async function handleRequest(request: Request, env: WorkerEnv, metrics: IMetrics
     globalThis.memCache = new Map<string, unknown>();
   }
   const memCacheRepository = new MemCacheRepository(globalThis.memCache);
-  const d1Repository = new CloudflareD1Repository(env.D1_GLOBAL, metrics);
+  // D1's latency depends on the replica nearest to where Tiles runs: on a full miss the upper tier's colo, not the
+  // client's (the colo tag).
+  const d1Tags = { tiles_colo: rayColo(request.headers.get(Header.CF_RAY)) };
+  const d1Repository = new CloudflareD1Repository(env.D1_GLOBAL, metrics, d1Tags);
   const tigrisStorageRepository = new TigrisStorageRepository(
     env.TIGRIS_KEY_ID,
     env.TIGRIS_ACCESS_KEY,
@@ -165,7 +169,13 @@ async function handleRequest(request: Request, env: WorkerEnv, metrics: IMetrics
   };
 
   try {
-    const pmTilesService = new PMTilesService(tigrisStorageRepository, memCacheRepository, metrics, d1Repository);
+    const pmTilesService = new PMTilesService(
+      tigrisStorageRepository,
+      memCacheRepository,
+      metrics,
+      d1Repository,
+      d1Tags,
+    );
 
     switch (params.requestType) {
       case 'tile': {

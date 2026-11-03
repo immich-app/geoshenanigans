@@ -14,7 +14,7 @@ import {
   tigrisEndpoint,
   TigrisStorageRepository,
 } from '../src/repository';
-import { CACHE_REVISION, decodeMetricTags, encodeMetricTags, innerUrl, parseInnerUrl } from '../src/request';
+import { CACHE_REVISION, decodeMetricTags, encodeMetricTags, innerUrl, parseInnerUrl, rayColo } from '../src/request';
 import { EDGE_CACHE, inlineTileSource, StyleJson } from '../src/tiles';
 
 // For now, you'll need to do something like this to get a correctly-typed
@@ -255,6 +255,21 @@ describe('inner URL', () => {
     expect(decodeMetricTags(encodeMetricTags(tags))).toEqual(tags);
     expect(decodeMetricTags(null)).toEqual({});
     expect(decodeMetricTags('%E0')).toEqual({});
+  });
+});
+
+describe('rayColo', () => {
+  it.each`
+    ray                        | colo
+    ${'a5475c6a794d555a-FRA'}  | ${'FRA'}
+    ${'a5475c6d9f024c0b-ARN'}  | ${'ARN'}
+    ${'a5475c6a794d555a'}      | ${''}
+    ${'a5475c6a794d555a-fra'}  | ${''}
+    ${'a5475c6a794d555a-FRA2'} | ${''}
+    ${''}                      | ${''}
+    ${null}                    | ${''}
+  `('reads colo "$colo" from Cf-Ray $ray', ({ ray, colo }) => {
+    expect(rayColo(ray)).toBe(colo);
   });
 });
 
@@ -1019,6 +1034,27 @@ describe('Tiles', () => {
     );
     await response.body?.cancel();
     expect(metrics('tiles_tile_request')).toEqual([{ ...tags, url: 'versioned', z: '0', version: '1' }]);
+  });
+
+  it('tags its D1 metrics with the colo it runs in, from the Cf-Ray of the request it got', async () => {
+    globalThis.memCache = new Map();
+    mockStorage();
+    mockStyle();
+    const metrics = captureMetrics();
+    for (const url of ['/v1/0/0/0.mvt', '/v1/style/light']) {
+      const response = await exports.Tiles.fetch(
+        tilesRequest(url, { 'Cf-Ray': 'a5475c6a794d555a-FRA', 'X-Metric-Tags': encodeMetricTags({ colo: 'ARN' }) }),
+      );
+      await response.body?.cancel();
+    }
+    const colos = (name: string) => metrics(name).map(({ colo, tiles_colo }) => ({ colo, tiles_colo }));
+    expect(colos('d1_query')).toEqual([
+      { colo: 'ARN', tiles_colo: 'FRA' },
+      { colo: 'ARN', tiles_colo: 'FRA' },
+    ]);
+    expect(colos('tiles_d1_lookup')).toEqual([{ colo: 'ARN', tiles_colo: 'FRA' }]);
+    // Only D1's: the others would multiply their series by the upper tiers for little.
+    expect(colos('tiles_tile_request')).toEqual([{ colo: 'ARN', tiles_colo: undefined }]);
   });
 
   it('has a purge method for the gateway', async () => {

@@ -21,6 +21,8 @@ export class CloudflareD1Repository implements IDatabaseRepository {
   constructor(
     private database: D1Database,
     private metrics: IMetricsRepository,
+    // Added to each query's d1_query metric.
+    private tags: { [key: string]: string } = {},
   ) {}
 
   async query(query: string, ...values: unknown[]) {
@@ -38,7 +40,8 @@ export class CloudflareD1Repository implements IDatabaseRepository {
       .addTag('served_by_primary', String(resp.meta.served_by_primary))
       .intField('rows_read', resp.meta.rows_read)
       .intField('sql_duration', resp.meta.duration)
-      .intField('count', 1);
+      .intField('count', 1)
+      .addTags(this.tags);
     this.metrics.push(metric);
 
     return resp;

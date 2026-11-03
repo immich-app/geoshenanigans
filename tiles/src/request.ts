@@ -58,6 +58,7 @@ export enum Header {
   ETAG = 'ETag',
   IF_NONE_MATCH = 'If-None-Match',
   ACCEPT_ENCODING = 'Accept-Encoding',
+  CF_RAY = 'Cf-Ray',
   // Set by the gateway on the inner request: the client's continent and the tags for Tiles' metrics, neither of which
   // Tiles can see itself (request.cf is undefined there). Request headers aren't part of the cache key.
   CONTINENT = 'X-Continent',
@@ -131,6 +132,14 @@ export function parseInnerUrl(url: string): { deploymentKey: string; params: PMT
   const inner = new URL(url);
   const [, deploymentKey = '', ...path] = inner.pathname.split('/');
   return { deploymentKey, params: parsePath(new URL(`/${path.join('/')}`, inner.origin)) };
+}
+
+/**
+ * The colo a request reached, from its Cf-Ray header ("<ray ID>-<colo>"), or "" without one. In Tiles, where
+ * request.cf is undefined, the inner request's ray names the colo Tiles runs in.
+ */
+export function rayColo(ray: string | null): string {
+  return /-([A-Z]{3})$/.exec(ray ?? '')?.[1] ?? '';
 }
 
 /** Metric tags travel to Tiles as URI-encoded JSON: header values must be Latin-1, AS names needn't be. */
