@@ -260,45 +260,13 @@ async fn polygons_geojson(
         return resp;
     }
 
-    let lat = params.lat;
-    let lng = params.lon;
-    let point = AdminPoint::new(lat, lng);
-
-    let mut features: Vec<serde_json::Value> = Vec::new();
-
-    // Iterate every loaded continent whose bbox covers the query.
-    // For boundary points (Russia/Türkiye/Egypt) two continents may
-    // contribute — feature IDs are local to each Index, so we dedupe
-    // per-Index using `seen`.
-    for idx in index.loaded_matches(lat, lng) {
-        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-
-        let cell = cell_id_at_level(lat, lng, idx.admin_cell_level);
-        let neighbors = cell_neighbors_at_level(cell, idx.admin_cell_level);
-
-        let mut hits: Vec<u32> = Vec::new();
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Index::for_each_entry_fb(&idx.admin_entries, Index::lookup_admin_cell_fb(&idx.admin_cells, c), |id| {
-                let poly_id = id & ID_MASK;
-                if seen.insert(poly_id) { hits.push(poly_id); }
-            });
-        }
-        for poly_id in hits {
-            let Some(poly) = idx.admin_polygon(poly_id) else { continue; };
-            if !idx.admin_geometry.contains_once(&poly, point) { continue; }
-            let rings = idx.admin_geometry.rings(&poly);
-            features.push(serde_json::json!({
-                "type": "Feature",
-                "geometry": { "type": "Polygon", "coordinates": rings },
-                "properties": {
-                    "name": idx.get_string(poly.name_id),
-                    "admin_level": poly.admin_level,
-                    "area": poly.area,
-                    "kind": "admin",
-                }
-            }));
-        }
-    }
+    // Every loaded continent whose bbox covers the query: at a border
+    // (Russia/Türkiye/Egypt) two may, each listing its own polygons.
+    let features: Vec<serde_json::Value> = index
+        .loaded_matches(params.lat, params.lon)
+        .iter()
+        .flat_map(|idx| idx.polygon_features(params.lat, params.lon))
+        .collect();
 
     let fc = serde_json::json!({
         "type": "FeatureCollection",

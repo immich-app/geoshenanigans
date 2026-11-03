@@ -300,6 +300,11 @@ const PIP_LAT_BOUND_SLACK_DEG: f32 = 1e-3;
 /// the point differ by at least 2^-124, a normal f32; closer to 0 the latitude test is skipped.
 const PIP_LAT_BOUND_MIN_ABS_LNG: f32 = f32::from_bits(27 << 23);
 
+/// The admin level of a postcode area's record (boundary=postal_code).
+pub const POSTCODE_AREA_LEVEL: u8 = 11;
+/// The admin level `/polygons` gives a postcode area, the one the test portal colours as postal.
+pub const POLYGONS_POSTAL_LEVEL: u8 = 99;
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AdminPolygon {
@@ -1865,6 +1870,42 @@ impl Index {
         })
     }
 
+    /// The polygons holding (lat, lng) as `/polygons` lists them, GeoJSON features: each polygon
+    /// the admin cells round the point list, once, a postcode area as kind "postal" at
+    /// POLYGONS_POSTAL_LEVEL and any other as kind "admin" at its own level.
+    pub fn polygon_features(&self, lat: f64, lng: f64) -> Vec<serde_json::Value> {
+        let point = AdminPoint::new(lat, lng);
+        let (lat, lng) = point.degrees();
+        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
+        let (mut seen, mut hits) = (std::collections::HashSet::new(), Vec::new());
+        for c in std::iter::once(cell).chain(cell_neighbors_at_level(cell, self.admin_cell_level)) {
+            Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
+                if seen.insert(id & ID_MASK) { hits.push(id & ID_MASK); }
+            });
+        }
+        hits.into_iter()
+            .filter_map(|id| self.admin_polygon(id))
+            .filter(|poly| self.admin_geometry.contains_once(poly, point))
+            .map(|poly| {
+                let (kind, admin_level) = if poly.admin_level == POSTCODE_AREA_LEVEL {
+                    ("postal", POLYGONS_POSTAL_LEVEL)
+                } else {
+                    ("admin", poly.admin_level)
+                };
+                serde_json::json!({
+                    "type": "Feature",
+                    "geometry": { "type": "Polygon", "coordinates": self.admin_geometry.rings(&poly) },
+                    "properties": {
+                        "name": self.get_string(poly.name_id),
+                        "admin_level": admin_level,
+                        "area": poly.area,
+                        "kind": kind,
+                    }
+                })
+            })
+            .collect()
+    }
+
     pub fn find_admin(&self, lat: f64, lng: f64) -> AdminResult<'_> {
         self.find_admin_in(&mut AdminScan::new(self, lat, lng))
     }
@@ -2005,7 +2046,7 @@ impl Index {
         let mut ranked: Vec<RankedPoly> = Vec::new();
         for level in 0..12 {
             if let Some((_, _, poly, _)) = best_by_level[level] {
-                if poly.admin_level == 11 { continue; } // postal code, handled separately
+                if poly.admin_level == POSTCODE_AREA_LEVEL { continue; } // handled separately
 
                 let initial_rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
                 if initial_rank == 0 && poly.place_type_override == 0 { continue; }
@@ -2623,7 +2664,7 @@ impl Index {
         let mut ranked: Vec<RankedPoly> = Vec::new();
         for &pid in &chain_ids {
             let Some(poly) = self.admin_polygon(pid) else { continue; };
-            if poly.admin_level == 11 { continue; } // postal
+            if poly.admin_level == POSTCODE_AREA_LEVEL { continue; }
             // ISO-less level-2 polygons (maritime boundary closed ways)
             // can never name a country — see find_admin.
             if poly.admin_level == 2 && poly.country_code == 0 { continue; }
@@ -2721,9 +2762,9 @@ impl Index {
     //
     // No query-time PIP on postal boundaries — Nominatim's postcode field
     // comes straight from placex.postcode, which is populated via triggers
-    // at index time. `postal_polygons.bin` is consumed at BUILD time only
-    // (for way_postcodes.bin / PoiRecord.parent_postcode_id inheritance);
-    // it is not consulted here.
+    // at index time. The postcode areas (the level-11 admin polygons) are
+    // consumed at BUILD time only (for way_postcodes.bin /
+    // PoiRecord.parent_postcode_id inheritance); they are not consulted here.
     /// Read one u32 from a per-record sidecar file (addr_postcodes /
     /// way_postcodes / interp_postcodes: u32 per record, NO_DATA = absent).
     fn sidecar_u32(f: &FileBytes, idx: u64) -> Option<u32> {
@@ -6886,6 +6927,46 @@ mod query_path_tests {
         // The first two are the origin's own point once S2 wraps them onto the globe.
         for (lat, lng) in [(lat, lng + 360.0), (180.0 - lat, lng - 180.0), (f64::NAN, lng), (lat, f64::INFINITY), (90.5, lng), (lat, -180.5)] {
             assert_eq!(world.query_json(lat, lng), "{}", "({}, {})", lat, lng);
+        }
+    }
+
+    #[test]
+    fn polygons_list_a_postcode_area_once_as_postal_at_level_99() {
+        let index = TestIndex::new()
+            .boundary("1010", POSTCODE_AREA_LEVEL, 0, (-15_000.0, -15_000.0, 15_000.0, 15_000.0))
+            .boundary("Town", 8, 0, (-2000.0, -2000.0, 2000.0, 2000.0))
+            .load();
+        // Testland is polygon 0, the postcode area the next.
+        let postcode_area = 1;
+        let p = at(0.0, 0.0);
+        let (lat, lng) = (p.lat as f64, p.lng as f64);
+        let cell = cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL);
+        let cells_listing_it = std::iter::once(cell)
+            .chain(cell_neighbors_at_level(cell, DEFAULT_ADMIN_CELL_LEVEL))
+            .filter(|&c| {
+                let mut listed = false;
+                Index::for_each_entry_fb(&index.admin_entries, Index::lookup_admin_cell_fb(&index.admin_cells, c), |id| {
+                    listed |= (id & ID_MASK) == postcode_area
+                });
+                listed
+            })
+            .count();
+        assert!(cells_listing_it > 1, "{cells_listing_it}");
+
+        let features = index.polygon_features(lat, lng);
+
+        let mut listed: Vec<(&str, &str, u64)> = features
+            .iter()
+            .map(|f| {
+                let p = &f["properties"];
+                (p["name"].as_str().unwrap(), p["kind"].as_str().unwrap(), p["admin_level"].as_u64().unwrap())
+            })
+            .collect();
+        listed.sort();
+        assert_eq!(listed, [("1010", "postal", 99), ("Testland", "admin", 2), ("Town", "admin", 8)]);
+        for f in &features {
+            let rings = f["geometry"]["coordinates"].as_array().unwrap();
+            assert_eq!((rings.len(), rings[0].as_array().unwrap().len()), (1, 5), "{}", f["properties"]["name"]);
         }
     }
 
