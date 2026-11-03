@@ -1259,15 +1259,39 @@ TEST(the_encoding_aborts_on_a_ring_whose_refs_dont_chain_or_a_ref_without_a_live
     CHECK(refusal_of([&] { encode_admin_arcs(arcs, m.store, 2); }).find("full refs don't chain") != std::string::npos);
 }
 
+namespace {
+
+// An 8 x 8 lattice of cells, every other one in the minimal set, and the
+// lattice whole, minimal too, whose ring of 28 refs is cut into chunks; the
+// planet holds a triangle more on `with_triangle` days.
+MixedStore cells_and_whole(bool with_triangle) {
+    const Lattice lattice(8, 8, 3, 93, 10000);
+    std::vector<Polygon> polygons;
+    MixedStore m;
+    for (int r = 0; r < 8; r++)
+        for (int c = 0; c < 8; c++) {
+            polygons.push_back({lattice.block(r, c, 1, 1), {}});
+            m.in_minimal.push_back((r + c) % 2 == 0);
+        }
+    polygons.push_back({lattice.block(0, 0, 8, 8), {}});
+    m.in_minimal.push_back(true);
+    if (with_triangle) {
+        polygons.push_back({closed({pt(-50000, -50000), pt(-50000, -40000), pt(-40000, -45000)}), {}});
+        m.in_minimal.push_back(true);
+    }
+    m.store = store_of(polygons);
+    return m;
+}
+
+}  // namespace
+
 TEST(a_continents_arc_and_ring_blocks_are_the_planets_in_its_own_slots) {
     using gc::id_alloc::IdAllocator;
     const ScratchDir prev("admin-arc-continent");
-    const MixedStore m = mixed_store();
+    const MixedStore m = cells_and_whole(false);
     // A planet whose slots aren't its presentation order: the day before
     // held a polygon more.
-    MixedStore before = mixed_store();
-    before.store.append(closed({pt(-50000, -50000), pt(-50000, -40000), pt(-40000, -45000)}), {});
-    before.in_minimal.push_back(true);
+    const MixedStore before = cells_and_whole(true);
     const AdminArcs yesterday = build_admin_arcs(before.store, before.in_minimal, "", 1);
     for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
         const std::string sidecar = arc_sidecar_path(prev.path() + "/planet", set);
@@ -1278,8 +1302,11 @@ TEST(a_continents_arc_and_ring_blocks_are_the_planets_in_its_own_slots) {
     const AdminArcBlocks planet = encode_admin_arcs(arcs, m.store, 2);
     CHECK(arcs.slot_counts.tombstones > 0);
 
-    // The lattice's lower two rows, the hole's filling and the spike.
-    const std::vector<uint32_t> polygons = {0, 1, 2, 3, 4, 5, 6, 7, 16, 18};
+    // The lattice's lower half and the whole: its chunk cuts hash the
+    // planet's slots, which aren't the continent's.
+    std::vector<uint32_t> polygons;
+    for (uint32_t k = 0; k < 32; k++) polygons.push_back(k);
+    polygons.push_back(64);
     auto continent = [&](const std::vector<uint32_t>& ids, const std::string& prev_dir) {
         AdminArcBlocks c = subset_admin_arcs(planet, ids, 2);
         assign_region_arc_slots(c, prev_dir, "test", 3);
@@ -1320,6 +1347,7 @@ TEST(a_continents_arc_and_ring_blocks_are_the_planets_in_its_own_slots) {
             std::vector<arc_blocks::RingChunk> x, y;
             REQUIRE(arc_blocks::decode_ring_block(ps.ring_blocks.data() + a.offset, a.size, x));
             REQUIRE(arc_blocks::decode_ring_block(cs.ring_blocks.data() + b.offset, b.size, y));
+            if (polygons[k] == 64) CHECK(x.size() >= 3);
             REQUIRE(x.size() == y.size());
             for (size_t j = 0; j < x.size(); j++) {
                 CHECK(x[j].has_box == y[j].has_box && x[j].box == y[j].box && x[j].last_in_ring == y[j].last_in_ring);
@@ -1331,14 +1359,15 @@ TEST(a_continents_arc_and_ring_blocks_are_the_planets_in_its_own_slots) {
             }
         }
     }
-    // Chained, without the spike: every arc it keeps keeps its slot, the
-    // spike's become tombstones.
+    // Chained, without the whole: every arc it keeps keeps its slot, those
+    // of the upper half's rim become tombstones.
     for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
         const std::string sidecar = arc_sidecar_path(prev.path() + "/test", set);
         std::filesystem::create_directories(std::filesystem::path(sidecar).parent_path());
         IdAllocator::write_sidecar(sidecar, c.set(set).sidecar);
     }
-    const AdminArcBlocks next = continent({0, 1, 2, 3, 4, 5, 6, 7, 16}, prev.path() + "/test");
+    polygons.pop_back();
+    const AdminArcBlocks next = continent(polygons, prev.path() + "/test");
     for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
         const ArcSetBlocks &one = c.set(set), &two = next.set(set);
         std::map<uint64_t, uint32_t> slot_of;
