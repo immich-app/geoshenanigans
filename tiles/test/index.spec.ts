@@ -167,9 +167,9 @@ describe('cachePolicy', () => {
     url                           | cacheControl                                               | etag
     ${'/v1/1/2/3.mvt'}            | ${'public, max-age=86400, stale-while-revalidate=2592000'} | ${'"20261102"'}
     ${'/v1/1/2/3.mvt?v=20261102'} | ${'public, max-age=31536000, immutable'}                   | ${undefined}
-    ${'/v1/1/2/3.mvt?v=20250818'} | ${'public, max-age=3600'}                                  | ${undefined}
-    ${'/v1.json'}                 | ${'public, max-age=3600'}                                  | ${'"20261102"'}
-    ${'/v1/style/dark.json'}      | ${'public, max-age=3600'}                                  | ${'"20261102"'}
+    ${'/v1/1/2/3.mvt?v=20250818'} | ${'public, max-age=300'}                                   | ${undefined}
+    ${'/v1.json'}                 | ${'public, max-age=300'}                                   | ${'"20261102"'}
+    ${'/v1/style/dark.json'}      | ${'public, max-age=300'}                                   | ${'"20261102"'}
     ${'/v1/nonsense'}             | ${'public, max-age=2678400'}                               | ${undefined}
   `('$url gets $cacheControl', ({ url, cacheControl, etag }) => {
     expect(policy(url)).toStrictEqual(etag ? { cacheControl, etag } : { cacheControl });
@@ -229,10 +229,51 @@ describe('conditional requests', () => {
     );
     const response = await fetchWith(url);
     expect(response.status).toBe(200);
-    expect(response.headers.get('Cache-Control')).toBe('public, max-age=3600');
+    expect(response.headers.get('Cache-Control')).toBe('public, max-age=300');
     expect(((await response.json()) as { tiles: string[] }).tiles).toEqual([
       `https://tiles.example/v1/{z}/{x}/{y}.mvt?v=${key}`,
     ]);
+  });
+
+  it("gives CDN hits the current policy's cache headers", async () => {
+    const url = 'https://tiles.example/v1/style/light.json?case=headers';
+    await caches.default.put(
+      url,
+      new Response('{}', {
+        headers: {
+          'PMTiles-Deployment-Key': key,
+          'Tiles-Cache-Revision': '2',
+          'Cache-Control': 'public, max-age=14400',
+          'Access-Control-Allow-Origin': '*',
+        },
+      }),
+    );
+    const response = await fetchWith(url);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('Cache-Control')).toBe('public, max-age=300');
+    expect(response.headers.get('ETag')).toBe(etag);
+    expect(await response.text()).toBe('{}');
+  });
+
+  it('drops a stored ETag from a versioned tile served from the CDN', async () => {
+    const url = `https://tiles.example/v1/1/2/3.mvt?v=${key}`;
+    await caches.default.put(
+      url,
+      new Response('tile', {
+        headers: {
+          'PMTiles-Deployment-Key': key,
+          'Tiles-Cache-Revision': '2',
+          'Cache-Control': 'public, max-age=86400',
+          'Access-Control-Allow-Origin': '*',
+          ETag: etag,
+        },
+      }),
+    );
+    const response = await fetchWith(url);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('Cache-Control')).toBe('public, max-age=31536000, immutable');
+    expect(response.headers.has('ETag')).toBe(false);
+    expect(await response.text()).toBe('tile');
   });
 
   it('answers 304 from a CDN hit the client already has', async () => {
@@ -259,7 +300,7 @@ describe('conditional requests', () => {
   it('answers 304 once a fresh response turns out to be what the client has', async () => {
     const response = await fetchWith('https://tiles.example/v1.json?case=fresh', { 'If-None-Match': etag });
     expect(response.status).toBe(304);
-    expect(response.headers.get('Cache-Control')).toBe('public, max-age=3600');
+    expect(response.headers.get('Cache-Control')).toBe('public, max-age=300');
   });
 
   it.each`

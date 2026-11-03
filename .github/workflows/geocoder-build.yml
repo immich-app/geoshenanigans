@@ -331,28 +331,34 @@ jobs:
           # Small and independent of the PBF, so they come down beside it
           # (~2 min one after another, against ~3 for the PBF).
           (
-          # Download wikidata sitelinks (if available). curl gets explicit
-          # timeouts so a stalled connection can't hang the workflow.
-          # --connect-timeout caps DNS+TCP handshake, --max-time caps the
-          # whole transfer. Both fall through to "skip" via `|| true`.
+          # Download wikidata sitelinks. They rank POIs by their Wikidata
+          # item's sitelinks; a build without them silently falls back to
+          # tag-only importance, so a missing, empty or short file fails the
+          # step, as TIGER's does below. curl gets explicit timeouts so a
+          # stalled connection can't hang the workflow: --connect-timeout
+          # caps DNS+TCP handshake, --max-time caps the whole transfer.
           echo "[wikidata] Checking for sitelinks data..."
           WIKIDATA_LATEST=$(curl -sL --fail --connect-timeout 30 --max-time 60 "$S3_PUBLIC_URL/geocoder/wikidata/latest.json" 2>/dev/null || echo '{}')
           WD_DATE=$(echo "$WIKIDATA_LATEST" | jq -r '.dump_date // ""' 2>/dev/null || echo "")
-          if [ -n "$WD_DATE" ]; then
-            echo "[wikidata] Found sitelinks from $WD_DATE, downloading..."
-            curl -sL --connect-timeout 30 --max-time 600 -o "$WORKDIR/qid_sitelinks.bin" \
-              "$S3_PUBLIC_URL/geocoder/wikidata/$WD_DATE/qid_sitelinks.bin" || true
-            if [ -f "$WORKDIR/qid_sitelinks.bin" ] && [ "$(stat -c%s "$WORKDIR/qid_sitelinks.bin")" -gt 1000 ]; then
-              echo "[wikidata] Downloaded: $(( $(stat -c%s "$WORKDIR/qid_sitelinks.bin") / 6 )) entries"
-              echo "wikidata_sitelinks=$WORKDIR/qid_sitelinks.bin" >> "$GITHUB_OUTPUT"
-              echo "wikidata_date=$WD_DATE" >> "$GITHUB_OUTPUT"
-            else
-              echo "[wikidata] Download failed or empty, skipping"
-              rm -f "$WORKDIR/qid_sitelinks.bin"
-            fi
-          else
-            echo "[wikidata] No sitelinks data available"
+          WD_SIZE=$(echo "$WIKIDATA_LATEST" | jq -r '.size_bytes // 0' 2>/dev/null || echo 0)
+          # The extraction's own key (Update Wikidata Sitelinks never
+          # overwrites a file a latest.json has named).
+          WD_PATH=$(echo "$WIKIDATA_LATEST" | jq -r '.path // ""' 2>/dev/null || echo "")
+          if ! [[ "$WD_DATE" =~ ^[0-9]{8}$ && "$WD_PATH" =~ ^wikidata/${WD_DATE}/[0-9]+-[0-9]+/qid_sitelinks\.bin$ ]]; then
+            echo "::error::[wikidata] No sitelinks file named by $S3_PUBLIC_URL/geocoder/wikidata/latest.json (dump '$WD_DATE', path '$WD_PATH') — refusing to build a planet index without POI sitelink counts; rerun Update Wikidata Sitelinks"
+            exit 1
           fi
+          echo "[wikidata] Found sitelinks from $WD_DATE ($WD_SIZE bytes), downloading..."
+          curl -sL --fail --connect-timeout 30 --max-time 600 -o "$WORKDIR/qid_sitelinks.bin" \
+            "$S3_PUBLIC_URL/geocoder/$WD_PATH" || true
+          WD_GOT=$(stat -c%s "$WORKDIR/qid_sitelinks.bin" 2>/dev/null || echo 0)
+          if [ "$WD_GOT" -le 1000 ] || [ "$WD_GOT" != "$WD_SIZE" ]; then
+            echo "::error::[wikidata] Sitelinks for dump $WD_DATE (named by wikidata/latest.json) missing or empty: got $WD_GOT bytes, latest.json says $WD_SIZE — refusing to build a planet index without POI sitelink counts; rerun Update Wikidata Sitelinks"
+            exit 1
+          fi
+          echo "[wikidata] Downloaded: $((WD_GOT / 6)) entries"
+          echo "wikidata_sitelinks=$WORKDIR/qid_sitelinks.bin" >> "$GITHUB_OUTPUT"
+          echo "wikidata_date=$WD_DATE" >> "$GITHUB_OUTPUT"
 
           # Download external postcode centroids. Nominatim supplements OSM
           # postcodes with external data for GB (Code-Point Open, which
@@ -475,7 +481,8 @@ jobs:
             echo "pbf_source=mirror" >> "$GITHUB_OUTPUT"
           fi
 
-          # Wait for the sidecars and the small downloads (TIGER fails the step)
+          # Wait for the sidecars and the small downloads (wikidata or TIGER
+          # fails the step)
           if [ "$HAS_PREVIOUS" = "true" ]; then
             echo "Waiting for the sidecar download..."
             wait $IDX_PID
