@@ -1,8 +1,7 @@
-// build-index's arc stage is opt-in: without --arcs-out a build writes what
-// one with it writes into its output dir, file for file and byte for byte,
-// and no arc file anywhere; with it, --arcs-out holds every region's arc
-// dirs, and a chained build of the same data (--prev-output, --prev-arcs)
-// writes them again unchanged.
+// build-index's admin dirs: every region's boundary tiers (with
+// --multi-quality) and both admin-minimal dirs (with --multi-output) hold
+// their admin geometry as arcs, and nothing else does; a chained build of the
+// same data (--prev-output) writes them again unchanged.
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -15,6 +14,7 @@
 #include "scratch_dir.h"
 #include "test_framework.h"
 #include "tool_runs.h"
+#include "types.h"
 
 namespace fs = std::filesystem;
 
@@ -134,24 +134,31 @@ const std::vector<std::string> kRegions = {"planet",        "africa",        "as
                                            "europe",        "north-america", "south-america",
                                            "oceania",       "central-america", "antarctica"};
 
-// What --arcs-out holds for every region, as PR 3 ships it.
-std::set<std::string> arc_dir_layout() {
+// The regions with polygons and place nodes: only these have admin-minimal.
+const std::set<std::string> kRegionsHeld = {"planet", "europe"};
+
+// The admin geometry files of every region's boundary tiers and, where it
+// has place nodes, its admin-minimal dirs.
+std::set<std::string> admin_dir_layout() {
     const std::vector<std::string> client = {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin"};
     std::set<std::string> out;
-    for (const std::string& region : kRegions) {
+    for (const std::string& region : kRegions)
         for (const char* dir : {"quality/simplified", "quality/exact", "admin-minimal", "admin-minimal-poi"})
-            for (const std::string& f : client) out.insert(region + "/" + dir + "/" + f);
-        out.insert(region + "/quality/exact/arc_index.osm_ids");
-        out.insert(region + "/admin-minimal/arc_index.osm_ids");
-        out.insert(region + "/admin-minimal/admin_polygons.osm_ids");
-    }
+            if (kRegionsHeld.count(region) || std::string(dir).rfind("quality/", 0) == 0)
+                for (const std::string& f : client) out.insert(region + "/" + dir + "/" + f);
     return out;
+}
+
+bool admin_geometry(const std::string& name) {
+    const std::string file = fs::path(name).filename().string();
+    return file == "admin_polygons.bin" || file == "admin_rings.bin" || file == "arc_index.bin" ||
+           file == "arc_vertices.bin";
 }
 
 }  // namespace
 
-TEST(build_index_writes_arc_dirs_only_into_arcs_out_and_a_chained_build_writes_them_again) {
-    const ScratchDir root("arc-dirs-opt-in");
+TEST(build_index_writes_every_regions_admin_dirs_as_arcs_and_a_chained_build_writes_them_again) {
+    const ScratchDir root("admin-dirs-build");
     const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
     write_test_pbf(pbf, fixture(), 1000);
     auto build = [&](const std::string& out, std::vector<std::string> extra) {
@@ -160,33 +167,38 @@ TEST(build_index_writes_arc_dirs_only_into_arcs_out_and_a_chained_build_writes_t
         words.insert(words.end(), extra.begin(), extra.end());
         return gctest::run(words, log);
     };
-    const std::string plain = root.path() + "/plain", with = root.path() + "/with", arcs = root.path() + "/arcs";
-    REQUIRE(build(plain, {}));
-    REQUIRE(build(with, {"--arcs-out", arcs}));
+    const std::string first = root.path() + "/first";
+    REQUIRE(build(first, {}));
+    const auto files = tree(first);
 
-    // The output dir: the same files, byte for byte, none of them an arc file.
-    const auto plain_files = tree(plain), with_files = tree(with);
-    CHECK(names_of(plain_files) == names_of(with_files));
-    CHECK(plain_files == with_files);
-    for (const std::string& name : names_of(plain_files)) {
+    // Admin geometry in the four admin dirs of every region and nowhere else:
+    // no quality ladder, no keyhole vertices, no postal files.
+    std::set<std::string> geometry;
+    for (const std::string& name : names_of(files)) {
+        if (admin_geometry(name)) geometry.insert(name);
         const std::string file = fs::path(name).filename().string();
-        CHECK(file != "admin_rings.bin" && file != "arc_index.bin" && file != "arc_vertices.bin" &&
-              file != "arc_index.osm_ids");
+        CHECK(file != "admin_vertices.bin" && file.rfind("postal_", 0) != 0);
+        CHECK(name.find("/quality/q") == std::string::npos && name.find("/quality/uncapped") == std::string::npos);
     }
-    REQUIRE(plain_files.count("planet/quality/uncapped/admin_polygons.bin"));
-
-    // --arcs-out: every region's four dirs and their sidecars, nothing else.
-    const auto arc_files = tree(arcs);
-    CHECK(names_of(arc_files) == arc_dir_layout());
-    auto file = [&](const std::string& region, const std::string& name) { return arc_files.at(region + "/" + name); };
+    CHECK(geometry == admin_dir_layout());
+    // The full set's slot sidecars beside the exact tier, the minimal set's
+    // in admin-minimal/.
+    for (const std::string& region : kRegions) {
+        const bool held = kRegionsHeld.count(region) > 0;
+        CHECK_EQ(files.count(region + "/quality/exact/admin_polygons.osm_ids") > 0, held);
+        CHECK(files.count(region + "/quality/exact/arc_index.osm_ids"));
+        CHECK_EQ(files.count(region + "/admin-minimal/arc_index.osm_ids") > 0, held);
+        CHECK(!files.count(region + "/quality/simplified/admin_polygons.osm_ids"));
+        CHECK(!files.count(region + "/admin-minimal-poi/arc_index.osm_ids"));
+    }
+    auto file = [&](const std::string& region, const std::string& name) { return files.at(region + "/" + name); };
     // The tiers' records and rings are one; the minimal dirs' arcs are one.
     CHECK(file("planet", "quality/simplified/admin_polygons.bin") == file("planet", "quality/exact/admin_polygons.bin"));
     CHECK(file("planet", "quality/simplified/admin_rings.bin") == file("planet", "quality/exact/admin_rings.bin"));
     for (const char* f : {"arc_index.bin", "arc_vertices.bin"})
         CHECK(file("planet", std::string("admin-minimal/") + f) == file("planet", std::string("admin-minimal-poi/") + f));
-    // In the shared slots, one 24 B record each.
-    CHECK_EQ(file("planet", "quality/exact/admin_polygons.bin").size(),
-             plain_files.at("planet/quality/uncapped/admin_polygons.bin").size());
+    // In the shared slots, one 24 B record each: the seven boundaries.
+    CHECK_EQ(file("planet", "quality/exact/admin_polygons.bin").size(), 7 * sizeof(AdminPolygon));
     CHECK(file("planet", "quality/exact/arc_vertices.bin").size() > file("planet", "quality/simplified/arc_vertices.bin").size());
     CHECK(!file("planet", "admin-minimal/admin_rings.bin").empty());
     // Every polygon is in Europe, whose arcs are then the planet's in the
@@ -197,8 +209,30 @@ TEST(build_index_writes_arc_dirs_only_into_arcs_out_and_a_chained_build_writes_t
     CHECK(file("asia", "quality/exact/arc_vertices.bin").empty());
     CHECK(file("asia", "quality/exact/admin_polygons.bin").empty());
 
-    // The same data again on top of that build: the same arc dirs.
-    const std::string again = root.path() + "/again", arcs_again = root.path() + "/arcs-again";
-    REQUIRE(build(again, {"--prev-output", with, "--arcs-out", arcs_again, "--prev-arcs", arcs}));
-    CHECK(tree(arcs_again) == arc_files);
+    // The same data again on top of that build: the same files.
+    const std::string again = root.path() + "/again";
+    REQUIRE(build(again, {"--prev-output", first}));
+    CHECK(tree(again) == files);
+}
+
+TEST(multi_quality_takes_no_scale_list_and_without_it_no_boundary_tier_is_written) {
+    const ScratchDir root("admin-dirs-flags");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    write_test_pbf(pbf, fixture(), 1000);
+    CHECK(!gctest::run({GEOCODER_BUILD_INDEX_BIN, root.path() + "/scales", pbf, "--multi-output", "--multi-quality",
+                        "0,0.5,2.5"},
+                       log));
+    CHECK(bytes_of(log).size() > 0);
+    const std::vector<char> refusal = bytes_of(log);
+    CHECK(std::string(refusal.begin(), refusal.end()).find("--multi-quality takes no scale list") != std::string::npos);
+
+    const std::string out = root.path() + "/no-tiers";
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf, "--multi-output"}, log));
+    const auto files = tree(out);
+    for (const std::string& name : names_of(files)) CHECK(name.find("/quality/") == std::string::npos);
+    // admin-minimal still holds its arcs.
+    for (const char* dir : {"admin-minimal", "admin-minimal-poi"})
+        for (const char* f : {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin"})
+            CHECK(files.count(std::string("planet/") + dir + "/" + f));
+    CHECK(!files.at("planet/admin-minimal/arc_vertices.bin").empty());
 }

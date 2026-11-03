@@ -181,10 +181,9 @@ std::vector<std::pair<S2CellId, bool>> cover_polygon(
     options.set_max_level(kAdminCellLevel);
     options.set_max_cells(MAX_S2_CELLS_PER_POLY);
 
-    // The cells are the outer loop's, holes and all: every quality variant
-    // and admin-minimal read this one index but simplify each hole their own
-    // way, so a hole's edge can give way to the polygon up to a tolerance
-    // inside the hole. Only the interior flags leave the holes out.
+    // The cells are the outer loop's, holes and all: a hole's simplified
+    // edge can give way to the polygon up to a tolerance inside the hole.
+    // Only the interior flags leave the holes out.
     S2RegionCoverer coverer(options);
     S2CellUnion covering = coverer.GetCovering(polygon);
     S2CellUnion interior = coverer.GetInteriorCovering(holed ? *holed : polygon);
@@ -291,20 +290,11 @@ void add_admin_polygon(ParsedData& data,
     auto vertices = ring;
     canonicalize_ring_rotation(vertices);
 
-    auto simplified = simplify_admin_polygon(unpack_ring(vertices), admin_level);
-    if (simplified.size() < 3) return;
+    if (simplify_admin_polygon(unpack_ring(vertices), admin_level).size() < 3) return;
 
     uint32_t poly_id = static_cast<uint32_t>(data.admin_polygons.size());
-    uint32_t vertex_offset = static_cast<uint32_t>(data.admin_vertices.size());
-
-    for (const auto& [lat, lng] : simplified) {
-        data.admin_vertices.push_back({static_cast<float>(lat), static_cast<float>(lng)});
-    }
-
     AdminPolygon poly;
     memset(&poly, 0, sizeof(poly)); // zero ALL bytes including padding
-    poly.vertex_offset = vertex_offset;
-    poly.vertex_count = static_cast<uint32_t>(simplified.size());
     poly.name_id = data.string_pool.intern(name);
     poly.admin_level = admin_level;
     poly.place_type_override = place_type_override;

@@ -14,6 +14,7 @@
 
 #include "parallel.h"
 #include "parsed_data.h"
+#include "strategy2_remap.h"
 #include "types.h"
 
 struct QidSitelinks { uint32_t qid; uint16_t count; };
@@ -605,63 +606,70 @@ inline void reorder_interps(ParsedData& data, unsigned threads = 0) {
               << " (" << (n - kept) << " duplicates removed)" << std::endl;
 }
 
-// Moves admin polygon order[i] to slot i, with its vertices repacked in the
-// new order (into vertex_buffer, when made beside earlier work as repack
-// takes it) and its osm id, exact rings and arc rings in lockstep; returns
-// old_to_new.
-// References to polygons elsewhere are the caller's to remap.
+// Moves admin polygon order[i] to slot i, with its osm id, exact rings, arc
+// rings and admin cell entries in lockstep; returns old_to_new.
+// Other references to polygons are the caller's to remap.
 inline std::vector<uint32_t> permute_admin_polygons(ParsedData& data, const std::vector<uint32_t>& order,
-                                                    unsigned threads, std::vector<NodeCoord> vertex_buffer = {}) {
+                                                    unsigned threads) {
     const size_t n = order.size();
-    const auto& polys = data.admin_polygons;
     auto& arc_polygons = data.admin_arcs.polygons;
     if (!arc_polygons.empty() && arc_polygons.size() != n)
         throw std::logic_error("admin arc polygons out of step with the polygons");
     std::vector<uint32_t> old_to_new = invert(order, threads);
-    Repacked<NodeCoord> repacked = repack(n, data.admin_vertices,
-        [&](size_t i) { return size_t(polys[order[i]].vertex_count); },
-        [&](size_t i) { return polys[order[i]].vertex_offset; }, threads, {}, std::move(vertex_buffer));
-    std::vector<AdminPolygon> new_polys = gather(polys, order, threads);
-    parallel_for(n, [&](size_t b, size_t e, unsigned) {
-        for (size_t i = b; i < e; i++) new_polys[i].vertex_offset = static_cast<uint32_t>(repacked.at[i]);
-    }, threads);
+    data.admin_polygons = gather(data.admin_polygons, order, threads);
     if (data.admin_osm_ids.size() == n) data.admin_osm_ids = gather(data.admin_osm_ids, order, threads);
     auto& exact = data.admin_exact_rings.polygons;
     if (exact.size() == n) exact = gather(exact, order, threads);
     if (!arc_polygons.empty()) arc_polygons = gather(arc_polygons, order, threads);
-    data.admin_polygons = std::move(new_polys);
-    data.admin_vertices.swap(repacked.items);
-    free_beside(std::move(repacked.items));
+    for (std::vector<CellItemPair>* cells :
+         {&data.admin_index_cells, &data.admin_minimal_index_cells, &data.admin_country_cells})
+        remap_cell_pairs(*cells, [&](uint32_t& id) {
+            const uint32_t masked = id & ID_MASK;
+            if (masked < n) id = old_to_new[masked] | (id & INTERIOR_FLAG);
+        });
     return old_to_new;
 }
 
-// Sorts admin polygons by (name, level, country, vertex_count) and reorders
-// their vertices.
+// The exact rings' smallest vertex of each polygon's outer ring by
+// vertex_key (none for a polygon without rings): the same whatever the
+// ring's rotation or direction.
+inline std::vector<uint64_t> exact_outer_least_vertices(const AdminExactRings& exact, unsigned threads) {
+    std::vector<uint64_t> least(exact.polygons.size(), UINT64_MAX);
+    parallel_for(exact.polygons.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t p = b; p < e; p++) {
+            if (exact.polygons[p].ring_count == 0) continue;
+            const RingSpan& outer = exact.rings_of(static_cast<uint32_t>(p))[0];
+            for (uint32_t v = 0; v < outer.count; v++)
+                least[p] = std::min(least[p], vertex_key(exact.vertices[outer.begin + v]));
+        }
+    }, threads);
+    return least;
+}
+
+// Sorts admin polygons by (name, level, country, their exact rings' vertex
+// occurrences, the smallest vertex of their exact outer ring, osm id): none
+// of which hangs on a ring's rotation or direction, or on slots.
 inline void reorder_admin_polygons(ParsedData& data, unsigned threads = 0) {
     if (data.admin_polygons.empty()) return;
 
     const size_t n = data.admin_polygons.size();
     const auto& polys = data.admin_polygons;
-    const auto& vertices = data.admin_vertices;
+    const AdminExactRings& exact = data.admin_exact_rings;
+    if (exact.polygons.size() != n) throw std::logic_error("admin exact rings out of step with the polygons");
     const bool have_osm = data.admin_osm_ids.size() == n;
+    std::vector<uint64_t> occurrences(n);
+    parallel_for(n, [&](size_t b, size_t e, unsigned) {
+        for (size_t p = b; p < e; p++) occurrences[p] = exact.occurrences(static_cast<uint32_t>(p));
+    }, threads);
+    const std::vector<uint64_t> least = exact_outer_least_vertices(exact, threads);
     auto admin_less = [&](uint32_t a, uint32_t b) {
         const auto& pa = polys[a];
         const auto& pb = polys[b];
         if (pa.name_id != pb.name_id) return pa.name_id < pb.name_id;
         if (pa.admin_level != pb.admin_level) return pa.admin_level < pb.admin_level;
         if (pa.country_code != pb.country_code) return pa.country_code < pb.country_code;
-        if (pa.vertex_count != pb.vertex_count) return pa.vertex_count < pb.vertex_count;
-        // Compare first few vertices for tiebreaking
-        uint32_t nc = std::min(pa.vertex_count, pb.vertex_count);
-        nc = std::min(nc, 20u); // limit comparison depth
-        for (uint32_t j = 0; j < nc; j++) {
-            uint32_t la = float_bits(vertices[pa.vertex_offset + j].lat);
-            uint32_t lb = float_bits(vertices[pb.vertex_offset + j].lat);
-            if (la != lb) return la < lb;
-            uint32_t ga = float_bits(vertices[pa.vertex_offset + j].lng);
-            uint32_t gb = float_bits(vertices[pb.vertex_offset + j].lng);
-            if (ga != gb) return ga < gb;
-        }
+        if (occurrences[a] != occurrences[b]) return occurrences[a] < occurrences[b];
+        if (least[a] != least[b]) return least[a] < least[b];
         if (have_osm) return data.admin_osm_ids[a] < data.admin_osm_ids[b];
         return false;
     };
@@ -700,17 +708,6 @@ inline void reorder_admin_polygons(ParsedData& data, unsigned threads = 0) {
     remap_each(data.way_parent_ids.size(), [&](size_t i) {
         uint32_t& pid = data.way_parent_ids[i];
         if (pid != NO_DATA && pid < n) pid = old_to_new[pid];
-    });
-    // Remap admin cell entries
-    const auto cells = cell_lists(data.cell_to_admin, threads);
-    remap_each(cells.size(), [&](size_t c) {
-        auto& ids = *cells[c].second;
-        for (auto& id : ids) {
-            uint32_t flags = id & INTERIOR_FLAG;
-            uint32_t masked = id & ID_MASK;
-            if (masked < n) id = old_to_new[masked] | flags;
-        }
-        std::sort(ids.begin(), ids.end());
     });
     std::cerr << "  Admin polygons sorted: " << n << std::endl;
 }

@@ -994,3 +994,17 @@ void tier_vertices(const AdminArcs& arcs, const AdminExactRings& store, const Ar
     std::vector<PackedLocation> raw;
     tier_vertices(arcs, store, tier, state, arc, raw, out);
 }
+
+void tier_ring(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier, const ArcTierState& state,
+               uint32_t ring, std::vector<PackedLocation>& out, std::vector<PackedLocation>& raw,
+               std::vector<StoredVertex>& stored) {
+    const SetArcs set(arcs, store, tier.set);
+    out.clear();
+    for (uint32_t k = set.ring_refs()[ring]; k < set.ring_refs()[ring + 1]; k++) {
+        const ArcRef ref = set.refs()[k];
+        set.read(ref.arc, raw);
+        stored_vertices(raw, state.kept, ref.arc, tier, state.grid_of(ref.arc), stored);
+        const size_t n = stored.size();
+        for (size_t i = out.empty() ? 0 : 1; i < n; i++) out.push_back(stored[ref.reversed ? n - 1 - i : i].at);
+    }
+}

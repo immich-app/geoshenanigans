@@ -174,8 +174,9 @@ AdminRingCells admin_ring_cells(const NodeCoord* verts, uint32_t n, int level, d
     const double sin_reach = std::sin(reach_rad);
 
     // Every cell within reach of an edge. A point the ray cast puts inside is
-    // within ADMIN_COVER_READER_SLACK_DEG of the ring's straight edges or
-    // inside them, and they lie within the chord tolerance of their pieces.
+    // within its own error of the ring's straight edges or inside them (the
+    // reach's part past the chord tolerance), and they lie within the chord
+    // tolerance of their pieces.
     std::vector<uint64_t> boundary;
     S2Point to = point_of(verts[n - 1].lat, verts[n - 1].lng);
     for (uint32_t i = 0, j = n - 1; i < n; j = i++) {

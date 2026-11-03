@@ -1,12 +1,10 @@
 #include "admin_arcs.h"
 
 #include <algorithm>
-#include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 
-#include "output_dir.h"
 #include "parallel.h"
 #include "parsed_data.h"
 
@@ -917,36 +915,4 @@ bool same_closed_ring(const PackedLocation* a, uint32_t a_count, const PackedLoc
         if (forwards || backwards) return true;
     }
     return false;
-}
-
-void require_arc_dirs(const std::string& output_dir, const std::string& arcs_out_dir,
-                      const std::string& prev_arcs_dir, const std::vector<std::string>& regions) {
-    namespace fs = std::filesystem;
-    if (arcs_out_dir.empty()) {
-        if (!prev_arcs_dir.empty())
-            throw std::runtime_error("--prev-arcs " + prev_arcs_dir + " without --arcs-out: only the arc stage reads it");
-        return;
-    }
-    require_new_or_empty_output_dir(arcs_out_dir);
-    auto normal = [](const std::string& dir) {
-        fs::path p = fs::weakly_canonical(fs::absolute(dir));
-        if (p.filename().empty()) p = p.parent_path();
-        return p;
-    };
-    auto within = [](const fs::path& dir, const fs::path& p) {
-        return std::mismatch(dir.begin(), dir.end(), p.begin(), p.end()).first == dir.end();
-    };
-    const fs::path output = normal(output_dir), arcs = normal(arcs_out_dir);
-    if (within(output, arcs) || within(arcs, output))
-        throw std::runtime_error("--arcs-out " + arcs_out_dir + " overlaps the output dir " + output_dir +
-                                 ", which publishes every file under it: keep them apart");
-    if (!prev_arcs_dir.empty())
-        for (const std::string& region : regions)
-            for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
-                const std::string sidecar = arc_sidecar_path(prev_arcs_dir + "/" + region, set);
-                std::error_code ec;
-                if (!fs::is_regular_file(sidecar, ec))
-                    throw std::runtime_error("--prev-arcs " + prev_arcs_dir + " holds no " + region + " arc sidecar " +
-                                             sidecar);
-            }
 }

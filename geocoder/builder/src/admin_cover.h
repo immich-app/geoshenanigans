@@ -1,7 +1,7 @@
-// The admin cells of one polygon: the reader's admin cell index covers the
-// f32 rings it reads, the builder's candidate map (admin_candidate_map) the
-// exact rings its links test. Either looks a point up in its own cell and
-// tests each ring listed there with a ray cast over straight lat/lng edges.
+// The admin cells of one polygon: the admin cell index covers the rings of
+// every tier the reader reads, the exact ones the builder's links test among
+// them. Either looks a point up in its own cell and tests each ring listed
+// there with a ray cast over straight lat/lng edges.
 // S2 joins two vertices by a great circle instead, which bows towards the
 // pole off any edge not along a meridian or the equator (660 km of Egypt's
 // border on 22°N bows 3.3 km north), so an S2 covering of the vertices
@@ -38,16 +38,15 @@ S2LatLngRect admin_ring_bounds(const NodeCoord* verts, uint32_t n);
 // (cell id, interior) pairs, ascending by id.
 using AdminRingCells = std::vector<std::pair<uint64_t, bool>>;
 
-// The level-`level` cells of the ring verts[0, n) as the reader's f32 ray
-// cast tests it, ascending by id: every cell within reach_rad of an edge
-// (flagged false), and every other cell the ring holds (flagged true: the ray
-// cast puts every point of it inside). The reader's index takes
-// ADMIN_COVER_REACH_RAD.
+// The level-`level` cells of the f32 ring verts[0, n) as an f32 ray cast
+// tests it, ascending by id: every cell within reach_rad of an edge (flagged
+// false), and every other cell the ring holds (flagged true: the ray cast
+// puts every point of it inside).
 AdminRingCells admin_ring_cells(const NodeCoord* verts, uint32_t n, int level, double reach_rad);
 
 // The same for a polygon's exact rings as exact_ring_contains tests them
 // (the outer ring, then its holes, each its own ring in verts, all of them
-// counted even-odd), for the builder's links: ADMIN_LINK_REACH_RAD. Each edge
+// counted even-odd), at ADMIN_COVER_REACH_RAD for the admin cell index. Each edge
 // is followed from its end of smaller coord_key, so the cells are the same
 // whatever the rings' rotation or direction.
 AdminRingCells admin_ring_cells(const PackedLocation* verts, const RingSpan* rings, uint32_t ring_count, int level,

@@ -48,6 +48,12 @@ uint32_t small_id(Rng& r, uint32_t range) {
 
 NodeCoord node(Rng& r, const Shape& s) { return {coord(r, s), coord(r, s)}; }
 
+// An e7 point from a handful of values, so that rings tie often.
+PackedLocation e7_point(Rng& r) {
+    static const int32_t kE7[] = {0, 15000000, -22500000, 30000000, 471250000};
+    return {kE7[r.below(5)], kE7[r.below(5)]};
+}
+
 std::vector<CellItemPair> new_cell_pairs(Rng& r, size_t n, uint32_t items, bool flags) {
     std::vector<CellItemPair> pairs(n);
     for (auto& p : pairs) {
@@ -131,23 +137,24 @@ void fill_records(ParsedData& d, std::vector<float>& elevations, std::vector<uin
 
     for (uint32_t i = 0; i < n_admin; i++) {
         AdminPolygon p{};
-        p.vertex_offset = static_cast<uint32_t>(d.admin_vertices.size());
-        p.vertex_count = r.one_in(4) ? 21 + r.below(3) : 1 + r.below(2);
         p.name_id = small_id(r, 4);
         p.admin_level = static_cast<uint8_t>(2 + r.below(2));
         p.country_code = static_cast<uint16_t>(r.below(2));
         p.area = static_cast<float>(r.below(3));
-        for (uint32_t j = 0; j < p.vertex_count; j++)
-            d.admin_vertices.push_back(j < 3 ? node(r, s) : NodeCoord{1.0f, 1.0f});
+        std::vector<PackedLocation> outer;
+        for (uint32_t j = r.one_in(4) ? 21 + r.below(3) : 3 + r.below(2); j > 0; j--)
+            outer.push_back(outer.size() < 3 ? e7_point(r) : PackedLocation{10000000, 10000000});
+        outer.push_back(outer.front());
+        std::vector<std::vector<PackedLocation>> holes;
+        if (r.one_in(8)) holes.push_back({e7_point(r), e7_point(r), e7_point(r), outer.front()});
+        d.admin_exact_rings.append(outer, holes);
         d.admin_polygons.push_back(p);
         if (s.osm_ids) d.admin_osm_ids.push_back(r.one_in(50) && !s.unique_osm_ids ? 0 : i + 1);
         if (s.side_arrays) d.admin_parent_ids.push_back(r.one_in(20) ? n_admin + 1 : small_id(r, n_admin));
     }
-    for (uint32_t c = 0; c < 500; c++) {
-        auto& ids = d.cell_to_admin[c * 7919ull];
-        for (uint32_t k = r.below(40); k > 0; k--)
-            ids.push_back((r.one_in(20) ? n_admin + 2 : r.below(n_admin)) | (r.one_in(2) ? INTERIOR_FLAG : 0));
-    }
+    d.admin_index_cells = new_cell_pairs(r, 20000, n_admin + 3, true);
+    d.admin_minimal_index_cells = new_cell_pairs(r, 10000, n_admin + 3, true);
+    d.admin_country_cells = new_cell_pairs(r, 5000, n_admin + 3, true);
 
     for (size_t i = 0; i < n; i++) {
         PoiRecord p{};
@@ -246,9 +253,11 @@ void check_same_records(const ParsedData& a, const ParsedData& b) {
     CHECK(same_pairs(a.sorted_interp_cells, b.sorted_interp_cells));
     CHECK(same_bytes(a.admin_polygons, b.admin_polygons));
     CHECK(same_bytes(a.admin_osm_ids, b.admin_osm_ids));
-    CHECK(same_bytes(a.admin_vertices, b.admin_vertices));
+    CHECK(same_bytes(a.admin_exact_rings.polygons, b.admin_exact_rings.polygons));
     CHECK(same_bytes(a.admin_parent_ids, b.admin_parent_ids));
-    CHECK(a.cell_to_admin == b.cell_to_admin);
+    CHECK(same_pairs(a.admin_index_cells, b.admin_index_cells));
+    CHECK(same_pairs(a.admin_minimal_index_cells, b.admin_minimal_index_cells));
+    CHECK(same_pairs(a.admin_country_cells, b.admin_country_cells));
     CHECK(same_bytes(a.poi_records, b.poi_records));
     CHECK(same_bytes(a.poi_osm_ids, b.poi_osm_ids));
     CHECK(same_bytes(a.poi_vertices, b.poi_vertices));
@@ -542,32 +551,27 @@ TEST(partition_strings_handles_an_empty_pool) {
 
 // --- Cell maps ---
 
-TEST(permute_admin_polygons_moves_vertices_and_osm_ids_with_each_polygon) {
+TEST(permute_admin_polygons_moves_osm_ids_and_cell_entries_with_each_polygon) {
     for (unsigned threads : kThreadCounts) {
         ParsedData d;
-        const uint32_t counts[] = {3, 1, 0, 2};
         for (uint32_t i = 0; i < 4; i++) {
             AdminPolygon p{};
-            p.vertex_offset = static_cast<uint32_t>(d.admin_vertices.size());
-            p.vertex_count = counts[i];
             p.name_id = i;
-            for (uint32_t v = 0; v < counts[i]; v++) d.admin_vertices.push_back({float(i), float(v)});
             d.admin_polygons.push_back(p);
             d.admin_osm_ids.push_back(100 + i);
         }
+        d.admin_index_cells = {{5, 0}, {5, 3 | INTERIOR_FLAG}, {7, 1}, {7, 2}, {9, 9}};
+        d.admin_minimal_index_cells = {{5, 2 | INTERIOR_FLAG}, {6, 0}, {6, 3}};
+        d.admin_country_cells = {{8, 1}, {8, 2}};
         auto old_to_new = permute_admin_polygons(d, {2, 0, 3, 1}, threads);
         CHECK(old_to_new == std::vector<uint32_t>({1, 3, 0, 2}));
         CHECK(d.admin_osm_ids == std::vector<uint64_t>({102, 100, 103, 101}));
-        const uint32_t want_offsets[] = {0, 0, 3, 5};
-        bool same = d.admin_vertices.size() == 6;
-        for (uint32_t i = 0; i < 4; i++) {
-            const auto& p = d.admin_polygons[i];
-            same = same && p.vertex_offset == want_offsets[i] && p.vertex_count == counts[p.name_id];
-            for (uint32_t v = 0; v < p.vertex_count; v++)
-                same = same && d.admin_vertices[p.vertex_offset + v].lat == float(p.name_id) &&
-                       d.admin_vertices[p.vertex_offset + v].lng == float(v);
-        }
-        CHECK(same);
+        for (uint32_t i = 0; i < 4; i++) CHECK_EQ(d.admin_polygons[old_to_new[i]].name_id, i);
+        // Each cell's entries in canonical order again; an id past the
+        // polygons stays.
+        CHECK(same_pairs(d.admin_index_cells, {{5, 1}, {5, 2 | INTERIOR_FLAG}, {7, 0}, {7, 3}, {9, 9}}));
+        CHECK(same_pairs(d.admin_minimal_index_cells, {{5, 0 | INTERIOR_FLAG}, {6, 1}, {6, 2}}));
+        CHECK(same_pairs(d.admin_country_cells, {{8, 0}, {8, 3}}));
     }
 }
 
@@ -594,6 +598,36 @@ TEST(permute_admin_polygons_moves_each_polygons_exact_rings_with_it) {
             const RingSpan& outer = d.admin_exact_rings.rings_of(k)[0];
             CHECK_EQ(d.admin_exact_rings.vertices[outer.begin].lat_e7, was);
         }
+    }
+}
+
+TEST(the_admin_order_follows_the_exact_rings_whatever_their_rotation_or_direction) {
+    // Four polygons of one name, level and country: a five-vertex ring, then
+    // two six-vertex ones whose smallest vertex is (0, 0) by osm id, then a
+    // six-vertex one whose smallest is higher.
+    const std::vector<std::vector<PackedLocation>> rings = {
+        {{0, 1000}, {50, 60}, {0, 3000}, {40, 2000}, {30, 1000}, {20, 500}},
+        {{1000, 1000}, {1000, 5000}, {5000, 5000}, {5000, 1000}, {3000, 400}},
+        {{0, 0}, {0, 5000}, {5000, 5000}, {6000, 2000}, {5000, 0}, {2000, -100}},
+        {{0, 0}, {0, 5000}, {5000, 5000}, {6000, 2000}, {5000, 0}, {2000, -100}},
+    };
+    const uint64_t osm_ids[] = {4, 3, 2, 1};
+    for (int variant = 0; variant < 12; variant++) {
+        ParsedData d;
+        for (size_t k = 0; k < rings.size(); k++) {
+            std::vector<PackedLocation> ring = rings[k];
+            std::rotate(ring.begin(), ring.begin() + (variant + int(k)) % int(ring.size()), ring.end());
+            if (variant % 2) std::reverse(ring.begin(), ring.end());
+            ring.push_back(ring.front());
+            AdminPolygon p{};
+            p.name_id = 7;
+            p.admin_level = 8;
+            d.admin_polygons.push_back(p);
+            d.admin_osm_ids.push_back(osm_ids[k]);
+            d.admin_exact_rings.append(ring, {});
+        }
+        reorder_admin_polygons(d, variant % 3 + 1);
+        CHECK(d.admin_osm_ids == std::vector<uint64_t>({3, 1, 2, 4}));
     }
 }
 

@@ -154,9 +154,9 @@ in [PATCHING.md](PATCHING.md) and `builder/configurations.template.json`.
 | `interp_entries.bin`, `interp_ways.bin`, `interp_nodes.bin` | Interpolation way IDs per cell, way headers, node coordinates |
 | `interp_postcodes.bin` | Per interpolation way: its TIGER ZIP (TIGER regions only) |
 | `admin_cells.bin`, `admin_entries.bin` | S2 cell index for admin boundaries |
-| `admin_polygons.bin`, `admin_vertices.bin` | Admin polygon metadata and vertices (per quality variant) |
+| `admin_polygons.bin`, `admin_rings.bin` | Admin polygon records (postcode areas among them, at level 11) and their rings, as refs to arcs |
+| `arc_index.bin`, `arc_vertices.bin` | The boundary arcs those rings share, each border once (per boundary tier: `quality/simplified` or `quality/exact`) |
 | `admin_parents.bin` | Per admin polygon: the next larger polygon containing it |
-| `postal_polygons.bin`, `postal_vertices.bin` | Postal code boundaries (per quality variant, where they exist) |
 | `place_nodes.bin` | Place nodes (city, town, village, suburb, ...); the first load derives their cell index into `derived/` |
 | `postcode_centroids.bin`, `postcode_centroid_cells.bin`, `postcode_centroid_entries.bin` | Postcode centroids and their cell index |
 | `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin` | Points of interest and their cell index |
@@ -209,7 +209,8 @@ cargo build --release --manifest-path server/Cargo.toml
 ### Planet builds
 
 A full planet build (`--continents --multi-output --multi-quality`, the
-nightly's configuration) takes about 5 minutes on 64 cores and fits in
+nightly's configuration; `--multi-quality` writes the two boundary tiers,
+`quality/simplified` and `quality/exact`) takes about 5 minutes on 64 cores and fits in
 80 GB of RAM (6.5 minutes there): the write phase sizes how much it runs at
 once to the memory limit, the smaller of MemTotal and the process's cgroup
 limit. Set

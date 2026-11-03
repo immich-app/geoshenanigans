@@ -16,7 +16,8 @@
 // the vertices Douglas-Peucker keeps of each arc, snapped to its grid, with
 // vertices given back where a ring would degenerate, two simplified segments
 // cross or a polygon's rings stop nesting. build-index runs the arc stage
-// (build_admin_arcs) only with --arcs-out.
+// (build_admin_arcs) on every build with admin polygons: every dir that holds
+// admin geometry holds it as arcs.
 #pragma once
 
 #include <algorithm>
@@ -337,8 +338,8 @@ struct ArcSlots {
 // slots included, becomes a tombstone, so it is reused only the day after.
 ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar);
 
-// Where a region's arc sidecar sits under its dir, as PR 3 ships them: the
-// full set's with the exact tier, the minimal set's with admin-minimal.
+// Where a region's arc sidecar sits under its dir: the full set's with the
+// exact tier, the minimal set's with admin-minimal.
 std::string arc_sidecar_path(const std::string& region_dir, ArcSet set);
 
 // The minimal set over the full set `arcs` of the store: the rings of the
@@ -416,6 +417,14 @@ void tier_vertices(const AdminArcs& arcs, const AdminExactRings& store, const Ar
                    const ArcTierState& state, uint32_t arc, std::vector<PackedLocation>& raw,
                    std::vector<StoredVertex>& out);
 
+// Ring `ring` of the store as `tier` (as `state` holds it) stores it, into
+// `out`: its refs' stored vertices chained, each junction once, its first
+// vertex again at its end; empty for a ring the tier's set doesn't hold.
+// `raw` and `stored` are scratch.
+void tier_ring(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier, const ArcTierState& state,
+               uint32_t ring, std::vector<PackedLocation>& out, std::vector<PackedLocation>& raw,
+               std::vector<StoredVertex>& stored);
+
 // The arc stage over the planet's polygons: the topology, then the full set's
 // planet slots against the sidecar under `prev_planet_dir` (a cold start when
 // empty), every polygon's rings, the minimal set of the polygons `in_minimal`
@@ -432,12 +441,6 @@ std::vector<PackedLocation> rebuild_ring(const AdminArcs& arcs, const AdminExact
 // Whether two closed rings (each ending on its first vertex) are one cycle,
 // from any vertex and in either direction.
 bool same_closed_ring(const PackedLocation* a, uint32_t a_count, const PackedLocation* b, uint32_t b_count);
-
-// build-index's arc dirs, refused before any work: --arcs-out new or empty and
-// apart from the output dir (which publishes whatever it holds), --prev-arcs
-// only with it, and holding each of `regions`' sidecar of each set.
-void require_arc_dirs(const std::string& output_dir, const std::string& arcs_out_dir,
-                      const std::string& prev_arcs_dir, const std::vector<std::string>& regions = {"planet"});
 
 // --- The encoded arcs: what the stage leaves the build ---
 
@@ -549,9 +552,9 @@ void assign_region_arc_slots(AdminArcBlocks& blocks, const std::string& prev_reg
 // tombstone's empty).
 void write_arc_files(const std::string& dir, const ArcSetBlocks& set, const ArcBlocks& tier);
 
-// A dir's admin_polygons.bin and admin_rings.bin in set `set`: records[slot]
-// with its ring block (that of polygon polygon_of[slot]) laid out in slot
-// order, a tombstone record (NO_DATA) holding none. Returns admin_rings.bin's
-// size.
-size_t write_ring_files(const std::string& dir, const AdminArcBlocks& blocks, ArcSet set,
+// The admin_polygons.bin and admin_rings.bin of `dirs`, the same bytes in
+// each, in set `set`: records[slot] with its ring block (that of polygon
+// polygon_of[slot]) laid out in slot order, a tombstone record (NO_DATA)
+// holding none. Returns admin_rings.bin's size.
+size_t write_ring_files(const std::vector<std::string>& dirs, const AdminArcBlocks& blocks, ArcSet set,
                         std::vector<AdminPolygon> records, const std::vector<uint32_t>& polygon_of);

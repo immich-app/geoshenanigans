@@ -528,32 +528,34 @@ inline void reorder_interps(ParsedData& data) {
     }
 }
 
-// Sorts admin polygons by (name, level, country, vertex_count) and reorders
-// their vertices.
+// Sorts admin polygons by (name, level, country, their exact rings' vertex
+// occurrences, their exact outer ring's smallest vertex, osm id), their exact
+// rings and admin cell entries in lockstep.
 inline void reorder_admin_polygons(ParsedData& data) {
     if (!data.admin_polygons.empty()) {
         size_t n = data.admin_polygons.size();
+        const AdminExactRings& exact = data.admin_exact_rings;
+        auto occurrences = [&](uint32_t p) {
+            uint64_t count = 0;
+            for (uint32_t r = 0; r < exact.polygons[p].ring_count; r++) count += exact.rings_of(p)[r].count;
+            return count;
+        };
+        auto least = [&](uint32_t p) {
+            uint64_t k = UINT64_MAX;
+            const RingSpan& outer = exact.rings_of(p)[0];
+            for (uint32_t v = 0; v < outer.count; v++) k = std::min(k, vertex_key(exact.vertices[outer.begin + v]));
+            return k;
+        };
         std::vector<uint32_t> order(n);
         std::iota(order.begin(), order.end(), 0);
-        const auto& sp = data.string_pool.data();
         std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
             const auto& pa = data.admin_polygons[a];
             const auto& pb = data.admin_polygons[b];
             if (pa.name_id != pb.name_id) return pa.name_id < pb.name_id;
             if (pa.admin_level != pb.admin_level) return pa.admin_level < pb.admin_level;
             if (pa.country_code != pb.country_code) return pa.country_code < pb.country_code;
-            if (pa.vertex_count != pb.vertex_count) return pa.vertex_count < pb.vertex_count;
-            // Compare first few vertices for tiebreaking
-            uint32_t nc = std::min(pa.vertex_count, pb.vertex_count);
-            nc = std::min(nc, 20u); // limit comparison depth
-            for (uint32_t j = 0; j < nc; j++) {
-                uint32_t la = float_bits(data.admin_vertices[pa.vertex_offset + j].lat);
-                uint32_t lb = float_bits(data.admin_vertices[pb.vertex_offset + j].lat);
-                if (la != lb) return la < lb;
-                uint32_t ga = float_bits(data.admin_vertices[pa.vertex_offset + j].lng);
-                uint32_t gb = float_bits(data.admin_vertices[pb.vertex_offset + j].lng);
-                if (ga != gb) return ga < gb;
-            }
+            if (occurrences(a) != occurrences(b)) return occurrences(a) < occurrences(b);
+            if (least(a) != least(b)) return least(a) < least(b);
             if (data.admin_osm_ids.size() == data.admin_polygons.size())
                 return data.admin_osm_ids[a] < data.admin_osm_ids[b];
             return false;
@@ -561,15 +563,10 @@ inline void reorder_admin_polygons(ParsedData& data) {
         std::vector<uint32_t> old_to_new(n);
         for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
         std::vector<AdminPolygon> new_polys(n);
-        std::vector<NodeCoord> new_verts;
-        new_verts.reserve(data.admin_vertices.size());
+        std::vector<AdminExactRings::Polygon> new_exact(n);
         for (uint32_t i = 0; i < n; i++) {
-            auto p = data.admin_polygons[order[i]];
-            uint32_t old_off = p.vertex_offset;
-            p.vertex_offset = static_cast<uint32_t>(new_verts.size());
-            for (uint32_t j = 0; j < p.vertex_count; j++)
-                new_verts.push_back(data.admin_vertices[old_off + j]);
-            new_polys[i] = p;
+            new_polys[i] = data.admin_polygons[order[i]];
+            new_exact[i] = exact.polygons[order[i]];
         }
         // Reorder admin_osm_ids in lockstep (no dedup happens in
         // this sort — just a permutation — so the size stays the
@@ -581,7 +578,7 @@ inline void reorder_admin_polygons(ParsedData& data) {
             data.admin_osm_ids = std::move(new_osm);
         }
         data.admin_polygons = std::move(new_polys);
-        data.admin_vertices = std::move(new_verts);
+        data.admin_exact_rings.polygons = std::move(new_exact);
         // Remap place-node parent_poly_id references
         for (auto& pn : data.place_nodes) {
             if (pn.parent_poly_id != 0xFFFFFFFFu &&
@@ -610,15 +607,15 @@ inline void reorder_admin_polygons(ParsedData& data) {
         for (auto& pid : data.way_parent_ids) {
             if (pid != NO_DATA && pid < n) pid = old_to_new[pid];
         }
-        // Remap admin cell entries
-        for (auto& [cell_id, ids] : data.cell_to_admin) {
-            for (auto& id : ids) {
-                uint32_t flags = id & INTERIOR_FLAG;
-                uint32_t masked = id & ID_MASK;
-                if (masked < old_to_new.size())
-                    id = old_to_new[masked] | flags;
+        // Remap admin cell entries, each cell's back in canonical order
+        for (std::vector<CellItemPair>* cells :
+             {&data.admin_index_cells, &data.admin_minimal_index_cells, &data.admin_country_cells}) {
+            for (auto& e : *cells) {
+                uint32_t flags = e.item_id & INTERIOR_FLAG;
+                uint32_t masked = e.item_id & ID_MASK;
+                if (masked < old_to_new.size()) e.item_id = old_to_new[masked] | flags;
             }
-            std::sort(ids.begin(), ids.end());
+            std::stable_sort(cells->begin(), cells->end(), cell_item_less);
         }
         std::cerr << "  Admin polygons sorted: " << n << std::endl;
     }

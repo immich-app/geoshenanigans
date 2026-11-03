@@ -1463,21 +1463,26 @@ TEST(a_dirs_arc_and_ring_files_lay_the_blocks_out_in_slot_order) {
         REQUIRE(end - at[slot] == blocks.tiers[1].bytes_of(a));
         CHECK(std::memcmp(vertices.data() + at[slot], blocks.tiers[1].data(a), end - at[slot]) == 0);
     }
-    // Records: polygon 5 then a tombstone then polygon 0 (its hole).
+    // Records: polygon 5 then a tombstone then polygon 0 (its hole), the
+    // same bytes in each dir.
     AdminPolygon five{}, zero{};
     five.name_id = 55;
     zero.name_id = 11;
-    const size_t ring_bytes = write_ring_files(dir.path(), blocks, ArcSet::Full, {five, admin_polygon_tombstone(), zero},
-                                               {5, NO_DATA, 0});
+    const std::string twin = dir.path() + "/twin";
+    std::filesystem::create_directories(twin);
+    const size_t ring_bytes = write_ring_files({dir.path(), twin}, blocks, ArcSet::Full,
+                                               {five, admin_polygon_tombstone(), zero}, {5, NO_DATA, 0});
     const std::vector<char> records = read_bytes(dir.path() + "/admin_polygons.bin"),
                             rings = read_bytes(dir.path() + "/admin_rings.bin");
+    CHECK(read_bytes(twin + "/admin_polygons.bin") == records);
+    CHECK(read_bytes(twin + "/admin_rings.bin") == rings);
     REQUIRE(records.size() == 3 * sizeof(AdminPolygon));
     AdminPolygon got[3];
     std::memcpy(got, records.data(), records.size());
     const BlockSpan b5 = blocks.polygons[5].blocks[0], b0 = blocks.polygons[0].blocks[0];
-    CHECK(got[0].vertex_offset == 0 && got[0].vertex_count == b5.size && got[0].hole_count == 0 && got[0].name_id == 55);
-    CHECK(got[1].vertex_offset == NO_DATA && got[1].vertex_count == 0 && got[1].name_id == NO_DATA);
-    CHECK(got[2].vertex_offset == b5.size && got[2].vertex_count == b0.size && got[2].hole_count == 1);
+    CHECK(got[0].ring_offset == 0 && got[0].ring_bytes == b5.size && got[0].hole_count == 0 && got[0].name_id == 55);
+    CHECK(got[1].ring_offset == NO_DATA && got[1].ring_bytes == 0 && got[1].name_id == NO_DATA);
+    CHECK(got[2].ring_offset == b5.size && got[2].ring_bytes == b0.size && got[2].hole_count == 1);
     REQUIRE(rings.size() == ring_bytes && ring_bytes == size_t(b5.size) + b0.size);
     CHECK(std::memcmp(rings.data(), full.ring_blocks.data() + b5.offset, b5.size) == 0);
     CHECK(std::memcmp(rings.data() + b5.size, full.ring_blocks.data() + b0.offset, b0.size) == 0);
@@ -1485,37 +1490,9 @@ TEST(a_dirs_arc_and_ring_files_lay_the_blocks_out_in_slot_order) {
 
 // --- The stage's dirs ---
 
-TEST(the_arc_dirs_are_refused_before_the_build_starts) {
-    const ScratchDir root("admin-arc-dirs");
-    const std::string out = root.path() + "/out", arcs = root.path() + "/arcs", prev = root.path() + "/prev";
-    auto refusal = [&](const std::string& o, const std::string& a, const std::string& p) {
-        return refusal_of([&] { require_arc_dirs(o, a, p); });
-    };
-    CHECK_EQ(refusal(out, "", ""), std::string());
-    CHECK_EQ(refusal(out, arcs, ""), std::string());
-    CHECK(refusal(out, "", prev).find("without --arcs-out") != std::string::npos);
-    CHECK(refusal(out, out, "").find("overlaps") != std::string::npos);
-    CHECK(refusal(out, out + "/arcs", "").find("overlaps") != std::string::npos);
-    CHECK(refusal(arcs + "/out", arcs, "").find("overlaps") != std::string::npos);
-    CHECK(refusal(out, root.path() + "/./out/", "").find("overlaps") != std::string::npos);
-    CHECK(refusal(out, root.path() + "/outside", "").empty());
-    std::filesystem::create_directories(arcs);
-    std::ofstream(arcs + "/left") << "x";
-    CHECK(refusal(out, arcs, "").find("not empty") != std::string::npos);
-    CHECK(refusal(out, root.path() + "/arcs2", prev).find("no planet arc sidecar") != std::string::npos);
-    const std::string sidecar = arc_sidecar_path(prev + "/planet", ArcSet::Full);
-    CHECK_EQ(sidecar, prev + "/planet/quality/exact/arc_index.osm_ids");
-    CHECK_EQ(arc_sidecar_path(prev + "/planet", ArcSet::Minimal), prev + "/planet/admin-minimal/arc_index.osm_ids");
-    std::filesystem::create_directories(prev + "/planet/quality/exact");
-    gc::id_alloc::IdAllocator::write_sidecar(sidecar, {});
-    // The minimal set's too.
-    CHECK(refusal(out, root.path() + "/arcs2", prev).find("admin-minimal/arc_index.osm_ids") != std::string::npos);
-    std::filesystem::create_directories(prev + "/planet/admin-minimal");
-    gc::id_alloc::IdAllocator::write_sidecar(arc_sidecar_path(prev + "/planet", ArcSet::Minimal), {});
-    CHECK_EQ(refusal(out, root.path() + "/arcs2", prev), std::string());
-    // A build with continents needs each one's too.
-    CHECK(refusal_of([&] { require_arc_dirs(out, root.path() + "/arcs2", prev, {"planet", "europe"}); })
-              .find("no europe arc sidecar " + prev + "/europe/quality/exact/arc_index.osm_ids") != std::string::npos);
+TEST(a_regions_arc_sidecars_sit_with_the_exact_tier_and_admin_minimal) {
+    CHECK_EQ(arc_sidecar_path("prev/planet", ArcSet::Full), std::string("prev/planet/quality/exact/arc_index.osm_ids"));
+    CHECK_EQ(arc_sidecar_path("prev/planet", ArcSet::Minimal), std::string("prev/planet/admin-minimal/arc_index.osm_ids"));
 }
 
 // --- Polygons in lockstep ---

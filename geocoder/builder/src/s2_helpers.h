@@ -83,9 +83,9 @@ void append_addr_point(ParsedData& data, double lat, double lng,
                        const NodeCoord* polygon_vertices = nullptr,
                        uint32_t polygon_vertex_count = 0);
 
-// Appends the admin polygon of a closed way's ring, simplified, with the ring
-// itself to the exact rings and their area as the polygon's; nothing when
-// the simplified ring keeps under 3 vertices.
+// Appends the admin polygon of a closed way's ring, with the ring itself to
+// the exact rings and their area as the polygon's; nothing when the ring,
+// simplified, keeps under 3 vertices.
 void add_admin_polygon(ParsedData& data,
                        const std::vector<PackedLocation>& ring,
                        const char* name, uint8_t admin_level,

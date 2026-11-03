@@ -299,6 +299,12 @@ struct AdminExactRings {
     std::vector<Polygon> polygons;  // parallel to ParsedData::admin_polygons
 
     const RingSpan* rings_of(uint32_t pid) const { return rings.data() + polygons[pid].first_ring; }
+    // The vertices of the polygon's rings, each ring's closing one counted.
+    uint64_t occurrences(uint32_t pid) const {
+        uint64_t n = 0;
+        for (uint32_t r = 0; r < polygons[pid].ring_count; r++) n += rings_of(pid)[r].count;
+        return n;
+    }
     // The rings' area in square degrees (exact_polygon_area).
     float area(uint32_t pid) const { return exact_polygon_area(vertices.data(), rings_of(pid), polygons[pid].ring_count); }
 
@@ -358,6 +364,9 @@ struct ParsedData {
     // not written. Mirrors Nominatim's location_property_tiger.postcode.
     std::vector<uint32_t> interp_postcode_ids;
     std::vector<NodeCoord> interp_nodes;
+    // The records of admin_polygons.bin before their dirs lay their ring
+    // blocks out (write_ring_files): ring_offset 0, or NO_DATA for a
+    // strategy-2 tombstone, and ring_bytes 0.
     std::vector<AdminPolygon> admin_polygons;
     // Parallel to admin_polygons. Packed (ObjectType<<56 | 56-bit id):
     // OSM_RELATION + (relation_id<<16 | ring_index) for relation-sourced
@@ -365,31 +374,33 @@ struct ParsedData {
     // #105). Strategy-2 IdAllocator keys on this.
     std::vector<uint64_t> admin_osm_ids;
     // A continent's admin polygons' planet ids, parallel to admin_polygons
-    // (NO_DATA for a strategy-2 tombstone); empty for the planet. Its
-    // quality variants take each polygon from the planet's.
+    // (NO_DATA for a strategy-2 tombstone); empty for the planet.
     std::vector<uint32_t> admin_planet_ids;
     std::vector<gc::id_alloc::SidecarSlot> admin_sidecar_blob;
     std::vector<gc::id_alloc::SidecarSlot> addr_sidecar_blob;
     std::vector<gc::id_alloc::SidecarSlot> place_sidecar_blob;
     std::vector<gc::id_alloc::SidecarSlot> poi_sidecar_blob;
     std::vector<gc::id_alloc::SidecarSlot> interp_sidecar_blob;
-    std::vector<NodeCoord> admin_vertices;
     // Freed once the postcode centroids, its last user, have their countries.
     AdminExactRings admin_exact_rings;
-    // The arc stage's encoded arcs of those rings, which outlive them
-    // (--arcs-out only, else empty).
+    // The arc stage's encoded arcs of those rings, which outlive them (empty
+    // without admin polygons).
     AdminArcBlocks admin_arcs;
-    // The builder's own admin candidates per cell (admin_candidate_map): every
-    // cell from which a polygon's exact rings can hold a point, flagged
-    // INTERIOR_FLAG where they hold all of it. The parent and country passes
-    // (and the continent split's polygon set) read it.
-    std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
     // The admin cell index the reader reads (admin_cells.bin), in canonical
-    // order: (cell, poly_id | INTERIOR_FLAG) for every cell from which any
-    // written variant's ring of the polygon contains a point (see
-    // compute_admin_index_cells), and admin-minimal's alike for its rings.
+    // order: (cell, poly_id | INTERIOR_FLAG) for every cell from which a
+    // polygon's rings in any of the full set's tiers contain a point,
+    // flagged where every tier's hold all of it (compute_admin_index_cells),
+    // and admin-minimal's alike for the minimal set's tier. The builder's
+    // links, country lookups and the continent split's polygon set read the
+    // full set's too.
     std::vector<CellItemPair> admin_index_cells;
     std::vector<CellItemPair> admin_minimal_index_cells;
+    // The exact tier's entries of admin_index_cells of the country polygons
+    // (level 2, a country code), its own interior flags kept: where a
+    // point's country is looked up (country_code_at_point), which shortcuts
+    // on the cell's list, so only the cells the exact rings reach may list
+    // a country. Freed with the exact rings.
+    std::vector<CellItemPair> admin_country_cells;
 
     // Deferred work for parallel S2 computation (ways + interps)
     std::vector<DeferredWay> deferred_ways;
