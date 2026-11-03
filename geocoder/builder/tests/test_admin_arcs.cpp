@@ -1,9 +1,10 @@
-// admin_arcs.h: the arc topology (junctions, cuts, canonical arcs, refs) and
-// the arcs' keys and Hilbert presentation order. In the sanitized suite: the
-// topology's scatter and partition passes index the store directly.
+// admin_arcs.h: the arc topology (junctions, cuts, canonical arcs, refs), the
+// arcs' keys and Hilbert presentation order, and their slots. In the sanitized
+// suite: the topology's scatter and partition passes index the store directly.
 #include "admin_arcs.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <map>
 #include <random>
 #include <set>
@@ -11,7 +12,10 @@
 #include <vector>
 
 #include "parsed_data.h"
+#include "scratch_dir.h"
 #include "test_framework.h"
+
+using gctest::refusal_of;
 
 namespace {
 
@@ -431,4 +435,69 @@ TEST(arcs_are_presented_in_one_total_order_whatever_the_threads) {
         CHECK(same);
         CHECK_EQ(again.counts.junctions, arcs.counts.junctions);
     }
+}
+
+// --- Slots ---
+
+TEST(no_arc_slot_is_reused_on_the_day_it_is_freed) {
+    using namespace gc::id_alloc;
+    const ScratchDir dir("admin-arc-slots");
+    auto day = [&](const std::vector<uint64_t>& keys, const std::string& prev, const std::string& next) {
+        ArcSlots slots = allocate_arc_slots(keys, prev);
+        IdAllocator::write_sidecar(next, slots.sidecar);
+        return slots;
+    };
+    const ArcSlots one = day({10, 20, 30}, "", dir.path() + "/1");
+    CHECK(one.slots == std::vector<uint32_t>({0, 1, 2}));
+    // 20 goes: its slot is a tombstone today, and 40 is appended.
+    const ArcSlots two = day({10, 30, 40}, dir.path() + "/1", dir.path() + "/2");
+    CHECK(two.slots == std::vector<uint32_t>({0, 2, 3}));
+    REQUIRE(two.sidecar.size() == 4u);
+    CHECK(is_tombstone(two.sidecar[1]));
+    CHECK_EQ(two.counts.kept, size_t(2));
+    CHECK_EQ(two.counts.appended, size_t(1));
+    CHECK_EQ(two.counts.tombstones, size_t(1));
+    CHECK_EQ(two.sidecar[3].object_type, uint8_t(ObjectType::ARC));
+    // The day after, 50 takes it.
+    const ArcSlots three = day({10, 30, 40, 50}, dir.path() + "/2", dir.path() + "/3");
+    CHECK(three.slots == std::vector<uint32_t>({0, 2, 3, 1}));
+    CHECK_EQ(three.counts.recycled, size_t(1));
+    CHECK_EQ(three.counts.tombstones, size_t(0));
+    // A key twice: the first in presentation order keeps the slot.
+    const ArcSlots twice = allocate_arc_slots({30, 10, 30}, dir.path() + "/3");
+    CHECK(twice.slots == std::vector<uint32_t>({2, 0, 4}));
+    CHECK(refusal_of([&] { allocate_arc_slots({1}, dir.path() + "/none"); }).find("unreadable") != std::string::npos);
+}
+
+TEST(a_chained_arc_stage_keeps_each_unchanged_arcs_slot) {
+    using gc::id_alloc::IdAllocator;
+    const ScratchDir prev("admin-arc-chain");
+    const std::vector<Polygon> cells = grid(5, 3, 77);
+    const AdminExactRings store = store_of(cells);
+    const AdminArcs day_one = build_admin_arcs(store, "", 4);
+    for (const Arc& a : day_one.arcs) CHECK(a.planet_slot < day_one.arcs.size());
+    const std::string sidecar = arc_sidecar_path(prev.path() + "/planet", ArcSet::Full);
+    std::filesystem::create_directories(std::filesystem::path(sidecar).parent_path());
+    IdAllocator::write_sidecar(sidecar, day_one.planet_sidecar);
+
+    // A junction moves: its arcs get new slots, not the ones they leave.
+    const AdminExactRings edited = store_of(moved(cells, pt(2000, 2000), pt(2020, 1990)));
+    const AdminArcs day_two = build_admin_arcs(edited, prev.path() + "/planet", 4);
+    std::map<uint64_t, uint32_t> slot_of;
+    for (const Arc& a : day_one.arcs) slot_of[a.key] = a.planet_slot;
+    size_t kept = 0;
+    for (const Arc& a : day_two.arcs) {
+        auto it = slot_of.find(a.key);
+        if (it != slot_of.end()) {
+            CHECK_EQ(a.planet_slot, it->second);
+            kept++;
+        } else {
+            CHECK(a.planet_slot >= day_one.arcs.size());
+        }
+    }
+    CHECK_EQ(kept, day_one.arcs.size() - 4);
+    CHECK_EQ(day_two.slot_counts.kept, kept);
+    CHECK_EQ(day_two.slot_counts.appended, size_t(4));
+    CHECK_EQ(day_two.slot_counts.tombstones, size_t(4));
+    CHECK_EQ(day_two.planet_sidecar.size(), day_one.arcs.size() + 4);
 }

@@ -6,21 +6,27 @@
 // rings is a junction. Rings are cut at their junctions into pieces, and equal
 // pieces are one arc, read in its canonical order. A ring is the chain of its
 // refs to arcs. Arcs are presented in Hilbert order of their first vertex and
-// keyed on their ends and their smallest interior vertex.
+// take their slots from IdAllocator (ObjectType::ARC), keyed on their ends and
+// their smallest interior vertex.
 #pragma once
 
 #include <climits>
 #include <cstdint>
 #include <functional>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "geometry.h"
+#include "id_allocator.h"
 #include "packed_location.h"
 #include "polygon_rings.h"
 #include "types.h"
 
 struct AdminExactRings;  // parsed_data.h
+
+// The stage's thread cap: the topology's transients grow with the threads.
+constexpr unsigned kArcTopologyMaxThreads = 32;
 
 // splitmix64's finalizer: a bijection of 64-bit values that spreads every bit.
 inline uint64_t mix64(uint64_t x) {
@@ -109,6 +115,7 @@ struct Arc {
     ArcView view;
     ArcBox box;
     uint64_t key = 0;          // arc_key
+    uint32_t planet_slot = 0;  // in the planet's full set (build_admin_arcs)
 };
 
 // An arc's vertices in its order, read through its view of a ring.
@@ -136,6 +143,15 @@ ArcVertices arc_vertices(const Store& store, const ArcView& view) {
     return {store.vertices.data() + ring.begin, ring.count, view};
 }
 
+// A polygon's rings, outer first, as AdminArcs numbers them.
+struct AdminArcPolygon {
+    uint32_t first_ring = 0;
+    uint32_t ring_count = 0;
+};
+inline bool operator==(const AdminArcPolygon& a, const AdminArcPolygon& b) {
+    return a.first_ring == b.first_ring && a.ring_count == b.ring_count;
+}
+
 struct AdminArcCounts {
     size_t junctions = 0;
     size_t arcs = 0;
@@ -147,6 +163,13 @@ struct AdminArcCounts {
     size_t duplicate_keys = 0;     // arcs whose key an earlier one has
 };
 
+struct AdminArcSlotCounts {
+    size_t kept = 0;      // the previous build's slot of the arc's key
+    size_t recycled = 0;  // a slot that was a tombstone in the previous build
+    size_t appended = 0;
+    size_t tombstones = 0;
+};
+
 // The arcs of every admin polygon's rings, one set (the full set).
 struct AdminArcs {
     // In presentation order; their views read the exact ring store, so only
@@ -156,7 +179,12 @@ struct AdminArcs {
     // the rings numbered as the exact ring store numbers them.
     std::vector<uint32_t> ring_refs;
     std::vector<ArcRef> refs;
+    // Parallel to ParsedData::admin_polygons; follows each admin permute.
+    std::vector<AdminArcPolygon> polygons;
+    // The planet slots' IdAllocator table, its arc_index.osm_ids sidecar.
+    std::vector<gc::id_alloc::SidecarSlot> planet_sidecar;
     AdminArcCounts counts;
+    AdminArcSlotCounts slot_counts;
 };
 
 // The topology of the store's rings: their arcs, in presentation order (the
@@ -165,6 +193,32 @@ struct AdminArcs {
 // with the same result on any number. `phase_done` is told as each step ends.
 AdminArcs build_arc_topology(const AdminExactRings& store, unsigned threads,
                              const std::function<void(const char*)>& phase_done = {});
+
+struct ArcSlots {
+    std::vector<uint32_t> slots;  // by presentation order
+    std::vector<gc::id_alloc::SidecarSlot> sidecar;
+    AdminArcSlotCounts counts;
+};
+
+// Slots for arcs keyed `keys`, in presentation order, against the previous
+// build's sidecar at `prev_sidecar` (none when empty): a key that held a slot
+// keeps it (the lowest presentation index of a repeated key), the others take
+// a slot that was a tombstone in the previous build, then new ones. A slot the
+// previous build's arc held and no arc holds now becomes a tombstone, so it is
+// reused only the day after.
+ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar);
+
+// The arc sets a region keeps sidecars for.
+enum class ArcSet { Full, Minimal };
+
+// Where a region's arc sidecar sits under its dir, as PR 3 ships them: the
+// full set's with the exact tier, the minimal set's with admin-minimal.
+std::string arc_sidecar_path(const std::string& region_dir, ArcSet set);
+
+// The arc stage over the planet's polygons: the topology, then the full set's
+// planet slots against the sidecar under `prev_planet_dir` (a cold start when
+// empty), and every polygon's rings. Logs its steps and counts.
+AdminArcs build_admin_arcs(const AdminExactRings& store, const std::string& prev_planet_dir, unsigned threads);
 
 // Ring `ring` of the store as its refs chain their arcs: each arc walked as
 // its ref says, a junction two arcs share once, ending where it starts.

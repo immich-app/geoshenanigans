@@ -59,6 +59,7 @@ enum class ObjectType : uint8_t {
     OSM_RELATION = 3,
     POSTCODE     = 4,   // hash of (country_code, postcode_string)
     SYNTHETIC    = 5,   // builder-derived (e.g. multi-ring relation: hash of relation_id+ring_index)
+    ARC          = 6,   // an admin boundary arc: arc_key (admin_arcs.h)
 };
 
 constexpr uint32_t SIDECAR_MAGIC   = 0xD0510EAD;

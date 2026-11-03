@@ -1,6 +1,8 @@
 #include "admin_arcs.h"
 
 #include <algorithm>
+#include <iostream>
+#include <sstream>
 #include <stdexcept>
 
 #include "parallel.h"
@@ -421,6 +423,68 @@ AdminArcs build_arc_topology(const AdminExactRings& store, unsigned threads,
     }
     done("      Admin arcs: refs");
     return out;
+}
+
+ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar) {
+    using namespace gc::id_alloc;
+    IdAllocator alloc;
+    if (!prev_sidecar.empty() && !alloc.load_previous(prev_sidecar))
+        throw std::runtime_error("unreadable arc sidecar " + prev_sidecar);
+    // The key each previous slot can be claimed by, none for its tombstones.
+    const size_t prev_slots = alloc.total_slots();
+    std::vector<uint64_t> prev_key(prev_slots, UINT64_MAX);
+    for (size_t s = 0; s < prev_slots; s++) {
+        const SidecarSlot& slot = alloc.slots()[s];
+        if (is_reclaimable(slot)) prev_key[s] = make_key(static_cast<ObjectType>(slot.object_type), slot.stable_id);
+    }
+
+    ArcSlots out;
+    out.slots = alloc.allocate_all(keys.size(), [&](size_t i) { return SlotIdentity{ObjectType::ARC, keys[i]}; });
+    alloc.finalize();
+    out.sidecar = alloc.take_slots();
+    for (size_t i = 0; i < keys.size(); i++) {
+        const uint32_t s = out.slots[i];
+        if (s >= prev_slots) out.counts.appended++;
+        else if (prev_key[s] == make_key(ObjectType::ARC, keys[i])) out.counts.kept++;
+        else out.counts.recycled++;
+    }
+    out.counts.tombstones = out.sidecar.size() - keys.size();
+    return out;
+}
+
+std::string arc_sidecar_path(const std::string& region_dir, ArcSet set) {
+    return region_dir + (set == ArcSet::Full ? "/quality/exact" : "/admin-minimal") + "/arc_index.osm_ids";
+}
+
+AdminArcs build_admin_arcs(const AdminExactRings& store, const std::string& prev_planet_dir, unsigned threads) {
+    threads = std::min(threads ? threads : parallel_threads(), kArcTopologyMaxThreads);
+    auto t = std::chrono::steady_clock::now();
+    auto cpu = CpuTicks::now();
+    AdminArcs arcs = build_arc_topology(store, threads, [&](const char* step) { log_phase(step, t, cpu); });
+
+    std::vector<uint64_t> keys(arcs.arcs.size());
+    for (size_t a = 0; a < keys.size(); a++) keys[a] = arcs.arcs[a].key;
+    ArcSlots slots =
+        allocate_arc_slots(keys, prev_planet_dir.empty() ? "" : arc_sidecar_path(prev_planet_dir, ArcSet::Full));
+    for (size_t a = 0; a < keys.size(); a++) arcs.arcs[a].planet_slot = slots.slots[a];
+    arcs.planet_sidecar = std::move(slots.sidecar);
+    arcs.slot_counts = slots.counts;
+    arcs.polygons.resize(store.polygons.size());
+    for (size_t p = 0; p < store.polygons.size(); p++)
+        arcs.polygons[p] = {store.polygons[p].first_ring, store.polygons[p].ring_count};
+    log_phase("      Admin arcs: planet slots", t, cpu);
+
+    const AdminArcCounts& c = arcs.counts;
+    const AdminArcSlotCounts& s = arcs.slot_counts;
+    std::ostringstream line;
+    line << "  Admin arcs: " << c.junctions << " junctions, " << c.arcs << " arcs (" << c.closed_arcs << " closed, "
+         << c.arc_vertices << " vertices), " << c.refs << " refs over " << store.rings.size() << " rings; largest partition "
+         << c.largest_partition << " occurrences, " << c.hash_collisions << " hash collisions, " << c.duplicate_keys
+         << " duplicate keys; planet slots: " << s.kept << " kept, " << s.recycled << " recycled, " << s.appended
+         << " appended, " << s.tombstones << " tombstones (" << arcs.planet_sidecar.size() << " slots) on " << threads
+         << " threads\n";
+    std::cerr << line.str();
+    return arcs;
 }
 
 std::vector<PackedLocation> rebuild_ring(const AdminArcs& arcs, const AdminExactRings& store, uint32_t ring) {
