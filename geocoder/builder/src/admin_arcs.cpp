@@ -127,7 +127,7 @@ std::vector<uint64_t> find_junctions(const AdminExactRings& store, unsigned thre
     each_occurrence([&](uint32_t* chunk, uint32_t i, bool ring_start) {
         scattered[chunk[arc_partition(vertex_key(v[i]))]++] = i | (ring_start ? kRingStart : 0);
     });
-    at = {};
+    free_storage(at);
 
     // The vertex before a ring's first occurrence is the ring's last.
     auto last_of_ring_from = [&](uint32_t first) {
@@ -161,8 +161,8 @@ std::vector<uint64_t> find_junctions(const AdminExactRings& store, unsigned thre
             }
         }
     }, threads);
-    buffers = {};
-    scattered = {};
+    free_storage(buffers);
+    free_storage(scattered);
     largest_partition = 0;
     for (uint32_t p = 0; p < kArcPartitions; p++)
         largest_partition = std::max(largest_partition, partition_at[p + 1] - partition_at[p]);
@@ -371,7 +371,7 @@ AdminArcs build_arc_topology(const AdminExactRings& store, unsigned threads,
             std::vector<uint32_t>().swap(cuts[r]);
         }
     }, threads);
-    cuts = {};
+    free_storage(cuts);
     done("      Admin arcs: pieces");
 
     // Equal pieces are one arc: alike in hash and shape, then vertex for vertex.
@@ -446,7 +446,7 @@ AdminArcs build_arc_topology(const AdminExactRings& store, unsigned threads,
             rank_of[order[rank].arc] = static_cast<uint32_t>(rank);
         }
     }, threads);
-    found = {};
+    free_storage(found);
     done("      Admin arcs: arcs");
 
     parallel_resize(out.refs, ref_count);
@@ -585,7 +585,7 @@ MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& sto
         }
         k = run_end;
     }
-    ends = {};
+    free_storage(ends);
     free_storage(turned_at);
 
     // The chains, each from the first of its arcs in full order: forwards
@@ -631,7 +631,7 @@ MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& sto
             chains.push_back({first, static_cast<uint32_t>(parts.size()) - first, closed});
         }
     }
-    joined = {};
+    free_storage(joined);
 
     // Each chain in its canonical walk, as build_arc_topology walks a piece:
     // an open one from its smaller end, a closed one round from a smallest
@@ -677,7 +677,7 @@ MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& sto
             for (uint32_t j = 0; j < chain.part_count; j++) arc.box.add(arcs.arcs[p[j].arc].box);
         }
     }, threads);
-    chains = {};
+    free_storage(chains);
 
     // The arcs' keys, then the arcs in presentation order, their parts with
     // them.
@@ -715,7 +715,7 @@ MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& sto
         out.parts = std::move(presented_parts);
         out.part_at = std::move(presented_at);
     }
-    order = {};
+    free_storage(order);
 
     // Each minimal ring's refs: its full refs a chain at a time, from the
     // first that starts one (its first part walked forwards, or its last

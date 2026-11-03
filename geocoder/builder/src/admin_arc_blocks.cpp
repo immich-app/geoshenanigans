@@ -53,7 +53,7 @@ void lay_out_blocks(size_t n, std::vector<uint8_t>& bytes, std::vector<uint32_t>
     }, threads);
     const std::vector<uint64_t> offsets = parallel_offsets<uint64_t>(n, [&](size_t i) { return sizes[i]; }, threads);
     if (offsets.back() > UINT32_MAX) throw std::length_error(what + " past 4 GiB: its readers hold 32-bit offsets");
-    sizes = {};
+    free_storage(sizes);
     parallel_resize(at, n + 1);
     parallel_for(n + 1, [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++) at[i] = static_cast<uint32_t>(offsets[i]);

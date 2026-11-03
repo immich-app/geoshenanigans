@@ -13,10 +13,17 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <optional>
 #include <random>
 #include <set>
 #include <string>
 #include <vector>
+
+#if defined(__SANITIZE_ADDRESS__)
+#include <sanitizer/allocator_interface.h>
+#elif defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include "parsed_data.h"
 #include "reorder.h"
@@ -1130,6 +1137,76 @@ TEST(the_repair_gives_back_the_vertices_a_crossing_needs_and_leaves_raw_crossing
         CHECK(points_of(stored_of(arcs, store, simplified_tier(), state, here)) ==
               points_of(stored_of(alone_arcs, alone, simplified_tier(), alone_state, 0)));
     }
+}
+
+namespace {
+
+// The heap's bytes in use, where the build can tell: ASan's count under
+// ASan, else glibc's arenas and mapped blocks.
+std::optional<size_t> heap_in_use() {
+#if defined(__SANITIZE_ADDRESS__)
+    return __sanitizer_get_current_allocated_bytes();
+#elif defined(__GLIBC__)
+    const struct mallinfo2 mi = mallinfo2();
+    return mi.uordblks + mi.hblkhd;
+#else
+    return std::nullopt;
+#endif
+}
+
+// A square island of side `side` e7 units from (lat, lng), each side `n`
+// segments zigzagging `amplitude` either side of the straight line, so that
+// the simplified tier keeps every vertex and nothing crosses.
+Ring zigzag_square(int32_t lat, int32_t lng, int32_t side, int n, int32_t amplitude) {
+    const PackedLocation corners[] = {pt(lat, lng), pt(lat, lng + side), pt(lat + side, lng + side), pt(lat + side, lng)};
+    Ring ring;
+    for (int e = 0; e < 4; e++) {
+        const PackedLocation a = corners[e], b = corners[(e + 1) % 4];
+        for (int k = 0; k < n; k++) {
+            const int32_t la = a.lat_e7 + int32_t(int64_t(b.lat_e7 - a.lat_e7) * k / n);
+            const int32_t ln = a.lon_e7 + int32_t(int64_t(b.lon_e7 - a.lon_e7) * k / n);
+            const int32_t off = k == 0 ? 0 : k % 2 ? amplitude : -amplitude;
+            ring.push_back(a.lat_e7 == b.lat_e7 ? pt(la + off, ln) : pt(la, ln + off));
+        }
+    }
+    return closed(ring);
+}
+
+}  // namespace
+
+TEST(the_repair_grid_is_handed_back_before_the_vertices_are_counted) {
+    if (!heap_in_use()) return;  // no heap count in this build
+
+    // 256 islands of 800 kept segments each, 0.4 degrees across: some 8 MiB
+    // of segments and grid cells.
+    std::vector<Polygon> islands;
+    for (int r = 0; r < 16; r++)
+        for (int c = 0; c < 16; c++)
+            islands.push_back({zigzag_square(r * 5000000, c * 5000000, 4000000, 200, 10000), {}});
+    const AdminExactRings store = store_of(islands);
+    const AdminArcs arcs = build_arc_topology(store, 1);
+    const std::vector<bool> nests = exact_rings_nest(store, 1);
+    std::vector<std::pair<std::string, size_t>> in_use;
+    in_use.reserve(16);
+    const ArcTierState state = build_arc_tier(arcs, store, simplified_tier(), nests, 1, [&](const char* step) {
+        const size_t now = *heap_in_use();
+        in_use.emplace_back(step, now);
+    });
+    CHECK(state.counts.kept_vertices > size_t(200000));
+    CHECK_EQ(state.counts.crossings_left, size_t(0));
+    auto at_step = [&](const std::string& step) -> int64_t {
+        for (const auto& [name, bytes] : in_use)
+            if (name == step) return static_cast<int64_t>(bytes);
+        return -1;
+    };
+    const int64_t validity = at_step("validity"), grid = at_step("segment grid"), repaired = at_step("repair"),
+                  left = at_step("what is left");
+    REQUIRE(validity >= 0 && grid >= 0 && repaired >= 0 && left >= 0);
+    // What laying the grid took, then gone again once the repair's counts
+    // are in, before count_vertices takes its arrays.
+    const int64_t held = grid - validity;
+    CHECK(held > int64_t(4) << 20);
+    CHECK(repaired - left >= held / 2);
 }
 
 // --- Nesting ---
