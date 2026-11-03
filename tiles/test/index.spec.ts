@@ -472,6 +472,18 @@ describe('TigrisStorageRepository', () => {
     },
   );
 
+  it('reads no object for a key Tigris has no object for', async () => {
+    let body: ReadableStream | null = null;
+    mockTigris(() => {
+      const response = new Response('<Error><Code>NoSuchKey</Code></Error>', { status: 404 });
+      body = response.body;
+      return response;
+    });
+    expect(await repository().getAsStream('styles/bogus.json')).toBeUndefined();
+    await expect(body!.getReader().read()).resolves.toEqual({ done: true, value: undefined });
+    expect(pushed).toEqual([]);
+  });
+
   it('fails a whole-object read Tigris answers with an error', async () => {
     mockTigris(() => new Response('AccessDenied', { status: 403 }));
     await expect(repository().getAsStream('styles/light.json')).rejects.toThrow('Tigris answered a read with 403');
@@ -957,6 +969,18 @@ describe('Tiles', () => {
     expect(await response.json()).toEqual({ ...storedStyle, sources: { vector: inlinedSource } });
   });
 
+  it('answers an unknown style with an uncached 404, without reading the metadata', async () => {
+    globalThis.memCache = new Map();
+    const getAsStream = vi.spyOn(TigrisStorageRepository.prototype, 'getAsStream').mockResolvedValue(undefined);
+    const metrics = captureMetrics();
+    const response = await exports.Tiles.fetch(tilesRequest('/v1/style/bogus'));
+    expect(response.status).toBe(404);
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+    expect(getAsStream).toHaveBeenCalledExactlyOnceWith('styles/bogus.json');
+    expect(metrics('d1_query')).toEqual([]);
+    expect(metrics('error')).toEqual([]);
+  });
+
   it('does not let the edge keep a failure', async () => {
     vi.spyOn(TigrisStorageRepository.prototype, 'getRangeAsStream').mockRejectedValue(new Error('Tigris is down'));
     vi.spyOn(console, 'error').mockImplementation(() => {});
@@ -1044,6 +1068,14 @@ describe('Tiles', () => {
     `('keeps the 404 for a tile $reason despite a matching ETag', async ({ tile }) => {
       const response = await fetchWith(`https://tiles.example/v1/${tile}.mvt`, { 'If-None-Match': etag });
       expect(response.status).toBe(404);
+    });
+
+    it('keeps the 404 for an unknown style from clients', async () => {
+      vi.spyOn(TigrisStorageRepository.prototype, 'getAsStream').mockResolvedValue(undefined);
+      const response = await fetchWith('https://tiles.example/v1/style/bogus', { 'If-None-Match': etag });
+      expect(response.status).toBe(404);
+      expect(response.headers.get('Cache-Control')).toBe('no-store');
+      expect(response.headers.has('ETag')).toBe(false);
     });
 
     it('answers HEAD for a tile Tiles reads from storage without its body', async () => {

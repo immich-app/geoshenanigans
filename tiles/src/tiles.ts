@@ -149,6 +149,7 @@ async function handleRequest(request: Request, env: WorkerEnv, metrics: IMetrics
 
   const handleStyleRequest = async (pmTiles: PMTilesService) => {
     const { style, version } = params as PMTilesStyleParams;
+    // Style names aren't known up front: they are whatever the deployment has in the bucket.
     const stored = await tigrisStorageRepository.getAsStream('styles/' + style + '.json');
     if (!stored) {
       return uncached('Style not found', 404);

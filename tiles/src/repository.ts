@@ -162,8 +162,12 @@ export class TigrisStorageRepository implements IStorageRepository {
     return response.body;
   }
 
-  async getAsStream(key: string): Promise<ReadableStream> {
+  async getAsStream(key: string): Promise<ReadableStream | undefined> {
     const response = await this.get(key);
+    if (response.status === 404) {
+      await response.body?.cancel();
+      return;
+    }
     if (response.status !== 200 || !response.body) {
       await response.body?.cancel();
       throw new Error(`Tigris answered a read with ${response.status}`);

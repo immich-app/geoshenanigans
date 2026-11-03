@@ -11,7 +11,8 @@ export interface IMemCacheRepository {
 
 export interface IStorageRepository {
   getRangeAsStream(range: { length: number; offset: number }, key: string): Promise<ReadableStream>;
-  getAsStream(key: string): Promise<ReadableStream>;
+  // Undefined if there is no such object.
+  getAsStream(key: string): Promise<ReadableStream | undefined>;
   getDeploymentKey(): string;
 }
 
