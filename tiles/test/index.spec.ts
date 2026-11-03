@@ -685,6 +685,27 @@ describe('Tiles', () => {
       expect(response.headers.get('Content-Encoding')).toBe('gzip');
       expect(new TextDecoder().decode(await response.arrayBuffer())).toBe('tile 0');
     });
+
+    it('streams tile bytes from storage to the client as they arrive', async () => {
+      // Random bytes don't compress, so the first half of the gzipped tile decodes to a good part of it.
+      const tile = crypto.getRandomValues(new Uint8Array(64 * 1024));
+      const gzipped = new Uint8Array(
+        await new Response(new Blob([tile]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer(),
+      );
+      // A storage read that sends half the tile and never finishes: anything that waited for the whole body would
+      // hang.
+      vi.spyOn(TigrisStorageRepository.prototype, 'getRangeAsStream').mockImplementation(
+        async () =>
+          new ReadableStream({ start: (controller) => controller.enqueue(gzipped.slice(0, gzipped.length / 2)) }),
+      );
+      const response = await exports.default.fetch(`https://tiles.example/v1/0/0/0.mvt?v=${key}`);
+      expect(response.status).toBe(200);
+      const reader = response.body!.getReader();
+      const { value } = await reader.read();
+      expect(value!.length).toBeGreaterThan(0);
+      expect(value).toEqual(tile.slice(0, value!.length));
+      await reader.cancel();
+    });
   });
 });
 

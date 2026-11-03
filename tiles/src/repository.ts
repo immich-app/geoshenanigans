@@ -137,19 +137,10 @@ export class TigrisStorageRepository implements IStorageRepository {
     return data;
   }
 
-  async getRange(range: { length: number; offset: number }): Promise<ArrayBuffer> {
-    const data = await this.getS3Object({ range });
-    return (await data.transformToByteArray()).buffer as ArrayBuffer;
-  }
-
+  // Reads are only ever handed on as streams, so a tile's bytes go from Tigris to the client as they arrive.
   async getRangeAsStream(range: { length: number; offset: number }, key?: string): Promise<ReadableStream> {
     const data = await this.getS3Object({ range, key });
     return data.transformToWebStream();
-  }
-
-  async get(key: string): Promise<ArrayBuffer> {
-    const data = await this.getS3Object({ key });
-    return (await data.transformToByteArray()).buffer as ArrayBuffer;
   }
 
   async getAsStream(key: string): Promise<ReadableStream> {
