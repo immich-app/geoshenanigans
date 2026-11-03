@@ -1,8 +1,9 @@
 //! Arc files as the builder writes them (builder/src/arc_blocks.h), for the tests here and, with
-//! the `fixtures` feature, for the crates that read them: arcs given as e7 vertices, and the ring
-//! blocks of refs to them.
+//! the `fixtures` feature, for the crates that read them: arcs given as e7 vertices, admin polygon
+//! records whose rings are refs to those arcs, and the four files they make.
 
-use crate::exact_pip::PointE7;
+use crate::exact_pip::{to_e7, PointE7};
+use crate::{AdminPolygon, NO_DATA};
 
 /// An arc block of this many vertices or more carries its box (builder kArcBboxMinVertices).
 pub const ARC_BBOX_MIN_VERTICES: usize = 16;
@@ -35,6 +36,11 @@ pub fn put_varint(mut v: u64, out: &mut Vec<u8>) {
         v >>= 7;
     }
     out.push(v as u8);
+}
+
+/// The point (lat, lng) in degrees on the e7 grid.
+pub fn e7(lat: f64, lng: f64) -> PointE7 {
+    PointE7 { lat: to_e7(lat), lng: to_e7(lng) }
 }
 
 /// A ring's ref to an arc slot, the arc walked backwards when `reversed`.
@@ -143,10 +149,49 @@ pub fn encode_ring(refs: &[Ref], box_of: impl Fn(u32) -> RawBox) -> Vec<u8> {
     out
 }
 
-/// Arcs, in slot order.
+/// A record's 24 bytes as admin_polygons.bin stores it.
+pub fn record_bytes(p: &AdminPolygon) -> Vec<u8> {
+    let b = [
+        &p.ring_offset.to_le_bytes()[..], &p.ring_bytes.to_le_bytes(), &p.name_id.to_le_bytes(),
+        &[p.admin_level, p.place_type_override, p._pad2, p._pad3], &p.area.to_le_bytes(),
+        &p.country_code.to_le_bytes(), &p.hole_count.to_le_bytes(),
+    ]
+    .concat();
+    assert_eq!(b.len(), std::mem::size_of::<AdminPolygon>());
+    b
+}
+
+/// A record with every field but the name, level and area at 0, for `ArcFixture::polygon` to
+/// give its rings.
+pub fn record(name_id: u32, admin_level: u8, area: f32) -> AdminPolygon {
+    AdminPolygon {
+        ring_offset: 0, ring_bytes: 0, name_id, admin_level, place_type_override: 0, _pad2: 0, _pad3: 0, area,
+        country_code: 0, hole_count: 0,
+    }
+}
+
+/// The area the builder stores for a polygon's rings (the outer, then its holes): each ring's
+/// exact shoelace, the holes taken off (none below 0), in square degrees.
+pub fn exact_area(rings: &[Vec<PointE7>]) -> f32 {
+    let twice = |r: &Vec<PointE7>| -> i128 {
+        let n = r.len();
+        (0..n).map(|a| {
+            let b = (a + n - 1) % n;
+            r[b].lat as i128 * r[a].lng as i128 - r[a].lat as i128 * r[b].lng as i128
+        }).sum::<i128>().abs()
+    };
+    let mut area2 = rings.first().map_or(0, twice);
+    for r in rings.iter().skip(1) {
+        area2 -= twice(r);
+    }
+    (area2.max(0) as f64 * 0.5e-14) as f32
+}
+
+/// Admin polygons and the arcs their rings are made of, in slot order.
 #[derive(Default)]
 pub struct ArcFixture {
     arcs: Vec<(Vec<u8>, RawBox)>,
+    polygons: Vec<(AdminPolygon, Vec<Vec<Ref>>)>,
 }
 
 impl ArcFixture {
@@ -171,6 +216,24 @@ impl ArcFixture {
         self.arc_block(Vec::new(), RawBox::EMPTY)
     }
 
+    /// A polygon whose rings, outer first, are the refs given (none: a polygon without rings).
+    /// The record's ring_offset, ring_bytes and hole_count are set from them; its slot.
+    pub fn polygon(&mut self, record: AdminPolygon, rings: &[Vec<Ref>]) -> u32 {
+        self.polygons.push((record, rings.to_vec()));
+        self.polygons.len() as u32 - 1
+    }
+
+    /// A polygon whose closed rings (outer first) are each one arc at grid k; its slot.
+    pub fn ring_polygon(&mut self, record: AdminPolygon, k: u8, rings: &[Vec<PointE7>]) -> u32 {
+        let refs: Vec<Vec<Ref>> = rings.iter().map(|r| vec![Ref::fwd(self.arc(k, r))]).collect();
+        self.polygon(record, &refs)
+    }
+
+    /// A polygon slot's tombstone: no rings and no name.
+    pub fn tombstone(&mut self) -> u32 {
+        self.polygon(AdminPolygon { ring_offset: NO_DATA, name_id: NO_DATA, ..record(0, 0, 0.0) }, &[])
+    }
+
     pub fn arc_index(&self) -> Vec<u8> {
         let mut offset = 0u32;
         let mut index = Vec::new();
@@ -183,5 +246,39 @@ impl ArcFixture {
 
     pub fn arc_vertices(&self) -> Vec<u8> {
         self.arcs.iter().flat_map(|(block, _)| block.iter().copied()).collect()
+    }
+
+    /// The ring block of each polygon, in slot order.
+    pub fn ring_blocks(&self) -> Vec<Vec<u8>> {
+        let box_of = |slot: u32| self.arcs.get(slot as usize).map_or(RawBox::EMPTY, |a| a.1);
+        self.polygons.iter().map(|(_, rings)| rings.iter().flat_map(|r| encode_ring(r, box_of)).collect()).collect()
+    }
+
+    /// Each polygon's record as written: its ring block's offset and length in admin_rings.bin
+    /// and its hole count (a tombstone keeps NO_DATA).
+    pub fn records(&self) -> Vec<AdminPolygon> {
+        let mut offset = 0u32;
+        self.polygons.iter().zip(self.ring_blocks()).map(|((record, rings), block)| {
+            let written = if record.ring_offset == NO_DATA {
+                *record
+            } else {
+                AdminPolygon {
+                    ring_offset: offset, ring_bytes: block.len() as u32,
+                    hole_count: rings.len().saturating_sub(1).min(u16::MAX as usize) as u16, ..*record
+                }
+            };
+            offset += block.len() as u32;
+            written
+        }).collect()
+    }
+
+    /// admin_polygons.bin, admin_rings.bin, arc_index.bin and arc_vertices.bin, by name.
+    pub fn files(&self) -> [(&'static str, Vec<u8>); 4] {
+        [
+            ("admin_polygons.bin", self.records().iter().flat_map(record_bytes).collect()),
+            ("admin_rings.bin", self.ring_blocks().concat()),
+            ("arc_index.bin", self.arc_index()),
+            ("arc_vertices.bin", self.arc_vertices()),
+        ]
     }
 }

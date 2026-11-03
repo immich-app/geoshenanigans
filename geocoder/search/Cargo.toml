@@ -25,6 +25,9 @@ serde_json = "1"
 sha2 = "0.10"
 query-server = { path = "../server" }
 
+[dev-dependencies]
+query-server = { path = "../server", features = ["fixtures"] }
+
 [profile.release]
 opt-level = 3
 lto = true

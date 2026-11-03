@@ -298,25 +298,6 @@ async fn polygons_geojson(
                 }
             }));
         }
-
-        if let (Some(pp), Some(postal)) = (&idx.postal_polygons, &idx.postal_geometry) {
-            let total = pp.len() / std::mem::size_of::<AdminPolygon>() as u64;
-            for i in 0..total {
-                let poly: AdminPolygon = pp.read_at::<AdminPolygon>(i);
-                if !postal.contains_once(&poly, point) { continue; }
-                let rings = postal.rings(&poly);
-                features.push(serde_json::json!({
-                    "type": "Feature",
-                    "geometry": { "type": "Polygon", "coordinates": rings },
-                    "properties": {
-                        "name": idx.get_string(poly.name_id),
-                        "admin_level": 99,
-                        "area": poly.area,
-                        "kind": "postal",
-                    }
-                }));
-            }
-        }
     }
 
     let fc = serde_json::json!({

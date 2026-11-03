@@ -17,7 +17,6 @@
 //! Every read here is bounds-checked: a truncated or overlong varint, an offset past the end of
 //! a file, a malformed head or a coordinate past i32 in e7 units (which the builder's decoder
 //! rejects too) reads as None, never a panic.
-#![cfg_attr(not(test), allow(dead_code))]
 
 use crate::exact_pip::{edge_crosses, PointE7};
 
@@ -81,6 +80,14 @@ impl ChunkBox {
         p.lng < self.min_lng as i64 - CHUNK_BOX_SLACK_E7
             || p.lng >= self.max_lng as i64 + CHUNK_BOX_SLACK_E7
             || p.lat >= self.max_lat as i64 + CHUNK_BOX_SLACK_E7
+    }
+
+    /// Whether, besides `excludes`, `p` is on no edge of the chunk's arcs.
+    #[inline]
+    pub fn excludes_on_edge(&self, p: PointE7) -> bool {
+        p.lng < self.min_lng as i64 - CHUNK_BOX_SLACK_E7
+            || p.lng > self.max_lng as i64 + CHUNK_BOX_SLACK_E7
+            || p.lat > self.max_lat as i64 + CHUNK_BOX_SLACK_E7
     }
 }
 

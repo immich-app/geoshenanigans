@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 mod admin_geometry;
-pub use admin_geometry::{AdminGeometry, AdminPoint, PipMemo};
+pub use admin_geometry::{AdminGeometry, AdminPoint, PipMemo, ADMIN_GEOMETRY_FILES};
 mod arc_blocks;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod arc_fixture;
@@ -49,6 +49,14 @@ impl FileBytes {
     }
 
     pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+    /// The whole file.
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Mmap(m) => m,
+        }
+    }
 
     /// Read `len` bytes starting at `off`.  `len` stays usize because
     /// individual reads are always tiny (max a few KiB of vertices).
@@ -270,7 +278,7 @@ pub fn vertex_scale(enc: u8) -> f64 {
 }
 
 /// Per-polygon header at the start of each polygon's vertex slice in
-/// admin_vertices.bin / poi_vertices.bin / addr_vertices.bin:
+/// poi_vertices.bin / addr_vertices.bin:
 ///   byte 0     : vertex encoding tag (VertexEncoding in builder/src/types.h)
 ///   byte 1     : padding
 ///   bytes 2..6 : bbox_min_lat (f32)
@@ -295,20 +303,22 @@ const PIP_LAT_BOUND_MIN_ABS_LNG: f32 = f32::from_bits(27 << 23);
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AdminPolygon {
-    pub vertex_offset: u32,       // BYTE offset into admin_vertices.bin (to header)
-    pub vertex_count: u32,
+    /// Byte offset of the polygon's ring block in admin_rings.bin (admin_geometry.rs); NO_DATA
+    /// for a tombstone.
+    pub ring_offset: u32,
+    /// The ring block's length; 0 where a tier left the polygon without rings.
+    pub ring_bytes: u32,
     pub name_id: u32,
     pub admin_level: u8,
     pub place_type_override: u8,  // 0=none, 1=city, 2=town, 3=village, 4=suburb, 5=neighbourhood, 6=quarter
     pub _pad2: u8,
     pub _pad3: u8,
-    pub area: f32,                // shoelace, holes subtracted
+    /// The exact shoelace of the polygon's rings, holes taken off, in square degrees: the same in
+    /// every tier.
+    pub area: f32,
     pub country_code: u16,
-    /// Holes appended to the outer ring in the vertex range. They are
-    /// keyhole-encoded (builder/src/polygon_rings.h): each is reached from
-    /// the outer ring's first vertex by axis-aligned connector edges walked
-    /// both ways, which cancel in `point_in_polygon`, so the plain crossing
-    /// test over all `vertex_count` vertices already leaves holes out.
+    /// The polygon's rings after its outer one, saturating at 65535: informational, as the ring
+    /// block holds every ring.
     pub hole_count: u16,
 }
 
@@ -963,7 +973,11 @@ pub struct AdminScan {
 }
 
 impl AdminScan {
+    /// The scan of the point (`lat`, `lng`), rounded once to the e7 grid: its cell is that of the
+    /// point every ring is tested at.
     pub fn new(index: &Index, lat: f64, lng: f64) -> Self {
+        let point = AdminPoint::new(lat, lng);
+        let (lat, lng) = point.degrees();
         let list = Index::lookup_admin_cell_fb(&index.admin_cells, cell_id_at_level(lat, lng, index.admin_cell_level));
         // The list, each record and most ring headers are read below wherever the point is, so
         // they are requested before the first one is needed: their cache misses overlap.
@@ -977,7 +991,7 @@ impl AdminScan {
         for (_, poly) in &rings {
             index.admin_geometry.prefetch(poly);
         }
-        AdminScan { rings, pip: ScanPip { point: AdminPoint::new(lat, lng), memo: PipMemo::new() } }
+        AdminScan { rings, pip: ScanPip { point, memo: PipMemo::new() } }
     }
 
     /// Calls `f(pip, entry, polygon)` for every ring, in visiting order.
@@ -1036,9 +1050,6 @@ pub struct Index {
     pub admin_parents: Option<FileBytes>,  // u32 per poly → next-larger containing admin poly
     pub addr_postcodes: Option<FileBytes>, // u32 per addr_point → postcode string (optional)
     pub way_postcodes: Option<FileBytes>,  // u32 per way → postcode string from postal boundary
-    // Separate postcode files (optional — postcodes omitted when absent)
-    pub postal_polygons: Option<FileBytes>,
-    pub postal_geometry: Option<AdminGeometry>,
     pub postcode_centroids: Option<FileBytes>,
     pub postcode_centroid_cells: Option<FileBytes>,
     pub postcode_centroid_entries: Option<FileBytes>,
@@ -1256,9 +1267,6 @@ impl Index {
             Some(index) => (Some(index.cells), Some(index.entries)),
             None => (None, None),
         };
-        let [postal_polygons, postal_vertices]: [Option<FileBytes>; 2] =
-            mmap_group(dir, &["postal_polygons.bin", "postal_vertices.bin"])?
-                .try_into().map_err(|_| "postal group arity")?;
         let [postcode_centroids, postcode_centroid_cells, postcode_centroid_entries]: [Option<FileBytes>; 3] =
             mmap_group(dir, &["postcode_centroids.bin", "postcode_centroid_cells.bin", "postcode_centroid_entries.bin"])?
                 .try_into().map_err(|_| "centroid group arity")?;
@@ -1278,7 +1286,7 @@ impl Index {
             admin_cells: mmap_file(&format!("{}/admin_cells.bin", dir))?,
             admin_entries: mmap_file(&format!("{}/admin_entries.bin", dir))?,
             admin_polygons: mmap_file(&format!("{}/admin_polygons.bin", dir))?,
-            admin_geometry: AdminGeometry::new(mmap_file(&format!("{}/admin_vertices.bin", dir))?),
+            admin_geometry: AdminGeometry::load(dir)?,
             poi_cells,
             poi_entries,
             poi_records,
@@ -1291,8 +1299,6 @@ impl Index {
             admin_parents: mmap_file_optional(&format!("{}/admin_parents.bin", dir)),
             addr_postcodes: mmap_file_optional(&format!("{}/addr_postcodes.bin", dir)),
             way_postcodes: mmap_file_optional(&format!("{}/way_postcodes.bin", dir)),
-            postal_polygons,
-            postal_geometry: postal_vertices.map(AdminGeometry::new),
             postcode_centroids,
             postcode_centroid_cells,
             postcode_centroid_entries,
@@ -1783,12 +1789,13 @@ impl Index {
     // --- Admin boundary lookup (point-in-polygon) ---
 
     pub fn debug_admin(&self, lat: f64, lng: f64) -> serde_json::Value {
+        let (point, mut memo) = (AdminPoint::new(lat, lng), PipMemo::new());
+        let (lat, lng) = point.degrees();
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
         let mut best_by_level: [Option<(f32, AdminPolygon, bool)>; 12] = [None; 12];
         let mut seen_in_level: [Vec<serde_json::Value>; 12] = Default::default();
-        let (point, mut memo) = (AdminPoint::new(lat, lng), PipMemo::new());
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
@@ -3762,19 +3769,14 @@ mod query_tests {
             strings.push(0);
             id
         };
-        let (mut polygons, mut vertices, mut admin_pairs) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut arcs, mut admin_pairs) = (arc_fixture::ArcFixture::new(), Vec::new());
         for (id, &(boundary, admin_level, [s, w, n, e])) in boundaries.iter().enumerate() {
-            let ring = [s, w, s, e, n, e, n, w, s, w];
-            u32s(&mut polygons, &[vertices.len() as u32, ring.len() as u32 / 2, name(boundary)]);
-            polygons.extend_from_slice(&[admin_level, 0, 0, 0]);
-            polygons.extend_from_slice(&((n - s) * (e - w)).to_le_bytes());
-            polygons.extend_from_slice(&[0; 4]); // country_code, hole_count
-            vertices.extend_from_slice(&[4, 0]); // raw f32 vertices, then the bbox minimum
-            for v in [s, w].iter().chain(&ring) {
-                vertices.extend_from_slice(&v.to_le_bytes());
-            }
+            let at = |lat: f32, lng: f32| arc_fixture::e7(lat as f64, lng as f64);
+            let ring = [at(s, w), at(s, e), at(n, e), at(n, w), at(s, w)];
+            arcs.ring_polygon(arc_fixture::record(name(boundary), admin_level, (n - s) * (e - w)), 0, &[ring.to_vec()]);
             admin_pairs.push((cell((s + n) / 2.0, (w + e) / 2.0), id as u32));
         }
+        let [(_, polygons), (_, rings), (_, arc_index), (_, arc_vertices)] = arcs.files();
         let mut records = Vec::new();
         for &(lat, lng, node, place_type) in nodes {
             records.extend_from_slice(&lat.to_le_bytes());
@@ -3783,7 +3785,6 @@ mod query_tests {
             records.extend_from_slice(&[place_type, 0, 0, 0]);
             u32s(&mut records, &[NO_DATA]);
         }
-        assert_eq!(polygons.len(), boundaries.len() * std::mem::size_of::<AdminPolygon>());
         assert_eq!(records.len(), nodes.len() * std::mem::size_of::<PlaceNode>());
         let (admin_cells, admin_entries) = cell_index(admin_pairs);
         // Derived as a load derives it; a few nodes fit one run, so nothing spills.
@@ -3806,7 +3807,7 @@ mod query_tests {
             admin_cells,
             admin_entries,
             admin_polygons: FileBytes::Owned(polygons),
-            admin_geometry: AdminGeometry::new(FileBytes::Owned(vertices)),
+            admin_geometry: AdminGeometry::new(FileBytes::Owned(rings), FileBytes::Owned(arc_index), FileBytes::Owned(arc_vertices)),
             poi_cells: None,
             poi_entries: None,
             poi_records: None,
@@ -3819,8 +3820,6 @@ mod query_tests {
             admin_parents: None,
             addr_postcodes: None,
             way_postcodes: None,
-            postal_polygons: None,
-            postal_geometry: None,
             postcode_centroids: None,
             postcode_centroid_cells: None,
             postcode_centroid_entries: None,
@@ -3890,7 +3889,7 @@ mod query_tests {
         };
 
         assert_eq!(village(elsewhere), None);
-        assert_eq!(village(AdminPolygon { vertex_count: 0, ..elsewhere }), Some("Shoals Village"));
+        assert_eq!(village(AdminPolygon { ring_bytes: 0, ..elsewhere }), Some("Shoals Village"));
     }
 }
 
@@ -5659,7 +5658,7 @@ mod pure_helper_tests {
 
     fn boundary(name_id: u32, admin_level: u8) -> AdminPolygon {
         AdminPolygon {
-            vertex_offset: 0, vertex_count: 0, name_id, admin_level, place_type_override: 0,
+            ring_offset: 0, ring_bytes: 0, name_id, admin_level, place_type_override: 0,
             _pad2: 0, _pad3: 0, area: 1.0, country_code: 0, hole_count: 0,
         }
     }
@@ -6533,8 +6532,6 @@ mod query_path_tests {
     /// north and east of it.
     const ORIGIN: (f64, f64) = (10.0, 20.0);
     const COUNTRY_CODE: u16 = (b'x' as u16) << 8 | b'x' as u16;
-    /// Raw f32 vertices (VertexEncoding in builder/src/types.h).
-    const RAW_F32_VERTICES: u8 = 4;
 
     /// A rectangle in metres from the origin: (south, west, north, east).
     type Span = (f64, f64, f64, f64);
@@ -6617,9 +6614,8 @@ mod query_path_tests {
             let ring = vec![at(s, w), at(s, e), at(n, e), at(n, w), at(s, w)];
             let (lat_lo, lng_lo, lat_hi, lng_hi) = bounds(&ring);
             let poly = AdminPolygon {
-                vertex_offset: 0, vertex_count: ring.len() as u32, name_id: self.string(name), admin_level,
-                place_type_override, _pad2: 0, _pad3: 0, area: ((lat_hi - lat_lo) * (lng_hi - lng_lo)) as f32,
-                country_code: COUNTRY_CODE, hole_count: 0,
+                place_type_override, country_code: COUNTRY_CODE,
+                ..arc_fixture::record(self.string(name), admin_level, ((lat_hi - lat_lo) * (lng_hi - lng_lo)) as f32)
             };
             self.polygons.push((poly, ring));
             self
@@ -6670,24 +6666,12 @@ mod query_path_tests {
         /// the cell lies inside it; a place node in its own cell; a street in
         /// the street cells along it.
         fn files(&self) -> Vec<(&'static str, Vec<u8>)> {
-            let (mut polygons, mut vertices) = (Vec::new(), Vec::new());
+            let mut arcs = arc_fixture::ArcFixture::new();
             let mut admin_cells: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
             for (id, (poly, ring)) in self.polygons.iter().enumerate() {
                 let (lat_lo, lng_lo, lat_hi, lng_hi) = bounds(ring);
-                polygons.extend_from_slice(&(vertices.len() as u32).to_le_bytes());
-                polygons.extend_from_slice(&poly.vertex_count.to_le_bytes());
-                polygons.extend_from_slice(&poly.name_id.to_le_bytes());
-                polygons.extend_from_slice(&[poly.admin_level, poly.place_type_override, 0, 0]);
-                polygons.extend_from_slice(&poly.area.to_le_bytes());
-                polygons.extend_from_slice(&poly.country_code.to_le_bytes());
-                polygons.extend_from_slice(&poly.hole_count.to_le_bytes());
-                vertices.extend_from_slice(&[RAW_F32_VERTICES, 0]);
-                vertices.extend_from_slice(&(lat_lo as f32).to_le_bytes());
-                vertices.extend_from_slice(&(lng_lo as f32).to_le_bytes());
-                for v in ring {
-                    vertices.extend_from_slice(&v.lat.to_le_bytes());
-                    vertices.extend_from_slice(&v.lng.to_le_bytes());
-                }
+                let e7_ring: Vec<PointE7> = ring.iter().map(|v| arc_fixture::e7(v.lat as f64, v.lng as f64)).collect();
+                arcs.ring_polygon(*poly, 0, &[e7_ring]);
                 for cell in cells_meeting(ring, DEFAULT_ADMIN_CELL_LEVEL) {
                     let b = Cell::from(CellID(cell)).rect_bound();
                     let interior = b.lat_lo().deg() > lat_lo && b.lat_hi().deg() < lat_hi
@@ -6695,12 +6679,9 @@ mod query_path_tests {
                     admin_cells.entry(cell).or_default().push(id as u32 | if interior { INTERIOR_FLAG } else { 0 });
                 }
             }
-            assert_eq!(polygons.len(), self.polygons.len() * std::mem::size_of::<AdminPolygon>());
             let (cells, entries) = cell_files(&admin_cells);
-            let mut files = vec![
-                ("admin_polygons.bin", polygons), ("admin_vertices.bin", vertices),
-                ("admin_cells.bin", cells), ("admin_entries.bin", entries),
-            ];
+            let mut files: Vec<(&'static str, Vec<u8>)> = arcs.files().into();
+            files.extend([("admin_cells.bin", cells), ("admin_entries.bin", entries)]);
 
             if !self.place_nodes.is_empty() {
                 let mut nodes = Vec::new();
@@ -7324,7 +7305,6 @@ mod encoded_pip_tests {
 
 #[cfg(test)]
 mod admin_scan_tests {
-    use super::encoded_pip_tests::pack_ring;
     use super::*;
 
     // A query point on Egypt's side of its 22°N border with Sudan. An S2 covering of the great
@@ -7358,27 +7338,27 @@ mod admin_scan_tests {
     fn admin_index(rings: &[Ring]) -> Index {
         let cell_ids = cells();
         let mut strings = vec![0u8];
-        let mut vertices = Vec::new();
-        let mut polygons = Vec::new();
+        let mut arcs = arc_fixture::ArcFixture::new();
         let mut by_cell: std::collections::BTreeMap<u64, Vec<u32>> = Default::default();
         for (id, r) in rings.iter().enumerate() {
             let name_id = strings.len() as u32;
             strings.extend_from_slice(r.name.as_bytes());
             strings.push(0);
-            let vertex_offset = vertices.len() as u32;
-            vertices.extend(pack_ring(3, &r.verts));
-            polygons.extend_from_slice(&vertex_offset.to_le_bytes());
-            polygons.extend_from_slice(&(r.verts.len() as u32).to_le_bytes());
-            polygons.extend_from_slice(&name_id.to_le_bytes());
-            polygons.extend_from_slice(&[r.level, r.place_type, 0, 0]);
-            polygons.extend_from_slice(&r.area.to_le_bytes());
-            polygons.extend_from_slice(&u16::from_be_bytes(*r.country).to_le_bytes());
-            polygons.extend_from_slice(&[0, 0]);
+            let record = AdminPolygon {
+                place_type_override: r.place_type, country_code: u16::from_be_bytes(*r.country),
+                ..arc_fixture::record(name_id, r.level, r.area)
+            };
+            if r.verts.is_empty() {
+                arcs.polygon(record, &[]);
+            } else {
+                let ring: Vec<PointE7> = r.verts.iter().chain(&r.verts[..1]).map(|&(lat, lng)| arc_fixture::e7(lat, lng)).collect();
+                arcs.ring_polygon(record, 0, &[ring]);
+            }
             for &(k, interior) in &r.cells {
                 by_cell.entry(cell_ids[k]).or_default().push(id as u32 | if interior { INTERIOR_FLAG } else { 0 });
             }
         }
-        assert_eq!(polygons.len(), rings.len() * std::mem::size_of::<AdminPolygon>());
+        let [(_, polygons), (_, ring_blocks), (_, arc_index), (_, arc_vertices)] = arcs.files();
         let (mut cells, mut entries) = (Vec::new(), Vec::new());
         for (cell, mut ids) in by_cell {
             ids.sort_unstable(); // the builder sorts each cell's entries by value
@@ -7395,12 +7375,11 @@ mod admin_scan_tests {
             admin_cells: FileBytes::Owned(cells),
             admin_entries: FileBytes::Owned(entries),
             admin_polygons: FileBytes::Owned(polygons),
-            admin_geometry: AdminGeometry::new(FileBytes::Owned(vertices)),
+            admin_geometry: AdminGeometry::new(FileBytes::Owned(ring_blocks), FileBytes::Owned(arc_index), FileBytes::Owned(arc_vertices)),
             poi_cells: None, poi_entries: None, poi_records: None, poi_vertices: None,
             poi_meta: PoiMeta { categories: HashMap::new() },
             place_nodes: None, place_cells: None, place_entries: None,
             way_parents: None, admin_parents: None, addr_postcodes: None, way_postcodes: None,
-            postal_polygons: None, postal_geometry: None,
             postcode_centroids: None, postcode_centroid_cells: None, postcode_centroid_entries: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(FileBytes::Owned(strings)), None, None, None, None], [0, len, len, len, len, len]),
@@ -7436,8 +7415,8 @@ mod admin_scan_tests {
 
     #[test]
     fn a_longitude_whole_turns_away_is_in_no_ring() {
-        // S2 wraps the longitude back into Q's cell; point-in-polygon tests the f32 longitude
-        // itself, 9.7e11 degrees east of every ring (past the i64 range of the enc 3 grid).
+        // S2 would wrap the longitude back into Q's cell, but the point is rounded to the e7 grid
+        // first, 9.7e11 degrees east of every ring (past i64 in e7 units): beyond them all.
         let far = Q.1 + 360.0 * 2.7e9;
         assert_eq!(cell_id_at_level(Q.0, far, DEFAULT_ADMIN_CELL_LEVEL), cell_id_at_level(Q.0, Q.1, DEFAULT_ADMIN_CELL_LEVEL));
         let idx = admin_index(&[
@@ -7447,6 +7426,8 @@ mod admin_scan_tests {
         assert_eq!(idx.find_admin(Q.0, Q.1).country, Some("Egypt"));
         let a = idx.find_admin(Q.0, far);
         assert_eq!((a.country, a.state), (None, None));
+        let egypt = idx.admin_polygon(0).unwrap();
+        assert!(!idx.admin_geometry.contains_once(&egypt, AdminPoint::new(Q.0, far)));
     }
 
     #[test]
@@ -7560,7 +7541,7 @@ mod admin_scan_tests {
         assert_eq!(&src.read_chunk(0, 3)[..], &[1, 2, 3]);
     }
 
-    /// A ring a tier simplified away: its record keeps its name, its vertex range is empty.
+    /// A ring a tier simplified away: its record keeps its name, its ring block is empty.
     fn ringless(name: &'static str, level: u8, cells: &[(usize, bool)]) -> Ring {
         Ring { verts: Vec::new(), ..ring(name, level, 1.0, EGYPT, cells) }
     }

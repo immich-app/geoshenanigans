@@ -22,7 +22,15 @@ const root = mkdtempSync(join(tmpdir(), 'geocoder-node-search-'));
 after(() => rmSync(root, { recursive: true, force: true }));
 
 const u32 = (v) => { const b = Buffer.alloc(4); b.writeUInt32LE(v); return b; };
+const i32 = (v) => { const b = Buffer.alloc(4); b.writeInt32LE(v); return b; };
 const f32 = (v) => { const b = Buffer.alloc(4); b.writeFloatLE(v); return b; };
+const varint = (v) => {
+  const out = [];
+  for (; v >= 0x80; v = Math.floor(v / 0x80)) out.push((v % 0x80) | 0x80);
+  out.push(v);
+  return Buffer.from(out);
+};
+const zigzag = (v) => (v >= 0 ? 2 * v : -2 * v - 1);
 
 // A dataset as the builder writes one: a country boundary and two places named `names`.
 function writeDataset(dir, names) {
@@ -37,14 +45,21 @@ function writeDataset(dir, names) {
   };
   const country = string('Testland');
   const places = names.map(string);
-  const ring = [[10, 20], [10, 21], [11, 21], [11, 20], [10, 20]];
-  const vertices = Buffer.concat([Buffer.from([4, 0]), f32(10), f32(20), ...ring.flatMap(([lat, lng]) => [f32(lat), f32(lng)])]);
-  const polygons = Buffer.concat([u32(0), u32(ring.length), u32(country), Buffer.from([2, 0, 0, 0]), f32(1), Buffer.from('tl'), Buffer.from([0, 0])]);
+  // The country's ring as one arc in e7 units: a flags byte (grid exponent 0, no box), the
+  // first vertex, then zigzag varint deltas. Its ring block is one chunk of one ref, to slot 0,
+  // that ends the ring.
+  const ring = [[10, 20], [10, 21], [11, 21], [11, 20], [10, 20]].map(([lat, lng]) => [lat * 1e7, lng * 1e7]);
+  const deltas = ring.slice(1).flatMap(([lat, lng], i) => [varint(zigzag(lat - ring[i][0])), varint(zigzag(lng - ring[i][1]))]);
+  const arc = Buffer.concat([Buffer.from([0]), i32(ring[0][0]), i32(ring[0][1]), ...deltas]);
+  const rings = Buffer.from([(1 << 2) | 1, 0]);
+  const polygons = Buffer.concat([u32(0), u32(rings.length), u32(country), Buffer.from([2, 0, 0, 0]), f32(1), Buffer.from('tl'), Buffer.from([0, 0])]);
   const nodes = Buffer.concat(places.map((name, i) => Buffer.concat([f32(10.2 + i * 0.5), f32(20.5), u32(name), Buffer.from([1, 0, 0, 0]), u32(0)])));
   const tiers = Array.from({ length: 5 }, (_, t) => ({ start: t === 0 ? 0 : size, end: size }));
   const files = {
     'admin_polygons.bin': polygons,
-    'admin_vertices.bin': vertices,
+    'admin_rings.bin': rings,
+    'arc_index.bin': u32(0),
+    'arc_vertices.bin': arc,
     'admin_cells.bin': Buffer.alloc(0),
     'admin_entries.bin': Buffer.alloc(0),
     'place_nodes.bin': nodes,
