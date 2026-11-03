@@ -802,6 +802,22 @@ TEST(an_arc_whose_ends_meet_keeps_four_vertices) {
     const std::vector<StoredVertex> v = stored_of(arcs, store, simplified_tier(), state, 0);
     CHECK(points_of(v) == Ring({pt(0, 0), pt(300, 50000), pt(0, 100000), pt(0, 0)}));
     CHECK_EQ(state.counts.degenerate_rings, size_t(0));
+
+    // The same sliver as one lobe of a ring that touches itself at (0, 0),
+    // its other lobe a triangle: the lobe is an arc from that junction back
+    // to it, and the ring keeps the triangle's area whatever the lobe keeps,
+    // so only the rule keeps the lobe from folding to a spike.
+    const Ring lobes = closed({pt(0, 0), pt(300, 50000), pt(0, 100000), pt(-250, 50000), pt(0, 0),
+                               pt(50000, -100000), pt(-50000, -100000)});
+    const AdminExactRings lobed = store_of({{lobes, {}}});
+    const AdminArcs lobe_arcs = build_arc_topology(lobed, 1);
+    const ArcTierState lobe_state = tier_of(lobe_arcs, lobed, simplified_tier());
+    const uint32_t lobe = arc_through(lobe_arcs, lobed, pt(300, 50000));
+    REQUIRE(lobe != UINT32_MAX);
+    CHECK(!lobe_arcs.arcs[lobe].view.closed);
+    CHECK(points_of(stored_of(lobe_arcs, lobed, simplified_tier(), lobe_state, lobe)) ==
+          Ring({pt(0, 0), pt(300, 50000), pt(0, 100000), pt(0, 0)}));
+    CHECK_EQ(lobe_state.counts.validity_restored, size_t(0));
 }
 
 TEST(the_simplified_tier_snaps_to_the_1_1_m_grid_and_drops_repeats) {
