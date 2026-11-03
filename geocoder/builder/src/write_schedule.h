@@ -200,6 +200,17 @@ inline StageCosts stage_costs(const KindValues& bytes) {
     return c;
 }
 
+// What writing a region's arc dirs (--arcs-out) holds beside its records:
+// one dir's records and the polygon maps of its slots, one set's slot maps,
+// and admin-minimal's subset of the core strings with its marks (at most
+// the core and a quarter).
+inline uint64_t arc_dirs_cost(const ParsedData& d) {
+    uint64_t slots = 0;
+    for (const ArcSetBlocks& s : d.admin_arcs.sets) slots = std::max<uint64_t>(slots, s.sidecar.size());
+    const uint64_t core = d.strings_tiers[0].size();
+    return vector_bytes(d.admin_polygons) * 2 + slots * 2 * sizeof(uint32_t) + core + core / 4;
+}
+
 // How a region's write runs and the bytes it holds at its peak: its records
 // plus the most any step holds beside them.
 struct RegionCost {

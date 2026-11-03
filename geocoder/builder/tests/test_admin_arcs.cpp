@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -1158,6 +1159,11 @@ AdminArcBlocks with_block(const AdminArcBlocks& from, size_t t, size_t a, const 
     return out;
 }
 
+std::vector<char> read_bytes(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    return std::vector<char>(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
 Ring exact_arc(const AdminArcBlocks& blocks, size_t a) {
     const ArcBlocks& exact = blocks.tiers[1];
     arc_blocks::DecodedArc d;
@@ -1342,6 +1348,56 @@ TEST(a_continents_arc_and_ring_blocks_are_the_planets_in_its_own_slots) {
         CHECK(two.slot_counts.tombstones > 0);
         CHECK_EQ(two.sidecar.size(), one.sidecar.size());
     }
+}
+
+TEST(a_dirs_arc_and_ring_files_lay_the_blocks_out_in_slot_order) {
+    const ScratchDir dir("admin-arc-files");
+    const MixedStore m = mixed_store();
+    const AdminArcs arcs = build_admin_arcs(m.store, m.in_minimal, "", 1);
+    AdminArcBlocks blocks = encode_admin_arcs(arcs, m.store, 1);
+    // Slots of another day: the arcs backwards, a tombstone after each.
+    ArcSetBlocks& full = blocks.set(ArcSet::Full);
+    const uint32_t n = static_cast<uint32_t>(full.arcs());
+    full.sidecar.assign(2 * n, gc::id_alloc::SidecarSlot{0, gc::id_alloc::SLOT_FLAG_TOMBSTONE, 0, 0, 0});
+    for (uint32_t a = 0; a < n; a++) {
+        full.slots[a] = 2 * (n - 1 - a);
+        full.sidecar[full.slots[a]] = {uint8_t(gc::id_alloc::ObjectType::ARC), 0, 0, 0, full.keys[a]};
+    }
+    encode_ring_blocks(blocks, ArcSet::Full, 2);
+    write_arc_files(dir.path(), full, blocks.tiers[1]);
+    const std::vector<char> index = read_bytes(dir.path() + "/arc_index.bin"),
+                            vertices = read_bytes(dir.path() + "/arc_vertices.bin");
+    REQUIRE(index.size() == 2 * n * sizeof(uint32_t));
+    std::vector<uint32_t> at(2 * n);
+    std::memcpy(at.data(), index.data(), index.size());
+    for (uint32_t slot = 0; slot < 2 * n; slot++) {
+        const size_t end = slot + 1 < 2 * n ? at[slot + 1] : vertices.size();
+        if (slot % 2) {
+            CHECK_EQ(end, size_t(at[slot]));
+            continue;
+        }
+        const size_t a = n - 1 - slot / 2;
+        REQUIRE(end - at[slot] == blocks.tiers[1].bytes_of(a));
+        CHECK(std::memcmp(vertices.data() + at[slot], blocks.tiers[1].data(a), end - at[slot]) == 0);
+    }
+    // Records: polygon 5 then a tombstone then polygon 0 (its hole).
+    AdminPolygon five{}, zero{};
+    five.name_id = 55;
+    zero.name_id = 11;
+    const size_t ring_bytes = write_ring_files(dir.path(), blocks, ArcSet::Full, {five, admin_polygon_tombstone(), zero},
+                                               {5, NO_DATA, 0});
+    const std::vector<char> records = read_bytes(dir.path() + "/admin_polygons.bin"),
+                            rings = read_bytes(dir.path() + "/admin_rings.bin");
+    REQUIRE(records.size() == 3 * sizeof(AdminPolygon));
+    AdminPolygon got[3];
+    std::memcpy(got, records.data(), records.size());
+    const BlockSpan b5 = blocks.polygons[5].blocks[0], b0 = blocks.polygons[0].blocks[0];
+    CHECK(got[0].vertex_offset == 0 && got[0].vertex_count == b5.size && got[0].hole_count == 0 && got[0].name_id == 55);
+    CHECK(got[1].vertex_offset == NO_DATA && got[1].vertex_count == 0 && got[1].name_id == NO_DATA);
+    CHECK(got[2].vertex_offset == b5.size && got[2].vertex_count == b0.size && got[2].hole_count == 1);
+    REQUIRE(rings.size() == ring_bytes && ring_bytes == size_t(b5.size) + b0.size);
+    CHECK(std::memcmp(rings.data(), full.ring_blocks.data() + b5.offset, b5.size) == 0);
+    CHECK(std::memcmp(rings.data() + b5.size, full.ring_blocks.data() + b0.offset, b0.size) == 0);
 }
 
 // --- The stage's dirs ---

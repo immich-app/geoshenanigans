@@ -9,6 +9,7 @@
 #include <iostream>
 #include <numeric>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <tuple>
@@ -1395,28 +1396,29 @@ struct AdminMinimalSlots {
 // full set's (apply_strategy2_admins). A dense renumbering shifted every later
 // id whenever one kept polygon came or went, re-sending ~459K parent ids
 // (3.5 MiB raw) every planet day.
-static AdminMinimalSlots own_admin_minimal_slots(const ParsedData& data, const AdminMinimalPolygons& kept,
+// `kept` holds the shared ids of the polygons it keeps, ascending.
+static AdminMinimalSlots own_admin_minimal_slots(const ParsedData& data, const std::vector<uint32_t>& kept,
                                                  const std::string& region_prev, const std::string& dir) {
     using namespace gc::id_alloc;
     IdAllocator alloc;
     if (!region_prev.empty()) alloc.load_previous(region_prev + "/admin-minimal/admin_polygons.osm_ids");
-    const std::vector<uint32_t> slots = alloc.allocate_all(kept.ids.size(), [&](size_t k) {
-        const uint32_t id = kept.ids[k];
+    const std::vector<uint32_t> slots = alloc.allocate_all(kept.size(), [&](size_t k) {
+        const uint32_t id = kept[k];
         return admin_identity(id < data.admin_osm_ids.size() ? data.admin_osm_ids[id] : 0);
     });
     alloc.finalize();
     IdAllocator::write_sidecar(dir + "/admin_polygons.osm_ids", alloc.slots());
 
     AdminMinimalSlots out{std::vector<uint32_t>(data.admin_polygons.size(), NO_DATA), alloc.total_slots()};
-    for (size_t k = 0; k < kept.ids.size(); k++) out.slot_of[kept.ids[k]] = slots[k];
+    for (size_t k = 0; k < kept.size(); k++) out.slot_of[kept[k]] = slots[k];
     return out;
 }
 
 // The shared slots of the quality dirs, which POI parent_poly_ids name: each
 // polygon at its own id.
-static AdminMinimalSlots shared_admin_minimal_slots(const ParsedData& data, const AdminMinimalPolygons& kept) {
+static AdminMinimalSlots shared_admin_minimal_slots(const ParsedData& data, const std::vector<uint32_t>& kept) {
     AdminMinimalSlots out{std::vector<uint32_t>(data.admin_polygons.size(), NO_DATA), data.admin_polygons.size()};
-    for (uint32_t id : kept.ids) out.slot_of[id] = id;
+    for (uint32_t id : kept) out.slot_of[id] = id;
     return out;
 }
 
@@ -1432,7 +1434,7 @@ struct AdminMinimalStrings {
 
 // The core strings admin-minimal's records name: its polygons' and its place
 // nodes', in the order of the shared core.
-static StringSubset admin_minimal_names(const ParsedData& data, const AdminMinimalPolygons& kept) {
+static StringSubset admin_minimal_names(const ParsedData& data, const std::vector<uint32_t>& kept) {
     const std::vector<char>& core = data.strings_tiers[0];
     std::vector<std::atomic<uint64_t>> used(core.size() / 64 + 1);
     auto use = [&](uint32_t name) {
@@ -1442,8 +1444,8 @@ static StringSubset admin_minimal_names(const ParsedData& data, const AdminMinim
                                    std::to_string(core.size()) + " bytes)");
         mark_bit(used, name);
     };
-    parallel_for(kept.ids.size(), [&](size_t b, size_t e, unsigned) {
-        for (size_t k = b; k < e; k++) use(data.admin_polygons[kept.ids[k]].name_id);
+    parallel_for(kept.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t k = b; k < e; k++) use(data.admin_polygons[kept[k]].name_id);
     });
     parallel_for(data.place_nodes.size(), [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++)
@@ -1527,12 +1529,78 @@ void write_admin_minimal(const ParsedData& data, const std::string& region_dir, 
 
     const std::string own_dir = region_dir + "/admin-minimal";
     ensure_dir(own_dir);
-    const StringSubset names = admin_minimal_names(data, kept);
-    write_admin_minimal_dir(data, own_dir, kept, own_admin_minimal_slots(data, kept, region_prev, own_dir),
+    const StringSubset names = admin_minimal_names(data, kept.ids);
+    write_admin_minimal_dir(data, own_dir, kept, own_admin_minimal_slots(data, kept.ids, region_prev, own_dir),
                             {names.bytes(), core_only_strings_layout(names.bytes().size()), &names});
 
-    const std::string poi_dir = region_dir + "/admin-minimal-poi";
+    const std::string poi_dir = region_dir + "/" + kAdminMinimalPoiDir;
     ensure_dir(poi_dir);
-    write_admin_minimal_dir(data, poi_dir, kept, shared_admin_minimal_slots(data, kept),
+    write_admin_minimal_dir(data, poi_dir, kept, shared_admin_minimal_slots(data, kept.ids),
                             {data.strings_tiers[0], data.strings_tier_bases});
+}
+
+void write_arc_dirs(const ParsedData& data, const std::string& region_dir, const std::string& region_prev) {
+    const AdminArcBlocks& arcs = data.admin_arcs;
+    const size_t n = data.admin_polygons.size();
+    if (arcs.polygons.size() != n) throw std::logic_error("admin arc polygons out of step with the polygons");
+    // A dir's records: polygon i at slot slots.slot_of[i] (none at NO_DATA),
+    // named name(its shared name), and a tombstone at every other slot.
+    struct Records {
+        std::vector<AdminPolygon> at_slot;
+        std::vector<uint32_t> polygon_of;
+    };
+    auto records_at = [&](const AdminMinimalSlots& slots, auto name) {
+        Records out{std::vector<AdminPolygon>(slots.count, admin_polygon_tombstone()),
+                    std::vector<uint32_t>(slots.count, NO_DATA)};
+        for (size_t i = 0; i < n; i++) {
+            const uint32_t slot = slots.slot_of[i];
+            if (slot == NO_DATA) continue;
+            out.at_slot[slot] = data.admin_polygons[i];
+            out.at_slot[slot].name_id = name(data.admin_polygons[i].name_id);
+            out.polygon_of[slot] = static_cast<uint32_t>(i);
+        }
+        return out;
+    };
+    auto shared_name = [](uint32_t name) { return name; };
+    std::ostringstream summary;
+    summary << "  Arc dirs of " << region_dir << ":";
+    auto write_dir = [&](const std::string& dir, size_t tier, const Records& records) {
+        const ArcSet set = kArcTiers[tier].set;
+        ensure_dir(dir);
+        const size_t ring_bytes = write_ring_files(dir, arcs, set, records.at_slot, records.polygon_of);
+        write_arc_files(dir, arcs.set(set), arcs.tiers[tier]);
+        summary << " " << dir_label(dir) << " " << records.at_slot.size() << " slots, " << ring_bytes
+                << " ring bytes, " << arcs.tiers[tier].bytes.size() << " arc bytes;";
+    };
+    // Live polygons (no strategy-2 tombstone) whose rings `set` holds.
+    auto holding = [&](ArcSet set) {
+        std::vector<uint32_t> ids;
+        for (size_t i = 0; i < n; i++)
+            if (data.admin_polygons[i].vertex_offset != NO_DATA &&
+                (set == ArcSet::Full || arcs.polygons[i].blocks[static_cast<size_t>(set)].size > 0))
+                ids.push_back(static_cast<uint32_t>(i));
+        return ids;
+    };
+
+    // The full set's tiers, in the shared slots.
+    const Records shared = records_at(shared_admin_minimal_slots(data, holding(ArcSet::Full)), shared_name);
+    for (size_t t = 0; t < kArcTierCount; t++)
+        if (kArcTiers[t].set == ArcSet::Full) write_dir(region_dir + "/" + kArcTiers[t].dir, t, shared);
+    gc::id_alloc::IdAllocator::write_sidecar(arc_sidecar_path(region_dir, ArcSet::Full), arcs.set(ArcSet::Full).sidecar);
+
+    // The minimal set's, in admin-minimal's own slots (and names) and in the
+    // shared ones.
+    const std::vector<uint32_t> kept = holding(ArcSet::Minimal);
+    for (size_t t = 0; t < kArcTierCount; t++) {
+        if (kArcTiers[t].set != ArcSet::Minimal) continue;
+        const std::string own_dir = region_dir + "/" + kArcTiers[t].dir;
+        ensure_dir(own_dir);
+        const StringSubset names = admin_minimal_names(data, kept);
+        write_dir(own_dir, t, records_at(own_admin_minimal_slots(data, kept, region_prev, own_dir),
+                                         [&](uint32_t name) { return names.offset_of(name); }));
+        write_dir(region_dir + "/" + kAdminMinimalPoiDir, t, records_at(shared_admin_minimal_slots(data, kept), shared_name));
+    }
+    gc::id_alloc::IdAllocator::write_sidecar(arc_sidecar_path(region_dir, ArcSet::Minimal),
+                                             arcs.set(ArcSet::Minimal).sidecar);
+    std::cerr << summary.str() << std::endl;
 }

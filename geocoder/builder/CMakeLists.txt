@@ -243,9 +243,12 @@ add_executable(geocoder-s2-tests
     src/cell_index.cpp
     src/s2_helpers.cpp
 )
-target_include_directories(geocoder-s2-tests PRIVATE src tests)
+target_include_directories(geocoder-s2-tests PRIVATE src tools tests)
+# tests/s2/test_arc_dirs_opt_in.cpp runs build-index on a PBF it writes.
+target_compile_definitions(geocoder-s2-tests PRIVATE GEOCODER_BUILD_INDEX_BIN="$<TARGET_FILE:build-index>")
+add_dependencies(geocoder-s2-tests build-index)
 geocoder_link_s2(geocoder-s2-tests)
-target_link_libraries(geocoder-s2-tests PRIVATE Threads::Threads)
+target_link_libraries(geocoder-s2-tests PRIVATE ZLIB::ZLIB libdeflate::libdeflate Threads::Threads)
 add_test(NAME geocoder-s2-tests COMMAND geocoder-s2-tests)
 
 # GEOCODER_SANITIZE=ON builds the unit tests and the tools they run with ASan

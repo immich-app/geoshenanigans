@@ -508,3 +508,15 @@ AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector
 // the planet's order; then its ring blocks with them. Logs the slots.
 void assign_region_arc_slots(AdminArcBlocks& blocks, const std::string& prev_region_dir, const std::string& region,
                              unsigned threads);
+
+// A tier dir's arc files: arc_index.bin (each slot's block offset in
+// arc_vertices.bin, a u32) and arc_vertices.bin (the blocks in slot order, a
+// tombstone's empty).
+void write_arc_files(const std::string& dir, const ArcSetBlocks& set, const ArcBlocks& tier);
+
+// A dir's admin_polygons.bin and admin_rings.bin in set `set`: records[slot]
+// with its ring block (that of polygon polygon_of[slot]) laid out in slot
+// order, a tombstone record (NO_DATA) holding none. Returns admin_rings.bin's
+// size.
+size_t write_ring_files(const std::string& dir, const AdminArcBlocks& blocks, ArcSet set,
+                        std::vector<AdminPolygon> records, const std::vector<uint32_t>& polygon_of);

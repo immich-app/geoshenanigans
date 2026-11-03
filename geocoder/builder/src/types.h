@@ -252,6 +252,10 @@ inline constexpr ArcTier kArcTiers[] = {
 };
 inline constexpr size_t kArcTierCount = sizeof(kArcTiers) / sizeof(kArcTiers[0]);
 
+// The dir beside admin-minimal that holds the minimal set's arcs too, in the
+// shared polygon slots a POI's parent names (write_admin_minimal).
+inline constexpr const char* kAdminMinimalPoiDir = "admin-minimal-poi";
+
 // The arc files' blocks (arc_blocks.h). An arc block of this many stored
 // vertices or more carries its box.
 static constexpr uint32_t kArcBboxMinVertices = 16;

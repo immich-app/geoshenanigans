@@ -3,11 +3,13 @@
 // a continent's share of them, and the arc files of a dir.
 #include <algorithm>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
 
 #include "admin_arcs.h"
+#include "cell_index_io.h"
 #include "parallel.h"
 #include "parsed_data.h"
 #include "ranked_bits.h"
@@ -460,4 +462,50 @@ void assign_region_arc_slots(AdminArcBlocks& blocks, const std::string& prev_reg
              << ";";
     }
     std::cerr << line.str() << "\n";
+}
+
+void write_arc_files(const std::string& dir, const ArcSetBlocks& set, const ArcBlocks& tier) {
+    if (tier.size() != set.arcs()) throw std::logic_error("arc blocks out of step with their set");
+    const std::vector<uint32_t> arc_of = arc_at_slot(set);
+    std::vector<uint32_t> index(arc_of.size());
+    const std::string path = dir + "/arc_vertices.bin";
+    std::ofstream f(path, std::ios::binary);
+    uint64_t at = 0;
+    for (size_t slot = 0; slot < arc_of.size(); slot++) {
+        index[slot] = static_cast<uint32_t>(at);
+        if (arc_of[slot] == UINT32_MAX) continue;
+        const size_t n = tier.bytes_of(arc_of[slot]);
+        f.write(reinterpret_cast<const char*>(tier.data(arc_of[slot])), static_cast<std::streamsize>(n));
+        at += n;
+        if (at > UINT32_MAX) throw std::length_error(path + " past 4 GiB: arc_index.bin holds 32-bit offsets");
+    }
+    f.flush();
+    if (!f) throw std::runtime_error("failed to write " + path);
+    write_binary_file(dir + "/arc_index.bin", reinterpret_cast<const char*>(index.data()), index.size() * sizeof(uint32_t));
+}
+
+size_t write_ring_files(const std::string& dir, const AdminArcBlocks& blocks, ArcSet set,
+                        std::vector<AdminPolygon> records, const std::vector<uint32_t>& polygon_of) {
+    if (records.size() != polygon_of.size()) throw std::logic_error("admin records out of step with their polygons");
+    const ArcSetBlocks& s = blocks.set(set);
+    const std::string path = dir + "/admin_rings.bin";
+    std::ofstream f(path, std::ios::binary);
+    uint64_t at = 0;
+    for (size_t slot = 0; slot < records.size(); slot++) {
+        if (polygon_of[slot] == NO_DATA) continue;
+        const AdminArcPolygon& p = blocks.polygons[polygon_of[slot]];
+        const BlockSpan span = p.blocks[set_index(set)];
+        AdminPolygon& r = records[slot];
+        r.vertex_offset = static_cast<uint32_t>(at);
+        r.vertex_count = span.size;
+        r.hole_count = static_cast<uint16_t>(std::min<uint32_t>(p.ring_count ? p.ring_count - 1 : 0, UINT16_MAX));
+        f.write(reinterpret_cast<const char*>(s.ring_blocks.data() + span.offset), span.size);
+        at += span.size;
+        if (at > UINT32_MAX) throw std::length_error(path + " past 4 GiB: admin_polygons.bin holds 32-bit offsets");
+    }
+    f.flush();
+    if (!f) throw std::runtime_error("failed to write " + path);
+    write_binary_file(dir + "/admin_polygons.bin", reinterpret_cast<const char*>(records.data()),
+                      records.size() * sizeof(AdminPolygon));
+    return at;
 }

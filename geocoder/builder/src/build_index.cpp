@@ -1490,13 +1490,15 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             std::function<void()> write;
             uint64_t cost;
         };
-        const Stage stages[] = {
+        std::vector<Stage> stages = {
             {"modes", write_modes, costs.modes},
             {"quality variants", write_quality_dirs, costs.quality},
             {"place files", write_places, costs.places},
             {"admin-minimal", write_admin_minimal_set, costs.admin_minimal},
             {"poi tiers", write_poi_tiers, costs.poi_tiers},
         };
+        if (!region_arcs.empty())
+            stages.push_back({"arc dirs", [&] { write_arc_dirs(d, region_arcs, region_prev_arcs); }, arc_dirs_cost(d)});
         auto run_stage = [&](const Stage& stage) {
             std::optional<BudgetLease> lease;
             if (budget) lease.emplace(*budget, stage.cost);
@@ -1587,7 +1589,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // when the budget holds them beside the costliest continents that can
     // run together; else one after another, to hold memory down while
     // continent subsets build alongside.
-    const uint64_t planet_stages = stage_costs(record_bytes(data)).total();
+    const uint64_t planet_stages =
+        stage_costs(record_bytes(data)).total() + (cfg.arcs_out_dir.empty() ? 0 : arc_dirs_cost(data));
 
     // The planet's own write and each continent's split read the planet
     // records; the last of them to finish frees them beside the work left,
