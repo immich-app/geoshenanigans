@@ -20,7 +20,9 @@
 #include <vector>
 
 #if defined(__SANITIZE_ADDRESS__)
-#include <sanitizer/allocator_interface.h>
+// ASan's runtime has it, but GCC ships no sanitizer/allocator_interface.h
+// to declare it.
+extern "C" size_t __sanitizer_get_current_allocated_bytes();
 #elif defined(__GLIBC__)
 #include <malloc.h>
 #endif
