@@ -1207,7 +1207,7 @@ TEST(the_repair_grid_is_handed_back_before_the_vertices_are_counted) {
     // What laying the grid took, then gone again once the repair's counts
     // are in, before count_vertices takes its arrays.
     const int64_t held = grid - validity;
-    CHECK(held > int64_t(4) << 20);
+    CHECK(held > (int64_t(4) << 20));
     CHECK(repaired - left >= held / 2);
 }
 
