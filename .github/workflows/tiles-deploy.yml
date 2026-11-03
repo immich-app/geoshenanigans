@@ -320,6 +320,12 @@ jobs:
           done
           exit 1
 
+      # Moves tiles-worker's state off Cloudflare provider v4 for the apply below (see its MIGRATION.md). A no-op once
+      # it has, and a re-run after a failed apply picks up where it stopped.
+      - name: Migrate tiles-worker state
+        working-directory: deployment
+        run: op run --env-file=".env" -- scripts/tiles-worker-v5-state.sh apply
+
       - name: Apply tiles worker
         working-directory: deployment/modules/cloudflare/tiles-worker
         env:
