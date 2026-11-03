@@ -54,25 +54,46 @@ std::vector<PackedLocation> vertices_of(const AdminExactRings& store, const Arc&
     return out;
 }
 
-// Whether every ring of the store in set `set` (a minimal ring for the
-// minimal set) comes back from its refs: the same cycle, in the ring's own
-// direction.
-bool every_ring_rebuilds(const AdminArcs& arcs, const AdminExactRings& store, ArcSet set = ArcSet::Full) {
+// Whether ring r of the store comes back as `rebuilt`: the same cycle, in
+// the ring's own direction.
+bool rebuilds_ring(const AdminExactRings& store, uint32_t r, const std::vector<PackedLocation>& rebuilt) {
+    const RingSpan& span = store.rings[r];
+    if (!same_closed_ring(rebuilt.data(), static_cast<uint32_t>(rebuilt.size()), store.vertices.data() + span.begin,
+                          span.count))
+        return false;
+    // Not merely the reverse: the chain runs the way the ring does.
+    Ring forwards(store.vertices.begin() + span.begin, store.vertices.begin() + span.begin + span.count);
+    Ring doubled(forwards.begin(), forwards.end() - 1);
+    doubled.insert(doubled.end(), forwards.begin(), forwards.end() - 1);
+    for (size_t s = 0; s + 1 < forwards.size(); s++)
+        if (std::equal(rebuilt.begin(), rebuilt.end() - 1, doubled.begin() + s)) return true;
+    return false;
+}
+
+// Whether every ring of the store comes back from its full-set refs.
+bool every_ring_rebuilds(const AdminArcs& arcs, const AdminExactRings& store) {
+    for (uint32_t r = 0; r < store.rings.size(); r++)
+        if (!rebuilds_ring(store, r, rebuild_ring(arcs, store, ArcSet::Full, r))) return false;
+    return true;
+}
+
+// Whether every ring of the polygons `in_minimal` marks (the fixture's own
+// marks, not what the minimal set says it holds) comes back from its
+// minimal-set refs, none of them empty, and every other ring has none.
+bool every_minimal_ring_rebuilds(const AdminArcs& arcs, const AdminExactRings& store,
+                                 const std::vector<bool>& in_minimal) {
+    if (in_minimal.size() != store.polygons.size()) return false;
+    std::vector<bool> minimal_ring(store.rings.size(), false);
+    for (size_t p = 0; p < in_minimal.size(); p++)
+        for (uint32_t k = 0; in_minimal[p] && k < store.polygons[p].ring_count; k++)
+            minimal_ring[store.polygons[p].first_ring + k] = true;
     for (uint32_t r = 0; r < store.rings.size(); r++) {
-        const RingSpan& span = store.rings[r];
-        const std::vector<PackedLocation> rebuilt = rebuild_ring(arcs, store, set, r);
-        if (set == ArcSet::Minimal && rebuilt.empty()) continue;
-        if (!same_closed_ring(rebuilt.data(), static_cast<uint32_t>(rebuilt.size()), store.vertices.data() + span.begin,
-                              span.count))
-            return false;
-        // Not merely the reverse: the chain runs the way the ring does.
-        Ring forwards(store.vertices.begin() + span.begin, store.vertices.begin() + span.begin + span.count);
-        Ring doubled(forwards.begin(), forwards.end() - 1);
-        doubled.insert(doubled.end(), forwards.begin(), forwards.end() - 1);
-        bool found = false;
-        for (size_t s = 0; s + 1 < forwards.size() && !found; s++)
-            found = std::equal(rebuilt.begin(), rebuilt.end() - 1, doubled.begin() + s);
-        if (!found) return false;
+        const std::vector<PackedLocation> rebuilt = rebuild_ring(arcs, store, ArcSet::Minimal, r);
+        if (!minimal_ring[r]) {
+            if (!rebuilt.empty()) return false;
+            continue;
+        }
+        if (rebuilt.empty() || !rebuilds_ring(store, r, rebuilt)) return false;
     }
     return true;
 }
@@ -677,7 +698,8 @@ TEST(a_minimal_border_is_one_arc_across_a_junction_only_other_polygons_make) {
     const Ring right = closed({pt(0, 0), pt(0, 10), pt(10, 10), pt(10, 0), pt(5, 0)});
     const Ring triangle = closed({pt(5, 0), pt(4, -3), pt(6, -3)});
     const AdminExactRings store = store_of({{left, {}}, {right, {}}, {triangle, {}}});
-    const AdminArcs arcs = full_and_minimal(store, {true, true, false});
+    const std::vector<bool> in_minimal = {true, true, false};
+    const AdminArcs arcs = full_and_minimal(store, in_minimal);
     CHECK_EQ(arcs.counts.junctions, size_t(3));
     CHECK_EQ(arcs.counts.arcs, size_t(5));
     const MinimalArcs& m = arcs.minimal;
@@ -693,7 +715,7 @@ TEST(a_minimal_border_is_one_arc_across_a_junction_only_other_polygons_make) {
         CHECK(!m.arcs[a].closed);
     }
     CHECK(found);
-    CHECK(every_ring_rebuilds(arcs, store, ArcSet::Minimal));
+    CHECK(every_minimal_ring_rebuilds(arcs, store, in_minimal));
     // The triangle's ring has no minimal refs.
     CHECK_EQ(m.ring_refs[3], m.ring_refs[2]);
 }
@@ -704,7 +726,8 @@ TEST(a_minimal_loop_joined_from_full_arcs_starts_at_its_smallest_vertex) {
     const Ring ring = island(5000, 5000, 400, 10, 9);
     const auto [a, b] = halves(ring, 5, pt(5000, 5000));
     const AdminExactRings store = store_of({{ring, {}}, {a, {}}, {b, {}}});
-    const AdminArcs arcs = full_and_minimal(store, {true, false, false});
+    const std::vector<bool> in_minimal = {true, false, false};
+    const AdminArcs arcs = full_and_minimal(store, in_minimal);
     CHECK_EQ(arcs.counts.junctions, size_t(2));
     const MinimalArcs& m = arcs.minimal;
     REQUIRE(m.arcs.size() == 1u);
@@ -722,7 +745,8 @@ TEST(a_minimal_loop_joined_from_full_arcs_starts_at_its_smallest_vertex) {
     CHECK_EQ(vertex_key(minimal_vertices(store, arcs, 0).front()), smallest);
     // Neither junction is the smallest: the loop starts inside a full arc.
     CHECK(m.arcs[0].start > 0 || vertex_key(ring[0]) == smallest || vertex_key(ring[5]) == smallest);
-    CHECK(every_ring_rebuilds(arcs, store, ArcSet::Minimal));
+    // The island's ring comes back from its refs to the loop; the halves have none.
+    CHECK(every_minimal_ring_rebuilds(arcs, store, in_minimal));
 }
 
 TEST(the_minimal_set_is_the_topology_of_the_minimal_polygons_alone) {
@@ -780,7 +804,7 @@ TEST(the_minimal_set_is_the_topology_of_the_minimal_polygons_alone) {
                 CHECK(got == want);
             }
         }
-        CHECK(every_ring_rebuilds(arcs, store, ArcSet::Minimal));
+        CHECK(every_minimal_ring_rebuilds(arcs, store, in_minimal));
         // The same on one thread.
         const AdminArcs one = full_and_minimal(store, in_minimal, 1);
         CHECK(one.minimal.refs == m.refs && one.minimal.parts == m.parts && one.minimal.part_at == m.part_at);
