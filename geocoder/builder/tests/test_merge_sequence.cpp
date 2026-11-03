@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "in_place_edits.h"
 #include "test_framework.h"
 
 namespace {
@@ -90,6 +91,20 @@ std::string tombstones(uint32_t n, char fill) { return std::string(size_t(n) * 1
 // The first nightly without unnamed POIs tombstoned 24,543 contiguous planet
 // poi/all records in place, behind and ahead of unchanged ones.
 constexpr uint32_t HEAD = 100, DEAD = 24543, TAIL = 5000;
+
+// old_f rebuilt from seq (stride 12): MATCH copies its records, DELETE skips
+// them, INSERT appends the sequence's; recs[op] counts each op's records.
+std::string replay(const std::string& old_f, const MergeSequence& seq, size_t recs[4]) {
+    std::string out;
+    size_t at = 0;
+    for_each_merge_op(seq, 12, [&](uint8_t op, uint32_t count, const char* inline_records) {
+        recs[op] += count;
+        if (op == OP_MATCH_RUN) out.append(old_f, at * 12, size_t(count) * 12);
+        if (inline_records) out.append(inline_records, size_t(count) * 12);
+        if (op != OP_INSERT_RUN) at += count;
+    });
+    return out;
+}
 
 }  // namespace
 
@@ -257,6 +272,111 @@ TEST(build_merge_seq_still_matches_the_tombstones_both_days_hold) {
         std::vector<Op> want = {{OP_DELETE_RUN, 1, ""}, {OP_MATCH_RUN, DEAD + TAIL, ""}};
         CHECK(got == want);
     }
+}
+
+TEST(build_merge_seq_matches_the_records_kept_among_records_edited_in_place) {
+    // A changed record at the cursor is passed only with the old record
+    // after it, which a stretch of edits too dense for a jump to be taken
+    // there never lets the cursor do: 12,000 such records leave the old
+    // records' counterparts behind a window of 10,000, and the rest of the
+    // file goes as DELETE + INSERT. Every unchanged record stays a MATCH.
+    constexpr uint32_t N = 200000, DENSE = 20000, DENSE_N = 12000;
+    std::mt19937 rng(20261103);
+    const auto edited = gctest::edited_in_place(rng, N, DENSE, DENSE_N);
+    const std::string old_f = numbered(0, N);
+    std::string new_f = old_f;
+    uint32_t n_edited = 0;
+    for (uint32_t i = 0; i < N; i++)
+        if (edited[i]) { new_f[size_t(i) * 12 + 4] = 'e'; n_edited++; }
+    size_t recs[4] = {};
+    const std::string got = replay(old_f, build_merge_seq(old_f.data(), old_f.size(), new_f.data(), new_f.size(), 12), recs);
+
+    CHECK(got == new_f);
+    CHECK_EQ(recs[OP_MATCH_RUN], size_t(N - n_edited));
+    CHECK_EQ(recs[OP_DELETE_RUN], size_t(n_edited));
+    CHECK_EQ(recs[OP_INSERT_RUN], size_t(n_edited));
+}
+
+TEST(build_merge_seq_matches_a_block_both_files_hold_twice_behind_deleted_records) {
+    // Two records deleted in front of a block of 12,000 that both files hold
+    // twice. Each record at the cursor has a copy further on in new, but the
+    // records after its old copy two records on are the ones that follow:
+    // sent in place of the deleted records, the block's records would put
+    // the cursor past their old copies, with the second copy past the
+    // window, and 12,000 unchanged records would go as DELETE + INSERT.
+    constexpr uint32_t B = 12000;
+    const std::string block = numbered(0, B);
+    auto got = merge_of(numbered(900000, 2) + block + block, block + block);
+    std::vector<Op> want = {{OP_DELETE_RUN, 2, ""}, {OP_MATCH_RUN, 2 * B, ""}};
+    CHECK(got == want);
+}
+
+TEST(build_merge_seq_matches_the_kept_records_of_a_block_held_twice_and_edited_in_place) {
+    // The block both files hold twice behind two deleted records, with 7 in
+    // 10 of its records edited in place on the new side: the records after
+    // an unchanged one's old copy still follow it better than those after
+    // the cursor, so it waits for that copy and every unchanged record of
+    // both copies stays a MATCH.
+    constexpr uint32_t B = 12000;
+    std::mt19937 rng(5);
+    const auto edited = gctest::edited_in_place(rng, B, 0, B);
+    const std::string block = numbered(0, B);
+    std::string block_new = block;
+    uint32_t n_edited = 0;
+    for (uint32_t i = 0; i < B; i++)
+        if (edited[i]) { block_new[size_t(i) * 12 + 4] = 'e'; n_edited++; }
+    const std::string old_f = numbered(900000, 2) + block + block, new_f = block_new + block_new;
+    size_t recs[4] = {};
+    const std::string got = replay(old_f, build_merge_seq(old_f.data(), old_f.size(), new_f.data(), new_f.size(), 12), recs);
+
+    CHECK(got == new_f);
+    CHECK_EQ(recs[OP_MATCH_RUN], size_t(2 * (B - n_edited)));
+    CHECK_EQ(recs[OP_DELETE_RUN], size_t(2 + 2 * n_edited));
+    CHECK_EQ(recs[OP_INSERT_RUN], size_t(2 * n_edited));
+}
+
+TEST(build_merge_seq_sends_deaths_in_place_among_yesterdays_tombstones) {
+    // Runs of 20 records that died in place, every 300 records, among runs
+    // of 30 of yesterday's tombstones, every 1000, and records edited in
+    // place, densely in [10000, 22000). A new tombstone at the cursor has
+    // copies further on in both files, and the old ones are other slots'
+    // tombstones: it goes in place of the record that died there, and every
+    // slot the two days share stays a MATCH.
+    constexpr uint32_t N = 100000;
+    for (char fill : {'\0', '\xff'}) {
+        std::mt19937 rng(91);
+        const auto edited = gctest::edited_in_place(rng, N, 10000, 12000);
+        std::string old_f = numbered(0, N), new_f = old_f;
+        const std::string t = tombstones(1, fill);
+        uint32_t kept = 0;
+        for (uint32_t i = 0; i < N; i++) {
+            if (i % 1000 < 30) { old_f.replace(size_t(i) * 12, 12, t); new_f.replace(size_t(i) * 12, 12, t); kept++; }
+            else if (i % 300 < 20) new_f.replace(size_t(i) * 12, 12, t);
+            else if (edited[i]) new_f[size_t(i) * 12 + 4] = 'e';
+            else kept++;
+        }
+        size_t recs[4] = {};
+        const std::string got = replay(old_f, build_merge_seq(old_f.data(), old_f.size(), new_f.data(), new_f.size(), 12), recs);
+
+        CHECK(got == new_f);
+        CHECK_EQ(recs[OP_MATCH_RUN], size_t(kept));
+        CHECK_EQ(recs[OP_DELETE_RUN], size_t(N - kept));
+        CHECK_EQ(recs[OP_INSERT_RUN], size_t(N - kept));
+    }
+}
+
+TEST(build_merge_seq_sends_edited_records_as_one_delete_then_one_insert) {
+    // Records sent in place of deleted ones join the INSERT after the DELETE
+    // run, with a jump's records and with those the new file ends with: the
+    // child streams pair the two runs.
+    std::string body = "abcdefghijklmnopqrstuvwxyz0123";
+    std::vector<Op> want = {{OP_MATCH_RUN, 3, ""}, {OP_DELETE_RUN, 2, ""}, {OP_INSERT_RUN, 2, records("DE")},
+                            {OP_MATCH_RUN, 25, ""}};
+    CHECK(record_merge(body, "abcDE" + body.substr(5)) == want);
+    want = {{OP_MATCH_RUN, 3, ""}, {OP_DELETE_RUN, 2, ""}, {OP_INSERT_RUN, 4, records("DE+!")}, {OP_MATCH_RUN, 25, ""}};
+    CHECK(record_merge(body, "abcDE+!" + body.substr(5)) == want);
+    want = {{OP_MATCH_RUN, 28, ""}, {OP_DELETE_RUN, 2, ""}, {OP_INSERT_RUN, 3, records("XY!")}};
+    CHECK(record_merge(body, body.substr(0, 28) + "XY!") == want);
 }
 
 TEST(for_each_merge_op_steps_over_inline_records) {

@@ -1105,7 +1105,7 @@ std::vector<CellItemPair> union_of_tiers(std::vector<std::vector<CellItemPair>> 
     for (auto& cells : tiers) {
         std::copy(cells.begin(), cells.end(), all.begin() + at);
         at += cells.size();
-        cells = {};
+        free_storage(cells);
     }
     parallel_sort(all.begin(), all.end(), [](const CellItemPair& a, const CellItemPair& b) {
         if (a.cell_id != b.cell_id) return a.cell_id < b.cell_id;
@@ -1122,7 +1122,7 @@ std::vector<CellItemPair> union_of_tiers(std::vector<std::vector<CellItemPair>> 
         const bool everywhere = end - i == tiers.size();
         found.push_back({all[i].cell_id, (all[i].item_id & ID_MASK) | (interior && everywhere ? INTERIOR_FLAG : 0)});
     });
-    all = {};
+    free_storage(all);
     parallel_sort(out.begin(), out.end(), cell_item_less, threads);
     return out;
 }
@@ -1373,16 +1373,20 @@ void write_admin_minimal(const ParsedData& data, const std::string& region_dir, 
 void write_admin_tiers(const ParsedData& data, const std::string& region_dir) {
     require_arcs_in_step(data);
     const AdminArcBlocks& arcs = data.admin_arcs;
-    const SlotRecords shared =
-        records_at(data, shared_admin_minimal_slots(data, polygons_holding(data, ArcSet::Full)), shared_name);
     std::vector<std::string> dirs;
     for (const ArcTier& tier : kArcTiers)
         if (tier.set == ArcSet::Full) dirs.push_back(region_dir + "/" + tier.dir);
     for (const std::string& dir : dirs) ensure_dir(dir);
-    const size_t ring_bytes = write_ring_files(dirs, arcs, ArcSet::Full, shared.at_slot, shared.polygon_of);
     std::ostringstream summary;
-    summary << "  Boundary tiers of " << region_dir << ": " << shared.at_slot.size() << " slots, " << ring_bytes
-            << " ring bytes;";
+    // The records in the shared slots, a copy of every polygon, gone once
+    // the tiers' records and rings are written.
+    {
+        const SlotRecords shared =
+            records_at(data, shared_admin_minimal_slots(data, polygons_holding(data, ArcSet::Full)), shared_name);
+        const size_t ring_bytes = write_ring_files(dirs, arcs, ArcSet::Full, shared.at_slot, shared.polygon_of);
+        summary << "  Boundary tiers of " << region_dir << ": " << shared.at_slot.size() << " slots, " << ring_bytes
+                << " ring bytes;";
+    }
     for (size_t t = 0; t < kArcTierCount; t++) {
         if (kArcTiers[t].set != ArcSet::Full) continue;
         write_arc_files(region_dir + "/" + kArcTiers[t].dir, arcs.set(ArcSet::Full), arcs.tiers[t]);

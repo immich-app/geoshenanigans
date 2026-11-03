@@ -182,7 +182,9 @@ inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& c
          + sum(continent_pairs) * sizeof(CellItemPair) / kFilterPairCopyDivisor;
 }
 
-// What each write stage holds while it runs.
+// What each write stage holds while it runs: every stage a region's write
+// runs, the boundary tiers and both admin-minimal dirs (which write the arc
+// geometry) among them.
 struct StageCosts {
     uint64_t modes = 0, admin_tiers = 0, places = 0, admin_minimal = 0, poi_tiers = 0;
 
@@ -216,7 +218,8 @@ inline uint64_t region_peak(const KindValues& bytes, const KindValues& counts, u
 }
 
 // A continent runs its steps at once when that fits the budget, else one
-// after another.
+// after another. It holds its whole reservation: its write takes no stage
+// leases of its own.
 inline RegionCost continent_cost(const KindValues& bytes, const KindValues& counts, uint64_t filter_bytes,
                                  uint64_t capacity) {
     const uint64_t at_once = region_peak(bytes, counts, filter_bytes, RunOrder::Concurrent);

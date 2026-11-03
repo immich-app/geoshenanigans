@@ -13,10 +13,19 @@
 #include <fstream>
 #include <functional>
 #include <map>
+#include <optional>
 #include <random>
 #include <set>
 #include <string>
 #include <vector>
+
+#if defined(__SANITIZE_ADDRESS__)
+// ASan's runtime has it, but GCC ships no sanitizer/allocator_interface.h
+// to declare it.
+extern "C" size_t __sanitizer_get_current_allocated_bytes();
+#elif defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include "parsed_data.h"
 #include "reorder.h"
@@ -54,25 +63,46 @@ std::vector<PackedLocation> vertices_of(const AdminExactRings& store, const Arc&
     return out;
 }
 
-// Whether every ring of the store in set `set` (a minimal ring for the
-// minimal set) comes back from its refs: the same cycle, in the ring's own
-// direction.
-bool every_ring_rebuilds(const AdminArcs& arcs, const AdminExactRings& store, ArcSet set = ArcSet::Full) {
+// Whether ring r of the store comes back as `rebuilt`: the same cycle, in
+// the ring's own direction.
+bool rebuilds_ring(const AdminExactRings& store, uint32_t r, const std::vector<PackedLocation>& rebuilt) {
+    const RingSpan& span = store.rings[r];
+    if (!same_closed_ring(rebuilt.data(), static_cast<uint32_t>(rebuilt.size()), store.vertices.data() + span.begin,
+                          span.count))
+        return false;
+    // Not merely the reverse: the chain runs the way the ring does.
+    Ring forwards(store.vertices.begin() + span.begin, store.vertices.begin() + span.begin + span.count);
+    Ring doubled(forwards.begin(), forwards.end() - 1);
+    doubled.insert(doubled.end(), forwards.begin(), forwards.end() - 1);
+    for (size_t s = 0; s + 1 < forwards.size(); s++)
+        if (std::equal(rebuilt.begin(), rebuilt.end() - 1, doubled.begin() + s)) return true;
+    return false;
+}
+
+// Whether every ring of the store comes back from its full-set refs.
+bool every_ring_rebuilds(const AdminArcs& arcs, const AdminExactRings& store) {
+    for (uint32_t r = 0; r < store.rings.size(); r++)
+        if (!rebuilds_ring(store, r, rebuild_ring(arcs, store, ArcSet::Full, r))) return false;
+    return true;
+}
+
+// Whether every ring of the polygons `in_minimal` marks (the fixture's own
+// marks, not what the minimal set says it holds) comes back from its
+// minimal-set refs, none of them empty, and every other ring has none.
+bool every_minimal_ring_rebuilds(const AdminArcs& arcs, const AdminExactRings& store,
+                                 const std::vector<bool>& in_minimal) {
+    if (in_minimal.size() != store.polygons.size()) return false;
+    std::vector<bool> minimal_ring(store.rings.size(), false);
+    for (size_t p = 0; p < in_minimal.size(); p++)
+        for (uint32_t k = 0; in_minimal[p] && k < store.polygons[p].ring_count; k++)
+            minimal_ring[store.polygons[p].first_ring + k] = true;
     for (uint32_t r = 0; r < store.rings.size(); r++) {
-        const RingSpan& span = store.rings[r];
-        const std::vector<PackedLocation> rebuilt = rebuild_ring(arcs, store, set, r);
-        if (set == ArcSet::Minimal && rebuilt.empty()) continue;
-        if (!same_closed_ring(rebuilt.data(), static_cast<uint32_t>(rebuilt.size()), store.vertices.data() + span.begin,
-                              span.count))
-            return false;
-        // Not merely the reverse: the chain runs the way the ring does.
-        Ring forwards(store.vertices.begin() + span.begin, store.vertices.begin() + span.begin + span.count);
-        Ring doubled(forwards.begin(), forwards.end() - 1);
-        doubled.insert(doubled.end(), forwards.begin(), forwards.end() - 1);
-        bool found = false;
-        for (size_t s = 0; s + 1 < forwards.size() && !found; s++)
-            found = std::equal(rebuilt.begin(), rebuilt.end() - 1, doubled.begin() + s);
-        if (!found) return false;
+        const std::vector<PackedLocation> rebuilt = rebuild_ring(arcs, store, ArcSet::Minimal, r);
+        if (!minimal_ring[r]) {
+            if (!rebuilt.empty()) return false;
+            continue;
+        }
+        if (rebuilt.empty() || !rebuilds_ring(store, r, rebuilt)) return false;
     }
     return true;
 }
@@ -677,7 +707,8 @@ TEST(a_minimal_border_is_one_arc_across_a_junction_only_other_polygons_make) {
     const Ring right = closed({pt(0, 0), pt(0, 10), pt(10, 10), pt(10, 0), pt(5, 0)});
     const Ring triangle = closed({pt(5, 0), pt(4, -3), pt(6, -3)});
     const AdminExactRings store = store_of({{left, {}}, {right, {}}, {triangle, {}}});
-    const AdminArcs arcs = full_and_minimal(store, {true, true, false});
+    const std::vector<bool> in_minimal = {true, true, false};
+    const AdminArcs arcs = full_and_minimal(store, in_minimal);
     CHECK_EQ(arcs.counts.junctions, size_t(3));
     CHECK_EQ(arcs.counts.arcs, size_t(5));
     const MinimalArcs& m = arcs.minimal;
@@ -693,7 +724,7 @@ TEST(a_minimal_border_is_one_arc_across_a_junction_only_other_polygons_make) {
         CHECK(!m.arcs[a].closed);
     }
     CHECK(found);
-    CHECK(every_ring_rebuilds(arcs, store, ArcSet::Minimal));
+    CHECK(every_minimal_ring_rebuilds(arcs, store, in_minimal));
     // The triangle's ring has no minimal refs.
     CHECK_EQ(m.ring_refs[3], m.ring_refs[2]);
 }
@@ -704,7 +735,8 @@ TEST(a_minimal_loop_joined_from_full_arcs_starts_at_its_smallest_vertex) {
     const Ring ring = island(5000, 5000, 400, 10, 9);
     const auto [a, b] = halves(ring, 5, pt(5000, 5000));
     const AdminExactRings store = store_of({{ring, {}}, {a, {}}, {b, {}}});
-    const AdminArcs arcs = full_and_minimal(store, {true, false, false});
+    const std::vector<bool> in_minimal = {true, false, false};
+    const AdminArcs arcs = full_and_minimal(store, in_minimal);
     CHECK_EQ(arcs.counts.junctions, size_t(2));
     const MinimalArcs& m = arcs.minimal;
     REQUIRE(m.arcs.size() == 1u);
@@ -722,7 +754,54 @@ TEST(a_minimal_loop_joined_from_full_arcs_starts_at_its_smallest_vertex) {
     CHECK_EQ(vertex_key(minimal_vertices(store, arcs, 0).front()), smallest);
     // Neither junction is the smallest: the loop starts inside a full arc.
     CHECK(m.arcs[0].start > 0 || vertex_key(ring[0]) == smallest || vertex_key(ring[5]) == smallest);
-    CHECK(every_ring_rebuilds(arcs, store, ArcSet::Minimal));
+    // The island's ring comes back from its refs to the loop; the halves have none.
+    CHECK(every_minimal_ring_rebuilds(arcs, store, in_minimal));
+}
+
+TEST(a_junction_two_minimal_spurs_end_at_stays_one_as_each_ring_turns_back_there) {
+    // Two minimal squares, each with a spur out to v (u-v-u and w-v-w), and a
+    // triangle of another level touching v. The full set cuts at v (its
+    // neighbours u, w and the triangle's two), where only the spurs' ends are
+    // the minimal rings': joining them into u-v-w would make each ring leave
+    // that chain at v, as each comes back along its own spur.
+    const PackedLocation u = pt(5, 10), v = pt(5, 15), w = pt(5, 20);
+    const Ring left = closed({pt(0, 0), pt(0, 10), u, v, u, pt(10, 10), pt(10, 0)});
+    const Ring right = closed({pt(0, 20), w, v, w, pt(10, 20), pt(10, 30), pt(0, 30)});
+    const Ring triangle = closed({v, pt(8, 14), pt(8, 16)});
+    const AdminExactRings store = store_of({{left, {}}, {right, {}}, {triangle, {}}});
+    const std::vector<bool> in_minimal = {true, true, false};
+    const AdminArcs arcs = full_and_minimal(store, in_minimal);
+    CHECK_EQ(arcs.counts.junctions, size_t(3));  // u, v and w
+    CHECK_EQ(arcs.counts.arcs, size_t(5));       // each spur, each square's rest, the triangle
+    const MinimalArcs& m = arcs.minimal;
+    CHECK_EQ(m.counts.core_arcs, size_t(4));
+    CHECK_EQ(m.counts.joined_junctions, size_t(0));
+    CHECK_EQ(m.counts.turnback_junctions, size_t(1));
+    // v stays a junction: each spur is a minimal arc of its own, its ring's
+    // twice, walked each way.
+    REQUIRE(m.arcs.size() == 4u);
+    for (const Ring& spur : {Ring{u, v}, Ring{v, w}}) {
+        bool found = false;
+        for (uint32_t a = 0; a < m.arcs.size(); a++) {
+            if (minimal_vertices(store, arcs, a) != spur) continue;
+            found = true;
+            CHECK_EQ(m.arcs[a].part_count, 1u);
+            size_t forwards = 0, backwards = 0;
+            for (const ArcRef& ref : m.refs)
+                if (ref.arc == a) (ref.reversed ? backwards : forwards)++;
+            CHECK(forwards == 1 && backwards == 1);
+        }
+        CHECK(found);
+    }
+    CHECK(every_minimal_ring_rebuilds(arcs, store, in_minimal));
+
+    // And the whole stage over it: tiers, encoding and its losslessness check.
+    const AdminArcs staged = build_admin_arcs(store, in_minimal, "", 2);
+    CHECK_EQ(staged.minimal.counts.turnback_junctions, size_t(1));
+    CHECK(every_minimal_ring_rebuilds(staged, store, in_minimal));
+    const AdminArcBlocks blocks = encode_admin_arcs(staged, store, 2);
+    CHECK_EQ(blocks.polygons.size(), size_t(3));
+    for (size_t p = 0; p < 2; p++) CHECK(blocks.polygons[p].blocks[static_cast<size_t>(ArcSet::Minimal)].size > 0);
 }
 
 TEST(the_minimal_set_is_the_topology_of_the_minimal_polygons_alone) {
@@ -780,7 +859,7 @@ TEST(the_minimal_set_is_the_topology_of_the_minimal_polygons_alone) {
                 CHECK(got == want);
             }
         }
-        CHECK(every_ring_rebuilds(arcs, store, ArcSet::Minimal));
+        CHECK(every_minimal_ring_rebuilds(arcs, store, in_minimal));
         // The same on one thread.
         const AdminArcs one = full_and_minimal(store, in_minimal, 1);
         CHECK(one.minimal.refs == m.refs && one.minimal.parts == m.parts && one.minimal.part_at == m.part_at);
@@ -1060,6 +1139,76 @@ TEST(the_repair_gives_back_the_vertices_a_crossing_needs_and_leaves_raw_crossing
         CHECK(points_of(stored_of(arcs, store, simplified_tier(), state, here)) ==
               points_of(stored_of(alone_arcs, alone, simplified_tier(), alone_state, 0)));
     }
+}
+
+namespace {
+
+// The heap's bytes in use, where the build can tell: ASan's count under
+// ASan, else glibc's arenas and mapped blocks.
+std::optional<size_t> heap_in_use() {
+#if defined(__SANITIZE_ADDRESS__)
+    return __sanitizer_get_current_allocated_bytes();
+#elif defined(__GLIBC__)
+    const struct mallinfo2 mi = mallinfo2();
+    return mi.uordblks + mi.hblkhd;
+#else
+    return std::nullopt;
+#endif
+}
+
+// A square island of side `side` e7 units from (lat, lng), each side `n`
+// segments zigzagging `amplitude` either side of the straight line, so that
+// the simplified tier keeps every vertex and nothing crosses.
+Ring zigzag_square(int32_t lat, int32_t lng, int32_t side, int n, int32_t amplitude) {
+    const PackedLocation corners[] = {pt(lat, lng), pt(lat, lng + side), pt(lat + side, lng + side), pt(lat + side, lng)};
+    Ring ring;
+    for (int e = 0; e < 4; e++) {
+        const PackedLocation a = corners[e], b = corners[(e + 1) % 4];
+        for (int k = 0; k < n; k++) {
+            const int32_t la = a.lat_e7 + int32_t(int64_t(b.lat_e7 - a.lat_e7) * k / n);
+            const int32_t ln = a.lon_e7 + int32_t(int64_t(b.lon_e7 - a.lon_e7) * k / n);
+            const int32_t off = k == 0 ? 0 : k % 2 ? amplitude : -amplitude;
+            ring.push_back(a.lat_e7 == b.lat_e7 ? pt(la + off, ln) : pt(la, ln + off));
+        }
+    }
+    return closed(ring);
+}
+
+}  // namespace
+
+TEST(the_repair_grid_is_handed_back_before_the_vertices_are_counted) {
+    if (!heap_in_use()) return;  // no heap count in this build
+
+    // 256 islands of 800 kept segments each, 0.4 degrees across: some 8 MiB
+    // of segments and grid cells.
+    std::vector<Polygon> islands;
+    for (int r = 0; r < 16; r++)
+        for (int c = 0; c < 16; c++)
+            islands.push_back({zigzag_square(r * 5000000, c * 5000000, 4000000, 200, 10000), {}});
+    const AdminExactRings store = store_of(islands);
+    const AdminArcs arcs = build_arc_topology(store, 1);
+    const std::vector<bool> nests = exact_rings_nest(store, 1);
+    std::vector<std::pair<std::string, size_t>> in_use;
+    in_use.reserve(16);
+    const ArcTierState state = build_arc_tier(arcs, store, simplified_tier(), nests, 1, [&](const char* step) {
+        const size_t now = *heap_in_use();
+        in_use.emplace_back(step, now);
+    });
+    CHECK(state.counts.kept_vertices > size_t(200000));
+    CHECK_EQ(state.counts.crossings_left, size_t(0));
+    auto at_step = [&](const std::string& step) -> int64_t {
+        for (const auto& [name, bytes] : in_use)
+            if (name == step) return static_cast<int64_t>(bytes);
+        return -1;
+    };
+    const int64_t validity = at_step("validity"), grid = at_step("segment grid"), repaired = at_step("repair"),
+                  left = at_step("what is left");
+    REQUIRE(validity >= 0 && grid >= 0 && repaired >= 0 && left >= 0);
+    // What laying the grid took, then gone again once the repair's counts
+    // are in, before count_vertices takes its arrays.
+    const int64_t held = grid - validity;
+    CHECK(held > (int64_t(4) << 20));
+    CHECK(repaired - left >= held / 2);
 }
 
 // --- Nesting ---

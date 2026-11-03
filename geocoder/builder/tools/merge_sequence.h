@@ -265,10 +265,18 @@ inline MergeSequence build_merge_seq(
     size_t new_n = new_size / stride;
     size_t oi = 0, ni = 0;
     MergeSequence seq;
-    uint32_t match_run = 0, del_run = 0;
+    uint32_t match_run = 0, del_run = 0, sub_run = 0;
 
     auto flush_match = [&]() { if (match_run > 0) { seq.add_match(match_run); match_run = 0; } };
-    auto flush_del = [&]() { if (del_run > 0) { seq.add_delete(del_run); del_run = 0; } };
+    // The DELETE run, then one INSERT of new[ni - sub_run, to): the sub_run
+    // records sent in place of deleted ones (see below), and those a jump to
+    // `to` passes.
+    auto flush_del = [&](size_t to) {
+        if (del_run > 0) { seq.add_delete(del_run); del_run = 0; }
+        const size_t from = ni - sub_run;
+        if (to > from) seq.add_insert(new_data + from * stride, static_cast<uint32_t>(to - from), stride);
+        sub_run = 0;
+    };
 
     // For small strides (<=8), records aren't unique enough for hash matching.
     // Use simple sequential scan instead.
@@ -287,13 +295,60 @@ inline MergeSequence build_merge_seq(
     constexpr size_t REACH = 10000;
     RecordJumpIndex new_index(new_data, use_hash ? new_n : 0, stride);
     JumpWindow window(new_data, use_hash ? new_n : 0, stride, REACH);
+    RecordJumpIndex old_index(old_data, use_hash ? old_n : 0, stride);
+
+    // A new record that no old record after this one equals is an INSERT
+    // whatever the merge does next, so when the old record goes as a DELETE
+    // the new one is sent in its place and the cursor moves on with it.
+    // Records edited in place need that: otherwise the cursor passes a
+    // changed record only by a jump, and the guards below refuse one unless
+    // the next old record follows it (and, past FAR_JUMP, the next 15 do).
+    // The 2026-11-03 nightly raised the importance of ~1 planet poi/all
+    // record in 23 (wikidata sitelinks were back), in stretches where 7 in
+    // 10 changed and never 16 in a row did not: the cursor stayed on a
+    // changed record, the old records' counterparts passed the window, and
+    // 24.5M records went as DELETE + INSERT (403 MiB where a day's is 0.9 MB).
+    // A record that an old one further on equals waits at the cursor for it,
+    // unless the new side holds copies of it too: tombstones, say (zeroed
+    // records, which are in neither index, wait only for the next old
+    // record). One of those copies can still MATCH the old one, so such a
+    // record waits only when the old records after that old copy equal more
+    // of the new ones after the cursor than the old records after the cursor
+    // do. That tells a tombstone that died in place, whose next old copy is
+    // any other tombstone, from a block both files hold twice behind deleted
+    // records: sent in place, the block's records put the cursor past their
+    // old copies, the second copy lay past the window, and the whole block
+    // went as DELETE + INSERT.
+    constexpr size_t FAR_JUMP = 16;  // see run_follows
+    auto zero = [&](const char* p) {
+        for (size_t k = 0; k < stride; k++) if (p[k] != 0) return false;
+        return true;
+    };
+    // How many of the FAR_JUMP - 1 old records after `from` equal the new
+    // ones after the cursor, copies of np aside.
+    auto follows = [&](size_t from, const char* np) {
+        size_t n = 0;
+        for (size_t j = 1; j < FAR_JUMP && from + j < old_n && ni + j < new_n; j++) {
+            const char* o = old_data + (from + j) * stride;
+            n += memcmp(o, new_data + (ni + j) * stride, stride) == 0 && memcmp(o, np, stride) != 0;
+        }
+        return n;
+    };
+    auto sent_in_place = [&](const char* np) {
+        if (oi + 1 < old_n && memcmp(np, old_data + (oi + 1) * stride, stride) == 0) return false;
+        if (zero(np)) return true;
+        const uint32_t twin = old_index.first_equal(np, oi + 2, old_n);
+        if (twin == UINT32_MAX) return true;
+        if (new_index.first_equal(np, ni + 1, new_n) == UINT32_MAX) return false;
+        return follows(twin, np) <= follows(oi, np);
+    };
 
     while (oi < old_n && ni < new_n) {
         const char* op = old_data + oi * stride;
         const char* np = new_data + ni * stride;
 
         if (memcmp(op, np, stride) == 0) {
-            flush_del();
+            flush_del(ni);
             match_run++;
             oi++; ni++;
         } else if (use_hash) {
@@ -326,7 +381,6 @@ inline MergeSequence build_merge_seq(
             // the window span, the run must not be copies of this record
             // alone: they place nothing, and old tombstones landing on new
             // ones there would re-send every unchanged record in between.
-            constexpr size_t FAR_JUMP = 16;
             auto run_follows = [&](uint32_t cand) -> bool {
                 if (cand - ni <= FAR_JUMP) return true;
                 bool placed = cand - ni < REACH;
@@ -338,34 +392,36 @@ inline MergeSequence build_merge_seq(
                 return placed;
             };
             if (best_ni != UINT32_MAX && best_ni > ni && next_aligns(best_ni) && run_follows(best_ni)) {
-                flush_match(); flush_del();
-                seq.add_insert(new_data + ni * stride, best_ni - ni, stride);
+                flush_match(); flush_del(best_ni);
                 ni = best_ni;
             } else if (best_ni == ni) {
-                flush_del(); match_run++; oi++; ni++;
+                flush_del(ni); match_run++; oi++; ni++;
             } else {
-                flush_match(); del_run++; oi++;
+                flush_match();
+                const bool in_place = sent_in_place(np);
+                del_run++; oi++;
+                if (in_place) { sub_run++; ni++; }
             }
         } else {
             size_t lookahead = std::min((size_t)200, std::min(old_n - oi, new_n - ni));
             bool found = false;
             for (size_t k = 1; k <= lookahead; k++) {
                 if (ni + k < new_n && memcmp(op, new_data + (ni + k) * stride, stride) == 0) {
-                    flush_match(); flush_del();
-                    seq.add_insert(new_data + ni * stride, k, stride);
+                    flush_match(); flush_del(ni + k);
                     ni += k; found = true; break;
                 }
                 if (oi + k < old_n && memcmp(np, old_data + (oi + k) * stride, stride) == 0) {
                     flush_match(); del_run += k; oi += k; found = true; break;
                 }
             }
-            if (!found) { flush_match(); del_run++; oi++; flush_del(); seq.add_insert(np, 1, stride); ni++; }
+            if (!found) { flush_match(); del_run++; oi++; flush_del(ni + 1); ni++; }
         }
     }
 
-    flush_match(); flush_del();
+    // One side ran out: the new records left (with those sent in place) go
+    // after the DELETE run, the old ones left after both.
+    flush_match(); flush_del(new_n);
     if (oi < old_n) seq.add_delete(old_n - oi);
-    if (ni < new_n) seq.add_insert(new_data + ni * stride, new_n - ni, stride);
 
     return seq;
 }

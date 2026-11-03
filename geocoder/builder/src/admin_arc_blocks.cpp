@@ -53,7 +53,7 @@ void lay_out_blocks(size_t n, std::vector<uint8_t>& bytes, std::vector<uint32_t>
     }, threads);
     const std::vector<uint64_t> offsets = parallel_offsets<uint64_t>(n, [&](size_t i) { return sizes[i]; }, threads);
     if (offsets.back() > UINT32_MAX) throw std::length_error(what + " past 4 GiB: its readers hold 32-bit offsets");
-    sizes = {};
+    free_storage(sizes);
     parallel_resize(at, n + 1);
     parallel_for(n + 1, [&](size_t b, size_t e, unsigned) {
         for (size_t i = b; i < e; i++) at[i] = static_cast<uint32_t>(offsets[i]);
@@ -412,7 +412,7 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
          << " slots=" << full.sidecar.size() << " ring_block_bytes=" << full.ring_blocks.size() << "\n";
     line << "ARC_CHECK set=minimal arcs=" << m.arcs << " closed_arcs=" << m.closed_arcs << " refs=" << m.refs
          << " rings=" << m.rings << " polygons=" << minimal_polygons << " joined_junctions=" << m.joined_junctions
-         << " duplicate_keys=" << m.duplicate_keys << " slots=" << minimal.sidecar.size()
+         << " turnback_junctions=" << m.turnback_junctions << " duplicate_keys=" << m.duplicate_keys << " slots=" << minimal.sidecar.size()
          << " ring_block_bytes=" << minimal.ring_blocks.size() << "\n";
     for (size_t k = 0; k < kArcTierCount; k++) {
         const ArcTierCounts& tc = arcs.tiers[k].counts;

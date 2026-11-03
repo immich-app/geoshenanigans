@@ -1660,6 +1660,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
             const KindValues bytes = continent_share(planet_bytes, planet_pairs, continent_pairs[c]);
             const KindValues counts = continent_share(planet_counts, planet_pairs, continent_pairs[c]);
             const uint64_t filter_bytes = filter_cost(planet_counts, continent_pairs[c]);
+            // Its write runs without a budget (run_continent), so its
+            // reservation holds every stage, the boundary tiers and both
+            // admin-minimal dirs included.
             pending.push_back({c, continent_cost(bytes, counts, filter_bytes, budget.capacity())});
         }
         // A continent past the budget even with its steps one after another

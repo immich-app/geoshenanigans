@@ -250,7 +250,7 @@ std::vector<T> collect_in_order(size_t n, Emit emit, unsigned threads) {
     out.reserve(total);
     for (auto& part : parts) {
         out.insert(out.end(), part.begin(), part.end());
-        part = {};
+        free_storage(part);
     }
     return out;
 }
@@ -756,7 +756,7 @@ private:
         std::vector<std::pair<uint32_t, uint32_t>> all;
         for (auto& f : found) {
             all.insert(all.end(), f.begin(), f.end());
-            f = {};
+            free_storage(f);
         }
         sort_unique(all, threads_);
         return all;
@@ -881,14 +881,16 @@ private:
         return first;
     }
 
+    // Hands the grid's storage back before count_vertices takes its own:
+    // `= {}` would clear the containers and keep it all.
     void free_grid() {
-        segs_ = {};
-        alive_ = {};
-        base_at_ = {};
-        base_cells_ = {};
-        overlay_cells_ = {};
-        rebuilt_ = {};
-        conflicts_ = {};
+        free_storage(segs_);
+        free_storage(alive_);
+        free_storage(base_at_);
+        free_storage(base_cells_);
+        free_storage(overlay_cells_);
+        free_storage(rebuilt_);
+        free_storage(conflicts_);
     }
 
     const AdminExactRings& store_;

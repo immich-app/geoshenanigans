@@ -90,6 +90,45 @@ TEST(continent_cost_runs_steps_one_at_a_time_only_past_the_budget) {
     CHECK_EQ(tight.bytes, serial);
 }
 
+TEST(region_peak_holds_the_arc_geometry_stages_beside_the_steps_at_once_or_as_one_of_them_one_at_a_time) {
+    // Admins well past the POIs: admin-minimal is the largest stage.
+    const KindValues bytes = kinds(4 * kGiB, 8 * kGiB, kGiB, 3 * kGiB, kGiB / 8, 24 * kGiB);
+    const KindValues counts = kinds(0, 0, 0, 0, 0, 0);  // no strategy-2 passes past the steps
+    const StageCosts stages = stage_costs(bytes);
+    // The boundary tiers and both admin-minimal dirs, which write the arcs.
+    CHECK_EQ(stages.admin_tiers, 24 * kGiB / kAdminTierAdminDivisor);
+    CHECK_EQ(stages.admin_minimal, 24 * kGiB / kAdminMinimalAdminDivisor);
+    REQUIRE(stages.admin_minimal > std::max({stages.modes, stages.admin_tiers, stages.places, stages.poi_tiers}));
+    // At once: beside every other stage.
+    CHECK_EQ(region_peak(bytes, counts, 0, RunOrder::Concurrent),
+             sum(bytes) + stages.modes + stages.places + stages.poi_tiers + stages.admin_tiers + stages.admin_minimal);
+    // One at a time: the largest stage, here admin-minimal.
+    CHECK_EQ(region_peak(bytes, counts, 0, RunOrder::Serial), sum(bytes) + stages.admin_minimal);
+}
+
+TEST(a_continents_reservation_holds_its_share_of_the_arc_geometry_stages_in_either_order) {
+    const KindValues planet = kinds(4 * kGiB, 8 * kGiB, kGiB, 3 * kGiB, kGiB / 8, 24 * kGiB);
+    const KindValues planet_pairs = kinds(100, 200, 30, 40, 10, 0);
+    // Half of every kind's pairs: half the planet's admins, with the margin.
+    const KindValues bytes = continent_share(planet, planet_pairs, kinds(50, 100, 15, 20, 5, 0));
+    REQUIRE(at(bytes, RecordKind::Admins) == uint64_t(14173392076));  // 24 GiB / 2 * 110 %
+    const KindValues counts = kinds(0, 0, 0, 0, 0, 0);
+    const StageCosts stages = stage_costs(bytes);
+    CHECK_EQ(stages.admin_tiers, at(bytes, RecordKind::Admins) / kAdminTierAdminDivisor);
+    CHECK_EQ(stages.admin_minimal, at(bytes, RecordKind::Admins) / kAdminMinimalAdminDivisor);
+    // Its write takes no stage leases: with room for every stage at once,
+    // all are reserved, the arc geometry stages among them.
+    const uint64_t at_once =
+        sum(bytes) + stages.modes + stages.places + stages.poi_tiers + stages.admin_tiers + stages.admin_minimal;
+    const RegionCost roomy = continent_cost(bytes, counts, 0, at_once);
+    CHECK(roomy.order == RunOrder::Concurrent);
+    CHECK_EQ(roomy.bytes, at_once);
+    // A byte short: one at a time, admin-minimal the largest.
+    const RegionCost tight = continent_cost(bytes, counts, 0, at_once - 1);
+    CHECK(tight.order == RunOrder::Serial);
+    CHECK_EQ(tight.bytes, sum(bytes) + stages.admin_minimal);
+}
+
 TEST(region_peak_counts_the_records_and_the_largest_step) {
     const KindValues bytes = kinds(kGiB, 0, 0, 0, 0, 0);
     const KindValues counts = kinds(0, 0, 0, 0, 0, 0);

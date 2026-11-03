@@ -1,8 +1,11 @@
 // build-index's admin dirs: every region's boundary tiers (with
 // --multi-quality) and both admin-minimal dirs (with --multi-output) hold
 // their admin geometry as arcs, and nothing else does; a chained build of the
-// same data (--prev-output) writes them again unchanged.
+// same data (--prev-output) writes them again unchanged. A chained build of
+// edited data keeps the slot of every arc the previous day had, which a fresh
+// build of it doesn't.
 #include <algorithm>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -11,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "id_allocator.h"
 #include "pbf_test_objects.h"
 #include "scratch_dir.h"
 #include "test_framework.h"
@@ -55,8 +59,11 @@ TestObject boundary(int64_t id, int level, const std::string& name, const std::v
 
 // A country of 2 x 2 municipalities near Zurich, one with a hole a village
 // of another level fills, a region over them all, a city, a street and an
-// address: every arc dir has polygons, shared borders and a hole.
-std::vector<TestObject> fixture() {
+// address: every arc dir has polygons, shared borders and a hole. With
+// `hole_moved` (the next day's edit), the hole and its village are in the
+// opposite municipality: that day has one arc fewer and one more in each
+// set, the rest as they were.
+std::vector<TestObject> fixture(bool hole_moved = false) {
     const int32_t lat0 = 470000000, lng0 = 80000000, side = 1000000;
     std::vector<TestObject> nodes, ways, relations;
     auto corner = [](int r, int c) { return int64_t(1 + 3 * r + c); };
@@ -87,8 +94,11 @@ std::vector<TestObject> fixture() {
             edge(upward(r, c), corner(r, c), corner(r + 1, c), lat0 + r * side, lng0 + c * side, lat0 + (r + 1) * side,
                  lng0 + c * side);
     const int64_t hole = 3000;
+    // In the first municipality, or moved to the last, clear of the city,
+    // the street and the address.
+    const int32_t near = hole_moved ? 1650000 : 200000, far = hole_moved ? 1850000 : 500000;
     for (int k = 0; k < 4; k++)
-        nodes.push_back(node(500 + k, lat0 + (k == 1 || k == 2 ? 500000 : 200000), lng0 + (k >= 2 ? 500000 : 200000)));
+        nodes.push_back(node(500 + k, lat0 + (k == 1 || k == 2 ? far : near), lng0 + (k >= 2 ? far : near)));
     ways.push_back(way(hole, {500, 501, 502, 503, 500}));
     nodes.push_back(node(900, lat0 + 1500000, lng0 + 1500000, {{"name", "Testville"}, {"place", "city"}}));
     nodes.push_back(node(950, lat0 + 1400000, lng0 + 1400000));
@@ -99,7 +109,8 @@ std::vector<TestObject> fixture() {
         for (int c = 0; c < 2; c++)
             relations.push_back(boundary(10 + 2 * r + c, 8, "Gemeinde " + std::to_string(2 * r + c),
                                          {across(r, c), upward(r, c + 1), across(r + 1, c), upward(r, c)},
-                                         r == 0 && c == 0 ? std::vector<int64_t>{hole} : std::vector<int64_t>{}));
+                                         r == c && r == (hole_moved ? 1 : 0) ? std::vector<int64_t>{hole}
+                                                                             : std::vector<int64_t>{}));
     relations.push_back(boundary(20, 10, "Weiler", {hole}));
     const std::vector<int64_t> rim = {across(0, 0), across(0, 1), upward(0, 2), upward(1, 2),
                                       across(2, 1), across(2, 0), upward(1, 0), upward(0, 0)};
@@ -154,6 +165,34 @@ bool admin_geometry(const std::string& name) {
     const std::string file = fs::path(name).filename().string();
     return file == "admin_polygons.bin" || file == "admin_rings.bin" || file == "arc_index.bin" ||
            file == "arc_vertices.bin";
+}
+
+// An arc sidecar's slots: each live one's arc key, UINT64_MAX for a
+// tombstone; none when it can't be read.
+std::vector<uint64_t> slot_keys(const std::string& path) {
+    gc::id_alloc::IdAllocator alloc;
+    if (!alloc.load_previous(path)) return {};
+    std::vector<uint64_t> keys;
+    for (const gc::id_alloc::SidecarSlot& s : alloc.slots())
+        keys.push_back(gc::id_alloc::is_tombstone(s) ? UINT64_MAX : s.stable_id);
+    return keys;
+}
+
+std::map<uint64_t, size_t> slot_of_key(const std::vector<uint64_t>& keys) {
+    std::map<uint64_t, size_t> out;
+    for (size_t s = 0; s < keys.size(); s++)
+        if (keys[s] != UINT64_MAX) out[keys[s]] = s;
+    return out;
+}
+
+// The admin geometry files and arc sidecars of a build's tree.
+std::map<std::string, std::vector<char>> arc_files(const std::string& out) {
+    std::map<std::string, std::vector<char>> files = tree(out);
+    for (auto it = files.begin(); it != files.end();) {
+        const std::string file = fs::path(it->first).filename().string();
+        it = admin_geometry(it->first) || file == "arc_index.osm_ids" ? std::next(it) : files.erase(it);
+    }
+    return files;
 }
 
 }  // namespace
@@ -263,4 +302,61 @@ TEST(an_admin_polygon_is_built_whatever_simplifying_would_leave_of_its_ring) {
         CHECK_EQ(files.at(std::string("planet/") + dir + "/admin_polygons.bin").size(), 8 * sizeof(AdminPolygon));
     const std::vector<char> strings = files.at("planet/full/strings_core.bin");
     CHECK(std::search(strings.begin(), strings.end(), std::begin("Punkt"), std::end("Punkt")) != strings.end());
+}
+
+TEST(a_chained_build_of_edited_data_keeps_each_retained_arcs_slot_where_a_fresh_build_moves_some) {
+    const ScratchDir root("admin-dirs-chained-edit");
+    const std::string day_one = root.path() + "/day1.osm.pbf", day_two = root.path() + "/day2.osm.pbf",
+                      log = root.path() + "/build.log";
+    write_test_pbf(day_one, fixture(), 1000);
+    write_test_pbf(day_two, fixture(true), 1000);
+    auto build = [&](const std::string& pbf, const std::string& out, std::vector<std::string> extra) {
+        std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out, pbf, "--continents", "--multi-output",
+                                          "--multi-quality"};
+        words.insert(words.end(), extra.begin(), extra.end());
+        return gctest::run(words, log);
+    };
+    const std::string out1 = root.path() + "/out1", chained = root.path() + "/chained",
+                      fresh = root.path() + "/fresh";
+    REQUIRE(build(day_one, out1, {}));
+    REQUIRE(build(day_two, chained, {"--prev-output", out1}));
+    REQUIRE(build(day_two, fresh, {}));
+    // The chained arcs aren't the fresh build's: --prev-output's arc
+    // sidecars were read.
+    CHECK(arc_files(chained) != arc_files(fresh));
+
+    // In each set of the planet and of Europe (which holds every polygon,
+    // its own slots against its own previous sidecars).
+    for (const char* region : {"planet", "europe"})
+        for (const char* sidecar : {"quality/exact/arc_index.osm_ids", "admin-minimal/arc_index.osm_ids"}) {
+            const std::string name = std::string(region) + "/" + sidecar;
+            const int failures_before = gctest::failures();
+            const std::vector<uint64_t> before = slot_keys(out1 + "/" + name);
+            const std::vector<uint64_t> after = slot_keys(chained + "/" + name);
+            const std::vector<uint64_t> anew = slot_keys(fresh + "/" + name);
+            REQUIRE(!before.empty() && !after.empty() && !anew.empty());
+            const auto after_slot = slot_of_key(after), anew_slot = slot_of_key(anew);
+            // Every arc both days have keeps its slot chained; a fresh build
+            // presents the moved hole elsewhere and shifts some of them.
+            size_t retained = 0, kept = 0, kept_fresh = 0;
+            for (size_t s = 0; s < before.size(); s++) {
+                REQUIRE(before[s] != UINT64_MAX);  // a fresh build's sidecar has no tombstone
+                const auto it = after_slot.find(before[s]);
+                if (it == after_slot.end()) continue;
+                retained++;
+                kept += it->second == s;
+                const auto f = anew_slot.find(before[s]);
+                kept_fresh += f != anew_slot.end() && f->second == s;
+            }
+            CHECK_EQ(retained, before.size() - 1);  // all but the old hole's
+            CHECK_EQ(kept, retained);
+            CHECK(kept_fresh < retained);
+            // The old hole's slot is a tombstone, not reused the day it is
+            // freed; the new hole's comes after the first day's slots.
+            CHECK_EQ(after.size(), before.size() + 1);
+            CHECK_EQ(static_cast<size_t>(std::count(after.begin(), after.end(), UINT64_MAX)), size_t(1));
+            CHECK(after.back() != UINT64_MAX && std::find(before.begin(), before.end(), after.back()) == before.end());
+            CHECK_EQ(anew.size(), before.size());
+            if (gctest::failures() != failures_before) std::printf("    in %s\n", name.c_str());
+        }
 }
