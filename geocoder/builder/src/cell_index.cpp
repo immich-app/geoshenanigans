@@ -1582,10 +1582,13 @@ void write_arc_dirs(const ParsedData& data, const std::string& region_dir, const
         return ids;
     };
 
-    // The full set's tiers, in the shared slots.
-    const Records shared = records_at(shared_admin_minimal_slots(data, holding(ArcSet::Full)), shared_name);
-    for (size_t t = 0; t < kArcTierCount; t++)
-        if (kArcTiers[t].set == ArcSet::Full) write_dir(region_dir + "/" + kArcTiers[t].dir, t, shared);
+    // The full set's tiers, in the shared slots: their records, a copy of
+    // every polygon, gone before the minimal set's are made.
+    {
+        const Records shared = records_at(shared_admin_minimal_slots(data, holding(ArcSet::Full)), shared_name);
+        for (size_t t = 0; t < kArcTierCount; t++)
+            if (kArcTiers[t].set == ArcSet::Full) write_dir(region_dir + "/" + kArcTiers[t].dir, t, shared);
+    }
     gc::id_alloc::IdAllocator::write_sidecar(arc_sidecar_path(region_dir, ArcSet::Full), arcs.set(ArcSet::Full).sidecar);
 
     // The minimal set's, in admin-minimal's own slots (and names) and in the
