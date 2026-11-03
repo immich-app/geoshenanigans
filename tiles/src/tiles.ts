@@ -164,12 +164,7 @@ async function handleRequest(request: Request, env: WorkerEnv, metrics: IMetrics
   };
 
   try {
-    const pmTilesService = await metrics.monitorAsyncFunction({ name: 'pmtiles_init' }, PMTilesService.init)(
-      tigrisStorageRepository,
-      memCacheRepository,
-      metrics,
-      d1Repository,
-    );
+    const pmTilesService = new PMTilesService(tigrisStorageRepository, memCacheRepository, metrics, d1Repository);
 
     switch (params.requestType) {
       case 'tile': {

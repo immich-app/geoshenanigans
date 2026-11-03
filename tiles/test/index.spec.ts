@@ -643,10 +643,22 @@ describe('Tiles', () => {
     expect(endpoints).toEqual([endpoint]);
   });
 
+  it("serves a tile from a fresh isolate with one D1 query, without the TileJSON's metadata", async () => {
+    globalThis.memCache = new Map();
+    mockStorage();
+    const metrics = captureMetrics();
+    const response = await exports.Tiles.fetch(tilesRequest('/v1/0/0/0.mvt'));
+    expect(response.status).toBe(200);
+    await response.body?.cancel();
+    expect(metrics('d1_query').map((tags) => tags.query)).toEqual([expect.stringContaining('startTileId <= ?')]);
+    expect(globalThis.memCache.size).toBe(0);
+  });
+
   it.each`
     tile        | reason
     ${'1/0/0'}  | ${'absent from the directory'}
     ${'16/0/0'} | ${'beyond maxzoom'}
+    ${'26/0/0'} | ${'at the deepest zoom a tile ID exists for'}
   `('does not let the edge keep a tile $reason', async ({ tile }) => {
     const response = await exports.Tiles.fetch(tilesRequest(`/v1/${tile}.mvt`));
     expect(response.status).toBe(404);
@@ -664,6 +676,18 @@ describe('Tiles', () => {
     vi
       .spyOn(TigrisStorageRepository.prototype, 'getAsStream')
       .mockImplementation(async () => new Response(JSON.stringify(storedStyle)).body!);
+
+  it('reads the TileJSON metadata once per isolate for the TileJSON and styles', async () => {
+    globalThis.memCache = new Map();
+    mockStyle();
+    const metrics = captureMetrics();
+    for (const url of ['/v1.json', '/v1/style/light', '/v1.json']) {
+      const response = await exports.Tiles.fetch(tilesRequest(url));
+      expect(response.status).toBe(200);
+      await response.body?.cancel();
+    }
+    expect(metrics('d1_query').map((tags) => tags.query)).toEqual([expect.stringContaining('startTileId = -1')]);
+  });
 
   it('inlines the tile source into a style, under the canonical host', async () => {
     mockStyle();
@@ -829,16 +853,56 @@ describe('inlineTileSource', () => {
   });
 });
 
-describe('TileJSON', () => {
+describe('PMTilesService', () => {
+  const key = '20261102';
+  const tileJson = { tiles: [] as string[], minzoom: 0, maxzoom: 15 } as unknown as JsonResponse;
+  const memCacheOf = (memCache: Map<string, unknown>) =>
+    ({
+      get: (key: string) => memCache.get(key),
+      set: (key: string, value: unknown) => memCache.set(key, value),
+    }) as IMemCacheRepository;
+  const metrics = {
+    monitorAsyncFunction:
+      (_operation: unknown, call: (...args: unknown[]) => Promise<unknown>) =>
+      (...args: unknown[]) =>
+        call(...args),
+    push: () => {},
+  } as unknown as IMetricsRepository;
+  // A D1 table holding the metadata row and the rows given, answering both of the service's queries.
+  const stubDb = (rows: { startTileId: number; entry: string }[]) => {
+    const all = [{ startTileId: -1, entry: JSON.stringify(tileJson) }, ...rows];
+    const query = vi.fn(async (sql: string, tileId?: number) => {
+      const results = sql.includes('startTileId <= ?')
+        ? all.filter((row) => row.startTileId <= tileId!).slice(-1)
+        : all.filter((row) => row.startTileId === -1);
+      return { success: true, results, meta: {} } as unknown as D1Result<Record<string, unknown>>;
+    });
+    return { query, db: { query } as IDatabaseRepository };
+  };
+  const storage = () => {
+    const getRangeAsStream = vi.fn(async () => new Blob(['tile']).stream());
+    return {
+      getRangeAsStream,
+      source: { getDeploymentKey: () => key, getRangeAsStream } as unknown as IStorageRepository,
+    };
+  };
+  // Two directories: tiles 7 and 8 (2/1/1 and 2/0/1), the latter stored 10 bytes after the former in chunk 3, and
+  // tile 13 (2/2/2).
+  const directory = (tileIdStart: number, tileIds: number[]) => ({
+    startTileId: tileIdStart,
+    entry: DirectoryString.fromDirectory({
+      tileIdStart,
+      offsetStart: 100,
+      entries: tileIds.map((tileId, i) => ({ tileId, offset: 100 + 10 * i, length: 10, runLength: 1, chunkId: 3 })),
+    }).toString(),
+  });
+  const directories = [directory(7, [7, 8]), directory(13, [13])];
+
   it("points clients at the live deployment's versioned tile URLs", async () => {
-    const tileJson = { tiles: [] as string[], minzoom: 0, maxzoom: 15 } as unknown as JsonResponse;
-    const memCache = new Map<string, unknown>([['20261102', tileJson]]);
-    const service = await PMTilesService.init(
-      { getDeploymentKey: () => '20261102' } as IStorageRepository,
-      {
-        get: (key: string) => memCache.get(key),
-        set: (key: string, value: unknown) => memCache.set(key, value),
-      } as IMemCacheRepository,
+    const memCache = new Map<string, unknown>([[key, tileJson]]);
+    const service = new PMTilesService(
+      { getDeploymentKey: () => key } as IStorageRepository,
+      memCacheOf(memCache),
       {} as IMetricsRepository,
       {} as IDatabaseRepository,
     );
@@ -846,5 +910,55 @@ describe('TileJSON', () => {
     expect(response.tiles).toEqual(['https://tiles.example/v1/{z}/{x}/{y}.mvt?v=20261102']);
     // The cached metadata is shared by every request, so it stays as stored.
     expect(tileJson.tiles).toEqual([]);
+  });
+
+  it('reads the metadata once per isolate', async () => {
+    const { query, db } = stubDb([]);
+    const service = new PMTilesService(storage().source, memCacheOf(new Map()), metrics, db);
+    await service.getJsonResponse('1', 'https://tiles.example');
+    await service.getJsonResponse('1', 'https://tiles.example');
+    expect(query).toHaveBeenCalledOnce();
+  });
+
+  it('serves a tile with a single query, the directory lookup, even before the metadata was read', async () => {
+    const { query, db } = stubDb(directories);
+    const { getRangeAsStream, source } = storage();
+    const memCache = new Map<string, unknown>();
+    const service = new PMTilesService(source, memCacheOf(memCache), metrics, db);
+    const tile = await service.getTile(2, 0, 1);
+    expect(await new Response(tile).text()).toBe('tile');
+    expect(query.mock.calls).toEqual([[expect.stringContaining('startTileId <= ?'), 8]]);
+    expect(getRangeAsStream).toHaveBeenCalledExactlyOnceWith({ offset: 110, length: 10 }, 'chunk_3.pmtiles');
+    expect(memCache.size).toBe(0);
+  });
+
+  it.each`
+    tile        | tileId        | reason
+    ${'0/0/0'}  | ${0}          | ${'before the first directory, where the lookup lands on the metadata row'}
+    ${'2/0/0'}  | ${5}          | ${'before the first directory, at a zoom the data has'}
+    ${'2/0/2'}  | ${9}          | ${'between directories'}
+    ${'2/3/0'}  | ${20}         | ${'past the last tile of the last directory'}
+    ${'16/0/0'} | ${1431655765} | ${'at a zoom deeper than the data has'}
+  `('has no tile $tile, $reason', async ({ tile, tileId }) => {
+    const { query, db } = stubDb(directories);
+    const { getRangeAsStream, source } = storage();
+    const service = new PMTilesService(source, memCacheOf(new Map()), metrics, db);
+    const [z, x, y] = tile.split('/').map(Number);
+    expect(await service.getTile(z, x, y)).toBeUndefined();
+    expect(query.mock.calls).toEqual([[expect.stringContaining('startTileId <= ?'), tileId]]);
+    expect(getRangeAsStream).not.toHaveBeenCalled();
+  });
+
+  it.each`
+    tile
+    ${'0/1/0'}
+    ${'1/0/2'}
+    ${'27/0/0'}
+  `('has no tile $tile, without a lookup, as the tile cannot exist', async ({ tile }) => {
+    const { query, db } = stubDb(directories);
+    const service = new PMTilesService(storage().source, memCacheOf(new Map()), metrics, db);
+    const [z, x, y] = tile.split('/').map(Number);
+    expect(await service.getTile(z, x, y)).toBeUndefined();
+    expect(query).not.toHaveBeenCalled();
   });
 });
