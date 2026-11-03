@@ -12,7 +12,8 @@
 // street_ways replay, PARALLEL_DELTA_STRIDE side files, unmapped ids dropped
 // from street / addr / interp cell lists, a cell index delta for every admin /
 // POI index and none for places, remap pairs ascending, the MATCH records'
-// string fixups, and the admin geometry files whole, with admin slots kept).
+// string fixups, and the admin geometry files merged by slot, with admin
+// slots kept).
 //
 // Low-memory mode: when <current-dir> is an encoded installed set (it has a
 // gc.manifest, see gcs_patch.h), the encoded families' old files are decoded

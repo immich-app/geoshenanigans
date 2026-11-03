@@ -346,7 +346,7 @@ TEST(patch_format_section_marker_values) {
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v14 = admin geometry as arcs, sent whole. The patcher
+    // diff/patch tools. v14 = admin geometry as arcs, merged by slot. The patcher
     // accepts this version only.
     CHECK_EQ(GCPATCH_VERSION, uint32_t(14));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
@@ -674,10 +674,11 @@ TEST(patch_format_string_fields_match_the_record_layouts) {
     CHECK_EQ(POSTCODE_CENTROID_POSTCODE_ID_OFF, size_t(8));
 }
 
-// v14: file ids 7, 26 and 27 name the arc files, whole files of no string
-// field, which the diff sends whole: no table that merges, remaps or scans a
-// file by its records at the admin stride (as the postal polygons were)
-// names them, nor remap kind 1 (an admin id) any file.
+// v14: file ids 7, 26 and 27 name the arc files, of no string field, which
+// the diff merges by slot (ADMIN_SLOT_FAMILIES: the arc index at 4 bytes a
+// record, the streams at 1, after their slot files): no table that remaps or
+// scans a file by its records at the admin stride (as the postal polygons
+// were) names them, nor remap kind 1 (an admin id) any file.
 TEST(patch_format_v14_names_the_arc_files_and_keeps_admin_slots) {
     CHECK_EQ(std::string(patch_file_names[7]), std::string("admin_rings.bin"));
     CHECK_EQ(std::string(patch_file_names[26]), std::string("arc_index.bin"));
@@ -692,9 +693,12 @@ TEST(patch_format_v14_names_the_arc_files_and_keeps_admin_slots) {
     }
     for (const auto& f : SPARSE_DELTA_FILES) CHECK(f.remap_kind != 1);
     for (const auto& f : PARALLEL_DELTA_FILES) CHECK(f.remap_kind != 1);
-    std::vector<std::string> whole;
-    for (const PatchFileId fid : ADMIN_GEOMETRY_FILES) whole.push_back(patch_file_names[uint32_t(fid)]);
-    CHECK(whole == std::vector<std::string>({"arc_index.bin", "arc_vertices.bin", "admin_polygons.bin", "admin_rings.bin"}));
+    std::vector<std::string> sent;
+    for (const AdminSlotFamily& family : ADMIN_SLOT_FAMILIES)
+        for (const PatchFileId fid : {family.slots, family.blocks}) sent.push_back(patch_file_names[uint32_t(fid)]);
+    CHECK(sent == std::vector<std::string>({"arc_index.bin", "arc_vertices.bin", "admin_polygons.bin", "admin_rings.bin"}));
+    CHECK_EQ(ADMIN_SLOT_FAMILIES[0].stride, size_t(4));
+    CHECK_EQ(ADMIN_SLOT_FAMILIES[1].stride, ADMIN_POLYGON_STRIDE);
 }
 
 // A sparse delta's file, value stride and remap kind are a row of

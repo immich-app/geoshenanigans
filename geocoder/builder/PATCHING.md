@@ -244,7 +244,7 @@ and 1450 s in 32 MiB (19.2 GiB).
 **Diff tool:**
 1. Build string-level diff (per tier, keep the longest run of common strings in the same order, every one of them in a sorted tier; emit the other old strings as deleted and the other new ones as added, with their new index unless the new tier is sorted)
 2. Build string remap (old string pool offsets → new, derived from string diff); the surviving strings no tier's edit keeps go as pairs, at most 65,536 of them (v12: with more, none does, and step 3 sends their values)
-3. For each data file: apply string remap to old, match records by content hash (for ways: also fix node_offset/vertex_offset fields), build merge sequence (MATCH/INSERT/DELETE at record stride); past the pairs' cap, the MATCH records' fields that hold a moved string go as string fixups, and the side files' values that hold one as changes. (v14) The four admin geometry files go whole, last
+3. For each data file: apply string remap to old, match records by content hash (for ways: also fix node_offset/vertex_offset fields), build merge sequence (MATCH/INSERT/DELETE at record stride); past the pairs' cap, the MATCH records' fields that hold a moved string go as string fixups, and the side files' values that hold one as changes. (v14) The admin geometry merges by slot: `arc_index.bin` and `admin_polygons.bin` record j against old record j, tombstones included (no content match), their byte streams a block per record along them, ahead of the admin cells
 4. For coordinate files (nodes/vertices): derive merge from parent way/polygon merge — verify node blocks match before COPY, INSERT if nodes changed
 5. Derive ID remaps from merge sequences (MATCH ops define old→new record correspondence)
 6. **Secondary matching**: For DELETE/INSERT records in merge sequences, match by relaxed key (name + node_count for ways, street + housenumber for addrs, etc.) to recover ID mappings for modified-but-same-entity records
@@ -584,8 +584,8 @@ and the postal files, which no build writes any more.
 | 3 | `addr_points.bin` | merge at stride 28, string fields `housenumber_id` and `street_id` |
 | 4 | `interp_ways.bin` | merge at stride 24, string field `street_id` |
 | 5 | `interp_nodes.bin` | child stream of interp_ways, at stride 8 |
-| 6 | `admin_polygons.bin` | whole (v14): a full replacement, or COPY_OLD when unchanged |
-| 7 | `admin_rings.bin` | whole (v14; v13: `admin_vertices.bin`) |
+| 6 | `admin_polygons.bin` | merge by slot at stride 24, string field `name_id`, offset field `ring_offset` (v14) |
+| 7 | `admin_rings.bin` | child stream of admin_polygons, at stride 1 (v14; v13: `admin_vertices.bin`) |
 | 8 | `geo_cells.bin` | geo cell changes (0xFFFFFFFB), rebuilt beside the geo entry deltas |
 | 9-11 | `street_entries.bin`, `addr_entries.bin`, `interp_entries.bin` | geo entry deltas (0xFFFFFFF0) |
 | 12, 13 | `admin_cells.bin`, `admin_entries.bin` | admin cell changes (0xFFFFFFFA) and a cell index delta (0xFFFFFFF7), over the old index's ids as they are (v14) |
@@ -599,15 +599,21 @@ and the postal files, which no build writes any more.
 | 22 | `way_postcodes.bin` | parallel delta along street_ways, remap kind 2 |
 | 23 | `postcode_centroids.bin` | sparse delta, remap kind 3 |
 | 24, 25 | `postcode_centroid_cells.bin`, `postcode_centroid_entries.bin` | cell list delta (stride 0xFB), or whole |
-| 26 | `arc_index.bin` | whole (v14; v13: `postal_polygons.bin`) |
-| 27 | `arc_vertices.bin` | whole (v14; v13: `postal_vertices.bin`) |
+| 26 | `arc_index.bin` | merge by slot at stride 4, the record its block's offset (v14; v13: `postal_polygons.bin`) |
+| 27 | `arc_vertices.bin` | child stream of arc_index, at stride 1 (v14; v13: `postal_vertices.bin`) |
 | 28 | `addr_vertices.bin` | child stream of addr_points at stride 1; whole in a dir without address points |
 | 29-33 | `strings_core.bin` … `strings_poi.bin` | the strings section; a tier the old dir lacks, whole |
 | 34 | `interp_postcodes.bin` | parallel delta along interp_ways, remap kind 2 |
 
-The four admin geometry files (`ADMIN_GEOMETRY_FILES`: arc_index,
-arc_vertices, admin_polygons, admin_rings, in that order) are the last
-sections of a patch, and no merge reads their records.
+The four admin geometry files (`ADMIN_SLOT_FAMILIES`) follow the place nodes
+as arc_index, arc_vertices, admin_polygons, admin_rings, ahead of the admin
+cells. A slot file's record j is slot j on both days (a dead slot keeps a
+tombstone, no slot is reused the day it dies), so the diff merges it by
+position: a slot both days hold is a MATCH (its block offset an offset fixup)
+or, for an admin polygon whose other fields changed, a REPLACE; slots past the
+old end are INSERTs. Its block is kept, edited with its unchanged head and
+tail kept, or replaced; a birth or a recycled slot's block is an INSERT, a
+death's a DELETE. The patcher replays them as any merge section.
 
 ## Performance
 

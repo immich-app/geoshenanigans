@@ -441,13 +441,9 @@ struct IdentityFamily {
     std::unordered_map<uint32_t, uint32_t> moved;
     std::string stats;
 };
-static IdentityFamily identity_family(char* old_recs, size_t old_size, const char* new_recs, size_t new_size, size_t stride,
-                                      size_t offset_field, const std::vector<uint32_t>& old_offsets,
-                                      const std::vector<uint32_t>& old_key, const std::vector<uint32_t>& new_key) {
-    auto o = old_index_of_new(old_key, new_key);
-    auto in_order = identity_in_order(o);
-    fixup_offsets_by_identity(old_recs, new_recs, stride, offset_field, o, in_order);
-    auto im = build_identity_merge_seq(old_recs, old_size, new_recs, new_size, stride, o, in_order);
+// An identity merge of old_recs (whose offset fields it fixed up) as a family.
+static IdentityFamily family_of(IdentityMerge im, const char* old_recs, size_t stride, size_t offset_field,
+                                const std::vector<uint32_t>& old_offsets) {
     IdentityFamily f;
     f.fixups = identity_offset_fixups(old_offsets, old_recs, stride, offset_field, im.matched_old);
     f.seq = std::move(im.seq);
@@ -456,6 +452,22 @@ static IdentityFamily identity_family(char* old_recs, size_t old_size, const cha
               " insert=" + std::to_string(im.n_insert) + " delete=" + std::to_string(im.n_delete) +
               " moved=" + std::to_string(im.moved.size());
     return f;
+}
+static IdentityFamily identity_family(char* old_recs, size_t old_size, const char* new_recs, size_t new_size, size_t stride,
+                                      size_t offset_field, const std::vector<uint32_t>& old_offsets,
+                                      const std::vector<uint32_t>& old_key, const std::vector<uint32_t>& new_key) {
+    auto o = old_index_of_new(old_key, new_key);
+    auto in_order = identity_in_order(o);
+    fixup_offsets_by_identity(old_recs, new_recs, stride, offset_field, o, in_order);
+    auto im = build_identity_merge_seq(old_recs, old_size, new_recs, new_size, stride, o, in_order);
+    return family_of(std::move(im), old_recs, stride, offset_field, old_offsets);
+}
+// The same for a file of slots, by position (build_slot_merge_seq): every
+// record's key is its index, tombstones included. Nothing moves.
+static IdentityFamily slot_family(char* old_recs, size_t old_size, const char* new_recs, size_t new_size, size_t stride,
+                                  size_t offset_field, const std::vector<uint32_t>& old_offsets) {
+    auto im = build_slot_merge_seq(old_recs, old_size, new_recs, new_size, stride, offset_field);
+    return family_of(std::move(im), old_recs, stride, offset_field, old_offsets);
 }
 
 // Both files byte-identical (the patcher then copies old and derives no remap).
@@ -743,8 +755,9 @@ static size_t fixed_stride(uint64_t) {
 // The record files the merges read, by the stride their merge sections give
 // for a new file of its size (a byte stream's is 1, a node's lat and lng 8),
 // and the siblings a variant without its own borrows them from. The admin
-// geometry files go whole (ADMIN_GEOMETRY_FILES), so no record index of
-// theirs reaches a patch.
+// geometry files merge at their own strides (ADMIN_SLOT_FAMILIES): an arc
+// index at 4, never the admin polygons' 24 that ids 26 and 27 merged at as
+// the postal files.
 struct MergedFile {
     PatchFileId id;
     size_t (*stride_of)(uint64_t new_size);
@@ -760,6 +773,10 @@ static constexpr MergedFile MERGED_FILES[] = {
     {PatchFileId::POI_RECORDS, fixed_stride<POI_RECORD_STRIDE>, {}},
     {PatchFileId::POI_VERTICES, fixed_stride<1>, {}},
     {PatchFileId::PLACE_NODES, fixed_stride<PLACE_NODE_STRIDE>, {}},
+    {PatchFileId::ARC_INDEX, fixed_stride<ARC_INDEX_STRIDE>, {}},
+    {PatchFileId::ARC_VERTICES, fixed_stride<1>, {}},
+    {PatchFileId::ADMIN_POLYGONS, fixed_stride<ADMIN_POLYGON_STRIDE>, {}},
+    {PatchFileId::ADMIN_RINGS, fixed_stride<1>, {}},
 };
 
 static int run(int argc, char* argv[]) {
@@ -1491,7 +1508,62 @@ static int run(int argc, char* argv[]) {
         log_rss("place");
     });
 
-    t_addr.join(); t_street.join(); t_interp.join(); t_poi.join(); t_place.join(); t_cells.join();
+    // Group 7: the admin geometry by slot, each family's slots (arc_index,
+    // admin_polygons) and then its blocks (arc_vertices, admin_rings) along
+    // them. A slot on both days is its old record (slot_family), its block
+    // kept, edited (head and tail kept) or replaced; a birth or a recycled
+    // slot's block is an INSERT, a death's a DELETE. A dir without them
+    // merges empty files, which the patcher writes nowhere it lists.
+    std::array<FileMergeResult, std::size(ADMIN_SLOT_FAMILIES)> res_slots, res_blocks;
+    std::thread t_admin([&]() {
+        double gs = now_ms();
+        for (size_t f = 0; f < std::size(ADMIN_SLOT_FAMILIES); f++) {
+            const AdminSlotFamily& family = ADMIN_SLOT_FAMILIES[f];
+            const std::string slots_name = patch_file_names[static_cast<uint32_t>(family.slots)];
+            const std::string blocks_name = patch_file_names[static_cast<uint32_t>(family.blocks)];
+            const size_t stride = family.stride;
+            auto old_r = mmap_file_rw(old_dir + "/" + slots_name);
+            auto new_r = mmap_file(new_dir + "/" + slots_name);
+            auto old_b = mmap_file(old_dir + "/" + blocks_name);
+            auto new_b = mmap_file(new_dir + "/" + blocks_name);
+            if (old_b.data) madvise(const_cast<char*>(old_b.data), old_b.size, MADV_SEQUENTIAL);
+            if (new_b.data) madvise(const_cast<char*>(new_b.data), new_b.size, MADV_SEQUENTIAL);
+            const size_t n = old_r.size / stride;
+            std::vector<uint32_t> old_offsets(n);
+            for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_r.data + i * stride, 4);
+            MergeSequence seq;
+            OffsetFixups fixups;
+            if (sent_unchanged(old_r.data, old_r.size, new_r.data, new_r.size)) {
+                seq = match_all(n);
+            } else {
+                if (old_r.size > 0) remap_string_fields(old_r.data, old_r.size, family.slots, stride, str_remap);
+                auto sf = slot_family(old_r.data, old_r.size, new_r.data, new_r.size, stride, 0, old_offsets);
+                seq = std::move(sf.seq);
+                fixups = std::move(sf.fixups);
+                {
+                    std::lock_guard<std::mutex> lock(log_mutex);
+                    std::cerr << "  " << slots_name << " by slot: " << sf.stats << std::endl;
+                }
+                // The block merge reads each old record's block where it was.
+                for (size_t i = 0; i < n; i++) memcpy(old_r.data + i * stride, &old_offsets[i], 4);
+            }
+            auto block_seq = build_vertex_byte_merge(seq, old_r.data, old_r.size, new_r.data, new_r.size,
+                                                     old_b.data ? old_b.data : "", old_b.size,
+                                                     new_b.data ? new_b.data : "", new_b.size, stride, 0);
+            res_slots[f] = {family.slots, slots_name, stride, old_r.size, new_r.size, std::move(seq), std::move(fixups), {}, {}};
+            res_blocks[f] = {family.blocks, blocks_name, 1, old_b.size, new_b.size, std::move(block_seq), {}, {}, {}};
+            log_merge(res_slots[f]);
+            log_merge(res_blocks[f]);
+            if (old_r.data) unmap_file(old_r);
+            if (new_r.data) unmap_file(new_r);
+            if (old_b.data) unmap_file(old_b);
+            if (new_b.data) unmap_file(new_b);
+        }
+        log_time("  group:admin", gs);
+        log_rss("admin");
+    });
+
+    t_addr.join(); t_street.join(); t_interp.join(); t_poi.join(); t_place.join(); t_cells.join(); t_admin.join();
     log_time("All merge sequences + cell changes built", merge_start);
     // str_remap is kept alive for emit_sparse_delta below — it consumes
     // the map directly to decide which addr_postcodes / way_postcodes /
@@ -1541,6 +1613,14 @@ static int run(int argc, char* argv[]) {
     serialize_merge(patch, res_poi_v, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     { std::vector<char>().swap(res_poi_v.seq.data); }
     serialize_merge(patch, res_place_n, old_dir, new_dir, patcher_strings, offset_fixup_limits);
+    // The admin geometry, ahead of the admin cells: arc_index, arc_vertices,
+    // admin_polygons, admin_rings.
+    for (size_t f = 0; f < res_slots.size(); f++) {
+        serialize_merge(patch, res_slots[f], old_dir, new_dir, patcher_strings, offset_fixup_limits);
+        serialize_merge(patch, res_blocks[f], old_dir, new_dir, patcher_strings, offset_fixup_limits);
+        std::vector<char>().swap(res_slots[f].seq.data);
+        std::vector<char>().swap(res_blocks[f].seq.data);
+    }
     malloc_trim(0); // return freed heap to OS
     log_rss("serialize");
     double t0 = now_ms();
@@ -1716,10 +1796,9 @@ static int run(int argc, char* argv[]) {
         uint64_t old_size = (stat(old_path.c_str(), &ost) == 0) ? (uint64_t)ost.st_size : 0;
 
         // Unchanged short-circuit: emit a copy-old marker instead of dumping
-        // the whole file when it's byte-identical to old. Several raw-emitted
-        // files (postcode_centroid_cells/entries, the admin geometry of a
-        // quiet day) are identical day-over-day; full-replacing the postcode
-        // centroid index wasted ~5.8 MiB/planet.
+        // the whole file when it's byte-identical to old. Raw-emitted files
+        // (postcode_centroid_cells/entries) can be identical day-over-day;
+        // full-replacing the postcode centroid index wasted ~5.8 MiB/planet.
         if (try_emit_copy_old(patch, static_cast<uint32_t>(fid), old_path, new_path,
                               old_size, new_size, fname.c_str()))
             return;
@@ -2052,19 +2131,6 @@ static int run(int argc, char* argv[]) {
     // A string tier the old dir lacks has no old file to rebuild from.
     for (int t = 0; t < STRING_TIER_COUNT; t++)
         if (tier_files.newly_shipped >> t & 1) emit_raw(string_tier_file_id(t), STRING_TIER_FILES[t]);
-    // The admin geometry files go whole, last. Their room (and their
-    // headers' and the end marker's) is taken at once, so the patch buffer
-    // never doubles past them: planet/quality/exact's are 0.7 GB.
-    {
-        uint64_t whole = 0;
-        for (PatchFileId fid : ADMIN_GEOMETRY_FILES) {
-            struct stat st;
-            if (stat((new_dir + "/" + patch_file_names[static_cast<uint32_t>(fid)]).c_str(), &st) == 0)
-                whole += static_cast<uint64_t>(st.st_size) + 64;
-        }
-        patch.reserve(patch.size() + static_cast<size_t>(whole) + 64);
-        for (PatchFileId fid : ADMIN_GEOMETRY_FILES) emit_raw(fid, patch_file_names[static_cast<uint32_t>(fid)]);
-    }
 
     // Now safe to free str_remap — all consumers (sparse_delta above)
     // have finished using it.

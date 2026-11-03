@@ -1179,45 +1179,44 @@ const std::vector<uint32_t> POLYGON_KEYS = {10, 11, 12, 13, 14, 15, 16, 17, 18, 
 
 }  // namespace
 
-// GCPATCH v14: the four admin geometry files travel whole, each a full
-// replacement or, unchanged, COPY_OLD: the new day's ring and arc bytes
-// differ (another seed, and an arc more) while its records are the old
-// day's. The parent refused the arc files' dir: no patch section named
-// admin_rings.bin.
-TEST(patch_round_trip_sends_the_admin_geometry_files_whole) {
-    const BuildDir old_d = admin_geometry(POLYGON_KEYS, 40, 1), new_d = admin_geometry(POLYGON_KEYS, 41, 2);
-    REQUIRE(old_d.at("admin_polygons.bin") == new_d.at("admin_polygons.bin"));
-
-    const RoundTrip r = round_trip(old_d, new_d);
-
-    CHECK(r.mismatches.empty());
-    CHECK(logged(r, "admin_polygons.bin: unchanged (copy old, " + std::to_string(new_d.at("admin_polygons.bin").size())));
-    for (const char* name : {"admin_rings.bin", "arc_index.bin", "arc_vertices.bin"})
-        CHECK(logged(r, std::string(name) + ": full replace " + std::to_string(new_d.at(name).size()) + " bytes"));
-    CHECK(!logged(r, "admin_polygons.bin: seq="));
-}
-
-// No admin geometry file is merged by its records, so none counts against
-// the diff's record limit (--file-records-max): ten admin polygons and 40
-// arcs (160 bytes of arc index, 6 records at the admin stride, at which the
-// postal polygons' id 26 merged), and the new day's three over 41, round-trip
-// under a limit of 1. The parent refused the old admin polygons' 10 records.
-TEST(patch_diff_merges_no_admin_geometry_file_by_its_records) {
+// The admin geometry files merge by their records at their own strides
+// (ADMIN_SLOT_FAMILIES), so each counts against the diff's record limit
+// (--file-records-max): the arc index at 4 bytes a record, never the admin
+// stride at which the postal polygons' id 26 merged, the byte streams at 1.
+// Ten polygons and 40 arcs, then three and 41: under a limit of 40 the new
+// arc index's 41 records are refused, under one less than the largest
+// stream's bytes that stream is, and under that many the dirs round-trip.
+// The parent refused none of them: it sent the files whole.
+TEST(patch_diff_counts_the_admin_geometry_records_against_the_limit) {
     const BuildDir old_d = admin_geometry(POLYGON_KEYS, 40, 1), new_d = admin_geometry({10, 11, 12}, 41, 2);
+    size_t most = 0;
+    std::string largest;
+    for (const BuildDir* d : {&old_d, &new_d})
+        for (const char* name : {"arc_vertices.bin", "admin_rings.bin"})
+            if (d->at(name).size() > most) {
+                most = d->at(name).size();
+                largest = std::string(d == &old_d ? "Old " : "New ") + name + " holds " + std::to_string(most) + " records";
+            }
 
-    const RoundTrip r = round_trip(old_d, new_d, {}, {"--file-records-max", "1"});
+    const RoundTrip index = round_trip(old_d, new_d, {}, {"--file-records-max", "40"});
+    const RoundTrip stream = round_trip(old_d, new_d, {}, {"--file-records-max", std::to_string(most - 1)});
+    const RoundTrip fits = round_trip(old_d, new_d, {}, {"--file-records-max", std::to_string(most)});
 
-    CHECK(r.mismatches.empty());
-    CHECK(!logged(r, "a patch can index"));
+    CHECK(index.mismatches == std::vector<std::string>{"diff failed"});
+    CHECK(logged(index, "New arc_index.bin holds 41 records, more than the 40 a patch can index"));
+    CHECK(stream.mismatches == std::vector<std::string>{"diff failed"});
+    CHECK(logged(stream, largest + ", more than the " + std::to_string(most - 1) + " a patch can index"));
+    CHECK(fits.mismatches.empty());
 }
 
 // Admin polygons keep their slots, so no file is remapped by admin polygon
 // content: a polygon new at slot 0 that moves the old ones' content up a
 // slot (the slots of a cold start) leaves the POIs' and places' parent slots
 // and the admin cell index's ids as they are. The POIs and places the new day
-// keeps MATCH, and the admin index's delta changes no cell. The parent's
-// admin merge moved both old polygons up a slot (an INSERT, then two MATCHes),
-// and every POI, place and index id with them.
+// keeps MATCH, the admin index's delta changes no cell, and the admin
+// polygons merge by slot: the two old slots REPLACEd, the third INSERTed.
+// The parent's admin merge moved both old polygons up a slot (an INSERT,
+// then two MATCHes), and every POI, place and index id with them.
 TEST(patch_round_trip_moves_no_admin_slot_by_admin_polygon_content) {
     auto day = [](const std::vector<uint32_t>& keys, const std::vector<uint32_t>& poi_parents, const std::vector<uint32_t>& place_parents) {
         BuildDir d = admin_geometry(keys, 0, 7);
@@ -1254,5 +1253,5 @@ TEST(patch_round_trip_moves_no_admin_slot_by_admin_polygon_content) {
     CHECK_EQ(merge_records(r, "poi_records.bin"), std::string("m/i/d/r=2/1/0/0"));
     CHECK_EQ(merge_records(r, "place_nodes.bin"), std::string("m/i/d/r=1/1/0/0"));
     CHECK(logged(r, "admin_entries.bin: cell index delta (" + std::to_string(unchanged_index.size()) + " bytes)"));
-    CHECK(logged(r, "admin_polygons.bin: full replace " + std::to_string(new_d.at("admin_polygons.bin").size()) + " bytes"));
+    CHECK_EQ(merge_records(r, "admin_polygons.bin"), std::string("m/i/d/r=0/1/0/2"));
 }

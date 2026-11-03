@@ -75,6 +75,7 @@ static constexpr size_t WAY_HEADER_STRIDE = 12;
 static constexpr size_t ADDR_POINT_STRIDE = 28;
 static constexpr size_t INTERP_WAY_STRIDE = 24;
 static constexpr size_t ADMIN_POLYGON_STRIDE = 24;
+static constexpr size_t ARC_INDEX_STRIDE = 4;
 static constexpr size_t POI_RECORD_STRIDE = 36;
 static constexpr size_t PLACE_NODE_STRIDE = 20;
 
@@ -205,8 +206,10 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // that index's rebuild read; the file ids after PLACE_NODES move down two.
 // v14: admin geometry is arcs. File ids 7, 26 and 27 name admin_rings.bin,
 // arc_index.bin and arc_vertices.bin (admin_vertices.bin and the postal files
-// are gone), and the four admin geometry files travel whole. Admin polygons
-// keep their slots, so nothing is remapped by an admin id: the parent-id remap
+// are gone). The four admin geometry files merge by slot: arc_index.bin and
+// admin_polygons.bin record by record, arc_vertices.bin and admin_rings.bin a
+// block per record along them, as plain merge sections. Admin polygons keep
+// their slots, so nothing is remapped by an admin id: the parent-id remap
 // is its street leg alone, the sparse and parallel deltas lose remap kind 1,
 // and the admin cell index is rebuilt from the old one's ids as they are.
 static constexpr uint32_t GCPATCH_VERSION = 14;
@@ -342,10 +345,19 @@ static constexpr StringRecordFile STRING_RECORD_FILES[] = {
     {PatchFileId::PLACE_NODES, PLACE_NODE_STRIDE},
 };
 
-// The admin geometry files, which a patch sends whole (a full replacement, or
-// COPY_OLD when unchanged), in the order it sends them.
-static constexpr PatchFileId ADMIN_GEOMETRY_FILES[] = {PatchFileId::ARC_INDEX, PatchFileId::ARC_VERTICES,
-                                                       PatchFileId::ADMIN_POLYGONS, PatchFileId::ADMIN_RINGS};
+// The admin geometry files by family, in the order a patch sends them: a file
+// of slots of `stride` bytes, each record's u32 at byte 0 the offset of its
+// slot's block in the byte stream after it (a dead arc's block empty, a dead
+// polygon's offset NO_DATA). The diff merges each family by slot
+// (build_slot_merge_seq), the stream a block per record along its slots.
+struct AdminSlotFamily {
+    PatchFileId slots, blocks;
+    size_t stride;
+};
+static constexpr AdminSlotFamily ADMIN_SLOT_FAMILIES[] = {
+    {PatchFileId::ARC_INDEX, PatchFileId::ARC_VERTICES, ARC_INDEX_STRIDE},
+    {PatchFileId::ADMIN_POLYGONS, PatchFileId::ADMIN_RINGS, ADMIN_POLYGON_STRIDE},
+};
 
 // Terminator written after the last patch section; the patcher breaks its
 // section loop when it reads this as a file_id and refuses a patch that ends

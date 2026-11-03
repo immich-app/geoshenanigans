@@ -20,6 +20,7 @@
 #include <unistd.h>
 #include <vector>
 
+#include "arc_blocks.h"
 #include "in_place_edits.h"
 #include "merge_sequence.h"
 #include "patch_format.h"
@@ -2879,21 +2880,169 @@ TEST(patch_fails_cleanly_on_a_tmpdir_too_small_for_the_patch) {
     }
 }
 
-// --- GCPATCH v14: admin geometry from arcs ---
+// --- GCPATCH v14: admin geometry from arcs, merged by slot ---
 
 namespace {
 
-// Each changed admin geometry file's full replacement in a patcher log, and
-// admin_polygons.bin's copy when it is unchanged: "" or what is missing.
-LogCheck sent_whole(const BuildDir& old_d, const BuildDir& new_d) {
+// A section's head: its file, its stride and its old and new sizes.
+std::vector<char> section_head(PatchFileId fid, uint32_t stride, uint64_t old_size, uint64_t new_size) {
+    std::vector<char> head;
+    append(head, static_cast<uint32_t>(fid));
+    append(head, stride);
+    append(head, old_size);
+    append(head, new_size);
+    return head;
+}
+
+// Where a raw patch sends fid's file of size bytes as COPY_OLD (unchanged),
+// or npos unless it does so once.
+size_t copied_old_at(const std::vector<char>& raw, PatchFileId fid, uint64_t size) {
+    std::vector<char> head = section_head(fid, COPY_OLD_STRIDE, size, size);
+    append(head, 0u);
+    append(head, uint64_t{0});
+    return find_once(raw, head);
+}
+
+// A merge section's ops, each (op, records).
+using Ops = std::vector<std::pair<uint8_t, uint32_t>>;
+
+// The merge section of a raw patch with that head: its offset fixups' run
+// and value counts and its ops; found is false unless the patch holds the
+// head once and a whole section after it.
+struct MergeSection {
+    bool found = false;
+    uint32_t fixup_runs = 0, fixup_values = 0;
+    Ops ops;
+};
+
+MergeSection merge_section(const std::vector<char>& raw, PatchFileId fid, uint32_t stride, uint64_t old_size,
+                           uint64_t new_size) {
+    MergeSection s;
+    const std::vector<char> head = section_head(fid, stride, old_size, new_size);
+    size_t at = find_once(raw, head);
+    if (at == std::string::npos) return s;
+    at += head.size();
+    auto skip = [&](uint64_t n) {
+        if (n > raw.size() - at) return false;
+        at += n;
+        return true;
+    };
+    auto read = [&](void* out, size_t n) {
+        if (n > raw.size() - at) return false;
+        memcpy(out, raw.data() + at, n);
+        at += n;
+        return true;
+    };
+    uint32_t runs_size = 0, values_size = 0, string_fixups = 0, string_fixups_size = 0;
+    uint64_t seq_size = 0;
+    if (!read(&s.fixup_runs, 4) || !read(&s.fixup_values, 4) || !read(&runs_size, 4) || !read(&values_size, 4) ||
+        !skip(uint64_t{runs_size} + values_size) || !read(&string_fixups, 4) || !read(&string_fixups_size, 4) ||
+        !skip(string_fixups_size) || !read(&seq_size, 8) || seq_size > raw.size() - at)
+        return s;
+    const size_t end = at + seq_size;
+    while (at < end) {
+        uint8_t op = 0;
+        uint32_t count = 0;
+        if (!read(&op, 1) || !read(&count, 4)) return s;
+        if ((op == OP_INSERT_RUN || op == OP_REPLACE_RUN) && !skip(uint64_t{count} * stride)) return s;
+        s.ops.push_back({op, count});
+    }
+    s.found = at == end;
+    return s;
+}
+
+// An admin arc dir by slot, with real blocks (arc_blocks.h): each arc slot's
+// vertices (none for a dead slot, whose block is empty) and each polygon
+// slot's one ring, the arc slots it runs over (none for a tombstone), and its
+// name.
+struct ArcSlots {
+    std::vector<std::vector<PackedLocation>> arcs;
+    std::vector<std::vector<uint32_t>> rings;
+    std::vector<uint32_t> names;
+};
+
+// Arc i of n vertices: a line north-east from (47° + i · 0.01°, 8°), 1000
+// e7 units of latitude and 1500 of longitude a step, so its ends are its box.
+std::vector<PackedLocation> arc_line(uint32_t i, uint32_t n) {
+    std::vector<PackedLocation> v;
+    for (uint32_t k = 0; k < n; k++)
+        v.push_back({470000000 + static_cast<int32_t>(i) * 100000 + static_cast<int32_t>(k) * 1000,
+                     80000000 + static_cast<int32_t>(k) * 1500});
+    return v;
+}
+
+// n_arcs arcs of `vertices` each and n_polygons polygons, polygon p's ring
+// over arcs 3p, 3p + 1 and 3p + 2 (mod n_arcs), named 100 + p.
+ArcSlots arc_slots(uint32_t n_arcs, uint32_t vertices, uint32_t n_polygons) {
+    ArcSlots a;
+    for (uint32_t i = 0; i < n_arcs; i++) a.arcs.push_back(arc_line(i, vertices));
+    for (uint32_t p = 0; p < n_polygons; p++) {
+        a.rings.push_back({(3 * p) % n_arcs, (3 * p + 1) % n_arcs, (3 * p + 2) % n_arcs});
+        a.names.push_back(100 + p);
+    }
+    return a;
+}
+
+// An arc's block at k = 0 (encode_arc); a dead slot's is empty.
+std::vector<char> arc_block(const std::vector<PackedLocation>& v) {
+    if (v.empty()) return {};
+    auto at = [&](size_t i) { return v[i]; };
+    std::vector<char> b(arc_blocks::encode_arc(v.size(), at, 0, nullptr));
+    arc_blocks::encode_arc(v.size(), at, 0, reinterpret_cast<uint8_t*>(b.data()));
+    return b;
+}
+
+// A polygon's ring block of one ring (encode_ring); a tombstone has none.
+std::vector<char> ring_block(const std::vector<uint32_t>& slots) {
+    if (slots.empty()) return {};
+    auto ref = [&](size_t i) {
+        arc_blocks::RingRef r;
+        r.slot = r.planet_slot = slots[i];
+        return r;
+    };
+    std::vector<char> b(arc_blocks::encode_ring(slots.size(), ref, nullptr));
+    arc_blocks::encode_ring(slots.size(), ref, reinterpret_cast<uint8_t*>(b.data()));
+    return b;
+}
+
+// a's four admin geometry files into d, laid out as put_arc_geometry lays
+// them out (a tombstone's record {NO, 0, NO}).
+void put_arc_slots(BuildDir& d, const ArcSlots& a) {
+    ArcGeometry g;
+    for (size_t p = 0; p < a.rings.size(); p++) {
+        g.keys.push_back(a.rings[p].empty() ? NO : a.names[p]);
+        g.rings.push_back(ring_block(a.rings[p]));
+    }
+    for (const auto& arc : a.arcs) g.arcs.push_back(arc_block(arc));
+    put_arc_geometry(d, g);
+}
+
+// The bytes of a's arc blocks of slots [from, to), and of its ring blocks.
+uint32_t arc_bytes(const ArcSlots& a, size_t from, size_t to) {
+    size_t n = 0;
+    for (size_t s = from; s < to; s++) n += arc_block(a.arcs[s]).size();
+    return static_cast<uint32_t>(n);
+}
+uint32_t ring_bytes(const ArcSlots& a, size_t from, size_t to) {
+    size_t n = 0;
+    for (size_t p = from; p < to; p++) n += ring_block(a.rings[p]).size();
+    return static_cast<uint32_t>(n);
+}
+
+// Each admin geometry file's line in a patcher log: a merge section's
+// ("<name>: <size> bytes"), or COPY_OLD's when it is unchanged, and never a
+// full replacement. "" or what is wrong.
+LogCheck merged_by_slot(const BuildDir& old_d, const BuildDir& new_d) {
     return [old_d, new_d](const std::string& log) -> std::string {
-        for (const PatchFileId fid : ADMIN_GEOMETRY_FILES) {
-            const std::string name = patch_file_names[uint32_t(fid)];
-            const std::string line = old_d.at(name) == new_d.at(name)
-                                         ? name + ": unchanged (copied " + std::to_string(new_d.at(name).size()) + " bytes from old)"
-                                         : name + ": full replace " + std::to_string(new_d.at(name).size()) + " bytes";
-            if (log.find(line) == std::string::npos) return "no \"" + line + "\"";
-        }
+        for (const AdminSlotFamily& family : ADMIN_SLOT_FAMILIES)
+            for (const PatchFileId fid : {family.slots, family.blocks}) {
+                const std::string name = patch_file_names[uint32_t(fid)];
+                const std::string size = std::to_string(new_d.at(name).size());
+                const std::string line = old_d.at(name) == new_d.at(name) ? name + ": unchanged (copied " + size + " bytes from old)"
+                                                                           : name + ": " + size + " bytes";
+                if (log.find(line) == std::string::npos) return "no \"" + line + "\"";
+                if (log.find(name + ": full replace") != std::string::npos) return name + " replaced whole";
+            }
         return "";
     };
 }
@@ -2902,8 +3051,8 @@ LogCheck sent_whole(const BuildDir& old_d, const BuildDir& new_d) {
 
 // An admin-minimal-shaped dir (its arc, ring, record, place and admin cell
 // files, core strings and layout) round-trips in every mode, the admin
-// geometry files whole: one arc edited, one longer, one new; one ring
-// edited in place, so the records stay and go as copied; a place's label
+// geometry files merged by slot: one arc edited, one longer, one new; one
+// ring edited in place, so the records stay and go as copied; a place's label
 // and an admin cell's list changed. The parent's diff refused the dir: no
 // patch section named admin_rings.bin.
 TEST(patch_lowmem_round_trips_an_admin_minimal_arc_dir) {
@@ -2925,13 +3074,13 @@ TEST(patch_lowmem_round_trips_an_admin_minimal_arc_dir) {
     const LowMemCase c{dir.path(), "arc-dir"};
     REQUIRE(prepare(c, old_d, new_d).empty());
 
-    CHECK(apply_modes(c, ALL_MODES, sent_whole(old_d, new_d)).bad.empty());
+    CHECK(apply_modes(c, ALL_MODES, merged_by_slot(old_d, new_d)).bad.empty());
 }
 
 // An encoded family (the POIs, encoded by geocoder-gc) beside the plain arc
 // files: the low-memory mode replays the family through its codecs and the
-// arc files as plain sections, and the new set is gc's encoding of the new
-// dir, byte for byte. The parent's diff refused the dir.
+// arc files as plain merge sections, and the new set is gc's encoding of the
+// new dir, byte for byte. The parent's diff refused the dir.
 TEST(patch_lowmem_applies_an_encoded_set_beside_plain_arc_files) {
     ScratchDir dir("lowmem-arcs-beside");
     std::mt19937 rng(20261103);
@@ -2951,15 +3100,239 @@ TEST(patch_lowmem_applies_an_encoded_set_beside_plain_arc_files) {
     REQUIRE(prepare(c, old_d, new_d).empty());
     REQUIRE(read_dir(c.dir("old.enc")).count("poi_records.r3") == 1);
 
-    const LogCheck whole = sent_whole(old_d, new_d);
+    const LogCheck merged = merged_by_slot(old_d, new_d);
     CHECK(apply_both_modes(c, [&](const std::string& log) -> std::string {
               if (log.find("encode poi:") == std::string::npos) return "no encode poi line";
-              return whole(log);
+              return merged(log);
           }).empty());
 }
 
-// arc_vertices.bin replaced whole, 1 MiB of it and 10 MiB (n arcs of a KiB,
-// every byte new), over the same 100 polygons: the patcher writes the file
+// One interior vertex of one arc moved, its box and every delta's length
+// kept: the arc vertices' merge keeps every byte but those of the vertex's
+// two deltas that changed, at most 16 (a MATCH of the blocks before the arc
+// and its head, a DELETE and an INSERT of the changed bytes, a MATCH of its
+// tail and every block after it), and the arc index, the records and the
+// rings go as unchanged. Every mode applies it. The parent sent the arc
+// vertices whole.
+TEST(patch_arc_vertices_send_only_the_bytes_of_a_moved_vertex) {
+    ScratchDir dir("lowmem-arc-vertex");
+    const ArcSlots old_a = arc_slots(40, 30, 12);
+    ArcSlots new_a = old_a;
+    new_a.arcs[7][15].lat_e7 += 3;
+    new_a.arcs[7][15].lon_e7 -= 2;
+    BuildDir old_d, new_d;
+    put_arc_slots(old_d, old_a);
+    put_arc_slots(new_d, new_a);
+    const uint64_t size = new_d.at("arc_vertices.bin").size();
+    REQUIRE(old_d.at("arc_vertices.bin").size() == size);
+    REQUIRE(old_d.at("arc_vertices.bin") != new_d.at("arc_vertices.bin"));
+    const LowMemCase c{dir.path(), "moved-vertex"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+
+    const std::vector<char> raw = raw_patch(c);
+    const MergeSection v = merge_section(raw, PatchFileId::ARC_VERTICES, 1, size, size);
+    CHECK(v.found);
+    REQUIRE(v.ops.size() == 4);
+    CHECK(v.ops[0].first == OP_MATCH_RUN && v.ops[1].first == OP_DELETE_RUN && v.ops[2].first == OP_INSERT_RUN &&
+          v.ops[3].first == OP_MATCH_RUN);
+    std::printf("    moved vertex: %u of %u bytes sent\n", v.ops[2].second, static_cast<uint32_t>(size));
+    CHECK(v.ops[0].second > arc_bytes(old_a, 0, 7));
+    CHECK_EQ(v.ops[1].second, v.ops[2].second);
+    CHECK(v.ops[2].second <= 16);
+    CHECK_EQ(uint64_t{v.ops[0].second} + v.ops[1].second + v.ops[3].second, size);
+    for (const PatchFileId fid : {PatchFileId::ARC_INDEX, PatchFileId::ADMIN_POLYGONS, PatchFileId::ADMIN_RINGS})
+        CHECK(copied_old_at(raw, fid, new_d.at(patch_file_names[uint32_t(fid)]).size()) != std::string::npos);
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// An arc that grows, a vertex added at its end inside its box: the arc index
+// MATCHes every slot, the slots after the arc moved by one offset fixup run
+// of the bytes it grew, and the arc vertices insert those bytes behind its
+// block; the rings, which name arc slots, not offsets, and the records go as
+// unchanged. Every mode applies it. The parent sent the arc files whole.
+TEST(patch_arc_index_moves_the_arcs_after_a_grown_arc_by_one_fixup_run) {
+    ScratchDir dir("lowmem-arc-grown");
+    const ArcSlots old_a = arc_slots(40, 30, 12);
+    ArcSlots new_a = old_a;
+    const PackedLocation end = new_a.arcs[7].back();
+    new_a.arcs[7].push_back({end.lat_e7 - 500, end.lon_e7 - 700});
+    BuildDir old_d, new_d;
+    put_arc_slots(old_d, old_a);
+    put_arc_slots(new_d, new_a);
+    const uint32_t old_size = arc_bytes(old_a, 0, 40), new_size = arc_bytes(new_a, 0, 40);
+    REQUIRE(new_size > old_size);
+    const LowMemCase c{dir.path(), "grown-arc"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+
+    const std::vector<char> raw = raw_patch(c);
+    const MergeSection index = merge_section(raw, PatchFileId::ARC_INDEX, 4, 40 * 4, 40 * 4);
+    CHECK(index.found);
+    CHECK(index.ops == (Ops{{OP_MATCH_RUN, 40}}));
+    CHECK_EQ(index.fixup_runs, 1u);
+    CHECK_EQ(index.fixup_values, 0u);
+    const MergeSection v = merge_section(raw, PatchFileId::ARC_VERTICES, 1, old_size, new_size);
+    const uint32_t through_7 = arc_bytes(old_a, 0, 8);
+    CHECK(v.ops == (Ops{{OP_MATCH_RUN, through_7}, {OP_INSERT_RUN, new_size - old_size}, {OP_MATCH_RUN, old_size - through_7}}));
+    for (const PatchFileId fid : {PatchFileId::ADMIN_POLYGONS, PatchFileId::ADMIN_RINGS})
+        CHECK(copied_old_at(raw, fid, new_d.at(patch_file_names[uint32_t(fid)]).size()) != std::string::npos);
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// 1,000 tombstones both days hold, among 100 live polygons (each eleventh
+// slot), MATCH in place: the one change, polygon 0's ring running over one
+// arc more, is a REPLACE of its record (its ring_bytes) and of its ring
+// block (a DELETE and an INSERT), every later record MATCHing with its
+// ring_offset moved by one fixup run. Nothing is inserted or deleted by
+// record. Every mode applies it. The parent sent the records whole.
+TEST(patch_admin_tombstones_both_days_hold_merge_in_place) {
+    ScratchDir dir("lowmem-admin-tombstones");
+    ArcSlots old_a = arc_slots(40, 10, 1100);
+    for (size_t p = 0; p < old_a.rings.size(); p++)
+        if (p % 11) old_a.rings[p].clear();
+    ArcSlots new_a = old_a;
+    new_a.rings[0].push_back(30);
+    BuildDir old_d, new_d;
+    put_arc_slots(old_d, old_a);
+    put_arc_slots(new_d, new_a);
+    const LowMemCase c{dir.path(), "tombstones"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+
+    const std::vector<char> raw = raw_patch(c);
+    const uint64_t records = 1100 * ADMIN_POLYGON_STRIDE;
+    const MergeSection polygons = merge_section(raw, PatchFileId::ADMIN_POLYGONS, ADMIN_POLYGON_STRIDE, records, records);
+    CHECK(polygons.found);
+    CHECK(polygons.ops == (Ops{{OP_REPLACE_RUN, 1}, {OP_MATCH_RUN, 1099}}));
+    CHECK_EQ(polygons.fixup_runs, 1u);
+    const uint32_t old_rings = ring_bytes(old_a, 0, 1100), new_rings = ring_bytes(new_a, 0, 1100);
+    const uint32_t ring_0 = ring_bytes(old_a, 0, 1), new_ring_0 = ring_bytes(new_a, 0, 1);
+    const MergeSection rings = merge_section(raw, PatchFileId::ADMIN_RINGS, 1, old_rings, new_rings);
+    CHECK(rings.ops == (Ops{{OP_DELETE_RUN, ring_0}, {OP_INSERT_RUN, new_ring_0}, {OP_MATCH_RUN, old_rings - ring_0}}));
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// The arc index by slot, where a slot present on both days is a MATCH (an
+// arc index record is only its offset): arc 3, dead on the old day, is born,
+// arc 5 dies, slot 8 is recycled for an arc that shares its first five
+// vertices, and arcs 20 and 21 are appended. The arc vertices show the birth
+// as an INSERT of its block, the death as a DELETE of its block, the recycle
+// as a DELETE and an INSERT of what the two blocks don't share (their head
+// kept) and the appended arcs as an INSERT; the index INSERTs the appended
+// slots. The records and rings go as unchanged, and every mode applies it.
+// The parent sent the arc files whole.
+TEST(patch_arc_slots_born_dead_recycled_and_appended_merge_by_slot) {
+    ScratchDir dir("lowmem-arc-slots");
+    ArcSlots old_a = arc_slots(20, 10, 6);
+    old_a.arcs[3].clear();
+    ArcSlots new_a = old_a;
+    new_a.arcs[3] = arc_line(30, 10);
+    new_a.arcs[5].clear();
+    for (size_t k = 5; k < 10; k++) new_a.arcs[8][k].lon_e7 += 40 * static_cast<int32_t>(k - 4);
+    new_a.arcs.push_back(arc_line(32, 10));
+    new_a.arcs.push_back(arc_line(33, 10));
+    BuildDir old_d, new_d;
+    put_arc_slots(old_d, old_a);
+    put_arc_slots(new_d, new_a);
+    const LowMemCase c{dir.path(), "arc-slots"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+
+    const std::vector<char> raw = raw_patch(c);
+    const MergeSection index = merge_section(raw, PatchFileId::ARC_INDEX, 4, 20 * 4, 22 * 4);
+    CHECK(index.found);
+    CHECK(index.ops == (Ops{{OP_MATCH_RUN, 20}, {OP_INSERT_RUN, 2}}));
+    // The recycled slot's blocks: their shared head, then what differs.
+    const std::vector<char> was = arc_block(old_a.arcs[8]), now = arc_block(new_a.arcs[8]);
+    REQUIRE(was.size() == now.size());
+    uint32_t head = 0;
+    while (head < was.size() && was[head] == now[head]) head++;
+    REQUIRE(head > 9 && head < was.size());
+    uint32_t tail = 0;
+    while (tail < was.size() - head && was[was.size() - 1 - tail] == now[now.size() - 1 - tail]) tail++;
+    const uint32_t middle = static_cast<uint32_t>(was.size()) - head - tail;
+    const MergeSection v = merge_section(raw, PatchFileId::ARC_VERTICES, 1, arc_bytes(old_a, 0, 20), arc_bytes(new_a, 0, 22));
+    CHECK(v.ops == (Ops{{OP_MATCH_RUN, arc_bytes(old_a, 0, 3)},
+                        {OP_INSERT_RUN, arc_bytes(new_a, 3, 4)},
+                        {OP_MATCH_RUN, arc_bytes(old_a, 4, 5)},
+                        {OP_DELETE_RUN, arc_bytes(old_a, 5, 6)},
+                        {OP_MATCH_RUN, arc_bytes(old_a, 6, 8) + head},
+                        {OP_DELETE_RUN, middle},
+                        {OP_INSERT_RUN, middle},
+                        {OP_MATCH_RUN, tail + arc_bytes(old_a, 9, 20)},
+                        {OP_INSERT_RUN, arc_bytes(new_a, 20, 22)}}));
+    for (const PatchFileId fid : {PatchFileId::ADMIN_POLYGONS, PatchFileId::ADMIN_RINGS})
+        CHECK(copied_old_at(raw, fid, new_d.at(patch_file_names[uint32_t(fid)]).size()) != std::string::npos);
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// Admin polygons by slot: slot 2, a tombstone on the old day, is recycled for
+// a new polygon (a REPLACE of its record and an INSERT of its ring block),
+// polygon 6 dies (a REPLACE to the tombstone and a DELETE of its ring block),
+// and a polygon is appended (an INSERT of both); every other slot MATCHes.
+// The arc files go as unchanged, and every mode applies it. The parent sent
+// the records and rings whole.
+TEST(patch_admin_polygon_slots_recycled_dead_and_appended_merge_by_slot) {
+    ScratchDir dir("lowmem-polygon-slots");
+    ArcSlots old_a = arc_slots(30, 10, 12);
+    old_a.rings[2].clear();
+    ArcSlots new_a = old_a;
+    new_a.rings[2] = {20, 21};
+    new_a.names[2] = 500;
+    new_a.rings[6].clear();
+    new_a.rings.push_back({25, 26, 27, 28});
+    new_a.names.push_back(600);
+    BuildDir old_d, new_d;
+    put_arc_slots(old_d, old_a);
+    put_arc_slots(new_d, new_a);
+    const LowMemCase c{dir.path(), "polygon-slots"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+
+    const std::vector<char> raw = raw_patch(c);
+    const MergeSection polygons = merge_section(raw, PatchFileId::ADMIN_POLYGONS, ADMIN_POLYGON_STRIDE,
+                                                12 * ADMIN_POLYGON_STRIDE, 13 * ADMIN_POLYGON_STRIDE);
+    CHECK(polygons.found);
+    CHECK(polygons.ops == (Ops{{OP_MATCH_RUN, 2}, {OP_REPLACE_RUN, 1}, {OP_MATCH_RUN, 3}, {OP_REPLACE_RUN, 1},
+                               {OP_MATCH_RUN, 5}, {OP_INSERT_RUN, 1}}));
+    const MergeSection rings = merge_section(raw, PatchFileId::ADMIN_RINGS, 1, ring_bytes(old_a, 0, 12), ring_bytes(new_a, 0, 13));
+    CHECK(rings.ops == (Ops{{OP_MATCH_RUN, ring_bytes(old_a, 0, 2)},
+                            {OP_INSERT_RUN, ring_bytes(new_a, 2, 3)},
+                            {OP_MATCH_RUN, ring_bytes(old_a, 3, 6)},
+                            {OP_DELETE_RUN, ring_bytes(old_a, 6, 7)},
+                            {OP_MATCH_RUN, ring_bytes(old_a, 7, 12)},
+                            {OP_INSERT_RUN, ring_bytes(new_a, 12, 13)}}));
+    for (const PatchFileId fid : {PatchFileId::ARC_INDEX, PatchFileId::ARC_VERTICES})
+        CHECK(copied_old_at(raw, fid, new_d.at(patch_file_names[uint32_t(fid)]).size()) != std::string::npos);
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// Identical days: each admin geometry file goes as COPY_OLD, arc_index,
+// arc_vertices, admin_polygons and admin_rings in that order, ahead of the
+// admin cells (their cell changes, then their index delta). Every mode
+// applies it. The parent sent them last, behind the admin cells.
+TEST(patch_identical_days_copy_the_admin_geometry_ahead_of_the_admin_cells) {
+    ScratchDir dir("lowmem-arcs-same");
+    BuildDir d;
+    put_arc_slots(d, arc_slots(40, 30, 12));
+    CellLists cells;
+    for (uint32_t k = 0; k < 12; k++) cells[cell_id(k)] = {k};
+    put_cells(d, "admin", cells);
+    const LowMemCase c{dir.path(), "same"};
+    REQUIRE(prepare(c, d, d).empty());
+
+    const std::vector<char> raw = raw_patch(c);
+    std::vector<size_t> at;
+    for (const AdminSlotFamily& family : ADMIN_SLOT_FAMILIES)
+        for (const PatchFileId fid : {family.slots, family.blocks})
+            at.push_back(copied_old_at(raw, fid, d.at(patch_file_names[uint32_t(fid)]).size()));
+    std::vector<char> admin_cells;
+    for (const uint32_t w : {CELL_CHANGES_ADMIN_MARKER, 0u, 0u}) append(admin_cells, w);
+    at.push_back(find_once(raw, admin_cells));
+    for (size_t i = 0; i < at.size(); i++) CHECK(at[i] != std::string::npos);
+    CHECK(std::is_sorted(at.begin(), at.end()));
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// arc_vertices.bin's every byte new, 1 MiB of it and 10 MiB (n arcs of a
+// KiB), over the same 100 polygons: its merge sends every block (head and
+// tail trimmed only where a byte happens to repeat), which the patcher writes
 // from the patch where it sits, so its heap stays flat in every mode. The
 // parent's diff refused the dir.
 TEST(patch_heap_stays_flat_as_arc_vertices_are_replaced_whole) {
@@ -2972,14 +3345,56 @@ TEST(patch_heap_stays_flat_as_arc_vertices_are_replaced_whole) {
         put_admin_minimal(old_d, old_g, 100);
         put_admin_minimal(new_d, new_g, 100);
         if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
-        // The full replacement's head: file id, stride 0, old and new sizes.
-        std::vector<char> head;
-        append(head, static_cast<uint32_t>(PatchFileId::ARC_VERTICES));
-        append(head, 0u);
-        append(head, uint64_t{n} << 10);
-        append(head, uint64_t{n} << 10);
-        return patch_holds(c, head, std::to_string(n) + " KiB of arc vertices replaced whole");
+        return patch_holds(c, section_head(PatchFileId::ARC_VERTICES, 1, uint64_t{n} << 10, uint64_t{n} << 10),
+                           "merge of " + std::to_string(n) + " KiB of new arc vertices");
     }, 1024).empty());
+}
+
+// n arcs edited, 20,000 and 200,000, each a byte longer, among 2n: every
+// later slot's offset moves by one byte more after each, n offset fixup runs
+// of the arc index, which the patcher decodes as its MATCH records pass, and
+// the arc vertices copy the old bytes between the edits. Its heap stays flat
+// in every mode. The parent sent both files whole.
+TEST(patch_heap_stays_flat_as_arcs_change) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::mt19937 rng(20261104);
+        const ArcGeometry old_g = arc_geometry(rng, 10, 2 * n, 24);
+        ArcGeometry new_g = old_g;
+        for (uint32_t i = 0; i < 2 * n; i += 2) new_g.arcs[i].push_back('x');
+        BuildDir old_d, new_d;
+        put_arc_geometry(old_d, old_g);
+        put_arc_geometry(new_d, new_g);
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        const uint64_t old_size = old_d.at("arc_vertices.bin").size(), new_size = new_d.at("arc_vertices.bin").size();
+        return patch_holds(c, section_head(PatchFileId::ARC_VERTICES, 1, old_size, new_size),
+                           "merge of " + std::to_string(n) + " edited arcs");
+    }, 20000).empty());
+}
+
+// n polygons' ring blocks edited, 20,000 and 200,000, each a byte longer,
+// among 2n slots: n REPLACEs of the records (their ring_bytes), the MATCH
+// records between them moved by offset fixups, and the ring blocks' merge
+// along them. The patcher's heap stays flat in every mode. The parent sent
+// both files whole.
+TEST(patch_heap_stays_flat_as_rings_change) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::mt19937 rng(20261104);
+        const ArcGeometry old_g = arc_geometry(rng, 2 * n, 10, 24);
+        ArcGeometry new_g = old_g;
+        for (uint32_t p = 0, edited = 0; p < 2 * n && edited < n; p++)
+            if (new_g.keys[p] != NO) {
+                new_g.rings[p].push_back('x');
+                edited++;
+            }
+        BuildDir old_d, new_d;
+        put_arc_geometry(old_d, old_g);
+        put_arc_geometry(new_d, new_g);
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        const uint64_t old_size = old_d.at("admin_rings.bin").size(), new_size = new_d.at("admin_rings.bin").size();
+        if (new_size - old_size != n) return std::string("not n rings edited");
+        return patch_holds(c, section_head(PatchFileId::ADMIN_RINGS, 1, old_size, new_size),
+                           "merge of " + std::to_string(n) + " edited rings");
+    }, 20000).empty());
 }
 
 // The low-memory admin family (layout B of admin_vertices.bin) is gone: an

@@ -152,6 +152,34 @@ inline IdentityMerge build_identity_merge_seq(const char* old_data, size_t old_s
     return r;
 }
 
+// --- Slot merge (v14 admin geometry) ---
+// A file of slots (arc_index.bin, admin_polygons.bin): record j is slot j on
+// both days, a dead slot keeps a tombstone in place, and no slot is reused
+// the day it dies, so a slot live on both days holds the same object. Each
+// new record's entity is the old record at its index: the identity merge with
+// old_of_new[j] = j and every record in order, so no keys and no LIS. A
+// tombstone both days hold MATCHes in place, where keyed by liveness it went
+// as a DELETE and an INSERT every day; the new file's slots past the old end
+// are INSERTs, the old ones past the new end DELETEs. Each old record's u32 at
+// offset_field (its block's offset in the stream after it) first takes its
+// new record's, so a record that is only an offset (arc_index.bin) MATCHes
+// whenever its slot is on both days and any other when its other fields are
+// equal; the caller restores the old offsets for the child merge. A content
+// merge (build_merge_seq) pairs an arc index's records by their offsets
+// instead: once an arc grows or dies, the slots after it pair with other
+// slots' records or with none, and their blocks with them.
+inline IdentityMerge build_slot_merge_seq(char* old_recs, size_t old_size, const char* new_recs, size_t new_size,
+                                          size_t stride, size_t offset_field) {
+    const size_t old_n = old_size / stride, new_n = new_size / stride, kept = std::min(old_n, new_n);
+    std::vector<uint32_t> old_of_new(new_n, UINT32_MAX);
+    for (size_t j = 0; j < kept; j++) {
+        old_of_new[j] = static_cast<uint32_t>(j);
+        memcpy(old_recs + j * stride + offset_field, new_recs + j * stride + offset_field, 4);
+    }
+    return build_identity_merge_seq(old_recs, old_size, new_recs, new_size, stride, old_of_new,
+                                    std::vector<uint8_t>(new_n, 1));
+}
+
 // The non-zero records of a file by content hash, for build_merge_seq's jumps:
 // (hash << 32 | index) sorted, 8 bytes a record where an unordered_multimap
 // cost ~40 (7 GB for planet addr_points), plus a directory of where each hash
