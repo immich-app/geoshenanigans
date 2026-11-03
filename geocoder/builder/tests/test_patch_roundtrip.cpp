@@ -4,16 +4,19 @@
 // refuse: a patch is untrusted input.
 #include <algorithm>
 #include <cerrno>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iterator>
 #include <map>
+#include <random>
 #include <string>
 #include <tuple>
 #include <vector>
 
+#include "in_place_edits.h"
 #include "merge_sequence.h"
 #include "patch_decompress.h"
 #include "patch_format.h"
@@ -439,6 +442,16 @@ BuildDir pois_with_dead_run(uint32_t n, uint32_t dead, uint32_t dead_n) {
     return {{"poi_records.bin", bytes_of(records)}, {"poi_vertices.bin", vertices}};
 }
 
+// pois_with_dead_run(n, 0, 0) with the importance of the POIs `edited` marks
+// raised, as wikidata sitelinks raise it; their vertex blocks stay.
+BuildDir pois_reranked(uint32_t n, const std::vector<bool>& edited) {
+    BuildDir d = pois_with_dead_run(n, 0, 0);
+    std::vector<char>& records = d["poi_records.bin"];
+    for (uint32_t i = 0; i < n; i++)
+        if (edited[i]) records[size_t(i) * POI_RECORD_STRIDE + offsetof(PoiRecord, importance)] = 40;
+    return d;
+}
+
 // The record counts by op of the diff's merge of file `name` ("m/i/d/r=..."
 // of its log line), printed; "" without one.
 std::string merge_records(const RoundTrip& r, const std::string& name) {
@@ -557,6 +570,21 @@ TEST(patch_round_trip_matches_the_pois_after_a_long_run_of_tombstones) {
     CHECK(r.mismatches.empty());
     CHECK_EQ(merge_records(r, "poi_records.bin"), "m/i/d/r=" + std::to_string(HEAD + TAIL) + "/" + std::to_string(DEAD) +
                                                       "/" + std::to_string(DEAD) + "/0");
+}
+
+// The 2026-11-03 nightly raised the importance of ~1 planet poi/all record in
+// 23, in stretches where 7 in 10 changed: the POIs kept among them stay
+// MATCHed instead of the rest of the file going as DELETE + INSERT.
+TEST(patch_round_trip_matches_the_pois_kept_among_reranked_ones) {
+    constexpr uint32_t N = 30000, DENSE = 1000, DENSE_N = 12000;
+    std::mt19937 rng(20261103);
+    const auto edited = gctest::edited_in_place(rng, N, DENSE, DENSE_N);
+    const auto n_edited = static_cast<uint32_t>(std::count(edited.begin(), edited.end(), true));
+    auto r = round_trip(pois_with_dead_run(N, 0, 0), pois_reranked(N, edited));
+
+    CHECK(r.mismatches.empty());
+    CHECK_EQ(merge_records(r, "poi_records.bin"), "m/i/d/r=" + std::to_string(N - n_edited) + "/" +
+                                                      std::to_string(n_edited) + "/" + std::to_string(n_edited) + "/0");
 }
 
 // Place nodes come without a cell index (a client derives theirs at load).

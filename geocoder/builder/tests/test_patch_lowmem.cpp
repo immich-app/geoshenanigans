@@ -5,6 +5,7 @@
 // patcher's heap peak, in every mode, as a case grows tenfold; and patches
 // and command lines the patcher must refuse.
 #include <algorithm>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -19,11 +20,13 @@
 #include <unistd.h>
 #include <vector>
 
+#include "in_place_edits.h"
 #include "merge_sequence.h"
 #include "patch_format.h"
 #include "scratch_dir.h"
 #include "test_framework.h"
 #include "tool_runs.h"
+#include "types.h"
 
 namespace {
 
@@ -765,6 +768,34 @@ TEST(patch_lowmem_replays_a_long_run_of_tombstones) {
     REQUIRE(prepare(c, old_d, new_d).empty());
 
     CHECK(raw_patch(c).size() < size_t(DEAD + TAIL / 2) * POI_RECORD_STRIDE);
+    CHECK(apply_modes(c, {"plain"}).bad.empty());
+    CHECK(apply_both_modes(c, decoder_peaks_at_most("poi", DECODER_HOLD)).empty());
+}
+
+// The 2026-11-03 nightly raised the importance of ~1 planet poi/all record in
+// 23, in stretches where 7 in 10 changed. The POIs kept among them stay
+// MATCHed, so the patch holds less than twice the edited records' bytes
+// (main's sent the rest of the file), and their DELETE + INSERT pairs replay
+// with the vertex blocks they keep.
+TEST(patch_lowmem_replays_records_edited_in_place) {
+    ScratchDir dir("lowmem-edited");
+    std::mt19937 rng(20261103);
+    constexpr uint32_t N = 30000, DENSE = 1000, DENSE_N = 12000;
+    const auto pois = pois_of(rng, N, 0, true);
+    const auto edited = gctest::edited_in_place(rng, N, DENSE, DENSE_N);
+    BuildDir old_d, new_d;
+    put_pois(old_d, pois);
+    put_pois(new_d, pois);
+    std::vector<char>& records = new_d["poi_records.bin"];
+    size_t n_edited = 0;
+    for (uint32_t i = 0; i < N; i++)
+        if (edited[i]) { records[size_t(i) * POI_RECORD_STRIDE + offsetof(PoiRecord, importance)] = 40; n_edited++; }
+    const LowMemCase c{dir.path(), "edited"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+
+    const size_t raw = raw_patch(c).size();
+    std::printf("    raw patch %zu bytes, %zu records edited\n", raw, n_edited);
+    CHECK(raw < n_edited * POI_RECORD_STRIDE * 2);
     CHECK(apply_modes(c, {"plain"}).bad.empty());
     CHECK(apply_both_modes(c, decoder_peaks_at_most("poi", DECODER_HOLD)).empty());
 }
