@@ -1,10 +1,13 @@
 // admin_arcs.h: the arc topology (junctions, cuts, canonical arcs, refs), the
-// arcs' keys and Hilbert presentation order, their slots, the arc stage's dirs
-// and its per-polygon rings following each admin permute. In the sanitized
-// suite: the topology's scatter and partition passes index the store directly.
+// arcs' keys and Hilbert presentation order, their slots, the minimal set, the
+// arc stage's dirs and its per-polygon rings following each admin permute. In
+// the sanitized suite: the
+// topology's scatter and partition passes and the minimal chains index their
+// arrays directly.
 #include "admin_arcs.h"
 
 #include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -49,12 +52,14 @@ std::vector<PackedLocation> vertices_of(const AdminExactRings& store, const Arc&
     return out;
 }
 
-// Whether every ring of the store comes back from its refs: the same cycle,
-// in the ring's own direction.
-bool every_ring_rebuilds(const AdminArcs& arcs, const AdminExactRings& store) {
+// Whether every ring of the store in set `set` (a minimal ring for the
+// minimal set) comes back from its refs: the same cycle, in the ring's own
+// direction.
+bool every_ring_rebuilds(const AdminArcs& arcs, const AdminExactRings& store, ArcSet set = ArcSet::Full) {
     for (uint32_t r = 0; r < store.rings.size(); r++) {
         const RingSpan& span = store.rings[r];
-        const std::vector<PackedLocation> rebuilt = rebuild_ring(arcs, store, r);
+        const std::vector<PackedLocation> rebuilt = rebuild_ring(arcs, store, set, r);
+        if (set == ArcSet::Minimal && rebuilt.empty()) continue;
         if (!same_closed_ring(rebuilt.data(), static_cast<uint32_t>(rebuilt.size()), store.vertices.data() + span.begin,
                               span.count))
             return false;
@@ -77,42 +82,65 @@ std::vector<std::vector<ArcRef>> users_of(const AdminArcs& arcs) {
     return users;
 }
 
-// An n x n grid of square cells of side `side` e7 units, every cell a polygon
-// whose sides each carry `inner` vertices between the corners, jittered off
-// the straight line and shared with the cell across (the same coordinates,
-// walked the other way). Rings run counterclockwise from each cell's lower
-// left corner.
+// A lattice of rows x cols square cells of side `side` e7 units whose edges
+// each carry `inner` vertices between the corners, jittered off the straight
+// line, so that cells side by side share their edge (the same coordinates,
+// walked the other way).
+struct Lattice {
+    Lattice(int rows, int cols, int inner, uint64_t seed, int32_t side) : side(side) {
+        std::mt19937_64 rng(seed);
+        std::uniform_int_distribution<int32_t> jitter(-side / 8, side / 8);
+        auto make = [&](int edge_rows, int edge_cols, bool horizontal) {
+            std::vector<std::vector<Ring>> edges(edge_rows, std::vector<Ring>(edge_cols));
+            for (int r = 0; r < edge_rows; r++)
+                for (int c = 0; c < edge_cols; c++)
+                    for (int k = 1; k <= inner; k++) {
+                        const int32_t along = k * side / (inner + 1), off = jitter(rng);
+                        edges[r][c].push_back(horizontal ? pt(r * side + off, c * side + along)
+                                                         : pt(r * side + along, c * side + off));
+                    }
+            return edges;
+        };
+        across = make(rows + 1, cols, true);
+        upward = make(rows, cols + 1, false);
+    }
+
+    PackedLocation corner(int r, int c) const { return pt(r * side, c * side); }
+
+    // The boundary of the cells [r, r + h) x [c, c + w), counterclockwise
+    // from its lower left corner, closed.
+    Ring block(int r, int c, int h, int w) const {
+        Ring ring;
+        for (int j = c; j < c + w; j++) {
+            ring.push_back(corner(r, j));
+            ring.insert(ring.end(), across[r][j].begin(), across[r][j].end());
+        }
+        for (int i = r; i < r + h; i++) {
+            ring.push_back(corner(i, c + w));
+            ring.insert(ring.end(), upward[i][c + w].begin(), upward[i][c + w].end());
+        }
+        for (int j = c + w; j > c; j--) {
+            ring.push_back(corner(r + h, j));
+            ring.insert(ring.end(), across[r + h][j - 1].rbegin(), across[r + h][j - 1].rend());
+        }
+        for (int i = r + h; i > r; i--) {
+            ring.push_back(corner(i, c));
+            ring.insert(ring.end(), upward[i - 1][c].rbegin(), upward[i - 1][c].rend());
+        }
+        return closed(ring);
+    }
+
+    int32_t side;
+    std::vector<std::vector<Ring>> across;  // the edge from corner (r, c) to (r, c + 1)
+    std::vector<std::vector<Ring>> upward;  // the edge from corner (r, c) to (r + 1, c)
+};
+
+// An n x n grid of the lattice's cells, every cell a polygon.
 std::vector<Polygon> grid(int n, int inner, uint64_t seed, int32_t side = 1000) {
-    std::mt19937_64 rng(seed);
-    std::uniform_int_distribution<int32_t> jitter(-side / 8, side / 8);
-    // The inner vertices of each edge, from its lower-left end: horizontal
-    // edges by (row, column), vertical ones likewise.
-    auto make = [&](int rows, int cols, bool horizontal) {
-        std::vector<std::vector<Ring>> edges(rows, std::vector<Ring>(cols));
-        for (int r = 0; r < rows; r++)
-            for (int c = 0; c < cols; c++)
-                for (int k = 1; k <= inner; k++) {
-                    const int32_t along = k * side / (inner + 1), off = jitter(rng);
-                    edges[r][c].push_back(horizontal ? pt(r * side + off, c * side + along)
-                                                     : pt(r * side + along, c * side + off));
-                }
-        return edges;
-    };
-    const auto across = make(n + 1, n, true);   // the edge from (r, c) to (r, c + 1)
-    const auto upward = make(n, n + 1, false);  // the edge from (r, c) to (r + 1, c)
+    const Lattice lattice(n, n, inner, seed, side);
     std::vector<Polygon> cells;
     for (int r = 0; r < n; r++)
-        for (int c = 0; c < n; c++) {
-            Ring ring{pt(r * side, c * side)};
-            for (const auto& p : across[r][c]) ring.push_back(p);
-            ring.push_back(pt(r * side, (c + 1) * side));
-            for (const auto& p : upward[r][c + 1]) ring.push_back(p);
-            ring.push_back(pt((r + 1) * side, (c + 1) * side));
-            for (auto it = across[r + 1][c].rbegin(); it != across[r + 1][c].rend(); ++it) ring.push_back(*it);
-            ring.push_back(pt((r + 1) * side, c * side));
-            for (auto it = upward[r][c].rbegin(); it != upward[r][c].rend(); ++it) ring.push_back(*it);
-            cells.push_back({closed(ring), {}});
-        }
+        for (int c = 0; c < n; c++) cells.push_back({lattice.block(r, c, 1, 1), {}});
     return cells;
 }
 
@@ -477,32 +505,211 @@ TEST(a_chained_arc_stage_keeps_each_unchanged_arcs_slot) {
     const ScratchDir prev("admin-arc-chain");
     const std::vector<Polygon> cells = grid(5, 3, 77);
     const AdminExactRings store = store_of(cells);
-    const AdminArcs day_one = build_admin_arcs(store, "", 4);
+    // Every cell in the minimal set too, whose arcs are then the full set's.
+    const std::vector<bool> in_minimal(cells.size(), true);
+    const AdminArcs day_one = build_admin_arcs(store, in_minimal, "", 4);
     for (const Arc& a : day_one.arcs) CHECK(a.planet_slot < day_one.arcs.size());
-    const std::string sidecar = arc_sidecar_path(prev.path() + "/planet", ArcSet::Full);
-    std::filesystem::create_directories(std::filesystem::path(sidecar).parent_path());
-    IdAllocator::write_sidecar(sidecar, day_one.planet_sidecar);
+    for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
+        const std::string sidecar = arc_sidecar_path(prev.path() + "/planet", set);
+        std::filesystem::create_directories(std::filesystem::path(sidecar).parent_path());
+        IdAllocator::write_sidecar(sidecar, set == ArcSet::Full ? day_one.planet_sidecar : day_one.minimal.planet_sidecar);
+    }
 
     // A junction moves: its arcs get new slots, not the ones they leave.
     const AdminExactRings edited = store_of(moved(cells, pt(2000, 2000), pt(2020, 1990)));
-    const AdminArcs day_two = build_admin_arcs(edited, prev.path() + "/planet", 4);
-    std::map<uint64_t, uint32_t> slot_of;
-    for (const Arc& a : day_one.arcs) slot_of[a.key] = a.planet_slot;
-    size_t kept = 0;
-    for (const Arc& a : day_two.arcs) {
-        auto it = slot_of.find(a.key);
-        if (it != slot_of.end()) {
-            CHECK_EQ(a.planet_slot, it->second);
-            kept++;
-        } else {
-            CHECK(a.planet_slot >= day_one.arcs.size());
+    const AdminArcs day_two = build_admin_arcs(edited, in_minimal, prev.path() + "/planet", 4);
+    auto slots_follow_keys = [&](auto key_slot_one, auto key_slot_two, size_t one, size_t two) {
+        std::map<uint64_t, uint32_t> slot_of;
+        for (size_t a = 0; a < one; a++) slot_of[key_slot_one(a).first] = key_slot_one(a).second;
+        size_t kept = 0;
+        for (size_t a = 0; a < two; a++) {
+            const auto [key, slot] = key_slot_two(a);
+            auto it = slot_of.find(key);
+            if (it != slot_of.end()) {
+                CHECK_EQ(slot, it->second);
+                kept++;
+            } else {
+                CHECK(slot >= one);
+            }
         }
-    }
+        return kept;
+    };
+    const size_t kept = slots_follow_keys(
+        [&](size_t a) { return std::make_pair(day_one.arcs[a].key, day_one.arcs[a].planet_slot); },
+        [&](size_t a) { return std::make_pair(day_two.arcs[a].key, day_two.arcs[a].planet_slot); },
+        day_one.arcs.size(), day_two.arcs.size());
     CHECK_EQ(kept, day_one.arcs.size() - 4);
     CHECK_EQ(day_two.slot_counts.kept, kept);
     CHECK_EQ(day_two.slot_counts.appended, size_t(4));
     CHECK_EQ(day_two.slot_counts.tombstones, size_t(4));
     CHECK_EQ(day_two.planet_sidecar.size(), day_one.arcs.size() + 4);
+    const MinimalArcs &m1 = day_one.minimal, &m2 = day_two.minimal;
+    CHECK_EQ(m1.arcs.size(), day_one.arcs.size());
+    const size_t minimal_kept = slots_follow_keys(
+        [&](size_t a) { return std::make_pair(m1.arcs[a].key, m1.arcs[a].planet_slot); },
+        [&](size_t a) { return std::make_pair(m2.arcs[a].key, m2.arcs[a].planet_slot); }, m1.arcs.size(),
+        m2.arcs.size());
+    CHECK_EQ(minimal_kept, m1.arcs.size() - 4);
+    CHECK_EQ(m2.slot_counts.kept, minimal_kept);
+    CHECK_EQ(m2.slot_counts.appended, size_t(4));
+}
+
+// --- The minimal set ---
+
+namespace {
+
+std::vector<PackedLocation> minimal_vertices(const AdminExactRings& store, const AdminArcs& arcs, uint32_t a) {
+    const MinimalArcVertices v(store, arcs, a);
+    std::vector<PackedLocation> out;
+    for (uint32_t i = 0; i < v.size(); i++) out.push_back(v[i]);
+    return out;
+}
+
+AdminArcs full_and_minimal(const AdminExactRings& store, const std::vector<bool>& in_minimal, unsigned threads = 1) {
+    AdminArcs arcs = build_arc_topology(store, threads);
+    arcs.minimal = build_minimal_arcs(arcs, store, in_minimal, threads);
+    return arcs;
+}
+
+// An island of `n` vertices round (lat, lng), radius about `r`, jittered.
+Ring island(int32_t lat, int32_t lng, int32_t r, int n, uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    std::uniform_int_distribution<int32_t> jitter(-r / 10, r / 10);
+    Ring ring;
+    for (int k = 0; k < n; k++) {
+        const double a = 2 * 3.14159265358979 * k / n;
+        ring.push_back(pt(lat + int32_t(std::lround(r * std::sin(a))) + jitter(rng),
+                          lng + int32_t(std::lround(r * std::cos(a))) + jitter(rng)));
+    }
+    return closed(ring);
+}
+
+// The halves of a closed ring either side of the chord from its vertex 0 to
+// its vertex k, through `middle`.
+std::pair<Ring, Ring> halves(const Ring& ring, size_t k, PackedLocation middle) {
+    Ring a(ring.begin(), ring.begin() + k + 1), b(ring.begin() + k, ring.end());
+    a.push_back(middle);
+    b.push_back(middle);
+    return {closed(a), closed(b)};
+}
+
+}  // namespace
+
+TEST(a_minimal_border_is_one_arc_across_a_junction_only_other_polygons_make) {
+    // Two minimal squares and a triangle of another level (not minimal)
+    // inside the left one, touching their border at (5, 0).
+    const Ring left = closed({pt(0, -10), pt(0, 0), pt(5, 0), pt(10, 0), pt(10, -10)});
+    const Ring right = closed({pt(0, 0), pt(0, 10), pt(10, 10), pt(10, 0), pt(5, 0)});
+    const Ring triangle = closed({pt(5, 0), pt(4, -3), pt(6, -3)});
+    const AdminExactRings store = store_of({{left, {}}, {right, {}}, {triangle, {}}});
+    const AdminArcs arcs = full_and_minimal(store, {true, true, false});
+    CHECK_EQ(arcs.counts.junctions, size_t(3));
+    CHECK_EQ(arcs.counts.arcs, size_t(5));
+    const MinimalArcs& m = arcs.minimal;
+    CHECK_EQ(m.counts.joined_junctions, size_t(1));
+    CHECK_EQ(m.counts.arcs, size_t(3));
+    CHECK_EQ(m.counts.rings, size_t(2));
+    CHECK_EQ(m.counts.polygons, size_t(2));
+    bool found = false;
+    for (uint32_t a = 0; a < m.arcs.size(); a++) {
+        if (minimal_vertices(store, arcs, a) != Ring({pt(0, 0), pt(5, 0), pt(10, 0)})) continue;
+        found = true;
+        CHECK_EQ(m.arcs[a].part_count, 2u);
+        CHECK(!m.arcs[a].closed);
+    }
+    CHECK(found);
+    CHECK(every_ring_rebuilds(arcs, store, ArcSet::Minimal));
+    // The triangle's ring has no minimal refs.
+    CHECK_EQ(m.ring_refs[3], m.ring_refs[2]);
+}
+
+TEST(a_minimal_loop_joined_from_full_arcs_starts_at_its_smallest_vertex) {
+    // A minimal island cut in two by polygons of another level, whose chord
+    // meets it at its vertices 0 and 5: two full arcs, one minimal loop.
+    const Ring ring = island(5000, 5000, 400, 10, 9);
+    const auto [a, b] = halves(ring, 5, pt(5000, 5000));
+    const AdminExactRings store = store_of({{ring, {}}, {a, {}}, {b, {}}});
+    const AdminArcs arcs = full_and_minimal(store, {true, false, false});
+    CHECK_EQ(arcs.counts.junctions, size_t(2));
+    const MinimalArcs& m = arcs.minimal;
+    REQUIRE(m.arcs.size() == 1u);
+    CHECK(m.arcs[0].closed);
+    CHECK_EQ(m.arcs[0].part_count, 2u);
+    CHECK_EQ(m.counts.joined_junctions, size_t(2));
+    // As the island alone has it.
+    const AdminExactRings alone = store_of({{ring, {}}});
+    const AdminArcs alone_arcs = build_arc_topology(alone, 1);
+    REQUIRE(alone_arcs.arcs.size() == 1u);
+    CHECK(minimal_vertices(store, arcs, 0) == vertices_of(alone, alone_arcs.arcs[0]));
+    CHECK_EQ(m.arcs[0].key, alone_arcs.arcs[0].key);
+    uint64_t smallest = UINT64_MAX;
+    for (const PackedLocation& p : ring) smallest = std::min(smallest, vertex_key(p));
+    CHECK_EQ(vertex_key(minimal_vertices(store, arcs, 0).front()), smallest);
+    // Neither junction is the smallest: the loop starts inside a full arc.
+    CHECK(m.arcs[0].start > 0 || vertex_key(ring[0]) == smallest || vertex_key(ring[5]) == smallest);
+    CHECK(every_ring_rebuilds(arcs, store, ArcSet::Minimal));
+}
+
+TEST(the_minimal_set_is_the_topology_of_the_minimal_polygons_alone) {
+    for (uint64_t seed : {3u, 4u, 5u}) {
+        // Minimal 2 x 2 blocks over every cell of another level, one block
+        // and its cell with a minimal island as a hole, the island cut in
+        // two by polygons of another level.
+        const Lattice lattice(6, 6, 3, seed, 1000);
+        const Ring isle = island(500, 500, 200, 10, seed);
+        const auto [half_a, half_b] = halves(isle, 5, pt(500, 500));
+        std::vector<Polygon> polygons, minimal_only;
+        std::vector<bool> in_minimal;
+        auto add = [&](Polygon p, bool minimal) {
+            polygons.push_back(p);
+            in_minimal.push_back(minimal);
+            if (minimal) minimal_only.push_back(p);
+        };
+        for (int r = 0; r < 6; r += 2)
+            for (int c = 0; c < 6; c += 2) {
+                Polygon block{lattice.block(r, c, 2, 2), {}};
+                if (r == 0 && c == 0) block.holes.push_back(isle);
+                add(block, true);
+            }
+        for (int r = 0; r < 6; r++)
+            for (int c = 0; c < 6; c++) {
+                Polygon cell{lattice.block(r, c, 1, 1), {}};
+                if (r == 0 && c == 0) cell.holes.push_back(isle);
+                add(cell, false);
+            }
+        add({isle, {}}, true);
+        add({half_a, {}}, false);
+        add({half_b, {}}, false);
+
+        const AdminExactRings store = store_of(polygons), alone = store_of(minimal_only);
+        const AdminArcs arcs = full_and_minimal(store, in_minimal, 3);
+        const AdminArcs expected = build_arc_topology(alone, 1);
+        const MinimalArcs& m = arcs.minimal;
+        CHECK(m.counts.joined_junctions > 0);
+        REQUIRE(m.arcs.size() == expected.arcs.size());
+        for (uint32_t a = 0; a < m.arcs.size(); a++) {
+            CHECK(minimal_vertices(store, arcs, a) == vertices_of(alone, expected.arcs[a]));
+            CHECK_EQ(m.arcs[a].key, expected.arcs[a].key);
+            CHECK_EQ(m.arcs[a].closed, expected.arcs[a].view.closed);
+            CHECK(m.arcs[a].box == expected.arcs[a].box);
+        }
+        // The minimal rings' refs are the lone topology's, ring for ring.
+        uint32_t alone_ring = 0;
+        for (size_t p = 0; p < polygons.size(); p++) {
+            if (!in_minimal[p]) continue;
+            for (uint32_t k = 0; k < store.polygons[p].ring_count; k++, alone_ring++) {
+                const uint32_t r = store.polygons[p].first_ring + k;
+                const std::vector<ArcRef> got(m.refs.begin() + m.ring_refs[r], m.refs.begin() + m.ring_refs[r + 1]);
+                const std::vector<ArcRef> want(expected.refs.begin() + expected.ring_refs[alone_ring],
+                                               expected.refs.begin() + expected.ring_refs[alone_ring + 1]);
+                CHECK(got == want);
+            }
+        }
+        CHECK(every_ring_rebuilds(arcs, store, ArcSet::Minimal));
+        // The same on one thread.
+        const AdminArcs one = full_and_minimal(store, in_minimal, 1);
+        CHECK(one.minimal.refs == m.refs && one.minimal.parts == m.parts && one.minimal.part_at == m.part_at);
+    }
 }
 
 // --- The stage's dirs ---
@@ -530,6 +737,10 @@ TEST(the_arc_dirs_are_refused_before_the_build_starts) {
     CHECK_EQ(arc_sidecar_path(prev + "/planet", ArcSet::Minimal), prev + "/planet/admin-minimal/arc_index.osm_ids");
     std::filesystem::create_directories(prev + "/planet/quality/exact");
     gc::id_alloc::IdAllocator::write_sidecar(sidecar, {});
+    // The minimal set's too.
+    CHECK(refusal(out, root.path() + "/arcs2", prev).find("admin-minimal/arc_index.osm_ids") != std::string::npos);
+    std::filesystem::create_directories(prev + "/planet/admin-minimal");
+    gc::id_alloc::IdAllocator::write_sidecar(arc_sidecar_path(prev + "/planet", ArcSet::Minimal), {});
     CHECK_EQ(refusal(out, root.path() + "/arcs2", prev), std::string());
 }
 
@@ -552,7 +763,7 @@ ParsedData named_polygons_with_arcs(int n) {
         if (i % 3 == 0) holes.push_back(closed({pt(at + 2, 2), pt(at + 2, 4), pt(at + 4, 3)}));
         d.admin_exact_rings.append(closed({pt(at, 0), pt(at, 10), pt(at + 10, 10), pt(at + 10, 0)}), holes);
     }
-    d.admin_arcs = build_admin_arcs(d.admin_exact_rings, "", 1);
+    d.admin_arcs = build_admin_arcs(d.admin_exact_rings, std::vector<bool>(n, false), "", 1);
     return d;
 }
 
@@ -563,7 +774,7 @@ bool arc_rings_follow_the_polygons(const ParsedData& d) {
     for (size_t k = 0; k < d.admin_polygons.size(); k++) {
         const AdminArcPolygon& p = d.admin_arcs.polygons[k];
         if (p.ring_count == 0) return false;
-        const std::vector<PackedLocation> outer = rebuild_ring(d.admin_arcs, d.admin_exact_rings, p.first_ring);
+        const std::vector<PackedLocation> outer = rebuild_ring(d.admin_arcs, d.admin_exact_rings, ArcSet::Full, p.first_ring);
         int32_t lowest = INT32_MAX;
         for (const PackedLocation& v : outer) lowest = std::min(lowest, v.lat_e7);
         if (lowest != 100 * static_cast<int32_t>(d.admin_polygons[k].name_id)) return false;

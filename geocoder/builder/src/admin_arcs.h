@@ -7,10 +7,15 @@
 // pieces are one arc, read in its canonical order. A ring is the chain of its
 // refs to arcs. Arcs are presented in Hilbert order of their first vertex and
 // take their slots from IdAllocator (ObjectType::ARC), keyed on their ends and
-// their smallest interior vertex. build-index runs the arc stage
-// (build_admin_arcs) only with --arcs-out.
+// their smallest interior vertex.
+//
+// That is the full set, every admin polygon's rings. The minimal set holds
+// admin-minimal's rings alone: its arcs are chains of full arcs, joined where
+// a full junction is one only for other polygons' rings. build-index runs the
+// arc stage (build_admin_arcs) only with --arcs-out.
 #pragma once
 
+#include <algorithm>
 #include <climits>
 #include <cstdint>
 #include <functional>
@@ -171,7 +176,50 @@ struct AdminArcSlotCounts {
     size_t tombstones = 0;
 };
 
-// The arcs of every admin polygon's rings, one set (the full set).
+// One arc of the minimal set: full arcs chained end to end, each walked as
+// its part says, so its vertices are theirs with each join once. A closed
+// one (a loop of parts) starts at place `start` of its first part.
+struct MinimalArc {
+    uint32_t first_part = 0;  // MinimalArcs::parts[first_part, first_part + part_count)
+    uint32_t part_count = 0;
+    uint32_t count = 0;  // vertices, a closed arc's first twice
+    uint32_t start = 0;
+    bool closed = false;
+    ArcBox box;
+    uint64_t key = 0;          // arc_key
+    uint32_t planet_slot = 0;  // in the planet's minimal set
+};
+
+struct MinimalArcCounts {
+    size_t rings = 0;     // of the minimal polygons
+    size_t polygons = 0;  // admin_minimal_keeps' with rings
+    size_t core_arcs = 0;           // full arcs a minimal ring uses
+    size_t joined_junctions = 0;    // full junctions inside a minimal arc
+    size_t arcs = 0;
+    size_t closed_arcs = 0;
+    size_t refs = 0;
+    size_t arc_vertices = 0;  // over every arc, a closed arc's first twice
+    size_t duplicate_keys = 0;
+};
+
+// The minimal set: the arcs of the rings of admin_minimal_keeps' polygons.
+struct MinimalArcs {
+    std::vector<MinimalArc> arcs;  // in presentation order
+    // Each arc's parts in its order, and where each part starts among its
+    // arc's places (a part's last vertex is the next one's first).
+    std::vector<ArcRef> parts;
+    std::vector<uint32_t> part_at;
+    // As AdminArcs' refs, over the same ring numbers: a ring of no minimal
+    // polygon has none.
+    std::vector<uint32_t> ring_refs;
+    std::vector<ArcRef> refs;
+    std::vector<gc::id_alloc::SidecarSlot> planet_sidecar;
+    MinimalArcCounts counts;
+    AdminArcSlotCounts slot_counts;
+};
+
+// The arcs of every admin polygon's rings (the full set), and the minimal
+// set over them.
 struct AdminArcs {
     // In presentation order; their views read the exact ring store, so only
     // while it lives.
@@ -186,6 +234,44 @@ struct AdminArcs {
     std::vector<gc::id_alloc::SidecarSlot> planet_sidecar;
     AdminArcCounts counts;
     AdminArcSlotCounts slot_counts;
+    MinimalArcs minimal;
+};
+
+// A minimal arc's vertices in its order, read through its parts' views.
+class MinimalArcVertices {
+public:
+    template <class Store>
+    MinimalArcVertices(const Store& store, const AdminArcs& arcs, const MinimalArcs& minimal, uint32_t arc)
+        : rings_(store.rings.data()),
+          vertices_(store.vertices.data()),
+          full_(arcs.arcs.data()),
+          parts_(minimal.parts.data()),
+          part_at_(minimal.part_at.data()),
+          arc_(minimal.arcs[arc]) {}
+    template <class Store>
+    MinimalArcVertices(const Store& store, const AdminArcs& arcs, uint32_t arc)
+        : MinimalArcVertices(store, arcs, arcs.minimal, arc) {}
+
+    uint32_t size() const { return arc_.count; }
+    PackedLocation operator[](uint32_t i) const {
+        const uint32_t places = arc_.count - 1;
+        const uint32_t place = arc_.closed ? (arc_.start + i) % places : i;
+        const uint32_t* first = part_at_ + arc_.first_part;
+        const uint32_t j = static_cast<uint32_t>(std::upper_bound(first, first + arc_.part_count, place) - first) - 1;
+        const ArcRef part = parts_[arc_.first_part + j];
+        const ArcView& view = full_[part.arc].view;
+        const ArcVertices av(vertices_ + rings_[view.ring].begin, rings_[view.ring].count, view);
+        const uint32_t k = place - first[j];
+        return av[part.reversed ? av.size() - 1 - k : k];
+    }
+
+private:
+    const RingSpan* rings_;
+    const PackedLocation* vertices_;
+    const Arc* full_;
+    const ArcRef* parts_;
+    const uint32_t* part_at_;
+    MinimalArc arc_;
 };
 
 // The topology of the store's rings: their arcs, in presentation order (the
@@ -209,21 +295,32 @@ struct ArcSlots {
 // reused only the day after.
 ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar);
 
-// The arc sets a region keeps sidecars for.
-enum class ArcSet { Full, Minimal };
-
 // Where a region's arc sidecar sits under its dir, as PR 3 ships them: the
 // full set's with the exact tier, the minimal set's with admin-minimal.
 std::string arc_sidecar_path(const std::string& region_dir, ArcSet set);
 
+// The minimal set over the full set `arcs` of the store: the rings of the
+// polygons `in_minimal` marks (parallel to the store's polygons), cut only
+// where they meet one another. A full junction that two of the arcs those
+// rings use end at, and no third, joins those two, and so on along the
+// chain; a chain that closes on itself is one closed arc. The arcs come in
+// the full set's canonical form and presentation order, so they are those
+// build_arc_topology finds for the minimal polygons alone.
+MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& store,
+                               const std::vector<bool>& in_minimal, unsigned threads);
+
 // The arc stage over the planet's polygons: the topology, then the full set's
 // planet slots against the sidecar under `prev_planet_dir` (a cold start when
-// empty), and every polygon's rings. Logs its steps and counts.
-AdminArcs build_admin_arcs(const AdminExactRings& store, const std::string& prev_planet_dir, unsigned threads);
+// empty), every polygon's rings, and the minimal set of the polygons
+// `in_minimal` marks and its planet slots. Logs its steps and counts.
+AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>& in_minimal,
+                           const std::string& prev_planet_dir, unsigned threads);
 
-// Ring `ring` of the store as its refs chain their arcs: each arc walked as
-// its ref says, a junction two arcs share once, ending where it starts.
-std::vector<PackedLocation> rebuild_ring(const AdminArcs& arcs, const AdminExactRings& store, uint32_t ring);
+// Ring `ring` of the store as set `set`'s refs chain its arcs: each arc
+// walked as its ref says, a junction two arcs share once, ending where it
+// starts. A ring of no minimal polygon has no minimal refs and no vertices.
+std::vector<PackedLocation> rebuild_ring(const AdminArcs& arcs, const AdminExactRings& store, ArcSet set,
+                                         uint32_t ring);
 
 // Whether two closed rings (each ending on its first vertex) are one cycle,
 // from any vertex and in either direction.
@@ -231,6 +328,6 @@ bool same_closed_ring(const PackedLocation* a, uint32_t a_count, const PackedLoc
 
 // build-index's arc dirs, refused before any work: --arcs-out new or empty and
 // apart from the output dir (which publishes whatever it holds), --prev-arcs
-// only with it, and holding the planet's full-set sidecar.
+// only with it, and holding the planet's sidecar of each set.
 void require_arc_dirs(const std::string& output_dir, const std::string& arcs_out_dir,
                       const std::string& prev_arcs_dir);

@@ -219,7 +219,9 @@ struct Piece {
     bool closed;
 };
 
-Piece closed_piece(const Cycle& c, uint32_t ring, uint32_t ref) {
+// A closed arc's canonical walk round the cycle: the smallest of the walks
+// from a smallest vertex, either way.
+Walk smallest_closed_walk(const Cycle& c) {
     uint64_t smallest = UINT64_MAX;
     for (uint32_t place = 0; place < c.size; place++) smallest = std::min(smallest, vertex_key(c.v[place]));
     const uint32_t count = c.size + 1;
@@ -234,20 +236,91 @@ Piece closed_piece(const Cycle& c, uint32_t ring, uint32_t ref) {
             found = true;
         }
     }
+    return best;
+}
+
+// The walk an open arc reads in from place `from` to place `to` of the cycle
+// (past its end when it wraps): from its smaller end, and from the end whose
+// walk is smaller when they are one vertex.
+Walk smaller_open_walk(const Cycle& c, uint32_t from, uint64_t to) {
+    const uint32_t count = static_cast<uint32_t>(to - from + 1);
+    const Walk forwards{from, false}, backwards{static_cast<uint32_t>(to % c.size), true};
+    return compare_walks(c, backwards, c, forwards, count) < 0 ? backwards : forwards;
+}
+
+Piece closed_piece(const Cycle& c, uint32_t ring, uint32_t ref) {
+    const Walk best = smallest_closed_walk(c);
+    const uint32_t count = c.size + 1;
     return {hash_walk(c, best, count, true), ring, best.start, count, ref, best.reversed, true};
 }
 
 Piece open_piece(const Cycle& c, uint32_t ring, uint32_t ref, uint32_t from, uint64_t to) {
     const uint32_t count = static_cast<uint32_t>(to - from + 1);
-    const Walk forwards{from, false}, backwards{static_cast<uint32_t>(to % c.size), true};
-    const bool reversed = compare_walks(c, backwards, c, forwards, count) < 0;
-    const Walk w = reversed ? backwards : forwards;
-    return {hash_walk(c, w, count, false), ring, w.start, count, ref, reversed, false};
+    const Walk w = smaller_open_walk(c, from, to);
+    return {hash_walk(c, w, count, false), ring, w.start, count, ref, w.reversed, false};
 }
 
 Cycle cycle_of(const AdminExactRings& store, uint32_t ring) {
     const RingSpan& span = store.rings[ring];
     return {store.vertices.data() + span.begin, span.count - 1};
+}
+
+// An arc's box and key from its vertices in its order (ArcVertices,
+// MinimalArcVertices).
+template <class Vertices>
+ArcBox box_of(const Vertices& v) {
+    ArcBox box;
+    for (uint32_t i = 0; i < v.size(); i++) {
+        const PackedLocation q = v[i];
+        box.min_lng = std::min(box.min_lng, q.lon_e7);
+        box.max_lng = std::max(box.max_lng, q.lon_e7);
+        box.max_lat = std::max(box.max_lat, q.lat_e7);
+    }
+    return box;
+}
+
+template <class Vertices>
+uint64_t key_of(const Vertices& v, bool closed) {
+    uint64_t min_interior = UINT64_MAX;
+    for (uint32_t i = 1; i + 1 < v.size(); i++) min_interior = std::min(min_interior, vertex_key(v[i]));
+    return arc_key(vertex_key(v[0]), vertex_key(v[v.size() - 1]), min_interior, closed);
+}
+
+// The presentation order's last word between two arcs of one Hilbert index
+// and key: their vertices, then their length, then closed after open.
+template <class Vertices>
+bool vertices_less(const Vertices& a, bool a_closed, const Vertices& b, bool b_closed) {
+    const uint32_t n = std::min(a.size(), b.size());
+    for (uint32_t i = 0; i < n; i++) {
+        const uint64_t ka = vertex_key(a[i]), kb = vertex_key(b[i]);
+        if (ka != kb) return ka < kb;
+    }
+    return a.size() != b.size() ? a.size() < b.size() : a_closed < b_closed;
+}
+
+// Where each arc goes in presentation order: by the Hilbert index of its
+// first vertex, then its key, then `less` (vertices_less).
+struct Presented {
+    uint64_t hilbert;
+    uint64_t key;
+    uint32_t arc;
+};
+
+template <class Less>
+void sort_presented(std::vector<Presented>& order, Less less, unsigned threads) {
+    parallel_sort(order.begin(), order.end(), [&](const Presented& a, const Presented& b) {
+        if (a.hilbert != b.hilbert) return a.hilbert < b.hilbert;
+        if (a.key != b.key) return a.key < b.key;
+        return less(a.arc, b.arc);
+    }, threads);
+}
+
+template <class Key>
+size_t duplicates_among(size_t n, Key key, unsigned threads) {
+    std::vector<uint64_t> keys(n);
+    for (size_t a = 0; a < n; a++) keys[a] = key(a);
+    parallel_sort(keys.begin(), keys.end(), std::less<uint64_t>(), threads);
+    return n - static_cast<size_t>(std::unique(keys.begin(), keys.end()) - keys.begin());
 }
 
 }  // namespace
@@ -348,11 +421,6 @@ AdminArcs build_arc_topology(const AdminExactRings& store, unsigned threads,
 
     // The arcs, then the presentation order: Hilbert index of the first
     // vertex, key, then the vertices themselves (two arcs are never equal).
-    struct Presented {
-        uint64_t hilbert;
-        uint64_t key;
-        uint32_t arc;
-    };
     std::vector<Arc> found;
     std::vector<Presented> order;
     parallel_resize(found, arc_count);
@@ -365,31 +433,14 @@ AdminArcs build_arc_topology(const AdminExactRings& store, unsigned threads,
             Arc& arc = found[arc_at[k]];
             arc.view = {p.ring, p.start, p.count, p.reversed, p.closed};
             const ArcVertices av = arc_vertices(store, arc.view);
-            uint64_t min_interior = UINT64_MAX;
-            for (uint32_t i = 0; i < av.size(); i++) {
-                const PackedLocation q = av[i];
-                arc.box.min_lng = std::min(arc.box.min_lng, q.lon_e7);
-                arc.box.max_lng = std::max(arc.box.max_lng, q.lon_e7);
-                arc.box.max_lat = std::max(arc.box.max_lat, q.lat_e7);
-                if (i > 0 && i + 1 < av.size()) min_interior = std::min(min_interior, vertex_key(q));
-            }
-            arc.key = arc_key(vertex_key(av[0]), vertex_key(av[av.size() - 1]), min_interior, p.closed);
+            arc.box = box_of(av);
+            arc.key = key_of(av, p.closed);
             order[arc_at[k]] = {hilbert_index(av[0]), arc.key, arc_at[k]};
         }
     }, threads);
-    auto vertices_less = [&](const ArcView& a, const ArcView& b) {
-        const ArcVertices va = arc_vertices(store, a), vb = arc_vertices(store, b);
-        const uint32_t n = std::min(va.size(), vb.size());
-        for (uint32_t i = 0; i < n; i++) {
-            const uint64_t ka = vertex_key(va[i]), kb = vertex_key(vb[i]);
-            if (ka != kb) return ka < kb;
-        }
-        return va.size() != vb.size() ? va.size() < vb.size() : a.closed < b.closed;
-    };
-    parallel_sort(order.begin(), order.end(), [&](const Presented& a, const Presented& b) {
-        if (a.hilbert != b.hilbert) return a.hilbert < b.hilbert;
-        if (a.key != b.key) return a.key < b.key;
-        return vertices_less(found[a.arc].view, found[b.arc].view);
+    sort_presented(order, [&](uint32_t a, uint32_t b) {
+        const ArcView &va = found[a].view, &vb = found[b].view;
+        return vertices_less(arc_vertices(store, va), va.closed, arc_vertices(store, vb), vb.closed);
     }, threads);
     std::vector<uint32_t> rank_of;
     parallel_resize(rank_of, arc_count);
@@ -417,13 +468,301 @@ AdminArcs build_arc_topology(const AdminExactRings& store, unsigned threads,
     out.counts.refs = ref_count;
     out.counts.closed_arcs = parallel_count(arc_count, [&](size_t a) { return out.arcs[a].view.closed; }, threads);
     out.counts.arc_vertices = parallel_sum<size_t>(arc_count, [&](size_t a) { return out.arcs[a].view.count; }, threads);
-    {
-        std::vector<uint64_t> keys(arc_count);
-        for (size_t a = 0; a < arc_count; a++) keys[a] = out.arcs[a].key;
-        parallel_sort(keys.begin(), keys.end(), std::less<uint64_t>(), threads);
-        out.counts.duplicate_keys = arc_count - static_cast<size_t>(std::unique(keys.begin(), keys.end()) - keys.begin());
-    }
+    out.counts.duplicate_keys = duplicates_among(arc_count, [&](size_t a) { return out.arcs[a].key; }, threads);
     done("      Admin arcs: refs");
+    return out;
+}
+
+namespace {
+
+// A chain of full arcs, each part walked from one end to the other, the next
+// part starting where it ends.
+struct Chain {
+    uint32_t first_part;
+    uint32_t part_count;
+    bool closed;
+};
+
+// A full arc's ends are numbered 2 * arc (its first vertex) and 2 * arc + 1
+// (its last); an end joined to none is joined to kNoEnd.
+constexpr uint32_t kNoEnd = UINT32_MAX;
+
+// The vertices of a chain's parts (`parts`) end to end, each join once: a
+// closed chain's cycle without its closing vertex.
+void chain_vertices(const AdminArcs& arcs, const AdminExactRings& store, const ArcRef* parts, uint32_t part_count,
+                    bool closed, std::vector<PackedLocation>& out) {
+    out.clear();
+    for (uint32_t j = 0; j < part_count; j++) {
+        const ArcVertices av = arc_vertices(store, arcs.arcs[parts[j].arc].view);
+        const uint32_t n = av.size();
+        for (uint32_t i = j == 0 ? 0 : 1; i < n; i++) out.push_back(av[parts[j].reversed ? n - 1 - i : i]);
+    }
+    if (closed) out.pop_back();
+}
+
+// The parts walked the other way: in the opposite order, each reversed.
+void reverse_parts(ArcRef* parts, uint32_t part_count) {
+    std::reverse(parts, parts + part_count);
+    for (uint32_t j = 0; j < part_count; j++) parts[j].reversed = !parts[j].reversed;
+}
+
+// Where each part of a chain starts among the chain's places.
+void place_parts(const AdminArcs& arcs, const ArcRef* parts, uint32_t part_count, uint32_t* part_at) {
+    uint32_t at = 0;
+    for (uint32_t j = 0; j < part_count; j++) {
+        part_at[j] = at;
+        at += arcs.arcs[parts[j].arc].view.count - 1;
+    }
+}
+
+}  // namespace
+
+MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& store,
+                               const std::vector<bool>& in_minimal, unsigned threads) {
+    if (threads == 0) threads = parallel_threads();
+    if (in_minimal.size() != store.polygons.size())
+        throw std::logic_error("minimal polygon marks out of step with the polygons");
+    const size_t ring_count = store.rings.size(), full_count = arcs.arcs.size();
+    MinimalArcs out;
+
+    // The minimal polygons' rings, and the full arcs they use (the core).
+    std::vector<uint8_t> minimal_ring(ring_count, 0);
+    for (size_t p = 0; p < in_minimal.size(); p++) {
+        if (!in_minimal[p] || store.polygons[p].ring_count == 0) continue;
+
+        out.counts.polygons++;
+        for (uint32_t r = 0; r < store.polygons[p].ring_count; r++) minimal_ring[store.polygons[p].first_ring + r] = 1;
+    }
+    std::vector<uint8_t> core(full_count, 0);
+    for (size_t r = 0; r < ring_count; r++) {
+        if (!minimal_ring[r]) continue;
+
+        out.counts.rings++;
+        for (uint32_t k = arcs.ring_refs[r]; k < arcs.ring_refs[r + 1]; k++) core[arcs.refs[k].arc] = 1;
+    }
+    out.counts.core_arcs = static_cast<size_t>(std::count(core.begin(), core.end(), 1));
+
+    // A full junction where exactly two core arc ends meet is none for the
+    // minimal rings: those two ends join.
+    struct End {
+        uint64_t vertex;
+        uint32_t end;
+    };
+    std::vector<End> ends;
+    for (uint32_t a = 0; a < full_count; a++) {
+        if (!core[a] || arcs.arcs[a].view.closed) continue;
+
+        const ArcVertices av = arc_vertices(store, arcs.arcs[a].view);
+        ends.push_back({vertex_key(av[0]), 2 * a});
+        ends.push_back({vertex_key(av[av.size() - 1]), 2 * a + 1});
+    }
+    parallel_sort(ends.begin(), ends.end(), [](const End& x, const End& y) {
+        return x.vertex != y.vertex ? x.vertex < y.vertex : x.end < y.end;
+    }, threads);
+    std::vector<uint32_t> joined(2 * full_count, kNoEnd);
+    for (size_t k = 0; k < ends.size();) {
+        size_t run_end = k + 1;
+        while (run_end < ends.size() && ends[run_end].vertex == ends[k].vertex) run_end++;
+        if (run_end - k == 2) {
+            joined[ends[k].end] = ends[k + 1].end;
+            joined[ends[k + 1].end] = ends[k].end;
+            out.counts.joined_junctions++;
+        }
+        k = run_end;
+    }
+    ends = {};
+
+    // The chains, each from the first of its arcs in full order: forwards
+    // from that arc's last vertex, then (unless it came back round) backwards
+    // from its first.
+    std::vector<ArcRef> parts;
+    std::vector<Chain> chains;
+    {
+        std::vector<uint8_t> chained(full_count, 0);
+        std::vector<ArcRef> before;
+        for (uint32_t a = 0; a < full_count; a++) {
+            if (!core[a] || chained[a]) continue;
+
+            const uint32_t first = static_cast<uint32_t>(parts.size());
+            chained[a] = 1;
+            if (arcs.arcs[a].view.closed) {
+                parts.push_back({a, false});
+                chains.push_back({first, 1, true});
+                continue;
+            }
+            parts.push_back({a, false});
+            bool closed = false;
+            for (uint32_t leave = 2 * a + 1; joined[leave] != kNoEnd;) {
+                const uint32_t enter = joined[leave], b = enter / 2;
+                if (b == a) {
+                    closed = true;
+                    break;
+                }
+                parts.push_back({b, (enter & 1) != 0});
+                chained[b] = 1;
+                leave = enter ^ 1;
+            }
+            if (!closed) {
+                before.clear();
+                for (uint32_t leave = 2 * a; joined[leave] != kNoEnd;) {
+                    const uint32_t enter = joined[leave], b = enter / 2;
+                    before.push_back({b, (enter & 1) == 0});
+                    chained[b] = 1;
+                    leave = enter ^ 1;
+                }
+                parts.insert(parts.begin() + first, before.rbegin(), before.rend());
+            }
+            chains.push_back({first, static_cast<uint32_t>(parts.size()) - first, closed});
+        }
+    }
+    joined = {};
+
+    // Each chain in its canonical walk, as build_arc_topology walks a piece:
+    // an open one from its smaller end, a closed one round from a smallest
+    // vertex, rotated so that it starts in its first part.
+    const size_t arc_count = chains.size();
+    std::vector<uint32_t> part_at(parts.size());
+    std::vector<MinimalArc> found(arc_count);
+    std::vector<Presented> order(arc_count);
+    parallel_for_dynamic(arc_count, 256, [&](size_t begin, size_t end, unsigned) {
+        std::vector<PackedLocation> v;
+        std::vector<ArcRef> rotated;
+        for (size_t c = begin; c < end; c++) {
+            const Chain& chain = chains[c];
+            ArcRef* p = parts.data() + chain.first_part;
+            uint32_t* at = part_at.data() + chain.first_part;
+            chain_vertices(arcs, store, p, chain.part_count, chain.closed, v);
+            const Cycle cycle{v.data(), static_cast<uint32_t>(v.size())};
+            MinimalArc& arc = found[c];
+            arc.first_part = chain.first_part;
+            arc.part_count = chain.part_count;
+            arc.closed = chain.closed;
+            if (!chain.closed) {
+                arc.count = cycle.size;
+                if (smaller_open_walk(cycle, 0, cycle.size - 1).reversed) reverse_parts(p, chain.part_count);
+            } else {
+                arc.count = cycle.size + 1;
+                const Walk w = smallest_closed_walk(cycle);
+                uint32_t start = w.start;
+                if (w.reversed) {
+                    reverse_parts(p, chain.part_count);
+                    start = (cycle.size - start) % cycle.size;
+                }
+                place_parts(arcs, p, chain.part_count, at);
+                const uint32_t j =
+                    static_cast<uint32_t>(std::upper_bound(at, at + chain.part_count, start) - at) - 1;
+                rotated.assign(p + j, p + chain.part_count);
+                rotated.insert(rotated.end(), p, p + j);
+                std::copy(rotated.begin(), rotated.end(), p);
+                arc.start = start - at[j];
+            }
+            place_parts(arcs, p, chain.part_count, at);
+            arc.box = arcs.arcs[p[0].arc].box;
+            for (uint32_t j = 1; j < chain.part_count; j++) {
+                const ArcBox& b = arcs.arcs[p[j].arc].box;
+                arc.box.min_lng = std::min(arc.box.min_lng, b.min_lng);
+                arc.box.max_lng = std::max(arc.box.max_lng, b.max_lng);
+                arc.box.max_lat = std::max(arc.box.max_lat, b.max_lat);
+            }
+        }
+    }, threads);
+    chains = {};
+
+    // The arcs' keys, then the arcs in presentation order, their parts with
+    // them.
+    out.arcs = std::move(found);
+    out.parts = std::move(parts);
+    out.part_at = std::move(part_at);
+    parallel_for_dynamic(arc_count, 256, [&](size_t begin, size_t end, unsigned) {
+        for (size_t a = begin; a < end; a++) {
+            const MinimalArcVertices v(store, arcs, out, static_cast<uint32_t>(a));
+            out.arcs[a].key = key_of(v, out.arcs[a].closed);
+            order[a] = {hilbert_index(v[0]), out.arcs[a].key, static_cast<uint32_t>(a)};
+        }
+    }, threads);
+    sort_presented(order, [&](uint32_t a, uint32_t b) {
+        return vertices_less(MinimalArcVertices(store, arcs, out, a), out.arcs[a].closed,
+                             MinimalArcVertices(store, arcs, out, b), out.arcs[b].closed);
+    }, threads);
+    {
+        std::vector<MinimalArc> presented(arc_count);
+        std::vector<ArcRef> presented_parts;
+        std::vector<uint32_t> presented_at;
+        presented_parts.reserve(out.parts.size());
+        presented_at.reserve(out.parts.size());
+        for (size_t rank = 0; rank < arc_count; rank++) {
+            MinimalArc arc = out.arcs[order[rank].arc];
+            const uint32_t first = static_cast<uint32_t>(presented_parts.size());
+            presented_parts.insert(presented_parts.end(), out.parts.begin() + arc.first_part,
+                                   out.parts.begin() + arc.first_part + arc.part_count);
+            presented_at.insert(presented_at.end(), out.part_at.begin() + arc.first_part,
+                                out.part_at.begin() + arc.first_part + arc.part_count);
+            arc.first_part = first;
+            presented[rank] = arc;
+        }
+        out.arcs = std::move(presented);
+        out.parts = std::move(presented_parts);
+        out.part_at = std::move(presented_at);
+    }
+    order = {};
+
+    // Each minimal ring's refs: its full refs a chain at a time, from the
+    // first that starts one (its first part walked forwards, or its last
+    // backwards).
+    struct InChain {
+        uint32_t arc = UINT32_MAX;
+        uint32_t part = 0;
+    };
+    std::vector<InChain> chain_of(full_count);
+    for (uint32_t m = 0; m < arc_count; m++)
+        for (uint32_t j = 0; j < out.arcs[m].part_count; j++) chain_of[out.parts[out.arcs[m].first_part + j].arc] = {m, j};
+    auto forwards = [&](const ArcRef& ref) {
+        const InChain in = chain_of[ref.arc];
+        return ref.reversed == out.parts[out.arcs[in.arc].first_part + in.part].reversed;
+    };
+    auto starts_chain = [&](const ArcRef& ref) {
+        const InChain in = chain_of[ref.arc];
+        return forwards(ref) ? in.part == 0 : in.part + 1 == out.arcs[in.arc].part_count;
+    };
+    const std::vector<uint32_t> ref_at = parallel_offsets<uint32_t>(ring_count, [&](size_t r) {
+        if (!minimal_ring[r]) return 0u;
+        uint32_t n = 0;
+        for (uint32_t k = arcs.ring_refs[r]; k < arcs.ring_refs[r + 1]; k++) n += starts_chain(arcs.refs[k]);
+        return n;
+    }, threads);
+    out.ring_refs.assign(ref_at.begin(), ref_at.end());
+    parallel_resize(out.refs, ref_at.back());
+    parallel_for_dynamic(ring_count, 1024, [&](size_t begin, size_t end, unsigned) {
+        for (size_t r = begin; r < end; r++) {
+            if (!minimal_ring[r]) continue;
+
+            const uint32_t first = arcs.ring_refs[r], n = arcs.ring_refs[r + 1] - first;
+            uint32_t from = 0;
+            while (from < n && !starts_chain(arcs.refs[first + from])) from++;
+            uint32_t next = ref_at[r];
+            for (uint32_t t = 0; t < n;) {
+                const ArcRef ref = arcs.refs[first + (from + t) % n];
+                const InChain in = chain_of[ref.arc];
+                const bool along = forwards(ref);
+                const MinimalArc& m = out.arcs[in.arc];
+                for (uint32_t j = 0; j < m.part_count; j++) {
+                    const ArcRef part = arcs.refs[first + (from + t + j) % n];
+                    const InChain at = chain_of[part.arc];
+                    if (t + j >= n || at.arc != in.arc || at.part != (along ? j : m.part_count - 1 - j) ||
+                        forwards(part) != along)
+                        throw std::logic_error("a minimal ring leaves its arc's chain of full arcs");
+                }
+                out.refs[next++] = {in.arc, !along};
+                t += m.part_count;
+            }
+        }
+    }, threads);
+
+    out.counts.arcs = arc_count;
+    out.counts.closed_arcs = parallel_count(arc_count, [&](size_t a) { return out.arcs[a].closed; }, threads);
+    out.counts.refs = out.refs.size();
+    out.counts.arc_vertices = parallel_sum<size_t>(arc_count, [&](size_t a) { return out.arcs[a].count; }, threads);
+    out.counts.duplicate_keys = duplicates_among(arc_count, [&](size_t a) { return out.arcs[a].key; }, threads);
     return out;
 }
 
@@ -458,17 +797,36 @@ std::string arc_sidecar_path(const std::string& region_dir, ArcSet set) {
     return region_dir + (set == ArcSet::Full ? "/quality/exact" : "/admin-minimal") + "/arc_index.osm_ids";
 }
 
-AdminArcs build_admin_arcs(const AdminExactRings& store, const std::string& prev_planet_dir, unsigned threads) {
+namespace {
+
+// Slots for a set's arcs in presentation order (key(a)) against the
+// previous planet build's sidecar of that set.
+template <class Key>
+ArcSlots planet_slots(size_t n, Key key, const std::string& prev_planet_dir, ArcSet set) {
+    std::vector<uint64_t> keys(n);
+    for (size_t a = 0; a < n; a++) keys[a] = key(a);
+    return allocate_arc_slots(keys, prev_planet_dir.empty() ? "" : arc_sidecar_path(prev_planet_dir, set));
+}
+
+std::string slot_summary(const AdminArcSlotCounts& s, size_t slots) {
+    std::ostringstream line;
+    line << "planet slots: " << s.kept << " kept, " << s.recycled << " recycled, " << s.appended << " appended, "
+         << s.tombstones << " tombstones (" << slots << " slots)";
+    return line.str();
+}
+
+}  // namespace
+
+AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>& in_minimal,
+                           const std::string& prev_planet_dir, unsigned threads) {
     threads = std::min(threads ? threads : parallel_threads(), kArcTopologyMaxThreads);
     auto t = std::chrono::steady_clock::now();
     auto cpu = CpuTicks::now();
     AdminArcs arcs = build_arc_topology(store, threads, [&](const char* step) { log_phase(step, t, cpu); });
 
-    std::vector<uint64_t> keys(arcs.arcs.size());
-    for (size_t a = 0; a < keys.size(); a++) keys[a] = arcs.arcs[a].key;
-    ArcSlots slots =
-        allocate_arc_slots(keys, prev_planet_dir.empty() ? "" : arc_sidecar_path(prev_planet_dir, ArcSet::Full));
-    for (size_t a = 0; a < keys.size(); a++) arcs.arcs[a].planet_slot = slots.slots[a];
+    ArcSlots slots = planet_slots(arcs.arcs.size(), [&](size_t a) { return arcs.arcs[a].key; }, prev_planet_dir,
+                                  ArcSet::Full);
+    for (size_t a = 0; a < arcs.arcs.size(); a++) arcs.arcs[a].planet_slot = slots.slots[a];
     arcs.planet_sidecar = std::move(slots.sidecar);
     arcs.slot_counts = slots.counts;
     arcs.polygons.resize(store.polygons.size());
@@ -476,26 +834,45 @@ AdminArcs build_admin_arcs(const AdminExactRings& store, const std::string& prev
         arcs.polygons[p] = {store.polygons[p].first_ring, store.polygons[p].ring_count};
     log_phase("      Admin arcs: planet slots", t, cpu);
 
+    arcs.minimal = build_minimal_arcs(arcs, store, in_minimal, threads);
+    MinimalArcs& minimal = arcs.minimal;
+    slots = planet_slots(minimal.arcs.size(), [&](size_t a) { return minimal.arcs[a].key; }, prev_planet_dir,
+                         ArcSet::Minimal);
+    for (size_t a = 0; a < minimal.arcs.size(); a++) minimal.arcs[a].planet_slot = slots.slots[a];
+    minimal.planet_sidecar = std::move(slots.sidecar);
+    minimal.slot_counts = slots.counts;
+    log_phase("      Admin arcs: minimal set", t, cpu);
+
     const AdminArcCounts& c = arcs.counts;
-    const AdminArcSlotCounts& s = arcs.slot_counts;
+    const MinimalArcCounts& m = minimal.counts;
     std::ostringstream line;
     line << "  Admin arcs: " << c.junctions << " junctions, " << c.arcs << " arcs (" << c.closed_arcs << " closed, "
          << c.arc_vertices << " vertices), " << c.refs << " refs over " << store.rings.size() << " rings; largest partition "
          << c.largest_partition << " occurrences, " << c.hash_collisions << " hash collisions, " << c.duplicate_keys
-         << " duplicate keys; planet slots: " << s.kept << " kept, " << s.recycled << " recycled, " << s.appended
-         << " appended, " << s.tombstones << " tombstones (" << arcs.planet_sidecar.size() << " slots) on " << threads
+         << " duplicate keys; " << slot_summary(arcs.slot_counts, arcs.planet_sidecar.size()) << " on " << threads
          << " threads\n";
+    line << "  Admin arcs minimal set: " << m.arcs << " arcs (" << m.closed_arcs << " closed, " << m.arc_vertices
+         << " vertices), " << m.refs << " refs over " << m.rings << " rings of " << m.polygons << " polygons; "
+         << m.core_arcs << " full arcs in " << m.joined_junctions << " full junctions joined, " << m.duplicate_keys
+         << " duplicate keys; " << slot_summary(minimal.slot_counts, minimal.planet_sidecar.size()) << "\n";
     std::cerr << line.str();
     return arcs;
 }
 
-std::vector<PackedLocation> rebuild_ring(const AdminArcs& arcs, const AdminExactRings& store, uint32_t ring) {
+std::vector<PackedLocation> rebuild_ring(const AdminArcs& arcs, const AdminExactRings& store, ArcSet set,
+                                         uint32_t ring) {
     std::vector<PackedLocation> out;
-    for (uint32_t k = arcs.ring_refs[ring]; k < arcs.ring_refs[ring + 1]; k++) {
-        const ArcRef ref = arcs.refs[k];
-        const ArcVertices av = arc_vertices(store, arcs.arcs[ref.arc].view);
-        const uint32_t n = av.size();
-        for (uint32_t i = out.empty() ? 0 : 1; i < n; i++) out.push_back(av[ref.reversed ? n - 1 - i : i]);
+    auto chain = [&](const auto& v, bool reversed) {
+        const uint32_t n = v.size();
+        for (uint32_t i = out.empty() ? 0 : 1; i < n; i++) out.push_back(v[reversed ? n - 1 - i : i]);
+    };
+    if (set == ArcSet::Full) {
+        for (uint32_t k = arcs.ring_refs[ring]; k < arcs.ring_refs[ring + 1]; k++)
+            chain(arc_vertices(store, arcs.arcs[arcs.refs[k].arc].view), arcs.refs[k].reversed);
+    } else {
+        const MinimalArcs& m = arcs.minimal;
+        for (uint32_t k = m.ring_refs[ring]; k < m.ring_refs[ring + 1]; k++)
+            chain(MinimalArcVertices(store, arcs, m.refs[k].arc), m.refs[k].reversed);
     }
     return out;
 }
@@ -540,10 +917,11 @@ void require_arc_dirs(const std::string& output_dir, const std::string& arcs_out
     if (within(output, arcs) || within(arcs, output))
         throw std::runtime_error("--arcs-out " + arcs_out_dir + " overlaps the output dir " + output_dir +
                                  ", which publishes every file under it: keep them apart");
-    if (!prev_arcs_dir.empty()) {
-        const std::string sidecar = arc_sidecar_path(prev_arcs_dir + "/planet", ArcSet::Full);
-        std::error_code ec;
-        if (!fs::is_regular_file(sidecar, ec))
-            throw std::runtime_error("--prev-arcs " + prev_arcs_dir + " holds no planet arc sidecar " + sidecar);
-    }
+    if (!prev_arcs_dir.empty())
+        for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
+            const std::string sidecar = arc_sidecar_path(prev_arcs_dir + "/planet", set);
+            std::error_code ec;
+            if (!fs::is_regular_file(sidecar, ec))
+                throw std::runtime_error("--prev-arcs " + prev_arcs_dir + " holds no planet arc sidecar " + sidecar);
+        }
 }

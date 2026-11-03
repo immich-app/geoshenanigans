@@ -214,6 +214,10 @@ static constexpr double ADMIN_LINK_REACH_RAD =
 // sort in cache and with no merge.
 static constexpr uint32_t kArcPartitions = 4096;
 
+// The arc sets: every admin polygon's rings, and admin-minimal's
+// (admin_minimal_keeps), which admin-minimal-poi shares.
+enum class ArcSet : uint8_t { Full, Minimal };
+
 // --- Index mode ---
 
 enum class IndexMode { Full, NoAddresses, AdminOnly };
