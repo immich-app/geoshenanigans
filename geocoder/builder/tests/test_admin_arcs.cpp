@@ -553,7 +553,35 @@ TEST(no_arc_slot_is_reused_on_the_day_it_is_freed) {
     // A key twice: the first in presentation order keeps the slot.
     const ArcSlots twice = allocate_arc_slots({30, 10, 30}, dir.path() + "/3");
     CHECK(twice.slots == std::vector<uint32_t>({2, 0, 4}));
-    CHECK(refusal_of([&] { allocate_arc_slots({1}, dir.path() + "/none"); }).find("unreadable") != std::string::npos);
+    CHECK_EQ(three.counts.previous_sidecar_missing, size_t(0));
+}
+
+TEST(a_previous_build_without_an_arc_sidecar_leaves_every_arc_slot_cold_and_says_so) {
+    using namespace gc::id_alloc;
+    const ScratchDir dir("admin-arc-cold-slots");
+    // No sidecar where the previous build's would be: the fresh build's slots, counted as a cold start.
+    const ArcSlots cold = allocate_arc_slots({30, 10, 20}, dir.path() + "/none");
+    CHECK(cold.slots == std::vector<uint32_t>({0, 1, 2}));
+    CHECK_EQ(cold.counts.appended, size_t(3));
+    CHECK_EQ(cold.counts.kept, size_t(0));
+    CHECK_EQ(cold.counts.previous_sidecar_missing, size_t(1));
+    CHECK(cold.sidecar.size() == 3u);
+    const std::string lines = arc_slot_start_lines("planet", ArcSet::Minimal, dir.path() + "/none", cold.counts);
+    CHECK(lines.find("planet arcs: no previous minimal arc slots at " + dir.path() + "/none, every slot cold") !=
+          std::string::npos);
+    CHECK(lines.find("ARC_CHECK slots=arcs set=minimal region=planet previous_sidecar_missing=1\n") != std::string::npos);
+    // With the sidecar there, the count is 0; without a previous build, no line at all.
+    IdAllocator::write_sidecar(dir.path() + "/1", cold.sidecar);
+    const ArcSlots warm = allocate_arc_slots({20, 30}, dir.path() + "/1");
+    CHECK(warm.slots == std::vector<uint32_t>({2, 0}));
+    CHECK_EQ(warm.counts.previous_sidecar_missing, size_t(0));
+    CHECK(arc_slot_start_lines("europe", ArcSet::Full, dir.path() + "/1", warm.counts) ==
+          "ARC_CHECK slots=arcs set=full region=europe previous_sidecar_missing=0\n");
+    CHECK(arc_slot_start_lines("planet", ArcSet::Full, "", allocate_arc_slots({1}, "").counts).empty());
+    // A sidecar that is there but can't be read is refused, not taken for a cold start.
+    std::ofstream(dir.path() + "/garbage") << "not a sidecar";
+    CHECK(refusal_of([&] { allocate_arc_slots({1}, dir.path() + "/garbage"); }).find("unreadable arc sidecar") !=
+          std::string::npos);
 }
 
 TEST(a_repeated_keys_slot_that_no_arc_holds_is_a_tombstone_and_recycled_the_day_after) {

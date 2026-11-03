@@ -3,7 +3,8 @@
 // their admin geometry as arcs, and nothing else does; a chained build of the
 // same data (--prev-output) writes them again unchanged. A chained build of
 // edited data keeps the slot of every arc the previous day had, which a fresh
-// build of it doesn't.
+// build of it doesn't. A previous build without its arc sidecars leaves every
+// arc slot cold and the admin slots as they were.
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
@@ -359,4 +360,57 @@ TEST(a_chained_build_of_edited_data_keeps_each_retained_arcs_slot_where_a_fresh_
             CHECK_EQ(anew.size(), before.size());
             if (gctest::failures() != failures_before) std::printf("    in %s\n", name.c_str());
         }
+}
+
+TEST(a_chained_build_on_a_previous_build_without_arc_sidecars_allocates_every_arc_slot_cold) {
+    const ScratchDir root("admin-dirs-cold-arcs");
+    const std::string day_one = root.path() + "/day1.osm.pbf", day_two = root.path() + "/day2.osm.pbf",
+                      log = root.path() + "/build.log";
+    write_test_pbf(day_one, fixture(), 1000);
+    write_test_pbf(day_two, fixture(true), 1000);
+    auto build = [&](const std::string& pbf, const std::string& out, std::vector<std::string> extra) {
+        std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out, pbf, "--continents", "--multi-output",
+                                          "--multi-quality"};
+        words.insert(words.end(), extra.begin(), extra.end());
+        return gctest::run(words, log);
+    };
+    const std::string out1 = root.path() + "/out1", prev = root.path() + "/prev", cold = root.path() + "/cold",
+                      chained = root.path() + "/chained", fresh = root.path() + "/fresh";
+    REQUIRE(build(day_one, out1, {}));
+    // The previous build as it is but for its arc sidecars, every region's.
+    fs::copy(out1, prev, fs::copy_options::recursive);
+    size_t removed = 0;
+    for (const auto& e : fs::recursive_directory_iterator(prev))
+        if (e.path().filename() == "arc_index.osm_ids") removed++;
+    for (const std::string& region : kRegions)
+        for (const char* sidecar : {"/quality/exact/arc_index.osm_ids", "/admin-minimal/arc_index.osm_ids"})
+            fs::remove(prev + "/" + region + sidecar);
+    REQUIRE(removed > 0);
+    REQUIRE(build(day_two, cold, {"--prev-output", prev}));
+    const std::vector<char> text = bytes_of(log);
+    const std::string said(text.begin(), text.end());
+    for (const char* set : {"full", "minimal"}) {
+        CHECK(said.find(std::string("ARC_CHECK slots=arcs set=") + set + " region=planet previous_sidecar_missing=1") !=
+              std::string::npos);
+        CHECK(said.find(std::string("planet arcs: no previous ") + set + " arc slots at " + prev + "/planet/") !=
+              std::string::npos);
+    }
+    CHECK(said.find("region=europe previous_sidecar_missing=1") != std::string::npos);
+    REQUIRE(build(day_two, chained, {"--prev-output", out1}));
+    REQUIRE(build(day_two, fresh, {}));
+    // Its arcs are a fresh build's, slots and all; its admin slots the chained build's.
+    auto arcs_only = [](std::map<std::string, std::vector<char>> files) {
+        for (auto it = files.begin(); it != files.end();) {
+            const std::string file = fs::path(it->first).filename().string();
+            it = file == "arc_index.bin" || file == "arc_vertices.bin" || file == "arc_index.osm_ids" ? std::next(it)
+                                                                                                      : files.erase(it);
+        }
+        return files;
+    };
+    CHECK(arcs_only(arc_files(cold)) == arcs_only(arc_files(fresh)));
+    CHECK(arcs_only(arc_files(cold)) != arcs_only(arc_files(chained)));
+    for (const std::string& region : {std::string("planet"), std::string("europe")}) {
+        const std::string sidecar = region + "/quality/exact/admin_polygons.osm_ids";
+        CHECK(bytes_of(cold + "/" + sidecar) == bytes_of(chained + "/" + sidecar));
+    }
 }
