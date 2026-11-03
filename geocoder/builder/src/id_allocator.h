@@ -90,6 +90,11 @@ inline bool is_tombstone(const SidecarSlot& s) {
     return (s.flags & SLOT_FLAG_TOMBSTONE) != 0;
 }
 
+// The tombstone a slot becomes when its record dies, keeping the record's tier.
+inline SidecarSlot tombstone_of(const SidecarSlot& s) {
+    return SidecarSlot{static_cast<uint8_t>(ObjectType::NONE), SLOT_FLAG_TOMBSTONE, s.tier, 0, 0};
+}
+
 // A slot whose identity a record of the next build can reclaim;
 // load_previous puts the others on the free-list.
 inline bool is_reclaimable(const SidecarSlot& s) {
@@ -293,10 +298,7 @@ public:
     // slot sits there unflagged and is dead now (slots already flagged keep
     // their bytes). Then drop the bookkeeping before slots_ moves out.
     void finalize() {
-        for (uint32_t i : unclaimed_) {
-            SidecarSlot& s = slots_[i];
-            s = SidecarSlot{static_cast<uint8_t>(ObjectType::NONE), SLOT_FLAG_TOMBSTONE, s.tier, 0, 0};
-        }
+        for (uint32_t i : unclaimed_) slots_[i] = tombstone_of(slots_[i]);
         for (uint32_t i : free_list_) slots_[i].flags |= SLOT_FLAG_TOMBSTONE;
         std::vector<uint32_t>().swap(unclaimed_);
         std::vector<uint32_t>().swap(free_list_);

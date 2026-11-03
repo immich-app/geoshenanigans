@@ -526,6 +526,55 @@ TEST(no_arc_slot_is_reused_on_the_day_it_is_freed) {
     CHECK(refusal_of([&] { allocate_arc_slots({1}, dir.path() + "/none"); }).find("unreadable") != std::string::npos);
 }
 
+TEST(a_repeated_keys_slot_that_no_arc_holds_is_a_tombstone_and_recycled_the_day_after) {
+    using namespace gc::id_alloc;
+    const ScratchDir dir("admin-arc-repeated-slots");
+    int days = 0;
+    auto day = [&](const std::vector<uint64_t>& keys) {
+        const std::string prev = days == 0 ? "" : dir.path() + "/" + std::to_string(days);
+        ArcSlots slots = allocate_arc_slots(keys, prev);
+        IdAllocator::write_sidecar(dir.path() + "/" + std::to_string(++days), slots.sidecar);
+        return slots;
+    };
+    auto only_held_slots_live = [](const ArcSlots& s) {
+        std::vector<char> held(s.sidecar.size(), 0);
+        for (uint32_t slot : s.slots) held.at(slot) = 1;
+        size_t tombstones = 0;
+        for (size_t slot = 0; slot < s.sidecar.size(); slot++) {
+            if (is_tombstone(s.sidecar[slot]) == static_cast<bool>(held[slot])) return false;
+            tombstones += !held[slot];
+        }
+        return tombstones == s.counts.tombstones;
+    };
+    // Two arcs share key 7, as two arcs whose 56-bit keys collide would.
+    const ArcSlots one = day({7, 7});
+    CHECK(one.slots == std::vector<uint32_t>({0, 1}));
+    // One of them goes: the first keeps its slot, and the second's is a
+    // tombstone like any other slot no arc holds now.
+    const ArcSlots two = day({7});
+    CHECK(two.slots == std::vector<uint32_t>({0}));
+    REQUIRE(two.sidecar.size() == 2u);
+    CHECK(is_tombstone(two.sidecar[1]));
+    CHECK(only_held_slots_live(two));
+    // The day after, a new arc takes it.
+    const ArcSlots three = day({7, 9});
+    CHECK(three.slots == std::vector<uint32_t>({0, 1}));
+    CHECK_EQ(three.counts.recycled, size_t(1));
+    CHECK_EQ(three.sidecar.size(), size_t(2));
+    // Both every day: the second can't reclaim its slot, so it takes
+    // yesterday's tombstone and the table stops growing.
+    const ArcSlots four = day({7, 7});
+    CHECK(only_held_slots_live(four));
+    size_t largest = four.sidecar.size();
+    for (int d = 0; d < 6; d++) {
+        const ArcSlots next = day({7, 7});
+        CHECK(only_held_slots_live(next));
+        CHECK_EQ(next.slots[0], 0u);
+        largest = std::max(largest, next.sidecar.size());
+    }
+    CHECK_EQ(largest, size_t(3));
+}
+
 TEST(a_chained_arc_stage_keeps_each_unchanged_arcs_slot) {
     using gc::id_alloc::IdAllocator;
     const ScratchDir prev("admin-arc-chain");

@@ -773,6 +773,12 @@ ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string
     out.slots = alloc.allocate_all(keys.size(), [&](size_t i) { return SlotIdentity{ObjectType::ARC, keys[i]}; });
     alloc.finalize();
     out.sidecar = alloc.take_slots();
+    // Of a repeated key the allocator reclaims only the lowest previous slot
+    // and leaves the others live, though no arc holds them.
+    std::vector<char> held(out.sidecar.size(), 0);
+    for (uint32_t s : out.slots) held[s] = 1;
+    for (size_t s = 0; s < out.sidecar.size(); s++)
+        if (!held[s] && !is_tombstone(out.sidecar[s])) out.sidecar[s] = tombstone_of(out.sidecar[s]);
     for (size_t i = 0; i < keys.size(); i++) {
         const uint32_t s = out.slots[i];
         if (s >= prev_slots) out.counts.appended++;

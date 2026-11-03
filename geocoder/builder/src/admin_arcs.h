@@ -314,8 +314,8 @@ struct ArcSlots {
 // build's sidecar at `prev_sidecar` (none when empty): a key that held a slot
 // keeps it (the lowest presentation index of a repeated key), the others take
 // a slot that was a tombstone in the previous build, then new ones. A slot the
-// previous build's arc held and no arc holds now becomes a tombstone, so it is
-// reused only the day after.
+// previous build's arcs held and no arc holds now, a repeated key's other
+// slots included, becomes a tombstone, so it is reused only the day after.
 ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar);
 
 // Where a region's arc sidecar sits under its dir, as PR 3 ships them: the
