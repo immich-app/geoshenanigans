@@ -170,6 +170,7 @@ struct MinimalArcCounts {
     size_t polygons = 0;  // admin_minimal_keeps' with rings
     size_t core_arcs = 0;           // full arcs a minimal ring uses
     size_t joined_junctions = 0;    // full junctions inside a minimal arc
+    size_t turnback_junctions = 0;  // of two core arc ends, kept: a minimal ring turns back there
     size_t arcs = 0;
     size_t closed_arcs = 0;
     size_t refs = 0;
@@ -328,7 +329,10 @@ std::string arc_sidecar_path(const std::string& region_dir, ArcSet set);
 // rings use end at, and no third, joins those two, and so on along the
 // chain; a chain that closes on itself is one closed arc. The arcs come in
 // the full set's canonical form and presentation order, so they are those
-// build_arc_topology finds for the minimal polygons alone.
+// build_arc_topology finds for the minimal polygons alone, but for one
+// case: where a minimal ring turns back along its arc at such a junction
+// (a spur's tip that only another polygon makes a junction), the junction
+// stays, since a chain through it would lose that ring.
 MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& store,
                                const std::vector<bool>& in_minimal, unsigned threads);
 

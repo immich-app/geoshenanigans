@@ -370,7 +370,7 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
          << " slots=" << full.sidecar.size() << " ring_block_bytes=" << full.ring_blocks.size() << "\n";
     line << "ARC_CHECK set=minimal arcs=" << m.arcs << " closed_arcs=" << m.closed_arcs << " refs=" << m.refs
          << " rings=" << m.rings << " polygons=" << minimal_polygons << " joined_junctions=" << m.joined_junctions
-         << " duplicate_keys=" << m.duplicate_keys << " slots=" << minimal.sidecar.size()
+         << " turnback_junctions=" << m.turnback_junctions << " duplicate_keys=" << m.duplicate_keys << " slots=" << minimal.sidecar.size()
          << " ring_block_bytes=" << minimal.ring_blocks.size() << "\n";
     for (size_t k = 0; k < kArcTierCount; k++) {
         const ArcTierCounts& tc = arcs.tiers[k].counts;

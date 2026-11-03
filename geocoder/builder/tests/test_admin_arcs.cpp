@@ -749,6 +749,52 @@ TEST(a_minimal_loop_joined_from_full_arcs_starts_at_its_smallest_vertex) {
     CHECK(every_minimal_ring_rebuilds(arcs, store, in_minimal));
 }
 
+TEST(a_junction_two_minimal_spurs_end_at_stays_one_as_each_ring_turns_back_there) {
+    // Two minimal squares, each with a spur out to v (u-v-u and w-v-w), and a
+    // triangle of another level touching v. The full set cuts at v (its
+    // neighbours u, w and the triangle's two), where only the spurs' ends are
+    // the minimal rings': joining them into u-v-w would make each ring leave
+    // that chain at v, as each comes back along its own spur.
+    const PackedLocation u = pt(5, 10), v = pt(5, 15), w = pt(5, 20);
+    const Ring left = closed({pt(0, 0), pt(0, 10), u, v, u, pt(10, 10), pt(10, 0)});
+    const Ring right = closed({pt(0, 20), w, v, w, pt(10, 20), pt(10, 30), pt(0, 30)});
+    const Ring triangle = closed({v, pt(8, 14), pt(8, 16)});
+    const AdminExactRings store = store_of({{left, {}}, {right, {}}, {triangle, {}}});
+    const std::vector<bool> in_minimal = {true, true, false};
+    const AdminArcs arcs = full_and_minimal(store, in_minimal);
+    CHECK_EQ(arcs.counts.junctions, size_t(3));  // u, v and w
+    CHECK_EQ(arcs.counts.arcs, size_t(5));       // each spur, each square's rest, the triangle
+    const MinimalArcs& m = arcs.minimal;
+    CHECK_EQ(m.counts.core_arcs, size_t(4));
+    CHECK_EQ(m.counts.joined_junctions, size_t(0));
+    CHECK_EQ(m.counts.turnback_junctions, size_t(1));
+    // v stays a junction: each spur is a minimal arc of its own, its ring's
+    // twice, walked each way.
+    REQUIRE(m.arcs.size() == 4u);
+    for (const Ring& spur : {Ring{u, v}, Ring{v, w}}) {
+        bool found = false;
+        for (uint32_t a = 0; a < m.arcs.size(); a++) {
+            if (minimal_vertices(store, arcs, a) != spur) continue;
+            found = true;
+            CHECK_EQ(m.arcs[a].part_count, 1u);
+            size_t forwards = 0, backwards = 0;
+            for (const ArcRef& ref : m.refs)
+                if (ref.arc == a) (ref.reversed ? backwards : forwards)++;
+            CHECK(forwards == 1 && backwards == 1);
+        }
+        CHECK(found);
+    }
+    CHECK(every_minimal_ring_rebuilds(arcs, store, in_minimal));
+
+    // And the whole stage over it: tiers, encoding and its losslessness check.
+    const AdminArcs staged = build_admin_arcs(store, in_minimal, "", 2);
+    CHECK_EQ(staged.minimal.counts.turnback_junctions, size_t(1));
+    CHECK(every_minimal_ring_rebuilds(staged, store, in_minimal));
+    const AdminArcBlocks blocks = encode_admin_arcs(staged, store, 2);
+    CHECK_EQ(blocks.polygons.size(), size_t(3));
+    for (size_t p = 0; p < 2; p++) CHECK(blocks.polygons[p].blocks[static_cast<size_t>(ArcSet::Minimal)].size > 0);
+}
+
 TEST(the_minimal_set_is_the_topology_of_the_minimal_polygons_alone) {
     for (uint64_t seed : {3u, 4u, 5u}) {
         // Minimal 2 x 2 blocks over every cell of another level, one block

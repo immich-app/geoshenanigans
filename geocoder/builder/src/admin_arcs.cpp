@@ -538,7 +538,23 @@ MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& sto
     out.counts.core_arcs = static_cast<size_t>(std::count(core.begin(), core.end(), 1));
 
     // A full junction where exactly two core arc ends meet is none for the
-    // minimal rings: those two ends join.
+    // minimal rings: those two ends join. Every minimal ring through it then
+    // goes from one of the ends to the other, unless it turns back there,
+    // leaving its arc by an end and coming straight back along it (a spur's
+    // tip another polygon touches): that ring would leave the chain, so such
+    // a junction stays one. The ends minimal rings turn back at:
+    std::vector<uint8_t> turned_at(2 * full_count, 0);
+    for (size_t r = 0; r < ring_count; r++) {
+        if (!minimal_ring[r]) continue;
+
+        const uint32_t first = arcs.ring_refs[r], n = arcs.ring_refs[r + 1] - first;
+        for (uint32_t t = 0; t < n; t++) {
+            const ArcRef here = arcs.refs[first + t], next = arcs.refs[first + (t + 1) % n];
+            const uint32_t leave = 2 * here.arc + (here.reversed ? 0 : 1);
+            const uint32_t enter = 2 * next.arc + (next.reversed ? 1 : 0);
+            if (leave == enter) turned_at[leave] = 1;
+        }
+    }
     struct End {
         uint64_t vertex;
         uint32_t end;
@@ -559,13 +575,18 @@ MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& sto
         size_t run_end = k + 1;
         while (run_end < ends.size() && ends[run_end].vertex == ends[k].vertex) run_end++;
         if (run_end - k == 2) {
-            joined[ends[k].end] = ends[k + 1].end;
-            joined[ends[k + 1].end] = ends[k].end;
-            out.counts.joined_junctions++;
+            if (turned_at[ends[k].end] || turned_at[ends[k + 1].end]) {
+                out.counts.turnback_junctions++;
+            } else {
+                joined[ends[k].end] = ends[k + 1].end;
+                joined[ends[k + 1].end] = ends[k].end;
+                out.counts.joined_junctions++;
+            }
         }
         k = run_end;
     }
     ends = {};
+    free_storage(turned_at);
 
     // The chains, each from the first of its arcs in full order: forwards
     // from that arc's last vertex, then (unless it came back round) backwards
@@ -874,7 +895,8 @@ AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>
          << " threads\n";
     line << "  Admin arcs minimal set: " << m.arcs << " arcs (" << m.closed_arcs << " closed, " << m.arc_vertices
          << " vertices), " << m.refs << " refs over " << m.rings << " rings of " << m.polygons << " polygons; "
-         << m.core_arcs << " full arcs in " << m.joined_junctions << " full junctions joined, " << m.duplicate_keys
+         << m.core_arcs << " full arcs in " << m.joined_junctions << " full junctions joined ("
+         << m.turnback_junctions << " kept where a ring turns back), " << m.duplicate_keys
          << " duplicate keys; " << slot_summary(minimal.slot_counts, minimal.planet_sidecar.size()) << "\n";
     line << "  Admin arcs rings_nest raw: " << arcs.rings_nest_raw << " polygons whose exact rings don't nest\n";
     for (size_t k = 0; k < kArcTierCount; k++) line << tier_summary(kArcTiers[k], arcs.tiers[k].counts);
