@@ -460,31 +460,31 @@ mod tests {
             ("mode.full", component(
                 &["{region}/{mode}/admin.bin", "{region}/{quality}/q.bin"],
                 &[], None)),
-            ("quality.q2.5", component(&["{region}/{quality}/cells.bin"], &[], None)),
+            ("quality.simplified", component(&["{region}/{quality}/cells.bin"], &[], None)),
             ("poi_tier.major", component(&["{region}/poi/{poi_tier}.bin"], &[], None)),
         ]);
-        let s = sel("europe", "full", "q2.5", "major");
+        let s = sel("europe", "full", "simplified", "major");
         let files = resolve_files(&c, &s).paths;
         // BTreeSet => sorted, deduped. {region}->europe, {mode}->full,
-        // {quality}->q2.5, {poi_tier}->major.
+        // {quality}->simplified, {poi_tier}->major.
         assert_eq!(files, vec![
             "europe/full/admin.bin".to_string(),
             "europe/poi/major.bin".to_string(),
-            "europe/q2.5/cells.bin".to_string(),
-            "europe/q2.5/q.bin".to_string(),
+            "europe/simplified/cells.bin".to_string(),
+            "europe/simplified/q.bin".to_string(),
         ]);
     }
 
     #[test]
     fn resolve_files_extends_chain_collects_parent_files() {
-        // quality.q2.5 extends quality.base; both sets of files appear.
+        // quality.simplified extends quality.base; both sets of files appear.
         let c = cfg(vec![
             ("mode.full", component(&["m.bin"], &[], None)),
             ("quality.base", component(&["base_a.bin", "base_b.bin"], &[], None)),
-            ("quality.q2.5", component(&["q.bin"], &[], Some("quality.base"))),
+            ("quality.simplified", component(&["q.bin"], &[], Some("quality.base"))),
             ("poi_tier.none", component(&[], &[], None)),
         ]);
-        let s = sel("eu", "full", "q2.5", "none");
+        let s = sel("eu", "full", "simplified", "none");
         let files = resolve_files(&c, &s).paths;
         assert_eq!(files, vec![
             "base_a.bin".to_string(),
@@ -496,13 +496,13 @@ mod tests {
 
     #[test]
     fn resolve_files_replaces_removes_matching_path() {
-        // quality.q2.5 replaces the base admin file with a higher-quality one.
+        // quality.simplified replaces the base admin file with a higher-quality one.
         let c = cfg(vec![
             ("mode.full", component(&["admin_lo.bin", "cells.bin"], &[], None)),
-            ("quality.q2.5", component(&["admin_hi.bin"], &["admin_lo.bin"], None)),
+            ("quality.simplified", component(&["admin_hi.bin"], &["admin_lo.bin"], None)),
             ("poi_tier.none", component(&[], &[], None)),
         ]);
-        let s = sel("eu", "full", "q2.5", "none");
+        let s = sel("eu", "full", "simplified", "none");
         let files = resolve_files(&c, &s).paths;
         assert_eq!(files, vec![
             "admin_hi.bin".to_string(),
@@ -517,10 +517,10 @@ mod tests {
         // A replaces entry containing {region} is substituted before matching.
         let c = cfg(vec![
             ("mode.full", component(&["{region}/admin_lo.bin"], &[], None)),
-            ("quality.q2.5", component(&["{region}/admin_hi.bin"], &["{region}/admin_lo.bin"], None)),
+            ("quality.simplified", component(&["{region}/admin_hi.bin"], &["{region}/admin_lo.bin"], None)),
             ("poi_tier.none", component(&[], &[], None)),
         ]);
-        let s = sel("asia", "full", "q2.5", "none");
+        let s = sel("asia", "full", "simplified", "none");
         let files = resolve_files(&c, &s).paths;
         assert_eq!(files, vec!["asia/admin_hi.bin".to_string()]);
     }
@@ -530,10 +530,10 @@ mod tests {
         // Same path emitted by two components collapses to one entry.
         let c = cfg(vec![
             ("mode.full", component(&["shared.bin"], &[], None)),
-            ("quality.q2.5", component(&["shared.bin", "extra.bin"], &[], None)),
+            ("quality.simplified", component(&["shared.bin", "extra.bin"], &[], None)),
             ("poi_tier.none", component(&[], &[], None)),
         ]);
-        let s = sel("eu", "full", "q2.5", "none");
+        let s = sel("eu", "full", "simplified", "none");
         let files = resolve_files(&c, &s).paths;
         assert_eq!(files, vec!["extra.bin".to_string(), "shared.bin".to_string()]);
     }
@@ -542,7 +542,7 @@ mod tests {
     fn resolve_files_missing_component_ids_yield_empty() {
         // No matching component ids at all -> empty result.
         let c = cfg(vec![("something.else", component(&["x.bin"], &[], None))]);
-        let s = sel("eu", "full", "q2.5", "none");
+        let s = sel("eu", "full", "simplified", "none");
         assert!(resolve_files(&c, &s).paths.is_empty());
     }
 
@@ -570,9 +570,9 @@ mod tests {
             files: BTreeMap::new(),
         };
 
-        assert_eq!(resolve_files(&c, &sel("eu", "small", "q2.5", "none")).paths,
+        assert_eq!(resolve_files(&c, &sel("eu", "small", "simplified", "none")).paths,
                    vec!["eu/small/a.bin".to_string(), "eu/small/b.bin".to_string()]);
-        assert_eq!(resolve_files(&c, &sel("eu", "small", "q2.5", "major")).paths,
+        assert_eq!(resolve_files(&c, &sel("eu", "small", "simplified", "major")).paths,
                    vec!["eu/poi/major/p.bin".to_string(), "eu/small-poi/b.bin".to_string()]);
     }
 
@@ -581,7 +581,7 @@ mod tests {
         let mut full = component(&["{region}/full/admin_cells.bin"], &[], None);
         full.optional_files = vec!["{region}/full/interp_postcodes.bin".to_string()];
         let c = cfg(vec![("mode.full", full)]);
-        let s = sel("europe", "full", "q2.5", "none");
+        let s = sel("europe", "full", "simplified", "none");
 
         let resolved = resolve_files(&c, &s);
 

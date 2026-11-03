@@ -1,6 +1,6 @@
 use super::*;
 use crate::arc_fixture::{encode_arc, encode_ring, mix64, put_varint, zigzag, ArcFixture, RawBox, Ref, CHUNK_BOX_MIN_REFS, REF_CHUNK_MIN};
-use crate::encoded_pip_tests::Rng;
+use crate::test_rng::Rng;
 
 /// A random walk of `n` vertices on the 10^k grid from `start` (e7, on that grid), steps of up to
 /// `reach` grid units.

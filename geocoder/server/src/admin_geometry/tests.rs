@@ -2,7 +2,7 @@ use super::*;
 use crate::arc_blocks::tests::{odd_crossings, probes, square_of_arcs};
 use crate::arc_blocks::ARC_MEMO_CAPACITY;
 use crate::arc_fixture::{e7, exact_area, record, ArcFixture, Ref};
-use crate::encoded_pip_tests::Rng;
+use crate::test_rng::Rng;
 use crate::exact_pip::tests::testdata_rows;
 use crate::scratch_dir::ScratchDir;
 use crate::{cell_id_at_level, AdminScan, Index, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL, STR_TIER_COUNT};
