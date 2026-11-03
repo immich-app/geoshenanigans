@@ -35,7 +35,8 @@ def substitute(path, sel):
 def resolve(cfg, sel):
     """The selection's paths (sorted) and which of them are optional, as the region downloader
     resolves them: each axis component's files and optional files, after those of the component
-    it extends, minus every path a component replaces."""
+    it extends and before those of the first of its variants whose `when` the selection matches,
+    minus every path a component replaces."""
     files, optional, replaced = [], set(), set()
 
     def visit(cid, seen):
@@ -50,6 +51,10 @@ def resolve(cfg, sel):
             optional.add(substitute(f, sel))
             files.append(substitute(f, sel))
         replaced.update(substitute(r, sel) for r in component.get("replaces", []))
+        for variant in component.get("variants", []):
+            if all(sel.get(axis) == value for axis, value in variant.get("when", {}).items()):
+                visit(variant["component"], seen)
+                break
 
     for axis in AXES:
         visit(f"{axis}.{sel[axis]}", set())

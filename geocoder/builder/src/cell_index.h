@@ -1,5 +1,7 @@
 #pragma once
 
+#include <array>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -23,9 +25,10 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
 void compute_admin_index_cells(ParsedData& data, const std::vector<double>& scales,
                                std::optional<double> minimal_scale);
 
-// strings_layout.json: each tier's [start, end) in the global string-offset
-// space, identical in every dir that resolves strings.
-void write_strings_layout(const std::string& dir, const ParsedData& data);
+// strings_layout.json: each tier's [start, end) in the dir's string-offset
+// space, tier t at [bases[t], bases[t + 1]): the build's
+// (data.strings_tier_bases) in every dir that resolves the shared strings.
+void write_strings_layout(const std::string& dir, const std::array<uint32_t, STR_TIER_COUNT + 1>& bases);
 
 // Country of the point via its admin cell's level-2 entries; border cells
 // (multiple candidate countries) resolve by point-in-polygon. 0 if unknown.
@@ -70,14 +73,27 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
                            const std::string& output_dir, double epsilon_scale,
                            const std::string& planet_variant = "");
 
-// Write a minimal admin polygon/vertex pair containing only polygons whose
-// admin_level falls in [2, 8] (drops L9/L10/L11/L15 sub-municipal levels).
-// Same delta-encoded vertex format as write_quality_variant. Fills
-// id_remap so the caller can rewrite the admin cell index against the
-// new dense ID space. Always emitted at q2.5 — admin-minimal isn't
-// tiered by quality.
-void write_admin_minimal_polygons(const ParsedData& data,
-                                  const std::string& output_dir,
-                                  const std::string& prev_dir,
-                                  double epsilon_scale,
-                                  std::vector<uint32_t>& id_remap);
+// Writes admin-minimal, the smallest useful set, in two dirs under
+// region_dir. Both drop:
+//   - place_nodes of other types than admin_minimal_keeps_place's (suburbs,
+//     neighbourhoods, quarters)
+//   - admin polygons (and their vertex bytes) admin_minimal_keeps
+//     leaves out: L9 borough, L10 quarter-area, L11 admin-postal,
+//     and L15 place areas ranked below 16.
+//   - those boundaries' claims on place nodes: a node one of them
+//     claims answers here as a place, since nothing here stands
+//     for it (an L9 or L10 boundary claims Banja Luka, Mildura and
+//     many Dutch villages).
+// and re-simplify the kept polygons at epsilon_scale (q2.5: admin-minimal
+// isn't tiered by quality), so neither needs a quality dir. They differ in
+// what other dirs they can be read beside:
+//   - admin-minimal/, for a set without POIs: its polygons in its own stable
+//     slots (region_prev's admin-minimal sidecar), and a core of its own,
+//     only the strings its records name, in the shared core's order, with
+//     a layout of that core alone.
+//   - admin-minimal-poi/, for a set with a POI tier: the shared polygon
+//     slots, which a POI's parent_poly_id names (a tombstone at each slot
+//     it drops), and the shared core strings and layout, which the POI
+//     tier's names extend.
+void write_admin_minimal(const ParsedData& data, const std::string& region_dir, const std::string& region_prev,
+                         double epsilon_scale);
