@@ -43,14 +43,14 @@ constexpr uint32_t ABS2_MAX_VERTICES = 69999;
 // a piece of it (64 KiB) and the largest unit the encoder takes whole. Each
 // family's own, so each check is as tight as its encoder allows (one bound
 // for all would be set by the largest unit of any encoder, a street way's
-// 65535 nodes (512 KiB), and let an admin encoder hold 256 KiB more than it
+// 65535 nodes (512 KiB), and let a POI encoder hold 256 KiB more than it
 // may):
-//   admin (and POI): a block up to big_block(), 256 KiB; a larger one goes
-//   plane by plane;
+//   POI: a block up to big_block(), 256 KiB; a larger one goes plane by
+//   plane;
 //   addr: an abs2 footprint, a 10-byte header and 4-byte vertices, 280,006 B
 //   at ABS2_MAX_VERTICES; an escaped one goes through in pieces.
 constexpr uint64_t ENCODER_PIECE = 64 << 10;
-constexpr uint64_t ADMIN_ENCODER_HOLD = ENCODER_PIECE + (256 << 10);
+constexpr uint64_t POI_ENCODER_HOLD = ENCODER_PIECE + (256 << 10);
 constexpr uint64_t ADDR_ENCODER_HOLD = ENCODER_PIECE + 10 + 4 * uint64_t(ABS2_MAX_VERTICES);
 // The most the patcher's heap peak may grow when a heap test's case grows
 // tenfold in the one structure it varies, which the patcher reads in place.
@@ -147,28 +147,58 @@ void put_addrs(BuildDir& d, const std::vector<Addr>& addrs) {
     d["addr_vertices.bin"] = verts;
 }
 
-// An admin polygon by its area (unique, so a polygon kept in the new set
-// matches) and its vertex block, as a POI's.
-struct Admin {
-    float area;
-    std::vector<char> block;
+// The admin geometry of an admin-minimal-shaped dir by polygon slot and arc
+// slot: each polygon's key (its name and area; NO for a tombstone, which has
+// no ring block) and ring block, and each arc's block. The blocks' bytes are
+// random: the patch tools read none of them.
+struct ArcGeometry {
+    std::vector<uint32_t> keys;
+    std::vector<std::vector<char>> rings, arcs;
 };
 
-// admin_polygons.bin and admin_vertices.bin of polys, into d: unnamed, level
-// 8, no country.
-void put_admins(BuildDir& d, const std::vector<Admin>& polys) {
-    std::vector<char> recs, verts;
-    for (const Admin& a : polys) {
-        append(recs, static_cast<uint32_t>(verts.size()));
-        append(recs, static_cast<uint32_t>((a.block.size() - 10) / 4));
-        append(recs, 0u);
+std::vector<char> random_bytes(std::mt19937& rng, size_t n) {
+    std::vector<char> b(n);
+    for (char& c : b) c = static_cast<char>(rng());
+    return b;
+}
+
+// n_polygons slots, every seventh a tombstone, each other's ring block of 8
+// to 39 bytes, and n_arcs arc blocks of arc_bytes bytes (0: 8 to 71 each).
+ArcGeometry arc_geometry(std::mt19937& rng, uint32_t n_polygons, uint32_t n_arcs, uint32_t arc_bytes = 0) {
+    ArcGeometry g;
+    for (uint32_t i = 0; i < n_polygons; i++) {
+        const bool tombstone = i % 7 == 3;
+        g.keys.push_back(tombstone ? NO : 100 + i);
+        g.rings.push_back(tombstone ? std::vector<char>{} : random_bytes(rng, 8 + rng() % 32));
+    }
+    for (uint32_t i = 0; i < n_arcs; i++) g.arcs.push_back(random_bytes(rng, arc_bytes ? arc_bytes : 8 + rng() % 64));
+    return g;
+}
+
+// g's four admin geometry files, laid out as the builder writes them, into d:
+// a 24-byte record per slot (ring_offset, ring_bytes, name_id, level 8,
+// area, no country; a tombstone's {NO, 0, NO}), the ring blocks in slot order,
+// a u32 offset per arc slot and the arc blocks in slot order.
+void put_arc_geometry(BuildDir& d, const ArcGeometry& g) {
+    std::vector<char> recs, rings, index, arcs;
+    for (size_t i = 0; i < g.keys.size(); i++) {
+        const bool tombstone = g.keys[i] == NO;
+        append(recs, tombstone ? NO : static_cast<uint32_t>(rings.size()));
+        append(recs, static_cast<uint32_t>(g.rings[i].size()));
+        append(recs, g.keys[i]);
         append(recs, uint32_t{8});
-        append(recs, a.area);
+        append(recs, tombstone ? 0.0f : static_cast<float>(g.keys[i]));
         append(recs, 0u);
-        verts.insert(verts.end(), a.block.begin(), a.block.end());
+        rings.insert(rings.end(), g.rings[i].begin(), g.rings[i].end());
+    }
+    for (const std::vector<char>& arc : g.arcs) {
+        append(index, static_cast<uint32_t>(arcs.size()));
+        arcs.insert(arcs.end(), arc.begin(), arc.end());
     }
     d["admin_polygons.bin"] = recs;
-    d["admin_vertices.bin"] = verts;
+    d["admin_rings.bin"] = rings;
+    d["arc_index.bin"] = index;
+    d["arc_vertices.bin"] = arcs;
 }
 
 // The id of a fixture's cell k.
@@ -210,6 +240,35 @@ void put_cells(BuildDir& d, const std::string& prefix, const CellLists& lists) {
     auto [cells, entries] = write_cell_lists(lists);
     d[prefix + "_cells.bin"] = cells;
     d[prefix + "_entries.bin"] = entries;
+}
+
+// The top bit of an admin cell index entry: the cell lies inside the polygon.
+constexpr uint32_t INTERIOR = 0x80000000u;
+
+// An admin-minimal-shaped dir (the files the builder writes there): g's
+// admin geometry, n_places place nodes each labelled by the polygon of its
+// slot (place i by slot i mod the slots, none by a tombstone), the admin
+// cell index (cell k listing slot k and slot k + 1 as interior), the core
+// strings and the strings layout.
+void put_admin_minimal(BuildDir& d, const ArcGeometry& g, uint32_t n_places) {
+    put_arc_geometry(d, g);
+    std::vector<char> places;
+    for (uint32_t i = 0; i < n_places; i++) {
+        const uint32_t slot = i % static_cast<uint32_t>(g.keys.size());
+        append(places, 47.0f + static_cast<float>(i) * 1e-4f);
+        append(places, 8.0f);
+        append(places, 0u);
+        append(places, uint32_t{1});
+        append(places, g.keys[slot] == NO ? NO : slot);
+    }
+    d["place_nodes.bin"] = places;
+    CellLists cells;
+    for (uint32_t k = 0; k + 1 < g.keys.size(); k++) cells[cell_id(k)] = {k, (k + 1) | INTERIOR};
+    put_cells(d, "admin", cells);
+    const std::string pool("Testland\0Ville\0", 15);
+    d["strings_core.bin"].assign(pool.begin(), pool.end());
+    const std::string layout = "{\"tiers\": []}\n";
+    d["strings_layout.json"].assign(layout.begin(), layout.end());
 }
 
 // Street ways of two nodes each, named by names, in one geo cell that lists
@@ -808,25 +867,25 @@ TEST(patch_lowmem_drops_the_old_records_of_a_replace_run) {
     CHECK(apply_both_modes(c, decoder_peaks_at_most("streets", DECODER_HOLD)).empty());
 }
 
-// An INSERT stretch of admin_vertices.bin (2 MB of new polygons between kept
-// ones), which reaches the encoder as one write of nearly all of it: the
-// encoder takes it a piece at a time, never holding more than a piece and the
-// largest block it takes whole.
-TEST(patch_lowmem_encodes_an_admin_insert_stretch_a_piece_at_a_time) {
-    ScratchDir dir("lowmem-admin");
+// An INSERT stretch of POI polygons (2 MB of new vertex blocks between kept
+// ones), which the replay hands the encoder record by record, each record's
+// block after it: the encoder never holds more than a piece and the largest
+// block it takes whole.
+TEST(patch_lowmem_encodes_a_poi_insert_stretch_within_its_hold) {
+    ScratchDir dir("lowmem-poi-insert");
     std::mt19937 rng(20261030);
-    std::vector<Admin> old_polys, inserted;
-    for (uint32_t i = 0; i < 300; i++) old_polys.push_back({static_cast<float>(i), block(rng, 50)});
-    for (uint32_t i = 0; i < 500; i++) inserted.push_back({static_cast<float>(1000 + i), block(rng, 1000)});
-    auto new_polys = old_polys;
-    new_polys.insert(new_polys.begin() + 150, inserted.begin(), inserted.end());
+    std::vector<Poi> old_pois, inserted;
+    for (uint32_t i = 0; i < 300; i++) old_pois.push_back({i, block(rng, 50)});
+    for (uint32_t i = 0; i < 500; i++) inserted.push_back({1000 + i, block(rng, 1000)});
+    auto new_pois = old_pois;
+    new_pois.insert(new_pois.begin() + 150, inserted.begin(), inserted.end());
     BuildDir old_d, new_d;
-    put_admins(old_d, old_polys);
-    put_admins(new_d, new_polys);
-    const LowMemCase c{dir.path(), "admin-insert"};
+    put_pois(old_d, old_pois);
+    put_pois(new_d, new_pois);
+    const LowMemCase c{dir.path(), "poi-insert"};
     REQUIRE(prepare(c, old_d, new_d).empty());
 
-    CHECK(apply_both_modes(c, encoder_peaks_at_most("admin", ADMIN_ENCODER_HOLD)).empty());
+    CHECK(apply_both_modes(c, encoder_peaks_at_most("poi", POI_ENCODER_HOLD)).empty());
 }
 
 // An escaped address footprint (encoding 3, 800K vertices: 6.4 MB) kept
@@ -1319,9 +1378,9 @@ TEST(patch_heap_stays_flat_as_streets_move) {
         BuildDir old_d, new_d, old_meta, new_meta;
         put_moved_ways(old_d, new_d, old_meta, new_meta, n, 200000);
         if (std::string e = prepare(c, old_d, new_d, old_meta, new_meta); !e.empty()) return e;
-        // No admin pairs, then the street leg.
+        // The street leg.
         std::vector<char> legs;
-        for (const uint32_t w : {POI_PARENT_REMAP_MARKER, 0u, n}) append(legs, w);
+        for (const uint32_t w : {POI_PARENT_REMAP_MARKER, n}) append(legs, w);
         return patch_holds(c, legs, std::to_string(n) + " moved street ways");
     }, 10000).empty());
 }
@@ -1734,10 +1793,10 @@ TEST(patch_refuses_change_counts_and_lengths_that_wrap_32_bits) {
     };
     // Parallel: parent file, value stride, remap kind, then n_inserted, the values, n_changes.
     const size_t parallel = at_of(PatchFileId::WAY_PARENTS, PARALLEL_DELTA_STRIDE, 30 * 4, 31 * 4,
-                                  {static_cast<uint32_t>(PatchFileId::STREET_WAYS), 4, 1});
+                                  {static_cast<uint32_t>(PatchFileId::STREET_WAYS), 4, 0});
     const size_t inserted_at = parallel + 36, parallel_changes_at = inserted_at + 4 + 4 * size_t{u32_at(inserted_at)};
     // Sparse: value stride, remap kind, then n_changes.
-    const size_t sparse_changes_at = at_of(PatchFileId::ADMIN_PARENTS, SPARSE_DELTA_STRIDE, 64 * 4, 64 * 4, {4, 1}) + 32;
+    const size_t sparse_changes_at = at_of(PatchFileId::ADMIN_PARENTS, SPARSE_DELTA_STRIDE, 64 * 4, 64 * 4, {4, 0}) + 32;
     // Full replacement and copy: a u32 (no fixups), then the data's length.
     const size_t full_length_at = at_of(PatchFileId::POSTCODE_CENTROIDS, 0, 0, centroids.size(), {0}) + 28;
     const size_t copy_length_at = at_of(PatchFileId::PLACE_NODES, COPY_OLD_STRIDE, places.size(), places.size(), {0}) + 28;
@@ -1771,27 +1830,27 @@ TEST(patch_refuses_change_counts_and_lengths_that_wrap_32_bits) {
 
 // A merge section whose stride is past any record's (0x100: from 0xFA up,
 // strides name section kinds) is refused in every mode before a record
-// buffer is sized by it: the admin polygons' merge, 24 bytes a record as
-// made. The patch as made applies.
+// buffer is sized by it: the place nodes' merge, 20 bytes a record as made
+// (a plain file in every mode). The patch as made applies.
 TEST(patch_refuses_a_record_stride_past_any_records) {
     ScratchDir dir("patch-stride");
-    std::mt19937 rng(20261030);
-    std::vector<Admin> polys;
-    for (uint32_t i = 0; i < 50; i++) polys.push_back({static_cast<float>(i), block(rng, 3 + i % 5)});
-    std::vector<Admin> fewer = polys;
-    fewer.erase(fewer.begin() + 20);
+    std::vector<char> places;
+    for (uint32_t i = 0; i < 50; i++)
+        for (const uint32_t w : {i, i, NO, 1u, NO}) append(places, w);
+    std::vector<char> fewer = places;
+    fewer.erase(fewer.begin() + 20 * PLACE_NODE_STRIDE, fewer.begin() + 21 * PLACE_NODE_STRIDE);
     BuildDir old_d, new_d;
-    put_admins(old_d, polys);
-    put_admins(new_d, fewer);
+    old_d["place_nodes.bin"] = places;
+    new_d["place_nodes.bin"] = fewer;
     const LowMemCase c{dir.path(), "stride"};
     REQUIRE(prepare(c, old_d, new_d).empty());
     const std::vector<char> raw = raw_patch(c);
     REQUIRE(!raw.empty());
     std::vector<char> header;
-    append(header, static_cast<uint32_t>(PatchFileId::ADMIN_POLYGONS));
-    append(header, static_cast<uint32_t>(ADMIN_POLYGON_STRIDE));
-    append(header, uint64_t{50 * ADMIN_POLYGON_STRIDE});
-    append(header, uint64_t{49 * ADMIN_POLYGON_STRIDE});
+    append(header, static_cast<uint32_t>(PatchFileId::PLACE_NODES));
+    append(header, static_cast<uint32_t>(PLACE_NODE_STRIDE));
+    append(header, uint64_t{50 * PLACE_NODE_STRIDE});
+    append(header, uint64_t{49 * PLACE_NODE_STRIDE});
     const size_t at = find_once(raw, header);
     REQUIRE(at != std::string::npos);
     std::vector<char> edited = raw;
@@ -1799,7 +1858,7 @@ TEST(patch_refuses_a_record_stride_past_any_records) {
     const std::string patch = c.dir("wide.gcpatch");
     REQUIRE(write_patch(c, patch, edited));
 
-    CHECK(not_refused(c, ALL_MODES, patch, "wide", "Malformed record stride: admin_polygons.bin").empty());
+    CHECK(not_refused(c, ALL_MODES, patch, "wide", "Malformed record stride: place_nodes.bin").empty());
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
@@ -2156,7 +2215,7 @@ TEST(patch_refuses_remap_pairs_out_of_order_or_twice_and_street_pairs_in_both_re
     const std::vector<char> raw = raw_patch(c);
     REQUIRE(!raw.empty());
     std::vector<char> legs;
-    for (const uint32_t w : {POI_PARENT_REMAP_MARKER, 0u, 20u}) append(legs, w);
+    for (const uint32_t w : {POI_PARENT_REMAP_MARKER, 20u}) append(legs, w);
     REQUIRE(find_once(raw, legs) != std::string::npos);
     const size_t head = find_once(raw, secondary_remap_head(20));
     REQUIRE(head != std::string::npos);
@@ -2241,13 +2300,13 @@ TEST(patch_refuses_a_second_pair_list_or_street_pairs_in_both_remaps_for_unchang
         append(copied, 0u);
         REQUIRE(find_once(raw, copied) != std::string::npos);
     }
-    const size_t parent = find_once(raw, words({POI_PARENT_REMAP_MARKER, 0, 0, 0}));
+    const size_t parent = find_once(raw, words({POI_PARENT_REMAP_MARKER, 0}));
     const size_t head = find_once(raw, secondary_remap_head(0));
     REQUIRE(parent != std::string::npos && head != std::string::npos && parent < head);
     // Where the parent-id remap's street pair count, and the secondary
     // remap's file count and street pair count sit, and where the secondary
     // remap ends (after the POI records' empty list).
-    const size_t parent_street_pairs = parent + 8, n_files = head + 4, street_pairs = head + 12, end = head + 40;
+    const size_t parent_street_pairs = parent + 4, n_files = head + 4, street_pairs = head + 12, end = head + 40;
     REQUIRE(std::vector<char>(raw.begin() + head + 32, raw.begin() + end) == words({poi, 0}));
 
     using Edit = std::function<void(std::vector<char>&)>;
@@ -2293,9 +2352,9 @@ TEST(patch_refuses_a_second_pair_list_or_street_pairs_in_both_remaps_for_unchang
 }
 
 // A second POI parent-id remap is refused in every mode, whichever comes
-// first: an empty one (no pair in any leg) before or after the one the diff
-// made (its street leg the 20 moved street ways with addresses), or that one
-// twice. The patch as made applies.
+// first: an empty one (no pair) before or after the one the diff made (the
+// 20 moved street ways with addresses), or that one twice. The patch as made
+// applies.
 TEST(patch_refuses_a_second_parent_id_remap) {
     ScratchDir dir("patch-second-parent-remap");
     BuildDir old_d, new_d, old_meta, new_meta;
@@ -2306,13 +2365,13 @@ TEST(patch_refuses_a_second_parent_id_remap) {
     const std::vector<char> raw = raw_patch(c);
     REQUIRE(!raw.empty());
     std::vector<char> legs, empty;
-    for (const uint32_t w : {POI_PARENT_REMAP_MARKER, 0u, 20u}) append(legs, w);
-    for (const uint32_t w : {POI_PARENT_REMAP_MARKER, 0u, 0u, 0u}) append(empty, w);
+    for (const uint32_t w : {POI_PARENT_REMAP_MARKER, 20u}) append(legs, w);
+    for (const uint32_t w : {POI_PARENT_REMAP_MARKER, 0u}) append(empty, w);
     const size_t at = find_once(raw, legs);
     REQUIRE(at != std::string::npos);
-    // The section's end: past its marker, the admin and street counts, the
-    // street pairs and the postcode count.
-    const size_t end = at + 12 + 20 * 8 + 4;
+    // The section's end: past its marker, the street count and the street
+    // pairs.
+    const size_t end = at + 8 + 20 * 8;
     const std::vector<char> made(raw.begin() + at, raw.begin() + end);
 
     struct Case {
@@ -2333,8 +2392,8 @@ TEST(patch_refuses_a_second_parent_id_remap) {
 }
 
 // Secondary pairs for a file the patcher keeps no record remap of are refused
-// in every mode: a list of one pair for admin_polygons.bin (whose pairs go in
-// the parent-id remap), for place_nodes.bin (no index the patcher rebuilds
+// in every mode: a list of one pair for admin_polygons.bin (admin polygons
+// keep their slots), for place_nodes.bin (no index the patcher rebuilds
 // holds place node ids) or for file 35, past every file (PatchFileId::COUNT).
 // Empty lists for them pass, as the diff's own empty lists do: that patch, and
 // the patch as made (20 secondary-matched POIs, 20 moved street ways with
@@ -2787,4 +2846,145 @@ TEST(patch_fails_cleanly_on_a_tmpdir_too_small_for_the_patch) {
         CHECK(bound.err.find("Bad magic") != std::string::npos);
         CHECK(bound.left.empty());
     }
+}
+
+// --- GCPATCH v14: admin geometry from arcs ---
+
+namespace {
+
+// Each changed admin geometry file's full replacement in a patcher log, and
+// admin_polygons.bin's copy when it is unchanged: "" or what is missing.
+LogCheck sent_whole(const BuildDir& old_d, const BuildDir& new_d) {
+    return [old_d, new_d](const std::string& log) -> std::string {
+        for (const PatchFileId fid : ADMIN_GEOMETRY_FILES) {
+            const std::string name = patch_file_names[uint32_t(fid)];
+            const std::string line = old_d.at(name) == new_d.at(name)
+                                         ? name + ": unchanged (copied " + std::to_string(new_d.at(name).size()) + " bytes from old)"
+                                         : name + ": full replace " + std::to_string(new_d.at(name).size()) + " bytes";
+            if (log.find(line) == std::string::npos) return "no \"" + line + "\"";
+        }
+        return "";
+    };
+}
+
+}  // namespace
+
+// An admin-minimal-shaped dir (its arc, ring, record, place and admin cell
+// files, core strings and layout) round-trips in every mode, the admin
+// geometry files whole: one arc edited, one longer, one new; one ring
+// edited in place, so the records stay and go as copied; a place's label
+// and an admin cell's list changed. The parent's diff refused the dir: no
+// patch section named admin_rings.bin.
+TEST(patch_lowmem_round_trips_an_admin_minimal_arc_dir) {
+    ScratchDir dir("lowmem-arc-dir");
+    std::mt19937 rng(20261103);
+    const ArcGeometry old_g = arc_geometry(rng, 200, 600);
+    ArcGeometry new_g = old_g;
+    new_g.arcs[5] = random_bytes(rng, new_g.arcs[5].size());
+    new_g.arcs[100].resize(new_g.arcs[100].size() + 8, 'x');
+    new_g.arcs.push_back(random_bytes(rng, 40));
+    new_g.rings[4] = random_bytes(rng, new_g.rings[4].size());
+    BuildDir old_d, new_d;
+    put_admin_minimal(old_d, old_g, 300);
+    put_admin_minimal(new_d, new_g, 300);
+    put_at(new_d["place_nodes.bin"], 7 * PLACE_NODE_STRIDE + 16, 2u);
+    CellLists cells = parse_cell_lists(new_d["admin_cells.bin"], new_d["admin_entries.bin"]);
+    cells[cell_id(9)] = {9, 11 | INTERIOR};
+    put_cells(new_d, "admin", cells);
+    const LowMemCase c{dir.path(), "arc-dir"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+
+    CHECK(apply_modes(c, ALL_MODES, sent_whole(old_d, new_d)).bad.empty());
+}
+
+// An encoded family (the POIs, encoded by geocoder-gc) beside the plain arc
+// files: the low-memory mode replays the family through its codecs and the
+// arc files as plain sections, and the new set is gc's encoding of the new
+// dir, byte for byte. The parent's diff refused the dir.
+TEST(patch_lowmem_applies_an_encoded_set_beside_plain_arc_files) {
+    ScratchDir dir("lowmem-arcs-beside");
+    std::mt19937 rng(20261103);
+    const ArcGeometry old_g = arc_geometry(rng, 60, 200);
+    ArcGeometry new_g = old_g;
+    new_g.arcs[17] = random_bytes(rng, new_g.arcs[17].size() + 4);
+    new_g.rings[20] = random_bytes(rng, new_g.rings[20].size());
+    const auto pois = pois_of(rng, 300, 0, true);
+    auto edited = pois;
+    std::fill(edited[100].block.begin() + 10, edited[100].block.end(), 0);
+    BuildDir old_d, new_d;
+    put_arc_geometry(old_d, old_g);
+    put_arc_geometry(new_d, new_g);
+    put_pois(old_d, pois);
+    put_pois(new_d, edited);
+    const LowMemCase c{dir.path(), "beside"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    REQUIRE(read_dir(c.dir("old.enc")).count("poi_records.r3") == 1);
+
+    const LogCheck whole = sent_whole(old_d, new_d);
+    CHECK(apply_both_modes(c, [&](const std::string& log) -> std::string {
+              if (log.find("encode poi:") == std::string::npos) return "no encode poi line";
+              return whole(log);
+          }).empty());
+}
+
+// arc_vertices.bin replaced whole, 1 MiB of it and 10 MiB (n arcs of a KiB,
+// every byte new), over the same 100 polygons: the patcher writes the file
+// from the patch where it sits, so its heap stays flat in every mode. The
+// parent's diff refused the dir.
+TEST(patch_heap_stays_flat_as_arc_vertices_are_replaced_whole) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::mt19937 rng(20261103);
+        const ArcGeometry old_g = arc_geometry(rng, 100, n, 1024);
+        ArcGeometry new_g = old_g;
+        for (std::vector<char>& arc : new_g.arcs) arc = random_bytes(rng, arc.size());
+        BuildDir old_d, new_d;
+        put_admin_minimal(old_d, old_g, 100);
+        put_admin_minimal(new_d, new_g, 100);
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        // The full replacement's head: file id, stride 0, old and new sizes.
+        std::vector<char> head;
+        append(head, static_cast<uint32_t>(PatchFileId::ARC_VERTICES));
+        append(head, 0u);
+        append(head, uint64_t{n} << 10);
+        append(head, uint64_t{n} << 10);
+        return patch_holds(c, head, std::to_string(n) + " KiB of arc vertices replaced whole");
+    }, 1024).empty());
+}
+
+// v14's parent-id remap is its street leg alone: one carrying v13's three
+// (an admin leg before the street leg, a postcode leg after it), empty or
+// with an admin pair, is refused in every mode, its stray words read as a
+// section for file 0, which no patch sends. The parent read three legs and
+// took the words after them as such a section. The patch as made (addresses
+// on street ways that stay) applies.
+TEST(patch_refuses_a_three_leg_parent_id_remap) {
+    ScratchDir dir("patch-three-legs");
+    BuildDir old_d, new_d, old_meta, new_meta;
+    put_moved_ways(old_d, new_d, old_meta, new_meta, 0, 50);
+    const LowMemCase c{dir.path(), "three-legs"};
+    REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    std::vector<char> street_leg;
+    for (const uint32_t w : {POI_PARENT_REMAP_MARKER, 0u}) append(street_leg, w);
+    const size_t at = find_once(raw, street_leg);
+    REQUIRE(at != std::string::npos);
+
+    struct Case {
+        std::string name;
+        std::vector<uint32_t> admin_leg;
+    };
+    const Case cases[] = {{"empty-legs", {0}}, {"an-admin-pair", {1, 3, 4}}};
+    for (const Case& e : cases) {
+        std::vector<char> edited(raw.begin(), raw.begin() + at + 4), postcode_leg;
+        for (const uint32_t w : e.admin_leg) append(edited, w);
+        edited.insert(edited.end(), raw.begin() + at + 4, raw.begin() + at + 8);
+        append(edited, 0u);
+        edited.insert(edited.end(), raw.begin() + at + 8, raw.end());
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, "Unknown file 0").empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }

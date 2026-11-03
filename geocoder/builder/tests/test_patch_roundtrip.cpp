@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <iterator>
 #include <map>
+#include <random>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -303,8 +304,8 @@ void put_identity_interps(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
     new_d["interp_postcodes.bin"] = bytes_of(std::vector<uint32_t>{NEW_C, NEW_B, NEW_D, NO_DATA});
 }
 
-// way_parents.bin of SPARSE_RECORDS admin ids, the SPARSE_CHANGES (position,
-// id) changed on the new day. With no street ways to follow, the diff sends
+// way_parents.bin of SPARSE_RECORDS admin slots, the SPARSE_CHANGES
+// (position, slot) changed on the new day. With no street ways to follow, the diff sends
 // the new file as a sparse delta.
 constexpr uint32_t SPARSE_RECORDS = 4096;
 constexpr std::pair<uint32_t, uint32_t> SPARSE_CHANGES[] = {{10, 7777}, {2000, 8888}, {4000, 9999}};
@@ -367,7 +368,7 @@ SparsePatch diff_way_parents(const std::string& root) {
     append(section, size);
     append(section, size);
     append(section, uint32_t{4});
-    append(section, uint32_t{1});
+    append(section, uint32_t{0});
     append(section, static_cast<uint32_t>(std::size(SPARSE_CHANGES)));
     // name_len, name, size, inline
     const std::string name = "way_parents.bin";
@@ -710,10 +711,9 @@ TEST(patch_diff_refuses_offset_fixups_past_the_sections_limit) {
 // A record file of more records than the diff's limit (--file-records-max,
 // FILE_RECORDS_MAX: the u32 record indices' own, lower for tests) is refused
 // before it is diffed, by its name and day, and no patch is written: street
-// ways of 2 and 3 records, either way round, under a limit of 2; their nodes
-// (8 bytes a record), 2 and 4, under 3; and the admin polygons a POI tier
-// borrows from its quality/q2.5 sibling, 3 and 2, under 2. Under 3 the ways
-// round-trip. A limit past FILE_RECORDS_MAX is refused.
+// ways of 2 and 3 records, either way round, under a limit of 2; and their
+// nodes (8 bytes a record), 2 and 4, under 3. Under 3 the ways round-trip. A
+// limit past FILE_RECORDS_MAX is refused.
 TEST(patch_diff_refuses_a_record_file_past_the_limit) {
     const NodeCoord x{10.0f, 20.0f}, y{11.0f, 21.0f}, z{12.0f, 22.0f}, w{13.0f, 23.0f};
     BuildDir two = with_pool(OLD_POOL), three = with_pool(OLD_POOL), four_nodes = with_pool(OLD_POOL);
@@ -728,16 +728,12 @@ TEST(patch_diff_refuses_a_record_file_past_the_limit) {
 
     ScratchDir dir("patch-diff-file-records");
     const std::string& root = dir.path();
-    // The diff of old_d to new_d (in root/<name>/old and new, or in their
-    // poi/major dirs with the q2.5 sibling `sibling`) under `limit`: its log
-    // when it refused, else "", and whether it wrote no patch.
-    auto refusal = [&](const std::string& name, const BuildDir& old_d, const BuildDir& new_d, const std::string& limit,
-                       const std::string& variant = "", const std::pair<BuildDir, BuildDir>& sibling = {}) {
+    // The diff of old_d to new_d (in root/<name>/old and new) under `limit`:
+    // its log when it refused, else "", and whether it wrote no patch.
+    auto refusal = [&](const std::string& name, const BuildDir& old_d, const BuildDir& new_d, const std::string& limit) {
         const std::string at = root + "/" + name, patch = at + "/p.gcpatch", log = at + "/diff.log";
-        REQUIRE(write_dir(at + "/old" + variant, old_d) && write_dir(at + "/new" + variant, new_d));
-        if (!variant.empty()) REQUIRE(write_dir(at + "/old/quality/q2.5", sibling.first) && write_dir(at + "/new/quality/q2.5", sibling.second));
-        const bool ran =
-            run({GEOCODER_DIFF_BIN, at + "/old" + variant, at + "/new" + variant, "-o", patch, "--file-records-max", limit}, log);
+        REQUIRE(write_dir(at + "/old", old_d) && write_dir(at + "/new", new_d));
+        const bool ran = run({GEOCODER_DIFF_BIN, at + "/old", at + "/new", "-o", patch, "--file-records-max", limit}, log);
         const std::vector<char> text = read_file(log);
         return std::pair(ran ? std::string() : std::string(text.begin(), text.end()), !std::filesystem::exists(patch));
     };
@@ -747,12 +743,6 @@ TEST(patch_diff_refuses_a_record_file_past_the_limit) {
     CHECK(refused_with(refusal("grows", two, three, "2"), "New street_ways.bin holds 3 records, more than the 2 a patch can index"));
     CHECK(refused_with(refusal("shrinks", three, two, "2"), "Old street_ways.bin holds 3 records, more than the 2 a patch can index"));
     CHECK(refused_with(refusal("nodes", two, four_nodes, "3"), "New street_nodes.bin holds 4 records, more than the 3 a patch can index"));
-    BuildDir poi_tier;
-    poi_tier["poi_records.bin"] = std::vector<char>(POI_RECORD_STRIDE, 0);
-    const std::pair<BuildDir, BuildDir> admins{{{"admin_polygons.bin", std::vector<char>(3 * ADMIN_POLYGON_STRIDE, 0)}},
-                                               {{"admin_polygons.bin", std::vector<char>(2 * ADMIN_POLYGON_STRIDE, 0)}}};
-    CHECK(refused_with(refusal("borrowed", poi_tier, poi_tier, "2", "/poi/major", admins),
-                       "Old admin_polygons.bin holds 3 records, more than the 2 a patch can index"));
     // Address points that aren't whole 28-byte points merge at stride 16, as
     // an empty file's do, and the patcher counts a section's records at its
     // stride: 3 old and 2 new (48 and 32 bytes, 1 point each at 28) round-trip
@@ -1126,4 +1116,116 @@ TEST(patch_diff_refuses_a_cell_index_with_a_no_data_list) {
         CHECK(!std::filesystem::exists(patch));
         CHECK(round_trip(old_d, new_d).mismatches.empty());
     }
+}
+
+namespace {
+
+// A dir's admin geometry files as the builder lays them out: a 24-byte record
+// per polygon of keys (name and area the key) whose ring_offset and
+// ring_bytes name its ring block in admin_rings.bin, of 8 + key % 5 bytes,
+// and n_arcs arc blocks of 16 + i % 7 bytes in arc_vertices.bin at the u32
+// offsets of arc_index.bin. The blocks' bytes come from seed: the patch tools
+// read none of them.
+BuildDir admin_geometry(const std::vector<uint32_t>& keys, uint32_t n_arcs, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::vector<AdminPolygon> records;
+    std::vector<char> rings, index, arcs;
+    for (const uint32_t key : keys) {
+        AdminPolygon p{};
+        p.ring_offset = static_cast<uint32_t>(rings.size());
+        p.ring_bytes = 8 + key % 5;
+        p.name_id = key;
+        p.admin_level = 8;
+        p.area = static_cast<float>(key);
+        records.push_back(p);
+        for (uint32_t b = 0; b < p.ring_bytes; b++) rings.push_back(static_cast<char>(rng()));
+    }
+    for (uint32_t i = 0; i < n_arcs; i++) {
+        append(index, static_cast<uint32_t>(arcs.size()));
+        for (uint32_t b = 0; b < 16 + i % 7; b++) arcs.push_back(static_cast<char>(rng()));
+    }
+    return {{"admin_polygons.bin", bytes_of(records)}, {"admin_rings.bin", rings}, {"arc_index.bin", index}, {"arc_vertices.bin", arcs}};
+}
+
+// Ten polygons by key.
+const std::vector<uint32_t> POLYGON_KEYS = {10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
+
+}  // namespace
+
+// GCPATCH v14: the four admin geometry files travel whole, each a full
+// replacement or, unchanged, COPY_OLD: the new day's ring and arc bytes
+// differ (another seed, and an arc more) while its records are the old
+// day's. The parent refused the arc files' dir: no patch section named
+// admin_rings.bin.
+TEST(patch_round_trip_sends_the_admin_geometry_files_whole) {
+    const BuildDir old_d = admin_geometry(POLYGON_KEYS, 40, 1), new_d = admin_geometry(POLYGON_KEYS, 41, 2);
+    REQUIRE(old_d.at("admin_polygons.bin") == new_d.at("admin_polygons.bin"));
+
+    const RoundTrip r = round_trip(old_d, new_d);
+
+    CHECK(r.mismatches.empty());
+    CHECK(logged(r, "admin_polygons.bin: unchanged (copy old, " + std::to_string(new_d.at("admin_polygons.bin").size())));
+    for (const char* name : {"admin_rings.bin", "arc_index.bin", "arc_vertices.bin"})
+        CHECK(logged(r, std::string(name) + ": full replace " + std::to_string(new_d.at(name).size()) + " bytes"));
+    CHECK(!logged(r, "admin_polygons.bin: seq="));
+}
+
+// No admin geometry file is merged by its records, so none counts against
+// the diff's record limit (--file-records-max): ten admin polygons and 40
+// arcs (160 bytes of arc index, 6 records at the admin stride, at which the
+// postal polygons' id 26 merged), and the new day's three over 41, round-trip
+// under a limit of 1. The parent refused the old admin polygons' 10 records.
+TEST(patch_diff_merges_no_admin_geometry_file_by_its_records) {
+    const BuildDir old_d = admin_geometry(POLYGON_KEYS, 40, 1), new_d = admin_geometry({10, 11, 12}, 41, 2);
+
+    const RoundTrip r = round_trip(old_d, new_d, {}, {"--file-records-max", "1"});
+
+    CHECK(r.mismatches.empty());
+    CHECK(!logged(r, "a patch can index"));
+}
+
+// Admin polygons keep their slots, so no file is remapped by admin polygon
+// content: a polygon new at slot 0 that moves the old ones' content up a
+// slot (the slots of a cold start) leaves the POIs' and places' parent slots
+// and the admin cell index's ids as they are. The POIs and places the new day
+// keeps MATCH, and the admin index's delta changes no cell. The parent's
+// admin merge moved both old polygons up a slot (an INSERT, then two MATCHes),
+// and every POI, place and index id with them.
+TEST(patch_round_trip_moves_no_admin_slot_by_admin_polygon_content) {
+    auto day = [](const std::vector<uint32_t>& keys, const std::vector<uint32_t>& poi_parents, const std::vector<uint32_t>& place_parents) {
+        BuildDir d = admin_geometry(keys, 0, 7);
+        d.erase("admin_rings.bin");
+        d.erase("arc_index.bin");
+        d.erase("arc_vertices.bin");
+        std::vector<PoiRecord> pois;
+        for (size_t i = 0; i < poi_parents.size(); i++) {
+            PoiRecord p = poi(NO_DATA);
+            p.lat = 48.0f + static_cast<float>(i) * 1e-3f;
+            p.parent_poly_id = poi_parents[i];
+            pois.push_back(p);
+        }
+        std::vector<PlaceNode> places;
+        for (size_t i = 0; i < place_parents.size(); i++) {
+            PlaceNode p = place(NO_DATA);
+            p.lat = 48.0f + static_cast<float>(i) * 1e-3f;
+            p.parent_poly_id = place_parents[i];
+            places.push_back(p);
+        }
+        d["poi_records.bin"] = bytes_of(pois);
+        d["place_nodes.bin"] = bytes_of(places);
+        put_cell_index(d, "admin", {0, 1});
+        return d;
+    };
+    const BuildDir old_d = day({10, 11}, {0, 1}, {1}), new_d = day({9, 10, 11}, {0, 1, 1}, {1, 0});
+    const CellLists lists = {{CELL, {0, 1}}};
+    std::vector<char> unchanged_index;
+    append_cell_list_delta(unchanged_index, lists, lists);
+
+    const RoundTrip r = round_trip(old_d, new_d);
+
+    CHECK(r.mismatches.empty());
+    CHECK_EQ(merge_records(r, "poi_records.bin"), std::string("m/i/d/r=2/1/0/0"));
+    CHECK_EQ(merge_records(r, "place_nodes.bin"), std::string("m/i/d/r=1/1/0/0"));
+    CHECK(logged(r, "admin_entries.bin: cell index delta (" + std::to_string(unchanged_index.size()) + " bytes)"));
+    CHECK(logged(r, "admin_polygons.bin: full replace " + std::to_string(new_d.at("admin_polygons.bin").size()) + " bytes"));
 }

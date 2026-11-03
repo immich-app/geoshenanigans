@@ -187,7 +187,7 @@ static void fixup_way_offsets(char* old_ways, size_t old_ways_size,
         old_ways, new_ways, stride, 0);
 }
 
-// v15 admin/POI vertex_offset fixup. Identifies polygons across builds
+// v15 POI / address vertex_offset fixup. Identifies polygons across builds
 // by (name_id, level, cc, vert_count, hash-of-vertex-bytes) and rewrites
 // the old polygon's vert_offset to match the new build's byte offset.
 // After this pass, unchanged polygons have byte-identical records, so
@@ -204,7 +204,7 @@ static void fixup_way_offsets(char* old_ways, size_t old_ways_size,
 // byte-identical (see fixup_way_offsets): the content-hash match can
 // otherwise rewrite an unchanged polygon's vert_offset to a colliding
 // polygon's offset, perturbing OLD and producing spurious non-identity
-// id_remaps / admin_ and addr_entries corrections on same-build diffs.
+// id_remaps / poi_ and addr_entries corrections on same-build diffs.
 static bool v15_fixup_skipped(const char* old_polys, size_t old_polys_size,
                               const char* old_verts, size_t old_verts_size,
                               const char* new_polys, size_t new_polys_size,
@@ -598,9 +598,7 @@ static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r, 
     // perturb the byte-merge into emitting ops for a file that is in fact
     // identical (addr_vertices / street_nodes were byte-equal yet encoded
     // ~0.1 MiB each on a same-PBF planet diff). Skipped automatically when
-    // either file isn't present at <dir>/<name> (mmap returns null); admin_*
-    // live at a fallback path during apply but the diff still finds them under
-    // old_dir/new_dir here, so they DO participate.
+    // either file isn't present at <dir>/<name> (mmap returns null).
     if (!old_dir.empty() &&
         try_emit_copy_old(patch, static_cast<uint32_t>(r.id),
                           old_dir + "/" + r.name, new_dir + "/" + r.name,
@@ -727,10 +725,9 @@ static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uin
 }
 
 // Where a variant without its own street ways and nodes (the admin and POI
-// variants) or admin polygons and vertices (the POI tiers) borrows its
-// sibling's, in the order tried (try_load_with_fallback).
+// variants) borrows its sibling's, in the order tried
+// (try_load_with_fallback).
 static constexpr std::initializer_list<const char*> FULL_SIBLINGS = {"../full/", "../../full/"};
-static constexpr std::initializer_list<const char*> Q25_SIBLINGS = {"../../quality/q2.5/", "../quality/q2.5/"};
 
 // The stride addr_points.bin merges at, by its size: an empty or absent one,
 // or one that isn't whole address points, goes out as stride 16, as patches
@@ -745,7 +742,9 @@ static size_t fixed_stride(uint64_t) {
 
 // The record files the merges read, by the stride their merge sections give
 // for a new file of its size (a byte stream's is 1, a node's lat and lng 8),
-// and the siblings a variant without its own borrows them from.
+// and the siblings a variant without its own borrows them from. The admin
+// geometry files go whole (ADMIN_GEOMETRY_FILES), so no record index of
+// theirs reaches a patch.
 struct MergedFile {
     PatchFileId id;
     size_t (*stride_of)(uint64_t new_size);
@@ -758,13 +757,9 @@ static constexpr MergedFile MERGED_FILES[] = {
     {PatchFileId::INTERP_NODES, fixed_stride<8>, {}},
     {PatchFileId::ADDR_POINTS, addr_points_stride, {}},
     {PatchFileId::ADDR_VERTICES, fixed_stride<1>, {}},
-    {PatchFileId::ADMIN_POLYGONS, fixed_stride<ADMIN_POLYGON_STRIDE>, Q25_SIBLINGS},
-    {PatchFileId::ADMIN_VERTICES, fixed_stride<1>, Q25_SIBLINGS},
     {PatchFileId::POI_RECORDS, fixed_stride<POI_RECORD_STRIDE>, {}},
     {PatchFileId::POI_VERTICES, fixed_stride<1>, {}},
     {PatchFileId::PLACE_NODES, fixed_stride<PLACE_NODE_STRIDE>, {}},
-    {PatchFileId::POSTAL_POLYGONS, fixed_stride<ADMIN_POLYGON_STRIDE>, {}},
-    {PatchFileId::POSTAL_VERTICES, fixed_stride<1>, {}},
 };
 
 static int run(int argc, char* argv[]) {
@@ -847,14 +842,10 @@ static int run(int argc, char* argv[]) {
         if (m.size > 0 || m.data != nullptr) return m;
         return mmap_file(dir + "/../../full/" + fname);
     };
-    // Generic fallback loader for shared-across-variants files. Used so
-    // t_admin/t_street can compute the parent-id remap that t_poi needs
-    // even when geocoder-diff is invoked on a per-variant subdir
-    // (e.g. <region>/poi/<tier>/) where admin_polygons.bin lives in
-    // <region>/quality/q2.5/ and street_ways.bin lives in <region>/full/.
-    // Returns the load path on success (so caller can detect fallback
-    // and suppress emitting a merge section that would target the
-    // wrong output directory).
+    // Fallback loader for street_ways.bin, which a variant subdir without
+    // its own (e.g. <region>/poi/<tier>/) finds in <region>/full/. Returns
+    // whether it fell back, so the caller can suppress emitting a merge
+    // section that would target the wrong output directory.
     auto try_load_with_fallback = [&](const std::string& dir, const char* fname,
                                        std::initializer_list<const char*> fallbacks)
             -> std::pair<MappedFile, bool> {
@@ -918,7 +909,6 @@ static int run(int argc, char* argv[]) {
 
     const size_t way_stride = WAY_HEADER_STRIDE;
     const size_t interp_stride = INTERP_WAY_STRIDE;
-    const size_t admin_stride = ADMIN_POLYGON_STRIDE;
     const size_t poi_stride = POI_RECORD_STRIDE;
     const size_t place_stride = PLACE_NODE_STRIDE;
 
@@ -980,27 +970,21 @@ static int run(int argc, char* argv[]) {
     }
 
     SEC("after_strings");
-    // Build merge sequences for all data files in parallel (4 groups)
+    // Build merge sequences for all data files in parallel
     // Group 1: addr_points (independent)
     // Group 2: street_ways → street_nodes (sequential within group)
     // Group 3: interp_ways → interp_nodes (sequential within group)
-    // Group 4: admin_polygons → admin_vertices (sequential within group)
-    FileMergeResult res_addr, res_addr_v, res_ways, res_nodes, res_interp_w, res_interp_n, res_admin_p, res_admin_v, res_poi_r, res_poi_v, res_place_n;
+    FileMergeResult res_addr, res_addr_v, res_ways, res_nodes, res_interp_w, res_interp_n, res_poi_r, res_poi_v, res_place_n;
 
     // Byte-block merge for the v15 variable-stride vertex stream
-    // (admin_vertices / poi_vertices / addr_vertices / postal_vertices). The
-    // vertex bytes for polygon i live at the polygon's `vertex_offset` and
-    // run until the next polygon's `vertex_offset` (or end-of-file for the
-    // last). Replaces the previous "emit the whole new file as raw" path
-    // that made every quality patch ~size-of-file.
+    // (poi_vertices / addr_vertices). The vertex bytes for polygon i live
+    // at the polygon's `vertex_offset` and run until the next polygon's
+    // `vertex_offset` (or end-of-file for the last).
     //
-    // Correctness depends on: (a) simplification being deterministic
-    // (verified — the existing patch verify is byte-identical), and
-    // (b) polygon byte blocks landing at the same byte offset in old
-    // and new admin_vertices when the polygon record is a MATCH in
-    // the parent sequence (verified by the same byte-identical pass —
-    // if blocks shifted, MATCH polygons in admin_polygons.bin would
-    // have stale vertex_offset values).
+    // Correctness depends on polygon byte blocks landing at the same byte
+    // offset in old and new vertices when the polygon record is a MATCH in
+    // the parent sequence (verified by the byte-identical patch verify — if
+    // blocks shifted, MATCH records would have stale vertex_offset values).
     //
     // off_field_pos: byte offset of vertex_offset on the parent record.
     auto build_vertex_byte_merge = [](const MergeSequence& parent_seq,
@@ -1059,13 +1043,10 @@ static int run(int argc, char* argv[]) {
     double merge_start = now_ms();
     std::cerr << "Building merge sequences (parallel)..." << std::endl;
 
-    // t_poi needs the full admin + street id_remaps to rewrite old
-    // PoiRecord parent ids before pr_seq is built. t_admin and t_street
-    // signal completion via these promises so t_poi can run in parallel
-    // with t_addr / t_interp / t_place / t_cells (only blocking on the
-    // narrow window where the remaps are consumed).
-    std::promise<void> admin_remap_ready, street_remap_ready;
-    std::shared_future<void> admin_remap_future = admin_remap_ready.get_future().share();
+    // t_addr rewrites old addresses' parent_way_id through the street
+    // id_remap before its merge; t_street signals it ready so t_addr runs
+    // alongside it up to there.
+    std::promise<void> street_remap_ready;
     std::shared_future<void> street_remap_future = street_remap_ready.get_future().share();
 
     // Group 1: addr_points (old=COW mmap for string remap, new=read-only mmap)
@@ -1185,7 +1166,7 @@ static int run(int argc, char* argv[]) {
         // polygons share a byte position in BOTH old and new), DELETE
         // parent slots drop their old block, INSERT parent slots emit
         // new block bytes. Mirrors build_vertex_byte_merge usage for
-        // admin_vertices and poi_vertices.
+        // poi_vertices.
         if (addr_stride >= 28) {
             // Restore old's original vertex_offsets so build_vertex_byte_merge
             // reads each polygon's old block from the *original* byte
@@ -1377,97 +1358,7 @@ static int run(int argc, char* argv[]) {
         log_rss("interp");
     });
 
-    // Group 4: admin_polygons → admin_vertices
-    bool admin_from_fallback = false;
-    std::thread t_admin([&]() {
-        double gs = now_ms();
-        auto [old_data, old_fb] = try_load_with_fallback_rw(old_dir, "admin_polygons.bin", Q25_SIBLINGS);
-        auto [new_data, new_fb] = try_load_with_fallback_rw(new_dir, "admin_polygons.bin", Q25_SIBLINGS);
-        admin_from_fallback = (old_fb || new_fb);
-        // Zero only actual padding bytes (14-15), preserve place_type_override at byte 13
-        for (size_t i = 0; i + admin_stride <= old_data.size; i += admin_stride)
-            memset(old_data.data + i + 14, 0, 2);
-        for (size_t i = 0; i + admin_stride <= new_data.size; i += admin_stride)
-            memset(new_data.data + i + 14, 0, 2);
-        remap_string_fields(old_data.data, old_data.size, PatchFileId::ADMIN_POLYGONS, admin_stride, str_remap);
-        // admin_vertices.bin lives next to admin_polygons.bin in every
-        // build mode, so it follows the same fallback resolution.
-        auto [old_v, _ov_fb] = try_load_with_fallback(old_dir, "admin_vertices.bin", Q25_SIBLINGS);
-        auto [new_v, _nv_fb] = try_load_with_fallback(new_dir, "admin_vertices.bin", Q25_SIBLINGS);
-        madvise(const_cast<char*>(old_v.data), old_v.size, MADV_SEQUENTIAL);
-        madvise(const_cast<char*>(new_v.data), new_v.size, MADV_SEQUENTIAL);
-        size_t n = old_data.size / admin_stride;
-        std::vector<uint32_t> old_offsets(n);
-        for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_data.data + i * admin_stride, 4);
-        // v15-aware fixup: rewrite old polygon vertex_offset to match
-        // the new build's byte offset for the same logical polygon.
-        // After this pass, unchanged polygons have byte-identical
-        // records, so build_merge_seq classifies them as MATCH —
-        // which is what build_vertex_byte_merge needs to emit
-        // efficient byte-stream MATCH ops below.
-        fixup_v15_offsets(old_data.data, old_data.size, old_v.data, old_v.size,
-                          new_data.data, new_data.size, new_v.data, new_v.size,
-                          admin_stride, /*off_field_pos=*/0,
-                          [](const char* rec) -> uint64_t {
-                              uint32_t name_id; memcpy(&name_id, rec + 8, 4);
-                              uint8_t level = static_cast<uint8_t>(rec[12]);
-                              uint16_t cc; memcpy(&cc, rec + 20, 2);
-                              uint32_t vert_count; memcpy(&vert_count, rec + 4, 4);
-                              uint64_t k = ((uint64_t)name_id << 24) | ((uint64_t)level << 16) | cc;
-                              return k ^ ((uint64_t)vert_count << 40);
-                          });
-        auto fixups = collect_offset_fixups(old_offsets, old_data.data, admin_stride, 0);
-        auto ap_seq = build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, admin_stride);
-        auto soft = secondary_match_from_merge(ap_seq, old_data.data, old_data.size, new_data.data, new_data.size, admin_stride,
-            [](const char* rec) -> uint64_t {
-                uint32_t name_id; memcpy(&name_id, rec + 8, 4);
-                uint8_t level = static_cast<uint8_t>(rec[12]);
-                uint16_t cc; memcpy(&cc, rec + 20, 2);
-                return ((uint64_t)name_id << 24) | ((uint64_t)level << 16) | cc;
-            });
-        // Populate id_remap up-front so t_poi can consume the full
-        // primary+secondary admin remap before pr_seq is built.
-        auto admin_id_rm = derive_id_remap_from_merge(ap_seq, old_data.size / admin_stride, admin_stride);
-        for (auto& [o,n] : soft) if (o < admin_id_rm.size()) admin_id_rm[o] = n;
-        res_admin_p = {PatchFileId::ADMIN_POLYGONS, "admin_polygons.bin", admin_stride,
-                       old_data.size, new_data.size, ap_seq, std::move(fixups), std::move(soft), std::move(admin_id_rm)};
-        log_merge(res_admin_p);
-        // Signal t_poi that res_admin_p.id_remap is ready. Vertex merge
-        // below restores byte 0 of each old record but t_poi only reads
-        // res_admin_p.id_remap which is already populated.
-        admin_remap_ready.set_value();
-        // Restore original old vertex_offsets — build_vertex_byte_merge
-        // reads each polygon's bytes from old_v at the *original* old
-        // offset, not the post-fixup new offset. (build_merge_seq above
-        // used the fixed-up offsets to find MATCH runs.)
-        for (size_t i = 0; i < n; i++) memcpy(old_data.data + i * admin_stride, &old_offsets[i], 4);
-        // Skip the vertex byte-block merge entirely when admin came from
-        // fallback — its output goes straight into the suppression block
-        // below, so emitting it just wastes a few hundred MiB of memory
-        // (av_seq holds INSERT data for every changed block) and a few
-        // seconds of CPU per parallel poi diff.
-        if (admin_from_fallback) {
-            res_admin_p.seq = MergeSequence{};
-            res_admin_p.old_size = 0;
-            res_admin_p.new_size = 0;
-            res_admin_p.fixups = {};
-            res_admin_v = {PatchFileId::ADMIN_VERTICES, "admin_vertices.bin", 1,
-                           0, 0, MergeSequence{}, {}, {}, {}};
-            log_merge(res_admin_v);
-        } else {
-            auto av_seq = build_vertex_byte_merge(ap_seq,
-                old_data.data, old_data.size, new_data.data, new_data.size,
-                old_v.data, old_v.size, new_v.data, new_v.size, admin_stride, 0);
-            res_admin_v = {PatchFileId::ADMIN_VERTICES, "admin_vertices.bin", 1,
-                           old_v.size, new_v.size, std::move(av_seq), {}, {}, {}};
-            log_merge(res_admin_v);
-        }
-        unmap_file(old_data); unmap_file(new_data); unmap_file(old_v); unmap_file(new_v);
-        log_time("  group:admin", gs);
-        log_rss("admin");
-    });
-
-    // Group 5: poi_records → poi_vertices (may not exist in old builds)
+    // Group 4: poi_records → poi_vertices (may not exist in old builds)
     std::thread t_poi([&]() {
         double gs = now_ms();
         auto old_data = mmap_file_rw(old_dir + "/poi_records.bin");
@@ -1486,30 +1377,11 @@ static int run(int argc, char* argv[]) {
         //   byte 24 = parent_street_id  (string offset of nearest street name)
         //   byte 28 = parent_postcode_id(string offset of POI postcode)
         // All three are string-pool offsets and shift day-over-day exactly
-        // like name_id, so they get the same str_remap. (Previously bytes
-        // 24/28 were wrongly remapped via the way-index / postcode-centroid
-        // tables — see the parent-id block below, now removed.)
+        // like name_id, so they get the same str_remap. Byte 32
+        // (parent_poly_id) is an admin slot, which a polygon keeps.
         const bool unchanged = sent_unchanged(old_data.data, old_data.size, new_data.data, new_data.size);
         if (old_data.size > 0)
             remap_string_fields(old_data.data, old_data.size, PatchFileId::POI_RECORDS, poi_stride, str_remap);
-
-        // Remap old PoiRecord parent ids into the new build's id-space so
-        // unchanged POIs don't differ day-over-day (otherwise pr_seq
-        // classifies most POIs as INSERT/DELETE and the byte-block walker
-        // emits INSERT for nearly every vertex block):
-        //   bytes 16/24/28 (name_id, parent_street_id, parent_postcode_id)
-        //     — string offsets, already remapped via str_remap above.
-        //   byte 32 (parent_poly_id) — admin polygon index, remapped below.
-        // Block on t_admin so the admin remap is ready before fixup runs.
-        admin_remap_future.wait();
-        street_remap_future.wait();
-
-        // Parent-poly remap: byte 32 (parent_poly_id) is a genuine admin
-        // polygon index and must be remapped from the old build's admin
-        // id-space into the new one. (Bytes 24/28 are string offsets,
-        // handled by str_remap above — NOT here.)
-        if (old_data.size > 0)
-            remap_id_field(old_data.data, old_data.size, poi_stride, 32, res_admin_p.id_remap);
 
         auto old_v = mmap_file(old_dir + "/poi_vertices.bin");
         auto new_v = mmap_file(new_dir + "/poi_vertices.bin");
@@ -1519,7 +1391,6 @@ static int run(int argc, char* argv[]) {
         std::vector<uint32_t> old_offsets(n);
         for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_data.data + i * poi_stride + 8, 4);
         // v15-aware fixup: PoiRecord's vertex_offset lives at byte 8.
-        // Same byte-block hash strategy as admin polygons.
         if (old_data.size > 0 && new_data.size > 0 && !unchanged) {
             fixup_v15_offsets(old_data.data, old_data.size, old_v.data, old_v.size,
                               new_data.data, new_data.size, new_v.data, new_v.size,
@@ -1545,7 +1416,7 @@ static int run(int argc, char* argv[]) {
                      old_data.size, new_data.size, pr_seq, std::move(fixups), std::move(soft), {}};
         log_merge(res_poi_r);
         // Byte-block delta over poi_vertices.bin — same shape as the
-        // admin_vertices path. Restore original old vert_offsets first
+        // addr_vertices path. Restore original old vert_offsets first
         // (build_vertex_byte_merge reads each POI's bytes from old_v
         // at the *original* old offset; build_merge_seq above used the
         // fixed-up offsets to find MATCH runs).
@@ -1566,7 +1437,7 @@ static int run(int argc, char* argv[]) {
         log_rss("poi");
     });
 
-    // Group 6: cell changes
+    // Group 5: cell changes
     std::vector<uint64_t> g_added, g_removed, a_added, a_removed, p_added, p_removed;
     std::thread t_cells([&]() {
         double gs = now_ms();
@@ -1585,7 +1456,7 @@ static int run(int argc, char* argv[]) {
         log_time("  group:cell_changes", gs);
     });
 
-    // Group 7: place_nodes (no child files, simple fixed-stride merge)
+    // Group 6: place_nodes (no child files, simple fixed-stride merge)
     std::thread t_place([&]() {
         double gs = now_ms();
         auto old_data = mmap_file_rw(old_dir + "/place_nodes.bin");
@@ -1599,18 +1470,10 @@ static int run(int argc, char* argv[]) {
             return;
         }
         const bool unchanged = sent_unchanged(old_data.data, old_data.size, new_data.data, new_data.size);
-        // String remap on name_id field (offset 8)
+        // String remap on name_id field (offset 8); parent_poly_id (byte 16)
+        // is an admin slot, which a polygon keeps.
         if (old_data.size > 0)
             remap_string_fields(old_data.data, old_data.size, PatchFileId::PLACE_NODES, place_stride, str_remap);
-        // parent_poly_id (byte 16-19) is a
-        // foreign id into admin_polygons.bin and shifts day-over-day with
-        // the admin id-space. Without rewriting it the merge sees
-        // byte-different records for every place_node whose claiming
-        // boundary's polygon id moved.
-        if (old_data.size > 0) {
-            admin_remap_future.wait();
-            remap_id_field(old_data.data, old_data.size, place_stride, 16, res_admin_p.id_remap);
-        }
         // Positional merge: strategy-2 keeps each place in its slot, so the
         // files are in slot order, not (type, name, lat, lng) order. The
         // key-sorted merge this replaced re-sent nearly the whole file daily
@@ -1628,7 +1491,7 @@ static int run(int argc, char* argv[]) {
         log_rss("place");
     });
 
-    t_addr.join(); t_street.join(); t_interp.join(); t_admin.join(); t_poi.join(); t_place.join(); t_cells.join();
+    t_addr.join(); t_street.join(); t_interp.join(); t_poi.join(); t_place.join(); t_cells.join();
     log_time("All merge sequences + cell changes built", merge_start);
     // str_remap is kept alive for emit_sparse_delta below — it consumes
     // the map directly to decide which addr_postcodes / way_postcodes /
@@ -1639,75 +1502,20 @@ static int run(int argc, char* argv[]) {
     // first_diff=267889).
     log_rss("merge phase");
 
-    // Parent-id remap section. Emitted FIRST so it's loaded before any
-    // merge section that consumes it during MATCH replay:
-    //   - addr_points.bin: byte 16 parent_way_id (uses street pairs)
-    //   - poi_records.bin: bytes 24/28/32 (street/postcode/admin pairs)
-    //   - place_nodes.bin: byte 16 parent_poly_id (uses admin pairs)
-    //   - way_parents/admin_parents (sparse delta, admin id remap)
-    //   - way_postcodes/addr_postcodes (sparse delta, string remap)
-    //   - postcode_centroids (sparse delta, string remap on postcode_id)
-    // Previous ordering emitted this AFTER addr_points, so addr_points'
-    // pw remap saw an empty poi_street_remap → every addr_point that
-    // matched via the street-shifted secondary path kept its OLD
-    // parent_way_id in the verify output, producing byte mismatches
-    // like the oceania/south-america addr_points failures we saw.
-    // Without this section, files that reference foreign IDs that
-    // shift day-over-day classify nearly every record as DELETE+INSERT
-    // (e.g. planet/full's addr_points was 4.89 GiB emitted as INSERT —
-    // the entire file). Quality/postal-only variants skip the marker
-    // entirely so they don't carry hundreds of MiB of remap pairs they'll
-    // never apply.
-    bool has_poi = res_poi_r.old_size > 0 || res_poi_r.new_size > 0;
-    bool has_place = res_place_n.old_size > 0 || res_place_n.new_size > 0;
-    bool has_addr = res_addr.old_size > 0 || res_addr.new_size > 0;
-    // Sparse-delta files also need the remap pairs to reconstruct the
-    // old → new id mapping during replay.
-    auto sparse_file_present = [&](const char* fname) -> bool {
-        struct stat st;
-        return stat((new_dir + "/" + fname).c_str(), &st) == 0;
-    };
-    bool has_sparse_delta_files =
-        sparse_file_present("way_parents.bin")    ||
-        sparse_file_present("way_postcodes.bin")  ||
-        sparse_file_present("addr_postcodes.bin") ||
-        sparse_file_present("admin_parents.bin")  ||
-        sparse_file_present("postcode_centroids.bin");
-    bool has_admin_entries = sparse_file_present("admin_entries.bin");
-    bool street_pairs_in_parent_remap = false;
+    // The parent-id remap: the street ways' moved pairs, which the patcher
+    // needs before the street ways' section, as the street replay's remap
+    // they complete is what the address replay moves parent_way_id by. A dir
+    // without address points sends them in the secondary remap instead.
+    // Without it, every address on a moved way would differ day over day
+    // (planet/full's addr_points was 4.89 GiB emitted as INSERT once).
+    const bool has_addr = res_addr.old_size > 0 || res_addr.new_size > 0;
     const std::unordered_map<uint32_t, uint32_t> no_pairs;
-    if (has_poi || has_place || has_addr || has_sparse_delta_files || has_admin_entries) {
+    if (has_addr) {
         SEC("poi_parent_remap");
         uint32_t marker = POI_PARENT_REMAP_MARKER;
         wval(patch, &marker, 4);
-        auto emit_pairs = [&](const std::vector<uint32_t>& rm) {
-            uint32_t n_pairs = 0;
-            for (uint32_t i = 0; i < rm.size(); i++)
-                if (rm[i] != NO_DATA && rm[i] != i) n_pairs++;
-            wval(patch, &n_pairs, 4);
-            for (uint32_t i = 0; i < rm.size(); i++) {
-                if (rm[i] != NO_DATA && rm[i] != i) {
-                    uint32_t o = i, nn = rm[i];
-                    wval(patch, &o, 4);
-                    wval(patch, &nn, 4);
-                }
-            }
-            return n_pairs;
-        };
-        uint32_t na = emit_pairs(res_admin_p.id_remap);
-        // v8: the patcher derives the street remap from the street_ways
-        // replay (sent before addr_points) and gets only the pairs no MATCH /
-        // REPLACE run gives: the moved (or secondary-matched) ways.
-        uint32_t ns = append_remap_pairs(patch, has_addr ? res_ways.secondary_matches : no_pairs);
-        street_pairs_in_parent_remap = has_addr;
-        // Reserved postcode leg: never populated (parent_postcode_id holds a
-        // string offset, remapped via str_remap, not a centroid index). Kept
-        // as a literal 0 on the wire for format compatibility.
-        uint32_t np = 0;
-        wval(patch, &np, 4);
-        std::cerr << "  POI parent-id remap: admin_pairs=" << na
-                  << " street_pairs=" << ns
-                  << " postcode_pairs=" << np << std::endl;
+        const uint32_t ns = append_remap_pairs(patch, res_ways.secondary_matches);
+        std::cerr << "  POI parent-id remap: street_pairs=" << ns << std::endl;
     }
 
     // Serialize merge results to patch in canonical order, freeing as we go.
@@ -1729,9 +1537,6 @@ static int run(int argc, char* argv[]) {
         serialize_merge(patch, res_addr_v, old_dir, new_dir, patcher_strings, offset_fixup_limits);
         { std::vector<char>().swap(res_addr_v.seq.data); }
     }
-    serialize_merge(patch, res_admin_p, old_dir, new_dir, patcher_strings, offset_fixup_limits);
-    serialize_merge(patch, res_admin_v, old_dir, new_dir, patcher_strings, offset_fixup_limits);
-    { std::vector<char>().swap(res_admin_v.seq.data); }
     serialize_merge(patch, res_poi_r, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     serialize_merge(patch, res_poi_v, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     { std::vector<char>().swap(res_poi_v.seq.data); }
@@ -1742,18 +1547,10 @@ static int run(int argc, char* argv[]) {
 
     // ID remaps were pre-computed in the parallel merge groups.
     // Cell changes were computed in parallel with merge groups.
-    // Just need to compute admin remap (small, kept as hash map).
+    // Just need to compute the POI remap (kept as hash map).
     auto& w_rm_v = res_ways.id_remap;
     auto& a_rm_v = res_addr.id_remap;
     auto& i_rm_v = res_interp_w.id_remap;
-    // The admin leg of the parent-id remap, which is what the patcher
-    // rebuilds admin_entries from: the full remap even for variants whose
-    // polygons live in quality/q2.5, so applying needs no sibling.
-    std::unordered_map<uint32_t,uint32_t> ad_rm_d;
-    for (uint32_t i = 0; i < res_admin_p.id_remap.size(); i++) {
-        uint32_t n = res_admin_p.id_remap[i];
-        if (n != NO_DATA && n != i) ad_rm_d[i] = n;
-    }
     std::unordered_map<uint32_t,uint32_t> poi_rm_d;
     if (res_poi_r.old_size > 0 || res_poi_r.new_size > 0) {
         auto vec = derive_id_remap_from_merge(
@@ -1764,7 +1561,7 @@ static int run(int argc, char* argv[]) {
             if (vec[i] != NO_DATA) poi_rm_d[i] = vec[i];
         for (auto& [o,n] : res_poi_r.secondary_matches) poi_rm_d[o] = n;
     }
-    log_time("Admin+POI remap", t0);
+    log_time("POI remap", t0);
 
     // old_geo no longer needed as a vector — streaming corrections use mmap directly
 
@@ -1787,7 +1584,6 @@ static int run(int argc, char* argv[]) {
     std::cerr << "  Secondary matches: ways=" << res_ways.secondary_matches.size()
               << " addr=" << res_addr.secondary_matches.size()
               << " interp=" << res_interp_w.secondary_matches.size()
-              << " admin=" << res_admin_p.secondary_matches.size()
               << " poi=" << res_poi_r.secondary_matches.size() << std::endl;
     SEC("secondary_remap");
     { uint32_t marker = SECONDARY_REMAP_MARKER; wval(patch, &marker, 4);
@@ -1796,10 +1592,9 @@ static int run(int argc, char* argv[]) {
           wval(patch, &file, 4);
           append_remap_pairs(patch, rm);
       };
-      // Admin pairs travel in the parent-id remap instead.
       uint32_t n_files = 4; wval(patch, &n_files, 4);
       // v8: street pairs already went in the parent-id remap.
-      emit_remap(PatchFileId::STREET_WAYS, street_pairs_in_parent_remap ? no_pairs : res_ways.secondary_matches);
+      emit_remap(PatchFileId::STREET_WAYS, has_addr ? no_pairs : res_ways.secondary_matches);
       emit_remap(PatchFileId::ADDR_POINTS, res_addr.secondary_matches);
       emit_remap(PatchFileId::INTERP_WAYS, res_interp_w.secondary_matches);
       emit_remap(PatchFileId::POI_RECORDS, res_poi_r.secondary_matches);
@@ -1812,9 +1607,7 @@ static int run(int argc, char* argv[]) {
     double t1 = now_ms();
 
     // Free merge sequences (already serialized to patch)
-    { std::vector<char>().swap(res_admin_p.seq.data);
-      std::vector<char>().swap(res_nodes.seq.data); std::vector<char>().swap(res_interp_n.seq.data);
-      std::vector<char>().swap(res_admin_v.seq.data);
+    { std::vector<char>().swap(res_nodes.seq.data); std::vector<char>().swap(res_interp_n.seq.data);
       std::vector<char>().swap(res_poi_r.seq.data); std::vector<char>().swap(res_poi_v.seq.data);
       std::vector<char>().swap(res_place_n.seq.data); }
 
@@ -1864,9 +1657,10 @@ static int run(int argc, char* argv[]) {
     log_rss("geo corrections");
 
     // The delta from a cell index as the patcher rebuilds it from an id remap
-    // (admin / POI) to the new one, for every index the old or the new
-    // dir holds. The patcher writes write_cell_lists layout: a new index in
-    // any other can't be rebuilt, and the diff never silently falls back.
+    // to the new one, for every index the old or the new dir holds. Admin
+    // polygons keep their slots, so the admin index's remap is the identity.
+    // The patcher writes write_cell_lists layout: a new index in any other
+    // can't be rebuilt, and the diff never silently falls back.
     auto emit_cell_index_delta = [&](PatchFileId entries_fid, const std::string& prefix,
                                      const std::unordered_map<uint32_t,uint32_t>& rm,
                                      const std::vector<uint64_t>& added, const std::vector<uint64_t>& removed) {
@@ -1888,7 +1682,7 @@ static int run(int argc, char* argv[]) {
         patch.insert(patch.end(), payload.begin(), payload.end());
         std::cerr << "  " << prefix << "_entries.bin: cell index delta (" << size << " bytes)" << std::endl;
     };
-    emit_cell_index_delta(PatchFileId::ADMIN_ENTRIES, "admin", ad_rm_d, a_added, a_removed);
+    emit_cell_index_delta(PatchFileId::ADMIN_ENTRIES, "admin", {}, a_added, a_removed);
     emit_cell_index_delta(PatchFileId::POI_ENTRIES, "poi", poi_rm_d, p_added, p_removed);
 
     log_time("Entry corrections", t1);
@@ -1923,9 +1717,9 @@ static int run(int argc, char* argv[]) {
 
         // Unchanged short-circuit: emit a copy-old marker instead of dumping
         // the whole file when it's byte-identical to old. Several raw-emitted
-        // files (postcode_centroid_cells/entries, postal_*) are fully
-        // deterministic and identical day-over-day; full-replacing them wasted
-        // ~5.8 MiB/planet.
+        // files (postcode_centroid_cells/entries, the admin geometry of a
+        // quiet day) are identical day-over-day; full-replacing the postcode
+        // centroid index wasted ~5.8 MiB/planet.
         if (try_emit_copy_old(patch, static_cast<uint32_t>(fid), old_path, new_path,
                               old_size, new_size, fname.c_str()))
             return;
@@ -1952,9 +1746,9 @@ static int run(int argc, char* argv[]) {
     };
 
     // Sparse position-keyed delta for files where strategy-2 keeps the
-    // record index stable but the stored *value* needs a remap to align
-    // old & new (admin polygon ids shift via res_admin_p.id_remap;
-    // postcode string offsets shift via str_remap). For unchanged
+    // record index stable and the stored *value* is a slot or needs the
+    // string remap to align old & new (postcode string offsets shift via
+    // str_remap). For unchanged
     // entries (vast majority day-over-day), the diff after remap matches
     // byte-for-byte and contributes 0 to the patch. For changed entries,
     // each emits 4 + value_stride bytes. Replaces full_replace which
@@ -1964,8 +1758,7 @@ static int run(int argc, char* argv[]) {
     // uncompressed cut from the patch).
     //
     // remap_kind:
-    //   0 = none                  (raw byte compare)
-    //   1 = admin polygon idx     (res_admin_p.id_remap, NO_DATA passthrough)
+    //   0 = none                  (raw byte compare; admin slots)
     //   2 = string pool offset    (patcher_strings)
     //   3 = postcode_centroid     (16B struct, patcher_strings on bytes 8-11 only)
     // String offsets are remapped as the patcher will remap them, so a moved
@@ -2088,15 +1881,7 @@ static int run(int argc, char* argv[]) {
                 uint32_t new_val; memcpy(&new_val, new_m.data + pos * 4, 4);
                 if (pos >= old_n) return true;
                 uint32_t old_val; memcpy(&old_val, old_m.data + pos * 4, 4);
-                uint32_t remapped = old_val;
-                if (old_val != NO_DATA) {
-                    if (remap_kind == 1 && old_val < res_admin_p.id_remap.size()) {
-                        uint32_t r = res_admin_p.id_remap[old_val];
-                        if (r != NO_DATA) remapped = r;
-                    } else if (remap_kind == 2) {
-                        remapped = patcher_strings.map(old_val);
-                    }
-                }
+                const uint32_t remapped = old_val != NO_DATA && remap_kind == 2 ? patcher_strings.map(old_val) : old_val;
                 return remapped != new_val;
             };
             for (size_t pos : parallel_filter<size_t>(new_n, changed)) {
@@ -2120,7 +1905,7 @@ static int run(int argc, char* argv[]) {
         // full when >50% of positions appear "changed" after remap, which
         // means strategy-2 slot stability is broken upstream (the file
         // contents at slot[i] genuinely diverge day-over-day instead of
-        // mostly matching via str_remap / admin_id_remap / postcode remap).
+        // mostly matching via str_remap / postcode remap).
         // Per project direction: never silently fall back. Always emit
         // the sparse format and let the patch size expose the real cost
         // of any instability so the build-side fix can be tracked.
@@ -2173,12 +1958,7 @@ static int run(int argc, char* argv[]) {
         auto new_m = mmap_file(new_path);
         auto val = [](const MappedFile& m, size_t i) { uint32_t v; memcpy(&v, m.data + i * 4, 4); return v; };
         auto remap_value = [&](uint32_t v) -> uint32_t {
-            if (v == NO_DATA) return v;
-            if (f.remap_kind == 1) {
-                if (v < res_admin_p.id_remap.size() && res_admin_p.id_remap[v] != NO_DATA) return res_admin_p.id_remap[v];
-                return v;
-            }
-            if (f.remap_kind == 2) return patcher_strings.map(v);
+            if (v != NO_DATA && f.remap_kind == 2) return patcher_strings.map(v);
             return v;
         };
         std::vector<uint32_t> ins;
@@ -2263,53 +2043,6 @@ static int run(int argc, char* argv[]) {
     };
     emit_cell_index(PatchFileId::POSTCODE_CENTROID_CELLS, "postcode_centroid_cells.bin",
                     PatchFileId::POSTCODE_CENTROID_ENTRIES, "postcode_centroid_entries.bin");
-    // Postal polygons are the admin_level 11 copies of admin polygons, in
-    // slot order with their own packed vertex stream, so they merge like
-    // admin_polygons / admin_vertices. Full-replacing them re-sent ~92 MiB
-    // of planet/quality/uncapped every day.
-    {
-        auto old_p = mmap_file_rw(old_dir + "/postal_polygons.bin");
-        auto new_p = mmap_file(new_dir + "/postal_polygons.bin");
-        auto old_v = mmap_file(old_dir + "/postal_vertices.bin");
-        auto new_v = mmap_file(new_dir + "/postal_vertices.bin");
-        const size_t stride = admin_stride;
-        bool mergeable = old_p.size > 0 && new_p.size > 0 && old_v.size > 0 && new_v.size > 0
-                         && old_p.size % stride == 0 && new_p.size % stride == 0;
-        if (mergeable) {
-            remap_string_fields(old_p.data, old_p.size, PatchFileId::POSTAL_POLYGONS, stride, str_remap);
-            size_t n = old_p.size / stride;
-            std::vector<uint32_t> old_offsets(n);
-            for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_p.data + i * stride, 4);
-            fixup_v15_offsets(old_p.data, old_p.size, old_v.data, old_v.size,
-                              new_p.data, new_p.size, new_v.data, new_v.size, stride, /*off_field_pos=*/0,
-                              [](const char* rec) -> uint64_t {
-                                  uint32_t name_id; memcpy(&name_id, rec + 8, 4);
-                                  uint8_t level = static_cast<uint8_t>(rec[12]);
-                                  uint16_t cc; memcpy(&cc, rec + 20, 2);
-                                  uint32_t vert_count; memcpy(&vert_count, rec + 4, 4);
-                                  uint64_t k = ((uint64_t)name_id << 24) | ((uint64_t)level << 16) | cc;
-                                  return k ^ ((uint64_t)vert_count << 40);
-                              });
-            auto fixups = collect_offset_fixups(old_offsets, old_p.data, stride, 0);
-            auto seq = build_merge_seq(old_p.data, old_p.size, new_p.data, new_p.size, stride);
-            // The vertex merge reads each polygon's bytes at its original offset.
-            for (size_t i = 0; i < n; i++) memcpy(old_p.data + i * stride, &old_offsets[i], 4);
-            auto vseq = build_vertex_byte_merge(seq, old_p.data, old_p.size, new_p.data, new_p.size,
-                                                old_v.data, old_v.size, new_v.data, new_v.size, stride, 0);
-            FileMergeResult rp = {PatchFileId::POSTAL_POLYGONS, "postal_polygons.bin", stride,
-                                  old_p.size, new_p.size, std::move(seq), std::move(fixups), {}, {}};
-            FileMergeResult rv = {PatchFileId::POSTAL_VERTICES, "postal_vertices.bin", 1,
-                                  old_v.size, new_v.size, std::move(vseq), {}, {}, {}};
-            log_merge(rp); log_merge(rv);
-            serialize_merge(patch, rp, old_dir, new_dir, patcher_strings, offset_fixup_limits);
-            serialize_merge(patch, rv, old_dir, new_dir, patcher_strings, offset_fixup_limits);
-        }
-        unmap_file(old_p); unmap_file(new_p); unmap_file(old_v); unmap_file(new_v);
-        if (!mergeable) {
-            emit_raw(PatchFileId::POSTAL_POLYGONS, "postal_polygons.bin");
-            emit_raw(PatchFileId::POSTAL_VERTICES, "postal_vertices.bin");
-        }
-    }
     // ADDR_VERTICES was already serialized as a byte-merge just after
     // res_addr when the dir has address points. Only fall back to
     // FULL_REPLACE here for a dir without them (res_addr_v.stride == 0).
@@ -2319,6 +2052,19 @@ static int run(int argc, char* argv[]) {
     // A string tier the old dir lacks has no old file to rebuild from.
     for (int t = 0; t < STRING_TIER_COUNT; t++)
         if (tier_files.newly_shipped >> t & 1) emit_raw(string_tier_file_id(t), STRING_TIER_FILES[t]);
+    // The admin geometry files go whole, last. Their room (and their
+    // headers' and the end marker's) is taken at once, so the patch buffer
+    // never doubles past them: planet/quality/exact's are 0.7 GB.
+    {
+        uint64_t whole = 0;
+        for (PatchFileId fid : ADMIN_GEOMETRY_FILES) {
+            struct stat st;
+            if (stat((new_dir + "/" + patch_file_names[static_cast<uint32_t>(fid)]).c_str(), &st) == 0)
+                whole += static_cast<uint64_t>(st.st_size) + 64;
+        }
+        patch.reserve(patch.size() + static_cast<size_t>(whole) + 64);
+        for (PatchFileId fid : ADMIN_GEOMETRY_FILES) emit_raw(fid, patch_file_names[static_cast<uint32_t>(fid)]);
+    }
 
     // Now safe to free str_remap — all consumers (sparse_delta above)
     // have finished using it.

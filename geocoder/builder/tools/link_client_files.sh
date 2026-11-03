@@ -5,7 +5,7 @@
 # client files: everything a client holds, the same set verify_patch.sh
 # compares (no *.osm_ids, *.gcpatch, *.zst or dotfiles). Applying a patch to
 # it proves the variant patches from its own files alone: nothing beside it
-# (../full, a sibling quality dir) exists.
+# (../full) exists.
 set -euo pipefail
 
 src=$(readlink -f "$1")
