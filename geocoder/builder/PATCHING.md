@@ -244,7 +244,7 @@ and 1450 s in 32 MiB (19.2 GiB).
 **Diff tool:**
 1. Build string-level diff (per tier, keep the longest run of common strings in the same order, every one of them in a sorted tier; emit the other old strings as deleted and the other new ones as added, with their new index unless the new tier is sorted)
 2. Build string remap (old string pool offsets → new, derived from string diff); the surviving strings no tier's edit keeps go as pairs, at most 65,536 of them (v12: with more, none does, and step 3 sends their values)
-3. For each data file: apply string remap to old, match records by content hash (for ways/admin: also fix node_offset/vertex_offset fields), build merge sequence (MATCH/INSERT/DELETE at record stride); past the pairs' cap, the MATCH records' fields that hold a moved string go as string fixups, and the side files' values that hold one as changes
+3. For each data file: apply string remap to old, match records by content hash (for ways: also fix node_offset/vertex_offset fields), build merge sequence (MATCH/INSERT/DELETE at record stride); past the pairs' cap, the MATCH records' fields that hold a moved string go as string fixups, and the side files' values that hold one as changes. (v14) The four admin geometry files go whole, last
 4. For coordinate files (nodes/vertices): derive merge from parent way/polygon merge — verify node blocks match before COPY, INSERT if nodes changed
 5. Derive ID remaps from merge sequences (MATCH ops define old→new record correspondence)
 6. **Secondary matching**: For DELETE/INSERT records in merge sequences, match by relaxed key (name + node_count for ways, street + housenumber for addrs, etc.) to recover ID mappings for modified-but-same-entity records
@@ -258,7 +258,7 @@ and 1450 s in 32 MiB (19.2 GiB).
 4. Read secondary ID remaps → each replayed file's moved pairs, read where they sit, beside its derived ID mappings
 5. Read cell changes (added/removed cell IDs) and the per-cell entry deltas
 6. Rebuild geo_cells and the street / addr / interp entry files in one pass over the old geo index: each cell's lists with their IDs remapped, corrected by the cell's delta
-7. Rebuild the admin / POI cell indexes from their ID remaps + cell changes, corrected by the Cell Index Delta
+7. Rebuild the admin / POI cell indexes from their ID remaps + cell changes (v14: the admin index's ids as they are, since admin polygons keep their slots), corrected by the Cell Index Delta
 
 ## Known Issues
 
@@ -331,8 +331,10 @@ dirs must all be patched to the same date and swapped in together.
 The place search index (`geocoder/search`) points into a selection's own
 files by record index and string offset, so it answers right only beside the
 exact files it was built from. Its `search_meta.json` records the sha256 of
-each of them (`dataset`: admin_polygons, admin_vertices, place_nodes,
-poi_records, strings_core, strings_layout.json, strings_poi), and the binding
+each of them (`dataset`: admin_polygons, admin_rings, arc_index, arc_vertices,
+place_nodes, poi_records, strings_core, strings_layout.json, strings_poi), so an
+index built beside one boundary tier is built again beside the other, whose
+arcs its label points would not lie on; and the binding
 (`openPlaceSearch`) uses an index only while the files beside it hash the
 same. Any other index, or none, is built there from the files first, on one
 thread, within 32 MiB.
@@ -375,7 +377,7 @@ v8 data patch that day; applying the delta also needs memory for the whole
 old file (1.0 GB for poi.fst). Rebuilding costs no download and two to three
 and a half minutes of one core.
 
-## Patch Format (.gcpatch, version 13)
+## Patch Format (.gcpatch, version 14)
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
 pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
@@ -385,8 +387,8 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=13 (u32) + flags=0 (u32)
-  (a v13 patcher accepts only v13 patches; the v8 to v13 changes are marked
+Header: "GCPATCH\0" (8) + version=14 (u32) + flags=0 (u32)
+  (a v14 patcher accepts only v14 patches; the v8 to v14 changes are marked
   below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
@@ -431,13 +433,16 @@ Strings: marker 0xFFFFFFF6 (u32)
   send the side-file values that hold them as changes.
 
 Parent-id remap: marker 0xFFFFFFF3 (u32)
-  + n_admin (u32) + [(old:u32, new:u32)] × n_admin
-  + n_street (u32) + [(old:u32, new:u32)] × n_street + 0 (u32, reserved)
+  + n_street (u32) + [(old:u32, new:u32)] × n_street
+  (v14: the street leg alone, sent only by a dir with address points. Admin
+  polygons keep their slots, so no admin leg or reserved postcode leg follows
+  it; the patcher refuses a section for file 0, which no patch sends, so the
+  words of a v13 three-leg remap are refused)
   (v8: the street pairs are only the ways no MATCH / REPLACE run maps, the
   moved and secondary-matched ones; the patcher derives the rest of the
   street remap from the street_ways replay)
-  Each leg ascending by old, each id once. The patcher reads the legs where
-  they sit and refuses one out of order. (v11) The street leg is the street
+  Ascending by old, each id once. The patcher reads the leg where it sits
+  and refuses one out of order. (v11) The street leg is the street
   remap's pairs as it sits, and a patch whose secondary remap gives
   street_ways pairs as well is refused. At most one such section: the
   patcher refuses a second ("Malformed POI parent-id remap: a second one").
@@ -446,7 +451,10 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   (the patcher refuses an old file of another size, 0 meaning absent)
   stride=0: full replacement (n_fixups=0 u32, size u64, data)
   stride=0xFD: unchanged, copy from cur_dir
-  stride=0xFC: sparse delta (value_stride, remap_kind, n, [(pos, value)] × n)
+  stride=0xFC: sparse delta (value_stride, remap_kind, n, [(pos, value)] × n;
+    remap_kind 0 raw, 2 a string offset, 3 a postcode centroid, as its file's
+    row of SPARSE_DELTA_FILES gives it, and the patcher refuses any other.
+    v14: no kind 1, an admin id the patch remapped)
   stride=0xFA (v8): parallel delta for a per-record side file (way_parents,
     way_postcodes, addr_postcodes, interp_postcodes), rebuilt along its
     parent's merge: parent_file_id u32, value_stride u32 = 4, remap_kind u32,
@@ -561,6 +569,45 @@ Cell Index Delta: marker 0xFFFFFFF7 (u32) + file_id (u32, the entries file)
 
 End marker: 0xFFFFFFFF (u32)
 ```
+
+### File ids (v14)
+
+Every section names its file by id (`PatchFileId`, `tools/patch_format.h`). v14
+gives ids 7, 26 and 27 to the admin arc files: they named `admin_vertices.bin`
+and the postal files, which no build writes any more.
+
+| Id | File | How it travels |
+|----|------|----------------|
+| 0 | `strings.bin` | never: a section for it is refused ("Unknown file 0") |
+| 1 | `street_ways.bin` | merge at stride 12, string field `name_id` |
+| 2 | `street_nodes.bin` | child stream of street_ways, at stride 8 |
+| 3 | `addr_points.bin` | merge at stride 28, string fields `housenumber_id` and `street_id` |
+| 4 | `interp_ways.bin` | merge at stride 24, string field `street_id` |
+| 5 | `interp_nodes.bin` | child stream of interp_ways, at stride 8 |
+| 6 | `admin_polygons.bin` | whole (v14): a full replacement, or COPY_OLD when unchanged |
+| 7 | `admin_rings.bin` | whole (v14; v13: `admin_vertices.bin`) |
+| 8 | `geo_cells.bin` | geo cell changes (0xFFFFFFFB), rebuilt beside the geo entry deltas |
+| 9-11 | `street_entries.bin`, `addr_entries.bin`, `interp_entries.bin` | geo entry deltas (0xFFFFFFF0) |
+| 12, 13 | `admin_cells.bin`, `admin_entries.bin` | admin cell changes (0xFFFFFFFA) and a cell index delta (0xFFFFFFF7), over the old index's ids as they are (v14) |
+| 14 | `poi_records.bin` | merge at stride 36, string fields `name_id`, `parent_street_id` and `parent_postcode_id` |
+| 15 | `poi_vertices.bin` | child stream of poi_records, at stride 1 |
+| 16, 17 | `poi_cells.bin`, `poi_entries.bin` | POI cell changes (0xFFFFFFF5) and a cell index delta |
+| 18 | `place_nodes.bin` | merge at stride 20, string field `name_id` |
+| 19 | `addr_postcodes.bin` | parallel delta along addr_points, remap kind 2 |
+| 20 | `admin_parents.bin` | sparse delta, remap kind 0 (v14; was 1) |
+| 21 | `way_parents.bin` | parallel delta along street_ways, remap kind 0 (v14; was 1) |
+| 22 | `way_postcodes.bin` | parallel delta along street_ways, remap kind 2 |
+| 23 | `postcode_centroids.bin` | sparse delta, remap kind 3 |
+| 24, 25 | `postcode_centroid_cells.bin`, `postcode_centroid_entries.bin` | cell list delta (stride 0xFB), or whole |
+| 26 | `arc_index.bin` | whole (v14; v13: `postal_polygons.bin`) |
+| 27 | `arc_vertices.bin` | whole (v14; v13: `postal_vertices.bin`) |
+| 28 | `addr_vertices.bin` | child stream of addr_points at stride 1; whole in a dir without address points |
+| 29-33 | `strings_core.bin` … `strings_poi.bin` | the strings section; a tier the old dir lacks, whole |
+| 34 | `interp_postcodes.bin` | parallel delta along interp_ways, remap kind 2 |
+
+The four admin geometry files (`ADMIN_GEOMETRY_FILES`: arc_index,
+arc_vertices, admin_polygons, admin_rings, in that order) are the last
+sections of a patch, and no merge reads their records.
 
 ## Performance
 

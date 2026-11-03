@@ -53,8 +53,8 @@ Users choose how much POI data they want:
 
 | Tier | Records | Download Size | What's included |
 |---|---|---|---|
-| **Major** | 0.9M | 204 MiB | Airports, national parks, volcanoes, glaciers, islands, cathedrals, palaces, train stations, UNESCO sites |
-| **Notable** | 3.8M | 373 MiB | + museums, castles, stadiums, beaches, waterfalls, universities, viewpoints, lighthouses |
+| **Major** | 0.9M | 124 MiB | Airports, national parks, volcanoes, glaciers, islands, cathedrals, palaces, train stations, UNESCO sites |
+| **Notable** | 3.8M | 304 MiB | + museums, castles, stadiums, beaches, waterfalls, universities, viewpoints, lighthouses |
 | **All** | 24.5M | 1.04 GiB | + every named POI: places of worship, peaks, memorials, artwork, libraries, gardens, springs |
 
 Tiers are cumulative — Notable includes all Major POIs, All includes everything.
@@ -85,57 +85,57 @@ A client picks: **region** + **mode** + **quality** + **POI tier** (all independ
 
 ### By Mode (planet)
 
+Measured on planet-261018b; sizes are zstd downloads (`compress_index.py`).
+
 | Mode | Size | Description |
 |---|---|---|
-| Full | 9.0 GiB | Streets + addresses + interpolation + admin cells + place nodes + postcodes |
-| No-addresses | 3.8 GiB | Streets + admin cells + place nodes + postcodes (no address points or interpolation) |
-| Admin | 110 MiB | Admin boundary cell index + place nodes + postcodes |
-| Admin-minimal | 220 MiB | Admin levels 2-8 + place nodes, with its own q2.5 polygons (no quality dir needed); with a POI tier its `admin-minimal-poi/` dir, on the shared polygon ids and strings |
+| Full | 9.2 GiB | Streets + addresses + interpolation + admin cells + place nodes + postcodes |
+| No-addresses | 4.0 GiB | Streets + admin cells + place nodes + postcodes (no address points or interpolation) |
+| Admin | 84 MiB | Admin boundary cell index + place nodes + postcodes |
+| Admin-minimal | 124 MiB | Admin levels 2-8 + place nodes, with its own simplified boundaries (no quality dir needed); with a POI tier its `admin-minimal-poi/` dir (128 MiB), on the shared polygon ids and strings |
 
-Sizes are zstd downloads. Except for admin-minimal, a mode dir holds no
-boundary polygons: those come from the quality dir.
+Except for admin-minimal, a mode dir holds no boundary polygons: those come
+from the quality dir.
 
 ### By Quality (planet, admin boundary resolution)
 
-The vertex file (`admin_vertices.bin`) is most of what varies between
-quality variants. The admin mode dir (place_nodes, postcode_centroids,
-string tiers, cell index, etc.) adds **305 MiB raw / 110 MiB zstd**
-regardless of quality; the quality dir also holds `admin_polygons.bin` and
-the postal boundaries.
+A quality dir holds the admin polygons (`admin_polygons.bin`, postcode areas
+among them) and their rings (`admin_rings.bin`), the same in both tiers, and
+the arcs the rings are made of (`arc_index.bin`, `arc_vertices.bin`): each
+border once, shared by the boundaries on either side of it. The arcs are what
+the tiers differ in. The admin mode dir (place_nodes, postcode_centroids,
+string tiers, cell index, etc.) adds **264 MiB raw / 84 MiB zstd** whatever
+the tier.
 
-| Quality | `admin_vertices.bin` | Admin mode + quality dir (raw) | (zstd download) | Boundary precision (L8) |
+| Quality | Arcs (raw) | Quality dir (raw / zstd) | Admin mode + quality dir (zstd download) | Boundary precision |
 |---|---|---|---|---|
-| Uncapped | 1.51 GiB | 1.93 GiB | 1.50 GiB | <1 m |
-| q0.2 | 789 MiB | 1.14 GiB | 893 MiB | ~3 m |
-| q0.5 | 534 MiB | 899 MiB | 649 MiB | ~7 m |
-| q1 | 379 MiB | 734 MiB | 497 MiB | ~15 m |
-| q1.5 | 305 MiB | 655 MiB | 424 MiB | ~22 m |
-| q2 | 260 MiB | 607 MiB | 378 MiB | ~30 m |
-| **q2.5** | **229 MiB** | **573 MiB** | **347 MiB** | **~37 m — default** |
+| **Simplified** | **124 MiB** | **166 / 118 MiB** | **202 MiB** | **within 37.5 m (less for small areas), on a 1.1 m grid — default** |
+| Exact | 650 MiB | 691 / 611 MiB | 695 MiB | every OSM point |
 
 ### By POI Tier (planet)
 
 | Tier | Size | Records |
 |---|---|---|
-| Major | 204 MiB | 0.9M |
-| Notable | 373 MiB | 3.8M |
+| Major | 124 MiB | 0.9M |
+| Notable | 304 MiB | 3.8M |
 | All | 1.04 GiB | 24.5M |
 
 ### Total Download Examples
 
+The presets of `builder/configurations.template.json`:
+
 | Configuration | Total Size | Use case |
 |---|---|---|
-| Full + uncapped + all POIs | 11.4 GiB | Maximum quality, all data |
-| Full + q1 + notable POIs | 9.7 GiB | Good balance for photo apps |
-| No-addresses + q1 + major POIs | 4.4 GiB | Streets + major landmarks |
-| Admin + q1 | 497 MiB | Minimal — just boundaries |
-| Admin + q2.5 | 347 MiB | Smallest useful configuration |
+| Admin-minimal (smallest) | 124 MiB | Smallest useful configuration |
+| Admin + simplified + major POIs (recommended) | 326 MiB | Best balance for photo apps |
+| Full + simplified + all POIs (with addresses) | 10.4 GiB | House-number resolution where tagged |
+| Full + exact + all POIs (max) | 10.9 GiB | Maximum quality, all data |
 
 ### Regional Extracts
 
 Available for: planet, europe, asia, north-america, south-america, africa, oceania, central-america, antarctica.
 
-Regional downloads are smaller — Europe full + uncapped is 4.4 GiB vs planet's 10.4 GiB.
+Regional downloads are smaller: each region's dirs hold only its own data.
 
 ## Incremental Updates
 
@@ -145,7 +145,7 @@ The system supports daily incremental patching:
 2. Patches (`.gcpatch` files) are generated against the previous day's build
 3. Clients download and apply patches instead of re-downloading the full index
 4. Patches are verified byte-identical to a fresh build before upload
-5. Patches are well under 0.1% of the index: one day of planet full + q2.5 + all POIs is about 4.5 MiB (see `builder/PATCHING.md`)
+5. Patches are well under 0.1% of the index: one day of planet full + q2.5 + all POIs (the boundary tier before simplified) was about 4.5 MiB with the GCPATCH v7 tools (see `builder/PATCHING.md`)
 
 POI data is patched independently — each tier directory gets its own patch file.
 

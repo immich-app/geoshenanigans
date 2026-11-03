@@ -62,7 +62,7 @@ pub struct Component {
     #[serde(default, rename = "extends")]
     pub extends: Option<String>,
     /// Files the builder writes only when the data has them (TIGER
-    /// sidecars, postal boundaries). Absent from the manifest = skip.
+    /// sidecars, postcode centroids). Absent from the manifest = skip.
     #[serde(default)]
     pub optional_files: Vec<String>,
     /// Components of which the selection takes one more: the first whose
@@ -89,7 +89,7 @@ pub struct FileEntry {
 
 /// Per-region selection passed in by the configuration endpoint. The
 /// quality/poi_tier strings have to match component IDs in
-/// configurations.components (e.g. "q2.5", "major").
+/// configurations.components (e.g. "simplified", "major").
 #[derive(Debug, Clone)]
 pub struct RegionSelection {
     pub region: String,
@@ -347,9 +347,9 @@ pub async fn download_region(
 
     // Files land FLAT under <root>/<region>/ — Index::load (via
     // install_region) reads a flat dir, not the manifest's nested
-    // {region}/{mode}/... layout. Later paths overwrite earlier basenames
-    // (quality-variant admin polygons over the mode set), mirroring how
-    // server dirs are assembled from build output.
+    // {region}/{mode}/... layout. A later path overwrites an earlier
+    // basename: no two .bin files of a template selection share one (its
+    // tests check it), and the strings_layout.json each dir holds are alike.
     let region_dir = root.join(&sel.region);
     tokio::fs::create_dir_all(&region_dir).await
         .map_err(|e| DownloadError::Io(format!("mkdir {}: {}", region_dir.display(), e)))?;
@@ -608,22 +608,50 @@ mod tests {
         v["axes"][axis]["values"].as_object().unwrap().keys().cloned().collect()
     }
 
+    /// Whether `s` keeps the template's constraints: a selection with every
+    /// value a constraint's `when` names has every value its `requires` names.
+    fn allowed(v: &serde_json::Value, s: &RegionSelection) -> bool {
+        v["constraints"].as_array().unwrap().iter().all(|c| {
+            let has = |key: &str| c[key].as_object().unwrap().iter().all(|(axis, value)| s.axis(axis) == value.as_str());
+            !has("when") || has("requires")
+        })
+    }
+
+    /// Every mode × quality × poi_tier the template's constraints allow, in
+    /// europe, and its presets' selections.
+    fn template_selections(v: &serde_json::Value) -> Vec<RegionSelection> {
+        let mut all = Vec::new();
+        for mode in axis_values(v, "mode") {
+            for quality in axis_values(v, "quality") {
+                for poi_tier in axis_values(v, "poi_tier") {
+                    all.push(sel("europe", &mode, &quality, &poi_tier));
+                }
+            }
+        }
+        all.retain(|s| allowed(v, s));
+        for preset in v["presets"].as_array().unwrap() {
+            let axis = |name: &str| preset["selections"][name].as_str().unwrap().to_string();
+            all.push(sel(&axis("region"), &axis("mode"), &axis("quality"), &axis("poi_tier")));
+        }
+        all
+    }
+
+    fn basename(path: &str) -> &str {
+        path.rsplit('/').next().unwrap()
+    }
+
     // Index::load needs strings_layout.json in every region dir and
     // PoiMeta::load reads poi_meta.json; a selection that resolves without
     // them downloads GiBs into a dir that can never load.
     #[test]
     fn template_selections_include_load_sidecars() {
         let (v, c) = template();
-        let names = |key: &str| axis_values(&v, key);
-        for mode in names("mode") {
-            for poi_tier in names("poi_tier") {
-                let s = sel("europe", &mode, "q2.5", &poi_tier);
-                let paths = resolve_files(&c, &s).paths;
-                let has = |name: &str| paths.iter().any(|p| p.ends_with(&format!("/{}", name)));
-                assert!(has("strings_layout.json"), "{}/{} lacks strings_layout.json", mode, poi_tier);
-                assert!(has("admin_cells.bin"), "{}/{} lacks admin_cells.bin", mode, poi_tier);
-                assert_eq!(has("poi_meta.json"), poi_tier != "none", "{}/{} poi_meta.json", mode, poi_tier);
-            }
+        for s in template_selections(&v) {
+            let paths = resolve_files(&c, &s).paths;
+            let has = |name: &str| paths.iter().any(|p| basename(p) == name);
+            assert!(has("strings_layout.json"), "{:?} lacks strings_layout.json", s);
+            assert!(has("admin_cells.bin"), "{:?} lacks admin_cells.bin", s);
+            assert_eq!(has("poi_meta.json"), s.poi_tier != "none", "{:?} poi_meta.json", s);
         }
     }
 
@@ -633,22 +661,68 @@ mod tests {
     #[test]
     fn template_admin_minimal_takes_its_poi_dir_beside_a_poi_tier() {
         let (v, c) = template();
-        let files = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_vertices.bin",
-                     "place_nodes.bin", "strings_core.bin", "strings_layout.json"];
-        for poi_tier in axis_values(&v, "poi_tier") {
-            let paths = resolve_files(&c, &sel("europe", "admin-minimal", "q2.5", &poi_tier)).paths;
-            let (dir, other) = if poi_tier == "none" {
+        let files = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_rings.bin",
+                     "arc_index.bin", "arc_vertices.bin", "place_nodes.bin", "strings_core.bin",
+                     "strings_layout.json"];
+        let minimal: Vec<RegionSelection> = template_selections(&v).into_iter()
+            .filter(|s| s.mode == "admin-minimal" && s.region == "europe")
+            .collect();
+        assert_eq!(minimal.len(), axis_values(&v, "poi_tier").len());
+        for s in minimal {
+            let paths = resolve_files(&c, &s).paths;
+            let (dir, other) = if s.poi_tier == "none" {
                 ("europe/admin-minimal/", "europe/admin-minimal-poi/")
             } else {
                 ("europe/admin-minimal-poi/", "europe/admin-minimal/")
             };
             let in_dir: Vec<&str> = paths.iter().filter_map(|p| p.strip_prefix(dir)).collect();
-            assert_eq!(in_dir, files, "{}", poi_tier);
+            assert_eq!(in_dir, files, "{:?}", s);
             let stray: Vec<&String> = paths.iter()
                 .filter(|p| p.starts_with(other) || p.starts_with("europe/quality/"))
                 .collect();
-            assert!(stray.is_empty(), "{}: {:?}", poi_tier, stray);
+            assert!(stray.is_empty(), "{:?}: {:?}", s, stray);
         }
+    }
+
+    // Downloads land flat by basename, so a selection taking two copies of an
+    // admin geometry file, or a .bin name twice, would mix two sets of arcs.
+    #[test]
+    fn template_selections_take_each_admin_geometry_file_once_from_their_dir() {
+        let (v, c) = template();
+        for s in template_selections(&v) {
+            let paths = resolve_files(&c, &s).paths;
+            let dir = match (s.mode.as_str(), s.poi_tier.as_str()) {
+                ("admin-minimal", "none") => format!("{}/admin-minimal/", s.region),
+                ("admin-minimal", _) => format!("{}/admin-minimal-poi/", s.region),
+                _ => format!("{}/quality/{}/", s.region, s.quality),
+            };
+            for name in std::iter::once("admin_polygons.bin").chain(query_server::ADMIN_GEOMETRY_FILES) {
+                let copies: Vec<&String> = paths.iter().filter(|p| basename(p) == name).collect();
+                assert_eq!(copies, [&format!("{dir}{name}")], "{:?}", s);
+            }
+            let mut bins: Vec<&str> = paths.iter().map(|p| basename(p)).filter(|n| n.ends_with(".bin")).collect();
+            let count = bins.len();
+            bins.sort_unstable();
+            bins.dedup();
+            assert_eq!(bins.len(), count, "{:?}: {:?}", s, paths);
+            let stale: Vec<&String> = paths.iter()
+                .filter(|p| basename(p) == "admin_vertices.bin" || basename(p).starts_with("postal_"))
+                .collect();
+            assert!(stale.is_empty(), "{:?}: {:?}", s, stale);
+        }
+    }
+
+    #[test]
+    fn the_default_configuration_is_a_selection_the_template_allows() {
+        let (v, c) = template();
+        let d = crate::region_state::Configuration::default();
+        let s = sel("europe", &d.mode, &d.quality, &d.poi_tier);
+
+        for (axis, value) in [("mode", &d.mode), ("quality", &d.quality), ("poi_tier", &d.poi_tier)] {
+            assert!(axis_values(&v, axis).contains(value), "{axis} {value}");
+        }
+        assert!(allowed(&v, &s));
+        assert!(resolve_files(&c, &s).paths.iter().any(|p| p == &format!("europe/quality/{}/arc_vertices.bin", d.quality)));
     }
 
     #[test]

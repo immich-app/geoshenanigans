@@ -41,8 +41,8 @@ pub struct Configuration {
     pub base_url: String,
     /// Address detail level — must match a `mode.*` component.
     pub mode: String,
-    /// Boundary precision quality variant (e.g. "q2.5"). Must match
-    /// a `quality.*` component.
+    /// Boundary tier ("simplified" or "exact"). Must match a
+    /// `quality.*` component.
     pub quality: String,
     /// POI tier ("none", "major", "notable", "all"). Must match a
     /// `poi_tier.*` component.
@@ -59,7 +59,7 @@ impl Default for Configuration {
             base_url: "https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io/geocoder"
                 .to_string(),
             mode: "admin".to_string(),
-            quality: "q2.5".to_string(),
+            quality: "simplified".to_string(),
             poi_tier: "none".to_string(),
             preload: Vec::new(),
         }

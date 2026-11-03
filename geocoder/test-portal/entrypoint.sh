@@ -4,20 +4,66 @@ set -e
 DATA_DIR="${DATA_DIR:-/data}"
 INDEX_DIR="$DATA_DIR/index"
 TIGRIS_BASE="https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io/geocoder/builds"
-# Quality variant for admin polygons.  q2.5 is the default — most
-# aggressive simplification (~37 m boundary precision at L8), smallest
-# disk footprint (~280 MB saved vs uncapped on planet).  Override
-# with QUALITY=uncapped|q1|q1.5|... for finer precision.
-QUALITY="${QUALITY:-q2.5}"
+# Boundary tier: simplified (the default: ~37 m boundaries, shared by
+# neighbours) or exact (every OSM point, the largest download).
+QUALITY="${QUALITY:-simplified}"
 # POI tier: major (8.6k records, 30 MB), notable (45k, 100 MB), or
 # all (340k, 670 MB).  All by default.
 POI_TIER="${POI_TIER:-all}"
-# Minimal mode: admin-only at q2.5 + place nodes (city/town/village/
-# hamlet/...).  Skips streets, addresses, interpolation, postcodes,
-# postal polygons, POI data, and all string tiers except strings_core
-# (which covers admin + place names).  Smallest possible deployable
-# that resolves admin hierarchy + GeoNames cities500-equivalent detail.
+# Minimal mode: admin-only with simplified boundaries + place nodes
+# (city/town/village/hamlet/...).  Skips streets, addresses,
+# interpolation, postcodes, postcode areas, POI data, and all string
+# tiers except strings_core (which covers admin + place names).
+# Smallest possible deployable that resolves admin hierarchy + GeoNames
+# cities500-equivalent detail.
 MINIMAL="${MINIMAL:-0}"
+
+# The planet files this server downloads, one "<dir> <file>" a line: those
+# of the template's selection (mode full or admin-minimal, $QUALITY,
+# $POI_TIER), each from the dir a client takes it from
+# (builder/tools/test_build_search_indexes.py checks them against it).
+selection_files() {
+    if [ "$MINIMAL" = "1" ]; then
+        # Everything comes from the admin-minimal/ subdir (filtered: admin
+        # polygons of levels 2-8, place types in {city,town,village,hamlet}):
+        # its own polygons on the minimal arc set, cell index, place_nodes,
+        # core strings and layout. The server derives the place index from
+        # place_nodes.bin at its first load.
+        for f in admin_cells.bin admin_entries.bin \
+                 admin_polygons.bin admin_rings.bin arc_index.bin arc_vertices.bin \
+                 place_nodes.bin strings_core.bin strings_layout.json; do
+            echo "admin-minimal $f"
+        done
+        return
+    fi
+    for f in geo_cells.bin \
+             street_entries.bin street_ways.bin street_nodes.bin \
+             addr_entries.bin addr_points.bin addr_vertices.bin addr_postcodes.bin \
+             interp_entries.bin interp_ways.bin interp_nodes.bin interp_postcodes.bin \
+             admin_cells.bin admin_entries.bin admin_parents.bin \
+             place_nodes.bin \
+             postcode_centroids.bin postcode_centroid_cells.bin postcode_centroid_entries.bin \
+             way_parents.bin way_postcodes.bin \
+             strings_core.bin strings_street.bin strings_addr.bin strings_postcode.bin; do
+        echo "full $f"
+    done
+    # The boundaries of the chosen tier: the admin polygons (postcode areas
+    # among them) and the arcs their rings share.
+    for f in admin_polygons.bin admin_rings.bin arc_index.bin arc_vertices.bin; do
+        echo "quality/$QUALITY $f"
+    done
+    # The POI tier's records and strings; its string layout is the one every
+    # dir sharing the strings holds.
+    for f in poi_records.bin poi_vertices.bin poi_cells.bin poi_entries.bin strings_poi.bin \
+             strings_layout.json poi_meta.json; do
+        echo "poi/$POI_TIER $f"
+    done
+}
+
+if [ "${1:-}" = "--list-files" ]; then
+    selection_files
+    exit 0
+fi
 
 # Files in S3 are zstd-compressed with .zst suffix.  Helper fetches
 # either the .zst (preferred) or plain version, decompresses if needed.
@@ -53,83 +99,15 @@ else
     echo "Latest build: $LATEST"
     BASE="$TIGRIS_BASE/$LATEST"
 
-    if [ "$MINIMAL" = "1" ]; then
-        # Truly minimal — admin-only at q2.5 plus place nodes for
-        # cities/towns/villages/hamlets.  No streets, no addresses,
-        # no interpolation, no postcodes, no postal polygons, no POIs.
-        # strings_core.bin covers admin + place names; no other tier
-        # is needed.  Equivalent to GeoNames cities500-level detail
-        # with admin boundary lookup.
-        #
-        # Everything comes from the admin-minimal/ subdir (filtered: admin
-        # polygon IDs in [L2..L8], place types in {city,town,village,hamlet}):
-        # its own polygons re-simplified at q2.5, cell index, place_nodes,
-        # core strings and layout. The server derives the place index from
-        # place_nodes.bin at its first load.
-        admin_minimal_files="admin_cells.bin admin_entries.bin
-                             admin_polygons.bin admin_vertices.bin
-                             place_nodes.bin
-                             strings_core.bin strings_layout.json"
-        echo "Downloading admin-minimal mode files..."
-        for f in $admin_minimal_files; do
-            echo "  $f"
-            fetch "$BASE/planet/admin-minimal/$f" "$INDEX_DIR/$f" &
+    # An optional file a region lacks (interp_postcodes.bin outside TIGER
+    # regions, the postcode centroids) is a miss, not an error.
+    selection_files | {
+        while read -r dir f; do
+            echo "  $dir/$f"
+            fetch "$BASE/planet/$dir/$f" "$INDEX_DIR/$f" &
         done
         wait
-        # Skip the per-mode loop below — admin-minimal has its own dir.
-        full_files=""
-    else
-        # Full set: everything except postal_* (lives under each
-        # quality variant in v15) and strings_poi (lives under each
-        # POI tier in v15).  Both are fetched separately below.
-        full_files="geo_cells.bin
-                    street_entries.bin street_ways.bin street_nodes.bin
-                    addr_entries.bin addr_points.bin addr_vertices.bin addr_postcodes.bin
-                    interp_entries.bin interp_ways.bin interp_nodes.bin interp_postcodes.bin
-                    admin_cells.bin admin_entries.bin admin_parents.bin
-                    place_nodes.bin
-                    postcode_centroids.bin postcode_centroid_cells.bin postcode_centroid_entries.bin
-                    way_parents.bin way_postcodes.bin
-                    strings_core.bin strings_street.bin strings_addr.bin
-                    strings_postcode.bin"
-    fi
-    if [ -n "$full_files" ]; then
-        echo "Downloading mode files..."
-        for f in $full_files; do
-            echo "  $f"
-            fetch "$BASE/planet/full/$f" "$INDEX_DIR/$f" &
-        done
-        wait
-    fi
-
-    # Layout JSON (string tier offsets); admin-minimal fetched its own above.
-    if [ "$MINIMAL" != "1" ]; then
-        curl -sL -o "$INDEX_DIR/strings_layout.json" "$BASE/planet/full/strings_layout.json"
-    fi
-
-    # Admin polygons + postal polygons from the selected quality variant.
-    # Skipped entirely when MINIMAL=1 — admin-minimal has its own
-    # admin_polygons.bin / admin_vertices.bin (re-simplified over the
-    # L2-L8 subset only) and doesn't use postal polygons at all.
-    if [ "$MINIMAL" != "1" ]; then
-        echo "Downloading admin polygons (quality=$QUALITY)..."
-        for f in admin_polygons.bin admin_vertices.bin postal_polygons.bin postal_vertices.bin; do
-            echo "  $f"
-            fetch "$BASE/planet/quality/$QUALITY/$f" "$INDEX_DIR/$f" &
-        done
-        wait
-    fi
-
-    if [ "$MINIMAL" != "1" ]; then
-        # POI meta + tier data + tier-specific strings_poi.bin
-        curl -sL -o "$INDEX_DIR/poi_meta.json" "$BASE/planet/poi/$POI_TIER/poi_meta.json"
-        echo "Downloading POI data (tier=$POI_TIER)..."
-        for f in poi_records.bin poi_vertices.bin poi_cells.bin poi_entries.bin strings_poi.bin; do
-            echo "  $f"
-            fetch "$BASE/planet/poi/$POI_TIER/$f" "$INDEX_DIR/$f" &
-        done
-        wait
-    fi
+    }
 
     echo "Download complete."
     SENTINEL_SIZE=$(stat -c%s "$INDEX_DIR/$SENTINEL" 2>/dev/null || echo 0)

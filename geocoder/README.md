@@ -71,7 +71,7 @@ cargo build --release --manifest-path server/Cargo.toml
 ```
 
 The server downloads a continent from the latest build the first time a query
-lands in it: `admin` mode, `q2.5` boundaries and no POIs unless an admin sets
+lands in it: `admin` mode, `simplified` boundaries and no POIs unless an admin sets
 another selection with `PUT /admin/configuration` (a JSON body of `base_url`,
 `mode`, `quality`, `poi_tier` and the regions to `preload`). Queries need an
 API key from the dashboard (see Authentication below).
