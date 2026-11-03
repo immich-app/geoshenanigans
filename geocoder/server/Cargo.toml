@@ -17,6 +17,10 @@ path = "src/lib.rs"
 name = "query-server"
 path = "src/main.rs"
 
+[features]
+# The arc fixture writer (src/arc_fixture.rs), for the tests of crates that read the arc files.
+fixtures = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
