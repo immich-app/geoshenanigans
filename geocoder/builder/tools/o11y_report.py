@@ -9,9 +9,9 @@ Usage:
       (--base-url URL | --dry-run)
 
 nightly reports what only the build's runner has, from the files the run left
-in its work dir: the build phases, peak memory, patch verify counts, patch and
-index sizes and the data's age, and log lines for build.log, the memwatch
-samples and the patch verify results. An input a run never wrote leaves its
+in its work dir: the build phases, the arc stage's check counts, peak memory,
+patch verify counts, patch and index sizes and the data's age, and log lines
+for build.log, the memwatch samples and the patch verify results. An input a run never wrote leaves its
 metrics out. watchdog, every 2 hours on a GitHub-hosted runner, reports the
 published build's dates from latest.json with a heartbeat, and the outcome,
 duration and steps of the latest finished nightly (--run and --job, the GitHub
@@ -77,6 +77,10 @@ MEMORY_KINDS = {"anon": "anon", "file": "file", "file_dirty": "dirty", "others_r
 # Nested phases indent their names.
 PHASE_LINE = re.compile(r"^  \[(\d+(?:\.\d+)?)s[^\]]*\] (\S.*)$")
 MEMWATCH_FIELD = re.compile(r"(\w+)=(\d+)Mi\b")
+# An ARC_CHECK line of build-index's arc stage: key=value words, those whose
+# value is a count and those that say what they count (set=full,
+# tier=quality/simplified).
+ARC_CHECK_LINE = re.compile(r"^\s*ARC_CHECK((?: [\w-]+=\S+)+)\s*$")
 
 
 def unix_time(text):
@@ -119,6 +123,20 @@ def phases(build_log):
         match = PHASE_LINE.match(line)
         if match:
             found[match[2]] = round(found.get(match[2], 0) + float(match[1]), 1)
+    return found
+
+
+def arc_checks(build_log):
+    """(labels, check, count) of each count in build.log's ARC_CHECK lines,
+    labelled by the line's other words."""
+    found = []
+    for line in build_log:
+        match = ARC_CHECK_LINE.match(line)
+        if not match:
+            continue
+        words = [word.split("=", 1) for word in match[1].split()]
+        labels = {key: value for key, value in words if not value.isdigit()}
+        found += [(labels, key, int(value)) for key, value in words if value.isdigit()]
     return found
 
 
@@ -256,6 +274,8 @@ def nightly(opts, now):
             log.add(line, step="build")
     samples += [("geocoder_build_phase_duration_seconds", {"phase": name}, seconds)
                 for name, seconds in phases(build_log).items()]
+    samples += [("geocoder_build_arc_check", {**labels, "check": check}, count)
+                for labels, check, count in arc_checks(build_log)]
     samples += [("geocoder_build_peak_memory_bytes", {"kind": kind}, peak)
                 for kind, peak in peak_memory(memwatch_log).items()]
     if opts.data_timestamp:
