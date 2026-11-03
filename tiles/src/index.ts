@@ -23,6 +23,9 @@ export { parseUrl } from './request';
 export { Tiles } from './tiles';
 
 const DAY_SECONDS = 60 * 60 * 24;
+// For anything but a found response: a 404 or a failure is kept by no one, as without an explicit policy it is open to
+// heuristic caching.
+const NO_STORE = 'no-store';
 // What points clients at a deployment (TileJSON, styles) is rechecked every few minutes, so a deploy reaches them
 // quickly; an unchanged one costs a bodiless 304.
 const POINTER_CACHE = 'public, max-age=300';
@@ -57,7 +60,7 @@ export function cachePolicy(params: PMTilesParams, liveDeploymentKey: string): C
     case 'style':
       return { cacheControl: POINTER_CACHE, etag };
     default:
-      return { cacheControl: `public, max-age=${31 * DAY_SECONDS}` };
+      return { cacheControl: NO_STORE };
   }
 }
 
@@ -97,8 +100,9 @@ async function handleRequest(
   respHeaders.set(Header.PMTILES_DEPLOYMENT_KEY, env.DEPLOYMENT_KEY);
 
   if (pmTilesParams.requestType === undefined) {
-    respHeaders.set(Header.CACHE_CONTROL, policy.cacheControl);
-    return new Response('Invalid URL', { headers: respHeaders, status: 404 });
+    // Including URLs of an API version that isn't published and tiles that can't exist, which Tiles never sees.
+    respHeaders.set(Header.CACHE_CONTROL, NO_STORE);
+    return new Response('Not found', { headers: respHeaders, status: 404 });
   }
 
   const metricTags = { ...tags };
@@ -146,9 +150,8 @@ async function handleRequest(
     respHeaders.set(Header.CF_CACHE_STATUS, response.headers.get(Header.CF_CACHE_STATUS)!);
   }
   if (response.status !== 200) {
-    // A missing tile or a failure isn't kept by clients, as it isn't by the edge. Without an explicit policy a 404 is
-    // open to heuristic caching.
-    respHeaders.set(Header.CACHE_CONTROL, 'no-store');
+    // A missing tile or a failure isn't kept by clients, as it isn't by the edge.
+    respHeaders.set(Header.CACHE_CONTROL, NO_STORE);
     return new Response(response.body, { headers: respHeaders, status: response.status });
   }
   respHeaders.set(Header.CACHE_CONTROL, policy.cacheControl);

@@ -83,11 +83,10 @@ describe.skip('Hello World worker', () => {
 
 describe('parseUrl', () => {
   it.each`
-    url                             | version
-    ${'http://example.com/v1'}      | ${'1'}
-    ${'http://example.com/v2'}      | ${'2'}
-    ${'http://example.com/v1.json'} | ${'1'}
-    ${'http://example.com/v2.json'} | ${'2'}
+    url                              | version
+    ${'http://example.com/v1'}       | ${'1'}
+    ${'http://example.com/v1.json'}  | ${'1'}
+    ${'http://example.com/v01.json'} | ${'01'}
   `('json endpoint $url returns version $version', ({ url, version }) => {
     const result = parseUrl(new Request(url));
     expect(result).toStrictEqual({
@@ -100,8 +99,8 @@ describe('parseUrl', () => {
   it.each`
     url                                         | style      | version
     ${'http://example.com/v1/style/dark'}       | ${'dark'}  | ${'1'}
-    ${'http://example.com/v2/style/light'}      | ${'light'} | ${'2'}
-    ${'http://example.com/v2/style/dark.json'}  | ${'dark'}  | ${'2'}
+    ${'http://example.com/v1/style/light'}      | ${'light'} | ${'1'}
+    ${'http://example.com/v1/style/dark.json'}  | ${'dark'}  | ${'1'}
     ${'http://example.com/v1/style/light.json'} | ${'light'} | ${'1'}
   `('style endpoint $url returns style $style', ({ url, style, version }) => {
     const result = parseUrl(new Request(url));
@@ -114,9 +113,10 @@ describe('parseUrl', () => {
   });
 
   it.each`
-    url                                  | version | z      | x      | y
-    ${'http://example.com/v1/0/0/0.mvt'} | ${'1'}  | ${'0'} | ${'0'} | ${'0'}
-    ${'http://example.com/v2/1/2/3.mvt'} | ${'2'}  | ${'1'} | ${'2'} | ${'3'}
+    url                                          | version | z       | x             | y
+    ${'http://example.com/v1/0/0/0.mvt'}         | ${'1'}  | ${'0'}  | ${'0'}        | ${'0'}
+    ${'http://example.com/v1/2/3/1.mvt'}         | ${'1'}  | ${'2'}  | ${'3'}        | ${'1'}
+    ${'http://example.com/v1/26/67108863/0.mvt'} | ${'1'}  | ${'26'} | ${'67108863'} | ${'0'}
   `('tile endpoint $url returns tile $z/$x/$y with version $version', ({ url, version, z, x, y }) => {
     const result = parseUrl(new Request(url));
     expect(result).toStrictEqual({
@@ -142,15 +142,40 @@ describe('parseUrl', () => {
   it.each`
     url
     ${'http://example.com/v1.jason'}
-    ${'http://example.com/v2/1/2/3'}
-    ${'http://example.com/v2/1/2/3.mvt/extra'}
+    ${'http://example.com/v1/1/0/1'}
+    ${'http://example.com/v1/1/0/1.mvt/extra'}
+    ${'http://example.com/v1/1/0/1xmvt'}
     ${'http://example.com/v1/1/2.mvt'}
+    ${'http://example.com/v1/style/dark-mode'}
   `('url $url returns undefined request type', ({ url }) => {
     const result = parseUrl(new Request(url));
     expect(result).toStrictEqual({
       requestType: undefined,
       url: new URL(url),
     });
+  });
+
+  it.each`
+    url
+    ${'http://example.com/v0.json'}
+    ${'http://example.com/v2'}
+    ${'http://example.com/v2.json'}
+    ${'http://example.com/v2/style/dark'}
+    ${'http://example.com/v10/1/0/1.mvt'}
+  `('url $url of an unpublished API version returns undefined request type', ({ url }) => {
+    expect(parseUrl(new Request(url)).requestType).toBeUndefined();
+  });
+
+  it.each`
+    tile                          | reason
+    ${'0/0/1'}                    | ${'y beyond the grid'}
+    ${'1/2/0'}                    | ${'x beyond the grid'}
+    ${'14/16384/0'}               | ${'x of 2^z'}
+    ${'27/0/0'}                   | ${'z beyond the deepest tile ID'}
+    ${'99999999999999999999/0/0'} | ${'z beyond any number'}
+    ${'3/99999999999999999999/0'} | ${'x beyond any number'}
+  `('tile $tile with $reason returns undefined request type', ({ tile }) => {
+    expect(parseUrl(new Request(`http://example.com/v1/${tile}.mvt`)).requestType).toBeUndefined();
   });
 });
 
@@ -176,12 +201,12 @@ describe('cachePolicy', () => {
 
   it.each`
     url                           | cacheControl                                               | etag
-    ${'/v1/1/2/3.mvt'}            | ${'public, max-age=86400, stale-while-revalidate=2592000'} | ${'"20261102"'}
-    ${'/v1/1/2/3.mvt?v=20261102'} | ${'public, max-age=31536000, immutable'}                   | ${undefined}
-    ${'/v1/1/2/3.mvt?v=20250818'} | ${'public, max-age=300'}                                   | ${undefined}
+    ${'/v1/2/3/1.mvt'}            | ${'public, max-age=86400, stale-while-revalidate=2592000'} | ${'"20261102"'}
+    ${'/v1/2/3/1.mvt?v=20261102'} | ${'public, max-age=31536000, immutable'}                   | ${undefined}
+    ${'/v1/2/3/1.mvt?v=20250818'} | ${'public, max-age=300'}                                   | ${undefined}
     ${'/v1.json'}                 | ${'public, max-age=300'}                                   | ${'"20261102"'}
     ${'/v1/style/dark.json'}      | ${'public, max-age=300'}                                   | ${'"20261102"'}
-    ${'/v1/nonsense'}             | ${'public, max-age=2678400'}                               | ${undefined}
+    ${'/v1/nonsense'}             | ${'no-store'}                                              | ${undefined}
   `('$url gets $cacheControl', ({ url, cacheControl, etag }) => {
     expect(policy(url)).toStrictEqual(etag ? { cacheControl, etag } : { cacheControl });
   });
@@ -333,7 +358,7 @@ describe('gateway', () => {
   });
 
   it("passes on the client's continent, metric tags and accepted encodings, and nothing else it sent", async () => {
-    const { calls } = await fetchGateway('/v1/1/2/3.mvt', {
+    const { calls } = await fetchGateway('/v1/2/3/1.mvt', {
       headers: {
         Origin: 'https://photos.example.org',
         'If-None-Match': etag,
@@ -356,21 +381,34 @@ describe('gateway', () => {
     expect(Object.keys(headers).sort()).toEqual(['accept-encoding', 'x-continent', 'x-metric-tags']);
   });
 
-  it('answers other methods and unknown URLs itself', async () => {
-    const post = await fetchGateway('/v1/1/2/3.mvt', { method: 'POST' });
+  it('answers other methods itself', async () => {
+    const post = await fetchGateway('/v1/1/1/0.mvt', { method: 'POST' });
     expect(post.response.status).toBe(405);
-    const unknown = await fetchGateway('/v1/nonsense');
-    expect(unknown.response.status).toBe(404);
-    expect(unknown.response.headers.get('Cache-Control')).toBe('public, max-age=2678400');
-    expect(unknown.response.headers.get('Access-Control-Allow-Origin')).toBe('*');
-    expect([...post.calls, ...unknown.calls]).toEqual([]);
+    expect(post.calls).toEqual([]);
+  });
+
+  it.each`
+    url                           | reason
+    ${'/v1/nonsense'}             | ${'an unknown path'}
+    ${'/v1/1/2/3.mvt'}            | ${'a tile beyond its zoom grid'}
+    ${'/v1/30/0/0.mvt'}           | ${'a zoom no tile ID exists for'}
+    ${'/v2.json'}                 | ${'an unpublished API version'}
+    ${'/v2/style/light'}          | ${'a style of an unpublished API version'}
+    ${'/v3/1/1/0.mvt?v=20261102'} | ${'a tile of an unpublished API version'}
+  `('answers $reason ($url) with an uncached 404 without asking Tiles', async ({ url }) => {
+    const { response, calls } = await fetchGateway(url, { headers: { 'If-None-Match': etag } });
+    expect(response.status).toBe(404);
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+    expect(response.headers.has('ETag')).toBe(false);
+    expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
+    expect(calls).toEqual([]);
   });
 
   it.each`
     url                                        | cacheControl                                               | etag
-    ${'/v1/1/2/3.mvt'}                         | ${'public, max-age=86400, stale-while-revalidate=2592000'} | ${`"${env.DEPLOYMENT_KEY}"`}
-    ${`/v1/1/2/3.mvt?v=${env.DEPLOYMENT_KEY}`} | ${'public, max-age=31536000, immutable'}                   | ${null}
-    ${'/v1/1/2/3.mvt?v=20240101'}              | ${'public, max-age=300'}                                   | ${null}
+    ${'/v1/2/3/1.mvt'}                         | ${'public, max-age=86400, stale-while-revalidate=2592000'} | ${`"${env.DEPLOYMENT_KEY}"`}
+    ${`/v1/2/3/1.mvt?v=${env.DEPLOYMENT_KEY}`} | ${'public, max-age=31536000, immutable'}                   | ${null}
+    ${'/v1/2/3/1.mvt?v=20240101'}              | ${'public, max-age=300'}                                   | ${null}
     ${'/v1.json'}                              | ${'public, max-age=300'}                                   | ${`"${env.DEPLOYMENT_KEY}"`}
     ${'/v1/style/light.json'}                  | ${'public, max-age=300'}                                   | ${`"${env.DEPLOYMENT_KEY}"`}
   `("gives $url the client policy, not the edge's", async ({ url, cacheControl, etag }) => {
@@ -452,7 +490,7 @@ describe('gateway', () => {
 
     it.each`
       url                | headers                      | status
-      ${'/v1/1/2/3.mvt'} | ${{}}                        | ${200}
+      ${'/v1/2/3/1.mvt'} | ${{}}                        | ${200}
       ${'/v1.json'}      | ${{ 'If-None-Match': etag }} | ${304}
     `(
       'warms the nearby replica for $url ($status) without holding the response for it',
@@ -490,7 +528,7 @@ describe('gateway', () => {
       const ctx = createExecutionContext();
       Object.defineProperty(ctx, 'exports', { value: { Tiles: { fetch: async () => cachedTile() } } });
       const response = await worker.fetch(
-        new IncomingRequest('https://tiles.example/v1/1/2/3.mvt'),
+        new IncomingRequest('https://tiles.example/v1/2/3/1.mvt'),
         { ...env, D1_GLOBAL: d1 },
         ctx,
       );
@@ -644,6 +682,18 @@ describe('Tiles', () => {
     expect(response.headers.get('Cache-Control')).toBe('no-store');
     expect(metrics('error')).toEqual([expect.objectContaining({ error: 'Tigris is down' })]);
     expect(metrics('tiles_tile_request')).toEqual([expect.objectContaining({ z: '0' })]);
+  });
+
+  it.each`
+    path                | reason
+    ${'/v2.json'}       | ${'an unpublished API version'}
+    ${'/v1/0/0/1.mvt'}  | ${'a tile beyond its zoom grid'}
+    ${'/v1/27/0/0.mvt'} | ${'a zoom no tile ID exists for'}
+    ${'/v1/nonsense'}   | ${'an unknown path'}
+  `('answers an inner URL for $reason with an uncached 404', async ({ path }) => {
+    const response = await exports.Tiles.fetch(`https://tiles.internal/${key}${path}?rev=${CACHE_REVISION}`);
+    expect(response.status).toBe(404);
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
   });
 
   it('refuses a deployment other than the live one', async () => {

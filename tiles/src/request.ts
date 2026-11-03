@@ -4,7 +4,18 @@
  */
 
 const URL_MATCHER =
-  /^\/v(?<VERSION>[0-9]+)((?=)|\/style\/(?<STYLE>\w+)(?:\.json)?|(?<JSON>\.json)|\/(?<Z>\d+)\/(?<X>\d+)\/(?<Y>\d+).mvt)$/;
+  /^\/v(?<VERSION>[0-9]+)((?=)|\/style\/(?<STYLE>\w+)(?:\.json)?|(?<JSON>\.json)|\/(?<Z>\d+)\/(?<X>\d+)\/(?<Y>\d+)\.mvt)$/;
+
+// The API versions the TileJSON and styles point clients at. Any other is not found: served, each would fill the cache
+// with its own copy of every response.
+export const API_VERSIONS: ReadonlySet<number> = new Set([1]);
+// The deepest zoom a tile ID can be computed for (see zxyToTileId); the data's own range ends well before it.
+export const MAX_ZOOM = 26;
+
+/** Whether z/x/y names a tile at all: x and y within the zoom's 2^z by 2^z grid. */
+export function isTile(z: number, x: number, y: number): boolean {
+  return z <= MAX_ZOOM && x < 2 ** z && y < 2 ** z;
+}
 
 export type PMTilesParams = {
   requestType: 'tile' | 'json' | 'style' | undefined;
@@ -54,14 +65,15 @@ export function parseUrl(request: Request): PMTilesParams {
   return parsePath(new URL(request.url));
 }
 
+/** What a public URL asks for; requestType is undefined for anything the worker doesn't serve. */
 function parsePath(url: URL): PMTilesParams {
-  const matches = URL_MATCHER.exec(url.pathname);
-  const version = matches?.groups?.VERSION;
-  const style = matches?.groups?.STYLE;
-  const z = matches?.groups?.Z;
-  const x = matches?.groups?.X;
-  const y = matches?.groups?.Y;
-  if (version && z && x && y) {
+  const groups = URL_MATCHER.exec(url.pathname)?.groups;
+  const version = groups?.VERSION;
+  const { STYLE: style, Z: z, X: x, Y: y } = groups ?? {};
+  if (!version || !API_VERSIONS.has(Number(version)) || (z && !isTile(Number(z), Number(x), Number(y)))) {
+    return { requestType: undefined, url };
+  }
+  if (z && x && y) {
     const deploymentKey = url.searchParams.get('v');
     return {
       requestType: 'tile',
@@ -74,10 +86,8 @@ function parsePath(url: URL): PMTilesParams {
     } as PMTilesTileParams;
   } else if (style) {
     return { requestType: 'style', style, url, version } as PMTilesStyleParams;
-  } else if (version) {
-    return { requestType: 'json', version, url } as PMTilesJsonParams;
   }
-  return { requestType: undefined, url };
+  return { requestType: 'json', version, url } as PMTilesJsonParams;
 }
 
 // Workers Cache keys entries by path and query, not by host, so the inner URL's host is only a placeholder.
