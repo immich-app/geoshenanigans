@@ -4285,8 +4285,10 @@ static int run(int argc, char* argv[]) {
             for (size_t p = 0; p < in_minimal.size(); p++)
                 in_minimal[p] = admin_minimal_keeps(data.admin_polygons[p].admin_level,
                                                     data.admin_polygons[p].place_type_override);
-            data.admin_arcs = build_admin_arcs(data.admin_exact_rings, in_minimal,
-                                               cfg.prev_arcs_dir.empty() ? "" : cfg.prev_arcs_dir + "/planet", num_threads);
+            const AdminArcs arcs = build_admin_arcs(data.admin_exact_rings, in_minimal,
+                                                    cfg.prev_arcs_dir.empty() ? "" : cfg.prev_arcs_dir + "/planet",
+                                                    num_threads);
+            data.admin_arcs = encode_admin_arcs(arcs, data.admin_exact_rings, num_threads);
             log_phase("    Admin: arcs", _pt, _cpu);
         }
 

@@ -133,15 +133,6 @@ ArcVertices arc_vertices(const Store& store, const ArcView& view) {
     return {store.vertices.data() + ring.begin, ring.count, view};
 }
 
-// A polygon's rings, outer first, as AdminArcs numbers them.
-struct AdminArcPolygon {
-    uint32_t first_ring = 0;
-    uint32_t ring_count = 0;
-};
-inline bool operator==(const AdminArcPolygon& a, const AdminArcPolygon& b) {
-    return a.first_ring == b.first_ring && a.ring_count == b.ring_count;
-}
-
 struct AdminArcCounts {
     size_t junctions = 0;
     size_t arcs = 0;
@@ -259,8 +250,6 @@ struct AdminArcs {
     // the rings numbered as the exact ring store numbers them.
     std::vector<uint32_t> ring_refs;
     std::vector<ArcRef> refs;
-    // Parallel to ParsedData::admin_polygons; follows each admin permute.
-    std::vector<AdminArcPolygon> polygons;
     // The planet slots' IdAllocator table, its arc_index.osm_ids sidecar.
     std::vector<gc::id_alloc::SidecarSlot> planet_sidecar;
     AdminArcCounts counts;
@@ -365,6 +354,16 @@ ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store,
                             const std::vector<bool>& nests_exact, unsigned threads,
                             const std::function<void(const char*)>& phase_done = {});
 
+// A coordinate on a grid of `step` e7 units, half up: floordiv(c + step / 2, step).
+inline int32_t snap(int32_t c, int32_t step) {
+    const int64_t x = int64_t(c) + step / 2;
+    int64_t q = x / step;
+    if (x % step != 0 && x < 0) q--;
+    return static_cast<int32_t>(q * step);
+}
+
+inline PackedLocation snapped(PackedLocation p, int32_t step) { return {snap(p.lat_e7, step), snap(p.lon_e7, step)}; }
+
 // A vertex a tier stores: at `raw` among its arc's raw vertices, snapped.
 struct StoredVertex {
     uint32_t raw;
@@ -378,6 +377,10 @@ struct StoredVertex {
 // ends there) unless the arc is all one point.
 void tier_vertices(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
                    const ArcTierState& state, uint32_t arc, std::vector<StoredVertex>& out);
+// The same, the arc's raw vertices left in `raw`.
+void tier_vertices(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
+                   const ArcTierState& state, uint32_t arc, std::vector<PackedLocation>& raw,
+                   std::vector<StoredVertex>& out);
 
 // The arc stage over the planet's polygons: the topology, then the full set's
 // planet slots against the sidecar under `prev_planet_dir` (a cold start when
@@ -401,3 +404,95 @@ bool same_closed_ring(const PackedLocation* a, uint32_t a_count, const PackedLoc
 // only with it, and holding the planet's sidecar of each set.
 void require_arc_dirs(const std::string& output_dir, const std::string& arcs_out_dir,
                       const std::string& prev_arcs_dir);
+
+// --- The encoded arcs: what the stage leaves the build ---
+
+// Bytes [offset, offset + size) of a buffer.
+struct BlockSpan {
+    uint32_t offset = 0;
+    uint32_t size = 0;
+};
+inline bool operator==(const BlockSpan& a, const BlockSpan& b) { return a.offset == b.offset && a.size == b.size; }
+
+// A polygon's rings as the arc sets hold them: its rings' numbers among the
+// sets' ring refs, outer first, and its ring block in each set (empty in a
+// set none of its rings is in). Follows each admin permute; a tombstone's
+// is empty.
+struct AdminArcPolygon {
+    uint32_t first_ring = 0;
+    uint32_t ring_count = 0;
+    BlockSpan blocks[2];  // by ArcSet, in ArcSetBlocks::ring_blocks
+};
+inline bool operator==(const AdminArcPolygon& a, const AdminArcPolygon& b) {
+    return a.first_ring == b.first_ring && a.ring_count == b.ring_count && a.blocks[0] == b.blocks[0] &&
+           a.blocks[1] == b.blocks[1];
+}
+
+// Blocks back to back: block i is bytes[at[i], at[i + 1]).
+struct ArcBlocks {
+    std::vector<uint8_t> bytes;
+    std::vector<uint32_t> at;
+    size_t size() const { return at.empty() ? 0 : at.size() - 1; }
+    const uint8_t* data(size_t i) const { return bytes.data() + at[i]; }
+    size_t bytes_of(size_t i) const { return at[i + 1] - at[i]; }
+};
+
+// One arc set of a region: its arcs, in the planet's presentation order, by
+// their raw boxes, keys and planet slots and the region's slots (the
+// planet's on the planet) and slot table; each ring's refs to them, the
+// rings numbered as AdminArcPolygon numbers them; and the polygons' ring
+// blocks.
+struct ArcSetBlocks {
+    std::vector<ArcBox> boxes;
+    std::vector<uint64_t> keys;
+    std::vector<uint32_t> planet_slots;
+    std::vector<uint32_t> slots;
+    std::vector<gc::id_alloc::SidecarSlot> sidecar;
+    AdminArcSlotCounts slot_counts;
+    std::vector<uint32_t> ring_refs;  // ring r's refs: refs[ring_refs[r], ring_refs[r + 1])
+    std::vector<ArcRef> refs;
+    std::vector<uint8_t> ring_blocks;
+
+    size_t arcs() const { return keys.size(); }
+    bool has_ring(uint32_t r) const { return ring_refs[r + 1] > ring_refs[r]; }
+};
+
+// A region's encoded arcs: the sets, each tier's arc blocks (parallel to
+// kArcTiers, over its set's arcs), and every polygon's place in them
+// (parallel to ParsedData::admin_polygons). Empty unless the arc stage ran.
+struct AdminArcBlocks {
+    std::vector<AdminArcPolygon> polygons;
+    ArcSetBlocks sets[2];  // by ArcSet
+    ArcBlocks tiers[kArcTierCount];
+
+    const ArcSetBlocks& set(ArcSet s) const { return sets[static_cast<size_t>(s)]; }
+    ArcSetBlocks& set(ArcSet s) { return sets[static_cast<size_t>(s)]; }
+    // The bytes it holds.
+    uint64_t bytes() const;
+};
+
+// The arc stage's encoding of `arcs` (build_admin_arcs) of the store: every
+// tier's arc blocks and every polygon's ring blocks in both sets, with the
+// planet's slots. Aborts (std::runtime_error) unless every ring's refs chain
+// closes, every arc block decodes to the vertices its tier stores, those
+// are raw vertices of the arc snapped to the tier's grid (within
+// kChunkBoxSlackE7 of them), every ref names a live slot of its arc, and
+// every ring of every polygon in each set comes back exactly from its ring
+// block's refs to the exact tier's arc blocks (check_lossless). Logs its
+// counts as ARC_CHECK lines.
+AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& store, unsigned threads);
+
+// Encodes every polygon's ring block in set `set` with the set's slots
+// (ArcSetBlocks::slots), cut where its refs' planet slots say. Aborts unless
+// every ref names a live slot holding its arc's key.
+void encode_ring_blocks(AdminArcBlocks& blocks, ArcSet set, unsigned threads);
+
+// Losslessness: aborts unless, for every polygon of the store and each set
+// that holds its rings, its ring block decodes to as many rings, each of
+// whose refs, read through the slots to the exact tier's arc blocks (a
+// minimal arc's through its full arcs), chain into that exact ring of the
+// store, from some vertex in either direction.
+void check_lossless(const AdminArcs& arcs, const AdminArcBlocks& blocks, const AdminExactRings& store, unsigned threads);
+
+// The arc of each of the set's slots, UINT32_MAX for a tombstone.
+std::vector<uint32_t> arc_at_slot(const ArcSetBlocks& set);

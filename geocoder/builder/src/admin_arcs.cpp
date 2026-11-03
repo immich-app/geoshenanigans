@@ -837,9 +837,6 @@ AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>
     for (size_t a = 0; a < arcs.arcs.size(); a++) arcs.arcs[a].planet_slot = slots.slots[a];
     arcs.planet_sidecar = std::move(slots.sidecar);
     arcs.slot_counts = slots.counts;
-    arcs.polygons.resize(store.polygons.size());
-    for (size_t p = 0; p < store.polygons.size(); p++)
-        arcs.polygons[p] = {store.polygons[p].first_ring, store.polygons[p].ring_count};
     log_phase("      Admin arcs: planet slots", t, cpu);
 
     arcs.minimal = build_minimal_arcs(arcs, store, in_minimal, threads);

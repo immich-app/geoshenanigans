@@ -54,16 +54,6 @@ private:
     ArcSet set_;
 };
 
-// A coordinate on a grid of `step` e7 units, half up: floordiv(c + step / 2, step).
-int32_t snap(int32_t c, int32_t step) {
-    const int64_t x = int64_t(c) + step / 2;
-    int64_t q = x / step;
-    if (x % step != 0 && x < 0) q--;
-    return static_cast<int32_t>(q * step);
-}
-
-PackedLocation snapped(PackedLocation p, int32_t step) { return {snap(p.lat_e7, step), snap(p.lon_e7, step)}; }
-
 // tier_vertices for arc a's raw vertices `raw`.
 void stored_vertices(const std::vector<PackedLocation>& raw, const ArcKeep& keep, uint32_t a, const ArcTier& tier,
                      std::vector<StoredVertex>& out) {
@@ -914,8 +904,14 @@ ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store,
 }
 
 void tier_vertices(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
-                   const ArcTierState& state, uint32_t arc, std::vector<StoredVertex>& out) {
-    std::vector<PackedLocation> raw;
+                   const ArcTierState& state, uint32_t arc, std::vector<PackedLocation>& raw,
+                   std::vector<StoredVertex>& out) {
     SetArcs(arcs, store, tier.set).read(arc, raw);
     stored_vertices(raw, state.kept, arc, tier, out);
+}
+
+void tier_vertices(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
+                   const ArcTierState& state, uint32_t arc, std::vector<StoredVertex>& out) {
+    std::vector<PackedLocation> raw;
+    tier_vertices(arcs, store, tier, state, arc, raw, out);
 }

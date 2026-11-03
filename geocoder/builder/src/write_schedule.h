@@ -32,8 +32,8 @@ template <class T>
 inline uint64_t vector_bytes(const std::vector<T>& v) { return v.size() * sizeof(T); }
 
 // A region's records and the structures that run parallel to them, by kind.
-// Strings and postcode centroids count with the admins: every region holds
-// them whole or nearly so.
+// Strings, postcode centroids and the encoded arcs count with the admins:
+// every region holds them whole or nearly so.
 inline KindValues record_bytes(const ParsedData& d) {
     KindValues b{};
     at(b, RecordKind::Ways) = vector_bytes(d.ways) + vector_bytes(d.way_osm_ids) + vector_bytes(d.way_sidecar_blob)
@@ -54,7 +54,8 @@ inline KindValues record_bytes(const ParsedData& d) {
     at(b, RecordKind::Admins) = vector_bytes(d.admin_polygons) + vector_bytes(d.admin_osm_ids)
         + vector_bytes(d.admin_sidecar_blob) + vector_bytes(d.admin_parent_ids) + vector_bytes(d.admin_vertices)
         + map_bytes_approx(d.cell_to_admin) + vector_bytes(d.admin_index_cells)
-        + vector_bytes(d.admin_minimal_index_cells) + map_bytes_approx(d.postcode_accum) + strings;
+        + vector_bytes(d.admin_minimal_index_cells) + map_bytes_approx(d.postcode_accum) + strings
+        + d.admin_arcs.bytes();
     for (const auto& [cell, ids] : d.cell_to_admin) at(b, RecordKind::Admins) += vector_bytes(ids);
     return b;
 }

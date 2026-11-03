@@ -10,6 +10,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <random>
 #include <set>
@@ -167,6 +168,30 @@ std::vector<uint64_t> keys_of(const AdminArcs& arcs) {
     std::vector<uint64_t> keys;
     for (const Arc& a : arcs.arcs) keys.push_back(a.key);
     return keys;
+}
+
+// Polygon p's rings in `set` as a reader gets them from tier t's files: its
+// ring block's refs, through the slots to the tier's arc blocks, each walked
+// as its ref says, a junction once.
+std::vector<Ring> decoded_rings(const AdminArcBlocks& arcs, ArcSet set, size_t t, const AdminArcPolygon& p) {
+    const ArcSetBlocks& s = arcs.set(set);
+    const BlockSpan span = p.blocks[static_cast<size_t>(set)];
+    std::vector<std::vector<arc_blocks::SlotRef>> refs;
+    if (!arc_blocks::decode_rings(s.ring_blocks.data() + span.offset, span.size, refs)) return {};
+    const std::vector<uint32_t> arc_of = arc_at_slot(s);
+    std::vector<Ring> rings;
+    for (const auto& ring : refs) {
+        Ring out;
+        for (const arc_blocks::SlotRef& ref : ring) {
+            arc_blocks::DecodedArc arc;
+            const uint32_t a = arc_of.at(ref.slot);
+            if (!arc_blocks::decode_arc(arcs.tiers[t].data(a), arcs.tiers[t].bytes_of(a), arc)) return {};
+            if (ref.reversed) std::reverse(arc.vertices.begin(), arc.vertices.end());
+            out.insert(out.end(), arc.vertices.begin() + (out.empty() ? 0 : 1), arc.vertices.end());
+        }
+        rings.push_back(out);
+    }
+    return rings;
 }
 
 // A key's arc, by key (the tests' arcs have unique keys).
@@ -1047,10 +1072,185 @@ TEST(every_tier_is_the_same_whatever_the_threads) {
                    again.tiers[t].counts.crossings_left == one.tiers[t].counts.crossings_left;
         }
         CHECK(same);
+        // And their blocks.
+        const AdminArcBlocks a = encode_admin_arcs(one, store, 1), b = encode_admin_arcs(again, store, threads);
+        for (size_t t = 0; t < kArcTierCount; t++) CHECK(a.tiers[t].bytes == b.tiers[t].bytes && a.tiers[t].at == b.tiers[t].at);
+        for (size_t set = 0; set < 2; set++) CHECK(a.sets[set].ring_blocks == b.sets[set].ring_blocks);
+        CHECK(a.polygons == b.polygons);
     }
     CHECK(one.minimal.counts.arcs > 0);
     CHECK(one.tiers[2].counts.stored_vertices < one.tiers[0].counts.stored_vertices);
     CHECK(one.tiers[0].counts.stored_vertices < one.tiers[1].counts.stored_vertices);
+}
+
+// --- Encoding ---
+
+namespace {
+
+// Every shape the encoding meets: a lattice of neighbours (shared arcs walked
+// both ways), the lattice whole as one polygon, a cell with a hole and a
+// polygon filling it, a ring with a spike and an island; the minimal set
+// takes every other cell and the whole.
+struct MixedStore {
+    AdminExactRings store;
+    std::vector<bool> in_minimal;
+};
+
+MixedStore mixed_store() {
+    const Lattice lattice(4, 4, 6, 91, 20000);
+    std::vector<Polygon> polygons;
+    MixedStore m;
+    for (int r = 0; r < 4; r++)
+        for (int c = 0; c < 4; c++) {
+            polygons.push_back({lattice.block(r, c, 1, 1), {}});
+            m.in_minimal.push_back((r + c) % 2 == 0);
+        }
+    const Ring hole = closed({pt(5000, 5000), pt(9000, 5000), pt(9000, 9000), pt(5000, 9000)});
+    polygons[0].holes.push_back(hole);
+    polygons.push_back({hole, {}});
+    m.in_minimal.push_back(false);
+    polygons.push_back({lattice.block(0, 0, 4, 4), {}});
+    m.in_minimal.push_back(true);
+    polygons.push_back(
+        {closed({pt(100000, 0), pt(100000, 10000), pt(105000, 10000), pt(105000, 15000), pt(105000, 10000),
+                 pt(110000, 10000), pt(110000, 0)}),
+         {}});
+    m.in_minimal.push_back(true);
+    polygons.push_back({island(150000, 150000, 3000, 30, 5), {}});
+    m.in_minimal.push_back(false);
+    m.store = store_of(polygons);
+    return m;
+}
+
+// Ring r of set `set` as tier t stores its arcs, chained.
+Ring stored_ring(const AdminArcs& arcs, const AdminExactRings& store, size_t t, uint32_t r) {
+    const bool full = kArcTiers[t].set == ArcSet::Full;
+    const std::vector<uint32_t>& ring_refs = full ? arcs.ring_refs : arcs.minimal.ring_refs;
+    const std::vector<ArcRef>& refs = full ? arcs.refs : arcs.minimal.refs;
+    Ring out;
+    for (uint32_t k = ring_refs[r]; k < ring_refs[r + 1]; k++) {
+        Ring v = points_of(stored_of(arcs, store, kArcTiers[t], arcs.tiers[t], refs[k].arc));
+        if (refs[k].reversed) std::reverse(v.begin(), v.end());
+        out.insert(out.end(), v.begin() + (out.empty() ? 0 : 1), v.end());
+    }
+    return out;
+}
+
+// The blocks with block `a` of tier t given `vertices` instead.
+AdminArcBlocks with_block(const AdminArcBlocks& from, size_t t, size_t a, const Ring& vertices) {
+    AdminArcBlocks out = from;
+    const ArcBlocks& old = from.tiers[t];
+    ArcBlocks& blocks = out.tiers[t];
+    blocks = {};
+    blocks.at.push_back(0);
+    for (size_t i = 0; i < old.size(); i++) {
+        if (i == a) {
+            const uint8_t k = arc_blocks::grid_exponent(kArcTiers[t].grid_e7);
+            auto at = [&](size_t j) { return vertices[j]; };
+            const size_t n = arc_blocks::encode_arc(vertices.size(), at, k, nullptr);
+            blocks.bytes.resize(blocks.bytes.size() + n);
+            arc_blocks::encode_arc(vertices.size(), at, k, blocks.bytes.data() + blocks.bytes.size() - n);
+        } else {
+            blocks.bytes.insert(blocks.bytes.end(), old.data(i), old.data(i) + old.bytes_of(i));
+        }
+        blocks.at.push_back(static_cast<uint32_t>(blocks.bytes.size()));
+    }
+    return out;
+}
+
+Ring exact_arc(const AdminArcBlocks& blocks, size_t a) {
+    const ArcBlocks& exact = blocks.tiers[1];
+    arc_blocks::DecodedArc d;
+    REQUIRE(arc_blocks::decode_arc(exact.data(a), exact.bytes_of(a), d));
+    return d.vertices;
+}
+
+}  // namespace
+
+TEST(every_polygons_rings_come_back_from_its_ring_block_and_each_tiers_arc_blocks) {
+    const MixedStore m = mixed_store();
+    const AdminArcs arcs = build_admin_arcs(m.store, m.in_minimal, "", 2);
+    const AdminArcBlocks blocks = encode_admin_arcs(arcs, m.store, 2);
+    REQUIRE(blocks.polygons.size() == m.store.polygons.size());
+    CHECK(blocks.set(ArcSet::Full).slots.size() == arcs.arcs.size());
+    for (size_t a = 0; a < arcs.arcs.size(); a++) CHECK_EQ(blocks.set(ArcSet::Full).slots[a], arcs.arcs[a].planet_slot);
+    size_t minimal = 0;
+    for (uint32_t p = 0; p < blocks.polygons.size(); p++) {
+        const AdminArcPolygon& poly = blocks.polygons[p];
+        const AdminExactRings::Polygon& raw = m.store.polygons[p];
+        CHECK(poly.first_ring == raw.first_ring && poly.ring_count == raw.ring_count);
+        // The exact tier is the store's rings themselves.
+        const std::vector<Ring> exact = decoded_rings(blocks, ArcSet::Full, 1, poly);
+        REQUIRE(exact.size() == raw.ring_count);
+        for (uint32_t k = 0; k < raw.ring_count; k++) {
+            const RingSpan& span = m.store.rings[raw.first_ring + k];
+            CHECK(same_closed_ring(exact[k].data(), uint32_t(exact[k].size()), m.store.vertices.data() + span.begin,
+                                   span.count));
+        }
+        const std::vector<Ring> simplified = decoded_rings(blocks, ArcSet::Full, 0, poly);
+        REQUIRE(simplified.size() == raw.ring_count);
+        for (uint32_t k = 0; k < raw.ring_count; k++) CHECK(simplified[k] == stored_ring(arcs, m.store, 0, raw.first_ring + k));
+        CHECK_EQ(poly.blocks[1].size > 0, bool(m.in_minimal[p]));
+        if (!m.in_minimal[p]) continue;
+        minimal++;
+        const std::vector<Ring> small = decoded_rings(blocks, ArcSet::Minimal, 2, poly);
+        REQUIRE(small.size() == raw.ring_count);
+        for (uint32_t k = 0; k < raw.ring_count; k++) CHECK(small[k] == stored_ring(arcs, m.store, 2, raw.first_ring + k));
+    }
+    CHECK_EQ(minimal, size_t(10));
+    CHECK(blocks.bytes() > blocks.tiers[1].bytes.size());
+}
+
+TEST(the_losslessness_check_passes_holes_spikes_and_shared_arcs_and_aborts_on_one_exact_vertex_dropped_or_moved) {
+    const MixedStore m = mixed_store();
+    const AdminArcs arcs = build_admin_arcs(m.store, m.in_minimal, "", 1);
+    const AdminArcBlocks blocks = encode_admin_arcs(arcs, m.store, 1);
+    CHECK_EQ(refusal_of([&] { check_lossless(arcs, blocks, m.store, 3); }), std::string());
+    // The hole's arc, the island's, and one the lattice's cells share.
+    for (PackedLocation through : {pt(5000, 9000), pt(150000, 153000 + 1), pt(20000, 20000)}) {
+        uint32_t a = UINT32_MAX;
+        for (uint32_t k = 0; k < arcs.arcs.size() && a == UINT32_MAX; k++) {
+            const Ring v = exact_arc(blocks, k);
+            for (const PackedLocation& q : v)
+                if (std::abs(q.lat_e7 - through.lat_e7) <= 400 && std::abs(q.lon_e7 - through.lon_e7) <= 400) a = k;
+        }
+        REQUIRE(a != UINT32_MAX);
+        Ring moved = exact_arc(blocks, a), dropped = moved;
+        REQUIRE(moved.size() >= 3);
+        moved[1].lon_e7 += 1;
+        dropped.erase(dropped.begin() + 1);
+        for (const Ring& v : {moved, dropped})
+            CHECK(refusal_of([&] { check_lossless(arcs, with_block(blocks, 1, a, v), m.store, 2); })
+                      .find("doesn't come back exactly from its exact arcs") != std::string::npos);
+    }
+    // A minimal ring's first ref naming the arc of the next slot: the
+    // spike's ring, one chunk of 3 refs, no box.
+    AdminArcBlocks other = blocks;
+    const BlockSpan spike = other.polygons[18].blocks[1];
+    REQUIRE(spike.size >= 2);
+    other.set(ArcSet::Minimal).ring_blocks[spike.offset + 1] ^= 4;  // the lowest bit of its slot
+    CHECK(refusal_of([&] { check_lossless(arcs, other, m.store, 2); }).find("polygon 18 in the minimal set") !=
+          std::string::npos);
+}
+
+TEST(the_encoding_aborts_on_a_ring_whose_refs_dont_chain_or_a_ref_without_a_live_slot) {
+    const MixedStore m = mixed_store();
+    AdminArcs arcs = build_admin_arcs(m.store, m.in_minimal, "", 1);
+    AdminArcBlocks blocks = encode_admin_arcs(arcs, m.store, 1);
+    for (const auto& kill : std::vector<std::function<void(gc::id_alloc::SidecarSlot&)>>{
+             [](gc::id_alloc::SidecarSlot& s) { s.flags |= gc::id_alloc::SLOT_FLAG_TOMBSTONE; },
+             [](gc::id_alloc::SidecarSlot& s) { s.stable_id ^= 1; }}) {
+        AdminArcBlocks dead = blocks;
+        ArcSetBlocks& full = dead.set(ArcSet::Full);
+        kill(full.sidecar[full.slots[3]]);
+        CHECK(refusal_of([&] { encode_ring_blocks(dead, ArcSet::Full, 2); }).find("full arc 3 has no live slot") !=
+              std::string::npos);
+    }
+    // Cell 5's first two refs swapped.
+    const uint32_t r = m.store.polygons[5].first_ring, first = arcs.ring_refs[r];
+    REQUIRE(arcs.ring_refs[r + 1] - first >= 3);
+    std::swap(arcs.refs[first], arcs.refs[first + 1]);
+    CHECK(refusal_of([&] { encode_admin_arcs(arcs, m.store, 2); }).find("full refs don't chain") != std::string::npos);
 }
 
 // --- The stage's dirs ---
@@ -1104,22 +1304,25 @@ ParsedData named_polygons_with_arcs(int n) {
         if (i % 3 == 0) holes.push_back(closed({pt(at + 2, 2), pt(at + 2, 4), pt(at + 4, 3)}));
         d.admin_exact_rings.append(closed({pt(at, 0), pt(at, 10), pt(at + 10, 10), pt(at + 10, 0)}), holes);
     }
-    d.admin_arcs = build_admin_arcs(d.admin_exact_rings, std::vector<bool>(n, false), "", 1);
+    d.admin_arcs = encode_admin_arcs(build_admin_arcs(d.admin_exact_rings, std::vector<bool>(n, false), "", 1),
+                                     d.admin_exact_rings, 1);
     return d;
 }
 
-// Whether each polygon's arc rings rebuild to its own rings (its name sets
-// its latitude).
+// Whether each polygon's ring block decodes to its own rings (its name sets
+// its latitude), and its rings are the store's.
 bool arc_rings_follow_the_polygons(const ParsedData& d) {
     if (d.admin_arcs.polygons.size() != d.admin_polygons.size()) return false;
     for (size_t k = 0; k < d.admin_polygons.size(); k++) {
         const AdminArcPolygon& p = d.admin_arcs.polygons[k];
         if (p.ring_count == 0) return false;
-        const std::vector<PackedLocation> outer = rebuild_ring(d.admin_arcs, d.admin_exact_rings, ArcSet::Full, p.first_ring);
+        const std::vector<Ring> rings = decoded_rings(d.admin_arcs, ArcSet::Full, 1, p);
+        if (rings.size() != p.ring_count) return false;
         int32_t lowest = INT32_MAX;
-        for (const PackedLocation& v : outer) lowest = std::min(lowest, v.lat_e7);
+        for (const PackedLocation& v : rings[0]) lowest = std::min(lowest, v.lat_e7);
         if (lowest != 100 * static_cast<int32_t>(d.admin_polygons[k].name_id)) return false;
-        if (!(p == AdminArcPolygon{d.admin_exact_rings.polygons[k].first_ring, d.admin_exact_rings.polygons[k].ring_count}))
+        if (p.first_ring != d.admin_exact_rings.polygons[k].first_ring ||
+            p.ring_count != d.admin_exact_rings.polygons[k].ring_count)
             return false;
     }
     return true;
