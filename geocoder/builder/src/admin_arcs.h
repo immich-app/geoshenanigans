@@ -11,7 +11,10 @@
 //
 // That is the full set, every admin polygon's rings. The minimal set holds
 // admin-minimal's rings alone: its arcs are chains of full arcs, joined where
-// a full junction is one only for other polygons' rings. build-index runs the
+// a full junction is one only for other polygons' rings. Each set has its
+// tiers (kArcTiers): the exact tier stores every raw vertex, a simplified tier
+// the vertices Douglas-Peucker keeps of each arc, snapped to its grid, with
+// vertices given back where a ring would degenerate. build-index runs the
 // arc stage (build_admin_arcs) only with --arcs-out.
 #pragma once
 
@@ -218,6 +221,45 @@ struct MinimalArcs {
     AdminArcSlotCounts slot_counts;
 };
 
+// The raw vertices a simplified tier keeps of each arc of its set: bits from
+// word word_at_[a] on, one per raw vertex. Arcs never share a word, so
+// threads can mark different arcs at once.
+class ArcKeep {
+public:
+    ArcKeep() = default;
+    template <class Count>
+    ArcKeep(size_t arcs, Count count) : word_at_(arcs + 1, 0) {
+        for (size_t a = 0; a < arcs; a++) word_at_[a + 1] = word_at_[a] + (size_t(count(a)) + 63) / 64;
+        words_.assign(word_at_[arcs], 0);
+    }
+    bool empty() const { return word_at_.empty(); }
+    bool test(uint32_t arc, uint32_t i) const { return (words_[word_at_[arc] + i / 64] >> (i % 64)) & 1; }
+    void set(uint32_t arc, uint32_t i) { words_[word_at_[arc] + i / 64] |= uint64_t(1) << (i % 64); }
+    friend bool operator==(const ArcKeep& a, const ArcKeep& b) {
+        return a.word_at_ == b.word_at_ && a.words_ == b.words_;
+    }
+
+private:
+    std::vector<size_t> word_at_;
+    std::vector<uint64_t> words_;
+};
+
+struct ArcTierCounts {
+    size_t kept_vertices = 0;    // raw vertices kept
+    size_t stored_vertices = 0;  // after the snap drops repeats
+    size_t single_point_arcs = 0;  // arcs whose stored vertices are one point
+    int validity_rounds = 0;
+    size_t validity_restored = 0;
+    size_t degenerate_rings = 0;  // under 3 vertices or of no area, after every round
+};
+
+// What a tier holds: the keep marks of a simplified tier (empty for one that
+// stores every raw vertex) and its counts.
+struct ArcTierState {
+    ArcKeep kept;
+    ArcTierCounts counts;
+};
+
 // The arcs of every admin polygon's rings (the full set), and the minimal
 // set over them.
 struct AdminArcs {
@@ -235,6 +277,8 @@ struct AdminArcs {
     AdminArcCounts counts;
     AdminArcSlotCounts slot_counts;
     MinimalArcs minimal;
+    // Parallel to kArcTiers.
+    std::vector<ArcTierState> tiers;
 };
 
 // A minimal arc's vertices in its order, read through its parts' views.
@@ -309,10 +353,36 @@ std::string arc_sidecar_path(const std::string& region_dir, ArcSet set);
 MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& store,
                                const std::vector<bool>& in_minimal, unsigned threads);
 
+// Tier `tier` of its set of `arcs`. A simplified tier keeps each arc's ends
+// and the vertices Douglas-Peucker keeps at the tier's tolerance in degrees at
+// the arc's first latitude (meters_to_degrees), capped at cap_factor times
+// the square root of the smallest area of a ring of the set that uses the
+// arc; an arc whose ends meet keeps at least 4. It then gives vertices back
+// to a ring of under 3 vertices or of no area once snapped: the farthest
+// dropped one of its arc that strays most, for up to kArcValidityRounds
+// rounds. A tier with no tolerance keeps everything and counts nothing.
+// `phase_done` is told as each step ends.
+ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
+                            unsigned threads, const std::function<void(const char*)>& phase_done = {});
+
+// A vertex a tier stores: at `raw` among its arc's raw vertices, snapped.
+struct StoredVertex {
+    uint32_t raw;
+    PackedLocation at;
+};
+
+// The vertices `tier` (as `state` holds it) stores of arc `arc` of its set:
+// every raw vertex as it is when the tier simplifies nothing, else the kept
+// ones snapped to the tier's grid, a vertex that snaps onto the one before it
+// left out (the last raw vertex taking that one's place, so the arc still
+// ends there) unless the arc is all one point.
+void tier_vertices(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
+                   const ArcTierState& state, uint32_t arc, std::vector<StoredVertex>& out);
+
 // The arc stage over the planet's polygons: the topology, then the full set's
 // planet slots against the sidecar under `prev_planet_dir` (a cold start when
-// empty), every polygon's rings, and the minimal set of the polygons
-// `in_minimal` marks and its planet slots. Logs its steps and counts.
+// empty), every polygon's rings, the minimal set of the polygons `in_minimal`
+// marks and its planet slots, and every tier. Logs its steps and counts.
 AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>& in_minimal,
                            const std::string& prev_planet_dir, unsigned threads);
 

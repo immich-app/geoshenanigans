@@ -815,6 +815,19 @@ std::string slot_summary(const AdminArcSlotCounts& s, size_t slots) {
     return line.str();
 }
 
+std::string tier_summary(const ArcTier& tier, const ArcTierCounts& c) {
+    std::ostringstream line;
+    line << "  Admin arc tier " << tier.dir << " (" << (tier.set == ArcSet::Full ? "full" : "minimal") << " set): ";
+    if (!tier.simplifies()) {
+        line << c.stored_vertices << " vertices, every raw one; " << c.single_point_arcs << " arcs of one point\n";
+        return line.str();
+    }
+    line << c.kept_vertices << " raw vertices kept, " << c.stored_vertices << " stored once snapped, "
+         << c.single_point_arcs << " arcs of one point; validity: " << c.validity_rounds << " rounds, "
+         << c.validity_restored << " vertices back, " << c.degenerate_rings << " degenerate rings\n";
+    return line.str();
+}
+
 }  // namespace
 
 AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>& in_minimal,
@@ -843,6 +856,13 @@ AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>
     minimal.slot_counts = slots.counts;
     log_phase("      Admin arcs: minimal set", t, cpu);
 
+    for (const ArcTier& tier : kArcTiers) {
+        arcs.tiers.push_back(build_arc_tier(arcs, store, tier, threads, [&](const char* step) {
+            log_phase((std::string("      Admin arcs: ") + tier.dir + " " + step).c_str(), t, cpu);
+        }));
+        log_phase((std::string("      Admin arcs: ") + tier.dir).c_str(), t, cpu);
+    }
+
     const AdminArcCounts& c = arcs.counts;
     const MinimalArcCounts& m = minimal.counts;
     std::ostringstream line;
@@ -855,6 +875,7 @@ AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>
          << " vertices), " << m.refs << " refs over " << m.rings << " rings of " << m.polygons << " polygons; "
          << m.core_arcs << " full arcs in " << m.joined_junctions << " full junctions joined, " << m.duplicate_keys
          << " duplicate keys; " << slot_summary(minimal.slot_counts, minimal.planet_sidecar.size()) << "\n";
+    for (size_t k = 0; k < kArcTierCount; k++) line << tier_summary(kArcTiers[k], arcs.tiers[k].counts);
     std::cerr << line.str();
     return arcs;
 }

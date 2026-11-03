@@ -79,6 +79,7 @@ add_executable(build-index
     src/pbf_reader.cpp
     src/s2_helpers.cpp
     src/admin_arcs.cpp
+    src/admin_arc_tiers.cpp
     src/admin_cover.cpp
     src/admin_links.cpp
     src/ring_assembly.cpp
@@ -197,6 +198,7 @@ file(GLOB GEOCODER_TEST_SRCS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/test
 add_executable(geocoder-tests
     ${GEOCODER_TEST_SRCS}
     src/admin_arcs.cpp
+    src/admin_arc_tiers.cpp
     src/ring_assembly.cpp
     src/interpolation.cpp
     src/pbf_reader.cpp

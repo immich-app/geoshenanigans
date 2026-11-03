@@ -1,7 +1,7 @@
 // admin_arcs.h: the arc topology (junctions, cuts, canonical arcs, refs), the
 // arcs' keys and Hilbert presentation order, their slots, the minimal set, the
-// arc stage's dirs and its per-polygon rings following each admin permute. In
-// the sanitized suite: the
+// tiers (simplifying, the snap, validity), the arc stage's dirs and its
+// per-polygon rings following each admin permute. In the sanitized suite: the
 // topology's scatter and partition passes and the minimal chains index their
 // arrays directly.
 #include "admin_arcs.h"
@@ -710,6 +710,228 @@ TEST(the_minimal_set_is_the_topology_of_the_minimal_polygons_alone) {
         const AdminArcs one = full_and_minimal(store, in_minimal, 1);
         CHECK(one.minimal.refs == m.refs && one.minimal.parts == m.parts && one.minimal.part_at == m.part_at);
     }
+}
+
+// --- Tiers ---
+
+namespace {
+
+std::vector<StoredVertex> stored_of(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
+                                    const ArcTierState& state, uint32_t a) {
+    std::vector<StoredVertex> out;
+    tier_vertices(arcs, store, tier, state, a, out);
+    return out;
+}
+
+Ring points_of(const std::vector<StoredVertex>& stored) {
+    Ring out;
+    for (const StoredVertex& v : stored) out.push_back(v.at);
+    return out;
+}
+
+ArcTierState tier_of(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier, unsigned threads = 1) {
+    return build_arc_tier(arcs, store, tier, threads);
+}
+
+// The full set's arc holding vertex p, or none.
+uint32_t arc_through(const AdminArcs& arcs, const AdminExactRings& store, PackedLocation p) {
+    for (uint32_t a = 0; a < arcs.arcs.size(); a++) {
+        const Ring v = vertices_of(store, arcs.arcs[a]);
+        if (std::find(v.begin(), v.end(), p) != v.end()) return a;
+    }
+    return UINT32_MAX;
+}
+
+int32_t floordiv_snap(int32_t c) {
+    int64_t x = int64_t(c) + 50, q = x / 100;
+    if (x % 100 != 0 && x < 0) q--;
+    return int32_t(q * 100);
+}
+
+const ArcTier& simplified_tier() { return kArcTiers[0]; }
+
+// Two squares of side `side` e7 units at latitude `lat`, either side of the
+// border along longitude 0, which bows out to `bow` at its middle; the right
+// one only `width` wide.
+AdminExactRings squares_either_side(int32_t lat, int32_t side, int32_t bow, int32_t width) {
+    const PackedLocation low = pt(lat, 0), mid = pt(lat + side / 2, bow), high = pt(lat + side, 0);
+    return store_of({
+        {closed({pt(lat, -side), low, mid, high, pt(lat + side, -side)}), {}},
+        {closed({low, pt(lat, width), pt(lat + side, width), high, mid}), {}},
+    });
+}
+
+}  // namespace
+
+TEST(the_simplified_tolerance_is_37_5_m_at_the_first_vertex_capped_by_the_smallest_ring) {
+    const int32_t lat = 450000000, side = 100000;
+    const double epsilon_e7 = meters_to_degrees(kArcSimplifyToleranceM, lat / 1e7) * 1e7;
+    for (int32_t bow : {int32_t(epsilon_e7) - 5, int32_t(epsilon_e7) + 6}) {
+        const AdminExactRings store = squares_either_side(lat, side, bow, side);
+        const AdminArcs arcs = build_arc_topology(store, 1);
+        const ArcTierState state = tier_of(arcs, store, simplified_tier());
+        const uint32_t border = arc_through(arcs, store, pt(lat + side / 2, bow));
+        REQUIRE(border != UINT32_MAX);
+        CHECK_EQ(stored_of(arcs, store, simplified_tier(), state, border).size(), size_t(bow > epsilon_e7 ? 3 : 2));
+    }
+    // Beside a strip 2000 wide the cap is 0.1 * sqrt of the strip's area,
+    // under the tolerance: a bow of 1600 stays that a square's border loses.
+    for (int32_t width : {side, 2000}) {
+        const AdminExactRings store = squares_either_side(lat, side, 1600, width);
+        const AdminArcs arcs = build_arc_topology(store, 1);
+        const ArcTierState state = tier_of(arcs, store, simplified_tier());
+        const RingSpan strip = store.rings[1];
+        const __int128 a2 = exact_ring_area2(store.vertices.data() + strip.begin, strip.count);
+        const double cap_e7 = kArcCapFactor * std::sqrt(double(a2 < 0 ? -a2 : a2) * 0.5e-14) * 1e7;
+        const bool capped = cap_e7 < 1600;
+        CHECK_EQ(capped, width == 2000);
+        const uint32_t border = arc_through(arcs, store, pt(lat + side / 2, 1600));
+        CHECK_EQ(stored_of(arcs, store, simplified_tier(), state, border).size(), size_t(capped ? 3 : 2));
+    }
+}
+
+TEST(an_arc_whose_ends_meet_keeps_four_vertices) {
+    // A sliver island: its middle vertices lie 300 and 250 off the line
+    // between its tips, inside the tolerance and the cap, so Douglas-Peucker
+    // alone keeps the tips; the bisection keeps the farther middle one.
+    const Ring sliver = closed({pt(0, 0), pt(300, 50000), pt(0, 100000), pt(-250, 50000)});
+    const AdminExactRings store = store_of({{sliver, {}}});
+    const AdminArcs arcs = build_arc_topology(store, 1);
+    const ArcTierState state = tier_of(arcs, store, simplified_tier());
+    REQUIRE(arcs.arcs.size() == 1u);
+    const std::vector<StoredVertex> v = stored_of(arcs, store, simplified_tier(), state, 0);
+    CHECK(points_of(v) == Ring({pt(0, 0), pt(300, 50000), pt(0, 100000), pt(0, 0)}));
+    CHECK_EQ(state.counts.degenerate_rings, size_t(0));
+}
+
+TEST(the_simplified_tier_snaps_to_the_1_1_m_grid_and_drops_repeats) {
+    // A zigzag far out of the tolerance, so every vertex stays, at
+    // latitudes about the grid's half steps, and two that snap together.
+    const Ring zigzag = {pt(-151, 0), pt(100049, 10000), pt(-149, 20000), pt(100050, 30000), pt(100070, 30010),
+                         pt(-150, 40000), pt(100051, 50000)};
+    Ring above = zigzag, below = zigzag;
+    above.insert(above.end(), {pt(200000, 50000), pt(200000, 0)});
+    below.insert(below.end(), {pt(-300000, 50000), pt(-300000, 0)});
+    const AdminExactRings store = store_of({{closed(above), {}}, {closed(below), {}}});
+    const AdminArcs arcs = build_arc_topology(store, 1);
+    const ArcTierState state = tier_of(arcs, store, simplified_tier());
+    const uint32_t a = arc_through(arcs, store, pt(100049, 10000));
+    REQUIRE(a != UINT32_MAX);
+    Ring raw = vertices_of(store, arcs.arcs[a]);
+    if (raw.front() != zigzag.front()) std::reverse(raw.begin(), raw.end());
+    REQUIRE(raw == zigzag);
+    Ring got = points_of(stored_of(arcs, store, simplified_tier(), state, a));
+    if (got.front() != pt(-200, 0)) std::reverse(got.begin(), got.end());
+    CHECK(got == Ring({pt(-200, 0), pt(100000, 10000), pt(-100, 20000), pt(100100, 30000), pt(-100, 40000),
+                       pt(100100, 50000)}));
+    for (const PackedLocation& p : got) CHECK(p.lat_e7 == floordiv_snap(p.lat_e7) && p.lon_e7 == floordiv_snap(p.lon_e7));
+}
+
+TEST(simplified_vertices_are_raw_vertices_of_their_arc_snapped) {
+    std::vector<Polygon> cells = grid(6, 12, 51, 4000);
+    for (Polygon& p : cells)
+        for (PackedLocation& v : p.outer) v = pt(v.lat_e7 - 12345, v.lon_e7 - 6789);
+    const AdminExactRings store = store_of(cells);
+    const AdminArcs arcs = build_arc_topology(store, 1);
+    const ArcTierState state = tier_of(arcs, store, simplified_tier());
+    size_t dropped = 0;
+    for (uint32_t a = 0; a < arcs.arcs.size(); a++) {
+        const Ring raw = vertices_of(store, arcs.arcs[a]);
+        const std::vector<StoredVertex> v = stored_of(arcs, store, simplified_tier(), state, a);
+        REQUIRE(!v.empty());
+        CHECK_EQ(v.front().raw, 0u);
+        if (v.size() > 1) CHECK_EQ(v.back().raw, uint32_t(raw.size() - 1));
+        for (size_t k = 0; k < v.size(); k++) {
+            if (k > 0) CHECK(v[k].raw > v[k - 1].raw && v[k].at != v[k - 1].at);
+            CHECK(v[k].at == pt(floordiv_snap(raw[v[k].raw].lat_e7), floordiv_snap(raw[v[k].raw].lon_e7)));
+        }
+        dropped += raw.size() - v.size();
+    }
+    CHECK(dropped > 0);
+}
+
+TEST(the_exact_tier_stores_every_raw_vertex_as_it_is) {
+    std::vector<Polygon> cells = grid(5, 6, 61, 1000);
+    for (Polygon& p : cells)
+        for (PackedLocation& v : p.outer) v = pt(v.lat_e7 - 2501, v.lon_e7 - 2499);
+    // A coordinate twice in a row, and a ring the simplified tier snaps to a point.
+    cells.push_back({closed({pt(-90000, -90000), pt(-90000, -80000), pt(-90000, -80000), pt(-80000, -80000)}), {}});
+    cells.push_back({closed({pt(70000, 70000), pt(70010, 70000), pt(70000, 70010)}), {}});
+    const AdminExactRings store = store_of(cells);
+    const AdminArcs arcs = build_admin_arcs(store, std::vector<bool>(cells.size(), true), "", 2);
+    const ArcTier& exact = kArcTiers[1];
+    REQUIRE(!exact.simplifies());
+    const ArcTierState& state = arcs.tiers[1];
+    CHECK(state.kept.empty());
+    size_t vertices = 0;
+    for (uint32_t a = 0; a < arcs.arcs.size(); a++) {
+        const std::vector<StoredVertex> v = stored_of(arcs, store, exact, state, a);
+        CHECK(points_of(v) == vertices_of(store, arcs.arcs[a]));
+        for (uint32_t k = 0; k < v.size(); k++) CHECK_EQ(v[k].raw, k);
+        vertices += v.size();
+    }
+    CHECK_EQ(state.counts.stored_vertices, vertices);
+    CHECK_EQ(state.counts.stored_vertices, arcs.counts.arc_vertices);
+    CHECK_EQ(state.counts.single_point_arcs, size_t(1));
+    CHECK_EQ(state.counts.degenerate_rings + state.counts.validity_restored, size_t(0));
+    // The simplified tier has the one-point ring as degenerate.
+    CHECK_EQ(arcs.tiers[0].counts.degenerate_rings, size_t(1));
+}
+
+TEST(the_minimal_tier_simplifies_across_a_junction_it_joins) {
+    // The border of two minimal squares runs straight through (5, 0), where
+    // a triangle of another level touches it: the full set keeps it as an
+    // arc end, the minimal set drops it.
+    const int32_t s = 100000;
+    const Ring left = closed({pt(0, -s), pt(0, 0), pt(s / 2, 0), pt(s, 0), pt(s, -s)});
+    const Ring right = closed({pt(0, 0), pt(0, s), pt(s, s), pt(s, 0), pt(s / 2, 0)});
+    const Ring triangle = closed({pt(s / 2, 0), pt(s / 2 - 20000, -30000), pt(s / 2 + 20000, -30000)});
+    const AdminExactRings store = store_of({{left, {}}, {right, {}}, {triangle, {}}});
+    const AdminArcs arcs = build_admin_arcs(store, {true, true, false}, "", 1);
+    std::vector<PackedLocation> full_border, minimal_border;
+    for (uint32_t a = 0; a < arcs.arcs.size(); a++) {
+        const Ring v = points_of(stored_of(arcs, store, kArcTiers[0], arcs.tiers[0], a));
+        if (std::find(v.begin(), v.end(), pt(s / 2, 0)) != v.end() && v.size() == 2) full_border.push_back(v.front());
+    }
+    CHECK_EQ(full_border.size(), size_t(2));
+    bool found = false;
+    for (uint32_t a = 0; a < arcs.minimal.arcs.size(); a++) {
+        const Ring raw = minimal_vertices(store, arcs, a);
+        if (std::find(raw.begin(), raw.end(), pt(s / 2, 0)) == raw.end()) continue;
+        found = true;
+        CHECK(points_of(stored_of(arcs, store, kArcTiers[2], arcs.tiers[2], a)) == Ring({pt(0, 0), pt(s, 0)}));
+    }
+    CHECK(found);
+}
+
+// --- Validity ---
+
+TEST(a_ring_simplified_to_no_area_gets_its_most_straying_vertex_back) {
+    // A sliver between two squares, its sides bowing 80 off the line between
+    // its ends, where three polygons meet: both sides simplify to that line.
+    const int32_t s = 100000;
+    const PackedLocation j1 = pt(0, 0), j2 = pt(0, s);
+    const Ring upper = {j1, pt(50, 25000), pt(80, 50000), pt(50, 75000), j2};
+    const Ring lower = {j1, pt(-50, 25000), pt(-80, 50000), pt(-50, 75000), j2};
+    Ring above = upper, below = lower, sliver = upper;
+    above.insert(above.end(), {pt(s, s), pt(s, 0)});
+    below.insert(below.end(), {pt(-s, s), pt(-s, 0)});
+    std::reverse(below.begin(), below.end());
+    sliver.insert(sliver.end(), lower.rbegin() + 1, lower.rend() - 1);
+    const AdminExactRings store = store_of({{closed(above), {}}, {closed(below), {}}, {closed(sliver), {}}});
+    const AdminArcs arcs = build_arc_topology(store, 1);
+    CHECK_EQ(arcs.counts.junctions, size_t(2));
+    const ArcTierState state = tier_of(arcs, store, simplified_tier());
+    CHECK_EQ(state.counts.validity_rounds, 1);
+    CHECK_EQ(state.counts.validity_restored, size_t(1));
+    CHECK_EQ(state.counts.degenerate_rings, size_t(0));
+    // The upper side's middle, first of the two equally far.
+    size_t middles = 0;
+    for (uint32_t a = 0; a < arcs.arcs.size(); a++) {
+        const Ring v = points_of(stored_of(arcs, store, simplified_tier(), state, a));
+        middles += std::count(v.begin(), v.end(), pt(100, 50000)) + std::count(v.begin(), v.end(), pt(-100, 50000));
+    }
+    CHECK_EQ(middles, size_t(1));
 }
 
 // --- The stage's dirs ---

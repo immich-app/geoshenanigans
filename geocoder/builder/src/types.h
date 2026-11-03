@@ -218,6 +218,35 @@ static constexpr uint32_t kArcPartitions = 4096;
 // (admin_minimal_keeps), which admin-minimal-poi shares.
 enum class ArcSet : uint8_t { Full, Minimal };
 
+// The simplified tiers' Douglas-Peucker tolerance at every level, and its cap
+// for an arc of small rings: kArcCapFactor times the square root of the
+// smallest ring's area that uses the arc.
+static constexpr double kArcSimplifyToleranceM = 37.5;
+static constexpr double kArcCapFactor = 0.1;
+// The simplified tiers' grid, in e7 units: 1e-5 degrees, 1.1 m.
+static constexpr int32_t kSimplifiedGridE7 = 100;
+// Rounds that give a degenerate simplified ring vertices back.
+static constexpr int kArcValidityRounds = 64;
+
+// A boundary tier: the arcs of one set at one tolerance and grid. A tier
+// with no tolerance stores every raw vertex as OSM has it: no simplifying,
+// snapping or cap.
+struct ArcTier {
+    ArcSet set;
+    const char* dir;     // under a region's dir
+    double tolerance_m;  // 0: none
+    double cap_factor;   // 0: none
+    int32_t grid_e7;     // the snap grid's step; 1: OSM's own
+    bool simplifies() const { return tolerance_m > 0; }
+};
+
+inline constexpr ArcTier kArcTiers[] = {
+    {ArcSet::Full, "quality/simplified", kArcSimplifyToleranceM, kArcCapFactor, kSimplifiedGridE7},
+    {ArcSet::Full, "quality/exact", 0, 0, 1},
+    {ArcSet::Minimal, "admin-minimal", kArcSimplifyToleranceM, kArcCapFactor, kSimplifiedGridE7},
+};
+inline constexpr size_t kArcTierCount = sizeof(kArcTiers) / sizeof(kArcTiers[0]);
+
 // --- Index mode ---
 
 enum class IndexMode { Full, NoAddresses, AdminOnly };
