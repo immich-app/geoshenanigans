@@ -313,6 +313,7 @@ describe('gateway', () => {
       headers: {
         'Cache-Control': EDGE_CACHE,
         'Content-Type': 'application/x-protobuf',
+        'Content-Length': '4',
         'PMTiles-Deployment-Key': key,
         Age: '86400',
         'Cf-Cache-Status': cacheStatus,
@@ -381,10 +382,70 @@ describe('gateway', () => {
     expect(Object.keys(headers).sort()).toEqual(['accept-encoding', 'x-continent', 'x-metric-tags']);
   });
 
-  it('answers other methods itself', async () => {
-    const post = await fetchGateway('/v1/1/1/0.mvt', { method: 'POST' });
-    expect(post.response.status).toBe(405);
-    expect(post.calls).toEqual([]);
+  it.each(['POST', 'PUT', 'DELETE', 'PATCH'])('refuses %s itself', async (method) => {
+    const { response, calls } = await fetchGateway('/v1/1/1/0.mvt', { method });
+    expect(response.status).toBe(405);
+    expect(response.headers.get('Allow')).toBe('GET, HEAD, OPTIONS');
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+    expect(calls).toEqual([]);
+  });
+
+  it.each(['/v1/1/1/0.mvt', '/v1.json', '/anything'])('answers a CORS preflight for %s itself', async (url) => {
+    const { response, calls } = await fetchGateway(url, {
+      method: 'OPTIONS',
+      headers: { Origin: 'https://photos.example.org', 'Access-Control-Request-Method': 'GET' },
+    });
+    expect(response.status).toBe(204);
+    expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
+    expect(response.headers.get('Access-Control-Allow-Methods')).toBe('GET, HEAD, OPTIONS');
+    expect(response.body).toBeNull();
+    expect(calls).toEqual([]);
+  });
+
+  it.each`
+    url                                        | cacheControl                                               | etag
+    ${'/v1/2/3/1.mvt'}                         | ${'public, max-age=86400, stale-while-revalidate=2592000'} | ${`"${env.DEPLOYMENT_KEY}"`}
+    ${`/v1/2/3/1.mvt?v=${env.DEPLOYMENT_KEY}`} | ${'public, max-age=31536000, immutable'}                   | ${null}
+    ${'/v1.json'}                              | ${'public, max-age=300'}                                   | ${`"${env.DEPLOYMENT_KEY}"`}
+  `("answers HEAD for $url with GET's headers and no body", async ({ url, cacheControl, etag }) => {
+    let tileBody: ReadableStream | null = null;
+    const { response, calls } = await fetchGateway(url, {
+      method: 'HEAD',
+      tiles: () => {
+        const tile = cachedTile();
+        tileBody = tile.body;
+        return tile;
+      },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get('Cache-Control')).toBe(cacheControl);
+    expect(response.headers.get('ETag')).toBe(etag);
+    expect(response.headers.get('Content-Type')).toBe('application/x-protobuf');
+    expect(response.headers.get('Content-Length')).toBe('4');
+    expect(response.headers.get('Cf-Cache-Status')).toBe('HIT');
+    expect(response.headers.get('Access-Control-Allow-Origin')).toBe('*');
+    expect(response.body).toBeNull();
+    // Tiles is asked with GET, which shares the cached entry, and its body is let go.
+    expect(calls.map((request) => request.method)).toEqual(['GET']);
+    expect(tileBody!.locked).toBe(false);
+    await expect(tileBody!.getReader().read()).resolves.toEqual({ done: true, value: undefined });
+  });
+
+  it('answers HEAD with a 304 for a response the client already has', async () => {
+    const { response } = await fetchGateway('/v1.json', { method: 'HEAD', headers: { 'If-None-Match': etag } });
+    expect(response.status).toBe(304);
+    expect(response.headers.get('ETag')).toBe(etag);
+  });
+
+  it.each`
+    url                | tiles
+    ${'/v1/nonsense'}  | ${undefined}
+    ${'/v1/1/0/0.mvt'} | ${() => new Response('Tile not found', { status: 404, headers: { 'Cache-Control': 'no-store' } })}
+  `('answers HEAD for $url with an uncached 404 and no body', async ({ url, tiles }) => {
+    const { response } = await fetchGateway(url, { method: 'HEAD', tiles });
+    expect(response.status).toBe(404);
+    expect(response.headers.get('Cache-Control')).toBe('no-store');
+    expect(response.body).toBeNull();
   });
 
   it.each`
@@ -784,6 +845,15 @@ describe('Tiles', () => {
     `('keeps the 404 for a tile $reason despite a matching ETag', async ({ tile }) => {
       const response = await fetchWith(`https://tiles.example/v1/${tile}.mvt`, { 'If-None-Match': etag });
       expect(response.status).toBe(404);
+    });
+
+    it('answers HEAD for a tile Tiles reads from storage without its body', async () => {
+      mockStorage();
+      const response = await exports.default.fetch(`https://tiles.example/v1/0/0/0.mvt?v=${key}`, { method: 'HEAD' });
+      expect(response.status).toBe(200);
+      expect(response.headers.get('Content-Encoding')).toBe('gzip');
+      expect(response.headers.get('Cache-Control')).toBe('public, max-age=31536000, immutable');
+      expect(response.body).toBeNull();
     });
 
     it('hands clients the stored tile bytes, encoded once', async () => {

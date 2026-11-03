@@ -30,6 +30,9 @@ const NO_STORE = 'no-store';
 // quickly; an unchanged one costs a bodiless 304.
 const POINTER_CACHE = 'public, max-age=300';
 
+// HEAD is answered like GET, without the body, and OPTIONS is a CORS preflight.
+const ALLOWED_METHODS = 'GET, HEAD, OPTIONS';
+
 // Cache statuses of a response the cache answered from a stored copy, without running Tiles for this request.
 // Requests that waited for another request's fill count as HIT too.
 const FROM_CACHE = new Set(['hit', 'stale', 'updating']);
@@ -88,27 +91,37 @@ async function handleRequest(
   metrics: IMetricsRepository,
   tags: { [key: string]: string },
 ): Promise<Response> {
-  if (request.method.toUpperCase() !== 'GET') {
-    return new Response(undefined, { status: 405 });
-  }
-
-  const pmTilesParams = parseUrl(request);
-  const requestType = pmTilesParams.requestType ?? 'unknown';
-  const policy = cachePolicy(pmTilesParams, env.DEPLOYMENT_KEY);
   const respHeaders = new Headers();
   respHeaders.set(Header.ACCESS_CONTROL_ALLOW_ORIGIN, '*');
   respHeaders.set(Header.PMTILES_DEPLOYMENT_KEY, env.DEPLOYMENT_KEY);
 
+  const method = request.method.toUpperCase();
+  if (method === 'OPTIONS') {
+    respHeaders.set(Header.ACCESS_CONTROL_ALLOW_METHODS, ALLOWED_METHODS);
+    return new Response(null, { headers: respHeaders, status: 204 });
+  }
+  if (method !== 'GET' && method !== 'HEAD') {
+    respHeaders.set(Header.ALLOW, ALLOWED_METHODS);
+    respHeaders.set(Header.CACHE_CONTROL, NO_STORE);
+    return new Response(null, { headers: respHeaders, status: 405 });
+  }
+  const head = method === 'HEAD';
+
+  const pmTilesParams = parseUrl(request);
+  const requestType = pmTilesParams.requestType ?? 'unknown';
+  const policy = cachePolicy(pmTilesParams, env.DEPLOYMENT_KEY);
+
   if (pmTilesParams.requestType === undefined) {
     // Including URLs of an API version that isn't published and tiles that can't exist, which Tiles never sees.
     respHeaders.set(Header.CACHE_CONTROL, NO_STORE);
-    return new Response('Not found', { headers: respHeaders, status: 404 });
+    return new Response(head ? null : 'Not found', { headers: respHeaders, status: 404 });
   }
 
   const metricTags = { ...tags };
   if (pmTilesParams.requestType === 'tile') {
     metricTags.url = (pmTilesParams as PMTilesTileParams).deploymentKey ? 'versioned' : 'unversioned';
   }
+  // Always a GET, HEAD included: the cache keeps one entry for both, and Tiles only ever sends whole responses.
   const innerRequest = new Request(innerUrl(pmTilesParams, env.DEPLOYMENT_KEY), {
     headers: {
       [Header.CONTINENT]: request.cf?.continent ?? '',
@@ -149,10 +162,23 @@ async function handleRequest(
   if (response.headers.has(Header.CF_CACHE_STATUS)) {
     respHeaders.set(Header.CF_CACHE_STATUS, response.headers.get(Header.CF_CACHE_STATUS)!);
   }
+  // The response with Tiles' body, or for HEAD without it, though with the length it would have had.
+  const reply = async (status: number) => {
+    if (!head) {
+      return new Response(response.body, { headers: respHeaders, status });
+    }
+    await response.body?.cancel();
+    const length = response.headers.get(Header.CONTENT_LENGTH);
+    if (length !== null) {
+      respHeaders.set(Header.CONTENT_LENGTH, length);
+    }
+    return new Response(null, { headers: respHeaders, status });
+  };
+
   if (response.status !== 200) {
     // A missing tile or a failure isn't kept by clients, as it isn't by the edge.
     respHeaders.set(Header.CACHE_CONTROL, NO_STORE);
-    return new Response(response.body, { headers: respHeaders, status: response.status });
+    return reply(response.status);
   }
   respHeaders.set(Header.CACHE_CONTROL, policy.cacheControl);
   if (policy.etag) {
@@ -172,7 +198,7 @@ async function handleRequest(
     respHeaders.delete(Header.CONTENT_TYPE);
     return new Response(null, { status: 304, headers: respHeaders });
   }
-  return new Response(response.body, { headers: respHeaders, status: 200 });
+  return reply(200);
 }
 
 export default {
