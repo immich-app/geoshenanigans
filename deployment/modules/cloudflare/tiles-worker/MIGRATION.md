@@ -21,19 +21,22 @@ stay as they are; only Terraform state changes, and CI does that by itself.
 - `apply` removes every `cloudflare_workers_domain` entry from the environment's state. The jobs that apply the module
   run it right before their apply, in the same job and so under the same `tiles-apply-<env>` concurrency group:
   Deploy Terragrunt and Deploy Dev Worker in `tiles-worker.yml`, and Activate in `tiles-deploy.yml`.
-- `preview` is for the PR's Plan Terragrunt jobs and never writes the remote state. It pulls the state into the
-  runner's temp directory, removes the same entries from that copy, and plans a copy of the module against it. Plan All
-  then leaves tiles-worker out, since it can't plan against the real state yet.
+- `preview` is for the PR's Plan Terragrunt jobs and never writes the remote state. It copies the state into the
+  runner's temp directory, removes the same entries from that copy, and plans a copy of the module against it. The
+  state holds the Worker's secrets, so the copy is only ever written encrypted (OpenTofu state encryption, under a
+  passphrase made for the run and kept in memory), and the plan isn't saved. Plan All then leaves tiles-worker out,
+  since it can't plan against the real state yet.
 
 Once an environment's entries are gone, both modes do nothing: `preview` lets Plan All plan the module as usual, and
 `apply` makes no state write. That makes them safe to run on every deploy, and a run whose apply failed recovers by
 running again: the entries are already gone, and an import of a domain that's already in state is a no-op.
 
-On the PR, each environment's Preview tiles-worker state migration step lists the entries the deploy will remove and
-prints the plan the deploy will then apply: its domains imported (1 in dev, 2 in prod),
-`cloudflare_workers_script.tiles` updated in place, and nothing added or destroyed. A local run against a v4-shaped
-state and a stub API gave `2 to import, 0 to add, 1 to change, 0 to destroy` for prod. The step fails if the plan
-would destroy or replace anything.
+On the PR, each environment's Preview tiles-worker state migration step lists the entries the deploy will remove,
+then each resource's planned action and the totals of the plan the deploy will then apply (not the attribute diff):
+its domains imported (1 in dev, 2 in prod), `cloudflare_workers_script.tiles` updated in place, and nothing added or
+destroyed. A local run against a v4-shaped state and a stub API gave `2 to import, 5 to add, 1 to change, 0 to destroy`
+for prod, the adds being the Grafana resources that test state didn't have. The step fails if the plan would destroy
+or replace anything.
 
 On merge, main's Deploy Terragrunt migrates and applies prod, then Deploy Dev Worker does dev. No tiles deploy needs to
 be held, with one exception: a Tiles Deploy dispatched before the merge runs the workflow without the migration step,

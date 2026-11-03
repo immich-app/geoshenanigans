@@ -7,9 +7,10 @@
 #   apply    Removes the v4 entries from state. Run it right before applying the module, under the same concurrency
 #            group. Once they're gone it does nothing, so a run whose apply failed recovers by running again.
 #   preview  Plans the module against a local copy of the state without the v4 entries, which is what apply and the
-#            deploy's apply will do, and fails if that plan destroys anything. The remote state isn't touched. Once
-#            the entries are gone it does nothing and the module plans as usual. In GitHub Actions it sets the step
-#            output pending to true when it planned the module, so the job's own plan can leave it out.
+#            deploy's apply will do, and fails if that plan destroys or replaces anything. The remote state isn't
+#            touched. The copy holds the worker's secrets, so it's only ever written encrypted, and the plan isn't
+#            saved. Once the entries are gone it does nothing and the module plans as usual. In GitHub Actions it sets
+#            the step output pending to true when it planned the module, so the job's own plan can leave it out.
 #
 # Run it like the terragrunt jobs: ENVIRONMENT set, under op run --env-file=deployment/.env.
 #
@@ -89,16 +90,46 @@ apply() {
   echo "$env: state migrated"
 }
 
+# OpenTofu encryption for preview's copy of the state, its backups and any plan, under a passphrase drawn for this run.
+# The passphrase only ever lives in this process's memory and the environment of the tofu commands it runs, so what
+# they write can't be read once the script is gone, and enforced stops tofu writing either in plaintext. Built with
+# builtins, so the passphrase is never in a command line.
+encryption_config() {
+  local passphrase
+  passphrase=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    echo "::add-mask::$passphrase"
+  fi
+  printf -v encryption '%s\n' \
+    'key_provider "pbkdf2" "run" {' \
+    "  passphrase = \"$passphrase\"" \
+    '}' \
+    'method "aes_gcm" "run" {' \
+    '  keys = key_provider.pbkdf2.run' \
+    '}' \
+    'state {' \
+    '  method   = method.aes_gcm.run' \
+    '  enforced = true' \
+    '}' \
+    'plan {' \
+    '  method   = method.aes_gcm.run' \
+    '  enforced = true' \
+    '}'
+}
+
+# tofu on preview's copy of the module. Only these commands get the encryption: terragrunt's, on the real state, don't.
+copy_tofu() {
+  TF_ENCRYPTION=$encryption "$tofu" "$@"
+}
+
 preview() {
-  local state found deletes
+  local state found events deletes status=0
   local -a old
-  work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/tiles-worker-v5.XXXXXX")
-  trap 'rm -rf "$work"' EXIT
-  # The state holds the worker's secrets. It stays in this private directory, which goes when the script exits.
-  state="$work/terraform.tfstate"
   tg_init
-  tg state pull > "$state"
-  found=$(old_entries < "$state")
+  # The state holds the worker's secrets, so it stays in memory until tofu encrypts it, and goes through pipes rather
+  # than here-strings, which bash can back with a temp file.
+  state=$(tg state pull)
+  found=$(printf '%s\n' "$state" | old_entries)
   mapfile -t old <<<"$found"
   if [ -z "$found" ]; then
     echo "$env: no $old_type entries in state, the module plans as usual"
@@ -106,27 +137,41 @@ preview() {
     return
   fi
 
-  # A copy of the module whose backend is the local copy of the state, so nothing here can write the real one.
+  work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/tiles-worker-v5.XXXXXX")
+  trap 'rm -rf "$work"' EXIT
+  encryption_config
+  # A copy of the module whose backend is a local state in this private directory, so nothing here can write the
+  # real one.
   mkdir "$work/module"
   tar -C "$module_dir" --exclude=./.terraform --exclude=./.terragrunt-cache -cf - . | tar -C "$work/module" -xf -
-  jq -n --arg path "$state" '{terraform: {backend: {local: {path: $path}}}}' > "$work/module/backend_override.tf.json"
+  jq -n --arg path "$work/terraform.tfstate" '{terraform: {backend: {local: {path: $path}}}}' \
+    > "$work/module/backend_override.tf.json"
   cd "$work/module"
-  # Keeps tofu from suggesting the saved plan be applied.
-  export TF_IN_AUTOMATION=1
   group "$tofu init"
-  "$tofu" init -input=false
+  copy_tofu init -input=false
   endgroup
+  printf '%s\n' "$state" | copy_tofu state push - > /dev/null
 
   # The same removal apply makes, here on the copy.
-  "$tofu" state rm "${old[@]}" > /dev/null
+  copy_tofu state rm "${old[@]}" > /dev/null
   echo "$env: the deploy removes these v4 custom domain entries from state before its apply:"
   printf '  %s\n' "${old[@]}"
   echo "$env: planning the module against a copy of the state without them (the remote state is unchanged)"
-  # The same var file terragrunt.hcl passes.
-  "$tofu" plan -input=false -lock=false -var-file="tiles.$env.tfvars.json" -out="$work/plan"
+  # Not saved: a plan file would hold the worker's secrets. The JSON messages name each resource and its action but
+  # carry no attribute values. The var file is the one terragrunt.hcl passes.
+  events=$(copy_tofu plan -input=false -lock=false -json -var-file="tiles.$env.tfvars.json") || status=$?
+  # Each planned change, the totals, and any warnings or errors.
+  printf '%s\n' "$events" | jq -r '
+    select(.type == "planned_change" or .type == "change_summary" or .type == "diagnostic")
+    | .["@message"] + (.diagnostic.detail // "" | if . == "" then "" else "\n" + . end)'
+  if [ "$status" -ne 0 ]; then
+    echo "::error::the migrated $env plan failed" >&2
+    exit "$status"
+  fi
 
-  deletes=$("$tofu" show -json "$work/plan" |
-    jq -r '.resource_changes[]? | select(.change.actions | index("delete")) | .address')
+  deletes=$(printf '%s\n' "$events" | jq -r '
+    select(.type == "planned_change" and (.change.action == "delete" or .change.action == "replace"))
+    | .change.resource.addr')
   if [ -n "$deletes" ]; then
     echo "::error::the migrated $env plan destroys or replaces resources:" >&2
     echo "$deletes" >&2
