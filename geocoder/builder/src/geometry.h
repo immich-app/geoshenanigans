@@ -323,16 +323,6 @@ inline double meters_to_degrees(double meters, double latitude_deg) {
     return meters / (111320.0 * cos_lat);
 }
 
-// Simplification epsilon in meters per admin level.
-inline constexpr double kAdminEpsilonMeters[12] = {
-    15, 15, 500, 200, 100, 50, 30, 20, 15, 15, 15, 15
-};
-
-inline double admin_epsilon_meters(uint8_t admin_level) {
-    int idx = (admin_level <= 11) ? admin_level : 11;
-    return kAdminEpsilonMeters[idx];
-}
-
 // Validate a postcode string for the centroid index. Mirrors
 // Nominatim's clean_postcodes sanitizer — rejects values that
 // don't conform to any known postcode pattern. The builder

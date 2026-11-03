@@ -2,6 +2,7 @@
 // --multi-quality) and both admin-minimal dirs (with --multi-output) hold
 // their admin geometry as arcs, and nothing else does; a chained build of the
 // same data (--prev-output) writes them again unchanged.
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -235,4 +236,31 @@ TEST(multi_quality_takes_no_scale_list_and_without_it_no_boundary_tier_is_writte
         for (const char* f : {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin"})
             CHECK(files.count(std::string("planet/") + dir + "/" + f));
     CHECK(!files.at("planet/admin-minimal/arc_vertices.bin").empty());
+}
+
+TEST(an_admin_polygon_is_built_whatever_simplifying_would_leave_of_its_ring) {
+    // A closed-way village whose six nodes sit at one point: Douglas-Peucker
+    // keeps two of its seven vertices at any tolerance, which once dropped
+    // the polygon. The exact tier keeps every polygon the ways make: the
+    // village is a record of its own, and the build's arc checks pass.
+    std::vector<TestObject> objects = fixture();
+    std::vector<int64_t> refs;
+    for (int64_t id = 600; id < 606; id++) {
+        objects.push_back(node(id, 470800000, 80800000));
+        refs.push_back(id);
+    }
+    refs.push_back(refs.front());
+    objects.push_back(way(5000, refs, {{"admin_level", "9"}, {"boundary", "administrative"}, {"name", "Punkt"}}));
+    std::stable_sort(objects.begin(), objects.end(), [](const TestObject& a, const TestObject& b) {
+        return a.type != b.type ? a.type < b.type : a.id < b.id;
+    });
+    const ScratchDir root("admin-dirs-one-point");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log", out = root.path() + "/out";
+    write_test_pbf(pbf, objects, 1000);
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf, "--multi-output", "--multi-quality"}, log));
+    const auto files = tree(out);
+    for (const char* dir : {"quality/simplified", "quality/exact"})
+        CHECK_EQ(files.at(std::string("planet/") + dir + "/admin_polygons.bin").size(), 8 * sizeof(AdminPolygon));
+    const std::vector<char> strings = files.at("planet/full/strings_core.bin");
+    CHECK(std::search(strings.begin(), strings.end(), std::begin("Punkt"), std::end("Punkt")) != strings.end());
 }

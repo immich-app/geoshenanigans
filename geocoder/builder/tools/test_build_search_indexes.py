@@ -238,11 +238,11 @@ class ResolveTest(unittest.TestCase):
         "mode.small": {"files": ["{region}/small/a.bin", "{region}/small/shared.json"],
                        "optional_files": ["{region}/small/opt.bin"],
                        "replaces": ["{region}/quality/{quality}/q.bin"]},
-        "quality.q1": {"extends": "quality.base", "files": ["{region}/quality/q1/q.bin"]},
+        "quality.simplified": {"extends": "quality.base", "files": ["{region}/quality/simplified/q.bin"]},
         "quality.base": {"files": ["{region}/quality/base.bin"]},
         "poi_tier.none": {"files": []},
     }}
-    SEL = {"region": "planet", "mode": "small", "quality": "q1", "poi_tier": "none"}
+    SEL = {"region": "planet", "mode": "small", "quality": "simplified", "poi_tier": "none"}
 
     def test_takes_extended_and_optional_files_minus_the_replaced(self):
         paths, optional = sut.resolve(self.CFG, self.SEL)

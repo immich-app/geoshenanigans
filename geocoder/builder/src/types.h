@@ -175,9 +175,6 @@ inline AdminPolygon admin_polygon_tombstone() {
 static const uint64_t FNV1A_OFFSET_BASIS = 14695981039346656037ULL;
 static const uint64_t FNV1A_PRIME        = 1099511628211ULL;
 
-// Simplification mode
-enum class SimplifyMode { MaxVertices, ErrorBounded };
-
 // Processing limits
 static constexpr int    MAX_NODE_COUNT          = 65535; // uint16_t node_count (OSM caps ways at 2000)
 static constexpr int    MAX_S2_CELLS_PER_POLY   = 200;   // S2RegionCoverer max_cells

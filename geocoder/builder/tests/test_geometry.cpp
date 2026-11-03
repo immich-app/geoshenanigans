@@ -316,7 +316,7 @@ TEST(geometry_simplify_epsilon_tiny_inputs_no_crash) {
 }
 
 // ---------------------------------------------------------------------------
-// meters_to_degrees / admin_epsilon_meters (small numeric helpers)
+// meters_to_degrees (a small numeric helper)
 // ---------------------------------------------------------------------------
 
 TEST(geometry_meters_to_degrees_equator) {
@@ -328,14 +328,6 @@ TEST(geometry_meters_to_degrees_equator) {
     CHECK(hi > eq);  // same meters span MORE degrees as cos shrinks
     CHECK_NEAR(meters_to_degrees(1000.0, 60.0),
                1000.0 / (111320.0 * std::cos(60.0 * M_PI / 180.0)), 1e-9);
-}
-
-TEST(geometry_admin_epsilon_meters_table) {
-    CHECK_NEAR(admin_epsilon_meters(2), 500.0, 1e-9);   // country
-    CHECK_NEAR(admin_epsilon_meters(8), 15.0, 1e-9);    // city
-    // Levels above 11 clamp to index 11.
-    CHECK_NEAR(admin_epsilon_meters(11), 15.0, 1e-9);
-    CHECK_NEAR(admin_epsilon_meters(200), admin_epsilon_meters(11), 1e-9);
 }
 
 // --- is_included_highway allow-list ----------------------------------------

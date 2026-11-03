@@ -1,28 +1,12 @@
-// Crossing-number point-in-ring test over packed admin vertices, in the
-// float arithmetic the country lookup has always used (its answers are
-// build output, so the arithmetic must not change).
+// A ring's edges bucketed by one axis, the index in front of the crossing
+// tests of exact_pip.h (ExactRingEdgeIndex) and continent_boundaries.h
+// (PolygonIndex).
 #pragma once
 
 #include <algorithm>
 #include <cstdint>
 #include <utility>
 #include <vector>
-
-#include "types.h"
-
-// Whether the edge between va and vb crosses the ray from (plat, plng)
-// towards +lat.
-inline bool ring_edge_crosses(const NodeCoord& va, const NodeCoord& vb, float plat, float plng) {
-    return ((va.lng > plng) != (vb.lng > plng)) &&
-           (plat < (vb.lat - va.lat) * (plng - va.lng) / (vb.lng - va.lng) + va.lat);
-}
-
-inline bool ring_contains(const NodeCoord* verts, uint32_t cnt, float plat, float plng) {
-    bool inside = false;
-    for (uint32_t a = 0, b = cnt - 1; a < cnt; b = a++)
-        if (ring_edge_crosses(verts[a], verts[b], plat, plng)) inside = !inside;
-    return inside;
-}
 
 // A ring's edges bucketed along one axis, for testing many points against
 // one ring by crossing number with the ray along the other axis. An edge can
@@ -93,24 +77,4 @@ private:
     uint32_t buckets_ = 1;
     std::vector<uint32_t> start_;  // bucket b's edges: edges_[start_[b], start_[b + 1])
     std::vector<uint32_t> edges_;  // edge (a - 1, a) stored as a
-};
-
-// ring_contains for many points against one ring (its ray runs along
-// latitude, so the edges are bucketed by longitude).
-class RingEdgeIndex {
-public:
-    // verts must outlive the index.
-    RingEdgeIndex(const NodeCoord* verts, uint32_t cnt)
-        : verts_(verts),
-          buckets_(cnt, std::min<uint32_t>(cnt / 16, 1u << 20), [verts](uint32_t k) { return verts[k].lng; }) {}
-
-    bool contains(float plat, float plng) const {
-        return buckets_.odd_crossings(plng, [&](uint32_t a, uint32_t b) {
-            return ring_edge_crosses(verts_[a], verts_[b], plat, plng);
-        });
-    }
-
-private:
-    const NodeCoord* verts_;
-    RingEdgeBuckets buckets_;
 };

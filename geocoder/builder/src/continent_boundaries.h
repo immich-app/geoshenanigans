@@ -11,7 +11,7 @@
 #include <vector>
 #include <utility>
 
-#include "ring_contains.h"
+#include "ring_edge_buckets.h"
 
 struct ContinentPolygon {
     std::string name;

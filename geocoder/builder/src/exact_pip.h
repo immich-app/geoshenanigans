@@ -15,7 +15,7 @@
 
 #include "packed_location.h"
 #include "polygon_rings.h"
-#include "ring_contains.h"
+#include "ring_edge_buckets.h"
 
 // A coordinate in degrees on the e7 grid, half away from zero: OSM's own e7
 // value for a coordinate read from it (lat_e7 / 1e7). A record's f32

@@ -1,5 +1,5 @@
-// Polygon vertex packing (vertex_pack.h): the bytes are part of the admin,
-// POI and addr vertex files, so they must match the packers it replaced.
+// Polygon vertex packing (vertex_pack.h): the bytes are part of the POI and
+// addr vertex files, so they must match the packers it replaced.
 #include "vertex_pack.h"
 
 #include <random>

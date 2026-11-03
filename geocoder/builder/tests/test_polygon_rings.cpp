@@ -1,5 +1,5 @@
-// polygon_rings.h: holes kept in an admin polygon's vertex range so that the
-// crossing-number tests honour them.
+// polygon_rings.h: an admin relation's rings nested into polygons, a
+// polygon's interior point, and whether its rings nest.
 #include "polygon_rings.h"
 
 #include <cmath>
@@ -7,7 +7,6 @@
 #include <vector>
 
 #include "geometry.h"
-#include "ring_contains.h"
 #include "test_framework.h"
 
 namespace {
@@ -25,87 +24,11 @@ Ring reversed(Ring r) {
     return r;
 }
 
-std::vector<NodeCoord> as_nodes(const Ring& r) {
-    std::vector<NodeCoord> out;
-    for (const auto& [lat, lng] : r) out.push_back({static_cast<float>(lat), static_cast<float>(lng)});
-    return out;
-}
-
 // Italy-like outer ring with two enclaves, the second touching nothing.
 const Ring kOuter = square(0, 0, 10, 10);
 const std::vector<Ring> kHoles = {reversed(square(2, 2, 4, 4)), reversed(square(6, 5, 7, 8))};
 
-bool range_contains(const std::vector<NodeCoord>& v, double lat, double lng) {
-    return ring_contains(v.data(), static_cast<uint32_t>(v.size()), static_cast<float>(lat), static_cast<float>(lng));
-}
-
 }  // namespace
-
-TEST(encode_rings_splits_back_into_the_same_rings) {
-    const Ring range = encode_rings(kOuter, kHoles);
-    CHECK_EQ(range.size(), kOuter.size() + kHoles[0].size() + kHoles[1].size() + 2 * kExcursionConnectors);
-    std::vector<RingSpan> spans;
-    CHECK(split_rings(range.data(), static_cast<uint32_t>(range.size()), 2, spans));
-    CHECK_EQ(spans.size(), 3u);
-    CHECK_EQ(spans[0].begin, 0u);
-    CHECK_EQ(spans[0].count, static_cast<uint32_t>(kOuter.size()));
-    for (size_t k = 0; k < kHoles.size(); k++) {
-        CHECK_EQ(spans[k + 1].count, static_cast<uint32_t>(kHoles[k].size()));
-        for (uint32_t j = 0; j < spans[k + 1].count; j++) CHECK(range[spans[k + 1].begin + j] == kHoles[k][j]);
-    }
-}
-
-TEST(split_rings_without_holes_is_one_ring) {
-    std::vector<RingSpan> spans;
-    CHECK(split_rings(kOuter.data(), static_cast<uint32_t>(kOuter.size()), 0, spans));
-    CHECK_EQ(spans.size(), 1u);
-    CHECK_EQ(spans[0].count, static_cast<uint32_t>(kOuter.size()));
-}
-
-TEST(split_rings_rejects_a_range_without_the_holes_it_claims) {
-    std::vector<RingSpan> spans;
-    CHECK(!split_rings(kOuter.data(), static_cast<uint32_t>(kOuter.size()), 1, spans));
-    CHECK_EQ(spans.size(), 1u);
-    CHECK_EQ(spans[0].count, static_cast<uint32_t>(kOuter.size()));
-}
-
-TEST(crossing_number_tests_leave_out_the_holes) {
-    const auto v = as_nodes(encode_rings(kOuter, kHoles));
-    CHECK(range_contains(v, 1, 1));       // outer ring only
-    CHECK(range_contains(v, 5, 9));
-    CHECK(!range_contains(v, 3, 3));      // first hole
-    CHECK(!range_contains(v, 6.5, 6));    // second hole
-    CHECK(!range_contains(v, 11, 5));     // outside
-    // Along the connectors: v0's latitude and the holes' first longitudes.
-    CHECK(range_contains(v, 0.5, 2));
-    CHECK(range_contains(v, 1, 5));
-    CHECK(range_contains(v, 5, 2));
-}
-
-TEST(crossing_number_matches_outer_minus_holes_at_random_points) {
-    // Every connector edge walked both ways cancels exactly, wherever the
-    // point is: compare against ring-by-ring tests on a fine random sample.
-    const auto v = as_nodes(encode_rings(kOuter, kHoles));
-    const auto outer = as_nodes(kOuter);
-    std::vector<std::vector<NodeCoord>> holes;
-    for (const auto& h : kHoles) holes.push_back(as_nodes(h));
-    std::mt19937_64 rng(7);
-    std::uniform_real_distribution<double> coord(-1, 11);
-    for (int i = 0; i < 20000; i++) {
-        // Snap to a coarse grid so many points land on connector lines.
-        const float lat = static_cast<float>(std::round(coord(rng) * 4) / 4);
-        const float lng = static_cast<float>(std::round(coord(rng) * 4) / 4);
-        bool want = range_contains(outer, lat, lng);
-        for (const auto& h : holes)
-            if (range_contains(h, lat, lng)) want = !want;
-        CHECK_EQ(range_contains(v, lat, lng), want);
-    }
-}
-
-TEST(shoelace_area_subtracts_holes) {
-    const Ring range = encode_rings(kOuter, kHoles);
-    CHECK_NEAR(polygon_area(range), 100.0 - 4.0 - 3.0, 1e-4);
-}
 
 TEST(interior_point_lies_inside_a_concave_ring) {
     // A C-shape: its vertex average (about (5, 3.6)) is in the notch.
@@ -124,10 +47,11 @@ TEST(interior_point_lies_inside_a_concave_ring) {
 TEST(interior_point_avoids_holes) {
     // The scan line through the middle meets the central hole: the point
     // must sit in one of the stretches beside it.
-    const Ring range = encode_rings(square(0, 0, 10, 10), {reversed(square(1, 3, 9, 7))});
-    std::vector<RingSpan> spans;
-    REQUIRE(split_rings(range.data(), static_cast<uint32_t>(range.size()), 1, spans));
-    const auto [lat, lng] = interior_point(range.data(), spans);
+    Ring rings = square(0, 0, 10, 10);
+    const Ring hole = reversed(square(1, 3, 9, 7));
+    rings.insert(rings.end(), hole.begin(), hole.end());
+    const std::vector<RingSpan> spans = {{0, 5}, {5, 5}};
+    const auto [lat, lng] = interior_point(rings.data(), spans);
     CHECK(ring_contains_latlng(square(0, 0, 10, 10), lat, lng));
     CHECK(!ring_contains_latlng(square(1, 3, 9, 7), lat, lng));
 }
@@ -217,127 +141,6 @@ TEST(packed_rings_nest_and_measure_as_their_doubles) {
     CHECK(polygons[2].holes == std::vector<std::vector<PackedLocation>>({packed[4]}));
 }
 
-TEST(simplify_rings_turns_holes_against_the_outer_ring_and_drops_collapsed_ones) {
-    const auto identity = [](const Ring& r, double) { return r; };
-    // Holes given with the outer ring's orientation, one too small to keep.
-    const std::vector<Ring> holes = {square(2, 2, 4, 4), {{6, 6}, {6, 7}, {6, 6}}};
-    const SimplifiedRings s = simplify_rings(kOuter, holes, identity);
-    CHECK_EQ(s.holes, 1u);
-    CHECK_EQ(s.halvings, 0u);
-    CHECK_NEAR(polygon_area(s.range), 96.0, 1e-4);
-    const auto v = as_nodes(s.range);
-    CHECK(!range_contains(v, 3, 3));
-    CHECK(range_contains(v, 6.5, 6.5));
-}
-
-TEST(simplify_rings_without_holes_is_the_simplified_outer_ring) {
-    const auto shrink = [](const Ring& r, double) { return Ring(r.begin(), r.end()); };
-    const SimplifiedRings s = simplify_rings(kOuter, {}, shrink);
-    CHECK_EQ(s.holes, 0u);
-    CHECK(s.range == kOuter);
-}
-
-TEST(simplify_rings_orders_holes_by_first_vertex) {
-    const auto identity = [](const Ring& r, double) { return r; };
-    const std::vector<Ring> holes = {kHoles[1], kHoles[0]};
-    const SimplifiedRings s = simplify_rings(kOuter, holes, identity);
-    CHECK_EQ(s.holes, 2u);
-    CHECK(s.range == encode_rings(kOuter, kHoles));
-}
-
-namespace {
-
-// Douglas-Peucker at eps degrees times simplify_rings' tolerance scale, as
-// the builder's quality variants simplify.
-auto dp(double eps) {
-    return [eps](const Ring& r, double scale) { return simplify_polygon_epsilon(r, eps * scale); };
-}
-
-}  // namespace
-
-TEST(simplify_rings_keeps_a_hole_inside_the_outer_ring_it_simplifies) {
-    // The outer ring's top edge has a 0.2 high bump at lng 5, and an
-    // enclave reaches up into it. At 0.3 the bump goes, the outer ring's top
-    // edge straightens to lat 10, and the enclave's top (lat 10.15) pokes
-    // out of it: the crossing test would count that strip outside the outer
-    // ring as inside the polygon. At half the tolerance the bump stays.
-    const Ring outer = {{0, 0}, {0, 10}, {10, 10}, {10.2, 5}, {10, 0}, {0, 0}};
-    const Ring hole = reversed(square(9.5, 4.8, 10.15, 5.2));
-    CHECK_EQ(dp(0.3)(outer, 1).size(), 5u);  // the bump simplified away
-    CHECK_EQ(dp(0.3)(hole, 1).size(), 5u);   // the enclave as it was
-    const SimplifiedRings s = simplify_rings(outer, {hole}, dp(0.3));
-    CHECK_EQ(s.holes, 1u);
-    CHECK_EQ(s.halvings, 1u);
-    CHECK(s.nests);
-    const auto v = as_nodes(s.range);
-    CHECK(!range_contains(v, 10.1, 5));  // above lat 10, in the enclave
-    CHECK(!range_contains(v, 9.8, 5));   // in the enclave
-    CHECK(range_contains(v, 5, 5));
-    CHECK(!range_contains(v, 10.5, 5));  // above the bump
-}
-
-TEST(simplify_rings_keeps_bordering_holes_apart) {
-    // Two enclaves share a border with a 0.2 bump into the second. The
-    // first straightens it at 0.3; the second keeps the bump but cuts its
-    // corner at (4, 4), so near there the two overlap, and the crossing test
-    // would count the overlap inside the polygon. Only at 0.3/16 does the
-    // second keep (4, 4).
-    const Ring a = {{2, 2}, {2, 4}, {3, 4.2}, {4, 4}, {4, 2}, {2, 2}};
-    const Ring b = {{2, 4}, {2, 6}, {6, 6}, {6, 3.5}, {4, 4}, {3, 4.2}, {2, 4}};
-    CHECK_EQ(dp(0.3)(a, 1).size(), 5u);
-    CHECK_EQ(dp(0.3)(b, 1).size(), 6u);
-    const SimplifiedRings s = simplify_rings(kOuter, {a, b}, dp(0.3));
-    CHECK_EQ(s.holes, 2u);
-    CHECK_EQ(s.halvings, 4u);
-    const auto v = as_nodes(s.range);
-    CHECK(!range_contains(v, 3.98, 3.995));  // in the overlap the first pass made
-    CHECK(!range_contains(v, 3, 3));
-    CHECK(!range_contains(v, 3, 5));
-    CHECK(range_contains(v, 1, 1));
-}
-
-TEST(simplify_rings_keeps_the_rings_as_given_when_no_tolerance_nests_them) {
-    // A simplification that moves the hole across the outer ring's edge at
-    // any tolerance.
-    const auto shove = [](const Ring& r, double) {
-        Ring out = r;
-        if (r.front().first > 1) for (auto& p : out) p.first += 7;
-        return out;
-    };
-    const Ring hole = reversed(square(2, 2, 4, 4));
-    const SimplifiedRings s = simplify_rings(kOuter, {hole}, shove);
-    CHECK_EQ(s.halvings, kKeptUnsimplified);
-    CHECK(s.nests);
-    CHECK(s.range == encode_rings(kOuter, {hole}));
-}
-
-TEST(simplify_rings_leaves_rings_that_do_not_nest_as_given_at_the_smallest_tolerance) {
-    // The hole crosses the outer ring as given, so no tolerance nests them.
-    // Kept as given they'd keep the outer ring's spare vertex (10, 5), which
-    // the smallest tolerance drops.
-    const Ring outer = {{0, 0}, {0, 10}, {10, 10}, {10, 5}, {10, 0}, {0, 0}};
-    const Ring hole = reversed(square(9, 2, 11, 4));
-    CHECK(dp(0.3)(outer, std::ldexp(1.0, -kToleranceHalvings)) == kOuter);
-    const SimplifiedRings s = simplify_rings(outer, {hole}, dp(0.3));
-    CHECK_EQ(s.halvings, kToleranceHalvings);
-    CHECK(!s.nests);
-    CHECK_EQ(s.holes, 1u);
-    CHECK(s.range == encode_rings(kOuter, {hole}));
-}
-
-TEST(hole_topology_counts_tells_retried_kept_and_not_nesting_polygons_apart) {
-    HoleTopologyCounts counts;
-    counts.add(kToleranceHalvings, false);
-    counts.add(kKeptUnsimplified, true);
-    counts.add(2, true);
-    counts.add(2, true);
-    counts.add(kToleranceHalvings, true);
-    counts.add(0, true);
-    CHECK(counts.summary() ==
-          "3 polygons simplified again (tolerance/2 0, /4 2, /8 0, /16 0, /32 0, /64 0, /128 0, /256 1), "
-          "1 kept unsimplified, 1 not nesting as given (at tolerance/256)");
-}
-
 TEST(rings_nest_takes_holes_inside_the_outer_ring) {
     CHECK(rings_nest(kOuter, kHoles));
     CHECK(rings_nest(kOuter, {}));
@@ -378,8 +181,8 @@ TEST(rings_nest_rejects_a_hole_edge_leaving_the_outer_ring_where_it_touches) {
     const Ring outer = {{0, 0}, {0, 9}, {5, 9}, {4, 7}, {5, 7}, {6, 7}, {5, 9}, {10, 9}, {10, 0}, {0, 0}};
     const Ring hole = {{5, 1}, {5, 9}, {2, 5}, {5, 1}};
     CHECK(!rings_nest(outer, {hole}));
-    const auto v = as_nodes(encode_rings(outer, {hole}));
-    CHECK(range_contains(v, 4.6, 7.8));  // in the notch, yet counted inside
+    // In the notch, yet counted inside: outside the outer ring, inside the hole.
+    CHECK(!ring_contains_latlng(outer, 4.6, 7.8) && ring_contains_latlng(hole, 4.6, 7.8));
 }
 
 TEST(rings_nest_rejects_overlapping_holes) {

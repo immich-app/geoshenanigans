@@ -25,7 +25,6 @@
 #include "admin_rank_config.h"
 #include "geometry.h"
 #include "id_allocator.h"
-#include "keyhole_pack.h"
 #include "parallel.h"
 #include "place_claims.h"
 #include "polygon_rings.h"

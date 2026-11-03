@@ -13,7 +13,6 @@
 
 #include "exact_pip.h"
 #include "geometry.h"
-#include "ring_contains.h"
 
 namespace {
 
@@ -154,47 +153,6 @@ uint32_t straight_edge_pieces(double lat1, double lng1, double lat2, double lng2
     const double by_chord = std::ceil(std::sqrt(bow / (kChordBoundDivisor * ADMIN_COVER_CHORD_TOLERANCE_RAD)));
     const double by_length = std::ceil(std::max(a, b) / ADMIN_COVER_MAX_PIECE_RAD);
     return static_cast<uint32_t>(std::max({1.0, by_chord, by_length}));
-}
-
-S2LatLngRect admin_ring_bounds(const NodeCoord* verts, uint32_t n) {
-    float lat_lo = verts[0].lat, lat_hi = lat_lo, lng_lo = verts[0].lng, lng_hi = lng_lo;
-    for (uint32_t k = 1; k < n; k++) {
-        lat_lo = std::min(lat_lo, verts[k].lat);
-        lat_hi = std::max(lat_hi, verts[k].lat);
-        lng_lo = std::min(lng_lo, verts[k].lng);
-        lng_hi = std::max(lng_hi, verts[k].lng);
-    }
-    return S2LatLngRect(S2LatLng::FromDegrees(std::max(lat_lo, -90.0f), std::max(lng_lo, -180.0f)),
-                        S2LatLng::FromDegrees(std::min(lat_hi, 90.0f), std::min(lng_hi, 180.0f)));
-}
-
-AdminRingCells admin_ring_cells(const NodeCoord* verts, uint32_t n, int level, double reach_rad) {
-    if (n == 0) return {};
-    const S1ChordAngle reach = S1ChordAngle::Radians(reach_rad);
-    const double sin_reach = std::sin(reach_rad);
-
-    // Every cell within reach of an edge. A point the ray cast puts inside is
-    // within its own error of the ring's straight edges or inside them (the
-    // reach's part past the chord tolerance), and they lie within the chord
-    // tolerance of their pieces.
-    std::vector<uint64_t> boundary;
-    S2Point to = point_of(verts[n - 1].lat, verts[n - 1].lng);
-    for (uint32_t i = 0, j = n - 1; i < n; j = i++) {
-        const double lat1 = verts[j].lat, lng1 = verts[j].lng, lat2 = verts[i].lat, lng2 = verts[i].lng;
-        if (lat1 == lat2 && lng1 == lng2) continue;
-        const S2Point a = to;
-        to = point_of(lat2, lng2);
-        add_edge_cells(lat1, lng1, a, lat2, lng2, to, level, reach, sin_reach, boundary);
-    }
-
-    std::unique_ptr<RingEdgeIndex> edges;
-    return classify_cells(std::move(boundary), admin_ring_bounds(verts, n), level, [&](const S2Point& p) {
-        const S2LatLng ll(p);
-        const float lat = static_cast<float>(ll.lat().degrees()), lng = static_cast<float>(ll.lng().degrees());
-        if (n < kMinIndexedRingVertices) return ring_contains(verts, n, lat, lng);
-        if (!edges) edges = std::make_unique<RingEdgeIndex>(verts, n);
-        return edges->contains(lat, lng);
-    });
 }
 
 AdminRingCells admin_ring_cells(const PackedLocation* verts, const RingSpan* rings, uint32_t ring_count, int level,
