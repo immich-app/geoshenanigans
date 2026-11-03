@@ -85,7 +85,7 @@ const INNER_ORIGIN = 'https://tiles.internal';
 
 // Bump when the body Tiles sends for the same URL and deployment changes (e.g. the TileJSON): cached responses outlive
 // code-only deploys, and a new revision gives every response a new URL.
-export const CACHE_REVISION = '2';
+export const CACHE_REVISION = '3';
 
 /**
  * The URL Tiles serves a request from, and the cache stores it under: the deployment key and the canonical form of

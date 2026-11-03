@@ -6,7 +6,7 @@ data "cloudflare_zone" "immich_cloud" {
 
 locals {
   # Every hostname the worker answers on. The first is canonical: Workers Cache doesn't key by host, so the TileJSON and
-  # dev styles point clients there whichever host they asked.
+  # styles point clients there whichever host they asked.
   hostnames = var.env == "prod" ? ["tiles.immich.cloud", "tiles.prod.immich.cloud"] : ["tiles.${var.env}.immich.cloud"]
 }
 

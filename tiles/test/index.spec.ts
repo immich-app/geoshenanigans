@@ -14,7 +14,7 @@ import {
   TigrisStorageRepository,
 } from '../src/repository';
 import { CACHE_REVISION, decodeMetricTags, encodeMetricTags, innerUrl, parseInnerUrl } from '../src/request';
-import { EDGE_CACHE } from '../src/tiles';
+import { EDGE_CACHE, inlineTileSource, StyleJson } from '../src/tiles';
 
 // For now, you'll need to do something like this to get a correctly-typed
 // `Request` to pass to `worker.fetch()`.
@@ -519,7 +519,24 @@ describe('gateway', () => {
 describe('Tiles', () => {
   const key = env.DEPLOYMENT_KEY;
   const etag = `"${key}"`;
-  const tileJson = { tilejson: '3.0.0', tiles: [], vector_layers: [], minzoom: 0, maxzoom: 15 };
+  const tileJson = {
+    tilejson: '3.0.0',
+    tiles: [],
+    vector_layers: [],
+    attribution: '<a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+    bounds: [-180, -85.0511287, 180, 85.0511287],
+    minzoom: 0,
+    maxzoom: 15,
+  };
+  // What a request's style inlines from the TileJSON.
+  const inlinedSource = {
+    type: 'vector',
+    tiles: [`${env.PUBLIC_URL}/v1/{z}/{x}/{y}.mvt?v=${key}`],
+    minzoom: tileJson.minzoom,
+    maxzoom: tileJson.maxzoom,
+    bounds: tileJson.bounds,
+    attribution: tileJson.attribution,
+  };
   // A directory whose only tile is tile 0, so other tiles in range are absent without any storage read.
   const directory = DirectoryString.fromDirectory({
     tileIdStart: 0,
@@ -598,16 +615,24 @@ describe('Tiles', () => {
     expect(response.headers.get('Cache-Control')).toBe('no-store');
   });
 
-  it('points a dev style at the canonical host', async () => {
-    const stored = { sources: { vector: { type: 'vector', url: 'https://tiles.immich.cloud/v1' } } };
+  // Stands in for a style as map-styles publishes it, its tile source a link to the TileJSON.
+  const storedStyle = {
+    version: 8,
+    sources: { vector: { type: 'vector', url: 'https://tiles.immich.cloud/v1.json' } },
+    layers: [{ id: 'background', type: 'background' }],
+  };
+  const mockStyle = () =>
     // Made per call: a stream belongs to the request that created it.
-    vi.spyOn(TigrisStorageRepository.prototype, 'getAsStream').mockImplementation(
-      async () => new Response(JSON.stringify(stored)).body!,
-    );
+    vi
+      .spyOn(TigrisStorageRepository.prototype, 'getAsStream')
+      .mockImplementation(async () => new Response(JSON.stringify(storedStyle)).body!);
+
+  it('inlines the tile source into a style, under the canonical host', async () => {
+    mockStyle();
     const response = await exports.Tiles.fetch(tilesRequest('/v1/style/dark'));
     expect(response.headers.get('Cache-Control')).toBe(EDGE_CACHE);
     expect(response.headers.get('Cache-Tag')).toBe(`tiles,deploy-${key},type-style`);
-    expect(await response.json()).toEqual({ sources: { vector: { type: 'vector', url: `${env.PUBLIC_URL}/v1` } } });
+    expect(await response.json()).toEqual({ ...storedStyle, sources: { vector: inlinedSource } });
   });
 
   it('does not let the edge keep a failure', async () => {
@@ -663,6 +688,15 @@ describe('Tiles', () => {
       ]);
     });
 
+    it("gives styles the TileJSON's tile source, with the 5-minute policy", async () => {
+      mockStyle();
+      const style = await fetchWith('https://tiles.prod.example/v1/style/light');
+      expect(style.headers.get('Cache-Control')).toBe('public, max-age=300');
+      expect(style.headers.get('ETag')).toBe(etag);
+      const { tiles } = (await (await fetchWith('https://tiles.prod.example/v1.json')).json()) as JsonResponse;
+      expect(((await style.json()) as StyleJson).sources.vector).toEqual({ ...inlinedSource, tiles });
+    });
+
     it('answers 304 once a fresh response turns out to be what the client has', async () => {
       const response = await fetchWith('https://tiles.example/v1.json', { 'If-None-Match': etag });
       expect(response.status).toBe(304);
@@ -706,6 +740,42 @@ describe('Tiles', () => {
       expect(value).toEqual(tile.slice(0, value!.length));
       await reader.cancel();
     });
+  });
+});
+
+describe('inlineTileSource', () => {
+  const tileJson = {
+    tiles: ['https://tiles.example/v1/{z}/{x}/{y}.mvt?v=20261102'],
+    minzoom: 0,
+    maxzoom: 15,
+    bounds: [-180, -85, 180, 85],
+    attribution: 'OpenStreetMap',
+    vector_layers: [],
+  } as unknown as JsonResponse;
+  const style = (sources: StyleJson['sources']) => ({ version: 8, sources, layers: [] }) as unknown as StyleJson;
+
+  it('replaces only the link to the TileJSON, and leaves the stored style as it was', () => {
+    const vector = { type: 'vector', url: 'https://tiles.immich.cloud/v1.json', promoteId: 'id' };
+    const other = { type: 'raster', url: 'https://example.org/raster.json' };
+    const stored = style({ vector, other });
+    expect(inlineTileSource(stored, tileJson).sources).toEqual({
+      vector: {
+        type: 'vector',
+        promoteId: 'id',
+        tiles: ['https://tiles.example/v1/{z}/{x}/{y}.mvt?v=20261102'],
+        minzoom: 0,
+        maxzoom: 15,
+        bounds: [-180, -85, 180, 85],
+        attribution: 'OpenStreetMap',
+      },
+      other,
+    });
+    expect(stored.sources.vector).toBe(vector);
+    expect(vector.url).toBe('https://tiles.immich.cloud/v1.json');
+  });
+
+  it('refuses a style without the vector source', () => {
+    expect(() => inlineTileSource(style({}), tileJson)).toThrow('Style has no "vector" tile source');
   });
 });
 

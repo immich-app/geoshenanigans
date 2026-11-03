@@ -1,6 +1,7 @@
 import { WorkerEntrypoint } from 'cloudflare:workers';
 import { IMetricsRepository } from './interface';
 import { PMTilesService } from './pmtiles.service';
+import { JsonResponse } from './pmtiles/types';
 import {
   CloudflareD1Repository,
   CloudflareMetricsRepository,
@@ -24,11 +25,16 @@ declare global {
   var memCache: Map<string, unknown>;
 }
 
-type StyleJson = {
+// A MapLibre vector source: a link to its TileJSON (url), or the fields MapLibre would read from it.
+type VectorSource = { type: string; url?: string } & Partial<
+  Pick<JsonResponse, 'tiles' | 'minzoom' | 'maxzoom' | 'bounds' | 'attribution'>
+>;
+
+export type StyleJson = {
   version: number;
   name: string;
   id: string;
-  sources: Record<string, { type: string; url: string }>;
+  sources: Record<string, VectorSource>;
   layers: unknown[];
   sprite: string;
   glyphs: string;
@@ -40,6 +46,22 @@ export const EDGE_CACHE = 'public, max-age=31536000, immutable';
 // Anything but a 200 might be a passing failure (a missing tile is also what a failed D1 lookup looks like), so it is
 // never stored.
 const NO_STORE = 'no-store';
+
+/**
+ * The style with its tile source, named "vector" by map-styles, inlined: the link to the TileJSON gives way to the
+ * fields MapLibre would read there, so clients skip that round trip. The tiles template is the TileJSON's, with the
+ * live deployment key, which the style's cache URL and ETag carry too: a data deploy gets clients a style with the new
+ * key.
+ */
+export function inlineTileSource(style: StyleJson, tileJson: JsonResponse): StyleJson {
+  if (style.sources?.vector?.type !== 'vector') {
+    throw new Error('Style has no "vector" tile source');
+  }
+  const { tiles, minzoom, maxzoom, bounds, attribution } = tileJson;
+  const vector: VectorSource = { ...style.sources.vector, tiles, minzoom, maxzoom, bounds, attribution };
+  delete vector.url;
+  return { ...style, sources: { ...style.sources, vector } };
+}
 
 /** Cache-Tag values a response can be purged by: everything, one deployment, or one type of response. */
 export function cacheTags(deploymentKey: string, requestType: PMTilesParams['requestType']): string {
@@ -125,19 +147,20 @@ async function handleRequest(request: Request, env: WorkerEnv, metrics: IMetrics
     return new Response(JSON.stringify(tileJson), { headers: respHeaders, status: 200 });
   };
 
-  const handleStyleRequest = async () => {
+  const handleStyleRequest = async (pmTiles: PMTilesService) => {
     const { style, version } = params as PMTilesStyleParams;
-    let styleJson = await tigrisStorageRepository.getAsStream('styles/' + style + '.json');
-    if (!styleJson) {
+    const stored = await tigrisStorageRepository.getAsStream('styles/' + style + '.json');
+    if (!stored) {
       return uncached('Style not found', 404);
     }
-    if (env.ENVIRONMENT !== 'prod') {
-      const style = (await new Response(styleJson).json()) as StyleJson;
-      style.sources.vector.url = `${env.PUBLIC_URL}/v${version}`;
-      styleJson = new Response(JSON.stringify(style)).body!;
-    }
+    // The one body that is parsed rather than streamed, to inline the tile source. Styles are tens of kilobytes, and
+    // this runs only when the cache has no copy for the deployment.
+    const styleJson = inlineTileSource(
+      (await new Response(stored).json()) as StyleJson,
+      await pmTiles.getJsonResponse(version, env.PUBLIC_URL),
+    );
     respHeaders.set(Header.CONTENT_TYPE, 'application/json');
-    return new Response(styleJson, { headers: respHeaders, status: 200 });
+    return new Response(JSON.stringify(styleJson), { headers: respHeaders, status: 200 });
   };
 
   try {
@@ -168,7 +191,10 @@ async function handleRequest(request: Request, env: WorkerEnv, metrics: IMetrics
       case 'style': {
         const { style } = params as PMTilesStyleParams;
         console.log('style');
-        return await metrics.monitorAsyncFunction({ name: 'style_request', tags: { style } }, handleStyleRequest)();
+        return await metrics.monitorAsyncFunction(
+          { name: 'style_request', tags: { style } },
+          handleStyleRequest,
+        )(pmTilesService);
       }
     }
   } catch (e: any) {
