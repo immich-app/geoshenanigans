@@ -10,6 +10,7 @@
 #include "admin_arcs.h"
 #include "parallel.h"
 #include "parsed_data.h"
+#include "ranked_bits.h"
 
 uint64_t AdminArcBlocks::bytes() const {
     auto held = [](const auto& v) { return uint64_t(v.size()) * sizeof(v[0]); };
@@ -296,6 +297,17 @@ void check_lossless(const AdminArcs& arcs, const AdminArcBlocks& blocks, const A
     }
 }
 
+namespace {
+
+std::string slot_line(const AdminArcSlotCounts& c, size_t slots) {
+    std::ostringstream line;
+    line << c.kept << " kept, " << c.recycled << " recycled, " << c.appended << " appended, " << c.tombstones
+         << " tombstones (" << slots << " slots)";
+    return line.str();
+}
+
+}  // namespace
+
 AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& store, unsigned threads) {
     if (threads == 0) threads = parallel_threads();
     if (arcs.tiers.size() != kArcTierCount) throw std::logic_error("admin arcs without their tiers");
@@ -374,4 +386,78 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
     }
     std::cerr << line.str();
     return out;
+}
+
+AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector<uint32_t>& polygons, unsigned threads) {
+    if (threads == 0) threads = parallel_threads();
+    AdminArcBlocks out;
+    out.polygons.resize(polygons.size());
+    std::vector<uint32_t> planet_ring;  // each of the subset's rings' number in the planet
+    for (size_t k = 0; k < polygons.size(); k++) {
+        if (polygons[k] >= planet.polygons.size()) throw std::out_of_range("a continent polygon past the planet's");
+        const AdminArcPolygon& p = planet.polygons[polygons[k]];
+        out.polygons[k] = {static_cast<uint32_t>(planet_ring.size()), p.ring_count, {}};
+        for (uint32_t r = 0; r < p.ring_count; r++) planet_ring.push_back(p.first_ring + r);
+    }
+    std::vector<uint32_t> kept_arcs[2];
+    for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
+        const ArcSetBlocks& from = planet.set(set);
+        ArcSetBlocks& to = out.set(set);
+        std::vector<std::atomic<uint64_t>> used(from.arcs() / 64 + 1);
+        parallel_for(planet_ring.size(), [&](size_t begin, size_t end, unsigned) {
+            for (size_t r = begin; r < end; r++)
+                for (uint32_t i = from.ring_refs[planet_ring[r]]; i < from.ring_refs[planet_ring[r] + 1]; i++)
+                    mark_bit(used, from.refs[i].arc);
+        }, threads);
+        const RankedBits kept(from.arcs(), used, threads);
+        std::vector<uint32_t>& arcs = kept_arcs[set_index(set)];
+        arcs = kept.ones(threads);
+        for (uint32_t a : arcs) {
+            to.boxes.push_back(from.boxes[a]);
+            to.keys.push_back(from.keys[a]);
+            to.planet_slots.push_back(from.planet_slots[a]);
+        }
+        to.ring_refs = parallel_offsets<uint32_t>(planet_ring.size(), [&](size_t r) {
+            return from.ring_refs[planet_ring[r] + 1] - from.ring_refs[planet_ring[r]];
+        }, threads);
+        parallel_resize(to.refs, to.ring_refs.back());
+        parallel_for(planet_ring.size(), [&](size_t begin, size_t end, unsigned) {
+            for (size_t r = begin; r < end; r++) {
+                const uint32_t first = from.ring_refs[planet_ring[r]];
+                for (uint32_t i = 0; i < to.ring_refs[r + 1] - to.ring_refs[r]; i++) {
+                    const ArcRef ref = from.refs[first + i];
+                    to.refs[to.ring_refs[r] + i] = {static_cast<uint32_t>(kept.index(ref.arc)), ref.reversed};
+                }
+            }
+        }, threads);
+    }
+    for (size_t t = 0; t < kArcTierCount; t++) {
+        const std::vector<uint32_t>& arcs = kept_arcs[set_index(kArcTiers[t].set)];
+        const ArcBlocks& from = planet.tiers[t];
+        lay_out_blocks(arcs.size(), out.tiers[t].bytes, out.tiers[t].at,
+            [&](size_t i, unsigned) { return from.bytes_of(arcs[i]); },
+            [&](size_t i, uint8_t* to, unsigned) {
+                std::copy_n(from.data(arcs[i]), from.bytes_of(arcs[i]), to);
+                return from.bytes_of(arcs[i]);
+            },
+            std::string(kArcTiers[t].dir) + " arc_vertices", threads);
+    }
+    return out;
+}
+
+void assign_region_arc_slots(AdminArcBlocks& blocks, const std::string& prev_region_dir, const std::string& region,
+                             unsigned threads) {
+    std::ostringstream line;
+    line << "  " << region << " arcs:";
+    for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
+        ArcSetBlocks& s = blocks.set(set);
+        ArcSlots slots = allocate_arc_slots(s.keys, prev_region_dir.empty() ? "" : arc_sidecar_path(prev_region_dir, set));
+        s.slots = std::move(slots.slots);
+        s.sidecar = std::move(slots.sidecar);
+        s.slot_counts = slots.counts;
+        encode_ring_blocks(blocks, set, threads);
+        line << " " << set_name(set) << " " << s.arcs() << " arcs, slots " << slot_line(s.slot_counts, s.sidecar.size())
+             << ";";
+    }
+    std::cerr << line.str() << "\n";
 }

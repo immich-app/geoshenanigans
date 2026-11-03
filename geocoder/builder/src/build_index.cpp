@@ -1265,8 +1265,15 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             if (rel.rfind(output_dir, 0) == 0) rel = rel.substr(output_dir.size());
             region_prev = prev_output_dir + rel;
         }
+        // The region's arc dirs (--arcs-out only) and the last such build's.
+        const std::string region_arcs = cfg.arcs_out_dir.empty() ? "" : cfg.arcs_out_dir + "/" + region;
+        const std::string region_prev_arcs = cfg.prev_arcs_dir.empty() ? "" : cfg.prev_arcs_dir + "/" + region;
         if (run == RegionRun::Continent) {
             timed_phase("    " + region + ": strategy2 remap", [&] { apply_strategy2_remaps(d, region_prev, order); });
+            // Its own arc slots, as the remap gives its polygons theirs.
+            if (!region_arcs.empty())
+                timed_phase("    " + region + ": arc slots",
+                            [&] { assign_region_arc_slots(d.admin_arcs, region_prev_arcs, region, 0); });
             timed_phase("    " + region + ": poi names in record order", [&] { order_poi_strings_by_record(d); });
         }
 
@@ -2037,7 +2044,12 @@ static int run(int argc, char* argv[]) {
         }
     }
     require_new_or_empty_output_dir(output_dir);
-    require_arc_dirs(output_dir, arcs_out_dir, prev_arcs_dir);
+    {
+        std::vector<std::string> regions = {"planet"};
+        if (generate_continents)
+            for (size_t c = 0; c < kContinentCount; c++) regions.push_back(kContinents[c].name);
+        require_arc_dirs(output_dir, arcs_out_dir, prev_arcs_dir, regions);
+    }
 
     // Set global simplification mode
     kSimplifyMode = simplify_mode;

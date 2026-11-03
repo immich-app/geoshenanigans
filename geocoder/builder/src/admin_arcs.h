@@ -401,9 +401,9 @@ bool same_closed_ring(const PackedLocation* a, uint32_t a_count, const PackedLoc
 
 // build-index's arc dirs, refused before any work: --arcs-out new or empty and
 // apart from the output dir (which publishes whatever it holds), --prev-arcs
-// only with it, and holding the planet's sidecar of each set.
+// only with it, and holding each of `regions`' sidecar of each set.
 void require_arc_dirs(const std::string& output_dir, const std::string& arcs_out_dir,
-                      const std::string& prev_arcs_dir);
+                      const std::string& prev_arcs_dir, const std::vector<std::string>& regions = {"planet"});
 
 // --- The encoded arcs: what the stage leaves the build ---
 
@@ -496,3 +496,15 @@ void check_lossless(const AdminArcs& arcs, const AdminArcBlocks& blocks, const A
 
 // The arc of each of the set's slots, UINT32_MAX for a tombstone.
 std::vector<uint32_t> arc_at_slot(const ArcSetBlocks& set);
+
+// A continent's share of the planet's encoded arcs: those its polygons
+// (`polygons`, planet ids ascending) use, in the planet's order, their
+// blocks, boxes, keys and planet slots copied, and its polygons' rings'
+// refs. It has no slots or ring blocks until assign_region_arc_slots.
+AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector<uint32_t>& polygons, unsigned threads);
+
+// A continent's own slots for each set, against its previous build's
+// sidecars under `prev_region_dir` (none when empty), its arcs presented in
+// the planet's order; then its ring blocks with them. Logs the slots.
+void assign_region_arc_slots(AdminArcBlocks& blocks, const std::string& prev_region_dir, const std::string& region,
+                             unsigned threads);

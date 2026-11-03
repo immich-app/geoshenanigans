@@ -914,7 +914,7 @@ bool same_closed_ring(const PackedLocation* a, uint32_t a_count, const PackedLoc
 }
 
 void require_arc_dirs(const std::string& output_dir, const std::string& arcs_out_dir,
-                      const std::string& prev_arcs_dir) {
+                      const std::string& prev_arcs_dir, const std::vector<std::string>& regions) {
     namespace fs = std::filesystem;
     if (arcs_out_dir.empty()) {
         if (!prev_arcs_dir.empty())
@@ -935,10 +935,12 @@ void require_arc_dirs(const std::string& output_dir, const std::string& arcs_out
         throw std::runtime_error("--arcs-out " + arcs_out_dir + " overlaps the output dir " + output_dir +
                                  ", which publishes every file under it: keep them apart");
     if (!prev_arcs_dir.empty())
-        for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
-            const std::string sidecar = arc_sidecar_path(prev_arcs_dir + "/planet", set);
-            std::error_code ec;
-            if (!fs::is_regular_file(sidecar, ec))
-                throw std::runtime_error("--prev-arcs " + prev_arcs_dir + " holds no planet arc sidecar " + sidecar);
-        }
+        for (const std::string& region : regions)
+            for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
+                const std::string sidecar = arc_sidecar_path(prev_arcs_dir + "/" + region, set);
+                std::error_code ec;
+                if (!fs::is_regular_file(sidecar, ec))
+                    throw std::runtime_error("--prev-arcs " + prev_arcs_dir + " holds no " + region + " arc sidecar " +
+                                             sidecar);
+            }
 }
