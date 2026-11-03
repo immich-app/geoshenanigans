@@ -7,7 +7,8 @@
 // pieces are one arc, read in its canonical order. A ring is the chain of its
 // refs to arcs. Arcs are presented in Hilbert order of their first vertex and
 // take their slots from IdAllocator (ObjectType::ARC), keyed on their ends and
-// their smallest interior vertex.
+// their smallest interior vertex. build-index runs the arc stage
+// (build_admin_arcs) only with --arcs-out.
 #pragma once
 
 #include <climits>
@@ -227,3 +228,9 @@ std::vector<PackedLocation> rebuild_ring(const AdminArcs& arcs, const AdminExact
 // Whether two closed rings (each ending on its first vertex) are one cycle,
 // from any vertex and in either direction.
 bool same_closed_ring(const PackedLocation* a, uint32_t a_count, const PackedLocation* b, uint32_t b_count);
+
+// build-index's arc dirs, refused before any work: --arcs-out new or empty and
+// apart from the output dir (which publishes whatever it holds), --prev-arcs
+// only with it, and holding the planet's full-set sidecar.
+void require_arc_dirs(const std::string& output_dir, const std::string& arcs_out_dir,
+                      const std::string& prev_arcs_dir);

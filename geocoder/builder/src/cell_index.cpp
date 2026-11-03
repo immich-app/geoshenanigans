@@ -247,9 +247,14 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
         return;
     }
 
+    auto& arc_polygons = data.admin_arcs.polygons;
+    if (!arc_polygons.empty() && arc_polygons.size() != n_old)
+        throw std::logic_error("admin arc polygons out of step with the polygons");
     reorder_by_remap(data.admin_polygons, remap, n_new, admin_polygon_tombstone());
     reorder_by_remap(data.admin_osm_ids, remap, n_new, uint64_t(0));
     if (!data.admin_planet_ids.empty()) reorder_by_remap(data.admin_planet_ids, remap, n_new, NO_DATA);
+    // A tombstone has no rings.
+    if (!arc_polygons.empty()) reorder_by_remap(arc_polygons, remap, n_new, AdminArcPolygon{});
     if (!data.admin_parent_ids.empty()) reorder_by_remap(data.admin_parent_ids, remap, n_new, NO_DATA);
 
     // Apply remap to every reference site that points into admin_polygons[].

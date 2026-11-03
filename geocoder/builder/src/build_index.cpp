@@ -52,6 +52,7 @@
 #include "parent_linking.h"
 #include "polygon_rings.h"
 #include "admin_rank_config.h"
+#include "admin_arcs.h"
 #include "admin_links.h"
 #include "cell_walk.h"
 #include "parallel.h"
@@ -352,6 +353,10 @@ struct BuildConfig {
     bool multi_quality = false;
     std::string output_dir;
     std::string prev_output_dir;
+    // The arc stage runs only with an arcs dir; prev_arcs_dir is the last
+    // such build's.
+    std::string arcs_out_dir;
+    std::string prev_arcs_dir;
 };
 
 // Shared nearest-named-street sweep used by the addr backfill and the POI
@@ -1945,6 +1950,8 @@ static int run(int argc, char* argv[]) {
         std::cerr << "  --tiger-data <path>          Load TIGER address data (tar.gz or directory of CSVs)" << std::endl;
         std::cerr << "  --external-postcodes <path>  Load GeoNames postcode centroids (CSV or .csv.gz)" << std::endl;
         std::cerr << "  --wikidata-sitelinks <path>  Load QID→sitelinks binary for POI importance" << std::endl;
+        std::cerr << "  --arcs-out <dir>             Cut the admin boundaries into arcs (a new or empty dir, apart from <output-dir>)" << std::endl;
+        std::cerr << "  --prev-arcs <dir>            The previous --arcs-out, for its arc slots" << std::endl;
         return 1;
     }
 
@@ -1958,6 +1965,8 @@ static int run(int argc, char* argv[]) {
     // the same dense IDs to records carried over from the previous
     // build. Empty means "fresh start, no stable IDs".
     std::string prev_output_dir;
+    std::string arcs_out_dir;
+    std::string prev_arcs_dir;
     bool multi_output = false;
     bool generate_continents = false;
     IndexMode mode = IndexMode::Full;
@@ -2019,11 +2028,16 @@ static int run(int argc, char* argv[]) {
             external_postcodes_path = argv[++i];
         } else if (arg == "--prev-output" && i + 1 < argc) {
             prev_output_dir = argv[++i];
+        } else if (arg == "--arcs-out" && i + 1 < argc) {
+            arcs_out_dir = argv[++i];
+        } else if (arg == "--prev-arcs" && i + 1 < argc) {
+            prev_arcs_dir = argv[++i];
         } else {
             input_files.push_back(arg);
         }
     }
     require_new_or_empty_output_dir(output_dir);
+    require_arc_dirs(output_dir, arcs_out_dir, prev_arcs_dir);
 
     // Set global simplification mode
     kSimplifyMode = simplify_mode;
@@ -2073,7 +2087,7 @@ static int run(int argc, char* argv[]) {
     }
 
     unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency() - 1);
-    BuildConfig cfg{num_threads, mode, multi_output, multi_quality, output_dir, prev_output_dir};
+    BuildConfig cfg{num_threads, mode, multi_output, multi_quality, output_dir, prev_output_dir, arcs_out_dir, prev_arcs_dir};
     {
         // Parse PBF files (always collect everything)
         if (input_files.empty()) {
@@ -4265,6 +4279,12 @@ static int run(int argc, char* argv[]) {
         data.cell_to_admin = admin_candidate_map(std::move(admin_cells), num_threads);
         log_phase("    Admin: candidate map", _pt, _cpu);
         std::cerr << "Admin candidate map complete (" << data.cell_to_admin.size() << " cells)." << std::endl;
+
+        if (!cfg.arcs_out_dir.empty()) {
+            data.admin_arcs = build_admin_arcs(data.admin_exact_rings,
+                                               cfg.prev_arcs_dir.empty() ? "" : cfg.prev_arcs_dir + "/planet", num_threads);
+            log_phase("    Admin: arcs", _pt, _cpu);
+        }
 
         // Sort admin polygons largest-first (by vertex count descending).
         // This ensures the work-stealing loops in S2 computation and quality

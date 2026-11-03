@@ -78,6 +78,7 @@ add_executable(build-index
     src/build_index.cpp
     src/pbf_reader.cpp
     src/s2_helpers.cpp
+    src/admin_arcs.cpp
     src/admin_cover.cpp
     src/admin_links.cpp
     src/ring_assembly.cpp

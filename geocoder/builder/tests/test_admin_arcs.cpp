@@ -1,10 +1,12 @@
 // admin_arcs.h: the arc topology (junctions, cuts, canonical arcs, refs), the
-// arcs' keys and Hilbert presentation order, and their slots. In the sanitized
+// arcs' keys and Hilbert presentation order, their slots, the arc stage's dirs
+// and its per-polygon rings following each admin permute. In the sanitized
 // suite: the topology's scatter and partition passes index the store directly.
 #include "admin_arcs.h"
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <random>
 #include <set>
@@ -12,6 +14,7 @@
 #include <vector>
 
 #include "parsed_data.h"
+#include "reorder.h"
 #include "scratch_dir.h"
 #include "test_framework.h"
 
@@ -500,4 +503,93 @@ TEST(a_chained_arc_stage_keeps_each_unchanged_arcs_slot) {
     CHECK_EQ(day_two.slot_counts.appended, size_t(4));
     CHECK_EQ(day_two.slot_counts.tombstones, size_t(4));
     CHECK_EQ(day_two.planet_sidecar.size(), day_one.arcs.size() + 4);
+}
+
+// --- The stage's dirs ---
+
+TEST(the_arc_dirs_are_refused_before_the_build_starts) {
+    const ScratchDir root("admin-arc-dirs");
+    const std::string out = root.path() + "/out", arcs = root.path() + "/arcs", prev = root.path() + "/prev";
+    auto refusal = [&](const std::string& o, const std::string& a, const std::string& p) {
+        return refusal_of([&] { require_arc_dirs(o, a, p); });
+    };
+    CHECK_EQ(refusal(out, "", ""), std::string());
+    CHECK_EQ(refusal(out, arcs, ""), std::string());
+    CHECK(refusal(out, "", prev).find("without --arcs-out") != std::string::npos);
+    CHECK(refusal(out, out, "").find("overlaps") != std::string::npos);
+    CHECK(refusal(out, out + "/arcs", "").find("overlaps") != std::string::npos);
+    CHECK(refusal(arcs + "/out", arcs, "").find("overlaps") != std::string::npos);
+    CHECK(refusal(out, root.path() + "/./out/", "").find("overlaps") != std::string::npos);
+    CHECK(refusal(out, root.path() + "/outside", "").empty());
+    std::filesystem::create_directories(arcs);
+    std::ofstream(arcs + "/left") << "x";
+    CHECK(refusal(out, arcs, "").find("not empty") != std::string::npos);
+    CHECK(refusal(out, root.path() + "/arcs2", prev).find("no planet arc sidecar") != std::string::npos);
+    const std::string sidecar = arc_sidecar_path(prev + "/planet", ArcSet::Full);
+    CHECK_EQ(sidecar, prev + "/planet/quality/exact/arc_index.osm_ids");
+    CHECK_EQ(arc_sidecar_path(prev + "/planet", ArcSet::Minimal), prev + "/planet/admin-minimal/arc_index.osm_ids");
+    std::filesystem::create_directories(prev + "/planet/quality/exact");
+    gc::id_alloc::IdAllocator::write_sidecar(sidecar, {});
+    CHECK_EQ(refusal(out, root.path() + "/arcs2", prev), std::string());
+}
+
+// --- Polygons in lockstep ---
+
+namespace {
+
+// Polygons named 0..n-1, each of a ring of its own (and a hole every third),
+// their arcs built: the names run backwards in polygon order, so sorting
+// moves every one.
+ParsedData named_polygons_with_arcs(int n) {
+    ParsedData d;
+    for (int i = 0; i < n; i++) {
+        AdminPolygon p{};
+        p.name_id = static_cast<uint32_t>(n - 1 - i);
+        d.admin_polygons.push_back(p);
+        d.admin_osm_ids.push_back(1000 + p.name_id);
+        const int32_t at = 100 * static_cast<int32_t>(p.name_id);
+        std::vector<Ring> holes;
+        if (i % 3 == 0) holes.push_back(closed({pt(at + 2, 2), pt(at + 2, 4), pt(at + 4, 3)}));
+        d.admin_exact_rings.append(closed({pt(at, 0), pt(at, 10), pt(at + 10, 10), pt(at + 10, 0)}), holes);
+    }
+    d.admin_arcs = build_admin_arcs(d.admin_exact_rings, "", 1);
+    return d;
+}
+
+// Whether each polygon's arc rings rebuild to its own rings (its name sets
+// its latitude).
+bool arc_rings_follow_the_polygons(const ParsedData& d) {
+    if (d.admin_arcs.polygons.size() != d.admin_polygons.size()) return false;
+    for (size_t k = 0; k < d.admin_polygons.size(); k++) {
+        const AdminArcPolygon& p = d.admin_arcs.polygons[k];
+        if (p.ring_count == 0) return false;
+        const std::vector<PackedLocation> outer = rebuild_ring(d.admin_arcs, d.admin_exact_rings, p.first_ring);
+        int32_t lowest = INT32_MAX;
+        for (const PackedLocation& v : outer) lowest = std::min(lowest, v.lat_e7);
+        if (lowest != 100 * static_cast<int32_t>(d.admin_polygons[k].name_id)) return false;
+        if (!(p == AdminArcPolygon{d.admin_exact_rings.polygons[k].first_ring, d.admin_exact_rings.polygons[k].ring_count}))
+            return false;
+    }
+    return true;
+}
+
+}  // namespace
+
+TEST(each_polygons_arc_rings_follow_it_through_the_admin_permutes) {
+    for (unsigned threads : {1u, 3u}) {
+        ParsedData d = named_polygons_with_arcs(9);
+        CHECK(arc_rings_follow_the_polygons(d));
+        permute_admin_polygons(d, {4, 0, 8, 1, 7, 2, 6, 3, 5}, threads);
+        CHECK(arc_rings_follow_the_polygons(d));
+        reorder_admin_polygons(d, threads);
+        CHECK_EQ(d.admin_polygons[0].name_id, 0u);
+        CHECK(arc_rings_follow_the_polygons(d));
+    }
+    // Out of step is refused before anything moves.
+    ParsedData d = named_polygons_with_arcs(3);
+    d.admin_arcs.polygons.pop_back();
+    const std::vector<uint64_t> osm_ids = d.admin_osm_ids;
+    CHECK(refusal_of<std::logic_error>([&] { permute_admin_polygons(d, {2, 1, 0}, 1); }).find("out of step") !=
+          std::string::npos);
+    CHECK(d.admin_osm_ids == osm_ids);
 }
