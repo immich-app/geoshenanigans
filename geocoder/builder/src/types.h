@@ -199,6 +199,13 @@ static constexpr double ADMIN_COVER_MAX_PIECE_RAD       = 0.01;
 static constexpr double ADMIN_COVER_READER_SLACK_DEG    = 1e-4;
 static constexpr double ADMIN_COVER_REACH_RAD =
     ADMIN_COVER_CHORD_TOLERANCE_RAD + ADMIN_COVER_READER_SLACK_DEG * (3.14159265358979323846 / 180.0);
+// The builder's own admin cells (admin_candidate_map) are tested by the exact
+// e7 ray cast at the point's e7 rounding, which has no error of its own. The
+// slack only covers the rounding of a cell centre to e7 for its interior
+// test, at most 0.71e-7 deg, so a centre never crosses an edge.
+static constexpr double ADMIN_LINK_SLACK_DEG = 1e-7;
+static constexpr double ADMIN_LINK_REACH_RAD =
+    ADMIN_COVER_CHORD_TOLERANCE_RAD + ADMIN_LINK_SLACK_DEG * (3.14159265358979323846 / 180.0);
 
 // --- Index mode ---
 

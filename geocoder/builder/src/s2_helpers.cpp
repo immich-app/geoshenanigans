@@ -237,123 +237,6 @@ std::vector<std::pair<S2CellId, bool>> cover_polygon(
     return result;
 }
 
-// --- AdminCoverPool ---
-
-AdminCoverPool::AdminCoverPool(size_t num_threads) : stop_(false) {
-    for (size_t i = 0; i < num_threads; i++) {
-        workers_.emplace_back([this]() { worker_loop(); });
-    }
-}
-
-AdminCoverPool::~AdminCoverPool() {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        stop_ = true;
-    }
-    cv_.notify_all();
-    for (auto& t : workers_) t.join();
-}
-
-void AdminCoverPool::submit(uint32_t poly_id, std::vector<std::pair<double,double>>&& vertices) {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        queue_.push_back({poly_id, std::move(vertices)});
-    }
-    cv_.notify_one();
-}
-
-void AdminCoverPool::submit_all(std::vector<WorkItem>&& items) {
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto& item : items) queue_.push_back(std::move(item));
-    }
-    cv_.notify_all();
-}
-
-void AdminCoverPool::wait_idle() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    done_cv_.wait(lock, [this]() { return queue_.empty() && active_workers_ == 0; });
-}
-
-std::unordered_map<uint64_t, std::vector<uint32_t>> AdminCoverPool::drain() {
-    wait_idle();
-    // Merge the per-worker maps on all workers, each cell in the one shard
-    // its id hashes to (splitmix64: level-10 ids end in 40 zero bits).
-    size_t shards = std::max<size_t>(1, thread_results_.size());
-    auto shard_of = [shards](uint64_t cell_id) {
-        uint64_t z = cell_id;
-        z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
-        z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
-        return static_cast<size_t>((z ^ (z >> 31)) % shards);
-    };
-    std::vector<std::unordered_map<uint64_t, std::vector<uint32_t>>> parts(shards);
-    parallel_for(shards, [&](size_t begin, size_t end, unsigned) {
-        for (size_t s = begin; s < end; s++) {
-            auto& part = parts[s];
-            for (const auto& local : thread_results_) {
-                for (const auto& [cell_id, ids] : local) {
-                    if (shard_of(cell_id) != s) continue;
-                    auto& target = part[cell_id];
-                    target.insert(target.end(), ids.begin(), ids.end());
-                }
-            }
-            // Determinism: the order in which worker threads pick items off the
-            // queue is thread-scheduling dependent, so each cell's merged vector
-            // can end up in a different order across runs. Downstream code that
-            // iterates these vectors (e.g. the "first admin_level=2 polygon"
-            // country lookup in the postcode centroid writer) must see a stable
-            // ordering or its output becomes non-deterministic and breaks
-            // incremental patching. Sort each vector by its entry value (which
-            // includes the INTERIOR_FLAG bit + poly_id).
-            for (auto& [cell_id, ids] : part) {
-                std::sort(ids.begin(), ids.end());
-            }
-        }
-    }, static_cast<unsigned>(shards));
-    std::unordered_map<uint64_t, std::vector<uint32_t>> merged;
-    size_t cells = 0;
-    for (const auto& part : parts) cells += part.size();
-    merged.reserve(cells);
-    for (auto& part : parts) {
-        for (auto& [cell_id, ids] : part) merged.emplace(cell_id, std::move(ids));
-    }
-    return merged;
-}
-
-void AdminCoverPool::worker_loop() {
-    size_t my_idx;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        my_idx = thread_results_.size();
-        thread_results_.emplace_back();
-    }
-
-    while (true) {
-        WorkItem item;
-        {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this]() { return stop_ || !queue_.empty(); });
-            if (stop_ && queue_.empty()) return;
-            item = std::move(queue_.front());
-            queue_.pop_front();
-            active_workers_++;
-        }
-
-        auto cell_ids = cover_polygon(item.vertices, item.holes);
-        auto& local = thread_results_[my_idx];
-        for (const auto& [cell_id, is_interior] : cell_ids) {
-            uint32_t entry = is_interior ? (item.poly_id | INTERIOR_FLAG) : item.poly_id;
-            local[cell_id.id()].push_back(entry);
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            active_workers_--;
-        }
-        done_cv_.notify_all();
-    }
-}
-
 // --- add_addr_point ---
 
 void add_addr_point(ParsedData& data, double lat, double lng,
@@ -403,7 +286,6 @@ void add_admin_polygon(ParsedData& data,
                        const std::vector<PackedLocation>& ring,
                        const char* name, uint8_t admin_level,
                        const char* country_code,
-                       AdminCoverPool* admin_pool,
                        uint8_t place_type_override,
                        int64_t osm_way_id) {
     auto vertices = ring;
@@ -426,7 +308,8 @@ void add_admin_polygon(ParsedData& data,
     poly.name_id = data.string_pool.intern(name);
     poly.admin_level = admin_level;
     poly.place_type_override = place_type_override;
-    poly.area = polygon_area(simplified);
+    data.admin_exact_rings.append(vertices, {});
+    poly.area = data.admin_exact_rings.area(poly_id);
     poly.country_code = (country_code && country_code[0] && country_code[1])
         ? pack_country_code(country_code[0], country_code[1])
         : 0;
@@ -449,7 +332,4 @@ void add_admin_polygon(ParsedData& data,
         data.admin_osm_ids.push_back(0);
     }
 
-    if (admin_pool) {
-        admin_pool->submit(poly_id, std::move(simplified));
-    }
 }

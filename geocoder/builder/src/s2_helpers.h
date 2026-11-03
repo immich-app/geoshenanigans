@@ -1,10 +1,6 @@
 #pragma once
 
-#include <condition_variable>
 #include <cstdint>
-#include <deque>
-#include <mutex>
-#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -44,39 +40,6 @@ S2CellId point_to_cell(double lat, double lng);
 // those wholly outside the holes are flagged.
 std::vector<std::pair<S2CellId, bool>> cover_polygon(
     const std::vector<std::pair<double,double>>& vertices, uint16_t holes = 0);
-
-// --- Thread pool for concurrent admin polygon S2 covering ---
-
-class AdminCoverPool {
-public:
-    struct WorkItem {
-        uint32_t poly_id;
-        std::vector<std::pair<double,double>> vertices;
-        uint16_t holes = 0;  // keyhole-encoded holes in `vertices`
-    };
-
-    explicit AdminCoverPool(size_t num_threads);
-    ~AdminCoverPool();
-
-    void submit(uint32_t poly_id, std::vector<std::pair<double,double>>&& vertices);
-    // submit() for many polygons at once: one lock, one wake-up call.
-    void submit_all(std::vector<WorkItem>&& items);
-    // Blocks until every submitted polygon is covered.
-    void wait_idle();
-    std::unordered_map<uint64_t, std::vector<uint32_t>> drain();
-
-private:
-    void worker_loop();
-
-    std::vector<std::thread> workers_;
-    std::deque<WorkItem> queue_;
-    std::vector<std::unordered_map<uint64_t, std::vector<uint32_t>>> thread_results_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::condition_variable done_cv_;
-    size_t active_workers_ = 0;
-    bool stop_;
-};
 
 // --- Simplification dispatch ---
 
@@ -120,10 +83,12 @@ void append_addr_point(ParsedData& data, double lat, double lng,
                        const NodeCoord* polygon_vertices = nullptr,
                        uint32_t polygon_vertex_count = 0);
 
+// Appends the admin polygon of a closed way's ring, simplified, with the ring
+// itself to the exact rings and their area as the polygon's; nothing when
+// the simplified ring keeps under 3 vertices.
 void add_admin_polygon(ParsedData& data,
                        const std::vector<PackedLocation>& ring,
                        const char* name, uint8_t admin_level,
                        const char* country_code,
-                       AdminCoverPool* admin_pool = nullptr,
                        uint8_t place_type_override = 0,
                        int64_t osm_way_id = 0);

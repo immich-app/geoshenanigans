@@ -607,8 +607,8 @@ inline void reorder_interps(ParsedData& data, unsigned threads = 0) {
 
 // Moves admin polygon order[i] to slot i, with its vertices repacked in the
 // new order (into vertex_buffer, when made beside earlier work as repack
-// takes it) and its osm id in lockstep; returns old_to_new. References to
-// polygons elsewhere are the caller's to remap.
+// takes it) and its osm id and exact rings in lockstep; returns old_to_new.
+// References to polygons elsewhere are the caller's to remap.
 inline std::vector<uint32_t> permute_admin_polygons(ParsedData& data, const std::vector<uint32_t>& order,
                                                     unsigned threads, std::vector<NodeCoord> vertex_buffer = {}) {
     const size_t n = order.size();
@@ -622,6 +622,8 @@ inline std::vector<uint32_t> permute_admin_polygons(ParsedData& data, const std:
         for (size_t i = b; i < e; i++) new_polys[i].vertex_offset = static_cast<uint32_t>(repacked.at[i]);
     }, threads);
     if (data.admin_osm_ids.size() == n) data.admin_osm_ids = gather(data.admin_osm_ids, order, threads);
+    auto& exact = data.admin_exact_rings.polygons;
+    if (exact.size() == n) exact = gather(exact, order, threads);
     data.admin_polygons = std::move(new_polys);
     data.admin_vertices.swap(repacked.items);
     free_beside(std::move(repacked.items));

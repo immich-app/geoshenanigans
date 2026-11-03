@@ -30,7 +30,6 @@
 #include "polygon_rings.h"
 #include "postcode_validation.h"
 #include "ranked_bits.h"
-#include "ring_contains.h"
 #include "s2_helpers.h"
 #include "strategy2_remap.h"
 #include "string_subset.h"
@@ -254,8 +253,8 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
     if (!data.admin_parent_ids.empty()) reorder_by_remap(data.admin_parent_ids, remap, n_new, NO_DATA);
 
     // Apply remap to every reference site that points into admin_polygons[].
-    // cell_to_admin entries carry the high-bit INTERIOR_FLAG (set during
-    // the admin S2-covering pass for cells fully inside a polygon). A
+    // cell_to_admin entries carry the high-bit INTERIOR_FLAG (set by
+    // admin_candidate_cells for cells fully inside a polygon). A
     // flagged value is ≥ 2^31, so the plain remap_index's `v < remap.size()`
     // guard would skip it and leave a stale polygon index after reorder, so
     // use remap_index_flagged which masks the flag, remaps, then re-ORs.
@@ -511,15 +510,13 @@ void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir, RunOr
 }
 
 // Find the level-2 (country) admin polygon covering (lat, lng) and return
-// its country_code, or 0 if none is found. Resolves the point to its
-// kAdminCellLevel S2 cell and walks that cell's admin entries. Single-
-// country cells return immediately; border cells (multiple countries in
-// the entry list) resolve by point-in-polygon, with the ring test supplied
-// as contains(polygon id, vertices, count, plat, plng).
-template <class Contains>
-static uint16_t country_at(const ParsedData& data, double lat, double lng, Contains contains) {
-    S2CellId cell = S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(kAdminCellLevel);
-    auto it = data.cell_to_admin.find(cell.id());
+// its country_code, or 0 if none is found. Rounds the point to e7 and walks
+// its own cell's admin entries. Single-country cells return immediately;
+// border cells (multiple countries in the entry list) resolve by the exact
+// point-in-polygon test of `countries`.
+static uint16_t country_at(const ParsedData& data, const AdminRings& countries, double lat, double lng) {
+    const PackedLocation p = point_e7(lat, lng);
+    auto it = data.cell_to_admin.find(admin_link_cell(p).id());
     if (it == data.cell_to_admin.end()) return 0;
 
     // Selection must be independent of the entry-vector order: the on-disk
@@ -555,8 +552,6 @@ static uint16_t country_at(const ParsedData& data, double lat, double lng, Conta
     if (single_cc == 0) return 0;
     if (!multiple) return single_cc;
 
-    float plat = static_cast<float>(lat);
-    float plng = static_cast<float>(lng);
     float best_area = std::numeric_limits<float>::max();
     uint16_t best_cc = 0;        // smallest containing polygon's country
     uint16_t fallback_cc = 0;    // lowest cc among all candidates
@@ -567,10 +562,7 @@ static uint16_t country_at(const ParsedData& data, double lat, double lng, Conta
         if (poly.admin_level != 2 || poly.country_code == 0) continue;
         if (fallback_cc == 0 || poly.country_code < fallback_cc)
             fallback_cc = poly.country_code;
-        uint32_t off = poly.vertex_offset;
-        uint32_t cnt = poly.vertex_count;
-        if (off + cnt > data.admin_vertices.size() || cnt < 3) continue;
-        if (contains(pid, &data.admin_vertices[off], cnt, plat, plng)) {
+        if ((raw_id & INTERIOR_FLAG) || countries.contains(pid, p)) {
             if (poly.area < best_area ||
                 (poly.area == best_area && poly.country_code < best_cc)) {
                 best_area = poly.area;
@@ -581,16 +573,11 @@ static uint16_t country_at(const ParsedData& data, double lat, double lng, Conta
     return best_cc != 0 ? best_cc : fallback_cc;
 }
 
-uint16_t country_code_at_point(const ParsedData& data, double lat, double lng) {
-    return country_at(data, lat, lng, [](uint32_t, const NodeCoord* verts, uint32_t cnt, float plat, float plng) {
-        return ring_contains(verts, cnt, plat, plng);
-    });
+uint16_t country_code_at_point(const ParsedData& data, const AdminRings& countries, double lat, double lng) {
+    return country_at(data, countries, lat, lng);
 }
 
-// Edge indexes of the country rings that border cells (several countries
-// in the entry list) test, by polygon id; null for the rest. Planet country
-// rings run to millions of vertices.
-static std::vector<std::unique_ptr<RingEdgeIndex>> index_border_rings(const ParsedData& data) {
+AdminRings border_country_rings(const ParsedData& data, unsigned int threads) {
     auto country_ring = [&](uint32_t raw_id) {
         uint32_t pid = raw_id & ID_MASK;
         return pid < data.admin_polygons.size() && data.admin_polygons[pid].admin_level == 2
@@ -615,31 +602,16 @@ static std::vector<std::unique_ptr<RingEdgeIndex>> index_border_rings(const Pars
                 for (uint32_t raw_id : ids)
                     if (country_ring(raw_id)) mark_bit(tested, raw_id & ID_MASK);
             }
-    });
+    }, threads);
     const RankedBits marked(polygons, tested);
-    const std::vector<uint32_t> pids = parallel_filter(polygons, [&](size_t pid) {
-        const auto& poly = data.admin_polygons[pid];
-        return marked.index(pid) != RankedBits::npos &&
-               poly.vertex_offset + poly.vertex_count <= data.admin_vertices.size() && poly.vertex_count >= 3;
-    });
-    std::vector<std::unique_ptr<RingEdgeIndex>> rings(data.admin_polygons.size());
-    parallel_for_dynamic(pids.size(), 1, [&](size_t begin, size_t end, unsigned) {
-        for (size_t k = begin; k < end; k++) {
-            const auto& poly = data.admin_polygons[pids[k]];
-            rings[pids[k]] = std::make_unique<RingEdgeIndex>(&data.admin_vertices[poly.vertex_offset],
-                                                             poly.vertex_count);
-        }
-    });
-    return rings;
+    return AdminRings(data.admin_exact_rings, threads,
+                      [&](uint32_t pid) { return marked.index(pid) != RankedBits::npos; });
 }
 
 void collect_postcode_centroids(ParsedData& data) {
     using Accums = std::unordered_map<uint64_t, ParsedData::PostcodeAccum>;
     size_t n = std::min(data.addr_points.size(), data.addr_postcode_ids.size());
-    const auto rings = index_border_rings(data);
-    auto contains = [&](uint32_t pid, const NodeCoord* verts, uint32_t cnt, float plat, float plng) {
-        return rings[pid] ? rings[pid]->contains(plat, plng) : ring_contains(verts, cnt, plat, plng);
-    };
+    const AdminRings countries = border_country_rings(data);
     // Border cells cost a point-in-polygon each, so workers take small
     // ranges as they free up. The sums are integers: merging the workers'
     // maps in any order gives the same totals.
@@ -649,7 +621,7 @@ void collect_postcode_centroids(ParsedData& data) {
             uint32_t pc_id = data.addr_postcode_ids[i];
             if (pc_id == NO_DATA) continue;
             const auto& ap = data.addr_points[i];
-            uint16_t cc = country_at(data, ap.lat, ap.lng, contains);
+            uint16_t cc = country_at(data, countries, ap.lat, ap.lng);
             if (cc == 0) continue;
             parts[w][postcode_key(cc, pc_id)].add(ap.lat, ap.lng);
         }
@@ -1155,7 +1127,7 @@ void compute_admin_index_cells(ParsedData& data, const std::vector<double>& scal
                 const PackedPolygon pp = pack_admin_polygon(data, ap, scale);
                 if (pp.bytes.empty()) return AdminRingCells();
                 const std::vector<NodeCoord> ring = unpack_polygon(pp.bytes.data(), pp.vertex_count);
-                return admin_ring_cells(ring.data(), pp.vertex_count, kAdminCellLevel);
+                return admin_ring_cells(ring.data(), pp.vertex_count, kAdminCellLevel, ADMIN_COVER_REACH_RAD);
             };
             const bool minimal = minimal_scale && admin_minimal_keeps(ap.admin_level, ap.place_type_override);
             std::optional<AdminRingCells> shared, own_minimal;

@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "admin_links.h"
 #include "types.h"
 #include "parsed_data.h"
 #include "cell_index_io.h"
@@ -30,15 +31,21 @@ void compute_admin_index_cells(ParsedData& data, const std::vector<double>& scal
 // (data.strings_tier_bases) in every dir that resolves the shared strings.
 void write_strings_layout(const std::string& dir, const std::array<uint32_t, STR_TIER_COUNT + 1>& bases);
 
-// Country of the point via its admin cell's level-2 entries; border cells
-// (multiple candidate countries) resolve by point-in-polygon. 0 if unknown.
-uint16_t country_code_at_point(const ParsedData& data, double lat, double lng);
+// The rings of the country polygons for country_code_at_point: those that
+// border cells (cells listing two countries) test, edge-indexed.
+AdminRings border_country_rings(const ParsedData& data, unsigned int threads = 0);
+
+// Country of the point via its own admin cell's level-2 entries; border
+// cells (multiple candidate countries) resolve by the exact point-in-polygon
+// test of `countries` (border_country_rings). 0 if unknown.
+uint16_t country_code_at_point(const ParsedData& data, const AdminRings& countries, double lat, double lng);
 
 // Fold the OSM addr:postcode points into data.postcode_accum per
 // (country, postcode), keeping external centroids only for the pairs OSM
 // lacks. Run once on the full data before the continent split, so every
 // region writes the same centroids (Nominatim's location_postcode is one
 // table) instead of recomputing them from its own subset of addr points.
+// The last reader of data.admin_exact_rings.
 void collect_postcode_centroids(ParsedData& data);
 
 // Strategy-2 persistent dense IDs. Loads the previous build's

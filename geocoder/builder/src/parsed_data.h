@@ -22,7 +22,9 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include "exact_pip.h"
 #include "packed_location.h"
+#include "polygon_rings.h"
 #include "types.h"
 #include "string_pool.h"
 #include "id_allocator.h"
@@ -282,6 +284,39 @@ struct WayGeometries {
 
 // --- Parsed data container ---
 
+// Every admin polygon's exact rings, OSM's own e7 points: closed rings
+// (the last vertex repeating the first), the outer ring first, then the
+// holes. As the polygons are reordered only `polygons` follows them; the
+// vertices and ring spans never move.
+struct AdminExactRings {
+    struct Polygon {
+        uint32_t first_ring = 0;
+        uint32_t ring_count = 0;
+    };
+    std::vector<PackedLocation> vertices;
+    std::vector<RingSpan> rings;
+    std::vector<Polygon> polygons;  // parallel to ParsedData::admin_polygons
+
+    const RingSpan* rings_of(uint32_t pid) const { return rings.data() + polygons[pid].first_ring; }
+    // The rings' area in square degrees (exact_polygon_area).
+    float area(uint32_t pid) const { return exact_polygon_area(vertices.data(), rings_of(pid), polygons[pid].ring_count); }
+
+    // Appends a polygon of the outer ring and the holes.
+    void append(const std::vector<PackedLocation>& outer, const std::vector<std::vector<PackedLocation>>& holes) {
+        size_t total = vertices.size() + outer.size();
+        for (const auto& h : holes) total += h.size();
+        if (total > UINT32_MAX || rings.size() + 1 + holes.size() > UINT32_MAX)
+            throw std::length_error("admin exact rings past 2^32 vertices or rings");
+        polygons.push_back({static_cast<uint32_t>(rings.size()), static_cast<uint32_t>(1 + holes.size())});
+        auto add = [&](const std::vector<PackedLocation>& ring) {
+            rings.push_back({static_cast<uint32_t>(vertices.size()), static_cast<uint32_t>(ring.size())});
+            vertices.insert(vertices.end(), ring.begin(), ring.end());
+        };
+        add(outer);
+        for (const auto& h : holes) add(h);
+    }
+};
+
 struct ParsedData {
     StringPool string_pool;
     std::vector<WayHeader> ways;
@@ -338,9 +373,12 @@ struct ParsedData {
     std::vector<gc::id_alloc::SidecarSlot> poi_sidecar_blob;
     std::vector<gc::id_alloc::SidecarSlot> interp_sidecar_blob;
     std::vector<NodeCoord> admin_vertices;
-    // The builder's own admin candidates per cell: the S2 covering of each
-    // polygon's ring, which the parent and country passes (and the continent
-    // split's polygon set) read.
+    // Freed once the postcode centroids, its last user, have their countries.
+    AdminExactRings admin_exact_rings;
+    // The builder's own admin candidates per cell (admin_candidate_map): every
+    // cell from which a polygon's exact rings can hold a point, flagged
+    // INTERIOR_FLAG where they hold all of it. The parent and country passes
+    // (and the continent split's polygon set) read it.
     std::unordered_map<uint64_t, std::vector<uint32_t>> cell_to_admin;
     // The admin cell index the reader reads (admin_cells.bin), in canonical
     // order: (cell, poly_id | INTERIOR_FLAG) for every cell from which any
@@ -404,8 +442,8 @@ struct ParsedData {
     struct PostcodeAccum {
         int64_t sum_lat_e7 = 0; int64_t sum_lng_e7 = 0; uint64_t count = 0;
         void add(double lat, double lng) {
-            sum_lat_e7 += llround(lat * 1e7);
-            sum_lng_e7 += llround(lng * 1e7);
+            sum_lat_e7 += to_e7(lat);
+            sum_lng_e7 += to_e7(lng);
             count++;
         }
         double lat() const { return (sum_lat_e7 / 1e7) / static_cast<double>(count); }

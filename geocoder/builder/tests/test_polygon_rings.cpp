@@ -60,8 +60,6 @@ TEST(split_rings_without_holes_is_one_ring) {
     CHECK(split_rings(kOuter.data(), static_cast<uint32_t>(kOuter.size()), 0, spans));
     CHECK_EQ(spans.size(), 1u);
     CHECK_EQ(spans[0].count, static_cast<uint32_t>(kOuter.size()));
-    CHECK_EQ(outer_ring_count(kOuter.data(), static_cast<uint32_t>(kOuter.size()), 0),
-             static_cast<uint32_t>(kOuter.size()));
 }
 
 TEST(split_rings_rejects_a_range_without_the_holes_it_claims) {
@@ -127,7 +125,9 @@ TEST(interior_point_avoids_holes) {
     // The scan line through the middle meets the central hole: the point
     // must sit in one of the stretches beside it.
     const Ring range = encode_rings(square(0, 0, 10, 10), {reversed(square(1, 3, 9, 7))});
-    const auto [lat, lng] = polygon_interior_point(range.data(), static_cast<uint32_t>(range.size()), 1);
+    std::vector<RingSpan> spans;
+    REQUIRE(split_rings(range.data(), static_cast<uint32_t>(range.size()), 1, spans));
+    const auto [lat, lng] = interior_point(range.data(), spans);
     CHECK(ring_contains_latlng(square(0, 0, 10, 10), lat, lng));
     CHECK(!ring_contains_latlng(square(1, 3, 9, 7), lat, lng));
 }

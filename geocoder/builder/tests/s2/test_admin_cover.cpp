@@ -19,6 +19,7 @@
 #include <s2/s2loop.h>
 
 #include "admin_rank_config.h"
+#include "exact_pip.h"
 #include "cell_index.h"
 #include "geometry.h"
 #include "ring_contains.h"
@@ -79,7 +80,8 @@ std::vector<std::pair<double, double>> probe_points(const std::vector<NodeCoord>
 // Every probe the reader puts inside the ring is listed in its own cell, and
 // none in an interior-flagged cell is outside it. Returns the inside probes.
 size_t check_ring(const std::vector<NodeCoord>& ring, std::mt19937_64& rng, size_t probes, int level) {
-    const AdminRingCells cells = admin_ring_cells(ring.data(), static_cast<uint32_t>(ring.size()), level);
+    const AdminRingCells cells =
+        admin_ring_cells(ring.data(), static_cast<uint32_t>(ring.size()), level, ADMIN_COVER_REACH_RAD);
     CHECK(std::is_sorted(cells.begin(), cells.end()));
     CHECK(std::adjacent_find(cells.begin(), cells.end(),
                              [](const auto& x, const auto& y) { return x.first == y.first; }) == cells.end());
@@ -116,7 +118,8 @@ TEST(a_point_in_the_bow_of_a_parallel_edge_is_listed_in_its_own_cell) {
     loop.Normalize();
     CHECK(!loop.Contains(S2LatLng::FromDegrees(lat, lng).ToPoint()));  // outside the great-circle ring
 
-    const AdminRingCells cells = admin_ring_cells(ring.data(), static_cast<uint32_t>(ring.size()), kLevel);
+    const AdminRingCells cells =
+        admin_ring_cells(ring.data(), static_cast<uint32_t>(ring.size()), kLevel, ADMIN_COVER_REACH_RAD);
     const auto* entry = own_cell_entry(cells, lat, lng, kLevel);
     REQUIRE(entry != nullptr);
     CHECK(!entry->second);  // 210 m from the edge: not interior
@@ -140,7 +143,8 @@ TEST(a_cell_within_the_reader_slack_of_an_edge_is_listed) {
                                               S2LatLng::FromDegrees(ring[2].lat, ring[2].lng).ToPoint());
     REQUIRE(gap > S1ChordAngle::Radians(ADMIN_COVER_CHORD_TOLERANCE_RAD));
 
-    const AdminRingCells cells = admin_ring_cells(ring.data(), static_cast<uint32_t>(ring.size()), kLevel);
+    const AdminRingCells cells =
+        admin_ring_cells(ring.data(), static_cast<uint32_t>(ring.size()), kLevel, ADMIN_COVER_REACH_RAD);
     const S2LatLng centre(cell.GetCenter());
     const auto* entry = own_cell_entry(cells, centre.lat().degrees(), centre.lng().degrees(), kLevel);
     REQUIRE(entry != nullptr);
@@ -271,7 +275,7 @@ AdminRingCells variant_cells(const std::vector<NodeCoord>& ring, uint8_t level, 
     std::vector<uint8_t> bytes(plan_polygon(pts.data(), pts.size()).bytes);
     pack_polygon_at(bytes.data(), pts.data(), pts.size());
     auto decoded = unpack_polygon(bytes.data(), pts.size());
-    return admin_ring_cells(decoded.data(), decoded.size(), kAdminCellLevel);
+    return admin_ring_cells(decoded.data(), decoded.size(), kAdminCellLevel, ADMIN_COVER_REACH_RAD);
 }
 
 AdminRingCells indexed_cells(const std::vector<CellItemPair>& pairs) {
@@ -372,4 +376,102 @@ TEST(admin_cover_minimal_keeps_rank_sixteen_city_areas) {
     data.admin_polygons[0].place_type_override = 0;
     compute_admin_index_cells(data, {0}, 2.5);
     CHECK(data.admin_minimal_index_cells.empty());
+}
+
+namespace {
+
+// A polygon's exact rings in one vertex array: the outer ring, then the holes.
+struct ExactPolygon {
+    std::vector<PackedLocation> vertices;
+    std::vector<RingSpan> rings;
+
+    void add(std::vector<PackedLocation> ring) {
+        ring.push_back(ring.front());
+        rings.push_back({static_cast<uint32_t>(vertices.size()), static_cast<uint32_t>(ring.size())});
+        vertices.insert(vertices.end(), ring.begin(), ring.end());
+    }
+    AdminRingCells cells(int level, double reach_rad) const {
+        return admin_ring_cells(vertices.data(), rings.data(), static_cast<uint32_t>(rings.size()), level, reach_rad);
+    }
+    // Even-odd over every ring, as the builder's links test it.
+    bool contains(PackedLocation p) const {
+        bool inside = false;
+        for (const RingSpan& r : rings) inside ^= exact_ring_contains(vertices.data() + r.begin, r.count, p);
+        return inside;
+    }
+};
+
+// A star of n vertices round (lat, lng), radii between 0.3 and 1 times r.
+std::vector<PackedLocation> star(std::mt19937_64& rng, double lat, double lng, double r, int n) {
+    std::uniform_real_distribution<double> unit(0, 1);
+    std::vector<PackedLocation> out;
+    for (int k = 0; k < n; k++) {
+        const double a = 2 * M_PI * (k + 0.5 * unit(rng)) / n, d = r * (0.3 + 0.7 * unit(rng));
+        out.push_back(point_e7(std::clamp(lat + d * std::sin(a), -89.9, 89.9),
+                               std::clamp(lng + d * std::cos(a) / std::cos(lat * M_PI / 180), -180.0, 180.0)));
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(admin_ring_cells_of_exact_rings_with_holes_list_every_point_inside) {
+    std::mt19937_64 rng(1103);
+    std::uniform_real_distribution<double> unit(0, 1), near(-1e-3, 1e-3);
+    size_t inside = 0, in_holes = 0;
+    for (int round = 0; round < 60; round++) {
+        const double lat = -80 + 160 * unit(rng), lng = -170 + 340 * unit(rng), r = round % 3 ? 0.3 : 3;
+        ExactPolygon polygon;
+        polygon.add(star(rng, lat, lng, r, 8 + static_cast<int>(rng() % 300)));
+        for (int h = 0; h < 1 + round % 3; h++)
+            polygon.add(star(rng, lat + 0.15 * r * (h - 1), lng + 0.15 * r * (h - 1), 0.12 * r, 6 + h));
+        const int level = round % 2 ? kLevel : 7;
+        const AdminRingCells cells = polygon.cells(level, ADMIN_LINK_REACH_RAD);
+        CHECK(std::is_sorted(cells.begin(), cells.end()));
+        for (int k = 0; k < 4000; k++) {
+            PackedLocation p;
+            if (k % 2) {
+                p = point_e7(lat + r * (2 * unit(rng) - 1), lng + r * (2 * unit(rng) - 1) / std::cos(lat * M_PI / 180));
+            } else {
+                const RingSpan& ring = polygon.rings[rng() % polygon.rings.size()];
+                const PackedLocation a = polygon.vertices[ring.begin + rng() % (ring.count - 1)];
+                p = point_e7(a.lat() + near(rng), a.lon() + near(rng));
+            }
+            p = {std::clamp(p.lat_e7, -900000000, 900000000), std::clamp(p.lon_e7, -1800000000, 1800000000)};
+            const auto* entry = own_cell_entry(cells, p.lat(), p.lon(), level);
+            const bool in = polygon.contains(p);
+            if (in) {
+                inside++;
+                CHECK(entry != nullptr);
+            } else if (exact_ring_contains(polygon.vertices.data(), polygon.rings[0].count, p)) {
+                in_holes++;
+            }
+            if (entry && entry->second) CHECK(in);
+        }
+    }
+    CHECK(inside > 20000);
+    CHECK(in_holes > 1000);
+}
+
+TEST(the_reach_decides_how_far_from_an_exact_edge_a_cell_is_listed) {
+    // A ring whose east edge runs along a meridian `gap` west of a cell: the
+    // reader's reach (6.4 m chord + 11 m slack) lists the cell from 8.9 m
+    // off, the builder's (6.4 m + 1.1 cm) only from under 6.4 m.
+    const S2Cell cell(S2CellId(S2LatLng::FromDegrees(5.3, 20.7)).parent(kLevel));
+    const S2LatLngRect rect = cell.GetRectBound();
+    const S2LatLng centre(cell.GetCenter());
+    auto listed = [&](double gap_deg, double reach_rad) {
+        const double east = rect.lng_lo().degrees() - gap_deg;
+        const double south = rect.lat_lo().degrees() - 0.01, north = rect.lat_hi().degrees() + 0.01;
+        ExactPolygon polygon;
+        polygon.add({point_e7(south, east - 0.05), point_e7(south, east), point_e7(north, east),
+                     point_e7(north, east - 0.05)});
+        const AdminRingCells cells = polygon.cells(kLevel, reach_rad);
+        const auto* entry = own_cell_entry(cells, centre.lat().degrees(), centre.lng().degrees(), kLevel);
+        return entry != nullptr && !entry->second;
+    };
+    CHECK(listed(8e-5, ADMIN_COVER_REACH_RAD));
+    CHECK(!listed(8e-5, ADMIN_LINK_REACH_RAD));
+    CHECK(listed(5e-5, ADMIN_LINK_REACH_RAD));
+    CHECK(!listed(2e-4, ADMIN_COVER_REACH_RAD));
 }
