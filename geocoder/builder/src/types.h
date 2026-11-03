@@ -252,6 +252,22 @@ inline constexpr ArcTier kArcTiers[] = {
 };
 inline constexpr size_t kArcTierCount = sizeof(kArcTiers) / sizeof(kArcTiers[0]);
 
+// The arc files' blocks (arc_blocks.h). An arc block of this many stored
+// vertices or more carries its box.
+static constexpr uint32_t kArcBboxMinVertices = 16;
+// A ring of more refs than kChunkBoxMinRefs is cut into chunks of refs, each
+// with the box of its arcs' raw vertices: after a ref whose planet slot's
+// mix64 has kRefChunkCutMask's bits all set once the chunk holds
+// kRefChunkMin refs, after kRefChunkMax refs, and at the ring's end.
+static constexpr uint32_t kChunkBoxMinRefs = 8;
+static constexpr uint32_t kRefChunkMin = 4;
+static constexpr uint32_t kRefChunkMax = 16;
+static constexpr uint64_t kRefChunkCutMask = 7;
+// How far, per axis in e7 units, a stored vertex may lie from its raw one:
+// a chunk's raw box widened by this holds every vertex any tier stores of
+// its arcs (half the 1e-4 degree grid, the coarsest a tier may take).
+static constexpr int32_t kChunkBoxSlackE7 = 500;
+
 // --- Index mode ---
 
 enum class IndexMode { Full, NoAddresses, AdminOnly };

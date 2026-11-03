@@ -270,12 +270,7 @@ Cycle cycle_of(const AdminExactRings& store, uint32_t ring) {
 template <class Vertices>
 ArcBox box_of(const Vertices& v) {
     ArcBox box;
-    for (uint32_t i = 0; i < v.size(); i++) {
-        const PackedLocation q = v[i];
-        box.min_lng = std::min(box.min_lng, q.lon_e7);
-        box.max_lng = std::max(box.max_lng, q.lon_e7);
-        box.max_lat = std::max(box.max_lat, q.lat_e7);
-    }
+    for (uint32_t i = 0; i < v.size(); i++) box.add(v[i]);
     return box;
 }
 
@@ -657,13 +652,8 @@ MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& sto
                 arc.start = start - at[j];
             }
             place_parts(arcs, p, chain.part_count, at);
-            arc.box = arcs.arcs[p[0].arc].box;
-            for (uint32_t j = 1; j < chain.part_count; j++) {
-                const ArcBox& b = arcs.arcs[p[j].arc].box;
-                arc.box.min_lng = std::min(arc.box.min_lng, b.min_lng);
-                arc.box.max_lng = std::max(arc.box.max_lng, b.max_lng);
-                arc.box.max_lat = std::max(arc.box.max_lat, b.max_lat);
-            }
+            arc.box = {};
+            for (uint32_t j = 0; j < chain.part_count; j++) arc.box.add(arcs.arcs[p[j].arc].box);
         }
     }, threads);
     chains = {};

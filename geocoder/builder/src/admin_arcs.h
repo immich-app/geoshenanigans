@@ -27,6 +27,7 @@
 #include <utility>
 #include <vector>
 
+#include "arc_blocks.h"
 #include "geometry.h"
 #include "id_allocator.h"
 #include "packed_location.h"
@@ -37,16 +38,6 @@ struct AdminExactRings;  // parsed_data.h
 
 // The stage's thread cap: the topology's transients grow with the threads.
 constexpr unsigned kArcTopologyMaxThreads = 32;
-
-// splitmix64's finalizer: a bijection of 64-bit values that spreads every bit.
-inline uint64_t mix64(uint64_t x) {
-    x ^= x >> 30;
-    x *= 0xbf58476d1ce4e5b9ull;
-    x ^= x >> 27;
-    x *= 0x94d049bb133111ebull;
-    x ^= x >> 31;
-    return x;
-}
 
 // K, the order the canonical forms compare vertices in: coord_key's bits, unsigned.
 inline uint64_t vertex_key(PackedLocation p) { return static_cast<uint64_t>(coord_key(p)); }
@@ -109,17 +100,6 @@ struct ArcView {
     bool reversed = false;
     bool closed = false;
 };
-
-// An arc's raw vertices' extent in e7 units, the three sides a north ray's
-// skip reads.
-struct ArcBox {
-    int32_t min_lng = INT32_MAX;
-    int32_t max_lng = INT32_MIN;
-    int32_t max_lat = INT32_MIN;
-};
-inline bool operator==(const ArcBox& a, const ArcBox& b) {
-    return a.min_lng == b.min_lng && a.max_lng == b.max_lng && a.max_lat == b.max_lat;
-}
 
 struct Arc {
     ArcView view;
