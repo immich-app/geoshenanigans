@@ -181,34 +181,56 @@ inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& c
          + sum(continent_pairs) * sizeof(CellItemPair) / kFilterPairCopyDivisor;
 }
 
-// What each write stage holds while it runs.
+// What each write stage holds while it runs; the arc dirs only with
+// --arcs-out, else 0.
 struct StageCosts {
-    uint64_t modes = 0, quality = 0, places = 0, admin_minimal = 0, poi_tiers = 0;
+    uint64_t modes = 0, quality = 0, places = 0, admin_minimal = 0, poi_tiers = 0, arc_dirs = 0;
 
-    uint64_t total() const { return modes + quality + places + admin_minimal + poi_tiers; }
-    uint64_t largest() const { return std::max({modes, quality, places, admin_minimal, poi_tiers}); }
+    uint64_t total() const { return modes + quality + places + admin_minimal + poi_tiers + arc_dirs; }
+    uint64_t largest() const { return std::max({modes, quality, places, admin_minimal, poi_tiers, arc_dirs}); }
 };
 
-// The place files are written straight from the records.
-inline StageCosts stage_costs(const KindValues& bytes) {
+// The place files are written straight from the records. `arc_dirs` is the
+// arc dirs stage's (arc_dirs_cost), 0 when it doesn't run.
+inline StageCosts stage_costs(const KindValues& bytes, uint64_t arc_dirs) {
     StageCosts c;
     const uint64_t admins = at(bytes, RecordKind::Admins);
     c.modes = 3 * kModeBytes;
     c.quality = admins / kQualityAdminDivisor;
     c.admin_minimal = admins / kAdminMinimalAdminDivisor;
     c.poi_tiers = at(bytes, RecordKind::Pois) * kPoiTierPoiTenths / 10;
+    c.arc_dirs = arc_dirs;
     return c;
 }
 
 // What writing a region's arc dirs (--arcs-out) holds beside its records:
-// one dir's records and the polygon maps of its slots, one set's slot maps,
+// one dir's records and the polygon maps of its slots (`polygon_bytes` the
+// region's admin records), one set's slot maps (`slots` its larger set's),
 // and admin-minimal's subset of the core strings with its marks (at most
 // the core and a quarter).
+inline uint64_t arc_dirs_cost(uint64_t polygon_bytes, uint64_t slots, uint64_t core_bytes) {
+    return polygon_bytes * 2 + slots * 2 * sizeof(uint32_t) + core_bytes + core_bytes / 4;
+}
+
 inline uint64_t arc_dirs_cost(const ParsedData& d) {
     uint64_t slots = 0;
     for (const ArcSetBlocks& s : d.admin_arcs.sets) slots = std::max<uint64_t>(slots, s.sidecar.size());
-    const uint64_t core = d.strings_tiers[0].size();
-    return vector_bytes(d.admin_polygons) * 2 + slots * 2 * sizeof(uint32_t) + core + core / 4;
+    return arc_dirs_cost(vector_bytes(d.admin_polygons), slots, d.strings_tiers[0].size());
+}
+
+// A continent's arc dirs stage before its split, from the planet's
+// (`planet_arc_dirs`, arc_dirs_cost; 0 without --arcs-out): its polygons,
+// slots and core strings are its share of the planet's admins (and the
+// strings counted with them), so the stage takes that share of the
+// planet's, as continent_share gives it, margin and all.
+inline uint64_t continent_arc_dirs_cost(uint64_t planet_arc_dirs, const KindValues& planet_bytes,
+                                        const KindValues& continent_bytes) {
+    const uint64_t planet_admins = at(planet_bytes, RecordKind::Admins);
+    if (planet_arc_dirs == 0 || planet_admins == 0) return planet_arc_dirs;
+
+    return static_cast<uint64_t>(static_cast<double>(planet_arc_dirs) *
+                                 static_cast<double>(at(continent_bytes, RecordKind::Admins)) /
+                                 static_cast<double>(planet_admins));
 }
 
 // How a region's write runs and the bytes it holds at its peak: its records
@@ -218,21 +240,25 @@ struct RegionCost {
     RunOrder order;
 };
 
+// `arc_dirs` is the arc dirs stage's (arc_dirs_cost), 0 without --arcs-out:
+// beside the other stages when they run at once, one of them when they run
+// one after another.
 inline uint64_t region_peak(const KindValues& bytes, const KindValues& counts, uint64_t filter_bytes,
-                            RunOrder order) {
-    const StageCosts stages = stage_costs(bytes);
+                            uint64_t arc_dirs, RunOrder order) {
+    const StageCosts stages = stage_costs(bytes, arc_dirs);
     const uint64_t steps = order == RunOrder::Serial ? stages.largest() : stages.total();
     return sum(bytes) + std::max({filter_bytes, strategy2_cost(counts, order), steps});
 }
 
 // A continent runs its steps at once when that fits the budget, else one
-// after another.
+// after another. It holds its whole reservation: its write takes no stage
+// leases of its own.
 inline RegionCost continent_cost(const KindValues& bytes, const KindValues& counts, uint64_t filter_bytes,
-                                 uint64_t capacity) {
-    const uint64_t at_once = region_peak(bytes, counts, filter_bytes, RunOrder::Concurrent);
+                                 uint64_t arc_dirs, uint64_t capacity) {
+    const uint64_t at_once = region_peak(bytes, counts, filter_bytes, arc_dirs, RunOrder::Concurrent);
     if (at_once <= capacity) return {at_once, RunOrder::Concurrent};
 
-    return {region_peak(bytes, counts, filter_bytes, RunOrder::Serial), RunOrder::Serial};
+    return {region_peak(bytes, counts, filter_bytes, arc_dirs, RunOrder::Serial), RunOrder::Serial};
 }
 
 // A continent's share of the planet's values, kind by kind, from its share

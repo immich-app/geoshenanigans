@@ -1484,7 +1484,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             }
         };
 
-        const StageCosts costs = stage_costs(record_bytes(d));
+        const StageCosts costs = stage_costs(record_bytes(d), region_arcs.empty() ? 0 : arc_dirs_cost(d));
         struct Stage {
             const char* name;
             std::function<void()> write;
@@ -1498,7 +1498,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             {"poi tiers", write_poi_tiers, costs.poi_tiers},
         };
         if (!region_arcs.empty())
-            stages.push_back({"arc dirs", [&] { write_arc_dirs(d, region_arcs, region_prev_arcs); }, arc_dirs_cost(d)});
+            stages.push_back({"arc dirs", [&] { write_arc_dirs(d, region_arcs, region_prev_arcs); }, costs.arc_dirs});
         auto run_stage = [&](const Stage& stage) {
             std::optional<BudgetLease> lease;
             if (budget) lease.emplace(*budget, stage.cost);
@@ -1589,8 +1589,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // when the budget holds them beside the costliest continents that can
     // run together; else one after another, to hold memory down while
     // continent subsets build alongside.
-    const uint64_t planet_stages =
-        stage_costs(record_bytes(data)).total() + (cfg.arcs_out_dir.empty() ? 0 : arc_dirs_cost(data));
+    // The arc dirs stage's, 0 without --arcs-out; each continent's is its
+    // share of it.
+    const uint64_t planet_arc_dirs = cfg.arcs_out_dir.empty() ? 0 : arc_dirs_cost(data);
+    const uint64_t planet_stages = stage_costs(record_bytes(data), planet_arc_dirs).total();
 
     // The planet's own write and each continent's split read the planet
     // records; the last of them to finish frees them beside the work left,
@@ -1731,7 +1733,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             const KindValues bytes = continent_share(planet_bytes, planet_pairs, continent_pairs[c]);
             const KindValues counts = continent_share(planet_counts, planet_pairs, continent_pairs[c]);
             const uint64_t filter_bytes = filter_cost(planet_counts, continent_pairs[c]);
-            pending.push_back({c, continent_cost(bytes, counts, filter_bytes, budget.capacity())});
+            // Its write runs without a budget (run_continent), so its
+            // reservation holds the arc dirs stage too.
+            const uint64_t arc_dirs = continent_arc_dirs_cost(planet_arc_dirs, planet_bytes, bytes);
+            pending.push_back({c, continent_cost(bytes, counts, filter_bytes, arc_dirs, budget.capacity())});
         }
         // A continent past the budget even with its steps one after another
         // goes last, once nothing else reads the planet records: its split

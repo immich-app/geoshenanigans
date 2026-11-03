@@ -78,23 +78,69 @@ TEST(filter_cost_holds_the_planet_maps_and_half_the_subset_pairs) {
 TEST(continent_cost_runs_steps_one_at_a_time_only_past_the_budget) {
     const KindValues bytes = kinds(4 * kGiB, 8 * kGiB, kGiB, 3 * kGiB, kGiB / 8, 2 * kGiB);
     const KindValues counts = kinds(20'000'000, 100'000'000, 1'000'000, 50'000'000, 1'000'000, 400'000);
-    const uint64_t at_once = region_peak(bytes, counts, 0, RunOrder::Concurrent);
-    const uint64_t serial = region_peak(bytes, counts, 0, RunOrder::Serial);
+    const uint64_t at_once = region_peak(bytes, counts, 0, 0, RunOrder::Concurrent);
+    const uint64_t serial = region_peak(bytes, counts, 0, 0, RunOrder::Serial);
     CHECK(serial < at_once);
 
-    RegionCost roomy = continent_cost(bytes, counts, 0, at_once);
+    RegionCost roomy = continent_cost(bytes, counts, 0, 0, at_once);
     CHECK(roomy.order == RunOrder::Concurrent);
     CHECK_EQ(roomy.bytes, at_once);
-    RegionCost tight = continent_cost(bytes, counts, 0, at_once - 1);
+    RegionCost tight = continent_cost(bytes, counts, 0, 0, at_once - 1);
     CHECK(tight.order == RunOrder::Serial);
     CHECK_EQ(tight.bytes, serial);
+}
+
+TEST(region_peak_holds_the_arc_dirs_beside_the_steps_at_once_or_as_one_of_them_one_at_a_time) {
+    const KindValues bytes = kinds(4 * kGiB, 8 * kGiB, kGiB, 3 * kGiB, kGiB / 8, 2 * kGiB);
+    const KindValues counts = kinds(0, 0, 0, 0, 0, 0);  // no strategy-2 passes past the steps
+    const StageCosts plain = stage_costs(bytes, 0);
+    const uint64_t arcs = 2 * kGiB;
+    REQUIRE(arcs > plain.largest());
+    CHECK_EQ(stage_costs(bytes, arcs).total(), plain.total() + arcs);
+    CHECK_EQ(stage_costs(bytes, arcs).largest(), arcs);
+    // At once: beside every other stage.
+    CHECK_EQ(region_peak(bytes, counts, 0, arcs, RunOrder::Concurrent), sum(bytes) + plain.total() + arcs);
+    // One at a time: the largest stage, here the arc dirs; below another
+    // stage, they add nothing.
+    CHECK_EQ(region_peak(bytes, counts, 0, arcs, RunOrder::Serial), sum(bytes) + arcs);
+    CHECK_EQ(region_peak(bytes, counts, 0, plain.largest() / 2, RunOrder::Serial), sum(bytes) + plain.largest());
+    // Without --arcs-out, the five stages alone.
+    CHECK_EQ(region_peak(bytes, counts, 0, 0, RunOrder::Concurrent), sum(bytes) + plain.total());
+    CHECK_EQ(region_peak(bytes, counts, 0, 0, RunOrder::Serial), sum(bytes) + plain.largest());
+}
+
+TEST(a_continents_reservation_holds_its_arc_dirs_in_either_order) {
+    const KindValues bytes = kinds(4 * kGiB, 8 * kGiB, kGiB, 3 * kGiB, kGiB / 8, 2 * kGiB);
+    const KindValues counts = kinds(0, 0, 0, 0, 0, 0);
+    const uint64_t arcs = 2 * kGiB;
+    const uint64_t plain_at_once = region_peak(bytes, counts, 0, 0, RunOrder::Concurrent);
+    // A budget its five stages fit at once is short of them and the arc
+    // dirs: one at a time, the arc dirs the largest.
+    const RegionCost tight = continent_cost(bytes, counts, 0, arcs, plain_at_once);
+    CHECK(tight.order == RunOrder::Serial);
+    CHECK_EQ(tight.bytes, sum(bytes) + arcs);
+    // With room for them too, at once, all six reserved.
+    const RegionCost roomy = continent_cost(bytes, counts, 0, arcs, plain_at_once + arcs);
+    CHECK(roomy.order == RunOrder::Concurrent);
+    CHECK_EQ(roomy.bytes, plain_at_once + arcs);
+}
+
+TEST(a_continents_arc_dirs_are_its_share_of_the_planets) {
+    const KindValues planet = kinds(1000, 2000, 300, 400, 100, 600);
+    const KindValues planet_pairs = kinds(100, 200, 30, 40, 10, 0);
+    const KindValues share = continent_share(planet, planet_pairs, kinds(50, 20, 0, 40, 1, 0));
+    // The admins' share with its margin (continent_share_scales_each_kind_by_its_pairs): 192 of 600.
+    REQUIRE(at(share, RecordKind::Admins) == 192u);
+    CHECK_EQ(continent_arc_dirs_cost(6000, planet, share), uint64_t(1920));
+    // No --arcs-out, no arc dirs.
+    CHECK_EQ(continent_arc_dirs_cost(0, planet, share), uint64_t(0));
 }
 
 TEST(region_peak_counts_the_records_and_the_largest_step) {
     const KindValues bytes = kinds(kGiB, 0, 0, 0, 0, 0);
     const KindValues counts = kinds(0, 0, 0, 0, 0, 0);
     // The split's scratch past every other step.
-    CHECK_EQ(region_peak(bytes, counts, 10 * kGiB, RunOrder::Serial), 11 * kGiB);
-    CHECK_EQ(region_peak(bytes, counts, 0, RunOrder::Serial),
-             kGiB + stage_costs(bytes).largest());
+    CHECK_EQ(region_peak(bytes, counts, 10 * kGiB, 0, RunOrder::Serial), 11 * kGiB);
+    CHECK_EQ(region_peak(bytes, counts, 0, 0, RunOrder::Serial),
+             kGiB + stage_costs(bytes, 0).largest());
 }
