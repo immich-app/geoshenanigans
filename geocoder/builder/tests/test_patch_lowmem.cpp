@@ -3053,8 +3053,8 @@ LogCheck merged_by_slot(const BuildDir& old_d, const BuildDir& new_d) {
 // files, core strings and layout) round-trips in every mode, the admin
 // geometry files merged by slot: one arc edited, one longer, one new; one
 // ring edited in place, so the records stay and go as copied; a place's label
-// and an admin cell's list changed. The parent's diff refused the dir: no
-// patch section named admin_rings.bin.
+// and an admin cell's list changed. The parent sent the admin geometry files
+// whole.
 TEST(patch_lowmem_round_trips_an_admin_minimal_arc_dir) {
     ScratchDir dir("lowmem-arc-dir");
     std::mt19937 rng(20261103);
@@ -3080,7 +3080,7 @@ TEST(patch_lowmem_round_trips_an_admin_minimal_arc_dir) {
 // An encoded family (the POIs, encoded by geocoder-gc) beside the plain arc
 // files: the low-memory mode replays the family through its codecs and the
 // arc files as plain merge sections, and the new set is gc's encoding of the
-// new dir, byte for byte. The parent's diff refused the dir.
+// new dir, byte for byte. The parent sent the admin geometry files whole.
 TEST(patch_lowmem_applies_an_encoded_set_beside_plain_arc_files) {
     ScratchDir dir("lowmem-arcs-beside");
     std::mt19937 rng(20261103);
@@ -3334,7 +3334,7 @@ TEST(patch_identical_days_copy_the_admin_geometry_ahead_of_the_admin_cells) {
 // KiB), over the same 100 polygons: its merge sends every block (head and
 // tail trimmed only where a byte happens to repeat), which the patcher writes
 // from the patch where it sits, so its heap stays flat in every mode. The
-// parent's diff refused the dir.
+// parent sent the file whole.
 TEST(patch_heap_stays_flat_as_arc_vertices_are_replaced_whole) {
     CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
         std::mt19937 rng(20261103);

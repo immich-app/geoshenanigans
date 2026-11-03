@@ -1215,8 +1215,7 @@ TEST(patch_diff_counts_the_admin_geometry_records_against_the_limit) {
 // and the admin cell index's ids as they are. The POIs and places the new day
 // keeps MATCH, the admin index's delta changes no cell, and the admin
 // polygons merge by slot: the two old slots REPLACEd, the third INSERTed.
-// The parent's admin merge moved both old polygons up a slot (an INSERT,
-// then two MATCHes), and every POI, place and index id with them.
+// The parent sent the admin polygons whole.
 TEST(patch_round_trip_moves_no_admin_slot_by_admin_polygon_content) {
     auto day = [](const std::vector<uint32_t>& keys, const std::vector<uint32_t>& poi_parents, const std::vector<uint32_t>& place_parents) {
         BuildDir d = admin_geometry(keys, 0, 7);
