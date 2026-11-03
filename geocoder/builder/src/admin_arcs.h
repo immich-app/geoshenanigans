@@ -150,6 +150,7 @@ struct AdminArcSlotCounts {
     size_t recycled = 0;  // a slot that was a tombstone in the previous build
     size_t appended = 0;
     size_t tombstones = 0;
+    size_t previous_sidecar_missing = 0;  // 1: a previous build was given without this sidecar
 };
 
 // One arc of the minimal set: full arcs chained end to end, each walked as
@@ -337,7 +338,16 @@ struct ArcSlots {
 // a slot that was a tombstone in the previous build, then new ones. A slot the
 // previous build's arcs held and no arc holds now, a repeated key's other
 // slots included, becomes a tombstone, so it is reused only the day after.
+// A previous build without the sidecar (none at `prev_sidecar`) leaves every
+// slot cold, as one without the admin sidecar does, and the counts say so; a
+// sidecar there that can't be read is refused.
 ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar);
+
+// The log lines of a region's slot allocation for `set` against
+// `prev_sidecar`, when a previous build was given: the cold start's, and the
+// ARC_CHECK count o11y reports.
+std::string arc_slot_start_lines(const std::string& region, ArcSet set, const std::string& prev_sidecar,
+                                 const AdminArcSlotCounts& counts);
 
 // Where a region's arc sidecar sits under its dir: the full set's with the
 // exact tier, the minimal set's with admin-minimal.

@@ -496,7 +496,9 @@ void assign_region_arc_slots(AdminArcBlocks& blocks, const std::string& prev_reg
     line << "  " << region << " arcs:";
     for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
         ArcSetBlocks& s = blocks.set(set);
-        ArcSlots slots = allocate_arc_slots(s.keys, prev_region_dir.empty() ? "" : arc_sidecar_path(prev_region_dir, set));
+        const std::string prev = prev_region_dir.empty() ? "" : arc_sidecar_path(prev_region_dir, set);
+        ArcSlots slots = allocate_arc_slots(s.keys, prev);
+        std::cerr << arc_slot_start_lines(region, set, prev, slots.counts);
         s.slots = std::move(slots.slots);
         s.sidecar = std::move(slots.sidecar);
         s.slot_counts = slots.counts;

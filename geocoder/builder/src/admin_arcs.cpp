@@ -1,6 +1,7 @@
 #include "admin_arcs.h"
 
 #include <algorithm>
+#include <filesystem>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -778,7 +779,9 @@ MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& sto
 ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar) {
     using namespace gc::id_alloc;
     IdAllocator alloc;
-    if (!prev_sidecar.empty() && !alloc.load_previous(prev_sidecar))
+    std::error_code ec;
+    const bool missing = !prev_sidecar.empty() && !std::filesystem::exists(prev_sidecar, ec);
+    if (!prev_sidecar.empty() && !missing && !alloc.load_previous(prev_sidecar))
         throw std::runtime_error("unreadable arc sidecar " + prev_sidecar);
     // The key each previous slot can be claimed by, none for its tombstones.
     const size_t prev_slots = alloc.total_slots();
@@ -805,7 +808,21 @@ ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string
         else out.counts.recycled++;
     }
     out.counts.tombstones = out.sidecar.size() - keys.size();
+    out.counts.previous_sidecar_missing = missing;
     return out;
+}
+
+std::string arc_slot_start_lines(const std::string& region, ArcSet set, const std::string& prev_sidecar,
+                                 const AdminArcSlotCounts& counts) {
+    if (prev_sidecar.empty()) return "";
+    const char* set_name = set == ArcSet::Full ? "full" : "minimal";
+    std::ostringstream line;
+    if (counts.previous_sidecar_missing)
+        line << "  " << region << " arcs: no previous " << set_name << " arc slots at " << prev_sidecar
+             << ", every slot cold\n";
+    line << "ARC_CHECK slots=arcs set=" << set_name << " region=" << region
+         << " previous_sidecar_missing=" << counts.previous_sidecar_missing << "\n";
+    return line.str();
 }
 
 std::string arc_sidecar_path(const std::string& region_dir, ArcSet set) {
@@ -820,7 +837,10 @@ template <class Key>
 ArcSlots planet_slots(size_t n, Key key, const std::string& prev_planet_dir, ArcSet set) {
     std::vector<uint64_t> keys(n);
     for (size_t a = 0; a < n; a++) keys[a] = key(a);
-    return allocate_arc_slots(keys, prev_planet_dir.empty() ? "" : arc_sidecar_path(prev_planet_dir, set));
+    const std::string prev = prev_planet_dir.empty() ? "" : arc_sidecar_path(prev_planet_dir, set);
+    ArcSlots slots = allocate_arc_slots(keys, prev);
+    std::cerr << arc_slot_start_lines("planet", set, prev, slots.counts);
+    return slots;
 }
 
 std::string slot_summary(const AdminArcSlotCounts& s, size_t slots) {
