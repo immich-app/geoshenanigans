@@ -167,11 +167,12 @@ jobs:
           TILES_WORKER_MIGRATION_PENDING: ${{ steps.tiles-worker-state.outputs.pending }}
         run: |
           set -euo pipefail
-          filter=()
+          exclude=()
           if [ "$TILES_WORKER_MIGRATION_PENDING" = true ]; then
-            filter=(--filter '!./modules/cloudflare/tiles-worker')
+            # Not --filter: terragrunt 1.2.1 rejects it unless the filter-flag experiment is enabled.
+            exclude=(--queue-exclude-dir ./modules/cloudflare/tiles-worker)
           fi
-          op run --env-file=".env" -- terragrunt run --all "${filter[@]}" plan
+          op run --env-file=".env" -- terragrunt run --all "${exclude[@]}" plan
 
   deploy-terragrunt:
     needs: [build, test]
