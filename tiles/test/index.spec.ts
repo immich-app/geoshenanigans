@@ -1,3 +1,4 @@
+import { SignatureV4 } from '@smithy/signature-v4';
 import { createExecutionContext, env, waitOnExecutionContext } from 'cloudflare:test';
 import { exports } from 'cloudflare:workers';
 import worker, { cachePolicy, cacheStatus, etagMatches, parseUrl } from '../src';
@@ -8,7 +9,7 @@ import { fromRadix64, toRadix64 } from '../src/pmtiles/utils';
 import {
   InfluxMetricsProvider,
   Metric,
-  s3Client,
+  tigrisClient,
   TigrisEndpoint,
   tigrisEndpoint,
   TigrisStorageRepository,
@@ -274,8 +275,206 @@ describe('tigrisEndpoint', () => {
   });
 
   it('keeps one client per endpoint', () => {
-    expect(s3Client(TigrisEndpoint.T3, 'id', 'secret')).toBe(s3Client(TigrisEndpoint.T3, 'id', 'secret'));
-    expect(s3Client(TigrisEndpoint.T3, 'id', 'secret')).not.toBe(s3Client(TigrisEndpoint.FLY, 'id', 'secret'));
+    expect(tigrisClient(TigrisEndpoint.T3, 'id', 'secret')).toBe(tigrisClient(TigrisEndpoint.T3, 'id', 'secret'));
+    expect(tigrisClient(TigrisEndpoint.T3, 'id', 'secret')).not.toBe(tigrisClient(TigrisEndpoint.FLY, 'id', 'secret'));
+  });
+});
+
+// The SHA-256 and HMAC-SHA256 the AWS SDK's signer takes, on WebCrypto.
+class WebCryptoSha256 {
+  private chunks: Uint8Array[] = [];
+  constructor(private secret?: Uint8Array | string) {}
+  update(data: Uint8Array | string) {
+    this.chunks.push(typeof data === 'string' ? new TextEncoder().encode(data) : data);
+  }
+  reset() {
+    this.chunks = [];
+  }
+  async digest(): Promise<Uint8Array> {
+    const data = new Uint8Array(await new Blob(this.chunks as BlobPart[]).arrayBuffer());
+    if (this.secret === undefined) {
+      return new Uint8Array(await crypto.subtle.digest('SHA-256', data));
+    }
+    const secret = typeof this.secret === 'string' ? new TextEncoder().encode(this.secret) : this.secret;
+    const key = await crypto.subtle.importKey('raw', secret, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    return new Uint8Array(await crypto.subtle.sign('HMAC', key, data));
+  }
+}
+
+describe('TigrisStorageRepository', () => {
+  const key = '20261102';
+  const pushed: Metric[] = [];
+  const metrics = { push: (metric: Metric) => pushed.push(metric) } as unknown as IMetricsRepository;
+  const repository = (endpoint = TigrisEndpoint.T3) =>
+    new TigrisStorageRepository('key-id', 'secret', 'tiles-geo', key, metrics, 'dev/', endpoint);
+
+  // Stands in for Tigris, answering each request with the next of the responses given.
+  const mockTigris = (...responses: (() => Response)[]) => {
+    const requests: Request[] = [];
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init) => {
+      requests.push(new Request(input as RequestInfo, init));
+      return responses[Math.min(requests.length, responses.length) - 1]();
+    });
+    return requests;
+  };
+  const partial =
+    (body: BodyInit = 'tile 0') =>
+    () =>
+      new Response(body, { status: 206 });
+
+  beforeEach(() => {
+    pushed.length = 0;
+    // No backoff between retries.
+    vi.spyOn(Math, 'random').mockReturnValue(0);
+  });
+
+  it("reads a range from the endpoint's bucket host, signed as the AWS SDK signs", async () => {
+    const requests = mockTigris(partial());
+    const stream = await repository().getRangeAsStream({ offset: 100, length: 10 }, 'chunk_3.pmtiles');
+    expect(await new Response(stream).text()).toBe('tile 0');
+
+    const [request] = requests;
+    expect(request.method).toBe('GET');
+    expect(request.url).toBe(`https://tiles-geo.t3.storage.dev/dev/${key}/chunk_3.pmtiles`);
+    expect(request.headers.get('Range')).toBe('bytes=100-109');
+    expect(request.headers.get('X-Amz-Content-Sha256')).toBe('UNSIGNED-PAYLOAD');
+    const amzDate = request.headers.get('X-Amz-Date')!;
+    const authorization = request.headers.get('Authorization')!;
+    expect(authorization).toMatch(
+      new RegExp(
+        `^AWS4-HMAC-SHA256 Credential=key-id/${amzDate.slice(0, 8)}/auto/s3/aws4_request, ` +
+          'SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=[0-9a-f]{64}$',
+      ),
+    );
+
+    // The signer the AWS SDK used for Tigris comes to the same signature for the same request at the same time.
+    const signer = new SignatureV4({
+      credentials: { accessKeyId: 'key-id', secretAccessKey: 'secret' },
+      region: 'auto',
+      service: 's3',
+      sha256: WebCryptoSha256,
+      uriEscapePath: false,
+      applyChecksum: true,
+    });
+    const url = new URL(request.url);
+    const [, year, month, day, hour, minute, second] = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(amzDate)!;
+    const signed = await signer.sign(
+      {
+        method: 'GET',
+        protocol: url.protocol,
+        hostname: url.hostname,
+        path: url.pathname,
+        query: {},
+        headers: { host: url.host, 'x-amz-content-sha256': 'UNSIGNED-PAYLOAD' },
+      },
+      { signingDate: new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}Z`) },
+    );
+    expect(signed.headers.authorization).toBe(authorization);
+  });
+
+  it.each`
+    endpoint              | host
+    ${TigrisEndpoint.T3}  | ${'t3.storage.dev'}
+    ${TigrisEndpoint.FLY} | ${'fly.storage.tigris.dev'}
+  `('reads from $host and tags its metric with it', async ({ endpoint, host }) => {
+    const requests = mockTigris(partial());
+    await (await repository(endpoint).getRangeAsStream({ offset: 0, length: 6 }, 'chunk_0.pmtiles')).cancel();
+    expect(new URL(requests[0].url).hostname).toBe(`tiles-geo.${host}`);
+    expect(pushed.map((metric) => [metric.name, Object.fromEntries(metric.tags)])).toEqual([
+      ['tigris_storage_get', { endpoint: host }],
+    ]);
+    expect(pushed[0].fields.get('count')).toEqual({ value: 1, type: 'int' });
+    expect(pushed[0].fields.get('duration')?.type).toBe('duration');
+  });
+
+  it('hands on the body as it arrives', async () => {
+    // A body that sends its first bytes and never finishes: anything that waited for all of it would hang.
+    mockTigris(partial(new ReadableStream({ start: (controller) => controller.enqueue(new Uint8Array([1, 2, 3])) })));
+    const reader = (await repository().getRangeAsStream({ offset: 0, length: 10 }, 'chunk_0.pmtiles')).getReader();
+    expect(await reader.read()).toEqual({ done: false, value: new Uint8Array([1, 2, 3]) });
+    await reader.cancel();
+  });
+
+  it('reads a whole object', async () => {
+    const requests = mockTigris(() => new Response('{"version":8}'));
+    expect(await new Response(await repository().getAsStream('styles/light.json')).text()).toBe('{"version":8}');
+    expect(requests[0].url).toBe(`https://tiles-geo.t3.storage.dev/dev/${key}/styles/light.json`);
+    expect(requests[0].headers.has('Range')).toBe(false);
+  });
+
+  it.each`
+    statuses
+    ${[503, 206]}
+    ${[500, 429, 206]}
+  `('retries a read Tigris answers with $statuses, letting go of each failed response', async ({ statuses }) => {
+    const failures: Response[] = [];
+    const requests = mockTigris(
+      ...statuses.map((status: number) => () => {
+        const response = new Response(status === 206 ? 'tile 0' : 'Slow down', { status });
+        if (status !== 206) {
+          failures.push(response);
+        }
+        return response;
+      }),
+    );
+    const stream = await repository().getRangeAsStream({ offset: 0, length: 6 }, 'chunk_0.pmtiles');
+    expect(await new Response(stream).text()).toBe('tile 0');
+    expect(requests).toHaveLength(statuses.length);
+    for (const response of failures) {
+      await expect(response.body!.getReader().read()).resolves.toEqual({ done: true, value: undefined });
+    }
+    expect(pushed).toHaveLength(1);
+  });
+
+  it('gives up after three attempts', async () => {
+    const requests = mockTigris(() => new Response('Unavailable', { status: 503 }));
+    await expect(repository().getRangeAsStream({ offset: 0, length: 6 }, 'chunk_0.pmtiles')).rejects.toThrow(
+      'Tigris answered a range read with 503',
+    );
+    expect(requests).toHaveLength(3);
+    expect(pushed).toEqual([]);
+  });
+
+  it.each`
+    status | body
+    ${404} | ${'NoSuchKey'}
+    ${403} | ${'SignatureDoesNotMatch'}
+    ${416} | ${'InvalidRange'}
+  `('fails a range read Tigris answers with $status, without retrying', async ({ status, body }) => {
+    const requests = mockTigris(() => new Response(body, { status }));
+    await expect(repository().getRangeAsStream({ offset: 0, length: 6 }, 'chunk_0.pmtiles')).rejects.toThrow(
+      `Tigris answered a range read with ${status}`,
+    );
+    expect(requests).toHaveLength(1);
+  });
+
+  it.each`
+    offset | length | contentLength | ok
+    ${0}   | ${6}   | ${'6'}        | ${true}
+    ${0}   | ${3}   | ${'6'}        | ${false}
+    ${3}   | ${3}   | ${'3'}        | ${false}
+  `(
+    'takes a 200 for a range at $offset of $length bytes, the whole $contentLength-byte object, only if it is the range: $ok',
+    async ({ offset, length, contentLength, ok }) => {
+      mockTigris(
+        () =>
+          new Response('tile 0'.slice(0, Number(contentLength)), {
+            status: 200,
+            headers: { 'Content-Length': contentLength },
+          }),
+      );
+      const read = repository().getRangeAsStream({ offset, length }, 'chunk_0.pmtiles');
+      if (ok) {
+        expect(await new Response(await read).text()).toBe('tile 0');
+      } else {
+        await expect(read).rejects.toThrow('Tigris answered a range read with 200');
+      }
+    },
+  );
+
+  it('fails a whole-object read Tigris answers with an error', async () => {
+    mockTigris(() => new Response('AccessDenied', { status: 403 }));
+    await expect(repository().getAsStream('styles/light.json')).rejects.toThrow('Tigris answered a read with 403');
   });
 });
 

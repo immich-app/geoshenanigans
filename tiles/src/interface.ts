@@ -10,7 +10,7 @@ export interface IMemCacheRepository {
 }
 
 export interface IStorageRepository {
-  getRangeAsStream(range: { length: number; offset: number }, key?: string): Promise<ReadableStream>;
+  getRangeAsStream(range: { length: number; offset: number }, key: string): Promise<ReadableStream>;
   getAsStream(key: string): Promise<ReadableStream>;
   getDeploymentKey(): string;
 }

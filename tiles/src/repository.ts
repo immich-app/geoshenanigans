@@ -1,5 +1,5 @@
-import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { Point } from '@influxdata/influxdb-client';
+import { AwsClient } from 'aws4fetch';
 import { parse as parseDomain } from 'tldts';
 import {
   AsyncFn,
@@ -83,69 +83,92 @@ export function tigrisEndpoint(continent: string | null | undefined): TigrisEndp
   return continent && T3_CONTINENTS.has(continent) ? TigrisEndpoint.T3 : TigrisEndpoint.FLY;
 }
 
-// One client per endpoint for the isolate's lifetime, so requests after the first skip building one.
-const s3Clients = new Map<string, S3Client>();
+// One signer per endpoint and key for the isolate's lifetime: it keeps the day's signing key, so a read after the
+// first is signed with one HMAC.
+const tigrisClients = new Map<string, AwsClient>();
 
-export function s3Client(endpoint: TigrisEndpoint, keyId: string, accessKey: string): S3Client {
+export function tigrisClient(endpoint: TigrisEndpoint, keyId: string, accessKey: string): AwsClient {
   const cacheKey = `${endpoint}|${keyId}`;
-  let client = s3Clients.get(cacheKey);
+  let client = tigrisClients.get(cacheKey);
   if (!client) {
-    client = new S3Client({
+    // Retries are TigrisStorageRepository's, which lets go of each failed response.
+    client = new AwsClient({
+      accessKeyId: keyId,
+      secretAccessKey: accessKey,
+      service: 's3',
       region: 'auto',
-      credentials: {
-        accessKeyId: keyId,
-        secretAccessKey: accessKey,
-      },
-      endpoint,
-      forcePathStyle: false,
+      retries: 0,
     });
-    s3Clients.set(cacheKey, client);
+    tigrisClients.set(cacheKey, client);
   }
   return client;
 }
 
+// As the AWS SDK did: up to 3 attempts while Tigris answers 5xx or 429, after a jittered, doubling backoff.
+const TIGRIS_ATTEMPTS = 3;
+const TIGRIS_RETRY_BASE_MS = 100;
+
+const retryable = (status: number) => status >= 500 || status === 429;
+
+/** Reads deployment objects from the tiles bucket with SigV4-signed GETs. */
 export class TigrisStorageRepository implements IStorageRepository {
-  private client: S3Client;
+  private bucketUrl: URL;
   constructor(
-    keyId: string,
-    accessKey: string,
-    private bucketKey: string,
+    private keyId: string,
+    private accessKey: string,
+    bucketKey: string,
     private deploymentKey: string,
     private metrics: IMetricsRepository,
     private storagePrefix = '',
     private endpoint = TigrisEndpoint.FLY,
   ) {
-    this.client = s3Client(endpoint, keyId, accessKey);
+    // Virtual-hosted style, the bucket in the host name.
+    this.bucketUrl = new URL(endpoint);
+    this.bucketUrl.hostname = `${bucketKey}.${this.bucketUrl.hostname}`;
   }
 
-  private async getS3Object(args: { key?: string; range?: { offset: number; length: number } }) {
-    const { range } = args;
+  /** GETs an object, or a range of it; the response is Tigris' last, whatever its status. */
+  private async get(key: string, range?: { offset: number; length: number }): Promise<Response> {
     const metric = Metric.create('tigris_storage_get').addTag('endpoint', new URL(this.endpoint).hostname);
-    const command = new GetObjectCommand({
-      Bucket: this.bucketKey,
-      Key: `${this.storagePrefix}${this.deploymentKey}/${args.key}`,
-      Range: range ? `bytes=${range.offset}-${range.offset + range.length - 1}` : undefined,
-    });
-    const response = await this.client.send(command);
-    metric.durationField(`duration`);
-    metric.intField('count', 1);
-    this.metrics.push(metric);
-    const data = response.Body;
-    if (!data) {
-      throw new Error('Data not found for range ' + JSON.stringify(range));
+    const path = `${this.storagePrefix}${this.deploymentKey}/${key}`.split('/').map(encodeURIComponent).join('/');
+    const url = new URL(path, this.bucketUrl).toString();
+    const headers = range ? { Range: `bytes=${range.offset}-${range.offset + range.length - 1}` } : undefined;
+    // Taken when a read is made, so that a missing key fails the read rather than the request.
+    const client = tigrisClient(this.endpoint, this.keyId, this.accessKey);
+    for (let attempt = 1; ; attempt++) {
+      const response = await fetch(await client.sign(url, { method: 'GET', headers }));
+      if (!retryable(response.status) || attempt === TIGRIS_ATTEMPTS) {
+        if (response.ok) {
+          metric.durationField('duration').intField('count', 1);
+          this.metrics.push(metric);
+        }
+        return response;
+      }
+      await response.body?.cancel();
+      await new Promise((resolve) => setTimeout(resolve, Math.random() * TIGRIS_RETRY_BASE_MS * 2 ** (attempt - 1)));
     }
-    return data;
   }
 
   // Reads are only ever handed on as streams, so a tile's bytes go from Tigris to the client as they arrive.
-  async getRangeAsStream(range: { length: number; offset: number }, key?: string): Promise<ReadableStream> {
-    const data = await this.getS3Object({ range, key });
-    return data.transformToWebStream();
+  async getRangeAsStream(range: { length: number; offset: number }, key: string): Promise<ReadableStream> {
+    const response = await this.get(key, range);
+    // A 200 is the whole object, which is the range only if the range is all of it.
+    const whole =
+      response.status === 200 && range.offset === 0 && response.headers.get('Content-Length') === String(range.length);
+    if ((response.status !== 206 && !whole) || !response.body) {
+      await response.body?.cancel();
+      throw new Error(`Tigris answered a range read with ${response.status}`);
+    }
+    return response.body;
   }
 
   async getAsStream(key: string): Promise<ReadableStream> {
-    const data = await this.getS3Object({ key });
-    return data.transformToWebStream();
+    const response = await this.get(key);
+    if (response.status !== 200 || !response.body) {
+      await response.body?.cancel();
+      throw new Error(`Tigris answered a read with ${response.status}`);
+    }
+    return response.body;
   }
 
   getDeploymentKey(): string {
