@@ -14,6 +14,9 @@ import {
 } from './interface';
 import { monitorAsyncFunction } from './monitor';
 
+// Every D1 read goes to the nearest replica, without waiting for it to catch up with the primary.
+const D1_SESSION = 'first-unconstrained';
+
 export class CloudflareD1Repository implements IDatabaseRepository {
   constructor(
     private database: D1Database,
@@ -23,7 +26,7 @@ export class CloudflareD1Repository implements IDatabaseRepository {
   async query(query: string, ...values: unknown[]) {
     const metric = Metric.create('d1_query');
     const resp = await this.database
-      .withSession('first-unconstrained')
+      .withSession(D1_SESSION)
       .prepare(query)
       .bind(...values)
       .run();
@@ -39,6 +42,19 @@ export class CloudflareD1Repository implements IDatabaseRepository {
     this.metrics.push(metric);
 
     return resp;
+  }
+}
+
+/**
+ * Keeps the D1 read replica nearest to this colo awake. Replicas spin down soon after their last read, and while one
+ * spins back up reads go to the primary, which can be on another continent. A trivial read in the lookups' session
+ * mode, made on every request, keeps the replica they use warm. Never rejects: a failed warm-up is only logged.
+ */
+export async function warmD1Replica(database: D1Database): Promise<void> {
+  try {
+    await database.withSession(D1_SESSION).prepare('SELECT 1').run();
+  } catch (error) {
+    console.error('D1 warm-up failed', error);
   }
 }
 

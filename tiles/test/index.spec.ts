@@ -439,6 +439,67 @@ describe('gateway', () => {
     expect(metrics('tiles_cache_fetch').map((tags) => tags.request_type)).toEqual(['tile', 'style', 'json']);
   });
 
+  describe('D1 warm-up', () => {
+    // A D1 binding that answers every read with run().
+    const stubD1 = (run: () => Promise<unknown>) => {
+      const prepare = vi.fn(() => ({ run }));
+      const withSession = vi.fn(() => ({ prepare }));
+      return { withSession, prepare, d1: { withSession } as unknown as D1Database };
+    };
+    // Whether a promise settles once everything already queued has run.
+    const settles = (promise: Promise<unknown>) =>
+      Promise.race([promise.then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), 10))]);
+
+    it.each`
+      url                | headers                      | status
+      ${'/v1/1/2/3.mvt'} | ${{}}                        | ${200}
+      ${'/v1.json'}      | ${{ 'If-None-Match': etag }} | ${304}
+    `(
+      'warms the nearby replica for $url ($status) without holding the response for it',
+      async ({ url, headers, status }) => {
+        captureMetrics();
+        const warmUps: (() => void)[] = [];
+        const { withSession, prepare, d1 } = stubD1(() => new Promise<void>((resolve) => warmUps.push(resolve)));
+        const ctx = createExecutionContext();
+        Object.defineProperty(ctx, 'exports', { value: { Tiles: { fetch: async () => cachedTile() } } });
+        const waitUntil = vi.spyOn(ctx, 'waitUntil');
+
+        // The warm-up is still running when the response comes back.
+        const response = await worker.fetch(
+          new IncomingRequest(`https://tiles.example${url}`, { headers }),
+          { ...env, D1_GLOBAL: d1 },
+          ctx,
+        );
+        expect(response.status).toBe(status);
+        expect(withSession).toHaveBeenCalledExactlyOnceWith('first-unconstrained');
+        expect(prepare).toHaveBeenCalledExactlyOnceWith('SELECT 1');
+        expect(warmUps).toHaveLength(1);
+
+        // It goes to waitUntil, which keeps the request alive until it finishes.
+        const [[warmUp]] = waitUntil.mock.calls;
+        expect(await settles(warmUp)).toBe(false);
+        warmUps[0]();
+        expect(await settles(warmUp)).toBe(true);
+        await waitOnExecutionContext(ctx);
+      },
+    );
+
+    it('only logs a failed warm-up', async () => {
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const { d1 } = stubD1(() => Promise.reject(new Error('D1 is down')));
+      const ctx = createExecutionContext();
+      Object.defineProperty(ctx, 'exports', { value: { Tiles: { fetch: async () => cachedTile() } } });
+      const response = await worker.fetch(
+        new IncomingRequest('https://tiles.example/v1/1/2/3.mvt'),
+        { ...env, D1_GLOBAL: d1 },
+        ctx,
+      );
+      await waitOnExecutionContext(ctx);
+      expect(response.status).toBe(200);
+      expect(error).toHaveBeenCalledWith('D1 warm-up failed', new Error('D1 is down'));
+    });
+  });
+
   it('counts 304s', async () => {
     const metrics = captureMetrics();
     await fetchGateway('/v1.json', { headers: { 'If-None-Match': etag } });

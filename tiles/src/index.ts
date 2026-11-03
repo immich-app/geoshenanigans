@@ -7,6 +7,7 @@ import {
   InfluxMetricsProvider,
   Metric,
   requestTags,
+  warmD1Replica,
 } from './repository';
 import {
   encodeMetricTags,
@@ -177,6 +178,10 @@ export default {
     if (workerEnv.WORKER_TYPE === 'D1_PROXY') {
       return handleD1ProxyRequest(request, workerEnv);
     }
+    // Tiles' lookups run at the upper-tier colo of this colo's regional pool, which reads from the same nearby D1
+    // replica. Warmed on every request, hits included, as those are what keep it awake between misses; never awaited,
+    // so no response waits for it.
+    ctx.waitUntil(warmD1Replica(workerEnv.D1_GLOBAL));
     const deferredRepository = new CloudflareDeferredRepository(ctx);
     const headerProvider = new HeaderMetricsProvider();
     const influxProvider = new InfluxMetricsProvider(workerEnv.VMETRICS_API_TOKEN, env.ENVIRONMENT);
