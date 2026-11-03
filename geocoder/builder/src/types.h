@@ -207,6 +207,71 @@ static constexpr double ADMIN_LINK_SLACK_DEG = 1e-7;
 static constexpr double ADMIN_LINK_REACH_RAD =
     ADMIN_COVER_CHORD_TOLERANCE_RAD + ADMIN_LINK_SLACK_DEG * (3.14159265358979323846 / 180.0);
 
+// --- Admin arcs (admin_arcs.h) ---
+
+// The arc topology's coordinate-hash partitions of the vertices: its junction
+// pass sorts each partition's neighbour lists on one thread, small enough to
+// sort in cache and with no merge.
+static constexpr uint32_t kArcPartitions = 4096;
+
+// The arc sets: every admin polygon's rings, and admin-minimal's
+// (admin_minimal_keeps), which admin-minimal-poi shares.
+enum class ArcSet : uint8_t { Full, Minimal };
+
+// The simplified tiers' Douglas-Peucker tolerance at every level, and its cap
+// for an arc of small rings: kArcCapFactor times the square root of the
+// smallest ring's area that uses the arc.
+static constexpr double kArcSimplifyToleranceM = 37.5;
+static constexpr double kArcCapFactor = 0.1;
+// The simplified tiers' grid, in e7 units: 1e-5 degrees, 1.1 m.
+static constexpr int32_t kSimplifiedGridE7 = 100;
+// Rounds that give a degenerate simplified ring vertices back.
+static constexpr int kArcValidityRounds = 64;
+// Rounds that give vertices back where simplified segments cross or a
+// polygon's rings stop nesting, and the grid they find crossings on, in e7
+// units: 0.02 degrees.
+static constexpr int kArcRepairRounds = 60;
+static constexpr int64_t kArcRepairCellE7 = 200000;
+
+// A boundary tier: the arcs of one set at one tolerance and grid. A tier
+// with no tolerance stores every raw vertex as OSM has it: no simplifying,
+// snapping or cap.
+struct ArcTier {
+    ArcSet set;
+    const char* dir;     // under a region's dir
+    double tolerance_m;  // 0: none
+    double cap_factor;   // 0: none
+    int32_t grid_e7;     // the snap grid's step; 1: OSM's own
+    bool simplifies() const { return tolerance_m > 0; }
+};
+
+inline constexpr ArcTier kArcTiers[] = {
+    {ArcSet::Full, "quality/simplified", kArcSimplifyToleranceM, kArcCapFactor, kSimplifiedGridE7},
+    {ArcSet::Full, "quality/exact", 0, 0, 1},
+    {ArcSet::Minimal, "admin-minimal", kArcSimplifyToleranceM, kArcCapFactor, kSimplifiedGridE7},
+};
+inline constexpr size_t kArcTierCount = sizeof(kArcTiers) / sizeof(kArcTiers[0]);
+
+// The dir beside admin-minimal that holds the minimal set's arcs too, in the
+// shared polygon slots a POI's parent names (write_admin_minimal).
+inline constexpr const char* kAdminMinimalPoiDir = "admin-minimal-poi";
+
+// The arc files' blocks (arc_blocks.h). An arc block of this many stored
+// vertices or more carries its box.
+static constexpr uint32_t kArcBboxMinVertices = 16;
+// A ring of more refs than kChunkBoxMinRefs is cut into chunks of refs, each
+// with the box of its arcs' raw vertices: after a ref whose planet slot's
+// mix64 has kRefChunkCutMask's bits all set once the chunk holds
+// kRefChunkMin refs, after kRefChunkMax refs, and at the ring's end.
+static constexpr uint32_t kChunkBoxMinRefs = 8;
+static constexpr uint32_t kRefChunkMin = 4;
+static constexpr uint32_t kRefChunkMax = 16;
+static constexpr uint64_t kRefChunkCutMask = 7;
+// How far, per axis in e7 units, a stored vertex may lie from its raw one:
+// a chunk's raw box widened by this holds every vertex any tier stores of
+// its arcs (half the 1e-4 degree grid, the coarsest a tier may take).
+static constexpr int32_t kChunkBoxSlackE7 = 500;
+
 // --- Index mode ---
 
 enum class IndexMode { Full, NoAddresses, AdminOnly };

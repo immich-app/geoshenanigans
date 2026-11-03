@@ -27,6 +27,7 @@ BUILD_LOG = """Using 87 worker threads.
   Processed 5000/154945 blocks...
   [35.3s 60.9/88cores 69% 36031MiB] Pass 2: node processing
   [1.2s 9.1/88cores 10% 30000MiB]       planet/full: pack + write
+ARC_CHECK tier=quality/simplified set=full crossings_left=4691 rings_nest_introduced=11
   [322.4s 9.8/88cores 11% 25143MiB] All index writing (total)
 """
 MEMWATCH_LOG = """[memwatch 06:30:01] cgroup=91675Mi/98304Mi anon=113Mi file=88832Mi file_dirty=0Mi file_writeback=0Mi build_index_rss=16Mi others_rss=310Mi
@@ -171,6 +172,22 @@ class PhasesTest(unittest.TestCase):
                          {"Admin assembly": 1.3})
 
 
+class ArcChecksTest(unittest.TestCase):
+    def test_each_count_is_labelled_by_the_words_of_its_line_that_say_what_it_counts(self):
+        log = ["ARC_CHECK set=full junctions=1447370 arcs=2487370",
+               "  ARC_CHECK tier=quality/simplified set=full crossings_left=4691 rings_nest_introduced=0"]
+
+        self.assertEqual(sut.arc_checks(log), [
+            ({"set": "full"}, "junctions", 1447370),
+            ({"set": "full"}, "arcs", 2487370),
+            ({"tier": "quality/simplified", "set": "full"}, "crossings_left", 4691),
+            ({"tier": "quality/simplified", "set": "full"}, "rings_nest_introduced", 0),
+        ])
+
+    def test_takes_no_line_that_only_mentions_it(self):
+        self.assertEqual(sut.arc_checks(["Error: ARC_CHECK failed", "ARC_CHECK", "  Admin arcs: 5 junctions"]), [])
+
+
 class PeakMemoryTest(unittest.TestCase):
     def test_takes_the_largest_sample_of_each_kind_in_bytes(self):
         self.assertEqual(sut.peak_memory(MEMWATCH_LOG.splitlines()), {
@@ -267,6 +284,10 @@ class NightlyTest(WorkDirTest):
         self.assertEqual(by_name(samples, "geocoder_build_data_timestamp_seconds"), {(): NOW - 7 * 3600})
         self.assertEqual(len(by_name(samples, "geocoder_build_phase_duration_seconds")), 3)
         self.assertEqual(by_name(samples, "geocoder_build_peak_memory_bytes")[(("kind", "dirty"),)], 6478 * sut.MIB)
+        self.assertEqual(by_name(samples, "geocoder_build_arc_check"), {
+            (("check", "crossings_left"), ("set", "full"), ("tier", "quality/simplified")): 4691,
+            (("check", "rings_nest_introduced"), ("set", "full"), ("tier", "quality/simplified")): 11,
+        })
 
     def test_leaves_the_runs_outcome_to_the_watchdog(self):
         samples, _ = self.run_sut()

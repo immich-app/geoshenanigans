@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include "admin_arcs.h"
 #include "exact_pip.h"
 #include "packed_location.h"
 #include "polygon_rings.h"
@@ -375,6 +376,9 @@ struct ParsedData {
     std::vector<NodeCoord> admin_vertices;
     // Freed once the postcode centroids, its last user, have their countries.
     AdminExactRings admin_exact_rings;
+    // The arc stage's encoded arcs of those rings, which outlive them
+    // (--arcs-out only, else empty).
+    AdminArcBlocks admin_arcs;
     // The builder's own admin candidates per cell (admin_candidate_map): every
     // cell from which a polygon's exact rings can hold a point, flagged
     // INTERIOR_FLAG where they hold all of it. The parent and country passes

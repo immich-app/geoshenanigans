@@ -104,3 +104,13 @@ void write_quality_variant(const ParsedData& data, const std::string& source_dir
 //     tier's names extend.
 void write_admin_minimal(const ParsedData& data, const std::string& region_dir, const std::string& region_prev,
                          double epsilon_scale);
+
+// Writes a region's arc dirs (--arcs-out) under region_dir as PR 3 ships
+// them: quality/simplified/ and quality/exact/ of the full set in the shared
+// polygon slots, the full set's arc sidecar beside the exact tier; and the
+// minimal set in admin-minimal/ (its own stable slots, against region_prev's
+// admin-minimal sidecar, and its own core string offsets, as write_admin_minimal
+// gives them) and in admin-minimal-poi/ (the shared slots and names), with
+// its arc sidecar in admin-minimal/. Each dir holds admin_polygons.bin,
+// admin_rings.bin, arc_index.bin and arc_vertices.bin.
+void write_arc_dirs(const ParsedData& data, const std::string& region_dir, const std::string& region_prev);

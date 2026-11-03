@@ -59,6 +59,7 @@ enum class ObjectType : uint8_t {
     OSM_RELATION = 3,
     POSTCODE     = 4,   // hash of (country_code, postcode_string)
     SYNTHETIC    = 5,   // builder-derived (e.g. multi-ring relation: hash of relation_id+ring_index)
+    ARC          = 6,   // an admin boundary arc: arc_key (admin_arcs.h)
 };
 
 constexpr uint32_t SIDECAR_MAGIC   = 0xD0510EAD;
@@ -87,6 +88,11 @@ constexpr uint8_t SLOT_FLAG_TOMBSTONE = 0x01;
 // missing allocates {NONE, 0}).
 inline bool is_tombstone(const SidecarSlot& s) {
     return (s.flags & SLOT_FLAG_TOMBSTONE) != 0;
+}
+
+// The tombstone a slot becomes when its record dies, keeping the record's tier.
+inline SidecarSlot tombstone_of(const SidecarSlot& s) {
+    return SidecarSlot{static_cast<uint8_t>(ObjectType::NONE), SLOT_FLAG_TOMBSTONE, s.tier, 0, 0};
 }
 
 // A slot whose identity a record of the next build can reclaim;
@@ -292,10 +298,7 @@ public:
     // slot sits there unflagged and is dead now (slots already flagged keep
     // their bytes). Then drop the bookkeeping before slots_ moves out.
     void finalize() {
-        for (uint32_t i : unclaimed_) {
-            SidecarSlot& s = slots_[i];
-            s = SidecarSlot{static_cast<uint8_t>(ObjectType::NONE), SLOT_FLAG_TOMBSTONE, s.tier, 0, 0};
-        }
+        for (uint32_t i : unclaimed_) slots_[i] = tombstone_of(slots_[i]);
         for (uint32_t i : free_list_) slots_[i].flags |= SLOT_FLAG_TOMBSTONE;
         std::vector<uint32_t>().swap(unclaimed_);
         std::vector<uint32_t>().swap(free_list_);

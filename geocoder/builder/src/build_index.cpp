@@ -52,6 +52,7 @@
 #include "parent_linking.h"
 #include "polygon_rings.h"
 #include "admin_rank_config.h"
+#include "admin_arcs.h"
 #include "admin_links.h"
 #include "cell_walk.h"
 #include "parallel.h"
@@ -352,6 +353,10 @@ struct BuildConfig {
     bool multi_quality = false;
     std::string output_dir;
     std::string prev_output_dir;
+    // The arc stage runs only with an arcs dir; prev_arcs_dir is the last
+    // such build's.
+    std::string arcs_out_dir;
+    std::string prev_arcs_dir;
 };
 
 // Shared nearest-named-street sweep used by the addr backfill and the POI
@@ -1260,8 +1265,15 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             if (rel.rfind(output_dir, 0) == 0) rel = rel.substr(output_dir.size());
             region_prev = prev_output_dir + rel;
         }
+        // The region's arc dirs (--arcs-out only) and the last such build's.
+        const std::string region_arcs = cfg.arcs_out_dir.empty() ? "" : cfg.arcs_out_dir + "/" + region;
+        const std::string region_prev_arcs = cfg.prev_arcs_dir.empty() ? "" : cfg.prev_arcs_dir + "/" + region;
         if (run == RegionRun::Continent) {
             timed_phase("    " + region + ": strategy2 remap", [&] { apply_strategy2_remaps(d, region_prev, order); });
+            // Its own arc slots, as the remap gives its polygons theirs.
+            if (!region_arcs.empty())
+                timed_phase("    " + region + ": arc slots",
+                            [&] { assign_region_arc_slots(d.admin_arcs, region_prev_arcs, region, 0); });
             timed_phase("    " + region + ": poi names in record order", [&] { order_poi_strings_by_record(d); });
         }
 
@@ -1472,19 +1484,21 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             }
         };
 
-        const StageCosts costs = stage_costs(record_bytes(d));
+        const StageCosts costs = stage_costs(record_bytes(d), region_arcs.empty() ? 0 : arc_dirs_cost(d));
         struct Stage {
             const char* name;
             std::function<void()> write;
             uint64_t cost;
         };
-        const Stage stages[] = {
+        std::vector<Stage> stages = {
             {"modes", write_modes, costs.modes},
             {"quality variants", write_quality_dirs, costs.quality},
             {"place files", write_places, costs.places},
             {"admin-minimal", write_admin_minimal_set, costs.admin_minimal},
             {"poi tiers", write_poi_tiers, costs.poi_tiers},
         };
+        if (!region_arcs.empty())
+            stages.push_back({"arc dirs", [&] { write_arc_dirs(d, region_arcs, region_prev_arcs); }, costs.arc_dirs});
         auto run_stage = [&](const Stage& stage) {
             std::optional<BudgetLease> lease;
             if (budget) lease.emplace(*budget, stage.cost);
@@ -1575,7 +1589,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // when the budget holds them beside the costliest continents that can
     // run together; else one after another, to hold memory down while
     // continent subsets build alongside.
-    const uint64_t planet_stages = stage_costs(record_bytes(data)).total();
+    // The arc dirs stage's, 0 without --arcs-out; each continent's is its
+    // share of it.
+    const uint64_t planet_arc_dirs = cfg.arcs_out_dir.empty() ? 0 : arc_dirs_cost(data);
+    const uint64_t planet_stages = stage_costs(record_bytes(data), planet_arc_dirs).total();
 
     // The planet's own write and each continent's split read the planet
     // records; the last of them to finish frees them beside the work left,
@@ -1716,7 +1733,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             const KindValues bytes = continent_share(planet_bytes, planet_pairs, continent_pairs[c]);
             const KindValues counts = continent_share(planet_counts, planet_pairs, continent_pairs[c]);
             const uint64_t filter_bytes = filter_cost(planet_counts, continent_pairs[c]);
-            pending.push_back({c, continent_cost(bytes, counts, filter_bytes, budget.capacity())});
+            // Its write runs without a budget (run_continent), so its
+            // reservation holds the arc dirs stage too.
+            const uint64_t arc_dirs = continent_arc_dirs_cost(planet_arc_dirs, planet_bytes, bytes);
+            pending.push_back({c, continent_cost(bytes, counts, filter_bytes, arc_dirs, budget.capacity())});
         }
         // A continent past the budget even with its steps one after another
         // goes last, once nothing else reads the planet records: its split
@@ -1945,6 +1965,8 @@ static int run(int argc, char* argv[]) {
         std::cerr << "  --tiger-data <path>          Load TIGER address data (tar.gz or directory of CSVs)" << std::endl;
         std::cerr << "  --external-postcodes <path>  Load GeoNames postcode centroids (CSV or .csv.gz)" << std::endl;
         std::cerr << "  --wikidata-sitelinks <path>  Load QID→sitelinks binary for POI importance" << std::endl;
+        std::cerr << "  --arcs-out <dir>             Cut the admin boundaries into arcs (a new or empty dir, apart from <output-dir>)" << std::endl;
+        std::cerr << "  --prev-arcs <dir>            The previous --arcs-out, for its arc slots" << std::endl;
         return 1;
     }
 
@@ -1958,6 +1980,8 @@ static int run(int argc, char* argv[]) {
     // the same dense IDs to records carried over from the previous
     // build. Empty means "fresh start, no stable IDs".
     std::string prev_output_dir;
+    std::string arcs_out_dir;
+    std::string prev_arcs_dir;
     bool multi_output = false;
     bool generate_continents = false;
     IndexMode mode = IndexMode::Full;
@@ -2019,11 +2043,21 @@ static int run(int argc, char* argv[]) {
             external_postcodes_path = argv[++i];
         } else if (arg == "--prev-output" && i + 1 < argc) {
             prev_output_dir = argv[++i];
+        } else if (arg == "--arcs-out" && i + 1 < argc) {
+            arcs_out_dir = argv[++i];
+        } else if (arg == "--prev-arcs" && i + 1 < argc) {
+            prev_arcs_dir = argv[++i];
         } else {
             input_files.push_back(arg);
         }
     }
     require_new_or_empty_output_dir(output_dir);
+    {
+        std::vector<std::string> regions = {"planet"};
+        if (generate_continents)
+            for (size_t c = 0; c < kContinentCount; c++) regions.push_back(kContinents[c].name);
+        require_arc_dirs(output_dir, arcs_out_dir, prev_arcs_dir, regions);
+    }
 
     // Set global simplification mode
     kSimplifyMode = simplify_mode;
@@ -2073,7 +2107,7 @@ static int run(int argc, char* argv[]) {
     }
 
     unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency() - 1);
-    BuildConfig cfg{num_threads, mode, multi_output, multi_quality, output_dir, prev_output_dir};
+    BuildConfig cfg{num_threads, mode, multi_output, multi_quality, output_dir, prev_output_dir, arcs_out_dir, prev_arcs_dir};
     {
         // Parse PBF files (always collect everything)
         if (input_files.empty()) {
@@ -4265,6 +4299,18 @@ static int run(int argc, char* argv[]) {
         data.cell_to_admin = admin_candidate_map(std::move(admin_cells), num_threads);
         log_phase("    Admin: candidate map", _pt, _cpu);
         std::cerr << "Admin candidate map complete (" << data.cell_to_admin.size() << " cells)." << std::endl;
+
+        if (!cfg.arcs_out_dir.empty()) {
+            std::vector<bool> in_minimal(data.admin_polygons.size());
+            for (size_t p = 0; p < in_minimal.size(); p++)
+                in_minimal[p] = admin_minimal_keeps(data.admin_polygons[p].admin_level,
+                                                    data.admin_polygons[p].place_type_override);
+            const AdminArcs arcs = build_admin_arcs(data.admin_exact_rings, in_minimal,
+                                                    cfg.prev_arcs_dir.empty() ? "" : cfg.prev_arcs_dir + "/planet",
+                                                    num_threads);
+            data.admin_arcs = encode_admin_arcs(arcs, data.admin_exact_rings, num_threads);
+            log_phase("    Admin: arcs", _pt, _cpu);
+        }
 
         // Sort admin polygons largest-first (by vertex count descending).
         // This ensures the work-stealing loops in S2 computation and quality

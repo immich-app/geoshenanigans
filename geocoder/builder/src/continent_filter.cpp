@@ -277,6 +277,9 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
             out.admin_polygons, out.admin_vertices);
         out.admin_osm_ids = subset_osm_ids(used_admin_ids, admin_remap, out.admin_polygons.size(), full.admin_osm_ids);
         out.admin_planet_ids = used_admin_ids;  // every one is kept
+        // Their arcs too: the planet's are gone once it is split.
+        if (!full.admin_arcs.polygons.empty()) out.admin_arcs = subset_admin_arcs(full.admin_arcs, used_admin_ids, 0);
+        if (consume) full.admin_arcs = {};
         drop(full.admin_polygons, full.admin_vertices, full.admin_osm_ids);
     };
 

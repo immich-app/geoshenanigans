@@ -186,6 +186,19 @@ inline bool ring_has_duplicate_coords(const std::vector<PackedLocation>& ring) {
     return false;
 }
 
+// The distance Douglas-Peucker measures: from p to the segment a-b, in the
+// coordinates' own units.
+inline double segment_distance(const std::pair<double,double>& a, const std::pair<double,double>& b,
+                               const std::pair<double,double>& p) {
+    const double dx = b.first - a.first, dy = b.second - a.second;
+    const double px = p.first - a.first, py = p.second - a.second;
+    const double len_sq = dx * dx + dy * dy;
+    if (len_sq == 0) return std::sqrt(px * px + py * py);
+    const double t = std::max(0.0, std::min(1.0, (px * dx + py * dy) / len_sq));
+    const double proj_x = t * dx - px, proj_y = t * dy - py;
+    return std::sqrt(proj_x * proj_x + proj_y * proj_y);
+}
+
 // Douglas-Peucker line simplification
 inline void dp_simplify(const std::vector<std::pair<double,double>>& pts,
                         size_t start, size_t end, double epsilon,
@@ -195,21 +208,8 @@ inline void dp_simplify(const std::vector<std::pair<double,double>>& pts,
     double max_dist = 0;
     size_t max_idx = start;
 
-    double ax = pts[start].first, ay = pts[start].second;
-    double bx = pts[end].first, by = pts[end].second;
-    double dx = bx - ax, dy = by - ay;
-    double len_sq = dx * dx + dy * dy;
-
     for (size_t i = start + 1; i < end; i++) {
-        double px = pts[i].first - ax, py = pts[i].second - ay;
-        double dist;
-        if (len_sq == 0) {
-            dist = std::sqrt(px * px + py * py);
-        } else {
-            double t = std::max(0.0, std::min(1.0, (px * dx + py * dy) / len_sq));
-            double proj_x = t * dx - px, proj_y = t * dy - py;
-            dist = std::sqrt(proj_x * proj_x + proj_y * proj_y);
-        }
+        const double dist = segment_distance(pts[start], pts[end], pts[i]);
         if (dist > max_dist) {
             max_dist = dist;
             max_idx = i;
@@ -262,14 +262,11 @@ inline std::vector<std::pair<double,double>> simplify_polygon(
     return result;
 }
 
-// Error-bounded simplification: maximum displacement of epsilon_deg (in degrees).
-// Epsilon is in the same coordinate units as the vertices (degrees).
-// Converts meters to degrees using latitude: epsilon_deg = meters / (111320 * cos(lat))
-// Always keeps at least min_vertices (default 4) to preserve basic shape.
-inline std::vector<std::pair<double,double>> simplify_polygon_epsilon(
-    const std::vector<std::pair<double,double>>& pts, double epsilon_deg,
-    size_t min_vertices = 4) {
-    if (pts.size() <= min_vertices) return pts;
+// The vertices simplify_polygon_epsilon keeps, as marks over pts: every one
+// when there are at most min_vertices.
+inline std::vector<bool> dp_keep_epsilon(const std::vector<std::pair<double,double>>& pts, double epsilon_deg,
+                                         size_t min_vertices = 4) {
+    if (pts.size() <= min_vertices) return std::vector<bool>(pts.size(), true);
 
     std::vector<bool> keep(pts.size(), false);
     keep[0] = true;
@@ -299,7 +296,19 @@ inline std::vector<std::pair<double,double>> simplify_polygon_epsilon(
             }
         }
     }
+    return keep;
+}
 
+// Error-bounded simplification: maximum displacement of epsilon_deg (in degrees).
+// Epsilon is in the same coordinate units as the vertices (degrees).
+// Converts meters to degrees using latitude: epsilon_deg = meters / (111320 * cos(lat))
+// Always keeps at least min_vertices (default 4) to preserve basic shape.
+inline std::vector<std::pair<double,double>> simplify_polygon_epsilon(
+    const std::vector<std::pair<double,double>>& pts, double epsilon_deg,
+    size_t min_vertices = 4) {
+    if (pts.size() <= min_vertices) return pts;
+
+    const std::vector<bool> keep = dp_keep_epsilon(pts, epsilon_deg, min_vertices);
     std::vector<std::pair<double,double>> result;
     for (size_t i = 0; i < pts.size(); i++) {
         if (keep[i]) result.push_back(pts[i]);

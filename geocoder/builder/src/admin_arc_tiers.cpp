@@ -1,0 +1,919 @@
+// The arc sets' tiers (build_arc_tier): Douglas-Peucker once per arc, the
+// snap, the rounds that give a degenerate ring vertices back, the repair of
+// crossings simplification makes, and the nesting counts.
+#include <algorithm>
+#include <cmath>
+#include <stdexcept>
+#include <unordered_map>
+
+#include "admin_arcs.h"
+#include "exact_pip.h"
+#include "parallel.h"
+#include "parsed_data.h"
+
+namespace {
+
+// Pairs of raw edges past which the repair takes two segments' raw spans for
+// apart without comparing them, so their crossing counts as made by
+// simplifying: each repair round shortens the spans.
+constexpr uint64_t kRawSpanPairsMax = 4000000;
+
+// One arc set's arcs and rings, read alike for either set.
+class SetArcs {
+public:
+    SetArcs(const AdminArcs& arcs, const AdminExactRings& store, ArcSet set) : arcs_(arcs), store_(store), set_(set) {}
+
+    size_t size() const { return set_ == ArcSet::Full ? arcs_.arcs.size() : arcs_.minimal.arcs.size(); }
+    const std::vector<uint32_t>& ring_refs() const {
+        return set_ == ArcSet::Full ? arcs_.ring_refs : arcs_.minimal.ring_refs;
+    }
+    const std::vector<ArcRef>& refs() const { return set_ == ArcSet::Full ? arcs_.refs : arcs_.minimal.refs; }
+    bool has_ring(uint32_t r) const { return ring_refs()[r + 1] > ring_refs()[r]; }
+
+    // fn(vertices): arc a's vertices in its order.
+    template <class Fn>
+    void with(uint32_t a, Fn&& fn) const {
+        if (set_ == ArcSet::Full) fn(arc_vertices(store_, arcs_.arcs[a].view));
+        else fn(MinimalArcVertices(store_, arcs_, a));
+    }
+    uint32_t count(uint32_t a) const {
+        return set_ == ArcSet::Full ? arcs_.arcs[a].view.count : arcs_.minimal.arcs[a].count;
+    }
+    // Arc a's raw vertices [from, to].
+    void read(uint32_t a, std::vector<PackedLocation>& out, uint32_t from = 0, uint32_t to = UINT32_MAX) const {
+        with(a, [&](const auto& v) {
+            to = std::min(to, v.size() - 1);
+            out.resize(to - from + 1);
+            for (uint32_t i = from; i <= to; i++) out[i - from] = v[i];
+        });
+    }
+
+private:
+    const AdminArcs& arcs_;
+    const AdminExactRings& store_;
+    ArcSet set_;
+};
+
+// tier_vertices for arc a's raw vertices `raw`.
+void stored_vertices(const std::vector<PackedLocation>& raw, const ArcKeep& keep, uint32_t a, const ArcTier& tier,
+                     std::vector<StoredVertex>& out) {
+    out.clear();
+    const uint32_t n = static_cast<uint32_t>(raw.size());
+    if (!tier.simplifies()) {
+        for (uint32_t i = 0; i < n; i++) out.push_back({i, raw[i]});
+        return;
+    }
+    for (uint32_t i = 0; i < n; i++) {
+        if (!keep.test(a, i)) continue;
+
+        const PackedLocation p = snapped(raw[i], tier.grid_e7);
+        if (!out.empty() && out.back().at == p) {
+            if (i + 1 == n && out.size() > 1) out.back().raw = i;
+            continue;
+        }
+        out.push_back({i, p});
+    }
+}
+
+void degrees_of(const std::vector<PackedLocation>& raw, std::vector<LatLng>& out) {
+    out.resize(raw.size());
+    for (size_t i = 0; i < raw.size(); i++) out[i] = {raw[i].lat(), raw[i].lon()};
+}
+
+// A dropped raw vertex and how far it lies from the kept segment over it.
+struct Farthest {
+    uint32_t at = 0;
+    double distance = -1;  // none
+};
+
+// The farthest vertex of `pts` strictly between `from` and `to` that arc a
+// doesn't keep, from the segment pts[from]-pts[to].
+Farthest farthest_dropped(const std::vector<LatLng>& pts, const ArcKeep& keep, uint32_t a, uint32_t from, uint32_t to) {
+    Farthest best;
+    for (uint32_t k = from + 1; k < to; k++) {
+        if (keep.test(a, k)) continue;
+
+        const double d = segment_distance(pts[from], pts[to], pts[k]);
+        if (d > best.distance) best = {k, d};
+    }
+    return best;
+}
+
+// The farthest of arc a's dropped vertices from its kept segments.
+Farthest farthest_dropped(const std::vector<LatLng>& pts, const ArcKeep& keep, uint32_t a) {
+    Farthest best;
+    uint32_t prev = 0;
+    for (uint32_t i = 1; i < pts.size(); i++) {
+        if (!keep.test(a, i)) continue;
+
+        if (i > prev + 1) {
+            const Farthest f = farthest_dropped(pts, keep, a, prev, i);
+            if (f.distance > best.distance) best = f;
+        }
+        prev = i;
+    }
+    return best;
+}
+
+// Twice the signed area of a, b, c: > 0 when c is left of a -> b, 0 in line.
+__int128 orientation(PackedLocation a, PackedLocation b, PackedLocation c) {
+    return static_cast<__int128>(int64_t(b.lon_e7) - a.lon_e7) * (int64_t(c.lat_e7) - a.lat_e7) -
+           static_cast<__int128>(int64_t(b.lat_e7) - a.lat_e7) * (int64_t(c.lon_e7) - a.lon_e7);
+}
+
+int sign(__int128 v) { return (v > 0) - (v < 0); }
+
+// Whether c, in line with a-b, lies on the closed segment.
+bool within(PackedLocation a, PackedLocation b, PackedLocation c) {
+    return std::min(a.lat_e7, b.lat_e7) <= c.lat_e7 && c.lat_e7 <= std::max(a.lat_e7, b.lat_e7) &&
+           std::min(a.lon_e7, b.lon_e7) <= c.lon_e7 && c.lon_e7 <= std::max(a.lon_e7, b.lon_e7);
+}
+
+// Whether segments a-b and c-d meet anywhere but at an end they share: a
+// crossing, an end on the other's inside, or segments in line overlapping.
+// The same segment (either way) meets nothing.
+bool segments_meet(PackedLocation a, PackedLocation b, PackedLocation c, PackedLocation d) {
+    const bool ac = a == c, ad = a == d, bc = b == c, bd = b == d;
+    const int shared = ac + ad + bc + bd;
+    if (shared >= 2) return false;
+    const int o1 = sign(orientation(a, b, c)), o2 = sign(orientation(a, b, d));
+    const int o3 = sign(orientation(c, d, a)), o4 = sign(orientation(c, d, b));
+    if (shared == 1) {
+        if (o1 != 0 || o2 != 0) return false;
+        // In line from the shared end: they overlap when either's other end
+        // lies on the other segment.
+        if ((ac || ad) && within(c, d, b)) return true;
+        if ((bc || bd) && within(c, d, a)) return true;
+        if ((ac || bc) && within(a, b, d)) return true;
+        if ((ad || bd) && within(a, b, c)) return true;
+        return false;
+    }
+    if (o1 != o2 && o3 != o4) return true;
+    return (o1 == 0 && within(a, b, c)) || (o2 == 0 && within(a, b, d)) || (o3 == 0 && within(c, d, a)) ||
+           (o4 == 0 && within(c, d, b));
+}
+
+struct Box {
+    int32_t lat_lo = INT32_MAX, lat_hi = INT32_MIN, lng_lo = INT32_MAX, lng_hi = INT32_MIN;
+    void add(PackedLocation p) {
+        lat_lo = std::min(lat_lo, p.lat_e7);
+        lat_hi = std::max(lat_hi, p.lat_e7);
+        lng_lo = std::min(lng_lo, p.lon_e7);
+        lng_hi = std::max(lng_hi, p.lon_e7);
+    }
+    bool overlaps(const Box& o) const {
+        return lat_lo <= o.lat_hi && o.lat_lo <= lat_hi && lng_lo <= o.lng_hi && o.lng_lo <= lng_hi;
+    }
+};
+
+Box box_of(PackedLocation a, PackedLocation b) {
+    Box box;
+    box.add(a);
+    box.add(b);
+    return box;
+}
+
+// A stored segment of a tier: between the stored vertices at raw places
+// `from` and `to` of its arc.
+struct Segment {
+    uint32_t arc, from, to;
+    PackedLocation a, b;
+};
+
+// Two segments a crossing can be between: not the same, nor one after the
+// other along one arc.
+bool segments_conflict(const Segment& p, const Segment& q) {
+    if (p.arc == q.arc && (p.to == q.from || q.to == p.from)) return false;
+    if (!box_of(p.a, p.b).overlaps(box_of(q.a, q.b))) return false;
+    return segments_meet(p.a, p.b, q.a, q.b);
+}
+
+// The repair grid's cells: kArcRepairCellE7 squares from (-90, -180).
+constexpr int64_t kCellColumns = int64_t(3600000000) / kArcRepairCellE7 + 1;
+
+// Every cell segment a-b passes through (and perhaps one or two beside it),
+// column by column: fn(cell).
+template <class Fn>
+void cells_of(PackedLocation a, PackedLocation b, Fn&& fn) {
+    int64_t x0 = int64_t(a.lon_e7) + 1800000000, y0 = int64_t(a.lat_e7) + 900000000;
+    int64_t x1 = int64_t(b.lon_e7) + 1800000000, y1 = int64_t(b.lat_e7) + 900000000;
+    if (x0 > x1) {
+        std::swap(x0, x1);
+        std::swap(y0, y1);
+    }
+    constexpr int64_t C = kArcRepairCellE7;
+    // The segment's latitude at x, rounded down or up.
+    auto y_at = [&](int64_t x, bool up) {
+        const __int128 num = static_cast<__int128>(y1 - y0) * (x - x0);
+        const int64_t den = x1 - x0;
+        __int128 q = num / den;
+        if (num % den != 0 && ((num < 0) != up)) q += up ? 1 : -1;
+        return y0 + static_cast<int64_t>(q);
+    };
+    for (int64_t cx = x0 / C; cx <= x1 / C; cx++) {
+        int64_t lo = std::min(y0, y1), hi = std::max(y0, y1);
+        if (x1 > x0) {
+            const int64_t xa = std::max(x0, cx * C), xb = std::min(x1, (cx + 1) * C);
+            lo = std::min(y_at(xa, false), y_at(xb, false));
+            hi = std::max(y_at(xa, true), y_at(xb, true));
+        }
+        for (int64_t cy = lo / C; cy <= hi / C; cy++) fn(static_cast<uint32_t>(cy * kCellColumns + cx));
+    }
+}
+
+uint64_t cell_entry(uint32_t cell, uint32_t segment) { return (uint64_t(cell) << 32) | segment; }
+uint32_t entry_cell(uint64_t e) { return static_cast<uint32_t>(e >> 32); }
+uint32_t entry_segment(uint64_t e) { return static_cast<uint32_t>(e); }
+
+// What emit(i, out, scratch) appends for each i in [0, n), in index order:
+// chunks of kCollectChunk indices handed out as workers free up, each worker
+// with a Scratch of its own.
+constexpr size_t kCollectChunk = 1024;
+
+template <class T, class Scratch, class Emit>
+std::vector<T> collect_in_order(size_t n, Emit emit, unsigned threads) {
+    const size_t chunks = (n + kCollectChunk - 1) / kCollectChunk;
+    std::vector<std::vector<T>> parts(chunks);
+    std::vector<Scratch> scratch(threads);
+    parallel_for_dynamic(chunks, 1, [&](size_t begin, size_t end, unsigned worker) {
+        for (size_t c = begin; c < end; c++)
+            for (size_t i = c * kCollectChunk; i < std::min(n, (c + 1) * kCollectChunk); i++)
+                emit(i, parts[c], scratch[worker]);
+    }, threads);
+    size_t total = 0;
+    for (const auto& part : parts) total += part.size();
+    std::vector<T> out;
+    out.reserve(total);
+    for (auto& part : parts) {
+        out.insert(out.end(), part.begin(), part.end());
+        free_storage(part);
+    }
+    return out;
+}
+
+template <class T>
+void sort_unique(std::vector<T>& v, unsigned threads) {
+    parallel_sort(v.begin(), v.end(), std::less<T>(), threads);
+    v.erase(std::unique(v.begin(), v.end()), v.end());
+}
+
+struct Scratch {
+    std::vector<PackedLocation> raw, other;
+    std::vector<LatLng> pts;
+    std::vector<StoredVertex> stored;
+    std::vector<PackedLocation> ring;
+};
+
+std::vector<LatLng> lat_lng_ring(const PackedLocation* v, size_t n, bool close) {
+    std::vector<LatLng> out;
+    out.reserve(n + 1);
+    for (size_t i = 0; i < n; i++) out.push_back({double(v[i].lat_e7), double(v[i].lon_e7)});
+    if (close && n > 0) out.push_back(out.front());
+    return out;
+}
+
+// One simplified tier of one set, built in place.
+class TierBuilder {
+public:
+    TierBuilder(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier, unsigned threads)
+        : store_(store), set_(arcs, store, tier.set), tier_(tier), threads_(threads), arc_count_(set_.size()),
+          keep_(arc_count_, [&](size_t a) { return set_.count(static_cast<uint32_t>(a)); }) {
+        for (uint32_t r = 0; r < store.rings.size(); r++)
+            if (set_.has_ring(r)) rings_.push_back(r);
+        // Each arc's rings.
+        user_at_.assign(arc_count_ + 1, 0);
+        for (uint32_t r : rings_)
+            for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) user_at_[set_.refs()[k].arc + 1]++;
+        for (size_t a = 0; a < arc_count_; a++) user_at_[a + 1] += user_at_[a];
+        users_.resize(user_at_.back());
+        std::vector<uint32_t> next(user_at_.begin(), user_at_.end() - 1);
+        for (uint32_t r : rings_)
+            for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) users_[next[set_.refs()[k].arc]++] = r;
+    }
+
+    // Douglas-Peucker on every arc at its tolerance.
+    void simplify() {
+        std::vector<double> ring_cap(store_.rings.size(), INFINITY);
+        if (tier_.cap_factor > 0)
+            parallel_for(rings_.size(), [&](size_t begin, size_t end, unsigned) {
+                for (size_t k = begin; k < end; k++) {
+                    const RingSpan& ring = store_.rings[rings_[k]];
+                    const __int128 a2 = exact_ring_area2(store_.vertices.data() + ring.begin, ring.count);
+                    const double area = static_cast<double>(a2 < 0 ? -a2 : a2) * 0.5e-14;
+                    ring_cap[rings_[k]] = tier_.cap_factor * std::sqrt(area);
+                }
+            }, threads_);
+        parallel_for_dynamic(arc_count_, 64, [&](size_t begin, size_t end, unsigned) {
+            Scratch s;
+            for (size_t i = begin; i < end; i++) {
+                const uint32_t a = static_cast<uint32_t>(i);
+                set_.read(a, s.raw);
+                degrees_of(s.raw, s.pts);
+                double epsilon = meters_to_degrees(tier_.tolerance_m, s.pts[0].first);
+                for (uint32_t u = user_at_[a]; u < user_at_[a + 1]; u++) epsilon = std::min(epsilon, ring_cap[users_[u]]);
+                const bool ends_meet = s.raw.front() == s.raw.back();
+                const std::vector<bool> kept = dp_keep_epsilon(s.pts, epsilon, ends_meet ? kMinClosedRing : 2);
+                for (uint32_t k = 0; k < kept.size(); k++)
+                    if (kept[k]) keep_.set(a, k);
+            }
+        }, threads_);
+    }
+
+    // Gives a ring that is degenerate once snapped (under 3 vertices, or no
+    // area) the farthest dropped vertex of its arc that strays most, round
+    // after round, every ring checked first and then those a round touched.
+    // Returns the arcs it changed.
+    std::vector<uint32_t> restore_degenerate_rings(ArcTierCounts& counts) {
+        std::vector<uint32_t> suspects = rings_, changed;
+        for (int round = 0;; round++) {
+            std::vector<uint32_t> bad = collect_in_order<uint32_t, Scratch>(suspects.size(),
+                [&](size_t k, std::vector<uint32_t>& out, Scratch& s) {
+                    if (!stored_ring_valid(suspects[k], s)) out.push_back(suspects[k]);
+                }, threads_);
+            counts.degenerate_rings = bad.size();
+            if (bad.empty() || round == kArcValidityRounds) break;
+
+            // Each bad ring's choice, then all of them, in ring order.
+            std::vector<std::pair<uint32_t, uint32_t>> back(bad.size(), {UINT32_MAX, 0});
+            parallel_for_dynamic(bad.size(), 16, [&](size_t begin, size_t end, unsigned) {
+                Scratch s;
+                for (size_t k = begin; k < end; k++) {
+                    Farthest best;
+                    for (uint32_t i = set_.ring_refs()[bad[k]]; i < set_.ring_refs()[bad[k] + 1]; i++) {
+                        const uint32_t a = set_.refs()[i].arc;
+                        set_.read(a, s.raw);
+                        degrees_of(s.raw, s.pts);
+                        const Farthest f = farthest_dropped(s.pts, keep_, a);
+                        if (f.distance > best.distance) {
+                            best = f;
+                            back[k] = {a, f.at};
+                        }
+                    }
+                }
+            }, threads_);
+            std::vector<uint32_t> touched;
+            for (const auto& [a, at] : back) {
+                if (a == UINT32_MAX || keep_.test(a, at)) continue;
+
+                keep_.set(a, at);
+                counts.validity_restored++;
+                touched.push_back(a);
+            }
+            if (touched.empty()) break;
+            counts.validity_rounds++;
+            sort_unique(touched, threads_);
+            changed.insert(changed.end(), touched.begin(), touched.end());
+            suspects = bad;
+            for (uint32_t a : touched) suspects.insert(suspects.end(), users_.begin() + user_at_[a], users_.begin() + user_at_[a + 1]);
+            sort_unique(suspects, threads_);
+        }
+        sort_unique(changed, threads_);
+        return changed;
+    }
+
+    // Lays every stored segment into the grid and finds every pair that meets.
+    void build_grid() {
+        std::vector<uint32_t> segments_of(arc_count_);
+        segs_ = collect_in_order<Segment, Scratch>(arc_count_, [&](size_t a, std::vector<Segment>& out, Scratch& s) {
+            const size_t before = out.size();
+            add_segments(static_cast<uint32_t>(a), s, out);
+            segments_of[a] = static_cast<uint32_t>(out.size() - before);
+        }, threads_);
+        if (segs_.size() >= UINT32_MAX) throw std::length_error("arc tier segments past 2^32");
+        base_at_ = parallel_offsets<uint32_t>(arc_count_, [&](size_t a) { return segments_of[a]; }, threads_);
+        alive_.assign(segs_.size(), 1);
+        base_cells_ = cells_from(0);
+        add_conflicts(meetings_in_cells());
+    }
+
+    // Repair rounds: each gives the spans of the crossings simplification
+    // made their farthest dropped vertices back, and the polygons whose
+    // rings stopped nesting theirs (restore_unnested). Then the validity
+    // rounds once more (a vertex given back can cross).
+    void repair(const std::vector<bool>& nests_exact, ArcTierCounts& counts) {
+        for (const Conflict& c : conflicts_) counts.crossings_simplified += !c.raw;
+        nesting_candidates(nests_exact);
+        std::vector<uint32_t> suspects = candidates_;
+        for (int round = 0; round < kArcRepairRounds; round++) {
+            std::vector<uint32_t> dirty = restore_crossed_spans(counts);
+            const std::vector<uint32_t> unnested = not_nesting(suspects);
+            const std::vector<uint32_t> nested = restore_unnested(unnested, counts);
+            dirty.insert(dirty.end(), nested.begin(), nested.end());
+            sort_unique(dirty, threads_);
+            if (dirty.empty()) break;
+            counts.repair_rounds++;
+            add_conflicts(meetings_of(update(dirty)));
+            suspects = unnested;
+            for (uint32_t a : dirty)
+                for (uint32_t u = user_at_[a]; u < user_at_[a + 1]; u++)
+                    if (polygon_of_[users_[u]] != UINT32_MAX) suspects.push_back(polygon_of_[users_[u]]);
+            sort_unique(suspects, threads_);
+        }
+        const std::vector<uint32_t> changed = restore_degenerate_rings(counts);
+        if (!changed.empty()) add_conflicts(meetings_of(update(changed)));
+    }
+
+    // What the repair leaves: crossings, the segments of those with nothing
+    // dropped, and polygons whose rings don't nest.
+    void count_left(ArcTierCounts& counts) {
+        std::vector<uint32_t> left;
+        for (const Conflict& c : conflicts_) {
+            if (!alive_[c.s] || !alive_[c.t]) continue;
+            if (c.raw) {
+                counts.raw_crossings++;
+                continue;
+            }
+            counts.crossings_left++;
+            left.push_back(c.s);
+            left.push_back(c.t);
+        }
+        sort_unique(left, threads_);
+        counts.unrepairable_segments = parallel_count(left.size(), [&](size_t k) {
+            const Segment& g = segs_[left[k]];
+            for (uint32_t i = g.from + 1; i < g.to; i++)
+                if (!keep_.test(g.arc, i)) return false;
+            return true;
+        }, threads_);
+        counts.rings_nest_introduced = not_nesting(candidates_).size();
+        free_grid();
+    }
+
+    void count_vertices(ArcTierCounts& counts) const {
+        std::vector<size_t> kept(arc_count_), stored(arc_count_);
+        std::vector<uint8_t> one_point(arc_count_);
+        parallel_for_dynamic(arc_count_, 256, [&](size_t begin, size_t end, unsigned) {
+            Scratch s;
+            for (size_t i = begin; i < end; i++) {
+                const uint32_t a = static_cast<uint32_t>(i);
+                set_.read(a, s.raw);
+                stored_vertices(s.raw, keep_, a, tier_, s.stored);
+                size_t k = 0;
+                for (uint32_t v = 0; v < s.raw.size(); v++) k += keep_.test(a, v);
+                kept[a] = k;
+                stored[a] = s.stored.size();
+                one_point[a] = s.stored.size() == 1;
+            }
+        }, threads_);
+        for (size_t a = 0; a < arc_count_; a++) {
+            counts.kept_vertices += kept[a];
+            counts.stored_vertices += stored[a];
+            counts.single_point_arcs += one_point[a];
+        }
+    }
+
+    ArcKeep take_keep() { return std::move(keep_); }
+
+private:
+    struct Conflict {
+        uint32_t s, t;
+        bool raw;
+    };
+
+    // The polygons of the set with holes whose exact rings nest, and the
+    // polygon of each of their rings.
+    void nesting_candidates(const std::vector<bool>& nests_exact) {
+        candidates_.clear();
+        polygon_of_.assign(store_.rings.size(), UINT32_MAX);
+        for (uint32_t p = 0; p < store_.polygons.size(); p++) {
+            const auto& poly = store_.polygons[p];
+            if (poly.ring_count < 2 || !nests_exact[p] || !set_.has_ring(poly.first_ring)) continue;
+            candidates_.push_back(p);
+            for (uint32_t r = 0; r < poly.ring_count; r++) polygon_of_[poly.first_ring + r] = p;
+        }
+    }
+
+    // Whether polygon p's stored rings nest (rings_nest), a degenerate ring
+    // left out (none at all for a degenerate outer ring).
+    bool stored_rings_nest(uint32_t p, Scratch& s) const {
+        const auto& poly = store_.polygons[p];
+        stored_ring(poly.first_ring, s);
+        if (!valid(s.ring)) return true;
+        const std::vector<LatLng> outer = lat_lng_ring(s.ring.data(), s.ring.size(), true);
+        std::vector<std::vector<LatLng>> holes;
+        for (uint32_t r = 1; r < poly.ring_count; r++) {
+            stored_ring(poly.first_ring + r, s);
+            if (valid(s.ring)) holes.push_back(lat_lng_ring(s.ring.data(), s.ring.size(), true));
+        }
+        return rings_nest(outer, holes);
+    }
+
+    // Those of `polygons` whose stored rings don't nest, in order; the
+    // largest checked first.
+    std::vector<uint32_t> not_nesting(const std::vector<uint32_t>& polygons) const {
+        const std::vector<uint32_t> by_cost = costliest_first(polygons.size(), [&](size_t k) {
+            const auto& poly = store_.polygons[polygons[k]];
+            const RingSpan& last = store_.rings[poly.first_ring + poly.ring_count - 1];
+            return float(last.begin + last.count - store_.rings[poly.first_ring].begin);
+        }, threads_);
+        std::vector<uint8_t> unnested(polygons.size(), 0);
+        std::vector<Scratch> scratch(threads_);
+        parallel_for_dynamic(polygons.size(), 1, [&](size_t begin, size_t end, unsigned worker) {
+            for (size_t k = begin; k < end; k++) unnested[by_cost[k]] = !stored_rings_nest(polygons[by_cost[k]], scratch[worker]);
+        }, threads_);
+        std::vector<uint32_t> out;
+        for (size_t k = 0; k < polygons.size(); k++)
+            if (unnested[k]) out.push_back(polygons[k]);
+        return out;
+    }
+
+    // Gives back, for each polygon of `unnested`, the farthest dropped vertex
+    // of every stored segment of one ring whose raw span's box holds a stored
+    // vertex of another ring (one not on an arc the first ring uses): a ring
+    // simplified across another without crossing it. Returns the arcs it
+    // changed.
+    std::vector<uint32_t> restore_unnested(const std::vector<uint32_t>& unnested, ArcTierCounts& counts) {
+        std::vector<std::vector<std::pair<uint32_t, uint32_t>>> back(unnested.size());
+        parallel_for_dynamic(unnested.size(), 1, [&](size_t begin, size_t end, unsigned) {
+            Scratch s;
+            struct Point {
+                PackedLocation at;
+                uint32_t ring, arc;
+            };
+            for (size_t k = begin; k < end; k++) {
+                const auto& poly = store_.polygons[unnested[k]];
+                std::vector<Point> points;
+                std::vector<std::vector<uint32_t>> ring_arcs(poly.ring_count);
+                for (uint32_t r = 0; r < poly.ring_count; r++)
+                    for (uint32_t i = set_.ring_refs()[poly.first_ring + r]; i < set_.ring_refs()[poly.first_ring + r + 1]; i++) {
+                        const uint32_t a = set_.refs()[i].arc;
+                        ring_arcs[r].push_back(a);
+                        set_.read(a, s.raw);
+                        stored_vertices(s.raw, keep_, a, tier_, s.stored);
+                        for (const StoredVertex& v : s.stored) points.push_back({v.at, r, a});
+                    }
+                for (auto& arcs_of : ring_arcs) std::sort(arcs_of.begin(), arcs_of.end());
+                std::sort(points.begin(), points.end(), [](const Point& x, const Point& y) {
+                    return x.at.lon_e7 < y.at.lon_e7;
+                });
+                for (uint32_t r = 0; r < poly.ring_count; r++)
+                    for (uint32_t a : ring_arcs[r]) {
+                        set_.read(a, s.raw);
+                        stored_vertices(s.raw, keep_, a, tier_, s.stored);
+                        degrees_of(s.raw, s.pts);
+                        for (size_t j = 1; j < s.stored.size(); j++) {
+                            const uint32_t from = s.stored[j - 1].raw, to = s.stored[j].raw;
+                            if (to <= from + 1) continue;
+                            Box span;
+                            for (uint32_t i = from; i <= to; i++) span.add(s.raw[i]);
+                            auto it = std::lower_bound(points.begin(), points.end(), span.lng_lo,
+                                                       [](const Point& x, int32_t lng) { return x.at.lon_e7 < lng; });
+                            bool holds = false;
+                            for (; it != points.end() && it->at.lon_e7 <= span.lng_hi && !holds; ++it)
+                                holds = it->ring != r && it->at.lat_e7 >= span.lat_lo && it->at.lat_e7 <= span.lat_hi &&
+                                        !std::binary_search(ring_arcs[r].begin(), ring_arcs[r].end(), it->arc);
+                            if (!holds) continue;
+                            const Farthest f = farthest_dropped(s.pts, keep_, a, from, to);
+                            if (f.distance >= 0) back[k].push_back({a, f.at});
+                        }
+                    }
+            }
+        }, threads_);
+        std::vector<uint32_t> changed;
+        for (const auto& polygon_back : back)
+            for (const auto& [a, at] : polygon_back) {
+                if (keep_.test(a, at)) continue;
+                keep_.set(a, at);
+                counts.nesting_restored++;
+                changed.push_back(a);
+            }
+        sort_unique(changed, threads_);
+        return changed;
+    }
+
+    // Ring r as the tier stores it, into s.ring: its arcs' stored vertices
+    // chained, each vertex once where its neighbour repeats it, without the
+    // closing one.
+    void stored_ring(uint32_t r, Scratch& s) const {
+        s.ring.clear();
+        for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) {
+            const ArcRef ref = set_.refs()[k];
+            set_.read(ref.arc, s.raw);
+            stored_vertices(s.raw, keep_, ref.arc, tier_, s.stored);
+            const size_t n = s.stored.size();
+            for (size_t i = 0; i < n; i++) {
+                const PackedLocation p = s.stored[ref.reversed ? n - 1 - i : i].at;
+                if (s.ring.empty() || s.ring.back() != p) s.ring.push_back(p);
+            }
+        }
+        if (s.ring.size() >= 2 && s.ring.front() == s.ring.back()) s.ring.pop_back();
+    }
+    static bool valid(const std::vector<PackedLocation>& ring) {
+        return ring.size() >= 3 && exact_ring_area2(ring.data(), static_cast<uint32_t>(ring.size())) != 0;
+    }
+    bool stored_ring_valid(uint32_t r, Scratch& s) const {
+        stored_ring(r, s);
+        return valid(s.ring);
+    }
+
+    void add_segments(uint32_t a, Scratch& s, std::vector<Segment>& out) const {
+        set_.read(a, s.raw);
+        stored_vertices(s.raw, keep_, a, tier_, s.stored);
+        for (size_t k = 1; k < s.stored.size(); k++)
+            out.push_back({a, s.stored[k - 1].raw, s.stored[k].raw, s.stored[k - 1].at, s.stored[k].at});
+    }
+
+    // The grid entries of segments [first, end), sorted.
+    std::vector<uint64_t> cells_from(uint32_t first) const {
+        std::vector<uint64_t> cells = collect_in_order<uint64_t, Scratch>(segs_.size() - first,
+            [&](size_t k, std::vector<uint64_t>& out, Scratch&) {
+                const uint32_t s = first + static_cast<uint32_t>(k);
+                cells_of(segs_[s].a, segs_[s].b, [&](uint32_t cell) { out.push_back(cell_entry(cell, s)); });
+            }, threads_);
+        parallel_sort(cells.begin(), cells.end(), std::less<uint64_t>(), threads_);
+        return cells;
+    }
+
+    // Every pair of live segments meeting in a cell of the base grid, each
+    // cell swept by longitude.
+    std::vector<std::pair<uint32_t, uint32_t>> meetings_in_cells() const {
+        std::vector<size_t> runs;
+        for (size_t i = 0; i < base_cells_.size(); i++)
+            if (i == 0 || entry_cell(base_cells_[i]) != entry_cell(base_cells_[i - 1])) runs.push_back(i);
+        runs.push_back(base_cells_.size());
+        std::vector<std::vector<std::pair<uint32_t, uint32_t>>> found(threads_);
+        parallel_for_dynamic(runs.size() - 1, 16, [&](size_t begin, size_t end, unsigned worker) {
+            struct Item {
+                int32_t lng_lo, lng_hi;
+                uint32_t s;
+            };
+            std::vector<Item> items;
+            for (size_t run = begin; run < end; run++) {
+                items.clear();
+                for (size_t i = runs[run]; i < runs[run + 1]; i++) {
+                    const uint32_t s = entry_segment(base_cells_[i]);
+                    if (!alive_[s]) continue;
+                    const Segment& g = segs_[s];
+                    items.push_back({std::min(g.a.lon_e7, g.b.lon_e7), std::max(g.a.lon_e7, g.b.lon_e7), s});
+                }
+                std::sort(items.begin(), items.end(), [](const Item& x, const Item& y) {
+                    return x.lng_lo != y.lng_lo ? x.lng_lo < y.lng_lo : x.s < y.s;
+                });
+                for (size_t i = 0; i < items.size(); i++)
+                    for (size_t j = i + 1; j < items.size() && items[j].lng_lo <= items[i].lng_hi; j++)
+                        if (segments_conflict(segs_[items[i].s], segs_[items[j].s]))
+                            found[worker].push_back(std::minmax(items[i].s, items[j].s));
+            }
+        }, threads_);
+        return joined(found);
+    }
+
+    // Every pair of live segments meeting that has a segment from `first` on.
+    std::vector<std::pair<uint32_t, uint32_t>> meetings_of(uint32_t first) const {
+        std::vector<std::vector<std::pair<uint32_t, uint32_t>>> found(threads_);
+        parallel_for_dynamic(segs_.size() - first, 16, [&](size_t begin, size_t end, unsigned worker) {
+            for (size_t k = begin; k < end; k++) {
+                const uint32_t s = first + static_cast<uint32_t>(k);
+                if (!alive_[s]) continue;
+                cells_of(segs_[s].a, segs_[s].b, [&](uint32_t cell) {
+                    for (const std::vector<uint64_t>* cells : {&base_cells_, &overlay_cells_}) {
+                        auto it = std::lower_bound(cells->begin(), cells->end(), cell_entry(cell, 0));
+                        for (; it != cells->end() && entry_cell(*it) == cell; ++it) {
+                            const uint32_t t = entry_segment(*it);
+                            if (t == s || !alive_[t] || (t >= first && t < s)) continue;
+                            if (segments_conflict(segs_[s], segs_[t])) found[worker].push_back(std::minmax(s, t));
+                        }
+                    }
+                });
+            }
+        }, threads_);
+        return joined(found);
+    }
+
+    std::vector<std::pair<uint32_t, uint32_t>> joined(std::vector<std::vector<std::pair<uint32_t, uint32_t>>>& found) const {
+        std::vector<std::pair<uint32_t, uint32_t>> all;
+        for (auto& f : found) {
+            all.insert(all.end(), f.begin(), f.end());
+            free_storage(f);
+        }
+        sort_unique(all, threads_);
+        return all;
+    }
+
+    // Whether two segments' raw spans already meet: the crossing is in the
+    // data, not made by simplifying.
+    bool raw_spans_meet(const Segment& p, const Segment& q, Scratch& s) const {
+        set_.read(p.arc, s.raw, p.from, p.to);
+        set_.read(q.arc, s.other, q.from, q.to);
+        Box bp, bq;
+        for (const PackedLocation& v : s.raw) bp.add(v);
+        for (const PackedLocation& v : s.other) bq.add(v);
+        auto edges_over = [](const std::vector<PackedLocation>& v, const Box& box) {
+            std::vector<uint32_t> out;
+            for (uint32_t i = 0; i + 1 < v.size(); i++)
+                if (box_of(v[i], v[i + 1]).overlaps(box)) out.push_back(i);
+            return out;
+        };
+        const std::vector<uint32_t> ep = edges_over(s.raw, bq), eq = edges_over(s.other, bp);
+        if (uint64_t(ep.size()) * eq.size() > kRawSpanPairsMax) return false;
+        for (uint32_t i : ep)
+            for (uint32_t j : eq) {
+                if (p.arc == q.arc) {
+                    const uint32_t gi = p.from + i, gj = q.from + j;
+                    if (gi == gj || gi + 1 == gj || gj + 1 == gi) continue;
+                }
+                const PackedLocation a = s.raw[i], b = s.raw[i + 1], c = s.other[j], d = s.other[j + 1];
+                if (box_of(a, b).overlaps(box_of(c, d)) && segments_meet(a, b, c, d)) return true;
+            }
+        return false;
+    }
+
+    void add_conflicts(const std::vector<std::pair<uint32_t, uint32_t>>& pairs) {
+        std::vector<uint8_t> raw(pairs.size(), 0);
+        parallel_for_dynamic(pairs.size(), 16, [&](size_t begin, size_t end, unsigned) {
+            Scratch s;
+            for (size_t k = begin; k < end; k++) raw[k] = raw_spans_meet(segs_[pairs[k].first], segs_[pairs[k].second], s);
+        }, threads_);
+        for (size_t k = 0; k < pairs.size(); k++) conflicts_.push_back({pairs[k].first, pairs[k].second, raw[k] != 0});
+    }
+
+    // Gives each span in a live crossing simplification made the farthest of
+    // its dropped vertices; returns the arcs it changed.
+    std::vector<uint32_t> restore_crossed_spans(ArcTierCounts& counts) {
+        std::vector<uint32_t> spans;
+        for (const Conflict& c : conflicts_)
+            if (!c.raw && alive_[c.s] && alive_[c.t]) {
+                spans.push_back(c.s);
+                spans.push_back(c.t);
+            }
+        sort_unique(spans, threads_);
+        std::sort(spans.begin(), spans.end(), [&](uint32_t x, uint32_t y) {
+            return segs_[x].arc != segs_[y].arc ? segs_[x].arc < segs_[y].arc : segs_[x].from < segs_[y].from;
+        });
+        std::vector<size_t> arc_runs;
+        for (size_t k = 0; k < spans.size(); k++)
+            if (k == 0 || segs_[spans[k]].arc != segs_[spans[k - 1]].arc) arc_runs.push_back(k);
+        arc_runs.push_back(spans.size());
+        std::vector<size_t> restored(arc_runs.size() - 1, 0);
+        parallel_for_dynamic(arc_runs.size() - 1, 4, [&](size_t begin, size_t end, unsigned) {
+            Scratch s;
+            for (size_t run = begin; run < end; run++) {
+                const uint32_t a = segs_[spans[arc_runs[run]]].arc;
+                set_.read(a, s.raw);
+                degrees_of(s.raw, s.pts);
+                for (size_t k = arc_runs[run]; k < arc_runs[run + 1]; k++) {
+                    const Segment& g = segs_[spans[k]];
+                    const Farthest f = farthest_dropped(s.pts, keep_, a, g.from, g.to);
+                    if (f.distance < 0) continue;
+                    keep_.set(a, f.at);
+                    restored[run]++;
+                }
+            }
+        }, threads_);
+        std::vector<uint32_t> dirty;
+        for (size_t run = 0; run + 1 < arc_runs.size(); run++) {
+            counts.repair_restored += restored[run];
+            if (restored[run]) dirty.push_back(segs_[spans[arc_runs[run]]].arc);
+        }
+        return dirty;
+    }
+
+    // Re-lays the segments of arcs `dirty` (sorted): a segment that stays
+    // keeps its number, one that goes dies, and a new one is laid in the
+    // overlay. Returns the first new number.
+    uint32_t update(const std::vector<uint32_t>& dirty) {
+        std::vector<std::vector<Segment>> now(dirty.size());
+        parallel_for_dynamic(dirty.size(), 4, [&](size_t begin, size_t end, unsigned) {
+            Scratch s;
+            for (size_t d = begin; d < end; d++) add_segments(dirty[d], s, now[d]);
+        }, threads_);
+        const uint32_t first = static_cast<uint32_t>(segs_.size());
+        for (size_t d = 0; d < dirty.size(); d++) {
+            const uint32_t a = dirty[d];
+            std::vector<uint32_t> was;
+            if (auto it = rebuilt_.find(a); it != rebuilt_.end()) was = std::move(it->second);
+            else
+                for (uint32_t s = base_at_[a]; s < base_at_[a + 1]; s++) was.push_back(s);
+            std::vector<uint32_t> live;
+            size_t i = 0;
+            for (const Segment& g : now[d]) {
+                while (i < was.size() && segs_[was[i]].from < g.from) alive_[was[i++]] = 0;
+                if (i < was.size() && segs_[was[i]].from == g.from && segs_[was[i]].to == g.to) {
+                    live.push_back(was[i++]);
+                    continue;
+                }
+                live.push_back(static_cast<uint32_t>(segs_.size()));
+                segs_.push_back(g);
+                alive_.push_back(1);
+            }
+            for (; i < was.size(); i++) alive_[was[i]] = 0;
+            rebuilt_[a] = std::move(live);
+        }
+        if (segs_.size() >= UINT32_MAX) throw std::length_error("arc tier segments past 2^32");
+        const std::vector<uint64_t> fresh = cells_from(first);
+        std::vector<uint64_t> merged(overlay_cells_.size() + fresh.size());
+        std::merge(overlay_cells_.begin(), overlay_cells_.end(), fresh.begin(), fresh.end(), merged.begin());
+        overlay_cells_ = std::move(merged);
+        return first;
+    }
+
+    // Hands the grid's storage back before count_vertices takes its own:
+    // `= {}` would clear the containers and keep it all.
+    void free_grid() {
+        free_storage(segs_);
+        free_storage(alive_);
+        free_storage(base_at_);
+        free_storage(base_cells_);
+        free_storage(overlay_cells_);
+        free_storage(rebuilt_);
+        free_storage(conflicts_);
+    }
+
+    const AdminExactRings& store_;
+    SetArcs set_;
+    const ArcTier& tier_;
+    unsigned threads_;
+    size_t arc_count_;
+    ArcKeep keep_;
+    std::vector<uint32_t> rings_;  // the set's
+    std::vector<uint32_t> user_at_, users_;  // arc a's rings: users_[user_at_[a], user_at_[a + 1])
+    std::vector<uint32_t> candidates_;  // nesting_candidates
+    std::vector<uint32_t> polygon_of_;  // a candidate's rings' polygon, by ring
+
+    std::vector<Segment> segs_;
+    std::vector<uint8_t> alive_;
+    std::vector<uint32_t> base_at_;  // arc a's segments as first laid: [base_at_[a], base_at_[a + 1])
+    std::unordered_map<uint32_t, std::vector<uint32_t>> rebuilt_;  // an arc re-laid: its live segments
+    std::vector<uint64_t> base_cells_, overlay_cells_;  // cell_entry, sorted
+    std::vector<Conflict> conflicts_;
+};
+
+}  // namespace
+
+std::vector<bool> exact_rings_nest(const AdminExactRings& store, unsigned threads) {
+    if (threads == 0) threads = parallel_threads();
+    const size_t n = store.polygons.size();
+    std::vector<uint8_t> nests(n, 1);
+    const std::vector<uint32_t> by_cost = costliest_first(n, [&](size_t p) {
+        const auto& poly = store.polygons[p];
+        if (poly.ring_count < 2) return 0.0f;
+        float vertices = 0;
+        for (uint32_t r = 0; r < poly.ring_count; r++) vertices += float(store.rings[poly.first_ring + r].count);
+        return vertices;
+    }, threads);
+    parallel_for_dynamic(n, 1, [&](size_t begin, size_t end, unsigned) {
+        for (size_t k = begin; k < end; k++) {
+            const auto& poly = store.polygons[by_cost[k]];
+            if (poly.ring_count < 2) continue;
+            auto ring = [&](uint32_t r) {
+                const RingSpan& span = store.rings[poly.first_ring + r];
+                return lat_lng_ring(store.vertices.data() + span.begin, span.count, false);
+            };
+            std::vector<std::vector<LatLng>> holes;
+            for (uint32_t r = 1; r < poly.ring_count; r++) holes.push_back(ring(r));
+            nests[by_cost[k]] = rings_nest(ring(0), holes);
+        }
+    }, threads);
+    return std::vector<bool>(nests.begin(), nests.end());
+}
+
+ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
+                            const std::vector<bool>& nests_exact, unsigned threads,
+                            const std::function<void(const char*)>& phase_done) {
+    auto done = [&](const char* step) {
+        if (phase_done) phase_done(step);
+    };
+    if (threads == 0) threads = parallel_threads();
+    if (nests_exact.size() != store.polygons.size())
+        throw std::logic_error("exact nesting marks out of step with the polygons");
+    ArcTierState state;
+    if (!tier.simplifies()) {
+        const SetArcs set(arcs, store, tier.set);
+        state.counts.kept_vertices = state.counts.stored_vertices =
+            parallel_sum<size_t>(set.size(), [&](size_t a) { return size_t(set.count(static_cast<uint32_t>(a))); }, threads);
+        state.counts.single_point_arcs = parallel_count(set.size(), [&](size_t a) {
+            bool one = true;
+            set.with(static_cast<uint32_t>(a), [&](const auto& v) {
+                for (uint32_t i = 1; i < v.size() && one; i++) one = v[i] == v[0];
+            });
+            return one;
+        }, threads);
+        return state;
+    }
+    TierBuilder builder(arcs, store, tier, threads);
+    builder.simplify();
+    done("simplify");
+    builder.restore_degenerate_rings(state.counts);
+    done("validity");
+    builder.build_grid();
+    done("segment grid");
+    builder.repair(nests_exact, state.counts);
+    done("repair");
+    builder.count_left(state.counts);
+    done("what is left");
+    builder.count_vertices(state.counts);
+    state.kept = builder.take_keep();
+    return state;
+}
+
+void tier_vertices(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
+                   const ArcTierState& state, uint32_t arc, std::vector<PackedLocation>& raw,
+                   std::vector<StoredVertex>& out) {
+    SetArcs(arcs, store, tier.set).read(arc, raw);
+    stored_vertices(raw, state.kept, arc, tier, out);
+}
+
+void tier_vertices(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
+                   const ArcTierState& state, uint32_t arc, std::vector<StoredVertex>& out) {
+    std::vector<PackedLocation> raw;
+    tier_vertices(arcs, store, tier, state, arc, raw, out);
+}

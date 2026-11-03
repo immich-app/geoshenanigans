@@ -78,6 +78,9 @@ add_executable(build-index
     src/build_index.cpp
     src/pbf_reader.cpp
     src/s2_helpers.cpp
+    src/admin_arcs.cpp
+    src/admin_arc_blocks.cpp
+    src/admin_arc_tiers.cpp
     src/admin_cover.cpp
     src/admin_links.cpp
     src/ring_assembly.cpp
@@ -195,6 +198,9 @@ enable_testing()
 file(GLOB GEOCODER_TEST_SRCS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tests/*.cpp")
 add_executable(geocoder-tests
     ${GEOCODER_TEST_SRCS}
+    src/admin_arcs.cpp
+    src/admin_arc_blocks.cpp
+    src/admin_arc_tiers.cpp
     src/ring_assembly.cpp
     src/interpolation.cpp
     src/pbf_reader.cpp
@@ -229,14 +235,20 @@ file(GLOB GEOCODER_S2_TEST_SRCS CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/t
 add_executable(geocoder-s2-tests
     tests/test_main.cpp
     ${GEOCODER_S2_TEST_SRCS}
+    src/admin_arcs.cpp
+    src/admin_arc_blocks.cpp
+    src/admin_arc_tiers.cpp
     src/admin_cover.cpp
     src/admin_links.cpp
     src/cell_index.cpp
     src/s2_helpers.cpp
 )
-target_include_directories(geocoder-s2-tests PRIVATE src tests)
+target_include_directories(geocoder-s2-tests PRIVATE src tools tests)
+# tests/s2/test_arc_dirs_opt_in.cpp runs build-index on a PBF it writes.
+target_compile_definitions(geocoder-s2-tests PRIVATE GEOCODER_BUILD_INDEX_BIN="$<TARGET_FILE:build-index>")
+add_dependencies(geocoder-s2-tests build-index)
 geocoder_link_s2(geocoder-s2-tests)
-target_link_libraries(geocoder-s2-tests PRIVATE Threads::Threads)
+target_link_libraries(geocoder-s2-tests PRIVATE ZLIB::ZLIB libdeflate::libdeflate Threads::Threads)
 add_test(NAME geocoder-s2-tests COMMAND geocoder-s2-tests)
 
 # GEOCODER_SANITIZE=ON builds the unit tests and the tools they run with ASan
