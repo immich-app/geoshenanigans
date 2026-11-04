@@ -7,6 +7,13 @@ variable "storage_prefix" {
   type = string
 }
 
+# How long the gateway waits for the cache's answer to a tile GET before also reading the tile itself, in milliseconds;
+# a negative value turns that race off.
+variable "race_ms" {
+  type    = number
+  default = 120
+}
+
 variable "tiles_build_dir" {}
 variable "vmetrics_api_token" {}
 variable "env" {}
