@@ -32,3 +32,6 @@ ENVIRONMENT = "production"
 # deployed tiles-dev origin; for `npm run dev`, set PUBLIC_URL=http://localhost:8787 in .dev.vars (gitignored), which
 # wrangler applies locally only.
 PUBLIC_URL = "https://tiles.dev.immich.cloud"
+# How long the gateway waits for the cache's answer to a tile GET before also reading the tile itself, in milliseconds;
+# a negative value turns that race off. Keep in step with race_ms in deployment/modules/cloudflare/tiles-worker.
+RACE_MS = "120"

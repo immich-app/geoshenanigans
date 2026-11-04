@@ -1,5 +1,5 @@
 import { handleD1ProxyRequest } from './d1-proxy';
-import { IMetricsRepository } from './interface';
+import { IDeferredRepository, IMetricsRepository } from './interface';
 import {
   CloudflareDeferredRepository,
   CloudflareMetricsRepository,
@@ -18,6 +18,7 @@ import {
   PMTilesStyleParams,
   PMTilesTileParams,
 } from './request';
+import { serveInner } from './tiles';
 
 export { parseUrl } from './request';
 export { Tiles } from './tiles';
@@ -36,6 +37,22 @@ const ALLOWED_METHODS = 'GET, HEAD, OPTIONS';
 // Cache statuses of a response the cache answered from a stored copy, without running Tiles for this request.
 // Requests that waited for another request's fill count as HIT too.
 const FROM_CACHE = new Set(['hit', 'stale', 'updating']);
+
+// How long the gateway waits for the cache's answer to a tile GET before also reading the tile itself (see raceTile),
+// unless RACE_MS says otherwise.
+const RACE_MS = 120;
+
+/**
+ * What answered a tile GET the gateway could race: the cache, before the race began ("none") or in it ("tier"), or the
+ * gateway's own read ("local").
+ */
+export type Race = 'none' | 'tier' | 'local';
+
+/** RACE_MS in milliseconds: 120 when unset, undefined (no race) when it is negative or not a number. */
+export function raceDelay(value: string | undefined): number | undefined {
+  const ms = value === undefined || value.trim() === '' ? RACE_MS : Number(value);
+  return Number.isFinite(ms) && ms >= 0 ? ms : undefined;
+}
 
 export type CachePolicy = { cacheControl: string; etag?: string };
 
@@ -72,12 +89,25 @@ export function etagMatches(ifNoneMatch: string | null, etag: string): boolean {
   return (ifNoneMatch ?? '').split(',').some((tag) => tag.trim().replace(/^W\//, '') === etag);
 }
 
+/** Whether an Accept-Encoding header takes gzip, which tiles are stored in ("*" is left to the cache). */
+export function acceptsGzip(acceptEncoding: string | null): boolean {
+  return (acceptEncoding ?? '').split(',').some((coding) => {
+    const [name, ...params] = coding.split(';').map((part) => part.trim().toLowerCase());
+    return name === 'gzip' && !params.some((param) => /^q=0(\.0*)?$/.test(param));
+  });
+}
+
 /** The cache_status metric tag: Cf-Cache-Status in lower case, "none" when the cache wasn't involved. */
 export function cacheStatus(response: Response): string {
   return response.headers.get(Header.CF_CACHE_STATUS)?.toLowerCase() ?? 'none';
 }
 
 const cacheStatusTags = (response: Response) => ({ cache_status: cacheStatus(response) });
+// The client's response: its cache status and, for a tile GET, what answered it.
+const responseTags = (response: Response) => ({
+  ...cacheStatusTags(response),
+  race: response.headers.get(Header.RACE) ?? 'none',
+});
 
 /**
  * The gateway: runs on every request, uncached, at the colo the client reached. It asks the cached Tiles entrypoint
@@ -90,6 +120,7 @@ async function handleRequest(
   ctx: ExecutionContext,
   metrics: IMetricsRepository,
   tags: { [key: string]: string },
+  deferred: IDeferredRepository,
 ): Promise<Response> {
   const respHeaders = new Headers();
   respHeaders.set(Header.ACCESS_CONTROL_ALLOW_ORIGIN, '*');
@@ -130,27 +161,62 @@ async function handleRequest(
       [Header.ACCEPT_ENCODING]: request.headers.get(Header.ACCEPT_ENCODING) ?? '',
     },
   });
-  const response = await metrics.monitorAsyncFunction(
-    { name: 'cache_fetch', tags: { request_type: requestType } },
-    (inner: Request) => ctx.exports.Tiles.fetch(inner),
-    { resultTags: cacheStatusTags },
-  )(innerRequest);
-
-  const status = cacheStatus(response);
-  if (FROM_CACHE.has(status)) {
-    // Tiles reports its own runs (tiles_<type>_request_*), so together they count every request.
-    const metric = Metric.create('tiles_cdn_hit')
-      .addTag('deployment_key', env.DEPLOYMENT_KEY)
-      .addTag('request_type', requestType)
-      .addTag('cache_status', status)
-      .intField('count', 1);
-    if (pmTilesParams.requestType === 'tile') {
-      metric.addTag('z', (pmTilesParams as PMTilesTileParams).z).addTag('url', metricTags.url);
-    } else if (pmTilesParams.requestType === 'style') {
-      metric.addTag('style', (pmTilesParams as PMTilesStyleParams).style);
+  // The cache's answer, timed as it comes. Its metrics are tagged with what answered the client, so they are pushed once
+  // that is known (reportTier).
+  const cacheFetch = Metric.create('tiles_cache_fetch').addTag('request_type', requestType).intField('invocation', 1);
+  const tier = ctx.exports.Tiles.fetch(innerRequest).then(
+    (response) => {
+      cacheFetch.durationField('duration').addTags(cacheStatusTags(response));
+      return response;
+    },
+    (error) => {
+      console.error(error, 'cache_fetch_errors');
+      cacheFetch.durationField('duration').intField('errors', 1);
+      throw error;
+    },
+  );
+  const reportTier = async (race: Race) => {
+    const answer = await tier.catch(() => undefined);
+    metrics.push(cacheFetch.addTag('race', race));
+    const status = answer ? cacheStatus(answer) : 'none';
+    if (FROM_CACHE.has(status)) {
+      // Tiles reports its own runs (tiles_<type>_request_*), so together they count every request. A stored copy counts
+      // even when the gateway's own read answered first, as Tiles didn't run for it.
+      const metric = Metric.create('tiles_cdn_hit')
+        .addTag('deployment_key', env.DEPLOYMENT_KEY)
+        .addTag('request_type', requestType)
+        .addTag('cache_status', status)
+        .addTag('race', race)
+        .intField('count', 1);
+      if (pmTilesParams.requestType === 'tile') {
+        metric.addTag('z', (pmTilesParams as PMTilesTileParams).z).addTag('url', metricTags.url);
+      } else if (pmTilesParams.requestType === 'style') {
+        metric.addTag('style', (pmTilesParams as PMTilesStyleParams).style);
+      }
+      metrics.push(metric);
     }
-    metrics.push(metric);
+  };
+
+  // A tile GET whose cached answer is late is also read here; never TileJSON, styles or HEAD, nor for a client that
+  // doesn't take gzip, which a tile read here is in. Workers get Accept-Encoding as "br, gzip" whatever the client sent;
+  // cf has what it did send when that differs.
+  const clientEncoding = request.cf?.clientAcceptEncoding ?? request.headers.get(Header.ACCEPT_ENCODING);
+  const raceMs =
+    pmTilesParams.requestType === 'tile' && !head && acceptsGzip(clientEncoding) ? raceDelay(env.RACE_MS) : undefined;
+  const { race, answer } =
+    raceMs === undefined
+      ? { race: 'none' as Race, answer: tier }
+      : await raceTile(tier, innerRequest, request, env, metrics.scoped('tiles_local', metricTags), deferred, raceMs);
+  if (raceMs !== undefined) {
+    respHeaders.set(Header.RACE, race);
   }
+  if (race === 'local') {
+    // The cache answers after the response is out; the metrics are sent once it has.
+    deferred.waitFor(reportTier(race));
+  } else {
+    await reportTier(race);
+  }
+  const response = await answer;
 
   // Only the body and its type come from Tiles; the edge's own headers (Cache-Control, Age) would mislead clients.
   for (const name of [Header.CONTENT_TYPE, Header.CONTENT_ENCODING]) {
@@ -165,7 +231,9 @@ async function handleRequest(
   // The response with Tiles' body, or for HEAD without it, though with the length it would have had.
   const reply = async (status: number) => {
     if (!head) {
-      return new Response(response.body, { headers: respHeaders, status });
+      // A tile read here is as stored, gzipped, which the client takes; the cache's answer is encoded for the client.
+      const encodeBody = race === 'local' ? 'manual' : 'automatic';
+      return new Response(response.body, { headers: respHeaders, status, encodeBody });
     }
     await response.body?.cancel();
     const length = response.headers.get(Header.CONTENT_LENGTH);
@@ -201,6 +269,74 @@ async function handleRequest(
   return reply(200);
 }
 
+/**
+ * A tile GET's answer: the cache's, unless that takes longer than raceMs. Then the gateway also runs Tiles' miss path
+ * itself (serveInner: its D1 lookup and Tigris read, from this colo) and serves whichever finds the tile first; the
+ * cache's answer stands if neither does, a failure included. A cached answer that loses is read to its end in the
+ * background, so its fill completes; a local one is cancelled. Never rejects: a failure is in the answer.
+ */
+async function raceTile(
+  tier: Promise<Response>,
+  innerRequest: Request,
+  request: Request<unknown, IncomingRequestCfProperties>,
+  env: WorkerEnv,
+  localMetrics: IMetricsRepository,
+  deferred: IDeferredRepository,
+  raceMs: number,
+): Promise<{ race: Race; answer: Promise<Response> }> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => resolve(undefined), raceMs);
+  });
+  try {
+    if (await Promise.race([tier, late])) {
+      return { race: 'none', answer: tier };
+    }
+  } catch {
+    // The cache failed before the race began, which fails the request as it would without the race.
+    return { race: 'none', answer: tier };
+  } finally {
+    clearTimeout(timer);
+  }
+
+  // Tiles' inner request, with a Cf-Ray naming this colo, which Tiles tags its D1 metrics with.
+  const headers = new Headers(innerRequest.headers);
+  headers.set(Header.CF_RAY, `${request.headers.get(Header.CF_RAY) ?? 'gateway'}-${request.cf?.colo ?? ''}`);
+  const local = serveInner(new Request(innerRequest.url, { headers }), env, localMetrics);
+  // Its metrics are pushed when it answers, which may be after the response is out.
+  deferred.waitFor(local);
+
+  // Only a 200 wins: a 404 or a failure on one side waits for the other.
+  try {
+    const winner = await Promise.any([
+      tier.then((response) => {
+        if (response.status !== 200) {
+          throw new Error(`Tiles answered ${response.status}`);
+        }
+        return { race: 'tier' as Race, response };
+      }),
+      local.then(async (response) => {
+        if (response.status !== 200) {
+          await response.body?.cancel();
+          throw new Error(`The local read answered ${response.status}`);
+        }
+        return { race: 'local' as Race, response };
+      }),
+    ]);
+    deferred.runImmediately(
+      (winner.race === 'local'
+        ? // The cache's fill completes only if its answer is read to the end, so it is never cancelled.
+          tier.then((response) => response.body?.pipeTo(new WritableStream()))
+        : local.then((response) => response.body?.cancel())
+      ).catch(() => {}),
+    );
+    return { race: winner.race, answer: Promise.resolve(winner.response) };
+  } catch {
+    // Neither found the tile.
+    return { race: 'tier', answer: tier };
+  }
+}
+
 export default {
   async fetch(request, env, ctx): Promise<Response> {
     const workerEnv = env as WorkerEnv;
@@ -220,8 +356,8 @@ export default {
 
     try {
       const response = await metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest, {
-        resultTags: cacheStatusTags,
-      })(request, workerEnv, ctx, metrics, tags);
+        resultTags: responseTags,
+      })(request, workerEnv, ctx, metrics, tags, deferredRepository);
       response.headers.set(Header.SERVER_TIMING, headerProvider.getTimingHeader());
       return response;
     } catch (e) {

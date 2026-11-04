@@ -185,6 +185,7 @@ export class TigrisStorageRepository implements IStorageRepository {
 
 export class CloudflareDeferredRepository implements IDeferredRepository {
   deferred: AsyncFn[] = [];
+  private pending: Promise<unknown>[] = [];
   constructor(private ctx: ExecutionContext) {}
 
   defer(call: AsyncFn): void {
@@ -195,9 +196,14 @@ export class CloudflareDeferredRepository implements IDeferredRepository {
     this.ctx.waitUntil(promise);
   }
 
+  waitFor(promise: Promise<unknown>): void {
+    this.pending.push(promise);
+  }
+
   runDeferred() {
+    const settled = Promise.allSettled(this.pending);
     for (const call of this.deferred) {
-      this.ctx.waitUntil(call());
+      this.ctx.waitUntil(settled.then(() => call()));
     }
   }
 }
@@ -364,5 +370,9 @@ export class CloudflareMetricsRepository implements IMetricsRepository {
     for (const provider of this.metricsProviders) {
       provider.pushMetric(metric);
     }
+  }
+
+  scoped(operationPrefix: string, tags: { [key: string]: string }): CloudflareMetricsRepository {
+    return new CloudflareMetricsRepository(operationPrefix, { ...this.defaultTags, ...tags }, this.metricsProviders);
   }
 }

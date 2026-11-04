@@ -1,4 +1,4 @@
-interface WorkerEnv extends Omit<Env, 'ENVIRONMENT' | 'DEPLOYMENT_KEY' | 'PUBLIC_URL'> {
+interface WorkerEnv extends Omit<Env, 'ENVIRONMENT' | 'DEPLOYMENT_KEY' | 'PUBLIC_URL' | 'RACE_MS'> {
   ENVIRONMENT: string;
   DEPLOYMENT_KEY: string;
   // The worker's canonical origin (e.g. https://tiles.immich.cloud), which TileJSON and styles point clients at:
@@ -6,6 +6,9 @@ interface WorkerEnv extends Omit<Env, 'ENVIRONMENT' | 'DEPLOYMENT_KEY' | 'PUBLIC
   PUBLIC_URL: string;
   // Prepended to object keys in the tiles-geo bucket; unset in prod, "dev/" in dev.
   STORAGE_PREFIX?: string;
+  // How long the gateway waits for the cache's answer to a tile GET before also reading the tile itself, in
+  // milliseconds; 120 when unset, and a negative value turns that race off (see raceDelay).
+  RACE_MS?: string;
   VMETRICS_API_TOKEN: string;
   WORKER_TYPE: string | undefined;
   TIGRIS_KEY_ID: string;

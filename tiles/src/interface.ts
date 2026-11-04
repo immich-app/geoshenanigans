@@ -19,6 +19,8 @@ export interface IStorageRepository {
 export interface IDeferredRepository {
   defer(promise: AsyncFn): void;
   runImmediately(promise: Promise<unknown>): void;
+  // Holds the deferred calls back until the promise settles, e.g. for metrics pushed after the response is out.
+  waitFor(promise: Promise<unknown>): void;
   runDeferred(): void;
 }
 
@@ -39,6 +41,8 @@ export interface IMetricsRepository {
     options?: Options,
   ): (...args: Parameters<T>) => Promise<Awaited<ReturnType<T>>>;
   push(metric: Metric): void;
+  // The same providers and tags, plus more tags, under another operation prefix.
+  scoped(operationPrefix: string, tags: { [key: string]: string }): IMetricsRepository;
 }
 
 export interface IMetricsProviderRepository {

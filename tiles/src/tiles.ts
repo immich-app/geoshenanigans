@@ -83,7 +83,7 @@ export class Tiles extends WorkerEntrypoint<WorkerEnv> {
       [influxProvider],
     );
     try {
-      return await handleRequest(request, this.env, metrics);
+      return await serveInner(request, this.env, metrics);
     } finally {
       this.ctx.waitUntil(influxProvider.flush());
     }
@@ -101,7 +101,11 @@ export class Tiles extends WorkerEntrypoint<WorkerEnv> {
   }
 }
 
-async function handleRequest(request: Request, env: WorkerEnv, metrics: IMetricsRepository): Promise<Response> {
+/**
+ * Tiles' answer to an inner request, from D1 and Tigris: the miss path. The gateway runs it too, in its own colo, for a
+ * tile whose cached answer is late (see raceTile in index.ts).
+ */
+export async function serveInner(request: Request, env: WorkerEnv, metrics: IMetricsRepository): Promise<Response> {
   const { deploymentKey, params } = parseInnerUrl(request.url);
   // The gateway only asks for the deployment it serves; another key would fill the cache from data it doesn't name.
   if (params.requestType === undefined || deploymentKey !== env.DEPLOYMENT_KEY) {

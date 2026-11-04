@@ -63,6 +63,8 @@ export enum Header {
   // Tiles can see itself (request.cf is undefined there). Request headers aren't part of the cache key.
   CONTINENT = 'X-Continent',
   METRIC_TAGS = 'X-Metric-Tags',
+  // Set by the gateway on a tile GET it could race: what answered it (see Race in index.ts).
+  RACE = 'X-Race',
 }
 
 export function parseUrl(request: Request): PMTilesParams {

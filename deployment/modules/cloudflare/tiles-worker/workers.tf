@@ -22,6 +22,7 @@ resource "cloudflare_workers_script" "tiles" {
       { type = "plain_text", name = "DEPLOYMENT_KEY", text = var.pmtiles_deployment_key },
       { type = "plain_text", name = "ENVIRONMENT", text = var.env },
       { type = "plain_text", name = "PUBLIC_URL", text = "https://${local.hostnames[0]}" },
+      { type = "plain_text", name = "RACE_MS", text = tostring(var.race_ms) },
       { type = "secret_text", name = "VMETRICS_API_TOKEN", text = var.vmetrics_api_token },
       { type = "secret_text", name = "TIGRIS_KEY_ID", text = var.tigris_read_key_id },
       { type = "secret_text", name = "TIGRIS_ACCESS_KEY", text = var.tigris_read_access_key },
