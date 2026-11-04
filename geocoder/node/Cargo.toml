@@ -9,7 +9,7 @@ rust-version = "1.89"
 crate-type = ["cdylib"]
 
 [dependencies]
-napi = { version = "2", default-features = false, features = ["napi8"] }
+napi = { version = "3", default-features = false, features = ["napi8"] }
 napi-derive = "2"
 query-server = { path = "../server" }
 place-search = { path = "../search" }
