@@ -3330,6 +3330,38 @@ TEST(patch_identical_days_copy_the_admin_geometry_ahead_of_the_admin_cells) {
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
+// A dir without admin geometry (a POI dir), one POI edited and on identical
+// days: its patch holds no section of the four admin geometry files, not even
+// an empty merge (four section heads, 14 to 21 bytes of a central-america
+// identical-day patch), as the parent's held none. Every mode applies it.
+TEST(patch_dir_without_admin_geometry_sends_no_admin_geometry_section) {
+    ScratchDir dir("lowmem-no-arcs");
+    std::mt19937 rng(20261104);
+    const auto pois = pois_of(rng, 300, 0, true);
+    auto edited = pois;
+    std::fill(edited[100].block.begin() + 10, edited[100].block.end(), 0);
+    BuildDir old_d, new_d;
+    put_pois(old_d, pois);
+    put_pois(new_d, edited);
+    const std::pair<const char*, const BuildDir*> days[] = {{"edited", &new_d}, {"same", &old_d}};
+    for (const auto& [name, new_day] : days) {
+        const LowMemCase c{dir.path(), name};
+        REQUIRE(prepare(c, old_d, *new_day).empty());
+        const std::vector<char> raw = raw_patch(c);
+        REQUIRE(!raw.empty());
+        std::vector<std::string> empty_merges;
+        for (const AdminSlotFamily& family : ADMIN_SLOT_FAMILIES)
+            for (const auto& [fid, stride] : {std::pair{family.slots, family.stride}, std::pair{family.blocks, size_t{1}}}) {
+                const std::vector<char> head = section_head(fid, static_cast<uint32_t>(stride), 0, 0);
+                if (std::search(raw.begin(), raw.end(), head.begin(), head.end()) != raw.end())
+                    empty_merges.push_back(patch_file_names[uint32_t(fid)]);
+            }
+        for (const std::string& f : empty_merges) std::printf("    %s: an empty merge of %s\n", name, f.c_str());
+        CHECK(empty_merges.empty());
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    }
+}
+
 // arc_vertices.bin's every byte new, 1 MiB of it and 10 MiB (n arcs of a
 // KiB), over the same 100 polygons: its merge sends every block (head and
 // tail trimmed only where a byte happens to repeat), which the patcher writes

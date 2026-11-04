@@ -1513,7 +1513,7 @@ static int run(int argc, char* argv[]) {
     // them. A slot on both days is its old record (slot_family), its block
     // kept, edited (head and tail kept) or replaced; a birth or a recycled
     // slot's block is an INSERT, a death's a DELETE. A dir without them
-    // merges empty files, which the patcher writes nowhere it lists.
+    // merges empty files, which the serialization below leaves out.
     std::array<FileMergeResult, std::size(ADMIN_SLOT_FAMILIES)> res_slots, res_blocks;
     std::thread t_admin([&]() {
         double gs = now_ms();
@@ -1614,13 +1614,17 @@ static int run(int argc, char* argv[]) {
     { std::vector<char>().swap(res_poi_v.seq.data); }
     serialize_merge(patch, res_place_n, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     // The admin geometry, ahead of the admin cells: arc_index, arc_vertices,
-    // admin_polygons, admin_rings.
-    for (size_t f = 0; f < res_slots.size(); f++) {
-        serialize_merge(patch, res_slots[f], old_dir, new_dir, patcher_strings, offset_fixup_limits);
-        serialize_merge(patch, res_blocks[f], old_dir, new_dir, patcher_strings, offset_fixup_limits);
-        std::vector<char>().swap(res_slots[f].seq.data);
-        std::vector<char>().swap(res_blocks[f].seq.data);
-    }
+    // admin_polygons, admin_rings. A file the new dir lacks gets no section,
+    // as it got no full replacement (emit_raw): the patch lists no such
+    // client file, and a dir without admin geometry (full, poi, the mode
+    // dirs) carries no empty merge of the four.
+    for (size_t f = 0; f < res_slots.size(); f++)
+        for (FileMergeResult* r : {&res_slots[f], &res_blocks[f]}) {
+            struct stat st;
+            if (stat((new_dir + "/" + r->name).c_str(), &st) == 0)
+                serialize_merge(patch, *r, old_dir, new_dir, patcher_strings, offset_fixup_limits);
+            std::vector<char>().swap(r->seq.data);
+        }
     malloc_trim(0); // return freed heap to OS
     log_rss("serialize");
     double t0 = now_ms();
