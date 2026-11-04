@@ -584,6 +584,16 @@ TEST(a_previous_build_without_an_arc_sidecar_leaves_every_arc_slot_cold_and_says
           std::string::npos);
 }
 
+TEST(an_arc_sidecar_path_that_cant_be_looked_up_is_refused_not_taken_for_a_cold_start) {
+    const ScratchDir dir("admin-arc-looped-sidecar");
+    // Two links naming each other: looking the path up fails (ELOOP), which says nothing of whether the previous
+    // build had the sidecar.
+    std::filesystem::create_symlink(dir.path() + "/b", dir.path() + "/a");
+    std::filesystem::create_symlink(dir.path() + "/a", dir.path() + "/b");
+    CHECK(refusal_of([&] { allocate_arc_slots({1}, dir.path() + "/a"); }).find("unreadable arc sidecar") !=
+          std::string::npos);
+}
+
 TEST(a_repeated_keys_slot_that_no_arc_holds_is_a_tombstone_and_recycled_the_day_after) {
     using namespace gc::id_alloc;
     const ScratchDir dir("admin-arc-repeated-slots");
