@@ -6,7 +6,7 @@
 [tools]
 jq = "1.8.2"
 yq = "4.53.6"
-kustomize = "5.8.1"
+kustomize = "5.8.3"
 kubeconform = "0.8.0"
 flux2 = "2.9.5"
 # github backend: the aqua backend fails to verify cosign v3's sigstore bundles.
