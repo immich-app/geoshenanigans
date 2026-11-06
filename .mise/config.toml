@@ -1,7 +1,7 @@
 [tools]
 "1password-cli" = "2.39.0"
 opentofu = "1.13.1"
-rclone = "1.75.1"
+rclone = "1.75.2"
 terragrunt = "1.2.1"
 
 [tasks.tg]
