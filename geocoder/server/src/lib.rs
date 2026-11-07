@@ -1918,9 +1918,14 @@ impl Index {
         // uses only these, not admin boundaries with linked_place tags. Kept apart from
         // best_by_level[]. Stored as (poly_id, AdminPolygon) so we can dedup by id.
         let mut place_area_polygons: Vec<(u32, AdminPolygon)> = Vec::new();
+        // The boundaries to test, as (level, area, place in the list) in one integer: an area
+        // here is positive, so its bits order as it does, and the place orders equals.
+        let mut boundaries: Vec<u64> = Vec::with_capacity(scan.rings.len());
+        let mut place = 0u64;
 
         scan.for_each_entry(|pip, id, poly| {
             let poly_id = id & ID_MASK;
+            place += 1;
             if poly.admin_level == 15 {
                 if poly.area <= 0.0 { return; }
                 if !pip.holds(self, id, &poly) { return; }
@@ -1935,11 +1940,20 @@ impl Index {
             // boundary closed ways) can never name a country.
             if level == 2 && poly.country_code == 0 { return; }
             if poly.area <= 0.0 { return; }
-            if best_by_level[level].is_some_and(|best| poly.area >= best.area) { return; }
-            if pip.holds(self, id, &poly) {
-                best_by_level[level] = Some(poly);
-            }
+            boundaries.push((level as u64) << 56 | (poly.area.to_bits() as u64) << 24 | (place - 1));
         });
+        // Each level's polygons from the smallest up: the first to hold the point is the level's
+        // best, and the larger ones, which take the longest to test, are never read.
+        boundaries.sort_unstable();
+        for key in boundaries {
+            let level = (key >> 56) as usize;
+            if best_by_level[level].is_none() {
+                let (id, poly) = scan.rings[(key & 0xff_ffff) as usize];
+                if scan.pip.holds(self, id, &poly) {
+                    best_by_level[level] = Some(poly);
+                }
+            }
+        }
 
         let mut result = AdminResult::default();
 
@@ -6834,6 +6848,70 @@ mod admin_scan_tests {
             ring("Second", 4, 1.0, around_q, &[(0, false)]),
         ]);
         assert_eq!(idx.find_admin(Q.0, Q.1).state, Some("Second"));
+    }
+
+    #[test]
+    fn a_levels_larger_boundaries_are_not_read_once_a_smaller_one_holds_the_point() {
+        let around_q = (21.99, 27.5, 22.05, 27.6);
+        let wider = (21.9, 27.4, 22.1, 27.7);
+        let arcs_read = |rings: &[Ring]| {
+            let idx = admin_index(rings);
+            let mut scan = AdminScan::new(&idx, Q.0, Q.1);
+            let state = idx.find_admin_in(&mut scan).state.map(str::to_string);
+            (state, scan.pip.memo.arcs_read())
+        };
+        // Listed first, so visited first in a walk down the list.
+        let (state, read) = arcs_read(&[
+            ring("Large", 4, 5.0, wider, &[(0, false)]),
+            ring("Small", 4, 1.0, around_q, &[(0, false)]),
+        ]);
+        assert_eq!(state.as_deref(), Some("Small"));
+        assert_eq!((state, read), arcs_read(&[ring("Small", 4, 1.0, around_q, &[(0, false)])]));
+        // A smaller one that misses the point leaves the larger one to be read.
+        let elsewhere = (30.0, 27.5, 30.05, 27.6);
+        let (state, read) = arcs_read(&[
+            ring("Large", 4, 5.0, wider, &[(0, false)]),
+            ring("Small", 4, 1.0, elsewhere, &[(0, false)]),
+        ]);
+        assert_eq!(state.as_deref(), Some("Large"));
+        assert!(read > 0);
+    }
+
+    #[test]
+    fn a_levels_best_is_the_smallest_holding_the_point_the_first_listed_among_equals() {
+        // Every list of the point's boundaries, whatever order it visits them in: what a walk down
+        // the list keeping the smaller one finds is the answer.
+        const NAMES: [&str; 6] = ["A", "B", "C", "D", "E", "F"];
+        const LEVELS: [u8; 3] = [4, 6, 8];
+        let holds_q = (21.99, 27.5, 22.05, 27.6);
+        let misses_q = (30.0, 27.5, 30.05, 27.6);
+        let mut rng = crate::test_rng::Rng::new(20261107);
+        for case in 0..300 {
+            let rings: Vec<Ring> = (0..NAMES.len()).map(|i| {
+                let level = LEVELS[(rng.next() % 3) as usize];
+                let area = [0.5f32, 0.5, 1.0, 2.0, 3.0][(rng.next() % 5) as usize];
+                let (holds, interior) = match rng.next() % 4 { 0 => (false, false), 1 => (true, true), _ => (true, false) };
+                ring(NAMES[i], level, area, if holds { holds_q } else { misses_q }, &[(0, interior)])
+            }).collect();
+            let want = |level: u8| {
+                // The builder sorts each cell's entries by value: the interior flag's high bit
+                // puts those last.
+                let mut listed: Vec<&Ring> = rings.iter().collect();
+                listed.sort_by_key(|r| r.cells[0].1);
+                let mut best: Option<&Ring> = None;
+                for r in listed {
+                    if r.level == level && r.verts[0].0 == holds_q.0 && best.is_none_or(|b| r.area < b.area) {
+                        best = Some(r);
+                    }
+                }
+                best.map(|r| r.name)
+            };
+            let idx = admin_index(&rings);
+            let a = idx.find_admin(Q.0, Q.1);
+            assert_eq!(a.state, want(4), "case {case} state");
+            assert_eq!(a.county, want(6), "case {case} county");
+            assert_eq!(a.city, want(8), "case {case} city");
+        }
     }
 
     #[test]
