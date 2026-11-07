@@ -1005,6 +1005,14 @@ impl ScanPip {
     fn contains(&mut self, index: &Index, poly: &AdminPolygon) -> bool {
         index.admin_geometry.contains(poly, self.point, &mut self.memo)
     }
+
+    /// Whether the polygon of the scan's entry `id` holds the point. An entry flagged interior
+    /// does without a test: the builder flags one only where the rings of every tier it covers
+    /// hold the whole cell, at the reach the ray cast needs (admin_cover.h, cell_index.cpp
+    /// union_of_tiers), and the scan's cell is the rounded point's. Any other entry is tested.
+    fn holds(&mut self, index: &Index, id: u32, poly: &AdminPolygon) -> bool {
+        (id & INTERIOR_FLAG != 0 && index.admin_geometry.has_rings(poly)) || self.contains(index, poly)
+    }
 }
 
 // --- Index data ---
@@ -1900,13 +1908,11 @@ impl Index {
 
     /// `find_admin` over a scan the caller may share with the other admin lookups of the point.
     pub fn find_admin_in(&self, scan: &mut AdminScan) -> AdminResult<'_> {
-        // For each admin level, find the smallest-area polygon actually containing
-        // the point. Interior flags are used as a fast path for uncontested cells,
-        // but PIP is always run when a polygon would win the smallest-area contest
-        // (interior flags can be wrong at polygon borders, e.g. NJ/NY).
-        // (area, id, poly, pip_verified) — owned AdminPolygon values so the
-        // backing admin_polygons file can be a chunked source.
-        let mut best_by_level: [Option<(f32, u32, AdminPolygon, bool)>; 12] = [None; 12];
+        // For each admin level, the smallest-area polygon holding the point, the first in
+        // visiting order among equals (`ScanPip::holds`: an entry flagged interior holds it
+        // without a test). Owned AdminPolygon values so the backing admin_polygons file can be a
+        // chunked source.
+        let mut best_by_level: [Option<AdminPolygon>; 12] = [None; 12];
         // Class='place' polygons (admin_level=15 marker) that cover the query point. These
         // drive the second-nested-check rule (placex_triggers.sql lines 944-963) — Nominatim
         // uses only these, not admin boundaries with linked_place tags. Kept apart from
@@ -1914,13 +1920,10 @@ impl Index {
         let mut place_area_polygons: Vec<(u32, AdminPolygon)> = Vec::new();
 
         scan.for_each_entry(|pip, id, poly| {
-            // The interior flag on a (cell, polygon) entry proves
-            // containment for queries inside that cell, the scan's only one.
-            let is_interior = (id & INTERIOR_FLAG) != 0;
             let poly_id = id & ID_MASK;
             if poly.admin_level == 15 {
                 if poly.area <= 0.0 { return; }
-                if !pip.contains(self, &poly) { return; }
+                if !pip.holds(self, id, &poly) { return; }
                 if !place_area_polygons.iter().any(|(pid, _)| *pid == poly_id) {
                     place_area_polygons.push((poly_id, poly));
                 }
@@ -1932,54 +1935,17 @@ impl Index {
             // boundary closed ways) can never name a country.
             if level == 2 && poly.country_code == 0 { return; }
             if poly.area <= 0.0 { return; }
-
-            if let Some((best_area, best_id, best_poly, best_verified)) = best_by_level[level] {
-                if poly.area >= best_area {
-                    // Larger than current best — skip unless current best is unverified
-                    // and this one can be verified
-                    if !best_verified {
-                        // Current best only passed via interior flag — verify it now
-                        if pip.contains(self, &best_poly) {
-                            best_by_level[level] = Some((best_area, best_id, best_poly, true));
-                        } else {
-                            // Best was wrong — try this polygon instead
-                            let inside = pip.contains(self, &poly);
-                            if is_interior || inside {
-                                best_by_level[level] = Some((poly.area, poly_id, poly, inside));
-                            } else {
-                                best_by_level[level] = None;
-                            }
-                        }
-                    }
-                    return;
-                }
-                // This polygon is smaller — must verify with PIP
-                if pip.contains(self, &poly) {
-                    best_by_level[level] = Some((poly.area, poly_id, poly, true));
-                }
-                // If PIP fails, keep existing best
-            } else {
-                // No existing candidate — accept with interior flag, verify later if contested
-                if is_interior {
-                    best_by_level[level] = Some((poly.area, poly_id, poly, false));
-                } else if pip.contains(self, &poly) {
-                    best_by_level[level] = Some((poly.area, poly_id, poly, true));
-                }
+            if best_by_level[level].is_some_and(|best| poly.area >= best.area) { return; }
+            if pip.holds(self, id, &poly) {
+                best_by_level[level] = Some(poly);
             }
         });
-
-        // Verify any uncontested winners that only passed via interior flag
-        for level in 0..12 {
-            if let Some((area, id, poly, false)) = best_by_level[level] {
-                best_by_level[level] = scan.pip.contains(self, &poly).then_some((area, id, poly, true));
-            }
-        }
 
         let mut result = AdminResult::default();
 
         // Get country code from level 2 polygon
         let country_code_str: String = best_by_level[2]
-            .and_then(|(_, _, poly, _)| {
+            .and_then(|poly| {
                 if poly.country_code != 0 {
                     Some(format!("{}{}",
                         (poly.country_code >> 8) as u8 as char,
@@ -2033,7 +1999,7 @@ impl Index {
         // promote_nested_ranks then gives them their effective one.
         let mut ranked: Vec<RankedPoly> = Vec::new();
         for level in 0..12 {
-            if let Some((_, _, poly, _)) = best_by_level[level] {
+            if let Some(poly) = best_by_level[level] {
                 if poly.admin_level == POSTCODE_AREA_LEVEL { continue; } // handled separately
 
                 let initial_rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
@@ -2174,24 +2140,23 @@ impl Index {
             .map(|c| c.iter().map(|b| b.to_ascii_uppercase() as char).collect())
             .unwrap_or_default();
 
-        // (area, id, polygon) of every boundary and place area near the point.
+        // (area, entry, polygon) of every boundary and place area near the point.
         let mut boundaries: Vec<(f32, u32, AdminPolygon)> = Vec::new();
         let mut place_areas: Vec<(f32, u32, AdminPolygon)> = Vec::new();
         scan.for_each_entry(|_, id, poly| {
-            let poly_id = id & ID_MASK;
             if poly.area <= 0.0 { return; }
             match poly.admin_level {
                 // ISO-less level-2 polygons are maritime lines, not countries.
                 2 if poly.country_code == 0 => {}
-                2..=10 => boundaries.push((poly.area, poly_id, poly)),
-                15 if poly.place_type_override != 0 => place_areas.push((poly.area, poly_id, poly)),
+                2..=10 => boundaries.push((poly.area, id, poly)),
+                15 if poly.place_type_override != 0 => place_areas.push((poly.area, id, poly)),
                 _ => {}
             }
         });
         let mut holding = |mut polys: Vec<(f32, u32, AdminPolygon)>| -> Vec<AdminPolygon> {
-            polys.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-            polys.dedup_by_key(|p| p.1);
-            polys.into_iter().filter(|(_, _, poly)| scan.pip.contains(self, poly)).map(|(_, _, poly)| poly).collect()
+            polys.sort_by(|a, b| a.0.total_cmp(&b.0).then((a.1 & ID_MASK).cmp(&(b.1 & ID_MASK))));
+            polys.dedup_by_key(|p| p.1 & ID_MASK);
+            polys.into_iter().filter(|(_, id, poly)| scan.pip.holds(self, *id, poly)).map(|(_, _, poly)| poly).collect()
         };
         let ranked: Vec<RankedPoly> = holding(boundaries).into_iter()
             .map(|poly| RankedPoly { poly, rank_address: self.admin_config.to_rank(&cc, poly.admin_level) })
@@ -2627,10 +2592,10 @@ impl Index {
         // PIP from the query point — these aren't in the parent chain
         // but provide place-area rank promotions.
         let mut place_area_polygons: Vec<AdminPolygon> = Vec::new();
-        scan.for_each_entry(|pip, _, poly| {
+        scan.for_each_entry(|pip, id, poly| {
             if poly.admin_level != 15 { return; }
             if poly.area <= 0.0 { return; }
-            if !pip.contains(self, &poly) { return; }
+            if !pip.holds(self, id, &poly) { return; }
             place_area_polygons.push(poly);
         });
 
@@ -6770,9 +6735,10 @@ mod admin_scan_tests {
     #[test]
     fn find_admin_reads_only_the_points_own_cell() {
         // Rings listed only in neighbour cells: the builder lists a ring in the cell of every point
-        // it contains, so these contain no point of Q's cell.
+        // it contains, so these contain no point of Q's cell. Sudan's edge on 22°N lies within
+        // reach of Q's cell, which lists it, not interior.
         let idx = admin_index(&[
-            Ring { country: b"sd", ..ring("Sudan", 2, 190.0, SUDAN, &[(0, true), (3, true)]) },
+            Ring { country: b"sd", ..ring("Sudan", 2, 190.0, SUDAN, &[(0, false), (3, true)]) },
             ring("Egypt", 2, 97.0, EGYPT, &[(3, false), (5, false)]),
             ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(5, false)]),
         ]);
@@ -6811,6 +6777,35 @@ mod admin_scan_tests {
             Ring { country: b"sd", ..ring("Sudan", 2, 9.0, SUDAN, &[(1, true), (2, true)]) },
         ]);
         assert_eq!(idx.find_admin(Q.0, Q.1).country, Some("Egypt"));
+    }
+
+    #[test]
+    fn an_interior_entry_holds_the_point_without_reading_an_arc() {
+        // The builder flags an entry interior only where the rings hold the whole cell, so the scan
+        // takes it as holding the point: find_admin, the current boundaries and the chain lookup
+        // read no arc of an interior entry, and test only the others.
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
+            ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, true)]),
+            ring("Paris", 8, 2.0, (21.9, 27.4, 22.1, 27.7), &[(0, true)]),
+            Ring { place_type: 5, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(0, true)]) },
+        ]);
+        let mut scan = AdminScan::new(&idx, Q.0, Q.1);
+        let a = idx.find_admin_in(&mut scan);
+        assert_eq!((a.country, a.state, a.neighbourhood), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
+        let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"));
+        assert_eq!(gates.for_rank(CurrentBoundaries::CITY).map(|p| idx.get_string(p.name_id)), Some("Paris"));
+        let c = idx.find_admin_from_chain_in(0, &mut scan);
+        assert_eq!((c.country, c.state), (Some("Egypt"), Some("New Valley")));
+        assert_eq!(scan.pip.memo.arcs_read(), 0);
+        // The same rings listed not interior are tested.
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, false)]),
+            ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, false)]),
+        ]);
+        let mut scan = AdminScan::new(&idx, Q.0, Q.1);
+        assert_eq!(idx.find_admin_in(&mut scan).state, Some("New Valley"));
+        assert!(scan.pip.memo.arcs_read() > 0);
     }
 
     #[test]
