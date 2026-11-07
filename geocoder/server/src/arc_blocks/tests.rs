@@ -136,6 +136,43 @@ fn arc_blocks_past_i32_e7_are_malformed_as_the_builder_reads_them() {
         assert_eq!(decoded(&edge(past)), None, "k {k}");
         assert_eq!(arc_crossings(&edge(past), p), None, "k {k}");
     }
+    // Vertices of short deltas that climb to the edge of the range or past it and come back, in
+    // the middle of the arc, however many vertices that takes, at every grid and on every side.
+    for k in [0u8, 1, 2, 3] {
+        let units = GRID_UNITS[k as usize];
+        let (lo, hi) = (units.lo, units.lo + units.span);
+        let walk = |lat0: i64, lng0: i64, d_lat: i64, d_lng: i64, steps: usize| {
+            let mut block = head(k, lat0 as i32, lng0 as i32);
+            for _ in 0..steps {
+                block.extend([delta(d_lat), delta(d_lng)].concat());
+            }
+            for _ in 0..steps {
+                block.extend([delta(-d_lat), delta(-d_lng)].concat());
+            }
+            block
+        };
+        let p = PointE7 { lat: 0, lng: 5 };
+        for steps in [1i64, 2, 5, 40] {
+            for (at_edge, past, d_lat, d_lng) in [
+                ((hi - steps * 8191, 0), (hi - steps * 8191 + 1, 0), 8191, 0),
+                ((lo + steps * 8192, 0), (lo + steps * 8192 - 1, 0), -8192, 0),
+                ((0, hi - steps * 8191), (0, hi - steps * 8191 + 1), 0, 8191),
+                ((0, lo + steps * 8192), (0, lo + steps * 8192 - 1), 0, -8192),
+            ] {
+                let fits = walk(at_edge.0, at_edge.1, d_lat, d_lng, steps as usize);
+                assert!(decoded(&fits).is_some() && arc_crossings(&fits, p).is_some(), "k {k} steps {steps} {at_edge:?}");
+                let over = walk(past.0, past.1, d_lat, d_lng, steps as usize);
+                assert_eq!(decoded(&over), None, "k {k} steps {steps} {past:?}");
+                assert_eq!(arc_crossings(&over, p), None, "k {k} steps {steps} {past:?}");
+            }
+        }
+        // A long delta past the range and straight back, from well inside it: no vertex before
+        // it was due a test.
+        let (past, back) = (hi + 1, -(hi + 1));
+        let out_and_back = [head(k, 0, 0), delta(past), delta(0), delta(back), delta(0), delta(1), delta(0)].concat();
+        assert_eq!(decoded(&out_and_back), None, "k {k}");
+        assert_eq!(arc_crossings(&out_and_back, p), None, "k {k}");
+    }
     // The largest varint, a delta no grid holds.
     let widest = [head(0, 0, 0), vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00]].concat();
     assert_eq!((decoded(&widest), arc_crossings(&widest, p)), (None, None));
@@ -522,7 +559,7 @@ fn the_vertex_loops_read_what_a_byte_at_a_time_reads() {
         let k = [0u8, 2, 3][case % 3];
         let units = GRID_UNITS[k as usize];
         let boxed = case % 5 == 0;
-        let coordinate = |rng: &mut Rng| (rng.next() % (units.hi - units.lo) as u64) as i64 + units.lo;
+        let coordinate = |rng: &mut Rng| (rng.next() % units.span as u64) as i64 + units.lo;
         let mut block = vec![k | if boxed { HAS_BOX } else { 0 }];
         let (lat0, lng0) = (coordinate(&mut rng) / 2, coordinate(&mut rng) / 2);
         block.extend((lat0 as i32).to_le_bytes());
@@ -544,7 +581,12 @@ fn the_vertex_loops_read_what_a_byte_at_a_time_reads() {
         let mut check = |b: &[u8]| {
             let want = vertices_bytewise(b);
             assert_eq!(decoded(b), want, "case {case} {} bytes", b.len());
-            match (&want, arc_crossings(b, p)) {
+            let got = arc_crossings(b, p);
+            // Bytes after the block, the next one's in the file, change nothing.
+            for after in [&[0xff, 0xff, 0xff][..], &[0x00, 0x00, 0x00], &[0x80, 0xff], &[0xff], &[0x83, 0x00, 0xff]] {
+                assert_eq!(arc_crossings_in(&[b, after].concat(), b.len(), p), got, "case {case} {} bytes, then {after:?}", b.len());
+            }
+            match (&want, got) {
                 (None, got) => {
                     assert!(got.is_none() || got == Some(ArcCrossings::Boxed), "case {case}");
                     malformed += 1;

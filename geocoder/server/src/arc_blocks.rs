@@ -32,10 +32,11 @@ pub(crate) const HAS_BOX: u8 = 0x80;
 const GRID_STEPS: [i64; 4] = [1, 10, 100, 1000];
 /// For each grid exponent k, the grid units whose e7 value fits i32.
 const GRID_UNITS: [GridUnits; 4] = {
-    let mut units = [GridUnits { lo: 0, hi: 0 }; 4];
+    let mut units = [GridUnits { lo: 0, span: 0 }; 4];
     let mut k = 0;
     while k < 4 {
-        units[k] = GridUnits { lo: i32::MIN as i64 / GRID_STEPS[k], hi: i32::MAX as i64 / GRID_STEPS[k] };
+        let lo = i32::MIN as i64 / GRID_STEPS[k];
+        units[k] = GridUnits { lo, span: i32::MAX as i64 / GRID_STEPS[k] - lo };
         k += 1;
     }
     units
@@ -189,15 +190,31 @@ impl<'a> ArcFiles<'a> {
         usize::try_from(u32::from_le_bytes([b[0], b[1], b[2], b[3]])).ok()
     }
 
-    /// Arc slot `slot`'s block, from its offset to the next slot's (to the end of the file for
-    /// the last slot); None for a slot past the index, a dead slot (an empty block) and a block
-    /// past the end of the file.
+    /// Where arc slot `slot`'s block lies in `vertices`, from its offset to the next slot's (to
+    /// the end of the file for the last slot); None for a slot past the index, and a block empty
+    /// or past the end of the file.
     #[inline]
-    pub fn block(&self, slot: u32) -> Option<&'a [u8]> {
+    fn span(&self, slot: u32) -> Option<(usize, usize)> {
         let slot = usize::try_from(slot).ok()?;
         let start = self.offset(slot)?;
         let end = if slot + 1 < self.slots() { self.offset(slot + 1)? } else { self.vertices.len() };
-        self.vertices.get(start..end).filter(|block| !block.is_empty())
+        (start < end && end <= self.vertices.len()).then_some((start, end))
+    }
+
+    /// Arc slot `slot`'s block; None for a slot past the index, a dead slot (an empty block) and
+    /// a block past the end of the file.
+    #[inline]
+    pub fn block(&self, slot: u32) -> Option<&'a [u8]> {
+        let (start, end) = self.span(slot)?;
+        Some(&self.vertices[start..end])
+    }
+
+    /// Arc slot `slot`'s block as `block` gives it, with up to DELTA_LOAD - 1 of the bytes after
+    /// it, and its length (`arc_crossings_in`).
+    #[inline]
+    fn block_and_after(&self, slot: u32) -> Option<(&'a [u8], usize)> {
+        let (start, end) = self.span(slot)?;
+        Some((&self.vertices[start..(end + DELTA_LOAD - 1).min(self.vertices.len())], end - start))
     }
 }
 
@@ -212,20 +229,21 @@ struct ArcHead {
     units: GridUnits,
 }
 
-/// The grid units, lo..=hi, whose e7 value fits i32 (GRID_UNITS, one per grid).
+/// The grid units, lo..=lo + span, whose e7 value fits i32 (GRID_UNITS, one per grid).
 #[derive(Clone, Copy)]
 struct GridUnits {
     lo: i64,
-    hi: i64,
+    span: i64,
 }
 
 impl GridUnits {
     #[inline(always)]
     fn hold(self, c: i64) -> bool {
-        self.lo <= c && c <= self.hi
+        c.wrapping_sub(self.lo) as u64 <= self.span as u64
     }
 }
 
+#[inline(always)]
 fn arc_head(block: &[u8]) -> Option<ArcHead> {
     let flags = *block.first()?;
     if flags & !(GRID_MASK | HAS_BOX) != 0 {
@@ -239,29 +257,18 @@ fn arc_head(block: &[u8]) -> Option<ArcHead> {
     Some(ArcHead { step, lat, lng, bbox, deltas: at, units })
 }
 
+/// The largest delta between two coordinates that fit i32.
+const MAX_DELTA: u64 = 1 << 32;
+
 /// The next vertex of an arc block in grid units, from the deltas at `*at`; None past i32 e7.
-///
-/// Inlined into each vertex loop. In the simplified tiers 99.8 % of the varints hold 1 or 2
-/// bytes (22 % and 78 %), so a branch on each one's length mispredicts often. A vertex whose
-/// two varints both do is read from one 4-byte load instead, the lengths taken from two
-/// continuation bits; any other goes through `varint` a byte at a time, to the same values.
+/// Inlined into each vertex loop: a vertex of short deltas comes from one 4-byte load, any other
+/// through `varint` a byte at a time, to the same values.
 #[inline(always)]
 fn next_vertex(block: &[u8], at: &mut usize, units: GridUnits, lat: i64, lng: i64) -> Option<(i64, i64)> {
-    if let Some(w) = block.get(*at..).and_then(<[u8]>::first_chunk::<4>) {
-        let w = u32::from_le_bytes(*w);
-        // Whether the latitude's varint has a second byte, the bytes after it, and whether
-        // the longitude's has one; each second byte must end its varint.
-        let lat2 = w >> 7 & 1;
-        let rest = w >> (8 + 8 * lat2);
-        let lng2 = rest >> 7 & 1;
-        if (lat2 & w >> 15 | lng2 & rest >> 15) & 1 == 0 {
-            // Each under 2^14: neither addition can overflow.
-            let lat_v = w & 0x7f | w >> 1 & 0x3f80 & 0u32.wrapping_sub(lat2);
-            let lng_v = rest & 0x7f | rest >> 1 & 0x3f80 & 0u32.wrapping_sub(lng2);
-            *at += (2 + lat2 + lng2) as usize;
-            let (lat, lng) = (lat + unzigzag(u64::from(lat_v)), lng + unzigzag(u64::from(lng_v)));
-            return (units.hold(lat) && units.hold(lng)).then_some((lat, lng));
-        }
+    if let Some((d_lat, d_lng, used)) = block.get(*at..).and_then(<[u8]>::first_chunk::<DELTA_LOAD>).and_then(|w| short_deltas(u32::from_le_bytes(*w))) {
+        *at += used;
+        let (lat, lng) = (lat + d_lat, lng + d_lng);
+        return (units.hold(lat) && units.hold(lng)).then_some((lat, lng));
     }
     let lat = lat.checked_add(unzigzag(varint(block, at)?))?;
     let lng = lng.checked_add(unzigzag(varint(block, at)?))?;
@@ -302,40 +309,152 @@ pub(crate) enum ArcCrossings {
 }
 
 /// How the ray from `p` towards +lat crosses the edges of an arc block; None for a malformed
-/// block. The straddle test compares grid units against p's longitude in grid units, so only
-/// the edges that straddle p are taken to e7 for `edge_crosses`.
-#[inline]
-pub(crate) fn arc_crossings(block: &[u8], p: PointE7) -> Option<ArcCrossings> {
-    let head = arc_head(block)?;
+/// block.
+#[cfg(test)]
+fn arc_crossings(block: &[u8], p: PointE7) -> Option<ArcCrossings> {
+    arc_crossings_in(block, block.len(), p)
+}
+
+/// `arc_crossings` of the block in the first `len` of `bytes`, which go on for up to
+/// DELTA_LOAD - 1 bytes where the file does: whether a load still fits is then the vertex loop's
+/// only test for the block's end.
+///
+/// The hot loop of an admin lookup, kept out of line so that its few values stay in registers,
+/// and everything rare (a varint past 2 bytes, an edge straddling p) out of its way.
+#[inline(never)]
+fn arc_crossings_in(bytes: &[u8], len: usize, p: PointE7) -> Option<ArcCrossings> {
+    let head = arc_head(bytes.get(..len)?)?;
     let step = head.step;
     if let Some([min_lng, max_lng, max_lat]) = head.bbox {
         if p.lng < min_lng * step || p.lng >= max_lng * step || p.lat >= max_lat * step {
             return Some(ArcCrossings::Boxed);
         }
     }
-    // A vertex is east of p exactly when its grid longitude is east of p's, floored to the grid
-    // (each step a constant divisor, which the compiler turns into a multiplication).
-    let p_lng = match step {
-        1 => p.lng,
-        10 => p.lng.div_euclid(10),
-        100 => p.lng.div_euclid(100),
-        _ => p.lng.div_euclid(1000),
-    };
-    let e7 = |lat: i64, lng: i64| PointE7 { lat: lat * step, lng: lng * step };
-    let (mut lat, mut lng) = (head.lat, head.lng);
-    let mut east = lng > p_lng;
-    let (mut odd, mut vertices) = (false, 1u32);
-    let mut at = head.deltas;
-    while at < block.len() {
-        let (next_lat, next_lng) = next_vertex(block, &mut at, head.units, lat, lng)?;
-        let next_east = next_lng > p_lng;
-        if next_east != east && edge_crosses(e7(lat, lng), e7(next_lat, next_lng), p) {
-            odd = !odd;
+    let mut walk = DeltaWalk::new(&head, p);
+    let mut tail = &bytes[head.deltas..];
+    let after = bytes.len() - len;
+    loop {
+        while let Some((d_lat, d_lng, used)) = tail.first_chunk::<DELTA_LOAD>().and_then(|w| short_deltas(u32::from_le_bytes(*w))) {
+            tail = &tail[used..];
+            walk.next_vertex(d_lat, d_lng)?;
         }
-        (lat, lng, east) = (next_lat, next_lng, next_east);
-        vertices = vertices.wrapping_add(1);
+        // Into the bytes after the block only when the block is over or a varint ran off it.
+        let in_block = tail.len().checked_sub(after)?;
+        if in_block == 0 {
+            return Some(ArcCrossings::Read { odd: walk.odd, vertices: walk.vertices });
+        }
+        let (d_lat, d_lng, used) = long_deltas(&tail[..in_block])?;
+        tail = &tail[used..];
+        walk.test_at = walk.vertices + 1;
+        walk.next_vertex(d_lat, d_lng)?;
     }
-    Some(ArcCrossings::Read { odd, vertices })
+}
+
+/// `arc_crossings_in`'s place along an arc block's vertices, in grid units. Longitude is relative
+/// to the first grid column east of p, so its sign says which side of p a vertex lies on and
+/// the straddle test needs no comparison with p: only the edges that straddle p are taken to e7
+/// for `edge_crosses`.
+struct DeltaWalk {
+    lat: i64,
+    lng: i64,
+    odd: bool,
+    vertices: u32,
+    /// The next vertex to test against the grid's range: a vertex of short deltas moves at most
+    /// 1 << SHORT_DELTA_BITS, so no vertex before this one can be past it.
+    test_at: u32,
+    units: GridUnits,
+    step: i64,
+    first_east: i64,
+    p: PointE7,
+}
+
+impl DeltaWalk {
+    #[inline(always)]
+    fn new(head: &ArcHead, p: PointE7) -> Self {
+        // A vertex is east of p exactly when its grid longitude is east of p's, floored to the
+        // grid (each step a constant divisor, which the compiler turns into a multiplication).
+        let floored = match head.step {
+            1 => p.lng,
+            10 => p.lng.div_euclid(10),
+            100 => p.lng.div_euclid(100),
+            _ => p.lng.div_euclid(1000),
+        };
+        // Clamped past every vertex, so that the sums below can't overflow.
+        let first_east = floored.clamp(-(1 << 40), 1 << 40) + 1;
+        let mut walk = DeltaWalk { lat: head.lat, lng: head.lng - first_east, odd: false, vertices: 1, test_at: 0, units: head.units, step: head.step, first_east, p };
+        // The arc head's coordinates are in range.
+        walk.test_at = 2 + (walk.room(walk.lat, walk.lng) >> SHORT_DELTA_BITS) as u32;
+        walk
+    }
+
+    /// How far a vertex lies inside the grid's range; negative past it.
+    #[inline(always)]
+    fn room(&self, lat: i64, relative_lng: i64) -> i64 {
+        let (lng, lo, hi) = (relative_lng + self.first_east, self.units.lo, self.units.lo + self.units.span);
+        (lat - lo).min(hi - lat).min(lng - lo).min(hi - lng)
+    }
+
+    /// Moves on to the vertex at these deltas, each at most MAX_DELTA; None past the grid's range.
+    #[inline(always)]
+    fn next_vertex(&mut self, d_lat: i64, d_lng: i64) -> Option<()> {
+        let (next_lat, next_lng) = (self.lat + d_lat, self.lng + d_lng);
+        self.vertices += 1;
+        if self.vertices == self.test_at {
+            let room = self.room(next_lat, next_lng);
+            if room < 0 {
+                return None;
+            }
+            self.test_at = self.vertices + 1 + (room >> SHORT_DELTA_BITS) as u32;
+        }
+        if (self.lng ^ next_lng) < 0 {
+            self.odd ^= straddling_edge_crosses(self.step, self.first_east, (self.lat, self.lng), (next_lat, next_lng), self.p);
+        }
+        (self.lat, self.lng) = (next_lat, next_lng);
+        Some(())
+    }
+}
+
+/// The bytes `short_deltas` looks at.
+const DELTA_LOAD: usize = 4;
+/// The largest move of a delta `short_deltas` gives is 1 << SHORT_DELTA_BITS.
+const SHORT_DELTA_BITS: u32 = 13;
+
+/// The two deltas of a vertex from the 4 bytes at its start, and the bytes they take; None if
+/// either takes more than 2, or the vertex after this one starts with a longer one. In the
+/// simplified tiers 99.8 % of the varints hold 1 or 2 bytes (22 % and 78 %), so a branch on each
+/// one's length mispredicts often: the lengths come from two continuation bits instead.
+#[inline(always)]
+fn short_deltas(w: u32) -> Option<(i64, i64, usize)> {
+    // No two bytes in a row with their continuation bits set: no varint here takes 3 bytes.
+    if w & w >> 8 & 0x0080_8080 != 0 {
+        return None;
+    }
+    // Whether the latitude's varint has a second byte, the bytes after it, and whether the
+    // longitude's has one.
+    let lat2 = w >> 7 & 1;
+    let rest = w >> (8 + 8 * lat2);
+    let lng2 = rest >> 7 & 1;
+    let lat_v = w & 0x7f | w >> 1 & 0x3f80 & 0u32.wrapping_sub(lat2);
+    let lng_v = rest & 0x7f | rest >> 1 & 0x3f80 & 0u32.wrapping_sub(lng2);
+    Some((unzigzag(u64::from(lat_v)), unzigzag(u64::from(lng_v)), (2 + lat2 + lng2) as usize))
+}
+
+/// The two deltas of a vertex a byte at a time, for any length, and the bytes they take; None
+/// for a malformed varint or a delta no two coordinates that fit i32 are apart.
+#[inline]
+fn long_deltas(tail: &[u8]) -> Option<(i64, i64, usize)> {
+    let mut at = 0;
+    let d_lat = unzigzag(varint(tail, &mut at)?);
+    let d_lng = unzigzag(varint(tail, &mut at)?);
+    (d_lat.unsigned_abs() <= MAX_DELTA && d_lng.unsigned_abs() <= MAX_DELTA).then_some((d_lat, d_lng, at))
+}
+
+/// `edge_crosses` of an edge whose two vertices are given in `DeltaWalk`'s terms.
+#[cold]
+#[inline(never)]
+fn straddling_edge_crosses(step: i64, first_east: i64, (lat_a, lng_a): (i64, i64), (lat_b, lng_b): (i64, i64), p: PointE7) -> bool {
+    let e7 = |lat: i64, lng: i64| PointE7 { lat: lat * step, lng: (lng + first_east) * step };
+    edge_crosses(e7(lat_a, lng_a), e7(lat_b, lng_b), p)
 }
 
 /// The crossing parities of the arcs read at one point, so an arc several polygons share (a
@@ -439,7 +558,7 @@ impl RingVisitor for Crossings<'_, '_> {
         let remembered = self.memo.as_deref().and_then(|memo| memo.get(r.slot));
         let odd = match remembered {
             Some(odd) => odd,
-            None => match arc_crossings(self.arcs.block(r.slot)?, self.p)? {
+            None => match self.arcs.block_and_after(r.slot).and_then(|(bytes, len)| arc_crossings_in(bytes, len, self.p))? {
                 ArcCrossings::Boxed => false,
                 ArcCrossings::Read { odd, vertices } => {
                     if let Some(memo) = self.memo.as_deref_mut() {
