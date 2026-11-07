@@ -3,9 +3,13 @@
 //! polygon's ring block in admin_rings.bin, a list of refs to the arcs in arc_vertices.bin that
 //! the neighbours along a border share (arc_blocks.rs).
 
-use crate::arc_blocks::{arc_vertices, ring_block_contains, walk_rings, ArcFiles, ArcMemo, ArcRef, ChunkBox, RingVisitor};
+use crate::arc_blocks::{
+    arc_box_max_lat, arc_vertices, ring_block_contains, walk_rings, ArcFiles, ArcMemo, ArcRef, ChunkBox, RingVisitor,
+    CHUNK_BOX_SLACK_E7,
+};
 use crate::exact_pip::{edge_crosses, on_edge, to_e7, PointE7};
 use crate::{mmap_file, AdminPolygon, FileBytes, NO_DATA};
+use std::sync::Mutex;
 
 /// A point as every admin test takes it: rounded once to the e7 grid, as the builder rounds the
 /// points it links (`to_e7`).
@@ -114,6 +118,67 @@ pub struct AdminGeometry {
     rings: FileBytes,
     arc_index: FileBytes,
     arc_vertices: FileBytes,
+    surfaces: Mutex<SurfaceMemo>,
+    insides: Mutex<InsideMemo>,
+}
+
+/// The answers `point_on_surface_in` gave, by the two ring blocks: a direct-mapped table of
+/// SLOTS entries like SurfaceMemo's. The address walk asks the same few pairs again and again,
+/// and each answer is a ray cast over the other polygon's arcs besides the point on surface.
+#[derive(Default)]
+struct InsideMemo {
+    slots: Vec<(u64, u64, bool)>,
+}
+
+impl InsideMemo {
+    const SLOTS: usize = 256;
+
+    fn slot(poly: u64, other: u64) -> usize {
+        ((poly ^ other.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - Self::SLOTS.trailing_zeros())) as usize
+    }
+
+    fn get(&self, poly: u64, other: u64) -> Option<bool> {
+        self.slots.get(Self::slot(poly, other)).filter(|&&(p, o, _)| (p, o) == (poly, other)).map(|&(_, _, inside)| inside)
+    }
+
+    fn insert(&mut self, poly: u64, other: u64, inside: bool) {
+        if self.slots.is_empty() {
+            self.slots = vec![(SurfaceMemo::FREE, SurfaceMemo::FREE, false); Self::SLOTS];
+        }
+        self.slots[Self::slot(poly, other)] = (poly, other, inside);
+    }
+}
+
+/// The points on surface `point_on_surface_in` found, by ring block: a direct-mapped table of
+/// SLOTS entries (a block takes over its slot from the last one there), empty until its first
+/// answer. A point on surface is two passes over every arc of a polygon, and the address walk
+/// tests the same few large boundaries at point after point (a level-3 region as large as its
+/// country, say). The answers depend on nothing but the files, which the geometry owns.
+#[derive(Default)]
+struct SurfaceMemo {
+    slots: Vec<(u64, Option<(f64, f64)>)>,
+}
+
+impl SurfaceMemo {
+    const SLOTS: usize = 256;
+    /// Marks a free slot; no ring block's key is all ones (`AdminGeometry::block_key`).
+    const FREE: u64 = u64::MAX;
+
+    fn slot(key: u64) -> usize {
+        // Fibonacci hashing; the top bits of the product mix every bit of the key.
+        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - Self::SLOTS.trailing_zeros())) as usize
+    }
+
+    fn get(&self, key: u64) -> Option<Option<(f64, f64)>> {
+        self.slots.get(Self::slot(key)).filter(|(k, _)| *k == key).map(|&(_, point)| point)
+    }
+
+    fn insert(&mut self, key: u64, point: Option<(f64, f64)>) {
+        if self.slots.is_empty() {
+            self.slots = vec![(Self::FREE, None); Self::SLOTS];
+        }
+        self.slots[Self::slot(key)] = (key, point);
+    }
 }
 
 /// The files `AdminGeometry::load` maps, by name.
@@ -121,7 +186,7 @@ pub const ADMIN_GEOMETRY_FILES: [&str; 3] = ["admin_rings.bin", "arc_index.bin",
 
 impl AdminGeometry {
     pub fn new(rings: FileBytes, arc_index: FileBytes, arc_vertices: FileBytes) -> Self {
-        AdminGeometry { rings, arc_index, arc_vertices }
+        AdminGeometry { rings, arc_index, arc_vertices, surfaces: Mutex::default(), insides: Mutex::default() }
     }
 
     /// The geometry files of the index in `dir`; the error names a file that is missing.
@@ -197,9 +262,31 @@ impl AdminGeometry {
     /// has no rings.
     pub fn point_on_surface_in(&self, poly: &AdminPolygon, other: &AdminPolygon) -> bool {
         let (Some(block), Some(other_block)) = (self.ring_block(poly), self.ring_block(other)) else { return false };
-        let Some((lat, lng)) = self.surface_point(block, &mut Vec::new()) else { return false };
-        let mut test = InsideOffEdges { arcs: self.arcs(), p: AdminPoint::new(lat, lng).e7(), odd: false, on_edge: false };
-        walk_rings(other_block, &mut test).is_some() && test.odd && !test.on_edge
+        let (poly_key, other_key) = (Self::block_key(poly), Self::block_key(other));
+        // A poisoned lock is the memo of a thread that panicked: its answers are still sound.
+        let memo = || self.insides.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(inside) = memo().get(poly_key, other_key) {
+            return inside;
+        }
+        let inside = self.memo_surface_point(poly, block).is_some_and(|(lat, lng)| {
+            let mut test = InsideOffEdges { arcs: self.arcs(), p: AdminPoint::new(lat, lng).e7(), odd: false, on_edge: false };
+            walk_rings(other_block, &mut test).is_some() && test.odd && !test.on_edge
+        });
+        memo().insert(poly_key, other_key, inside);
+        inside
+    }
+
+    /// `surface_point` of `poly`'s ring block `block`, from the memo when it holds it.
+    fn memo_surface_point(&self, poly: &AdminPolygon, block: &[u8]) -> Option<(f64, f64)> {
+        let key = Self::block_key(poly);
+        // A poisoned lock is the memo of a thread that panicked: its answers are still sound.
+        let memo = || self.surfaces.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(point) = memo().get(key) {
+            return point;
+        }
+        let point = self.surface_point(block, &mut Vec::new());
+        memo().insert(key, point);
+        point
     }
 
     /// Hints that `poly`'s rings are read soon. Never changes an answer.
@@ -222,39 +309,37 @@ impl AdminGeometry {
     /// latitude range; the first vertex where no stretch has width. (lat, lng) in degrees.
     ///
     /// No bound in the files holds a ring's lowest latitude, and a whole exact country ring is
-    /// too large to hold, so it streams the arcs three times: the outer ring's latitude range,
-    /// then the latitudes nearest its middle, then the scan line's crossings.
+    /// too large to hold, so it streams the arcs twice: the outer ring's latitude range, then the
+    /// latitudes nearest its middle together with the edges that can cross the scan line.
     fn surface_point(&self, block: &[u8], crossings: &mut Vec<f64>) -> Option<(f64, f64)> {
         let arcs = self.arcs();
-        let deg = |e7: i64| e7 as f64 / 1e7;
 
         let mut outer = OuterRange { arcs, lo: i64::MAX, hi: i64::MIN, first: None, done: false };
         walk_rings(block, &mut outer)?;
         let first = outer.first?;
-        let (mut lo, mut hi) = (deg(outer.lo), deg(outer.hi));
+        let (lo, hi) = (deg(outer.lo), deg(outer.hi));
         let centre = (lo + hi) / 2.0;
 
-        let mut nearest = |a: PointE7, _: PointE7| {
-            let y = deg(a.lat);
-            if y <= centre {
-                if y > lo { lo = y; }
-            } else if y < hi {
-                hi = y;
-            }
-        };
-        // Every vertex starts an edge of its ring: the closing one ends where the ring began.
-        walk_rings(block, &mut EdgeWalk { arcs, edge: &mut nearest })?;
-        let scan = (lo + hi) / 2.0;
-
+        // The scan line lies strictly between lo, at or below the centre, and hi, above it, and
+        // no vertex lies between those: an edge with both ends at or below the centre (so at or
+        // below lo) or both above it (at or above hi) doesn't reach the scan line. The edges that
+        // cross the centre's line are kept, as (y0, x0, y1, x1) in their ring's direction.
         crossings.clear();
-        let mut cross = |a: PointE7, b: PointE7| {
-            let (y0, y1, x0, x1) = (deg(a.lat), deg(b.lat), deg(a.lng), deg(b.lng));
-            if (y0 > scan && y1 > scan) || (y0 < scan && y1 < scan) || y0 == y1 { return; }
-            if y0 == scan && y1 < scan { return; }  // a downward edge leaves out its start
-            if y1 == scan && y0 < scan { return; }  // an upward edge leaves out its end
-            crossings.push(if x0 == x1 { x0 } else { x0 + (scan - y0) / ((y1 - y0) / (x1 - x0)) });
-        };
-        walk_rings(block, &mut EdgeWalk { arcs, edge: &mut cross })?;
+        let mut near = NearCentre { arcs, centre, lo, hi, edges: crossings };
+        walk_rings(block, &mut near)?;
+        let scan = (near.lo + near.hi) / 2.0;
+
+        // Each kept edge's crossing of the scan line, if any, in place of the edges.
+        let mut found = 0;
+        for k in 0..crossings.len() / 4 {
+            let (y0, x0, y1, x1) = (crossings[4 * k], crossings[4 * k + 1], crossings[4 * k + 2], crossings[4 * k + 3]);
+            if (y0 > scan && y1 > scan) || (y0 < scan && y1 < scan) || y0 == y1 { continue; }
+            if y0 == scan && y1 < scan { continue; }  // a downward edge leaves out its start
+            if y1 == scan && y0 < scan { continue; }  // an upward edge leaves out its end
+            crossings[found] = if x0 == x1 { x0 } else { x0 + (scan - y0) / ((y1 - y0) / (x1 - x0)) };
+            found += 1;
+        }
+        crossings.truncate(found);
         crossings.sort_by(f64::total_cmp);
 
         let mut best = first.degrees();
@@ -341,23 +426,49 @@ impl RingVisitor for OuterRange<'_> {
     }
 }
 
-/// Calls `edge(a, b)` for every edge of a ring block's rings, a to b in its ring's direction.
-struct EdgeWalk<'a, 'e, E: FnMut(PointE7, PointE7)> {
-    arcs: ArcFiles<'a>,
-    edge: &'e mut E,
+/// An e7 coordinate in degrees, as the builder reads a PackedLocation.
+fn deg(e7: i64) -> f64 {
+    e7 as f64 / 1e7
 }
 
-impl<E: FnMut(PointE7, PointE7)> RingVisitor for EdgeWalk<'_, '_, E> {
-    fn wants_chunk(&mut self, _: &ChunkBox) -> bool {
-        true
+/// `surface_point`'s second pass over every ring: the vertex latitudes nearest `centre`, at or
+/// below it (`lo`, raised from the outer ring's lowest) and above it (`hi`, lowered from its
+/// highest), and the edges crossing the centre's line of latitude, as (y0, x0, y1, x1) in their
+/// ring's direction (every vertex starts an edge of its ring: the closing one ends where the ring
+/// began). A chunk or an arc whose vertices all lie at or below `lo` can neither move `lo` or `hi`
+/// nor cross the centre's line, so it isn't read.
+struct NearCentre<'a, 'e> {
+    arcs: ArcFiles<'a>,
+    centre: f64,
+    lo: f64,
+    hi: f64,
+    edges: &'e mut Vec<f64>,
+}
+
+impl RingVisitor for NearCentre<'_, '_> {
+    fn wants_chunk(&mut self, bbox: &ChunkBox) -> bool {
+        deg(bbox.max_lat as i64 + CHUNK_BOX_SLACK_E7) > self.lo
     }
 
     fn arc(&mut self, r: ArcRef) -> Option<()> {
+        let block = self.arcs.block(r.slot)?;
+        if arc_box_max_lat(block).is_some_and(|max| deg(max) <= self.lo) {
+            return Some(());
+        }
+        let NearCentre { centre, lo, hi, edges, .. } = self;
         let mut prev: Option<PointE7> = None;
-        let edge = &mut *self.edge;
-        arc_vertices(self.arcs.block(r.slot)?, |v| {
-            if let Some(a) = prev {
-                if r.reversed { edge(v, a) } else { edge(a, v) }
+        arc_vertices(block, |v| {
+            if let Some(p) = prev {
+                let (a, b) = if r.reversed { (v, p) } else { (p, v) };
+                let y = deg(a.lat);
+                if y <= *centre {
+                    if y > *lo { *lo = y; }
+                } else if y < *hi {
+                    *hi = y;
+                }
+                if (y <= *centre) != (deg(b.lat) <= *centre) {
+                    edges.extend([y, deg(a.lng), deg(b.lat), deg(b.lng)]);
+                }
             }
             prev = Some(v);
         })?;

@@ -340,7 +340,8 @@ struct ArcSlots {
 // slots included, becomes a tombstone, so it is reused only the day after.
 // A previous build without the sidecar (none at `prev_sidecar`) leaves every
 // slot cold, as one without the admin sidecar does, and the counts say so; a
-// sidecar there that can't be read is refused.
+// sidecar there that can't be read, or a path that can't be looked up, is
+// refused.
 ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar);
 
 // The log lines of a region's slot allocation for `set` against

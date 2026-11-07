@@ -779,8 +779,9 @@ MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& sto
 ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar) {
     using namespace gc::id_alloc;
     IdAllocator alloc;
+    // Only a sidecar the lookup finds absent starts cold; one it can't look up (ec set) is read, and refused.
     std::error_code ec;
-    const bool missing = !prev_sidecar.empty() && !std::filesystem::exists(prev_sidecar, ec);
+    const bool missing = !prev_sidecar.empty() && !std::filesystem::exists(prev_sidecar, ec) && !ec;
     if (!prev_sidecar.empty() && !missing && !alloc.load_previous(prev_sidecar))
         throw std::runtime_error("unreadable arc sidecar " + prev_sidecar);
     // The key each previous slot can be claimed by, none for its tombstones.

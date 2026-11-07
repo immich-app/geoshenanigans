@@ -29,10 +29,18 @@ on:
         required: false
         type: boolean
         default: false
+      s3_prefix:
+        description: 'Bucket prefix the run reads yesterday from and publishes under: a scratch one (one segment of a-z, 0-9, ".", "_", "-") keeps a test run off the live builds'
+        required: false
+        type: string
+        default: 'geocoder'
 
 env:
   S3_BUCKET: geoshenanigans-reverse-geocoding
-  S3_PREFIX: geocoder
+  # builds/, memwatch/ and latest.json live under it; a scheduled run has no
+  # inputs and publishes the live builds. The wikidata and tiger inputs other
+  # workflows publish are read from geocoder/ whatever the prefix.
+  S3_PREFIX: ${{ inputs.s3_prefix || 'geocoder' }}
   S3_ENDPOINT: https://t3.storage.dev
   S3_PUBLIC_URL: https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io
   # Tigris retention, in days counting the build's own date: full indexes,
@@ -190,6 +198,13 @@ jobs:
           FORCE_FRESH: ${{ inputs.force_fresh }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
+          # The cleanup steps delete under builds/ of the prefix: one segment,
+          # so a dispatch can't name a path outside it.
+          if ! [[ "$S3_PREFIX" =~ ^[a-z0-9][a-z0-9._-]*$ ]]; then
+            echo "::error::s3_prefix must be one segment of a-z, 0-9, '.', '_' and '-', starting with a letter or digit"
+            exit 1
+          fi
+          echo "Publishing under s3://$S3_BUCKET/$S3_PREFIX/"
           # Workdir + cache config
           WORKDIR="$RUNNER_TEMP/geocoder"
           mkdir -p "$WORKDIR"
@@ -668,9 +683,9 @@ jobs:
           # doesn't survive a runner-agent crash mid-step (GitHub
           # never finalises the partial step log) and the internal
           # cache bucket isn't public-readable, so we land the data
-          # at $S3_PUBLIC_URL/geocoder/memwatch/$RUN_ID.log where
+          # at $S3_PUBLIC_URL/$S3_PREFIX/memwatch/$RUN_ID.log where
           # `curl` works without auth. After a failure, fetch with:
-          #   curl $S3_PUBLIC_URL/geocoder/memwatch/$RUN_ID.log
+          #   curl $S3_PUBLIC_URL/$S3_PREFIX/memwatch/$RUN_ID.log
           # to see RSS right up to the disconnect.
           MEMWATCH_KEY="s3://$S3_BUCKET/$S3_PREFIX/memwatch/${GITHUB_RUN_ID}.log"
           # The job's memory is its cgroup's, the nearest one up from this

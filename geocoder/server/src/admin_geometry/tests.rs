@@ -612,16 +612,20 @@ fn point_on_surface_is_in_the_widest_run_inside() {
 
 #[test]
 fn point_on_surface_streams_what_the_builder_finds_over_the_rings() {
+    // Wiggling edges cross a scan line many times, and in a lattice of mixed grids arcs of
+    // different grids meet at their shared junctions.
     let mut rng = Rng::new(41);
-    for grid in [0u8, 2, 3] {
-        let l = lattice(&mut rng, (3, 3), 200_000, 40, &[grid], true);
-        let (geom, polys) = l.shapes.geometry();
-        let mut crossings = Vec::new();
-        for id in l.polygons() {
-            let (lat, lng) = interior_point(&l.shapes.rings[id as usize]);
-            let got = geom.point_on_surface_with(&polys[id as usize], &mut crossings);
-            assert_eq!(got, Some((lat as f32, lng as f32)), "grid {grid} polygon {id}");
-            assert!(geom.contains_once(&polys[id as usize], AdminPoint::new(lat, lng)), "grid {grid} polygon {id}");
+    for grids in [&[0u8][..], &[2], &[3], &[0, 2, 3]] {
+        for round in 0..4 {
+            let l = lattice(&mut rng, (3, 3), 200_000, 40, grids, true);
+            let (geom, polys) = l.shapes.geometry();
+            let mut crossings = Vec::new();
+            for id in l.polygons() {
+                let (lat, lng) = interior_point(&l.shapes.rings[id as usize]);
+                let got = geom.point_on_surface_with(&polys[id as usize], &mut crossings);
+                assert_eq!(got, Some((lat as f32, lng as f32)), "grids {grids:?} round {round} polygon {id}");
+                assert!(geom.contains_once(&polys[id as usize], AdminPoint::new(lat, lng)), "grids {grids:?} round {round} polygon {id}");
+            }
         }
     }
 }
@@ -827,4 +831,76 @@ fn a_long_ring_answers_through_its_chunk_boxes() {
         read += memo.arcs_read() as usize;
     }
     assert!(read < points.len() * 40, "{read} arcs read at {} points", points.len());
+}
+
+#[test]
+fn point_on_surface_in_answers_from_its_memo_as_from_the_passes() {
+    let mut rng = Rng::new(43);
+    let l = lattice(&mut rng, (3, 3), 200_000, 40, &[0, 2, 3], true);
+    let (geom, polys) = l.shapes.geometry();
+    let ids: Vec<u32> = l.polygons().collect();
+    let passes = |id: u32| geom.surface_point(geom.ring_block(&polys[id as usize]).unwrap(), &mut Vec::new());
+    let inside = |id: u32, other: u32| {
+        let Some((lat, lng)) = passes(id) else { return false };
+        let mut test = InsideOffEdges { arcs: geom.arcs(), p: AdminPoint::new(lat, lng).e7(), odd: false, on_edge: false };
+        walk_rings(geom.ring_block(&polys[other as usize]).unwrap(), &mut test).is_some() && test.odd && !test.on_edge
+    };
+    // Asked twice, the second time from the memo.
+    let mut held = 0;
+    for round in 0..2 {
+        for &a in &ids {
+            for &b in &ids {
+                assert_eq!(geom.point_on_surface_in(&polys[a as usize], &polys[b as usize]), inside(a, b), "round {round} {a} in {b}");
+            }
+        }
+    }
+    let memo = geom.surfaces.lock().unwrap();
+    for &a in &ids {
+        if let Some(point) = memo.get(AdminGeometry::block_key(&polys[a as usize])) {
+            assert_eq!(point, passes(a), "{a}");
+            held += 1;
+        }
+    }
+    assert!(held > ids.len() / 2, "{held} of {} points on surface held", ids.len());
+    let (insides, mut held) = (geom.insides.lock().unwrap(), 0);
+    for &a in &ids {
+        for &b in &ids {
+            let key = |id: u32| AdminGeometry::block_key(&polys[id as usize]);
+            if let Some(answer) = insides.get(key(a), key(b)) {
+                assert_eq!(answer, inside(a, b), "{a} in {b}");
+                held += 1;
+            }
+        }
+    }
+    assert!(held > ids.len() * ids.len() / 4, "{held} of {} answers held", ids.len() * ids.len());
+}
+
+#[test]
+fn the_surface_memo_keeps_the_last_answer_of_each_slot() {
+    let mut memo = SurfaceMemo::default();
+    assert_eq!(memo.get(5), None);
+    assert!(memo.slots.is_empty());
+    memo.insert(5, Some((1.0, 2.0)));
+    memo.insert(6, None);
+    assert_eq!((memo.get(5), memo.get(6), memo.get(7)), (Some(Some((1.0, 2.0))), Some(None), None));
+    assert_eq!(memo.slots.len(), SurfaceMemo::SLOTS);
+    // A key of 5's slot takes it over.
+    let other = (6..).find(|&k| SurfaceMemo::slot(k) == SurfaceMemo::slot(5)).unwrap();
+    memo.insert(other, Some((3.0, 4.0)));
+    assert_eq!((memo.get(5), memo.get(other)), (None, Some(Some((3.0, 4.0)))));
+}
+
+#[test]
+fn the_inside_memo_keeps_the_last_answer_of_each_slot() {
+    let mut memo = InsideMemo::default();
+    assert_eq!(memo.get(5, 6), None);
+    assert!(memo.slots.is_empty());
+    memo.insert(5, 6, true);
+    memo.insert(6, 5, false);
+    assert_eq!((memo.get(5, 6), memo.get(6, 5), memo.get(5, 5)), (Some(true), Some(false), None));
+    assert_eq!(memo.slots.len(), InsideMemo::SLOTS);
+    // A pair of (5, 6)'s slot takes it over.
+    let other = (7..).find(|&k| InsideMemo::slot(k, 6) == InsideMemo::slot(5, 6)).unwrap();
+    memo.insert(other, 6, false);
+    assert_eq!((memo.get(5, 6), memo.get(other, 6)), (None, Some(false)));
 }
