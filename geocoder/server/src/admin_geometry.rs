@@ -119,6 +119,34 @@ pub struct AdminGeometry {
     arc_index: FileBytes,
     arc_vertices: FileBytes,
     surfaces: Mutex<SurfaceMemo>,
+    insides: Mutex<InsideMemo>,
+}
+
+/// The answers `point_on_surface_in` gave, by the two ring blocks: a direct-mapped table of
+/// SLOTS entries like SurfaceMemo's. The address walk asks the same few pairs again and again,
+/// and each answer is a ray cast over the other polygon's arcs besides the point on surface.
+#[derive(Default)]
+struct InsideMemo {
+    slots: Vec<(u64, u64, bool)>,
+}
+
+impl InsideMemo {
+    const SLOTS: usize = 256;
+
+    fn slot(poly: u64, other: u64) -> usize {
+        ((poly ^ other.rotate_left(32)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - Self::SLOTS.trailing_zeros())) as usize
+    }
+
+    fn get(&self, poly: u64, other: u64) -> Option<bool> {
+        self.slots.get(Self::slot(poly, other)).filter(|&&(p, o, _)| (p, o) == (poly, other)).map(|&(_, _, inside)| inside)
+    }
+
+    fn insert(&mut self, poly: u64, other: u64, inside: bool) {
+        if self.slots.is_empty() {
+            self.slots = vec![(SurfaceMemo::FREE, SurfaceMemo::FREE, false); Self::SLOTS];
+        }
+        self.slots[Self::slot(poly, other)] = (poly, other, inside);
+    }
 }
 
 /// The points on surface `point_on_surface_in` found, by ring block: a direct-mapped table of
@@ -158,7 +186,7 @@ pub const ADMIN_GEOMETRY_FILES: [&str; 3] = ["admin_rings.bin", "arc_index.bin",
 
 impl AdminGeometry {
     pub fn new(rings: FileBytes, arc_index: FileBytes, arc_vertices: FileBytes) -> Self {
-        AdminGeometry { rings, arc_index, arc_vertices, surfaces: Mutex::default() }
+        AdminGeometry { rings, arc_index, arc_vertices, surfaces: Mutex::default(), insides: Mutex::default() }
     }
 
     /// The geometry files of the index in `dir`; the error names a file that is missing.
@@ -234,9 +262,18 @@ impl AdminGeometry {
     /// has no rings.
     pub fn point_on_surface_in(&self, poly: &AdminPolygon, other: &AdminPolygon) -> bool {
         let (Some(block), Some(other_block)) = (self.ring_block(poly), self.ring_block(other)) else { return false };
-        let Some((lat, lng)) = self.memo_surface_point(poly, block) else { return false };
-        let mut test = InsideOffEdges { arcs: self.arcs(), p: AdminPoint::new(lat, lng).e7(), odd: false, on_edge: false };
-        walk_rings(other_block, &mut test).is_some() && test.odd && !test.on_edge
+        let (poly_key, other_key) = (Self::block_key(poly), Self::block_key(other));
+        // A poisoned lock is the memo of a thread that panicked: its answers are still sound.
+        let memo = || self.insides.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(inside) = memo().get(poly_key, other_key) {
+            return inside;
+        }
+        let inside = self.memo_surface_point(poly, block).is_some_and(|(lat, lng)| {
+            let mut test = InsideOffEdges { arcs: self.arcs(), p: AdminPoint::new(lat, lng).e7(), odd: false, on_edge: false };
+            walk_rings(other_block, &mut test).is_some() && test.odd && !test.on_edge
+        });
+        memo().insert(poly_key, other_key, inside);
+        inside
     }
 
     /// `surface_point` of `poly`'s ring block `block`, from the memo when it holds it.

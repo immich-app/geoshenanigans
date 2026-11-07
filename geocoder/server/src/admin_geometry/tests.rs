@@ -862,6 +862,17 @@ fn point_on_surface_in_answers_from_its_memo_as_from_the_passes() {
         }
     }
     assert!(held > ids.len() / 2, "{held} of {} points on surface held", ids.len());
+    let (insides, mut held) = (geom.insides.lock().unwrap(), 0);
+    for &a in &ids {
+        for &b in &ids {
+            let key = |id: u32| AdminGeometry::block_key(&polys[id as usize]);
+            if let Some(answer) = insides.get(key(a), key(b)) {
+                assert_eq!(answer, inside(a, b), "{a} in {b}");
+                held += 1;
+            }
+        }
+    }
+    assert!(held > ids.len() * ids.len() / 4, "{held} of {} answers held", ids.len() * ids.len());
 }
 
 #[test]
@@ -877,4 +888,19 @@ fn the_surface_memo_keeps_the_last_answer_of_each_slot() {
     let other = (6..).find(|&k| SurfaceMemo::slot(k) == SurfaceMemo::slot(5)).unwrap();
     memo.insert(other, Some((3.0, 4.0)));
     assert_eq!((memo.get(5), memo.get(other)), (None, Some(Some((3.0, 4.0)))));
+}
+
+#[test]
+fn the_inside_memo_keeps_the_last_answer_of_each_slot() {
+    let mut memo = InsideMemo::default();
+    assert_eq!(memo.get(5, 6), None);
+    assert!(memo.slots.is_empty());
+    memo.insert(5, 6, true);
+    memo.insert(6, 5, false);
+    assert_eq!((memo.get(5, 6), memo.get(6, 5), memo.get(5, 5)), (Some(true), Some(false), None));
+    assert_eq!(memo.slots.len(), InsideMemo::SLOTS);
+    // A pair of (5, 6)'s slot takes it over.
+    let other = (7..).find(|&k| InsideMemo::slot(k, 6) == InsideMemo::slot(5, 6)).unwrap();
+    memo.insert(other, 6, false);
+    assert_eq!((memo.get(5, 6), memo.get(other, 6)), (None, Some(false)));
 }
