@@ -612,16 +612,20 @@ fn point_on_surface_is_in_the_widest_run_inside() {
 
 #[test]
 fn point_on_surface_streams_what_the_builder_finds_over_the_rings() {
+    // Wiggling edges cross a scan line many times, and in a lattice of mixed grids arcs of
+    // different grids meet at their shared junctions.
     let mut rng = Rng::new(41);
-    for grid in [0u8, 2, 3] {
-        let l = lattice(&mut rng, (3, 3), 200_000, 40, &[grid], true);
-        let (geom, polys) = l.shapes.geometry();
-        let mut crossings = Vec::new();
-        for id in l.polygons() {
-            let (lat, lng) = interior_point(&l.shapes.rings[id as usize]);
-            let got = geom.point_on_surface_with(&polys[id as usize], &mut crossings);
-            assert_eq!(got, Some((lat as f32, lng as f32)), "grid {grid} polygon {id}");
-            assert!(geom.contains_once(&polys[id as usize], AdminPoint::new(lat, lng)), "grid {grid} polygon {id}");
+    for grids in [&[0u8][..], &[2], &[3], &[0, 2, 3]] {
+        for round in 0..4 {
+            let l = lattice(&mut rng, (3, 3), 200_000, 40, grids, true);
+            let (geom, polys) = l.shapes.geometry();
+            let mut crossings = Vec::new();
+            for id in l.polygons() {
+                let (lat, lng) = interior_point(&l.shapes.rings[id as usize]);
+                let got = geom.point_on_surface_with(&polys[id as usize], &mut crossings);
+                assert_eq!(got, Some((lat as f32, lng as f32)), "grids {grids:?} round {round} polygon {id}");
+                assert!(geom.contains_once(&polys[id as usize], AdminPoint::new(lat, lng)), "grids {grids:?} round {round} polygon {id}");
+            }
         }
     }
 }

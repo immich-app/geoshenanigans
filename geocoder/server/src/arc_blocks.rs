@@ -284,6 +284,13 @@ pub(crate) fn arc_vertices(block: &[u8], mut f: impl FnMut(PointE7)) -> Option<u
     Some(n)
 }
 
+/// The highest latitude, in e7 units, of an arc block's vertices from its box; None for a block
+/// without a box, and a malformed one.
+pub(crate) fn arc_box_max_lat(block: &[u8]) -> Option<i64> {
+    let head = arc_head(block)?;
+    head.bbox.map(|[_, _, max_lat]| max_lat * head.step)
+}
+
 /// What the ray from a point towards +lat does at one arc.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ArcCrossings {

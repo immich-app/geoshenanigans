@@ -3,7 +3,10 @@
 //! polygon's ring block in admin_rings.bin, a list of refs to the arcs in arc_vertices.bin that
 //! the neighbours along a border share (arc_blocks.rs).
 
-use crate::arc_blocks::{arc_vertices, ring_block_contains, walk_rings, ArcFiles, ArcMemo, ArcRef, ChunkBox, RingVisitor};
+use crate::arc_blocks::{
+    arc_box_max_lat, arc_vertices, ring_block_contains, walk_rings, ArcFiles, ArcMemo, ArcRef, ChunkBox, RingVisitor,
+    CHUNK_BOX_SLACK_E7,
+};
 use crate::exact_pip::{edge_crosses, on_edge, to_e7, PointE7};
 use crate::{mmap_file, AdminPolygon, FileBytes, NO_DATA};
 
@@ -222,39 +225,37 @@ impl AdminGeometry {
     /// latitude range; the first vertex where no stretch has width. (lat, lng) in degrees.
     ///
     /// No bound in the files holds a ring's lowest latitude, and a whole exact country ring is
-    /// too large to hold, so it streams the arcs three times: the outer ring's latitude range,
-    /// then the latitudes nearest its middle, then the scan line's crossings.
+    /// too large to hold, so it streams the arcs twice: the outer ring's latitude range, then the
+    /// latitudes nearest its middle together with the edges that can cross the scan line.
     fn surface_point(&self, block: &[u8], crossings: &mut Vec<f64>) -> Option<(f64, f64)> {
         let arcs = self.arcs();
-        let deg = |e7: i64| e7 as f64 / 1e7;
 
         let mut outer = OuterRange { arcs, lo: i64::MAX, hi: i64::MIN, first: None, done: false };
         walk_rings(block, &mut outer)?;
         let first = outer.first?;
-        let (mut lo, mut hi) = (deg(outer.lo), deg(outer.hi));
+        let (lo, hi) = (deg(outer.lo), deg(outer.hi));
         let centre = (lo + hi) / 2.0;
 
-        let mut nearest = |a: PointE7, _: PointE7| {
-            let y = deg(a.lat);
-            if y <= centre {
-                if y > lo { lo = y; }
-            } else if y < hi {
-                hi = y;
-            }
-        };
-        // Every vertex starts an edge of its ring: the closing one ends where the ring began.
-        walk_rings(block, &mut EdgeWalk { arcs, edge: &mut nearest })?;
-        let scan = (lo + hi) / 2.0;
-
+        // The scan line lies strictly between lo, at or below the centre, and hi, above it, and
+        // no vertex lies between those: an edge with both ends at or below the centre (so at or
+        // below lo) or both above it (at or above hi) doesn't reach the scan line. The edges that
+        // cross the centre's line are kept, as (y0, x0, y1, x1) in their ring's direction.
         crossings.clear();
-        let mut cross = |a: PointE7, b: PointE7| {
-            let (y0, y1, x0, x1) = (deg(a.lat), deg(b.lat), deg(a.lng), deg(b.lng));
-            if (y0 > scan && y1 > scan) || (y0 < scan && y1 < scan) || y0 == y1 { return; }
-            if y0 == scan && y1 < scan { return; }  // a downward edge leaves out its start
-            if y1 == scan && y0 < scan { return; }  // an upward edge leaves out its end
-            crossings.push(if x0 == x1 { x0 } else { x0 + (scan - y0) / ((y1 - y0) / (x1 - x0)) });
-        };
-        walk_rings(block, &mut EdgeWalk { arcs, edge: &mut cross })?;
+        let mut near = NearCentre { arcs, centre, lo, hi, edges: crossings };
+        walk_rings(block, &mut near)?;
+        let scan = (near.lo + near.hi) / 2.0;
+
+        // Each kept edge's crossing of the scan line, if any, in place of the edges.
+        let mut found = 0;
+        for k in 0..crossings.len() / 4 {
+            let (y0, x0, y1, x1) = (crossings[4 * k], crossings[4 * k + 1], crossings[4 * k + 2], crossings[4 * k + 3]);
+            if (y0 > scan && y1 > scan) || (y0 < scan && y1 < scan) || y0 == y1 { continue; }
+            if y0 == scan && y1 < scan { continue; }  // a downward edge leaves out its start
+            if y1 == scan && y0 < scan { continue; }  // an upward edge leaves out its end
+            crossings[found] = if x0 == x1 { x0 } else { x0 + (scan - y0) / ((y1 - y0) / (x1 - x0)) };
+            found += 1;
+        }
+        crossings.truncate(found);
         crossings.sort_by(f64::total_cmp);
 
         let mut best = first.degrees();
@@ -341,23 +342,49 @@ impl RingVisitor for OuterRange<'_> {
     }
 }
 
-/// Calls `edge(a, b)` for every edge of a ring block's rings, a to b in its ring's direction.
-struct EdgeWalk<'a, 'e, E: FnMut(PointE7, PointE7)> {
-    arcs: ArcFiles<'a>,
-    edge: &'e mut E,
+/// An e7 coordinate in degrees, as the builder reads a PackedLocation.
+fn deg(e7: i64) -> f64 {
+    e7 as f64 / 1e7
 }
 
-impl<E: FnMut(PointE7, PointE7)> RingVisitor for EdgeWalk<'_, '_, E> {
-    fn wants_chunk(&mut self, _: &ChunkBox) -> bool {
-        true
+/// `surface_point`'s second pass over every ring: the vertex latitudes nearest `centre`, at or
+/// below it (`lo`, raised from the outer ring's lowest) and above it (`hi`, lowered from its
+/// highest), and the edges crossing the centre's line of latitude, as (y0, x0, y1, x1) in their
+/// ring's direction (every vertex starts an edge of its ring: the closing one ends where the ring
+/// began). A chunk or an arc whose vertices all lie at or below `lo` can neither move `lo` or `hi`
+/// nor cross the centre's line, so it isn't read.
+struct NearCentre<'a, 'e> {
+    arcs: ArcFiles<'a>,
+    centre: f64,
+    lo: f64,
+    hi: f64,
+    edges: &'e mut Vec<f64>,
+}
+
+impl RingVisitor for NearCentre<'_, '_> {
+    fn wants_chunk(&mut self, bbox: &ChunkBox) -> bool {
+        deg(bbox.max_lat as i64 + CHUNK_BOX_SLACK_E7) > self.lo
     }
 
     fn arc(&mut self, r: ArcRef) -> Option<()> {
+        let block = self.arcs.block(r.slot)?;
+        if arc_box_max_lat(block).is_some_and(|max| deg(max) <= self.lo) {
+            return Some(());
+        }
+        let NearCentre { centre, lo, hi, edges, .. } = self;
         let mut prev: Option<PointE7> = None;
-        let edge = &mut *self.edge;
-        arc_vertices(self.arcs.block(r.slot)?, |v| {
-            if let Some(a) = prev {
-                if r.reversed { edge(v, a) } else { edge(a, v) }
+        arc_vertices(block, |v| {
+            if let Some(p) = prev {
+                let (a, b) = if r.reversed { (v, p) } else { (p, v) };
+                let y = deg(a.lat);
+                if y <= *centre {
+                    if y > *lo { *lo = y; }
+                } else if y < *hi {
+                    *hi = y;
+                }
+                if (y <= *centre) != (deg(b.lat) <= *centre) {
+                    edges.extend([y, deg(a.lng), deg(b.lat), deg(b.lng)]);
+                }
             }
             prev = Some(v);
         })?;
