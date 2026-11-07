@@ -9,6 +9,7 @@ use crate::arc_blocks::{
 };
 use crate::exact_pip::{edge_crosses, on_edge, to_e7, PointE7};
 use crate::{mmap_file, AdminPolygon, FileBytes, NO_DATA};
+use std::sync::Mutex;
 
 /// A point as every admin test takes it: rounded once to the e7 grid, as the builder rounds the
 /// points it links (`to_e7`).
@@ -117,6 +118,39 @@ pub struct AdminGeometry {
     rings: FileBytes,
     arc_index: FileBytes,
     arc_vertices: FileBytes,
+    surfaces: Mutex<SurfaceMemo>,
+}
+
+/// The points on surface `point_on_surface_in` found, by ring block: a direct-mapped table of
+/// SLOTS entries (a block takes over its slot from the last one there), empty until its first
+/// answer. A point on surface is two passes over every arc of a polygon, and the address walk
+/// tests the same few large boundaries at point after point (a level-3 region as large as its
+/// country, say). The answers depend on nothing but the files, which the geometry owns.
+#[derive(Default)]
+struct SurfaceMemo {
+    slots: Vec<(u64, Option<(f64, f64)>)>,
+}
+
+impl SurfaceMemo {
+    const SLOTS: usize = 256;
+    /// Marks a free slot; no ring block's key is all ones (`AdminGeometry::block_key`).
+    const FREE: u64 = u64::MAX;
+
+    fn slot(key: u64) -> usize {
+        // Fibonacci hashing; the top bits of the product mix every bit of the key.
+        (key.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - Self::SLOTS.trailing_zeros())) as usize
+    }
+
+    fn get(&self, key: u64) -> Option<Option<(f64, f64)>> {
+        self.slots.get(Self::slot(key)).filter(|(k, _)| *k == key).map(|&(_, point)| point)
+    }
+
+    fn insert(&mut self, key: u64, point: Option<(f64, f64)>) {
+        if self.slots.is_empty() {
+            self.slots = vec![(Self::FREE, None); Self::SLOTS];
+        }
+        self.slots[Self::slot(key)] = (key, point);
+    }
 }
 
 /// The files `AdminGeometry::load` maps, by name.
@@ -124,7 +158,7 @@ pub const ADMIN_GEOMETRY_FILES: [&str; 3] = ["admin_rings.bin", "arc_index.bin",
 
 impl AdminGeometry {
     pub fn new(rings: FileBytes, arc_index: FileBytes, arc_vertices: FileBytes) -> Self {
-        AdminGeometry { rings, arc_index, arc_vertices }
+        AdminGeometry { rings, arc_index, arc_vertices, surfaces: Mutex::default() }
     }
 
     /// The geometry files of the index in `dir`; the error names a file that is missing.
@@ -200,9 +234,22 @@ impl AdminGeometry {
     /// has no rings.
     pub fn point_on_surface_in(&self, poly: &AdminPolygon, other: &AdminPolygon) -> bool {
         let (Some(block), Some(other_block)) = (self.ring_block(poly), self.ring_block(other)) else { return false };
-        let Some((lat, lng)) = self.surface_point(block, &mut Vec::new()) else { return false };
+        let Some((lat, lng)) = self.memo_surface_point(poly, block) else { return false };
         let mut test = InsideOffEdges { arcs: self.arcs(), p: AdminPoint::new(lat, lng).e7(), odd: false, on_edge: false };
         walk_rings(other_block, &mut test).is_some() && test.odd && !test.on_edge
+    }
+
+    /// `surface_point` of `poly`'s ring block `block`, from the memo when it holds it.
+    fn memo_surface_point(&self, poly: &AdminPolygon, block: &[u8]) -> Option<(f64, f64)> {
+        let key = Self::block_key(poly);
+        // A poisoned lock is the memo of a thread that panicked: its answers are still sound.
+        let memo = || self.surfaces.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(point) = memo().get(key) {
+            return point;
+        }
+        let point = self.surface_point(block, &mut Vec::new());
+        memo().insert(key, point);
+        point
     }
 
     /// Hints that `poly`'s rings are read soon. Never changes an answer.
