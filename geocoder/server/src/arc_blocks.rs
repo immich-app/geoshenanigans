@@ -282,24 +282,27 @@ pub(crate) fn arc_crossings(block: &[u8], p: PointE7) -> Option<ArcCrossings> {
 }
 
 /// The crossing parities of the arcs read at one point, so an arc several polygons share (a
-/// border between levels) is read once per point: a fixed table of ARC_MEMO_CAPACITY entries,
-/// open-addressed by slot. Once full it remembers nothing more and later arcs are read again. It
-/// never allocates.
+/// border between levels) is read once per point: up to ARC_MEMO_CAPACITY arcs in a fixed table
+/// of twice as many entries, open-addressed by slot, so that it is never more than half full and
+/// a probe for an arc it doesn't hold ends at a free entry within a few steps. Once it holds
+/// ARC_MEMO_CAPACITY arcs it remembers nothing more and later arcs are read again. It never
+/// allocates.
 pub struct ArcMemo {
     /// An arc slot per entry, FREE where none.
-    slots: [u32; ARC_MEMO_CAPACITY],
+    slots: [u32; ARC_MEMO_ENTRIES],
     /// Bit i: the parity of the arc in slots[i].
-    odd: u64,
+    odd: u128,
     len: u32,
     arcs_read: u32,
     vertices_read: u64,
 }
 
 pub(crate) const ARC_MEMO_CAPACITY: usize = 64;
+const ARC_MEMO_ENTRIES: usize = 2 * ARC_MEMO_CAPACITY;
 
 impl Default for ArcMemo {
     fn default() -> Self {
-        ArcMemo { slots: [ArcMemo::FREE; ARC_MEMO_CAPACITY], odd: 0, len: 0, arcs_read: 0, vertices_read: 0 }
+        ArcMemo { slots: [ArcMemo::FREE; ARC_MEMO_ENTRIES], odd: 0, len: 0, arcs_read: 0, vertices_read: 0 }
     }
 }
 
@@ -318,7 +321,7 @@ impl ArcMemo {
 
     fn home(slot: u32) -> usize {
         // Fibonacci hashing; the top bits of the product mix every bit of the slot.
-        (slot.wrapping_mul(0x9E37_79B9) >> (32 - ARC_MEMO_CAPACITY.trailing_zeros())) as usize
+        (slot.wrapping_mul(0x9E37_79B9) >> (32 - ARC_MEMO_ENTRIES.trailing_zeros())) as usize
     }
 
     /// The parity remembered for `slot`.
@@ -327,15 +330,15 @@ impl ArcMemo {
         if slot == Self::FREE || self.len == 0 {
             return None;
         }
+        // At most half the entries are taken: the probe meets a free one.
         let mut i = Self::home(slot);
-        for _ in 0..ARC_MEMO_CAPACITY {
+        loop {
             match self.slots[i] {
                 s if s == slot => return Some(self.odd >> i & 1 != 0),
                 Self::FREE => return None,
-                _ => i = (i + 1) % ARC_MEMO_CAPACITY,
+                _ => i = (i + 1) % ARC_MEMO_ENTRIES,
             }
         }
-        None
     }
 
     /// Counts an arc of `vertices` read at this point, and remembers its parity while there is
@@ -348,10 +351,10 @@ impl ArcMemo {
         }
         let mut i = Self::home(slot);
         while self.slots[i] != Self::FREE {
-            i = (i + 1) % ARC_MEMO_CAPACITY;
+            i = (i + 1) % ARC_MEMO_ENTRIES;
         }
         self.slots[i] = slot;
-        self.odd |= (odd as u64) << i;
+        self.odd |= (odd as u128) << i;
         self.len += 1;
     }
 

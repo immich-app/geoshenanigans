@@ -449,3 +449,29 @@ fn the_memo_remembers_up_to_its_capacity_and_then_nothing_more() {
     memo.arc_read(u32::MAX, true, 1);
     assert_eq!((memo.get(u32::MAX), memo.len()), (None, 0));
 }
+
+#[test]
+fn a_full_memo_ends_a_probe_at_a_free_entry_nearby() {
+    // Full, it holds as many free entries as taken ones, so a probe for an arc it doesn't hold
+    // stops at a free one instead of visiting every entry; the longest run of taken entries
+    // bounds every probe.
+    let mut rng = Rng::new(9);
+    let mut memo = ArcMemo::default();
+    while memo.len() < ARC_MEMO_CAPACITY {
+        let slot = (rng.next() % 4_000_000) as u32;
+        if memo.get(slot).is_none() {
+            memo.arc_read(slot, slot % 2 == 0, 3);
+        }
+    }
+    let free = memo.slots.iter().filter(|&&s| s == ArcMemo::FREE).count();
+    assert!(free >= ARC_MEMO_CAPACITY, "{free} free entries");
+    let longest_run = (0..memo.slots.len())
+        .map(|start| (0..memo.slots.len()).take_while(|k| memo.slots[(start + k) % memo.slots.len()] != ArcMemo::FREE).count())
+        .max()
+        .unwrap();
+    assert!(longest_run < ARC_MEMO_CAPACITY / 2, "a run of {longest_run} taken entries");
+    for k in 0..10_000u32 {
+        let slot = 5_000_000 + k;
+        assert_eq!(memo.get(slot), None);
+    }
+}
