@@ -30,6 +30,16 @@ pub(crate) const GRID_MASK: u8 = 0x03;
 pub(crate) const HAS_BOX: u8 = 0x80;
 /// 10^k for each grid exponent k.
 const GRID_STEPS: [i64; 4] = [1, 10, 100, 1000];
+/// For each grid exponent k, the grid units whose e7 value fits i32.
+const GRID_UNITS: [GridUnits; 4] = {
+    let mut units = [GridUnits { lo: 0, hi: 0 }; 4];
+    let mut k = 0;
+    while k < 4 {
+        units[k] = GridUnits { lo: i32::MIN as i64 / GRID_STEPS[k], hi: i32::MAX as i64 / GRID_STEPS[k] };
+        k += 1;
+    }
+    units
+};
 
 /// The LEB128 varint at `*at`, which it moves past it; None for one running past the end of
 /// `bytes` or past 64 bits.
@@ -199,7 +209,21 @@ struct ArcHead {
     lng: i64,
     bbox: Option<[i64; 3]>,
     deltas: usize,
-    units: std::ops::RangeInclusive<i64>,
+    units: GridUnits,
+}
+
+/// The grid units, lo..=hi, whose e7 value fits i32 (GRID_UNITS, one per grid).
+#[derive(Clone, Copy)]
+struct GridUnits {
+    lo: i64,
+    hi: i64,
+}
+
+impl GridUnits {
+    #[inline(always)]
+    fn hold(self, c: i64) -> bool {
+        self.lo <= c && c <= self.hi
+    }
 }
 
 fn arc_head(block: &[u8]) -> Option<ArcHead> {
@@ -207,21 +231,41 @@ fn arc_head(block: &[u8]) -> Option<ArcHead> {
     if flags & !(GRID_MASK | HAS_BOX) != 0 {
         return None;
     }
-    let step = GRID_STEPS[(flags & GRID_MASK) as usize];
-    let units = i32::MIN as i64 / step..=i32::MAX as i64 / step;
+    let (step, units) = (GRID_STEPS[(flags & GRID_MASK) as usize], GRID_UNITS[(flags & GRID_MASK) as usize]);
     let mut at = 1;
-    let mut coordinate = || i32_at(block, &mut at).map(i64::from).filter(|c| units.contains(c));
+    let mut coordinate = || i32_at(block, &mut at).map(i64::from).filter(|&c| units.hold(c));
     let (lat, lng) = (coordinate()?, coordinate()?);
     let bbox = if flags & HAS_BOX != 0 { Some([coordinate()?, coordinate()?, coordinate()?]) } else { None };
     Some(ArcHead { step, lat, lng, bbox, deltas: at, units })
 }
 
 /// The next vertex of an arc block in grid units, from the deltas at `*at`; None past i32 e7.
-#[inline]
-fn next_vertex(block: &[u8], at: &mut usize, head: &ArcHead, lat: i64, lng: i64) -> Option<(i64, i64)> {
+///
+/// Inlined into each vertex loop. In the simplified tiers 99.8 % of the varints hold 1 or 2
+/// bytes (22 % and 78 %), so a branch on each one's length mispredicts often. A vertex whose
+/// two varints both do is read from one 4-byte load instead, the lengths taken from two
+/// continuation bits; any other goes through `varint` a byte at a time, to the same values.
+#[inline(always)]
+fn next_vertex(block: &[u8], at: &mut usize, units: GridUnits, lat: i64, lng: i64) -> Option<(i64, i64)> {
+    if let Some(w) = block.get(*at..).and_then(<[u8]>::first_chunk::<4>) {
+        let w = u32::from_le_bytes(*w);
+        // Whether the latitude's varint has a second byte, the bytes after it, and whether
+        // the longitude's has one; each second byte must end its varint.
+        let lat2 = w >> 7 & 1;
+        let rest = w >> (8 + 8 * lat2);
+        let lng2 = rest >> 7 & 1;
+        if (lat2 & w >> 15 | lng2 & rest >> 15) & 1 == 0 {
+            // Each under 2^14: neither addition can overflow.
+            let lat_v = w & 0x7f | w >> 1 & 0x3f80 & 0u32.wrapping_sub(lat2);
+            let lng_v = rest & 0x7f | rest >> 1 & 0x3f80 & 0u32.wrapping_sub(lng2);
+            *at += (2 + lat2 + lng2) as usize;
+            let (lat, lng) = (lat + unzigzag(u64::from(lat_v)), lng + unzigzag(u64::from(lng_v)));
+            return (units.hold(lat) && units.hold(lng)).then_some((lat, lng));
+        }
+    }
     let lat = lat.checked_add(unzigzag(varint(block, at)?))?;
     let lng = lng.checked_add(unzigzag(varint(block, at)?))?;
-    (head.units.contains(&lat) && head.units.contains(&lng)).then_some((lat, lng))
+    (units.hold(lat) && units.hold(lng)).then_some((lat, lng))
 }
 
 /// Calls `f` with each vertex of an arc block in e7 units, in the order it stores them; their
@@ -233,7 +277,7 @@ pub(crate) fn arc_vertices(block: &[u8], mut f: impl FnMut(PointE7)) -> Option<u
     f(e7(lat, lng));
     let (mut at, mut n) = (head.deltas, 1u32);
     while at < block.len() {
-        (lat, lng) = next_vertex(block, &mut at, &head, lat, lng)?;
+        (lat, lng) = next_vertex(block, &mut at, head.units, lat, lng)?;
         f(e7(lat, lng));
         n = n.wrapping_add(1);
     }
@@ -262,15 +306,21 @@ pub(crate) fn arc_crossings(block: &[u8], p: PointE7) -> Option<ArcCrossings> {
             return Some(ArcCrossings::Boxed);
         }
     }
-    // A vertex is east of p exactly when its grid longitude is east of p's, floored to the grid.
-    let p_lng = p.lng.div_euclid(step);
+    // A vertex is east of p exactly when its grid longitude is east of p's, floored to the grid
+    // (each step a constant divisor, which the compiler turns into a multiplication).
+    let p_lng = match step {
+        1 => p.lng,
+        10 => p.lng.div_euclid(10),
+        100 => p.lng.div_euclid(100),
+        _ => p.lng.div_euclid(1000),
+    };
     let e7 = |lat: i64, lng: i64| PointE7 { lat: lat * step, lng: lng * step };
     let (mut lat, mut lng) = (head.lat, head.lng);
     let mut east = lng > p_lng;
     let (mut odd, mut vertices) = (false, 1u32);
     let mut at = head.deltas;
     while at < block.len() {
-        let (next_lat, next_lng) = next_vertex(block, &mut at, &head, lat, lng)?;
+        let (next_lat, next_lng) = next_vertex(block, &mut at, head.units, lat, lng)?;
         let next_east = next_lng > p_lng;
         if next_east != east && edge_crosses(e7(lat, lng), e7(next_lat, next_lng), p) {
             odd = !odd;

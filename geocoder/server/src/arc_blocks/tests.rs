@@ -475,3 +475,97 @@ fn a_full_memo_ends_a_probe_at_a_free_entry_nearby() {
         assert_eq!(memo.get(slot), None);
     }
 }
+
+/// An arc block's vertices with every varint read a byte at a time (`varint`): what
+/// `arc_vertices` must give.
+fn vertices_bytewise(block: &[u8]) -> Option<Vec<PointE7>> {
+    let head = arc_head(block)?;
+    let e7 = |lat: i64, lng: i64| PointE7 { lat: lat * head.step, lng: lng * head.step };
+    let (mut lat, mut lng) = (head.lat, head.lng);
+    let mut out = vec![e7(lat, lng)];
+    let mut at = head.deltas;
+    while at < block.len() {
+        lat = lat.checked_add(unzigzag(varint(block, &mut at)?))?;
+        lng = lng.checked_add(unzigzag(varint(block, &mut at)?))?;
+        if !(head.units.hold(lat) && head.units.hold(lng)) {
+            return None;
+        }
+        out.push(e7(lat, lng));
+    }
+    Some(out)
+}
+
+/// A varint of `v`, sometimes padded with continuation bytes of no value (as a reader must take
+/// them, though the builder writes none).
+fn padded_varint(rng: &mut Rng, v: u64, out: &mut Vec<u8>) {
+    let mut bytes = Vec::new();
+    put_varint(v, &mut bytes);
+    if rng.next() % 8 == 0 && bytes.len() < 9 {
+        let last = bytes.len() - 1;
+        bytes[last] |= 0x80;
+        for _ in 0..rng.next() % (9 - bytes.len() as u64) {
+            bytes.push(0x80);
+        }
+        bytes.push(0x00);
+    }
+    out.extend(bytes);
+}
+
+#[test]
+fn the_vertex_loops_read_what_a_byte_at_a_time_reads() {
+    // Blocks of deltas of every varint length (1 to 10 bytes, padded ones too), values that leave
+    // the grid's i32 range, every prefix and single flipped bits: the vertices, the count and the
+    // crossing parity are the byte-at-a-time reader's, malformed blocks included.
+    let mut rng = Rng::new(20261107);
+    let (mut whole, mut malformed) = (0, 0);
+    for case in 0..2000 {
+        let k = [0u8, 2, 3][case % 3];
+        let units = GRID_UNITS[k as usize];
+        let boxed = case % 5 == 0;
+        let coordinate = |rng: &mut Rng| (rng.next() % (units.hi - units.lo) as u64) as i64 + units.lo;
+        let mut block = vec![k | if boxed { HAS_BOX } else { 0 }];
+        let (lat0, lng0) = (coordinate(&mut rng) / 2, coordinate(&mut rng) / 2);
+        block.extend((lat0 as i32).to_le_bytes());
+        block.extend((lng0 as i32).to_le_bytes());
+        if boxed {
+            for _ in 0..3 {
+                block.extend((coordinate(&mut rng) as i32).to_le_bytes());
+            }
+        }
+        // The short varints most often.
+        for _ in 0..rng.next() % 60 {
+            for _ in 0..2 {
+                let bits = [3u32, 6, 6, 9, 13, 13, 13, 20, 27, 34, 45, 63][(rng.next() % 12) as usize];
+                let d = (rng.next() & ((1u64 << bits) - 1)) as i64 * if rng.next() % 2 == 0 { 1 } else { -1 };
+                padded_varint(&mut rng, zigzag(d), &mut block);
+            }
+        }
+        let p = PointE7 { lat: lat0 * 10i64.pow(k as u32), lng: lng0 * 10i64.pow(k as u32) + 1 };
+        let mut check = |b: &[u8]| {
+            let want = vertices_bytewise(b);
+            assert_eq!(decoded(b), want, "case {case} {} bytes", b.len());
+            match (&want, arc_crossings(b, p)) {
+                (None, got) => {
+                    assert!(got.is_none() || got == Some(ArcCrossings::Boxed), "case {case}");
+                    malformed += 1;
+                }
+                (Some(v), Some(ArcCrossings::Read { odd, vertices })) => {
+                    assert_eq!((odd, vertices as usize), (odd_crossings(v, p), v.len()), "case {case}");
+                    whole += 1;
+                }
+                (Some(_), got) => assert!(got == Some(ArcCrossings::Boxed), "case {case}"),
+            }
+        };
+        check(&block);
+        for len in (0..block.len()).step_by(1 + block.len() / 40) {
+            check(&block[..len]);
+        }
+        for _ in 0..8 {
+            let mut bad = block.clone();
+            let at = (rng.next() % bad.len() as u64) as usize;
+            bad[at] ^= 1 << (rng.next() % 8);
+            check(&bad);
+        }
+    }
+    assert!(whole > 1000 && malformed > 1000, "{whole} read whole, {malformed} malformed");
+}
