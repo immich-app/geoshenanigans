@@ -6860,19 +6860,29 @@ mod admin_scan_tests {
         // The builder flags an entry interior only where the rings hold the whole cell, so the scan
         // takes it as holding the point: find_admin, the current boundaries and the chain lookup
         // read no arc of an interior entry, and test only the others.
-        let idx = admin_index(&[
+        let mut idx = admin_index(&[
             ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
             ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, true)]),
             ring("Paris", 8, 2.0, (21.9, 27.4, 22.1, 27.7), &[(0, true)]),
             Ring { place_type: 5, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(0, true)]) },
+            // A smaller state holding the point, which Paris's chain doesn't take.
+            ring("Kharga", 4, 20.0, (22.0, 27.0, 26.0, 31.0), &[(0, true)]),
         ]);
+        // Each polygon's next larger one: Paris in New Valley in Egypt.
+        let parents = [NO_DATA, 0, 1, NO_DATA, 0];
+        idx.admin_parents = Some(FileBytes::Owned(parents.iter().flat_map(|p| p.to_le_bytes()).collect()));
         let mut scan = AdminScan::new(&idx, Q.0, Q.1);
         let a = idx.find_admin_in(&mut scan);
-        assert_eq!((a.country, a.state, a.neighbourhood), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
+        assert_eq!((a.country, a.state, a.city, a.neighbourhood), (Some("Egypt"), Some("Kharga"), Some("Paris"), Some("Bir Tarfawi")));
         let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"));
         assert_eq!(gates.for_rank(CurrentBoundaries::CITY).map(|p| idx.get_string(p.name_id)), Some("Paris"));
-        let c = idx.find_admin_from_chain_in(0, &mut scan);
-        assert_eq!((c.country, c.state), (Some("Egypt"), Some("New Valley")));
+        assert_eq!(scan.pip.memo.arcs_read(), 0);
+        // The chain lookup from Paris over a scan of its own: its boundaries are the chain's (New
+        // Valley, not the scan's Kharga, so this is no fallback to find_admin), its place area the
+        // scan's interior entry.
+        let mut scan = AdminScan::new(&idx, Q.0, Q.1);
+        let c = idx.find_admin_from_chain_in(2, &mut scan);
+        assert_eq!((c.country, c.state, c.city, c.neighbourhood), (Some("Egypt"), Some("New Valley"), Some("Paris"), Some("Bir Tarfawi")));
         assert_eq!(scan.pip.memo.arcs_read(), 0);
         // The same rings listed not interior are tested.
         let idx = admin_index(&[
