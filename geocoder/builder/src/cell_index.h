@@ -85,7 +85,8 @@ std::string admin_sidecar_path(const std::string& region_dir);
 // polygon at its own slot with its ring block in the full set, a tombstone
 // at a strategy-2 one), and the tier's arc_index.bin and arc_vertices.bin.
 // quality/exact/ holds the full set's sidecars too: admin_polygons.osm_ids
-// (admin_sidecar_path) and arc_index.osm_ids (arc_sidecar_path).
+// (admin_sidecar_path), arc_index.osm_ids (arc_sidecar_path) and
+// arc_index.fallback.osm_ids (arc_fallback_sidecar_path).
 void write_admin_tiers(const ParsedData& data, const std::string& region_dir);
 
 // Writes admin-minimal, the smallest useful set, in two dirs under
@@ -105,7 +106,7 @@ void write_admin_tiers(const ParsedData& data, const std::string& region_dir);
 //   - admin-minimal/, for a set without POIs: its polygons in its own stable
 //     slots (region_prev's admin-minimal sidecar), and a core of its own,
 //     only the strings its records name, in the shared core's order, with
-//     a layout of that core alone. It holds the minimal set's arc sidecar.
+//     a layout of that core alone. It holds the minimal set's arc sidecars.
 //   - admin-minimal-poi/, for a set with a POI tier: the shared polygon
 //     slots, which a POI's parent_poly_id names (a tombstone at each slot
 //     it drops), and the shared core strings and layout, which the POI

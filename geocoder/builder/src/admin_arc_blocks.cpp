@@ -344,8 +344,8 @@ namespace {
 
 std::string slot_line(const AdminArcSlotCounts& c, size_t slots) {
     std::ostringstream line;
-    line << c.kept << " kept, " << c.recycled << " recycled, " << c.appended << " appended, " << c.tombstones
-         << " tombstones (" << slots << " slots)";
+    line << c.kept << " kept, " << c.by_way_set << " by way set, " << c.by_ends << " by ends, " << c.recycled
+         << " recycled, " << c.appended << " appended, " << c.tombstones << " tombstones (" << slots << " slots)";
     return line.str();
 }
 
@@ -503,7 +503,8 @@ void assign_region_arc_slots(AdminArcBlocks& blocks, const std::string& prev_reg
     for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
         ArcSetBlocks& s = blocks.set(set);
         const std::string prev = prev_region_dir.empty() ? "" : arc_sidecar_path(prev_region_dir, set);
-        ArcSlots slots = allocate_arc_slots(s.keys, prev);
+        const std::string prev_fallback = prev_region_dir.empty() ? "" : arc_fallback_sidecar_path(prev_region_dir, set);
+        ArcSlots slots = allocate_arc_slots(s.keys, prev, s.fallback_keys, prev_fallback);
         std::cerr << arc_slot_start_lines(region, set, prev, slots.counts);
         s.slots = std::move(slots.slots);
         s.sidecar = std::move(slots.sidecar);

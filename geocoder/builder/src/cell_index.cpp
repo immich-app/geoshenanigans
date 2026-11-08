@@ -1363,6 +1363,7 @@ void write_admin_minimal(const ParsedData& data, const std::string& region_dir, 
                             {names.bytes(), core_only_strings_layout(names.bytes().size()), &names});
     gc::id_alloc::IdAllocator::write_sidecar(arc_sidecar_path(region_dir, ArcSet::Minimal),
                                              data.admin_arcs.set(ArcSet::Minimal).sidecar);
+    write_arc_fallback_sidecar(arc_fallback_sidecar_path(region_dir, ArcSet::Minimal), data.admin_arcs.set(ArcSet::Minimal));
 
     const std::string poi_dir = region_dir + "/" + kAdminMinimalPoiDir;
     ensure_dir(poi_dir);
@@ -1408,5 +1409,6 @@ void write_admin_tiers(const ParsedData& data, const std::string& region_dir) {
     }
     emit_strategy2_sidecar(admin_sidecar_path(region_dir), data.admin_sidecar_blob, packed_fallback);
     gc::id_alloc::IdAllocator::write_sidecar(arc_sidecar_path(region_dir, ArcSet::Full), arcs.set(ArcSet::Full).sidecar);
+    write_arc_fallback_sidecar(arc_fallback_sidecar_path(region_dir, ArcSet::Full), arcs.set(ArcSet::Full));
     std::cerr << summary.str() << std::endl;
 }

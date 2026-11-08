@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
@@ -917,12 +918,24 @@ MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& sto
     return out;
 }
 
-ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar) {
-    using namespace gc::id_alloc;
-    IdAllocator alloc;
-    // Only a sidecar the lookup finds absent starts cold; one it can't look up (ec set) is read, and refused.
+namespace {
+
+// Whether a lookup finds nothing at `path`; one it can't make (ec set) says
+// nothing, and the read that follows refuses it.
+bool absent(const std::string& path) {
     std::error_code ec;
-    const bool missing = !prev_sidecar.empty() && !std::filesystem::exists(prev_sidecar, ec) && !ec;
+    return !std::filesystem::exists(path, ec) && !ec;
+}
+
+}  // namespace
+
+ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar,
+                            const std::vector<ArcFallbackKeys>& fallback, const std::string& prev_fallback_sidecar) {
+    using namespace gc::id_alloc;
+    if (!fallback.empty() && fallback.size() != keys.size()) throw std::logic_error("arc fallback keys out of step with the keys");
+    IdAllocator alloc;
+    // Only a sidecar the lookup finds absent starts cold.
+    const bool missing = !prev_sidecar.empty() && absent(prev_sidecar);
     if (!prev_sidecar.empty() && !missing && !alloc.load_previous(prev_sidecar))
         throw std::runtime_error("unreadable arc sidecar " + prev_sidecar);
     // The key each previous slot can be claimed by, none for its tombstones.
@@ -932,9 +945,25 @@ ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string
         const SidecarSlot& slot = alloc.slots()[s];
         if (is_reclaimable(slot)) prev_key[s] = make_key(static_cast<ObjectType>(slot.object_type), slot.stable_id);
     }
+    // The previous slots' fallback keys, and a pass for each: the way set, then the ends.
+    const bool fallback_missing =
+        prev_slots > 0 && !fallback.empty() && (prev_fallback_sidecar.empty() || absent(prev_fallback_sidecar));
+    std::vector<ArcFallbackKeys> prev_fallback;
+    if (prev_slots > 0 && !fallback.empty() && !fallback_missing)
+        prev_fallback = read_arc_fallback_sidecar(prev_fallback_sidecar, prev_slots);
+    std::vector<FallbackPass> passes;
+    if (!prev_fallback.empty()) {
+        passes.push_back({[&](size_t i) { return fallback[i].way_set; }, [&](uint32_t s) { return prev_fallback[s].way_set; }});
+        passes.push_back({[&](size_t i) { return fallback[i].ends; }, [&](uint32_t s) { return prev_fallback[s].ends; }});
+    }
 
     ArcSlots out;
-    out.slots = alloc.allocate_all(keys.size(), [&](size_t i) { return SlotIdentity{ObjectType::ARC, keys[i]}; });
+    out.slots = alloc.allocate_all(keys.size(), [&](size_t i) { return SlotIdentity{ObjectType::ARC, keys[i]}; },
+                                   kRecordsPerMatchPass, passes);
+    if (!passes.empty()) {
+        out.counts.by_way_set = alloc.fallback_matches()[0];
+        out.counts.by_ends = alloc.fallback_matches()[1];
+    }
     alloc.finalize();
     out.sidecar = alloc.take_slots();
     // Of a repeated key the allocator reclaims only the lowest previous slot
@@ -943,14 +972,18 @@ ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string
     for (uint32_t s : out.slots) held[s] = 1;
     for (size_t s = 0; s < out.sidecar.size(); s++)
         if (!held[s] && !is_tombstone(out.sidecar[s])) out.sidecar[s] = tombstone_of(out.sidecar[s]);
+    // A previous slot that isn't the key's: by a fallback key, else recycled.
+    size_t reused = 0;
     for (size_t i = 0; i < keys.size(); i++) {
         const uint32_t s = out.slots[i];
         if (s >= prev_slots) out.counts.appended++;
         else if (prev_key[s] == make_key(ObjectType::ARC, keys[i])) out.counts.kept++;
-        else out.counts.recycled++;
+        else reused++;
     }
+    out.counts.recycled = reused - out.counts.by_way_set - out.counts.by_ends;
     out.counts.tombstones = out.sidecar.size() - keys.size();
     out.counts.previous_sidecar_missing = missing;
+    out.counts.previous_fallback_sidecar_missing = fallback_missing;
     return out;
 }
 
@@ -964,31 +997,88 @@ std::string arc_slot_start_lines(const std::string& region, ArcSet set, const st
              << ", every slot cold\n";
     line << "ARC_CHECK slots=arcs set=" << set_name << " region=" << region
          << " previous_sidecar_missing=" << counts.previous_sidecar_missing << "\n";
+    if (counts.previous_sidecar_missing) return line.str();
+    if (counts.previous_fallback_sidecar_missing)
+        line << "  " << region << " arcs: no previous " << set_name << " arc fallback keys beside " << prev_sidecar
+             << ", slots by arc keys alone\n";
+    line << "ARC_CHECK fallbacks=arcs set=" << set_name << " region=" << region
+         << " previous_fallback_sidecar_missing=" << counts.previous_fallback_sidecar_missing
+         << " by_way_set=" << counts.by_way_set << " by_ends=" << counts.by_ends << "\n";
     return line.str();
-}
-
-std::string arc_sidecar_path(const std::string& region_dir, ArcSet set) {
-    return region_dir + (set == ArcSet::Full ? "/quality/exact" : "/admin-minimal") + "/arc_index.osm_ids";
 }
 
 namespace {
 
-// Slots for a set's arcs in presentation order (key(a)) against the
-// previous planet build's sidecar of that set.
-template <class Key>
-ArcSlots planet_slots(size_t n, Key key, const std::string& prev_planet_dir, ArcSet set) {
+std::string arc_sidecar_dir(const std::string& region_dir, ArcSet set) {
+    return region_dir + (set == ArcSet::Full ? "/quality/exact" : "/admin-minimal");
+}
+
+}  // namespace
+
+std::string arc_sidecar_path(const std::string& region_dir, ArcSet set) {
+    return arc_sidecar_dir(region_dir, set) + "/arc_index.osm_ids";
+}
+
+std::string arc_fallback_sidecar_path(const std::string& region_dir, ArcSet set) {
+    return arc_sidecar_dir(region_dir, set) + "/arc_index.fallback.osm_ids";
+}
+
+void write_arc_fallback_sidecar(const std::string& path, const ArcSetBlocks& set) {
+    if (set.slots.size() != set.arcs() || set.fallback_keys.size() != set.arcs())
+        throw std::logic_error("arc fallback keys out of step with their set");
+    std::vector<ArcFallbackKeys> at_slot(set.sidecar.size());
+    for (size_t a = 0; a < set.arcs(); a++) {
+        if (set.slots[a] >= at_slot.size()) throw std::logic_error("an arc slot past its set's slot table");
+        at_slot[set.slots[a]] = set.fallback_keys[a];
+    }
+    if (at_slot.size() > UINT32_MAX) throw std::length_error(path + " past 2^32 slots");
+    const uint32_t header[3] = {kArcFallbackSidecarMagic, kArcFallbackSidecarVersion, static_cast<uint32_t>(at_slot.size())};
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(header), sizeof header);
+    f.write(reinterpret_cast<const char*>(at_slot.data()), static_cast<std::streamsize>(at_slot.size() * sizeof(ArcFallbackKeys)));
+    f.flush();
+    if (!f) throw std::runtime_error("failed to write " + path);
+}
+
+std::vector<ArcFallbackKeys> read_arc_fallback_sidecar(const std::string& path, size_t slots) {
+    auto refused = [&](const std::string& why) { return std::runtime_error("unreadable arc fallback sidecar " + path + ": " + why); };
+    std::ifstream f(path, std::ios::binary);
+    uint32_t header[3] = {0, 0, 0};
+    if (!f.read(reinterpret_cast<char*>(header), sizeof header)) throw refused("no header");
+    if (header[0] != kArcFallbackSidecarMagic || header[1] != kArcFallbackSidecarVersion) throw refused("not one");
+    if (header[2] != slots)
+        throw refused(std::to_string(header[2]) + " slots beside " + std::to_string(slots) + " in arc_index.osm_ids");
+    std::vector<ArcFallbackKeys> out(slots);
+    if (!f.read(reinterpret_cast<char*>(out.data()), static_cast<std::streamsize>(slots * sizeof(ArcFallbackKeys))))
+        throw refused("cut short");
+    if (f.peek() != std::char_traits<char>::eof()) throw refused("bytes past its slots");
+    return out;
+}
+
+namespace {
+
+// Slots for a set's arcs in presentation order (key(a), fallback(a))
+// against the previous planet build's sidecars of that set.
+template <class Key, class Fallback>
+ArcSlots planet_slots(size_t n, Key key, Fallback fallback, const std::string& prev_planet_dir, ArcSet set) {
     std::vector<uint64_t> keys(n);
-    for (size_t a = 0; a < n; a++) keys[a] = key(a);
+    std::vector<ArcFallbackKeys> fallbacks(n);
+    for (size_t a = 0; a < n; a++) {
+        keys[a] = key(a);
+        fallbacks[a] = fallback(a);
+    }
     const std::string prev = prev_planet_dir.empty() ? "" : arc_sidecar_path(prev_planet_dir, set);
-    ArcSlots slots = allocate_arc_slots(keys, prev);
+    const std::string prev_fallback = prev_planet_dir.empty() ? "" : arc_fallback_sidecar_path(prev_planet_dir, set);
+    ArcSlots slots = allocate_arc_slots(keys, prev, fallbacks, prev_fallback);
     std::cerr << arc_slot_start_lines("planet", set, prev, slots.counts);
     return slots;
 }
 
 std::string slot_summary(const AdminArcSlotCounts& s, size_t slots) {
     std::ostringstream line;
-    line << "planet slots: " << s.kept << " kept, " << s.recycled << " recycled, " << s.appended << " appended, "
-         << s.tombstones << " tombstones (" << slots << " slots)";
+    line << "planet slots: " << s.kept << " kept, " << s.by_way_set << " by way set, " << s.by_ends << " by ends, "
+         << s.recycled << " recycled, " << s.appended << " appended, " << s.tombstones << " tombstones (" << slots
+         << " slots)";
     return line.str();
 }
 
@@ -1019,8 +1109,8 @@ AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>
     auto cpu = CpuTicks::now();
     AdminArcs arcs = build_arc_topology(store, threads, [&](const char* step) { log_phase(step, t, cpu); });
 
-    ArcSlots slots = planet_slots(arcs.arcs.size(), [&](size_t a) { return arcs.arcs[a].key; }, prev_planet_dir,
-                                  ArcSet::Full);
+    ArcSlots slots = planet_slots(arcs.arcs.size(), [&](size_t a) { return arcs.arcs[a].key; },
+                                  [&](size_t a) { return arcs.arcs[a].fallback; }, prev_planet_dir, ArcSet::Full);
     for (size_t a = 0; a < arcs.arcs.size(); a++) arcs.arcs[a].planet_slot = slots.slots[a];
     arcs.planet_sidecar = std::move(slots.sidecar);
     arcs.slot_counts = slots.counts;
@@ -1030,8 +1120,8 @@ AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>
     free_storage(arcs.way_at);
     free_storage(arcs.ways);
     MinimalArcs& minimal = arcs.minimal;
-    slots = planet_slots(minimal.arcs.size(), [&](size_t a) { return minimal.arcs[a].key; }, prev_planet_dir,
-                         ArcSet::Minimal);
+    slots = planet_slots(minimal.arcs.size(), [&](size_t a) { return minimal.arcs[a].key; },
+                         [&](size_t a) { return minimal.arcs[a].fallback; }, prev_planet_dir, ArcSet::Minimal);
     for (size_t a = 0; a < minimal.arcs.size(); a++) minimal.arcs[a].planet_slot = slots.slots[a];
     minimal.planet_sidecar = std::move(slots.sidecar);
     minimal.slot_counts = slots.counts;

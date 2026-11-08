@@ -67,6 +67,7 @@ struct ArcFallbackKeys {
     uint64_t way_set = gc::id_alloc::kNoFallbackKey;
     uint64_t ends = gc::id_alloc::kNoFallbackKey;
 };
+static_assert(sizeof(ArcFallbackKeys) == 16, "an arc fallback sidecar slot is 16 bytes");
 inline bool operator==(const ArcFallbackKeys& a, const ArcFallbackKeys& b) {
     return a.way_set == b.way_set && a.ends == b.ends;
 }
@@ -181,11 +182,15 @@ struct AdminArcCounts {
 };
 
 struct AdminArcSlotCounts {
-    size_t kept = 0;      // the previous build's slot of the arc's key
-    size_t recycled = 0;  // a slot that was a tombstone in the previous build
+    size_t kept = 0;        // the previous build's slot of the arc's key
+    size_t by_way_set = 0;  // the previous slot of an arc of its way set (a fallback pass)
+    size_t by_ends = 0;     // the previous slot of an arc of its ends (the next)
+    size_t recycled = 0;    // a slot that was a tombstone in the previous build
     size_t appended = 0;
     size_t tombstones = 0;
     size_t previous_sidecar_missing = 0;  // 1: a previous build was given without this sidecar
+    // 1: its arc slots came without their fallback keys (arc_index.fallback.osm_ids)
+    size_t previous_fallback_sidecar_missing = 0;
 };
 
 // One arc of the minimal set: full arcs chained end to end, each walked as
@@ -380,25 +385,55 @@ struct ArcSlots {
 
 // Slots for arcs keyed `keys`, in presentation order, against the previous
 // build's sidecar at `prev_sidecar` (none when empty): a key that held a slot
-// keeps it (the lowest presentation index of a repeated key), the others take
-// a slot that was a tombstone in the previous build, then new ones. A slot the
+// keeps it (the lowest presentation index of a repeated key). The others,
+// given their fallback keys (`fallback`, parallel to `keys`) and the
+// previous build's (its fallback sidecar at `prev_fallback_sidecar`), take
+// the previous slot no key held whose arc had their way set, then their
+// ends, where exactly one such arc and one such slot have that key; then a
+// slot that was a tombstone in the previous build, then new ones. A slot the
 // previous build's arcs held and no arc holds now, a repeated key's other
 // slots included, becomes a tombstone, so it is reused only the day after.
 // A previous build without the sidecar (none at `prev_sidecar`) leaves every
-// slot cold, as one without the admin sidecar does, and the counts say so; a
-// sidecar there that can't be read, or a path that can't be looked up, is
-// refused.
-ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar);
+// slot cold, as one without the admin sidecar does, and one with it but
+// without the fallback sidecar (none at `prev_fallback_sidecar`, the first
+// night with fallback keys) matches by keys alone; the counts say so. A
+// sidecar there that can't be read (a fallback sidecar of another slot
+// count too), or a path that can't be looked up, is refused.
+ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar,
+                            const std::vector<ArcFallbackKeys>& fallback = {},
+                            const std::string& prev_fallback_sidecar = "");
 
 // The log lines of a region's slot allocation for `set` against
 // `prev_sidecar`, when a previous build was given: the cold start's, and the
-// ARC_CHECK count o11y reports.
+// ARC_CHECK counts o11y reports; with the sidecar there, the fallback
+// passes' too.
 std::string arc_slot_start_lines(const std::string& region, ArcSet set, const std::string& prev_sidecar,
                                  const AdminArcSlotCounts& counts);
 
-// Where a region's arc sidecar sits under its dir: the full set's with the
-// exact tier, the minimal set's with admin-minimal.
+// Where a region's arc sidecars sit under its dir: the full set's with the
+// exact tier, the minimal set's with admin-minimal. arc_index.osm_ids holds
+// the slots (IdAllocator's), arc_index.fallback.osm_ids their arcs' fallback
+// keys.
 std::string arc_sidecar_path(const std::string& region_dir, ArcSet set);
+std::string arc_fallback_sidecar_path(const std::string& region_dir, ArcSet set);
+
+// arc_index.fallback.osm_ids: a header of u32 magic, u32 version and u32
+// slot count, then each slot's ArcFallbackKeys (16 B) in slot order,
+// kNoFallbackKey twice for a tombstone. Its suffix keeps it out of the
+// client files, as every strategy-2 sidecar is.
+constexpr uint32_t kArcFallbackSidecarMagic = 0xFA11BAC5;
+constexpr uint32_t kArcFallbackSidecarVersion = 1;
+
+struct ArcSetBlocks;
+
+// Writes set's fallback sidecar at `path`: its arcs' fallback keys at their
+// slots, among all of its slot table's.
+void write_arc_fallback_sidecar(const std::string& path, const ArcSetBlocks& set);
+
+// The fallback keys of a fallback sidecar of `slots` slots (those of the
+// arc_index.osm_ids beside it). Refused (std::runtime_error) unless it reads
+// whole, as one of that many slots.
+std::vector<ArcFallbackKeys> read_arc_fallback_sidecar(const std::string& path, size_t slots);
 
 // The minimal set over the full set `arcs` of the store: the rings of the
 // polygons `in_minimal` marks (parallel to the store's polygons), cut only

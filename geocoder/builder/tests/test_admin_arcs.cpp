@@ -576,7 +576,8 @@ TEST(a_previous_build_without_an_arc_sidecar_leaves_every_arc_slot_cold_and_says
     CHECK(warm.slots == std::vector<uint32_t>({2, 0}));
     CHECK_EQ(warm.counts.previous_sidecar_missing, size_t(0));
     CHECK(arc_slot_start_lines("europe", ArcSet::Full, dir.path() + "/1", warm.counts) ==
-          "ARC_CHECK slots=arcs set=full region=europe previous_sidecar_missing=0\n");
+          "ARC_CHECK slots=arcs set=full region=europe previous_sidecar_missing=0\n"
+          "ARC_CHECK fallbacks=arcs set=full region=europe previous_fallback_sidecar_missing=0 by_way_set=0 by_ends=0\n");
     CHECK(arc_slot_start_lines("planet", ArcSet::Full, "", allocate_arc_slots({1}, "").counts).empty());
     // A sidecar that is there but can't be read is refused, not taken for a cold start.
     std::ofstream(dir.path() + "/garbage") << "not a sidecar";

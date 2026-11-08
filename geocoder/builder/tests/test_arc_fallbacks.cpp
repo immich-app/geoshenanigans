@@ -5,6 +5,8 @@
 #include "admin_arcs.h"
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <random>
 #include <set>
@@ -14,6 +16,7 @@
 #include <vector>
 
 #include "parsed_data.h"
+#include "scratch_dir.h"
 #include "test_framework.h"
 
 using gctest::refusal_of;
@@ -391,4 +394,304 @@ TEST(the_arc_stage_carries_the_fallback_keys_to_its_sets_and_continents_and_free
         REQUIRE(to.fallback_keys.size() == to.arcs() && to.arcs() > 0);
         for (size_t a = 0; a < to.arcs(); a++) CHECK(to.fallback_keys[a] == by_key.at(to.keys[a]));
     }
+}
+
+// --- Slots by fallback keys ---
+
+namespace {
+
+namespace fs = std::filesystem;
+
+// A set as the allocator left it: its keys, fallback keys, slots and table.
+ArcSetBlocks set_of(const std::vector<uint64_t>& keys, const std::vector<ArcFallbackKeys>& fallback, const ArcSlots& slots) {
+    ArcSetBlocks set;
+    set.keys = keys;
+    set.fallback_keys = fallback;
+    set.slots = slots.slots;
+    set.sidecar = slots.sidecar;
+    return set;
+}
+
+// Both of a region's sets written as a previous build's sidecars under region_dir.
+void write_region_sidecars(const std::string& region_dir, const AdminArcBlocks& blocks, bool with_fallback = true) {
+    for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
+        const std::string sidecar = arc_sidecar_path(region_dir, set);
+        fs::create_directories(fs::path(sidecar).parent_path());
+        gc::id_alloc::IdAllocator::write_sidecar(sidecar, blocks.set(set).sidecar);
+        if (with_fallback) write_arc_fallback_sidecar(arc_fallback_sidecar_path(region_dir, set), blocks.set(set));
+    }
+}
+
+// A planet day of the lattice's cells: its store, arc stage (chained on the
+// previous build at prev_dir, none when empty) and encoded sets.
+struct Day {
+    AdminExactRings store;
+    AdminArcs arcs;
+    AdminArcBlocks blocks;
+};
+Day planet_day(const WayLattice& lattice, const std::vector<bool>& in_minimal, const std::string& prev_dir) {
+    Day d;
+    d.store = store_of(lattice.cells());
+    d.arcs = build_admin_arcs(d.store, in_minimal, prev_dir.empty() ? "" : prev_dir + "/planet", 2);
+    d.blocks = encode_admin_arcs(d.arcs, d.store, 2);
+    return d;
+}
+
+// The smallest inner vertex of an edge, moved `dlat` (keeping its place
+// among the edge's vertices: the edges here are 1000 long, jittered 125).
+void move_smallest(Ring& edge, int32_t dlat) {
+    auto smallest = std::min_element(edge.begin(), edge.end(), [](const PackedLocation& a, const PackedLocation& b) {
+        return vertex_key(a) < vertex_key(b);
+    });
+    smallest->lat_e7 += dlat;
+}
+
+enum class PairBy { WaySet, Ends };
+
+// Whether day two's set holds every slot day one's did and no other: an
+// arc of a key day one had at that key's slot, each of the `changed` others
+// at the slot of day one's arc of its way set or its ends (unique here), the
+// counts saying how.
+void check_slots_kept(const ArcSetBlocks& one, const ArcSetBlocks& two, PairBy by, size_t changed, size_t by_way_set,
+                      size_t by_ends) {
+    auto pair_key = [&](const ArcFallbackKeys& k) { return by == PairBy::WaySet ? k.way_set : k.ends; };
+    std::map<uint64_t, uint32_t> slot_of_key, slot_of_pair;
+    for (size_t a = 0; a < one.arcs(); a++) {
+        slot_of_key[one.keys[a]] = one.slots[a];
+        slot_of_pair[pair_key(one.fallback_keys[a])] = one.slots[a];
+    }
+    size_t others = 0;
+    for (size_t a = 0; a < two.arcs(); a++) {
+        const auto it = slot_of_key.find(two.keys[a]);
+        if (it != slot_of_key.end()) {
+            CHECK_EQ(two.slots[a], it->second);
+            continue;
+        }
+        others++;
+        const auto paired = slot_of_pair.find(pair_key(two.fallback_keys[a]));
+        REQUIRE(paired != slot_of_pair.end());
+        CHECK_EQ(two.slots[a], paired->second);
+    }
+    CHECK_EQ(others, changed);
+    const AdminArcSlotCounts& c = two.slot_counts;
+    CHECK_EQ(c.kept, two.arcs() - changed);
+    CHECK_EQ(c.by_way_set, by_way_set);
+    CHECK_EQ(c.by_ends, by_ends);
+    CHECK_EQ(c.recycled + c.appended + c.tombstones, size_t(0));
+    CHECK_EQ(c.previous_fallback_sidecar_missing, size_t(0));
+    CHECK_EQ(two.sidecar.size(), one.sidecar.size());
+}
+
+}  // namespace
+
+TEST(lost_arc_keys_take_their_previous_slots_by_way_set_then_by_ends) {
+    using namespace gc::id_alloc;
+    const ScratchDir dir("arc-fallback-passes");
+    auto day = [&](int n, const std::vector<uint64_t>& keys, const std::vector<ArcFallbackKeys>& fallback, int prev) {
+        const std::string at = dir.path() + "/" + std::to_string(prev);
+        ArcSlots slots = allocate_arc_slots(keys, prev ? at : "", fallback, prev ? at + ".fallback" : "");
+        const std::string next = dir.path() + "/" + std::to_string(n);
+        IdAllocator::write_sidecar(next, slots.sidecar);
+        write_arc_fallback_sidecar(next + ".fallback", set_of(keys, fallback, slots));
+        return slots;
+    };
+    const ArcSlots one = day(1, {10, 20, 30, 40}, {{100, 200}, {101, 201}, {102, 202}, {103, 203}}, 0);
+    CHECK(one.slots == std::vector<uint32_t>({0, 1, 2, 3}));
+    // 10's arc keeps its way set, 20's its ends; 40 goes and 41 is new.
+    const std::vector<ArcFallbackKeys> fallback = {{100, 900}, {555, 201}, {102, 202}, {777, 888}};
+    const ArcSlots two = day(2, {11, 21, 30, 41}, fallback, 1);
+    CHECK(two.slots == std::vector<uint32_t>({0, 1, 2, 4}));
+    CHECK_EQ(two.counts.kept, size_t(1));
+    CHECK_EQ(two.counts.by_way_set, size_t(1));
+    CHECK_EQ(two.counts.by_ends, size_t(1));
+    CHECK_EQ(two.counts.recycled, size_t(0));
+    CHECK_EQ(two.counts.appended, size_t(1));
+    CHECK_EQ(two.counts.tombstones, size_t(1));
+    REQUIRE(two.sidecar.size() == 5u);
+    CHECK(is_tombstone(two.sidecar[3]));
+    CHECK(two.sidecar[0].stable_id == 11 && two.sidecar[1].stable_id == 21);
+    CHECK(read_arc_fallback_sidecar(dir.path() + "/2.fallback", 5) ==
+          std::vector<ArcFallbackKeys>({{100, 900}, {555, 201}, {102, 202}, {}, {777, 888}}));
+    // The day after, the slots are their new keys'; 50 takes 40's tombstone.
+    std::vector<ArcFallbackKeys> more = fallback;
+    more.push_back({600, 601});
+    const ArcSlots three = day(3, {11, 21, 30, 41, 50}, more, 2);
+    CHECK(three.slots == std::vector<uint32_t>({0, 1, 2, 4, 3}));
+    CHECK_EQ(three.counts.kept, size_t(4));
+    CHECK_EQ(three.counts.by_way_set + three.counts.by_ends, size_t(0));
+    CHECK_EQ(three.counts.recycled, size_t(1));
+
+    // Two lost arcs of one way set: it matches neither, and their ends each its own.
+    const ArcSlots a = day(4, {10, 20}, {{100, 200}, {100, 201}}, 0);
+    const ArcSlots b = day(5, {11, 21}, {{100, 201}, {100, 200}}, 4);
+    CHECK(b.slots == std::vector<uint32_t>({1, 0}));
+    CHECK_EQ(b.counts.by_way_set, size_t(0));
+    CHECK_EQ(b.counts.by_ends, size_t(2));
+    // Without fallback keys, today's or the previous build's, they are new arcs.
+    const ArcSlots c = allocate_arc_slots({11, 21}, dir.path() + "/4");
+    CHECK(c.slots == std::vector<uint32_t>({2, 3}));
+    CHECK_EQ(c.counts.previous_fallback_sidecar_missing, size_t(0));
+    CHECK(refusal_of<std::logic_error>([&] { allocate_arc_slots({11, 21}, dir.path() + "/4", {{1, 2}}, dir.path() + "/4.fallback"); })
+              .find("out of step") != std::string::npos);
+}
+
+TEST(the_first_night_without_fallback_keys_takes_slots_by_arc_keys_alone_and_says_so) {
+    using namespace gc::id_alloc;
+    const ScratchDir dir("arc-fallback-first-night");
+    const std::vector<ArcFallbackKeys> fallback = {{100, 200}, {101, 201}};
+    const ArcSlots one = allocate_arc_slots({10, 20}, "", fallback, "");
+    IdAllocator::write_sidecar(dir.path() + "/1", one.sidecar);
+    // No fallback sidecar beside it: 11 is a new arc, 10's slot a tombstone.
+    const ArcSlots two = allocate_arc_slots({11, 20}, dir.path() + "/1", fallback, dir.path() + "/1.fallback");
+    CHECK(two.slots == std::vector<uint32_t>({2, 1}));
+    CHECK_EQ(two.counts.previous_fallback_sidecar_missing, size_t(1));
+    CHECK_EQ(two.counts.appended, size_t(1));
+    CHECK_EQ(two.counts.tombstones, size_t(1));
+    const std::string lines = arc_slot_start_lines("planet", ArcSet::Full, dir.path() + "/1", two.counts);
+    CHECK(lines.find("planet arcs: no previous full arc fallback keys beside " + dir.path() + "/1, slots by arc keys alone\n") !=
+          std::string::npos);
+    CHECK(lines.find("ARC_CHECK fallbacks=arcs set=full region=planet previous_fallback_sidecar_missing=1 by_way_set=0 "
+                     "by_ends=0\n") != std::string::npos);
+    // With it there, the passes' counts.
+    write_arc_fallback_sidecar(dir.path() + "/1.fallback", set_of({10, 20}, fallback, one));
+    const ArcSlots warm = allocate_arc_slots({11, 20}, dir.path() + "/1", fallback, dir.path() + "/1.fallback");
+    CHECK(warm.slots == std::vector<uint32_t>({0, 1}));
+    CHECK(arc_slot_start_lines("europe", ArcSet::Minimal, dir.path() + "/1", warm.counts) ==
+          "ARC_CHECK slots=arcs set=minimal region=europe previous_sidecar_missing=0\n"
+          "ARC_CHECK fallbacks=arcs set=minimal region=europe previous_fallback_sidecar_missing=0 by_way_set=1 by_ends=0\n");
+    // A previous build without arc slots says that alone.
+    const ArcSlots cold = allocate_arc_slots({11, 20}, dir.path() + "/none", fallback, dir.path() + "/none.fallback");
+    CHECK_EQ(cold.counts.previous_fallback_sidecar_missing, size_t(0));
+    CHECK(arc_slot_start_lines("planet", ArcSet::Full, dir.path() + "/none", cold.counts).find("fallbacks=") ==
+          std::string::npos);
+}
+
+TEST(the_fallback_sidecar_holds_each_slots_keys_and_is_refused_unless_whole) {
+    const ScratchDir dir("arc-fallback-sidecar");
+    ArcSetBlocks set;
+    set.keys = {7, 8};
+    set.fallback_keys = {{70, 71}, {80, 81}};
+    set.slots = {2, 0};
+    set.sidecar.resize(4);  // slots 1 and 3 tombstones
+    const std::string path = dir.path() + "/arc_index.fallback.osm_ids";
+    write_arc_fallback_sidecar(path, set);
+    CHECK_EQ(fs::file_size(path), uintmax_t(12 + 4 * 16));
+    const ArcFallbackKeys none;
+    CHECK(read_arc_fallback_sidecar(path, 4) == std::vector<ArcFallbackKeys>({{80, 81}, none, {70, 71}, none}));
+    auto refusal = [&](const std::string& at, size_t slots) {
+        return refusal_of([&] { read_arc_fallback_sidecar(at, slots); });
+    };
+    CHECK(refusal(path, 3).find("4 slots beside 3 in arc_index.osm_ids") != std::string::npos);
+    CHECK(refusal(dir.path() + "/none", 4).find("no header") != std::string::npos);
+    std::ofstream(dir.path() + "/garbage") << "not a fallback sidecar at all";
+    CHECK(refusal(dir.path() + "/garbage", 4).find("not one") != std::string::npos);
+    fs::copy_file(path, dir.path() + "/short");
+    fs::resize_file(dir.path() + "/short", 12 + 3 * 16);
+    CHECK(refusal(dir.path() + "/short", 4).find("cut short") != std::string::npos);
+    fs::copy_file(path, dir.path() + "/long");
+    std::ofstream(dir.path() + "/long", std::ios::binary | std::ios::app) << 'x';
+    CHECK(refusal(dir.path() + "/long", 4).find("bytes past its slots") != std::string::npos);
+    // The allocator refuses one it can't read rather than go without.
+    gc::id_alloc::IdAllocator::write_sidecar(dir.path() + "/slots", std::vector<gc::id_alloc::SidecarSlot>(
+        4, gc::id_alloc::SidecarSlot{uint8_t(gc::id_alloc::ObjectType::ARC), 0, 0, 0, 5}));
+    CHECK(refusal_of([&] { allocate_arc_slots({5}, dir.path() + "/slots", {{1, 2}}, dir.path() + "/garbage"); })
+              .find("unreadable arc fallback sidecar") != std::string::npos);
+    set.slots = {2, 4};
+    CHECK(refusal_of<std::logic_error>([&] { write_arc_fallback_sidecar(path, set); }).find("past its set's slot table") !=
+          std::string::npos);
+}
+
+TEST(a_moved_smallest_vertex_keeps_its_arcs_slot_by_way_set) {
+    const ScratchDir prev("arc-fallback-smallest");
+    WayLattice lattice(3, 3, 4, 83, 1000);
+    const std::vector<bool> in_minimal(9, true);
+    const Day one = planet_day(lattice, in_minimal, "");
+    write_region_sidecars(prev.path() + "/planet", one.blocks);
+    // The edge from corner (1, 0) to (1, 1): its arc's key changes, not its ends or way.
+    move_smallest(lattice.across[1][0], -40);
+    const Day two = planet_day(lattice, in_minimal, prev.path());
+    for (ArcSet set : {ArcSet::Full, ArcSet::Minimal})
+        check_slots_kept(one.blocks.set(set), two.blocks.set(set), PairBy::WaySet, 1, 1, 0);
+}
+
+TEST(a_moved_junction_keeps_its_arcs_slots_by_way_set) {
+    const ScratchDir prev("arc-fallback-junction");
+    WayLattice lattice(3, 3, 4, 89, 1000);
+    const std::vector<bool> in_minimal(9, true);
+    const Day one = planet_day(lattice, in_minimal, "");
+    write_region_sidecars(prev.path() + "/planet", one.blocks);
+    // A corner four arcs end at: their keys and ends change, not their ways.
+    lattice.corners[1][1] = pt(1030, 980);
+    const Day two = planet_day(lattice, in_minimal, prev.path());
+    for (ArcSet set : {ArcSet::Full, ArcSet::Minimal})
+        check_slots_kept(one.blocks.set(set), two.blocks.set(set), PairBy::WaySet, 4, 4, 0);
+}
+
+TEST(a_moved_smallest_vertex_keeps_its_arcs_slot_by_ends_where_its_way_set_isnt_its_own) {
+    const std::vector<bool> in_minimal(9, true);
+    {
+        // One way along two edges in a row: both arcs' way sets are it.
+        const ScratchDir prev("arc-fallback-shared-way");
+        WayLattice lattice(3, 3, 4, 97, 1000);
+        lattice.across_way[1][1] = lattice.across_way[1][0];
+        const Day one = planet_day(lattice, in_minimal, "");
+        CHECK(one.arcs.counts.shared_way_sets >= size_t(1));
+        write_region_sidecars(prev.path() + "/planet", one.blocks);
+        move_smallest(lattice.across[1][0], -40);
+        move_smallest(lattice.across[1][1], -40);
+        const Day two = planet_day(lattice, in_minimal, prev.path());
+        for (ArcSet set : {ArcSet::Full, ArcSet::Minimal})
+            check_slots_kept(one.blocks.set(set), two.blocks.set(set), PairBy::Ends, 2, 0, 2);
+    }
+    {
+        // The edge's way mapped again as a new one, its smallest vertex moved.
+        const ScratchDir prev("arc-fallback-new-way");
+        WayLattice lattice(3, 3, 4, 101, 1000);
+        const Day one = planet_day(lattice, in_minimal, "");
+        write_region_sidecars(prev.path() + "/planet", one.blocks);
+        lattice.across_way[1][0] = 4242;
+        move_smallest(lattice.across[1][0], -40);
+        const Day two = planet_day(lattice, in_minimal, prev.path());
+        for (ArcSet set : {ArcSet::Full, ArcSet::Minimal})
+            check_slots_kept(one.blocks.set(set), two.blocks.set(set), PairBy::Ends, 1, 0, 1);
+    }
+}
+
+TEST(the_first_night_without_fallback_sidecars_gives_a_moved_arc_a_new_slot) {
+    const ScratchDir prev("arc-fallback-first-planet-night");
+    WayLattice lattice(3, 3, 4, 83, 1000);
+    const std::vector<bool> in_minimal(9, true);
+    const Day one = planet_day(lattice, in_minimal, "");
+    write_region_sidecars(prev.path() + "/planet", one.blocks, false);
+    move_smallest(lattice.across[1][0], -40);
+    const Day two = planet_day(lattice, in_minimal, prev.path());
+    for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
+        const AdminArcSlotCounts& c = two.blocks.set(set).slot_counts;
+        CHECK_EQ(c.previous_fallback_sidecar_missing, size_t(1));
+        CHECK_EQ(c.by_way_set + c.by_ends, size_t(0));
+        CHECK_EQ(c.appended, size_t(1));
+        CHECK_EQ(c.tombstones, size_t(1));
+    }
+}
+
+TEST(a_continent_keeps_a_moved_arcs_slot_by_its_own_fallback_sidecars) {
+    const ScratchDir prev("arc-fallback-continent");
+    WayLattice lattice(3, 3, 4, 107, 1000);
+    const std::vector<bool> in_minimal(9, true);
+    // The continent: the lower two rows' cells.
+    const std::vector<uint32_t> polygons = {0, 1, 2, 3, 4, 5};
+    auto continent = [&](const Day& d, const std::string& prev_dir) {
+        AdminArcBlocks c = subset_admin_arcs(d.blocks, polygons, 2);
+        assign_region_arc_slots(c, prev_dir, "test", 2);
+        return c;
+    };
+    const Day one = planet_day(lattice, in_minimal, "");
+    write_region_sidecars(prev.path() + "/planet", one.blocks);
+    const AdminArcBlocks c1 = continent(one, "");
+    write_region_sidecars(prev.path() + "/test", c1);
+    move_smallest(lattice.across[1][0], -40);
+    const Day two = planet_day(lattice, in_minimal, prev.path());
+    const AdminArcBlocks c2 = continent(two, prev.path() + "/test");
+    for (ArcSet set : {ArcSet::Full, ArcSet::Minimal})
+        check_slots_kept(c1.set(set), c2.set(set), PairBy::WaySet, 1, 1, 0);
 }
