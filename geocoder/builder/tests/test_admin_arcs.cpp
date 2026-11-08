@@ -1306,7 +1306,9 @@ TEST(every_tier_is_the_same_whatever_the_threads) {
         const AdminArcs again = build_admin_arcs(store, in_minimal, "", threads);
         bool same = again.minimal.refs == one.minimal.refs && again.minimal.parts == one.minimal.parts;
         for (size_t t = 0; t < kArcTierCount; t++) {
-            same = same && again.tiers[t].kept == one.tiers[t].kept;
+            same = same && again.tiers[t].kept == one.tiers[t].kept && again.tiers[t].grid == one.tiers[t].grid &&
+                   again.tiers[t].fine_junctions == one.tiers[t].fine_junctions &&
+                   again.tiers[t].fine_valid == one.tiers[t].fine_valid;
             const size_t n = kArcTiers[t].set == ArcSet::Full ? one.arcs.size() : one.minimal.arcs.size();
             for (uint32_t a = 0; a < n; a++)
                 same = same && points_of(stored_of(again, store, kArcTiers[t], again.tiers[t], a)) ==
@@ -1816,5 +1818,5 @@ TEST(arcs_away_from_a_polygon_on_the_e7_grid_keep_the_tiers_grid) {
     CHECK_EQ(k_of(0, island_arc), 2);
     CHECK_EQ(k_of(1, island_arc), 0);
     REQUIRE(arcs.minimal.arcs.size() == 1);
-    CHECK_EQ(k_of(2, 0), 2);
+    CHECK_EQ(k_of(2, 0), 3);
 }

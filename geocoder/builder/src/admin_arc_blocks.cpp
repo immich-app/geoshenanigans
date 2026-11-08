@@ -10,6 +10,7 @@
 
 #include "admin_arcs.h"
 #include "cell_index_io.h"
+#include "exact_pip.h"
 #include "parallel.h"
 #include "parsed_data.h"
 #include "ranked_bits.h"
@@ -188,6 +189,70 @@ void check_stored_chains_close(const AdminArcs& arcs, const AdminExactRings& sto
 }
 
 }  // namespace
+
+void check_coarsened_tier(const AdminArcs& arcs, const AdminExactRings& store, size_t t, const ArcBlocks& blocks,
+                          unsigned threads) {
+    if (threads == 0) threads = parallel_threads();
+    const ArcTier& tier = kArcTiers[t];
+    const ArcTierState& state = arcs.tiers[t];
+    const bool full = tier.set == ArcSet::Full;
+    const std::vector<uint32_t>& ring_refs = full ? arcs.ring_refs : arcs.minimal.ring_refs;
+    const std::vector<ArcRef>& refs = full ? arcs.refs : arcs.minimal.refs;
+    if (state.fine_valid.size() != store.rings.size())
+        throw std::logic_error(std::string(tier.dir) + " coarsened without its rings valid on the fine grid");
+    if (blocks.size() != (full ? arcs.arcs.size() : arcs.minimal.arcs.size()))
+        throw std::logic_error(std::string(tier.dir) + " arc blocks out of step with its set");
+    const std::vector<uint64_t>& fine = state.fine_junctions;
+    const uint8_t fine_k = arc_blocks::grid_exponent(tier.fine_grid_e7);
+    std::vector<DecodedArc> decoded(threads);
+    parallel_for_dynamic(blocks.size(), 256, [&](size_t begin, size_t end, unsigned worker) {
+        for (size_t a = begin; a < end; a++) {
+            bool at_fine = false;
+            auto ends_fine = [&](const auto& v) {
+                at_fine = std::binary_search(fine.begin(), fine.end(), vertex_key(v[0])) ||
+                          std::binary_search(fine.begin(), fine.end(), vertex_key(v[v.size() - 1]));
+            };
+            if (full) {
+                if (arcs.arcs[a].view.closed) continue;
+                ends_fine(arc_vertices(store, arcs.arcs[a].view));
+            } else {
+                if (arcs.minimal.arcs[a].closed) continue;
+                ends_fine(MinimalArcVertices(store, arcs, static_cast<uint32_t>(a)));
+            }
+            if (!at_fine) continue;
+            if (!arc_blocks::decode_arc(blocks.data(a), blocks.bytes_of(a), decoded[worker]))
+                check_failed("arc " + std::to_string(a) + " of " + tier.dir + " doesn't decode");
+            if (decoded[worker].k > fine_k)
+                check_failed("arc " + std::to_string(a) + " of " + tier.dir + " ends at a junction kept fine but is stored at k = " +
+                             std::to_string(decoded[worker].k));
+        }
+    }, threads);
+    struct Scratch {
+        DecodedArc decoded;
+        std::vector<PackedLocation> ring;
+    };
+    std::vector<Scratch> scratch(threads);
+    parallel_for_dynamic(store.rings.size(), 64, [&](size_t begin, size_t end, unsigned worker) {
+        Scratch& s = scratch[worker];
+        for (size_t r = begin; r < end; r++) {
+            if (!state.fine_valid[r]) continue;
+            s.ring.clear();
+            for (uint32_t k = ring_refs[r]; k < ring_refs[r + 1]; k++) {
+                const ArcRef ref = refs[k];
+                if (!arc_blocks::decode_arc(blocks.data(ref.arc), blocks.bytes_of(ref.arc), s.decoded))
+                    check_failed("arc " + std::to_string(ref.arc) + " of " + tier.dir + " doesn't decode");
+                const size_t n = s.decoded.vertices.size();
+                for (size_t i = 0; i < n; i++) {
+                    const PackedLocation p = s.decoded.vertices[ref.reversed ? n - 1 - i : i];
+                    if (s.ring.empty() || s.ring.back() != p) s.ring.push_back(p);
+                }
+            }
+            if (s.ring.size() >= 2 && s.ring.front() == s.ring.back()) s.ring.pop_back();
+            if (s.ring.size() < 3 || exact_ring_area2(s.ring.data(), static_cast<uint32_t>(s.ring.size())) == 0)
+                check_failed("ring " + std::to_string(r) + ", valid on the fine grid, collapses in " + tier.dir);
+        }
+    }, threads);
+}
 
 std::vector<uint32_t> arc_at_slot(const ArcSetBlocks& set) {
     std::vector<uint32_t> out(set.sidecar.size(), UINT32_MAX);
@@ -390,6 +455,7 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
     for (size_t k = 0; k < kArcTierCount; k++) {
         out.tiers[k] = encode_tier(arcs, store, k, threads);
         check_stored_chains_close(arcs, store, k, out.tiers[k], threads);
+        if (kArcTiers[k].coarsens()) check_coarsened_tier(arcs, store, k, out.tiers[k], threads);
         log_phase((std::string("      Admin arcs: encode ") + kArcTiers[k].dir).c_str(), t, cpu);
     }
     for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) encode_ring_blocks(out, set, threads);
@@ -432,6 +498,10 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
                  << " e7_grid_rounds=" << tc.e7_grid_rounds << " e7_grid_arcs=" << tc.e7_grid_arcs
                  << " crossings_left=" << tc.crossings_left << " unrepairable_segments=" << tc.unrepairable_segments
                  << " raw_crossings=" << tc.raw_crossings << " rings_nest_introduced=" << tc.rings_nest_introduced;
+        if (kArcTiers[k].coarsens())
+            line << " fine_degenerate_rings=" << tc.fine_degenerate_rings << " fine_crossings_left=" << tc.fine_crossings_left
+                 << " crossings_coarse=" << tc.crossings_coarse << " coarse_rounds=" << tc.coarse_rounds
+                 << " fine_rings=" << tc.fine_rings << " fine_junctions=" << tc.fine_junctions << " fine_arcs=" << tc.fine_arcs;
         line << "\n";
     }
     std::cerr << line.str();

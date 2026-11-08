@@ -217,6 +217,9 @@ static constexpr double kArcSimplifyToleranceM = 37.5;
 static constexpr double kArcCapFactor = 0.1;
 // The simplified tiers' grid, in e7 units: 1e-5 degrees, 1.1 m.
 static constexpr int32_t kSimplifiedGridE7 = 100;
+// admin-minimal's grid, in e7 units: 1e-4 degrees, 11 m. A ring it would
+// collapse keeps the simplified grid (build_arc_tier).
+static constexpr int32_t kMinimalCoarseGridE7 = 1000;
 // Rounds that give a degenerate simplified ring vertices back.
 static constexpr int kArcValidityRounds = 64;
 // Rounds that give vertices back where simplified segments cross or a
@@ -244,7 +247,7 @@ struct ArcTier {
 inline constexpr ArcTier kArcTiers[] = {
     {ArcSet::Full, "quality/simplified", kArcSimplifyToleranceM, kArcCapFactor, kSimplifiedGridE7, kSimplifiedGridE7},
     {ArcSet::Full, "quality/exact", 0, 0, 1, 1},
-    {ArcSet::Minimal, "admin-minimal", kArcSimplifyToleranceM, kArcCapFactor, kSimplifiedGridE7, kSimplifiedGridE7},
+    {ArcSet::Minimal, "admin-minimal", kArcSimplifyToleranceM, kArcCapFactor, kMinimalCoarseGridE7, kSimplifiedGridE7},
 };
 inline constexpr size_t kArcTierCount = sizeof(kArcTiers) / sizeof(kArcTiers[0]);
 

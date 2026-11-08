@@ -70,7 +70,7 @@
         },
         "admin-minimal": {
           "label": "Admin minimal",
-          "description": "Admin boundaries + place nodes only — no postcodes, no postcode areas. Smallest possible deployable. Country/state/city + cities500-equivalent place names.",
+          "description": "Admin boundaries (within 37.5 m, on an 11 m grid) + place nodes only — no postcodes, no postcode areas. Smallest possible deployable. Country/state/city + cities500-equivalent place names.",
           "order": 4
         }
       }
