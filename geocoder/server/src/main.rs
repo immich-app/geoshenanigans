@@ -223,8 +223,10 @@ async fn put_configuration(
         return resp;
     }
 
+    // A selection the build at hand doesn't offer is refused, naming the
+    // values it does.
     if let Err(e) = state.set_configuration(new_cfg).await {
-        return (StatusCode::INTERNAL_SERVER_ERROR, format!("persist failed: {}", e)).into_response();
+        return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
     (StatusCode::ACCEPTED, "configuration updated, downloads scheduled").into_response()
 }
