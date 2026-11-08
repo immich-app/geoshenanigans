@@ -7,6 +7,7 @@ on:
       - "geocoder/node/**"
       - "geocoder/search/**"
       - "geocoder/server/**"
+      - "geocoder/test-portal/**"
       - ".github/workflows/geocoder-tests.yml"
       # The tool tests read the nightly's package list.
       - ".github/workflows/geocoder-build.yml"
@@ -173,3 +174,13 @@ jobs:
           cd geocoder/node
           cargo build --release --locked
           node --test test/*.test.mjs
+
+  test-portal-tests:
+    name: Test portal entrypoint tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Test
+        run: geocoder/test-portal/entrypoint.test.sh
