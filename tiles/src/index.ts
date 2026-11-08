@@ -1,12 +1,13 @@
+import { parse as parseDomain } from 'tldts';
 import { handleD1ProxyRequest } from './d1-proxy';
 import { IMetricsRepository } from './interface';
+import { O11yLogger, O11yMetricsProvider, o11yConfig, sampleRequest, sendHeartbeat } from './o11y';
 import { PMTilesService } from './pmtiles.service';
 import {
   CloudflareD1Repository,
   CloudflareDeferredRepository,
   CloudflareMetricsRepository,
   HeaderMetricsProvider,
-  InfluxMetricsProvider,
   MemCacheRepository,
   Metric,
   TigrisStorageRepository,
@@ -145,6 +146,7 @@ async function handleRequest(
   env: WorkerEnv,
   deferredRepository: CloudflareDeferredRepository,
   metrics: IMetricsRepository,
+  logger: O11yLogger,
 ) {
   const cacheResponse = async (response: Response): Promise<Response> => {
     if (!response.body) {
@@ -310,13 +312,41 @@ async function handleRequest(
         await metrics.monitorAsyncFunction({ name: 'style_request', tags: { style } }, handleStyleRequest)(respHeaders),
       );
     }
-  } catch (e: any) {
-    console.error(e);
-    metrics.push(Metric.create('error').addTag('error', e.message ?? 'unknown'));
+  } catch (e) {
+    const requestType = pmTilesParams.requestType ?? 'unknown';
+    logger.error('Request failed', e, { request_type: requestType });
+    // The message stays in the log line: as a tag it would make a series per error.
+    metrics.push(Metric.create('tiles_request_error').addTag('request_type', requestType).intField('count', 1));
     return new Response('Internal Server Error', { status: 500 });
   }
 
   return cacheResponse(new Response('Invalid URL', { headers: respHeaders, status: 404 }));
+}
+
+/** Fields on every log line of a request, so its lines can be followed together. */
+function requestLogFields(request: Request<unknown, IncomingRequestCfProperties>) {
+  return {
+    ray: request.headers.get('cf-ray') ?? undefined,
+    method: request.method,
+    path: new URL(request.url).pathname,
+    colo: request.cf?.colo,
+    continent: request.cf?.continent,
+  };
+}
+
+/** The registrable domain of the page that asked, from Origin; undefined when there is none. */
+function requestOrigin(request: Request): string | undefined {
+  const origin = request.headers.get('origin');
+  if (!origin) {
+    return undefined;
+  }
+  try {
+    const { hostname } = new URL(origin);
+    return parseDomain(hostname).domain ?? hostname;
+  } catch {
+    // "null" from sandboxed and file:// pages, which isn't a URL.
+    return undefined;
+  }
 }
 
 export default {
@@ -325,27 +355,70 @@ export default {
     if (workerEnv.WORKER_TYPE === 'D1_PROXY') {
       return handleD1ProxyRequest(request, workerEnv);
     }
+    const started = performance.now();
     const deferredRepository = new CloudflareDeferredRepository(ctx);
     // Before the cache lookup, so cache hits keep the nearby D1 replica warm too (see warmD1Replica).
     deferredRepository.runImmediately(warmD1Replica(workerEnv.D1_GLOBAL));
     const headerProvider = new HeaderMetricsProvider();
-    const influxProvider = new InfluxMetricsProvider(workerEnv.VMETRICS_API_TOKEN, env.ENVIRONMENT);
-    deferredRepository.defer(() => influxProvider.flush());
-    const metrics = new CloudflareMetricsRepository('tiles', request, [influxProvider, headerProvider]);
+    const o11y = o11yConfig(workerEnv);
+    const metricsProvider = new O11yMetricsProvider(o11y);
+    const logger = new O11yLogger(o11y, requestLogFields(request));
+    deferredRepository.defer(() => Promise.all([metricsProvider.flush(), logger.flush()]));
+    const metrics = new CloudflareMetricsRepository('tiles', request, [metricsProvider, headerProvider]);
 
+    let response: Response;
     try {
-      const response = await metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest)(
+      response = await metrics.monitorAsyncFunction({ name: 'handle_request' }, handleRequest)(
         request,
         workerEnv,
         deferredRepository,
         metrics,
+        logger,
       );
       response.headers.set(Header.SERVER_TIMING, headerProvider.getTimingHeader());
-      deferredRepository.runDeferred();
-      return response;
     } catch (e) {
-      console.error(e);
-      return new Response('Internal Server Error', { status: 500 });
+      logger.error('Request failed', e);
+      response = new Response('Internal Server Error', { status: 500 });
     }
+
+    try {
+      const params = parseUrl(request);
+      const requestType = params.requestType ?? 'unknown';
+      // Every response by status, which handle_request's errors (only what threw) don't show.
+      metrics.push(
+        Metric.create('tiles_response')
+          .addTag('request_type', requestType)
+          .addTag('status', String(response.status))
+          .intField('count', 1),
+      );
+      // A sample of requests with what metrics leave out (the site and network they came from), for questions such
+      // as which sites use the tiles most.
+      if (sampleRequest(workerEnv.REQUEST_LOG_SAMPLE_RATE)) {
+        logger.info('Request', {
+          kind: 'request',
+          request_type: requestType,
+          status: response.status,
+          duration_ms: Math.round(performance.now() - started),
+          z: (params as Partial<PMTilesTileParams>).z,
+          apex_domain: requestOrigin(request),
+          as_org: request.cf?.asOrganization,
+          country: request.cf?.country,
+        });
+      }
+    } finally {
+      // Also after a failure, whose metrics and log lines matter most.
+      deferredRepository.runDeferred();
+    }
+    return response;
+  },
+
+  // tiles-worker's cron trigger runs this every minute: the heartbeat o11y's absence alert watches.
+  async scheduled(controller, env): Promise<void> {
+    const workerEnv = env as WorkerEnv;
+    const o11y = o11yConfig(workerEnv);
+    if (workerEnv.WORKER_TYPE === 'D1_PROXY' || !o11y) {
+      return;
+    }
+    await sendHeartbeat(o11y, workerEnv.DEPLOYMENT_KEY);
   },
 } satisfies ExportedHandler<Env>;

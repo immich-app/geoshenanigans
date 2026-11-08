@@ -26,9 +26,15 @@ resource "cloudflare_workers_script" "tiles" {
     }
   }
 
+  # Metrics and logs go to FUTO's o11y stack through its vmauth gateway: prod to the production store, dev to staging.
+  plain_text_binding {
+    name = "O11Y_URL"
+    text = var.env == "prod" ? "https://vmauth.futostatus.com" : "https://vmauth.staging.futostatus.com"
+  }
+
   secret_text_binding {
-    name = "VMETRICS_API_TOKEN"
-    text = var.vmetrics_api_token
+    name = "O11Y_TOKEN"
+    text = var.o11y_vmauth_token
   }
 
   secret_text_binding {
@@ -48,6 +54,14 @@ resource "cloudflare_workers_script" "tiles" {
 
   compatibility_date  = "2024-07-29"
   compatibility_flags = ["nodejs_compat"]
+}
+
+# Every minute the worker's scheduled handler sends o11y its heartbeat, which the bundle's
+# geoshenanigans-tiles-heartbeat alert watches (o11y/README.md).
+resource "cloudflare_workers_cron_trigger" "tiles" {
+  account_id  = var.cloudflare_account_id
+  script_name = cloudflare_workers_script.tiles.name
+  schedules   = ["* * * * *"]
 }
 
 resource "cloudflare_workers_domain" "tiles" {

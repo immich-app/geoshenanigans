@@ -3,7 +3,12 @@ interface WorkerEnv extends Omit<Env, 'ENVIRONMENT' | 'DEPLOYMENT_KEY'> {
   DEPLOYMENT_KEY: string;
   // Prepended to object keys in the tiles-geo bucket; unset in prod, "dev/" in dev.
   STORAGE_PREFIX?: string;
-  VMETRICS_API_TOKEN: string;
+  // The o11y gateway's origin (https://vmauth.futostatus.com in prod, the staging store's in dev) and its bearer token.
+  // Without both the worker ships no metrics or logs (see o11y.ts).
+  O11Y_URL?: string;
+  O11Y_TOKEN?: string;
+  // The fraction of requests logged to o11y, 0.01 when unset.
+  REQUEST_LOG_SAMPLE_RATE?: string;
   WORKER_TYPE: string | undefined;
   TIGRIS_KEY_ID: string;
   TIGRIS_ACCESS_KEY: string;
