@@ -155,6 +155,30 @@ void fill_records(ParsedData& d, std::vector<float>& elevations, std::vector<uin
     d.admin_index_cells = new_cell_pairs(r, 20000, n_admin + 3, true);
     d.admin_minimal_index_cells = new_cell_pairs(r, 10000, n_admin + 3, true);
     d.admin_country_cells = new_cell_pairs(r, 5000, n_admin + 3, true);
+    // The arc stage's encoding, which comes before the ordering: each
+    // polygon's ring numbers and its ring block in each set (none in the
+    // minimal set for some), and each tier's arc blocks. Its own draws, so
+    // the records after it are as they were.
+    {
+        Rng a(seed ^ 0xa3c5u);
+        for (const AdminExactRings::Polygon& exact : d.admin_exact_rings.polygons) {
+            AdminArcPolygon p{exact.first_ring, exact.ring_count, {}};
+            for (size_t set = 0; set < 2; set++) {
+                std::vector<uint8_t>& blocks = d.admin_arcs.sets[set].ring_blocks;
+                const uint32_t size = set == 0 || !a.one_in(3) ? 1 + a.below(6) : 0;
+                if (size) p.blocks[set] = {static_cast<uint32_t>(blocks.size()), size};
+                for (uint32_t k = 0; k < size; k++) blocks.push_back(static_cast<uint8_t>(a.below(256)));
+            }
+            d.admin_arcs.polygons.push_back(p);
+        }
+        for (ArcBlocks& tier : d.admin_arcs.tiers) {
+            tier.at = {0};
+            for (uint32_t arc = 0; arc < 300; arc++) {
+                for (uint32_t k = 1 + a.below(9); k > 0; k--) tier.bytes.push_back(static_cast<uint8_t>(a.below(256)));
+                tier.at.push_back(static_cast<uint32_t>(tier.bytes.size()));
+            }
+        }
+    }
 
     for (size_t i = 0; i < n; i++) {
         PoiRecord p{};
@@ -254,6 +278,15 @@ void check_same_records(const ParsedData& a, const ParsedData& b) {
     CHECK(same_bytes(a.admin_polygons, b.admin_polygons));
     CHECK(same_bytes(a.admin_osm_ids, b.admin_osm_ids));
     CHECK(same_bytes(a.admin_exact_rings.polygons, b.admin_exact_rings.polygons));
+    CHECK(same_bytes(a.admin_exact_rings.rings, b.admin_exact_rings.rings));
+    CHECK(same_bytes(a.admin_exact_rings.vertices, b.admin_exact_rings.vertices));
+    CHECK(same_bytes(a.admin_arcs.polygons, b.admin_arcs.polygons));
+    for (size_t set = 0; set < 2; set++)
+        CHECK(same_bytes(a.admin_arcs.sets[set].ring_blocks, b.admin_arcs.sets[set].ring_blocks));
+    for (size_t t = 0; t < kArcTierCount; t++) {
+        CHECK(same_bytes(a.admin_arcs.tiers[t].bytes, b.admin_arcs.tiers[t].bytes));
+        CHECK(same_bytes(a.admin_arcs.tiers[t].at, b.admin_arcs.tiers[t].at));
+    }
     CHECK(same_bytes(a.admin_parent_ids, b.admin_parent_ids));
     CHECK(same_pairs(a.admin_index_cells, b.admin_index_cells));
     CHECK(same_pairs(a.admin_minimal_index_cells, b.admin_minimal_index_cells));
