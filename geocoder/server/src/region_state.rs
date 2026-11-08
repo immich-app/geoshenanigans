@@ -34,6 +34,9 @@ use query_server::MultiIndex;
 /// never re-resolved would 404 on every new download from day 4.
 const CONFIGURATIONS_TTL: Duration = Duration::from_secs(3600);
 
+/// The selection a server downloads. A mode, quality or poi_tier its build
+/// has no component for fails each download, naming the values the build
+/// offers.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Configuration {
     /// Base URL for the geocoder build artifacts. Latest.json + each
@@ -62,6 +65,17 @@ impl Default for Configuration {
             quality: "simplified".to_string(),
             poi_tier: "none".to_string(),
             preload: Vec::new(),
+        }
+    }
+}
+
+impl Configuration {
+    pub fn selection(&self, region: &str) -> RegionSelection {
+        RegionSelection {
+            region: region.to_string(),
+            mode: self.mode.clone(),
+            quality: self.quality.clone(),
+            poi_tier: self.poi_tier.clone(),
         }
     }
 }
@@ -203,12 +217,7 @@ impl RegionState {
 
         let configurations = self.ensure_configurations().await?;
         let cfg = self.config.lock().await.clone();
-        let sel = RegionSelection {
-            region: region.to_string(),
-            mode: cfg.mode.clone(),
-            quality: cfg.quality.clone(),
-            poi_tier: cfg.poi_tier.clone(),
-        };
+        let sel = cfg.selection(region);
 
         let region_owned = region.to_string();
         download_region(
@@ -235,6 +244,7 @@ impl RegionState {
 mod tests {
     use super::*;
     use crate::scratch_dir::ScratchDir;
+    use crate::test_bucket;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct FakeBucket {
@@ -295,5 +305,24 @@ mod tests {
 
         assert_eq!(bucket.fetches.load(Ordering::SeqCst), 2);
         assert_eq!(second.build.date, "2026-01-02");
+    }
+
+    // A configuration.json kept from an earlier build, naming a value this
+    // one lacks, loads as it is; its downloads fail naming the value and the
+    // build's, fetching nothing into the region dir.
+    #[tokio::test]
+    async fn a_persisted_value_the_build_lacks_fails_its_download_naming_it() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let root = ScratchDir::new();
+        let persisted = Configuration { base_url: bucket.url.clone(), quality: "q2.5".into(), ..Configuration::default() };
+        std::fs::write(root.path().join("configuration.json"), serde_json::to_string(&persisted).unwrap()).unwrap();
+        let mi = MultiIndex::load(root.path().to_str().unwrap(), 17, 10, 660.0).unwrap();
+        let state = RegionState::new(Arc::new(mi), root.path().to_path_buf());
+
+        let got = state.ensure_loaded("europe").await.map_err(|e| e.to_string());
+
+        assert_eq!(got, Err("this build has no quality \"q2.5\"; it offers quality: exact, simplified".to_string()));
+        assert_eq!(bucket.files_served(), 0);
+        assert!(!root.path().join("europe").exists());
     }
 }

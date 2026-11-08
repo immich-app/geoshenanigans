@@ -3,6 +3,8 @@ mod downloader;
 mod region_state;
 #[cfg(test)]
 mod scratch_dir;
+#[cfg(test)]
+mod test_bucket;
 
 use region_state::{Configuration, RegionState};
 
