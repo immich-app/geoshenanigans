@@ -1764,14 +1764,18 @@ TEST(a_polygon_kept_on_the_e7_grid_keeps_its_junctions_there_in_its_neighbours_a
     const uint32_t shared = arc_through(arcs, store, pt(at, s));
     for (const PackedLocation& p : {pt(at, s), hole[1]}) {
         const uint32_t a = arc_through(arcs, store, p);
+        REQUIRE(a != UINT32_MAX);
         CHECK(points_of(stored_of(arcs, store, simplified_tier(), state, a)) == vertices_of(store, arcs.arcs[a]));
     }
     CHECK(shared != UINT32_MAX);
     // The neighbour's own arc: its ends the polygon's junctions as they are,
     // its corners snapped.
     const uint32_t own = arc_through(arcs, store, pt(at + 200037, 0));
+    REQUIRE(own != UINT32_MAX);
     const Ring raw = vertices_of(store, arcs.arcs[own]);
     const Ring stored = points_of(stored_of(arcs, store, simplified_tier(), state, own));
+    // Its two junctions and its two corners.
+    REQUIRE(raw.size() == 4);
     REQUIRE(stored.size() == raw.size());
     CHECK(stored.front() == raw.front() && stored.back() == raw.back());
     for (size_t i = 1; i + 1 < raw.size(); i++) CHECK(stored[i] == pt(floordiv_snap(raw[i].lat_e7), floordiv_snap(raw[i].lon_e7)));
@@ -1785,7 +1789,9 @@ TEST(a_polygon_kept_on_the_e7_grid_keeps_its_junctions_there_in_its_neighbours_a
         CHECK(d.vertices == points_of(stored_of(arcs, store, simplified_tier(), state, a)));
     }
     for (uint32_t p = 0; p < 2; p++) {
+        // Every ring: decoded_rings gives none when a block doesn't decode.
         const std::vector<Ring> rings = decoded_rings(blocks, ArcSet::Full, 0, blocks.polygons[p]);
+        REQUIRE(rings.size() == store.polygons[p].ring_count);
         for (uint32_t k = 0; k < rings.size(); k++)
             CHECK(rings[k] == stored_ring(arcs, store, 0, store.polygons[p].first_ring + k));
     }
