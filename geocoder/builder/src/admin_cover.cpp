@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <functional>
 #include <memory>
+#include <stdexcept>
 
 #include <s2/s1chord_angle.h>
 #include <s2/s2cap.h>
@@ -84,17 +87,14 @@ void add_edge_cells(double lat1, double lng1, const S2Point& a, double lat2, dou
 }
 
 // The cells of a polygon from the cells within reach of its edges
-// (`boundary`, any order, repeats allowed): those, flagged false, and every
-// other cell inside, flagged true, as contains(cell centre) says. A cell no
-// edge comes near is wholly inside or wholly outside, and its centre far
-// enough from every edge for the ray cast to tell which. The ray cast puts
-// nothing outside the vertices' bounds inside, so the cells start from those.
+// (`boundary`, ascending, each once): those, flagged false, and every other
+// cell inside, flagged true, as contains(cell centre) says. A cell no edge
+// comes near is wholly inside or wholly outside, and its centre far enough
+// from every edge for the ray cast to tell which. The ray cast puts nothing
+// outside the vertices' bounds inside, so the cells start from those.
 template <class Contains>
-AdminRingCells classify_cells(std::vector<uint64_t> boundary, const S2LatLngRect& bounds, int level,
+AdminRingCells classify_cells(const std::vector<uint64_t>& boundary, const S2LatLngRect& bounds, int level,
                               Contains contains) {
-    std::sort(boundary.begin(), boundary.end());
-    boundary.erase(std::unique(boundary.begin(), boundary.end()), boundary.end());
-
     std::vector<uint64_t> interior;
     std::vector<S2CellId> pending;
     bounds.GetCellUnionBound(&pending);
@@ -155,35 +155,45 @@ uint32_t straight_edge_pieces(double lat1, double lng1, double lat2, double lng2
     return static_cast<uint32_t>(std::max({1.0, by_chord, by_length}));
 }
 
-AdminRingCells admin_ring_cells(const PackedLocation* verts, const RingSpan* rings, uint32_t ring_count, int level,
-                                double reach_rad) {
-    if (ring_count == 0 || rings[0].count == 0) return {};
+void admin_arc_cells(const PackedLocation* v, uint32_t count, int level, double reach_rad,
+                     std::vector<uint64_t>& out) {
+    if (count < 2) return;
     const S1ChordAngle reach = S1ChordAngle::Radians(reach_rad);
     const double sin_reach = std::sin(reach_rad);
 
-    // Every cell within reach of an edge: a point inside lies inside the
-    // straight edges or on them, and they lie within the chord tolerance of
-    // their pieces. Past that the reach covers the e7 rounding of the cell
-    // centres classify_cells tests.
-    std::vector<uint64_t> boundary;
+    // Every cell within reach of an edge: a point inside a polygon lies
+    // inside its straight edges or on them, and they lie within the chord
+    // tolerance of their pieces. Past that the reach covers the e7 rounding
+    // of the cell centres classify_cells tests.
+    const size_t first = out.size();
+    S2Point prev = point_of(v[0].lat(), v[0].lon());
+    for (uint32_t i = 1; i < count; i++) {
+        if (v[i] == v[i - 1]) continue;
+        const S2Point here = point_of(v[i].lat(), v[i].lon());
+        if (static_cast<uint64_t>(coord_key(v[i - 1])) < static_cast<uint64_t>(coord_key(v[i])))
+            add_edge_cells(v[i - 1].lat(), v[i - 1].lon(), prev, v[i].lat(), v[i].lon(), here, level, reach, sin_reach,
+                           out);
+        else
+            add_edge_cells(v[i].lat(), v[i].lon(), here, v[i - 1].lat(), v[i - 1].lon(), prev, level, reach, sin_reach,
+                           out);
+        prev = here;
+    }
+    std::sort(out.begin() + static_cast<std::ptrdiff_t>(first), out.end());
+    out.erase(std::unique(out.begin() + static_cast<std::ptrdiff_t>(first), out.end()), out.end());
+}
+
+AdminRingCells admin_polygon_cells(const std::vector<uint64_t>& boundary, const PackedLocation* verts,
+                                   const RingSpan* rings, uint32_t ring_count, int level) {
+    if (ring_count == 0 || rings[0].count == 0) return {};
+    if (std::adjacent_find(boundary.begin(), boundary.end(), std::greater_equal<uint64_t>()) != boundary.end())
+        throw std::logic_error("admin polygon cells: boundary cells not ascending, each once");
+
     int32_t lat_lo = INT32_MAX, lat_hi = INT32_MIN, lng_lo = INT32_MAX, lng_hi = INT32_MIN;
     for (uint32_t r = 0; r < ring_count; r++) {
         const PackedLocation* v = verts + rings[r].begin;
-        const uint32_t n = rings[r].count;
-        if (n == 0) continue;
-        S2Point prev = point_of(v[n - 1].lat(), v[n - 1].lon());
-        for (uint32_t i = 0, j = n - 1; i < n; j = i++) {
+        for (uint32_t i = 0; i < rings[r].count; i++) {
             lat_lo = std::min(lat_lo, v[i].lat_e7), lat_hi = std::max(lat_hi, v[i].lat_e7);
             lng_lo = std::min(lng_lo, v[i].lon_e7), lng_hi = std::max(lng_hi, v[i].lon_e7);
-            if (v[i] == v[j]) continue;
-            const S2Point here = point_of(v[i].lat(), v[i].lon());
-            if (static_cast<uint64_t>(coord_key(v[j])) < static_cast<uint64_t>(coord_key(v[i])))
-                add_edge_cells(v[j].lat(), v[j].lon(), prev, v[i].lat(), v[i].lon(), here, level, reach, sin_reach,
-                               boundary);
-            else
-                add_edge_cells(v[i].lat(), v[i].lon(), here, v[j].lat(), v[j].lon(), prev, level, reach, sin_reach,
-                               boundary);
-            prev = here;
         }
     }
     const S2LatLngRect bounds(
@@ -191,7 +201,7 @@ AdminRingCells admin_ring_cells(const PackedLocation* verts, const RingSpan* rin
         S2LatLng::FromDegrees(std::min(lat_hi / 1e7, 90.0), std::min(lng_hi / 1e7, 180.0)));
 
     std::vector<std::unique_ptr<ExactRingEdgeIndex>> edges(ring_count);
-    return classify_cells(std::move(boundary), bounds, level, [&](const S2Point& p) {
+    return classify_cells(boundary, bounds, level, [&](const S2Point& p) {
         const S2LatLng ll(p);
         const PackedLocation q = point_e7(ll.lat().degrees(), ll.lng().degrees());
         bool inside = false;
@@ -207,6 +217,23 @@ AdminRingCells admin_ring_cells(const PackedLocation* verts, const RingSpan* rin
         }
         return inside;
     });
+}
+
+AdminRingCells admin_ring_cells(const PackedLocation* verts, const RingSpan* rings, uint32_t ring_count, int level,
+                                double reach_rad) {
+    if (ring_count == 0 || rings[0].count == 0) return {};
+    std::vector<uint64_t> boundary;
+    std::vector<PackedLocation> closed;
+    for (uint32_t r = 0; r < ring_count; r++) {
+        const PackedLocation* v = verts + rings[r].begin;
+        if (rings[r].count == 0) continue;
+        closed.assign(v, v + rings[r].count);
+        closed.push_back(v[0]);
+        admin_arc_cells(closed.data(), static_cast<uint32_t>(closed.size()), level, reach_rad, boundary);
+    }
+    std::sort(boundary.begin(), boundary.end());
+    boundary.erase(std::unique(boundary.begin(), boundary.end()), boundary.end());
+    return admin_polygon_cells(boundary, verts, rings, ring_count, level);
 }
 
 bool admin_cell_routed(uint64_t cell, const std::function<bool(uint64_t)>& holds) {
