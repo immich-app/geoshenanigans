@@ -88,6 +88,15 @@ std::string admin_sidecar_path(const std::string& region_dir);
 // (admin_sidecar_path) and arc_index.osm_ids (arc_sidecar_path).
 void write_admin_tiers(const ParsedData& data, const std::string& region_dir);
 
+// Writes the full set's admin geometry at the exact tier into dir: the bytes
+// of quality/exact/'s admin_polygons.bin, admin_rings.bin, arc_index.bin and
+// arc_vertices.bin (write_admin_tiers), no sidecar. A region's dir of a
+// single-output build holds them beside its mode's files, which makes it a
+// whole index: the admin cell index (compute_admin_index_cells) lists every
+// polygon wherever any tier of the full set has it, so it serves the exact
+// tier's rings.
+void write_exact_admin_geometry(const ParsedData& data, const std::string& dir);
+
 // Writes admin-minimal, the smallest useful set, in two dirs under
 // region_dir. Both hold the minimal arc set (admin_minimal_keeps' polygons:
 // its ring blocks, arc_index.bin and arc_vertices.bin, the same arc files in

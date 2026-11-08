@@ -4,9 +4,11 @@
 // same data (--prev-output) writes them again unchanged. A chained build of
 // edited data keeps the slot of every arc the previous day had, which a fresh
 // build of it doesn't. A previous build without its arc sidecars leaves every
-// arc slot cold and the admin slots as they were.
+// arc slot cold and the admin slots as they were. Without --multi-output,
+// each region's dir is a whole index the server answers from.
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -196,6 +198,35 @@ std::map<std::string, std::vector<char>> arc_files(const std::string& out) {
     return files;
 }
 
+// The server's answers (its query_json, through the grid_query example) at
+// each point from the index under dir, one JSON line each; none when it
+// can't load the index. Its stderr goes to log.
+std::vector<std::string> server_answers(const std::string& dir, const std::vector<std::pair<double, double>>& points,
+                                        const std::string& scratch, const std::string& log) {
+#ifdef GEOCODER_GRID_QUERY_BIN
+    const std::string coords = scratch + ".coords", answers = scratch + ".answers";
+    {
+        std::ofstream f(coords);
+        for (const auto& [lat, lng] : points) f << lat << " " << lng << "\n";
+    }
+    const std::string cmd = gctest::quoted(GEOCODER_GRID_QUERY_BIN) + " " + gctest::quoted(dir) + " < " +
+                            gctest::quoted(coords) + " > " + gctest::quoted(answers) + " 2>> " + gctest::quoted(log);
+    if (std::system(cmd.c_str()) != 0) return {};
+    std::vector<std::string> lines;
+    std::ifstream f(answers);
+    for (std::string line; std::getline(f, line);) lines.push_back(line);
+    return lines;
+#else
+    (void)dir, (void)points, (void)scratch, (void)log;
+    std::printf("    no grid_query: configure with cargo on PATH to build the server's read path\n");
+    return {};
+#endif
+}
+
+bool says(const std::string& answer, const std::string& name) {
+    return answer.find("\"" + name + "\"") != std::string::npos;
+}
+
 }  // namespace
 
 TEST(build_index_writes_every_regions_admin_dirs_as_arcs_and_a_chained_build_writes_them_again) {
@@ -276,6 +307,61 @@ TEST(multi_quality_takes_no_scale_list_and_without_it_no_boundary_tier_is_writte
         for (const char* f : {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin"})
             CHECK(files.count(std::string("planet/") + dir + "/" + f));
     CHECK(!files.at("planet/admin-minimal/arc_vertices.bin").empty());
+}
+
+TEST(a_build_without_the_multi_flags_writes_whole_dirs_the_server_answers_from) {
+    const ScratchDir root("admin-dirs-single-output");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    write_test_pbf(pbf, fixture(), 1000);
+    const std::vector<std::string> geometry = {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin",
+                                               "arc_vertices.bin"};
+    // The default invocation: the planet's dir, its mode's files and the
+    // exact tier's admin geometry beside them; no boundary tier, no
+    // admin-minimal.
+    const std::string out = root.path() + "/single";
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
+    const auto files = tree(out);
+    for (const std::string& name : names_of(files))
+        CHECK(name.find("quality/") == std::string::npos && name.find("admin-minimal") == std::string::npos);
+    // The exact tier's bytes: what --multi-quality writes in quality/exact/,
+    // and beside the mode's files then too.
+    const std::string tiers = root.path() + "/tiers";
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, tiers, pbf, "--multi-quality"}, log));
+    const auto with_tiers = tree(tiers);
+    for (const std::string& f : geometry) {
+        REQUIRE(files.count("planet/" + f) && with_tiers.count("planet/" + f) &&
+                with_tiers.count("planet/quality/exact/" + f));
+        CHECK(files.at("planet/" + f) == with_tiers.at("planet/quality/exact/" + f));
+        CHECK(files.at("planet/" + f) == with_tiers.at("planet/" + f));
+    }
+    CHECK_EQ(files.at("planet/admin_polygons.bin").size(), 7 * sizeof(AdminPolygon));
+
+    // The server loads the dir and puts each point on its side of the border
+    // of the first two municipalities, 0.0005 degrees off it (its ways stray
+    // 0.0002 degrees): by their rings, as the cells there hold both.
+    const std::vector<std::pair<double, double>> points = {{47.05, 8.0995}, {47.05, 8.1005}};
+    auto check_answers = [&](const std::string& dir, const std::string& name) {
+        const std::vector<std::string> answers = server_answers(dir, points, root.path() + "/" + name, log);
+        REQUIRE(answers.size() == points.size());
+        const int failures_before = gctest::failures();
+        CHECK(says(answers[0], "Gemeinde 0") && !says(answers[0], "Gemeinde 1"));
+        CHECK(says(answers[1], "Gemeinde 1") && !says(answers[1], "Gemeinde 0"));
+        for (const std::string& answer : answers) CHECK(says(answer, "Kanton"));
+        if (gctest::failures() != failures_before)
+            for (const std::string& answer : answers) std::printf("    %s: %s\n", name.c_str(), answer.c_str());
+    };
+    check_answers(out + "/planet", "single");
+
+    // With --continents, every region's dir alike (Europe's arcs the
+    // planet's), which the server loads continent by continent.
+    const std::string continents = root.path() + "/continents";
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, continents, pbf, "--continents"}, log));
+    const auto regions = tree(continents);
+    for (const std::string& region : kRegions)
+        for (const std::string& f : geometry) CHECK(regions.count(region + "/" + f));
+    for (const char* f : {"admin_rings.bin", "arc_index.bin", "arc_vertices.bin"})
+        CHECK(regions.at(std::string("europe/") + f) == regions.at(std::string("planet/") + f));
+    check_answers(continents, "continents");
 }
 
 TEST(an_admin_polygon_is_built_whatever_simplifying_would_leave_of_its_ring) {

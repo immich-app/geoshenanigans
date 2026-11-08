@@ -1230,6 +1230,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
         };
         auto write_boundary_tiers = [&] {
             if (multi_quality) write_admin_tiers(d, base_dir);
+            // A single output dir is a whole index: the exact tier's
+            // geometry (lossless) beside the mode's files. --multi-output's
+            // mode dirs are read beside a boundary tier.
+            if (!multi_output) write_exact_admin_geometry(d, base_dir);
         };
         auto write_places = [&] {
             // Write place node files into each mode directory (so diff/patch can find them). Their
@@ -1889,6 +1893,8 @@ static int run(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
         std::cerr << "  <output-dir> must be new or empty" << std::endl;
+        std::cerr << "  Without --multi-output each region's dir is one whole index: the mode's files" << std::endl;
+        std::cerr << "  and the admin geometry at the exact tier" << std::endl;
         std::cerr << std::endl;
         std::cerr << "Options:" << std::endl;
         std::cerr << "  --street-level N       S2 cell level for streets (default: 17)" << std::endl;
