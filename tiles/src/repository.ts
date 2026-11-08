@@ -14,13 +14,22 @@ import {
 } from './interface';
 import { monitorAsyncFunction } from './monitor';
 
+// D1 read replicas spin down when idle, and while one spins back up its reads go to the primary, which may be far
+// away. A cheap query on every request, cache hits included, keeps the replica nearest each colo warm for the tile
+// misses that need it. It looks like dead code; it isn't.
+export async function warmD1Replica(database: D1Database): Promise<void> {
+  try {
+    await database.withSession('first-unconstrained').prepare('SELECT 1').run();
+  } catch (error) {
+    console.error('D1 warm-up failed', error);
+  }
+}
+
 export class CloudflareD1Repository implements IDatabaseRepository {
   constructor(
     private database: D1Database,
     private metrics: IMetricsRepository,
-  ) {
-    void database.withSession('first-unconstrained').prepare('SELECT 1').run();
-  }
+  ) {}
 
   async query(query: string, ...values: unknown[]) {
     const metric = Metric.create('d1_query');
