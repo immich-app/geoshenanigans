@@ -967,9 +967,14 @@ pub struct AdminScan {
 
 impl AdminScan {
     /// The scan of the point (`lat`, `lng`), rounded once to the e7 grid: its cell is that of the
-    /// point every ring is tested at.
+    /// point every ring is tested at. A point off the globe, or NaN, is in no ring and its scan
+    /// lists none: S2 would wrap it onto a cell of the globe ((10, 380) onto the cell of (10, 20)),
+    /// whose interior entries hold that cell's points, not this one.
     pub fn new(index: &Index, lat: f64, lng: f64) -> Self {
         let point = AdminPoint::new(lat, lng);
+        if !coords_in_range(lat, lng) {
+            return AdminScan { rings: Vec::new(), pip: ScanPip { point, memo: PipMemo::new() } };
+        }
         let (lat, lng) = point.degrees();
         let list = Index::lookup_admin_cell_fb(&index.admin_cells, cell_id_at_level(lat, lng, index.admin_cell_level));
         // The list, each record and most ring headers are read below wherever the point is, so
@@ -1009,7 +1014,8 @@ impl ScanPip {
     /// Whether the polygon of the scan's entry `id` holds the point. An entry flagged interior
     /// does without a test: the builder flags one only where the rings of every tier it covers
     /// hold the whole cell, at the reach the ray cast needs (admin_cover.h, cell_index.cpp
-    /// union_of_tiers), and the scan's cell is the rounded point's. Any other entry is tested.
+    /// union_of_tiers), and the scan's cell is the rounded point's, which is on the globe
+    /// (`AdminScan::new`). Any other entry is tested.
     fn holds(&mut self, index: &Index, id: u32, poly: &AdminPolygon) -> bool {
         (id & INTERIOR_FLAG != 0 && index.admin_geometry.has_rings(poly)) || self.contains(index, poly)
     }
@@ -6689,7 +6695,11 @@ mod admin_scan_tests {
 
     /// An Index holding only the admin files, laid out as the builder writes them.
     fn admin_index(rings: &[Ring]) -> Index {
-        let cell_ids = cells();
+        admin_index_in(rings, &cells())
+    }
+
+    /// `admin_index` with each ring's cells indices into `cell_ids`.
+    fn admin_index_in(rings: &[Ring], cell_ids: &[u64]) -> Index {
         let mut strings = vec![0u8];
         let mut arcs = arc_fixture::ArcFixture::new();
         let mut by_cell: std::collections::BTreeMap<u64, Vec<u32>> = Default::default();
@@ -6782,6 +6792,55 @@ mod admin_scan_tests {
         assert_eq!((a.country, a.state), (None, None));
         let egypt = idx.admin_polygon(0).unwrap();
         assert!(!idx.admin_geometry.contains_once(&egypt, AdminPoint::new(Q.0, far)));
+    }
+
+    #[test]
+    fn a_point_off_the_globe_is_in_no_ring_though_its_wrapped_cell_lists_them_interior() {
+        // Each point is Q once S2 wraps it onto the globe, so it would look up Q's cell, where every
+        // ring is listed interior: an interior entry holds the points of its cell, not this one.
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
+            ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, true)]),
+            ring("Paris", 8, 2.0, (21.9, 27.4, 22.1, 27.7), &[(0, true)]),
+            Ring { place_type: 5, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(0, true)]) },
+        ]);
+        let a = idx.find_admin(Q.0, Q.1);
+        assert_eq!((a.country, a.state, a.neighbourhood), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
+        for (lat, lng) in [(Q.0, Q.1 + 360.0), (Q.0, Q.1 - 360.0), (180.0 - Q.0, Q.1 - 180.0), (-180.0 - Q.0, Q.1 + 180.0)] {
+            let (rlat, rlng) = AdminPoint::new(lat, lng).degrees();
+            assert_eq!(cell_id_at_level(rlat, rlng, DEFAULT_ADMIN_CELL_LEVEL), cells()[0], "({lat}, {lng})");
+            let a = idx.find_admin(lat, lng);
+            assert_eq!((a.country, a.state, a.neighbourhood), (None, None, None), "({lat}, {lng})");
+            let mut scan = AdminScan::new(&idx, lat, lng);
+            assert!(scan.rings.is_empty(), "({lat}, {lng})");
+            let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"));
+            assert!(gates.gates.iter().all(Option::is_none) && gates.promoting.is_empty(), "({lat}, {lng})");
+            assert_eq!(idx.find_admin_from_chain(0, lat, lng).neighbourhood, None, "({lat}, {lng})");
+        }
+        for (lat, lng) in [(f64::NAN, Q.1), (Q.0, f64::NAN), (Q.0, f64::INFINITY), (f64::NEG_INFINITY, Q.1)] {
+            assert!(AdminScan::new(&idx, lat, lng).rings.is_empty(), "({lat}, {lng})");
+            assert_eq!(idx.find_admin(lat, lng).country, None, "({lat}, {lng})");
+        }
+    }
+
+    #[test]
+    fn the_globes_edges_are_on_it_and_a_hair_past_them_is_not() {
+        // A ring listed interior both in the cell of a point on the edge of the globe and in the
+        // cell S2 wraps a point a hair past it onto.
+        for ((lat, lng), past, around) in [
+            ((90.0, 45.0), (90.0000001, 45.0), (89.0, 44.0, 90.0, 46.0)),
+            ((-90.0, 45.0), (-90.0000001, 45.0), (-90.0, 44.0, -89.0, 46.0)),
+            ((10.0, 180.0), (10.0, 180.0000001), (9.0, 179.0, 11.0, 180.0)),
+            ((10.0, -180.0), (10.0, -180.0000001), (9.0, -180.0, 11.0, -179.0)),
+        ] {
+            let cell = |(lat, lng): (f64, f64)| {
+                let (lat, lng) = AdminPoint::new(lat, lng).degrees();
+                cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL)
+            };
+            let idx = admin_index_in(&[ring("Edge", 2, 1.0, around, &[(0, true), (1, true)])], &[cell((lat, lng)), cell(past)]);
+            assert_eq!(idx.find_admin(lat, lng).country, Some("Edge"), "({lat}, {lng})");
+            assert_eq!(idx.find_admin(past.0, past.1).country, None, "{past:?}");
+        }
     }
 
     #[test]
