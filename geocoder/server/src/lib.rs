@@ -2318,11 +2318,12 @@ impl Index {
     // whether it's a road or an addressable POI.
     //
     // For polygon POIs, returns distance 0 if the query is inside
-    // the polygon, otherwise the distance to the nearest edge.
+    // the polygon, otherwise the distance to the nearest edge. None for
+    // a point off the globe (see find_pois).
     pub fn find_nearest_poi_with_parent(&self, lat: f64, lng: f64) -> Option<(f64, PoiRecord)> {
         let poi_cells = self.poi_cells.as_ref()?;
         let poi_entries = self.poi_entries.as_ref()?;
-        if self.poi_records.is_none() { return None; }
+        if self.poi_records.is_none() || !coords_in_range(lat, lng) { return None; }
 
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
@@ -2419,6 +2420,8 @@ impl Index {
 
     // --- POI lookup ---
 
+    /// The POIs near (lat, lng); none for a point off the globe, or NaN: S2 would wrap it onto a
+    /// cell of the globe, whose interior entries hold that cell's points, not this one.
     pub fn find_pois(&self, lat: f64, lng: f64) -> Vec<PoiMatch<'_>> {
         let poi_cells = match &self.poi_cells {
             Some(c) => c,
@@ -2428,7 +2431,7 @@ impl Index {
             Some(e) => e,
             None => return vec![],
         };
-        if self.poi_records.is_none() { return vec![]; }
+        if self.poi_records.is_none() || !coords_in_range(lat, lng) { return vec![]; }
 
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
@@ -7050,6 +7053,48 @@ mod admin_scan_tests {
     /// A ring a tier simplified away: its record keeps its name, its ring block is empty.
     fn ringless(name: &'static str, level: u8, cells: &[(usize, bool)]) -> Ring {
         Ring { verts: Vec::new(), ..ring(name, level, 1.0, EGYPT, cells) }
+    }
+
+    /// `idx` with one polygon POI, the box `around` named as admin polygon `named_after` is, its
+    /// own parent street, listed in Q's cell (interior or not).
+    fn with_polygon_poi(mut idx: Index, named_after: u32, (lat0, lng0, lat1, lng1): (f64, f64, f64, f64), interior: bool) -> Index {
+        let name_id = idx.admin_polygon(named_after).unwrap().name_id;
+        let f32s = |values: &[f64]| values.iter().flat_map(|&v| (v as f32).to_le_bytes()).collect::<Vec<u8>>();
+        // The polygon header (raw f32 vertices, encoding 4, then the box's low corner), then the vertices.
+        let vertices = [&[4u8, 0][..], &f32s(&[lat0, lng0]), &f32s(&[lat0, lng0, lat0, lng1, lat1, lng1, lat1, lng0])].concat();
+        let record = [&f32s(&[(lat0 + lat1) / 2.0, (lng0 + lng1) / 2.0])[..], &0u32.to_le_bytes(), &4u32.to_le_bytes(),
+            &name_id.to_le_bytes(), &[1u8, 0, 0, 0], &name_id.to_le_bytes(), &NO_DATA.to_le_bytes(), &NO_DATA.to_le_bytes()].concat();
+        assert_eq!(record.len(), std::mem::size_of::<PoiRecord>());
+        let entry = if interior { INTERIOR_FLAG } else { 0 };
+        idx.poi_cells = Some(FileBytes::Owned([&cells()[0].to_le_bytes()[..], &0u32.to_le_bytes()].concat()));
+        idx.poi_entries = Some(FileBytes::Owned([&1u16.to_le_bytes()[..], &entry.to_le_bytes()].concat()));
+        idx.poi_records = Some(FileBytes::Owned(record));
+        idx.poi_vertices = Some(FileBytes::Owned(vertices));
+        idx
+    }
+
+    #[test]
+    fn a_point_off_the_globe_is_in_no_poi_though_its_wrapped_cell_lists_one_interior() {
+        let around_q = (21.99, 27.5, 22.05, 27.6);
+        let rings = || [ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]), Ring { place_type: 5, ..ring("Bir Tarfawi", 15, 0.01, around_q, &[(0, true)]) }];
+        for interior in [false, true] {
+            let idx = with_polygon_poi(admin_index(&rings()), 1, around_q, interior);
+            let pois = |lat, lng| idx.find_pois(lat, lng).iter().map(|p| (p.name, p.contained)).collect::<Vec<_>>();
+            assert_eq!(pois(Q.0, Q.1), [("Bir Tarfawi", true)], "interior {interior}");
+            assert_eq!(idx.find_nearest_poi_with_parent(Q.0, Q.1).map(|(d, p)| (d, p.name_id)), Some((0.0, idx.admin_polygon(1).unwrap().name_id)));
+            let answer = serde_json::to_string(&idx.query(Q.0, Q.1)).unwrap();
+            assert!(answer.contains("Egypt") && answer.contains("Bir Tarfawi"), "{answer}");
+            for (lat, lng) in [(Q.0, Q.1 + 360.0), (Q.0, Q.1 - 360.0), (180.0 - Q.0, Q.1 - 180.0), (-180.0 - Q.0, Q.1 + 180.0)] {
+                assert_eq!(cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL), cells()[0], "({lat}, {lng})");
+                assert_eq!(pois(lat, lng), [], "({lat}, {lng}) interior {interior}");
+                assert!(idx.find_nearest_poi_with_parent(lat, lng).is_none(), "({lat}, {lng}) interior {interior}");
+                assert_eq!(serde_json::to_string(&idx.query(lat, lng)).unwrap(), r#"{"address":{}}"#, "({lat}, {lng}) interior {interior}");
+            }
+            for (lat, lng) in [(f64::NAN, Q.1), (Q.0, f64::NAN), (Q.0, f64::INFINITY), (f64::NEG_INFINITY, Q.1)] {
+                assert_eq!(pois(lat, lng), [], "({lat}, {lng})");
+                assert!(idx.find_nearest_poi_with_parent(lat, lng).is_none(), "({lat}, {lng})");
+            }
+        }
     }
 
     #[test]
