@@ -1,8 +1,9 @@
-// admin_ring_cells (src/admin_cover.h) and the admin cell index over the arc
-// tiers (compute_admin_index_cells): a reader looks a point up in its own
-// cell only, so every point the ray cast puts inside a ring must find the
-// ring listed in that cell, and an interior flag must hold for every point of
-// its cell.
+// A polygon's admin cells (src/admin_cover.h: its edges' cells,
+// admin_arc_cells, classified by admin_polygon_cells) and the admin cell
+// index over the arc tiers (compute_admin_index_cells): a reader looks a
+// point up in its own cell only, so every point the ray cast puts inside a
+// ring must find the ring listed in that cell, and an interior flag must hold
+// for every point of its cell.
 #include "admin_cover.h"
 
 #include <algorithm>
@@ -44,10 +45,26 @@ const std::pair<uint64_t, bool>* own_cell_entry(const AdminRingCells& cells, dou
 
 using Ring = std::vector<PackedLocation>;
 
+// The cells of a polygon's rings of verts, each joined back to its first
+// vertex: the cells of each ring's edges (admin_arc_cells of the ring
+// closed), classified.
+AdminRingCells rings_cells(const PackedLocation* verts, const RingSpan* rings, uint32_t ring_count, int level,
+                           double reach_rad) {
+    std::vector<uint64_t> boundary;
+    for (uint32_t r = 0; r < ring_count; r++) {
+        Ring closed(verts + rings[r].begin, verts + rings[r].begin + rings[r].count);
+        if (!closed.empty() && closed.back() != closed.front()) closed.push_back(closed.front());
+        admin_arc_cells(closed.data(), static_cast<uint32_t>(closed.size()), level, reach_rad, boundary);
+    }
+    std::sort(boundary.begin(), boundary.end());
+    boundary.erase(std::unique(boundary.begin(), boundary.end()), boundary.end());
+    return admin_polygon_cells(boundary, verts, rings, ring_count, level);
+}
+
 // The cells of one ring at the admin cell index's reach.
 AdminRingCells ring_cells(const Ring& ring, int level) {
     const RingSpan span{0, static_cast<uint32_t>(ring.size())};
-    return admin_ring_cells(ring.data(), &span, 1, level, ADMIN_COVER_REACH_RAD);
+    return rings_cells(ring.data(), &span, 1, level, ADMIN_COVER_REACH_RAD);
 }
 
 // Points in the ring's bounds and a margin past them, and points within
@@ -129,7 +146,7 @@ TEST(a_point_in_the_bow_of_a_parallel_edge_is_listed_in_its_own_cell) {
     CHECK(deep->second);
 }
 
-TEST(admin_ring_cells_list_every_point_the_ray_cast_puts_inside) {
+TEST(a_rings_cells_list_every_point_the_ray_cast_puts_inside) {
     std::mt19937_64 rng(20261020);
     std::uniform_real_distribution<double> unit(0, 1);
     size_t inside = 0;
@@ -151,7 +168,7 @@ TEST(admin_ring_cells_list_every_point_the_ray_cast_puts_inside) {
     CHECK(inside > 50000);
 }
 
-TEST(admin_ring_cells_follow_edges_near_the_poles_and_the_long_way_round) {
+TEST(a_rings_cells_follow_edges_near_the_poles_and_the_long_way_round) {
     std::mt19937_64 rng(7);
     // The cap north of 85°N: its edges run along 85°N and along 90°N, a
     // single point on the sphere the ray cast spreads over every longitude.
@@ -165,7 +182,7 @@ TEST(admin_ring_cells_follow_edges_near_the_poles_and_the_long_way_round) {
                      20000, kLevel) > 5000);
 }
 
-TEST(admin_ring_cells_cover_rings_along_the_antimeridian_and_up_to_the_pole) {
+TEST(a_rings_cells_cover_it_along_the_antimeridian_and_up_to_the_pole) {
     std::mt19937_64 rng(5);
     for (const Ring& ring : {ring_of({{-18, 179.12345}, {-18, 180}, {-17, 180}, {-17, 179.12345}}),
                              ring_of({{89.00003, 10}, {89.00003, 11}, {90, 11}, {90, 10}})})
@@ -277,21 +294,21 @@ Indexed indexed(const std::vector<std::pair<double, double>>& lat_lng, uint8_t l
     out.data.admin_polygons.push_back(p);
     const AdminExactRings& store = out.data.admin_exact_rings;
     out.arcs = build_admin_arcs(store, {admin_minimal_keeps(level, place_type)}, "", 1);
-    // Each tier's cells as admin_ring_cells gives them for its rings.
+    // Each tier's cells of its ring.
     auto cells_of = [&](size_t t) {
         std::vector<PackedLocation> stored, raw;
         std::vector<StoredVertex> scratch;
         tier_ring(out.arcs, store, kArcTiers[t], out.arcs.tiers[t], 0, stored, raw, scratch);
         if (stored.empty()) return AdminRingCells();
         const RingSpan span{0, static_cast<uint32_t>(stored.size())};
-        return admin_ring_cells(stored.data(), &span, 1, kAdminCellLevel, ADMIN_COVER_REACH_RAD);
+        return rings_cells(stored.data(), &span, 1, kAdminCellLevel, ADMIN_COVER_REACH_RAD);
     };
     out.simplified = cells_of(0);
     out.exact = cells_of(1);
     out.minimal = cells_of(2);
-    CHECK(out.exact == admin_ring_cells(store.vertices.data(), store.rings_of(0), 1, kAdminCellLevel,
-                                        ADMIN_COVER_REACH_RAD));
-    compute_admin_index_cells(out.data, out.arcs, admin_candidate_cells(store, 0, 1, 1), 1);
+    CHECK(out.exact ==
+          rings_cells(store.vertices.data(), store.rings_of(0), 1, kAdminCellLevel, ADMIN_COVER_REACH_RAD));
+    compute_admin_index_cells(out.data, out.arcs, 1);
     return out;
 }
 
@@ -348,7 +365,7 @@ struct ExactPolygon {
         vertices.insert(vertices.end(), ring.begin(), ring.end());
     }
     AdminRingCells cells(int level, double reach_rad) const {
-        return admin_ring_cells(vertices.data(), rings.data(), static_cast<uint32_t>(rings.size()), level, reach_rad);
+        return rings_cells(vertices.data(), rings.data(), static_cast<uint32_t>(rings.size()), level, reach_rad);
     }
     // Even-odd over every ring, as the builder's links test it.
     bool contains(PackedLocation p) const {
@@ -372,7 +389,7 @@ std::vector<PackedLocation> star(std::mt19937_64& rng, double lat, double lng, d
 
 }  // namespace
 
-TEST(admin_ring_cells_of_exact_rings_with_holes_list_every_point_inside) {
+TEST(the_cells_of_exact_rings_with_holes_list_every_point_inside) {
     std::mt19937_64 rng(1103);
     std::uniform_real_distribution<double> unit(0, 1), near(-1e-3, 1e-3);
     size_t inside = 0, in_holes = 0;

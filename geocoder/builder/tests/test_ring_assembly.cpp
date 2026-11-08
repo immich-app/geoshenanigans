@@ -9,6 +9,7 @@
 #include "ring_assembly.h"
 
 #include <cmath>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -490,4 +491,166 @@ TEST(area_rings_drop_coordinates_repeated_in_a_row) {
     const std::vector<NestedPolygon<PackedLocation>> polygons = nested(a);
     CHECK_EQ(polygons_holding(polygons, 20.0, 20.0), 1);
     CHECK_EQ(polygons_holding(polygons, 50.0, 50.0), 0);
+}
+
+// --- Way runs: the member ways along each ring's edges ---
+
+namespace {
+
+// Whether `runs` cover the ring's edges once each, in its order, with no
+// two runs in a row of one way, and each edge lies along its run's way: its
+// two vertices one after the other in that way's coordinates (a repeat
+// dropped), either way round.
+bool runs_follow_ways(const Ring& ring, const std::vector<WayRun>& runs, const WayGeometries& geoms) {
+    size_t edges = 0;
+    for (size_t k = 0; k < runs.size(); k++) {
+        if (runs[k].edges == 0 || (k > 0 && runs[k].way == runs[k - 1].way)) return false;
+        edges += runs[k].edges;
+    }
+    if (ring.size() < 2 || edges != ring.size() - 1) return false;
+    size_t e = 0;
+    for (const WayRun& run : runs) {
+        const auto* way = geoms.find(run.way);
+        if (!way) return false;
+        const CoordSpan coords = geoms.coords_of(*way);
+        std::vector<PackedLocation> along;
+        for (const PackedLocation& p : coords)
+            if (along.empty() || along.back() != p) along.push_back(p);
+        for (uint32_t i = 0; i < run.edges; i++, e++) {
+            bool found = false;
+            for (size_t j = 0; j + 1 < along.size() && !found; j++)
+                found = (along[j] == ring[e] && along[j + 1] == ring[e + 1]) ||
+                        (along[j] == ring[e + 1] && along[j + 1] == ring[e]);
+            if (!found) return false;
+        }
+    }
+    return true;
+}
+
+bool every_ring_follows_its_ways(const AreaRings& a, const WayGeometries& geoms) {
+    if (a.runs.size() != a.rings.size()) return false;
+    for (size_t r = 0; r < a.rings.size(); r++)
+        if (!runs_follow_ways(a.rings[r], a.runs[r], geoms)) return false;
+    return true;
+}
+
+}  // namespace
+
+// A square of two ways is a run of each, in the order the ring walks them.
+TEST(area_rings_give_each_ring_the_member_ways_along_its_edges) {
+    WayGeometries geoms;
+    add_way(geoms, 7, {{0.0, 0.0}, {0.0, 1.0}, {1.0, 1.0}});
+    add_way(geoms, 9, {{0.0, 0.0}, {1.0, 0.0}, {1.0, 1.0}});
+    const AreaRings a = assemble_area_rings({{7, "outer"}, {9, "outer"}}, geoms);
+    REQUIRE(a.rings.size() == size_t(1));
+    CHECK(a.runs == std::vector<std::vector<WayRun>>({{{7, 2}, {9, 2}}}));
+    CHECK(every_ring_follows_its_ways(a, geoms));
+}
+
+// Whatever the walk does: rings split where they touch, duplicate sub-ways
+// cancelled, rings re-paired where they cross at shared nodes, repeated
+// coordinates dropped, holes and islands. Each ring's runs follow its ways.
+TEST(area_rings_runs_follow_the_member_ways_whatever_the_walk_does) {
+    WayGeometries geoms;
+    // Rings touching at a node, the outline in two ways.
+    add_way(geoms, 1, {{0.0, 0.0}, {0.0, 10.0}, {10.0, 10.0}, {10.0, 0.0}, {5.0, 0.0}});
+    add_way(geoms, 2, {{5.0, 0.0}, {7.0, 3.0}, {3.0, 3.0}, {5.0, 0.0}});
+    add_way(geoms, 3, {{5.0, 0.0}, {0.0, 0.0}});
+    // Two squares sharing a side listed twice (it cancels).
+    add_way(geoms, 11, {{20.0, 21.0}, {20.0, 20.0}, {21.0, 20.0}, {21.0, 21.0}});
+    add_way(geoms, 12, {{20.0, 21.0}, {20.0, 22.0}, {21.0, 22.0}, {21.0, 21.0}});
+    add_way(geoms, 13, {{20.0, 21.0}, {21.0, 21.0}});
+    // Two closed ways crossing at shared nodes, re-paired into two L-shapes.
+    add_way(geoms, 21, {{30.0, 30.0}, {30.0, 32.0}, {31.0, 32.0}, {32.0, 32.0}, {32.0, 31.0}, {32.0, 30.0}, {30.0, 30.0}});
+    add_way(geoms, 22, {{31.0, 31.0}, {31.0, 32.0}, {31.0, 33.0}, {33.0, 33.0}, {33.0, 31.0}, {32.0, 31.0}, {31.0, 31.0}});
+    // An outline with every coordinate twice, a hole and an island in it.
+    std::vector<Coord> outline;
+    for (int i = 0; i < 6; i++) outline.push_back({40.0, 40.0 + i});
+    for (int i = 0; i < 6; i++) outline.push_back({40.0 + i, 46.0});
+    for (int i = 6; i > 0; i--) outline.push_back({46.0, 40.0 + i});
+    for (int i = 6; i > 0; i--) outline.push_back({40.0 + i, 40.0});
+    std::vector<Coord> repeated;
+    for (const Coord& c : outline) repeated.insert(repeated.end(), {c, c});
+    repeated.push_back(outline.front());
+    add_way(geoms, 31, repeated);
+    add_way(geoms, 32, {{41.0, 41.0}, {41.0, 45.0}, {45.0, 45.0}});
+    add_way(geoms, 33, {{45.0, 45.0}, {45.0, 41.0}, {41.0, 41.0}});
+    add_way(geoms, 34, {{42.0, 42.0}, {42.0, 44.0}, {44.0, 44.0}, {44.0, 42.0}, {42.0, 42.0}});
+    using Members = std::vector<std::pair<int64_t, std::string>>;
+    for (const Members& members :
+         {Members{{1, "outer"}, {2, "inner"}, {3, "outer"}}, Members{{3, "outer"}, {1, "outer"}, {2, "inner"}},
+          Members{{11, "outer"}, {13, "outer"}, {12, "outer"}, {13, "outer"}}, Members{{21, "outer"}, {22, "outer"}},
+          Members{{22, "outer"}, {21, "inner"}}, Members{{31, "outer"}, {32, "inner"}, {34, "outer"}, {33, "inner"}}}) {
+        const AreaRings a = assemble_area_rings(members, geoms);
+        CHECK(a.failure == AreaFailure::None);
+        CHECK(!a.rings.empty());
+        CHECK(every_ring_follows_its_ways(a, geoms));
+    }
+    // Way 13 cancels: the rectangle runs along 11 and 12 alone.
+    const AreaRings rectangle = assemble_area_rings({{11, "outer"}, {13, "outer"}, {12, "outer"}, {13, "outer"}}, geoms);
+    REQUIRE(rectangle.runs.size() == size_t(1));
+    for (const WayRun& run : rectangle.runs[0]) CHECK(run.way == 11 || run.way == 12);
+    // The repeats dropped: one run of the outline's 24 edges.
+    const AreaRings doubled = assemble_area_rings({{31, "outer"}}, geoms);
+    CHECK(doubled.runs == std::vector<std::vector<WayRun>>({{{31, 24}}}));
+}
+
+// Rotated as canonicalize_ring_rotation rotates it, a ring keeps its runs on
+// its edges: the run at the new start splits there, and the two runs of one
+// way the old start parted join again.
+TEST(a_rings_way_runs_rotate_with_it) {
+    WayGeometries geoms;
+    // A ring of ways 4, 5 and 6, its smallest vertex inside way 6's run.
+    add_way(geoms, 5, {{2.0, 1.0}, {2.0, 2.0}, {1.0, 2.0}, {0.5, 1.5}});
+    add_way(geoms, 6, {{0.5, 1.5}, {0.0, 1.0}, {1.0, 0.5}, {1.5, 0.0}, {2.0, 0.5}});
+    Ring ring;
+    for (const Coord& c : std::vector<Coord>{{2.0, 0.5}, {2.0, 1.0}, {2.0, 2.0}, {1.0, 2.0}, {0.5, 1.5}, {0.0, 1.0},
+                                             {1.0, 0.5}, {1.5, 0.0}, {2.0, 0.5}})
+        ring.push_back(pack_location(c.first, c.second));
+    add_way(geoms, 4, {{2.0, 0.5}, {2.0, 1.0}});
+    std::vector<WayRun> runs = {{4, 1}, {5, 3}, {6, 4}};
+    REQUIRE(runs_follow_ways(ring, runs, geoms));
+    // Its smallest vertex, (0.0, 1.0), is the second of way 6's run.
+    CHECK_EQ(canonical_ring_start(ring), size_t(5));
+    canonicalize_ring_rotation(ring, runs);
+    CHECK(ring.front() == pack_location(0.0, 1.0));
+    CHECK(runs == std::vector<WayRun>({{6, 3}, {4, 1}, {5, 3}, {6, 1}}));
+    CHECK(runs_follow_ways(ring, runs, geoms));
+
+    // One way all round stays one run; the old start's two runs of way 8 join.
+    std::vector<WayRun> one = {{3, 8}};
+    restart_way_runs(one, 5);
+    CHECK(one == std::vector<WayRun>({{3, 8}}));
+    std::vector<WayRun> parted = {{8, 2}, {9, 3}, {8, 1}};
+    restart_way_runs(parted, 3);
+    CHECK(parted == std::vector<WayRun>({{9, 2}, {8, 3}, {9, 1}}));
+    std::vector<WayRun> short_runs = {{1, 2}};
+    CHECK(gctest::refusal_of<std::logic_error>([&] { restart_way_runs(short_runs, 2); }).find("past the edges of its way runs") !=
+          std::string::npos);
+}
+
+// The store keeps each ring's runs beside it: none for a ring appended
+// without them, and a polygon whose runs don't match its rings is refused.
+TEST(the_exact_ring_store_keeps_each_rings_way_runs) {
+    AdminExactRings store;
+    const Ring square = {pack_location(0, 0), pack_location(0, 1), pack_location(1, 1), pack_location(1, 0),
+                         pack_location(0, 0)};
+    const Ring hole = {pack_location(0.2, 0.2), pack_location(0.2, 0.4), pack_location(0.4, 0.4), pack_location(0.2, 0.2)};
+    store.append(square, {hole}, {{{1, 2}, {2, 2}}, {{3, 3}}});
+    store.append(square, {});
+    store.append(square, {}, {{{4, 4}}});
+    REQUIRE(store.first_run.size() == store.rings.size());
+    auto runs_of = [&](uint32_t r) {
+        const auto [first, last] = store.runs_of_ring(r);
+        return std::vector<WayRun>(first, last);
+    };
+    CHECK(runs_of(0) == std::vector<WayRun>({{1, 2}, {2, 2}}));
+    CHECK(runs_of(1) == std::vector<WayRun>({{3, 3}}));
+    CHECK(runs_of(2).empty());
+    CHECK(runs_of(3) == std::vector<WayRun>({{4, 4}}));
+    CHECK(gctest::refusal_of<std::logic_error>([&] { store.append(square, {hole}, {{{5, 4}}}); }).find("out of step") !=
+          std::string::npos);
+    store.drop_way_runs();
+    CHECK(store.runs.empty() && store.first_run.empty());
+    CHECK_EQ(store.rings.size(), size_t(4));
 }

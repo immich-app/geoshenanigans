@@ -6,6 +6,7 @@
 
 #include "packed_location.h"
 #include "parsed_data.h"
+#include "polygon_rings.h"
 
 std::vector<std::vector<PackedLocation>> assemble_outer_rings(
     const std::vector<std::pair<int64_t, std::string>>& members,
@@ -21,6 +22,7 @@ enum class AreaFailure : uint8_t { None, OpenRing, TooManyTouches, Crossing };
 struct AreaRings {
     std::vector<std::vector<PackedLocation>> rings;  // closed
     std::vector<uint8_t> roles;      // per ring: RingRole bits of the ways it runs along
+    std::vector<std::vector<WayRun>> runs;  // per ring: the member ways along its edges, in its order
     uint32_t cancelled_sub_ways = 0; // duplicates dropped in pairs
     uint32_t crossing_coordinates = 0;  // where rings walked in member order crossed (re-paired)
     AreaFailure failure = AreaFailure::None;  // set: no rings
@@ -32,3 +34,6 @@ struct AreaRings {
 // tells the outer rings from the holes by geometry.
 AreaRings assemble_area_rings(const std::vector<std::pair<int64_t, std::string>>& members,
                               const WayGeometries& way_geoms);
+
+// canonicalize_ring_rotation's rotation of a ring, its way runs rotated with it.
+void canonicalize_ring_rotation(std::vector<PackedLocation>& ring, std::vector<WayRun>& runs);

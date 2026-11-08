@@ -288,7 +288,7 @@ struct WayGeometries {
 // Every admin polygon's exact rings, OSM's own e7 points: closed rings
 // (the last vertex repeating the first), the outer ring first, then the
 // holes. As the polygons are reordered only `polygons` follows them; the
-// vertices and ring spans never move.
+// vertices, ring spans and way runs never move.
 struct AdminExactRings {
     struct Polygon {
         uint32_t first_ring = 0;
@@ -297,8 +297,24 @@ struct AdminExactRings {
     std::vector<PackedLocation> vertices;
     std::vector<RingSpan> rings;
     std::vector<Polygon> polygons;  // parallel to ParsedData::admin_polygons
+    // Each ring's member ways along its edges, in its order (WayRun): ring
+    // r's are runs[first_run[r], first_run[r + 1]), the last ring's up to the
+    // end; none for a ring appended without them. first_run is parallel to
+    // `rings` until drop_way_runs frees both after the arc stage, their only
+    // reader (build_admin_arcs).
+    std::vector<WayRun> runs;
+    std::vector<uint32_t> first_run;
 
     const RingSpan* rings_of(uint32_t pid) const { return rings.data() + polygons[pid].first_ring; }
+    // Ring r's way runs, [first, second); first_run must be in step with the rings.
+    std::pair<const WayRun*, const WayRun*> runs_of_ring(uint32_t r) const {
+        const size_t end = r + 1 < first_run.size() ? first_run[r + 1] : runs.size();
+        return {runs.data() + first_run[r], runs.data() + end};
+    }
+    void drop_way_runs() {
+        std::vector<WayRun>().swap(runs);
+        std::vector<uint32_t>().swap(first_run);
+    }
     // The vertices of the polygon's rings, each ring's closing one counted.
     uint64_t occurrences(uint32_t pid) const {
         uint64_t n = 0;
@@ -308,19 +324,26 @@ struct AdminExactRings {
     // The rings' area in square degrees (exact_polygon_area).
     float area(uint32_t pid) const { return exact_polygon_area(vertices.data(), rings_of(pid), polygons[pid].ring_count); }
 
-    // Appends a polygon of the outer ring and the holes.
-    void append(const std::vector<PackedLocation>& outer, const std::vector<std::vector<PackedLocation>>& holes) {
-        size_t total = vertices.size() + outer.size();
+    // Appends a polygon of the outer ring and the holes, with each ring's way
+    // runs (`ring_runs`, the outer ring's first; none when empty).
+    void append(const std::vector<PackedLocation>& outer, const std::vector<std::vector<PackedLocation>>& holes,
+                const std::vector<std::vector<WayRun>>& ring_runs = {}) {
+        if (!ring_runs.empty() && ring_runs.size() != 1 + holes.size())
+            throw std::logic_error("a polygon's way runs out of step with its rings");
+        size_t total = vertices.size() + outer.size(), total_runs = runs.size();
         for (const auto& h : holes) total += h.size();
-        if (total > UINT32_MAX || rings.size() + 1 + holes.size() > UINT32_MAX)
-            throw std::length_error("admin exact rings past 2^32 vertices or rings");
+        for (const auto& r : ring_runs) total_runs += r.size();
+        if (total > UINT32_MAX || rings.size() + 1 + holes.size() > UINT32_MAX || total_runs > UINT32_MAX)
+            throw std::length_error("admin exact rings past 2^32 vertices, rings or way runs");
         polygons.push_back({static_cast<uint32_t>(rings.size()), static_cast<uint32_t>(1 + holes.size())});
-        auto add = [&](const std::vector<PackedLocation>& ring) {
+        auto add = [&](const std::vector<PackedLocation>& ring, size_t k) {
+            first_run.push_back(static_cast<uint32_t>(runs.size()));
             rings.push_back({static_cast<uint32_t>(vertices.size()), static_cast<uint32_t>(ring.size())});
             vertices.insert(vertices.end(), ring.begin(), ring.end());
+            if (!ring_runs.empty()) runs.insert(runs.end(), ring_runs[k].begin(), ring_runs[k].end());
         };
-        add(outer);
-        for (const auto& h : holes) add(h);
+        add(outer, 0);
+        for (size_t k = 0; k < holes.size(); k++) add(holes[k], k + 1);
     }
 };
 

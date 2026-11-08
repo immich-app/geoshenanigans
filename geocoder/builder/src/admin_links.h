@@ -24,13 +24,6 @@
 // The admin cell index's cell of the e7 point p, the one cell a link reads.
 S2CellId admin_link_cell(PackedLocation p);
 
-// The exact tier's share of the admin cell index for polygons [begin, end),
-// in no order: each polygon's admin_ring_cells over its exact rings at
-// kAdminCellLevel and ADMIN_COVER_REACH_RAD, its id flagged INTERIOR_FLAG in
-// the cells its rings hold whole.
-std::vector<CellItemPair> admin_candidate_cells(const AdminExactRings& rings, uint32_t begin, uint32_t end,
-                                                unsigned int threads);
-
 // The entries of `cell` in a canonical cell index (cell_item_less order).
 std::pair<const CellItemPair*, const CellItemPair*> admin_cell_entries(const std::vector<CellItemPair>& index,
                                                                        uint64_t cell);

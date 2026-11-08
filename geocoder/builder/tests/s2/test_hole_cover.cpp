@@ -85,7 +85,7 @@ TEST(the_admin_index_lists_a_country_where_its_simplified_hole_gave_way) {
     }
     const AdminExactRings& store = data.admin_exact_rings;
     const AdminArcs arcs = build_admin_arcs(store, {true, true}, "", 1);
-    compute_admin_index_cells(data, arcs, admin_candidate_cells(store, 0, 2, 1), 1);
+    compute_admin_index_cells(data, arcs, 1);
 
     const std::vector<Ring> simplified = stored_rings(arcs, store, 0, 0), exact = stored_rings(arcs, store, 1, 0);
     size_t bulge = 0;
@@ -125,7 +125,7 @@ TEST(the_admin_index_lists_each_polygon_wherever_a_tier_puts_a_point_in_it) {
     // The enclave is no polygon of the minimal set.
     const std::vector<bool> in_minimal = {true, false, true};
     const AdminArcs arcs = build_admin_arcs(store, in_minimal, "", 1);
-    compute_admin_index_cells(data, arcs, admin_candidate_cells(store, 0, 3, 1), 1);
+    compute_admin_index_cells(data, arcs, 1);
 
     size_t inside = 0, interior = 0, inside_minimal = 0;
     for (uint32_t p = 0; p < 3; p++) {

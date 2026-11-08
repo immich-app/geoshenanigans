@@ -322,9 +322,11 @@ TEST(both_admin_minimal_dirs_hold_the_same_minimal_arcs) {
         // Not the full set's: the minimal set's own arcs.
         CHECK(file_bytes(r.own_dir + file) != file_bytes(r.simplified_dir + file));
     }
-    // One sidecar of the minimal set's slots, in admin-minimal/.
-    CHECK(std::filesystem::exists(r.own_dir + "/arc_index.osm_ids"));
-    CHECK(!std::filesystem::exists(r.poi_dir + "/arc_index.osm_ids"));
+    // The minimal set's slot sidecars, in admin-minimal/ alone.
+    for (const char* sidecar : {"/arc_index.osm_ids", "/arc_index.fallback.osm_ids"}) {
+        CHECK(std::filesystem::exists(r.own_dir + sidecar));
+        CHECK(!std::filesystem::exists(r.poi_dir + sidecar));
+    }
 }
 
 TEST(the_boundary_tiers_share_their_records_and_rings_and_postcode_areas_are_records_there) {
@@ -350,7 +352,7 @@ TEST(the_boundary_tiers_share_their_records_and_rings_and_postcode_areas_are_rec
     for (const auto& entry : std::filesystem::recursive_directory_iterator(r.tmp.path))
         CHECK(entry.path().filename().string().rfind("postal_", 0) != 0);
     // The slots' sidecars beside the exact tier only.
-    for (const char* sidecar : {"/admin_polygons.osm_ids", "/arc_index.osm_ids"}) {
+    for (const char* sidecar : {"/admin_polygons.osm_ids", "/arc_index.osm_ids", "/arc_index.fallback.osm_ids"}) {
         CHECK(std::filesystem::exists(r.exact_dir + sidecar));
         CHECK(!std::filesystem::exists(r.simplified_dir + sidecar));
     }

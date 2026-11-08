@@ -33,6 +33,7 @@ Ring closed(Ring vertices) {
 // and the admin cell index over their arcs' tiers.
 struct Admins {
     ParsedData data;
+    AdminArcs arcs;
 
     uint32_t add(uint8_t level, const Ring& outer, const std::vector<Ring>& holes = {}) {
         const uint32_t pid = static_cast<uint32_t>(data.admin_polygons.size());
@@ -48,8 +49,8 @@ struct Admins {
 
     void map() {
         const uint32_t n = static_cast<uint32_t>(data.admin_polygons.size());
-        const AdminArcs arcs = build_admin_arcs(data.admin_exact_rings, std::vector<bool>(n, false), "", 1);
-        compute_admin_index_cells(data, arcs, admin_candidate_cells(data.admin_exact_rings, 0, n, 1), 1);
+        arcs = build_admin_arcs(data.admin_exact_rings, std::vector<bool>(n, false), "", 1);
+        compute_admin_index_cells(data, arcs, 1);
     }
 
     void add_poi(float lat, float lng) {
@@ -177,7 +178,8 @@ TEST(a_point_finds_no_country_where_only_its_simplified_rings_reach_its_cell) {
     a.map();
     const PackedLocation p = at(-0.005, 0.005);
     REQUIRE(a.listed(p, country));  // by the simplified tier
-    const auto exact = admin_candidate_cells(a.data.admin_exact_rings, 0, 1, 1);
+    REQUIRE(!kArcTiers[1].simplifies());
+    const auto exact = admin_tier_cells(a.arcs, a.data.admin_exact_rings, 1, 1).cells;
     REQUIRE(std::none_of(exact.begin(), exact.end(), [&](const CellItemPair& e) {
         return e.cell_id == admin_link_cell(p).id();
     }));

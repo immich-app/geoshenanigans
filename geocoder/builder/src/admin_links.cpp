@@ -12,7 +12,6 @@
 #include <s2/s2cell_id.h>
 #include <s2/s2latlng.h>
 
-#include "admin_cover.h"
 #include "cell_index_io.h"
 #include "cell_walk.h"
 #include "parallel.h"
@@ -84,41 +83,6 @@ std::pair<const CellItemPair*, const CellItemPair*> admin_cell_entries(const std
     auto last = first;
     while (last != index.end() && last->cell_id == cell) ++last;
     return {index.data() + (first - index.begin()), index.data() + (last - index.begin())};
-}
-
-std::vector<CellItemPair> admin_candidate_cells(const AdminExactRings& rings, uint32_t begin, uint32_t end,
-                                                unsigned int threads) {
-    if (threads == 0) threads = parallel_threads();
-    auto vertices_of = [&](size_t k) {
-        const uint32_t pid = begin + static_cast<uint32_t>(k);
-        const RingSpan* r = rings.rings_of(pid);
-        size_t count = 0;
-        for (uint32_t q = 0; q < rings.polygons[pid].ring_count; q++) count += r[q].count;
-        return count;
-    };
-    // Largest first, one at a time: a country takes seconds, and started last
-    // it would leave one core working alone.
-    const std::vector<uint32_t> largest_first = costliest_first(end - begin, vertices_of, threads);
-    std::vector<std::vector<CellItemPair>> found(threads);
-    parallel_for_dynamic(largest_first.size(), 1, [&](size_t from, size_t to, unsigned worker) {
-        for (size_t k = from; k < to; k++) {
-            const uint32_t pid = begin + largest_first[k];
-            const AdminRingCells cells = admin_ring_cells(rings.vertices.data(), rings.rings_of(pid),
-                                                          rings.polygons[pid].ring_count, kAdminCellLevel,
-                                                          ADMIN_COVER_REACH_RAD);
-            for (const auto& [cell, interior] : cells)
-                found[worker].push_back({cell, interior ? pid | INTERIOR_FLAG : pid});
-        }
-    }, threads);
-    std::vector<size_t> at(found.size() + 1, 0);
-    for (size_t w = 0; w < found.size(); w++) at[w + 1] = at[w] + found[w].size();
-    std::vector<CellItemPair> out;
-    parallel_resize(out, at.back());
-    parallel_for_each(found.size(), [&](size_t w, unsigned) {
-        std::copy(found[w].begin(), found[w].end(), out.begin() + at[w]);
-        std::vector<CellItemPair>().swap(found[w]);
-    }, threads);
-    return out;
 }
 
 AdminRings::AdminRings(const AdminExactRings& rings, unsigned int threads,

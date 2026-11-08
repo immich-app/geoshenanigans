@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -39,6 +40,42 @@ struct RingSpan {
     uint32_t begin;
     uint32_t count;
 };
+
+// A stretch of a ring along one of the member ways it is assembled from:
+// `edges` edges in a row (an edge is a vertex and the next), from where the
+// run before it ends, or from the ring's first vertex. A ring's runs cover
+// its edges once each, in its order, and no two runs in a row share a way.
+#pragma pack(push, 4)
+struct WayRun {
+    int64_t way;
+    uint32_t edges;
+};
+#pragma pack(pop)
+static_assert(sizeof(WayRun) == 12, "WayRun must be 12 bytes");
+inline bool operator==(const WayRun& a, const WayRun& b) { return a.way == b.way && a.edges == b.edges; }
+
+// A ring's runs once the ring starts at its vertex `start` instead (a closed
+// ring rotated, as canonicalize_ring_rotation rotates it): the run edge
+// `start` is in splits there, and runs of one way that come to follow each
+// other join. Refused (std::logic_error) when the runs end before `start`.
+inline void restart_way_runs(std::vector<WayRun>& runs, size_t start) {
+    if (start == 0 || runs.empty()) return;
+    size_t k = 0, at = 0;  // runs[k] covers edges [at, at + runs[k].edges)
+    while (k < runs.size() && at + runs[k].edges <= start) at += runs[k++].edges;
+    if (k == runs.size()) throw std::logic_error("a ring restarted past the edges of its way runs");
+    std::vector<WayRun> out;
+    out.reserve(runs.size() + 1);
+    auto add = [&](int64_t way, size_t edges) {
+        if (edges == 0) return;
+        if (!out.empty() && out.back().way == way) out.back().edges += static_cast<uint32_t>(edges);
+        else out.push_back({way, static_cast<uint32_t>(edges)});
+    };
+    add(runs[k].way, at + runs[k].edges - start);
+    for (size_t j = k + 1; j < runs.size(); j++) add(runs[j].way, runs[j].edges);
+    for (size_t j = 0; j < k; j++) add(runs[j].way, runs[j].edges);
+    add(runs[k].way, start - at);
+    runs = std::move(out);
+}
 
 // A closed ring's fewest vertices (a triangle and its closing vertex).
 static constexpr uint32_t kMinClosedRing = 4;

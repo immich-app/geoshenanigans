@@ -18,7 +18,7 @@ uint64_t AdminArcBlocks::bytes() const {
     auto held = [](const auto& v) { return uint64_t(v.size()) * sizeof(v[0]); };
     uint64_t total = held(polygons);
     for (const ArcSetBlocks& s : sets)
-        total += held(s.boxes) + held(s.keys) + held(s.planet_slots) + held(s.slots) + held(s.sidecar) +
+        total += held(s.boxes) + held(s.keys) + held(s.fallback_keys) + held(s.planet_slots) + held(s.slots) + held(s.sidecar) +
                  held(s.ring_refs) + held(s.refs) + held(s.ring_blocks);
     for (const ArcBlocks& t : tiers) total += held(t.bytes) + held(t.at);
     return total;
@@ -344,8 +344,8 @@ namespace {
 
 std::string slot_line(const AdminArcSlotCounts& c, size_t slots) {
     std::ostringstream line;
-    line << c.kept << " kept, " << c.recycled << " recycled, " << c.appended << " appended, " << c.tombstones
-         << " tombstones (" << slots << " slots)";
+    line << c.kept << " kept, " << c.by_way_set << " by way set, " << c.by_ends << " by ends, " << c.recycled
+         << " recycled, " << c.appended << " appended, " << c.tombstones << " tombstones (" << slots << " slots)";
     return line.str();
 }
 
@@ -365,6 +365,7 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
     for (const Arc& a : arcs.arcs) {
         full.boxes.push_back(a.box);
         full.keys.push_back(a.key);
+        full.fallback_keys.push_back(a.fallback);
         full.planet_slots.push_back(a.planet_slot);
     }
     full.sidecar = arcs.planet_sidecar;
@@ -375,6 +376,7 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
     for (const MinimalArc& a : arcs.minimal.arcs) {
         minimal.boxes.push_back(a.box);
         minimal.keys.push_back(a.key);
+        minimal.fallback_keys.push_back(a.fallback);
         minimal.planet_slots.push_back(a.planet_slot);
     }
     minimal.sidecar = arcs.minimal.planet_sidecar;
@@ -408,11 +410,14 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
     line << "ARC_CHECK set=full junctions=" << c.junctions << " arcs=" << c.arcs << " closed_arcs=" << c.closed_arcs
          << " refs=" << c.refs << " rings=" << store.rings.size() << " polygons=" << polygons
          << " hash_collisions=" << c.hash_collisions << " duplicate_keys=" << c.duplicate_keys
+         << " arcs_without_ways=" << c.arcs_without_ways << " shared_way_sets=" << c.shared_way_sets
+         << " shared_ends=" << c.shared_ends
          << " saturated_hole_counts=" << saturated << " rings_nest_raw=" << arcs.rings_nest_raw
          << " slots=" << full.sidecar.size() << " ring_block_bytes=" << full.ring_blocks.size() << "\n";
     line << "ARC_CHECK set=minimal arcs=" << m.arcs << " closed_arcs=" << m.closed_arcs << " refs=" << m.refs
          << " rings=" << m.rings << " polygons=" << minimal_polygons << " joined_junctions=" << m.joined_junctions
-         << " turnback_junctions=" << m.turnback_junctions << " duplicate_keys=" << m.duplicate_keys << " slots=" << minimal.sidecar.size()
+         << " turnback_junctions=" << m.turnback_junctions << " duplicate_keys=" << m.duplicate_keys
+         << " shared_way_sets=" << m.shared_way_sets << " shared_ends=" << m.shared_ends << " slots=" << minimal.sidecar.size()
          << " ring_block_bytes=" << minimal.ring_blocks.size() << "\n";
     for (size_t k = 0; k < kArcTierCount; k++) {
         const ArcTierCounts& tc = arcs.tiers[k].counts;
@@ -460,6 +465,7 @@ AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector
         for (uint32_t a : arcs) {
             to.boxes.push_back(from.boxes[a]);
             to.keys.push_back(from.keys[a]);
+            to.fallback_keys.push_back(from.fallback_keys[a]);
             to.planet_slots.push_back(from.planet_slots[a]);
         }
         to.ring_refs = parallel_offsets<uint32_t>(planet_ring.size(), [&](size_t r) {
@@ -497,7 +503,8 @@ void assign_region_arc_slots(AdminArcBlocks& blocks, const std::string& prev_reg
     for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
         ArcSetBlocks& s = blocks.set(set);
         const std::string prev = prev_region_dir.empty() ? "" : arc_sidecar_path(prev_region_dir, set);
-        ArcSlots slots = allocate_arc_slots(s.keys, prev);
+        const std::string prev_fallback = prev_region_dir.empty() ? "" : arc_fallback_sidecar_path(prev_region_dir, set);
+        ArcSlots slots = allocate_arc_slots(s.keys, prev, s.fallback_keys, prev_fallback);
         std::cerr << arc_slot_start_lines(region, set, prev, slots.counts);
         s.slots = std::move(slots.slots);
         s.sidecar = std::move(slots.sidecar);

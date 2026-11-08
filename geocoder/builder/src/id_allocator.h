@@ -8,6 +8,12 @@
 // build. New identities go to a free-list slot from a previously-deleted
 // record, falling back to appending past the previous max.
 //
+// A caller whose identities can change from one build to the next (an
+// admin arc whose ends or smallest vertex move) can give allocate_all
+// fallback keys, kept outside this sidecar: a record its identity found no
+// slot for takes the previous slot no identity claimed that shares a
+// fallback key with it alone, and the slot takes the record's identity.
+//
 // Net effect: unchanged records keep the same byte offset day-over-day,
 // so the diff tool gets clean MATCH ops with no parent-id cascade
 // shifts. PARENT_REMAP_MARKER becomes vestigial; all id_remap noise
@@ -28,7 +34,8 @@
 // Memory model: slots_ is the single source of truth — populated from
 // the previous sidecar at load_previous(), then mutated in-place by
 // allocate_all(). Reused slots keep their existing payload (already correct)
-// apart from the tier; recycled tombstones get rewritten; fresh allocations append. After
+// apart from the tier; slots matched by a fallback key and recycled
+// tombstones get rewritten; fresh allocations append. After
 // allocate_all(), finalize() marks any unconsumed-prev slots as
 // tombstones and drops the bookkeeping immediately so only the slot
 // table itself remains. take_slots() then moves the table out without
@@ -40,6 +47,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <vector>
 #include <stdexcept>
 
@@ -142,6 +150,17 @@ struct SlotIdentity {
     uint8_t tier = 0;
 };
 
+// The fallback key of a record or slot that has none in a pass.
+constexpr uint64_t kNoFallbackKey = UINT64_MAX;
+
+// One fallback key pass of allocate_all: record_key(i) is record i's key
+// this build, slot_key(s) the key the record that held previous slot s had
+// last build, kNoFallbackKey for none. Both run on many threads at once.
+struct FallbackPass {
+    std::function<uint64_t(size_t record)> record_key;
+    std::function<uint64_t(uint32_t slot)> slot_key;
+};
+
 class IdAllocator {
 public:
     IdAllocator() = default;
@@ -188,9 +207,16 @@ public:
     // slots is sorts and merges on every core, the records a pass of
     // records_per_pass at a time; only the hand-out of recycled and new
     // slots walks the records in order. Once per allocator.
+    // Before the hand-out, each of `fallbacks` in turn matches the records
+    // still without a slot to the previous slots still unclaimed (those
+    // finalize would make tombstones) by its keys, unique keys only: a key
+    // that exactly one such record and one such slot hold gives the record
+    // that slot, rewritten to the record's identity; a key more of either
+    // hold matches none of them.
     template <class Identity>
     std::vector<uint32_t> allocate_all(size_t n, Identity identity,
-                                       size_t records_per_pass = kRecordsPerMatchPass) {
+                                       size_t records_per_pass = kRecordsPerMatchPass,
+                                       const std::vector<FallbackPass>& fallbacks = {}) {
         if (allocated_) throw std::logic_error("IdAllocator::allocate_all called twice");
         allocated_ = true;
 
@@ -210,7 +236,6 @@ public:
                                [](const KeyIdx& a, const KeyIdx& b) { return a.key == b.key; }),
                    prev.end());
 
-        constexpr uint32_t kUnmatched = TOMBSTONE_IDX;
         std::vector<uint32_t> out;
         std::vector<char> claimed;
         parallel_resize(out, n, kUnmatched);
@@ -259,11 +284,15 @@ public:
             }
         }
 
-        // A matched record's slot already holds its {type, stable_id} from
-        // the load and is its alone: the tiers go in on every core, unless
-        // neither the records nor the slots have one (every kind but POIs),
-        // when the stamp would only write each slot's 0 back at random. Only
-        // the others take slots in record order.
+        fallback_matches_.assign(fallbacks.size(), 0);
+        for (size_t f = 0; f < fallbacks.size(); f++)
+            fallback_matches_[f] = match_fallback(fallbacks[f], n, identity, prev, claimed, out);
+
+        // A matched record's slot already holds its {type, stable_id}, from
+        // the load or a fallback match, and is its alone: the tiers go in on
+        // every core, unless neither the records nor the slots have one
+        // (every kind but POIs), when the stamp would only write each slot's
+        // 0 back at random. Only the others take slots in record order.
         const std::vector<uint32_t> unmatched = parallel_filter(n, [&](size_t i) { return out[i] == kUnmatched; });
         const bool tiers = parallel_any(n, [&](size_t i) { return identity(i).tier != 0; }) ||
                            parallel_any(slots_.size(), [&](size_t s) { return slots_[s].tier != 0; });
@@ -327,6 +356,9 @@ public:
         return slots_.size() - live_count_;
     }
 
+    // The records each fallback pass of allocate_all gave a slot, in pass order.
+    const std::vector<size_t>& fallback_matches() const { return fallback_matches_; }
+
     static void write_sidecar(const std::string& path,
                               const std::vector<SidecarSlot>& slots) {
         std::ofstream f(path, std::ios::binary);
@@ -342,6 +374,67 @@ public:
     }
 
 private:
+    // allocate_all's mark of a record no slot is handed yet.
+    static constexpr uint32_t kUnmatched = TOMBSTONE_IDX;
+
+    // One fallback pass of allocate_all over `prev` (its reclaimable slots,
+    // lowest of a key, by key) and `claimed`: gives each record of out ==
+    // kUnmatched the unclaimed slot it alone shares a unique key with, and
+    // returns how many it gave. Sorts on every core, then one merge.
+    template <class Identity>
+    size_t match_fallback(const FallbackPass& pass, size_t n, Identity& identity, const std::vector<KeyIdx>& prev,
+                          std::vector<char>& claimed, std::vector<uint32_t>& out) {
+        auto by_key = [](const KeyIdx& a, const KeyIdx& b) {
+            return a.key != b.key ? a.key < b.key : a.idx < b.idx;
+        };
+        // The unclaimed slots' keys, each with its entry in prev, and the
+        // keys of the records without a slot.
+        std::vector<KeyIdx> keyed_slots = parallel_collect<KeyIdx>(prev.size(), [&](size_t p, std::vector<KeyIdx>& found) {
+            if (claimed[p]) return;
+            const uint64_t key = pass.slot_key(prev[p].idx);
+            if (key != kNoFallbackKey) found.push_back({key, static_cast<uint32_t>(p)});
+        });
+        if (keyed_slots.empty()) return 0;
+        std::vector<KeyIdx> keyed_records = parallel_collect<KeyIdx>(n, [&](size_t i, std::vector<KeyIdx>& found) {
+            if (out[i] != kUnmatched) return;
+            const uint64_t key = pass.record_key(i);
+            if (key != kNoFallbackKey) found.push_back({key, static_cast<uint32_t>(i)});
+        });
+        parallel_sort(keyed_slots.begin(), keyed_slots.end(), by_key);
+        parallel_sort(keyed_records.begin(), keyed_records.end(), by_key);
+
+        // Where the run of v[i]'s key ends.
+        auto run_end = [](const std::vector<KeyIdx>& v, size_t i) {
+            const uint64_t key = v[i].key;
+            while (++i < v.size() && v[i].key == key) {}
+            return i;
+        };
+        size_t matched = 0;
+        for (size_t r = 0, s = 0; r < keyed_records.size() && s < keyed_slots.size();) {
+            const uint64_t record_key = keyed_records[r].key, slot_key = keyed_slots[s].key;
+            if (record_key < slot_key) {
+                r = run_end(keyed_records, r);
+                continue;
+            }
+            if (slot_key < record_key) {
+                s = run_end(keyed_slots, s);
+                continue;
+            }
+            const size_t r_end = run_end(keyed_records, r), s_end = run_end(keyed_slots, s);
+            if (r_end - r == 1 && s_end - s == 1) {
+                const uint32_t record = keyed_records[r].idx, at = keyed_slots[s].idx, slot = prev[at].idx;
+                const SlotIdentity id = identity(record);
+                slots_[slot] = SidecarSlot{static_cast<uint8_t>(id.type), 0, id.tier, 0, id.stable_id};
+                out[record] = slot;
+                claimed[at] = 1;
+                matched++;
+            }
+            r = r_end;
+            s = s_end;
+        }
+        return matched;
+    }
+
     // Reads len bytes at offset `at` of fd into buf; false on an error or
     // the end of the file first.
     static bool read_at(int fd, void* buf, size_t len, size_t at) {
@@ -359,8 +452,10 @@ private:
 
     std::vector<SidecarSlot> slots_;
     std::vector<uint32_t> free_list_;
-    // Previous-build slots whose identity no record of this build had.
+    // Previous-build slots no record of this build took, by its identity
+    // or by a fallback key.
     std::vector<uint32_t> unclaimed_;
+    std::vector<size_t> fallback_matches_;
     size_t live_count_ = 0;
     bool allocated_ = false;
 };

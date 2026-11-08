@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -15,18 +16,33 @@
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode);
 
+// Tier t's covering of its set's polygons (kArcTiers[t], of `arcs` over the
+// store), per arc: each arc's boundary cells once (admin_arc_cells over the
+// vertices the tier stores of it), each polygon's the merge of its rings'
+// arcs' (merge_cell_lists), classified over its rings as the tier stores
+// them, the store's own for the exact tier (admin_polygon_cells, at
+// kAdminCellLevel and ADMIN_COVER_REACH_RAD). `phase_done` is told as each
+// step ends ("arcs", "polygons").
+struct AdminTierCells {
+    // (cell, polygon id flagged INTERIOR_FLAG where its rings hold the whole
+    // cell), in no order.
+    std::vector<CellItemPair> cells;
+    size_t arc_cells = 0;       // over the set's arcs, each arc's once
+    size_t boundary_cells = 0;  // over its polygons, each one's arcs' merged
+};
+AdminTierCells admin_tier_cells(const AdminArcs& arcs, const AdminExactRings& store, size_t t, unsigned threads = 0,
+                                const std::function<void(const char*)>& phase_done = {});
+
 // Fills the admin cell indexes the reader reads (data.admin_index_cells,
 // data.admin_minimal_index_cells) from the arc stage's tiers (`arcs` of
-// data.admin_exact_rings, before any admin permute): the full set's gets
-// each polygon's cells over every tier of the set, the exact tier's being
-// `exact_cells` (admin_candidate_cells), interior only where interior in
-// every one; the minimal set's the cells of its tier's rings. Each tier's
-// interior is its exact ray cast at the cell centre. The admin permutes,
-// strategy-2 and the continent split carry the tables on from there.
-// data.admin_country_cells gets the country polygons' share of
-// `exact_cells`.
-void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, std::vector<CellItemPair> exact_cells,
-                               unsigned threads = 0);
+// data.admin_exact_rings, before any admin permute), each tier's covering
+// admin_tier_cells': the full set's gets each polygon's cells over every
+// tier of the set, interior only where interior in every one; the minimal
+// set's the cells of its tier. Each tier's interior is its exact ray cast at
+// the cell centre. The admin permutes, strategy-2 and the continent split
+// carry the tables on from there. data.admin_country_cells gets the country
+// polygons' share of the exact tier's, which the builder's links read too.
+void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads = 0);
 
 // strings_layout.json: each tier's [start, end) in the dir's string-offset
 // space, tier t at [bases[t], bases[t + 1]): the build's
@@ -85,7 +101,8 @@ std::string admin_sidecar_path(const std::string& region_dir);
 // polygon at its own slot with its ring block in the full set, a tombstone
 // at a strategy-2 one), and the tier's arc_index.bin and arc_vertices.bin.
 // quality/exact/ holds the full set's sidecars too: admin_polygons.osm_ids
-// (admin_sidecar_path) and arc_index.osm_ids (arc_sidecar_path).
+// (admin_sidecar_path), arc_index.osm_ids (arc_sidecar_path) and
+// arc_index.fallback.osm_ids (arc_fallback_sidecar_path).
 void write_admin_tiers(const ParsedData& data, const std::string& region_dir);
 
 // Writes the full set's admin geometry at the exact tier into dir: the bytes
@@ -114,7 +131,7 @@ void write_exact_admin_geometry(const ParsedData& data, const std::string& dir);
 //   - admin-minimal/, for a set without POIs: its polygons in its own stable
 //     slots (region_prev's admin-minimal sidecar), and a core of its own,
 //     only the strings its records name, in the shared core's order, with
-//     a layout of that core alone. It holds the minimal set's arc sidecar.
+//     a layout of that core alone. It holds the minimal set's arc sidecars.
 //   - admin-minimal-poi/, for a set with a POI tier: the shared polygon
 //     slots, which a POI's parent_poly_id names (a tombstone at each slot
 //     it drops), and the shared core strings and layout, which the POI

@@ -3,8 +3,10 @@
 // their admin geometry as arcs, and nothing else does; a chained build of the
 // same data (--prev-output) writes them again unchanged. A chained build of
 // edited data keeps the slot of every arc the previous day had, which a fresh
-// build of it doesn't. A previous build without its arc sidecars leaves every
-// arc slot cold and the admin slots as they were. Without --multi-output,
+// build of it doesn't, and an arc whose key changes keeps its slot by its way
+// set or its ends. A previous build without its arc sidecars leaves every
+// arc slot cold and the admin slots as they were; one without their fallback
+// sidecars, the slots of arcs whose keys changed. Without --multi-output,
 // each region's dir is a whole index the server answers from; with it, a
 // build without --multi-quality is refused.
 #include <algorithm>
@@ -65,8 +67,9 @@ TestObject boundary(int64_t id, int level, const std::string& name, const std::v
 // of another level fills, a region over them all, a city, a street and an
 // address: every arc dir has polygons, shared borders and a hole. With
 // `hole_moved` (the next day's edit), the hole and its village are in the
-// opposite municipality: that day has one arc fewer and one more in each
-// set, the rest as they were.
+// opposite municipality, mapped again as a new way of new nodes: that day
+// has one arc fewer and one more in each set (no fallback key of the old
+// one's the new one's), the rest as they were.
 std::vector<TestObject> fixture(bool hole_moved = false) {
     const int32_t lat0 = 470000000, lng0 = 80000000, side = 1000000;
     std::vector<TestObject> nodes, ways, relations;
@@ -97,13 +100,13 @@ std::vector<TestObject> fixture(bool hole_moved = false) {
         for (int c = 0; c <= 2; c++)
             edge(upward(r, c), corner(r, c), corner(r + 1, c), lat0 + r * side, lng0 + c * side, lat0 + (r + 1) * side,
                  lng0 + c * side);
-    const int64_t hole = 3000;
+    const int64_t hole = hole_moved ? 3001 : 3000, hole_node = hole_moved ? 504 : 500;
     // In the first municipality, or moved to the last, clear of the city,
     // the street and the address.
     const int32_t near = hole_moved ? 1650000 : 200000, far = hole_moved ? 1850000 : 500000;
     for (int k = 0; k < 4; k++)
-        nodes.push_back(node(500 + k, lat0 + (k == 1 || k == 2 ? far : near), lng0 + (k >= 2 ? far : near)));
-    ways.push_back(way(hole, {500, 501, 502, 503, 500}));
+        nodes.push_back(node(hole_node + k, lat0 + (k == 1 || k == 2 ? far : near), lng0 + (k >= 2 ? far : near)));
+    ways.push_back(way(hole, {hole_node, hole_node + 1, hole_node + 2, hole_node + 3, hole_node}));
     nodes.push_back(node(900, lat0 + 1500000, lng0 + 1500000, {{"name", "Testville"}, {"place", "city"}}));
     nodes.push_back(node(950, lat0 + 1400000, lng0 + 1400000));
     nodes.push_back(node(951, lat0 + 1400000, lng0 + 1600000));
@@ -187,6 +190,35 @@ std::map<uint64_t, size_t> slot_of_key(const std::vector<uint64_t>& keys) {
     for (size_t s = 0; s < keys.size(); s++)
         if (keys[s] != UINT64_MAX) out[keys[s]] = s;
     return out;
+}
+
+// The next day's edits of the fixture's way 1002, the border from the
+// corner (1, 0) between the first and third municipality to the middle
+// (1, 1), where four borders meet: its inner nodes moved 3 cm north
+// (its arc's smallest vertex with them), the middle moved, or the way
+// mapped again as a new one, 1009, on its inner nodes moved.
+enum class Edit { InnerNodesMoved, MiddleMoved, WayRemapped };
+
+std::vector<TestObject> edited(Edit edit) {
+    std::vector<TestObject> objects = fixture();
+    std::set<int64_t> inner;
+    for (const TestObject& o : objects)
+        if (o.type == OsmType::Way && o.id == 1002) inner.insert(o.refs.begin() + 1, o.refs.end() - 1);
+    for (TestObject& o : objects) {
+        if (o.type == OsmType::Node && edit != Edit::MiddleMoved && inner.count(o.id)) o.lat += 300;
+        if (o.type == OsmType::Node && edit == Edit::MiddleMoved && o.id == 5) {
+            o.lat += 2000;
+            o.lon -= 1500;
+        }
+        if (edit != Edit::WayRemapped) continue;
+        if (o.type == OsmType::Way && o.id == 1002) o.id = 1009;
+        for (auto& [type, id, role] : o.members)
+            if (type == OsmType::Way && id == 1002) id = 1009;
+    }
+    std::stable_sort(objects.begin(), objects.end(), [](const TestObject& a, const TestObject& b) {
+        return a.type != b.type ? a.type < b.type : a.id < b.id;
+    });
+    return objects;
 }
 
 // The admin geometry files and arc sidecars of a build's tree.
@@ -502,4 +534,106 @@ TEST(a_chained_build_on_a_previous_build_without_arc_sidecars_allocates_every_ar
         const std::string sidecar = region + "/quality/exact/admin_polygons.osm_ids";
         CHECK(bytes_of(cold + "/" + sidecar) == bytes_of(chained + "/" + sidecar));
     }
+}
+
+TEST(a_chained_build_keeps_the_slot_of_an_arc_whose_key_changes_by_its_way_set_or_its_ends) {
+    const ScratchDir root("admin-dirs-fallbacks");
+    const std::string day_one = root.path() + "/day1.osm.pbf", log = root.path() + "/build.log";
+    write_test_pbf(day_one, fixture(), 1000);
+    auto build = [&](const std::string& pbf, const std::string& out, std::vector<std::string> extra) {
+        std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out, pbf, "--continents", "--multi-output",
+                                          "--multi-quality"};
+        words.insert(words.end(), extra.begin(), extra.end());
+        return gctest::run(words, log);
+    };
+    const std::string out1 = root.path() + "/out1";
+    REQUIRE(build(day_one, out1, {}));
+    // Each set's arcs' fallback keys beside its slots.
+    const auto files = tree(out1);
+    for (const std::string& region : kRegions) {
+        const bool held = kRegionsHeld.count(region) > 0;
+        CHECK(files.count(region + "/quality/exact/arc_index.fallback.osm_ids"));
+        CHECK_EQ(files.count(region + "/admin-minimal/arc_index.fallback.osm_ids") > 0, held);
+        CHECK(!files.count(region + "/quality/simplified/arc_index.fallback.osm_ids"));
+        CHECK(!files.count(region + "/admin-minimal-poi/arc_index.fallback.osm_ids"));
+    }
+
+    struct Case {
+        Edit edit;
+        size_t changed, by_way_set, by_ends;
+        const char* name;
+    };
+    for (const Case& c : {Case{Edit::InnerNodesMoved, 1, 1, 0, "inner nodes moved"},
+                          Case{Edit::MiddleMoved, 4, 4, 0, "middle moved"},
+                          Case{Edit::WayRemapped, 1, 0, 1, "way remapped"}}) {
+        const std::string pbf = root.path() + "/day2.osm.pbf", out = root.path() + "/out2";
+        fs::remove_all(out);
+        write_test_pbf(pbf, edited(c.edit), 1000);
+        REQUIRE(build(pbf, out, {"--prev-output", out1}));
+        const std::vector<char> text = bytes_of(log);
+        const std::string said(text.begin(), text.end());
+        const int failures_before = gctest::failures();
+        // In each set of the planet and of Europe (every polygon, its own
+        // slots against its own previous sidecars): every slot held both
+        // days, the changed arcs' by their new keys, none appended.
+        for (const char* region : {"planet", "europe"})
+            for (const std::string set : {"full", "minimal"}) {
+                const std::string sidecar =
+                    std::string("/") + region + (set == "full" ? "/quality/exact" : "/admin-minimal") + "/arc_index.osm_ids";
+                const std::vector<uint64_t> before = slot_keys(out1 + sidecar), after = slot_keys(out + sidecar);
+                REQUIRE(!before.empty());
+                CHECK_EQ(after.size(), before.size());
+                CHECK_EQ(static_cast<size_t>(std::count(after.begin(), after.end(), UINT64_MAX)), size_t(0));
+                size_t changed = 0;
+                for (size_t s = 0; s < std::min(before.size(), after.size()); s++) changed += after[s] != before[s];
+                CHECK_EQ(changed, c.changed);
+                CHECK(said.find("ARC_CHECK fallbacks=arcs set=" + set + " region=" + region +
+                                " previous_fallback_sidecar_missing=0 by_way_set=" + std::to_string(c.by_way_set) +
+                                " by_ends=" + std::to_string(c.by_ends) + "\n") != std::string::npos);
+                if (gctest::failures() != failures_before) std::printf("    in %s %s\n", region, sidecar.c_str());
+            }
+        if (gctest::failures() != failures_before) std::printf("    with the %s\n", c.name);
+    }
+}
+
+TEST(a_chained_build_on_a_previous_build_without_arc_fallback_sidecars_takes_slots_by_arc_keys_alone) {
+    const ScratchDir root("admin-dirs-first-fallback-night");
+    const std::string day_one = root.path() + "/day1.osm.pbf", day_two = root.path() + "/day2.osm.pbf",
+                      log = root.path() + "/build.log";
+    write_test_pbf(day_one, fixture(), 1000);
+    write_test_pbf(day_two, edited(Edit::InnerNodesMoved), 1000);
+    auto build = [&](const std::string& pbf, const std::string& out, std::vector<std::string> extra) {
+        std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out, pbf, "--continents", "--multi-output",
+                                          "--multi-quality"};
+        words.insert(words.end(), extra.begin(), extra.end());
+        return gctest::run(words, log);
+    };
+    const std::string out1 = root.path() + "/out1", prev = root.path() + "/prev", out2 = root.path() + "/out2";
+    REQUIRE(build(day_one, out1, {}));
+    // The previous build as it is but for its arcs' fallback sidecars, every region's.
+    fs::copy(out1, prev, fs::copy_options::recursive);
+    std::vector<fs::path> fallbacks;
+    for (const auto& e : fs::recursive_directory_iterator(prev))
+        if (e.path().filename() == "arc_index.fallback.osm_ids") fallbacks.push_back(e.path());
+    REQUIRE(fallbacks.size() == kRegions.size() + kRegionsHeld.size());
+    for (const fs::path& p : fallbacks) fs::remove(p);
+    REQUIRE(build(day_two, out2, {"--prev-output", prev}));
+    const std::vector<char> text = bytes_of(log);
+    const std::string said(text.begin(), text.end());
+    for (const char* region : {"planet", "europe"})
+        for (const std::string set : {"full", "minimal"}) {
+            const std::string dir = std::string("/") + region + (set == "full" ? "/quality/exact" : "/admin-minimal");
+            CHECK(said.find("ARC_CHECK fallbacks=arcs set=" + set + " region=" + region +
+                            " previous_fallback_sidecar_missing=1 by_way_set=0 by_ends=0\n") != std::string::npos);
+            CHECK(said.find(std::string(region) + " arcs: no previous " + set + " arc fallback keys beside " + prev + dir +
+                            "/arc_index.osm_ids, slots by arc keys alone") != std::string::npos);
+            // The moved arc is a new one: its old slot a tombstone, its new one appended.
+            const std::vector<uint64_t> before = slot_keys(out1 + dir + "/arc_index.osm_ids"),
+                                        after = slot_keys(out2 + dir + "/arc_index.osm_ids");
+            REQUIRE(!before.empty());
+            CHECK_EQ(after.size(), before.size() + 1);
+            CHECK_EQ(static_cast<size_t>(std::count(after.begin(), after.end(), UINT64_MAX)), size_t(1));
+            // And it writes its own fallback keys for the next night.
+            CHECK(fs::exists(out2 + dir + "/arc_index.fallback.osm_ids"));
+        }
 }
