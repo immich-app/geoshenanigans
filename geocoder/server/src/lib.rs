@@ -967,9 +967,14 @@ pub struct AdminScan {
 
 impl AdminScan {
     /// The scan of the point (`lat`, `lng`), rounded once to the e7 grid: its cell is that of the
-    /// point every ring is tested at.
+    /// point every ring is tested at. A point off the globe, or NaN, is in no ring and its scan
+    /// lists none: S2 would wrap it onto a cell of the globe ((10, 380) onto the cell of (10, 20)),
+    /// whose interior entries hold that cell's points, not this one.
     pub fn new(index: &Index, lat: f64, lng: f64) -> Self {
         let point = AdminPoint::new(lat, lng);
+        if !coords_in_range(lat, lng) {
+            return AdminScan { rings: Vec::new(), pip: ScanPip { point, memo: PipMemo::new() } };
+        }
         let (lat, lng) = point.degrees();
         let list = Index::lookup_admin_cell_fb(&index.admin_cells, cell_id_at_level(lat, lng, index.admin_cell_level));
         // The list, each record and most ring headers are read below wherever the point is, so
@@ -1009,7 +1014,8 @@ impl ScanPip {
     /// Whether the polygon of the scan's entry `id` holds the point. An entry flagged interior
     /// does without a test: the builder flags one only where the rings of every tier it covers
     /// hold the whole cell, at the reach the ray cast needs (admin_cover.h, cell_index.cpp
-    /// union_of_tiers), and the scan's cell is the rounded point's. Any other entry is tested.
+    /// union_of_tiers), and the scan's cell is the rounded point's, which is on the globe
+    /// (`AdminScan::new`). Any other entry is tested.
     fn holds(&mut self, index: &Index, id: u32, poly: &AdminPolygon) -> bool {
         (id & INTERIOR_FLAG != 0 && index.admin_geometry.has_rings(poly)) || self.contains(index, poly)
     }
@@ -2312,11 +2318,12 @@ impl Index {
     // whether it's a road or an addressable POI.
     //
     // For polygon POIs, returns distance 0 if the query is inside
-    // the polygon, otherwise the distance to the nearest edge.
+    // the polygon, otherwise the distance to the nearest edge. None for
+    // a point off the globe (see find_pois).
     pub fn find_nearest_poi_with_parent(&self, lat: f64, lng: f64) -> Option<(f64, PoiRecord)> {
         let poi_cells = self.poi_cells.as_ref()?;
         let poi_entries = self.poi_entries.as_ref()?;
-        if self.poi_records.is_none() { return None; }
+        if self.poi_records.is_none() || !coords_in_range(lat, lng) { return None; }
 
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
@@ -2413,6 +2420,8 @@ impl Index {
 
     // --- POI lookup ---
 
+    /// The POIs near (lat, lng); none for a point off the globe, or NaN: S2 would wrap it onto a
+    /// cell of the globe, whose interior entries hold that cell's points, not this one.
     pub fn find_pois(&self, lat: f64, lng: f64) -> Vec<PoiMatch<'_>> {
         let poi_cells = match &self.poi_cells {
             Some(c) => c,
@@ -2422,7 +2431,7 @@ impl Index {
             Some(e) => e,
             None => return vec![],
         };
-        if self.poi_records.is_none() { return vec![]; }
+        if self.poi_records.is_none() || !coords_in_range(lat, lng) { return vec![]; }
 
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
@@ -3011,7 +3020,12 @@ impl Index {
         (landmark_name, places)
     }
 
+    /// The address of (lat, lng); none for a point off the globe, or NaN: S2 would wrap it onto
+    /// cells of the globe, whose streets, POIs and boundaries are near another point.
     pub fn query(&self, lat: f64, lng: f64) -> Address<'_> {
+        if !coords_in_range(lat, lng) {
+            return Address::default();
+        }
         let max_dist = self.max_distance_sq;
 
         // Run geo lookups first so we know the primary street
@@ -6462,6 +6476,30 @@ mod query_path_tests {
     }
 
     #[test]
+    fn query_finds_nothing_off_the_globe_though_its_wrapped_cells_list_a_street_with_a_parent() {
+        // S2 wraps a point off the globe onto cells of the globe, and where those cells list a
+        // street the query's admin walks that street's parent chain, however far the street is:
+        // Main Street's chain names Testland.
+        let mut index = TestIndex::new().street("Main Street", &[(0.0, -500.0), (0.0, 500.0)]).load();
+        // Main Street (way 0) in Testland (polygon 0), the top of its chain.
+        index.way_parents = Some(FileBytes::Owned(0u32.to_le_bytes().to_vec()));
+        index.admin_parents = Some(FileBytes::Owned(NO_DATA.to_le_bytes().to_vec()));
+        let on = address_at(&index, 10.0, 0.0);
+        assert_eq!((on["road"].as_str(), on["country"].as_str()), (Some("Main Street"), Some("Testland")));
+        let p = at(10.0, 0.0);
+        let (lat, lng) = (p.lat as f64, p.lng as f64);
+        let cell = |lat: f64, lng: f64| cell_id_at_level(lat, lng, DEFAULT_STREET_CELL_LEVEL);
+        // Each is p once S2 wraps it onto the globe.
+        for (wlat, wlng) in [(lat, lng + 360.0), (lat, lng - 360.0), (180.0 - lat, lng - 180.0), (-180.0 - lat, lng + 180.0)] {
+            assert_eq!(cell(wlat, wlng), cell(lat, lng), "({wlat}, {wlng})");
+            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), r#"{"address":{}}"#, "({wlat}, {wlng})");
+        }
+        for (wlat, wlng) in [(f64::NAN, lng), (lat, f64::NAN), (lat, f64::INFINITY), (f64::NEG_INFINITY, lng)] {
+            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), r#"{"address":{}}"#, "({wlat}, {wlng})");
+        }
+    }
+
+    #[test]
     fn polygons_list_a_postcode_area_once_as_postal_at_level_99() {
         let index = TestIndex::new()
             .boundary("1010", POSTCODE_AREA_LEVEL, 0, (-15_000.0, -15_000.0, 15_000.0, 15_000.0))
@@ -6689,7 +6727,11 @@ mod admin_scan_tests {
 
     /// An Index holding only the admin files, laid out as the builder writes them.
     fn admin_index(rings: &[Ring]) -> Index {
-        let cell_ids = cells();
+        admin_index_in(rings, &cells())
+    }
+
+    /// `admin_index` with each ring's cells indices into `cell_ids`.
+    fn admin_index_in(rings: &[Ring], cell_ids: &[u64]) -> Index {
         let mut strings = vec![0u8];
         let mut arcs = arc_fixture::ArcFixture::new();
         let mut by_cell: std::collections::BTreeMap<u64, Vec<u32>> = Default::default();
@@ -6785,6 +6827,55 @@ mod admin_scan_tests {
     }
 
     #[test]
+    fn a_point_off_the_globe_is_in_no_ring_though_its_wrapped_cell_lists_them_interior() {
+        // Each point is Q once S2 wraps it onto the globe, so it would look up Q's cell, where every
+        // ring is listed interior: an interior entry holds the points of its cell, not this one.
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
+            ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, true)]),
+            ring("Paris", 8, 2.0, (21.9, 27.4, 22.1, 27.7), &[(0, true)]),
+            Ring { place_type: 5, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(0, true)]) },
+        ]);
+        let a = idx.find_admin(Q.0, Q.1);
+        assert_eq!((a.country, a.state, a.neighbourhood), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
+        for (lat, lng) in [(Q.0, Q.1 + 360.0), (Q.0, Q.1 - 360.0), (180.0 - Q.0, Q.1 - 180.0), (-180.0 - Q.0, Q.1 + 180.0)] {
+            let (rlat, rlng) = AdminPoint::new(lat, lng).degrees();
+            assert_eq!(cell_id_at_level(rlat, rlng, DEFAULT_ADMIN_CELL_LEVEL), cells()[0], "({lat}, {lng})");
+            let a = idx.find_admin(lat, lng);
+            assert_eq!((a.country, a.state, a.neighbourhood), (None, None, None), "({lat}, {lng})");
+            let mut scan = AdminScan::new(&idx, lat, lng);
+            assert!(scan.rings.is_empty(), "({lat}, {lng})");
+            let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"));
+            assert!(gates.gates.iter().all(Option::is_none) && gates.promoting.is_empty(), "({lat}, {lng})");
+            assert_eq!(idx.find_admin_from_chain(0, lat, lng).neighbourhood, None, "({lat}, {lng})");
+        }
+        for (lat, lng) in [(f64::NAN, Q.1), (Q.0, f64::NAN), (Q.0, f64::INFINITY), (f64::NEG_INFINITY, Q.1)] {
+            assert!(AdminScan::new(&idx, lat, lng).rings.is_empty(), "({lat}, {lng})");
+            assert_eq!(idx.find_admin(lat, lng).country, None, "({lat}, {lng})");
+        }
+    }
+
+    #[test]
+    fn the_globes_edges_are_on_it_and_a_hair_past_them_is_not() {
+        // A ring listed interior both in the cell of a point on the edge of the globe and in the
+        // cell S2 wraps a point a hair past it onto.
+        for ((lat, lng), past, around) in [
+            ((90.0, 45.0), (90.0000001, 45.0), (89.0, 44.0, 90.0, 46.0)),
+            ((-90.0, 45.0), (-90.0000001, 45.0), (-90.0, 44.0, -89.0, 46.0)),
+            ((10.0, 180.0), (10.0, 180.0000001), (9.0, 179.0, 11.0, 180.0)),
+            ((10.0, -180.0), (10.0, -180.0000001), (9.0, -180.0, 11.0, -179.0)),
+        ] {
+            let cell = |(lat, lng): (f64, f64)| {
+                let (lat, lng) = AdminPoint::new(lat, lng).degrees();
+                cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL)
+            };
+            let idx = admin_index_in(&[ring("Edge", 2, 1.0, around, &[(0, true), (1, true)])], &[cell((lat, lng)), cell(past)]);
+            assert_eq!(idx.find_admin(lat, lng).country, Some("Edge"), "({lat}, {lng})");
+            assert_eq!(idx.find_admin(past.0, past.1).country, None, "{past:?}");
+        }
+    }
+
+    #[test]
     fn a_neighbour_cells_interior_flag_does_not_prove_containment() {
         let idx = admin_index(&[
             ring("Egypt", 2, 97.0, EGYPT, &[(0, false)]),
@@ -6798,19 +6889,29 @@ mod admin_scan_tests {
         // The builder flags an entry interior only where the rings hold the whole cell, so the scan
         // takes it as holding the point: find_admin, the current boundaries and the chain lookup
         // read no arc of an interior entry, and test only the others.
-        let idx = admin_index(&[
+        let mut idx = admin_index(&[
             ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
             ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, true)]),
             ring("Paris", 8, 2.0, (21.9, 27.4, 22.1, 27.7), &[(0, true)]),
             Ring { place_type: 5, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(0, true)]) },
+            // A smaller state holding the point, which Paris's chain doesn't take.
+            ring("Kharga", 4, 20.0, (22.0, 27.0, 26.0, 31.0), &[(0, true)]),
         ]);
+        // Each polygon's next larger one: Paris in New Valley in Egypt.
+        let parents = [NO_DATA, 0, 1, NO_DATA, 0];
+        idx.admin_parents = Some(FileBytes::Owned(parents.iter().flat_map(|p| p.to_le_bytes()).collect()));
         let mut scan = AdminScan::new(&idx, Q.0, Q.1);
         let a = idx.find_admin_in(&mut scan);
-        assert_eq!((a.country, a.state, a.neighbourhood), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
+        assert_eq!((a.country, a.state, a.city, a.neighbourhood), (Some("Egypt"), Some("Kharga"), Some("Paris"), Some("Bir Tarfawi")));
         let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"));
         assert_eq!(gates.for_rank(CurrentBoundaries::CITY).map(|p| idx.get_string(p.name_id)), Some("Paris"));
-        let c = idx.find_admin_from_chain_in(0, &mut scan);
-        assert_eq!((c.country, c.state), (Some("Egypt"), Some("New Valley")));
+        assert_eq!(scan.pip.memo.arcs_read(), 0);
+        // The chain lookup from Paris over a scan of its own: its boundaries are the chain's (New
+        // Valley, not the scan's Kharga, so this is no fallback to find_admin), its place area the
+        // scan's interior entry.
+        let mut scan = AdminScan::new(&idx, Q.0, Q.1);
+        let c = idx.find_admin_from_chain_in(2, &mut scan);
+        assert_eq!((c.country, c.state, c.city, c.neighbourhood), (Some("Egypt"), Some("New Valley"), Some("Paris"), Some("Bir Tarfawi")));
         assert_eq!(scan.pip.memo.arcs_read(), 0);
         // The same rings listed not interior are tested.
         let idx = admin_index(&[
@@ -6991,6 +7092,48 @@ mod admin_scan_tests {
     /// A ring a tier simplified away: its record keeps its name, its ring block is empty.
     fn ringless(name: &'static str, level: u8, cells: &[(usize, bool)]) -> Ring {
         Ring { verts: Vec::new(), ..ring(name, level, 1.0, EGYPT, cells) }
+    }
+
+    /// `idx` with one polygon POI, the box `around` named as admin polygon `named_after` is, its
+    /// own parent street, listed in Q's cell (interior or not).
+    fn with_polygon_poi(mut idx: Index, named_after: u32, (lat0, lng0, lat1, lng1): (f64, f64, f64, f64), interior: bool) -> Index {
+        let name_id = idx.admin_polygon(named_after).unwrap().name_id;
+        let f32s = |values: &[f64]| values.iter().flat_map(|&v| (v as f32).to_le_bytes()).collect::<Vec<u8>>();
+        // The polygon header (raw f32 vertices, encoding 4, then the box's low corner), then the vertices.
+        let vertices = [&[4u8, 0][..], &f32s(&[lat0, lng0]), &f32s(&[lat0, lng0, lat0, lng1, lat1, lng1, lat1, lng0])].concat();
+        let record = [&f32s(&[(lat0 + lat1) / 2.0, (lng0 + lng1) / 2.0])[..], &0u32.to_le_bytes(), &4u32.to_le_bytes(),
+            &name_id.to_le_bytes(), &[1u8, 0, 0, 0], &name_id.to_le_bytes(), &NO_DATA.to_le_bytes(), &NO_DATA.to_le_bytes()].concat();
+        assert_eq!(record.len(), std::mem::size_of::<PoiRecord>());
+        let entry = if interior { INTERIOR_FLAG } else { 0 };
+        idx.poi_cells = Some(FileBytes::Owned([&cells()[0].to_le_bytes()[..], &0u32.to_le_bytes()].concat()));
+        idx.poi_entries = Some(FileBytes::Owned([&1u16.to_le_bytes()[..], &entry.to_le_bytes()].concat()));
+        idx.poi_records = Some(FileBytes::Owned(record));
+        idx.poi_vertices = Some(FileBytes::Owned(vertices));
+        idx
+    }
+
+    #[test]
+    fn a_point_off_the_globe_is_in_no_poi_though_its_wrapped_cell_lists_one_interior() {
+        let around_q = (21.99, 27.5, 22.05, 27.6);
+        let rings = || [ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]), Ring { place_type: 5, ..ring("Bir Tarfawi", 15, 0.01, around_q, &[(0, true)]) }];
+        for interior in [false, true] {
+            let idx = with_polygon_poi(admin_index(&rings()), 1, around_q, interior);
+            let pois = |lat, lng| idx.find_pois(lat, lng).iter().map(|p| (p.name, p.contained)).collect::<Vec<_>>();
+            assert_eq!(pois(Q.0, Q.1), [("Bir Tarfawi", true)], "interior {interior}");
+            assert_eq!(idx.find_nearest_poi_with_parent(Q.0, Q.1).map(|(d, p)| (d, p.name_id)), Some((0.0, idx.admin_polygon(1).unwrap().name_id)));
+            let answer = serde_json::to_string(&idx.query(Q.0, Q.1)).unwrap();
+            assert!(answer.contains("Egypt") && answer.contains("Bir Tarfawi"), "{answer}");
+            for (lat, lng) in [(Q.0, Q.1 + 360.0), (Q.0, Q.1 - 360.0), (180.0 - Q.0, Q.1 - 180.0), (-180.0 - Q.0, Q.1 + 180.0)] {
+                assert_eq!(cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL), cells()[0], "({lat}, {lng})");
+                assert_eq!(pois(lat, lng), [], "({lat}, {lng}) interior {interior}");
+                assert!(idx.find_nearest_poi_with_parent(lat, lng).is_none(), "({lat}, {lng}) interior {interior}");
+                assert_eq!(serde_json::to_string(&idx.query(lat, lng)).unwrap(), r#"{"address":{}}"#, "({lat}, {lng}) interior {interior}");
+            }
+            for (lat, lng) in [(f64::NAN, Q.1), (Q.0, f64::NAN), (Q.0, f64::INFINITY), (f64::NEG_INFINITY, Q.1)] {
+                assert_eq!(pois(lat, lng), [], "({lat}, {lng})");
+                assert!(idx.find_nearest_poi_with_parent(lat, lng).is_none(), "({lat}, {lng})");
+            }
+        }
     }
 
     #[test]

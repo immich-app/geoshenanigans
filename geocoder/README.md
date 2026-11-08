@@ -73,7 +73,9 @@ cargo build --release --manifest-path server/Cargo.toml
 The server downloads a continent from the latest build the first time a query
 lands in it: `admin` mode, `simplified` boundaries and no POIs unless an admin sets
 another selection with `PUT /admin/configuration` (a JSON body of `base_url`,
-`mode`, `quality`, `poi_tier` and the regions to `preload`). Queries need an
+`mode`, `quality`, `poi_tier` and the regions to `preload`). A value the build
+doesn't offer fails each download, naming those it does, and the PUT is refused
+with them (400) when the server has the build's manifest at hand. Queries need an
 API key from the dashboard (see Authentication below).
 
 The test portal is a map page for checking answers, served by every query
@@ -196,21 +198,23 @@ cargo build --release --manifest-path server/Cargo.toml
 
 ```bash
 # Create index from PBF file, into a new or empty output-dir (it refuses any other:
-# an earlier build's files left there would be published as this one's)
+# an earlier build's files left there would be published as this one's). The index
+# is output-dir/planet; with --continents, each continent's dir beside it is one too
 ./build/build-index output-dir input.osm.pbf [input2.osm.pbf ...]
 
-# Start the server
-./server/target/release/query-server output-dir [bind-address]
+# Start the server (on output-dir instead, a --continents build serves continent by continent)
+./server/target/release/query-server output-dir/planet [bind-address]
 
 # Start with automatic HTTPS (certificates cached in --cache, default acme-cache)
-./server/target/release/query-server output-dir --domain geocoder.example.com
+./server/target/release/query-server output-dir/planet --domain geocoder.example.com
 ```
 
 ### Planet builds
 
 A full planet build (`--continents --multi-output --multi-quality`, the
 nightly's configuration; `--multi-quality` writes the two boundary tiers,
-`quality/simplified` and `quality/exact`) takes about 5 minutes on 64 cores and fits in
+`quality/simplified` and `quality/exact`, which `--multi-output` needs: its
+mode dirs hold no admin geometry and are read beside a tier) takes about 5 minutes on 64 cores and fits in
 80 GB of RAM (6.5 minutes there): the write phase sizes how much it runs at
 once to the memory limit, the smaller of MemTotal and the process's cgroup
 limit. Set

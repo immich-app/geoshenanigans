@@ -20,6 +20,12 @@ pub enum DownloadError {
     NotInManifest(String),
     Decompress(String),
     UnknownRegion(String),
+    /// The selection names a value on `axis` (mode, quality or poi_tier)
+    /// that the build has no component for; `offered` lists those it has.
+    NotOffered { axis: &'static str, value: String, offered: Vec<String> },
+    /// The manifest names a component (as a parent or a variant) that it
+    /// doesn't define.
+    MissingComponent(String),
 }
 
 impl std::fmt::Display for DownloadError {
@@ -33,6 +39,13 @@ impl std::fmt::Display for DownloadError {
             DownloadError::NotInManifest(p) => write!(f, "file not in manifest: {}", p),
             DownloadError::Decompress(s) => write!(f, "zstd decompress: {}", s),
             DownloadError::UnknownRegion(r) => write!(f, "unknown region: {}", r),
+            DownloadError::NotOffered { axis, value, offered } => {
+                let offered = if offered.is_empty() { "(none)".to_string() } else { offered.join(", ") };
+                write!(f, "this build has no {axis} \"{value}\"; it offers {axis}: {offered}")
+            }
+            DownloadError::MissingComponent(id) => {
+                write!(f, "the manifest names component \"{id}\" but does not define it")
+            }
         }
     }
 }
@@ -87,8 +100,32 @@ pub struct FileEntry {
     pub sha256: String,
 }
 
+/// The axes a selection takes one component of, `<axis>.<value>`.
+pub const COMPONENT_AXES: [&str; 3] = ["mode", "quality", "poi_tier"];
+
+impl Configurations {
+    /// The values of `axis` the build has a component for, in order.
+    pub fn offered(&self, axis: &str) -> Vec<String> {
+        let prefix = format!("{axis}.");
+        self.components.keys().filter_map(|id| id.strip_prefix(&prefix)).map(str::to_string).collect()
+    }
+}
+
+/// Fails, naming the value and those the build offers, unless the build has
+/// a component for each of `sel`'s mode, quality and poi_tier. The region
+/// isn't checked: the manifest's files table holds it.
+pub fn check_selection(cfg: &Configurations, sel: &RegionSelection) -> Result<(), DownloadError> {
+    for axis in COMPONENT_AXES {
+        let value = sel.axis(axis).unwrap_or_default();
+        if !cfg.components.contains_key(&format!("{axis}.{value}")) {
+            return Err(DownloadError::NotOffered { axis, value: value.to_string(), offered: cfg.offered(axis) });
+        }
+    }
+    Ok(())
+}
+
 /// Per-region selection passed in by the configuration endpoint. The
-/// quality/poi_tier strings have to match component IDs in
+/// mode/quality/poi_tier strings have to match component IDs in
 /// configurations.components (e.g. "simplified", "major").
 #[derive(Debug, Clone)]
 pub struct RegionSelection {
@@ -127,16 +164,14 @@ pub struct ResolvedFiles {
     pub optional: HashSet<String>,
 }
 
-pub fn resolve_files(cfg: &Configurations, sel: &RegionSelection) -> ResolvedFiles {
+/// The files of `sel`, or an error when it names a value the build has no
+/// component for or the manifest names a component it lacks: skipping one
+/// would leave a set that can never load.
+pub fn resolve_files(cfg: &Configurations, sel: &RegionSelection) -> Result<ResolvedFiles, DownloadError> {
+    check_selection(cfg, sel)?;
     let mut files = Vec::new();
     let mut optional = HashSet::new();
     let mut replaced = HashSet::new();
-
-    let component_ids = [
-        format!("mode.{}", sel.mode),
-        format!("quality.{}", sel.quality),
-        format!("poi_tier.{}", sel.poi_tier),
-    ];
 
     fn substitute(path: &str, sel: &RegionSelection) -> String {
         path.replace("{region}", &sel.region)
@@ -149,11 +184,11 @@ pub fn resolve_files(cfg: &Configurations, sel: &RegionSelection) -> ResolvedFil
         cfg: &Configurations, sel: &RegionSelection, id: &str,
         seen: &mut HashSet<String>, files: &mut Vec<String>,
         optional: &mut HashSet<String>, replaced: &mut HashSet<String>,
-    ) {
-        if !seen.insert(id.to_string()) { return; }
-        let Some(c) = cfg.components.get(id) else { return; };
+    ) -> Result<(), DownloadError> {
+        if !seen.insert(id.to_string()) { return Ok(()); }
+        let c = cfg.components.get(id).ok_or_else(|| DownloadError::MissingComponent(id.to_string()))?;
         if let Some(parent) = c.extends.as_deref() {
-            visit(cfg, sel, parent, seen, files, optional, replaced);
+            visit(cfg, sel, parent, seen, files, optional, replaced)?;
         }
         for f in &c.files { files.push(substitute(f, sel)); }
         for f in &c.optional_files {
@@ -163,12 +198,14 @@ pub fn resolve_files(cfg: &Configurations, sel: &RegionSelection) -> ResolvedFil
         }
         for r in &c.replaces { replaced.insert(substitute(r, sel)); }
         if let Some(v) = c.variants.iter().find(|v| sel.matches(&v.when)) {
-            visit(cfg, sel, &v.component, seen, files, optional, replaced);
+            visit(cfg, sel, &v.component, seen, files, optional, replaced)?;
         }
+        Ok(())
     }
 
-    for cid in &component_ids {
-        visit(cfg, sel, cid, &mut HashSet::new(), &mut files, &mut optional, &mut replaced);
+    for axis in COMPONENT_AXES {
+        let id = format!("{axis}.{}", sel.axis(axis).unwrap_or_default());
+        visit(cfg, sel, &id, &mut HashSet::new(), &mut files, &mut optional, &mut replaced)?;
     }
 
     let paths: Vec<String> = files.into_iter()
@@ -177,7 +214,7 @@ pub fn resolve_files(cfg: &Configurations, sel: &RegionSelection) -> ResolvedFil
         .into_iter()
         .collect();
     optional.retain(|p| paths.contains(p));
-    ResolvedFiles { paths, optional }
+    Ok(ResolvedFiles { paths, optional })
 }
 
 // --- Download a single file -------------------------------------------------
@@ -325,7 +362,7 @@ pub async fn download_region(
     root: &Path,
     progress: impl Fn(DownloadProgress) + Send + Sync,
 ) -> Result<(), DownloadError> {
-    let resolved = resolve_files(cfg, sel);
+    let resolved = resolve_files(cfg, sel)?;
     if resolved.paths.is_empty() {
         return Err(DownloadError::UnknownRegion(sel.region.clone()));
     }
@@ -393,14 +430,16 @@ pub async fn download_region(
     Ok(())
 }
 
-// --- Pure-helper regression tests -------------------------------------------
+// --- Regression tests ---------------------------------------------------------
 //
 // Lock in current behaviour of resolve_files (component graph walking) and
-// the DownloadError Display strings.  No network/filesystem.
+// the DownloadError Display strings; the download tests fetch from a bucket
+// on localhost (test_bucket.rs) into scratch dirs.
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::scratch_dir::ScratchDir;
+    use crate::test_bucket::{self, TestBucket};
 
     #[test]
     fn streaming_decode_hash_roundtrip() {
@@ -464,7 +503,7 @@ mod tests {
             ("poi_tier.major", component(&["{region}/poi/{poi_tier}.bin"], &[], None)),
         ]);
         let s = sel("europe", "full", "simplified", "major");
-        let files = resolve_files(&c, &s).paths;
+        let files = resolve_files(&c, &s).unwrap().paths;
         // BTreeSet => sorted, deduped. {region}->europe, {mode}->full,
         // {quality}->simplified, {poi_tier}->major.
         assert_eq!(files, vec![
@@ -485,7 +524,7 @@ mod tests {
             ("poi_tier.none", component(&[], &[], None)),
         ]);
         let s = sel("eu", "full", "simplified", "none");
-        let files = resolve_files(&c, &s).paths;
+        let files = resolve_files(&c, &s).unwrap().paths;
         assert_eq!(files, vec![
             "base_a.bin".to_string(),
             "base_b.bin".to_string(),
@@ -503,7 +542,7 @@ mod tests {
             ("poi_tier.none", component(&[], &[], None)),
         ]);
         let s = sel("eu", "full", "simplified", "none");
-        let files = resolve_files(&c, &s).paths;
+        let files = resolve_files(&c, &s).unwrap().paths;
         assert_eq!(files, vec![
             "admin_hi.bin".to_string(),
             "cells.bin".to_string(),
@@ -521,7 +560,7 @@ mod tests {
             ("poi_tier.none", component(&[], &[], None)),
         ]);
         let s = sel("asia", "full", "simplified", "none");
-        let files = resolve_files(&c, &s).paths;
+        let files = resolve_files(&c, &s).unwrap().paths;
         assert_eq!(files, vec!["asia/admin_hi.bin".to_string()]);
     }
 
@@ -534,16 +573,53 @@ mod tests {
             ("poi_tier.none", component(&[], &[], None)),
         ]);
         let s = sel("eu", "full", "simplified", "none");
-        let files = resolve_files(&c, &s).paths;
+        let files = resolve_files(&c, &s).unwrap().paths;
         assert_eq!(files, vec!["extra.bin".to_string(), "shared.bin".to_string()]);
     }
 
+    // A value the build has no component for would otherwise be skipped,
+    // leaving a set without that component's files that can never load.
     #[test]
-    fn resolve_files_missing_component_ids_yield_empty() {
-        // No matching component ids at all -> empty result.
-        let c = cfg(vec![("something.else", component(&["x.bin"], &[], None))]);
-        let s = sel("eu", "full", "simplified", "none");
-        assert!(resolve_files(&c, &s).paths.is_empty());
+    fn resolve_files_refuses_a_value_the_build_has_no_component_for() {
+        let (_, c) = template();
+        let not_offered = |s: RegionSelection| match resolve_files(&c, &s) {
+            Err(DownloadError::NotOffered { axis, value, offered }) => (axis, value, offered),
+            Err(e) => panic!("{s:?}: {e}"),
+            Ok(r) => panic!("{s:?} resolved to {:?}", r.paths),
+        };
+        let strings = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        assert_eq!(not_offered(sel("europe", "admin", "q2.5", "none")),
+                   ("quality", "q2.5".to_string(), strings(&["exact", "simplified"])));
+        assert_eq!(not_offered(sel("europe", "ful", "simplified", "major")),
+                   ("mode", "ful".to_string(), strings(&["admin", "admin-minimal", "full", "no-addresses"])));
+        assert_eq!(not_offered(sel("europe", "full", "simplified", "majr")),
+                   ("poi_tier", "majr".to_string(), strings(&["all", "major", "none", "notable"])));
+    }
+
+    #[test]
+    fn resolve_files_refuses_a_component_the_manifest_names_but_lacks() {
+        let missing = |components: serde_json::Value| {
+            let c = Configurations {
+                build: BuildMeta { date: "2026-01-01".into() },
+                components: serde_json::from_value(components).unwrap(),
+                files: BTreeMap::new(),
+            };
+            match resolve_files(&c, &sel("eu", "full", "simplified", "none")) {
+                Err(DownloadError::MissingComponent(id)) => id,
+                Err(e) => panic!("{e}"),
+                Ok(r) => panic!("resolved to {:?}", r.paths),
+            }
+        };
+
+        assert_eq!(missing(serde_json::json!({
+            "mode.full": { "files": ["{region}/full/a.bin"], "extends": "full/base" },
+            "quality.simplified": {}, "poi_tier.none": {}
+        })), "full/base");
+        assert_eq!(missing(serde_json::json!({
+            "mode.full": { "files": ["{region}/full/a.bin"], "variants": [{ "component": "full/alone" }] },
+            "quality.simplified": {}, "poi_tier.none": {}
+        })), "full/alone");
     }
 
     #[test]
@@ -565,14 +641,16 @@ mod tests {
                     "replaces": ["{region}/small/a.bin"]
                 },
                 "small/never": { "files": ["{region}/never.bin"] },
+                "quality.simplified": {},
+                "poi_tier.none": {},
                 "poi_tier.major": { "files": ["{region}/poi/{poi_tier}/p.bin"] }
             })).unwrap(),
             files: BTreeMap::new(),
         };
 
-        assert_eq!(resolve_files(&c, &sel("eu", "small", "simplified", "none")).paths,
+        assert_eq!(resolve_files(&c, &sel("eu", "small", "simplified", "none")).unwrap().paths,
                    vec!["eu/small/a.bin".to_string(), "eu/small/b.bin".to_string()]);
-        assert_eq!(resolve_files(&c, &sel("eu", "small", "simplified", "major")).paths,
+        assert_eq!(resolve_files(&c, &sel("eu", "small", "simplified", "major")).unwrap().paths,
                    vec!["eu/poi/major/p.bin".to_string(), "eu/small-poi/b.bin".to_string()]);
     }
 
@@ -580,10 +658,14 @@ mod tests {
     fn resolve_files_marks_optional_files() {
         let mut full = component(&["{region}/full/admin_cells.bin"], &[], None);
         full.optional_files = vec!["{region}/full/interp_postcodes.bin".to_string()];
-        let c = cfg(vec![("mode.full", full)]);
+        let c = cfg(vec![
+            ("mode.full", full),
+            ("quality.simplified", component(&[], &[], None)),
+            ("poi_tier.none", component(&[], &[], None)),
+        ]);
         let s = sel("europe", "full", "simplified", "none");
 
-        let resolved = resolve_files(&c, &s);
+        let resolved = resolve_files(&c, &s).unwrap();
 
         assert_eq!(resolved.paths, vec![
             "europe/full/admin_cells.bin".to_string(),
@@ -647,7 +729,7 @@ mod tests {
     fn template_selections_include_load_sidecars() {
         let (v, c) = template();
         for s in template_selections(&v) {
-            let paths = resolve_files(&c, &s).paths;
+            let paths = resolve_files(&c, &s).unwrap().paths;
             let has = |name: &str| paths.iter().any(|p| basename(p) == name);
             assert!(has("strings_layout.json"), "{:?} lacks strings_layout.json", s);
             assert!(has("admin_cells.bin"), "{:?} lacks admin_cells.bin", s);
@@ -669,7 +751,7 @@ mod tests {
             .collect();
         assert_eq!(minimal.len(), axis_values(&v, "poi_tier").len());
         for s in minimal {
-            let paths = resolve_files(&c, &s).paths;
+            let paths = resolve_files(&c, &s).unwrap().paths;
             let (dir, other) = if s.poi_tier == "none" {
                 ("europe/admin-minimal/", "europe/admin-minimal-poi/")
             } else {
@@ -690,7 +772,7 @@ mod tests {
     fn template_selections_take_each_admin_geometry_file_once_from_their_dir() {
         let (v, c) = template();
         for s in template_selections(&v) {
-            let paths = resolve_files(&c, &s).paths;
+            let paths = resolve_files(&c, &s).unwrap().paths;
             let dir = match (s.mode.as_str(), s.poi_tier.as_str()) {
                 ("admin-minimal", "none") => format!("{}/admin-minimal/", s.region),
                 ("admin-minimal", _) => format!("{}/admin-minimal-poi/", s.region),
@@ -722,7 +804,63 @@ mod tests {
             assert!(axis_values(&v, axis).contains(value), "{axis} {value}");
         }
         assert!(allowed(&v, &s));
-        assert!(resolve_files(&c, &s).paths.iter().any(|p| p == &format!("europe/quality/{}/arc_vertices.bin", d.quality)));
+        assert!(resolve_files(&c, &s).unwrap().paths.iter().any(|p| p == &format!("europe/quality/{}/arc_vertices.bin", d.quality)));
+    }
+
+    async fn download(bucket: &TestBucket, s: &RegionSelection, root: &Path) -> Result<(), DownloadError> {
+        download_region(&reqwest::Client::new(), &bucket.url, &bucket.manifest, s, root, |_| {}).await
+    }
+
+    // Skipping a value the build lacks fetched the rest of the selection and
+    // succeeded: a q2.5 selection got no admin geometry, and install failed.
+    #[tokio::test]
+    async fn a_download_of_a_value_the_build_lacks_fails_naming_it_before_fetching_a_file() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        for (s, error) in [
+            (sel("europe", "admin", "q2.5", "none"),
+             "this build has no quality \"q2.5\"; it offers quality: exact, simplified"),
+            (sel("europe", "ful", "simplified", "major"),
+             "this build has no mode \"ful\"; it offers mode: admin, admin-minimal, full, no-addresses"),
+        ] {
+            let root = ScratchDir::new();
+
+            let got = download(&bucket, &s, root.path()).await.map_err(|e| e.to_string());
+
+            assert_eq!(got, Err(error.to_string()), "{s:?}");
+            assert!(!root.path().join(&s.region).exists(), "{s:?}");
+        }
+        assert_eq!(bucket.files_served(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_download_naming_a_component_the_manifest_lacks_fails_before_fetching_a_file() {
+        let bucket = test_bucket::serve(serde_json::json!({
+            "mode.full": { "files": ["{region}/full/a.bin"], "variants": [{ "component": "full/alone" }] },
+            "quality.simplified": {},
+            "poi_tier.none": {}
+        })).await;
+        let root = ScratchDir::new();
+
+        let got = download(&bucket, &sel("europe", "full", "simplified", "none"), root.path()).await.map_err(|e| e.to_string());
+
+        assert_eq!(got, Err("the manifest names component \"full/alone\" but does not define it".to_string()));
+        assert_eq!(bucket.files_served(), 0);
+    }
+
+    // The checks refuse no selection the template allows, nor a preset's.
+    #[tokio::test]
+    async fn every_template_selection_downloads_its_admin_geometry() {
+        let (v, _) = template();
+        let bucket = test_bucket::serve(v["components"].clone()).await;
+        for s in template_selections(&v) {
+            let root = ScratchDir::new();
+
+            download(&bucket, &s, root.path()).await.unwrap_or_else(|e| panic!("{s:?}: {e}"));
+
+            for name in ["admin_cells.bin", "strings_layout.json", "admin_polygons.bin"].into_iter().chain(query_server::ADMIN_GEOMETRY_FILES) {
+                assert!(root.path().join(&s.region).join(name).exists(), "{s:?} {name}");
+            }
+        }
     }
 
     #[test]
@@ -748,6 +886,18 @@ mod tests {
         assert_eq!(
             DownloadError::UnknownRegion("atlantis".into()).to_string(),
             "unknown region: atlantis"
+        );
+        assert_eq!(
+            DownloadError::NotOffered { axis: "quality", value: "q2.5".into(), offered: vec!["exact".into(), "simplified".into()] }.to_string(),
+            "this build has no quality \"q2.5\"; it offers quality: exact, simplified"
+        );
+        assert_eq!(
+            DownloadError::NotOffered { axis: "mode", value: "full".into(), offered: Vec::new() }.to_string(),
+            "this build has no mode \"full\"; it offers mode: (none)"
+        );
+        assert_eq!(
+            DownloadError::MissingComponent("dir.admin-minimal".into()).to_string(),
+            "the manifest names component \"dir.admin-minimal\" but does not define it"
         );
     }
 }

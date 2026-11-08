@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::downloader::{
-    download_region, Configurations, DownloadError, DownloadProgress, RegionSelection,
+    check_selection, download_region, Configurations, DownloadError, DownloadProgress, RegionSelection,
 };
 use query_server::MultiIndex;
 
@@ -34,6 +34,9 @@ use query_server::MultiIndex;
 /// never re-resolved would 404 on every new download from day 4.
 const CONFIGURATIONS_TTL: Duration = Duration::from_secs(3600);
 
+/// The selection a server downloads. A mode, quality or poi_tier its build
+/// has no component for fails each download, naming the values the build
+/// offers; a PUT naming one is refused when the build's manifest is at hand.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Configuration {
     /// Base URL for the geocoder build artifacts. Latest.json + each
@@ -62,6 +65,17 @@ impl Default for Configuration {
             quality: "simplified".to_string(),
             poi_tier: "none".to_string(),
             preload: Vec::new(),
+        }
+    }
+}
+
+impl Configuration {
+    pub fn selection(&self, region: &str) -> RegionSelection {
+        RegionSelection {
+            region: region.to_string(),
+            mode: self.mode.clone(),
+            quality: self.quality.clone(),
+            poi_tier: self.poi_tier.clone(),
         }
     }
 }
@@ -112,7 +126,20 @@ impl RegionState {
     /// Replace the active configuration. Persists to disk and kicks
     /// off background downloads for any preload region not yet on
     /// disk. Returns immediately — downloads run as tokio tasks.
-    pub async fn set_configuration(self: &Arc<Self>, new_cfg: Configuration) -> std::io::Result<()> {
+    ///
+    /// Refused, changing nothing, when the manifest at hand has no
+    /// component for its mode, quality or poi_tier.
+    pub async fn set_configuration(self: &Arc<Self>, new_cfg: Configuration) -> Result<(), DownloadError> {
+        // The manifest at hand: the cached one, when it is of this base_url
+        // and within its TTL. Without one the first download reports a
+        // value the build lacks. The check reads no region.
+        let same_bucket = self.config.lock().await.base_url == new_cfg.base_url;
+        if let Some((fetched_at, manifest)) = self.configurations.lock().await.as_ref() {
+            if same_bucket && fetched_at.elapsed() < self.configurations_ttl {
+                check_selection(manifest, &new_cfg.selection(""))?;
+            }
+        }
+
         // Persist + swap in atomically. Disk write is best-effort —
         // we still apply the new config in memory if disk is full.
         let json = serde_json::to_string_pretty(&new_cfg).unwrap_or_default();
@@ -203,12 +230,7 @@ impl RegionState {
 
         let configurations = self.ensure_configurations().await?;
         let cfg = self.config.lock().await.clone();
-        let sel = RegionSelection {
-            region: region.to_string(),
-            mode: cfg.mode.clone(),
-            quality: cfg.quality.clone(),
-            poi_tier: cfg.poi_tier.clone(),
-        };
+        let sel = cfg.selection(region);
 
         let region_owned = region.to_string();
         download_region(
@@ -235,6 +257,7 @@ impl RegionState {
 mod tests {
     use super::*;
     use crate::scratch_dir::ScratchDir;
+    use crate::test_bucket;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct FakeBucket {
@@ -295,5 +318,80 @@ mod tests {
 
         assert_eq!(bucket.fetches.load(Ordering::SeqCst), 2);
         assert_eq!(second.build.date, "2026-01-02");
+    }
+
+    // A configuration.json kept from an earlier build, naming a value this
+    // one lacks, loads as it is; its downloads fail naming the value and the
+    // build's, fetching nothing into the region dir.
+    #[tokio::test]
+    async fn a_persisted_value_the_build_lacks_fails_its_download_naming_it() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let root = ScratchDir::new();
+        let persisted = Configuration { base_url: bucket.url.clone(), quality: "q2.5".into(), ..Configuration::default() };
+        std::fs::write(root.path().join("configuration.json"), serde_json::to_string(&persisted).unwrap()).unwrap();
+        let mi = MultiIndex::load(root.path().to_str().unwrap(), 17, 10, 660.0).unwrap();
+        let state = RegionState::new(Arc::new(mi), root.path().to_path_buf());
+
+        let got = state.ensure_loaded("europe").await.map_err(|e| e.to_string());
+
+        assert_eq!(got, Err("this build has no quality \"q2.5\"; it offers quality: exact, simplified".to_string()));
+        assert_eq!(bucket.files_served(), 0);
+        assert!(!root.path().join("europe").exists());
+    }
+
+    // With the build's manifest at hand, a configuration naming a value it
+    // lacks is refused before it replaces or persists anything.
+    #[tokio::test]
+    async fn a_configuration_naming_a_value_the_manifest_at_hand_lacks_is_refused() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (root, state) = state_for(bucket.url.clone(), std::time::Duration::from_secs(3600)).await;
+        let state = Arc::new(state);
+        state.ensure_configurations().await.unwrap();
+        let before = state.get_configuration().await;
+
+        for (cfg, error) in [
+            (Configuration { quality: "q2.5".into(), ..before.clone() },
+             "this build has no quality \"q2.5\"; it offers quality: exact, simplified"),
+            (Configuration { mode: "ful".into(), ..before.clone() },
+             "this build has no mode \"ful\"; it offers mode: admin, admin-minimal, full, no-addresses"),
+        ] {
+            let got = state.set_configuration(cfg).await.map_err(|e| e.to_string());
+
+            assert_eq!(got, Err(error.to_string()));
+        }
+        let json = |c: &Configuration| serde_json::to_value(c).unwrap();
+        assert_eq!(json(&state.get_configuration().await), json(&before));
+        assert!(!root.path().join("configuration.json").exists());
+
+        state.set_configuration(Configuration { quality: "exact".into(), ..before.clone() }).await.unwrap();
+        assert_eq!(state.get_configuration().await.quality, "exact");
+    }
+
+    // The manifest at hand is the cached one of the configuration's own
+    // bucket, within its TTL. Another bucket's build, or a newer build than
+    // a manifest past its TTL, may offer a value that manifest lacks: a PUT
+    // naming one is accepted, for its downloads to fetch the build they use.
+    #[tokio::test]
+    async fn a_configuration_is_checked_only_against_a_fresh_manifest_of_its_bucket() {
+        let mut components = test_bucket::template_components();
+        components["quality.fine"] = components["quality.simplified"].clone();
+        let offering = test_bucket::serve(components).await;
+        let lacking = test_bucket::serve(test_bucket::template_components()).await;
+
+        // A PUT moving to another bucket, with this one's manifest at hand.
+        let (_root, state) = state_for(lacking.url.clone(), Duration::from_secs(3600)).await;
+        let state = Arc::new(state);
+        state.ensure_configurations().await.unwrap();
+        let moved = Configuration { base_url: offering.url.clone(), quality: "fine".into(), ..state.get_configuration().await };
+        state.set_configuration(moved).await.unwrap();
+        assert_eq!(state.get_configuration().await.quality, "fine");
+
+        // A PUT once the manifest at hand is past its TTL.
+        let (_root, state) = state_for(offering.url.clone(), Duration::ZERO).await;
+        let state = Arc::new(state);
+        *state.configurations.lock().await = Some((Instant::now(), lacking.manifest.clone()));
+        let fine = Configuration { quality: "fine".into(), ..state.get_configuration().await };
+        state.set_configuration(fine).await.unwrap();
+        assert_eq!(state.get_configuration().await.quality, "fine");
     }
 }

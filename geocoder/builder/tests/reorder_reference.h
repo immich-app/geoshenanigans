@@ -530,7 +530,7 @@ inline void reorder_interps(ParsedData& data) {
 
 // Sorts admin polygons by (name, level, country, their exact rings' vertex
 // occurrences, their exact outer ring's smallest vertex, osm id), their exact
-// rings and admin cell entries in lockstep.
+// and arc rings and admin cell entries in lockstep.
 inline void reorder_admin_polygons(ParsedData& data) {
     if (!data.admin_polygons.empty()) {
         size_t n = data.admin_polygons.size();
@@ -579,6 +579,12 @@ inline void reorder_admin_polygons(ParsedData& data) {
         }
         data.admin_polygons = std::move(new_polys);
         data.admin_exact_rings.polygons = std::move(new_exact);
+        // And their arc rings, once the arc stage has run.
+        if (!data.admin_arcs.polygons.empty()) {
+            std::vector<AdminArcPolygon> new_arcs(n);
+            for (uint32_t i = 0; i < n; i++) new_arcs[i] = data.admin_arcs.polygons[order[i]];
+            data.admin_arcs.polygons = std::move(new_arcs);
+        }
         // Remap place-node parent_poly_id references
         for (auto& pn : data.place_nodes) {
             if (pn.parent_poly_id != 0xFFFFFFFFu &&

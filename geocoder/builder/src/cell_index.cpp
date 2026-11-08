@@ -1289,11 +1289,14 @@ void require_arcs_in_step(const ParsedData& data) {
         throw std::logic_error("admin arc polygons out of step with the polygons");
 }
 
-const char* exact_tier_dir() {
-    for (const ArcTier& tier : kArcTiers)
-        if (tier.set == ArcSet::Full && !tier.simplifies()) return tier.dir;
+// The full set's exact tier, its place in kArcTiers.
+size_t exact_tier_index() {
+    for (size_t t = 0; t < kArcTierCount; t++)
+        if (kArcTiers[t].set == ArcSet::Full && !kArcTiers[t].simplifies()) return t;
     throw std::logic_error("no exact tier of the full set");
 }
+
+const char* exact_tier_dir() { return kArcTiers[exact_tier_index()].dir; }
 
 }  // namespace
 
@@ -1513,4 +1516,18 @@ void write_admin_tiers(const ParsedData& data, const std::string& region_dir) {
     gc::id_alloc::IdAllocator::write_sidecar(arc_sidecar_path(region_dir, ArcSet::Full), arcs.set(ArcSet::Full).sidecar);
     write_arc_fallback_sidecar(arc_fallback_sidecar_path(region_dir, ArcSet::Full), arcs.set(ArcSet::Full));
     std::cerr << summary.str() << std::endl;
+}
+
+void write_exact_admin_geometry(const ParsedData& data, const std::string& dir) {
+    require_arcs_in_step(data);
+    const AdminArcBlocks& arcs = data.admin_arcs;
+    const size_t t = exact_tier_index();
+    ensure_dir(dir);
+    // The records in the shared slots, as write_admin_tiers lays them out.
+    const SlotRecords shared =
+        records_at(data, shared_admin_minimal_slots(data, polygons_holding(data, ArcSet::Full)), shared_name);
+    const size_t ring_bytes = write_ring_files({dir}, arcs, ArcSet::Full, shared.at_slot, shared.polygon_of);
+    write_arc_files(dir, arcs.set(ArcSet::Full), arcs.tiers[t]);
+    std::cerr << "  Exact admin geometry in " << dir << ": " << shared.at_slot.size() << " slots, " << ring_bytes
+              << " ring bytes, " << arcs.tiers[t].bytes.size() << " arc bytes" << std::endl;
 }

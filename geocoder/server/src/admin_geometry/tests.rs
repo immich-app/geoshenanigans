@@ -198,7 +198,10 @@ impl Lattice {
 
 #[test]
 fn admin_points_round_as_the_shared_vectors_say() {
-    for r in testdata_rows("point_e7.tsv") {
+    // Every row: a table that lost them would check nothing.
+    let rows = testdata_rows("point_e7.tsv");
+    assert!(rows.len() > 60);
+    for r in rows {
         let deg = if r[1] == "f32" { r[0].parse::<f32>().unwrap() as f64 } else { r[0].parse::<f64>().unwrap() };
         let want: i64 = r[2].parse().unwrap();
         assert_eq!(AdminPoint::new(deg, 0.0).e7(), pt(want, 0), "{r:?}");

@@ -7,6 +7,7 @@ on:
       - "geocoder/node/**"
       - "geocoder/search/**"
       - "geocoder/server/**"
+      - "geocoder/test-portal/**"
       - ".github/workflows/geocoder-tests.yml"
       # The tool tests read the nightly's package list.
       - ".github/workflows/geocoder-build.yml"
@@ -92,6 +93,11 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      # The S2 tests load what build-index writes with the server's read path:
+      # its grid_query example, which the build makes with cargo.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: stable
       - name: Install dependencies
         run: |
           sudo apt-get update
@@ -168,3 +174,13 @@ jobs:
           cd geocoder/node
           cargo build --release --locked
           node --test test/*.test.mjs
+
+  test-portal-tests:
+    name: Test portal entrypoint tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Test
+        run: geocoder/test-portal/entrypoint.test.sh

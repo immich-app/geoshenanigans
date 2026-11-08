@@ -67,27 +67,68 @@ fi
 
 # Files in S3 are zstd-compressed with .zst suffix.  Helper fetches
 # either the .zst (preferred) or plain version, decompresses if needed.
+# A file the build lacks (404 for both) is a miss; any other failure, a
+# transfer that broke off among them, fails the fetch and leaves nothing.
 fetch() {
-    src_path="$1"; dest="$2"
-    if curl -fsSL "$src_path.zst" -o "$dest.zst" 2>/dev/null; then
-        zstd -dq --rm "$dest.zst"
-    elif curl -fsSL "$src_path" -o "$dest" 2>/dev/null; then
-        :
-    else
+    src_path="$1"; dest="$2"; zst=; plain=
+    if zst=$(curl -fsSL -w '%{http_code}' "$src_path.zst" -o "$dest.zst" 2>/dev/null); then
+        zstd -dq --rm "$dest.zst" && return
+    elif plain=$(curl -fsSL -w '%{http_code}' "$src_path" -o "$dest" 2>/dev/null); then
+        rm -f "$dest.zst"
+        return
+    elif [ "$zst" = 404 ] && [ "$plain" = 404 ]; then
         echo "  miss: $src_path"
-        return 1
+        return
     fi
+    echo "  failed: $src_path"
+    rm -f "$dest" "$dest.zst"
+    return 1
+}
+
+# Files a region may lack (interp_postcodes.bin outside TIGER regions, the
+# postcode centroids): the template's optional files of mode full.
+optional_file() {
+    case "$1" in
+        interp_postcodes.bin|postcode_centroids.bin|postcode_centroid_cells.bin|postcode_centroid_entries.bin)
+            return 0 ;;
+    esac
+    return 1
+}
+
+# A finished download leaves the "<dir> <file>" lines of its selection here.
+MARKER="$INDEX_DIR/.selection"
+
+# The selection's files missing from $INDEX_DIR that a region can't lack,
+# one a line.
+missing_files() {
+    selection_files | while read -r dir f; do
+        optional_file "$f" || [ -f "$INDEX_DIR/$f" ] || echo "$dir/$f"
+    done
+}
+
+# Whether $INDEX_DIR holds a finished download of this selection: its marker
+# names this selection's files and none it needs is missing. An interrupted
+# download, or a dataset of another selection or build, fails it.
+dataset_complete() {
+    [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$(selection_files)" ] && [ -z "$(missing_files)" ]
 }
 
 # Sentinel file differs by mode — minimal doesn't download geo_cells.
 SENTINEL="geo_cells.bin"
 if [ "$MINIMAL" = "1" ]; then SENTINEL="admin_cells.bin"; fi
 
-if [ -f "$INDEX_DIR/$SENTINEL" ]; then
+if dataset_complete; then
     echo "Index data found at $INDEX_DIR (delete to force re-download)"
 else
-    echo "No index data found — downloading from Tigris (quality=$QUALITY, poi=$POI_TIER, minimal=$MINIMAL)..."
+    # Download the whole selection afresh, never into what is there: its
+    # cells and strings may be another build's. Only the accounts stay.
     mkdir -p "$INDEX_DIR"
+    if find "$INDEX_DIR" -mindepth 1 -maxdepth 1 ! -name geocoder.json | grep -q .; then
+        echo "Index data at $INDEX_DIR is not a finished download of this selection — removing it"
+        rm -f "$MARKER"
+        find "$INDEX_DIR" -mindepth 1 -maxdepth 1 ! -name geocoder.json -exec rm -rf {} +
+    fi
+    echo "Downloading index data from Tigris (quality=$QUALITY, poi=$POI_TIER, minimal=$MINIMAL)..."
 
     LATEST_JSON=$(curl -sL "$TIGRIS_BASE/latest.json")
     # latest.json is multi-line pretty-printed JSON; flatten with tr
@@ -100,16 +141,30 @@ else
     BASE="$TIGRIS_BASE/$LATEST"
 
     # An optional file a region lacks (interp_postcodes.bin outside TIGER
-    # regions, the postcode centroids) is a miss, not an error.
-    selection_files | {
+    # regions, the postcode centroids) is a miss, not an error. A fetch that
+    # failed fails the start before the marker vouches for the download.
+    if ! selection_files | {
+        pids=
         while read -r dir f; do
             echo "  $dir/$f"
             fetch "$BASE/planet/$dir/$f" "$INDEX_DIR/$f" &
+            pids="$pids $!"
         done
-        wait
-    }
+        ok=1
+        for pid in $pids; do wait "$pid" || ok=; done
+        [ -n "$ok" ]
+    }; then
+        echo "Error: a file failed to download (named above); the next start downloads afresh"
+        exit 1
+    fi
 
     echo "Download complete."
+    MISSING=$(missing_files)
+    if [ -n "$MISSING" ]; then
+        echo "Error: the download lacks files the server needs:"
+        echo "$MISSING"
+        exit 1
+    fi
     SENTINEL_SIZE=$(stat -c%s "$INDEX_DIR/$SENTINEL" 2>/dev/null || echo 0)
     if [ "$SENTINEL_SIZE" -lt 1000 ]; then
         echo "Error: $SENTINEL is only ${SENTINEL_SIZE} bytes — download likely failed"
@@ -117,6 +172,7 @@ else
     fi
     echo "Verified: $SENTINEL is $((SENTINEL_SIZE / 1024 / 1024)) MiB"
     echo "Total index size: $(du -sh $INDEX_DIR | cut -f1)"
+    selection_files > "$MARKER"
 fi
 
 # Test auth config
