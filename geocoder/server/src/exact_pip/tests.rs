@@ -77,3 +77,19 @@ fn far_off_points_cross_nothing_they_should_not() {
         assert!(edge_crosses(a, b, PointE7 { lat: -lat, lng: 0 }));
     }
 }
+
+#[test]
+fn points_at_the_ends_of_i64_cross_as_the_side_they_are_on_says() {
+    // Their differences with an edge's ends are past i64: an edge crosses the ray of the
+    // southernmost point and not that of the northernmost, either way round, and neither lies on it.
+    let ends = |lat: i64| (PointE7 { lat, lng: -1 }, PointE7 { lat, lng: 1 });
+    let widest = (PointE7 { lat: i32::MAX as i64, lng: i32::MIN as i64 }, PointE7 { lat: i32::MIN as i64, lng: i32::MAX as i64 });
+    for (a, b) in [ends(1), ends(-1), ends(i32::MAX as i64), ends(i32::MIN as i64), widest] {
+        let (south, north) = (PointE7 { lat: i64::MIN, lng: 0 }, PointE7 { lat: i64::MAX, lng: 0 });
+        for (a, b) in [(a, b), (b, a)] {
+            assert!(edge_crosses(a, b, south), "{a:?} {b:?}");
+            assert!(!edge_crosses(a, b, north), "{a:?} {b:?}");
+            assert!(!on_edge(a, b, south) && !on_edge(a, b, north), "{a:?} {b:?}");
+        }
+    }
+}
