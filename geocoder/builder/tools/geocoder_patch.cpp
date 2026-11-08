@@ -8,11 +8,12 @@
 //
 // Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--threads] [--file-records-max N]
 //
-// Reads GCPATCH v13 (REPLACE runs, street remap derived from the
+// Reads GCPATCH v14 (REPLACE runs, street remap derived from the
 // street_ways replay, PARALLEL_DELTA_STRIDE side files, unmapped ids dropped
 // from street / addr / interp cell lists, a cell index delta for every admin /
-// POI index and none for places, remap pairs ascending, and the MATCH records'
-// string fixups).
+// POI index and none for places, remap pairs ascending, the MATCH records'
+// string fixups, and the admin geometry files merged by slot, with admin
+// slots kept).
 //
 // Low-memory mode: when <current-dir> is an encoded installed set (it has a
 // gc.manifest, see gcs_patch.h), the encoded families' old files are decoded
@@ -518,10 +519,9 @@ static int run(int argc, char* argv[]) {
     CellChanges geo_cells, admin_cells, poi_cells;
     EntriesFileSections geo_deltas("geo entry delta", GEO_ENTRIES_FILES);
     EntriesFileSections cell_index_deltas("cell index delta", CELL_INDEX_ENTRIES_FILES);
-    // POI parent-id remap (from POI_PARENT_REMAP_MARKER), read where it sits.
-    // Applied during POI_RECORDS MATCH replay to byte 32 of each record
-    // alongside the str_remap on its string fields.
-    SortedTable<RemapPair> poi_admin_remap;
+    // The parent-id remap's street leg (POI_PARENT_REMAP_MARKER), read where
+    // it sits: the moved street ways, which complete the street replay's
+    // remap the address replay moves parent_way_id by.
     SortedTable<RemapPair> poi_street_remap;
     bool saw_parent_remap = false;  // a patch gives one
     auto poi_remap_lookup = [](const SortedTable<RemapPair>& t, uint32_t old_id) {
@@ -628,13 +628,9 @@ static int run(int argc, char* argv[]) {
         if (file_id == POI_PARENT_REMAP_MARKER) {
             if (saw_parent_remap) throw std::runtime_error("Malformed POI parent-id remap: a second one");
             saw_parent_remap = true;
-            ParentIdRemap r = parse_parent_id_remap(P, patch_size, pos);
-            if (!r.street.empty()) take_street_pairs("POI parent-id remap");
-            poi_admin_remap = std::move(r.admin);
-            poi_street_remap = std::move(r.street);
-            std::cerr << "  POI parent-id remap: admin_pairs=" << poi_admin_remap.size()
-                      << " street_pairs=" << poi_street_remap.size()
-                      << " postcode_pairs=" << r.n_postcode << std::endl;
+            poi_street_remap = parse_parent_id_remap(P, patch_size, pos);
+            if (!poi_street_remap.empty()) take_street_pairs("POI parent-id remap");
+            std::cerr << "  POI parent-id remap: street_pairs=" << poi_street_remap.size() << std::endl;
             continue;
         }
         if (file_id == CELL_INDEX_DELTA_MARKER) {
@@ -652,7 +648,11 @@ static int run(int argc, char* argv[]) {
         auto section_io = [&] { return " [" + io_delta(section_start, get_io_counters()) + "]"; };
         uint32_t stride = patch.u32();
         uint64_t old_size = patch.u64(), new_size = patch.u64();
-        if (file_id >= (uint32_t)PatchFileId::COUNT) { std::cerr << "Unknown file " << file_id << std::endl; return 1; }
+        // No patch sends the legacy strings.bin (file 0).
+        if (file_id >= (uint32_t)PatchFileId::COUNT || file_id == (uint32_t)PatchFileId::STRINGS) {
+            std::cerr << "Unknown file " << file_id << std::endl;
+            return 1;
+        }
         const char* fname = patch_file_names[file_id];
         require_old_file_size(cur_dir, fname, old_size);
 
@@ -750,9 +750,7 @@ static int run(int argc, char* argv[]) {
             const char* changes = patch.take_items(n_changes, 8, "parallel changes");
             constexpr uint32_t NO_DATA_VAL = 0xFFFFFFFFu;
             auto remap_value = [&](uint32_t v) -> uint32_t {
-                if (v == NO_DATA_VAL) return v;
-                if (remap_kind == 1) return poi_remap_lookup(poi_admin_remap, v);
-                if (remap_kind == 2) return str_remap_lookup(v);
+                if (v != NO_DATA_VAL && remap_kind == 2) return str_remap_lookup(v);
                 return v;
             };
             SequentialFileReader old(cur_dir + "/" + std::string(fname));
@@ -820,10 +818,10 @@ static int run(int argc, char* argv[]) {
             uint32_t value_stride = patch.u32();
             uint32_t remap_kind = patch.u32();
             uint32_t n_changes = patch.u32();
+            check_sparse_delta_header(file_id, value_stride, remap_kind);
             // Whole records only: a change writes its record whole, so one in
             // a part record would write past the file.
-            if ((value_stride != 4 && value_stride != 16) || new_size % value_stride)
-                throw std::runtime_error("Malformed sparse delta");
+            if (new_size % value_stride) throw std::runtime_error("Malformed sparse delta");
             const size_t change_size = 4 + value_stride;
             const char* changes = patch.take_items(n_changes, change_size, "sparse changes");
 
@@ -835,16 +833,10 @@ static int run(int argc, char* argv[]) {
             SequentialFileReader old(cur_dir + "/" + std::string(fname));
             const size_t copy_n = std::min<uint64_t>({old_size, new_size, old.size()});
             constexpr uint32_t NO_DATA_VAL = 0xFFFFFFFFu;
-            auto remap_value = [&](uint32_t v) -> uint32_t {
-                if (v == NO_DATA_VAL) return v;
-                if (remap_kind == 1) return poi_remap_lookup(poi_admin_remap, v);
-                return str_remap_lookup(v);
-            };
+            auto remap_value = [&](uint32_t v) -> uint32_t { return v == NO_DATA_VAL ? v : str_remap_lookup(v); };
             // Field of each record the remap applies to (postcode_id at
             // byte 8 of a 16-byte postcode_centroid), or none.
-            const bool remapped = (remap_kind == 1 && !poi_admin_remap.empty() && value_stride == 4) ||
-                                  (remap_kind == 2 && !str_remap.empty() && value_stride == 4) ||
-                                  (remap_kind == 3 && !str_remap.empty() && value_stride == 16);
+            const bool remapped = (remap_kind == 2 || remap_kind == 3) && !str_remap.empty();
             const size_t field = value_stride == 16 ? POSTCODE_CENTROID_POSTCODE_ID_OFF : 0;
 
             FILE* out = open_out(fname);
@@ -901,7 +893,6 @@ static int run(int argc, char* argv[]) {
         if (joint && actual_stride != joint_parent_stride(file_id))
             throw std::runtime_error(std::string("Malformed record stride: ") + fname);
         bool needs_remap = !string_fields.empty();
-        bool needs_padding = file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24;
 
         // Offset fixups, decoded lazily during merge replay (zero allocation).
         uint32_t n_fixup_runs = patch.u32(), n_fixup_values = patch.u32();
@@ -1001,7 +992,7 @@ static int run(int argc, char* argv[]) {
                 if (!run)
                     throw std::runtime_error(std::string("Malformed merge sequence: ") + fname + " (a MATCH run past the old file)");
                 const uint64_t run_bytes = *run;
-                if (!jc && !needs_remap && !needs_padding && remap_offs.empty() && !has_fixups) {
+                if (!jc && !needs_remap && remap_offs.empty() && !has_fixups) {
                     append_old_range(old, outf, old_bytes, run_bytes, fname);
                     written += run_bytes;
                     old_rec += count; new_rec += count; old_bytes += run_bytes;
@@ -1022,18 +1013,7 @@ static int run(int argc, char* argv[]) {
 
                         bool modified = false;
                         // Check if this record needs any modification
-                        if (!remap_offs.empty() || needs_padding) modified = true;
-                        // POI records: byte-32 parent_poly_id shifts with the
-                        // admin id-space. (name_id/parent_street_id/parent_postcode_id
-                        // are string offsets handled by remap_offs, which already
-                        // set modified=true above.)
-                        if (file_id == (uint32_t)PatchFileId::POI_RECORDS &&
-                            !poi_admin_remap.empty())
-                            modified = true;
-                        // PlaceNode parent_poly_id (byte 16) shifts with admin id-space.
-                        if (file_id == (uint32_t)PatchFileId::PLACE_NODES &&
-                            actual_stride >= 20 && !poi_admin_remap.empty())
-                            modified = true;
+                        if (!remap_offs.empty()) modified = true;
                         // AddrPoint parent_way_id (byte 16) shifts with street id-space.
                         if (file_id == (uint32_t)PatchFileId::ADDR_POINTS &&
                             actual_stride >= 20 && (street_rm || !poi_street_remap.empty()))
@@ -1048,9 +1028,6 @@ static int run(int argc, char* argv[]) {
 
                         if (modified) {
                             memcpy(rec_buf.data(), rec, actual_stride);
-                            // Apply padding zeroing
-                            if (file_id == (uint32_t)PatchFileId::ADMIN_POLYGONS && actual_stride == 24)
-                                memset(rec_buf.data() + 14, 0, 2); // preserve place_type_override at byte 13
                             // Apply string remap, or the field's string fixup
                             const uint64_t slot = uint64_t(old_rec + k) * remap_offs.size();
                             for (size_t f = 0; f < remap_offs.size(); f++) {
@@ -1058,31 +1035,6 @@ static int run(int argc, char* argv[]) {
                                 uint32_t v; memcpy(&v, rec_buf.data() + off, 4);
                                 uint32_t nv = string_fixups.fixes(slot + f) ? string_fixups.take() : str_remap.lookup(v, remap_hints[f]);
                                 if (nv != v) memcpy(rec_buf.data() + off, &nv, 4);
-                            }
-                            // Apply POI parent_poly_id remap (byte 32, admin
-                            // polygon index). Bytes 24/28 (parent_street_id,
-                            // parent_postcode_id) are string offsets and are
-                            // handled by the str_remap pass via remap_offs
-                            // above — NOT here. Mirrors geocoder_diff.cpp.
-                            if (file_id == (uint32_t)PatchFileId::POI_RECORDS) {
-                                constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
-                                if (actual_stride >= 36 && !poi_admin_remap.empty()) {
-                                    uint32_t pp; memcpy(&pp, rec_buf.data() + POI_RECORD_PARENT_POLY_ID_OFF, 4);
-                                    if (pp != NO_DATA) {
-                                        uint32_t npp = poi_remap_lookup(poi_admin_remap, pp);
-                                        if (npp != pp) memcpy(rec_buf.data() + POI_RECORD_PARENT_POLY_ID_OFF, &npp, 4);
-                                    }
-                                }
-                            }
-                            // PlaceNode parent_poly_id at byte 16 (20-byte stride).
-                            if (file_id == (uint32_t)PatchFileId::PLACE_NODES &&
-                                actual_stride >= 20 && !poi_admin_remap.empty()) {
-                                constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
-                                uint32_t pp; memcpy(&pp, rec_buf.data() + PLACE_NODE_PARENT_POLY_ID_OFF, 4);
-                                if (pp != NO_DATA) {
-                                    uint32_t npp = poi_remap_lookup(poi_admin_remap, pp);
-                                    if (npp != pp) memcpy(rec_buf.data() + PLACE_NODE_PARENT_POLY_ID_OFF, &npp, 4);
-                                }
                             }
                             // AddrPoint parent_way_id at byte 16 (20+ stride).
                             if (file_id == (uint32_t)PatchFileId::ADDR_POINTS &&
@@ -1381,9 +1333,8 @@ static int run(int argc, char* argv[]) {
             }
             log_phase((std::string("  ") + label).c_str(), t_entry);
         };
-        // Admin ids move by the admin leg of the parent-id remap, as the diff used it.
-        rebuild_cell_index("Admin", PatchFileId::ADMIN_ENTRIES, "admin", admin_cells,
-                           [&](uint32_t id) { return poi_remap_lookup(poi_admin_remap, id); });
+        // Admin polygons keep their slots: the old index's ids are the new ones.
+        rebuild_cell_index("Admin", PatchFileId::ADMIN_ENTRIES, "admin", admin_cells, [](uint32_t id) { return id; });
         // POI ids move by their replay's record remap, read in place by the
         // streaming pass (by id, so not as a sequential stream).
         rebuild_cell_index("POI", PatchFileId::POI_ENTRIES, "poi", poi_cells,

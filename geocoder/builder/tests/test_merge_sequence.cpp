@@ -436,6 +436,88 @@ TEST(build_identity_merge_seq_deletes_trailing_old_records) {
     CHECK(r.moved.empty());
 }
 
+namespace {
+
+// An arc index (a u32 offset per arc slot) of blocks laid out in slot order,
+// and its arc_vertices stream: block i of sizes[i] bytes, each byte labels[i].
+struct ArcIndex {
+    std::string index, stream;
+};
+
+ArcIndex arc_index_of(const std::vector<uint32_t>& sizes, const std::string& labels) {
+    ArcIndex a;
+    for (size_t i = 0; i < sizes.size(); i++) {
+        const uint32_t at = static_cast<uint32_t>(a.stream.size());
+        a.index.append(reinterpret_cast<const char*>(&at), 4);
+        a.stream.append(sizes[i], labels[i]);
+    }
+    return a;
+}
+
+// The arc_vertices merge along an arc_index merge, as the diff makes it.
+MergeSequence arc_blocks_along(const MergeSequence& parent, const ArcIndex& o, const ArcIndex& n) {
+    const VertexBlocks ob = vertex_blocks(o.index.data(), o.index.size(), 4, 0, o.stream.size());
+    const VertexBlocks nb = vertex_blocks(n.index.data(), n.index.size(), 4, 0, n.stream.size());
+    auto block = [](const VertexBlocks& b) {
+        return [&b](size_t i) { return ChildBlock{b.offsets[i], b.sizes[i]}; };
+    };
+    return merge_child_blocks(parent, 4, 1, o.stream.data(), o.stream.size(), n.stream.data(), n.stream.size(),
+                              block(ob), block(nb));
+}
+
+}  // namespace
+
+// The arc index merges by slot (geocoder-diff's slot_family), never by
+// content: arc c of five 10-byte arcs dies (its slot's block empties, so d's
+// and e's offsets move down 10 bytes) and an arc f is appended. Every slot
+// both days hold is a MATCH once it has its new offset, each old record takes
+// it, and the arc vertices lose c's block and gain f's, d and e MATCHing.
+// build_merge_seq's sequential path (stride 4) pairs the records by their
+// offsets instead: old d (30) with new e, old e (40) with new f, so the
+// vertices re-send d, e and f.
+TEST(build_slot_merge_seq_matches_every_arc_slot_both_days_hold) {
+    const ArcIndex o = arc_index_of({10, 10, 10, 10, 10}, "abcde"), n = arc_index_of({10, 10, 0, 10, 10, 10}, "abcdef");
+    std::string fixed = o.index;
+
+    const IdentityMerge slots = build_slot_merge_seq(fixed.data(), fixed.size(), n.index.data(), n.index.size(), 4, 0);
+
+    const std::string f_offset("\x28\0\0\0", 4);
+    CHECK(ops_of(slots.seq, 4) == (std::vector<Op>{{OP_MATCH_RUN, 5, ""}, {OP_INSERT_RUN, 1, f_offset}}));
+    CHECK(slots.matched_old == std::vector<uint8_t>(5, 1));
+    CHECK(slots.moved.empty());
+    CHECK_EQ(fixed, n.index.substr(0, 20));
+    CHECK(ops_of(arc_blocks_along(slots.seq, o, n), 1) ==
+          (std::vector<Op>{{OP_MATCH_RUN, 20, ""}, {OP_DELETE_RUN, 10, ""}, {OP_MATCH_RUN, 20, ""},
+                           {OP_INSERT_RUN, 10, std::string(10, 'f')}}));
+
+    const MergeSequence by_offsets = build_merge_seq(o.index.data(), o.index.size(), n.index.data(), n.index.size(), 4);
+    CHECK(ops_of(by_offsets, 4) == (std::vector<Op>{{OP_MATCH_RUN, 3, ""}, {OP_INSERT_RUN, 1, n.index.substr(12, 4)},
+                                                    {OP_MATCH_RUN, 2, ""}}));
+    CHECK(ops_of(arc_blocks_along(by_offsets, o, n), 1) ==
+          (std::vector<Op>{{OP_MATCH_RUN, 20, ""}, {OP_DELETE_RUN, 30, ""}, {OP_INSERT_RUN, 30, n.stream.substr(20, 30)}}));
+}
+
+// Admin polygon slots by position: a tombstone both days hold MATCHes in
+// place, a slot that dies or is recycled is a REPLACE, and the slots past
+// the old end INSERTs (past the new end, DELETEs). Keyed by liveness (the
+// identity merge over keys only live slots carry), each tombstone was a
+// DELETE and an INSERT.
+TEST(build_slot_merge_seq_keeps_tombstones_in_place) {
+    // a b - - c, then a - B - c d: b dies, slot 2 is recycled as B.
+    std::string o = records("ab--c");
+    const std::string n = records("a-B-cd");
+    const IdentityMerge r = build_slot_merge_seq(o.data(), o.size(), n.data(), n.size(), 12, 0);
+    CHECK(ops_of(r.seq, 12) == (std::vector<Op>{{OP_MATCH_RUN, 1, ""}, {OP_REPLACE_RUN, 2, records("-B")},
+                                                {OP_MATCH_RUN, 2, ""}, {OP_INSERT_RUN, 1, records("d")}}));
+    CHECK(r.matched_old == std::vector<uint8_t>({1, 0, 0, 1, 1}));
+    CHECK_EQ(r.n_insert, size_t(1));
+
+    std::string shrunk = records("ab--c");
+    const std::string fewer = records("ab-");
+    const IdentityMerge s = build_slot_merge_seq(shrunk.data(), shrunk.size(), fewer.data(), fewer.size(), 12, 0);
+    CHECK(ops_of(s.seq, 12) == (std::vector<Op>{{OP_MATCH_RUN, 3, ""}, {OP_DELETE_RUN, 2, ""}}));
+}
+
 TEST(merge_child_blocks_match_keeps_equal_blocks_and_resends_changed_ones) {
     MergeSequence parent;
     parent.add_match(2);

@@ -1,32 +1,11 @@
-// Admin polygons with holes, stored so that a plain crossing-number test
-// honours them ("keyhole" encoding).
-//
-// An admin polygon record covers one outer ring of its relation. The
-// relation's inner rings inside that outer ring (enclaves: the Vatican in
-// Italy and Rome, Büsingen in Switzerland, Baarle-Hertog's Belgian pieces in
-// the Netherlands) follow the outer ring in the same vertex range, each
-// reached by an excursion from the outer ring's first vertex v0:
-//
-//   v0 ... v0                      the outer ring, closed
-//   v0, c, h0 ... h0, c            per hole, with connector c = (v0.lat, h0.lng)
-//
-// and the range's closing edge (last c back to v0) ends the last excursion.
-// Every connector edge is horizontal (v0 - c) or vertical (c - h0) and is
-// walked once each way. A vertical edge never straddles a point's longitude.
-// A horizontal edge reaches exactly its own latitude at any longitude,
-// whichever way it is walked (its slope term is an exact zero), so its two
-// crossings cancel. A crossing-number test over the range (ring_contains,
-// the reader's point_in_polygon, and their axis-swapped variants) therefore
-// counts the rings' own edges only: a point is inside when it is inside the
-// outer ring and outside every hole, as Nominatim's PostGIS geometry has it.
-// Snapping the vertices to a grid keeps the connectors axis-aligned, as c
-// shares v0's latitude and h0's longitude bit for bit.
-//
-// Holes run against the outer ring, so the range's shoelace area is the
-// outer ring's minus the holes' (the connector terms cancel exactly).
-// AdminPolygon::hole_count says how many excursions follow the outer ring;
-// split_rings recovers the rings for the passes that need them one by one
-// (S2 covering, simplification).
+// Admin polygons with holes. An admin polygon record covers one outer ring
+// of its relation; the relation's rings inside that outer ring (enclaves: the
+// Vatican in Italy and Rome, Büsingen in Switzerland, Baarle-Hertog's Belgian
+// pieces in the Netherlands) are its holes, each a closed ring of its own.
+// The rings nest by geometry, as osmium nests them (enclosing_rings,
+// nest_rings). A crossing-number test over every ring of a polygon, counted
+// even-odd, puts a point inside the outer ring and outside every hole while
+// the rings nest (rings_nest), as Nominatim's PostGIS geometry has it.
 #pragma once
 
 #include <algorithm>
@@ -34,7 +13,6 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <string>
 #include <utility>
 #include <vector>
 
@@ -62,63 +40,8 @@ struct RingSpan {
     uint32_t count;
 };
 
-// Vertices of one excursion beyond its hole ring: v0, c before it and c after.
-static constexpr uint32_t kExcursionConnectors = 3;
 // A closed ring's fewest vertices (a triangle and its closing vertex).
 static constexpr uint32_t kMinClosedRing = 4;
-
-// The keyhole vertex range of a closed outer ring and closed holes.
-inline std::vector<LatLng> encode_rings(const std::vector<LatLng>& outer,
-                                        const std::vector<std::vector<LatLng>>& holes) {
-    size_t total = outer.size();
-    for (const auto& h : holes) total += h.size() + kExcursionConnectors;
-    std::vector<LatLng> out;
-    out.reserve(total);
-    out.insert(out.end(), outer.begin(), outer.end());
-    const LatLng v0 = outer.front();
-    for (const auto& h : holes) {
-        const LatLng c{v0.first, h.front().second};
-        out.push_back(v0);
-        out.push_back(c);
-        out.insert(out.end(), h.begin(), h.end());
-        out.push_back(c);
-    }
-    return out;
-}
-
-// The outer ring (first) and the holes of a keyhole range of n vertices with
-// `holes` excursions, or false when the range doesn't parse as that (spans
-// then holds the whole range as one ring). Excursions are peeled off the end:
-// each is v0, c, h0 ... h0, c, so the hole ring starts at the last h0 that
-// follows v0 and c.
-template <class P>
-bool split_rings(const P* v, uint32_t n, uint16_t holes, std::vector<RingSpan>& spans) {
-    spans.clear();
-    uint32_t end = n;
-    bool ok = true;
-    for (uint16_t k = 0; k < holes && ok; k++) {
-        ok = false;
-        if (end < kMinClosedRing + kExcursionConnectors + kMinClosedRing) break;
-        const P& c = v[end - 1];
-        const P& h0 = v[end - 2];
-        for (uint32_t j = end - 1 - kMinClosedRing; j >= kMinClosedRing + 2; j--) {
-            if (same_vertex(v[j], h0) && same_vertex(v[j - 1], c) && same_vertex(v[j - 2], v[0])) {
-                spans.push_back({j, end - 1 - j});
-                end = j - 2;
-                ok = true;
-                break;
-            }
-        }
-    }
-    if (ok && (end < kMinClosedRing || !same_vertex(v[end - 1], v[0]))) ok = false;
-    if (!ok) {
-        spans.assign(1, RingSpan{0, n});
-        return false;
-    }
-    spans.push_back({0, end});
-    std::reverse(spans.begin(), spans.end());
-    return true;
-}
 
 // Twice the signed shoelace area of a closed ring, in degrees squared.
 template <class P>
@@ -309,7 +232,7 @@ std::vector<NestedPolygon<P>> nest_rings(std::vector<std::vector<P>> rings, cons
 // --- Ring topology ---
 //
 // The crossing-number test counts a point inside when an odd number of the
-// range's rings hold it. That is the outer ring minus the holes only while
+// polygon's rings hold it. That is the outer ring minus the holes only while
 // every hole lies inside the outer ring and no two holes overlap: the part of
 // a hole outside the outer ring counts as inside, and so does the overlap of
 // two holes. Simplifying each ring on its own can break this near a boundary
@@ -381,8 +304,8 @@ private:
     std::vector<std::vector<uint32_t>> bands_;
 };
 
-// Whether a crossing-number test over the keyhole range of these closed
-// rings gives the outer ring minus the holes: no edge of one ring crosses an
+// Whether a crossing-number test over these closed rings, counted even-odd,
+// gives the outer ring minus the holes: no edge of one ring crosses an
 // edge of another, every hole lies inside the outer ring, and no hole inside
 // (or on top of) another. Rings may touch, at a vertex or along an edge they
 // share, as OSM's enclaves do.
@@ -560,132 +483,3 @@ inline bool rings_nest(const std::vector<LatLng>& outer, const std::vector<std::
     }
     return true;
 }
-
-// simplify_rings simplifies rings that don't nest again with the tolerance
-// halved, up to this many times.
-static constexpr uint8_t kToleranceHalvings = 8;
-// SimplifiedRings::halvings when no tolerance nested the rings and they were
-// kept as given.
-static constexpr uint8_t kKeptUnsimplified = kToleranceHalvings + 1;
-
-// A polygon's keyhole range as simplify_rings made it.
-struct SimplifiedRings {
-    std::vector<LatLng> range;
-    uint16_t holes = 0;  // excursions in the range
-    // Halvings of the tolerance it took for the simplified rings to nest, or
-    // kKeptUnsimplified.
-    uint8_t halvings = 0;
-    // False when the rings don't nest as given either, so no tolerance can
-    // keep them nesting; the range then holds them at the smallest tolerance
-    // tried (halvings is kToleranceHalvings).
-    bool nests = true;
-};
-
-// The outer ring and the holes `simplify` (closed ring in, closed ring out)
-// leaves: holes that collapse below a triangle are dropped, the rest turned
-// against the outer ring, at most 65535 (the largest), put in a canonical
-// order (by first vertex). No holes when the outer ring collapses.
-template <class Simplify>
-std::pair<std::vector<LatLng>, std::vector<std::vector<LatLng>>> simplified_rings(
-    const std::vector<LatLng>& outer, const std::vector<std::vector<LatLng>>& holes, Simplify simplify) {
-    std::pair<std::vector<LatLng>, std::vector<std::vector<LatLng>>> rings{simplify(outer), {}};
-    const std::vector<LatLng>& out = rings.first;
-    std::vector<std::vector<LatLng>>& kept = rings.second;
-    if (holes.empty() || out.size() < kMinClosedRing) return rings;
-    const bool outer_ccw = signed_area2(out) > 0;
-    for (const auto& h : holes) {
-        std::vector<LatLng> s = simplify(h);
-        if (s.size() < kMinClosedRing || !same_vertex(s.front(), s.back())) continue;
-        if ((signed_area2(s) > 0) == outer_ccw) std::reverse(s.begin(), s.end());
-        kept.push_back(std::move(s));
-    }
-    if (kept.size() > std::numeric_limits<uint16_t>::max()) {
-        std::stable_sort(kept.begin(), kept.end(), [](const auto& a, const auto& b) {
-            return std::fabs(signed_area2(a)) > std::fabs(signed_area2(b));
-        });
-        kept.resize(std::numeric_limits<uint16_t>::max());
-    }
-    std::stable_sort(kept.begin(), kept.end(), [](const auto& a, const auto& b) { return a.front() < b.front(); });
-    return rings;
-}
-
-// The keyhole range of a closed outer ring and its closed holes once each
-// has been simplified on its own by `simplify` (ring, tolerance scale) ->
-// ring, the scale a factor on the caller's tolerance. Rings simplified on
-// their own can stop nesting (rings_nest); the polygon is then simplified
-// again from its given rings at half the tolerance, up to kToleranceHalvings
-// times, and failing that kept as given, so the range nests whenever the
-// given rings do. Given rings that don't nest (a hole across its outer ring
-// in the source, or touching rings rounded a little apart) can't be kept
-// nesting by any tolerance: they're left at the smallest tolerance tried,
-// each ring within tolerance / 2^kToleranceHalvings of its given self,
-// rather than at full size. Each step depends on the rings alone, so the
-// result is deterministic. Without holes the range is just the simplified
-// outer ring.
-template <class Simplify>
-SimplifiedRings simplify_rings(const std::vector<LatLng>& outer, const std::vector<std::vector<LatLng>>& holes,
-                               Simplify simplify) {
-    SimplifiedRings result;
-    double scale = 1;
-    auto at_scale = [&](const std::vector<LatLng>& ring) { return simplify(ring, scale); };
-    auto rings = simplified_rings(outer, holes, at_scale);
-    while (!rings_nest(rings.first, rings.second)) {
-        if (result.halvings == kToleranceHalvings) {
-            auto given = simplified_rings(outer, holes, [](const std::vector<LatLng>& ring) { return ring; });
-            result.nests = rings_nest(given.first, given.second);
-            if (result.nests) {
-                result.halvings = kKeptUnsimplified;
-                rings = std::move(given);
-            }
-            break;
-        }
-        result.halvings++;
-        scale /= 2;
-        rings = simplified_rings(outer, holes, at_scale);
-    }
-
-    auto& [out, kept] = rings;
-    result.range = std::move(out);
-    if (kept.empty()) return result;
-    std::vector<LatLng> range = encode_rings(result.range, kept);
-    const auto count = static_cast<uint16_t>(kept.size());
-    // The excursions must peel off again as the same rings.
-    std::vector<RingSpan> spans;
-    bool round_trip = split_rings(range.data(), static_cast<uint32_t>(range.size()), count, spans) &&
-                      spans[0].count == result.range.size();
-    for (size_t k = 0; round_trip && k < kept.size(); k++) round_trip = spans[k + 1].count == kept[k].size();
-    if (!round_trip) return result;
-    result.range = std::move(range);
-    result.holes = count;
-    return result;
-}
-
-// How simplify_rings fared over many polygons, for the build log.
-struct HoleTopologyCounts {
-    uint64_t halved[kToleranceHalvings + 1] = {};  // [k]: nested after k halvings, k > 0
-    uint64_t unsimplified = 0;                      // kept as given
-    uint64_t not_nesting = 0;                       // not nesting as given either
-
-    void add(uint8_t halvings, bool nests) {
-        if (!nests) {
-            not_nesting++;
-        } else if (halvings == kKeptUnsimplified) {
-            unsimplified++;
-        } else if (halvings > 0) {
-            halved[halvings]++;
-        }
-    }
-    // "<n> polygons simplified again (tolerance/2 a, /4 b, ...), <m> kept unsimplified, <k> not nesting as
-    // given (at tolerance/<2^kToleranceHalvings>)"
-    std::string summary() const {
-        uint64_t again = 0;
-        std::string by_halving;
-        for (size_t k = 1; k <= kToleranceHalvings; k++) {
-            again += halved[k];
-            by_halving += (k == 1 ? "tolerance/" : ", /") + std::to_string(1u << k) + " " + std::to_string(halved[k]);
-        }
-        return std::to_string(again) + " polygons simplified again (" + by_halving + "), " +
-               std::to_string(unsimplified) + " kept unsimplified, " + std::to_string(not_nesting) +
-               " not nesting as given (at tolerance/" + std::to_string(1u << kToleranceHalvings) + ")";
-    }
-};

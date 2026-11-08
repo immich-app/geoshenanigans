@@ -71,9 +71,11 @@ cargo build --release --manifest-path server/Cargo.toml
 ```
 
 The server downloads a continent from the latest build the first time a query
-lands in it: `admin` mode, `q2.5` boundaries and no POIs unless an admin sets
+lands in it: `admin` mode, `simplified` boundaries and no POIs unless an admin sets
 another selection with `PUT /admin/configuration` (a JSON body of `base_url`,
-`mode`, `quality`, `poi_tier` and the regions to `preload`). Queries need an
+`mode`, `quality`, `poi_tier` and the regions to `preload`). A value the build
+doesn't offer fails each download, naming those it does, and the PUT is refused
+with them (400) when the server has the build's manifest at hand. Queries need an
 API key from the dashboard (see Authentication below).
 
 The test portal is a map page for checking answers, served by every query
@@ -154,9 +156,9 @@ in [PATCHING.md](PATCHING.md) and `builder/configurations.template.json`.
 | `interp_entries.bin`, `interp_ways.bin`, `interp_nodes.bin` | Interpolation way IDs per cell, way headers, node coordinates |
 | `interp_postcodes.bin` | Per interpolation way: its TIGER ZIP (TIGER regions only) |
 | `admin_cells.bin`, `admin_entries.bin` | S2 cell index for admin boundaries |
-| `admin_polygons.bin`, `admin_vertices.bin` | Admin polygon metadata and vertices (per quality variant) |
+| `admin_polygons.bin`, `admin_rings.bin` | Admin polygon records (postcode areas among them, at level 11) and their rings, as refs to arcs |
+| `arc_index.bin`, `arc_vertices.bin` | The boundary arcs those rings share, each border once (per boundary tier: `quality/simplified` or `quality/exact`) |
 | `admin_parents.bin` | Per admin polygon: the next larger polygon containing it |
-| `postal_polygons.bin`, `postal_vertices.bin` | Postal code boundaries (per quality variant, where they exist) |
 | `place_nodes.bin` | Place nodes (city, town, village, suburb, ...); the first load derives their cell index into `derived/` |
 | `postcode_centroids.bin`, `postcode_centroid_cells.bin`, `postcode_centroid_entries.bin` | Postcode centroids and their cell index |
 | `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin` | Points of interest and their cell index |
@@ -196,20 +198,23 @@ cargo build --release --manifest-path server/Cargo.toml
 
 ```bash
 # Create index from PBF file, into a new or empty output-dir (it refuses any other:
-# an earlier build's files left there would be published as this one's)
+# an earlier build's files left there would be published as this one's). The index
+# is output-dir/planet; with --continents, each continent's dir beside it is one too
 ./build/build-index output-dir input.osm.pbf [input2.osm.pbf ...]
 
-# Start the server
-./server/target/release/query-server output-dir [bind-address]
+# Start the server (on output-dir instead, a --continents build serves continent by continent)
+./server/target/release/query-server output-dir/planet [bind-address]
 
 # Start with automatic HTTPS (certificates cached in --cache, default acme-cache)
-./server/target/release/query-server output-dir --domain geocoder.example.com
+./server/target/release/query-server output-dir/planet --domain geocoder.example.com
 ```
 
 ### Planet builds
 
 A full planet build (`--continents --multi-output --multi-quality`, the
-nightly's configuration) takes about 5 minutes on 64 cores and fits in
+nightly's configuration; `--multi-quality` writes the two boundary tiers,
+`quality/simplified` and `quality/exact`, which `--multi-output` needs: its
+mode dirs hold no admin geometry and are read beside a tier) takes about 5 minutes on 64 cores and fits in
 80 GB of RAM (6.5 minutes there): the write phase sizes how much it runs at
 once to the memory limit, the smaller of MemTotal and the process's cgroup
 limit. Set

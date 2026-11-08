@@ -19,10 +19,11 @@
 # a diff peaks at about 2 × its old + new non-string .bin bytes plus 14 × the
 # string tiers it loads, its own or borrowed from ../full. Measured vs
 # estimated GiB: planet/full 114.8 vs 122.5, planet/poi/all 24.6 vs 25.1,
-# planet/quality/q2.5 5.4 vs 9.7. The budget is 3/4 of the memory available at
-# start, or of the job's cgroup limit if lower. A variant holds its estimate
-# only while its diff runs: the patch + verify after it stream in about 10 MiB,
-# so they run alongside later diffs. At most nproc jobs run at once.
+# planet/quality/exact 1.5 vs 11.0 (its admin geometry merged by slot). The
+# budget is 3/4 of the memory available at start, or of the job's cgroup limit
+# if lower. A variant holds its estimate only while its diff runs: the patch
+# + verify after it stream in about 10 MiB, so they run alongside later diffs.
+# At most nproc jobs run at once.
 #
 # Env: GEOCODER_DIFF, GEOCODER_PATCH (default: on PATH).
 set -uo pipefail

@@ -72,15 +72,15 @@ struct EncodeScratch {
     DecodedArc decoded;
 };
 
-// Tier t's arc blocks, each checked: it decodes to the vertices the tier
-// stores, and those are raw vertices of the arc, ascending from its first,
-// snapped to the tier's grid, within kChunkBoxSlackE7 of them, ending where
-// the arc does.
+// Tier t's arc blocks, each on its own grid (arc_grid_exponent) and checked:
+// it decodes to the vertices the tier stores, and those are raw vertices of
+// the arc, ascending from its first, each snapped to its own grid
+// (vertex_grid_e7, no finer than the block's), within kChunkBoxSlackE7 of
+// them, ending where the arc does.
 ArcBlocks encode_tier(const AdminArcs& arcs, const AdminExactRings& store, size_t t, unsigned threads) {
     const ArcTier& tier = kArcTiers[t];
     const ArcTierState& state = arcs.tiers[t];
     const size_t n = tier.set == ArcSet::Full ? arcs.arcs.size() : arcs.minimal.arcs.size();
-    const uint8_t k = arc_blocks::grid_exponent(tier.grid_e7);
     std::vector<EncodeScratch> scratch(threads);
     auto stored_of = [&](size_t a, EncodeScratch& s) {
         tier_vertices(arcs, store, tier, state, static_cast<uint32_t>(a), s.raw, s.stored);
@@ -91,29 +91,37 @@ ArcBlocks encode_tier(const AdminArcs& arcs, const AdminExactRings& store, size_
     lay_out_blocks(n, out.bytes, out.at,
         [&](size_t a, unsigned worker) {
             EncodeScratch& s = scratch[worker];
+            const uint8_t k = arc_grid_exponent(tier, state.grid_of(static_cast<uint32_t>(a)));
             return arc_blocks::encode_arc(stored_of(a, s), at_of(s), k, nullptr);
         },
         [&](size_t a, uint8_t* to, unsigned worker) {
             EncodeScratch& s = scratch[worker];
+            const uint8_t e7_grid = state.grid_of(static_cast<uint32_t>(a));
+            const uint8_t k = arc_grid_exponent(tier, e7_grid);
             const size_t count = stored_of(a, s);
             const size_t bytes = arc_blocks::encode_arc(count, at_of(s), k, to);
             auto fail = [&](const std::string& what) {
                 check_failed("arc " + std::to_string(a) + " of " + tier.dir + " " + what);
             };
-            if (!arc_blocks::decode_arc(to, bytes, s.decoded) || s.decoded.vertices.size() != count)
+            if (!arc_blocks::decode_arc(to, bytes, s.decoded) || s.decoded.vertices.size() != count ||
+                s.decoded.k != k)
                 fail("doesn't decode to the " + std::to_string(count) + " vertices it stores");
+            const uint32_t raw_count = static_cast<uint32_t>(s.raw.size());
+            const int32_t block_grid = arc_blocks::grid_step(k);
             for (size_t i = 0; i < count; i++) {
                 const StoredVertex& v = s.stored[i];
                 if (s.decoded.vertices[i] != v.at) fail("decodes vertex " + std::to_string(i) + " elsewhere");
-                if (v.raw >= s.raw.size() || (i > 0 && v.raw <= s.stored[i - 1].raw) || (i == 0 && v.raw != 0))
+                if (v.raw >= raw_count || (i > 0 && v.raw <= s.stored[i - 1].raw) || (i == 0 && v.raw != 0))
                     fail("stores its raw vertices out of order");
                 const PackedLocation raw = s.raw[v.raw];
-                if (v.at != snapped(raw, tier.grid_e7)) fail("stores a vertex no raw one snaps to");
+                const int32_t grid = vertex_grid_e7(tier, e7_grid, v.raw, raw_count);
+                if (grid < block_grid || v.at != snapped(raw, grid)) fail("stores a vertex no raw one snaps to");
                 if (std::abs(int64_t(v.at.lat_e7) - raw.lat_e7) > kChunkBoxSlackE7 ||
                     std::abs(int64_t(v.at.lon_e7) - raw.lon_e7) > kChunkBoxSlackE7)
                     fail("stores a vertex past the chunk slack from its raw one");
             }
-            if (s.stored.back().at != snapped(s.raw.back(), tier.grid_e7)) fail("doesn't end where its raw vertices do");
+            if (s.stored.back().at != snapped(s.raw.back(), vertex_grid_e7(tier, e7_grid, raw_count - 1, raw_count)))
+                fail("doesn't end where its raw vertices do");
             return bytes;
         },
         std::string(tier.dir) + " arc_vertices", threads);
@@ -142,6 +150,39 @@ void check_chains_close(const AdminArcs& arcs, const AdminExactRings& store, Arc
                 if (ends(refs[first + i]).second != ends(refs[first + (i + 1) % n]).first)
                     check_failed(std::string("ring ") + std::to_string(r) + "'s " + set_name(set) +
                                  " refs don't chain at ref " + std::to_string(i));
+        }
+    }, threads);
+}
+
+// Whether each ring's arcs, as tier t's blocks hold them, chain: the stored
+// junction one arc ends at is the one the next starts at, whichever grid
+// each arc is on.
+void check_stored_chains_close(const AdminArcs& arcs, const AdminExactRings& store, size_t t, const ArcBlocks& blocks,
+                               unsigned threads) {
+    const bool full = kArcTiers[t].set == ArcSet::Full;
+    const std::vector<uint32_t>& ring_refs = full ? arcs.ring_refs : arcs.minimal.ring_refs;
+    const std::vector<ArcRef>& refs = full ? arcs.refs : arcs.minimal.refs;
+    // Each arc's first and last stored vertex.
+    std::vector<std::pair<PackedLocation, PackedLocation>> ends(blocks.size());
+    std::vector<DecodedArc> decoded(threads);
+    parallel_for_dynamic(blocks.size(), 256, [&](size_t begin, size_t end, unsigned worker) {
+        for (size_t a = begin; a < end; a++) {
+            if (!arc_blocks::decode_arc(blocks.data(a), blocks.bytes_of(a), decoded[worker]))
+                check_failed(std::string("arc ") + std::to_string(a) + " of " + kArcTiers[t].dir + " doesn't decode");
+            ends[a] = {decoded[worker].vertices.front(), decoded[worker].vertices.back()};
+        }
+    }, threads);
+    parallel_for(store.rings.size(), [&](size_t begin, size_t end, unsigned) {
+        for (size_t r = begin; r < end; r++) {
+            const uint32_t first = ring_refs[r], n = ring_refs[r + 1] - first;
+            auto walked = [&](const ArcRef& ref) {
+                const auto& e = ends[ref.arc];
+                return ref.reversed ? std::make_pair(e.second, e.first) : e;
+            };
+            for (uint32_t i = 0; i < n; i++)
+                if (walked(refs[first + i]).second != walked(refs[first + (i + 1) % n]).first)
+                    check_failed(std::string("ring ") + std::to_string(r) + "'s arcs in " + kArcTiers[t].dir +
+                                 " don't chain at ref " + std::to_string(i));
         }
     }, threads);
 }
@@ -346,6 +387,7 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
     log_phase("      Admin arcs: chains close", t, cpu);
     for (size_t k = 0; k < kArcTierCount; k++) {
         out.tiers[k] = encode_tier(arcs, store, k, threads);
+        check_stored_chains_close(arcs, store, k, out.tiers[k], threads);
         log_phase((std::string("      Admin arcs: encode ") + kArcTiers[k].dir).c_str(), t, cpu);
     }
     for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) encode_ring_blocks(out, set, threads);
@@ -382,6 +424,7 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
                  << " validity_restored=" << tc.validity_restored << " degenerate_rings=" << tc.degenerate_rings
                  << " crossings_simplified=" << tc.crossings_simplified << " repair_rounds=" << tc.repair_rounds
                  << " repair_restored=" << tc.repair_restored << " nesting_restored=" << tc.nesting_restored
+                 << " e7_grid_rounds=" << tc.e7_grid_rounds << " e7_grid_arcs=" << tc.e7_grid_arcs
                  << " crossings_left=" << tc.crossings_left << " unrepairable_segments=" << tc.unrepairable_segments
                  << " raw_crossings=" << tc.raw_crossings << " rings_nest_introduced=" << tc.rings_nest_introduced;
         line << "\n";
@@ -453,7 +496,9 @@ void assign_region_arc_slots(AdminArcBlocks& blocks, const std::string& prev_reg
     line << "  " << region << " arcs:";
     for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
         ArcSetBlocks& s = blocks.set(set);
-        ArcSlots slots = allocate_arc_slots(s.keys, prev_region_dir.empty() ? "" : arc_sidecar_path(prev_region_dir, set));
+        const std::string prev = prev_region_dir.empty() ? "" : arc_sidecar_path(prev_region_dir, set);
+        ArcSlots slots = allocate_arc_slots(s.keys, prev);
+        std::cerr << arc_slot_start_lines(region, set, prev, slots.counts);
         s.slots = std::move(slots.slots);
         s.sidecar = std::move(slots.sidecar);
         s.slot_counts = slots.counts;
@@ -484,28 +529,30 @@ void write_arc_files(const std::string& dir, const ArcSetBlocks& set, const ArcB
     write_binary_file(dir + "/arc_index.bin", reinterpret_cast<const char*>(index.data()), index.size() * sizeof(uint32_t));
 }
 
-size_t write_ring_files(const std::string& dir, const AdminArcBlocks& blocks, ArcSet set,
+size_t write_ring_files(const std::vector<std::string>& dirs, const AdminArcBlocks& blocks, ArcSet set,
                         std::vector<AdminPolygon> records, const std::vector<uint32_t>& polygon_of) {
     if (records.size() != polygon_of.size()) throw std::logic_error("admin records out of step with their polygons");
     const ArcSetBlocks& s = blocks.set(set);
-    const std::string path = dir + "/admin_rings.bin";
-    std::ofstream f(path, std::ios::binary);
+    std::vector<std::ofstream> files;
+    for (const std::string& dir : dirs) files.emplace_back(dir + "/admin_rings.bin", std::ios::binary);
     uint64_t at = 0;
     for (size_t slot = 0; slot < records.size(); slot++) {
         if (polygon_of[slot] == NO_DATA) continue;
         const AdminArcPolygon& p = blocks.polygons[polygon_of[slot]];
         const BlockSpan span = p.blocks[set_index(set)];
         AdminPolygon& r = records[slot];
-        r.vertex_offset = static_cast<uint32_t>(at);
-        r.vertex_count = span.size;
+        r.ring_offset = static_cast<uint32_t>(at);
+        r.ring_bytes = span.size;
         r.hole_count = static_cast<uint16_t>(std::min<uint32_t>(p.ring_count ? p.ring_count - 1 : 0, UINT16_MAX));
-        f.write(reinterpret_cast<const char*>(s.ring_blocks.data() + span.offset), span.size);
+        for (std::ofstream& f : files) f.write(reinterpret_cast<const char*>(s.ring_blocks.data() + span.offset), span.size);
         at += span.size;
-        if (at > UINT32_MAX) throw std::length_error(path + " past 4 GiB: admin_polygons.bin holds 32-bit offsets");
+        if (at > UINT32_MAX) throw std::length_error("admin_rings.bin past 4 GiB: admin_polygons.bin holds 32-bit offsets");
     }
-    f.flush();
-    if (!f) throw std::runtime_error("failed to write " + path);
-    write_binary_file(dir + "/admin_polygons.bin", reinterpret_cast<const char*>(records.data()),
-                      records.size() * sizeof(AdminPolygon));
+    for (size_t d = 0; d < dirs.size(); d++) {
+        files[d].flush();
+        if (!files[d]) throw std::runtime_error("failed to write " + dirs[d] + "/admin_rings.bin");
+        write_binary_file(dirs[d] + "/admin_polygons.bin", reinterpret_cast<const char*>(records.data()),
+                          records.size() * sizeof(AdminPolygon));
+    }
     return at;
 }

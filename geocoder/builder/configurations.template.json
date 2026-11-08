@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "build": {
-    "version": 17,
-    "patch_version": 13
+    "version": 18,
+    "patch_version": 14
   },
   "axes": {
     "region": {
@@ -70,57 +70,27 @@
         },
         "admin-minimal": {
           "label": "Admin minimal",
-          "description": "Admin boundaries + place nodes only — no postcodes, no postal polygons. Smallest possible deployable. Country/state/city + cities500-equivalent place names.",
+          "description": "Admin boundaries + place nodes only — no postcodes, no postcode areas. Smallest possible deployable. Country/state/city + cities500-equivalent place names.",
           "order": 4
         }
       }
     },
     "quality": {
       "label": "Boundary precision",
-      "description": "Higher quality = sharper admin polygon edges but larger download. Default q2.5 is invisible at typical photo-GPS accuracy.",
+      "description": "Each border is stored once, shared by the boundaries on either side of it. Default simplified is invisible at typical photo-GPS accuracy.",
       "order": 3,
       "values": {
-        "uncapped": {
-          "label": "Uncapped",
+        "exact": {
+          "label": "Exact",
           "precision_m": 0,
-          "description": "Full vertex precision (<1m).",
+          "description": "Every OSM point.",
           "order": 1
         },
-        "q0.2": {
-          "label": "q0.2",
-          "precision_m": 3,
-          "description": "~3m boundary precision.",
+        "simplified": {
+          "label": "Simplified",
+          "precision_m": 37.5,
+          "description": "~37 m boundaries, shared by neighbours.",
           "order": 2
-        },
-        "q0.5": {
-          "label": "q0.5",
-          "precision_m": 7,
-          "description": "~7m boundary precision.",
-          "order": 3
-        },
-        "q1": {
-          "label": "q1",
-          "precision_m": 15,
-          "description": "~15m boundary precision.",
-          "order": 4
-        },
-        "q1.5": {
-          "label": "q1.5",
-          "precision_m": 22,
-          "description": "~22m boundary precision.",
-          "order": 5
-        },
-        "q2": {
-          "label": "q2",
-          "precision_m": 30,
-          "description": "~30m boundary precision.",
-          "order": 6
-        },
-        "q2.5": {
-          "label": "q2.5",
-          "precision_m": 37,
-          "description": "~37m boundary precision.",
-          "order": 7
         }
       }
     },
@@ -154,14 +124,14 @@
   },
   "constraints": [
     {
-      "id": "admin-minimal-needs-q2.5",
+      "id": "admin-minimal-needs-simplified",
       "when": {
         "mode": "admin-minimal"
       },
       "requires": {
-        "quality": "q2.5"
+        "quality": "simplified"
       },
-      "message": "Admin minimal mode is only built at q2.5 — the whole point is the smallest possible deployable."
+      "message": "Admin minimal mode is only built with simplified boundaries — the whole point is the smallest possible deployable."
     }
   ],
   "components": {
@@ -184,16 +154,18 @@
         "{region}/admin-minimal/admin_cells.bin",
         "{region}/admin-minimal/admin_entries.bin",
         "{region}/admin-minimal/admin_polygons.bin",
-        "{region}/admin-minimal/admin_vertices.bin",
+        "{region}/admin-minimal/admin_rings.bin",
+        "{region}/admin-minimal/arc_index.bin",
+        "{region}/admin-minimal/arc_vertices.bin",
         "{region}/admin-minimal/place_nodes.bin",
         "{region}/admin-minimal/strings_core.bin",
         "{region}/admin-minimal/strings_layout.json"
       ],
       "replaces": [
         "{region}/quality/{quality}/admin_polygons.bin",
-        "{region}/quality/{quality}/admin_vertices.bin",
-        "{region}/quality/{quality}/postal_polygons.bin",
-        "{region}/quality/{quality}/postal_vertices.bin"
+        "{region}/quality/{quality}/admin_rings.bin",
+        "{region}/quality/{quality}/arc_index.bin",
+        "{region}/quality/{quality}/arc_vertices.bin"
       ]
     },
     "dir.admin-minimal-poi": {
@@ -202,16 +174,18 @@
         "{region}/admin-minimal-poi/admin_cells.bin",
         "{region}/admin-minimal-poi/admin_entries.bin",
         "{region}/admin-minimal-poi/admin_polygons.bin",
-        "{region}/admin-minimal-poi/admin_vertices.bin",
+        "{region}/admin-minimal-poi/admin_rings.bin",
+        "{region}/admin-minimal-poi/arc_index.bin",
+        "{region}/admin-minimal-poi/arc_vertices.bin",
         "{region}/admin-minimal-poi/place_nodes.bin",
         "{region}/admin-minimal-poi/strings_core.bin",
         "{region}/admin-minimal-poi/strings_layout.json"
       ],
       "replaces": [
         "{region}/quality/{quality}/admin_polygons.bin",
-        "{region}/quality/{quality}/admin_vertices.bin",
-        "{region}/quality/{quality}/postal_polygons.bin",
-        "{region}/quality/{quality}/postal_vertices.bin"
+        "{region}/quality/{quality}/admin_rings.bin",
+        "{region}/quality/{quality}/arc_index.bin",
+        "{region}/quality/{quality}/arc_vertices.bin"
       ]
     },
     "mode.admin": {
@@ -284,74 +258,20 @@
         "{region}/full/postcode_centroid_entries.bin"
       ]
     },
-    "quality.uncapped": {
+    "quality.simplified": {
       "files": [
-        "{region}/quality/uncapped/admin_polygons.bin",
-        "{region}/quality/uncapped/admin_vertices.bin"
-      ],
-      "optional_files": [
-        "{region}/quality/uncapped/postal_polygons.bin",
-        "{region}/quality/uncapped/postal_vertices.bin"
+        "{region}/quality/simplified/admin_polygons.bin",
+        "{region}/quality/simplified/admin_rings.bin",
+        "{region}/quality/simplified/arc_index.bin",
+        "{region}/quality/simplified/arc_vertices.bin"
       ]
     },
-    "quality.q0.2": {
+    "quality.exact": {
       "files": [
-        "{region}/quality/q0.2/admin_polygons.bin",
-        "{region}/quality/q0.2/admin_vertices.bin"
-      ],
-      "optional_files": [
-        "{region}/quality/q0.2/postal_polygons.bin",
-        "{region}/quality/q0.2/postal_vertices.bin"
-      ]
-    },
-    "quality.q0.5": {
-      "files": [
-        "{region}/quality/q0.5/admin_polygons.bin",
-        "{region}/quality/q0.5/admin_vertices.bin"
-      ],
-      "optional_files": [
-        "{region}/quality/q0.5/postal_polygons.bin",
-        "{region}/quality/q0.5/postal_vertices.bin"
-      ]
-    },
-    "quality.q1": {
-      "files": [
-        "{region}/quality/q1/admin_polygons.bin",
-        "{region}/quality/q1/admin_vertices.bin"
-      ],
-      "optional_files": [
-        "{region}/quality/q1/postal_polygons.bin",
-        "{region}/quality/q1/postal_vertices.bin"
-      ]
-    },
-    "quality.q1.5": {
-      "files": [
-        "{region}/quality/q1.5/admin_polygons.bin",
-        "{region}/quality/q1.5/admin_vertices.bin"
-      ],
-      "optional_files": [
-        "{region}/quality/q1.5/postal_polygons.bin",
-        "{region}/quality/q1.5/postal_vertices.bin"
-      ]
-    },
-    "quality.q2": {
-      "files": [
-        "{region}/quality/q2/admin_polygons.bin",
-        "{region}/quality/q2/admin_vertices.bin"
-      ],
-      "optional_files": [
-        "{region}/quality/q2/postal_polygons.bin",
-        "{region}/quality/q2/postal_vertices.bin"
-      ]
-    },
-    "quality.q2.5": {
-      "files": [
-        "{region}/quality/q2.5/admin_polygons.bin",
-        "{region}/quality/q2.5/admin_vertices.bin"
-      ],
-      "optional_files": [
-        "{region}/quality/q2.5/postal_polygons.bin",
-        "{region}/quality/q2.5/postal_vertices.bin"
+        "{region}/quality/exact/admin_polygons.bin",
+        "{region}/quality/exact/admin_rings.bin",
+        "{region}/quality/exact/arc_index.bin",
+        "{region}/quality/exact/arc_vertices.bin"
       ]
     },
     "poi_tier.none": {
@@ -399,7 +319,7 @@
       "selections": {
         "region": "planet",
         "mode": "admin-minimal",
-        "quality": "q2.5",
+        "quality": "simplified",
         "poi_tier": "none"
       }
     },
@@ -410,7 +330,7 @@
       "selections": {
         "region": "planet",
         "mode": "admin",
-        "quality": "q2.5",
+        "quality": "simplified",
         "poi_tier": "major"
       },
       "default": true
@@ -422,18 +342,18 @@
       "selections": {
         "region": "planet",
         "mode": "full",
-        "quality": "q2.5",
+        "quality": "simplified",
         "poi_tier": "all"
       }
     },
     {
       "id": "max-quality",
       "label": "Maximum quality",
-      "description": "Full mode at uncapped boundary precision. Largest configuration available.",
+      "description": "Full mode with exact boundaries, every OSM point. Largest configuration available.",
       "selections": {
         "region": "planet",
         "mode": "full",
-        "quality": "uncapped",
+        "quality": "exact",
         "poi_tier": "all"
       }
     }
@@ -458,12 +378,12 @@
     "shipped": [
       {
         "mode": "full",
-        "quality": "q2.5",
+        "quality": "simplified",
         "poi_tier": "all"
       },
       {
         "mode": "full",
-        "quality": "uncapped",
+        "quality": "exact",
         "poi_tier": "all"
       }
     ]

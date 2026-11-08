@@ -32,8 +32,8 @@ template <class T>
 inline uint64_t vector_bytes(const std::vector<T>& v) { return v.size() * sizeof(T); }
 
 // A region's records and the structures that run parallel to them, by kind.
-// Strings, postcode centroids and the encoded arcs count with the admins:
-// every region holds them whole or nearly so.
+// Strings, postcode centroids, the encoded arcs and the admin cell indexes
+// count with the admins: every region holds them whole or nearly so.
 inline KindValues record_bytes(const ParsedData& d) {
     KindValues b{};
     at(b, RecordKind::Ways) = vector_bytes(d.ways) + vector_bytes(d.way_osm_ids) + vector_bytes(d.way_sidecar_blob)
@@ -52,11 +52,9 @@ inline KindValues record_bytes(const ParsedData& d) {
     uint64_t strings = d.string_pool.data().size();
     for (const auto& tier : d.strings_tiers) strings += tier.size();
     at(b, RecordKind::Admins) = vector_bytes(d.admin_polygons) + vector_bytes(d.admin_osm_ids)
-        + vector_bytes(d.admin_sidecar_blob) + vector_bytes(d.admin_parent_ids) + vector_bytes(d.admin_vertices)
-        + map_bytes_approx(d.cell_to_admin) + vector_bytes(d.admin_index_cells)
+        + vector_bytes(d.admin_sidecar_blob) + vector_bytes(d.admin_parent_ids) + vector_bytes(d.admin_index_cells)
         + vector_bytes(d.admin_minimal_index_cells) + map_bytes_approx(d.postcode_accum) + strings
         + d.admin_arcs.bytes();
-    for (const auto& [cell, ids] : d.cell_to_admin) at(b, RecordKind::Admins) += vector_bytes(ids);
     return b;
 }
 
@@ -113,12 +111,15 @@ constexpr uint64_t kFilterPairCopyDivisor = 2;
 // the three).
 constexpr uint64_t kModeBytes = uint64_t(256) << 20;
 
-// Stage working sets as fractions of the records they read: the quality
-// variants' packed polygons (three at once) and admin-minimal's copies of
-// the admins (planet: 1.0 and 0.4 GiB of 4.4), a POI tier's filtered
-// records, vertices and cells (planet: 2.7 GiB of 7.8).
-constexpr uint64_t kQualityAdminDivisor = 2;
-constexpr uint64_t kAdminMinimalAdminDivisor = 4;
+// Stage working sets as fractions of the records they read: the boundary
+// tiers' records and slot maps, and admin-minimal's records, place nodes,
+// cell index and strings for each of its dirs, against the admins (planet
+// 261018b, one stage at a time: at most 0.04 and 0.70 GiB of 2.82 GiB of
+// admins; the boundary tiers' 0.11 GiB of records, slot maps and sidecar is
+// below what RSS shows of a stage), a POI tier's filtered records, vertices
+// and cells (planet: 2.7 GiB of 7.8).
+constexpr uint64_t kAdminTierAdminDivisor = 16;
+constexpr uint64_t kAdminMinimalAdminDivisor = 3;
 constexpr uint64_t kPoiTierPoiTenths = 4;
 
 // A continent's records can run past its share of the planet's cell pairs
@@ -181,56 +182,25 @@ inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& c
          + sum(continent_pairs) * sizeof(CellItemPair) / kFilterPairCopyDivisor;
 }
 
-// What each write stage holds while it runs; the arc dirs only with
-// --arcs-out, else 0.
+// What each write stage holds while it runs: every stage a region's write
+// runs, the boundary tiers and both admin-minimal dirs (which write the arc
+// geometry) among them.
 struct StageCosts {
-    uint64_t modes = 0, quality = 0, places = 0, admin_minimal = 0, poi_tiers = 0, arc_dirs = 0;
+    uint64_t modes = 0, admin_tiers = 0, places = 0, admin_minimal = 0, poi_tiers = 0;
 
-    uint64_t total() const { return modes + quality + places + admin_minimal + poi_tiers + arc_dirs; }
-    uint64_t largest() const { return std::max({modes, quality, places, admin_minimal, poi_tiers, arc_dirs}); }
+    uint64_t total() const { return modes + admin_tiers + places + admin_minimal + poi_tiers; }
+    uint64_t largest() const { return std::max({modes, admin_tiers, places, admin_minimal, poi_tiers}); }
 };
 
-// The place files are written straight from the records. `arc_dirs` is the
-// arc dirs stage's (arc_dirs_cost), 0 when it doesn't run.
-inline StageCosts stage_costs(const KindValues& bytes, uint64_t arc_dirs) {
+// The place files are written straight from the records.
+inline StageCosts stage_costs(const KindValues& bytes) {
     StageCosts c;
     const uint64_t admins = at(bytes, RecordKind::Admins);
     c.modes = 3 * kModeBytes;
-    c.quality = admins / kQualityAdminDivisor;
+    c.admin_tiers = admins / kAdminTierAdminDivisor;
     c.admin_minimal = admins / kAdminMinimalAdminDivisor;
     c.poi_tiers = at(bytes, RecordKind::Pois) * kPoiTierPoiTenths / 10;
-    c.arc_dirs = arc_dirs;
     return c;
-}
-
-// What writing a region's arc dirs (--arcs-out) holds beside its records:
-// one dir's records and the polygon maps of its slots (`polygon_bytes` the
-// region's admin records), one set's slot maps (`slots` its larger set's),
-// and admin-minimal's subset of the core strings with its marks (at most
-// the core and a quarter).
-inline uint64_t arc_dirs_cost(uint64_t polygon_bytes, uint64_t slots, uint64_t core_bytes) {
-    return polygon_bytes * 2 + slots * 2 * sizeof(uint32_t) + core_bytes + core_bytes / 4;
-}
-
-inline uint64_t arc_dirs_cost(const ParsedData& d) {
-    uint64_t slots = 0;
-    for (const ArcSetBlocks& s : d.admin_arcs.sets) slots = std::max<uint64_t>(slots, s.sidecar.size());
-    return arc_dirs_cost(vector_bytes(d.admin_polygons), slots, d.strings_tiers[0].size());
-}
-
-// A continent's arc dirs stage before its split, from the planet's
-// (`planet_arc_dirs`, arc_dirs_cost; 0 without --arcs-out): its polygons,
-// slots and core strings are its share of the planet's admins (and the
-// strings counted with them), so the stage takes that share of the
-// planet's, as continent_share gives it, margin and all.
-inline uint64_t continent_arc_dirs_cost(uint64_t planet_arc_dirs, const KindValues& planet_bytes,
-                                        const KindValues& continent_bytes) {
-    const uint64_t planet_admins = at(planet_bytes, RecordKind::Admins);
-    if (planet_arc_dirs == 0 || planet_admins == 0) return planet_arc_dirs;
-
-    return static_cast<uint64_t>(static_cast<double>(planet_arc_dirs) *
-                                 static_cast<double>(at(continent_bytes, RecordKind::Admins)) /
-                                 static_cast<double>(planet_admins));
 }
 
 // How a region's write runs and the bytes it holds at its peak: its records
@@ -240,12 +210,9 @@ struct RegionCost {
     RunOrder order;
 };
 
-// `arc_dirs` is the arc dirs stage's (arc_dirs_cost), 0 without --arcs-out:
-// beside the other stages when they run at once, one of them when they run
-// one after another.
 inline uint64_t region_peak(const KindValues& bytes, const KindValues& counts, uint64_t filter_bytes,
-                            uint64_t arc_dirs, RunOrder order) {
-    const StageCosts stages = stage_costs(bytes, arc_dirs);
+                            RunOrder order) {
+    const StageCosts stages = stage_costs(bytes);
     const uint64_t steps = order == RunOrder::Serial ? stages.largest() : stages.total();
     return sum(bytes) + std::max({filter_bytes, strategy2_cost(counts, order), steps});
 }
@@ -254,11 +221,11 @@ inline uint64_t region_peak(const KindValues& bytes, const KindValues& counts, u
 // after another. It holds its whole reservation: its write takes no stage
 // leases of its own.
 inline RegionCost continent_cost(const KindValues& bytes, const KindValues& counts, uint64_t filter_bytes,
-                                 uint64_t arc_dirs, uint64_t capacity) {
-    const uint64_t at_once = region_peak(bytes, counts, filter_bytes, arc_dirs, RunOrder::Concurrent);
+                                 uint64_t capacity) {
+    const uint64_t at_once = region_peak(bytes, counts, filter_bytes, RunOrder::Concurrent);
     if (at_once <= capacity) return {at_once, RunOrder::Concurrent};
 
-    return {region_peak(bytes, counts, filter_bytes, arc_dirs, RunOrder::Serial), RunOrder::Serial};
+    return {region_peak(bytes, counts, filter_bytes, RunOrder::Serial), RunOrder::Serial};
 }
 
 // A continent's share of the planet's values, kind by kind, from its share

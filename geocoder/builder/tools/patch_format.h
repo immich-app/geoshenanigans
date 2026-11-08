@@ -75,6 +75,7 @@ static constexpr size_t WAY_HEADER_STRIDE = 12;
 static constexpr size_t ADDR_POINT_STRIDE = 28;
 static constexpr size_t INTERP_WAY_STRIDE = 24;
 static constexpr size_t ADMIN_POLYGON_STRIDE = 24;
+static constexpr size_t ARC_INDEX_STRIDE = 4;
 static constexpr size_t POI_RECORD_STRIDE = 36;
 static constexpr size_t PLACE_NODE_STRIDE = 20;
 
@@ -108,17 +109,16 @@ static constexpr size_t ADMIN_POLYGON_NAME_ID_OFF = 8;
 // name_id, 4×u8, parent_street_id, parent_postcode_id, parent_poly_id).
 // vertex_offset is the fixup target. name_id / parent_street_id /
 // parent_postcode_id are string-pool offsets; parent_poly_id is an admin
-// polygon index (admin id-space).
+// slot, which a polygon keeps.
 static constexpr size_t POI_RECORD_VERTEX_OFFSET_OFF = 8;
 static constexpr size_t POI_RECORD_NAME_ID_OFF = 16;
 static constexpr size_t POI_RECORD_PARENT_STREET_ID_OFF = 24;
 static constexpr size_t POI_RECORD_PARENT_POSTCODE_ID_OFF = 28;
 static constexpr size_t POI_RECORD_PARENT_POLY_ID_OFF = 32;
 
-// PlaceNode byte offsets. name_id is a string-pool offset; parent_poly_id is
-// an admin polygon index.
+// PlaceNode byte offsets. name_id is a string-pool offset (parent_poly_id, at
+// 16, is an admin slot).
 static constexpr size_t PLACE_NODE_NAME_ID_OFF = 8;
-static constexpr size_t PLACE_NODE_PARENT_POLY_ID_OFF = 16;
 
 // --- File I/O helpers ---
 
@@ -204,7 +204,15 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // place_nodes.bin when it loads the dir), so no patch carries its cell changes,
 // its cell index delta or the place nodes' secondary remap pairs, which only
 // that index's rebuild read; the file ids after PLACE_NODES move down two.
-static constexpr uint32_t GCPATCH_VERSION = 13;
+// v14: admin geometry is arcs. File ids 7, 26 and 27 name admin_rings.bin,
+// arc_index.bin and arc_vertices.bin (admin_vertices.bin and the postal files
+// are gone). The four admin geometry files merge by slot: arc_index.bin and
+// admin_polygons.bin record by record, arc_vertices.bin and admin_rings.bin a
+// block per record along them, as plain merge sections. Admin polygons keep
+// their slots, so nothing is remapped by an admin id: the parent-id remap
+// is its street leg alone, the sparse and parallel deltas lose remap kind 1,
+// and the admin cell index is rebuilt from the old one's ids as they are.
+static constexpr uint32_t GCPATCH_VERSION = 14;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -217,7 +225,7 @@ enum class PatchFileId : uint32_t {
     INTERP_WAYS = 4,
     INTERP_NODES = 5,
     ADMIN_POLYGONS = 6,
-    ADMIN_VERTICES = 7,
+    ADMIN_RINGS = 7,
     GEO_CELLS = 8,
     STREET_ENTRIES = 9,
     ADDR_ENTRIES = 10,
@@ -230,8 +238,7 @@ enum class PatchFileId : uint32_t {
     POI_ENTRIES = 17,
     PLACE_NODES = 18,
     // Secondary parallel arrays (SPARSE_DELTA_FILES), the postcode
-    // centroid index (a cell list delta) and the postal polygons, which
-    // merge like the admin ones.
+    // centroid index (a cell list delta) and the admin arcs.
     ADDR_POSTCODES = 19,
     ADMIN_PARENTS = 20,
     WAY_PARENTS = 21,
@@ -239,8 +246,8 @@ enum class PatchFileId : uint32_t {
     POSTCODE_CENTROIDS = 23,
     POSTCODE_CENTROID_CELLS = 24,
     POSTCODE_CENTROID_ENTRIES = 25,
-    POSTAL_POLYGONS = 26,
-    POSTAL_VERTICES = 27,
+    ARC_INDEX = 26,
+    ARC_VERTICES = 27,
     // addr_points polygon footprints introduced by commit aaf050b
     // (build_version bump 8→9), byte-merged along addr_points like the
     // other vertex streams.
@@ -262,14 +269,14 @@ enum class PatchFileId : uint32_t {
 
 static const char* patch_file_names[] = {
     "strings.bin", "street_ways.bin", "street_nodes.bin", "addr_points.bin",
-    "interp_ways.bin", "interp_nodes.bin", "admin_polygons.bin", "admin_vertices.bin",
+    "interp_ways.bin", "interp_nodes.bin", "admin_polygons.bin", "admin_rings.bin",
     "geo_cells.bin", "street_entries.bin", "addr_entries.bin", "interp_entries.bin",
     "admin_cells.bin", "admin_entries.bin",
     "poi_records.bin", "poi_vertices.bin", "poi_cells.bin", "poi_entries.bin",
     "place_nodes.bin",
     "addr_postcodes.bin", "admin_parents.bin", "way_parents.bin", "way_postcodes.bin",
     "postcode_centroids.bin", "postcode_centroid_cells.bin", "postcode_centroid_entries.bin",
-    "postal_polygons.bin", "postal_vertices.bin",
+    "arc_index.bin", "arc_vertices.bin",
     "addr_vertices.bin",
     "strings_core.bin", "strings_street.bin", "strings_addr.bin",
     "strings_postcode.bin", "strings_poi.bin",
@@ -284,8 +291,7 @@ inline std::vector<size_t> string_field_offsets(PatchFileId fid) {
     case PatchFileId::ADDR_POINTS: return {ADDR_POINT_HOUSENUMBER_ID_OFF, ADDR_POINT_STREET_ID_OFF};
     case PatchFileId::STREET_WAYS: return {WAY_HEADER_NAME_ID_OFF};
     case PatchFileId::INTERP_WAYS: return {INTERP_WAY_STREET_ID_OFF};
-    case PatchFileId::ADMIN_POLYGONS:
-    case PatchFileId::POSTAL_POLYGONS: return {ADMIN_POLYGON_NAME_ID_OFF};
+    case PatchFileId::ADMIN_POLYGONS: return {ADMIN_POLYGON_NAME_ID_OFF};
     case PatchFileId::POI_RECORDS:
         return {POI_RECORD_NAME_ID_OFF, POI_RECORD_PARENT_STREET_ID_OFF, POI_RECORD_PARENT_POSTCODE_ID_OFF};
     case PatchFileId::PLACE_NODES: return {PLACE_NODE_NAME_ID_OFF};
@@ -295,22 +301,37 @@ inline std::vector<size_t> string_field_offsets(PatchFileId fid) {
 
 // The files sent as SPARSE_DELTA_STRIDE sections, in emission order, with
 // the value each position holds:
-//   remap_kind 0 = raw, 1 = admin polygon id, 2 = string offset,
+//   remap_kind 0 = raw, 2 = string offset,
 //   3 = postcode_centroid (16 bytes, string offset at byte 8).
+// Admin parents are admin slots, which polygons keep, so they go raw; kind 1
+// (an admin id the patch remapped) names no file.
 struct SparseDeltaFile { PatchFileId fid; uint32_t value_stride, remap_kind; };
 static constexpr SparseDeltaFile SPARSE_DELTA_FILES[] = {
     {PatchFileId::ADDR_POSTCODES, 4, 2},
-    {PatchFileId::ADMIN_PARENTS, 4, 1},
-    {PatchFileId::WAY_PARENTS, 4, 1},
+    {PatchFileId::ADMIN_PARENTS, 4, 0},
+    {PatchFileId::WAY_PARENTS, 4, 0},
     {PatchFileId::WAY_POSTCODES, 4, 2},
     {PatchFileId::INTERP_POSTCODES, 4, 2},
     {PatchFileId::POSTCODE_CENTROIDS, 16, 3},
 };
 static constexpr size_t POSTCODE_CENTROID_POSTCODE_ID_OFF = 8;
 
+inline const SparseDeltaFile* sparse_delta_file(PatchFileId fid) {
+    for (const auto& f : SPARSE_DELTA_FILES)
+        if (f.fid == fid) return &f;
+    return nullptr;
+}
+
+// Refuses a sparse delta section unless its file, value stride and remap kind
+// are a row of SPARSE_DELTA_FILES, before a byte of it is used.
+inline void check_sparse_delta_header(uint32_t fid, uint32_t value_stride, uint32_t remap_kind) {
+    const SparseDeltaFile* file = fid < uint32_t(PatchFileId::COUNT) ? sparse_delta_file(static_cast<PatchFileId>(fid)) : nullptr;
+    if (!file || value_stride != file->value_stride || remap_kind != file->remap_kind)
+        throw std::runtime_error("Malformed sparse delta");
+}
+
 // The record files with string fields (string_field_offsets) and their
-// strides. Postal polygons are admin polygons of admin_level 11, at the admin
-// stride.
+// strides.
 struct StringRecordFile {
     PatchFileId fid;
     size_t stride;
@@ -320,9 +341,22 @@ static constexpr StringRecordFile STRING_RECORD_FILES[] = {
     {PatchFileId::STREET_WAYS, WAY_HEADER_STRIDE},
     {PatchFileId::INTERP_WAYS, INTERP_WAY_STRIDE},
     {PatchFileId::ADMIN_POLYGONS, ADMIN_POLYGON_STRIDE},
-    {PatchFileId::POSTAL_POLYGONS, ADMIN_POLYGON_STRIDE},
     {PatchFileId::POI_RECORDS, POI_RECORD_STRIDE},
     {PatchFileId::PLACE_NODES, PLACE_NODE_STRIDE},
+};
+
+// The admin geometry files by family, in the order a patch sends them: a file
+// of slots of `stride` bytes, each record's u32 at byte 0 the offset of its
+// slot's block in the byte stream after it (a dead arc's block empty, a dead
+// polygon's offset NO_DATA). The diff merges each family by slot
+// (build_slot_merge_seq), the stream a block per record along its slots.
+struct AdminSlotFamily {
+    PatchFileId slots, blocks;
+    size_t stride;
+};
+static constexpr AdminSlotFamily ADMIN_SLOT_FAMILIES[] = {
+    {PatchFileId::ARC_INDEX, PatchFileId::ARC_VERTICES, ARC_INDEX_STRIDE},
+    {PatchFileId::ADMIN_POLYGONS, PatchFileId::ADMIN_RINGS, ADMIN_POLYGON_STRIDE},
 };
 
 // Terminator written after the last patch section; the patcher breaks its
@@ -340,7 +374,8 @@ static constexpr uint32_t CELL_CHANGES_ADMIN_MARKER = 0xFFFFFFFA;
 static constexpr uint32_t CELL_CHANGES_POI_MARKER = 0xFFFFFFF5;
 
 // Cell index delta marker: 0xFFFFFFF7
-// An admin / POI cell index the patcher rebuilds from its id remap,
+// An admin / POI cell index the patcher rebuilds from the old one through
+// its id remap (the POI records' replay; admin slots stay as they are),
 // corrected per cell: a corrected cell costs the ids it lost and gained, not
 // its whole list. Sent for every index the old or the new dir holds; the
 // patcher writes the new index in write_cell_lists layout, so the diff
@@ -383,8 +418,7 @@ static constexpr uint32_t SECONDARY_REMAP_MARKER = 0xFFFFFFF6;
 
 // The record files whose old → new record ids the patcher keeps (RecordRemap)
 // for the entry pipeline's geo and POI indexes: the secondary remap gives
-// pairs for these and no other (the admin polygons' go in the parent-id
-// remap).
+// pairs for these and no other (admin polygons keep their slots).
 static constexpr PatchFileId REMAPPED_RECORD_FILES[] = {PatchFileId::STREET_WAYS, PatchFileId::ADDR_POINTS,
                                                         PatchFileId::INTERP_WAYS, PatchFileId::POI_RECORDS};
 inline bool is_remapped_record_file(uint32_t fid) {
@@ -478,19 +512,19 @@ inline uint64_t content_hash(const char* data, size_t n) {
 // Sparse position-keyed delta. Stride sentinel that signals the section
 // payload is a list of (position, value) pairs for the positions where
 // new differs from old. Used for files where strategy-2 keeps the index
-// stable but values still need remap (e.g. way_parents holds admin
-// polygon ids that shift when closed-way polygons get fresh ids; the
-// diff applies an admin or string remap to the loaded old array before
-// computing the delta, and the patcher applies the same remap before
-// overwriting the changed positions). Daily delta drops from a full
-// replace (hundreds of MiB per file) to tens of KiB.
+// stable and the values are slots or string offsets (e.g. postcode
+// string offsets shift with the string tiers; the diff applies the string
+// remap to the loaded old array before computing the delta, and the
+// patcher applies the same remap before overwriting the changed
+// positions). Daily delta drops from a full replace (hundreds of MiB per
+// file) to tens of KiB.
 //
 // Section format:
 //   file_id(u32),
 //   stride = SPARSE_DELTA_STRIDE (u32),
 //   old_size(u64), new_size(u64),
 //   value_stride(u32) — bytes per record (4 for uint32 arrays, 16 for postcode_centroid),
-//   remap_kind(u32)  — 0=none, 1=admin idx, 2=string offset, 3=postcode_centroid struct,
+//   remap_kind(u32)  — 0=none, 2=string offset, 3=postcode_centroid struct (SPARSE_DELTA_FILES),
 //   n_changes(u32),
 //   [(pos:u32, value:value_stride bytes)] × n_changes.
 //
@@ -564,7 +598,7 @@ static_assert(RECORD_BATCH_BYTES >= MAX_RECORD_STRIDE, "a batch holds at least o
 struct ParallelDeltaFile { PatchFileId fid, parent; uint32_t value_stride, remap_kind; };
 static constexpr ParallelDeltaFile PARALLEL_DELTA_FILES[] = {
     {PatchFileId::ADDR_POSTCODES, PatchFileId::ADDR_POINTS, 4, 2},
-    {PatchFileId::WAY_PARENTS, PatchFileId::STREET_WAYS, 4, 1},
+    {PatchFileId::WAY_PARENTS, PatchFileId::STREET_WAYS, 4, 0},
     {PatchFileId::WAY_POSTCODES, PatchFileId::STREET_WAYS, 4, 2},
     {PatchFileId::INTERP_POSTCODES, PatchFileId::INTERP_WAYS, 4, 2},
 };
@@ -598,20 +632,13 @@ inline void close_patch_outputs(std::initializer_list<std::pair<FILE*, std::stri
 }
 
 // POI parent-id remap marker: 0xFFFFFFF3
-// Carries the full primary+secondary admin-polygon, street-way, and
-// postcode-centroid old→new ID remap that the diff side applied to old
-// PoiRecord bytes 24/28/32 before computing pr_seq + the byte-block
-// delta over poi_vertices.bin. The patcher applies the same remap
-// during POI_RECORDS MATCH replay so the reconstructed bytes match the
-// new file. Emitted only when the patch contains POI_RECORDS — quality,
-// admin, full, etc. variants without POI files would otherwise carry
-// hundreds of MiB of remap pairs that are never applied.
-// Format: marker(4),
-//   n_admin_pairs(4),    [(old_id:u32, new_id:u32)] × n_admin_pairs,
-//   n_street_pairs(4),   [(old_id:u32, new_id:u32)] × n_street_pairs,
-//   n_postcode_pairs(4), [(old_id:u32, new_id:u32)] × n_postcode_pairs.
-// Only entries where old_id != new_id are transmitted, each leg ascending
-// by old_id, each id once; the patcher reads the legs where they sit
+// The street leg (v14: the only one): the old → new ids of the street ways no
+// MATCH or REPLACE run of their replay maps (moved or secondary-matched ways),
+// which complete the street remap the address replay moves parent_way_id by.
+// Sent, before the street ways' section, only by a dir with address points;
+// any other dir's moved ways go in the secondary remap.
+// Format: marker(4), n_street_pairs(4), [(old_id:u32, new_id:u32)] × n_street_pairs,
+// ascending by old_id, each id once; the patcher reads them where they sit
 // (parse_parent_id_remap).
 static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 
@@ -1160,25 +1187,12 @@ struct RemapPair {
 };
 
 // The parent-id remap after its marker (POI_PARENT_REMAP_MARKER), where it
-// sits: the admin and street legs. The reserved postcode leg is skipped.
-struct ParentIdRemap {
-    SortedTable<RemapPair> admin, street;
-    uint32_t n_postcode = 0;
-};
-
-// Reads the section at data[pos, size) and advances pos past it.
-inline ParentIdRemap parse_parent_id_remap(const char* data, size_t size, size_t& pos) {
+// sits: the street leg. Reads the section at data[pos, size) and advances pos
+// past it.
+inline SortedTable<RemapPair> parse_parent_id_remap(const char* data, size_t size, size_t& pos) {
     SectionReader in(data, size, pos, "POI parent-id remap");
-    auto leg = [&] {
-        const uint32_t n = in.u32();
-        return SortedTable<RemapPair>(in.take_items(n, sizeof(RemapPair)), n, "POI parent-id remap");
-    };
-    ParentIdRemap r;
-    r.admin = leg();
-    r.street = leg();
-    r.n_postcode = in.u32();
-    in.take_items(r.n_postcode, sizeof(RemapPair));
-    return r;
+    const uint32_t n = in.u32();
+    return SortedTable<RemapPair>(in.take_items(n, sizeof(RemapPair)), n, "POI parent-id remap");
 }
 
 // --- Cell index rebuild ---

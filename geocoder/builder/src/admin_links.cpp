@@ -23,16 +23,22 @@
 namespace {
 
 // Calls visit(id, polygon) for each admin polygon listed in `cell`, id its
-// entry there (INTERIOR_FLAG kept), in the list's order.
+// entry there (INTERIOR_FLAG kept), in the index's order.
 template <typename Visit>
 void for_each_admin_candidate(const ParsedData& data, S2CellId cell, Visit visit) {
-    auto it = data.cell_to_admin.find(cell.id());
-    if (it == data.cell_to_admin.end()) return;
-    for (uint32_t id : it->second) {
-        const uint32_t pid = id & ID_MASK;
+    const auto [first, last] = admin_cell_entries(data.admin_index_cells, cell.id());
+    for (const CellItemPair* e = first; e != last; ++e) {
+        const uint32_t pid = e->item_id & ID_MASK;
         if (pid >= data.admin_polygons.size()) continue;
-        visit(id, data.admin_polygons[pid]);
+        visit(e->item_id, data.admin_polygons[pid]);
     }
+}
+
+// The tie-break of the passes' rankings: the lower admin osm id, which
+// doesn't depend on slots.
+bool lower_osm_id(const ParsedData& data, uint32_t a, uint32_t b) {
+    return data.admin_osm_ids.size() == data.admin_polygons.size() &&
+           data.admin_osm_ids[a & ID_MASK] < data.admin_osm_ids[b & ID_MASK];
 }
 
 // rank_candidates orders admin polygons by area, which needs a strict weak
@@ -43,38 +49,41 @@ void require_ordered_admin_areas(const ParsedData& data) {
 }
 
 // rank_candidates order of the admin parent-chain picks over candidate
-// entries: highest admin_level (the closest parent), then smallest area.
+// entries: highest admin_level (the closest parent), then smallest area,
+// then the lower osm id.
 auto closest_parent_first(const ParsedData& data) {
     return [&data](uint32_t a, uint32_t b) {
         const auto& pa = data.admin_polygons[a & ID_MASK];
         const auto& pb = data.admin_polygons[b & ID_MASK];
         if (pa.admin_level != pb.admin_level) return pa.admin_level > pb.admin_level;
-        return pa.area < pb.area;
+        if (pa.area != pb.area) return pa.area < pb.area;
+        return lower_osm_id(data, a, b);
     };
 }
 
 // rank_candidates order of the smallest containing polygon over candidate
-// entries.
+// entries, then the lower osm id.
 auto smallest_first(const ParsedData& data) {
     return [&data](uint32_t a, uint32_t b) {
-        return data.admin_polygons[a & ID_MASK].area < data.admin_polygons[b & ID_MASK].area;
+        const float area_a = data.admin_polygons[a & ID_MASK].area, area_b = data.admin_polygons[b & ID_MASK].area;
+        if (area_a != area_b) return area_a < area_b;
+        return lower_osm_id(data, a, b);
     };
-}
-
-// Runs fn(ids) on every cell's list in cell_to_admin, lists spread over the
-// cores; fn must touch only the list it is given.
-template <typename Fn>
-void for_each_admin_cell_list(ParsedData& data, unsigned int threads, Fn fn) {
-    const auto cells = cell_lists(data.cell_to_admin, threads);
-    parallel_for(cells.size(), [&](size_t begin, size_t end, unsigned) {
-        for (size_t i = begin; i < end; i++) fn(*cells[i].second);
-    }, threads);
 }
 
 }  // namespace
 
 S2CellId admin_link_cell(PackedLocation p) {
     return S2CellId(S2LatLng::FromDegrees(p.lat(), p.lon())).parent(kAdminCellLevel);
+}
+
+std::pair<const CellItemPair*, const CellItemPair*> admin_cell_entries(const std::vector<CellItemPair>& index,
+                                                                       uint64_t cell) {
+    const auto first = std::lower_bound(index.begin(), index.end(), cell,
+                                        [](const CellItemPair& e, uint64_t c) { return e.cell_id < c; });
+    auto last = first;
+    while (last != index.end() && last->cell_id == cell) ++last;
+    return {index.data() + (first - index.begin()), index.data() + (last - index.begin())};
 }
 
 std::vector<CellItemPair> admin_candidate_cells(const AdminExactRings& rings, uint32_t begin, uint32_t end,
@@ -96,7 +105,7 @@ std::vector<CellItemPair> admin_candidate_cells(const AdminExactRings& rings, ui
             const uint32_t pid = begin + largest_first[k];
             const AdminRingCells cells = admin_ring_cells(rings.vertices.data(), rings.rings_of(pid),
                                                           rings.polygons[pid].ring_count, kAdminCellLevel,
-                                                          ADMIN_LINK_REACH_RAD);
+                                                          ADMIN_COVER_REACH_RAD);
             for (const auto& [cell, interior] : cells)
                 found[worker].push_back({cell, interior ? pid | INTERIOR_FLAG : pid});
         }
@@ -110,22 +119,6 @@ std::vector<CellItemPair> admin_candidate_cells(const AdminExactRings& rings, ui
         std::vector<CellItemPair>().swap(found[w]);
     }, threads);
     return out;
-}
-
-std::unordered_map<uint64_t, std::vector<uint32_t>> admin_candidate_map(std::vector<CellItemPair> cells,
-                                                                         unsigned int threads) {
-    // A polygon gives a cell once, so (cell, id) pairs never repeat.
-    parallel_sort(cells.begin(), cells.end(), cell_item_less, threads);
-    std::unordered_map<uint64_t, std::vector<uint32_t>> map;
-    map.reserve(count_cells(cells));
-    for (size_t k = 0; k < cells.size();) {
-        size_t run_end = k + 1;
-        while (run_end < cells.size() && cells[run_end].cell_id == cells[k].cell_id) run_end++;
-        std::vector<uint32_t>& ids = map[cells[k].cell_id];
-        ids.reserve(run_end - k);
-        for (; k < run_end; k++) ids.push_back(cells[k].item_id);
-    }
-    return map;
 }
 
 AdminRings::AdminRings(const AdminExactRings& rings, unsigned int threads,
@@ -164,37 +157,6 @@ uint32_t AdminRings::first_containing(const std::vector<uint32_t>& ranked, Packe
     for (uint32_t id : ranked)
         if ((id & INTERIOR_FLAG) || contains(id & ID_MASK, p)) return id & ID_MASK;
     return NO_DATA;
-}
-
-void remap_admin_candidates(ParsedData& data, const std::vector<uint32_t>& old_to_new, unsigned int threads) {
-    for_each_admin_cell_list(data, threads, [&](std::vector<uint32_t>& ids) {
-        for (auto& id : ids) {
-            uint32_t flags = id & INTERIOR_FLAG;
-            uint32_t old_id = id & ID_MASK;
-            id = old_to_new[old_id] | flags;
-        }
-    });
-}
-
-// Deterministic tie-break for the smallest-containing-admin parent
-// computations (way_parent / admin_parent / poi parent). Those
-// pick the min-area containing polygon with a strict `area < best`,
-// leaving exact-area ties to whichever candidate is iterated first.
-// AdminPolygon.area is float32, so distinct polygons can share an area
-// value. Sort each cell's candidate list by admin osm_id
-// (build-invariant, unique, kept aligned by the largest-first sort) so
-// the first-of-equal-area winner is stable. write_cell_index re-sorts
-// by raw poly_id at write time, so the on-disk layout is unaffected;
-// this order only governs the parent tie-breaks.
-void order_admin_candidates(ParsedData& data, unsigned int threads) {
-    if (data.admin_osm_ids.size() == data.admin_polygons.size()) {
-        for_each_admin_cell_list(data, threads, [&](std::vector<uint32_t>& ids) {
-            std::sort(ids.begin(), ids.end(), [&](uint32_t x, uint32_t y) {
-                return data.admin_osm_ids[x & ID_MASK] <
-                       data.admin_osm_ids[y & ID_MASK];
-            });
-        });
-    }
 }
 
 // Admin polygon parent chain: for each admin polygon, find the closest containing

@@ -10,7 +10,7 @@
 // there: each streamed pass writes its own, the caller merges them).
 //
 // Families (each runs when its input files are present): streets, interps, way_parents,
-// way_postcodes, interp_postcodes, gxc (geo_cells + the three entries files), addr, admin, poi.
+// way_postcodes, interp_postcodes, gxc (geo_cells + the three entries files), addr, poi.
 // Every other file is hardlinked (copied across filesystems). OUT_DIR, new or empty, gets gc.manifest
 // (counts and parameters the decoder needs). Prints one "phase" line per family: wall and CPU
 // seconds, bytes in/out.
@@ -20,6 +20,7 @@
 #include "gc_side.h"
 #include "gc_ways.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <functional>
 #include <set>
@@ -68,9 +69,6 @@ static std::vector<Family> families() {
                  [](const Manifest&) { return V{"addr_points.col", "addr_vertices.abs2"}; },
                  [](auto& s, auto& o, Manifest& m) { addr::encode(s, o, m); },
                  [](auto& s, auto& o, const Manifest& m) { addr::decode(s, o, m); }});
-    f.push_back({"admin", {"admin_vertices.bin"}, {"admin_polygons.bin"}, [](const Manifest&) { return V{"admin_vertices.B"}; },
-                 [](auto& s, auto& o, Manifest& m) { poly::encode_admin(s, o, m); },
-                 [](auto& s, auto& o, const Manifest& m) { poly::decode_admin(s, o, m); }});
     f.push_back({"poi", {"poi_records.bin", "poi_vertices.bin"}, {},
                  [](const Manifest&) { return V{"poi_records.r3", "poi_vertices.bopen"}; },
                  [](auto& s, auto& o, Manifest& m) { poly::encode_poi(s, o, m); },
@@ -180,6 +178,9 @@ int main(int argc, char** argv) {
     } else {
         m.load(src + "/gc.manifest");
         const std::set<std::string> enc = split(m.get("gc.families"));
+        for (const std::string& name : enc)
+            if (std::none_of(fams.begin(), fams.end(), [&](const Family& f) { return f.name == name; }))
+                die("unknown family %s in gc.manifest", name.c_str());
         for (const Family& f : fams) {
             if (!enc.count(f.name)) continue;
             bool any = false;

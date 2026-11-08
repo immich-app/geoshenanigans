@@ -125,6 +125,8 @@ pub struct PlacesSource<'a> {
     bnd: Mmap,
     n_slots: u32,
     n_linked: u32,
+    /// The most bytes the label points' scan line crossings held.
+    label_crossings_held: usize,
     /// label nodes that name a boundary slot (indexed through the boundary, not on their own)
     label_used: Bits,
     imp_places: Option<Mmap>,
@@ -156,6 +158,8 @@ impl<'a> PlacesSource<'a> {
         let mut label_used = Bits::new(n_place_nodes as usize);
         let mut w = BufWriter::with_capacity(WRITE_BUFFER, File::create(bnd_path)?);
         let (mut n_slots, mut n_linked) = (0u32, 0u32);
+        // The scan line crossings of each label point found, held for the next one.
+        let mut crossings = Vec::new();
         // Sets built without the search flags: every named ring is its own boundary entity.
         let flagged = (0..n_poly).any(|p| polygon_raw(geo, p)._pad2 & POLY_FLAG_PRIMARY_RING != 0);
         for p in 0..n_poly {
@@ -171,7 +175,7 @@ impl<'a> PlacesSource<'a> {
             } else if (BOUNDARY_MIN_LEVEL..=BOUNDARY_MAX_LEVEL).contains(&ap.admin_level) && ap.area > 0.0 {
                 // The builder's interior_point (ST_PointOnSurface, Nominatim's centre of an area):
                 // an area centroid can fall outside a concave ring or in a hole.
-                let Some((lat, lng)) = geo.admin_geometry.point_on_surface(&ap) else { continue };
+                let Some((lat, lng)) = geo.admin_geometry.point_on_surface_with(&ap, &mut crossings) else { continue };
                 BoundarySlot { poly: p, node: NO_DATA, lat, lng }
             } else {
                 continue;
@@ -190,6 +194,7 @@ impl<'a> PlacesSource<'a> {
             bnd,
             n_slots,
             n_linked,
+            label_crossings_held: crossings.capacity() * std::mem::size_of::<f64>(),
             label_used,
             imp_places: map_importance(dir, "imp_places.u8", n_place_nodes)?,
             imp_polys: map_importance(dir, "imp_polys.u8", n_poly)?,
@@ -953,6 +958,7 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
         st.add("place nodes", s.n_place_nodes);
         st.add("boundary slots", s.n_slots);
         st.add("boundary slots linked", s.n_linked);
+        st.add("label point crossings held, bytes", s.label_crossings_held);
         Source::Places(s)
     };
     let t_src = t0.elapsed();

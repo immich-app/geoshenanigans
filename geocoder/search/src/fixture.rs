@@ -1,18 +1,17 @@
 //! Test fixture: a small geocoder index (rectangular boundaries, place nodes, point POIs) in the
-//! builder's file layout, and the place-search index built from it the way `place-search build`
-//! builds one.
+//! builder's file layout (the boundaries' rings as arcs, query_server's arc fixture), and the
+//! place-search index built from it the way `place-search build` builds one.
 use crate::build::{build_all, held_subs, index_meta, BuildOpts};
 use crate::constants::SUB_INDEXES;
 use crate::model::PLACE_FLAG_LABEL_OF;
+use query_server::arc_fixture::{self, ArcFixture};
 use query_server::{
-    cell_id_at_level, AdminPolygon, Index, PlaceNode, PoiRecord, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE,
-    DEFAULT_STREET_CELL_LEVEL, NO_DATA, PLACE_FLAG_HIDDEN, STR_TIER_COUNT,
+    cell_id_at_level, AdminPolygon, Index, PlaceNode, PointE7, PoiRecord, DEFAULT_ADMIN_CELL_LEVEL,
+    DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL, NO_DATA, PLACE_FLAG_HIDDEN, STR_TIER_COUNT,
 };
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// Raw f32 vertices (VertexEncoding in builder/src/types.h).
-const RAW_F32_VERTICES: u8 = 4;
 /// Grid steps per side of a boundary's bounding box whose points list it in their admin cells.
 const GRID: u32 = 32;
 
@@ -39,8 +38,8 @@ impl Drop for TempDir {
 #[derive(Default)]
 pub struct Geo {
     strings: Vec<u8>,
-    /// (record, keyhole vertex range as (lat, lng) in degrees)
-    polygons: Vec<(AdminPolygon, Vec<(f32, f32)>)>,
+    /// (record, closed rings as (lat, lng) in degrees, the outer one first)
+    polygons: Vec<(AdminPolygon, Vec<Vec<(f32, f32)>>)>,
     nodes: Vec<PlaceNode>,
     pois: Vec<PoiRecord>,
 }
@@ -59,24 +58,13 @@ impl Geo {
         self.shaped_boundary(name, admin_level, &[(s, w), (s, e), (n, e), (n, w), (s, w)], &[])
     }
 
-    /// A boundary of closed (lat, lng) rings, `outer` around `holes`, packed into one keyhole
-    /// vertex range as the builder packs them; returns its polygon id.
+    /// A boundary of closed (lat, lng) rings, `outer` around `holes`, each one arc; returns its
+    /// polygon id.
     pub fn shaped_boundary(&mut self, name: &str, admin_level: u8, outer: &[(f32, f32)], holes: &[&[(f32, f32)]]) -> u32 {
-        let mut verts = outer.to_vec();
-        for h in holes {
-            let c = (outer[0].0, h[0].1);
-            verts.extend([outer[0], c]);
-            verts.extend_from_slice(h);
-            verts.push(c);
-        }
-        let ring_area = |r: &[(f32, f32)]| r.windows(2).map(|e| e[0].1 * e[1].0 - e[1].1 * e[0].0).sum::<f32>().abs() / 2.0;
-        let poly = AdminPolygon {
-            vertex_offset: 0, vertex_count: verts.len() as u32, name_id: self.string(name), admin_level,
-            place_type_override: 0, _pad2: 0, _pad3: 0,
-            area: ring_area(outer) - holes.iter().map(|h| ring_area(h)).sum::<f32>(),
-            country_code: 0, hole_count: holes.len() as u16,
-        };
-        self.polygons.push((poly, verts));
+        let rings: Vec<Vec<(f32, f32)>> = std::iter::once(outer).chain(holes.iter().copied()).map(|r| r.to_vec()).collect();
+        let area = arc_fixture::exact_area(&rings.iter().map(|r| e7_ring(r)).collect::<Vec<_>>());
+        let poly = arc_fixture::record(self.string(name), admin_level, area);
+        self.polygons.push((poly, rings));
         self.polygons.len() as u32 - 1
     }
 
@@ -110,16 +98,13 @@ impl Geo {
         let cell = |lat: f32, lng: f32| cell_id_at_level(lat as f64, lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
         let points: Vec<(f32, f32)> =
             self.nodes.iter().map(|p| (p.lat, p.lng)).chain(self.pois.iter().map(|p| (p.lat, p.lng))).collect();
-        let (mut polygons, mut vertices, mut admin) = (Vec::new(), Vec::new(), Vec::new());
-        for (id, (poly, verts)) in self.polygons.iter().enumerate() {
-            polygons.extend(polygon_bytes(&AdminPolygon { vertex_offset: vertices.len() as u32, ..*poly }));
-            let min = |f: fn(&(f32, f32)) -> f32| verts.iter().map(f).fold(f32::INFINITY, f32::min);
-            let max = |f: fn(&(f32, f32)) -> f32| verts.iter().map(f).fold(f32::NEG_INFINITY, f32::max);
+        let (mut arcs, mut admin) = (ArcFixture::new(), Vec::new());
+        for (id, (poly, rings)) in self.polygons.iter().enumerate() {
+            arcs.ring_polygon(*poly, 0, &rings.iter().map(|r| e7_ring(r)).collect::<Vec<_>>());
+            let outer = &rings[0];
+            let min = |f: fn(&(f32, f32)) -> f32| outer.iter().map(f).fold(f32::INFINITY, f32::min);
+            let max = |f: fn(&(f32, f32)) -> f32| outer.iter().map(f).fold(f32::NEG_INFINITY, f32::max);
             let ([s, w], [n, e]) = ([min(|v| v.0), min(|v| v.1)], [max(|v| v.0), max(|v| v.1)]);
-            vertices.extend([RAW_F32_VERTICES, 0]);
-            for v in [s, w].into_iter().chain(verts.iter().flat_map(|v| [v.0, v.1])) {
-                vertices.extend(v.to_le_bytes());
-            }
             let grid = (0..=GRID).flat_map(|i| {
                 (0..=GRID).map(move |j| (s + (n - s) * i as f32 / GRID as f32, w + (e - w) * j as f32 / GRID as f32))
             });
@@ -135,13 +120,13 @@ impl Geo {
         let tiers: Vec<String> = (0..STR_TIER_COUNT)
             .map(|t| format!("{{\"start\": {}, \"end\": {end}}}", if t == 0 { 0 } else { end }))
             .collect();
-        let mut files = vec![
-            ("admin_polygons.bin", polygons), ("admin_vertices.bin", vertices),
+        let mut files: Vec<(&'static str, Vec<u8>)> = arcs.files().into();
+        files.extend([
             ("admin_cells.bin", admin_cells), ("admin_entries.bin", admin_entries),
             ("place_nodes.bin", nodes),
             ("strings_core.bin", self.strings.clone()),
             ("strings_layout.json", format!("{{\"tiers\": [{}]}}", tiers.join(", ")).into_bytes()),
-        ];
+        ]);
         if !self.pois.is_empty() {
             let (poi_cells, poi_entries) =
                 cell_files(self.pois.iter().enumerate().map(|(i, p)| (cell(p.lat, p.lng), i as u32)).collect());
@@ -196,15 +181,9 @@ fn cell_files(mut pairs: Vec<(u64, u32)>) -> (Vec<u8>, Vec<u8>) {
     (cells, entries)
 }
 
-fn polygon_bytes(p: &AdminPolygon) -> Vec<u8> {
-    let b = [
-        &p.vertex_offset.to_le_bytes()[..], &p.vertex_count.to_le_bytes(), &p.name_id.to_le_bytes(),
-        &[p.admin_level, p.place_type_override, p._pad2, p._pad3], &p.area.to_le_bytes(),
-        &p.country_code.to_le_bytes(), &p.hole_count.to_le_bytes(),
-    ]
-    .concat();
-    assert_eq!(b.len(), std::mem::size_of::<AdminPolygon>());
-    b
+/// A ring of (lat, lng) degrees on the e7 grid.
+fn e7_ring(ring: &[(f32, f32)]) -> Vec<PointE7> {
+    ring.iter().map(|&(lat, lng)| arc_fixture::e7(lat as f64, lng as f64)).collect()
 }
 
 fn node_bytes(p: &PlaceNode) -> Vec<u8> {

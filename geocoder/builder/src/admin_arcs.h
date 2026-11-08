@@ -16,7 +16,8 @@
 // the vertices Douglas-Peucker keeps of each arc, snapped to its grid, with
 // vertices given back where a ring would degenerate, two simplified segments
 // cross or a polygon's rings stop nesting. build-index runs the arc stage
-// (build_admin_arcs) only with --arcs-out.
+// (build_admin_arcs) on every build with admin polygons: every dir that holds
+// admin geometry holds it as arcs.
 #pragma once
 
 #include <algorithm>
@@ -149,6 +150,7 @@ struct AdminArcSlotCounts {
     size_t recycled = 0;  // a slot that was a tombstone in the previous build
     size_t appended = 0;
     size_t tombstones = 0;
+    size_t previous_sidecar_missing = 0;  // 1: a previous build was given without this sidecar
 };
 
 // One arc of the minimal set: full arcs chained end to end, each walked as
@@ -228,17 +230,36 @@ struct ArcTierCounts {
     int repair_rounds = 0;
     size_t repair_restored = 0;
     size_t nesting_restored = 0;  // vertices given back to polygons whose rings stopped nesting
+    int e7_grid_rounds = 0;
+    size_t e7_grid_arcs = 0;  // arcs stored on OSM's own grid (arc_grid), some vertices only
     size_t crossings_left = 0;
     size_t unrepairable_segments = 0;  // in a crossing left, with no dropped vertex
     size_t raw_crossings = 0;  // segment pairs meeting whose raw spans already meet
     size_t rings_nest_introduced = 0;  // polygons whose rings nest in exact, not here
 };
 
+// Which vertices of a simplified tier's arc stay on OSM's own e7 grid
+// instead of the tier's: its first and last (each a junction other arcs end
+// at too) and the ones between. A polygon whose rings stop nesting only once
+// snapped, with no dropped vertex to give back, keeps its arcs and their
+// junctions on the e7 grid, and so does every arc at one of those junctions
+// at that end: a junction is one point in every arc that ends there.
+namespace arc_grid {
+constexpr uint8_t kE7First = 1;
+constexpr uint8_t kE7Last = 2;
+constexpr uint8_t kE7Between = 4;
+constexpr uint8_t kE7Whole = kE7First | kE7Last | kE7Between;
+}  // namespace arc_grid
+
 // What a tier holds: the keep marks of a simplified tier (empty for one that
-// stores every raw vertex) and its counts.
+// stores every raw vertex), each arc's arc_grid marks (empty, or one per arc
+// of a simplified tier) and its counts.
 struct ArcTierState {
     ArcKeep kept;
+    std::vector<uint8_t> e7_grid;
     ArcTierCounts counts;
+
+    uint8_t grid_of(uint32_t arc) const { return e7_grid.empty() ? 0 : e7_grid[arc]; }
 };
 
 // The arcs of every admin polygon's rings (the full set), and the minimal
@@ -317,10 +338,20 @@ struct ArcSlots {
 // a slot that was a tombstone in the previous build, then new ones. A slot the
 // previous build's arcs held and no arc holds now, a repeated key's other
 // slots included, becomes a tombstone, so it is reused only the day after.
+// A previous build without the sidecar (none at `prev_sidecar`) leaves every
+// slot cold, as one without the admin sidecar does, and the counts say so; a
+// sidecar there that can't be read, or a path that can't be looked up, is
+// refused.
 ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar);
 
-// Where a region's arc sidecar sits under its dir, as PR 3 ships them: the
-// full set's with the exact tier, the minimal set's with admin-minimal.
+// The log lines of a region's slot allocation for `set` against
+// `prev_sidecar`, when a previous build was given: the cold start's, and the
+// ARC_CHECK count o11y reports.
+std::string arc_slot_start_lines(const std::string& region, ArcSet set, const std::string& prev_sidecar,
+                                 const AdminArcSlotCounts& counts);
+
+// Where a region's arc sidecar sits under its dir: the full set's with the
+// exact tier, the minimal set's with admin-minimal.
 std::string arc_sidecar_path(const std::string& region_dir, ArcSet set);
 
 // The minimal set over the full set `arcs` of the store: the rings of the
@@ -352,7 +383,9 @@ std::vector<bool> exact_rings_nest(const AdminExactRings& store, unsigned thread
 // one of each span, and to a polygon whose rings nest exactly
 // (`nests_exact`, exact_rings_nest) but not once stored, the farthest dropped
 // one of each span of a ring whose box holds a vertex of another ring. A
-// tier with no tolerance keeps everything and counts nothing.
+// polygon whose rings still don't nest then keeps its arcs on the e7 grid
+// (arc_grid), round after round while that changes anything. A tier with no
+// tolerance keeps everything and counts nothing.
 // `phase_done` is told as each step ends.
 ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
                             const std::vector<bool>& nests_exact, unsigned threads,
@@ -374,17 +407,38 @@ struct StoredVertex {
     PackedLocation at;
 };
 
+// The grid step, in e7 units, a tier stores raw vertex i of an arc of n
+// raw vertices on, given the arc's arc_grid marks.
+inline int32_t vertex_grid_e7(const ArcTier& tier, uint8_t e7_grid, uint32_t i, uint32_t n) {
+    const uint8_t mark = i == 0 ? arc_grid::kE7First : i + 1 == n ? arc_grid::kE7Last : arc_grid::kE7Between;
+    return (e7_grid & mark) ? 1 : tier.grid_e7;
+}
+
+// The grid exponent of a tier's block of an arc: OSM's own once any of its
+// vertices stays there.
+inline uint8_t arc_grid_exponent(const ArcTier& tier, uint8_t e7_grid) {
+    return arc_blocks::grid_exponent(e7_grid ? 1 : tier.grid_e7);
+}
+
 // The vertices `tier` (as `state` holds it) stores of arc `arc` of its set:
 // every raw vertex as it is when the tier simplifies nothing, else the kept
-// ones snapped to the tier's grid, a vertex that snaps onto the one before it
-// left out (the last raw vertex taking that one's place, so the arc still
-// ends there) unless the arc is all one point.
+// ones snapped (each to vertex_grid_e7's step), a vertex that snaps onto the
+// one before it left out (the last raw vertex taking that one's place, so
+// the arc still ends there) unless the arc is all one point.
 void tier_vertices(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
                    const ArcTierState& state, uint32_t arc, std::vector<StoredVertex>& out);
 // The same, the arc's raw vertices left in `raw`.
 void tier_vertices(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
                    const ArcTierState& state, uint32_t arc, std::vector<PackedLocation>& raw,
                    std::vector<StoredVertex>& out);
+
+// Ring `ring` of the store as `tier` (as `state` holds it) stores it, into
+// `out`: its refs' stored vertices chained, each junction once, its first
+// vertex again at its end; empty for a ring the tier's set doesn't hold.
+// `raw` and `stored` are scratch.
+void tier_ring(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier, const ArcTierState& state,
+               uint32_t ring, std::vector<PackedLocation>& out, std::vector<PackedLocation>& raw,
+               std::vector<StoredVertex>& stored);
 
 // The arc stage over the planet's polygons: the topology, then the full set's
 // planet slots against the sidecar under `prev_planet_dir` (a cold start when
@@ -402,12 +456,6 @@ std::vector<PackedLocation> rebuild_ring(const AdminArcs& arcs, const AdminExact
 // Whether two closed rings (each ending on its first vertex) are one cycle,
 // from any vertex and in either direction.
 bool same_closed_ring(const PackedLocation* a, uint32_t a_count, const PackedLocation* b, uint32_t b_count);
-
-// build-index's arc dirs, refused before any work: --arcs-out new or empty and
-// apart from the output dir (which publishes whatever it holds), --prev-arcs
-// only with it, and holding each of `regions`' sidecar of each set.
-void require_arc_dirs(const std::string& output_dir, const std::string& arcs_out_dir,
-                      const std::string& prev_arcs_dir, const std::vector<std::string>& regions = {"planet"});
 
 // --- The encoded arcs: what the stage leaves the build ---
 
@@ -478,9 +526,10 @@ struct AdminArcBlocks {
 // The arc stage's encoding of `arcs` (build_admin_arcs) of the store: every
 // tier's arc blocks and every polygon's ring blocks in both sets, with the
 // planet's slots. Aborts (std::runtime_error) unless every ring's refs chain
-// closes, every arc block decodes to the vertices its tier stores, those
-// are raw vertices of the arc snapped to the tier's grid (within
-// kChunkBoxSlackE7 of them), every ref names a live slot of its arc, and
+// closes, in every tier's arc blocks too, every arc block decodes to the
+// vertices its tier stores, those are raw vertices of the arc each snapped
+// to its own grid (vertex_grid_e7, within kChunkBoxSlackE7 of them), every
+// ref names a live slot of its arc, and
 // every ring of every polygon in each set comes back exactly from its ring
 // block's refs to the exact tier's arc blocks (check_lossless). Logs its
 // counts as ARC_CHECK lines.
@@ -518,9 +567,9 @@ void assign_region_arc_slots(AdminArcBlocks& blocks, const std::string& prev_reg
 // tombstone's empty).
 void write_arc_files(const std::string& dir, const ArcSetBlocks& set, const ArcBlocks& tier);
 
-// A dir's admin_polygons.bin and admin_rings.bin in set `set`: records[slot]
-// with its ring block (that of polygon polygon_of[slot]) laid out in slot
-// order, a tombstone record (NO_DATA) holding none. Returns admin_rings.bin's
-// size.
-size_t write_ring_files(const std::string& dir, const AdminArcBlocks& blocks, ArcSet set,
+// The admin_polygons.bin and admin_rings.bin of `dirs`, the same bytes in
+// each, in set `set`: records[slot] with its ring block (that of polygon
+// polygon_of[slot]) laid out in slot order, a tombstone record (NO_DATA)
+// holding none. Returns admin_rings.bin's size.
+size_t write_ring_files(const std::vector<std::string>& dirs, const AdminArcBlocks& blocks, ArcSet set,
                         std::vector<AdminPolygon> records, const std::vector<uint32_t>& polygon_of);

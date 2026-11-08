@@ -1,15 +1,11 @@
-// Admin outlines, layout B (max/verify/scripts/layoutb.c, four-changes change 3), and POI records +
-// vertices (the index track's R3 records and B-open vertices, max/index-poi-strings/scripts/poi_rec.py,
-// poi_vert.py), neither re-sorted.
-//
-// admin_vertices.B: every polygon block keeps today's offset and size (admin_polygons.bin unchanged):
-//   10-byte header verbatim, then the wrapping zigzag deltas (first vertex absolute) of q_lat then q_lng
-//   at the polygon's width w (2 B for enc 0-2, 4 B for enc 3) as byte planes:
-//   lat b0 | lat b1 [| b2 | b3] | lng b0 | ...
+// POI records + vertices (the index track's R3 records and B-open vertices,
+// max/index-poi-strings/scripts/poi_rec.py, poi_vert.py), not re-sorted.
 //
 // poi_vertices.bopen: polygons back to back in record order; each block: today's 10-byte header with
 //   the pad byte (byte 1) = 1 when the ring's closing vertex (== first, count > 1) was dropped; then
-//   the wrapping zigzag deltas of the stored vertices as byte planes at width w, as layout B.
+//   the wrapping zigzag deltas (first vertex absolute) of the stored vertices' q_lat then q_lng at the
+//   polygon's width w (2 B for enc 0-2, 4 B for enc 3) as byte planes:
+//   lat b0 | lat b1 [| b2 | b3] | lng b0 | ...
 // poi_records.r3 (32 B): today's 36-byte record without vertex_count, with vertex_offset replaced by a
 //   monotone offset into poi_vertices.bopen (a polygon: its block; a point: where the next polygon's
 //   block starts, or the file size). A record is a polygon iff its offset differs from the next
@@ -56,63 +52,6 @@ static void planes_dec(const uint8_t* src, uint8_t* dst, uint64_t c, int w) {
             prev = q;
         }
     }
-}
-
-// ---------------------------------------------------------------- admin layout B
-struct PolyRef { uint64_t off, cnt; };
-
-static std::vector<PolyRef> admin_polys(const std::string& dir) {
-    Reader r(dir + "/admin_polygons.bin", 1 << 20);
-    if (r.size() % 24) die("admin_polygons.bin size");
-    std::vector<PolyRef> ps;
-    while (!r.eof()) {
-        const uint8_t* p = r.take(24);
-        const uint32_t vo = rd32(p), vc = rd32(p + 4);
-        if (vc > 0 && vo != NO) ps.push_back({vo, vc});
-    }
-    std::sort(ps.begin(), ps.end(), [](const PolyRef& a, const PolyRef& b) { return a.off < b.off; });
-    return ps;
-}
-
-static void admin_run(const std::string& polys_dir, const std::string& in, const std::string& outp, bool enc, Manifest* m) {
-    // Streaming: the vertices are opened first, so a FIFO open waits until the patcher has written
-    // admin_polygons.bin (its section comes first) and moved on to admin_vertices.bin.
-    Reader R(in);
-    const std::vector<PolyRef> ps = admin_polys(polys_dir);
-    Writer W(outp);
-    std::vector<uint8_t> blk;
-    uint64_t pos = 0, verts = 0, by_enc[4] = {0, 0, 0, 0};
-    for (const PolyRef& p : ps) {
-        if (p.off != pos) die("admin_vertices: gap or overlap at offset %llu (expected %llu)", (unsigned long long)p.off,
-                              (unsigned long long)pos);
-        const uint8_t e = *R.need(1);
-        if (e > 3) die("admin_vertices: bad encoding %u", e);
-        const int w = e == 3 ? 4 : 2;
-        const size_t size = R.unit_size(10, p.cnt, 2 * uint64_t(w));
-        const uint8_t* s = R.take(size);
-        blk.resize(size);
-        memcpy(blk.data(), s, 10);
-        if (enc) planes_enc(s + 10, blk.data() + 10, p.cnt, w);
-        else planes_dec(s + 10, blk.data() + 10, p.cnt, w);
-        W.put(blk);
-        pos += size;
-        verts += p.cnt;
-        by_enc[e]++;
-    }
-    if (!R.eof()) die("admin_vertices: bytes after the last polygon");
-    if (m) {
-        m->set("admin.polygons", ps.size());
-        fprintf(stderr, "  admin layout B: polygons %zu vertices %llu enc0/1/2/3 %llu/%llu/%llu/%llu bytes %llu\n", ps.size(),
-                (unsigned long long)verts, (unsigned long long)by_enc[0], (unsigned long long)by_enc[1],
-                (unsigned long long)by_enc[2], (unsigned long long)by_enc[3], (unsigned long long)pos);
-    }
-}
-
-inline void encode_admin(const std::string& src, const std::string& out, Manifest& m) {
-    admin_run(src, src + "/admin_vertices.bin", out + "/admin_vertices.B", true, &m);
-}
-inline void decode_admin(const std::string& src, const std::string& out, const Manifest&) {
-    admin_run(src, src + "/admin_vertices.B", out + "/admin_vertices.bin", false, nullptr);
 }
 
 // ---------------------------------------------------------------- POI R3 + B-open

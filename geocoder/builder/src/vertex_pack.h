@@ -1,4 +1,4 @@
-// Polygon vertex packing shared by the admin, POI and addr vertex files: a
+// Polygon vertex packing shared by the POI and addr vertex files: a
 // POLY_HEADER_BYTES header (encoding tag, pad, bbox_min lat/lng as f32), then
 // every vertex as unsigned deltas from bbox_min on the finest grid the
 // polygon's span fits. Layout in types.h (VertexEncoding).

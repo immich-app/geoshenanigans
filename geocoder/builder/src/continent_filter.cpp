@@ -139,29 +139,14 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         });
         return r;
     };
-    IndexCells index_cells, minimal_index_cells;
 
-    // The continent's admin cells (admin has no precomputed masks), and the
-    // ids of the polygons they hold, ascending: those of its own cells in the
-    // builder's covering, and every polygon its reader's admin cell indexes
-    // list.
-    using AdminCell = std::unordered_map<uint64_t, std::vector<uint32_t>>::value_type;
-    std::vector<const AdminCell*> admin_cells;
-    auto filter_admin_cells = [&](const std::unordered_map<uint64_t, std::vector<uint32_t>>& cell_map) {
-        admin_cells = parallel_collect<const AdminCell*>(cell_map.bucket_count(),
-            [&](size_t b, std::vector<const AdminCell*>& inside) {
-                for (auto it = cell_map.begin(b); it != cell_map.end(b); ++it)
-                    if (cell_in_continent(it->first, bbox, polygon)) inside.push_back(&*it);
-            });
+    // The ids of the polygons the continent's cells of the admin cell
+    // indexes list, ascending: the full set's index is the builder's own too,
+    // so these hold every polygon a link in the continent names.
+    IndexCells index_cells, minimal_index_cells;
+    auto filter_admin_cells = [&] {
         const size_t polygons = full.admin_polygons.size();
         std::vector<std::atomic<uint64_t>> used(polygons / 64 + 1);
-        parallel_for(admin_cells.size(), [&](size_t begin, size_t end, unsigned) {
-            for (size_t c = begin; c < end; c++)
-                for (uint32_t id : admin_cells[c]->second) {
-                    if ((id & ID_MASK) >= polygons) throw std::out_of_range("admin cell entry past the polygons");
-                    mark_bit(used, id & ID_MASK);
-                }
-        });
         index_cells = routed_cells(full.admin_index_cells);
         minimal_index_cells = routed_cells(full.admin_minimal_index_cells);
         auto mark_index = [&](const std::vector<CellItemPair>& pairs, const IndexCells& cells) {
@@ -191,7 +176,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     auto f_interps = std::async(std::launch::async, [&]{ return filter_sorted_masked(full.sorted_interp_cells, interp_masks, max_interp_id); });
     auto f_pois    = std::async(std::launch::async, [&]{ return filter_sorted_masked(full.sorted_poi_cells,    poi_masks,    max_poi_id); });
     auto f_places  = std::async(std::launch::async, [&]{ return filter_sorted_masked(full.sorted_place_cells,  place_masks,  max_place_id); });
-    auto f_admin   = std::async(std::launch::async, [&]{ return filter_admin_cells(full.cell_to_admin); });
+    auto f_admin   = std::async(std::launch::async, filter_admin_cells);
 
     auto used_way_ids    = f_ways.get();
     auto used_addr_ids   = f_addrs.get();
@@ -266,21 +251,19 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         drop(full.interp_ways, full.interp_nodes, full.interp_osm_ids);
     };
 
-    // Admin
+    // Admin: the records, with their arcs (the planet's are gone once it is
+    // split).
     auto copy_admins = [&]() {
-        admin_remap = copy_subset(used_admin_ids, full.admin_polygons, full.admin_vertices,
-            [](uint32_t) { return true; },
-            [&](uint32_t id) {
-                return CoordRun{full.admin_polygons[id].vertex_offset, full.admin_polygons[id].vertex_count};
-            },
-            [](AdminPolygon& ap, uint32_t offset, uint32_t) { ap.vertex_offset = offset; },
-            out.admin_polygons, out.admin_vertices);
+        const std::vector<NodeCoord> no_coords;
+        std::vector<NodeCoord> unused;
+        admin_remap = copy_subset(used_admin_ids, full.admin_polygons, no_coords, [](uint32_t) { return true; },
+            [](uint32_t) { return CoordRun{0, 0}; }, [](AdminPolygon&, uint32_t, uint32_t) {}, out.admin_polygons,
+            unused);
         out.admin_osm_ids = subset_osm_ids(used_admin_ids, admin_remap, out.admin_polygons.size(), full.admin_osm_ids);
         out.admin_planet_ids = used_admin_ids;  // every one is kept
-        // Their arcs too: the planet's are gone once it is split.
         if (!full.admin_arcs.polygons.empty()) out.admin_arcs = subset_admin_arcs(full.admin_arcs, used_admin_ids, 0);
         if (consume) full.admin_arcs = {};
-        drop(full.admin_polygons, full.admin_vertices, full.admin_osm_ids);
+        drop(full.admin_polygons, full.admin_osm_ids);
     };
 
     // POIs — coord polygon refinement, preserve vertex arrays for polygon POIs
@@ -453,22 +436,6 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         }, pair_pass_threads());
     };
 
-    // The continent's admin cells with their polygons' continent ids (and
-    // INTERIOR_FLAG), cells left empty dropped.
-    auto remap_admin_cells = [&] {
-        using CellIds = std::pair<uint64_t, std::vector<uint32_t>>;
-        auto kept = parallel_collect<CellIds>(admin_cells.size(), [&](size_t c, std::vector<CellIds>& found) {
-            std::vector<uint32_t> ids;
-            for (uint32_t id : admin_cells[c]->second) {
-                uint32_t new_id = remap_id(admin_remap, id & ID_MASK);
-                if (new_id != NO_DATA) ids.push_back(new_id | (id & INTERIOR_FLAG));
-            }
-            if (!ids.empty()) found.emplace_back(admin_cells[c]->first, std::move(ids));
-        });
-        out.cell_to_admin.reserve(kept.size());
-        for (auto& [cell, ids] : kept) out.cell_to_admin.emplace(cell, std::move(ids));
-    };
-
     // The reader's admin cell indexes cut to the cells they keep, with their
     // polygons' continent ids (the continent keeps every polygon they list).
     auto remap_index_cells = [&](const std::vector<CellItemPair>& planet, const IndexCells& cells,
@@ -494,7 +461,6 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         auto f3 = std::async(std::launch::async, [&]{ remap_sorted_masked(full.sorted_interp_cells, interp_masks, interp_remap, out.sorted_interp_cells); });
         auto f4 = std::async(std::launch::async, [&]{ remap_sorted_masked(full.sorted_poi_cells,    poi_masks,    poi_remap,    out.sorted_poi_cells); });
         auto f5 = std::async(std::launch::async, [&]{ remap_sorted_masked(full.sorted_place_cells,  place_masks,  place_remap,  out.sorted_place_cells); });
-        auto f6 = std::async(std::launch::async, remap_admin_cells);
         auto f7 = std::async(std::launch::async, [&]{
             remap_index_cells(full.admin_index_cells, index_cells, out.admin_index_cells, "admin index");
         });
@@ -502,10 +468,10 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
             remap_index_cells(full.admin_minimal_index_cells, minimal_index_cells, out.admin_minimal_index_cells,
                               "admin-minimal index");
         });
-        f1.get(); f2.get(); f3.get(); f4.get(); f5.get(); f6.get(); f7.get(); f8.get();
+        f1.get(); f2.get(); f3.get(); f4.get(); f5.get(); f7.get(); f8.get();
     }
     drop(full.sorted_way_cells, full.sorted_addr_cells, full.sorted_interp_cells, full.sorted_poi_cells,
-         full.sorted_place_cells, full.cell_to_admin, full.admin_index_cells, full.admin_minimal_index_cells);
+         full.sorted_place_cells, full.admin_index_cells, full.admin_minimal_index_cells);
     log_phase(("      " + std::string(bbox.name) + " filter: cell map remap (masked)").c_str(), _ft, _fc);
 
     // --- String pool compaction ---

@@ -1,9 +1,9 @@
 // admin_arcs.h: the arc topology (junctions, cuts, canonical arcs, refs), the
 // arcs' keys and Hilbert presentation order, their slots, the minimal set, the
-// tiers (simplifying, the snap, validity, the crossing repair, nesting), the
-// arc stage's dirs and its per-polygon rings following each admin permute. In
-// the sanitized suite: the topology's scatter and partition passes, the
-// minimal chains and the repair grid index their arrays directly.
+// tiers (simplifying, the snap, validity, the crossing repair, nesting, the e7
+// grid), the arc stage's dirs and its per-polygon rings following each admin
+// permute. In the sanitized suite: the topology's scatter and partition
+// passes, the minimal chains and the repair grid index their arrays directly.
 #include "admin_arcs.h"
 
 #include <algorithm>
@@ -553,7 +553,45 @@ TEST(no_arc_slot_is_reused_on_the_day_it_is_freed) {
     // A key twice: the first in presentation order keeps the slot.
     const ArcSlots twice = allocate_arc_slots({30, 10, 30}, dir.path() + "/3");
     CHECK(twice.slots == std::vector<uint32_t>({2, 0, 4}));
-    CHECK(refusal_of([&] { allocate_arc_slots({1}, dir.path() + "/none"); }).find("unreadable") != std::string::npos);
+    CHECK_EQ(three.counts.previous_sidecar_missing, size_t(0));
+}
+
+TEST(a_previous_build_without_an_arc_sidecar_leaves_every_arc_slot_cold_and_says_so) {
+    using namespace gc::id_alloc;
+    const ScratchDir dir("admin-arc-cold-slots");
+    // No sidecar where the previous build's would be: the fresh build's slots, counted as a cold start.
+    const ArcSlots cold = allocate_arc_slots({30, 10, 20}, dir.path() + "/none");
+    CHECK(cold.slots == std::vector<uint32_t>({0, 1, 2}));
+    CHECK_EQ(cold.counts.appended, size_t(3));
+    CHECK_EQ(cold.counts.kept, size_t(0));
+    CHECK_EQ(cold.counts.previous_sidecar_missing, size_t(1));
+    CHECK(cold.sidecar.size() == 3u);
+    const std::string lines = arc_slot_start_lines("planet", ArcSet::Minimal, dir.path() + "/none", cold.counts);
+    CHECK(lines.find("planet arcs: no previous minimal arc slots at " + dir.path() + "/none, every slot cold") !=
+          std::string::npos);
+    CHECK(lines.find("ARC_CHECK slots=arcs set=minimal region=planet previous_sidecar_missing=1\n") != std::string::npos);
+    // With the sidecar there, the count is 0; without a previous build, no line at all.
+    IdAllocator::write_sidecar(dir.path() + "/1", cold.sidecar);
+    const ArcSlots warm = allocate_arc_slots({20, 30}, dir.path() + "/1");
+    CHECK(warm.slots == std::vector<uint32_t>({2, 0}));
+    CHECK_EQ(warm.counts.previous_sidecar_missing, size_t(0));
+    CHECK(arc_slot_start_lines("europe", ArcSet::Full, dir.path() + "/1", warm.counts) ==
+          "ARC_CHECK slots=arcs set=full region=europe previous_sidecar_missing=0\n");
+    CHECK(arc_slot_start_lines("planet", ArcSet::Full, "", allocate_arc_slots({1}, "").counts).empty());
+    // A sidecar that is there but can't be read is refused, not taken for a cold start.
+    std::ofstream(dir.path() + "/garbage") << "not a sidecar";
+    CHECK(refusal_of([&] { allocate_arc_slots({1}, dir.path() + "/garbage"); }).find("unreadable arc sidecar") !=
+          std::string::npos);
+}
+
+TEST(an_arc_sidecar_path_that_cant_be_looked_up_is_refused_not_taken_for_a_cold_start) {
+    const ScratchDir dir("admin-arc-looped-sidecar");
+    // Two links naming each other: looking the path up fails (ELOOP), which says nothing of whether the previous
+    // build had the sidecar.
+    std::filesystem::create_symlink(dir.path() + "/b", dir.path() + "/a");
+    std::filesystem::create_symlink(dir.path() + "/a", dir.path() + "/b");
+    CHECK(refusal_of([&] { allocate_arc_slots({1}, dir.path() + "/a"); }).find("unreadable arc sidecar") !=
+          std::string::npos);
 }
 
 TEST(a_repeated_keys_slot_that_no_arc_holds_is_a_tombstone_and_recycled_the_day_after) {
@@ -1213,7 +1251,7 @@ TEST(the_repair_grid_is_handed_back_before_the_vertices_are_counted) {
 
 // --- Nesting ---
 
-TEST(a_hole_simplifying_leaves_outside_gets_vertices_back_and_one_the_snap_crosses_counts_as_introduced) {
+TEST(a_hole_simplifying_leaves_outside_gets_vertices_back_and_one_the_snap_crosses_keeps_the_e7_grid) {
     const int32_t s = 100000;
     // The outer ring bows 3000 out round a hole: straightened, it leaves the
     // hole outside, crossing nothing, until the bow comes back.
@@ -1221,7 +1259,8 @@ TEST(a_hole_simplifying_leaves_outside_gets_vertices_back_and_one_the_snap_cross
                                pt(s, 40000), pt(s, 0)});
     const Ring hole = closed({pt(s + 1000, 48000), pt(s + 1000, 52000), pt(s + 2000, 52000), pt(s + 2000, 48000)});
     // A hole 4 under its outer ring's slanted edge, both on single raw
-    // edges: snapped to the grid they cross, with no vertex to give back.
+    // edges: snapped to the grid they cross, with no vertex to give back,
+    // so both rings keep OSM's own grid.
     const int32_t at = 1000000;
     const Ring outer_snapped = closed({pt(at, 0), pt(at + 100049, 0), pt(at + 100149, s), pt(at, s)});
     const Ring hole_snapped =
@@ -1238,9 +1277,13 @@ TEST(a_hole_simplifying_leaves_outside_gets_vertices_back_and_one_the_snap_cross
     CHECK(state.counts.nesting_restored >= 1);
     const Ring kept = points_of(stored_of(arcs, store, simplified_tier(), state, arc_through(arcs, store, outer[4])));
     CHECK(std::find(kept.begin(), kept.end(), outer[4]) != kept.end());
-    CHECK_EQ(state.counts.rings_nest_introduced, size_t(1));
-    CHECK_EQ(state.counts.crossings_left, size_t(2));
-    CHECK_EQ(state.counts.unrepairable_segments, size_t(3));
+    for (const Ring* ring : {&outer_snapped, &hole_snapped}) {
+        const Ring stored = points_of(stored_of(arcs, store, simplified_tier(), state, arc_through(arcs, store, (*ring)[1])));
+        CHECK(same_closed_ring(stored.data(), uint32_t(stored.size()), ring->data(), uint32_t(ring->size())));
+    }
+    CHECK_EQ(state.counts.rings_nest_introduced, size_t(0));
+    CHECK_EQ(state.counts.crossings_left, size_t(0));
+    CHECK_EQ(state.counts.unrepairable_segments, size_t(0));
     CHECK_EQ(state.counts.raw_crossings, size_t(2));
 }
 
@@ -1607,21 +1650,26 @@ TEST(a_dirs_arc_and_ring_files_lay_the_blocks_out_in_slot_order) {
         REQUIRE(end - at[slot] == blocks.tiers[1].bytes_of(a));
         CHECK(std::memcmp(vertices.data() + at[slot], blocks.tiers[1].data(a), end - at[slot]) == 0);
     }
-    // Records: polygon 5 then a tombstone then polygon 0 (its hole).
+    // Records: polygon 5 then a tombstone then polygon 0 (its hole), the
+    // same bytes in each dir.
     AdminPolygon five{}, zero{};
     five.name_id = 55;
     zero.name_id = 11;
-    const size_t ring_bytes = write_ring_files(dir.path(), blocks, ArcSet::Full, {five, admin_polygon_tombstone(), zero},
-                                               {5, NO_DATA, 0});
+    const std::string twin = dir.path() + "/twin";
+    std::filesystem::create_directories(twin);
+    const size_t ring_bytes = write_ring_files({dir.path(), twin}, blocks, ArcSet::Full,
+                                               {five, admin_polygon_tombstone(), zero}, {5, NO_DATA, 0});
     const std::vector<char> records = read_bytes(dir.path() + "/admin_polygons.bin"),
                             rings = read_bytes(dir.path() + "/admin_rings.bin");
+    CHECK(read_bytes(twin + "/admin_polygons.bin") == records);
+    CHECK(read_bytes(twin + "/admin_rings.bin") == rings);
     REQUIRE(records.size() == 3 * sizeof(AdminPolygon));
     AdminPolygon got[3];
     std::memcpy(got, records.data(), records.size());
     const BlockSpan b5 = blocks.polygons[5].blocks[0], b0 = blocks.polygons[0].blocks[0];
-    CHECK(got[0].vertex_offset == 0 && got[0].vertex_count == b5.size && got[0].hole_count == 0 && got[0].name_id == 55);
-    CHECK(got[1].vertex_offset == NO_DATA && got[1].vertex_count == 0 && got[1].name_id == NO_DATA);
-    CHECK(got[2].vertex_offset == b5.size && got[2].vertex_count == b0.size && got[2].hole_count == 1);
+    CHECK(got[0].ring_offset == 0 && got[0].ring_bytes == b5.size && got[0].hole_count == 0 && got[0].name_id == 55);
+    CHECK(got[1].ring_offset == NO_DATA && got[1].ring_bytes == 0 && got[1].name_id == NO_DATA);
+    CHECK(got[2].ring_offset == b5.size && got[2].ring_bytes == b0.size && got[2].hole_count == 1);
     REQUIRE(rings.size() == ring_bytes && ring_bytes == size_t(b5.size) + b0.size);
     CHECK(std::memcmp(rings.data(), full.ring_blocks.data() + b5.offset, b5.size) == 0);
     CHECK(std::memcmp(rings.data() + b5.size, full.ring_blocks.data() + b0.offset, b0.size) == 0);
@@ -1629,37 +1677,9 @@ TEST(a_dirs_arc_and_ring_files_lay_the_blocks_out_in_slot_order) {
 
 // --- The stage's dirs ---
 
-TEST(the_arc_dirs_are_refused_before_the_build_starts) {
-    const ScratchDir root("admin-arc-dirs");
-    const std::string out = root.path() + "/out", arcs = root.path() + "/arcs", prev = root.path() + "/prev";
-    auto refusal = [&](const std::string& o, const std::string& a, const std::string& p) {
-        return refusal_of([&] { require_arc_dirs(o, a, p); });
-    };
-    CHECK_EQ(refusal(out, "", ""), std::string());
-    CHECK_EQ(refusal(out, arcs, ""), std::string());
-    CHECK(refusal(out, "", prev).find("without --arcs-out") != std::string::npos);
-    CHECK(refusal(out, out, "").find("overlaps") != std::string::npos);
-    CHECK(refusal(out, out + "/arcs", "").find("overlaps") != std::string::npos);
-    CHECK(refusal(arcs + "/out", arcs, "").find("overlaps") != std::string::npos);
-    CHECK(refusal(out, root.path() + "/./out/", "").find("overlaps") != std::string::npos);
-    CHECK(refusal(out, root.path() + "/outside", "").empty());
-    std::filesystem::create_directories(arcs);
-    std::ofstream(arcs + "/left") << "x";
-    CHECK(refusal(out, arcs, "").find("not empty") != std::string::npos);
-    CHECK(refusal(out, root.path() + "/arcs2", prev).find("no planet arc sidecar") != std::string::npos);
-    const std::string sidecar = arc_sidecar_path(prev + "/planet", ArcSet::Full);
-    CHECK_EQ(sidecar, prev + "/planet/quality/exact/arc_index.osm_ids");
-    CHECK_EQ(arc_sidecar_path(prev + "/planet", ArcSet::Minimal), prev + "/planet/admin-minimal/arc_index.osm_ids");
-    std::filesystem::create_directories(prev + "/planet/quality/exact");
-    gc::id_alloc::IdAllocator::write_sidecar(sidecar, {});
-    // The minimal set's too.
-    CHECK(refusal(out, root.path() + "/arcs2", prev).find("admin-minimal/arc_index.osm_ids") != std::string::npos);
-    std::filesystem::create_directories(prev + "/planet/admin-minimal");
-    gc::id_alloc::IdAllocator::write_sidecar(arc_sidecar_path(prev + "/planet", ArcSet::Minimal), {});
-    CHECK_EQ(refusal(out, root.path() + "/arcs2", prev), std::string());
-    // A build with continents needs each one's too.
-    CHECK(refusal_of([&] { require_arc_dirs(out, root.path() + "/arcs2", prev, {"planet", "europe"}); })
-              .find("no europe arc sidecar " + prev + "/europe/quality/exact/arc_index.osm_ids") != std::string::npos);
+TEST(a_regions_arc_sidecars_sit_with_the_exact_tier_and_admin_minimal) {
+    CHECK_EQ(arc_sidecar_path("prev/planet", ArcSet::Full), std::string("prev/planet/quality/exact/arc_index.osm_ids"));
+    CHECK_EQ(arc_sidecar_path("prev/planet", ArcSet::Minimal), std::string("prev/planet/admin-minimal/arc_index.osm_ids"));
 }
 
 // --- Polygons in lockstep ---
@@ -1724,4 +1744,76 @@ TEST(each_polygons_arc_rings_follow_it_through_the_admin_permutes) {
     CHECK(refusal_of<std::logic_error>([&] { permute_admin_polygons(d, {2, 1, 0}, 1); }).find("out of step") !=
           std::string::npos);
     CHECK(d.admin_osm_ids == osm_ids);
+}
+
+// --- The e7 grid ---
+
+TEST(a_polygon_kept_on_the_e7_grid_keeps_its_junctions_there_in_its_neighbours_arcs) {
+    const int32_t s = 100000, at = 1000000;
+    // The snapped hole above, its outer ring's slanted edge shared with a
+    // neighbour whose far corners sit off the 1.1 m grid.
+    const PackedLocation low = pt(at + 100049, 0), high = pt(at + 100149, s);
+    const Ring outer = closed({pt(at, 0), low, high, pt(at, s)});
+    const Ring hole = closed({pt(at + 99000, 90000), pt(at + 100135, 90000), pt(at + 100135, 90600), pt(at + 99000, 90600)});
+    const Ring neighbour = closed({low, pt(at + 200037, 0), pt(at + 200037, s), high});
+    const AdminExactRings store = store_of({{outer, {hole}}, {neighbour, {}}});
+    const AdminArcs arcs = build_admin_arcs(store, {false, false}, "", 1);
+    const ArcTierState& state = arcs.tiers[0];
+    CHECK_EQ(state.counts.rings_nest_introduced, size_t(0));
+    // The polygon's arcs as OSM has them.
+    const uint32_t shared = arc_through(arcs, store, pt(at, s));
+    for (const PackedLocation& p : {pt(at, s), hole[1]}) {
+        const uint32_t a = arc_through(arcs, store, p);
+        REQUIRE(a != UINT32_MAX);
+        CHECK(points_of(stored_of(arcs, store, simplified_tier(), state, a)) == vertices_of(store, arcs.arcs[a]));
+    }
+    CHECK(shared != UINT32_MAX);
+    // The neighbour's own arc: its ends the polygon's junctions as they are,
+    // its corners snapped.
+    const uint32_t own = arc_through(arcs, store, pt(at + 200037, 0));
+    REQUIRE(own != UINT32_MAX);
+    const Ring raw = vertices_of(store, arcs.arcs[own]);
+    const Ring stored = points_of(stored_of(arcs, store, simplified_tier(), state, own));
+    // Its two junctions and its two corners.
+    REQUIRE(raw.size() == 4);
+    REQUIRE(stored.size() == raw.size());
+    CHECK(stored.front() == raw.front() && stored.back() == raw.back());
+    for (size_t i = 1; i + 1 < raw.size(); i++) CHECK(stored[i] == pt(floordiv_snap(raw[i].lat_e7), floordiv_snap(raw[i].lon_e7)));
+    // Their blocks keep OSM's grid, the chains close, and the rings come back.
+    const AdminArcBlocks blocks = encode_admin_arcs(arcs, store, 1);
+    const ArcBlocks& simplified = blocks.tiers[0];
+    for (uint32_t a = 0; a < arcs.arcs.size(); a++) {
+        arc_blocks::DecodedArc d;
+        REQUIRE(arc_blocks::decode_arc(simplified.data(a), simplified.bytes_of(a), d));
+        CHECK_EQ(int(d.k), 0);
+        CHECK(d.vertices == points_of(stored_of(arcs, store, simplified_tier(), state, a)));
+    }
+    for (uint32_t p = 0; p < 2; p++) {
+        // Every ring: decoded_rings gives none when a block doesn't decode.
+        const std::vector<Ring> rings = decoded_rings(blocks, ArcSet::Full, 0, blocks.polygons[p]);
+        REQUIRE(rings.size() == store.polygons[p].ring_count);
+        for (uint32_t k = 0; k < rings.size(); k++)
+            CHECK(rings[k] == stored_ring(arcs, store, 0, store.polygons[p].first_ring + k));
+    }
+}
+
+TEST(arcs_away_from_a_polygon_on_the_e7_grid_keep_the_tiers_grid) {
+    const int32_t s = 100000, at = 1000000;
+    const Ring outer = closed({pt(at, 0), pt(at + 100049, 0), pt(at + 100149, s), pt(at, s)});
+    const Ring hole = closed({pt(at + 99000, 90000), pt(at + 100135, 90000), pt(at + 100135, 90600), pt(at + 99000, 90600)});
+    const AdminExactRings store = store_of({{outer, {hole}}, {island(3000000, 3000000, 20000, 24, 7), {}}});
+    const AdminArcs arcs = build_admin_arcs(store, {false, true}, "", 1);
+    const AdminArcBlocks blocks = encode_admin_arcs(arcs, store, 1);
+    auto k_of = [&](size_t t, uint32_t a) {
+        arc_blocks::DecodedArc d;
+        REQUIRE(arc_blocks::decode_arc(blocks.tiers[t].data(a), blocks.tiers[t].bytes_of(a), d));
+        return int(d.k);
+    };
+    CHECK_EQ(k_of(0, arc_through(arcs, store, outer[1])), 0);
+    CHECK_EQ(k_of(0, arc_through(arcs, store, hole[1])), 0);
+    const uint32_t island_arc = arc_through(arcs, store, store.vertices[store.rings[2].begin]);
+    CHECK_EQ(k_of(0, island_arc), 2);
+    CHECK_EQ(k_of(1, island_arc), 0);
+    REQUIRE(arcs.minimal.arcs.size() == 1);
+    CHECK_EQ(k_of(2, 0), 2);
 }

@@ -23,12 +23,12 @@ def page(uploads, truncated=False, next_key="", next_id=""):
 class ParseUploadsTest(unittest.TestCase):
     def test_reads_each_upload_and_ends_on_the_last_page(self):
         uploads, markers = sut.parse_uploads(page([
-            ("geocoder-cache/builds/2026-04-05/full/admin_vertices.bin", "2~abc", "2026-04-06T16:16:56.759Z"),
+            ("geocoder-cache/builds/2026-04-05/full/admin_rings.bin", "2~abc", "2026-04-06T16:16:56.759Z"),
             ("geocoder/speed-test/geo_cells.bin", "xyz", "2026-04-07T14:24:01.86810307Z"),
         ]))
         self.assertIsNone(markers)
         self.assertEqual(uploads, [
-            ("geocoder-cache/builds/2026-04-05/full/admin_vertices.bin", "2~abc",
+            ("geocoder-cache/builds/2026-04-05/full/admin_rings.bin", "2~abc",
              datetime.datetime(2026, 4, 6, 16, 16, 56, tzinfo=UTC)),
             ("geocoder/speed-test/geo_cells.bin", "xyz", datetime.datetime(2026, 4, 7, 14, 24, 1, tzinfo=UTC)),
         ])

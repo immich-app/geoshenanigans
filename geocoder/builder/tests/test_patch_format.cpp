@@ -346,9 +346,9 @@ TEST(patch_format_section_marker_values) {
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v13 = no place cell index. The patcher accepts this
-    // version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(13));
+    // diff/patch tools. v14 = admin geometry as arcs, merged by slot. The patcher
+    // accepts this version only.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(14));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
@@ -654,26 +654,73 @@ TEST(patch_format_string_fields_match_the_record_layouts) {
     CHECK(string_field_offsets(PatchFileId::STREET_WAYS) == V({8}));
     CHECK(string_field_offsets(PatchFileId::INTERP_WAYS) == V({8}));
     CHECK(string_field_offsets(PatchFileId::ADMIN_POLYGONS) == V({8}));
-    CHECK(string_field_offsets(PatchFileId::POSTAL_POLYGONS) == V({8}));
     CHECK(string_field_offsets(PatchFileId::POI_RECORDS) == V({16, 24, 28}));  // not parent_poly_id at 32
     CHECK(string_field_offsets(PatchFileId::PLACE_NODES) == V({8}));  // not parent_poly_id at 16
     CHECK(string_field_offsets(PatchFileId::STREET_NODES).empty());
-    CHECK(string_field_offsets(PatchFileId::ADMIN_VERTICES).empty());
     CHECK(string_field_offsets(PatchFileId::POI_VERTICES).empty());
 
     // Sparse files: string offsets are kind 2 (the u32 itself) and kind 3
-    // (byte 8 of a postcode centroid); kind 1 holds admin polygon ids.
-    std::vector<std::string> strings, admin_ids;
+    // (byte 8 of a postcode centroid); kind 0 holds admin slots, raw.
+    std::vector<std::string> strings, raw;
     for (const auto& f : SPARSE_DELTA_FILES) {
         const std::string name = patch_file_names[(uint32_t)f.fid];
         if (f.remap_kind == 2) { CHECK_EQ(f.value_stride, 4u); strings.push_back(name); }
         if (f.remap_kind == 3) { CHECK_EQ(f.value_stride, 16u); strings.push_back(name); }
-        if (f.remap_kind == 1) admin_ids.push_back(name);
+        if (f.remap_kind == 0) raw.push_back(name);
     }
     CHECK(strings == std::vector<std::string>({"addr_postcodes.bin", "way_postcodes.bin",
                                                "interp_postcodes.bin", "postcode_centroids.bin"}));
-    CHECK(admin_ids == std::vector<std::string>({"admin_parents.bin", "way_parents.bin"}));
+    CHECK(raw == std::vector<std::string>({"admin_parents.bin", "way_parents.bin"}));
     CHECK_EQ(POSTCODE_CENTROID_POSTCODE_ID_OFF, size_t(8));
+}
+
+// v14: file ids 7, 26 and 27 name the arc files, of no string field, which
+// the diff merges by slot (ADMIN_SLOT_FAMILIES: the arc index at 4 bytes a
+// record, the streams at 1, after their slot files): no table that remaps or
+// scans a file by its records at the admin stride (as the postal polygons
+// were) names them, nor remap kind 1 (an admin id) any file.
+TEST(patch_format_v14_names_the_arc_files_and_keeps_admin_slots) {
+    CHECK_EQ(std::string(patch_file_names[7]), std::string("admin_rings.bin"));
+    CHECK_EQ(std::string(patch_file_names[26]), std::string("arc_index.bin"));
+    CHECK_EQ(std::string(patch_file_names[27]), std::string("arc_vertices.bin"));
+    CHECK(uint32_t(PatchFileId::ADMIN_RINGS) == 7 && uint32_t(PatchFileId::ARC_INDEX) == 26 &&
+          uint32_t(PatchFileId::ARC_VERTICES) == 27);
+    for (const PatchFileId arc_file : {PatchFileId::ADMIN_RINGS, PatchFileId::ARC_INDEX, PatchFileId::ARC_VERTICES}) {
+        CHECK(string_field_offsets(arc_file).empty());
+        for (const auto& f : STRING_RECORD_FILES) CHECK(f.fid != arc_file);
+        CHECK(sparse_delta_file(arc_file) == nullptr);
+        CHECK(parallel_delta_file(arc_file) == nullptr);
+    }
+    for (const auto& f : SPARSE_DELTA_FILES) CHECK(f.remap_kind != 1);
+    for (const auto& f : PARALLEL_DELTA_FILES) CHECK(f.remap_kind != 1);
+    std::vector<std::string> sent;
+    for (const AdminSlotFamily& family : ADMIN_SLOT_FAMILIES)
+        for (const PatchFileId fid : {family.slots, family.blocks}) sent.push_back(patch_file_names[uint32_t(fid)]);
+    CHECK(sent == std::vector<std::string>({"arc_index.bin", "arc_vertices.bin", "admin_polygons.bin", "admin_rings.bin"}));
+    CHECK_EQ(ADMIN_SLOT_FAMILIES[0].stride, size_t(4));
+    CHECK_EQ(ADMIN_SLOT_FAMILIES[1].stride, ADMIN_POLYGON_STRIDE);
+}
+
+// A sparse delta's file, value stride and remap kind are a row of
+// SPARSE_DELTA_FILES: kind 1 (an admin id, remapped before v14) is refused
+// for every file, as are a value stride or kind another file's, and a file
+// that sends no sparse delta.
+TEST(patch_format_sparse_delta_header_is_a_row_of_its_table) {
+    for (const auto& f : SPARSE_DELTA_FILES)
+        CHECK_EQ(refusal_of([&] { check_sparse_delta_header(uint32_t(f.fid), f.value_stride, f.remap_kind); }), std::string());
+    auto refusal = [](PatchFileId fid, uint32_t stride, uint32_t kind) {
+        return refusal_of([&] { check_sparse_delta_header(uint32_t(fid), stride, kind); });
+    };
+    const std::string malformed = "Malformed sparse delta";
+    CHECK_EQ(refusal(PatchFileId::ADMIN_PARENTS, 4, 1), malformed);
+    CHECK_EQ(refusal(PatchFileId::WAY_PARENTS, 4, 1), malformed);
+    CHECK_EQ(refusal(PatchFileId::ADMIN_PARENTS, 4, 2), malformed);
+    CHECK_EQ(refusal(PatchFileId::ADDR_POSTCODES, 4, 0), malformed);
+    CHECK_EQ(refusal(PatchFileId::POSTCODE_CENTROIDS, 4, 3), malformed);
+    CHECK_EQ(refusal(PatchFileId::ADDR_POSTCODES, 16, 2), malformed);
+    CHECK_EQ(refusal(PatchFileId::ARC_INDEX, 4, 0), malformed);
+    CHECK_EQ(refusal_of([] { check_sparse_delta_header(uint32_t(PatchFileId::COUNT), 4, 0); }), malformed);
+    CHECK_EQ(refusal_of([] { check_sparse_delta_header(0xFFFFFFFFu, 4, 0); }), malformed);
 }
 
 TEST(patch_format_string_record_files_cover_every_string_field) {
@@ -696,12 +743,12 @@ TEST(patch_format_string_record_files_cover_every_string_field) {
 TEST(patch_format_old_file_must_be_the_size_the_patch_was_made_from) {
     ScratchDir dir("old-size");
     REQUIRE(write_file(dir.path() + "/admin_polygons.bin", std::vector<char>(48, 'x')));
-    REQUIRE(write_file(dir.path() + "/postal_polygons.bin", std::vector<char>()));
+    REQUIRE(write_file(dir.path() + "/arc_index.bin", std::vector<char>()));
     auto message = [&](const std::string& name, uint64_t expected) {
         return refusal_of([&] { require_old_file_size(dir.path(), name, expected); });
     };
     CHECK_EQ(message("admin_polygons.bin", 48), std::string());
-    CHECK_EQ(message("postal_polygons.bin", 0), std::string());
+    CHECK_EQ(message("arc_index.bin", 0), std::string());
     // The diff writes 0 for a file the old dir lacks.
     CHECK_EQ(message("absent.bin", 0), std::string());
     CHECK_EQ(message("admin_polygons.bin", 72),
@@ -1578,44 +1625,48 @@ TEST(patch_format_scratch_table_refuses_a_file_it_cannot_close) {
     CHECK(sut.table().empty());
 }
 
-// A parent-id remap after its marker: the admin, street and reserved postcode
-// legs, each a count and its pairs.
-static std::vector<char> parent_id_remap_bytes(const std::vector<RemapPair>& admin, const std::vector<RemapPair>& street,
-                                               const std::vector<RemapPair>& postcode = {}) {
+// Legs of a parent-id remap after its marker, each a count and its pairs:
+// v14's is the street leg alone; v13's were the admin, street and reserved
+// postcode legs.
+static std::vector<char> parent_id_remap_bytes(const std::vector<std::vector<RemapPair>>& legs) {
     std::vector<char> out;
-    for (const std::vector<RemapPair>* leg : {&admin, &street, &postcode}) {
-        const uint32_t n = static_cast<uint32_t>(leg->size());
+    for (const std::vector<RemapPair>& leg : legs) {
+        const uint32_t n = static_cast<uint32_t>(leg.size());
         out.insert(out.end(), reinterpret_cast<const char*>(&n), reinterpret_cast<const char*>(&n) + 4);
-        const std::vector<char> pairs = pair_bytes(*leg);
+        const std::vector<char> pairs = pair_bytes(leg);
         out.insert(out.end(), pairs.begin(), pairs.end());
     }
     return out;
 }
 
-TEST(patch_format_parent_id_remap_reads_its_legs_where_they_sit) {
-    const std::vector<char> bytes = parent_id_remap_bytes({{1, 0}, {7, 3}}, {{4, 9}}, {{2, 2}});
+// The street leg is the whole section: the parse reads its pairs where they
+// sit and stops past them, so the words of a three-leg (v13) remap after its
+// first leg are left to the section loop (which refuses them,
+// patch_refuses_a_three_leg_parent_id_remap).
+TEST(patch_format_parent_id_remap_reads_its_street_leg_where_it_sits) {
+    const std::vector<char> bytes = parent_id_remap_bytes({{{1, 0}, {7, 3}}});
     size_t pos = 0;
 
-    const ParentIdRemap sut = parse_parent_id_remap(bytes.data(), bytes.size(), pos);
+    const SortedTable<RemapPair> sut = parse_parent_id_remap(bytes.data(), bytes.size(), pos);
 
     CHECK_EQ(pos, bytes.size());
-    CHECK(sut.admin.data() == bytes.data() + 4);
-    CHECK_EQ(sut.admin.size(), size_t(2));
-    CHECK_EQ(sut.admin.find(7)->to, 3u);
-    CHECK(!sut.admin.find(4));
-    CHECK(sut.street.data() == bytes.data() + 4 + 16 + 4);
-    CHECK_EQ(sut.street.find(4)->to, 9u);
-    CHECK_EQ(sut.n_postcode, 1u);
+    CHECK(sut.data() == bytes.data() + 4);
+    CHECK_EQ(sut.size(), size_t(2));
+    CHECK_EQ(sut.find(7)->to, 3u);
+    CHECK(!sut.find(4));
+
+    const std::vector<char> three_legs = parent_id_remap_bytes({{{1, 0}, {7, 3}}, {{4, 9}}, {}});
+    pos = 0;
+    CHECK_EQ(parse_parent_id_remap(three_legs.data(), three_legs.size(), pos).size(), size_t(2));
+    CHECK_EQ(pos, 4 + 2 * sizeof(RemapPair));
 }
 
 TEST(patch_format_parent_id_remap_refuses_a_leg_out_of_order_or_cut_short) {
     struct Case { std::vector<char> bytes; std::string refusal; };
-    const std::vector<char> whole = parent_id_remap_bytes({{1, 0}, {7, 3}}, {{4, 9}, {6, 2}});
+    const std::vector<char> whole = parent_id_remap_bytes({{{4, 9}, {6, 2}}});
     std::vector<Case> cases = {
-        {parent_id_remap_bytes({{7, 3}, {1, 0}}, {}), "Malformed POI parent-id remap"},
-        {parent_id_remap_bytes({{7, 3}, {7, 4}}, {}), "Malformed POI parent-id remap"},
-        {parent_id_remap_bytes({}, {{6, 2}, {4, 9}}), "Malformed POI parent-id remap"},
-        {parent_id_remap_bytes({}, {{4, 9}, {4, 2}}), "Malformed POI parent-id remap"},
+        {parent_id_remap_bytes({{{6, 2}, {4, 9}}}), "Malformed POI parent-id remap"},
+        {parent_id_remap_bytes({{{4, 9}, {4, 2}}}), "Malformed POI parent-id remap"},
     };
     for (size_t cut = 0; cut < whole.size(); cut++)
         cases.push_back({std::vector<char>(whole.begin(), whole.begin() + cut), "Truncated POI parent-id remap"});
@@ -2908,11 +2959,11 @@ TEST(patch_format_record_remap_lookup_with_a_hint_matches_the_index) {
 
 TEST(patch_format_parallel_delta_files_follow_their_parent) {
     // v8 side files: one u32 per parent record, remapped like their sparse
-    // delta (admin ids for way_parents, string offsets for postcodes).
+    // delta (way_parents' admin slots raw, string offsets for postcodes).
     const ParallelDeltaFile* f = parallel_delta_file(PatchFileId::WAY_PARENTS);
     REQUIRE(f != nullptr);
     CHECK(f->parent == PatchFileId::STREET_WAYS);
-    CHECK_EQ(f->remap_kind, 1u);
+    CHECK_EQ(f->remap_kind, 0u);
     f = parallel_delta_file(PatchFileId::ADDR_POSTCODES);
     REQUIRE(f != nullptr);
     CHECK(f->parent == PatchFileId::ADDR_POINTS);
@@ -3031,11 +3082,13 @@ TEST(patch_parallel_delta_rejects_invalid_headers) {
         CHECK_EQ(refusal_of([&] { check_parallel_delta_header(uint32_t(fid), parent, stride, remap); }),
                  std::string("Malformed parallel delta"));
     };
-    rejects(PatchFileId::WAY_PARENTS, uint32_t(PatchFileId::COUNT), 4, 1);
-    rejects(PatchFileId::WAY_PARENTS, 0xFFFFFFFFu, 4, 1);
-    rejects(PatchFileId::WAY_PARENTS, uint32_t(PatchFileId::ADDR_POINTS), 4, 1);
+    rejects(PatchFileId::WAY_PARENTS, uint32_t(PatchFileId::COUNT), 4, 0);
+    rejects(PatchFileId::WAY_PARENTS, 0xFFFFFFFFu, 4, 0);
+    rejects(PatchFileId::WAY_PARENTS, uint32_t(PatchFileId::ADDR_POINTS), 4, 0);
     rejects(PatchFileId::WAY_PARENTS, uint32_t(PatchFileId::STREET_WAYS), 4, 3);
-    rejects(PatchFileId::WAY_PARENTS, uint32_t(PatchFileId::STREET_WAYS), 16, 1);
+    rejects(PatchFileId::WAY_PARENTS, uint32_t(PatchFileId::STREET_WAYS), 16, 0);
+    // v14: way_parents holds admin slots, which no patch remaps.
+    rejects(PatchFileId::WAY_PARENTS, uint32_t(PatchFileId::STREET_WAYS), 4, 1);
     rejects(PatchFileId::POI_RECORDS, uint32_t(PatchFileId::POI_RECORDS), 4, 0);
 }
 

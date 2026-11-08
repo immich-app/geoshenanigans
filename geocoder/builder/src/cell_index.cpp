@@ -25,7 +25,6 @@
 #include "admin_rank_config.h"
 #include "geometry.h"
 #include "id_allocator.h"
-#include "keyhole_pack.h"
 #include "parallel.h"
 #include "place_claims.h"
 #include "polygon_rings.h"
@@ -203,20 +202,20 @@ static std::vector<uint32_t> apply_strategy2_streets(ParsedData& data, const std
 }
 
 // Strategy-2 stable IDs for admin_polygons.
-// Stable identity: (relation_id<<16 | ring_index) packed into uint64_t.
-// Closed-way admin polygons (non-relation-sourced) carry stable_id=0
-// and get fresh IDs each build (acceptable: <1% of admin polygons).
+// Stable identity: (relation_id<<16 | ring_index) packed into uint64_t, or
+// OSM_WAY + way id for a closed-way polygon.
 //
 // Reference sites updated:
-//   - data.cell_to_admin (map values)
+//   - data.admin_index_cells, data.admin_minimal_index_cells (item ids)
 //   - data.admin_parent_ids (parallel array — both reorder AND value remap)
 //   - data.way_parent_ids (values point to admin polys — value remap)
 //   - data.poi_records[*].parent_poly_id
 //   - data.place_nodes[*].parent_poly_id
 //
-// admin_polygons are written to /full/admin_polygons.bin in the admin
-// variant and to /quality/q*/ in quality variants; sidecar is canonical
-// at /admin/admin_polygons.osm_ids (admin variant always has it).
+// The previous slots are the previous build's admin_polygons.osm_ids beside
+// its exact tier (admin_sidecar_path): without it every slot is allocated
+// cold, which a log line and an o11y count (ARC_CHECK
+// previous_sidecar_missing) show.
 static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir) {
     using namespace gc::id_alloc;
     if (data.admin_polygons.empty()) return;
@@ -224,15 +223,11 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
 
     IdAllocator alloc;
     if (!prev_dir.empty()) {
-        // admin_polygons.osm_ids canonical paths, in priority order:
-        // quality/uncapped (admin_polygons.bin written for every quality
-        // tier including uncapped, sidecars are identical), then quality/q2.5.
-        // Try each — only one needs to load successfully. (Not /admin/:
-        // admin_polygons.bin is not written there. Not admin-minimal/: its
-        // sidecar numbers only the kept polygons, in its own slots.)
-        if (!alloc.load_previous(prev_dir + "/quality/uncapped/admin_polygons.osm_ids"))
-        if (!alloc.load_previous(prev_dir + "/quality/q2.5/admin_polygons.osm_ids"))
-            { /* fall through: no prev — fresh allocation */ }
+        const std::string sidecar = admin_sidecar_path(prev_dir);
+        const bool loaded = alloc.load_previous(sidecar);
+        if (!loaded) std::cerr << "  strategy2 : admins: no previous slots at " << sidecar << ", every slot cold" << std::endl;
+        std::cerr << "ARC_CHECK slots=admin_polygons region=" << prev_dir.substr(prev_dir.find_last_of('/') + 1)
+                  << " previous_sidecar_missing=" << (loaded ? 0 : 1) << "\n";
     }
 
     const size_t n_old = data.admin_polygons.size();
@@ -259,12 +254,11 @@ static void apply_strategy2_admins(ParsedData& data, const std::string& prev_dir
     if (!data.admin_parent_ids.empty()) reorder_by_remap(data.admin_parent_ids, remap, n_new, NO_DATA);
 
     // Apply remap to every reference site that points into admin_polygons[].
-    // cell_to_admin entries carry the high-bit INTERIOR_FLAG (set by
-    // admin_candidate_cells for cells fully inside a polygon). A
-    // flagged value is ≥ 2^31, so the plain remap_index's `v < remap.size()`
-    // guard would skip it and leave a stale polygon index after reorder, so
-    // use remap_index_flagged which masks the flag, remaps, then re-ORs.
-    remap_cell_map(data.cell_to_admin, [&](uint32_t& v) { remap_index_flagged(v, remap); });
+    // Admin cell entries carry the high-bit INTERIOR_FLAG (set for cells
+    // fully inside a polygon). A flagged value is ≥ 2^31, so the plain
+    // remap_index's `v < remap.size()` guard would skip it and leave a stale
+    // polygon index after reorder, so use remap_index_flagged which masks the
+    // flag, remaps, then re-ORs.
     remap_cell_pairs(data.admin_index_cells, [&](uint32_t& v) { remap_index_flagged(v, remap); });
     remap_cell_pairs(data.admin_minimal_index_cells, [&](uint32_t& v) { remap_index_flagged(v, remap); });
     // admin_parent_ids and way_parent_ids hold admin polygon IDs (parent chain).
@@ -522,13 +516,11 @@ void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir, RunOr
 // point-in-polygon test of `countries`.
 static uint16_t country_at(const ParsedData& data, const AdminRings& countries, double lat, double lng) {
     const PackedLocation p = point_e7(lat, lng);
-    auto it = data.cell_to_admin.find(admin_link_cell(p).id());
-    if (it == data.cell_to_admin.end()) return 0;
+    const auto [first, last] = admin_cell_entries(data.admin_country_cells, admin_link_cell(p).id());
+    if (first == last) return 0;
 
-    // Selection must be independent of the entry-vector order: the on-disk
-    // cell index is sorted at write time, but the IN-MEMORY cell_to_admin
-    // vectors reflect covering completion order, which is not guaranteed
-    // across runs. "First candidate wins" here made a few hundred
+    // Selection must be independent of the entries' order, which follows
+    // the polygons' slots: "first candidate wins" here made a few hundred
     // borderline/offshore postcode centroids flip country between
     // otherwise-identical builds (same-PBF chain patch blew up from 251 B
     // to 6 MB via strategy-2 identity churn).
@@ -543,8 +535,8 @@ static uint16_t country_at(const ParsedData& data, const AdminRings& countries, 
     //    rejects downstream anyway.
     uint16_t single_cc = 0;
     bool multiple = false;
-    for (uint32_t raw_id : it->second) {
-        uint32_t pid = raw_id & ID_MASK;
+    for (const CellItemPair* e = first; e != last; ++e) {
+        uint32_t pid = e->item_id & ID_MASK;
         if (pid >= data.admin_polygons.size()) continue;
         const auto& poly = data.admin_polygons[pid];
         if (poly.admin_level != 2 || poly.country_code == 0) continue;
@@ -561,14 +553,14 @@ static uint16_t country_at(const ParsedData& data, const AdminRings& countries, 
     float best_area = std::numeric_limits<float>::max();
     uint16_t best_cc = 0;        // smallest containing polygon's country
     uint16_t fallback_cc = 0;    // lowest cc among all candidates
-    for (uint32_t raw_id : it->second) {
-        uint32_t pid = raw_id & ID_MASK;
+    for (const CellItemPair* e = first; e != last; ++e) {
+        uint32_t pid = e->item_id & ID_MASK;
         if (pid >= data.admin_polygons.size()) continue;
         const auto& poly = data.admin_polygons[pid];
         if (poly.admin_level != 2 || poly.country_code == 0) continue;
         if (fallback_cc == 0 || poly.country_code < fallback_cc)
             fallback_cc = poly.country_code;
-        if ((raw_id & INTERIOR_FLAG) || countries.contains(pid, p)) {
+        if ((e->item_id & INTERIOR_FLAG) || countries.contains(pid, p)) {
             if (poly.area < best_area ||
                 (poly.area == best_area && poly.country_code < best_cc)) {
                 best_area = poly.area;
@@ -591,23 +583,24 @@ AdminRings border_country_rings(const ParsedData& data, unsigned int threads) {
     };
     const size_t polygons = data.admin_polygons.size();
     std::vector<std::atomic<uint64_t>> tested(polygons / 64 + 1);
-    const auto& cells = data.cell_to_admin;
-    parallel_for(cells.bucket_count(), [&](size_t b0, size_t b1, unsigned) {
-        for (size_t b = b0; b < b1; b++)
-            for (auto it = cells.begin(b); it != cells.end(b); ++it) {
-                const auto& ids = it->second;
-                uint16_t first_cc = 0;
-                bool border = false;
-                for (uint32_t raw_id : ids) {
-                    if (!country_ring(raw_id)) continue;
-                    uint16_t cc = data.admin_polygons[raw_id & ID_MASK].country_code;
-                    if (first_cc == 0) first_cc = cc;
-                    else if (cc != first_cc) border = true;
-                }
-                if (!border) continue;
-                for (uint32_t raw_id : ids)
-                    if (country_ring(raw_id)) mark_bit(tested, raw_id & ID_MASK);
+    const auto& cells = data.admin_country_cells;
+    parallel_for_runs(cells.size(), same_cell(cells), [&](size_t begin, size_t end, unsigned) {
+        for (size_t run = begin; run < end;) {
+            size_t run_end = run + 1;
+            while (run_end < end && cells[run_end].cell_id == cells[run].cell_id) run_end++;
+            uint16_t first_cc = 0;
+            bool border = false;
+            for (size_t i = run; i < run_end; i++) {
+                if (!country_ring(cells[i].item_id)) continue;
+                uint16_t cc = data.admin_polygons[cells[i].item_id & ID_MASK].country_code;
+                if (first_cc == 0) first_cc = cc;
+                else if (cc != first_cc) border = true;
             }
+            if (border)
+                for (size_t i = run; i < run_end; i++)
+                    if (country_ring(cells[i].item_id)) mark_bit(tested, cells[i].item_id & ID_MASK);
+            run = run_end;
+        }
     }, threads);
     const RankedBits marked(polygons, tested);
     return AdminRings(data.admin_exact_rings, threads,
@@ -1045,345 +1038,171 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     log_phase((label + "total").c_str(), _total_t, _total_c);
 }
 
-// One admin polygon re-simplified at epsilon_scale (0 = as is) and packed on
-// its own; no bytes when fewer than 3 vertices survive. Packed bytes don't
-// depend on where they land, so the writers lay these out back to back
-// instead of holding every simplified vertex list (6 GiB of doubles for the
-// planet's uncapped variant).
-struct PackedPolygon {
-    std::vector<uint8_t> bytes;
-    uint32_t vertex_count = 0;
-    float area = 0;
-    uint16_t hole_count = 0;
-    uint8_t halvings = 0;  // SimplifiedRings::halvings
-    bool nests = true;
-    KeyholeGrid grid = KeyholeGrid::Planned;  // pack_keyhole's
-};
+// --- The admin cell indexes ---
 
-// The build log line of how simplify_rings and pack_keyhole fared over
-// packed polygons.
-static std::string hole_topology(const std::vector<PackedPolygon>& packed) {
-    HoleTopologyCounts counts;
-    KeyholeGridCounts grids;
-    for (const PackedPolygon& p : packed) {
-        counts.add(p.halvings, p.nests);
-        grids.add(p.grid);
-    }
-    return counts.summary() + "; " + grids.summary();
-}
-static PackedPolygon pack_admin_polygon(const ParsedData& data, const AdminPolygon& ap,
-                                        double epsilon_scale) {
-    if (ap.vertex_count < 3) return {};  // tombstone, or no area to draw
-    const NodeCoord* verts = data.admin_vertices.data() + ap.vertex_offset;
-    auto points = [&](const RingSpan& r) {
-        std::vector<std::pair<double,double>> pts;
-        pts.reserve(r.count);
-        for (uint32_t j = 0; j < r.count; j++) pts.emplace_back(verts[r.begin + j].lat, verts[r.begin + j].lng);
-        return pts;
+namespace {
+
+// Each polygon of tier t's set, by its rings as the tier stores them: its
+// cells at kAdminCellLevel and ADMIN_COVER_REACH_RAD (admin_ring_cells), in
+// no order, its id flagged INTERIOR_FLAG where the rings hold the whole cell.
+std::vector<CellItemPair> tier_cells(const AdminArcs& arcs, const AdminExactRings& store, size_t t, unsigned threads) {
+    const ArcTier& tier = kArcTiers[t];
+    const std::vector<uint32_t>& ring_refs = tier.set == ArcSet::Full ? arcs.ring_refs : arcs.minimal.ring_refs;
+    auto in_set = [&](uint32_t p) {
+        const auto& poly = store.polygons[p];
+        return poly.ring_count > 0 && ring_refs[poly.first_ring + 1] > ring_refs[poly.first_ring];
     };
-    std::vector<RingSpan> rings;
-    const bool parsed = split_rings(verts, ap.vertex_count, ap.hole_count, rings);
-    std::vector<std::pair<double,double>> pts;
-    uint16_t holes = parsed ? ap.hole_count : 0;
-    PackedPolygon out;
-    if (epsilon_scale > 0) {
-        // Each ring on its own: simplifying the keyhole range as one ring
-        // would cut its connectors.
-        double eps_m = admin_epsilon_meters(ap.admin_level) * epsilon_scale;
-        std::vector<std::vector<std::pair<double,double>>> hole_rings;
-        for (size_t r = 1; r < rings.size(); r++) hole_rings.push_back(points(rings[r]));
-        SimplifiedRings s = simplify_rings(points(rings[0]), hole_rings,
-            [&](const std::vector<std::pair<double,double>>& ring, double scale) {
-                double lat = ring.empty() ? 0.0 : ring[0].first;
-                return simplify_polygon_epsilon(ring, meters_to_degrees(eps_m * scale, lat));
-            });
-        pts = std::move(s.range);
-        holes = s.holes;
-        out.halvings = s.halvings;
-        out.nests = s.nests;
-    } else {
-        pts = points(RingSpan{0, ap.vertex_count});
-    }
-    if (pts.size() < 3) return out;
-
-    PackedKeyhole keyhole = pack_keyhole(pts, holes);
-    out.bytes = std::move(keyhole.bytes);
-    out.grid = keyhole.grid;
-    out.vertex_count = static_cast<uint32_t>(pts.size());
-    out.area = polygon_area(pts);
-    out.hole_count = holes;
+    // Largest first, one at a time: a country takes seconds, and started last
+    // it would leave one core working alone.
+    const std::vector<uint32_t> largest_first = costliest_first(store.polygons.size(), [&](size_t p) {
+        return in_set(static_cast<uint32_t>(p)) ? store.occurrences(static_cast<uint32_t>(p)) : 0;
+    }, threads);
+    struct Scratch {
+        std::vector<PackedLocation> vertices, ring, raw;
+        std::vector<StoredVertex> stored;
+        std::vector<RingSpan> spans;
+        std::vector<CellItemPair> found;
+    };
+    std::vector<Scratch> scratch(threads);
+    parallel_for_dynamic(largest_first.size(), 1, [&](size_t from, size_t to, unsigned worker) {
+        Scratch& s = scratch[worker];
+        for (size_t k = from; k < to; k++) {
+            const uint32_t p = largest_first[k];
+            if (!in_set(p)) continue;
+            const auto& poly = store.polygons[p];
+            s.vertices.clear();
+            s.spans.clear();
+            for (uint32_t r = poly.first_ring; r < poly.first_ring + poly.ring_count; r++) {
+                tier_ring(arcs, store, tier, arcs.tiers[t], r, s.ring, s.raw, s.stored);
+                s.spans.push_back({static_cast<uint32_t>(s.vertices.size()), static_cast<uint32_t>(s.ring.size())});
+                s.vertices.insert(s.vertices.end(), s.ring.begin(), s.ring.end());
+            }
+            for (const auto& [cell, interior] : admin_ring_cells(s.vertices.data(), s.spans.data(), poly.ring_count,
+                                                                 kAdminCellLevel, ADMIN_COVER_REACH_RAD))
+                s.found.push_back({cell, interior ? p | INTERIOR_FLAG : p});
+        }
+    }, threads);
+    std::vector<size_t> at(threads + 1, 0);
+    for (unsigned w = 0; w < threads; w++) at[w + 1] = at[w] + scratch[w].found.size();
+    std::vector<CellItemPair> out;
+    parallel_resize(out, at[threads]);
+    parallel_for_each(threads, [&](size_t w, unsigned) {
+        std::copy(scratch[w].found.begin(), scratch[w].found.end(), out.begin() + at[w]);
+        scratch[w] = {};
+    }, threads);
     return out;
 }
 
-void compute_admin_index_cells(ParsedData& data, const std::vector<double>& scales,
-                               std::optional<double> minimal_scale) {
-    const unsigned threads = parallel_threads();
-    struct Found {
-        std::vector<CellItemPair> shared, minimal;
-    };
-    std::vector<Found> found(threads);
-    parallel_for_dynamic(data.admin_polygons.size(), 1, [&](size_t begin, size_t end, unsigned worker) {
-        Found& out = found[worker];
-        for (size_t i = begin; i < end; i++) {
-            const AdminPolygon& ap = data.admin_polygons[i];
-            if (ap.vertex_count == 0 || ap.vertex_offset == NO_DATA) continue;
-            // The cells of the ring a variant at `scale` writes, none when it
-            // writes no ring.
-            auto ring_cells = [&](double scale) {
-                const PackedPolygon pp = pack_admin_polygon(data, ap, scale);
-                if (pp.bytes.empty()) return AdminRingCells();
-                const std::vector<NodeCoord> ring = unpack_polygon(pp.bytes.data(), pp.vertex_count);
-                return admin_ring_cells(ring.data(), pp.vertex_count, kAdminCellLevel, ADMIN_COVER_REACH_RAD);
-            };
-            const bool minimal = minimal_scale && admin_minimal_keeps(ap.admin_level, ap.place_type_override);
-            std::optional<AdminRingCells> shared, own_minimal;
-            for (double scale : scales) {
-                AdminRingCells cells = ring_cells(scale);
-                if (minimal && scale == *minimal_scale) own_minimal = cells;
-                if (cells.empty()) continue;
-                shared = shared ? merge_admin_ring_cells(*shared, cells) : std::move(cells);
-            }
-            if (minimal && !own_minimal) own_minimal = ring_cells(*minimal_scale);
-            const uint32_t id = static_cast<uint32_t>(i);
-            if (shared)
-                for (const auto& [cell, interior] : *shared) out.shared.push_back({cell, interior ? id | INTERIOR_FLAG : id});
-            if (own_minimal)
-                for (const auto& [cell, interior] : *own_minimal) out.minimal.push_back({cell, interior ? id | INTERIOR_FLAG : id});
-        }
+// The cell index over `tiers` coverings of one set (each a polygon's cells
+// at most once): every (cell, polygon) any of them lists, once, flagged
+// INTERIOR_FLAG where each one flags it, in canonical order.
+std::vector<CellItemPair> union_of_tiers(std::vector<std::vector<CellItemPair>> tiers, unsigned threads) {
+    std::vector<CellItemPair> all;
+    size_t total = 0;
+    for (const auto& cells : tiers) total += cells.size();
+    parallel_resize(all, total);
+    size_t at = 0;
+    for (auto& cells : tiers) {
+        std::copy(cells.begin(), cells.end(), all.begin() + at);
+        at += cells.size();
+        free_storage(cells);
+    }
+    parallel_sort(all.begin(), all.end(), [](const CellItemPair& a, const CellItemPair& b) {
+        if (a.cell_id != b.cell_id) return a.cell_id < b.cell_id;
+        return (a.item_id & ID_MASK) < (b.item_id & ID_MASK);
     }, threads);
-
-    auto gather = [&](std::vector<CellItemPair> Found::*part) {
-        std::vector<size_t> at(threads + 1, 0);
-        for (unsigned w = 0; w < threads; w++) at[w + 1] = at[w] + (found[w].*part).size();
-        std::vector<CellItemPair> pairs;
-        parallel_resize(pairs, at[threads]);
-        parallel_for(threads, [&](size_t b, size_t e, unsigned) {
-            for (size_t w = b; w < e; w++) {
-                std::copy((found[w].*part).begin(), (found[w].*part).end(), pairs.begin() + at[w]);
-                found[w].*part = {};
-            }
-        });
-        // Each (cell, polygon) once: the order is the workers' schedule's
-        // until sorted.
-        parallel_sort(pairs.begin(), pairs.end(), cell_item_less);
-        return pairs;
+    auto same_entry = [&](size_t i) {
+        return all[i].cell_id == all[i - 1].cell_id && (all[i].item_id & ID_MASK) == (all[i - 1].item_id & ID_MASK);
     };
-    data.admin_index_cells = gather(&Found::shared);
-    data.admin_minimal_index_cells = gather(&Found::minimal);
+    std::vector<CellItemPair> out = parallel_collect<CellItemPair>(all.size(), [&](size_t i, std::vector<CellItemPair>& found) {
+        if (i > 0 && same_entry(i)) return;
+        size_t end = i + 1;
+        bool interior = (all[i].item_id & INTERIOR_FLAG) != 0;
+        for (; end < all.size() && same_entry(end); end++) interior = interior && (all[end].item_id & INTERIOR_FLAG);
+        const bool everywhere = end - i == tiers.size();
+        found.push_back({all[i].cell_id, (all[i].item_id & ID_MASK) | (interior && everywhere ? INTERIOR_FLAG : 0)});
+    });
+    free_storage(all);
+    parallel_sort(out.begin(), out.end(), cell_item_less, threads);
+    return out;
+}
 
-    auto interior = [](const std::vector<CellItemPair>& pairs) {
-        return parallel_count(pairs.size(), [&](size_t k) { return (pairs[k].item_id & INTERIOR_FLAG) != 0; });
+}  // namespace
+
+void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, std::vector<CellItemPair> exact_cells,
+                               unsigned threads) {
+    if (threads == 0) threads = parallel_threads();
+    const AdminExactRings& store = data.admin_exact_rings;
+    data.admin_country_cells = parallel_collect<CellItemPair>(exact_cells.size(), [&](size_t k, std::vector<CellItemPair>& out) {
+        const uint32_t p = exact_cells[k].item_id & ID_MASK;
+        if (p < data.admin_polygons.size() && data.admin_polygons[p].admin_level == 2 &&
+            data.admin_polygons[p].country_code != 0)
+            out.push_back(exact_cells[k]);
+    }, threads);
+    parallel_sort(data.admin_country_cells.begin(), data.admin_country_cells.end(), cell_item_less, threads);
+    std::vector<std::vector<CellItemPair>> sets[2];
+    for (size_t t = 0; t < kArcTierCount; t++) {
+        const ArcTier& tier = kArcTiers[t];
+        auto& set = sets[static_cast<size_t>(tier.set)];
+        if (tier.set == ArcSet::Full && !tier.simplifies()) set.push_back(std::move(exact_cells));
+        else set.push_back(tier_cells(arcs, store, t, threads));
+    }
+    data.admin_index_cells = union_of_tiers(std::move(sets[static_cast<size_t>(ArcSet::Full)]), threads);
+    data.admin_minimal_index_cells = union_of_tiers(std::move(sets[static_cast<size_t>(ArcSet::Minimal)]), threads);
+
+    auto interior = [&](const std::vector<CellItemPair>& pairs) {
+        return parallel_count(pairs.size(), [&](size_t k) { return (pairs[k].item_id & INTERIOR_FLAG) != 0; }, threads);
     };
     std::cerr << "Admin index cells: " << count_cells(data.admin_index_cells) << " cells, "
               << data.admin_index_cells.size() << " entries (" << interior(data.admin_index_cells)
-              << " interior) over " << scales.size() << " variants; admin-minimal "
-              << count_cells(data.admin_minimal_index_cells) << " cells, "
-              << data.admin_minimal_index_cells.size() << " entries ("
+              << " interior) over the full set's tiers; admin-minimal " << count_cells(data.admin_minimal_index_cells)
+              << " cells, " << data.admin_minimal_index_cells.size() << " entries ("
               << interior(data.admin_minimal_index_cells) << " interior)" << std::endl;
 }
 
-// Writes packed polygons back to back: bytes_of(j) for j in [0, n), null to
-// skip one.
-template <class BytesOf>
-static void write_packed_polygons(const std::string& path, size_t n, BytesOf bytes_of) {
-    std::ofstream f(path, std::ios::binary);
-    for (size_t j = 0; j < n; j++)
-        if (const std::vector<uint8_t>* bytes = bytes_of(j))
-            f.write(reinterpret_cast<const char*>(bytes->data()), static_cast<std::streamsize>(bytes->size()));
-    f.flush();
-    if (!f) throw std::runtime_error("failed to write " + path);
+// --- The admin dirs ---
+
+namespace {
+
+// A dir's records: the polygon of each slot (NO_DATA for a tombstone) and
+// its record, named as the dir names it.
+struct SlotRecords {
+    std::vector<AdminPolygon> at_slot;
+    std::vector<uint32_t> polygon_of;
+};
+
+// The live polygons (no strategy-2 tombstone) whose rings `set` holds,
+// ascending.
+std::vector<uint32_t> polygons_holding(const ParsedData& data, ArcSet set) {
+    std::vector<uint32_t> ids;
+    for (size_t i = 0; i < data.admin_polygons.size(); i++)
+        if (data.admin_polygons[i].ring_offset != NO_DATA &&
+            data.admin_arcs.polygons[i].blocks[static_cast<size_t>(set)].size > 0)
+            ids.push_back(static_cast<uint32_t>(i));
+    return ids;
 }
 
-// A continent's polygons packed as in the planet's finished variant at the
-// same scale (planet_variant): the same vertices and level pack to the same
-// bytes, so each takes its planet polygon's record and bytes rather than
-// being simplified again. False when the planet's files can't be read.
-static bool copy_planet_polygons(const ParsedData& data, const std::string& planet_variant,
-                                 std::vector<PackedPolygon>& packed) {
-    std::ifstream records(planet_variant + "/admin_polygons.bin", std::ios::binary | std::ios::ate);
-    if (!records) return false;
-    const auto polygon_bytes = static_cast<size_t>(records.tellg());
-    if (polygon_bytes % sizeof(AdminPolygon) != 0) return false;
-    std::vector<AdminPolygon> planet(polygon_bytes / sizeof(AdminPolygon));
-    records.seekg(0);
-    records.read(reinterpret_cast<char*>(planet.data()), static_cast<std::streamsize>(polygon_bytes));
-    if (!records) return false;
-
-    const int fd = ::open((planet_variant + "/admin_vertices.bin").c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return false;
-    struct stat st{};
-    const bool sized = ::fstat(fd, &st) == 0;
-    const size_t file_bytes = sized ? static_cast<size_t>(st.st_size) : 0;
-    // The records' 32-bit offsets locate bytes only in a file under 4 GiB.
-    const bool addressable = sized && file_bytes <= UINT32_MAX;
-    void* map = addressable && file_bytes ? ::mmap(nullptr, file_bytes, PROT_READ, MAP_PRIVATE, fd, 0) : nullptr;
-    ::close(fd);
-    if (!addressable || map == MAP_FAILED) return false;
-    const uint8_t* bytes = static_cast<const uint8_t*>(map);
-
-    // A polygon's bytes run to where the next packed one's start, or the
-    // file's end: the variant lays them back to back in id order.
-    std::vector<size_t> end(planet.size());
-    for (size_t p = planet.size(), next = file_bytes; p-- > 0;) {
-        end[p] = next;
-        if (planet[p].vertex_count > 0) next = planet[p].vertex_offset;
-    }
-    std::atomic<bool> fits{true};
-    parallel_for(packed.size(), [&](size_t b, size_t e, unsigned) {
-        for (size_t j = b; j < e; j++) {
-            const uint32_t p = data.admin_planet_ids[j];
-            if (p >= planet.size() || planet[p].vertex_count == 0) continue;
-            if (planet[p].vertex_offset > end[p] || end[p] > file_bytes) {
-                fits = false;
-                continue;
-            }
-            packed[j].bytes.assign(bytes + planet[p].vertex_offset, bytes + end[p]);
-            packed[j].vertex_count = planet[p].vertex_count;
-            packed[j].area = planet[p].area;
-            packed[j].hole_count = planet[p].hole_count;
-        }
-    });
-    if (file_bytes) ::munmap(map, file_bytes);
-    return fits;
+void require_arcs_in_step(const ParsedData& data) {
+    if (data.admin_arcs.polygons.size() != data.admin_polygons.size())
+        throw std::logic_error("admin arc polygons out of step with the polygons");
 }
 
-void write_quality_variant(const ParsedData& data, const std::string& source_dir,
-                           const std::string& output_dir, double epsilon_scale,
-                           const std::string& planet_variant) {
-    ensure_dir(output_dir);
-    const std::string label = "      " + dir_label(output_dir) + ": ";
-    auto _qt = std::chrono::steady_clock::now();
-    auto _qc = CpuTicks::now();
+// The full set's exact tier, its place in kArcTiers.
+size_t exact_tier_index() {
+    for (size_t t = 0; t < kArcTierCount; t++)
+        if (kArcTiers[t].set == ArcSet::Full && !kArcTiers[t].simplifies()) return t;
+    throw std::logic_error("no exact tier of the full set");
+}
 
-    const size_t n = data.admin_polygons.size();
-    std::vector<PackedPolygon> packed(n);
-    const bool copied = !planet_variant.empty() && data.admin_planet_ids.size() == n &&
-                        copy_planet_polygons(data, planet_variant, packed);
-    if (!copied) {
-        packed.assign(n, PackedPolygon{});
-        parallel_for_dynamic(n, 1, [&](size_t begin, size_t end, unsigned) {
-            for (size_t i = begin; i < end; i++)
-                packed[i] = pack_admin_polygon(data, data.admin_polygons[i], epsilon_scale);
-        });
-    }
-    log_phase((label + (copied ? "copy from the planet" : "simplify")).c_str(), _qt, _qc);
-    if (!copied)
-        std::cerr << "Quality " << epsilon_scale << "x hole topology (" << output_dir << "): " << hole_topology(packed)
-                  << std::endl;
+const char* exact_tier_dir() { return kArcTiers[exact_tier_index()].dir; }
 
-    // admin_polygons.bin MUST stay index-aligned with data.admin_polygons:
-    // the cell index (admin_cells/admin_entries, written by the full/admin
-    // variants) references slot `i` in this space, and the server's
-    // admin_polygon(idx) accessor reads admin_polygons[idx] directly with
-    // no remap. Build new_polys at full size and place each simplified
-    // polygon at its own index `i`. Slots that have no usable geometry —
-    // strategy-2 tombstones (a polygon that existed in the previous build
-    // but not this one) and any polygon that simplifies to <3 vertices —
-    // are written as NO_DATA tombstone records, which the accessor skips.
-    // (Previously this loop push_back-compacted; with strategy-2 tombstones
-    // present that shifted every slot past the first gap and corrupted
-    // admin lookups.) Postal boundaries (admin_level=11) are kept in the
-    // main arrays (cell index references them by ID) AND also written to
-    // separate optional files.
-    std::vector<AdminPolygon> new_polys(n, admin_polygon_tombstone());
-    std::vector<AdminPolygon> postal_polys;
-    std::vector<uint32_t> postal_idx;
-    size_t vertex_bytes = 0, postal_bytes = 0;
-    for (size_t i = 0; i < n; i++) {
-        const PackedPolygon& pp = packed[i];
-        if (pp.bytes.empty()) continue;
+}  // namespace
 
-        AdminPolygon np = data.admin_polygons[i];
-        np.vertex_offset = static_cast<uint32_t>(vertex_bytes);
-        np.vertex_count = pp.vertex_count;
-        np.area = pp.area;
-        np.hole_count = pp.hole_count;
-        new_polys[i] = np;
-        vertex_bytes += pp.bytes.size();
-        if (np.admin_level != 11) continue;
-        np.vertex_offset = static_cast<uint32_t>(postal_bytes);
-        postal_polys.push_back(np);
-        postal_idx.push_back(static_cast<uint32_t>(i));
-        postal_bytes += pp.bytes.size();
-    }
-
-    std::cerr << "Quality " << epsilon_scale << "x: " << new_polys.size()
-              << " admin polygons, " << vertex_bytes / 1024 / 1024
-              << " MiB packed vertices, " << postal_polys.size() << " postal polygons" << std::endl;
-
-    // Write admin files (excluding postal)
-    write_binary_file(output_dir + "/admin_polygons.bin",
-                      reinterpret_cast<const char*>(new_polys.data()),
-                      new_polys.size() * sizeof(AdminPolygon));
-    write_packed_polygons(output_dir + "/admin_vertices.bin", n,
-                          [&](size_t i) { return &packed[i].bytes; });
-    // Strategy-2 sidecar for admin polygons (cached only). Same content
-    // across full/no-addresses/admin since they share the same polygon
-    // set. data.admin_osm_ids is already packed (ObjectType<<56 |
-    // stable56) — OSM_RELATION for relation rings, OSM_WAY for closed
-    // ways — so the fallback passes it straight through. A bare 0 is the
-    // legacy "no stable id" sentinel → emit as a SYNTHETIC slot.
-    {
-        std::vector<uint64_t> packed_fallback;
-        if (data.admin_sidecar_blob.empty() && !data.admin_osm_ids.empty()) {
-            packed_fallback.resize(data.admin_osm_ids.size());
-            for (size_t i = 0; i < data.admin_osm_ids.size(); i++) {
-                packed_fallback[i] = data.admin_osm_ids[i] != 0
-                    ? data.admin_osm_ids[i]
-                    : (static_cast<uint64_t>(gc::id_alloc::ObjectType::SYNTHETIC) << 56);
-            }
-        }
-        emit_strategy2_sidecar(output_dir + "/admin_polygons.osm_ids",
-                                data.admin_sidecar_blob, packed_fallback);
-    }
-
-    // Write postal boundary files (optional, admin_level=11 only)
-    if (!postal_polys.empty()) {
-        write_binary_file(output_dir + "/postal_polygons.bin",
-                          reinterpret_cast<const char*>(postal_polys.data()),
-                          postal_polys.size() * sizeof(AdminPolygon));
-        write_packed_polygons(output_dir + "/postal_vertices.bin", postal_idx.size(),
-                              [&](size_t k) { return &packed[postal_idx[k]].bytes; });
-    }
-
-    log_phase((label + "pack + write").c_str(), _qt, _qc);
-    // Quality directories only contain the files that change.
-    // Shared files (admin_cells.bin, admin_entries.bin, strings.bin)
-    // stay in the parent directory.
+std::string admin_sidecar_path(const std::string& region_dir) {
+    return region_dir + "/" + exact_tier_dir() + "/admin_polygons.osm_ids";
 }
 
 // --- admin-minimal ---
-
-// The polygons admin-minimal keeps (admin_minimal_keeps) that keep a shape at
-// its scale: each one's id in the shared slots, ascending, and its bytes.
-struct AdminMinimalPolygons {
-    std::vector<uint32_t> ids;
-    std::vector<PackedPolygon> packed;
-};
-
-static AdminMinimalPolygons pack_admin_minimal_polygons(const ParsedData& data, double epsilon_scale,
-                                                        const std::string& region_dir) {
-    std::vector<uint32_t> kept;
-    kept.reserve(data.admin_polygons.size() / 2);
-    for (size_t i = 0; i < data.admin_polygons.size(); i++) {
-        const auto& p = data.admin_polygons[i];
-        if (admin_minimal_keeps(p.admin_level, p.place_type_override)) kept.push_back(static_cast<uint32_t>(i));
-    }
-    std::vector<PackedPolygon> packed(kept.size());
-    parallel_for_dynamic(kept.size(), 1, [&](size_t begin, size_t end, unsigned) {
-        for (size_t k = begin; k < end; k++)
-            packed[k] = pack_admin_polygon(data, data.admin_polygons[kept[k]], epsilon_scale);
-    });
-    std::cerr << "  Admin-minimal hole topology (" << region_dir << "): " << hole_topology(packed) << std::endl;
-
-    AdminMinimalPolygons out;
-    for (size_t k = 0; k < kept.size(); k++) {
-        if (packed[k].bytes.empty()) continue;
-        out.ids.push_back(kept[k]);
-        out.packed.push_back(std::move(packed[k]));
-    }
-    return out;
-}
 
 // Where a dir puts admin-minimal's polygons: slot_of[shared id] (NO_DATA for
 // one it leaves out) among `count` slots.
@@ -1414,8 +1233,8 @@ static AdminMinimalSlots own_admin_minimal_slots(const ParsedData& data, const s
     return out;
 }
 
-// The shared slots of the quality dirs, which POI parent_poly_ids name: each
-// polygon at its own id.
+// The shared slots of the boundary tiers, which POI parent_poly_ids name:
+// each polygon at its own id.
 static AdminMinimalSlots shared_admin_minimal_slots(const ParsedData& data, const std::vector<uint32_t>& kept) {
     AdminMinimalSlots out{std::vector<uint32_t>(data.admin_polygons.size(), NO_DATA), data.admin_polygons.size()};
     for (uint32_t id : kept) out.slot_of[id] = id;
@@ -1454,35 +1273,43 @@ static StringSubset admin_minimal_names(const ParsedData& data, const std::vecto
     return StringSubset(core, used);
 }
 
-// One admin-minimal dir: the polygons at their slots, the place nodes it
-// keeps with parents in those slots, the admin cell index over them, and its
-// core strings.
-static void write_admin_minimal_dir(const ParsedData& data, const std::string& dir, const AdminMinimalPolygons& kept,
-                                    const AdminMinimalSlots& slots, const AdminMinimalStrings& strings) {
-    // Vertex bytes in slot order, so offsets ascend with ids; the builder's
-    // tombstone (the reader's "no polygon") at a slot without one.
-    std::vector<size_t> kept_at_slot(slots.count, SIZE_MAX);
-    for (size_t k = 0; k < kept.ids.size(); k++) kept_at_slot[slots.slot_of[kept.ids[k]]] = k;
-    std::vector<AdminPolygon> polygons(slots.count, admin_polygon_tombstone());
-    size_t vertex_bytes = 0;
-    for (size_t slot = 0; slot < slots.count; slot++) {
-        const size_t k = kept_at_slot[slot];
-        if (k == SIZE_MAX) continue;
+namespace {
 
-        AdminPolygon p = data.admin_polygons[kept.ids[k]];
-        p.vertex_offset = static_cast<uint32_t>(vertex_bytes);
-        p.vertex_count = kept.packed[k].vertex_count;
-        p.area = kept.packed[k].area;
-        p.hole_count = kept.packed[k].hole_count;
-        p.name_id = strings.name(p.name_id);
-        polygons[slot] = p;
-        vertex_bytes += kept.packed[k].bytes.size();
+// A dir's records over `slots`: polygon i at slot slots.slot_of[i] (none at
+// NO_DATA), named name(its shared name), and a tombstone at every other slot.
+template <class Name>
+SlotRecords records_at(const ParsedData& data, const AdminMinimalSlots& slots, Name name) {
+    SlotRecords out{std::vector<AdminPolygon>(slots.count, admin_polygon_tombstone()),
+                    std::vector<uint32_t>(slots.count, NO_DATA)};
+    for (size_t i = 0; i < data.admin_polygons.size(); i++) {
+        const uint32_t slot = slots.slot_of[i];
+        if (slot == NO_DATA) continue;
+        out.at_slot[slot] = data.admin_polygons[i];
+        out.at_slot[slot].name_id = name(data.admin_polygons[i].name_id);
+        out.polygon_of[slot] = static_cast<uint32_t>(i);
     }
-    write_binary_file(dir + "/admin_polygons.bin", reinterpret_cast<const char*>(polygons.data()),
-                      polygons.size() * sizeof(AdminPolygon));
-    write_packed_polygons(dir + "/admin_vertices.bin", slots.count, [&](size_t slot) -> const std::vector<uint8_t>* {
-        return kept_at_slot[slot] == SIZE_MAX ? nullptr : &kept.packed[kept_at_slot[slot]].bytes;
-    });
+    return out;
+}
+
+uint32_t shared_name(uint32_t name) { return name; }
+
+// The minimal set's tier, which both admin-minimal dirs hold.
+size_t minimal_tier() {
+    for (size_t t = 0; t < kArcTierCount; t++)
+        if (kArcTiers[t].set == ArcSet::Minimal) return t;
+    throw std::logic_error("no tier of the minimal set");
+}
+
+// One admin-minimal dir: the minimal set's polygons at their slots with
+// their ring blocks and its arcs, the place nodes it keeps with parents in
+// those slots, the admin cell index over them, and its core strings.
+void write_admin_minimal_dir(const ParsedData& data, const std::string& dir, const AdminMinimalSlots& slots,
+                             const AdminMinimalStrings& strings) {
+    const AdminArcBlocks& arcs = data.admin_arcs;
+    const size_t t = minimal_tier();
+    const SlotRecords records = records_at(data, slots, [&](uint32_t name) { return strings.name(name); });
+    const size_t ring_bytes = write_ring_files({dir}, arcs, ArcSet::Minimal, records.at_slot, records.polygon_of);
+    write_arc_files(dir, arcs.set(ArcSet::Minimal), arcs.tiers[t]);
 
     // Parents in this dir's slots (NO_DATA when the parent polygon isn't
     // kept), like every other id here; a node whose claimant isn't kept is
@@ -1516,94 +1343,87 @@ static void write_admin_minimal_dir(const ParsedData& data, const std::string& d
     write_binary_file(dir + "/" + STR_TIER_FILENAMES[0], strings.core.data(), strings.core.size());
     write_strings_layout(dir, strings.bases);
 
-    std::cerr << "  " << dir_label(dir) << ": " << kept.ids.size() << " polygons in " << slots.count
-              << " slots (of " << data.admin_polygons.size() << "), " << vertex_bytes / 1024 / 1024
-              << " MiB packed vertices, " << places.size() << " place nodes (of " << data.place_nodes.size()
-              << "), " << count_cells(cells) << " cells (of " << count_cells(data.admin_index_cells) << "), "
-              << strings.core.size() << " bytes of core strings" << std::endl;
+    size_t kept = 0;
+    for (uint32_t p : records.polygon_of) kept += p != NO_DATA;
+    std::cerr << "  " << dir_label(dir) << ": " << kept << " polygons in " << slots.count << " slots (of "
+              << data.admin_polygons.size() << "), " << ring_bytes << " ring bytes, "
+              << arcs.tiers[t].bytes.size() << " arc bytes, " << places.size() << " place nodes (of "
+              << data.place_nodes.size() << "), " << count_cells(cells) << " cells (of "
+              << count_cells(data.admin_index_cells) << "), " << strings.core.size() << " bytes of core strings"
+              << std::endl;
 }
 
-void write_admin_minimal(const ParsedData& data, const std::string& region_dir, const std::string& region_prev,
-                         double epsilon_scale) {
-    const AdminMinimalPolygons kept = pack_admin_minimal_polygons(data, epsilon_scale, region_dir);
+}  // namespace
+
+void write_admin_minimal(const ParsedData& data, const std::string& region_dir, const std::string& region_prev) {
+    require_arcs_in_step(data);
+    const std::vector<uint32_t> kept = polygons_holding(data, ArcSet::Minimal);
 
     const std::string own_dir = region_dir + "/admin-minimal";
     ensure_dir(own_dir);
-    const StringSubset names = admin_minimal_names(data, kept.ids);
-    write_admin_minimal_dir(data, own_dir, kept, own_admin_minimal_slots(data, kept.ids, region_prev, own_dir),
+    const StringSubset names = admin_minimal_names(data, kept);
+    write_admin_minimal_dir(data, own_dir, own_admin_minimal_slots(data, kept, region_prev, own_dir),
                             {names.bytes(), core_only_strings_layout(names.bytes().size()), &names});
+    gc::id_alloc::IdAllocator::write_sidecar(arc_sidecar_path(region_dir, ArcSet::Minimal),
+                                             data.admin_arcs.set(ArcSet::Minimal).sidecar);
 
     const std::string poi_dir = region_dir + "/" + kAdminMinimalPoiDir;
     ensure_dir(poi_dir);
-    write_admin_minimal_dir(data, poi_dir, kept, shared_admin_minimal_slots(data, kept.ids),
+    write_admin_minimal_dir(data, poi_dir, shared_admin_minimal_slots(data, kept),
                             {data.strings_tiers[0], data.strings_tier_bases});
 }
 
-void write_arc_dirs(const ParsedData& data, const std::string& region_dir, const std::string& region_prev) {
+void write_admin_tiers(const ParsedData& data, const std::string& region_dir) {
+    require_arcs_in_step(data);
     const AdminArcBlocks& arcs = data.admin_arcs;
-    const size_t n = data.admin_polygons.size();
-    if (arcs.polygons.size() != n) throw std::logic_error("admin arc polygons out of step with the polygons");
-    // A dir's records: polygon i at slot slots.slot_of[i] (none at NO_DATA),
-    // named name(its shared name), and a tombstone at every other slot.
-    struct Records {
-        std::vector<AdminPolygon> at_slot;
-        std::vector<uint32_t> polygon_of;
-    };
-    auto records_at = [&](const AdminMinimalSlots& slots, auto name) {
-        Records out{std::vector<AdminPolygon>(slots.count, admin_polygon_tombstone()),
-                    std::vector<uint32_t>(slots.count, NO_DATA)};
-        for (size_t i = 0; i < n; i++) {
-            const uint32_t slot = slots.slot_of[i];
-            if (slot == NO_DATA) continue;
-            out.at_slot[slot] = data.admin_polygons[i];
-            out.at_slot[slot].name_id = name(data.admin_polygons[i].name_id);
-            out.polygon_of[slot] = static_cast<uint32_t>(i);
-        }
-        return out;
-    };
-    auto shared_name = [](uint32_t name) { return name; };
+    std::vector<std::string> dirs;
+    for (const ArcTier& tier : kArcTiers)
+        if (tier.set == ArcSet::Full) dirs.push_back(region_dir + "/" + tier.dir);
+    for (const std::string& dir : dirs) ensure_dir(dir);
     std::ostringstream summary;
-    summary << "  Arc dirs of " << region_dir << ":";
-    auto write_dir = [&](const std::string& dir, size_t tier, const Records& records) {
-        const ArcSet set = kArcTiers[tier].set;
-        ensure_dir(dir);
-        const size_t ring_bytes = write_ring_files(dir, arcs, set, records.at_slot, records.polygon_of);
-        write_arc_files(dir, arcs.set(set), arcs.tiers[tier]);
-        summary << " " << dir_label(dir) << " " << records.at_slot.size() << " slots, " << ring_bytes
-                << " ring bytes, " << arcs.tiers[tier].bytes.size() << " arc bytes;";
-    };
-    // Live polygons (no strategy-2 tombstone) whose rings `set` holds.
-    auto holding = [&](ArcSet set) {
-        std::vector<uint32_t> ids;
-        for (size_t i = 0; i < n; i++)
-            if (data.admin_polygons[i].vertex_offset != NO_DATA &&
-                (set == ArcSet::Full || arcs.polygons[i].blocks[static_cast<size_t>(set)].size > 0))
-                ids.push_back(static_cast<uint32_t>(i));
-        return ids;
-    };
-
-    // The full set's tiers, in the shared slots: their records, a copy of
-    // every polygon, gone before the minimal set's are made.
+    // The records in the shared slots, a copy of every polygon, gone once
+    // the tiers' records and rings are written.
     {
-        const Records shared = records_at(shared_admin_minimal_slots(data, holding(ArcSet::Full)), shared_name);
-        for (size_t t = 0; t < kArcTierCount; t++)
-            if (kArcTiers[t].set == ArcSet::Full) write_dir(region_dir + "/" + kArcTiers[t].dir, t, shared);
+        const SlotRecords shared =
+            records_at(data, shared_admin_minimal_slots(data, polygons_holding(data, ArcSet::Full)), shared_name);
+        const size_t ring_bytes = write_ring_files(dirs, arcs, ArcSet::Full, shared.at_slot, shared.polygon_of);
+        summary << "  Boundary tiers of " << region_dir << ": " << shared.at_slot.size() << " slots, " << ring_bytes
+                << " ring bytes;";
     }
-    gc::id_alloc::IdAllocator::write_sidecar(arc_sidecar_path(region_dir, ArcSet::Full), arcs.set(ArcSet::Full).sidecar);
-
-    // The minimal set's, in admin-minimal's own slots (and names) and in the
-    // shared ones.
-    const std::vector<uint32_t> kept = holding(ArcSet::Minimal);
     for (size_t t = 0; t < kArcTierCount; t++) {
-        if (kArcTiers[t].set != ArcSet::Minimal) continue;
-        const std::string own_dir = region_dir + "/" + kArcTiers[t].dir;
-        ensure_dir(own_dir);
-        const StringSubset names = admin_minimal_names(data, kept);
-        write_dir(own_dir, t, records_at(own_admin_minimal_slots(data, kept, region_prev, own_dir),
-                                         [&](uint32_t name) { return names.offset_of(name); }));
-        write_dir(region_dir + "/" + kAdminMinimalPoiDir, t, records_at(shared_admin_minimal_slots(data, kept), shared_name));
+        if (kArcTiers[t].set != ArcSet::Full) continue;
+        write_arc_files(region_dir + "/" + kArcTiers[t].dir, arcs.set(ArcSet::Full), arcs.tiers[t]);
+        summary << " " << kArcTiers[t].dir << " " << arcs.tiers[t].bytes.size() << " arc bytes;";
     }
-    gc::id_alloc::IdAllocator::write_sidecar(arc_sidecar_path(region_dir, ArcSet::Minimal),
-                                             arcs.set(ArcSet::Minimal).sidecar);
+
+    // The next build's slots (apply_strategy2_admins, the arc stage) beside
+    // the exact tier. data.admin_osm_ids is already packed (ObjectType<<56 |
+    // stable56) — OSM_RELATION for relation rings, OSM_WAY for closed ways —
+    // so the fallback passes it straight through. A bare 0 is the legacy "no
+    // stable id" sentinel → emit as a SYNTHETIC slot.
+    std::vector<uint64_t> packed_fallback;
+    if (data.admin_sidecar_blob.empty() && !data.admin_osm_ids.empty()) {
+        packed_fallback.resize(data.admin_osm_ids.size());
+        for (size_t i = 0; i < data.admin_osm_ids.size(); i++)
+            packed_fallback[i] = data.admin_osm_ids[i] != 0
+                ? data.admin_osm_ids[i]
+                : (static_cast<uint64_t>(gc::id_alloc::ObjectType::SYNTHETIC) << 56);
+    }
+    emit_strategy2_sidecar(admin_sidecar_path(region_dir), data.admin_sidecar_blob, packed_fallback);
+    gc::id_alloc::IdAllocator::write_sidecar(arc_sidecar_path(region_dir, ArcSet::Full), arcs.set(ArcSet::Full).sidecar);
     std::cerr << summary.str() << std::endl;
+}
+
+void write_exact_admin_geometry(const ParsedData& data, const std::string& dir) {
+    require_arcs_in_step(data);
+    const AdminArcBlocks& arcs = data.admin_arcs;
+    const size_t t = exact_tier_index();
+    ensure_dir(dir);
+    // The records in the shared slots, as write_admin_tiers lays them out.
+    const SlotRecords shared =
+        records_at(data, shared_admin_minimal_slots(data, polygons_holding(data, ArcSet::Full)), shared_name);
+    const size_t ring_bytes = write_ring_files({dir}, arcs, ArcSet::Full, shared.at_slot, shared.polygon_of);
+    write_arc_files(dir, arcs.set(ArcSet::Full), arcs.tiers[t]);
+    std::cerr << "  Exact admin geometry in " << dir << ": " << shared.at_slot.size() << " slots, " << ring_bytes
+              << " ring bytes, " << arcs.tiers[t].bytes.size() << " arc bytes" << std::endl;
 }

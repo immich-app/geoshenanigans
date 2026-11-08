@@ -6,7 +6,6 @@
 #include <sstream>
 #include <stdexcept>
 
-#include "output_dir.h"
 #include "parallel.h"
 #include "parsed_data.h"
 
@@ -780,7 +779,10 @@ MinimalArcs build_minimal_arcs(const AdminArcs& arcs, const AdminExactRings& sto
 ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string& prev_sidecar) {
     using namespace gc::id_alloc;
     IdAllocator alloc;
-    if (!prev_sidecar.empty() && !alloc.load_previous(prev_sidecar))
+    // Only a sidecar the lookup finds absent starts cold; one it can't look up (ec set) is read, and refused.
+    std::error_code ec;
+    const bool missing = !prev_sidecar.empty() && !std::filesystem::exists(prev_sidecar, ec) && !ec;
+    if (!prev_sidecar.empty() && !missing && !alloc.load_previous(prev_sidecar))
         throw std::runtime_error("unreadable arc sidecar " + prev_sidecar);
     // The key each previous slot can be claimed by, none for its tombstones.
     const size_t prev_slots = alloc.total_slots();
@@ -807,7 +809,21 @@ ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string
         else out.counts.recycled++;
     }
     out.counts.tombstones = out.sidecar.size() - keys.size();
+    out.counts.previous_sidecar_missing = missing;
     return out;
+}
+
+std::string arc_slot_start_lines(const std::string& region, ArcSet set, const std::string& prev_sidecar,
+                                 const AdminArcSlotCounts& counts) {
+    if (prev_sidecar.empty()) return "";
+    const char* set_name = set == ArcSet::Full ? "full" : "minimal";
+    std::ostringstream line;
+    if (counts.previous_sidecar_missing)
+        line << "  " << region << " arcs: no previous " << set_name << " arc slots at " << prev_sidecar
+             << ", every slot cold\n";
+    line << "ARC_CHECK slots=arcs set=" << set_name << " region=" << region
+         << " previous_sidecar_missing=" << counts.previous_sidecar_missing << "\n";
+    return line.str();
 }
 
 std::string arc_sidecar_path(const std::string& region_dir, ArcSet set) {
@@ -822,7 +838,10 @@ template <class Key>
 ArcSlots planet_slots(size_t n, Key key, const std::string& prev_planet_dir, ArcSet set) {
     std::vector<uint64_t> keys(n);
     for (size_t a = 0; a < n; a++) keys[a] = key(a);
-    return allocate_arc_slots(keys, prev_planet_dir.empty() ? "" : arc_sidecar_path(prev_planet_dir, set));
+    const std::string prev = prev_planet_dir.empty() ? "" : arc_sidecar_path(prev_planet_dir, set);
+    ArcSlots slots = allocate_arc_slots(keys, prev);
+    std::cerr << arc_slot_start_lines("planet", set, prev, slots.counts);
+    return slots;
 }
 
 std::string slot_summary(const AdminArcSlotCounts& s, size_t slots) {
@@ -939,36 +958,4 @@ bool same_closed_ring(const PackedLocation* a, uint32_t a_count, const PackedLoc
         if (forwards || backwards) return true;
     }
     return false;
-}
-
-void require_arc_dirs(const std::string& output_dir, const std::string& arcs_out_dir,
-                      const std::string& prev_arcs_dir, const std::vector<std::string>& regions) {
-    namespace fs = std::filesystem;
-    if (arcs_out_dir.empty()) {
-        if (!prev_arcs_dir.empty())
-            throw std::runtime_error("--prev-arcs " + prev_arcs_dir + " without --arcs-out: only the arc stage reads it");
-        return;
-    }
-    require_new_or_empty_output_dir(arcs_out_dir);
-    auto normal = [](const std::string& dir) {
-        fs::path p = fs::weakly_canonical(fs::absolute(dir));
-        if (p.filename().empty()) p = p.parent_path();
-        return p;
-    };
-    auto within = [](const fs::path& dir, const fs::path& p) {
-        return std::mismatch(dir.begin(), dir.end(), p.begin(), p.end()).first == dir.end();
-    };
-    const fs::path output = normal(output_dir), arcs = normal(arcs_out_dir);
-    if (within(output, arcs) || within(arcs, output))
-        throw std::runtime_error("--arcs-out " + arcs_out_dir + " overlaps the output dir " + output_dir +
-                                 ", which publishes every file under it: keep them apart");
-    if (!prev_arcs_dir.empty())
-        for (const std::string& region : regions)
-            for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
-                const std::string sidecar = arc_sidecar_path(prev_arcs_dir + "/" + region, set);
-                std::error_code ec;
-                if (!fs::is_regular_file(sidecar, ec))
-                    throw std::runtime_error("--prev-arcs " + prev_arcs_dir + " holds no " + region + " arc sidecar " +
-                                             sidecar);
-            }
 }

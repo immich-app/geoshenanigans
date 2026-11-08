@@ -244,9 +244,27 @@ add_executable(geocoder-s2-tests
     src/s2_helpers.cpp
 )
 target_include_directories(geocoder-s2-tests PRIVATE src tools tests)
-# tests/s2/test_arc_dirs_opt_in.cpp runs build-index on a PBF it writes.
+# tests/s2/test_admin_dirs_build.cpp runs build-index on a PBF it writes.
 target_compile_definitions(geocoder-s2-tests PRIVATE GEOCODER_BUILD_INDEX_BIN="$<TARGET_FILE:build-index>")
 add_dependencies(geocoder-s2-tests build-index)
+# It loads what build-index writes with the server's read path too: the
+# query-server crate's grid_query example, which cargo builds here (with the
+# server's Cargo.lock, into this build dir). Without cargo that test fails.
+find_program(GEOCODER_CARGO cargo HINTS "$ENV{HOME}/.cargo/bin")
+if(GEOCODER_CARGO)
+    set(GEOCODER_GRID_QUERY_TARGET_DIR "${CMAKE_CURRENT_BINARY_DIR}/grid-query")
+    set(GEOCODER_GRID_QUERY_BIN "${GEOCODER_GRID_QUERY_TARGET_DIR}/debug/examples/grid_query")
+    # Not under make's jobserver, whose descriptors the command doesn't get.
+    add_custom_target(grid-query
+        COMMAND "${CMAKE_COMMAND}" -E env --unset=MAKEFLAGS --unset=MFLAGS
+                "${GEOCODER_CARGO}" build --locked --example grid_query
+                --manifest-path "${CMAKE_CURRENT_SOURCE_DIR}/../server/Cargo.toml"
+                --target-dir "${GEOCODER_GRID_QUERY_TARGET_DIR}"
+        BYPRODUCTS "${GEOCODER_GRID_QUERY_BIN}"
+        COMMENT "Building the server's grid_query example")
+    add_dependencies(geocoder-s2-tests grid-query)
+    target_compile_definitions(geocoder-s2-tests PRIVATE GEOCODER_GRID_QUERY_BIN="${GEOCODER_GRID_QUERY_BIN}")
+endif()
 geocoder_link_s2(geocoder-s2-tests)
 target_link_libraries(geocoder-s2-tests PRIVATE ZLIB::ZLIB libdeflate::libdeflate Threads::Threads)
 add_test(NAME geocoder-s2-tests COMMAND geocoder-s2-tests)

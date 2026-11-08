@@ -1,7 +1,9 @@
-// write_admin_minimal (cell_index.h) writes the smallest set twice:
-// admin-minimal/, read without a POI tier, ships only the core strings its
-// records name; admin-minimal-poi/, read beside one, keeps the shared polygon
-// slots and strings that the POI tier's parent_poly_ids and names point into.
+// write_admin_minimal (cell_index.h) writes the smallest set twice, both on
+// the minimal arc set: admin-minimal/, read without a POI tier, ships only
+// the core strings its records name; admin-minimal-poi/, read beside one,
+// keeps the shared polygon slots and strings that the POI tier's
+// parent_poly_ids and names point into. write_admin_tiers writes the full
+// set's boundary tiers, quality/simplified and quality/exact.
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -15,9 +17,10 @@
 
 #include <unistd.h>
 
+#include "admin_arcs.h"
+#include "admin_rank_config.h"
 #include "cell_index.h"
 #include "parsed_data.h"
-#include "polygon_rings.h"
 #include "test_framework.h"
 #include "types.h"
 
@@ -100,46 +103,48 @@ std::vector<std::pair<uint64_t, uint32_t>> cell_pairs(const std::string& dir) {
     return out;
 }
 
-// A polygon's packed bytes in a dir: from its vertex_offset to the next
-// polygon's, or the file's end.
-std::vector<char> polygon_bytes(const std::string& dir, uint32_t slot) {
+// A polygon's ring block in a dir.
+std::vector<char> ring_block(const std::string& dir, uint32_t slot) {
     const std::vector<AdminPolygon> polygons = records<AdminPolygon>(dir + "/admin_polygons.bin");
-    const std::vector<char> vertices = file_bytes(dir + "/admin_vertices.bin");
-    REQUIRE(slot < polygons.size() && polygons[slot].vertex_count > 0);
-    size_t end = vertices.size();
-    for (size_t s = slot + 1; s < polygons.size(); s++)
-        if (polygons[s].vertex_count > 0) {
-            end = polygons[s].vertex_offset;
-            break;
-        }
-    return {vertices.begin() + polygons[slot].vertex_offset, vertices.begin() + end};
+    const std::vector<char> rings = file_bytes(dir + "/admin_rings.bin");
+    REQUIRE(slot < polygons.size() && polygons[slot].ring_bytes > 0);
+    REQUIRE(size_t(polygons[slot].ring_offset) + polygons[slot].ring_bytes <= rings.size());
+    return {rings.begin() + polygons[slot].ring_offset, rings.begin() + polygons[slot].ring_offset + polygons[slot].ring_bytes};
+}
+
+// A record but for where its ring block lies.
+AdminPolygon unplaced(AdminPolygon p) {
+    p.ring_offset = p.ring_bytes = 0;
+    return p;
 }
 
 uint8_t pt(PlaceType t) { return static_cast<uint8_t>(t); }
 
-// A region: a country with a state and a city it keeps, a borough and a
-// quarter it drops, and a polygon the previous build had (a strategy-2
-// tombstone); place nodes the city and the borough claim, a suburb, a hamlet,
-// a town and a place tombstone; and POIs in the city and the borough, one
-// named like a street (a core string no admin-minimal record names).
+// A region: a country with a state and a city it keeps, a borough, a
+// quarter and a postcode area it drops, and a polygon the previous build had
+// (a strategy-2 tombstone); place nodes the city and the borough claim, a
+// suburb, a hamlet, a town and a place tombstone; and POIs in the city and
+// the borough, one named like a street (a core string no admin-minimal
+// record names).
 struct Region {
     ParsedData data;
     TempDir tmp;
-    std::string quality_dir, own_dir, poi_dir;
+    std::string simplified_dir, exact_dir, own_dir, poi_dir;
 
     // The place nodes, in the order they are added.
     enum Places : size_t { HARBOUR_CITY, MILL_VILLAGE, DOCKS_SUBURB, FORD_HAMLET, ATLANTIS_TOWN, PLACE_TOMBSTONE };
 
+    // A square 0.4 degrees wide at `lat`, its north edge bowing out.
     void add_polygon(const char* name, uint8_t level, uint64_t relation, double lat) {
-        const std::vector<LatLng> outer = {{lat, 20.0}, {lat, 20.4}, {lat + 0.4, 20.4}, {lat + 0.4, 20.0}, {lat, 20.0}};
-        const std::vector<LatLng> ring = encode_rings(outer, {});
+        const int32_t south = static_cast<int32_t>(lat * 1e7), side = 4000000;
+        data.admin_exact_rings.append({{south, 200000000}, {south, 204000000}, {south + side, 204000000},
+                                       {south + side + 130567, 202000000}, {south + side, 200000000},
+                                       {south, 200000000}},
+                                      {});
         AdminPolygon ap{};
-        ap.vertex_offset = static_cast<uint32_t>(data.admin_vertices.size());
-        ap.vertex_count = static_cast<uint32_t>(ring.size());
         ap.name_id = data.string_pool.intern(name);
         ap.admin_level = level;
-        ap.area = 1;
-        for (const auto& [la, lo] : ring) data.admin_vertices.push_back({static_cast<float>(la), static_cast<float>(lo)});
+        ap.area = data.admin_exact_rings.area(static_cast<uint32_t>(data.admin_polygons.size()));
         data.admin_polygons.push_back(ap);
         data.admin_osm_ids.push_back((static_cast<uint64_t>(gc::id_alloc::ObjectType::OSM_RELATION) << 56) | (relation << 16));
     }
@@ -167,13 +172,22 @@ struct Region {
     }
 
     Region() {
+        // Their slots once strategy-2's tombstone is in at 3:
         add_polygon("Atlantis", 2, 11, 10.0);        // 0, kept
         add_polygon("Old Town", 9, 12, 11.0);        // 1, a borough: dropped
         add_polygon("Harbour", 8, 13, 12.0);         // 2, kept
-        data.admin_polygons.push_back(admin_polygon_tombstone());  // 3
-        data.admin_osm_ids.push_back(0);
         add_polygon("Quay", 10, 14, 13.0);           // 4, a quarter: dropped
         add_polygon("Northern State", 4, 15, 14.0);  // 5, kept
+        add_polygon("1234", 11, 16, 15.0);           // 6, a postcode area: dropped
+        std::vector<bool> in_minimal;
+        for (const AdminPolygon& p : data.admin_polygons)
+            in_minimal.push_back(admin_minimal_keeps(p.admin_level, p.place_type_override));
+        data.admin_arcs = encode_admin_arcs(build_admin_arcs(data.admin_exact_rings, in_minimal, "", 1),
+                                            data.admin_exact_rings, 1);
+        // The tombstone strategy-2 leaves at slot 3.
+        data.admin_polygons.insert(data.admin_polygons.begin() + 3, admin_polygon_tombstone());
+        data.admin_osm_ids.insert(data.admin_osm_ids.begin() + 3, 0);
+        data.admin_arcs.polygons.insert(data.admin_arcs.polygons.begin() + 3, AdminArcPolygon{});
 
         add_place("Harbour", PlaceType::CITY, PLACE_FLAG_HIDDEN | PLACE_FLAG_LABEL_OF, 2);
         add_place("Mill", PlaceType::VILLAGE, PLACE_FLAG_HIDDEN | PLACE_FLAG_LABEL_OF, 1);
@@ -192,11 +206,12 @@ struct Region {
 
         partition_strings_into_tiers(data);
 
-        quality_dir = (tmp.path / "quality" / "q2.5").string();
+        simplified_dir = (tmp.path / "quality" / "simplified").string();
+        exact_dir = (tmp.path / "quality" / "exact").string();
         own_dir = (tmp.path / "admin-minimal").string();
         poi_dir = (tmp.path / "admin-minimal-poi").string();
-        write_quality_variant(data, tmp.path.string(), quality_dir, 2.5);
-        write_admin_minimal(data, tmp.path.string(), "", 2.5);
+        write_admin_tiers(data, tmp.path.string());
+        write_admin_minimal(data, tmp.path.string(), "");
     }
 
     std::string shared_name(uint32_t offset) const {
@@ -243,21 +258,23 @@ TEST(admin_minimal_ships_only_the_core_strings_its_records_name) {
 
 TEST(admin_minimal_poi_keeps_the_shared_polygon_slots) {
     const Region r;
-    const std::vector<AdminPolygon> shared = records<AdminPolygon>(r.quality_dir + "/admin_polygons.bin");
+    const std::vector<AdminPolygon> shared = records<AdminPolygon>(r.exact_dir + "/admin_polygons.bin");
     const std::vector<AdminPolygon> polygons = records<AdminPolygon>(r.poi_dir + "/admin_polygons.bin");
+    const std::vector<AdminPolygon> own = records<AdminPolygon>(r.own_dir + "/admin_polygons.bin");
     REQUIRE(shared.size() == r.data.admin_polygons.size());
     REQUIRE(polygons.size() == shared.size());
+    REQUIRE(own.size() == 3);
 
-    // A kept polygon is the q2.5 dir's at the same slot, but for where its
-    // bytes start; a dropped one is the builder's tombstone, which the reader
-    // takes for no polygon.
+    // A kept polygon is the boundary tiers' at the same slot, but for where
+    // its ring block lies, which holds the minimal set's arcs as in
+    // admin-minimal/; a dropped one is the builder's tombstone, which the
+    // reader takes for no polygon.
+    const uint32_t own_slot[] = {0, NO_DATA, 1, NO_DATA, NO_DATA, 2, NO_DATA};
     for (uint32_t slot : {0u, 2u, 5u}) {
-        AdminPolygon p = polygons[slot];
-        p.vertex_offset = shared[slot].vertex_offset;
-        CHECK(same_bytes(p, shared[slot]));
-        CHECK(polygon_bytes(r.poi_dir, slot) == polygon_bytes(r.quality_dir, slot));
+        CHECK(same_bytes(unplaced(polygons[slot]), unplaced(shared[slot])));
+        CHECK(ring_block(r.poi_dir, slot) == ring_block(r.own_dir, own_slot[slot]));
     }
-    for (uint32_t slot : {1u, 3u, 4u}) CHECK(same_bytes(polygons[slot], admin_polygon_tombstone()));
+    for (uint32_t slot : {1u, 3u, 4u, 6u}) CHECK(same_bytes(polygons[slot], admin_polygon_tombstone()));
 
     // So a POI's parent_poly_id names its own polygon: the city, or nothing
     // where admin-minimal drops the borough.
@@ -295,4 +312,46 @@ TEST(admin_minimal_poi_places_name_the_shared_slots_and_strings) {
         bases.push_back({r.data.strings_tier_bases[t], r.data.strings_tier_bases[t + 1]});
     CHECK(layout_of(r.poi_dir) == bases);
     CHECK(r.data.strings_tier_bases[STR_TIER_POI] < r.data.strings_tier_bases[STR_TIER_POI + 1]);
+}
+
+TEST(both_admin_minimal_dirs_hold_the_same_minimal_arcs) {
+    const Region r;
+    for (const char* file : {"/arc_index.bin", "/arc_vertices.bin"}) {
+        CHECK(!file_bytes(r.own_dir + file).empty());
+        CHECK(file_bytes(r.own_dir + file) == file_bytes(r.poi_dir + file));
+        // Not the full set's: the minimal set's own arcs.
+        CHECK(file_bytes(r.own_dir + file) != file_bytes(r.simplified_dir + file));
+    }
+    // One sidecar of the minimal set's slots, in admin-minimal/.
+    CHECK(std::filesystem::exists(r.own_dir + "/arc_index.osm_ids"));
+    CHECK(!std::filesystem::exists(r.poi_dir + "/arc_index.osm_ids"));
+}
+
+TEST(the_boundary_tiers_share_their_records_and_rings_and_postcode_areas_are_records_there) {
+    const Region r;
+    for (const char* file : {"/admin_polygons.bin", "/admin_rings.bin"})
+        CHECK(file_bytes(r.simplified_dir + file) == file_bytes(r.exact_dir + file));
+    // Their arcs differ: every raw vertex in exact, fewer in simplified.
+    CHECK(file_bytes(r.exact_dir + "/arc_vertices.bin").size() > file_bytes(r.simplified_dir + "/arc_vertices.bin").size());
+    // Every live polygon at its own slot, its area that of its exact rings.
+    const std::vector<AdminPolygon> shared = records<AdminPolygon>(r.exact_dir + "/admin_polygons.bin");
+    REQUIRE(shared.size() == 7);
+    for (uint32_t slot = 0; slot < 7; slot++) {
+        if (slot == 3) {
+            CHECK(same_bytes(shared[slot], admin_polygon_tombstone()));
+            continue;
+        }
+        CHECK(shared[slot].ring_bytes > 0);
+        CHECK(shared[slot].area == r.data.admin_polygons[slot].area);
+        CHECK(shared[slot].name_id == r.data.admin_polygons[slot].name_id);
+    }
+    // The postcode area is a level-11 record there; no dir has postal files.
+    CHECK_EQ(shared[6].admin_level, uint8_t(11));
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(r.tmp.path))
+        CHECK(entry.path().filename().string().rfind("postal_", 0) != 0);
+    // The slots' sidecars beside the exact tier only.
+    for (const char* sidecar : {"/admin_polygons.osm_ids", "/arc_index.osm_ids"}) {
+        CHECK(std::filesystem::exists(r.exact_dir + sidecar));
+        CHECK(!std::filesystem::exists(r.simplified_dir + sidecar));
+    }
 }

@@ -18,11 +18,6 @@ extern int kStreetCellLevel;
 extern int kAdminCellLevel;
 extern int kMaxAdminLevel;
 
-// --- Simplification globals ---
-
-extern SimplifyMode kSimplifyMode;
-extern double kSimplifyEpsilonOverride; // 0 = use per-level defaults
-
 // --- S2 helpers ---
 
 // The street-level cells the edge from (lat1, lng1) to (lat2, lng2) crosses.
@@ -34,33 +29,9 @@ void cover_edge(S2CellId c1, S2CellId c2, double lat1, double lng1, double lat2,
 
 S2CellId point_to_cell(double lat, double lng);
 
-// The kAdminCellLevel cells covering a polygon, each flagged when it lies
-// wholly inside. `vertices` is a closed ring, or a keyhole range with
-// `holes` holes (polygon_rings.h): the cells cover its outer ring, and only
-// those wholly outside the holes are flagged.
-std::vector<std::pair<S2CellId, bool>> cover_polygon(
-    const std::vector<std::pair<double,double>>& vertices, uint16_t holes = 0);
-
-// --- Simplification dispatch ---
-
-// Simplify a polygon using the current global mode, taking admin_level into account.
-// In MaxVertices mode: caps at MAX_POLYGON_VERTICES (500).
-// In ErrorBounded mode: uses per-level epsilon in meters, converted to degrees.
-// tolerance_scale (0, 1] tightens either: epsilon times it, or the vertex cap
-// over it (simplify_rings retrying rings that stopped nesting).
-inline std::vector<std::pair<double,double>> simplify_admin_polygon(
-    const std::vector<std::pair<double,double>>& pts, uint8_t admin_level, double tolerance_scale = 1) {
-    if (kSimplifyMode == SimplifyMode::ErrorBounded) {
-        double eps_m = kSimplifyEpsilonOverride > 0
-            ? kSimplifyEpsilonOverride
-            : admin_epsilon_meters(admin_level);
-        // Estimate latitude from first vertex for degree conversion
-        double lat = pts.empty() ? 0.0 : pts[0].first;
-        double eps_deg = meters_to_degrees(eps_m * tolerance_scale, lat);
-        return simplify_polygon_epsilon(pts, eps_deg);
-    }
-    return simplify_polygon(pts, static_cast<size_t>(MAX_POLYGON_VERTICES / tolerance_scale));
-}
+// The kAdminCellLevel cells covering the closed ring `vertices`, each
+// flagged when it lies wholly inside.
+std::vector<std::pair<S2CellId, bool>> cover_polygon(const std::vector<std::pair<double,double>>& vertices);
 
 // --- Helper functions that depend on S2 ---
 
@@ -83,9 +54,8 @@ void append_addr_point(ParsedData& data, double lat, double lng,
                        const NodeCoord* polygon_vertices = nullptr,
                        uint32_t polygon_vertex_count = 0);
 
-// Appends the admin polygon of a closed way's ring, simplified, with the ring
-// itself to the exact rings and their area as the polygon's; nothing when
-// the simplified ring keeps under 3 vertices.
+// Appends the admin polygon of a closed way's ring, with the ring itself to
+// the exact rings and their area as the polygon's.
 void add_admin_polygon(ParsedData& data,
                        const std::vector<PackedLocation>& ring,
                        const char* name, uint8_t admin_level,

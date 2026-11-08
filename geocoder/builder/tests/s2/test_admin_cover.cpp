@@ -1,5 +1,6 @@
-// admin_ring_cells (src/admin_cover.h): a reader looks a point up in its own
-// cell only, so every point the f32 ray cast puts inside a ring must find the
+// admin_ring_cells (src/admin_cover.h) and the admin cell index over the arc
+// tiers (compute_admin_index_cells): a reader looks a point up in its own
+// cell only, so every point the ray cast puts inside a ring must find the
 // ring listed in that cell, and an interior flag must hold for every point of
 // its cell.
 #include "admin_cover.h"
@@ -18,14 +19,13 @@
 #include <s2/s2latlng_rect.h>
 #include <s2/s2loop.h>
 
+#include "admin_arcs.h"
 #include "admin_rank_config.h"
 #include "exact_pip.h"
 #include "cell_index.h"
 #include "geometry.h"
-#include "ring_contains.h"
 #include "s2_helpers.h"
 #include "test_framework.h"
-#include "vertex_pack.h"
 
 namespace {
 
@@ -42,23 +42,24 @@ const std::pair<uint64_t, bool>* own_cell_entry(const AdminRingCells& cells, dou
     return cell_entry(cells, S2CellId(S2LatLng::FromDegrees(lat, lng)).parent(level).id());
 }
 
-// The reader's answer: the f32 ray cast at the f32 point.
-bool reader_inside(const std::vector<NodeCoord>& ring, double lat, double lng) {
-    return ring_contains(ring.data(), static_cast<uint32_t>(ring.size()), static_cast<float>(lat),
-                         static_cast<float>(lng));
+using Ring = std::vector<PackedLocation>;
+
+// The cells of one ring at the admin cell index's reach.
+AdminRingCells ring_cells(const Ring& ring, int level) {
+    const RingSpan span{0, static_cast<uint32_t>(ring.size())};
+    return admin_ring_cells(ring.data(), &span, 1, level, ADMIN_COVER_REACH_RAD);
 }
 
 // Points in the ring's bounds and a margin past them, and points within
-// about 100 m of its edges.
-std::vector<std::pair<double, double>> probe_points(const std::vector<NodeCoord>& ring, std::mt19937_64& rng,
-                                                    size_t n) {
+// about 100 m of its edges, on the e7 grid the reader rounds a point to.
+std::vector<PackedLocation> probe_points(const Ring& ring, std::mt19937_64& rng, size_t n) {
     double lat_lo = 90, lat_hi = -90, lng_lo = 180, lng_hi = -180;
-    for (const NodeCoord& v : ring) {
-        lat_lo = std::min<double>(lat_lo, v.lat), lat_hi = std::max<double>(lat_hi, v.lat);
-        lng_lo = std::min<double>(lng_lo, v.lng), lng_hi = std::max<double>(lng_hi, v.lng);
+    for (const PackedLocation& v : ring) {
+        lat_lo = std::min(lat_lo, v.lat()), lat_hi = std::max(lat_hi, v.lat());
+        lng_lo = std::min(lng_lo, v.lon()), lng_hi = std::max(lng_hi, v.lon());
     }
     std::uniform_real_distribution<double> unit(0, 1), near(-1e-3, 1e-3);
-    std::vector<std::pair<double, double>> out;
+    std::vector<PackedLocation> out;
     for (size_t k = 0; k < n; k++) {
         double lat, lng;
         if (k % 2 == 0) {
@@ -66,29 +67,29 @@ std::vector<std::pair<double, double>> probe_points(const std::vector<NodeCoord>
             lng = lng_lo - 0.05 + unit(rng) * (lng_hi - lng_lo + 0.1);
         } else {
             const size_t e = rng() % ring.size();
-            const NodeCoord& a = ring[e];
-            const NodeCoord& b = ring[(e + 1) % ring.size()];
+            const PackedLocation& a = ring[e];
+            const PackedLocation& b = ring[(e + 1) % ring.size()];
             const double t = unit(rng);
-            lat = a.lat + t * (b.lat - a.lat) + near(rng);
-            lng = a.lng + t * (b.lng - a.lng) + near(rng);
+            lat = a.lat() + t * (b.lat() - a.lat()) + near(rng);
+            lng = a.lon() + t * (b.lon() - a.lon()) + near(rng);
         }
-        out.emplace_back(std::clamp(lat, -90.0, 90.0), std::clamp(lng, -180.0, 180.0));
+        out.push_back(point_e7(std::clamp(lat, -90.0, 90.0), std::clamp(lng, -180.0, 180.0)));
     }
     return out;
 }
 
-// Every probe the reader puts inside the ring is listed in its own cell, and
-// none in an interior-flagged cell is outside it. Returns the inside probes.
-size_t check_ring(const std::vector<NodeCoord>& ring, std::mt19937_64& rng, size_t probes, int level) {
-    const AdminRingCells cells =
-        admin_ring_cells(ring.data(), static_cast<uint32_t>(ring.size()), level, ADMIN_COVER_REACH_RAD);
+// Every probe the exact ray cast puts inside the ring is listed in its own
+// cell, and none in an interior-flagged cell is outside it. Returns the
+// inside probes.
+size_t check_ring(const Ring& ring, std::mt19937_64& rng, size_t probes, int level) {
+    const AdminRingCells cells = ring_cells(ring, level);
     CHECK(std::is_sorted(cells.begin(), cells.end()));
     CHECK(std::adjacent_find(cells.begin(), cells.end(),
                              [](const auto& x, const auto& y) { return x.first == y.first; }) == cells.end());
     size_t inside = 0;
-    for (const auto& [lat, lng] : probe_points(ring, rng, probes)) {
-        const auto* entry = own_cell_entry(cells, lat, lng, level);
-        const bool in = reader_inside(ring, lat, lng);
+    for (const PackedLocation& p : probe_points(ring, rng, probes)) {
+        const auto* entry = own_cell_entry(cells, p.lat(), p.lon(), level);
+        const bool in = exact_ring_contains(ring.data(), static_cast<uint32_t>(ring.size()), p);
         if (in) {
             inside++;
             CHECK(entry != nullptr);
@@ -98,9 +99,9 @@ size_t check_ring(const std::vector<NodeCoord>& ring, std::mt19937_64& rng, size
     return inside;
 }
 
-std::vector<NodeCoord> ring_of(const std::vector<std::pair<double, double>>& lat_lng) {
-    std::vector<NodeCoord> ring;
-    for (const auto& [lat, lng] : lat_lng) ring.push_back({static_cast<float>(lat), static_cast<float>(lng)});
+Ring ring_of(const std::vector<std::pair<double, double>>& lat_lng) {
+    Ring ring;
+    for (const auto& [lat, lng] : lat_lng) ring.push_back(point_e7(lat, lng));
     return ring;
 }
 
@@ -109,46 +110,23 @@ std::vector<NodeCoord> ring_of(const std::vector<std::pair<double, double>>& lat
 TEST(a_point_in_the_bow_of_a_parallel_edge_is_listed_in_its_own_cell) {
     // Egypt's southern border runs 660 km along 22°N; its great circle bows
     // 3.3 km north of the parallel, past this point the ray cast puts inside.
-    const std::vector<NodeCoord> ring = ring_of({{22.0, 25.0}, {22.0, 31.39888}, {24.0, 31.39888}, {24.0, 25.0}});
-    const double lat = 22.0019170, lng = 27.5734270;
-    REQUIRE(reader_inside(ring, lat, lng));
+    const Ring ring = ring_of({{22.0, 25.0}, {22.0, 31.39888}, {24.0, 31.39888}, {24.0, 25.0}});
+    const PackedLocation p = point_e7(22.0019170, 27.5734270);
+    REQUIRE(exact_ring_contains(ring.data(), static_cast<uint32_t>(ring.size()), p));
     std::vector<S2Point> points;
-    for (const NodeCoord& v : ring) points.push_back(S2LatLng::FromDegrees(v.lat, v.lng).ToPoint());
+    for (const PackedLocation& v : ring) points.push_back(S2LatLng::FromDegrees(v.lat(), v.lon()).ToPoint());
     S2Loop loop(points);
     loop.Normalize();
-    CHECK(!loop.Contains(S2LatLng::FromDegrees(lat, lng).ToPoint()));  // outside the great-circle ring
+    CHECK(!loop.Contains(S2LatLng::FromDegrees(p.lat(), p.lon()).ToPoint()));  // outside the great-circle ring
 
-    const AdminRingCells cells =
-        admin_ring_cells(ring.data(), static_cast<uint32_t>(ring.size()), kLevel, ADMIN_COVER_REACH_RAD);
-    const auto* entry = own_cell_entry(cells, lat, lng, kLevel);
+    const AdminRingCells cells = ring_cells(ring, kLevel);
+    const auto* entry = own_cell_entry(cells, p.lat(), p.lon(), kLevel);
     REQUIRE(entry != nullptr);
     CHECK(!entry->second);  // 210 m from the edge: not interior
     // 10 km north the cell lies wholly inside.
     const auto* deep = own_cell_entry(cells, 22.5, 27.5734270, kLevel);
     REQUIRE(deep != nullptr);
     CHECK(deep->second);
-}
-
-TEST(a_cell_within_the_reader_slack_of_an_edge_is_listed) {
-    // The f32 ray cast can put a point up to 6.6e-5° (types.h) outside an
-    // edge inside the ring, so a cell that close is listed though no edge
-    // enters it. The ring's east edge runs along a meridian, a great circle,
-    // 8e-5° (8.9 m) west of the cell: past the chord tolerance (6.4 m) alone.
-    const S2Cell cell(S2CellId(S2LatLng::FromDegrees(5.3, 20.7)).parent(kLevel));
-    const S2LatLngRect rect = cell.GetRectBound();
-    const double east = rect.lng_lo().degrees() - 8e-5;
-    const double south = rect.lat_lo().degrees() - 0.01, north = rect.lat_hi().degrees() + 0.01;
-    const std::vector<NodeCoord> ring = ring_of({{south, east - 0.05}, {south, east}, {north, east}, {north, east - 0.05}});
-    const S1ChordAngle gap = cell.GetDistance(S2LatLng::FromDegrees(ring[1].lat, ring[1].lng).ToPoint(),
-                                              S2LatLng::FromDegrees(ring[2].lat, ring[2].lng).ToPoint());
-    REQUIRE(gap > S1ChordAngle::Radians(ADMIN_COVER_CHORD_TOLERANCE_RAD));
-
-    const AdminRingCells cells =
-        admin_ring_cells(ring.data(), static_cast<uint32_t>(ring.size()), kLevel, ADMIN_COVER_REACH_RAD);
-    const S2LatLng centre(cell.GetCenter());
-    const auto* entry = own_cell_entry(cells, centre.lat().degrees(), centre.lng().degrees(), kLevel);
-    REQUIRE(entry != nullptr);
-    CHECK(!entry->second);
 }
 
 TEST(admin_ring_cells_list_every_point_the_ray_cast_puts_inside) {
@@ -187,24 +165,11 @@ TEST(admin_ring_cells_follow_edges_near_the_poles_and_the_long_way_round) {
                      20000, kLevel) > 5000);
 }
 
-TEST(admin_ring_cells_cover_rings_decoded_past_the_antimeridian_and_the_pole) {
-    // Packed on the 1e-4 grid from these minima, 180 decodes to 180.0000458
-    // and 90 to 90.0000305.
-    const std::vector<std::vector<std::pair<double, double>>> rings = {
-        {{-18, 179.12345}, {-18, 180}, {-17, 180}, {-17, 179.12345}},
-        {{89.00003, 10}, {89.00003, 11}, {90, 11}, {90, 10}},
-    };
+TEST(admin_ring_cells_cover_rings_along_the_antimeridian_and_up_to_the_pole) {
     std::mt19937_64 rng(5);
-    for (const auto& lat_lng : rings) {
-        const std::vector<NodeCoord> ring = ring_of(lat_lng);
-        const PolygonPacking p = plan_polygon(ring.data(), ring.size());
-        std::vector<uint8_t> bytes(p.bytes);
-        pack_polygon(bytes.data(), p, ring.data(), ring.size());
-        const std::vector<NodeCoord> decoded = unpack_polygon(bytes.data(), ring.size());
-        REQUIRE(std::any_of(decoded.begin(), decoded.end(), [](const NodeCoord& v) { return v.lng > 180 || v.lat > 90; }));
-        CHECK(admin_ring_bounds(decoded.data(), static_cast<uint32_t>(decoded.size())).is_valid());
-        CHECK(check_ring(decoded, rng, 20000, kLevel) > 2000);
-    }
+    for (const Ring& ring : {ring_of({{-18, 179.12345}, {-18, 180}, {-17, 180}, {-17, 179.12345}}),
+                             ring_of({{89.00003, 10}, {89.00003, 11}, {90, 11}, {90, 10}})})
+        CHECK(check_ring(ring, rng, 20000, kLevel) > 2000);
 }
 
 TEST(admin_cell_routed_keeps_the_ring_of_cells_around_a_region) {
@@ -268,24 +233,6 @@ TEST(admin_cover_union_marks_only_common_interiors) {
 }
 
 namespace {
-AdminRingCells variant_cells(const std::vector<NodeCoord>& ring, uint8_t level, double scale) {
-    std::vector<std::pair<double, double>> pts;
-    for (auto v : ring) pts.emplace_back(v.lat, v.lng);
-    if (scale > 0) pts = simplify_polygon_epsilon(pts, meters_to_degrees(admin_epsilon_meters(level) * scale, pts[0].first));
-    std::vector<uint8_t> bytes(plan_polygon(pts.data(), pts.size()).bytes);
-    pack_polygon_at(bytes.data(), pts.data(), pts.size());
-    auto decoded = unpack_polygon(bytes.data(), pts.size());
-    return admin_ring_cells(decoded.data(), decoded.size(), kAdminCellLevel, ADMIN_COVER_REACH_RAD);
-}
-
-AdminRingCells indexed_cells(const std::vector<CellItemPair>& pairs) {
-    AdminRingCells cells;
-    for (const auto& pair : pairs) {
-        CHECK_EQ(pair.item_id & ~INTERIOR_FLAG, 0u);
-        cells.emplace_back(pair.cell_id, (pair.item_id & INTERIOR_FLAG) != 0);
-    }
-    return cells;
-}
 
 // Whether `a` lists a cell `b` does not.
 bool lists_more(const AdminRingCells& a, const AdminRingCells& b) {
@@ -300,82 +247,92 @@ bool interior_differs(const AdminRingCells& a, const AdminRingCells& b) {
     });
 }
 
-// Every cell either variant lists, interior where both are.
-AdminRingCells shared_covering(const AdminRingCells& a, const AdminRingCells& b) {
-    std::map<uint64_t, int> interior_in;
-    for (const AdminRingCells* variant : {&a, &b})
-        for (const auto& [cell, interior] : *variant) interior_in[cell] += interior;
-    AdminRingCells out;
-    for (const auto& [cell, n] : interior_in) out.emplace_back(cell, n == 2);
+// One polygon's entries of an admin cell index.
+AdminRingCells indexed_cells(const std::vector<CellItemPair>& pairs) {
+    AdminRingCells cells;
+    for (const auto& pair : pairs) {
+        CHECK_EQ(pair.item_id & ~INTERIOR_FLAG, 0u);
+        cells.emplace_back(pair.cell_id, (pair.item_id & INTERIOR_FLAG) != 0);
+    }
+    return cells;
+}
+
+// One polygon of the given ring (in degrees, closed here) and its arc
+// stage, with its admin cell indexes.
+struct Indexed {
+    ParsedData data;
+    AdminArcs arcs;
+    AdminRingCells exact, simplified, minimal;
+};
+
+Indexed indexed(const std::vector<std::pair<double, double>>& lat_lng, uint8_t level, uint8_t place_type = 0) {
+    Indexed out;
+    std::vector<PackedLocation> ring;
+    for (const auto& [lat, lng] : lat_lng) ring.push_back(point_e7(lat, lng));
+    ring.push_back(ring.front());
+    out.data.admin_exact_rings.append(ring, {});
+    AdminPolygon p{};
+    p.admin_level = level;
+    p.place_type_override = place_type;
+    out.data.admin_polygons.push_back(p);
+    const AdminExactRings& store = out.data.admin_exact_rings;
+    out.arcs = build_admin_arcs(store, {admin_minimal_keeps(level, place_type)}, "", 1);
+    // Each tier's cells as admin_ring_cells gives them for its rings.
+    auto cells_of = [&](size_t t) {
+        std::vector<PackedLocation> stored, raw;
+        std::vector<StoredVertex> scratch;
+        tier_ring(out.arcs, store, kArcTiers[t], out.arcs.tiers[t], 0, stored, raw, scratch);
+        if (stored.empty()) return AdminRingCells();
+        const RingSpan span{0, static_cast<uint32_t>(stored.size())};
+        return admin_ring_cells(stored.data(), &span, 1, kAdminCellLevel, ADMIN_COVER_REACH_RAD);
+    };
+    out.simplified = cells_of(0);
+    out.exact = cells_of(1);
+    out.minimal = cells_of(2);
+    CHECK(out.exact == admin_ring_cells(store.vertices.data(), store.rings_of(0), 1, kAdminCellLevel,
+                                        ADMIN_COVER_REACH_RAD));
+    compute_admin_index_cells(out.data, out.arcs, admin_candidate_cells(store, 0, 1, 1), 1);
     return out;
 }
 
-// The shared index of the level-8 polygon `ring` over q0 and q2.5, in either
-// order, is the shared covering of its two variants.
-void check_shared_index(const std::vector<NodeCoord>& ring, const AdminRingCells& original,
-                        const AdminRingCells& simplified) {
-    const AdminRingCells want = shared_covering(original, simplified);
-    ParsedData data;
-    data.admin_vertices = ring;
-    AdminPolygon ap{};
-    ap.vertex_count = ring.size(); ap.vertex_offset = 0; ap.admin_level = 8;
-    data.admin_polygons.push_back(ap);
-    compute_admin_index_cells(data, {0, 2.5}, std::nullopt);
-    CHECK(indexed_cells(data.admin_index_cells) == want);
-    compute_admin_index_cells(data, {2.5, 0}, std::nullopt);
-    CHECK(indexed_cells(data.admin_index_cells) == want);
-}
+// A level-8 rectangle 0.4° tall whose southern edge at `edge` degrees has a
+// spike `depth` degrees deep (negative: a notch) at 0.3°E, which the
+// simplified tier's 37.5 m drops.
+std::vector<std::pair<double, double>> spiked(double edge, double depth) {
+    return {{edge, 0.1}, {edge, 0.3}, {edge - depth, 0.30001}, {edge, 0.30002}, {edge, 0.5}, {0.4, 0.5}, {0.4, 0.1}};
 }
 
-TEST(admin_cover_shared_index_covers_both_quality_geometries) {
-    // A shallow spike near an S2 edge is dropped by q2.5; uncapped must still
-    // contribute the cells it reaches. Try adjacent offsets to avoid relying
-    // on the particular rounding of an S2 edge's floating point coordinate.
-    std::vector<NodeCoord> ring;
-    AdminRingCells original, simplified;
-    for (int shift = 1; shift <= 50 && !lists_more(original, simplified); shift++) {
-        float edge = shift * 0.00001f;
-        ring = {{edge, 0.1f}, {edge, 0.3f}, {edge - 0.0003f, 0.30001f},
-                {edge, 0.30002f}, {edge, 0.5f}, {0.4f, 0.5f}, {0.4f, 0.1f}, {edge, 0.1f}};
-        original = variant_cells(ring, 8, 0);
-        simplified = variant_cells(ring, 8, 2.5);
-    }
-    REQUIRE(lists_more(original, simplified));
-    check_shared_index(ring, original, simplified);
+}  // namespace
+
+TEST(the_admin_index_covers_the_exact_and_the_simplified_rings) {
+    // The spike crosses the equator, an S2 cell edge at every level, 11 m
+    // south of the rectangle: only the exact rings reach the cells past it.
+    const Indexed polygon = indexed(spiked(1e-4, 3e-4), 8);
+    REQUIRE(lists_more(polygon.exact, polygon.simplified));
+    CHECK(indexed_cells(polygon.data.admin_index_cells) == merge_admin_ring_cells(polygon.exact, polygon.simplified));
+    // Admin-minimal's over its own tier alone.
+    CHECK(indexed_cells(polygon.data.admin_minimal_index_cells) == polygon.minimal);
 }
 
-TEST(admin_cover_shared_index_flags_interior_only_where_both_geometries_do) {
-    // A shallow notch across an S2 edge is dropped by q2.5, which leaves the
-    // cell past the edge interior there; uncapped still reaches into that
-    // cell, so the shared index must not flag it.
-    std::vector<NodeCoord> ring;
-    AdminRingCells original, simplified;
-    for (int shift = 1; shift <= 50 && !interior_differs(original, simplified); shift++) {
-        float edge = -shift * 0.00001f;
-        ring = {{edge, 0.1f}, {edge, 0.3f}, {edge + 0.0003f, 0.30001f},
-                {edge, 0.30002f}, {edge, 0.5f}, {0.4f, 0.5f}, {0.4f, 0.1f}, {edge, 0.1f}};
-        original = variant_cells(ring, 8, 0);
-        simplified = variant_cells(ring, 8, 2.5);
-    }
-    REQUIRE(interior_differs(original, simplified));
-    check_shared_index(ring, original, simplified);
+TEST(the_admin_index_flags_interior_only_where_every_tier_does) {
+    // A notch north across the equator from 11 m south of it: the simplified
+    // rectangle holds the cells past the equator whole, the exact rings
+    // don't.
+    const Indexed polygon = indexed(spiked(-1e-4, -3e-4), 8);
+    REQUIRE(interior_differs(polygon.exact, polygon.simplified));
+    CHECK(indexed_cells(polygon.data.admin_index_cells) == merge_admin_ring_cells(polygon.exact, polygon.simplified));
 }
 
-TEST(admin_cover_minimal_keeps_rank_sixteen_city_areas) {
-    ParsedData data;
-    data.admin_vertices = {{1.0f, 1.0f}, {1.0f, 1.2f}, {1.2f, 1.2f}, {1.2f, 1.0f}, {1.0f, 1.0f}};
-    AdminPolygon ap{};
-    ap.vertex_count = data.admin_vertices.size(); ap.vertex_offset = 0;
-    ap.admin_level = 15; ap.place_type_override = uint8_t(AdminPlaceType::CITY);
-    REQUIRE(admin_minimal_keeps(ap.admin_level, ap.place_type_override));
-    data.admin_polygons.push_back(ap);
-    const AdminRingCells want = variant_cells(data.admin_vertices, ap.admin_level, 2.5);
-    REQUIRE(!want.empty());
-    compute_admin_index_cells(data, {0}, 2.5);
-    CHECK(indexed_cells(data.admin_minimal_index_cells) == want);
-    data.admin_polygons[0].place_type_override = 0;
-    compute_admin_index_cells(data, {0}, 2.5);
-    CHECK(data.admin_minimal_index_cells.empty());
+TEST(the_admin_minimal_index_keeps_rank_sixteen_city_areas_on_the_minimal_tier) {
+    const std::vector<std::pair<double, double>> square = {{1.0, 1.0}, {1.0, 1.2}, {1.2, 1.2}, {1.2, 1.0}};
+    REQUIRE(admin_minimal_keeps(15, uint8_t(AdminPlaceType::CITY)));
+    const Indexed city = indexed(square, 15, uint8_t(AdminPlaceType::CITY));
+    REQUIRE(!city.minimal.empty());
+    CHECK(indexed_cells(city.data.admin_minimal_index_cells) == city.minimal);
+    CHECK(indexed_cells(city.data.admin_index_cells) == merge_admin_ring_cells(city.exact, city.simplified));
+    const Indexed area = indexed(square, 15);
+    CHECK(area.data.admin_minimal_index_cells.empty());
+    CHECK(!area.data.admin_index_cells.empty());
 }
 
 namespace {
@@ -426,7 +383,7 @@ TEST(admin_ring_cells_of_exact_rings_with_holes_list_every_point_inside) {
         for (int h = 0; h < 1 + round % 3; h++)
             polygon.add(star(rng, lat + 0.15 * r * (h - 1), lng + 0.15 * r * (h - 1), 0.12 * r, 6 + h));
         const int level = round % 2 ? kLevel : 7;
-        const AdminRingCells cells = polygon.cells(level, ADMIN_LINK_REACH_RAD);
+        const AdminRingCells cells = polygon.cells(level, ADMIN_COVER_REACH_RAD);
         CHECK(std::is_sorted(cells.begin(), cells.end()));
         for (int k = 0; k < 4000; k++) {
             PackedLocation p;
@@ -453,25 +410,32 @@ TEST(admin_ring_cells_of_exact_rings_with_holes_list_every_point_inside) {
     CHECK(in_holes > 1000);
 }
 
-TEST(the_reach_decides_how_far_from_an_exact_edge_a_cell_is_listed) {
+TEST(a_cell_8_m_outside_an_exact_edge_is_not_listed) {
     // A ring whose east edge runs along a meridian `gap` west of a cell: the
-    // reader's reach (6.4 m chord + 11 m slack) lists the cell from 8.9 m
-    // off, the builder's (6.4 m + 1.1 cm) only from under 6.4 m.
-    const S2Cell cell(S2CellId(S2LatLng::FromDegrees(5.3, 20.7)).parent(kLevel));
+    // reach (6.4 m chord + 1.1 cm) lists the cell only from under 6.4 m off,
+    // in the exact rings' covering and in the admin cell index over every
+    // tier (an 11 m slack for an f32 reader listed it from 17.5 m).
+    const S2Cell cell(S2CellId(S2LatLng::FromDegrees(5.3, 20.7)).parent(kAdminCellLevel));
     const S2LatLngRect rect = cell.GetRectBound();
     const S2LatLng centre(cell.GetCenter());
-    auto listed = [&](double gap_deg, double reach_rad) {
+    auto ring_at = [&](double gap_deg) {
         const double east = rect.lng_lo().degrees() - gap_deg;
         const double south = rect.lat_lo().degrees() - 0.01, north = rect.lat_hi().degrees() + 0.01;
-        ExactPolygon polygon;
-        polygon.add({point_e7(south, east - 0.05), point_e7(south, east), point_e7(north, east),
-                     point_e7(north, east - 0.05)});
-        const AdminRingCells cells = polygon.cells(kLevel, reach_rad);
-        const auto* entry = own_cell_entry(cells, centre.lat().degrees(), centre.lng().degrees(), kLevel);
+        return std::vector<std::pair<double, double>>{{south, east - 0.05}, {south, east}, {north, east}, {north, east - 0.05}};
+    };
+    auto listed = [&](const AdminRingCells& cells) {
+        const auto* entry = own_cell_entry(cells, centre.lat().degrees(), centre.lng().degrees(), kAdminCellLevel);
         return entry != nullptr && !entry->second;
     };
-    CHECK(listed(8e-5, ADMIN_COVER_REACH_RAD));
-    CHECK(!listed(8e-5, ADMIN_LINK_REACH_RAD));
-    CHECK(listed(5e-5, ADMIN_LINK_REACH_RAD));
-    CHECK(!listed(2e-4, ADMIN_COVER_REACH_RAD));
+    auto exact_listed = [&](double gap_deg) {
+        ExactPolygon polygon;
+        std::vector<PackedLocation> ring;
+        for (const auto& [lat, lng] : ring_at(gap_deg)) ring.push_back(point_e7(lat, lng));
+        polygon.add(ring);
+        return listed(polygon.cells(kAdminCellLevel, ADMIN_COVER_REACH_RAD));
+    };
+    CHECK(!exact_listed(8e-5));
+    CHECK(exact_listed(5e-5));
+    CHECK(!listed(indexed_cells(indexed(ring_at(8e-5), 8).data.admin_index_cells)));
+    CHECK(listed(indexed_cells(indexed(ring_at(5e-5), 8).data.admin_index_cells)));
 }

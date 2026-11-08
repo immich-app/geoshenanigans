@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Tests for build_search_indexes.py. Run: python3 -m unittest discover -s geocoder/builder/tools"""
+import itertools
 import json
 import os
+import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -11,6 +14,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import build_search_indexes as sut  # noqa: E402
 
 TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "configurations.template.json")
+PORTAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "test-portal")
+# The files a dir's admin geometry is read from (server/src/admin_geometry.rs, ADMIN_GEOMETRY_FILES).
+ADMIN_GEOMETRY = ["admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin"]
 
 # Stands in for place-search: `build <set> <out> ...` records its arguments and what the set dir
 # held (name -> link target) and writes the index files, then fails for a set path containing
@@ -82,8 +88,8 @@ class BuildSearchIndexesTest(unittest.TestCase):
                 self.assertEqual(call["rest"][:2], ["--threads", "3"])
                 # The fixture writes no optional file.
                 self.assertEqual(sorted(call["held"]), sorted({os.path.basename(p) for p in paths if p not in optional}))
-                self.assertEqual(call["held"]["admin_vertices.bin"],
-                                 os.path.join(self.out, region, "quality", sel["quality"], "admin_vertices.bin"))
+                self.assertEqual(call["held"]["arc_vertices.bin"],
+                                 os.path.join(self.out, region, "quality", sel["quality"], "arc_vertices.bin"))
                 self.assertEqual(call["held"]["poi_records.bin"],
                                  os.path.join(self.out, region, "poi", sel["poi_tier"], "poi_records.bin"))
         self.assertFalse([d for d in os.listdir(self.tmp.name) if d.startswith("search-indexes-")])
@@ -106,23 +112,125 @@ class BuildSearchIndexesTest(unittest.TestCase):
         self.assertEqual(self.run_main(), 1)
 
 
+def load_template():
+    with open(TEMPLATE) as f:
+        return json.load(f)
+
+
+def allowed(cfg, sel):
+    """Whether `sel` keeps the template's constraints: a selection with every value a constraint's
+    `when` names has every value its `requires` names."""
+    def has(values):
+        return all(sel.get(axis) == value for axis, value in values.items())
+    return all(not has(c["when"]) or has(c["requires"]) for c in cfg["constraints"])
+
+
+def selections(cfg, region="planet"):
+    """Every mode × quality × poi_tier the template's constraints allow, in `region`."""
+    axes = [list(cfg["axes"][axis]["values"]) for axis in sut.AXES]
+    every = (dict(zip(sut.AXES, values), region=region) for values in itertools.product(*axes))
+    return [sel for sel in every if allowed(cfg, sel)]
+
+
+def flat(paths):
+    """The dir a flat download takes each file name from: the last path of that name, as a client
+    downloads in path order."""
+    return {os.path.basename(p): os.path.dirname(p) for p in sorted(paths)}
+
+
 class TemplateTest(unittest.TestCase):
-    MINIMAL_FILES = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_vertices.bin",
-                     "place_nodes.bin", "strings_core.bin", "strings_layout.json"]
+    MINIMAL_FILES = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_rings.bin",
+                     "arc_index.bin", "arc_vertices.bin", "place_nodes.bin", "strings_core.bin",
+                     "strings_layout.json"]
 
     def test_admin_minimal_takes_its_poi_dir_beside_a_poi_tier(self):
         # admin-minimal/ holds strings of its own, which a POI tier's names and parent polygons don't
         # point into: beside a POI tier the mode takes admin-minimal-poi/, on the shared slots and strings.
-        with open(TEMPLATE) as f:
-            cfg = json.load(f)
-        for poi_tier in cfg["axes"]["poi_tier"]["values"]:
-            sel = {"region": "planet", "mode": "admin-minimal", "quality": "q2.5", "poi_tier": poi_tier}
+        cfg = load_template()
+        minimal = [sel for sel in selections(cfg) if sel["mode"] == "admin-minimal"]
+        self.assertEqual(len(minimal), len(cfg["axes"]["poi_tier"]["values"]))
+        for sel in minimal:
             paths, _ = sut.resolve(cfg, sel)
             own, poi = "planet/admin-minimal/", "planet/admin-minimal-poi/"
-            dir_, other = (own, poi) if poi_tier == "none" else (poi, own)
+            dir_, other = (own, poi) if sel["poi_tier"] == "none" else (poi, own)
 
-            self.assertEqual([p[len(dir_):] for p in paths if p.startswith(dir_)], self.MINIMAL_FILES, poi_tier)
-            self.assertEqual([p for p in paths if p.startswith(other) or p.startswith("planet/quality/")], [], poi_tier)
+            self.assertEqual([p[len(dir_):] for p in paths if p.startswith(dir_)], self.MINIMAL_FILES, sel)
+            self.assertEqual([p for p in paths if p.startswith(other) or p.startswith("planet/quality/")], [], sel)
+
+    def test_every_selection_takes_each_admin_geometry_file_once_from_its_dir(self):
+        # Downloads land flat by name: a second copy of an admin geometry file, or a .bin name twice,
+        # would mix two sets of arcs.
+        cfg = load_template()
+        presets = [p["selections"] for p in cfg["presets"]]
+        for sel in selections(cfg) + presets:
+            paths, _ = sut.resolve(cfg, sel)
+            if sel["mode"] == "admin-minimal":
+                dir_ = "planet/admin-minimal" if sel["poi_tier"] == "none" else "planet/admin-minimal-poi"
+            else:
+                dir_ = f"planet/quality/{sel['quality']}"
+            names = [os.path.basename(p) for p in paths]
+
+            for name in ADMIN_GEOMETRY:
+                self.assertEqual([p for p in paths if os.path.basename(p) == name], [f"{dir_}/{name}"], sel)
+            bins = [n for n in names if n.endswith(".bin")]
+            self.assertEqual(len(bins), len(set(bins)), sel)
+            self.assertEqual([n for n in names if n == "admin_vertices.bin" or n.startswith("postal_")], [], sel)
+
+    def test_presets_take_their_boundaries_from_the_tier_they_name(self):
+        # smallest: admin-minimal's own; recommended and with-addresses: simplified; max: exact.
+        cfg = load_template()
+        expected = {"smallest": "planet/admin-minimal", "immich-recommended": "planet/quality/simplified",
+                    "with-addresses": "planet/quality/simplified", "max-quality": "planet/quality/exact"}
+        got = {p["id"]: flat(sut.resolve(cfg, p["selections"])[0])["arc_vertices.bin"] for p in cfg["presets"]}
+
+        self.assertEqual(got, expected)
+
+
+class TestPortalTest(unittest.TestCase):
+    """The test portal's servers download the files of the selection they name, from the dirs a
+    client takes them from."""
+
+    def portal_files(self, env):
+        """The "<dir> <file>" lines entrypoint.sh --list-files gives under `env`, as planet paths. It runs
+        with no curl, zstd or query-server on its PATH, so it can't download or serve."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run = subprocess.run(["sh", os.path.join(PORTAL, "entrypoint.sh"), "--list-files"],
+                                 env={"PATH": tmp, "DATA_DIR": tmp, **env}, capture_output=True, text=True,
+                                 executable="/bin/sh", timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return [f"planet/{d}/{f}" for d, f in (line.split() for line in run.stdout.splitlines())]
+
+    def compose_environments(self):
+        """Each docker-compose.yml service's environment (its `KEY: value` lines)."""
+        with open(os.path.join(PORTAL, "docker-compose.yml")) as f:
+            text = f.read()
+        blocks = re.findall(r"^    environment:\n((?:      \w+: .+\n)+)", text, re.M)
+        return [{k: v.strip('"') for k, v in re.findall(r"^      (\w+): (.+)$", block, re.M)} for block in blocks]
+
+    def selection_of(self, env):
+        if env.get("MINIMAL") == "1":
+            return {"region": "planet", "mode": "admin-minimal", "quality": env["QUALITY"], "poi_tier": "none"}
+        return {"region": "planet", "mode": "full", "quality": env["QUALITY"], "poi_tier": env["POI_TIER"]}
+
+    def test_each_server_downloads_its_selections_files_from_their_dirs(self):
+        cfg = load_template()
+        envs = self.compose_environments()
+        self.assertEqual(sorted(e.get("MINIMAL") for e in envs), ["0", "1"])
+        tiers = [dict(e, QUALITY=q) for e in envs for q in cfg["axes"]["quality"]["values"]]
+        for env in envs + tiers:
+            sel = self.selection_of(env)
+            if not allowed(cfg, sel):
+                continue
+            listed = self.portal_files(env)
+
+            self.assertEqual(len(listed), len(set(map(os.path.basename, listed))), env)
+            self.assertEqual(flat(listed), flat(sut.resolve(cfg, sel)[0]), env)
+
+    def test_the_defaults_are_the_compose_files(self):
+        envs = {e["MINIMAL"]: e for e in self.compose_environments()}
+
+        self.assertEqual(self.portal_files({}), self.portal_files(envs["0"]))
+        self.assertEqual(self.portal_files({"MINIMAL": "1"}), self.portal_files(envs["1"]))
 
 
 class ResolveTest(unittest.TestCase):
@@ -130,11 +238,11 @@ class ResolveTest(unittest.TestCase):
         "mode.small": {"files": ["{region}/small/a.bin", "{region}/small/shared.json"],
                        "optional_files": ["{region}/small/opt.bin"],
                        "replaces": ["{region}/quality/{quality}/q.bin"]},
-        "quality.q1": {"extends": "quality.base", "files": ["{region}/quality/q1/q.bin"]},
+        "quality.simplified": {"extends": "quality.base", "files": ["{region}/quality/simplified/q.bin"]},
         "quality.base": {"files": ["{region}/quality/base.bin"]},
         "poi_tier.none": {"files": []},
     }}
-    SEL = {"region": "planet", "mode": "small", "quality": "q1", "poi_tier": "none"}
+    SEL = {"region": "planet", "mode": "small", "quality": "simplified", "poi_tier": "none"}
 
     def test_takes_extended_and_optional_files_minus_the_replaced(self):
         paths, optional = sut.resolve(self.CFG, self.SEL)

@@ -90,7 +90,7 @@ enum class VertexEncoding : uint8_t {
 static constexpr uint8_t VERTEX_STRIDE[4] = {4, 4, 4, 8};
 static constexpr double VERTEX_SCALE[4] = {1e-5, 1e-4, 1e-6, 1e-7};  // degrees per delta step
 
-// admin_vertices.bin / poi_vertices.bin / addr_vertices.bin layout per
+// poi_vertices.bin / addr_vertices.bin layout per
 // polygon (only present when vertex_count > 0):
 //
 //   byte 0     : VertexEncoding tag
@@ -106,17 +106,20 @@ static constexpr double VERTEX_SCALE[4] = {1e-5, 1e-4, 1e-6, 1e-7};  // degrees 
 // point-only and would otherwise carry unused bbox_min fields.
 static constexpr uint32_t POLY_HEADER_BYTES = 10;
 
+// An admin_polygons.bin record. Its rings are its ring block in its dir's
+// admin_rings.bin (arc_blocks.h), bytes [ring_offset, ring_offset +
+// ring_bytes): the outer ring, then the holes.
 struct AdminPolygon {
-    uint32_t vertex_offset;       // BYTE offset into admin_vertices.bin (to polygon header)
-    uint32_t vertex_count;
+    uint32_t ring_offset;
+    uint32_t ring_bytes;
     uint32_t name_id;
     uint8_t admin_level;
     uint8_t place_type_override = 0; // AdminPlaceType — overrides admin_level for field mapping
     uint8_t _pad2 = 0, _pad3 = 0;
-    float area;                   // shoelace, holes subtracted
+    float area;                   // of the exact rings, holes subtracted
     uint16_t country_code;
-    // Holes appended to the outer ring in the vertex range, keyhole-encoded
-    // so a crossing-number test honours them (polygon_rings.h).
+    // How many holes follow the outer ring, at most UINT16_MAX: the reader
+    // walks the block's rings by ring_bytes, so this only informs.
     uint16_t hole_count = 0;
 };
 static_assert(sizeof(AdminPolygon) == 24, "AdminPolygon must be 24 bytes");
@@ -157,14 +160,12 @@ static const uint32_t INTERIOR_FLAG = 0x80000000u;
 static const uint32_t ID_MASK       = 0x7FFFFFFFu;
 static const uint32_t NO_DATA       = 0xFFFFFFFFu;
 
-// A strategy-2 slot with no living polygon. vertex_offset must be NO_DATA,
-// not 0: geocoder-diff sizes each polygon's vertex block as the distance to
-// the next non-NO_DATA offset, so a 0 offset claims every byte before the
-// next polygon and corrupts the admin_vertices patch.
+// A strategy-2 slot with no living polygon: no ring block (ring_offset
+// NO_DATA, ring_bytes 0) and no name.
 inline AdminPolygon admin_polygon_tombstone() {
     AdminPolygon p{};
-    p.vertex_offset = NO_DATA;
-    p.vertex_count = 0;
+    p.ring_offset = NO_DATA;
+    p.ring_bytes = 0;
     p.name_id = NO_DATA;
     return p;
 }
@@ -173,9 +174,6 @@ inline AdminPolygon admin_polygon_tombstone() {
 // stable ids for TIGER interpolation ways and place nodes (build_index.cpp).
 static const uint64_t FNV1A_OFFSET_BASIS = 14695981039346656037ULL;
 static const uint64_t FNV1A_PRIME        = 1099511628211ULL;
-
-// Simplification mode
-enum class SimplifyMode { MaxVertices, ErrorBounded };
 
 // Processing limits
 static constexpr int    MAX_NODE_COUNT          = 65535; // uint16_t node_count (OSM caps ways at 2000)
@@ -191,21 +189,15 @@ static constexpr size_t MAX_NODE_ID_DEFAULT     = 15000000000ULL; // node index 
 // is followed in pieces whose great-circle chords lie within the chord
 // tolerance (6.4 m) of them and which span at most the max piece (64 km) of
 // latitude or longitude; every cell within the reach of a piece is listed.
-// The reach adds the reader's own error to the tolerance: its query point
-// rounds to f32 by at most 8.5e-6 deg, and its f32 ray cast puts a crossing
-// at most 5 * 2^-24 * 180 + 3.8e-6 = 5.8e-5 deg off the edge.
+// The reader and the builder's links test a point by the exact e7 ray cast
+// at the point's e7 rounding, which has no error of its own. The slack only
+// covers the rounding of a cell centre to e7 for its interior test, at most
+// 0.71e-7 deg, so a centre never crosses an edge.
 static constexpr double ADMIN_COVER_CHORD_TOLERANCE_RAD = 1e-6;
 static constexpr double ADMIN_COVER_MAX_PIECE_RAD       = 0.01;
-static constexpr double ADMIN_COVER_READER_SLACK_DEG    = 1e-4;
+static constexpr double ADMIN_COVER_READER_SLACK_DEG    = 1e-7;
 static constexpr double ADMIN_COVER_REACH_RAD =
     ADMIN_COVER_CHORD_TOLERANCE_RAD + ADMIN_COVER_READER_SLACK_DEG * (3.14159265358979323846 / 180.0);
-// The builder's own admin cells (admin_candidate_map) are tested by the exact
-// e7 ray cast at the point's e7 rounding, which has no error of its own. The
-// slack only covers the rounding of a cell centre to e7 for its interior
-// test, at most 0.71e-7 deg, so a centre never crosses an edge.
-static constexpr double ADMIN_LINK_SLACK_DEG = 1e-7;
-static constexpr double ADMIN_LINK_REACH_RAD =
-    ADMIN_COVER_CHORD_TOLERANCE_RAD + ADMIN_LINK_SLACK_DEG * (3.14159265358979323846 / 180.0);
 
 // --- Admin arcs (admin_arcs.h) ---
 

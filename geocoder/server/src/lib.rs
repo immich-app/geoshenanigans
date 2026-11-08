@@ -11,7 +11,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 mod admin_geometry;
-pub use admin_geometry::{AdminGeometry, AdminPoint, PipMemo};
+pub use admin_geometry::{AdminGeometry, AdminPoint, PipMemo, ADMIN_GEOMETRY_FILES};
+mod arc_blocks;
+#[cfg(any(test, feature = "fixtures"))]
+pub mod arc_fixture;
+mod exact_pip;
+pub use exact_pip::{edge_crosses, on_edge, to_e7, PointE7};
 mod file_stamp;
 pub use file_stamp::FileStamp;
 mod place_index;
@@ -44,6 +49,14 @@ impl FileBytes {
     }
 
     pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+    /// The whole file.
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(v) => v,
+            Self::Mmap(m) => m,
+        }
+    }
 
     /// Read `len` bytes starting at `off`.  `len` stays usize because
     /// individual reads are always tiny (max a few KiB of vertices).
@@ -265,7 +278,7 @@ pub fn vertex_scale(enc: u8) -> f64 {
 }
 
 /// Per-polygon header at the start of each polygon's vertex slice in
-/// admin_vertices.bin / poi_vertices.bin / addr_vertices.bin:
+/// poi_vertices.bin / addr_vertices.bin:
 ///   byte 0     : vertex encoding tag (VertexEncoding in builder/src/types.h)
 ///   byte 1     : padding
 ///   bytes 2..6 : bbox_min_lat (f32)
@@ -275,35 +288,30 @@ pub fn vertex_scale(enc: u8) -> f64 {
 /// vertex_offset == NO_DATA).
 pub const POLY_HEADER_BYTES: u64 = 10;
 
-/// Largest vertex delta (in scale steps) the u16 encodings 0-2 can store.
-const U16_VERTEX_MAX_STEPS: f64 = u16::MAX as f64;
-/// Margin of the latitude bounds test in `ring_bounds_exclude`. `point_in_polygon` computes an
-/// edge's crossing latitude in f32; while the edge's longitude span is a normal f32 it lands
-/// within about 7e-5 degrees of the edge's latitude span (five roundings relative to a span of at
-/// most 180 degrees, plus the final addition), so a point 1e-3 degrees beyond every vertex is
-/// beyond every crossing.
-const PIP_LAT_BOUND_SLACK_DEG: f32 = 1e-3;
-/// 2^-100 (f32 biased exponent 27). At or above this |lng| the longitudes of an edge straddling
-/// the point differ by at least 2^-124, a normal f32; closer to 0 the latitude test is skipped.
-const PIP_LAT_BOUND_MIN_ABS_LNG: f32 = f32::from_bits(27 << 23);
+/// The admin level of a postcode area's record (boundary=postal_code).
+pub const POSTCODE_AREA_LEVEL: u8 = 11;
+/// The admin level `/polygons` gives a postcode area, the one the test portal colours as postal.
+pub const POLYGONS_POSTAL_LEVEL: u8 = 99;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct AdminPolygon {
-    pub vertex_offset: u32,       // BYTE offset into admin_vertices.bin (to header)
-    pub vertex_count: u32,
+    /// Byte offset of the polygon's ring block in admin_rings.bin (admin_geometry.rs); NO_DATA
+    /// for a tombstone.
+    pub ring_offset: u32,
+    /// The ring block's length; 0 where a tier left the polygon without rings.
+    pub ring_bytes: u32,
     pub name_id: u32,
     pub admin_level: u8,
     pub place_type_override: u8,  // 0=none, 1=city, 2=town, 3=village, 4=suburb, 5=neighbourhood, 6=quarter
     pub _pad2: u8,
     pub _pad3: u8,
-    pub area: f32,                // shoelace, holes subtracted
+    /// The exact shoelace of the polygon's rings, holes taken off, in square degrees: the same in
+    /// every tier.
+    pub area: f32,
     pub country_code: u16,
-    /// Holes appended to the outer ring in the vertex range. They are
-    /// keyhole-encoded (builder/src/polygon_rings.h): each is reached from
-    /// the outer ring's first vertex by axis-aligned connector edges walked
-    /// both ways, which cancel in `point_in_polygon`, so the plain crossing
-    /// test over all `vertex_count` vertices already leaves holes out.
+    /// The polygon's rings after its outer one, saturating at 65535: informational, as the ring
+    /// block holds every ring.
     pub hole_count: u16,
 }
 
@@ -958,7 +966,16 @@ pub struct AdminScan {
 }
 
 impl AdminScan {
+    /// The scan of the point (`lat`, `lng`), rounded once to the e7 grid: its cell is that of the
+    /// point every ring is tested at. A point off the globe, or NaN, is in no ring and its scan
+    /// lists none: S2 would wrap it onto a cell of the globe ((10, 380) onto the cell of (10, 20)),
+    /// whose interior entries hold that cell's points, not this one.
     pub fn new(index: &Index, lat: f64, lng: f64) -> Self {
+        let point = AdminPoint::new(lat, lng);
+        if !coords_in_range(lat, lng) {
+            return AdminScan { rings: Vec::new(), pip: ScanPip { point, memo: PipMemo::new() } };
+        }
+        let (lat, lng) = point.degrees();
         let list = Index::lookup_admin_cell_fb(&index.admin_cells, cell_id_at_level(lat, lng, index.admin_cell_level));
         // The list, each record and most ring headers are read below wherever the point is, so
         // they are requested before the first one is needed: their cache misses overlap.
@@ -972,7 +989,7 @@ impl AdminScan {
         for (_, poly) in &rings {
             index.admin_geometry.prefetch(poly);
         }
-        AdminScan { rings, pip: ScanPip { point: AdminPoint::new(lat, lng), memo: PipMemo::new() } }
+        AdminScan { rings, pip: ScanPip { point, memo: PipMemo::new() } }
     }
 
     /// Calls `f(pip, entry, polygon)` for every ring, in visiting order.
@@ -992,6 +1009,15 @@ struct ScanPip {
 impl ScanPip {
     fn contains(&mut self, index: &Index, poly: &AdminPolygon) -> bool {
         index.admin_geometry.contains(poly, self.point, &mut self.memo)
+    }
+
+    /// Whether the polygon of the scan's entry `id` holds the point. An entry flagged interior
+    /// does without a test: the builder flags one only where the rings of every tier it covers
+    /// hold the whole cell, at the reach the ray cast needs (admin_cover.h, cell_index.cpp
+    /// union_of_tiers), and the scan's cell is the rounded point's, which is on the globe
+    /// (`AdminScan::new`). Any other entry is tested.
+    fn holds(&mut self, index: &Index, id: u32, poly: &AdminPolygon) -> bool {
+        (id & INTERIOR_FLAG != 0 && index.admin_geometry.has_rings(poly)) || self.contains(index, poly)
     }
 }
 
@@ -1031,9 +1057,6 @@ pub struct Index {
     pub admin_parents: Option<FileBytes>,  // u32 per poly → next-larger containing admin poly
     pub addr_postcodes: Option<FileBytes>, // u32 per addr_point → postcode string (optional)
     pub way_postcodes: Option<FileBytes>,  // u32 per way → postcode string from postal boundary
-    // Separate postcode files (optional — postcodes omitted when absent)
-    pub postal_polygons: Option<FileBytes>,
-    pub postal_geometry: Option<AdminGeometry>,
     pub postcode_centroids: Option<FileBytes>,
     pub postcode_centroid_cells: Option<FileBytes>,
     pub postcode_centroid_entries: Option<FileBytes>,
@@ -1156,7 +1179,7 @@ fn mmap_opened(file: &File, path: &str) -> Result<FileBytes, String> {
     // string offsets) — readahead pulls in 32 pages of neighbours per
     // touched page, inflating RSS several × without helping the next
     // access.  Random-mode keeps RSS proportional to actually-touched
-    // bytes.  Cuts admin_vertices RSS from ~150 MB → ~35 MB on planet.
+    // bytes.
     let _ = mmap.advise(memmap2::Advice::Random);
     Ok(FileBytes::Mmap(mmap))
 }
@@ -1251,9 +1274,6 @@ impl Index {
             Some(index) => (Some(index.cells), Some(index.entries)),
             None => (None, None),
         };
-        let [postal_polygons, postal_vertices]: [Option<FileBytes>; 2] =
-            mmap_group(dir, &["postal_polygons.bin", "postal_vertices.bin"])?
-                .try_into().map_err(|_| "postal group arity")?;
         let [postcode_centroids, postcode_centroid_cells, postcode_centroid_entries]: [Option<FileBytes>; 3] =
             mmap_group(dir, &["postcode_centroids.bin", "postcode_centroid_cells.bin", "postcode_centroid_entries.bin"])?
                 .try_into().map_err(|_| "centroid group arity")?;
@@ -1273,7 +1293,7 @@ impl Index {
             admin_cells: mmap_file(&format!("{}/admin_cells.bin", dir))?,
             admin_entries: mmap_file(&format!("{}/admin_entries.bin", dir))?,
             admin_polygons: mmap_file(&format!("{}/admin_polygons.bin", dir))?,
-            admin_geometry: AdminGeometry::new(mmap_file(&format!("{}/admin_vertices.bin", dir))?),
+            admin_geometry: AdminGeometry::load(dir)?,
             poi_cells,
             poi_entries,
             poi_records,
@@ -1286,8 +1306,6 @@ impl Index {
             admin_parents: mmap_file_optional(&format!("{}/admin_parents.bin", dir)),
             addr_postcodes: mmap_file_optional(&format!("{}/addr_postcodes.bin", dir)),
             way_postcodes: mmap_file_optional(&format!("{}/way_postcodes.bin", dir)),
-            postal_polygons,
-            postal_geometry: postal_vertices.map(AdminGeometry::new),
             postcode_centroids,
             postcode_centroid_cells,
             postcode_centroid_entries,
@@ -1778,12 +1796,13 @@ impl Index {
     // --- Admin boundary lookup (point-in-polygon) ---
 
     pub fn debug_admin(&self, lat: f64, lng: f64) -> serde_json::Value {
+        let (point, mut memo) = (AdminPoint::new(lat, lng), PipMemo::new());
+        let (lat, lng) = point.degrees();
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
 
         let mut best_by_level: [Option<(f32, AdminPolygon, bool)>; 12] = [None; 12];
         let mut seen_in_level: [Vec<serde_json::Value>; 12] = Default::default();
-        let (point, mut memo) = (AdminPoint::new(lat, lng), PipMemo::new());
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
             Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
@@ -1853,33 +1872,69 @@ impl Index {
         })
     }
 
+    /// The polygons holding (lat, lng) as `/polygons` lists them, GeoJSON features: each polygon
+    /// the admin cells round the point list, once, a postcode area as kind "postal" at
+    /// POLYGONS_POSTAL_LEVEL and any other as kind "admin" at its own level.
+    pub fn polygon_features(&self, lat: f64, lng: f64) -> Vec<serde_json::Value> {
+        let point = AdminPoint::new(lat, lng);
+        let (lat, lng) = point.degrees();
+        let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
+        let (mut seen, mut hits) = (std::collections::HashSet::new(), Vec::new());
+        for c in std::iter::once(cell).chain(cell_neighbors_at_level(cell, self.admin_cell_level)) {
+            Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
+                if seen.insert(id & ID_MASK) { hits.push(id & ID_MASK); }
+            });
+        }
+        hits.into_iter()
+            .filter_map(|id| self.admin_polygon(id))
+            .filter(|poly| self.admin_geometry.contains_once(poly, point))
+            .map(|poly| {
+                let (kind, admin_level) = if poly.admin_level == POSTCODE_AREA_LEVEL {
+                    ("postal", POLYGONS_POSTAL_LEVEL)
+                } else {
+                    ("admin", poly.admin_level)
+                };
+                serde_json::json!({
+                    "type": "Feature",
+                    "geometry": { "type": "Polygon", "coordinates": self.admin_geometry.rings(&poly) },
+                    "properties": {
+                        "name": self.get_string(poly.name_id),
+                        "admin_level": admin_level,
+                        "area": poly.area,
+                        "kind": kind,
+                    }
+                })
+            })
+            .collect()
+    }
+
     pub fn find_admin(&self, lat: f64, lng: f64) -> AdminResult<'_> {
         self.find_admin_in(&mut AdminScan::new(self, lat, lng))
     }
 
     /// `find_admin` over a scan the caller may share with the other admin lookups of the point.
     pub fn find_admin_in(&self, scan: &mut AdminScan) -> AdminResult<'_> {
-        // For each admin level, find the smallest-area polygon actually containing
-        // the point. Interior flags are used as a fast path for uncontested cells,
-        // but PIP is always run when a polygon would win the smallest-area contest
-        // (interior flags can be wrong at polygon borders, e.g. NJ/NY).
-        // (area, id, poly, pip_verified) — owned AdminPolygon values so the
-        // backing admin_polygons file can be a chunked source.
-        let mut best_by_level: [Option<(f32, u32, AdminPolygon, bool)>; 12] = [None; 12];
+        // For each admin level, the smallest-area polygon holding the point, the first in
+        // visiting order among equals (`ScanPip::holds`: an entry flagged interior holds it
+        // without a test). Owned AdminPolygon values so the backing admin_polygons file can be a
+        // chunked source.
+        let mut best_by_level: [Option<AdminPolygon>; 12] = [None; 12];
         // Class='place' polygons (admin_level=15 marker) that cover the query point. These
         // drive the second-nested-check rule (placex_triggers.sql lines 944-963) — Nominatim
         // uses only these, not admin boundaries with linked_place tags. Kept apart from
         // best_by_level[]. Stored as (poly_id, AdminPolygon) so we can dedup by id.
         let mut place_area_polygons: Vec<(u32, AdminPolygon)> = Vec::new();
+        // The boundaries to test, as (level, area, place in the list) in one integer: an area
+        // here is positive, so its bits order as it does, and the place orders equals.
+        let mut boundaries: Vec<u64> = Vec::with_capacity(scan.rings.len());
+        let mut place = 0u64;
 
         scan.for_each_entry(|pip, id, poly| {
-            // The interior flag on a (cell, polygon) entry proves
-            // containment for queries inside that cell, the scan's only one.
-            let is_interior = (id & INTERIOR_FLAG) != 0;
             let poly_id = id & ID_MASK;
+            place += 1;
             if poly.admin_level == 15 {
                 if poly.area <= 0.0 { return; }
-                if !pip.contains(self, &poly) { return; }
+                if !pip.holds(self, id, &poly) { return; }
                 if !place_area_polygons.iter().any(|(pid, _)| *pid == poly_id) {
                     place_area_polygons.push((poly_id, poly));
                 }
@@ -1891,46 +1946,18 @@ impl Index {
             // boundary closed ways) can never name a country.
             if level == 2 && poly.country_code == 0 { return; }
             if poly.area <= 0.0 { return; }
-
-            if let Some((best_area, best_id, best_poly, best_verified)) = best_by_level[level] {
-                if poly.area >= best_area {
-                    // Larger than current best — skip unless current best is unverified
-                    // and this one can be verified
-                    if !best_verified {
-                        // Current best only passed via interior flag — verify it now
-                        if pip.contains(self, &best_poly) {
-                            best_by_level[level] = Some((best_area, best_id, best_poly, true));
-                        } else {
-                            // Best was wrong — try this polygon instead
-                            let inside = pip.contains(self, &poly);
-                            if is_interior || inside {
-                                best_by_level[level] = Some((poly.area, poly_id, poly, inside));
-                            } else {
-                                best_by_level[level] = None;
-                            }
-                        }
-                    }
-                    return;
-                }
-                // This polygon is smaller — must verify with PIP
-                if pip.contains(self, &poly) {
-                    best_by_level[level] = Some((poly.area, poly_id, poly, true));
-                }
-                // If PIP fails, keep existing best
-            } else {
-                // No existing candidate — accept with interior flag, verify later if contested
-                if is_interior {
-                    best_by_level[level] = Some((poly.area, poly_id, poly, false));
-                } else if pip.contains(self, &poly) {
-                    best_by_level[level] = Some((poly.area, poly_id, poly, true));
-                }
-            }
+            boundaries.push((level as u64) << 56 | (poly.area.to_bits() as u64) << 24 | (place - 1));
         });
-
-        // Verify any uncontested winners that only passed via interior flag
-        for level in 0..12 {
-            if let Some((area, id, poly, false)) = best_by_level[level] {
-                best_by_level[level] = scan.pip.contains(self, &poly).then_some((area, id, poly, true));
+        // Each level's polygons from the smallest up: the first to hold the point is the level's
+        // best, and the larger ones, which take the longest to test, are never read.
+        boundaries.sort_unstable();
+        for key in boundaries {
+            let level = (key >> 56) as usize;
+            if best_by_level[level].is_none() {
+                let (id, poly) = scan.rings[(key & 0xff_ffff) as usize];
+                if scan.pip.holds(self, id, &poly) {
+                    best_by_level[level] = Some(poly);
+                }
             }
         }
 
@@ -1938,7 +1965,7 @@ impl Index {
 
         // Get country code from level 2 polygon
         let country_code_str: String = best_by_level[2]
-            .and_then(|(_, _, poly, _)| {
+            .and_then(|poly| {
                 if poly.country_code != 0 {
                     Some(format!("{}{}",
                         (poly.country_code >> 8) as u8 as char,
@@ -1992,8 +2019,8 @@ impl Index {
         // promote_nested_ranks then gives them their effective one.
         let mut ranked: Vec<RankedPoly> = Vec::new();
         for level in 0..12 {
-            if let Some((_, _, poly, _)) = best_by_level[level] {
-                if poly.admin_level == 11 { continue; } // postal code, handled separately
+            if let Some(poly) = best_by_level[level] {
+                if poly.admin_level == POSTCODE_AREA_LEVEL { continue; } // handled separately
 
                 let initial_rank = self.admin_config.to_rank(&country_code_str, poly.admin_level);
                 if initial_rank == 0 && poly.place_type_override == 0 { continue; }
@@ -2133,24 +2160,23 @@ impl Index {
             .map(|c| c.iter().map(|b| b.to_ascii_uppercase() as char).collect())
             .unwrap_or_default();
 
-        // (area, id, polygon) of every boundary and place area near the point.
+        // (area, entry, polygon) of every boundary and place area near the point.
         let mut boundaries: Vec<(f32, u32, AdminPolygon)> = Vec::new();
         let mut place_areas: Vec<(f32, u32, AdminPolygon)> = Vec::new();
         scan.for_each_entry(|_, id, poly| {
-            let poly_id = id & ID_MASK;
             if poly.area <= 0.0 { return; }
             match poly.admin_level {
                 // ISO-less level-2 polygons are maritime lines, not countries.
                 2 if poly.country_code == 0 => {}
-                2..=10 => boundaries.push((poly.area, poly_id, poly)),
-                15 if poly.place_type_override != 0 => place_areas.push((poly.area, poly_id, poly)),
+                2..=10 => boundaries.push((poly.area, id, poly)),
+                15 if poly.place_type_override != 0 => place_areas.push((poly.area, id, poly)),
                 _ => {}
             }
         });
         let mut holding = |mut polys: Vec<(f32, u32, AdminPolygon)>| -> Vec<AdminPolygon> {
-            polys.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-            polys.dedup_by_key(|p| p.1);
-            polys.into_iter().filter(|(_, _, poly)| scan.pip.contains(self, poly)).map(|(_, _, poly)| poly).collect()
+            polys.sort_by(|a, b| a.0.total_cmp(&b.0).then((a.1 & ID_MASK).cmp(&(b.1 & ID_MASK))));
+            polys.dedup_by_key(|p| p.1 & ID_MASK);
+            polys.into_iter().filter(|(_, id, poly)| scan.pip.holds(self, *id, poly)).map(|(_, _, poly)| poly).collect()
         };
         let ranked: Vec<RankedPoly> = holding(boundaries).into_iter()
             .map(|poly| RankedPoly { poly, rank_address: self.admin_config.to_rank(&cc, poly.admin_level) })
@@ -2292,11 +2318,12 @@ impl Index {
     // whether it's a road or an addressable POI.
     //
     // For polygon POIs, returns distance 0 if the query is inside
-    // the polygon, otherwise the distance to the nearest edge.
+    // the polygon, otherwise the distance to the nearest edge. None for
+    // a point off the globe (see find_pois).
     pub fn find_nearest_poi_with_parent(&self, lat: f64, lng: f64) -> Option<(f64, PoiRecord)> {
         let poi_cells = self.poi_cells.as_ref()?;
         let poi_entries = self.poi_entries.as_ref()?;
-        if self.poi_records.is_none() { return None; }
+        if self.poi_records.is_none() || !coords_in_range(lat, lng) { return None; }
 
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
@@ -2393,6 +2420,8 @@ impl Index {
 
     // --- POI lookup ---
 
+    /// The POIs near (lat, lng); none for a point off the globe, or NaN: S2 would wrap it onto a
+    /// cell of the globe, whose interior entries hold that cell's points, not this one.
     pub fn find_pois(&self, lat: f64, lng: f64) -> Vec<PoiMatch<'_>> {
         let poi_cells = match &self.poi_cells {
             Some(c) => c,
@@ -2402,7 +2431,7 @@ impl Index {
             Some(e) => e,
             None => return vec![],
         };
-        if self.poi_records.is_none() { return vec![]; }
+        if self.poi_records.is_none() || !coords_in_range(lat, lng) { return vec![]; }
 
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
@@ -2586,10 +2615,10 @@ impl Index {
         // PIP from the query point — these aren't in the parent chain
         // but provide place-area rank promotions.
         let mut place_area_polygons: Vec<AdminPolygon> = Vec::new();
-        scan.for_each_entry(|pip, _, poly| {
+        scan.for_each_entry(|pip, id, poly| {
             if poly.admin_level != 15 { return; }
             if poly.area <= 0.0 { return; }
-            if !pip.contains(self, &poly) { return; }
+            if !pip.holds(self, id, &poly) { return; }
             place_area_polygons.push(poly);
         });
 
@@ -2611,7 +2640,7 @@ impl Index {
         let mut ranked: Vec<RankedPoly> = Vec::new();
         for &pid in &chain_ids {
             let Some(poly) = self.admin_polygon(pid) else { continue; };
-            if poly.admin_level == 11 { continue; } // postal
+            if poly.admin_level == POSTCODE_AREA_LEVEL { continue; }
             // ISO-less level-2 polygons (maritime boundary closed ways)
             // can never name a country — see find_admin.
             if poly.admin_level == 2 && poly.country_code == 0 { continue; }
@@ -2709,9 +2738,9 @@ impl Index {
     //
     // No query-time PIP on postal boundaries — Nominatim's postcode field
     // comes straight from placex.postcode, which is populated via triggers
-    // at index time. `postal_polygons.bin` is consumed at BUILD time only
-    // (for way_postcodes.bin / PoiRecord.parent_postcode_id inheritance);
-    // it is not consulted here.
+    // at index time. The postcode areas (the level-11 admin polygons) are
+    // consumed at BUILD time only (for way_postcodes.bin /
+    // PoiRecord.parent_postcode_id inheritance); they are not consulted here.
     /// Read one u32 from a per-record sidecar file (addr_postcodes /
     /// way_postcodes / interp_postcodes: u32 per record, NO_DATA = absent).
     fn sidecar_u32(f: &FileBytes, idx: u64) -> Option<u32> {
@@ -2991,7 +3020,12 @@ impl Index {
         (landmark_name, places)
     }
 
+    /// The address of (lat, lng); none for a point off the globe, or NaN: S2 would wrap it onto
+    /// cells of the globe, whose streets, POIs and boundaries are near another point.
     pub fn query(&self, lat: f64, lng: f64) -> Address<'_> {
+        if !coords_in_range(lat, lng) {
+            return Address::default();
+        }
         let max_dist = self.max_distance_sq;
 
         // Run geo lookups first so we know the primary street
@@ -3757,19 +3791,14 @@ mod query_tests {
             strings.push(0);
             id
         };
-        let (mut polygons, mut vertices, mut admin_pairs) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut arcs, mut admin_pairs) = (arc_fixture::ArcFixture::new(), Vec::new());
         for (id, &(boundary, admin_level, [s, w, n, e])) in boundaries.iter().enumerate() {
-            let ring = [s, w, s, e, n, e, n, w, s, w];
-            u32s(&mut polygons, &[vertices.len() as u32, ring.len() as u32 / 2, name(boundary)]);
-            polygons.extend_from_slice(&[admin_level, 0, 0, 0]);
-            polygons.extend_from_slice(&((n - s) * (e - w)).to_le_bytes());
-            polygons.extend_from_slice(&[0; 4]); // country_code, hole_count
-            vertices.extend_from_slice(&[4, 0]); // raw f32 vertices, then the bbox minimum
-            for v in [s, w].iter().chain(&ring) {
-                vertices.extend_from_slice(&v.to_le_bytes());
-            }
+            let at = |lat: f32, lng: f32| arc_fixture::e7(lat as f64, lng as f64);
+            let ring = [at(s, w), at(s, e), at(n, e), at(n, w), at(s, w)];
+            arcs.ring_polygon(arc_fixture::record(name(boundary), admin_level, (n - s) * (e - w)), 0, &[ring.to_vec()]);
             admin_pairs.push((cell((s + n) / 2.0, (w + e) / 2.0), id as u32));
         }
+        let [(_, polygons), (_, rings), (_, arc_index), (_, arc_vertices)] = arcs.files();
         let mut records = Vec::new();
         for &(lat, lng, node, place_type) in nodes {
             records.extend_from_slice(&lat.to_le_bytes());
@@ -3778,7 +3807,6 @@ mod query_tests {
             records.extend_from_slice(&[place_type, 0, 0, 0]);
             u32s(&mut records, &[NO_DATA]);
         }
-        assert_eq!(polygons.len(), boundaries.len() * std::mem::size_of::<AdminPolygon>());
         assert_eq!(records.len(), nodes.len() * std::mem::size_of::<PlaceNode>());
         let (admin_cells, admin_entries) = cell_index(admin_pairs);
         // Derived as a load derives it; a few nodes fit one run, so nothing spills.
@@ -3801,7 +3829,7 @@ mod query_tests {
             admin_cells,
             admin_entries,
             admin_polygons: FileBytes::Owned(polygons),
-            admin_geometry: AdminGeometry::new(FileBytes::Owned(vertices)),
+            admin_geometry: AdminGeometry::new(FileBytes::Owned(rings), FileBytes::Owned(arc_index), FileBytes::Owned(arc_vertices)),
             poi_cells: None,
             poi_entries: None,
             poi_records: None,
@@ -3814,8 +3842,6 @@ mod query_tests {
             admin_parents: None,
             addr_postcodes: None,
             way_postcodes: None,
-            postal_polygons: None,
-            postal_geometry: None,
             postcode_centroids: None,
             postcode_centroid_cells: None,
             postcode_centroid_entries: None,
@@ -3885,7 +3911,7 @@ mod query_tests {
         };
 
         assert_eq!(village(elsewhere), None);
-        assert_eq!(village(AdminPolygon { vertex_count: 0, ..elsewhere }), Some("Shoals Village"));
+        assert_eq!(village(AdminPolygon { ring_bytes: 0, ..elsewhere }), Some("Shoals Village"));
     }
 }
 
@@ -4148,60 +4174,6 @@ pub fn polygon_distance_sq(lat: f64, lng: f64, vertices: &[NodeCoord], cos_lat: 
     best
 }
 
-/// A ring inside a polygon's keyhole vertex range: `count` vertices from
-/// `begin`, the last repeating the first (builder/src/polygon_rings.h).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RingSpan {
-    pub begin: usize,
-    pub count: usize,
-}
-
-/// Vertices of one keyhole excursion beyond its hole ring: v0, c before it
-/// and c after (polygon_rings.h kExcursionConnectors).
-const EXCURSION_CONNECTORS: usize = 3;
-/// A closed ring's fewest vertices: a triangle and its closing vertex.
-const MIN_CLOSED_RING: usize = 4;
-
-/// The outer ring (first) and the holes of a keyhole vertex range with
-/// `holes` excursions, as polygon_rings.h split_rings finds them: each
-/// excursion is v0, c, h0 ... h0, c, peeled off the end, the hole ring
-/// starting at the last h0 that follows v0 and c. A range that doesn't parse
-/// as that is one ring.
-pub fn split_rings(v: &[NodeCoord], holes: u16) -> Vec<RingSpan> {
-    let same = |a: &NodeCoord, b: &NodeCoord| a.lat == b.lat && a.lng == b.lng;
-    let whole = vec![RingSpan { begin: 0, count: v.len() }];
-    let mut spans = Vec::with_capacity(holes as usize + 1);
-    let mut end = v.len();
-    for _ in 0..holes {
-        if end < MIN_CLOSED_RING + EXCURSION_CONNECTORS + MIN_CLOSED_RING {
-            return whole;
-        }
-        let (c, h0) = (&v[end - 1], &v[end - 2]);
-        let Some(j) = (MIN_CLOSED_RING + 2..=end - 1 - MIN_CLOSED_RING).rev()
-            .find(|&j| same(&v[j], h0) && same(&v[j - 1], c) && same(&v[j - 2], &v[0]))
-        else {
-            return whole;
-        };
-        spans.push(RingSpan { begin: j, count: end - 1 - j });
-        end = j - 2;
-    }
-    if end < MIN_CLOSED_RING || !same(&v[end - 1], &v[0]) {
-        return whole;
-    }
-
-    spans.push(RingSpan { begin: 0, count: end });
-    spans.reverse();
-    spans
-}
-
-/// A polygon's rings for GeoJSON: outer ring first, then its holes, each a
-/// closed ring of [lng, lat] positions.
-pub fn geojson_rings(verts: &[NodeCoord], holes: u16) -> Vec<Vec<[f64; 2]>> {
-    split_rings(verts, holes).iter()
-        .map(|r| verts[r.begin..r.begin + r.count].iter().map(|p| [p.lng as f64, p.lat as f64]).collect())
-        .collect()
-}
-
 // Ray casting point-in-polygon test
 pub fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
     let mut inside = false;
@@ -4221,196 +4193,6 @@ pub fn point_in_polygon(lat: f32, lng: f32, vertices: &[NodeCoord]) -> bool {
     }
 
     inside
-}
-
-/// `point_in_polygon` over a polygon's encoded vertices (the layout `decode_polygon_verts`
-/// reads), decoding one vertex at a time to the same f32 values: no allocation, one pass. None
-/// exactly where `decode_polygon_verts` is None. A point the header's bounds already exclude is
-/// answered without reading the vertices.
-///
-/// Never inlined, so the per-vertex loops get registers of their own: inlined into
-/// `AdminGeometry::contains`, whose memo values stay live across the test, the u32 grid loop
-/// reloaded its vertex pointer from the stack, 15 instructions a vertex instead of 13.
-#[inline(never)]
-pub fn point_in_encoded_polygon(src: &FileBytes, vertex_offset: u32, vertex_count: u32, lat: f32, lng: f32) -> Option<bool> {
-    let EncodedPolygon { encoding, bmin_lat: bmin_lat32, bmin_lng: bmin_lng32, verts_off } =
-        encoded_polygon(src, vertex_offset, vertex_count)?;
-    let stride = vertex_stride(encoding);
-    let n = vertex_count as usize;
-    if ring_bounds_exclude(encoding, bmin_lat32, bmin_lng32, lat, lng) { return Some(false); }
-    let (bmin_lat, bmin_lng) = (bmin_lat32 as f64, bmin_lng32 as f64);
-    let bytes = src.read_chunk(verts_off, n * stride);
-    let scale = vertex_scale(encoding);
-    let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[i], b[i + 1]]) as i64;
-    let u32_at = |b: &[u8], i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
-    Some(match encoding {
-        4 => pip_vertices(&bytes, 8, lat, lng, |b| (f32::from_bits(u32_at(b, 0)), f32::from_bits(u32_at(b, 4)))),
-        3 => pip_grid(&bytes, 8, lat, lng, bmin_lat, bmin_lng, scale, u32::MAX as i64, |b| (u32_at(b, 0) as i64, u32_at(b, 4) as i64)),
-        _ => pip_grid(&bytes, 4, lat, lng, bmin_lat, bmin_lng, scale, u16::MAX as i64, |b| (u16_at(b, 0), u16_at(b, 2))),
-    })
-}
-
-/// Largest k in -1..=k_max with `(base + k * scale) as f32 <= x`; -1 when even k = 0 decodes
-/// above x. The decoded value is monotone in k (every step rounds monotonically), so a vertex
-/// whose k is in 0..=k_max decodes above x exactly when its k is above this. Comparisons with NaN
-/// are false: a NaN x or base gives k_max, no vertex above x. The search gallops out from the
-/// estimate, so any x (±inf, NaN, far off the grid) takes a few dozen steps at most.
-#[inline]
-pub fn grid_threshold(x: f32, base: f64, scale: f64, k_max: i64) -> i64 {
-    let above = |k: i64| (base + k as f64 * scale) as f32 > x;
-    let estimate = ((x as f64 - base) / scale).floor();
-    // `as` saturates to the i64 range, and would turn NaN into 0.
-    let start = if estimate.is_nan() { k_max } else { (estimate as i64).clamp(-1, k_max) };
-    // Bracket the answer: lo is -1 or not above x, hi is above x or k_max + 1.
-    let (mut lo, mut hi) = (start, start + 1);
-    let mut step = 1;
-    while lo >= 0 && above(lo) {
-        hi = lo;
-        lo = (lo - step).max(-1);
-        step *= 2;
-    }
-    step = 1;
-    while hi <= k_max && !above(hi) {
-        lo = hi;
-        hi = (hi + step).min(k_max + 1);
-        step *= 2;
-    }
-    while hi - lo > 1 {
-        let mid = lo + (hi - lo) / 2;
-        if above(mid) { hi = mid } else { lo = mid }
-    }
-    lo
-}
-
-/// `pip_vertices` over quantized vertices (k_lat, k_lng) in 0..=k_max that decode to `(bmin + k *
-/// scale) as f32`: the straddle test compares integers against `grid_threshold` of the point's
-/// longitude, and only the straddling edges decode, to the same values, so the answer is the same.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn pip_grid(bytes: &[u8], stride: usize, lat: f32, lng: f32, bmin_lat: f64, bmin_lng: f64, scale: f64, k_max: i64,
-            at: impl Fn(&[u8]) -> (i64, i64)) -> bool {
-    let t = grid_threshold(lng, bmin_lng, scale, k_max);
-    let decode = |k_lat: i64, k_lng: i64| ((bmin_lat + k_lat as f64 * scale) as f32, (bmin_lng + k_lng as f64 * scale) as f32);
-    let n = bytes.len() / stride;
-    let mut inside = false;
-    let (mut kj_lat, mut kj_lng) = at(&bytes[(n - 1) * stride..]);
-    for c in bytes.chunks_exact(stride) {
-        let (ki_lat, ki_lng) = at(c);
-        if (ki_lng > t) != (kj_lng > t) {
-            let (vi_lat, vi_lng) = decode(ki_lat, ki_lng);
-            let (vj_lat, vj_lng) = decode(kj_lat, kj_lng);
-            if lat < (vj_lat - vi_lat) * (lng - vi_lng) / (vj_lng - vi_lng) + vi_lat {
-                inside = !inside;
-            }
-        }
-        kj_lat = ki_lat;
-        kj_lng = ki_lng;
-    }
-    inside
-}
-
-/// True when `point_in_polygon` on a ring of encoding `enc` with header bbox minimum
-/// (`bmin_lat`, `bmin_lng`) is false at (`lat`, `lng`) whatever the vertices. Encodings 0-3 decode
-/// every vertex to `(bmin + k * scale) as f32` with k >= 0, so no vertex is below the minimum; the
-/// u16 encodings 0-2 also bound k by 65535. Outside the bounds in longitude, no edge straddles the
-/// point's meridian. Outside them in latitude, every straddling edge crosses north of the point
-/// (or none does), and a closed ring has an even number of straddling edges.
-fn ring_bounds_exclude(enc: u8, bmin_lat: f32, bmin_lng: f32, lat: f32, lng: f32) -> bool {
-    if enc > 3 { return false; }
-    if lng < bmin_lng { return true; }
-    let latitude_test = lng.abs() >= PIP_LAT_BOUND_MIN_ABS_LNG;
-    if latitude_test && lat < bmin_lat - PIP_LAT_BOUND_SLACK_DEG { return true; }
-    if enc == 3 { return false; }
-    let span = U16_VERTEX_MAX_STEPS * vertex_scale(enc);
-    let (bmax_lat, bmax_lng) = ((bmin_lat as f64 + span) as f32, (bmin_lng as f64 + span) as f32);
-    lng > bmax_lng || (latitude_test && lat > bmax_lat + PIP_LAT_BOUND_SLACK_DEG)
-}
-
-/// The `point_in_polygon` ray cast over packed vertices of one encoding (`at` decodes one).
-#[inline]
-fn pip_vertices(bytes: &[u8], stride: usize, lat: f32, lng: f32, at: impl Fn(&[u8]) -> (f32, f32)) -> bool {
-    let n = bytes.len() / stride;
-    let mut inside = false;
-    let (mut vj_lat, mut vj_lng) = at(&bytes[(n - 1) * stride..]);
-    for c in bytes.chunks_exact(stride) {
-        let (vi_lat, vi_lng) = at(c);
-        if ((vi_lng > lng) != (vj_lng > lng))
-            && (lat < (vj_lat - vi_lat) * (lng - vi_lng) / (vj_lng - vi_lng) + vi_lat)
-        {
-            inside = !inside;
-        }
-        vj_lat = vi_lat;
-        vj_lng = vi_lng;
-    }
-    inside
-}
-
-/// A point inside a polygon's keyhole vertex range as GEOS's
-/// InteriorPointArea finds it (PostGIS ST_PointOnSurface, which Nominatim's
-/// get_center_point uses for areas), the same as the builder's
-/// interior_point (polygon_rings.h): the midpoint of the widest inside
-/// stretch of the line of latitude half-way between the vertex latitudes of
-/// all rings nearest the middle of the outer ring's latitude range. The
-/// first vertex where no stretch has width; None for no vertices.
-/// (lat, lng).
-pub fn point_on_surface(verts: &[NodeCoord], holes: u16) -> Option<(f32, f32)> {
-    let first = verts.first()?;
-    let rings: Vec<&[NodeCoord]> = split_rings(verts, holes).iter().map(|r| &verts[r.begin..r.begin + r.count]).collect();
-    let (mut lo, mut hi) = rings[0].iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), p| (lo.min(p.lat as f64), hi.max(p.lat as f64)));
-    let centre = (lo + hi) / 2.0;
-    for p in rings.iter().flat_map(|r| r.iter()) {
-        let y = p.lat as f64;
-        if y <= centre {
-            if y > lo { lo = y; }
-        } else if y < hi {
-            hi = y;
-        }
-    }
-    let scan = (lo + hi) / 2.0;
-    let mut crossings: Vec<f64> = Vec::new();
-    for ring in &rings {
-        for edge in ring.windows(2) {
-            let (y0, y1) = (edge[0].lat as f64, edge[1].lat as f64);
-            let (x0, x1) = (edge[0].lng as f64, edge[1].lng as f64);
-            if (y0 > scan && y1 > scan) || (y0 < scan && y1 < scan) || y0 == y1 { continue; }
-            if y0 == scan && y1 < scan { continue; }  // a downward edge leaves out its start
-            if y1 == scan && y0 < scan { continue; }  // an upward edge leaves out its end
-            crossings.push(if x0 == x1 { x0 } else { x0 + (scan - y0) / ((y1 - y0) / (x1 - x0)) });
-        }
-    }
-    crossings.sort_by(|a, b| a.total_cmp(b));
-    let mut best = (first.lat, first.lng);
-    let mut best_width = 0.0;
-    for run in crossings.chunks_exact(2) {
-        if run[1] - run[0] > best_width {
-            best_width = run[1] - run[0];
-            best = (scan as f32, ((run[0] + run[1]) / 2.0) as f32);
-        }
-    }
-    Some(best)
-}
-
-/// Whether a polygon's point on surface lies inside another polygon, not on
-/// its edges (ST_Contains): Nominatim's test of a boundary's centroid
-/// against the current boundary.
-pub fn point_on_surface_in(verts: &[NodeCoord], holes: u16, other: &[NodeCoord], other_holes: u16) -> bool {
-    !other.is_empty()
-        && point_on_surface(verts, holes)
-            .is_some_and(|(lat, lng)| point_in_polygon(lat, lng, other) && !on_ring_edge(lat, lng, other, other_holes))
-}
-
-/// Whether a point lies on an edge of a polygon's outer ring or holes (not
-/// on a keyhole connector).
-fn on_ring_edge(lat: f32, lng: f32, verts: &[NodeCoord], holes: u16) -> bool {
-    let (y, x) = (lat as f64, lng as f64);
-    split_rings(verts, holes).iter().any(|r| {
-        verts[r.begin..r.begin + r.count].windows(2).any(|e| {
-            let (y0, x0, y1, x1) = (e[0].lat as f64, e[0].lng as f64, e[1].lat as f64, e[1].lng as f64);
-            (x1 - x0) * (y - y0) == (y1 - y0) * (x - x0)
-                && (x0.min(x1)..=x0.max(x1)).contains(&x)
-                && (y0.min(y1)..=y0.max(y1)).contains(&y)
-        })
-    })
 }
 
 // --- API types ---
@@ -5595,66 +5377,9 @@ mod pure_helper_tests {
         assert!(!point_in_polygon(-0.5, 0.5, &sq));
     }
 
-    // The keyhole range of a closed outer ring and closed holes, laid out as
-    // polygon_rings.h encode_rings writes it: the outer ring, then per hole
-    // v0, c = (v0.lat, h0.lng), the hole ring, c.
-    fn keyhole(outer: &[NodeCoord], holes: &[Vec<NodeCoord>]) -> Vec<NodeCoord> {
-        let mut v = outer.to_vec();
-        for h in holes {
-            let c = nc(outer[0].lat, h[0].lng);
-            v.extend([outer[0], c]);
-            v.extend_from_slice(h);
-            v.push(c);
-        }
-        v
-    }
-
-    // Outer square 0..10 with holes 2..4 and (6..7, 5..8), all closed.
-    fn square_with_two_holes() -> (Vec<NodeCoord>, Vec<Vec<NodeCoord>>) {
-        let outer = vec![nc(0.0, 0.0), nc(0.0, 10.0), nc(10.0, 10.0), nc(10.0, 0.0), nc(0.0, 0.0)];
-        let holes = [(2.0, 2.0, 4.0, 4.0), (6.0, 5.0, 7.0, 8.0)].map(|(lat0, lng0, lat1, lng1)| {
-            vec![nc(lat0, lng0), nc(lat1, lng0), nc(lat1, lng1), nc(lat0, lng1), nc(lat0, lng0)]
-        });
-        (outer, holes.to_vec())
-    }
-
-    #[test]
-    fn split_rings_recovers_the_keyhole_rings() {
-        let (outer, holes) = square_with_two_holes();
-        let v = keyhole(&outer, &holes);
-        let span = |begin, count| RingSpan { begin, count };
-        assert_eq!(split_rings(&v, 2), [span(0, 5), span(7, 5), span(15, 5)]);
-        // GeoJSON gets the outer ring and each hole as a closed ring of its
-        // own, without the connector edges.
-        let lnglat = |ring: &[NodeCoord]| ring.iter().map(|p| [p.lng as f64, p.lat as f64]).collect::<Vec<_>>();
-        let want: Vec<Vec<[f64; 2]>> = std::iter::once(&outer).chain(&holes).map(|r| lnglat(r)).collect();
-        assert_eq!(geojson_rings(&v, 2), want);
-        // Without holes, or a range that doesn't parse: the whole range.
-        assert_eq!(split_rings(&outer, 0), [span(0, 5)]);
-        assert_eq!(split_rings(&outer, 1), [span(0, 5)]);
-        assert_eq!(split_rings(&v[..v.len() - 1], 2), [span(0, v.len() - 1)]);
-        assert_eq!(split_rings(&v, 3), [span(0, v.len())]);
-        assert_eq!(geojson_rings(&outer, 0), [lnglat(&outer)]);
-    }
-
-    #[test]
-    fn point_in_polygon_leaves_out_keyhole_holes() {
-        let (outer, holes) = square_with_two_holes();
-        let v = keyhole(&outer, &holes);
-        assert!(point_in_polygon(1.0, 1.0, &v));
-        assert!(point_in_polygon(5.0, 9.0, &v));
-        assert!(!point_in_polygon(3.0, 3.0, &v));
-        assert!(!point_in_polygon(6.5, 6.0, &v));
-        assert!(!point_in_polygon(11.0, 5.0, &v));
-        // On the connector lines (v0's latitude, the holes' first longitudes).
-        assert!(point_in_polygon(0.5, 2.0, &v));
-        assert!(point_in_polygon(5.0, 2.0, &v));
-        assert!(point_in_polygon(1.0, 5.0, &v));
-    }
-
     fn boundary(name_id: u32, admin_level: u8) -> AdminPolygon {
         AdminPolygon {
-            vertex_offset: 0, vertex_count: 0, name_id, admin_level, place_type_override: 0,
+            ring_offset: 0, ring_bytes: 0, name_id, admin_level, place_type_override: 0,
             _pad2: 0, _pad3: 0, area: 1.0, country_code: 0, hole_count: 0,
         }
     }
@@ -5792,33 +5517,6 @@ mod pure_helper_tests {
     }
 
     #[test]
-    fn current_boundaries_test_the_point_on_surface_of_larger_and_equal_boundaries() {
-        // A city square (rank 16) and a rank 20 boundary holding a point in
-        // the city: round the city, beside it, beside it with the same area,
-        // and with its point on surface on the city's edge. Only the one round
-        // it has its point on surface inside the city.
-        let square = |lat0: f32, lng0: f32, lat1: f32, lng1: f32| {
-            vec![nc(lat0, lng0), nc(lat0, lng1), nc(lat1, lng1), nc(lat1, lng0), nc(lat0, lng0)]
-        };
-        let verts = [
-            (2, square(0.0, 0.0, 2.0, 2.0)),
-            (11, square(-1.0, -1.0, 3.0, 3.0)),
-            (12, square(1.5, 1.5, 3.5, 9.5)),
-            (13, square(1.5, 1.5, 3.5, 3.5)),
-            // Its point on surface (0, 1) is on the city's edge.
-            (14, square(-1.0, -1.0, 1.0, 3.0)),
-        ];
-        let of = |poly: &AdminPolygon| &verts.iter().find(|(id, _)| *id == poly.name_id).unwrap().1;
-        let inside = |poly: &AdminPolygon, current: &AdminPolygon| point_on_surface_in(of(poly), 0, of(current), 0);
-        let city = AdminPolygon { area: 4.0, ..boundary(2, 8) };
-        for (id, area, gate) in [(11, 16.0, 11), (12, 16.0, 2), (13, 4.0, 2), (14, 8.0, 2)] {
-            let other = AdminPolygon { area, ..boundary(id, 9) };
-            let found = CurrentBoundaries::walk([(16, city), (20, other)], inside);
-            assert_eq!(names(&found), [Some(2), Some(2), Some(gate), Some(gate), Some(gate)], "rank 20 boundary {id}");
-        }
-    }
-
-    #[test]
     fn current_boundaries_take_smaller_boundaries_as_inside() {
         // A county, then a town, each smaller than the boundary before: both
         // are accepted without testing their centroids.
@@ -5840,41 +5538,6 @@ mod pure_helper_tests {
         assert_eq!(names(&found), [Some(2), Some(2), Some(1), Some(1), Some(1)]);
         let found = CurrentBoundaries::walk(candidates, |poly, _| poly.name_id != 1);
         assert_eq!(names(&found), [Some(2), Some(2), Some(4), Some(4), Some(4)]);
-    }
-
-    #[test]
-    fn point_on_surface_is_in_the_widest_run_inside() {
-        // A square: its middle. An L whose bounding box's middle is outside
-        // it: on the line between the latitudes round the middle (1 and 4,
-        // so 2.5), the middle of the run inside (lng 0 to 2).
-        let square = [nc(0.0, 0.0), nc(0.0, 2.0), nc(2.0, 2.0), nc(2.0, 0.0), nc(0.0, 0.0)];
-        assert_eq!(point_on_surface(&square, 0), Some((1.0, 1.0)));
-        let l = [nc(0.0, 0.0), nc(0.0, 8.0), nc(1.0, 8.0), nc(1.0, 2.0), nc(4.0, 2.0), nc(4.0, 0.0), nc(0.0, 0.0)];
-        assert_eq!(point_on_surface(&l, 0), Some((2.5, 1.0)));
-        // Holes split the runs, keyhole connectors don't: the line at lat 5
-        // runs inside from 0 to 10 past the second hole's connector, and from
-        // 6 to 10 right of a hole from lng 1 to 6.
-        let (outer, holes) = square_with_two_holes();
-        assert_eq!(point_on_surface(&keyhole(&outer, &holes), 2), Some((5.0, 5.0)));
-        let wide_hole = vec![nc(2.0, 1.0), nc(8.0, 1.0), nc(8.0, 6.0), nc(2.0, 6.0), nc(2.0, 1.0)];
-        let v = keyhole(&outer, &[wide_hole]);
-        assert_eq!(point_on_surface(&v, 1), Some((5.0, 8.0)));
-        assert!(point_in_polygon(5.0, 8.0, &v));
-        // Hole latitudes choose the line too: a hole from lat 4 to 8 moves it
-        // from 5 to half-way between 4 and 8.
-        let high_hole = vec![nc(4.0, 1.0), nc(8.0, 1.0), nc(8.0, 6.0), nc(4.0, 6.0), nc(4.0, 1.0)];
-        assert_eq!(point_on_surface(&keyhole(&outer, &[high_hole]), 1), Some((6.0, 8.0)));
-        // The square's point on surface (1, 1) is inside the 0..10 square,
-        // but not when it is on the top edge of a hole there (which ray
-        // casting counts as inside).
-        assert!(point_on_surface_in(&square, 0, &outer, 0));
-        let low_hole = vec![nc(0.5, 0.5), nc(1.0, 0.5), nc(1.0, 4.0), nc(0.5, 4.0), nc(0.5, 0.5)];
-        let holed = keyhole(&outer, &[low_hole]);
-        assert!(point_in_polygon(1.0, 1.0, &holed));
-        assert!(!point_on_surface_in(&square, 0, &holed, 1));
-        // A ring with no width gives its first vertex; no vertices, none.
-        assert_eq!(point_on_surface(&[nc(1.0, 0.0), nc(1.0, 2.0), nc(1.0, 1.0), nc(1.0, 0.0)], 0), Some((1.0, 0.0)));
-        assert_eq!(point_on_surface(&[], 0), None);
     }
 
     #[test]
@@ -6436,79 +6099,6 @@ mod pure_helper_tests {
         // Declared more vertices than the buffer holds -> None.
         assert!(decode_polygon_verts(&src, 0, 5).is_none());
     }
-
-    // A polygon buffer of `verts` in encoding `enc`, the bbox minimum as the delta base.
-    fn encode_poly(enc: u8, verts: &[NodeCoord]) -> Vec<u8> {
-        let bmin_lat = verts.iter().map(|v| v.lat).fold(f32::MAX, f32::min);
-        let bmin_lng = verts.iter().map(|v| v.lng).fold(f32::MAX, f32::min);
-        let delta = |x: f32, min: f32| ((x - min) as f64 / vertex_scale(enc)).round() as u64;
-        let mut packed = Vec::new();
-        for v in verts {
-            match enc {
-                4 => [v.lat.to_le_bytes(), v.lng.to_le_bytes()].iter().for_each(|b| packed.extend_from_slice(b)),
-                3 => [delta(v.lat, bmin_lat), delta(v.lng, bmin_lng)]
-                    .iter()
-                    .for_each(|&d| packed.extend_from_slice(&u32::try_from(d).unwrap().to_le_bytes())),
-                _ => [delta(v.lat, bmin_lat), delta(v.lng, bmin_lng)]
-                    .iter()
-                    .for_each(|&d| packed.extend_from_slice(&u16::try_from(d).unwrap().to_le_bytes())),
-            }
-        }
-        build_poly_buf(enc, bmin_lat, bmin_lng, &packed)
-    }
-
-    #[test]
-    fn point_in_encoded_polygon_matches_the_decoded_ray_cast_on_a_keyhole_and_its_boundary() {
-        // The keyhole square with two holes, scaled into each encoding's delta range.
-        let (outer, holes) = square_with_two_holes();
-        let unit = keyhole(&outer, &holes);
-        // Inside, in each hole, outside on three sides, on the keyhole connectors.
-        let probes = [
-            ((1.0, 1.0), true), ((5.0, 9.0), true), ((3.0, 3.0), false), ((6.5, 6.0), false), ((11.0, 5.0), false),
-            ((5.0, -1.0), false), ((-1.0, 5.0), false), ((0.5, 2.0), true), ((5.0, 2.0), true), ((1.0, 5.0), true),
-        ];
-        for (enc, extent) in [(0u8, 0.5f32), (1, 5.0), (2, 0.05), (3, 10.0), (4, 10.0)] {
-            let k = extent / 10.0;
-            let at = |lat: f32, lng: f32| nc(40.0 + lat * k, -3.0 + lng * k);
-            let verts: Vec<NodeCoord> = unit.iter().map(|p| at(p.lat, p.lng)).collect();
-            // At an odd byte offset, behind another record's bytes.
-            let mut buf = vec![0xAB; 7];
-            let off = buf.len() as u32;
-            buf.extend(encode_poly(enc, &verts));
-            let src = FileBytes::Owned(buf);
-            let n = verts.len() as u32;
-            let decoded = decode_polygon_verts(&src, off, n).unwrap();
-            let mut points: Vec<(NodeCoord, Option<bool>)> =
-                probes.iter().map(|&((lat, lng), inside)| (at(lat, lng), Some(inside))).collect();
-            // On the boundary: every decoded vertex and edge midpoint.
-            for (i, v) in decoded.iter().enumerate() {
-                let w = decoded[(i + 1) % decoded.len()];
-                points.extend([(*v, None), (nc((v.lat + w.lat) / 2.0, (v.lng + w.lng) / 2.0), None)]);
-            }
-
-            for (p, inside) in points {
-                let got = point_in_encoded_polygon(&src, off, n, p.lat, p.lng);
-
-                assert_eq!(got, Some(point_in_polygon(p.lat, p.lng, &decoded)), "enc {enc} at ({}, {})", p.lat, p.lng);
-                if let Some(inside) = inside {
-                    assert_eq!(got, Some(inside), "enc {enc} at ({}, {})", p.lat, p.lng);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn point_in_encoded_polygon_is_none_where_the_decoder_is() {
-        let square = unit_square();
-        let src = FileBytes::Owned(encode_poly(1, &square));
-        let len = src.len() as u32;
-        assert_eq!(point_in_encoded_polygon(&src, 0, 4, 0.5, 0.5), Some(true));
-        // No vertices, no record, a header past the end, more vertices than the buffer holds.
-        for (off, n) in [(0, 0), (NO_DATA, 1), (len - 5, 1), (0, 5)] {
-            assert_eq!(point_in_encoded_polygon(&src, off, n, 0.5, 0.5), None, "offset {off} count {n}");
-            assert!(decode_polygon_verts(&src, off, n).is_none(), "offset {off} count {n}");
-        }
-    }
 }
 
 /// Query-path tests: a small index in the builder's file layout, written by
@@ -6528,8 +6118,6 @@ mod query_path_tests {
     /// north and east of it.
     const ORIGIN: (f64, f64) = (10.0, 20.0);
     const COUNTRY_CODE: u16 = (b'x' as u16) << 8 | b'x' as u16;
-    /// Raw f32 vertices (VertexEncoding in builder/src/types.h).
-    const RAW_F32_VERTICES: u8 = 4;
 
     /// A rectangle in metres from the origin: (south, west, north, east).
     type Span = (f64, f64, f64, f64);
@@ -6612,9 +6200,8 @@ mod query_path_tests {
             let ring = vec![at(s, w), at(s, e), at(n, e), at(n, w), at(s, w)];
             let (lat_lo, lng_lo, lat_hi, lng_hi) = bounds(&ring);
             let poly = AdminPolygon {
-                vertex_offset: 0, vertex_count: ring.len() as u32, name_id: self.string(name), admin_level,
-                place_type_override, _pad2: 0, _pad3: 0, area: ((lat_hi - lat_lo) * (lng_hi - lng_lo)) as f32,
-                country_code: COUNTRY_CODE, hole_count: 0,
+                place_type_override, country_code: COUNTRY_CODE,
+                ..arc_fixture::record(self.string(name), admin_level, ((lat_hi - lat_lo) * (lng_hi - lng_lo)) as f32)
             };
             self.polygons.push((poly, ring));
             self
@@ -6665,24 +6252,12 @@ mod query_path_tests {
         /// the cell lies inside it; a place node in its own cell; a street in
         /// the street cells along it.
         fn files(&self) -> Vec<(&'static str, Vec<u8>)> {
-            let (mut polygons, mut vertices) = (Vec::new(), Vec::new());
+            let mut arcs = arc_fixture::ArcFixture::new();
             let mut admin_cells: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
             for (id, (poly, ring)) in self.polygons.iter().enumerate() {
                 let (lat_lo, lng_lo, lat_hi, lng_hi) = bounds(ring);
-                polygons.extend_from_slice(&(vertices.len() as u32).to_le_bytes());
-                polygons.extend_from_slice(&poly.vertex_count.to_le_bytes());
-                polygons.extend_from_slice(&poly.name_id.to_le_bytes());
-                polygons.extend_from_slice(&[poly.admin_level, poly.place_type_override, 0, 0]);
-                polygons.extend_from_slice(&poly.area.to_le_bytes());
-                polygons.extend_from_slice(&poly.country_code.to_le_bytes());
-                polygons.extend_from_slice(&poly.hole_count.to_le_bytes());
-                vertices.extend_from_slice(&[RAW_F32_VERTICES, 0]);
-                vertices.extend_from_slice(&(lat_lo as f32).to_le_bytes());
-                vertices.extend_from_slice(&(lng_lo as f32).to_le_bytes());
-                for v in ring {
-                    vertices.extend_from_slice(&v.lat.to_le_bytes());
-                    vertices.extend_from_slice(&v.lng.to_le_bytes());
-                }
+                let e7_ring: Vec<PointE7> = ring.iter().map(|v| arc_fixture::e7(v.lat as f64, v.lng as f64)).collect();
+                arcs.ring_polygon(*poly, 0, &[e7_ring]);
                 for cell in cells_meeting(ring, DEFAULT_ADMIN_CELL_LEVEL) {
                     let b = Cell::from(CellID(cell)).rect_bound();
                     let interior = b.lat_lo().deg() > lat_lo && b.lat_hi().deg() < lat_hi
@@ -6690,12 +6265,9 @@ mod query_path_tests {
                     admin_cells.entry(cell).or_default().push(id as u32 | if interior { INTERIOR_FLAG } else { 0 });
                 }
             }
-            assert_eq!(polygons.len(), self.polygons.len() * std::mem::size_of::<AdminPolygon>());
             let (cells, entries) = cell_files(&admin_cells);
-            let mut files = vec![
-                ("admin_polygons.bin", polygons), ("admin_vertices.bin", vertices),
-                ("admin_cells.bin", cells), ("admin_entries.bin", entries),
-            ];
+            let mut files: Vec<(&'static str, Vec<u8>)> = arcs.files().into();
+            files.extend([("admin_cells.bin", cells), ("admin_entries.bin", entries)]);
 
             if !self.place_nodes.is_empty() {
                 let mut nodes = Vec::new();
@@ -6904,6 +6476,70 @@ mod query_path_tests {
     }
 
     #[test]
+    fn query_finds_nothing_off_the_globe_though_its_wrapped_cells_list_a_street_with_a_parent() {
+        // S2 wraps a point off the globe onto cells of the globe, and where those cells list a
+        // street the query's admin walks that street's parent chain, however far the street is:
+        // Main Street's chain names Testland.
+        let mut index = TestIndex::new().street("Main Street", &[(0.0, -500.0), (0.0, 500.0)]).load();
+        // Main Street (way 0) in Testland (polygon 0), the top of its chain.
+        index.way_parents = Some(FileBytes::Owned(0u32.to_le_bytes().to_vec()));
+        index.admin_parents = Some(FileBytes::Owned(NO_DATA.to_le_bytes().to_vec()));
+        let on = address_at(&index, 10.0, 0.0);
+        assert_eq!((on["road"].as_str(), on["country"].as_str()), (Some("Main Street"), Some("Testland")));
+        let p = at(10.0, 0.0);
+        let (lat, lng) = (p.lat as f64, p.lng as f64);
+        let cell = |lat: f64, lng: f64| cell_id_at_level(lat, lng, DEFAULT_STREET_CELL_LEVEL);
+        // Each is p once S2 wraps it onto the globe.
+        for (wlat, wlng) in [(lat, lng + 360.0), (lat, lng - 360.0), (180.0 - lat, lng - 180.0), (-180.0 - lat, lng + 180.0)] {
+            assert_eq!(cell(wlat, wlng), cell(lat, lng), "({wlat}, {wlng})");
+            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), r#"{"address":{}}"#, "({wlat}, {wlng})");
+        }
+        for (wlat, wlng) in [(f64::NAN, lng), (lat, f64::NAN), (lat, f64::INFINITY), (f64::NEG_INFINITY, lng)] {
+            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), r#"{"address":{}}"#, "({wlat}, {wlng})");
+        }
+    }
+
+    #[test]
+    fn polygons_list_a_postcode_area_once_as_postal_at_level_99() {
+        let index = TestIndex::new()
+            .boundary("1010", POSTCODE_AREA_LEVEL, 0, (-15_000.0, -15_000.0, 15_000.0, 15_000.0))
+            .boundary("Town", 8, 0, (-2000.0, -2000.0, 2000.0, 2000.0))
+            .load();
+        // Testland is polygon 0, the postcode area the next.
+        let postcode_area = 1;
+        let p = at(0.0, 0.0);
+        let (lat, lng) = (p.lat as f64, p.lng as f64);
+        let cell = cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL);
+        let cells_listing_it = std::iter::once(cell)
+            .chain(cell_neighbors_at_level(cell, DEFAULT_ADMIN_CELL_LEVEL))
+            .filter(|&c| {
+                let mut listed = false;
+                Index::for_each_entry_fb(&index.admin_entries, Index::lookup_admin_cell_fb(&index.admin_cells, c), |id| {
+                    listed |= (id & ID_MASK) == postcode_area
+                });
+                listed
+            })
+            .count();
+        assert!(cells_listing_it > 1, "{cells_listing_it}");
+
+        let features = index.polygon_features(lat, lng);
+
+        let mut listed: Vec<(&str, &str, u64)> = features
+            .iter()
+            .map(|f| {
+                let p = &f["properties"];
+                (p["name"].as_str().unwrap(), p["kind"].as_str().unwrap(), p["admin_level"].as_u64().unwrap())
+            })
+            .collect();
+        listed.sort();
+        assert_eq!(listed, [("1010", "postal", 99), ("Testland", "admin", 2), ("Town", "admin", 8)]);
+        for f in &features {
+            let rings = f["geometry"]["coordinates"].as_array().unwrap();
+            assert_eq!((rings.len(), rings[0].as_array().unwrap().len()), (1, 5), "{}", f["properties"]["name"]);
+        }
+    }
+
+    #[test]
     fn query_gates_place_nodes_by_the_promoted_ranks_of_boundaries() {
         // A level 6 boundary linked to a suburb ranks 20, so its level 7
         // child ranks 22: the country, not the child, gates the village node
@@ -7040,9 +6676,7 @@ mod query_path_tests {
 }
 
 #[cfg(test)]
-mod encoded_pip_tests {
-    use super::*;
-
+mod test_rng {
     /// xorshift64*: deterministic test values without a dependency.
     pub(crate) struct Rng(u64);
     impl Rng {
@@ -7058,268 +6692,10 @@ mod encoded_pip_tests {
             lo + (self.next() >> 11) as f64 / (1u64 << 53) as f64 * (hi - lo)
         }
     }
-
-    /// One ring packed as the builder lays it out in admin_vertices.bin: the 10-byte header
-    /// (encoding, pad, bbox minimum as f32) and the vertices at the encoding's stride.
-    pub(crate) fn pack_ring(enc: u8, ring: &[(f64, f64)]) -> Vec<u8> {
-        let scale = vertex_scale(enc);
-        let min = |f: fn(&(f64, f64)) -> f64| ring.iter().map(f).fold(f64::MAX, f64::min);
-        // One step below the minimum keeps every delta non-negative after f32 rounding.
-        let (bmin_lat, bmin_lng) = if enc == 4 { (0.0, 0.0) } else { ((min(|v| v.0) - scale) as f32, (min(|v| v.1) - scale) as f32) };
-        let mut buf = vec![enc, 0];
-        buf.extend_from_slice(&bmin_lat.to_le_bytes());
-        buf.extend_from_slice(&bmin_lng.to_le_bytes());
-        for &(lat, lng) in ring {
-            let step = |v: f64, b: f32| ((v - b as f64) / scale).round();
-            match enc {
-                4 => {
-                    buf.extend_from_slice(&(lat as f32).to_le_bytes());
-                    buf.extend_from_slice(&(lng as f32).to_le_bytes());
-                }
-                3 => {
-                    buf.extend_from_slice(&(step(lat, bmin_lat) as u32).to_le_bytes());
-                    buf.extend_from_slice(&(step(lng, bmin_lng) as u32).to_le_bytes());
-                }
-                _ => {
-                    assert!(step(lat, bmin_lat).max(step(lng, bmin_lng)) <= u16::MAX as f64, "ring too wide for encoding {enc}");
-                    buf.extend_from_slice(&(step(lat, bmin_lat) as u16).to_le_bytes());
-                    buf.extend_from_slice(&(step(lng, bmin_lng) as u16).to_le_bytes());
-                }
-            }
-        }
-        buf
-    }
-
-    /// A random simple ring: vertices at increasing angles around a centre, random radii.
-    fn star_ring(rng: &mut Rng, lat: f64, lng: f64, radius: f64) -> Vec<(f64, f64)> {
-        let n = 3 + (rng.next() % 30) as usize;
-        let mut angles: Vec<f64> = (0..n).map(|_| rng.range(0.0, std::f64::consts::TAU)).collect();
-        angles.sort_by(f64::total_cmp);
-        angles.iter().map(|a| (lat + radius * rng.range(0.2, 1.0) * a.sin(), lng + radius * rng.range(0.2, 1.0) * a.cos())).collect()
-    }
-
-    // Ring widths (degrees) each encoding can hold: u16 deltas cap the encodings 0-2.
-    const WIDTH_BY_ENCODING: [f64; 5] = [0.3, 3.0, 0.03, 20.0, 20.0];
-
-    #[test]
-    fn point_in_encoded_polygon_matches_the_decoded_ray_cast_on_random_rings() {
-        let mut rng = Rng::new(20261019);
-        for enc in 0u8..=4 {
-            let radius = WIDTH_BY_ENCODING[enc as usize] / 2.0;
-            let mut inside = 0;
-            for _ in 0..300 {
-                let (clat, clng) = (rng.range(-80.0, 80.0), rng.range(-170.0, 170.0));
-                let ring = star_ring(&mut rng, clat, clng, radius);
-                let src = FileBytes::Owned(pack_ring(enc, &ring));
-                let n = ring.len() as u32;
-                let verts = decode_polygon_verts(&src, 0, n).unwrap();
-                for k in 0..40 {
-                    // Mostly points around the ring; some on a vertex's latitude or longitude.
-                    let mut lat = rng.range(clat - 1.5 * radius, clat + 1.5 * radius);
-                    let mut lng = rng.range(clng - 1.5 * radius, clng + 1.5 * radius);
-                    let v = verts[k % verts.len()];
-                    if k % 5 == 1 { lat = v.lat as f64; }
-                    if k % 5 == 2 { lng = v.lng as f64; }
-                    let want = point_in_polygon(lat as f32, lng as f32, &verts);
-                    assert_eq!(point_in_encoded_polygon(&src, 0, n, lat as f32, lng as f32), Some(want), "enc {enc} ring {ring:?} point {lat} {lng}");
-                    inside += want as usize;
-                }
-            }
-            // Both answers are exercised.
-            assert!(inside > 1000 && inside < 11000, "enc {enc}: {inside} of 12000 inside");
-        }
-    }
-
-    #[test]
-    fn ring_bounds_exclude_only_points_the_ray_cast_puts_outside() {
-        let mut rng = Rng::new(7);
-        let mut excluded = [0usize; 4];
-        for enc in 0u8..=3 {
-            let scale = vertex_scale(enc);
-            // Nearly every u16 step (the f32 bbox minimum sits up to a few steps below the ring),
-            // so the extent bound is exercised at its limit.
-            let width = if enc == 3 { 5.0 } else { (u16::MAX - 20) as f64 * scale };
-            for _ in 0..200 {
-                let (lat0, lng0) = (rng.range(-80.0, 75.0), rng.range(-175.0, 170.0));
-                // A square spanning the full width, each side's midpoint pushed in a little.
-                let (lat1, lng1) = (lat0 + width, lng0 + width);
-                let (mid_lat, mid_lng) = (lat0 + width / 2.0, lng0 + width / 2.0);
-                let mut dent = || rng.range(0.0, 0.1) * width;
-                let ring = vec![
-                    (lat0, lng0), (lat0 + dent(), mid_lng), (lat0, lng1), (mid_lat, lng1 - dent()),
-                    (lat1, lng1), (lat1 - dent(), mid_lng), (lat1, lng0), (mid_lat, lng0 + dent()),
-                ];
-                let src = FileBytes::Owned(pack_ring(enc, &ring));
-                let verts = decode_polygon_verts(&src, 0, ring.len() as u32).unwrap();
-                let h = src.read_chunk(0, POLY_HEADER_BYTES as usize);
-                let (bmin_lat, bmin_lng) = (f32::from_le_bytes(h[2..6].try_into().unwrap()), f32::from_le_bytes(h[6..10].try_into().unwrap()));
-                for _ in 0..50 {
-                    // Points within 0.01 degrees of a bbox side, in both directions.
-                    let near = |rng: &mut Rng, lo: f64, hi: f64| if rng.next() % 2 == 0 { lo + rng.range(-0.01, 0.01) } else { hi + rng.range(-0.01, 0.01) };
-                    let (lat, lng) = match rng.next() % 3 {
-                        0 => (near(&mut rng, lat0, lat0 + width), rng.range(lng0, lng0 + width)),
-                        1 => (rng.range(lat0, lat0 + width), near(&mut rng, lng0, lng0 + width)),
-                        _ => (near(&mut rng, lat0, lat0 + width), near(&mut rng, lng0, lng0 + width)),
-                    };
-                    let (lat, lng) = (lat as f32, lng as f32);
-                    if ring_bounds_exclude(enc, bmin_lat, bmin_lng, lat, lng) {
-                        excluded[enc as usize] += 1;
-                        assert!(!point_in_polygon(lat, lng, &verts), "enc {enc} excluded a point inside: {lat} {lng}");
-                        assert_eq!(point_in_encoded_polygon(&src, 0, ring.len() as u32, lat, lng), Some(false));
-                    }
-                }
-            }
-        }
-        assert!(excluded.iter().all(|&n| n > 1000), "{excluded:?}");
-        // The legacy f32 encoding carries no usable bounds.
-        assert!(!ring_bounds_exclude(4, 10.0, 10.0, 0.0, 0.0));
-    }
-
-    #[test]
-    fn ring_bounds_exclude_skips_the_latitude_test_at_the_zero_meridian() {
-        assert!(ring_bounds_exclude(3, 10.0, -1.0, 9.0, 0.5));
-        assert!(!ring_bounds_exclude(3, 10.0, -1.0, 9.0, 0.0));
-        assert!(!ring_bounds_exclude(3, 10.0, -1.0, 9.0, 1e-35));
-        // The longitude test holds everywhere.
-        assert!(ring_bounds_exclude(3, 10.0, 1e-30, 9.0, 0.0));
-    }
-
-    #[test]
-    fn grid_threshold_splits_the_decoded_values_at_the_point() {
-        let mut rng = Rng::new(31);
-        for enc in 0u8..=3 {
-            let (scale, k_max) = (vertex_scale(enc), k_max(enc));
-            for _ in 0..5000 {
-                // Near 180 degrees an f32 step spans many grid steps (enc 3: about 150).
-                let base = rng.range(-180.0, 179.9) as f32 as f64;
-                let decode = |k: i64| (base + k as f64 * scale) as f32;
-                let k = (rng.next() % 70_000) as i64 - 1_000;
-                let x = match rng.next() % 4 {
-                    0 => decode(k),
-                    1 => (decode(k) as f64 - scale / 3.0) as f32,
-                    2 => (decode(k) as f64 + scale / 3.0) as f32,
-                    _ => (base + rng.range(-0.1, 70_000.0 * scale)) as f32,
-                };
-                let t = grid_threshold(x, base, scale, k_max);
-                assert!((-1..=k_max).contains(&t), "enc {enc} base {base} x {x} t {t}");
-                assert!((t < 0 || decode(t) <= x) && (t == k_max || decode(t + 1) > x), "enc {enc} base {base} x {x} t {t}");
-            }
-        }
-    }
-
-    /// The largest delta of an encoding: u32 for 3, u16 for 0-2 and the tags `pip_grid` reads as u16.
-    fn k_max(enc: u8) -> i64 {
-        if enc == 3 { u32::MAX as i64 } else { u16::MAX as i64 }
-    }
-
-    /// f32 coordinates a caller can hand `query_json` (it narrows f64 input with `as f32`): NaN,
-    /// the infinities, the largest finite values, values past the enc 3 grid's i64 range (beyond
-    /// 9.22e11 degrees) or on its widest f32 plateaus, the edges of the valid range, signed zeros
-    /// and subnormals.
-    const EXTREME: [f32; 26] = [
-        f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX, -f32::MAX, 1_099_511_627_776.0, -1_099_511_627_776.0,
-        1e12, -1e12, 9.3e11, 1e9, -1e9, 1e6, -1e6, 360.0, -360.0, 180.0, -180.0, 90.0, -90.0, 0.0, -0.0,
-        f32::MIN_POSITIVE, -f32::MIN_POSITIVE, 1e-45, -1e-45,
-    ];
-
-    #[test]
-    fn grid_threshold_splits_the_decoded_values_for_any_input() {
-        let mut rng = Rng::new(5);
-        // Scale 0.0 is what `vertex_scale` gives a tag other than 0-4; the bases include ones only
-        // a damaged header holds.
-        let scales = [vertex_scale(0), vertex_scale(1), vertex_scale(2), vertex_scale(3), 0.0];
-        let bases = [-180.0, -0.5, 0.0, 25.0, 179.9, f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::MAX, 1e30];
-        for (s, &scale) in scales.iter().enumerate() {
-            let k_max = k_max(s as u8);
-            for &base in &bases {
-                let base = base as f64;
-                for &x in EXTREME.iter().chain(&[base as f32, (base + 1e-3) as f32, (base + 0.25) as f32]) {
-                    let t = grid_threshold(x, base, scale, k_max);
-                    assert!((-1..=k_max).contains(&t), "scale {scale} base {base} x {x} t {t}");
-                    let probes = [0, 1, k_max - 1, k_max, t, t + 1, (rng.next() % (k_max as u64 + 1)) as i64];
-                    for k in probes.into_iter().filter(|k| (0..=k_max).contains(k)) {
-                        let decoded = (base + k as f64 * scale) as f32;
-                        assert_eq!(decoded > x, k > t, "scale {scale} base {base} x {x} t {t} k {k}");
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn point_in_encoded_polygon_matches_the_decoded_ray_cast_at_extreme_coordinates() {
-        let mut rng = Rng::new(20261020);
-        let mut rings: Vec<(u8, Vec<u8>, u32)> = Vec::new();
-        for enc in 0u8..=4 {
-            let w = WIDTH_BY_ENCODING[enc as usize].min(1.0);
-            let mut shapes = vec![
-                // The unit square at the origin (as wide as the encoding holds).
-                vec![(0.0, 0.0), (0.0, w), (w, w), (w, 0.0)],
-                // At the antimeridian, from either side, and at the poles.
-                vec![(-w / 2.0, 180.0 - w), (w / 2.0, 180.0 - w), (0.0, 180.0)],
-                vec![(-w / 2.0, -180.0), (0.0, -180.0 + w), (w / 2.0, -180.0)],
-                vec![(90.0 - w, 180.0 - w), (90.0, 180.0 - w), (90.0, 180.0)],
-                vec![(-90.0, -180.0), (-90.0, -180.0 + w), (-90.0 + w, -180.0 + w)],
-            ];
-            for _ in 0..20 {
-                let (lat, lng) = (rng.range(-80.0, 80.0), rng.range(-170.0, 170.0));
-                shapes.push(star_ring(&mut rng, lat, lng, w / 2.0));
-            }
-            rings.extend(shapes.iter().map(|s| (enc, pack_ring(enc, s), s.len() as u32)));
-        }
-        // A tag the reader does not know (vertex_scale 0.0): every vertex decodes to the minimum.
-        let mut unknown = vec![7, 0];
-        unknown.extend_from_slice(&0.5f32.to_le_bytes());
-        unknown.extend_from_slice(&0.5f32.to_le_bytes());
-        unknown.extend((0..4 * 8).map(|_| rng.next() as u8));
-        rings.push((7, unknown, 4));
-
-        let mut inside = [0usize; 8];
-        for (enc, ring, n) in &rings {
-            let src = FileBytes::Owned(ring.clone());
-            let verts = decode_polygon_verts(&src, 0, *n).unwrap();
-            let shape: Vec<(f32, f32)> = verts.iter().map(|v| (v.lat, v.lng)).collect();
-            // A vertex and the vertex centroid of the ring, next to every extreme value.
-            let centre = |f: fn(&NodeCoord) -> f32| verts.iter().map(f).sum::<f32>() / verts.len() as f32;
-            let lats: Vec<f32> = EXTREME.iter().copied().chain([verts[0].lat, centre(|v| v.lat)]).collect();
-            let lngs: Vec<f32> = EXTREME.iter().copied().chain([verts[0].lng, centre(|v| v.lng)]).collect();
-            for &lat in &lats {
-                for &lng in &lngs {
-                    let want = point_in_polygon(lat, lng, &verts);
-                    assert_eq!(point_in_encoded_polygon(&src, 0, *n, lat, lng), Some(want), "enc {enc} ring {shape:?} point {lat} {lng}");
-                    inside[*enc as usize] += want as usize;
-                }
-            }
-        }
-        // Each known encoding has points inside some ring (the centroids of the convex ones).
-        assert!(inside[..5].iter().all(|&n| n > 0), "{inside:?}");
-    }
-
-    #[test]
-    fn point_in_encoded_polygon_is_none_where_decoding_is() {
-        let ring = [(10.0, 10.0), (10.0, 10.1), (10.1, 10.05)];
-        let src = FileBytes::Owned(pack_ring(0, &ring));
-        assert_eq!(point_in_encoded_polygon(&src, 0, 0, 10.05, 10.05), None);
-        assert_eq!(point_in_encoded_polygon(&src, NO_DATA, 3, 10.05, 10.05), None);
-        assert_eq!(point_in_encoded_polygon(&src, 1000, 3, 10.05, 10.05), None);
-        assert_eq!(point_in_encoded_polygon(&src, 0, 4, 10.05, 10.05), None);
-        assert_eq!(point_in_encoded_polygon(&src, 0, 3, 10.03, 10.05), Some(true));
-    }
-
-    #[test]
-    fn point_in_encoded_polygon_reads_the_ring_at_its_offset() {
-        let a = pack_ring(3, &[(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)]);
-        let b = pack_ring(2, &[(5.0, 5.0), (5.0, 5.01), (5.01, 5.01), (5.01, 5.0)]);
-        let src = FileBytes::Owned([a.clone(), b].concat());
-        assert_eq!(point_in_encoded_polygon(&src, 0, 4, 0.5, 0.5), Some(true));
-        assert_eq!(point_in_encoded_polygon(&src, a.len() as u32, 4, 0.5, 0.5), Some(false));
-        assert_eq!(point_in_encoded_polygon(&src, a.len() as u32, 4, 5.005, 5.005), Some(true));
-    }
 }
 
 #[cfg(test)]
 mod admin_scan_tests {
-    use super::encoded_pip_tests::pack_ring;
     use super::*;
 
     // A query point on Egypt's side of its 22°N border with Sudan. An S2 covering of the great
@@ -7351,29 +6727,33 @@ mod admin_scan_tests {
 
     /// An Index holding only the admin files, laid out as the builder writes them.
     fn admin_index(rings: &[Ring]) -> Index {
-        let cell_ids = cells();
+        admin_index_in(rings, &cells())
+    }
+
+    /// `admin_index` with each ring's cells indices into `cell_ids`.
+    fn admin_index_in(rings: &[Ring], cell_ids: &[u64]) -> Index {
         let mut strings = vec![0u8];
-        let mut vertices = Vec::new();
-        let mut polygons = Vec::new();
+        let mut arcs = arc_fixture::ArcFixture::new();
         let mut by_cell: std::collections::BTreeMap<u64, Vec<u32>> = Default::default();
         for (id, r) in rings.iter().enumerate() {
             let name_id = strings.len() as u32;
             strings.extend_from_slice(r.name.as_bytes());
             strings.push(0);
-            let vertex_offset = vertices.len() as u32;
-            vertices.extend(pack_ring(3, &r.verts));
-            polygons.extend_from_slice(&vertex_offset.to_le_bytes());
-            polygons.extend_from_slice(&(r.verts.len() as u32).to_le_bytes());
-            polygons.extend_from_slice(&name_id.to_le_bytes());
-            polygons.extend_from_slice(&[r.level, r.place_type, 0, 0]);
-            polygons.extend_from_slice(&r.area.to_le_bytes());
-            polygons.extend_from_slice(&u16::from_be_bytes(*r.country).to_le_bytes());
-            polygons.extend_from_slice(&[0, 0]);
+            let record = AdminPolygon {
+                place_type_override: r.place_type, country_code: u16::from_be_bytes(*r.country),
+                ..arc_fixture::record(name_id, r.level, r.area)
+            };
+            if r.verts.is_empty() {
+                arcs.polygon(record, &[]);
+            } else {
+                let ring: Vec<PointE7> = r.verts.iter().chain(&r.verts[..1]).map(|&(lat, lng)| arc_fixture::e7(lat, lng)).collect();
+                arcs.ring_polygon(record, 0, &[ring]);
+            }
             for &(k, interior) in &r.cells {
                 by_cell.entry(cell_ids[k]).or_default().push(id as u32 | if interior { INTERIOR_FLAG } else { 0 });
             }
         }
-        assert_eq!(polygons.len(), rings.len() * std::mem::size_of::<AdminPolygon>());
+        let [(_, polygons), (_, ring_blocks), (_, arc_index), (_, arc_vertices)] = arcs.files();
         let (mut cells, mut entries) = (Vec::new(), Vec::new());
         for (cell, mut ids) in by_cell {
             ids.sort_unstable(); // the builder sorts each cell's entries by value
@@ -7390,12 +6770,11 @@ mod admin_scan_tests {
             admin_cells: FileBytes::Owned(cells),
             admin_entries: FileBytes::Owned(entries),
             admin_polygons: FileBytes::Owned(polygons),
-            admin_geometry: AdminGeometry::new(FileBytes::Owned(vertices)),
+            admin_geometry: AdminGeometry::new(FileBytes::Owned(ring_blocks), FileBytes::Owned(arc_index), FileBytes::Owned(arc_vertices)),
             poi_cells: None, poi_entries: None, poi_records: None, poi_vertices: None,
             poi_meta: PoiMeta { categories: HashMap::new() },
             place_nodes: None, place_cells: None, place_entries: None,
             way_parents: None, admin_parents: None, addr_postcodes: None, way_postcodes: None,
-            postal_polygons: None, postal_geometry: None,
             postcode_centroids: None, postcode_centroid_cells: None, postcode_centroid_entries: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(FileBytes::Owned(strings)), None, None, None, None], [0, len, len, len, len, len]),
@@ -7412,9 +6791,10 @@ mod admin_scan_tests {
     #[test]
     fn find_admin_reads_only_the_points_own_cell() {
         // Rings listed only in neighbour cells: the builder lists a ring in the cell of every point
-        // it contains, so these contain no point of Q's cell.
+        // it contains, so these contain no point of Q's cell. Sudan's edge on 22°N lies within
+        // reach of Q's cell, which lists it, not interior.
         let idx = admin_index(&[
-            Ring { country: b"sd", ..ring("Sudan", 2, 190.0, SUDAN, &[(0, true), (3, true)]) },
+            Ring { country: b"sd", ..ring("Sudan", 2, 190.0, SUDAN, &[(0, false), (3, true)]) },
             ring("Egypt", 2, 97.0, EGYPT, &[(3, false), (5, false)]),
             ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(5, false)]),
         ]);
@@ -7431,8 +6811,8 @@ mod admin_scan_tests {
 
     #[test]
     fn a_longitude_whole_turns_away_is_in_no_ring() {
-        // S2 wraps the longitude back into Q's cell; point-in-polygon tests the f32 longitude
-        // itself, 9.7e11 degrees east of every ring (past the i64 range of the enc 3 grid).
+        // S2 would wrap the longitude back into Q's cell, but the point is rounded to the e7 grid
+        // first, 9.7e11 degrees east of every ring (past i64 in e7 units): beyond them all.
         let far = Q.1 + 360.0 * 2.7e9;
         assert_eq!(cell_id_at_level(Q.0, far, DEFAULT_ADMIN_CELL_LEVEL), cell_id_at_level(Q.0, Q.1, DEFAULT_ADMIN_CELL_LEVEL));
         let idx = admin_index(&[
@@ -7442,6 +6822,57 @@ mod admin_scan_tests {
         assert_eq!(idx.find_admin(Q.0, Q.1).country, Some("Egypt"));
         let a = idx.find_admin(Q.0, far);
         assert_eq!((a.country, a.state), (None, None));
+        let egypt = idx.admin_polygon(0).unwrap();
+        assert!(!idx.admin_geometry.contains_once(&egypt, AdminPoint::new(Q.0, far)));
+    }
+
+    #[test]
+    fn a_point_off_the_globe_is_in_no_ring_though_its_wrapped_cell_lists_them_interior() {
+        // Each point is Q once S2 wraps it onto the globe, so it would look up Q's cell, where every
+        // ring is listed interior: an interior entry holds the points of its cell, not this one.
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
+            ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, true)]),
+            ring("Paris", 8, 2.0, (21.9, 27.4, 22.1, 27.7), &[(0, true)]),
+            Ring { place_type: 5, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(0, true)]) },
+        ]);
+        let a = idx.find_admin(Q.0, Q.1);
+        assert_eq!((a.country, a.state, a.neighbourhood), (Some("Egypt"), Some("New Valley"), Some("Bir Tarfawi")));
+        for (lat, lng) in [(Q.0, Q.1 + 360.0), (Q.0, Q.1 - 360.0), (180.0 - Q.0, Q.1 - 180.0), (-180.0 - Q.0, Q.1 + 180.0)] {
+            let (rlat, rlng) = AdminPoint::new(lat, lng).degrees();
+            assert_eq!(cell_id_at_level(rlat, rlng, DEFAULT_ADMIN_CELL_LEVEL), cells()[0], "({lat}, {lng})");
+            let a = idx.find_admin(lat, lng);
+            assert_eq!((a.country, a.state, a.neighbourhood), (None, None, None), "({lat}, {lng})");
+            let mut scan = AdminScan::new(&idx, lat, lng);
+            assert!(scan.rings.is_empty(), "({lat}, {lng})");
+            let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"));
+            assert!(gates.gates.iter().all(Option::is_none) && gates.promoting.is_empty(), "({lat}, {lng})");
+            assert_eq!(idx.find_admin_from_chain(0, lat, lng).neighbourhood, None, "({lat}, {lng})");
+        }
+        for (lat, lng) in [(f64::NAN, Q.1), (Q.0, f64::NAN), (Q.0, f64::INFINITY), (f64::NEG_INFINITY, Q.1)] {
+            assert!(AdminScan::new(&idx, lat, lng).rings.is_empty(), "({lat}, {lng})");
+            assert_eq!(idx.find_admin(lat, lng).country, None, "({lat}, {lng})");
+        }
+    }
+
+    #[test]
+    fn the_globes_edges_are_on_it_and_a_hair_past_them_is_not() {
+        // A ring listed interior both in the cell of a point on the edge of the globe and in the
+        // cell S2 wraps a point a hair past it onto.
+        for ((lat, lng), past, around) in [
+            ((90.0, 45.0), (90.0000001, 45.0), (89.0, 44.0, 90.0, 46.0)),
+            ((-90.0, 45.0), (-90.0000001, 45.0), (-90.0, 44.0, -89.0, 46.0)),
+            ((10.0, 180.0), (10.0, 180.0000001), (9.0, 179.0, 11.0, 180.0)),
+            ((10.0, -180.0), (10.0, -180.0000001), (9.0, -180.0, 11.0, -179.0)),
+        ] {
+            let cell = |(lat, lng): (f64, f64)| {
+                let (lat, lng) = AdminPoint::new(lat, lng).degrees();
+                cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL)
+            };
+            let idx = admin_index_in(&[ring("Edge", 2, 1.0, around, &[(0, true), (1, true)])], &[cell((lat, lng)), cell(past)]);
+            assert_eq!(idx.find_admin(lat, lng).country, Some("Edge"), "({lat}, {lng})");
+            assert_eq!(idx.find_admin(past.0, past.1).country, None, "{past:?}");
+        }
     }
 
     #[test]
@@ -7451,6 +6882,45 @@ mod admin_scan_tests {
             Ring { country: b"sd", ..ring("Sudan", 2, 9.0, SUDAN, &[(1, true), (2, true)]) },
         ]);
         assert_eq!(idx.find_admin(Q.0, Q.1).country, Some("Egypt"));
+    }
+
+    #[test]
+    fn an_interior_entry_holds_the_point_without_reading_an_arc() {
+        // The builder flags an entry interior only where the rings hold the whole cell, so the scan
+        // takes it as holding the point: find_admin, the current boundaries and the chain lookup
+        // read no arc of an interior entry, and test only the others.
+        let mut idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]),
+            ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, true)]),
+            ring("Paris", 8, 2.0, (21.9, 27.4, 22.1, 27.7), &[(0, true)]),
+            Ring { place_type: 5, ..ring("Bir Tarfawi", 15, 0.01, (21.99, 27.5, 22.05, 27.6), &[(0, true)]) },
+            // A smaller state holding the point, which Paris's chain doesn't take.
+            ring("Kharga", 4, 20.0, (22.0, 27.0, 26.0, 31.0), &[(0, true)]),
+        ]);
+        // Each polygon's next larger one: Paris in New Valley in Egypt.
+        let parents = [NO_DATA, 0, 1, NO_DATA, 0];
+        idx.admin_parents = Some(FileBytes::Owned(parents.iter().flat_map(|p| p.to_le_bytes()).collect()));
+        let mut scan = AdminScan::new(&idx, Q.0, Q.1);
+        let a = idx.find_admin_in(&mut scan);
+        assert_eq!((a.country, a.state, a.city, a.neighbourhood), (Some("Egypt"), Some("Kharga"), Some("Paris"), Some("Bir Tarfawi")));
+        let gates = idx.find_current_boundaries(&mut scan, Some(*b"eg"));
+        assert_eq!(gates.for_rank(CurrentBoundaries::CITY).map(|p| idx.get_string(p.name_id)), Some("Paris"));
+        assert_eq!(scan.pip.memo.arcs_read(), 0);
+        // The chain lookup from Paris over a scan of its own: its boundaries are the chain's (New
+        // Valley, not the scan's Kharga, so this is no fallback to find_admin), its place area the
+        // scan's interior entry.
+        let mut scan = AdminScan::new(&idx, Q.0, Q.1);
+        let c = idx.find_admin_from_chain_in(2, &mut scan);
+        assert_eq!((c.country, c.state, c.city, c.neighbourhood), (Some("Egypt"), Some("New Valley"), Some("Paris"), Some("Bir Tarfawi")));
+        assert_eq!(scan.pip.memo.arcs_read(), 0);
+        // The same rings listed not interior are tested.
+        let idx = admin_index(&[
+            ring("Egypt", 2, 97.0, EGYPT, &[(0, false)]),
+            ring("New Valley", 4, 38.8, (22.0, 25.0, 27.7, 32.7), &[(0, false)]),
+        ]);
+        let mut scan = AdminScan::new(&idx, Q.0, Q.1);
+        assert_eq!(idx.find_admin_in(&mut scan).state, Some("New Valley"));
+        assert!(scan.pip.memo.arcs_read() > 0);
     }
 
     #[test]
@@ -7479,6 +6949,70 @@ mod admin_scan_tests {
             ring("Second", 4, 1.0, around_q, &[(0, false)]),
         ]);
         assert_eq!(idx.find_admin(Q.0, Q.1).state, Some("Second"));
+    }
+
+    #[test]
+    fn a_levels_larger_boundaries_are_not_read_once_a_smaller_one_holds_the_point() {
+        let around_q = (21.99, 27.5, 22.05, 27.6);
+        let wider = (21.9, 27.4, 22.1, 27.7);
+        let arcs_read = |rings: &[Ring]| {
+            let idx = admin_index(rings);
+            let mut scan = AdminScan::new(&idx, Q.0, Q.1);
+            let state = idx.find_admin_in(&mut scan).state.map(str::to_string);
+            (state, scan.pip.memo.arcs_read())
+        };
+        // Listed first, so visited first in a walk down the list.
+        let (state, read) = arcs_read(&[
+            ring("Large", 4, 5.0, wider, &[(0, false)]),
+            ring("Small", 4, 1.0, around_q, &[(0, false)]),
+        ]);
+        assert_eq!(state.as_deref(), Some("Small"));
+        assert_eq!((state, read), arcs_read(&[ring("Small", 4, 1.0, around_q, &[(0, false)])]));
+        // A smaller one that misses the point leaves the larger one to be read.
+        let elsewhere = (30.0, 27.5, 30.05, 27.6);
+        let (state, read) = arcs_read(&[
+            ring("Large", 4, 5.0, wider, &[(0, false)]),
+            ring("Small", 4, 1.0, elsewhere, &[(0, false)]),
+        ]);
+        assert_eq!(state.as_deref(), Some("Large"));
+        assert!(read > 0);
+    }
+
+    #[test]
+    fn a_levels_best_is_the_smallest_holding_the_point_the_first_listed_among_equals() {
+        // Every list of the point's boundaries, whatever order it visits them in: what a walk down
+        // the list keeping the smaller one finds is the answer.
+        const NAMES: [&str; 6] = ["A", "B", "C", "D", "E", "F"];
+        const LEVELS: [u8; 3] = [4, 6, 8];
+        let holds_q = (21.99, 27.5, 22.05, 27.6);
+        let misses_q = (30.0, 27.5, 30.05, 27.6);
+        let mut rng = crate::test_rng::Rng::new(20261107);
+        for case in 0..300 {
+            let rings: Vec<Ring> = (0..NAMES.len()).map(|i| {
+                let level = LEVELS[(rng.next() % 3) as usize];
+                let area = [0.5f32, 0.5, 1.0, 2.0, 3.0][(rng.next() % 5) as usize];
+                let (holds, interior) = match rng.next() % 4 { 0 => (false, false), 1 => (true, true), _ => (true, false) };
+                ring(NAMES[i], level, area, if holds { holds_q } else { misses_q }, &[(0, interior)])
+            }).collect();
+            let want = |level: u8| {
+                // The builder sorts each cell's entries by value: the interior flag's high bit
+                // puts those last.
+                let mut listed: Vec<&Ring> = rings.iter().collect();
+                listed.sort_by_key(|r| r.cells[0].1);
+                let mut best: Option<&Ring> = None;
+                for r in listed {
+                    if r.level == level && r.verts[0].0 == holds_q.0 && best.is_none_or(|b| r.area < b.area) {
+                        best = Some(r);
+                    }
+                }
+                best.map(|r| r.name)
+            };
+            let idx = admin_index(&rings);
+            let a = idx.find_admin(Q.0, Q.1);
+            assert_eq!(a.state, want(4), "case {case} state");
+            assert_eq!(a.county, want(6), "case {case} county");
+            assert_eq!(a.city, want(8), "case {case} city");
+        }
     }
 
     #[test]
@@ -7555,9 +7089,51 @@ mod admin_scan_tests {
         assert_eq!(&src.read_chunk(0, 3)[..], &[1, 2, 3]);
     }
 
-    /// A ring a tier simplified away: its record keeps its name, its vertex range is empty.
+    /// A ring a tier simplified away: its record keeps its name, its ring block is empty.
     fn ringless(name: &'static str, level: u8, cells: &[(usize, bool)]) -> Ring {
         Ring { verts: Vec::new(), ..ring(name, level, 1.0, EGYPT, cells) }
+    }
+
+    /// `idx` with one polygon POI, the box `around` named as admin polygon `named_after` is, its
+    /// own parent street, listed in Q's cell (interior or not).
+    fn with_polygon_poi(mut idx: Index, named_after: u32, (lat0, lng0, lat1, lng1): (f64, f64, f64, f64), interior: bool) -> Index {
+        let name_id = idx.admin_polygon(named_after).unwrap().name_id;
+        let f32s = |values: &[f64]| values.iter().flat_map(|&v| (v as f32).to_le_bytes()).collect::<Vec<u8>>();
+        // The polygon header (raw f32 vertices, encoding 4, then the box's low corner), then the vertices.
+        let vertices = [&[4u8, 0][..], &f32s(&[lat0, lng0]), &f32s(&[lat0, lng0, lat0, lng1, lat1, lng1, lat1, lng0])].concat();
+        let record = [&f32s(&[(lat0 + lat1) / 2.0, (lng0 + lng1) / 2.0])[..], &0u32.to_le_bytes(), &4u32.to_le_bytes(),
+            &name_id.to_le_bytes(), &[1u8, 0, 0, 0], &name_id.to_le_bytes(), &NO_DATA.to_le_bytes(), &NO_DATA.to_le_bytes()].concat();
+        assert_eq!(record.len(), std::mem::size_of::<PoiRecord>());
+        let entry = if interior { INTERIOR_FLAG } else { 0 };
+        idx.poi_cells = Some(FileBytes::Owned([&cells()[0].to_le_bytes()[..], &0u32.to_le_bytes()].concat()));
+        idx.poi_entries = Some(FileBytes::Owned([&1u16.to_le_bytes()[..], &entry.to_le_bytes()].concat()));
+        idx.poi_records = Some(FileBytes::Owned(record));
+        idx.poi_vertices = Some(FileBytes::Owned(vertices));
+        idx
+    }
+
+    #[test]
+    fn a_point_off_the_globe_is_in_no_poi_though_its_wrapped_cell_lists_one_interior() {
+        let around_q = (21.99, 27.5, 22.05, 27.6);
+        let rings = || [ring("Egypt", 2, 97.0, EGYPT, &[(0, true)]), Ring { place_type: 5, ..ring("Bir Tarfawi", 15, 0.01, around_q, &[(0, true)]) }];
+        for interior in [false, true] {
+            let idx = with_polygon_poi(admin_index(&rings()), 1, around_q, interior);
+            let pois = |lat, lng| idx.find_pois(lat, lng).iter().map(|p| (p.name, p.contained)).collect::<Vec<_>>();
+            assert_eq!(pois(Q.0, Q.1), [("Bir Tarfawi", true)], "interior {interior}");
+            assert_eq!(idx.find_nearest_poi_with_parent(Q.0, Q.1).map(|(d, p)| (d, p.name_id)), Some((0.0, idx.admin_polygon(1).unwrap().name_id)));
+            let answer = serde_json::to_string(&idx.query(Q.0, Q.1)).unwrap();
+            assert!(answer.contains("Egypt") && answer.contains("Bir Tarfawi"), "{answer}");
+            for (lat, lng) in [(Q.0, Q.1 + 360.0), (Q.0, Q.1 - 360.0), (180.0 - Q.0, Q.1 - 180.0), (-180.0 - Q.0, Q.1 + 180.0)] {
+                assert_eq!(cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL), cells()[0], "({lat}, {lng})");
+                assert_eq!(pois(lat, lng), [], "({lat}, {lng}) interior {interior}");
+                assert!(idx.find_nearest_poi_with_parent(lat, lng).is_none(), "({lat}, {lng}) interior {interior}");
+                assert_eq!(serde_json::to_string(&idx.query(lat, lng)).unwrap(), r#"{"address":{}}"#, "({lat}, {lng}) interior {interior}");
+            }
+            for (lat, lng) in [(f64::NAN, Q.1), (Q.0, f64::NAN), (Q.0, f64::INFINITY), (f64::NEG_INFINITY, Q.1)] {
+                assert_eq!(pois(lat, lng), [], "({lat}, {lng})");
+                assert!(idx.find_nearest_poi_with_parent(lat, lng).is_none(), "({lat}, {lng})");
+            }
+        }
     }
 
     #[test]

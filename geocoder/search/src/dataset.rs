@@ -17,10 +17,13 @@ use std::io::{ErrorKind, Read};
 use std::path::Path;
 
 /// The geocoder files an index is derived from: the records its postings point at, the string
-/// tiers of their names and the rings its boundary points come from.
-pub const DATASET_FILES: [&str; 7] = [
+/// tiers of their names and the boundary geometry its label points come from, the boundary tier's
+/// own arcs among it (the records and rings are the same in every tier).
+pub const DATASET_FILES: [&str; 9] = [
     "admin_polygons.bin",
-    "admin_vertices.bin",
+    "admin_rings.bin",
+    "arc_index.bin",
+    "arc_vertices.bin",
     "place_nodes.bin",
     "poi_records.bin",
     "strings_core.bin",
@@ -271,7 +274,7 @@ mod tests {
     use crate::build::build_all;
     use crate::fixture::{Geo, TempDir};
     use crate::query::Searcher;
-    use query_server::{DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
+    use query_server::{AdminPoint, ADMIN_GEOMETRY_FILES, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
     use std::path::PathBuf;
 
     /// The fingerprint of the dataset in `dir`, every file hashed.
@@ -287,6 +290,21 @@ mod tests {
             g.place(name, 1, 10.2 + i as f32 * 0.5, 20.5);
         }
         g
+    }
+
+    /// Hookcounty, a county whose ring is `outer`, (lat, lng) in tenths of a degree from (10, 20).
+    fn county(outer: &[(f32, f32)]) -> Geo {
+        let ring: Vec<(f32, f32)> = outer.iter().map(|&(lat, lng)| (10.0 + lat / 10.0, 20.0 + lng / 10.0)).collect();
+        let mut g = Geo::default();
+        g.shaped_boundary("Hookcounty", 6, &ring, &[]);
+        g
+    }
+
+    /// Where the index `idx` has Hookcounty's label point.
+    fn label_point(idx: &SearchIndex) -> AdminPoint {
+        let found = Searcher::new(idx).search("Hookcounty", 5).0;
+        assert_eq!(found.len(), 1);
+        AdminPoint::new(found[0].lat as f64, found[0].lng as f64)
     }
 
     /// The dataset in `dir` loaded, with its stamps, as the binding loads it.
@@ -422,6 +440,34 @@ mod tests {
         assert_eq!(names(&idx, "nestville"), vec!["Nestville"]);
         assert!(names(&idx, "testville").is_empty());
         assert!(!index.join(BUILD_STAGE_DIR).exists());
+    }
+
+    #[test]
+    fn an_index_shipped_beside_one_boundary_tier_is_rebuilt_beside_the_other() {
+        // One county in two tiers, which share its record and ring and differ in their arcs: the
+        // simplified one is a square, whose label point is its middle, where the exact one is open
+        // to the north.
+        let square = [(0.0, 0.0), (0.0, 3.0), (3.0, 3.0), (3.0, 0.0), (0.0, 0.0)];
+        let hook = [(0.0, 0.0), (0.0, 3.0), (3.0, 3.0), (3.0, 2.0), (1.0, 2.0), (1.0, 1.0), (3.0, 1.0), (3.0, 0.0), (0.0, 0.0)];
+        let (ci, ds, arcs) = (TempDir::new("ci-tier"), TempDir::new("other-tier"), TempDir::new("tier-arcs"));
+        county(&square).write(&ci.0);
+        county(&square).write(&ds.0);
+        county(&hook).write(&arcs.0);
+        std::fs::copy(arcs.0.join("arc_vertices.bin"), ds.0.join("arc_vertices.bin")).unwrap();
+        let shipped = ci.0.join("out");
+        ship(&ci.0, &shipped);
+        let index = ds.0.join("search");
+        download(&shipped, &index);
+        let (geo, stamps) = load_dataset(&ds.0);
+        let ci_geo = load_dataset(&ci.0).0;
+        let hook_county = geo.admin_polygon(0).unwrap();
+        let shipped_label = label_point(&SearchIndex::open(&ci_geo, &shipped, None, None).unwrap());
+        assert!(!geo.admin_geometry.contains_once(&hook_county, shipped_label));
+
+        let (idx, origin) = open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap();
+
+        assert_eq!(origin, Origin::Built);
+        assert!(geo.admin_geometry.contains_once(&hook_county, label_point(&idx)));
     }
 
     #[test]
@@ -721,6 +767,23 @@ mod tests {
 
         assert_eq!(kept["place_nodes.bin"], "kept");
         assert_eq!(rehashed, first);
+    }
+
+    #[test]
+    fn the_fingerprint_holds_each_file_the_boundaries_are_read_from() {
+        let ds = TempDir::new("boundaries");
+        dataset(["Testville", "Otherton"]).write(&ds.0);
+        let before = fingerprint(&ds.0).unwrap();
+        let mut vertices = std::fs::read(ds.0.join("arc_vertices.bin")).unwrap();
+        *vertices.last_mut().unwrap() ^= 1;
+        std::fs::write(ds.0.join("arc_vertices.bin"), vertices).unwrap();
+
+        let after = fingerprint(&ds.0).unwrap();
+
+        for name in std::iter::once("admin_polygons.bin").chain(ADMIN_GEOMETRY_FILES) {
+            assert!(before.contains_key(name), "{name}");
+        }
+        assert_ne!(after, before);
     }
 
     #[test]

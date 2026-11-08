@@ -353,10 +353,6 @@ struct BuildConfig {
     bool multi_quality = false;
     std::string output_dir;
     std::string prev_output_dir;
-    // The arc stage runs only with an arcs dir; prev_arcs_dir is the last
-    // such build's.
-    std::string arcs_out_dir;
-    std::string prev_arcs_dir;
 };
 
 // Shared nearest-named-street sweep used by the addr backfill and the POI
@@ -1171,72 +1167,19 @@ static void compute_s2_and_poi_cells(ParsedData& data, const BuildConfig& cfg,
 }
 
 // Write all index files (full + multi-output variants + qualities + continents).
-static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
-                const std::vector<double>& quality_scales, bool generate_continents,
+static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool generate_continents,
                 std::chrono::steady_clock::time_point& _pt, CpuTicks& _cpu) {
     const std::string& output_dir = cfg.output_dir;
     const std::string& prev_output_dir = cfg.prev_output_dir;
     bool multi_output = cfg.multi_output;
     bool multi_quality = cfg.multi_quality;
     IndexMode mode = cfg.mode;
-    constexpr double kAdminMinimalEpsilonScale = 2.5;
-    (void)output_dir; (void)prev_output_dir; (void)multi_output; (void)multi_quality; (void)mode;
     log_phase("Deterministic ordering", _pt, _cpu);
     std::cerr << "Writing index files to " << output_dir << "..." << std::endl;
 
-    auto quality_dir_name = [](double scale) -> std::string {
-        if (scale == 0) return "uncapped";
-        char buf[32]; snprintf(buf, sizeof(buf), "q%.4g", scale);
-        return buf;
-    };
-
     enum class RegionRun { Planet, Continent };
 
-    // The planet's quality variants, each marked done once its files are
-    // written: a continent's variant at the same scale then copies its
-    // polygons from them rather than simplifying them again.
-    std::vector<std::atomic<bool>> planet_quality_done(quality_scales.size());
-    const std::string planet_quality_dir = output_dir + "/planet" + (multi_output ? "/quality" : "");
-
-    // Write quality variants in parallel (bounded concurrency).
-    // Each variant does parallel simplification internally, so limit
-    // concurrency to avoid over-subscribing CPU.
-    auto write_qualities = [&](const ParsedData& d, const std::string& admin_dir, RegionRun run) {
-        constexpr unsigned max_concurrent_qualities = 3;
-        std::atomic<unsigned> active{0};
-        std::mutex qmtx;
-        std::condition_variable qcv;
-        std::vector<std::future<void>> qfutures;
-
-        for (size_t k = 0; k < quality_scales.size(); k++) {
-            const double scale = quality_scales[k];
-            {
-                std::unique_lock<std::mutex> lock(qmtx);
-                qcv.wait(lock, [&]{ return active.load() < max_concurrent_qualities; });
-            }
-            active.fetch_add(1);
-
-            std::string qname = quality_dir_name(scale);
-            std::string qdir = admin_dir + "/" + qname;
-            qfutures.push_back(std::async(std::launch::async, [&, qdir, qname, scale, k]() {
-                const bool from_planet =
-                    run == RegionRun::Continent && planet_quality_done[k].load(std::memory_order_acquire);
-                write_quality_variant(d, admin_dir, qdir, scale, from_planet ? planet_quality_dir + "/" + qname : "");
-                if (run == RegionRun::Planet) planet_quality_done[k].store(true, std::memory_order_release);
-                // Decrement under the mutex: an unlocked change + notify can
-                // fire between the waiter's predicate check and its block,
-                // losing the wakeup (deadlock when max_concurrent is 1).
-                {
-                    std::lock_guard<std::mutex> lk(qmtx);
-                    active.fetch_sub(1);
-                }
-                qcv.notify_one();
-            }));
-        }
-        for (auto& f : qfutures) f.get();
-    };
-
-    // Write one region: modes, quality variants, place files, admin-minimal
+    // Write one region: modes, boundary tiers, place files, admin-minimal
     // and POI tiers. Takes ParsedData& (non-const) because
     // apply_strategy2_remaps reorders the in-memory record arrays and
     // rewrites every reference site; the stages after it only read.
@@ -1265,15 +1208,12 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             if (rel.rfind(output_dir, 0) == 0) rel = rel.substr(output_dir.size());
             region_prev = prev_output_dir + rel;
         }
-        // The region's arc dirs (--arcs-out only) and the last such build's.
-        const std::string region_arcs = cfg.arcs_out_dir.empty() ? "" : cfg.arcs_out_dir + "/" + region;
-        const std::string region_prev_arcs = cfg.prev_arcs_dir.empty() ? "" : cfg.prev_arcs_dir + "/" + region;
         if (run == RegionRun::Continent) {
             timed_phase("    " + region + ": strategy2 remap", [&] { apply_strategy2_remaps(d, region_prev, order); });
             // Its own arc slots, as the remap gives its polygons theirs.
-            if (!region_arcs.empty())
+            if (!d.admin_arcs.polygons.empty())
                 timed_phase("    " + region + ": arc slots",
-                            [&] { assign_region_arc_slots(d.admin_arcs, region_prev_arcs, region, 0); });
+                            [&] { assign_region_arc_slots(d.admin_arcs, region_prev, region, 0); });
             timed_phase("    " + region + ": poi names in record order", [&] { order_poi_strings_by_record(d); });
         }
 
@@ -1288,14 +1228,12 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
                 write_index(d, base_dir, mode);
             }
         };
-        auto write_quality_dirs = [&] {
-            // Write quality variants (each gets admin_polygons + admin_vertices)
-            if (multi_quality) {
-                std::string quality_dir = multi_output ? base_dir + "/quality" : base_dir;
-                std::cerr << "  Writing quality variants for " << base_dir << "..." << std::endl;
-                write_qualities(d, quality_dir, run);
-            }
-
+        auto write_boundary_tiers = [&] {
+            if (multi_quality) write_admin_tiers(d, base_dir);
+            // A single output dir is a whole index: the exact tier's
+            // geometry (lossless) beside the mode's files. --multi-output's
+            // mode dirs are read beside a boundary tier.
+            if (!multi_output) write_exact_admin_geometry(d, base_dir);
         };
         auto write_places = [&] {
             // Write place node files into each mode directory (so diff/patch can find them). Their
@@ -1328,8 +1266,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         auto write_admin_minimal_set = [&] {
             // Written for a region without admin polygons too: every
             // configuration of the region lists the tier's files.
-            if (multi_output && !d.place_nodes.empty())
-                write_admin_minimal(d, base_dir, region_prev, kAdminMinimalEpsilonScale);
+            if (multi_output && !d.place_nodes.empty()) write_admin_minimal(d, base_dir, region_prev);
         };
         auto write_poi_tiers = [&] {
             // Write POI tier variants
@@ -1484,7 +1421,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             }
         };
 
-        const StageCosts costs = stage_costs(record_bytes(d), region_arcs.empty() ? 0 : arc_dirs_cost(d));
+        const StageCosts costs = stage_costs(record_bytes(d));
         struct Stage {
             const char* name;
             std::function<void()> write;
@@ -1492,13 +1429,11 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         };
         std::vector<Stage> stages = {
             {"modes", write_modes, costs.modes},
-            {"quality variants", write_quality_dirs, costs.quality},
+            {"boundary tiers", write_boundary_tiers, costs.admin_tiers},
             {"place files", write_places, costs.places},
             {"admin-minimal", write_admin_minimal_set, costs.admin_minimal},
             {"poi tiers", write_poi_tiers, costs.poi_tiers},
         };
-        if (!region_arcs.empty())
-            stages.push_back({"arc dirs", [&] { write_arc_dirs(d, region_arcs, region_prev_arcs); }, costs.arc_dirs});
         auto run_stage = [&](const Stage& stage) {
             std::optional<BudgetLease> lease;
             if (budget) lease.emplace(*budget, stage.cost);
@@ -1522,9 +1457,10 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // in any order, and a point's country rests on area and code, not slot.
     timed_phase("    planet: postcode centroids", [&] { collect_postcode_centroids(data); });
     // Gone before the strategy-2 remap takes its budget from what the build
-    // holds: the exact rings never reach the remap, which would have to
-    // follow them, nor the write phase.
+    // holds: the exact rings and the countries' cells never reach the remap,
+    // which would have to follow them, nor the write phase.
     free_storage(data.admin_exact_rings);
+    free_storage(data.admin_country_cells);
 
     // Strategy-2 remap for the planet region runs synchronously HERE — before
     // the planet write launches and before continent filtering reads the
@@ -1560,14 +1496,6 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
         unsetenv("GC_PREV_OUTPUT_ROOT");
     }
 
-    // The reader's admin cell indexes, once the polygon ids are final: from
-    // the rings the quality variants (or, in one dir, the uncapped rings) and
-    // admin-minimal write. The continents take their part of them.
-    timed_phase("    planet: admin index cells", [&] {
-        compute_admin_index_cells(data, multi_quality ? quality_scales : std::vector<double>{0},
-                                  multi_output ? std::optional<double>(kAdminMinimalEpsilonScale) : std::nullopt);
-    });
-
 #ifdef __GLIBC__
     // The earlier phases' freed blocks sit in the malloc arenas; handed back,
     // they leave the write phase and the page cache room.
@@ -1589,10 +1517,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     // when the budget holds them beside the costliest continents that can
     // run together; else one after another, to hold memory down while
     // continent subsets build alongside.
-    // The arc dirs stage's, 0 without --arcs-out; each continent's is its
-    // share of it.
-    const uint64_t planet_arc_dirs = cfg.arcs_out_dir.empty() ? 0 : arc_dirs_cost(data);
-    const uint64_t planet_stages = stage_costs(record_bytes(data), planet_arc_dirs).total();
+    const uint64_t planet_stages = stage_costs(record_bytes(data)).total();
 
     // The planet's own write and each continent's split read the planet
     // records; the last of them to finish frees them beside the work left,
@@ -1607,7 +1532,13 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
     std::future<void> planet_future;
     auto write_planet = [&](uint64_t beside) {
         const RunOrder order = planet_stages + beside <= budget.capacity() ? RunOrder::Concurrent : RunOrder::Serial;
-        std::cerr << "Planet: stages " << (order == RunOrder::Serial ? "one at a time" : "at once") << std::endl;
+        const KindValues bytes = record_bytes(data);
+        const StageCosts costs = stage_costs(bytes);
+        std::cerr << "Planet: stages " << (order == RunOrder::Serial ? "one at a time" : "at once") << " (admins "
+                  << (at(bytes, RecordKind::Admins) >> 20) << " MiB, pois " << (at(bytes, RecordKind::Pois) >> 20)
+                  << " MiB; estimates: modes " << (costs.modes >> 20) << ", boundary tiers " << (costs.admin_tiers >> 20)
+                  << ", admin-minimal " << (costs.admin_minimal >> 20) << ", poi tiers " << (costs.poi_tiers >> 20)
+                  << " MiB)" << std::endl;
         planet_future = std::async(std::launch::async, [&, order]() {
             timed_phase("    planet: write", [&] {
                 write_region(data, output_dir + "/planet", RegionRun::Planet, order, &budget);
@@ -1734,9 +1665,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg,
             const KindValues counts = continent_share(planet_counts, planet_pairs, continent_pairs[c]);
             const uint64_t filter_bytes = filter_cost(planet_counts, continent_pairs[c]);
             // Its write runs without a budget (run_continent), so its
-            // reservation holds the arc dirs stage too.
-            const uint64_t arc_dirs = continent_arc_dirs_cost(planet_arc_dirs, planet_bytes, bytes);
-            pending.push_back({c, continent_cost(bytes, counts, filter_bytes, arc_dirs, budget.capacity())});
+            // reservation holds every stage, the boundary tiers and both
+            // admin-minimal dirs included.
+            pending.push_back({c, continent_cost(bytes, counts, filter_bytes, budget.capacity())});
         }
         // A continent past the budget even with its steps one after another
         // goes last, once nothing else reads the planet records: its split
@@ -1949,24 +1880,33 @@ static std::pair<size_t, std::future<void>> grow_beside(std::vector<T>& out, con
     return {out.size(), std::async(std::launch::async, [&out, n] { grow_by(out, n); })};
 }
 
+// Whether an argument reads as the scale list --multi-quality once took
+// (0,0.2,0.5): digits, dots and commas.
+static bool is_scale_list(const char* arg) {
+    if (!*arg) return false;
+    for (const char* c = arg; *c; c++)
+        if (!std::isdigit(static_cast<unsigned char>(*c)) && *c != '.' && *c != ',') return false;
+    return true;
+}
+
 static int run(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
         std::cerr << "  <output-dir> must be new or empty" << std::endl;
+        std::cerr << "  Without --multi-output each region's dir is one whole index: the mode's files" << std::endl;
+        std::cerr << "  and the admin geometry at the exact tier" << std::endl;
         std::cerr << std::endl;
         std::cerr << "Options:" << std::endl;
         std::cerr << "  --street-level N       S2 cell level for streets (default: 17)" << std::endl;
         std::cerr << "  --admin-level N        S2 cell level for admin (default: 10)" << std::endl;
         std::cerr << "  --max-admin-level N    Only include admin levels <= N" << std::endl;
-        std::cerr << "  --multi-output         Write full, no-addresses, admin-only indexes" << std::endl;
+        std::cerr << "  --multi-output         Write full, no-addresses, admin-only indexes (needs --multi-quality)" << std::endl;
         std::cerr << "  --continents           Also generate per-continent indexes" << std::endl;
         std::cerr << "  --mode <mode>          Index mode: full, no-addresses, admin-only (default: full)" << std::endl;
-        std::cerr << "  --multi-quality [S,S,...]  Write quality variants at given scales (default: 0,0.2,0.5,1,1.5,2,2.5)" << std::endl;
+        std::cerr << "  --multi-quality        Write the boundary tiers: quality/simplified and quality/exact" << std::endl;
         std::cerr << "  --tiger-data <path>          Load TIGER address data (tar.gz or directory of CSVs)" << std::endl;
         std::cerr << "  --external-postcodes <path>  Load GeoNames postcode centroids (CSV or .csv.gz)" << std::endl;
         std::cerr << "  --wikidata-sitelinks <path>  Load QID→sitelinks binary for POI importance" << std::endl;
-        std::cerr << "  --arcs-out <dir>             Cut the admin boundaries into arcs (a new or empty dir, apart from <output-dir>)" << std::endl;
-        std::cerr << "  --prev-arcs <dir>            The previous --arcs-out, for its arc slots" << std::endl;
         return 1;
     }
 
@@ -1980,15 +1920,10 @@ static int run(int argc, char* argv[]) {
     // the same dense IDs to records carried over from the previous
     // build. Empty means "fresh start, no stable IDs".
     std::string prev_output_dir;
-    std::string arcs_out_dir;
-    std::string prev_arcs_dir;
     bool multi_output = false;
     bool generate_continents = false;
     IndexMode mode = IndexMode::Full;
-    SimplifyMode simplify_mode = SimplifyMode::MaxVertices;
-    double simplify_epsilon_override = 0; // 0 = use per-level defaults
     bool multi_quality = false;
-    std::vector<double> quality_scales;
 
     for (int i = 2; i < argc; i++) {
         std::string arg = argv[i];
@@ -2004,25 +1939,11 @@ static int run(int argc, char* argv[]) {
             generate_continents = true;
         } else if (arg == "--multi-quality") {
             multi_quality = true;
-            // Optional: next arg might be comma-separated scales
-            if (i + 1 < argc && argv[i+1][0] != '-') {
-                std::string vals = argv[++i];
-                size_t pos = 0;
-                while (pos < vals.size()) {
-                    size_t next = vals.find(',', pos);
-                    if (next == std::string::npos) next = vals.size();
-                    double v = std::strtod(vals.substr(pos, next - pos).c_str(), nullptr);
-                    quality_scales.push_back(v);
-                    pos = next + 1;
-                }
+            if (i + 1 < argc && is_scale_list(argv[i + 1])) {
+                std::cerr << "Error: --multi-quality takes no scale list ('" << argv[i + 1]
+                          << "'): it writes the boundary tiers, quality/simplified and quality/exact" << std::endl;
+                return 1;
             }
-            if (quality_scales.empty()) {
-                quality_scales = {0, 0.2, 0.5, 1.0, 1.5, 2.0, 2.5};
-            }
-            // Build with uncapped polygons — quality variants simplify at write time.
-            // We need full vertex detail to produce all quality levels accurately.
-            simplify_mode = SimplifyMode::ErrorBounded;
-            simplify_epsilon_override = 0.1; // effectively uncapped
         } else if (arg == "--mode" && i + 1 < argc) {
             std::string mode_str = argv[++i];
             if (mode_str == "full") {
@@ -2043,28 +1964,20 @@ static int run(int argc, char* argv[]) {
             external_postcodes_path = argv[++i];
         } else if (arg == "--prev-output" && i + 1 < argc) {
             prev_output_dir = argv[++i];
-        } else if (arg == "--arcs-out" && i + 1 < argc) {
-            arcs_out_dir = argv[++i];
-        } else if (arg == "--prev-arcs" && i + 1 < argc) {
-            prev_arcs_dir = argv[++i];
         } else {
             input_files.push_back(arg);
         }
     }
+    // The mode dirs hold no admin geometry: a client reads them beside a
+    // boundary tier, without which none of them would load (only
+    // admin-minimal, which holds its own arcs, would).
+    if (multi_output && !multi_quality) {
+        std::cerr << "Error: --multi-output needs --multi-quality: its mode dirs (full, no-addresses, admin) hold no "
+                     "admin geometry, which a client reads from a boundary tier (quality/simplified or quality/exact)"
+                  << std::endl;
+        return 1;
+    }
     require_new_or_empty_output_dir(output_dir);
-    {
-        std::vector<std::string> regions = {"planet"};
-        if (generate_continents)
-            for (size_t c = 0; c < kContinentCount; c++) regions.push_back(kContinents[c].name);
-        require_arc_dirs(output_dir, arcs_out_dir, prev_arcs_dir, regions);
-    }
-
-    // Set global simplification mode
-    kSimplifyMode = simplify_mode;
-    kSimplifyEpsilonOverride = simplify_epsilon_override;
-    if (simplify_mode == SimplifyMode::ErrorBounded) {
-        std::cerr << "Simplification: error-bounded, fixed " << simplify_epsilon_override << "m epsilon" << std::endl;
-    }
 
     ParsedData data;
     auto _pt = std::chrono::steady_clock::now();
@@ -2107,7 +2020,7 @@ static int run(int argc, char* argv[]) {
     }
 
     unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency() - 1);
-    BuildConfig cfg{num_threads, mode, multi_output, multi_quality, output_dir, prev_output_dir, arcs_out_dir, prev_arcs_dir};
+    BuildConfig cfg{num_threads, mode, multi_output, multi_quality, output_dir, prev_output_dir};
     {
         // Parse PBF files (always collect everything)
         if (input_files.empty()) {
@@ -2121,7 +2034,7 @@ static int run(int argc, char* argv[]) {
             tiger_csvs = std::async(std::launch::async, find_tiger_csvs, tiger_data_path);
 
         std::cerr << "Using " << num_threads << " worker threads." << std::endl;
-        // The candidate map's cells of each input's admin polygons, covered
+        // The exact tier's admin cells of each input's admin polygons, covered
         // beside the rest of the work (admin_candidate_cells).
         std::vector<std::future<std::vector<CellItemPair>>> admin_cells_pending;
 
@@ -3864,92 +3777,18 @@ static int run(int argc, char* argv[]) {
                     }
                     uint64_t total_admin_rings = all_admin_results.size();
 
-                    // Parallel simplification: the expensive work (normalize, simplify,
-                    // compute area) is done per-polygon with no shared state.
-                    struct PreparedPolygon {
-                        std::vector<std::pair<double,double>> simplified;  // keyhole range
-                        uint16_t hole_count = 0;
-                        uint8_t halvings = 0;  // SimplifiedRings::halvings
-                        bool nests = true;
-                        // The exact rings, rotated as canonicalize_ring_rotation puts them.
-                        std::vector<PackedLocation> outer;
-                        std::vector<std::vector<PackedLocation>> holes;
-                        std::string name;
-                        uint8_t admin_level;
-                        std::string country_code;
-                        uint8_t place_type_override;
-                        int64_t relation_id;
-                        uint16_t ring_index;
-                    };
-                    std::vector<PreparedPolygon> prepared(total_admin_rings);
-                    {
-                        const std::vector<uint32_t> rings_largest_first = costliest_first(total_admin_rings,
-                            [&](size_t i) { return all_admin_results[i].vertices.size(); }, num_threads);
-                        std::atomic<size_t> prep_idx{0};
-                        std::vector<std::thread> prep_workers;
-                        for (unsigned int t = 0; t < num_threads; t++) {
-                            prep_workers.emplace_back([&]() {
-                                while (true) {
-                                    size_t k = prep_idx.fetch_add(1);
-                                    if (k >= total_admin_rings) break;
-                                    size_t i = rings_largest_first[k];
-                                    auto& ar = all_admin_results[i];
-                                    auto& pp = prepared[i];
-
-                                    // Normalize ring rotation
-                                    canonicalize_ring_rotation(ar.vertices);
-                                    std::vector<std::vector<LatLng>> holes;
-                                    holes.reserve(ar.holes.size());
-                                    for (auto& hole : ar.holes) {
-                                        canonicalize_ring_rotation(hole);
-                                        holes.push_back(unpack_ring(hole));
-                                    }
-
-                                    SimplifiedRings s = simplify_rings(unpack_ring(ar.vertices), holes,
-                                        [&](const std::vector<std::pair<double,double>>& ring, double scale) {
-                                            return simplify_admin_polygon(ring, ar.admin_level, scale);
-                                        });
-                                    pp.simplified = std::move(s.range);
-                                    pp.hole_count = s.holes;
-                                    pp.halvings = s.halvings;
-                                    pp.nests = s.nests;
-                                    pp.outer = std::move(ar.vertices);
-                                    pp.holes = std::move(ar.holes);
-                                    pp.name = std::move(ar.name);
-                                    pp.admin_level = ar.admin_level;
-                                    pp.country_code = std::move(ar.country_code);
-                                    pp.place_type_override = ar.place_type_override;
-                                    pp.relation_id = ar.relation_id;
-                                    pp.ring_index = ar.ring_index;
-                                }
-                            });
-                        }
-                        for (auto& w : prep_workers) w.join();
-                    }
-                    all_admin_results.clear();
-                    {
-                        HoleTopologyCounts topology;
-                        for (const auto& pp : prepared) topology.add(pp.halvings, pp.nests);
-                        std::cerr << "  Admin hole topology: " << topology.summary() << std::endl;
-                    }
-                    log_phase("    Admin: parallel simplify", _pt, _cpu);
-
-                    // Append the rings of 3+ vertices, in order, on every core,
-                    // with their exact rings: a loop appending them one by one
-                    // took one core seconds.
-                    const std::vector<uint32_t> kept = parallel_filter(prepared.size(),
-                        [&](size_t i) { return prepared[i].simplified.size() >= 3; }, num_threads);
-                    std::vector<std::string_view> names(kept.size());
-                    for (size_t k = 0; k < kept.size(); k++) names[k] = prepared[kept[k]].name;
+                    // Append every assembled polygon, in order, with its exact rings,
+                    // each rotated as canonicalize_ring_rotation puts it, on every core:
+                    // a loop appending them one by one took one core seconds.
+                    std::vector<std::string_view> names(all_admin_results.size());
+                    for (size_t k = 0; k < all_admin_results.size(); k++) names[k] = all_admin_results[k].name;
                     const std::vector<uint32_t> name_ids = data.string_pool.intern_all(names, num_threads);
-                    const std::vector<size_t> vertex_at = parallel_offsets<size_t>(kept.size(),
-                        [&](size_t k) { return prepared[kept[k]].simplified.size(); }, num_threads);
-                    const std::vector<size_t> ring_at = parallel_offsets<size_t>(kept.size(),
-                        [&](size_t k) { return 1 + prepared[kept[k]].holes.size(); }, num_threads);
-                    const std::vector<size_t> exact_at = parallel_offsets<size_t>(kept.size(), [&](size_t k) {
-                        const auto& pp = prepared[kept[k]];
-                        size_t n = pp.outer.size();
-                        for (const auto& h : pp.holes) n += h.size();
+                    const std::vector<size_t> ring_at = parallel_offsets<size_t>(all_admin_results.size(),
+                        [&](size_t k) { return 1 + all_admin_results[k].holes.size(); }, num_threads);
+                    const std::vector<size_t> exact_at = parallel_offsets<size_t>(all_admin_results.size(), [&](size_t k) {
+                        const auto& ar = all_admin_results[k];
+                        size_t n = ar.vertices.size();
+                        for (const auto& h : ar.holes) n += h.size();
                         return n;
                     }, num_threads);
                     AdminExactRings& exact = data.admin_exact_rings;
@@ -3957,40 +3796,31 @@ static int run(int argc, char* argv[]) {
                         throw std::logic_error("admin exact rings out of step with the polygons");
                     if (exact.vertices.size() + exact_at.back() > UINT32_MAX || exact.rings.size() + ring_at.back() > UINT32_MAX)
                         throw std::length_error("admin exact rings past 2^32 vertices or rings");
-                    const size_t poly_base = grow_by(data.admin_polygons, kept.size());
-                    const size_t vertex_base = grow_by(data.admin_vertices, vertex_at.back());
-                    grow_by(data.admin_osm_ids, kept.size());
-                    grow_by(exact.polygons, kept.size());
+                    const size_t poly_base = grow_by(data.admin_polygons, all_admin_results.size());
+                    grow_by(data.admin_osm_ids, all_admin_results.size());
+                    grow_by(exact.polygons, all_admin_results.size());
                     const size_t ring_base = grow_by(exact.rings, ring_at.back());
                     const size_t exact_base = grow_by(exact.vertices, exact_at.back());
-                    parallel_for(kept.size(), [&](size_t begin, size_t end, unsigned) {
+                    parallel_for(all_admin_results.size(), [&](size_t begin, size_t end, unsigned) {
                         for (size_t k = begin; k < end; k++) {
-                            auto& pp = prepared[kept[k]];
-                            uint32_t vertex_offset = static_cast<uint32_t>(vertex_base + vertex_at[k]);
-                            for (size_t v = 0; v < pp.simplified.size(); v++) {
-                                const auto& [lat, lng] = pp.simplified[v];
-                                data.admin_vertices[vertex_offset + v] = {static_cast<float>(lat), static_cast<float>(lng)};
-                            }
-
+                            auto& pp = all_admin_results[k];
                             uint32_t ring = static_cast<uint32_t>(ring_base + ring_at[k]);
                             size_t at = exact_base + exact_at[k];
                             exact.polygons[poly_base + k] = {ring, static_cast<uint32_t>(1 + pp.holes.size())};
                             auto put = [&](std::vector<PackedLocation>& r) {
+                                canonicalize_ring_rotation(r);
                                 exact.rings[ring++] = {static_cast<uint32_t>(at), static_cast<uint32_t>(r.size())};
                                 at = std::copy(r.begin(), r.end(), exact.vertices.begin() + at) - exact.vertices.begin();
                                 std::vector<PackedLocation>().swap(r);
                             };
-                            put(pp.outer);
+                            put(pp.vertices);
                             for (auto& h : pp.holes) put(h);
 
                             AdminPolygon poly{};
-                            poly.vertex_offset = vertex_offset;
-                            poly.vertex_count = static_cast<uint32_t>(pp.simplified.size());
                             poly.name_id = name_ids[k];
                             poly.admin_level = pp.admin_level;
                             poly.place_type_override = pp.place_type_override;
                             poly.area = exact.area(static_cast<uint32_t>(poly_base + k));
-                            poly.hole_count = pp.hole_count;
                             const char* cc = pp.country_code.empty() ? nullptr : pp.country_code.c_str();
                             poly.country_code = (cc && cc[0] && cc[1])
                                 ? pack_country_code(cc[0], cc[1]) : 0;
@@ -4004,9 +3834,9 @@ static int run(int argc, char* argv[]) {
                             // The type byte keeps relation ids from colliding
                             // with closed-way ids (which use OSM_WAY + way_id).
                             data.admin_osm_ids[poly_base + k] = admin_ring_id(pp.relation_id, pp.ring_index);
-                            std::vector<std::pair<double,double>>().swap(pp.simplified);
                         }
                     }, num_threads);
+                    all_admin_results.clear();
                     admin_cells_pending.push_back(std::async(std::launch::async,
                         [&exact, from = first_admin, to = static_cast<uint32_t>(data.admin_polygons.size()), num_threads] {
                             return admin_candidate_cells(exact, from, to, num_threads);
@@ -4254,9 +4084,7 @@ static int run(int argc, char* argv[]) {
         log_mem("data.addr_cells",                   vec_bytes(data.addr_cells));
         log_mem("data.admin_polygons",               vec_bytes(data.admin_polygons));
         log_mem("data.admin_osm_ids",                vec_bytes(data.admin_osm_ids));
-        log_mem("data.admin_vertices",               vec_bytes(data.admin_vertices));
         log_mem("data.admin_exact_rings.vertices",   vec_bytes(data.admin_exact_rings.vertices));
-        log_mem("data.cell_to_admin (approx)",       map_bytes_approx(data.cell_to_admin));
         log_mem("data.admin_parent_ids",             vec_bytes(data.admin_parent_ids));
         log_mem("data.poi_records",                  vec_bytes(data.poi_records));
         log_mem("data.poi_osm_ids",                  vec_bytes(data.poi_osm_ids));
@@ -4283,64 +4111,59 @@ static int run(int argc, char* argv[]) {
 
         log_phase("    Release + shrink parsed data", _pt, _cpu);
 
-        // The largest-first sort below repacks the admin vertices into a
-        // buffer faulted in meanwhile.
-        auto admin_vertex_buffer = vector_beside<NodeCoord>(data.admin_vertices.size());
-
         std::cerr << "Waiting for the admin candidate cells..." << std::endl;
-        std::vector<CellItemPair> admin_cells;
+        std::vector<CellItemPair> exact_cells;
         for (auto& pending : admin_cells_pending) {
             std::vector<CellItemPair> cells = pending.get();
-            if (admin_cells.empty()) admin_cells = std::move(cells);
-            else admin_cells.insert(admin_cells.end(), cells.begin(), cells.end());
+            if (exact_cells.empty()) exact_cells = std::move(cells);
+            else exact_cells.insert(exact_cells.end(), cells.begin(), cells.end());
         }
         admin_cells_pending.clear();
         log_phase("    Admin: candidate cells wait", _pt, _cpu);
-        data.cell_to_admin = admin_candidate_map(std::move(admin_cells), num_threads);
-        log_phase("    Admin: candidate map", _pt, _cpu);
-        std::cerr << "Admin candidate map complete (" << data.cell_to_admin.size() << " cells)." << std::endl;
 
-        if (!cfg.arcs_out_dir.empty()) {
+        // The arcs, which every admin dir's geometry is, and the admin cell
+        // index over their tiers, which the links read too.
+        if (!data.admin_polygons.empty()) {
             std::vector<bool> in_minimal(data.admin_polygons.size());
             for (size_t p = 0; p < in_minimal.size(); p++)
                 in_minimal[p] = admin_minimal_keeps(data.admin_polygons[p].admin_level,
                                                     data.admin_polygons[p].place_type_override);
             const AdminArcs arcs = build_admin_arcs(data.admin_exact_rings, in_minimal,
-                                                    cfg.prev_arcs_dir.empty() ? "" : cfg.prev_arcs_dir + "/planet",
+                                                    cfg.prev_output_dir.empty() ? "" : cfg.prev_output_dir + "/planet",
                                                     num_threads);
             data.admin_arcs = encode_admin_arcs(arcs, data.admin_exact_rings, num_threads);
             log_phase("    Admin: arcs", _pt, _cpu);
+            compute_admin_index_cells(data, arcs, std::move(exact_cells), num_threads);
+            log_phase("    Admin: index cells", _pt, _cpu);
         }
 
-        // Sort admin polygons largest-first (by vertex count descending).
-        // This ensures the work-stealing loops in S2 computation and quality
-        // variant simplification process expensive polygons first, avoiding
-        // stragglers at the end.
+        // Sort admin polygons largest-first (by their exact rings' vertex
+        // occurrences, descending). This ensures the work-stealing loops of
+        // the links process expensive polygons first, avoiding stragglers at
+        // the end.
         {
             size_t n = data.admin_polygons.size();
+            std::vector<uint64_t> occurrences(n);
+            parallel_for(n, [&](size_t b, size_t e, unsigned) {
+                for (size_t p = b; p < e; p++) occurrences[p] = data.admin_exact_rings.occurrences(static_cast<uint32_t>(p));
+            }, num_threads);
             std::vector<uint32_t> order(n);
             std::iota(order.begin(), order.end(), 0u);
-            std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
-                return data.admin_polygons[a].vertex_count > data.admin_polygons[b].vertex_count;
-            });
+            std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return occurrences[a] > occurrences[b]; });
 
-            // Reorder polygons, vertices and admin_osm_ids in lockstep.
-            // admin_osm_ids is a parallel array (slot i is the stable
-            // osm-id of admin_polygons[i]); failing to permute it here
-            // leaves the sidecar misaligned from the polygon array, so the
-            // canonical sort below and strategy-2 (which match by osm-id)
-            // attach the wrong stable id to each polygon → non-deterministic
-            // sidecar + massive admin churn on chained builds.
+            // Reorder polygons, their exact and arc rings, cell index entries
+            // and admin_osm_ids in lockstep. admin_osm_ids is a parallel array
+            // (slot i is the stable osm-id of admin_polygons[i]); failing to
+            // permute it here leaves the sidecar misaligned from the polygon
+            // array, so the canonical sort below and strategy-2 (which match by
+            // osm-id) attach the wrong stable id to each polygon →
+            // non-deterministic sidecar + massive admin churn on chained builds.
             // (admin_parent_ids / way_parent_ids / poi+place parent_poly_id
             // are all computed AFTER this sort, so they need no remap here.)
-            const std::vector<uint32_t> old_to_new =
-                permute_admin_polygons(data, order, num_threads, admin_vertex_buffer.get());
-
-            remap_admin_candidates(data, old_to_new, num_threads);
+            permute_admin_polygons(data, order, num_threads);
             std::cerr << "Sorted admin polygons largest-first (" << n << " polygons)." << std::endl;
         }
 
-        order_admin_candidates(data, num_threads);
         log_phase("Admin polygon order", _pt, _cpu);
 
         link_places_by_name(data, cfg, _pt, _cpu);
@@ -4393,8 +4216,6 @@ static int run(int argc, char* argv[]) {
             data.sorted_addr_cells = sorted_item_cells(data.addr_cells);
             std::vector<uint64_t>().swap(data.addr_cells);
             log_phase("    Sort: addr cell pairs", _dt, _dc);
-            deduplicate(data.cell_to_admin);
-            log_phase("    Dedup: admin cells", _dt, _dc);
         }
     }
 
@@ -4402,7 +4223,7 @@ static int run(int argc, char* argv[]) {
     reorder_deterministically(data, std::move(poi_elevations), std::move(poi_qids), std::move(sitelinks_data));
 
     // --- Write index files ---
-    write_all_index_files(data, cfg, quality_scales, generate_continents, _pt, _cpu);
+    write_all_index_files(data, cfg, generate_continents, _pt, _cpu);
 
     std::cerr << "Done." << std::endl;
     return 0;

@@ -10,7 +10,10 @@
 #include <random>
 #include <vector>
 
+#include "admin_arcs.h"
+#include "cell_index.h"
 #include "cell_walk.h"
+#include "country_code.h"
 #include "s2_helpers.h"
 #include "test_framework.h"
 
@@ -27,7 +30,7 @@ Ring closed(Ring vertices) {
 }
 
 // Admin polygons as the build leaves them: records, exact rings, osm ids,
-// and the candidate map over them.
+// and the admin cell index over their arcs' tiers.
 struct Admins {
     ParsedData data;
 
@@ -45,8 +48,8 @@ struct Admins {
 
     void map() {
         const uint32_t n = static_cast<uint32_t>(data.admin_polygons.size());
-        data.cell_to_admin = admin_candidate_map(admin_candidate_cells(data.admin_exact_rings, 0, n, 1), 1);
-        order_admin_candidates(data, 1);
+        const AdminArcs arcs = build_admin_arcs(data.admin_exact_rings, std::vector<bool>(n, false), "", 1);
+        compute_admin_index_cells(data, arcs, admin_candidate_cells(data.admin_exact_rings, 0, n, 1), 1);
     }
 
     void add_poi(float lat, float lng) {
@@ -76,9 +79,8 @@ struct Admins {
     }
 
     bool listed(PackedLocation p, uint32_t pid) const {
-        auto it = data.cell_to_admin.find(admin_link_cell(p).id());
-        return it != data.cell_to_admin.end() &&
-               std::any_of(it->second.begin(), it->second.end(), [&](uint32_t id) { return (id & ID_MASK) == pid; });
+        const auto [first, last] = admin_cell_entries(data.admin_index_cells, admin_link_cell(p).id());
+        return std::any_of(first, last, [&](const CellItemPair& e) { return (e.item_id & ID_MASK) == pid; });
     }
 };
 
@@ -160,6 +162,30 @@ TEST(a_streets_postcode_is_the_postal_polygon_holding_most_of_its_vertices_where
     }
 }
 
+TEST(a_point_finds_no_country_where_only_its_simplified_rings_reach_its_cell) {
+    // A country round the corner (0, 0), where the cells south of the
+    // equator and east of Greenwich begin at every level: its exact rings
+    // keep 6.7 m from that cell, round a notch north-west of the corner
+    // that the simplified tier cuts across the cell. A point in the cell,
+    // outside every country, has none, though a list of only that country
+    // would hand it the country.
+    Admins a;
+    const uint32_t country =
+        a.add(2, closed({at(-0.002, -0.01), at(-0.002, -0.00006), at(0.0002, -0.0002), at(0.00006, 0.00009),
+                         at(0.00006, 0.01), at(0.01, 0.01), at(0.01, -0.01)}));
+    a.data.admin_polygons[country].country_code = pack_country_code('C', 'H');
+    a.map();
+    const PackedLocation p = at(-0.005, 0.005);
+    REQUIRE(a.listed(p, country));  // by the simplified tier
+    const auto exact = admin_candidate_cells(a.data.admin_exact_rings, 0, 1, 1);
+    REQUIRE(std::none_of(exact.begin(), exact.end(), [&](const CellItemPair& e) {
+        return e.cell_id == admin_link_cell(p).id();
+    }));
+    const AdminRings countries = border_country_rings(a.data, 1);
+    CHECK_EQ(country_code_at_point(a.data, countries, p.lat(), p.lon()), uint16_t(0));
+    CHECK_EQ(country_code_at_point(a.data, countries, 0.005, -0.005), pack_country_code('C', 'H'));
+}
+
 TEST(admin_candidates_are_the_same_for_any_rotation_or_direction_of_the_rings) {
     std::mt19937_64 rng(27);
     std::uniform_real_distribution<double> unit(0, 1);
@@ -184,7 +210,9 @@ TEST(admin_candidates_are_the_same_for_any_rotation_or_direction_of_the_rings) {
             Admins a;
             a.add(4, o, {h});
             a.map();
-            return a.data.cell_to_admin;
+            std::vector<std::pair<uint64_t, uint32_t>> entries;
+            for (const CellItemPair& e : a.data.admin_index_cells) entries.push_back({e.cell_id, e.item_id});
+            return entries;
         };
         const auto base = candidates(outer, hole);
         cells += base.size();

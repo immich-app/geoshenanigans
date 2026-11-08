@@ -7,7 +7,7 @@
 // Nothing is held beyond the buffers, the unit in flight and the queues' skew. A unit held whole is
 // bounded by the format (a way <= 65535 nodes, an abs2 address footprint <= 69999 vertices; a
 // footprint escaped raw, of any size, is copied through in pieces) or, for a polygon block, by
-// big_block() (256 KiB): larger admin and POI blocks go plane by plane through positional
+// big_block() (256 KiB): larger POI blocks go plane by plane through positional
 // readers / writers (a POI encoder lays the planes out for a closed ring and moves them in the
 // file when the last vertex shows the ring is open).
 #pragma once
@@ -1183,7 +1183,7 @@ struct Enc : Encoder {
 };
 }  // namespace addr
 
-// ------------------------------------------------------------------ admin layout B, POI R3 + B-open
+// ------------------------------------------------------------------ POI R3 + B-open
 namespace poly {
 static inline uint32_t zzw(uint32_t d, int bits) {  // d: wrapped delta in [0, 2^bits)
     const int64_t full = bits == 32 ? 0x100000000LL : (1LL << bits);
@@ -1223,201 +1223,7 @@ static void planes_dec(const uint8_t* src, uint8_t* dst, uint64_t c, int w) {
     }
 }
 
-// The next polygon of an admin_polygons.bin with vertices: offset and count; false at the end.
-struct PolyCursor {
-    std::unique_ptr<Reader> r;
-    uint64_t n = 0;
-    explicit PolyCursor(const std::string& path) {
-        r.reset(new Reader(path, 24 << 10));
-        if (r->size() % 24) die("admin_polygons.bin size");
-    }
-    bool next(uint64_t& off, uint64_t& cnt) {
-        while (!r->eof()) {
-            const uint8_t* p = r->take(24);
-            const uint32_t vo = rd32(p), vc = rd32(p + 4);
-            if (vc > 0 && vo != NO) {
-                off = vo;
-                cnt = vc;
-                n++;
-                return true;
-            }
-        }
-        return false;
-    }
-};
-
 static const size_t VERTS_PER_STEP = 8192;
-
-// admin_vertices.B -> admin_vertices.bin (port 0). The polygons come in offset order (the sort step's
-// admin_polygons.bin is; a gap or overlap fails). A big block is read plane by plane.
-struct AdminDec : Decoder {
-    PolyCursor pc;
-    std::unique_ptr<Reader> R;
-    std::vector<std::unique_ptr<Reader>> pl;  // big block: its 2w planes
-    std::vector<uint8_t> blk;
-    uint64_t pos = 0, big_cnt = 0, big_k = 0, big_end = 0;
-    int big_w = 0;
-    uint32_t prev[2] = {0, 0};
-    std::string bpath;
-    AdminDec(const std::string& src) : Decoder("admin", {"admin_vertices.bin"}), pc(src + "/admin_polygons.bin") {
-        bpath = src + "/admin_vertices.B";
-        R.reset(new Reader(bpath));
-    }
-    uint64_t decoded_size(int) const override { return R->size(); }
-    bool step() override {
-        if (!pl.empty()) {  // inside a big block
-            const uint64_t k = std::min<uint64_t>(VERTS_PER_STEP, big_cnt - big_k);
-            const int w = big_w;
-            const uint64_t mask = wmask(w);
-            uint8_t* o = emit_reserve(0, size_t(k) * 2 * size_t(w));
-            for (uint64_t j = 0; j < k; j++)
-                for (int comp = 0; comp < 2; comp++) {
-                    uint32_t z = 0;
-                    for (int b = 0; b < w; b++) z |= uint32_t(pl[size_t(comp * w + b)]->u8()) << (8 * b);
-                    const uint32_t q = uint32_t((uint64_t(prev[comp]) + unzz(z)) & mask);
-                    for (int b = 0; b < w; b++) o[j * 2 * size_t(w) + size_t(comp * w + b)] = uint8_t(q >> (8 * b));
-                    prev[comp] = q;
-                }
-            big_k += k;
-            if (big_k == big_cnt) {
-                pl.clear();
-                R->seek(big_end);
-            }
-            return true;
-        }
-        uint64_t off, cnt;
-        if (!pc.next(off, cnt)) {
-            if (!R->eof()) die("admin_vertices: bytes after the last polygon");
-            return false;
-        }
-        if (off != pos) die("admin_vertices: gap or overlap at offset %llu (expected %llu)", (unsigned long long)off, (unsigned long long)pos);
-        const uint8_t e = *R->need(1);
-        if (e > 3) die("admin_vertices: bad encoding %u", e);
-        const int w = e == 3 ? 4 : 2;
-        const size_t size = R->unit_size(10, cnt, 2 * uint64_t(w));
-        pos += size;
-        if (size <= big_block()) {
-            const uint8_t* s = R->take(size);
-            uint8_t* o = emit_reserve(0, size);
-            memcpy(o, s, 10);
-            planes_dec(s + 10, o + 10, cnt, w);
-            return true;
-        }
-        emit(0, R->take(10), 10);
-        const uint64_t base = R->tell();
-        for (int j = 0; j < 2 * w; j++)
-            pl.emplace_back(new Reader(bpath, PLANE_BUF, base + uint64_t(j) * cnt, base + uint64_t(j + 1) * cnt));
-        big_cnt = cnt;
-        big_k = 0;
-        big_w = w;
-        big_end = base + 2 * uint64_t(w) * cnt;
-        prev[0] = prev[1] = 0;
-        return true;
-    }
-};
-
-// admin_vertices.bin (port 0) -> admin_vertices.B, with the new admin_polygons.bin (the patcher has
-// written it before admin_vertices.bin starts). A big block is written plane by plane.
-struct AdminEnc : Encoder {
-    std::unique_ptr<PolyCursor> pc;
-    int fd = -1;
-    std::unique_ptr<Writer> W;
-    std::vector<std::unique_ptr<Writer>> pl;
-    std::vector<uint8_t> blk;
-    std::string path;
-    bool in_poly = false, done = false;
-    uint64_t pos = 0, cnt = 0, k = 0, size = 0;
-    int w = 0;
-    uint32_t prev[2] = {0, 0};
-    explicit AdminEnc(const std::string& od) : Encoder("admin", od, 1) {
-        path = od + "/admin_vertices.B";
-        if (unlink(path.c_str()) && errno != ENOENT) die("unlink %s", path.c_str());
-        fd = open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-        if (fd < 0) die("create %s", path.c_str());
-    }
-    ~AdminEnc() override {
-        if (fd >= 0) close(fd);
-    }
-    void pump() override {
-        if (!pc) pc.reset(new PolyCursor(out_dir + "/admin_polygons.bin"));
-        ByteQueue& q = in[0];
-        for (;;) {
-            if (!in_poly) {
-                if (q.size() < 1) return;
-                uint64_t off;
-                if (!pc->next(off, cnt)) die("admin_vertices: bytes after the last polygon");
-                if (off != pos) die("admin_vertices: gap or overlap at offset %llu (expected %llu)", (unsigned long long)off,
-                                    (unsigned long long)pos);
-                const uint8_t e = q.data()[0];
-                if (e > 3) die("admin_vertices: bad encoding %u", e);
-                w = e == 3 ? 4 : 2;
-                size = unit_size(0, 10, cnt, 2 * uint64_t(w));
-                in_poly = true;
-                k = 0;
-            }
-            if (size <= big_block()) {
-                if (q.size() < size) return;
-                blk.resize(size);
-                memcpy(blk.data(), q.data(), 10);
-                planes_enc(q.data() + 10, blk.data() + 10, cnt, w);
-                W_put(blk.data(), size);
-                q.pop(size);
-                pos += size;
-                in_poly = false;
-                continue;
-            }
-            if (pl.empty() && k == 0) {  // big block: header, then plane writers at their offsets
-                if (q.size() < 10) return;
-                W_put(q.data(), 10);
-                q.pop(10);
-                for (int j = 0; j < 2 * w; j++)
-                    pl.emplace_back(new Writer(fd, path, pos + 10 + uint64_t(j) * cnt, PLANE_BUF));
-                prev[0] = prev[1] = 0;
-            }
-            const size_t vs = 2 * size_t(w);
-            const uint64_t avail = std::min<uint64_t>(q.size() / vs, cnt - k);
-            const uint64_t mask = wmask(w);
-            const uint8_t* s = q.data();
-            for (uint64_t j = 0; j < avail; j++)
-                for (int comp = 0; comp < 2; comp++) {
-                    const uint32_t v = getw(s + j * vs + size_t(comp * w), w);
-                    const uint32_t z = zzw(uint32_t((uint64_t(v) - prev[comp]) & mask), 8 * w);
-                    for (int b = 0; b < w; b++) pl[size_t(comp * w + b)]->u8(uint8_t(z >> (8 * b)));
-                    prev[comp] = v;
-                }
-            q.pop(size_t(avail) * vs);
-            k += avail;
-            if (k < cnt) return;
-            for (auto& x : pl) x->finish();
-            pl.clear();
-            pos += size;
-            in_poly = false;
-            W_skip_to(pos);
-        }
-    }
-    // The block writer: sequential at pos (a big block's planes go around it).
-    void W_put(const uint8_t* p, size_t n) {
-        if (!W) W.reset(new Writer(fd, path, 0, WRITE_BUF));
-        W->put(p, n);
-    }
-    void W_skip_to(uint64_t at) {
-        if (!W) W.reset(new Writer(fd, path, 0, WRITE_BUF));
-        W->skip_to(at);
-    }
-    void finish(Manifest& m) override {
-        require_empty();
-        if (!pc) pc.reset(new PolyCursor(out_dir + "/admin_polygons.bin"));
-        if (in_poly) die("admin_vertices: stream ends inside a polygon");
-        uint64_t off, c;
-        if (pc->next(off, c)) die("admin_vertices: stream ends before the last polygon");
-        if (W) W->finish();
-        W.reset();
-        const int f = fd;
-        fd = -1;
-        if (close(f)) die("close %s", path.c_str());
-        m.set("admin.polygons", pc->n);
-    }
-};
 
 // Ports: 0 = poi_records (36 B), 1 = poi_vertices. A step: one record and its block, or a piece of a
 // big block (read plane by plane).

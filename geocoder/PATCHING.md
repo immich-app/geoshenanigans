@@ -15,9 +15,9 @@ builds/
       admin-minimal/   ...
       admin-minimal-poi/ ...
       quality/
-        uncapped/      admin_polygons.bin.zst + admin_vertices.bin.zst (+ postal_*.bin.zst) + patch.gcpatch
-        q0.2/          ...
-        q0.5/ … q2.5/  ...
+        simplified/    admin_polygons.bin.zst + admin_rings.bin.zst + arc_index.bin.zst
+                       + arc_vertices.bin.zst + patch.gcpatch
+        exact/         ...
       poi/
         major/         poi_*.bin.zst + strings_poi.bin.zst + strings_layout.json(.zst)
                        + poi_meta.json(.zst) + patch.gcpatch
@@ -43,8 +43,8 @@ A complete geocoder index for a given region and configuration consists of files
 | `full/` | 22 files (+4 optional) | Streets + addresses + interpolation + admin + postcodes |
 | `no-addresses/` | 14 files (+3 optional) | Streets + admin + postcodes (no address points) |
 | `admin/` | 6 files (+3 optional) | Admin cell indexes + place nodes + postcodes |
-| `admin-minimal/` | 7 files | Admin levels 2-8 + place nodes, with its own q2.5 polygons (takes the place of the quality dir, so pick q2.5) and only the core strings its records name. For POI tier `none` |
-| `admin-minimal-poi/` | 7 files | The same, on the shared polygon slots and core strings that a POI tier's parent polygons and names point into (a dropped polygon's slot holds a tombstone). The admin-minimal mode's dir beside a POI tier |
+| `admin-minimal/` | 9 files | Admin levels 2-8 + place nodes, with its own polygons over the minimal arc set, simplified (takes the place of the quality dir, so pick simplified), and only the core strings its records name. For POI tier `none` |
+| `admin-minimal-poi/` | 9 files | The same, on the shared polygon slots and core strings that a POI tier's parent polygons and names point into (a dropped polygon's slot holds a tombstone), with the same arc files. The admin-minimal mode's dir beside a POI tier |
 
 Optional files are written only when the data has them; see `optional_files`
 under configurations.json below. The admin-minimal mode picks its dir by the
@@ -59,15 +59,14 @@ derives it from `place_nodes.bin` into `<dir>/derived/` (see Fresh Install).
 
 | Quality | Files | Description |
 |---------|-------|-------------|
-| `quality/uncapped/` | 2 files (+2 optional) | Full-resolution admin boundaries |
-| `quality/q0.2/` | 2 files (+2 optional) | Admin boundaries simplified at 0.2x |
-| `quality/q0.5/` | 2 files (+2 optional) | Admin boundaries simplified at 0.5x |
-| `quality/q1/` | 2 files (+2 optional) | Admin boundaries simplified at 1x |
-| `quality/q1.5/` | 2 files (+2 optional) | Admin boundaries simplified at 1.5x |
-| `quality/q2/` | 2 files (+2 optional) | Admin boundaries simplified at 2x |
-| `quality/q2.5/` | 2 files (+2 optional) | Admin boundaries simplified at 2.5x |
+| `quality/simplified/` | 4 files | Admin boundaries simplified to within 37.5 m (less for small areas), on a 1.1 m grid |
+| `quality/exact/` | 4 files | Every OSM point of every admin boundary, with nothing simplified, snapped or capped |
 
-Higher quality numbers = more simplification = smaller files = less accurate boundaries.
+Both hold the admin polygons (postcode areas among them, at level 11) as
+`admin_polygons.bin` and their rings as `admin_rings.bin`: the same bytes in
+both. Each ring is a list of refs to the arcs of `arc_index.bin` and
+`arc_vertices.bin`, the borders the polygons on either side of them share, each
+stored once; those two files are what the tiers differ in.
 
 ### POI directory (optional, pick one)
 
@@ -85,8 +84,8 @@ The entry point for all clients:
 
 ```json
 {
-  "build_version": 2,
-  "patch_version": 13,
+  "build_version": 18,
+  "patch_version": 14,
   "latest": "2026-04-10",
   "previous": "2026-04-09",
   "oldest_indexes": "2026-04-08",
@@ -116,8 +115,8 @@ files belong to each axis value), constraints, presets, and the flat
 {
   "schema_version": 1,
   "build": {
-    "version": 15,
-    "patch_version": 13,
+    "version": 18,
+    "patch_version": 14,
     "date": "2026-04-10",
     "previous": "2026-04-09",
     "built_at": "2026-04-10T09:00:14Z",
@@ -125,7 +124,7 @@ files belong to each axis value), constraints, presets, and the flat
   },
   "axes":        { "region": { ... }, "mode": { ... }, ... },
   "components":  { "mode.full": { "files": ["{region}/full/...", ... ] }, ... },
-  "constraints": [ { "when": { "mode": "admin-minimal" }, "requires": { "quality": "q2.5" } } ],
+  "constraints": [ { "when": { "mode": "admin-minimal" }, "requires": { "quality": "simplified" } } ],
   "presets":     [ { "id": "smallest", "selections": { ... } }, ... ],
   "files": {
     "planet/full/admin_cells.bin": { "size_zst": 6393328, "size_raw": 24807168, "sha256": "..." },
@@ -140,8 +139,8 @@ builds. CI splices in `build.*` and the `files` table during the
 build's compress step.
 
 A component's `optional_files` are written only when the data has them
-(`interp_postcodes.bin` in TIGER regions, `postal_*` where postal
-boundaries exist); a client skips any that are absent from `files`.
+(`interp_postcodes.bin` in TIGER regions, the postcode centroids where a
+region has postcodes); a client skips any that are absent from `files`.
 
 A component's `variants` add one more component, picked by the whole
 selection: the first variant whose `when` names the selection's value on
@@ -159,14 +158,14 @@ the `.bin` files, because the server can't load a region without them.
 1. GET builds/latest.json
 2. Choose a date >= oldest_indexes (typically use latest)
 3. GET builds/{date}/configurations.json
-4. Choose region (e.g. europe), mode (e.g. full), quality (e.g. q1), and POI tier (e.g. notable)
+4. Choose region (e.g. europe), mode (e.g. full), quality (e.g. simplified), and POI tier (e.g. notable)
 5. Download every file the selected components and the variants they pick
    list (their `files`, the `optional_files` that appear in `files`, minus
    any `replaces`), each as
    <path>.zst, decompress, and check it against its sha256:
-   - builds/{date}/europe/full/…          (24 files + up to 4 optional)
-   - builds/{date}/europe/quality/q1/…    (2 files + up to 2 optional)
-   - builds/{date}/europe/poi/notable/…   (7 files, optional)
+   - builds/{date}/europe/full/…                (22 files + up to 4 optional)
+   - builds/{date}/europe/quality/simplified/…  (4 files)
+   - builds/{date}/europe/poi/notable/…         (7 files, optional)
    The JSON files (strings_layout.json, poi_meta.json) are part of the set:
    the server can't load a region without them.
 6. Store build_version, patch_version, and date locally
@@ -202,7 +201,7 @@ copy use it as is.
 6. Apply patches in order (oldest first):
    For each date in the chain:
    - Download builds/{date}/europe/full/patch.gcpatch → apply to mode files
-   - Download builds/{date}/europe/quality/q1/patch.gcpatch → apply to quality files
+   - Download builds/{date}/europe/quality/simplified/patch.gcpatch → apply to quality files
    - Download builds/{date}/europe/poi/notable/patch.gcpatch → apply to POI files (if using POIs)
 7. Update local date to latest
 ```
@@ -236,9 +235,8 @@ Quality changes don't require patching — just download the new quality files:
 1. Download the files the quality.{new_quality} component lists for
    {current_date} (its `files` and the `optional_files` that appear in
    `files`), each as <path>.zst, decompress, and check it against its sha256
-2. Replace the local quality dir with them: admin_polygons.bin and
-   admin_vertices.bin, plus postal_polygons.bin and postal_vertices.bin
-   where the region has postal boundaries
+2. Replace the local quality dir with them: admin_polygons.bin,
+   admin_rings.bin, arc_index.bin and arc_vertices.bin
 ```
 
 ### Switching Region

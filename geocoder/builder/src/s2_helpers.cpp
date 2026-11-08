@@ -2,7 +2,6 @@
 #include "geometry.h"
 #include "country_code.h"
 #include "parallel.h"
-#include "polygon_rings.h"
 #include "segment_rect.h"
 
 #include <algorithm>
@@ -23,9 +22,6 @@
 int kStreetCellLevel = 17;
 int kAdminCellLevel = 10;
 int kMaxAdminLevel = 0;  // 0 means no filtering
-
-SimplifyMode kSimplifyMode = SimplifyMode::MaxVertices;
-double kSimplifyEpsilonOverride = 0;
 
 // --- cover_edge ---
 
@@ -144,32 +140,11 @@ static std::unique_ptr<S2Loop> ring_loop(const std::pair<double,double>* ring, s
     return loop;
 }
 
-std::vector<std::pair<S2CellId, bool>> cover_polygon(
-    const std::vector<std::pair<double,double>>& vertices, uint16_t holes) {
-    std::vector<RingSpan> rings;
-    split_rings(vertices.data(), static_cast<uint32_t>(vertices.size()), holes, rings);
-    auto outer = ring_loop(vertices.data() + rings[0].begin, rings[0].count);
+std::vector<std::pair<S2CellId, bool>> cover_polygon(const std::vector<std::pair<double,double>>& vertices) {
+    auto outer = ring_loop(vertices.data(), vertices.size());
     if (!outer) return {};
 
     S2Error error;
-    // Holes nest in the outer loop (simplify_rings keeps them nesting in the
-    // plane wherever the source rings do). A polygon S2 rejects even so
-    // (rings sharing an edge, nesting only in the plane, S2's geodesic edges
-    // bowing across, or source rings that don't nest) takes its interior
-    // flags from its outer loop alone; the reader's ring test still has the
-    // last word on a flagged cell.
-    std::unique_ptr<S2Polygon> holed;
-    if (rings.size() > 1) {
-        std::vector<std::unique_ptr<S2Loop>> loops;
-        loops.emplace_back(outer->Clone());
-        for (size_t r = 1; r < rings.size(); r++)
-            if (auto hole = ring_loop(vertices.data() + rings[r].begin, rings[r].count))
-                loops.push_back(std::move(hole));
-        holed = std::make_unique<S2Polygon>();
-        holed->set_s2debug_override(S2Debug::DISABLE);
-        holed->InitNested(std::move(loops));
-        if (holed->FindValidationError(&error)) holed.reset();
-    }
     // Validate through the polygon: for one loop of 3+ vertices
     // S2Polygon::FindValidationError runs exactly S2Loop's checks (the
     // empty-loop, orientation and nesting checks cannot fire), on the shape
@@ -181,13 +156,9 @@ std::vector<std::pair<S2CellId, bool>> cover_polygon(
     options.set_max_level(kAdminCellLevel);
     options.set_max_cells(MAX_S2_CELLS_PER_POLY);
 
-    // The cells are the outer loop's, holes and all: every quality variant
-    // and admin-minimal read this one index but simplify each hole their own
-    // way, so a hole's edge can give way to the polygon up to a tolerance
-    // inside the hole. Only the interior flags leave the holes out.
     S2RegionCoverer coverer(options);
     S2CellUnion covering = coverer.GetCovering(polygon);
-    S2CellUnion interior = coverer.GetInteriorCovering(holed ? *holed : polygon);
+    S2CellUnion interior = coverer.GetInteriorCovering(polygon);
 
     std::unordered_set<uint64_t> interior_set;
     for (const auto& cell : interior.cell_ids()) {
@@ -291,20 +262,9 @@ void add_admin_polygon(ParsedData& data,
     auto vertices = ring;
     canonicalize_ring_rotation(vertices);
 
-    auto simplified = simplify_admin_polygon(unpack_ring(vertices), admin_level);
-    if (simplified.size() < 3) return;
-
     uint32_t poly_id = static_cast<uint32_t>(data.admin_polygons.size());
-    uint32_t vertex_offset = static_cast<uint32_t>(data.admin_vertices.size());
-
-    for (const auto& [lat, lng] : simplified) {
-        data.admin_vertices.push_back({static_cast<float>(lat), static_cast<float>(lng)});
-    }
-
     AdminPolygon poly;
     memset(&poly, 0, sizeof(poly)); // zero ALL bytes including padding
-    poly.vertex_offset = vertex_offset;
-    poly.vertex_count = static_cast<uint32_t>(simplified.size());
     poly.name_id = data.string_pool.intern(name);
     poly.admin_level = admin_level;
     poly.place_type_override = place_type_override;
