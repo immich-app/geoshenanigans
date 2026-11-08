@@ -586,11 +586,18 @@ inline bool is_included_highway_full(const char* highway, const char* footway) {
 // Closed means both ends are the same e7 location. Every ring the builder
 // passes in is closed that way: the ring assemblers close a ring on equal
 // coord_key, and a closed way starts and ends at the same node.
+// canonical_ring_start is the vertex it starts the ring at: the first
+// smallest, 0 for a ring it leaves as it is.
+inline size_t canonical_ring_start(const std::vector<PackedLocation>& ring) {
+    if (ring.size() < 4 || ring.front() != ring.back()) return 0;
+    return static_cast<size_t>(std::min_element(ring.begin(), ring.end() - 1) - ring.begin());
+}
+
 inline void canonicalize_ring_rotation(std::vector<PackedLocation>& ring) {
     if (ring.size() >= 4 && ring.front() == ring.back()) {
+        const size_t start = canonical_ring_start(ring);
         ring.pop_back();
-        auto min_it = std::min_element(ring.begin(), ring.end());
-        std::rotate(ring.begin(), min_it, ring.end());
+        std::rotate(ring.begin(), ring.begin() + static_cast<std::ptrdiff_t>(start), ring.end());
         ring.push_back(ring.front());
     }
 }

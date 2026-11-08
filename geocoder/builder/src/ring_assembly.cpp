@@ -12,6 +12,7 @@ using Coords = std::vector<PackedLocation>;
 struct SubWay {
     Coords coords;
     uint8_t roles = 0;  // RingRole bit of the member way it comes from
+    int64_t way = 0;    // that way's id
 };
 
 // Whether a coordinate follows itself somewhere along the way (a node listed
@@ -38,7 +39,8 @@ uint8_t role_bit(const std::string& role) {
 
 // The ways cut at their endpoints and at every coordinate more than one way
 // (or one way twice) passes through, so sub-ways only meet at their ends.
-std::vector<SubWay> split_sub_ways(const std::vector<CoordSpan>& way_coords, const std::vector<uint8_t>& way_roles) {
+std::vector<SubWay> split_sub_ways(const std::vector<CoordSpan>& way_coords, const std::vector<uint8_t>& way_roles,
+                                   const std::vector<int64_t>& way_ids) {
     std::unordered_map<int64_t, int> coord_count;
     for (const CoordSpan& coords : way_coords)
         for (const auto& p : coords) coord_count[coord_key(p)]++;
@@ -58,12 +60,12 @@ std::vector<SubWay> split_sub_ways(const std::vector<CoordSpan>& way_coords, con
         size_t seg_start = 0;
         for (size_t i = 1; i < coords.size(); i++) {
             if (split_points.count(coord_key(coords[i])) && i > seg_start) {
-                sub_ways.push_back({Coords(coords.begin() + seg_start, coords.begin() + i + 1), way_roles[w]});
+                sub_ways.push_back({Coords(coords.begin() + seg_start, coords.begin() + i + 1), way_roles[w], way_ids[w]});
                 seg_start = i;
             }
         }
         if (seg_start < coords.size() - 1) {
-            sub_ways.push_back({Coords(coords.begin() + seg_start, coords.end()), way_roles[w]});
+            sub_ways.push_back({Coords(coords.begin() + seg_start, coords.end()), way_roles[w], way_ids[w]});
         }
     }
     return sub_ways;
@@ -131,13 +133,15 @@ std::vector<Coords> assemble_rings(
     // coord_key() from geometry.h provides coordinate hashing.
 
     std::vector<CoordSpan> way_coords;
+    std::vector<int64_t> way_ids;
     for (const auto& [way_id, role] : members) {
         if (!takes_role(roles, role)) continue;
         const auto* way = way_geoms.find(way_id);
         if (!way || way->count == 0) continue;
         way_coords.push_back(way_geoms.coords_of(*way));
+        way_ids.push_back(way_id);
     }
-    const std::vector<SubWay> sub_ways = split_sub_ways(way_coords, std::vector<uint8_t>(way_coords.size(), 0));
+    const std::vector<SubWay> sub_ways = split_sub_ways(way_coords, std::vector<uint8_t>(way_coords.size(), 0), way_ids);
 
     std::unordered_map<int64_t, std::vector<std::pair<size_t, bool>>> coord_adj;
     for (size_t i = 0; i < sub_ways.size(); i++) {
@@ -373,6 +377,7 @@ uint32_t crossing_coordinates(const std::unordered_map<int64_t, std::vector<End>
 struct Walk {
     std::vector<Coords> rings;
     std::vector<uint8_t> roles;
+    std::vector<std::vector<WayRun>> runs;
     std::vector<int32_t> ring_of;  // per sub-way: its ring, or -1
 };
 
@@ -440,12 +445,16 @@ Walk walk_rings(const std::vector<SubWay>& sub_ways, const std::unordered_map<in
             const size_t from = seen->second;
             Coords ring;
             uint8_t roles = 0;
+            std::vector<WayRun> runs;
             for (size_t k = from; k < steps.size(); k++) {
                 const SubWay& sw = sub_ways[steps[k].sub_way];
                 roles |= sw.roles;
                 const size_t skip = ring.empty() ? 0 : 1;
                 if (!steps[k].reversed) ring.insert(ring.end(), sw.coords.begin() + skip, sw.coords.end());
                 else ring.insert(ring.end(), sw.coords.rbegin() + skip, sw.coords.rend());
+                const uint32_t edges = static_cast<uint32_t>(sw.coords.size() - 1);
+                if (!runs.empty() && runs.back().way == sw.way) runs.back().edges += edges;
+                else runs.push_back({sw.way, edges});
             }
             if (ring.size() >= 4)
                 for (size_t k = from; k < steps.size(); k++) out.ring_of[steps[k].sub_way] = static_cast<int32_t>(out.rings.size());
@@ -455,6 +464,7 @@ Walk walk_rings(const std::vector<SubWay>& sub_ways, const std::unordered_map<in
             if (ring.size() < 4) continue;
             out.rings.push_back(std::move(ring));
             out.roles.push_back(roles);
+            out.runs.push_back(std::move(runs));
         }
     }
     return out;
@@ -474,6 +484,7 @@ AreaRings assemble_area_rings(const std::vector<std::pair<int64_t, std::string>>
     AreaRings out;
     std::vector<CoordSpan> way_coords;
     std::vector<uint8_t> way_roles;
+    std::vector<int64_t> way_ids;
     // osmium makes no segment of a coordinate and its repeat straight after
     // it (SegmentList::extract_segments_from_way_impl), so such repeats are
     // no coordinates rings touch at: the ways that have them are copied
@@ -491,8 +502,9 @@ AreaRings assemble_area_rings(const std::vector<std::pair<int64_t, std::string>>
         if (coords.size() < 2) continue;  // no segment
         way_coords.push_back(coords);
         way_roles.push_back(role_bit(role));
+        way_ids.push_back(way_id);
     }
-    std::vector<SubWay> sub_ways = split_sub_ways(way_coords, way_roles);
+    std::vector<SubWay> sub_ways = split_sub_ways(way_coords, way_roles, way_ids);
     out.cancelled_sub_ways = cancel_duplicate_sub_ways(sub_ways);
 
     // Sub-ways by end coordinate, in sub-way order (a closed one twice).
@@ -553,5 +565,11 @@ AreaRings assemble_area_rings(const std::vector<std::pair<int64_t, std::string>>
     }
     out.rings = std::move(walk.rings);
     out.roles = std::move(walk.roles);
+    out.runs = std::move(walk.runs);
     return out;
+}
+
+void canonicalize_ring_rotation(std::vector<PackedLocation>& ring, std::vector<WayRun>& runs) {
+    restart_way_runs(runs, canonical_ring_start(ring));
+    canonicalize_ring_rotation(ring);
 }

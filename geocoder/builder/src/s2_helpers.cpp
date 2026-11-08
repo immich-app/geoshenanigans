@@ -268,7 +268,11 @@ void add_admin_polygon(ParsedData& data,
     poly.name_id = data.string_pool.intern(name);
     poly.admin_level = admin_level;
     poly.place_type_override = place_type_override;
-    data.admin_exact_rings.append(vertices, {});
+    // Its one member way runs along the whole ring, however it is rotated.
+    std::vector<std::vector<WayRun>> runs;
+    if (osm_way_id != 0 && vertices.size() >= 2)
+        runs.push_back({{osm_way_id, static_cast<uint32_t>(vertices.size() - 1)}});
+    data.admin_exact_rings.append(vertices, {}, runs);
     poly.area = data.admin_exact_rings.area(poly_id);
     poly.country_code = (country_code && country_code[0] && country_code[1])
         ? pack_country_code(country_code[0], country_code[1])

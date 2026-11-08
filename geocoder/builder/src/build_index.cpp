@@ -3512,6 +3512,9 @@ static int run(int argc, char* argv[]) {
                         std::vector<PackedLocation> vertices;
                         // The relation's inner rings inside this outer ring.
                         std::vector<std::vector<PackedLocation>> holes;
+                        // The member ways along the outer ring's edges and each hole's (WayRun).
+                        std::vector<WayRun> runs;
+                        std::vector<std::vector<WayRun>> hole_runs;
                         std::string name;
                         uint8_t admin_level;
                         std::string country_code;
@@ -3623,6 +3626,9 @@ static int run(int argc, char* argv[]) {
                                 }
                                 std::vector<NestedPolygon<PackedLocation>> polygons =
                                     nest_rings(std::move(assembled.rings), around, depth);
+                                // Each ring's way runs, nested as it is.
+                                std::vector<NestedPolygon<WayRun>> polygon_runs =
+                                    nest_rings(std::move(assembled.runs), around, depth);
 
                                 // Diagnostic: log relations with 0 rings produced
                                 if (polygons.empty() && !rel.members.empty()) {
@@ -3710,11 +3716,19 @@ static int run(int argc, char* argv[]) {
                                 }
 
                                 uint16_t ring_idx = 0;
-                                for (auto& polygon : polygons) {
+                                for (size_t k = 0; k < polygons.size(); k++) {
+                                    auto& polygon = polygons[k];
                                     if (polygon.outer.size() >= 3) {
                                         AdminResult ar;
                                         ar.vertices = std::move(polygon.outer);
                                         ar.holes = std::move(polygon.holes);
+                                        ar.runs = std::move(polygon_runs[k].outer);
+                                        ar.hole_runs = std::move(polygon_runs[k].holes);
+                                        // Each ring rotated as canonicalize_ring_rotation puts
+                                        // it, its runs with it, here on the assembly's cores.
+                                        canonicalize_ring_rotation(ar.vertices, ar.runs);
+                                        for (size_t h = 0; h < ar.holes.size(); h++)
+                                            canonicalize_ring_rotation(ar.holes[h], ar.hole_runs[h]);
                                         ar.name = rel.name;
                                         ar.admin_level = rel.admin_level;
                                         ar.country_code = rel.country_code;
@@ -3762,9 +3776,10 @@ static int run(int argc, char* argv[]) {
                     }
                     uint64_t total_admin_rings = all_admin_results.size();
 
-                    // Append every assembled polygon, in order, with its exact rings,
-                    // each rotated as canonicalize_ring_rotation puts it, on every core:
-                    // a loop appending them one by one took one core seconds.
+                    // Append every assembled polygon, in order, with its exact rings
+                    // (each rotated as canonicalize_ring_rotation puts it) and their
+                    // way runs, on every core: a loop appending them one by one took
+                    // one core seconds.
                     std::vector<std::string_view> names(all_admin_results.size());
                     for (size_t k = 0; k < all_admin_results.size(); k++) names[k] = all_admin_results[k].name;
                     const std::vector<uint32_t> name_ids = data.string_pool.intern_all(names, num_threads);
@@ -3776,30 +3791,41 @@ static int run(int argc, char* argv[]) {
                         for (const auto& h : ar.holes) n += h.size();
                         return n;
                     }, num_threads);
+                    const std::vector<size_t> run_at = parallel_offsets<size_t>(all_admin_results.size(), [&](size_t k) {
+                        const auto& ar = all_admin_results[k];
+                        size_t n = ar.runs.size();
+                        for (const auto& h : ar.hole_runs) n += h.size();
+                        return n;
+                    }, num_threads);
                     AdminExactRings& exact = data.admin_exact_rings;
-                    if (exact.polygons.size() != data.admin_polygons.size())
+                    if (exact.polygons.size() != data.admin_polygons.size() || exact.first_run.size() != exact.rings.size())
                         throw std::logic_error("admin exact rings out of step with the polygons");
-                    if (exact.vertices.size() + exact_at.back() > UINT32_MAX || exact.rings.size() + ring_at.back() > UINT32_MAX)
-                        throw std::length_error("admin exact rings past 2^32 vertices or rings");
+                    if (exact.vertices.size() + exact_at.back() > UINT32_MAX || exact.rings.size() + ring_at.back() > UINT32_MAX ||
+                        exact.runs.size() + run_at.back() > UINT32_MAX)
+                        throw std::length_error("admin exact rings past 2^32 vertices, rings or way runs");
                     const size_t poly_base = grow_by(data.admin_polygons, all_admin_results.size());
                     grow_by(data.admin_osm_ids, all_admin_results.size());
                     grow_by(exact.polygons, all_admin_results.size());
                     const size_t ring_base = grow_by(exact.rings, ring_at.back());
+                    grow_by(exact.first_run, ring_at.back());
                     const size_t exact_base = grow_by(exact.vertices, exact_at.back());
+                    const size_t run_base = grow_by(exact.runs, run_at.back());
                     parallel_for(all_admin_results.size(), [&](size_t begin, size_t end, unsigned) {
                         for (size_t k = begin; k < end; k++) {
                             auto& pp = all_admin_results[k];
                             uint32_t ring = static_cast<uint32_t>(ring_base + ring_at[k]);
-                            size_t at = exact_base + exact_at[k];
+                            size_t at = exact_base + exact_at[k], run = run_base + run_at[k];
                             exact.polygons[poly_base + k] = {ring, static_cast<uint32_t>(1 + pp.holes.size())};
-                            auto put = [&](std::vector<PackedLocation>& r) {
-                                canonicalize_ring_rotation(r);
+                            auto put = [&](std::vector<PackedLocation>& r, std::vector<WayRun>& runs) {
+                                exact.first_run[ring] = static_cast<uint32_t>(run);
                                 exact.rings[ring++] = {static_cast<uint32_t>(at), static_cast<uint32_t>(r.size())};
                                 at = std::copy(r.begin(), r.end(), exact.vertices.begin() + at) - exact.vertices.begin();
+                                run = std::copy(runs.begin(), runs.end(), exact.runs.begin() + run) - exact.runs.begin();
                                 std::vector<PackedLocation>().swap(r);
+                                std::vector<WayRun>().swap(runs);
                             };
-                            put(pp.vertices);
-                            for (auto& h : pp.holes) put(h);
+                            put(pp.vertices, pp.runs);
+                            for (size_t h = 0; h < pp.holes.size(); h++) put(pp.holes[h], pp.hole_runs[h]);
 
                             AdminPolygon poly{};
                             poly.name_id = name_ids[k];
