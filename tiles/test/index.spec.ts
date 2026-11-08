@@ -313,6 +313,82 @@ describe('conditional requests', () => {
   });
 });
 
+describe('D1 warm-up', () => {
+  // A D1 binding that records what it is asked; a CDN hit needs nothing else from D1.
+  const recordingD1 = (run: () => Promise<unknown>) => {
+    const calls: string[] = [];
+    const database = {
+      withSession: (constraint: string) => ({
+        prepare: (query: string) => ({
+          run: () => {
+            calls.push(`${constraint}: ${query}`);
+            return run();
+          },
+        }),
+      }),
+    } as unknown as D1Database;
+    return { calls, database };
+  };
+  const seedCdn = (url: string) =>
+    caches.default.put(
+      url,
+      new Response('{}', {
+        headers: {
+          'PMTiles-Deployment-Key': env.DEPLOYMENT_KEY,
+          'Tiles-Cache-Revision': '2',
+          'Cache-Control': 'public, max-age=14400',
+        },
+      }),
+    );
+  const cdnHit = async (url: string, database: D1Database) => {
+    await seedCdn(url);
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(new IncomingRequest(url), { ...env, D1_GLOBAL: database }, ctx);
+    await waitOnExecutionContext(ctx);
+    return response;
+  };
+
+  it('answers a CDN hit without waiting for the warm-up, but keeps the request alive until it finishes', async () => {
+    let finish = () => {};
+    const pending = new Promise<void>((resolve) => (finish = resolve));
+    const { calls, database } = recordingD1(() => pending.then(() => ({ results: [], success: true, meta: {} })));
+    const url = 'https://tiles.example/v1/style/light.json?case=warmup-lifetime';
+    await seedCdn(url);
+    try {
+      const ctx = createExecutionContext();
+      const response = await worker.fetch(new IncomingRequest(url), { ...env, D1_GLOBAL: database }, ctx);
+      expect(response.status).toBe(200);
+      expect(calls).toEqual(['first-unconstrained: SELECT 1']);
+
+      let settled = false;
+      const done = waitOnExecutionContext(ctx).then(() => (settled = true));
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(settled).toBe(false);
+
+      finish();
+      await done;
+      expect(settled).toBe(true);
+    } finally {
+      finish();
+    }
+  });
+
+  it('keeps the nearby replica warm on CDN hits too', async () => {
+    const { calls, database } = recordingD1(async () => ({ results: [], success: true, meta: {} }));
+    const response = await cdnHit('https://tiles.example/v1/style/light.json?case=warmup', database);
+    expect(response.status).toBe(200);
+    expect(calls).toEqual(['first-unconstrained: SELECT 1']);
+  });
+
+  it('still serves the request when the warm-up fails', async () => {
+    const { calls, database } = recordingD1(() => Promise.reject(new Error('D1 unavailable')));
+    const response = await cdnHit('https://tiles.example/v1/style/light.json?case=warmup-fails', database);
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('{}');
+    expect(calls).toEqual(['first-unconstrained: SELECT 1']);
+  });
+});
+
 describe('TileJSON', () => {
   it("points clients at the live deployment's versioned tile URLs", async () => {
     const tileJson = { tiles: [] as string[], minzoom: 0, maxzoom: 15 } as unknown as JsonResponse;

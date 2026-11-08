@@ -10,6 +10,7 @@ import {
   MemCacheRepository,
   Metric,
   TigrisStorageRepository,
+  warmD1Replica,
 } from './repository';
 
 declare global {
@@ -325,6 +326,8 @@ export default {
       return handleD1ProxyRequest(request, workerEnv);
     }
     const deferredRepository = new CloudflareDeferredRepository(ctx);
+    // Before the cache lookup, so cache hits keep the nearby D1 replica warm too (see warmD1Replica).
+    deferredRepository.runImmediately(warmD1Replica(workerEnv.D1_GLOBAL));
     const headerProvider = new HeaderMetricsProvider();
     const influxProvider = new InfluxMetricsProvider(workerEnv.VMETRICS_API_TOKEN, env.ENVIRONMENT);
     deferredRepository.defer(() => influxProvider.flush());
