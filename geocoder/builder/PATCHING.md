@@ -184,7 +184,8 @@ keep it so:
   or has a cap it refuses past: 65,536 moved-string pairs (STRING_PAIRS_MAX), 1024 client files
   (MAX_CLIENT_FILES) of names at most 255 bytes, a record stride below 0x100
   (MAX_RECORD_STRIDE), 0xFFFFFFFE records in a merged file (FILE_RECORDS_MAX), secondary remap
-  pairs for the five remapped record files only, 0xFFFF lost and 0xFFFF gained ids per cell list,
+  pairs for the five remapped record files only, 0xFFFF ids in the lost and in the gained runs
+  over a cell of a cell list delta (v15: 8 bytes an id, so 512 KiB each, however many runs),
   a child stream at most 4 MiB ahead of its parent (MAX_DECODER_SKEW), fewer than 0xFFFF values
   in a `.dict`, and, on the `zstd` command, an 8 MiB zstd window (PATCH_ZSTD_WINDOW_LOG). The
   encoders take what they're given in pieces of at most 64 KiB (ENCODER_PIECE).
@@ -377,7 +378,7 @@ v8 data patch that day; applying the delta also needs memory for the whole
 old file (1.0 GB for poi.fst). Rebuilding costs no download and two to three
 and a half minutes of one core.
 
-## Patch Format (.gcpatch, version 14)
+## Patch Format (.gcpatch, version 15)
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
 pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
@@ -387,8 +388,8 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=14 (u32) + flags=0 (u32)
-  (a v14 patcher accepts only v14 patches; the v8 to v14 changes are marked
+Header: "GCPATCH\0" (8) + version=15 (u32) + flags=0 (u32)
+  (a v15 patcher accepts only v15 patches; the v8 to v15 changes are marked
   below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
@@ -464,10 +465,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     inserted value, DELETE skips one; then the changes overwrite positions
     of the new file. A parent sent unchanged counts as one MATCH.
   stride=0xFB: cell list delta for <name>_cells.bin + <name>_entries.bin
-    (payload_size u64, new entries size u64, n_removed u32 + [cell u64],
-    n_set u32 + [cell u64, n_lost u32, n_gained u32, lost ids, gained ids];
-    both cell lists ascending; n_lost and n_gained at most 0xFFFF, a list's
-    most ids)
+    (payload_size u64, new entries size u64, then the cell list delta from
+    the old index to the new one: see Cell List Delta below)
   otherwise (a record stride, at most 0xFF, MAX_RECORD_STRIDE): n_runs (u32)
     + n_values (u32) + runs_size (u32) + values_size (u32) + runs + values
     + n_string_fixups (u32, v12) + string_fixups_size (u32) + string fixups
@@ -555,9 +554,34 @@ Geo Entry Deltas (street / addr / interp entries): marker 0xFFFFFFF0 (u32)
   and drops out of the derived list. At most one per entries file; the
   patcher refuses another file or a second one.
 
+Cell List Delta (v15; the payload of stride=0xFB and of a Cell Index Delta):
+  runs over the ranks of the cells, every number a varint (LEB128, a u64; an
+  id's a u32). The source is the index the delta corrects (the old one, or
+  the rebuilt admin / POI index); a cell's rank is its place among its
+  index's cells.
+    n_gone + the rank of each source cell the new index doesn't hold, as the
+      gap from the rank after the previous one (the first from 0)
+    n_new + the id of each cell new to the index, as the gap from the id
+      after the previous one (the first from 0); its source list is empty
+    n_lost + runs of consecutive new-index ranks whose cells lose an id
+    n_gained + runs whose cells gain one
+  each run (start gap, length - 1, bare id << 1 | interior), sorted by
+  (start, id as the lists hold it): the start gap is the start rank less the
+  previous run's (the first from 0). A cell's new list is its source list
+  less its lost ids, merged with its gained ids; an id a cell loses or gains
+  twice (a POI index rebuilt through a remap can list an id twice) is in two
+  runs over it. The patcher walks the cells by rank, holding the ids of the
+  runs over its cell sorted by id, and refuses a lost id missing from its
+  cell, more than 0xFFFF ids lost or gained at a cell ("an active set above
+  65535 ids"), a step back (a run's (start, id) below the previous one's, or
+  a new cell the source holds), a run past the last rank, a gone rank past
+  the last source cell, and bytes after the gained runs. Before v15 each
+  changed cell travelled with its lost and gained ids (12 bytes, then 4 an
+  id), so a polygon whose boundary moved cost an id in every cell it left.
+
 Cell Index Delta: marker 0xFFFFFFF7 (u32) + file_id (u32, the entries file)
   + payload_size (u64) + the cell list delta from the rebuilt admin / POI
-  index to the new one (same layout as stride=0xFB). At most one per
+  index to the new one. At most one per
   entries file; the patcher refuses another file or a second one. (v10) One
   for every index the old or new dir holds: the patcher refuses a patch
   without the delta of an index its dir holds or the patch lists ("Patch has
