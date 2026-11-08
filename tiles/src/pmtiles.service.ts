@@ -1,6 +1,10 @@
 import { IDatabaseRepository, IMemCacheRepository, IMetricsRepository, IStorageRepository } from './interface';
 import { Directory, Entry, JsonResponse } from './pmtiles/types';
 import { fromRadix64, getJsonCacheKey, toRadix64, zxyToTileId } from './pmtiles/utils';
+import { isTile } from './request';
+
+// The directory table's row for the TileJSON metadata; every other row is a directory, keyed by its first tile ID.
+const METADATA_ROW = -1;
 
 export class DirectoryString {
   constructor(private entry: string) {}
@@ -54,70 +58,58 @@ export class DirectoryString {
 }
 
 export class PMTilesService {
-  private constructor(
+  constructor(
     private source: IStorageRepository,
     private memCache: IMemCacheRepository,
     private metrics: IMetricsRepository,
     private db: IDatabaseRepository,
+    // Added to the d1_lookup metric.
+    private lookupTags: { [key: string]: string } = {},
   ) {}
 
-  static async init(
-    source: IStorageRepository,
-    memCache: IMemCacheRepository,
-    metrics: IMetricsRepository,
-    db: IDatabaseRepository,
-  ): Promise<PMTilesService> {
-    const p = new PMTilesService(source, memCache, metrics, db);
-    const jsonCacheKey = getJsonCacheKey(source.getDeploymentKey());
-    if (memCache.get(jsonCacheKey)) {
-      return p;
-    }
-    memCache.set(jsonCacheKey, await p.getJson());
-    return p;
-  }
-
+  /**
+   * The deployment's TileJSON metadata, read from D1 once per isolate. Only the TileJSON and styles need it: tiles are
+   * served from the directory alone, so a cold isolate's tile miss makes one D1 query, not two in a row.
+   */
   private async getJson(): Promise<JsonResponse> {
     const cacheKey = getJsonCacheKey(this.source.getDeploymentKey());
     const cache = this.memCache.get<JsonResponse>(cacheKey);
     if (cache) {
-      console.log('Cache hit for JSON metadata');
       return cache;
     }
     console.log('Cache miss for JSON metadata, fetching from source');
     const query = await this.db.query(
-      `SELECT * FROM cache_entries_${this.source.getDeploymentKey()} WHERE startTileId = -1 LIMIT 1`,
+      `SELECT * FROM cache_entries_${this.source.getDeploymentKey()} WHERE startTileId = ${METADATA_ROW} LIMIT 1`,
     );
 
     if (query.error || !query.success || query.results.length === 0) {
       throw new Error('Error while looking up tile location');
     }
 
-    return JSON.parse(query.results[0].entry as string);
-  }
-
-  async getJsonResponse(version: string, url: URL): Promise<JsonResponse> {
-    const json = await this.getJson();
-    json.tiles = [
-      `${url.protocol}//` +
-        url.hostname +
-        `${url.port ? `:${url.port}` : ''}` +
-        `/v${version}` +
-        '/{z}/{x}/{y}' +
-        `.mvt?v=${this.source.getDeploymentKey()}`,
-    ];
+    const json = JSON.parse(query.results[0].entry as string) as JsonResponse;
+    this.memCache.set(cacheKey, json);
     return json;
   }
 
+  /** The TileJSON, with tile URLs under publicUrl (the worker's canonical origin) for this deployment. */
+  async getJsonResponse(version: string, publicUrl: string): Promise<JsonResponse> {
+    const json = await this.getJson();
+    const tiles = [`${publicUrl}/v${version}/{z}/{x}/{y}.mvt?v=${this.source.getDeploymentKey()}`];
+    return { ...json, tiles };
+  }
+
+  /**
+   * The tile's bytes as stored, or undefined if the data has no such tile. The directory only lists tiles the data
+   * has, so that covers zooms outside its range too, without the TileJSON's minzoom and maxzoom.
+   */
   async getTile(z: number, x: number, y: number): Promise<ReadableStream | undefined> {
     console.log('getTile', z, x, y);
-    const tileId = zxyToTileId(z, x, y);
-    const json = await this.getJson();
-
-    if (z < json.minzoom || z > json.maxzoom) {
+    if (!isTile(z, x, y)) {
       return;
     }
+    const tileId = zxyToTileId(z, x, y);
 
-    const dbLookup = await this.metrics.monitorAsyncFunction({ name: 'd1_lookup' }, (tileId) =>
+    const dbLookup = await this.metrics.monitorAsyncFunction({ name: 'd1_lookup', tags: this.lookupTags }, (tileId) =>
       this.db.query(
         `SELECT * FROM cache_entries_${this.source.getDeploymentKey()} WHERE startTileId <= ? ORDER BY startTileId DESC LIMIT 1`,
         tileId,
@@ -128,7 +120,8 @@ export class PMTilesService {
       throw new Error('Error while looking up tile location');
     }
 
-    if (!dbLookup.success || dbLookup.results.length === 0) {
+    // Before the first directory, the lookup lands on the metadata row.
+    if (!dbLookup.success || dbLookup.results.length === 0 || Number(dbLookup.results[0].startTileId) <= METADATA_ROW) {
       return;
     }
 

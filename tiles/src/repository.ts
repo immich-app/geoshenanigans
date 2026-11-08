@@ -1,5 +1,5 @@
-import { GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { Point } from '@influxdata/influxdb-client';
+import { AwsClient } from 'aws4fetch';
 import { parse as parseDomain } from 'tldts';
 import {
   AsyncFn,
@@ -14,18 +14,21 @@ import {
 } from './interface';
 import { monitorAsyncFunction } from './monitor';
 
+// Every D1 read goes to the nearest replica, without waiting for it to catch up with the primary.
+const D1_SESSION = 'first-unconstrained';
+
 export class CloudflareD1Repository implements IDatabaseRepository {
   constructor(
     private database: D1Database,
     private metrics: IMetricsRepository,
-  ) {
-    void database.withSession('first-unconstrained').prepare('SELECT 1').run();
-  }
+    // Added to each query's d1_query metric.
+    private tags: { [key: string]: string } = {},
+  ) {}
 
   async query(query: string, ...values: unknown[]) {
     const metric = Metric.create('d1_query');
     const resp = await this.database
-      .withSession('first-unconstrained')
+      .withSession(D1_SESSION)
       .prepare(query)
       .bind(...values)
       .run();
@@ -37,10 +40,24 @@ export class CloudflareD1Repository implements IDatabaseRepository {
       .addTag('served_by_primary', String(resp.meta.served_by_primary))
       .intField('rows_read', resp.meta.rows_read)
       .intField('sql_duration', resp.meta.duration)
-      .intField('count', 1);
+      .intField('count', 1)
+      .addTags(this.tags);
     this.metrics.push(metric);
 
     return resp;
+  }
+}
+
+/**
+ * Keeps the D1 read replica nearest to this colo awake. Replicas spin down soon after their last read, and while one
+ * spins back up reads go to the primary, which can be on another continent. A trivial read in the lookups' session
+ * mode, made on every request, keeps the replica they use warm. Never rejects: a failed warm-up is only logged.
+ */
+export async function warmD1Replica(database: D1Database): Promise<void> {
+  try {
+    await database.withSession(D1_SESSION).prepare('SELECT 1').run();
+  } catch (error) {
+    console.error('D1 warm-up failed', error);
   }
 }
 
@@ -56,64 +73,109 @@ export class MemCacheRepository implements IMemCacheRepository {
   }
 }
 
+export enum TigrisEndpoint {
+  T3 = 'https://t3.storage.dev',
+  FLY = 'https://fly.storage.tigris.dev',
+}
+
+// Continents where t3.storage.dev reaches Tigris faster; elsewhere fly.storage.tigris.dev does.
+const T3_CONTINENTS = new Set(['EU', 'NA', 'AS']);
+
+/** The Tigris endpoint for a request from the given continent (unknown ones get the Fly endpoint). */
+export function tigrisEndpoint(continent: string | null | undefined): TigrisEndpoint {
+  return continent && T3_CONTINENTS.has(continent) ? TigrisEndpoint.T3 : TigrisEndpoint.FLY;
+}
+
+// One signer per endpoint and key for the isolate's lifetime: it keeps the day's signing key, so a read after the
+// first is signed with one HMAC.
+const tigrisClients = new Map<string, AwsClient>();
+
+export function tigrisClient(endpoint: TigrisEndpoint, keyId: string, accessKey: string): AwsClient {
+  const cacheKey = `${endpoint}|${keyId}`;
+  let client = tigrisClients.get(cacheKey);
+  if (!client) {
+    // Retries are TigrisStorageRepository's, which lets go of each failed response.
+    client = new AwsClient({
+      accessKeyId: keyId,
+      secretAccessKey: accessKey,
+      service: 's3',
+      region: 'auto',
+      retries: 0,
+    });
+    tigrisClients.set(cacheKey, client);
+  }
+  return client;
+}
+
+// As the AWS SDK did: up to 3 attempts while Tigris answers 5xx or 429, after a jittered, doubling backoff.
+const TIGRIS_ATTEMPTS = 3;
+const TIGRIS_RETRY_BASE_MS = 100;
+
+const retryable = (status: number) => status >= 500 || status === 429;
+
+/** Reads deployment objects from the tiles bucket with SigV4-signed GETs. */
 export class TigrisStorageRepository implements IStorageRepository {
-  private client: S3Client;
+  private bucketUrl: URL;
   constructor(
-    keyId: string,
-    accessKey: string,
-    private bucketKey: string,
+    private keyId: string,
+    private accessKey: string,
+    bucketKey: string,
     private deploymentKey: string,
     private metrics: IMetricsRepository,
     private storagePrefix = '',
+    private endpoint = TigrisEndpoint.FLY,
   ) {
-    this.client = new S3Client({
-      region: 'auto',
-      credentials: {
-        accessKeyId: keyId,
-        secretAccessKey: accessKey,
-      },
-      endpoint: 'https://fly.storage.tigris.dev',
-      forcePathStyle: false,
-    });
+    // Virtual-hosted style, the bucket in the host name.
+    this.bucketUrl = new URL(endpoint);
+    this.bucketUrl.hostname = `${bucketKey}.${this.bucketUrl.hostname}`;
   }
 
-  private async getS3Object(args: { key?: string; range?: { offset: number; length: number } }) {
-    const { range } = args;
-    const metric = Metric.create('tigris_storage_get');
-    const command = new GetObjectCommand({
-      Bucket: this.bucketKey,
-      Key: `${this.storagePrefix}${this.deploymentKey}/${args.key}`,
-      Range: range ? `bytes=${range.offset}-${range.offset + range.length - 1}` : undefined,
-    });
-    const response = await this.client.send(command);
-    metric.durationField(`duration`);
-    metric.intField('count', 1);
-    this.metrics.push(metric);
-    const data = response.Body;
-    if (!data) {
-      throw new Error('Data not found for range ' + JSON.stringify(range));
+  /** GETs an object, or a range of it; the response is Tigris' last, whatever its status. */
+  private async get(key: string, range?: { offset: number; length: number }): Promise<Response> {
+    const metric = Metric.create('tigris_storage_get').addTag('endpoint', new URL(this.endpoint).hostname);
+    const path = `${this.storagePrefix}${this.deploymentKey}/${key}`.split('/').map(encodeURIComponent).join('/');
+    const url = new URL(path, this.bucketUrl).toString();
+    const headers = range ? { Range: `bytes=${range.offset}-${range.offset + range.length - 1}` } : undefined;
+    // Taken when a read is made, so that a missing key fails the read rather than the request.
+    const client = tigrisClient(this.endpoint, this.keyId, this.accessKey);
+    for (let attempt = 1; ; attempt++) {
+      const response = await fetch(await client.sign(url, { method: 'GET', headers }));
+      if (!retryable(response.status) || attempt === TIGRIS_ATTEMPTS) {
+        if (response.ok) {
+          metric.durationField('duration').intField('count', 1);
+          this.metrics.push(metric);
+        }
+        return response;
+      }
+      await response.body?.cancel();
+      await new Promise((resolve) => setTimeout(resolve, Math.random() * TIGRIS_RETRY_BASE_MS * 2 ** (attempt - 1)));
     }
-    return data;
   }
 
-  async getRange(range: { length: number; offset: number }): Promise<ArrayBuffer> {
-    const data = await this.getS3Object({ range });
-    return (await data.transformToByteArray()).buffer as ArrayBuffer;
+  // Reads are only ever handed on as streams, so a tile's bytes go from Tigris to the client as they arrive.
+  async getRangeAsStream(range: { length: number; offset: number }, key: string): Promise<ReadableStream> {
+    const response = await this.get(key, range);
+    // A 200 is the whole object, which is the range only if the range is all of it.
+    const whole =
+      response.status === 200 && range.offset === 0 && response.headers.get('Content-Length') === String(range.length);
+    if ((response.status !== 206 && !whole) || !response.body) {
+      await response.body?.cancel();
+      throw new Error(`Tigris answered a range read with ${response.status}`);
+    }
+    return response.body;
   }
 
-  async getRangeAsStream(range: { length: number; offset: number }, key?: string): Promise<ReadableStream> {
-    const data = await this.getS3Object({ range, key });
-    return data.transformToWebStream();
-  }
-
-  async get(key: string): Promise<ArrayBuffer> {
-    const data = await this.getS3Object({ key });
-    return (await data.transformToByteArray()).buffer as ArrayBuffer;
-  }
-
-  async getAsStream(key: string): Promise<ReadableStream> {
-    const data = await this.getS3Object({ key });
-    return data.transformToWebStream();
+  async getAsStream(key: string): Promise<ReadableStream | undefined> {
+    const response = await this.get(key);
+    if (response.status === 404) {
+      await response.body?.cancel();
+      return;
+    }
+    if (response.status !== 200 || !response.body) {
+      await response.body?.cancel();
+      throw new Error(`Tigris answered a read with ${response.status}`);
+    }
+    return response.body;
   }
 
   getDeploymentKey(): string {
@@ -123,6 +185,7 @@ export class TigrisStorageRepository implements IStorageRepository {
 
 export class CloudflareDeferredRepository implements IDeferredRepository {
   deferred: AsyncFn[] = [];
+  private pending: Promise<unknown>[] = [];
   constructor(private ctx: ExecutionContext) {}
 
   defer(call: AsyncFn): void {
@@ -133,9 +196,14 @@ export class CloudflareDeferredRepository implements IDeferredRepository {
     this.ctx.waitUntil(promise);
   }
 
+  waitFor(promise: Promise<unknown>): void {
+    this.pending.push(promise);
+  }
+
   runDeferred() {
+    const settled = Promise.allSettled(this.pending);
     for (const call of this.deferred) {
-      this.ctx.waitUntil(call());
+      this.ctx.waitUntil(settled.then(() => call()));
     }
   }
 }
@@ -259,26 +327,28 @@ export class Metric {
   }
 }
 
-export class CloudflareMetricsRepository implements IMetricsRepository {
-  private readonly defaultTags: { [key: string]: string };
+/** Tags for every metric of a client request: where it reached Cloudflare and which site it came from. */
+export function requestTags(request: Request<unknown, IncomingRequestCfProperties>): { [key: string]: string } {
+  // Origin is "null" from sandboxed or file:// pages, which isn't a URL.
+  const url = URL.parse(request.headers.get('origin') ?? '') ?? new URL('http://missing.url');
+  const apexDomain = parseDomain(url.hostname).domain ?? url.hostname;
+  const protocol = url.protocol;
 
+  return {
+    continent: request.cf?.continent ?? '',
+    colo: request.cf?.colo ?? '',
+    asOrg: request.cf?.asOrganization ?? '',
+    apexDomain,
+    protocol,
+  };
+}
+
+export class CloudflareMetricsRepository implements IMetricsRepository {
   constructor(
     private operationPrefix: string,
-    request: Request<unknown, IncomingRequestCfProperties>,
+    private readonly defaultTags: { [key: string]: string },
     private metricsProviders: IMetricsProviderRepository[],
-  ) {
-    const url = new URL(request.headers.get('origin') ?? 'http://missing.url');
-    const apexDomain = parseDomain(url.hostname).domain ?? url.hostname;
-    const protocol = url.protocol;
-
-    this.defaultTags = {
-      continent: request.cf?.continent ?? '',
-      colo: request.cf?.colo ?? '',
-      asOrg: request.cf?.asOrganization ?? '',
-      apexDomain,
-      protocol,
-    };
-  }
+  ) {}
 
   monitorAsyncFunction<T extends AsyncFn>(
     operation: Operation,
@@ -300,5 +370,9 @@ export class CloudflareMetricsRepository implements IMetricsRepository {
     for (const provider of this.metricsProviders) {
       provider.pushMetric(metric);
     }
+  }
+
+  scoped(operationPrefix: string, tags: { [key: string]: string }): CloudflareMetricsRepository {
+    return new CloudflareMetricsRepository(operationPrefix, { ...this.defaultTags, ...tags }, this.metricsProviders);
   }
 }

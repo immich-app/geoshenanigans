@@ -9,7 +9,7 @@ export function monitorAsyncFunction<T extends AsyncFn>(
   options: Options = {},
 ): (...args: Parameters<T>) => Promise<Awaited<ReturnType<T>>> {
   const { name: operationName, tags = {} } = operation;
-  const { monitorInvocations = true, acceptedErrors = [] } = options;
+  const { monitorInvocations = true, acceptedErrors = [], resultTags } = options;
 
   return async (...args: Parameters<T>) => {
     const metric = Metric.create(`${operationPrefix}_${operationName}`);
@@ -20,7 +20,11 @@ export function monitorAsyncFunction<T extends AsyncFn>(
     }
 
     try {
-      return await call(...args);
+      const result = await call(...args);
+      if (resultTags) {
+        metric.addTags(resultTags(result));
+      }
+      return result;
     } catch (e) {
       if (!acceptedErrors || !acceptedErrors.some((acceptedError) => e instanceof acceptedError)) {
         console.error(e, `${operationName}_errors`);
