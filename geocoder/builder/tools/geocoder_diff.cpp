@@ -1779,15 +1779,13 @@ static int run(int argc, char* argv[]) {
             throw std::runtime_error("Cell index " + prefix + " has a layout write_cell_lists can't reproduce");
         auto derived = rebuild_cells_from_remap(read_file(old_dir + cells), read_file(old_dir + entries), rm, added, removed);
         std::vector<char> payload;
-        const CellListDeltaCounts n =
-            append_cell_list_delta(payload, parse_cell_lists(derived.cells_data, derived.entries_data), new_lists);
+        append_cell_list_delta(payload, parse_cell_lists(derived.cells_data, derived.entries_data), new_lists);
         SEC("celldelta:" << prefix);
         uint32_t marker = CELL_INDEX_DELTA_MARKER, file = static_cast<uint32_t>(entries_fid);
         uint64_t size = payload.size();
         wval(patch, &marker, 4); wval(patch, &file, 4); wval(patch, &size, 8);
         patch.insert(patch.end(), payload.begin(), payload.end());
-        std::cerr << "  " << prefix << "_entries.bin: cell index delta (" << size << " bytes: " << n.gone << " gone and "
-                  << n.fresh << " new cells, " << n.lost_runs << " lost and " << n.gained_runs << " gained runs)" << std::endl;
+        std::cerr << "  " << prefix << "_entries.bin: cell index delta (" << size << " bytes)" << std::endl;
     };
     emit_cell_index_delta(PatchFileId::ADMIN_ENTRIES, "admin", {}, a_added, a_removed);
     emit_cell_index_delta(PatchFileId::POI_ENTRIES, "poi", poi_rm_d, p_added, p_removed);
@@ -2122,7 +2120,7 @@ static int run(int argc, char* argv[]) {
                 std::vector<char> payload;
                 uint64_t new_entries_size = new_e.size();
                 payload.insert(payload.end(), (const char*)&new_entries_size, (const char*)&new_entries_size + 8);
-                const CellListDeltaCounts n = append_cell_list_delta(payload, parse_cell_lists(old_c, old_e), new_lists);
+                append_cell_list_delta(payload, parse_cell_lists(old_c, old_e), new_lists);
                 SEC("celllist:" << cells_name);
                 uint32_t fid = static_cast<uint32_t>(cells_fid), stride = CELL_LIST_DELTA_STRIDE;
                 uint64_t old_size = old_c.size(), new_size = new_c.size(), payload_size = payload.size();
@@ -2130,8 +2128,7 @@ static int run(int argc, char* argv[]) {
                 wval(patch, &old_size, 8); wval(patch, &new_size, 8); wval(patch, &payload_size, 8);
                 patch.insert(patch.end(), payload.begin(), payload.end());
                 std::cerr << "  " << cells_name << " + " << entries_name << ": cell list delta "
-                          << payload_size << " bytes vs " << new_c.size() + new_e.size() << " full (" << n.gone << " gone and "
-                          << n.fresh << " new cells, " << n.lost_runs << " lost and " << n.gained_runs << " gained runs)" << std::endl;
+                          << payload_size << " bytes vs " << new_c.size() + new_e.size() << " full" << std::endl;
                 return;
             }
         }

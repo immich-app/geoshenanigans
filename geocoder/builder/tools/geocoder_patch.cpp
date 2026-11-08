@@ -8,12 +8,12 @@
 //
 // Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--threads] [--file-records-max N]
 //
-// Reads GCPATCH v15 (REPLACE runs, street remap derived from the
+// Reads GCPATCH v14 (REPLACE runs, street remap derived from the
 // street_ways replay, PARALLEL_DELTA_STRIDE side files, unmapped ids dropped
 // from street / addr / interp cell lists, a cell index delta for every admin /
 // POI index and none for places, remap pairs ascending, the MATCH records'
-// string fixups, the admin geometry files merged by slot, with admin slots
-// kept, and cell list deltas as runs).
+// string fixups, and the admin geometry files merged by slot, with admin
+// slots kept).
 //
 // Low-memory mode: when <current-dir> is an encoded installed set (it has a
 // gc.manifest, see gcs_patch.h), the encoded families' old files are decoded
@@ -710,8 +710,8 @@ static int run(int argc, char* argv[]) {
             continue;
         }
         if (stride == CELL_LIST_DELTA_STRIDE) {
-            // A cell index patched by runs of cells that lose or gain an id
-            // (v15); the paired entries file is rebuilt from the same lists.
+            // A cell index patched per cell; the paired entries file is
+            // rebuilt from the same lists.
             std::string cells_name = fname;
             const std::string suffix = "_cells.bin";
             if (cells_name.size() < suffix.size() || cells_name.compare(cells_name.size() - suffix.size(), suffix.size(), suffix) != 0)
@@ -1308,8 +1308,7 @@ static int run(int argc, char* argv[]) {
 
         // An admin / POI index the old dir holds or the new one lists
         // is rebuilt and corrected by its cell index delta in one streaming
-        // pass over the old files, holding one cell and the ids of the runs
-        // over it (at most 0xFFFF lost and 0xFFFF gained) at a time.
+        // pass over the old files, holding one cell at a time.
         auto rebuild_cell_index = [&](const char* label, PatchFileId entries_fid, const std::string& prefix,
                                       const CellChanges& changes, auto remap) {
             const std::string cells_name = prefix + "_cells.bin", entries_name = prefix + "_entries.bin";

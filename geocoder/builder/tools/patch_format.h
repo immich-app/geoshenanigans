@@ -20,7 +20,6 @@
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#include <tuple>
 #include <type_traits>
 #include <unistd.h>
 #include <unordered_map>
@@ -213,13 +212,7 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // their slots, so nothing is remapped by an admin id: the parent-id remap
 // is its street leg alone, the sparse and parallel deltas lose remap kind 1,
 // and the admin cell index is rebuilt from the old one's ids as they are.
-// v15: a cell index delta (CELL_INDEX_DELTA_MARKER, CELL_LIST_DELTA_STRIDE) is
-// runs: the source cells the new index drops by rank, the cells new to it by
-// id, then the runs of consecutive cells of the new index that lose or gain an
-// id, in varints (append_cell_list_delta). A polygon whose boundary moved costs
-// a run, not its id in every cell, and the patcher holds only the ids of the
-// runs over its cell, at most 0xFFFF each way.
-static constexpr uint32_t GCPATCH_VERSION = 15;
+static constexpr uint32_t GCPATCH_VERSION = 14;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -383,11 +376,10 @@ static constexpr uint32_t CELL_CHANGES_POI_MARKER = 0xFFFFFFF5;
 // Cell index delta marker: 0xFFFFFFF7
 // An admin / POI cell index the patcher rebuilds from the old one through
 // its id remap (the POI records' replay; admin slots stay as they are),
-// corrected by runs of cells that lose or gain an id (v15): a polygon costs
-// the runs its cells form in the index, not an id per cell. Sent for every
-// index the old or the new dir holds; the patcher writes the new index in
-// write_cell_lists layout, so the diff refuses a new index that layout
-// doesn't reproduce byte for byte.
+// corrected per cell: a corrected cell costs the ids it lost and gained, not
+// its whole list. Sent for every index the old or the new dir holds; the
+// patcher writes the new index in write_cell_lists layout, so the diff
+// refuses a new index that layout doesn't reproduce byte for byte.
 // Format: marker(4), file_id(4) = the entries file, payload_size(u64),
 //   append_cell_list_delta(rebuilt → new) bytes.
 // At most one per file of CELL_INDEX_ENTRIES_FILES.
@@ -551,9 +543,9 @@ constexpr uint32_t SPARSE_DELTA_STRIDE = 0xFC;
 constexpr uint32_t COPY_OLD_STRIDE = 0xFD;
 
 // Stride sentinel: a cell index (<name>_cells.bin + <name>_entries.bin)
-// patched by runs (v15). Strategy-2 ids keep most lists unchanged day to day,
-// so only the runs of cells that lost or gained ids travel. The section names
-// the cells file and the patcher writes both files.
+// patched per cell. Strategy-2 ids keep most lists unchanged day to day, so
+// only the cells that lost or gained ids travel. The section names the cells
+// file and the patcher writes both files.
 //   file_id(u32), stride = CELL_LIST_DELTA_STRIDE (u32),
 //   old_size(u64), new_size(u64) of the cells file,
 //   payload_size(u64), new entries size(u64), append_cell_list_delta bytes.
@@ -1216,35 +1208,6 @@ inline SortedTable<RemapPair> parse_parent_id_remap(const char* data, size_t siz
     return SortedTable<RemapPair>(in.take_items(n, sizeof(RemapPair)), n, "POI parent-id remap");
 }
 
-// --- Varint encoding for delta-compressed fixup tables, string runs and cell list deltas ---
-
-inline void write_varint(std::vector<char>& buf, uint32_t value) {
-    while (value >= 128) {
-        buf.push_back(static_cast<char>((value & 0x7F) | 0x80));
-        value >>= 7;
-    }
-    buf.push_back(static_cast<char>(value));
-}
-
-// A u64 as SectionReader::varint64 reads it: 1 to 10 bytes.
-inline void write_varint64(std::vector<char>& buf, uint64_t value) {
-    while (value >= 128) {
-        buf.push_back(static_cast<char>((value & 0x7F) | 0x80));
-        value >>= 7;
-    }
-    buf.push_back(static_cast<char>(value));
-}
-
-// The bytes write_varint writes for value: 1 to 5.
-inline size_t varint_size(uint32_t value) {
-    size_t n = 1;
-    for (; value >= 128; value >>= 7) n++;
-    return n;
-}
-
-inline uint32_t zigzag32(uint32_t v) { return (v << 1) ^ (0u - (v >> 31)); }
-inline uint32_t unzigzag32(uint32_t v) { return (v >> 1) ^ (0u - (v & 1)); }
-
 // --- Cell index rebuild ---
 
 // Admin and POI cell index rebuild, as the diff derives the index the
@@ -1316,7 +1279,7 @@ inline RebuiltCells rebuild_cells_from_remap(
     return result;
 }
 
-// --- Cell index deltas as runs (CELL_INDEX_DELTA_MARKER, CELL_LIST_DELTA_STRIDE) ---
+// --- Cell index as per-cell id lists (CELL_LIST_DELTA_STRIDE) ---
 
 // cell_id → its ids (sorted), in cell order.
 using CellLists = std::map<uint64_t, std::vector<uint32_t>>;
@@ -1339,15 +1302,12 @@ inline CellLists parse_cell_lists(const std::vector<char>& cells, const std::vec
     return out;
 }
 
-// The most ids a cell lists: its count is a u16.
-static constexpr uint32_t CELL_LIST_MAX = 0xFFFF;
-
 // The bytes write_cell_index writes for these lists: (cells, entries).
 inline std::pair<std::vector<char>, std::vector<char>> write_cell_lists(const CellLists& lists) {
     std::pair<std::vector<char>, std::vector<char>> out;
     auto& [cells, entries] = out;
     for (const auto& [cid, ids] : lists) {
-        if (ids.size() > CELL_LIST_MAX) throw std::runtime_error("Cell holds more than 65535 entries");
+        if (ids.size() > 0xFFFF) throw std::runtime_error("Cell holds more than 65535 entries");
         uint32_t off = static_cast<uint32_t>(entries.size());
         uint16_t n = static_cast<uint16_t>(ids.size());
         cells.insert(cells.end(), (const char*)&cid, (const char*)&cid + 8);
@@ -1358,319 +1318,88 @@ inline std::pair<std::vector<char>, std::vector<char>> write_cell_lists(const Ce
     return out;
 }
 
-// A cell list delta (v15) turns one cell index, the source, into the new one: for a postcode centroid index
-// (CELL_LIST_DELTA_STRIDE) the old index, for an admin or POI index (CELL_INDEX_DELTA_MARKER) the one the patcher
-// rebuilds from it. A source cell has a rank, its place among the source's cells, and so has a cell of the new index
-// among the new index's cells. Every number is a varint (write_varint64; the ids' write_varint):
-//   n_gone, then the rank of each source cell the new index doesn't hold, ascending, each as the gap from the one
-//     after the previous (the first from rank 0);
-//   n_new, then the id of each cell new to the index, ascending, each as the gap from the one after the previous
-//     (the first from 0), with an empty source list;
-//   n_lost, then the runs of consecutive new-index ranks whose cells lose an id; n_gained, then those that gain one.
-//     Each run as (start gap, length - 1, bare id << 1 | interior), sorted by (start, id) with the id as the list
-//     holds it (INTERIOR_FLAG on top): the start gap is the start rank less the previous run's (the first from 0).
-// A cell's new list is its source list less its lost ids, merged with its gained ids. The lists are multisets (a POI
-// index rebuilt through a remap can list an id twice and lose both): an id a cell loses k times is in k runs over
-// it. A polygon whose boundary moved costs a run or two, not an id per cell; the patcher holds the runs that cover
-// the cell it is at (ActiveRuns), at most CELL_LIST_MAX ids each way.
+// Removed cells (u32 n, u64 each), then every cell that is new or whose list
+// changed (u32 n, then u64 cell, u32 n_lost, u32 n_gained, lost ids, gained ids).
+inline void append_cell_list_delta(std::vector<char>& out, const CellLists& old_lists, const CellLists& new_lists) {
+    auto put = [&](const void* p, size_t n) { out.insert(out.end(), (const char*)p, (const char*)p + n); };
+    std::vector<uint64_t> removed;
+    for (const auto& kv : old_lists)
+        if (!new_lists.count(kv.first)) removed.push_back(kv.first);
+    uint32_t n_removed = static_cast<uint32_t>(removed.size());
+    put(&n_removed, 4);
+    put(removed.data(), removed.size() * 8);
 
-// A run of new-index ranks [start, last] that loses or gains id (the id as the lists hold it).
-struct CellRun {
-    uint64_t start, last;
-    uint32_t id;
-};
-
-// The id a run's varint carries: the bare id above the interior flag, so an id costs no 5th byte for its flag.
-inline uint32_t cell_run_value(uint32_t id) { return (id & 0x7FFFFFFFu) << 1 | id >> 31; }
-inline uint32_t cell_run_id(uint32_t value) { return value >> 1 | value << 31; }
-
-// The runs of (id, rank) pairs: per id, the maximal runs of consecutive ranks it occurs at, one layer of runs per
-// occurrence (layer j covers the ranks the id occurs at more than j times), sorted by (start, id, last).
-inline std::vector<CellRun> cell_runs(std::vector<std::pair<uint32_t, uint64_t>> pairs) {
-    std::sort(pairs.begin(), pairs.end());
-    std::vector<CellRun> runs;
-    std::vector<std::pair<uint64_t, uint32_t>> counts;  // one id's (rank, occurrences)
-    for (size_t i = 0; i < pairs.size();) {
-        const uint32_t id = pairs[i].first;
-        counts.clear();
-        for (; i < pairs.size() && pairs[i].first == id; i++) {
-            if (!counts.empty() && counts.back().first == pairs[i].second) counts.back().second++;
-            else counts.push_back({pairs[i].second, 1});
-        }
-        for (uint32_t layer = 0;; layer++) {
-            bool any = false, open = false;
-            CellRun run{0, 0, id};
-            for (const auto& [rank, n] : counts) {
-                if (n <= layer) continue;
-                any = true;
-                if (open && rank == run.last + 1) {
-                    run.last = rank;
-                    continue;
-                }
-                if (open) runs.push_back(run);
-                run = {rank, rank, id};
-                open = true;
-            }
-            if (open) runs.push_back(run);
-            if (!any) break;
-        }
-    }
-    std::sort(runs.begin(), runs.end(), [](const CellRun& a, const CellRun& b) {
-        return std::tie(a.start, a.id, a.last) < std::tie(b.start, b.id, b.last);
-    });
-    return runs;
-}
-
-// What a cell list delta holds, for the diff's log.
-struct CellListDeltaCounts {
-    uint64_t gone = 0, fresh = 0, lost_runs = 0, gained_runs = 0;
-};
-
-// Appends the cell list delta from `from` (the source) to `to`, as stream_cell_index reads it. Refuses a new list
-// out of order, which no walk rebuilds, and more cells than a run's rank holds (a u32); a source list out of order
-// is taken sorted, as the patcher's walk sorts it.
-inline CellListDeltaCounts append_cell_list_delta(std::vector<char>& out, const CellLists& from, const CellLists& to) {
-    if (to.size() > uint64_t{UINT32_MAX}) throw std::runtime_error("Cell index holds more cells than a cell list delta ranks");
-    CellListDeltaCounts counts;
-    std::vector<uint64_t> gone, fresh;
-    uint64_t rank = 0;
-    for (const auto& kv : from) {
-        if (!to.count(kv.first)) gone.push_back(rank);
-        rank++;
-    }
-    std::vector<std::pair<uint32_t, uint64_t>> lost, gained;  // (id, new-index rank)
     const std::vector<uint32_t> none;
-    std::vector<uint32_t> sorted, d;
-    rank = 0;
-    for (const auto& [cid, ids] : to) {
-        if (!std::is_sorted(ids.begin(), ids.end())) throw std::runtime_error("Cell index list out of order");
-        auto it = from.find(cid);
-        if (it == from.end()) fresh.push_back(cid);
-        const std::vector<uint32_t>* was = it != from.end() ? &it->second : &none;
-        if (!std::is_sorted(was->begin(), was->end())) {
-            sorted = *was;
-            std::sort(sorted.begin(), sorted.end());
-            was = &sorted;
-        }
-        if (*was != ids) {
-            d.clear();
-            std::set_difference(was->begin(), was->end(), ids.begin(), ids.end(), std::back_inserter(d));
-            for (const uint32_t id : d) lost.push_back({id, rank});
-            d.clear();
-            std::set_difference(ids.begin(), ids.end(), was->begin(), was->end(), std::back_inserter(d));
-            for (const uint32_t id : d) gained.push_back({id, rank});
-        }
-        rank++;
+    std::vector<char> sets;
+    uint32_t n_set = 0;
+    for (const auto& [cid, ids] : new_lists) {
+        auto it = old_lists.find(cid);
+        if (it != old_lists.end() && it->second == ids) continue;
+        const auto& was = it != old_lists.end() ? it->second : none;
+        std::vector<uint32_t> lost, gained;
+        std::set_difference(was.begin(), was.end(), ids.begin(), ids.end(), std::back_inserter(lost));
+        std::set_difference(ids.begin(), ids.end(), was.begin(), was.end(), std::back_inserter(gained));
+        uint32_t nl = static_cast<uint32_t>(lost.size()), ng = static_cast<uint32_t>(gained.size());
+        sets.insert(sets.end(), (const char*)&cid, (const char*)&cid + 8);
+        sets.insert(sets.end(), (const char*)&nl, (const char*)&nl + 4);
+        sets.insert(sets.end(), (const char*)&ng, (const char*)&ng + 4);
+        sets.insert(sets.end(), (const char*)lost.data(), (const char*)lost.data() + lost.size() * 4);
+        sets.insert(sets.end(), (const char*)gained.data(), (const char*)gained.data() + gained.size() * 4);
+        n_set++;
     }
-    for (const auto* values : {&gone, &fresh}) {
-        write_varint64(out, values->size());
-        uint64_t next = 0;
-        for (const uint64_t v : *values) {
-            write_varint64(out, v - next);
-            next = v + 1;
-        }
-    }
-    counts.gone = gone.size();
-    counts.fresh = fresh.size();
-    for (auto* pairs : {&lost, &gained}) {
-        const std::vector<CellRun> runs = cell_runs(std::move(*pairs));
-        write_varint64(out, runs.size());
-        uint64_t start = 0;
-        for (const CellRun& r : runs) {
-            write_varint64(out, r.start - start);
-            write_varint64(out, r.last - r.start);
-            write_varint(out, cell_run_value(r.id));
-            start = r.start;
-        }
-        (pairs == &lost ? counts.lost_runs : counts.gained_runs) = runs.size();
-    }
-    return counts;
+    put(&n_set, 4);
+    out.insert(out.end(), sets.begin(), sets.end());
 }
 
-// Where a cell list delta's four lists start, and how many each holds: the patcher walks them side by side.
-struct CellListDeltaParts {
-    uint64_t n_gone, n_new, n_lost, n_gained;
-    size_t gone_at, new_at, lost_at, gained_at;
-};
-
-// Reads the delta's counts and passes over its items, refusing one that runs past the end or bytes after the last.
-inline CellListDeltaParts cell_list_delta_parts(const char* delta, size_t size) {
-    size_t pos = 0;
-    SectionReader in(delta, size, pos, "cell list delta", PastEnd::MALFORMED);
-    CellListDeltaParts p{};
-    p.n_gone = in.varint64();
-    p.gone_at = pos;
-    for (uint64_t i = 0; i < p.n_gone; i++) in.varint64();
-    p.n_new = in.varint64();
-    p.new_at = pos;
-    for (uint64_t i = 0; i < p.n_new; i++) in.varint64();
-    for (uint64_t* n : {&p.n_lost, &p.n_gained}) {
-        *n = in.varint64();
-        (n == &p.n_lost ? p.lost_at : p.gained_at) = pos;
-        for (uint64_t i = 0; i < *n; i++) {
-            in.varint64();
-            in.varint64();
-            in.varint();
-        }
-    }
-    if (!in.at_end()) in.malformed();
-    return p;
-}
-
-[[noreturn, gnu::cold, gnu::noinline]] inline void refuse_cell_list_delta(const char* why) {
-    throw std::runtime_error(std::string("Malformed cell list delta: ") + why);
-}
-
-// A cell list delta's gone ranks or new cell ids from at, n of them, read in order: each the one after the previous
-// plus its gap (the first from 0). A value of NONE or past it is malformed; next() gives NONE once all are read.
-class CellGaps {
-public:
-    static constexpr uint64_t NONE = ~0ull;
-    CellGaps(const char* data, size_t size, size_t at, uint64_t n)
-        : pos_(at), in_(data, size, pos_, "cell list delta", PastEnd::MALFORMED), left_(n) {}
-    CellGaps(const CellGaps&) = delete;
-    CellGaps& operator=(const CellGaps&) = delete;
-    uint64_t next() {
-        if (left_ == 0) return NONE;
-        left_--;
-        const uint64_t gap = in_.varint64();
-        if (gap >= NONE - next_) in_.malformed();
-        const uint64_t v = next_ + gap;
-        next_ = v + 1;
-        return v;
-    }
-
-private:
-    size_t pos_;
-    SectionReader in_;
-    uint64_t left_, next_ = 0;
-};
-
-// A cell list delta's lost or gained runs from at, n of them, read in order, each checked as it is read: refused as
-// "a step back" when its (start, id) is below the previous run's, and as "a run past the last rank" when its last rank
-// passes a u32 (no index has as many cells: each lists at least its count in an entries file of u32 offsets) or its
-// sum wraps 64 bits. The bounds are computed in 64 bits whatever size_t is.
-class CellRunReader {
-public:
-    CellRunReader(const char* data, size_t size, size_t at, uint64_t n)
-        : data_(data), size_(size), pos_(at), in_(data, size, pos_, "cell list delta", PastEnd::MALFORMED), left_(n) {
-        load();
-    }
-    CellRunReader(const CellRunReader&) = delete;
-    CellRunReader& operator=(const CellRunReader&) = delete;
-    bool done() const { return !have_; }
-    // How many runs from the next one on start at rank (stops counting past CELL_LIST_MAX, which no set holds).
-    uint64_t starting_at(uint64_t rank) const {
-        if (!have_ || next_.start != rank) return 0;
-        uint64_t n = 1;
-        size_t p = pos_;
-        SectionReader peek(data_, size_, p, "cell list delta", PastEnd::MALFORMED);
-        for (uint64_t k = 0; k < left_ && n <= CELL_LIST_MAX; k++) {
-            if (peek.varint64() != 0) break;
-            peek.varint64();
-            peek.varint();
-            n++;
-        }
-        return n;
-    }
-    // The next run, which there is (!done()).
-    CellRun next() {
-        const CellRun r = next_;
-        load();
-        return r;
-    }
-
-private:
-    void load() {
-        have_ = left_ > 0;
-        if (!have_) return;
-        left_--;
-        const uint64_t gap = in_.varint64(), length_less_one = in_.varint64();
-        const uint32_t id = cell_run_id(in_.varint());
-        if (gap > ~0ull - start_) refuse_cell_list_delta("a run past the last rank");
-        const uint64_t start = start_ + gap;
-        if (length_less_one > uint64_t{UINT32_MAX} || start > uint64_t{UINT32_MAX} - length_less_one)
-            refuse_cell_list_delta("a run past the last rank");
-        if (start == start_ && id < id_) refuse_cell_list_delta("a step back");
-        next_ = {start, start + length_less_one, id};
-        start_ = start;
-        id_ = id;
-    }
-
-    const char* data_;
-    size_t size_;
-    size_t pos_;
-    SectionReader in_;
-    uint64_t left_;
-    bool have_ = false;
-    CellRun next_{0, 0, 0};
-    uint64_t start_ = 0;
-    uint32_t id_ = 0;
-};
-
-// The ids of the lost or gained runs over the cell the walk is at, sorted by id (an id as often as runs of it cover
-// the cell), each with its run's last rank: 8 bytes an id, and at most CELL_LIST_MAX ids, since a cell holds every id
-// it loses and lists every id it gains, so 512 KiB however many runs the delta holds. Its capacity grows to that at
-// most.
-class ActiveRuns {
-public:
-    struct Id {
-        uint32_t id, last;
-    };
-    const std::vector<Id>& ids() const { return ids_; }
-    bool empty() const { return ids_.empty(); }
-    // Adds the runs that start at rank, merged into the set by id where it sits: refuses a set past CELL_LIST_MAX
-    // before it grows.
-    void start_at(CellRunReader& runs, uint64_t rank) {
-        const uint64_t b = runs.starting_at(rank);
-        if (b == 0) return;
-        const size_t a = ids_.size();
-        if (b > CELL_LIST_MAX - a) refuse_cell_list_delta("an active set above 65535 ids");
-        const size_t nb = static_cast<size_t>(b), n = a + nb;
-        if (n > ids_.capacity()) ids_.reserve(std::min<size_t>(std::max(n, 2 * ids_.capacity()), CELL_LIST_MAX));
-        ids_.resize(n);
-        // The set moves to the end; the merge writes from the front, never past what it has still to read.
-        std::memmove(ids_.data() + nb, ids_.data(), a * sizeof(Id));
-        size_t i = nb, k = 0;
-        for (size_t j = 0; j < nb; j++) {
-            const CellRun r = runs.next();
-            while (i < n && ids_[i].id <= r.id) ids_[k++] = ids_[i++];
-            ids_[k++] = {r.id, static_cast<uint32_t>(r.last)};
-        }
-    }
-    // Drops the runs whose last rank is rank.
-    void end_at(uint64_t rank) {
-        ids_.erase(std::remove_if(ids_.begin(), ids_.end(), [&](const Id& x) { return x.last == rank; }), ids_.end());
-    }
-
-private:
-    std::vector<Id> ids_;
-};
-
-// Rebuilds a cell index and applies a cell list delta (append_cell_list_delta) to it in one pass, writing the
-// result in write_cell_lists layout through out_cells(bytes, n) / out_entries(bytes, n). The source is the old
-// index (cells sorted by id) plus `added` cell ids with empty lists, minus `removed`; every old id moves by
-// remap(id without INTERIOR_FLAG), flag kept, and each list is sorted: the same lists rebuild_cells_from_remap
-// gives. Holds one cell's list and the runs over it: the patcher runs on client machines, where materialising
-// planet poi/all (1.1M cells, 25M ids, a 23M entry remap map) cost over 1 GiB. The old cells and entries are read
-// front to back through size() and at(off, n), a view that lasts until the next call (SequentialFileReader); the
-// cell changes and the delta where they sit. Refuses, besides a malformed index or delta: a lost id missing from its
-// cell, an active set above CELL_LIST_MAX, a step back (a run's (start, id) below the previous one's, or a new cell
-// the source holds) and a run past the last rank (or a gone rank past the last source cell). Returns the entries
-// bytes written.
+// Rebuilds a cell index and applies append_cell_list_delta bytes to it in one
+// pass, writing the result in write_cell_lists layout through
+// out_cells(bytes, n) / out_entries(bytes, n). The source is the old index
+// (cells sorted by id) plus `added` cell ids with empty lists, minus
+// `removed`; every old id moves by remap(id without INTERIOR_FLAG), flag
+// kept, and each list is sorted: the same lists rebuild_cells_from_remap
+// gives. Holds one cell's list at a time: the patcher runs on client
+// machines, where materialising planet poi/all (1.1M cells, 25M ids, a 23M
+// entry remap map) cost over 1 GiB. The old cells and entries are read
+// front to back through size() and at(off, n), a view that lasts until the
+// next call (SequentialFileReader); the cell changes and the delta where
+// they sit. Returns the entries bytes written.
 template <typename Cells, typename Entries, typename Remap, typename OutCells, typename OutEntries>
 uint64_t stream_cell_index(Cells&& cells, Entries&& entries, AscendingIds added, AscendingIds removed, Remap remap,
                            const char* delta, size_t delta_size, OutCells out_cells, OutEntries out_entries) {
     auto bad_index = [] { throw std::runtime_error("Malformed cell index"); };
-    constexpr uint64_t NONE = CellGaps::NONE;
 
-    const CellListDeltaParts parts = cell_list_delta_parts(delta, delta_size);
-    CellGaps gone(delta, delta_size, parts.gone_at, parts.n_gone), fresh(delta, delta_size, parts.new_at, parts.n_new);
-    CellRunReader lost_runs(delta, delta_size, parts.lost_at, parts.n_lost);
-    CellRunReader gained_runs(delta, delta_size, parts.gained_at, parts.n_gained);
-    ActiveRuns lost, gained;
+    size_t pos = 0;
+    SectionReader in(delta, delta_size, pos, "cell list delta", PastEnd::MALFORMED);
+    const uint32_t n_gone = in.u32();
+    AscendingIds gone(in.take_items(n_gone, 8), n_gone, "cell list delta");
+    const uint32_t n_set = in.u32();
+    uint32_t set_i = 0;
 
-    // The next source cell: old cells minus `removed`, merged with `added`.
+    // The next changed cell from the delta, read in cell order.
+    constexpr uint64_t NONE = ~0ull;
+    uint64_t set_cid = NONE, prev_set = 0;
+    std::vector<uint32_t> lost, gained;
+    // An empty list's data() may be null, which memcpy may not get.
+    auto ids_into = [](std::vector<uint32_t>& ids, const char* p, uint32_t n) {
+        ids.resize(n);
+        if (n) memcpy(ids.data(), p, size_t{n} * 4);
+    };
+    auto next_set = [&] {
+        if (set_i == n_set) { set_cid = NONE; return; }
+        set_cid = in.u64();
+        const uint32_t nl = in.u32(), ng = in.u32();
+        if ((set_i > 0 && set_cid <= prev_set) || set_cid == NONE) in.malformed();
+        // A list holds at most 0xFFFF ids (its u16 count), so a cell loses or gains at most as many.
+        if (nl > 0xFFFF || ng > 0xFFFF) in.malformed();
+        const char* lost_at = in.take_items(nl, 4);
+        const char* gained_at = in.take_items(ng, 4);
+        ids_into(lost, lost_at, nl);
+        ids_into(gained, gained_at, ng);
+        prev_set = set_cid;
+        set_i++;
+    };
+
+    // The next rebuilt cell: old cells minus `removed`, merged with `added`.
     const uint64_t entries_size = entries.size();
     size_t n_cells = cells.size() / 12, i = 0;
     uint64_t prev_old = 0;
@@ -1712,9 +1441,10 @@ uint64_t stream_cell_index(Cells&& cells, Entries&& entries, AscendingIds added,
         }
     };
 
-    uint64_t written = 0, rank = 0;
-    std::vector<uint32_t> merged;
-    auto write = [&](uint64_t cid, const std::vector<uint32_t>& list) {
+    uint64_t written = 0;
+    std::vector<uint32_t> kept, merged;
+    auto emit = [&](uint64_t cid, const std::vector<uint32_t>& list) {
+        if (list.size() > 0xFFFF) throw std::runtime_error("Cell holds more than 65535 entries");
         if (written > 0xFFFFFFFFull) throw std::runtime_error("Cell index entries past 4 GiB");
         uint32_t off = static_cast<uint32_t>(written);
         uint16_t n = static_cast<uint16_t>(list.size());
@@ -1724,64 +1454,32 @@ uint64_t stream_cell_index(Cells&& cells, Entries&& entries, AscendingIds added,
         out_entries((const char*)list.data(), list.size() * 4);
         written += 2 + list.size() * 4;
     };
-    // The new index's cell at `rank`: its source list less the lost runs over it, merged with the gained ones.
-    auto emit = [&](uint64_t cid, const std::vector<uint32_t>& source) {
-        lost.start_at(lost_runs, rank);
-        gained.start_at(gained_runs, rank);
-        if (lost.empty() && gained.empty()) {
-            if (source.size() > CELL_LIST_MAX) throw std::runtime_error("Cell holds more than 65535 entries");
-            write(cid, source);
-        } else {
-            const auto& l = lost.ids();
-            const auto& g = gained.ids();
-            if (l.size() > source.size()) refuse_cell_list_delta("a lost id missing from its cell");
-            if (source.size() - l.size() + g.size() > CELL_LIST_MAX) throw std::runtime_error("Cell holds more than 65535 entries");
-            merged.clear();
-            size_t li = 0, gi = 0;
-            for (const uint32_t id : source) {
-                if (li < l.size() && l[li].id < id) refuse_cell_list_delta("a lost id missing from its cell");
-                if (li < l.size() && l[li].id == id) {
-                    li++;
-                    continue;
-                }
-                for (; gi < g.size() && g[gi].id < id; gi++) merged.push_back(g[gi].id);
-                merged.push_back(id);
-            }
-            if (li < l.size()) refuse_cell_list_delta("a lost id missing from its cell");
-            for (; gi < g.size(); gi++) merged.push_back(g[gi].id);
-            write(cid, merged);
-        }
-        lost.end_at(rank);
-        gained.end_at(rank);
-        rank++;
-    };
 
-    static const std::vector<uint32_t> no_ids;
-    uint64_t source_rank = 0, next_gone = gone.next(), next_new = fresh.next(), cid = NONE;
+    next_set();
+    uint64_t cid = NONE;
     bool have = next_source(cid);
-    for (;;) {
-        while (have && source_rank == next_gone) {
-            source_rank++;
-            next_gone = gone.next();
-            have = next_source(cid);
+    while (have || set_cid != NONE) {
+        uint64_t src = have ? cid : NONE;
+        if (set_cid < src) {  // a cell the rebuilt index doesn't have
+            emit(set_cid, gained);
+            next_set();
+            continue;
         }
-        if (have && cid < next_new) {
-            emit(cid, ids);
-            source_rank++;
-            have = next_source(cid);
-        } else if (next_new != NONE && (!have || next_new < cid)) {
-            emit(next_new, no_ids);
-            next_new = fresh.next();
-        } else if (have) {
-            refuse_cell_list_delta("a step back");  // a new cell the source holds
-        } else {
-            break;
+        if (src == set_cid) {
+            kept.clear();
+            std::set_difference(ids.begin(), ids.end(), lost.begin(), lost.end(), std::back_inserter(kept));
+            merged.clear();
+            std::merge(kept.begin(), kept.end(), gained.begin(), gained.end(), std::back_inserter(merged));
+            emit(src, merged);
+            next_set();
+        } else if (!gone.skip_to(src)) {
+            emit(src, ids);
         }
+        have = next_source(cid);
     }
     removed.require_ascending();
-    if (next_gone != NONE) refuse_cell_list_delta("a gone rank past the last source cell");
-    if (!lost_runs.done() || !gained_runs.done() || !lost.empty() || !gained.empty())
-        refuse_cell_list_delta("a run past the last rank");
+    gone.require_ascending();
+    if (!in.at_end()) in.malformed();
     return written;
 }
 
@@ -1985,6 +1683,35 @@ private:
     ScratchTable<Run> runs_;
     SortedTable<RemapPair> pairs_;
 };
+
+// --- Varint encoding for delta-compressed fixup tables and string runs ---
+
+inline void write_varint(std::vector<char>& buf, uint32_t value) {
+    while (value >= 128) {
+        buf.push_back(static_cast<char>((value & 0x7F) | 0x80));
+        value >>= 7;
+    }
+    buf.push_back(static_cast<char>(value));
+}
+
+// A u64 as SectionReader::varint64 reads it: 1 to 10 bytes.
+inline void write_varint64(std::vector<char>& buf, uint64_t value) {
+    while (value >= 128) {
+        buf.push_back(static_cast<char>((value & 0x7F) | 0x80));
+        value >>= 7;
+    }
+    buf.push_back(static_cast<char>(value));
+}
+
+// The bytes write_varint writes for value: 1 to 5.
+inline size_t varint_size(uint32_t value) {
+    size_t n = 1;
+    for (; value >= 128; value >>= 7) n++;
+    return n;
+}
+
+inline uint32_t zigzag32(uint32_t v) { return (v << 1) ^ (0u - (v >> 31)); }
+inline uint32_t unzigzag32(uint32_t v) { return (v >> 1) ^ (0u - (v & 1)); }
 
 // --- String offset remap (patcher) ---
 

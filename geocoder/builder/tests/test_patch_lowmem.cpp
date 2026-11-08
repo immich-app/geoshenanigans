@@ -5,7 +5,6 @@
 // patcher's heap peak, in every mode, as a case grows tenfold; and patches
 // and command lines the patcher must refuse.
 #include <algorithm>
-#include <array>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -607,19 +606,17 @@ std::vector<std::string> apply_both_modes(const LowMemCase& c, const LogCheck& c
 // into c as prepare() writes one: "" or what failed.
 using CaseOfSize = std::function<std::string(const LowMemCase& c, uint32_t n)>;
 
-// "" when the least of a mode's heap peaks at factor n (10 n unless said; in
-// what: the mode, and the codec state the runs ended in) is at most
-// HEAP_GROWTH_SLACK above the greatest at n, else how far it grew. Each size
-// has a peak.
-std::string peak_grew(const std::string& what, const std::vector<uint64_t>& at_n, const std::vector<uint64_t>& at_10n, uint32_t n,
-                      uint32_t factor = 10) {
+// "" when the least of a mode's heap peaks at 10 n (in what: the mode, and
+// the codec state the runs ended in) is at most HEAP_GROWTH_SLACK above the
+// greatest at n, else how far it grew. Each size has a peak.
+std::string peak_grew(const std::string& what, const std::vector<uint64_t>& at_n, const std::vector<uint64_t>& at_10n, uint32_t n) {
     const uint64_t from = *std::max_element(at_n.begin(), at_n.end()), to = *std::min_element(at_10n.begin(), at_10n.end());
     if (to <= from + HEAP_GROWTH_SLACK) return "";
     auto of_runs = [](const char* which, const std::vector<uint64_t>& v) {
         return v.size() > 1 ? " (the " + std::string(which) + " of " + std::to_string(v.size()) + " runs)" : std::string();
     };
     return what + ": the heap peak grew from " + std::to_string(from) + " B at n = " + std::to_string(n) + of_runs("greatest", at_n) + " to " +
-           std::to_string(to) + " B at n = " + std::to_string(uint64_t{factor} * n) + of_runs("least", at_10n) + ", past the " +
+           std::to_string(to) + " B at n = " + std::to_string(10 * n) + of_runs("least", at_10n) + ", past the " +
            std::to_string(HEAP_GROWTH_SLACK) + " B of slack";
 }
 
@@ -649,8 +646,7 @@ struct ThreadsCheck {
     bool settled;
 };
 
-ThreadsCheck threads_check(const std::vector<ThreadsRun>& runs_n, const std::vector<ThreadsRun>& runs_10n, uint32_t n,
-                           uint32_t factor = 10) {
+ThreadsCheck threads_check(const std::vector<ThreadsRun>& runs_n, const std::vector<ThreadsRun>& runs_10n, uint32_t n) {
     std::map<std::string, std::vector<uint64_t>> by_state[2];
     std::vector<uint64_t> all[2];
     for (size_t s = 0; s < 2; s++)
@@ -664,7 +660,7 @@ ThreadsCheck threads_check(const std::vector<ThreadsRun>& runs_n, const std::vec
         const auto at_10n = by_state[1].find(state);
         if (at_10n == by_state[1].end()) continue;
         shared = true;
-        const std::string grew = peak_grew("threads, codec state [" + state + "]", at_n, at_10n->second, n, factor);
+        const std::string grew = peak_grew("threads, codec state [" + state + "]", at_n, at_10n->second, n);
         if (grew.empty()) return {{}, true};
         c.failures.push_back(grew);
         c.settled |= std::min(at_n.size(), at_10n->second.size()) >= THREADS_STATE_RUNS;
@@ -672,20 +668,20 @@ ThreadsCheck threads_check(const std::vector<ThreadsRun>& runs_n, const std::vec
     if (shared) return c;
     if (all[0].empty() || all[1].empty()) return {{}, true};
     for (std::vector<uint64_t>& peaks : all) peaks.resize(std::min(peaks.size(), size_t(THREADS_HEAP_RUNS)));
-    if (const std::string grew = peak_grew("threads", all[0], all[1], n, factor); !grew.empty())
+    if (const std::string grew = peak_grew("threads", all[0], all[1], n); !grew.empty())
         return {{grew + ", and no codec state came up at both sizes"}, false};
     return {{}, true};
 }
 
-// The case at n and at factor n (10 n unless said), each applied in every
-// mode: each output as apply_modes checks it, and in each mode the heap peak
-// at factor n at most HEAP_GROWTH_SLACK above the one at n. Plain and sync runs peak the same
+// The case at n and at 10 n, each applied in every mode: each output as
+// apply_modes checks it, and in each mode the heap peak at 10 n at most
+// HEAP_GROWTH_SLACK above the one at n. Plain and sync runs peak the same
 // every time, so one run at each size decides; --threads runs
 // THREADS_HEAP_RUNS times at each size, the sizes taking turns so that both
 // see the same load, and threads_check decides, both sizes running again
 // while its failures aren't settled, up to THREADS_HEAP_MAX_RUNS times.
 // Every failure, printed; skipped without a heap shim (the sanitizer build).
-std::vector<std::string> heap_flat(const CaseOfSize& make_case, uint32_t n, uint32_t factor = 10) {
+std::vector<std::string> heap_flat(const CaseOfSize& make_case, uint32_t n) {
     if (!gctest::heap_peak_shim()) {
         std::printf("    SKIP heap peaks at n = %u: no heap shim under the sanitizers\n", n);
         return {};
@@ -696,7 +692,7 @@ std::vector<std::string> heap_flat(const CaseOfSize& make_case, uint32_t n, uint
         std::printf("    %s\n", why.c_str());
         bad.push_back(why);
     };
-    const uint32_t sizes[] = {n, factor * n};
+    const uint32_t sizes[] = {n, 10 * n};
     std::vector<LowMemCase> cases;
     for (const uint32_t size : sizes) {
         cases.push_back({dir.path(), "n" + std::to_string(size)});
@@ -709,7 +705,7 @@ std::vector<std::string> heap_flat(const CaseOfSize& make_case, uint32_t n, uint
     std::map<std::string, uint64_t> peaks[2];
     std::vector<ThreadsRun> threads[2];
     for (int run = 0; run < THREADS_HEAP_MAX_RUNS && (run == 0 || bad.empty()) &&
-                      (run < THREADS_HEAP_RUNS || !threads_check(threads[0], threads[1], n, factor).settled);
+                      (run < THREADS_HEAP_RUNS || !threads_check(threads[0], threads[1], n).settled);
          run++)
         for (size_t s = 0; s < 2; s++) {
             const std::vector<std::string> modes = run == 0 ? ALL_MODES : std::vector<std::string>{"threads"};
@@ -724,8 +720,8 @@ std::vector<std::string> heap_flat(const CaseOfSize& make_case, uint32_t n, uint
         }
     for (const auto& [mode, at_n] : peaks[0])
         if (const auto at_10n = peaks[1].find(mode); at_10n != peaks[1].end())
-            if (const std::string grew = peak_grew(mode, {at_n}, {at_10n->second}, n, factor); !grew.empty()) fail(grew);
-    for (const std::string& grew : threads_check(threads[0], threads[1], n, factor).failures) fail(grew);
+            if (const std::string grew = peak_grew(mode, {at_n}, {at_10n->second}, n); !grew.empty()) fail(grew);
+    for (const std::string& grew : threads_check(threads[0], threads[1], n).failures) fail(grew);
     return bad;
 }
 
@@ -1254,12 +1250,11 @@ TEST(patch_heap_stays_flat_as_a_poi_cell_index_delta_grows) {
         put_cells(old_d, "poi", old_cells);
         put_cells(new_d, "poi", new_cells);
         if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
-        // The POIs stay, so the rebuilt index is the old one: n lost and n gained runs of one cell.
-        std::vector<char> payload, delta;
-        append_cell_list_delta(payload, old_cells, new_cells);
+        // No removed cells, then n cells of one lost and one gained id.
+        std::vector<char> delta;
         append(delta, CELL_INDEX_DELTA_MARKER);
         append(delta, static_cast<uint32_t>(PatchFileId::POI_ENTRIES));
-        append(delta, uint64_t{payload.size()});
+        append(delta, uint64_t{8} + uint64_t{24} * n);
         return patch_holds(c, delta, "POI cell index delta of " + std::to_string(n) + " cells");
     }, 10000).empty());
 }
@@ -1287,73 +1282,6 @@ TEST(patch_heap_stays_flat_as_poi_cells_change) {
         append(changes, n);
         append(changes, n);
         return patch_holds(c, changes, std::to_string(n) + " added and " + std::to_string(n) + " removed POI cells");
-    }, 10000).empty());
-}
-
-namespace {
-
-// The admin index of n_cells cells: cell k lists ids_of(k). The admin
-// polygons keep their slots, so the patch rebuilds the old index as it is.
-CellLists admin_cells_of(uint32_t n_cells, const std::function<std::vector<uint32_t>(uint32_t)>& ids_of) {
-    CellLists lists;
-    for (uint32_t k = 0; k < n_cells; k++) lists[cell_id(k)] = ids_of(k);
-    return lists;
-}
-
-// The head of a cell index delta of payload: marker, the entries file, the payload's size.
-std::vector<char> cell_index_delta_head(PatchFileId entries, const std::vector<char>& payload) {
-    std::vector<char> head;
-    append(head, CELL_INDEX_DELTA_MARKER);
-    append(head, static_cast<uint32_t>(entries));
-    append(head, uint64_t{payload.size()});
-    return head;
-}
-
-}  // namespace
-
-// One polygon (slot 9) that leaves every other one of 2n cells, all of which
-// list slot 2 too: an admin cell index delta of n lost runs of one cell, each
-// 2 ranks after the one before, which the patcher reads where they sit; the
-// lost set holds one id at a time. From 1K to 100K cells lost.
-TEST(patch_heap_stays_flat_as_a_polygon_loses_cells) {
-    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
-        BuildDir old_d, new_d;
-        put_cells(old_d, "admin", admin_cells_of(2 * n, [](uint32_t) { return std::vector<uint32_t>{2, 9}; }));
-        put_cells(new_d, "admin", admin_cells_of(2 * n, [](uint32_t k) { return k % 2 ? std::vector<uint32_t>{2, 9} : std::vector<uint32_t>{2}; }));
-        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
-        // No gone or new cells; n lost runs (start gap, length - 1, 9 << 1); no gained runs.
-        std::vector<char> payload;
-        for (const uint64_t v : {uint64_t{0}, uint64_t{0}, uint64_t{n}}) write_varint64(payload, v);
-        for (uint32_t r = 0; r < n; r++)
-            for (const uint64_t v : {uint64_t{r ? 2u : 0u}, uint64_t{0}, uint64_t{9 << 1}}) write_varint64(payload, v);
-        write_varint64(payload, 0);
-        return patch_holds(c, cell_index_delta_head(PatchFileId::ADMIN_ENTRIES, payload),
-                           "admin cell index delta of " + std::to_string(n) + " lost runs");
-    }, 1000, 100).empty());
-}
-
-// n polygons that each leave their one cell (cell k lists slot 7919 k mod n,
-// which it loses, and a slot every cell lists): an admin cell index delta of n
-// lost runs of one cell each, in rank order, their ids out of order, which the
-// patcher reads where they sit. From 10K to 100K polygons.
-TEST(patch_heap_stays_flat_as_polygons_lose_a_cell_each) {
-    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
-        constexpr uint32_t SHARED = 0x7FFFFFF0;
-        auto slot = [n](uint32_t k) { return static_cast<uint32_t>(uint64_t{k} * 7919 % n); };
-        BuildDir old_d, new_d;
-        put_cells(old_d, "admin", admin_cells_of(n, [&](uint32_t k) { return std::vector<uint32_t>{slot(k), SHARED}; }));
-        put_cells(new_d, "admin", admin_cells_of(n, [](uint32_t) { return std::vector<uint32_t>{SHARED}; }));
-        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
-        std::vector<char> payload;
-        for (const uint64_t v : {uint64_t{0}, uint64_t{0}, uint64_t{n}}) write_varint64(payload, v);
-        for (uint32_t k = 0; k < n; k++) {
-            write_varint64(payload, k ? 1 : 0);
-            write_varint64(payload, 0);
-            write_varint(payload, slot(k) << 1);
-        }
-        write_varint64(payload, 0);
-        return patch_holds(c, cell_index_delta_head(PatchFileId::ADMIN_ENTRIES, payload),
-                           "admin cell index delta of " + std::to_string(n) + " polygons' lost runs");
     }, 10000).empty());
 }
 
@@ -1966,58 +1894,13 @@ TEST(patch_refuses_a_record_stride_past_any_records) {
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
-namespace {
-
-// A cell list delta of hand-written varints: the gone ranks' and the new
-// cells' gaps, then the lost and the gained runs as (start gap, length - 1,
-// bare id << 1 | interior).
-std::vector<char> cell_delta_payload(const std::vector<uint64_t>& gone, const std::vector<uint64_t>& fresh,
-                                     const std::vector<std::array<uint64_t, 3>>& lost,
-                                     const std::vector<std::array<uint64_t, 3>>& gained) {
-    std::vector<char> p;
-    for (const auto* list : {&gone, &fresh}) {
-        write_varint64(p, list->size());
-        for (const uint64_t v : *list) write_varint64(p, v);
-    }
-    for (const auto* runs : {&lost, &gained}) {
-        write_varint64(p, runs->size());
-        for (const auto& r : *runs) {
-            write_varint64(p, r[0]);
-            write_varint64(p, r[1]);
-            write_varint(p, static_cast<uint32_t>(r[2]));
-        }
-    }
-    return p;
-}
-
-// raw with the payload of its cell index delta for entries replaced.
-std::vector<char> with_cell_index_delta(const std::vector<char>& raw, PatchFileId entries, const std::vector<char>& payload) {
-    std::vector<char> head;
-    append(head, CELL_INDEX_DELTA_MARKER);
-    append(head, static_cast<uint32_t>(entries));
-    const size_t at = find_once(raw, head);
-    REQUIRE(at != std::string::npos);
-    uint64_t size;
-    memcpy(&size, raw.data() + at + 8, 8);
-    std::vector<char> out(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(at + 8));
-    append(out, uint64_t{payload.size()});
-    out.insert(out.end(), payload.begin(), payload.end());
-    out.insert(out.end(), raw.begin() + static_cast<std::ptrdiff_t>(at + 16 + size), raw.end());
-    return out;
-}
-
-// The POI index of 20 cells (cell k lists POI k mod 7, the new day's POI k mod
-// 7 + 1) over 40 POIs that stay: the rebuilt index is the old one, ranks 0 to
-// 19. Each case its patch with the POI cell index delta replaced, and the
-// refusal it must earn in every mode.
-struct DeltaCase {
-    std::string name;
-    std::vector<char> payload;
-    std::string refusal;
-};
-
-void check_poi_delta_refusals(const std::string& dir_name, const std::vector<DeltaCase>& cases) {
-    ScratchDir dir(dir_name);
+// A cell index delta whose cell loses, or gains, more ids than a list holds
+// (0xFFFF, its u16 count) is refused in every mode before the ids are read:
+// the POI index's first changed cell, with 65,536 ids the cell doesn't hold
+// added to the ids it loses (the replay took them, dropping none) or with as
+// many new ones added to those it gains. The patch as made applies.
+TEST(patch_refuses_a_cell_losing_or_gaining_more_ids_than_a_list_holds) {
+    ScratchDir dir("patch-cell-ids");
     std::mt19937 rng(20261030);
     CellLists old_cells, new_cells;
     for (uint32_t k = 0; k < 20; k++) {
@@ -2030,58 +1913,44 @@ void check_poi_delta_refusals(const std::string& dir_name, const std::vector<Del
     put_pois(new_d, pois);
     put_cells(old_d, "poi", old_cells);
     put_cells(new_d, "poi", new_cells);
-    const LowMemCase c{dir.path(), "cell-runs"};
+    const LowMemCase c{dir.path(), "cell-ids"};
     REQUIRE(prepare(c, old_d, new_d).empty());
     const std::vector<char> raw = raw_patch(c);
     REQUIRE(!raw.empty());
-    for (const DeltaCase& e : cases) {
-        const std::string patch = c.dir(e.name + ".gcpatch");
-        REQUIRE(write_patch(c, patch, with_cell_index_delta(raw, PatchFileId::POI_ENTRIES, e.payload)));
+    std::vector<char> head;
+    append(head, CELL_INDEX_DELTA_MARKER);
+    append(head, static_cast<uint32_t>(PatchFileId::POI_ENTRIES));
+    const size_t at = find_once(raw, head);
+    REQUIRE(at != std::string::npos);
+    // marker, file id, payload size; the payload: n_removed, removed cells,
+    // n_set, then the first cell: id, n_lost, n_gained, lost ids, gained ids.
+    uint32_t n_removed, n_lost;
+    memcpy(&n_removed, raw.data() + at + 16, 4);
+    const size_t first = at + 24 + 8 * size_t{n_removed};
+    uint32_t n_gained;
+    memcpy(&n_lost, raw.data() + first + 8, 4);
+    memcpy(&n_gained, raw.data() + first + 12, 4);
+    REQUIRE(n_lost == 1 && n_gained == 1);
+    for (const bool gained : {false, true}) {
+        const std::string name = gained ? "gained" : "lost";
+        std::vector<char> ids;
+        for (uint32_t k = 0; k < 0x10000; k++) append(ids, 0x40000000u + k);
+        std::vector<char> edited = raw;
+        uint64_t payload;
+        uint32_t count;
+        memcpy(&payload, edited.data() + at + 8, 8);
+        put_at(edited, at + 8, payload + ids.size());
+        const size_t count_at = first + (gained ? 12 : 8);
+        memcpy(&count, edited.data() + count_at, 4);
+        put_at(edited, count_at, count + 0x10000);
+        // After the cell's ids it loses (one), or those it gains too (one).
+        edited.insert(edited.begin() + static_cast<std::ptrdiff_t>(first + 16 + 4 + (gained ? 4 : 0)), ids.begin(), ids.end());
+        const std::string patch = c.dir(name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
 
-        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+        CHECK(not_refused(c, ALL_MODES, patch, name, "Malformed cell list delta").empty());
     }
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
-}
-
-}  // namespace
-
-// A POI cell index delta with a malformed run is refused in every mode: a lost
-// run over a cell without its id (cell 0 lists POI 0, not 5); 0x10000 lost or
-// gained runs starting at one cell, refused before the patcher holds their
-// ids; a run below the one before it (the same start, a lower id); a run past
-// the last of the index's 20 ranks. The patch as made applies.
-TEST(patch_refuses_each_malformed_run_of_a_cell_index_delta) {
-    std::vector<std::array<uint64_t, 3>> many;
-    for (uint64_t k = 0; k < 0x10000; k++) many.push_back({0, 0, (k + 0x1000) << 1});
-    const std::string active = "Malformed cell list delta: an active set above 65535 ids";
-    check_poi_delta_refusals("patch-cell-runs", {
-        {"missing", cell_delta_payload({}, {}, {{0, 0, 5 << 1}}, {}), "Malformed cell list delta: a lost id missing from its cell"},
-        {"lost-set", cell_delta_payload({}, {}, many, {}), active},
-        {"gained-set", cell_delta_payload({}, {}, {}, many), active},
-        {"step-back", cell_delta_payload({}, {}, {}, {{0, 0, 9 << 1}, {0, 0, 8 << 1}}), "Malformed cell list delta: a step back"},
-        {"past-last", cell_delta_payload({}, {}, {}, {{20, 0, 9 << 1}}), "Malformed cell list delta: a run past the last rank"},
-    });
-}
-
-// The ranks of a cell index delta are u64s in the patcher whatever its size_t
-// (the i386 runner runs this): a run starting at 2^32 + 3 (rank 3 on a 32-bit
-// wrap), one at rank 1 of 2^32 cells (it would end at rank 0), a gone rank of
-// 2^32 + 2 (rank 2), and 2^32 + 1 gained runs where one is (the count wraps to
-// 1) are refused in every mode. The patch as made applies.
-TEST(patch_refuses_cell_index_delta_ranks_that_wrap_32_bits) {
-    const uint64_t two32 = uint64_t{1} << 32;
-    const std::string past = "Malformed cell list delta: a run past the last rank";
-    std::vector<char> counted = cell_delta_payload({}, {}, {}, {});
-    counted.pop_back();  // n_gained, 2^32 + 1 over one run
-    write_varint64(counted, two32 + 1);
-    for (const uint64_t v : {uint64_t{3}, uint64_t{0}}) write_varint64(counted, v);
-    write_varint(counted, 9 << 1);
-    check_poi_delta_refusals("patch-cell-runs-32", {
-        {"start", cell_delta_payload({}, {}, {}, {{two32 + 3, 0, 9 << 1}}), past},
-        {"length", cell_delta_payload({}, {}, {}, {{1, two32 - 1, 9 << 1}}), past},
-        {"gone", cell_delta_payload({two32 + 2}, {}, {}, {}), "Malformed cell list delta: a gone rank past the last source cell"},
-        {"count", counted, "Malformed cell list delta"},
-    });
 }
 
 // A client file list of more files than a variant holds (1025, past

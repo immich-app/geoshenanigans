@@ -1251,7 +1251,6 @@ TEST(patch_round_trip_moves_no_admin_slot_by_admin_polygon_content) {
     CHECK(r.mismatches.empty());
     CHECK_EQ(merge_records(r, "poi_records.bin"), std::string("m/i/d/r=2/1/0/0"));
     CHECK_EQ(merge_records(r, "place_nodes.bin"), std::string("m/i/d/r=1/1/0/0"));
-    CHECK(logged(r, "admin_entries.bin: cell index delta (" + std::to_string(unchanged_index.size()) +
-                        " bytes: 0 gone and 0 new cells, 0 lost and 0 gained runs)"));
+    CHECK(logged(r, "admin_entries.bin: cell index delta (" + std::to_string(unchanged_index.size()) + " bytes)"));
     CHECK_EQ(merge_records(r, "admin_polygons.bin"), std::string("m/i/d/r=0/1/0/2"));
 }
