@@ -57,6 +57,37 @@ inline uint64_t arc_key(uint64_t first, uint64_t last, uint64_t min_interior, bo
     return h & 0x00FFFFFFFFFFFFFFull;
 }
 
+// The identities an arc whose arc_key changed can still keep its slot by,
+// one fallback pass each (IdAllocator::allocate_all), in this order: its way
+// set, the OSM ways along its edges in every ring that runs along it, which
+// stays when vertices move, its ends included; and its ends, which stay when
+// its interior changes, ways and all. 56-bit hashes, or kNoFallbackKey (an
+// arc of no ring with way runs; a tombstone's slot).
+struct ArcFallbackKeys {
+    uint64_t way_set = gc::id_alloc::kNoFallbackKey;
+    uint64_t ends = gc::id_alloc::kNoFallbackKey;
+};
+inline bool operator==(const ArcFallbackKeys& a, const ArcFallbackKeys& b) {
+    return a.way_set == b.way_set && a.ends == b.ends;
+}
+
+// The way-set key of the ways `ways`, ascending, each once; none for none.
+inline uint64_t arc_way_set_key(const int64_t* ways, size_t n) {
+    if (n == 0) return gc::id_alloc::kNoFallbackKey;
+    uint64_t h = mix64(uint64_t(n) + 0x632be59bd9b4e019ull);
+    for (size_t i = 0; i < n; i++) h = mix64(h ^ static_cast<uint64_t>(ways[i]));
+    return h & 0x00FFFFFFFFFFFFFFull;
+}
+
+// The ends key of an arc from vertex `first` to `last` (its smallest vertex
+// twice when closed).
+inline uint64_t arc_ends_key(uint64_t first, uint64_t last, bool closed) {
+    uint64_t h = mix64(first + 0x8cb92ba72f3d8dd7ull);
+    h = mix64(h ^ last);
+    h = mix64(h ^ (closed ? 1u : 2u));
+    return h & 0x00FFFFFFFFFFFFFFull;
+}
+
 // The index of cell (x, y) along the Hilbert curve over 2^32 x 2^32 cells.
 inline uint64_t hilbert_index(uint32_t x, uint32_t y) {
     uint64_t d = 0;
@@ -106,6 +137,7 @@ struct Arc {
     ArcView view;
     ArcBox box;
     uint64_t key = 0;          // arc_key
+    ArcFallbackKeys fallback;
     uint32_t planet_slot = 0;  // in the planet's full set (build_admin_arcs)
 };
 
@@ -143,6 +175,9 @@ struct AdminArcCounts {
     size_t largest_partition = 0;  // vertex occurrences
     size_t hash_collisions = 0;    // pieces whose hash another arc had
     size_t duplicate_keys = 0;     // arcs whose key an earlier one has
+    size_t arcs_without_ways = 0;  // of rings with no way runs: no way-set key
+    size_t shared_way_sets = 0;    // arcs whose way-set key an earlier one has
+    size_t shared_ends = 0;        // arcs whose ends key an earlier one has
 };
 
 struct AdminArcSlotCounts {
@@ -164,6 +199,7 @@ struct MinimalArc {
     bool closed = false;
     ArcBox box;
     uint64_t key = 0;          // arc_key
+    ArcFallbackKeys fallback;  // its way set its parts' ways
     uint32_t planet_slot = 0;  // in the planet's minimal set
 };
 
@@ -178,6 +214,8 @@ struct MinimalArcCounts {
     size_t refs = 0;
     size_t arc_vertices = 0;  // over every arc, a closed arc's first twice
     size_t duplicate_keys = 0;
+    size_t shared_way_sets = 0;
+    size_t shared_ends = 0;
 };
 
 // The minimal set: the arcs of the rings of admin_minimal_keeps' polygons.
@@ -272,6 +310,11 @@ struct AdminArcs {
     // the rings numbered as the exact ring store numbers them.
     std::vector<uint32_t> ring_refs;
     std::vector<ArcRef> refs;
+    // Arc a's member ways (its way set), ascending, each once:
+    // ways[way_at[a], way_at[a + 1]). The minimal set's way sets are its
+    // parts'; build_admin_arcs frees them once it has those.
+    std::vector<uint32_t> way_at;
+    std::vector<int64_t> ways;
     // The planet slots' IdAllocator table, its arc_index.osm_ids sidecar.
     std::vector<gc::id_alloc::SidecarSlot> planet_sidecar;
     AdminArcCounts counts;
@@ -321,8 +364,11 @@ private:
 
 // The topology of the store's rings: their arcs, in presentation order (the
 // Hilbert index of the first vertex, the key, then the vertices), each with
-// its view, box and key, and every ring's refs. On at most `threads` threads,
-// with the same result on any number. `phase_done` is told as each step ends.
+// its view, box, key and fallback keys, its way set the ways of the store's
+// way runs along it in every ring, and every ring's refs. On at most
+// `threads` threads, with the same result on any number and in any ring
+// order. Aborts (std::logic_error) unless each ring with way runs has them
+// over all of its edges. `phase_done` is told as each step ends.
 AdminArcs build_arc_topology(const AdminExactRings& store, unsigned threads,
                              const std::function<void(const char*)>& phase_done = {});
 
@@ -490,13 +536,14 @@ struct ArcBlocks {
 };
 
 // One arc set of a region: its arcs, in the planet's presentation order, by
-// their raw boxes, keys and planet slots and the region's slots (the
+// their raw boxes, keys, fallback keys and planet slots and the region's slots (the
 // planet's on the planet) and slot table; each ring's refs to them, the
 // rings numbered as AdminArcPolygon numbers them; and the polygons' ring
 // blocks.
 struct ArcSetBlocks {
     std::vector<ArcBox> boxes;
     std::vector<uint64_t> keys;
+    std::vector<ArcFallbackKeys> fallback_keys;
     std::vector<uint32_t> planet_slots;
     std::vector<uint32_t> slots;
     std::vector<gc::id_alloc::SidecarSlot> sidecar;
@@ -552,7 +599,7 @@ std::vector<uint32_t> arc_at_slot(const ArcSetBlocks& set);
 
 // A continent's share of the planet's encoded arcs: those its polygons
 // (`polygons`, planet ids ascending) use, in the planet's order, their
-// blocks, boxes, keys and planet slots copied, and its polygons' rings'
+// blocks, boxes, keys, fallback keys and planet slots copied, and its polygons' rings'
 // refs. It has no slots or ring blocks until assign_region_arc_slots.
 AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector<uint32_t>& polygons, unsigned threads);
 

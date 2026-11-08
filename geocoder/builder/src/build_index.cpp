@@ -4096,6 +4096,7 @@ static int run(int argc, char* argv[]) {
         log_mem("data.admin_polygons",               vec_bytes(data.admin_polygons));
         log_mem("data.admin_osm_ids",                vec_bytes(data.admin_osm_ids));
         log_mem("data.admin_exact_rings.vertices",   vec_bytes(data.admin_exact_rings.vertices));
+        log_mem("data.admin_exact_rings.runs",       vec_bytes(data.admin_exact_rings.runs));
         log_mem("data.admin_parent_ids",             vec_bytes(data.admin_parent_ids));
         log_mem("data.poi_records",                  vec_bytes(data.poi_records));
         log_mem("data.poi_osm_ids",                  vec_bytes(data.poi_osm_ids));
@@ -4142,6 +4143,7 @@ static int run(int argc, char* argv[]) {
             const AdminArcs arcs = build_admin_arcs(data.admin_exact_rings, in_minimal,
                                                     cfg.prev_output_dir.empty() ? "" : cfg.prev_output_dir + "/planet",
                                                     num_threads);
+            data.admin_exact_rings.drop_way_runs();  // the arcs' way sets were their last use
             data.admin_arcs = encode_admin_arcs(arcs, data.admin_exact_rings, num_threads);
             log_phase("    Admin: arcs", _pt, _cpu);
             compute_admin_index_cells(data, arcs, std::move(exact_cells), num_threads);
