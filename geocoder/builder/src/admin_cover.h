@@ -56,7 +56,9 @@ inline void merge_cell_lists(std::vector<CellList>& lists, std::vector<uint64_t>
     lists.erase(std::remove_if(lists.begin(), lists.end(), [](const CellList& l) { return l.first == l.second; }),
                 lists.end());
     if (lists.size() == 1) {
+        // A list may name a cell more than once; the union names it once.
         out.assign(lists[0].first, lists[0].second);
+        out.erase(std::unique(out.begin(), out.end()), out.end());
         lists.clear();
         return;
     }
