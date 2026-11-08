@@ -1969,7 +1969,8 @@ static int run(int argc, char* argv[]) {
         }
     }
     // The mode dirs hold no admin geometry: a client reads them beside a
-    // boundary tier, without which no dir of the build would load.
+    // boundary tier, without which none of them would load (only
+    // admin-minimal, which holds its own arcs, would).
     if (multi_output && !multi_quality) {
         std::cerr << "Error: --multi-output needs --multi-quality: its mode dirs (full, no-addresses, admin) hold no "
                      "admin geometry, which a client reads from a boundary tier (quality/simplified or quality/exact)"
