@@ -693,19 +693,6 @@ public:
         }
         malformed();
     }
-    // A u64 as a varint (write_varint64). One longer than 10 bytes, or of 2^64
-    // or more, is malformed.
-    uint64_t varint64() {
-        uint64_t v = 0;
-        for (uint32_t bit = 0; bit < 70; bit += 7) {
-            if (pos_ >= size_) refuse_past_end(name_, past_end_, 1, "varint", pos_, size_);
-            const uint8_t byte = static_cast<uint8_t>(data_[pos_++]);
-            if (bit == 63 && (byte & 0x7E)) malformed();
-            v |= static_cast<uint64_t>(byte & 0x7F) << bit;
-            if (!(byte & 0x80)) return v;
-        }
-        malformed();
-    }
     // A NUL-terminated string, where it sits.
     const char* cstring() {
         const void* nul = pos_ < size_ ? memchr(data_ + pos_, '\0', size_ - pos_) : nullptr;
@@ -1687,15 +1674,6 @@ private:
 // --- Varint encoding for delta-compressed fixup tables and string runs ---
 
 inline void write_varint(std::vector<char>& buf, uint32_t value) {
-    while (value >= 128) {
-        buf.push_back(static_cast<char>((value & 0x7F) | 0x80));
-        value >>= 7;
-    }
-    buf.push_back(static_cast<char>(value));
-}
-
-// A u64 as SectionReader::varint64 reads it: 1 to 10 bytes.
-inline void write_varint64(std::vector<char>& buf, uint64_t value) {
     while (value >= 128) {
         buf.push_back(static_cast<char>((value & 0x7F) | 0x80));
         value >>= 7;

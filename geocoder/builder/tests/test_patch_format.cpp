@@ -156,43 +156,6 @@ TEST(patch_format_bounded_varint_rejects_bits_past_32) {
     CHECK_EQ(runs_reader(max.data(), max.size(), pos).varint(), 0xFFFFFFFFu);
 }
 
-// --- write_varint64 / SectionReader::varint64 ---
-
-TEST(patch_format_varint64_round_trips_every_length) {
-    // Each 7-bit boundary (the last value of n bytes, the first of n + 1), up to the 10-byte 2^64 - 1.
-    std::vector<uint64_t> values = {0, 1, 127, 128, 300000, 0xFFFFFFFFull, 0x100000000ull, ~0ull};
-    for (unsigned bits = 7; bits < 64; bits += 7) {
-        values.push_back((uint64_t{1} << bits) - 1);
-        values.push_back(uint64_t{1} << bits);
-    }
-    for (const uint64_t v : values) {
-        std::vector<char> buf;
-        write_varint64(buf, v);
-        size_t pos = 0;
-        CHECK_EQ(SectionReader(buf.data(), buf.size(), pos, "varint").varint64(), v);
-        CHECK_EQ(pos, buf.size());
-    }
-    std::vector<char> max;
-    write_varint64(max, ~0ull);
-    CHECK_EQ(max.size(), size_t(10));
-}
-
-TEST(patch_format_varint64_rejects_truncated_overlong_and_values_past_64_bits) {
-    std::vector<char> buf;
-    write_varint64(buf, 0x123456789ABCDEFull);
-    for (size_t cut = 0; cut < buf.size(); cut++) {
-        size_t pos = 0;
-        CHECK_EQ(refusal_of([&] { runs_reader(buf.data(), cut, pos).varint64(); }), std::string("Malformed runs"));
-    }
-    // An 11th byte, and a 10th byte holding a bit past bit 63 (2^64 + 5 would read as 5).
-    const char overlong[11] = {'\x80', '\x80', '\x80', '\x80', '\x80', '\x80', '\x80', '\x80', '\x80', '\x80', '\x01'};
-    const char too_big[10] = {'\x85', '\x80', '\x80', '\x80', '\x80', '\x80', '\x80', '\x80', '\x80', '\x02'};
-    for (const auto& [bytes, n] : {std::pair<const char*, size_t>{overlong, sizeof overlong}, {too_big, sizeof too_big}}) {
-        size_t pos = 0;
-        CHECK_EQ(refusal_of([&] { runs_reader(bytes, n, pos).varint64(); }), std::string("Malformed runs"));
-    }
-}
-
 // --- SectionReader ---
 
 // One read of each kind, and the bytes it reads.
