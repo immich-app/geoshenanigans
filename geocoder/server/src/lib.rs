@@ -3020,7 +3020,12 @@ impl Index {
         (landmark_name, places)
     }
 
+    /// The address of (lat, lng); none for a point off the globe, or NaN: S2 would wrap it onto
+    /// cells of the globe, whose streets, POIs and boundaries are near another point.
     pub fn query(&self, lat: f64, lng: f64) -> Address<'_> {
+        if !coords_in_range(lat, lng) {
+            return Address::default();
+        }
         let max_dist = self.max_distance_sq;
 
         // Run geo lookups first so we know the primary street
@@ -6467,6 +6472,30 @@ mod query_path_tests {
         // The first two are the origin's own point once S2 wraps them onto the globe.
         for (lat, lng) in [(lat, lng + 360.0), (180.0 - lat, lng - 180.0), (f64::NAN, lng), (lat, f64::INFINITY), (90.5, lng), (lat, -180.5)] {
             assert_eq!(world.query_json(lat, lng), "{}", "({}, {})", lat, lng);
+        }
+    }
+
+    #[test]
+    fn query_finds_nothing_off_the_globe_though_its_wrapped_cells_list_a_street_with_a_parent() {
+        // S2 wraps a point off the globe onto cells of the globe, and where those cells list a
+        // street the query's admin walks that street's parent chain, however far the street is:
+        // Main Street's chain names Testland.
+        let mut index = TestIndex::new().street("Main Street", &[(0.0, -500.0), (0.0, 500.0)]).load();
+        // Main Street (way 0) in Testland (polygon 0), the top of its chain.
+        index.way_parents = Some(FileBytes::Owned(0u32.to_le_bytes().to_vec()));
+        index.admin_parents = Some(FileBytes::Owned(NO_DATA.to_le_bytes().to_vec()));
+        let on = address_at(&index, 10.0, 0.0);
+        assert_eq!((on["road"].as_str(), on["country"].as_str()), (Some("Main Street"), Some("Testland")));
+        let p = at(10.0, 0.0);
+        let (lat, lng) = (p.lat as f64, p.lng as f64);
+        let cell = |lat: f64, lng: f64| cell_id_at_level(lat, lng, DEFAULT_STREET_CELL_LEVEL);
+        // Each is p once S2 wraps it onto the globe.
+        for (wlat, wlng) in [(lat, lng + 360.0), (lat, lng - 360.0), (180.0 - lat, lng - 180.0), (-180.0 - lat, lng + 180.0)] {
+            assert_eq!(cell(wlat, wlng), cell(lat, lng), "({wlat}, {wlng})");
+            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), r#"{"address":{}}"#, "({wlat}, {wlng})");
+        }
+        for (wlat, wlng) in [(f64::NAN, lng), (lat, f64::NAN), (lat, f64::INFINITY), (f64::NEG_INFINITY, lng)] {
+            assert_eq!(serde_json::to_string(&index.query(wlat, wlng)).unwrap(), r#"{"address":{}}"#, "({wlat}, {wlng})");
         }
     }
 
