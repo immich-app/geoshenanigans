@@ -602,6 +602,77 @@ TEST(a_hole_the_11_m_grid_puts_on_its_outer_ring_goes_back_to_the_1_1_m_tier_not
     }
 }
 
+TEST(a_polygon_the_11_m_grid_unnests_without_a_crossing_goes_back_to_the_1_1_m_tier) {
+    // A hole just inside its outer ring's straight north edge (at 300), small
+    // enough to collapse on the 11 m grid, so kept fine: the 11 m grid moves
+    // the edge to 0, which leaves the hole outside, touching nothing, with
+    // nothing dropped to give back. The polygon's arcs go back as the 1.1 m
+    // tier has them, not to OSM's grid.
+    const Ring outer = closed({pt(300, 0), pt(300, 100000), pt(-100000, 100000), pt(-100000, 0)});
+    const Ring hole = closed({pt(137, 50037), pt(237, 49737), pt(237, 50337)});
+    const Built b = built({{outer, {hole}}});
+    const size_t m = minimal_tier();
+    const ArcTierCounts& c = b.arcs.tiers[m].counts;
+    CHECK_EQ(c.crossings_coarse, size_t(0));
+    CHECK_EQ(c.put_back_arcs, size_t(2));
+    CHECK_EQ(c.e7_grid_arcs, size_t(0));
+    CHECK_EQ(c.rings_nest_introduced, size_t(0));
+    bool chained = true;
+    const std::vector<Ring> rings = decoded_rings(b.blocks, ArcSet::Minimal, m, 0, chained);
+    REQUIRE(rings.size() == 2);
+    CHECK(chained);
+    CHECK(same_ring(rings[0], outer));
+    CHECK(same_ring(rings[1], snapped_ring(hole, kFine)));
+    const uint32_t a = minimal_arc_through(b, outer[1]);
+    REQUIRE(a != UINT32_MAX);
+    CHECK_EQ(int(block_of(b.blocks, m, a).k), 2);
+}
+
+TEST(an_arc_put_back_drops_the_vertex_the_11_m_repair_gave_it) {
+    // A square whose north edge bows 300 south at 30000, dropped on both
+    // grids, and an island 400 north of that edge, which the 11 m grid lays
+    // on it. The repair there gives the bow back, on the 11 m grid, so on the
+    // edge still, and has nothing more to give: both arcs go back as the
+    // 1.1 m tier has them, the bow dropped again.
+    const Ring square = closed({pt(0, 0), pt(-300, 30000), pt(0, 100000), pt(-100000, 100000), pt(-100000, 0)});
+    const Ring island = closed({pt(400, 49000), pt(400, 51000), pt(3000, 51000), pt(3000, 49000)});
+    const Built b = built({{square, {}}, {island, {}}});
+    const size_t m = minimal_tier();
+    const ArcTierCounts& c = b.arcs.tiers[m].counts;
+    CHECK(c.repair_restored >= 1);
+    CHECK_EQ(c.put_back_arcs, size_t(2));
+    CHECK_EQ(c.crossings_left, size_t(0));
+    const uint32_t a = minimal_arc_through(b, square[1]);
+    REQUIRE(a != UINT32_MAX);
+    const arc_blocks::DecodedArc d = block_of(b.blocks, m, a);
+    CHECK_EQ(int(d.k), 2);
+    CHECK(same_ring(d.vertices, closed({pt(0, 0), pt(0, 100000), pt(-100000, 100000), pt(-100000, 0)})));
+}
+
+TEST(an_arc_put_back_that_meets_a_coarse_one_puts_that_one_back_in_another_round) {
+    // The 11 m grid lays the triangle T's south edge on the square Q's north
+    // edge, 400 below: both go back. T's apex then sits, on the 1.1 m grid,
+    // at 500 on P's south edge as the 11 m grid has it (600 raw), so a second
+    // round puts P back too.
+    const int32_t L = 500000;
+    const Ring T = closed({pt(-5000, L - 3000), pt(450, L), pt(-5000, L + 3000)});
+    const Ring Q = closed({pt(-5400, L - 2000), pt(-5400, L + 2000), pt(-9000, L + 2000), pt(-9000, L - 2000)});
+    const Ring P = closed({pt(1450, L - 10000), pt(-250, L + 10000), pt(20000, L + 10000), pt(20000, L - 10000)});
+    const Built b = built({{T, {}}, {Q, {}}, {P, {}}});
+    const size_t m = minimal_tier();
+    const ArcTierCounts& c = b.arcs.tiers[m].counts;
+    CHECK_EQ(c.put_back_arcs, size_t(3));
+    CHECK_EQ(c.put_back_rounds, 2);
+    CHECK_EQ(c.crossings_left, size_t(0));
+    for (const Ring* ring : {&T, &Q, &P}) {
+        const uint32_t a = minimal_arc_through(b, (*ring)[1]);
+        REQUIRE(a != UINT32_MAX);
+        const arc_blocks::DecodedArc d = block_of(b.blocks, m, a);
+        CHECK_EQ(int(d.k), 2);
+        CHECK(same_ring(d.vertices, snapped_ring(*ring, kFine)));
+    }
+}
+
 TEST(a_ring_kept_fine_that_the_11_m_repair_collapses_again_goes_back_to_the_1_1_m_tier) {
     // R = A B C is valid on the 1.1 m grid and a line on the 11 m one, so
     // the loop keeps it fine. Its arc B..C drops D, at A's latitude; the
