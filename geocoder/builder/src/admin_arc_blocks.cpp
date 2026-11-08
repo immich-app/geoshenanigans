@@ -96,8 +96,8 @@ ArcBlocks encode_tier(const AdminArcs& arcs, const AdminExactRings& store, size_
         },
         [&](size_t a, uint8_t* to, unsigned worker) {
             EncodeScratch& s = scratch[worker];
-            const uint8_t e7_grid = state.grid_of(static_cast<uint32_t>(a));
-            const uint8_t k = arc_grid_exponent(tier, e7_grid);
+            const uint8_t grid = state.grid_of(static_cast<uint32_t>(a));
+            const uint8_t k = arc_grid_exponent(tier, grid);
             const size_t count = stored_of(a, s);
             const size_t bytes = arc_blocks::encode_arc(count, at_of(s), k, to);
             auto fail = [&](const std::string& what) {
@@ -114,13 +114,13 @@ ArcBlocks encode_tier(const AdminArcs& arcs, const AdminExactRings& store, size_
                 if (v.raw >= raw_count || (i > 0 && v.raw <= s.stored[i - 1].raw) || (i == 0 && v.raw != 0))
                     fail("stores its raw vertices out of order");
                 const PackedLocation raw = s.raw[v.raw];
-                const int32_t grid = vertex_grid_e7(tier, e7_grid, v.raw, raw_count);
-                if (grid < block_grid || v.at != snapped(raw, grid)) fail("stores a vertex no raw one snaps to");
+                const int32_t step = vertex_grid_e7(tier, grid, v.raw, raw_count);
+                if (step < block_grid || v.at != snapped(raw, step)) fail("stores a vertex no raw one snaps to");
                 if (std::abs(int64_t(v.at.lat_e7) - raw.lat_e7) > kChunkBoxSlackE7 ||
                     std::abs(int64_t(v.at.lon_e7) - raw.lon_e7) > kChunkBoxSlackE7)
                     fail("stores a vertex past the chunk slack from its raw one");
             }
-            if (s.stored.back().at != snapped(s.raw.back(), vertex_grid_e7(tier, e7_grid, raw_count - 1, raw_count)))
+            if (s.stored.back().at != snapped(s.raw.back(), vertex_grid_e7(tier, grid, raw_count - 1, raw_count)))
                 fail("doesn't end where its raw vertices do");
             return bytes;
         },

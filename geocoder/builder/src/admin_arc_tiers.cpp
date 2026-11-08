@@ -60,7 +60,7 @@ private:
 
 // tier_vertices for arc a's raw vertices `raw` and its arc_grid marks.
 void stored_vertices(const std::vector<PackedLocation>& raw, const ArcKeep& keep, uint32_t a, const ArcTier& tier,
-                     uint8_t e7_grid, std::vector<StoredVertex>& out) {
+                     uint8_t grid, std::vector<StoredVertex>& out) {
     out.clear();
     const uint32_t n = static_cast<uint32_t>(raw.size());
     if (!tier.simplifies()) {
@@ -70,7 +70,7 @@ void stored_vertices(const std::vector<PackedLocation>& raw, const ArcKeep& keep
     for (uint32_t i = 0; i < n; i++) {
         if (!keep.test(a, i)) continue;
 
-        const PackedLocation p = snapped(raw[i], vertex_grid_e7(tier, e7_grid, i, n));
+        const PackedLocation p = snapped(raw[i], vertex_grid_e7(tier, grid, i, n));
         if (!out.empty() && out.back().at == p) {
             if (i + 1 == n && out.size() > 1) out.back().raw = i;
             continue;
@@ -282,7 +282,7 @@ public:
     TierBuilder(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier, unsigned threads)
         : store_(store), set_(arcs, store, tier.set), tier_(tier), threads_(threads), arc_count_(set_.size()),
           keep_(arc_count_, [&](size_t a) { return set_.count(static_cast<uint32_t>(a)); }),
-          e7_grid_(arc_count_, 0) {
+          grid_(arc_count_, 0) {
         for (uint32_t r = 0; r < store.rings.size(); r++)
             if (set_.has_ring(r)) rings_.push_back(r);
         // Each arc's rings.
@@ -451,7 +451,7 @@ public:
             for (size_t i = begin; i < end; i++) {
                 const uint32_t a = static_cast<uint32_t>(i);
                 set_.read(a, s.raw);
-                stored_vertices(s.raw, keep_, a, tier_, e7_grid_[a], s.stored);
+                stored_vertices(s.raw, keep_, a, tier_, grid_[a], s.stored);
                 size_t k = 0;
                 for (uint32_t v = 0; v < s.raw.size(); v++) k += keep_.test(a, v);
                 kept[a] = k;
@@ -467,7 +467,7 @@ public:
     }
 
     ArcKeep take_keep() { return std::move(keep_); }
-    std::vector<uint8_t> take_e7_grid() { return std::move(e7_grid_); }
+    std::vector<uint8_t> take_grid() { return std::move(grid_); }
 
     // Polygons whose rings nest in exact but still not once stored after the
     // repair keep their arcs and those arcs' junctions on the e7 grid
@@ -488,7 +488,8 @@ public:
             sort_unique(suspects, threads_);
             unnested = not_nesting(suspects);
         }
-        counts.e7_grid_arcs = parallel_count(arc_count_, [&](size_t a) { return e7_grid_[a] != 0; }, threads_);
+        counts.e7_grid_arcs =
+            parallel_count(arc_count_, [&](size_t a) { return (grid_[a] & arc_grid::kE7Whole) != 0; }, threads_);
     }
 
 private:
@@ -566,7 +567,7 @@ private:
                         const uint32_t a = set_.refs()[i].arc;
                         ring_arcs[r].push_back(a);
                         set_.read(a, s.raw);
-                        stored_vertices(s.raw, keep_, a, tier_, e7_grid_[a], s.stored);
+                        stored_vertices(s.raw, keep_, a, tier_, grid_[a], s.stored);
                         for (const StoredVertex& v : s.stored) points.push_back({v.at, r, a});
                     }
                 for (auto& arcs_of : ring_arcs) std::sort(arcs_of.begin(), arcs_of.end());
@@ -576,7 +577,7 @@ private:
                 for (uint32_t r = 0; r < poly.ring_count; r++)
                     for (uint32_t a : ring_arcs[r]) {
                         set_.read(a, s.raw);
-                        stored_vertices(s.raw, keep_, a, tier_, e7_grid_[a], s.stored);
+                        stored_vertices(s.raw, keep_, a, tier_, grid_[a], s.stored);
                         degrees_of(s.raw, s.pts);
                         for (size_t j = 1; j < s.stored.size(); j++) {
                             const uint32_t from = s.stored[j - 1].raw, to = s.stored[j].raw;
@@ -632,9 +633,9 @@ private:
         parallel_for(arc_count_, [&](size_t begin, size_t end, unsigned) {
             for (size_t i = begin; i < end; i++) {
                 const uint32_t a = static_cast<uint32_t>(i);
-                grid[a] = e7_grid_[a];
+                grid[a] = grid_[a];
                 if (std::binary_search(whole.begin(), whole.end(), a)) {
-                    grid[a] = arc_grid::kE7Whole;
+                    grid[a] |= arc_grid::kE7Whole;
                     continue;
                 }
                 if (set_.closed(a)) continue;
@@ -648,8 +649,8 @@ private:
         }, threads_);
         std::vector<uint32_t> changed;
         for (uint32_t a = 0; a < arc_count_; a++)
-            if (grid[a] != e7_grid_[a]) changed.push_back(a);
-        e7_grid_ = std::move(grid);
+            if (grid[a] != grid_[a]) changed.push_back(a);
+        grid_ = std::move(grid);
         return changed;
     }
 
@@ -661,7 +662,7 @@ private:
         for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) {
             const ArcRef ref = set_.refs()[k];
             set_.read(ref.arc, s.raw);
-            stored_vertices(s.raw, keep_, ref.arc, tier_, e7_grid_[ref.arc], s.stored);
+            stored_vertices(s.raw, keep_, ref.arc, tier_, grid_[ref.arc], s.stored);
             const size_t n = s.stored.size();
             for (size_t i = 0; i < n; i++) {
                 const PackedLocation p = s.stored[ref.reversed ? n - 1 - i : i].at;
@@ -680,7 +681,7 @@ private:
 
     void add_segments(uint32_t a, Scratch& s, std::vector<Segment>& out) const {
         set_.read(a, s.raw);
-        stored_vertices(s.raw, keep_, a, tier_, e7_grid_[a], s.stored);
+        stored_vertices(s.raw, keep_, a, tier_, grid_[a], s.stored);
         for (size_t k = 1; k < s.stored.size(); k++)
             out.push_back({a, s.stored[k - 1].raw, s.stored[k].raw, s.stored[k - 1].at, s.stored[k].at});
     }
@@ -899,7 +900,7 @@ private:
     unsigned threads_;
     size_t arc_count_;
     ArcKeep keep_;
-    std::vector<uint8_t> e7_grid_;  // arc_grid marks, by arc
+    std::vector<uint8_t> grid_;  // arc_grid marks, by arc
     std::vector<uint32_t> rings_;  // the set's
     std::vector<uint32_t> user_at_, users_;  // arc a's rings: users_[user_at_[a], user_at_[a + 1])
     std::vector<uint32_t> candidates_;  // nesting_candidates
@@ -980,7 +981,7 @@ ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store,
     done("what is left");
     builder.count_vertices(state.counts);
     state.kept = builder.take_keep();
-    state.e7_grid = builder.take_e7_grid();
+    state.grid = builder.take_grid();
     return state;
 }
 

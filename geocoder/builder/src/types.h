@@ -227,20 +227,24 @@ static constexpr int64_t kArcRepairCellE7 = 200000;
 
 // A boundary tier: the arcs of one set at one tolerance and grid. A tier
 // with no tolerance stores every raw vertex as OSM has it: no simplifying,
-// snapping or cap.
+// snapping or cap. A tier whose grid is coarser than its fine grid is first
+// built on the fine one, then coarsened: a ring valid on the fine grid that
+// its grid would collapse keeps its arcs and their junctions there.
 struct ArcTier {
     ArcSet set;
-    const char* dir;     // under a region's dir
-    double tolerance_m;  // 0: none
-    double cap_factor;   // 0: none
-    int32_t grid_e7;     // the snap grid's step; 1: OSM's own
+    const char* dir;       // under a region's dir
+    double tolerance_m;    // 0: none
+    double cap_factor;     // 0: none
+    int32_t grid_e7;       // the snap grid's step; 1: OSM's own
+    int32_t fine_grid_e7;  // the grid a collapsing ring keeps: grid_e7 for a tier that doesn't coarsen
     bool simplifies() const { return tolerance_m > 0; }
+    bool coarsens() const { return grid_e7 > fine_grid_e7; }
 };
 
 inline constexpr ArcTier kArcTiers[] = {
-    {ArcSet::Full, "quality/simplified", kArcSimplifyToleranceM, kArcCapFactor, kSimplifiedGridE7},
-    {ArcSet::Full, "quality/exact", 0, 0, 1},
-    {ArcSet::Minimal, "admin-minimal", kArcSimplifyToleranceM, kArcCapFactor, kSimplifiedGridE7},
+    {ArcSet::Full, "quality/simplified", kArcSimplifyToleranceM, kArcCapFactor, kSimplifiedGridE7, kSimplifiedGridE7},
+    {ArcSet::Full, "quality/exact", 0, 0, 1, 1},
+    {ArcSet::Minimal, "admin-minimal", kArcSimplifyToleranceM, kArcCapFactor, kSimplifiedGridE7, kSimplifiedGridE7},
 };
 inline constexpr size_t kArcTierCount = sizeof(kArcTiers) / sizeof(kArcTiers[0]);
 
@@ -263,6 +267,13 @@ static constexpr uint64_t kRefChunkCutMask = 7;
 // a chunk's raw box widened by this holds every vertex any tier stores of
 // its arcs (half the 1e-4 degree grid, the coarsest a tier may take).
 static constexpr int32_t kChunkBoxSlackE7 = 500;
+constexpr bool every_tier_snaps_within_the_chunk_slack() {
+    for (const ArcTier& tier : kArcTiers)
+        if (tier.grid_e7 / 2 > kChunkBoxSlackE7 || tier.fine_grid_e7 > tier.grid_e7) return false;
+    return true;
+}
+static_assert(every_tier_snaps_within_the_chunk_slack(),
+              "a tier's grid snaps a vertex past the chunk slack, or its fine grid is coarser than its grid");
 
 // --- Index mode ---
 

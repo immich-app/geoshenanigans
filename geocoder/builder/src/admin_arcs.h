@@ -281,17 +281,24 @@ struct ArcTierCounts {
     size_t rings_nest_introduced = 0;  // polygons whose rings nest in exact, not here
 };
 
-// Which vertices of a simplified tier's arc stay on OSM's own e7 grid
-// instead of the tier's: its first and last (each a junction other arcs end
-// at too) and the ones between. A polygon whose rings stop nesting only once
-// snapped, with no dropped vertex to give back, keeps its arcs and their
-// junctions on the e7 grid, and so does every arc at one of those junctions
-// at that end: a junction is one point in every arc that ends there.
+// Which vertices of a simplified tier's arc are stored on another grid than
+// the tier's: its first and last (each a junction other arcs end at too) and
+// the ones between, each on OSM's own e7 grid, or else on the tier's fine
+// grid (ArcTier::fine_grid_e7).
+//
+// A polygon whose rings stop nesting only once snapped, with no dropped
+// vertex to give back, keeps its arcs and their junctions on the e7 grid,
+// and so does every arc at one of those junctions at that end: a junction is
+// one point in every arc that ends there.
 namespace arc_grid {
 constexpr uint8_t kE7First = 1;
 constexpr uint8_t kE7Last = 2;
 constexpr uint8_t kE7Between = 4;
 constexpr uint8_t kE7Whole = kE7First | kE7Last | kE7Between;
+constexpr uint8_t kFineFirst = 8;
+constexpr uint8_t kFineLast = 16;
+constexpr uint8_t kFineBetween = 32;
+constexpr uint8_t kFineWhole = kFineFirst | kFineLast | kFineBetween;
 }  // namespace arc_grid
 
 // What a tier holds: the keep marks of a simplified tier (empty for one that
@@ -299,10 +306,10 @@ constexpr uint8_t kE7Whole = kE7First | kE7Last | kE7Between;
 // of a simplified tier) and its counts.
 struct ArcTierState {
     ArcKeep kept;
-    std::vector<uint8_t> e7_grid;
+    std::vector<uint8_t> grid;
     ArcTierCounts counts;
 
-    uint8_t grid_of(uint32_t arc) const { return e7_grid.empty() ? 0 : e7_grid[arc]; }
+    uint8_t grid_of(uint32_t arc) const { return grid.empty() ? 0 : grid[arc]; }
 };
 
 // The arcs of every admin polygon's rings (the full set), and the minimal
@@ -490,15 +497,19 @@ struct StoredVertex {
 
 // The grid step, in e7 units, a tier stores raw vertex i of an arc of n
 // raw vertices on, given the arc's arc_grid marks.
-inline int32_t vertex_grid_e7(const ArcTier& tier, uint8_t e7_grid, uint32_t i, uint32_t n) {
-    const uint8_t mark = i == 0 ? arc_grid::kE7First : i + 1 == n ? arc_grid::kE7Last : arc_grid::kE7Between;
-    return (e7_grid & mark) ? 1 : tier.grid_e7;
+inline int32_t vertex_grid_e7(const ArcTier& tier, uint8_t grid, uint32_t i, uint32_t n) {
+    const bool first = i == 0, last = i + 1 == n;
+    const uint8_t e7 = first ? arc_grid::kE7First : last ? arc_grid::kE7Last : arc_grid::kE7Between;
+    const uint8_t fine = first ? arc_grid::kFineFirst : last ? arc_grid::kFineLast : arc_grid::kFineBetween;
+    return (grid & e7) ? 1 : (grid & fine) ? tier.fine_grid_e7 : tier.grid_e7;
 }
 
-// The grid exponent of a tier's block of an arc: OSM's own once any of its
-// vertices stays there.
-inline uint8_t arc_grid_exponent(const ArcTier& tier, uint8_t e7_grid) {
-    return arc_blocks::grid_exponent(e7_grid ? 1 : tier.grid_e7);
+// The grid exponent of a tier's block of an arc: the finest any of its
+// vertices is stored on.
+inline uint8_t arc_grid_exponent(const ArcTier& tier, uint8_t grid) {
+    return arc_blocks::grid_exponent((grid & arc_grid::kE7Whole)     ? 1
+                                     : (grid & arc_grid::kFineWhole) ? tier.fine_grid_e7
+                                                                     : tier.grid_e7);
 }
 
 // The vertices `tier` (as `state` holds it) stores of arc `arc` of its set:
