@@ -67,16 +67,22 @@ fi
 
 # Files in S3 are zstd-compressed with .zst suffix.  Helper fetches
 # either the .zst (preferred) or plain version, decompresses if needed.
+# A file the build lacks (404 for both) is a miss; any other failure, a
+# transfer that broke off among them, fails the fetch and leaves nothing.
 fetch() {
-    src_path="$1"; dest="$2"
-    if curl -fsSL "$src_path.zst" -o "$dest.zst" 2>/dev/null; then
-        zstd -dq --rm "$dest.zst"
-    elif curl -fsSL "$src_path" -o "$dest" 2>/dev/null; then
-        :
-    else
+    src_path="$1"; dest="$2"; zst=; plain=
+    if zst=$(curl -fsSL -w '%{http_code}' "$src_path.zst" -o "$dest.zst" 2>/dev/null); then
+        zstd -dq --rm "$dest.zst" && return
+    elif plain=$(curl -fsSL -w '%{http_code}' "$src_path" -o "$dest" 2>/dev/null); then
+        rm -f "$dest.zst"
+        return
+    elif [ "$zst" = 404 ] && [ "$plain" = 404 ]; then
         echo "  miss: $src_path"
-        return 1
+        return
     fi
+    echo "  failed: $src_path"
+    rm -f "$dest" "$dest.zst"
+    return 1
 }
 
 # Files a region may lack (interp_postcodes.bin outside TIGER regions, the
@@ -135,14 +141,22 @@ else
     BASE="$TIGRIS_BASE/$LATEST"
 
     # An optional file a region lacks (interp_postcodes.bin outside TIGER
-    # regions, the postcode centroids) is a miss, not an error.
-    selection_files | {
+    # regions, the postcode centroids) is a miss, not an error. A fetch that
+    # failed fails the start before the marker vouches for the download.
+    if ! selection_files | {
+        pids=
         while read -r dir f; do
             echo "  $dir/$f"
             fetch "$BASE/planet/$dir/$f" "$INDEX_DIR/$f" &
+            pids="$pids $!"
         done
-        wait
-    }
+        ok=1
+        for pid in $pids; do wait "$pid" || ok=; done
+        [ -n "$ok" ]
+    }; then
+        echo "Error: a file failed to download (named above); the next start downloads afresh"
+        exit 1
+    fi
 
     echo "Download complete."
     MISSING=$(missing_files)

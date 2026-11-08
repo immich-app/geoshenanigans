@@ -15,22 +15,38 @@ failures=0
 build=2026-11-01
 
 # curl serves <bucket>/<path after builds/> and logs each URL; the bucket holds
-# its files plain, which the entrypoint fetches when a .zst is missing.
+# its files plain, which the entrypoint fetches when a .zst is missing. With
+# -w it writes the HTTP status, 404 for a file the bucket lacks. A file in
+# $FLAKY (its path under planet/, one a line) breaks off halfway, as a dropped
+# connection does: half of it is written, then curl's error.
 mkdir -p "$work/bin"
 cat > "$work/bin/curl" <<'STUB'
 #!/usr/bin/env bash
-out= url=
+out= url= fmt=
 while [ $# -gt 0 ]; do
   case "$1" in
     -o) out=$2; shift ;;
+    -w) fmt=$2; shift ;;
     http*) url=$1 ;;
   esac
   shift
 done
 echo "$url" >> "$CURL_LOG"
-src="$BUCKET/${url#*/builds/}"
-[ -f "$src" ] || exit 22
+rel=${url#*/builds/}
+src="$BUCKET/$rel"
+key=${rel#*/planet/}
+if [ -n "${FLAKY:-}" ] && printf '%s\n' "$FLAKY" | grep -qxF -- "${key%.zst}"; then
+  plain="$BUCKET/${rel%.zst}"
+  head -c $(($(stat -c%s "$plain") / 2)) "$plain" > "$out"
+  [ -z "$fmt" ] || printf 200
+  exit 18
+fi
+if [ ! -f "$src" ]; then
+  [ -z "$fmt" ] || printf 404
+  exit 22
+fi
 if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
+[ -z "$fmt" ] || printf 200
 STUB
 printf '#!/bin/sh\necho "query-server $*"\n' > "$work/bin/query-server"
 chmod +x "$work/bin/"*
@@ -199,6 +215,21 @@ check "a failed download leaves no marker" test ! -e "$d/index/.selection"
 BUCKET=$bucket
 start "$d"
 check "a failed download is downloaded afresh next time" holds "$d"
+
+# A fetch that breaks off partway fails the start, of an optional file the
+# build has (its miss would be taken for the build lacking it) as of a
+# required one (its half would pass for the file). None of either is left,
+# no marker vouches for the download, and the next start downloads afresh.
+d="$work/broken-off"
+start "$d" FLAKY="$(printf '%s\n' full/postcode_centroids.bin quality/simplified/arc_index.bin)"
+check "a fetch that breaks off fails the start" test "$status" != 0
+check "a broken-off optional file is named" grep -q 'failed: .*/planet/full/postcode_centroids.bin$' "$work/out"
+check "a broken-off required file is named" grep -q 'failed: .*/planet/quality/simplified/arc_index.bin$' "$work/out"
+check "a broken-off fetch leaves none of its file" eval '! ls -A "$d/index" | grep -E "^(postcode_centroids|arc_index)\.bin"'
+check "a broken-off download leaves no marker" test ! -e "$d/index/.selection"
+start "$d"
+check "a broken-off download is downloaded afresh next time" holds "$d"
+check "a broken-off download: the server starts" served "$d"
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures failure(s)"
