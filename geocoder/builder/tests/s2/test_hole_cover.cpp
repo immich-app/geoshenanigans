@@ -122,13 +122,19 @@ TEST(the_admin_index_lists_each_polygon_wherever_a_tier_puts_a_point_in_it) {
         data.admin_polygons.push_back(p);
     }
     const AdminExactRings& store = data.admin_exact_rings;
-    const AdminArcs arcs = build_admin_arcs(store, {true, false, true}, "", 1);
+    // The enclave is no polygon of the minimal set.
+    const std::vector<bool> in_minimal = {true, false, true};
+    const AdminArcs arcs = build_admin_arcs(store, in_minimal, "", 1);
     compute_admin_index_cells(data, arcs, admin_candidate_cells(store, 0, 3, 1), 1);
 
-    size_t inside = 0, interior = 0;
+    size_t inside = 0, interior = 0, inside_minimal = 0;
     for (uint32_t p = 0; p < 3; p++) {
         const std::vector<Ring> tiers[] = {stored_rings(arcs, store, 0, p), stored_rings(arcs, store, 1, p)};
+        // Its rings in the minimal tier: each empty for a polygon the set
+        // leaves out.
         const std::vector<Ring> minimal = stored_rings(arcs, store, 2, p);
+        REQUIRE(minimal.size() == store.polygons[p].ring_count);
+        for (const Ring& ring : minimal) REQUIRE(ring.empty() != in_minimal[p]);
         for (double lat = 9.995; lat < 10.08; lat += 0.0007)
             for (double lng = 19.995; lng < 20.095; lng += 0.0007) {
                 const PackedLocation at = point_e7(lat, lng);
@@ -143,9 +149,10 @@ TEST(the_admin_index_lists_each_polygon_wherever_a_tier_puts_a_point_in_it) {
                 }
                 // The minimal set's index alike over its own tier.
                 const CellItemPair* small = entry_of(data.admin_minimal_index_cells, at, p);
-                if (minimal.empty()) {
+                if (!in_minimal[p]) {
                     CHECK(small == nullptr);
                 } else {
+                    inside_minimal += contains(minimal, at);
                     if (contains(minimal, at)) CHECK(small != nullptr);
                     if (small && (small->item_id & INTERIOR_FLAG)) CHECK(contains(minimal, at));
                 }
@@ -153,4 +160,5 @@ TEST(the_admin_index_lists_each_polygon_wherever_a_tier_puts_a_point_in_it) {
     }
     CHECK(inside > 10000);
     CHECK(interior > 1000);
+    CHECK(inside_minimal > 5000);
 }
