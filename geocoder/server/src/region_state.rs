@@ -366,4 +366,32 @@ mod tests {
         state.set_configuration(Configuration { quality: "exact".into(), ..before.clone() }).await.unwrap();
         assert_eq!(state.get_configuration().await.quality, "exact");
     }
+
+    // The manifest at hand is the cached one of the configuration's own
+    // bucket, within its TTL. Another bucket's build, or a newer build than
+    // a manifest past its TTL, may offer a value that manifest lacks: a PUT
+    // naming one is accepted, for its downloads to fetch the build they use.
+    #[tokio::test]
+    async fn a_configuration_is_checked_only_against_a_fresh_manifest_of_its_bucket() {
+        let mut components = test_bucket::template_components();
+        components["quality.fine"] = components["quality.simplified"].clone();
+        let offering = test_bucket::serve(components).await;
+        let lacking = test_bucket::serve(test_bucket::template_components()).await;
+
+        // A PUT moving to another bucket, with this one's manifest at hand.
+        let (_root, state) = state_for(lacking.url.clone(), Duration::from_secs(3600)).await;
+        let state = Arc::new(state);
+        state.ensure_configurations().await.unwrap();
+        let moved = Configuration { base_url: offering.url.clone(), quality: "fine".into(), ..state.get_configuration().await };
+        state.set_configuration(moved).await.unwrap();
+        assert_eq!(state.get_configuration().await.quality, "fine");
+
+        // A PUT once the manifest at hand is past its TTL.
+        let (_root, state) = state_for(offering.url.clone(), Duration::ZERO).await;
+        let state = Arc::new(state);
+        *state.configurations.lock().await = Some((Instant::now(), lacking.manifest.clone()));
+        let fine = Configuration { quality: "fine".into(), ..state.get_configuration().await };
+        state.set_configuration(fine).await.unwrap();
+        assert_eq!(state.get_configuration().await.quality, "fine");
+    }
 }
