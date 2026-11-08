@@ -219,23 +219,6 @@ AdminRingCells admin_polygon_cells(const std::vector<uint64_t>& boundary, const 
     });
 }
 
-AdminRingCells admin_ring_cells(const PackedLocation* verts, const RingSpan* rings, uint32_t ring_count, int level,
-                                double reach_rad) {
-    if (ring_count == 0 || rings[0].count == 0) return {};
-    std::vector<uint64_t> boundary;
-    std::vector<PackedLocation> closed;
-    for (uint32_t r = 0; r < ring_count; r++) {
-        const PackedLocation* v = verts + rings[r].begin;
-        if (rings[r].count == 0) continue;
-        closed.assign(v, v + rings[r].count);
-        closed.push_back(v[0]);
-        admin_arc_cells(closed.data(), static_cast<uint32_t>(closed.size()), level, reach_rad, boundary);
-    }
-    std::sort(boundary.begin(), boundary.end());
-    boundary.erase(std::unique(boundary.begin(), boundary.end()), boundary.end());
-    return admin_polygon_cells(boundary, verts, rings, ring_count, level);
-}
-
 bool admin_cell_routed(uint64_t cell, const std::function<bool(uint64_t)>& holds) {
     if (holds(cell)) return true;
     const S2CellId id(cell);
@@ -245,8 +228,8 @@ bool admin_cell_routed(uint64_t cell, const std::function<bool(uint64_t)>& holds
     return std::any_of(neighbours.begin(), neighbours.end(), [&](S2CellId n) { return holds(n.id()); });
 }
 
-// The cells of either of two rings of one polygon (admin_ring_cells, both
-// ascending), interior where interior for both.
+// The cells of either of two rings of one polygon (admin_polygon_cells,
+// both ascending), interior where interior for both.
 AdminRingCells merge_admin_ring_cells(const AdminRingCells& x, const AdminRingCells& y) {
     AdminRingCells out;
     out.reserve(std::max(x.size(), y.size()));

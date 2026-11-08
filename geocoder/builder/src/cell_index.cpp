@@ -1042,12 +1042,77 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
 
 namespace {
 
-// Each polygon of tier t's set, by its rings as the tier stores them: its
-// cells at kAdminCellLevel and ADMIN_COVER_REACH_RAD (admin_ring_cells), in
-// no order, its id flagged INTERIOR_FLAG where the rings hold the whole cell.
-std::vector<CellItemPair> tier_cells(const AdminArcs& arcs, const AdminExactRings& store, size_t t, unsigned threads) {
+// Each arc of a tier's set by its boundary cells (admin_arc_cells over the
+// vertices the tier stores of it, at kAdminCellLevel and
+// ADMIN_COVER_REACH_RAD): arc a's are cells[at[a], at[a + 1]).
+struct ArcCells {
+    std::vector<size_t> at;
+    std::vector<uint64_t> cells;
+
+    CellList of(uint32_t a) const { return {cells.data() + at[a], cells.data() + at[a + 1]}; }
+};
+
+ArcCells tier_arc_cells(const AdminArcs& arcs, const AdminExactRings& store, size_t t, unsigned threads) {
     const ArcTier& tier = kArcTiers[t];
+    const size_t n = tier.set == ArcSet::Full ? arcs.arcs.size() : arcs.minimal.arcs.size();
+    // Longest first, a few at a time: started last, a long arc would leave
+    // one core working alone.
+    const std::vector<uint32_t> longest_first = costliest_first(n, [&](size_t a) {
+        return tier.set == ArcSet::Full ? arcs.arcs[a].view.count : arcs.minimal.arcs[a].count;
+    }, threads);
+    // Where arc a's cells landed among its worker's.
+    struct Found {
+        uint32_t worker;
+        uint32_t count;
+        size_t at;
+    };
+    std::vector<Found> found;
+    parallel_resize(found, n);
+    struct Scratch {
+        std::vector<PackedLocation> raw, vertices;
+        std::vector<StoredVertex> stored;
+        std::vector<uint64_t> cells;
+    };
+    std::vector<Scratch> scratch(threads);
+    constexpr size_t kArcsPerGrab = 16;
+    parallel_for_dynamic(n, kArcsPerGrab, [&](size_t from, size_t to, unsigned worker) {
+        Scratch& s = scratch[worker];
+        for (size_t k = from; k < to; k++) {
+            const uint32_t a = longest_first[k];
+            tier_vertices(arcs, store, tier, arcs.tiers[t], a, s.raw, s.stored);
+            s.vertices.resize(s.stored.size());
+            for (size_t i = 0; i < s.stored.size(); i++) s.vertices[i] = s.stored[i].at;
+            const size_t before = s.cells.size();
+            admin_arc_cells(s.vertices.data(), static_cast<uint32_t>(s.vertices.size()), kAdminCellLevel,
+                            ADMIN_COVER_REACH_RAD, s.cells);
+            found[a] = {worker, static_cast<uint32_t>(s.cells.size() - before), before};
+        }
+    }, threads);
+    ArcCells out;
+    out.at = parallel_offsets<size_t>(n, [&](size_t a) { return found[a].count; }, threads);
+    parallel_resize(out.cells, out.at[n]);
+    parallel_for(n, [&](size_t begin, size_t end, unsigned) {
+        for (size_t a = begin; a < end; a++) {
+            const auto from = scratch[found[a].worker].cells.begin() + static_cast<std::ptrdiff_t>(found[a].at);
+            std::copy(from, from + found[a].count, out.cells.begin() + static_cast<std::ptrdiff_t>(out.at[a]));
+        }
+    }, threads);
+    return out;
+}
+
+}  // namespace
+
+AdminTierCells admin_tier_cells(const AdminArcs& arcs, const AdminExactRings& store, size_t t, unsigned threads,
+                                const std::function<void(const char*)>& phase_done) {
+    if (threads == 0) threads = parallel_threads();
+    const ArcTier& tier = kArcTiers[t];
+    // The exact tier's rings are the store's own: the same cycles its arcs chain.
+    const bool exact = tier.set == ArcSet::Full && !tier.simplifies();
     const std::vector<uint32_t>& ring_refs = tier.set == ArcSet::Full ? arcs.ring_refs : arcs.minimal.ring_refs;
+    const std::vector<ArcRef>& refs = tier.set == ArcSet::Full ? arcs.refs : arcs.minimal.refs;
+    const ArcCells arc_cells = tier_arc_cells(arcs, store, t, threads);
+    if (phase_done) phase_done("arcs");
+
     auto in_set = [&](uint32_t p) {
         const auto& poly = store.polygons[p];
         return poly.ring_count > 0 && ring_refs[poly.first_ring + 1] > ring_refs[poly.first_ring];
@@ -1061,7 +1126,10 @@ std::vector<CellItemPair> tier_cells(const AdminArcs& arcs, const AdminExactRing
         std::vector<PackedLocation> vertices, ring, raw;
         std::vector<StoredVertex> stored;
         std::vector<RingSpan> spans;
+        std::vector<CellList> lists;
+        std::vector<uint64_t> boundary;
         std::vector<CellItemPair> found;
+        size_t boundary_cells = 0;
     };
     std::vector<Scratch> scratch(threads);
     parallel_for_dynamic(largest_first.size(), 1, [&](size_t from, size_t to, unsigned worker) {
@@ -1070,28 +1138,47 @@ std::vector<CellItemPair> tier_cells(const AdminArcs& arcs, const AdminExactRing
             const uint32_t p = largest_first[k];
             if (!in_set(p)) continue;
             const auto& poly = store.polygons[p];
-            s.vertices.clear();
-            s.spans.clear();
-            for (uint32_t r = poly.first_ring; r < poly.first_ring + poly.ring_count; r++) {
-                tier_ring(arcs, store, tier, arcs.tiers[t], r, s.ring, s.raw, s.stored);
-                s.spans.push_back({static_cast<uint32_t>(s.vertices.size()), static_cast<uint32_t>(s.ring.size())});
-                s.vertices.insert(s.vertices.end(), s.ring.begin(), s.ring.end());
+            s.lists.clear();
+            for (uint32_t ref = ring_refs[poly.first_ring]; ref < ring_refs[poly.first_ring + poly.ring_count]; ref++)
+                s.lists.push_back(arc_cells.of(refs[ref].arc));
+            merge_cell_lists(s.lists, s.boundary);
+            s.boundary_cells += s.boundary.size();
+            AdminRingCells cells;
+            if (exact) {
+                cells = admin_polygon_cells(s.boundary, store.vertices.data(), store.rings_of(p), poly.ring_count,
+                                            kAdminCellLevel);
+            } else {
+                s.vertices.clear();
+                s.spans.clear();
+                for (uint32_t r = poly.first_ring; r < poly.first_ring + poly.ring_count; r++) {
+                    tier_ring(arcs, store, tier, arcs.tiers[t], r, s.ring, s.raw, s.stored);
+                    s.spans.push_back({static_cast<uint32_t>(s.vertices.size()), static_cast<uint32_t>(s.ring.size())});
+                    s.vertices.insert(s.vertices.end(), s.ring.begin(), s.ring.end());
+                }
+                cells = admin_polygon_cells(s.boundary, s.vertices.data(), s.spans.data(), poly.ring_count,
+                                            kAdminCellLevel);
             }
-            for (const auto& [cell, interior] : admin_ring_cells(s.vertices.data(), s.spans.data(), poly.ring_count,
-                                                                 kAdminCellLevel, ADMIN_COVER_REACH_RAD))
-                s.found.push_back({cell, interior ? p | INTERIOR_FLAG : p});
+            for (const auto& [cell, interior] : cells) s.found.push_back({cell, interior ? p | INTERIOR_FLAG : p});
         }
     }, threads);
+    AdminTierCells out;
+    out.arc_cells = arc_cells.cells.size();
     std::vector<size_t> at(threads + 1, 0);
-    for (unsigned w = 0; w < threads; w++) at[w + 1] = at[w] + scratch[w].found.size();
-    std::vector<CellItemPair> out;
-    parallel_resize(out, at[threads]);
+    for (unsigned w = 0; w < threads; w++) {
+        at[w + 1] = at[w] + scratch[w].found.size();
+        out.boundary_cells += scratch[w].boundary_cells;
+    }
+    parallel_resize(out.cells, at[threads]);
     parallel_for_each(threads, [&](size_t w, unsigned) {
-        std::copy(scratch[w].found.begin(), scratch[w].found.end(), out.begin() + at[w]);
+        std::copy(scratch[w].found.begin(), scratch[w].found.end(),
+                  out.cells.begin() + static_cast<std::ptrdiff_t>(at[w]));
         scratch[w] = {};
     }, threads);
+    if (phase_done) phase_done("polygons");
     return out;
 }
+
+namespace {
 
 // The cell index over `tiers` coverings of one set (each a polygon's cells
 // at most once): every (cell, polygon) any of them lists, once, flagged
@@ -1129,26 +1216,41 @@ std::vector<CellItemPair> union_of_tiers(std::vector<std::vector<CellItemPair>> 
 
 }  // namespace
 
-void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, std::vector<CellItemPair> exact_cells,
-                               unsigned threads) {
+void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads) {
     if (threads == 0) threads = parallel_threads();
     const AdminExactRings& store = data.admin_exact_rings;
-    data.admin_country_cells = parallel_collect<CellItemPair>(exact_cells.size(), [&](size_t k, std::vector<CellItemPair>& out) {
-        const uint32_t p = exact_cells[k].item_id & ID_MASK;
-        if (p < data.admin_polygons.size() && data.admin_polygons[p].admin_level == 2 &&
-            data.admin_polygons[p].country_code != 0)
-            out.push_back(exact_cells[k]);
-    }, threads);
-    parallel_sort(data.admin_country_cells.begin(), data.admin_country_cells.end(), cell_item_less, threads);
+    auto clock = std::chrono::steady_clock::now();
+    auto cpu = CpuTicks::now();
+    std::ostringstream counts;
     std::vector<std::vector<CellItemPair>> sets[2];
     for (size_t t = 0; t < kArcTierCount; t++) {
         const ArcTier& tier = kArcTiers[t];
-        auto& set = sets[static_cast<size_t>(tier.set)];
-        if (tier.set == ArcSet::Full && !tier.simplifies()) set.push_back(std::move(exact_cells));
-        else set.push_back(tier_cells(arcs, store, t, threads));
+        AdminTierCells covered = admin_tier_cells(arcs, store, t, threads, [&](const char* step) {
+            log_phase((std::string("      Admin cells: ") + tier.dir + " " + step).c_str(), clock, cpu);
+        });
+        counts << "  Admin cells " << tier.dir << ": "
+               << (tier.set == ArcSet::Full ? arcs.arcs.size() : arcs.minimal.arcs.size()) << " arcs with "
+               << covered.arc_cells << " boundary cells, merged into " << covered.boundary_cells
+               << " over the polygons' boundaries; " << covered.cells.size() << " entries\n";
+        if (tier.set == ArcSet::Full && !tier.simplifies()) {
+            const std::vector<CellItemPair>& exact = covered.cells;
+            data.admin_country_cells = parallel_collect<CellItemPair>(
+                exact.size(),
+                [&](size_t k, std::vector<CellItemPair>& out) {
+                    const uint32_t p = exact[k].item_id & ID_MASK;
+                    if (p < data.admin_polygons.size() && data.admin_polygons[p].admin_level == 2 &&
+                        data.admin_polygons[p].country_code != 0)
+                        out.push_back(exact[k]);
+                },
+                threads);
+            parallel_sort(data.admin_country_cells.begin(), data.admin_country_cells.end(), cell_item_less, threads);
+        }
+        sets[static_cast<size_t>(tier.set)].push_back(std::move(covered.cells));
     }
     data.admin_index_cells = union_of_tiers(std::move(sets[static_cast<size_t>(ArcSet::Full)]), threads);
     data.admin_minimal_index_cells = union_of_tiers(std::move(sets[static_cast<size_t>(ArcSet::Minimal)]), threads);
+    log_phase("      Admin cells: unions", clock, cpu);
+    std::cerr << counts.str();
 
     auto interior = [&](const std::vector<CellItemPair>& pairs) {
         return parallel_count(pairs.size(), [&](size_t k) { return (pairs[k].item_id & INTERIOR_FLAG) != 0; }, threads);

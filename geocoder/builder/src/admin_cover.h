@@ -8,6 +8,11 @@
 // misses cells the ray cast reaches. Here each edge is followed in pieces
 // short enough that their great-circle chords stay close to it, and every
 // cell near a piece is listed.
+// A polygon's rings are chains of arcs (admin_arcs.h), each arc a stretch of
+// border many rings run along, so the cells near its edges are its arcs':
+// each arc's are found once per tier (admin_arc_cells), and a polygon's are
+// the merge of its arcs' (merge_cell_lists), from which admin_polygon_cells
+// classifies the rest.
 #pragma once
 
 #include <algorithm>
@@ -82,17 +87,6 @@ inline void merge_cell_lists(std::vector<CellList>& lists, std::vector<uint64_t>
 // empty outer ring; a boundary out of order is refused (std::logic_error).
 AdminRingCells admin_polygon_cells(const std::vector<uint64_t>& boundary, const PackedLocation* verts,
                                    const RingSpan* rings, uint32_t ring_count, int level);
-
-// The level-`level` cells of a polygon's exact rings as exact_ring_contains
-// tests them (the outer ring, then its holes, each its own ring in verts, all
-// of them counted even-odd), ascending by id: admin_polygon_cells over the
-// cells within reach_rad of every edge (each ring's admin_arc_cells, its last
-// vertex joined back to its first). The admin cell index takes them at
-// ADMIN_COVER_REACH_RAD. Each edge is followed from its end of smaller
-// coord_key, so the cells are the same whatever the rings' rotation or
-// direction.
-AdminRingCells admin_ring_cells(const PackedLocation* verts, const RingSpan* rings, uint32_t ring_count, int level,
-                                double reach_rad);
 
 // Whether a region whose cells are those `holds` takes (by cell id) must keep
 // `cell` in its admin cell index: the server routes a query to every region

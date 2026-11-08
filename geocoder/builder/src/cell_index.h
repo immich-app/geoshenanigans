@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -15,18 +16,33 @@
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode);
 
+// Tier t's covering of its set's polygons (kArcTiers[t], of `arcs` over the
+// store), per arc: each arc's boundary cells once (admin_arc_cells over the
+// vertices the tier stores of it), each polygon's the merge of its rings'
+// arcs' (merge_cell_lists), classified over its rings as the tier stores
+// them, the store's own for the exact tier (admin_polygon_cells, at
+// kAdminCellLevel and ADMIN_COVER_REACH_RAD). `phase_done` is told as each
+// step ends ("arcs", "polygons").
+struct AdminTierCells {
+    // (cell, polygon id flagged INTERIOR_FLAG where its rings hold the whole
+    // cell), in no order.
+    std::vector<CellItemPair> cells;
+    size_t arc_cells = 0;       // over the set's arcs, each arc's once
+    size_t boundary_cells = 0;  // over its polygons, each one's arcs' merged
+};
+AdminTierCells admin_tier_cells(const AdminArcs& arcs, const AdminExactRings& store, size_t t, unsigned threads = 0,
+                                const std::function<void(const char*)>& phase_done = {});
+
 // Fills the admin cell indexes the reader reads (data.admin_index_cells,
 // data.admin_minimal_index_cells) from the arc stage's tiers (`arcs` of
-// data.admin_exact_rings, before any admin permute): the full set's gets
-// each polygon's cells over every tier of the set, the exact tier's being
-// `exact_cells` (admin_candidate_cells), interior only where interior in
-// every one; the minimal set's the cells of its tier's rings. Each tier's
-// interior is its exact ray cast at the cell centre. The admin permutes,
-// strategy-2 and the continent split carry the tables on from there.
-// data.admin_country_cells gets the country polygons' share of
-// `exact_cells`.
-void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, std::vector<CellItemPair> exact_cells,
-                               unsigned threads = 0);
+// data.admin_exact_rings, before any admin permute), each tier's covering
+// admin_tier_cells': the full set's gets each polygon's cells over every
+// tier of the set, interior only where interior in every one; the minimal
+// set's the cells of its tier. Each tier's interior is its exact ray cast at
+// the cell centre. The admin permutes, strategy-2 and the continent split
+// carry the tables on from there. data.admin_country_cells gets the country
+// polygons' share of the exact tier's, which the builder's links read too.
+void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads = 0);
 
 // strings_layout.json: each tier's [start, end) in the dir's string-offset
 // space, tier t at [bases[t], bases[t + 1]): the build's

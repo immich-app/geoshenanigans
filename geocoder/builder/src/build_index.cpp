@@ -2019,18 +2019,11 @@ static int run(int argc, char* argv[]) {
             tiger_csvs = std::async(std::launch::async, find_tiger_csvs, tiger_data_path);
 
         std::cerr << "Using " << num_threads << " worker threads." << std::endl;
-        // The exact tier's admin cells of each input's admin polygons, covered
-        // beside the rest of the work (admin_candidate_cells).
-        std::vector<std::future<std::vector<CellItemPair>>> admin_cells_pending;
 
         // The last input's way geometries, freed beside the admin linking.
         WayGeometries spent_geometries;
         for (const auto& input_file : input_files) {
             std::cerr << "Processing " << input_file << "..." << std::endl;
-            // This input's polygons append to the exact rings the last one's
-            // covering reads.
-            for (auto& cells : admin_cells_pending) cells.wait();
-            const uint32_t first_admin = static_cast<uint32_t>(data.admin_polygons.size());
 
             // --- Pass 1: collect relation members for parallel admin assembly ---
             std::cerr << "  Pass 1: scanning relations..." << std::endl;
@@ -3848,10 +3841,6 @@ static int run(int argc, char* argv[]) {
                         }
                     }, num_threads);
                     all_admin_results.clear();
-                    admin_cells_pending.push_back(std::async(std::launch::async,
-                        [&exact, from = first_admin, to = static_cast<uint32_t>(data.admin_polygons.size()), num_threads] {
-                            return admin_candidate_cells(exact, from, to, num_threads);
-                        }));
 
                     std::cerr << "  Parallel admin assembly complete: "
                               << total_admin_rings << " polygon rings from "
@@ -4123,16 +4112,6 @@ static int run(int argc, char* argv[]) {
 
         log_phase("    Release + shrink parsed data", _pt, _cpu);
 
-        std::cerr << "Waiting for the admin candidate cells..." << std::endl;
-        std::vector<CellItemPair> exact_cells;
-        for (auto& pending : admin_cells_pending) {
-            std::vector<CellItemPair> cells = pending.get();
-            if (exact_cells.empty()) exact_cells = std::move(cells);
-            else exact_cells.insert(exact_cells.end(), cells.begin(), cells.end());
-        }
-        admin_cells_pending.clear();
-        log_phase("    Admin: candidate cells wait", _pt, _cpu);
-
         // The arcs, which every admin dir's geometry is, and the admin cell
         // index over their tiers, which the links read too.
         if (!data.admin_polygons.empty()) {
@@ -4146,7 +4125,7 @@ static int run(int argc, char* argv[]) {
             data.admin_exact_rings.drop_way_runs();  // the arcs' way sets were their last use
             data.admin_arcs = encode_admin_arcs(arcs, data.admin_exact_rings, num_threads);
             log_phase("    Admin: arcs", _pt, _cpu);
-            compute_admin_index_cells(data, arcs, std::move(exact_cells), num_threads);
+            compute_admin_index_cells(data, arcs, num_threads);
             log_phase("    Admin: index cells", _pt, _cpu);
         }
 
