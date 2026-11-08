@@ -3,9 +3,10 @@
 // arc that ends there; a ring valid on the 1.1 m grid that the 11 m grid
 // would collapse keeping its arcs and its junctions fine, every arc that ends
 // at one of those junctions fine too, round after round; the repair on the
-// 11 m grid, and the arcs of the crossings and polygons not nesting it leaves
-// put back as the 1.1 m tier has them; and the two checks the arc stage
-// aborts on. S2-free, in the sanitized suite.
+// 11 m grid, and the arcs of the crossings and polygons not nesting it leaves,
+// and of the rings it collapses again, put back as the 1.1 m tier has them;
+// and the two checks the arc stage aborts on. S2-free, in the sanitized
+// suite.
 #include <algorithm>
 #include <cmath>
 #include <random>
@@ -599,6 +600,52 @@ TEST(a_hole_the_11_m_grid_puts_on_its_outer_ring_goes_back_to_the_1_1_m_tier_not
         REQUIRE(a != UINT32_MAX);
         CHECK_EQ(int(block_of(b.blocks, m, a).k), 2);
     }
+}
+
+TEST(a_ring_kept_fine_that_the_11_m_repair_collapses_again_goes_back_to_the_1_1_m_tier) {
+    // R = A B C is valid on the 1.1 m grid and a line on the 11 m one, so
+    // the loop keeps it fine. Its arc B..C drops D, at A's latitude; the
+    // square Q, 300 below B..C, lands on it on the 11 m grid, and the repair
+    // there gives D back. A B D C has no area: the bowtie the raw ring is
+    // already (A-B crosses D-C; E, dropped, gives the raw ring its area).
+    // Every arc and junction of R is fine by then, so the loop has nothing to
+    // move: R's arcs go back as the 1.1 m tier has them, and Q's, which cross
+    // B..C again then, too. Triangles touching R at A, B and C alone make
+    // each a junction.
+    const PackedLocation A = pt(400, 500000), B = pt(0, 0), C = pt(0, 1000000), D = pt(400, 100000), E = pt(500, 750000);
+    const Ring R = closed({A, B, D, C, E});
+    const Ring Q = closed({pt(-300, 200000), pt(-300, 300000), pt(-5300, 300000), pt(-5300, 200000)});
+    const std::vector<Polygon> polygons = {{R, {}},
+                                           {closed({A, pt(5000, 499000), pt(5000, 501000)}), {}},
+                                           {closed({B, pt(-5000, 1000), pt(-5000, -1000)}), {}},
+                                           {closed({C, pt(-5000, 1001000), pt(-5000, 999000)}), {}},
+                                           {Q, {}}};
+    // As the plan of the fixture says.
+    CHECK(valid(snapped_ring(closed({A, B, C}), kFine)) && !valid(snapped_ring(closed({A, B, C}), kCoarse)));
+    CHECK(!valid(closed({A, B, D, C})));
+    Built b;
+    const std::string why = refusal_of([&] { b = built(polygons); });
+    CHECK_EQ(why, std::string());
+    if (!why.empty()) return;
+    const size_t m = minimal_tier();
+    const ArcTierCounts& c = b.arcs.tiers[m].counts;
+    CHECK(c.repair_restored >= 1);
+    CHECK_EQ(c.crossings_left, size_t(0));
+    CHECK_EQ(c.degenerate_rings, size_t(0));
+    CHECK_EQ(c.e7_grid_arcs, size_t(0));
+    bool chained = true;
+    const std::vector<Ring> rings = decoded_rings(b.blocks, ArcSet::Minimal, m, 0, chained);
+    REQUIRE(rings.size() == 1);
+    CHECK(chained);
+    CHECK(same_ring(rings[0], closed({A, B, C})));
+    const uint32_t bc = minimal_arc(b, B, C), q = minimal_arc_through(b, Q[1]);
+    REQUIRE(bc != UINT32_MAX && q != UINT32_MAX);
+    const arc_blocks::DecodedArc arc = block_of(b.blocks, m, bc);
+    CHECK_EQ(int(arc.k), 2);
+    CHECK(std::find(arc.vertices.begin(), arc.vertices.end(), D) == arc.vertices.end());
+    const arc_blocks::DecodedArc square = block_of(b.blocks, m, q);
+    CHECK_EQ(int(square.k), 2);
+    CHECK(same_ring(square.vertices, Q));
 }
 
 TEST(an_arc_keeps_copy_takes_one_arcs_marks_from_another_of_the_same_arcs) {

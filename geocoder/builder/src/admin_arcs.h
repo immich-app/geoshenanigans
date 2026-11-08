@@ -297,6 +297,8 @@ struct ArcTierCounts {
     size_t fine_arcs = 0;              // arcs stored on the fine grid (arc_grid), none on OSM's
     int put_back_rounds = 0;           // rounds that put arcs back as the fine build left them
     size_t put_back_arcs = 0;          // arcs of crossings and of polygons not nesting put back so
+    int collapsed_put_back_rounds = 0;     // last rounds that put back rings collapsing still, all fine
+    size_t collapsed_put_back_rings = 0;   // the rings they put back
 };
 
 // Which vertices of a simplified tier's arc are stored on another grid than
@@ -520,7 +522,10 @@ std::vector<bool> exact_rings_nest(const AdminExactRings& store, unsigned thread
 // The arcs of each crossing it leaves, and of each polygon whose rings then
 // stop nesting, are put back as the fine build left them (its vertices, on
 // the fine grid, their junctions fine), round after round: two arcs put back
-// cross only where the fine build's do.
+// cross only where the fine build's do. Last, a ring valid on the fine grid
+// that collapses still with every arc and junction of it fine (the repair
+// gave it a vertex back that takes its area away) has its arcs put back too,
+// and what that makes is put back in turn.
 // `phase_done` is told as each step ends.
 ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
                             const std::vector<bool>& nests_exact, unsigned threads,

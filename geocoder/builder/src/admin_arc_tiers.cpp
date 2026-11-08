@@ -569,6 +569,39 @@ public:
         }
     }
 
+    // Last, the rings valid on the fine grid that collapse still, though
+    // their arcs and junctions are all fine: the repair on the tier's grid
+    // gave one a vertex back that takes its area away (a bowtie the raw ring
+    // already is), and the loop has nothing left to move. Puts their arcs
+    // back as the fine build left them, then puts back the arcs of the
+    // crossings and polygons not nesting that makes and runs the e7 grid
+    // rounds once more, round after round until none collapses or a round has
+    // nothing to put back. Nothing gives a vertex back to an arc put back, so
+    // a ring all of whose arcs are put back is the fine build's. One that
+    // still collapses (an arc of it on the e7 grid since) is left for the
+    // check encode_admin_arcs makes.
+    void put_back_collapsing_rings(ArcTierCounts& counts) {
+        for (int round = 0; round < kArcRepairRounds; round++) {
+            const std::vector<uint32_t> collapsing = collect_in_order<uint32_t, Scratch>(rings_.size(),
+                [&](size_t k, std::vector<uint32_t>& out, Scratch& s) {
+                    if (fine_valid_[rings_[k]] && !stored_ring_valid(rings_[k], s)) out.push_back(rings_[k]);
+                }, threads_);
+            if (collapsing.empty()) break;
+
+            std::vector<uint32_t> arcs;
+            for (uint32_t r : collapsing)
+                for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) arcs.push_back(set_.refs()[k].arc);
+            std::vector<uint32_t> changed = put_back(arcs, counts);
+            if (changed.empty()) break;
+            counts.collapsed_put_back_rounds++;
+            counts.collapsed_put_back_rings += collapsing.size();
+            with_collapsing_rings_kept_fine(changed, counts);
+            add_conflicts(meetings_of(update(changed)));
+            put_back_crossed_and_unnested(counts);
+            keep_unnested_on_e7_grid(counts);
+        }
+    }
+
     // The degenerate rings left: under 3 vertices or of no area.
     void count_degenerate(ArcTierCounts& counts) const {
         counts.degenerate_rings = collect_in_order<uint32_t, Scratch>(rings_.size(),
@@ -1198,6 +1231,8 @@ ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store,
         done("coarse put back");
         builder.keep_unnested_on_e7_grid(state.counts);
         done("coarse e7 grid");
+        builder.put_back_collapsing_rings(state.counts);
+        done("coarse collapsing put back");
         builder.count_degenerate(state.counts);
     }
     builder.count_left(state.counts);

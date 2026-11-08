@@ -502,7 +502,9 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
             line << " fine_degenerate_rings=" << tc.fine_degenerate_rings << " fine_crossings_left=" << tc.fine_crossings_left
                  << " crossings_coarse=" << tc.crossings_coarse << " coarse_rounds=" << tc.coarse_rounds
                  << " fine_rings=" << tc.fine_rings << " fine_junctions=" << tc.fine_junctions << " fine_arcs=" << tc.fine_arcs
-                 << " put_back_rounds=" << tc.put_back_rounds << " put_back_arcs=" << tc.put_back_arcs;
+                 << " put_back_rounds=" << tc.put_back_rounds << " put_back_arcs=" << tc.put_back_arcs
+                 << " collapsed_put_back_rounds=" << tc.collapsed_put_back_rounds
+                 << " collapsed_put_back_rings=" << tc.collapsed_put_back_rings;
         line << "\n";
     }
     std::cerr << line.str();
