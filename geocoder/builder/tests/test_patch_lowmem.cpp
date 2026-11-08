@@ -3362,6 +3362,48 @@ TEST(patch_dir_without_admin_geometry_sends_no_admin_geometry_section) {
     }
 }
 
+// A dir whose four admin geometry files are empty on both days (Antarctica's
+// admin-minimal, admin-minimal-poi and quality dirs hold no admin polygon),
+// one POI edited and on identical days: each of the four goes as a full
+// replacement of nothing (a 36-byte section, as the parent sent it), not as
+// an empty merge (56 bytes); COPY_OLD never stands for an empty file. Every
+// mode applies it.
+TEST(patch_empty_admin_geometry_files_go_as_empty_full_replacements) {
+    ScratchDir dir("lowmem-empty-arcs");
+    std::mt19937 rng(20261108);
+    const auto pois = pois_of(rng, 300, 0, true);
+    auto edited = pois;
+    std::fill(edited[100].block.begin() + 10, edited[100].block.end(), 0);
+    BuildDir old_d, new_d;
+    put_pois(old_d, pois);
+    put_pois(new_d, edited);
+    for (const AdminSlotFamily& family : ADMIN_SLOT_FAMILIES)
+        for (const PatchFileId fid : {family.slots, family.blocks})
+            old_d[patch_file_names[uint32_t(fid)]] = new_d[patch_file_names[uint32_t(fid)]] = {};
+    const std::pair<const char*, const BuildDir*> days[] = {{"edited", &new_d}, {"same", &old_d}};
+    for (const auto& [name, new_day] : days) {
+        const LowMemCase c{dir.path(), name};
+        REQUIRE(prepare(c, old_d, *new_day).empty());
+        const std::vector<char> raw = raw_patch(c);
+        REQUIRE(!raw.empty());
+        for (const AdminSlotFamily& family : ADMIN_SLOT_FAMILIES)
+            for (const auto& [fid, stride] : {std::pair{family.slots, family.stride}, std::pair{family.blocks, size_t{1}}}) {
+                std::vector<char> nothing = section_head(fid, 0, 0, 0);
+                append(nothing, 0u);
+                append(nothing, uint64_t{0});
+                const bool replaced = find_once(raw, nothing) != std::string::npos;
+                const std::vector<char> merge = section_head(fid, static_cast<uint32_t>(stride), 0, 0);
+                const bool merged = std::search(raw.begin(), raw.end(), merge.begin(), merge.end()) != raw.end();
+                if (!replaced || merged)
+                    std::printf("    %s: %s %s\n", name, patch_file_names[uint32_t(fid)],
+                                merged ? "went as an empty merge" : "got no full replacement of nothing");
+                CHECK(replaced);
+                CHECK(!merged);
+            }
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    }
+}
+
 // arc_vertices.bin's every byte new, 1 MiB of it and 10 MiB (n arcs of a
 // KiB), over the same 100 polygons: its merge sends every block (head and
 // tail trimmed only where a byte happens to repeat), which the patcher writes

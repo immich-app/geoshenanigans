@@ -614,7 +614,9 @@ or, for an admin polygon whose other fields changed, a REPLACE; slots past the
 old end are INSERTs. Its block is kept, edited with its unchanged head and
 tail kept, or replaced; a birth or a recycled slot's block is an INSERT, a
 death's a DELETE. The patcher replays them as any merge section. A file the
-new dir lacks gets no section, so a dir without admin geometry carries none.
+new dir lacks gets no section, so a dir without admin geometry carries none;
+an empty one (Antarctica's dirs) goes as a full replacement of nothing, as
+COPY_OLD never stands for an empty file.
 
 ## Performance
 
