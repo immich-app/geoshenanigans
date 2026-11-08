@@ -1900,7 +1900,7 @@ static int run(int argc, char* argv[]) {
         std::cerr << "  --street-level N       S2 cell level for streets (default: 17)" << std::endl;
         std::cerr << "  --admin-level N        S2 cell level for admin (default: 10)" << std::endl;
         std::cerr << "  --max-admin-level N    Only include admin levels <= N" << std::endl;
-        std::cerr << "  --multi-output         Write full, no-addresses, admin-only indexes" << std::endl;
+        std::cerr << "  --multi-output         Write full, no-addresses, admin-only indexes (needs --multi-quality)" << std::endl;
         std::cerr << "  --continents           Also generate per-continent indexes" << std::endl;
         std::cerr << "  --mode <mode>          Index mode: full, no-addresses, admin-only (default: full)" << std::endl;
         std::cerr << "  --multi-quality        Write the boundary tiers: quality/simplified and quality/exact" << std::endl;
@@ -1967,6 +1967,14 @@ static int run(int argc, char* argv[]) {
         } else {
             input_files.push_back(arg);
         }
+    }
+    // The mode dirs hold no admin geometry: a client reads them beside a
+    // boundary tier, without which no dir of the build would load.
+    if (multi_output && !multi_quality) {
+        std::cerr << "Error: --multi-output needs --multi-quality: its mode dirs (full, no-addresses, admin) hold no "
+                     "admin geometry, which a client reads from a boundary tier (quality/simplified or quality/exact)"
+                  << std::endl;
+        return 1;
     }
     require_new_or_empty_output_dir(output_dir);
 

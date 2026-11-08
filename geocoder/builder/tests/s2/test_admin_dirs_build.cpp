@@ -5,7 +5,8 @@
 // edited data keeps the slot of every arc the previous day had, which a fresh
 // build of it doesn't. A previous build without its arc sidecars leaves every
 // arc slot cold and the admin slots as they were. Without --multi-output,
-// each region's dir is a whole index the server answers from.
+// each region's dir is a whole index the server answers from; with it, a
+// build without --multi-quality is refused.
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -287,26 +288,28 @@ TEST(build_index_writes_every_regions_admin_dirs_as_arcs_and_a_chained_build_wri
     CHECK(tree(again) == files);
 }
 
-TEST(multi_quality_takes_no_scale_list_and_without_it_no_boundary_tier_is_written) {
+TEST(multi_quality_takes_no_scale_list_and_multi_output_needs_it) {
     const ScratchDir root("admin-dirs-flags");
-    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    const std::string pbf = root.path() + "/fixture.osm.pbf";
     write_test_pbf(pbf, fixture(), 1000);
-    CHECK(!gctest::run({GEOCODER_BUILD_INDEX_BIN, root.path() + "/scales", pbf, "--multi-output", "--multi-quality",
-                        "0,0.5,2.5"},
-                       log));
-    CHECK(bytes_of(log).size() > 0);
-    const std::vector<char> refusal = bytes_of(log);
-    CHECK(std::string(refusal.begin(), refusal.end()).find("--multi-quality takes no scale list") != std::string::npos);
-
-    const std::string out = root.path() + "/no-tiers";
-    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf, "--multi-output"}, log));
-    const auto files = tree(out);
-    for (const std::string& name : names_of(files)) CHECK(name.find("/quality/") == std::string::npos);
-    // admin-minimal still holds its arcs.
-    for (const char* dir : {"admin-minimal", "admin-minimal-poi"})
-        for (const char* f : {"admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin"})
-            CHECK(files.count(std::string("planet/") + dir + "/" + f));
-    CHECK(!files.at("planet/admin-minimal/arc_vertices.bin").empty());
+    // Each refused before the build starts, saying why: no output dir.
+    auto refusal = [&](const std::string& name, std::vector<std::string> flags) {
+        const std::string out = root.path() + "/" + name, log = root.path() + "/" + name + ".log";
+        std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out, pbf};
+        words.insert(words.end(), flags.begin(), flags.end());
+        CHECK(!gctest::run(words, log));
+        CHECK(!fs::exists(out));
+        const std::vector<char> said = bytes_of(log);
+        return std::string(said.begin(), said.end());
+    };
+    CHECK(refusal("scales", {"--multi-output", "--multi-quality", "0,0.5,2.5"}).find("--multi-quality takes no scale list") !=
+          std::string::npos);
+    // Its mode dirs hold no admin geometry, which a client reads from a
+    // boundary tier.
+    for (const std::vector<std::string>& flags :
+         {std::vector<std::string>{"--multi-output"}, std::vector<std::string>{"--multi-output", "--continents"}})
+        CHECK(refusal("no-tiers-" + std::to_string(flags.size()), flags)
+                  .find("--multi-output needs --multi-quality") != std::string::npos);
 }
 
 TEST(a_build_without_the_multi_flags_writes_whole_dirs_the_server_answers_from) {
