@@ -24,6 +24,7 @@
 #include <climits>
 #include <cstdint>
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -253,6 +254,13 @@ public:
     bool empty() const { return word_at_.empty(); }
     bool test(uint32_t arc, uint32_t i) const { return (words_[word_at_[arc] + i / 64] >> (i % 64)) & 1; }
     void set(uint32_t arc, uint32_t i) { words_[word_at_[arc] + i / 64] |= uint64_t(1) << (i % 64); }
+    // Arc `arc`'s marks as `from`, the marks of the same arcs, holds them.
+    void copy_arc(const ArcKeep& from, uint32_t arc) {
+        if (from.word_at_ != word_at_) throw std::logic_error("arc keep marks of other arcs");
+        std::copy(from.words_.begin() + static_cast<std::ptrdiff_t>(word_at_[arc]),
+                  from.words_.begin() + static_cast<std::ptrdiff_t>(word_at_[arc + 1]),
+                  words_.begin() + static_cast<std::ptrdiff_t>(word_at_[arc]));
+    }
     friend bool operator==(const ArcKeep& a, const ArcKeep& b) {
         return a.word_at_ == b.word_at_ && a.words_ == b.words_;
     }
@@ -287,6 +295,8 @@ struct ArcTierCounts {
     size_t fine_rings = 0;             // rings kept fine: valid on the fine grid, collapsing on the tier's
     size_t fine_junctions = 0;         // junctions kept fine in every arc that ends there
     size_t fine_arcs = 0;              // arcs stored on the fine grid (arc_grid), none on OSM's
+    int put_back_rounds = 0;           // rounds that put arcs back as the fine build left them
+    size_t put_back_arcs = 0;          // arcs of crossings and of polygons not nesting put back so
 };
 
 // Which vertices of a simplified tier's arc are stored on another grid than
@@ -507,6 +517,10 @@ std::vector<bool> exact_rings_nest(const AdminExactRings& store, unsigned thread
 // valid, so it ends, and no such ring is lost. The repair then runs again on
 // the tier's own grid, every vertex it gives back on its arc's grid, keeping
 // the rings of the arcs each of its rounds changes fine where they collapse.
+// The arcs of each crossing it leaves, and of each polygon whose rings then
+// stop nesting, are put back as the fine build left them (its vertices, on
+// the fine grid, their junctions fine), round after round: two arcs put back
+// cross only where the fine build's do.
 // `phase_done` is told as each step ends.
 ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
                             const std::vector<bool>& nests_exact, unsigned threads,

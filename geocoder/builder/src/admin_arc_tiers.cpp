@@ -517,6 +517,8 @@ public:
         size_t valid = 0;
         for (uint32_t r : rings_) valid += fine_valid_[r];
         counts.fine_degenerate_rings = rings_.size() - valid;
+        fine_keep_ = keep_;
+        put_back_.assign(arc_count_, 0);
         tier_.grid_e7 = coarse_grid_e7_;
         coarse_ = true;
         ends_ = collect_in_order<ArcEnd, Scratch>(arc_count_, [&](size_t i, std::vector<ArcEnd>& out, Scratch&) {
@@ -530,6 +532,41 @@ public:
         parallel_sort(ends_.begin(), ends_.end(), std::less<ArcEnd>(), threads_);
         kept_fine_.assign(store_.rings.size(), 0);
         keep_collapsing_rings_fine(rings_, counts);
+    }
+
+    // After the repair on the tier's own grid: puts the arcs of every
+    // crossing it leaves and of every polygon whose rings stop nesting back
+    // as the fine build left them (put_back), round after round over the
+    // crossings and polygons a round makes, the rings of the arcs it changes
+    // kept fine where they collapse, until a round has nothing to put back.
+    // A crossing between two arcs put back is one the fine build has, and a
+    // polygon all of whose arcs are put back nests as it does there.
+    void put_back_crossed_and_unnested(ArcTierCounts& counts) {
+        std::vector<uint32_t> suspects = candidates_;
+        for (int round = 0; round < kArcRepairRounds; round++) {
+            std::vector<uint32_t> arcs;
+            for (const Conflict& c : conflicts_)
+                if (!c.raw && alive_[c.s] && alive_[c.t]) {
+                    arcs.push_back(segs_[c.s].arc);
+                    arcs.push_back(segs_[c.t].arc);
+                }
+            const std::vector<uint32_t> unnested = not_nesting(suspects);
+            for (uint32_t p : unnested) {
+                const auto& poly = store_.polygons[p];
+                for (uint32_t r = poly.first_ring; r < poly.first_ring + poly.ring_count; r++)
+                    for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) arcs.push_back(set_.refs()[k].arc);
+            }
+            std::vector<uint32_t> changed = put_back(arcs, counts);
+            if (changed.empty()) break;
+            counts.put_back_rounds++;
+            with_collapsing_rings_kept_fine(changed, counts);
+            add_conflicts(meetings_of(update(changed)));
+            suspects = unnested;
+            for (uint32_t a : changed)
+                for (uint32_t u = user_at_[a]; u < user_at_[a + 1]; u++)
+                    if (polygon_of_[users_[u]] != UINT32_MAX) suspects.push_back(polygon_of_[users_[u]]);
+            sort_unique(suspects, threads_);
+        }
     }
 
     // The degenerate rings left: under 3 vertices or of no area.
@@ -727,47 +764,72 @@ private:
             if (collapsing.empty()) break;
 
             std::vector<uint32_t> arcs;
-            std::vector<uint64_t> junctions;
             for (uint32_t r : collapsing) {
                 counts.fine_rings += !kept_fine_[r];
                 kept_fine_[r] = 1;
-                for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) {
-                    const uint32_t a = set_.refs()[k].arc;
-                    arcs.push_back(a);
-                    if (set_.closed(a)) continue;
-                    set_.with(a, [&](const auto& v) {
-                        junctions.push_back(vertex_key(v[0]));
-                        junctions.push_back(vertex_key(v[v.size() - 1]));
-                    });
-                }
+                for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) arcs.push_back(set_.refs()[k].arc);
             }
-            sort_unique(arcs, threads_);
-            sort_unique(junctions, threads_);
-            std::vector<uint32_t> round;
-            auto mark = [&](uint32_t a, uint8_t bits) {
-                if ((grid_[a] | bits) == grid_[a]) return;
-                grid_[a] |= bits;
-                round.push_back(a);
-            };
-            // A closed arc has no junction: all of it is the arc's.
-            for (uint32_t a : arcs) mark(a, set_.closed(a) ? arc_grid::kFineWhole : arc_grid::kFineBetween);
-            std::vector<uint64_t> added;
-            std::set_difference(junctions.begin(), junctions.end(), fine_junctions_.begin(), fine_junctions_.end(),
-                                std::back_inserter(added));
-            for (uint64_t j : added)
-                for (auto it = std::lower_bound(ends_.begin(), ends_.end(), ArcEnd{j, 0, false});
-                     it != ends_.end() && it->junction == j; ++it)
-                    mark(it->arc, arc_grid::kFineBetween | (it->last ? arc_grid::kFineLast : arc_grid::kFineFirst));
-            std::vector<uint64_t> merged(fine_junctions_.size() + added.size());
-            std::merge(fine_junctions_.begin(), fine_junctions_.end(), added.begin(), added.end(), merged.begin());
-            fine_junctions_ = std::move(merged);
+            const std::vector<uint32_t> round = keep_fine(arcs);
             if (round.empty()) break;
 
             counts.coarse_rounds++;
-            sort_unique(round, threads_);
             changed.insert(changed.end(), round.begin(), round.end());
             suspects = rings_of(round);
         }
+        sort_unique(changed, threads_);
+        return changed;
+    }
+
+    // Keeps `arcs` fine, and their junctions in every arc that ends there,
+    // that arc kept fine too. Returns the arcs whose marks changed,
+    // ascending.
+    std::vector<uint32_t> keep_fine(std::vector<uint32_t> arcs) {
+        sort_unique(arcs, threads_);
+        std::vector<uint64_t> junctions;
+        for (uint32_t a : arcs) {
+            if (set_.closed(a)) continue;
+            set_.with(a, [&](const auto& v) {
+                junctions.push_back(vertex_key(v[0]));
+                junctions.push_back(vertex_key(v[v.size() - 1]));
+            });
+        }
+        sort_unique(junctions, threads_);
+        std::vector<uint32_t> changed;
+        auto mark = [&](uint32_t a, uint8_t bits) {
+            if ((grid_[a] | bits) == grid_[a]) return;
+            grid_[a] |= bits;
+            changed.push_back(a);
+        };
+        // A closed arc has no junction: all of it is the arc's.
+        for (uint32_t a : arcs) mark(a, set_.closed(a) ? arc_grid::kFineWhole : arc_grid::kFineBetween);
+        std::vector<uint64_t> added;
+        std::set_difference(junctions.begin(), junctions.end(), fine_junctions_.begin(), fine_junctions_.end(),
+                            std::back_inserter(added));
+        for (uint64_t j : added)
+            for (auto it = std::lower_bound(ends_.begin(), ends_.end(), ArcEnd{j, 0, false});
+                 it != ends_.end() && it->junction == j; ++it)
+                mark(it->arc, arc_grid::kFineBetween | (it->last ? arc_grid::kFineLast : arc_grid::kFineFirst));
+        std::vector<uint64_t> merged(fine_junctions_.size() + added.size());
+        std::merge(fine_junctions_.begin(), fine_junctions_.end(), added.begin(), added.end(), merged.begin());
+        fine_junctions_ = std::move(merged);
+        sort_unique(changed, threads_);
+        return changed;
+    }
+
+    // Puts those of `arcs` not yet put back as the fine build left them:
+    // its keep marks (the vertices the repair on the tier's grid gave back
+    // dropped again), kept fine with their junctions (keep_fine). Returns
+    // the arcs that changed, ascending.
+    std::vector<uint32_t> put_back(std::vector<uint32_t> arcs, ArcTierCounts& counts) {
+        sort_unique(arcs, threads_);
+        arcs.erase(std::remove_if(arcs.begin(), arcs.end(), [&](uint32_t a) { return put_back_[a] != 0; }), arcs.end());
+        for (uint32_t a : arcs) {
+            keep_.copy_arc(fine_keep_, a);
+            put_back_[a] = 1;
+        }
+        counts.put_back_arcs += arcs.size();
+        std::vector<uint32_t> changed = keep_fine(arcs);
+        changed.insert(changed.end(), arcs.begin(), arcs.end());
         sort_unique(changed, threads_);
         return changed;
     }
@@ -1043,6 +1105,8 @@ private:
     std::vector<uint8_t> kept_fine_;   // by ring: kept fine (keep_collapsing_rings_fine)
     std::vector<uint64_t> fine_junctions_;  // ascending
     std::vector<ArcEnd> ends_;  // every open arc's two, ascending
+    ArcKeep fine_keep_;  // keep_ as the fine build left it (coarsen)
+    std::vector<uint8_t> put_back_;  // by arc: put back as the fine build left it
     std::vector<uint32_t> rings_;  // the set's
     std::vector<uint32_t> user_at_, users_;  // arc a's rings: users_[user_at_[a], user_at_[a + 1])
     std::vector<uint32_t> candidates_;  // nesting_candidates
@@ -1130,6 +1194,8 @@ ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store,
         done("coarse segment grid");
         builder.repair(nests_exact, state.counts);
         done("coarse repair");
+        builder.put_back_crossed_and_unnested(state.counts);
+        done("coarse put back");
         builder.keep_unnested_on_e7_grid(state.counts);
         done("coarse e7 grid");
         builder.count_degenerate(state.counts);

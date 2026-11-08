@@ -3,8 +3,9 @@
 // arc that ends there; a ring valid on the 1.1 m grid that the 11 m grid
 // would collapse keeping its arcs and its junctions fine, every arc that ends
 // at one of those junctions fine too, round after round; the repair on the
-// 11 m grid; and the two checks the arc stage aborts on. S2-free, in the
-// sanitized suite.
+// 11 m grid, and the arcs of the crossings and polygons not nesting it leaves
+// put back as the 1.1 m tier has them; and the two checks the arc stage
+// aborts on. S2-free, in the sanitized suite.
 #include <algorithm>
 #include <cmath>
 #include <random>
@@ -550,4 +551,67 @@ TEST(the_stage_aborts_on_a_ring_valid_on_the_1_1_m_grid_that_collapses_or_a_coar
     const AdminArcBlocks coarse = with_block(b.blocks, m, spoke, snapped_ring(minimal_raw(b, spoke), kCoarse), 3);
     CHECK(refusal_of([&] { check_coarsened_tier(b.arcs, b.store, m, coarse.tiers[m], 2); })
               .find("ends at a junction kept fine but is stored at k = 3") != std::string::npos);
+}
+
+TEST(a_crossing_the_11_m_grid_makes_with_nothing_to_give_back_puts_both_arcs_back_as_the_1_1_m_tier_has_them) {
+    // An island 400 north of a square's straight edge, every vertex of both
+    // kept: the 11 m grid puts the island's edge on the square's, and the
+    // repair there has no vertex to give back.
+    const Ring square = closed({pt(0, 0), pt(0, 100000), pt(-100000, 100000), pt(-100000, 0)});
+    const Ring island = closed({pt(400, 49000), pt(400, 51000), pt(3000, 51000), pt(3000, 49000)});
+    const Built b = built({{square, {}}, {island, {}}});
+    const size_t m = minimal_tier();
+    const ArcTierCounts& c = b.arcs.tiers[m].counts;
+    CHECK_EQ(c.fine_crossings_left, size_t(0));
+    CHECK(c.crossings_coarse >= 1);
+    CHECK_EQ(c.crossings_left, size_t(0));
+    CHECK_EQ(c.put_back_arcs, size_t(2));
+    CHECK_EQ(c.e7_grid_arcs, size_t(0));
+    for (const Ring* ring : {&square, &island}) {
+        const uint32_t a = minimal_arc_through(b, (*ring)[1]);
+        REQUIRE(a != UINT32_MAX);
+        const arc_blocks::DecodedArc d = block_of(b.blocks, m, a);
+        CHECK_EQ(int(d.k), 2);
+        CHECK(same_ring(d.vertices, *ring));
+    }
+}
+
+TEST(a_hole_the_11_m_grid_puts_on_its_outer_ring_goes_back_to_the_1_1_m_tier_not_osms_grid) {
+    // A hole 400 inside its outer ring's straight edge: on the 11 m grid it
+    // touches it, so it stops nesting, with nothing to give back.
+    const Ring outer = closed({pt(0, 0), pt(0, 100000), pt(100000, 100000), pt(100000, 0)});
+    const Ring hole = closed({pt(400, 40000), pt(400, 60000), pt(3000, 60000), pt(3000, 40000)});
+    const Built b = built({{outer, {hole}}});
+    const size_t m = minimal_tier();
+    const ArcTierCounts& c = b.arcs.tiers[m].counts;
+    CHECK(c.crossings_coarse >= 1);
+    CHECK_EQ(c.crossings_left, size_t(0));
+    CHECK_EQ(c.rings_nest_introduced, size_t(0));
+    CHECK_EQ(c.e7_grid_arcs, size_t(0));
+    CHECK_EQ(c.put_back_arcs, size_t(2));
+    bool chained = true;
+    const std::vector<Ring> rings = decoded_rings(b.blocks, ArcSet::Minimal, m, 0, chained);
+    REQUIRE(rings.size() == 2);
+    CHECK(chained);
+    CHECK(same_ring(rings[0], outer) && same_ring(rings[1], hole));
+    for (const Ring* ring : {&outer, &hole}) {
+        const uint32_t a = minimal_arc_through(b, (*ring)[1]);
+        REQUIRE(a != UINT32_MAX);
+        CHECK_EQ(int(block_of(b.blocks, m, a).k), 2);
+    }
+}
+
+TEST(an_arc_keeps_copy_takes_one_arcs_marks_from_another_of_the_same_arcs) {
+    auto sizes = [](size_t a) { return a == 1 ? 130u : 7u; };
+    ArcKeep from(3, sizes), to(3, sizes);
+    for (uint32_t i : {0u, 63u, 64u, 129u}) from.set(1, i);
+    from.set(0, 3);
+    to.set(1, 5);
+    to.set(2, 6);
+    to.copy_arc(from, 1);
+    for (uint32_t i = 0; i < 130; i++) CHECK_EQ(to.test(1, i), from.test(1, i));
+    CHECK(!to.test(0, 3));
+    CHECK(to.test(2, 6));
+    const ArcKeep other(3, [](size_t) { return 7u; });
+    CHECK(refusal_of<std::logic_error>([&] { to.copy_arc(other, 0); }).find("other arcs") != std::string::npos);
 }

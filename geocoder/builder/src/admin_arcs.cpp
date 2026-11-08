@@ -1102,7 +1102,9 @@ std::string tier_summary(const ArcTier& tier, const ArcTierCounts& c) {
              << c.fine_degenerate_rings << " rings degenerate and " << c.fine_crossings_left
              << " crossings left on the fine one, " << c.coarse_rounds << " rounds keep " << c.fine_rings
              << " collapsing rings fine (" << c.fine_junctions << " junctions, " << c.fine_arcs << " arcs), "
-             << c.crossings_coarse << " crossings before its repair";
+             << c.crossings_coarse << " crossings before its repair, " << c.put_back_arcs
+             << " arcs of crossings and polygons not nesting put back as on the fine one in " << c.put_back_rounds
+             << " rounds";
     line << "\n";
     return line.str();
 }
