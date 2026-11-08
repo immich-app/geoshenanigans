@@ -668,6 +668,18 @@ static void wval(std::vector<char>& buf, const void* data, size_t size) {
     buf.insert(buf.end(), (const char*)data, (const char*)data + size);
 }
 
+// A full replacement's head (stride 0, no fixups), the new file's new_size
+// bytes to follow it: emit_raw's sections, and an empty admin geometry file's.
+static void write_full_replacement_head(std::vector<char>& buf, uint32_t fid, uint64_t old_size, uint64_t new_size) {
+    const uint32_t stride = 0, nfix = 0;
+    wval(buf, &fid, 4);
+    wval(buf, &stride, 4);
+    wval(buf, &old_size, 8);
+    wval(buf, &new_size, 8);
+    wval(buf, &nfix, 4);
+    wval(buf, &new_size, 8);
+}
+
 // Appends n (u32) and rm's n pairs ascending by old id, as the patcher reads
 // remap pairs where they sit (SortedTable); returns n.
 static uint32_t append_remap_pairs(std::vector<char>& buf, const std::unordered_map<uint32_t, uint32_t>& rm) {
@@ -1617,12 +1629,21 @@ static int run(int argc, char* argv[]) {
     // admin_polygons, admin_rings. A file the new dir lacks gets no section,
     // as it got no full replacement (emit_raw): the patch lists no such
     // client file, and a dir without admin geometry (full, poi, the mode
-    // dirs) carries no empty merge of the four.
+    // dirs) carries no empty merge of the four. An empty one (Antarctica's
+    // dirs hold no admin polygon) goes as a full replacement of nothing, 36
+    // bytes against an empty merge's 56, as emit_raw sent it: COPY_OLD never
+    // stands for an empty file (try_emit_copy_old).
     for (size_t f = 0; f < res_slots.size(); f++)
         for (FileMergeResult* r : {&res_slots[f], &res_blocks[f]}) {
             struct stat st;
-            if (stat((new_dir + "/" + r->name).c_str(), &st) == 0)
-                serialize_merge(patch, *r, old_dir, new_dir, patcher_strings, offset_fixup_limits);
+            if (stat((new_dir + "/" + r->name).c_str(), &st) == 0) {
+                if (st.st_size == 0) {
+                    write_full_replacement_head(patch, static_cast<uint32_t>(r->id), r->old_size, 0);
+                    std::cerr << "  " << r->name << ": full replace 0 bytes" << std::endl;
+                } else {
+                    serialize_merge(patch, *r, old_dir, new_dir, patcher_strings, offset_fixup_limits);
+                }
+            }
             std::vector<char>().swap(r->seq.data);
         }
     malloc_trim(0); // return freed heap to OS
@@ -1807,17 +1828,7 @@ static int run(int argc, char* argv[]) {
                               old_size, new_size, fname.c_str()))
             return;
 
-        uint32_t fid_u = static_cast<uint32_t>(fid);
-        uint32_t stride = 0;  // sentinel: full replacement
-        uint32_t nfix = 0;
-        uint64_t ds = new_size;
-
-        wval(patch, &fid_u, 4);
-        wval(patch, &stride, 4);
-        wval(patch, &old_size, 8);
-        wval(patch, &new_size, 8);
-        wval(patch, &nfix, 4);
-        wval(patch, &ds, 8);
+        write_full_replacement_head(patch, static_cast<uint32_t>(fid), old_size, new_size);
         if (new_size > 0) {
             auto new_m = mmap_file(new_path);
             if (new_m.data) {
