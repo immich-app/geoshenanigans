@@ -297,8 +297,10 @@ struct ArcTierCounts {
     size_t fine_arcs = 0;              // arcs stored on the fine grid (arc_grid), none on OSM's
     int put_back_rounds = 0;           // rounds that put arcs back as the fine build left them
     size_t put_back_arcs = 0;          // arcs of crossings and of polygons not nesting put back so
-    int collapsed_put_back_rounds = 0;     // last rounds that put back rings collapsing still, all fine
+    int collapsed_put_back_rounds = 0;     // last rounds that put back rings collapsing or folding still, all fine
     size_t collapsed_put_back_rings = 0;   // the rings they put back
+    size_t folded_put_back_rings = 0;      // of them, rings with an area that fold: turned over where the fine one isn't
+    size_t folds_left = 0;                 // rings valid on the fine grid that fold still
 };
 
 // Which vertices of a simplified tier's arc are stored on another grid than
@@ -525,7 +527,11 @@ std::vector<bool> exact_rings_nest(const AdminExactRings& store, unsigned thread
 // cross only where the fine build's do. Last, a ring valid on the fine grid
 // that collapses still with every arc and junction of it fine (the repair
 // gave it a vertex back that takes its area away) has its arcs put back too,
-// and what that makes is put back in turn.
+// and so has one that folds where the fine one doesn't: it winds the other
+// way, or a loop of it split off where it comes back to a vertex winds
+// against the rest and lies outside it (a strip narrower than the grid
+// turned over, which the ring and its neighbours on both sides would all
+// cover; no crossing shows it). What that makes is put back in turn.
 // `phase_done` is told as each step ends.
 ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
                             const std::vector<bool>& nests_exact, unsigned threads,
@@ -681,6 +687,17 @@ struct AdminArcBlocks {
 // its arc blocks store it and every arc ending at a junction kept fine is
 // stored on the fine grid or finer. Logs its counts as ARC_CHECK lines.
 AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& store, unsigned threads);
+
+// Whether `ring` (each vertex once where its neighbour repeats it, without
+// the closing one) folds over itself: split at each vertex it comes back
+// to, a loop with an area that winds against the rest of the ring and lies
+// outside it. The polygon covers that loop, and so do the neighbours whose
+// borders bound it: a strip narrower than the grid, turned over between the
+// two vertices its ends pinch to. A loop without an area (a spur), one that
+// winds as the rest does (a pinched neck) and one inside the rest (a hole
+// the ring pinches off) fold nothing. `keys`, `loop` and `rest` are scratch.
+bool ring_folds_over(const std::vector<PackedLocation>& ring, std::vector<uint64_t>& keys, std::vector<PackedLocation>& loop,
+                     std::vector<PackedLocation>& rest);
 
 // The checks tier t, one that coarsens, aborts on (std::runtime_error) over
 // its arc blocks `blocks`: every ring of its set that was valid on its fine

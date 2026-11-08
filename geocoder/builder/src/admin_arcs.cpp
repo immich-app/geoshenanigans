@@ -1104,8 +1104,9 @@ std::string tier_summary(const ArcTier& tier, const ArcTierCounts& c) {
              << " collapsing rings fine (" << c.fine_junctions << " junctions, " << c.fine_arcs << " arcs), "
              << c.crossings_coarse << " crossings before its repair, " << c.put_back_arcs
              << " arcs of crossings and polygons not nesting put back as on the fine one in " << c.put_back_rounds
-             << " rounds, " << c.collapsed_put_back_rings << " rings collapsing still put back in "
-             << c.collapsed_put_back_rounds << " rounds";
+             << " rounds, " << c.collapsed_put_back_rings << " rings collapsing or folding still ("
+             << c.folded_put_back_rings << " folding) put back in " << c.collapsed_put_back_rounds << " rounds, "
+             << c.folds_left << " rings folding left";
     line << "\n";
     return line.str();
 }

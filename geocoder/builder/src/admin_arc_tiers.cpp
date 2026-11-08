@@ -12,6 +12,48 @@
 #include "parallel.h"
 #include "parsed_data.h"
 
+bool ring_folds_over(const std::vector<PackedLocation>& ring, std::vector<uint64_t>& keys, std::vector<PackedLocation>& loop,
+                     std::vector<PackedLocation>& rest) {
+    auto winding = [](const std::vector<PackedLocation>& v) {
+        const __int128 a2 = exact_ring_area2(v.data(), static_cast<uint32_t>(v.size()));
+        return (a2 > 0) - (a2 < 0);
+    };
+    keys.clear();
+    for (const PackedLocation& p : ring) keys.push_back(vertex_key(p));
+    std::sort(keys.begin(), keys.end());
+    if (std::adjacent_find(keys.begin(), keys.end()) == keys.end()) return false;
+    std::unordered_map<uint64_t, uint32_t> at;  // a vertex of rest: its index
+    std::vector<std::pair<int, std::vector<PackedLocation>>> loops;  // each loop with an area, and its winding
+    rest.clear();
+    for (const PackedLocation& p : ring) {
+        const auto it = at.find(vertex_key(p));
+        if (it == at.end()) {
+            at.emplace(vertex_key(p), static_cast<uint32_t>(rest.size()));
+            rest.push_back(p);
+            continue;
+        }
+        const uint32_t i = it->second;
+        loop.assign(rest.begin() + i, rest.end());
+        const int w = winding(loop);
+        if (w != 0) loops.push_back({w, loop});
+        for (size_t k = i + 1; k < rest.size(); k++) at.erase(vertex_key(rest[k]));
+        rest.resize(i + 1);
+    }
+    // Which of the two lies inside the other doesn't depend on where the
+    // ring starts: test a vertex of each, off the vertex they share, in the
+    // other.
+    const int whole = winding(rest);
+    for (const auto& [w, l] : loops) {
+        if (whole == 0 || w == whole) continue;
+        const auto off = std::find_if(rest.begin(), rest.end(), [&](const PackedLocation& p) { return p != l[0]; });
+        if (off == rest.end()) continue;
+        if (!exact_ring_contains(rest.data(), static_cast<uint32_t>(rest.size()), l[l.size() / 2]) &&
+            !exact_ring_contains(l.data(), static_cast<uint32_t>(l.size()), *off))
+            return true;
+    }
+    return false;
+}
+
 namespace {
 
 // Pairs of raw edges past which the repair takes two segments' raw spans for
@@ -267,7 +309,19 @@ struct Scratch {
     std::vector<LatLng> pts;
     std::vector<StoredVertex> stored;
     std::vector<PackedLocation> ring;
+    std::vector<uint64_t> keys;  // folds_over
+    std::vector<PackedLocation> loop, rest;
 };
+
+// Which way a ring winds: the sign of its exact area, 0 for none.
+int winding(const PackedLocation* v, size_t n) {
+    const __int128 a2 = exact_ring_area2(v, static_cast<uint32_t>(n));
+    return (a2 > 0) - (a2 < 0);
+}
+
+bool folds_over(const std::vector<PackedLocation>& ring, Scratch& s) {
+    return ring_folds_over(ring, s.keys, s.loop, s.rest);
+}
 
 std::vector<LatLng> lat_lng_ring(const PackedLocation* v, size_t n, bool close) {
     std::vector<LatLng> out;
@@ -511,8 +565,16 @@ public:
     void coarsen(ArcTierCounts& counts) {
         std::vector<Scratch> scratch(threads_);
         fine_valid_.assign(store_.rings.size(), 0);
+        fine_winding_.assign(store_.rings.size(), 0);
+        fine_folds_.assign(store_.rings.size(), 0);
         parallel_for_dynamic(rings_.size(), 64, [&](size_t begin, size_t end, unsigned worker) {
-            for (size_t k = begin; k < end; k++) fine_valid_[rings_[k]] = stored_ring_valid(rings_[k], scratch[worker]);
+            Scratch& s = scratch[worker];
+            for (size_t k = begin; k < end; k++) {
+                const uint32_t r = rings_[k];
+                fine_valid_[r] = stored_ring_valid(r, s);
+                fine_winding_[r] = static_cast<int8_t>(winding(s.ring.data(), s.ring.size()));
+                fine_folds_[r] = fine_valid_[r] && folds_over(s.ring, s);
+            }
         }, threads_);
         size_t valid = 0;
         for (uint32_t r : rings_) valid += fine_valid_[r];
@@ -572,29 +634,39 @@ public:
     // Last, the rings valid on the fine grid that collapse still, though
     // their arcs and junctions are all fine: the repair on the tier's grid
     // gave one a vertex back that takes its area away (a bowtie the raw ring
-    // already is), and the loop has nothing left to move. Puts their arcs
+    // already is), and the loop has nothing left to move. And those that
+    // fold (folds): a strip narrower than the tier's grid that it turns
+    // over, which the ring and its neighbours on both sides then all cover;
+    // no crossing shows it, and the ring keeps an area. Puts their arcs
     // back as the fine build left them, then puts back the arcs of the
     // crossings and polygons not nesting that makes and runs the e7 grid
-    // rounds once more, round after round until none collapses or a round has
-    // nothing to put back. Nothing gives a vertex back to an arc put back, so
-    // a ring all of whose arcs are put back is the fine build's. One that
-    // still collapses (an arc of it on the e7 grid since) is left for the
-    // check encode_admin_arcs makes.
+    // rounds once more, round after round until none collapses or folds or a
+    // round has nothing to put back. Nothing gives a vertex back to an arc
+    // put back, so a ring all of whose arcs are put back is the fine
+    // build's. One that still collapses (an arc of it on the e7 grid since)
+    // is left for the check encode_admin_arcs makes; one that still folds
+    // is counted (folds_left).
     void put_back_collapsing_rings(ArcTierCounts& counts) {
         for (int round = 0; round < kArcRepairRounds; round++) {
             const std::vector<uint32_t> collapsing = collect_in_order<uint32_t, Scratch>(rings_.size(),
                 [&](size_t k, std::vector<uint32_t>& out, Scratch& s) {
-                    if (fine_valid_[rings_[k]] && !stored_ring_valid(rings_[k], s)) out.push_back(rings_[k]);
+                    const uint32_t r = rings_[k];
+                    if (fine_valid_[r] && (!stored_ring_valid(r, s) || folds(r, s))) out.push_back(r);
                 }, threads_);
             if (collapsing.empty()) break;
 
             std::vector<uint32_t> arcs;
-            for (uint32_t r : collapsing)
+            size_t folding = 0;
+            Scratch s;
+            for (uint32_t r : collapsing) {
+                folding += stored_ring_valid(r, s);
                 for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) arcs.push_back(set_.refs()[k].arc);
+            }
             std::vector<uint32_t> changed = put_back(arcs, counts);
             if (changed.empty()) break;
             counts.collapsed_put_back_rounds++;
             counts.collapsed_put_back_rings += collapsing.size();
+            counts.folded_put_back_rings += folding;
             with_collapsing_rings_kept_fine(changed, counts);
             add_conflicts(meetings_of(update(changed)));
             put_back_crossed_and_unnested(counts);
@@ -607,6 +679,15 @@ public:
         counts.degenerate_rings = collect_in_order<uint32_t, Scratch>(rings_.size(),
             [&](size_t k, std::vector<uint32_t>& out, Scratch& s) {
                 if (!stored_ring_valid(rings_[k], s)) out.push_back(rings_[k]);
+            }, threads_).size();
+    }
+
+    // The rings valid on the fine grid that fold still (folds).
+    void count_folds(ArcTierCounts& counts) const {
+        counts.folds_left = collect_in_order<uint32_t, Scratch>(rings_.size(),
+            [&](size_t k, std::vector<uint32_t>& out, Scratch& s) {
+                const uint32_t r = rings_[k];
+                if (fine_valid_[r] && stored_ring_valid(r, s) && folds(r, s)) out.push_back(r);
             }, threads_).size();
     }
 
@@ -899,6 +980,13 @@ private:
         stored_ring(r, s);
         return valid(s.ring);
     }
+    // Whether ring r, as s.ring holds it on the tier's grid (stored_ring),
+    // folds where the fine build's doesn't: it winds the other way, or
+    // folds over itself (folds_over).
+    bool folds(uint32_t r, Scratch& s) const {
+        const int w = winding(s.ring.data(), s.ring.size());
+        return (w != 0 && fine_winding_[r] != 0 && w != fine_winding_[r]) || (!fine_folds_[r] && folds_over(s.ring, s));
+    }
 
     void add_segments(uint32_t a, Scratch& s, std::vector<Segment>& out) const {
         set_.read(a, s.raw);
@@ -1135,6 +1223,8 @@ private:
     ArcKeep keep_;
     std::vector<uint8_t> grid_;  // arc_grid marks, by arc
     std::vector<uint8_t> fine_valid_;  // by ring: in the set and valid on the fine grid (coarsen)
+    std::vector<int8_t> fine_winding_;  // by ring: which way it winds there (winding)
+    std::vector<uint8_t> fine_folds_;   // by ring: valid there and folding over itself (folds_over)
     std::vector<uint8_t> kept_fine_;   // by ring: kept fine (keep_collapsing_rings_fine)
     std::vector<uint64_t> fine_junctions_;  // ascending
     std::vector<ArcEnd> ends_;  // every open arc's two, ascending
@@ -1234,6 +1324,7 @@ ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store,
         builder.put_back_collapsing_rings(state.counts);
         done("coarse collapsing put back");
         builder.count_degenerate(state.counts);
+        builder.count_folds(state.counts);
     }
     builder.count_left(state.counts);
     done("what is left");

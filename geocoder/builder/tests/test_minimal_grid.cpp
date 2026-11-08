@@ -4,9 +4,9 @@
 // would collapse keeping its arcs and its junctions fine, every arc that ends
 // at one of those junctions fine too, round after round; the repair on the
 // 11 m grid, and the arcs of the crossings and polygons not nesting it leaves,
-// and of the rings it collapses again, put back as the 1.1 m tier has them;
-// and the two checks the arc stage aborts on. S2-free, in the sanitized
-// suite.
+// and of the rings it collapses again or folds, put back as the 1.1 m tier
+// has them; and the two checks the arc stage aborts on. S2-free, in the
+// sanitized suite.
 #include <algorithm>
 #include <cmath>
 #include <random>
@@ -147,6 +147,12 @@ bool valid(Ring ring) {
     ring.erase(std::unique(ring.begin(), ring.end()), ring.end());
     if (ring.size() >= 2 && ring.front() == ring.back()) ring.pop_back();
     return ring.size() >= 3 && exact_ring_area2(ring.data(), static_cast<uint32_t>(ring.size())) != 0;
+}
+
+// Which way a closed ring winds: the sign of its exact area.
+int winding_of(const Ring& ring) {
+    const __int128 a2 = exact_ring_area2(ring.data(), static_cast<uint32_t>(ring.size()));
+    return (a2 > 0) - (a2 < 0);
 }
 
 Ring snapped_ring(const Ring& raw, int32_t step) {
@@ -717,6 +723,80 @@ TEST(a_ring_kept_fine_that_the_11_m_repair_collapses_again_goes_back_to_the_1_1_
     const arc_blocks::DecodedArc square = block_of(b.blocks, m, q);
     CHECK_EQ(int(square.k), 2);
     CHECK(same_ring(square.vertices, Q));
+}
+
+// How many of the first `polygons` polygons hold p, each by its minimal rings
+// as tier t's blocks hold them (even-odd over all of them).
+size_t holders(const Built& b, size_t t, uint32_t polygons, PackedLocation p) {
+    size_t n = 0;
+    for (uint32_t i = 0; i < polygons; i++) {
+        bool chained = true, in = false;
+        for (const Ring& r : decoded_rings(b.blocks, ArcSet::Minimal, t, i, chained))
+            if (exact_ring_contains(r.data(), static_cast<uint32_t>(r.size()), p)) in = !in;
+        n += in;
+    }
+    return n;
+}
+
+TEST(a_strip_the_11_m_grid_turns_over_goes_back_to_the_1_1_m_tier) {
+    // The strip S N V, 0.3 m wide, between A, east of its edge S..N, and B,
+    // west of its edge N..V..S. On the 11 m grid V lands east of S..N: the
+    // strip winds the other way, a triangle that it, A and B would all hold
+    // (P), and nothing crosses. Its arcs go back as the 1.1 m tier has them.
+    const PackedLocation S = pt(0, -499), N = pt(20000, 1499), V = pt(10499, 520), P = pt(12000, 900);
+    const Ring strip = closed({S, N, V});
+    const Ring A = closed({S, pt(0, 20000), pt(20000, 20000), N});
+    const Ring B = closed({S, V, N, pt(20000, -20000), pt(0, -20000)});
+    // As the plan of the fixture says.
+    CHECK_EQ(winding_of(snapped_ring(strip, kFine)), winding_of(strip));
+    CHECK_EQ(winding_of(snapped_ring(strip, kCoarse)), -winding_of(strip));
+    CHECK(exact_ring_contains(snapped_ring(strip, kCoarse).data(), 4, P));
+    CHECK(!exact_ring_contains(snapped_ring(strip, kFine).data(), 4, P));
+    Built b;
+    const std::string why = refusal_of([&] { b = built({{strip, {}}, {A, {}}, {B, {}}}); });
+    CHECK_EQ(why, std::string());
+    if (!why.empty()) return;
+    const size_t m = minimal_tier();
+    const ArcTierCounts& c = b.arcs.tiers[m].counts;
+    CHECK_EQ(c.folded_put_back_rings, size_t(1));
+    CHECK_EQ(c.folds_left, size_t(0));
+    CHECK_EQ(c.crossings_left, size_t(0));
+    bool chained = true;
+    const std::vector<Ring> rings = decoded_rings(b.blocks, ArcSet::Minimal, m, 0, chained);
+    REQUIRE(rings.size() == 1);
+    CHECK(chained);
+    CHECK(same_ring(rings[0], snapped_ring(strip, kFine)));
+    CHECK_EQ(winding_of(rings[0]), winding_of(strip));
+    CHECK_EQ(holders(b, m, 3, P), size_t(1));
+}
+
+bool folds_over(const Ring& ring) {
+    std::vector<uint64_t> keys;
+    Ring loop, rest;
+    return ring_folds_over(ring, keys, loop, rest);
+}
+
+TEST(a_ring_folds_over_where_a_loop_it_pinches_off_winds_against_it_outside_it) {
+    // The square A B C D, and at C a loop: outside the square winding
+    // against it (a fold), outside it winding as it does (a pinched neck),
+    // inside it winding against it (a hole pinched off), or of no area (a
+    // spur). Only the first folds.
+    const PackedLocation A = pt(0, 0), B = pt(0, 100), C = pt(100, 100), D = pt(100, 0);
+    const PackedLocation E = pt(150, 150), F = pt(150, 100), G = pt(50, 50), H = pt(50, 90), K = pt(150, 120);
+    const Ring square = {A, B, C, D};
+    // As the plan of the fixture says.
+    CHECK_EQ(winding_of({C, F, E}), -winding_of(square));
+    CHECK_EQ(winding_of({C, E, F}), winding_of(square));
+    CHECK_EQ(winding_of({C, H, G}), -winding_of(square));
+    CHECK(exact_ring_contains(square.data(), 4, G) && exact_ring_contains(square.data(), 4, H));
+    CHECK(folds_over({A, B, C, F, E, C, D}));
+    CHECK(!folds_over({A, B, C, E, F, C, D}));
+    CHECK(!folds_over({A, B, C, H, G, C, D}));
+    CHECK(!folds_over({A, B, C, K, C, D}));
+    CHECK(!folds_over(square));
+    // Where the ring starts doesn't matter.
+    CHECK(folds_over({E, C, D, A, B, C, F}));
+    CHECK(!folds_over({G, C, D, A, B, C, H}));
 }
 
 TEST(an_arc_keeps_copy_takes_one_arcs_marks_from_another_of_the_same_arcs) {
