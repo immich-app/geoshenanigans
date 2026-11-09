@@ -249,7 +249,7 @@ and 1450 s in 32 MiB (19.2 GiB).
 4. For coordinate files (nodes/vertices): derive merge from parent way/polygon merge — verify node blocks match before COPY, INSERT if nodes changed
 5. Derive ID remaps from merge sequences (MATCH ops define old→new record correspondence)
 6. **Secondary matching**: For DELETE/INSERT records in merge sequences, match by relaxed key (name + node_count for ways, street + housenumber for addrs, etc.) to recover ID mappings for modified-but-same-entity records
-7. Derive each cell's entry list from the old one (IDs remapped) and the cell changes, and compare it with the new one: street / addr / interp cells that differ go out as per-cell lost / gained ids (Geo Entry Deltas), the admin / POI cell indexes as a Cell Index Delta (v10: the diff refuses a new index whose layout the patcher can't rebuild byte for byte). The place nodes have no cell index to send (v13: the reader derives theirs at load)
+7. Derive each cell's entry list from the old one (IDs remapped) and the cell changes, and compare it with the new one: street / addr / interp cells that differ go out as per-cell lost / gained ids (Geo Entry Deltas; both days' geo indexes walked block by block on every core, and a new one the patcher's Writer wouldn't write byte for byte refused), the admin / POI cell indexes as a Cell Index Delta (v10: the diff refuses a new index whose layout the patcher can't rebuild byte for byte). The place nodes have no cell index to send (v13: the reader derives theirs at load)
 8. Package everything, compress whole patch with zstd for transport
 
 **Patch tool:**
@@ -258,7 +258,7 @@ and 1450 s in 32 MiB (19.2 GiB).
 3. For each data file: apply string remap (or a string fixup) + offset fixups to old, replay merge sequence → output file, track ID mapping from MATCH ops
 4. Read secondary ID remaps → each replayed file's moved pairs, read where they sit, beside its derived ID mappings
 5. Read cell changes (added/removed cell IDs) and the per-cell entry deltas
-6. Rebuild geo_cells and the street / addr / interp entry files in one pass over the old geo index: each cell's lists with their IDs remapped, corrected by the cell's delta
+6. Rebuild the geo index in one pass over the old one: each cell's lists with their IDs remapped, corrected by the cell's delta, the old index decoded and the new one encoded block by block (`src/geo_index.h`), so the files hash as the build's
 7. Rebuild the admin / POI cell indexes from their ID remaps + cell changes (v14: the admin index's ids as they are, since admin polygons keep their slots), corrected by the Cell Index Delta: the old index decoded and the new one encoded block by block (`src/cell_pairs.h`), so the files hash as the build's
 
 ## Known Issues
@@ -545,14 +545,19 @@ Secondary ID Remap: marker 0xFFFFFFF6 (u32) + n_files (u32)
   refuses pairs for any other ("Malformed secondary remap: pairs for <file>,
   which has none") and passes over an empty list.
 
-Geo Entry Deltas (street / addr / interp entries): marker 0xFFFFFFF0 (u32)
-  + file_id (u32) + count (u32), then per cell in cell order:
-  cell_id (u64) + n_lost (u16) + n_gained (u16) + [id:u32] × n_lost
+Geo Entry Deltas (street / addr / interp lists): marker 0xFFFFFFF0 (u32)
+  + file_id (u32, 9 to 11: the table) + count (u32), then per cell in cell
+  order: cell_id (u64) + n_lost (u16) + n_gained (u16) + [id:u32] × n_lost
   + [id:u32] × n_gained, turning the list the patcher derives (old list,
   ids remapped) into the new one. n_lost 0xFFFF: the gained ids are the
   whole new list. v8: an old id the remap doesn't map is a deleted record
-  and drops out of the derived list. At most one per entries file; the
-  patcher refuses another file or a second one.
+  and drops out of the derived list. At most one per table; the patcher
+  refuses another file or a second one. The patcher reads the old geo index
+  and writes the new one through the builder's own codec (`src/geo_index.h`:
+  a Reader and a Writer, each front to back, holding a group's footer and
+  a row's lists and each table's list before them in the block). The deltas
+  name cells and ids, not where the files keep them, so they are the same
+  whatever the layout.
 
 Cell List Delta (v15; the payload of stride=0xFB and of a Cell Index Delta):
   runs over the ranks of the cells, every number a varint (LEB128, a u64; an
@@ -602,7 +607,9 @@ End marker: 0xFFFFFFFF (u32)
 
 Every section names its file by id (`PatchFileId`, `tools/patch_format.h`). v14
 gives ids 7, 26 and 27 to the admin arc files: they named `admin_vertices.bin`
-and the postal files, which no build writes any more.
+and the postal files, which no build writes any more. The geo index's GXT2
+layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
+9 to 11 its three lists, which the geo entry deltas name.
 
 | Id | File | How it travels |
 |----|------|----------------|
@@ -614,8 +621,8 @@ and the postal files, which no build writes any more.
 | 5 | `interp_nodes.bin` | child stream of interp_ways, at stride 8 |
 | 6 | `admin_polygons.bin` | merge by slot at stride 24, string field `name_id`, offset field `ring_offset` (v14) |
 | 7 | `admin_rings.bin` | child stream of admin_polygons, at stride 1 (v14; v13: `admin_vertices.bin`) |
-| 8 | `geo_cells.bin` | geo cell changes (0xFFFFFFFB), rebuilt beside the geo entry deltas |
-| 9-11 | `street_entries.bin`, `addr_entries.bin`, `interp_entries.bin` | geo entry deltas (0xFFFFFFF0) |
+| 8 | `geo_cells.bin` | geo cell changes (0xFFFFFFFB), rebuilt with `geo_entries.bin` (35) beside the geo entry deltas |
+| 9-11 | the geo index's street, address and interpolation lists (no files of their own since GXT2) | geo entry deltas (0xFFFFFFF0) |
 | 12, 13 | `admin_cells.bin`, `admin_entries.bin` | admin cell changes (0xFFFFFFFA) and a cell index delta (0xFFFFFFF7), over the old index's ids as they are (v14) |
 | 14 | `poi_records.bin` | merge at stride 36, string fields `name_id`, `parent_street_id` and `parent_postcode_id` |
 | 15 | `poi_vertices.bin` | child stream of poi_records, at stride 1 |
@@ -632,6 +639,7 @@ and the postal files, which no build writes any more.
 | 28 | `addr_vertices.bin` | child stream of addr_points at stride 1; whole in a dir without address points |
 | 29-33 | `strings_core.bin` … `strings_poi.bin` | the strings section; a tier the old dir lacks, whole |
 | 34 | `interp_postcodes.bin` | parallel delta along interp_ways, remap kind 2 |
+| 35 | `geo_entries.bin` | the geo index's blocks, rebuilt with `geo_cells.bin` (8) |
 
 The four admin geometry files (`ADMIN_SLOT_FAMILIES`) follow the place nodes
 as arc_index, arc_vertices, admin_polygons, admin_rings, ahead of the admin

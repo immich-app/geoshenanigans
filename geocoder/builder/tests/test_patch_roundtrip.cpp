@@ -16,6 +16,7 @@
 #include <tuple>
 #include <vector>
 
+#include "geo_index.h"
 #include "in_place_edits.h"
 #include "merge_sequence.h"
 #include "patch_decompress.h"
@@ -62,37 +63,24 @@ BuildDir with_pool(const std::string& pool) {
     return d;
 }
 
-std::vector<char> entry_list(const std::vector<uint32_t>& ids) {
-    std::vector<char> out;
-    append(out, static_cast<uint16_t>(ids.size()));
-    for (uint32_t id : ids) append(out, id);
-    return out;
-}
-
 // A geo cell and the street, addr and interp ids it lists.
 struct GeoCell {
     uint64_t id;
     std::vector<uint32_t> streets, addrs, interps;
 };
 
-// geo_cells.bin and the entries files of `cells` (ascending ids), laid out as
-// the builder writes them: each list after the one before, an empty one NO_DATA.
+// The geo index of `cells` (ascending ids), as the builder writes it
+// (geo_index.h): its top file and its blocks file.
 void put_geo_cells(BuildDir& d, const std::vector<GeoCell>& cells) {
-    std::vector<char> geo;
-    for (const auto& cell : cells) {
-        append(geo, cell.id);
-        const std::pair<const char*, const std::vector<uint32_t>*> lists[] = {
-            {"street_entries.bin", &cell.streets}, {"addr_entries.bin", &cell.addrs},
-            {"interp_entries.bin", &cell.interps}};
-        for (const auto& [name, ids] : lists) {
-            if (ids->empty()) { append(geo, NO_DATA); continue; }
-            auto& entries = d[name];
-            append(geo, static_cast<uint32_t>(entries.size()));
-            auto list = entry_list(*ids);
-            entries.insert(entries.end(), list.begin(), list.end());
-        }
-    }
-    d["geo_cells.bin"] = geo;
+    std::vector<char> top, blocks;
+    geo_index::Writer writer([&](const char* p, size_t n) { top.insert(top.end(), p, p + n); },
+                             [&](const char* p, size_t n) { blocks.insert(blocks.end(), p, p + n); });
+    for (const auto& cell : cells) writer.add(cell.id, {{{cell.streets.data(), cell.streets.size()},
+                                                         {cell.addrs.data(), cell.addrs.size()},
+                                                         {cell.interps.data(), cell.interps.size()}}});
+    writer.finish();
+    d["geo_cells.bin"] = top;
+    d["geo_entries.bin"] = blocks;
 }
 
 // <prefix>_cells.bin and <prefix>_entries.bin holding CELL, which lists ids.
@@ -549,6 +537,73 @@ TEST(patch_round_trip_keeps_the_interp_ids_of_unchanged_interp_ways) {
     put_geo_cells(new_d, {{CELL, {}, {}, {0, 1}}});
 
     CHECK(round_trip(old_d, new_d).mismatches.empty());
+}
+
+// A geo index of many blocks in three groups, whose lists repeat and edit
+// the row before's as the builder's do, a day on: cells dropped, cells new,
+// lists that gain and lose ids in every table. The patcher's index is the
+// builder's, byte for byte (geo_index::Writer on both sides).
+TEST(patch_round_trip_rebuilds_a_geo_index_of_many_groups_as_the_builder_writes_it) {
+    std::mt19937_64 rng(20261109);
+    std::vector<GeoCell> old_cells, new_cells;
+    std::vector<uint32_t> prev[3] = {{1, 2}, {1}, {4}};
+    for (uint64_t k = 0; old_cells.size() < 9000; k += 2 * (1 + rng() % 3)) {
+        GeoCell c{geo_index::cell_of(1000 + k, 17), {}, {}, {}};
+        std::vector<uint32_t>* lists[3] = {&c.streets, &c.addrs, &c.interps};
+        for (int t = 0; t < 3; t++) {
+            const uint64_t kind = rng() % 6;
+            if (kind == 0) continue;
+            std::vector<uint32_t>& l = *lists[t];
+            if (kind < 3) l = prev[t];
+            else if (kind == 3) { l = prev[t]; l.push_back(static_cast<uint32_t>(rng() % 3000)); }
+            else for (int j = 0; j < 1 + int(rng() % 4); j++) l.push_back(static_cast<uint32_t>(rng() % 3000));
+            std::sort(l.begin(), l.end());
+            l.erase(std::unique(l.begin(), l.end()), l.end());
+            prev[t] = l;
+        }
+        if (c.streets.empty() && c.addrs.empty() && c.interps.empty()) c.streets = {7};
+        old_cells.push_back(c);
+    }
+    for (const GeoCell& c : old_cells) {
+        const uint64_t fate = rng() % 10;
+        if (fate == 0) continue;  // dropped
+        GeoCell n = c;
+        if (fate == 1) {
+            std::vector<uint32_t>& l = rng() % 2 ? n.streets : n.interps;
+            if (!l.empty()) l.erase(l.begin());
+            l.push_back(3000 + static_cast<uint32_t>(rng() % 100));
+            std::sort(l.begin(), l.end());
+        }
+        if (fate == 2) n.addrs.push_back(5000 + static_cast<uint32_t>(new_cells.size()));
+        new_cells.push_back(n);
+        if (fate == 3) new_cells.push_back({c.id + (uint64_t(1) << 27), {9}, {}, {2}});  // a new cell beside it
+    }
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(OLD_POOL);
+    // The records the lists name, the same on both days: every id keeps its value.
+    std::vector<WayHeader> ways;
+    std::vector<InterpWay> interps;
+    std::vector<NodeCoord> nodes;
+    std::vector<AddrPoint> points;
+    for (uint32_t w = 0; w < 3200; w++) {
+        ways.push_back({w, 1, 0, NO_DATA});
+        interps.push_back({w, 1, 0, NO_DATA, 1, 9, 0});
+        nodes.push_back({10.0f + float(w) * 1e-4f, 20.0f});
+    }
+    for (uint32_t k = 0; k < 15000; k++) points.push_back({48.0f + float(k) * 1e-5f, 11.0f, NO_DATA, NO_DATA, NO_DATA, NO_DATA, 0});
+    for (BuildDir* d : {&old_d, &new_d}) {
+        (*d)["street_ways.bin"] = bytes_of(ways);
+        (*d)["street_nodes.bin"] = (*d)["interp_nodes.bin"] = bytes_of(nodes);
+        (*d)["interp_ways.bin"] = bytes_of(interps);
+        (*d)["addr_points.bin"] = bytes_of(points);
+    }
+    put_geo_cells(old_d, old_cells);
+    put_geo_cells(new_d, new_cells);
+    REQUIRE(old_d["geo_cells.bin"].size() == 8 + 3 * 12 + 8);
+
+    auto r = round_trip(old_d, new_d);
+
+    CHECK(r.mismatches.empty());
+    CHECK(logged(r, "Geo: " + std::to_string(new_cells.size()) + " cells written"));
 }
 
 TEST(patch_round_trip_keeps_the_poi_ids_of_unchanged_poi_records) {

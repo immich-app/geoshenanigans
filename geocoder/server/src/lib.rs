@@ -18,6 +18,7 @@ pub mod arc_fixture;
 pub mod cell_pairs;
 pub mod geo_index;
 pub use cell_pairs::CellPairs;
+pub use geo_index::{GeoIndex, GeoLists};
 mod exact_pip;
 pub use exact_pip::{edge_crosses, on_edge, to_e7, PointE7};
 mod file_stamp;
@@ -1035,14 +1036,13 @@ impl ScanPip {
 // --- Index data ---
 
 pub struct Index {
-    pub geo_cells: Option<FileBytes>,
-    pub street_entries: Option<FileBytes>,
+    /// The cells' lists of street ways, address points and interpolation ways (geo_index.rs);
+    /// none in a dir without streets.
+    pub geo_index: GeoIndex,
     pub street_ways: Option<FileBytes>,
     pub street_nodes: Option<FileBytes>,
-    pub addr_entries: Option<FileBytes>,
     pub addr_points: Option<FileBytes>,
     pub addr_vertices: Option<FileBytes>,
-    pub interp_entries: Option<FileBytes>,
     pub interp_ways: Option<FileBytes>,
     pub interp_nodes: Option<FileBytes>,
     // TIGER per-segment ZIP sidecar: u32 postcode string offset per interp
@@ -1162,17 +1162,17 @@ fn interpolate_house_number(start: u32, end: u32, interpolation: u8, t: f64) -> 
 
 pub const NO_DATA: u32 = 0xFFFFFFFF;
 
+thread_local! {
+    /// The lists of a query's geo lookups (geo_index.rs), taken while the lookup's caller reads
+    /// them and put back after.
+    static GEO_LISTS: std::cell::Cell<GeoLists> = Default::default();
+}
+
 // Entry-ID encoding for admin/POI cell entries: the high bit flags an
 // "interior" entry (cell fully inside the polygon, a fast path for PIP),
 // and the low 31 bits carry the polygon/POI index.
 pub const INTERIOR_FLAG: u32 = 0x80000000;
 pub const ID_MASK: u32 = 0x7FFFFFFF;
-
-pub struct GeoCellOffsets {
-    pub street: u32,
-    pub addr: u32,
-    pub interp: u32,
-}
 
 pub fn mmap_file(path: &str) -> Result<FileBytes, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path, e))?;
@@ -1250,8 +1250,14 @@ impl Index {
         let radians = search_distance / 6_371_000.0;
         let max_distance_sq = radians * radians;
 
-        let geo_cells = mmap_file_optional(&format!("{}/geo_cells.bin", dir));
+        let [geo_cells, geo_entries]: [Option<FileBytes>; 2] =
+            mmap_group(dir, &["geo_cells.bin", "geo_entries.bin"])?.try_into().map_err(|_| "geo group arity")?;
         let has_geo = geo_cells.is_some();
+        let geo_index = match (geo_cells, geo_entries) {
+            (Some(top), Some(blocks)) => GeoIndex::open(top, blocks, street_cell_level)
+                .map_err(|e| format!("{dir}/geo_cells.bin: {e}"))?,
+            _ => GeoIndex::none(),
+        };
 
         let required_geo = |name: &str| -> Result<Option<FileBytes>, String> {
             let path = format!("{}/{}", dir, name);
@@ -1268,11 +1274,9 @@ impl Index {
         // was added in v9 (building footprints) and older indexes
         // legitimately lack it. The way_/admin_parents and *_postcodes
         // sidecars are individually optional for the same version reason.
-        let [addr_entries, addr_points]: [Option<FileBytes>; 2] =
-            mmap_group(dir, &["addr_entries.bin", "addr_points.bin"])?
-                .try_into().map_err(|_| "addr group arity")?;
-        let [interp_entries, interp_ways, interp_nodes]: [Option<FileBytes>; 3] =
-            mmap_group(dir, &["interp_entries.bin", "interp_ways.bin", "interp_nodes.bin"])?
+        let addr_points = mmap_file_optional(&format!("{}/addr_points.bin", dir));
+        let [interp_ways, interp_nodes]: [Option<FileBytes>; 2] =
+            mmap_group(dir, &["interp_ways.bin", "interp_nodes.bin"])?
                 .try_into().map_err(|_| "interp group arity")?;
         let [poi_cells, poi_entries, poi_records, poi_vertices]: [Option<FileBytes>; 4] =
             mmap_group(dir, &["poi_cells.bin", "poi_entries.bin", "poi_records.bin", "poi_vertices.bin"])?
@@ -1301,14 +1305,11 @@ impl Index {
                                 mmap_file(&format!("{}/admin_entries.bin", dir))?, cell_pairs::ADMIN)?;
 
         Ok(Index {
-            geo_cells,
-            street_entries: required_geo("street_entries.bin")?,
+            geo_index,
             street_ways: required_geo("street_ways.bin")?,
             street_nodes: required_geo("street_nodes.bin")?,
-            addr_entries,
             addr_points,
             addr_vertices: mmap_file_optional(&format!("{}/addr_vertices.bin", dir)),
-            interp_entries,
             interp_ways,
             interp_nodes,
             interp_postcodes: mmap_file_optional(&format!("{}/interp_postcodes.bin", dir)),
@@ -1440,72 +1441,31 @@ impl Index {
         NO_DATA
     }
 
-    // geo_cells is a 20-byte-stride sorted index — binary search it
-    // with read_chunk.
-    pub fn lookup_geo_cell_fb(geo_cells: &FileBytes, target: u64) -> GeoCellOffsets {
-        let entry_size: u64 = 20;
-        let count = geo_cells.len() / entry_size;
-        let empty = GeoCellOffsets { street: NO_DATA, addr: NO_DATA, interp: NO_DATA };
-        if count == 0 { return empty; }
-        let mut lo: u64 = 0;
-        let mut hi = count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let bytes = geo_cells.read_chunk(mid * entry_size, entry_size as usize);
-            let mid_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-            if mid_id == target {
-                return GeoCellOffsets {
-                    street: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-                    addr:   u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-                    interp: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-                };
-            } else if mid_id < target { lo = mid + 1; } else { hi = mid; }
-        }
-        empty
-    }
-
-    // Read entries blob as Cow so it works on chunked sources.
-    // Same wire format as `for_each_entry_fb` (u16 count, then count
-    // u32 IDs), but materialises the IDs into a Vec for callers that
-    // need to iterate them more than once.
-    pub fn read_entries_fb(source: &FileBytes, offset: u32) -> Vec<u32> {
-        if offset == NO_DATA { return Vec::new(); }
-        let off = offset as u64;
-        if off + 2 > source.len() { return Vec::new(); }
-        let header = source.read_chunk(off, 2);
-        let count = u16::from_le_bytes([header[0], header[1]]) as usize;
-        if count == 0 { return Vec::new(); }
-        // Bound the payload: a corrupt count must not read past EOF.
-        if off + 2 + (count as u64) * 4 > source.len() { return Vec::new(); }
-        let blob = source.read_chunk(off + 2, count * 4);
-        let mut out = Vec::with_capacity(count);
-        for i in 0..count {
-            out.push(u32::from_le_bytes(blob[i*4..i*4+4].try_into().unwrap()));
-        }
-        out
-    }
-
-
     // --- Geo lookup (streets, addresses, interpolation from merged index) ---
+
+    /// The point's street-level cell and its neighbours, in the order the geo lookups read them.
+    fn geo_cells_around(&self, lat: f64, lng: f64) -> Vec<u64> {
+        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
+        std::iter::once(cell).chain(cell_neighbors_at_level(cell, self.street_cell_level)).collect()
+    }
 
     pub fn query_geo(&self, lat: f64, lng: f64)
         -> (Option<(f64, AddrPoint, u32)>, Option<(f64, &str, u32, u32)>, Option<(f64, WayHeader, u32)>)
     {
-        let geo_cells = match &self.geo_cells {
-            Some(gc) => gc,
-            None => return (None, None, None),
-        };
-        // Street files always accompany geo_cells in a well-formed index
+        if self.geo_index.is_empty() {
+            return (None, None, None);
+        }
+        // Street files always accompany the geo index in a well-formed dir
         // (required_geo enforces all-or-nothing at load). Guard rather than
         // unwrap so a partial/admin-only index degrades gracefully instead
         // of panicking.
-        let (Some(street_entries), Some(street_ways), Some(street_nodes)) =
-            (self.street_entries.as_ref(), self.street_ways.as_ref(), self.street_nodes.as_ref())
+        let (Some(street_ways), Some(street_nodes)) = (self.street_ways.as_ref(), self.street_nodes.as_ref())
         else {
             return (None, None, None);
         };
-        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
-        let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
+        let cells = self.geo_cells_around(lat, lng);
+        let mut lists = GEO_LISTS.with(std::cell::Cell::take);
+        self.geo_index.lookup_many(&cells, geo_index::ALL_TABLES, &mut lists);
 
         let cos_lat = lat.to_radians().cos();
         let addr_key = |a: &AddrPoint| {
@@ -1531,14 +1491,12 @@ impl Index {
         // Fixed-size hash set on stack to skip duplicate street IDs across cells
         let mut seen_streets: [u32; 64] = [u32::MAX; 64];
 
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            let offsets = Self::lookup_geo_cell_fb(geo_cells, c);
-
+        for i in 0..cells.len() {
             // Addresses. Building-sourced points (vertex_count > 0)
             // use polygon distance, matching ST_Distance behaviour.
-            if let (Some(addr_entries), Some(addr_points)) = (self.addr_entries.as_ref(), self.addr_points.as_ref()) {
+            if let Some(addr_points) = self.addr_points.as_ref() {
                 let total_addr = addr_points.len() / std::mem::size_of::<AddrPoint>() as u64;
-                for id in Self::read_entries_fb(addr_entries, offsets.addr) {
+                for &id in lists.list(i, geo_index::ADDRESSES) {
                     let idx = id as u64;
                     if idx >= total_addr { continue; }
                     let point: AddrPoint = addr_points.read_at(idx);
@@ -1559,7 +1517,7 @@ impl Index {
             // Streets
             let total_ways = street_ways.len() / std::mem::size_of::<WayHeader>() as u64;
             let total_street_nodes = street_nodes.len() / std::mem::size_of::<NodeCoord>() as u64;
-            for id in Self::read_entries_fb(street_entries, offsets.street) {
+            for &id in lists.list(i, geo_index::STREETS) {
                 let slot = (id as usize) & 0x3F;
                 if seen_streets[slot] == id { continue; }
                 seen_streets[slot] = id;
@@ -1591,11 +1549,9 @@ impl Index {
             }
 
             // Interpolation
-            if let (Some(interp_entries), Some(interp_ways)) =
-                (self.interp_entries.as_ref(), self.interp_ways.as_ref())
-            {
+            if let Some(interp_ways) = self.interp_ways.as_ref() {
                 let total_interps = interp_ways.len() / std::mem::size_of::<InterpWay>() as u64;
-                for id in Self::read_entries_fb(interp_entries, offsets.interp) {
+                for &id in lists.list(i, geo_index::INTERPOLATIONS) {
                     // Corrupt cell entries must not read past the record files.
                     if (id as u64) >= total_interps { continue; }
                     let iw: InterpWay = interp_ways.read_at(id as u64);
@@ -1610,6 +1566,8 @@ impl Index {
                 }
             }
         }
+
+        GEO_LISTS.with(|g| g.set(lists));
 
         let addr_result = best_addr.map(|p| (best_addr_dist, p, best_addr_id));
         let street_result = best_street.map(|w| (best_street_dist, w, best_street_idx));
@@ -1630,13 +1588,12 @@ impl Index {
     pub fn find_addr_on_way(&self, lat: f64, lng: f64, parent_way_idx: u32, max_dist_sq: f64)
         -> Option<AddrPoint>
     {
-        let geo_cells = self.geo_cells.as_ref()?;
-        let addr_entries = self.addr_entries.as_ref()?;
         let addr_points = self.addr_points.as_ref()?;
         let total_addr = addr_points.len() / std::mem::size_of::<AddrPoint>() as u64;
 
-        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
-        let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
+        let cells = self.geo_cells_around(lat, lng);
+        let mut lists = GEO_LISTS.with(std::cell::Cell::take);
+        self.geo_index.lookup_many(&cells, 1 << geo_index::ADDRESSES, &mut lists);
         let cos_lat = lat.to_radians().cos();
         let addr_key = |a: &AddrPoint| {
             let d = dist_sq((a.lat as f64 - lat).to_radians(), (a.lng as f64 - lng).to_radians(), cos_lat);
@@ -1645,9 +1602,8 @@ impl Index {
 
         let mut best_dist = max_dist_sq;
         let mut best: Option<AddrPoint> = None;
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            let offsets = Self::lookup_geo_cell_fb(geo_cells, c);
-            for id in Self::read_entries_fb(addr_entries, offsets.addr) {
+        for i in 0..cells.len() {
+            for &id in lists.list(i, geo_index::ADDRESSES) {
                 let idx = id as u64;
                 if idx >= total_addr { continue; }
                 let point: AddrPoint = addr_points.read_at(idx);
@@ -1664,6 +1620,7 @@ impl Index {
                 }
             }
         }
+        GEO_LISTS.with(|g| g.set(lists));
         best
     }
 
@@ -1691,19 +1648,17 @@ impl Index {
     /// Equally near lines (TIGER's odd and even sides share the street
     /// centreline) go to the lower start number, not to record order.
     pub fn find_interp_on_way(&self, lat: f64, lng: f64, street_name: &str, max_dist_sq: f64) -> Option<u32> {
-        let geo_cells = self.geo_cells.as_ref()?;
-        let interp_entries = self.interp_entries.as_ref()?;
         let interp_ways = self.interp_ways.as_ref()?;
         let total_interps = interp_ways.len() / std::mem::size_of::<InterpWay>() as u64;
 
-        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
-        let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
+        let cells = self.geo_cells_around(lat, lng);
+        let mut lists = GEO_LISTS.with(std::cell::Cell::take);
+        self.geo_index.lookup_many(&cells, 1 << geo_index::INTERPOLATIONS, &mut lists);
         let cos_lat = lat.to_radians().cos();
 
         let mut best: Option<(f64, InterpWay, f64)> = None;
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            let offsets = Self::lookup_geo_cell_fb(geo_cells, c);
-            for id in Self::read_entries_fb(interp_entries, offsets.interp) {
+        for i in 0..cells.len() {
+            for &id in lists.list(i, geo_index::INTERPOLATIONS) {
                 if (id as u64) >= total_interps { continue; }
                 let iw: InterpWay = interp_ways.read_at(id as u64);
                 if iw.start_number == 0 || iw.end_number == 0 { continue; }
@@ -1718,6 +1673,7 @@ impl Index {
                 if better { best = Some((dist, iw, t)); }
             }
         }
+        GEO_LISTS.with(|g| g.set(lists));
         best.map(|(_, iw, t)| interpolate_house_number(iw.start_number, iw.end_number, iw.interpolation, t))
     }
 
@@ -3819,14 +3775,11 @@ mod query_tests {
                             &mut place_cells, &mut place_entries).unwrap();
         let end = strings.len() as u32;
         Index {
-            geo_cells: None,
-            street_entries: None,
+            geo_index: GeoIndex::none(),
             street_ways: None,
             street_nodes: None,
-            addr_entries: None,
             addr_points: None,
             addr_vertices: None,
-            interp_entries: None,
             interp_ways: None,
             interp_nodes: None,
             interp_postcodes: None,
@@ -6490,16 +6443,11 @@ mod query_path_tests {
                     }
                 }
                 assert_eq!(ways.len(), self.streets.len() * std::mem::size_of::<WayHeader>());
-                let (mut geo_cells, mut entries) = (Vec::new(), Vec::new());
-                for (cell, ids) in &street_cells {
-                    geo_cells.extend_from_slice(&cell.to_le_bytes());
-                    geo_cells.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-                    geo_cells.extend_from_slice(&NO_DATA.to_le_bytes());
-                    geo_cells.extend_from_slice(&NO_DATA.to_le_bytes());
-                    entries.extend_from_slice(&(ids.len() as u16).to_le_bytes());
-                    ids.iter().for_each(|id| entries.extend_from_slice(&id.to_le_bytes()));
-                }
-                files.extend([("geo_cells.bin", geo_cells), ("street_entries.bin", entries),
+                let rows: Vec<(u64, [Vec<u32>; geo_index::TABLES])> = street_cells.into_iter()
+                    .map(|(cell, mut ids)| { ids.sort_unstable(); (cell, [ids, vec![], vec![]]) })
+                    .collect();
+                let (top, blocks) = geo_index::write(&rows);
+                files.extend([("geo_cells.bin", top), ("geo_entries.bin", blocks),
                               ("street_ways.bin", ways), ("street_nodes.bin", nodes)]);
             }
 
@@ -6945,9 +6893,9 @@ mod admin_scan_tests {
         let (cells, entries) = cell_pairs::write(&by_cell.into_iter().collect::<Vec<_>>(), cell_pairs::ADMIN);
         let len = strings.len() as u32;
         Index {
-            geo_cells: None, street_entries: None, street_ways: None, street_nodes: None,
-            addr_entries: None, addr_points: None, addr_vertices: None,
-            interp_entries: None, interp_ways: None, interp_nodes: None, interp_postcodes: None,
+            geo_index: GeoIndex::none(), street_ways: None, street_nodes: None,
+            addr_points: None, addr_vertices: None,
+            interp_ways: None, interp_nodes: None, interp_postcodes: None,
             admin_index: CellPairs::open(FileBytes::Owned(cells), FileBytes::Owned(entries), cell_pairs::ADMIN, DEFAULT_ADMIN_CELL_LEVEL).unwrap(),
             admin_polygons: FileBytes::Owned(polygons),
             admin_geometry: AdminGeometry::new(FileBytes::Owned(ring_blocks), FileBytes::Owned(arc_index), FileBytes::Owned(arc_vertices)),

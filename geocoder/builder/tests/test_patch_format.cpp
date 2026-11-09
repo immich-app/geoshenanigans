@@ -394,14 +394,18 @@ TEST(patch_format_magic_and_version) {
 
 TEST(patch_format_fileid_count_and_names_aligned) {
     // The names table must have exactly COUNT entries (one per PatchFileId).
-    CHECK_EQ(static_cast<uint32_t>(PatchFileId::COUNT), uint32_t(35));
+    CHECK_EQ(static_cast<uint32_t>(PatchFileId::COUNT), uint32_t(36));
     const size_t n_names = sizeof(patch_file_names) / sizeof(patch_file_names[0]);
-    CHECK_EQ(n_names, size_t(35));
+    CHECK_EQ(n_names, size_t(36));
     // Spot-check that index lines up with the enum value.
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::STRINGS)]) == "strings.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::POI_RECORDS)]) == "poi_records.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::STRINGS_POI)]) == "strings_poi.bin");
     CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::INTERP_POSTCODES)]) == "interp_postcodes.bin");
+    // The geo index's two files; its lists by table are no files.
+    CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::GEO_CELLS)]) == "geo_cells.bin");
+    CHECK(std::string(patch_file_names[static_cast<uint32_t>(PatchFileId::GEO_ENTRIES)]) == "geo_entries.bin");
+    for (PatchFileId fid : GEO_ENTRIES_FILES) CHECK(!has_suffix(patch_file_names[static_cast<uint32_t>(fid)], ".bin"));
 }
 
 // --- node_byte_offset ---
@@ -819,6 +823,7 @@ TEST(patch_format_old_file_size_of_a_virtual_file_comes_from_the_hook) {
 TEST(patch_format_old_file_sizes_cover_the_files_no_section_names) {
     ScratchDir old_dir("old-sizes");
     REQUIRE(write_file(old_dir.path() + "/geo_cells.bin", std::vector<char>(40, 'g')));
+    REQUIRE(write_file(old_dir.path() + "/geo_entries.bin", std::vector<char>(30, 'e')));
     REQUIRE(write_file(old_dir.path() + "/poi_entries.bin", std::vector<char>()));
     std::vector<char> buf;
     append_old_file_sizes(buf, old_dir.path());
@@ -832,9 +837,15 @@ TEST(patch_format_old_file_sizes_cover_the_files_no_section_names) {
     // Another day's index: same name, another size.
     ScratchDir other("old-sizes-other");
     REQUIRE(write_file(other.path() + "/geo_cells.bin", std::vector<char>(60, 'g')));
+    REQUIRE(write_file(other.path() + "/geo_entries.bin", std::vector<char>(30, 'e')));
     REQUIRE(write_file(other.path() + "/poi_entries.bin", std::vector<char>()));
     CHECK_EQ(check_in(other.path(), buf),
              std::string("Old geo_cells.bin is not the one the patch was made from (60 bytes, the patch expects 40)"));
+    REQUIRE(write_file(other.path() + "/geo_cells.bin", std::vector<char>(40, 'g')));
+    REQUIRE(write_file(other.path() + "/geo_entries.bin", std::vector<char>(31, 'e')));
+    CHECK_EQ(check_in(other.path(), buf),
+             std::string("Old geo_entries.bin is not the one the patch was made from (31 bytes, the patch expects 30)"));
+    REQUIRE(write_file(other.path() + "/geo_entries.bin", std::vector<char>(30, 'e')));
     // A file the old dir lacked must still be absent (or empty).
     REQUIRE(write_file(other.path() + "/geo_cells.bin", std::vector<char>(40, 'g')));
     REQUIRE(write_file(other.path() + "/admin_cells.bin", std::vector<char>(12, 'a')));
@@ -1411,14 +1422,14 @@ TEST(patch_format_entries_file_sections_keep_the_section_of_each_file) {
     CHECK_EQ(poi->pos, size_t(40));
     CHECK_EQ(poi->size, size_t(8));
     CHECK(sut.find(PatchFileId::ADMIN_ENTRIES) == nullptr);
-    CHECK(sut.find(PatchFileId::STREET_ENTRIES) == nullptr);
+    CHECK(sut.find(PatchFileId::STREET_LISTS) == nullptr);
 }
 
 TEST(patch_format_entries_file_sections_refuse_a_second_section_or_another_file) {
     struct Case { uint32_t fid; std::string refusal; };
     const Case cases[] = {
         {static_cast<uint32_t>(PatchFileId::POI_ENTRIES), "Malformed cell index delta: a second one for poi_entries.bin"},
-        {static_cast<uint32_t>(PatchFileId::STREET_ENTRIES), "Malformed cell index delta for file 9"},
+        {static_cast<uint32_t>(PatchFileId::STREET_LISTS), "Malformed cell index delta for file 9"},
         {999, "Malformed cell index delta for file 999"},
     };
     for (const Case& c : cases) {
@@ -3335,32 +3346,6 @@ TEST(patch_format_geo_list_delta_rejects_truncation_and_disorder) {
     append_geo_list_delta(back, 7, {1}, {2});
     size_t pos = 0;
     CHECK_EQ(refusal_of([&] { scan_geo_list_deltas(back.data(), back.size(), pos, 2); }), malformed);
-}
-
-// --- read_entry_list ---
-
-TEST(patch_format_read_entry_list_reads_the_list_at_an_offset) {
-    // An empty list at 0, then {5, 6} at 2.
-    std::vector<char> entries = {0, 0, 2, 0, 5, 0, 0, 0, 6, 0, 0, 0};
-    ByteSpan sut{entries.data(), entries.size()};
-    std::vector<uint32_t> ids = {9};
-    read_entry_list(sut, 2, ids);
-    CHECK(ids == std::vector<uint32_t>({5, 6}));
-    read_entry_list(sut, 0, ids);
-    CHECK(ids.empty());
-}
-
-TEST(patch_format_read_entry_list_reads_bad_offsets_as_empty) {
-    std::vector<char> entries = {3, 0, 5, 0, 0, 0, 6, 0, 0, 0};  // count 3, only 2 ids
-    ByteSpan sut{entries.data(), entries.size()};
-    for (uint32_t off : {0xFFFFFFFFu,    // NO_DATA
-                         0u,             // the list overruns the file
-                         9u,             // the count runs past the end
-                         0xFFFFFFFEu}) { // off + 2 wraps in 32 bits
-        std::vector<uint32_t> ids = {9};
-        read_entry_list(sut, off, ids);
-        CHECK(ids.empty());
-    }
 }
 
 TEST(patch_parallel_delta_rejects_invalid_headers) {

@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "arc_blocks.h"
+#include "geo_index.h"
 #include "in_place_edits.h"
 #include "merge_sequence.h"
 #include "patch_format.h"
@@ -206,39 +207,33 @@ void put_arc_geometry(BuildDir& d, const ArcGeometry& g) {
     d["arc_vertices.bin"] = arcs;
 }
 
-// The id of a fixture's cell k.
-uint64_t cell_id(uint32_t k) { return uint64_t(k + 1) << 27; }
+// The id of a fixture's geo cell k, at the street level.
+uint64_t cell_id(uint32_t k) { return geo_index::cell_of(k, 17); }
 // Cell k of a cell pair index, which holds cells of one level.
 uint64_t pair_cell(uint32_t k) { return cell_pairs::cell_of(k, 10); }
 
 // A geo row: its cell index and the street ids it lists.
 using GeoRow = std::pair<uint32_t, std::vector<uint32_t>>;
 
-// The geo index of rows (in cell order, no address or interp lists) over
-// `ways` street ways without nodes (a patch drops ids no way replay maps).
+// The geo index of rows (in cell order, street lists alone, each sorted)
+// over `ways` street ways without nodes (a patch drops ids no way replay
+// maps).
 void put_geo(BuildDir& d, const std::vector<GeoRow>& rows, uint32_t ways = 1000) {
-    std::vector<char> street_ways, geo, entries;
+    std::vector<char> street_ways, top, blocks;
     for (uint32_t w = 0; w < ways; w++) {
         append(street_ways, 0u);
         append(street_ways, uint16_t{0});
         append(street_ways, uint16_t{0});
         append(street_ways, w);
     }
-    for (const auto& [k, ids] : rows) {
-        append(geo, cell_id(k));
-        append(geo, ids.empty() ? NO : static_cast<uint32_t>(entries.size()));
-        append(geo, NO);
-        append(geo, NO);
-        if (ids.empty()) continue;
-        append(entries, static_cast<uint16_t>(ids.size()));
-        for (uint32_t id : ids) append(entries, id);
-    }
+    geo_index::Writer writer([&](const char* p, size_t n) { top.insert(top.end(), p, p + n); },
+                             [&](const char* p, size_t n) { blocks.insert(blocks.end(), p, p + n); });
+    for (const auto& [k, ids] : rows) writer.add(cell_id(k), {{{ids.data(), ids.size()}, {}, {}}});
+    writer.finish();
     d["street_ways.bin"] = street_ways;
     d["street_nodes.bin"] = {};
-    d["geo_cells.bin"] = geo;
-    d["street_entries.bin"] = entries;
-    d["addr_entries.bin"] = {};
-    d["interp_entries.bin"] = {};
+    d["geo_cells.bin"] = top;
+    d["geo_entries.bin"] = blocks;
 }
 
 // The cell index <prefix>_cells.bin + <prefix>_entries.bin of lists (cell
@@ -1190,21 +1185,21 @@ TEST(patch_heap_stays_flat_as_geo_entry_deltas_grow) {
         if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
         std::vector<char> corrections;
         append(corrections, GEO_ENTRY_DELTA_MARKER);
-        append(corrections, static_cast<uint32_t>(PatchFileId::STREET_ENTRIES));
+        append(corrections, static_cast<uint32_t>(PatchFileId::STREET_LISTS));
         append(corrections, n);
         return patch_holds(c, corrections, std::to_string(n) + " street entry corrections");
     }, 20000).empty());
 }
 
 // n geo cells removed and n added (the old cells are the even ones, the new
-// cells the odd ones, none with a list): cell changes of n and n cells, which
-// the patcher reads where they sit in the patch.
+// cells the odd ones, each listing a street): cell changes of n and n cells,
+// which the patcher reads where they sit in the patch.
 TEST(patch_heap_stays_flat_as_geo_cells_change) {
     CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
         std::vector<GeoRow> old_rows, new_rows;
         for (uint32_t k = 0; k < n; k++) {
-            old_rows.push_back({2 * k, {}});
-            new_rows.push_back({2 * k + 1, {}});
+            old_rows.push_back({2 * k, {k % 950}});
+            new_rows.push_back({2 * k + 1, {k % 950}});
         }
         BuildDir old_d, new_d;
         put_geo(old_d, old_rows);
@@ -2295,7 +2290,7 @@ TEST(patch_refuses_cell_changes_out_of_order_and_a_second_or_foreign_delta) {
         REQUIRE(at != std::string::npos);
         return at;
     };
-    const uint32_t street = static_cast<uint32_t>(PatchFileId::STREET_ENTRIES), poi = static_cast<uint32_t>(PatchFileId::POI_ENTRIES);
+    const uint32_t street = static_cast<uint32_t>(PatchFileId::STREET_LISTS), poi = static_cast<uint32_t>(PatchFileId::POI_ENTRIES);
     // Where each list's ids start (after marker, n_added, n_removed), and
     // where the street entries' geo entry delta and the POI cell index delta
     // start.
@@ -2330,7 +2325,7 @@ TEST(patch_refuses_cell_changes_out_of_order_and_a_second_or_foreign_delta) {
         {"poi-removed-last", swap_ids(poi_removed, 8), "Malformed cell changes"},
         // Each before the real section: an empty one (no cells; a u64 size of 0), or its copy.
         {"second-geo-delta", insert_at(street_delta, head({GEO_ENTRY_DELTA_MARKER, street, 0})),
-         "Malformed geo entry delta: a second one for street_entries.bin"},
+         "Malformed geo entry delta: a second one for geo street lists"},
         {"foreign-geo-delta", insert_at(street_delta, head({GEO_ENTRY_DELTA_MARKER, poi, 0})), "Malformed geo entry delta for file 17"},
         {"second-cell-index-delta", insert_at(poi_delta, poi_delta_section), "Malformed cell index delta: a second one for poi_entries.bin"},
         {"foreign-cell-index-delta", insert_at(poi_delta, head({CELL_INDEX_DELTA_MARKER, 999, 0, 0})), "Malformed cell index delta for file 999"},
@@ -2577,7 +2572,8 @@ TEST(patch_refuses_secondary_pairs_for_a_file_without_a_record_remap) {
     const Case cases[] = {
         {"admin", with_lists(1, {admin, 1, 0, 1}), "Malformed secondary remap: pairs for admin_polygons.bin, which has none"},
         {"place", with_lists(1, {place, 1, 0, 1}), "Malformed secondary remap: pairs for place_nodes.bin, which has none"},
-        {"past-every-file", with_lists(1, {past, 1, 0, 1}), "Malformed secondary remap: pairs for file 35, which has none"},
+        {"past-every-file", with_lists(1, {past, 1, 0, 1}),
+         "Malformed secondary remap: pairs for file " + std::to_string(past) + ", which has none"},
     };
     for (const Case& e : cases) {
         const std::string patch = c.dir(e.name + ".gcpatch");

@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "cell_pairs.h"
+#include "geo_index.h"
 #include "parallel.h"
 #include "types.h"
 
@@ -139,24 +140,62 @@ inline void write_cell_index_sorted(
         });
 }
 
-// The cell-grouped tables a mode's geo index draws on, in geo_cells.bin
-// column order: streets, addrs, interps. A null table has no entries file and
-// leaves its column NO_DATA.
-constexpr size_t GEO_TABLE_COUNT = 3;
-constexpr const char* GEO_ENTRY_FILENAMES[GEO_TABLE_COUNT] = {
-    "street_entries.bin", "addr_entries.bin", "interp_entries.bin"};
+// The cell-grouped tables a mode's geo index draws on, in its table order
+// (geo_index.h): streets, addrs, interps, each in canonical order (by cell,
+// then item, as cell_item_less). A null table has no lists.
+constexpr size_t GEO_TABLE_COUNT = geo_index::TABLES;
+constexpr const char* GEO_CELLS_FILE = "geo_cells.bin";
+constexpr const char* GEO_ENTRIES_FILE = "geo_entries.bin";
+constexpr const char* GEO_TABLE_NAMES[GEO_TABLE_COUNT] = {"street", "address", "interpolation"};
 using GeoTables = std::array<const std::vector<CellItemPair>*, GEO_TABLE_COUNT>;
 
-// Writes a mode's geo index into dir: geo_cells.bin has one row per cell any
-// table has items in, ascending: the cell id, then per table the byte offset
-// of the cell's entry (uint16 count, then its items in table order) in that
-// table's entries file, or NO_DATA. Every core builds slices of cells (none
-// holds more than pairs_per_slice pairs of a table) that are appended in
-// order, so only a few slices are held at once. Returns the row count.
+// The rows of a geo index's tables in cell order, from given positions in
+// them: each cell some table has items at, with every table's items there.
+class GeoRowCursor {
+public:
+    GeoRowCursor(const GeoTables& tables, const std::array<size_t, GEO_TABLE_COUNT>& at) : tables_(tables), next_(at) {}
+
+    // The next row's cell and lists (an empty one is none), false past the
+    // tables' ends.
+    bool row(uint64_t& cell, geo_index::RowLists& lists) {
+        bool any = false;
+        for (size_t t = 0; t < GEO_TABLE_COUNT; t++)
+            if (tables_[t] && next_[t] < tables_[t]->size() && (!any || (*tables_[t])[next_[t]].cell_id < cell)) {
+                cell = (*tables_[t])[next_[t]].cell_id;
+                any = true;
+            }
+        if (!any) return false;
+        for (size_t t = 0; t < GEO_TABLE_COUNT; t++) {
+            lists[t].clear();
+            if (!tables_[t]) continue;
+            const auto& table = *tables_[t];
+            for (size_t& i = next_[t]; i < table.size() && table[i].cell_id == cell; i++) lists[t].push_back(table[i].item_id);
+        }
+        return true;
+    }
+
+private:
+    const GeoTables& tables_;
+    std::array<size_t, GEO_TABLE_COUNT> next_;
+};
+
+// Writes a mode's geo index into dir (geo_index.h): its rows are the cells
+// any table has items in. The tables split into slices of cells (none holds
+// more than pairs_per_slice pairs of a table); every core counts a slice's
+// rows, then encodes the blocks that start in it (reading on into the next
+// slices for their rows), and the blocks are written in order, so only a few
+// slices' blocks are held at once. The bytes are a geo_index::Writer's for
+// the same rows. Returns the row count.
 inline size_t write_geo_index(const std::string& dir, const GeoTables& tables,
                               size_t pairs_per_slice = size_t(1) << 17) {
-    constexpr size_t kRowBytes = sizeof(uint64_t) + GEO_TABLE_COUNT * sizeof(uint32_t);
-    auto path_of = [&](size_t t) { return dir + "/" + GEO_ENTRY_FILENAMES[t]; };
+    using geo_index::BLOCK_ROWS;
+    const std::string top_path = dir + "/" + GEO_CELLS_FILE, blocks_path = dir + "/" + GEO_ENTRIES_FILE;
+    for (size_t t = 0; t < GEO_TABLE_COUNT; t++) {
+        const auto* table = tables[t];
+        if (table && parallel_any(table->empty() ? 0 : table->size() - 1,
+                                  [&](size_t i) { return cell_item_less((*table)[i + 1], (*table)[i]); }))
+            throw std::logic_error(std::string("write_geo_index: the ") + GEO_TABLE_NAMES[t] + " table is out of order");
+    }
 
     // Slices start at every pairs_per_slice-th cell of each table.
     std::vector<uint64_t> starts;
@@ -168,129 +207,94 @@ inline size_t write_geo_index(const std::string& dir, const GeoTables& tables,
     starts.erase(std::unique(starts.begin(), starts.end()), starts.end());
     const size_t slices = starts.size() + 1;
 
-    // Per table and slice: where its pairs begin, its cells, its longest
-    // cell and the byte offset its entries start at.
-    struct Layout {
-        std::vector<size_t> at, cells, longest;
-        std::vector<uint64_t> base;
-    };
-    std::array<Layout, GEO_TABLE_COUNT> layout;
+    // Per slice: where each table's pairs begin, its rows, and per table its
+    // longest cell.
+    std::vector<std::array<size_t, GEO_TABLE_COUNT>> at(slices + 1);
     for (size_t t = 0; t < GEO_TABLE_COUNT; t++) {
-        if (!tables[t]) continue;
-        const auto& table = *tables[t];
-        auto& l = layout[t];
-        l.at.resize(slices + 1);
-        l.at[0] = 0;
-        l.at[slices] = table.size();
+        const size_t size = tables[t] ? tables[t]->size() : 0;
+        at[0][t] = 0;
+        at[slices][t] = size;
         for (size_t k = 1; k < slices; k++)
-            l.at[k] = static_cast<size_t>(std::lower_bound(table.begin(), table.end(), starts[k - 1],
-                [](const CellItemPair& p, uint64_t cell) { return p.cell_id < cell; }) - table.begin());
-        l.cells.assign(slices, 0);
-        l.longest.assign(slices, 0);
+            at[k][t] = !tables[t] ? 0 : static_cast<size_t>(std::lower_bound(tables[t]->begin(), tables[t]->end(), starts[k - 1],
+                [](const CellItemPair& p, uint64_t cell) { return p.cell_id < cell; }) - tables[t]->begin());
     }
+    std::vector<uint64_t> slice_rows(slices, 0);
+    std::vector<std::array<size_t, GEO_TABLE_COUNT>> longest(slices);
     parallel_for(slices, [&](size_t b, size_t e, unsigned) {
-        for (size_t k = b; k < e; k++)
-            for (size_t t = 0; t < GEO_TABLE_COUNT; t++) {
-                if (!tables[t]) continue;
-                const auto& table = *tables[t];
-                auto& l = layout[t];
-                for (size_t i = l.at[k], end = l.at[k + 1]; i < end;) {
-                    size_t run = i + 1;
-                    while (run < end && table[run].cell_id == table[i].cell_id) run++;
-                    l.cells[k]++;
-                    l.longest[k] = std::max(l.longest[k], run - i);
-                    i = run;
+        for (size_t k = b; k < e; k++) {
+            longest[k] = {};
+            std::array<size_t, GEO_TABLE_COUNT> next = at[k];
+            for (;;) {
+                bool any = false;
+                uint64_t cell = 0;
+                for (size_t t = 0; t < GEO_TABLE_COUNT; t++)
+                    if (next[t] < at[k + 1][t] && (!any || (*tables[t])[next[t]].cell_id < cell)) {
+                        cell = (*tables[t])[next[t]].cell_id;
+                        any = true;
+                    }
+                if (!any) break;
+                for (size_t t = 0; t < GEO_TABLE_COUNT; t++) {
+                    const size_t from = next[t];
+                    while (next[t] < at[k + 1][t] && (*tables[t])[next[t]].cell_id == cell) next[t]++;
+                    longest[k][t] = std::max(longest[k][t], next[t] - from);
                 }
+                slice_rows[k]++;
             }
+        }
     });
-    auto slice_bytes = [&](size_t t, size_t k) {
-        const auto& l = layout[t];
-        return l.cells[k] * sizeof(uint16_t) + (l.at[k + 1] - l.at[k]) * sizeof(uint32_t);
-    };
     for (size_t t = 0; t < GEO_TABLE_COUNT; t++) {
         if (!tables[t]) continue;
-        auto& l = layout[t];
-        l.base.resize(slices);
-        uint64_t bytes = 0;
-        for (size_t k = 0; k < slices; k++) {
-            l.base[k] = bytes;
-            bytes += slice_bytes(t, k);
-        }
-        size_t longest = *std::max_element(l.longest.begin(), l.longest.end());
-        checked_entry_count(longest, path_of(t));
-        std::cerr << "  " << path_of(t) << ": max entries/cell = " << longest << std::endl;
+        size_t most = 0;
+        for (const auto& l : longest) most = std::max(most, l[t]);
+        const std::string what = blocks_path + " (" + GEO_TABLE_NAMES[t] + " lists)";
+        checked_entry_count(most, what);
+        std::cerr << "  " << what << ": max entries/cell = " << most << std::endl;
     }
+    // first_row[k]: the index of slice k's first row.
+    std::vector<uint64_t> first_row(slices + 1, 0);
+    for (size_t k = 0; k < slices; k++) first_row[k + 1] = first_row[k] + slice_rows[k];
+    const uint64_t rows = first_row[slices];
 
-    struct Slice {
-        std::unique_ptr<char[]> rows;
-        size_t row_count = 0;
-        std::array<std::unique_ptr<char[]>, GEO_TABLE_COUNT> entries;
-    };
-    auto build = [&](size_t k) {
-        Slice out;
-        std::array<size_t, GEO_TABLE_COUNT> next{}, end{};
-        std::array<char*, GEO_TABLE_COUNT> put{};
-        size_t max_rows = 0;
-        for (size_t t = 0; t < GEO_TABLE_COUNT; t++) {
-            if (!tables[t]) continue;
-            next[t] = layout[t].at[k];
-            end[t] = layout[t].at[k + 1];
-            out.entries[t].reset(new char[slice_bytes(t, k)]);
-            put[t] = out.entries[t].get();
-            max_rows += layout[t].cells[k];
-        }
-        out.rows.reset(new char[max_rows * kRowBytes]);
-        char* row = out.rows.get();
-        for (;;) {
-            bool any = false;
-            uint64_t cell = 0;
-            for (size_t t = 0; t < GEO_TABLE_COUNT; t++)
-                if (next[t] < end[t] && (!any || (*tables[t])[next[t]].cell_id < cell)) {
-                    cell = (*tables[t])[next[t]].cell_id;
-                    any = true;
-                }
-            if (!any) break;
-
-            uint32_t offsets[GEO_TABLE_COUNT] = {NO_DATA, NO_DATA, NO_DATA};
-            for (size_t t = 0; t < GEO_TABLE_COUNT; t++) {
-                if (next[t] >= end[t] || (*tables[t])[next[t]].cell_id != cell) continue;
-                const auto& table = *tables[t];
-                offsets[t] = static_cast<uint32_t>(layout[t].base[k] + (put[t] - out.entries[t].get()));
-                size_t run = next[t];
-                while (run < end[t] && table[run].cell_id == cell) run++;
-                uint16_t count = static_cast<uint16_t>(run - next[t]);
-                std::memcpy(put[t], &count, sizeof(count));
-                put[t] += sizeof(count);
-                for (; next[t] < run; next[t]++, put[t] += sizeof(uint32_t))
-                    std::memcpy(put[t], &table[next[t]].item_id, sizeof(uint32_t));
+    // Slice k encodes the blocks whose first row is one of its own.
+    auto encode = [&](size_t k) {
+        std::vector<geo_index::EncodedBlock> out;
+        const uint64_t first_block = (first_row[k] + BLOCK_ROWS - 1) / BLOCK_ROWS;
+        const uint64_t end_block = (first_row[k + 1] + BLOCK_ROWS - 1) / BLOCK_ROWS;
+        if (first_block >= end_block) return out;
+        GeoRowCursor rows_at(tables, at[k]);
+        geo_index::RowLists lists;
+        uint64_t cell = 0;
+        for (uint64_t skip = first_block * BLOCK_ROWS - first_row[k]; skip > 0; skip--) rows_at.row(cell, lists);
+        geo_index::BlockEncoder encoder;
+        int level = -1;
+        for (uint64_t b = first_block; b < end_block; b++) {
+            geo_index::EncodedBlock& block = out.emplace_back();
+            encoder.start();
+            const uint64_t n = std::min<uint64_t>(BLOCK_ROWS, rows - b * BLOCK_ROWS);
+            for (uint64_t r = 0; r < n; r++) {
+                if (!rows_at.row(cell, lists)) throw std::logic_error("write_geo_index: rows past the tables");
+                if (level < 0) level = geo_index::level_of(cell);
+                if (geo_index::level_of(cell) != level) throw std::runtime_error("write_geo_index: cells of two levels");
+                if (r == 0) block.first_cell = cell;
+                encoder.row(block.bytes, geo_index::number_of(cell, level), geo_index::ids_of(lists));
             }
-            std::memcpy(row, &cell, sizeof(cell));
-            std::memcpy(row + sizeof(cell), offsets, sizeof(offsets));
-            row += kRowBytes;
-            out.row_count++;
+            block.last_cell = cell;
+            block.rows = static_cast<size_t>(n);
         }
         return out;
     };
 
-    std::array<std::ofstream, GEO_TABLE_COUNT> entry_files;
-    for (size_t t = 0; t < GEO_TABLE_COUNT; t++)
-        if (tables[t]) entry_files[t].open(path_of(t), std::ios::binary);
-    const std::string geo_path = dir + "/geo_cells.bin";
-    std::ofstream geo(geo_path, std::ios::binary);
-    size_t rows = 0;
-    parallel_ordered(slices, build, [&](size_t k, Slice slice) {
-        for (size_t t = 0; t < GEO_TABLE_COUNT; t++)
-            if (tables[t])
-                entry_files[t].write(slice.entries[t].get(), static_cast<std::streamsize>(slice_bytes(t, k)));
-        geo.write(slice.rows.get(), static_cast<std::streamsize>(slice.row_count * kRowBytes));
-        rows += slice.row_count;
+    std::ofstream top(top_path, std::ios::binary), blocks(blocks_path, std::ios::binary);
+    geo_index::Writer writer([&](const char* p, size_t n) { top.write(p, static_cast<std::streamsize>(n)); },
+                             [&](const char* p, size_t n) { blocks.write(p, static_cast<std::streamsize>(n)); });
+    parallel_ordered(slices, encode, [&](size_t, std::vector<geo_index::EncodedBlock> encoded) {
+        for (const auto& block : encoded) writer.add_block(block);
     }, 0, parallel_threads());
-    for (size_t t = 0; t < GEO_TABLE_COUNT; t++) {
-        if (!tables[t]) continue;
-        entry_files[t].flush();
-        if (!entry_files[t]) throw std::runtime_error("failed to write " + path_of(t));
-    }
-    geo.flush();
-    if (!geo) throw std::runtime_error("failed to write " + geo_path);
-    return rows;
+    writer.finish();
+    if (writer.rows() != rows) throw std::logic_error("write_geo_index: rows lost between the slices");
+    top.flush();
+    blocks.flush();
+    if (!top) throw std::runtime_error("failed to write " + top_path);
+    if (!blocks) throw std::runtime_error("failed to write " + blocks_path);
+    return static_cast<size_t>(rows);
 }

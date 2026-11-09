@@ -219,7 +219,11 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // id, then the runs of consecutive cells of the new index that lose or gain an
 // id, in varints (append_cell_list_delta). A polygon whose boundary moved costs
 // a run, not its id in every cell, and the patcher holds only the ids of the
-// runs over its cell, at most 0xFFFF each way.
+// runs over its cell, at most 0xFFFF each way. The geo index's GXT2 layout
+// (build 19, geo_index.h) keeps v15's sections: file id 35 names its blocks
+// file, geo_entries.bin, beside its top file geo_cells.bin (8), and ids 9 to
+// 11 name its street, address and interpolation lists, which the geo entry
+// deltas correct, not files of their own.
 static constexpr uint32_t GCPATCH_VERSION = 15;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
@@ -234,10 +238,11 @@ enum class PatchFileId : uint32_t {
     INTERP_NODES = 5,
     ADMIN_POLYGONS = 6,
     ADMIN_RINGS = 7,
+    // The geo index: its top file, and (no files) its lists by table.
     GEO_CELLS = 8,
-    STREET_ENTRIES = 9,
-    ADDR_ENTRIES = 10,
-    INTERP_ENTRIES = 11,
+    STREET_LISTS = 9,
+    ADDR_LISTS = 10,
+    INTERP_LISTS = 11,
     ADMIN_CELLS = 12,
     ADMIN_ENTRIES = 13,
     POI_RECORDS = 14,
@@ -272,13 +277,15 @@ enum class PatchFileId : uint32_t {
     // Per-segment TIGER ZIP sidecar (u32 string offset per interp way,
     // NO_DATA for OSM interpolations; absent on builds without TIGER).
     INTERP_POSTCODES = 34,
-    COUNT = 35
+    // The geo index's blocks, beside its top file (GEO_CELLS).
+    GEO_ENTRIES = 35,
+    COUNT = 36
 };
 
 static const char* patch_file_names[] = {
     "strings.bin", "street_ways.bin", "street_nodes.bin", "addr_points.bin",
     "interp_ways.bin", "interp_nodes.bin", "admin_polygons.bin", "admin_rings.bin",
-    "geo_cells.bin", "street_entries.bin", "addr_entries.bin", "interp_entries.bin",
+    "geo_cells.bin", "geo street lists", "geo address lists", "geo interpolation lists",
     "admin_cells.bin", "admin_entries.bin",
     "poi_records.bin", "poi_vertices.bin", "poi_cells.bin", "poi_entries.bin",
     "place_nodes.bin",
@@ -288,7 +295,8 @@ static const char* patch_file_names[] = {
     "addr_vertices.bin",
     "strings_core.bin", "strings_street.bin", "strings_addr.bin",
     "strings_postcode.bin", "strings_poi.bin",
-    "interp_postcodes.bin"
+    "interp_postcodes.bin",
+    "geo_entries.bin"
 };
 
 // The string offset fields of a record file the patch merges, as byte
@@ -405,12 +413,13 @@ static constexpr uint32_t CELL_INDEX_DELTA_MARKER = 0xFFFFFFF7;
 static constexpr uint32_t GEO_ENTRY_DELTA_MARKER = 0xFFFFFFF0;
 static constexpr uint16_t GEO_LIST_REPLACE = 0xFFFF;
 
-// The entries files the geo walk derives and corrects, and those of the
-// cell indexes rebuilt from an id remap.
+// The geo index's lists the geo walk derives and corrects (in its table
+// order, geo_index.h), and the entries files of the cell indexes rebuilt
+// from an id remap.
 template <size_t N>
 using EntriesFiles = std::array<PatchFileId, N>;
-static constexpr EntriesFiles<3> GEO_ENTRIES_FILES = {PatchFileId::STREET_ENTRIES, PatchFileId::ADDR_ENTRIES,
-                                                      PatchFileId::INTERP_ENTRIES};
+static constexpr EntriesFiles<3> GEO_ENTRIES_FILES = {PatchFileId::STREET_LISTS, PatchFileId::ADDR_LISTS,
+                                                      PatchFileId::INTERP_LISTS};
 static constexpr EntriesFiles<2> CELL_INDEX_ENTRIES_FILES = {PatchFileId::ADMIN_ENTRIES, PatchFileId::POI_ENTRIES};
 
 // Secondary ID remap marker: 0xFFFFFFF6
@@ -853,7 +862,7 @@ inline std::vector<ClientFile> parse_client_files(const char* data, size_t size,
 //   n(4), n × {file_id(4), old_size(8)}
 // and the patcher checks them before it reads anything else.
 static constexpr PatchFileId UNSECTIONED_OLD_FILES[] = {
-    PatchFileId::GEO_CELLS, PatchFileId::STREET_ENTRIES, PatchFileId::ADDR_ENTRIES, PatchFileId::INTERP_ENTRIES,
+    PatchFileId::GEO_CELLS, PatchFileId::GEO_ENTRIES,
     PatchFileId::ADMIN_CELLS, PatchFileId::ADMIN_ENTRIES, PatchFileId::POI_CELLS, PatchFileId::POI_ENTRIES,
     PatchFileId::POSTCODE_CENTROID_ENTRIES,
 };
@@ -1742,21 +1751,6 @@ CellIndexWritten stream_cell_list_delta(Cells&& cells, Entries&& entries, cell_p
 
 // --- Geo entry list deltas (GEO_ENTRY_DELTA_MARKER) ---
 
-// Reads the (u16 count, u32 ids) list at `off` of a street / addr / interp
-// entries file (size() / at(off, n), like the cell index streams) into `ids`.
-// NO_DATA, or a list running past the end of the file, reads as empty; the
-// bounds are checked in 64 bits, so an offset near 4 GiB can't wrap.
-template <typename Entries>
-void read_entry_list(Entries& entries, uint32_t off, std::vector<uint32_t>& ids) {
-    ids.clear();
-    if (off == 0xFFFFFFFFu || (uint64_t)off + 2 > entries.size()) return;
-    uint16_t n;
-    memcpy(&n, entries.at(off, 2), 2);
-    if ((uint64_t)off + 2 + (uint64_t)n * 4 > entries.size()) return;
-    ids.resize(n);
-    if (n) memcpy(ids.data(), entries.at((uint64_t)off + 2, (size_t)n * 4), (size_t)n * 4);
-}
-
 // Appends one cell's correction: the ids `derived` (sorted) lost and the
 // ids it gained to become `target`, or `target` whole when it isn't sorted or
 // the delta wouldn't fit in u16 counts. A delta even where the whole list is
@@ -1816,7 +1810,7 @@ public:
     // The correction replaces the derived list whole (GEO_LIST_REPLACE).
     bool replaces() const { return replace_; }
     // Out of line: few cells carry a correction, and the entry walk that asks for it runs for every cell of
-    // geo_cells.bin, so its loop stays as small as without one.
+    // the geo index, so its loop stays as small as without one.
     [[gnu::noinline]] void apply(std::vector<uint32_t>& ids, std::vector<uint32_t>& scratch) {
         gained_ids_.resize(ng_);
         if (ng_) memcpy(gained_ids_.data(), data_ + gained_, (size_t)ng_ * 4);

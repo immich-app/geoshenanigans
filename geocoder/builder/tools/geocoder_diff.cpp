@@ -3,7 +3,7 @@
 // For each data file: walk old (string-remapped) and new in parallel,
 // match records by content, emit MATCH/INSERT/DELETE operations.
 // For entry/cell files: include changed cell entry data directly.
-// geo_cells rebuilt by patch tool from entries (not delta-patched).
+// The geo index rebuilt by the patch tool from its old lists (not delta-patched).
 //
 // Patch format: custom binary, zstd-compressed as a whole for transport.
 //
@@ -1470,15 +1470,6 @@ static int run(int argc, char* argv[]) {
     std::vector<uint64_t> g_added, g_removed, a_added, a_removed, p_added, p_removed;
     std::thread t_cells([&]() {
         double gs = now_ms();
-        auto diff_cells = [](const std::string& old_path, const std::string& new_path,
-                             size_t stride, std::vector<uint64_t>& added, std::vector<uint64_t>& removed) {
-            auto old_m = mmap_file(old_path);
-            auto new_m = mmap_file(new_path);
-            auto d = diff_cell_ids(old_m.data, old_m.size / stride, new_m.data, new_m.size / stride, stride);
-            added = std::move(d.added);
-            removed = std::move(d.removed);
-            unmap_file(old_m); unmap_file(new_m);
-        };
         // A cell pair index's cells, decoded: absent files are an index of none.
         auto diff_pair_cells = [&](const std::string& prefix, std::vector<uint64_t>& added,
                                    std::vector<uint64_t>& removed) {
@@ -1497,7 +1488,12 @@ static int run(int argc, char* argv[]) {
             added = std::move(d.added);
             removed = std::move(d.removed);
         };
-        diff_cells(old_dir + "/geo_cells.bin", new_dir + "/geo_cells.bin", 20, g_added, g_removed);
+        {
+            const GeoIndexMap old_geo(old_dir), new_geo(new_dir);
+            CellIdDiff d = diff_geo_cells(old_geo.view, new_geo.view);
+            g_added = std::move(d.added);
+            g_removed = std::move(d.removed);
+        }
         diff_pair_cells("admin", a_added, a_removed);
         diff_pair_cells("poi", p_added, p_removed);
         log_time("  group:cell_changes", gs);
@@ -1686,8 +1682,6 @@ static int run(int argc, char* argv[]) {
     }
     log_time("POI remap", t0);
 
-    // old_geo no longer needed as a vector — streaming corrections use mmap directly
-
     // Emit cell changes
     SEC("cell_changes");
     { uint32_t marker = CELL_CHANGES_GEO_MARKER, na = g_added.size(), nr = g_removed.size();
@@ -1724,9 +1718,9 @@ static int run(int argc, char* argv[]) {
     }
 
     // --- Streaming entry corrections ---
-    // Instead of materializing all 15M cells' entries in memory, merge-walk old
-    // and new geo_cells in parallel. For each old cell, remap its entry IDs
-    // on the fly and compare with new entries. This uses O(1) memory per cell.
+    // Both days' geo indexes walked block by block, split across cores: for
+    // each old cell, its lists' ids remapped on the fly and compared with the
+    // new lists.
     double t1 = now_ms();
 
     // Free merge sequences (already serialized to patch)
@@ -1734,47 +1728,28 @@ static int run(int argc, char* argv[]) {
       std::vector<char>().swap(res_poi_r.seq.data); std::vector<char>().swap(res_poi_v.seq.data);
       std::vector<char>().swap(res_place_n.seq.data); }
 
-    // mmap all geo/entry files (old + new)
-    auto old_geo_m = mmap_file(old_dir + "/geo_cells.bin");
-    auto old_se_m = mmap_file(old_dir + "/street_entries.bin");
-    auto old_ae_m = mmap_file(old_dir + "/addr_entries.bin");
-    auto old_ie_m = mmap_file(old_dir + "/interp_entries.bin");
-    auto new_geo_m = mmap_file(new_dir + "/geo_cells.bin");
-    auto new_se_m = mmap_file(new_dir + "/street_entries.bin");
-    auto new_ae_m = mmap_file(new_dir + "/addr_entries.bin");
-    auto new_ie_m = mmap_file(new_dir + "/interp_entries.bin");
-
-    size_t old_nc = old_geo_m.size / 20;
-    size_t new_nc = new_geo_m.size / 20;
-    std::cerr << "  Streaming entry corrections: " << old_nc << " old cells, " << new_nc
-              << " new cells, +" << g_added.size() << " -" << g_removed.size() << std::endl;
-    std::cerr << "  RSS before corrections: " << get_rss_mb() << " MiB" << std::endl;
-
-    // For each entry type, compute derived entries on the fly and compare with new.
-    auto streaming_corrections = [&](PatchFileId fid, const std::string& fname,
-                                      const MappedFile& old_entries, size_t geo_off_pos,
-                                      const MappedFile& new_entries,
-                                      const std::vector<uint32_t>& id_rm) {
-        SEC("geodelta:" << fname);
+    {
+        const GeoIndexMap old_geo(old_dir), new_geo(new_dir);
+        std::cerr << "  Streaming entry corrections: " << old_geo.view.rows() << " old cells, " << new_geo.view.rows()
+                  << " new cells, +" << g_added.size() << " -" << g_removed.size() << std::endl;
+        std::cerr << "  RSS before corrections: " << get_rss_mb() << " MiB" << std::endl;
+        SEC("geodelta");
         // v8: an old id the remap doesn't map is a deleted record and drops
         // out (the patcher does the same when it replayed the file). A file
         // sent unchanged has no remap and keeps every id, as its copy does.
-        auto c = geo_entry_corrections(static_cast<uint32_t>(fid), {old_geo_m.data, old_nc}, {new_geo_m.data, new_nc},
-                                       g_added, g_removed, {old_entries.data, old_entries.size},
-                                       {new_entries.data, new_entries.size}, geo_off_pos, id_rm, 0,
-                                       /*drop_unmapped*/ !id_rm.empty());
-        std::cerr << "  " << fname << ": " << c.cells << " cell corrections (" << c.section.size() - 12 << " bytes)" << std::endl;
-        patch.insert(patch.end(), c.section.begin(), c.section.end());
-    };
-    streaming_corrections(PatchFileId::STREET_ENTRIES, "street_entries.bin", old_se_m, 8, new_se_m, w_rm_v);
-    streaming_corrections(PatchFileId::ADDR_ENTRIES, "addr_entries.bin", old_ae_m, 12, new_ae_m, a_rm_v);
-    streaming_corrections(PatchFileId::INTERP_ENTRIES, "interp_entries.bin", old_ie_m, 16, new_ie_m, i_rm_v);
+        const GeoEntryCorrections c = geo_entry_corrections(old_geo.view, new_geo.view, g_added, g_removed,
+                                                            {&w_rm_v, &a_rm_v, &i_rm_v},
+                                                            {!w_rm_v.empty(), !a_rm_v.empty(), !i_rm_v.empty()});
+        for (size_t t = 0; t < geo_index::TABLES; t++) {
+            std::cerr << "  " << patch_file_names[static_cast<uint32_t>(GEO_ENTRIES_FILES[t])] << ": " << c.cells[t]
+                      << " cell corrections (" << c.sections[t].size() - 12 << " bytes)" << std::endl;
+            patch.insert(patch.end(), c.sections[t].begin(), c.sections[t].end());
+        }
+    }
 
-    // Free remaps and entry mmaps
+    // Free remaps
     { std::vector<uint32_t>().swap(w_rm_v); std::vector<uint32_t>().swap(a_rm_v);
       std::vector<uint32_t>().swap(i_rm_v); }
-    unmap_file(old_se_m); unmap_file(old_ae_m); unmap_file(old_ie_m);
-    unmap_file(new_se_m); unmap_file(new_ae_m); unmap_file(new_ie_m);
     malloc_trim(0);
     log_time("Streaming entry corrections", t1);
     log_rss("geo corrections");
@@ -1817,7 +1792,6 @@ static int run(int argc, char* argv[]) {
     // appears or empties already carries an entry correction, which decides
     // the patcher's output on its own (planet: 0.09 MiB/day and a hash map
     // of every old geo cell).
-    unmap_file(old_geo_m); unmap_file(new_geo_m);
 
     // --- Full-replacement sections ---
     // The fallback for a file the sections below can't delta (no old
