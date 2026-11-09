@@ -622,7 +622,7 @@ layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
 | 6 | `admin_polygons.bin` | merge by slot at stride 24, string field `name_id`, offset field `ring_offset` (v14) |
 | 7 | `admin_rings.bin` | child stream of admin_polygons, at stride 1 (v14; v13: `admin_vertices.bin`) |
 | 8 | `geo_cells.bin` | geo cell changes (0xFFFFFFFB), rebuilt with `geo_entries.bin` (35) beside the geo entry deltas |
-| 9-11 | the geo index's street, address and interpolation lists (no files of their own since GXT2) | geo entry deltas (0xFFFFFFF0) |
+| 9-11 | the geo index's street, address and interpolation lists (no files of their own since GXT2: a file section naming one is refused) | geo entry deltas (0xFFFFFFF0) |
 | 12, 13 | `admin_cells.bin`, `admin_entries.bin` | admin cell changes (0xFFFFFFFA) and a cell index delta (0xFFFFFFF7), over the old index's ids as they are (v14) |
 | 14 | `poi_records.bin` | merge at stride 36, string fields `name_id`, `parent_street_id` and `parent_postcode_id` |
 | 15 | `poi_vertices.bin` | child stream of poi_records, at stride 1 |

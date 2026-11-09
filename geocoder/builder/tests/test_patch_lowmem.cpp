@@ -2249,6 +2249,52 @@ TEST(patch_refuses_the_old_place_cell_changes_marker_as_an_unknown_file) {
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
+// Ids 9 to 11 name the geo index's lists by table since build 19, not files:
+// a file section for one (a full replacement) is refused as a file the
+// patcher doesn't know, in every mode. Build 19's first patcher took it, its
+// bytes written to the scratch dir as a file the new dir doesn't list. The
+// patch as made applies.
+TEST(patch_refuses_a_file_section_for_a_geo_list) {
+    ScratchDir dir("patch-geo-list-section");
+    std::mt19937 rng(20261109);
+    CellLists old_cells, new_cells;
+    for (uint32_t k = 0; k < 30; k++) old_cells[pair_cell(k)] = {k % 7};
+    for (uint32_t k = 0; k < 20; k++) new_cells[pair_cell(k)] = {k % 7 + 1};
+    for (uint32_t k = 40; k < 50; k++) new_cells[pair_cell(k)] = {2};
+    const auto pois = pois_of(rng, 40, 0, true);
+    BuildDir old_d, new_d;
+    put_pois(old_d, pois);
+    put_pois(new_d, pois);
+    put_cells(old_d, "poi", old_cells);
+    put_cells(new_d, "poi", new_cells);
+    const LowMemCase c{dir.path(), "geo-list-section"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    std::vector<char> poi_changes;
+    for (const uint32_t w : {CELL_CHANGES_POI_MARKER, 10u, 10u}) append(poi_changes, w);
+    const size_t at = find_once(raw, poi_changes);
+    REQUIRE(at != std::string::npos);
+    for (const PatchFileId fid : GEO_ENTRIES_FILES) {
+        const uint32_t id = static_cast<uint32_t>(fid);
+        // file id, stride 0 (a full replacement), old size 0, new size 4, no files, 4 bytes of data.
+        std::vector<char> section, edited(raw);
+        append(section, id);
+        append(section, uint32_t(0));
+        append(section, uint64_t(0));
+        append(section, uint64_t(4));
+        append(section, uint32_t(0));
+        append(section, uint64_t(4));
+        append(section, uint32_t(0x01020304));
+        edited.insert(edited.begin() + static_cast<std::ptrdiff_t>(at), section.begin(), section.end());
+        const std::string name = "geo-list-" + std::to_string(id), patch = c.dir(name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ALL_MODES, patch, name, "Unknown file " + std::to_string(id)).empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
 // Cell changes out of order (two ids of one list swapped: the geo index's
 // added or removed cells, the POI index's), and a geo entry delta or a cell
 // index delta for a file that has one already or for a file not of its kind,

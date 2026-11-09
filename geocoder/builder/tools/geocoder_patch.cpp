@@ -649,8 +649,8 @@ static int run(int argc, char* argv[]) {
         auto section_io = [&] { return " [" + io_delta(section_start, get_io_counters()) + "]"; };
         uint32_t stride = patch.u32();
         uint64_t old_size = patch.u64(), new_size = patch.u64();
-        // No patch sends the legacy strings.bin (file 0).
-        if (file_id >= (uint32_t)PatchFileId::COUNT || file_id == (uint32_t)PatchFileId::STRINGS) {
+        // No patch sends the legacy strings.bin (file 0), nor a file for the geo index's lists (they name none).
+        if (file_id >= (uint32_t)PatchFileId::COUNT || file_id == (uint32_t)PatchFileId::STRINGS || is_geo_list_id(file_id)) {
             std::cerr << "Unknown file " << file_id << std::endl;
             return 1;
         }

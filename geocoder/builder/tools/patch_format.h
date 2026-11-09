@@ -422,6 +422,13 @@ static constexpr EntriesFiles<3> GEO_ENTRIES_FILES = {PatchFileId::STREET_LISTS,
                                                       PatchFileId::INTERP_LISTS};
 static constexpr EntriesFiles<2> CELL_INDEX_ENTRIES_FILES = {PatchFileId::ADMIN_ENTRIES, PatchFileId::POI_ENTRIES};
 
+// Whether a file id names one of the geo index's lists (GEO_ENTRIES_FILES):
+// no file, so no file section's.
+inline bool is_geo_list_id(uint32_t id) {
+    return std::find(GEO_ENTRIES_FILES.begin(), GEO_ENTRIES_FILES.end(), static_cast<PatchFileId>(id)) !=
+           GEO_ENTRIES_FILES.end();
+}
+
 // Secondary ID remap marker: 0xFFFFFFF6
 // Additional old→new ID mappings for modified records (recovered by relaxed key matching).
 // Both diff and patch tools must apply these to their derived remaps for consistent results.
