@@ -16,6 +16,7 @@ mod arc_blocks;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod arc_fixture;
 pub mod cell_pairs;
+pub mod geo_index;
 pub use cell_pairs::CellPairs;
 mod exact_pip;
 pub use exact_pip::{edge_crosses, on_edge, to_e7, PointE7};
