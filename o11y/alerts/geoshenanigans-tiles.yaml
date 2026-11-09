@@ -1,0 +1,303 @@
+---
+# yaml-language-server: $schema=https://k8s-schemas.home-operations.com/grafana.integreatly.org/grafanaalertrulegroup_v1beta1.json
+#
+# tiles.immich.cloud, shipped as-is in the signed o11y bundle (o11y/render-manifests.sh).
+#
+# The worker sends one sample per request to o11y's serverless ingest path,
+# which writes each series' sum per minute (<name>:1m_sum_samples), durations'
+# histogram buckets included (<name>_bucket:1m_sum_samples{vmrange=...});
+# sum_over_time() adds up the minutes. Two aggregator replicas each sum part of
+# the traffic, so every query also adds up over their `aggregator` label.
+#
+# Every query uses VictoriaMetricsFleet: the default VictoriaMetrics datasource
+# only sees the o11y cluster's own tenant. `project: geoshenanigans` routes to
+# the rootly-geoshenanigans contact point; never add `heartbeat: rootly`.
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaAlertRuleGroup
+metadata:
+  name: geoshenanigans-tiles
+spec:
+  instanceSelector:
+    matchLabels:
+      dashboards: grafana
+  folderRef: geoshenanigans
+  interval: 1m
+  rules:
+    # The worker's cron sends tiles_heartbeat_timestamp_seconds to /insert/0/
+    # every minute. 10 empty minutes plus `for` means the cron trigger, the worker
+    # or its push to vmauth is gone: o11y sees nothing from tiles, and its
+    # fleet-wide stopped-reporting rule leaves the tiles tenant out (yucca-o11y
+    # docs/05). Unguarded, as version's heartbeat is: the Fleet datasource only
+    # finds tenants that ingested on the query's day, so a "seen recently" guard
+    # would resolve a full outage at the next UTC midnight.
+    - uid: geoshenanigans-tiles-heartbeat
+      title: Tiles worker heartbeat stopped
+      condition: B
+      for: 5m
+      labels:
+        project: geoshenanigans
+        severity: critical
+      annotations:
+        summary: The tiles worker has sent o11y no heartbeat for over 10 minutes.
+        description: >-
+          No tiles_heartbeat_timestamp_seconds sample for 10 minutes on this o11y instance (production
+          o11y receives env=prod, staging env=dev). The worker's every-minute cron trigger stopped firing,
+          the worker isn't deployed, or its pushes no longer reach vmauth: O11Y_TOKEN no longer matches the
+          vmauth token after a rotation (apply core-infra-tf, then rerun the Tiles Worker workflow on main), or
+          the gateway rejects it (the worker logs "o11y: ... answered" to Workers Logs). Check tiles-prod's
+          cron events in the Cloudflare dashboard. Until this resolves, the other tiles alerts are blind.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              absent_over_time(tiles_heartbeat_timestamp_seconds{project="geoshenanigans", cluster="tiles", env="prod"}[10m])
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # The worker answers several requests a second around the clock, so 15
+    # minutes without one counted is an outage. Only while the heartbeat arrives:
+    # without it the metrics path is down and geoshenanigans-tiles-heartbeat pages
+    # instead. The serverless path writes zeros for 5 minutes after a series' last
+    # event, then nothing, so `or vector(0)` turns both into 0, and `== bool 0`
+    # turns that into the 1 the threshold fires on.
+    - uid: geoshenanigans-tiles-silent
+      title: Tiles worker counted no requests for 15 minutes
+      condition: B
+      for: 5m
+      labels:
+        project: geoshenanigans
+        severity: critical
+      annotations:
+        summary: tiles.immich.cloud has counted no requests for 15 minutes while its heartbeat arrives.
+        description: >-
+          tiles_handle_request_invocation has counted no request for 15 minutes in o11y, though the
+          worker's heartbeat still arrives, so its metrics reach o11y. Either tiles.immich.cloud gets no
+          requests through the worker (curl https://tiles.immich.cloud/v1.json; DNS and the workers domain in
+          the Cloudflare dashboard) or o11y's serverless ingest path (vmagent-serverless) drops them while
+          /insert/0/ works.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 900
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              ((sum(sum_over_time(tiles_handle_request_invocation:1m_sum_samples{project="geoshenanigans", cluster="tiles", env="prod"}[15m])) or vector(0))
+              == bool 0)
+              and on () (count(last_over_time(tiles_heartbeat_timestamp_seconds{project="geoshenanigans", cluster="tiles", env="prod"}[15m])) > 0)
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 900
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # Failed responses over 10 minutes against all of them, with a floor of 50
+    # failures so a handful at night doesn't page. `for: 5m` rides out a single
+    # bad deploy minute.
+    - uid: geoshenanigans-tiles-5xx
+      title: Tiles worker answering 5xx
+      condition: B
+      for: 5m
+      labels:
+        project: geoshenanigans
+        severity: critical
+      annotations:
+        summary: More than 2% of tiles.immich.cloud responses are 5xx.
+        description: >-
+          Over 2% of the worker's responses in the past 10 minutes were 5xx (at least 50 of them).
+          The Tiles dashboard splits them by request type, and its log panel has each failure's error,
+          stack and Cf-Ray (project:="geoshenanigans" cluster:="tiles" level:="error" in VictoriaLogs).
+          Tigris read errors and missing D1 directory tables after a deploy are the usual causes; a deploy
+          can be rolled back with the Tiles Deploy workflow or by reverting the tfvars change.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              (sum(sum_over_time(tiles_response_count:1m_sum_samples{project="geoshenanigans", cluster="tiles", env="prod", status=~"5.."}[10m])) > 50)
+              / sum(sum_over_time(tiles_response_count:1m_sum_samples{project="geoshenanigans", cluster="tiles", env="prod"}[10m]))
+              > 0.02
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # The worker's time per request, CDN hits included, which keep most requests
+    # fast. A warning: slow tiles degrade Immich's map without breaking it.
+    - uid: geoshenanigans-tiles-slow
+      title: Tiles worker slow
+      condition: B
+      for: 15m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: tiles.immich.cloud p95 time per request is above 1.5 seconds.
+        description: >-
+          The 95th percentile of the worker's time per request has been above 1.5s for 15 minutes.
+          The Tiles dashboard shows whether it is uncached tiles in one continent (Tigris or D1 from
+          there), D1 queries landing on the primary instead of a replica, or one colo (Busiest colos).
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 900
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              histogram_quantile(0.95, sum by (vmrange) (sum_over_time(tiles_handle_request_duration_bucket:1m_sum_samples{project="geoshenanigans", cluster="tiles", env="prod"}[15m])))
+              > 1500
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 900
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []

@@ -8,9 +8,17 @@ variable "storage_prefix" {
 }
 
 variable "tiles_build_dir" {}
-variable "vmetrics_api_token" {}
 variable "env" {}
 
+# The o11y vmauth gateway's bearer token for the env's store (tf_prod: production, tf_dev: staging), mirrored from FUTO's
+# vault by core-infra-tf.
+variable "o11y_vmauth_token" {
+  type      = string
+  sensitive = true
+}
+
+# Only for destroying the dashboards and alerts this module used to keep in the old monitoring.immich.cloud Grafana;
+# remove with the provider once that apply has run in both environments.
 variable "grafana_url" {}
 variable "grafana_token" {}
 
