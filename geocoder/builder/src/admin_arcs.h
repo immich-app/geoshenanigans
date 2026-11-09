@@ -706,15 +706,17 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
 
 // ring_folds_over's scratch, kept from one call to the next.
 struct FoldScratch {
-    // A loop with an area: which way it winds (the sign of its area), and
-    // an edge of it that isn't on one meridian.
-    struct Loop {
-        int winding;
-        PackedLocation from, to;
+    // A point beside the midpoint (lat, lon, in doubled units) of an edge
+    // that isn't on one meridian, and the edges a ray from it towards +lat
+    // crosses, each +1 running east and -1 west: north of the midpoint
+    // (crossed) and through it (through).
+    struct Probe {
+        int64_t lat, lon;
+        int crossed, through;
     };
     std::vector<uint64_t> keys;
-    std::vector<PackedLocation> rest;
-    std::vector<Loop> loops;
+    std::vector<PackedLocation> ring, rest;  // the ring without its spikes; what is left of it split
+    std::vector<Probe> probes;
 };
 
 // Whether `ring` (each vertex once where its neighbour repeats it, without
@@ -724,15 +726,22 @@ struct FoldScratch {
 // winding against the ring outside it, which the polygon covers and so do
 // the neighbours whose borders bound it. A spur, a pinched neck, a lobe
 // inside a lobe and a hole the ring pinches off (which it winds round not at
-// all) fold nothing, wherever the ring starts and whatever is left of it
-// once its loops are split off (a spur when every lobe is). Split at each
-// vertex it comes back to, the ring is loops that meet only there; round a
-// point just inside a loop it winds as often as that loop and the loops
-// round the point add up to. So it folds when, for a loop with an area
-// winding each way, it winds round a point just inside that loop the loop's
-// own way: each loop tested costs a pass over the ring, none when the loops
-// all wind one way, those winding the way fewer do first, and the others
-// only once one of those winds its own way.
+// all) fold nothing, wherever the ring starts. A ring that comes back to no
+// vertex folds nothing here. Its spikes taken off first (a vertex it goes
+// out to and comes back from along one line, which changes nothing it winds
+// round), split at each vertex it comes back to, the ring is loops: when
+// those with an area all wind one way, it winds round no point the other
+// way. Otherwise it is stretches from one vertex it comes back to to the
+// next, and every part of the plane it bounds lies beside one of them. Where
+// the ring meets itself only at those vertices or along whole edges, so that
+// what lies beside a stretch is the same all along it, it folds exactly
+// when it winds round a point beside one stretch's first edge off one
+// meridian one way and round a point beside another's (or the other side of
+// the same one) the other way; where it meets itself elsewhere too, an end
+// on another edge or a crossing (the repair puts those the tier's grid
+// makes back as the fine build has them), a fold it finds is still one, but
+// it may miss some. Its windings round all the probes take one pass over its
+// edges, each going only to the probes within its longitudes.
 bool ring_folds_over(const std::vector<PackedLocation>& ring, FoldScratch& scratch);
 
 // The checks tier t, one that coarsens, aborts on (std::runtime_error) over

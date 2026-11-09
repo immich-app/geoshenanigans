@@ -879,6 +879,149 @@ TEST(a_loop_inside_a_hole_the_ring_pinches_off_folds_where_it_winds_as_the_hole_
     CHECK_EQ(folding_walks({A, B, C, H1, T1, T2, H1, H2, C, D}), size_t(0));
 }
 
+// How often `ring` winds round p, on none of its edges: the edges a ray from
+// p towards +lat crosses (exact_edge_crosses), +1 each running east and -1
+// west.
+int winding_round(const Ring& ring, PackedLocation p) {
+    int w = 0;
+    for (size_t k = 0, j = ring.size() - 1; k < ring.size(); j = k++)
+        if (exact_edge_crosses(ring[j], ring[k], p)) w += ring[k].lon_e7 > ring[j].lon_e7 ? 1 : -1;
+    return w;
+}
+
+TEST(a_ring_meeting_itself_at_two_vertices_in_turn_folds_where_it_winds_both_ways_however_it_is_walked) {
+    // Four stretches from U to V, each bent at lon 50 to lat 40 (d), 20 (a),
+    // 5 (c) or -20 (b), walked U a V b U c V d. Split at the U it comes back
+    // to, it is the loops U a V b and U c V d, which wind against each other
+    // and cross at U and V. The ring winds round the part between d and a
+    // one way, round the part between c and b the other way and round the
+    // part between a and c not at all: it folds, however it is walked.
+    // Walked U d V b U c V a, it winds round the part between a and c not
+    // at all and round the other two the same way, a hole pinched off at
+    // both its ends: it folds nowhere.
+    const PackedLocation U = pt(0, 0), V = pt(0, 100), a = pt(20, 50), b = pt(-20, 50), c = pt(5, 50), d = pt(40, 50);
+    const Ring fold = {U, a, V, b, U, c, V, d}, hole = {U, d, V, b, U, c, V, a};
+    CHECK_EQ(winding_of({U, a, V, b}), -winding_of({U, c, V, d}));
+    const PackedLocation da = pt(30, 50), ac = pt(12, 50), cb = pt(-10, 50);
+    CHECK_EQ(winding_round(fold, da), -winding_round(fold, cb));
+    CHECK(winding_round(fold, da) != 0 && winding_round(fold, ac) == 0);
+    CHECK(folds_over(fold));
+    CHECK_EQ(folding_walks(fold), size_t(16));
+    CHECK_EQ(winding_round(hole, da), winding_round(hole, cb));
+    CHECK(winding_round(hole, da) != 0 && winding_round(hole, ac) == 0);
+    CHECK_EQ(folding_walks(hole), size_t(0));
+}
+
+TEST(a_ring_folds_where_a_loop_it_pinches_off_winds_against_it_whatever_spike_the_loop_starts_with) {
+    // The square, and at C a loop that starts with a spike: out east on the
+    // line of the square's north edge to X and back to Y on the way, then Z,
+    // then C. The spike Y X sticks out of the loop C Y Z, of no area. Where
+    // the loop winds against the square, the ring folds, however it is
+    // walked; where it winds as the square does (N north of that line where
+    // Z is south), a pinched neck with the same spike, it doesn't.
+    const PackedLocation A = pt(0, 0), B = pt(0, 100), C = pt(100, 100), D = pt(100, 0);
+    const PackedLocation X = pt(100, 200), Y = pt(100, 120), Z = pt(50, 160), N = pt(150, 160);
+    const Ring square = {A, B, C, D}, fold = {A, B, C, X, Y, Z, C, D}, neck = {A, B, C, X, Y, N, C, D};
+    CHECK_EQ(winding_of({C, Y, Z}), -winding_of(square));
+    CHECK_EQ(winding_of({C, Y, N}), winding_of(square));
+    CHECK_EQ(winding_round(fold, pt(80, 130)), -winding_round(fold, pt(50, 50)));
+    CHECK(winding_round(fold, pt(50, 50)) != 0);
+    CHECK(folds_over(fold));
+    CHECK_EQ(folding_walks(fold), size_t(16));
+    CHECK_EQ(folding_walks(neck), size_t(0));
+    // The spike walked out and back along the same edges twice, and a ring
+    // that is the square with spikes alone.
+    CHECK_EQ(folding_walks({A, B, C, X, Y, X, Y, Z, C, D}), size_t(20));
+    CHECK_EQ(folding_walks({A, B, C, X, Y, N, C, D, pt(100, -50), pt(100, -20)}), size_t(0));
+}
+
+// How `ring` meets itself, past the end each edge shares with the next: 0
+// only at vertices it comes back to; 1 also along whole edges it walks twice
+// or in spikes, an edge going back along the one before it; 2 elsewhere as
+// well, a crossing, an end on another edge's inside or edges partly along
+// each other.
+int how_it_meets_itself(const Ring& ring) {
+    auto side = [](PackedLocation a, PackedLocation b, PackedLocation p) {
+        const int64_t x = (int64_t(b.lat_e7) - a.lat_e7) * (int64_t(p.lon_e7) - a.lon_e7) -
+                          (int64_t(b.lon_e7) - a.lon_e7) * (int64_t(p.lat_e7) - a.lat_e7);
+        return (x > 0) - (x < 0);
+    };
+    // p, on the line of a b, strictly between them.
+    auto between = [](PackedLocation a, PackedLocation b, PackedLocation p) {
+        return p != a && p != b && std::min(a.lat_e7, b.lat_e7) <= p.lat_e7 && p.lat_e7 <= std::max(a.lat_e7, b.lat_e7) &&
+               std::min(a.lon_e7, b.lon_e7) <= p.lon_e7 && p.lon_e7 <= std::max(a.lon_e7, b.lon_e7);
+    };
+    const size_t n = ring.size();
+    int how = 0;
+    for (size_t i = 0; i < n; i++)
+        for (size_t j = i + 1; j < n; j++) {
+            const PackedLocation a = ring[i], b = ring[(i + 1) % n], c = ring[j], d = ring[(j + 1) % n];
+            const bool next = j == i + 1 || (i == 0 && j == n - 1);
+            const int sc = side(a, b, c), sd = side(a, b, d);
+            if (sc == 0 && sd == 0) {
+                if ((a == c && b == d) || (a == d && b == c)) how = std::max(how, 1);
+                else if (between(a, b, c) || between(a, b, d) || between(c, d, a) || between(c, d, b))
+                    how = std::max(how, next ? 1 : 2);
+            } else if (a != c && a != d && b != c && b != d && sc * sd <= 0 && side(c, d, a) * side(c, d, b) <= 0) {
+                return 2;
+            }
+        }
+    return how;
+}
+
+TEST(a_random_ring_meeting_itself_at_vertices_along_whole_edges_or_in_spikes_folds_where_it_winds_both_ways) {
+    // Random rings on a grid of 4 to 6 by as many, of 5 to 12 vertices, that
+    // come back to a vertex, have an area and meet themselves only at the
+    // vertices they come back to, along whole edges or in spikes
+    // (how_it_meets_itself under 2). Each part of the plane such a ring
+    // bounds lies beside some edge, between two of the grid points on it, so
+    // the ring winds round some point one way and round another the other
+    // way exactly when it does so round two of the points a seventh, two
+    // sevenths ... six sevenths of the way along its edges, off them on
+    // either side by far less than any other edge comes to them: on the grid
+    // scaled up 7000 times, by an edge's own lat and lon steps across it.
+    // However each ring is walked, folds_over says the same.
+    std::mt19937_64 rng(505);
+    constexpr int32_t kScale = 7000;
+    size_t folding = 0, not_folding = 0, folding_on_edges_or_spikes = 0, disagreeing = 0;
+    for (int t = 0; t < 400000; t++) {
+        const int32_t grid = 4 + int32_t(rng() % 3);
+        Ring ring(5 + rng() % 8);
+        for (PackedLocation& p : ring) p = pt(int32_t(rng() % uint64_t(grid)), int32_t(rng() % uint64_t(grid)));
+        bool ok = true;
+        for (size_t k = 0; k < ring.size(); k++) ok &= ring[k] != ring[(k + 1) % ring.size()];
+        if (!ok || exact_ring_area2(ring.data(), static_cast<uint32_t>(ring.size())) == 0) continue;
+        Ring sorted = ring;
+        std::sort(sorted.begin(), sorted.end(),
+                  [](PackedLocation x, PackedLocation y) { return vertex_key(x) < vertex_key(y); });
+        if (std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end()) continue;
+        const int how = how_it_meets_itself(ring);
+        if (how == 2) continue;
+        Ring scaled;
+        for (const PackedLocation& p : ring) scaled.push_back(pt(p.lat_e7 * kScale, p.lon_e7 * kScale));
+        int lowest = 0, highest = 0;
+        for (size_t k = 0; k < scaled.size(); k++) {
+            const PackedLocation from = scaled[k], to = scaled[(k + 1) % scaled.size()];
+            const int32_t dlat = (to.lat_e7 - from.lat_e7) / kScale, dlon = (to.lon_e7 - from.lon_e7) / kScale;
+            for (int32_t seventh = 1; seventh < 7; seventh++) {
+                const PackedLocation at =
+                    pt(from.lat_e7 + dlat * seventh * (kScale / 7), from.lon_e7 + dlon * seventh * (kScale / 7));
+                for (const int s : {-1, 1}) {
+                    const int w = winding_round(scaled, pt(at.lat_e7 - s * dlon, at.lon_e7 + s * dlat));
+                    lowest = std::min(lowest, w);
+                    highest = std::max(highest, w);
+                }
+            }
+        }
+        const bool folds = lowest < 0 && highest > 0;
+        (folds ? folding : not_folding)++;
+        folding_on_edges_or_spikes += folds && how == 1;
+        for (const Ring& w : walks(ring)) disagreeing += folds_over(w) != folds;
+    }
+    CHECK_EQ(disagreeing, size_t(0));
+    CHECK(folding > 500 && not_folding > 500 && folding_on_edges_or_spikes > 100);
+}
+
 TEST(an_arc_keeps_copy_takes_one_arcs_marks_from_another_of_the_same_arcs) {
     auto sizes = [](size_t a) { return a == 1 ? 130u : 7u; };
     ArcKeep from(3, sizes), to(3, sizes);
