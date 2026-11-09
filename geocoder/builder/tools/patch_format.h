@@ -1878,7 +1878,9 @@ public:
     }
     // The correction replaces the derived list whole (GEO_LIST_REPLACE).
     bool replaces() const { return replace_; }
-    void apply(std::vector<uint32_t>& ids, std::vector<uint32_t>& scratch) {
+    // Out of line: few cells carry a correction, and the entry walk that asks for it runs for every cell of
+    // geo_cells.bin, so its loop stays as small as without one.
+    [[gnu::noinline]] void apply(std::vector<uint32_t>& ids, std::vector<uint32_t>& scratch) {
         gained_ids_.resize(ng_);
         if (ng_) memcpy(gained_ids_.data(), data_ + gained_, (size_t)ng_ * 4);
         if (replace_) { ids = gained_ids_; return; }
