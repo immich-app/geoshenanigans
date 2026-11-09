@@ -249,13 +249,8 @@ TEST(minimal_arcs_are_stored_at_k_3_on_the_11_m_grid) {
     for (uint32_t a = 0; a < b.arcs.minimal.arcs.size(); a++) {
         const arc_blocks::DecodedArc d = block_of(b.blocks, m, a);
         CHECK_EQ(int(d.k), 3);
-        // Each stored vertex a raw one of the arc, in order, on the 11 m grid.
-        const Ring raw = minimal_raw(b, a);
-        size_t at = 0;
-        for (const PackedLocation& v : d.vertices) {
-            while (at < raw.size() && on_grid(raw[at], kCoarse) != v) at++;
-            CHECK(at < raw.size());
-        }
+        // Every raw vertex of the arc stays, in order, on the 11 m grid.
+        CHECK(d.vertices == snapped_ring(minimal_raw(b, a), kCoarse));
     }
     for (uint32_t a = 0; a < b.arcs.arcs.size(); a++) CHECK_EQ(int(block_of(b.blocks, f, a).k), 2);
     CHECK_EQ(state.counts.fine_rings, size_t(0));
