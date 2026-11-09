@@ -12,46 +12,91 @@
 #include "parallel.h"
 #include "parsed_data.h"
 
-bool ring_folds_over(const std::vector<PackedLocation>& ring, std::vector<uint64_t>& keys, std::vector<PackedLocation>& loop,
-                     std::vector<PackedLocation>& rest) {
-    auto winding = [](const std::vector<PackedLocation>& v) {
-        const __int128 a2 = exact_ring_area2(v.data(), static_cast<uint32_t>(v.size()));
-        return (a2 > 0) - (a2 < 0);
+namespace {
+
+// How often `ring` (its last vertex joined back to its first) winds round a
+// point beside its edge from -> to (from.lon_e7 != to.lon_e7): off the
+// edge's midpoint north (`north`) or south, by less than any vertex or
+// other edge comes to it, and east of its longitude by less again. The ray
+// from that point towards +lat crosses an edge that straddles the
+// midpoint's longitude as exact_edge_crosses has it, one end east of it and
+// the other at or west of it, and passes north of the midpoint, or through
+// it when the point is south: +1 for an edge running east, -1 west, so that
+// a ring of positive area (exact_ring_area2) winds round its inside +1
+// times. In doubled units, which hold the midpoint on their grid: the cross
+// products need 128 bits.
+int winding_beside(const std::vector<PackedLocation>& ring, PackedLocation from, PackedLocation to, bool north) {
+    const int64_t mid_lat = int64_t(from.lat_e7) + to.lat_e7, mid_lon = int64_t(from.lon_e7) + to.lon_e7;
+    int crossed = 0, through = 0;
+    for (size_t k = 0, j = ring.size() - 1; k < ring.size(); j = k++) {
+        const PackedLocation c = ring[j], d = ring[k];
+        const bool c_east = 2 * int64_t(c.lon_e7) > mid_lon, d_east = 2 * int64_t(d.lon_e7) > mid_lon;
+        if (c_east == d_east) continue;
+
+        const int east = d_east ? 1 : -1;
+        // (d - c) x (midpoint - c), in (lat, lon), and so its sign times
+        // east's: where c -> d passes the midpoint's longitude, north of it
+        // (> 0), through it (0) or south of it.
+        const __int128 cross = __int128(int64_t(d.lat_e7) - c.lat_e7) * (mid_lon - 2 * int64_t(c.lon_e7)) -
+                               __int128(mid_lat - 2 * int64_t(c.lat_e7)) * (int64_t(d.lon_e7) - c.lon_e7);
+        if (cross == 0) through += east;
+        else if ((cross > 0) == (east > 0)) crossed += east;
+    }
+    return north ? crossed : crossed + through;
+}
+
+}  // namespace
+
+bool ring_folds_over(const std::vector<PackedLocation>& ring, FoldScratch& s) {
+    s.keys.clear();
+    for (const PackedLocation& p : ring) s.keys.push_back(vertex_key(p));
+    std::sort(s.keys.begin(), s.keys.end());
+    if (std::adjacent_find(s.keys.begin(), s.keys.end()) == s.keys.end()) return false;
+    // The loops, the rest last: rest[from, end) joined back to rest[from].
+    s.rest.clear();
+    s.loops.clear();
+    auto add_loop = [&](uint32_t from) {
+        const PackedLocation* v = s.rest.data() + from;
+        const uint32_t n = static_cast<uint32_t>(s.rest.size() - from);
+        const __int128 a2 = exact_ring_area2(v, n);
+        if (a2 == 0) return;
+        for (uint32_t k = 0; k < n; k++)
+            if (v[k].lon_e7 != v[(k + 1) % n].lon_e7) {
+                s.loops.push_back({a2 > 0 ? 1 : -1, v[k], v[(k + 1) % n]});
+                return;
+            }
     };
-    keys.clear();
-    for (const PackedLocation& p : ring) keys.push_back(vertex_key(p));
-    std::sort(keys.begin(), keys.end());
-    if (std::adjacent_find(keys.begin(), keys.end()) == keys.end()) return false;
     std::unordered_map<uint64_t, uint32_t> at;  // a vertex of rest: its index
-    std::vector<std::pair<int, std::vector<PackedLocation>>> loops;  // each loop with an area, and its winding
-    rest.clear();
     for (const PackedLocation& p : ring) {
-        const auto it = at.find(vertex_key(p));
-        if (it == at.end()) {
-            at.emplace(vertex_key(p), static_cast<uint32_t>(rest.size()));
-            rest.push_back(p);
+        const auto [it, added] = at.try_emplace(vertex_key(p), static_cast<uint32_t>(s.rest.size()));
+        if (added) {
+            s.rest.push_back(p);
             continue;
         }
         const uint32_t i = it->second;
-        loop.assign(rest.begin() + i, rest.end());
-        const int w = winding(loop);
-        if (w != 0) loops.push_back({w, loop});
-        for (size_t k = i + 1; k < rest.size(); k++) at.erase(vertex_key(rest[k]));
-        rest.resize(i + 1);
+        add_loop(i);
+        for (size_t k = i + 1; k < s.rest.size(); k++) at.erase(vertex_key(s.rest[k]));
+        s.rest.resize(i + 1);
     }
-    // Which of the two lies inside the other doesn't depend on where the
-    // ring starts: test a vertex of each, off the vertex they share, in the
-    // other.
-    const int whole = winding(rest);
-    for (const auto& [w, l] : loops) {
-        if (whole == 0 || w == whole) continue;
-        const auto off = std::find_if(rest.begin(), rest.end(), [&](const PackedLocation& p) { return p != l[0]; });
-        if (off == rest.end()) continue;
-        if (!exact_ring_contains(rest.data(), static_cast<uint32_t>(rest.size()), l[l.size() / 2]) &&
-            !exact_ring_contains(l.data(), static_cast<uint32_t>(l.size()), *off))
-            return true;
-    }
-    return false;
+    add_loop(0);
+    const size_t positive = static_cast<size_t>(
+        std::count_if(s.loops.begin(), s.loops.end(), [](const FoldScratch::Loop& l) { return l.winding > 0; }));
+    const size_t negative = s.loops.size() - positive;
+    if (positive == 0 || negative == 0) return false;
+    // Whether the ring winds round the inside of a loop winding w way that
+    // way too. A loop's inside is left of its edges where it winds
+    // positively: south of an edge running east.
+    auto own_way = [&](int w) {
+        for (const FoldScratch::Loop& l : s.loops) {
+            if (l.winding != w) continue;
+
+            const bool east = l.to.lon_e7 > l.from.lon_e7;
+            if (winding_beside(ring, l.from, l.to, (w > 0) != east) * w > 0) return true;
+        }
+        return false;
+    };
+    const int fewer = positive <= negative ? 1 : -1;
+    return own_way(fewer) && own_way(-fewer);
 }
 
 namespace {
@@ -309,8 +354,7 @@ struct Scratch {
     std::vector<LatLng> pts;
     std::vector<StoredVertex> stored;
     std::vector<PackedLocation> ring;
-    std::vector<uint64_t> keys;  // folds_over
-    std::vector<PackedLocation> loop, rest;
+    FoldScratch fold;  // folds_over
 };
 
 // Which way a ring winds: the sign of its exact area, 0 for none.
@@ -320,7 +364,7 @@ int winding(const PackedLocation* v, size_t n) {
 }
 
 bool folds_over(const std::vector<PackedLocation>& ring, Scratch& s) {
-    return ring_folds_over(ring, s.keys, s.loop, s.rest);
+    return ring_folds_over(ring, s.fold);
 }
 
 std::vector<LatLng> lat_lng_ring(const PackedLocation* v, size_t n, bool close) {

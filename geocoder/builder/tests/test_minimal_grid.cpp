@@ -771,9 +771,28 @@ TEST(a_strip_the_11_m_grid_turns_over_goes_back_to_the_1_1_m_tier) {
 }
 
 bool folds_over(const Ring& ring) {
-    std::vector<uint64_t> keys;
-    Ring loop, rest;
-    return ring_folds_over(ring, keys, loop, rest);
+    static FoldScratch scratch;  // as the tier's, kept from one ring to the next
+    return ring_folds_over(ring, scratch);
+}
+
+// Every walk of `ring`: from each of its vertices, either way.
+std::vector<Ring> walks(Ring ring) {
+    std::vector<Ring> out;
+    for (int way = 0; way < 2; way++) {
+        for (size_t k = 0; k < ring.size(); k++) {
+            out.push_back(ring);
+            std::rotate(ring.begin(), ring.begin() + 1, ring.end());
+        }
+        std::reverse(ring.begin(), ring.end());
+    }
+    return out;
+}
+
+// How many walks of `ring` fold over (folds_over).
+size_t folding_walks(const Ring& ring) {
+    size_t n = 0;
+    for (const Ring& w : walks(ring)) n += folds_over(w);
+    return n;
 }
 
 TEST(a_ring_folds_over_where_a_loop_it_pinches_off_winds_against_it_outside_it) {
@@ -797,6 +816,72 @@ TEST(a_ring_folds_over_where_a_loop_it_pinches_off_winds_against_it_outside_it) 
     // Where the ring starts doesn't matter.
     CHECK(folds_over({E, C, D, A, B, C, F}));
     CHECK(!folds_over({G, C, D, A, B, C, H}));
+}
+
+TEST(a_ring_left_a_spur_once_its_lobes_are_split_off_folds_where_one_winds_against_another_outside_it) {
+    // The square and the fold at C above, the ring walked from P, on the
+    // square's edge C..D, to C and back at its end: split, it is the two
+    // lobes and, left, the spur P C, of no area. However it is walked, it
+    // folds; with a pinched neck or a hole at C instead it doesn't.
+    const PackedLocation A = pt(0, 0), B = pt(0, 100), C = pt(100, 100), D = pt(100, 0), P = pt(100, 50);
+    const PackedLocation E = pt(150, 150), F = pt(150, 100), G = pt(50, 50), H = pt(50, 90);
+    const Ring fold = {P, C, F, E, C, D, A, B, C};
+    CHECK(folds_over(fold));
+    CHECK_EQ(folding_walks(fold), size_t(18));
+    CHECK_EQ(folding_walks({P, C, E, F, C, D, A, B, C}), size_t(0));
+    CHECK_EQ(folding_walks({P, C, H, G, C, D, A, B, C}), size_t(0));
+    // More lobes: a pinched neck at A besides the fold (A M N, outside the
+    // square, winding as it does); or the fold moved to the spur's far end
+    // (P X Y, outside the square, winding against it), which it touches the
+    // rest of the ring at alone. With the fold turned round, neither folds.
+    const PackedLocation M = pt(-40, -10), N = pt(-40, 30), X = pt(130, 40), Y = pt(130, 60);
+    const Ring square = {A, B, C, D};
+    CHECK_EQ(winding_of({A, M, N}), winding_of(square));
+    CHECK_EQ(winding_of({P, X, Y}), -winding_of(square));
+    CHECK_EQ(folding_walks({P, C, F, E, C, D, A, M, N, A, B, C}), size_t(24));
+    CHECK_EQ(folding_walks({P, C, E, F, C, D, A, M, N, A, B, C}), size_t(0));
+    CHECK_EQ(folding_walks({P, X, Y, P, C, D, A, B, C}), size_t(18));
+    CHECK_EQ(folding_walks({P, Y, X, P, C, D, A, B, C}), size_t(0));
+}
+
+TEST(a_hole_a_lobe_of_the_ring_pinches_off_folds_nothing_wherever_the_ring_starts) {
+    // The square, and at C the pinched neck C Q3 Q2 Q1 (outside the square,
+    // winding as it does), which pinches off at Q2 the hole Q2 R1 R2. The
+    // hole lies outside the square and winds against it, but the ring winds
+    // round it not at all: nothing folds, however the ring is walked. Turned
+    // round, the hole is a lobe inside a lobe, which folds nothing either.
+    const PackedLocation A = pt(0, 0), B = pt(0, 100), C = pt(100, 100), D = pt(100, 0);
+    const PackedLocation Q1 = pt(200, 100), Q2 = pt(200, 200), Q3 = pt(100, 200), R1 = pt(150, 180), R2 = pt(180, 150);
+    const Ring square = {A, B, C, D}, neck = {C, Q3, Q2, Q1}, hole = {Q2, R1, R2};
+    CHECK_EQ(winding_of(neck), winding_of(square));
+    CHECK_EQ(winding_of(hole), -winding_of(square));
+    CHECK(exact_ring_contains(neck.data(), 4, R1) && exact_ring_contains(neck.data(), 4, R2));
+    const Ring ring = {A, B, C, Q3, Q2, R1, R2, Q2, Q1, C, D};
+    CHECK(!folds_over(ring));
+    CHECK_EQ(folding_walks(ring), size_t(0));
+    CHECK_EQ(folding_walks({A, B, C, Q3, Q2, R2, R1, Q2, Q1, C, D}), size_t(0));
+    // The lobe turned round instead, a fold, with the hole turned round too:
+    // a hole in the fold, which folds still.
+    CHECK_EQ(folding_walks({A, B, C, Q1, Q2, R2, R1, Q2, Q3, C, D}), size_t(22));
+}
+
+TEST(a_loop_inside_a_hole_the_ring_pinches_off_folds_where_it_winds_as_the_hole_does) {
+    // The square pinches off at C the hole C H1 H2, and the hole pinches off
+    // at H1 the loop H1 T2 T1 inside it, winding as the hole does: the ring
+    // winds round that loop's inside against the square's. It folds,
+    // however the ring is walked; with the loop turned round, an island in
+    // the hole, it doesn't.
+    const PackedLocation A = pt(0, 0), B = pt(0, 100), C = pt(100, 100), D = pt(100, 0);
+    const PackedLocation H1 = pt(10, 90), H2 = pt(90, 10), T1 = pt(40, 80), T2 = pt(70, 50);
+    const Ring square = {A, B, C, D}, hole = {C, H1, H2}, loop = {H1, T2, T1};
+    CHECK_EQ(winding_of(hole), -winding_of(square));
+    CHECK_EQ(winding_of(loop), winding_of(hole));
+    CHECK(exact_ring_contains(square.data(), 4, H1) && exact_ring_contains(square.data(), 4, H2));
+    CHECK(exact_ring_contains(hole.data(), 3, T1) && exact_ring_contains(hole.data(), 3, T2));
+    const Ring ring = {A, B, C, H1, T2, T1, H1, H2, C, D};
+    CHECK(folds_over(ring));
+    CHECK_EQ(folding_walks(ring), size_t(20));
+    CHECK_EQ(folding_walks({A, B, C, H1, T1, T2, H1, H2, C, D}), size_t(0));
 }
 
 TEST(an_arc_keeps_copy_takes_one_arcs_marks_from_another_of_the_same_arcs) {

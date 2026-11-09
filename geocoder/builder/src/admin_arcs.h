@@ -704,16 +704,36 @@ struct AdminArcBlocks {
 // stored on the fine grid or finer. Logs its counts as ARC_CHECK lines.
 AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& store, unsigned threads);
 
+// ring_folds_over's scratch, kept from one call to the next.
+struct FoldScratch {
+    // A loop with an area: which way it winds (the sign of its area), and
+    // an edge of it that isn't on one meridian.
+    struct Loop {
+        int winding;
+        PackedLocation from, to;
+    };
+    std::vector<uint64_t> keys;
+    std::vector<PackedLocation> rest;
+    std::vector<Loop> loops;
+};
+
 // Whether `ring` (each vertex once where its neighbour repeats it, without
-// the closing one) folds over itself: split at each vertex it comes back
-// to, a loop with an area that winds against the rest of the ring and lies
-// outside it. The polygon covers that loop, and so do the neighbours whose
-// borders bound it: a strip narrower than the grid, turned over between the
-// two vertices its ends pinch to. A loop without an area (a spur), one that
-// winds as the rest does (a pinched neck) and one inside the rest (a hole
-// the ring pinches off) fold nothing. `keys`, `loop` and `rest` are scratch.
-bool ring_folds_over(const std::vector<PackedLocation>& ring, std::vector<uint64_t>& keys, std::vector<PackedLocation>& loop,
-                     std::vector<PackedLocation>& rest);
+// the closing one) folds over itself: it winds round some point one way and
+// round another the other way. So it does where a strip narrower than the
+// grid is turned over between the two vertices its ends pinch to, a loop
+// winding against the ring outside it, which the polygon covers and so do
+// the neighbours whose borders bound it. A spur, a pinched neck, a lobe
+// inside a lobe and a hole the ring pinches off (which it winds round not at
+// all) fold nothing, wherever the ring starts and whatever is left of it
+// once its loops are split off (a spur when every lobe is). Split at each
+// vertex it comes back to, the ring is loops that meet only there; round a
+// point just inside a loop it winds as often as that loop and the loops
+// round the point add up to. So it folds when, for a loop with an area
+// winding each way, it winds round a point just inside that loop the loop's
+// own way: each loop tested costs a pass over the ring, none when the loops
+// all wind one way, those winding the way fewer do first, and the others
+// only once one of those winds its own way.
+bool ring_folds_over(const std::vector<PackedLocation>& ring, FoldScratch& scratch);
 
 // The checks tier t, one that coarsens, aborts on (std::runtime_error) over
 // its arc blocks `blocks`: every ring of its set that was valid on its fine
