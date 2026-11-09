@@ -266,18 +266,21 @@ inline size_t write_geo_index(const std::string& dir, const GeoTables& tables,
         uint64_t cell = 0;
         for (uint64_t skip = first_block * BLOCK_ROWS - first_row[k]; skip > 0; skip--) rows_at.row(cell, lists);
         geo_index::BlockEncoder encoder;
+        geo_index::ByteBuffer bytes;
         int level = -1;
         for (uint64_t b = first_block; b < end_block; b++) {
             geo_index::EncodedBlock& block = out.emplace_back();
             encoder.start();
+            bytes.clear();
             const uint64_t n = std::min<uint64_t>(BLOCK_ROWS, rows - b * BLOCK_ROWS);
             for (uint64_t r = 0; r < n; r++) {
                 if (!rows_at.row(cell, lists)) throw std::logic_error("write_geo_index: rows past the tables");
                 if (level < 0) level = geo_index::level_of(cell);
                 if (geo_index::level_of(cell) != level) throw std::runtime_error("write_geo_index: cells of two levels");
                 if (r == 0) block.first_cell = cell;
-                encoder.row(block.bytes, geo_index::number_of(cell, level), geo_index::ids_of(lists));
+                encoder.row(bytes, geo_index::number_of(cell, level), geo_index::ids_of(lists));
             }
+            block.bytes.assign(bytes.data(), bytes.data() + bytes.size());
             block.last_cell = cell;
             block.rows = static_cast<size_t>(n);
         }

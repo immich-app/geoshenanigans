@@ -59,6 +59,8 @@ inline constexpr char MAGIC[4] = {'G', 'X', 'T', '2'};
 inline constexpr size_t HEADER_BYTES = 8, FOOTER_BYTES = 8, ENTRY_BYTES = 12;
 inline constexpr size_t BLOCK_ROWS = 64, GROUP_BLOCKS = 64;
 inline constexpr size_t TABLES = 3, ADDRESSES = 1;
+// The blocks file's bytes a Writer holds before it hands them on.
+inline constexpr size_t FLUSH_BYTES = 64 << 10;
 // A list's count is that of a u16, as the server's lists always were.
 inline constexpr uint32_t LIST_MAX = 0xFFFF;
 inline constexpr int MIN_LEVEL = 1, MAX_LEVEL = 30;
@@ -104,9 +106,45 @@ inline uint64_t get_u64(const uint8_t* p) {
     return v;
 }
 
+// A varint's length, and the varint written at p (returning past it).
+inline unsigned varint_bytes(uint64_t v) {
+    unsigned n = 1;
+    for (; v >= 0x80; v >>= 7) n++;
+    return n;
+}
+inline uint8_t* write_varint(uint8_t* p, uint64_t v) {
+    for (; v >= 0x80; v >>= 7) *p++ = static_cast<uint8_t>(v | 0x80);
+    *p++ = static_cast<uint8_t>(v);
+    return p;
+}
+
+// Bytes written through a pointer: room(n) gives at least n bytes past
+// size() (zeroed once, kept between uses), end_at(p) sets where they end.
+class ByteBuffer {
+public:
+    uint8_t* room(size_t n) {
+        if (size_ + n > buf_.size()) buf_.resize(std::max(buf_.size() * 2, size_ + n));
+        return buf_.data() + size_;
+    }
+    void end_at(const uint8_t* p) { size_ = static_cast<size_t>(p - buf_.data()); }
+    void append(const uint8_t* p, size_t n) {
+        if (n) std::memcpy(room(n), p, n);
+        size_ += n;
+    }
+    const uint8_t* data() const { return buf_.data(); }
+    size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    void clear() { size_ = 0; }
+
+private:
+    std::vector<uint8_t> buf_;
+    size_t size_ = 0;
+};
+
 // Encodes the rows of the blocks it is given, a block at a time: start() at
 // each block's first row, then row() for each of its rows in cell order.
-// Holds the previous list of each table in the block.
+// Holds the previous list of each table in the block. Each list is sized as
+// PLAIN and, where it can be one, as EDIT, then written once as the shorter.
 class BlockEncoder {
 public:
     void start() {
@@ -120,30 +158,34 @@ public:
     // Appends the row of the cell numbered `number` (its number at the
     // index's level, past the block's last row) to out. Its lists are
     // ascending, at most LIST_MAX ids each, and at least one has ids.
-    void row(std::vector<uint8_t>& out, uint64_t number, const RowIds& lists) {
-        bool any = false;
-        for (const Ids& l : lists) {
+    void row(ByteBuffer& out, uint64_t number, const RowIds& lists) {
+        bool any = false, rep[TABLES] = {};
+        // The most a row takes: its header and step, and each list as PLAIN (an EDIT is only taken shorter).
+        size_t most = 11;
+        for (size_t t = 0; t < TABLES; t++) {
+            const Ids& l = lists[t];
             if (l.n > LIST_MAX)
                 throw std::runtime_error("Cell holds " + std::to_string(l.n) + " entries, more than " +
                                          std::to_string(LIST_MAX));
-            for (size_t i = 1; i < l.n; i++)
+            for (size_t i = 1; i < l.n; i++) {
                 if (l.p[i] < l.p[i - 1]) throw std::runtime_error("geo_index: a list out of order");
+                rep[t] |= l.p[i] == l.p[i - 1];
+            }
             any |= l.n > 0;
+            most += 3 + 5 * l.n;
         }
         if (!any) throw std::runtime_error("geo_index: a cell without lists");
-        const size_t at = out.size();
-        out.push_back(0);
-        unsigned header = 0;
-        if (rows_ > 0) {
-            if (number <= prev_) throw std::runtime_error("geo_index: cells out of order");
-            const uint64_t step = number - prev_;
-            const unsigned d = step <= 3 ? static_cast<unsigned>(step - 1) : 3;
-            if (d == 3) cell_pairs::put_varint(out, step - 4);
-            header |= d << 6;
-        }
+        if (rows_ > 0 && number <= prev_) throw std::runtime_error("geo_index: cells out of order");
+        uint8_t* const start = out.room(most);
+        uint8_t* p = start + 1;
+        const uint64_t step = rows_ > 0 ? number - prev_ : 0;
+        const unsigned d = rows_ == 0 ? 0 : step <= 3 ? static_cast<unsigned>(step - 1) : 3;
+        if (d == 3) p = write_varint(p, step - 4);
+        unsigned header = d << 6;
         for (size_t t = 0; t < TABLES; t++)
-            if (lists[t].n > 0) header |= put_list(out, t, lists[t]) << (2 * t);
-        out[at] = static_cast<uint8_t>(header);
+            if (lists[t].n > 0) header |= put_list(p, t, lists[t], rep[t]) << (2 * t);
+        *start = static_cast<uint8_t>(header);
+        out.end_at(p);
         prev_ = number;
         rows_++;
     }
@@ -151,38 +193,52 @@ public:
     size_t rows() const { return rows_; }
 
 private:
-    unsigned put_list(std::vector<uint8_t>& out, size_t t, const Ids& l) {
+    // Writes the list at p (moved past it) and returns its code.
+    unsigned put_list(uint8_t*& p, size_t t, const Ids& l, bool rep) {
         std::vector<uint32_t>& prev = prev_list_[t];
         const bool prior = have_[t] && t != ADDRESSES;
         unsigned code = PLAIN;
         if (prior && prev.size() == l.n && std::equal(l.p, l.p + l.n, prev.begin())) {
-            code = SAME;
+            return SAME;  // the list kept is this one
         } else {
-            plain_.clear();
-            cell_pairs::put_plain(plain_, l.p, l.n, false, cell_pairs::Gaps::VARINT, &lf_[t]);
-            if (prior && !cell_pairs::has_repeats(l.p, l.n) && !cell_pairs::has_repeats(prev.data(), prev.size())) {
-                edit_.clear();
-                put_edit(edit_, prev, l, lf_[t]);
-                if (edit_.size() < plain_.size()) code = EDIT;
+            const uint64_t head = uint64_t(l.n) << 1 | rep;
+            const uint64_t first = cell_pairs::zigzag(int64_t(l.p[0]) - int64_t(lf_[t]));
+            const uint32_t inc = rep ? 0 : 1;
+            size_t plain = varint_bytes(head) + varint_bytes(first);
+            for (size_t i = 1; i < l.n; i++) plain += varint_bytes(l.p[i] - l.p[i - 1] - inc);
+            // An edit takes its ops and its count at least: past PLAIN's length it isn't sized.
+            size_t edit = 0;
+            if (prior && !rep && !prev_rep_[t] && plain > (prev.size() + 7) / 8 + 1) {
+                edit = size_edit(prev, l, lf_[t]);
+                if (edit < plain) code = EDIT;
             }
-            const std::vector<uint8_t>& payload = code == EDIT ? edit_ : plain_;
-            out.insert(out.end(), payload.begin(), payload.end());
-            if (code == PLAIN) lf_[t] = l.p[0];
+            if (code == EDIT) {
+                p = std::copy(ops_.begin(), ops_.end(), p);
+                p = write_varint(p, adds_.size());
+                for (size_t k = 0; k < adds_.size(); k++)
+                    p = write_varint(p, k ? uint64_t(adds_[k]) - adds_[k - 1] - 1
+                                          : cell_pairs::zigzag(int64_t(adds_[0]) - int64_t(lf_[t])));
+            } else {
+                p = write_varint(write_varint(p, head), first);
+                for (size_t i = 1; i < l.n; i++) p = write_varint(p, l.p[i] - l.p[i - 1] - inc);
+                lf_[t] = l.p[0];
+            }
         }
         prev.assign(l.p, l.p + l.n);
+        prev_rep_[t] = rep;
         have_[t] = true;
         return code;
     }
 
-    // The EDIT of prev into l, neither with a repeated id: one walk of both.
-    void put_edit(std::vector<uint8_t>& out, const std::vector<uint32_t>& prev, const Ids& l, uint32_t lf) {
-        const size_t at = out.size();
-        out.resize(at + (prev.size() + 7) / 8, 0);
+    // The EDIT of prev into l (neither with a repeated id) sized, its ops
+    // and adds kept to write: one walk of both.
+    size_t size_edit(const std::vector<uint32_t>& prev, const Ids& l, uint32_t lf) {
+        ops_.assign((prev.size() + 7) / 8, 0);
         adds_.clear();
         size_t i = 0, j = 0;
         while (i < prev.size() || j < l.n) {
             if (j == l.n || (i < prev.size() && prev[i] < l.p[j])) {
-                out[at + i / 8] |= static_cast<uint8_t>(1u << (i % 8));  // dropped
+                ops_[i / 8] |= static_cast<uint8_t>(1u << (i % 8));  // dropped
                 i++;
             } else if (i == prev.size() || l.p[j] < prev[i]) {
                 adds_.push_back(l.p[j++]);
@@ -191,18 +247,18 @@ private:
                 j++;
             }
         }
-        cell_pairs::put_varint(out, adds_.size());
+        size_t n = ops_.size() + varint_bytes(adds_.size());
         for (size_t k = 0; k < adds_.size(); k++)
-            cell_pairs::put_varint(out, k ? uint64_t(adds_[k]) - adds_[k - 1] - 1
-                                          : cell_pairs::zigzag(int64_t(adds_[0]) - int64_t(lf)));
+            n += varint_bytes(k ? uint64_t(adds_[k]) - adds_[k - 1] - 1 : cell_pairs::zigzag(int64_t(adds_[0]) - int64_t(lf)));
+        return n;
     }
 
     size_t rows_ = 0;
     uint64_t prev_ = 0;
-    bool have_[TABLES] = {};
+    bool have_[TABLES] = {}, prev_rep_[TABLES] = {};
     uint32_t lf_[TABLES] = {};
     std::array<std::vector<uint32_t>, TABLES> prev_list_;
-    std::vector<uint8_t> plain_, edit_;
+    std::vector<uint8_t> ops_;
     std::vector<uint32_t> adds_;
 };
 
@@ -216,8 +272,9 @@ struct EncodedBlock {
 
 // Writes an index's two files front to back through top(bytes, n) and
 // blocks(bytes, n): add() each cell's lists in cell order, then finish().
-// Holds a row's bytes, the previous list of each table in the block and the
-// footer of the group it is at (64 entries).
+// Holds the previous list of each table in the block, the footer of the
+// group it is at (64 entries) and up to FLUSH_BYTES of the blocks file before
+// it hands them on.
 template <typename TopOut, typename BlocksOut>
 class Writer {
 public:
@@ -232,11 +289,12 @@ public:
             begin_block(cell);
             encoder_.start();
         }
-        row_.clear();
-        encoder_.row(row_, number, lists);
-        put_blocks(row_.data(), row_.size());
+        const size_t before = pending_.size();
+        encoder_.row(pending_, number, lists);
+        blocks_bytes_ += pending_.size() - before;
         last_ = number;
         rows_++;
+        if (pending_.size() >= FLUSH_BYTES) flush();
     }
 
     // A whole block of rows encoded by a BlockEncoder from its first row:
@@ -261,6 +319,7 @@ public:
         finished_ = true;
         if (level_ < 0) return;
         end_group();
+        flush();
         std::vector<uint8_t> footer;
         put_u64(footer, rows_);
         put_top(footer);
@@ -321,9 +380,19 @@ private:
         top_bytes_ += bytes.size();
     }
     void put_blocks(const uint8_t* p, size_t n) {
-        if (n == 0) return;
-        blocks_out_(reinterpret_cast<const char*>(p), n);
         blocks_bytes_ += n;
+        if (n >= FLUSH_BYTES) {
+            flush();
+            blocks_out_(reinterpret_cast<const char*>(p), n);
+            return;
+        }
+        pending_.append(p, n);
+        if (pending_.size() >= FLUSH_BYTES) flush();
+    }
+    void flush() {
+        if (pending_.empty()) return;
+        blocks_out_(reinterpret_cast<const char*>(pending_.data()), pending_.size());
+        pending_.clear();
     }
 
     TopOut top_out_;
@@ -332,12 +401,26 @@ private:
     int level_ = -1;
     uint64_t rows_ = 0, last_ = 0, group_first_ = 0, top_bytes_ = 0, blocks_bytes_ = 0;
     size_t group_blocks_ = 0;
-    std::vector<uint8_t> footer_, row_;
+    std::vector<uint8_t> footer_;
+    ByteBuffer pending_;
     BlockEncoder encoder_;
 };
 
 template <typename TopOut, typename BlocksOut>
 Writer(TopOut, BlocksOut) -> Writer<TopOut, BlocksOut>;
+
+// The varint at p, at least 10 bytes before the input's end, p past it; as
+// the inputs' varint() refuses one past 64 bits.
+inline uint64_t fast_varint(const uint8_t*& p) {
+    uint64_t v = 0;
+    for (int shift = 0; shift < 64; shift += 7) {
+        const uint8_t b = *p++;
+        if (shift == 63 && b > 1) break;
+        v |= uint64_t(b & 0x7F) << shift;
+        if (!(b & 0x80)) return v;
+    }
+    malformed("a varint past 64 bits");
+}
 
 // Bytes in memory, read from `pos` up to `limit` (a block's end).
 class SpanIn {
@@ -349,6 +432,12 @@ public:
         return data_[pos_++];
     }
     uint64_t varint() {
+        if (limit_ - pos_ >= 10) {
+            const uint8_t* p = data_ + pos_;
+            const uint64_t v = fast_varint(p);
+            pos_ = static_cast<uint64_t>(p - data_);
+            return v;
+        }
         uint64_t v = 0;
         for (int shift = 0; shift < 64; shift += 7) {
             const uint8_t b = byte();
@@ -388,6 +477,7 @@ public:
         return *p_++;
     }
     uint64_t varint() {
+        if (end_ - p_ >= 10) return fast_varint(p_);
         uint64_t v = 0;
         for (int shift = 0; shift < 64; shift += 7) {
             const uint8_t b = byte();
@@ -743,7 +833,7 @@ public:
         BlockDecoder decoder;
         RowLists lists;
         BlockEncoder encoder;
-        std::vector<uint8_t> bytes;
+        ByteBuffer bytes;
     };
     Scratch scratch() const { return Scratch(level_ < 0 ? MIN_LEVEL : level_); }
 
@@ -773,7 +863,7 @@ public:
         s.encoder.start();
         s.bytes.clear();
         rows_of(b, s, [&](uint64_t cell, const RowLists& l) { s.encoder.row(s.bytes, number_of(cell, level_), ids_of(l)); });
-        return s.bytes.size() == k.end - k.begin && std::equal(s.bytes.begin(), s.bytes.end(), blocks_ + k.begin);
+        return s.bytes.size() == k.end - k.begin && std::memcmp(s.bytes.data(), blocks_ + k.begin, s.bytes.size()) == 0;
     }
 
 private:
