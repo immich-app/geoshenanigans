@@ -280,6 +280,28 @@ fn lookups_in_malformed_blocks_stop_without_panicking() {
     }
 }
 
+/// A row whose edit's ops run past its block's end (the block cut short after the first of its two
+/// ops bytes): a lookup of a cell past it stops at the block's end, and one before it still reads.
+#[test]
+fn a_lookup_stepping_over_an_edit_cut_short_stops_at_the_blocks_end() {
+    // Row 0: streets {0..15} PLAIN (16 << 1, zigzag 0, 15 gaps of 0); row 1: an EDIT, one ops byte.
+    let mut blocks = vec![0x01, 0x20, 0x00];
+    blocks.extend([0u8; 15]);
+    blocks.extend([0x03, 0x00]);
+    let footer = blocks.len() as u32;
+    blocks.extend(cell(5).to_le_bytes());
+    blocks.extend(0u32.to_le_bytes());
+    let mut top = vec![b'G', b'X', b'T', b'2', 17, 64, 64, 0];
+    top.extend(cell(5).to_le_bytes());
+    top.extend(footer.to_le_bytes());
+    top.extend(2u64.to_le_bytes());
+    let index = open((top, blocks), DEFAULT_STREET_CELL_LEVEL).unwrap();
+    let mut lists = GeoLists::default();
+    index.lookup_many(&[cell(5), cell(7)], ALL_TABLES, &mut lists);
+    assert_eq!(got(&lists, 0), [(0..16).collect::<Vec<u32>>(), vec![], vec![]]);
+    assert!(got(&lists, 1).iter().all(Vec::is_empty));
+}
+
 /// A lookup of the cells the last one asked for takes their lists as they are when it decoded the
 /// tables asked for, in the same index: a subset of them, then all of them again, then the same
 /// cells in another index (another day's rows), which has lists of its own.
