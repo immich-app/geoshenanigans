@@ -1096,7 +1096,18 @@ std::string tier_summary(const ArcTier& tier, const ArcTierCounts& c) {
          << c.repair_restored << " vertices back to crossings, " << c.nesting_restored
          << " to polygons not nesting, " << c.crossings_left << " crossings left, "
          << c.unrepairable_segments << " unrepairable segments, " << c.raw_crossings
-         << " raw crossings; rings_nest: " << c.rings_nest_introduced << " polygons introduced\n";
+         << " raw crossings; rings_nest: " << c.rings_nest_introduced << " polygons introduced";
+    if (tier.coarsens())
+        line << "; coarsened from the " << tier.fine_grid_e7 << " to the " << tier.grid_e7 << " e7 grid: "
+             << c.fine_degenerate_rings << " rings degenerate and " << c.fine_crossings_left
+             << " crossings left on the fine one, " << c.coarse_rounds << " rounds keep " << c.fine_rings
+             << " collapsing rings fine (" << c.fine_junctions << " junctions, " << c.fine_arcs << " arcs), "
+             << c.crossings_coarse << " crossings before its repair, " << c.put_back_arcs
+             << " arcs of crossings and polygons not nesting put back as on the fine one in " << c.put_back_rounds
+             << " rounds, " << c.collapsed_put_back_rings << " rings collapsing or folding still ("
+             << c.folded_put_back_rings << " folding) put back in " << c.collapsed_put_back_rounds << " rounds, "
+             << c.folds_left << " rings folding left";
+    line << "\n";
     return line.str();
 }
 

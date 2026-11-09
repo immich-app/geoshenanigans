@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -154,6 +155,43 @@ TEST(patch_format_bounded_varint_rejects_bits_past_32) {
     write_varint(max, 0xFFFFFFFFu);
     pos = 0;
     CHECK_EQ(runs_reader(max.data(), max.size(), pos).varint(), 0xFFFFFFFFu);
+}
+
+// --- write_varint64 / SectionReader::varint64 ---
+
+TEST(patch_format_varint64_round_trips_every_length) {
+    // Each 7-bit boundary (the last value of n bytes, the first of n + 1), up to the 10-byte 2^64 - 1.
+    std::vector<uint64_t> values = {0, 1, 127, 128, 300000, 0xFFFFFFFFull, 0x100000000ull, ~0ull};
+    for (unsigned bits = 7; bits < 64; bits += 7) {
+        values.push_back((uint64_t{1} << bits) - 1);
+        values.push_back(uint64_t{1} << bits);
+    }
+    for (const uint64_t v : values) {
+        std::vector<char> buf;
+        write_varint64(buf, v);
+        size_t pos = 0;
+        CHECK_EQ(SectionReader(buf.data(), buf.size(), pos, "varint").varint64(), v);
+        CHECK_EQ(pos, buf.size());
+    }
+    std::vector<char> max;
+    write_varint64(max, ~0ull);
+    CHECK_EQ(max.size(), size_t(10));
+}
+
+TEST(patch_format_varint64_rejects_truncated_overlong_and_values_past_64_bits) {
+    std::vector<char> buf;
+    write_varint64(buf, 0x123456789ABCDEFull);
+    for (size_t cut = 0; cut < buf.size(); cut++) {
+        size_t pos = 0;
+        CHECK_EQ(refusal_of([&] { runs_reader(buf.data(), cut, pos).varint64(); }), std::string("Malformed runs"));
+    }
+    // An 11th byte, and a 10th byte holding a bit past bit 63 (2^64 + 5 would read as 5).
+    const char overlong[11] = {'\x80', '\x80', '\x80', '\x80', '\x80', '\x80', '\x80', '\x80', '\x80', '\x80', '\x01'};
+    const char too_big[10] = {'\x85', '\x80', '\x80', '\x80', '\x80', '\x80', '\x80', '\x80', '\x80', '\x02'};
+    for (const auto& [bytes, n] : {std::pair<const char*, size_t>{overlong, sizeof overlong}, {too_big, sizeof too_big}}) {
+        size_t pos = 0;
+        CHECK_EQ(refusal_of([&] { runs_reader(bytes, n, pos).varint64(); }), std::string("Malformed runs"));
+    }
 }
 
 // --- SectionReader ---
@@ -346,9 +384,9 @@ TEST(patch_format_section_marker_values) {
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v14 = admin geometry as arcs, merged by slot. The patcher
-    // accepts this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(14));
+    // diff/patch tools. v15 = cell list deltas as runs (v14: admin geometry as
+    // arcs, merged by slot). The patcher accepts this version only.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(15));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
@@ -1760,11 +1798,223 @@ TEST(patch_format_cell_list_delta_round_trip) {
     std::vector<char> delta;
     append_cell_list_delta(delta, old_lists, new_lists);
     CHECK(apply_delta(write_cell_lists(old_lists), delta, delta.size()) == write_cell_lists(new_lists));
-    // Unchanged cells don't travel: 3 removed; 0 / 2 / 4 / 5 / 9 set; 1 skipped.
-    uint32_t n_removed; std::memcpy(&n_removed, delta.data(), 4);
-    uint32_t n_set; std::memcpy(&n_set, delta.data() + 4 + n_removed * 8, 4);
-    CHECK_EQ(n_removed, uint32_t(1));
-    CHECK_EQ(n_set, uint32_t(5));
+    // Unchanged cells don't travel. Source ranks 1 2 3 5 -> 0 1 2 3, new ranks 0 1 2 4 5 9 -> 0 1 2 3 4 5:
+    // gone source rank 2 (cell 3); new cells 0, 4 and 9; lost 21 at rank 2 and 50 at rank 4; gained 7 at rank 0, 23 at
+    // rank 2, 40 and 41 at rank 3 and 90 at rank 5, each run (start gap, length - 1, id << 1).
+    const std::vector<uint8_t> want = {1, 2,                                                // gone: rank 2
+                                       3, 0, 3, 4,                                          // new: 0, 4 (1 + 3), 9 (5 + 4)
+                                       2, 2, 0, 42, 2, 0, 100,                              // lost
+                                       5, 0, 0, 14, 2, 0, 46, 1, 0, 80, 0, 0, 82, 2, 0, 0xB4, 0x01};  // gained
+    CHECK(std::vector<uint8_t>(delta.begin(), delta.end()) == want);
+}
+
+// The old index plus a delta of hand-written varints (each list as its values), applied: the refusal, or "" when it
+// applies.
+static std::string refusal_applying(const CellLists& old_lists, const std::vector<uint64_t>& gone, const std::vector<uint64_t>& fresh,
+                                    const std::vector<std::array<uint64_t, 3>>& lost, const std::vector<std::array<uint64_t, 3>>& gained) {
+    std::vector<char> delta;
+    for (const auto* list : {&gone, &fresh}) {
+        write_varint64(delta, list->size());
+        for (const uint64_t v : *list) write_varint64(delta, v);
+    }
+    for (const auto* runs : {&lost, &gained}) {
+        write_varint64(delta, runs->size());
+        for (const auto& r : *runs) {
+            write_varint64(delta, r[0]);
+            write_varint64(delta, r[1]);
+            write_varint(delta, static_cast<uint32_t>(r[2]));
+        }
+    }
+    return refusal_of([&] { apply_delta(write_cell_lists(old_lists), delta, delta.size()); });
+}
+
+// A polygon that leaves 800 cells in a row and becomes interior in 100 of them costs one lost and one gained run,
+// not 900 cell lists.
+TEST(patch_format_cell_list_delta_sends_a_polygon_as_runs) {
+    constexpr uint32_t INTERIOR = 0x80000000u;
+    CellLists old_lists, new_lists;
+    for (uint64_t k = 0; k < 1000; k++) {
+        old_lists[k * 4] = {3, 7};
+        new_lists[k * 4] = k < 100 || k >= 900 ? std::vector<uint32_t>{3, 7} : std::vector<uint32_t>{3};
+        if (k >= 400 && k < 500) new_lists[k * 4] = {3, 7 | INTERIOR};
+    }
+    std::vector<char> delta;
+    append_cell_list_delta(delta, old_lists, new_lists);
+    CHECK(apply_delta(write_cell_lists(old_lists), delta, delta.size()) == write_cell_lists(new_lists));
+    // No gone or new cells; lost 7 over ranks 100-899, gained 7 | INTERIOR (7 << 1 | 1) over 400-499.
+    const std::vector<uint8_t> want = {0, 0, 1, 100, 0x9F, 0x06, 14, 1, 0x90, 0x03, 99, 15};
+    CHECK(std::vector<uint8_t>(delta.begin(), delta.end()) == want);
+}
+
+// A cell list delta read as the layout has it, with this test's own reader: the gone ranks, the new cell ids, and
+// the lost and gained runs as (start, last, id), each list in order.
+struct DecodedDelta {
+    std::vector<uint64_t> gone, fresh;
+    std::vector<std::array<uint64_t, 3>> runs[2];
+};
+
+static DecodedDelta decode_delta(const std::vector<char>& delta) {
+    DecodedDelta d;
+    size_t pos = 0;
+    SectionReader in(delta.data(), delta.size(), pos, "decoded delta", PastEnd::MALFORMED);
+    for (auto* list : {&d.gone, &d.fresh}) {
+        uint64_t next = 0;
+        for (uint64_t k = in.varint64(); k > 0; k--) {
+            list->push_back(next + in.varint64());
+            next = list->back() + 1;
+        }
+    }
+    for (auto& runs : d.runs) {
+        uint64_t start = 0;
+        for (uint64_t k = in.varint64(); k > 0; k--) {
+            start += in.varint64();
+            const uint64_t last = start + in.varint64();
+            const uint32_t v = in.varint();
+            runs.push_back({start, last, (v >> 1) | (uint64_t{v & 1} << 31)});
+        }
+    }
+    if (!in.at_end()) in.malformed();
+    return d;
+}
+
+// The number of runs an id needs at a list of (rank, count) pairs: a run starts wherever its count rises.
+static uint64_t runs_needed(const std::map<uint64_t, uint32_t>& counts) {
+    uint64_t n = 0, prev_rank = 0;
+    uint32_t prev = 0;
+    for (const auto& [rank, c] : counts) {
+        const uint32_t before = rank == prev_rank + 1 ? prev : 0;
+        if (c > before) n += c - before;
+        prev_rank = rank;
+        prev = c;
+    }
+    return n;
+}
+
+// On random days with gone and new cells, interior flags, long runs and ids a list holds twice (lost once, or
+// both times): the delta applies to the new index, its runs expand to exactly the (rank, id) changes of the lists, and
+// it has as few runs as an id's counts allow.
+TEST(patch_format_cell_list_delta_runs_match_the_list_changes_on_random_days) {
+    std::mt19937 rng(20261108);
+    for (int round = 0; round < 300; round++) {
+        CellLists old_lists, new_lists;
+        const uint32_t n_ids = 1 + rng() % 12;
+        auto list = [&] {
+            std::vector<uint32_t> ids;
+            for (uint32_t id = 0; id < n_ids; id++)
+                for (uint32_t copies = rng() % 7 == 0 ? 2 : 1; copies > 0; copies--)
+                    if (rng() % 3 == 0) ids.push_back(id | (rng() % 5 == 0 ? 0x80000000u : 0));
+            std::sort(ids.begin(), ids.end());
+            return ids;
+        };
+        std::vector<uint32_t> stretch;
+        for (uint64_t cid = 0; cid < 120; cid++) {
+            if (rng() % 10 == 0) stretch = list();  // a stretch of cells listing the same ids
+            const uint32_t kind = rng() % 8;
+            if (kind != 0) old_lists[cid] = rng() % 2 ? stretch : list();
+            if (kind == 1) continue;  // gone
+            new_lists[cid] = kind == 2 || kind == 3 ? old_lists[cid] : rng() % 2 ? stretch : list();
+        }
+        std::vector<char> delta;
+        append_cell_list_delta(delta, old_lists, new_lists);
+        CHECK(apply_delta(write_cell_lists(old_lists), delta, delta.size()) == write_cell_lists(new_lists));
+
+        // The gone source ranks and the new cells; the changes by new rank: the lost and gained (id, rank) multisets
+        // of each cell's lists.
+        std::vector<uint64_t> gone, fresh;
+        uint64_t rank = 0;
+        for (const auto& kv : old_lists) {
+            if (!new_lists.count(kv.first)) gone.push_back(rank);
+            rank++;
+        }
+        for (const auto& kv : new_lists)
+            if (!old_lists.count(kv.first)) fresh.push_back(kv.first);
+        std::map<std::pair<uint32_t, uint64_t>, uint32_t> want[2];
+        rank = 0;
+        for (const auto& [cid, ids] : new_lists) {
+            auto it = old_lists.find(cid);
+            const std::vector<uint32_t> was = it == old_lists.end() ? std::vector<uint32_t>{} : it->second;
+            std::vector<uint32_t> d[2];
+            std::set_difference(was.begin(), was.end(), ids.begin(), ids.end(), std::back_inserter(d[0]));
+            std::set_difference(ids.begin(), ids.end(), was.begin(), was.end(), std::back_inserter(d[1]));
+            for (int s = 0; s < 2; s++)
+                for (const uint32_t id : d[s]) want[s][{id, rank}]++;
+            rank++;
+        }
+        const DecodedDelta d = decode_delta(delta);
+        CHECK(d.gone == gone);
+        CHECK(d.fresh == fresh);
+        for (int s = 0; s < 2; s++) {
+            std::map<std::pair<uint32_t, uint64_t>, uint32_t> got;
+            for (const auto& [start, last, id] : d.runs[s])
+                for (uint64_t k = start; k <= last; k++) got[{static_cast<uint32_t>(id), k}]++;
+            CHECK(std::is_sorted(d.runs[s].begin(), d.runs[s].end(), [](const auto& a, const auto& b) {
+                return std::tie(a[0], a[2]) < std::tie(b[0], b[2]);
+            }));
+            CHECK(got == want[s]);
+            std::map<uint32_t, std::map<uint64_t, uint32_t>> by_id;
+            for (const auto& [key, c] : want[s]) by_id[key.first][key.second] = c;
+            uint64_t needed = 0;
+            for (const auto& [id, counts] : by_id) needed += runs_needed(counts);
+            CHECK_EQ(uint64_t{d.runs[s].size()}, needed);
+        }
+    }
+}
+
+// Refused, each before the walk writes the cell it is about (the patcher drops what it wrote): a lost run over a
+// cell that doesn't hold its id, over a cell new to the index, or past the cell that holds it; the ids of the runs
+// over a cell past 0xFFFF, lost or gained (0xFFFF - 2 gained by a cell of 2 apply); a run below the previous one's
+// (start, id) (the same start, a lower id) and a new cell the source holds; a run past the new index's last rank (the
+// old index's 3 cells, one gone, so ranks 0 and 1) and a gone rank past the source's last cell. The same delta's
+// well-formed runs apply.
+TEST(patch_format_cell_list_delta_refuses_each_malformed_run) {
+    const CellLists old_lists = {{10, {1, 2}}, {20, {2, 3}}, {30, {3}}};
+    auto many = [](uint64_t n) {
+        std::vector<std::array<uint64_t, 3>> runs;
+        for (uint64_t k = 0; k < n; k++) runs.push_back({0, 0, (k + 100) << 1});
+        return runs;
+    };
+    const std::string missing = "Malformed cell list delta: a lost id missing from its cell";
+    const std::string active = "Malformed cell list delta: an active set above 65535 ids";
+    const std::string back = "Malformed cell list delta: a step back";
+    const std::string past = "Malformed cell list delta: a run past the last rank";
+    CHECK_EQ(refusal_applying(old_lists, {}, {}, {{0, 0, 3 << 1}}, {}), missing);              // 3 not in cell 10
+    CHECK_EQ(refusal_applying(old_lists, {}, {}, {{0, 0, (1 << 1) | 1}}, {}), missing);        // 1 | INTERIOR
+    CHECK_EQ(refusal_applying(old_lists, {}, {15}, {{1, 0, 2 << 1}}, {}), missing);            // new cell 15
+    CHECK_EQ(refusal_applying(old_lists, {}, {}, {{0, 1, 1 << 1}}, {}), missing);              // 1 not in cell 20
+    CHECK_EQ(refusal_applying(old_lists, {}, {}, many(0x10000), {}), active);
+    CHECK_EQ(refusal_applying(old_lists, {}, {}, {}, many(0x10000)), active);
+    CHECK_EQ(refusal_applying(old_lists, {}, {}, {}, many(0xFFFD)), std::string());  // cell 10 then lists 0xFFFF ids
+    CHECK_EQ(refusal_applying(old_lists, {}, {}, {{1, 0, 3 << 1}, {0, 0, 2 << 1}}, {}), back);
+    CHECK_EQ(refusal_applying(old_lists, {}, {}, {}, {{0, 0, 9 << 1}, {0, 0, (9 << 1) | 1}, {0, 0, 8 << 1}}), back);
+    CHECK_EQ(refusal_applying(old_lists, {}, {20}, {}, {}), back);
+    CHECK_EQ(refusal_applying(old_lists, {1}, {}, {}, {{2, 0, 5 << 1}}), past);
+    CHECK_EQ(refusal_applying(old_lists, {1}, {}, {}, {{1, 1, 5 << 1}}), past);
+    CHECK_EQ(refusal_applying(old_lists, {1}, {}, {}, {{1, 0, 5 << 1}}), std::string());
+    CHECK_EQ(refusal_applying(old_lists, {3}, {}, {}, {}), std::string("Malformed cell list delta: a gone rank past the last source cell"));
+    CHECK_EQ(refusal_applying(old_lists, {2}, {}, {}, {}), std::string());
+}
+
+// A run's ranks and the gone ranks are u64s on any size_t, so none wraps into the index on a 32-bit build: a run
+// starting at 2^32 + 1, or at 1 for 2^32 cells, is past the last rank as is one whose start or length passes 2^64 (it
+// would wrap to rank 0); a gone rank of 2^32 is past the last cell; 2^32 + 1 runs where one is (the count a 32-bit
+// size_t would wrap to 1) is a delta cut short; a new cell id past 2^64 is malformed. Each over an index of 3 cells.
+TEST(patch_format_cell_list_delta_bounds_ranks_in_64_bits) {
+    const CellLists old_lists = {{10, {1, 2}}, {20, {2, 3}}, {30, {3}}};
+    const std::string past = "Malformed cell list delta: a run past the last rank";
+    const uint64_t two32 = uint64_t{1} << 32;
+    CHECK_EQ(refusal_applying(old_lists, {}, {}, {}, {{two32 + 1, 0, 5 << 1}}), past);
+    CHECK_EQ(refusal_applying(old_lists, {}, {}, {}, {{1, two32 - 1, 5 << 1}}), past);
+    CHECK_EQ(refusal_applying(old_lists, {}, {}, {}, {{1, 0, 5 << 1}, {~0ull, 0, 6 << 1}}), past);
+    CHECK_EQ(refusal_applying(old_lists, {}, {}, {}, {{1, ~0ull, 5 << 1}}), past);
+    CHECK_EQ(refusal_applying(old_lists, {two32}, {}, {}, {}), std::string("Malformed cell list delta: a gone rank past the last source cell"));
+    CHECK_EQ(refusal_applying(old_lists, {}, {5, ~0ull - 6}, {}, {}), std::string("Malformed cell list delta"));
+    // n_gained 2^32 + 1 over one run.
+    std::vector<char> delta = {0, 0, 0};
+    write_varint64(delta, two32 + 1);
+    write_varint64(delta, 1);
+    write_varint64(delta, 0);
+    write_varint(delta, 5 << 1);
+    CHECK_EQ(refusal_of([&] { apply_delta(write_cell_lists(old_lists), delta, delta.size()); }), std::string("Malformed cell list delta"));
 }
 
 TEST(patch_format_cell_list_delta_matches_the_new_index_on_random_days) {
@@ -1875,21 +2125,6 @@ TEST(patch_format_stream_cell_index_refuses_cell_changes_out_of_order) {
         };
 
         CHECK_EQ(refusal_of(walk), std::string("Malformed cell changes"));
-    }
-}
-
-TEST(patch_format_cell_list_delta_refuses_removed_cells_out_of_order) {
-    // The delta removes, of an index of cells 7, 9 and 11, cells 9 then 7 (a
-    // step back the walk reaches at cell 11) or 11 then 9 (one past the last
-    // cell the walk asks for).
-    const auto old_index = write_cell_lists({{7, {1}}, {9, {2}}, {11, {3}}});
-    for (const std::vector<uint64_t>& removed : {std::vector<uint64_t>{9, 7}, std::vector<uint64_t>{11, 9}}) {
-        std::vector<char> delta;
-        append_u32(delta, 2);
-        for (const uint64_t cid : removed) delta.insert(delta.end(), (const char*)&cid, (const char*)&cid + 8);
-        append_u32(delta, 0);
-
-        CHECK_EQ(refusal_of([&] { apply_delta(old_index, delta, delta.size()); }), std::string("Malformed cell list delta"));
     }
 }
 

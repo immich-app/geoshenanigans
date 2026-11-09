@@ -24,6 +24,7 @@
 #include <climits>
 #include <cstdint>
 #include <functional>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
@@ -253,11 +254,34 @@ public:
     bool empty() const { return word_at_.empty(); }
     bool test(uint32_t arc, uint32_t i) const { return (words_[word_at_[arc] + i / 64] >> (i % 64)) & 1; }
     void set(uint32_t arc, uint32_t i) { words_[word_at_[arc] + i / 64] |= uint64_t(1) << (i % 64); }
+    // Arc `arc`'s marks as `from`, the marks of the same arcs, holds them.
+    void copy_arc(const ArcKeep& from, uint32_t arc) {
+        check_same_arcs(from);
+        copy_words(from, arc);
+    }
+    // copy_arc for each of `arcs`, `from`'s arcs compared with these once,
+    // for all of them, before any is copied.
+    void copy_arcs(const ArcKeep& from, const std::vector<uint32_t>& arcs) {
+        check_same_arcs(from);
+        for (uint32_t a : arcs) copy_words(from, a);
+    }
     friend bool operator==(const ArcKeep& a, const ArcKeep& b) {
         return a.word_at_ == b.word_at_ && a.words_ == b.words_;
     }
 
 private:
+    // Whether `from` marks the same arcs, as many vertices each: a compare of
+    // every arc's offset.
+    void check_same_arcs(const ArcKeep& from) const {
+        if (from.word_at_ != word_at_) throw std::logic_error("arc keep marks of other arcs");
+    }
+    // Arc `arc`'s words from `from`, which check_same_arcs passed.
+    void copy_words(const ArcKeep& from, uint32_t arc) {
+        std::copy(from.words_.begin() + static_cast<std::ptrdiff_t>(word_at_[arc]),
+                  from.words_.begin() + static_cast<std::ptrdiff_t>(word_at_[arc + 1]),
+                  words_.begin() + static_cast<std::ptrdiff_t>(word_at_[arc]));
+    }
+
     std::vector<size_t> word_at_;
     std::vector<uint64_t> words_;
 };
@@ -279,30 +303,65 @@ struct ArcTierCounts {
     size_t unrepairable_segments = 0;  // in a crossing left, with no dropped vertex
     size_t raw_crossings = 0;  // segment pairs meeting whose raw spans already meet
     size_t rings_nest_introduced = 0;  // polygons whose rings nest in exact, not here
+    // A tier that coarsens (ArcTier::coarsens), built on its fine grid first:
+    size_t fine_degenerate_rings = 0;  // rings degenerate there, which the coarsening leaves as they are
+    size_t fine_crossings_left = 0;    // crossings left there
+    size_t crossings_coarse = 0;       // segment pairs meeting once coarsened, before the repair on its own grid
+    int coarse_rounds = 0;             // rounds that keep collapsing rings fine
+    size_t fine_rings = 0;             // rings kept fine: valid on the fine grid, collapsing on the tier's
+    size_t fine_junctions = 0;         // junctions kept fine in every arc that ends there
+    size_t fine_arcs = 0;              // arcs stored on the fine grid (arc_grid), none on OSM's
+    int put_back_rounds = 0;           // rounds that put arcs back as the fine build left them
+    size_t put_back_arcs = 0;          // arcs of crossings and of polygons not nesting put back so
+    int collapsed_put_back_rounds = 0;     // last rounds that put back rings collapsing or folding still, all fine
+    size_t collapsed_put_back_rings = 0;   // the rings they put back
+    size_t folded_put_back_rings = 0;      // of them, rings with an area that fold: turned over where the fine one isn't
+    size_t folds_left = 0;                 // rings valid on the fine grid that fold still
 };
 
-// Which vertices of a simplified tier's arc stay on OSM's own e7 grid
-// instead of the tier's: its first and last (each a junction other arcs end
-// at too) and the ones between. A polygon whose rings stop nesting only once
-// snapped, with no dropped vertex to give back, keeps its arcs and their
-// junctions on the e7 grid, and so does every arc at one of those junctions
-// at that end: a junction is one point in every arc that ends there.
+// Which vertices of a simplified tier's arc are stored on another grid than
+// the tier's: its first and last (each a junction other arcs end at too) and
+// the ones between, each on OSM's own e7 grid, or else on the tier's fine
+// grid (ArcTier::fine_grid_e7).
+//
+// A polygon whose rings stop nesting only once snapped, with no dropped
+// vertex to give back, keeps its arcs and their junctions on the e7 grid,
+// and so does every arc at one of those junctions at that end: a junction is
+// one point in every arc that ends there.
+//
+// On a tier that coarsens, a junction is on the tier's grid in every arc
+// that ends there, and an arc's other vertices on the grid of the arc: the
+// tier's, or the fine one for an arc kept fine. A ring valid on the fine grid
+// that the tier's would collapse keeps its arcs fine and its junctions fine,
+// and every arc that ends at a junction kept fine is kept fine too, so that
+// it stores the junction as the others do; its other end stays on the tier's
+// grid, which the fine one holds exactly, unless that is a junction kept fine
+// too.
 namespace arc_grid {
 constexpr uint8_t kE7First = 1;
 constexpr uint8_t kE7Last = 2;
 constexpr uint8_t kE7Between = 4;
 constexpr uint8_t kE7Whole = kE7First | kE7Last | kE7Between;
+constexpr uint8_t kFineFirst = 8;
+constexpr uint8_t kFineLast = 16;
+constexpr uint8_t kFineBetween = 32;  // the arc is kept fine
+constexpr uint8_t kFineWhole = kFineFirst | kFineLast | kFineBetween;
 }  // namespace arc_grid
 
 // What a tier holds: the keep marks of a simplified tier (empty for one that
 // stores every raw vertex), each arc's arc_grid marks (empty, or one per arc
-// of a simplified tier) and its counts.
+// of a simplified tier) and its counts. A tier that coarsens holds too the
+// junctions it keeps fine (their vertex_key, ascending) and, by ring of the
+// store, which rings of its set it found valid on its fine grid: those its
+// grid must not collapse.
 struct ArcTierState {
     ArcKeep kept;
-    std::vector<uint8_t> e7_grid;
+    std::vector<uint8_t> grid;
+    std::vector<uint64_t> fine_junctions;
+    std::vector<uint8_t> fine_valid;
     ArcTierCounts counts;
 
-    uint8_t grid_of(uint32_t arc) const { return e7_grid.empty() ? 0 : e7_grid[arc]; }
+    uint8_t grid_of(uint32_t arc) const { return grid.empty() ? 0 : grid[arc]; }
 };
 
 // The arcs of every admin polygon's rings (the full set), and the minimal
@@ -467,6 +526,28 @@ std::vector<bool> exact_rings_nest(const AdminExactRings& store, unsigned thread
 // polygon whose rings still don't nest then keeps its arcs on the e7 grid
 // (arc_grid), round after round while that changes anything. A tier with no
 // tolerance keeps everything and counts nothing.
+//
+// A tier that coarsens does all that on its fine grid, notes the rings valid
+// there, then snaps every arc and junction to its own grid and keeps
+// collapsing rings fine: each of those rings that its grid leaves with under
+// 3 vertices or no area gets its arcs and its junctions fine, and every arc
+// that ends at one of those junctions is kept fine, round after round over
+// the rings of the arcs a round changed, until none collapses. Each round
+// only moves arcs and junctions to the fine grid, where every such ring is
+// valid, so it ends, and no such ring is lost. The repair then runs again on
+// the tier's own grid, every vertex it gives back on its arc's grid, keeping
+// the rings of the arcs each of its rounds changes fine where they collapse.
+// The arcs of each crossing it leaves, and of each polygon whose rings then
+// stop nesting, are put back as the fine build left them (its vertices, on
+// the fine grid, their junctions fine), round after round: two arcs put back
+// cross only where the fine build's do. Last, a ring valid on the fine grid
+// that collapses still with every arc and junction of it fine (the repair
+// gave it a vertex back that takes its area away) has its arcs put back too,
+// and so has one that folds where the fine one doesn't: it winds the other
+// way, or a loop of it split off where it comes back to a vertex winds
+// against the rest and lies outside it (a strip narrower than the grid
+// turned over, which the ring and its neighbours on both sides would all
+// cover; no crossing shows it). What that makes is put back in turn.
 // `phase_done` is told as each step ends.
 ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store, const ArcTier& tier,
                             const std::vector<bool>& nests_exact, unsigned threads,
@@ -490,15 +571,19 @@ struct StoredVertex {
 
 // The grid step, in e7 units, a tier stores raw vertex i of an arc of n
 // raw vertices on, given the arc's arc_grid marks.
-inline int32_t vertex_grid_e7(const ArcTier& tier, uint8_t e7_grid, uint32_t i, uint32_t n) {
-    const uint8_t mark = i == 0 ? arc_grid::kE7First : i + 1 == n ? arc_grid::kE7Last : arc_grid::kE7Between;
-    return (e7_grid & mark) ? 1 : tier.grid_e7;
+inline int32_t vertex_grid_e7(const ArcTier& tier, uint8_t grid, uint32_t i, uint32_t n) {
+    const bool first = i == 0, last = i + 1 == n;
+    const uint8_t e7 = first ? arc_grid::kE7First : last ? arc_grid::kE7Last : arc_grid::kE7Between;
+    const uint8_t fine = first ? arc_grid::kFineFirst : last ? arc_grid::kFineLast : arc_grid::kFineBetween;
+    return (grid & e7) ? 1 : (grid & fine) ? tier.fine_grid_e7 : tier.grid_e7;
 }
 
-// The grid exponent of a tier's block of an arc: OSM's own once any of its
-// vertices stays there.
-inline uint8_t arc_grid_exponent(const ArcTier& tier, uint8_t e7_grid) {
-    return arc_blocks::grid_exponent(e7_grid ? 1 : tier.grid_e7);
+// The grid exponent of a tier's block of an arc: the finest any of its
+// vertices is stored on.
+inline uint8_t arc_grid_exponent(const ArcTier& tier, uint8_t grid) {
+    return arc_blocks::grid_exponent((grid & arc_grid::kE7Whole)     ? 1
+                                     : (grid & arc_grid::kFineWhole) ? tier.fine_grid_e7
+                                                                     : tier.grid_e7);
 }
 
 // The vertices `tier` (as `state` holds it) stores of arc `arc` of its set:
@@ -613,9 +698,60 @@ struct AdminArcBlocks {
 // to its own grid (vertex_grid_e7, within kChunkBoxSlackE7 of them), every
 // ref names a live slot of its arc, and
 // every ring of every polygon in each set comes back exactly from its ring
-// block's refs to the exact tier's arc blocks (check_lossless). Logs its
-// counts as ARC_CHECK lines.
+// block's refs to the exact tier's arc blocks (check_lossless); and, in a
+// tier that coarsens, unless every ring valid on its fine grid is valid as
+// its arc blocks store it and every arc ending at a junction kept fine is
+// stored on the fine grid or finer. Logs its counts as ARC_CHECK lines.
 AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& store, unsigned threads);
+
+// ring_folds_over's scratch, kept from one call to the next.
+struct FoldScratch {
+    // A point beside the midpoint (lat, lon, in doubled units) of an edge
+    // that isn't on one meridian, and the edges a ray from it towards +lat
+    // crosses, each +1 running east and -1 west: north of the midpoint
+    // (crossed) and through it (through).
+    struct Probe {
+        int64_t lat, lon;
+        int crossed, through;
+    };
+    std::vector<uint64_t> keys;
+    std::vector<PackedLocation> ring, rest;  // the ring without its spikes; what is left of it split
+    std::vector<Probe> probes;
+};
+
+// Whether `ring` (each vertex once where its neighbour repeats it, without
+// the closing one) folds over itself: it winds round some point one way and
+// round another the other way. So it does where a strip narrower than the
+// grid is turned over between the two vertices its ends pinch to, a loop
+// winding against the ring outside it, which the polygon covers and so do
+// the neighbours whose borders bound it. A spur, a pinched neck, a lobe
+// inside a lobe and a hole the ring pinches off (which it winds round not at
+// all) fold nothing, wherever the ring starts. A ring that comes back to no
+// vertex folds nothing here. Its spikes taken off first (a vertex it goes
+// out to and comes back from along one line, which changes nothing it winds
+// round), split at each vertex it comes back to, the ring is loops: when
+// those with an area all wind one way, it winds round no point the other
+// way. Otherwise it is stretches from one vertex it comes back to to the
+// next, and every part of the plane it bounds lies beside one of them. Where
+// the ring meets itself only at those vertices or along whole edges, so that
+// what lies beside a stretch is the same all along it, it folds exactly
+// when it winds round a point beside one stretch's first edge off one
+// meridian one way and round a point beside another's (or the other side of
+// the same one) the other way; where it meets itself elsewhere too, an end
+// on another edge or a crossing (the repair puts those the tier's grid
+// makes back as the fine build has them), a fold it finds is still one, but
+// it may miss some. Its windings round all the probes take one pass over its
+// edges, each going only to the probes within its longitudes.
+bool ring_folds_over(const std::vector<PackedLocation>& ring, FoldScratch& scratch);
+
+// The checks tier t, one that coarsens, aborts on (std::runtime_error) over
+// its arc blocks `blocks`: every ring of its set that was valid on its fine
+// grid (ArcTierState::fine_valid) is valid as the blocks store it, of 3
+// vertices or more and an area; and every arc that ends at a junction kept
+// fine (ArcTierState::fine_junctions) is stored on the fine grid or finer, so
+// that it holds the junction where the arcs kept fine do.
+void check_coarsened_tier(const AdminArcs& arcs, const AdminExactRings& store, size_t t, const ArcBlocks& blocks,
+                          unsigned threads);
 
 // Encodes every polygon's ring block in set `set` with the set's slots
 // (ArcSetBlocks::slots), cut where its refs' planet slots say. Aborts unless

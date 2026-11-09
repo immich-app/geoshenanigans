@@ -2,7 +2,7 @@
   "schema_version": 1,
   "build": {
     "version": 18,
-    "patch_version": 14
+    "patch_version": 15
   },
   "axes": {
     "region": {
@@ -70,7 +70,7 @@
         },
         "admin-minimal": {
           "label": "Admin minimal",
-          "description": "Admin boundaries + place nodes only — no postcodes, no postcode areas. Smallest possible deployable. Country/state/city + cities500-equivalent place names.",
+          "description": "Admin boundaries (within 37.5 m, on an 11 m grid) + place nodes only — no postcodes, no postcode areas. Smallest possible deployable. Country/state/city + cities500-equivalent place names.",
           "order": 4
         }
       }
