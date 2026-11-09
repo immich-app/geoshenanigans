@@ -154,7 +154,7 @@ static void fixup_way_offsets(char* old_ways, size_t old_ways_size,
     // and rewrite its node_offset to the wrong value, perturbing OLD so
     // build_merge_seq classifies unchanged records as DELETE+INSERT and the
     // derived id_remap goes non-identity — emitting thousands of spurious
-    // entry corrections (street_entries) for data that did not change. Skip.
+    // corrections of the geo index's street lists for data that did not change. Skip.
     if (old_ways_size == new_ways_size && old_nodes_size == new_nodes_size &&
         old_ways_size > 0 &&
         memcmp(old_ways, new_ways, old_ways_size) == 0 &&
@@ -204,7 +204,7 @@ static void fixup_way_offsets(char* old_ways, size_t old_ways_size,
 // byte-identical (see fixup_way_offsets): the content-hash match can
 // otherwise rewrite an unchanged polygon's vert_offset to a colliding
 // polygon's offset, perturbing OLD and producing spurious non-identity
-// id_remaps / poi_ and addr_entries corrections on same-build diffs.
+// id_remaps / POI index and geo address list corrections on same-build diffs.
 static bool v15_fixup_skipped(const char* old_polys, size_t old_polys_size,
                               const char* old_verts, size_t old_verts_size,
                               const char* new_polys, size_t new_polys_size,
