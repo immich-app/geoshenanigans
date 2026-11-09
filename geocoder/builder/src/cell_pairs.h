@@ -133,6 +133,9 @@ inline uint64_t cell_of(uint64_t number, int level) {
 }
 // The parents of a level-L index: the cells at level L - 5.
 inline uint64_t parents_at(int level) { return uint64_t(6) << (2 * (level - LEAF_LEVELS)); }
+// The words of a bitmap of every parent at the level: past the last whole
+// one below level 8 (6, 24 and 96 parents), at least one.
+inline size_t parent_words_at(int level) { return static_cast<size_t>((parents_at(level) + 63) / 64); }
 
 inline void put_varint(std::vector<uint8_t>& out, uint64_t v) {
     for (; v >= 0x80; v >>= 7) out.push_back(static_cast<uint8_t>(v | 0x80));
@@ -302,7 +305,7 @@ private:
         if (level_ < MIN_LEVEL || level_ > MAX_LEVEL)
             throw std::runtime_error("cell_pairs::Writer: cell " + std::to_string(cell) + " is not a cell of levels " +
                                    std::to_string(MIN_LEVEL) + " to " + std::to_string(MAX_LEVEL));
-        pbits_.assign(static_cast<size_t>(parents_at(level_) / 64), 0);
+        pbits_.assign(parent_words_at(level_), 0);
         const uint8_t header[HEADER_BYTES] = {uint8_t(MAGIC[0]), uint8_t(MAGIC[1]), uint8_t(MAGIC[2]), uint8_t(MAGIC[3]),
                                               uint8_t(format_.kind), format_.flags(),
                                               uint8_t(level_), 0};
@@ -469,7 +472,7 @@ public:
             malformed("a cells file of another kind of index");
         level_ = h[6];
         if (level_ < MIN_LEVEL || level_ > MAX_LEVEL || h[7] != 0) malformed("a header past the levels it takes");
-        pbits_.assign(static_cast<size_t>(parents_at(level_) / 64), 0);
+        pbits_.assign(parent_words_at(level_), 0);
         pos_ = HEADER_BYTES;
     }
     Reader(const Reader&) = delete;

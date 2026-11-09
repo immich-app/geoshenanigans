@@ -123,6 +123,37 @@ TEST(cell_pairs_every_list_shape_reads_back_from_each_kind) {
     }
 }
 
+// Every level an index can be at (5 to 13): lists in its first and last
+// parents and those at the bitmap's word ends among them read back, and the
+// bitmap runs to the last parent's word. Below level 8 a level's parents (6,
+// 24 and 96) end inside a word.
+TEST(cell_pairs_every_level_reads_back) {
+    std::mt19937_64 rng(5);
+    for (int level = MIN_LEVEL; level <= MAX_LEVEL; level++) {
+        const uint64_t parents = parents_at(level);
+        std::vector<uint64_t> at = {0, 1, parents - 2, parents - 1};
+        for (uint64_t p : {63, 64, 65, 127, 128})
+            if (p < parents) at.push_back(p);
+        std::sort(at.begin(), at.end());
+        at.erase(std::unique(at.begin(), at.end()), at.end());
+        Lists lists;
+        for (uint64_t parent : at)
+            for (uint64_t child : {0, 1, 512, 1023}) {
+                std::vector<uint32_t> l(1 + rng() % 5);
+                for (uint32_t& id : l) id = static_cast<uint32_t>(rng() % 1000) | (rng() % 4 == 0 ? FLAG : 0);
+                std::sort(l.begin(), l.end());
+                lists.push_back({cell_of(parent << (2 * LEAF_LEVELS) | child, level), l});
+            }
+        for (Format format : FORMATS) {
+            const Files files = encode(lists, format);
+            CHECK(decode(files, format) == lists);
+            uint32_t words;
+            std::memcpy(&words, files.first.data() + files.first.size() - 4, 4);
+            CHECK_EQ(words, static_cast<uint32_t>((parents - 1) / 64 + 1));
+        }
+    }
+}
+
 // The Writer's bytes for small indexes of each kind, which the server's tests
 // read and its fixture writer writes. ADMIN: a block of a PLAIN row, a SAME
 // row, an EDIT (9 toggled, 12 added) and a row repeating an id, then an empty

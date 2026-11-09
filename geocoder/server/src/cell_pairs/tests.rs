@@ -75,6 +75,40 @@ fn every_list_shape_reads_back_from_each_kind() {
     }
 }
 
+/// Every level an index can be at (5 to 13): lists in its first and last parents and those at the
+/// bitmap's word ends among them read back at that level. Below level 8 a level's parents (6, 24
+/// and 96) end inside a word.
+#[test]
+fn every_level_reads_back() {
+    let mut rng = Rng::new(5);
+    for level in MIN_LEVEL..=MAX_LEVEL {
+        let parents = 6u64 << (2 * (level - LEAF_LEVELS));
+        let mut at = vec![0, 1, parents - 2, parents - 1];
+        at.extend([63, 64, 65, 127, 128].into_iter().filter(|&p| p < parents));
+        at.sort_unstable();
+        at.dedup();
+        let mut lists: Vec<(u64, Vec<u32>)> = Vec::new();
+        for &parent in &at {
+            for child in [0u64, 1, 512, 1023] {
+                let mut l: Vec<u32> = (0..1 + rng.next() % 5)
+                    .map(|_| (rng.next() % 1000) as u32 | if rng.next() % 4 == 0 { FLAG } else { 0 })
+                    .collect();
+                l.sort_unstable();
+                let n = parent << (2 * LEAF_LEVELS) | child;
+                lists.push((n << (61 - 2 * level) | 1 << (60 - 2 * level), l));
+            }
+        }
+        for format in FORMATS {
+            let (cells, entries) = write(&lists, format);
+            let pairs = CellPairs::open(FileBytes::Owned(cells), FileBytes::Owned(entries), format, level)
+                .unwrap_or_else(|e| panic!("{format:?} at level {level}: {e}"));
+            for (c, l) in &lists {
+                assert_eq!(&pairs.ids(*c), l, "{format:?} at level {level}, cell {c:#x}");
+            }
+        }
+    }
+}
+
 #[test]
 fn an_index_of_no_cells_is_two_empty_files() {
     for format in FORMATS {

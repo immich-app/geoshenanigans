@@ -78,6 +78,12 @@ thread_local! {
     static SCRATCH: Cell<(Vec<u32>, Vec<u32>)> = const { Cell::new((Vec::new(), Vec::new())) };
 }
 
+/// The words of a bitmap of every parent (cell 5 levels up) at `level`: past the last whole one
+/// below level 8 (6, 24 and 96 parents), at least one.
+fn parent_words_at(level: u64) -> usize {
+    (6u64 << (2 * (level - LEAF_LEVELS))).div_ceil(64) as usize
+}
+
 #[inline(always)]
 fn rd32(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
@@ -183,7 +189,7 @@ impl CellPairs {
         let n = c.len();
         let records = rd32(c, n - 8) as usize;
         let pwords = rd32(c, n - 4) as usize;
-        let max_words = ((6u64 << (2 * (level - LEAF_LEVELS))) / 64) as usize;
+        let max_words = parent_words_at(level);
         if pwords == 0 || pwords > max_words || records == 0 {
             return bad("a footer past its index");
         }
@@ -555,7 +561,7 @@ pub fn write(lists: &[(u64, Vec<u32>)], format: Format) -> (Vec<u8>, Vec<u8>) {
     let shift = 61 - 2 * level as u32;
     cells.extend_from_slice(MAGIC);
     cells.extend_from_slice(&[format.kind as u8, format.flags(), level as u8, 0]);
-    let mut pbits = vec![0u64; ((6u64 << (2 * (level - LEAF_LEVELS))) / 64) as usize];
+    let mut pbits = vec![0u64; parent_words_at(level)];
     let mut dir = Vec::new();
     let mut prev: Option<(&Vec<u32>, u32)> = None; // direct: the row before and its offset
     let mut i = 0;
