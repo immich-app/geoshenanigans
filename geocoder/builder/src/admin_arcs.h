@@ -256,16 +256,32 @@ public:
     void set(uint32_t arc, uint32_t i) { words_[word_at_[arc] + i / 64] |= uint64_t(1) << (i % 64); }
     // Arc `arc`'s marks as `from`, the marks of the same arcs, holds them.
     void copy_arc(const ArcKeep& from, uint32_t arc) {
-        if (from.word_at_ != word_at_) throw std::logic_error("arc keep marks of other arcs");
-        std::copy(from.words_.begin() + static_cast<std::ptrdiff_t>(word_at_[arc]),
-                  from.words_.begin() + static_cast<std::ptrdiff_t>(word_at_[arc + 1]),
-                  words_.begin() + static_cast<std::ptrdiff_t>(word_at_[arc]));
+        check_same_arcs(from);
+        copy_words(from, arc);
+    }
+    // copy_arc for each of `arcs`, `from`'s arcs compared with these once,
+    // for all of them, before any is copied.
+    void copy_arcs(const ArcKeep& from, const std::vector<uint32_t>& arcs) {
+        check_same_arcs(from);
+        for (uint32_t a : arcs) copy_words(from, a);
     }
     friend bool operator==(const ArcKeep& a, const ArcKeep& b) {
         return a.word_at_ == b.word_at_ && a.words_ == b.words_;
     }
 
 private:
+    // Whether `from` marks the same arcs, as many vertices each: a compare of
+    // every arc's offset.
+    void check_same_arcs(const ArcKeep& from) const {
+        if (from.word_at_ != word_at_) throw std::logic_error("arc keep marks of other arcs");
+    }
+    // Arc `arc`'s words from `from`, which check_same_arcs passed.
+    void copy_words(const ArcKeep& from, uint32_t arc) {
+        std::copy(from.words_.begin() + static_cast<std::ptrdiff_t>(word_at_[arc]),
+                  from.words_.begin() + static_cast<std::ptrdiff_t>(word_at_[arc + 1]),
+                  words_.begin() + static_cast<std::ptrdiff_t>(word_at_[arc]));
+    }
+
     std::vector<size_t> word_at_;
     std::vector<uint64_t> words_;
 };

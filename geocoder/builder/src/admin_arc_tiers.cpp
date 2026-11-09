@@ -937,10 +937,8 @@ private:
     std::vector<uint32_t> put_back(std::vector<uint32_t> arcs, ArcTierCounts& counts) {
         sort_unique(arcs, threads_);
         arcs.erase(std::remove_if(arcs.begin(), arcs.end(), [&](uint32_t a) { return put_back_[a] != 0; }), arcs.end());
-        for (uint32_t a : arcs) {
-            keep_.copy_arc(fine_keep_, a);
-            put_back_[a] = 1;
-        }
+        keep_.copy_arcs(fine_keep_, arcs);
+        for (uint32_t a : arcs) put_back_[a] = 1;
         counts.put_back_arcs += arcs.size();
         std::vector<uint32_t> changed = keep_fine(arcs);
         changed.insert(changed.end(), arcs.begin(), arcs.end());

@@ -813,3 +813,27 @@ TEST(an_arc_keeps_copy_takes_one_arcs_marks_from_another_of_the_same_arcs) {
     const ArcKeep other(3, [](size_t) { return 7u; });
     CHECK(refusal_of<std::logic_error>([&] { to.copy_arc(other, 0); }).find("other arcs") != std::string::npos);
 }
+
+TEST(an_arc_keeps_copy_of_a_list_takes_each_listed_arcs_marks_and_refuses_other_arcs_before_any) {
+    auto sizes = [](size_t a) { return a % 2 ? 130u : 7u; };
+    ArcKeep from(5, sizes), to(5, sizes);
+    for (uint32_t a = 0; a < 5; a++)
+        for (uint32_t i : {0u, 6u}) from.set(a, i);
+    for (uint32_t i : {63u, 64u, 129u}) from.set(3, i);
+    to.set(1, 64);
+    to.set(2, 5);
+    to.copy_arcs(from, {1, 3, 4});
+    for (uint32_t a : {1u, 3u})
+        for (uint32_t i = 0; i < 130; i++) CHECK_EQ(to.test(a, i), from.test(a, i));
+    for (uint32_t i = 0; i < 7; i++) CHECK_EQ(to.test(4, i), from.test(4, i));
+    // The arcs not listed keep their own marks.
+    for (uint32_t i = 0; i < 7; i++) CHECK_EQ(to.test(0, i), false);
+    for (uint32_t i = 0; i < 7; i++) CHECK_EQ(to.test(2, i), i == 5);
+    // Marks of other arcs: refused before any arc is copied, and for an
+    // empty list too.
+    const ArcKeep other(5, [](size_t) { return 130u; });
+    const ArcKeep was = to;
+    CHECK(refusal_of<std::logic_error>([&] { to.copy_arcs(other, {0, 2}); }).find("other arcs") != std::string::npos);
+    CHECK(to == was);
+    CHECK(refusal_of<std::logic_error>([&] { to.copy_arcs(other, {}); }).find("other arcs") != std::string::npos);
+}
