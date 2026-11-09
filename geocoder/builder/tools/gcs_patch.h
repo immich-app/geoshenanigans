@@ -26,7 +26,6 @@ static const std::vector<FamilyDesc>& families() {
         {"way_parents", {"way_parents.bin"}},
         {"way_postcodes", {"way_postcodes.bin"}},
         {"interp_postcodes", {"interp_postcodes.bin"}},
-        {"gxc", {"geo_cells.bin", "street_entries.bin", "addr_entries.bin", "interp_entries.bin"}},
         {"addr", {"addr_points.bin", "addr_vertices.bin"}},
         {"poi", {"poi_records.bin", "poi_vertices.bin"}},
     };
@@ -137,7 +136,6 @@ struct Store {
             else if (f == "interps") d = new ways::Dec(s, false, old_m);
             else if (f == "way_parents") d = new side::U24Dec(s, old_m);
             else if (f == "way_postcodes" || f == "interp_postcodes") d = new side::DictDec(s, f, old_m);
-            else if (f == "gxc") d = new gxc::Dec(s, old_m);
             else if (f == "addr") d = new addr::Dec(s, old_m);
             else if (f == "poi") d = new poly::PoiDec(s, old_m);
             else die("no decoder for %s", f.c_str());
@@ -156,7 +154,6 @@ struct Store {
             else if (f == "interps") e = new ways::Enc(o, false);
             else if (f == "way_parents") e = new side::U24Enc(o);
             else if (f == "way_postcodes" || f == "interp_postcodes") e = new side::DictEnc(o, f);
-            else if (f == "gxc") e = new gxc::Enc(o);
             else if (f == "addr") {
                 auto it = expect_out.find("addr_points.bin");
                 if (it == expect_out.end()) die("addr: the patch lists no addr_points.bin size");

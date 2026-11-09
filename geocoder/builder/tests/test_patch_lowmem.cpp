@@ -791,27 +791,6 @@ TEST(patch_lowmem_drops_the_child_bytes_of_deleted_and_replaced_records) {
     }
 }
 
-// The same for the geo index: the lists of a removed stretch of cells (4 MiB
-// of street lists).
-TEST(patch_lowmem_drops_the_lists_of_removed_cells) {
-    ScratchDir dir("lowmem-geo");
-    std::vector<GeoRow> rows, kept;
-    for (uint32_t k = 0; k < 20000; k++) {
-        std::vector<uint32_t> ids(50);
-        for (uint32_t i = 0; i < 50; i++) ids[i] = k % 950 + i;
-        rows.push_back({k, ids});
-    }
-    kept.assign(rows.begin(), rows.begin() + 1000);
-    kept.insert(kept.end(), rows.begin() + 19000, rows.end());
-    BuildDir old_d, new_d;
-    put_geo(old_d, rows);
-    put_geo(new_d, kept);
-    const LowMemCase c{dir.path(), "removed-cells"};
-    REQUIRE(prepare(c, old_d, new_d).empty());
-
-    CHECK(apply_both_modes(c, decoder_peaks_at_most("gxc", DECODER_HOLD)).empty());
-}
-
 // The first nightly without unnamed POIs tombstoned 24,543 contiguous planet
 // poi/all records in place. The POIs after the run stay one MATCH run, so
 // the patch carries the run's tombstones but not those POIs, and the dead

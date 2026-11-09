@@ -1211,13 +1211,8 @@ static int run(int argc, char* argv[]) {
         // Write entry and return offset, or NO if empty. Offsets come from a
         // running count per output: ftell per list cost ~40 s of client CPU
         // on planet (~460M lists).
-        // Encoded set: the four streams flush as a group whenever one of them would (lists, then
-        // rows), so the encoder always has every list of the rows it is handed and holds at most
-        // the lists of the cell in progress.
-        auto gflush = [&] { for (FILE* f : {o_se.f, o_ae.f, o_ie.f, f_geo}) fflush(f); };
         auto emit = [&](EntriesOut& out, const uint32_t* ids, size_t n) -> uint32_t {
             if (n == 0) return NO;
-            if (gcs::store().active && __fpending(out.f) + 2 + n * 4 > gcs::Store::SINK_BUF) gflush();
             uint32_t off = (uint32_t)out.written;
             // One libc call per list: the u16 count goes into the stream's buffer in place.
             const uint16_t c = (uint16_t)n;
@@ -1257,7 +1252,6 @@ static int run(int argc, char* argv[]) {
             memcpy(rec + 8, &so, 4);
             memcpy(rec + 12, &ao, 4);
             memcpy(rec + 16, &io, 4);
-            if (gcs::store().active && __fpending(f_geo) + sizeof rec > gcs::Store::SINK_BUF) gflush();
             fwrite(rec, sizeof rec, 1, f_geo);
             cells_written++;
         };
@@ -1276,16 +1270,7 @@ static int run(int argc, char* argv[]) {
             if (!added.done()) add_cid = added.front();
 
             if (old_cid <= add_cid) {
-                if (!removed.skip_to(old_cid)) {
-                    process_cell(old_cid, old_offs);
-                } else {
-                    // An encoded set's lists come in row order: those before a removed row's are
-                    // never read, and the gxc decoder drops them instead of queueing a removed
-                    // stretch's lists for the next row kept.
-                    SequentialFileReader* es[3] = {&old_se, &old_ae, &old_ie};
-                    for (int t = 0; t < 3; t++)
-                        if (old_offs[size_t(t)] != NO) es[t]->skip_to(old_offs[size_t(t)]);
-                }
+                if (!removed.skip_to(old_cid)) process_cell(old_cid, old_offs);
                 old_i++;
                 if (!added.done() && old_cid == add_cid) added.pop(); // skip duplicate add
             } else {
