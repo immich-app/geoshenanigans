@@ -783,6 +783,12 @@ pub struct StringPool {
     pub bases: [u32; STR_TIER_COUNT + 1],
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The strings `StringPool::get` has read on this thread, for tests that count a lookup's reads.
+    static STRING_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl StringPool {
     /// Construct directly from tier buffers + parsed bases.  Used by
     /// the loader (which mmaps then wraps).
@@ -822,6 +828,8 @@ impl StringPool {
     }
 
     pub fn get(&self, offset: u32) -> &str {
+        #[cfg(test)]
+        STRING_READS.with(|n| n.set(n.get() + 1));
         if offset == NO_DATA { return ""; }
         for t in 0..STR_TIER_COUNT {
             if offset < self.bases[t + 1] {
@@ -2451,8 +2459,6 @@ impl Index {
                 let is_interior = c == cell && (id & INTERIOR_FLAG) != 0;
                 let poi_id = (id & ID_MASK) as u32;
                 let Some(poi) = self.poi_record(poi_id) else { return; };
-                let name = self.get_string(poi.name_id);
-                if name.is_empty() { return; }
 
                 let ref_dist = self.poi_meta.reference_distance(poi.category);
                 let importance = if poi.importance > 0 {
@@ -2542,6 +2548,10 @@ impl Index {
                 };
                 let score = importance * proximity_weight;
                 if score < 0.5 { return; }
+                // Read the name only now: none of the filters above needs it, and most
+                // candidates fail one of them.
+                let name = self.get_string(poi.name_id);
+                if name.is_empty() { return; }
 
                 results.push(PoiMatch {
                     name,
@@ -2837,6 +2847,9 @@ impl Index {
                 let dlng = (lng - pc.lng as f64).to_radians();
                 let d = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
                 if d >= max_dist_sq { return; }
+                // A centroid farther than the best so far can't win (nearer_postcode), so its
+                // postcode isn't read.
+                if best.is_some_and(|(best_d, _)| d > best_d) { return; }
                 let s = self.get_string(pc.postcode_id);
                 if centroid_postcode_ok(s) && nearer_postcode(d, s, best) {
                     best = Some((d, s));
@@ -3912,6 +3925,195 @@ mod query_tests {
 
         assert_eq!(village(elsewhere), None);
         assert_eq!(village(AdminPolygon { ring_bytes: 0, ..elsewhere }), Some("Shoals Village"));
+    }
+
+    /// (metres north of `origin()`, metres east, name or None for a tombstone, category,
+    /// importance) of a point POI.
+    type Poi<'a> = (f64, f64, Option<&'a str>, u8, u8);
+    /// (metres north of `origin()`, metres east, postcode, country code or [0, 0]) of a postcode
+    /// centroid.
+    type Centroid<'a> = (f64, f64, &'a str, [u8; 2]);
+
+    /// The centre of an admin cell in Paris.
+    fn origin() -> (f64, f64) {
+        let centre = LatLng::from(CellID(cell_id_at_level(48.8566, 2.3522, DEFAULT_ADMIN_CELL_LEVEL)));
+        (centre.lat.deg(), centre.lng.deg())
+    }
+
+    /// The point `north` and `east` metres from `origin()`.
+    fn at(north: f64, east: f64) -> (f64, f64) {
+        let (lat, lng) = origin();
+        let per_degree = 6_371_000.0_f64.to_radians();
+        (lat + north / per_degree, lng + east / (per_degree * lat.to_radians().cos()))
+    }
+
+    /// The POI categories of `pois_and_centroids`: 100 m reference distance, 500 m max distance,
+    /// importance 5.
+    const POI_META: &str = r#"{"0": {"name": "cafe", "max_distance": 500}, "1": {"name": "museum", "max_distance": 500},
+        "2": {"name": "fountain", "max_distance": 500}, "60": {"name": "park", "max_distance": 500},
+        "93": {"name": "island", "max_distance": 500}}"#;
+
+    /// An index of point POIs (of POI_META's categories) and postcode centroids only, all in
+    /// `origin()`'s cell, so its cell lists hold them in record order.
+    fn pois_and_centroids(pois: &[Poi<'_>], centroids: &[Centroid<'_>]) -> Index {
+        let own = cell_id_at_level(origin().0, origin().1, DEFAULT_ADMIN_CELL_LEVEL);
+        let cell = |(lat, lng): (f64, f64)| {
+            assert_eq!(cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL), own, "({lat}, {lng})");
+            own
+        };
+        let mut strings = Vec::new();
+        let mut string = |s: &str| {
+            let id = strings.len() as u32;
+            strings.extend_from_slice(s.as_bytes());
+            strings.push(0);
+            id
+        };
+        let (mut records, mut poi_pairs) = (Vec::new(), Vec::new());
+        for (id, &(north, east, name, category, importance)) in pois.iter().enumerate() {
+            let (lat, lng) = at(north, east);
+            records.extend_from_slice(&(lat as f32).to_le_bytes());
+            records.extend_from_slice(&(lng as f32).to_le_bytes());
+            u32s(&mut records, &[NO_DATA, 0, name.map_or(NO_DATA, &mut string)]);
+            records.extend_from_slice(&[category, 0, 0, importance]);
+            u32s(&mut records, &[NO_DATA, NO_DATA, NO_DATA]);
+            poi_pairs.push((cell((lat, lng)), id as u32));
+        }
+        assert_eq!(records.len(), pois.len() * std::mem::size_of::<PoiRecord>());
+        let (mut centroid_records, mut centroid_pairs) = (Vec::new(), Vec::new());
+        for (id, &(north, east, postcode, country)) in centroids.iter().enumerate() {
+            let (lat, lng) = at(north, east);
+            centroid_records.extend_from_slice(&(lat as f32).to_le_bytes());
+            centroid_records.extend_from_slice(&(lng as f32).to_le_bytes());
+            u32s(&mut centroid_records, &[string(postcode)]);
+            centroid_records.extend_from_slice(&u16::from_be_bytes(country).to_le_bytes());
+            centroid_records.extend_from_slice(&[0, 0]);
+            centroid_pairs.push((cell((lat, lng)), id as u32));
+        }
+        assert_eq!(centroid_records.len(), centroids.len() * std::mem::size_of::<PostcodeCentroid>());
+        let ((poi_cells, poi_entries), (centroid_cells, centroid_entries)) = (cell_index(poi_pairs), cell_index(centroid_pairs));
+        let end = strings.len() as u32;
+        Index {
+            poi_cells: Some(poi_cells),
+            poi_entries: Some(poi_entries),
+            poi_records: Some(FileBytes::Owned(records)),
+            poi_meta: PoiMeta::from_json(POI_META),
+            postcode_centroids: Some(FileBytes::Owned(centroid_records)),
+            postcode_centroid_cells: Some(centroid_cells),
+            postcode_centroid_entries: Some(centroid_entries),
+            strings: StringPool::from_parts([Some(FileBytes::Owned(strings)), None, None, None, None], [0, end, end, end, end, end]),
+            ..index(&[], &[])
+        }
+    }
+
+    /// `f`'s result and the number of strings it read.
+    fn reads<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        let before = STRING_READS.with(|n| n.get());
+        let got = f();
+        (got, STRING_READS.with(|n| n.get()) - before)
+    }
+
+    #[test]
+    fn a_poi_name_is_read_only_once_the_poi_passes_every_filter() {
+        // Cafes (category 0) and a museum (1), with POI_META's distances and importance.
+        let idx = pois_and_centroids(&[
+            (50.0, 0.0, Some("Kept"), 0, 0),
+            (2000.0, 0.0, Some("Too far"), 0, 0),  // past 550 m, the max at importance 5
+            (50.0, 0.0, Some("Island"), 93, 0),    // islands never list
+            (400.0, 0.0, Some("Faint"), 0, 1),     // scores 1 / (1 + 4²), under 0.5
+            (60.0, 0.0, Some(""), 0, 0),           // passes every filter, but has no name
+            (120.0, 0.0, Some("Also kept"), 1, 0),
+        ], &[]);
+
+        let (names, read) = reads(|| idx.find_pois(origin().0, origin().1).iter().map(|p| p.name).collect::<Vec<_>>());
+
+        assert_eq!(names, ["Kept", "Also kept"]);
+        assert_eq!(read, 3);
+    }
+
+    #[test]
+    fn a_centroid_farther_than_the_best_so_far_leaves_its_postcode_unread() {
+        // Read in record order.
+        let idx = pois_and_centroids(&[], &[
+            (1000.0, 0.0, "75001", *b"fr"),
+            (2000.0, 0.0, "75002", *b"fr"),  // farther: not read
+            (1000.0, 0.0, "75003", *b"fr"),  // as near, a larger postcode
+            (500.0, 0.0, "75;04", *b"fr"),   // nearer, not a postcode
+            (300.0, 0.0, "10115", *b"de"),   // another country's: not read
+            (1000.0, 0.0, "75000", *b"fr"),  // as near, a smaller postcode: the answer
+            (1500.0, 0.0, "75005", *b"fr"),  // farther: not read
+        ]);
+
+        let (postcode, read) = reads(|| idx.resolve_postcode(origin().0, origin().1, None, None, None, None, Some(*b"fr")));
+
+        assert_eq!(postcode, Some("75000"));
+        assert_eq!(read, 4);
+    }
+
+    #[test]
+    fn every_poi_name_and_postcode_answers_as_reading_them_all_would() {
+        // A jumble on a 300 m grid, so centroids coincide and tie: POIs of every filter's kind,
+        // one in five without a name, and centroids of three countries (one none), some with no
+        // valid postcode.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut pick = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let grid = |k: usize| (k as f64 - 5.0) * 300.0;
+        let names: Vec<String> = (0..40).map(|k| format!("Lieu {k}")).collect();
+        let pois: Vec<Poi<'_>> = (0..300).map(|_| {
+            let (north, east) = (grid(pick(11)), grid(pick(11)));
+            let name = if pick(5) == 0 { "" } else { names[pick(names.len())].as_str() };
+            (north, east, Some(name), [0, 1, 2, 60, 93][pick(5)], [0, 1, 20, 100][pick(4)])
+        }).collect();
+        let postcodes = ["75001", "75002", "75003", "75004", "75005", "", "75;06", "75001-2345", "10115"];
+        let centroids: Vec<Centroid<'_>> = (0..300).map(|_| {
+            let (north, east) = (grid(pick(11)), grid(pick(11)));
+            (north, east, postcodes[pick(postcodes.len())], [*b"fr", *b"de", [0, 0]][pick(3)])
+        }).collect();
+        // Reading every name first drops a nameless POI before any filter, as a tombstone is.
+        let tombstoned: Vec<Poi<'_>> = pois.iter().map(|&(n, e, name, c, i)| (n, e, name.filter(|s| !s.is_empty()), c, i)).collect();
+        let (idx, eager) = (pois_and_centroids(&pois, &centroids), pois_and_centroids(&tombstoned, &centroids));
+        fn listed(idx: &Index, lat: f64, lng: f64) -> Vec<(&str, u8, u64, bool, bool, u64, u64)> {
+            idx.find_pois(lat, lng).iter()
+                .map(|p| (p.name, p.category_id, p.distance_m.to_bits(), p.contained, p.is_point, p.score.to_bits(), p.area.to_bits()))
+                .collect()
+        }
+        // Reading every centroid's postcode: the nearest valid one of the country, or of none,
+        // ties to the smaller postcode; and whether another postcode is as near.
+        let nearest = |lat: f64, lng: f64, country: Option<[u8; 2]>| {
+            let cos_lat = lat.to_radians().cos();
+            let mut found: Vec<(f64, &str)> = centroids.iter()
+                .filter(|c| country.is_none_or(|cc| c.3 == [0, 0] || c.3 == cc))
+                .filter_map(|&(north, east, postcode, _)| {
+                    let (c_lat, c_lng) = at(north, east);
+                    let dlat = (lat - c_lat as f32 as f64).to_radians();
+                    let dlng = (lng - c_lng as f32 as f64).to_radians();
+                    let d = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
+                    (d < 0.05_f64.to_radians().powi(2) && centroid_postcode_ok(postcode)).then_some((d, postcode))
+                })
+                .collect();
+            found.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)));
+            let tied = found.len() > 1 && found[0].0 == found[1].0 && found[0].1 != found[1].1;
+            (found.first().map(|&(_, s)| s), tied)
+        };
+
+        // The nameless POIs that pass every filter, and the answers another postcode ties.
+        let (mut nameless, mut tied) = (0, 0);
+        for (north, east) in pois.iter().map(|p| (p.0, p.1)).chain(centroids.iter().map(|c| (c.0, c.1))) {
+            let (lat, lng) = at(north, east);
+            let ((got, read), (want, read_named)) = (reads(|| listed(&idx, lat, lng)), reads(|| listed(&eager, lat, lng)));
+            assert_eq!(got, want, "({lat}, {lng})");
+            nameless += read - read_named;
+            for country in [None, Some(*b"fr"), Some(*b"de")] {
+                let (want, tie) = nearest(lat, lng, country);
+                assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, country), want, "({lat}, {lng}) {country:?}");
+                tied += usize::from(tie);
+            }
+        }
+        assert!(nameless > 1000 && tied > 500, "{nameless} {tied}");
     }
 }
 
