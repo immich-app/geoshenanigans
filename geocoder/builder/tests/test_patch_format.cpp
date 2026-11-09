@@ -3,6 +3,7 @@
 // fingerprint quantiser, and the stride/marker sentinel constants so a future
 // refactor of the patch tooling can't silently shift them (the constants are
 // load-bearing: diff and patch must agree on them byte-for-byte).
+#include "cell_index_io.h"
 #include "patch_format.h"
 #include "scratch_dir.h"
 
@@ -1717,46 +1718,43 @@ TEST(patch_format_parent_id_remap_refuses_a_leg_out_of_order_or_cut_short) {
 
 // --- cell index rebuild from an id remap ---
 
-static void append_u32(std::vector<char>& buf, uint32_t v) { buf.insert(buf.end(), (const char*)&v, (const char*)&v + 4); }
+// The level-10 cell of number n: the cell pair files hold cells of one level.
+static uint64_t c10(uint64_t n) { return cell_pairs::cell_of(n, 10); }
 
-// One cell holding `ids`, as cells (cell_id, offset) + entries (count, ids).
-static std::pair<std::vector<char>, std::vector<char>> one_cell(uint64_t cell_id, const std::vector<uint32_t>& ids) {
-    std::vector<char> cells((const char*)&cell_id, (const char*)&cell_id + 8), entries;
-    append_u32(cells, 0);
-    uint16_t n = static_cast<uint16_t>(ids.size());
-    entries.insert(entries.end(), (const char*)&n, (const char*)&n + 2);
-    for (uint32_t id : ids) append_u32(entries, id);
-    return {cells, entries};
-}
-
-static std::vector<uint32_t> ids_of_first_cell(const std::vector<char>& cells, const std::vector<char>& entries) {
-    uint32_t off; std::memcpy(&off, cells.data() + 8, 4);
-    uint16_t n; std::memcpy(&n, entries.data() + off, 2);
-    std::vector<uint32_t> ids(n);
-    if (!ids.empty()) std::memcpy(ids.data(), entries.data() + off + 2, n * 4);
-    return ids;
+// lists by cell number, at their level-10 cells.
+static CellLists at10(const CellLists& lists) {
+    CellLists out;
+    for (const auto& [n, ids] : lists) out.emplace_hint(out.end(), c10(n), ids);
+    return out;
 }
 
 TEST(patch_format_empty_cell_lists_round_trip) {
-    // An emptied cell keeps a count-0 list; parsing and rebuilding it copy
+    // An emptied cell keeps an empty list; parsing and rebuilding it copy
     // no ids (its vector's data() is null).
-    auto [cells, entries] = write_cell_lists({{7, {}}, {9, {4}}});
-    CHECK(parse_cell_lists(cells, entries) == CellLists({{7, {}}, {9, {4}}}));
-    auto [one_c, one_e] = one_cell(42, {});
-    auto rebuilt = rebuild_cells_from_remap(one_c, one_e, {{3, 2}});
-    // The cell stays, with a NO_DATA offset and no list written.
-    CHECK(parse_cell_lists(rebuilt.cells_data, rebuilt.entries_data) == CellLists({{42, {}}}));
-    CHECK(rebuilt.entries_data.empty());
+    for (cell_pairs::Format format : {cell_pairs::ADMIN, cell_pairs::POI, cell_pairs::POSTCODE_CENTROID}) {
+        auto [cells, entries] = write_cell_lists(at10({{7, {}}, {9, {4}}}), format);
+        CHECK(parse_cell_lists(cells, entries, format) == at10({{7, {}}, {9, {4}}}));
+    }
+    // The cell stays, with its list empty.
+    CHECK(rebuild_cell_lists(at10({{42, {}}}), {{3, 2}}) == at10({{42, {}}}));
+    CHECK(rebuild_cell_lists({}, {{3, 2}}).empty());
 }
 
 TEST(patch_format_rebuild_cells_remaps_interior_entries) {
     // Interior entries carry INTERIOR_FLAG in the top bit; the remap is keyed
     // by the bare id and the flag survives it.
     const uint32_t interior = 0x80000000u;
-    auto [cells, entries] = one_cell(42, {3 | interior, 5});
     const std::unordered_map<uint32_t, uint32_t> rm = {{3, 2}, {5, 4}};
-    auto rebuilt = rebuild_cells_from_remap(cells, entries, rm);
-    CHECK(ids_of_first_cell(rebuilt.cells_data, rebuilt.entries_data) == std::vector<uint32_t>({4, 2 | interior}));
+    CHECK(rebuild_cell_lists(at10({{42, {3 | interior, 5}}}), rm) == at10({{42, {4, 2 | interior}}}));
+}
+
+TEST(patch_format_rebuild_cells_drops_removed_and_adds_empty_cells) {
+    // Removed cells go, added ones come with empty lists; a cell the old index
+    // holds can't be added, as the patcher's walk refuses it (removed or not).
+    const CellLists old = at10({{1, {5}}, {2, {6}}, {3, {7}}});
+    CHECK(rebuild_cell_lists(old, {}, {c10(0), c10(4)}, {c10(2)}) == at10({{0, {}}, {1, {5}}, {3, {7}}, {4, {}}}));
+    CHECK_EQ(refusal_of([&] { rebuild_cell_lists(old, {}, {c10(3)}); }), std::string("Malformed cell index"));
+    CHECK_EQ(refusal_of([&] { rebuild_cell_lists(old, {}, {c10(3)}, {c10(3)}); }), std::string("Malformed cell index"));
 }
 
 // --- cell list delta ---
@@ -1765,31 +1763,47 @@ static void write_bytes(const std::string& path, const std::vector<char>& bytes)
     std::ofstream(path, std::ios::binary).write(bytes.data(), bytes.size());
 }
 
-TEST(patch_format_cell_lists_write_the_cell_index_layout) {
-    // Cells sorted by id with contiguous entry offsets; entries are
-    // (u16 count, ids). Matches write_cell_index.
-    auto [cells, entries] = write_cell_lists({{9, {4}}, {7, {1, 2}}});
-    auto [one_c, one_e] = one_cell(7, {1, 2});
-    CHECK(std::vector<char>(cells.begin(), cells.begin() + 12) == one_c);
-    CHECK(std::vector<char>(entries.begin(), entries.begin() + 10) == one_e);
-    uint64_t second; std::memcpy(&second, cells.data() + 12, 8);
-    uint32_t off; std::memcpy(&off, cells.data() + 20, 4);
-    CHECK_EQ(second, uint64_t(9));
-    CHECK_EQ(off, uint32_t(10));
-    CHECK(parse_cell_lists(cells, entries) == CellLists({{7, {1, 2}}, {9, {4}}}));
+TEST(patch_format_cell_lists_write_the_cell_pair_files) {
+    // The bytes a cell_pairs::Writer writes for the lists in cell order, which
+    // parse back to them.
+    const CellLists lists = at10({{9, {4}}, {7, {1, 2}}});
+    std::vector<char> cells, entries;
+    cell_pairs::Writer writer(
+        cell_pairs::ADMIN, [&](const char* p, size_t n) { cells.insert(cells.end(), p, p + n); },
+        [&](const char* p, size_t n) { entries.insert(entries.end(), p, p + n); });
+    const std::vector<uint32_t> a = {1, 2}, b = {4};
+    writer.add(c10(7), a.data(), a.size());
+    writer.add(c10(9), b.data(), b.size());
+    writer.finish();
+    CHECK(write_cell_lists(lists, cell_pairs::ADMIN) == std::make_pair(cells, entries));
+    CHECK(parse_cell_lists(cells, entries, cell_pairs::ADMIN) == lists);
+    CHECK_EQ(refusal_of([&] { parse_cell_lists(cells, entries, cell_pairs::POI); }),
+             std::string("Malformed cell index: a cells file of another kind of index"));
 }
 
 // The index stream_cell_list_delta writes for the old index plus the delta
 // from old_lists to new_lists.
 static std::pair<std::vector<char>, std::vector<char>> apply_delta(
-        const std::pair<std::vector<char>, std::vector<char>>& old_index, const std::vector<char>& delta, size_t delta_size) {
+        const std::pair<std::vector<char>, std::vector<char>>& old_index, const std::vector<char>& delta, size_t delta_size,
+        cell_pairs::Format format = cell_pairs::POSTCODE_CENTROID) {
     std::pair<std::vector<char>, std::vector<char>> out;
     stream_cell_list_delta(ByteSpan{old_index.first.data(), old_index.first.size()},
-                           ByteSpan{old_index.second.data(), old_index.second.size()},
+                           ByteSpan{old_index.second.data(), old_index.second.size()}, format,
                            delta.data(), delta_size,
                            [&](const char* p, size_t n) { out.first.insert(out.first.end(), p, p + n); },
                            [&](const char* p, size_t n) { out.second.insert(out.second.end(), p, p + n); });
     return out;
+}
+
+// Applying the delta from old_lists to new_lists to the old index gives the new index, in each format.
+static bool delta_applies(const CellLists& old_lists, const CellLists& new_lists) {
+    std::vector<char> delta;
+    append_cell_list_delta(delta, old_lists, new_lists);
+    bool ok = true;
+    for (cell_pairs::Format format : {cell_pairs::POSTCODE_CENTROID, cell_pairs::ADMIN, cell_pairs::POI})
+        ok &= apply_delta(write_cell_lists(old_lists, format), delta, delta.size(), format) ==
+              write_cell_lists(new_lists, format);
+    return ok;
 }
 
 TEST(patch_format_cell_list_delta_round_trip) {
@@ -1797,7 +1811,7 @@ TEST(patch_format_cell_list_delta_round_trip) {
     const CellLists new_lists = {{0, {7}}, {1, {10, 11}}, {2, {20, 22, 23}}, {4, {40, 41}}, {5, {}}, {9, {90}}};
     std::vector<char> delta;
     append_cell_list_delta(delta, old_lists, new_lists);
-    CHECK(apply_delta(write_cell_lists(old_lists), delta, delta.size()) == write_cell_lists(new_lists));
+    CHECK(delta_applies(at10(old_lists), at10(new_lists)));
     // Unchanged cells don't travel. Source ranks 1 2 3 5 -> 0 1 2 3, new ranks 0 1 2 4 5 9 -> 0 1 2 3 4 5:
     // gone source rank 2 (cell 3); new cells 0, 4 and 9; lost 21 at rank 2 and 50 at rank 4; gained 7 at rank 0, 23 at
     // rank 2, 40 and 41 at rank 3 and 90 at rank 5, each run (start gap, length - 1, id << 1).
@@ -1808,14 +1822,19 @@ TEST(patch_format_cell_list_delta_round_trip) {
     CHECK(std::vector<uint8_t>(delta.begin(), delta.end()) == want);
 }
 
-// The old index plus a delta of hand-written varints (each list as its values), applied: the refusal, or "" when it
+// The old index (old_lists by cell number) plus a delta of hand-written varints (the gone ranks and runs as their
+// values, the new cells by number, as gaps between their level-10 cells), applied: the refusal, or "" when it
 // applies.
 static std::string refusal_applying(const CellLists& old_lists, const std::vector<uint64_t>& gone, const std::vector<uint64_t>& fresh,
                                     const std::vector<std::array<uint64_t, 3>>& lost, const std::vector<std::array<uint64_t, 3>>& gained) {
     std::vector<char> delta;
-    for (const auto* list : {&gone, &fresh}) {
-        write_varint64(delta, list->size());
-        for (const uint64_t v : *list) write_varint64(delta, v);
+    write_varint64(delta, gone.size());
+    for (const uint64_t v : gone) write_varint64(delta, v);
+    write_varint64(delta, fresh.size());
+    uint64_t next = 0;
+    for (const uint64_t n : fresh) {
+        write_varint64(delta, c10(n) - next);
+        next = c10(n) + 1;
     }
     for (const auto* runs : {&lost, &gained}) {
         write_varint64(delta, runs->size());
@@ -1825,7 +1844,7 @@ static std::string refusal_applying(const CellLists& old_lists, const std::vecto
             write_varint(delta, static_cast<uint32_t>(r[2]));
         }
     }
-    return refusal_of([&] { apply_delta(write_cell_lists(old_lists), delta, delta.size()); });
+    return refusal_of([&] { apply_delta(write_cell_lists(at10(old_lists), cell_pairs::ADMIN), delta, delta.size(), cell_pairs::ADMIN); });
 }
 
 // A polygon that leaves 800 cells in a row and becomes interior in 100 of them costs one lost and one gained run,
@@ -1834,13 +1853,13 @@ TEST(patch_format_cell_list_delta_sends_a_polygon_as_runs) {
     constexpr uint32_t INTERIOR = 0x80000000u;
     CellLists old_lists, new_lists;
     for (uint64_t k = 0; k < 1000; k++) {
-        old_lists[k * 4] = {3, 7};
-        new_lists[k * 4] = k < 100 || k >= 900 ? std::vector<uint32_t>{3, 7} : std::vector<uint32_t>{3};
-        if (k >= 400 && k < 500) new_lists[k * 4] = {3, 7 | INTERIOR};
+        old_lists[c10(k * 4)] = {3, 7};
+        new_lists[c10(k * 4)] = k < 100 || k >= 900 ? std::vector<uint32_t>{3, 7} : std::vector<uint32_t>{3};
+        if (k >= 400 && k < 500) new_lists[c10(k * 4)] = {3, 7 | INTERIOR};
     }
     std::vector<char> delta;
     append_cell_list_delta(delta, old_lists, new_lists);
-    CHECK(apply_delta(write_cell_lists(old_lists), delta, delta.size()) == write_cell_lists(new_lists));
+    CHECK(delta_applies(old_lists, new_lists));
     // No gone or new cells; lost 7 over ranks 100-899, gained 7 | INTERIOR (7 << 1 | 1) over 400-499.
     const std::vector<uint8_t> want = {0, 0, 1, 100, 0x9F, 0x06, 14, 1, 0x90, 0x03, 99, 15};
     CHECK(std::vector<uint8_t>(delta.begin(), delta.end()) == want);
@@ -1910,13 +1929,13 @@ TEST(patch_format_cell_list_delta_runs_match_the_list_changes_on_random_days) {
         for (uint64_t cid = 0; cid < 120; cid++) {
             if (rng() % 10 == 0) stretch = list();  // a stretch of cells listing the same ids
             const uint32_t kind = rng() % 8;
-            if (kind != 0) old_lists[cid] = rng() % 2 ? stretch : list();
+            if (kind != 0) old_lists[c10(cid)] = rng() % 2 ? stretch : list();
             if (kind == 1) continue;  // gone
-            new_lists[cid] = kind == 2 || kind == 3 ? old_lists[cid] : rng() % 2 ? stretch : list();
+            new_lists[c10(cid)] = kind == 2 || kind == 3 ? old_lists[c10(cid)] : rng() % 2 ? stretch : list();
         }
         std::vector<char> delta;
         append_cell_list_delta(delta, old_lists, new_lists);
-        CHECK(apply_delta(write_cell_lists(old_lists), delta, delta.size()) == write_cell_lists(new_lists));
+        CHECK(delta_applies(old_lists, new_lists));
 
         // The gone source ranks and the new cells; the changes by new rank: the lost and gained (id, rank) multisets
         // of each cell's lists.
@@ -2007,14 +2026,20 @@ TEST(patch_format_cell_list_delta_bounds_ranks_in_64_bits) {
     CHECK_EQ(refusal_applying(old_lists, {}, {}, {}, {{1, 0, 5 << 1}, {~0ull, 0, 6 << 1}}), past);
     CHECK_EQ(refusal_applying(old_lists, {}, {}, {}, {{1, ~0ull, 5 << 1}}), past);
     CHECK_EQ(refusal_applying(old_lists, {two32}, {}, {}, {}), std::string("Malformed cell list delta: a gone rank past the last source cell"));
-    CHECK_EQ(refusal_applying(old_lists, {}, {5, ~0ull - 6}, {}, {}), std::string("Malformed cell list delta"));
+    const auto old_index = write_cell_lists(at10(old_lists), cell_pairs::POSTCODE_CENTROID);
+    // A new cell past 2^64: cell 5, then a gap past what is left.
+    std::vector<char> beyond = {0, 2};
+    write_varint64(beyond, c10(5));
+    write_varint64(beyond, ~0ull - c10(5) - 1);
+    beyond.insert(beyond.end(), {0, 0});
+    CHECK_EQ(refusal_of([&] { apply_delta(old_index, beyond, beyond.size()); }), std::string("Malformed cell list delta"));
     // n_gained 2^32 + 1 over one run.
     std::vector<char> delta = {0, 0, 0};
     write_varint64(delta, two32 + 1);
     write_varint64(delta, 1);
     write_varint64(delta, 0);
     write_varint(delta, 5 << 1);
-    CHECK_EQ(refusal_of([&] { apply_delta(write_cell_lists(old_lists), delta, delta.size()); }), std::string("Malformed cell list delta"));
+    CHECK_EQ(refusal_of([&] { apply_delta(old_index, delta, delta.size()); }), std::string("Malformed cell list delta"));
 }
 
 TEST(patch_format_cell_list_delta_matches_the_new_index_on_random_days) {
@@ -2027,59 +2052,66 @@ TEST(patch_format_cell_list_delta_matches_the_new_index_on_random_days) {
         for (uint64_t cid = 0; cid < 40; cid++) {
             auto make = [&] { std::vector<uint32_t> ids; for (uint32_t id = 0; id < 30; id++) if (rnd(4) == 0) ids.push_back(id); return ids; };
             uint32_t kind = rnd(5);
-            if (kind != 0) old_lists[cid] = make();
-            if (kind == 1 || kind == 2) new_lists[cid] = old_lists[cid];
-            else if (kind != 0 || rnd(2)) new_lists[cid] = make();
+            if (kind != 0) old_lists[c10(cid)] = make();
+            if (kind == 1 || kind == 2) new_lists[c10(cid)] = old_lists[c10(cid)];
+            else if (kind != 0 || rnd(2)) new_lists[c10(cid)] = make();
         }
-        std::vector<char> delta;
-        append_cell_list_delta(delta, old_lists, new_lists);
-        CHECK(apply_delta(write_cell_lists(old_lists), delta, delta.size()) == write_cell_lists(new_lists));
+        CHECK(delta_applies(old_lists, new_lists));
     }
 }
 
 TEST(patch_format_stream_cell_index_matches_rebuild_then_delta) {
     // The patcher's one-pass rebuild (old index + remap + added/removed +
-    // delta) writes exactly the new index the diff aimed at, on random days
-    // with interior flags, removed and added cells.
+    // delta) writes exactly the new index the diff aimed at, the bytes the
+    // builder writes for its lists, on random days with interior flags,
+    // removed and added cells, over cells of several parents.
     uint64_t seed = 99;
     auto rnd = [&](uint32_t n) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33) % n; };
+    // Cell k: two parents of 1024 cells and their neighbours apart, in steps of up to 300 cells.
+    auto cell = [](uint64_t k) { return c10(k * 97); };
     ScratchDir dir("cell-index-test");
     for (int round = 0; round < 200; round++) {
+        const cell_pairs::Format format = round % 2 ? cell_pairs::POI : cell_pairs::ADMIN;
         CellLists old_lists;
         for (uint64_t cid = 1; cid < 30; cid++) {
             if (rnd(3) == 0) continue;
             std::vector<uint32_t> ids;
             for (uint32_t id = 0; id < 40; id++) if (rnd(5) == 0) ids.push_back(id | (rnd(4) == 0 ? 0x80000000u : 0));
             std::sort(ids.begin(), ids.end());
-            old_lists[cid] = ids;
+            old_lists[cell(cid)] = ids;
         }
         std::unordered_map<uint32_t, uint32_t> rm;
         for (uint32_t id = 0; id < 40; id++) if (rnd(3) == 0) rm[id] = 100 + rnd(60);
         std::vector<uint64_t> added, removed;
         for (uint64_t cid = 1; cid < 34; cid++) {
-            if (!old_lists.count(cid) && rnd(3) == 0) added.push_back(cid);
-            else if (old_lists.count(cid) && rnd(6) == 0) removed.push_back(cid);
+            if (!old_lists.count(cell(cid)) && rnd(3) == 0) added.push_back(cell(cid));
+            else if (old_lists.count(cell(cid)) && rnd(6) == 0) removed.push_back(cell(cid));
         }
-        auto [cells, entries] = write_cell_lists(old_lists);
-        auto derived = rebuild_cells_from_remap(cells, entries, rm, added, removed);
-        CellLists new_lists = parse_cell_lists(derived.cells_data, derived.entries_data);
+        auto [cells, entries] = write_cell_lists(old_lists, format);
+        const CellLists derived = rebuild_cell_lists(parse_cell_lists(cells, entries, format), rm, added, removed);
+        CellLists new_lists = derived;
         for (auto it = new_lists.begin(); it != new_lists.end();) {
             if (rnd(5) == 0) { it = new_lists.erase(it); continue; }
             if (rnd(3) == 0) { it->second.push_back(500 + rnd(9)); std::sort(it->second.begin(), it->second.end()); }
             if (rnd(4) == 0 && !it->second.empty()) it->second.erase(it->second.begin());
             ++it;
         }
-        if (rnd(2)) new_lists[40 + rnd(5)] = {7};
+        if (rnd(2)) new_lists[cell(40 + rnd(5))] = {7};
         std::vector<char> delta;
-        append_cell_list_delta(delta, parse_cell_lists(derived.cells_data, derived.entries_data), new_lists);
+        append_cell_list_delta(delta, derived, new_lists);
         std::pair<std::vector<char>, std::vector<char>> got;
-        stream_cell_index(ByteSpan{cells.data(), cells.size()}, ByteSpan{entries.data(), entries.size()}, ascending(added),
-                          ascending(removed),
+        stream_cell_index(ByteSpan{cells.data(), cells.size()}, ByteSpan{entries.data(), entries.size()}, format,
+                          ascending(added), ascending(removed),
                           [&](uint32_t id) { auto f = rm.find(id); return f != rm.end() ? f->second : id; },
                           delta.data(), delta.size(),
                           [&](const char* p, size_t n) { got.first.insert(got.first.end(), p, p + n); },
                           [&](const char* p, size_t n) { got.second.insert(got.second.end(), p, p + n); });
-        CHECK(got == write_cell_lists(new_lists));
+        CHECK(got == write_cell_lists(new_lists, format));
+        // The builder's writer (its map one: a cell's list can be empty here).
+        std::unordered_map<uint64_t, std::vector<uint32_t>> map(new_lists.begin(), new_lists.end());
+        write_cell_index(dir.path() + "/built_cells.bin", dir.path() + "/built_entries.bin", format, map);
+        CHECK(read_file(dir.path() + "/built_cells.bin") == got.first);
+        CHECK(read_file(dir.path() + "/built_entries.bin") == got.second);
 
         // The patcher reads the old index from files; a 16-byte window
         // refills mid-list, grows for longer lists and skips removed cells.
@@ -2087,7 +2119,7 @@ TEST(patch_format_stream_cell_index_matches_rebuild_then_delta) {
         write_bytes(dir.path() + "/entries.bin", entries);
         SequentialFileReader cells_file(dir.path() + "/cells.bin", 16), entries_file(dir.path() + "/entries.bin", 16);
         std::pair<std::vector<char>, std::vector<char>> streamed;
-        stream_cell_index(cells_file, entries_file, ascending(added), ascending(removed),
+        stream_cell_index(cells_file, entries_file, format, ascending(added), ascending(removed),
                           [&](uint32_t id) { auto f = rm.find(id); return f != rm.end() ? f->second : id; },
                           delta.data(), delta.size(),
                           [&](const char* p, size_t n) { streamed.first.insert(streamed.first.end(), p, p + n); },
@@ -2097,41 +2129,62 @@ TEST(patch_format_stream_cell_index_matches_rebuild_then_delta) {
     }
 }
 
-TEST(patch_format_cell_list_delta_drops_removed_no_data_cells) {
-    // A rebuilt index can hold an emptied cell (offset NO_DATA); the delta removes it.
-    auto [cells, entries] = one_cell(7, {1});
-    uint64_t gone = 9; uint32_t no_data = 0xFFFFFFFFu;
-    cells.insert(cells.end(), (const char*)&gone, (const char*)&gone + 8);
-    cells.insert(cells.end(), (const char*)&no_data, (const char*)&no_data + 4);
+TEST(patch_format_cell_list_delta_drops_an_emptied_cell) {
+    // An index can hold a cell with an empty list; the delta removes it.
+    const CellLists old_lists = at10({{7, {1}}, {9, {}}}), new_lists = at10({{7, {1}}});
     std::vector<char> delta;
-    append_cell_list_delta(delta, parse_cell_lists(cells, entries), {{7, {1}}});
-    CHECK(apply_delta({cells, entries}, delta, delta.size()) == write_cell_lists({{7, {1}}}));
+    append_cell_list_delta(delta, old_lists, new_lists);
+    CHECK(apply_delta(write_cell_lists(old_lists, cell_pairs::POSTCODE_CENTROID), delta, delta.size()) ==
+          write_cell_lists(new_lists, cell_pairs::POSTCODE_CENTROID));
 }
 
 TEST(patch_format_stream_cell_index_refuses_cell_changes_out_of_order) {
     // Over an old index of cells 5, 7 and 9: added cells 3 then 2; removed
     // cells 7 then 5, a step back the walk reaches at cell 9; removed cells 9
     // then 7, one past the last cell the walk asks for.
-    const auto old_index = write_cell_lists({{5, {1}}, {7, {2}}, {9, {3}}});
+    const auto old_index = write_cell_lists(at10({{5, {1}}, {7, {2}}, {9, {3}}}), cell_pairs::ADMIN);
     std::vector<char> delta;
     append_cell_list_delta(delta, {}, {});
     struct Case { std::vector<uint64_t> added, removed; };
-    for (const Case& c : {Case{{3, 2}, {}}, Case{{}, {7, 5}}, Case{{}, {9, 7}}}) {
+    for (const Case& c : {Case{{c10(3), c10(2)}, {}}, Case{{}, {c10(7), c10(5)}}, Case{{}, {c10(9), c10(7)}}}) {
         auto walk = [&] {
             stream_cell_index(ByteSpan{old_index.first.data(), old_index.first.size()},
-                              ByteSpan{old_index.second.data(), old_index.second.size()}, ascending(c.added),
-                              ascending(c.removed), [](uint32_t id) { return id; }, delta.data(), delta.size(),
-                              [](const char*, size_t) {}, [](const char*, size_t) {});
+                              ByteSpan{old_index.second.data(), old_index.second.size()}, cell_pairs::ADMIN,
+                              ascending(c.added), ascending(c.removed), [](uint32_t id) { return id; }, delta.data(),
+                              delta.size(), [](const char*, size_t) {}, [](const char*, size_t) {});
         };
 
         CHECK_EQ(refusal_of(walk), std::string("Malformed cell changes"));
     }
 }
 
+TEST(patch_format_stream_cell_index_refuses_a_malformed_old_index_or_new_cell) {
+    // The old index as the walk reads it (a malformed block: a code of 3), and
+    // a new cell of another level than the index's: refused before a list of
+    // the new index is written past them.
+    auto old_index = write_cell_lists(at10({{5, {1, 2}}, {7, {2}}}), cell_pairs::ADMIN);
+    old_index.second[0] = static_cast<char>(old_index.second[0] | 0x0C);  // row 1: code 3
+    std::vector<char> none;
+    append_cell_list_delta(none, {}, {});
+    auto walk = [&](const std::pair<std::vector<char>, std::vector<char>>& index, const std::vector<char>& delta) {
+        return refusal_of([&] {
+            stream_cell_index(ByteSpan{index.first.data(), index.first.size()},
+                              ByteSpan{index.second.data(), index.second.size()}, cell_pairs::ADMIN, {}, {},
+                              [](uint32_t id) { return id; }, delta.data(), delta.size(), [](const char*, size_t) {},
+                              [](const char*, size_t) {});
+        });
+    };
+    CHECK_EQ(walk(old_index, none), std::string("Malformed cell index: a row code of 3"));
+    const auto good = write_cell_lists(at10({{5, {1, 2}}}), cell_pairs::ADMIN);
+    std::vector<char> fresh;
+    append_cell_list_delta(fresh, at10({{5, {1, 2}}}), {{c10(5), {1, 2}}, {cell_pairs::cell_of(9, 11), {3}}});
+    CHECK_EQ(walk(good, fresh), std::string("cell_pairs::Writer: cells of two levels"));
+}
+
 TEST(patch_format_cell_list_delta_rejects_truncation) {
     std::vector<char> delta;
-    append_cell_list_delta(delta, {{1, {10}}}, {{1, {11}}, {2, {5}}});
-    auto old_index = write_cell_lists({{1, {10}}});
+    append_cell_list_delta(delta, at10({{1, {10}}}), at10({{1, {11}}, {2, {5}}}));
+    auto old_index = write_cell_lists(at10({{1, {10}}}), cell_pairs::POSTCODE_CENTROID);
     for (size_t cut = 0; cut < delta.size(); cut++)
         CHECK_EQ(refusal_of([&] { apply_delta(old_index, delta, cut); }), std::string("Malformed cell list delta"));
 }

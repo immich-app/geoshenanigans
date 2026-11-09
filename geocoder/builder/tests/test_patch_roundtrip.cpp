@@ -97,7 +97,7 @@ void put_geo_cells(BuildDir& d, const std::vector<GeoCell>& cells) {
 
 // <prefix>_cells.bin and <prefix>_entries.bin holding CELL, which lists ids.
 void put_cell_index(BuildDir& d, const std::string& prefix, const std::vector<uint32_t>& ids) {
-    auto [cells, entries] = write_cell_lists({{CELL, ids}});
+    auto [cells, entries] = write_cell_lists({{CELL, ids}}, cell_pairs::format_of(prefix));
     d[prefix + "_cells.bin"] = cells;
     d[prefix + "_entries.bin"] = entries;
 }
@@ -601,8 +601,10 @@ TEST(patch_round_trip_keeps_place_nodes_without_a_cell_index) {
 TEST(patch_round_trip_rebuilds_a_cell_index_without_its_records) {
     for (const std::string prefix : {"admin", "poi"}) {
         BuildDir old_d, new_d;
-        std::tie(old_d[prefix + "_cells.bin"], old_d[prefix + "_entries.bin"]) = write_cell_lists({{CELL, {0, 1}}});
-        std::tie(new_d[prefix + "_cells.bin"], new_d[prefix + "_entries.bin"]) = write_cell_lists({{CELL, {0, 2}}, {CELL_2, {1}}});
+        const cell_pairs::Format format = cell_pairs::format_of(prefix);
+        std::tie(old_d[prefix + "_cells.bin"], old_d[prefix + "_entries.bin"]) = write_cell_lists({{CELL, {0, 1}}}, format);
+        std::tie(new_d[prefix + "_cells.bin"], new_d[prefix + "_entries.bin"]) =
+            write_cell_lists({{CELL, {0, 2}}, {CELL_2, {1}}}, format);
 
         CHECK(round_trip(old_d, new_d).mismatches.empty());
     }
@@ -1106,12 +1108,12 @@ TEST(patch_diff_refuses_a_dir_of_more_client_files_than_a_patch_may_list) {
     CHECK(round_trip(json_files(1), json_files(1024)).mismatches.empty());
 }
 
-// A new admin or POI cell index whose empty list is NO_DATA (the geo
-// index's layout, not the one write_cell_lists writes and the patcher's
-// rebuild gives) fails the diff, and no patch is written: the patcher could
-// not rebuild it. The same lists in the builder's layout, the empty one a
-// zero count, round-trip.
-TEST(patch_diff_refuses_a_cell_index_with_a_no_data_list) {
+// A new admin or POI cell index in a layout the patcher's rebuild doesn't
+// write (cell_pairs::Writer: its first list, {0, 1}, flags repeats it doesn't
+// have, so its gap is 1, not 0) fails the diff, and no patch is written: the
+// patcher could not rebuild it. The same lists as the builder writes them
+// round-trip.
+TEST(patch_diff_refuses_a_cell_index_the_writer_wouldnt_write) {
     const std::pair<std::string, BuildDir> indexes[] = {
         {"admin", {}},
         {"poi", {{"poi_records.bin", bytes_of(std::vector<PoiRecord>{poi(NAME_2), poi(NAME_4)})}}},
@@ -1123,17 +1125,21 @@ TEST(patch_diff_refuses_a_cell_index_with_a_no_data_list) {
         BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
         for (const auto& [name, bytes] : records) old_d[name] = new_d[name] = bytes;
         put_cell_index(old_d, prefix, {0, 1});
-        BuildDir no_data = new_d;
         // CELL lists 0 and 1, CELL_2 none.
-        std::tie(new_d[prefix + "_cells.bin"], new_d[prefix + "_entries.bin"]) = write_cell_lists({{CELL, {0, 1}}, {CELL_2, {}}});
-        auto& cells = no_data[prefix + "_cells.bin"];
-        append(cells, CELL);
-        append(cells, uint32_t{0});
-        append(cells, CELL_2);
-        append(cells, NO_DATA);
-        no_data[prefix + "_entries.bin"] = entry_list({0, 1});
+        std::tie(new_d[prefix + "_cells.bin"], new_d[prefix + "_entries.bin"]) =
+            write_cell_lists({{CELL, {0, 1}}, {CELL_2, {}}}, cell_pairs::format_of(prefix));
+        BuildDir unwritten = new_d;
+        // Admin: a block (2 bytes of codes), then {0, 1} as PLAIN, its header, no flagged ids, 0, the gap. POI: the
+        // list alone, its gap after a byte of gap lengths.
+        std::vector<char>& entries = unwritten[prefix + "_entries.bin"];
+        const size_t list = prefix == "admin" ? 2 : 0, gap = prefix == "admin" ? 5 : 4;
+        REQUIRE(entries[list] == 4 && entries[gap] == 0);
+        entries[list] = 5;
+        entries[gap] = 1;
+        REQUIRE(parse_cell_lists(unwritten[prefix + "_cells.bin"], entries, cell_pairs::format_of(prefix)) ==
+                CellLists({{CELL, {0, 1}}, {CELL_2, {}}}));
         REQUIRE(write_dir(root + "/old", old_d));
-        REQUIRE(write_dir(root + "/new", no_data));
+        REQUIRE(write_dir(root + "/new", unwritten));
 
         CHECK(!run({GEOCODER_DIFF_BIN, root + "/old", root + "/new", "-o", patch}, log));
 

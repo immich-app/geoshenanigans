@@ -27,6 +27,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "cell_pairs.h"
 #include "checked_size.h"
 #include "sequential_file_reader.h"
 
@@ -385,8 +386,8 @@ static constexpr uint32_t CELL_CHANGES_POI_MARKER = 0xFFFFFFF5;
 // its id remap (the POI records' replay; admin slots stay as they are),
 // corrected by runs of cells that lose or gain an id (v15): a polygon costs
 // the runs its cells form in the index, not an id per cell. Sent for every
-// index the old or the new dir holds; the patcher writes the new index in
-// write_cell_lists layout, so the diff refuses a new index that layout
+// index the old or the new dir holds; the patcher writes the new index
+// through a cell_pairs::Writer, so the diff refuses a new index that writer
 // doesn't reproduce byte for byte.
 // Format: marker(4), file_id(4) = the entries file, payload_size(u64),
 //   append_cell_list_delta(rebuilt → new) bytes.
@@ -1247,116 +1248,73 @@ inline uint32_t unzigzag32(uint32_t v) { return (v >> 1) ^ (0u - (v & 1)); }
 
 // --- Cell index rebuild ---
 
-// Admin and POI cell index rebuild, as the diff derives the index the
-// patcher rebuilds (stream_cell_index gives the same lists): 12-byte cells
-// (cell_id u64, entry_offset u32) over (count u16, ids u32[]) entries. An
-// id's top bit is INTERIOR_FLAG, so the remap is keyed by the bare id and the
-// flag carried over.
-struct RebuiltCells {
-    std::vector<char> cells_data;
-    std::vector<char> entries_data;
+// Bytes in memory behind the size() / at(off, n) interface the patcher's
+// file readers have (SequentialFileReader), for readers over a buffer.
+struct ByteSpan {
+    const char* data;
+    size_t bytes;
+    uint64_t size() const { return bytes; }
+    const char* at(uint64_t off, size_t) const { return data + off; }
 };
 
-inline RebuiltCells rebuild_cells_from_remap(
-    const std::vector<char>& old_cells, const std::vector<char>& old_entries,
-    const std::unordered_map<uint32_t,uint32_t>& rm,
-    const std::vector<uint64_t>& added_cells = {},
-    const std::vector<uint64_t>& removed_cells = {})
-{
-    size_t n_cells = old_cells.size() / 12;
+// cell_id → its ids (sorted), in cell order: an admin / POI / postcode
+// centroid index (cell_pairs.h) as the patch sees it, whatever the layout of
+// its files.
+using CellLists = std::map<uint64_t, std::vector<uint32_t>>;
 
-    struct CellData { uint64_t cell_id; std::vector<uint32_t> ids; };
-    std::vector<CellData> cells(n_cells);
-    for (size_t i = 0; i < n_cells; i++) {
-        memcpy(&cells[i].cell_id, old_cells.data() + i * 12, 8);
-        uint32_t off; memcpy(&off, old_cells.data() + i * 12 + 8, 4);
-        if (off != 0xFFFFFFFF && off + 2 <= old_entries.size()) {
-            uint16_t count; memcpy(&count, old_entries.data() + off, 2);
-            if (off + 2 + count * 4 <= old_entries.size()) {
-                cells[i].ids.resize(count);
-                if (count) memcpy(cells[i].ids.data(), old_entries.data() + off + 2, count * 4);
-                for (auto& id : cells[i].ids) {
-                    uint32_t flags = id & 0x80000000u;
-                    uint32_t masked = id & 0x7FFFFFFFu;
-                    auto it = rm.find(masked);
-                    if (it != rm.end()) id = it->second | flags;
-                }
-                std::sort(cells[i].ids.begin(), cells[i].ids.end());
-            }
+// The lists of a cell pair index of `format` from its files' bytes.
+inline CellLists parse_cell_lists(const std::vector<char>& cells, const std::vector<char>& entries,
+                                  cell_pairs::Format format) {
+    ByteSpan c{cells.data(), cells.size()}, e{entries.data(), entries.size()};
+    cell_pairs::Reader reader(c, e, format);
+    CellLists out;
+    uint64_t cell;
+    std::vector<uint32_t> ids;
+    while (reader.next(cell, ids)) out.emplace_hint(out.end(), cell, ids);
+    return out;
+}
+
+// The files cell_pairs::Writer writes for these lists: (cells, entries).
+inline std::pair<std::vector<char>, std::vector<char>> write_cell_lists(const CellLists& lists,
+                                                                         cell_pairs::Format format) {
+    std::pair<std::vector<char>, std::vector<char>> out;
+    cell_pairs::Writer writer(
+        format, [&](const char* p, size_t n) { out.first.insert(out.first.end(), p, p + n); },
+        [&](const char* p, size_t n) { out.second.insert(out.second.end(), p, p + n); });
+    for (const auto& [cell, ids] : lists) writer.add(cell, ids.data(), ids.size());
+    writer.finish();
+    return out;
+}
+
+// The admin / POI index the patcher rebuilds, as the diff derives it
+// (stream_cell_index gives the same lists): the old index's cells less
+// `removed`, with `added` (empty lists), every id moved by rm keyed by the
+// bare id, INTERIOR_FLAG carried over, and each list sorted.
+inline CellLists rebuild_cell_lists(const CellLists& old, const std::unordered_map<uint32_t, uint32_t>& rm,
+                                    const std::vector<uint64_t>& added = {},
+                                    const std::vector<uint64_t>& removed = {}) {
+    const std::unordered_set<uint64_t> gone(removed.begin(), removed.end());
+    CellLists out;
+    for (const auto& [cell, ids] : old) {
+        if (gone.count(cell)) continue;
+        std::vector<uint32_t>& moved = out.emplace_hint(out.end(), cell, ids)->second;
+        for (uint32_t& id : moved) {
+            auto it = rm.find(id & cell_pairs::BARE);
+            if (it != rm.end()) id = it->second | (id & cell_pairs::FLAG);
         }
+        std::sort(moved.begin(), moved.end());
     }
-
-    if (!removed_cells.empty()) {
-        std::unordered_set<uint64_t> removed_set(removed_cells.begin(), removed_cells.end());
-        cells.erase(std::remove_if(cells.begin(), cells.end(),
-            [&](const CellData& c) { return removed_set.count(c.cell_id); }), cells.end());
-    }
-    if (!added_cells.empty()) {
-        for (uint64_t cid : added_cells) { CellData cd; cd.cell_id = cid; cells.push_back(cd); }
-        std::sort(cells.begin(), cells.end(),
-            [](const CellData& a, const CellData& b) { return a.cell_id < b.cell_id; });
-    }
-
-    RebuiltCells result;
-    uint32_t no_data = 0xFFFFFFFF;
-    std::unordered_map<uint64_t, uint32_t> offsets;
-    for (auto& c : cells) {
-        if (c.ids.empty()) continue;
-        offsets[c.cell_id] = static_cast<uint32_t>(result.entries_data.size());
-        uint16_t count = static_cast<uint16_t>(c.ids.size());
-        result.entries_data.insert(result.entries_data.end(), (const char*)&count, (const char*)&count + 2);
-        result.entries_data.insert(result.entries_data.end(), (const char*)c.ids.data(), (const char*)c.ids.data() + c.ids.size() * 4);
-    }
-    for (auto& c : cells) {
-        result.cells_data.insert(result.cells_data.end(), (const char*)&c.cell_id, (const char*)&c.cell_id + 8);
-        auto it = offsets.find(c.cell_id);
-        uint32_t off = it != offsets.end() ? it->second : no_data;
-        result.cells_data.insert(result.cells_data.end(), (const char*)&off, (const char*)&off + 4);
-    }
-    return result;
+    // A cell the old index holds can't be added, as the patcher's walk refuses it.
+    for (uint64_t cell : added)
+        if (old.count(cell) || !out.emplace(cell, std::vector<uint32_t>()).second)
+            throw std::runtime_error("Malformed cell index");
+    return out;
 }
 
 // --- Cell index deltas as runs (CELL_INDEX_DELTA_MARKER, CELL_LIST_DELTA_STRIDE) ---
 
-// cell_id → its ids (sorted), in cell order.
-using CellLists = std::map<uint64_t, std::vector<uint32_t>>;
-
-inline CellLists parse_cell_lists(const std::vector<char>& cells, const std::vector<char>& entries) {
-    CellLists out;
-    for (size_t i = 0; i + 12 <= cells.size(); i += 12) {
-        uint64_t cid; uint32_t off;
-        memcpy(&cid, cells.data() + i, 8);
-        memcpy(&off, cells.data() + i + 8, 4);
-        auto& ids = out[cid];
-        if (off == 0xFFFFFFFF) continue;
-        uint16_t n;
-        if ((size_t)off + 2 > entries.size()) throw std::runtime_error("Malformed cell index");
-        memcpy(&n, entries.data() + off, 2);
-        if ((size_t)off + 2 + (size_t)n * 4 > entries.size()) throw std::runtime_error("Malformed cell index");
-        ids.resize(n);
-        if (n) memcpy(ids.data(), entries.data() + off + 2, (size_t)n * 4);
-    }
-    return out;
-}
-
-// The most ids a cell lists: its count is a u16.
-static constexpr uint32_t CELL_LIST_MAX = 0xFFFF;
-
-// The bytes write_cell_index writes for these lists: (cells, entries).
-inline std::pair<std::vector<char>, std::vector<char>> write_cell_lists(const CellLists& lists) {
-    std::pair<std::vector<char>, std::vector<char>> out;
-    auto& [cells, entries] = out;
-    for (const auto& [cid, ids] : lists) {
-        if (ids.size() > CELL_LIST_MAX) throw std::runtime_error("Cell holds more than 65535 entries");
-        uint32_t off = static_cast<uint32_t>(entries.size());
-        uint16_t n = static_cast<uint16_t>(ids.size());
-        cells.insert(cells.end(), (const char*)&cid, (const char*)&cid + 8);
-        cells.insert(cells.end(), (const char*)&off, (const char*)&off + 4);
-        entries.insert(entries.end(), (const char*)&n, (const char*)&n + 2);
-        entries.insert(entries.end(), (const char*)ids.data(), (const char*)ids.data() + ids.size() * 4);
-    }
-    return out;
-}
+// The most ids a cell lists.
+static constexpr uint32_t CELL_LIST_MAX = cell_pairs::LIST_MAX;
 
 // A cell list delta (v15) turns one cell index, the source, into the new one: for a postcode centroid index
 // (CELL_LIST_DELTA_STRIDE) the old index, for an admin or POI index (CELL_INDEX_DELTA_MARKER) the one the patcher
@@ -1647,20 +1605,26 @@ private:
     std::vector<Id> ids_;
 };
 
-// Rebuilds a cell index and applies a cell list delta (append_cell_list_delta) to it in one pass, writing the
-// result in write_cell_lists layout through out_cells(bytes, n) / out_entries(bytes, n). The source is the old
-// index (cells sorted by id) plus `added` cell ids with empty lists, minus `removed`; every old id moves by
-// remap(id without INTERIOR_FLAG), flag kept, and each list is sorted: the same lists rebuild_cells_from_remap
-// gives. Holds one cell's list and the runs over it: the patcher runs on client machines, where materialising
-// planet poi/all (1.1M cells, 25M ids, a 23M entry remap map) cost over 1 GiB. The old cells and entries are read
-// front to back through size() and at(off, n), a view that lasts until the next call (SequentialFileReader); the
-// cell changes and the delta where they sit. Refuses, besides a malformed index or delta: a lost id missing from its
-// cell, an active set above CELL_LIST_MAX, a step back (a run's (start, id) below the previous one's, or a new cell
-// the source holds) and a run past the last rank (or a gone rank past the last source cell). Returns the entries
-// bytes written.
+// What a cell index rebuild wrote: its rows and both files' bytes.
+struct CellIndexWritten {
+    uint64_t rows = 0, cells_bytes = 0, entries_bytes = 0;
+};
+
+// Rebuilds a cell index of `format` and applies a cell list delta (append_cell_list_delta) to it in one pass,
+// writing the result through a cell_pairs::Writer to out_cells(bytes, n) / out_entries(bytes, n). The source is the
+// old index (read by a cell_pairs::Reader) plus `added` cell ids with empty lists, minus `removed`; every old id
+// moves by remap(id without INTERIOR_FLAG), flag kept, and each list is sorted: the same lists rebuild_cell_lists
+// gives. Holds one block of the old index, one cell's list and the runs over it: the patcher runs on client
+// machines, where materialising planet poi/all (1.1M cells, 25M ids, a 23M entry remap map) cost over 1 GiB. The old
+// cells and entries are read front to back through size() and at(off, n), a view that lasts until the next call
+// (SequentialFileReader); the cell changes and the delta where they sit. Refuses, besides a malformed index or delta:
+// a lost id missing from its cell, an active set above CELL_LIST_MAX, a step back (a run's (start, id) below the
+// previous one's, or a new cell the source holds) and a run past the last rank (or a gone rank past the last source
+// cell).
 template <typename Cells, typename Entries, typename Remap, typename OutCells, typename OutEntries>
-uint64_t stream_cell_index(Cells&& cells, Entries&& entries, AscendingIds added, AscendingIds removed, Remap remap,
-                           const char* delta, size_t delta_size, OutCells out_cells, OutEntries out_entries) {
+CellIndexWritten stream_cell_index(Cells&& cells, Entries&& entries, cell_pairs::Format format, AscendingIds added,
+                                   AscendingIds removed, Remap remap, const char* delta, size_t delta_size,
+                                   OutCells out_cells, OutEntries out_entries) {
     auto bad_index = [] { throw std::runtime_error("Malformed cell index"); };
     constexpr uint64_t NONE = CellGaps::NONE;
 
@@ -1670,67 +1634,47 @@ uint64_t stream_cell_index(Cells&& cells, Entries&& entries, AscendingIds added,
     CellRunReader gained_runs(delta, delta_size, parts.gained_at, parts.n_gained);
     ActiveRuns lost, gained;
 
-    // The next source cell: old cells minus `removed`, merged with `added`.
-    const uint64_t entries_size = entries.size();
-    size_t n_cells = cells.size() / 12, i = 0;
-    uint64_t prev_old = 0;
-    std::vector<uint32_t> ids;
+    // The next source cell: old cells minus `removed`, merged with `added`. The old index's next row waits in
+    // (old_cid, old_ids) while an added cell comes first.
+    cell_pairs::Reader old(cells, entries, format);
+    uint64_t old_cid = NONE;
+    std::vector<uint32_t> old_ids, ids;
+    bool old_waiting = false, old_done = false;
     auto next_source = [&](uint64_t& cid) -> bool {
         for (;;) {
-            uint64_t old_cid = NONE;
-            uint32_t off = 0;
-            if (i < n_cells) {
-                const char* rec = cells.at((uint64_t)i * 12, 12);
-                memcpy(&old_cid, rec, 8);
-                memcpy(&off, rec + 8, 4);
-                if (i > 0 && old_cid <= prev_old) bad_index();
+            if (!old_waiting && !old_done) {
+                old_waiting = old.next(old_cid, old_ids);
+                old_done = !old_waiting;
             }
-            uint64_t add_cid = added.done() ? NONE : added.front();
-            if (old_cid == NONE && add_cid == NONE) return false;
-            if (add_cid < old_cid) {
+            const uint64_t o = old_waiting ? old_cid : NONE;
+            const uint64_t add_cid = added.done() ? NONE : added.front();
+            if (o == NONE && add_cid == NONE) return false;
+            if (add_cid < o) {
                 cid = add_cid; added.pop();
                 ids.clear();
                 return true;
             }
-            if (add_cid == old_cid) bad_index();
-            prev_old = old_cid;
-            i++;
-            if (removed.skip_to(old_cid)) continue;
-            cid = old_cid;
-            ids.clear();
-            if (off != 0xFFFFFFFF) {
-                uint16_t n;
-                if ((uint64_t)off + 2 > entries_size) bad_index();
-                memcpy(&n, entries.at(off, 2), 2);
-                if ((uint64_t)off + 2 + (uint64_t)n * 4 > entries_size) bad_index();
-                ids.resize(n);
-                if (n) memcpy(ids.data(), entries.at((uint64_t)off + 2, (size_t)n * 4), (size_t)n * 4);
-                for (auto& id : ids) id = remap(id & 0x7FFFFFFFu) | (id & 0x80000000u);
-                std::sort(ids.begin(), ids.end());
-            }
+            if (add_cid == o) bad_index();
+            old_waiting = false;
+            if (removed.skip_to(o)) continue;
+            cid = o;
+            ids.swap(old_ids);
+            for (auto& id : ids) id = remap(id & 0x7FFFFFFFu) | (id & 0x80000000u);
+            std::sort(ids.begin(), ids.end());
             return true;
         }
     };
 
-    uint64_t written = 0, rank = 0;
+    cell_pairs::Writer out(format, out_cells, out_entries);
+    uint64_t rank = 0;
     std::vector<uint32_t> merged;
-    auto write = [&](uint64_t cid, const std::vector<uint32_t>& list) {
-        if (written > 0xFFFFFFFFull) throw std::runtime_error("Cell index entries past 4 GiB");
-        uint32_t off = static_cast<uint32_t>(written);
-        uint16_t n = static_cast<uint16_t>(list.size());
-        out_cells((const char*)&cid, 8);
-        out_cells((const char*)&off, 4);
-        out_entries((const char*)&n, 2);
-        out_entries((const char*)list.data(), list.size() * 4);
-        written += 2 + list.size() * 4;
-    };
     // The new index's cell at `rank`: its source list less the lost runs over it, merged with the gained ones.
     auto emit = [&](uint64_t cid, const std::vector<uint32_t>& source) {
         lost.start_at(lost_runs, rank);
         gained.start_at(gained_runs, rank);
         if (lost.empty() && gained.empty()) {
             if (source.size() > CELL_LIST_MAX) throw std::runtime_error("Cell holds more than 65535 entries");
-            write(cid, source);
+            out.add(cid, source.data(), source.size());
         } else {
             const auto& l = lost.ids();
             const auto& g = gained.ids();
@@ -1749,7 +1693,7 @@ uint64_t stream_cell_index(Cells&& cells, Entries&& entries, AscendingIds added,
             }
             if (li < l.size()) refuse_cell_list_delta("a lost id missing from its cell");
             for (; gi < g.size(); gi++) merged.push_back(g[gi].id);
-            write(cid, merged);
+            out.add(cid, merged.data(), merged.size());
         }
         lost.end_at(rank);
         gained.end_at(rank);
@@ -1782,28 +1726,21 @@ uint64_t stream_cell_index(Cells&& cells, Entries&& entries, AscendingIds added,
     if (next_gone != NONE) refuse_cell_list_delta("a gone rank past the last source cell");
     if (!lost_runs.done() || !gained_runs.done() || !lost.empty() || !gained.empty())
         refuse_cell_list_delta("a run past the last rank");
-    return written;
+    out.finish();
+    return {out.rows(), out.cells_bytes(), out.entries_bytes()};
 }
 
 // stream_cell_index for an index whose ids don't move (the postcode centroid
 // index): the old index plus the delta.
 template <typename Cells, typename Entries, typename OutCells, typename OutEntries>
-uint64_t stream_cell_list_delta(Cells&& cells, Entries&& entries,
-                                const char* delta, size_t delta_size, OutCells out_cells, OutEntries out_entries) {
-    return stream_cell_index(cells, entries, {}, {}, [](uint32_t id) { return id; },
+CellIndexWritten stream_cell_list_delta(Cells&& cells, Entries&& entries, cell_pairs::Format format,
+                                        const char* delta, size_t delta_size, OutCells out_cells,
+                                        OutEntries out_entries) {
+    return stream_cell_index(cells, entries, format, {}, {}, [](uint32_t id) { return id; },
                              delta, delta_size, out_cells, out_entries);
 }
 
 // --- Geo entry list deltas (GEO_ENTRY_DELTA_MARKER) ---
-
-// Bytes in memory behind the size() / at(off, n) interface the patcher's
-// file readers have (SequentialFileReader), for readers over a buffer.
-struct ByteSpan {
-    const char* data;
-    size_t bytes;
-    uint64_t size() const { return bytes; }
-    const char* at(uint64_t off, size_t) const { return data + off; }
-};
 
 // Reads the (u16 count, u32 ids) list at `off` of a street / addr / interp
 // entries file (size() / at(off, n), like the cell index streams) into `ids`.

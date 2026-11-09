@@ -208,6 +208,8 @@ void put_arc_geometry(BuildDir& d, const ArcGeometry& g) {
 
 // The id of a fixture's cell k.
 uint64_t cell_id(uint32_t k) { return uint64_t(k + 1) << 27; }
+// Cell k of a cell pair index, which holds cells of one level.
+uint64_t pair_cell(uint32_t k) { return cell_pairs::cell_of(k, 10); }
 
 // A geo row: its cell index and the street ids it lists.
 using GeoRow = std::pair<uint32_t, std::vector<uint32_t>>;
@@ -240,9 +242,10 @@ void put_geo(BuildDir& d, const std::vector<GeoRow>& rows, uint32_t ways = 1000)
 }
 
 // The cell index <prefix>_cells.bin + <prefix>_entries.bin of lists (cell
-// id → ids), into d, as the builder writes it.
+// id → ids), into d, as the builder writes it (in the admin index's format
+// for a prefix of no index's, the place index an old dir held).
 void put_cells(BuildDir& d, const std::string& prefix, const CellLists& lists) {
-    auto [cells, entries] = write_cell_lists(lists);
+    auto [cells, entries] = write_cell_lists(lists, cell_pairs::format_named(prefix).value_or(cell_pairs::ADMIN));
     d[prefix + "_cells.bin"] = cells;
     d[prefix + "_entries.bin"] = entries;
 }
@@ -268,7 +271,7 @@ void put_admin_minimal(BuildDir& d, const ArcGeometry& g, uint32_t n_places) {
     }
     d["place_nodes.bin"] = places;
     CellLists cells;
-    for (uint32_t k = 0; k + 1 < g.keys.size(); k++) cells[cell_id(k)] = {k, (k + 1) | INTERIOR};
+    for (uint32_t k = 0; k + 1 < g.keys.size(); k++) cells[pair_cell(k)] = {k, (k + 1) | INTERIOR};
     put_cells(d, "admin", cells);
     const std::string pool("Testland\0Ville\0", 15);
     d["strings_core.bin"].assign(pool.begin(), pool.end());
@@ -1245,8 +1248,8 @@ TEST(patch_heap_stays_flat_as_a_poi_cell_index_delta_grows) {
         const auto pois = pois_of(rng, 1000, 0, true);
         CellLists old_cells, new_cells;
         for (uint32_t k = 0; k < n; k++) {
-            old_cells[cell_id(k)] = {k % 950};
-            new_cells[cell_id(k)] = {k % 950 + 1};
+            old_cells[pair_cell(k)] = {k % 950};
+            new_cells[pair_cell(k)] = {k % 950 + 1};
         }
         BuildDir old_d, new_d;
         put_pois(old_d, pois);
@@ -1273,8 +1276,8 @@ TEST(patch_heap_stays_flat_as_poi_cells_change) {
         const auto pois = pois_of(rng, 1000, 0, true);
         CellLists old_cells, new_cells;
         for (uint32_t k = 0; k < n; k++) {
-            old_cells[cell_id(2 * k)] = {};
-            new_cells[cell_id(2 * k + 1)] = {};
+            old_cells[pair_cell(2 * k)] = {};
+            new_cells[pair_cell(2 * k + 1)] = {};
         }
         BuildDir old_d, new_d;
         put_pois(old_d, pois);
@@ -1296,7 +1299,7 @@ namespace {
 // polygons keep their slots, so the patch rebuilds the old index as it is.
 CellLists admin_cells_of(uint32_t n_cells, const std::function<std::vector<uint32_t>(uint32_t)>& ids_of) {
     CellLists lists;
-    for (uint32_t k = 0; k < n_cells; k++) lists[cell_id(k)] = ids_of(k);
+    for (uint32_t k = 0; k < n_cells; k++) lists[pair_cell(k)] = ids_of(k);
     return lists;
 }
 
@@ -2021,8 +2024,8 @@ void check_poi_delta_refusals(const std::string& dir_name, const std::vector<Del
     std::mt19937 rng(20261030);
     CellLists old_cells, new_cells;
     for (uint32_t k = 0; k < 20; k++) {
-        old_cells[cell_id(k)] = {k % 7};
-        new_cells[cell_id(k)] = {k % 7 + 1};
+        old_cells[pair_cell(k)] = {k % 7};
+        new_cells[pair_cell(k)] = {k % 7 + 1};
     }
     const auto pois = pois_of(rng, 40, 0, true);
     BuildDir old_d, new_d;
@@ -2170,8 +2173,8 @@ TEST(patch_refuses_a_patch_without_the_delta_of_a_cell_index) {
     std::mt19937 rng(20261031);
     CellLists old_cells, new_cells;
     for (uint32_t k = 0; k < 20; k++) {
-        old_cells[cell_id(k)] = {k % 7};
-        new_cells[cell_id(k)] = {k % 7 + 1};
+        old_cells[pair_cell(k)] = {k % 7};
+        new_cells[pair_cell(k)] = {k % 7 + 1};
     }
     const auto pois = pois_of(rng, 40, 0, true);
     struct Case {
@@ -2225,7 +2228,7 @@ TEST(patch_to_a_dir_without_a_place_index_applies_to_an_old_dir_with_or_without_
         for (const uint32_t w : {i, i == 7 ? 99 : i, NO, NO, NO}) append(new_places, w);
     }
     CellLists place_lists;
-    for (uint32_t k = 0; k < 20; k++) place_lists[cell_id(k)] = {k, k + 20};
+    for (uint32_t k = 0; k < 20; k++) place_lists[pair_cell(k)] = {k, k + 20};
     BuildDir with_index, without_index, new_d;
     with_index["place_nodes.bin"] = without_index["place_nodes.bin"] = old_places;
     put_cells(with_index, "place", place_lists);
@@ -2246,9 +2249,9 @@ TEST(patch_refuses_the_old_place_cell_changes_marker_as_an_unknown_file) {
     ScratchDir dir("patch-place-cell-changes");
     std::mt19937 rng(20261102);
     CellLists old_cells, new_cells;
-    for (uint32_t k = 0; k < 30; k++) old_cells[cell_id(k)] = {k % 7};
-    for (uint32_t k = 0; k < 20; k++) new_cells[cell_id(k)] = {k % 7 + 1};
-    for (uint32_t k = 40; k < 50; k++) new_cells[cell_id(k)] = {2};
+    for (uint32_t k = 0; k < 30; k++) old_cells[pair_cell(k)] = {k % 7};
+    for (uint32_t k = 0; k < 20; k++) new_cells[pair_cell(k)] = {k % 7 + 1};
+    for (uint32_t k = 40; k < 50; k++) new_cells[pair_cell(k)] = {2};
     const auto pois = pois_of(rng, 40, 0, true);
     BuildDir old_d, new_d;
     put_pois(old_d, pois);
@@ -2287,9 +2290,9 @@ TEST(patch_refuses_cell_changes_out_of_order_and_a_second_or_foreign_delta) {
     for (uint32_t k = 0; k < 40; k++) new_rows.push_back({k, {(k + 1) % 10}});
     for (uint32_t k = 60; k < 70; k++) new_rows.push_back({k, {3}});
     CellLists old_cells, new_cells;
-    for (uint32_t k = 0; k < 30; k++) old_cells[cell_id(k)] = {k % 7};
-    for (uint32_t k = 0; k < 20; k++) new_cells[cell_id(k)] = {k % 7 + 1};
-    for (uint32_t k = 40; k < 50; k++) new_cells[cell_id(k)] = {2};
+    for (uint32_t k = 0; k < 30; k++) old_cells[pair_cell(k)] = {k % 7};
+    for (uint32_t k = 0; k < 20; k++) new_cells[pair_cell(k)] = {k % 7 + 1};
+    for (uint32_t k = 40; k < 50; k++) new_cells[pair_cell(k)] = {2};
     const auto pois = pois_of(rng, 40, 0, true);
     BuildDir old_d, new_d;
     put_geo(old_d, old_rows);
@@ -3199,8 +3202,8 @@ TEST(patch_lowmem_round_trips_an_admin_minimal_arc_dir) {
     put_admin_minimal(old_d, old_g, 300);
     put_admin_minimal(new_d, new_g, 300);
     put_at(new_d["place_nodes.bin"], 7 * PLACE_NODE_STRIDE + 16, 2u);
-    CellLists cells = parse_cell_lists(new_d["admin_cells.bin"], new_d["admin_entries.bin"]);
-    cells[cell_id(9)] = {9, 11 | INTERIOR};
+    CellLists cells = parse_cell_lists(new_d["admin_cells.bin"], new_d["admin_entries.bin"], cell_pairs::ADMIN);
+    cells[pair_cell(9)] = {9, 11 | INTERIOR};
     put_cells(new_d, "admin", cells);
     const LowMemCase c{dir.path(), "arc-dir"};
     REQUIRE(prepare(c, old_d, new_d).empty());
@@ -3443,7 +3446,7 @@ TEST(patch_identical_days_copy_the_admin_geometry_ahead_of_the_admin_cells) {
     BuildDir d;
     put_arc_slots(d, arc_slots(40, 30, 12));
     CellLists cells;
-    for (uint32_t k = 0; k < 12; k++) cells[cell_id(k)] = {k};
+    for (uint32_t k = 0; k < 12; k++) cells[pair_cell(k)] = {k};
     put_cells(d, "admin", cells);
     const LowMemCase c{dir.path(), "same"};
     REQUIRE(prepare(c, d, d).empty());

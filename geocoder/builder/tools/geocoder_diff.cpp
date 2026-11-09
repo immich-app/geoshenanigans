@@ -1479,9 +1479,27 @@ static int run(int argc, char* argv[]) {
             removed = std::move(d.removed);
             unmap_file(old_m); unmap_file(new_m);
         };
+        // A cell pair index's cells, decoded: absent files are an index of none.
+        auto diff_pair_cells = [&](const std::string& prefix, std::vector<uint64_t>& added,
+                                   std::vector<uint64_t>& removed) {
+            auto cells_of = [&](const std::string& dir) {
+                const auto lists = parse_cell_lists(read_file(dir + "/" + prefix + "_cells.bin"),
+                                                    read_file(dir + "/" + prefix + "_entries.bin"),
+                                                    cell_pairs::format_of(prefix));
+                std::vector<uint64_t> cells;
+                cells.reserve(lists.size());
+                for (const auto& kv : lists) cells.push_back(kv.first);
+                return cells;
+            };
+            const std::vector<uint64_t> o = cells_of(old_dir), n = cells_of(new_dir);
+            auto d = diff_cell_ids(reinterpret_cast<const char*>(o.data()), o.size(),
+                                   reinterpret_cast<const char*>(n.data()), n.size(), sizeof(uint64_t));
+            added = std::move(d.added);
+            removed = std::move(d.removed);
+        };
         diff_cells(old_dir + "/geo_cells.bin", new_dir + "/geo_cells.bin", 20, g_added, g_removed);
-        diff_cells(old_dir + "/admin_cells.bin", new_dir + "/admin_cells.bin", 12, a_added, a_removed);
-        diff_cells(old_dir + "/poi_cells.bin", new_dir + "/poi_cells.bin", 12, p_added, p_removed);
+        diff_pair_cells("admin", a_added, a_removed);
+        diff_pair_cells("poi", p_added, p_removed);
         log_time("  group:cell_changes", gs);
     });
 
@@ -1764,23 +1782,25 @@ static int run(int argc, char* argv[]) {
     // The delta from a cell index as the patcher rebuilds it from an id remap
     // to the new one, for every index the old or the new dir holds. Admin
     // polygons keep their slots, so the admin index's remap is the identity.
-    // The patcher writes write_cell_lists layout: a new index in any other
-    // can't be rebuilt, and the diff never silently falls back.
+    // The patcher writes through a cell_pairs::Writer: a new index it doesn't
+    // reproduce can't be rebuilt, and the diff never silently falls back.
     auto emit_cell_index_delta = [&](PatchFileId entries_fid, const std::string& prefix,
                                      const std::unordered_map<uint32_t,uint32_t>& rm,
                                      const std::vector<uint64_t>& added, const std::vector<uint64_t>& removed) {
         const std::string cells = "/" + prefix + "_cells.bin", entries = "/" + prefix + "_entries.bin";
         struct stat st;
         if (stat((old_dir + cells).c_str(), &st) != 0 && stat((new_dir + cells).c_str(), &st) != 0) return;
+        const cell_pairs::Format format = cell_pairs::format_of(prefix);
         auto new_c = read_file(new_dir + cells);
         auto new_e = read_file(new_dir + entries);
-        auto new_lists = parse_cell_lists(new_c, new_e);
-        if (write_cell_lists(new_lists) != std::make_pair(new_c, new_e))
+        auto new_lists = parse_cell_lists(new_c, new_e, format);
+        if (write_cell_lists(new_lists, format) != std::make_pair(new_c, new_e))
             throw std::runtime_error("Cell index " + prefix + " has a layout write_cell_lists can't reproduce");
-        auto derived = rebuild_cells_from_remap(read_file(old_dir + cells), read_file(old_dir + entries), rm, added, removed);
+        const CellLists derived =
+            rebuild_cell_lists(parse_cell_lists(read_file(old_dir + cells), read_file(old_dir + entries), format), rm,
+                               added, removed);
         std::vector<char> payload;
-        const CellListDeltaCounts n =
-            append_cell_list_delta(payload, parse_cell_lists(derived.cells_data, derived.entries_data), new_lists);
+        const CellListDeltaCounts n = append_cell_list_delta(payload, derived, new_lists);
         SEC("celldelta:" << prefix);
         uint32_t marker = CELL_INDEX_DELTA_MARKER, file = static_cast<uint32_t>(entries_fid);
         uint64_t size = payload.size();
@@ -2113,16 +2133,17 @@ static int run(int argc, char* argv[]) {
                        stat((new_dir + "/" + cells_name).c_str(), &st) == 0 &&
                        stat((new_dir + "/" + entries_name).c_str(), &st) == 0;
         if (present) {
+            const cell_pairs::Format format = cell_pairs::POSTCODE_CENTROID;
             auto old_c = read_file(old_dir + "/" + cells_name), old_e = read_file(old_dir + "/" + entries_name);
             auto new_c = read_file(new_dir + "/" + cells_name), new_e = read_file(new_dir + "/" + entries_name);
-            auto new_lists = parse_cell_lists(new_c, new_e);
+            auto new_lists = parse_cell_lists(new_c, new_e, format);
             bool unchanged = old_c == new_c && old_e == new_e;
             // Only a layout write_cell_lists reproduces byte for byte can be rebuilt.
-            if (!unchanged && write_cell_lists(new_lists) == std::make_pair(new_c, new_e)) {
+            if (!unchanged && write_cell_lists(new_lists, format) == std::make_pair(new_c, new_e)) {
                 std::vector<char> payload;
                 uint64_t new_entries_size = new_e.size();
                 payload.insert(payload.end(), (const char*)&new_entries_size, (const char*)&new_entries_size + 8);
-                const CellListDeltaCounts n = append_cell_list_delta(payload, parse_cell_lists(old_c, old_e), new_lists);
+                const CellListDeltaCounts n = append_cell_list_delta(payload, parse_cell_lists(old_c, old_e, format), new_lists);
                 SEC("celllist:" << cells_name);
                 uint32_t fid = static_cast<uint32_t>(cells_fid), stride = CELL_LIST_DELTA_STRIDE;
                 uint64_t old_size = old_c.size(), new_size = new_c.size(), payload_size = payload.size();

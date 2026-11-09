@@ -1,6 +1,7 @@
 // Cell index writers (cell_index_io.h): the sorted-table writer must emit the
-// same bytes as the map writer it stands in for, and the streamed geo index
-// the bytes the whole-array writer laid out.
+// same bytes as the map writer it stands in for, both the cell pair files
+// cell_pairs::Writer gives for the same lists (the patcher's), and the streamed
+// geo index the bytes the whole-array writer laid out.
 #include "cell_index_io.h"
 
 #include <array>
@@ -10,6 +11,7 @@
 #include <random>
 #include <string>
 
+#include "patch_format.h"
 #include "scratch_dir.h"
 #include "test_framework.h"
 
@@ -17,7 +19,7 @@ using gctest::refusal_of;
 
 namespace {
 
-std::string read_file(const std::string& path) {
+std::string file_text(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     return std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
 }
@@ -88,10 +90,10 @@ TEST(write_geo_index_matches_the_whole_array_layout) {
         const GeoFiles want = reference_geo_index(tables);
         size_t rows = write_geo_index(dir.path(), tables, per_slice);
         CHECK_EQ(rows, want.geo.size() / 20);
-        CHECK(read_file(dir.path() + "/geo_cells.bin") == want.geo);
+        CHECK(file_text(dir.path() + "/geo_cells.bin") == want.geo);
         for (size_t t = 0; t < GEO_TABLE_COUNT; t++) {
             const std::string path = dir.path() + "/" + GEO_ENTRY_FILENAMES[t];
-            if (tables[t]) CHECK(read_file(path) == want.entries[t]);
+            if (tables[t]) CHECK(file_text(path) == want.entries[t]);
             std::remove(path.c_str());
         }
     }
@@ -105,6 +107,9 @@ TEST(write_geo_index_rejects_a_cell_past_the_count_limit_before_writing) {
     CHECK(!std::ifstream(dir.path() + "/geo_cells.bin").good());
 }
 
+// The level-10 cell of number n: a cell pair index holds cells of one level.
+static uint64_t cell10(uint64_t n) { return cell_pairs::cell_of(n, 10); }
+
 TEST(write_cell_index_sorted_matches_the_map_writer) {
     ScratchDir dir("gctest-cellio");
     std::mt19937_64 rng(4);
@@ -113,7 +118,7 @@ TEST(write_cell_index_sorted_matches_the_map_writer) {
         std::vector<CellItemPair> pairs;
         size_t cells = round == 0 ? 0 : 1 + rng() % 300;
         for (size_t c = 0; c < cells; c++) {
-            uint64_t cell_id = (rng() % 100000) << 20;
+            uint64_t cell_id = cell10(rng() % 100000);
             size_t k = 1 + (rng() % 10 == 0 ? rng() % 400 : rng() % 4);
             for (size_t j = 0; j < k; j++) {
                 uint32_t item = static_cast<uint32_t>(rng() % 50);
@@ -125,71 +130,74 @@ TEST(write_cell_index_sorted_matches_the_map_writer) {
         for (const auto& p : pairs) map[p.cell_id].push_back(p.item_id);
 
         CHECK_EQ(count_cells(pairs), map.size());
-        write_cell_index(dir.path() + "/map_cells.bin", dir.path() + "/map_entries.bin", map);
-        write_cell_index_sorted(dir.path() + "/cells.bin", dir.path() + "/entries.bin", pairs);
-        CHECK(read_file(dir.path() + "/cells.bin") == read_file(dir.path() + "/map_cells.bin"));
-        CHECK(read_file(dir.path() + "/entries.bin") == read_file(dir.path() + "/map_entries.bin"));
+        for (cell_pairs::Format format : {cell_pairs::ADMIN, cell_pairs::POI, cell_pairs::POSTCODE_CENTROID}) {
+            write_cell_index(dir.path() + "/map_cells.bin", dir.path() + "/map_entries.bin", format, map);
+            write_cell_index_sorted(dir.path() + "/cells.bin", dir.path() + "/entries.bin", format, pairs);
+            CHECK(file_text(dir.path() + "/cells.bin") == file_text(dir.path() + "/map_cells.bin"));
+            CHECK(file_text(dir.path() + "/entries.bin") == file_text(dir.path() + "/map_entries.bin"));
+        }
     }
 }
 
-TEST(write_cell_index_writers_lay_out_cells_and_entries_back_to_back) {
-    // Past the blocks the writers split their work into: the files as a
-    // serial walk over the cells, ids sorted within each, lays them out.
+TEST(write_cell_index_writers_write_the_cell_pair_files_of_their_lists) {
+    // Past the blocks the writers split their checks into: the files a
+    // cell_pairs::Writer writes for the same lists, ids sorted within each
+    // cell, which the patcher's rebuild writes too.
     ScratchDir dir("gctest-cellio");
     std::mt19937_64 rng(6);
     std::vector<CellItemPair> pairs;
     for (uint64_t cell = 1; pairs.size() < 400000; cell += 1 + rng() % 3) {
         size_t k = 1 + (rng() % 50 == 0 ? rng() % 300 : rng() % 4);
-        for (size_t j = 0; j < k; j++) pairs.push_back({cell << 10, static_cast<uint32_t>(rng() % 100000)});
+        for (size_t j = 0; j < k; j++) pairs.push_back({cell10(cell), static_cast<uint32_t>(rng() % 100000)});
     }
     std::sort(pairs.begin(), pairs.end(), cell_item_less);
-    std::string cells, entries;
-    for (size_t run = 0; run < pairs.size();) {
-        size_t end = run;
-        while (end < pairs.size() && pairs[end].cell_id == pairs[run].cell_id) end++;
-        append(cells, pairs[run].cell_id);
-        append(cells, static_cast<uint32_t>(entries.size()));
-        append(entries, static_cast<uint16_t>(end - run));
-        for (; run < end; run++) append(entries, pairs[run].item_id);
-    }
+    CellLists lists;
+    for (const auto& p : pairs) lists[p.cell_id].push_back(p.item_id);
     // The map holds each cell's ids in no particular order.
     std::unordered_map<uint64_t, std::vector<uint32_t>> map;
     for (const auto& p : pairs) map[p.cell_id].push_back(p.item_id);
     for (auto& [cell, ids] : map) std::shuffle(ids.begin(), ids.end(), rng);
 
-    write_cell_index_sorted(dir.path() + "/cells.bin", dir.path() + "/entries.bin", pairs);
-    CHECK(read_file(dir.path() + "/cells.bin") == cells);
-    CHECK(read_file(dir.path() + "/entries.bin") == entries);
-    write_cell_index(dir.path() + "/map_cells.bin", dir.path() + "/map_entries.bin", map);
-    CHECK(read_file(dir.path() + "/map_cells.bin") == cells);
-    CHECK(read_file(dir.path() + "/map_entries.bin") == entries);
+    for (cell_pairs::Format format : {cell_pairs::ADMIN, cell_pairs::POI, cell_pairs::POSTCODE_CENTROID}) {
+        const auto [cells, entries] = write_cell_lists(lists, format);
+        write_cell_index_sorted(dir.path() + "/cells.bin", dir.path() + "/entries.bin", format, pairs);
+        CHECK(file_text(dir.path() + "/cells.bin") == std::string(cells.begin(), cells.end()));
+        CHECK(file_text(dir.path() + "/entries.bin") == std::string(entries.begin(), entries.end()));
+        write_cell_index(dir.path() + "/map_cells.bin", dir.path() + "/map_entries.bin", format, map);
+        CHECK(file_text(dir.path() + "/map_cells.bin") == std::string(cells.begin(), cells.end()));
+        CHECK(file_text(dir.path() + "/map_entries.bin") == std::string(entries.begin(), entries.end()));
+        CHECK(parse_cell_lists(cells, entries, format) == lists);
+    }
 }
 
 TEST(write_cell_index_writes_cells_without_ids) {
     // No ids at all: the sorted copy is empty and has no storage to copy from.
     ScratchDir dir("gctest-cellio");
-    std::unordered_map<uint64_t, std::vector<uint32_t>> map = {{3 << 10, {}}};
-    std::string cells, entries;
-    append(cells, uint64_t(3 << 10));
-    append(cells, uint32_t(0));
-    append(entries, uint16_t(0));
-
-    write_cell_index(dir.path() + "/cells.bin", dir.path() + "/entries.bin", map);
-    CHECK(read_file(dir.path() + "/cells.bin") == cells);
-    CHECK(read_file(dir.path() + "/entries.bin") == entries);
+    std::unordered_map<uint64_t, std::vector<uint32_t>> map = {{cell10(3), {}}};
+    write_cell_index(dir.path() + "/cells.bin", dir.path() + "/entries.bin", cell_pairs::ADMIN, map);
+    const std::string cells = file_text(dir.path() + "/cells.bin"), entries = file_text(dir.path() + "/entries.bin");
+    CHECK(parse_cell_lists(std::vector<char>(cells.begin(), cells.end()), std::vector<char>(entries.begin(), entries.end()),
+                           cell_pairs::ADMIN) == CellLists({{cell10(3), {}}}));
+    // An index of no cells: two empty files.
+    write_cell_index(dir.path() + "/cells.bin", dir.path() + "/entries.bin", cell_pairs::ADMIN, {});
+    CHECK(file_text(dir.path() + "/cells.bin").empty() && file_text(dir.path() + "/entries.bin").empty());
 }
 
 TEST(write_cell_index_sorted_rejects_a_table_out_of_order) {
     ScratchDir dir("gctest-cellio");
     CHECK_EQ(refusal_of<std::logic_error>([&] {
-                 write_cell_index_sorted(dir.path() + "/cells.bin", dir.path() + "/entries.bin", {{9, 1}, {3, 1}});
+                 write_cell_index_sorted(dir.path() + "/cells.bin", dir.path() + "/entries.bin", cell_pairs::ADMIN,
+                                         {{cell10(9), 1}, {cell10(3), 1}});
              }),
              "write_cell_index_sorted: table out of order for " + dir.path() + "/entries.bin");
 }
 
 TEST(write_cell_index_sorted_rejects_a_cell_past_the_count_limit) {
     ScratchDir dir("gctest-cellio");
-    std::vector<CellItemPair> pairs(70000, CellItemPair{7, 1});
-    CHECK_EQ(refusal_of([&] { write_cell_index_sorted(dir.path() + "/cells.bin", dir.path() + "/entries.bin", pairs); }),
+    std::vector<CellItemPair> pairs(70000, CellItemPair{cell10(7), 1});
+    CHECK_EQ(refusal_of([&] {
+                 write_cell_index_sorted(dir.path() + "/cells.bin", dir.path() + "/entries.bin", cell_pairs::ADMIN, pairs);
+             }),
              "cell entry count 70000 exceeds uint16 limit (65535) in " + dir.path() + "/entries.bin");
+    CHECK(!std::ifstream(dir.path() + "/cells.bin").good());
 }

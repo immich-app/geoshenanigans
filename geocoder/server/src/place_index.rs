@@ -1,8 +1,8 @@
 //! The place index: the visible place nodes (`PlaceNode::is_visible`, the ones reverse geocoding
 //! reads) of each admin cell (the cell, at the admin cell level, of a node's point), laid out as
-//! the builder lays out a cell index (builder/src/cell_index_io.h): a cells file of rows,
-//! ascending by cell (u64 cell id, u32 offset of its list in the entries file), and an entries
-//! file of the lists (u16 count, then the node ids, ascending).
+//! the builder laid out its cell indexes before the cell pairs (lib.rs `lookup_place_cell_fb`): a
+//! cells file of rows, ascending by cell (u64 cell id, u32 offset of its list in the entries
+//! file), and an entries file of the lists (u16 count, then the node ids, ascending).
 //!
 //! Datasets don't ship it. `open` derives it from place_nodes.bin the first time a dataset loads,
 //! into DERIVED_DIR beside the dataset's files (or, where those can't be written, into a private

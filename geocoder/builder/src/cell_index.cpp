@@ -667,7 +667,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     auto admin_future = std::async(std::launch::async, [&] {
         timed_phase(label + "admin cells", [&] {
             write_cell_index_sorted(output_dir + "/admin_cells.bin", output_dir + "/admin_entries.bin",
-                                    data.admin_index_cells);
+                                    cell_pairs::ADMIN, data.admin_index_cells);
         });
         std::cerr << "admin index: " << count_cells(data.admin_index_cells) << " cells, " << data.admin_polygons.size() << " polygons" << std::endl;
     });
@@ -1010,7 +1010,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             }
             write_cell_index(output_dir + "/postcode_centroid_cells.bin",
                              output_dir + "/postcode_centroid_entries.bin",
-                             centroid_cells);
+                             cell_pairs::POSTCODE_CENTROID, centroid_cells);
 
             std::cerr << "postcode centroids: " << centroids.size() << " entries, "
                       << centroid_cells.size() << " cells" << std::endl;
@@ -1440,7 +1440,7 @@ void write_admin_minimal_dir(const ParsedData& data, const std::string& dir, con
     // Own slots renumber the ids: each cell's back in canonical order (the
     // shared slots keep it).
     parallel_sort(cells.begin(), cells.end(), cell_item_less);
-    write_cell_index_sorted(dir + "/admin_cells.bin", dir + "/admin_entries.bin", cells);
+    write_cell_index_sorted(dir + "/admin_cells.bin", dir + "/admin_entries.bin", cell_pairs::ADMIN, cells);
 
     write_binary_file(dir + "/" + STR_TIER_FILENAMES[0], strings.core.data(), strings.core.size());
     write_strings_layout(dir, strings.bases);

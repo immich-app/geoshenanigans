@@ -259,7 +259,7 @@ and 1450 s in 32 MiB (19.2 GiB).
 4. Read secondary ID remaps → each replayed file's moved pairs, read where they sit, beside its derived ID mappings
 5. Read cell changes (added/removed cell IDs) and the per-cell entry deltas
 6. Rebuild geo_cells and the street / addr / interp entry files in one pass over the old geo index: each cell's lists with their IDs remapped, corrected by the cell's delta
-7. Rebuild the admin / POI cell indexes from their ID remaps + cell changes (v14: the admin index's ids as they are, since admin polygons keep their slots), corrected by the Cell Index Delta
+7. Rebuild the admin / POI cell indexes from their ID remaps + cell changes (v14: the admin index's ids as they are, since admin polygons keep their slots), corrected by the Cell Index Delta: the old index decoded and the new one encoded block by block (`src/cell_pairs.h`), so the files hash as the build's
 
 ## Known Issues
 
@@ -585,11 +585,15 @@ Cell Index Delta: marker 0xFFFFFFF7 (u32) + file_id (u32, the entries file)
   entries file; the patcher refuses another file or a second one. (v10) One
   for every index the old or new dir holds: the patcher refuses a patch
   without the delta of an index its dir holds or the patch lists ("Patch has
-  no cell index delta for <prefix>"). The patcher writes the index in the
-  builder's layout (each cell's list at the next offset, an empty one as a
-  zero count), and the diff refuses a new index in any other ("Cell index
+  no cell index delta for <prefix>"). The patcher reads the old index and
+  writes the new one through the builder's own codec (`src/cell_pairs.h`:
+  a Reader and a Writer, each front to back, holding a parent record, a
+  block of lists and the parent bitmap and directory), and the diff refuses
+  a new index that Writer doesn't reproduce byte for byte ("Cell index
   <prefix> has a layout write_cell_lists can't reproduce"); Entry
   Corrections (marker 0xFFFFFFF8, whole lists for such an index) are gone.
+  The runs' ranks and the cells' ids don't depend on how the files lay the
+  lists out, so the delta is the same whatever the layout.
 
 End marker: 0xFFFFFFFF (u32)
 ```

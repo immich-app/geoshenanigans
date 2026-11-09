@@ -334,8 +334,8 @@ impl<'a, 'g> Searcher<'a, 'g> {
     fn cell_polygons(&self, lat: f32, lng: f32) -> Vec<(u32, AdminPolygon, bool)> {
         let geo: &Index = self.idx.geo;
         let cell = cell_id_at_level(lat as f64, lng as f64, geo.admin_cell_level);
-        let off = Index::lookup_admin_cell_fb(&geo.admin_cells, cell);
-        Index::read_entries_fb(&geo.admin_entries, off)
+        geo.admin_index
+            .ids(cell)
             .into_iter()
             .map(|id| (id & ID_MASK, polygon_raw(geo, id & ID_MASK), id & INTERIOR_FLAG != 0))
             .filter(|(_, ap, _)| ap.name_id != NO_DATA)

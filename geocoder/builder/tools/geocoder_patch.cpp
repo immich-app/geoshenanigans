@@ -716,7 +716,10 @@ static int run(int argc, char* argv[]) {
             const std::string suffix = "_cells.bin";
             if (cells_name.size() < suffix.size() || cells_name.compare(cells_name.size() - suffix.size(), suffix.size(), suffix) != 0)
                 throw std::runtime_error("Cell list delta for " + cells_name);
-            std::string entries_name = cells_name.substr(0, cells_name.size() - suffix.size()) + "_entries.bin";
+            const std::string prefix = cells_name.substr(0, cells_name.size() - suffix.size());
+            const std::optional<cell_pairs::Format> format = cell_pairs::format_named(prefix);
+            if (!format) throw std::runtime_error("Cell list delta for " + cells_name);
+            std::string entries_name = prefix + "_entries.bin";
             uint64_t payload_size = patch.u64();
             if (payload_size < 8) throw std::runtime_error("Malformed cell list delta");
             const char* payload = patch.take(payload_size, "cell list delta");
@@ -725,18 +728,17 @@ static int run(int argc, char* argv[]) {
             SequentialFileReader old_e(cur_dir + "/" + entries_name);
             FILE* fc = open_out(cells_name);
             FILE* fe = open_out(entries_name);
-            uint64_t cells_written = 0;
-            uint64_t entries_written = stream_cell_list_delta(
-                old_c, old_e, payload + 8, payload_size - 8,
-                [&](const char* p, size_t n) { fwrite(p, 1, n, fc); cells_written += n; },
+            const CellIndexWritten written = stream_cell_list_delta(
+                old_c, old_e, *format, payload + 8, payload_size - 8,
+                [&](const char* p, size_t n) { fwrite(p, 1, n, fc); },
                 [&](const char* p, size_t n) { fwrite(p, 1, n, fe); });
             close_patch_outputs({{fc, cells_name}, {fe, entries_name}});
             log_rewinds(old_c);
             log_rewinds(old_e);
-            if (cells_written != new_size || entries_written != new_entries_size)
+            if (written.cells_bytes != new_size || written.entries_bytes != new_entries_size)
                 throw std::runtime_error("Rebuilt " + cells_name + " does not match the new build");
             std::cerr << "  " << cells_name << " + " << entries_name << ": cell list delta, "
-                      << cells_written / 12 << " cells" << section_io() << std::endl;
+                      << written.rows << " cells" << section_io() << std::endl;
             continue;
         }
         if (stride == PARALLEL_DELTA_STRIDE) {
@@ -1321,14 +1323,15 @@ static int run(int argc, char* argv[]) {
                 SequentialFileReader old_e(cur_dir + "/" + entries_name);
                 FILE* fc = open_out(cells_name);
                 FILE* fe = open_out(entries_name);
-                size_t n_out = 0;
-                stream_cell_index(old_c, old_e, changes.added, changes.removed, remap, P + delta->pos, delta->size,
-                                  [&](const char* p, size_t len) { fwrite(p, 1, len, fc); n_out += len; },
-                                  [&](const char* p, size_t len) { fwrite(p, 1, len, fe); });
+                const CellIndexWritten written =
+                    stream_cell_index(old_c, old_e, cell_pairs::format_of(prefix), changes.added, changes.removed, remap,
+                                      P + delta->pos, delta->size,
+                                      [&](const char* p, size_t len) { fwrite(p, 1, len, fc); },
+                                      [&](const char* p, size_t len) { fwrite(p, 1, len, fe); });
                 close_patch_outputs({{fc, cells_name}, {fe, entries_name}});
                 log_rewinds(old_c);
                 log_rewinds(old_e);
-                std::cerr << "  " << label << ": " << n_out / 12 << " cells, cell index delta" << std::endl;
+                std::cerr << "  " << label << ": " << written.rows << " cells, cell index delta" << std::endl;
             } else if (listed.count(cells_name) || stat((cur_dir + "/" + cells_name).c_str(), &st) == 0) {
                 throw std::runtime_error("Patch has no cell index delta for " + prefix);
             }
