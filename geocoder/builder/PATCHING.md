@@ -142,7 +142,9 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 - **build-index** (`src/build_index.cpp`): Builder with deterministic ordering. It builds into a
   new or empty output dir and refuses any other, since every file there is diffed and published
   as the build's
-- **geocoder-diff** (`tools/geocoder_diff.cpp`): Compares two builds, produces `.gcpatch`
+- **geocoder-diff** (`tools/geocoder_diff.cpp`): Compares two builds, produces `.gcpatch`. The
+  POI files are R2 records and V2 polygon blocks on disk (`src/poi_files.h`); the diff decodes both
+  days' into their logical form (today's 36-byte records and vertex stream) and merges those
 - **geocoder-patch** (`tools/geocoder_patch.cpp`): Applies patch, produces new build. It links
   the static libzstd (`libzstd.a`) and decompresses the patch in process;
   `cmake -DGEOCODER_PATCH_LIBZSTD=OFF` builds it on the `zstd` command on PATH instead, for a host
@@ -150,13 +152,15 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 - **patch_format.h** (`tools/patch_format.h`): Shared format definitions + rebuild functions
 - **geocoder-gc** (`tools/gc.cpp`, `tools/gc_*.h`): Encodes a variant dir into the compact installed
   set (the encoded files and a `gc.manifest`) and decodes one back to today's files, byte for byte,
-  each into a new or empty dir
+  each into a new or empty dir. The POI files are compact in every dir, and it links them as they
+  are
 - **gcs_\*.h** (`tools/gcs_patch.h`, `gcs_codec.h`, `gcs_io.h`, `gcs_async.h`): geocoder-patch's
-  low-memory mode. When the old dir is an encoded installed set (a `gc.manifest` beside the files,
-  as geocoder-gc writes it), the encoded families' old files are decoded and their new files
-  encoded in process, a family's records and their child stream replay together, and the output
-  is the new encoded set, geocoder-gc's encoding of the new dir; `--threads` gives each codec a
-  thread
+  in-process codecs. The POI files are decoded and their new ones encoded in every dir (one record
+  and one polygon in flight; a polygon past 256 KiB a piece at a time). In low-memory mode, when
+  the old dir is an encoded installed set (a `gc.manifest` beside the files, as geocoder-gc writes
+  it), gc's families too, and the output is the new encoded set, geocoder-gc's encoding of the new
+  dir. An encoded family's records and their child stream replay together; `--threads` gives each
+  codec a thread
 
 ### Patcher memory and speed
 
@@ -487,8 +491,9 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   position: its MATCH bytes are the old bytes of the parent records at the
   same places, a MATCH or REPLACE record's own or, where a DELETE run is
   followed by an INSERT run, the deleted record's for the inserted one at the
-  same place in the run. The low-memory mode decodes both files from one
-  stream, and refuses a replay that reads one of them 4 MiB
+  same place in the run. An encoded family (the POI files in every dir,
+  gc's in low-memory mode) decodes both files from one stream, and the
+  patcher refuses a replay that reads one of them 4 MiB
   (MAX_DECODER_SKEW) ahead of the other ("Malformed merge sequence: <file>
   runs ahead of <file>").
   Offset fixups (node_offset / vertex_offset of MATCH records, see
@@ -624,8 +629,8 @@ layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
 | 8 | `geo_cells.bin` | geo cell changes (0xFFFFFFFB), rebuilt with `geo_entries.bin` (35) beside the geo entry deltas |
 | 9-11 | the geo index's street, address and interpolation lists (no files of their own since GXT2: a file section naming one is refused) | geo entry deltas (0xFFFFFFF0) |
 | 12, 13 | `admin_cells.bin`, `admin_entries.bin` | admin cell changes (0xFFFFFFFA) and a cell index delta (0xFFFFFFF7), over the old index's ids as they are (v14) |
-| 14 | `poi_records.bin` | merge at stride 36, string fields `name_id`, `parent_street_id` and `parent_postcode_id` |
-| 15 | `poi_vertices.bin` | child stream of poi_records, at stride 1 |
+| 14 | `poi_records.bin` | merge of the logical records (R2 decoded) at stride 36, string fields `name_id`, `parent_street_id` and `parent_postcode_id`; the client list gives the R2 file's size |
+| 15 | `poi_vertices.bin` | child stream of poi_records, of the logical vertex stream (V2 decoded), at stride 1 |
 | 16, 17 | `poi_cells.bin`, `poi_entries.bin` | POI cell changes (0xFFFFFFF5) and a cell index delta |
 | 18 | `place_nodes.bin` | merge at stride 20, string field `name_id` |
 | 19 | `addr_postcodes.bin` | parallel delta along addr_points, remap kind 2 |

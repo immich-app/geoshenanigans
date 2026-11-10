@@ -24,6 +24,8 @@ pub use exact_pip::{edge_crosses, on_edge, to_e7, PointE7};
 mod file_stamp;
 pub use file_stamp::FileStamp;
 mod place_index;
+pub mod poi_files;
+pub use poi_files::PoiRecords;
 #[cfg(test)]
 mod scratch_dir;
 
@@ -326,13 +328,13 @@ pub struct NodeCoord {
     pub lng: f32,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
+/// A POI as poi_records.bin's row and dictionaries give it (poi_files.rs).
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PoiRecord {
     pub lat: f32,
     pub lng: f32,
-    pub vertex_offset: u32,       // BYTE offset into poi_vertices.bin (to header), NO_DATA for point POIs
-    pub vertex_count: u32,
+    /// Where the POI's polygon block starts in poi_vertices.bin; NO_DATA for a point.
+    pub vertex_offset: u32,
     pub name_id: u32,
     pub category: u8,
     pub tier: u8,
@@ -360,6 +362,13 @@ pub struct PoiRecord {
     /// boundary contains the POI (e.g. ocean nodes, cross-border
     /// features lost during continent-filter remap).
     pub parent_poly_id: u32,
+}
+
+impl PoiRecord {
+    /// Whether the POI is a polygon (has a block in poi_vertices.bin), not a point.
+    pub fn is_polygon(&self) -> bool {
+        self.vertex_offset != NO_DATA
+    }
 }
 
 #[repr(C)]
@@ -1053,7 +1062,7 @@ pub struct Index {
     pub admin_polygons: FileBytes,
     pub admin_geometry: AdminGeometry,
     pub poi_index: Option<CellPairs>,
-    pub poi_records: Option<FileBytes>,
+    pub poi_records: Option<PoiRecords>,
     pub poi_vertices: Option<FileBytes>,
     pub poi_meta: PoiMeta,
     pub place_nodes: Option<FileBytes>,
@@ -1293,6 +1302,8 @@ impl Index {
         let pairs = |prefix: &str, cells: FileBytes, entries: FileBytes, format: cell_pairs::Format| {
             CellPairs::open(cells, entries, format, admin_cell_level).map_err(|e| format!("{dir}/{prefix}_cells.bin: {e}"))
         };
+        let poi_records =
+            poi_records.map(|f| PoiRecords::open(f).map_err(|e| format!("{dir}/poi_records.bin: {e}"))).transpose()?;
         let poi_index = match (poi_cells, poi_entries) {
             (Some(c), Some(e)) => Some(pairs("poi", c, e, cell_pairs::POI)?),
             _ => None,
@@ -1341,12 +1352,18 @@ impl Index {
         self.strings.get(offset)
     }
 
-    /// Decode a POI polygon's quantized vertex slice from `poi_vertices` (optional file): the
-    /// inline 10-byte polygon header (encoding + bbox_min) at `poly.vertex_offset`, then the
-    /// vertices that follow.
+    /// A POI polygon's vertices, decoded from its block in `poi_vertices` (optional file): None
+    /// for a point.
     pub fn poi_verts(&self, poly: &PoiRecord) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
-        let v = self.poi_vertices.as_ref()?;
-        decode_polygon_verts(v, poly.vertex_offset, poly.vertex_count)
+        poi_files::polygon(self.poi_vertices.as_ref()?, poly).map(std::borrow::Cow::Owned)
+    }
+
+    /// A POI's vertex count: 0 for a point, None where its polygon can't be read.
+    pub fn poi_vertex_count(&self, poi: &PoiRecord) -> Option<u32> {
+        if !poi.is_polygon() {
+            return Some(0);
+        }
+        poi_files::vertex_count(self.poi_vertices.as_ref()?, poi)
     }
 
     /// Decode an addr_point's polygon footprint vertex slice.  Same
@@ -1379,10 +1396,7 @@ impl Index {
     }
 
     pub fn poi_record(&self, idx: u32) -> Option<PoiRecord> {
-        let m = self.poi_records.as_ref()?;
-        let total = m.len() / std::mem::size_of::<PoiRecord>() as u64;
-        if (idx as u64) >= total { return None; }
-        let pr = m.read_at::<PoiRecord>(idx as u64);
+        let pr = self.poi_records.as_ref()?.record(idx)?;
         // The builder ships no unnamed POI, so a nameless record is a tombstone.
         if pr.name_id == NO_DATA { return None; }
         Some(pr)
@@ -1703,7 +1717,7 @@ impl Index {
                 "dist_m": to_m(d),
                 "name": self.get_string(p.name_id),
                 "parent_street": if p.parent_street_id != NO_DATA { self.get_string(p.parent_street_id) } else { "" },
-                "vertex_count": p.vertex_count,
+                "vertex_count": self.poi_vertex_count(&p),
                 "category": p.category,
                 "category_name": self.poi_meta.category_name(p.category),
             })),
@@ -2337,7 +2351,7 @@ impl Index {
                 // otherwise min distance to any edge; for point POIs,
                 // direct point-to-point distance.
                 let dist_sq_val;
-                if poi.vertex_count > 0 && poi.vertex_offset != NO_DATA {
+                if poi.is_polygon() {
                     let Some(verts) = self.poi_verts(&poi) else { return; };
                     let count = verts.len();
                     if is_interior || point_in_polygon(lat as f32, lng as f32, &verts) {
@@ -2439,7 +2453,7 @@ impl Index {
                 // area).
                 let mut area_sq_deg = 0.0_f64;
 
-                if poi.vertex_count > 0 && poi.vertex_offset != NO_DATA {
+                if poi.is_polygon() {
                     let Some(verts) = self.poi_verts(&poi) else { return; };
                     let count = verts.len();
                     contained = is_interior || point_in_polygon(lat as f32, lng as f32, &verts);
@@ -2518,7 +2532,7 @@ impl Index {
                     category_id: poi.category,
                     distance_m: if contained { 0.0 } else { dist_m },
                     contained,
-                    is_point: poi.vertex_count == 0,
+                    is_point: !poi.is_polygon(),
                     score,
                     area: area_sq_deg,
                 });
@@ -3113,8 +3127,7 @@ impl Index {
                 // (housenumber, street) drive the result.
                 if addr_dist == 0.0 {
                     effective_poi_dist = f64::MAX;
-                } else if addr_pt.vertex_count == 0 && poi.vertex_count > 0
-                    && poi.vertex_offset != NO_DATA {
+                } else if addr_pt.vertex_count == 0 && poi.is_polygon() {
                     let mut inside = false;
                     if let Some(verts) = self.poi_verts(&poi) {
                         inside = point_in_polygon(addr_pt.lat, addr_pt.lng, &verts);
@@ -3170,7 +3183,7 @@ impl Index {
         };
         let compare_poi_dist = match poi_primary.as_ref() {
             Some((_, poi)) if poi.tier == 1
-                && poi.vertex_count > 0
+                && poi.is_polygon()
                 && effective_poi_dist < max_dist => {
                 if effective_poi_dist > tier1_bonus_sq {
                     effective_poi_dist - tier1_bonus_sq
@@ -3210,7 +3223,7 @@ impl Index {
                 // query, matching nominatim's rank-30 chain walk.
                 let (_, poi) = poi_primary.unwrap();
                 let is_highway_poi = (poi.flags & POI_FLAG_HIGHWAY) != 0;
-                let use_poi_name = is_highway_poi && poi.vertex_count > 0 && poi_dist == 0.0;
+                let use_poi_name = is_highway_poi && poi.is_polygon() && poi_dist == 0.0;
                 if use_poi_name {
                     road = Some(self.get_string(poi.name_id));
                 } else if poi.parent_street_id != NO_DATA {
@@ -3912,14 +3925,14 @@ mod query_tests {
         let (mut records, mut poi_pairs) = (Vec::new(), Vec::new());
         for (id, &(north, east, name, category, importance)) in pois.iter().enumerate() {
             let (lat, lng) = at(north, east);
-            records.extend_from_slice(&(lat as f32).to_le_bytes());
-            records.extend_from_slice(&(lng as f32).to_le_bytes());
-            u32s(&mut records, &[NO_DATA, 0, name.map_or(NO_DATA, &mut string)]);
-            records.extend_from_slice(&[category, 0, 0, importance]);
-            u32s(&mut records, &[NO_DATA, NO_DATA, NO_DATA]);
+            let record = PoiRecord {
+                lat: lat as f32, lng: lng as f32, vertex_offset: NO_DATA, name_id: name.map_or(NO_DATA, &mut string), category,
+                tier: 0, flags: 0, importance, parent_street_id: NO_DATA, parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
+            };
+            records.push((record, None));
             poi_pairs.push((cell((lat, lng)), id as u32));
         }
-        assert_eq!(records.len(), pois.len() * std::mem::size_of::<PoiRecord>());
+        let (records, vertices) = poi_files::encode(&records);
         let (mut centroid_records, mut centroid_pairs) = (Vec::new(), Vec::new());
         for (id, &(north, east, postcode, country)) in centroids.iter().enumerate() {
             let (lat, lng) = at(north, east);
@@ -3934,7 +3947,8 @@ mod query_tests {
         let end = strings.len() as u32;
         Index {
             poi_index: Some(cell_pairs::from_pairs(poi_pairs, cell_pairs::POI)),
-            poi_records: Some(FileBytes::Owned(records)),
+            poi_records: Some(PoiRecords::open(FileBytes::Owned(records)).unwrap()),
+            poi_vertices: Some(FileBytes::Owned(vertices)),
             poi_meta: PoiMeta::from_json(POI_META),
             postcode_centroids: Some(FileBytes::Owned(centroid_records)),
             postcode_centroid_index: Some(cell_pairs::from_pairs(centroid_pairs, cell_pairs::POSTCODE_CENTROID)),
@@ -3985,6 +3999,95 @@ mod query_tests {
 
         assert_eq!(postcode, Some("75000"));
         assert_eq!(read, 4);
+    }
+
+    /// 150 POIs of POI_META's categories on a 300 m grid around origin(), named from 30 names:
+    /// points and polygons (squares and triangles 40 to 400 m across, of every vertex encoding,
+    /// open and closed rings), one in fifteen a tombstone, two in three with a parent street.
+    fn poi_jumble() -> Vec<(PoiRecord, Option<poi_files::PoiPolygon>)> {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut pick = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let grid = |k: usize| (k as f64 - 5.0) * 300.0;
+        (0..150)
+            .map(|k| {
+                let (north, east) = (grid(pick(11)), grid(pick(11)));
+                let (lat, lng) = at(north, east);
+                let polygon = (pick(2) == 0).then(|| {
+                    let encoding = pick(4) as u8;
+                    let half = [20.0, 80.0, 200.0][pick(3)];
+                    let mut corners = vec![at(north - half, east - half), at(north - half, east + half), at(north + half, east + half)];
+                    if pick(2) == 0 {
+                        corners.push(at(north + half, east - half));
+                    }
+                    let (bmin_lat, bmin_lng) = (corners[0].0 as f32, corners[0].1 as f32);
+                    let scale = vertex_scale(encoding);
+                    let mut q: Vec<(u32, u32)> = corners
+                        .iter()
+                        .map(|&(a, b)| (((a - bmin_lat as f64) / scale).round() as u32, ((b - bmin_lng as f64) / scale).round() as u32))
+                        .collect();
+                    if pick(2) == 0 {
+                        q.push(q[0]);
+                    }
+                    poi_files::PoiPolygon { encoding, bmin_lat, bmin_lng, q }
+                });
+                let record = PoiRecord {
+                    lat: lat as f32, lng: lng as f32, vertex_offset: 0,
+                    name_id: if pick(15) == 0 { NO_DATA } else { 6 * pick(30) as u32 },
+                    category: [0, 1, 2, 60, 93][pick(5)], tier: 1 + pick(3) as u8, flags: 0, importance: [0, 1, 20, 100][pick(4)],
+                    parent_street_id: if pick(3) == 0 { NO_DATA } else { 6 * pick(30) as u32 },
+                    parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
+                };
+                let _ = k;
+                (record, polygon)
+            })
+            .collect()
+    }
+
+    /// The POI lookups of an index of the jumble, on a 250 m grid and at each POI: every
+    /// find_pois match and find_nearest_poi_with_parent's answer, as text.
+    fn poi_jumble_answers() -> (usize, usize, u64) {
+        let pois = poi_jumble();
+        let own = cell_id_at_level(origin().0, origin().1, DEFAULT_ADMIN_CELL_LEVEL);
+        let pairs = pois.iter().enumerate().filter(|(_, (r, _))| r.name_id != NO_DATA).map(|(i, _)| (own, i as u32));
+        let strings: Vec<u8> = (0..30).flat_map(|k| format!("Lieu{k:02}").into_bytes().into_iter().chain([0])).collect();
+        let end = strings.len() as u32;
+        let (records, vertices) = poi_files::encode(&pois);
+        let idx = Index {
+            poi_index: Some(cell_pairs::from_pairs(pairs.collect::<Vec<_>>(), cell_pairs::POI)),
+            poi_records: Some(PoiRecords::open(FileBytes::Owned(records)).unwrap()),
+            poi_vertices: Some(FileBytes::Owned(vertices)),
+            poi_meta: PoiMeta::from_json(POI_META),
+            strings: StringPool::from_parts([Some(FileBytes::Owned(strings)), None, None, None, None], [0, end, end, end, end, end]),
+            ..index(&[], &[])
+        };
+        let points = (0..13 * 13).map(|k| at((k / 13) as f64 * 250.0 - 1500.0, (k % 13) as f64 * 250.0 - 1500.0))
+            .chain(pois.iter().map(|(r, _)| (r.lat as f64, r.lng as f64)));
+        let (mut matches, mut contained, mut hash) = (0, 0, 0xcbf2_9ce4_8422_2325_u64);
+        for (lat, lng) in points {
+            assert_eq!(cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL), own, "({lat}, {lng})");
+            let listed: Vec<_> = idx.find_pois(lat, lng).iter()
+                .map(|p| (p.name, p.category_id, p.distance_m.to_bits(), p.contained, p.is_point, p.score.to_bits(), p.area.to_bits()))
+                .collect();
+            matches += listed.len();
+            contained += listed.iter().filter(|p| p.3).count();
+            let nearest = idx.find_nearest_poi_with_parent(lat, lng).map(|(d, p)| (d.to_bits(), p.name_id, p.category, p.lat.to_bits()));
+            for b in format!("{listed:?} {nearest:?}").bytes() {
+                hash = (hash ^ b as u64).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        (matches, contained, hash)
+    }
+
+    #[test]
+    fn poi_lookups_answer_as_the_old_reader_did() {
+        // The answers today's 36-byte records and vertex stream gave for the jumble (the reader
+        // before R2 and V2, at 447a8a3), match for match and bit for bit.
+        assert_eq!(poi_jumble_answers(), (1593, 103, 6_893_521_405_585_614_420));
     }
 
     #[test]
@@ -7226,15 +7329,20 @@ mod admin_scan_tests {
     /// own parent street, listed in Q's cell (interior or not).
     fn with_polygon_poi(mut idx: Index, named_after: u32, (lat0, lng0, lat1, lng1): (f64, f64, f64, f64), interior: bool) -> Index {
         let name_id = idx.admin_polygon(named_after).unwrap().name_id;
-        let f32s = |values: &[f64]| values.iter().flat_map(|&v| (v as f32).to_le_bytes()).collect::<Vec<u8>>();
-        // The polygon header (raw f32 vertices, encoding 4, then the box's low corner), then the vertices.
-        let vertices = [&[4u8, 0][..], &f32s(&[lat0, lng0]), &f32s(&[lat0, lng0, lat0, lng1, lat1, lng1, lat1, lng0])].concat();
-        let record = [&f32s(&[(lat0 + lat1) / 2.0, (lng0 + lng1) / 2.0])[..], &0u32.to_le_bytes(), &4u32.to_le_bytes(),
-            &name_id.to_le_bytes(), &[1u8, 0, 0, 0], &name_id.to_le_bytes(), &NO_DATA.to_le_bytes(), &NO_DATA.to_le_bytes()].concat();
-        assert_eq!(record.len(), std::mem::size_of::<PoiRecord>());
+        // The box at 1e-7 degrees (encoding 3) from its low corner.
+        let q = |v: f64, from: f64| ((v - (from as f32) as f64) / 1e-7).round() as u32;
+        let polygon = poi_files::PoiPolygon {
+            encoding: 3, bmin_lat: lat0 as f32, bmin_lng: lng0 as f32,
+            q: [(lat0, lng0), (lat0, lng1), (lat1, lng1), (lat1, lng0)].iter().map(|&(a, b)| (q(a, lat0), q(b, lng0))).collect(),
+        };
+        let record = PoiRecord {
+            lat: ((lat0 + lat1) / 2.0) as f32, lng: ((lng0 + lng1) / 2.0) as f32, vertex_offset: 0, name_id, category: 1, tier: 0,
+            flags: 0, importance: 0, parent_street_id: name_id, parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
+        };
+        let (records, vertices) = poi_files::encode(&[(record, Some(polygon))]);
         let entry = if interior { INTERIOR_FLAG } else { 0 };
         idx.poi_index = Some(cell_pairs::from_pairs([(cells()[0], entry)], cell_pairs::POI));
-        idx.poi_records = Some(FileBytes::Owned(record));
+        idx.poi_records = Some(PoiRecords::open(FileBytes::Owned(records)).unwrap());
         idx.poi_vertices = Some(FileBytes::Owned(vertices));
         idx
     }
@@ -7267,7 +7375,7 @@ mod admin_scan_tests {
     fn a_poi_whose_parent_has_no_rings_passes_the_chain_check() {
         let idx = admin_index(&[ring("Sudan", 2, 97.0, SUDAN, &[]), ringless("Ringless", 8, &[])]);
         let poi = |parent_poly_id: u32| PoiRecord {
-            lat: 0.0, lng: 0.0, vertex_offset: NO_DATA, vertex_count: 0, name_id: 0, category: 0, tier: 0, flags: 0,
+            lat: 0.0, lng: 0.0, vertex_offset: NO_DATA, name_id: 0, category: 0, tier: 0, flags: 0,
             importance: 0, parent_street_id: NO_DATA, parent_postcode_id: NO_DATA, parent_poly_id,
         };
 
@@ -7278,15 +7386,17 @@ mod admin_scan_tests {
     #[test]
     fn a_nameless_poi_record_is_a_tombstone_point_or_polygon() {
         let mut idx = admin_index(&[]);
-        let poi = |name_id: u32, vertex_offset: u32| {
-            let vertex_count: u32 = if vertex_offset == NO_DATA { 0 } else { 4 };
-            [&0f32.to_le_bytes()[..], &0f32.to_le_bytes(), &vertex_offset.to_le_bytes(), &vertex_count.to_le_bytes(),
-             &name_id.to_le_bytes(), &[0u8, 3, 0, 1], &0u32.to_le_bytes(), &NO_DATA.to_le_bytes(), &NO_DATA.to_le_bytes()]
-                .concat()
+        let poi = |name_id: u32, polygon: bool| {
+            let record = PoiRecord {
+                lat: 0.0, lng: 0.0, vertex_offset: 0, name_id, category: 0, tier: 3, flags: 0, importance: 1,
+                parent_street_id: 0, parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
+            };
+            let square = poi_files::PoiPolygon { encoding: 0, bmin_lat: 0.0, bmin_lng: 0.0, q: vec![(0, 0), (0, 1), (1, 1), (1, 0)] };
+            (record, polygon.then_some(square))
         };
-        let records = [poi(0, NO_DATA), poi(0, 0), poi(NO_DATA, NO_DATA), poi(NO_DATA, 0)];
-        assert!(records.iter().all(|r| r.len() == std::mem::size_of::<PoiRecord>()));
-        idx.poi_records = Some(FileBytes::Owned(records.concat()));
+        let (records, vertices) = poi_files::encode(&[poi(0, false), poi(0, true), poi(NO_DATA, false), poi(NO_DATA, true)]);
+        idx.poi_records = Some(PoiRecords::open(FileBytes::Owned(records)).unwrap());
+        idx.poi_vertices = Some(FileBytes::Owned(vertices));
 
         let live: Vec<bool> = (0..4).map(|i| idx.poi_record(i).is_some()).collect();
 

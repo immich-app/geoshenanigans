@@ -152,7 +152,7 @@ struct JointChild {
         SectionReader in(P, size, at, "patch: child section");
         fid = in.u32();
         if (fid != want_fid)
-            throw std::runtime_error(std::string("Encoded set: ") + patch_file_names[want_fid] + " does not follow its parent in the patch");
+            throw std::runtime_error(std::string("Encoded family: ") + patch_file_names[want_fid] + " does not follow its parent in the patch");
         stride = in.u32();
         old_size = in.u64();
         new_size = in.u64();
@@ -165,14 +165,14 @@ struct JointChild {
             if (kind == FULL && ds != new_size) throw std::runtime_error("Malformed child full replacement");
             stride = 1;
         } else if (stride == SPARSE_DELTA_STRIDE || stride == CELL_LIST_DELTA_STRIDE || stride == PARALLEL_DELTA_STRIDE) {
-            throw std::runtime_error("Encoded set: unexpected section kind for a child stream");
+            throw std::runtime_error("Encoded family: unexpected section kind for a child stream");
         } else {
             require_merge_records(patch_file_names[fid], old_size, new_size, stride, file_records_max);
             const uint32_t n_runs = in.u32(), n_values = in.u32(), runs_size = in.u32(), values_size = in.u32();
             if (n_runs || n_values || runs_size || values_size)
-                throw std::runtime_error("Encoded set: a child stream with offset fixups");
+                throw std::runtime_error("Encoded family: a child stream with offset fixups");
             const uint32_t n_string_fixups = in.u32(), string_fixups_size = in.u32();
-            if (n_string_fixups || string_fixups_size) throw std::runtime_error("Encoded set: a child stream with string fixups");
+            if (n_string_fixups || string_fixups_size) throw std::runtime_error("Encoded family: a child stream with string fixups");
             const uint64_t ss = in.u64();
             seq = q = at;
             in.take(ss);
@@ -397,19 +397,18 @@ static int run(int argc, char* argv[]) {
     }
     // The output is exactly the patch's file set, so stale files can't stay.
     if (!std::filesystem::is_empty(out_dir)) throw std::runtime_error("Output dir is not empty: " + out_dir);
-    // Low-memory mode: an encoded installed set (gc.manifest) is decoded and the new set encoded
-    // in process.
+    // The encoded families' old files are decoded and their new ones encoded in process: the POI
+    // files in every dir, and, in low-memory mode (an encoded installed set, a gc.manifest),
+    // gc's families too.
     gcs::store().init(cur_dir, out_dir);
-    if (gcs::store().active) {
-        stream_source_factory() = [](const std::string& p) { return gcs::store().open_source(p); };
-        virtual_size_hook() = [](const std::string& dir, const std::string& name, uint64_t expected) -> bool {
-            gcs::Store& s = gcs::store();
-            if (dir != s.cur_dir || !s.is_encoded(name)) return false;
-            s.check_old_size(name, expected);
-            return true;
-        };
-        std::cerr << "Encoded set: " << gcs::store().old_m.get("gc.families") << std::endl;
-    }
+    stream_source_factory() = [](const std::string& p) { return gcs::store().open_source(p); };
+    virtual_size_hook() = [](const std::string& dir, const std::string& name, uint64_t expected) -> bool {
+        gcs::Store& s = gcs::store();
+        if (dir != s.cur_dir || !s.is_encoded(name)) return false;
+        s.check_old_size(name, expected);
+        return true;
+    };
+    if (gcs::store().active) std::cerr << "Encoded set: " << gcs::store().old_m.get("gc.families") << std::endl;
     ScratchDir scratch("geocoder-patch");
     const std::string& tmpdir = scratch.path();
     double t_start = now_ms();
@@ -662,7 +661,7 @@ static int run(int argc, char* argv[]) {
             uint32_t nf = patch.u32(); (void)nf; uint64_t ds = patch.u64();
             const char* data = patch.take(ds, "full replacement");
             if (gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX)
-                throw std::runtime_error(std::string("Encoded set: a full replacement of ") + fname + " is not replayed with its child yet");
+                throw std::runtime_error(std::string("Encoded family: a full replacement of ") + fname + " is not replayed with its child yet");
             if (gcs::store().is_encoded(fname)) {
                 FILE* f = open_out(fname);
                 fwrite(data, 1, ds, f);
@@ -1299,7 +1298,7 @@ static int run(int argc, char* argv[]) {
     unmap_file(patch_map);
 
     for (const auto& f : client_files) {
-        if (gcs::store().is_encoded(f.name)) {
+        if (gcs::store().sized_by_encoder(f.name)) {
             auto it = gcs::store().got_out.find(f.name);
             if (it == gcs::store().got_out.end()) throw std::runtime_error("Patch did not produce " + f.name);
             if (it->second != f.size)
@@ -1317,10 +1316,8 @@ static int run(int argc, char* argv[]) {
             throw std::runtime_error("Output size mismatch: " + f.name + " is " + std::to_string(st.st_size) +
                                      " bytes, the patch lists " + std::to_string(f.size));
     }
-    if (gcs::store().active) {
-        gcs::store().save_manifest();
-        for (const auto& r : gcs::store().report) std::cerr << "  " << r << std::endl;
-    }
+    gcs::store().finish_outputs();
+    for (const auto& r : gcs::store().report) std::cerr << "  " << r << std::endl;
     log_phase("Total", t_start);
     std::cerr << "Patch applied. Output in " << out_dir << std::endl;
     return 0;

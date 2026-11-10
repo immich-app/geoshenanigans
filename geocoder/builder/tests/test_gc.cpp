@@ -2,11 +2,9 @@
 // tools/gc_*.h): malformed encoded sets fail through gc's die() (exit 2) in
 // its decoders, before anything is sized from a bad count, each case in a
 // child process; address footprints past abs2's bound round trip; and the
-// tool never writes its source, refuses an encoded dir as encode input, an
-// output dir holding files, and a POI set whose offsets do not fit the
-// encoding. (The patcher's decoders: tests/test_gcs_codec.cpp.)
+// tool never writes its source, refuses an encoded dir as encode input and an
+// output dir holding files. (The patcher's decoders: tests/test_gcs_codec.cpp.)
 #include "gc_addr.h"
-#include "gc_poly.h"
 #include "gc_side.h"
 #include "gc_ways.h"
 
@@ -144,35 +142,6 @@ AddrSet big_footprints() {
         s.points.insert(s.points.end(), r, r + 28);
     }
     return s;
-}
-
-// A POI record of today's format: id, vertex offset and count, the rest 0.
-std::vector<uint8_t> poi_record(uint32_t offset, uint32_t count) {
-    std::vector<uint8_t> r = le(7, 8);
-    put32(r, offset);
-    put32(r, count);
-    r.resize(36, 0);
-    return r;
-}
-
-// polygons: vertex counts of all-zero closed rings (enc 0), back to back,
-// then trailing_points point records. poi_vertices.bin is a sparse file.
-void poi_today_set(const std::string& dir, const std::vector<uint32_t>& polygons, size_t trailing_points) {
-    std::filesystem::create_directories(dir);
-    std::vector<uint8_t> recs;
-    uint64_t off = 0;
-    for (uint32_t vc : polygons) {
-        auto r = poi_record(uint32_t(off), vc);
-        recs.insert(recs.end(), r.begin(), r.end());
-        off += 10 + 4 * uint64_t(vc);
-    }
-    for (size_t i = 0; i < trailing_points; i++) {
-        auto r = poi_record(gcset::NO, 0);
-        recs.insert(recs.end(), r.begin(), r.end());
-    }
-    write_bytes(dir + "/poi_records.bin", recs);
-    write_bytes(dir + "/poi_vertices.bin", {});
-    std::filesystem::resize_file(dir + "/poi_vertices.bin", off);
 }
 
 // Three street ways of two nodes each and a file of no family.
@@ -688,9 +657,11 @@ TEST(gc_decode_of_some_families_leaves_an_encoded_set_of_the_rest) {
     const std::string& root = dir.path();
     const std::string src = root + "/source", enc = root + "/encoded", part = root + "/part", log = root + "/gc.log";
     street_today_set(src);
-    poi_today_set(src, {3, 5}, 2);
+    std::vector<uint8_t> parents;
+    for (const uint32_t p : {7u, gcset::NO, 0xFFFFFEu}) put32(parents, p);
+    write_bytes(src + "/way_parents.bin", parents);
     REQUIRE(run_gc({"encode", src, enc}, log).ok);
-    REQUIRE(run_gc({"decode", enc, part, "--only", "poi"}, log).ok);
+    REQUIRE(run_gc({"decode", enc, part, "--only", "way_parents"}, log).ok);
     const auto manifest = read_file(part + "/gc.manifest");
 
     auto r = run_gc({"decode", part, root + "/whole"}, log);
@@ -755,93 +726,6 @@ TEST(gc_refuses_to_encode_an_encoded_dir) {
         CHECK(!r.ok);
         CHECK(r.log.find("is already encoded (it has a gc.manifest)") != std::string::npos);
         CHECK(!std::filesystem::exists(dest));
-    }
-}
-
-// R3 stores a POI record's B-open offset in 32 bits: a set whose B-open file
-// ends past 4 GiB with a point record after the last polygon (whose offset is
-// that file's size) must fail to encode rather than write a set its decoder
-// rejects, and a small set with a trailing point round trips. The big set is
-// 1024 closed all-zero rings of 2^20 vertices: every polygon starts below
-// 2^32, the B-open file ends at 4,294,973,440 bytes. Neither 4 GiB file is on
-// disk: the vertices are a sparse file, and the B-open a FIFO a child drains
-// (a streamed pass, which writes into a dir its caller owns).
-TEST(gc_refuses_a_poi_offset_past_u32) {
-    ScratchDir dir("gc-poi-offset");
-    const std::string& root = dir.path();
-    const std::string small = root + "/small", enc = root + "/small.enc", dec = root + "/small.dec", log = root + "/gc.log";
-    poi_today_set(small, {3, 5}, 2);
-    REQUIRE(run_gc({"encode", small, enc, "--only", "poi", "--no-link"}, log).ok);
-    REQUIRE(run_gc({"decode", enc, dec, "--only", "poi", "--no-link"}, log).ok);
-    for (const char* f : {"/poi_records.bin", "/poi_vertices.bin"}) CHECK(read_bytes(dec + f) == read_bytes(small + f));
-
-    const std::string big = root + "/big", out = root + "/big.enc", bopen = out + "/poi_vertices.bopen";
-    poi_today_set(big, std::vector<uint32_t>(1024, 1u << 20), 1);
-    std::filesystem::create_directories(out);
-    REQUIRE(mkfifo(bopen.c_str(), 0600) == 0);
-    std::vector<char> sink(size_t(1) << 20);
-    std::fflush(nullptr);
-    const pid_t drain = fork();
-    REQUIRE(drain >= 0);
-    if (!drain) {
-        const int fd = open(bopen.c_str(), O_RDONLY);
-        while (fd >= 0 && read(fd, sink.data(), sink.size()) > 0) {}
-        _exit(0);
-    }
-
-    auto r = run_gc({"encode", big, out, "--files", "poi_records.bin,poi_vertices.bin", "--no-link"}, log);
-
-    kill(drain, SIGKILL);  // still waiting to open the FIFO if gc never did
-    waitpid(drain, nullptr, 0);
-    CHECK(!r.ok);
-    CHECK(r.log.find("poi_vertices.bopen offset overflow at record 1024") != std::string::npos);
-}
-
-// POI blocks the encoder never writes, each the one block of a one-record
-// encoded set: a header without a stored vertex, with the closing flag (whose
-// closing vertex would be copied from a vertex never decoded) or without it,
-// and 2^32 stored vertices (a sparse poi_vertices.bopen), more than the
-// record's u32 vertex_count holds. Refused before the block is read; a block
-// of one vertex decodes. The child's address space is capped: reading the
-// 16 GiB block runs out of it.
-TEST(gc_poi_decoder_refuses_blocks_the_encoder_never_writes) {
-    struct Case {
-        const char* name;
-        uint8_t flag;
-        uint64_t bytes;
-        bool valid;
-    };
-    const Case cases[] = {{"one vertex", 0, 14, true},
-                          {"closing flag, no stored vertex", 1, 10, false},
-                          {"no stored vertex", 0, 10, false},
-                          {"2^32 stored vertices", 0, 10 + (uint64_t(4) << 32), false}};
-    ScratchDir dir("gc-poi-blocks");
-    int n = 0;
-    for (const Case& c : cases) {
-        const std::string src = dir.path() + "/" + std::to_string(n++), out = src + "/out";
-        std::filesystem::create_directories(out);
-        std::vector<uint8_t> rec = le(7, 8);
-        put32(rec, 0);
-        rec.resize(32, 0);
-        write_bytes(src + "/poi_records.r3", rec);
-        write_bytes(src + "/poi_vertices.bopen", {0, c.flag});
-        std::filesystem::resize_file(src + "/poi_vertices.bopen", c.bytes);
-
-        const int status = exit_status_in_child(
-            [&] {
-#ifndef __SANITIZE_ADDRESS__
-                struct rlimit as{size_t(4) << 30, size_t(4) << 30};
-                setrlimit(RLIMIT_AS, &as);
-#endif
-                gcset::Manifest m;
-                m.set("poi.n", 1);
-                gcset::poly::decode_poi(src, out, m);
-                return 0;
-            },
-            20);
-
-        if (status != (c.valid ? 0 : 2)) std::printf("    %s: exit %d\n", c.name, status);
-        CHECK_EQ(status, c.valid ? 0 : 2);
     }
 }
 

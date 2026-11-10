@@ -161,11 +161,12 @@ RoundTrip round_trip(const BuildDir& old_files, const BuildDir& new_files, const
     else if (!run({GEOCODER_PATCH_BIN, old_dir, patch, "-o", out_dir}, log))
         bad.push_back("patch failed");
     else {
-        for (const auto& [name, bytes] : new_files)
+        const BuildDir want = gctest::as_written(new_files);
+        for (const auto& [name, bytes] : want)
             if (!std::filesystem::exists(out_dir + "/" + name) || read_file(out_dir + "/" + name) != bytes)
                 bad.push_back(name);
         for (const auto& e : std::filesystem::directory_iterator(out_dir))
-            if (!new_files.count(e.path().filename().string())) bad.push_back("extra " + e.path().filename().string());
+            if (!want.count(e.path().filename().string())) bad.push_back("extra " + e.path().filename().string());
     }
     auto text = read_file(log);
     r.log.assign(text.begin(), text.end());
@@ -384,7 +385,8 @@ PatchRun apply_raw(const std::string& root, const std::vector<char>& raw, const 
 }
 
 // MATCH_POIS polygon POIs of MATCH_RING vertices (a 10-byte header, 4 bytes
-// a vertex) each; the new day drops POI MATCH_DROPPED. The diff sends both
+// a vertex: an open ring, each POI's of its own) each; the new day drops POI
+// MATCH_DROPPED. The diff sends both
 // files as MATCH, DELETE, MATCH runs: poi_records.bin by record (replayed
 // record by record) and poi_vertices.bin by byte (copied a run at a time).
 constexpr uint32_t MATCH_POIS = 300, MATCH_DROPPED = 100, MATCH_RING = 3;
@@ -400,7 +402,7 @@ BuildDir poi_polygons(bool drop) {
         p.vertex_offset = static_cast<uint32_t>(vertices.size());
         p.vertex_count = MATCH_RING;
         records.push_back(p);
-        for (uint32_t b = 0; b < MATCH_BLOCK; b++) vertices.push_back(static_cast<char>(i * 7 + b));
+        for (uint32_t b = 0; b < MATCH_BLOCK; b++) vertices.push_back(b < 2 ? 0 : static_cast<char>(i * 7 + b));
     }
     return {{"poi_records.bin", bytes_of(records)}, {"poi_vertices.bin", vertices}};
 }
@@ -1109,9 +1111,10 @@ TEST(patch_refuses_a_sparse_delta_change_past_the_last_record) {
 }
 
 // A MATCH run longer than what is left of the old file is refused before any
-// of it is written, in the record by record replay (poi_records.bin) and the
-// run copy (poi_vertices.bin): the replay stopped at the old file's end and
-// went on as if the run were whole.
+// of it is written: of the POI records (replayed record by record with their
+// child), 5 longer, and of their vertices (the child stream, which the
+// records size), as bytes past the last record. The replay stopped at the old
+// file's end and went on as if the run were whole.
 TEST(patch_refuses_a_match_run_past_the_old_file) {
     ScratchDir dir("patch-match");
     const std::string& root = dir.path();
@@ -1122,10 +1125,16 @@ TEST(patch_refuses_a_match_run_past_the_old_file) {
     REQUIRE(run({"zstd", "-d", "-q", "-f", root + "/p.gcpatch", "-o", raw}, log));
     const std::vector<char> patch = read_file(raw);
     const uint32_t rest = MATCH_POIS - MATCH_DROPPED - 1;
-    const std::pair<std::string, std::vector<char>> files[] = {
-        {"poi_records.bin", match_delete_match(MATCH_DROPPED, 1, rest)},
-        {"poi_vertices.bin", match_delete_match(MATCH_DROPPED * MATCH_BLOCK, MATCH_BLOCK, rest * MATCH_BLOCK)}};
-    for (const auto& [name, runs] : files) {
+    struct Edit {
+        std::string name;
+        std::vector<char> runs;
+        std::string refusal;
+    };
+    const Edit files[] = {
+        {"poi_records.bin", match_delete_match(MATCH_DROPPED, 1, rest), "Malformed merge sequence: poi_records.bin (a MATCH run past the old file)"},
+        {"poi_vertices.bin", match_delete_match(MATCH_DROPPED * MATCH_BLOCK, MATCH_BLOCK, rest * MATCH_BLOCK),
+         "poi_vertices.bin has bytes past its last record"}};
+    for (const auto& [name, runs, refusal] : files) {
         const size_t at = find_once(patch, runs);
         REQUIRE(at != std::string::npos);
         std::vector<char> longer = patch;
@@ -1136,12 +1145,13 @@ TEST(patch_refuses_a_match_run_past_the_old_file) {
         auto r = apply_raw(root, longer, "out-" + name);
 
         CHECK(!r.ok);
-        CHECK(logged(r, "Malformed merge sequence: " + name + " (a MATCH run past the old file)"));
+        CHECK(logged(r, refusal));
     }
     auto r = apply_raw(root, patch, "out");
     CHECK(r.ok);
-    CHECK(read_file(root + "/out/poi_records.bin") == poi_polygons(true)["poi_records.bin"]);
-    CHECK(read_file(root + "/out/poi_vertices.bin") == poi_polygons(true)["poi_vertices.bin"]);
+    const BuildDir want = gctest::as_written(poi_polygons(true));
+    CHECK(read_file(root + "/out/poi_records.bin") == want.at("poi_records.bin"));
+    CHECK(read_file(root + "/out/poi_vertices.bin") == want.at("poi_vertices.bin"));
 }
 
 // A new dir of more client files than a patch may list (1025, past

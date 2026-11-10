@@ -73,7 +73,7 @@ pub fn polygon_raw(geo: &Index, i: u32) -> AdminPolygon {
 }
 
 pub fn poi_raw(geo: &Index, i: u32) -> PoiRecord {
-    geo.poi_records.as_ref().expect("poi_records").read_at::<PoiRecord>(i as u64)
+    geo.poi_records.as_ref().expect("poi_records").record(i).expect("poi record")
 }
 
 pub fn cc_of(code: u16) -> [u8; 2] {

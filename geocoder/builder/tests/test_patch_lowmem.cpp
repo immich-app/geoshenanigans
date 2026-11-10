@@ -735,7 +735,120 @@ std::vector<Poi> pois_of(std::mt19937& rng, uint32_t n, uint32_t vertices, bool 
     return pois;
 }
 
+// n address points, every third without a footprint, the others with one of
+// 1 to 8 random vertices, on a street of their own: geocoder-gc's address
+// family and its streets, into d.
+void put_addr_family(BuildDir& d, std::mt19937& rng, uint32_t n) {
+    std::vector<GeoRow> rows;
+    for (uint32_t k = 0; k < 50; k++) rows.push_back({k, {k % 10}});
+    put_geo(d, rows);
+    std::vector<Addr> addrs;
+    for (uint32_t i = 0; i < n; i++)
+        addrs.push_back({47.0f + static_cast<float>(i) * 1e-4f, i % 3 == 0 ? std::vector<char>{} : block(rng, 1 + rng() % 8)});
+    put_addrs(d, addrs);
+}
+
 }  // namespace
+
+// Random days of POIs as strategy 2 leaves them: an old day of 400 records
+// (points, polygons of every encoding at random widths, closed and open, one
+// past big_block(), tombstones with and without their blocks) and a new day
+// that edits fields of some, replaces the polygons of some, kills some in
+// place and appends 40, a polygon past big_block() among them. In every mode
+// the patcher writes the builder's POI files of the new day (write_dir
+// writes them through poi_files::Writer), byte for byte.
+TEST(patch_rebuilds_the_builders_poi_files_on_random_days) {
+    ScratchDir dir("lowmem-poi-days");
+    constexpr uint32_t NAME = 12, NAMES = 64;  // "poi 0000000\0"
+    std::string pool;
+    for (uint32_t i = 0; i < NAMES; i++) {
+        char b[16];
+        std::snprintf(b, sizeof b, "poi %07u", i);
+        pool += std::string(b, NAME);
+    }
+    struct Poi36 {
+        std::vector<char> rec;    // 36 bytes, vertex_offset and vertex_count set by dir_of
+        std::vector<char> block;  // its logical polygon, or none
+    };
+    for (uint32_t seed = 1; seed <= 4; seed++) {
+        std::mt19937 rng(20261110 + seed);
+        auto string_id = [&] { return rng() % 4 == 0 ? NO : static_cast<uint32_t>(rng() % NAMES) * NAME; };
+        auto polygon = [&](uint32_t vc) {
+            const uint8_t e = static_cast<uint8_t>(rng() % 4);
+            const uint32_t max_w = e == 3 ? 32 : 16, wl = static_cast<uint32_t>(rng() % (max_w + 1)), wg = static_cast<uint32_t>(rng() % (max_w + 1));
+            auto q = [&](uint32_t w) { return w == 32 ? static_cast<uint32_t>(rng()) : static_cast<uint32_t>(rng() & ((1u << w) - 1)); };
+            std::vector<char> b(10, 0);
+            b[0] = static_cast<char>(e);
+            put_at(b, 2, static_cast<uint32_t>(rng()));
+            put_at(b, 6, static_cast<uint32_t>(rng()));
+            const bool closed = vc >= 2 && rng() % 2;
+            for (uint32_t k = 0; k < vc; k++) {
+                const size_t at = b.size();
+                if (closed && k + 1 == vc) {
+                    b.insert(b.end(), b.begin() + 10, b.begin() + 10 + (e == 3 ? 8 : 4));
+                    continue;
+                }
+                b.resize(at + (e == 3 ? 8 : 4));
+                poi_files::put_q(reinterpret_cast<uint8_t*>(&b[at]), e, q(wl), q(wg));
+            }
+            return b;
+        };
+        auto random_poi = [&](uint32_t big = 0) {
+            Poi36 p{std::vector<char>(36, 0), {}};
+            put_at(p.rec, 0, static_cast<float>(-90.0 + 180.0 * (rng() / 4294967296.0)));
+            put_at(p.rec, 4, static_cast<float>(-180.0 + 360.0 * (rng() / 4294967296.0)));
+            put_at(p.rec, 16, static_cast<uint32_t>(rng() % NAMES) * NAME);
+            for (int k = 0; k < 4; k++) p.rec[20 + k] = static_cast<char>(k == 1 ? 1 + rng() % 3 : rng() % (k == 0 ? 55 : 256));
+            put_at(p.rec, 24, string_id());
+            put_at(p.rec, 28, string_id());
+            put_at(p.rec, 32, rng() % 5 == 0 ? NO : static_cast<uint32_t>(rng() % 1000));
+            if (big || rng() % 3) p.block = polygon(big ? big : 1 + static_cast<uint32_t>(rng() % 40));
+            return p;
+        };
+        auto kill = [&](Poi36& p) {
+            p.rec.assign(36, 0);
+            put_at(p.rec, 16, NO);
+            if (rng() % 2) p.block.clear();
+        };
+        std::vector<Poi36> old_day;
+        for (uint32_t i = 0; i < 400; i++) old_day.push_back(random_poi(i == 123 ? 35000 : 0));
+        for (uint32_t i = 0; i < 400; i += 37) kill(old_day[i]);
+        std::vector<Poi36> new_day = old_day;
+        for (Poi36& p : new_day) {
+            const uint32_t r = rng() % 20;
+            if (r == 0) p.rec[23] = static_cast<char>(rng());                                     // importance
+            if (r == 1) put_at(p.rec, 16, static_cast<uint32_t>(rng() % NAMES) * NAME);          // name
+            if (r == 2) put_at(p.rec, 28, string_id());                                           // postcode
+            if (r == 3) p.block = polygon(1 + static_cast<uint32_t>(rng() % 40));                 // polygon replaced
+            if (r == 4 && !p.block.empty()) p.block.clear();                                      // polygon gone
+            if (r == 5) kill(p);
+        }
+        for (uint32_t i = 0; i < 40; i++) new_day.push_back(random_poi(i == 17 ? 40000 : 0));
+        auto dir_of = [&](const std::vector<Poi36>& day) {
+            BuildDir d;
+            std::vector<char>& recs = d["poi_records.bin"];
+            std::vector<char>& verts = d["poi_vertices.bin"];
+            for (const Poi36& p : day) {
+                std::vector<char> rec = p.rec;
+                const bool poly = !p.block.empty();
+                put_at(rec, 8, poly ? static_cast<uint32_t>(verts.size()) : NO);
+                put_at(rec, 12, poly ? static_cast<uint32_t>((p.block.size() - 10) / (p.block[0] == 3 ? 8 : 4)) : 0u);
+                recs.insert(recs.end(), rec.begin(), rec.end());
+                verts.insert(verts.end(), p.block.begin(), p.block.end());
+            }
+            d["strings_poi.bin"].assign(pool.begin(), pool.end());
+            return d;
+        };
+        const BuildDir old_d = dir_of(old_day), new_d = dir_of(new_day);
+        const LowMemCase c{dir.path(), "seed-" + std::to_string(seed)};
+        REQUIRE(prepare(c, old_d, new_d).empty());
+
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
+        const BuildDir want = gctest::as_written(new_d);
+        for (const std::string& mode : ALL_MODES)
+            for (const char* f : {"poi_records.bin", "poi_vertices.bin"}) CHECK(read_file(c.dir("out." + mode) + "/" + f) == want.at(f));
+    }
+}
 
 // An unchanged parent of an encoded family (poi_records.bin sent as kept)
 // replays with its child: both files unchanged, then the records unchanged
@@ -1632,24 +1745,19 @@ TEST(patch_lowmem_new_manifest_names_only_the_families_the_patch_ships) {
     CHECK(r.ok && read_dir(c.dir("out.dec")) == new_d);
 }
 
-// A new set with part of an encoded family (one of the POI family's two
-// files) is refused before the replay.
+// A new set with part of an encoded family (the address family without its
+// addr_vertices.bin) is refused before the replay.
 TEST(patch_lowmem_refuses_a_new_set_with_part_of_a_family) {
     ScratchDir dir("lowmem-part");
     std::mt19937 rng(20261027);
-    std::vector<GeoRow> rows;
-    for (uint32_t k = 0; k < 50; k++) rows.push_back({k, {k % 10}});
     BuildDir old_d;
-    put_geo(old_d, rows);
-    put_pois(old_d, pois_of(rng, 40, 0, true));
-    for (const std::string gone : {"poi_vertices.bin", "poi_records.bin"}) {
-        BuildDir new_d = old_d;
-        new_d.erase(gone);
-        const LowMemCase c{dir.path(), "without-" + gone};
-        REQUIRE(prepare(c, old_d, new_d).empty());
+    put_addr_family(old_d, rng, 40);
+    BuildDir new_d = old_d;
+    new_d.erase("addr_vertices.bin");
+    const LowMemCase c{dir.path(), "without-addr_vertices.bin"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
 
-        CHECK(not_refused(c, ENCODED_MODES, c.patch(), "part", "family poi: the patch ships 1 of its 2 files").empty());
-    }
+    CHECK(not_refused(c, ENCODED_MODES, c.patch(), "part", "family addr: the patch ships 1 of its 2 files").empty());
 }
 
 // A MATCH run longer than what is left of the old file is refused in the
@@ -2727,7 +2835,7 @@ TEST(patch_refuses_secondary_pairs_for_a_file_without_a_record_remap) {
 // them points, and the new day's with an eleventh, a polygon, under a limit
 // of 10 (the new POI records), the other way round under 10 too (the old
 // ones), and under one less than the new day's vertex bytes (the POIs' child
-// stream, a byte a record, which the low-memory mode replays with its parent).
+// stream, a byte a record, which the patcher replays with its parent).
 // Under the most records a file of either patch holds (those vertex bytes),
 // both patches apply.
 TEST(patch_refuses_a_merge_section_of_more_records_than_its_limit) {
@@ -2770,7 +2878,7 @@ TEST(patch_refuses_a_merge_section_of_more_records_than_its_limit) {
 //   deleted: the first moved to POI 1's name, which the replay deletes,
 //   left-over: one more, past the last POI,
 //   child: one in the merge of the POI vertices, a file without string
-//     fields, which the low-memory mode replays as the POIs' child stream.
+//     fields, which the patcher replays as the POIs' child stream.
 // The patch as made applies.
 TEST(patch_refuses_string_fixups_on_a_deleted_record_left_over_or_in_a_child_stream) {
     ScratchDir dir("patch-string-fixups");
@@ -2817,9 +2925,8 @@ TEST(patch_refuses_string_fixups_on_a_deleted_record_left_over_or_in_a_child_str
     const Case cases[] = {
         {"deleted", [&](std::vector<char>& p) { p[first] = 3; }, ALL_MODES, "Malformed string fixups"},
         {"left-over", [&](std::vector<char>& p) { add_fixup(p, n_at, 0x7F); }, ALL_MODES, "Malformed string fixups"},
-        {"child", [&](std::vector<char>& p) { add_fixup(p, child_at + 40, 0); }, {"plain"}, "Malformed string fixups"},
-        {"child", [&](std::vector<char>& p) { add_fixup(p, child_at + 40, 0); }, ENCODED_MODES,
-         "Encoded set: a child stream with string fixups"},
+        {"child", [&](std::vector<char>& p) { add_fixup(p, child_at + 40, 0); }, ALL_MODES,
+         "Encoded family: a child stream with string fixups"},
     };
     for (const Case& e : cases) {
         std::vector<char> edited = raw;
@@ -2842,8 +2949,8 @@ TEST(patch_refuses_string_fixups_on_a_deleted_record_left_over_or_in_a_child_str
 //   run: a run 1000 records past the last one,
 //   byte: a byte past the last run,
 //   child: a byte in the runs of the POI vertices' merge, without a run (a
-//     file without offset fields, which the low-memory mode replays as the
-//     POIs' child stream).
+//     file without offset fields, which the patcher replays as the POIs'
+//     child stream).
 // The patch as made applies.
 TEST(patch_refuses_offset_fixups_left_over_or_in_a_child_stream) {
     ScratchDir dir("patch-offset-fixups");
@@ -2905,9 +3012,8 @@ TEST(patch_refuses_offset_fixups_left_over_or_in_a_child_stream) {
         {"offset", [&](std::vector<char>& p) { add(p, records, VALUES, {3, 0}, true); }, ALL_MODES, "Malformed offset fixups"},
         {"run", [&](std::vector<char>& p) { add(p, records, RUNS, {'\xE8', 7, 1, 0}, true); }, ALL_MODES, "Malformed offset fixups"},
         {"byte", [&](std::vector<char>& p) { add(p, records, RUNS, {0}, false); }, ALL_MODES, "Malformed offset fixups"},
-        {"child", [&](std::vector<char>& p) { add(p, vertices, RUNS, {0}, false); }, {"plain"}, "Malformed offset fixups"},
-        {"child", [&](std::vector<char>& p) { add(p, vertices, RUNS, {0}, false); }, ENCODED_MODES,
-         "Encoded set: a child stream with offset fixups"},
+        {"child", [&](std::vector<char>& p) { add(p, vertices, RUNS, {0}, false); }, ALL_MODES,
+         "Encoded family: a child stream with offset fixups"},
     };
     for (const Case& e : cases) {
         std::vector<char> edited = raw;
@@ -3321,10 +3427,11 @@ TEST(patch_lowmem_round_trips_an_admin_minimal_arc_dir) {
     CHECK(apply_modes(c, ALL_MODES, merged_by_slot(old_d, new_d)).bad.empty());
 }
 
-// An encoded family (the POIs, encoded by geocoder-gc) beside the plain arc
-// files: the low-memory mode replays the family through its codecs and the
-// arc files as plain merge sections, and the new set is gc's encoding of the
-// new dir, byte for byte. The parent sent the admin geometry files whole.
+// An encoded family (the address points, encoded by geocoder-gc) beside the
+// plain arc files: the low-memory mode replays the family through its codecs
+// and the arc files as plain merge sections, and the new set is gc's encoding
+// of the new dir, byte for byte. The parent sent the admin geometry files
+// whole.
 TEST(patch_lowmem_applies_an_encoded_set_beside_plain_arc_files) {
     ScratchDir dir("lowmem-arcs-beside");
     std::mt19937 rng(20261103);
@@ -3332,21 +3439,18 @@ TEST(patch_lowmem_applies_an_encoded_set_beside_plain_arc_files) {
     ArcGeometry new_g = old_g;
     new_g.arcs[17] = random_bytes(rng, new_g.arcs[17].size() + 4);
     new_g.rings[20] = random_bytes(rng, new_g.rings[20].size());
-    const auto pois = pois_of(rng, 300, 0, true);
-    auto edited = pois;
-    std::fill(edited[100].block.begin() + 10, edited[100].block.end(), 0);
     BuildDir old_d, new_d;
     put_arc_geometry(old_d, old_g);
     put_arc_geometry(new_d, new_g);
-    put_pois(old_d, pois);
-    put_pois(new_d, edited);
+    put_addr_family(old_d, rng, 300);
+    put_addr_family(new_d, rng, 300);
     const LowMemCase c{dir.path(), "beside"};
     REQUIRE(prepare(c, old_d, new_d).empty());
-    REQUIRE(read_dir(c.dir("old.enc")).count("poi_records.r3") == 1);
+    REQUIRE(read_dir(c.dir("old.enc")).count("addr_points.col") == 1);
 
     const LogCheck merged = merged_by_slot(old_d, new_d);
     CHECK(apply_both_modes(c, [&](const std::string& log) -> std::string {
-              if (log.find("encode poi:") == std::string::npos) return "no encode poi line";
+              if (log.find("encode addr:") == std::string::npos) return "no encode addr line";
               return merged(log);
           }).empty());
 }
@@ -3722,20 +3826,17 @@ TEST(patch_heap_stays_flat_as_rings_change) {
 TEST(patch_lowmem_refuses_a_manifest_naming_the_admin_family) {
     ScratchDir dir("lowmem-admin-family");
     std::mt19937 rng(20261103);
-    const auto pois = pois_of(rng, 40, 0, true);
-    auto edited = pois;
-    std::fill(edited[10].block.begin() + 10, edited[10].block.end(), 0);
     BuildDir old_d, new_d;
-    put_pois(old_d, pois);
-    put_pois(new_d, edited);
+    put_addr_family(old_d, rng, 40);
+    put_addr_family(new_d, rng, 40);
     const LowMemCase c{dir.path(), "admin-family"};
     REQUIRE(prepare(c, old_d, new_d).empty());
     const std::string manifest = c.dir("old.enc") + "/gc.manifest";
     const std::vector<char> was = read_file(manifest);
     std::string text(was.begin(), was.end());
-    const size_t at = text.find("gc.families poi\n");
+    const size_t at = text.find("gc.families streets,addr\n");
     REQUIRE(at != std::string::npos);
-    text.replace(at, 16, "gc.families poi,admin\n");
+    text.replace(at, 25, "gc.families streets,addr,admin\n");
     REQUIRE(write_file(manifest, std::vector<char>(text.begin(), text.end())));
     const std::string refusal = "unknown family admin in gc.manifest";
 
