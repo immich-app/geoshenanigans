@@ -36,7 +36,7 @@ Why, from the measurements:
 |---|---|---|---|
 | D1 | Ocean tiles | (a) upload nothing for the ocean tile: the storage zone's `Custom404FilePath` + `Rewrite404To200` return it for any missing file; (b) upload every position | **(b), upload every position** (maintainer, 2026-11-10): 1.43B files, 261 GB, $78.30/month. A missing file is then a real 404, never silent ocean. Switching to (a) later (637M files, $55.60) stays possible. |
 | D2 | Scope | (a) every zoom as files; (b) zooms 0-14 as files and zoom 15 in chunks behind the Edge Script | **(a)** (recommended, not yet confirmed). With daily diffs the first load is a one-time cost. (b) keeps a script, a directory and chunk repacking for zoom 15. |
-| D3 | Invalidation after a daily update | (a) bump `?v=` in the TileJSON daily: every tile URL changes, so CDN and browser caches start cold each day; (b) keep URLs stable and purge only the changed tiles (~200-330k a day) from the CDN; browsers revalidate daily (`max-age` 1 day with ETag); (c) like (a), but weekly | **Decided by spike S6**, which runs first (maintainer: measure invalidation speed before implementing). (b) if Bunny can purge ~330k URLs within an hour and every PoP drops them quickly; otherwise (a). |
+| D3 | Invalidation after a daily update | (a) bump `?v=` in the TileJSON daily: every tile URL changes, so CDN and browser caches start cold each day; (b) keep URLs stable and purge only the changed tiles (~200-330k a day) from the CDN; browsers revalidate daily (`max-age` 1 day with ETag); (c) like (a), but weekly; (d) keep URLs stable and purge the whole zone once a day; browsers revalidate with `Last-Modified` (`max-age` 1 day) | **Spike S6 measured it (section 10).** Per-URL purge is out: ~5 purges/s sustained (~18 h for a day's ~330k tiles) and one Stockholm server ignored exact purges. Recommended now: (d) stable URLs plus **one full-zone purge per day** after the replication gate (every probe fresh in 6-25 s); browsers revalidate with `Last-Modified` (304 works). Fallback: (a). Needs the maintainer's confirmation. |
 | D4 | Analytics | see section 3 | **CDN request logs into o11y** (maintainer, 2026-11-10), plus a synthetic latency probe. No script in the request path. |
 | D5 | Account and keys | (a) a new production account; (b) the dedicated account used for the PoC | **(b)** (maintainer, 2026-11-10): the PoC's dedicated bunny.net account becomes the production account, with its current key for now. The maintainer rotates the key later and replaces it where it is used. The account key is used only by OpenTofu and the purge/log jobs (1Password `tf_prod`); uploads use the storage zone's own password, which only works on that zone. |
 | D6 | Cutover | test hostname first, then move the DNS record | (Recommended, not yet confirmed.) Seed and verify under a test hostname on the same pull zone, try it in Immich, then CNAME `tiles.immich.cloud` to Bunny (DNS-only in Cloudflare). The Cloudflare Worker stays deployable for rollback for 4 weeks. |
@@ -140,8 +140,8 @@ Protomaps publishes daily builds around 09:05 UTC. A scheduled workflow, "Tiles 
 4. Diff it against the live manifest (a few minutes): measured 327,826 positions in 1 day, 1.67M in 8 days and 1.90M in 9 days.
    - **Guard rail:** if more than 5% of positions changed, stop and alert, and treat it as a full rewrite.
 5. Upload every changed position, ocean included: ~30 s to a few minutes.
-6. Wait for replication and verify: ~5-25 min in measurements; give up and alert after a set limit.
-7. Purge the changed URLs or bump `?v=` (D3), then upload the TileJSON and styles.
+6. Wait for replication and verify: `DESCRIBE` every changed file (it returns the stored SHA-256 and the regions holding a copy) until all 14 regions have it; ~5-25 min in measurements; give up and alert after a set limit.
+7. Purge the whole zone once (D3), then wait until probes in every region see a changed tile.
 8. Store the new manifest. Send the run's numbers to o11y: files changed, durations, replication wait.
 
 That is about 30-60 min of runner time a day. The live zone is never in a half-updated state as far as cached content goes: the switch happens after replication.
@@ -214,6 +214,8 @@ Measurements behind this plan (2026-11-10):
 
 ## 9. Risks
 
+- **Bunny config changes reach PoPs late:** a new pull zone answered "Domain suspended or not configured" at the Bogota PoP for 20-30 minutes, and new edge rules took ~45-48 minutes to apply there, so for that time tiles went out without `Content-Encoding: gzip` or CORS. Every zone or rule change must be made ahead of time and confirmed from probes at every PoP before traffic depends on it; the daily sync changes no configuration.
+- **Rewriting a file with identical bytes** clears its replica list for good (the copies stay, only the metadata is lost), which would stall the replication gate. The uploader never re-sends unchanged content and checks `DESCRIBE` checksums when it resumes.
 - **A missing or stale file:** a failed upload or a replica that hasn't caught up serves a 404 or an old tile. With the ocean fallback (D1a) it would silently draw ocean. Mitigations:
   - the replication gate before every switch;
   - a daily check of random positions against the manifest in every region.
@@ -224,3 +226,40 @@ Measurements behind this plan (2026-11-10):
   - HEAD gets 200 where prod gives 405;
   - clients that refuse gzip get gzip bytes. Browsers and MapLibre accept gzip.
 - **China:** Bunny has no mainland PoPs. A test from 37 mainland probes (32 complete pairs) was faster than prod at the median, but most requests went to Los Angeles or Frankfurt. Routing will be raised with Bunny later.
+
+## 10. Phase 0 spike results (2026-11-10)
+
+Measured on the dedicated Bunny account with a test storage zone (main Frankfurt + 14 replicas) behind a pull zone that uses it as origin, holding real tiles of build 20261101.
+
+**S6, cache invalidation (measured first):**
+
+| Purge | Call | Every probe fresh after | Limit |
+|---|---|---|---|
+| One exact URL | 0.16-0.38 s | 44-45 of 46 probes in 1.4-3 s; one Stockholm server (SE1-725) kept the old copy as a HIT through 20-40 polls in **both** rounds, even after a second purge | 120 burst, 5/s sustained (800 rapid calls after a pause: 65 OK, 735 `429`) |
+| Whole zone | 0.14-0.17 s | 46 of 46 in **6 s and 25 s** (two rounds), including that Stockholm server | 20 burst, 0.5/s |
+| By tag | | not possible here: storage can't send a `CDN-Tag` header, and edge rules reject `CDN-*` headers | |
+
+Conclusion: purging a day's ~330k changed tiles one URL at a time would take ~18 h at the default limit and is not reliable on every server. One full-zone purge per day is fast and reached every probe.
+
+**S1, headers and bytes:** 485 tiles (all of z0-3 and 400 random z4-15) decode identical to prod. Edge rules reproduce `Content-Type`, `Content-Encoding: gzip` (the stored bytes pass through untouched), `Cache-Control`, CORS `*` and `Vary: Origin`. Tiles carry `Last-Modified` and answer `If-Modified-Since` with 304; they have no ETag. Prod's debug headers (`PMTiles-Deployment-Key`, `Tiles-Cache-Revision`) and `/v2.json` still need adding.
+
+**S3, latency (47 pinned probes, each its own never-requested z13-15 tile, same window):**
+
+| Weighted first byte | Storage origin | PoC Edge Script | Prod |
+|---|---|---|---|
+| Never-requested | **25 ms** | 188 ms | 359 ms |
+| Cached | **9 ms** | 12 ms | 47 ms |
+
+Per continent, never-requested on the storage origin: EU 18, NA 30, AS 42, OC 30, SA 64, AF 78 ms. Paired with prod: -411 ms [-530, -308], faster on 40 of 40 probes. With the script: -158 ms.
+
+**S5, replication checks:** regional storage endpoints refuse a zone whose main region is elsewhere (401), so copies can't be read per region through the API. `DESCRIBE` on a single file returns its SHA-256 and the regions holding it (`ReplicatedZones`) at ~265 files/s with 32 in flight. That is enough to check a daily diff file by file. A file that hasn't reached a region yet is served from Frankfurt instead (350-530 ms from far PoPs), not as an error.
+
+**S7, request logs:** 400 of 400 test requests appeared in the Logging API v2 within 16-17 s, with time, status, cache status, bytes, country, edge region, ASN and organisation, path with query, user agent and referer.
+
+**S4/S8, uploads:**
+- Every z0-12 position (22,369,621 files) uploaded in **29.0 min at 12,838 files/s**, each PUT with a SHA-256 checksum. There were no 429s, no errors and no retries, the average PUT took 115 ms, and the uploading machine was 19% busy.
+- One full z15 folder (32,768 files) was slow when written alone: 246 files/s with 128 retried errors at 256 in flight. The first load should interleave folders, as the z0-12 run did by following tile-id order.
+- Listing a 32,768-entry folder returns 15.4 MB in 1.6 s.
+- Replication of the z0-12 seed is still being sampled: right after the upload, z0-8 were on all regions, z9-10 98%, z11 25% and z12 2%, with Sydney, São Paulo, Tokyo, Hong Kong, Johannesburg and Singapore behind.
+
+**Other findings:** see the first two risks in section 9 (config propagation to PoPs, identical rewrites).
