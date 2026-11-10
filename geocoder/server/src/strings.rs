@@ -398,18 +398,19 @@ mod tests {
     #[test]
     fn a_bucket_that_does_not_decode_reads_as_empty() {
         // The table adds up, but the bucket's bytes don't: a varint past its end, a suffix past it,
-        // and an lcp past the string before.
-        for bucket in [&[0x02, b'a', b'b', 0x80][..], &[0x01, b'a', 0x00, 0x05], &[0x01, b'a', 0x03, 0x00]] {
+        // and an lcp past the string before. The bucket's first string reads; every offset past
+        // its NUL, which the walk reaches only through the bad bytes, reads as "".
+        for (bucket, first) in [(&[0x02, b'a', b'b', 0x80][..], "ab"), (&[0x01, b'a', 0x00, 0x05], "a"), (&[0x01, b'a', 0x03, 0x00], "a")] {
             let mut f = bucket.to_vec();
             f.extend_from_slice(&[6, 0, bucket.len() as u8, 0]);
             f.extend_from_slice(&1u32.to_le_bytes());
             f.extend_from_slice(&6u32.to_le_bytes());
             f.extend_from_slice(MAGIC);
             let t = Tier::open(FileBytes::Owned(f)).unwrap();
-            for off in 0..6 {
-                let _ = t.get(off);
+            assert_eq!(t.get(0), first);
+            for off in first.len() as u32 + 1..6 {
+                assert_eq!(t.get(off), "", "bucket {bucket:02x?}, offset {off}");
             }
-            assert_eq!(t.get(5), "");
         }
     }
 }
