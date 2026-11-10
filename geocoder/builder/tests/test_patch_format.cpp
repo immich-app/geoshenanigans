@@ -2143,6 +2143,32 @@ TEST(patch_format_stream_cell_index_matches_rebuild_then_delta) {
     }
 }
 
+TEST(patch_format_stream_cell_index_sorts_the_lists_a_remap_reorders) {
+    // The rebuild sorts a remapped list again only where the remap moved an
+    // id before the one ahead of it: cells 5, 9 and 11 keep their order
+    // through it, cell 7's ids 1 and 3 swap places (its flagged 1 stays
+    // last). A block-coded (admin) and a direct (POI) index alike.
+    constexpr uint32_t F = 0x80000000u;
+    const std::unordered_map<uint32_t, uint32_t> rm = {{1, 30}, {3, 10}, {4, 40}};
+    const CellLists old_lists = at10({{5, {2, 4, F | 6}}, {7, {1, 3, F | 1}}, {9, {F | 3, F | 4}}, {11, {4, F | 3}}});
+    const CellLists want = at10({{5, {2, 40, F | 6}}, {7, {10, 30, F | 30}}, {9, {F | 10, F | 40}}, {11, {40, F | 10}}});
+    CHECK(rebuild_cell_lists(old_lists, rm) == want);
+    std::vector<char> delta;
+    append_cell_list_delta(delta, {}, {});
+    const std::vector<uint64_t> none;
+    for (const cell_pairs::Format format : {cell_pairs::ADMIN, cell_pairs::POI}) {
+        const auto old_index = write_cell_lists(old_lists, format);
+        std::pair<std::vector<char>, std::vector<char>> got;
+        stream_cell_index(ByteSpan{old_index.first.data(), old_index.first.size()},
+                          ByteSpan{old_index.second.data(), old_index.second.size()}, format, ascending(none),
+                          ascending(none), [&](uint32_t id) { auto f = rm.find(id); return f != rm.end() ? f->second : id; },
+                          delta.data(), delta.size(),
+                          [&](const char* p, size_t n) { got.first.insert(got.first.end(), p, p + n); },
+                          [&](const char* p, size_t n) { got.second.insert(got.second.end(), p, p + n); });
+        CHECK(got == write_cell_lists(want, format));
+    }
+}
+
 TEST(patch_format_cell_list_delta_drops_an_emptied_cell) {
     // An index can hold a cell with an empty list; the delta removes it.
     const CellLists old_lists = at10({{7, {1}}, {9, {}}}), new_lists = at10({{7, {1}}});

@@ -1680,8 +1680,16 @@ CellIndexWritten stream_cell_index(Cells&& cells, Entries&& entries, cell_pairs:
             if (removed.skip_to(o)) continue;
             cid = o;
             if (!old_mapped) {
-                for (auto& id : old_ids) id = remap(id & 0x7FFFFFFFu) | (id & 0x80000000u);
-                std::sort(old_ids.begin(), old_ids.end());
+                // A remap that keeps the list's order (the admin index's, which moves no id) leaves it sorted: it
+                // is sorted only where the remap moved an id before the one ahead of it.
+                bool in_order = true;
+                uint32_t last = 0;
+                for (auto& id : old_ids) {
+                    id = remap(id & 0x7FFFFFFFu) | (id & 0x80000000u);
+                    in_order &= id >= last;
+                    last = id;
+                }
+                if (!in_order) std::sort(old_ids.begin(), old_ids.end());
                 old_mapped = true;
             }
             list = &old_ids;
