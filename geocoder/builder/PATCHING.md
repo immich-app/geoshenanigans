@@ -144,7 +144,9 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
   as the build's
 - **geocoder-diff** (`tools/geocoder_diff.cpp`): Compares two builds, produces `.gcpatch`. The
   POI files are R2 records and V2 polygon blocks on disk (`src/poi_files.h`); the diff decodes both
-  days' into their logical form (today's 36-byte records and vertex stream) and merges those
+  days' into their logical form (today's 36-byte records and vertex stream) and merges those.
+  The string tiers are FCC2 files, front-coded buckets cut by content (`src/string_files.h`);
+  the diff decodes each tier it reads into its pool and diffs the pools
 - **geocoder-patch** (`tools/geocoder_patch.cpp`): Applies patch, produces new build. It links
   the static libzstd (`libzstd.a`) and decompresses the patch in process;
   `cmake -DGEOCODER_PATCH_LIBZSTD=OFF` builds it on the `zstd` command on PATH instead, for a host
@@ -305,9 +307,13 @@ build shares one global string layout, so each tier's offsets are the sum of
 the tier sizes before it, which the patch carries.
 
 - **Shipped tier**: a `strings_<tier>.bin` the old and new dir both hold
-  (empty files count). The patch sends its string diff and size and hash
-  stamps; the patcher rebuilds it and derives its remap runs from the same
-  walk. The tiers are
+  (empty pools count). The patch sends its pool's string diff and size and
+  hash stamps; the patcher rebuilds it and derives its remap runs from the
+  same walk. The walk decodes the old FCC2 file a bucket at a time
+  (`string_files::Decoder`) and encodes the new pool as it writes it, one
+  bucket in memory, its bucket table set aside in the scratch dir until the
+  body ends (`string_files::SpillWriter`); the encoding is canonical, so the
+  new file is the builder's byte for byte. The tiers are
   sorted alphabetically except the POI tier, which is in POI record order
   (the names of POI tier 0, 1, 2, 3 in turn, each at its first record of
   that tier, so a reader walking the records reads the names front to
@@ -642,7 +648,7 @@ layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
 | 26 | `arc_index.bin` | merge by slot at stride 4, the record its block's offset (v14; v13: `postal_polygons.bin`) |
 | 27 | `arc_vertices.bin` | child stream of arc_index, at stride 1 (v14; v13: `postal_vertices.bin`) |
 | 28 | `addr_vertices.bin` | child stream of addr_points at stride 1; whole in a dir without address points |
-| 29-33 | `strings_core.bin` … `strings_poi.bin` | the strings section; a tier the old dir lacks, whole |
+| 29-33 | `strings_core.bin` … `strings_poi.bin` | the strings section, of the decoded pools; a tier the old dir lacks, whole (its FCC2 file) |
 | 34 | `interp_postcodes.bin` | parallel delta along interp_ways, remap kind 2 |
 | 35 | `geo_entries.bin` | the geo index's blocks, rebuilt with `geo_cells.bin` (8) |
 

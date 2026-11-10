@@ -212,7 +212,7 @@ the build's directory layout. The new dir ends up holding exactly the
 variant's files, JSON included. Each variant dir patches from its own files
 alone, in any order: the tool reads nothing outside the dir it is given. The
 patch records the size of every old file it reads and the hash of every
-string tier it rebuilds, and the tool fails when one differs. A size check
+string tier it rebuilds (of its decoded pool), and the tool fails when one differs. A size check
 only catches a file from another build when its size changed; the string
 tiers' hashes are the content check. The server combines a mode dir with a
 quality or poi dir by global string offsets, so patch every selected dir to
@@ -263,7 +263,7 @@ geocoder-patch <current-dir> <patch-file> -o <output-dir>
 The patch tool:
 - Reads old files front to back through `pread` (sequential readahead) and
   writes each new file in one streaming pass; only the patch and its
-  decompressed copy, each old string tier while it rebuilds it, and the remap
+  decompressed copy, each old string tier while it decodes it, and the remap
   runs it spills to its scratch dir are mmapped. Long unchanged runs and
   unchanged files are copied in the kernel (`copy_file_range`), or through
   `pread` where the kernel, the filesystem or a seccomp profile refuses that

@@ -482,19 +482,30 @@ static int run(int argc, char* argv[]) {
             const StringTierEdit& edit = strings.edits[t];
             total_added += edit.n_added;
             total_deleted += edit.n_deleted;
-            require_old_file_size(cur_dir, name, strings.old_size(t));
-            MappedFile old_pool = mmap_file(cur_dir + "/" + name);
-            if (old_pool.size != strings.old_size(t))
-                throw std::runtime_error(std::string("Old ") + name + " is not the one the patch was made from");
-            advise_pages(old_pool.data, old_pool.size, MADV_SEQUENTIAL);
-            PagesBehind old_behind(old_pool.data);
+            // The tier's file is FCC2 (string_files.h): its decoder walks the
+            // old pool a bucket at a time, and the new pool is encoded as it
+            // is written, its bucket table put aside in the scratch dir.
+            struct stat st;
+            if (stat((cur_dir + "/" + name).c_str(), &st) != 0)
+                throw std::runtime_error(std::string("Old ") + name + " is not the one the patch was made from (missing)");
+            MappedFile old_file = mmap_file(cur_dir + "/" + name);
+            string_files::Decoder old_pool(reinterpret_cast<const uint8_t*>(old_file.data), old_file.size,
+                                           std::string("old ") + name);
+            if (old_pool.raw_size() != strings.old_size(t))
+                throw std::runtime_error(std::string("Old ") + name + " is not the one the patch was made from (a pool of " +
+                                         std::to_string(old_pool.raw_size()) + " bytes, the patch expects " +
+                                         std::to_string(strings.old_size(t)) + ")");
+            advise_pages(old_file.data, old_file.size, MADV_SEQUENTIAL);
+            PagesBehind old_behind(old_file.data);
             FILE* fp = open_out(name);
+            string_files::SpillWriter out(fp, tmpdir + "/" + name + ".table");
             const StringTierRebuild rebuilt = rebuild_string_tier(
-                old_pool.data, old_pool.size, edit, strings.place(t), str_remap,
-                [&](const char* p, size_t n) { fwrite(p, 1, n, fp); }, [&](size_t old_off) { old_behind.passed(old_off); });
+                old_pool, edit, strings.place(t), str_remap, [&](const char* p, size_t n) { out.write(p, n); },
+                [&](size_t coded) { old_behind.passed(coded); });
+            out.finish();
             close_patch_outputs({{fp, name}});
             require_string_tier_rebuilt(rebuilt, edit, strings.place(t), name);
-            unmap_file(old_pool);
+            unmap_file(old_file);
             patch_behind.passed(static_cast<size_t>(edit.end() - P));
         });
         malloc_trim(0);

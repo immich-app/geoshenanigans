@@ -553,6 +553,27 @@ static bool decode_poi_files(const std::string& dir, const std::string& to) {
     return true;
 }
 
+// A string tier's pool, as the diff reads it: the file at path (FCC2,
+// string_files.h) decoded into the scratch file `to` and mapped, as mmap_file
+// maps a file: {nullptr, 0} for a missing file or an empty pool. The scratch
+// file goes at once; its pages stay until the pool is unmapped.
+static MappedFile map_string_pool(const std::string& path, const std::string& to) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return {nullptr, 0};
+    MappedFile f = mmap_file(path);
+    {
+        std::ofstream o(to, std::ios::binary);
+        string_files::decode(
+            reinterpret_cast<const uint8_t*>(f.data), f.size,
+            [&](const char* p, size_t n) { o.write(p, static_cast<std::streamsize>(n)); }, path);
+        if (!o.flush()) throw std::runtime_error("Cannot write the decoded pool of " + path);
+    }
+    unmap_file(f);
+    MappedFile pool = mmap_file(to);
+    unlink(to.c_str());
+    return pool;
+}
+
 static bool try_emit_copy_old(std::vector<char>& patch, uint32_t fid,
                               const std::string& old_path, const std::string& new_path,
                               uint64_t old_size, uint64_t new_size, const char* log_name) {
@@ -912,8 +933,9 @@ static int run(int argc, char* argv[]) {
         return {std::move(ok), std::move(nk)};
     };
 
-    // Build string remap (mmap each tier's pool — read-only sequential
-    // scan) over the global-offset layout that record name_ids point into.
+    // Build string remap (each tier's pool, decoded from its FCC2 file and
+    // mapped: map_string_pool) over the global-offset layout that record
+    // name_ids point into.
     // Tier bases are the cumulative sizes of the tiers found; a tier found
     // nowhere is empty (strings_poi.bin beside full/).
     std::cerr << "Building string remap... (RSS=" << get_rss_mb() << " MiB)" << std::endl;
@@ -927,12 +949,16 @@ static int run(int argc, char* argv[]) {
     // ends up empty and records that should match (after name_id
     // re-tier) get classified as INSERT/DELETE → byte-block walker
     // produces patches the size of the whole vertex stream.
+    size_t pools = 0;
+    auto load_tier = [&](const std::string& path) {
+        return map_string_pool(path, scratch.path() + "/pool-" + std::to_string(pools++));
+    };
     auto try_load_tier = [&](const std::string& dir, const char* fname) -> MappedFile {
-        MappedFile m = mmap_file(dir + "/" + fname);
+        MappedFile m = load_tier(dir + "/" + fname);
         if (m.size > 0 || m.data != nullptr) return m;
-        m = mmap_file(dir + "/../full/" + fname);
+        m = load_tier(dir + "/../full/" + fname);
         if (m.size > 0 || m.data != nullptr) return m;
-        return mmap_file(dir + "/../../full/" + fname);
+        return load_tier(dir + "/../../full/" + fname);
     };
     // Fallback loader for street_ways.bin, which a variant subdir without
     // its own (e.g. <region>/poi/<tier>/) finds in <region>/full/. Returns
@@ -988,8 +1014,8 @@ static int run(int argc, char* argv[]) {
     const uint32_t shipped = tier_files.shipped;
     for (int t = 0; t < 5; t++) {
         const bool own = shipped >> t & 1;
-        old_tier_maps[t] = own ? mmap_file(old_dir + "/" + STRING_TIER_FILES[t]) : try_load_tier(old_dir, STRING_TIER_FILES[t]);
-        new_tier_maps[t] = own ? mmap_file(new_dir + "/" + STRING_TIER_FILES[t]) : try_load_tier(new_dir, STRING_TIER_FILES[t]);
+        old_tier_maps[t] = own ? load_tier(old_dir + "/" + STRING_TIER_FILES[t]) : try_load_tier(old_dir, STRING_TIER_FILES[t]);
+        new_tier_maps[t] = own ? load_tier(new_dir + "/" + STRING_TIER_FILES[t]) : try_load_tier(new_dir, STRING_TIER_FILES[t]);
         old_tier_bases[t + 1] = old_tier_bases[t] + static_cast<uint32_t>(old_tier_maps[t].size);
     }
     SortedU32Map str_remap;

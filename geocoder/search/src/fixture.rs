@@ -6,7 +6,7 @@ use crate::constants::SUB_INDEXES;
 use crate::model::PLACE_FLAG_LABEL_OF;
 use query_server::arc_fixture::{self, ArcFixture};
 use query_server::{
-    cell_id_at_level, cell_pairs, poi_files, AdminPolygon, Index, PlaceNode, PointE7, PoiRecord, DEFAULT_ADMIN_CELL_LEVEL,
+    cell_id_at_level, cell_pairs, poi_files, strings, AdminPolygon, Index, PlaceNode, PointE7, PoiRecord, DEFAULT_ADMIN_CELL_LEVEL,
     DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL, NO_DATA, PLACE_FLAG_HIDDEN, STR_TIER_COUNT,
 };
 use std::path::{Path, PathBuf};
@@ -126,7 +126,7 @@ impl Geo {
         files.extend([
             ("admin_cells.bin", admin_cells), ("admin_entries.bin", admin_entries),
             ("place_nodes.bin", nodes),
-            ("strings_core.bin", self.strings.clone()),
+            ("strings_core.bin", strings::encode(&self.strings)),
             ("strings_layout.json", format!("{{\"tiers\": [{}]}}", tiers.join(", ")).into_bytes()),
         ]);
         if !self.pois.is_empty() {

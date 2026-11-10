@@ -161,7 +161,7 @@ impl<'a> Entities<'a> {
         self.slot(e - self.n_place_nodes).record_refs()
     }
 
-    pub fn base_name(&self, e: u32) -> &'a str {
+    pub fn base_name(&self, e: u32) -> Cow<'a, str> {
         let id = if Self::is_poi(e) {
             poi_raw(self.geo, e & !POI_BIT).name_id
         } else if e < self.n_place_nodes {
@@ -175,18 +175,18 @@ impl<'a> Entities<'a> {
     /// The name a posting matched: the record's own (ord 0) or an extra name.
     pub fn name(&self, e: u32, ord: u8) -> Cow<'a, str> {
         if ord == 0 || ord >= crate::constants::MAX_NAME_ORD {
-            return Cow::Borrowed(self.base_name(e));
+            return self.base_name(e);
         }
         if ord == crate::constants::ORD_BOUNDARY_NAME {
             if !Self::is_poi(e) && e >= self.n_place_nodes {
                 let s = self.slot(e - self.n_place_nodes);
-                return Cow::Borrowed(self.geo.get_string(polygon_raw(self.geo, s.poly).name_id));
+                return self.geo.get_string(polygon_raw(self.geo, s.poly).name_id);
             }
-            return Cow::Borrowed(self.base_name(e));
+            return self.base_name(e);
         }
         match self.extras.as_ref().and_then(|x| x.name_at(&self.record_refs(e), ord)) {
             Some((n, _)) => Cow::Owned(n.to_string()),
-            None => Cow::Borrowed(self.base_name(e)),
+            None => self.base_name(e),
         }
     }
 

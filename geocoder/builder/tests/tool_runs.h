@@ -18,18 +18,30 @@
 
 namespace gctest {
 
-// A build dir's files by name. Its POI files are logical: poi_records.bin
-// the 36-byte records, poi_vertices.bin the vertex stream they point into.
+// A build dir's files by name. Its POI files and string tiers are logical:
+// poi_records.bin the 36-byte records, poi_vertices.bin the vertex stream they
+// point into, a strings_*.bin its pool.
 using BuildDir = std::map<std::string, std::vector<char>>;
 
-// The dir as the builder writes it: the POI files of a dir with
-// poi_records.bin as R2 and V2 (poi_files.h), a missing poi_vertices.bin an
-// empty vertex stream.
+inline bool is_string_tier(const std::string& name) {
+    for (const char* t : STRING_TIER_FILES)
+        if (name == t) return true;
+    return false;
+}
+
+// The dir as the builder writes it: its string tiers as FCC2
+// (string_files.h), and the POI files of a dir with poi_records.bin as R2 and
+// V2 (poi_files.h), a missing poi_vertices.bin an empty vertex stream.
 inline BuildDir as_written(const BuildDir& files) {
-    auto r = files.find("poi_records.bin");
-    if (r == files.end()) return files;
-    if (r->second.size() % poi_files::LOGICAL_STRIDE) throw std::runtime_error("poi_records.bin is not whole records");
     BuildDir out = files;
+    for (auto& [name, bytes] : out) {
+        if (!is_string_tier(name)) continue;
+        const std::vector<uint8_t> f = string_files::encode(bytes.data(), bytes.size());
+        bytes.assign(f.begin(), f.end());
+    }
+    auto r = files.find("poi_records.bin");
+    if (r == files.end()) return out;
+    if (r->second.size() % poi_files::LOGICAL_STRIDE) throw std::runtime_error("poi_records.bin is not whole records");
     auto v = files.find("poi_vertices.bin");
     static const std::vector<char> none;
     const std::vector<char>& verts = v == files.end() ? none : v->second;

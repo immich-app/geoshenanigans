@@ -35,6 +35,7 @@
 #include <s2/s2latlng.h>
 
 #include "types.h"
+#include "string_files.h"
 #include "string_pool.h"
 #include "geometry.h"
 #include "country_code.h"
@@ -1398,8 +1399,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                     // shorter file moves no offset.
                     {
                         const std::string_view names = poi_dir_strings(d, tier_var.max_tier);
-                        std::ofstream f(poi_dir + "/" + STR_TIER_FILENAMES[STR_TIER_POI], std::ios::binary);
-                        f.write(names.data(), static_cast<std::streamsize>(names.size()));
+                        string_files::write_file(poi_dir + "/" + STR_TIER_FILENAMES[STR_TIER_POI], names.data(),
+                                                 names.size());
                     }
                     write_strings_layout(poi_dir, d.strings_tier_bases);
 

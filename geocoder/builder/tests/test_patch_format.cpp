@@ -2314,8 +2314,9 @@ std::vector<uint32_t> starts_of(const std::string& pool, uint32_t base) {
     return out;
 }
 
-// A shipped tier's walk (rebuild_string_tier) over an old pool in memory,
-// its runs added to remap: the new pool it wrote, and what it read and wrote.
+// A shipped tier's walk (rebuild_string_tier) over an old pool's FCC2 file
+// in memory, its runs added to remap: the new pool it wrote, and what it read
+// and wrote.
 struct Rebuilt {
     std::string pool;
     StringTierRebuild walk;
@@ -2323,8 +2324,10 @@ struct Rebuilt {
 
 Rebuilt rebuild(std::string_view old_pool, const StringTierEdit& edit, const StringTierPlace& at, StringRemap& remap) {
     Rebuilt out;
-    out.walk = rebuild_string_tier(old_pool.data(), old_pool.size(), edit, at, remap,
-                                   [&](const char* p, size_t n) { out.pool.append(p, n); }, [](size_t) {});
+    const std::vector<uint8_t> file = string_files::encode(old_pool.data(), old_pool.size());
+    string_files::Decoder old(file.data(), file.size());
+    out.walk = rebuild_string_tier(old, edit, at, remap, [&](const char* p, size_t n) { out.pool.append(p, n); },
+                                   [](size_t) {});
     return out;
 }
 
@@ -2807,19 +2810,19 @@ TEST(patch_format_rebuild_finds_a_diff_the_old_pool_cannot_place) {
     CHECK(!rebuilds({0, 0, true, {x}, {}, {2}}));
 }
 
-TEST(patch_format_string_tier_walk_writes_pieces_and_reads_nothing_it_passed) {
-    // 30,000 names, one longer than a piece. Mixed: every seventh deleted and
-    // every fifth followed by an added one (sorted, or put before it, which an
-    // indexed tier's order allows). Deleted suffix: the same up to name
-    // 10,000, then every name deleted, the long one too. All deleted: no new
-    // string at all. The one walk writes the new pool in pieces of at most
-    // STRING_WALK_PIECE (a kept long name alone), hashes both pools as
-    // content_hash does and derives the runs. It gives the old pool back as it
-    // passes it, deleted strings as well as kept ones: each call at the end of
-    // the first string that puts a piece behind the last call, and under a
-    // piece left for the end. It reads no old byte before an offset it passed:
-    // scribbled over as it passes them, the old pool still rebuilds into the
-    // new one, under the old pool's hash.
+TEST(patch_format_string_tier_walk_writes_strings_and_reads_nothing_it_passed) {
+    // 120,000 names, one of the longest length a tier holds. Mixed: every
+    // seventh deleted and every fifth followed by an added one (sorted, or
+    // put before it, which an indexed tier's order allows). Deleted suffix:
+    // the same up to name 10,000, then every name deleted, the long one too.
+    // All deleted: no new string at all. The one walk writes the new pool a
+    // string at a time, hashes both pools as content_hash does and derives
+    // the runs. It gives the old file's body back as it decodes it, deleted
+    // strings as well as kept ones: each call at the end of the first bucket
+    // that puts a piece behind the last call, and under a piece left for the
+    // end. It reads no body byte before an offset it passed: scribbled over as
+    // it passes them, the old file still rebuilds into the new pool, under the
+    // old pool's hash.
     enum class Shape { Mixed, DeletedSuffix, AllDeleted };
     struct Case {
         const char* name;
@@ -2832,10 +2835,10 @@ TEST(patch_format_string_tier_walk_writes_pieces_and_reads_nothing_it_passed) {
                          Case{"all deleted", Shape::AllDeleted, true}}) {
         const int failures_before = gctest::failures();
         std::vector<std::string> o, n;
-        for (uint32_t i = 0; i < 30000; i++) {
+        for (uint32_t i = 0; i < 120000; i++) {
             char b[16];
             std::snprintf(b, sizeof b, "name %07u", i);
-            const std::string w = i == 12345 ? b + std::string(STRING_WALK_PIECE + 100, 'z') : b;
+            const std::string w = i == 12345 ? b + std::string(string_files::MAX_STRING - 12, 'z') : b;
             o.push_back(w);
             if (c.shape == Shape::AllDeleted || (c.shape == Shape::DeletedSuffix && i >= 10000)) continue;
             if (i % 5 == 1 && !c.sorted) n.push_back(w + "+");
@@ -2845,23 +2848,34 @@ TEST(patch_format_string_tier_walk_writes_pieces_and_reads_nothing_it_passed) {
         const std::string old_pool = pool_in_order(o), new_pool = pool_in_order(n);
         const TierEdit e = tier_edit(old_pool, new_pool);
         REQUIRE(e.diff.sorted == c.sorted);
-        std::vector<char> old_bytes(old_pool.begin(), old_pool.end());
+        std::vector<uint8_t> file = string_files::encode(old_pool.data(), old_pool.size());
+        const string_files::Footer ft = string_files::read_footer(file.data(), file.size());
+        REQUIRE(ft.body >= 6 * STRING_WALK_PIECE);
+        // The body offset each bucket ends at, and the one it starts at.
+        std::map<uint64_t, uint64_t> bucket_at_end;
+        for (uint64_t b = 0, at = 0; b < ft.buckets; b++) {
+            const uint64_t size = string_files::rd16(&file[ft.body + 4 * b + 2]);
+            bucket_at_end[at + size] = at;
+            at += size;
+        }
+        string_files::Decoder old(file.data(), file.size());
         std::string rebuilt;
-        size_t longer = 0, passed = 0, scribbled = 0, late = 0;
+        size_t not_one = 0, passed = 0, scribbled = 0, late = 0, off_end = 0;
         StringRemap remap(scratch_tables());
 
         const StringTierRebuild walk = rebuild_string_tier(
-            old_bytes.data(), old_bytes.size(), e.edit(), place_of(1000, 900, new_pool), remap,
+            old, e.edit(), place_of(1000, 900, new_pool), remap,
             [&](const char* p, size_t len) {
                 rebuilt.append(p, len);
-                longer += len > STRING_WALK_PIECE;
+                not_one += len == 0 || p[len - 1] != '\0' || memchr(p, 0, len - 1) != nullptr;
             },
             [&](size_t off) {
-                CHECK(off >= scribbled + STRING_WALK_PIECE && off <= old_bytes.size() && old_pool[off - 1] == '\0');
-                // The string that ended at off started under a piece past the last call.
-                const size_t last = old_pool.rfind('\0', off - 2);
-                late += (last == std::string::npos ? 0 : last + 1) >= scribbled + STRING_WALK_PIECE;
-                std::fill(old_bytes.begin(), old_bytes.begin() + off, '#');
+                CHECK(off >= scribbled + STRING_WALK_PIECE && off <= ft.body);
+                // A bucket ends at off, and started under a piece past the last call.
+                const auto it = bucket_at_end.find(off);
+                off_end += it == bucket_at_end.end();
+                late += it != bucket_at_end.end() && it->second >= scribbled + STRING_WALK_PIECE;
+                std::fill(file.begin(), file.begin() + static_cast<std::ptrdiff_t>(off), uint8_t('#'));
                 scribbled = off;
                 passed++;
             });
@@ -2871,10 +2885,12 @@ TEST(patch_format_string_tier_walk_writes_pieces_and_reads_nothing_it_passed) {
         CHECK_EQ(walk.new_size, uint64_t(new_pool.size()));
         CHECK_EQ(walk.old_hash, content_hash(old_pool.data(), old_pool.size()));
         CHECK_EQ(walk.new_hash, content_hash(new_pool.data(), new_pool.size()));
-        CHECK_EQ(longer, size_t(c.shape == Shape::Mixed));
+        CHECK_EQ(not_one, size_t(0));
+        CHECK_EQ(off_end, size_t(0));
         CHECK_EQ(late, size_t(0));
-        CHECK(old_pool.size() - scribbled < STRING_WALK_PIECE);
-        CHECK(passed + 2 >= old_pool.size() / STRING_WALK_PIECE);
+        CHECK(ft.body - scribbled < STRING_WALK_PIECE);
+        CHECK(passed + 2 >= ft.body / STRING_WALK_PIECE);
+        CHECK(passed >= 4);
         remap.finish();
         const auto want = pairs_of(old_pool, new_pool, 1000, 900);
         size_t wrong = 0;
@@ -2922,27 +2938,6 @@ TEST(patch_format_string_tier_rebuild_is_refused_for_its_first_fault) {
     CHECK_EQ(refusal(letter, other_new, at), stale);
     CHECK_EQ(refusal(o, other_new, at), rebuilt);
     CHECK_EQ(refusal(o, e.diff, place_of(0, 0, n + "x")), rebuilt);
-}
-
-TEST(patch_format_string_tier_walk_reads_a_stale_pool_only_within_it) {
-    // A stale old pool held in exactly its bytes, whose last string lost its
-    // NUL, under a sorted edit adding a string that string prefixes: the
-    // walk compares and copies nothing past the pool (the sanitizer build
-    // sees any byte past it) and the rebuild names the pool stale.
-    const std::string o = pool_of({"a", "cd"}), n = pool_of({"a", "cd", "cdz"});
-    const TierEdit e = tier_edit(o, n);
-    REQUIRE(e.diff.sorted);
-    const std::vector<char> stale(o.begin(), o.end() - 1);  // a\0cd
-    StringRemap remap(scratch_tables());
-    const StringTierPlace at = place_of(0, 0, n);
-
-    const Rebuilt b = rebuild({stale.data(), stale.size()}, e.edit(), at, remap);
-
-    CHECK(b.walk.placed);
-    CHECK(b.pool == std::string("a\0cdcdz\0", 8));
-    CHECK_EQ(b.walk.old_hash, content_hash(stale.data(), stale.size()));
-    CHECK_EQ(refusal_of([&] { require_string_tier_rebuilt(b.walk, e.edit(), at, "strings_core.bin"); }),
-             std::string("Old strings_core.bin is not the one the patch was made from"));
 }
 
 TEST(patch_format_sorted_tier_sends_no_indices) {

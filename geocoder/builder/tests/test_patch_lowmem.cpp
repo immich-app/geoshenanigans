@@ -850,6 +850,67 @@ TEST(patch_rebuilds_the_builders_poi_files_on_random_days) {
     }
 }
 
+// Random days of the five string tiers: old pools of random strings (empty
+// ones, one of the longest length a tier holds, runs of names sharing a
+// prefix, every other tier sorted), and new days that delete, edit and add
+// strings, one tier empty on the old day and one on the new. In every mode the
+// patcher writes the builder's tier files of the new day (string_files.h:
+// FCC2, encoded front to back with the bucket table set aside), byte for
+// byte.
+TEST(patch_rebuilds_the_builders_string_tiers_on_random_days) {
+    ScratchDir dir("lowmem-string-days");
+    for (uint32_t seed = 1; seed <= 3; seed++) {
+        std::mt19937 rng(20261111 + seed);
+        auto name = [&] {
+            const uint32_t r = rng() % 40;
+            if (r == 0) return std::string();
+            std::string s = "Stra\xC3\x9F" "e " + std::to_string(rng() % 50) + " " + std::to_string(rng() % (r < 20 ? 30 : 100000));
+            return s;
+        };
+        BuildDir old_d, new_d;
+        for (int t = 0; t < STRING_TIER_COUNT; t++) {
+            const bool sorted = t % 2 == 0;
+            std::vector<std::string> o;
+            const bool old_empty = t == int(seed), new_empty = t == int(seed + 1) % STRING_TIER_COUNT;
+            if (!old_empty)
+                for (uint32_t i = 0, n = 200 + rng() % 3000; i < n; i++) o.push_back(name());
+            if (!old_empty && t == 2) o.insert(o.begin() + o.size() / 2, std::string(string_files::MAX_STRING, 'L'));
+            std::vector<std::string> n;
+            if (!new_empty)
+                for (const std::string& w : o) {
+                    const uint32_t r = rng() % 30;
+                    if (r < 3) continue;                     // deleted
+                    if (r == 3) n.push_back(w + "x");        // edited
+                    else n.push_back(w);
+                    if (r == 4 || r == 5) n.push_back(name());  // added
+                }
+            if (!new_empty && n.empty()) n.push_back(name());
+            for (std::vector<std::string>* v : {&o, &n})
+                if (sorted) {
+                    std::sort(v->begin(), v->end());
+                    v->erase(std::unique(v->begin(), v->end()), v->end());
+                }
+            auto pool = [](const std::vector<std::string>& v) {
+                std::vector<char> p;
+                for (const std::string& w : v) p.insert(p.end(), w.c_str(), w.c_str() + w.size() + 1);
+                return p;
+            };
+            old_d[STRING_TIER_FILES[t]] = pool(o);
+            new_d[STRING_TIER_FILES[t]] = pool(n);
+        }
+        const LowMemCase c{dir.path(), "seed-" + std::to_string(seed)};
+        REQUIRE(prepare(c, old_d, new_d).empty());
+
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
+        for (const std::string& mode : ALL_MODES)
+            for (const char* f : STRING_TIER_FILES) {
+                const std::vector<char>& pool = new_d.at(f);
+                const std::vector<uint8_t> built = string_files::encode(pool.data(), pool.size());
+                CHECK(read_file(c.dir("out." + mode) + "/" + f) == std::vector<char>(built.begin(), built.end()));
+            }
+    }
+}
+
 // An unchanged parent of an encoded family (poi_records.bin sent as kept)
 // replays with its child: both files unchanged, then the records unchanged
 // and one vertex block edited.
@@ -3030,7 +3091,9 @@ TEST(patch_refuses_offset_fixups_left_over_or_in_a_child_stream) {
 // with a letter changed, or with a NUL lost so that the old pool holds one
 // string fewer and the edit's last deleted index lies past it, it's refused in
 // every mode as an old file the patch wasn't made from, not as a malformed
-// patch. The patch applies to the tier it was made from.
+// patch; so is a pool of another size, and the file missing. An old file that
+// isn't FCC2 (string_files.h) is refused as malformed, named. The patch
+// applies to the tier it was made from.
 TEST(patch_refuses_a_stale_old_string_tier) {
     ScratchDir dir("patch-stale-strings");
     // 10,000 streets, every third and the last deleted and every hundredth
@@ -3051,8 +3114,10 @@ TEST(patch_refuses_a_stale_old_string_tier) {
     // The old dir's tier and the encoded set's (a link to it, or a copy):
     // whether both were written.
     auto put_old_pool = [&](const std::string& pool) {
-        return write_file(c.dir("old") + "/strings_core.bin", pool.data(), pool.size()) &&
-               write_file(c.dir("old.enc") + "/strings_core.bin", pool.data(), pool.size());
+        const std::vector<uint8_t> f = string_files::encode(pool.data(), pool.size());
+        const char* p = reinterpret_cast<const char*>(f.data());
+        return write_file(c.dir("old") + "/strings_core.bin", p, f.size()) &&
+               write_file(c.dir("old.enc") + "/strings_core.bin", p, f.size());
     };
     std::string letter = old_pool, fewer = old_pool;
     letter[3] = 'E';
@@ -3065,6 +3130,21 @@ TEST(patch_refuses_a_stale_old_string_tier) {
 
         CHECK(not_refused(c, ALL_MODES, c.patch(), name, stale).empty());
     }
+    REQUIRE(put_old_pool(old_pool + std::string("one more", 9)));
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "longer", stale + " (a pool of " + std::to_string(old_pool.size() + 9) +
+                                                         " bytes, the patch expects " + std::to_string(old_pool.size()) + ")")
+              .empty());
+    {
+        std::vector<uint8_t> f = string_files::encode(old_pool.data(), old_pool.size());
+        f.back() = '3';  // FCC3
+        const char* p = reinterpret_cast<const char*>(f.data());
+        REQUIRE(write_file(c.dir("old") + "/strings_core.bin", p, f.size()));
+        REQUIRE(write_file(c.dir("old.enc") + "/strings_core.bin", p, f.size()));
+        CHECK(not_refused(c, ALL_MODES, c.patch(), "not-fcc2", "Malformed old strings_core.bin: no FCC2 footer").empty());
+    }
+    REQUIRE(unlink((c.dir("old") + "/strings_core.bin").c_str()) == 0);
+    REQUIRE(unlink((c.dir("old.enc") + "/strings_core.bin").c_str()) == 0);
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "missing", stale + " (missing)").empty());
     REQUIRE(put_old_pool(old_pool));
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
