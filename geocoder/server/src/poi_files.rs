@@ -126,8 +126,9 @@ fn unzigzag(z: u64) -> i64 {
     (z >> 1) as i64 ^ -((z & 1) as i64)
 }
 
-/// The block of polygon record rec, or None: a point, or a block whose vertices run past the
-/// file's pad.
+/// The block of polygon record rec, or None: a point, a block whose vertices run past the file's
+/// pad, or one of more vertices than the file has bits (the builder's blocks never have, and a
+/// corrupt count of zero-width vertices must not size the decode).
 fn block(v: &[u8], rec: &PoiRecord) -> Option<Block> {
     if !rec.is_polygon() {
         return None;
@@ -146,7 +147,7 @@ fn block(v: &[u8], rec: &PoiRecord) -> Option<Block> {
     at += 2;
     let encoding = tag & 3;
     let max = if encoding == 3 { 32 } else { 16 };
-    if tag > 7 || m == 0 || wl > max || wg > max {
+    if tag > 7 || m == 0 || wl > max || wg > max || m as u64 > 8 * v.len() as u64 {
         return None;
     }
     let payload = (m as u64 * (wl + wg) as u64).div_ceil(8);
@@ -385,5 +386,9 @@ mod tests {
         let v = hex(SMALL_V2);
         assert!(polygon(&FileBytes::Owned(v[..11].to_vec()), &b).is_none());
         assert!(polygon(&FileBytes::Owned(v), &b).is_some());
+        // 2^32 - 1 vertices of no bits each in a block of 7 bytes.
+        let zero_width = FileBytes::Owned(hex("00 ffffffff0f 00 ffffff03 00 00  0000000000000000"));
+        assert_eq!(vertex_count(&zero_width, &b), None);
+        assert!(polygon(&zero_width, &b).is_none());
     }
 }
