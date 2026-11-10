@@ -1377,7 +1377,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                     // array), so reading them at the next build's allocator
                     // would put records at the wrong slots.
                     write_cell_index_sorted(poi_dir + "/poi_cells.bin", poi_dir + "/poi_entries.bin",
-                                            filtered_cells);
+                                            cell_pairs::POI, filtered_cells);
 
                     // POI tier strings — only clients opting in to POI get
                     // these names, and each dir only the head of the tier

@@ -6,7 +6,6 @@
 // output dir holding files, and a POI set whose offsets do not fit the
 // encoding. (The patcher's decoders: tests/test_gcs_codec.cpp.)
 #include "gc_addr.h"
-#include "gc_gxc.h"
 #include "gc_poly.h"
 #include "gc_side.h"
 #include "gc_ways.h"
@@ -321,224 +320,6 @@ TEST(gc_address_encoders_refuse_a_footprint_past_the_end_of_the_file) {
     }
 }
 
-// Malformed list and address counts in a gxc row, each a one-row encoded set.
-// The child's address space is capped: an unchecked count runs out of it.
-TEST(gc_gxc_decoder_refuses_malformed_counts) {
-    constexpr uint64_t MAX = ~uint64_t(0);  // LEB128 FF x9 01: count - 1 + 1 wraps to 0
-    struct Case {
-        const char* name;
-        int s, a;                      // street list state, address state of the row
-        std::vector<uint64_t> street;  // gxc_street.bin varints
-        std::vector<uint64_t> addr;    // address payload varints
-        uint64_t addr_ids;             // next address id after the row
-        bool valid;
-    };
-    const Case cases[] = {
-        {"valid row", 1, 1, {1, 4, 0}, {2}, 2, true},
-        {"street count - 1 = 2^64 - 1", 1, 0, {MAX, 0}, {}, 0, false},
-        {"street count 65536", 3, 0, {0xFFFF, 0}, {}, 0, false},
-        {"address state 1, 2^40 ids", 0, 1, {}, {uint64_t(1) << 40}, 0, false},
-        {"address state 1, no ids", 0, 1, {}, {0}, 0, false},
-        {"address state 2, index gap 2^40", 0, 2, {}, {3, 1, uint64_t(1) << 40, 0}, 3, false},
-        {"address state 2, 2^40 copies", 0, 2, {}, {1, 1, 0, uint64_t(1) << 40}, 1, false},
-        {"address state 2, more repeats than ids", 0, 2, {}, {1, 2, 0, 0, 0, 0}, 1, false},
-        {"address state 3, count - 1 = 2^64 - 1", 0, 3, {}, {1, MAX, 0}, 1, false},
-    };
-    ScratchDir dir("gc-gxc-counts");
-    int n = 0;
-    for (const Case& c : cases) {
-        const std::string src = dir.path() + "/" + std::to_string(n++), out = src + "/out";
-        std::filesystem::create_directories(out);
-        uint8_t top[32] = {};
-        gcset::wr64(top, uint64_t(1) << 40);
-        gcset::wr32(top + 12, gcset::NO);  // no street / interp list in effect at the block start
-        gcset::wr32(top + 16, gcset::NO);
-        write_bytes(src + "/gxc_top.bin", std::vector<uint8_t>(top, top + 32));
-        std::vector<uint8_t> rows{uint8_t(c.s | c.a << 2)}, street;
-        for (uint64_t v : c.addr) uv(rows, v);
-        for (uint64_t v : c.street) uv(street, v);
-        write_bytes(src + "/gxc_rows.bin", rows);
-        write_bytes(src + "/gxc_street.bin", street);
-        write_bytes(src + "/gxc_interp.bin", {});
-
-        const int status = exit_status_in_child(
-            [&] {
-#ifndef __SANITIZE_ADDRESS__
-                struct rlimit as{size_t(4) << 30, size_t(4) << 30};
-                setrlimit(RLIMIT_AS, &as);
-#endif
-                gcset::Manifest m;
-                m.set("gxc.rows", 1);
-                m.set("gxc.B", 128);
-                m.set("gxc.addr_ids", c.addr_ids);
-                gcset::gxc::decode(src, out, m);
-                return 0;
-            },
-            20);
-
-        if (status != (c.valid ? 0 : 2)) std::printf("    %s: exit %d\n", c.name, status);
-        CHECK_EQ(status, c.valid ? 0 : 2);
-    }
-}
-
-namespace {
-
-// A gxc row: its header byte (list states, address state, cell step) and the
-// varints after it (an escaped step, then the address payload).
-struct GxcRow {
-    uint8_t h;
-    std::vector<uint64_t> after;
-};
-
-// An encoded geo index of rows at dir: blocks of 128 rows starting at cells
-// (2^40 by default), no list in effect at a block's start (a later block's
-// rows list nothing before it), street: gxc_street.bin's varints.
-void write_gxc(const std::string& dir, const std::vector<GxcRow>& rows, const std::vector<uint64_t>& street,
-               const std::vector<uint64_t>& cells = {uint64_t(1) << 40}) {
-    std::filesystem::create_directories(dir);
-    std::vector<uint8_t> top, r, s;
-    for (size_t i = 0; i < rows.size(); i++) {
-        if (i % 128 == 0) {
-            uint8_t t[32] = {};
-            gcset::wr64(t, cells[i / 128]);
-            gcset::wr32(t + 8, uint32_t(r.size()));
-            gcset::wr32(t + 12, gcset::NO);
-            gcset::wr32(t + 16, gcset::NO);
-            top.insert(top.end(), t, t + 32);
-        }
-        r.push_back(rows[i].h);
-        for (uint64_t v : rows[i].after) uv(r, v);
-    }
-    for (uint64_t v : street) uv(s, v);
-    write_bytes(dir + "/gxc_top.bin", top);
-    write_bytes(dir + "/gxc_rows.bin", r);
-    write_bytes(dir + "/gxc_street.bin", s);
-    write_bytes(dir + "/gxc_interp.bin", {});
-}
-
-// gcset's zigzag coding of a signed delta.
-uint64_t zz(int64_t v) { return gcset::zz64(v); }
-
-}  // namespace
-
-// List and address ids that leave the u32 range, or pass the set's address id
-// count, are refused, each case a one- or two-row encoded set (street list
-// state 1 or address state 1 or 3 in each row): a first id 2^32 (narrowed
-// to 0), 1 + (2^63 - 1) (a signed overflow), a gap from 2^32 - 1 (wrapped to
-// 0), an address advance of 2^64 - 1 (next wrapped to 0 by the next row), an
-// id at or past the count, a count past 2^32. Ids up to 2^32 - 1 decode.
-TEST(gc_gxc_decoder_refuses_ids_past_u32_and_the_id_count) {
-    struct Case {
-        const char* name;
-        std::vector<GxcRow> rows;
-        std::vector<uint64_t> street;
-        uint64_t addr_ids;
-        bool valid;
-    };
-    const uint64_t MAX = ~uint64_t(0), U32 = uint64_t(1) << 32;
-    const Case cases[] = {
-        {"valid ids", {{1 | 1 << 2, {2}}, {1 | 3 << 2, {0, 0, zz(-1)}}}, {0, zz(1), 1, zz(0xFFFFFFFC), 1}, 2, true},
-        {"street first id 2^32", {{1, {}}}, {0, zz(int64_t(U32))}, 0, false},
-        {"street first id 1 + 2^63 - 1", {{1, {}}, {1, {}}}, {0, zz(1), 0, zz(INT64_MAX)}, 0, false},
-        {"street id 2^32 - 1 + 1", {{1, {}}}, {1, zz(int64_t(U32 - 1)), 0}, 0, false},
-        {"address advance 2^64 - 1", {{3 << 2, {MAX, 0, zz(0)}}, {1 << 2, {1}}}, {}, 0, false},
-        {"address first id 2^32", {{3 << 2, {1, 0, zz(int64_t(U32))}}}, {}, 1, false},
-        {"address id past the count", {{3 << 2, {0, 0, zz(5)}}}, {}, 0, false},
-        {"address id count 2^32 + 1", {{3 << 2, {U32 + 1, 0, zz(0)}}}, {}, U32 + 1, false},
-    };
-    ScratchDir dir("gc-gxc-ids");
-    int n = 0;
-    for (const Case& c : cases) {
-        const std::string src = dir.path() + "/" + std::to_string(n++), out = src + "/out";
-        write_gxc(src, c.rows, c.street);
-        std::filesystem::create_directories(out);
-
-        const int status = exit_status_in_child(
-            [&] {
-                gcset::Manifest m;
-                m.set("gxc.rows", c.rows.size());
-                m.set("gxc.B", 128);
-                m.set("gxc.addr_ids", c.addr_ids);
-                gcset::gxc::decode(src, out, m);
-                return 0;
-            },
-            20);
-
-        if (status != (c.valid ? 0 : 2)) std::printf("    %s: exit %d\n", c.name, status);
-        CHECK_EQ(status, c.valid ? 0 : 2);
-    }
-}
-
-// gxc rows out of cell order are refused. By the decoder: an escaped cell step
-// of 2^64 - 1 (its + 4 wrapped to 3) or 2^37 - 4 (2^37, shifted past the u64 to
-// 0: the same cell again), a step from the last cell id (wrapped to 0), and a
-// block starting at its previous row's cell; a step of 2^20 and a block past
-// its previous row decode. By the encoder: a block's first row at the cell of
-// the row before it.
-TEST(gc_gxc_rows_out_of_cell_order_are_refused) {
-    const uint64_t MAX = ~uint64_t(0), C = uint64_t(1) << 40, LAST = MAX - ((uint64_t(1) << 27) - 1);
-    std::vector<GxcRow> blocks(129, GxcRow{0, {}});  // steps of one cell, no lists
-    struct Case {
-        const char* name;
-        std::vector<GxcRow> rows;
-        std::vector<uint64_t> cells;
-        bool valid;
-    };
-    const Case cases[] = {
-        {"escaped step 2^20", {{0, {}}, {3 << 6, {(1 << 20) - 4}}}, {C}, true},
-        {"block past its previous row", blocks, {C, C + (uint64_t(128) << 27)}, true},
-        {"escaped step 2^64 - 1 + 4", {{0, {}}, {3 << 6, {MAX}}}, {C}, false},
-        {"escaped step 2^37", {{0, {}}, {3 << 6, {(uint64_t(1) << 37) - 4}}}, {C}, false},
-        {"step from the last cell id", {{0, {}}, {0, {}}}, {LAST}, false},
-        {"block at its previous row's cell", blocks, {C, C + (uint64_t(127) << 27)}, false},
-    };
-    ScratchDir dir("gc-gxc-cells");
-    int n = 0;
-    for (const Case& c : cases) {
-        const std::string src = dir.path() + "/" + std::to_string(n++), out = src + "/out";
-        write_gxc(src, c.rows, {}, c.cells);
-        std::filesystem::create_directories(out);
-
-        const int status = exit_status_in_child(
-            [&] {
-                gcset::Manifest m;
-                m.set("gxc.rows", c.rows.size());
-                m.set("gxc.B", 128);
-                m.set("gxc.addr_ids", 0);
-                gcset::gxc::decode(src, out, m);
-                return 0;
-            },
-            20);
-
-        if (status != (c.valid ? 0 : 2)) std::printf("    %s: exit %d\n", c.name, status);
-        CHECK_EQ(status, c.valid ? 0 : 2);
-    }
-    for (const bool sorted : {true, false}) {
-        const std::string src = dir.path() + (sorted ? "/sorted" : "/unsorted"), out = src + ".enc";
-        std::filesystem::create_directories(src);
-        std::filesystem::create_directories(out);
-        std::vector<uint8_t> geo;
-        for (uint64_t i = 0; i < 129; i++) {
-            const std::vector<uint8_t> cell = le(C + ((i - (!sorted && i == 128)) << 27), 8), none = le(gcset::NO, 4);
-            geo.insert(geo.end(), cell.begin(), cell.end());
-            for (int t = 0; t < 3; t++) geo.insert(geo.end(), none.begin(), none.end());
-        }
-        write_bytes(src + "/geo_cells.bin", geo);
-        for (const char* e : gcset::gxc::ENTRY) write_bytes(src + "/" + e, {});
-
-        const int status = exit_status_in_child(
-            [&] {
-                gcset::Manifest m;
-                gcset::gxc::encode(src, out, m);
-                return 0;
-            },
-            20);
-
-        if (status != (sorted ? 0 : 2)) std::printf("    encoder, %s rows: exit %d\n", sorted ? "sorted" : "unsorted", status);
-        CHECK_EQ(status, sorted ? 0 : 2);
-    }
-}
-
 // A way's code with widths the encoder never writes (first coordinate past 4
 // bytes, deltas past 32 bits) is refused instead of shifting a u32 past its
 // width; the widest valid code decodes. One street way of two nodes: its
@@ -759,10 +540,10 @@ TEST(gc_address_footprints_past_abs2s_bound_round_trip) {
 // When a FIFO's pipe can't be enlarged, the grouped FIFO writers fail at once
 // instead of deadlocking with their reader. A writer child drops to nobody
 // (when run as root), holds pipes until it is past its pipe page limit
-// (fs.pipe-user-pages-soft), then writes gxc-decode-shaped rows (geo row,
-// 100-id street list, 1-id address list) through four FIFOs to a reader in
-// the patcher's order (row, then its lists). gc's die (exit 2) on the pipe
-// size passes; a writer still going after 20 s (the deadlock) fails.
+// (fs.pipe-user-pages-soft), then writes rows of four streams (a 20-byte
+// row, a 100-id list, a 1-id list), each row flushed whole, through four
+// FIFOs to a reader of them side by side. gc's die (exit 2) on the pipe size
+// passes; a writer still going after 20 s (the deadlock) fails.
 TEST(gc_fifo_writers_fail_when_the_pipe_cannot_grow) {
     static const char* const NAMES[4] = {"geo", "street", "addr", "interp"};
     // A 64 KiB window per FIFO, one read() until n bytes are in.
@@ -840,7 +621,6 @@ TEST(gc_fifo_writers_fail_when_the_pipe_cannot_grow) {
         }
         alarm(20);
         gcset::Writer geo(dir + "/geo"), street(dir + "/street"), addr(dir + "/addr"), interp(dir + "/interp");
-        gcset::FlushGroup fg({&geo, &street, &addr, &interp});
         const std::vector<uint32_t> ids(100, 7);
         uint8_t row[20] = {};
         for (int r = 0; r < 20000; r++) {
@@ -849,7 +629,7 @@ TEST(gc_fifo_writers_fail_when_the_pipe_cannot_grow) {
             addr.u16(1);
             addr.u32(1);
             geo.put(row, 20);
-            fg.row_done();
+            for (gcset::Writer* w : {&street, &addr, &geo}) w->flush();
         }
         _exit(0);  // (the pipes were wide after all: no deadlock to look for)
     }

@@ -22,10 +22,12 @@
 #include <vector>
 
 #include "arc_blocks.h"
+#include "geo_index.h"
 #include "in_place_edits.h"
 #include "merge_sequence.h"
 #include "patch_format.h"
 #include "scratch_dir.h"
+#include "sequential_file_reader.h"
 #include "test_framework.h"
 #include "tool_runs.h"
 #include "types.h"
@@ -206,43 +208,40 @@ void put_arc_geometry(BuildDir& d, const ArcGeometry& g) {
     d["arc_vertices.bin"] = arcs;
 }
 
-// The id of a fixture's cell k.
-uint64_t cell_id(uint32_t k) { return uint64_t(k + 1) << 27; }
+// The id of a fixture's geo cell k, at the street level.
+uint64_t cell_id(uint32_t k) { return geo_index::cell_of(k, 17); }
+// Cell k of a cell pair index, which holds cells of one level.
+uint64_t pair_cell(uint32_t k) { return cell_pairs::cell_of(k, 10); }
 
 // A geo row: its cell index and the street ids it lists.
 using GeoRow = std::pair<uint32_t, std::vector<uint32_t>>;
 
-// The geo index of rows (in cell order, no address or interp lists) over
-// `ways` street ways without nodes (a patch drops ids no way replay maps).
+// The geo index of rows (in cell order, street lists alone, each sorted)
+// over `ways` street ways without nodes (a patch drops ids no way replay
+// maps).
 void put_geo(BuildDir& d, const std::vector<GeoRow>& rows, uint32_t ways = 1000) {
-    std::vector<char> street_ways, geo, entries;
+    std::vector<char> street_ways, top, blocks;
     for (uint32_t w = 0; w < ways; w++) {
         append(street_ways, 0u);
         append(street_ways, uint16_t{0});
         append(street_ways, uint16_t{0});
         append(street_ways, w);
     }
-    for (const auto& [k, ids] : rows) {
-        append(geo, cell_id(k));
-        append(geo, ids.empty() ? NO : static_cast<uint32_t>(entries.size()));
-        append(geo, NO);
-        append(geo, NO);
-        if (ids.empty()) continue;
-        append(entries, static_cast<uint16_t>(ids.size()));
-        for (uint32_t id : ids) append(entries, id);
-    }
+    geo_index::Writer writer([&](const char* p, size_t n) { top.insert(top.end(), p, p + n); },
+                             [&](const char* p, size_t n) { blocks.insert(blocks.end(), p, p + n); });
+    for (const auto& [k, ids] : rows) writer.add(cell_id(k), {{{ids.data(), ids.size()}, {}, {}}});
+    writer.finish();
     d["street_ways.bin"] = street_ways;
     d["street_nodes.bin"] = {};
-    d["geo_cells.bin"] = geo;
-    d["street_entries.bin"] = entries;
-    d["addr_entries.bin"] = {};
-    d["interp_entries.bin"] = {};
+    d["geo_cells.bin"] = top;
+    d["geo_entries.bin"] = blocks;
 }
 
 // The cell index <prefix>_cells.bin + <prefix>_entries.bin of lists (cell
-// id → ids), into d, as the builder writes it.
+// id → ids), into d, as the builder writes it (in the admin index's format
+// for a prefix of no index's, the place index an old dir held).
 void put_cells(BuildDir& d, const std::string& prefix, const CellLists& lists) {
-    auto [cells, entries] = write_cell_lists(lists);
+    auto [cells, entries] = write_cell_lists(lists, cell_pairs::format_named(prefix).value_or(cell_pairs::ADMIN));
     d[prefix + "_cells.bin"] = cells;
     d[prefix + "_entries.bin"] = entries;
 }
@@ -268,7 +267,7 @@ void put_admin_minimal(BuildDir& d, const ArcGeometry& g, uint32_t n_places) {
     }
     d["place_nodes.bin"] = places;
     CellLists cells;
-    for (uint32_t k = 0; k + 1 < g.keys.size(); k++) cells[cell_id(k)] = {k, (k + 1) | INTERIOR};
+    for (uint32_t k = 0; k + 1 < g.keys.size(); k++) cells[pair_cell(k)] = {k, (k + 1) | INTERIOR};
     put_cells(d, "admin", cells);
     const std::string pool("Testland\0Ville\0", 15);
     d["strings_core.bin"].assign(pool.begin(), pool.end());
@@ -788,27 +787,6 @@ TEST(patch_lowmem_drops_the_child_bytes_of_deleted_and_replaced_records) {
     }
 }
 
-// The same for the geo index: the lists of a removed stretch of cells (4 MiB
-// of street lists).
-TEST(patch_lowmem_drops_the_lists_of_removed_cells) {
-    ScratchDir dir("lowmem-geo");
-    std::vector<GeoRow> rows, kept;
-    for (uint32_t k = 0; k < 20000; k++) {
-        std::vector<uint32_t> ids(50);
-        for (uint32_t i = 0; i < 50; i++) ids[i] = k % 950 + i;
-        rows.push_back({k, ids});
-    }
-    kept.assign(rows.begin(), rows.begin() + 1000);
-    kept.insert(kept.end(), rows.begin() + 19000, rows.end());
-    BuildDir old_d, new_d;
-    put_geo(old_d, rows);
-    put_geo(new_d, kept);
-    const LowMemCase c{dir.path(), "removed-cells"};
-    REQUIRE(prepare(c, old_d, new_d).empty());
-
-    CHECK(apply_both_modes(c, decoder_peaks_at_most("gxc", DECODER_HOLD)).empty());
-}
-
 // The first nightly without unnamed POIs tombstoned 24,543 contiguous planet
 // poi/all records in place. The POIs after the run stay one MATCH run, so
 // the patch carries the run's tombstones but not those POIs, and the dead
@@ -1208,21 +1186,21 @@ TEST(patch_heap_stays_flat_as_geo_entry_deltas_grow) {
         if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
         std::vector<char> corrections;
         append(corrections, GEO_ENTRY_DELTA_MARKER);
-        append(corrections, static_cast<uint32_t>(PatchFileId::STREET_ENTRIES));
+        append(corrections, static_cast<uint32_t>(PatchFileId::STREET_LISTS));
         append(corrections, n);
         return patch_holds(c, corrections, std::to_string(n) + " street entry corrections");
     }, 20000).empty());
 }
 
 // n geo cells removed and n added (the old cells are the even ones, the new
-// cells the odd ones, none with a list): cell changes of n and n cells, which
-// the patcher reads where they sit in the patch.
+// cells the odd ones, each listing a street): cell changes of n and n cells,
+// which the patcher reads where they sit in the patch.
 TEST(patch_heap_stays_flat_as_geo_cells_change) {
     CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
         std::vector<GeoRow> old_rows, new_rows;
         for (uint32_t k = 0; k < n; k++) {
-            old_rows.push_back({2 * k, {}});
-            new_rows.push_back({2 * k + 1, {}});
+            old_rows.push_back({2 * k, {k % 950}});
+            new_rows.push_back({2 * k + 1, {k % 950}});
         }
         BuildDir old_d, new_d;
         put_geo(old_d, old_rows);
@@ -1236,6 +1214,47 @@ TEST(patch_heap_stays_flat_as_geo_cells_change) {
     }, 20000).empty());
 }
 
+// The plain patcher's walk over a geo index of 60,000 cells whose street
+// lists all change (a blocks file of ~190 KiB, past a read window) holds a
+// read window for the old blocks and a few pages besides: the old top file
+// and the group footers, read 12 and 768 bytes at a time, each through a
+// page, and the new blocks handed to the output's FILE buffer a page at a
+// time. Its heap peak is at most a read window and 48 KiB above that of the
+// same patch over an empty geo index. It was 258 KiB above it when the top
+// and footer readers had read windows of their own and the writer held
+// 64 KiB of blocks. Skipped without a heap shim (the sanitizer build).
+TEST(patch_heap_of_the_geo_walk_is_a_read_window_and_a_few_pages) {
+    if (!gctest::heap_peak_shim()) {
+        std::printf("    SKIP heap peaks: no heap shim under the sanitizers\n");
+        return;
+    }
+    ScratchDir dir("lowmem-heap-geo-walk");
+    const uint32_t sizes[] = {0, 60000};
+    uint64_t peaks[2] = {}, blocks[2] = {};
+    for (size_t s = 0; s < 2; s++) {
+        const LowMemCase c{dir.path(), "n" + std::to_string(sizes[s])};
+        std::vector<GeoRow> rows, changed;
+        for (uint32_t k = 0; k < sizes[s]; k++) {
+            rows.push_back({k, {k % 950}});
+            changed.push_back({k, {k % 950 + 1}});
+        }
+        BuildDir old_d, new_d;
+        put_geo(old_d, rows);
+        put_geo(new_d, changed);
+        REQUIRE(prepare(c, old_d, new_d).empty());
+        blocks[s] = read_file(c.dir("old") + "/geo_entries.bin").size();
+        if (s == 1) REQUIRE(blocks[s] > 2 * SEQUENTIAL_READ_BUFFER_BYTES);
+        const Applied a = apply_modes(c, {"plain"});
+        CHECK(a.bad.empty());
+        REQUIRE(a.heap_peaks.count("plain"));
+        peaks[s] = a.heap_peaks.at("plain");
+    }
+    std::printf("    plain: heap peak %llu B over an empty geo index, %llu B over %u cells of %llu B of blocks (%lld B above)\n",
+                (unsigned long long)peaks[0], (unsigned long long)peaks[1], sizes[1], (unsigned long long)blocks[1],
+                (long long)peaks[1] - (long long)peaks[0]);
+    CHECK(peaks[1] <= peaks[0] + SEQUENTIAL_READ_BUFFER_BYTES + (48 << 10));
+}
+
 // n POI cells whose lists all change (each cell's POI becomes the next one)
 // over POIs that stay: a POI cell index delta of n cells, which the patcher
 // reads where it sits in the patch.
@@ -1245,8 +1264,8 @@ TEST(patch_heap_stays_flat_as_a_poi_cell_index_delta_grows) {
         const auto pois = pois_of(rng, 1000, 0, true);
         CellLists old_cells, new_cells;
         for (uint32_t k = 0; k < n; k++) {
-            old_cells[cell_id(k)] = {k % 950};
-            new_cells[cell_id(k)] = {k % 950 + 1};
+            old_cells[pair_cell(k)] = {k % 950};
+            new_cells[pair_cell(k)] = {k % 950 + 1};
         }
         BuildDir old_d, new_d;
         put_pois(old_d, pois);
@@ -1273,8 +1292,8 @@ TEST(patch_heap_stays_flat_as_poi_cells_change) {
         const auto pois = pois_of(rng, 1000, 0, true);
         CellLists old_cells, new_cells;
         for (uint32_t k = 0; k < n; k++) {
-            old_cells[cell_id(2 * k)] = {};
-            new_cells[cell_id(2 * k + 1)] = {};
+            old_cells[pair_cell(2 * k)] = {};
+            new_cells[pair_cell(2 * k + 1)] = {};
         }
         BuildDir old_d, new_d;
         put_pois(old_d, pois);
@@ -1290,13 +1309,60 @@ TEST(patch_heap_stays_flat_as_poi_cells_change) {
     }, 10000).empty());
 }
 
+// Eight POI cells that share one list of n POIs (as a dense city's poi/all
+// cells do) and a ninth whose POI changes: the patcher holds a long list as
+// few times as the rebuild needs (the old index's row, the writer's previous
+// list and its encoding), so from n = 6,000 to 60,000 its heap peak, plain
+// and sync, grows by at most three times the ids added (2.7 and 1.2 times).
+// It grew by 4.7 and 3.4 times them when the old index's reader kept its own
+// copy of a shared list, and the rebuild a second list it swapped with the
+// reader's. Skipped without a heap shim (the sanitizer build).
+TEST(patch_heap_holds_a_long_shared_poi_cell_list_at_most_three_times) {
+    if (!gctest::heap_peak_shim()) {
+        std::printf("    SKIP heap peaks: no heap shim under the sanitizers\n");
+        return;
+    }
+    ScratchDir dir("lowmem-heap-shared-list");
+    std::mt19937 rng(20261110);
+    const uint32_t sizes[] = {6000, 60000};
+    const auto pois = pois_of(rng, sizes[1] + 2, 0, true);
+    std::map<std::string, uint64_t> peaks[2];
+    for (size_t s = 0; s < 2; s++) {
+        const LowMemCase c{dir.path(), "n" + std::to_string(sizes[s])};
+        std::vector<uint32_t> shared(sizes[s]);
+        for (uint32_t i = 0; i < sizes[s]; i++) shared[i] = i;
+        CellLists old_cells, new_cells;
+        for (uint32_t k = 0; k < 8; k++) old_cells[pair_cell(k)] = new_cells[pair_cell(k)] = shared;
+        old_cells[pair_cell(8)] = {sizes[1]};
+        new_cells[pair_cell(8)] = {sizes[1] + 1};
+        BuildDir old_d, new_d;
+        put_pois(old_d, pois);
+        put_pois(new_d, pois);
+        put_cells(old_d, "poi", old_cells);
+        put_cells(new_d, "poi", new_cells);
+        REQUIRE(prepare(c, old_d, new_d).empty());
+        const Applied a = apply_modes(c, {"plain", "sync"});
+        CHECK(a.bad.empty());
+        peaks[s] = a.heap_peaks;
+    }
+    const uint64_t added = 4 * uint64_t(sizes[1] - sizes[0]);
+    for (const std::string mode : {"plain", "sync"}) {
+        REQUIRE(peaks[0].count(mode) && peaks[1].count(mode));
+        const uint64_t from = peaks[0][mode], to = peaks[1][mode];
+        std::printf("    %s: heap peak %llu B at n = %u, %llu B at n = %u (%.2f times the %llu B of ids added)\n",
+                    mode.c_str(), (unsigned long long)from, sizes[0], (unsigned long long)to, sizes[1],
+                    to > from ? double(to - from) / double(added) : 0.0, (unsigned long long)added);
+        CHECK(to <= from + 3 * added);
+    }
+}
+
 namespace {
 
 // The admin index of n_cells cells: cell k lists ids_of(k). The admin
 // polygons keep their slots, so the patch rebuilds the old index as it is.
 CellLists admin_cells_of(uint32_t n_cells, const std::function<std::vector<uint32_t>(uint32_t)>& ids_of) {
     CellLists lists;
-    for (uint32_t k = 0; k < n_cells; k++) lists[cell_id(k)] = ids_of(k);
+    for (uint32_t k = 0; k < n_cells; k++) lists[pair_cell(k)] = ids_of(k);
     return lists;
 }
 
@@ -2021,8 +2087,8 @@ void check_poi_delta_refusals(const std::string& dir_name, const std::vector<Del
     std::mt19937 rng(20261030);
     CellLists old_cells, new_cells;
     for (uint32_t k = 0; k < 20; k++) {
-        old_cells[cell_id(k)] = {k % 7};
-        new_cells[cell_id(k)] = {k % 7 + 1};
+        old_cells[pair_cell(k)] = {k % 7};
+        new_cells[pair_cell(k)] = {k % 7 + 1};
     }
     const auto pois = pois_of(rng, 40, 0, true);
     BuildDir old_d, new_d;
@@ -2170,8 +2236,8 @@ TEST(patch_refuses_a_patch_without_the_delta_of_a_cell_index) {
     std::mt19937 rng(20261031);
     CellLists old_cells, new_cells;
     for (uint32_t k = 0; k < 20; k++) {
-        old_cells[cell_id(k)] = {k % 7};
-        new_cells[cell_id(k)] = {k % 7 + 1};
+        old_cells[pair_cell(k)] = {k % 7};
+        new_cells[pair_cell(k)] = {k % 7 + 1};
     }
     const auto pois = pois_of(rng, 40, 0, true);
     struct Case {
@@ -2225,7 +2291,7 @@ TEST(patch_to_a_dir_without_a_place_index_applies_to_an_old_dir_with_or_without_
         for (const uint32_t w : {i, i == 7 ? 99 : i, NO, NO, NO}) append(new_places, w);
     }
     CellLists place_lists;
-    for (uint32_t k = 0; k < 20; k++) place_lists[cell_id(k)] = {k, k + 20};
+    for (uint32_t k = 0; k < 20; k++) place_lists[pair_cell(k)] = {k, k + 20};
     BuildDir with_index, without_index, new_d;
     with_index["place_nodes.bin"] = without_index["place_nodes.bin"] = old_places;
     put_cells(with_index, "place", place_lists);
@@ -2246,9 +2312,9 @@ TEST(patch_refuses_the_old_place_cell_changes_marker_as_an_unknown_file) {
     ScratchDir dir("patch-place-cell-changes");
     std::mt19937 rng(20261102);
     CellLists old_cells, new_cells;
-    for (uint32_t k = 0; k < 30; k++) old_cells[cell_id(k)] = {k % 7};
-    for (uint32_t k = 0; k < 20; k++) new_cells[cell_id(k)] = {k % 7 + 1};
-    for (uint32_t k = 40; k < 50; k++) new_cells[cell_id(k)] = {2};
+    for (uint32_t k = 0; k < 30; k++) old_cells[pair_cell(k)] = {k % 7};
+    for (uint32_t k = 0; k < 20; k++) new_cells[pair_cell(k)] = {k % 7 + 1};
+    for (uint32_t k = 40; k < 50; k++) new_cells[pair_cell(k)] = {2};
     const auto pois = pois_of(rng, 40, 0, true);
     BuildDir old_d, new_d;
     put_pois(old_d, pois);
@@ -2272,6 +2338,52 @@ TEST(patch_refuses_the_old_place_cell_changes_marker_as_an_unknown_file) {
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
+// Ids 9 to 11 name the geo index's lists by table since build 19, not files:
+// a file section for one (a full replacement) is refused as a file the
+// patcher doesn't know, in every mode. Build 19's first patcher took it, its
+// bytes written to the scratch dir as a file the new dir doesn't list. The
+// patch as made applies.
+TEST(patch_refuses_a_file_section_for_a_geo_list) {
+    ScratchDir dir("patch-geo-list-section");
+    std::mt19937 rng(20261109);
+    CellLists old_cells, new_cells;
+    for (uint32_t k = 0; k < 30; k++) old_cells[pair_cell(k)] = {k % 7};
+    for (uint32_t k = 0; k < 20; k++) new_cells[pair_cell(k)] = {k % 7 + 1};
+    for (uint32_t k = 40; k < 50; k++) new_cells[pair_cell(k)] = {2};
+    const auto pois = pois_of(rng, 40, 0, true);
+    BuildDir old_d, new_d;
+    put_pois(old_d, pois);
+    put_pois(new_d, pois);
+    put_cells(old_d, "poi", old_cells);
+    put_cells(new_d, "poi", new_cells);
+    const LowMemCase c{dir.path(), "geo-list-section"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    std::vector<char> poi_changes;
+    for (const uint32_t w : {CELL_CHANGES_POI_MARKER, 10u, 10u}) append(poi_changes, w);
+    const size_t at = find_once(raw, poi_changes);
+    REQUIRE(at != std::string::npos);
+    for (const PatchFileId fid : GEO_ENTRIES_FILES) {
+        const uint32_t id = static_cast<uint32_t>(fid);
+        // file id, stride 0 (a full replacement), old size 0, new size 4, no files, 4 bytes of data.
+        std::vector<char> section, edited(raw);
+        append(section, id);
+        append(section, uint32_t(0));
+        append(section, uint64_t(0));
+        append(section, uint64_t(4));
+        append(section, uint32_t(0));
+        append(section, uint64_t(4));
+        append(section, uint32_t(0x01020304));
+        edited.insert(edited.begin() + static_cast<std::ptrdiff_t>(at), section.begin(), section.end());
+        const std::string name = "geo-list-" + std::to_string(id), patch = c.dir(name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ALL_MODES, patch, name, "Unknown file " + std::to_string(id)).empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
 // Cell changes out of order (two ids of one list swapped: the geo index's
 // added or removed cells, the POI index's), and a geo entry delta or a cell
 // index delta for a file that has one already or for a file not of its kind,
@@ -2287,9 +2399,9 @@ TEST(patch_refuses_cell_changes_out_of_order_and_a_second_or_foreign_delta) {
     for (uint32_t k = 0; k < 40; k++) new_rows.push_back({k, {(k + 1) % 10}});
     for (uint32_t k = 60; k < 70; k++) new_rows.push_back({k, {3}});
     CellLists old_cells, new_cells;
-    for (uint32_t k = 0; k < 30; k++) old_cells[cell_id(k)] = {k % 7};
-    for (uint32_t k = 0; k < 20; k++) new_cells[cell_id(k)] = {k % 7 + 1};
-    for (uint32_t k = 40; k < 50; k++) new_cells[cell_id(k)] = {2};
+    for (uint32_t k = 0; k < 30; k++) old_cells[pair_cell(k)] = {k % 7};
+    for (uint32_t k = 0; k < 20; k++) new_cells[pair_cell(k)] = {k % 7 + 1};
+    for (uint32_t k = 40; k < 50; k++) new_cells[pair_cell(k)] = {2};
     const auto pois = pois_of(rng, 40, 0, true);
     BuildDir old_d, new_d;
     put_geo(old_d, old_rows);
@@ -2313,7 +2425,7 @@ TEST(patch_refuses_cell_changes_out_of_order_and_a_second_or_foreign_delta) {
         REQUIRE(at != std::string::npos);
         return at;
     };
-    const uint32_t street = static_cast<uint32_t>(PatchFileId::STREET_ENTRIES), poi = static_cast<uint32_t>(PatchFileId::POI_ENTRIES);
+    const uint32_t street = static_cast<uint32_t>(PatchFileId::STREET_LISTS), poi = static_cast<uint32_t>(PatchFileId::POI_ENTRIES);
     // Where each list's ids start (after marker, n_added, n_removed), and
     // where the street entries' geo entry delta and the POI cell index delta
     // start.
@@ -2348,7 +2460,7 @@ TEST(patch_refuses_cell_changes_out_of_order_and_a_second_or_foreign_delta) {
         {"poi-removed-last", swap_ids(poi_removed, 8), "Malformed cell changes"},
         // Each before the real section: an empty one (no cells; a u64 size of 0), or its copy.
         {"second-geo-delta", insert_at(street_delta, head({GEO_ENTRY_DELTA_MARKER, street, 0})),
-         "Malformed geo entry delta: a second one for street_entries.bin"},
+         "Malformed geo entry delta: a second one for geo street lists"},
         {"foreign-geo-delta", insert_at(street_delta, head({GEO_ENTRY_DELTA_MARKER, poi, 0})), "Malformed geo entry delta for file 17"},
         {"second-cell-index-delta", insert_at(poi_delta, poi_delta_section), "Malformed cell index delta: a second one for poi_entries.bin"},
         {"foreign-cell-index-delta", insert_at(poi_delta, head({CELL_INDEX_DELTA_MARKER, 999, 0, 0})), "Malformed cell index delta for file 999"},
@@ -2595,7 +2707,8 @@ TEST(patch_refuses_secondary_pairs_for_a_file_without_a_record_remap) {
     const Case cases[] = {
         {"admin", with_lists(1, {admin, 1, 0, 1}), "Malformed secondary remap: pairs for admin_polygons.bin, which has none"},
         {"place", with_lists(1, {place, 1, 0, 1}), "Malformed secondary remap: pairs for place_nodes.bin, which has none"},
-        {"past-every-file", with_lists(1, {past, 1, 0, 1}), "Malformed secondary remap: pairs for file 35, which has none"},
+        {"past-every-file", with_lists(1, {past, 1, 0, 1}),
+         "Malformed secondary remap: pairs for file " + std::to_string(past) + ", which has none"},
     };
     for (const Case& e : cases) {
         const std::string patch = c.dir(e.name + ".gcpatch");
@@ -3199,8 +3312,8 @@ TEST(patch_lowmem_round_trips_an_admin_minimal_arc_dir) {
     put_admin_minimal(old_d, old_g, 300);
     put_admin_minimal(new_d, new_g, 300);
     put_at(new_d["place_nodes.bin"], 7 * PLACE_NODE_STRIDE + 16, 2u);
-    CellLists cells = parse_cell_lists(new_d["admin_cells.bin"], new_d["admin_entries.bin"]);
-    cells[cell_id(9)] = {9, 11 | INTERIOR};
+    CellLists cells = parse_cell_lists(new_d["admin_cells.bin"], new_d["admin_entries.bin"], cell_pairs::ADMIN);
+    cells[pair_cell(9)] = {9, 11 | INTERIOR};
     put_cells(new_d, "admin", cells);
     const LowMemCase c{dir.path(), "arc-dir"};
     REQUIRE(prepare(c, old_d, new_d).empty());
@@ -3443,7 +3556,7 @@ TEST(patch_identical_days_copy_the_admin_geometry_ahead_of_the_admin_cells) {
     BuildDir d;
     put_arc_slots(d, arc_slots(40, 30, 12));
     CellLists cells;
-    for (uint32_t k = 0; k < 12; k++) cells[cell_id(k)] = {k};
+    for (uint32_t k = 0; k < 12; k++) cells[pair_cell(k)] = {k};
     put_cells(d, "admin", cells);
     const LowMemCase c{dir.path(), "same"};
     REQUIRE(prepare(c, d, d).empty());

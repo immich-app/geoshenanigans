@@ -148,20 +148,20 @@ in [PATCHING.md](PATCHING.md) and `builder/configurations.template.json`.
 
 | Files | Description |
 |------|-------------|
-| `geo_cells.bin` | Merged S2 cell index for streets, addresses, and interpolations |
-| `street_entries.bin`, `street_ways.bin`, `street_nodes.bin` | Street way IDs per cell, way headers (node offset, name), node coordinates |
+| `geo_cells.bin`, `geo_entries.bin` | S2 cell index for streets, addresses and interpolations: each cell's three lists, in blocks of 64 cells, each list against the one before (GXT2, `builder/src/geo_index.h`); the server reads a query's cell and its neighbours in one walk per block |
+| `street_ways.bin`, `street_nodes.bin` | Street way headers (node offset, name), node coordinates |
 | `way_parents.bin`, `way_postcodes.bin` | Per street: smallest containing admin polygon, postcode from its postal boundary |
-| `addr_entries.bin`, `addr_points.bin`, `addr_vertices.bin` | Address point IDs per cell, point data (coordinates, house number, street), building outlines |
+| `addr_points.bin`, `addr_vertices.bin` | Address point data (coordinates, house number, street), building outlines |
 | `addr_postcodes.bin` | Per address point: its own `addr:postcode` |
-| `interp_entries.bin`, `interp_ways.bin`, `interp_nodes.bin` | Interpolation way IDs per cell, way headers, node coordinates |
+| `interp_ways.bin`, `interp_nodes.bin` | Interpolation way headers, node coordinates |
 | `interp_postcodes.bin` | Per interpolation way: its TIGER ZIP (TIGER regions only) |
-| `admin_cells.bin`, `admin_entries.bin` | S2 cell index for admin boundaries |
+| `admin_cells.bin`, `admin_entries.bin` | S2 cell index for admin boundaries: lists in blocks of 8 cells, each against the one before (the cell pair layout, `builder/src/cell_pairs.h`) |
 | `admin_polygons.bin`, `admin_rings.bin` | Admin polygon records (postcode areas among them, at level 11) and their rings, as refs to arcs |
 | `arc_index.bin`, `arc_vertices.bin` | The boundary arcs those rings share, each border once (per boundary tier: `quality/simplified` or `quality/exact`) |
 | `admin_parents.bin` | Per admin polygon: the next larger polygon containing it |
 | `place_nodes.bin` | Place nodes (city, town, village, suburb, ...); the first load derives their cell index into `derived/` |
-| `postcode_centroids.bin`, `postcode_centroid_cells.bin`, `postcode_centroid_entries.bin` | Postcode centroids and their cell index |
-| `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin` | Points of interest and their cell index |
+| `postcode_centroids.bin`, `postcode_centroid_cells.bin`, `postcode_centroid_entries.bin` | Postcode centroids and their cell index (a list per cell) |
+| `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin` | Points of interest and their cell index (a list per cell) |
 | `strings_core.bin`, `strings_street.bin`, `strings_addr.bin`, `strings_postcode.bin`, `strings_poi.bin` | Deduplicated string pool, in five tiers so each variant ships only the strings it uses |
 | `strings_layout.json` | Start and end of each string tier, which place every string offset |
 | `poi_meta.json` | POI category names and scoring parameters |

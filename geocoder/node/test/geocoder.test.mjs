@@ -23,7 +23,6 @@ after(() => rmSync(root, { recursive: true, force: true }));
 
 const u16 = (v) => { const b = Buffer.alloc(2); b.writeUInt16LE(v); return b; };
 const u32 = (v) => { const b = Buffer.alloc(4); b.writeUInt32LE(v); return b; };
-const u64 = (v) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(v); return b; };
 const i32 = (v) => { const b = Buffer.alloc(4); b.writeInt32LE(v); return b; };
 const f32 = (v) => { const b = Buffer.alloc(4); b.writeFloatLE(v); return b; };
 const varint = (v) => {
@@ -37,6 +36,25 @@ const zigzag = (v) => (v >= 0 ? 2 * v : -2 * v - 1);
 // The admin cell (S2, level 10) of (10.5, 20.5), inside the country: the server's
 // cell_id_at_level(10.5, 20.5, DEFAULT_ADMIN_CELL_LEVEL).
 const COUNTRY_CELL = 0x1129af0000000000n;
+
+// The admin cell index the builder writes (builder/src/cell_pairs.h) of one level-10 cell listing
+// one id: the cell's parent record (its number, its leaf, the offset of its one block), the end of
+// the records, the parent bitmap up to the parent's word, the ranks, the directory and the footer;
+// the block's codes (one PLAIN row) and the list: one id of group 0 against 0, none of group 1.
+function adminIndex(cell, id) {
+  const number = cell >> 41n;
+  const parent = Number(number >> 10n);
+  const child = Number(number & 1023n);
+  const leaf = Buffer.alloc(128);
+  leaf.writeBigUInt64LE(1n << BigInt(child % 64), 8 * Math.floor(child / 64));
+  const words = Math.floor(parent / 64) + 1;
+  const bitmap = Buffer.alloc(8 * words);
+  bitmap.writeBigUInt64LE(1n << BigInt(parent % 64), 8 * (words - 1));
+  const cells = Buffer.concat([Buffer.from('GCP1'), Buffer.from([1, 1, 10, 0]), u32(parent), leaf, u32(0),
+    u32(0xFFFFFFFF), bitmap, Buffer.alloc(4 * words), u32(8), u32(1), u32(words)]);
+  const entries = Buffer.concat([u16(0), varint(1 << 1), varint(0), varint(zigzag(id))]);
+  return [cells, entries];
+}
 
 // A dataset as the builder writes one: a country boundary, listed in the admin cell of
 // COUNTRY_CELL, and two places named `names`.
@@ -62,15 +80,16 @@ function writeDataset(dir, names) {
   const polygons = Buffer.concat([u32(0), u32(rings.length), u32(country), Buffer.from([2, 0, 0, 0]), f32(1), Buffer.from('tl'), Buffer.from([0, 0])]);
   const nodes = Buffer.concat(places.map((name, i) => Buffer.concat([f32(10.2 + i * 0.5), f32(20.5), u32(name), Buffer.from([1, 0, 0, 0]), u32(0)])));
   const tiers = Array.from({ length: 5 }, (_, t) => ({ start: t === 0 ? 0 : size, end: size }));
+  const [adminCells, adminEntries] = adminIndex(COUNTRY_CELL, 0);
   const files = {
     'admin_polygons.bin': polygons,
     'admin_rings.bin': rings,
     'arc_index.bin': u32(0),
     'arc_vertices.bin': arc,
-    // One cell, its list at offset 0: the country (slot 0), not interior, so a lookup there tests
-    // the point against the country's arc.
-    'admin_cells.bin': Buffer.concat([u64(COUNTRY_CELL), u32(0)]),
-    'admin_entries.bin': Buffer.concat([u16(1), u32(0)]),
+    // One cell listing the country (slot 0), not interior, so a lookup there tests the point
+    // against the country's arc.
+    'admin_cells.bin': adminCells,
+    'admin_entries.bin': adminEntries,
     'place_nodes.bin': nodes,
     'strings_core.bin': Buffer.concat(strings),
     'strings_layout.json': JSON.stringify({ tiers }),

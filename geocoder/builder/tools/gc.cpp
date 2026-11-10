@@ -10,12 +10,11 @@
 // there: each streamed pass writes its own, the caller merges them).
 //
 // Families (each runs when its input files are present): streets, interps, way_parents,
-// way_postcodes, interp_postcodes, gxc (geo_cells + the three entries files), addr, poi.
+// way_postcodes, interp_postcodes, addr, poi.
 // Every other file is hardlinked (copied across filesystems). OUT_DIR, new or empty, gets gc.manifest
 // (counts and parameters the decoder needs). Prints one "phase" line per family: wall and CPU
 // seconds, bytes in/out.
 #include "gc_addr.h"
-#include "gc_gxc.h"
 #include "gc_poly.h"
 #include "gc_side.h"
 #include "gc_ways.h"
@@ -61,10 +60,6 @@ static std::vector<Family> families() {
                      [name](auto& s, auto& o, Manifest& m) { side::encode_dict(s, o, name.c_str(), m); },
                      [name](auto& s, auto& o, const Manifest& m) { side::decode_dict(s, o, name.c_str(), m); }});
     }
-    f.push_back({"gxc", {"geo_cells.bin", "street_entries.bin", "addr_entries.bin", "interp_entries.bin"}, {},
-                 [](const Manifest&) { return V{"gxc_top.bin", "gxc_rows.bin", "gxc_street.bin", "gxc_interp.bin"}; },
-                 [](auto& s, auto& o, Manifest& m) { gxc::encode(s, o, m); },
-                 [](auto& s, auto& o, const Manifest& m) { gxc::decode(s, o, m); }});
     f.push_back({"addr", {"addr_points.bin", "addr_vertices.bin"}, {},
                  [](const Manifest&) { return V{"addr_points.col", "addr_vertices.abs2"}; },
                  [](auto& s, auto& o, Manifest& m) { addr::encode(s, o, m); },

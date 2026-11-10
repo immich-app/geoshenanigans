@@ -657,15 +657,7 @@ fn current_boundaries_test_the_point_on_surface_of_larger_and_equal_boundaries()
 /// An index of `fx`'s polygons, each listed in the admin cells `cells` gives (cell, entry),
 /// written as files into `dir`, with `names` its strings.
 fn write_index(dir: &std::path::Path, fx: &ArcFixture, cells: &[(u64, u32)], names: &[u8]) {
-    let mut cells = cells.to_vec();
-    cells.sort_unstable();
-    let (mut index, mut entries) = (Vec::new(), Vec::new());
-    for group in cells.chunk_by(|a, b| a.0 == b.0) {
-        index.extend(group[0].0.to_le_bytes());
-        index.extend((entries.len() as u32).to_le_bytes());
-        entries.extend((group.len() as u16).to_le_bytes());
-        group.iter().for_each(|(_, id)| entries.extend(id.to_le_bytes()));
-    }
+    let (index, entries) = crate::cell_pairs::write_pairs(cells.iter().copied(), crate::cell_pairs::ADMIN);
     let end = names.len();
     let tiers: Vec<String> = (0..STR_TIER_COUNT).map(|t| format!("{{\"start\": {}, \"end\": {end}}}", if t == 0 { 0 } else { end })).collect();
     let mut files: Vec<(&str, Vec<u8>)> = fx.files().into();
