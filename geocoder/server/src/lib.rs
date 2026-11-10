@@ -1346,7 +1346,7 @@ impl Index {
     /// A POI polygon's vertices, decoded from its block in `poi_vertices` (optional file): None
     /// for a point.
     pub fn poi_verts(&self, poly: &PoiRecord) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
-        poi_files::polygon(self.poi_vertices.as_ref()?, poly).map(std::borrow::Cow::Owned)
+        self.poi_records.as_ref()?.polygon(self.poi_vertices.as_ref()?, poly).map(std::borrow::Cow::Owned)
     }
 
     /// A POI's vertex count: 0 for a point, None where its polygon can't be read.
@@ -1354,7 +1354,7 @@ impl Index {
         if !poi.is_polygon() {
             return Some(0);
         }
-        poi_files::vertex_count(self.poi_vertices.as_ref()?, poi)
+        self.poi_records.as_ref()?.vertex_count(self.poi_vertices.as_ref()?, poi)
     }
 
     /// Decode an addr_point's polygon footprint vertex slice.  Same

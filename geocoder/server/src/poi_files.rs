@@ -32,6 +32,9 @@ pub struct PoiRecords {
     rows: u32,
     combos: Vec<[u8; COMBO_BYTES]>,
     postcodes: Vec<u32>,
+    /// The footer's logical vertex stream: the bytes every polygon's header and vertices take as
+    /// the builder holds them, which bounds any one block's vertices.
+    logical_vertex_bytes: u64,
 }
 
 impl PoiRecords {
@@ -45,6 +48,7 @@ impl PoiRecords {
             return Err("not R2".into());
         }
         let (rows, combos, postcodes) = (u32_at(f, 0), u32_at(f, 4) as usize, u32_at(f, 8) as usize);
+        let logical_vertex_bytes = u64::from_le_bytes(f[12..20].try_into().unwrap());
         if combos > DICT_MAX || postcodes > DICT_MAX {
             return Err("a dictionary of more than 65535 entries".into());
         }
@@ -57,7 +61,7 @@ impl PoiRecords {
         let p = &b[rows_end + combos * COMBO_BYTES..b.len() - FOOTER_BYTES];
         let combos = c.chunks_exact(COMBO_BYTES).map(|e| e.try_into().unwrap()).collect();
         let postcodes = p.chunks_exact(POSTCODE_BYTES).map(|e| u32::from_le_bytes(e.try_into().unwrap())).collect();
-        Ok(PoiRecords { file, rows, combos, postcodes })
+        Ok(PoiRecords { file, rows, combos, postcodes, logical_vertex_bytes })
     }
 
     /// The records, tombstones included.
@@ -129,9 +133,10 @@ fn unzigzag(z: u64) -> i64 {
 }
 
 /// The block of polygon record rec, or None: a point, a block whose vertices run past the file's
-/// pad, or one of more vertices than the file has bits (the builder's blocks never have, and a
-/// corrupt count of zero-width vertices must not size the decode).
-fn block(v: &[u8], rec: &PoiRecord) -> Option<Block> {
+/// pad, or one whose logical bytes (its header and vertices as the builder holds them) run past
+/// the footer's whole vertex stream, `logical` bytes. The builder's blocks never do, and vertices
+/// of no bits take no bytes of the file, so only the stream bounds a corrupt count of them.
+fn block(v: &[u8], rec: &PoiRecord, logical: u64) -> Option<Block> {
     if !rec.is_polygon() {
         return None;
     }
@@ -149,7 +154,9 @@ fn block(v: &[u8], rec: &PoiRecord) -> Option<Block> {
     at += 2;
     let encoding = tag & 3;
     let max = if encoding == 3 { 32 } else { 16 };
-    if tag > 7 || m == 0 || wl > max || wg > max || m as u64 > 8 * v.len() as u64 {
+    let vertices = m as u64 + (tag & 4 != 0) as u64;
+    let vertex_bytes = if encoding == 3 { 8 } else { 4 };
+    if tag > 7 || m == 0 || wl > max || wg > max || vertices > u32::MAX as u64 || 10 + vertices * vertex_bytes > logical {
         return None;
     }
     let payload = (m as u64 * (wl + wg) as u64).div_ceil(8);
@@ -159,11 +166,26 @@ fn block(v: &[u8], rec: &PoiRecord) -> Option<Block> {
     Some(Block { encoding, closed: tag & 4 != 0, m, bmin_lat, bmin_lng, wl, wg, at })
 }
 
-/// The polygon of record rec, decoded from its block in poi_vertices.bin: None for a point or a
-/// block past the file's end.
-pub fn polygon(vertices: &FileBytes, rec: &PoiRecord) -> Option<Vec<NodeCoord>> {
-    let v = vertices.as_slice();
-    let b = block(v, rec)?;
+impl PoiRecords {
+    /// The polygon of record rec, decoded from its block in poi_vertices.bin: None for a point or
+    /// a block that can't be read (block()).
+    pub fn polygon(&self, vertices: &FileBytes, rec: &PoiRecord) -> Option<Vec<NodeCoord>> {
+        polygon(vertices.as_slice(), rec, self.logical_vertex_bytes)
+    }
+
+    /// The vertex count of record rec's polygon: 0 for a point, None for a block that can't be
+    /// read (block()).
+    pub fn vertex_count(&self, vertices: &FileBytes, rec: &PoiRecord) -> Option<u32> {
+        if !rec.is_polygon() {
+            return Some(0);
+        }
+        let b = block(vertices.as_slice(), rec, self.logical_vertex_bytes)?;
+        Some((b.m + b.closed as usize) as u32)
+    }
+}
+
+fn polygon(v: &[u8], rec: &PoiRecord, logical: u64) -> Option<Vec<NodeCoord>> {
+    let b = block(v, rec, logical)?;
     let scale = vertex_scale(b.encoding);
     let w = (b.wl + b.wg) as usize;
     let (ml, mg) = (mask(b.wl), mask(b.wg));
@@ -198,15 +220,6 @@ pub fn polygon(vertices: &FileBytes, rec: &PoiRecord) -> Option<Vec<NodeCoord>> 
 
 fn mask(w: u32) -> u64 {
     (1u64 << w) - 1
-}
-
-/// The vertex count of record rec's polygon: 0 for a point, None for a block past the file's end.
-pub fn vertex_count(vertices: &FileBytes, rec: &PoiRecord) -> Option<u32> {
-    if !rec.is_polygon() {
-        return Some(0);
-    }
-    let b = block(vertices.as_slice(), rec)?;
-    Some((b.m + b.closed as usize) as u32)
 }
 
 /// A polygon as the builder holds it: its encoding (0 to 2: u16 vertices, 3: u32), its bbox
@@ -344,10 +357,10 @@ mod tests {
             assert_eq!((got.parent_street_id, got.parent_postcode_id, got.parent_poly_id), (w.parent_street_id, w.parent_postcode_id, w.parent_poly_id));
         }
         assert!(!a.is_polygon() && b.is_polygon() && b.vertex_offset == 0);
-        assert!(polygon(&vertices, &a).is_none());
-        assert_eq!(vertex_count(&vertices, &a), Some(0));
-        assert_eq!(vertex_count(&vertices, &b), Some(4));
-        let got: Vec<(f32, f32)> = polygon(&vertices, &b).unwrap().iter().map(|c| (c.lat, c.lng)).collect();
+        assert!(records.polygon(&vertices, &a).is_none());
+        assert_eq!(records.vertex_count(&vertices, &a), Some(0));
+        assert_eq!(records.vertex_count(&vertices, &b), Some(4));
+        let got: Vec<(f32, f32)> = records.polygon(&vertices, &b).unwrap().iter().map(|c| (c.lat, c.lng)).collect();
         let want: Vec<(f32, f32)> = [(0, 5), (3, 0), (1, 7), (0, 5)]
             .iter()
             .map(|&(ql, qg)| ((1.0f64 + ql as f64 * 1e-5) as f32, (1.5f32 as f64 + qg as f64 * 1e-5) as f32))
@@ -372,7 +385,7 @@ mod tests {
             let p = PoiPolygon { encoding, bmin_lat: 46.5, bmin_lng: 7.5, q: q.clone() };
             let (r, v) = encode(&[(rec, Some(p))]);
             let records = PoiRecords::open(FileBytes::Owned(r)).unwrap();
-            let got = polygon(&FileBytes::Owned(v), &records.record(0).unwrap()).unwrap();
+            let got = records.polygon(&FileBytes::Owned(v), &records.record(0).unwrap()).unwrap();
             let scale = vertex_scale(encoding);
             let want: Vec<(f32, f32)> =
                 q.iter().map(|&(a, b)| ((46.5f64 + a as f64 * scale) as f32, (7.5f64 + b as f64 * scale) as f32)).collect();
@@ -394,11 +407,38 @@ mod tests {
         let b = records.record(1).unwrap();
         // The block's last vertex byte without the pad after it.
         let v = hex(SMALL_V2);
-        assert!(polygon(&FileBytes::Owned(v[..11].to_vec()), &b).is_none());
-        assert!(polygon(&FileBytes::Owned(v), &b).is_some());
+        assert!(records.polygon(&FileBytes::Owned(v[..11].to_vec()), &b).is_none());
+        assert!(records.polygon(&FileBytes::Owned(v), &b).is_some());
         // 2^32 - 1 vertices of no bits each in a block of 7 bytes.
         let zero_width = FileBytes::Owned(hex("00 ffffffff0f 00 ffffff03 00 00  0000000000000000"));
-        assert_eq!(vertex_count(&zero_width, &b), None);
-        assert!(polygon(&zero_width, &b).is_none());
+        assert_eq!(records.vertex_count(&zero_width, &b), None);
+        assert!(records.polygon(&zero_width, &b).is_none());
+    }
+
+    #[test]
+    fn bounds_a_blocks_vertices_by_the_footers_vertex_stream() {
+        // A closed block of 201 equal vertices, 200 stored at no bits each: 7 bytes and the pad,
+        // fewer bits than it has vertices. The builder writes it and it reads, whole. Its footer
+        // giving a vertex stream a byte short of the block's 814 logical bytes, it doesn't.
+        let rec = PoiRecord {
+            lat: 47.0, lng: 8.0, vertex_offset: 0, name_id: 1, category: 1, tier: 1, flags: 0, importance: 0,
+            parent_street_id: NO_DATA, parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
+        };
+        let p = PoiPolygon { encoding: 0, bmin_lat: 47.0, bmin_lng: 8.0, q: vec![(0, 0); 201] };
+        let (r, v) = encode(&[(rec, Some(p))]);
+        assert_eq!(v, hex("04 c801 00 00 00 00  0000000000000000"));
+        let vertices = FileBytes::Owned(v);
+        let records = PoiRecords::open(FileBytes::Owned(r.clone())).unwrap();
+        let got = records.record(0).unwrap();
+        assert_eq!(records.vertex_count(&vertices, &got), Some(201));
+        let polygon = records.polygon(&vertices, &got).map(|p| p.iter().map(|c| (c.lat, c.lng)).collect::<Vec<_>>());
+        assert_eq!(polygon, Some(vec![(47.0, 8.0); 201]));
+        let mut short = r;
+        let at = short.len() - 12;
+        assert_eq!(u64::from_le_bytes(short[at..at + 8].try_into().unwrap()), 814);
+        short[at..at + 8].copy_from_slice(&813u64.to_le_bytes());
+        let records = PoiRecords::open(FileBytes::Owned(short)).unwrap();
+        assert_eq!(records.vertex_count(&vertices, &got), None);
+        assert!(records.polygon(&vertices, &got).is_none());
     }
 }
