@@ -1210,14 +1210,15 @@ static int run(int argc, char* argv[]) {
 
         // A cell's lists: the old ones (none for a new cell) with their ids
         // remapped, then corrected by the diff where it sent a correction.
-        geo_index::RowLists old_lists, lists;
+        // An old cell's lists are remapped where the reader gave them: its
+        // next row replaces them (the reader codes each against its own copy
+        // of the row before), so they aren't copied first.
+        geo_index::RowLists old_lists, new_cell_lists;
         uint64_t cells_written = 0;
-        auto process_cell = [&](uint64_t cid, const geo_index::RowLists* from) {
+        auto process_cell = [&](uint64_t cid, geo_index::RowLists& lists) {
             bool any = false;
             for (size_t t = 0; t < geo_index::TABLES; t++) {
                 std::vector<uint32_t>& ids = lists[t];
-                if (from) ids = (*from)[t];
-                else ids.clear();
                 if (!ids.empty()) remap(ids, *remaps[t]);
                 if (deltas[t].at(cid)) deltas[t].apply(ids, scratch);
                 any |= !ids.empty();
@@ -1234,11 +1235,12 @@ static int run(int argc, char* argv[]) {
         while (have_old || !added.done()) {
             const uint64_t at_old = have_old ? old_cid : UINT64_MAX, add_cid = added.done() ? UINT64_MAX : added.front();
             if (at_old <= add_cid) {
-                if (!removed.skip_to(at_old)) process_cell(at_old, &old_lists);
+                if (!removed.skip_to(at_old)) process_cell(at_old, old_lists);
                 have_old = old_geo.next(old_cid, old_lists);
                 if (!added.done() && at_old == add_cid) added.pop(); // skip duplicate add
             } else {
-                process_cell(add_cid, nullptr);
+                for (std::vector<uint32_t>& l : new_cell_lists) l.clear();
+                process_cell(add_cid, new_cell_lists);
                 added.pop();
             }
 
