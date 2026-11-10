@@ -114,34 +114,10 @@ inline unsigned varint_bytes(uint64_t v) {
     for (; v >= 0x80; v >>= 7) n++;
     return n;
 }
-inline uint8_t* write_varint(uint8_t* p, uint64_t v) {
-    for (; v >= 0x80; v >>= 7) *p++ = static_cast<uint8_t>(v | 0x80);
-    *p++ = static_cast<uint8_t>(v);
-    return p;
-}
+using cell_pairs::write_varint;
 
-// Bytes written through a pointer: room(n) gives at least n bytes past
-// size() (zeroed once, kept between uses), end_at(p) sets where they end.
-class ByteBuffer {
-public:
-    uint8_t* room(size_t n) {
-        if (size_ + n > buf_.size()) buf_.resize(std::max(buf_.size() * 2, size_ + n));
-        return buf_.data() + size_;
-    }
-    void end_at(const uint8_t* p) { size_ = static_cast<size_t>(p - buf_.data()); }
-    void append(const uint8_t* p, size_t n) {
-        if (n) std::memcpy(room(n), p, n);
-        size_ += n;
-    }
-    const uint8_t* data() const { return buf_.data(); }
-    size_t size() const { return size_; }
-    bool empty() const { return size_ == 0; }
-    void clear() { size_ = 0; }
-
-private:
-    std::vector<uint8_t> buf_;
-    size_t size_ = 0;
-};
+// Bytes written through a pointer (cell_pairs.h).
+using cell_pairs::ByteBuffer;
 
 // Encodes the rows of the blocks it is given, a block at a time: start() at
 // each block's first row, then row() for each of its rows in cell order.

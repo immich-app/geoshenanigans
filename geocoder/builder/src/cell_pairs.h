@@ -137,10 +137,44 @@ inline uint64_t parents_at(int level) { return uint64_t(6) << (2 * (level - LEAF
 // one below level 8 (6, 24 and 96 parents), at least one.
 inline size_t parent_words_at(int level) { return static_cast<size_t>((parents_at(level) + 63) / 64); }
 
-inline void put_varint(std::vector<uint8_t>& out, uint64_t v) {
-    for (; v >= 0x80; v >>= 7) out.push_back(static_cast<uint8_t>(v | 0x80));
-    out.push_back(static_cast<uint8_t>(v));
+// Bytes written through a pointer: room(n) gives at least n bytes past
+// size() (zeroed once, kept between uses), end_at(p) sets where they end.
+class ByteBuffer {
+public:
+    uint8_t* room(size_t n) {
+        if (size_ + n > buf_.size()) buf_.resize(std::max(buf_.size() * 2, size_ + n));
+        return buf_.data() + size_;
+    }
+    void end_at(const uint8_t* p) { size_ = static_cast<size_t>(p - buf_.data()); }
+    void append(const uint8_t* p, size_t n) {
+        if (n) std::memcpy(room(n), p, n);
+        size_ += n;
+    }
+    uint8_t* data() { return buf_.data(); }
+    const uint8_t* data() const { return buf_.data(); }
+    size_t size() const { return size_; }
+    bool empty() const { return size_ == 0; }
+    void clear() { size_ = 0; }
+
+private:
+    std::vector<uint8_t> buf_;
+    size_t size_ = 0;
+};
+
+// The varint written at p, returning past it.
+inline uint8_t* write_varint(uint8_t* p, uint64_t v) {
+    for (; v >= 0x80; v >>= 7) *p++ = static_cast<uint8_t>(v | 0x80);
+    *p++ = static_cast<uint8_t>(v);
+    return p;
 }
+// The most bytes a list's count (at most LIST_MAX, doubled) takes as a
+// varint, and an id or a gap of one (a u32, or the zigzag of the step from
+// a last first) as a varint or in a quad of gaps with its share of the
+// lengths byte.
+inline constexpr size_t COUNT_MOST = 3, ID_MOST = 5;
+// The ids a writer takes room for at a time: a long list's buffer grows with
+// its bytes, not ID_MOST bytes an id.
+inline constexpr size_t STRETCH_IDS = 256;
 inline uint64_t zigzag(int64_t v) { return v >= 0 ? uint64_t(v) << 1 : (uint64_t(-(v + 1)) << 1) | 1; }
 inline int64_t unzigzag(uint64_t v) { return v & 1 ? -int64_t(v >> 1) - 1 : int64_t(v >> 1); }
 
@@ -156,38 +190,58 @@ inline size_t group0_size(const uint32_t* ids, size_t n, bool groups) {
     return static_cast<size_t>(std::lower_bound(ids, ids + n, FLAG) - ids);
 }
 
-// The gaps of ids[from, to) in quads: a byte of lengths, then the gaps.
-inline void put_group_gaps(std::vector<uint8_t>& out, const uint32_t* ids, size_t from, size_t to, bool rep) {
-    for (size_t i = from + 1; i < to; i += 4) {
-        const size_t lengths_at = out.size();
-        out.push_back(0);
-        for (size_t q = 0; q < 4 && i + q < to; q++) {
-            const uint32_t gap = ids[i + q] - ids[i + q - 1] - (rep ? 0 : 1);
-            const unsigned bytes = gap < 1u << 8 ? 1 : gap < 1u << 16 ? 2 : gap < 1u << 24 ? 3 : 4;
-            out[lengths_at] |= static_cast<uint8_t>((bytes - 1) << (2 * q));
-            for (unsigned b = 0; b < bytes; b++) out.push_back(static_cast<uint8_t>(gap >> (8 * b)));
-        }
+// The gaps of ids[from, to) less inc each, as varints, a stretch at a time.
+inline void put_gaps(ByteBuffer& out, const uint32_t* ids, size_t from, size_t to, uint32_t inc) {
+    for (size_t i = from + 1; i < to;) {
+        const size_t end = std::min(to, i + STRETCH_IDS);
+        uint8_t* p = out.room(ID_MOST * (end - i));
+        for (; i < end; i++) p = write_varint(p, uint64_t(ids[i]) - ids[i - 1] - inc);
+        out.end_at(p);
     }
 }
 
-// The PLAIN list of ids[0, n), sorted: lf is the block's last firsts, or
-// null for absolute firsts.
-inline void put_plain(std::vector<uint8_t>& out, const uint32_t* ids, size_t n, bool groups, Gaps gaps,
-                      const uint32_t* lf) {
+// The gaps of ids[from, to) less inc each in quads: a byte of lengths, then
+// the gaps; a stretch (whole quads) at a time.
+inline void put_group_gaps(ByteBuffer& out, const uint32_t* ids, size_t from, size_t to, uint32_t inc) {
+    static_assert(STRETCH_IDS % 4 == 0, "a stretch of whole quads");
+    for (size_t i = from + 1; i < to;) {
+        const size_t end = std::min(to, i + STRETCH_IDS);
+        uint8_t* p = out.room(ID_MOST * (end - i));
+        for (; i < end; i += 4) {
+            uint8_t* const lengths = p++;
+            unsigned l = 0;
+            for (size_t q = 0; q < 4 && i + q < end; q++) {
+                const uint32_t gap = ids[i + q] - ids[i + q - 1] - inc;
+                const unsigned bytes = gap < 1u << 8 ? 1 : gap < 1u << 16 ? 2 : gap < 1u << 24 ? 3 : 4;
+                l |= (bytes - 1) << (2 * q);
+                for (unsigned b = 0; b < bytes; b++) *p++ = static_cast<uint8_t>(gap >> (8 * b));
+            }
+            *lengths = static_cast<uint8_t>(l);
+        }
+        out.end_at(p);
+    }
+}
+
+// The PLAIN list of ids[0, n), sorted, appended to out: lf is the block's
+// last firsts, or null for absolute firsts.
+inline void put_plain(ByteBuffer& out, const uint32_t* ids, size_t n, bool groups, Gaps gaps, const uint32_t* lf) {
     const bool rep = has_repeats(ids, n);
+    const uint32_t inc = rep ? 0 : 1;
     const size_t n0 = group0_size(ids, n, groups);
-    put_varint(out, uint64_t(groups ? n0 : n) << 1 | rep);
-    if (groups) put_varint(out, n - n0);
+    uint8_t* p = out.room(2 * COUNT_MOST);
+    p = write_varint(p, uint64_t(groups ? n0 : n) << 1 | rep);
+    if (groups) p = write_varint(p, n - n0);
+    out.end_at(p);
     const uint32_t bare = groups ? BARE : 0xFFFFFFFFu;
     for (int g = 0; g < (groups ? 2 : 1); g++) {
         const size_t from = g ? n0 : 0, to = g ? n : (groups ? n0 : n);
         if (from == to) continue;
         const uint32_t first = ids[from] & bare;
-        if (lf) put_varint(out, zigzag(int64_t(first) - int64_t(lf[g])));
-        else put_varint(out, first);
-        if (gaps == Gaps::GROUP_VARINT) put_group_gaps(out, ids, from, to, rep);
-        else
-            for (size_t i = from + 1; i < to; i++) put_varint(out, uint64_t(ids[i]) - ids[i - 1] - (rep ? 0 : 1));
+        p = out.room(ID_MOST);
+        p = write_varint(p, lf ? zigzag(int64_t(first) - int64_t(lf[g])) : first);
+        out.end_at(p);
+        if (gaps == Gaps::GROUP_VARINT) put_group_gaps(out, ids, from, to, inc);
+        else put_gaps(out, ids, from, to, inc);
     }
 }
 
@@ -202,12 +256,15 @@ inline void update_firsts(const uint32_t* ids, size_t n, bool groups, uint32_t l
 inline uint32_t edit_order(uint32_t id, bool groups) { return groups ? (id & BARE) << 1 | id >> 31 : id; }
 inline uint32_t edit_id(uint32_t t, bool groups) { return groups ? t >> 1 | t << 31 : t; }
 
-// The EDIT of prev into ids[0, n), neither with a repeated id.
-inline void put_edit(std::vector<uint8_t>& out, const std::vector<uint32_t>& prev, const uint32_t* ids, size_t n,
-                     bool groups, std::vector<uint32_t>& adds, std::vector<char>& used) {
+// The EDIT of prev into ids[0, n), neither with a repeated id, appended to
+// out.
+inline void put_edit(ByteBuffer& out, const std::vector<uint32_t>& prev, const uint32_t* ids, size_t n, bool groups,
+                     std::vector<uint32_t>& adds, std::vector<char>& used) {
     const int bits = groups ? 2 : 1;
-    const size_t at = out.size();
-    out.resize(at + (prev.size() * bits + 7) / 8, 0);
+    const size_t ops = (prev.size() * bits + 7) / 8;
+    // The ops, then the count of the adds.
+    uint8_t* const op_bytes = out.room(ops + COUNT_MOST);
+    std::fill_n(op_bytes, ops, uint8_t(0));
     used.assign(n, 0);
     const uint32_t* end = ids + n;
     for (size_t i = 0; i < prev.size(); i++) {
@@ -224,14 +281,19 @@ inline void put_edit(std::vector<uint8_t>& out, const std::vector<uint32_t>& pre
                 used[t - ids] = 1;
             }
         }
-        out[at + i * bits / 8] |= static_cast<uint8_t>(op << (i * bits % 8));
+        op_bytes[i * bits / 8] |= static_cast<uint8_t>(op << (i * bits % 8));
     }
     adds.clear();
     for (size_t j = 0; j < n; j++)
         if (!used[j]) adds.push_back(edit_order(ids[j], groups));
     std::sort(adds.begin(), adds.end());
-    put_varint(out, adds.size());
-    for (size_t j = 0; j < adds.size(); j++) put_varint(out, j ? uint64_t(adds[j]) - adds[j - 1] - 1 : adds[0]);
+    out.end_at(write_varint(op_bytes + ops, adds.size()));
+    for (size_t j = 0; j < adds.size();) {
+        const size_t stop = std::min(adds.size(), j + STRETCH_IDS);
+        uint8_t* p = out.room(ID_MOST * (stop - j));
+        for (; j < stop; j++) p = write_varint(p, j ? uint64_t(adds[j]) - adds[j - 1] - 1 : adds[0]);
+        out.end_at(p);
+    }
 }
 
 // Writes an index's two files front to back through cells(bytes, n) and
@@ -318,7 +380,7 @@ private:
         cells_bytes_ += n;
     }
     void put_cells_u32(uint32_t v) { put_cells(&v, 4); }
-    void put_entries(const std::vector<uint8_t>& bytes) {
+    void put_entries(const ByteBuffer& bytes) {
         if (bytes.empty()) return;
         entries_out_(reinterpret_cast<const char*>(bytes.data()), bytes.size());
         entries_bytes_ += bytes.size();
@@ -332,26 +394,33 @@ private:
     void add_block_row(const uint32_t* ids, size_t n) {
         const bool groups = format_.groups;
         if (block_rows_ == 0) {
-            block_.assign(2, 0);
+            block_.clear();
+            uint8_t* const codes_at = block_.room(2);
+            codes_at[0] = codes_at[1] = 0;
+            block_.end_at(codes_at + 2);
             lf_[0] = lf_[1] = 0;
         }
         unsigned code = 0;
         if (block_rows_ > 0 && prev_.size() == n && std::equal(ids, ids + n, prev_.begin())) {
             code = 1;
         } else {
-            plain_.clear();
-            put_plain(plain_, ids, n, groups, format_.gaps, lf_);
+            // The PLAIN list where the block's bytes go and the EDIT beside it: an EDIT that is shorter replaces it.
+            const size_t at = block_.size();
+            put_plain(block_, ids, n, groups, format_.gaps, lf_);
             if (block_rows_ > 0 && !has_repeats(ids, n) && !has_repeats(prev_.data(), prev_.size())) {
                 edit_.clear();
                 put_edit(edit_, prev_, ids, n, groups, adds_, used_);
-                if (edit_.size() < plain_.size()) code = 2;
+                if (edit_.size() < block_.size() - at) {
+                    code = 2;
+                    std::memcpy(block_.data() + at, edit_.data(), edit_.size());
+                    block_.end_at(block_.data() + at + edit_.size());
+                }
             }
-            const std::vector<uint8_t>& payload = code == 2 ? edit_ : plain_;
-            block_.insert(block_.end(), payload.begin(), payload.end());
         }
-        const uint16_t codes = static_cast<uint16_t>(block_[0] | block_[1] << 8) | uint16_t(code << (2 * block_rows_));
-        block_[0] = static_cast<uint8_t>(codes);
-        block_[1] = static_cast<uint8_t>(codes >> 8);
+        uint8_t* const codes_at = block_.data();
+        const uint16_t codes = static_cast<uint16_t>(codes_at[0] | codes_at[1] << 8) | uint16_t(code << (2 * block_rows_));
+        codes_at[0] = static_cast<uint8_t>(codes);
+        codes_at[1] = static_cast<uint8_t>(codes >> 8);
         update_firsts(ids, n, groups, lf_);
         prev_.assign(ids, ids + n);
         if (++block_rows_ == BLOCK_ROWS) end_block();
@@ -399,7 +468,7 @@ private:
     uint64_t leaf_[LEAF_WORDS] = {};
     std::vector<uint32_t> offsets_, directory_;
     std::vector<uint64_t> pbits_;
-    std::vector<uint8_t> block_, plain_, edit_;
+    ByteBuffer block_, plain_, edit_;
     size_t block_rows_ = 0;
     uint32_t lf_[2] = {0, 0};
     std::vector<uint32_t> prev_, adds_;
