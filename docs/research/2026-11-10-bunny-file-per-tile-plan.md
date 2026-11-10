@@ -1,6 +1,6 @@
-# tiles.immich.cloud on Bunny, one file per tile, updated daily: implementation plan (draft for review)
+# tiles.immich.cloud on Bunny, one file per tile, updated daily: implementation plan
 
-Follows the [Bunny Storage + Edge Script PoC](2026-11-10-bunny-storage-edge-script-poc.md) and the follow-up measurements of 2026-11-10 (section 8). Nothing here is built yet. Decisions marked **D1-D7** need the maintainer's answer before Phase 1. Recommendations are given for each.
+Follows the [Bunny Storage + Edge Script PoC](2026-11-10-bunny-storage-edge-script-poc.md) and the follow-up measurements of 2026-11-10 (section 8). The maintainer answered decisions D1, D3, D4 and D5 on 2026-11-10 (section 2) and asked for the Phase 0 spikes, cache invalidation first, before any implementation. Nothing else is built yet.
 
 ## 1. What we are building
 
@@ -30,17 +30,17 @@ Why, from the measurements:
 
 ¹ A Bunny storage-backed object fetched uncached from 120 probes on 2026-11-09 took 46 ms weighted. Perma-Cache copies took 6-20 ms median from Sydney, Singapore and New York. Spike S3 measures it on our own tiles.
 
-## 2. Decisions for review
+## 2. Decisions
 
-| # | Decision | Options | Recommendation |
+| # | Decision | Options | Answer |
 |---|---|---|---|
-| D1 | Ocean tiles | (a) upload nothing for the ocean tile: the storage zone's `Custom404FilePath` + `Rewrite404To200` return it for any missing file; (b) upload every position | **(a)**, if spike S2 passes. 637M files, 185 GB and $55.60/month, against 1.43B, 261 GB and $78.30. The first load is about half as long. |
-| D2 | Scope | (a) every zoom as files; (b) zooms 0-14 as files and zoom 15 in chunks behind the Edge Script | **(a)**. With daily diffs the first load is a one-time cost. (b) keeps a script, a directory and chunk repacking for zoom 15. |
-| D3 | Invalidation after a daily update | (a) bump `?v=` in the TileJSON daily: every tile URL changes, so CDN and browser caches start cold each day; (b) keep URLs stable and purge only the changed tiles (~200-330k a day) from the CDN; browsers revalidate daily (`max-age` 1 day with ETag); (c) like (a), but weekly | **(b)**, if spike S6 shows Bunny can purge ~330k URLs within an hour. Otherwise (a). |
-| D4 | Analytics | see section 3 | **CDN logs into o11y**, plus a synthetic latency probe. A script on every request only if S7 shows it costs nothing on hits. |
-| D5 | Account and keys | production Bunny account owned by FUTO/Immich | The account API key is used only by OpenTofu and the purge/log jobs (1Password `tf_prod`). Uploads use the storage zone's own password, which only works on that zone. |
-| D6 | Cutover | test hostname first, then move the DNS record | Seed and verify under a test hostname on the same pull zone, try it in Immich, then CNAME `tiles.immich.cloud` to Bunny (DNS-only in Cloudflare). The Cloudflare Worker stays deployable for rollback for 4 weeks. |
-| D7 | Dev environment | (a) its own zone with a single region (no replicas); (b) full replicas; (c) none | **(a)**: about $3.70/month. It exercises the whole pipeline without paying for 14 replicas. |
+| D1 | Ocean tiles | (a) upload nothing for the ocean tile: the storage zone's `Custom404FilePath` + `Rewrite404To200` return it for any missing file; (b) upload every position | **(b), upload every position** (maintainer, 2026-11-10): 1.43B files, 261 GB, $78.30/month. A missing file is then a real 404, never silent ocean. Switching to (a) later (637M files, $55.60) stays possible. |
+| D2 | Scope | (a) every zoom as files; (b) zooms 0-14 as files and zoom 15 in chunks behind the Edge Script | **(a)** (recommended, not yet confirmed). With daily diffs the first load is a one-time cost. (b) keeps a script, a directory and chunk repacking for zoom 15. |
+| D3 | Invalidation after a daily update | (a) bump `?v=` in the TileJSON daily: every tile URL changes, so CDN and browser caches start cold each day; (b) keep URLs stable and purge only the changed tiles (~200-330k a day) from the CDN; browsers revalidate daily (`max-age` 1 day with ETag); (c) like (a), but weekly | **Decided by spike S6**, which runs first (maintainer: measure invalidation speed before implementing). (b) if Bunny can purge ~330k URLs within an hour and every PoP drops them quickly; otherwise (a). |
+| D4 | Analytics | see section 3 | **CDN request logs into o11y** (maintainer, 2026-11-10), plus a synthetic latency probe. No script in the request path. |
+| D5 | Account and keys | (a) a new production account; (b) the dedicated account used for the PoC | **(b)** (maintainer, 2026-11-10): the PoC's dedicated bunny.net account becomes the production account, with its current key for now. The maintainer rotates the key later and replaces it where it is used. The account key is used only by OpenTofu and the purge/log jobs (1Password `tf_prod`); uploads use the storage zone's own password, which only works on that zone. |
+| D6 | Cutover | test hostname first, then move the DNS record | (Recommended, not yet confirmed.) Seed and verify under a test hostname on the same pull zone, try it in Immich, then CNAME `tiles.immich.cloud` to Bunny (DNS-only in Cloudflare). The Cloudflare Worker stays deployable for rollback for 4 weeks. |
+| D7 | Dev environment | (a) its own zone with a single region (no replicas); (b) full replicas; (c) none | **(a)** (recommended, not yet confirmed): about $5.20/month with every position uploaded. It exercises the whole pipeline without paying for 14 replicas. |
 
 ## 3. Analytics: what we keep and how
 
@@ -71,7 +71,7 @@ With no script in the path, none of this would run. What Bunny offers:
   - Log Forwarding (syslog, 10-30 s delay, delivery not guaranteed) and Permanent Log Storage (gzip parts in a storage zone) also exist.
   - The logs carry **no timings**.
 
-Proposed mapping, with the logs read every minute by a small cron job (the existing Worker's cron and o11y code are the natural home) and written to o11y as per-minute sums:
+**Chosen (D4): the request logs.** A small cron job reads the Logging API v2 every minute (with a couple of minutes' lag for late rows) and writes per-minute sums to o11y, plus a sample of request lines to VictoriaLogs. The existing Worker's cron and o11y code are the natural home. The before-cache middleware above is not used. Mapping:
 
 | Today | New source |
 |---|---|
@@ -103,24 +103,24 @@ Proposed mapping, with the logs read every minute by a small cron job (the exist
    - full listings by zoom for the first load.
 4. **Switch:** upload the TileJSON and styles, then purge or bump the version per D3.
 
-**First load**, from the dedicated server or the self-hosted runner. It is limited by API calls, not bandwidth, so it needs 3-6 MB/s at most:
+**First load**, from a pokedex runner or the dedicated server. It is limited by API calls, not bandwidth, so it needs 3-8 MB/s at most:
 
-| Zooms | Files (D1a) | Upload at ~11.5k/s | Sydney has them (~1.3-1.5k files/s) |
+| Zooms | Files (D1b, every position) | Upload at ~11.5k/s | Sydney has them (~1.3-1.5k files/s) |
 |---|---|---|---|
-| 0-12 | 12.0M | 17 min | ~2.2-2.6 h |
-| 13 | 31.5M | 46 min | +6-7 h |
-| 14 | 120.8M | 2.9 h | +22-26 h |
-| 15 | 472.4M | 11.4 h | +3.6-4.2 days |
-| **All** | **636.7M** | **~15.4 h** | **~5-6 days** |
+| 0-12 | 22.4M | 32 min | ~4.1-4.8 h |
+| 13 | 67.1M | 1.6 h | +12-14 h |
+| 14 | 268.4M | 6.5 h | +2.1-2.4 days |
+| 15 | 1,073.7M | 25.9 h | +8.3-9.6 days |
+| **All** | **1.43B** | **~35 h** | **~11-13 days** |
 
-With D1b, the totals are 1.43B files, ~35 h of uploading and ~11-13 days for Sydney.
+With the ocean fallback (D1a) it would be 637M files, ~15 h of uploading and ~5-6 days for Sydney. These times shrink if Bunny raises the limits below.
 
 The other regions finish sooner:
 - London, Stockholm, Madrid and Prague replicate at ~3.7k files/s;
 - the US regions and Singapore at ~3k/s;
 - Tokyo, Hong Kong, Johannesburg and São Paulo at ~2-2.5k/s.
 
-The load runs in separate resumable jobs (zooms 0-13, zoom 14, zoom 15 in 8 tile-id ranges). The zone is not live until the verifier passes.
+The load runs in separate resumable jobs (zooms 0-13, zoom 14 in 2 tile-id ranges, zoom 15 in 8). The zone is not live until the verifier passes.
 
 While Sydney catches up, new daily builds keep arriving. After the first load, the pipeline applies the diffs from the loaded build to the latest one (~1-2M files, minutes) before the zone goes live.
 
@@ -132,19 +132,33 @@ While Sydney catches up, new daily builds keep arriving. After the first load, t
 
 ## 5. Daily update
 
-Protomaps publishes daily builds around 09:05 UTC. A scheduled workflow, "Tiles Sync", runs at about 10:00 UTC on the self-hosted runner, plus a manual dispatch:
+Protomaps publishes daily builds around 09:05 UTC. A scheduled workflow, "Tiles Sync", runs at about 10:00 UTC on a pokedex runner, plus a manual dispatch. Any pokedex size works: all have 10 Gbps networking, so the 139 GB download takes a few minutes. The larger sizes hash faster but are harder to schedule, so the job asks for a mid size and its hashing step scales with the cores it gets.
 
 1. Pick the newest build (`builds.json`). Skip it if it is already live, or if its schema version differs (see section 6).
-2. Download it and check the MD5 (~11 min today).
+2. Download it and check the MD5 (a few minutes at 10 Gbps; ~11 min on today's deploy runs).
 3. Build the manifest (~8-10 min).
 4. Diff it against the live manifest (a few minutes): measured 327,826 positions in 1 day, 1.67M in 8 days and 1.90M in 9 days.
    - **Guard rail:** if more than 5% of positions changed, stop and alert, and treat it as a full rewrite.
-5. Upload the changed tiles and delete the ones that became ocean: ~30 s to a few minutes.
+5. Upload every changed position, ocean included: ~30 s to a few minutes.
 6. Wait for replication and verify: ~5-25 min in measurements; give up and alert after a set limit.
 7. Purge the changed URLs or bump `?v=` (D3), then upload the TileJSON and styles.
 8. Store the new manifest. Send the run's numbers to o11y: files changed, durations, replication wait.
 
-That is about 45-60 min of runner time a day. The live zone is never in a half-updated state as far as cached content goes: the switch happens after replication.
+That is about 30-60 min of runner time a day. The live zone is never in a half-updated state as far as cached content goes: the switch happens after replication.
+
+**Monitoring and alerting of the job itself**, as for the geocoder nightly (its report step, watchdog workflow and `o11y/alerts/geoshenanigans.yaml`):
+- Every run pushes metrics and a log line to o11y: status, build key and its OSM date, duration per step, positions changed, bytes uploaded, retries and 429s, replication wait per region, purge or switch time.
+- A watchdog workflow runs every few hours and reports the live build key and its age, independently of the sync job.
+- Alerts in `o11y/alerts/geoshenanigans-tiles.yaml` and panels in `o11y/dashboards/geoshenanigans-tiles.json`:
+  - tiles sync failed;
+  - no successful sync for 30 hours;
+  - tiles watchdog stopped reporting for 5 hours;
+  - replication gate timed out, or the per-region sample check found a wrong or missing tile;
+  - the sync took over 2 hours;
+  - the diff was unusually large (over 1M positions, or over the 5% guard rail);
+  - the live tiles are built from OSM data more than 48 hours old;
+  - the log reader stopped sending request metrics for 15 minutes;
+  - the synthetic probe sees errors or slow misses.
 
 ## 6. Full rewrites (schema or basemap upgrades)
 
@@ -158,7 +172,7 @@ That is about 45-60 min of runner time a day. The live zone is never in a half-u
 
 | Phase | Work | Exit criteria |
 |---|---|---|
-| 0. Spikes (PoC account, ~1-2 days) | S1-S8 below | Every spike answered; D1-D7 confirmed |
+| 0. Spikes (the Bunny account, ~1-2 days) | S1-S8 below, S6 first | Every spike answered; D2, D3, D6, D7 confirmed |
 | 1. Tooling | manifest, diff, uploader, verifier, switch, with tests | unit + local end-to-end tests pass; Kritika approves |
 | 2. Infrastructure | OpenTofu with `bunnyway/bunnynet` (v0.20: `storage_zone`, `pullzone`, `pullzone_edgerule`, `pullzone_hostname`) for dev and prod; secrets in 1Password | plans clean in CI |
 | 3. First load | dev, then prod under the test hostname | verifier passes; 2,000+ random tiles decode identical to prod for the same build; 48-probe latency vs prod; hands-on in Immich |
@@ -169,26 +183,25 @@ That is about 45-60 min of runner time a day. The live zone is never in a half-u
 
 **Spikes:**
 - **S1, storage-origin pull zone:** tiles decode identical to prod, with prod's headers via edge rules. Bunny neither unpacks nor re-compresses the stored gzip. ETag and 304 work.
-- **S2, ocean fallback via `Custom404FilePath` + `Rewrite404To200`:** the ocean tile comes back with tile headers, 200, and is cached.
+- **S2, ocean fallback via `Custom404FilePath` + `Rewrite404To200`:** not needed with D1b; kept in case D1 changes.
 - **S3, miss latency:** never-requested tiles on the 48 pinned probes, storage-origin zone vs the PoC script vs prod.
 - **S4, large directories:** a zoom-15 column holds up to 32,768 files. Check PUT rate, listing time and replication at that size.
 - **S5, regional checks:** each region's storage endpoint returns its own copy, and 404s before the copy arrives. The replication gate depends on this.
-- **S6, purge:** per-URL purge rate and limits for ~330k URLs. This decides D3.
-- **S7, analytics:**
-  - Logging API v2 completeness and lag against requests we send;
-  - a before-cache middleware with `onClientResponse` + `waitUntil`: hit-latency cost on the probes, whether cache status is visible, and fail-open behaviour.
+- **S6, cache invalidation (first):** per-URL purge rate and limits for ~330k URLs; how long after a purge every PoP serves the new file; how long a full zone purge takes. This decides D3.
+- **S7, request logs:** Logging API v2 completeness and lag against requests we send, and which fields arrive.
 - **S8, upload robustness:** a 1-hour run at ~1,500 in flight with checksums; 429 handling.
 
 ## 8. Cost (35.8M tile requests and 1.39 TB a month)
 
 | Item | $/month |
 |---|---|
-| Storage, 15 regions ($0.30/GB-month): D1a 185 GB / D1b 261 GB | 55.60 / 78.30 |
+| Storage, 15 regions ($0.30/GB-month), every position (D1b): 261 GB | 78.30 |
 | Delivery, $0.0141/GB blended | 19.60 |
-| Uploads, API calls, replication, logs | 0 |
-| Dev zone, one region (D7a) | ~3.70 |
-| Optional before-cache analytics script | ~8-10 |
-| **Total** | **~79 (D1a, logs) to ~112 (D1b + script)** |
+| Uploads, API calls, replication, request logs | 0 |
+| Dev zone, one region (D7a) | ~5.20 |
+| **Total** | **~103** |
+
+With the ocean fallback (D1a) storage would be $55.60 and the total ~$79.
 
 That compares with prod at about $26-29 today and [#489](https://github.com/immich-app/geoshenanigans/pull/489) at about $36. Small files are billed at their real size; 3.4M 1 KiB test files added exactly 3.5 GB.
 
@@ -201,7 +214,7 @@ Measurements behind this plan (2026-11-10):
 
 ## 9. Risks
 
-- **A missing file shows as ocean, silently (D1a):** a failed upload or a replica that hasn't caught up draws ocean instead of an error. Mitigations:
+- **A missing or stale file:** a failed upload or a replica that hasn't caught up serves a 404 or an old tile. With the ocean fallback (D1a) it would silently draw ocean. Mitigations:
   - the replication gate before every switch;
   - a daily check of random positions against the manifest in every region.
 - **Replication throughput** sets the first-load time (days) and the worst case of a large daily diff. Raise it with Bunny.
