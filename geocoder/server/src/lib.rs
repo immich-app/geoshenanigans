@@ -25,6 +25,7 @@ mod file_stamp;
 pub use file_stamp::FileStamp;
 mod place_index;
 pub mod poi_files;
+pub mod strings;
 pub use poi_files::PoiRecords;
 #[cfg(test)]
 mod scratch_dir;
