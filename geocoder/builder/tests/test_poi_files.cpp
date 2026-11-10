@@ -357,6 +357,11 @@ TEST(poi_files_decoder_refuses_each_file_the_encoder_never_writes) {
         {"Malformed POI files: a block's vertex width", block(hex("00 01 00 ffffff03 11 03 000000"))},
         {"Malformed POI files: a block's bbox past 32 bits", block(hex("00 01 00 8080808020 00 00"))},
         {"Malformed POI files: row 1: a block past the end of poi_vertices.bin", block(hex("04 03 00 ffffff03 02 03 74"))},
+        // 100,000 stored vertices of no bits (a closed block of 100,001, all
+        // equal): 11 bytes of poi_vertices.bin, 400,014 logical bytes where
+        // the footer gives 26. Refused at the block, not once it is decoded.
+        {"Malformed POI files: row 1: a block past the footer's vertex stream of 26 bytes",
+         block(hex("04 a08d06 00 ffffff03 00 00"))},
         // One vertex (1, 1) at widths 2 and 1, not 1 and 1.
         {"Malformed POI files: a block's vertex width is not its largest vertex's", block(hex("00 01 00 ffffff03 02 01 05"), 14)},
         // Two vertices (1, 1) and (1, 1) stored open.

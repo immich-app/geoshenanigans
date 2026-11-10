@@ -975,6 +975,7 @@ struct Dec : Decoder {
         const uint8_t* h = V->need(poi_files::MAX_BLOCK_HEADER, true);
         blk = poi_files::read_block_header(h, size_t(std::min<uint64_t>(left, poi_files::MAX_BLOCK_HEADER)), rd32(rec), rd32(rec + 4));
         if (blk.bytes() > left) poi_files::malformed("row " + std::to_string(i - 1) + ": a block past the end of poi_vertices.bin");
+        if (blk.logical_bytes() > rows.footer().logical_vertex_bytes - logical) poi_files::past_vertex_stream(i - 1, rows.footer());
         if (logical >= NO) poi_files::malformed("a logical vertex stream of 4 GiB or more");
         wr32(rec + poi_files::OFF_VERTEX_OFFSET, uint32_t(logical));
         wr32(rec + poi_files::OFF_VERTEX_COUNT, uint32_t(blk.vertex_count()));

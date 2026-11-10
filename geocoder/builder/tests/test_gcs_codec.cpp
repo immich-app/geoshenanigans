@@ -463,9 +463,11 @@ TEST(gcs_poi_round_trip_whole_and_in_pieces) {
 TEST(gcs_poi_decoder_refuses_blocks_the_encoder_never_writes) {
     // One polygon record whose block is all of poi_vertices.bin but its pad:
     // a block of no stored vertex, one of 2^32 stored vertices (more than the
-    // record's u32 vertex_count holds), and one whose vertices run past the
-    // file. Refused by the header before the block is sized or the record
-    // emitted; a block of one vertex decodes.
+    // record's u32 vertex_count holds), one whose vertices run past the
+    // file, and one of 65,535 stored vertices of no bits (a closed block, all
+    // equal: past big_block(), in 8 bytes of the file) whose logical bytes run
+    // past the footer's 14. Refused by the header before the block is sized
+    // or the record emitted; a block of one vertex decodes.
     struct Case {
         std::vector<uint8_t> block;
         const char* error;  // nullptr: decodes
@@ -473,7 +475,8 @@ TEST(gcs_poi_decoder_refuses_blocks_the_encoder_never_writes) {
     const Case cases[] = {{{0, 1, 0, 0, 1, 2, 0b101}, nullptr},
                           {{0, 0, 0, 0, 16, 16}, "Malformed POI files: a block of no vertices"},
                           {{0, 0x80, 0x80, 0x80, 0x80, 0x10, 0, 0, 16, 16}, "Malformed POI files: a block of more vertices than a record holds"},
-                          {{0, 0xFF, 0xFF, 0x03, 0, 0, 16, 16}, "Malformed POI files: row 0: a block past the end of poi_vertices.bin"}};
+                          {{0, 0xFF, 0xFF, 0x03, 0, 0, 16, 16}, "Malformed POI files: row 0: a block past the end of poi_vertices.bin"},
+                          {{4, 0xFF, 0xFF, 0x03, 0, 0, 0, 0}, "Malformed POI files: row 0: a block past the footer's vertex stream of 14 bytes"}};
     for (const Case& c : cases) {
         ScratchDir dir("gcs-test");
         std::vector<uint8_t> row(27, 0), tail;

@@ -246,6 +246,14 @@ struct Footer {
     uint64_t rows_end() const { return rows * ROW_BYTES; }
     uint64_t dict_bytes() const { return combos * COMBO_BYTES + postcodes * POSTCODE_BYTES; }
 };
+// Row i's block decodes past the footer's logical vertex stream: refused at
+// the block, before its vertices (which take no bytes of the file at no bits
+// each) are decoded.
+[[noreturn]] inline void past_vertex_stream(uint64_t i, const Footer& ft) {
+    malformed("row " + std::to_string(i) + ": a block past the footer's vertex stream of " +
+              std::to_string(ft.logical_vertex_bytes) + " bytes");
+}
+
 // The footer of an R2 file of file_size bytes, its last FOOTER_BYTES at f.
 inline Footer read_footer(const uint8_t* f, uint64_t file_size) {
     if (file_size < FOOTER_BYTES) malformed("poi_records.bin is shorter than its footer");
@@ -608,6 +616,7 @@ inline void decode(const uint8_t* r2, uint64_t r2_size, const uint8_t* v2, uint6
         const Block b = read_block_header(v2 + at, size_t(std::min<uint64_t>(blocks_end - std::min(at, blocks_end), MAX_BLOCK_HEADER)),
                                           rd32(rec + OFF_LAT), rd32(rec + OFF_LNG));
         if (b.bytes() > blocks_end - at) malformed("row " + std::to_string(i) + ": a block past the end of poi_vertices.bin");
+        if (b.logical_bytes() > ft.logical_vertex_bytes - logical) past_vertex_stream(i, ft);
         if (logical >= NO) malformed("a logical vertex stream of 4 GiB or more");
         wr32(rec + OFF_VERTEX_OFFSET, uint32_t(logical));
         wr32(rec + OFF_VERTEX_COUNT, uint32_t(b.vertex_count()));
