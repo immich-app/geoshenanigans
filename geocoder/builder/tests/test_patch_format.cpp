@@ -2327,7 +2327,7 @@ Rebuilt rebuild(std::string_view old_pool, const StringTierEdit& edit, const Str
     const std::vector<uint8_t> file = string_files::encode(old_pool.data(), old_pool.size());
     string_files::Decoder old(file.data(), file.size());
     out.walk = rebuild_string_tier(old, edit, at, remap, [&](const char* p, size_t n) { out.pool.append(p, n); },
-                                   [](size_t) {});
+                                   [](size_t, size_t) {});
     return out;
 }
 
@@ -2820,8 +2820,9 @@ TEST(patch_format_string_tier_walk_writes_strings_and_reads_nothing_it_passed) {
     // the runs. It gives the old file's body back as it decodes it, deleted
     // strings as well as kept ones: each call at the end of the first bucket
     // that puts a piece behind the last call, and under a piece left for the
-    // end. It reads no body byte before an offset it passed: scribbled over as
-    // it passes them, the old file still rebuilds into the new pool, under the
+    // end. It reads no body byte before an offset it passed, nor a byte of the
+    // bucket table before the entry of the bucket after: scribbled over as it
+    // passes them, the old file still rebuilds into the new pool, under the
     // old pool's hash.
     enum class Shape { Mixed, DeletedSuffix, AllDeleted };
     struct Case {
@@ -2851,16 +2852,17 @@ TEST(patch_format_string_tier_walk_writes_strings_and_reads_nothing_it_passed) {
         std::vector<uint8_t> file = string_files::encode(old_pool.data(), old_pool.size());
         const string_files::Footer ft = string_files::read_footer(file.data(), file.size());
         REQUIRE(ft.body >= 6 * STRING_WALK_PIECE);
-        // The body offset each bucket ends at, and the one it starts at.
-        std::map<uint64_t, uint64_t> bucket_at_end;
+        // The body offset each bucket ends at, and the one it starts at and
+        // its index.
+        std::map<uint64_t, std::pair<uint64_t, uint64_t>> bucket_at_end;
         for (uint64_t b = 0, at = 0; b < ft.buckets; b++) {
             const uint64_t size = string_files::rd16(&file[ft.body + 4 * b + 2]);
-            bucket_at_end[at + size] = at;
+            bucket_at_end[at + size] = {at, b};
             at += size;
         }
         string_files::Decoder old(file.data(), file.size());
         std::string rebuilt;
-        size_t not_one = 0, passed = 0, scribbled = 0, late = 0, off_end = 0;
+        size_t not_one = 0, passed = 0, scribbled = 0, late = 0, off_end = 0, table_wrong = 0, table_scribbled = 0;
         StringRemap remap(scratch_tables());
 
         const StringTierRebuild walk = rebuild_string_tier(
@@ -2869,14 +2871,19 @@ TEST(patch_format_string_tier_walk_writes_strings_and_reads_nothing_it_passed) {
                 rebuilt.append(p, len);
                 not_one += len == 0 || p[len - 1] != '\0' || memchr(p, 0, len - 1) != nullptr;
             },
-            [&](size_t off) {
+            [&](size_t off, size_t table) {
                 CHECK(off >= scribbled + STRING_WALK_PIECE && off <= ft.body);
-                // A bucket ends at off, and started under a piece past the last call.
+                // A bucket ends at off, and started under a piece past the last call; the
+                // table is passed up to the entry of the bucket after it.
                 const auto it = bucket_at_end.find(off);
                 off_end += it == bucket_at_end.end();
-                late += it != bucket_at_end.end() && it->second >= scribbled + STRING_WALK_PIECE;
+                late += it != bucket_at_end.end() && it->second.first >= scribbled + STRING_WALK_PIECE;
+                table_wrong += it != bucket_at_end.end() && table != 4 * (it->second.second + 1);
                 std::fill(file.begin(), file.begin() + static_cast<std::ptrdiff_t>(off), uint8_t('#'));
+                std::fill(file.begin() + static_cast<std::ptrdiff_t>(ft.body),
+                          file.begin() + static_cast<std::ptrdiff_t>(ft.body + table), uint8_t('#'));
                 scribbled = off;
+                table_scribbled = table;
                 passed++;
             });
 
@@ -2888,7 +2895,9 @@ TEST(patch_format_string_tier_walk_writes_strings_and_reads_nothing_it_passed) {
         CHECK_EQ(not_one, size_t(0));
         CHECK_EQ(off_end, size_t(0));
         CHECK_EQ(late, size_t(0));
+        CHECK_EQ(table_wrong, size_t(0));
         CHECK(ft.body - scribbled < STRING_WALK_PIECE);
+        CHECK(table_scribbled > 0 && table_scribbled <= uint64_t(ft.buckets) * 4);
         CHECK(passed + 2 >= ft.body / STRING_WALK_PIECE);
         CHECK(passed >= 4);
         remap.finish();

@@ -2193,8 +2193,9 @@ public:
     }
     // The hash of the pool (content_hash) once the walk is at its end.
     uint64_t hash() const { return hash_.hash(); }
-    // The file's body bytes the walk has decoded.
+    // The file's body bytes the walk has decoded, and its bucket table's.
     uint64_t coded_end() const { return d_.coded_end(); }
+    uint64_t table_read() const { return d_.table_read(); }
 
 private:
     void load() {
@@ -2565,11 +2566,13 @@ struct StringTierRebuild {
 // pool (the old pool's kept strings with the added ones at their indices)
 // through write(bytes, n), a string at a time, adds the runs of the kept
 // strings that moved to remap, and hashes the old pool as the walk decodes it
-// and the new one as it writes it. on_passed(coded_off) once the walk has
-// decoded STRING_WALK_PIECE or more of the old file's body past the last
-// call: it reads none of the body before coded_off again. The walk decodes the
-// whole old file even when the edit doesn't fit (require_string_tier_rebuilt),
-// and the decoder refuses a file that is not an FCC2 encoding.
+// and the new one as it writes it. on_passed(coded_off, table_off) once the
+// walk has decoded STRING_WALK_PIECE or more of the old file's body past the
+// last call: it reads none of the body before coded_off again, nor of the
+// bucket table (which follows the body) before table_off bytes into it. The
+// walk decodes the whole old file even when the edit doesn't fit
+// (require_string_tier_rebuilt), and the decoder refuses a file that is not
+// an FCC2 encoding.
 template <typename Write, typename OnPassed>
 StringTierRebuild rebuild_string_tier(string_files::Decoder& old_file, const StringTierEdit& edit,
                                       const StringTierPlace& at, StringRemap& remap, Write write, OnPassed on_passed) {
@@ -2592,7 +2595,7 @@ StringTierRebuild rebuild_string_tier(string_files::Decoder& old_file, const Str
     auto on_consumed = [&] {
         if (old.coded_end() - passed < STRING_WALK_PIECE) return;
         passed = old.coded_end();
-        on_passed(static_cast<size_t>(passed));
+        on_passed(static_cast<size_t>(passed), static_cast<size_t>(old.table_read()));
     };
     r.placed = for_each_new_string(old, edit, on_string, on_consumed);
     joiner.finish();

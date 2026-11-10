@@ -310,7 +310,8 @@ the tier sizes before it, which the patch carries.
   (empty pools count). The patch sends its pool's string diff and size and
   hash stamps; the patcher rebuilds it and derives its remap runs from the
   same walk. The walk decodes the old FCC2 file a bucket at a time
-  (`string_files::Decoder`) and encodes the new pool as it writes it, one
+  (`string_files::Decoder`), giving back the pages of its body and of its
+  bucket table behind it, and encodes the new pool as it writes it, one
   bucket in memory, its bucket table set aside in the scratch dir until the
   body ends (`string_files::SpillWriter`); the encoding is canonical, so the
   new file is the builder's byte for byte. The tiers are

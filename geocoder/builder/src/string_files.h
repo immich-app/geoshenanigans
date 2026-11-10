@@ -370,6 +370,10 @@ public:
     uint64_t raw_start() const { return raw_start_; }
     // The body's bytes decoded so far.
     uint64_t coded_end() const { return coded_; }
+    // Where the bucket table starts in the file (the body's bytes), and the
+    // bytes of it read so far: the decoder reads none of them again.
+    uint64_t table_offset() const { return ft_.body; }
+    uint64_t table_read() const { return uint64_t(b_) * ENTRY_BYTES; }
 
 private:
     [[noreturn]] void bad(const char* what) const { malformed(name_, "bucket " + std::to_string(b_) + what); }

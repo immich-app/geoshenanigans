@@ -496,12 +496,20 @@ static int run(int argc, char* argv[]) {
                                          std::to_string(old_pool.raw_size()) + " bytes, the patch expects " +
                                          std::to_string(strings.old_size(t)) + ")");
             advise_pages(old_file.data, old_file.size, MADV_SEQUENTIAL);
+            // The body's pages and the bucket table's (after the body) go back
+            // as the walk passes them; the table's from the page it starts in.
             PagesBehind old_behind(old_file.data);
+            const size_t table_at = static_cast<size_t>(old_pool.table_offset());
+            const size_t table_page = table_at & ~(page_size() - 1);
+            PagesBehind table_behind(old_file.data + table_page);
             FILE* fp = open_out(name);
             string_files::SpillWriter out(fp, tmpdir + "/" + name + ".table");
             const StringTierRebuild rebuilt = rebuild_string_tier(
                 old_pool, edit, strings.place(t), str_remap, [&](const char* p, size_t n) { out.write(p, n); },
-                [&](size_t coded) { old_behind.passed(coded); });
+                [&](size_t coded, size_t table) {
+                    old_behind.passed(coded);
+                    table_behind.passed(table_at - table_page + table);
+                });
             out.finish();
             close_patch_outputs({{fp, name}});
             require_string_tier_rebuilt(rebuilt, edit, strings.place(t), name);
