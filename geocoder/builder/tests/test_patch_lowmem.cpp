@@ -27,6 +27,7 @@
 #include "merge_sequence.h"
 #include "patch_format.h"
 #include "scratch_dir.h"
+#include "sequential_file_reader.h"
 #include "test_framework.h"
 #include "tool_runs.h"
 #include "types.h"
@@ -1211,6 +1212,47 @@ TEST(patch_heap_stays_flat_as_geo_cells_change) {
         append(changes, n);
         return patch_holds(c, changes, std::to_string(n) + " added and " + std::to_string(n) + " removed geo cells");
     }, 20000).empty());
+}
+
+// The plain patcher's walk over a geo index of 60,000 cells whose street
+// lists all change (a blocks file of ~190 KiB, past a read window) holds a
+// read window for the old blocks and a few pages besides: the old top file
+// and the group footers, read 12 and 768 bytes at a time, each through a
+// page, and the new blocks handed to the output's FILE buffer a page at a
+// time. Its heap peak is at most a read window and 48 KiB above that of the
+// same patch over an empty geo index. It was 258 KiB above it when the top
+// and footer readers had read windows of their own and the writer held
+// 64 KiB of blocks. Skipped without a heap shim (the sanitizer build).
+TEST(patch_heap_of_the_geo_walk_is_a_read_window_and_a_few_pages) {
+    if (!gctest::heap_peak_shim()) {
+        std::printf("    SKIP heap peaks: no heap shim under the sanitizers\n");
+        return;
+    }
+    ScratchDir dir("lowmem-heap-geo-walk");
+    const uint32_t sizes[] = {0, 60000};
+    uint64_t peaks[2] = {}, blocks[2] = {};
+    for (size_t s = 0; s < 2; s++) {
+        const LowMemCase c{dir.path(), "n" + std::to_string(sizes[s])};
+        std::vector<GeoRow> rows, changed;
+        for (uint32_t k = 0; k < sizes[s]; k++) {
+            rows.push_back({k, {k % 950}});
+            changed.push_back({k, {k % 950 + 1}});
+        }
+        BuildDir old_d, new_d;
+        put_geo(old_d, rows);
+        put_geo(new_d, changed);
+        REQUIRE(prepare(c, old_d, new_d).empty());
+        blocks[s] = read_file(c.dir("old") + "/geo_entries.bin").size();
+        if (s == 1) REQUIRE(blocks[s] > 2 * SEQUENTIAL_READ_BUFFER_BYTES);
+        const Applied a = apply_modes(c, {"plain"});
+        CHECK(a.bad.empty());
+        REQUIRE(a.heap_peaks.count("plain"));
+        peaks[s] = a.heap_peaks.at("plain");
+    }
+    std::printf("    plain: heap peak %llu B over an empty geo index, %llu B over %u cells of %llu B of blocks (%lld B above)\n",
+                (unsigned long long)peaks[0], (unsigned long long)peaks[1], sizes[1], (unsigned long long)blocks[1],
+                (long long)peaks[1] - (long long)peaks[0]);
+    CHECK(peaks[1] <= peaks[0] + SEQUENTIAL_READ_BUFFER_BYTES + (48 << 10));
 }
 
 // n POI cells whose lists all change (each cell's POI becomes the next one)

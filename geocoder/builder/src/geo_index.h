@@ -59,8 +59,10 @@ inline constexpr char MAGIC[4] = {'G', 'X', 'T', '2'};
 inline constexpr size_t HEADER_BYTES = 8, FOOTER_BYTES = 8, ENTRY_BYTES = 12;
 inline constexpr size_t BLOCK_ROWS = 64, GROUP_BLOCKS = 64;
 inline constexpr size_t TABLES = 3, ADDRESSES = 1;
-// The blocks file's bytes a Writer holds before it hands them on.
-inline constexpr size_t FLUSH_BYTES = 64 << 10;
+// The blocks file's bytes a Writer holds before it hands them on: a page,
+// what a FILE or stream buffer takes in at once, so its callers' buffers do
+// the batching and the Writer doesn't hold a second 64 KiB.
+inline constexpr size_t FLUSH_BYTES = 4 << 10;
 // A list's count is that of a u16, as the server's lists always were.
 inline constexpr uint32_t LIST_MAX = 0xFFFF;
 inline constexpr int MIN_LEVEL = 1, MAX_LEVEL = 30;

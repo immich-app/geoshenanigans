@@ -1159,10 +1159,14 @@ static int run(int argc, char* argv[]) {
         {
         // The old geo index read front to back (geo_index.h): its top file,
         // and its blocks file through two readers, the second ahead of the
-        // first at each group's footer.
-        SequentialFileReader old_top(cur_dir + "/geo_cells.bin");
+        // first at each group's footer. The top file and the footers are
+        // read an entry (12 bytes) and a footer (768) at a time, so their
+        // readers read a page each instead of a 64 KiB window.
+        constexpr size_t GEO_TOP_AND_FOOTER_READ_BYTES = 4 << 10;
+        static_assert(GEO_TOP_AND_FOOTER_READ_BYTES >= geo_index::GROUP_BLOCKS * geo_index::ENTRY_BYTES);
+        SequentialFileReader old_top(cur_dir + "/geo_cells.bin", GEO_TOP_AND_FOOTER_READ_BYTES);
         SequentialFileReader old_blocks(cur_dir + "/geo_entries.bin");
-        SequentialFileReader old_footers(cur_dir + "/geo_entries.bin");
+        SequentialFileReader old_footers(cur_dir + "/geo_entries.bin", GEO_TOP_AND_FOOTER_READ_BYTES);
         geo_index::Reader old_geo(old_top, old_blocks, old_footers);
 
         // Added and removed cells and the diff's per-cell corrections, in
