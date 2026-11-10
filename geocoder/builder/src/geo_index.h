@@ -601,15 +601,24 @@ private:
         const size_t kept = ids.size();
         const uint64_t adds = in.varint();
         if (adds > LIST_MAX - kept) malformed("a list of more than 65535 ids");
+        // The kept ids move to the end and the adds (ascending) merge in from the front as they are read, a kept id
+        // before an add of its value as std::inplace_merge puts it: the merge never writes past what it has still to
+        // read, so it needs no buffer (inplace_merge took one for every edit).
+        const size_t n = kept + static_cast<size_t>(adds);
+        ids.resize(n);
+        uint32_t* const d = ids.data();
+        if (kept > 0 && adds > 0) std::memmove(d + adds, d, kept * sizeof(uint32_t));
+        size_t i = static_cast<size_t>(adds), k = 0;
         int64_t v = 0;
         for (uint64_t j = 0; j < adds; j++) {
             const uint64_t coded = in.varint();
             if (coded >> 34) malformed("an id past 32 bits");
             v = j ? v + int64_t(coded) + 1 : int64_t(lf) + cell_pairs::unzigzag(coded);
             if (v < 0 || v > int64_t(0xFFFFFFFF)) malformed("an id past 32 bits");
-            ids.push_back(static_cast<uint32_t>(v));
+            const uint32_t id = static_cast<uint32_t>(v);
+            while (i < n && d[i] <= id) d[k++] = d[i++];
+            d[k++] = id;
         }
-        std::inplace_merge(ids.begin(), ids.begin() + static_cast<std::ptrdiff_t>(kept), ids.end());
         if (ids.empty()) malformed("an empty list");
         if (cell_pairs::has_repeats(ids.data(), ids.size())) malformed("an edit to a list with a repeated id");
     }
