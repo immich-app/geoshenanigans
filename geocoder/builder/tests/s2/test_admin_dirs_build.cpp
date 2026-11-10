@@ -23,6 +23,7 @@
 #include "id_allocator.h"
 #include "pbf_test_objects.h"
 #include "scratch_dir.h"
+#include "string_files.h"
 #include "test_framework.h"
 #include "tool_runs.h"
 #include "types.h"
@@ -422,8 +423,11 @@ TEST(an_admin_polygon_is_built_whatever_simplifying_would_leave_of_its_ring) {
     const auto files = tree(out);
     for (const char* dir : {"quality/simplified", "quality/exact"})
         CHECK_EQ(files.at(std::string("planet/") + dir + "/admin_polygons.bin").size(), 8 * sizeof(AdminPolygon));
-    const std::vector<char> strings = files.at("planet/full/strings_core.bin");
-    CHECK(std::search(strings.begin(), strings.end(), std::begin("Punkt"), std::end("Punkt")) != strings.end());
+    const std::vector<char>& file = files.at("planet/full/strings_core.bin");
+    std::string strings;
+    string_files::decode(reinterpret_cast<const uint8_t*>(file.data()), file.size(),
+                         [&](const char* p, size_t n) { strings.append(p, n); });
+    CHECK(strings.find(std::string("Punkt", 6)) != std::string::npos);
 }
 
 TEST(a_chained_build_of_edited_data_keeps_each_retained_arcs_slot_where_a_fresh_build_moves_some) {
