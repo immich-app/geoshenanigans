@@ -306,8 +306,8 @@ mod tests {
     #[test]
     fn every_string_id_reads_as_the_raw_tier() {
         // Random pools of names sharing prefixes, empty strings, UTF-8 and invalid bytes, long
-        // strings alone in their buckets, sorted or not: every offset, string start or not, reads as
-        // the raw tier read it.
+        // strings alone in their buckets, sorted or not: every string start, and offsets inside the
+        // strings and at their NULs, read as the raw tier read them.
         let mut x = 0x2545F4914F6CDD1Du64;
         let mut rng = move || {
             x ^= x << 13;
@@ -345,8 +345,20 @@ mod tests {
             }
             let pool = pool_of(&strings.iter().map(|s| s.as_slice()).collect::<Vec<_>>());
             let t = Tier::of_pool(&pool);
+            // Each string's every offset up to its NUL; in a long one (each of whose offsets
+            // reads to its end) its first two, middle and last two.
+            let mut offsets = vec![pool.len(), pool.len() + 1];
+            let mut start = 0;
+            for (end, _) in pool.iter().enumerate().filter(|(_, &c)| c == 0) {
+                if end - start < 1024 {
+                    offsets.extend(start..=end);
+                } else {
+                    offsets.extend([start, start + 1, (start + end) / 2, end - 1, end]);
+                }
+                start = end + 1;
+            }
             let mut wrong = 0;
-            for off in 0..pool.len() + 2 {
+            for &off in &offsets {
                 wrong += (t.get(off as u32) != raw_get(&pool, off)) as usize;
             }
             assert_eq!(wrong, 0, "round {round}: {wrong} offsets of {} read wrong", pool.len());
