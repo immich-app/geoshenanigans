@@ -17,9 +17,11 @@ const NO_POSTCODE: usize = 0xFFFF;
 /// The zero bytes after the last block, for the decoder's 8-byte loads.
 const VERTEX_PAD: usize = 8;
 
+#[inline(always)]
 fn u16_at(b: &[u8], at: usize) -> u16 {
     u16::from_le_bytes([b[at], b[at + 1]])
 }
+#[inline(always)]
 fn u32_at(b: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
 }
@@ -75,7 +77,7 @@ impl PoiRecords {
             return None;
         }
         let at = idx as usize * ROW_BYTES;
-        let b = &self.file.as_slice()[at..at + ROW_BYTES];
+        let b: &[u8; ROW_BYTES] = self.file.as_slice()[at..at + ROW_BYTES].try_into().unwrap();
         let c = self.combos.get(u16_at(b, 25) as usize)?;
         let postcode = u16_at(b, 23) as usize;
         let parent_postcode_id = if postcode == NO_POSTCODE { NO_DATA } else { *self.postcodes.get(postcode)? };
@@ -165,7 +167,15 @@ pub fn polygon(vertices: &FileBytes, rec: &PoiRecord) -> Option<Vec<NodeCoord>> 
     let scale = vertex_scale(b.encoding);
     let w = (b.wl + b.wg) as usize;
     let (ml, mg) = (mask(b.wl), mask(b.wg));
-    let load = |bit: usize| u64::from_le_bytes(v[b.at + (bit >> 3)..][..8].try_into().unwrap()) >> (bit & 7);
+    let payload = &v[b.at..];
+    // The 8 bytes from the one holding bit `bit` of the vertices, shifted to it. Every bit a vertex
+    // has is in the block's payload, and block() checked that 8 bytes past the payload's end stay in
+    // the file (its pad), so no load leaves `payload`.
+    let load = |bit: usize| {
+        debug_assert!((bit >> 3) + 8 <= payload.len());
+        // SAFETY: in bounds, as above; read_unaligned takes any alignment.
+        u64::from_le(unsafe { std::ptr::read_unaligned(payload.as_ptr().add(bit >> 3) as *const u64) }) >> (bit & 7)
+    };
     let mut out = Vec::with_capacity(b.m + b.closed as usize);
     for k in 0..b.m {
         let pos = k * w;

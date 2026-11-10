@@ -1395,6 +1395,7 @@ impl Index {
         pn.is_visible().then_some(pn)
     }
 
+    #[inline]
     pub fn poi_record(&self, idx: u32) -> Option<PoiRecord> {
         let pr = self.poi_records.as_ref()?.record(idx)?;
         // The builder ships no unnamed POI, so a nameless record is a tombstone.
