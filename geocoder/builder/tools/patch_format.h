@@ -1650,33 +1650,41 @@ CellIndexWritten stream_cell_index(Cells&& cells, Entries&& entries, cell_pairs:
     CellRunReader gained_runs(delta, delta_size, parts.gained_at, parts.n_gained);
     ActiveRuns lost, gained;
 
-    // The next source cell: old cells minus `removed`, merged with `added`. The old index's next row waits in
-    // (old_cid, old_ids) while an added cell comes first.
+    // The next source cell and its list: old cells minus `removed`, merged with `added`. The old index's next row
+    // waits in (old_cid, old_ids) while an added cell comes first. old_ids is the one copy of an old list the pass
+    // holds: as read, or remapped and sorted (old_mapped) once a source cell took it; a row that shares the list of
+    // the row before leaves it as it is (Reader::next's repeat), the same list remapped the same way.
+    static const std::vector<uint32_t> no_ids;
     cell_pairs::Reader old(cells, entries, format);
     uint64_t old_cid = NONE;
-    std::vector<uint32_t> old_ids, ids;
-    bool old_waiting = false, old_done = false;
-    auto next_source = [&](uint64_t& cid) -> bool {
+    std::vector<uint32_t> old_ids;
+    bool old_mapped = false, old_waiting = false, old_done = false;
+    auto next_source = [&](uint64_t& cid, const std::vector<uint32_t>*& list) -> bool {
         for (;;) {
             if (!old_waiting && !old_done) {
-                old_waiting = old.next(old_cid, old_ids);
+                bool repeat = false;
+                old_waiting = old.next(old_cid, old_ids, repeat);
                 old_done = !old_waiting;
+                if (old_waiting && !repeat) old_mapped = false;
             }
             const uint64_t o = old_waiting ? old_cid : NONE;
             const uint64_t add_cid = added.done() ? NONE : added.front();
             if (o == NONE && add_cid == NONE) return false;
             if (add_cid < o) {
                 cid = add_cid; added.pop();
-                ids.clear();
+                list = &no_ids;
                 return true;
             }
             if (add_cid == o) bad_index();
             old_waiting = false;
             if (removed.skip_to(o)) continue;
             cid = o;
-            ids.swap(old_ids);
-            for (auto& id : ids) id = remap(id & 0x7FFFFFFFu) | (id & 0x80000000u);
-            std::sort(ids.begin(), ids.end());
+            if (!old_mapped) {
+                for (auto& id : old_ids) id = remap(id & 0x7FFFFFFFu) | (id & 0x80000000u);
+                std::sort(old_ids.begin(), old_ids.end());
+                old_mapped = true;
+            }
+            list = &old_ids;
             return true;
         }
     };
@@ -1716,19 +1724,19 @@ CellIndexWritten stream_cell_index(Cells&& cells, Entries&& entries, cell_pairs:
         rank++;
     };
 
-    static const std::vector<uint32_t> no_ids;
     uint64_t source_rank = 0, next_gone = gone.next(), next_new = fresh.next(), cid = NONE;
-    bool have = next_source(cid);
+    const std::vector<uint32_t>* list = &no_ids;
+    bool have = next_source(cid, list);
     for (;;) {
         while (have && source_rank == next_gone) {
             source_rank++;
             next_gone = gone.next();
-            have = next_source(cid);
+            have = next_source(cid, list);
         }
         if (have && cid < next_new) {
-            emit(cid, ids);
+            emit(cid, *list);
             source_rank++;
-            have = next_source(cid);
+            have = next_source(cid, list);
         } else if (next_new != NONE && (!have || next_new < cid)) {
             emit(next_new, no_ids);
             next_new = fresh.next();

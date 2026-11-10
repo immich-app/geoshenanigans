@@ -1267,6 +1267,53 @@ TEST(patch_heap_stays_flat_as_poi_cells_change) {
     }, 10000).empty());
 }
 
+// Eight POI cells that share one list of n POIs (as a dense city's poi/all
+// cells do) and a ninth whose POI changes: the patcher holds a long list as
+// few times as the rebuild needs (the old index's row, the writer's previous
+// list and its encoding), so from n = 6,000 to 60,000 its heap peak, plain
+// and sync, grows by at most three times the ids added (2.7 and 1.2 times).
+// It grew by 4.7 and 3.4 times them when the old index's reader kept its own
+// copy of a shared list, and the rebuild a second list it swapped with the
+// reader's. Skipped without a heap shim (the sanitizer build).
+TEST(patch_heap_holds_a_long_shared_poi_cell_list_at_most_three_times) {
+    if (!gctest::heap_peak_shim()) {
+        std::printf("    SKIP heap peaks: no heap shim under the sanitizers\n");
+        return;
+    }
+    ScratchDir dir("lowmem-heap-shared-list");
+    std::mt19937 rng(20261110);
+    const uint32_t sizes[] = {6000, 60000};
+    const auto pois = pois_of(rng, sizes[1] + 2, 0, true);
+    std::map<std::string, uint64_t> peaks[2];
+    for (size_t s = 0; s < 2; s++) {
+        const LowMemCase c{dir.path(), "n" + std::to_string(sizes[s])};
+        std::vector<uint32_t> shared(sizes[s]);
+        for (uint32_t i = 0; i < sizes[s]; i++) shared[i] = i;
+        CellLists old_cells, new_cells;
+        for (uint32_t k = 0; k < 8; k++) old_cells[pair_cell(k)] = new_cells[pair_cell(k)] = shared;
+        old_cells[pair_cell(8)] = {sizes[1]};
+        new_cells[pair_cell(8)] = {sizes[1] + 1};
+        BuildDir old_d, new_d;
+        put_pois(old_d, pois);
+        put_pois(new_d, pois);
+        put_cells(old_d, "poi", old_cells);
+        put_cells(new_d, "poi", new_cells);
+        REQUIRE(prepare(c, old_d, new_d).empty());
+        const Applied a = apply_modes(c, {"plain", "sync"});
+        CHECK(a.bad.empty());
+        peaks[s] = a.heap_peaks;
+    }
+    const uint64_t added = 4 * uint64_t(sizes[1] - sizes[0]);
+    for (const std::string mode : {"plain", "sync"}) {
+        REQUIRE(peaks[0].count(mode) && peaks[1].count(mode));
+        const uint64_t from = peaks[0][mode], to = peaks[1][mode];
+        std::printf("    %s: heap peak %llu B at n = %u, %llu B at n = %u (%.2f times the %llu B of ids added)\n",
+                    mode.c_str(), (unsigned long long)from, sizes[0], (unsigned long long)to, sizes[1],
+                    to > from ? double(to - from) / double(added) : 0.0, (unsigned long long)added);
+        CHECK(to <= from + 3 * added);
+    }
+}
+
 namespace {
 
 // The admin index of n_cells cells: cell k lists ids_of(k). The admin

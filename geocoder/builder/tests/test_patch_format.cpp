@@ -2075,7 +2075,9 @@ TEST(patch_format_stream_cell_index_matches_rebuild_then_delta) {
     // The patcher's one-pass rebuild (old index + remap + added/removed +
     // delta) writes exactly the new index the diff aimed at, the bytes the
     // builder writes for its lists, on random days with interior flags,
-    // removed and added cells, over cells of several parents.
+    // removed and added cells, over cells of several parents, a third of
+    // the cells sharing the list of the cell before (a direct table's rows
+    // that share a list, which the rebuild remaps once).
     uint64_t seed = 99;
     auto rnd = [&](uint32_t n) { seed = seed * 6364136223846793005ull + 1442695040888963407ull; return (uint32_t)(seed >> 33) % n; };
     // Cell k: two parents of 1024 cells and their neighbours apart, in steps of up to 300 cells.
@@ -2089,6 +2091,7 @@ TEST(patch_format_stream_cell_index_matches_rebuild_then_delta) {
             std::vector<uint32_t> ids;
             for (uint32_t id = 0; id < 40; id++) if (rnd(5) == 0) ids.push_back(id | (rnd(4) == 0 ? 0x80000000u : 0));
             std::sort(ids.begin(), ids.end());
+            if (!old_lists.empty() && rnd(3) == 0) ids = old_lists.rbegin()->second;
             old_lists[cell(cid)] = ids;
         }
         std::unordered_map<uint32_t, uint32_t> rm;

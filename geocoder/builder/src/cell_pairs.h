@@ -451,9 +451,10 @@ private:
 // Reads an index's two files front to back (each through size() and
 // at(off, n), as ByteIn), checking them as it goes: next() gives each row's
 // cell and list in cell order, then checks the tail and that both files end
-// there. Holds one parent record, the row's list and the previous one, and
-// the parent bitmap and record starts (as the Writer). Every refusal is a
-// "Malformed cell index" runtime_error.
+// there. Holds one parent record, the row's list and the previous one (but
+// for a direct table read through next(cell, ids, repeat): the caller's list
+// alone), and the parent bitmap and record starts (as the Writer). Every
+// refusal is a "Malformed cell index" runtime_error.
 template <typename Cells, typename Entries>
 class Reader {
 public:
@@ -484,6 +485,22 @@ public:
 
     // The next row's cell and list (ids replaced), false past the last.
     bool next(uint64_t& cell, std::vector<uint32_t>& ids) {
+        bool repeat = false;
+        if (!next(cell, ids, repeat)) return false;
+        if (format_.kind == Kind::DIRECT) {
+            if (repeat) ids = prev_;
+            else prev_ = ids;
+        }
+        return true;
+    }
+
+    // next() for a caller that keeps the list it is given until the next
+    // call: a direct table's row that shares the list of the row before sets
+    // repeat and leaves ids as they are, so the reader holds no copy of a
+    // direct table's lists. A block index's rows edit the one before, so its
+    // reader keeps that one, and repeat stays false.
+    bool next(uint64_t& cell, std::vector<uint32_t>& ids, bool& repeat) {
+        repeat = false;
         if (done_) return false;
         while (row_ == row_count_) {
             if (!next_record()) {
@@ -496,7 +513,7 @@ public:
         word_bits_ &= word_bits_ - 1;
         cell = cell_of(parent_ << (2 * LEAF_LEVELS) | (word_ * 64 + bit), level_);
         if (format_.kind == Kind::BLOCKS) block_row(ids);
-        else direct_row(ids);
+        else repeat = direct_row(ids);
         row_++;
         rows_++;
         return true;
@@ -559,17 +576,17 @@ private:
         prev_ = ids;
     }
 
-    void direct_row(std::vector<uint32_t>& ids) {
+    // A direct table's row: its list into ids, or true for a row that shares
+    // the list of the row before (ids untouched).
+    bool direct_row(std::vector<uint32_t>& ids) {
         const uint32_t off = offsets_[row_];
         if (off == in_.pos()) {
             get_plain(ids, nullptr);
-            prev_ = ids;
             prev_offset_ = off;
-        } else if (rows_ > 0 && off == prev_offset_) {
-            ids = prev_;
-        } else {
-            malformed("a list where none starts");
+            return false;
         }
+        if (rows_ > 0 && off == prev_offset_) return true;
+        malformed("a list where none starts");
     }
 
     void get_plain(std::vector<uint32_t>& ids, const uint32_t* lf) {
