@@ -198,19 +198,21 @@ fn polygon(v: &[u8], rec: &PoiRecord, logical: u64) -> Option<Vec<NodeCoord>> {
         // SAFETY: in bounds, as above; read_unaligned takes any alignment.
         u64::from_le(unsafe { std::ptr::read_unaligned(payload.as_ptr().add(bit >> 3) as *const u64) }) >> (bit & 7)
     };
+    // A quantized offset is below 2^32, so it converts through i64 (one instruction) to the
+    // same f64 as through u64.
+    let vertex = |ql: u64, qg: u64| NodeCoord {
+        lat: (b.bmin_lat + ql as i64 as f64 * scale) as f32,
+        lng: (b.bmin_lng + qg as i64 as f64 * scale) as f32,
+    };
+    let wl = b.wl as usize;
     let mut out = Vec::with_capacity(b.m + b.closed as usize);
-    for k in 0..b.m {
-        let pos = k * w;
-        let (ql, qg) = if w <= 57 {
-            let x = load(pos);
-            (x & ml, (x >> b.wl) & mg)
-        } else {
-            (load(pos) & ml, load(pos + b.wl as usize) & mg)
-        };
-        out.push(NodeCoord {
-            lat: (b.bmin_lat + ql as f64 * scale) as f32,
-            lng: (b.bmin_lng + qg as f64 * scale) as f32,
-        });
+    if w <= 57 {
+        out.extend((0..b.m).map(|k| {
+            let x = load(k * w);
+            vertex(x & ml, (x >> wl) & mg)
+        }));
+    } else {
+        out.extend((0..b.m).map(|k| vertex(load(k * w) & ml, load(k * w + wl) & mg)));
     }
     if b.closed {
         out.push(out[0]);
