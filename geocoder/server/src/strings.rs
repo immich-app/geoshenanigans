@@ -3,8 +3,8 @@
 //! offset into its tier's pool, the strings back to back, each ended by a NUL. [`Tier::get`] finds
 //! the bucket that holds an offset through the pool and body offsets of every 16th bucket, summed
 //! from the bucket table once at open, then walks that bucket. A string the bucket stores whole (its
-//! first, or one sharing nothing with the string before) is borrowed from the file; any other is
-//! rebuilt into a `String`.
+//! first, or one sharing nothing with the string before), or an offset into a string's own suffix,
+//! is borrowed from the file; any other is rebuilt into a `String`.
 
 use std::borrow::Cow;
 
@@ -17,6 +17,8 @@ const ENTRY: usize = 4;
 const SB: usize = 16;
 /// A bucket of two strings or more spans at most this, so each of its strings fits.
 const MAX_SPAN: usize = 512;
+/// The bytes walk copies at a time: at most the 16 a tier's file holds past its body.
+const CHUNK: usize = 16;
 
 /// One tier's file, read in place.
 pub struct Tier {
@@ -123,67 +125,73 @@ impl Tier {
         let f = self.file.as_slice();
         let s = self.raw_starts.partition_point(|&r| r <= local) - 1;
         let (mut raw, mut coded) = (self.raw_starts[s] as usize, self.coded_starts[s] as usize);
-        let mut e = self.body + s * SB * ENTRY;
+        // The superblock's entries, read as one slice (open checked that they add up, so the
+        // bucket that holds `local` is among them).
+        let e = self.body + s * SB * ENTRY;
+        let entries = f.get(e..(e + SB * ENTRY).min(f.len() - FOOTER))?;
         let local = local as usize;
-        loop {
-            let span = u16_at(f, e);
+        let mut size = 0;
+        for en in entries.chunks_exact(ENTRY) {
+            let span = u16::from_le_bytes([en[0], en[1]]) as usize;
+            size = u16::from_le_bytes([en[2], en[3]]) as usize;
             if local < raw + span {
                 break;
             }
             raw += span;
-            coded += u16_at(f, e + 2);
-            e += ENTRY;
+            coded += size;
         }
-        let d = f.get(coded..coded + u16_at(f, e + 2))?;
-        walk(d, local - raw)
+        walk(f, coded, size, local.checked_sub(raw)?)
     }
 }
 
-/// The string at `target` in a bucket's strings (`d` its coded bytes).
-fn walk(d: &[u8], target: usize) -> Option<Cow<'_, str>> {
+/// The string at `target` in the bucket at f[b..b + size]. Each string after the first goes into
+/// buf, its suffix copied CHUNK bytes at a time: a tier's file runs at least CHUNK bytes past any
+/// byte of its body (its table and footer), and every string after a bucket's first ends within
+/// MAX_SPAN.
+fn walk(f: &[u8], b: usize, size: usize, target: usize) -> Option<Cow<'_, str>> {
+    let d = f.get(b..b + size)?;
     let mut at = 0;
     let len = varint(d, &mut at)?;
     let head = d.get(at..at + len)?;
     if target <= len {
         return borrowed(&head[target..]);
     }
-    // The string the walk is at: whole in d at (start, len), or built in buf's first len bytes.
-    enum Cur {
-        Whole(usize, usize),
-        Built(usize),
+    if len + 1 >= MAX_SPAN {
+        return None;
     }
-    let mut cur = Cur::Whole(at, len);
+    let mut buf = [0u8; MAX_SPAN + CHUNK];
+    copy(&mut buf, 0, f, b + at, len);
     at += len;
-    let mut pos = len + 1;
-    let mut buf = [0u8; MAX_SPAN];
+    let (mut cur, mut pos) = (len, len + 1);
     loop {
         let lcp = varint(d, &mut at)?;
         let sl = varint(d, &mut at)?;
-        let suffix = d.get(at..at + sl)?;
         let l = lcp + sl;
-        if lcp == 0 {
-            cur = Cur::Whole(at, sl);
-        } else {
-            if l > MAX_SPAN {
-                return None;
+        if lcp > cur || sl > d.len() - at || pos + l >= MAX_SPAN {
+            return None;
+        }
+        copy(&mut buf, lcp, f, b + at, sl);
+        if target <= pos + l {
+            let k = target - pos;
+            // Bytes of its own suffix alone are borrowed from the file.
+            if k >= lcp {
+                return borrowed(&d[at + k - lcp..at + sl]);
             }
-            match cur {
-                Cur::Whole(s, n) if lcp <= n => buf[..lcp].copy_from_slice(&d[s..s + lcp]),
-                Cur::Built(n) if lcp <= n => {}
-                _ => return None,
-            }
-            buf[lcp..l].copy_from_slice(suffix);
-            cur = Cur::Built(l);
+            return std::str::from_utf8(&buf[k..l]).ok().map(|s| Cow::Owned(s.to_owned()));
         }
         at += sl;
-        if target < pos + l + 1 {
-            let k = target - pos;
-            return match cur {
-                Cur::Whole(s, n) => borrowed(&d[s + k..s + n]),
-                Cur::Built(n) => std::str::from_utf8(&buf[k..n]).ok().map(|s| Cow::Owned(s.to_owned())),
-            };
-        }
+        cur = l;
         pos += l + 1;
+    }
+}
+
+/// buf[to..to + n] = f[from..from + n], CHUNK bytes at a time (so up to CHUNK - 1 past both).
+#[inline(always)]
+fn copy(buf: &mut [u8; MAX_SPAN + CHUNK], to: usize, f: &[u8], from: usize, n: usize) {
+    let mut i = 0;
+    while i < n {
+        buf[to + i..to + i + CHUNK].copy_from_slice(&f[from + i..from + i + CHUNK]);
+        i += CHUNK;
     }
 }
 
@@ -412,5 +420,56 @@ mod tests {
                 assert_eq!(t.get(off), "", "bucket {bucket:02x?}, offset {off}");
             }
         }
+    }
+
+    #[test]
+    fn builds_each_string_on_the_one_before_and_borrows_its_own_suffix() {
+        // One bucket of strings each one byte longer than the string before and sharing all of it,
+        // so each is built on the one before: the prefixes of the first 30 letters drawn that the
+        // encoder cuts nowhere in.
+        let buckets = |f: &[u8]| u32_at(f, f.len() - FOOTER);
+        let mut x = 0x9E3779B97F4A7C15u64;
+        let pool = (0..1000)
+            .map(|_| {
+                let word: Vec<u8> = (0..30)
+                    .map(|_| {
+                        x ^= x << 13;
+                        x ^= x >> 7;
+                        x ^= x << 17;
+                        b'a' + (x % 26) as u8
+                    })
+                    .collect();
+                pool_of(&(1..=30).map(|n| &word[..n]).collect::<Vec<_>>())
+            })
+            .find(|pool| buckets(&encode(pool)) == 1)
+            .expect("a word of one bucket");
+        let t = Tier::of_pool(&pool);
+        assert_eq!(buckets(t.file.as_slice()), 1, "one bucket");
+        for off in 0..=pool.len() {
+            assert_eq!(t.get(off as u32), raw_get(&pool, off), "offset {off}");
+        }
+        // The last string: from its start, built; from its last byte, its own suffix, borrowed
+        // from the file.
+        let last = pool.len() - 31;
+        assert!(matches!(t.get(last as u32), Cow::Owned(_)));
+        assert!(matches!(t.get(last as u32 + 29), Cow::Borrowed(s) if s.len() == 1));
+    }
+
+    #[test]
+    fn a_bucket_of_two_strings_past_its_span_reads_as_empty_past_the_first() {
+        // "a", then a string sharing nothing that ends past MAX_SPAN: the encoder would have cut
+        // before it, so only the first reads.
+        let mut f = vec![0x01, b'a', 0x00, 0xD8, 0x04];
+        f.extend([b'b'; 600]);
+        let size = f.len() as u16;
+        f.extend_from_slice(&603u16.to_le_bytes());
+        f.extend_from_slice(&size.to_le_bytes());
+        f.extend_from_slice(&1u32.to_le_bytes());
+        f.extend_from_slice(&603u32.to_le_bytes());
+        f.extend_from_slice(MAGIC);
+        let t = Tier::open(FileBytes::Owned(f)).unwrap();
+        assert_eq!(t.get(0), "a");
+        assert_eq!(t.get(2), "");
+        assert_eq!(t.get(300), "");
     }
 }
