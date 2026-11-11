@@ -2,7 +2,8 @@
 //! (builder/src/string_files.h writes them and documents the format). A string id stays a byte
 //! offset into its tier's pool, the strings back to back, each ended by a NUL. [`Tier::get`] finds
 //! the bucket that holds an offset through the pool and body offsets of every 16th bucket, summed
-//! from the bucket table once at open, then walks that bucket. A string the bucket stores whole (its
+//! from the bucket table once at open, and a jump table into them per 4 KiB of the pool, then walks
+//! that bucket. A string the bucket stores whole (its
 //! first, or one sharing nothing with the string before), or an offset into a string's own suffix,
 //! is borrowed from the file; any other is rebuilt into a `String`.
 
@@ -15,6 +16,8 @@ const FOOTER: usize = 12;
 const ENTRY: usize = 4;
 /// Buckets per superblock: the reader keeps the offsets of every SB-th bucket.
 const SB: usize = 16;
+/// The pool's bytes per jump entry: 2^JUMP, about a superblock's worth.
+const JUMP: u32 = 12;
 /// A bucket of two strings or more spans at most this, so each of its strings fits.
 const MAX_SPAN: usize = 512;
 /// The bytes walk copies at a time: at most the 16 a tier's file holds past its body.
@@ -29,6 +32,8 @@ pub struct Tier {
     /// Per superblock, the pool offset of its first bucket and that bucket's offset in the body.
     raw_starts: Vec<u32>,
     coded_starts: Vec<u32>,
+    /// Per 2^JUMP bytes of the pool, the superblock its first byte is in; the one after the last.
+    jump: Vec<u32>,
 }
 
 fn u16_at(f: &[u8], at: usize) -> usize {
@@ -81,9 +86,14 @@ impl Tier {
         }
         let n = (buckets as usize).div_ceil(SB);
         let (mut raw_starts, mut coded_starts) = (Vec::with_capacity(n), Vec::with_capacity(n));
+        let mut jump = Vec::with_capacity((raw_size >> JUMP) as usize + 2);
         let (mut raw, mut coded) = (0u64, 0u64);
         for (b, e) in f[body..body + table as usize].chunks_exact(ENTRY).enumerate() {
             if b % SB == 0 {
+                // Each jump entry whose first byte is in a superblock before this one has its index.
+                while (jump.len() as u64) << JUMP < raw && jump.len() < (raw_size >> JUMP) as usize + 2 {
+                    jump.push((b / SB) as u32 - 1);
+                }
                 raw_starts.push(raw as u32);
                 coded_starts.push(coded as u32);
             }
@@ -99,7 +109,11 @@ impl Tier {
                 "buckets of {raw} bytes in {coded} where the footer gives {raw_size} in a body of {body}"
             ));
         }
-        Ok(Tier { file, raw_size, body, raw_starts, coded_starts })
+        // Entries past the pool's last superblock: its index (the last of them, one past the
+        // pool's last byte, is the "one after" of the last entry the pool reaches).
+        let last = raw_starts.len().saturating_sub(1) as u32;
+        jump.resize((raw_size >> JUMP) as usize + 2, last);
+        Ok(Tier { file, raw_size, body, raw_starts, coded_starts, jump })
     }
 
     /// The pool's bytes.
@@ -123,7 +137,10 @@ impl Tier {
             return None;
         }
         let f = self.file.as_slice();
-        let s = self.raw_starts.partition_point(|&r| r <= local) - 1;
+        // The superblock is between the ones of the jump entries around local.
+        let i = (local >> JUMP) as usize;
+        let (lo, hi) = (self.jump[i] as usize, self.jump[i + 1] as usize);
+        let s = lo + self.raw_starts[lo + 1..=hi].partition_point(|&r| r <= local);
         let (mut raw, mut coded) = (self.raw_starts[s] as usize, self.coded_starts[s] as usize);
         // The superblock's entries, read as one slice (open checked that they add up, so the
         // bucket that holds `local` is among them).
