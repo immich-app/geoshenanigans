@@ -57,6 +57,14 @@ impl FileBytes {
 
     pub fn is_empty(&self) -> bool { self.len() == 0 }
 
+    /// Asks the kernel to read `len` bytes from `off` ahead of a pass over them (a mapping is
+    /// advised for random access, so its pages would otherwise come from disk one at a time).
+    pub fn will_need(&self, off: usize, len: usize) {
+        if let Self::Mmap(m) = self {
+            let _ = m.advise_range(memmap2::Advice::WillNeed, off, len);
+        }
+    }
+
     /// The whole file.
     pub fn as_slice(&self) -> &[u8] {
         match self {
