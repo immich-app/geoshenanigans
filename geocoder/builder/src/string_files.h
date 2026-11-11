@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstring>
 #include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -86,6 +87,10 @@ inline size_t put_varint(uint8_t* o, uint64_t v) {
 // A varint of at most 3 bytes at p[at, end), in its fewest bytes: false for
 // any other.
 inline bool get_varint(const uint8_t* p, size_t end, size_t& at, uint32_t& v) {
+    if (at < end && p[at] < 0x80) {
+        v = p[at++];
+        return true;
+    }
     v = 0;
     for (int s = 0; s < 21; s += 7) {
         if (at >= end) return false;
@@ -132,7 +137,8 @@ inline Footer read_footer(const uint8_t* file, uint64_t size, const std::string&
 class Encoder {
 public:
     using OnBucket = std::function<void(const uint8_t* coded, size_t size, uint32_t span)>;
-    explicit Encoder(OnBucket on_bucket) : on_bucket_(std::move(on_bucket)) { bucket_.reserve(MAX_SPAN + 64); }
+    explicit Encoder(OnBucket on_bucket)
+        : on_bucket_(std::move(on_bucket)), bucket_(new uint8_t[MAX_BUCKET + 8]), prev_(new char[MAX_STRING]) {}
 
     void write(const char* p, size_t n) {
         while (n) {
@@ -153,6 +159,12 @@ public:
             n -= k + 1;
         }
     }
+    // One whole string of len bytes, no NUL among them (its NUL not given),
+    // between write()'s pieces of whole strings.
+    void put(const char* s, size_t len) {
+        if (!partial_.empty()) unencodable("a string put into the middle of another");
+        add(s, len);
+    }
     // The pool's end: refuses one whose last string has no NUL.
     void finish() {
         if (!partial_.empty()) unencodable("a pool whose last string has no NUL");
@@ -169,36 +181,54 @@ private:
     [[noreturn]] static void too_long(size_t n) {
         unencodable("a string of " + std::to_string(n) + " bytes or more (at most " + std::to_string(MAX_STRING) + ")");
     }
+    // The bucket's bytes go straight into bucket_ (a bucket of two strings or
+    // more spans at most MAX_SPAN bytes, so its varints keep it within
+    // MAX_BUCKET, as does a string alone of MAX_STRING bytes), and prev_ keeps
+    // the string before: only the bytes past their common prefix change.
     void add(const char* s, size_t len) {
         if (len > MAX_STRING) too_long(len);
         if (raw_ + len + 1 > UINT32_MAX) unencodable("a pool of 4 GiB or more");
         if (span_ && cuts_before(span_, s, len)) flush();
-        uint8_t v[8];
+        uint8_t* o = bucket_.get() + size_;
         size_t lcp = 0;
         if (span_) {
-            const size_t m = std::min(len, prev_.size());
-            while (lcp < m && s[lcp] == prev_[lcp]) lcp++;
-            bucket_.insert(bucket_.end(), v, v + put_varint(v, lcp));
+            lcp = common_prefix(s, prev_.get(), std::min(len, prev_len_));
+            o += put_varint(o, lcp);
         }
-        bucket_.insert(bucket_.end(), v, v + put_varint(v, len - lcp));
-        bucket_.insert(bucket_.end(), reinterpret_cast<const uint8_t*>(s) + lcp, reinterpret_cast<const uint8_t*>(s) + len);
-        prev_.assign(s, s + len);
+        o += put_varint(o, len - lcp);
+        memcpy(o, s + lcp, len - lcp);
+        size_ = size_t(o - bucket_.get()) + (len - lcp);
+        memcpy(prev_.get() + lcp, s + lcp, len - lcp);
+        prev_len_ = len;
         span_ += len + 1;
         raw_ += len + 1;
+    }
+    // The bytes a and b share from their first, of at most m.
+    static size_t common_prefix(const char* a, const char* b, size_t m) {
+        size_t i = 0;
+        for (; i + 8 <= m; i += 8) {
+            uint64_t x, y;
+            memcpy(&x, a + i, 8);
+            memcpy(&y, b + i, 8);
+            if (x != y) return i + size_t(__builtin_ctzll(x ^ y) >> 3);
+        }
+        while (i < m && a[i] == b[i]) i++;
+        return i;
     }
     void flush() {
         if (!span_) return;
         if (buckets_ == UINT32_MAX) unencodable("2^32 buckets or more");
-        on_bucket_(bucket_.data(), bucket_.size(), uint32_t(span_));
-        bucket_.clear();
+        on_bucket_(bucket_.get(), size_, uint32_t(span_));
+        size_ = 0;
         span_ = 0;
         buckets_++;
     }
 
     OnBucket on_bucket_;
-    std::vector<uint8_t> bucket_;
-    std::string prev_, partial_;
-    size_t span_ = 0;
+    std::unique_ptr<uint8_t[]> bucket_;
+    std::unique_ptr<char[]> prev_;
+    std::string partial_;
+    size_t size_ = 0, prev_len_ = 0, span_ = 0;
     uint64_t raw_ = 0, buckets_ = 0;
 };
 
@@ -275,6 +305,8 @@ public:
     ~SpillWriter() { drop_spill(); }
 
     void write(const char* p, size_t n) { enc_.write(p, n); }
+    // One whole string (Encoder::put).
+    void put(const char* s, size_t len) { enc_.put(s, len); }
     // The pool's end: appends the table and footer to out (which stays open).
     void finish() {
         enc_.finish();

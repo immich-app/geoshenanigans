@@ -505,7 +505,7 @@ static int run(int argc, char* argv[]) {
             FILE* fp = open_out(name);
             string_files::SpillWriter out(fp, tmpdir + "/" + name + ".table");
             const StringTierRebuild rebuilt = rebuild_string_tier(
-                old_pool, edit, strings.place(t), str_remap, [&](const char* p, size_t n) { out.write(p, n); },
+                old_pool, edit, strings.place(t), str_remap, [&](const char* p, size_t n) { out.put(p, n - 1); },
                 [&](size_t coded, size_t table) {
                     old_behind.passed(coded);
                     table_behind.passed(table_at - table_page + table);

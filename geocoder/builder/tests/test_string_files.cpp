@@ -1,8 +1,8 @@
 // The string tiers' codec (src/string_files.h): random pools (empty strings,
 // strings of the longest length, prefixes shared across bucket cuts) round
 // trip through FCC2 and cut where the rule says; the encoder given its pool in
-// any pieces, the patcher's SpillWriter and the builder's write_file write the
-// same file; a small pool's file is the bytes the format gives
+// any pieces or a whole string at a time, the patcher's SpillWriter and the
+// builder's write_file write the same file; a small pool's file is the bytes the format gives
 // (server/src/strings.rs reads the same ones); and the codec refuses each pool
 // it can't hold and each file it never writes.
 #include "string_files.h"
@@ -165,6 +165,19 @@ TEST(string_files_encoder_writers_and_pieces_write_one_file) {
         w.finish();
     }
     REQUIRE(fclose(out) == 0);
+    // The patcher's way: one whole string at a time.
+    out = fopen((dir.path() + "/put.bin").c_str(), "wb");
+    REQUIRE(out);
+    {
+        string_files::SpillWriter w(out, dir.path() + "/put.table");
+        for (size_t at = 0; at < pool.size();) {
+            const size_t len = strlen(pool.data() + at);
+            w.put(pool.data() + at, len);
+            at += len + 1;
+        }
+        w.finish();
+    }
+    REQUIRE(fclose(out) == 0);
     auto read = [&](const std::string& name) {
         std::vector<uint8_t> v;
         FILE* f = fopen((dir.path() + "/" + name).c_str(), "rb");
@@ -174,6 +187,7 @@ TEST(string_files_encoder_writers_and_pieces_write_one_file) {
     };
     CHECK(read("built.bin") == want);
     CHECK(read("patched.bin") == want);
+    CHECK(read("put.bin") == want);
     CHECK(read("patched.table").empty());  // the spill is gone
     // The empty pool is the footer alone.
     CHECK(encode("") == hex("0000000000000000" "46434332"));
@@ -214,6 +228,13 @@ TEST(string_files_encoder_refuses_pools_it_cant_hold) {
                  e.write("q", 1);
              }),
              too_long);
+    // A whole string put while a piece written leaves a string open.
+    CHECK_EQ(refusal_of([&] {
+                 string_files::Encoder e([](const uint8_t*, size_t, uint32_t) {});
+                 e.write("ab", 2);
+                 e.put("c", 1);
+             }),
+             "A string tier can't hold a string put into the middle of another");
     CHECK_EQ(refusal_of([&] { encode(std::string("a\0b", 3)); }),
              std::string("A string tier can't hold a pool whose last string has no NUL"));
 }
