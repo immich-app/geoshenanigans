@@ -416,6 +416,17 @@ mod tests {
         let mut empty = good.clone();
         empty[6..8].copy_from_slice(&[0, 0]);
         assert_eq!(open(empty), "bucket 0 is empty");
+        let mut no_size = good.clone();
+        no_size[8..10].copy_from_slice(&[0, 0]);
+        assert_eq!(open(no_size), "bucket 0 is empty");
+        // An empty bucket past the first superblock: 18 strings longer than MAX_SPAN, each alone
+        // in its bucket, the last one's size 0.
+        let long: Vec<Vec<u8>> = (0..18u8).map(|i| vec![b'a' + i; 600]).collect();
+        let mut late = encode(&pool_of(&long.iter().map(|s| s.as_slice()).collect::<Vec<_>>()));
+        assert_eq!(u32_at(&late, late.len() - FOOTER), 18, "18 buckets");
+        let e = late.len() - FOOTER - ENTRY;
+        late[e + 2..e + 4].copy_from_slice(&[0, 0]);
+        assert_eq!(open(late), "bucket 17 is empty");
         let mut longer = good.clone();
         longer.insert(0, 1);
         assert_eq!(open(longer), "buckets of 7 bytes in 6 where the footer gives 7 in a body of 7");
@@ -480,19 +491,25 @@ mod tests {
 
     #[test]
     fn a_bucket_of_two_strings_past_its_span_reads_as_empty_past_the_first() {
-        // "a", then a string sharing nothing that ends past MAX_SPAN: the encoder would have cut
-        // before it, so only the first reads.
-        let mut f = vec![0x01, b'a', 0x00, 0xD8, 0x04];
-        f.extend([b'b'; 600]);
-        let size = f.len() as u16;
-        f.extend_from_slice(&603u16.to_le_bytes());
-        f.extend_from_slice(&size.to_le_bytes());
-        f.extend_from_slice(&1u32.to_le_bytes());
-        f.extend_from_slice(&603u32.to_le_bytes());
-        f.extend_from_slice(MAGIC);
-        let t = Tier::open(FileBytes::Owned(f)).unwrap();
-        assert_eq!(t.get(0), "a");
-        assert_eq!(t.get(2), "");
-        assert_eq!(t.get(300), "");
+        // Two buckets the encoder would have cut: "a", then a string sharing nothing that ends
+        // past MAX_SPAN; and a first string of 600 bytes, longer than walk's buffer, then "c".
+        // Only the first string reads: every offset past its NUL reads as "".
+        let long = [b'b'; 600];
+        for (bucket, first) in [
+            ([&[0x01, b'a', 0x00, 0xD8, 0x04][..], &long].concat(), "a"),
+            ([&[0xD8, 0x04][..], &long, &[0x00, 0x01, b'c']].concat(), std::str::from_utf8(&long).unwrap()),
+        ] {
+            let mut f = bucket.clone();
+            f.extend_from_slice(&603u16.to_le_bytes());
+            f.extend_from_slice(&(bucket.len() as u16).to_le_bytes());
+            f.extend_from_slice(&1u32.to_le_bytes());
+            f.extend_from_slice(&603u32.to_le_bytes());
+            f.extend_from_slice(MAGIC);
+            let t = Tier::open(FileBytes::Owned(f)).unwrap();
+            assert_eq!(t.get(0), first);
+            for off in first.len() as u32 + 1..603 {
+                assert_eq!(t.get(off), "", "first {} bytes, offset {off}", first.len());
+            }
+        }
     }
 }
