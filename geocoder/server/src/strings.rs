@@ -88,21 +88,27 @@ impl Tier {
         let (mut raw_starts, mut coded_starts) = (Vec::with_capacity(n), Vec::with_capacity(n));
         let mut jump = Vec::with_capacity((raw_size >> JUMP) as usize + 2);
         let (mut raw, mut coded) = (0u64, 0u64);
-        for (b, e) in f[body..body + table as usize].chunks_exact(ENTRY).enumerate() {
-            if b % SB == 0 {
-                // Each jump entry whose first byte is in a superblock before this one has its index.
-                while (jump.len() as u64) << JUMP < raw && jump.len() < (raw_size >> JUMP) as usize + 2 {
-                    jump.push((b / SB) as u32 - 1);
-                }
-                raw_starts.push(raw as u32);
-                coded_starts.push(coded as u32);
+        for (k, sb) in f[body..body + table as usize].chunks(SB * ENTRY).enumerate() {
+            // Each jump entry whose first byte is in a superblock before this one has its index.
+            while (jump.len() as u64) << JUMP < raw && jump.len() < (raw_size >> JUMP) as usize + 2 {
+                jump.push(k as u32 - 1);
             }
-            let (span, size) = (u16_at(e, 0) as u64, u16_at(e, 2) as u64);
-            if span == 0 || size == 0 {
-                return Err(format!("bucket {b} is empty"));
+            raw_starts.push(raw as u32);
+            coded_starts.push(coded as u32);
+            // A superblock's sums, with no branch per bucket; an empty bucket is found after.
+            let (mut r, mut c, mut empty) = (0u32, 0u32, false);
+            for e in sb.chunks_exact(ENTRY) {
+                let (span, size) = (u16_at(e, 0) as u32, u16_at(e, 2) as u32);
+                empty |= (span == 0) | (size == 0);
+                r += span;
+                c += size;
             }
-            raw += span;
-            coded += size;
+            if empty {
+                let j = sb.chunks_exact(ENTRY).position(|e| u16_at(e, 0) == 0 || u16_at(e, 2) == 0).unwrap_or(0);
+                return Err(format!("bucket {} is empty", k * SB + j));
+            }
+            raw += r as u64;
+            coded += c as u64;
         }
         if raw != raw_size as u64 || coded != body as u64 {
             return Err(format!(
