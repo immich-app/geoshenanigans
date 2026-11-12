@@ -64,7 +64,7 @@ struct Decoder {
         for (size_t p = 0; p < out.size(); p++)
             if (int(p) != port && state[p] != 2 && out[p].size() > MAX_DECODER_SKEW) runs_ahead(port, int(p));
     }
-    size_t read(int port, char* dst, size_t max) {
+    [[gnu::always_inline]] size_t read(int port, char* dst, size_t max) {
         ByteQueue& q = out[size_t(port)];
         const size_t want = std::min(max, READ_AHEAD);
         while (q.size() < want) {
