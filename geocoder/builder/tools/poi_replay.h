@@ -34,7 +34,7 @@ public:
         V_.reset(new gcs::Reader(vp));
         if (V_->size() < poi_files::VERTEX_PAD) poi_files::malformed("poi_vertices.bin is shorter than its pad");
         blocks_end_ = V_->size() - poi_files::VERTEX_PAD;
-        hash_.reset(new ContentHasher(V_->size()));
+        hash_.reset(new LaneHasher(V_->size()));
     }
     uint64_t rows() const { return rows_.footer().rows; }
     uint64_t logical_vertex_bytes() const { return rows_.footer().logical_vertex_bytes; }
@@ -84,7 +84,7 @@ public:
         copy_block([](const uint8_t*, size_t) {});
     }
     // Passes the rows left, checks the files end as the encoder ends them, and returns the V2 file's
-    // hash (content_hash).
+    // hash (lane_hash).
     uint64_t finish() {
         while (i_ < rows()) next();
         pass_block();
@@ -104,7 +104,7 @@ private:
     static constexpr size_t PIECE = 64 << 10;
     poi_files::RowDecoder rows_;
     std::unique_ptr<gcs::Reader> R_, V_;
-    std::unique_ptr<ContentHasher> hash_;
+    std::unique_ptr<LaneHasher> hash_;
     uint64_t i_ = 0, logical_ = 0, blocks_end_ = 0, block_logical_ = 0, block_left_ = 0;
     uint8_t rec_[poi_files::LOGICAL_STRIDE] = {};
     bool block_ = false;

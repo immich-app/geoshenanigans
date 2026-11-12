@@ -689,6 +689,66 @@ TEST(patch_format_content_hasher_equals_content_hash_over_any_split) {
     CHECK_EQ(ContentHasher(0).hash(), one_pass_content_hash(nullptr, 0));
 }
 
+// lane_hash as the patch format defines it, in one pass.
+static uint64_t one_pass_lane_hash(const char* data, size_t n) {
+    auto step = [](uint64_t h, const char* p) {
+        uint64_t w;
+        memcpy(&w, p, 8);
+        h = (h ^ w) * 0xFF51AFD7ED558CCDull;
+        return h ^ (h >> 32);
+    };
+    uint64_t h[4];
+    for (uint64_t i = 0; i < 4; i++) h[i] = (0x9E3779B97F4A7C15ull * (i + 1)) ^ n;
+    std::vector<char> padded(data, data + n);
+    padded.resize(n / 32 * 32 + 32, 0);
+    for (size_t at = 0; at < padded.size(); at += 32)
+        for (size_t i = 0; i < 4; i++) h[i] = step(h[i], padded.data() + at + 8 * i);
+    uint64_t x = h[0];
+    for (size_t i = 1; i < 4; i++) {
+        char w[8];
+        memcpy(w, &h[i], 8);
+        x = step(x, w);
+    }
+    x *= 0xC4CEB9FE1A85EC53ull;
+    return x ^ (x >> 29);
+}
+
+TEST(patch_format_lane_hasher_equals_lane_hash_over_any_split) {
+    // Random bytes of every length up to 200 and a few longer, fed in random
+    // pieces (empty ones too): each hash is the one-pass lane_hash, and a
+    // byte changed or one more zero byte changes it.
+    std::mt19937 rng(20261112);
+    std::vector<size_t> sizes(201);
+    std::iota(sizes.begin(), sizes.end(), size_t(0));
+    for (const size_t n : {size_t(4095), size_t(4096), size_t(65537)}) sizes.push_back(n);
+    size_t wrong = 0, blind = 0;
+    for (const size_t n : sizes) {
+        std::vector<char> data(n);
+        for (char& c : data) c = static_cast<char>(rng());
+        const uint64_t want = one_pass_lane_hash(data.data(), n);
+        CHECK_EQ(lane_hash(data.data(), n), want);
+        for (int split = 0; split < 20; split++) {
+            LaneHasher sut(n);
+            for (size_t at = 0; at < n;) {
+                const size_t piece = std::min<size_t>(n - at, rng() % (split % 2 ? 40 : 3000));
+                sut.update(data.data() + at, piece);
+                at += piece;
+            }
+            wrong += sut.hash() != want;
+        }
+        std::vector<char> longer = data;
+        longer.push_back(0);
+        blind += lane_hash(longer.data(), longer.size()) == want;
+        if (n) {
+            std::vector<char> changed = data;
+            changed[rng() % n] ^= static_cast<char>(1 + rng() % 255);
+            blind += lane_hash(changed.data(), n) == want;
+        }
+    }
+    CHECK_EQ(wrong, size_t(0));
+    CHECK_EQ(blind, size_t(0));
+}
+
 // --- string offset fields ---
 
 TEST(patch_format_string_fields_match_the_record_layouts) {

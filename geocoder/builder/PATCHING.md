@@ -430,9 +430,9 @@ Strings: marker 0xFFFFFFF6 (u32)
   client file, and a listed tier without its bit comes in a per-file section)
   + sent (u32, bit per unshipped tier the dir's old files reference)
   + per tier in order:
-    shipped: old_hash:u64, new_hash:u64 (the FCC2 files': each bucket's
-      bytes then its table entry, then the footer, seeded with the pool's
-      size), n_added:u32, n_deleted:u32,
+    shipped: old_hash:u64, new_hash:u64 (the FCC2 files' lane_hash: each
+      bucket's bytes then its table entry, then the footer, seeded with the
+      pool's size), n_added:u32, n_deleted:u32,
       order:u32 (v9; 0 sorted: both tiers sort and an added string
       goes where it sorts; 1 indexed: the new indices follow the strings),
       [string\0] × n_added, indexed only [new index:u32] × n_added,
@@ -467,8 +467,8 @@ Parent-id remap: marker 0xFFFFFFF3 (u32)
   street_ways pairs as well is refused. At most one such section: the
   patcher refuses a second ("Malformed POI parent-id remap: a second one").
 
-Old POI vertices' hash: marker 0xFFFFFFF8 (u32) + content_hash of the old
-  poi_vertices.bin file (u64), right before the POI records' section of a dir
+Old POI vertices' hash: marker 0xFFFFFFF8 (u32) + lane_hash of the old
+  poi_vertices.bin file (u64; `tools/patch_format.h`), right before the POI records' section of a dir
   with POI files. The patcher replays the POI records and their blocks on R2
   and V2 as they sit (`tools/poi_replay.h`): a new record whose polygon is
   the old record's, one MATCH of its block's logical bytes, at the same lat

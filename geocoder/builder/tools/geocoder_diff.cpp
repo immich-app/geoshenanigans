@@ -1745,7 +1745,7 @@ static int run(int argc, char* argv[]) {
     if (struct stat vst; (res_poi_r.old_size || res_poi_r.new_size) && stat((old_dir + "/poi_vertices.bin").c_str(), &vst) == 0) {
         MappedFile v = mmap_file(old_dir + "/poi_vertices.bin");
         if (!v.data) throw std::runtime_error("Cannot read " + old_dir + "/poi_vertices.bin");
-        const uint64_t h = content_hash(v.data, v.size);
+        const uint64_t h = lane_hash(v.data, v.size);
         unmap_file(v);
         const uint32_t marker = POI_VERTICES_HASH_MARKER;
         patch.insert(patch.end(), reinterpret_cast<const char*>(&marker), reinterpret_cast<const char*>(&marker) + 4);

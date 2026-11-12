@@ -536,6 +536,69 @@ inline uint64_t content_hash(const char* data, size_t n) {
     return h.hash();
 }
 
+// content_hash's step in four lanes, for whole files the patcher hashes as
+// it passes them (lane_hash): a 32-byte stride's words go one to each lane,
+// which run side by side (one lane is a chain of multiplies, so four go about
+// four times as fast), and the lanes and the last stride's bytes (zeros past
+// them) mix at the end. Seeded with the total length n, fed in any split.
+class LaneHasher {
+public:
+    explicit LaneHasher(uint64_t n) {
+        for (uint64_t i = 0; i < LANES; i++) h_[i] = (0x9E3779B97F4A7C15ull * (i + 1)) ^ n;
+    }
+    void update(const char* p, size_t n) {
+        if (n == 0) return;
+        if (carried_ > 0) {
+            const size_t k = std::min(n, STRIDE - carried_);
+            memcpy(carry_ + carried_, p, k);
+            carried_ += k;
+            p += k;
+            n -= k;
+            if (carried_ < STRIDE) return;
+            stride(h_, carry_);
+            carried_ = 0;
+        }
+        uint64_t h[LANES] = {h_[0], h_[1], h_[2], h_[3]};
+        for (; n >= STRIDE; p += STRIDE, n -= STRIDE) stride(h, p);
+        memcpy(h_, h, sizeof h);
+        memcpy(carry_, p, n);
+        carried_ = n;
+    }
+    uint64_t hash() const {
+        uint64_t h[LANES] = {h_[0], h_[1], h_[2], h_[3]};
+        char tail[STRIDE] = {};
+        memcpy(tail, carry_, carried_);
+        stride(h, tail);
+        uint64_t x = h[0];
+        for (size_t i = 1; i < LANES; i++) x = step(x, h[i]);
+        x *= 0xC4CEB9FE1A85EC53ull;
+        return x ^ (x >> 29);
+    }
+
+private:
+    static constexpr size_t LANES = 4, STRIDE = 32;
+    static uint64_t step(uint64_t h, uint64_t w) {
+        h = (h ^ w) * 0xFF51AFD7ED558CCDull;
+        return h ^ (h >> 32);
+    }
+    static void stride(uint64_t* h, const char* p) {
+        for (size_t i = 0; i < LANES; i++) {
+            uint64_t w;
+            memcpy(&w, p + 8 * i, 8);
+            h[i] = step(h[i], w);
+        }
+    }
+    uint64_t h_[LANES];
+    char carry_[STRIDE];
+    size_t carried_ = 0;
+};
+
+inline uint64_t lane_hash(const char* data, size_t n) {
+    LaneHasher h(n);
+    h.update(data, n);
+    return h.hash();
+}
+
 // Sparse position-keyed delta. Stride sentinel that signals the section
 // payload is a list of (position, value) pairs for the positions where
 // new differs from old. Used for files where strategy-2 keeps the index
@@ -669,7 +732,7 @@ inline void close_patch_outputs(std::initializer_list<std::pair<FILE*, std::stri
 // (parse_parent_id_remap).
 static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 
-// The old poi_vertices.bin's hash: marker(4), content_hash of the file (u64),
+// The old poi_vertices.bin's hash: marker(4), lane_hash of the file (u64),
 // right before the POI records' section. The patcher's POI replay
 // (poi_replay.h) copies the old blocks a day leaves whole without decoding
 // them, and checks them by it.
@@ -2185,7 +2248,7 @@ inline StringTierEdit parse_string_tier_edit(const char* data, size_t size, size
 }
 
 // A string tier file's hash, as the strings section carries it (old_hash,
-// new_hash): content_hash, seeded with the pool's size, of each bucket's coded
+// new_hash): lane_hash, seeded with the pool's size, of each bucket's coded
 // bytes then its table entry, bucket by bucket, then the footer. They are the
 // file's bytes in the order a walk passes them, so the patcher hashes the old
 // file and the new one as it passes their buckets once, copied or decoded,
@@ -2207,7 +2270,7 @@ public:
     }
 
 private:
-    ContentHasher h_;
+    LaneHasher h_;
 };
 
 // The hash of a tier's FCC2 file (StringTierHasher), read through its table.
