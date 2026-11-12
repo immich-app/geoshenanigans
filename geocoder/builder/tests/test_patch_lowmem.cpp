@@ -858,7 +858,7 @@ TEST(patch_rebuilds_the_builders_poi_files_on_random_days) {
 // appended, and two polygons past big_block(), one kept and one moved. In every
 // mode the patcher writes the builder's POI files of the new day, byte for
 // byte, copying the blocks of the polygons kept at their place (the log counts
-// them) and encoding the others, their old bytes decoded from the old block
+// them) and encoding the others, their old bytes decoded from the old blocks
 // at hand. A byte flipped in a copied block of the old
 // dir goes through undecoded, and the old poi_vertices.bin's hash refuses it.
 TEST(patch_copies_the_poi_blocks_a_day_leaves_whole) {
@@ -964,8 +964,10 @@ TEST(patch_copies_the_poi_blocks_a_day_leaves_whole) {
     CHECK(copied <= kept_in_place && copied * 10 >= uint64_t(kept_in_place) * 9);
     CHECK(encoded > 30);
     // The old vertex bytes the encoded polygons keep come from the old block
-    // the replay is at, but for a few the vertex merge matched elsewhere.
-    CHECK(at_hand > 0 && by_cursor * 20 <= at_hand);
+    // the replay is at, or from one it passed just before (where the vertex
+    // merge matched a few), none through the vertex cursor.
+    CHECK(at_hand > 0);
+    CHECK_EQ(by_cursor, uint64_t(0));
 
     // A byte flipped in the kept big polygon's block (record 200's, the first
     // vertex past its header): copied, and refused by the hash.

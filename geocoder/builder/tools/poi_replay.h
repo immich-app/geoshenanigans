@@ -5,14 +5,16 @@
 // lat and lng alone (its bbox minimum is stored against them), so a new record whose polygon is,
 // byte for byte, the old record's (its vertex bytes one MATCH of that old block's) at the same
 // lat and lng gets that very block: copied as it is. Every other polygon goes through the codec
-// (gcs::poi::Enc), its old bytes decoded from the old block the replay is at, or else from a cursor
-// that decodes only the blocks it is asked for (gcs::poi::Dec, vertices_only), made when one is. Rows are decoded and encoded again one by one (their string
+// (gcs::poi::Enc), its old bytes decoded from the old block the replay is at or one of those it
+// passed last (read again), or else from a cursor that decodes only the blocks it is asked for
+// (gcs::poi::Dec, vertices_only), made when one is. Rows are decoded and encoded again one by one (their string
 // ids move every day). A copied block is never decoded: the old poi_vertices.bin is hashed as the
 // replay passes it and checked against the diff's hash (POI_VERTICES_HASH_MARKER).
 #pragma once
 
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -42,6 +44,10 @@ public:
     // The next row (the block before it passed when it wasn't copied).
     void next() {
         pass_block();
+        if (block_) {
+            passed_.push_back({block_logical_, block_voff_, blk_});
+            while (passed_.size() > HISTORY_BLOCKS || block_logical_ - passed_.front().logical > HISTORY_BYTES) passed_.pop_front();
+        }
         decoded_ = false;
         if (i_ == rows()) poi_files::malformed("a row past the last");
         bool polygon;
@@ -53,6 +59,7 @@ public:
         block_ = polygon;
         if (!polygon) return;
         const uint64_t left = blocks_end_ - std::min(V_->tell(), blocks_end_);
+        block_voff_ = V_->tell();
         const uint8_t* h = V_->need(poi_files::MAX_BLOCK_HEADER, true);
         blk_ = poi_files::read_block_header(h, size_t(std::min<uint64_t>(left, poi_files::MAX_BLOCK_HEADER)),
                                             poi_files::rd32(rec_), poi_files::rd32(rec_ + 4));
@@ -92,6 +99,33 @@ public:
         decoded_ = true;
         return o;
     }
+    // An old block the replay has read or passed (the row's, or one of those passed last, up to
+    // HISTORY_BYTES of the logical stream back) that holds logical offset at, in its logical form,
+    // decoded from its bytes read again: its start and length, or null.
+    const uint8_t* reread(uint64_t at, uint64_t& start, uint64_t& len) {
+        const Passed* hit = nullptr;
+        Passed row{block_logical_, block_voff_, blk_};
+        if (block_ && !whole() && at >= block_logical_ && at - block_logical_ < blk_.logical_bytes()) hit = &row;
+        for (auto it = passed_.rbegin(); !hit && it != passed_.rend(); ++it)
+            if (at >= it->logical && at - it->logical < it->blk.logical_bytes()) hit = &*it;
+        if (!hit || hit->blk.logical_bytes() > gcs::big_block()) return nullptr;
+        start = hit->logical;
+        len = hit->blk.logical_bytes();
+        if (reread_ok_ && reread_at_ == start) return reread_buf_.data();
+        const size_t bytes = size_t(hit->blk.bytes()), pb = size_t(hit->blk.payload());
+        raw_.resize(bytes + poi_files::VERTEX_PAD);
+        gcs::pread_all(V_->fd, raw_.data(), bytes, hit->voff, V_->path);
+        reread_buf_.resize(size_t(len));
+        uint8_t* o = reread_buf_.data();
+        poi_files::logical_header(hit->blk, o);
+        poi_files::VertexDecoder vd(hit->blk);
+        const uint8_t* pay = raw_.data() + hit->blk.header;
+        vd.decode(pay, pb, hit->blk.m, o + poi_files::LOGICAL_HEADER);
+        vd.finish(pb ? pay[pb - 1] : 0, o + poi_files::LOGICAL_HEADER + hit->blk.m * poi_files::vertex_bytes(hit->blk.encoding));
+        reread_ok_ = true;
+        reread_at_ = start;
+        return o;
+    }
     // The row's block's bytes through out(p, n), a piece at a time, as they are.
     template <typename Out>
     void copy_block(Out out) {
@@ -125,6 +159,18 @@ public:
 
 private:
     static constexpr size_t PIECE = 64 << 10;
+    // The blocks passed last that reread() reads again: a day's changed polygons match bytes of the
+    // few blocks before their own (a planet day: 1,004 reads, none further back than 64 KiB).
+    static constexpr size_t HISTORY_BLOCKS = 1024;
+    static constexpr uint64_t HISTORY_BYTES = 64 << 10;
+    struct Passed {
+        uint64_t logical, voff;
+        poi_files::Block blk;
+    };
+    std::deque<Passed> passed_;
+    uint64_t block_voff_ = 0, reread_at_ = 0;
+    bool reread_ok_ = false;
+    std::vector<uint8_t> raw_, reread_buf_;
     poi_files::RowDecoder rows_;
     std::unique_ptr<gcs::Reader> R_, V_;
     std::unique_ptr<LaneHasher> hash_;
@@ -268,16 +314,19 @@ Result replay(const char* P, size_t patch_size, size_t pos, size_t seq_end, cons
     std::unique_ptr<gcs::poi::Dec> vd;
     uint64_t vd_at = 0;  // the old stream's offset vd reads next
     // k old stream bytes at child.old, at most, to dst: from the old block the replay is at when
-    // they start in it, else from vd. Returns how many.
+    // they start in it, or from one it read or passed last, else from vd. Returns how many.
     auto old_bytes = [&](uint64_t k, char* dst, size_t room) -> size_t {
         const uint64_t at = child.old;
-        if (old.block() && at >= old.block_logical() && at - old.block_logical() < old.block_logical_bytes())
-            if (const uint8_t* lb = old.logical_block()) {
-                const size_t g = size_t(std::min<uint64_t>({k, old.block_logical() + old.block_logical_bytes() - at, room}));
-                memcpy(dst, lb + (at - old.block_logical()), g);
-                r.at_hand += g;
-                return g;
-            }
+        const uint8_t* lb = nullptr;
+        uint64_t start = old.block_logical(), len = old.block_logical_bytes();
+        if (old.block() && at >= start && at - start < len) lb = old.logical_block();
+        if (!lb) lb = old.reread(at, start, len);
+        if (lb) {
+            const size_t g = size_t(std::min<uint64_t>({k, start + len - at, room}));
+            memcpy(dst, lb + (at - start), g);
+            r.at_hand += g;
+            return g;
+        }
         if (!vd) {
             vd.reset(new gcs::poi::Dec(cur_dir));
             vd->vertices_only = true;
