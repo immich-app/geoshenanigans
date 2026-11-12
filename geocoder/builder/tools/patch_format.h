@@ -774,7 +774,7 @@ public:
     }
     uint8_t u8() { return value<uint8_t>("u8"); }
     uint16_t u16() { return value<uint16_t>("u16"); }
-    uint32_t u32() { return value<uint32_t>("u32"); }
+    [[gnu::always_inline]] uint32_t u32() { return value<uint32_t>("u32"); }
     uint64_t u64() { return value<uint64_t>("u64"); }
     // A u32 as a varint (write_varint). One longer than 5 bytes, or of 2^32
     // or more, is malformed.
@@ -2889,8 +2889,9 @@ public:
         return END - first < count ? static_cast<uint32_t>(END - first) : count;
     }
     // Record idx's offset after the fixups, given its old offset; idx below
-    // END, as reach gives them.
-    uint32_t apply(uint32_t idx, uint32_t old) {
+    // END, as reach gives them. Inlined into the replays' record loops, where
+    // it runs per record, wherever else it is called.
+    [[gnu::always_inline]] uint32_t apply(uint32_t idx, uint32_t old) {
         while (value_idx_ < idx) next_value();
         if (value_idx_ == idx) {
             if (old != END) malformed();

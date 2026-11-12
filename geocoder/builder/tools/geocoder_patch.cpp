@@ -359,6 +359,46 @@ private:
     size_t dropped_ = 0;  // a page multiple
 };
 
+// The POI records' merge section at P[seq_at, seq_end) and the vertex section after it, replayed
+// on R2 + V2 as they sit (poi_replay.h), the MATCH records' fields moved as the generic replay
+// moves them; their MATCH and REPLACE runs go to remap (when given). Out of run() and never
+// inlined into it: run()'s own record loops keep the code they had. Writes its log line and the
+// codecs' reports.
+[[gnu::noinline]] static poi_replay::Result replay_poi_section(
+    const char* P, size_t patch_size, size_t seq_at, size_t seq_end, const std::string& cur_dir, const std::string& to,
+    uint64_t old_size, uint64_t new_size, uint32_t file_records_max, uint64_t vertices_hash, bool has_fixups,
+    size_t fixup_off, OffsetFixupReader& fixups, StringFixupReader& string_fixups, const StringRemap& str_remap,
+    const std::vector<size_t>& remap_offs, std::vector<size_t>& remap_hints, RecordRemap* remap) {
+    auto fix = [&](uint8_t* rec, uint64_t old_index, uint32_t k, uint64_t run_first, uint32_t run_count) {
+        if (has_fixups && k < OffsetFixupReader::reach(run_first, run_count)) {
+            uint32_t old_off;
+            memcpy(&old_off, rec + fixup_off, 4);
+            const uint32_t new_off = fixups.apply(static_cast<uint32_t>(old_index), old_off);
+            memcpy(rec + fixup_off, &new_off, 4);
+        }
+        const uint64_t slot = old_index * remap_offs.size();
+        for (size_t f = 0; f < remap_offs.size(); f++) {
+            uint32_t v;
+            memcpy(&v, rec + remap_offs[f], 4);
+            const uint32_t nv = string_fixups.fixes(slot + f) ? string_fixups.take() : str_remap.lookup(v, remap_hints[f]);
+            memcpy(rec + remap_offs[f], &nv, 4);
+        }
+    };
+    const poi_replay::Result r = poi_replay::replay(
+        P, patch_size, seq_at, seq_end, cur_dir, to, old_size, new_size, file_records_max, vertices_hash, fix,
+        [&](uint64_t o, uint64_t n, uint32_t count) {
+            if (remap) remap->add_match(static_cast<uint32_t>(o), static_cast<uint32_t>(n), count);
+        });
+    std::cerr << "  poi_vertices.bin: " << r.vertex_bytes << " bytes, replayed with poi_records.bin: blocks " << r.copied
+              << " copied, " << r.encoded << " encoded; old vertex bytes " << r.at_hand << " at hand, " << r.by_cursor
+              << " by the cursor" << std::endl;
+    gcs::store().report.push_back("decode poi: queue peaks " + std::to_string(r.decode_peaks[0]) + " " +
+                                  std::to_string(r.decode_peaks[1]) + " B");
+    gcs::store().report.push_back("encode poi: queue peaks " + std::to_string(r.encode_peaks[0]) + " " +
+                                  std::to_string(r.encode_peaks[1]) + " B");
+    return r;
+}
+
 static int run(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << "Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--threads] [--file-records-max N]"
@@ -968,40 +1008,15 @@ static int run(int argc, char* argv[]) {
             const uint64_t n_old_records = old_size / actual_stride;
             const bool track = is_remapped_record_file(file_id);
             RecordRemap remap(track ? static_cast<uint32_t>(n_old_records) : 0, tmpdir);
-            // A MATCH record's string fields and vertex_offset, as the generic replay moves them.
-            auto fix = [&](uint8_t* rec, uint64_t old_index, uint32_t k, uint64_t run_first, uint32_t run_count) {
-                if (has_fixups && k < OffsetFixupReader::reach(run_first, run_count)) {
-                    uint32_t old_off;
-                    memcpy(&old_off, rec + fixup_off, 4);
-                    const uint32_t new_off = fixups.apply(static_cast<uint32_t>(old_index), old_off);
-                    memcpy(rec + fixup_off, &new_off, 4);
-                }
-                const uint64_t slot = old_index * remap_offs.size();
-                for (size_t f = 0; f < remap_offs.size(); f++) {
-                    uint32_t v;
-                    memcpy(&v, rec + remap_offs[f], 4);
-                    const uint32_t nv = string_fixups.fixes(slot + f) ? string_fixups.take() : str_remap.lookup(v, remap_hints[f]);
-                    memcpy(rec + remap_offs[f], &nv, 4);
-                }
-            };
-            const std::string to = listed.count(fname) ? out_dir : tmpdir;
-            const poi_replay::Result r = poi_replay::replay(
-                P, patch_size, seq_at, seq_end, cur_dir, to, old_size, new_size, file_records_max, *poi_vertices_hash, fix,
-                [&](uint64_t o, uint64_t n, uint32_t count) {
-                    if (track) remap.add_match(static_cast<uint32_t>(o), static_cast<uint32_t>(n), count);
-                });
+            const poi_replay::Result r = replay_poi_section(
+                P, patch_size, seq_at, seq_end, cur_dir, listed.count(fname) ? out_dir : tmpdir, old_size, new_size,
+                file_records_max, *poi_vertices_hash, has_fixups, fixup_off, fixups, string_fixups, str_remap, remap_offs,
+                remap_hints, track ? &remap : nullptr);
             fixups.finish(n_old_records);
             string_fixups.finish();
             if (r.child.kind == poi_replay::ChildOps::MERGE)
                 merge_seqs[(uint32_t)PatchFileId::POI_VERTICES] = {r.child.seq, r.child.seq_end - r.child.seq, 1};
             pos = r.child.section_end;
-            std::cerr << "  poi_vertices.bin: " << r.vertex_bytes << " bytes, replayed with poi_records.bin: blocks "
-                      << r.copied << " copied, " << r.encoded << " encoded; old vertex bytes " << r.at_hand << " at hand, "
-                      << r.by_cursor << " by the cursor" << std::endl;
-            gcs::store().report.push_back("decode poi: queue peaks " + std::to_string(r.decode_peaks[0]) + " " +
-                                          std::to_string(r.decode_peaks[1]) + " B");
-            gcs::store().report.push_back("encode poi: queue peaks " + std::to_string(r.encode_peaks[0]) + " " +
-                                          std::to_string(r.encode_peaks[1]) + " B");
             if (track) remap.finish_runs();
             const std::string fixed_strings =
                 n_string_fixups > 0 ? ", " + std::to_string(n_string_fixups) + " string fixups" : std::string();
