@@ -56,6 +56,52 @@ function adminIndex(cell, id) {
   return [cells, entries];
 }
 
+// A string tier as the builder writes it (builder/src/string_files.h): FCC2, the strings
+// front-coded in buckets cut by content, the bucket table and the footer after them.
+function fcc2(strings) {
+  const fnv = (b) => {
+    let h = 0xcbf29ce484222325n;
+    for (const c of b) h = ((h ^ BigInt(c)) * 0x100000001b3n) & 0xffffffffffffffffn;
+    return h;
+  };
+  const vint = (v) => {
+    const o = [];
+    for (; v >= 0x80; v >>>= 7) o.push((v & 0x7f) | 0x80);
+    o.push(v);
+    return Buffer.from(o);
+  };
+  const body = [];
+  const table = [];
+  let bucket = [];
+  let span = 0;
+  let prev = null;
+  let buckets = 0;
+  let raw = 0;
+  const flush = () => {
+    const b = Buffer.concat(bucket);
+    body.push(b);
+    table.push(u16(span), u16(b.length));
+    bucket = [];
+    span = 0;
+    buckets++;
+  };
+  for (const s of strings) {
+    if (span && (span + s.length + 1 > 512 || (span >= 128 && (fnv(s) >> 32n) % 8n === 0n))) flush();
+    if (!span) {
+      bucket.push(vint(s.length), s);
+    } else {
+      let l = 0;
+      while (l < Math.min(s.length, prev.length) && s[l] === prev[l]) l++;
+      bucket.push(vint(l), vint(s.length - l), s.subarray(l));
+    }
+    prev = s;
+    span += s.length + 1;
+    raw += s.length + 1;
+  }
+  if (span) flush();
+  return Buffer.concat([...body, ...table, u32(buckets), u32(raw), Buffer.from('FCC2')]);
+}
+
 // A dataset as the builder writes one: a country boundary, listed in the admin cell of
 // COUNTRY_CELL, and two places named `names`.
 function writeDataset(dir, names) {
@@ -63,9 +109,9 @@ function writeDataset(dir, names) {
   let size = 0;
   const string = (s) => {
     const at = size;
-    const bytes = Buffer.from(`${s}\0`);
+    const bytes = Buffer.from(s);
     strings.push(bytes);
-    size += bytes.length;
+    size += bytes.length + 1;
     return at;
   };
   const country = string('Testland');
@@ -91,7 +137,7 @@ function writeDataset(dir, names) {
     'admin_cells.bin': adminCells,
     'admin_entries.bin': adminEntries,
     'place_nodes.bin': nodes,
-    'strings_core.bin': Buffer.concat(strings),
+    'strings_core.bin': fcc2(strings),
     'strings_layout.json': JSON.stringify({ tiers }),
   };
   for (const [name, bytes] of Object.entries(files)) {

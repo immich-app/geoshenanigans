@@ -21,6 +21,7 @@
 #include "admin_rank_config.h"
 #include "cell_index.h"
 #include "parsed_data.h"
+#include "string_files.h"
 #include "test_framework.h"
 #include "types.h"
 
@@ -37,6 +38,15 @@ struct TempDir {
 std::vector<char> file_bytes(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+}
+
+// A string tier's pool, decoded from its FCC2 file (string_files.h).
+std::vector<char> pool_bytes(const std::string& path) {
+    const std::vector<char> f = file_bytes(path);
+    std::vector<char> pool;
+    string_files::decode(reinterpret_cast<const uint8_t*>(f.data()), f.size(),
+                         [&](const char* p, size_t n) { pool.insert(pool.end(), p, p + n); });
+    return pool;
 }
 
 template <class Record>
@@ -67,7 +77,7 @@ std::vector<std::pair<uint32_t, uint32_t>> layout_of(const std::string& dir) {
 // strings (StringPool::get): "" for NO_DATA or an offset no tier of the dir
 // holds.
 std::string name_in(const std::string& dir, uint32_t offset) {
-    const std::vector<char> core = file_bytes(dir + "/strings_core.bin");
+    const std::vector<char> core = pool_bytes(dir + "/strings_core.bin");
     const auto tiers = layout_of(dir);
     REQUIRE(!tiers.empty());
     if (offset == NO_DATA || offset < tiers[0].first || offset >= tiers[0].second) return "";
@@ -229,9 +239,9 @@ TEST(admin_minimal_ships_only_the_core_strings_its_records_name) {
     // Its kept polygons' and place nodes' names, in the shared core's order;
     // not the dropped borough's, quarter's or suburb's, nor the POI's that
     // a street shares.
-    CHECK(strings_of(file_bytes(r.own_dir + "/strings_core.bin")) ==
+    CHECK(strings_of(pool_bytes(r.own_dir + "/strings_core.bin")) ==
           (std::vector<std::string>{"Atlantis", "Ford", "Harbour", "Mill", "Northern State"}));
-    const uint32_t size = static_cast<uint32_t>(file_bytes(r.own_dir + "/strings_core.bin").size());
+    const uint32_t size = static_cast<uint32_t>(pool_bytes(r.own_dir + "/strings_core.bin").size());
     CHECK(layout_of(r.own_dir) == (std::vector<std::pair<uint32_t, uint32_t>>{
                                   {0, size}, {size, size}, {size, size}, {size, size}, {size, size}}));
 
@@ -307,7 +317,7 @@ TEST(admin_minimal_poi_places_name_the_shared_slots_and_strings) {
     const size_t kept_places[] = {Region::HARBOUR_CITY, Region::MILL_VILLAGE, Region::FORD_HAMLET,
                                   Region::ATLANTIS_TOWN, Region::PLACE_TOMBSTONE};
     for (size_t k = 0; k < places.size(); k++) CHECK_EQ(places[k].name_id, r.data.place_nodes[kept_places[k]].name_id);
-    CHECK(file_bytes(r.poi_dir + "/strings_core.bin") == r.data.strings_tiers[0]);
+    CHECK(pool_bytes(r.poi_dir + "/strings_core.bin") == r.data.strings_tiers[0]);
     std::vector<std::pair<uint32_t, uint32_t>> bases;
     for (size_t t = 0; t < STR_TIER_COUNT; t++)
         bases.push_back({r.data.strings_tier_bases[t], r.data.strings_tier_bases[t + 1]});

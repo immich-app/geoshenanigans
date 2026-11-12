@@ -101,7 +101,7 @@ impl Iso {
             if ap.admin_level == 2 {
                 iso.country.entry(cc).or_default().extend(codes);
             } else {
-                iso.state.entry((cc, normalize(geo.get_string(ap.name_id)))).or_default().extend(codes);
+                iso.state.entry((cc, normalize(&geo.get_string(ap.name_id)))).or_default().extend(codes);
             }
         }
         Ok(iso)

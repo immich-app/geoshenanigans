@@ -147,6 +147,7 @@ PoiSet poi_set(const std::vector<PoiSpec>& specs, std::mt19937& rng) {
     for (const PoiSpec& sp : specs) {
         uint8_t r[36];
         for (auto& b : r) b = uint8_t(rng());
+        wr32(r + 32, rng() % 0xFFFFFF);  // parent_poly_id: R2 holds 24 bits
         if (!sp.vc) {
             wr32(r + 8, NO);
             wr32(r + 12, 0);
@@ -181,9 +182,9 @@ PoiSet poi_set(std::mt19937& rng) {
 }
 
 // Encodes a POI set record by record (each record, then its vertex block, in
-// odd-sized pieces) into dir; returns the manifest.
-Manifest encode_poi(const PoiSet& s, const std::string& dir, std::mt19937& rng) {
-    poly::PoiEnc enc(dir);
+// odd-sized pieces) into dir.
+void encode_poi(const PoiSet& s, const std::string& dir, std::mt19937& rng) {
+    poi::Enc enc(dir);
     enc.state = {1, 1};
     size_t vp = 0;
     for (size_t i = 0; i < s.recs.size() / 36; i++) {
@@ -195,7 +196,14 @@ Manifest encode_poi(const PoiSet& s, const std::string& dir, std::mt19937& rng) 
         write_in_pieces(enc, 1, &s.verts[vp], bs, rng, 997);
         vp += bs;
     }
-    return finish_all(enc);
+    finish_all(enc);
+}
+
+// The POI files the builder writes for a set (poi_files::Writer).
+std::map<std::string, std::vector<char>> poi_files_of(const PoiSet& s) {
+    const poi_files::Files f = poi_files::encode(s.recs.data(), s.recs.size() / 36, s.verts.data(), s.verts.size());
+    return {{"poi_records.bin", std::vector<char>(f.records.begin(), f.records.end())},
+            {"poi_vertices.bin", std::vector<char>(f.vertices.begin(), f.vertices.end())}};
 }
 
 // Sets big_block() for one scope.
@@ -425,66 +433,68 @@ TEST(gcs_dictionary_encoder_writes_fewer_than_0xffff_values) {
     }
 }
 
-TEST(gcs_poi_round_trip_in_memory_and_by_planes) {
-    // Blocks up to big_block() are laid out in memory, larger ones plane by
-    // plane through positional writers (the open-ring relayout included):
-    // both paths must write the same files and decode to the input.
+TEST(gcs_poi_round_trip_whole_and_in_pieces) {
+    // Blocks up to big_block() are encoded and decoded whole, larger ones a
+    // piece at a time (the encoder's packed in place in the new file): both
+    // ways write the builder's files and decode to the input.
     std::mt19937 rng(20261018);
     const PoiSet s = poi_set(rng);
-    ScratchDir mem("gcs-test"), planes("gcs-test");
-    Manifest m_mem, m_planes;
+    ScratchDir whole("gcs-test"), pieces("gcs-test");
     {
         std::mt19937 feed(1);
-        m_mem = encode_poi(s, mem.path(), feed);
+        encode_poi(s, whole.path(), feed);
     }
     {
         BigBlock small(64);
         std::mt19937 feed(2);
-        m_planes = encode_poi(s, planes.path(), feed);
+        encode_poi(s, pieces.path(), feed);
     }
-    CHECK(m_mem.kv == m_planes.kv);
-    for (const char* f : {"poi_records.r3", "poi_vertices.bopen"}) {
-        const std::vector<char> a = slurp(mem.path() + "/" + f), b = slurp(planes.path() + "/" + f);
-        CHECK(!a.empty());
-        CHECK(a == b);
-    }
+    CHECK(dir_files(whole.path()) == poi_files_of(s));
+    CHECK(dir_files(pieces.path()) == poi_files_of(s));
     for (size_t b : {big_block(), size_t(64)}) {
         BigBlock bb(b);
-        poly::PoiDec dec(mem.path(), m_mem);
+        poi::Dec dec(whole.path());
         const auto out = decode_all(dec);
         CHECK(out[0] == s.recs);
         CHECK(out[1] == s.verts);
     }
 }
 
-TEST(gcs_poi_decoder_rejects_blocks_the_encoder_never_writes) {
-    // One POI record at offset 0 whose block is all of poi_vertices.bopen: a
-    // header without a stored vertex, with the closing flag (whose closing
-    // vertex would be copied from a vertex never decoded) or without it, and
-    // 2^32 stored vertices (a sparse file), more than the record's u32
-    // vertex_count holds (and, on a 32-bit build, its size_t). Rejected by
-    // the header before the block is sized or the record emitted; a block of
-    // one vertex decodes.
+TEST(gcs_poi_decoder_refuses_blocks_the_encoder_never_writes) {
+    // One polygon record whose block is all of poi_vertices.bin but its pad:
+    // a block of no stored vertex, one of 2^32 stored vertices (more than the
+    // record's u32 vertex_count holds), one whose vertices run past the
+    // file, and one of 65,535 stored vertices of no bits (a closed block, all
+    // equal: past big_block(), in 8 bytes of the file) whose logical bytes run
+    // past the footer's 14. Refused by the header before the block is sized
+    // or the record emitted; a block of one vertex decodes.
     struct Case {
-        uint8_t flag;
-        uint64_t bytes;
+        std::vector<uint8_t> block;
         const char* error;  // nullptr: decodes
     };
-    const Case cases[] = {{0, 14, nullptr},
-                          {1, 10, "gcs: poi 0: block with no stored vertex"},
-                          {0, 10, "gcs: poi 0: block with no stored vertex"},
-                          {0, 10 + (uint64_t(4) << 32), "gcs: poi 0: block of more vertices than a record holds"}};
+    const Case cases[] = {{{0, 1, 0, 0, 1, 2, 0b101}, nullptr},
+                          {{0, 0, 0, 0, 16, 16}, "Malformed POI files: a block of no vertices"},
+                          {{0, 0x80, 0x80, 0x80, 0x80, 0x10, 0, 0, 16, 16}, "Malformed POI files: a block of more vertices than a record holds"},
+                          {{0, 0xFF, 0xFF, 0x03, 0, 0, 16, 16}, "Malformed POI files: row 0: a block past the end of poi_vertices.bin"},
+                          {{4, 0xFF, 0xFF, 0x03, 0, 0, 0, 0}, "Malformed POI files: row 0: a block past the footer's vertex stream of 14 bytes"}};
     for (const Case& c : cases) {
         ScratchDir dir("gcs-test");
-        std::vector<uint8_t> rec = le(7, 8);
-        for (uint8_t b : le(0, 4)) rec.push_back(b);
-        rec.resize(32, 0);
-        write_bytes(dir.path() + "/poi_records.r3", rec);
-        write_bytes(dir.path() + "/poi_vertices.bopen", {0, c.flag});
-        std::filesystem::resize_file(dir.path() + "/poi_vertices.bopen", c.bytes);
-        Manifest m;
-        m.set("poi.n", 1);
-        poly::PoiDec dec(dir.path(), m);
+        std::vector<uint8_t> row(27, 0), tail;
+        wr32(&row[12], 7);                          // name_id
+        row[20] = row[21] = row[22] = 0xFF;         // no parent polygon
+        row[23] = row[24] = 0xFF;                   // no postcode
+        for (uint8_t b : {0, 0, 0, 0, 1}) tail.push_back(b);  // the one combo: a polygon
+        for (uint8_t b : le(1, 4)) tail.push_back(b);
+        for (uint8_t b : le(1, 4)) tail.push_back(b);
+        for (uint8_t b : le(0, 4)) tail.push_back(b);
+        for (uint8_t b : le(14, 8)) tail.push_back(b);
+        for (uint8_t b : {'P', 'O', 'R', '2'}) tail.push_back(b);
+        row.insert(row.end(), tail.begin(), tail.end());
+        write_bytes(dir.path() + "/poi_records.bin", row);
+        std::vector<uint8_t> v = c.block;
+        v.resize(v.size() + 8, 0);
+        write_bytes(dir.path() + "/poi_vertices.bin", v);
+        poi::Dec dec(dir.path());
         dec.state = {1, 1};
 
         if (!c.error) {
@@ -499,25 +509,25 @@ TEST(gcs_poi_decoder_rejects_blocks_the_encoder_never_writes) {
 TEST(gcs_encoder_queues_one_large_write_a_piece_at_a_time) {
     // poi_vertices.bin of 1 MiB and of 10 MiB, each in one write after the
     // records (as the patcher's FILE passes a long write), of small blocks,
-    // blocks just under big_block() (taken whole) and just past it (plane by
-    // plane): at both sizes the vertices' queue peaks at no more than a piece
+    // blocks just under big_block() (taken whole) and just past it (packed in
+    // place): at both sizes the vertices' queue peaks at no more than a piece
     // of the write (64 KiB) and a block taken whole (256 KiB), and the files
     // are those of a write in odd-sized pieces. The patch's file sizes are
     // given, so a unit is checked against the bytes left from where it starts.
-    const uint32_t whole = uint32_t((big_block() - 10) / 8), planes = whole + 2;
+    const uint32_t whole = uint32_t((big_block() - 10) / 8), in_place = whole + 2;
     std::mt19937 rng(20261030);
     for (const size_t mib : {1, 10}) {
         std::vector<PoiSpec> specs;
         for (size_t k = 0, bytes = 0; bytes < (mib << 20); k++) {
             const PoiSpec sp = k % 64 == 7    ? PoiSpec{whole, 4, false}
-                               : k % 64 == 40 ? PoiSpec{planes, 4, k % 128 == 40}
+                               : k % 64 == 40 ? PoiSpec{in_place, 4, k % 128 == 40}
                                               : PoiSpec{1 + uint32_t(rng() % 500), k % 2 ? 4 : 2, k % 3 == 0};
             specs.push_back(sp);
             bytes += 10 + size_t(sp.vc) * 2 * size_t(sp.w);
         }
         const PoiSet s = poi_set(specs, rng);
         ScratchDir one("gcs-test"), pieces("gcs-test");
-        poly::PoiEnc enc(one.path());
+        poi::Enc enc(one.path());
         enc.state = {1, 1};
         enc.expect = {s.recs.size(), s.verts.size()};
         enc.write(0, s.recs.data(), s.recs.size());
@@ -754,7 +764,7 @@ TEST(gcs_encoders_refuse_a_unit_past_the_end_of_its_file) {
         std::vector<uint8_t> rec(36, 0);
         wr32(&rec[8], 0);
         wr32(&rec[12], 0x40000000);
-        poly::PoiEnc enc(dir.path());
+        poi::Enc enc(dir.path());
         enc.state = {1, 1};
         enc.expect = {rec.size(), ten.size()};
         enc.write(0, rec.data(), rec.size());

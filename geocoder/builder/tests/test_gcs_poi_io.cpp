@@ -1,7 +1,7 @@
 // The POI codec (tools/gcs_codec.h) round trips while every positional read
 // and write of the process is interrupted (EINTR) or cut short in turn: the
-// big blocks' plane relocation (open rings) and header writes go on where a
-// transfer stopped, as the buffered readers and writers do. geocoder-tests is
+// big blocks' raw vertices, their read back and their packing in place go on
+// where a transfer stopped, as the buffered readers and writers do. geocoder-tests is
 // built with _FILE_OFFSET_BITS=64, where pread / pwrite are pread64 /
 // pwrite64: this file's definitions replace libc's for the whole process, and
 // pass every call through untouched unless a test arms them.
@@ -12,6 +12,7 @@
 #include <sys/syscall.h>
 #include <vector>
 
+#include "patch_format.h"
 #include "scratch_dir.h"
 #include "test_framework.h"
 
@@ -69,12 +70,13 @@ TEST(gcs_poi_round_trip_through_interrupted_and_short_positional_io) {
     std::mt19937 rng(20261027);
     std::vector<uint8_t> recs, verts;
     struct Spec { uint32_t vc; int w; bool closed; };
-    // Past big_block (256 KiB): open rings of both widths (relocated planes), closed ones (header only).
+    // Past big_block (256 KiB): open and closed rings of both widths, packed in place.
     const Spec specs[] = {{0, 0, false},      {70000, 2, false}, {5, 2, true},       {70000, 4, false}, {80000, 2, true},
                           {0, 0, false},      {100000, 4, true}, {65537, 4, false},  {7, 4, false}};
     for (const Spec& sp : specs) {
         uint8_t r[36];
         for (auto& b : r) b = uint8_t(rng());
+        wr32(r + 32, rng() % 0xFFFFFF);  // parent_poly_id: R2 holds 24 bits
         if (!sp.vc) {
             wr32(r + 8, NO);
             wr32(r + 12, 0);
@@ -102,7 +104,7 @@ TEST(gcs_poi_round_trip_through_interrupted_and_short_positional_io) {
     std::vector<uint8_t> got_recs, got_verts;
     {
         Armed scope;
-        poly::PoiEnc enc(dir.path());
+        poi::Enc enc(dir.path());
         enc.state = {1, 1};
         size_t vp = 0;
         for (size_t i = 0; i < recs.size() / 36; i++) {
@@ -121,7 +123,7 @@ TEST(gcs_poi_round_trip_through_interrupted_and_short_positional_io) {
         enc.pump();
         Manifest m;
         enc.finish(m);
-        poly::PoiDec dec(dir.path(), m);
+        poi::Dec dec(dir.path());
         dec.state = {1, 1};
         while (dec.step()) {}
         got_recs.assign(dec.out[0].data(), dec.out[0].data() + dec.out[0].size());
@@ -129,6 +131,9 @@ TEST(gcs_poi_round_trip_through_interrupted_and_short_positional_io) {
     }
     CHECK(got_recs == recs);
     CHECK(got_verts == verts);
+    const poi_files::Files want = poi_files::encode(recs.data(), recs.size() / 36, verts.data(), verts.size());
+    CHECK(read_file(dir.path() + "/poi_records.bin") == std::vector<char>(want.records.begin(), want.records.end()));
+    CHECK(read_file(dir.path() + "/poi_vertices.bin") == std::vector<char>(want.vertices.begin(), want.vertices.end()));
     CHECK(interrupted > 0);
     CHECK(cut > 0);
 }

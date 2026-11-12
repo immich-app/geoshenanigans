@@ -142,7 +142,11 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 - **build-index** (`src/build_index.cpp`): Builder with deterministic ordering. It builds into a
   new or empty output dir and refuses any other, since every file there is diffed and published
   as the build's
-- **geocoder-diff** (`tools/geocoder_diff.cpp`): Compares two builds, produces `.gcpatch`
+- **geocoder-diff** (`tools/geocoder_diff.cpp`): Compares two builds, produces `.gcpatch`. The
+  POI files are R2 records and V2 polygon blocks on disk (`src/poi_files.h`); the diff decodes both
+  days' into their logical form (today's 36-byte records and vertex stream) and merges those.
+  The string tiers are FCC2 files, front-coded buckets cut by content (`src/string_files.h`);
+  the diff decodes each tier it reads into its pool and diffs the pools
 - **geocoder-patch** (`tools/geocoder_patch.cpp`): Applies patch, produces new build. It links
   the static libzstd (`libzstd.a`) and decompresses the patch in process;
   `cmake -DGEOCODER_PATCH_LIBZSTD=OFF` builds it on the `zstd` command on PATH instead, for a host
@@ -150,13 +154,15 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 - **patch_format.h** (`tools/patch_format.h`): Shared format definitions + rebuild functions
 - **geocoder-gc** (`tools/gc.cpp`, `tools/gc_*.h`): Encodes a variant dir into the compact installed
   set (the encoded files and a `gc.manifest`) and decodes one back to today's files, byte for byte,
-  each into a new or empty dir
+  each into a new or empty dir. The POI files are compact in every dir, and it links them as they
+  are
 - **gcs_\*.h** (`tools/gcs_patch.h`, `gcs_codec.h`, `gcs_io.h`, `gcs_async.h`): geocoder-patch's
-  low-memory mode. When the old dir is an encoded installed set (a `gc.manifest` beside the files,
-  as geocoder-gc writes it), the encoded families' old files are decoded and their new files
-  encoded in process, a family's records and their child stream replay together, and the output
-  is the new encoded set, geocoder-gc's encoding of the new dir; `--threads` gives each codec a
-  thread
+  in-process codecs. The POI files are decoded and their new ones encoded in every dir (one record
+  and one polygon in flight; a polygon past 256 KiB a piece at a time). In low-memory mode, when
+  the old dir is an encoded installed set (a `gc.manifest` beside the files, as geocoder-gc writes
+  it), gc's families too, and the output is the new encoded set, geocoder-gc's encoding of the new
+  dir. An encoded family's records and their child stream replay together; `--threads` gives each
+  codec a thread
 
 ### Patcher memory and speed
 
@@ -254,7 +260,7 @@ and 1450 s in 32 MiB (19.2 GiB).
 
 **Patch tool:**
 1. Decompress zstd
-2. Read the strings section → rebuild each shipped tier from the dir's own old tier + additions/deletions in one walk, which also derives its remap runs and hashes the old tier as it reads it and the new one as it writes it (a stale old tier is named as such even when the edit doesn't fit it); take the sent runs of unshipped tiers and the moved-string pairs as they come (v12: past 65,536 moved strings the patch sends no pair, and the merge sections carry the moved strings' new values for the fields that hold them, read in record order)
+2. Read the strings section → rebuild each shipped tier from the dir's own old tier + additions/deletions in one walk, which copies the old buckets the edit leaves whole as they are, decodes the others, derives its remap runs, and hashes the old tier file as it passes it and the new one as it writes it (a stale old tier is named as such even when the edit doesn't fit it); take the sent runs of unshipped tiers and the moved-string pairs as they come (v12: past 65,536 moved strings the patch sends no pair, and the merge sections carry the moved strings' new values for the fields that hold them, read in record order)
 3. For each data file: apply string remap (or a string fixup) + offset fixups to old, replay merge sequence → output file, track ID mapping from MATCH ops
 4. Read secondary ID remaps → each replayed file's moved pairs, read where they sit, beside its derived ID mappings
 5. Read cell changes (added/removed cell IDs) and the per-cell entry deltas
@@ -301,9 +307,20 @@ build shares one global string layout, so each tier's offsets are the sum of
 the tier sizes before it, which the patch carries.
 
 - **Shipped tier**: a `strings_<tier>.bin` the old and new dir both hold
-  (empty files count). The patch sends its string diff and size and hash
-  stamps; the patcher rebuilds it and derives its remap runs from the same
-  walk. The tiers are
+  (empty pools count). The patch sends its pool's string diff and size and
+  its files' hash stamps; the patcher rebuilds it and derives its remap runs
+  from the same walk. The walk passes the old FCC2 file a bucket at a time
+  (`string_files::Decoder`), giving back the pages of its body and of its
+  bucket table behind it, and encodes the new pool as it writes it, one
+  bucket in memory, its bucket table set aside in the scratch dir until the
+  body ends (`string_files::SpillWriter`); the encoding is canonical, so the
+  new file is the builder's byte for byte. A bucket cut ends where the bucket
+  so far and the next string say, and nothing passes a cut, so an old bucket
+  whose strings the edit keeps, with nothing added among or right after them
+  and its next string kept, is the bucket the encoder would make wherever it
+  starts one: the walk copies it as it is, undecoded (its bytes checked by
+  the old file's hash), and decodes only the buckets around the edits (a
+  planet day: a few thousand of a tier's buckets). The tiers are
   sorted alphabetically except the POI tier, which is in POI record order
   (the names of POI tier 0, 1, 2, 3 in turn, each at its first record of
   that tier, so a reader walking the records reads the names front to
@@ -413,8 +430,10 @@ Strings: marker 0xFFFFFFF6 (u32)
   client file, and a listed tier without its bit comes in a per-file section)
   + sent (u32, bit per unshipped tier the dir's old files reference)
   + per tier in order:
-    shipped: old_hash:u64, new_hash:u64, n_added:u32, n_deleted:u32,
-      order:u32 (v9; 0 sorted: the new tier sorts and an added string
+    shipped: old_hash:u64, new_hash:u64 (the FCC2 files' lane_hash: each
+      bucket's bytes then its table entry, then the footer, seeded with the
+      pool's size), n_added:u32, n_deleted:u32,
+      order:u32 (v9; 0 sorted: both tiers sort and an added string
       goes where it sorts; 1 indexed: the new indices follow the strings),
       [string\0] × n_added, indexed only [new index:u32] × n_added,
       [old index:u32] × n_deleted (indices and a sorted tier's added
@@ -447,6 +466,19 @@ Parent-id remap: marker 0xFFFFFFF3 (u32)
   remap's pairs as it sits, and a patch whose secondary remap gives
   street_ways pairs as well is refused. At most one such section: the
   patcher refuses a second ("Malformed POI parent-id remap: a second one").
+
+Old POI vertices' hash: marker 0xFFFFFFF8 (u32) + lane_hash of the old
+  poi_vertices.bin file (u64; `tools/patch_format.h`), right before the POI records' section of a dir
+  with POI files. The patcher replays the POI records and their blocks on R2
+  and V2 as they sit (`tools/poi_replay.h`): a new record whose polygon is
+  the old record's, one MATCH of its block's logical bytes, at the same lat
+  and lng, gets that block as it is (a V2 block is a function of its polygon
+  and its record's lat and lng alone); every other polygon is decoded from
+  the old file (the blocks asked for alone) and encoded again, and every row
+  decoded and encoded again (its string ids move). The copied blocks are
+  never decoded: the replay hashes the old file as it passes it and refuses
+  one of another hash ("Old poi_vertices.bin is not the one the patch was
+  made from"), and a POI records section without the hash before it.
 
 Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64) + ...
   (the patcher refuses an old file of another size, 0 meaning absent)
@@ -487,8 +519,9 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   position: its MATCH bytes are the old bytes of the parent records at the
   same places, a MATCH or REPLACE record's own or, where a DELETE run is
   followed by an INSERT run, the deleted record's for the inserted one at the
-  same place in the run. The low-memory mode decodes both files from one
-  stream, and refuses a replay that reads one of them 4 MiB
+  same place in the run. An encoded family (the POI files in every dir,
+  gc's in low-memory mode) decodes both files from one stream, and the
+  patcher refuses a replay that reads one of them 4 MiB
   (MAX_DECODER_SKEW) ahead of the other ("Malformed merge sequence: <file>
   runs ahead of <file>").
   Offset fixups (node_offset / vertex_offset of MATCH records, see
@@ -624,8 +657,8 @@ layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
 | 8 | `geo_cells.bin` | geo cell changes (0xFFFFFFFB), rebuilt with `geo_entries.bin` (35) beside the geo entry deltas |
 | 9-11 | the geo index's street, address and interpolation lists (no files of their own since GXT2: a file section naming one is refused) | geo entry deltas (0xFFFFFFF0) |
 | 12, 13 | `admin_cells.bin`, `admin_entries.bin` | admin cell changes (0xFFFFFFFA) and a cell index delta (0xFFFFFFF7), over the old index's ids as they are (v14) |
-| 14 | `poi_records.bin` | merge at stride 36, string fields `name_id`, `parent_street_id` and `parent_postcode_id` |
-| 15 | `poi_vertices.bin` | child stream of poi_records, at stride 1 |
+| 14 | `poi_records.bin` | merge of the logical records (R2 decoded) at stride 36, string fields `name_id`, `parent_street_id` and `parent_postcode_id`; the client list gives the R2 file's size |
+| 15 | `poi_vertices.bin` | child stream of poi_records, of the logical vertex stream (V2 decoded), at stride 1 |
 | 16, 17 | `poi_cells.bin`, `poi_entries.bin` | POI cell changes (0xFFFFFFF5) and a cell index delta |
 | 18 | `place_nodes.bin` | merge at stride 20, string field `name_id` |
 | 19 | `addr_postcodes.bin` | parallel delta along addr_points, remap kind 2 |
@@ -637,7 +670,7 @@ layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
 | 26 | `arc_index.bin` | merge by slot at stride 4, the record its block's offset (v14; v13: `postal_polygons.bin`) |
 | 27 | `arc_vertices.bin` | child stream of arc_index, at stride 1 (v14; v13: `postal_vertices.bin`) |
 | 28 | `addr_vertices.bin` | child stream of addr_points at stride 1; whole in a dir without address points |
-| 29-33 | `strings_core.bin` … `strings_poi.bin` | the strings section; a tier the old dir lacks, whole |
+| 29-33 | `strings_core.bin` … `strings_poi.bin` | the strings section, of the decoded pools; a tier the old dir lacks, whole (its FCC2 file) |
 | 34 | `interp_postcodes.bin` | parallel delta along interp_ways, remap kind 2 |
 | 35 | `geo_entries.bin` | the geo index's blocks, rebuilt with `geo_cells.bin` (8) |
 

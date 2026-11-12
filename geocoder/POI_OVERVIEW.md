@@ -168,8 +168,8 @@ POI data is patched independently — each tier directory gets its own patch fil
 
 | File | Record Size | Description |
 |---|---|---|
-| `poi_records.bin` | 36 bytes | Name, category, tier, importance, coordinates, polygon reference, parent street, postcode and admin polygon |
-| `poi_vertices.bin` | 10-byte header + 4 or 8 bytes per vertex | Polygon outlines: encoding and bounding box, then the packed vertices |
+| `poi_records.bin` | 27 bytes, then two dictionaries | Coordinates, polygon block offset, name, parent street, admin polygon (24 bits), and the indexes of the postcode and of the (category, tier, flags, importance, polygon) combo in the dictionaries after the records (R2, `builder/src/poi_files.h`) |
+| `poi_vertices.bin` | variable | Polygon outlines (V2): per polygon its encoding, vertex count and bounding box against the record's coordinates, then each vertex's two offsets bit-packed at the polygon's widths, a closed ring's closing vertex left out |
 | `poi_cells.bin` | variable | S2 cell spatial index: per parent cell (5 levels up) a 1,024-bit leaf of its cells and each cell's list offset, then the bitmap of the parents (`builder/src/cell_pairs.h`) |
 | `poi_entries.bin` | variable | Per-cell POI ID lists, gaps in group varints; a cell listing what the cell before lists shares its list |
 | `strings_poi.bin` | variable | POI names: the names of the dir's POI tiers, the head of the build's POI string tier |

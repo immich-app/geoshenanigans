@@ -162,7 +162,7 @@ in [PATCHING.md](PATCHING.md) and `builder/configurations.template.json`.
 | `place_nodes.bin` | Place nodes (city, town, village, suburb, ...); the first load derives their cell index into `derived/` |
 | `postcode_centroids.bin`, `postcode_centroid_cells.bin`, `postcode_centroid_entries.bin` | Postcode centroids and their cell index (a list per cell) |
 | `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin` | Points of interest and their cell index (a list per cell) |
-| `strings_core.bin`, `strings_street.bin`, `strings_addr.bin`, `strings_postcode.bin`, `strings_poi.bin` | Deduplicated string pool, in five tiers so each variant ships only the strings it uses |
+| `strings_core.bin`, `strings_street.bin`, `strings_addr.bin`, `strings_postcode.bin`, `strings_poi.bin` | Deduplicated string pool, in five tiers so each variant ships only the strings it uses; each tier front-coded in buckets cut by content (FCC2, `builder/src/string_files.h`), a string's id still its offset in the tier's pool |
 | `strings_layout.json` | Start and end of each string tier, which place every string offset |
 | `poi_meta.json` | POI category names and scoring parameters |
 

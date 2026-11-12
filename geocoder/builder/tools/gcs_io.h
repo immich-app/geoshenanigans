@@ -320,28 +320,30 @@ struct ByteQueue {
     ~ByteQueue() { free(b); }
     size_t size() const { return tail - head; }
     const uint8_t* data() const { return b + head; }
-    // Room for n more bytes at the back, for the caller to fill (uninitialized).
-    uint8_t* reserve(size_t n) {
+    // Room for n more bytes at the back, for the caller to fill (uninitialized). The codecs
+    // reserve per unit: inlined, its rare compaction or growth (make_room) not.
+    [[gnu::always_inline]] uint8_t* reserve(size_t n) {
         if (head == tail) head = tail = 0;
-        if (tail + n > cap) {
-            if (head) {  // compact before growing
-                memmove(b, b + head, tail - head);
-                tail -= head;
-                head = 0;
-            }
-            if (tail + n > cap) {
-                size_t nc = std::max<size_t>(std::max<size_t>(cap * 2, tail + n), 4096);
-                uint8_t* nb = static_cast<uint8_t*>(realloc(b, nc));
-                if (!nb) die("out of memory (%zu bytes)", nc);
-                b = nb;
-                cap = nc;
-                cap_peak = std::max(cap_peak, cap);
-            }
-        }
+        if (tail + n > cap) make_room(n);
         uint8_t* p = b + tail;
         tail += n;
         peak = std::max(peak, tail - head);
         return p;
+    }
+    [[gnu::noinline]] void make_room(size_t n) {
+        if (head) {  // compact before growing
+            memmove(b, b + head, tail - head);
+            tail -= head;
+            head = 0;
+        }
+        if (tail + n > cap) {
+            size_t nc = std::max<size_t>(std::max<size_t>(cap * 2, tail + n), 4096);
+            uint8_t* nb = static_cast<uint8_t*>(realloc(b, nc));
+            if (!nb) die("out of memory (%zu bytes)", nc);
+            b = nb;
+            cap = nc;
+            cap_peak = std::max(cap_peak, cap);
+        }
     }
     void push(const void* p, size_t n) {
         if (n) memcpy(reserve(n), p, n);
