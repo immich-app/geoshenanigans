@@ -996,7 +996,8 @@ static int run(int argc, char* argv[]) {
                 merge_seqs[(uint32_t)PatchFileId::POI_VERTICES] = {r.child.seq, r.child.seq_end - r.child.seq, 1};
             pos = r.child.section_end;
             std::cerr << "  poi_vertices.bin: " << r.vertex_bytes << " bytes, replayed with poi_records.bin: blocks "
-                      << r.copied << " copied, " << r.encoded << " encoded" << std::endl;
+                      << r.copied << " copied, " << r.encoded << " encoded; old vertex bytes " << r.at_hand << " at hand, "
+                      << r.by_cursor << " by the cursor" << std::endl;
             gcs::store().report.push_back("decode poi: queue peaks " + std::to_string(r.decode_peaks[0]) + " " +
                                           std::to_string(r.decode_peaks[1]) + " B");
             gcs::store().report.push_back("encode poi: queue peaks " + std::to_string(r.encode_peaks[0]) + " " +

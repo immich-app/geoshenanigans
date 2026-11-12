@@ -5,8 +5,8 @@
 // lat and lng alone (its bbox minimum is stored against them), so a new record whose polygon is,
 // byte for byte, the old record's (its vertex bytes one MATCH of that old block's) at the same
 // lat and lng gets that very block: copied as it is. Every other polygon goes through the codec
-// (gcs::poi::Enc), its old bytes from a cursor that decodes only the blocks it is asked for
-// (gcs::poi::Dec, vertices_only). Rows are decoded and encoded again one by one (their string
+// (gcs::poi::Enc), its old bytes decoded from the old block the replay is at, or else from a cursor
+// that decodes only the blocks it is asked for (gcs::poi::Dec, vertices_only), made when one is. Rows are decoded and encoded again one by one (their string
 // ids move every day). A copied block is never decoded: the old poi_vertices.bin is hashed as the
 // replay passes it and checked against the diff's hash (POI_VERTICES_HASH_MARKER).
 #pragma once
@@ -42,6 +42,7 @@ public:
     // The next row (the block before it passed when it wasn't copied).
     void next() {
         pass_block();
+        decoded_ = false;
         if (i_ == rows()) poi_files::malformed("a row past the last");
         bool polygon;
         const uint32_t voff = rows_.decode(R_->take(poi_files::ROW_BYTES), rec_, polygon);
@@ -69,6 +70,28 @@ public:
     bool block() const { return block_; }
     uint64_t block_logical() const { return block_logical_; }
     uint64_t block_logical_bytes() const { return blk_.logical_bytes(); }
+    // Whether the row's block is unread: copy_block copies it whole.
+    bool whole() const { return block_ && !decoded_ && block_left_ == blk_.bytes(); }
+    // The row's block in its logical form (vertex reads that fall in it), decoded whole from its
+    // bytes, which it reads: one of up to big_block() logical bytes, else null (or once it was
+    // copied or passed).
+    const uint8_t* logical_block() {
+        if (decoded_) return logical_buf_.data();
+        if (!whole() || blk_.logical_bytes() > gcs::big_block()) return nullptr;
+        const size_t bytes = size_t(blk_.bytes()), pb = size_t(blk_.payload());
+        const uint8_t* p = V_->take(bytes);
+        hash_->update(reinterpret_cast<const char*>(p), bytes);
+        block_left_ = 0;
+        logical_buf_.resize(size_t(blk_.logical_bytes()));
+        uint8_t* o = logical_buf_.data();
+        poi_files::logical_header(blk_, o);
+        poi_files::VertexDecoder vd(blk_);
+        const uint8_t* pay = p + blk_.header;
+        vd.decode(pay, pb, blk_.m, o + poi_files::LOGICAL_HEADER);
+        vd.finish(pb ? pay[pb - 1] : 0, o + poi_files::LOGICAL_HEADER + blk_.m * poi_files::vertex_bytes(blk_.encoding));
+        decoded_ = true;
+        return o;
+    }
     // The row's block's bytes through out(p, n), a piece at a time, as they are.
     template <typename Out>
     void copy_block(Out out) {
@@ -107,8 +130,9 @@ private:
     std::unique_ptr<LaneHasher> hash_;
     uint64_t i_ = 0, logical_ = 0, blocks_end_ = 0, block_logical_ = 0, block_left_ = 0;
     uint8_t rec_[poi_files::LOGICAL_STRIDE] = {};
-    bool block_ = false;
+    bool block_ = false, decoded_ = false;
     poi_files::Block blk_;
+    std::vector<uint8_t> logical_buf_;
 };
 
 // The vertex section after the records' (a merge sequence of byte runs, a copy of the old stream or
@@ -213,6 +237,7 @@ struct ChildOps {
 struct Result {
     uint64_t records_bytes = 0, vertex_bytes = 0;  // the new logical files'
     uint64_t copied = 0, encoded = 0;              // the new polygons' blocks
+    uint64_t at_hand = 0, by_cursor = 0;           // old vertex bytes read from the old block at hand, through vd
     ChildOps child;
     // The codecs' queue peaks per port: the vertex cursor's and the encoder's.
     size_t decode_peaks[2] = {0, 0}, encode_peaks[2] = {0, 0};
@@ -240,11 +265,35 @@ Result replay(const char* P, size_t patch_size, size_t pos, size_t seq_end, cons
         throw std::runtime_error("Old poi_vertices.bin is not the one the patch was made from (" +
                                  std::to_string(old.logical_vertex_bytes()) + " bytes, the patch expects " +
                                  std::to_string(child.old_size) + ")");
-    gcs::poi::Dec vd(cur_dir);
-    vd.vertices_only = true;
-    vd.state[0] = 2;
-    vd.state[1] = 1;
+    std::unique_ptr<gcs::poi::Dec> vd;
     uint64_t vd_at = 0;  // the old stream's offset vd reads next
+    // k old stream bytes at child.old, at most, to dst: from the old block the replay is at when
+    // they start in it, else from vd. Returns how many.
+    auto old_bytes = [&](uint64_t k, char* dst, size_t room) -> size_t {
+        const uint64_t at = child.old;
+        if (old.block() && at >= old.block_logical() && at - old.block_logical() < old.block_logical_bytes())
+            if (const uint8_t* lb = old.logical_block()) {
+                const size_t g = size_t(std::min<uint64_t>({k, old.block_logical() + old.block_logical_bytes() - at, room}));
+                memcpy(dst, lb + (at - old.block_logical()), g);
+                r.at_hand += g;
+                return g;
+            }
+        if (!vd) {
+            vd.reset(new gcs::poi::Dec(cur_dir));
+            vd->vertices_only = true;
+            vd->state[0] = 2;
+            vd->state[1] = 1;
+        }
+        if (vd_at < at) {
+            vd->skip(1, at - vd_at);
+            vd_at = at;
+        }
+        const size_t g = vd->read(1, dst, size_t(std::min<uint64_t>(k, room)));
+        if (!g) poi_files::malformed("the vertex stream ends before the patch's MATCH bytes do");
+        vd_at += g;
+        r.by_cursor += g;
+        return g;
+    };
     gcs::poi::Enc enc(out_dir);
     enc.state[0] = enc.state[1] = 1;
     std::vector<char> buf(64 << 10);
@@ -256,20 +305,13 @@ Result replay(const char* P, size_t patch_size, size_t pos, size_t seq_end, cons
             const uint64_t k = std::min(n, child.left);
             if (child.op == OP_MATCH_RUN) {
                 if (child.old + k > child.old_size) throw std::runtime_error("Malformed merge sequence: poi_vertices.bin");
-                if (vd_at < child.old) {
-                    vd.skip(1, child.old - vd_at);
-                    vd_at = child.old;
-                }
-                for (uint64_t got = 0; got < k;) {
-                    const size_t g = vd.read(1, buf.data(), size_t(std::min<uint64_t>(k - got, buf.size())));
-                    if (!g) poi_files::malformed("the vertex stream ends before the patch's MATCH bytes do");
-                    enc.write(1, buf.data(), g);
-                    got += g;
-                }
-                vd_at += k;
-            } else {
-                enc.write(1, P + child.data, size_t(k));
+                const size_t g = old_bytes(k, buf.data(), buf.size());
+                enc.write(1, buf.data(), g);
+                child.took(g);
+                n -= g;
+                continue;
             }
+            enc.write(1, P + child.data, size_t(k));
             child.took(k);
             n -= k;
         }
@@ -285,7 +327,7 @@ Result replay(const char* P, size_t patch_size, size_t pos, size_t seq_end, cons
             return;
         }
         child.at_bytes();
-        if (copy_from_old && child.op == OP_MATCH_RUN && child.old == old.block_logical() &&
+        if (copy_from_old && old.whole() && child.op == OP_MATCH_RUN && child.old == old.block_logical() &&
             child.left >= old.block_logical_bytes()) {
             enc.put_coded_row(rec);
             old.copy_block([&](const uint8_t* p, size_t n) { enc.put_coded_bytes(p, n); });
@@ -299,12 +341,7 @@ Result replay(const char* P, size_t patch_size, size_t pos, size_t seq_end, cons
         uint8_t e;
         if (child.op == OP_MATCH_RUN) {
             if (child.old >= child.old_size) throw std::runtime_error("Malformed merge sequence: poi_vertices.bin");
-            if (vd_at < child.old) {
-                vd.skip(1, child.old - vd_at);
-                vd_at = child.old;
-            }
-            if (vd.read(1, reinterpret_cast<char*>(&e), 1) != 1) poi_files::malformed("the vertex stream ends early");
-            vd_at++;
+            old_bytes(1, reinterpret_cast<char*>(&e), 1);
         } else {
             e = uint8_t(P[child.data]);
         }
@@ -371,7 +408,7 @@ Result replay(const char* P, size_t patch_size, size_t pos, size_t seq_end, cons
     gcs::Manifest m;
     enc.finish(m);
     for (int p = 0; p < 2; p++) {
-        r.decode_peaks[p] = vd.peak(p);
+        r.decode_peaks[p] = vd ? vd->peak(p) : 0;
         r.encode_peaks[p] = enc.peak(p);
     }
     return r;

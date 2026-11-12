@@ -858,7 +858,8 @@ TEST(patch_rebuilds_the_builders_poi_files_on_random_days) {
 // appended, and two polygons past big_block(), one kept and one moved. In every
 // mode the patcher writes the builder's POI files of the new day, byte for
 // byte, copying the blocks of the polygons kept at their place (the log counts
-// them) and encoding the others. A byte flipped in a copied block of the old
+// them) and encoding the others, their old bytes decoded from the old block
+// at hand. A byte flipped in a copied block of the old
 // dir goes through undecoded, and the old poi_vertices.bin's hash refuses it.
 TEST(patch_copies_the_poi_blocks_a_day_leaves_whole) {
     ScratchDir dir("lowmem-poi-copy");
@@ -939,12 +940,14 @@ TEST(patch_copies_the_poi_blocks_a_day_leaves_whole) {
     const BuildDir old_d = dir_of(old_day), new_d = dir_of(new_day);
     const LowMemCase c{dir.path(), "copy"};
     REQUIRE(prepare(c, old_d, new_d).empty());
-    uint64_t copied = 0, encoded = 0;
+    uint64_t copied = 0, encoded = 0, at_hand = 0, by_cursor = 0;
     const LogCheck counts = [&](const std::string& log) {
         const size_t at = log.find("replayed with poi_records.bin: blocks ");
         if (at == std::string::npos) return std::string("no block counts in the log");
-        if (std::sscanf(log.c_str() + at, "replayed with poi_records.bin: blocks %" SCNu64 " copied, %" SCNu64 " encoded", &copied,
-                        &encoded) != 2)
+        if (std::sscanf(log.c_str() + at,
+                        "replayed with poi_records.bin: blocks %" SCNu64 " copied, %" SCNu64 " encoded; old vertex bytes %" SCNu64
+                        " at hand, %" SCNu64 " by the cursor",
+                        &copied, &encoded, &at_hand, &by_cursor) != 4)
             return std::string("no block counts in the log");
         return std::string();
     };
@@ -955,9 +958,14 @@ TEST(patch_copies_the_poi_blocks_a_day_leaves_whole) {
     // The polygons kept at their place are copied (the one past big_block()
     // too) but for those the vertex merge resyncs on past an edit before
     // them (their first bytes go as the patch's), and the others are encoded.
-    std::printf("    %u polygons kept in place: %" PRIu64 " copied, %" PRIu64 " encoded\n", kept_in_place, copied, encoded);
+    std::printf("    %u polygons kept in place: %" PRIu64 " copied, %" PRIu64 " encoded; old vertex bytes %" PRIu64
+                " at hand, %" PRIu64 " by the cursor\n",
+                kept_in_place, copied, encoded, at_hand, by_cursor);
     CHECK(copied <= kept_in_place && copied * 10 >= uint64_t(kept_in_place) * 9);
     CHECK(encoded > 30);
+    // The old vertex bytes the encoded polygons keep come from the old block
+    // the replay is at, but for a few the vertex merge matched elsewhere.
+    CHECK(at_hand > 0 && by_cursor * 20 <= at_hand);
 
     // A byte flipped in the kept big polygon's block (record 200's, the first
     // vertex past its header): copied, and refused by the hash.
