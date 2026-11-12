@@ -2124,6 +2124,97 @@ TEST(patch_lowmem_refuses_counts_and_lengths_that_wrap_32_bits) {
     CHECK(apply_both_modes(c).empty());
 }
 
+// The POI replay copies an old block only for a new record at its old
+// record's lat and lng whose polygon is that very block's bytes. Three POIs
+// and two days made by hand from the diff's patch of the unchanged set, its
+// two POI sections rebuilt: the records REPLACEd in place one ulp of latitude
+// away, their vertices one MATCH of the old stream (each block encoded again
+// against its new lat); and the records MATCHed, the first one's vertices
+// MATCHed from the second's old block (its own deleted) and the second's
+// inserted. Each patch gives the edited day's own files.
+TEST(patch_encodes_the_poi_blocks_it_cannot_copy) {
+    ScratchDir dir("lowmem-poi-nocopy");
+    std::mt19937 rng(20261113);
+    std::vector<Poi> pois;
+    for (uint32_t i = 0; i < 3; i++) pois.push_back({1000 + i, block(rng, 8)});
+    BuildDir d;
+    put_pois(d, pois);
+    const LowMemCase c{dir.path(), "nocopy"};
+    REQUIRE(prepare(c, d, d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    const std::vector<char>& records = d.at("poi_records.bin");
+    const std::vector<char>& vertices = d.at("poi_vertices.bin");
+    const uint32_t n = static_cast<uint32_t>(pois.size()), b = static_cast<uint32_t>(pois[0].block.size());
+    std::vector<char> copies;
+    for (const auto& [fid, size] : {std::pair<PatchFileId, uint64_t>{PatchFileId::POI_RECORDS, records.size()},
+                                    {PatchFileId::POI_VERTICES, vertices.size()}}) {
+        append(copies, static_cast<uint32_t>(fid));
+        append(copies, COPY_OLD_STRIDE);
+        append(copies, size);
+        append(copies, size);
+        append(copies, uint32_t{0});
+        append(copies, uint64_t{0});
+    }
+    const size_t at = find_once(raw, copies);
+    REQUIRE(at != std::string::npos);
+    auto op = [](std::vector<char>& ops, uint8_t kind, uint32_t count, const char* data = nullptr, size_t stride = 0) {
+        append(ops, kind);
+        append(ops, count);
+        if (data) ops.insert(ops.end(), data, data + size_t{count} * stride);
+    };
+    auto merge = [](PatchFileId fid, uint32_t stride, uint64_t size, const std::vector<char>& ops) {
+        std::vector<char> s;
+        append(s, static_cast<uint32_t>(fid));
+        append(s, stride);
+        append(s, size);
+        append(s, size);
+        for (int k = 0; k < 6; k++) append(s, uint32_t{0});
+        append(s, static_cast<uint64_t>(ops.size()));
+        s.insert(s.end(), ops.begin(), ops.end());
+        return s;
+    };
+    // The patch with the POI sections rebuilt, applied to the old dir: the
+    // patched POI files against the day's own (the same sizes as the old).
+    auto check = [&](const char* name, const BuildDir& day, const std::vector<char>& rec_ops, const std::vector<char>& vert_ops) {
+        const int failures_before = gctest::failures();
+        const BuildDir want = gctest::as_written(day), had = gctest::as_written(d);
+        for (const char* f : {"poi_records.bin", "poi_vertices.bin"}) REQUIRE(want.at(f).size() == had.at(f).size());
+        std::vector<char> edited(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(at));
+        for (const auto& section : {merge(PatchFileId::POI_RECORDS, POI_RECORD_STRIDE, records.size(), rec_ops),
+                                    merge(PatchFileId::POI_VERTICES, 1, vertices.size(), vert_ops)})
+            edited.insert(edited.end(), section.begin(), section.end());
+        edited.insert(edited.end(), raw.begin() + static_cast<std::ptrdiff_t>(at + copies.size()), raw.end());
+        const std::string patch = c.dir(std::string(name) + ".gcpatch"), out = c.dir(std::string("out.") + name);
+        REQUIRE(write_patch(c, patch, edited));
+        std::filesystem::remove_all(out);
+        const auto r = run_tool(patch_words(c, "plain", patch, out), c.log());
+        CHECK(r.ok);
+        for (const char* f : {"poi_records.bin", "poi_vertices.bin"}) CHECK(read_file(out + "/" + f) == want.at(f));
+        if (gctest::failures() > failures_before) std::printf("    in the %s day\n", name);
+    };
+    // One ulp of latitude away: lat is the record's first four bytes.
+    BuildDir moved = d;
+    std::vector<char>& moved_records = moved["poi_records.bin"];
+    for (uint32_t i = 0; i < n; i++) put_at(moved_records, size_t{i} * POI_RECORD_STRIDE, static_cast<uint32_t>(1000 + i + 1));
+    std::vector<char> rec_ops, vert_ops;
+    op(rec_ops, OP_REPLACE_RUN, n, moved_records.data(), POI_RECORD_STRIDE);
+    op(vert_ops, OP_MATCH_RUN, static_cast<uint32_t>(vertices.size()));
+    check("moved", moved, rec_ops, vert_ops);
+    // The first POI's polygon the second's.
+    BuildDir second = d;
+    std::vector<char>& second_vertices = second["poi_vertices.bin"];
+    std::copy(vertices.begin() + b, vertices.begin() + 2 * b, second_vertices.begin());
+    rec_ops.clear();
+    vert_ops.clear();
+    op(rec_ops, OP_MATCH_RUN, n);
+    op(vert_ops, OP_DELETE_RUN, b);
+    op(vert_ops, OP_MATCH_RUN, b);
+    op(vert_ops, OP_INSERT_RUN, b, vertices.data() + b, 1);
+    op(vert_ops, OP_MATCH_RUN, b);
+    check("second", second, rec_ops, vert_ops);
+}
+
 // The POI records and their vertex stream replayed out of step apply in
 // every mode: the POI replay reads the old rows and the old vertex stream
 // through cursors of their own (poi_replay.h), so neither holds what the
