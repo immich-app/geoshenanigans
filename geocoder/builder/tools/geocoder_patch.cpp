@@ -477,14 +477,16 @@ static int run(int argc, char* argv[]) {
         const StringsSection strings = parse_strings_section(P, patch_size, pos);
         require_shipped_tiers_listed(strings.shipped, listed);
         uint32_t total_added = 0, total_deleted = 0;
+        uint64_t buckets_copied = 0, buckets_decoded = 0;
         load_string_remap(strings, str_remap, [&](int t) {
             const char* name = STRING_TIER_FILES[t];
             const StringTierEdit& edit = strings.edits[t];
             total_added += edit.n_added;
             total_deleted += edit.n_deleted;
-            // The tier's file is FCC2 (string_files.h): its decoder walks the
-            // old pool a bucket at a time, and the new pool is encoded as it
-            // is written, its bucket table put aside in the scratch dir.
+            // The tier's file is FCC2 (string_files.h): the walk copies the old
+            // buckets the edit leaves whole and decodes the others, and the
+            // new pool is encoded as it is written, its bucket table put aside
+            // in the scratch dir. Both files hash as the walk passes them.
             struct stat st;
             if (stat((cur_dir + "/" + name).c_str(), &st) != 0)
                 throw std::runtime_error(std::string("Old ") + name + " is not the one the patch was made from (missing)");
@@ -503,22 +505,27 @@ static int run(int argc, char* argv[]) {
             const size_t table_page = table_at & ~(page_size() - 1);
             PagesBehind table_behind(old_file.data + table_page);
             FILE* fp = open_out(name);
-            string_files::SpillWriter out(fp, tmpdir + "/" + name + ".table");
-            const StringTierRebuild rebuilt = rebuild_string_tier(
-                old_pool, edit, strings.place(t), str_remap, [&](const char* p, size_t n) { out.put(p, n - 1); },
-                [&](size_t coded, size_t table) {
-                    old_behind.passed(coded);
-                    table_behind.passed(table_at - table_page + table);
-                });
+            StringTierHasher new_hash(strings.new_size(t));
+            string_files::SpillWriter out(fp, tmpdir + "/" + name + ".table",
+                                          [&](const uint8_t* c, size_t n, uint32_t span) { new_hash.bucket(c, n, span); });
+            StringTierRebuild rebuilt = rebuild_string_tier(old_pool, edit, strings.place(t), str_remap, out.encoder(),
+                                                            [&](size_t coded, size_t table) {
+                                                                old_behind.passed(coded);
+                                                                table_behind.passed(table_at - table_page + table);
+                                                            });
             out.finish();
+            rebuilt.new_hash = new_hash.finish(out.buckets(), out.raw_size());
             close_patch_outputs({{fp, name}});
+            buckets_copied += rebuilt.copied;
+            buckets_decoded += rebuilt.decoded;
             require_string_tier_rebuilt(rebuilt, edit, strings.place(t), name);
             unmap_file(old_file);
             patch_behind.passed(static_cast<size_t>(edit.end() - P));
         });
         malloc_trim(0);
-        std::cerr << "  Strings: +" << total_added << " -" << total_deleted << ", "
-                  << str_remap.run_count() << " remap runs, " << strings.pairs.size() << " moved-string pairs" << std::endl;
+        std::cerr << "  Strings: +" << total_added << " -" << total_deleted << ", old buckets " << buckets_copied
+                  << " copied, " << buckets_decoded << " decoded, " << str_remap.run_count() << " remap runs, "
+                  << strings.pairs.size() << " moved-string pairs" << std::endl;
         // The moved strings' pairs, at the section's end, are looked up at
         // random from here on.
         advise_pages(P + strings_at, patch_size - strings_at, MADV_RANDOM);

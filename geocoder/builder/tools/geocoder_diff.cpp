@@ -574,6 +574,16 @@ static MappedFile map_string_pool(const std::string& path, const std::string& to
     return pool;
 }
 
+// A string tier file's hash (string_tier_file_hash): the strings section's
+// check of a shipped tier, old and new.
+static uint64_t string_tier_file_hash_of(const std::string& path) {
+    MappedFile f = mmap_file(path);
+    if (!f.data) throw std::runtime_error("Cannot read " + path);
+    const uint64_t h = string_tier_file_hash(reinterpret_cast<const uint8_t*>(f.data), f.size, path);
+    unmap_file(f);
+    return h;
+}
+
 static bool try_emit_copy_old(std::vector<char>& patch, uint32_t fid,
                               const std::string& old_path, const std::string& new_path,
                               uint64_t old_size, uint64_t new_size, const char* log_name) {
@@ -1012,11 +1022,16 @@ static int run(int argc, char* argv[]) {
     // and may be borrowed; a newly shipped one is sent whole at the end.
     const ShippedStringTiers tier_files = shipped_string_tiers(old_dir, new_dir);
     const uint32_t shipped = tier_files.shipped;
+    std::array<uint64_t, 5> old_tier_hash{}, new_tier_hash{};
     for (int t = 0; t < 5; t++) {
         const bool own = shipped >> t & 1;
         old_tier_maps[t] = own ? load_tier(old_dir + "/" + STRING_TIER_FILES[t]) : try_load_tier(old_dir, STRING_TIER_FILES[t]);
         new_tier_maps[t] = own ? load_tier(new_dir + "/" + STRING_TIER_FILES[t]) : try_load_tier(new_dir, STRING_TIER_FILES[t]);
         old_tier_bases[t + 1] = old_tier_bases[t] + static_cast<uint32_t>(old_tier_maps[t].size);
+        if (own) {
+            old_tier_hash[t] = string_tier_file_hash_of(old_dir + "/" + STRING_TIER_FILES[t]);
+            new_tier_hash[t] = string_tier_file_hash_of(new_dir + "/" + STRING_TIER_FILES[t]);
+        }
     }
     SortedU32Map str_remap;
     {
@@ -1058,7 +1073,8 @@ static int run(int argc, char* argv[]) {
         std::array<StringTierPools, STRING_TIER_COUNT> tiers;
         uint32_t tier_ends[STRING_TIER_COUNT];
         for (int t = 0; t < STRING_TIER_COUNT; t++) {
-            tiers[t] = {old_tier_maps[t].data, old_tier_maps[t].size, new_tier_maps[t].data, new_tier_maps[t].size};
+            tiers[t] = {old_tier_maps[t].data, old_tier_maps[t].size, new_tier_maps[t].data, new_tier_maps[t].size,
+                        old_tier_hash[t], new_tier_hash[t]};
             tier_ends[t] = old_tier_bases[t + 1];
         }
         const uint32_t referenced =

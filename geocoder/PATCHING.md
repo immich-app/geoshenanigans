@@ -212,7 +212,7 @@ the build's directory layout. The new dir ends up holding exactly the
 variant's files, JSON included. Each variant dir patches from its own files
 alone, in any order: the tool reads nothing outside the dir it is given. The
 patch records the size of every old file it reads and the hash of every
-string tier it rebuilds (of its decoded pool), and the tool fails when one differs. A size check
+string tier it rebuilds (of its FCC2 file), and the tool fails when one differs. A size check
 only catches a file from another build when its size changed; the string
 tiers' hashes are the content check. The server combines a mode dir with a
 quality or poi dir by global string offsets, so patch every selected dir to

@@ -260,7 +260,7 @@ and 1450 s in 32 MiB (19.2 GiB).
 
 **Patch tool:**
 1. Decompress zstd
-2. Read the strings section → rebuild each shipped tier from the dir's own old tier + additions/deletions in one walk, which also derives its remap runs and hashes the old tier as it reads it and the new one as it writes it (a stale old tier is named as such even when the edit doesn't fit it); take the sent runs of unshipped tiers and the moved-string pairs as they come (v12: past 65,536 moved strings the patch sends no pair, and the merge sections carry the moved strings' new values for the fields that hold them, read in record order)
+2. Read the strings section → rebuild each shipped tier from the dir's own old tier + additions/deletions in one walk, which copies the old buckets the edit leaves whole as they are, decodes the others, derives its remap runs, and hashes the old tier file as it passes it and the new one as it writes it (a stale old tier is named as such even when the edit doesn't fit it); take the sent runs of unshipped tiers and the moved-string pairs as they come (v12: past 65,536 moved strings the patch sends no pair, and the merge sections carry the moved strings' new values for the fields that hold them, read in record order)
 3. For each data file: apply string remap (or a string fixup) + offset fixups to old, replay merge sequence → output file, track ID mapping from MATCH ops
 4. Read secondary ID remaps → each replayed file's moved pairs, read where they sit, beside its derived ID mappings
 5. Read cell changes (added/removed cell IDs) and the per-cell entry deltas
@@ -308,13 +308,19 @@ the tier sizes before it, which the patch carries.
 
 - **Shipped tier**: a `strings_<tier>.bin` the old and new dir both hold
   (empty pools count). The patch sends its pool's string diff and size and
-  hash stamps; the patcher rebuilds it and derives its remap runs from the
-  same walk. The walk decodes the old FCC2 file a bucket at a time
+  its files' hash stamps; the patcher rebuilds it and derives its remap runs
+  from the same walk. The walk passes the old FCC2 file a bucket at a time
   (`string_files::Decoder`), giving back the pages of its body and of its
   bucket table behind it, and encodes the new pool as it writes it, one
   bucket in memory, its bucket table set aside in the scratch dir until the
   body ends (`string_files::SpillWriter`); the encoding is canonical, so the
-  new file is the builder's byte for byte. The tiers are
+  new file is the builder's byte for byte. A bucket cut ends where the bucket
+  so far and the next string say, and nothing passes a cut, so an old bucket
+  whose strings the edit keeps, with nothing added among or right after them
+  and its next string kept, is the bucket the encoder would make wherever it
+  starts one: the walk copies it as it is, undecoded (its bytes checked by
+  the old file's hash), and decodes only the buckets around the edits (a
+  planet day: a few thousand of a tier's buckets). The tiers are
   sorted alphabetically except the POI tier, which is in POI record order
   (the names of POI tier 0, 1, 2, 3 in turn, each at its first record of
   that tier, so a reader walking the records reads the names front to
@@ -424,8 +430,10 @@ Strings: marker 0xFFFFFFF6 (u32)
   client file, and a listed tier without its bit comes in a per-file section)
   + sent (u32, bit per unshipped tier the dir's old files reference)
   + per tier in order:
-    shipped: old_hash:u64, new_hash:u64, n_added:u32, n_deleted:u32,
-      order:u32 (v9; 0 sorted: the new tier sorts and an added string
+    shipped: old_hash:u64, new_hash:u64 (the FCC2 files': each bucket's
+      bytes then its table entry, then the footer, seeded with the pool's
+      size), n_added:u32, n_deleted:u32,
+      order:u32 (v9; 0 sorted: both tiers sort and an added string
       goes where it sorts; 1 indexed: the new indices follow the strings),
       [string\0] × n_added, indexed only [new index:u32] × n_added,
       [old index:u32] × n_deleted (indices and a sorted tier's added

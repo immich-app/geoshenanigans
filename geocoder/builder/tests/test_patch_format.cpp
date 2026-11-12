@@ -2279,6 +2279,18 @@ struct TierEdit {
     StringTierEdit edit() const { return edit_of(bytes); }
 };
 
+// The hash of a pool's FCC2 file (string_tier_file_hash), as the diff takes
+// it from the file.
+uint64_t pool_file_hash(std::string_view pool) {
+    const std::vector<uint8_t> f = string_files::encode(pool.data(), pool.size());
+    return string_tier_file_hash(f.data(), f.size());
+}
+
+// A shipped tier's pools as the diff loads them, with their files' hashes.
+StringTierPools pools_of(const std::string& o, const std::string& n) {
+    return {o.data(), o.size(), n.data(), n.size(), pool_file_hash(o), pool_file_hash(n)};
+}
+
 TierEdit tier_edit(const std::string& o, const std::string& n) {
     std::unordered_map<std::string, uint32_t> new_at;
     for (size_t i = 0; i < n.size(); i += strlen(n.c_str() + i) + 1) new_at[n.c_str() + i] = (uint32_t)i;
@@ -2289,7 +2301,7 @@ TierEdit tier_edit(const std::string& o, const std::string& n) {
     }
     TierEdit e;
     e.kept = kept_strings(common);
-    e.diff = string_tier_diff(o.data(), o.size(), n.data(), n.size(), e.kept);
+    e.diff = string_tier_diff(o.data(), o.size(), n.data(), n.size(), e.kept, pool_file_hash(o), pool_file_hash(n));
     e.bytes = bytes_of(e.diff);
     return e;
 }
@@ -2315,20 +2327,29 @@ std::vector<uint32_t> starts_of(const std::string& pool, uint32_t base) {
 }
 
 // A shipped tier's walk (rebuild_string_tier) over an old pool's FCC2 file
-// in memory, its runs added to remap: the new pool it wrote, and what it read
-// and wrote.
+// in memory, its runs added to remap: the new file it wrote (its hash in the
+// walk's new_hash, as the patcher fills it) and the pool it holds, and what it
+// read and wrote.
 struct Rebuilt {
     std::string pool;
+    std::vector<uint8_t> file;
     StringTierRebuild walk;
 };
 
-Rebuilt rebuild(std::string_view old_pool, const StringTierEdit& edit, const StringTierPlace& at, StringRemap& remap) {
+Rebuilt rebuild_file(const std::vector<uint8_t>& old_file, const StringTierEdit& edit, const StringTierPlace& at,
+                     StringRemap& remap) {
     Rebuilt out;
-    const std::vector<uint8_t> file = string_files::encode(old_pool.data(), old_pool.size());
-    string_files::Decoder old(file.data(), file.size());
-    out.walk = rebuild_string_tier(old, edit, at, remap, [&](const char* p, size_t n) { out.pool.append(p, n); },
-                                   [](size_t, size_t) {});
+    string_files::Decoder old(old_file.data(), old_file.size());
+    string_files::BufferWriter w;
+    out.walk = rebuild_string_tier(old, edit, at, remap, w.encoder(), [](size_t, size_t) {});
+    out.file = w.finish();
+    out.walk.new_hash = string_tier_file_hash(out.file.data(), out.file.size());
+    string_files::decode(out.file.data(), out.file.size(), [&](const char* p, size_t n) { out.pool.append(p, n); });
     return out;
+}
+
+Rebuilt rebuild(std::string_view old_pool, const StringTierEdit& edit, const StringTierPlace& at, StringRemap& remap) {
+    return rebuild_file(string_files::encode(old_pool.data(), old_pool.size()), edit, at, remap);
 }
 
 // The place of a tier at old offset ob and new offset nb whose new pool is n.
@@ -2620,7 +2641,7 @@ struct RandomTiers {
     std::array<StringTierPools, STRING_TIER_COUNT> pools() const {
         std::array<StringTierPools, STRING_TIER_COUNT> p;
         for (int t = 0; t < STRING_TIER_COUNT; t++)
-            p[t] = {olds[t].data(), olds[t].size(), news[t].data(), news[t].size()};
+            p[t] = pools_of(olds[t], news[t]);
         return p;
     }
     int old_tier_of(uint32_t v) const {
@@ -2689,10 +2710,11 @@ void decode_strings(const std::vector<char>& buf, const RandomTiers& r, DecodedS
     CHECK_EQ(pos, buf.size());
     load_string_remap(out.section, remap, [&](int t) {
         const StringTierEdit& d = out.section.edits[t];
-        CHECK_EQ(d.old_hash, content_hash(r.olds[t].data(), r.olds[t].size()));
+        CHECK_EQ(d.old_hash, pool_file_hash(r.olds[t]));
         const Rebuilt b = rebuild(r.olds[t], d, out.section.place(t), remap);
         out.rebuilt[t] = b.pool;
-        CHECK_EQ(content_hash(out.rebuilt[t].data(), out.rebuilt[t].size()), d.new_hash);
+        CHECK_EQ(pool_file_hash(out.rebuilt[t]), d.new_hash);
+        CHECK(b.file == string_files::encode(r.news[t].data(), r.news[t].size()));
         CHECK_EQ(b.walk.old_hash, d.old_hash);
         CHECK_EQ(b.walk.new_hash, d.new_hash);
         CHECK_EQ(refusal_of([&] { require_string_tier_rebuilt(b.walk, d, out.section.place(t), STRING_TIER_FILES[t]); }),
@@ -2815,9 +2837,8 @@ TEST(patch_format_string_tier_walk_writes_strings_and_reads_nothing_it_passed) {
     // seventh deleted and every fifth followed by an added one (sorted, or
     // put before it, which an indexed tier's order allows). Deleted suffix:
     // the same up to name 10,000, then every name deleted, the long one too.
-    // All deleted: no new string at all. The one walk writes the new pool a
-    // string at a time, hashes both pools as content_hash does and derives
-    // the runs. It gives the old file's body back as it decodes it, deleted
+    // All deleted: no new string at all. The one walk writes the new file,
+    // hashes the old one as string_tier_file_hash does and derives the runs. It gives the old file's body back as it decodes it, deleted
     // strings as well as kept ones: each call at the end of the first bucket
     // that puts a piece behind the last call, and under a piece left for the
     // end. It reads no body byte before an offset it passed, nor a byte of the
@@ -2861,16 +2882,13 @@ TEST(patch_format_string_tier_walk_writes_strings_and_reads_nothing_it_passed) {
             at += size;
         }
         string_files::Decoder old(file.data(), file.size());
-        std::string rebuilt;
-        size_t not_one = 0, passed = 0, scribbled = 0, late = 0, off_end = 0, table_wrong = 0, table_scribbled = 0;
+        const uint64_t old_hash = string_tier_file_hash(file.data(), file.size());
+        string_files::BufferWriter w;
+        size_t passed = 0, scribbled = 0, late = 0, off_end = 0, table_wrong = 0, table_scribbled = 0;
         StringRemap remap(scratch_tables());
 
         const StringTierRebuild walk = rebuild_string_tier(
-            old, e.edit(), place_of(1000, 900, new_pool), remap,
-            [&](const char* p, size_t len) {
-                rebuilt.append(p, len);
-                not_one += len == 0 || p[len - 1] != '\0' || memchr(p, 0, len - 1) != nullptr;
-            },
+            old, e.edit(), place_of(1000, 900, new_pool), remap, w.encoder(),
             [&](size_t off, size_t table) {
                 CHECK(off >= scribbled + STRING_WALK_PIECE && off <= ft.body);
                 // A bucket ends at off, and started under a piece past the last call; the
@@ -2887,12 +2905,10 @@ TEST(patch_format_string_tier_walk_writes_strings_and_reads_nothing_it_passed) {
                 passed++;
             });
 
-        CHECK(rebuilt == new_pool);
+        CHECK(w.finish() == string_files::encode(new_pool.data(), new_pool.size()));
         CHECK(walk.placed);
         CHECK_EQ(walk.new_size, uint64_t(new_pool.size()));
-        CHECK_EQ(walk.old_hash, content_hash(old_pool.data(), old_pool.size()));
-        CHECK_EQ(walk.new_hash, content_hash(new_pool.data(), new_pool.size()));
-        CHECK_EQ(not_one, size_t(0));
+        CHECK_EQ(walk.old_hash, old_hash);
         CHECK_EQ(off_end, size_t(0));
         CHECK_EQ(late, size_t(0));
         CHECK_EQ(table_wrong, size_t(0));
@@ -2912,6 +2928,137 @@ TEST(patch_format_string_tier_walk_writes_strings_and_reads_nothing_it_passed) {
     }
 }
 
+TEST(patch_format_string_tier_walk_copies_whole_buckets_as_a_full_encode_would) {
+    // Random days on sorted and indexed tiers, their edits mostly at bucket
+    // edges: a bucket's first or last string deleted, a string added right
+    // before or after it, a string edited (deleted and added) there, and a
+    // few anywhere, between long untouched stretches. The walk copies the old
+    // buckets the edit leaves whole and decodes the rest: its new file is
+    // byte for byte the new pool's own encoding, and its runs map every old
+    // string as the per-string pairs did.
+    uint64_t seed = 0x5eed;
+    auto rnd = [&](uint32_t n) {
+        seed = seed * 6364136223846793005ull + 1442695040888963407ull;
+        return static_cast<uint32_t>(seed >> 33) % n;
+    };
+    // A word: a shared stem (so buckets front-code), a random tail, now and
+    // then long enough to end a bucket by MAX_SPAN or sit alone in one.
+    auto word = [&](uint32_t i) {
+        static const char* stems[] = {"Rue de la ", "Strasse ", "Main Street ", "Via ", "Café ", ""};
+        std::string w = stems[rnd(6)];
+        const uint32_t tail = rnd(50) == 0 ? 200 + rnd(700) : 1 + rnd(14);
+        for (uint32_t k = 0; k < tail; k++) w.push_back(char('a' + rnd(26)));
+        return w + std::to_string(i);
+    };
+    uint64_t copied = 0, decoded = 0, buckets = 0, flips = 0;
+    for (int round = 0; round < 60; round++) {
+        const int failures_before = gctest::failures();
+        const bool sorted = round % 2 == 0;
+        const uint32_t n_old = 500 + rnd(6000);
+        std::vector<std::string> o;
+        std::unordered_set<std::string> seen;
+        uint32_t fresh = 0;
+        auto unique_word = [&] {
+            for (;;) {
+                std::string w = word(fresh++);
+                if (seen.insert(w).second) return w;
+            }
+        };
+        for (uint32_t i = 0; i < n_old; i++) o.push_back(unique_word());
+        if (sorted) std::sort(o.begin(), o.end());
+        const std::string old_pool = pool_in_order(o);
+        const std::vector<uint8_t> old_file = string_files::encode(old_pool.data(), old_pool.size());
+        // Each old bucket's first string index.
+        std::vector<uint32_t> starts;
+        {
+            string_files::Decoder d(old_file.data(), old_file.size());
+            uint32_t at = 0;
+            while (d.next()) {
+                starts.push_back(at);
+                for (size_t k = 0; k < d.size(); k += strlen(d.data() + k) + 1) at++;
+            }
+            REQUIRE(at == n_old);
+        }
+        // The edits, keyed by old index: deleted, and added before (ins) it.
+        std::vector<bool> del(n_old, false);
+        std::vector<std::vector<std::string>> ins(n_old + 1);
+        const uint32_t n_edits = 1 + rnd(1 + uint32_t(starts.size()) / 8);
+        for (uint32_t k = 0; k < n_edits; k++) {
+            const uint32_t b = rnd(uint32_t(starts.size()));
+            const uint32_t first = starts[b], end = b + 1 < starts.size() ? starts[b + 1] : n_old;
+            switch (rnd(7)) {
+            case 0: del[first] = true; break;                                // its first string deleted
+            case 1: del[end - 1] = true; break;                              // its last
+            case 2: ins[first].push_back(unique_word()); break;              // added before it
+            case 3: ins[end].push_back(unique_word()); break;                // added after it
+            case 4: del[first] = true; ins[first].push_back(o[first] + "!"); break;    // its first edited
+            case 5: del[end - 1] = true; ins[end].push_back(o[end - 1] + "!"); break;  // its last edited
+            default: {                                                       // anywhere in it
+                const uint32_t i = first + rnd(end - first);
+                if (rnd(2)) del[i] = true;
+                else ins[i].push_back(unique_word());
+            }
+            }
+        }
+        std::vector<std::string> n;
+        for (uint32_t i = 0; i <= n_old; i++) {
+            for (const auto& w : ins[i]) n.push_back(w);
+            if (i < n_old && !del[i]) n.push_back(o[i]);
+        }
+        if (sorted) {
+            std::sort(n.begin(), n.end());
+            n.erase(std::unique(n.begin(), n.end()), n.end());
+        }
+        const std::string new_pool = pool_in_order(n);
+        const TierEdit e = tier_edit(old_pool, new_pool);
+        REQUIRE(e.diff.sorted == sorted);
+        StringRemap remap(scratch_tables());
+        const StringTierPlace at = place_of(700, 300, new_pool);
+        const Rebuilt b = rebuild_file(old_file, e.edit(), at, remap);
+        CHECK(b.file == string_files::encode(new_pool.data(), new_pool.size()));
+        CHECK(b.walk.placed);
+        CHECK_EQ(b.walk.new_size, uint64_t(new_pool.size()));
+        CHECK_EQ(b.walk.old_hash, e.diff.old_hash);
+        CHECK_EQ(b.walk.new_hash, e.diff.new_hash);
+        CHECK_EQ(b.walk.copied + b.walk.decoded, uint64_t(starts.size()));
+        remap.finish();
+        const auto want = pairs_of(old_pool, new_pool, 700, 300);
+        size_t wrong = 0;
+        for (uint32_t v : starts_of(old_pool, 700)) {
+            auto it = want.find(v);
+            wrong += remap.lookup(v) != (it != want.end() ? it->second : v);
+        }
+        CHECK_EQ(wrong, size_t(0));
+        copied += b.walk.copied;
+        decoded += b.walk.decoded;
+        buckets += starts.size();
+        // The first bucket is whole when the new pool starts with its strings
+        // and the next bucket's first: the walk copies it. A byte flipped in
+        // it goes through undecoded, and the old file's hash refuses it.
+        const bool first_whole = starts.size() > 1 && n.size() > starts[1] &&
+                                 std::equal(o.begin(), o.begin() + starts[1] + 1, n.begin());
+        if (first_whole) {
+            std::vector<uint8_t> flipped = old_file;
+            const string_files::Footer ft = string_files::read_footer(flipped.data(), flipped.size());
+            flipped[string_files::rd16(&flipped[ft.body + 2]) - 1] ^= 0x01;
+            string_files::Decoder d(flipped.data(), flipped.size());
+            string_files::BufferWriter w;
+            StringRemap r2(scratch_tables());
+            CHECK_EQ(refusal_of([&] {
+                         const StringTierRebuild walk = rebuild_string_tier(d, e.edit(), at, r2, w.encoder(), [](size_t, size_t) {});
+                         require_string_tier_rebuilt(walk, e.edit(), at, "strings_poi.bin");
+                     }),
+                     std::string("Old strings_poi.bin is not the one the patch was made from"));
+            flips++;
+        }
+        if (gctest::failures() > failures_before) std::printf("    in round %d (%s)\n", round, sorted ? "sorted" : "indexed");
+    }
+    // Most buckets go through whole, and the edits' ones are decoded.
+    CHECK(copied * 4 > buckets * 3);
+    CHECK(decoded > 60);
+    CHECK(flips > 5);
+}
+
 TEST(patch_format_string_tier_rebuild_is_refused_for_its_first_fault) {
     // The walk reads the old pool before anything checks it. A stale pool is
     // named as such, even when the edit doesn't fit it; then an edit the
@@ -2926,7 +3073,7 @@ TEST(patch_format_string_tier_rebuild_is_refused_for_its_first_fault) {
         const StringTierEdit edit = edit_of(bytes);
         StringRemap remap(scratch_tables());
         const Rebuilt b = rebuild(old_pool, edit, at, remap);
-        CHECK_EQ(b.walk.old_hash, content_hash(old_pool.data(), old_pool.size()));
+        CHECK_EQ(b.walk.old_hash, pool_file_hash(old_pool));
         return refusal_of([&] { require_string_tier_rebuilt(b.walk, edit, at, "strings_core.bin"); });
     };
     const StringTierPlace at = place_of(0, 0, n);
@@ -2961,7 +3108,7 @@ TEST(patch_format_sorted_tier_sends_no_indices) {
     CHECK(rebuild(o, e.edit(), place_of(0, 0, n), remap).pool == n);
     // The section holds the order flag but no index of the three added strings.
     std::array<StringTierPools, STRING_TIER_COUNT> tiers{};
-    tiers[0] = {o.data(), o.size(), n.data(), n.size()};
+    tiers[0] = pools_of(o, n);
     const std::vector<std::pair<uint32_t, uint32_t>> moved = {{0, 2}, {4, 6}};
     std::vector<char> buf;
     append_strings_section(buf, tiers, 1, 0, moved);
@@ -2982,7 +3129,7 @@ TEST(patch_format_strings_section_refuses_indices_out_of_order) {
     // both added.
     const std::string o = pool_of({"a", "b"}), n = pool_in_order({"d", "c"});
     std::array<StringTierPools, STRING_TIER_COUNT> tiers{};
-    tiers[0] = {o.data(), o.size(), n.data(), n.size()};
+    tiers[0] = pools_of(o, n);
     std::vector<char> buf;
     append_strings_section(buf, tiers, 1, 0, std::vector<std::pair<uint32_t, uint32_t>>());
     size_t pos = 0;
@@ -3017,7 +3164,7 @@ TEST(patch_format_strings_section_reads_tier_edits_where_they_sit) {
     // at 1 and added at 2, tea added at 3, and cafe's offset as a pair.
     const std::string o = pool_in_order({"zoo", "cafe", "bank"}), n = pool_in_order({"zoo", "bank", "cafe", "tea"});
     std::array<StringTierPools, STRING_TIER_COUNT> tiers{};
-    tiers[4] = {o.data(), o.size(), n.data(), n.size()};
+    tiers[4] = pools_of(o, n);
     const std::vector<std::pair<uint32_t, uint32_t>> moved = {{0, 0}, {4, 9}, {9, 4}};
     std::vector<char> buf;
     append_strings_section(buf, tiers, 1u << 4, 0, moved);
@@ -3044,7 +3191,7 @@ TEST(patch_format_strings_section_refuses_moved_strings_out_of_order_or_twice) {
     // string, and the other two go as the pairs that end the section.
     const std::string o = pool_in_order({"a", "b", "c"}), n = pool_in_order({"c", "b", "a"});
     std::array<StringTierPools, STRING_TIER_COUNT> tiers{};
-    tiers[0] = {o.data(), o.size(), n.data(), n.size()};
+    tiers[0] = pools_of(o, n);
     const std::vector<std::pair<uint32_t, uint32_t>> moved = {{0, 4}, {2, 2}, {4, 0}};
     std::vector<char> buf;
     append_strings_section(buf, tiers, 1, 0, moved);
@@ -3069,7 +3216,7 @@ TEST(patch_format_strings_section_sends_no_pair_past_its_cap) {
     // fixups give new values.
     const std::string o = pool_in_order({"a", "b", "c"}), n = pool_in_order({"c", "b", "a"});
     std::array<StringTierPools, STRING_TIER_COUNT> tiers{};
-    tiers[0] = {o.data(), o.size(), n.data(), n.size()};
+    tiers[0] = pools_of(o, n);
     const std::vector<std::pair<uint32_t, uint32_t>> moved = {{0, 4}, {2, 2}, {4, 0}};
     std::vector<char> sent, unsent;
     const StringsSectionStats at_cap = append_strings_section(sent, tiers, 1, 0, moved, 2);
