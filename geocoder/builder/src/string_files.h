@@ -20,7 +20,8 @@
 // string s once it holds at least MIN_CUT bytes and fnv1a64(s) >> 32 is
 // 0 mod PERIOD, or when s would take it past MAX_SPAN. A bucket then starts
 // where nearby content says, so an edit to the pool changes only the buckets
-// around it, and a bucket of two or more strings spans at most MAX_SPAN
+// around it (the patcher copies the others as they are: Encoder::cut_before),
+// and a bucket of two or more strings spans at most MAX_SPAN
 // bytes; a longer string sits alone in its bucket. Varints are LEB128 in their
 // fewest bytes. An empty pool is the footer alone.
 //
@@ -165,6 +166,31 @@ public:
         if (!partial_.empty()) unencodable("a string put into the middle of another");
         add(s, len);
     }
+    // Whether a bucket would start at the string of len bytes at s, were it
+    // put next: the encoder holds none, or the cut rule ends the bucket it
+    // holds before s, which then goes out. The rule reads only the bucket's
+    // bytes and s, and past a cut the encoder holds nothing, so a run of
+    // strings that starts at a cut and ends at one encodes to the same bucket
+    // in any pool: an old bucket whose strings, cut before and cut after a
+    // patch leaves alone goes through put_bucket as it is.
+    bool cut_before(const char* s, size_t len) {
+        if (!partial_.empty()) unencodable("a cut in the middle of a string");
+        if (span_ && !cuts_before(span_, s, len)) return false;
+        flush();
+        return true;
+    }
+    // A bucket of this encoding (coded bytes and span) at a cut: out as it
+    // is. The caller proves it is the bucket the strings it holds make here,
+    // and that a cut follows it (the next string put is cut before, or the
+    // pool ends).
+    void put_bucket(const uint8_t* coded, size_t size, uint32_t span) {
+        if (!partial_.empty() || span_) unencodable("a bucket put into the middle of another");
+        if (raw_ + span > UINT32_MAX) unencodable("a pool of 4 GiB or more");
+        if (buckets_ == UINT32_MAX) unencodable("2^32 buckets or more");
+        on_bucket_(coded, size, span);
+        raw_ += span;
+        buckets_++;
+    }
     // The pool's end: refuses one whose last string has no NUL.
     void finish() {
         if (!partial_.empty()) unencodable("a pool whose last string has no NUL");
@@ -239,22 +265,40 @@ inline void put_entry(uint8_t* e, size_t size, uint32_t span) {
     e[3] = uint8_t(size >> 8);
 }
 
+// An encoding made in memory: strings and buckets go through encoder(), and
+// finish() gives the file.
+class BufferWriter {
+public:
+    BufferWriter()
+        : enc_([this](const uint8_t* c, size_t n, uint32_t span) {
+              body_.insert(body_.end(), c, c + n);
+              uint8_t t[ENTRY_BYTES];
+              put_entry(t, n, span);
+              table_.insert(table_.end(), t, t + ENTRY_BYTES);
+          }) {}
+    BufferWriter(const BufferWriter&) = delete;
+    BufferWriter& operator=(const BufferWriter&) = delete;
+    Encoder& encoder() { return enc_; }
+    std::vector<uint8_t> finish() {
+        enc_.finish();
+        std::vector<uint8_t> file = std::move(body_);
+        file.insert(file.end(), table_.begin(), table_.end());
+        uint8_t f[FOOTER_BYTES];
+        put_footer(f, enc_.buckets(), enc_.raw_size());
+        file.insert(file.end(), f, f + FOOTER_BYTES);
+        return file;
+    }
+
+private:
+    std::vector<uint8_t> body_, table_;
+    Encoder enc_;
+};
+
 // A pool's encoding, in memory.
 inline std::vector<uint8_t> encode(const char* pool, size_t size) {
-    std::vector<uint8_t> body, table;
-    Encoder e([&](const uint8_t* c, size_t n, uint32_t span) {
-        body.insert(body.end(), c, c + n);
-        uint8_t t[ENTRY_BYTES];
-        put_entry(t, n, span);
-        table.insert(table.end(), t, t + ENTRY_BYTES);
-    });
-    e.write(pool, size);
-    e.finish();
-    body.insert(body.end(), table.begin(), table.end());
-    uint8_t f[FOOTER_BYTES];
-    put_footer(f, e.buckets(), e.raw_size());
-    body.insert(body.end(), f, f + FOOTER_BYTES);
-    return body;
+    BufferWriter w;
+    w.encoder().write(pool, size);
+    return w.finish();
 }
 
 // Writes a pool to path as FCC2 (the builder: the table is held, 4 bytes a
@@ -287,15 +331,18 @@ inline void write_file(const std::string& path, const char* pool, size_t size) {
 
 // Writes a pool given in pieces as FCC2 to out, holding one bucket: the
 // table goes to a scratch file at spill_path until finish appends it (the
-// patcher's constant memory).
+// patcher's constant memory). on_bucket, if given, sees each bucket as it
+// goes out.
 class SpillWriter {
 public:
-    SpillWriter(FILE* out, std::string spill_path)
-        : out_(out), spill_path_(std::move(spill_path)), enc_([this](const uint8_t* c, size_t n, uint32_t span) {
+    SpillWriter(FILE* out, std::string spill_path, Encoder::OnBucket on_bucket = nullptr)
+        : out_(out), spill_path_(std::move(spill_path)), on_bucket_(std::move(on_bucket)),
+          enc_([this](const uint8_t* c, size_t n, uint32_t span) {
               ok_ &= fwrite(c, 1, n, out_) == n;
               uint8_t t[ENTRY_BYTES];
               put_entry(t, n, span);
               ok_ &= fwrite(t, 1, ENTRY_BYTES, spill_) == ENTRY_BYTES;
+              if (on_bucket_) on_bucket_(c, n, span);
           }) {
         spill_ = fopen(spill_path_.c_str(), "w+b");
         if (!spill_) throw std::runtime_error("Cannot create " + spill_path_);
@@ -321,6 +368,9 @@ public:
         if (!ok_) throw std::runtime_error("Cannot write a string tier's table through " + spill_path_);
     }
     uint32_t raw_size() const { return enc_.raw_size(); }
+    uint32_t buckets() const { return enc_.buckets(); }
+    // Strings and whole buckets (Encoder::cut_before, put_bucket).
+    Encoder& encoder() { return enc_; }
 
 private:
     void drop_spill() {
@@ -333,6 +383,7 @@ private:
     std::string spill_path_;
     FILE* spill_ = nullptr;
     bool ok_ = true;
+    Encoder::OnBucket on_bucket_;
     Encoder enc_;
 };
 
@@ -346,10 +397,60 @@ public:
     }
     uint32_t raw_size() const { return ft_.raw_size; }
     uint32_t buckets() const { return ft_.buckets; }
+
+    // A bucket as its table entry places it, its bytes undecoded: its index,
+    // where it starts in the body and in the pool, its coded bytes and span.
+    struct Entry {
+        uint32_t b = 0;
+        uint64_t coded_at = 0, raw_at = 0;
+        const uint8_t* coded = nullptr;
+        uint32_t size = 0, span = 0;
+    };
+    // The next bucket's entry, checked as next() checks it; false past the
+    // last (next() then ends the walk).
+    bool peek(Entry& e) const { return entry_at(b_, coded_, raw_, e); }
+    // The entry of the bucket after e, likewise.
+    bool peek_after(const Entry& e, Entry& after) const {
+        return entry_at(e.b + 1, e.coded_at + e.size, e.raw_at + e.span, after);
+    }
+    // Passes the next bucket (e, from peek) undecoded: a walk that copies it
+    // as it is. Nothing checks its bytes; the file's hash does.
+    void skip(const Entry& e) {
+        if (e.b != b_ || e.coded_at != coded_ || e.raw_at != raw_) malformed(name_, "a bucket skipped out of turn");
+        raw_start_ = raw_;
+        raw_ += e.span;
+        coded_ += e.size;
+        prev_span_ = e.span;
+        size_ = 0;
+        b_++;
+    }
+    // A bucket's first string, which it holds whole: len bytes at s.
+    void first_of(const Entry& e, const char*& s, size_t& len) const {
+        size_t at = 0;
+        uint32_t l = 0;
+        if (!get_varint(e.coded, e.size, at, l)) bad(e.b, " has a bad varint");
+        if (l > e.size - at) bad(e.b, " runs past its size");
+        s = reinterpret_cast<const char*>(e.coded + at);
+        len = l;
+    }
+    // A bucket's strings, counted by its varints, undecoded.
+    uint32_t count_of(const Entry& e) const {
+        size_t at = 0;
+        uint32_t n = 0, lcp = 0, sl = 0;
+        for (bool first = true; at < e.size; first = false, n++) {
+            if ((!first && !get_varint(e.coded, e.size, at, lcp)) || !get_varint(e.coded, e.size, at, sl))
+                bad(e.b, " has a bad varint");
+            if (sl > e.size - at) bad(e.b, " runs past its size");
+            at += sl;
+        }
+        return n;
+    }
+
     // Decodes the next bucket into data() (its strings, NULs included, size()
     // bytes, until the next call); false past the last.
     bool next() {
-        if (b_ == ft_.buckets) {
+        Entry ent;
+        if (!peek(ent)) {
             size_ = 0;
             if (raw_ != ft_.raw_size)
                 malformed(name_, "buckets of " + std::to_string(raw_) + " bytes where the footer gives " +
@@ -358,12 +459,8 @@ public:
                 malformed(name_, "a body of " + std::to_string(ft_.body) + " bytes whose buckets take " + std::to_string(coded_));
             return false;
         }
-        const uint8_t* e = table_ + size_t(b_) * ENTRY_BYTES;
-        const uint32_t span = rd16(e), csize = rd16(e + 2);
-        if (span == 0 || csize == 0) bad(" is empty");
-        if (csize > ft_.body - coded_) bad(" runs past the body");
-        if (span > uint64_t(ft_.raw_size) - raw_) bad(" runs past the pool's bytes");
-        const uint8_t* p = body_ + coded_;
+        const uint32_t span = ent.span, csize = ent.size;
+        const uint8_t* p = ent.coded;
         char* out = buf_.data();
         size_t at = 0, o = 0, prev = 0, prev_len = 0;
         for (bool first = true; at < csize; first = false) {
@@ -408,7 +505,22 @@ public:
     uint64_t table_read() const { return uint64_t(b_) * ENTRY_BYTES; }
 
 private:
-    [[noreturn]] void bad(const char* what) const { malformed(name_, "bucket " + std::to_string(b_) + what); }
+    [[noreturn]] void bad(const char* what) const { bad(b_, what); }
+    [[noreturn]] void bad(uint32_t b, const char* what) const { malformed(name_, "bucket " + std::to_string(b) + what); }
+    bool entry_at(uint32_t b, uint64_t coded, uint64_t raw, Entry& e) const {
+        if (b >= ft_.buckets) return false;
+        const uint8_t* t = table_ + size_t(b) * ENTRY_BYTES;
+        e.b = b;
+        e.coded_at = coded;
+        e.raw_at = raw;
+        e.span = rd16(t);
+        e.size = rd16(t + 2);
+        if (e.span == 0 || e.size == 0) bad(b, " is empty");
+        if (e.size > ft_.body - coded) bad(b, " runs past the body");
+        if (e.span > uint64_t(ft_.raw_size) - raw) bad(b, " runs past the pool's bytes");
+        e.coded = body_ + coded;
+        return true;
+    }
 
     std::string name_;
     Footer ft_;

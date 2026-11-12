@@ -2,7 +2,8 @@
 // strings of the longest length, prefixes shared across bucket cuts) round
 // trip through FCC2 and cut where the rule says; the encoder given its pool in
 // any pieces or a whole string at a time, the patcher's SpillWriter and the
-// builder's write_file write the same file; a small pool's file is the bytes the format gives
+// builder's write_file write the same file, and so do buckets put whole at
+// cuts; a small pool's file is the bytes the format gives
 // (server/src/strings.rs reads the same ones); and the codec refuses each pool
 // it can't hold and each file it never writes.
 #include "string_files.h"
@@ -192,6 +193,69 @@ TEST(string_files_encoder_writers_and_pieces_write_one_file) {
     // The empty pool is the footer alone.
     CHECK(encode("") == hex("0000000000000000" "46434332"));
     CHECK(decode(hex("0000000000000000" "46434332")).empty());
+}
+
+TEST(string_files_buckets_put_whole_at_cuts_write_one_file) {
+    // Every bucket of a random pool's file, peeked and skipped undecoded and
+    // put whole at a cut, writes the file again: each starts at a cut
+    // (cut_before), its first string and string count read from its varints.
+    // Mixed with a decoded bucket put string by string, the same. A string
+    // the rule doesn't cut before is no cut, and a bucket put into another, a
+    // bucket skipped out of turn and a bucket's string past its size are
+    // refused.
+    std::mt19937 rng(20261112);
+    for (int round = 0; round < 40; round++) {
+        std::vector<std::string> strings = random_strings(rng, 1 + rng() % 3000);
+        if (round % 2) std::sort(strings.begin(), strings.end());
+        const std::vector<uint8_t> f = encode(pool_of(strings));
+        string_files::Decoder d(f.data(), f.size());
+        string_files::BufferWriter w;
+        string_files::Decoder::Entry e;
+        size_t at = 0, wrong = 0;
+        while (d.peek(e)) {
+            const char* first;
+            size_t first_len;
+            d.first_of(e, first, first_len);
+            wrong += std::string(first, first_len) != strings[at];
+            wrong += !w.encoder().cut_before(first, first_len);
+            const uint32_t n = d.count_of(e);
+            if (e.b % 3 == 1) {
+                d.next();
+                uint32_t k = 0;
+                for (size_t o = 0; o < d.size(); o += strlen(d.data() + o) + 1, k++) w.encoder().put(d.data() + o, strlen(d.data() + o));
+                wrong += k != n;
+            } else {
+                w.encoder().put_bucket(e.coded, e.size, e.span);
+                d.skip(e);
+            }
+            at += n;
+        }
+        CHECK(!d.next());
+        CHECK_EQ(at, strings.size());
+        CHECK_EQ(wrong, size_t(0));
+        CHECK(w.finish() == f);
+    }
+    const std::vector<std::string> strings = {"Rue 1", "Rue 2", "Rue 3"};
+    const std::vector<uint8_t> f = encode(pool_of(strings));
+    string_files::BufferWriter w;
+    w.encoder().put("Rue 1", 5);
+    CHECK(!w.encoder().cut_before("Rue 2", 5));
+    string_files::Decoder d(f.data(), f.size());
+    string_files::Decoder::Entry e;
+    REQUIRE(d.peek(e));
+    CHECK_EQ(refusal_of([&] { w.encoder().put_bucket(e.coded, e.size, e.span); }),
+             std::string("A string tier can't hold a bucket put into the middle of another"));
+    string_files::Decoder::Entry later = e;
+    later.b = 1;
+    CHECK_EQ(refusal_of([&] { d.skip(later); }), std::string("Malformed string tier: a bucket skipped out of turn"));
+    std::vector<uint8_t> past = f;
+    past[0] = 0x7F;  // the first string's length past the bucket
+    string_files::Decoder pd(past.data(), past.size());
+    REQUIRE(pd.peek(e));
+    const char* s;
+    size_t len;
+    CHECK_EQ(refusal_of([&] { pd.first_of(e, s, len); }), std::string("Malformed string tier: bucket 0 runs past its size"));
+    CHECK_EQ(refusal_of([&] { pd.count_of(e); }), std::string("Malformed string tier: bucket 0 runs past its size"));
 }
 
 TEST(string_files_small_pool_is_the_bytes_the_format_gives) {
