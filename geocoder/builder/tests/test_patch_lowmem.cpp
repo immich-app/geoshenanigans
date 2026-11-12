@@ -6,6 +6,7 @@
 // and command lines the patcher must refuse.
 #include <algorithm>
 #include <array>
+#include <cinttypes>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -848,6 +849,128 @@ TEST(patch_rebuilds_the_builders_poi_files_on_random_days) {
         for (const std::string& mode : ALL_MODES)
             for (const char* f : {"poi_records.bin", "poi_vertices.bin"}) CHECK(read_file(c.dir("out." + mode) + "/" + f) == want.at(f));
     }
+}
+
+// A day that leaves most POI polygons alone, its edits at their blocks'
+// edges: names changed with the polygon kept (in place, at the same lat and
+// lng), a POI moved with its polygon kept, a polygon's last vertex moved, a
+// polygon replaced, dropped or given to a point, POIs killed in place and
+// appended, and two polygons past big_block(), one kept and one moved. In every
+// mode the patcher writes the builder's POI files of the new day, byte for
+// byte, copying the blocks of the polygons kept at their place (the log counts
+// them) and encoding the others. A byte flipped in a copied block of the old
+// dir goes through undecoded, and the old poi_vertices.bin's hash refuses it.
+TEST(patch_copies_the_poi_blocks_a_day_leaves_whole) {
+    ScratchDir dir("lowmem-poi-copy");
+    constexpr uint32_t NAME = 12, NAMES = 64, N = 500;
+    std::string pool;
+    for (uint32_t i = 0; i < NAMES; i++) {
+        char b[16];
+        std::snprintf(b, sizeof b, "poi %07u", i);
+        pool += std::string(b, NAME);
+    }
+    struct Poi36 {
+        std::vector<char> rec;    // 36 bytes, vertex_offset and vertex_count set by dir_of
+        std::vector<char> block;  // its logical polygon, or none
+    };
+    std::mt19937 rng(20261112);
+    auto polygon = [&](uint32_t vc) {
+        const uint8_t e = static_cast<uint8_t>(rng() % 4);
+        std::vector<char> b(10, 0);
+        b[0] = static_cast<char>(e);
+        put_at(b, 2, static_cast<float>(-1.0 + rng() % 1000 * 1e-3));
+        put_at(b, 6, static_cast<float>(-1.0 + rng() % 1000 * 1e-3));
+        for (uint32_t k = 0; k < vc; k++) {
+            const size_t at = b.size();
+            b.resize(at + (e == 3 ? 8 : 4));
+            poi_files::put_q(reinterpret_cast<uint8_t*>(&b[at]), e, static_cast<uint32_t>(rng() % 5000), static_cast<uint32_t>(rng() % 5000));
+        }
+        return b;
+    };
+    auto random_poi = [&](uint32_t vc) {
+        Poi36 p{std::vector<char>(36, 0), {}};
+        put_at(p.rec, 0, static_cast<float>(-90.0 + 180.0 * (rng() / 4294967296.0)));
+        put_at(p.rec, 4, static_cast<float>(-180.0 + 360.0 * (rng() / 4294967296.0)));
+        put_at(p.rec, 16, static_cast<uint32_t>(rng() % NAMES) * NAME);
+        for (int k = 0; k < 4; k++) p.rec[20 + k] = static_cast<char>(k == 1 ? 1 + rng() % 3 : rng() % (k == 0 ? 55 : 256));
+        put_at(p.rec, 24, NO);
+        put_at(p.rec, 28, rng() % 4 ? NO : static_cast<uint32_t>(rng() % NAMES) * NAME);
+        put_at(p.rec, 32, static_cast<uint32_t>(rng() % 1000));
+        if (vc) p.block = polygon(vc);
+        return p;
+    };
+    std::vector<Poi36> old_day;
+    for (uint32_t i = 0; i < N; i++) old_day.push_back(random_poi(i == 200 || i == 300 ? 35000 : i % 4 == 0 ? 0 : 1 + rng() % 40));
+    std::vector<Poi36> new_day = old_day;
+    uint32_t kept_in_place = 0;  // polygons the new day keeps at their place
+    for (uint32_t i = 0; i < N; i++) {
+        Poi36& p = new_day[i];
+        const bool poly = !p.block.empty();
+        const uint32_t r = i == 300 ? 1 : i == 200 ? 99 : rng() % 16;
+        if (r == 0) put_at(p.rec, 16, static_cast<uint32_t>(rng() % NAMES) * NAME);      // renamed, kept
+        if (r == 1) put_at(p.rec, 0, static_cast<float>(p.rec[0] == 0 ? 1.5 : -1.5));       // moved
+        if (r == 2 && poly) p.block[p.block.size() - 1] ^= 1;                               // last vertex moved
+        if (r == 3 && poly) p.block = polygon(1 + rng() % 40);                              // replaced
+        if (r == 4) p.block.clear();                                                        // dropped
+        if (r == 5 && !poly) p.block = polygon(1 + rng() % 40);                             // given one
+        if (r == 6) {                                                                       // killed in place
+            p.rec.assign(36, 0);
+            put_at(p.rec, 16, NO);
+            p.block.clear();
+        }
+        kept_in_place += poly && (r == 0 || r == 5 || r > 6);
+    }
+    for (uint32_t i = 0; i < 30; i++) new_day.push_back(random_poi(i % 3 ? 1 + rng() % 40 : 0));
+    auto dir_of = [&](const std::vector<Poi36>& day) {
+        BuildDir d;
+        std::vector<char>& recs = d["poi_records.bin"];
+        std::vector<char>& verts = d["poi_vertices.bin"];
+        for (const Poi36& p : day) {
+            std::vector<char> rec = p.rec;
+            const bool poly = !p.block.empty();
+            put_at(rec, 8, poly ? static_cast<uint32_t>(verts.size()) : NO);
+            put_at(rec, 12, poly ? static_cast<uint32_t>((p.block.size() - 10) / (p.block[0] == 3 ? 8 : 4)) : 0u);
+            recs.insert(recs.end(), rec.begin(), rec.end());
+            verts.insert(verts.end(), p.block.begin(), p.block.end());
+        }
+        d["strings_poi.bin"].assign(pool.begin(), pool.end());
+        return d;
+    };
+    const BuildDir old_d = dir_of(old_day), new_d = dir_of(new_day);
+    const LowMemCase c{dir.path(), "copy"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    uint64_t copied = 0, encoded = 0;
+    const LogCheck counts = [&](const std::string& log) {
+        const size_t at = log.find("replayed with poi_records.bin: blocks ");
+        if (at == std::string::npos) return std::string("no block counts in the log");
+        if (std::sscanf(log.c_str() + at, "replayed with poi_records.bin: blocks %" SCNu64 " copied, %" SCNu64 " encoded", &copied,
+                        &encoded) != 2)
+            return std::string("no block counts in the log");
+        return std::string();
+    };
+    CHECK(apply_modes(c, ALL_MODES, counts).bad.empty());
+    const BuildDir want = gctest::as_written(new_d);
+    for (const std::string& mode : ALL_MODES)
+        for (const char* f : {"poi_records.bin", "poi_vertices.bin"}) CHECK(read_file(c.dir("out." + mode) + "/" + f) == want.at(f));
+    // The polygons kept at their place are copied (the one past big_block()
+    // too) but for those the vertex merge resyncs on past an edit before
+    // them (their first bytes go as the patch's), and the others are encoded.
+    std::printf("    %u polygons kept in place: %" PRIu64 " copied, %" PRIu64 " encoded\n", kept_in_place, copied, encoded);
+    CHECK(copied <= kept_in_place && copied * 10 >= uint64_t(kept_in_place) * 9);
+    CHECK(encoded > 30);
+
+    // A byte flipped in the kept big polygon's block (record 200's, the first
+    // vertex past its header): copied, and refused by the hash.
+    std::vector<char> v2 = read_file(c.dir("old") + "/poi_vertices.bin");
+    const std::vector<char> r2 = read_file(c.dir("old") + "/poi_records.bin");
+    uint32_t voff;
+    memcpy(&voff, r2.data() + 200 * poi_files::ROW_BYTES + poi_files::ROW_VOFF, 4);
+    v2[voff + poi_files::MAX_BLOCK_HEADER + 100] ^= 0x10;
+    REQUIRE(write_file(c.dir("old") + "/poi_vertices.bin", v2.data(), v2.size()));
+    std::filesystem::remove_all(c.dir("out.flipped"));
+    const auto r = run_tool(patch_words(c, "plain", c.patch(), c.dir("out.flipped")), c.log());
+    CHECK(!r.ok);
+    CHECK(r.log.find("Old poi_vertices.bin is not the one the patch was made from") != std::string::npos);
 }
 
 // Random days of the five string tiers: old pools of random strings (empty
@@ -1991,17 +2114,18 @@ TEST(patch_lowmem_refuses_counts_and_lengths_that_wrap_32_bits) {
     CHECK(apply_both_modes(c).empty());
 }
 
-// A parent and its child stream replayed out of step are refused in sync and
-// --threads once the shared decoder holds 4 MiB (MAX_DECODER_SKEW) of the
-// file left behind. 150,000 POIs with the same 8-vertex block, and the two
-// POI sections rebuilt by hand, both giving the new set (new = old): the
-// child runs ahead when every record is inserted before the old ones are
-// deleted while its block is matched from the old ones (the decoder queues
-// each old record it passes for the parent's reader: 5.4 MB of them), and
-// the parent runs ahead when the records are matched while their blocks are
-// inserted but for the last, matched from the first old block (it queues
-// each old block for the child's reader: 6.3 MB). The patch as made applies.
-TEST(patch_lowmem_refuses_a_parent_and_child_replayed_out_of_step) {
+// The POI records and their vertex stream replayed out of step apply in
+// every mode: the POI replay reads the old rows and the old vertex stream
+// through cursors of their own (poi_replay.h), so neither holds what the
+// other passes. 150,000 POIs with the same 8-vertex block, and the two POI
+// sections rebuilt by hand, both giving the new set (new = old): the child
+// runs ahead when every record is inserted before the old ones are deleted
+// while its block is matched from the old ones (5.4 MB of old records a
+// shared decoder would hold for the parent's reader), and the parent runs
+// ahead when the records are matched while their blocks are inserted but for
+// the last, matched from the first old block (6.3 MB of old blocks it would
+// hold for the child's). The patch as made applies.
+TEST(patch_lowmem_replays_poi_records_and_vertices_out_of_step) {
     ScratchDir dir("lowmem-skew");
     std::mt19937 rng(20261030);
     const std::vector<char> shared = block(rng, 8);
@@ -2051,13 +2175,12 @@ TEST(patch_lowmem_refuses_a_parent_and_child_replayed_out_of_step) {
     struct Case {
         std::string name;
         std::vector<char> parent_ops, child_ops;
-        std::string refusal;
     };
-    Case child_ahead{"child-ahead", {}, {}, "Malformed merge sequence: poi_vertices.bin runs ahead of poi_records.bin"};
+    Case child_ahead{"child-ahead", {}, {}};
     op(child_ahead.parent_ops, OP_INSERT_RUN, n, records.data(), POI_RECORD_STRIDE);
     op(child_ahead.parent_ops, OP_DELETE_RUN, n);
     op(child_ahead.child_ops, OP_MATCH_RUN, v);
-    Case parent_ahead{"parent-ahead", {}, {}, "Malformed merge sequence: poi_records.bin runs ahead of poi_vertices.bin"};
+    Case parent_ahead{"parent-ahead", {}, {}};
     op(parent_ahead.parent_ops, OP_MATCH_RUN, n);
     op(parent_ahead.child_ops, OP_INSERT_RUN, v - b, vertices.data(), 1);
     op(parent_ahead.child_ops, OP_MATCH_RUN, b);
@@ -2067,12 +2190,12 @@ TEST(patch_lowmem_refuses_a_parent_and_child_replayed_out_of_step) {
                                     merge(PatchFileId::POI_VERTICES, 1, vertices.size(), e.child_ops)})
             edited.insert(edited.end(), section.begin(), section.end());
         edited.insert(edited.end(), raw.begin() + at + copies.size(), raw.end());
-        const std::string patch = c.dir(e.name + ".gcpatch");
-        REQUIRE(write_patch(c, patch, edited));
+        REQUIRE(write_patch(c, c.patch(), edited));
 
-        CHECK(not_refused(c, ENCODED_MODES, patch, e.name, e.refusal).empty());
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
     }
-    CHECK(apply_both_modes(c).empty());
+    REQUIRE(write_patch(c, c.patch(), raw));
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
 // Counts and lengths the patch gives, each made to name 2^32 bytes more than

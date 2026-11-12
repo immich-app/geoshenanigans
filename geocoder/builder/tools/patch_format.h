@@ -669,6 +669,12 @@ inline void close_patch_outputs(std::initializer_list<std::pair<FILE*, std::stri
 // (parse_parent_id_remap).
 static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 
+// The old poi_vertices.bin's hash: marker(4), content_hash of the file (u64),
+// right before the POI records' section. The patcher's POI replay
+// (poi_replay.h) copies the old blocks a day leaves whole without decoding
+// them, and checks them by it.
+static constexpr uint32_t POI_VERTICES_HASH_MARKER = 0xFFFFFFF8;
+
 // --- Reading a part of the patch ---
 
 // How a SectionReader words its refusal of a read past its end.

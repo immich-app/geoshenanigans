@@ -183,9 +183,11 @@ struct Store {
 
     // --- old side ---
     // The decoded size check for require_old_file_size: the manifest's size when it gives one.
+    // A native family's from its footer, with no decoder made (the POI replay reads the files
+    // itself).
     void check_old_size(const std::string& name, uint64_t expected) {
         auto [fi, port] = file_port.at(name);
-        const uint64_t ds = decoder(fi)->decoded_size(port);
+        const uint64_t ds = families()[size_t(fi)].native ? poi::decoded_size(cur_dir, port) : decoder(fi)->decoded_size(port);
         if (ds != ~0ull && ds != expected)
             die("old %s decodes to %llu bytes, the patch expects %llu", name.c_str(), (unsigned long long)ds, (unsigned long long)expected);
     }

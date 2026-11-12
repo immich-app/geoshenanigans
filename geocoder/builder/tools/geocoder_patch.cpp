@@ -56,6 +56,7 @@
 #include "sequential_file_reader.h"
 #include "gcs_patch.h"
 #include "patch_decompress.h"
+#include "poi_replay.h"
 
 
 // --- Helpers ---
@@ -550,6 +551,9 @@ static int run(int argc, char* argv[]) {
     // remap the address replay moves parent_way_id by.
     SortedTable<RemapPair> poi_street_remap;
     bool saw_parent_remap = false;  // a patch gives one
+    // The old poi_vertices.bin's hash (POI_VERTICES_HASH_MARKER), which the POI replay checks the
+    // blocks it copies by.
+    std::optional<uint64_t> poi_vertices_hash;
     auto poi_remap_lookup = [](const SortedTable<RemapPair>& t, uint32_t old_id) {
         const std::optional<RemapPair> p = t.find(old_id);
         return p ? p->to : old_id;
@@ -657,6 +661,11 @@ static int run(int argc, char* argv[]) {
             poi_street_remap = parse_parent_id_remap(P, patch_size, pos);
             if (!poi_street_remap.empty()) take_street_pairs("POI parent-id remap");
             std::cerr << "  POI parent-id remap: street_pairs=" << poi_street_remap.size() << std::endl;
+            continue;
+        }
+        if (file_id == POI_VERTICES_HASH_MARKER) {
+            if (poi_vertices_hash) throw std::runtime_error("Malformed patch: a second hash of the old poi_vertices.bin");
+            poi_vertices_hash = patch.u64();
             continue;
         }
         if (file_id == CELL_INDEX_DELTA_MARKER) {
@@ -947,6 +956,61 @@ static int run(int argc, char* argv[]) {
         // A run hint per field: a field whose offsets ascend in record order
         // (POI names, the POI tier's order) mostly skips the run search.
         std::vector<size_t> remap_hints(remap_offs.size(), 0);
+
+        // The POI records and their blocks replay on R2 + V2 as they sit (poi_replay.h): a block
+        // the day leaves whole is copied, the rest decoded and encoded again.
+        if (joint && file_id == (uint32_t)PatchFileId::POI_RECORDS && old_size > 0) {
+            if (!poi_vertices_hash) throw std::runtime_error("Malformed patch: POI records without the old poi_vertices.bin's hash");
+            const uint64_t seq_size = patch.u64();
+            patch.require(seq_size, "merge sequence");
+            const size_t seq_at = pos, seq_end = pos + seq_size;
+            merge_seqs[file_id] = {seq_at, (size_t)seq_size, actual_stride};
+            const uint64_t n_old_records = old_size / actual_stride;
+            const bool track = is_remapped_record_file(file_id);
+            RecordRemap remap(track ? static_cast<uint32_t>(n_old_records) : 0, tmpdir);
+            // A MATCH record's string fields and vertex_offset, as the generic replay moves them.
+            auto fix = [&](uint8_t* rec, uint64_t old_index, uint32_t k, uint64_t run_first, uint32_t run_count) {
+                if (has_fixups && k < OffsetFixupReader::reach(run_first, run_count)) {
+                    uint32_t old_off;
+                    memcpy(&old_off, rec + fixup_off, 4);
+                    const uint32_t new_off = fixups.apply(static_cast<uint32_t>(old_index), old_off);
+                    memcpy(rec + fixup_off, &new_off, 4);
+                }
+                const uint64_t slot = old_index * remap_offs.size();
+                for (size_t f = 0; f < remap_offs.size(); f++) {
+                    uint32_t v;
+                    memcpy(&v, rec + remap_offs[f], 4);
+                    const uint32_t nv = string_fixups.fixes(slot + f) ? string_fixups.take() : str_remap.lookup(v, remap_hints[f]);
+                    memcpy(rec + remap_offs[f], &nv, 4);
+                }
+            };
+            const std::string to = listed.count(fname) ? out_dir : tmpdir;
+            const poi_replay::Result r = poi_replay::replay(
+                P, patch_size, seq_at, seq_end, cur_dir, to, old_size, new_size, file_records_max, *poi_vertices_hash, fix,
+                [&](uint64_t o, uint64_t n, uint32_t count) {
+                    if (track) remap.add_match(static_cast<uint32_t>(o), static_cast<uint32_t>(n), count);
+                });
+            fixups.finish(n_old_records);
+            string_fixups.finish();
+            if (r.child.kind == poi_replay::ChildOps::MERGE)
+                merge_seqs[(uint32_t)PatchFileId::POI_VERTICES] = {r.child.seq, r.child.seq_end - r.child.seq, 1};
+            pos = r.child.section_end;
+            std::cerr << "  poi_vertices.bin: " << r.vertex_bytes << " bytes, replayed with poi_records.bin: blocks "
+                      << r.copied << " copied, " << r.encoded << " encoded" << std::endl;
+            gcs::store().report.push_back("decode poi: queue peaks " + std::to_string(r.decode_peaks[0]) + " " +
+                                          std::to_string(r.decode_peaks[1]) + " B");
+            gcs::store().report.push_back("encode poi: queue peaks " + std::to_string(r.encode_peaks[0]) + " " +
+                                          std::to_string(r.encode_peaks[1]) + " B");
+            if (track) remap.finish_runs();
+            const std::string fixed_strings =
+                n_string_fixups > 0 ? ", " + std::to_string(n_string_fixups) + " string fixups" : std::string();
+            std::cerr << "  " << fname << ": " << r.records_bytes << " bytes (remap of " << n_old_records << " records, "
+                      << remap.run_count() << " runs" << fixed_strings << ")" << section_io() << std::endl;
+            if (track) record_remaps[file_id] = std::move(remap);
+            madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
+            malloc_trim(0);
+            continue;
+        }
 
         // The old file, read front to back (DELETE runs skip forward).
         SequentialFileReader old(cur_dir + "/" + std::string(fname));

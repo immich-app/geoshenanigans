@@ -1740,6 +1740,17 @@ static int run(int argc, char* argv[]) {
         serialize_merge(patch, res_addr_v, old_dir, new_dir, patcher_strings, offset_fixup_limits);
         { std::vector<char>().swap(res_addr_v.seq.data); }
     }
+    // The old V2 file's hash, before the POI records' section: the patcher's POI replay copies the
+    // blocks the day leaves whole and checks them by it.
+    if (struct stat vst; (res_poi_r.old_size || res_poi_r.new_size) && stat((old_dir + "/poi_vertices.bin").c_str(), &vst) == 0) {
+        MappedFile v = mmap_file(old_dir + "/poi_vertices.bin");
+        if (!v.data) throw std::runtime_error("Cannot read " + old_dir + "/poi_vertices.bin");
+        const uint64_t h = content_hash(v.data, v.size);
+        unmap_file(v);
+        const uint32_t marker = POI_VERTICES_HASH_MARKER;
+        patch.insert(patch.end(), reinterpret_cast<const char*>(&marker), reinterpret_cast<const char*>(&marker) + 4);
+        patch.insert(patch.end(), reinterpret_cast<const char*>(&h), reinterpret_cast<const char*>(&h) + 8);
+    }
     serialize_merge(patch, res_poi_r, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     serialize_merge(patch, res_poi_v, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     { std::vector<char>().swap(res_poi_v.seq.data); }

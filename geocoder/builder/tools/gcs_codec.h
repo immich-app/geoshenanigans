@@ -905,12 +905,33 @@ inline poi_files::RowDecoder open_rows(const std::string& path, uint64_t size) {
     return poi_files::RowDecoder(ft, dicts.data());
 }
 
+// A dir's POI files' decoded sizes (Dec::decoded_size), from the R2 footer alone: 0 without the
+// file.
+inline uint64_t decoded_size(const std::string& dir, int port) {
+    const std::string rp = dir + "/poi_records.bin";
+    struct stat st;
+    if (stat(rp.c_str(), &st) != 0) return 0;
+    const uint64_t size = uint64_t(st.st_size);
+    uint8_t f[poi_files::FOOTER_BYTES] = {};
+    if (size >= poi_files::FOOTER_BYTES) {
+        const int fd = open(rp.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) die("open %s: %s", rp.c_str(), strerror(errno));
+        pread_all(fd, f, poi_files::FOOTER_BYTES, size - poi_files::FOOTER_BYTES, rp);
+        close(fd);
+    }
+    const poi_files::Footer ft = poi_files::read_footer(f, size);
+    return port == 0 ? poi_files::LOGICAL_STRIDE * ft.rows : ft.logical_vertex_bytes;
+}
+
 // Ports: 0 = poi_records (36 B), 1 = poi_vertices. A step: one record and its block, or a piece of a
-// block too large to take whole. A dir without the two files decodes to none.
+// block too large to take whole. A dir without the two files decodes to none. vertices_only: the
+// POI replay's vertex cursor (poi_replay.h), which reads port 1 alone (port 0 closed) and skips
+// ahead: a block its pending skip covers whole passes undecoded.
 struct Dec : Decoder {
     poi_files::RowDecoder rows;
     std::unique_ptr<Reader> R, V;
     uint64_t n = 0, i = 0, logical = 0, blocks_end = 0;
+    bool vertices_only = false;
     // a block in pieces
     std::unique_ptr<poi_files::VertexDecoder> big;
     poi_files::Block blk;
@@ -977,6 +998,13 @@ struct Dec : Decoder {
         if (blk.bytes() > left) poi_files::malformed("row " + std::to_string(i - 1) + ": a block past the end of poi_vertices.bin");
         if (blk.logical_bytes() > rows.footer().logical_vertex_bytes - logical) poi_files::past_vertex_stream(i - 1, rows.footer());
         if (logical >= NO) poi_files::malformed("a logical vertex stream of 4 GiB or more");
+        if (vertices_only && drop[1] >= blk.logical_bytes()) {
+            logical += blk.logical_bytes();
+            V->seek(V->tell() + blk.bytes());
+            drop[1] -= blk.logical_bytes();
+            if (!drop[1]) dropping--;
+            return true;
+        }
         wr32(rec + poi_files::OFF_VERTEX_OFFSET, uint32_t(logical));
         wr32(rec + poi_files::OFF_VERTEX_COUNT, uint32_t(blk.vertex_count()));
         emit(0, rec, poi_files::LOGICAL_STRIDE);
@@ -1051,6 +1079,19 @@ struct Enc : Encoder {
         logical += big_size;
         big = false;
     }
+    // A record whose block is an old one as it is (the POI replay copies the blocks a patch leaves
+    // whole): put_coded_row(rec) with nothing queued, the block's bytes through put_coded_bytes,
+    // then end_coded(its logical bytes).
+    void put_coded_row(const uint8_t* rec) {
+        if (big || in[0].size() || in[1].size()) die("poi: a copied block among queued records");
+        const uint32_t vo = rd32(rec + poi_files::OFF_VERTEX_OFFSET);
+        if (vo != logical) die("poi_records %llu: polygons not back to back in record order", (unsigned long long)rows.rows());
+        uint8_t row[poi_files::ROW_BYTES];
+        rows.encode(rec, O->tell(), row);
+        RW->put(row, poi_files::ROW_BYTES);
+    }
+    void put_coded_bytes(const uint8_t* p, size_t n) { O->put(p, n); }
+    void end_coded(uint64_t logical_bytes) { logical += logical_bytes; }
     void pump() override {
         ByteQueue &R = in[0], &V = in[1];
         for (;;) {

@@ -467,6 +467,19 @@ Parent-id remap: marker 0xFFFFFFF3 (u32)
   street_ways pairs as well is refused. At most one such section: the
   patcher refuses a second ("Malformed POI parent-id remap: a second one").
 
+Old POI vertices' hash: marker 0xFFFFFFF8 (u32) + content_hash of the old
+  poi_vertices.bin file (u64), right before the POI records' section of a dir
+  with POI files. The patcher replays the POI records and their blocks on R2
+  and V2 as they sit (`tools/poi_replay.h`): a new record whose polygon is
+  the old record's, one MATCH of its block's logical bytes, at the same lat
+  and lng, gets that block as it is (a V2 block is a function of its polygon
+  and its record's lat and lng alone); every other polygon is decoded from
+  the old file (the blocks asked for alone) and encoded again, and every row
+  decoded and encoded again (its string ids move). The copied blocks are
+  never decoded: the replay hashes the old file as it passes it and refuses
+  one of another hash ("Old poi_vertices.bin is not the one the patch was
+  made from"), and a POI records section without the hash before it.
+
 Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64) + ...
   (the patcher refuses an old file of another size, 0 meaning absent)
   stride=0: full replacement (n_fixups=0 u32, size u64, data)
