@@ -230,22 +230,14 @@ pub fn encode_ring(refs: &[Ref], box_of: impl Fn(u32) -> RawBox) -> Vec<u8> {
 
 /// A record's 24 bytes as admin_polygons.bin stores it.
 pub fn record_bytes(p: &AdminPolygon) -> Vec<u8> {
-    let b = [
-        &p.ring_offset.to_le_bytes()[..], &p.ring_bytes.to_le_bytes(), &p.name_id.to_le_bytes(),
-        &[p.admin_level, p.place_type_override, p._pad2, p._pad3], &p.area.to_le_bytes(),
-        &p.country_code.to_le_bytes(), &p.hole_count.to_le_bytes(),
-    ]
-    .concat();
-    assert_eq!(b.len(), std::mem::size_of::<AdminPolygon>());
-    b
+    p.record_bytes().to_vec()
 }
 
 /// A record with every field but the name, level and area at 0, for `ArcFixture::polygon` to
 /// give its rings.
 pub fn record(name_id: u32, admin_level: u8, area: f32) -> AdminPolygon {
     AdminPolygon {
-        ring_offset: 0, ring_bytes: 0, name_id, admin_level, place_type_override: 0, _pad2: 0, _pad3: 0, area,
-        country_code: 0, hole_count: 0,
+        ring_offset: 0, ring_bytes: 0, name_id, admin_level, place_type_override: 0, area, country_code: 0,
     }
 }
 
@@ -296,7 +288,7 @@ impl ArcFixture {
     }
 
     /// A polygon whose rings, outer first, are the refs given (none: a polygon without rings).
-    /// The record's ring_offset, ring_bytes and hole_count are set from them; its slot.
+    /// The record's ring_offset and ring_bytes are set from them; its slot.
     pub fn polygon(&mut self, record: AdminPolygon, rings: &[Vec<Ref>]) -> u32 {
         self.polygons.push((record, rings.to_vec()));
         self.polygons.len() as u32 - 1
@@ -310,7 +302,7 @@ impl ArcFixture {
 
     /// A polygon slot's tombstone: no rings and no name.
     pub fn tombstone(&mut self) -> u32 {
-        self.polygon(AdminPolygon { ring_offset: NO_DATA, name_id: NO_DATA, ..record(0, 0, 0.0) }, &[])
+        self.polygon(AdminPolygon { name_id: NO_DATA, ..record(0, 0, 0.0) }, &[])
     }
 
     pub fn arc_index(&self) -> Vec<u8> {
@@ -334,18 +326,11 @@ impl ArcFixture {
     }
 
     /// Each polygon's record as written: its ring block's offset and length in admin_rings.bin
-    /// and its hole count (a tombstone keeps NO_DATA).
+    /// (a tombstone's empty block at the running offset).
     pub fn records(&self) -> Vec<AdminPolygon> {
         let mut offset = 0u32;
-        self.polygons.iter().zip(self.ring_blocks()).map(|((record, rings), block)| {
-            let written = if record.ring_offset == NO_DATA {
-                *record
-            } else {
-                AdminPolygon {
-                    ring_offset: offset, ring_bytes: block.len() as u32,
-                    hole_count: rings.len().saturating_sub(1).min(u16::MAX as usize) as u16, ..*record
-                }
-            };
+        self.polygons.iter().zip(self.ring_blocks()).map(|((record, _), block)| {
+            let written = AdminPolygon { ring_offset: offset, ring_bytes: block.len() as u32, ..*record };
             offset += block.len() as u32;
             written
         }).collect()

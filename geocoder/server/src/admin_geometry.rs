@@ -8,7 +8,7 @@ use crate::arc_blocks::{
     CHUNK_BOX_SLACK_E7,
 };
 use crate::exact_pip::{edge_crosses, on_edge, to_e7, PointE7};
-use crate::{mmap_file, AdminPolygon, FileBytes, NO_DATA};
+use crate::{mmap_file, AdminPolygon, FileBytes};
 use std::sync::Mutex;
 
 /// A point as every admin test takes it: rounded once to the e7 grid, as the builder rounds the
@@ -195,6 +195,11 @@ impl AdminGeometry {
         Ok(AdminGeometry::new(rings?, arc_index?, arc_vertices?))
     }
 
+    /// admin_rings.bin's length, where the last polygon's ring block ends.
+    pub fn rings_len(&self) -> u64 {
+        self.rings.len()
+    }
+
     fn arcs(&self) -> ArcFiles<'_> {
         ArcFiles { index: self.arc_index.as_slice(), vertices: self.arc_vertices.as_slice() }
     }
@@ -202,11 +207,12 @@ impl AdminGeometry {
     /// `poly`'s ring block; none for a tombstone, a polygon a tier left without rings, and a
     /// block past the end of the file.
     fn ring_block(&self, poly: &AdminPolygon) -> Option<&[u8]> {
-        if poly.ring_offset == NO_DATA || poly.ring_bytes == 0 {
+        if poly.ring_bytes == 0 {
             return None;
         }
-        let start = usize::try_from(poly.ring_offset).ok()?;
-        self.rings.as_slice().get(start..start.checked_add(usize::try_from(poly.ring_bytes).ok()?)?)
+        // The format's u32 offsets address 4 GiB of rings: no block ends past that.
+        let end = poly.ring_offset.checked_add(poly.ring_bytes)?;
+        self.rings.as_slice().get(usize::try_from(poly.ring_offset).ok()?..usize::try_from(end).ok()?)
     }
 
     /// Whether `poly` has rings: false for a tombstone, a polygon a tier left without rings, and
@@ -291,13 +297,14 @@ impl AdminGeometry {
 
     /// Hints that `poly`'s rings are read soon. Never changes an answer.
     pub fn prefetch(&self, poly: &AdminPolygon) {
-        if poly.ring_offset != NO_DATA {
+        if poly.ring_bytes != 0 {
             self.rings.prefetch(poly.ring_offset as u64);
         }
     }
 
     /// The memo key of `poly`'s ring block, whose answer depends on nothing else. Never all ones:
-    /// `contains` keys no block at offset NO_DATA.
+    /// a block ends within the 4 GiB its u32 offset addresses (`ring_block`), so one at offset
+    /// u32::MAX is empty, and an empty block has no key.
     fn block_key(poly: &AdminPolygon) -> u64 {
         (poly.ring_offset as u64) << 32 | poly.ring_bytes as u64
     }

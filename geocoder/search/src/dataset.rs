@@ -19,11 +19,13 @@ use std::path::Path;
 /// The geocoder files an index is derived from: the records its postings point at, the string
 /// tiers of their names and the boundary geometry its label points come from, the boundary tier's
 /// own arcs among it (the records and rings are the same in every tier).
-pub const DATASET_FILES: [&str; 9] = [
+pub const DATASET_FILES: [&str; 11] = [
     "admin_polygons.bin",
     "admin_rings.bin",
     "arc_index.bin",
     "arc_vertices.bin",
+    "place_cells.bin",
+    "place_hidden.bin",
     "place_nodes.bin",
     "poi_records.bin",
     "strings_core.bin",

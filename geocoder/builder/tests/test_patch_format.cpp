@@ -5,10 +5,12 @@
 // load-bearing: diff and patch must agree on them byte-for-byte).
 #include "cell_index_io.h"
 #include "patch_format.h"
+#include "place_files.h"
 #include "scratch_dir.h"
 
 #include <algorithm>
 #include <array>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -353,9 +355,9 @@ TEST(patch_format_stride_sentinels_no_collision_with_real_strides) {
         4,   // u32 id arrays (entries, parents, postcodes)
         8,   // NodeCoord, cell_id
         12,  // WayHeader / admin_cells / poi_cells
-        16,  // postcode_centroid value_stride, empty addr_points
-        20,  // PlaceNode / geo_cell
-        24,  // InterpWay / AdminPolygon
+        16,  // postcode_centroid value_stride, empty addr_points, AdminPolygonRecord
+        20,  // geo_cell
+        24,  // InterpWay / logical place node
         28,  // AddrPoint
         36,  // PoiRecord
     };
@@ -385,9 +387,9 @@ TEST(patch_format_section_marker_values) {
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v15 = cell list deltas as runs (v14: admin geometry as
-    // arcs, merged by slot). The patcher accepts this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(15));
+    // diff/patch tools. v16 = 16-byte admin polygon records (v15: cell list
+    // deltas as runs). The patcher accepts this version only.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(16));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
@@ -425,9 +427,10 @@ TEST(patch_format_record_strides_match_the_builder) {
     CHECK_EQ(WAY_HEADER_STRIDE, sizeof(WayHeader));
     CHECK_EQ(ADDR_POINT_STRIDE, sizeof(AddrPoint));
     CHECK_EQ(INTERP_WAY_STRIDE, sizeof(InterpWay));
-    CHECK_EQ(ADMIN_POLYGON_STRIDE, sizeof(AdminPolygon));
+    CHECK_EQ(ADMIN_POLYGON_STRIDE, sizeof(AdminPolygonRecord));
+    CHECK_EQ(ADMIN_POLYGON_NAME_ID_OFF, offsetof(AdminPolygonRecord, name_id));
     CHECK_EQ(POI_RECORD_STRIDE, sizeof(PoiRecord));
-    CHECK_EQ(PLACE_NODE_STRIDE, sizeof(PlaceNode));
+    CHECK_EQ(PLACE_NODE_STRIDE, sizeof(place_files::LogicalPlace));
 }
 
 TEST(patch_format_record_node_count_reads_u16) {
@@ -756,7 +759,7 @@ TEST(patch_format_string_fields_match_the_record_layouts) {
     CHECK(string_field_offsets(PatchFileId::ADDR_POINTS) == V({8, 12}));  // not parent_way_id at 16
     CHECK(string_field_offsets(PatchFileId::STREET_WAYS) == V({8}));
     CHECK(string_field_offsets(PatchFileId::INTERP_WAYS) == V({8}));
-    CHECK(string_field_offsets(PatchFileId::ADMIN_POLYGONS) == V({8}));
+    CHECK(string_field_offsets(PatchFileId::ADMIN_POLYGONS) == V({4}));
     CHECK(string_field_offsets(PatchFileId::POI_RECORDS) == V({16, 24, 28}));  // not parent_poly_id at 32
     CHECK(string_field_offsets(PatchFileId::PLACE_NODES) == V({8}));  // not parent_poly_id at 16
     CHECK(string_field_offsets(PatchFileId::STREET_NODES).empty());

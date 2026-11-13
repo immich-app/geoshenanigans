@@ -49,14 +49,11 @@
 #include "merge_sequence.h"
 #include "parallel.h"
 #include "patch_format.h"
+#include "place_files.h"
 #include "poi_files.h"
 #include "scratch_dir.h"
 #include "record_match.h"
 #include "string_offset_map.h"
-
-// Sentinel meaning "no offset / no data / unmapped id" in cell offset fields
-// and id-remap tables. Emitted/compared as a raw uint32_t.
-static constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
 
 // Section offset probes for the section-size breakdown (built with -DSEC_PROBES).
 #ifdef SEC_PROBES
@@ -517,30 +514,33 @@ struct FileMergeResult {
 // A record file that feeds entry corrections merges as itself when unchanged
 // (sent_unchanged), so the diff derives its dependents with the ids the
 // patcher keeps.
-// The merges diff the POI files' logical form: each dir's R2 and V2 files
-// (poi_files.h) are decoded at the start into a scratch dir of their own,
-// which merge_path reads them from.
-static std::map<std::string, std::string>& logical_poi_dirs() {
+// The merges diff the POI and place files' logical form: each dir's R2 and V2
+// files (poi_files.h) and its place files (place_files.h, their logical
+// stream as place_nodes.bin) are decoded at the start into a scratch dir of
+// their own, which merge_path reads them from.
+static std::map<std::string, std::string>& logical_dirs() {
     static std::map<std::string, std::string> dirs;
     return dirs;
 }
-static bool is_poi_file(const std::string& name) { return name == "poi_records.bin" || name == "poi_vertices.bin"; }
-// The file a merge reads for name in dir: the decoded one for a POI file.
+static bool is_logical_file(const std::string& name) {
+    return name == "poi_records.bin" || name == "poi_vertices.bin" || name == place_files::NODES_FILE;
+}
+// The file a merge reads for name in dir: the decoded one for a POI file or
+// place_nodes.bin.
 static std::string merge_path(const std::string& dir, const std::string& name) {
-    if (is_poi_file(name)) {
-        auto it = logical_poi_dirs().find(dir);
-        if (it != logical_poi_dirs().end()) return it->second + "/" + name;
+    if (is_logical_file(name)) {
+        auto it = logical_dirs().find(dir);
+        if (it != logical_dirs().end()) return it->second + "/" + name;
     }
     return dir + "/" + name;
 }
-// Decodes dir's POI files into to (a new dir); false: dir has none.
+// Decodes dir's POI files into to; false: dir has none.
 static bool decode_poi_files(const std::string& dir, const std::string& to) {
     const std::string rp = dir + "/poi_records.bin", vp = dir + "/poi_vertices.bin";
     struct stat st;
     const bool has_r = stat(rp.c_str(), &st) == 0, has_v = stat(vp.c_str(), &st) == 0;
     if (!has_r && !has_v) return false;
     if (!has_r || !has_v) throw std::runtime_error(dir + " has one of poi_records.bin and poi_vertices.bin");
-    if (mkdir(to.c_str(), 0700) != 0) throw std::runtime_error("Cannot create " + to);
     MappedFile r = mmap_file(rp), v = mmap_file(vp);
     if (!r.data || !v.data) throw std::runtime_error("Cannot read the POI files of " + dir);
     std::ofstream ro(to + "/poi_records.bin", std::ios::binary), vo(to + "/poi_vertices.bin", std::ios::binary);
@@ -551,6 +551,41 @@ static bool decode_poi_files(const std::string& dir, const std::string& to) {
     unmap_file(v);
     if (!ro.flush() || !vo.flush()) throw std::runtime_error("Cannot write the decoded POI files of " + dir);
     return true;
+}
+// Decodes dir's place files into to's place_nodes.bin, their logical stream;
+// false: dir has none.
+static bool decode_place_files(const std::string& dir, const std::string& to) {
+    const std::string names[] = {place_files::CELLS_FILE, place_files::NODES_FILE, place_files::HIDDEN_FILE};
+    MappedFile m[3];
+    int has = 0;
+    for (int k = 0; k < 3; k++) {
+        struct stat st;
+        if (stat((dir + "/" + names[k]).c_str(), &st) != 0) {
+            m[k] = {nullptr, 0};
+            continue;
+        }
+        has++;
+        m[k] = mmap_file(dir + "/" + names[k]);
+        if (static_cast<uint64_t>(st.st_size) != m[k].size) throw std::runtime_error("Cannot read " + dir + "/" + names[k]);
+    }
+    if (!has) return false;
+    if (has != 3) throw std::runtime_error(dir + " has some of the place files");
+    auto u8 = [](const MappedFile& f) { return reinterpret_cast<const uint8_t*>(f.data); };
+    std::ofstream o(to + "/" + place_files::NODES_FILE, std::ios::binary);
+    place_files::decode(u8(m[0]), m[0].size, u8(m[1]), m[1].size, u8(m[2]), m[2].size, [&](const place_files::LogicalPlace& p) {
+        o.write(reinterpret_cast<const char*>(&p), place_files::LOGICAL_STRIDE);
+    });
+    for (MappedFile& f : m)
+        if (f.data) unmap_file(f);
+    if (!o.flush()) throw std::runtime_error("Cannot write the decoded place files of " + dir);
+    return true;
+}
+// Decodes dir's POI and place files into to (a new dir); false: dir has
+// neither.
+static bool decode_logical_files(const std::string& dir, const std::string& to) {
+    if (mkdir(to.c_str(), 0700) != 0) throw std::runtime_error("Cannot create " + to);
+    const bool poi = decode_poi_files(dir, to);
+    return decode_place_files(dir, to) || poi;
 }
 
 // A string tier's pool, as the diff reads it: the file at path (FCC2,
@@ -771,6 +806,7 @@ static uint32_t append_remap_pairs(std::vector<char>& buf, const std::unordered_
 static std::vector<ClientFile> list_client_files(const std::string& dir, std::list<std::vector<char>>& contents) {
     std::unordered_set<std::string> section_files(std::begin(patch_file_names), std::end(patch_file_names));
     section_files.erase("strings.bin");  // legacy single pool, never emitted
+    section_files.insert(std::begin(PLACE_SIDE_FILES), std::end(PLACE_SIDE_FILES));
     std::vector<ClientFile> files;
     DIR* d = opendir(dir.c_str());
     if (!d) throw std::runtime_error("Cannot read " + dir);
@@ -900,26 +936,26 @@ static int run(int argc, char* argv[]) {
     }
     ScratchDir scratch("geocoder-diff");
     {
-        const std::string old_to = scratch.path() + "/old-poi", new_to = scratch.path() + "/new-poi";
+        const std::string old_to = scratch.path() + "/old-logical", new_to = scratch.path() + "/new-logical";
         bool old_has = false, new_has = false;
         std::exception_ptr old_failed, new_failed;
         std::thread t_old([&] {
             try {
-                old_has = decode_poi_files(old_dir, old_to);
+                old_has = decode_logical_files(old_dir, old_to);
             } catch (...) {
                 old_failed = std::current_exception();
             }
         });
         try {
-            new_has = decode_poi_files(new_dir, new_to);
+            new_has = decode_logical_files(new_dir, new_to);
         } catch (...) {
             new_failed = std::current_exception();
         }
         t_old.join();
         if (old_failed) std::rethrow_exception(old_failed);
         if (new_failed) std::rethrow_exception(new_failed);
-        if (old_has) logical_poi_dirs()[old_dir] = old_to;
-        if (new_has && new_dir != old_dir) logical_poi_dirs()[new_dir] = new_to;
+        if (old_has) logical_dirs()[old_dir] = old_to;
+        if (new_has && new_dir != old_dir) logical_dirs()[new_dir] = new_to;
     }
     // A family's keys from one day's sidecar (see identity_keys). A sidecar
     // that is not one key per record is rejected with a warning: the family
@@ -1607,8 +1643,9 @@ static int run(int argc, char* argv[]) {
     // Group 6: place_nodes (no child files, simple fixed-stride merge)
     std::thread t_place([&]() {
         double gs = now_ms();
-        auto old_data = mmap_file_rw(old_dir + "/place_nodes.bin");
-        auto new_data = mmap_file(new_dir + "/place_nodes.bin");
+        // The place files' logical streams (decode_place_files).
+        auto old_data = mmap_file_rw(merge_path(old_dir, place_files::NODES_FILE));
+        auto new_data = mmap_file(merge_path(new_dir, place_files::NODES_FILE));
         // Handle missing place files gracefully (new feature, old builds may not have them)
         if (new_data.size == 0 && old_data.size == 0) {
             res_place_n = {PatchFileId::PLACE_NODES, "place_nodes.bin", place_stride, 0, 0, MergeSequence{}, {}};
@@ -1622,12 +1659,9 @@ static int run(int argc, char* argv[]) {
         // is an admin slot, which a polygon keeps.
         if (old_data.size > 0)
             remap_string_fields(old_data.data, old_data.size, PatchFileId::PLACE_NODES, place_stride, str_remap);
-        // Positional merge: strategy-2 keeps each place in its slot, so the
-        // files are in slot order, not (type, name, lat, lng) order. The
-        // key-sorted merge this replaced re-sent nearly the whole file daily
-        // (planet: 3.1M of 4.1M places secondary-matched).
-        // No id remap: no file the patch rebuilds holds place node ids (the
-        // place cell index ships in no dir).
+        // A merge of the logical rows, the visible nodes in cell order and
+        // then the hidden ones: a day's new node is an INSERT among MATCH
+        // runs. No id remap: no file the patch rebuilds holds place node ids.
         auto pn_seq = unchanged ? match_all(old_data.size / place_stride)
                                 : build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, place_stride);
         res_place_n = {PatchFileId::PLACE_NODES, "place_nodes.bin", place_stride,

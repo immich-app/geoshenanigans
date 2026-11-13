@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <vector>
 #include <string>
 
@@ -106,23 +107,50 @@ static constexpr double VERTEX_SCALE[4] = {1e-5, 1e-4, 1e-6, 1e-7};  // degrees 
 // point-only and would otherwise carry unused bbox_min fields.
 static constexpr uint32_t POLY_HEADER_BYTES = 10;
 
-// An admin_polygons.bin record. Its rings are its ring block in its dir's
-// admin_rings.bin (arc_blocks.h), bytes [ring_offset, ring_offset +
-// ring_bytes): the outer ring, then the holes.
+// An admin polygon as the builder holds it. Its dirs store it as an
+// AdminPolygonRecord, its rings the record's ring block in the dir's
+// admin_rings.bin (arc_blocks.h): the outer ring, then the holes.
 struct AdminPolygon {
+    // NO_DATA for a strategy-2 tombstone, else 0: where the ring block lies
+    // is each dir's (write_ring_files).
     uint32_t ring_offset;
-    uint32_t ring_bytes;
     uint32_t name_id;
     uint8_t admin_level;
     uint8_t place_type_override = 0; // AdminPlaceType — overrides admin_level for field mapping
     uint8_t _pad2 = 0, _pad3 = 0;
     float area;                   // of the exact rings, holes subtracted
     uint16_t country_code;
-    // How many holes follow the outer ring, at most UINT16_MAX: the reader
-    // walks the block's rings by ring_bytes, so this only informs.
-    uint16_t hole_count = 0;
+    uint16_t _pad4 = 0;
 };
-static_assert(sizeof(AdminPolygon) == 24, "AdminPolygon must be 24 bytes");
+static_assert(sizeof(AdminPolygon) == 20, "AdminPolygon must be 20 bytes");
+
+// An admin_polygons.bin record. Its ring block runs from its ring_offset to
+// the next record's (the last one's to the end of admin_rings.bin): every
+// record's offset is the running one, a tombstone's included, whose block is
+// empty, as is that of a polygon a tier left without rings. A tombstone's
+// name_id is NO_DATA. level_override is admin_level << 4 | the
+// place_type_override, both under 16.
+struct AdminPolygonRecord {
+    uint32_t ring_offset;
+    uint32_t name_id;
+    float area;
+    uint16_t country_code;
+    uint8_t level_override;
+    uint8_t reserved = 0;
+};
+static_assert(sizeof(AdminPolygonRecord) == 16, "AdminPolygonRecord must be 16 bytes");
+
+inline AdminPolygonRecord admin_polygon_record(const AdminPolygon& p, uint32_t ring_offset) {
+    if (p.admin_level > 15 || p.place_type_override > 15)
+        throw std::logic_error("an admin level or place type past 4 bits");
+    AdminPolygonRecord r;
+    r.ring_offset = ring_offset;
+    r.name_id = p.name_id;
+    r.area = p.area;
+    r.country_code = p.country_code;
+    r.level_override = static_cast<uint8_t>(p.admin_level << 4 | p.place_type_override);
+    return r;
+}
 
 struct NodeCoord {
     float lat;
@@ -161,11 +189,10 @@ static const uint32_t ID_MASK       = 0x7FFFFFFFu;
 static const uint32_t NO_DATA       = 0xFFFFFFFFu;
 
 // A strategy-2 slot with no living polygon: no ring block (ring_offset
-// NO_DATA, ring_bytes 0) and no name.
+// NO_DATA) and no name.
 inline AdminPolygon admin_polygon_tombstone() {
     AdminPolygon p{};
     p.ring_offset = NO_DATA;
-    p.ring_bytes = 0;
     p.name_id = NO_DATA;
     return p;
 }

@@ -2,7 +2,6 @@
 name = "place-search"
 version = "0.2.0"
 edition = "2021"
-# File::lock (server/src/place_index.rs) is stable from 1.89.
 rust-version = "1.89"
 
 # Geocoder-native forward place search over the geocoder's own files: the index holds only

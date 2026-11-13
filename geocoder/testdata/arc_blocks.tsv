@@ -1,7 +1,7 @@
 # Arc blocks as the builder's encode_arc writes them (builder/src/arc_blocks.h): the grid exponent k,
 # what the case covers, the vertices in e7 units (lat,lng;...), and the block as hex. The builder's
 # tests encode each to the block and decode it back; the server's decode it to the vertices and its
-# test encoder (arc_fixture.rs) must write the same block. Regenerate with disk-scripts gen_arc_vectors.
+# test encoder (arc_fixture.rs) must write the same block. Regenerate with geocoder/testdata/gen_arc_vectors.cpp.
 k	case	vertices	block
 0	short steps	247109083,18538367	00db95ba0e7fdf1a01
 0	wide steps	560307823,-598999642	006f9e6521a6fd4bdc

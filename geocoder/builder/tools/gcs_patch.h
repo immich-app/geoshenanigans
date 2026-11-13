@@ -1,9 +1,10 @@
 // The patcher's side of the in-process codecs: every today's-format file of an encoded family is
 // a virtual old file (a SequentialFileReader reads it from the family's decoder) and a virtual
 // output (open_out hands back a FILE* whose bytes go to the family's encoder). A native family
-// (the POI files, R2 and V2 in every dir: poi_files.h) is encoded in every dir under today's
-// names; gc's families only in an encoded installed set (a dir with a gc.manifest), whose new dir
-// gets the merged gc.manifest. No today's-format file of an encoded family touches the disk.
+// (the POI files, R2 and V2 in every dir: poi_files.h; the place files, place_files.h) is encoded
+// in every dir under today's names, the place files' logical stream as place_nodes.bin; gc's
+// families only in an encoded installed set (a dir with a gc.manifest), whose new dir gets the
+// merged gc.manifest. No today's-format file of an encoded family touches the disk.
 #pragma once
 #include <malloc.h>
 #include <set>
@@ -30,6 +31,7 @@ static const std::vector<FamilyDesc>& families() {
         {"interp_postcodes", {"interp_postcodes.bin"}},
         {"addr", {"addr_points.bin", "addr_vertices.bin"}},
         {"poi", {"poi_records.bin", "poi_vertices.bin"}, true},
+        {"places", {"place_nodes.bin"}, true},
     };
     return f;
 }
@@ -149,6 +151,7 @@ struct Store {
             else if (f == "way_postcodes" || f == "interp_postcodes") d = new side::DictDec(s, f, old_m);
             else if (f == "addr") d = new addr::Dec(s, old_m);
             else if (f == "poi") d = new poi::Dec(s);
+            else if (f == "places") d = new place::Dec(s);
             else die("no decoder for %s", f.c_str());
             dec[size_t(fi)].reset(d);
             if (threads) adec[size_t(fi)].reset(new AsyncDec(d));
@@ -170,6 +173,7 @@ struct Store {
                 if (it == expect_out.end()) die("addr: the patch lists no addr_points.bin size");
                 e = new addr::Enc(o, it->second);
             } else if (f == "poi") e = new poi::Enc(o);
+            else if (f == "places") e = new place::Enc(o);
             else die("no encoder for %s", f.c_str());
             for (size_t p = 0; p < F.today.size() && !F.native; p++) {
                 auto it = expect_out.find(F.today[p]);
@@ -187,7 +191,10 @@ struct Store {
     // itself).
     void check_old_size(const std::string& name, uint64_t expected) {
         auto [fi, port] = file_port.at(name);
-        const uint64_t ds = families()[size_t(fi)].native ? poi::decoded_size(cur_dir, port) : decoder(fi)->decoded_size(port);
+        const FamilyDesc& F = families()[size_t(fi)];
+        const uint64_t ds = !F.native ? decoder(fi)->decoded_size(port)
+                            : std::string(F.name) == "poi" ? poi::decoded_size(cur_dir, port)
+                                                           : place::decoded_size(cur_dir);
         if (ds != ~0ull && ds != expected)
             die("old %s decodes to %llu bytes, the patch expects %llu", name.c_str(), (unsigned long long)ds, (unsigned long long)expected);
     }

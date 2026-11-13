@@ -12,7 +12,7 @@ use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI};
 use crate::model::*;
 use crate::normalize::{join, tokens, transliterate};
 use memmap2::Mmap;
-use query_server::{AdminPolygon, Index, PlaceNode, NO_DATA};
+use query_server::{Index, NO_DATA};
 use serde_json::json;
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::File;
@@ -138,8 +138,8 @@ pub struct PlacesSource<'a> {
 impl<'a> PlacesSource<'a> {
     /// Derives the boundary slots and writes them to `bnd_path` (sorted by polygon).
     pub fn new(geo: &'a Index, opts: &BuildOpts, extras: Option<&'a Extras>, bnd_path: &Path) -> std::io::Result<Self> {
-        let n_place_nodes = record_count::<PlaceNode>(geo.place_nodes.as_ref().expect("place_nodes"));
-        let n_poly = record_count::<AdminPolygon>(&geo.admin_polygons);
+        let n_place_nodes = geo.place_node_count();
+        let n_poly = geo.admin_polygon_count();
         // A hidden node that names its claiming boundary is that boundary's label point.
         let mut link_buf = MapVec::with_capacity(n_poly as usize)?;
         for _ in 0..n_poly {
@@ -160,11 +160,9 @@ impl<'a> PlacesSource<'a> {
         let (mut n_slots, mut n_linked) = (0u32, 0u32);
         // The scan line crossings of each label point found, held for the next one.
         let mut crossings = Vec::new();
-        // Sets built without the search flags: every named ring is its own boundary entity.
-        let flagged = (0..n_poly).any(|p| polygon_raw(geo, p)._pad2 & POLY_FLAG_PRIMARY_RING != 0);
         for p in 0..n_poly {
             let ap = polygon_raw(geo, p);
-            if ap.name_id == NO_DATA || (flagged && ap._pad2 & POLY_FLAG_PRIMARY_RING == 0) {
+            if ap.name_id == NO_DATA {
                 continue;
             }
             let node = link[p as usize];
@@ -1144,7 +1142,7 @@ pub fn has_sub_index(dir: &Path, name: &str) -> bool {
 /// The META_FILE fields of an index of `geo` built with `opts`: what `SearchIndex::open` reads
 /// and the options it was built with.
 pub fn index_meta(geo: &Index, opts: &BuildOpts) -> serde_json::Map<String, serde_json::Value> {
-    let n_place_nodes = geo.place_nodes.as_ref().map_or(0, record_count::<PlaceNode>);
+    let n_place_nodes = geo.place_node_count();
     [
         ("n_place_nodes", json!(n_place_nodes)),
         ("extras", json!(opts.extras.is_some())),

@@ -21,6 +21,7 @@
 #include "merge_sequence.h"
 #include "patch_decompress.h"
 #include "patch_format.h"
+#include "place_test_files.h"
 #include "scratch_dir.h"
 #include "test_framework.h"
 #include "tool_runs.h"
@@ -205,14 +206,7 @@ PoiRecord poi(uint32_t name) {
     return p;
 }
 
-PlaceNode place(uint32_t name) {
-    PlaceNode p{};
-    p.lat = 48.0f;
-    p.lng = 11.0f;
-    p.name_id = name;
-    p.place_type = 1;
-    return p;
-}
+PlaceNode place(uint32_t name) { return test_place(48.0f, 11.0f, name); }
 
 // Nodes (or vertices) numbered i, as street_nodes.bin holds them.
 std::vector<char> nodes_of(const std::vector<int>& numbers) {
@@ -644,12 +638,18 @@ TEST(patch_round_trip_matches_the_pois_kept_among_reranked_ones) {
                                                       std::to_string(n_edited) + "/" + std::to_string(n_edited) + "/0");
 }
 
-// Place nodes come without a cell index (a client derives theirs at load).
-TEST(patch_round_trip_keeps_place_nodes_without_a_cell_index) {
+// The place files, their names moved by the string remap, round-trip: the
+// three of them from place_nodes.bin's logical section.
+TEST(patch_round_trip_keeps_the_place_files) {
     BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
-    old_d["place_nodes.bin"] = new_d["place_nodes.bin"] = bytes_of(std::vector<PlaceNode>{place(NAME_2), place(NAME_4)});
+    PlaceNode hidden = place(NAME_4);
+    hidden._pad1 = PLACE_FLAG_HIDDEN;
+    put_places(old_d, {place(NAME_2), hidden});
+    put_places(new_d, {place(NAME_2), hidden});
 
-    CHECK(round_trip(old_d, new_d).mismatches.empty());
+    const RoundTrip r = round_trip(old_d, new_d);
+
+    CHECK(r.mismatches.empty());
 }
 
 // An admin or POI cell index in dirs that hold none of its records (admin
@@ -1218,25 +1218,23 @@ TEST(patch_diff_refuses_a_cell_index_the_writer_wouldnt_write) {
 
 namespace {
 
-// A dir's admin geometry files as the builder lays them out: a 24-byte record
-// per polygon of keys (name and area the key) whose ring_offset and
-// ring_bytes name its ring block in admin_rings.bin, of 8 + key % 5 bytes,
+// A dir's admin geometry files as the builder lays them out: a 16-byte record
+// per polygon of keys (name and area the key) whose ring_offset starts its
+// ring block in admin_rings.bin (the next one's ends it), of 8 + key % 5 bytes,
 // and n_arcs arc blocks of 16 + i % 7 bytes in arc_vertices.bin at the u32
 // offsets of arc_index.bin. The blocks' bytes come from seed: the patch tools
 // read none of them.
 BuildDir admin_geometry(const std::vector<uint32_t>& keys, uint32_t n_arcs, uint32_t seed) {
     std::mt19937 rng(seed);
-    std::vector<AdminPolygon> records;
+    std::vector<AdminPolygonRecord> records;
     std::vector<char> rings, index, arcs;
     for (const uint32_t key : keys) {
         AdminPolygon p{};
-        p.ring_offset = static_cast<uint32_t>(rings.size());
-        p.ring_bytes = 8 + key % 5;
         p.name_id = key;
         p.admin_level = 8;
         p.area = static_cast<float>(key);
-        records.push_back(p);
-        for (uint32_t b = 0; b < p.ring_bytes; b++) rings.push_back(static_cast<char>(rng()));
+        records.push_back(admin_polygon_record(p, static_cast<uint32_t>(rings.size())));
+        for (uint32_t b = 0; b < 8 + key % 5; b++) rings.push_back(static_cast<char>(rng()));
     }
     for (uint32_t i = 0; i < n_arcs; i++) {
         append(index, static_cast<uint32_t>(arcs.size()));
@@ -1300,15 +1298,17 @@ TEST(patch_round_trip_moves_no_admin_slot_by_admin_polygon_content) {
             p.parent_poly_id = poi_parents[i];
             pois.push_back(p);
         }
+        // Labels of the polygons, hidden.
         std::vector<PlaceNode> places;
         for (size_t i = 0; i < place_parents.size(); i++) {
-            PlaceNode p = place(NO_DATA);
+            PlaceNode p = place(0);
             p.lat = 48.0f + static_cast<float>(i) * 1e-3f;
+            p._pad1 = PLACE_FLAG_HIDDEN | PLACE_FLAG_LABEL_OF;
             p.parent_poly_id = place_parents[i];
             places.push_back(p);
         }
         d["poi_records.bin"] = bytes_of(pois);
-        d["place_nodes.bin"] = bytes_of(places);
+        put_places(d, places);
         put_cell_index(d, "admin", {0, 1});
         return d;
     };

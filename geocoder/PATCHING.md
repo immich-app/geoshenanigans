@@ -52,8 +52,10 @@ POI tier (its component's `variants`, below): `admin-minimal/`'s strings and
 polygon ids are its own, so no other dir's offsets or ids can be read
 against it.
 
-No dir ships the place nodes' cell index: the first load of an index dir
-derives it from `place_nodes.bin` into `<dir>/derived/` (see Fresh Install).
+The place nodes come as three files: `place_cells.bin` (each admin cell's
+first row), `place_nodes.bin` (the visible nodes in cell order, bit-packed)
+and `place_hidden.bin` (the ones a boundary hides), which the server reads
+as they are.
 
 ### Quality directory (pick one)
 
@@ -163,28 +165,13 @@ the `.bin` files, because the server can't load a region without them.
    list (their `files`, the `optional_files` that appear in `files`, minus
    any `replaces`), each as
    <path>.zst, decompress, and check it against its sha256:
-   - builds/{date}/europe/full/…                (22 files + up to 4 optional)
+   - builds/{date}/europe/full/…                (24 files + up to 4 optional)
    - builds/{date}/europe/quality/simplified/…  (4 files)
    - builds/{date}/europe/poi/notable/…         (7 files, optional)
    The JSON files (strings_layout.json, poi_meta.json) are part of the set:
    the server can't load a region without them.
 6. Store build_version, patch_version, and date locally
 ```
-
-The first load of the dir (the server, the node binding, `grid_query`)
-derives the place index from `place_nodes.bin` into `<dir>/derived/`:
-`place_cells.idx`, `place_entries.idx` and `place_index.json`, which records
-what they were derived from (place_nodes.bin's size, mtime, inode and
-sha256, and the cell level). Planet admin (4.1M place nodes) takes about a
-second on one core, with a heap peak of 5.4 MiB. Later loads map them while
-`place_nodes.bin` keeps its stat, or its sha256 when the files were copied.
-Where `<dir>` can't be written, the index goes to a private dir under
-`$TMPDIR` instead, one per user and dataset dir
-(`geocoder-place-index-<uid>-<sha256 of the dir's path>`, mode 0700; a load
-refuses one another user owns or can open), checked the same way.
-A pack or an image that bundles a dataset only has to load it once when it
-is built: the `derived/` that load writes comes along, and loads from the
-copy use it as is.
 
 ### Daily Update (patching)
 
@@ -216,8 +203,7 @@ string tier it rebuilds (of its FCC2 file), and the tool fails when one differs.
 only catches a file from another build when its size changed; the string
 tiers' hashes are the content check. The server combines a mode dir with a
 quality or poi dir by global string offsets, so patch every selected dir to
-the same date and swap the whole set in together. The first load of the
-patched set derives its place index again.
+the same date and swap the whole set in together.
 
 ### Version Mismatch
 

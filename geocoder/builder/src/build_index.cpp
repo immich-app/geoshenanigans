@@ -1244,29 +1244,19 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
             if (!multi_output) write_exact_admin_geometry(d, base_dir);
         };
         auto write_places = [&] {
-            // Write place node files into each mode directory (so diff/patch can find them). Their
-            // cell index ships in no dir: a client derives it from place_nodes.bin when it loads
-            // the dir (server/src/place_index.rs).
+            // The place files (place_files.h) in each mode directory.
             if (!d.place_nodes.empty()) {
-                auto write_place_files = [&](const std::string& dir) {
+                auto write_places_in = [&](const std::string& dir) {
                     ensure_dir(dir);
-                    {
-                        std::ofstream f(dir + "/place_nodes.bin", std::ios::binary);
-                        f.write(reinterpret_cast<const char*>(d.place_nodes.data()),
-                                d.place_nodes.size() * sizeof(PlaceNode));
-                        f.flush();
-                        if (!f) throw std::runtime_error("failed to write " + dir + "/place_nodes.bin");
-                    }
-                    emit_strategy2_sidecar(dir + "/place_nodes.osm_ids",
-                                            d.place_sidecar_blob, d.place_osm_ids);
+                    write_place_files(dir, d.place_nodes);
                 };
 
                 if (multi_output) {
-                    write_place_files(base_dir + "/full");
-                    write_place_files(base_dir + "/no-addresses");
-                    write_place_files(base_dir + "/admin");
+                    write_places_in(base_dir + "/full");
+                    write_places_in(base_dir + "/no-addresses");
+                    write_places_in(base_dir + "/admin");
                 } else {
-                    write_place_files(base_dir);
+                    write_places_in(base_dir);
                 }
                 std::cerr << "  Place nodes: " << d.place_nodes.size() << " nodes" << std::endl;
             }
