@@ -47,6 +47,8 @@ pub const PARTIAL_MAX_WORDS: usize = 6;
 pub const PARTIAL_MIN_CHARS: usize = 3;
 /// Postings kept per key for trailing-word matches (best importance first).
 pub const PARTIAL_CAP: usize = 256;
+/// The place nodes the index build holds at once to fill them in name order: 3 MiB a worker.
+pub const NAME_BATCH_NODES: u32 = 1 << 17;
 /// Prefixes up to PREFIX_TABLE_ALL_CHARS chars, and longer ones up to PREFIX_TABLE_MAX_CHARS
 /// that start at least HEAVY_PREFIX_MIN_KEYS keys, are answered from a precomputed table.
 pub const PREFIX_TABLE_ALL_CHARS: usize = 2;

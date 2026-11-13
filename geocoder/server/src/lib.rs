@@ -1398,6 +1398,13 @@ impl Index {
         self.places.as_ref()?.node(id)
     }
 
+    /// Calls `f` with each place node of ids [first, end) and its id, in id order.
+    pub fn for_each_place_node(&self, first: u32, end: u32, f: impl FnMut(u32, PlaceNode)) {
+        if let Some(places) = &self.places {
+            places.for_nodes(first, end, f);
+        }
+    }
+
     /// Calls `f` with each visible place node in the admin cells `cells`, in id order, each once.
     fn for_each_place_in(&self, cells: impl IntoIterator<Item = u64>, mut f: impl FnMut(PlaceNode)) {
         let Some(places) = &self.places else { return };

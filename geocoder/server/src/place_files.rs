@@ -177,6 +177,17 @@ impl PlaceFiles {
         }
     }
 
+    /// Calls `f` with each node of ids [first, end) and its id, in id order: the visible rows,
+    /// then the hidden ones.
+    pub fn for_nodes(&self, first: u32, end: u32, mut f: impl FnMut(u32, PlaceNode)) {
+        self.for_rows(first, end, &mut f);
+        for id in first.max(self.visible)..end.min(self.count()) {
+            if let Some(pn) = self.hidden_node(id) {
+                f(id, pn);
+            }
+        }
+    }
+
     /// Node `id`, visible or hidden; None past the last.
     pub fn node(&self, id: u32) -> Option<PlaceNode> {
         if id < self.visible {
@@ -184,6 +195,11 @@ impl PlaceFiles {
             self.for_rows(id, id + 1, |_, pn| out = Some(pn));
             return out;
         }
+        self.hidden_node(id)
+    }
+
+    /// The hidden node of id `id` (at or past the visible rows); None past the last.
+    fn hidden_node(&self, id: u32) -> Option<PlaceNode> {
         let at = (id - self.visible) as usize * HIDDEN_ROW_BYTES;
         let r = self.hidden.as_slice().get(at..at + HIDDEN_ROW_BYTES)?;
         let w = u32_at(r, 8);
@@ -206,8 +222,9 @@ fn block_end(b: usize, end: u32) -> u32 {
     ((b as u64 + 1) * BLOCK_ROWS as u64).min(u64::from(end)) as u32
 }
 
-/// The w bits (at most 32) at bit `bit` of the blocks, which end at `blocks_end`; the file runs
-/// on past them (the table and footer), and a load stops at its end. None past the blocks.
+/// The w bits (at most 32) at bit `bit` of the blocks, which end at `blocks_end`: one 8-byte
+/// load, which the footer after the blocks (and the table) always leaves room for. None past the
+/// blocks.
 #[inline]
 fn bits_at(file: &[u8], bit: usize, w: u32, blocks_end: usize) -> Option<u32> {
     if w == 0 {
@@ -217,10 +234,8 @@ fn bits_at(file: &[u8], bit: usize, w: u32, blocks_end: usize) -> Option<u32> {
         return None;
     }
     let at = bit >> 3;
-    let mut word = [0u8; 8];
-    let k = (file.len() - at).min(8);
-    word[..k].copy_from_slice(&file[at..at + k]);
-    Some(((u64::from_le_bytes(word) >> (bit & 7)) & ((1u64 << w) - 1)) as u32)
+    let word = u64::from_le_bytes(file.get(at..at + 8)?.try_into().ok()?);
+    Some(((word >> (bit & 7)) & ((1u64 << w) - 1)) as u32)
 }
 
 /// The three files' bytes for `nodes` (fixtures and tests), the builder's encoding: the visible

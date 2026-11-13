@@ -12,7 +12,7 @@ use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI};
 use crate::model::*;
 use crate::normalize::{join, tokens, transliterate};
 use memmap2::Mmap;
-use query_server::{Index, NO_DATA};
+use query_server::{Index, PlaceNode, NO_DATA};
 use serde_json::json;
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::File;
@@ -146,15 +146,14 @@ impl<'a> PlacesSource<'a> {
             link_buf.push(NO_DATA);
         }
         let link = link_buf.as_mut_slice();
-        for i in 0..n_place_nodes {
-            let pn = place_node_raw(geo, i);
+        geo.for_each_place_node(0, n_place_nodes, |i, pn| {
             if !pn.is_visible() && pn._pad1 & PLACE_FLAG_LABEL_OF != 0 && pn.parent_poly_id < n_poly {
                 let l = &mut link[pn.parent_poly_id as usize];
                 if *l == NO_DATA {
                     *l = i;
                 }
             }
-        }
+        });
         let mut label_used = Bits::new(n_place_nodes as usize);
         let mut w = BufWriter::with_capacity(WRITE_BUFFER, File::create(bnd_path)?);
         let (mut n_slots, mut n_linked) = (0u32, 0u32);
@@ -209,10 +208,11 @@ impl<'a> PlacesSource<'a> {
         self.n_slots + self.n_place_nodes
     }
 
-    fn fill(&self, pos: u32, e: &mut EntityBuf) -> bool {
+    /// The entity of boundary slot `pos`; false when it has no name.
+    fn fill_slot(&self, pos: u32, e: &mut EntityBuf) -> bool {
         e.names.clear();
         let geo = self.geo;
-        let (rrefs, base_id) = if pos < self.n_slots {
+        let (rrefs, base_id) = {
             let s = self.slot(pos);
             let ap = polygon_raw(geo, s.poly);
             let node = s.linked().then(|| place_node_raw(geo, s.node));
@@ -232,21 +232,58 @@ impl<'a> PlacesSource<'a> {
                 }
             }
             (s.record_refs(), primary)
-        } else {
-            let i = pos - self.n_slots;
-            let pn = place_node_raw(geo, i);
-            // A hidden node is searchable on its own only when no boundary of this set claims it.
-            if pn.name_id == NO_DATA || self.label_used.get(i) {
-                return false;
-            }
-            let kind = place_node_kind(pn.place_type);
-            let typ = PLACE_NODE_TYPES.get(pn.place_type as usize).copied().unwrap_or("place");
-            e.id = i;
-            e.imp = W_TYPE * type_base(kind, typ, 0) + extra_importance(byte_at(&self.imp_places, i));
-            e.cc_poly = pn.parent_poly_id;
-            (vec![record_ref(KIND_PLACE_NODE, i)], pn.name_id)
         };
         fill_names(geo, self.extras, &rrefs, base_id, e)
+    }
+
+    /// The entity of place node `i`, `pn`; false when it is not one on its own or has no name.
+    fn fill_node(&self, i: u32, pn: &PlaceNode, e: &mut EntityBuf) -> bool {
+        e.names.clear();
+        // A hidden node is searchable on its own only when no boundary of this set claims it.
+        if pn.name_id == NO_DATA || self.label_used.get(i) {
+            return false;
+        }
+        let kind = place_node_kind(pn.place_type);
+        let typ = PLACE_NODE_TYPES.get(pn.place_type as usize).copied().unwrap_or("place");
+        e.id = i;
+        e.imp = W_TYPE * type_base(kind, typ, 0) + extra_importance(byte_at(&self.imp_places, i));
+        e.cc_poly = pn.parent_poly_id;
+        fill_names(self.geo, self.extras, &[record_ref(KIND_PLACE_NODE, i)], pn.name_id, e)
+    }
+
+    /// Calls `f` with the entity of each position of [lo, hi) that is one: the boundary slots,
+    /// then the place nodes. The nodes sit in cell order, so their names lie anywhere in the
+    /// string tier: they are read NAME_BATCH_NODES at a time, in id order, and each batch is
+    /// filled in name order, which reads the tier front to back once a batch instead of a page
+    /// here and there for every node.
+    fn for_each_entity<E>(&self, lo: u32, hi: u32, e: &mut EntityBuf, f: &mut impl FnMut(&EntityBuf) -> Result<(), E>) -> Result<(), E> {
+        self.for_each_entity_in(lo, hi, NAME_BATCH_NODES, e, f)
+    }
+
+    /// `for_each_entity` with the nodes read `batch_nodes` at a time.
+    fn for_each_entity_in<E>(
+        &self, lo: u32, hi: u32, batch_nodes: u32, e: &mut EntityBuf, f: &mut impl FnMut(&EntityBuf) -> Result<(), E>,
+    ) -> Result<(), E> {
+        for pos in lo..hi.min(self.n_slots) {
+            if self.fill_slot(pos, e) {
+                f(e)?;
+            }
+        }
+        let (mut at, end) = (lo.max(self.n_slots) - self.n_slots, hi.saturating_sub(self.n_slots));
+        let mut batch: Vec<(u32, PlaceNode)> = Vec::new();
+        while at < end {
+            let to = end.min(at.saturating_add(batch_nodes.max(1)));
+            batch.clear();
+            self.geo.for_each_place_node(at, to, |i, pn| batch.push((i, pn)));
+            batch.sort_unstable_by_key(|&(i, pn)| (pn.name_id, i));
+            for (i, pn) in &batch {
+                if self.fill_node(*i, pn, e) {
+                    f(e)?;
+                }
+            }
+            at = to;
+        }
+        Ok(())
     }
 }
 
@@ -306,10 +343,18 @@ impl Source<'_> {
             Source::Poi(s) => s.n,
         }
     }
-    fn fill(&self, pos: u32, e: &mut EntityBuf) -> bool {
+    /// Calls `f` with the entity of each position of [lo, hi) that is one, each once.
+    fn for_each_entity<E>(&self, lo: u32, hi: u32, e: &mut EntityBuf, f: &mut impl FnMut(&EntityBuf) -> Result<(), E>) -> Result<(), E> {
         match self {
-            Source::Places(s) => s.fill(pos, e),
-            Source::Poi(s) => s.fill(pos, e),
+            Source::Places(s) => s.for_each_entity(lo, hi, e, f),
+            Source::Poi(s) => {
+                for pos in lo..hi {
+                    if s.fill(pos, e) {
+                        f(e)?;
+                    }
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -977,13 +1022,12 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
                     let mut e = EntityBuf::default();
                     let mut keys = Vec::new();
                     let (mut ents, mut entries) = (0u64, 0u64);
-                    for pos in lo..hi {
-                        if !src.fill(pos, &mut e) {
-                            continue;
-                        }
-                        keys_of(geo, &e, &mut keys);
+                    // The runs sort by key and then entity, so the order the entities come in changes
+                    // no index byte.
+                    src.for_each_entity(lo, hi, &mut e, &mut |e: &EntityBuf| -> Result<(), String> {
+                        keys_of(geo, e, &mut keys);
                         if keys.is_empty() {
-                            continue;
+                            return Ok(());
                         }
                         ents += 1;
                         let imp_q = quantize(e.imp);
@@ -992,7 +1036,8 @@ pub fn sort_keys(geo: &Index, name: &str, out: &Path, opts: &BuildOpts) -> Resul
                                 .map_err(|x| x.to_string())?;
                             entries += 1;
                         }
-                    }
+                        Ok(())
+                    })?;
                     // Hands the run memory back before the merge.
                     let (files, spilled) = runs.finish().map_err(|x| x.to_string())?;
                     Ok((files, spilled, ents, entries))
@@ -1713,6 +1758,50 @@ mod tests {
         let err = build(&geo, &["places"], &dir.0.join("idx"), &opts).err();
 
         assert!(err.as_deref().is_some_and(|e| e.contains("65536 bytes")), "{err:?}");
+    }
+
+    #[test]
+    fn place_entities_come_once_each_whatever_the_batch_and_range() {
+        use crate::fixture::{Geo, TempDir};
+        let mut g = Geo::default();
+        let land = g.boundary("Testland", 2, [0.0, 0.0, 60.0, 60.0]);
+        // Named in this order (their name ids ascend), at points whose cells order them otherwise.
+        let names = ["Zulu", "Alpha", "Mike", "Bravo", "Yankee", "Charlie", "Xray", "Delta", "Whiskey"];
+        for (k, name) in names.iter().enumerate() {
+            g.place(name, 2, 5.0 + 6.0 * k as f32, 50.0 - 5.0 * k as f32);
+        }
+        let capital = g.place("Capital", 0, 30.0, 30.0);
+        g.claim(land, capital);
+        let dir = TempDir::new("entity-batches");
+        let geo = g.load(&dir.0.join("geo"));
+        let src = PlacesSource::new(&geo, &BuildOpts::new(dir.0.join("tmp")), None, &dir.0.join("places.bnd")).unwrap();
+        let entities = |lo: u32, hi: u32, batch: u32| {
+            let (mut e, mut out) = (EntityBuf::default(), Vec::new());
+            let mut take = |e: &EntityBuf| -> Result<(), ()> {
+                out.push((e.id, e.names[0].3.clone()));
+                Ok(())
+            };
+            src.for_each_entity_in(lo, hi, batch, &mut e, &mut take).unwrap();
+            out
+        };
+        let n = src.len();
+
+        let mut all = entities(0, n, NAME_BATCH_NODES);
+
+        // The boundary, under its label's name (the claimed capital is no entity of its own), then
+        // the nine nodes of one batch in name order, which is not their id order.
+        assert_eq!(all.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>(), [&["Capital"][..], &names[..]].concat());
+        assert!(all[1..].windows(2).any(|w| w[0].0 > w[1].0), "the fixture's nodes sit in name order");
+        // Every batch size and every cut of the range gives each entity once.
+        all.sort();
+        for batch in [1, 2, 3, 4, 100] {
+            for cut in 0..=n {
+                let mut got = entities(0, cut, batch);
+                got.extend(entities(cut, n, batch));
+                got.sort();
+                assert_eq!(got, all, "batch {batch}, cut {cut}");
+            }
+        }
     }
 
     fn writer(dir: &Path) -> Writer {
