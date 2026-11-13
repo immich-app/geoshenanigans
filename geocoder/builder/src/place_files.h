@@ -197,8 +197,10 @@ private:
         BlockEntry e;
         e.lat_base = e.lng_base = UINT32_MAX;
         uint32_t lat_max = 0, lng_max = 0, name_max = 0;
-        for (const PlaceNode& n : block_) {
-            const uint32_t l = order_key(bits_of(n.lat)), g = order_key(bits_of(n.lng));
+        std::array<uint32_t, BLOCK_ROWS> lk, gk;
+        for (size_t k = 0; k < block_.size(); k++) {
+            const PlaceNode& n = block_[k];
+            const uint32_t l = lk[k] = order_key(bits_of(n.lat)), g = gk[k] = order_key(bits_of(n.lng));
             e.lat_base = std::min(e.lat_base, l);
             e.lng_base = std::min(e.lng_base, g);
             lat_max = std::max(lat_max, l);
@@ -213,29 +215,28 @@ private:
         std::array<uint8_t, TABLE_ENTRY_BYTES> entry;
         write_entry(e, entry.data());
         table_.push_back(entry);
-        bytes_.clear();
-        uint64_t acc = 0;
-        uint32_t n_bits = 0;
+        // Each field ORed in with one 8-byte load and store at its first byte (a field of at most 32
+        // bits shifted by at most 7 fits 64), into zeroed bytes with 8 to spare.
+        const size_t bytes = e.bytes(block_.size());
+        bytes_.assign(bytes + 8, 0);
+        uint8_t* out = bytes_.data();
+        uint64_t bit = 0;
         auto add = [&](uint64_t v, uint32_t w) {
-            if (!w) return;
-            acc |= v << n_bits;
-            n_bits += w;
-            while (n_bits >= 8) {
-                bytes_.push_back(uint8_t(acc));
-                acc >>= 8;
-                n_bits -= 8;
-            }
+            uint64_t word;
+            std::memcpy(&word, out + (bit >> 3), 8);
+            word |= v << (bit & 7);
+            std::memcpy(out + (bit >> 3), &word, 8);
+            bit += w;
         };
-        for (const PlaceNode& n : block_) {
-            add(order_key(bits_of(n.lat)) - e.lat_base, e.wl);
-            add(order_key(bits_of(n.lng)) - e.lng_base, e.wg);
-            add(n.place_type, TYPE_BITS);
-            add(n.name_id, e.wn);
+        for (size_t k = 0; k < block_.size(); k++) {
+            add(lk[k] - e.lat_base, e.wl);
+            add(gk[k] - e.lng_base, e.wg);
+            add(block_[k].place_type, TYPE_BITS);
+            add(block_[k].name_id, e.wn);
         }
-        if (n_bits) bytes_.push_back(uint8_t(acc));
-        if (bytes_.size() != e.bytes(block_.size())) throw std::logic_error("a place block's bytes don't add up");
-        blocks_(bytes_.data(), bytes_.size());
-        offset_ += bytes_.size();
+        if ((bit + 7) / 8 != bytes) throw std::logic_error("a place block's bytes don't add up");
+        blocks_(out, bytes);
+        offset_ += bytes;
         block_.clear();
     }
 
@@ -256,7 +257,9 @@ struct RowReader {
         if (!w) return 0;
         const uint8_t* at = p + (bit >> 3);
         uint64_t word = 0;
-        std::memcpy(&word, at, std::min<size_t>(8, size_t(end - at)));
+        // One 8-byte load where the block holds 8 bytes from here (the fixed size inlines).
+        if (end - at >= 8) std::memcpy(&word, at, 8);
+        else std::memcpy(&word, at, size_t(end - at));
         const uint32_t v = uint32_t((word >> (bit & 7)) & ((uint64_t(1) << w) - 1));
         bit += w;
         return v;
