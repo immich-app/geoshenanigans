@@ -146,7 +146,7 @@ impl PlaceFiles {
         let mut row = first;
         while row < end {
             let b = row as usize / BLOCK_ROWS;
-            let block_end = (((b + 1) * BLOCK_ROWS) as u32).min(end);
+            let block_end = block_end(b, end);
             let Some(e) = self.block(b) else {
                 row = block_end;
                 continue;
@@ -197,6 +197,13 @@ impl PlaceFiles {
             parent_poly_id: u32_at(r, 12),
         })
     }
+}
+
+/// The row after block b's last that a read to `end` takes: the block's end, clamped to `end` before it
+/// is narrowed (the last block of 2^32 - 1 rows ends at 2^32).
+#[inline]
+fn block_end(b: usize, end: u32) -> u32 {
+    ((b as u64 + 1) * BLOCK_ROWS as u64).min(u64::from(end)) as u32
 }
 
 /// The w bits (at most 32) at bit `bit` of the blocks, which end at `blocks_end`; the file runs

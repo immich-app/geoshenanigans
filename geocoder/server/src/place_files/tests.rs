@@ -188,3 +188,14 @@ fn place_files_read_as_the_shared_vectors_say_and_the_test_encoder_writes_them()
     }
     assert!(rows.len() >= 9);
 }
+
+#[test]
+fn the_last_block_of_the_most_rows_ends_at_the_read_end() {
+    // 2^32 - 1 rows: the last block, 2^26 - 1, would end at 2^32, past u32.
+    let last = (u32::MAX as usize) / BLOCK_ROWS;
+    assert_eq!(block_end(last, u32::MAX), u32::MAX);
+    assert_eq!(block_end(last - 1, u32::MAX), (last * BLOCK_ROWS) as u32);
+    assert_eq!(block_end(0, 10), 10);
+    assert_eq!(block_end(0, 64), 64);
+    assert_eq!(block_end(1, 200), 128);
+}

@@ -228,7 +228,7 @@ pub fn encode_ring(refs: &[Ref], box_of: impl Fn(u32) -> RawBox) -> Vec<u8> {
     out
 }
 
-/// A record's 24 bytes as admin_polygons.bin stores it.
+/// A record's 16 bytes as admin_polygons.bin stores it.
 pub fn record_bytes(p: &AdminPolygon) -> Vec<u8> {
     p.record_bytes().to_vec()
 }

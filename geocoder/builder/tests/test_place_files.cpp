@@ -69,14 +69,27 @@ LogicalPlace hidden(float lat, float lng, uint32_t name, uint8_t type, uint32_t 
 std::vector<LogicalPlace> random_stream(std::mt19937_64& rng, size_t n) {
     std::vector<LogicalPlace> rows;
     uint32_t key = uint32_t(rng() % 1000);
+    // One draw a statement: the same stream whatever order a compiler evaluates arguments in.
     for (size_t i = 0; i < n; i++) {
-        if (rng() % 4 == 0) key += 1 + uint32_t(rng() % (rng() % 2 ? 3 : 100000));
-        const float lat = float(int64_t(rng() % 1800001) - 900000) / 10000.0f, lng = float(int64_t(rng() % 3600001) - 1800000) / 10000.0f;
-        rows.push_back(visible(rng() % 13 ? lat : -0.0f, lng, uint32_t(rng() >> (32 + rng() % 32)), uint8_t(rng() % 8), key));
+        if (rng() % 4 == 0) {
+            const uint64_t reach = rng() % 2 ? 3 : 100000;
+            key += 1 + uint32_t(rng() % reach);
+        }
+        const float lat = float(int64_t(rng() % 1800001) - 900000) / 10000.0f;
+        const float lng = float(int64_t(rng() % 3600001) - 1800000) / 10000.0f;
+        const bool zero = rng() % 13 == 0;
+        const uint64_t shift = 32 + rng() % 32;
+        const uint32_t name = uint32_t(rng() >> shift);
+        const uint8_t type = uint8_t(rng() % 8);
+        rows.push_back(visible(zero ? -0.0f : lat, lng, name, type, key));
     }
-    for (size_t i = 0; i < n / 5; i++)
-        rows.push_back(hidden(float(i) * 0.01f, -float(i), uint32_t(rng() % (1u << 28)), uint8_t(rng() % 8),
-                              rng() % 2 ? uint32_t(rng() % 50000) : NO_DATA));
+    for (size_t i = 0; i < n / 5; i++) {
+        const uint32_t name = uint32_t(rng() % (1u << 28));
+        const uint8_t type = uint8_t(rng() % 8);
+        const bool label = rng() % 2;
+        const uint32_t parent = label ? uint32_t(rng() % 50000) : NO_DATA;
+        rows.push_back(hidden(float(i) * 0.01f, -float(i), name, type, parent));
+    }
     return rows;
 }
 

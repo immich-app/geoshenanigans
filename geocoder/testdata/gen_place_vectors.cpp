@@ -82,14 +82,24 @@ int main() {
     for (size_t n : {size_t(63), size_t(64), size_t(65), size_t(200)}) {
         std::vector<LogicalPlace> rows;
         uint32_t key = 0x01000000;
+        // One draw a statement, so the vectors don't depend on the order a compiler evaluates
+        // arguments in.
         for (size_t i = 0; i < n; i++) {
             if (rng() % 5 == 0) key += 1 + uint32_t(rng() % 1000);
-            const float lat = float(int64_t(rng() % 1700000) - 850000) / 10000.0f, lng = float(int64_t(rng() % 3500000) - 1750000) / 10000.0f;
-            rows.push_back(visible(lat, lng, uint32_t(rng() % 4000000) >> (rng() % 22), uint8_t(rng() % 7), key));
+            const float lat = float(int64_t(rng() % 1700000) - 850000) / 10000.0f;
+            const float lng = float(int64_t(rng() % 3500000) - 1750000) / 10000.0f;
+            const uint32_t name = uint32_t(rng() % 4000000);
+            const uint32_t shift = uint32_t(rng() % 22);
+            const uint8_t type = uint8_t(rng() % 7);
+            rows.push_back(visible(lat, lng, name >> shift, type, key));
         }
-        for (size_t i = 0; i < n / 7; i++)
-            rows.push_back(hidden(float(i), float(i) / 3.0f, uint32_t(rng() % (1u << 28)), uint8_t(rng() % 7),
-                                  rng() % 2 ? uint32_t(rng() % 100000) : NO_DATA));
+        for (size_t i = 0; i < n / 7; i++) {
+            const uint32_t name = uint32_t(rng() % (1u << 28));
+            const uint8_t type = uint8_t(rng() % 7);
+            const bool label = rng() % 2;
+            const uint32_t parent = label ? uint32_t(rng() % 100000) : NO_DATA;
+            rows.push_back(hidden(float(i), float(i) / 3.0f, name, type, parent));
+        }
         row((std::to_string(n) + " visible nodes, " + std::to_string(n / 7) + " hidden").c_str(), rows);
     }
     return 0;
