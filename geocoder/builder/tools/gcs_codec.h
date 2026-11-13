@@ -1180,6 +1180,9 @@ struct Enc : Encoder {
 // ------------------------------------------------------------------ places (place_files.h)
 namespace place {
 namespace pf = place_files;
+// The codec's buffers: the place files stream front to back in units of a block (under 1 KiB) or a run
+// of hidden rows, so a few KiB each do; the codec holds about 56 KiB.
+static const size_t SMALL_BUF = size_t(4) << 10, BLOCKS_BUF = size_t(16) << 10;
 
 // A dir's place files' decoded size, LOGICAL_STRIDE a node, from place_nodes.bin's footer and
 // place_hidden.bin's size alone: 0 without place_nodes.bin.
@@ -1203,7 +1206,7 @@ inline uint64_t decoded_size(const std::string& dir) {
 // Port 0 = place_nodes.bin's logical stream (pf::LogicalPlace). A step: a block of visible rows, or
 // a run of hidden rows. A dir without the three files decodes to none.
 struct Dec : Decoder {
-    static constexpr size_t HIDDEN_PER_STEP = 512;
+    static constexpr size_t HIDDEN_PER_STEP = SMALL_BUF / pf::HIDDEN_ROW_BYTES;
     std::unique_ptr<Reader> C, N, T, H;  // place_cells.bin, place_nodes.bin's blocks and its table, place_hidden.bin
     pf::Footer f;
     std::unique_ptr<pf::CellCursor> cells;
@@ -1225,10 +1228,10 @@ struct Dec : Decoder {
         if (cs % pf::CELL_ROW_BYTES) pf::malformed("place_cells.bin is not whole rows");
         if (hs % pf::HIDDEN_ROW_BYTES) pf::malformed("place_hidden.bin is not whole rows");
         cells.reset(new pf::CellCursor(f.rows, cs / pf::CELL_ROW_BYTES));
-        C.reset(new Reader(cp, 32 << 10));
-        N.reset(new Reader(np, READ_BUF, 0, f.table_at));
-        T.reset(new Reader(np, 32 << 10, f.table_at, size - pf::FOOTER_BYTES));
-        H.reset(new Reader(hp, 32 << 10));
+        C.reset(new Reader(cp, SMALL_BUF));
+        N.reset(new Reader(np, BLOCKS_BUF, 0, f.table_at));
+        T.reset(new Reader(np, SMALL_BUF, f.table_at, size - pf::FOOTER_BYTES));
+        H.reset(new Reader(hp, SMALL_BUF));
     }
     uint64_t decoded_size(int) const override {
         if (!N) return 0;
@@ -1283,10 +1286,10 @@ struct Enc : Encoder {
     pf::Encoder<Sink> enc;
     explicit Enc(const std::string& od)
         : Encoder("places", od, 1),
-          CW(new Writer(od + "/" + pf::CELLS_FILE, 32 << 10)),
-          NW(new Writer(od + "/" + pf::NODES_FILE)),
-          HW(new Writer(od + "/" + pf::HIDDEN_FILE, 32 << 10)),
-          TW(new Writer(od + "/.place_nodes.table", 32 << 10, true)),
+          CW(new Writer(od + "/" + pf::CELLS_FILE, SMALL_BUF)),
+          NW(new Writer(od + "/" + pf::NODES_FILE, BLOCKS_BUF)),
+          HW(new Writer(od + "/" + pf::HIDDEN_FILE, SMALL_BUF)),
+          TW(new Writer(od + "/.place_nodes.table", SMALL_BUF, true)),
           tpath(od + "/.place_nodes.table"),
           enc([this](const uint8_t* p, size_t n) { CW->put(p, n); }, [this](const uint8_t* p, size_t n) { NW->put(p, n); },
               [this](const uint8_t* p, size_t n) { HW->put(p, n); }) {}
@@ -1295,22 +1298,44 @@ struct Enc : Encoder {
         for (const auto& e : enc.table()) TW->put(e.data(), e.size());
         enc.clear_table();
     }
+    void add(const uint8_t* row) {
+        pf::LogicalPlace p;
+        memcpy(&p, row, pf::LOGICAL_STRIDE);
+        enc.add(p);
+        spill();
+    }
+    // Every byte straight from the writer (nothing queued): a row a write cuts waits in carry.
+    uint8_t carry[pf::LOGICAL_STRIDE];
+    size_t carried = 0;
+    size_t consume(int, const uint8_t* p, size_t n) override {
+        size_t used = 0;
+        if (carried) {
+            used = std::min(pf::LOGICAL_STRIDE - carried, n);
+            memcpy(carry + carried, p, used);
+            carried += used;
+            if (carried < pf::LOGICAL_STRIDE) return n;
+            add(carry);
+            carried = 0;
+        }
+        for (; n - used >= pf::LOGICAL_STRIDE; used += pf::LOGICAL_STRIDE) add(p + used);
+        memcpy(carry, p + used, n - used);
+        carried = n - used;
+        return n;
+    }
     void pump() override {
         ByteQueue& q = in[0];
         while (q.size() >= pf::LOGICAL_STRIDE) {
-            pf::LogicalPlace p;
-            memcpy(&p, q.data(), pf::LOGICAL_STRIDE);
+            add(q.data());
             q.pop(pf::LOGICAL_STRIDE);
-            enc.add(p);
-            spill();
         }
     }
     void finish(Manifest&) override {
         require_empty();
+        if (carried) die("places: the stream ends %zu bytes into a row", carried);
         enc.finish();
         spill();
         TW->flush();
-        std::vector<uint8_t> buf(size_t(32) << 10);
+        std::vector<uint8_t> buf(BLOCKS_BUF);
         for (uint64_t off = 0, n = TW->tell(); off < n;) {
             const size_t k = size_t(std::min<uint64_t>(buf.size(), n - off));
             pread_all(TW->fd, buf.data(), k, off, tpath);
