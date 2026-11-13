@@ -338,6 +338,8 @@ public:
                 first = get32(c + 4);
             }
             if (first != row || (started_ && key <= key_)) malformed("place_cells.bin's rows are not ascending from row 0");
+            // The key a hidden node's row holds: no visible node has it.
+            if (key == NO_DATA) malformed("a visible node without a cell");
             key_ = key;
             if (++started_ < cells_) {
                 const uint8_t* c = next();

@@ -177,15 +177,35 @@ TEST(a_logical_stream_has_one_encoding) {
             const size_t at = rng() % file.size();
             file[at] ^= uint8_t(1u << (rng() % 8));
         }
+        // Only the decoder may refuse: a stream it hands back that the
+        // encoder then refuses fails the test.
+        std::vector<LogicalPlace> rows;
         try {
-            const std::vector<LogicalPlace> rows = decode(g);
-            decoded++;
-            CHECK(encode(rows) == g);
+            rows = decode(g);
         } catch (const std::runtime_error&) {
             refused++;
+            continue;
         }
+        decoded++;
+        CHECK(encode(rows) == g);
     }
     CHECK(refused > 0 && decoded > 0);
+}
+
+TEST(a_visible_cell_keyed_as_a_hidden_node_is_refused) {
+    // NO_DATA is the key of a hidden node's row; the encoder refuses a
+    // visible node with it, so no file may decode to one.
+    Files f = encode({visible(1, 1, 0, 0, 5), visible(2, 2, 0, 0, 9), hidden(0, 0, 1, 0, NO_DATA)});
+    REQUIRE(f.cells.size() == 2 * place_files::CELL_ROW_BYTES);
+    const uint32_t none = NO_DATA;
+    std::memcpy(f.cells.data() + place_files::CELL_ROW_BYTES, &none, sizeof none);
+    std::string said;
+    try {
+        decode(f);
+    } catch (const std::runtime_error& e) {
+        said = e.what();
+    }
+    CHECK(said.find("a visible node without a cell") != std::string::npos);
 }
 
 TEST(place_files_are_the_shared_vectors_byte_for_byte) {
