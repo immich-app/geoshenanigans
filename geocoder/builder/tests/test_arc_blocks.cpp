@@ -2,7 +2,10 @@
 // boxes and chunk cuts, and what a decoder refuses.
 #include "arc_blocks.h"
 
+#include <fstream>
 #include <random>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include "test_framework.h"
@@ -97,7 +100,7 @@ TEST(an_arc_block_round_trips_on_each_grid_and_carries_its_box_from_16_vertices)
             CHECK(d.vertices == v);
             CHECK_EQ(int(d.k), int(k));
             CHECK_EQ(d.has_box, n >= kArcBboxMinVertices);
-            CHECK_EQ(int(block[0]), int(k | (n >= kArcBboxMinVertices ? 0x80 : 0)));
+            CHECK_EQ(int(block[0] & (kGridMask | kHasBox)), int(k | (n >= kArcBboxMinVertices ? 0x80 : 0)));
             if (d.has_box) {
                 ArcBox want;
                 for (const PackedLocation& p : v) want.add(p);
@@ -113,26 +116,113 @@ TEST(an_arc_block_round_trips_on_each_grid_and_carries_its_box_from_16_vertices)
 }
 
 TEST(an_arc_block_that_isnt_well_formed_decodes_to_nothing) {
+    // 3 vertices: flags, the first vertex, a header byte and 2 deltas a coordinate at 8 bits or more.
     const std::vector<uint8_t> good = arc_block({{100, 200}, {300, -400}, {300, -500}}, 2);
     DecodedArc d;
     CHECK(decode_arc(good.data(), good.size(), d));
     for (size_t cut = 0; cut < good.size(); cut++) {
-        // Short of its first vertex, or ending inside a delta.
+        // Short of its first vertex, or ending inside a group (at 9 and 11 the
+        // block is a shorter arc's: one vertex, or one delta at 4 + 4 bits).
         if (cut == 9 || cut == 11) continue;
         CHECK(!decode_arc(good.data(), cut, d));
     }
-    std::vector<uint8_t> flags = good;
-    flags[0] |= 0x04;
-    CHECK(!decode_arc(flags.data(), flags.size(), d));
+    // A short group whose widths sum to less than 8 can't say its count.
+    std::vector<uint8_t> narrow = good;
+    narrow.resize(9);
+    narrow.push_back(0x21);  // widths 2 and 1
+    narrow.push_back(0x05);
+    CHECK(!decode_arc(narrow.data(), narrow.size(), d));
+    // A short group too short for one vertex: widths 5 and 5 in one byte.
+    std::vector<uint8_t> short_group = good;
+    short_group.resize(9);
+    short_group.push_back(0x55);
+    short_group.push_back(0x00);
+    CHECK(!decode_arc(short_group.data(), short_group.size(), d));
     // A latitude past i32 once scaled by the grid, and a delta past any.
     std::vector<uint8_t> far = arc_block({{0, 0}}, 3);
     for (int i = 1; i <= 4; i++) far[i] = 0x7f;
     CHECK(!decode_arc(far.data(), far.size(), d));
     std::vector<uint8_t> jump = arc_block({{0, 0}}, 0);
-    const std::vector<uint8_t> huge = varint(zigzag(int64_t(1) << 40)), zero = varint(0);
-    jump.insert(jump.end(), huge.begin(), huge.end());
-    jump.insert(jump.end(), zero.begin(), zero.end());
+    jump[0] |= 15 << kBaseWidthShift;  // base width 30
+    jump.push_back(0xff);              // widths 45 and 45: one vertex in 12 bytes
+    for (int i = 0; i < 12; i++) jump.push_back(0xff);
     CHECK(!decode_arc(jump.data(), jump.size(), d));
+}
+
+TEST(an_arc_block_packs_its_deltas_in_groups_and_takes_second_order_ones_where_smaller) {
+    // Evenly spaced vertices: every second-order delta is 0.
+    std::vector<PackedLocation> line;
+    for (int i = 0; i < 40; i++) line.push_back({1000000 + i * 12345, -2000000 + i * 6789});
+    const std::vector<uint8_t> straight = arc_block(line, 0);
+    CHECK((straight[0] & kSecondOrder) != 0);
+    DecodedArc d;
+    REQUIRE(decode_arc(straight.data(), straight.size(), d));
+    CHECK(d.vertices == line);
+    // A zigzag on both axes: second-order deltas are twice the first-order ones, so first order wins.
+    std::vector<PackedLocation> zig;
+    for (int i = 0; i < 40; i++) zig.push_back({i % 2 ? 5000 : 0, i % 2 ? 3000 : 0});
+    const std::vector<uint8_t> z = arc_block(zig, 0);
+    CHECK((z[0] & kSecondOrder) == 0);
+    REQUIRE(decode_arc(z.data(), z.size(), d));
+    CHECK(d.vertices == zig);
+    // Every vertex count round-trips: full groups, a short last one, and its count from its bytes.
+    std::mt19937_64 rng(11);
+    std::uniform_int_distribution<int32_t> small(-3, 3), wide(-2000000, 2000000);
+    for (size_t n = 1; n <= 70; n++)
+        for (int kind = 0; kind < 3; kind++) {
+            std::vector<PackedLocation> v{{0, 0}};
+            for (size_t i = 1; i < n; i++) {
+                const int32_t dl = kind == 0 ? small(rng) : wide(rng), dg = kind == 2 ? small(rng) : wide(rng);
+                v.push_back({v.back().lat_e7 + dl, v.back().lon_e7 + dg});
+            }
+            const std::vector<uint8_t> block = arc_block(v, 0);
+            REQUIRE(decode_arc(block.data(), block.size(), d));
+            CHECK(d.vertices == v);
+        }
+}
+
+TEST(an_arc_delta_across_the_whole_globe_round_trips_at_a_wider_base) {
+    // From the south-west corner to the north-east and back: deltas of about 2^32 e7, past 30 bits.
+    const std::vector<PackedLocation> v{{-900000000, -1800000000}, {900000000, 1800000000}, {-900000000, -1800000000}};
+    const std::vector<uint8_t> block = arc_block(v, 0);
+    CHECK(((block[0] >> kBaseWidthShift) & 15) > 0);
+    DecodedArc d;
+    REQUIRE(decode_arc(block.data(), block.size(), d));
+    CHECK(d.vertices == v);
+}
+
+TEST(arc_blocks_are_the_shared_vectors_byte_for_byte) {
+    // geocoder/testdata/arc_blocks.tsv, which the server's decoder and test encoder read too.
+    std::ifstream f(std::string(GEOCODER_TESTDATA_DIR) + "/arc_blocks.tsv");
+    REQUIRE(f.good());
+    size_t rows = 0;
+    bool header = true;
+    for (std::string line; std::getline(f, line);) {
+        if (line.empty() || line[0] == '#') continue;
+        if (header) {
+            header = false;
+            continue;
+        }
+        std::vector<std::string> field;
+        std::stringstream in(line);
+        for (std::string x; std::getline(in, x, '\t');) field.push_back(x);
+        REQUIRE(field.size() == 4);
+        const uint8_t k = static_cast<uint8_t>(std::stoi(field[0]));
+        std::vector<PackedLocation> v;
+        std::stringstream verts(field[2]);
+        for (std::string pair; std::getline(verts, pair, ';');) {
+            const size_t comma = pair.find(',');
+            v.push_back({std::stoi(pair.substr(0, comma)), std::stoi(pair.substr(comma + 1))});
+        }
+        std::vector<uint8_t> want;
+        for (size_t i = 0; i + 1 < field[3].size(); i += 2) want.push_back(static_cast<uint8_t>(std::stoi(field[3].substr(i, 2), nullptr, 16)));
+        CHECK(arc_block(v, k) == want);
+        DecodedArc d;
+        CHECK(decode_arc(want.data(), want.size(), d));
+        CHECK(d.vertices == v);
+        rows++;
+    }
+    CHECK(rows > 100);
 }
 
 TEST(a_ring_of_up_to_8_refs_is_one_chunk_without_a_box) {

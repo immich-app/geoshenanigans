@@ -3790,7 +3790,8 @@ TEST(patch_arc_vertices_send_only_the_bytes_of_a_moved_vertex) {
     std::printf("    moved vertex: %u of %u bytes sent\n", v.ops[2].second, static_cast<uint32_t>(size));
     CHECK(v.ops[0].second > arc_bytes(old_a, 0, 7));
     CHECK_EQ(v.ops[1].second, v.ops[2].second);
-    CHECK(v.ops[2].second <= 16);
+    // At most the arc's block: the bytes of its delta group, whose bits the vertex moved.
+    CHECK(v.ops[2].second < arc_bytes(new_a, 7, 8));
     CHECK_EQ(uint64_t{v.ops[0].second} + v.ops[1].second + v.ops[3].second, size);
     for (const PatchFileId fid : {PatchFileId::ARC_INDEX, PatchFileId::ADMIN_POLYGONS, PatchFileId::ADMIN_RINGS})
         CHECK(copied_old_at(raw, fid, new_d.at(patch_file_names[uint32_t(fid)]).size()) != std::string::npos);
@@ -3799,8 +3800,8 @@ TEST(patch_arc_vertices_send_only_the_bytes_of_a_moved_vertex) {
 
 // An arc that grows, a vertex added at its end inside its box: the arc index
 // MATCHes every slot, the slots after the arc moved by one offset fixup run
-// of the bytes it grew, and the arc vertices insert those bytes behind its
-// block; the rings, which name arc slots, not offsets, and the records go as
+// of the bytes it grew, and the arc vertices rewrite its last delta group;
+// the rings, which name arc slots, not offsets, and the records go as
 // unchanged. Every mode applies it. The parent sent the arc files whole.
 TEST(patch_arc_index_moves_the_arcs_after_a_grown_arc_by_one_fixup_run) {
     ScratchDir dir("lowmem-arc-grown");
@@ -3823,8 +3824,18 @@ TEST(patch_arc_index_moves_the_arcs_after_a_grown_arc_by_one_fixup_run) {
     CHECK_EQ(index.fixup_runs, 1u);
     CHECK_EQ(index.fixup_values, 0u);
     const MergeSection v = merge_section(raw, PatchFileId::ARC_VERTICES, 1, old_size, new_size);
+    // Its last delta group is rewritten with the vertex in it: a MATCH into arc 7's block, its
+    // changed tail out and in, and a MATCH of every block after it.
     const uint32_t through_7 = arc_bytes(old_a, 0, 8);
-    CHECK(v.ops == (Ops{{OP_MATCH_RUN, through_7}, {OP_INSERT_RUN, new_size - old_size}, {OP_MATCH_RUN, old_size - through_7}}));
+    REQUIRE(v.ops.size() >= 3);
+    CHECK(v.ops.front().first == OP_MATCH_RUN && v.ops.front().second > arc_bytes(old_a, 0, 7));
+    CHECK(v.ops.back().first == OP_MATCH_RUN && v.ops.back().second == old_size - through_7);
+    uint64_t out = 0, in = 0;
+    for (size_t i = 1; i + 1 < v.ops.size(); i++) {
+        CHECK(v.ops[i].first == OP_DELETE_RUN || v.ops[i].first == OP_INSERT_RUN);
+        (v.ops[i].first == OP_DELETE_RUN ? out : in) += v.ops[i].second;
+    }
+    CHECK_EQ(in - out, uint64_t{new_size - old_size});
     for (const PatchFileId fid : {PatchFileId::ADMIN_POLYGONS, PatchFileId::ADMIN_RINGS})
         CHECK(copied_old_at(raw, fid, new_d.at(patch_file_names[uint32_t(fid)]).size()) != std::string::npos);
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
