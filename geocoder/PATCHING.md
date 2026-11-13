@@ -41,10 +41,10 @@ A complete geocoder index for a given region and configuration consists of files
 | Mode | Files | Description |
 |------|-------|-------------|
 | `full/` | 22 files (+4 optional) | Streets + addresses + interpolation + admin + postcodes |
-| `no-addresses/` | 14 files (+3 optional) | Streets + admin + postcodes (no address points) |
-| `admin/` | 6 files (+3 optional) | Admin cell indexes + place nodes + postcodes |
-| `admin-minimal/` | 9 files | Admin levels 2-8 + place nodes, with its own polygons over the minimal arc set, simplified to within 37.5 m on an 11 m grid (a ring that grid would collapse keeps the 1.1 m one; takes the place of the quality dir, so pick simplified), and only the core strings its records name. For POI tier `none` |
-| `admin-minimal-poi/` | 9 files | The same, on the shared polygon slots and core strings that a POI tier's parent polygons and names point into (a dropped polygon's slot holds a tombstone), with the same arc files. The admin-minimal mode's dir beside a POI tier |
+| `no-addresses/` | 16 files (+3 optional) | Streets + admin + postcodes (no address points) |
+| `admin/` | 8 files (+3 optional) | Admin cell indexes + place nodes + postcodes |
+| `admin-minimal/` | 11 files | Admin levels 2-8 + place nodes, with its own polygons over the minimal arc set, simplified to within 37.5 m on an 11 m grid (a ring that grid would collapse keeps the 1.1 m one; takes the place of the quality dir, so pick simplified), and only the core strings its records name. For POI tier `none` |
+| `admin-minimal-poi/` | 11 files | The same, on the shared polygon slots and core strings that a POI tier's parent polygons and names point into (a dropped polygon's slot holds a tombstone), with the same arc files. The admin-minimal mode's dir beside a POI tier |
 
 Optional files are written only when the data has them; see `optional_files`
 under configurations.json below. The admin-minimal mode picks its dir by the
@@ -52,8 +52,10 @@ POI tier (its component's `variants`, below): `admin-minimal/`'s strings and
 polygon ids are its own, so no other dir's offsets or ids can be read
 against it.
 
-No dir ships the place nodes' cell index: the first load of an index dir
-derives it from `place_nodes.bin` into `<dir>/derived/` (see Fresh Install).
+The place nodes come as three files: `place_cells.bin` (each admin cell's
+first row), `place_nodes.bin` (the visible nodes in cell order, bit-packed)
+and `place_hidden.bin` (the ones a boundary hides), which the server reads
+as they are.
 
 ### Quality directory (pick one)
 
@@ -171,21 +173,6 @@ the `.bin` files, because the server can't load a region without them.
 6. Store build_version, patch_version, and date locally
 ```
 
-The first load of the dir (the server, the node binding, `grid_query`)
-derives the place index from `place_nodes.bin` into `<dir>/derived/`:
-`place_cells.idx`, `place_entries.idx` and `place_index.json`, which records
-what they were derived from (place_nodes.bin's size, mtime, inode and
-sha256, and the cell level). Planet admin (4.1M place nodes) takes about a
-second on one core, with a heap peak of 5.4 MiB. Later loads map them while
-`place_nodes.bin` keeps its stat, or its sha256 when the files were copied.
-Where `<dir>` can't be written, the index goes to a private dir under
-`$TMPDIR` instead, one per user and dataset dir
-(`geocoder-place-index-<uid>-<sha256 of the dir's path>`, mode 0700; a load
-refuses one another user owns or can open), checked the same way.
-A pack or an image that bundles a dataset only has to load it once when it
-is built: the `derived/` that load writes comes along, and loads from the
-copy use it as is.
-
 ### Daily Update (patching)
 
 ```
@@ -216,8 +203,7 @@ string tier it rebuilds (of its FCC2 file), and the tool fails when one differs.
 only catches a file from another build when its size changed; the string
 tiers' hashes are the content check. The server combines a mode dir with a
 quality or poi dir by global string offsets, so patch every selected dir to
-the same date and swap the whole set in together. The first load of the
-patched set derives its place index again.
+the same date and swap the whole set in together.
 
 ### Version Mismatch
 

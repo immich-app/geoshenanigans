@@ -1,5 +1,5 @@
-// The binding: the first load derives the place index, reverse geocoding finds a boundary by its
-// arcs and nothing off the globe. Place search uses an index shipped beside its dataset as is,
+// The binding: reverse geocoding finds a place in its cell, a boundary by its arcs and nothing
+// off the globe. Place search uses an index shipped beside its dataset as is,
 // rebuilds one shipped for other files, builds a missing one on the device, and refuses files
 // replaced under a loaded geocoder.
 //
@@ -7,7 +7,7 @@
 //
 // GEOCODER_NODE overrides the addon path (default: this crate's release build).
 import assert from 'node:assert/strict';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
@@ -36,6 +36,8 @@ const zigzag = (v) => (v >= 0 ? 2 * v : -2 * v - 1);
 // The admin cell (S2, level 10) of (10.5, 20.5), inside the country: the server's
 // cell_id_at_level(10.5, 20.5, DEFAULT_ADMIN_CELL_LEVEL).
 const COUNTRY_CELL = 0x1129af0000000000n;
+// The keys (cell id >> 32) of the admin cells of the places at (10.2, 20.5) and (10.7, 20.5).
+const PLACE_CELL_KEYS = [0x1129cf00, 0x11290700];
 
 // The admin cell index the builder writes (builder/src/cell_pairs.h) of one level-10 cell listing
 // one id: the cell's parent record (its number, its leaf, the offset of its one block), the end of
@@ -116,15 +118,62 @@ function writeDataset(dir, names) {
   };
   const country = string('Testland');
   const places = names.map(string);
-  // The country's ring as one arc in e7 units: a flags byte (grid exponent 0, no box), the
-  // first vertex, then zigzag varint deltas. Its ring block is one chunk of one ref, to slot 0,
-  // that ends the ring.
+  // The country's ring as one arc in e7 units (builder/src/arc_blocks.h): a flags byte (grid
+  // exponent 0, first-order deltas, base width b over 2 in bits 3-6, no box), the first vertex,
+  // then the zigzag deltas in groups of 16: a byte of the group's widths over b (lat << 4 |
+  // lng), then its lat and its lng deltas at those widths, LSB first. A short group's widths
+  // sum to 8 or more. Its ring block is one chunk of one ref, to slot 0, that ends the ring.
   const ring = [[10, 20], [10, 21], [11, 21], [11, 20], [10, 20]].map(([lat, lng]) => [lat * 1e7, lng * 1e7]);
-  const deltas = ring.slice(1).flatMap(([lat, lng], i) => [varint(zigzag(lat - ring[i][0])), varint(zigzag(lng - ring[i][1]))]);
-  const arc = Buffer.concat([Buffer.from([0]), i32(ring[0][0]), i32(ring[0][1]), ...deltas]);
+  const width = (v) => (v ? v.toString(2).length : 0);
+  const zl = ring.slice(1).map(([lat], i) => zigzag(lat - ring[i][0]));
+  const zg = ring.slice(1).map(([, lng], i) => zigzag(lng - ring[i][1]));
+  const b = 2 * Math.floor((Math.max(0, Math.max(...zl.map(width), ...zg.map(width)) - 15) + 1) / 2);
+  const groups = [];
+  for (let g = 0; g < zl.length; g += 16) {
+    const lat = zl.slice(g, g + 16), lng = zg.slice(g, g + 16);
+    let wl = Math.max(b, ...lat.map(width)), wg = Math.max(b, ...lng.map(width));
+    while (lat.length < 16 && wl + wg < 8) {
+      if (wl - b < 15) wl++;
+      else wg++;
+    }
+    let bits = 0n, n = 0n;
+    for (const [v, w] of [...lat.map((v) => [v, wl]), ...lng.map((v) => [v, wg])]) {
+      bits |= BigInt(v) << n;
+      n += BigInt(w);
+    }
+    const bytes = Buffer.alloc(Number((n + 7n) / 8n));
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Number((bits >> BigInt(8 * i)) & 0xffn);
+    groups.push(Buffer.from([((wl - b) << 4) | (wg - b)]), bytes);
+  }
+  const arc = Buffer.concat([Buffer.from([(b / 2) << 3]), i32(ring[0][0]), i32(ring[0][1]), ...groups]);
   const rings = Buffer.from([(1 << 2) | 1, 0]);
-  const polygons = Buffer.concat([u32(0), u32(rings.length), u32(country), Buffer.from([2, 0, 0, 0]), f32(1), Buffer.from('tl'), Buffer.from([0, 0])]);
-  const nodes = Buffer.concat(places.map((name, i) => Buffer.concat([f32(10.2 + i * 0.5), f32(20.5), u32(name), Buffer.from([1, 0, 0, 0]), u32(0)])));
+  // Its record: its ring block at 0 (to the end of admin_rings.bin), its name, area, country
+  // code and admin level 2 (level << 4 | place type).
+  const polygons = Buffer.concat([u32(0), u32(country), f32(1), Buffer.from('tl'), Buffer.from([2 << 4, 0])]);
+  // The places, towns, as the builder lays them out (builder/src/place_files.h): visible nodes
+  // by their admin cell's key, in one block (of 64 rows at most) of a row per node, LSB first:
+  // its lat and lng order keys (f32 bit patterns in the floats' order) less the block's least
+  // ones, its place type (3 bits) and its name, at the block's widths; then the block table and
+  // the footer. place_cells.bin lists each cell's key and first row; none are hidden.
+  const f32bits = (v) => f32(v).readUInt32LE(0);
+  const orderKey = (bits) => (bits & 0x80000000 ? ~bits : bits | 0x80000000) >>> 0;
+  const rows = places
+    .map((name, i) => ({ key: PLACE_CELL_KEYS[i], lat: orderKey(f32bits(10.2 + i * 0.5)), lng: orderKey(f32bits(20.5)), name }))
+    .sort((a, c) => a.key - c.key);
+  const latBase = Math.min(...rows.map((r) => r.lat)), lngBase = Math.min(...rows.map((r) => r.lng));
+  const wl = width(Math.max(...rows.map((r) => r.lat - latBase))), wg = width(Math.max(...rows.map((r) => r.lng - lngBase)));
+  const wn = width(Math.max(...rows.map((r) => r.name)));
+  let rowBits = 0n, at = 0n;
+  for (const r of rows) {
+    for (const [v, w] of [[r.lat - latBase, wl], [r.lng - lngBase, wg], [1, 3], [r.name, wn]]) {
+      rowBits |= BigInt(v) << at;
+      at += BigInt(w);
+    }
+  }
+  const block = Buffer.alloc(Number((at + 7n) / 8n));
+  for (let i = 0; i < block.length; i++) block[i] = Number((rowBits >> BigInt(8 * i)) & 0xffn);
+  const nodes = Buffer.concat([block, u32(latBase), u32(lngBase), u32(0), Buffer.from([wl, wg, wn, 0]), u32(rows.length), Buffer.from('PNL3')]);
+  const placeCells = Buffer.concat(rows.map((r, i) => Buffer.concat([u32(r.key), u32(i)])));
   const tiers = Array.from({ length: 5 }, (_, t) => ({ start: t === 0 ? 0 : size, end: size }));
   const [adminCells, adminEntries] = adminIndex(COUNTRY_CELL, 0);
   const files = {
@@ -136,7 +185,9 @@ function writeDataset(dir, names) {
     // against the country's arc.
     'admin_cells.bin': adminCells,
     'admin_entries.bin': adminEntries,
+    'place_cells.bin': placeCells,
     'place_nodes.bin': nodes,
+    'place_hidden.bin': Buffer.alloc(0),
     'strings_core.bin': fcc2(strings),
     'strings_layout.json': JSON.stringify({ tiers }),
   };
@@ -155,13 +206,11 @@ const dataset = (names) => {
   return writeDataset(dir, names);
 };
 
-test('the first load derives the place index the dataset does not ship', async () => {
-  const dir = dataset(['Testville', 'Otherton']);
-
-  const geocoder = Geocoder.load(dir);
+test('reverse geocoding finds a place in its cell', async () => {
+  const geocoder = Geocoder.load(dataset(['Testville', 'Otherton']));
 
   assert.equal(JSON.parse(await geocoder.reverseGeocode(10.2, 20.5)).address.town, 'Testville');
-  assert.ok(existsSync(join(dir, 'derived', 'place_index.json')));
+  assert.equal(JSON.parse(await geocoder.reverseGeocode(10.7, 20.5)).address.town, 'Otherton');
 });
 
 test('reverse geocoding inside the country finds it by its arcs', async () => {

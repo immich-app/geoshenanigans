@@ -1666,13 +1666,14 @@ TEST(a_dirs_arc_and_ring_files_lay_the_blocks_out_in_slot_order) {
                             rings = read_bytes(dir.path() + "/admin_rings.bin");
     CHECK(read_bytes(twin + "/admin_polygons.bin") == records);
     CHECK(read_bytes(twin + "/admin_rings.bin") == rings);
-    REQUIRE(records.size() == 3 * sizeof(AdminPolygon));
-    AdminPolygon got[3];
+    REQUIRE(records.size() == 3 * sizeof(AdminPolygonRecord));
+    AdminPolygonRecord got[3];
     std::memcpy(got, records.data(), records.size());
     const BlockSpan b5 = blocks.polygons[5].blocks[0], b0 = blocks.polygons[0].blocks[0];
-    CHECK(got[0].ring_offset == 0 && got[0].ring_bytes == b5.size && got[0].hole_count == 0 && got[0].name_id == 55);
-    CHECK(got[1].ring_offset == NO_DATA && got[1].ring_bytes == 0 && got[1].name_id == NO_DATA);
-    CHECK(got[2].ring_offset == b5.size && got[2].ring_bytes == b0.size && got[2].hole_count == 1);
+    // Each block runs to the next record's offset, the tombstone's empty.
+    CHECK(got[0].ring_offset == 0 && got[0].name_id == 55);
+    CHECK(got[1].ring_offset == b5.size && got[1].name_id == NO_DATA);
+    CHECK(got[2].ring_offset == b5.size && got[2].name_id == 11);
     REQUIRE(rings.size() == ring_bytes && ring_bytes == size_t(b5.size) + b0.size);
     CHECK(std::memcmp(rings.data(), full.ring_blocks.data() + b5.offset, b5.size) == 0);
     CHECK(std::memcmp(rings.data() + b5.size, full.ring_blocks.data() + b0.offset, b0.size) == 0);

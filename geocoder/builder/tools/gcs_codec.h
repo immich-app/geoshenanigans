@@ -11,8 +11,10 @@
 // new file (its vertices written as they come, then packed in place).
 #pragma once
 #include <cmath>
+#include <functional>
 #include <memory>
 #include "gcs_io.h"
+#include "place_files.h"
 #include "poi_files.h"
 
 namespace gcs {
@@ -1174,5 +1176,185 @@ struct Enc : Encoder {
     }
 };
 }  // namespace poi
+
+// ------------------------------------------------------------------ places (place_files.h)
+namespace place {
+namespace pf = place_files;
+// The codec's buffers: the place files stream front to back in units of a block (under 1 KiB) or a run
+// of hidden rows, so a few KiB each do; the codec holds about 56 KiB.
+static const size_t SMALL_BUF = size_t(4) << 10, BLOCKS_BUF = size_t(16) << 10;
+
+// A dir's place files' decoded size, LOGICAL_STRIDE a node, from place_nodes.bin's footer and
+// place_hidden.bin's size alone: 0 without place_nodes.bin.
+inline uint64_t decoded_size(const std::string& dir) {
+    const std::string np = dir + "/" + pf::NODES_FILE, hp = dir + "/" + pf::HIDDEN_FILE;
+    struct stat st;
+    if (stat(np.c_str(), &st) != 0) return 0;
+    const uint64_t size = uint64_t(st.st_size);
+    uint8_t f[pf::FOOTER_BYTES] = {};
+    if (size >= pf::FOOTER_BYTES) {
+        const int fd = open(np.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) die("open %s: %s", np.c_str(), strerror(errno));
+        pread_all(fd, f, pf::FOOTER_BYTES, size - pf::FOOTER_BYTES, np);
+        close(fd);
+    }
+    const pf::Footer ft = pf::read_footer(f, size);
+    const uint64_t hidden = stat(hp.c_str(), &st) == 0 ? uint64_t(st.st_size) / pf::HIDDEN_ROW_BYTES : 0;
+    return pf::LOGICAL_STRIDE * (uint64_t(ft.rows) + hidden);
+}
+
+// Port 0 = place_nodes.bin's logical stream (pf::LogicalPlace). A step: a block of visible rows, or
+// a run of hidden rows. A dir without the three files decodes to none.
+struct Dec : Decoder {
+    static constexpr size_t HIDDEN_PER_STEP = SMALL_BUF / pf::HIDDEN_ROW_BYTES;
+    std::unique_ptr<Reader> C, N, T, H;  // place_cells.bin, place_nodes.bin's blocks and its table, place_hidden.bin
+    pf::Footer f;
+    std::unique_ptr<pf::CellCursor> cells;
+    size_t b = 0;
+    uint64_t at = 0;
+    explicit Dec(const std::string& src) : Decoder("places", {pf::NODES_FILE}) {
+        const std::string cp = src + "/" + pf::CELLS_FILE, np = src + "/" + pf::NODES_FILE, hp = src + "/" + pf::HIDDEN_FILE;
+        struct stat st;
+        const int has = (stat(cp.c_str(), &st) == 0) + (stat(np.c_str(), &st) == 0) + (stat(hp.c_str(), &st) == 0);
+        if (!has) return;
+        if (has != 3) die("%s has some of the place files", src.c_str());
+        const uint64_t size = file_size(np), cs = file_size(cp), hs = file_size(hp);
+        uint8_t ft[pf::FOOTER_BYTES] = {};
+        if (size >= pf::FOOTER_BYTES) {
+            Reader footer(np, pf::FOOTER_BYTES, size - pf::FOOTER_BYTES);
+            memcpy(ft, footer.take(pf::FOOTER_BYTES), pf::FOOTER_BYTES);
+        }
+        f = pf::read_footer(ft, size);
+        if (cs % pf::CELL_ROW_BYTES) pf::malformed("place_cells.bin is not whole rows");
+        if (hs % pf::HIDDEN_ROW_BYTES) pf::malformed("place_hidden.bin is not whole rows");
+        cells.reset(new pf::CellCursor(f.rows, cs / pf::CELL_ROW_BYTES));
+        C.reset(new Reader(cp, SMALL_BUF));
+        N.reset(new Reader(np, BLOCKS_BUF, 0, f.table_at));
+        T.reset(new Reader(np, SMALL_BUF, f.table_at, size - pf::FOOTER_BYTES));
+        H.reset(new Reader(hp, SMALL_BUF));
+    }
+    uint64_t decoded_size(int) const override {
+        if (!N) return 0;
+        return pf::LOGICAL_STRIDE * (uint64_t(f.rows) + H->size() / pf::HIDDEN_ROW_BYTES);
+    }
+    bool step() override {
+        if (!N) return false;
+        if (b < f.blocks) {
+            const pf::BlockEntry e = pf::read_entry(T->take(pf::TABLE_ENTRY_BYTES));
+            const size_t rows = f.rows_of(b), bytes = e.bytes(rows);
+            if (e.offset != at) pf::malformed("block " + std::to_string(b) + " is not where the blocks before it end");
+            if (at + bytes > f.table_at) pf::malformed("block " + std::to_string(b) + " runs into the block table");
+            const uint8_t* p = N->take(bytes);
+            uint8_t* o = emit_reserve(0, rows * pf::LOGICAL_STRIDE);
+            pf::decode_block(
+                b, e, rows, p, [&](uint32_t row) { return cells->key_of(row, [&] { return C->take(pf::CELL_ROW_BYTES); }); },
+                [&](const pf::LogicalPlace& pl) {
+                    memcpy(o, &pl, pf::LOGICAL_STRIDE);
+                    o += pf::LOGICAL_STRIDE;
+                });
+            at += bytes;
+            b++;
+            return true;
+        }
+        if (!H->eof()) {
+            const size_t n = size_t(std::min<uint64_t>(H->left() / pf::HIDDEN_ROW_BYTES, HIDDEN_PER_STEP));
+            const uint8_t* p = H->take(n * pf::HIDDEN_ROW_BYTES);
+            uint8_t* o = emit_reserve(0, n * pf::LOGICAL_STRIDE);
+            for (size_t k = 0; k < n; k++) {
+                const pf::LogicalPlace pl = pf::hidden_place(p + k * pf::HIDDEN_ROW_BYTES);
+                memcpy(o + k * pf::LOGICAL_STRIDE, &pl, pf::LOGICAL_STRIDE);
+            }
+            return true;
+        }
+        if (at != f.table_at) pf::malformed("place_nodes.bin has bytes between its blocks and its table");
+        cells->finish();
+        C.reset();
+        N.reset();
+        T.reset();
+        H.reset();
+        return false;
+    }
+};
+
+// Port 0 = the logical stream in; the three files out. The blocks go to place_nodes.bin as they are
+// packed and their table entries to a scratch file beside it, which finish appends to it with the
+// footer: nothing grows with the set but the files.
+struct Enc : Encoder {
+    using Sink = std::function<void(const uint8_t*, size_t)>;
+    std::unique_ptr<Writer> CW, NW, HW, TW;
+    std::string tpath;
+    pf::Encoder<Sink> enc;
+    explicit Enc(const std::string& od)
+        : Encoder("places", od, 1),
+          CW(new Writer(od + "/" + pf::CELLS_FILE, SMALL_BUF)),
+          NW(new Writer(od + "/" + pf::NODES_FILE, BLOCKS_BUF)),
+          HW(new Writer(od + "/" + pf::HIDDEN_FILE, SMALL_BUF)),
+          TW(new Writer(od + "/.place_nodes.table", SMALL_BUF, true)),
+          tpath(od + "/.place_nodes.table"),
+          enc([this](const uint8_t* p, size_t n) { CW->put(p, n); }, [this](const uint8_t* p, size_t n) { NW->put(p, n); },
+              [this](const uint8_t* p, size_t n) { HW->put(p, n); }) {}
+    void spill() {
+        if (enc.table().empty()) return;
+        for (const auto& e : enc.table()) TW->put(e.data(), e.size());
+        enc.clear_table();
+    }
+    void add(const uint8_t* row) {
+        pf::LogicalPlace p;
+        memcpy(&p, row, pf::LOGICAL_STRIDE);
+        enc.add(p);
+        spill();
+    }
+    // Every byte straight from the writer (nothing queued): a row a write cuts waits in carry.
+    uint8_t carry[pf::LOGICAL_STRIDE];
+    size_t carried = 0;
+    size_t consume(int, const uint8_t* p, size_t n) override {
+        size_t used = 0;
+        if (carried) {
+            used = std::min(pf::LOGICAL_STRIDE - carried, n);
+            memcpy(carry + carried, p, used);
+            carried += used;
+            if (carried < pf::LOGICAL_STRIDE) return n;
+            add(carry);
+            carried = 0;
+        }
+        for (; n - used >= pf::LOGICAL_STRIDE; used += pf::LOGICAL_STRIDE) add(p + used);
+        memcpy(carry, p + used, n - used);
+        carried = n - used;
+        return n;
+    }
+    void pump() override {
+        ByteQueue& q = in[0];
+        while (q.size() >= pf::LOGICAL_STRIDE) {
+            add(q.data());
+            q.pop(pf::LOGICAL_STRIDE);
+        }
+    }
+    void finish(Manifest&) override {
+        require_empty();
+        if (carried) die("places: the stream ends %zu bytes into a row", carried);
+        enc.finish();
+        spill();
+        TW->flush();
+        std::vector<uint8_t> buf(BLOCKS_BUF);
+        for (uint64_t off = 0, n = TW->tell(); off < n;) {
+            const size_t k = size_t(std::min<uint64_t>(buf.size(), n - off));
+            pread_all(TW->fd, buf.data(), k, off, tpath);
+            NW->put(buf.data(), k);
+            off += k;
+        }
+        const auto footer = enc.footer();
+        NW->put(footer.data(), footer.size());
+        TW->finish();
+        if (unlink(tpath.c_str())) die("unlink %s: %s", tpath.c_str(), strerror(errno));
+        CW->finish();
+        NW->finish();
+        HW->finish();
+        TW.reset();
+        CW.reset();
+        NW.reset();
+        HW.reset();
+    }
+};
+}  // namespace place
 
 }  // namespace gcs

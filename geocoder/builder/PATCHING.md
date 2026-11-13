@@ -350,7 +350,8 @@ The place search index (`geocoder/search`) points into a selection's own
 files by record index and string offset, so it answers right only beside the
 exact files it was built from. Its `search_meta.json` records the sha256 of
 each of them (`dataset`: admin_polygons, admin_rings, arc_index, arc_vertices,
-place_nodes, poi_records, strings_core, strings_layout.json, strings_poi), so an
+place_cells, place_hidden, place_nodes, poi_records, strings_core,
+strings_layout.json, strings_poi), so an
 index built beside one boundary tier is built again beside the other, whose
 arcs its label points would not lie on; and the binding
 (`openPlaceSearch`) uses an index only while the files beside it hash the
@@ -652,7 +653,7 @@ layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
 | 3 | `addr_points.bin` | merge at stride 28, string fields `housenumber_id` and `street_id` |
 | 4 | `interp_ways.bin` | merge at stride 24, string field `street_id` |
 | 5 | `interp_nodes.bin` | child stream of interp_ways, at stride 8 |
-| 6 | `admin_polygons.bin` | merge by slot at stride 24, string field `name_id`, offset field `ring_offset` (v14) |
+| 6 | `admin_polygons.bin` | merge by slot at stride 16 (v16; v14–v15: 24), string field `name_id`, offset field `ring_offset` (v14) |
 | 7 | `admin_rings.bin` | child stream of admin_polygons, at stride 1 (v14; v13: `admin_vertices.bin`) |
 | 8 | `geo_cells.bin` | geo cell changes (0xFFFFFFFB), rebuilt with `geo_entries.bin` (35) beside the geo entry deltas |
 | 9-11 | the geo index's street, address and interpolation lists (no files of their own since GXT2: a file section naming one is refused) | geo entry deltas (0xFFFFFFF0) |
@@ -660,7 +661,7 @@ layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
 | 14 | `poi_records.bin` | merge of the logical records (R2 decoded) at stride 36, string fields `name_id`, `parent_street_id` and `parent_postcode_id`; the client list gives the R2 file's size |
 | 15 | `poi_vertices.bin` | child stream of poi_records, of the logical vertex stream (V2 decoded), at stride 1 |
 | 16, 17 | `poi_cells.bin`, `poi_entries.bin` | POI cell changes (0xFFFFFFF5) and a cell index delta |
-| 18 | `place_nodes.bin` | merge at stride 20, string field `name_id` |
+| 18 | `place_nodes.bin` | merge of the place files' logical rows (`builder/src/place_files.h`, decoded) at stride 24 (v16; was 20), string field `name_id`; the patcher encodes `place_cells.bin`, `place_nodes.bin` and `place_hidden.bin` from them, whose sizes the client list gives |
 | 19 | `addr_postcodes.bin` | parallel delta along addr_points, remap kind 2 |
 | 20 | `admin_parents.bin` | sparse delta, remap kind 0 (v14; was 1) |
 | 21 | `way_parents.bin` | parallel delta along street_ways, remap kind 0 (v14; was 1) |

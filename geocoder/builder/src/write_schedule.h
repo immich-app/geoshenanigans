@@ -48,7 +48,7 @@ inline KindValues record_bytes(const ParsedData& d) {
     at(b, RecordKind::Pois) = vector_bytes(d.poi_records) + vector_bytes(d.poi_osm_ids)
         + vector_bytes(d.poi_sidecar_blob) + vector_bytes(d.poi_vertices) + vector_bytes(d.sorted_poi_cells);
     at(b, RecordKind::Places) = vector_bytes(d.place_nodes) + vector_bytes(d.place_osm_ids)
-        + vector_bytes(d.place_sidecar_blob) + vector_bytes(d.sorted_place_cells);
+        + vector_bytes(d.sorted_place_cells);
     uint64_t strings = d.string_pool.data().size();
     for (const auto& tier : d.strings_tiers) strings += tier.size();
     at(b, RecordKind::Admins) = vector_bytes(d.admin_polygons) + vector_bytes(d.admin_osm_ids)

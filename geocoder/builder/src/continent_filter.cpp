@@ -87,8 +87,8 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         if (consume) (release(planet_arrays), ...);
     };
     // The sidecars stay with the planet's own files, written by now.
-    drop(full.way_sidecar_blob, full.admin_sidecar_blob, full.addr_sidecar_blob, full.place_sidecar_blob,
-         full.poi_sidecar_blob, full.interp_sidecar_blob);
+    drop(full.way_sidecar_blob, full.admin_sidecar_blob, full.addr_sidecar_blob, full.poi_sidecar_blob,
+         full.interp_sidecar_blob);
     std::optional<PolygonIndex> boundary_index;
     if (boundary) boundary_index.emplace(*boundary);
     const PolygonIndex* polygon = boundary ? &*boundary_index : nullptr;

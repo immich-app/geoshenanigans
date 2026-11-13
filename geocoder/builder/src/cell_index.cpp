@@ -27,6 +27,7 @@
 #include "id_allocator.h"
 #include "parallel.h"
 #include "place_claims.h"
+#include "place_files.h"
 #include "polygon_rings.h"
 #include "postcode_validation.h"
 #include "ranked_bits.h"
@@ -315,47 +316,6 @@ static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir)
     finalize_strategy2(alloc, n_new, n_old, data.addr_sidecar_blob, "addrs", /*no_shifts=*/false);
 }
 
-// Strategy-2 stable IDs for place_nodes.
-// place_nodes are referenced from cell_to_place / sorted_place_cells.
-// They aren't sorted by content for binary search (verified — server
-// uses cell-driven lookup); reordering is safe.
-static void apply_strategy2_places(ParsedData& data, const std::string& prev_dir) {
-    using namespace gc::id_alloc;
-    if (data.place_nodes.empty()) return;
-    if (data.place_osm_ids.size() != data.place_nodes.size()) return;
-
-    IdAllocator alloc;
-    if (!prev_dir.empty()) {
-        // place_nodes live in /admin/ (and /full/, /no-addresses/).
-        // Use /admin/ as canonical since it's always present when
-        // place_nodes exist.
-        alloc.load_previous(prev_dir + "/admin/place_nodes.osm_ids");
-    }
-
-    const size_t n_old = data.place_nodes.size();
-    const std::vector<uint32_t> remap = alloc.allocate_all(n_old, [&](size_t i) {
-        return unpack_identity(data.place_osm_ids[i]);
-    });
-    const bool identity = is_identity(remap);
-    const uint32_t n_new = alloc.total_slots();
-
-    if (identity && n_new == n_old) {
-        finalize_strategy2(alloc, n_new, n_old, data.place_sidecar_blob, "places", /*no_shifts=*/true);
-        return;
-    }
-
-    PlaceNode tomb_pn{};
-    std::memset(&tomb_pn, 0, sizeof(tomb_pn));
-    tomb_pn.name_id = NO_DATA;
-    tomb_pn.parent_poly_id = NO_DATA;
-    reorder_by_remap(data.place_nodes, remap, n_new, tomb_pn);
-    reorder_by_remap(data.place_osm_ids, remap, n_new, uint64_t(0));
-
-    remap_cell_pairs(data.sorted_place_cells, [&](uint32_t& v) { remap_index(v, remap); });
-
-    finalize_strategy2(alloc, n_new, n_old, data.place_sidecar_blob, "places", /*no_shifts=*/false);
-}
-
 // Strategy-2 stable IDs for poi_records.
 // Reference sites updated:
 //   - data.sorted_poi_cells (item_id)
@@ -496,7 +456,6 @@ void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir, RunOr
     };
     start(RecordKind::Ways, "streets", [&] { way_remap = apply_strategy2_streets(data, prev_dir); });
     start(RecordKind::Addrs, "addrs", [&] { apply_strategy2_addrs(data, prev_dir); });
-    start(RecordKind::Places, "places", [&] { apply_strategy2_places(data, prev_dir); });
     start(RecordKind::Pois, "pois", [&] { apply_strategy2_pois(data, prev_dir); });
     start(RecordKind::Interps, "interps", [&] { apply_strategy2_interps(data, prev_dir); });
     for (auto& f : passes) f.get();
@@ -1375,6 +1334,30 @@ static StringSubset admin_minimal_names(const ParsedData& data, const std::vecto
     return StringSubset(core, used);
 }
 
+void write_place_files(const std::string& dir, const std::vector<PlaceNode>& nodes) {
+    std::vector<uint32_t> order, keys(nodes.size(), NO_DATA);
+    for (size_t i = 0; i < nodes.size(); i++) {
+        if (!place_files::is_visible(nodes[i])) continue;
+        keys[i] = place_files::cell_key(
+            S2CellId(S2LatLng::FromDegrees(nodes[i].lat, nodes[i].lng)).parent(kAdminCellLevel).id());
+        order.push_back(static_cast<uint32_t>(i));
+    }
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return keys[a] < keys[b]; });
+    for (size_t i = 0; i < nodes.size(); i++)
+        if (!place_files::is_visible(nodes[i])) order.push_back(static_cast<uint32_t>(i));
+    std::vector<uint8_t> cells, blocks, hidden;
+    auto into = [](std::vector<uint8_t>& v) { return [&v](const uint8_t* p, size_t n) { v.insert(v.end(), p, p + n); }; };
+    place_files::Encoder enc(into(cells), into(blocks), into(hidden));
+    for (const uint32_t i : order) enc.add({nodes[i], keys[i]});
+    enc.finish();
+    for (const auto& entry : enc.table()) blocks.insert(blocks.end(), entry.begin(), entry.end());
+    const auto footer = enc.footer();
+    blocks.insert(blocks.end(), footer.begin(), footer.end());
+    write_binary_file(dir + "/" + place_files::CELLS_FILE, reinterpret_cast<const char*>(cells.data()), cells.size());
+    write_binary_file(dir + "/" + place_files::NODES_FILE, reinterpret_cast<const char*>(blocks.data()), blocks.size());
+    write_binary_file(dir + "/" + place_files::HIDDEN_FILE, reinterpret_cast<const char*>(hidden.data()), hidden.size());
+}
+
 namespace {
 
 // A dir's records over `slots`: polygon i at slot slots.slot_of[i] (none at
@@ -1425,8 +1408,7 @@ void write_admin_minimal_dir(const ParsedData& data, const std::string& dir, con
         pn.name_id = strings.name(pn.name_id);
         places.push_back(pn);
     }
-    write_binary_file(dir + "/place_nodes.bin", reinterpret_cast<const char*>(places.data()),
-                      places.size() * sizeof(PlaceNode));
+    write_place_files(dir, places);
 
     // Its admin cell index (compute_admin_index_cells), in its slots, each
     // id's INTERIOR_FLAG kept.
