@@ -1520,49 +1520,71 @@ impl Index {
         self.geo_index.lookup_many(&cells, geo_index::ALL_TABLES, &mut lists);
 
         let cos_lat = lat.to_radians().cos();
+        let addr_result = self.nearest_addr(&lists, cells.len(), lat, lng, cos_lat);
+        let street_result = self.nearest_street(street_ways, street_nodes, &lists, cells.len(), lat, lng, cos_lat);
+        let interp_result = self.nearest_interp(&lists, cells.len(), lat, lng, cos_lat);
+
+        GEO_LISTS.with(|g| g.set(lists));
+
+        (addr_result, interp_result, street_result)
+    }
+
+    /// The address point nearest (lat, lng) in `lists`, a lookup's lists of `cells` cells: its
+    /// squared distance, its record and its id. An exact tie goes by `addr_tie_key`, then to the
+    /// point read first: cells are read in the order the lookup asked for them, a cell's ids in
+    /// its list's.
+    fn nearest_addr(&self, lists: &GeoLists, cells: usize, lat: f64, lng: f64, cos_lat: f64)
+        -> Option<(f64, AddrPoint, u32)>
+    {
+        let addr_points = self.addr_points.as_ref()?;
+        let total_addr = addr_points.len() / std::mem::size_of::<AddrPoint>() as u64;
         let addr_key = |a: &AddrPoint| self.addr_tie_key(a, lat, lng, cos_lat);
-        let street_key = |w: &WayHeader| self.street_tie_key(street_nodes, w);
 
         let mut best_addr_dist = f64::MAX;
         let mut best_addr: Option<AddrPoint> = None;
         let mut best_addr_id: u32 = NO_DATA;
+        // Building-sourced points (vertex_count > 0)
+        // use polygon distance, matching ST_Distance behaviour.
+        for i in 0..cells {
+            for &id in lists.list(i, geo_index::ADDRESSES) {
+                let idx = id as u64;
+                if idx >= total_addr { continue; }
+                let point: AddrPoint = addr_points.read_at(idx);
+                let dlat = (point.lat as f64 - lat).to_radians();
+                let dlng = (point.lng as f64 - lng).to_radians();
+                let mut dist = dist_sq(dlat, dlng, cos_lat);
+                if let Some(verts) = self.addr_polygon_verts(&point) {
+                    dist = polygon_distance_sq(lat, lng, &verts, cos_lat);
+                }
+                if beats(dist, best_addr_dist, || best_addr.as_ref().map(|b| (addr_key(&point), addr_key(b)))) {
+                    best_addr_dist = dist;
+                    best_addr = Some(point);
+                    best_addr_id = id;
+                }
+            }
+        }
+        best_addr.map(|p| (best_addr_dist, p, best_addr_id))
+    }
+
+    /// The street way nearest (lat, lng) in `lists`, read in `nearest_addr`'s order: its squared
+    /// distance, its record and its id. An exact tie goes by `street_tie_key`, then to the way
+    /// read first.
+    fn nearest_street(&self, street_ways: &FileBytes, street_nodes: &FileBytes, lists: &GeoLists, cells: usize,
+                      lat: f64, lng: f64, cos_lat: f64)
+        -> Option<(f64, WayHeader, u32)>
+    {
+        let street_key = |w: &WayHeader| self.street_tie_key(street_nodes, w);
+        let total_ways = street_ways.len() / std::mem::size_of::<WayHeader>() as u64;
+        let total_street_nodes = street_nodes.len() / std::mem::size_of::<NodeCoord>() as u64;
+
         let mut best_street_dist = f64::MAX;
         let mut best_street: Option<WayHeader> = None;
         let mut best_street_idx: u32 = NO_DATA;
-        let mut best_interp_dist = f64::MAX;
-        let mut best_interp: Option<InterpWay> = None;
-        let mut best_interp_t: f64 = 0.0;
-        let mut best_interp_id: u32 = NO_DATA;
 
         // Fixed-size hash set on stack to skip duplicate street IDs across cells
         let mut seen_streets: [u32; 64] = [u32::MAX; 64];
 
-        for i in 0..cells.len() {
-            // Addresses. Building-sourced points (vertex_count > 0)
-            // use polygon distance, matching ST_Distance behaviour.
-            if let Some(addr_points) = self.addr_points.as_ref() {
-                let total_addr = addr_points.len() / std::mem::size_of::<AddrPoint>() as u64;
-                for &id in lists.list(i, geo_index::ADDRESSES) {
-                    let idx = id as u64;
-                    if idx >= total_addr { continue; }
-                    let point: AddrPoint = addr_points.read_at(idx);
-                    let dlat = (point.lat as f64 - lat).to_radians();
-                    let dlng = (point.lng as f64 - lng).to_radians();
-                    let mut dist = dist_sq(dlat, dlng, cos_lat);
-                    if let Some(verts) = self.addr_polygon_verts(&point) {
-                        dist = polygon_distance_sq(lat, lng, &verts, cos_lat);
-                    }
-                    if beats(dist, best_addr_dist, || best_addr.as_ref().map(|b| (addr_key(&point), addr_key(b)))) {
-                        best_addr_dist = dist;
-                        best_addr = Some(point);
-                        best_addr_id = id;
-                    }
-                }
-            }
-
-            // Streets
-            let total_ways = street_ways.len() / std::mem::size_of::<WayHeader>() as u64;
-            let total_street_nodes = street_nodes.len() / std::mem::size_of::<NodeCoord>() as u64;
+        for i in 0..cells {
             for &id in lists.list(i, geo_index::STREETS) {
                 let slot = (id as usize) & 0x3F;
                 if seen_streets[slot] == id { continue; }
@@ -1593,37 +1615,43 @@ impl Index {
                     }
                 }
             }
+        }
+        best_street.map(|w| (best_street_dist, w, best_street_idx))
+    }
 
-            // Interpolation
-            if let Some(interp_ways) = self.interp_ways.as_ref() {
-                let total_interps = interp_ways.len() / std::mem::size_of::<InterpWay>() as u64;
-                for &id in lists.list(i, geo_index::INTERPOLATIONS) {
-                    // Corrupt cell entries must not read past the record files.
-                    if (id as u64) >= total_interps { continue; }
-                    let iw: InterpWay = interp_ways.read_at(id as u64);
-                    if iw.start_number == 0 || iw.end_number == 0 { continue; }
-                    let Some((dist, t)) = self.interp_way_position(&iw, lat, lng, cos_lat) else { continue };
-                    if beats(dist, best_interp_dist, || best_interp.as_ref().map(|b| (self.interp_tie_key(&iw), self.interp_tie_key(b)))) {
-                        best_interp_dist = dist;
-                        best_interp = Some(iw);
-                        best_interp_t = t;
-                        best_interp_id = id;
-                    }
+    /// The interpolation way nearest (lat, lng) in `lists`, read in `nearest_addr`'s order: its
+    /// squared distance, its street, the house number at the point of its line nearest
+    /// (lat, lng), and its id. Equally near ways go to the lesser `interp_tie_key`.
+    fn nearest_interp(&self, lists: &GeoLists, cells: usize, lat: f64, lng: f64, cos_lat: f64)
+        -> Option<(f64, Cow<'_, str>, u32, u32)>
+    {
+        let interp_ways = self.interp_ways.as_ref()?;
+        let total_interps = interp_ways.len() / std::mem::size_of::<InterpWay>() as u64;
+
+        let mut best_interp_dist = f64::MAX;
+        let mut best_interp: Option<InterpWay> = None;
+        let mut best_interp_t: f64 = 0.0;
+        let mut best_interp_id: u32 = NO_DATA;
+        for i in 0..cells {
+            for &id in lists.list(i, geo_index::INTERPOLATIONS) {
+                // Corrupt cell entries must not read past the record files.
+                if (id as u64) >= total_interps { continue; }
+                let iw: InterpWay = interp_ways.read_at(id as u64);
+                if iw.start_number == 0 || iw.end_number == 0 { continue; }
+                let Some((dist, t)) = self.interp_way_position(&iw, lat, lng, cos_lat) else { continue };
+                if beats(dist, best_interp_dist, || best_interp.as_ref().map(|b| (self.interp_tie_key(&iw), self.interp_tie_key(b)))) {
+                    best_interp_dist = dist;
+                    best_interp = Some(iw);
+                    best_interp_t = t;
+                    best_interp_id = id;
                 }
             }
         }
-
-        GEO_LISTS.with(|g| g.set(lists));
-
-        let addr_result = best_addr.map(|p| (best_addr_dist, p, best_addr_id));
-        let street_result = best_street.map(|w| (best_street_dist, w, best_street_idx));
-        let interp_result = best_interp.map(|iw| {
+        best_interp.map(|iw| {
             let number = interpolate_house_number(
                 iw.start_number, iw.end_number, iw.interpolation, best_interp_t);
             (best_interp_dist, self.get_string(iw.street_id), number, best_interp_id)
-        });
-
-        (addr_result, interp_result, street_result)
+        })
     }
 
     // Nominatim's `_find_housenumber_for_street` (reverse.py:231):
