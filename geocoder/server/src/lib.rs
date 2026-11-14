@@ -28,6 +28,7 @@ pub mod place_files;
 pub mod poi_files;
 pub mod side_blocks;
 pub mod strings;
+pub mod way_files;
 pub use place_files::PlaceFiles;
 pub use poi_files::PoiRecords;
 #[cfg(test)]
