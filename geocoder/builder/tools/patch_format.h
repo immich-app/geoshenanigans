@@ -1065,6 +1065,9 @@ private:
 
 // The keys a SortedTable samples for its directory: 16 KiB at most.
 static constexpr size_t TABLE_DIRECTORY_KEYS = 4096;
+// The buckets a SortedTable cuts its directory's key range into, at most:
+// 8 KiB of them.
+static constexpr size_t TABLE_BUCKETS = 4096;
 // A SortedTable's key filter: 2^15 bits, 4 KiB. A normal day's tables (90
 // moved strings, a parent id or two) set under 1% of them, so nearly every
 // lookup in them ends at the filter.
@@ -1085,7 +1088,11 @@ static constexpr uint32_t STRING_PAIRS_MAX = 65536;
 // refusing a step back or a repeated key as a malformed `what`, sets each
 // key's bit in a fixed filter, which turns away most keys a small table
 // lacks, and samples every step-th key into a directory, so a lookup the
-// filter passes, or a floor, searches one step of the records.
+// filter passes, or a floor, searches one step of the records. The
+// directory's key range is cut into equal buckets, each knowing where its
+// keys start in the directory, so a floor searches one bucket's keys
+// (about one when the keys are spread evenly) whatever order the lookups
+// come in.
 template <typename Rec>
 class SortedTable {
     static_assert(std::is_trivially_copyable<Rec>::value && sizeof(Rec) >= sizeof(uint32_t), "a record starts with its u32 key");
@@ -1103,6 +1110,15 @@ public:
             const uint32_t bit = filter_bit(key);
             filter_[bit / 64] |= uint64_t{1} << (bit % 64);
         }
+        if (directory_.empty()) return;
+        // As many buckets as directory keys, to a power of two: the widest
+        // that keeps the last key's bucket below that.
+        size_t most = 1;
+        while (most < directory_.size() && most < TABLE_BUCKETS) most *= 2;
+        while ((uint64_t{directory_.back()} >> bucket_shift_) >= most) bucket_shift_++;
+        buckets_.assign(bucket_of(directory_.back()) + 2, 0);
+        for (const uint32_t key : directory_) buckets_[bucket_of(key) + 1]++;
+        for (size_t b = 1; b < buckets_.size(); b++) buckets_[b] += buckets_[b - 1];
     }
 
     const char* data() const { return data_; }
@@ -1156,7 +1172,14 @@ private:
         uint32_t key;
     };
     Floor floor_of(uint32_t key) const {
-        const size_t d = static_cast<size_t>(std::upper_bound(directory_.begin(), directory_.end(), key) - directory_.begin());
+        // The directory keys at most `key`: those of the buckets below
+        // key's, and of its own up to key. A key past the last bucket is
+        // above them all.
+        const size_t b = bucket_of(key);
+        const size_t d = b + 1 >= buckets_.size()
+            ? directory_.size()
+            : static_cast<size_t>(std::upper_bound(directory_.begin() + buckets_[b], directory_.begin() + buckets_[b + 1], key) -
+                                  directory_.begin());
         if (d == 0) return {count_, 0};
         Floor f{(d - 1) * step_, directory_[d - 1]};
         if (f.key == key) return f;
@@ -1179,11 +1202,16 @@ private:
         memcpy(&key, data_ + i * sizeof(Rec), sizeof key);
         return key;
     }
+    size_t bucket_of(uint32_t key) const { return static_cast<size_t>(uint64_t{key} >> bucket_shift_); }
 
     const char* data_ = nullptr;
     size_t count_ = 0, step_ = 1;
     std::vector<uint32_t> directory_;  // the key of every step_-th record
     std::vector<uint64_t> filter_;     // a bit per filter_bit, none when empty
+    // buckets_[b]: how many directory keys lie in buckets below b, for b up
+    // to one past the last key's bucket; none when empty.
+    std::vector<uint16_t> buckets_;
+    unsigned bucket_shift_ = 0;        // a key's bucket is key >> bucket_shift_
 };
 
 // How a ScratchTable closes its file: close(), or a test's stand-in that

@@ -1668,6 +1668,45 @@ TEST(patch_format_sorted_and_scratch_tables_floor_as_upper_bound_does) {
     }
 }
 
+TEST(patch_format_sorted_table_floors_keys_crowded_into_few_buckets_or_at_bucket_edges) {
+    // The directory's buckets cut the key range evenly; these keys don't
+    // fill it evenly: all in one bucket, all at the top of the range, every
+    // one on a bucket's first or last key, one key far above a crowd.
+    std::vector<std::vector<uint32_t>> shapes;
+    std::vector<uint32_t> crowd, top, edges, outlier;
+    for (uint32_t i = 0; i < 10000; i++) {
+        crowd.push_back(1000 + i);
+        top.push_back(UINT32_MAX - 10000 + i);
+        edges.push_back((i / 2) << 18 | (i % 2 ? 0x3FFFF : 0));
+        outlier.push_back(3 * i);
+    }
+    outlier.push_back(UINT32_MAX);
+    for (const size_t n : {size_t(1), size_t(2), size_t(3), size_t(100), size_t(10000)})
+        for (const std::vector<uint32_t>* shape : {&crowd, &top, &edges, &outlier}) {
+            std::vector<uint32_t> keys(shape->begin(), shape->begin() + n);
+            if (shape == &outlier && n > 1) keys.back() = UINT32_MAX;
+            shapes.push_back(keys);
+        }
+    shapes.push_back({0});
+    shapes.push_back({UINT32_MAX});
+    shapes.push_back({0, UINT32_MAX});
+
+    size_t wrong = 0;
+    for (const std::vector<uint32_t>& keys : shapes) {
+        const std::vector<char> bytes = complement_pair_bytes(keys);
+        const SortedTable<RemapPair> sut = pair_table(bytes);
+        std::vector<uint32_t> probes = {0, 1, 1u << 18, UINT32_MAX - 1, UINT32_MAX};
+        for (const uint32_t key : keys) probes.insert(probes.end(), {key - 1, key, key + 1});
+        std::mt19937 rng(23);
+        for (int i = 0; i < 20000; i++) probes.push_back(rng());
+        for (const uint32_t probe : probes) {
+            const size_t above = static_cast<size_t>(std::upper_bound(keys.begin(), keys.end(), probe) - keys.begin());
+            wrong += sut.floor(probe) != (above == 0 ? keys.size() : above - 1);
+        }
+    }
+    CHECK_EQ(wrong, size_t(0));
+}
+
 TEST(patch_format_scratch_table_refuses_a_key_out_of_order_or_twice) {
     // The last case steps back past the first buffer, which went to the file.
     std::vector<uint32_t> many(3 * SCRATCH_TABLE_BUF / sizeof(RemapPair));
