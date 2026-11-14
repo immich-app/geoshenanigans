@@ -55,7 +55,10 @@ env:
   KEEP_CACHE_PBF_DAYS: 2
   # Free space a run needs in its work dir: ~400 GB at the peak (PBF 95,
   # today's index 113 + 41 compressed, yesterday's 113 + sidecars 11) plus
-  # patch verification's copies.
+  # what the patch step's three writers add there: each running diff's
+  # decoded record files and string pools, each verify's patched copy of its
+  # variant, and the compressor's .zst files beside them. generate_patches.sh
+  # starts a diff or a verify only in the free space the compressor leaves.
   MIN_WORK_DISK_GIB: 500
   # Memory the build leaves under the job's limit, which it otherwise sizes
   # its write phase to fill: the fetch of yesterday's index beside it (16
@@ -817,12 +820,22 @@ jobs:
           RESULTS_DIR="$WORKDIR/results"
           VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
 
+          # The compressor writes into the volume the diffs and verifies use
+          # for scratch: at most the bytes of the files it compresses (every
+          # .bin, the load sidecars, the search indexes). The patch jobs leave
+          # that much of the free space alone.
+          RESERVE_KIB=$(find "$WORKDIR/output" -type f \
+            \( -name '*.bin' -o -name strings_layout.json -o -name poi_meta.json -o -path '*/search/*' \) \
+            ! -name '*.zst' -printf '%s\n' | awk '{s += $1} END {printf "%d", (s + 1023) / 1024}')
+
           # Per variant: diff, apply to a scratch copy, verify the whole client
           # file set (JSON included, no extra files). Jobs are admitted by
-          # estimated diff memory, largest first; see the script header.
+          # estimated diff memory, largest first, and by the scratch they
+          # write; see the script header.
           # A script abort leaves variants without results; the collector
           # counts those as CRASH, so patches are dropped but data still uploads.
-          "$GITHUB_WORKSPACE/geocoder/builder/tools/generate_patches.sh" \
+          GEOCODER_PATCH_SCRATCH_RESERVE_KIB="$RESERVE_KIB" \
+            "$GITHUB_WORKSPACE/geocoder/builder/tools/generate_patches.sh" \
             "$WORKDIR/old-output" "$WORKDIR/output" "$RESULTS_DIR" "$WORKDIR/diff-logs" \
             || echo "::error::generate_patches.sh exited $?"
           echo "Patch generation + verification completed in $(($(date +%s) - START))s"

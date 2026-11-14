@@ -808,6 +808,95 @@ TEST(decode_logical_writes_the_poi_and_place_files_a_dir_holds_and_none_it_lacks
     CHECK(std::string(usage.begin(), usage.end()).find("geocoder-diff --decode-logical <dir> <out-dir>") != std::string::npos);
 }
 
+// geocoder-diff --logical-size DIR prints two numbers, from DIR's file sizes
+// and footers alone. The bytes a diff maps for DIR's record files: every .bin
+// but the string tiers at its size, the POI and place files at their logical
+// size. And the bytes it writes to scratch for DIR: those logical files and
+// the pool of each string tier as the diff finds it, in DIR, else ../full,
+// else ../../full, an empty pool as none. A DIR that is no dir, and the
+// option without its one path, are refused.
+TEST(logical_size_prints_the_mapped_and_the_scratch_bytes_of_a_dir) {
+    ScratchDir dir("logical-size");
+    const std::string log = dir.path() + "/tools.log", region = dir.path() + "/region";
+    // The tool's exit status 0, and its output.
+    auto sizes_of = [&](const std::vector<std::string>& paths) {
+        std::filesystem::remove(log);
+        std::vector<std::string> words = {GEOCODER_DIFF_BIN, "--logical-size"};
+        words.insert(words.end(), paths.begin(), paths.end());
+        const bool ok = run(words, log);
+        const std::vector<char> text = read_file(log);
+        return std::pair<bool, std::string>(ok, std::string(text.begin(), text.end()));
+    };
+    auto two = [](uint64_t mapped, uint64_t scratch) { return std::to_string(mapped) + " " + std::to_string(scratch) + "\n"; };
+    auto pool = [](const std::string& strings) { return std::vector<char>(strings.begin(), strings.end()); };
+
+    const BuildDir pois = poi_polygons(false);
+    const uint64_t poi_bytes = pois.at("poi_records.bin").size() + pois.at("poi_vertices.bin").size();
+    PlaceNode hidden = place(NAME_4);
+    hidden._pad1 = PLACE_FLAG_HIDDEN;
+    const std::vector<PlaceNode> nodes = {place(NAME_2), place(NAME_4), hidden, place(NAME_2)};
+    const uint64_t place_bytes = nodes.size() * place_files::LOGICAL_STRIDE;
+    const std::string street_pool("Elm\0Oak\0Pine\0", 13);
+
+    // full: two string tiers of its own, street files, a geo index, the POI
+    // and place files, and files that are no .bin.
+    BuildDir full = with_pool(OLD_POOL);
+    full["strings_street.bin"] = pool(street_pool);
+    full["street_ways.bin"] = bytes_of(std::vector<WayHeader>{{0, 2, 0, NAME_2}, {2, 1, 0, NAME_4}});
+    full["street_nodes.bin"] = nodes_of({1, 2, 3});
+    put_geo_cells(full, {{CELL, {0, 1}, {}, {}}});
+    full.insert(pois.begin(), pois.end());
+    put_places(full, nodes);
+    full["strings_layout.json"] = {'{', '}'};
+    full["street_ways.bin.osm_ids"] = std::vector<char>(64, 'i');
+    REQUIRE(write_dir(region + "/full", full));
+    const BuildDir written = gctest::as_written(full);
+    const uint64_t raw_bytes = written.at("street_ways.bin").size() + written.at("street_nodes.bin").size() +
+                               written.at("geo_cells.bin").size() + written.at("geo_entries.bin").size();
+    // The encoded files are not their logical size, so neither number is a
+    // sum of file sizes.
+    REQUIRE(written.at("poi_records.bin").size() + written.at("poi_vertices.bin").size() != poi_bytes);
+    REQUIRE(written.at("strings_street.bin").size() != street_pool.size());
+
+    auto r = sizes_of({region + "/full"});
+    CHECK(r.first);
+    CHECK_EQ(r.second, two(raw_bytes + poi_bytes + place_bytes, poi_bytes + place_bytes + OLD_POOL.size() + street_pool.size()));
+
+    // A dir beside full with one tier of its own, another of its own that
+    // is an empty pool, and no family: the tiers it lacks are ../full's.
+    const std::string own_pool("X\0Y\0", 4);
+    BuildDir beside;
+    beside["strings_core.bin"] = pool(own_pool);
+    beside["strings_street.bin"] = {};
+    beside["way_parents.bin"] = bytes_of(std::vector<uint32_t>{5, 6, 7, 8});
+    REQUIRE(write_dir(region + "/admin", beside));
+    r = sizes_of({region + "/admin"});
+    CHECK(r.first);
+    CHECK_EQ(r.second, two(16, own_pool.size() + street_pool.size()));
+
+    // A dir two levels below full's parent, with a family and no tier.
+    REQUIRE(write_dir(region + "/poi/major", pois));
+    r = sizes_of({region + "/poi/major"});
+    CHECK(r.first);
+    CHECK_EQ(r.second, two(poi_bytes, poi_bytes + OLD_POOL.size() + street_pool.size()));
+
+    // No full beside or above it: nothing is decoded for it.
+    REQUIRE(write_dir(dir.path() + "/alone/deep/lone", {{"way_parents.bin", bytes_of(std::vector<uint32_t>{5, 6})}}));
+    r = sizes_of({dir.path() + "/alone/deep/lone"});
+    CHECK(r.first);
+    CHECK_EQ(r.second, two(8, 0));
+
+    r = sizes_of({dir.path() + "/nowhere"});
+    CHECK(!r.first);
+    CHECK_EQ(r.second, "Not a dir: " + dir.path() + "/nowhere\n");
+
+    for (const std::vector<std::string>& paths : {std::vector<std::string>{}, {region + "/full", region + "/admin"}}) {
+        r = sizes_of(paths);
+        CHECK(!r.first);
+        CHECK(r.second.find("geocoder-diff --logical-size <dir>") != std::string::npos);
+    }
+}
+
 // An admin or POI cell index in dirs that hold none of its records (admin
 // polygons, POI records) still comes as a cell index delta, which the patcher
 // needs to rebuild it: a cell's list changes and a cell is added.

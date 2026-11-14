@@ -11,9 +11,14 @@
 //                      [--string-pairs-max N] [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N]
 //                      [--file-records-max N]
 //        geocoder-diff --decode-logical <dir> <out-dir>
+//        geocoder-diff --logical-size <dir>
 //
 // --decode-logical writes the logical files the merges read of the families
 // the builder writes encoded (logical_families), and no patch.
+//
+// --logical-size prints the bytes a diff maps for <dir>'s record files and
+// the bytes it writes to scratch for <dir> (logical_size), and reads no more
+// than sizes and footers: tools/generate_patches.sh budgets its diffs by them.
 //
 // GCPATCH v8: street / interp / addr records match across days by one stable
 // entity key per record, not by content; see build_identity_merge_seq and
@@ -534,14 +539,16 @@ static std::map<std::string, std::string>& logical_dirs() {
 }
 // A family of files the builder writes encoded and the merges diff in
 // logical form. files: its logical files, which the merges and the patch's
-// sections name. decode: dir's files of the family decoded into those files
-// in `to`; false, and nothing written: dir has none of them. logical_size:
-// the bytes decode writes for dir, from its files' footers and sizes alone;
-// 0 for a dir without the family. Both take the family's own row, so
-// families of one format share them.
+// sections name. written: the files the builder writes for it, which a dir
+// with the family holds. decode: dir's files of the family decoded into the
+// logical files in `to`; false, and nothing written: dir has none of them.
+// logical_size: the bytes decode writes for dir, from its files' footers and
+// sizes alone; 0 for a dir without the family. Both take the family's own
+// row, so families of one format share them.
 struct LogicalFamily {
     const char* name;
     std::vector<const char*> files;
+    std::vector<const char*> written;
     bool (*decode)(const LogicalFamily& family, const std::string& dir, const std::string& to);
     uint64_t (*logical_size)(const LogicalFamily& family, const std::string& dir);
 };
@@ -620,8 +627,12 @@ static uint64_t place_logical_size(const LogicalFamily&, const std::string& dir)
 }
 static const std::vector<LogicalFamily>& logical_families() {
     static const std::vector<LogicalFamily> f = {
-        {"poi", {"poi_records.bin", "poi_vertices.bin"}, decode_poi_files, poi_logical_size},
-        {"places", {place_files::NODES_FILE}, decode_place_files, place_logical_size},
+        {"poi", {"poi_records.bin", "poi_vertices.bin"}, {"poi_records.bin", "poi_vertices.bin"}, decode_poi_files, poi_logical_size},
+        {"places",
+         {place_files::NODES_FILE},
+         {place_files::CELLS_FILE, place_files::NODES_FILE, place_files::HIDDEN_FILE},
+         decode_place_files,
+         place_logical_size},
     };
     return f;
 }
@@ -685,6 +696,58 @@ static int decode_logical(const std::string& dir, const std::string& out) {
                                      " bytes, its files give " + std::to_string(expected));
         std::cerr << "  " << families[f].name << ": " << written << " logical bytes" << std::endl;
     }
+    return 0;
+}
+
+// The bytes of the pool map_string_pool decodes from the tier file at path,
+// from its footer alone; 0 without the file.
+static uint64_t string_pool_size(const std::string& path) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return 0;
+    MappedFile f = mmap_file(path);
+    if (static_cast<uint64_t>(st.st_size) != f.size) throw std::runtime_error("Cannot read " + path);
+    const uint64_t pool = string_files::read_footer(reinterpret_cast<const uint8_t*>(f.data), f.size, path).raw_size;
+    unmap_file(f);
+    return pool;
+}
+// geocoder-diff --logical-size: two numbers on stdout, from dir's file sizes
+// and footers alone, by which a caller that runs diffs side by side budgets
+// them. The bytes a diff maps for dir's record files: every .bin of dir but
+// its string tiers at its size, the written files of a logical family at the
+// family's logical size instead. And the bytes a diff writes to scratch for
+// dir, which stay on the volume while it runs: the logical files of its
+// families and the pool of each string tier where the diff of a dir that
+// ships none finds one (try_load_tier: dir, ../full, ../../full, an empty
+// pool as none).
+static int logical_size(const std::string& dir) {
+    if (!std::filesystem::is_directory(dir)) throw std::runtime_error("Not a dir: " + dir);
+    uint64_t mapped = 0, scratch = 0;
+    for (const LogicalFamily& f : logical_families()) {
+        const uint64_t logical = f.logical_size(f, dir);
+        mapped += logical;
+        scratch += logical;
+    }
+    auto is_written_file = [](const std::string& name) {
+        for (const LogicalFamily& f : logical_families())
+            for (const char* file : f.written)
+                if (name == file) return true;
+        return false;
+    };
+    for (const auto& e : std::filesystem::directory_iterator(dir)) {
+        const std::string name = e.path().filename().string();
+        if (!has_suffix(name, ".bin") || !e.is_regular_file() || is_written_file(name)) continue;
+        if (std::find(std::begin(STRING_TIER_FILES), std::end(STRING_TIER_FILES), name) != std::end(STRING_TIER_FILES)) continue;
+        mapped += e.file_size();
+    }
+    for (const char* tier : STRING_TIER_FILES) {
+        for (const char* in : {"/", "/../full/", "/../../full/"}) {
+            const uint64_t pool = string_pool_size(dir + in + tier);
+            if (pool == 0) continue;
+            scratch += pool;
+            break;
+        }
+    }
+    std::cout << mapped << " " << scratch << std::endl;
     return 0;
 }
 
@@ -1018,13 +1081,21 @@ static int run(int argc, char* argv[]) {
     const char* usage =
         "Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity-slots | --identity OLD_META NEW_META]"
         " [--string-pairs-max N] [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N] [--file-records-max N]\n"
-        "       geocoder-diff --decode-logical <dir> <out-dir>";
+        "       geocoder-diff --decode-logical <dir> <out-dir>\n"
+        "       geocoder-diff --logical-size <dir>";
     if (argc >= 2 && std::string(argv[1]) == "--decode-logical") {
         if (argc != 4) {
             std::cerr << usage << std::endl;
             return 1;
         }
         return decode_logical(argv[2], argv[3]);
+    }
+    if (argc >= 2 && std::string(argv[1]) == "--logical-size") {
+        if (argc != 3) {
+            std::cerr << usage << std::endl;
+            return 1;
+        }
+        return logical_size(argv[2]);
     }
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << usage << std::endl;
