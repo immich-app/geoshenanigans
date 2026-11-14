@@ -36,7 +36,6 @@
 #include "strategy2_remap.h"
 #include "string_files.h"
 #include "string_subset.h"
-#include "vertex_pack.h"
 #include "write_schedule.h"
 
 #include <s2/s2latlng.h>
@@ -667,69 +666,13 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             }));
         }
         if (write_addresses) {
-            // Pack addr_point polygon footprints with the same encoding
-            // scheme used for admin/POI vertices.  Most addr_points are
-            // single-coord (vertex_count == 0) and contribute nothing
-            // to the byte stream; the ~5% with building footprints get
-            // a 10-byte header + delta-encoded vertices.  Cuts the
-            // 5 GB planet addr_vertices.bin to ~2.5 GB.
+            // addr_points.bin, addr_vertices.bin and addr_index.bin
+            // (addr_files.h): the three footers in a region without
+            // addresses.
             write_futures.push_back(std::async(std::launch::async, [&] {
                 auto _at = std::chrono::steady_clock::now();
                 auto _ac = CpuTicks::now();
-                // Point address, polygon footprint missing, or out-of-range
-                // index (defends against caller passing addr_points without
-                // matching addr_vertices) all pack as points.
-                auto footprint = [&](const AddrPoint& ap) -> const NodeCoord* {
-                    if (ap.vertex_count == 0 || ap.vertex_offset == NO_DATA
-                        || (size_t)ap.vertex_offset + ap.vertex_count > data.addr_vertices.size())
-                        return nullptr;
-                    return &data.addr_vertices[ap.vertex_offset];
-                };
-                // Packed and written a slice at a time: the packed copies
-                // run to 8.7 GB on planet.
-                constexpr size_t kPointsPerSlice = size_t(1) << 16;
-                struct Slice {
-                    std::vector<AddrPoint> points;
-                    std::vector<uint8_t> bytes;
-                };
-                const std::string points_path = output_dir + "/addr_points.bin";
-                const std::string bytes_path = output_dir + "/addr_vertices.bin";
-                std::ofstream points_file(points_path, std::ios::binary);
-                std::ofstream bytes_file(bytes_path, std::ios::binary);
-                parallel_prefix_stream(data.addr_points.size(), kPointsPerSlice,
-                    [&](size_t i) -> size_t {
-                        const AddrPoint& ap = data.addr_points[i];
-                        const NodeCoord* verts = footprint(ap);
-                        return verts ? plan_polygon(verts, ap.vertex_count).bytes : 0;
-                    },
-                    [&](size_t begin, size_t end, size_t offset, size_t bytes) {
-                        Slice out;
-                        out.points.resize(end - begin);
-                        out.bytes.resize(bytes);
-                        size_t at = 0;
-                        for (size_t i = begin; i < end; i++) {
-                            AddrPoint ap = data.addr_points[i];
-                            if (const NodeCoord* verts = footprint(ap)) {
-                                ap.vertex_offset = static_cast<uint32_t>(offset + at);
-                                at += pack_polygon_at(out.bytes.data() + at, verts, ap.vertex_count);
-                            } else {
-                                ap.vertex_offset = NO_DATA;
-                                ap.vertex_count = 0;
-                            }
-                            out.points[i - begin] = ap;
-                        }
-                        return out;
-                    },
-                    [&](Slice&& slice) {
-                        points_file.write(reinterpret_cast<const char*>(slice.points.data()),
-                                          static_cast<std::streamsize>(slice.points.size() * sizeof(AddrPoint)));
-                        bytes_file.write(reinterpret_cast<const char*>(slice.bytes.data()),
-                                         static_cast<std::streamsize>(slice.bytes.size()));
-                    }, 0, parallel_threads());
-                points_file.flush();
-                if (!points_file) throw std::runtime_error("failed to write " + points_path);
-                bytes_file.flush();
-                if (!bytes_file) throw std::runtime_error("failed to write " + bytes_path);
+                write_addr_files(output_dir, data.addr_points, data.addr_vertices);
                 emit_strategy2_sidecar(output_dir + "/addr_points.osm_ids",
                                         data.addr_sidecar_blob, data.addr_osm_ids);
                 log_phase((label + "addr points").c_str(), _at, _ac);

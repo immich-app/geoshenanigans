@@ -1,11 +1,13 @@
-// The record files' writers (record_files_io.h): a side file and a pair of
-// way files are the bytes their serial encoders give, however many threads
-// encode them and wherever their slices are cut; the threads encode no more
-// than the slice window ahead of the write; and a side array that is not a
-// value a record, nodes that are not the ways' and a pair the way files
-// can't hold are refused.
+// The record files' writers (record_files_io.h): a side file, a pair of way
+// files and the three address files are the bytes their serial encoders
+// give, however many threads encode them and wherever their slices are cut;
+// the threads encode no more than the slice window ahead of the write; and a
+// side array that is not a value a record, nodes that are not the ways', a
+// pair the way files can't hold and footprints whose logical blobs are more
+// bytes than a patch indexes are refused.
 #include "record_files_io.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -19,11 +21,13 @@
 #include <type_traits>
 #include <vector>
 
+#include "addr_files.h"
 #include "coord_keys.h"
 #include "scratch_dir.h"
 #include "side_blocks.h"
 #include "test_framework.h"
 #include "types.h"
+#include "vertex_pack.h"
 #include "way_files.h"
 
 using gctest::refusal_of;
@@ -229,6 +233,190 @@ WayFiles no_ways() {
     return f;
 }
 
+// The builder's addresses: each one's record, a building's vertex_offset the
+// place of its footprint's first vertex in `vertices` and its vertex_count
+// how many follow it there.
+struct Addresses {
+    std::vector<AddrPoint> points;
+    std::vector<NodeCoord> vertices;
+};
+
+// addr_points.bin, addr_vertices.bin and addr_index.bin.
+struct AddrFiles {
+    std::vector<uint8_t> points, vertices, index;
+    bool operator==(const AddrFiles& o) const { return points == o.points && vertices == o.vertices && index == o.index; }
+};
+
+// The logical pair of the three files: an AddrPoint a record, and the
+// footprints' logical blobs back to back.
+struct LogicalAddresses {
+    std::vector<uint8_t> points, vertices;
+    bool operator==(const LogicalAddresses& o) const { return points == o.points && vertices == o.vertices; }
+};
+
+// A dead slot's record.
+const AddrPoint TOMBSTONE = addr_point_tombstone();
+
+// Whether the vertices hold the record's footprint.
+bool has_footprint(const Addresses& a, const AddrPoint& p) {
+    return p.vertex_count != 0 && p.vertex_offset != NO_DATA && size_t(p.vertex_offset) + p.vertex_count <= a.vertices.size();
+}
+
+// The logical pair the builder's addresses are: each footprint packed
+// (vertex_pack.h), its record's vertex_offset the bytes of the ones before
+// it; a record whose footprint the vertices do not hold a point.
+LogicalAddresses logical(const Addresses& a) {
+    LogicalAddresses out;
+    for (AddrPoint p : a.points) {
+        if (has_footprint(a, p)) {
+            const NodeCoord* ring = &a.vertices[p.vertex_offset];
+            const size_t at = out.vertices.size();
+            p.vertex_offset = uint32_t(at);
+            out.vertices.resize(at + plan_polygon(ring, p.vertex_count).bytes);
+            pack_polygon_at(out.vertices.data() + at, ring, p.vertex_count);
+        } else {
+            p.vertex_offset = NO_DATA;
+            p.vertex_count = 0;
+        }
+        const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&p);
+        out.points.insert(out.points.end(), bytes, bytes + sizeof(AddrPoint));
+    }
+    return out;
+}
+
+// The addresses' files through the serial encoder of their logical pair.
+AddrFiles serial(const Addresses& a) {
+    const LogicalAddresses l = logical(a);
+    addr_files::Files f = addr_files::encode(l.points.data(), a.points.size(), l.vertices.data(), l.vertices.size());
+    return {std::move(f.points), std::move(f.vertices), std::move(f.index)};
+}
+
+// What the address writer puts for the addresses.
+AddrFiles written(const Addresses& a, unsigned threads, size_t slice_superblocks) {
+    AddrFiles f;
+    write_addr_pair(a.points, a.vertices, into(f.points), into(f.vertices), into(f.index), threads, slice_superblocks);
+    return f;
+}
+
+// The address files as write_addr_files leaves them in a dir.
+AddrFiles addr_files_of(const std::string& dir) {
+    return {file_bytes(dir + "/addr_points.bin"), file_bytes(dir + "/addr_vertices.bin"), file_bytes(dir + "/addr_index.bin")};
+}
+
+// The logical pair the three files decode to.
+LogicalAddresses decoded(const AddrFiles& f) {
+    addr_files::Logical l = addr_files::decode(f.points.data(), f.points.size(), f.vertices.data(), f.vertices.size(),
+                                               f.index.data(), f.index.size());
+    return {std::move(l.points), std::move(l.vertices)};
+}
+
+// The three footers of files without a record.
+AddrFiles no_addresses() {
+    return {{0, 0, 0, 0, 'A', 'D', 'B', '1'},
+            {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'A', 'D', 'F', '1'},
+            {0, 0, 0, 0, 'A', 'D', 'X', '1'}};
+}
+
+// A footprint's ring of `count` vertices around a point, `span` degrees
+// across, appended to the vertices; closed, the last vertex is the first.
+// Where it starts.
+uint32_t add_ring(Addresses& a, std::mt19937_64& rng, double lat, double lng, size_t count, double span, bool closed) {
+    const uint32_t at = uint32_t(a.vertices.size());
+    for (size_t k = 0; k < count; k++) {
+        const double north = double(rng() % 100001) / 100000.0;
+        const double east = double(rng() % 100001) / 100000.0;
+        a.vertices.push_back({float(lat + (north - 0.5) * span), float(lng + (east - 0.5) * span)});
+    }
+    if (closed && count >= 2) a.vertices.back() = a.vertices[at];
+    return at;
+}
+
+// n addresses in towns of some forty, a town's streets in runs of a few
+// records under one parent way or under parents of their own: nodes, dead
+// slots, buildings of a closed ring some thirty metres across, footprints
+// left open and of one vertex, footprints wide enough for each coarser
+// encoding (the widest an escape), and records whose footprint the vertices
+// do not hold; every seventh town at coordinates of any bits, which take the
+// order key.
+Addresses random_addresses(std::mt19937_64& rng, size_t n) {
+    Addresses a;
+    double lat = 0, lng = 0;
+    uint32_t street = 0, parent = 0, housenumber = 0;
+    bool any_bits = false, own_parents = false;
+    // One draw a statement: the same addresses whatever order a compiler evaluates operands in.
+    for (size_t i = 0; i < n; i++) {
+        if (i % 40 == 0) {
+            lat = double(int64_t(rng() % 1600000001) - 800000000) / 1e7;
+            lng = double(int64_t(rng() % 3400000001) - 1700000000) / 1e7;
+            housenumber = uint32_t(rng() % 5000000);
+            any_bits = rng() % 7 == 0;
+            own_parents = rng() % 2 == 0;
+        }
+        if (i % 40 == 0 || rng() % 5 == 0) {
+            street = uint32_t(rng() % 3000000);
+            parent = uint32_t(rng() % 90000000);
+        }
+        if (own_parents) parent += uint32_t(rng() % 3);
+        const uint64_t pick = rng() % 16;
+        if (pick == 0) {
+            a.points.push_back(addr_point_tombstone());
+            continue;
+        }
+        AddrPoint p{};
+        const double north = double(int64_t(rng() % 20001) - 10000) / 1e7;
+        const double east = double(int64_t(rng() % 20001) - 10000) / 1e7;
+        p.lat = float(lat + north);
+        p.lng = float(lng + east);
+        if (any_bits) {
+            p.lat = of_bits(uint32_t(rng()));
+            p.lng = of_bits(uint32_t(rng()));
+        }
+        p.housenumber_id = housenumber + uint32_t(rng() % 300);
+        p.street_id = street;
+        p.parent_way_id = rng() % 50 == 0 ? NO_DATA : parent;
+        p.vertex_offset = NO_DATA;
+        if (pick >= 8 && pick <= 12) {
+            p.vertex_count = 4 + uint32_t(rng() % 8);
+            p.vertex_offset = add_ring(a, rng, lat + north, lng + east, p.vertex_count, 3e-4, true);
+        } else if (pick == 13) {
+            p.vertex_count = 1 + uint32_t(rng() % 5);
+            p.vertex_offset = add_ring(a, rng, lat + north, lng + east, p.vertex_count, 3e-4, false);
+        } else if (pick == 14) {
+            const double spans[] = {0.4, 4.0, 9.0};
+            const double span = spans[rng() % 3];
+            p.vertex_count = 3 + uint32_t(rng() % 6);
+            p.vertex_offset = add_ring(a, rng, lat + north, lng + east, p.vertex_count, span, rng() % 2 == 0);
+        } else if (pick == 15) {
+            // A count without a place, or a place past the vertices' end.
+            p.vertex_count = 5;
+            if (rng() % 2 == 0) p.vertex_offset = 0xFFFFFF00u;
+        }
+        a.points.push_back(p);
+    }
+    return a;
+}
+
+// The footprints' vertices, which note how many slices ahead of those
+// written a slice is as its first vertex is read to be encoded: the read
+// after the one that sizes the slice's logical blobs.
+struct WatchedVertices {
+    const std::vector<NodeCoord>& vertices;
+    size_t slice_vertices;
+    const std::atomic<size_t>& written;
+    std::atomic<size_t>& furthest;
+    std::vector<std::atomic<bool>>& sized;
+    std::atomic<size_t>& noted;
+
+    size_t size() const { return vertices.size(); }
+    const NodeCoord& operator[](size_t i) const {
+        if (i % slice_vertices == 0 && sized[i / slice_vertices].exchange(true)) {
+            note_ahead(i / slice_vertices, written, furthest);
+            noted++;
+        }
+        return vertices[i];
+    }
+};
+
 template <class Record>
 void check_the_way_writer_puts_the_serial_encoders_files(uint64_t seed) {
     std::mt19937_64 rng(seed);
@@ -280,7 +468,7 @@ TEST(the_side_writer_puts_the_serial_encoders_bytes_at_any_thread_count_and_slic
             for (size_t slice_blocks : {size_t(1), size_t(3), kSideSliceBlocks})
                 CHECK(written(values, threads, slice_blocks) == want);
     }
-    CHECK(written({}, 2, 1) == (std::vector<uint8_t>{0, 0, 0, 0, 'S', 'D', 'B', '1'}));
+    CHECK(written(std::vector<uint32_t>{}, 2, 1) == (std::vector<uint8_t>{0, 0, 0, 0, 'S', 'D', 'B', '1'}));
 }
 
 TEST(a_side_file_is_the_serial_encoders_bytes) {
@@ -387,6 +575,122 @@ TEST(way_files_refused_or_not_written_name_their_dir) {
              dir.path() + ": Malformed way files: interp_ways.bin way 20 has its padding set");
 }
 
+TEST(the_address_writer_puts_the_serial_encoders_files_at_any_thread_count_and_slice_size) {
+    std::mt19937_64 rng(61);
+    // Around a block's edge and a superblock's, and past a slice of the
+    // builder's size.
+    size_t footprints = 0, unheld = 0, dead = 0;
+    for (size_t n : {size_t(0), size_t(1), size_t(15), size_t(16), size_t(17), size_t(1023), size_t(1024), size_t(1025),
+                     size_t(3000), size_t(70001)}) {
+        const Addresses a = random_addresses(rng, n);
+        const AddrFiles want = serial(a);
+        for (unsigned threads : {1u, 2u, 7u})
+            for (size_t slice_superblocks : {size_t(1), size_t(3), kAddrSliceSuperblocks})
+                CHECK(written(a, threads, slice_superblocks) == want);
+        for (const AddrPoint& p : a.points) {
+            footprints += has_footprint(a, p);
+            unheld += !has_footprint(a, p) && p.vertex_count != 0;
+            dead += std::memcmp(&p, &TOMBSTONE, sizeof p) == 0;
+        }
+    }
+    // The addresses are of every kind.
+    CHECK(footprints > 20000 && unheld > 3000 && dead > 3000);
+    CHECK_EQ(kAddrSliceSuperblocks * addr_files::SUPERBLOCK_RECORDS, size_t(65536));
+    CHECK(written(Addresses{}, 2, 1) == no_addresses());
+}
+
+TEST(address_files_are_the_serial_encoders_files_and_three_footers_without_addresses) {
+    const ScratchDir dir("addr-files");
+    std::mt19937_64 rng(67);
+    // Past a slice, with a footprint of more vertices than a blob holds.
+    Addresses a = random_addresses(rng, 150000);
+    AddrPoint& large = a.points[90000];
+    large.vertex_count = 70000;
+    large.vertex_offset = add_ring(a, rng, 47.0, 8.0, large.vertex_count, 0.01, true);
+    write_addr_files(dir.path(), a.points, a.vertices);
+    const AddrFiles f = addr_files_of(dir.path());
+    CHECK(f == serial(a));
+    // The files decode to the addresses' logical pair.
+    const LogicalAddresses l = logical(a);
+    CHECK(decoded(f) == l);
+    // The large footprint's blob is an escape: its head, then its logical blob.
+    AddrPoint escaped;
+    std::memcpy(&escaped, l.points.data() + 90000 * sizeof(AddrPoint), sizeof escaped);
+    REQUIRE(escaped.vertex_count == 70000 && size_t(escaped.vertex_offset) + 280010 <= l.vertices.size());
+    std::vector<uint8_t> blob(addr_files::ESCAPE_HEAD_MAX);
+    blob.resize(addr_files::escape_head(70000, blob.data()));
+    blob.insert(blob.end(), l.vertices.begin() + escaped.vertex_offset, l.vertices.begin() + escaped.vertex_offset + 280010);
+    CHECK(std::search(f.vertices.begin(), f.vertices.end(), blob.begin(), blob.end()) != f.vertices.end());
+
+    // No addresses: the three footers, in place of the files before.
+    write_addr_files(dir.path(), std::vector<AddrPoint>{}, std::vector<NodeCoord>{});
+    CHECK(addr_files_of(dir.path()) == no_addresses());
+}
+
+TEST(a_record_whose_footprint_the_vertices_do_not_hold_is_written_as_a_point) {
+    Addresses a;
+    std::mt19937_64 rng(71);
+    add_ring(a, rng, 47.0, 8.0, 5, 3e-4, true);
+    auto record = [](uint32_t housenumber, uint32_t vertex_offset, uint32_t vertex_count) {
+        return AddrPoint{47.0f, 8.0f, housenumber, 7, 9, vertex_offset, vertex_count};
+    };
+    // Two buildings of the one ring; between them a count without a place, a
+    // ring that ends a vertex past the vertices, and a place without a count.
+    a.points = {record(1, 0, 5), record(2, NO_DATA, 5), record(3, 1, 5), record(4, 0, 0), record(5, 0, 5)};
+    const AddrFiles f = written(a, 2, 1);
+    CHECK(f == serial(a));
+    const LogicalAddresses l = decoded(f);
+    CHECK(l == logical(a));
+    REQUIRE(l.points.size() == 5 * sizeof(AddrPoint) && l.vertices.size() == 2 * 30);
+    AddrPoint got[5];
+    std::memcpy(got, l.points.data(), sizeof got);
+    for (uint32_t i = 0; i < 5; i++) {
+        const bool building = i == 0 || i == 4;
+        CHECK(got[i].housenumber_id == i + 1 && got[i].street_id == 7 && got[i].parent_way_id == 9);
+        CHECK_EQ(got[i].vertex_count, building ? 5u : 0u);
+        CHECK_EQ(got[i].vertex_offset, i == 0 ? 0u : i == 4 ? 30u : NO_DATA);
+    }
+    // Each building's footprint is the ring, packed.
+    std::vector<uint8_t> ring(30);
+    REQUIRE(pack_polygon_at(ring.data(), a.vertices.data(), 5) == 30);
+    CHECK(std::equal(ring.begin(), ring.end(), l.vertices.begin()) && std::equal(ring.begin(), ring.end(), l.vertices.begin() + 30));
+}
+
+TEST(the_address_writer_refuses_footprints_of_more_logical_bytes_than_a_patch_indexes_before_it_writes) {
+    // 536 footprints of one array's vertices, wide enough to take 8 bytes a
+    // vertex: 535 of 1,000,000 vertices and one of 1,870,242 are 2^32 bytes
+    // of logical blobs, which no vertex_offset counts. Three nodes after
+    // each put them in three slices of a superblock, the last of which holds
+    // the footprint that passes the limit: none of them is put.
+    Addresses a;
+    a.vertices.resize(1870242);
+    for (size_t i = 0; i < a.vertices.size(); i++) a.vertices[i] = {float(i % 1000) * 0.01f, float(i / 1000 % 1000) * 0.01f};
+    for (uint32_t i = 0; i < 536; i++) {
+        a.points.push_back({1.0f, 2.0f, i, 0, 0, 0, i == 535 ? 1870242u : 1000000u});
+        for (int node = 0; node < 3; node++) a.points.push_back({1.0f, 2.0f, i, 0, 0, NO_DATA, 0});
+    }
+    REQUIRE(plan_polygon(a.vertices.data(), 1000000).bytes == 8000010);
+    REQUIRE(a.points.size() > 2 * addr_files::SUPERBLOCK_RECORDS);
+    const std::string refused =
+        "Malformed address files: a logical addr_vertices.bin of 4294967296 bytes is more than the 4294967294 a patch can index";
+    size_t puts = 0;
+    auto count = [&puts](const uint8_t*, size_t) { puts++; };
+    CHECK_EQ(refusal_of([&] { write_addr_pair(a.points, a.vertices, count, count, count, 4, 1); }), refused);
+    CHECK_EQ(puts, size_t(0));
+
+    // Under the dir's name, its files left without a byte.
+    const ScratchDir dir("addr-files-refused");
+    CHECK_EQ(refusal_of([&] { write_addr_files(dir.path(), a.points, a.vertices); }), dir.path() + ": " + refused);
+    const AddrFiles f = addr_files_of(dir.path());
+    CHECK(f.points.empty() && f.vertices.empty() && f.index.empty());
+
+    // A dir that is not there is an error, whatever the addresses.
+    CHECK_EQ(refusal_of([&] { write_addr_files(dir.path() + "/none", a.points, a.vertices); }),
+             "failed to write " + dir.path() + "/none/addr_points.bin");
+    CHECK_EQ(refusal_of([&] { write_addr_files(dir.path() + "/none", std::vector<AddrPoint>{}, std::vector<NodeCoord>{}); }),
+             "failed to write " + dir.path() + "/none/addr_points.bin");
+}
+
 TEST(a_slice_writer_runs_no_more_than_its_window_ahead_of_the_consumer) {
     // Two slices a thread, and no more than kSliceWindow however many threads.
     CHECK_EQ(slice_window(1), size_t(2));
@@ -429,6 +733,32 @@ TEST(a_slice_writer_runs_no_more_than_its_window_ahead_of_the_consumer) {
         // Each slice's rows and blocks, then each file's footer.
         CHECK_EQ(slices_written.load(), slices + 1);
         CHECK_EQ(block_puts, slices + 1);
+        CHECK(furthest.load() < slice_window(threads));
+    }
+
+    // The address writer the same: 600 slices of a superblock of buildings
+    // of two vertices.
+    const size_t slice_records = addr_files::SUPERBLOCK_RECORDS, building_vertices = 2;
+    Addresses a;
+    for (size_t i = 0; i < slices * slice_records; i++) {
+        a.points.push_back({47.0f, 8.0f, uint32_t(i), 0, 0, uint32_t(a.vertices.size()), uint32_t(building_vertices)});
+        for (size_t j = 0; j < building_vertices; j++) a.vertices.push_back({47.0f + float(j) * 1e-4f, 8.0f + float(i % 100) * 1e-5f});
+    }
+    for (unsigned threads : {3u, 64u}) {
+        std::atomic<size_t> slices_written{0}, furthest{0}, noted{0};
+        std::vector<std::atomic<bool>> sized(slices);
+        size_t blob_puts = 0, index_puts = 0;
+        const WatchedVertices watched{a.vertices, slice_records * building_vertices, slices_written, furthest, sized, noted};
+        write_addr_pair(a.points, watched, [&](const uint8_t*, size_t) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            slices_written++;
+        }, [&](const uint8_t*, size_t) { blob_puts++; }, [&](const uint8_t*, size_t) { index_puts++; }, threads, 1);
+        // Each slice's blocks, blobs and index rows, then each file's footer.
+        CHECK_EQ(slices_written.load(), slices + 1);
+        CHECK_EQ(blob_puts, slices + 1);
+        CHECK_EQ(index_puts, slices + 1);
+        // Every slice was seen as it was encoded.
+        CHECK_EQ(noted.load(), slices);
         CHECK(furthest.load() < slice_window(threads));
     }
 }

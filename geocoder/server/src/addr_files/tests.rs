@@ -1,7 +1,7 @@
 use super::*;
 use crate::coord_keys::hybrid_key;
 use crate::test_rng::Rng;
-use crate::NO_DATA;
+use crate::{vertex_scale, NO_DATA};
 
 const SUPERBLOCK_RECORDS: usize = SUPERBLOCK_BLOCKS * BLOCK_RECORDS;
 /// The kinds of records `random_records` draws.
@@ -90,11 +90,115 @@ fn fields(r: &AddrRecord) -> Fields {
     (r.lat.to_bits(), r.lng.to_bits(), r.housenumber_id, r.street_id, r.parent_way_id, r.blob_at, r.blob_len)
 }
 
+/// A logical blob's header, as a polygon's in a stream of logical blobs:
+///   byte 0     : vertex encoding tag (VertexEncoding in builder/src/types.h)
+///   byte 1     : padding
+///   bytes 2..6 : bbox_min_lat (f32)
+///   bytes 6..10: bbox_min_lng (f32)
+/// Vertices follow at byte 10, packed at the encoding's stride.
+const POLY_HEADER_BYTES: u64 = 10;
+
+#[inline]
+fn vertex_stride(enc: u8) -> usize {
+    match enc {
+        0 | 1 | 2 => 4, // u16 dlat + u16 dlng
+        3 | 4     => 8, // u32 dlat + u32 dlng OR f32 + f32
+        _ => 8,
+    }
+}
+
+/// A polygon's encoded vertices as `decode_polygon_verts` reads them: the inline 10-byte header
+/// (encoding tag, bbox minimum) at `vertex_offset` and where its `vertex_count` vertices start.
+struct EncodedPolygon {
+    encoding: u8,
+    bmin_lat: f32,
+    bmin_lng: f32,
+    verts_off: u64,
+}
+
+/// The polygon at `vertex_offset`, or None where it has none: no vertices, or the header or
+/// vertices past the end of `src`.
+fn encoded_polygon(src: &FileBytes, vertex_offset: u32, vertex_count: u32) -> Option<EncodedPolygon> {
+    if vertex_count == 0 || vertex_offset == NO_DATA { return None; }
+    let off = vertex_offset as u64;
+    if off + POLY_HEADER_BYTES > src.len() { return None; }
+    let header = src.read_chunk(off, POLY_HEADER_BYTES as usize);
+    let encoding = header[0];
+    let bmin_lat = f32::from_le_bytes(header[2..6].try_into().unwrap());
+    let bmin_lng = f32::from_le_bytes(header[6..10].try_into().unwrap());
+    let verts_off = off + POLY_HEADER_BYTES;
+    if verts_off + vertex_count as u64 * vertex_stride(encoding) as u64 > src.len() { return None; }
+    Some(EncodedPolygon { encoding, bmin_lat, bmin_lng, verts_off })
+}
+
+/// Decode a polygon's quantized vertices into NodeCoord values.
+/// Reads the inline 10-byte polygon header (encoding tag + bbox_min)
+/// at vertex_offset, then `vertex_count` vertices that follow. The
+/// decoder of logical blobs: a footprint's vertices are the ones it
+/// gives for the footprint's logical blob (`logical_vertices`).
+fn decode_polygon_verts<'a>(
+    src: &'a FileBytes,
+    vertex_offset: u32,
+    vertex_count: u32,
+) -> Option<std::borrow::Cow<'a, [NodeCoord]>> {
+    let EncodedPolygon { encoding, bmin_lat: bbox_min_lat, bmin_lng: bbox_min_lng, verts_off } =
+        encoded_polygon(src, vertex_offset, vertex_count)?;
+    let total_bytes = (vertex_count as u64) * vertex_stride(encoding) as u64;
+    let bytes = src.read_chunk(verts_off, total_bytes as usize);
+
+    if encoding == 4 {
+        // Legacy raw F32 lat/lng (8 bytes/vertex). Vertices start at
+        // POLY_HEADER_BYTES (byte 10), which is only 2-aligned, so a direct
+        // `bytes.as_ptr() as *const NodeCoord` cast is undefined behaviour
+        // (NodeCoord needs 4-byte alignment). Decode each field with an
+        // unaligned little-endian read instead: this yields bit-identical
+        // f32 values to the cast on little-endian targets without the
+        // alignment hazard.
+        let count = vertex_count as usize;
+        let mut out = Vec::<NodeCoord>::with_capacity(count);
+        for i in 0..count {
+            let lat = f32::from_le_bytes(bytes[i*8..i*8+4].try_into().unwrap());
+            let lng = f32::from_le_bytes(bytes[i*8+4..i*8+8].try_into().unwrap());
+            out.push(NodeCoord { lat, lng });
+        }
+        Some(std::borrow::Cow::Owned(out))
+    } else {
+        // Delta-encoded.  Decode each vertex into a fresh NodeCoord.
+        let scale = vertex_scale(encoding);
+        let bmin_lat = bbox_min_lat as f64;
+        let bmin_lng = bbox_min_lng as f64;
+        let count = vertex_count as usize;
+        let mut out = Vec::<NodeCoord>::with_capacity(count);
+        if encoding == 3 {
+            // u32 deltas (8 bytes/vertex)
+            for i in 0..count {
+                let dlat = u32::from_le_bytes(bytes[i*8..i*8+4].try_into().unwrap()) as f64;
+                let dlng = u32::from_le_bytes(bytes[i*8+4..i*8+8].try_into().unwrap()) as f64;
+                out.push(NodeCoord {
+                    lat: (bmin_lat + dlat * scale) as f32,
+                    lng: (bmin_lng + dlng * scale) as f32,
+                });
+            }
+        } else {
+            // u16 deltas (4 bytes/vertex) — encodings 0, 1, 2
+            for i in 0..count {
+                let dlat = u16::from_le_bytes(bytes[i*4..i*4+2].try_into().unwrap()) as f64;
+                let dlng = u16::from_le_bytes(bytes[i*4+2..i*4+4].try_into().unwrap()) as f64;
+                out.push(NodeCoord {
+                    lat: (bmin_lat + dlat * scale) as f32,
+                    lng: (bmin_lng + dlng * scale) as f32,
+                });
+            }
+        }
+        Some(std::borrow::Cow::Owned(out))
+    }
+}
+
 /// The vertices of a logical blob, as the decoder of logical blobs gives them: each the bbox
 /// minimum plus its steps.
 fn logical_vertices(logical: &[u8]) -> Vec<(u32, u32)> {
     let src = FileBytes::Owned(logical.to_vec());
-    bits(&crate::decode_polygon_verts(&src, 0, count_of(logical)).expect("a polygon"))
+    bits(&decode_polygon_verts(&src, 0, count_of(logical)).expect("a polygon"))
 }
 
 /// Record `id` as the reader gives it against its logical record: its fields, its vertex count,
@@ -1039,6 +1143,31 @@ fn a_footprints_vertices_are_its_logical_blobs_in_every_encoding() {
     // The longest blob is the most vertices at the widths their steps take.
     assert_eq!(f.record(records.len() as u32 - 3).map(|r| f.vertex_count(&r)), Some(65_535));
     assert_eq!(f.record(records.len() as u32 - 1).map(|r| (f.vertex_count(&r), r.blob_len)), Some((65_536, 4 + 10 + 4 * 65_536)));
+}
+
+#[test]
+fn a_footprints_vertex_is_its_bbox_minimum_plus_its_steps_on_its_encodings_grid() {
+    // One vertex, its steps north and east of the bbox minimum, in each encoding; encoding 3's
+    // blob is an escape.
+    let cases: [(u8, f64, (f32, f32), (u32, u32)); 5] = [
+        (0, 1e-5, (50.0, 5.0), (10, 20)),
+        (1, 1e-4, (50.0, 5.0), (10, 20)),
+        (2, 1e-6, (50.0, 5.0), (10, 20)),
+        (3, 1e-7, (50.0, 5.0), (10, 20)),
+        (3, 1e-7, (-10.0, 100.0), (1_000_000, 2_000_000)),
+    ];
+    for (enc, scale, (bmin_lat, bmin_lng), (north, east)) in cases {
+        let footprint = logical_blob(enc, bmin_lat.to_bits(), bmin_lng.to_bits(), &[(north, east)]);
+        let record = Logical { lat: bmin_lat.to_bits(), lng: bmin_lng.to_bits(), housenumber: 1, street: 2, parent: 3, footprint };
+        let f = files(&encoded(&[record]));
+        let mut vertices = Vec::new();
+        assert!(f.footprint(&f.record(0).expect("a record"), &mut vertices), "encoding {enc}");
+        let want = NodeCoord {
+            lat: (f64::from(bmin_lat) + f64::from(north) * scale) as f32,
+            lng: (f64::from(bmin_lng) + f64::from(east) * scale) as f32,
+        };
+        assert_eq!(bits(&vertices), bits(&[want]), "encoding {enc}");
+    }
 }
 
 #[test]

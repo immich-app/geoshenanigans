@@ -16,9 +16,11 @@
 #include <utility>
 #include <vector>
 
+#include "addr_files.h"
 #include "parallel.h"
 #include "side_blocks.h"
 #include "types.h"
+#include "vertex_pack.h"
 #include "way_files.h"
 
 // The most slices a writer's threads encode ahead of the one being written:
@@ -188,4 +190,134 @@ void write_way_files(const std::string& dir, const std::vector<Record>& ways, co
     if (!rows) throw std::runtime_error("failed to write " + rows_path);
     blocks.flush();
     if (!blocks) throw std::runtime_error("failed to write " + blocks_path);
+}
+
+// The superblocks of an address slice: 65,536 records.
+inline constexpr size_t kAddrSliceSuperblocks = 64;
+
+// Writes the address files (addr_files.h) of the builder's addresses:
+// points[i] is address i's AddrPoint, a building's vertex_offset the place of
+// its footprint's first vertex in vertices and its vertex_count how many
+// follow it there; vertices gives each by operator[] as a reference into one
+// array. A footprint is written as its packed polygon (vertex_pack.h), the
+// logical blob, its record's vertex_offset the bytes of the ones before it; a
+// record whose footprint the vertices do not hold is written as a point. Each
+// slice's blocks go through put_points(const uint8_t*, size_t) in one call,
+// its blobs through put_vertices and its index rows through put_index, then
+// each file's footer. Refuses, before anything is put, more records than a
+// patch indexes and footprints whose logical blobs are more bytes than one
+// indexes; and what the serial encoder refuses of the pair, in its words.
+template <class Points, class Vertices, class PutPoints, class PutVertices, class PutIndex>
+void write_addr_pair(const Points& points, const Vertices& vertices, PutPoints put_points, PutVertices put_vertices,
+                     PutIndex put_index, unsigned threads = 0, size_t slice_superblocks = kAddrSliceSuperblocks) {
+    struct Slice {
+        // The index rows' offsets count from the slice's first block and
+        // first blob.
+        std::vector<uint8_t> blocks, blobs, index;
+        uint64_t footprints = 0;
+    };
+    const size_t n = points.size(), slice = std::max<size_t>(slice_superblocks, 1) * addr_files::SUPERBLOCK_RECORDS;
+    const size_t slices = (n + slice - 1) / slice;
+    addr_files::check_records(n);
+    // A record's footprint in the vertices: none of a point's, and none
+    // where they do not hold it.
+    auto footprint = [&vertices](const AddrPoint& p) -> const NodeCoord* {
+        if (p.vertex_count == 0 || p.vertex_offset == NO_DATA || size_t(p.vertex_offset) + p.vertex_count > vertices.size())
+            return nullptr;
+        return &vertices[p.vertex_offset];
+    };
+    // The bytes of the logical blobs before each slice, which its encoder
+    // starts from, and after the last.
+    std::vector<uint64_t> before(slices + 1, 0);
+    parallel_for(slices, [&](size_t begin, size_t end, unsigned) {
+        for (size_t k = begin; k < end; k++) {
+            uint64_t bytes = 0;
+            for (size_t i = k * slice, last = std::min(n, i + slice); i < last; i++) {
+                const AddrPoint p = points[i];
+                if (const NodeCoord* ring = footprint(p)) bytes += plan_polygon(ring, p.vertex_count).bytes;
+            }
+            before[k + 1] = bytes;
+        }
+    }, threads);
+    for (size_t k = 0; k < slices; k++) before[k + 1] += before[k];
+    addr_files::check_logical_vertex_bytes(before[slices]);
+
+    uint64_t blocks_written = 0, blobs_written = 0, footprints = 0;
+    encode_slices(slices, [&](size_t k) {
+        Slice out;
+        const size_t first = k * slice, end = std::min(n, first + slice);
+        out.index.reserve((end - first + addr_files::SUPERBLOCK_RECORDS - 1) / addr_files::SUPERBLOCK_RECORDS *
+                              addr_files::INDEX_HEAD_BYTES +
+                          (end - first + addr_files::BLOCK_RECORDS - 1) / addr_files::BLOCK_RECORDS * addr_files::INDEX_ENTRY_BYTES);
+        auto into = [](std::vector<uint8_t>& v) {
+            return [&v](const uint8_t* p, size_t len) { v.insert(v.end(), p, p + len); };
+        };
+        addr_files::Encoder enc(into(out.blocks), into(out.blobs), into(out.index), first, before[k]);
+        std::vector<uint8_t> logical;
+        uint64_t logical_at = before[k];
+        for (size_t i = first; i < end; i++) {
+            AddrPoint p = points[i];
+            if (const NodeCoord* ring = footprint(p)) {
+                const PolygonPacking packing = plan_polygon(ring, p.vertex_count);
+                logical.resize(packing.bytes);
+                pack_polygon(logical.data(), packing, ring, p.vertex_count);
+                p.vertex_offset = static_cast<uint32_t>(logical_at);
+                logical_at += packing.bytes;
+            } else {
+                p.vertex_offset = NO_DATA;
+                p.vertex_count = 0;
+            }
+            enc.add(reinterpret_cast<const uint8_t*>(&p), logical.data());
+        }
+        enc.finish();
+        out.footprints = enc.blobs();
+        // A slice waits for its turn at the size of its bytes, not at what
+        // they grew through.
+        out.blocks.shrink_to_fit();
+        out.blobs.shrink_to_fit();
+        return out;
+    }, [&](size_t, Slice&& s) {
+        addr_files::rebase_index(s.index.data(), s.index.size(), blocks_written, blobs_written);
+        put_points(s.blocks.data(), s.blocks.size());
+        put_vertices(s.blobs.data(), s.blobs.size());
+        put_index(s.index.data(), s.index.size());
+        blocks_written += s.blocks.size();
+        blobs_written += s.blobs.size();
+        footprints += s.footprints;
+    }, threads);
+    const auto points_footer = addr_files::points_footer(n);
+    const auto vertices_footer = addr_files::vertices_footer(before[slices], footprints);
+    const auto index_footer = addr_files::index_footer(n);
+    put_points(points_footer.data(), points_footer.size());
+    put_vertices(vertices_footer.data(), vertices_footer.size());
+    put_index(index_footer.data(), index_footer.size());
+}
+
+// Writes the three address files of `dir` for the builder's addresses, the
+// three footers of no addresses. Addresses the writer refuses are refused
+// under the dir's name.
+inline void write_addr_files(const std::string& dir, const std::vector<AddrPoint>& points, const std::vector<NodeCoord>& vertices,
+                             unsigned threads = 0) {
+    const char* const names[3] = {addr_files::POINTS_FILE, addr_files::VERTICES_FILE, addr_files::INDEX_FILE};
+    std::string paths[3];
+    std::ofstream files[3];
+    for (size_t f = 0; f < 3; f++) {
+        paths[f] = dir + "/" + names[f];
+        files[f].open(paths[f], std::ios::binary);
+        if (!files[f]) throw std::runtime_error("failed to write " + paths[f]);
+    }
+    auto to = [&files](size_t f) {
+        return [&file = files[f]](const uint8_t* p, size_t n) {
+            file.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n));
+        };
+    };
+    try {
+        write_addr_pair(points, vertices, to(0), to(1), to(2), threads);
+    } catch (const std::runtime_error& e) {
+        throw std::runtime_error(dir + ": " + e.what());
+    }
+    for (size_t f = 0; f < 3; f++) {
+        files[f].flush();
+        if (!files[f]) throw std::runtime_error("failed to write " + paths[f]);
+    }
 }

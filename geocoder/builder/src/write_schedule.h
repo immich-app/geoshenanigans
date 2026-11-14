@@ -108,9 +108,11 @@ constexpr uint64_t kFilterPairCopyDivisor = 2;
 
 // Per mode dir, write_index's slices in flight, postcode centroids and admin
 // cell copies (planet: 0.8 GiB for the three). The slices are the geo
-// index's, the packed addr points' (one a thread) and those of the street,
-// interpolation and side file writers (record_files_io.h), each of which
-// holds at most kSliceWindow slices however many cores encode them.
+// index's and those of the way, address and side file writers
+// (record_files_io.h), each of which holds at most kSliceWindow slices of
+// 65,536 records however many cores encode them: a way writer their rows and
+// node blocks, the address writer their blocks, blobs and index rows, a side
+// writer their values' blocks.
 constexpr uint64_t kModeBytes = uint64_t(256) << 20;
 
 // Stage working sets as fractions of the records they read: the boundary

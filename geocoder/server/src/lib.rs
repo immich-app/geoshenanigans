@@ -30,6 +30,7 @@ pub mod poi_files;
 pub mod side_blocks;
 pub mod strings;
 pub mod way_files;
+pub use addr_files::{AddrFiles, AddrRecord};
 pub use place_files::PlaceFiles;
 pub use poi_files::PoiRecords;
 pub use side_blocks::SideBlocks;
@@ -119,93 +120,6 @@ impl FileBytes {
     }
 }
 
-/// A polygon's encoded vertices as `decode_polygon_verts` reads them: the inline 10-byte header
-/// (encoding tag, bbox minimum) at `vertex_offset` and where its `vertex_count` vertices start.
-pub(crate) struct EncodedPolygon {
-    encoding: u8,
-    bmin_lat: f32,
-    bmin_lng: f32,
-    verts_off: u64,
-}
-
-/// The polygon at `vertex_offset`, or None where it has none: no vertices, or the header or
-/// vertices past the end of `src`.
-pub(crate) fn encoded_polygon(src: &FileBytes, vertex_offset: u32, vertex_count: u32) -> Option<EncodedPolygon> {
-    if vertex_count == 0 || vertex_offset == NO_DATA { return None; }
-    let off = vertex_offset as u64;
-    if off + POLY_HEADER_BYTES > src.len() { return None; }
-    let header = src.read_chunk(off, POLY_HEADER_BYTES as usize);
-    let encoding = header[0];
-    let bmin_lat = f32::from_le_bytes(header[2..6].try_into().unwrap());
-    let bmin_lng = f32::from_le_bytes(header[6..10].try_into().unwrap());
-    let verts_off = off + POLY_HEADER_BYTES;
-    if verts_off + vertex_count as u64 * vertex_stride(encoding) as u64 > src.len() { return None; }
-    Some(EncodedPolygon { encoding, bmin_lat, bmin_lng, verts_off })
-}
-
-/// Decode a polygon's quantized vertices into NodeCoord values.
-/// Reads the inline 10-byte polygon header (encoding tag + bbox_min)
-/// at vertex_offset, then `vertex_count` vertices that follow.  Used
-/// by AdminGeometry, Index::poi_verts, Index::addr_polygon_verts
-/// — keeping the encoding logic in one place.
-pub fn decode_polygon_verts<'a>(
-    src: &'a FileBytes,
-    vertex_offset: u32,
-    vertex_count: u32,
-) -> Option<std::borrow::Cow<'a, [NodeCoord]>> {
-    let EncodedPolygon { encoding, bmin_lat: bbox_min_lat, bmin_lng: bbox_min_lng, verts_off } =
-        encoded_polygon(src, vertex_offset, vertex_count)?;
-    let total_bytes = (vertex_count as u64) * vertex_stride(encoding) as u64;
-    let bytes = src.read_chunk(verts_off, total_bytes as usize);
-
-    if encoding == 4 {
-        // Legacy raw F32 lat/lng (8 bytes/vertex). Vertices start at
-        // POLY_HEADER_BYTES (byte 10), which is only 2-aligned, so a direct
-        // `bytes.as_ptr() as *const NodeCoord` cast is undefined behaviour
-        // (NodeCoord needs 4-byte alignment). Decode each field with an
-        // unaligned little-endian read instead: this yields bit-identical
-        // f32 values to the cast on little-endian targets without the
-        // alignment hazard.
-        let count = vertex_count as usize;
-        let mut out = Vec::<NodeCoord>::with_capacity(count);
-        for i in 0..count {
-            let lat = f32::from_le_bytes(bytes[i*8..i*8+4].try_into().unwrap());
-            let lng = f32::from_le_bytes(bytes[i*8+4..i*8+8].try_into().unwrap());
-            out.push(NodeCoord { lat, lng });
-        }
-        Some(std::borrow::Cow::Owned(out))
-    } else {
-        // Delta-encoded.  Decode each vertex into a fresh NodeCoord.
-        let scale = vertex_scale(encoding);
-        let bmin_lat = bbox_min_lat as f64;
-        let bmin_lng = bbox_min_lng as f64;
-        let count = vertex_count as usize;
-        let mut out = Vec::<NodeCoord>::with_capacity(count);
-        if encoding == 3 {
-            // u32 deltas (8 bytes/vertex)
-            for i in 0..count {
-                let dlat = u32::from_le_bytes(bytes[i*8..i*8+4].try_into().unwrap()) as f64;
-                let dlng = u32::from_le_bytes(bytes[i*8+4..i*8+8].try_into().unwrap()) as f64;
-                out.push(NodeCoord {
-                    lat: (bmin_lat + dlat * scale) as f32,
-                    lng: (bmin_lng + dlng * scale) as f32,
-                });
-            }
-        } else {
-            // u16 deltas (4 bytes/vertex) — encodings 0, 1, 2
-            for i in 0..count {
-                let dlat = u16::from_le_bytes(bytes[i*4..i*4+2].try_into().unwrap()) as f64;
-                let dlng = u16::from_le_bytes(bytes[i*4+2..i*4+4].try_into().unwrap()) as f64;
-                out.push(NodeCoord {
-                    lat: (bmin_lat + dlat * scale) as f32,
-                    lng: (bmin_lng + dlng * scale) as f32,
-                });
-            }
-        }
-        Some(std::borrow::Cow::Owned(out))
-    }
-}
-
 // --- S2 helpers ---
 
 pub const DEFAULT_STREET_CELL_LEVEL: u64 = 17;
@@ -240,27 +154,6 @@ pub fn cell_neighbors_at_level(cell_id: u64, level: u64) -> Vec<u64> {
 
 // --- Binary format structs (must match C++ build pipeline) ---
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct AddrPoint {
-    pub lat: f32,
-    pub lng: f32,
-    pub housenumber_id: u32,
-    pub street_id: u32,
-    pub parent_way_id: u32,
-    pub vertex_offset: u32,  // NO_DATA for node-sourced points
-    pub vertex_count: u32,   // 0 for nodes, >0 for building polygons
-}
-
-#[inline]
-pub fn vertex_stride(enc: u8) -> usize {
-    match enc {
-        0 | 1 | 2 => 4, // u16 dlat + u16 dlng
-        3 | 4     => 8, // u32 dlat + u32 dlng OR f32 + f32
-        _ => 8,
-    }
-}
-
 #[inline]
 pub fn vertex_scale(enc: u8) -> f64 {
     match enc {
@@ -271,17 +164,6 @@ pub fn vertex_scale(enc: u8) -> f64 {
         _ => 0.0,  // F32: not used
     }
 }
-
-/// Per-polygon header at the start of each polygon's vertex slice in
-/// poi_vertices.bin / addr_vertices.bin:
-///   byte 0     : vertex encoding tag (VertexEncoding in builder/src/types.h)
-///   byte 1     : padding
-///   bytes 2..6 : bbox_min_lat (f32)
-///   bytes 6..10: bbox_min_lng (f32)
-/// Vertices follow at byte 10, packed at the encoding's stride.
-/// Header is omitted for vertex_count == 0 (point-only records,
-/// vertex_offset == NO_DATA).
-pub const POLY_HEADER_BYTES: u64 = 10;
 
 /// The admin level of a postcode area's record (boundary=postal_code).
 pub const POSTCODE_AREA_LEVEL: u8 = 11;
@@ -1065,8 +947,9 @@ pub struct Index {
     /// The street ways (way_files.rs), street_ways.bin and street_nodes.bin, which come with
     /// the geo index.
     pub streets: Option<WayFiles>,
-    pub addr_points: Option<FileBytes>,
-    pub addr_vertices: Option<FileBytes>,
+    /// The address points (addr_files.rs), addr_points.bin, addr_vertices.bin and
+    /// addr_index.bin; none in a dir without them.
+    pub addrs: Option<AddrFiles>,
     /// The interpolation ways, interp_ways.bin and interp_nodes.bin; none in a dir without them.
     pub interps: Option<WayFiles>,
     // TIGER per-segment ZIP side file: a postcode string offset per interp
@@ -1191,25 +1074,48 @@ thread_local! {
     /// The buffer a read decodes a way's nodes into (way_files.rs), taken while the read uses
     /// it and put back after, with room for WAY_NODES_KEPT nodes.
     static WAY_NODES: std::cell::Cell<Vec<NodeCoord>> = Default::default();
+
+    /// The buffer a scan decodes an address's footprint into (addr_files.rs), taken and put
+    /// back as the way buffer is, with room for FOOTPRINT_KEPT vertices.
+    static FOOTPRINT: std::cell::Cell<Vec<NodeCoord>> = Default::default();
 }
 
 /// The nodes a thread's way buffer has room for between reads, 32 KiB: an OSM way has at most
 /// 2,000 nodes, a way file's up to 65,535.
 const WAY_NODES_KEPT: usize = 4096;
 
-/// Runs `read` with this thread's way buffer to decode ways into. A way of more nodes than the
-/// buffer has room for grows it, and a buffer that grew is freed when `read` returns.
-fn with_way_nodes<R>(read: impl FnOnce(&mut Vec<NodeCoord>) -> R) -> R {
-    let mut nodes = WAY_NODES.with(std::cell::Cell::take);
-    if nodes.capacity() < WAY_NODES_KEPT {
-        nodes = Vec::with_capacity(WAY_NODES_KEPT);
+/// The vertices a thread's footprint buffer has room for between reads, 32 KiB: a building's
+/// footprint has few, and nothing bounds how many one has.
+const FOOTPRINT_KEPT: usize = 4096;
+
+/// Runs `read` with the buffer this thread keeps in `kept`, which has room for `room`
+/// coordinates between reads. A read of more grows it, and a buffer that grew is freed when
+/// `read` returns.
+fn with_buffer<R>(
+    kept: &'static std::thread::LocalKey<std::cell::Cell<Vec<NodeCoord>>>,
+    room: usize,
+    read: impl FnOnce(&mut Vec<NodeCoord>) -> R,
+) -> R {
+    let mut buffer = kept.with(std::cell::Cell::take);
+    if buffer.capacity() < room {
+        buffer = Vec::with_capacity(room);
     }
-    let room = nodes.capacity();
-    let result = read(&mut nodes);
-    if nodes.capacity() == room {
-        WAY_NODES.with(|kept| kept.set(nodes));
+    let room = buffer.capacity();
+    let result = read(&mut buffer);
+    if buffer.capacity() == room {
+        kept.with(|kept| kept.set(buffer));
     }
     result
+}
+
+/// Runs `read` with this thread's way buffer to decode ways into.
+fn with_way_nodes<R>(read: impl FnOnce(&mut Vec<NodeCoord>) -> R) -> R {
+    with_buffer(&WAY_NODES, WAY_NODES_KEPT, read)
+}
+
+/// Runs `read` with this thread's footprint buffer to decode footprints into.
+fn with_footprint<R>(read: impl FnOnce(&mut Vec<NodeCoord>) -> R) -> R {
+    with_buffer(&FOOTPRINT, FOOTPRINT_KEPT, read)
 }
 
 // Entry-ID encoding for admin/POI cell entries: the high bit flags an
@@ -1335,11 +1241,10 @@ impl Index {
 
         // Files that are only meaningful together load as all-or-nothing
         // groups (whole-group-absent = a thinner index variant; half-present
-        // = corruption). addr_vertices is NOT part of the addr group — it
-        // was added in v9 (building footprints) and older indexes
-        // legitimately lack it. admin_parents is individually optional for
-        // the same version reason.
-        let addr_points = mmap_file_optional(&format!("{}/addr_points.bin", dir));
+        // = corruption).
+        let file = |name: &str| mmap_file_optional(&format!("{dir}/{name}"));
+        let addrs = AddrFiles::open(file(addr_files::POINTS_FILE), file(addr_files::VERTICES_FILE), file(addr_files::INDEX_FILE))
+            .map_err(|e| format!("{dir}: {e}"))?;
         let [interp_ways, interp_nodes]: [Option<FileBytes>; 2] =
             mmap_group(dir, &["interp_ways.bin", "interp_nodes.bin"])?
                 .try_into().map_err(|_| "interp group arity")?;
@@ -1372,17 +1277,16 @@ impl Index {
         // Each side file is optional, and holds a value for each record of the file it sits
         // beside.
         let ways = |files: &Option<WayFiles>| files.as_ref().map(|files| u64::from(files.count()));
-        let addrs = addr_points.as_ref().map(|points| points.len() / std::mem::size_of::<AddrPoint>() as u64);
         let way_parents = load_side(dir, "way_parents.bin", "street_ways.bin", ways(&streets))?;
         let way_postcodes = load_side(dir, "way_postcodes.bin", "street_ways.bin", ways(&streets))?;
-        let addr_postcodes = load_side(dir, "addr_postcodes.bin", "addr_points.bin", addrs)?;
+        let addr_postcodes =
+            load_side(dir, "addr_postcodes.bin", addr_files::POINTS_FILE, addrs.as_ref().map(|addrs| u64::from(addrs.count())))?;
         let interp_postcodes = load_side(dir, "interp_postcodes.bin", "interp_ways.bin", ways(&interps))?;
 
         Ok(Index {
             geo_index,
             streets,
-            addr_points,
-            addr_vertices: mmap_file_optional(&format!("{}/addr_vertices.bin", dir)),
+            addrs,
             interps,
             interp_postcodes,
             admin_index,
@@ -1423,13 +1327,6 @@ impl Index {
             return Some(0);
         }
         self.poi_records.as_ref()?.vertex_count(self.poi_vertices.as_ref()?, poi)
-    }
-
-    /// Decode an addr_point's polygon footprint vertex slice.  Same
-    /// inline-header layout as admin/POI vertices.
-    pub fn addr_polygon_verts(&self, point: &AddrPoint) -> Option<std::borrow::Cow<'_, [NodeCoord]>> {
-        let v = self.addr_vertices.as_ref()?;
-        decode_polygon_verts(v, point.vertex_offset, point.vertex_count)
     }
 
     /// The place nodes, visible and hidden: their ids run below this.
@@ -1510,7 +1407,7 @@ impl Index {
     /// What decides between two address points at one exact distance (see
     /// `beats`): the distance of the point itself (a building's distance is
     /// its outline's), then its house number and street as text.
-    fn addr_tie_key(&self, a: &AddrPoint, lat: f64, lng: f64, cos_lat: f64) -> (f64, Cow<'_, str>, Cow<'_, str>) {
+    fn addr_tie_key(&self, a: &AddrRecord, lat: f64, lng: f64, cos_lat: f64) -> (f64, Cow<'_, str>, Cow<'_, str>) {
         let d = dist_sq((a.lat as f64 - lat).to_radians(), (a.lng as f64 - lng).to_radians(), cos_lat);
         (d, self.get_string(a.housenumber_id), self.get_string(a.street_id))
     }
@@ -1539,7 +1436,7 @@ impl Index {
     /// its squared distance and its id: the address's record, the interpolation's street and
     /// the house number at the point, the street's row.
     pub fn query_geo(&self, lat: f64, lng: f64)
-        -> (Option<(f64, AddrPoint, u32)>, Option<(f64, Cow<'_, str>, u32, u32)>, Option<(f64, WayRow, u32)>)
+        -> (Option<(f64, AddrRecord, u32)>, Option<(f64, Cow<'_, str>, u32, u32)>, Option<(f64, WayRow, u32)>)
     {
         if self.geo_index.is_empty() {
             return (None, None, None);
@@ -1570,35 +1467,34 @@ impl Index {
     /// point read first: cells are read in the order the lookup asked for them, a cell's ids in
     /// its list's.
     fn nearest_addr(&self, lists: &GeoLists, cells: usize, lat: f64, lng: f64, cos_lat: f64)
-        -> Option<(f64, AddrPoint, u32)>
+        -> Option<(f64, AddrRecord, u32)>
     {
-        let addr_points = self.addr_points.as_ref()?;
-        let total_addr = addr_points.len() / std::mem::size_of::<AddrPoint>() as u64;
-        let addr_key = |a: &AddrPoint| self.addr_tie_key(a, lat, lng, cos_lat);
+        let addrs = self.addrs.as_ref()?;
+        let addr_key = |a: &AddrRecord| self.addr_tie_key(a, lat, lng, cos_lat);
 
         let mut best_addr_dist = f64::MAX;
-        let mut best_addr: Option<AddrPoint> = None;
+        let mut best_addr: Option<AddrRecord> = None;
         let mut best_addr_id: u32 = NO_DATA;
-        // Building-sourced points (vertex_count > 0)
-        // use polygon distance, matching ST_Distance behaviour.
-        for i in 0..cells {
-            for &id in lists.list(i, geo_index::ADDRESSES) {
-                let idx = id as u64;
-                if idx >= total_addr { continue; }
-                let point: AddrPoint = addr_points.read_at(idx);
+        // One run over the cells' lists. A corrupt cell entry reads as no record: an id past
+        // the last address, a record whose block can't be read.
+        let ids = (0..cells).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
+        with_footprint(|footprint| {
+            addrs.for_ids(ids, |id, point| {
                 let dlat = (point.lat as f64 - lat).to_radians();
                 let dlng = (point.lng as f64 - lng).to_radians();
                 let mut dist = dist_sq(dlat, dlng, cos_lat);
-                if let Some(verts) = self.addr_polygon_verts(&point) {
-                    dist = polygon_distance_sq(lat, lng, &verts, cos_lat);
+                // A building is as far as its outline, matching ST_Distance behaviour; one
+                // whose footprint can't be read, as its point.
+                if point.is_building() && addrs.footprint(&point, footprint) {
+                    dist = polygon_distance_sq(lat, lng, footprint, cos_lat);
                 }
                 if beats(dist, best_addr_dist, || best_addr.as_ref().map(|b| (addr_key(&point), addr_key(b)))) {
                     best_addr_dist = dist;
                     best_addr = Some(point);
                     best_addr_id = id;
                 }
-            }
-        }
+            })
+        });
         best_addr.map(|p| (best_addr_dist, p, best_addr_id))
     }
 
@@ -1679,41 +1575,38 @@ impl Index {
 
     // Nominatim's `_find_housenumber_for_street` (reverse.py:231):
     // given a street that has just won primary selection, look up the
-    // nearest AddrPoint whose parent_way_id matches that street's
+    // nearest address whose parent_way_id matches that street's
     // index, gated by `ST_DWithin(query, 0.001)` (~100m). Returns the
-    // addr_point whose housenumber should refine the result.
+    // address whose housenumber should refine the result.
     pub fn find_addr_on_way(&self, lat: f64, lng: f64, parent_way_idx: u32, max_dist_sq: f64)
-        -> Option<AddrPoint>
+        -> Option<AddrRecord>
     {
-        let addr_points = self.addr_points.as_ref()?;
-        let total_addr = addr_points.len() / std::mem::size_of::<AddrPoint>() as u64;
+        let addrs = self.addrs.as_ref()?;
 
         let cells = self.geo_cells_around(lat, lng);
         let mut lists = GEO_LISTS.with(std::cell::Cell::take);
         self.geo_index.lookup_many(&cells, 1 << geo_index::ADDRESSES, &mut lists);
         let cos_lat = lat.to_radians().cos();
-        let addr_key = |a: &AddrPoint| self.addr_tie_key(a, lat, lng, cos_lat);
+        let addr_key = |a: &AddrRecord| self.addr_tie_key(a, lat, lng, cos_lat);
 
         let mut best_dist = max_dist_sq;
-        let mut best: Option<AddrPoint> = None;
-        for i in 0..cells.len() {
-            for &id in lists.list(i, geo_index::ADDRESSES) {
-                let idx = id as u64;
-                if idx >= total_addr { continue; }
-                let point: AddrPoint = addr_points.read_at(idx);
-                if point.parent_way_id != parent_way_idx { continue; }
+        let mut best: Option<AddrRecord> = None;
+        // Of an address under another way no more than its street and its parent is read.
+        let ids = (0..cells.len()).flat_map(|i| lists.list(i, geo_index::ADDRESSES).iter().copied());
+        with_footprint(|footprint| {
+            addrs.for_ids_on_way(ids, parent_way_idx, |_, point| {
                 let dlat = (point.lat as f64 - lat).to_radians();
                 let dlng = (point.lng as f64 - lng).to_radians();
                 let mut dist = dist_sq(dlat, dlng, cos_lat);
-                if let Some(verts) = self.addr_polygon_verts(&point) {
-                    dist = polygon_distance_sq(lat, lng, &verts, cos_lat);
+                if point.is_building() && addrs.footprint(&point, footprint) {
+                    dist = polygon_distance_sq(lat, lng, footprint, cos_lat);
                 }
                 if beats(dist, best_dist, || best.as_ref().map(|b| (addr_key(&point), addr_key(b)))) {
                     best_dist = dist;
                     best = Some(point);
                 }
-            }
-        }
+            })
+        });
         GEO_LISTS.with(|g| g.set(lists));
         best
     }
@@ -1788,7 +1681,7 @@ impl Index {
                     "house_number": if p.housenumber_id != NO_DATA { self.get_string(p.housenumber_id) } else { Cow::Borrowed("") },
                     "street": if p.street_id != NO_DATA { self.get_string(p.street_id) } else { Cow::Borrowed("") },
                     "lat": p.lat, "lng": p.lng,
-                    "vertex_count": p.vertex_count,
+                    "vertex_count": self.addrs.as_ref().map_or(0, |addrs| addrs.vertex_count(&p)),
                     "id": id,
                     "dist_bits": bits(d),
                     "tie": [serde_json::json!(bits(point_dist)), serde_json::json!(house_number), serde_json::json!(street)],
@@ -2805,7 +2698,7 @@ impl Index {
         f.get(u32::try_from(idx).ok()?).filter(|&v| v != NO_DATA)
     }
 
-    pub fn resolve_postcode(&self, lat: f64, lng: f64, street: Option<(usize, &WayRow)>, addr: Option<(usize, &AddrPoint)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, country_code: Option<[u8; 2]>) -> Option<Cow<'_, str>> {
+    pub fn resolve_postcode(&self, lat: f64, lng: f64, street: Option<(usize, &WayRow)>, addr: Option<(usize, &AddrRecord)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, country_code: Option<[u8; 2]>) -> Option<Cow<'_, str>> {
         // 0. Nearest addr_point's own postcode (from addr_postcodes.bin)
         // Matches Nominatim's token_get_postcode — the feature's own
         // addr:postcode tag is the highest-priority source.
@@ -3164,7 +3057,7 @@ impl Index {
         //
         // We implement the real containment check: if the nearest
         // containing POI has a polygon and the nearest addr_point is a
-        // node (vertex_count == 0) that point_in_polygon reports as
+        // node (no footprint) that point_in_polygon reports as
         // inside, demote the POI so the node wins.
         let mut effective_poi_dist = poi_dist;
         if poi_dist == 0.0 {
@@ -3176,7 +3069,7 @@ impl Index {
                 // (housenumber, street) drive the result.
                 if addr_dist == 0.0 {
                     effective_poi_dist = f64::MAX;
-                } else if addr_pt.vertex_count == 0 && poi.is_polygon() {
+                } else if !addr_pt.is_building() && poi.is_polygon() {
                     let mut inside = false;
                     if let Some(verts) = self.poi_verts(&poi) {
                         inside = point_in_polygon(addr_pt.lat, addr_pt.lng, &verts);
@@ -3294,7 +3187,7 @@ impl Index {
                 }
             } else {
                 // Street is closest — use its name, then refine with a
-                // housenumber if an AddrPoint whose parent_way_id matches
+                // housenumber if an address whose parent_way_id matches
                 // this street sits within ~100m of the query. Mirrors
                 // Nominatim's `_find_housenumber_for_street` (reverse.py
                 // :231): after the closest street wins, a second query
@@ -3840,8 +3733,7 @@ mod query_tests {
         Index {
             geo_index: GeoIndex::none(),
             streets: None,
-            addr_points: None,
-            addr_vertices: None,
+            addrs: None,
             interps: None,
             interp_postcodes: None,
             admin_index,
@@ -6194,18 +6086,18 @@ mod pure_helper_tests {
         // Two buildings the query sits inside (both 0 m): the nearer address
         // point wins, then the house number / street text that sorts first,
         // whatever the string offsets; record order never decides.
-        let at = |lat: f32, lng: f32, hn: u32, st: u32| AddrPoint {
+        let at = |lat: f32, lng: f32, hn: u32, st: u32| AddrRecord {
             lat, lng, housenumber_id: hn, street_id: st, parent_way_id: 0,
-            vertex_offset: NO_DATA, vertex_count: 0,
+            blob_at: 0, blob_len: 0,
         };
         let text = ["2", "1/2", "Angell Street", "Bell Road"];
         let (lat, lng) = (52.0f64, 13.0f64);
         let cos_lat = lat.to_radians().cos();
-        let key = |a: &AddrPoint| {
+        let key = |a: &AddrRecord| {
             let d = dist_sq((a.lat as f64 - lat).to_radians(), (a.lng as f64 - lng).to_radians(), cos_lat);
             (d, text[a.housenumber_id as usize], text[a.street_id as usize])
         };
-        let wins = |dist: f64, p: &AddrPoint, best_dist: f64, best: Option<&AddrPoint>| {
+        let wins = |dist: f64, p: &AddrRecord, best_dist: f64, best: Option<&AddrRecord>| {
             beats(dist, best_dist, || best.map(|b| (key(p), key(b))))
         };
         let near = at(52.0001, 13.0, 0, 3);
@@ -6282,18 +6174,8 @@ mod pure_helper_tests {
         assert!((got - expect).abs() < 1e-12, "got {got} expect {expect}");
     }
 
-    // -- vertex encoding round-trips -----------------------------------------
-
     #[test]
-    fn vertex_stride_and_scale_snapshot() {
-        assert_eq!(vertex_stride(0), 4);
-        assert_eq!(vertex_stride(1), 4);
-        assert_eq!(vertex_stride(2), 4);
-        assert_eq!(vertex_stride(3), 8);
-        assert_eq!(vertex_stride(4), 8);
-        // NOTE: unknown encodings fall through to 8.
-        assert_eq!(vertex_stride(99), 8);
-
+    fn vertex_scale_snapshot() {
         assert_eq!(vertex_scale(0), 1e-5);
         assert_eq!(vertex_scale(1), 1e-4);
         assert_eq!(vertex_scale(2), 1e-6);
@@ -6301,89 +6183,6 @@ mod pure_helper_tests {
         // F32 (and unknown) report scale 0.0 (unused for the f32 path).
         assert_eq!(vertex_scale(4), 0.0);
         assert_eq!(vertex_scale(99), 0.0);
-    }
-
-    // Build a polygon buffer: 10-byte header + packed vertices.
-    fn build_poly_buf(enc: u8, bmin_lat: f32, bmin_lng: f32, verts: &[u8]) -> Vec<u8> {
-        let mut buf = Vec::new();
-        buf.push(enc);
-        buf.push(0); // padding
-        buf.extend_from_slice(&bmin_lat.to_le_bytes());
-        buf.extend_from_slice(&bmin_lng.to_le_bytes());
-        buf.extend_from_slice(verts);
-        buf
-    }
-
-    #[test]
-    fn decode_polygon_verts_u16_encodings() {
-        // Encodings 0,1,2 all use u16 deltas (4 bytes/vertex) with differing
-        // scales.  One vertex with dlat=10, dlng=20.
-        let mut vbytes = Vec::new();
-        vbytes.extend_from_slice(&10u16.to_le_bytes());
-        vbytes.extend_from_slice(&20u16.to_le_bytes());
-
-        for enc in [0u8, 1, 2] {
-            let buf = build_poly_buf(enc, 50.0, 5.0, &vbytes);
-            let src = FileBytes::Owned(buf);
-            let got = decode_polygon_verts(&src, 0, 1).expect("decode");
-            assert_eq!(got.len(), 1);
-            let scale = vertex_scale(enc);
-            let expect_lat = (50.0_f64 + 10.0 * scale) as f32;
-            let expect_lng = (5.0_f64 + 20.0 * scale) as f32;
-            assert_eq!(got[0].lat, expect_lat, "enc {enc} lat");
-            assert_eq!(got[0].lng, expect_lng, "enc {enc} lng");
-        }
-    }
-
-    #[test]
-    fn decode_polygon_verts_u32_encoding3() {
-        // Encoding 3: u32 deltas (8 bytes/vertex), scale 1e-7.
-        let mut vbytes = Vec::new();
-        vbytes.extend_from_slice(&1_000_000u32.to_le_bytes()); // dlat
-        vbytes.extend_from_slice(&2_000_000u32.to_le_bytes()); // dlng
-        let buf = build_poly_buf(3, -10.0, 100.0, &vbytes);
-        let src = FileBytes::Owned(buf);
-        let got = decode_polygon_verts(&src, 0, 1).expect("decode");
-        assert_eq!(got.len(), 1);
-        let expect_lat = (-10.0_f64 + 1_000_000.0 * 1e-7) as f32;
-        let expect_lng = (100.0_f64 + 2_000_000.0 * 1e-7) as f32;
-        assert_eq!(got[0].lat, expect_lat);
-        assert_eq!(got[0].lng, expect_lng);
-    }
-
-    #[test]
-    fn decode_polygon_verts_f32_encoding4() {
-        // Encoding 4: raw f32 lat/lng (8 bytes/vertex), no scale/bbox.
-        // Vertices begin at POLY_HEADER_BYTES (byte 10), which is only
-        // 2-aligned, so this exercises the unaligned-read decode path
-        // (a `*const NodeCoord` cast here would be UB). Two vertices.
-        let mut vbytes = Vec::new();
-        vbytes.extend_from_slice(&51.5074_f32.to_le_bytes());
-        vbytes.extend_from_slice(&(-0.1278_f32).to_le_bytes());
-        vbytes.extend_from_slice(&48.8566_f32.to_le_bytes());
-        vbytes.extend_from_slice(&2.3522_f32.to_le_bytes());
-        let buf = build_poly_buf(4, 0.0, 0.0, &vbytes);
-        let src = FileBytes::Owned(buf);
-        let got = decode_polygon_verts(&src, 0, 2).expect("decode");
-        assert_eq!(got.len(), 2);
-        assert_eq!(got[0].lat, 51.5074_f32);
-        assert_eq!(got[0].lng, -0.1278_f32);
-        assert_eq!(got[1].lat, 48.8566_f32);
-        assert_eq!(got[1].lng, 2.3522_f32);
-    }
-
-    #[test]
-    fn decode_polygon_verts_guards() {
-        let buf = build_poly_buf(0, 0.0, 0.0, &[0, 0, 0, 0]);
-        let src = FileBytes::Owned(buf);
-        // vertex_count == 0 -> None.
-        assert!(decode_polygon_verts(&src, 0, 0).is_none());
-        // NO_DATA offset -> None.
-        assert!(decode_polygon_verts(&src, NO_DATA, 1).is_none());
-        // Offset+header past EOF -> None (offset way beyond buffer).
-        assert!(decode_polygon_verts(&src, 1000, 1).is_none());
-        // Declared more vertices than the buffer holds -> None.
-        assert!(decode_polygon_verts(&src, 0, 5).is_none());
     }
 }
 
@@ -6458,7 +6257,7 @@ mod query_path_tests {
         footprint: Option<Footprint>,
     }
 
-    /// A building's outline as addr_vertices.bin holds one at vertex encoding 2 (the builder's
+    /// A building's outline as its logical blob holds one at vertex encoding 2 (the builder's
     /// U16_011M, which a building's span takes): each vertex in steps of 1e-6 degrees north and
     /// east of `min`.
     struct Footprint {
@@ -6494,10 +6293,11 @@ mod query_path_tests {
         [(kind.ways_file(), files.ways), (kind.nodes_file(), files.nodes)]
     }
 
-    /// addr_points.bin and addr_vertices.bin of `addrs` as the builder writes them: an AddrPoint
-    /// a record, and each footprint's polygon block (its 10-byte header, then its steps as u16
+    /// The three files of `addrs` as the builder writes them (addr_files.rs): addr_points.bin,
+    /// addr_vertices.bin and addr_index.bin, from their logical pair: a record of seven u32s an
+    /// address, and each footprint's logical blob (its 10-byte header, then its steps as u16
     /// pairs) at the record's vertex_offset.
-    fn addr_files(addrs: &[Addr]) -> [(&'static str, Vec<u8>); 2] {
+    fn addr_triple(addrs: &[Addr]) -> [(&'static str, Vec<u8>); 3] {
         let (mut points, mut vertices) = (Vec::new(), Vec::new());
         for addr in addrs {
             let (vertex_offset, vertex_count) = match &addr.footprint {
@@ -6517,8 +6317,8 @@ mod query_path_tests {
                 }
             }
         }
-        assert_eq!(points.len(), addrs.len() * std::mem::size_of::<AddrPoint>());
-        [("addr_points.bin", points), ("addr_vertices.bin", vertices)]
+        let files = addr_files::encode(&points, &vertices);
+        [(addr_files::POINTS_FILE, files.points), (addr_files::VERTICES_FILE, files.vertices), (addr_files::INDEX_FILE, files.index)]
     }
 
     #[derive(Default)]
@@ -6757,7 +6557,7 @@ mod query_path_tests {
                     files.extend(way_pair(&self.interps, way_files::Kind::Interps));
                 }
                 if !self.addrs.is_empty() {
-                    files.extend(addr_files(&self.addrs));
+                    files.extend(addr_triple(&self.addrs));
                 }
                 let side_files = [
                     ("way_parents.bin", &self.way_parents, self.streets.len()),
@@ -7581,7 +7381,7 @@ mod query_path_tests {
         let cases: [(&str, &str, Vec<&str>); 4] = [
             ("way_parents.bin", "street_ways.bin", [&streets[..], &["way_postcodes.bin"][..]].concat()),
             ("way_postcodes.bin", "street_ways.bin", [&streets[..], &["way_parents.bin"][..]].concat()),
-            ("addr_postcodes.bin", "addr_points.bin", vec!["addr_points.bin", "addr_vertices.bin"]),
+            ("addr_postcodes.bin", "addr_points.bin", vec!["addr_points.bin", "addr_vertices.bin", "addr_index.bin"]),
             ("interp_postcodes.bin", "interp_ways.bin", vec!["interp_ways.bin", "interp_nodes.bin"]),
         ];
         for (name, parent, without) in cases {
@@ -7667,6 +7467,187 @@ mod query_path_tests {
             assert!(said.ends_with(&format!(": {kept} without {gone}")), "{kept}: {said}");
         }
         assert_eq!(without(&[&no_geo[..], &["street_ways.bin", "street_nodes.bin"][..]].concat()), "");
+    }
+
+    #[test]
+    fn load_refuses_part_of_the_address_files() {
+        let dataset = two_of_each();
+        let (points, vertices, index) = (addr_files::POINTS_FILE, addr_files::VERTICES_FILE, addr_files::INDEX_FILE);
+        // Without the addresses' postcodes too, which no dir holds without addr_points.bin.
+        let without = |files: &[&str]| {
+            let said = load_refusal(&dataset, |dir| {
+                for file in files.iter().chain(&["addr_postcodes.bin"]) {
+                    std::fs::remove_file(dir.join(file)).unwrap();
+                }
+            });
+            said.unwrap_or_default()
+        };
+        // The dir, then the files it holds and the ones it lacks.
+        let cases: [(&[&str], &str); 6] = [
+            (&[points], "addr_vertices.bin and addr_index.bin without addr_points.bin"),
+            (&[vertices], "addr_points.bin and addr_index.bin without addr_vertices.bin"),
+            (&[index], "addr_points.bin and addr_vertices.bin without addr_index.bin"),
+            (&[points, vertices], "addr_index.bin without addr_points.bin and addr_vertices.bin"),
+            (&[points, index], "addr_vertices.bin without addr_points.bin and addr_index.bin"),
+            (&[vertices, index], "addr_points.bin without addr_vertices.bin and addr_index.bin"),
+        ];
+        for (files, want) in cases {
+            let said = without(files);
+            assert!(said.ends_with(&format!(": {want}")), "{files:?}: {said}");
+        }
+        // A dir with none of the three has no addresses, and loads.
+        assert_eq!(without(&[points, vertices, index]), "");
+    }
+
+    #[test]
+    fn load_refuses_address_files_no_builder_writes() {
+        let dataset = two_of_each();
+        // What load says of the dir with `file` edited: the dir, then what the files' reader says.
+        let refused = |file: &str, edit: &dyn Fn(Vec<u8>) -> Vec<u8>, want: &str| {
+            let said = load_refusal(&dataset, |dir| std::fs::write(dir.join(file), edit(std::fs::read(dir.join(file)).unwrap())).unwrap());
+            let said = said.unwrap_or_default();
+            assert!(said.ends_with(&format!(": {want}")), "{file}: {said}");
+        };
+        // The count a footer holds before its magic, set to 3: the records of addr_points.bin
+        // and of addr_index.bin, which are 2, and the blobs of addr_vertices.bin, of which it
+        // has none.
+        let counting_three = |mut bytes: Vec<u8>| {
+            let count = bytes.len() - 8;
+            bytes[count..count + 4].copy_from_slice(&3u32.to_le_bytes());
+            bytes
+        };
+        // Two fixed-width records, a file cut short, none of its bytes.
+        refused("addr_points.bin", &|_| vec![0; 56], "addr_points.bin has no ADB1 footer");
+        refused("addr_vertices.bin", &|mut bytes| { bytes.pop(); bytes }, "addr_vertices.bin has no ADF1 footer");
+        refused("addr_index.bin", &|_| Vec::new(), "addr_index.bin has no ADX1 footer");
+        // Footers that count different records, an index a byte longer than its records' rows,
+        // and more blobs than records.
+        refused("addr_points.bin", &counting_three, "addr_points.bin and addr_index.bin count different records");
+        refused("addr_index.bin", &counting_three, "addr_points.bin and addr_index.bin count different records");
+        refused("addr_index.bin", &|mut bytes| { bytes.insert(0, 0); bytes }, "addr_index.bin is not the rows of its 2 records");
+        refused("addr_vertices.bin", &counting_three, "addr_vertices.bin counts more blobs than addr_points.bin has records");
+    }
+
+    #[test]
+    fn address_files_of_no_records_load_and_give_no_address() {
+        // What a full dir holds for a region without addresses: the three files' footers.
+        let mut dataset = TestIndex::new();
+        dataset.street("Main Street", &parallel(0.0, 200.0));
+        let dir = ScratchDir::new();
+        dataset.write(dir.path());
+        let none = addr_files::encode(&[], &[]);
+        assert_eq!((none.points.len(), none.vertices.len(), none.index.len()), (8, 16, 8));
+        std::fs::write(dir.path().join(addr_files::POINTS_FILE), none.points).unwrap();
+        std::fs::write(dir.path().join(addr_files::VERTICES_FILE), none.vertices).unwrap();
+        std::fs::write(dir.path().join(addr_files::INDEX_FILE), none.index).unwrap();
+
+        let index = load_dir(dir.path());
+
+        assert_eq!(index.addrs.as_ref().map(AddrFiles::count), Some(0));
+        let primary = primary_at(&index, 1.0, ALONG_EAST_M);
+        assert_eq!(primary["street"]["name"], "Main Street");
+        assert!(primary["addr"].is_null(), "{primary}");
+        assert_eq!(house_number_on_way(&index, 1.0, ALONG_EAST_M, 0, 100.0), None);
+        let address = address_at(&index, 1.0, ALONG_EAST_M);
+        assert_eq!((address["road"].as_str(), address.get("house_number")), (Some("Main Street"), None));
+    }
+
+    #[test]
+    fn an_address_a_cell_lists_past_the_last_record_is_skipped() {
+        // No builder lists an id its files do not hold. Where a cell does, one just past the
+        // last record and one blocks past it, the scans read the records there are.
+        let index = TestIndex::new()
+            .street("Main Street", &parallel(0.0, 200.0))
+            .address("7", 30.0, 0.0)
+            .listed(geo_index::ADDRESSES, 1, 30.0, 0.0)
+            .listed(geo_index::ADDRESSES, 4000, 30.0, 0.0)
+            .load();
+
+        let addr = primary_at(&index, 29.0, 0.0)["addr"].clone();
+        assert_eq!((addr["id"].as_u64(), addr["house_number"].as_str()), (Some(0), Some("7")));
+        assert_eq!(house_number_on_way(&index, 29.0, 0.0, 0, 100.0).as_deref(), Some("7"));
+        assert_eq!(address_at(&index, 29.0, 0.0)["house_number"], "7");
+    }
+
+    #[test]
+    fn a_building_whose_blob_does_not_read_is_as_far_as_its_point() {
+        // House 3 is a building 30 m square. Its blob starts with a tag no blob has.
+        let mut dataset = TestIndex::new();
+        dataset.street("Main Street", &parallel(-40.0, 200.0)).building("3", (10.0, 20.0, 40.0, 50.0));
+        let dir = ScratchDir::new();
+        dataset.write(dir.path());
+        let blobs = dir.path().join(addr_files::VERTICES_FILE);
+        let mut bytes = std::fs::read(&blobs).unwrap();
+        bytes[0] = 0x40;
+        std::fs::write(&blobs, bytes).unwrap();
+        let read = |index: &Index, north_m, east_m| {
+            let addr = primary_at(index, north_m, east_m)["addr"].clone();
+            (addr["house_number"].as_str().map(str::to_owned), addr["vertex_count"].as_u64(), addr["dist_m"].clone())
+        };
+
+        // Inside its outline, 12 m west of its point, for both scans.
+        let damaged = load_dir(dir.path());
+        let (house_number, vertex_count, dist_m) = read(&damaged, 25.0, 23.0);
+        assert_eq!((house_number.as_deref(), vertex_count), (Some("3"), Some(0)));
+        assert!(about(&dist_m, 12.0), "{dist_m}");
+        assert_eq!(house_number_on_way(&damaged, 25.0, 23.0, 0, 100.0).as_deref(), Some("3"));
+        assert_eq!(house_number_on_way(&damaged, 25.0, 23.0, 0, 10.0), None);
+
+        // With the blob as the builder writes it, the point is in the building.
+        let whole = dataset.load();
+        let (house_number, vertex_count, dist_m) = read(&whole, 25.0, 23.0);
+        assert_eq!((house_number.as_deref(), vertex_count), (Some("3"), Some(5)));
+        assert!(about(&dist_m, 0.0), "{dist_m}");
+        assert_eq!(house_number_on_way(&whole, 25.0, 23.0, 0, 10.0).as_deref(), Some("3"));
+    }
+
+    /// `index` with one polygon POI, the rectangle: `name_id` its name and `parent_street_id`
+    /// its parent street's, strings of the index's. The admin cell of its middle lists it.
+    fn with_polygon_poi(mut index: Index, name_id: u32, parent_street_id: u32, (s, w, n, e): Span) -> Index {
+        let (low, middle) = (at(s, w), at((s + n) / 2.0, (w + e) / 2.0));
+        // Its corners at 1e-7 degrees (encoding 3) from its low corner.
+        let steps = |v: f32, from: f32| ((v as f64 - from as f64) / 1e-7).round() as u32;
+        let polygon = poi_files::PoiPolygon {
+            encoding: 3, bmin_lat: low.lat, bmin_lng: low.lng,
+            q: [at(s, w), at(s, e), at(n, e), at(n, w)].iter().map(|c| (steps(c.lat, low.lat), steps(c.lng, low.lng))).collect(),
+        };
+        let record = PoiRecord {
+            lat: middle.lat, lng: middle.lng, vertex_offset: 0, name_id, category: 1, tier: 0, flags: 0, importance: 0,
+            parent_street_id, parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
+        };
+        let (records, vertices) = poi_files::encode(&[(record, Some(polygon))]);
+        let cell = cell_id_at_level(middle.lat as f64, middle.lng as f64, DEFAULT_ADMIN_CELL_LEVEL);
+        index.poi_index = Some(cell_pairs::from_pairs([(cell, 0)], cell_pairs::POI));
+        index.poi_records = Some(PoiRecords::open(FileBytes::Owned(records)).unwrap());
+        index.poi_vertices = Some(FileBytes::Owned(vertices));
+        index
+    }
+
+    #[test]
+    fn a_poi_around_the_query_gives_way_to_an_address_node_inside_it_and_not_to_a_building() {
+        // The town hall's outline, 40 m by 60 m, holds the query and, 28 m from it, the point of
+        // house 1: a node, or the middle of a building 10 m square. Main Street runs 70 m south
+        // of the query; the town hall's parent street is Mill Lane.
+        let answer = |building: bool| {
+            let mut dataset = TestIndex::new();
+            dataset.street("Main Street", &parallel(-40.0, 200.0));
+            if building {
+                dataset.building("1", (5.0, 25.0, 15.0, 35.0));
+            } else {
+                dataset.address("1", 10.0, 30.0);
+            }
+            let (hall, lane) = (dataset.string("Town Hall"), dataset.string("Mill Lane"));
+            let index = with_polygon_poi(dataset.load(), hall, lane, (0.0, 0.0, 40.0, 60.0));
+            assert_eq!(primary_at(&index, 30.0, 10.0)["addr"]["vertex_count"], if building { 5 } else { 0 });
+            let address = address_at(&index, 30.0, 10.0);
+            (address["house_number"].as_str().map(str::to_owned), address["road"].as_str().map(str::to_owned))
+        };
+
+        // The node answers, on its street.
+        assert_eq!(answer(false), (Some("1".to_owned()), Some("Main Street".to_owned())));
+        // The building's nearest wall is 21 m from the query: the town hall answers, on its
+        // parent street.
+        assert_eq!(answer(true), (None, Some("Mill Lane".to_owned())));
     }
 
     #[test]
@@ -7763,6 +7744,61 @@ mod query_path_tests {
             kept.set(nodes);
             room
         })
+    }
+
+    /// The room this thread's footprint buffer has between reads.
+    fn footprint_buffer_room() -> usize {
+        FOOTPRINT.with(|kept| {
+            let vertices = kept.take();
+            let room = vertices.capacity();
+            kept.set(vertices);
+            room
+        })
+    }
+
+    #[test]
+    fn a_footprint_of_more_vertices_than_the_footprint_buffer_keeps_room_for_leaves_it_no_larger() {
+        // House 3 is a building 30 m square. House 5, 5 km north of it, is one 400 m square
+        // whose outline has more vertices than the buffer keeps room for: half as many as that
+        // along each wall, and the first again.
+        const WALL: usize = FOOTPRINT_KEPT / 2;
+        const VERTICES: usize = 4 * WALL + 1;
+        let corners = [(5000.0, 0.0), (5000.0, 400.0), (5400.0, 400.0), (5400.0, 0.0), (5000.0, 0.0)];
+        let mut ring: Vec<NodeCoord> = corners
+            .windows(2)
+            .flat_map(|wall| {
+                let ((north, east), (to_north, to_east)) = (wall[0], wall[1]);
+                (0..WALL).map(move |i| {
+                    let along = i as f64 / WALL as f64;
+                    at(north + (to_north - north) * along, east + (to_east - east) * along)
+                })
+            })
+            .collect();
+        ring.push(ring[0]);
+        assert_eq!(ring.len(), VERTICES);
+        let mut dataset = TestIndex::new();
+        dataset.street("Main Street", &parallel(-40.0, 200.0)).building("3", (10.0, 20.0, 40.0, 50.0));
+        dataset.street("Long Row", &parallel(4960.0, 200.0)).address_point("5", at(5200.0, 200.0), Some(Footprint::of(&ring)));
+        let index = dataset.load();
+        assert_eq!(footprint_buffer_room(), 0);
+        let nearest = |north_m, east_m| {
+            let addr = primary_at(&index, north_m, east_m)["addr"].clone();
+            (addr["house_number"].as_str().map(str::to_owned), addr["vertex_count"].as_u64(), addr["dist_bits"].as_str().map(str::to_owned))
+        };
+        let inside = Some(format!("{:016x}", 0f64.to_bits()));
+
+        // A query of the small building leaves the buffer with the room it keeps.
+        assert_eq!(nearest(15.0, 45.0), (Some("3".to_owned()), Some(5), inside.clone()));
+        assert_eq!(footprint_buffer_room(), FOOTPRINT_KEPT);
+
+        // Both scans of the large one, from inside it, 14 m from its point.
+        assert_eq!(nearest(5190.0, 190.0), (Some("5".to_owned()), Some(VERTICES as u64), inside.clone()));
+        assert_eq!(house_number_on_way(&index, 5190.0, 190.0, 1, 10.0).as_deref(), Some("5"));
+        assert!(footprint_buffer_room() <= FOOTPRINT_KEPT, "{}", footprint_buffer_room());
+
+        // The small building answers as before, from a buffer of that room again.
+        assert_eq!(nearest(15.0, 45.0), (Some("3".to_owned()), Some(5), inside));
+        assert_eq!(footprint_buffer_room(), FOOTPRINT_KEPT);
     }
 
     #[test]
@@ -7901,7 +7937,7 @@ mod admin_scan_tests {
         let len = strings.len() as u32;
         Index {
             geo_index: GeoIndex::none(), streets: None,
-            addr_points: None, addr_vertices: None,
+            addrs: None,
             interps: None, interp_postcodes: None,
             admin_index: CellPairs::open(FileBytes::Owned(cells), FileBytes::Owned(entries), cell_pairs::ADMIN, DEFAULT_ADMIN_CELL_LEVEL).unwrap(),
             admin_polygons: FileBytes::Owned(polygons),

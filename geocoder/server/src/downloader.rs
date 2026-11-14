@@ -737,6 +737,18 @@ mod tests {
         }
     }
 
+    // Index::load refuses a dir with some of the three address files and not all of them.
+    #[test]
+    fn template_selections_take_the_three_address_files_together() {
+        use query_server::addr_files::{INDEX_FILE, POINTS_FILE, VERTICES_FILE};
+        let (v, c) = template();
+        for s in template_selections(&v) {
+            let paths = resolve_files(&c, &s).unwrap().paths;
+            let held = [POINTS_FILE, VERTICES_FILE, INDEX_FILE].map(|name| paths.iter().any(|p| basename(p) == name));
+            assert_eq!(held, [s.mode == "full"; 3], "{:?}", s);
+        }
+    }
+
     // admin-minimal/ holds strings of its own, which a POI tier's names and
     // parent polygons don't point into: beside a POI tier the mode takes
     // admin-minimal-poi/, on the shared slots and strings.

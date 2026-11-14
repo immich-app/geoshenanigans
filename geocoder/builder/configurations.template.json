@@ -242,6 +242,7 @@
         "{region}/full/street_nodes.bin",
         "{region}/full/addr_points.bin",
         "{region}/full/addr_vertices.bin",
+        "{region}/full/addr_index.bin",
         "{region}/full/addr_postcodes.bin",
         "{region}/full/interp_ways.bin",
         "{region}/full/interp_nodes.bin",
