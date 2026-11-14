@@ -314,7 +314,7 @@ inline void encode_blob(const uint8_t* logical, uint64_t vertex_count, uint32_t 
     const int64_t rl = residual(bmin_lat, predicted.lat), rg = residual(bmin_lng, predicted.lng);
     const bool small = predicted.finite && fits(rl) && fits(rg);
 
-    const size_t at = out.size(), bbox = small ? 2 : 8, head = 1 + varint_size(oc) + bbox + 1;
+    const size_t at = out.size(), bbox = small ? 2 : 8, head = 1 + coord_keys::varint_size(oc) + bbox + 1;
     const uint64_t bits = uint64_t(oc) * (c.wl + c.wg);
     // Zeroed, with the 8 bytes to spare put_bits asks for.
     out.resize(at + head + size_t((bits + 7) / 8) + 8);
