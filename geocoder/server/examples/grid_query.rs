@@ -15,10 +15,12 @@
 // the point's primary features (Index::debug_primary): the winning address,
 // street and interpolation with their record ids, exact distances and tie
 // keys. Where two builds answer differently, equal distances and tie keys
-// say record order alone told the winners apart. On a root of continent
-// dirs it explains the first region that covers the point, as the server's
-// debug endpoint does, while the answer is the best of them all: "covering"
-// counts them, and above 1 the line may explain another region's winners.
+// say record order alone told the winners apart: two streets of one name
+// from one node, say. An interpolation's key is its whole content, so its
+// winner never depends on the order. On a root of continent dirs it explains
+// the first region that covers the point, as the server's debug endpoint
+// does, while the answer is the best of them all: "covering" counts them,
+// and above 1 the line may explain another region's winners.
 use query_server::{
     MultiIndex, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL,
 };

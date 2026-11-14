@@ -1479,6 +1479,25 @@ impl Index {
         (self.get_string(w.name_id), first.lat, first.lng)
     }
 
+    /// What decides between two interpolation lines at one exact distance
+    /// (lines that meet at the point): the street as text, the range, the
+    /// type, then the line's nodes. Lines equal in all of them are one line,
+    /// which the builder folds, so record order never decides.
+    fn interp_tie_key(&self, iw: &InterpWay) -> (Cow<'_, str>, u32, u32, u8, Vec<(f32, f32)>) {
+        let nodes = self.interp_nodes.as_ref().map_or_else(Vec::new, |file| {
+            let total = file.len() / std::mem::size_of::<NodeCoord>() as u64;
+            let first = iw.node_offset as u64;
+            (first..first + iw.node_count as u64)
+                .filter(|&at| at < total)
+                .map(|at| {
+                    let node: NodeCoord = file.read_at(at);
+                    (node.lat, node.lng)
+                })
+                .collect()
+        });
+        (self.get_string(iw.street_id), iw.start_number, iw.end_number, iw.interpolation, nodes)
+    }
+
     pub fn query_geo(&self, lat: f64, lng: f64)
         -> (Option<(f64, AddrPoint, u32)>, Option<(f64, Cow<'_, str>, u32, u32)>, Option<(f64, WayHeader, u32)>)
     {
@@ -1581,7 +1600,7 @@ impl Index {
                     let iw: InterpWay = interp_ways.read_at(id as u64);
                     if iw.start_number == 0 || iw.end_number == 0 { continue; }
                     let Some((dist, t)) = self.interp_way_position(&iw, lat, lng, cos_lat) else { continue };
-                    if dist < best_interp_dist {
+                    if beats(dist, best_interp_dist, || best_interp.as_ref().map(|b| (self.interp_tie_key(&iw), self.interp_tie_key(b)))) {
                         best_interp_dist = dist;
                         best_interp = Some(iw);
                         best_interp_t = t;
@@ -1667,7 +1686,8 @@ impl Index {
     /// house number. TIGER lines carry no parent street, so "of that
     /// street" is the name-token gate the TIGER postcode tier uses.
     /// Equally near lines (TIGER's odd and even sides share the street
-    /// centreline) go to the lower start number, not to record order.
+    /// centreline) go to the lower start number and type, then to the lesser
+    /// interp_tie_key, never to record order.
     pub fn find_interp_on_way(&self, lat: f64, lng: f64, street_name: &str, max_dist_sq: f64) -> Option<u32> {
         let interp_ways = self.interp_ways.as_ref()?;
         let total_interps = interp_ways.len() / std::mem::size_of::<InterpWay>() as u64;
@@ -1686,10 +1706,13 @@ impl Index {
                 if !street_tokens_overlap(&self.get_string(iw.street_id), street_name) { continue; }
                 let Some((dist, t)) = self.interp_way_position(&iw, lat, lng, cos_lat) else { continue };
                 if dist >= max_dist_sq { continue; }
+                let range = |w: &InterpWay| (w.start_number, w.interpolation);
                 let better = match best {
                     None => true,
                     Some((bd, bw, _)) => dist < bd
-                        || (dist == bd && (iw.start_number, iw.interpolation) < (bw.start_number, bw.interpolation)),
+                        || (dist == bd
+                            && (range(&iw) < range(&bw)
+                                || (range(&iw) == range(&bw) && self.interp_tie_key(&iw) < self.interp_tie_key(&bw)))),
                 };
                 if better { best = Some((dist, iw, t)); }
             }
@@ -1701,16 +1724,17 @@ impl Index {
     // Debug helper — returns primary feature distances + names. Each of
     // the address, street and interpolation winners also comes with what
     // tells two builds' answers apart: its record id, its distance exactly
-    // (`dist_bits`, the bits of the squared distance the scan compared) and,
-    // for an address or a street, the key that breaks an exact tie (`tie`,
-    // floats as their bits, -0 as +0 since the scan compares them equal).
-    // Two winners with equal `dist_bits` and `tie` were told apart by record
-    // order alone.
+    // (`dist_bits`, the bits of the squared distance the scan compared) and
+    // the key that breaks an exact tie (`tie`, floats as their bits, -0 as
+    // +0 since the scan compares them equal). Two winners with equal
+    // `dist_bits` and `tie` were told apart by record order alone; an
+    // interpolation's key is its whole content, so two such are one line.
     pub fn debug_primary(&self, lat: f64, lng: f64) -> serde_json::Value {
         let (addr, interp, street) = self.query_geo(lat, lng);
         let poi_primary = self.find_nearest_poi_with_parent(lat, lng);
         let to_m = |d2: f64| (d2.sqrt() * 6_371_000.0) as f64;
         let bits = |d: f64| format!("{:016x}", d.to_bits());
+        let float_bits = |v: f32| format!("{:08x}", if v == 0.0 { 0 } else { v.to_bits() });
         let cos_lat = lat.to_radians().cos();
         serde_json::json!({
             "addr": addr.map(|(d, p, id)| {
@@ -1733,7 +1757,6 @@ impl Index {
                 "dist_bits": bits(d),
                 "tie": self.street_nodes.as_ref().map(|nodes| {
                     let (name, first_lat, first_lng) = self.street_tie_key(nodes, &w);
-                    let float_bits = |v: f32| format!("{:08x}", if v == 0.0 { 0 } else { v.to_bits() });
                     serde_json::json!([name, float_bits(first_lat), float_bits(first_lng)])
                 }),
             })),
@@ -1743,6 +1766,11 @@ impl Index {
                 "number": n,
                 "id": id,
                 "dist_bits": bits(d),
+                "tie": self.interp_ways.as_ref().map(|ways| {
+                    let (street, start, end, kind, nodes) = self.interp_tie_key(&ways.read_at::<InterpWay>(id as u64));
+                    let nodes: String = nodes.iter().map(|&(lat, lng)| float_bits(lat) + &float_bits(lng)).collect();
+                    serde_json::json!([street, start, end, kind, nodes])
+                }),
             })),
             "poi": poi_primary.map(|(d, p)| serde_json::json!({
                 "dist_m": to_m(d),
@@ -6401,6 +6429,26 @@ mod query_path_tests {
         polygons: Vec<(AdminPolygon, Vec<NodeCoord>)>,
         place_nodes: Vec<PlaceNode>,
         streets: Vec<(u32, Vec<NodeCoord>)>,
+        interps: Vec<TestInterp>,
+    }
+
+    /// An interpolation line: its street, its numbers from the first node
+    /// to the last, its type (0: every number) and its nodes.
+    struct TestInterp {
+        street_id: u32,
+        numbers: (u32, u32),
+        kind: u8,
+        line: Vec<NodeCoord>,
+    }
+
+    /// Lists `id` in `table` of every street cell the line meets.
+    fn list_line(cells: &mut BTreeMap<u64, [Vec<u32>; geo_index::TABLES]>, table: usize, id: u32, line: &[NodeCoord]) {
+        for segment in line.windows(2) {
+            for cell in cells_meeting(segment, DEFAULT_STREET_CELL_LEVEL) {
+                let ids = &mut cells.entry(cell).or_default()[table];
+                if !ids.contains(&id) { ids.push(id); }
+            }
+        }
     }
 
     impl TestIndex {
@@ -6459,10 +6507,19 @@ mod query_path_tests {
             self
         }
 
+        /// An interpolation line along `points_m`. The geo index it is
+        /// listed in comes with the street files: add a street too.
+        fn interp(&mut self, street: &str, numbers: (u32, u32), kind: u8, points_m: &[(f64, f64)]) -> &mut Self {
+            let street_id = self.string(street);
+            let line = points_m.iter().map(|&(n, e)| at_from(self.origin, n, e)).collect();
+            self.interps.push(TestInterp { street_id, numbers, kind, line });
+            self
+        }
+
         /// The files as the builder writes them, by name. A boundary is
         /// listed in every admin cell meeting its box, flagged interior where
-        /// the cell lies inside it; a place node in its own cell; a street in
-        /// the street cells along it.
+        /// the cell lies inside it; a place node in its own cell; a street or
+        /// an interpolation line in the street cells along it.
         fn files(&self) -> Vec<(&'static str, Vec<u8>)> {
             let mut arcs = arc_fixture::ArcFixture::new();
             let mut admin_cells: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
@@ -6487,9 +6544,10 @@ mod query_path_tests {
                               (place_files::HIDDEN_FILE, places.hidden)]);
             }
 
+            assert!(self.interps.is_empty() || !self.streets.is_empty(), "the geo index comes with the street files");
             if !self.streets.is_empty() {
                 let (mut ways, mut nodes) = (Vec::new(), Vec::new());
-                let mut street_cells: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
+                let mut geo_cells: BTreeMap<u64, [Vec<u32>; geo_index::TABLES]> = BTreeMap::new();
                 for (id, (name_id, line)) in self.streets.iter().enumerate() {
                     ways.extend_from_slice(&((nodes.len() / std::mem::size_of::<NodeCoord>()) as u32).to_le_bytes());
                     ways.extend_from_slice(&(line.len() as u16).to_le_bytes());
@@ -6499,16 +6557,30 @@ mod query_path_tests {
                         nodes.extend_from_slice(&v.lat.to_le_bytes());
                         nodes.extend_from_slice(&v.lng.to_le_bytes());
                     }
-                    for segment in line.windows(2) {
-                        for cell in cells_meeting(segment, DEFAULT_STREET_CELL_LEVEL) {
-                            let ids = street_cells.entry(cell).or_default();
-                            if !ids.contains(&(id as u32)) { ids.push(id as u32); }
-                        }
-                    }
+                    list_line(&mut geo_cells, geo_index::STREETS, id as u32, line);
                 }
                 assert_eq!(ways.len(), self.streets.len() * std::mem::size_of::<WayHeader>());
-                let rows: Vec<(u64, [Vec<u32>; geo_index::TABLES])> = street_cells.into_iter()
-                    .map(|(cell, mut ids)| { ids.sort_unstable(); (cell, [ids, vec![], vec![]]) })
+                if !self.interps.is_empty() {
+                    let (mut records, mut interp_nodes) = (Vec::new(), Vec::new());
+                    for (id, interp) in self.interps.iter().enumerate() {
+                        records.extend_from_slice(&((interp_nodes.len() / std::mem::size_of::<NodeCoord>()) as u32).to_le_bytes());
+                        records.extend_from_slice(&(interp.line.len() as u16).to_le_bytes());
+                        records.extend_from_slice(&[0, 0]);
+                        records.extend_from_slice(&interp.street_id.to_le_bytes());
+                        records.extend_from_slice(&interp.numbers.0.to_le_bytes());
+                        records.extend_from_slice(&interp.numbers.1.to_le_bytes());
+                        records.extend_from_slice(&[interp.kind, 0, 0, 0]);
+                        for v in &interp.line {
+                            interp_nodes.extend_from_slice(&v.lat.to_le_bytes());
+                            interp_nodes.extend_from_slice(&v.lng.to_le_bytes());
+                        }
+                        list_line(&mut geo_cells, geo_index::INTERPOLATIONS, id as u32, &interp.line);
+                    }
+                    assert_eq!(records.len(), self.interps.len() * std::mem::size_of::<InterpWay>());
+                    files.extend([("interp_ways.bin", records), ("interp_nodes.bin", interp_nodes)]);
+                }
+                let rows: Vec<(u64, [Vec<u32>; geo_index::TABLES])> = geo_cells.into_iter()
+                    .map(|(cell, mut lists)| { lists.iter_mut().for_each(|ids| ids.sort_unstable()); (cell, lists) })
                     .collect();
                 let (top, blocks) = geo_index::write(&rows);
                 files.extend([("geo_cells.bin", top), ("geo_entries.bin", blocks),
@@ -6757,6 +6829,49 @@ mod query_path_tests {
         assert_eq!(far["street"]["name"], "Far Road");
         assert_eq!(far["street"]["id"], 2);
         assert_ne!(far["street"]["tie"], a["street"]["tie"]);
+    }
+
+    #[test]
+    fn equally_near_interpolation_lines_go_by_content_whatever_their_record_order() {
+        type Line<'a> = (&'a str, (u32, u32), &'a [(f64, f64)]);
+        let (north, east): (&[(f64, f64)], &[(f64, f64)]) = (&[(0.0, 0.0), (200.0, 0.0)], &[(0.0, 0.0), (0.0, 200.0)]);
+        // Through the corner, which is its middle node, half way along.
+        let through: &[(f64, f64)] = &[(-200.0, 0.0), (0.0, 0.0), (0.0, 200.0)];
+        let (lat, lng) = (at(0.0, 0.0).lat as f64, at(0.0, 0.0).lng as f64);
+        // Two lines that touch the corner, both at distance 0 from it, as
+        // records 0 and 1 or the other way round.
+        let pair = |a: Line, b: Line, swap: bool| {
+            let (first, second) = if swap { (b, a) } else { (a, b) };
+            TestIndex::new()
+                .street("Far Road", &[(900.0, 900.0), (900.0, 1000.0)])
+                .interp(first.0, first.1, 0, first.2)
+                .interp(second.0, second.1, 0, second.2)
+                .load()
+        };
+        for swap in [false, true] {
+            let second = if swap { 0 } else { 1 };
+            // Two streets: the one that sorts first as text.
+            let index = pair(("Pine Hill Road", (1, 99), north), ("Clemmons Street", (2, 98), east), swap);
+            let (dist, street, number, id) = index.query_geo(lat, lng).1.unwrap();
+            assert_eq!((dist, &*street, number, id), (0.0, "Clemmons Street", 2, second));
+            let primary = index.debug_primary(lat, lng);
+            assert_eq!(primary["interp"]["dist_bits"], format!("{:016x}", 0f64.to_bits()));
+            assert_eq!(primary["interp"]["tie"][0], "Clemmons Street");
+            assert_eq!(primary["interp"]["tie"][1], 2);
+
+            // One street: the lower start, then the lower end.
+            let index = pair(("Fork Road", (3, 9), north), ("Fork Road", (1, 9), east), swap);
+            assert_eq!(index.query_geo(lat, lng).1.unwrap().3, second);
+            let index = pair(("Fork Road", (1, 9), north), ("Fork Road", (1, 5), east), swap);
+            assert_eq!(index.query_geo(lat, lng).1.unwrap().3, second);
+            assert_eq!(index.find_interp_on_way(lat, lng, "Fork Road", f64::MAX), Some(1));
+
+            // One street and range: the line whose nodes sort first, which
+            // starts south of the corner and is half way to 9 there.
+            let index = pair(("Fork Road", (1, 9), north), ("Fork Road", (1, 9), through), swap);
+            assert_eq!(index.query_geo(lat, lng).1.unwrap().2, 5);
+            assert_eq!(index.find_interp_on_way(lat, lng, "Fork Road", f64::MAX), Some(5));
+        }
     }
 
     #[test]
