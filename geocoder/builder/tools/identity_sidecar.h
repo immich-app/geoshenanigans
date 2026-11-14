@@ -1,17 +1,37 @@
-// Identity sidecars (GCPATCH v8): geocoder-diff --identity matches street /
-// interp / addr records across days by one stable entity key (u32) per
-// record, read from <META>/{street,interp,addr}.slot.u32
-// (tools/gen_identity_sidecar.py writes them).
+// Identity keys (GCPATCH v8): geocoder-diff matches street / interp / addr
+// records across days by one stable entity key (u32) per record. With
+// --identity-slots the keys come from the records of a day built in stable
+// slots (slot_identity_keys); with --identity they are read from the
+// sidecars <META>/{street,interp,addr}.slot.u32.
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "parallel.h"
+
+// A family's keys from its records, for a day built in stable slots
+// (strategy 2): a slot live on two days holds the same entity, so a live
+// record's key is its index, and a tombstone's (the family's fill of a slot
+// without an entity, types.h) is NO_DATA. `records` holds size / sizeof(Record)
+// whole records. Empty for no records: the family then merges by content.
+template <class Record>
+std::vector<uint32_t> slot_identity_keys(const char* records, size_t size, const Record& tombstone) {
+    static_assert(std::is_trivially_copyable_v<Record>, "a record is compared with the tombstone byte by byte");
+    constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
+    std::vector<uint32_t> keys(size / sizeof(Record));
+    parallel_for(keys.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++)
+            keys[i] = memcmp(records + i * sizeof(Record), &tombstone, sizeof(Record)) == 0 ? NO_DATA : static_cast<uint32_t>(i);
+    });
+    return keys;
+}
 
 // A family's keys from its sidecar's bytes: one per record, or empty when
 // the sidecar is not exactly one u32 per record (the family then merges by

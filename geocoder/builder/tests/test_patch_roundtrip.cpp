@@ -133,11 +133,12 @@ bool write_sidecars(const std::string& path, const Sidecars& keys) {
 }
 
 // The files of the patched dir that are missing, extra or not new's bytes
-// ("diff failed" / "patch failed" when a tool exits non-zero), and the
-// tools' log.
+// ("diff failed" / "patch failed" when a tool exits non-zero), the tools'
+// log, and the patch file the diff wrote.
 struct RoundTrip {
     std::vector<std::string> mismatches;
     std::string log;
+    std::vector<char> patch;
 };
 
 // Diffs old -> new (with diff_options), applies the patch to old and
@@ -171,6 +172,7 @@ RoundTrip round_trip(const BuildDir& old_files, const BuildDir& new_files, const
     }
     auto text = read_file(log);
     r.log.assign(text.begin(), text.end());
+    r.patch = read_file(patch);
     if (!bad.empty()) {
         for (const auto& b : bad) std::printf("    round trip: %s\n", b.c_str());
         std::printf("%s\n", r.log.c_str());
@@ -287,6 +289,72 @@ void put_identity_interps(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
     ids.new_keys["interp"] = {3, 0, 1, 13};
     old_d["interp_postcodes.bin"] = bytes_of(std::vector<uint32_t>{OLD_B, OLD_C, OLD_A, OLD_C});
     new_d["interp_postcodes.bin"] = bytes_of(std::vector<uint32_t>{NEW_C, NEW_B, NEW_D, NO_DATA});
+}
+
+// A day's keys by slot, as geocoder-diff --identity-slots takes them from the
+// records: record i's key is i, or NO_DATA where `dead` lists it.
+std::vector<uint32_t> slot_keys(uint32_t n, const std::vector<uint32_t>& dead) {
+    std::vector<uint32_t> keys(n);
+    for (uint32_t i = 0; i < n; i++) keys[i] = i;
+    for (uint32_t i : dead) keys[i] = NO_DATA;
+    return keys;
+}
+
+// Streets of two days built in stable slots (slot: old -> new), and the
+// sidecars of their slot keys:
+//   0: MATCH               (B, nodes 1 2)
+//   1: dies                (A, node 3 -> a tombstone)
+//   2: REPLACE             (C -> D, nodes 4 5 -> 4 9 5), node offset 3 -> 2
+//   3: refilled            (a tombstone -> B, node 6)
+//   4: MATCH               (C, node 7), node offset 5 -> 6
+//   5: appended            (C, node 8)
+void put_slot_streets(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
+    const WayHeader dead = street_way_tombstone();
+    old_d["street_ways.bin"] = bytes_of(std::vector<WayHeader>{
+        {0, 2, 0, OLD_B}, {2, 1, 0, OLD_A}, {3, 2, 0, OLD_C}, dead, {5, 1, 0, OLD_C}});
+    old_d["street_nodes.bin"] = nodes_of({1, 2, 3, 4, 5, 7});
+    new_d["street_ways.bin"] = bytes_of(std::vector<WayHeader>{
+        {0, 2, 0, NEW_B}, dead, {2, 3, 0, NEW_D}, {5, 1, 0, NEW_B}, {6, 1, 0, NEW_C}, {7, 1, 0, NEW_C}});
+    new_d["street_nodes.bin"] = nodes_of({1, 2, 4, 9, 5, 6, 7, 8});
+    ids.old_keys["street"] = slot_keys(5, {3});
+    ids.new_keys["street"] = slot_keys(6, {1});
+}
+
+// Addresses on put_slot_streets' streets, in stable slots (slot: old -> new):
+//   0: MATCH               (B, on street 0)
+//   1: refilled            (a tombstone -> D, on the appended street 5)
+//   2: REPLACE             (C -> D, on street 2), polygon of vertices 1 2 -> 1 9 2
+//   3: dies                (A, on the dead street 1 -> a tombstone)
+//   4: MATCH               (B, on street 4), polygon 3 4, vertex offset 16 -> 24
+void put_slot_addresses(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
+    const AddrPoint dead = addr_point_tombstone();
+    old_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{
+        {48.0f, 11.0f, OLD_B, OLD_B, 0, NO_DATA, 0}, dead, {48.0f, 11.0f, OLD_C, OLD_C, 2, 0, 2},
+        {48.0f, 11.0f, OLD_A, OLD_A, 1, NO_DATA, 0}, {48.0f, 11.0f, OLD_B, OLD_B, 4, 16, 2}});
+    old_d["addr_vertices.bin"] = nodes_of({1, 2, 3, 4});
+    new_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{
+        {48.0f, 11.0f, NEW_B, NEW_B, 0, NO_DATA, 0}, {48.0f, 11.0f, NEW_D, NEW_D, 5, NO_DATA, 0},
+        {48.0f, 11.0f, NEW_D, NEW_D, 2, 0, 3}, dead, {48.0f, 11.0f, NEW_B, NEW_B, 4, 24, 2}});
+    new_d["addr_vertices.bin"] = nodes_of({1, 9, 2, 3, 4});
+    ids.old_keys["addr"] = slot_keys(5, {1});
+    ids.new_keys["addr"] = slot_keys(5, {3});
+}
+
+// Interpolations in stable slots (slot: old -> new):
+//   0: REPLACE             (B 1-9 -> 1-11, nodes 1 2 -> 1 9 2)
+//   1: MATCH               (C 2-8, node 3), node offset 2 -> 3
+//   2: dies                (A 1-5, node 4 -> a tombstone)
+//   3: refilled            (a tombstone -> D 1-3, node 6)
+void put_slot_interps(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
+    const InterpWay dead = interp_way_tombstone();
+    old_d["interp_ways.bin"] = bytes_of(std::vector<InterpWay>{
+        {0, 2, 0, OLD_B, 1, 9, 0}, {2, 1, 0, OLD_C, 2, 8, 0}, {3, 1, 0, OLD_A, 1, 5, 0}, dead});
+    old_d["interp_nodes.bin"] = nodes_of({1, 2, 3, 4});
+    new_d["interp_ways.bin"] = bytes_of(std::vector<InterpWay>{
+        {0, 3, 0, NEW_B, 1, 11, 0}, {3, 1, 0, NEW_C, 2, 8, 0}, dead, {4, 1, 0, NEW_D, 1, 3, 0}});
+    new_d["interp_nodes.bin"] = nodes_of({1, 9, 2, 3, 6});
+    ids.old_keys["interp"] = slot_keys(4, {3});
+    ids.new_keys["interp"] = slot_keys(4, {2});
 }
 
 // way_parents.bin of SPARSE_RECORDS admin slots, the SPARSE_CHANGES
@@ -1029,6 +1097,77 @@ TEST(patch_round_trip_warns_of_each_rejected_identity_sidecar_and_merges_its_fam
     CHECK(logged(r, "old-meta/interp.slot.u32 rejected (0 bytes for 4 records); interp merges by content"));
     CHECK(!logged(r, "old-meta/street.slot.u32"));
     CHECK(!logged(r, " identity: match="));
+}
+
+// geocoder-diff --identity-slots takes the keys of a day built in stable
+// slots from its records, a live record's index and NO_DATA for a tombstone:
+// the patch is the one --identity writes from sidecars of those keys, byte
+// for byte.
+TEST(patch_round_trip_by_slot_identity_gives_the_patch_the_sidecars_gave) {
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+    Identity ids;
+    put_slot_streets(old_d, new_d, ids);
+    put_slot_addresses(old_d, new_d, ids);
+    put_slot_interps(old_d, new_d, ids);
+    put_geo_cells(old_d, {{CELL, {0, 1, 2, 4}, {0, 2, 3, 4}, {0, 1, 2}}, {CELL_2, {2, 4}, {0, 4}, {1}}});
+    put_geo_cells(new_d, {{CELL, {0, 2, 3, 4, 5}, {0, 1, 2, 4}, {0, 1, 3}}, {CELL_2, {2, 4}, {0, 4}, {1}}});
+
+    const RoundTrip by_sidecar = round_trip(old_d, new_d, ids);
+    const RoundTrip by_slot = round_trip(old_d, new_d, {}, {"--identity-slots"});
+
+    for (const RoundTrip* r : {&by_sidecar, &by_slot}) {
+        CHECK(r->mismatches.empty());
+        CHECK(logged(*r, "street_ways identity: match=2 replace=1 insert=3 delete=2 moved=0"));
+        CHECK(logged(*r, "addr_points identity: match=2 replace=1 insert=2 delete=2 moved=0"));
+        CHECK(logged(*r, "interp_ways identity: match=1 replace=1 insert=2 delete=2 moved=0"));
+    }
+    CHECK(!by_slot.patch.empty());
+    CHECK(by_slot.patch == by_sidecar.patch);
+}
+
+// A family a day has no record of has no keys that day: under
+// --identity-slots it merges by content, as it does without its sidecar, and
+// the other families by slot.
+TEST(patch_round_trip_by_slot_identity_merges_a_family_a_day_lacks_by_content) {
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+    Identity ids, interp_ids;
+    put_slot_streets(old_d, new_d, ids);
+    BuildDir no_interps;
+    put_slot_interps(no_interps, new_d, interp_ids);
+    ids.new_keys["interp"] = interp_ids.new_keys["interp"];
+    put_geo_cells(old_d, {{CELL, {0, 1, 2, 4}, {}, {}}});
+    put_geo_cells(new_d, {{CELL, {0, 2, 3, 4, 5}, {}, {0, 1, 3}}});
+
+    const RoundTrip by_sidecar = round_trip(old_d, new_d, ids);
+    const RoundTrip by_slot = round_trip(old_d, new_d, {}, {"--identity-slots"});
+
+    for (const RoundTrip* r : {&by_sidecar, &by_slot}) {
+        CHECK(r->mismatches.empty());
+        CHECK(logged(*r, "street_ways identity: match=2 replace=1 insert=3 delete=2 moved=0"));
+        CHECK(!logged(*r, "interp_ways identity:"));
+        CHECK(!logged(*r, "addr_points identity:"));
+    }
+    CHECK(!by_slot.patch.empty());
+    CHECK(by_slot.patch == by_sidecar.patch);
+}
+
+// The keys come from the sidecars or from the records, never both.
+TEST(patch_diff_refuses_identity_slots_beside_identity_sidecars) {
+    ScratchDir dir("identity-options");
+    const std::string old_dir = dir.path() + "/old", new_dir = dir.path() + "/new", patch = dir.path() + "/p.gcpatch";
+    const std::string log = dir.path() + "/tools.log";
+    REQUIRE(write_dir(old_dir, with_pool(OLD_POOL)) && write_dir(new_dir, with_pool(NEW_POOL)));
+
+    for (const std::vector<std::string>& options : {std::vector<std::string>{"--identity", old_dir, new_dir, "--identity-slots"},
+                                                    std::vector<std::string>{"--identity-slots", "--identity", old_dir, new_dir}}) {
+        std::filesystem::remove(log);
+        std::vector<std::string> diff = {GEOCODER_DIFF_BIN, old_dir, new_dir, "-o", patch};
+        diff.insert(diff.end(), options.begin(), options.end());
+        CHECK(!run(diff, log));
+        const std::vector<char> text = read_file(log);
+        CHECK(std::string(text.begin(), text.end()).find("--identity and --identity-slots both give the keys") != std::string::npos);
+        CHECK(!std::filesystem::exists(patch));
+    }
 }
 
 // The patch path is one argument to the decompressor whatever its

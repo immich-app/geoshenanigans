@@ -7,18 +7,22 @@
 //
 // Patch format: custom binary, zstd-compressed as a whole for transport.
 //
-// Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META] [--string-pairs-max N]
-//                      [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N] [--file-records-max N]
+// Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity-slots | --identity OLD_META NEW_META]
+//                      [--string-pairs-max N] [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N]
+//                      [--file-records-max N]
 //        geocoder-diff --decode-logical <dir> <out-dir>
 //
 // --decode-logical writes the logical files the merges read of the families
 // the builder writes encoded (logical_families), and no patch.
 //
-// GCPATCH v8: with --identity, street / interp / addr records match across
-// days by the server-side identity sidecars <META>/{street,interp,addr}.slot.u32
-// (record id -> stable entity key; tools/gen_identity_sidecar.py writes them
-// for stable-slot days), not by content; see build_identity_merge_seq and
-// PARALLEL_DELTA_STRIDE. Without --identity the families merge by content.
+// GCPATCH v8: street / interp / addr records match across days by one stable
+// entity key per record, not by content; see build_identity_merge_seq and
+// PARALLEL_DELTA_STRIDE. --identity-slots takes the keys from the records, for
+// two days built in stable slots (<new-dir> with --prev-output from
+// <old-dir>'s build): a record's key is its index, a tombstone has none
+// (slot_identity_keys). --identity reads them from the sidecars
+// <META>/{street,interp,addr}.slot.u32 (record id -> key). Without either the
+// families merge by content.
 
 #include <algorithm>
 #include <array>
@@ -58,6 +62,7 @@
 #include "scratch_dir.h"
 #include "record_match.h"
 #include "string_offset_map.h"
+#include "types.h"
 
 // Section offset probes for the section-size breakdown (built with -DSEC_PROBES).
 #ifdef SEC_PROBES
@@ -1011,8 +1016,8 @@ static constexpr MergedFile MERGED_FILES[] = {
 
 static int run(int argc, char* argv[]) {
     const char* usage =
-        "Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META] [--string-pairs-max N]"
-        " [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N] [--file-records-max N]\n"
+        "Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity-slots | --identity OLD_META NEW_META]"
+        " [--string-pairs-max N] [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N] [--file-records-max N]\n"
         "       geocoder-diff --decode-logical <dir> <out-dir>";
     if (argc >= 2 && std::string(argv[1]) == "--decode-logical") {
         if (argc != 4) {
@@ -1027,6 +1032,7 @@ static int run(int argc, char* argv[]) {
     }
     std::string old_dir = argv[1], new_dir = argv[2], patch_path = argv[4];
     std::string id_old_meta, id_new_meta;
+    bool identity_slots = false;
     // The most moved strings the strings section sends as pairs; more go as
     // string fixups. Lower for tests.
     uint32_t string_pairs_max = STRING_PAIRS_MAX;
@@ -1039,6 +1045,7 @@ static int run(int argc, char* argv[]) {
     for (int a = 5; a < argc; a++) {
         const std::string arg = argv[a];
         if (arg == "--identity" && a + 2 < argc) { id_old_meta = argv[a + 1]; id_new_meta = argv[a + 2]; a += 2; }
+        else if (arg == "--identity-slots") identity_slots = true;
         else if (arg == "--string-pairs-max" && a + 1 < argc) {
             if (!u32_option(arg, argv[++a], STRING_PAIRS_MAX, string_pairs_max)) return 1;
         }
@@ -1052,6 +1059,10 @@ static int run(int argc, char* argv[]) {
             if (!u32_option(arg, argv[++a], FILE_RECORDS_MAX, file_records_max)) return 1;
         }
         else { std::cerr << "Unknown argument " << arg << std::endl << usage << std::endl; return 1; }
+    }
+    if (identity_slots && !id_old_meta.empty()) {
+        std::cerr << "--identity and --identity-slots both give the keys" << std::endl << usage << std::endl;
+        return 1;
     }
     ScratchDir scratch("geocoder-diff");
     {
@@ -1089,11 +1100,24 @@ static int run(int argc, char* argv[]) {
         }
         return identity_keys(bytes, n_records);
     };
-    // A family's identity sidecars when both days have one per record.
-    auto identity_of = [&](const char* family, size_t old_n, size_t new_n)
+    static_assert(sizeof(WayHeader) == WAY_HEADER_STRIDE && sizeof(InterpWay) == INTERP_WAY_STRIDE &&
+                      sizeof(AddrPoint) == ADDR_POINT_STRIDE,
+                  "a family's tombstone is one record of its merge's stride");
+    // A family's keys on both days, when both have one per record: from the
+    // records its merge maps, before any remap (--identity-slots; tombstone
+    // is the family's, types.h), or from the days' sidecars (--identity).
+    // None: the family merges by content.
+    auto identity_of = [&](const char* family, const auto& tombstone, const char* old_recs, size_t old_size,
+                           const char* new_recs, size_t new_size)
             -> std::pair<std::vector<uint32_t>, std::vector<uint32_t>> {
-        if (id_old_meta.empty()) return {};
-        auto ok = load_identity(id_old_meta, family, old_n), nk = load_identity(id_new_meta, family, new_n);
+        std::vector<uint32_t> ok, nk;
+        if (identity_slots) {
+            ok = slot_identity_keys(old_recs, old_size, tombstone);
+            nk = slot_identity_keys(new_recs, new_size, tombstone);
+        } else if (!id_old_meta.empty()) {
+            ok = load_identity(id_old_meta, family, old_size / sizeof tombstone);
+            nk = load_identity(id_new_meta, family, new_size / sizeof tombstone);
+        }
         if (ok.empty() || nk.empty()) return {};
         return {std::move(ok), std::move(nk)};
     };
@@ -1203,6 +1227,7 @@ static int run(int argc, char* argv[]) {
     // Build patch data (uncompressed, will be zstd-compressed at the end)
     std::vector<char> patch;
     if (!id_old_meta.empty()) std::cerr << "Identity sidecars: " << id_old_meta << " -> " << id_new_meta << std::endl;
+    if (identity_slots) std::cerr << "Identity keys: each record's slot" << std::endl;
     patch.insert(patch.end(), GCPATCH_MAGIC, GCPATCH_MAGIC + 8);
     uint32_t ver = GCPATCH_VERSION, flags = 0; // custom merge-sequence format
     wval(patch, &ver, 4); wval(patch, &flags, 4);
@@ -1357,7 +1382,7 @@ static int run(int argc, char* argv[]) {
         // patcher then copies old and derives no remap).
         std::pair<std::vector<uint32_t>, std::vector<uint32_t>> addr_ids;
         if (addr_stride >= 28 && !same_bytes(old_m.data, old_m.size, new_m.data, new_m.size))
-            addr_ids = identity_of("addr", old_m.size / addr_stride, new_m.size / addr_stride);
+            addr_ids = identity_of("addr", addr_point_tombstone(), old_m.data, old_m.size, new_m.data, new_m.size);
         const bool addr_identity = !addr_ids.first.empty();
         const bool unchanged = sent_unchanged(old_m.data, old_m.size, new_m.data, new_m.size);
         remap_addr_points(old_m.data, old_m.size, str_remap);
@@ -1498,7 +1523,7 @@ static int run(int argc, char* argv[]) {
         const bool unchanged = !street_from_fallback && sent_unchanged(old_w.data, old_w.size, new_w.data, new_w.size);
         std::pair<std::vector<uint32_t>, std::vector<uint32_t>> street_ids;
         if (!street_from_fallback && !same_bytes(old_w.data, old_w.size, new_w.data, new_w.size))
-            street_ids = identity_of("street", old_w.size / way_stride, new_w.size / way_stride);
+            street_ids = identity_of("street", street_way_tombstone(), old_w.data, old_w.size, new_w.data, new_w.size);
 
         // Variants without their own street_ways (admin, admin-minimal,
         // poi tiers) borrow the sibling /full/ copy. They emit no street
@@ -1598,7 +1623,7 @@ static int run(int argc, char* argv[]) {
         auto new_data = mmap_file_rw(new_dir + "/interp_ways.bin");
         std::pair<std::vector<uint32_t>, std::vector<uint32_t>> interp_ids;
         if (!same_bytes(old_data.data, old_data.size, new_data.data, new_data.size))
-            interp_ids = identity_of("interp", old_data.size / interp_stride, new_data.size / interp_stride);
+            interp_ids = identity_of("interp", interp_way_tombstone(), old_data.data, old_data.size, new_data.data, new_data.size);
         const bool unchanged = sent_unchanged(old_data.data, old_data.size, new_data.data, new_data.size);
         remap_string_fields(old_data.data, old_data.size, PatchFileId::INTERP_WAYS, interp_stride, str_remap);
         auto old_n = mmap_file(old_dir + "/interp_nodes.bin");

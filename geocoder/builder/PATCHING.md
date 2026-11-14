@@ -51,10 +51,12 @@ Most of the old bytes were bookkeeping the patcher can derive:
 
 ### GCPATCH v8 on planet (2026-10-11 → 12 and 10-12 → 13)
 
-v8 matches street / interp / addr records across days by a server-side
-identity sidecar instead of by content (`geocoder-diff --identity`; on the
-published stable-slot days the key is the slot, see
-`tools/gen_identity_sidecar.py`). Measured 2026-10-14 on planet/full of the
+v8 matches street / interp / addr records across days by one stable entity
+key per record instead of by content. On the published stable-slot days the
+key is the slot: `geocoder-diff --identity-slots` takes it from the records,
+a live record's index and none for a tombstone (`tools/identity_sidecar.h`).
+`geocoder-diff --identity` reads the keys from sidecar files instead, one u32
+per record. Measured 2026-10-14 on planet/full of the
 published days against the nightly's v7 patches (cold cache, `geocoder-patch`
 on 1 core, every apply byte-identical to the new day):
 
@@ -64,11 +66,12 @@ on 1 core, every apply byte-identical to the new day):
 | 10-11 → 12 | 2.78 MiB | **2.46 MiB** (−11.6%) | 209 s | **165 s** (−21%) | 390 s / 36.7 GiB | 211 s / 24.9 GiB |
 
 planet/quality/uncapped and planet/poi/all patch to within a few bytes of v7
-(no street / interp / addr records). Without `--identity` the families merge
+(no street / interp / addr records). Without either option the families merge
 by content as in v7, with the rest of the v8 format. The nightly diffs every
-variant by identity: `tools/generate_patches.sh` writes both days' sidecars
-(each day is built with `--prev-output` from the last), and the diff warns of
-a sidecar it rejects, naming the family that then merges by content.
+variant by slot: `tools/generate_patches.sh` passes `--identity-slots` (each
+day is built with `--prev-output` from the last). A family one of the days
+has no record of merges by content, and so does one whose `--identity`
+sidecar the diff rejects, with a warning that names it.
 
 The tables below predate all of these changes.
 
