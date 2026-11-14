@@ -1987,6 +1987,35 @@ TEST(patch_heap_stays_flat_as_streets_move) {
     }, 10000).empty());
 }
 
+// Two side files of n values that follow no records: way_parents.bin, a
+// value in a thousand another on the new day (a sparse delta over the old
+// values), and way_postcodes.bin, which the old day lacks (a full replacement,
+// handed to its encoder whole). The codecs hold a block of either, and each
+// new file's block table waits in its scratch file.
+TEST(patch_heap_stays_flat_as_side_files_grow) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::vector<char> parents, changed, postcodes;
+        for (uint32_t v = 0; v < n; v++) {
+            append(parents, v % 50000);
+            append(changed, v % 50000 + (v % 1000 == 7));
+            append(postcodes, v / 3 * 8);
+        }
+        if (std::string e = prepare(c, {{"way_parents.bin", parents}}, {{"way_parents.bin", changed}, {"way_postcodes.bin", postcodes}});
+            !e.empty())
+            return e;
+        // way_postcodes.bin's section: a full replacement (stride 0, no
+        // fixups) of no old values by the new ones' bytes.
+        std::vector<char> head;
+        append(head, static_cast<uint32_t>(PatchFileId::WAY_POSTCODES));
+        append(head, 0u);
+        append(head, uint64_t{0});
+        append(head, uint64_t{4} * n);
+        append(head, 0u);
+        append(head, uint64_t{4} * n);
+        return patch_holds(c, head, "full replacement of " + std::to_string(n) + " values");
+    }, 400000).empty());
+}
+
 // The diff sends the moved strings as pairs up to its cap and as string
 // fixups past it (GCPATCH v12): 99 moved POI names go as 99 pairs under a cap
 // of 99, and as the POI merge's 99 string fixups, with no pair, under a cap of
@@ -2667,6 +2696,29 @@ TEST(patch_refuses_cell_index_delta_ranks_that_wrap_32_bits) {
         {"gone", cell_delta_payload({two32 + 2}, {}, {}, {}), "Malformed cell list delta: a gone rank past the last source cell"},
         {"count", counted, "Malformed cell list delta"},
     });
+}
+
+// An old side file the builder would not write (its first block's mode byte
+// is neither of the two) is refused by name in every mode as the patcher
+// reads its values, though its footer gives the size the patch expects. The
+// patch applies to the file as written.
+TEST(patch_refuses_an_old_side_file_the_builder_would_not_write) {
+    ScratchDir dir("patch-old-side");
+    std::vector<char> parents, changed;
+    for (uint32_t v = 0; v < 4096; v++) {
+        append(parents, v);
+        append(changed, v + (v == 2000));
+    }
+    const LowMemCase c{dir.path(), "side"};
+    REQUIRE(prepare(c, {{"way_parents.bin", parents}}, {{"way_parents.bin", changed}}).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    std::vector<char> file = read_file(c.dir("old") + "/way_parents.bin");
+    REQUIRE(!file.empty() && file[0] == 0);
+    file[0] = 2;
+    // (The encoded set's file is the old dir's or a copy of it.)
+    for (const char* set : {"old", "old.enc"}) REQUIRE(write_file(c.dir(set) + "/way_parents.bin", file));
+
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "mode-byte", "Malformed way_parents.bin: block 0 is neither FOR nor a dictionary").empty());
 }
 
 // A client file list of more files than a variant holds (1025, past
@@ -3544,7 +3596,7 @@ TEST(patch_refuses_an_output_dir_holding_files) {
     };
     int n = 0;
     for (const Alias& a : {Alias{"old", "meta.json", false}, Alias{"old", "way_parents.bin", true},
-                           Alias{"old.enc", "way_parents.u24", false}, Alias{"old.enc", "gc.manifest", true}}) {
+                           Alias{"old.enc", "way_parents.bin", false}, Alias{"old.enc", "gc.manifest", true}}) {
         const std::string cur = c.dir(a.cur), out = root + "/out" + std::to_string(n++);
         std::filesystem::create_directories(out);
         if (a.symlink) std::filesystem::create_symlink(cur + "/" + a.name, out + "/" + a.name);

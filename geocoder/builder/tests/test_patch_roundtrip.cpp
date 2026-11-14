@@ -375,6 +375,11 @@ std::vector<uint32_t> new_way_parents() {
     return ids;
 }
 
+// way_parents.bin of ids as the builder writes it.
+std::vector<char> written_way_parents(const std::vector<uint32_t>& ids) {
+    return gctest::as_written({{"way_parents.bin", bytes_of(ids)}}).at("way_parents.bin");
+}
+
 template <typename T>
 void put_at(std::vector<char>& out, size_t at, T v) {
     memcpy(out.data() + at, &v, sizeof v);
@@ -390,16 +395,17 @@ size_t find_once(const std::vector<char>& hay, const std::vector<char>& needle) 
 
 // The diff of old_way_parents() -> new_way_parents(), uncompressed, and
 // where it holds the fields a test edits. raw is empty when a tool failed or
-// the patch holds no single way_parents sparse delta.
+// the patch holds no single way_parents sparse delta of the values' logical
+// sizes, or does not list the file once at its size on disk.
 struct SparsePatch {
     std::vector<char> raw;
     size_t new_size_at = 0, last_pos_at = 0, listed_size_at = 0;
 
-    // The client file list is kept in step, so only the section is wrong.
-    void set_new_size(uint64_t size) {
-        put_at(raw, new_size_at, size);
-        put_at(raw, listed_size_at, size);
-    }
+    // The section's new size, the values' logical bytes.
+    void set_new_size(uint64_t size) { put_at(raw, new_size_at, size); }
+    // The client file list's size of the file on disk, which the patcher
+    // holds its output to.
+    void set_listed_size(uint64_t size) { put_at(raw, listed_size_at, size); }
     void set_last_pos(uint32_t pos) { put_at(raw, last_pos_at, pos); }
 };
 
@@ -428,7 +434,7 @@ SparsePatch diff_way_parents(const std::string& root) {
     std::vector<char> listed;
     append(listed, static_cast<uint16_t>(name.size()));
     listed.insert(listed.end(), name.begin(), name.end());
-    append(listed, size);
+    append(listed, static_cast<uint64_t>(written_way_parents(new_way_parents()).size()));
     append(listed, uint8_t{0});
     const size_t section_at = find_once(bytes, section), listed_at = find_once(bytes, listed);
     if (section_at == std::string::npos || listed_at == std::string::npos) return p;
@@ -569,7 +575,28 @@ TEST(patch_round_trip_walks_the_side_files_of_unchanged_street_ways_as_kept) {
     old_d["way_postcodes.bin"] = bytes_of(std::vector<uint32_t>{NAME_2, NAME_4});
     new_d["way_postcodes.bin"] = bytes_of(std::vector<uint32_t>{NAME_4, NAME_2});
 
-    CHECK(round_trip(old_d, new_d).mismatches.empty());
+    const RoundTrip r = round_trip(old_d, new_d);
+
+    CHECK(r.mismatches.empty());
+    // The second way's postcode is the old one where the remap puts it; the
+    // first's is another.
+    CHECK(logged(r, "way_postcodes.bin: parallel delta along street_ways.bin, 0 inserted, 1 changes"));
+}
+
+// A side file whose values a day keeps goes as unchanged, beside its parent's
+// records and without them, and the patched dir holds it as the builder
+// writes it.
+TEST(patch_round_trip_keeps_a_side_file_a_day_leaves_unchanged) {
+    for (const bool with_parent : {true, false}) {
+        BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(OLD_POOL);
+        if (with_parent) put_shifted_streets(old_d, new_d);
+        old_d["way_parents.bin"] = new_d["way_parents.bin"] = bytes_of(std::vector<uint32_t>{7, NO_DATA});
+
+        const RoundTrip r = round_trip(old_d, new_d);
+
+        CHECK(r.mismatches.empty());
+        CHECK(logged(r, "way_parents.bin: unchanged (copy old, 8 bytes saved)"));
+    }
 }
 
 TEST(patch_round_trip_keeps_the_parent_ways_of_unchanged_street_ways) {
@@ -808,13 +835,54 @@ TEST(decode_logical_writes_the_poi_and_place_files_a_dir_holds_and_none_it_lacks
     CHECK(std::string(usage.begin(), usage.end()).find("geocoder-diff --decode-logical <dir> <out-dir>") != std::string::npos);
 }
 
+// --decode-logical writes the values of each side file a dir holds, 4 bytes a
+// value, and nothing for one it lacks or for a file of u32s that is no side
+// file. A side file the builder would not write is refused by name.
+TEST(decode_logical_writes_the_values_of_the_side_files_a_dir_holds) {
+    ScratchDir dir("decode-logical-side");
+    const std::string log = dir.path() + "/tools.log", in = dir.path() + "/in", out = dir.path() + "/out";
+    auto decode = [&](const std::string& to) {
+        std::filesystem::remove(log);
+        const bool ok = run({GEOCODER_DIFF_BIN, "--decode-logical", in, to}, log);
+        const std::vector<char> text = read_file(log);
+        return std::pair<bool, std::string>(ok, std::string(text.begin(), text.end()));
+    };
+    std::vector<uint32_t> parents, postcodes;
+    for (uint32_t i = 0; i < 200; i++) {
+        parents.push_back(i % 7 == 3 ? NO_DATA : 5000 + i * i);
+        postcodes.push_back(i < 70 ? NAME_2 : NAME_4);
+    }
+    const BuildDir sides = {{"way_parents.bin", bytes_of(parents)}, {"addr_postcodes.bin", bytes_of(postcodes)}};
+    BuildDir d = sides;
+    d["admin_parents.bin"] = bytes_of(std::vector<uint32_t>{1, 2, 3});
+    REQUIRE(write_dir(in, d));
+    REQUIRE(read_file(in + "/way_parents.bin") != sides.at("way_parents.bin"));
+
+    auto r = decode(out);
+
+    CHECK(r.first);
+    CHECK(gctest::read_dir(out) == sides);
+    CHECK(r.second.find("  way_parents: 800 logical bytes") != std::string::npos);
+    CHECK(r.second.find("  addr_postcodes: 800 logical bytes") != std::string::npos);
+    CHECK(r.second.find("  way_postcodes: none") != std::string::npos);
+    CHECK(r.second.find("  interp_postcodes: none") != std::string::npos);
+
+    // The file's magic, its last byte.
+    std::vector<char> other = read_file(in + "/addr_postcodes.bin");
+    other.back() = '2';
+    REQUIRE(write_file(in + "/addr_postcodes.bin", other));
+    r = decode(dir.path() + "/refused");
+    CHECK(!r.first);
+    CHECK(r.second.find("Malformed addr_postcodes.bin: no SDB1 in its footer") != std::string::npos);
+}
+
 // geocoder-diff --logical-size DIR prints two numbers, from DIR's file sizes
 // and footers alone. The bytes a diff maps for DIR's record files: every .bin
-// but the string tiers at its size, the POI and place files at their logical
-// size. And the bytes it writes to scratch for DIR: those logical files and
-// the pool of each string tier as the diff finds it, in DIR, else ../full,
-// else ../../full, an empty pool as none. A DIR that is no dir, and the
-// option without its one path, are refused.
+// but the string tiers at its size, the POI, place and side files at their
+// logical size. And the bytes it writes to scratch for DIR: those logical
+// files and the pool of each string tier as the diff finds it, in DIR, else
+// ../full, else ../../full, an empty pool as none. A DIR that is no dir, and
+// the option without its one path, are refused.
 TEST(logical_size_prints_the_mapped_and_the_scratch_bytes_of_a_dir) {
     ScratchDir dir("logical-size");
     const std::string log = dir.path() + "/tools.log", region = dir.path() + "/region";
@@ -836,14 +904,17 @@ TEST(logical_size_prints_the_mapped_and_the_scratch_bytes_of_a_dir) {
     hidden._pad1 = PLACE_FLAG_HIDDEN;
     const std::vector<PlaceNode> nodes = {place(NAME_2), place(NAME_4), hidden, place(NAME_2)};
     const uint64_t place_bytes = nodes.size() * place_files::LOGICAL_STRIDE;
+    const std::vector<char> way_parents = bytes_of(std::vector<uint32_t>{5, 6});
+    const uint64_t side_bytes = way_parents.size();
     const std::string street_pool("Elm\0Oak\0Pine\0", 13);
 
     // full: two string tiers of its own, street files, a geo index, the POI
-    // and place files, and files that are no .bin.
+    // and place files, a side file, and files that are no .bin.
     BuildDir full = with_pool(OLD_POOL);
     full["strings_street.bin"] = pool(street_pool);
     full["street_ways.bin"] = bytes_of(std::vector<WayHeader>{{0, 2, 0, NAME_2}, {2, 1, 0, NAME_4}});
     full["street_nodes.bin"] = nodes_of({1, 2, 3});
+    full["way_parents.bin"] = way_parents;
     put_geo_cells(full, {{CELL, {0, 1}, {}, {}}});
     full.insert(pois.begin(), pois.end());
     put_places(full, nodes);
@@ -856,11 +927,13 @@ TEST(logical_size_prints_the_mapped_and_the_scratch_bytes_of_a_dir) {
     // The encoded files are not their logical size, so neither number is a
     // sum of file sizes.
     REQUIRE(written.at("poi_records.bin").size() + written.at("poi_vertices.bin").size() != poi_bytes);
+    REQUIRE(written.at("way_parents.bin").size() != side_bytes);
     REQUIRE(written.at("strings_street.bin").size() != street_pool.size());
 
     auto r = sizes_of({region + "/full"});
     CHECK(r.first);
-    CHECK_EQ(r.second, two(raw_bytes + poi_bytes + place_bytes, poi_bytes + place_bytes + OLD_POOL.size() + street_pool.size()));
+    CHECK_EQ(r.second, two(raw_bytes + poi_bytes + place_bytes + side_bytes,
+                           poi_bytes + place_bytes + side_bytes + OLD_POOL.size() + street_pool.size()));
 
     // A dir beside full with one tier of its own, another of its own that
     // is an empty pool, and no family: the tiers it lacks are ../full's.
@@ -868,7 +941,7 @@ TEST(logical_size_prints_the_mapped_and_the_scratch_bytes_of_a_dir) {
     BuildDir beside;
     beside["strings_core.bin"] = pool(own_pool);
     beside["strings_street.bin"] = {};
-    beside["way_parents.bin"] = bytes_of(std::vector<uint32_t>{5, 6, 7, 8});
+    beside["admin_parents.bin"] = bytes_of(std::vector<uint32_t>{5, 6, 7, 8});
     REQUIRE(write_dir(region + "/admin", beside));
     r = sizes_of({region + "/admin"});
     CHECK(r.first);
@@ -881,7 +954,7 @@ TEST(logical_size_prints_the_mapped_and_the_scratch_bytes_of_a_dir) {
     CHECK_EQ(r.second, two(poi_bytes, poi_bytes + OLD_POOL.size() + street_pool.size()));
 
     // No full beside or above it: nothing is decoded for it.
-    REQUIRE(write_dir(dir.path() + "/alone/deep/lone", {{"way_parents.bin", bytes_of(std::vector<uint32_t>{5, 6})}}));
+    REQUIRE(write_dir(dir.path() + "/alone/deep/lone", {{"admin_parents.bin", bytes_of(std::vector<uint32_t>{5, 6})}}));
     r = sizes_of({dir.path() + "/alone/deep/lone"});
     CHECK(r.first);
     CHECK_EQ(r.second, two(8, 0));
@@ -1166,6 +1239,68 @@ TEST(patch_round_trip_by_identity_rebuilds_interp_ways) {
     CHECK(logged(r, "interp_ways identity: match=1 replace=1 insert=2 delete=2 moved=1"));
 }
 
+// The four side files, each beside the records it follows.
+const char* const SIDE_FILES[] = {"way_parents.bin", "way_postcodes.bin", "interp_postcodes.bin", "addr_postcodes.bin"};
+
+// A side file is written only on a day that has a value for it. One the old
+// day lacks comes whole, a full replacement of its values (4 bytes each),
+// which the patcher writes as the builder does; the other files follow their
+// records as on any day.
+TEST(patch_round_trip_adds_a_side_file_the_old_day_lacks) {
+    for (const char* added : SIDE_FILES) {
+        BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+        Identity ids;
+        put_identity_streets(old_d, new_d, ids);
+        put_identity_addresses(old_d, new_d, ids);
+        put_identity_interps(old_d, new_d, ids);
+        const std::string values = std::to_string(new_d.at(added).size());
+        old_d.erase(added);
+
+        const RoundTrip r = round_trip(old_d, new_d, ids);
+
+        CHECK(r.mismatches.empty());
+        CHECK(logged(r, std::string(added) + ": no old file, using full replace (" + values + " bytes)"));
+        CHECK(logged(r, std::string(added) + ": full replace " + values + " bytes"));
+        for (const char* kept : SIDE_FILES)
+            if (kept != added) CHECK(logged(r, std::string(kept) + ": parallel delta along "));
+    }
+}
+
+// A side file the new day lacks gets no section, and the patched dir does not
+// hold it; the other files follow their records.
+TEST(patch_round_trip_drops_a_side_file_the_new_day_lacks) {
+    for (const char* dropped : SIDE_FILES) {
+        BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+        Identity ids;
+        put_identity_streets(old_d, new_d, ids);
+        put_identity_addresses(old_d, new_d, ids);
+        put_identity_interps(old_d, new_d, ids);
+        new_d.erase(dropped);
+
+        const RoundTrip r = round_trip(old_d, new_d, ids);
+
+        CHECK(r.mismatches.empty());
+        CHECK(!logged(r, dropped));
+        for (const char* kept : SIDE_FILES)
+            if (kept != dropped) CHECK(logged(r, std::string(kept) + ": parallel delta along "));
+    }
+}
+
+// A side file of no values is its footer alone, which no build writes: the
+// patcher still gives it for a day that has it, from an old day without the
+// file, with an empty one or with values, and takes it as an old file of no
+// values.
+TEST(patch_round_trip_keeps_a_side_file_of_no_values) {
+    const std::vector<char> none, some = bytes_of(std::vector<uint32_t>{5, NO_DATA, 7});
+    REQUIRE(gctest::as_written({{"way_parents.bin", none}}).at("way_parents.bin").size() == 8);
+    const BuildDir without, empty = {{"way_parents.bin", none}}, with = {{"way_parents.bin", some}};
+
+    CHECK(round_trip(without, empty).mismatches.empty());
+    CHECK(round_trip(empty, empty).mismatches.empty());
+    CHECK(round_trip(with, empty).mismatches.empty());
+    CHECK(round_trip(empty, with).mismatches.empty());
+}
+
 // A sidecar that is not one key per record (short, long or missing) is
 // rejected: the log names its family, which merges by content.
 TEST(patch_round_trip_warns_of_each_rejected_identity_sidecar_and_merges_its_family_by_content) {
@@ -1302,7 +1437,7 @@ TEST(patch_needs_no_zstd_on_path_unless_built_on_the_zstd_cli) {
     CHECK(logged(r, "Failed to decompress"));
 #else
     CHECK(r.ok);
-    CHECK(read_file(root + "/out/way_parents.bin") == bytes_of(new_way_parents()));
+    CHECK(read_file(root + "/out/way_parents.bin") == written_way_parents(new_way_parents()));
 #endif
 }
 
@@ -1335,7 +1470,7 @@ TEST(patch_holds_a_zstd_window_no_larger_than_the_diffs) {
 #endif
         CHECK_EQ(r.ok, !refused);
         if (refused) CHECK(logged(r, "Failed to decompress"));
-        else CHECK(read_file(root + "/" + name + "/way_parents.bin") == bytes_of(new_way_parents()));
+        else CHECK(read_file(root + "/" + name + "/way_parents.bin") == written_way_parents(new_way_parents()));
     }
 }
 
@@ -1380,21 +1515,75 @@ TEST(patch_refuses_a_patch_shorter_than_its_magic) {
 }
 
 // A sparse delta's change at its file's last record applies: the patcher
-// refuses records past the end, not the last one.
+// refuses records past the end, not the last one. The value moves from one
+// block of the file to another and with it the bits a value of each takes, so
+// the patch lists the size of the file the edit gives.
 TEST(patch_applies_a_sparse_delta_change_at_the_last_record) {
     ScratchDir dir("patch-sparse");
     SparsePatch p = diff_way_parents(dir.path());
     REQUIRE(!p.raw.empty());
-    p.set_last_pos(SPARSE_RECORDS - 1);
-
-    auto r = apply_raw(dir.path(), p.raw, "out");
-
     auto want = new_way_parents();
     const auto [last_pos, last_id] = SPARSE_CHANGES[std::size(SPARSE_CHANGES) - 1];
     want[last_pos] = old_way_parents()[last_pos];
     want[SPARSE_RECORDS - 1] = last_id;
+    REQUIRE(written_way_parents(want).size() != written_way_parents(new_way_parents()).size());
+    p.set_last_pos(SPARSE_RECORDS - 1);
+    p.set_listed_size(written_way_parents(want).size());
+
+    auto r = apply_raw(dir.path(), p.raw, "out");
+
     CHECK(r.ok);
-    CHECK(read_file(dir.path() + "/out/way_parents.bin") == bytes_of(want));
+    CHECK(read_file(dir.path() + "/out/way_parents.bin") == written_way_parents(want));
+}
+
+// The diff reads a side file as side blocks and as nothing else: one of bare
+// u32s is refused by name, and no patch is written.
+TEST(patch_diff_refuses_a_side_file_that_is_not_side_blocks) {
+    ScratchDir dir("patch-diff-side");
+    const std::string& root = dir.path();
+    const std::string patch = root + "/p.gcpatch", log = root + "/tools.log";
+    const BuildDir day = {{"way_parents.bin", bytes_of(std::vector<uint32_t>{5, 6, 7, 8})}};
+    REQUIRE(write_dir(root + "/old", day) && write_dir(root + "/new", day));
+    REQUIRE(write_file(root + "/new/way_parents.bin", day.at("way_parents.bin")));
+
+    CHECK(!run({GEOCODER_DIFF_BIN, root + "/old", root + "/new", "-o", patch}, log));
+
+    const std::vector<char> text = read_file(log);
+    CHECK(std::string(text.begin(), text.end()).find("Malformed way_parents.bin: no SDB1 in its footer") != std::string::npos);
+    CHECK(!std::filesystem::exists(patch));
+}
+
+// A side file's size on disk follows its values' widths, its section their
+// count: the client file list gives the file's size on disk, which the
+// patcher holds its output to, and the section the old and the new values'
+// logical bytes, 4 a value, which it holds the old file's values to.
+TEST(patch_lists_a_side_file_at_its_encoded_size_and_sends_its_section_at_its_logical_size) {
+    ScratchDir dir("patch-side-sizes");
+    const std::string& root = dir.path();
+    const uint64_t logical = uint64_t{SPARSE_RECORDS} * 4, written = written_way_parents(new_way_parents()).size();
+    REQUIRE(written != logical);
+    // The section and the list's entry, found by those sizes.
+    SparsePatch p = diff_way_parents(root);
+    REQUIRE(!p.raw.empty());
+    const size_t old_size_at = p.new_size_at - 8;
+
+    auto r = apply_raw(root, p.raw, "out");
+    CHECK(r.ok);
+    CHECK(read_file(root + "/out/way_parents.bin") == written_way_parents(new_way_parents()));
+
+    SparsePatch listed_logical = p;
+    listed_logical.set_listed_size(logical);
+    r = apply_raw(root, listed_logical.raw, "listed-logical");
+    CHECK(!r.ok);
+    CHECK(logged(r, "Output size mismatch: way_parents.bin is " + std::to_string(written) + " bytes, the patch lists " +
+                        std::to_string(logical)));
+
+    SparsePatch old_written = p;
+    put_at(old_written.raw, old_size_at, static_cast<uint64_t>(written_way_parents(old_way_parents()).size()));
+    r = apply_raw(root, old_written.raw, "old-written");
+    CHECK(!r.ok);
+    CHECK(logged(r, "old way_parents.bin decodes to " + std::to_string(logical) + " bytes, the patch expects " +
+                        std::to_string(written_way_parents(old_way_parents()).size())));
 }
 
 // A change writes its record whole, so a sparse delta whose new size ends in

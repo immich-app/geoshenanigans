@@ -283,6 +283,32 @@ bool gc_encodes_the_same(const AddrSet& s, const std::string& dir) {
     return same;
 }
 
+// The families of the four side files, each <family>.bin.
+const char* const SIDE_FAMILIES[] = {"way_parents", "way_postcodes", "interp_postcodes", "addr_postcodes"};
+
+// n side values in stretches of 100, which cut the blocks of 64 anywhere: one
+// value, a few values in turn with NO_DATA among them (a dictionary), a
+// narrow range and any u32 (both FOR).
+std::vector<uint32_t> side_values(size_t n, std::mt19937& rng) {
+    std::vector<uint32_t> v(n);
+    for (size_t j = 0; j < n; j++) {
+        const uint32_t stretch = uint32_t(j / 100);
+        switch (stretch % 4) {
+        case 0: v[j] = 7000 + stretch; break;
+        case 1: v[j] = rng() % 4 ? 900000 * (rng() % 3) : NO; break;
+        case 2: v[j] = 100000 + rng() % 500; break;
+        default: v[j] = uint32_t(rng()); break;
+        }
+    }
+    return v;
+}
+
+// The file the builder writes of a side family's values (side_blocks.h).
+std::vector<char> side_file_of(const std::string& family, const std::vector<uint32_t>& values) {
+    const std::vector<uint8_t> f = side_blocks::encode(family + ".bin", values.data(), values.size());
+    return std::vector<char>(f.begin(), f.end());
+}
+
 // Today's street (12-byte) or interpolation (24-byte) ways of 0 to 3 nodes,
 // node_offset the running node count (0 for a way without nodes).
 struct WaySet {
@@ -315,122 +341,141 @@ WaySet way_set(bool street) {
 
 }  // namespace
 
-TEST(gcs_way_parents_round_trip_with_no_data) {
-    ScratchDir dir("gcs-test");
-    std::mt19937 rng(7);
-    const std::vector<uint32_t> values = {0, 1, NO, 0xFFFFFE, 12345, NO, 0x10000};
-    side::U24Enc enc(dir.path());
-    enc.state = {1};
-    write_in_pieces(enc, 0, u32s(values), rng, 7);
-    const Manifest m = finish_all(enc);
-    CHECK_EQ(m.num("way_parents.n"), uint64_t(values.size()));
-    CHECK_EQ(slurp(dir.path() + "/way_parents.u24").size(), 3 * values.size());
-    side::U24Dec dec(dir.path(), m);
-    CHECK_EQ(dec.decoded_size(0), uint64_t(4 * values.size()));
-    CHECK(decode_all(dec)[0] == u32s(values));
+TEST(gcs_side_blocks_round_trip_in_odd_pieces_and_equal_the_builders_encoder) {
+    // Values written in pieces that cut them anywhere (of 1 to 7 bytes, and of
+    // up to 5000) give the builder's file, whatever their count: none (the
+    // footer alone), one, a block less one, a block, a block and one, and
+    // many blocks of every kind. The table's scratch file is gone from the
+    // dir. The decoder gives the values back, and the decoded size is the
+    // footer's without a decoder. Each of the four side files in turn.
+    std::mt19937 rng(20261114);
+    size_t k = 0;
+    for (const size_t n : {size_t(0), size_t(1), size_t(63), size_t(64), size_t(65), size_t(5000)})
+        for (const size_t max_piece : {size_t(7), size_t(5000)}) {
+            const std::string family = SIDE_FAMILIES[k++ % std::size(SIDE_FAMILIES)];
+            const std::vector<uint32_t> values = side_values(n, rng);
+            ScratchDir dir("gcs-test");
+            side::Enc enc(dir.path(), family);
+            enc.state = {1};
+            write_in_pieces(enc, 0, u32s(values), rng, max_piece);
+            finish_all(enc);
+
+            CHECK(dir_files(dir.path()) == (std::map<std::string, std::vector<char>>{{family + ".bin", side_file_of(family, values)}}));
+            CHECK_EQ(side::decoded_size(dir.path(), family), uint64_t(4 * n));
+            side::Dec dec(dir.path(), family);
+            CHECK_EQ(dec.decoded_size(0), uint64_t(4 * n));
+            CHECK(decode_all(dec)[0] == u32s(values));
+        }
 }
 
-TEST(gcs_way_parents_rejects_a_value_past_24_bits) {
+TEST(gcs_side_decoder_takes_a_dir_without_its_file_as_no_values) {
+    // A side file is written only for a day that has a value: a dir without
+    // it decodes to none, beside another family's file.
     ScratchDir dir("gcs-test");
-    side::U24Enc enc(dir.path());
-    enc.state = {1};
-    const std::vector<uint8_t> bytes = u32s({0xFFFFFF});
-    CHECK_EQ(refusal_of([&] { enc.write(0, bytes.data(), bytes.size()); }),
-             std::string("gcs: way_parents value 16777215 does not fit 24 bits"));
+    write_bytes(dir.path() + "/way_parents.bin", std::vector<uint8_t>(side_file_of("way_parents", {1, 2, 3}).size(), 0x5A));
+
+    CHECK_EQ(side::decoded_size(dir.path(), "way_postcodes"), uint64_t(0));
+    side::Dec dec(dir.path(), "way_postcodes");
+    CHECK_EQ(dec.decoded_size(0), uint64_t(0));
+    CHECK(decode_all(dec)[0].empty());
 }
 
-TEST(gcs_dictionary_round_trip_renumbers_in_value_order) {
-    ScratchDir dir("gcs-test");
-    std::mt19937 rng(11);
-    // First seen out of value order, repeats, NO_DATA, and enough distinct
-    // values to grow the table past its first size.
-    std::vector<uint32_t> values = {900, 5, NO, 900, 7, 5};
-    for (uint32_t i = 0; i < 5000; i++) values.push_back(100000 - (i * 7919) % 6000);
-    side::DictEnc enc(dir.path(), "way_postcodes");
-    enc.state = {1};
-    write_in_pieces(enc, 0, u32s(values), rng, 4096);
-    const Manifest m = finish_all(enc);
-    const std::vector<char> dict = slurp(dir.path() + "/way_postcodes.dict");
-    bool ascending = true;
-    for (size_t i = 4; i + 4 <= dict.size(); i += 4)
-        ascending &= rd32(reinterpret_cast<const uint8_t*>(&dict[i - 4])) < rd32(reinterpret_cast<const uint8_t*>(&dict[i]));
-    CHECK(ascending);
-    CHECK_EQ(m.num("way_postcodes.dict"), uint64_t(dict.size() / 4));
-    side::DictDec dec(dir.path(), "way_postcodes", m);
-    CHECK(decode_all(dec)[0] == u32s(values));
-}
-
-TEST(gcs_dictionary_decoder_rejects_a_dict_past_the_manifest) {
-    // A dictionary family's .dict holds the manifest's count of values, fewer
-    // than the u16 index's 0xFFFF, and is rejected before it is read otherwise:
-    // a value more than the manifest's, 0xFFFF values (as many as the manifest
-    // says), and a sparse 64 MiB file under a dictionary of none (reserved and
-    // read in, before). Two values and three indexes decode, and so do 0xFFFE
-    // values.
+TEST(gcs_side_decoder_refuses_a_malformed_block_or_table) {
+    // Three blocks: 64 values of 7 (FOR, 6 bytes at 0), 64 of NO_DATA and 5 in
+    // turn (a dictionary, 19 bytes at 6) and 22 from 1000 up (FOR at 5 bits,
+    // 20 bytes at 25); their table at 45 and the footer at 57. The file
+    // decodes as written. With a block where the table does not put it, a
+    // byte between the last block and the table, a block the encoder would
+    // not write or cut short, or a footer of another file or count, it is
+    // refused by name, by the decoder and, for the footer, by the decoded
+    // size alone.
+    std::vector<uint32_t> values(64, 7);
+    for (uint32_t j = 0; j < 64; j++) values.push_back(j % 2 ? 5 : NO);
+    for (uint32_t j = 0; j < 22; j++) values.push_back(1000 + j);
+    const std::vector<char> written = side_file_of("way_postcodes", values);
+    REQUIRE(written.size() == 65 && rd32(reinterpret_cast<const uint8_t*>(&written[49])) == 6);
     struct Case {
-        uint64_t manifest, values;  // the manifest's dictionary count, the file's
-        uint64_t sparse_bytes;      // instead: a sparse file of these bytes
-        const char* error;          // nullptr: decodes
+        std::function<void(std::vector<uint8_t>&)> edit;
+        const char* refusal;  // nullptr: decodes
+        bool footer = false;
     };
     const Case cases[] = {
-        {2, 2, 0, nullptr},
-        {2, 3, 0, "gcs: way_postcodes.dict size"},
-        {0xFFFE, 0xFFFE, 0, nullptr},
-        {0xFFFF, 0xFFFF, 0, "gcs: way_postcodes: 65535 dictionary values, past a u16 index"},
-        {0, 0, uint64_t(64) << 20, "gcs: way_postcodes.dict size"},
+        {[](std::vector<uint8_t>&) {}, nullptr},
+        {[](std::vector<uint8_t>& f) { f[49] = 7; }, "block 1 is not where the blocks before it end"},
+        {[](std::vector<uint8_t>& f) { f.insert(f.begin() + 45, 0); }, "bytes between its blocks and its table"},
+        {[](std::vector<uint8_t>& f) { f.erase(f.begin() + 44); }, "block 2 runs past the blocks' end"},
+        {[](std::vector<uint8_t>& f) { f[0] = 2; }, "block 0 is neither FOR nor a dictionary"},
+        {[](std::vector<uint8_t>& f) { f[17] = 0x55; }, "block 1 has an index out of first-use order, or past its dictionary"},
+        {[](std::vector<uint8_t>& f) { f[44] |= 0x80; }, "block 2 has bits set past its last value"},
+        {[](std::vector<uint8_t>& f) { f.back() = '2'; }, "no SDB1 in its footer", true},
+        {[](std::vector<uint8_t>& f) { f.resize(7); }, "shorter than its footer", true},
+        {[](std::vector<uint8_t>& f) { wr32(&f[57], 100000); }, "shorter than its block table", true},
     };
     for (const Case& c : cases) {
         ScratchDir dir("gcs-test");
-        std::vector<uint32_t> dict;
-        for (uint64_t v = 0; v < c.values; v++) dict.push_back(uint32_t(100 + v));
-        write_bytes(dir.path() + "/way_postcodes.dict", u32s(dict));
-        if (c.sparse_bytes) std::filesystem::resize_file(dir.path() + "/way_postcodes.dict", c.sparse_bytes);
-        const std::vector<uint16_t> ids = c.manifest ? std::vector<uint16_t>{0, 1, 0xFFFF} : std::vector<uint16_t>{};
-        std::vector<uint8_t> index;
-        for (uint16_t x : ids) for (uint8_t b : le(x, 2)) index.push_back(b);
-        write_bytes(dir.path() + "/way_postcodes.u16", index);
+        std::vector<uint8_t> file(written.begin(), written.end());
+        c.edit(file);
+        write_bytes(dir.path() + "/way_postcodes.bin", file);
+        const std::string refusal = c.refusal ? std::string("Malformed way_postcodes.bin: ") + c.refusal : "";
+        std::vector<uint8_t> decoded;
 
-        const int status = exit_status_in_child(
-            [&] {
-                return refusal_code(
-                    [&] {
-                        Manifest m;
-                        m.set("way_postcodes.n", ids.size());
-                        m.set("way_postcodes.dict", c.manifest);
-                        side::DictDec dec(dir.path(), "way_postcodes", m);
-                        decode_all(dec);
-                    },
-                    c.error ? c.error : "");
-            },
-            20);
-
-        CHECK_EQ(status, c.error ? 2 : 0);
+        CHECK_EQ(refusal_of([&] {
+                     side::Dec dec(dir.path(), "way_postcodes");
+                     decoded = decode_all(dec)[0];
+                 }),
+                 refusal);
+        CHECK_EQ(refusal_of([&] { side::decoded_size(dir.path(), "way_postcodes"); }), c.footer ? refusal : "");
+        if (!c.refusal) CHECK(decoded == u32s(values));
     }
 }
 
-TEST(gcs_dictionary_encoder_writes_fewer_than_0xffff_values) {
-    // As gc's encoder: 0xFFFE distinct values (indexes 0 to 0xFFFD; 0xFFFF is
-    // NO_DATA) round trip through the decoder, and a 0xFFFF-th is rejected, as
-    // the decoders reject a dictionary of 0xFFFF values.
-    for (const uint32_t distinct : {0xFFFEu, 0xFFFFu}) {
-        ScratchDir dir("gcs-test");
-        std::vector<uint32_t> values{NO};
-        for (uint32_t v = 0; v < distinct; v++) values.push_back(3 * v);
-        const std::vector<uint8_t> bytes = u32s(values);
-        side::DictEnc enc(dir.path(), "way_postcodes");
-        enc.state = {1};
+TEST(gcs_side_encoder_refuses_a_stream_ending_inside_a_value) {
+    // A full replacement whose payload is not whole u32s: refused at the
+    // finish, not written as a file of the whole ones.
+    ScratchDir dir("gcs-test");
+    side::Enc enc(dir.path(), "way_parents");
+    enc.state = {1};
+    const std::vector<uint8_t> bytes = u32s({1, 2, 3});
+    enc.write(0, bytes.data(), bytes.size() - 1);
 
-        const int status = refusal_code(
-            [&] {
-                enc.write(0, bytes.data(), bytes.size());
-                const Manifest m = finish_all(enc);
-                side::DictDec dec(dir.path(), "way_postcodes", m);
-                if (decode_all(dec)[0] != bytes) throw std::runtime_error("decodes to other values");
-            },
-            "gcs: way_postcodes: too many distinct values for a u16 index");
+    CHECK_EQ(refusal_of([&] { finish_all(enc); }), std::string("gcs: way_parents.bin: the stream ends 3 bytes into a value"));
+}
 
-        CHECK_EQ(status, distinct == 0xFFFE ? 0 : 2);
+TEST(gcs_side_codec_holds_one_block) {
+    // 4 MiB of values in one write (as the patcher's FILE passes a full
+    // replacement), read back as the patcher reads them (64 KiB views). The
+    // encoder queues none of the write and keeps no table entry of a block it
+    // has written; the decoder's queue holds what a read asks ahead and one
+    // block's values, and its readers their buffers. The file is the
+    // builder's.
+    std::mt19937 rng(20261114);
+    const std::vector<uint32_t> values = side_values(size_t(1) << 20, rng);
+    const std::vector<uint8_t> bytes = u32s(values);
+    ScratchDir dir("gcs-test");
+    side::Enc enc(dir.path(), "addr_postcodes");
+    enc.state = {1};
+    enc.write(0, bytes.data(), bytes.size());
+    const size_t encoder_peak = enc.peak(0), table_held = enc.blocks.table().size();
+    finish_all(enc);
+
+    side::Dec dec(dir.path(), "addr_postcodes");
+    dec.state = {1};
+    std::vector<uint8_t> out;
+    std::vector<char> view(size_t(64) << 10);
+    size_t readers = 0;
+    for (size_t got; (got = dec.read(0, view.data(), view.size())) != 0;) {
+        out.insert(out.end(), view.data(), view.data() + got);
+        if (dec.B) readers = std::max(readers, dec.B->buf.size() + dec.T->buf.size());
     }
+    std::printf("    %zu values: encoder queue peak %zu B, decoder queue peak %zu B, readers %zu B\n", values.size(), encoder_peak,
+                dec.peak(0), readers);
+
+    CHECK_EQ(encoder_peak, size_t(0));
+    CHECK_EQ(table_held, size_t(0));
+    CHECK(dec.peak(0) < Decoder::READ_AHEAD + 4 * side_blocks::BLOCK_VALUES);
+    CHECK(readers > 0 && readers <= side::BLOCKS_BUF + side::TABLE_BUF + 2 * READ_SLACK);
+    CHECK(out == bytes);
+    CHECK(slurp(dir.path() + "/addr_postcodes.bin") == side_file_of("addr_postcodes", values));
 }
 
 TEST(gcs_poi_round_trip_whole_and_in_pieces) {
@@ -946,22 +991,25 @@ TEST(gcs_ways_decoder_rejects_a_way_starting_past_node_u32) {
 
 namespace {
 
-std::vector<uint32_t> u24_values() {
-    std::vector<uint32_t> v(15000);  // 45000 bytes of u24: one buffer (48 KiB), written at finish
-    for (size_t j = 0; j < v.size(); j++) v[j] = uint32_t(j * 7919 % 0xFFFFFF);
+// 128,000 values, one value a block: 2,000 blocks of 6 bytes, 12 KB that
+// wait in the encoder's buffer for finish(), which adds their table (8 KB)
+// and the footer.
+std::vector<uint32_t> one_value_blocks() {
+    std::vector<uint32_t> v(128000);
+    for (size_t j = 0; j < v.size(); j++) v[j] = uint32_t(j / 64 * 7919 % 0xFFFFFF);
     return v;
 }
 
 // 0: the write is refused with the error naming its file, too large for
-// the limit (mode 3, no limit: every byte is in the file); 3: another
+// the limit (mode 3, no limit: the file holds the values); 3: another
 // refusal; 4: none; 5, 6: mode 3's file is wrong; 8: a refusal in mode 3.
 int writer_case(int mode, const std::string& dir) {
-    const bool u24 = mode == 0 || mode == 3;
-    const std::string file = dir + (u24 ? "/way_parents.u24" : "/output");
-    const std::vector<uint32_t> v = u24_values();
+    const bool side = mode == 0 || mode == 3;
+    const std::string file = dir + (side ? "/way_parents.bin" : "/output");
+    const std::vector<uint32_t> v = one_value_blocks();
     const std::string refusal = refusal_of([&] {
-        if (u24) {  // U24Enc: its last buffer goes out in finish()
-            side::U24Enc enc(dir);
+        if (side) {  // side::Enc: its blocks' last buffer, their table and the footer go out in finish()
+            side::Enc enc(dir, "way_parents");
             enc.state[0] = 1;
             enc.write(0, v.data(), v.size() * 4);
             enc.state[0] = 2;
@@ -979,13 +1027,14 @@ int writer_case(int mode, const std::string& dir) {
         return refusal == "gcs: write " + file + ": " + std::strerror(EFBIG) ? 0 : 3;
     }
     if (!refusal.empty()) return 8;
-    Reader r(file);
-    if (r.size() != 3 * v.size()) return 5;
-    for (uint32_t x : v) {
-        const uint8_t* b = r.take(3);
-        if ((uint32_t(b[0]) | uint32_t(b[1]) << 8 | uint32_t(b[2]) << 16) != x) return 6;
-    }
-    return 0;
+    const std::vector<char> bytes = slurp(file);
+    std::vector<uint32_t> values;
+    if (!refusal_of([&] {
+             side_blocks::decode("way_parents.bin", reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(),
+                                 [&](const uint32_t* p, size_t n) { values.insert(values.end(), p, p + n); });
+         }).empty())
+        return 5;
+    return values == v ? 0 : 6;
 }
 
 }  // namespace

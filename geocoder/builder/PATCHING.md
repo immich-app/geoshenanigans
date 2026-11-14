@@ -153,8 +153,12 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
   days' into their logical form (today's 36-byte records and vertex stream) and merges those.
   The string tiers are FCC2 files, front-coded buckets cut by content (`src/string_files.h`);
   the diff decodes each tier it reads into its pool and diffs the pools.
-  `geocoder-diff --decode-logical DIR OUT` writes the logical files it would read of DIR's POI
-  and place files into OUT, a new or empty dir, and no patch.
+  The four per-record side files (`way_parents.bin`, `way_postcodes.bin`, `interp_postcodes.bin`,
+  `addr_postcodes.bin`) are side blocks on disk (`src/side_blocks.h`); the diff decodes each into
+  its u32 values, and a side file's section carries those: its sizes are 4 bytes a value, and a
+  file the old day lacks goes as a full replacement of its values.
+  `geocoder-diff --decode-logical DIR OUT` writes the logical files it would read of DIR's POI,
+  place and side files into OUT, a new or empty dir, and no patch.
   `geocoder-diff --logical-size DIR` prints the bytes a diff maps for DIR's record files and the
   bytes it writes to scratch for DIR, from file sizes and footers alone;
   `tools/generate_patches.sh` starts its diffs and verifies by them, within a memory budget and
@@ -166,15 +170,16 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 - **patch_format.h** (`tools/patch_format.h`): Shared format definitions + rebuild functions
 - **geocoder-gc** (`tools/gc.cpp`, `tools/gc_*.h`): Encodes a variant dir into the compact installed
   set (the encoded files and a `gc.manifest`) and decodes one back to today's files, byte for byte,
-  each into a new or empty dir. The POI files are compact in every dir, and it links them as they
-  are
+  each into a new or empty dir. The POI files and the side files are compact in every dir, and it
+  links them as they are
 - **gcs_\*.h** (`tools/gcs_patch.h`, `gcs_codec.h`, `gcs_io.h`, `gcs_async.h`): geocoder-patch's
   in-process codecs. The POI files are decoded and their new ones encoded in every dir (one record
-  and one polygon in flight; a polygon past 256 KiB a piece at a time). In low-memory mode, when
-  the old dir is an encoded installed set (a `gc.manifest` beside the files, as geocoder-gc writes
-  it), gc's families too, and the output is the new encoded set, geocoder-gc's encoding of the new
-  dir. An encoded family's records and their child stream replay together; `--threads` gives each
-  codec a thread
+  and one polygon in flight; a polygon past 256 KiB a piece at a time), and so are the side files
+  (a block of 64 values in flight, the new file's block table in a scratch file beside it until
+  the file is closed). In low-memory mode, when the old dir is an encoded installed set (a
+  `gc.manifest` beside the files, as geocoder-gc writes it), gc's families too, and the output is
+  the new encoded set, geocoder-gc's encoding of the new dir. An encoded family's records and
+  their child stream replay together; `--threads` gives each codec a thread
 
 ### Patcher memory and speed
 
@@ -206,9 +211,9 @@ keep it so:
   (MAX_RECORD_STRIDE), 0xFFFFFFFE records in a merged file (FILE_RECORDS_MAX), secondary remap
   pairs for the five remapped record files only, 0xFFFF ids in the lost and in the gained runs
   over a cell of a cell list delta (v15: 8 bytes an id, so 512 KiB each, however many runs),
-  a child stream at most 4 MiB ahead of its parent (MAX_DECODER_SKEW), fewer than 0xFFFF values
-  in a `.dict`, and, on the `zstd` command, an 8 MiB zstd window (PATCH_ZSTD_WINDOW_LOG). The
-  encoders take what they're given in pieces of at most 64 KiB (ENCODER_PIECE).
+  a child stream at most 4 MiB ahead of its parent (MAX_DECODER_SKEW), and, on the `zstd`
+  command, an 8 MiB zstd window (PATCH_ZSTD_WINDOW_LOG). The encoders take what they're given
+  in pieces of at most 64 KiB (ENCODER_PIECE).
 
 The heap tests in `tests/test_patch_lowmem.cpp` hold the patcher to these rules: each grows one
 structure tenfold, applies the patch in plain, low-memory and `--threads` mode, and fails when

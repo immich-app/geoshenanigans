@@ -9,14 +9,13 @@
 // length), --no-link (don't hardlink the other files), --manifest-out FILE (write the manifest
 // there: each streamed pass writes its own, the caller merges them).
 //
-// Families (each runs when its input files are present): streets, interps, way_parents,
-// way_postcodes, interp_postcodes, addr. The POI files are compact in every dir already (R2 and V2,
-// src/poi_files.h) and are hardlinked as they are.
+// Families (each runs when its input files are present): streets, interps, addr. The POI files (R2
+// and V2, src/poi_files.h) and the side files (src/side_blocks.h) are compact in every dir already
+// and are hardlinked as they are.
 // Every other file is hardlinked (copied across filesystems). OUT_DIR, new or empty, gets gc.manifest
 // (counts and parameters the decoder needs). Prints one "phase" line per family: wall and CPU
 // seconds, bytes in/out.
 #include "gc_addr.h"
-#include "gc_side.h"
 #include "gc_ways.h"
 
 #include <algorithm>
@@ -51,15 +50,6 @@ static std::vector<Family> families() {
                  },
                  [](auto& s, auto& o, Manifest& m) { ways::encode(s, o, false, m); },
                  [](auto& s, auto& o, const Manifest& m) { ways::decode(s, o, false, m); }});
-    f.push_back({"way_parents", {"way_parents.bin"}, {}, [](const Manifest&) { return V{"way_parents.u24"}; },
-                 [](auto& s, auto& o, Manifest& m) { side::encode_u24(s, o, m); },
-                 [](auto& s, auto& o, const Manifest& m) { side::decode_u24(s, o, m); }});
-    for (const char* n : {"way_postcodes", "interp_postcodes"}) {
-        const std::string name = n;
-        f.push_back({name, {name + ".bin"}, {}, [name](const Manifest&) { return V{name + ".u16", name + ".dict"}; },
-                     [name](auto& s, auto& o, Manifest& m) { side::encode_dict(s, o, name.c_str(), m); },
-                     [name](auto& s, auto& o, const Manifest& m) { side::decode_dict(s, o, name.c_str(), m); }});
-    }
     f.push_back({"addr", {"addr_points.bin", "addr_vertices.bin"}, {},
                  [](const Manifest&) { return V{"addr_points.col", "addr_vertices.abs2"}; },
                  [](auto& s, auto& o, Manifest& m) { addr::encode(s, o, m); },

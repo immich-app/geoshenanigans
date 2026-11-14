@@ -16,6 +16,7 @@
 #include "gcs_io.h"
 #include "place_files.h"
 #include "poi_files.h"
+#include "side_blocks.h"
 
 namespace gcs {
 
@@ -444,187 +445,142 @@ struct Enc : Encoder {
 };
 }  // namespace ways
 
-// ------------------------------------------------------------------ u32 sidecars
+// ------------------------------------------------------------------ side files (side_blocks.h)
+// way_parents.bin, way_postcodes.bin, interp_postcodes.bin and addr_postcodes.bin are side blocks in
+// every dir: these codecs turn one into its logical form, the u32 values back to back, for the
+// patcher's deltas and back. A family is its file's name without ".bin".
 namespace side {
-static const size_t CHUNK = 8192;  // values per decoder step
+// The codec's buffers: a file streams front to back a block (262 bytes at most) at a time, its
+// table 4 bytes a block.
+static const size_t BLOCKS_BUF = size_t(16) << 10, TABLE_BUF = size_t(4) << 10;
 
-// way_parents.u24: 3 bytes per value, NO_DATA -> 0xFFFFFF.
-struct U24Dec : Decoder {
-    uint64_t n, i = 0;
-    std::unique_ptr<Reader> r;
-    U24Dec(const std::string& src, const Manifest& m) : Decoder("way_parents", {"way_parents.bin"}) {
-        n = m.num("way_parents.n");
-        r.reset(new Reader(src + "/way_parents.u24", 48 << 10));
-        if (r->size() != 3 * n) die("way_parents.u24 size");
+// The footer of the side file `file` at path, of size bytes.
+inline side_blocks::Footer footer_of(const std::string& path, const std::string& file, uint64_t size) {
+    uint8_t f[side_blocks::FOOTER_BYTES] = {};
+    if (size >= side_blocks::FOOTER_BYTES) {
+        Reader footer(path, side_blocks::FOOTER_BYTES, size - side_blocks::FOOTER_BYTES);
+        memcpy(f, footer.take(side_blocks::FOOTER_BYTES), side_blocks::FOOTER_BYTES);
     }
-    uint64_t decoded_size(int) const override { return 4 * n; }
+    return side_blocks::read_footer(file, f, size);
+}
+
+// A dir's side file's decoded size, 4 bytes a value, from its footer alone: 0 without the file.
+inline uint64_t decoded_size(const std::string& dir, const std::string& family) {
+    const std::string file = family + ".bin", path = dir + "/" + file;
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return 0;
+    return footer_of(path, file, uint64_t(st.st_size)).logical_bytes();
+}
+
+// Port 0 = the file's values. A step: a block. A dir without the file decodes to none.
+struct Dec : Decoder {
+    std::string file;
+    std::unique_ptr<Reader> B, T;  // the blocks, and their table
+    side_blocks::Footer f;
+    uint64_t b = 0, at = 0;
+    Dec(const std::string& src, const std::string& family) : Decoder(family, {family + ".bin"}), file(family + ".bin") {
+        const std::string path = src + "/" + file;
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) return;
+        const uint64_t size = uint64_t(st.st_size);
+        f = footer_of(path, file, size);
+        B.reset(new Reader(path, BLOCKS_BUF, 0, f.table_at));
+        T.reset(new Reader(path, TABLE_BUF, f.table_at, size - side_blocks::FOOTER_BYTES));
+    }
+    uint64_t decoded_size(int) const override { return f.logical_bytes(); }
     bool step() override {
-        if (i == n) return false;
-        const size_t k = size_t(std::min<uint64_t>(CHUNK, n - i));
-        uint8_t* o = emit_reserve(0, 4 * k);
-        for (size_t j = 0; j < k; j++) {
-            const uint8_t* b = r->take(3);
-            uint32_t v = uint32_t(b[0]) | (uint32_t(b[1]) << 8) | (uint32_t(b[2]) << 16);
-            if (v == 0xFFFFFF) v = NO;
-            wr32(o + 4 * j, v);
+        if (!B) return false;
+        if (b == f.blocks) {
+            if (at != f.table_at) side_blocks::malformed(file, "bytes between its blocks and its table");
+            B.reset();
+            T.reset();
+            return false;
         }
-        i += k;
+        if (side_blocks::get32(T->take(side_blocks::TABLE_ENTRY_BYTES)) != at)
+            side_blocks::malformed(file, "block " + std::to_string(b) + " is not where the blocks before it end");
+        const size_t count = f.values_of(b), avail = size_t(std::min<uint64_t>(B->left(), side_blocks::BLOCK_MAX_BYTES));
+        // Decoded into u32s of their own: the queue's bytes sit at any address.
+        std::array<uint32_t, side_blocks::BLOCK_VALUES> values;
+        const size_t bytes = side_blocks::decode_block(file, b, avail ? B->need(avail) : nullptr, avail, count, values.data());
+        B->skip(bytes);
+        emit(0, values.data(), 4 * count);
+        at += bytes;
+        b++;
         return true;
     }
 };
 
-struct U24Enc : Encoder {
-    std::unique_ptr<Writer> w;
-    uint64_t n = 0;
-    explicit U24Enc(const std::string& od) : Encoder("way_parents", od, 1) { w.reset(new Writer(od + "/way_parents.u24", 48 << 10)); }
-    size_t consume(int, const uint8_t* p, size_t bytes) override {
-        const size_t k = bytes / 4;
-        for (size_t j = 0; j < k; j++) {
-            uint32_t v = rd32(p + 4 * j);
-            if (v == NO) v = 0xFFFFFF;
-            else if (v >= 0xFFFFFF) die("way_parents value %u does not fit 24 bits", v);
-            const uint8_t b[3] = {uint8_t(v), uint8_t(v >> 8), uint8_t(v >> 16)};
-            w->put(b, 3);
-        }
-        n += k;
-        return 4 * k;
+// Port 0 = the values in; the file out. The blocks go to it as they fill and their table entries
+// to a scratch file beside it, which finish appends to it with the footer: nothing grows with the
+// file but the files.
+struct Enc : Encoder {
+    struct BlockSink {
+        Writer* to;
+        void operator()(const uint8_t* p, size_t n) const { to->put(p, n); }
+    };
+    std::string file, tpath;
+    std::unique_ptr<Writer> BW, TW;
+    side_blocks::Encoder<BlockSink> blocks;
+    Enc(const std::string& od, const std::string& family)
+        : Encoder(family, od, 1),
+          file(family + ".bin"),
+          tpath(od + "/." + family + ".table"),
+          BW(new Writer(od + "/" + file, BLOCKS_BUF)),
+          TW(new Writer(tpath, TABLE_BUF, true)),
+          blocks(BlockSink{BW.get()}) {}
+    void add(uint32_t v) {
+        blocks.add(v);
+        if (!blocks.table().empty()) spill();
     }
-    void pump() override { in[0].pop(consume(0, in[0].data(), in[0].size())); }
-    void finish(Manifest& m) override {
+    void spill() {
+        for (const uint64_t offset : blocks.table()) {
+            uint8_t e[side_blocks::TABLE_ENTRY_BYTES];
+            side_blocks::write_table_entry(file, offset, e);
+            TW->put(e, sizeof e);
+        }
+        blocks.clear_table();
+    }
+    // Every byte straight from the writer (nothing queued): a value a write cuts waits in carry.
+    uint8_t carry[4];
+    size_t carried = 0;
+    size_t consume(int, const uint8_t* p, size_t n) override {
+        size_t used = 0;
+        if (carried) {
+            used = std::min(sizeof carry - carried, n);
+            memcpy(carry + carried, p, used);
+            carried += used;
+            if (carried < sizeof carry) return n;
+            add(rd32(carry));
+            carried = 0;
+        }
+        for (; n - used >= sizeof carry; used += sizeof carry) add(rd32(p + used));
+        memcpy(carry, p + used, n - used);
+        carried = n - used;
+        return n;
+    }
+    void pump() override {
+        if (in[0].size()) in[0].pop(consume(0, in[0].data(), in[0].size()));
+    }
+    void finish(Manifest&) override {
         require_empty();
-        m.set("way_parents.n", n);
-        w->finish();
-        w.reset();
-    }
-};
-
-// <name>.u16 (index per value, 0xFFFF = NO_DATA) + <name>.dict (the distinct values, ascending;
-// fewer than 0xFFFF of them).
-struct DictDec : Decoder {
-    uint64_t n, i = 0;
-    std::vector<uint32_t> dict;
-    std::unique_ptr<Reader> r;
-    DictDec(const std::string& src, const std::string& nm, const Manifest& m) : Decoder(nm, {nm + ".bin"}) {
-        n = m.num(nm + ".n");
-        // The dictionary holds the manifest's count of values, fewer than the u16 index's 0xFFFF:
-        // checked before it is read, so a malformed file can't make it any size.
-        const uint64_t nd = m.num(nm + ".dict");
-        if (nd >= 0xFFFF) die("%s: %llu dictionary values, past a u16 index", nm.c_str(), (unsigned long long)nd);
-        {
-            Reader d(src + "/" + nm + ".dict", 16 << 10);
-            if (d.size() != 4 * nd) die("%s.dict size", nm.c_str());
-            dict.reserve(size_t(nd));
-            while (!d.eof()) dict.push_back(d.u32());
+        if (carried) die("%s: the stream ends %zu bytes into a value", file.c_str(), carried);
+        blocks.finish();
+        spill();
+        TW->flush();
+        uint8_t buf[TABLE_BUF];
+        for (uint64_t off = 0, n = TW->tell(); off < n;) {
+            const size_t k = size_t(std::min<uint64_t>(sizeof buf, n - off));
+            pread_all(TW->fd, buf, k, off, tpath);
+            BW->put(buf, k);
+            off += k;
         }
-        r.reset(new Reader(src + "/" + nm + ".u16", 32 << 10));
-        if (r->size() != 2 * n) die("%s.u16 size", nm.c_str());
-    }
-    uint64_t decoded_size(int) const override { return 4 * n; }
-    bool step() override {
-        if (i == n) return false;
-        const size_t k = size_t(std::min<uint64_t>(CHUNK, n - i));
-        uint8_t* o = emit_reserve(0, 4 * k);
-        for (size_t j = 0; j < k; j++) {
-            const uint16_t x = r->u16();
-            if (x == 0xFFFF) { wr32(o + 4 * j, NO); continue; }
-            if (x >= dict.size()) die("%s: index out of range", name.c_str());
-            wr32(o + 4 * j, dict[x]);
-        }
-        i += k;
-        return true;
-    }
-};
-
-// One pass: each value is written as its first-seen index; at the end the dictionary is sorted and
-// the .u16 file is renumbered in place (a sequential read and write of it, no memory per value).
-struct DictEnc : Encoder {
-    size_t slots = 1 << 12;  // doubles to keep the load under a half (at most 2^17 for 65535 values)
-    std::vector<uint32_t> keys;
-    std::vector<uint16_t> vals;
-    std::vector<uint32_t> dict;  // first-seen order
-    std::unique_ptr<Writer> w;
-    uint64_t n = 0, nd = 0;
-    double renumber_s = 0;
-    DictEnc(const std::string& od, const std::string& nm) : Encoder(nm, od, 1), keys(slots, NO), vals(slots, 0) {
-        w.reset(new Writer(od + "/" + nm + ".u16", 32 << 10));
-    }
-    static inline size_t h(uint32_t k) { return size_t((uint64_t(k) * 0x9E3779B97F4A7C15ull) >> 32); }
-    // Doubles the table and reinserts every value but the newest (the caller places it).
-    void grow() {
-        slots *= 2;
-        keys.assign(slots, NO);
-        vals.assign(slots, 0);
-        for (size_t j = 0; j + 1 < dict.size(); j++) {
-            size_t s = h(dict[j]) & (slots - 1);
-            while (keys[s] != NO) s = (s + 1) & (slots - 1);
-            keys[s] = dict[j];
-            vals[s] = uint16_t(j);
-        }
-    }
-    void pump() override { in[0].pop(consume(0, in[0].data(), in[0].size())); }
-    size_t consume(int, const uint8_t* p, size_t bytes) override {
-        const size_t k = bytes / 4;
-        for (size_t j = 0; j < k; j++) {
-            const uint32_t v = rd32(p + 4 * j);
-            if (v == NO) { w->u16(0xFFFF); nd++; continue; }
-            size_t s = h(v) & (slots - 1);
-            while (keys[s] != NO && keys[s] != v) s = (s + 1) & (slots - 1);
-            if (keys[s] == NO) {
-                // Fewer than 0xFFFF values, as gc's encoder writes and both decoders take.
-                if (dict.size() + 1 >= 0xFFFF) die("%s: too many distinct values for a u16 index", name.c_str());
-                const uint16_t id = uint16_t(dict.size());
-                dict.push_back(v);
-                if (2 * dict.size() > slots) {
-                    grow();
-                    s = h(v) & (slots - 1);
-                    while (keys[s] != NO) s = (s + 1) & (slots - 1);
-                }
-                keys[s] = v;
-                vals[s] = id;
-            }
-            w->u16(vals[s]);
-        }
-        n += k;
-        return 4 * k;
-    }
-    void finish(Manifest& m) override {
-        require_empty();
-        w->finish();
-        w.reset();
-        std::vector<uint32_t> order(dict.size());
-        for (size_t j = 0; j < order.size(); j++) order[j] = uint32_t(j);
-        std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return dict[a] < dict[b]; });
-        std::vector<uint16_t> final_of(dict.size());
-        bool identity = true;
-        for (size_t j = 0; j < order.size(); j++) {
-            final_of[order[j]] = uint16_t(j);
-            identity &= order[j] == j;
-        }
-        {
-            Writer d(out_dir + "/" + name + ".dict", 16 << 10);
-            for (uint32_t j : order) d.u32(dict[j]);
-            d.finish();
-        }
-        if (!identity) {
-            const std::string p = out_dir + "/" + name + ".u16";
-            const int fd = open(p.c_str(), O_RDWR | O_CLOEXEC);
-            if (fd < 0) die("open %s: %s", p.c_str(), strerror(errno));
-            posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
-            std::vector<uint16_t> b(16 << 10);
-            for (uint64_t at = 0; at < 2 * n;) {
-                const size_t want = size_t(std::min<uint64_t>(2 * b.size(), 2 * n - at));
-                pread_all(fd, b.data(), want, at, p);
-                for (size_t j = 0; j < want / 2; j++)
-                    if (b[j] != 0xFFFF) b[j] = final_of[b[j]];
-                pwrite_all(fd, b.data(), want, at, p);
-                at += want;
-            }
-            if (close(fd)) die("close %s", p.c_str());
-        }
-        m.set(name + ".n", n);
-        m.set(name + ".dict", dict.size());
-        std::vector<uint32_t>().swap(keys);
-        std::vector<uint16_t>().swap(vals);
+        const auto footer = side_blocks::footer(file, blocks.values());
+        BW->put(footer.data(), footer.size());
+        TW->finish();
+        if (unlink(tpath.c_str())) die("unlink %s: %s", tpath.c_str(), strerror(errno));
+        BW->finish();
+        TW.reset();
+        BW.reset();
     }
 };
 }  // namespace side

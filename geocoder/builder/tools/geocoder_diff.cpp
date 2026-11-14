@@ -13,7 +13,7 @@
 //        geocoder-diff --decode-logical <dir> <out-dir>
 //        geocoder-diff --logical-size <dir>
 //
-// --decode-logical writes the logical files the merges read of the families
+// --decode-logical writes the logical files the diff reads of the families
 // the builder writes encoded (logical_families), and no patch.
 //
 // --logical-size prints the bytes a diff maps for <dir>'s record files and
@@ -66,6 +66,7 @@
 #include "poi_files.h"
 #include "scratch_dir.h"
 #include "record_match.h"
+#include "side_blocks.h"
 #include "string_offset_map.h"
 #include "types.h"
 
@@ -528,11 +529,12 @@ struct FileMergeResult {
 // A record file that feeds entry corrections merges as itself when unchanged
 // (sent_unchanged), so the diff derives its dependents with the ids the
 // patcher keeps.
-// The merges diff the logical form of the families the builder writes encoded
-// (logical_families): each dir's POI files (R2 and V2, poi_files.h) and place
-// files (place_files.h, their logical stream as place_nodes.bin) are decoded
-// at the start into a scratch dir of their own, which merge_path reads them
-// from.
+// The merges and the side files' deltas diff the logical form of the families
+// the builder writes encoded (logical_families): each dir's POI files (R2 and
+// V2, poi_files.h), place files (place_files.h, their logical stream as
+// place_nodes.bin) and side files (side_blocks.h, each its u32 values) are
+// decoded at the start into a scratch dir of their own, which merge_path
+// reads them from.
 static std::map<std::string, std::string>& logical_dirs() {
     static std::map<std::string, std::string> dirs;
     return dirs;
@@ -625,6 +627,37 @@ static uint64_t place_logical_size(const LogicalFamily&, const std::string& dir)
     const uint64_t hidden = stat(hp.c_str(), &st) == 0 ? static_cast<uint64_t>(st.st_size) / place_files::HIDDEN_ROW_BYTES : 0;
     return place_files::LOGICAL_STRIDE * (uint64_t{f.rows} + hidden);
 }
+// Decodes dir's side file, the family's one file, into its values in to;
+// false: dir has no such file.
+static bool decode_side_file(const LogicalFamily& family, const std::string& dir, const std::string& to) {
+    const char* name = family.files[0];
+    const std::string path = dir + "/" + name;
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return false;
+    MappedFile m = mmap_file(path);
+    if (static_cast<uint64_t>(st.st_size) != m.size) throw std::runtime_error("Cannot read " + path);
+    std::ofstream o(to + "/" + name, std::ios::binary);
+    side_blocks::decode(name, reinterpret_cast<const uint8_t*>(m.data), m.size, [&](const uint32_t* values, size_t count) {
+        o.write(reinterpret_cast<const char*>(values), static_cast<std::streamsize>(4 * count));
+    });
+    unmap_file(m);
+    if (!o.flush()) throw std::runtime_error("Cannot write the decoded " + path);
+    return true;
+}
+// The bytes decode_side_file writes for dir, from the file's footer alone; 0
+// without the file.
+static uint64_t side_logical_size(const LogicalFamily& family, const std::string& dir) {
+    const char* name = family.files[0];
+    const std::string path = dir + "/" + name;
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return 0;
+    MappedFile m = mmap_file(path);
+    if (static_cast<uint64_t>(st.st_size) != m.size) throw std::runtime_error("Cannot read " + path);
+    const side_blocks::Footer f = side_blocks::read_footer(
+        name, reinterpret_cast<const uint8_t*>(m.data) + m.size - std::min<size_t>(m.size, side_blocks::FOOTER_BYTES), m.size);
+    unmap_file(m);
+    return f.logical_bytes();
+}
 static const std::vector<LogicalFamily>& logical_families() {
     static const std::vector<LogicalFamily> f = {
         {"poi", {"poi_records.bin", "poi_vertices.bin"}, {"poi_records.bin", "poi_vertices.bin"}, decode_poi_files, poi_logical_size},
@@ -633,6 +666,10 @@ static const std::vector<LogicalFamily>& logical_families() {
          {place_files::CELLS_FILE, place_files::NODES_FILE, place_files::HIDDEN_FILE},
          decode_place_files,
          place_logical_size},
+        {"way_parents", {"way_parents.bin"}, {"way_parents.bin"}, decode_side_file, side_logical_size},
+        {"way_postcodes", {"way_postcodes.bin"}, {"way_postcodes.bin"}, decode_side_file, side_logical_size},
+        {"interp_postcodes", {"interp_postcodes.bin"}, {"interp_postcodes.bin"}, decode_side_file, side_logical_size},
+        {"addr_postcodes", {"addr_postcodes.bin"}, {"addr_postcodes.bin"}, decode_side_file, side_logical_size},
     };
     return f;
 }
@@ -2210,13 +2247,17 @@ static int run(int argc, char* argv[]) {
     //   3 = postcode_centroid     (16B struct, patcher_strings on bytes 8-11 only)
     // String offsets are remapped as the patcher will remap them, so a moved
     // string the strings section sends no pair for arrives as a change.
+    //
+    // A side file (side_blocks.h) is diffed and sent as its values: the
+    // section's sizes, its changes and a full replacement's payload are of
+    // the logical file (merge_path), which the patcher encodes.
     auto emit_sparse_delta = [&](PatchFileId fid, const char* fname,
                                   uint32_t value_stride, uint32_t remap_kind) {
         SEC("sparse:" << fname);
-        std::string new_path = new_dir + "/" + std::string(fname);
-        std::string old_path = old_dir + "/" + std::string(fname);
         struct stat nst;
-        if (stat(new_path.c_str(), &nst) != 0) return;
+        if (stat((new_dir + "/" + fname).c_str(), &nst) != 0) return;
+        const std::string new_path = merge_path(new_dir, fname), old_path = merge_path(old_dir, fname);
+        if (stat(new_path.c_str(), &nst) != 0) throw std::runtime_error("Cannot read " + new_path);
         uint64_t new_size = (uint64_t)nst.st_size;
         struct stat ost;
         uint64_t old_size = (stat(old_path.c_str(), &ost) == 0) ? (uint64_t)ost.st_size : 0;
@@ -2382,12 +2423,16 @@ static int run(int argc, char* argv[]) {
     // v8: a per-record side file follows its parent's merge (old values of
     // kept records copied and remapped, inserted records' values inline),
     // then the values that changed. Falls back to the positional sparse
-    // delta when the parent wasn't merged.
+    // delta when the parent wasn't merged, and with it to a full replacement
+    // of the values of a file the old dir lacks. A file the new dir lacks
+    // gets no section.
     auto emit_parallel_delta = [&](const ParallelDeltaFile& f) {
         const char* fname = patch_file_names[(uint32_t)f.fid];
-        std::string new_path = new_dir + "/" + fname, old_path = old_dir + "/" + fname;
         struct stat nst, ost;
-        if (stat(new_path.c_str(), &nst) != 0) return;
+        if (stat((new_dir + "/" + fname).c_str(), &nst) != 0) return;
+        // The values, as emit_sparse_delta reads them.
+        const std::string new_path = merge_path(new_dir, fname), old_path = merge_path(old_dir, fname);
+        if (stat(new_path.c_str(), &nst) != 0) throw std::runtime_error("Cannot read " + new_path);
         uint64_t new_size = (uint64_t)nst.st_size;
         uint64_t old_size = stat(old_path.c_str(), &ost) == 0 ? (uint64_t)ost.st_size : 0;
         const FileMergeResult& parent = f.parent == PatchFileId::STREET_WAYS ? res_ways

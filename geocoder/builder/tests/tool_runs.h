@@ -6,21 +6,26 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "patch_format.h"
 #include "poi_files.h"
 #include "sanitizer_report.h"
+#include "side_blocks.h"
 
 namespace gctest {
 
-// A build dir's files by name. Its POI files and string tiers are logical:
-// poi_records.bin the 36-byte records, poi_vertices.bin the vertex stream they
-// point into, a strings_*.bin its pool.
+// A build dir's files by name. Its POI files, side files and string tiers are
+// logical: poi_records.bin the 36-byte records, poi_vertices.bin the vertex
+// stream they point into, a side file (way_parents.bin, way_postcodes.bin,
+// interp_postcodes.bin, addr_postcodes.bin) its u32 values, a strings_*.bin
+// its pool.
 using BuildDir = std::map<std::string, std::vector<char>>;
 
 inline bool is_string_tier(const std::string& name) {
@@ -54,9 +59,23 @@ inline void write_poi_family(const WrittenFamily& family, const BuildDir& files,
     out["poi_vertices.bin"].assign(f.vertices.begin(), f.vertices.end());
 }
 
+// A side file as side blocks (side_blocks.h) of its u32 values.
+inline void write_side_file(const WrittenFamily& family, const BuildDir& files, BuildDir& out) {
+    const std::vector<char>& logical = files.at(family.records);
+    if (logical.size() % 4) throw std::runtime_error(std::string(family.records) + " is not whole values");
+    std::vector<uint32_t> values(logical.size() / 4);
+    if (!values.empty()) memcpy(values.data(), logical.data(), logical.size());
+    const std::vector<uint8_t> f = side_blocks::encode(family.records, values.data(), values.size());
+    out[family.records].assign(f.begin(), f.end());
+}
+
 inline const std::vector<WrittenFamily>& written_families() {
     static const std::vector<WrittenFamily> f = {
         {"poi_records.bin", write_poi_family},
+        {"way_parents.bin", write_side_file},
+        {"way_postcodes.bin", write_side_file},
+        {"interp_postcodes.bin", write_side_file},
+        {"addr_postcodes.bin", write_side_file},
     };
     return f;
 }

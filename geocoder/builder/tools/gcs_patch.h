@@ -1,10 +1,11 @@
 // The patcher's side of the in-process codecs: every today's-format file of an encoded family is
 // a virtual old file (a SequentialFileReader reads it from the family's decoder) and a virtual
 // output (open_out hands back a FILE* whose bytes go to the family's encoder). A native family
-// (the POI files, R2 and V2 in every dir: poi_files.h; the place files, place_files.h) is encoded
-// in every dir under today's names, the place files' logical stream as place_nodes.bin; gc's
-// families only in an encoded installed set (a dir with a gc.manifest), whose new dir gets the
-// merged gc.manifest. No today's-format file of an encoded family touches the disk.
+// (the POI files, R2 and V2 in every dir: poi_files.h; the place files, place_files.h; each of the
+// four side files, side_blocks.h) is encoded in every dir under today's names, the place files'
+// logical stream as place_nodes.bin; gc's families only in an encoded installed set (a dir with a
+// gc.manifest), whose new dir gets the merged gc.manifest. No today's-format file of an encoded
+// family touches the disk.
 #pragma once
 #include <malloc.h>
 #include <set>
@@ -32,7 +33,7 @@ struct FamilyDesc {
     Encoder* (*encoder)(const std::string& dir, const ListedSizes& sizes);
     uint64_t (*decoded_size)(const std::string& dir, int port);
 };
-// gc's family order (tools/gc.cpp; gc.families lists them in it), then the native ones.
+// gc's families in gc's order (tools/gc.cpp; gc.families lists them in it), and the native ones.
 static const std::vector<FamilyDesc>& families() {
     static const std::vector<FamilyDesc> f = {
         {"streets", {"street_ways.bin", "street_nodes.bin"}, false,
@@ -41,15 +42,22 @@ static const std::vector<FamilyDesc>& families() {
         {"interps", {"interp_ways.bin", "interp_nodes.bin"}, false,
          [](const std::string& dir, const Manifest& m) -> Decoder* { return new ways::Dec(dir, false, m); },
          [](const std::string& dir, const ListedSizes&) -> Encoder* { return new ways::Enc(dir, false); }, nullptr},
-        {"way_parents", {"way_parents.bin"}, false,
-         [](const std::string& dir, const Manifest& m) -> Decoder* { return new side::U24Dec(dir, m); },
-         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::U24Enc(dir); }, nullptr},
-        {"way_postcodes", {"way_postcodes.bin"}, false,
-         [](const std::string& dir, const Manifest& m) -> Decoder* { return new side::DictDec(dir, "way_postcodes", m); },
-         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::DictEnc(dir, "way_postcodes"); }, nullptr},
-        {"interp_postcodes", {"interp_postcodes.bin"}, false,
-         [](const std::string& dir, const Manifest& m) -> Decoder* { return new side::DictDec(dir, "interp_postcodes", m); },
-         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::DictEnc(dir, "interp_postcodes"); }, nullptr},
+        {"way_parents", {"way_parents.bin"}, true,
+         [](const std::string& dir, const Manifest&) -> Decoder* { return new side::Dec(dir, "way_parents"); },
+         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::Enc(dir, "way_parents"); },
+         [](const std::string& dir, int) { return side::decoded_size(dir, "way_parents"); }},
+        {"way_postcodes", {"way_postcodes.bin"}, true,
+         [](const std::string& dir, const Manifest&) -> Decoder* { return new side::Dec(dir, "way_postcodes"); },
+         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::Enc(dir, "way_postcodes"); },
+         [](const std::string& dir, int) { return side::decoded_size(dir, "way_postcodes"); }},
+        {"interp_postcodes", {"interp_postcodes.bin"}, true,
+         [](const std::string& dir, const Manifest&) -> Decoder* { return new side::Dec(dir, "interp_postcodes"); },
+         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::Enc(dir, "interp_postcodes"); },
+         [](const std::string& dir, int) { return side::decoded_size(dir, "interp_postcodes"); }},
+        {"addr_postcodes", {"addr_postcodes.bin"}, true,
+         [](const std::string& dir, const Manifest&) -> Decoder* { return new side::Dec(dir, "addr_postcodes"); },
+         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::Enc(dir, "addr_postcodes"); },
+         [](const std::string& dir, int) { return side::decoded_size(dir, "addr_postcodes"); }},
         {"addr", {"addr_points.bin", "addr_vertices.bin"}, false,
          [](const std::string& dir, const Manifest& m) -> Decoder* { return new addr::Dec(dir, m); },
          [](const std::string& dir, const ListedSizes& sizes) -> Encoder* {

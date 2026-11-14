@@ -5,7 +5,6 @@
 // tool never writes its source, refuses an encoded dir as encode input and an
 // output dir holding files. (The patcher's decoders: tests/test_gcs_codec.cpp.)
 #include "gc_addr.h"
-#include "gc_side.h"
 #include "gc_ways.h"
 
 #include <csignal>
@@ -158,6 +157,27 @@ void street_today_set(const std::string& dir) {
     write_bytes(dir + "/a.bin", {'k', 'e', 'e', 'p'});
     write_bytes(dir + "/street_ways.bin", ways);
     write_bytes(dir + "/street_nodes.bin", nodes);
+}
+
+// Three address points, the second with a footprint of three vertices, and a
+// file of no family.
+void addr_today_set(const std::string& dir) {
+    std::vector<uint8_t> points, verts;
+    for (uint32_t a = 0; a < 3; a++) {
+        putf(points, 47.0f + float(a) * 1e-4f);
+        putf(points, 8.0f);
+        for (const uint32_t w : {200 + a, 300 + a, a}) put32(points, w);  // house number, street, parent way
+        put32(points, a == 1 ? 0 : gcset::NO);                            // vertex_offset
+        put32(points, a == 1 ? 3 : 0);                                    // vertex_count
+    }
+    verts.insert(verts.end(), {0, 0});  // encoding 0, pad
+    putf(verts, 47.0f);
+    putf(verts, 8.0f);
+    for (const uint8_t q : {1, 2, 30, 4, 5, 60}) verts.insert(verts.end(), {q, 0});  // u16 latitude and longitude steps
+    std::filesystem::create_directories(dir);
+    write_bytes(dir + "/a.bin", {'k', 'e', 'e', 'p'});
+    write_bytes(dir + "/addr_points.bin", points);
+    write_bytes(dir + "/addr_vertices.bin", verts);
 }
 
 // A gc run: exit status 0, and its log.
@@ -415,53 +435,6 @@ TEST(gc_ways_decoders_refuse_a_way_starting_past_node_u32) {
     }
 }
 
-// A dictionary family's .dict holds the manifest's count of values, fewer
-// than the u16 index's 0xFFFF, and is refused before it is read otherwise: a
-// value more than the manifest's, 0xFFFF values (as many as the manifest
-// says), and a sparse 64 MiB file under a dictionary of none (all read in,
-// before). Two values and three indexes decode, and so do 0xFFFE values.
-TEST(gc_dictionary_decoder_refuses_a_dict_past_the_manifest) {
-    struct Case {
-        const char* name;
-        uint64_t manifest, values;  // the manifest's dictionary count, the file's
-        uint64_t sparse_bytes;      // instead: a sparse file of these bytes
-        bool valid;
-    };
-    const Case cases[] = {
-        {"as encoded", 2, 2, 0, true},
-        {"a value more", 2, 3, 0, false},
-        {"0xFFFE values", 0xFFFE, 0xFFFE, 0, true},
-        {"0xFFFF values", 0xFFFF, 0xFFFF, 0, false},
-        {"64 MiB, none", 0, 0, uint64_t(64) << 20, false},
-    };
-    ScratchDir dir("gc-dict");
-    int n = 0;
-    for (const Case& c : cases) {
-        const std::string src = dir.path() + "/" + std::to_string(n++), out = src + "/out";
-        std::filesystem::create_directories(out);
-        std::vector<uint8_t> dict, index;
-        for (uint64_t v = 0; v < c.values; v++) put32(dict, uint32_t(100 + v));
-        write_bytes(src + "/way_postcodes.dict", dict);
-        if (c.sparse_bytes) std::filesystem::resize_file(src + "/way_postcodes.dict", c.sparse_bytes);
-        const std::vector<uint16_t> ids = c.manifest ? std::vector<uint16_t>{0, 1, 0xFFFF} : std::vector<uint16_t>{};
-        for (uint16_t x : ids) for (uint8_t b : le(x, 2)) index.push_back(b);
-        write_bytes(src + "/way_postcodes.u16", index);
-
-        const int status = exit_status_in_child(
-            [&] {
-                gcset::Manifest m;
-                m.set("way_postcodes.n", ids.size());
-                m.set("way_postcodes.dict", c.manifest);
-                gcset::side::decode_dict(src, out, "way_postcodes", m);
-                return 0;
-            },
-            20);
-
-        if (status != (c.valid ? 0 : 2)) std::printf("    %s: exit %d\n", c.name, status);
-        CHECK_EQ(status, c.valid ? 0 : 2);
-    }
-}
-
 // Footprints past abs2's bound round trip through the raw escape, byte for
 // byte: the encoder in one pass and in its two streamed passes, and the
 // decoders whole, points only and vertices only.
@@ -628,7 +601,7 @@ TEST(gc_never_writes_its_source_dir) {
     ScratchDir dir("gc-cli");
     const std::string& root = dir.path();
     const std::string src = root + "/source", encoded = root + "/encoded", log = root + "/gc.log";
-    street_today_set(src);
+    addr_today_set(src);
     REQUIRE(run_gc({"encode", src, encoded}, log).ok);
     REQUIRE(std::filesystem::exists(encoded + "/gc.manifest"));
     for (const auto& [mode, source] : {std::pair<std::string, std::string>{"encode", src}, {"decode", encoded}}) {
@@ -656,17 +629,15 @@ TEST(gc_decode_of_some_families_leaves_an_encoded_set_of_the_rest) {
     ScratchDir dir("gc-decode-part");
     const std::string& root = dir.path();
     const std::string src = root + "/source", enc = root + "/encoded", part = root + "/part", log = root + "/gc.log";
+    addr_today_set(src);
     street_today_set(src);
-    std::vector<uint8_t> parents;
-    for (const uint32_t p : {7u, gcset::NO, 0xFFFFFEu}) put32(parents, p);
-    write_bytes(src + "/way_parents.bin", parents);
     REQUIRE(run_gc({"encode", src, enc}, log).ok);
-    REQUIRE(run_gc({"decode", enc, part, "--only", "way_parents"}, log).ok);
+    REQUIRE(run_gc({"decode", enc, part, "--only", "streets"}, log).ok);
     const auto manifest = read_file(part + "/gc.manifest");
 
     auto r = run_gc({"decode", part, root + "/whole"}, log);
 
-    CHECK(std::string(manifest.begin(), manifest.end()).find("gc.families streets\n") != std::string::npos);
+    CHECK(std::string(manifest.begin(), manifest.end()).find("gc.families addr\n") != std::string::npos);
     CHECK(r.ok);
     CHECK(r.ok && gctest::read_dir(root + "/whole") == gctest::read_dir(src));
 }
@@ -680,9 +651,9 @@ TEST(gc_refuses_an_out_dir_holding_files) {
     ScratchDir dir("gc-out-dir");
     const std::string& root = dir.path();
     const std::string src = root + "/source", enc = root + "/encoded", log = root + "/gc.log";
-    street_today_set(src);
+    addr_today_set(src);
     REQUIRE(run_gc({"encode", src, enc}, log).ok);
-    const std::vector<std::vector<std::string>> runs = {{"decode", enc}, {"decode", enc, "--only", "streets"}, {"encode", src}};
+    const std::vector<std::vector<std::string>> runs = {{"decode", enc}, {"decode", enc, "--only", "addr"}, {"encode", src}};
     for (size_t k = 0; k < runs.size(); k++) {
         const std::string reused = root + "/reused" + std::to_string(k);
         std::filesystem::copy(enc, reused);
@@ -700,10 +671,10 @@ TEST(gc_refuses_an_out_dir_holding_files) {
     std::filesystem::create_directories(empty);
     REQUIRE(run_gc({"decode", enc, empty}, log).ok);
     CHECK(gctest::read_dir(empty) == gctest::read_dir(src));
-    REQUIRE(run_gc({"decode", enc, streamed, "--files", "street_nodes.bin", "--no-link"}, log).ok);
-    auto r = run_gc({"decode", enc, streamed, "--files", "street_ways.bin", "--no-link"}, log);
+    REQUIRE(run_gc({"decode", enc, streamed, "--files", "addr_vertices.bin", "--no-link"}, log).ok);
+    auto r = run_gc({"decode", enc, streamed, "--files", "addr_points.bin", "--no-link"}, log);
     CHECK(r.ok);
-    for (const char* f : {"/street_ways.bin", "/street_nodes.bin"}) CHECK(read_bytes(streamed + f) == read_bytes(src + f));
+    for (const char* f : {"/addr_points.bin", "/addr_vertices.bin"}) CHECK(read_bytes(streamed + f) == read_bytes(src + f));
 }
 
 // An encoded dir is refused as encode input, whole or one more family with
