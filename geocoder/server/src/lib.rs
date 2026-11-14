@@ -1703,8 +1703,9 @@ impl Index {
     // tells two builds' answers apart: its record id, its distance exactly
     // (`dist_bits`, the bits of the squared distance the scan compared) and,
     // for an address or a street, the key that breaks an exact tie (`tie`,
-    // floats as their bits). Two winners with equal `dist_bits` and `tie`
-    // were told apart by record order alone.
+    // floats as their bits, -0 as +0 since the scan compares them equal).
+    // Two winners with equal `dist_bits` and `tie` were told apart by record
+    // order alone.
     pub fn debug_primary(&self, lat: f64, lng: f64) -> serde_json::Value {
         let (addr, interp, street) = self.query_geo(lat, lng);
         let poi_primary = self.find_nearest_poi_with_parent(lat, lng);
@@ -1732,7 +1733,8 @@ impl Index {
                 "dist_bits": bits(d),
                 "tie": self.street_nodes.as_ref().map(|nodes| {
                     let (name, first_lat, first_lng) = self.street_tie_key(nodes, &w);
-                    serde_json::json!([name, format!("{:08x}", first_lat.to_bits()), format!("{:08x}", first_lng.to_bits())])
+                    let float_bits = |v: f32| format!("{:08x}", if v == 0.0 { 0 } else { v.to_bits() });
+                    serde_json::json!([name, float_bits(first_lat), float_bits(first_lng)])
                 }),
             })),
             "interp": interp.map(|(d, s, n, id)| serde_json::json!({

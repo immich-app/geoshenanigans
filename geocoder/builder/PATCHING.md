@@ -180,7 +180,9 @@ keep it so:
   gives it, and the patcher refuses one that steps back. The lists it looks keys up in (the
   moved-string pairs, the parent-id legs, the secondary remap) are searched where they sit
   (`SortedTable`: a binary search narrowed by a directory of at most 4096 sampled keys,
-  TABLE_DIRECTORY_KEYS, and a 4 KiB key filter); the others are read once, front to back, as the
+  TABLE_DIRECTORY_KEYS, itself cut into at most 4096 key-range buckets, TABLE_BUCKETS, so a
+  lookup in any key order searches one bucket; and a 4 KiB key filter); the others are read
+  once, front to back, as the
   walk or replay they serve reaches them.
 - **Remap runs spill.** The string and record remap runs the patcher derives (from each string
   tier's walk and each file's replay) go through a 64 KiB buffer (SCRATCH_TABLE_BUF) to files in

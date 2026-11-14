@@ -413,10 +413,10 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0, uint64_t
     std::cerr << "  Addr points sorted: " << n << std::endl;
 }
 
-// Sorts ways by (name, node_count, nodes) and reorders their nodes; returns
-// old_to_new, which the addr points' parent ways still need (see
-// remap_parent_ways), empty when there are no ways. `headroom` as for
-// reorder_addr_points.
+// Sorts ways by (name, node_count, nodes) and dedups them, lays the survivors
+// out in cell order and reorders their nodes; returns old_to_new, which the
+// addr points' parent ways still need (see remap_parent_ways), empty when
+// there are no ways. `headroom` as for reorder_addr_points.
 inline std::vector<uint32_t> sort_ways(ParsedData& data, unsigned threads = 0, uint64_t headroom = UINT64_MAX) {
     if (data.ways.empty()) return {};
 

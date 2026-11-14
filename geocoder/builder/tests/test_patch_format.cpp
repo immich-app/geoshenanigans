@@ -1670,8 +1670,9 @@ TEST(patch_format_sorted_and_scratch_tables_floor_as_upper_bound_does) {
 
 TEST(patch_format_sorted_table_floors_keys_crowded_into_few_buckets_or_at_bucket_edges) {
     // The directory's buckets cut the key range evenly; these keys don't
-    // fill it evenly: all in one bucket, all at the top of the range, every
-    // one on a bucket's first or last key, one key far above a crowd.
+    // fill it evenly: all in one bucket, all at the top of the range, pairs
+    // at each multiple of 2^18 and the key just below the next, one key far
+    // above a crowd.
     std::vector<std::vector<uint32_t>> shapes;
     std::vector<uint32_t> crowd, top, edges, outlier;
     for (uint32_t i = 0; i < 10000; i++) {

@@ -15,7 +15,10 @@
 // the point's primary features (Index::debug_primary): the winning address,
 // street and interpolation with their record ids, exact distances and tie
 // keys. Where two builds answer differently, equal distances and tie keys
-// say record order alone told the winners apart.
+// say record order alone told the winners apart. On a root of continent
+// dirs it explains the first region that covers the point, as the server's
+// debug endpoint does, while the answer is the best of them all: "covering"
+// counts them, and above 1 the line may explain another region's winners.
 use query_server::{
     MultiIndex, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL,
 };
@@ -51,7 +54,9 @@ fn main() {
         };
         // Print coords with fixed precision so two runs key identically.
         if explain {
-            let primary = idx.loaded_matches(lat, lng).first().map_or(serde_json::Value::Null, |index| index.debug_primary(lat, lng));
+            let covering = idx.loaded_matches(lat, lng);
+            let mut primary = covering.first().map_or(serde_json::json!({}), |index| index.debug_primary(lat, lng));
+            primary["covering"] = serde_json::json!(covering.len());
             writeln!(out, "{:.6} {:.6} {}", lat, lng, primary).unwrap();
         } else {
             writeln!(out, "{:.6} {:.6} {}", lat, lng, idx.query_json(lat, lng)).unwrap();

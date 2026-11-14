@@ -57,7 +57,8 @@ PackedLocation e7_point(Rng& r) {
 std::vector<CellItemPair> new_cell_pairs(Rng& r, size_t n, uint32_t items, bool flags) {
     std::vector<CellItemPair> pairs(n);
     for (auto& p : pairs) {
-        p.cell_id = r.below(97) * 0x1000000001ull;
+        // 97 cells whose high and low halves order differently.
+        p.cell_id = r.below(97) * 0x9E3779B97F4A7C15ull;
         p.item_id = r.below(items) | (flags && r.one_in(3) ? INTERIOR_FLAG : 0);
     }
     std::sort(pairs.begin(), pairs.end(), cell_item_less);
@@ -623,6 +624,18 @@ TEST(regroup_by_cell_moves_whole_runs_by_their_least_cell_and_keeps_ties_in_plac
     regroup_by_cell(order, starts, {}, 2);
     CHECK(order == std::vector<uint32_t>({1, 0, 2}));
     CHECK(starts == std::vector<uint32_t>({0, 2}));
+
+    // The whole 64-bit cell orders the runs: a cell whose low half is the
+    // larger still comes first when its high half is the smaller, and cells
+    // of one high half go by their low halves.
+    const std::vector<CellItemPair> wide = {{0x0000000100000000ull, 0}, {0x00000000FFFFFFFFull, 1},
+                                            {0x0000000100000002ull, 2}, {0x0000000100000001ull, 3}};
+    for (unsigned threads : kThreadCounts) {
+        std::vector<uint32_t> records = {0, 1, 2, 3}, runs = {0, 1, 2, 3};
+        regroup_by_cell(records, runs, wide, threads);
+        CHECK(records == std::vector<uint32_t>({1, 0, 3, 2}));
+        CHECK(runs == std::vector<uint32_t>({0, 1, 2, 3}));
+    }
 }
 
 TEST(reorder_ways_puts_them_in_cell_order_and_ways_of_one_cell_in_name_order) {
@@ -641,9 +654,9 @@ TEST(reorder_ways_puts_them_in_cell_order_and_ways_of_one_cell_in_name_order) {
         d.way_osm_ids = {100, 101, 102, 103};
         d.way_parent_ids = {200, 201, 202, 203};
         d.way_postcode_ids = {300, 301, 302, 303};
-        // Way 0 lies in cells 10 and 40, ways 1 and 2 in cell 20, way 3 in
-        // none.
-        d.sorted_way_cells = {{10, 0}, {20, 1}, {20, 2}, {40, 0}};
+        // Way 0 lies in cells 10 and 40, ways 1 and 2 in cell 20, way 1 in
+        // cell 50 too, way 3 in none.
+        d.sorted_way_cells = {{10, 0}, {20, 1}, {20, 2}, {40, 0}, {50, 1}};
         d.addr_points.resize(5);
         for (uint32_t i = 0; i < 5; i++) d.addr_points[i].parent_way_id = i < 4 ? i : NO_DATA;
         reorder_ways(d, threads);
@@ -668,7 +681,8 @@ TEST(reorder_ways_puts_them_in_cell_order_and_ways_of_one_cell_in_name_order) {
             CHECK_EQ(d.way_postcode_ids[k], 300 + i);
         }
         CHECK_EQ(d.street_nodes.size(), size_t(10));
-        CHECK(same_pairs(d.sorted_way_cells, {{10, 0}, {20, 1}, {20, 2}, {40, 0}}));
+        // Way 1 is way 2 now: cell 50 lists it under its new id.
+        CHECK(same_pairs(d.sorted_way_cells, {{10, 0}, {20, 1}, {20, 2}, {40, 0}, {50, 2}}));
         CHECK_EQ(d.addr_points[0].parent_way_id, 0u);
         CHECK_EQ(d.addr_points[1].parent_way_id, 2u);
         CHECK_EQ(d.addr_points[2].parent_way_id, 1u);
@@ -690,26 +704,30 @@ TEST(reorder_addr_points_puts_folded_copies_under_the_least_cell_of_either) {
         AddrPoint b = a;
         b.street_id = 2;  // ahead of a by street
         b.vertex_count = 1;
-        // b, then two copies of a, each with its own copy of the footprint.
+        // b, then two copies of a, each with a footprint of its own (the
+        // dedup does not compare them). By osm id the second copy (60) sorts
+        // ahead of the first (61) and survives.
         d.addr_points = {b, a, a};
         d.addr_points[0].vertex_offset = 0;
         d.addr_points[1].vertex_offset = 1;
         d.addr_points[2].vertex_offset = 3;
-        d.addr_vertices = {{7.0f, 7.5f}, {8.0f, 8.5f}, {9.0f, 9.5f}, {8.0f, 8.5f}, {9.0f, 9.5f}};
+        d.addr_vertices = {{7.0f, 7.5f}, {8.0f, 8.5f}, {9.0f, 9.5f}, {8.0f, 8.5f}, {9.0f, 9.75f}};
         d.addr_osm_ids = {50, 61, 60};
         d.addr_postcode_ids = {70, NO_DATA, 81};
-        // The copies' exact points lie in two cells, one each side of b's.
-        d.sorted_addr_cells = {{5, 2}, {7, 0}, {9, 1}};
+        // The copies' exact points lie in two cells, one each side of b's:
+        // the least is the cell of the copy that does not survive.
+        d.sorted_addr_cells = {{5, 1}, {7, 0}, {9, 2}};
         reorder_addr_points(d, threads);
 
         // The copies fold into one record, which cell 5 puts ahead of b; it
-        // keeps the first copy's osm id (60) and the first postcode set.
+        // keeps the surviving copy's osm id (60), footprint and postcode,
+        // and the other copy's footprint follows its own.
         REQUIRE(d.addr_points.size() == size_t(2));
         CHECK_EQ(d.addr_points[0].street_id, 4u);
         CHECK_EQ(d.addr_points[0].vertex_offset, 0u);
         CHECK_EQ(d.addr_points[1].street_id, 2u);
         CHECK_EQ(d.addr_points[1].vertex_offset, 4u);
-        CHECK(same_bytes(d.addr_vertices, std::vector<NodeCoord>({{8.0f, 8.5f}, {9.0f, 9.5f}, {8.0f, 8.5f},
+        CHECK(same_bytes(d.addr_vertices, std::vector<NodeCoord>({{8.0f, 8.5f}, {9.0f, 9.75f}, {8.0f, 8.5f},
                                                                     {9.0f, 9.5f}, {7.0f, 7.5f}})));
         CHECK(d.addr_osm_ids == std::vector<uint64_t>({60, 50}));
         CHECK(d.addr_postcode_ids == std::vector<uint32_t>({81, 70}));

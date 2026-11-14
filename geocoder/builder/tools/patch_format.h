@@ -1066,8 +1066,9 @@ private:
 // The keys a SortedTable samples for its directory: 16 KiB at most.
 static constexpr size_t TABLE_DIRECTORY_KEYS = 4096;
 // The buckets a SortedTable cuts its directory's key range into, at most:
-// 8 KiB of them.
+// 8 KiB of them, each a u16 count of directory keys.
 static constexpr size_t TABLE_BUCKETS = 4096;
+static_assert(TABLE_DIRECTORY_KEYS <= UINT16_MAX, "a bucket counts the directory's keys in a u16");
 // A SortedTable's key filter: 2^15 bits, 4 KiB. A normal day's tables (90
 // moved strings, a parent id or two) set under 1% of them, so nearly every
 // lookup in them ends at the filter.
