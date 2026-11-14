@@ -155,7 +155,9 @@ inline KindValues strategy2_pass_costs(const ParsedData& d) {
 
 // The ordering steps' working set per record beside the copy of the records
 // they move them into: the sort's keys, its merge copy, the order, the run
-// starts and old_to_new.
+// starts and old_to_new. The cell order's (regroup_by_cell: each record's
+// least cell, the runs' keys and their merge copy, the sorted runs, beside
+// the order and starts) comes once the sort's keys are gone and is no more.
 constexpr uint64_t kReorderBytesPerRecord = 48;
 
 // What the ordering steps of the addrs, ways, POIs, places and interps hold

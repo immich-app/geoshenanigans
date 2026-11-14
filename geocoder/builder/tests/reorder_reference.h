@@ -1,10 +1,11 @@
-// The serial deterministic-ordering steps as of d77ab8e, verbatim save three
+// The serial deterministic-ordering steps as of d77ab8e, verbatim save four
 // changes: the addr and way steps list each survivor once per cell, as the
 // interp step did, the string partition writes only the strings a shipped
-// record uses, and it takes every POI record as shipped (no POI has a tier no
-// dir ships). They give the byte layout the parallel steps in reorder.h and
-// parsed_data.h must reproduce for any input and thread count
-// (test_reorder.cpp).
+// record uses, it takes every POI record as shipped (no POI has a tier no
+// dir ships), and the addr, way and interp steps end by moving their
+// survivors into cell order (the blocks marked "Cell order"). They give the
+// byte layout the parallel steps in reorder.h and parsed_data.h must
+// reproduce for any input and thread count (test_reorder.cpp).
 #pragma once
 
 #include <numeric>
@@ -22,6 +23,57 @@ inline void erase_repeated_pairs(std::vector<CellItemPair>& pairs) {
                                 return a.cell_id == b.cell_id && a.item_id == b.item_id;
                             }),
                 pairs.end());
+}
+
+// --- Cell order ---
+// A step's survivors go by the least cell that lists them, those no cell
+// lists last, and ones that share a least cell (or have none) stay in the
+// order the step's sort and dedup left them in.
+
+// The records [0, n) in that order, from the cells that list them.
+inline std::vector<uint32_t> cell_order(const std::vector<CellItemPair>& cells, size_t n) {
+    std::vector<uint64_t> least(n, UINT64_MAX);
+    for (const auto& p : cells) least[p.item_id] = std::min(least[p.item_id], p.cell_id);
+    std::vector<uint32_t> order(n);
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return least[a] < least[b]; });
+    return order;
+}
+
+// values[order[j]] for every j, in place.
+template <class T>
+void move_to(std::vector<T>& values, const std::vector<uint32_t>& order) {
+    std::vector<T> out;
+    out.reserve(order.size());
+    for (uint32_t k : order) out.push_back(values[k]);
+    values = std::move(out);
+}
+
+// Ways or interps moved to `order`, their nodes packed in it.
+template <class Record>
+void move_with_nodes(std::vector<Record>& records, std::vector<NodeCoord>& nodes,
+                     const std::vector<uint32_t>& order) {
+    std::vector<Record> out;
+    std::vector<NodeCoord> out_nodes;
+    for (uint32_t k : order) {
+        Record r = records[k];
+        const uint32_t from = r.node_offset;
+        r.node_offset = static_cast<uint32_t>(out_nodes.size());
+        for (uint32_t j = 0; j < r.node_count; j++) out_nodes.push_back(nodes[from + j]);
+        out.push_back(r);
+    }
+    records = std::move(out);
+    nodes = std::move(out_nodes);
+}
+
+// The cells' item ids once record order[j] is record j; returns each
+// record's new id.
+inline std::vector<uint32_t> renumber_cells(std::vector<CellItemPair>& cells, const std::vector<uint32_t>& order) {
+    std::vector<uint32_t> new_id(order.size());
+    for (uint32_t j = 0; j < order.size(); j++) new_id[order[j]] = j;
+    for (auto& p : cells) p.item_id = new_id[p.item_id];
+    std::sort(cells.begin(), cells.end(), cell_item_less);
+    return new_id;
 }
 
 // Partition the string pool in `data` into 5 per-consumer tiers, sorting
@@ -224,6 +276,16 @@ inline void reorder_addr_points(ParsedData& data) {
             }
             return a < b;
         });
+        // Cell order: where the packing below puts each sorted record's
+        // vertices, duplicates' included, and which arrays move with the
+        // points.
+        std::vector<size_t> packed_at(n + 1, 0);
+        for (size_t i = 0; i < n; i++) {
+            const AddrPoint& a = data.addr_points[order[i]];
+            packed_at[i + 1] = packed_at[i] + (a.vertex_count > 0 && a.vertex_offset != NO_DATA ? a.vertex_count : 0);
+        }
+        const bool cell_order_osm = data.addr_osm_ids.size() == n;
+        const bool cell_order_postcodes = data.addr_postcode_ids.size() == n;
         std::vector<uint32_t> old_to_new(n);
         for (uint32_t i = 0; i < n; i++) old_to_new[order[i]] = i;
         std::vector<AddrPoint> sorted(n);
@@ -310,6 +372,27 @@ inline void reorder_addr_points(ParsedData& data) {
         auto cmp = cell_item_less;
         std::sort(data.sorted_addr_cells.begin(), data.sorted_addr_cells.end(), cmp);
         erase_repeated_pairs(data.sorted_addr_cells);
+        // Cell order: each survivor moves with the vertices of its run of
+        // duplicates, which start with its own.
+        {
+            std::vector<size_t> run_at(write_pos + 1, packed_at[n]);
+            for (size_t i = n; i-- > 0;) run_at[dedup_remap[i]] = packed_at[i];
+            const std::vector<uint32_t> by_cell = cell_order(data.sorted_addr_cells, write_pos);
+            std::vector<AddrPoint> points;
+            std::vector<NodeCoord> vertices;
+            for (uint32_t k : by_cell) {
+                AddrPoint p = data.addr_points[k];
+                if (p.vertex_count > 0 && p.vertex_offset != NO_DATA)
+                    p.vertex_offset = static_cast<uint32_t>(vertices.size());
+                for (size_t v = run_at[k]; v < run_at[k + 1]; v++) vertices.push_back(data.addr_vertices[v]);
+                points.push_back(p);
+            }
+            data.addr_points = std::move(points);
+            data.addr_vertices = std::move(vertices);
+            if (cell_order_osm) move_to(data.addr_osm_ids, by_cell);
+            if (cell_order_postcodes) move_to(data.addr_postcode_ids, by_cell);
+            renumber_cells(data.sorted_addr_cells, by_cell);
+        }
         std::cerr << "  Addr points sorted: " << n << std::endl;
     }
 }
@@ -343,6 +426,10 @@ inline void reorder_ways(ParsedData& data) {
                 return data.way_osm_ids[a] < data.way_osm_ids[b];
             return false;
         });
+        // Cell order: which arrays move with the ways.
+        const bool cell_order_osm = data.way_osm_ids.size() == n;
+        const bool cell_order_parents = data.way_parent_ids.size() == n;
+        const bool cell_order_postcodes = data.way_postcode_ids.size() == n;
         // Reorder ways + nodes by sort order, dedup identical consecutive ways
         std::vector<WayHeader> new_ways;
         std::vector<NodeCoord> new_nodes;
@@ -425,6 +512,19 @@ inline void reorder_ways(ParsedData& data) {
             if (a.parent_way_id != NO_DATA && a.parent_way_id < n) {
                 a.parent_way_id = old_to_new[a.parent_way_id];
             }
+        }
+        // Cell order. The parents remapped above are below the survivor
+        // count; the ones left alone are at or past n.
+        {
+            const size_t kept = data.ways.size();
+            const std::vector<uint32_t> by_cell = cell_order(data.sorted_way_cells, kept);
+            move_with_nodes(data.ways, data.street_nodes, by_cell);
+            if (cell_order_osm) move_to(data.way_osm_ids, by_cell);
+            if (cell_order_parents) move_to(data.way_parent_ids, by_cell);
+            if (cell_order_postcodes) move_to(data.way_postcode_ids, by_cell);
+            const std::vector<uint32_t> new_id = renumber_cells(data.sorted_way_cells, by_cell);
+            for (auto& a : data.addr_points)
+                if (a.parent_way_id < kept) a.parent_way_id = new_id[a.parent_way_id];
         }
         std::cerr << "  Ways sorted: " << n << " (" << deduped << " duplicates removed)" << std::endl;
     }
@@ -523,6 +623,14 @@ inline void reorder_interps(ParsedData& data) {
         auto cmp = cell_item_less;
         std::sort(data.sorted_interp_cells.begin(), data.sorted_interp_cells.end(), cmp);
         erase_repeated_pairs(data.sorted_interp_cells);
+        // Cell order.
+        {
+            const std::vector<uint32_t> by_cell = cell_order(data.sorted_interp_cells, data.interp_ways.size());
+            move_with_nodes(data.interp_ways, data.interp_nodes, by_cell);
+            if (have_interp_osm) move_to(data.interp_osm_ids, by_cell);
+            if (have_interp_pc) move_to(data.interp_postcode_ids, by_cell);
+            renumber_cells(data.sorted_interp_cells, by_cell);
+        }
         std::cerr << "  Interps sorted: " << data.interp_ways.size()
                   << " (" << interp_deduped << " duplicates removed)" << std::endl;
     }

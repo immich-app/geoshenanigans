@@ -141,7 +141,10 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 ### Tools
 - **build-index** (`src/build_index.cpp`): Builder with deterministic ordering. It builds into a
   new or empty output dir and refuses any other, since every file there is diffed and published
-  as the build's
+  as the build's. A fresh build puts street ways, address points and interpolations in cell
+  order (`src/reorder.h`): by the least street cell that lists a record, then by its content.
+  A chained build keeps each record's slot, so new records go to free slots or the end, and
+  the order is restored by the next fresh build (every `build.version` change is one)
 - **geocoder-diff** (`tools/geocoder_diff.cpp`): Compares two builds, produces `.gcpatch`. The
   POI files are R2 records and V2 polygon blocks on disk (`src/poi_files.h`); the diff decodes both
   days' into their logical form (today's 36-byte records and vertex stream) and merges those.
@@ -177,7 +180,9 @@ keep it so:
   gives it, and the patcher refuses one that steps back. The lists it looks keys up in (the
   moved-string pairs, the parent-id legs, the secondary remap) are searched where they sit
   (`SortedTable`: a binary search narrowed by a directory of at most 4096 sampled keys,
-  TABLE_DIRECTORY_KEYS, and a 4 KiB key filter); the others are read once, front to back, as the
+  TABLE_DIRECTORY_KEYS, itself cut into at most 4096 key-range buckets, TABLE_BUCKETS, so a
+  lookup in any key order searches one bucket; and a 4 KiB key filter); the others are read
+  once, front to back, as the
   walk or replay they serve reaches them.
 - **Remap runs spill.** The string and record remap runs the patcher derives (from each string
   tier's walk and each file's replay) go through a 64 KiB buffer (SCRATCH_TABLE_BUF) to files in
