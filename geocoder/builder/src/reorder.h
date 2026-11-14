@@ -3,6 +3,13 @@
 // same input yields the same on-disk byte layout whatever the thread
 // scheduling (enables patching). reorder_deterministically (build_index.cpp)
 // runs them in order once the string pool is partitioned into tiers.
+//
+// Street ways, address points and interpolations come out in cell order: by
+// the least geo cell that lists a record (ascending cell ids follow the S2
+// curve, so records near each other on the ground sit near each other in
+// their file), then by the content order their sort gives. The content sort
+// and its dedup run first and decide which duplicate survives; the survivors
+// are then laid out by cell (regroup_by_cell).
 #pragma once
 
 #include <algorithm>
@@ -10,6 +17,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <utility>
 #include <vector>
 
 #include "parallel.h"
@@ -84,6 +92,72 @@ std::vector<T> first_set_per_run(const std::vector<T>& values, const std::vector
         }
     }, threads);
     return out;
+}
+
+// Each item's least cell among the pairs that list it (their item ids are
+// below n), UINT64_MAX for an item none lists. Threads race only to lower a
+// cell, so the least wins whatever their timing.
+inline std::vector<uint64_t> least_cells(const std::vector<CellItemPair>& pairs, size_t n, unsigned threads) {
+    std::vector<uint64_t> least;
+    parallel_resize(least, n, UINT64_MAX);
+    parallel_for(pairs.size(), [&](size_t b, size_t e, unsigned) {
+        for (size_t i = b; i < e; i++) {
+            const uint64_t cell = pairs[i].cell_id;
+            uint64_t* slot = &least[pairs[i].item_id];
+            uint64_t seen = __atomic_load_n(slot, __ATOMIC_RELAXED);
+            while (cell < seen &&
+                   !__atomic_compare_exchange_n(slot, &seen, cell, true, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            }
+        }
+    }, threads);
+    return least;
+}
+
+// Lays the runs of a sorted, deduped order out in cell order: by the least
+// cell in `pairs` that lists any record of a run, runs no cell lists last,
+// and runs that share a least cell (or have none) in the order they stood
+// in. `order` and `starts` come back describing the same runs, each with its
+// records in the order they had, so whatever a step takes from a run (its
+// survivor, its first set value) is what it took before.
+//
+// Working set: 8 B a record for the cells, then 12 B a run for the keys,
+// their merge copy and 4 B for the sorted runs, beside the order and starts
+// coming in; then the new order and starts beside the old.
+inline void regroup_by_cell(std::vector<uint32_t>& order, std::vector<uint32_t>& starts,
+                            const std::vector<CellItemPair>& pairs, unsigned threads) {
+    if (pairs.empty()) return;
+    const size_t n = order.size(), runs = starts.size();
+    // The cell as two halves: 12 B a key rather than 16.
+    struct RunKey {
+        uint32_t cell_high, cell_low, index;
+    };
+    std::vector<uint64_t> least = least_cells(pairs, n, threads);
+    auto key_of = [&](size_t k) {
+        uint64_t cell = UINT64_MAX;
+        for (size_t i = starts[k], end = run_end(starts, k, n); i < end; i++) cell = std::min(cell, least[order[i]]);
+        return RunKey{static_cast<uint32_t>(cell >> 32), static_cast<uint32_t>(cell), static_cast<uint32_t>(k)};
+    };
+    auto key_less = [](const RunKey& a, const RunKey& b) {
+        if (a.cell_high != b.cell_high) return a.cell_high < b.cell_high;
+        if (a.cell_low != b.cell_low) return a.cell_low < b.cell_low;
+        return a.index < b.index;
+    };
+    // Every key holds its own run, so none tie.
+    auto no_tie = [](uint32_t, uint32_t) { return false; };
+    const std::vector<uint32_t> by_cell = parallel_sort_keys(runs, key_of, key_less, no_tie, threads).order;
+    free_beside(std::move(least));
+    auto length = [&](size_t j) { return static_cast<uint32_t>(run_end(starts, by_cell[j], n) - starts[by_cell[j]]); };
+    std::vector<uint32_t> new_starts = parallel_offsets<uint32_t>(runs, length, threads);
+    std::vector<uint32_t> new_order;
+    parallel_resize(new_order, n);
+    parallel_for(runs, [&](size_t b, size_t e, unsigned) {
+        for (size_t j = b; j < e; j++)
+            std::copy_n(order.begin() + starts[by_cell[j]], new_starts[j + 1] - new_starts[j],
+                        new_order.begin() + new_starts[j]);
+    }, threads);
+    new_starts.pop_back();  // the total
+    free_beside(std::exchange(order, std::move(new_order)));
+    starts = std::move(new_starts);
 }
 
 // Renumbers the item ids of (cell_id, item_id) pairs and restores their
@@ -176,10 +250,11 @@ inline std::vector<uint32_t> invert(const std::vector<uint32_t>& order, unsigned
     return old_to_new;
 }
 
-// Sorts addr_points by (street_id, housenumber_id, lat_bits, lng_bits, ...).
-// String offsets are already remapped to the sorted pool, so they order
-// deterministically; raw float bits break the remaining ties. `headroom`:
-// the bytes it may hold at once beyond its input arrays (see beside_sort).
+// Sorts addr_points by (street_id, housenumber_id, lat_bits, lng_bits, ...)
+// and dedups them, then lays the survivors out in cell order. String offsets
+// are already remapped to the sorted pool, so they order deterministically;
+// raw float bits break the remaining ties. `headroom`: the bytes it may hold
+// at once beyond its input arrays (see beside_sort).
 inline void reorder_addr_points(ParsedData& data, unsigned threads = 0, uint64_t headroom = UINT64_MAX) {
     if (data.sorted_addr_cells.empty()) return;
 
@@ -281,13 +356,17 @@ inline void reorder_addr_points(ParsedData& data, unsigned threads = 0, uint64_t
                a.parent_way_id == b.parent_way_id &&
                a.vertex_count == b.vertex_count;
     }, threads);
+    // Copies of one address can lie in two cells (a point's cell comes from
+    // its exact coordinates, the dedup compares the stored floats): the
+    // survivor goes under the least of them.
+    regroup_by_cell(order, starts, data.sorted_addr_cells, threads);
     const size_t kept = starts.size();
     const bool have_postcodes = data.addr_postcode_ids.size() == n;
     auto sorted_buffer = vector_beside<AddrPoint>(beside ? kept : 0);
 
     // Reorder the vertex buffer alongside addr_points. Duplicates keep
-    // their copy of the vertices too: the buffer is packed in sorted order
-    // before the dedup.
+    // their copy of the vertices too, after their survivor's: the buffer is
+    // packed in the order of every record, survivor or not.
     Repacked<NodeCoord> repacked = repack(n, vertices,
         [&](size_t i) { const auto& p = points[order[i]]; return has_polygon(p) ? size_t(p.vertex_count) : 0; },
         [&](size_t i) { return points[order[i]].vertex_offset; }, threads, at_buffer.get(), vertex_buffer.get());
@@ -419,6 +498,7 @@ inline std::vector<uint32_t> sort_ways(ParsedData& data, unsigned threads = 0, u
                std::memcmp(nodes.data() + a.node_offset, nodes.data() + b.node_offset,
                            a.node_count * sizeof(NodeCoord)) == 0;
     }, threads);
+    regroup_by_cell(order, starts, data.sorted_way_cells, threads);
     const size_t kept = starts.size();
 
     Repacked<NodeCoord> repacked = repack(kept, nodes,
@@ -498,7 +578,8 @@ inline void reorder_ways(ParsedData& data, unsigned threads = 0, uint64_t headro
     remap_parent_ways(data, sort_ways(data, threads, headroom), threads);
 }
 
-// Sorts interps by (street, start, end, type, nodes) and reorders their nodes.
+// Sorts interps by (street, start, end, type, nodes) and dedups them, lays
+// the survivors out in cell order and reorders their nodes.
 inline void reorder_interps(ParsedData& data, unsigned threads = 0) {
     if (data.interp_ways.empty()) return;
 
@@ -574,6 +655,7 @@ inline void reorder_interps(ParsedData& data, unsigned threads = 0) {
                std::memcmp(nodes.data() + a.node_offset, nodes.data() + b.node_offset,
                            a.node_count * sizeof(NodeCoord)) == 0;
     }, threads);
+    regroup_by_cell(order, starts, data.sorted_interp_cells, threads);
     const size_t kept = starts.size();
 
     Repacked<NodeCoord> repacked = repack(kept, nodes,

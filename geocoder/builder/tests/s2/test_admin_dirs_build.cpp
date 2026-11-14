@@ -8,10 +8,13 @@
 // arc slot cold and the admin slots as they were; one without their fallback
 // sidecars, the slots of arcs whose keys changed. Without --multi-output,
 // each region's dir is a whole index the server answers from; with it, a
-// build without --multi-quality is refused.
+// build without --multi-quality is refused. A fresh build writes its streets
+// and addresses in cell order, whatever their names.
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -19,6 +22,8 @@
 #include <set>
 #include <string>
 #include <vector>
+
+#include <s2/s2cell_id.h>
 
 #include "id_allocator.h"
 #include "pbf_test_objects.h"
@@ -29,6 +34,11 @@
 #include "types.h"
 
 namespace fs = std::filesystem;
+
+// The builder's street cells (s2_helpers.h, whose own includes clash with
+// the tool headers here).
+void cover_edge(S2CellId c1, S2CellId c2, double lat1, double lng1, double lat2, double lng2, std::vector<S2CellId>& out);
+S2CellId point_to_cell(double lat, double lng);
 
 namespace {
 
@@ -260,6 +270,29 @@ std::vector<std::string> server_answers(const std::string& dir, const std::vecto
 bool says(const std::string& answer, const std::string& name) {
     return answer.find("\"" + name + "\"") != std::string::npos;
 }
+
+// A file of fixed-width records.
+template <class Record>
+std::vector<Record> records_of(const std::vector<char>& bytes) {
+    std::vector<Record> out(bytes.size() / sizeof(Record));
+    if (!out.empty()) std::memcpy(out.data(), bytes.data(), out.size() * sizeof(Record));
+    return out;
+}
+
+// The least street-level cell that lists a way of these nodes: the builder
+// covers each edge between the nodes as it stores them.
+uint64_t least_way_cell(const NodeCoord* nodes, size_t count) {
+    uint64_t least = UINT64_MAX;
+    std::vector<S2CellId> cells;
+    for (size_t j = 0; j + 1 < count; j++) {
+        cover_edge(point_to_cell(nodes[j].lat, nodes[j].lng), point_to_cell(nodes[j + 1].lat, nodes[j + 1].lng),
+                   nodes[j].lat, nodes[j].lng, nodes[j + 1].lat, nodes[j + 1].lng, cells);
+        for (const S2CellId cell : cells) least = std::min<uint64_t>(least, cell.id());
+    }
+    return least;
+}
+
+bool close_to(double a, double b) { return std::fabs(a - b) < 1e-4; }
 
 }  // namespace
 
@@ -640,4 +673,123 @@ TEST(a_chained_build_on_a_previous_build_without_arc_fallback_sidecars_takes_slo
             // And it writes its own fallback keys for the next night.
             CHECK(fs::exists(out2 + dir + "/arc_index.fallback.osm_ids"));
         }
+}
+
+TEST(a_fresh_build_writes_streets_and_addresses_in_cell_order_whatever_their_names) {
+    const ScratchDir root("record-order-build");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    // Six streets of 30 m across the fixture's country, kilometres apart,
+    // each with an address 11 m north of its middle.
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    auto degrees = [](int32_t e7) { return e7 / 1e7; };
+    struct Spot {
+        int32_t lat, lon;
+        uint64_t cell = 0;
+        std::string name;
+    };
+    std::vector<Spot> spots = {{lat0 + 150000, lng0 + 700000},  {lat0 + 1800000, lng0 + 300000},
+                               {lat0 + 700000, lng0 + 1700000}, {lat0 + 1900000, lng0 + 1850000},
+                               {lat0 + 900000, lng0 + 950000},  {lat0 + 1200000, lng0 + 400000}};
+    for (Spot& s : spots) {
+        const NodeCoord ends[] = {{static_cast<float>(degrees(s.lat)), static_cast<float>(degrees(s.lon))},
+                                  {static_cast<float>(degrees(s.lat)), static_cast<float>(degrees(s.lon + 4000))}};
+        s.cell = least_way_cell(ends, 2);
+    }
+    // Named against their cells: the street of the least cell is "Weg F",
+    // the last by name, and the fixture's Teststrasse is ahead of them all.
+    std::sort(spots.begin(), spots.end(), [](const Spot& a, const Spot& b) { return a.cell < b.cell; });
+    for (size_t i = 0; i < spots.size(); i++) {
+        REQUIRE(i == 0 || spots[i - 1].cell < spots[i].cell);
+        spots[i].name = std::string("Weg ") + static_cast<char>('F' - i);
+    }
+    std::vector<TestObject> objects = fixture();
+    for (size_t i = 0; i < spots.size(); i++) {
+        const Spot& s = spots[i];
+        const int64_t id = 960 + 3 * static_cast<int64_t>(i);
+        objects.push_back(node(id, s.lat, s.lon));
+        objects.push_back(node(id + 1, s.lat, s.lon + 4000));
+        objects.push_back(node(id + 2, s.lat + 1000, s.lon + 2000,
+                               {{"addr:housenumber", std::to_string(i + 1)}, {"addr:street", s.name}}));
+        objects.push_back(way(4001 + static_cast<int64_t>(i), {id, id + 1}, {{"highway", "residential"}, {"name", s.name}}));
+    }
+    std::stable_sort(objects.begin(), objects.end(), [](const TestObject& a, const TestObject& b) {
+        return a.type != b.type ? a.type < b.type : a.id < b.id;
+    });
+    write_test_pbf(pbf, objects, 1000);
+
+    // The addresses by the cell of each one's point, the fixture's (spot 6)
+    // among them. By street name they would go 6, 5, 4, 3, 2, 1, 0.
+    struct Address {
+        uint64_t cell;
+        double lat, lng;
+        size_t spot;
+    };
+    std::vector<Address> addresses;
+    for (size_t i = 0; i < spots.size(); i++) {
+        const double lat = degrees(spots[i].lat + 1000), lng = degrees(spots[i].lon + 2000);
+        addresses.push_back({uint64_t{point_to_cell(lat, lng).id()}, lat, lng, i});
+    }
+    addresses.push_back({uint64_t{point_to_cell(degrees(lat0 + 1410000), degrees(lng0 + 1500000)).id()},
+                         degrees(lat0 + 1410000), degrees(lng0 + 1500000), spots.size()});
+    std::sort(addresses.begin(), addresses.end(), [](const Address& a, const Address& b) { return a.cell < b.cell; });
+    {
+        std::vector<size_t> by_cell;
+        for (const Address& a : addresses) by_cell.push_back(a.spot);
+        REQUIRE(by_cell != std::vector<size_t>({6, 5, 4, 3, 2, 1, 0}));
+    }
+
+    // The dir's street ways ascend by least cell, the six streets among them
+    // from "Weg F" to "Weg A", and its addresses by the cell of their point.
+    auto check_order = [&](const std::map<std::string, std::vector<char>>& files, const std::string& dir) {
+        REQUIRE(files.count(dir + "street_ways.bin") && files.count(dir + "street_nodes.bin") &&
+                files.count(dir + "addr_points.bin"));
+        const auto ways = records_of<WayHeader>(files.at(dir + "street_ways.bin"));
+        const auto nodes = records_of<NodeCoord>(files.at(dir + "street_nodes.bin"));
+        REQUIRE(ways.size() == spots.size() + 1);
+        std::vector<size_t> streets;
+        uint64_t last = 0;
+        for (const WayHeader& w : ways) {
+            REQUIRE(w.node_count >= 2 && size_t(w.node_offset) + w.node_count <= nodes.size());
+            const NodeCoord* first = &nodes[w.node_offset];
+            const uint64_t cell = least_way_cell(first, w.node_count);
+            CHECK(cell > last);
+            last = cell;
+            for (size_t i = 0; i < spots.size(); i++)
+                if (close_to(first->lat, degrees(spots[i].lat)) && close_to(first->lng, degrees(spots[i].lon))) streets.push_back(i);
+        }
+        CHECK(streets == std::vector<size_t>({0, 1, 2, 3, 4, 5}));
+        const auto points = records_of<AddrPoint>(files.at(dir + "addr_points.bin"));
+        REQUIRE(points.size() == addresses.size());
+        for (size_t k = 0; k < points.size(); k++)
+            CHECK(close_to(points[k].lat, addresses[k].lat) && close_to(points[k].lng, addresses[k].lng));
+    };
+
+    // A whole dir, which the server answers from: each address by its own
+    // street.
+    const std::string single = root.path() + "/single";
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, single, pbf}, log));
+    check_order(tree(single), "planet/");
+    std::vector<std::pair<double, double>> at;
+    for (const Spot& s : spots) at.push_back({degrees(s.lat + 1000), degrees(s.lon + 2000)});
+    const std::vector<std::string> answers = server_answers(single + "/planet", at, root.path() + "/single-q", log);
+    REQUIRE(answers.size() == spots.size());
+    for (size_t i = 0; i < spots.size(); i++)
+        for (size_t j = 0; j < spots.size(); j++) CHECK_EQ(says(answers[i], spots[j].name), i == j);
+
+    // Every region's dirs: Europe's records are the planet's, in its order.
+    // The same data again on top of that build keeps every record's slot.
+    auto build = [&](const std::string& out, std::vector<std::string> extra) {
+        std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out, pbf, "--continents", "--multi-output",
+                                          "--multi-quality"};
+        words.insert(words.end(), extra.begin(), extra.end());
+        return gctest::run(words, log);
+    };
+    const std::string first = root.path() + "/first";
+    REQUIRE(build(first, {}));
+    const auto files = tree(first);
+    check_order(files, "planet/full/");
+    check_order(files, "europe/full/");
+    const std::string again = root.path() + "/again";
+    REQUIRE(build(again, {"--prev-output", first}));
+    CHECK(tree(again) == files);
 }

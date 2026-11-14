@@ -590,6 +590,168 @@ TEST(reorder_ways_lists_folded_copies_once_per_cell) {
     }
 }
 
+TEST(least_cells_gives_each_item_its_smallest_cell_and_none_to_an_item_no_cell_lists) {
+    // Not in cell order: the smallest wins wherever it stands.
+    const std::vector<CellItemPair> pairs = {{9, 2}, {5, 0}, {7, 2}, {8, 0}, {7, 3}, {6, 2}};
+    const std::vector<uint64_t> want = {5, UINT64_MAX, 6, 7, UINT64_MAX};
+    for (unsigned threads : kThreadCounts) CHECK(least_cells(pairs, 5, threads) == want);
+    CHECK(least_cells({}, 2, 1) == std::vector<uint64_t>(2, UINT64_MAX));
+
+    Rng r(31);
+    const size_t n = 200000;
+    const auto many = new_cell_pairs(r, 3 * n, static_cast<uint32_t>(n), false);
+    std::vector<uint64_t> serial(n, UINT64_MAX);
+    for (const auto& p : many) serial[p.item_id] = std::min(serial[p.item_id], p.cell_id);
+    for (unsigned threads : kThreadCounts) CHECK(least_cells(many, n, threads) == serial);
+}
+
+TEST(regroup_by_cell_moves_whole_runs_by_their_least_cell_and_keeps_ties_in_place) {
+    // Runs {4}, {2, 0}, {3}, {1}, {5}: records 0 and 3 are listed in cell 6,
+    // record 2 in cell 8, record 4 in cell 9, records 1 and 5 nowhere.
+    const std::vector<CellItemPair> pairs = {{6, 0}, {6, 3}, {8, 2}, {9, 4}};
+    for (unsigned threads : kThreadCounts) {
+        std::vector<uint32_t> order = {4, 2, 0, 3, 1, 5};
+        std::vector<uint32_t> starts = {0, 1, 3, 4, 5};
+        regroup_by_cell(order, starts, pairs, threads);
+        // Run {2, 0} takes record 0's cell and stays ahead of {3}, which
+        // ties it; {4} follows; {1} and {5} stay last, in their order.
+        CHECK(order == std::vector<uint32_t>({2, 0, 3, 4, 1, 5}));
+        CHECK(starts == std::vector<uint32_t>({0, 2, 3, 4, 5}));
+    }
+    // Nothing listed: nothing moves.
+    std::vector<uint32_t> order = {1, 0, 2}, starts = {0, 2};
+    regroup_by_cell(order, starts, {}, 2);
+    CHECK(order == std::vector<uint32_t>({1, 0, 2}));
+    CHECK(starts == std::vector<uint32_t>({0, 2}));
+}
+
+TEST(reorder_ways_puts_them_in_cell_order_and_ways_of_one_cell_in_name_order) {
+    for (unsigned threads : kThreadCounts) {
+        ParsedData d;
+        // Way i has i + 1 nodes at latitude 10 + i and name 3 - i, so the
+        // names order them 3, 2, 1, 0.
+        for (uint32_t i = 0; i < 4; i++) {
+            WayHeader w{};
+            w.node_offset = static_cast<uint32_t>(d.street_nodes.size());
+            w.node_count = static_cast<uint16_t>(i + 1);
+            w.name_id = 3 - i;
+            for (uint32_t j = 0; j <= i; j++) d.street_nodes.push_back({10.0f + i, 1.0f * j});
+            d.ways.push_back(w);
+        }
+        d.way_osm_ids = {100, 101, 102, 103};
+        d.way_parent_ids = {200, 201, 202, 203};
+        d.way_postcode_ids = {300, 301, 302, 303};
+        // Way 0 lies in cells 10 and 40, ways 1 and 2 in cell 20, way 3 in
+        // none.
+        d.sorted_way_cells = {{10, 0}, {20, 1}, {20, 2}, {40, 0}};
+        d.addr_points.resize(5);
+        for (uint32_t i = 0; i < 5; i++) d.addr_points[i].parent_way_id = i < 4 ? i : NO_DATA;
+        reorder_ways(d, threads);
+
+        // Way 0 first (cell 10), then cell 20's by name (way 2, way 1), then
+        // the way no cell lists.
+        REQUIRE(d.ways.size() == size_t(4));
+        const uint32_t want[] = {0, 2, 1, 3};
+        uint32_t at = 0;
+        for (uint32_t k = 0; k < 4; k++) {
+            const uint32_t i = want[k];
+            CHECK_EQ(d.ways[k].name_id, 3 - i);
+            CHECK_EQ(d.ways[k].node_count, uint16_t(i + 1));
+            CHECK_EQ(d.ways[k].node_offset, at);
+            for (uint32_t j = 0; j <= i; j++) {
+                CHECK_EQ(d.street_nodes[at + j].lat, 10.0f + i);
+                CHECK_EQ(d.street_nodes[at + j].lng, 1.0f * j);
+            }
+            at += i + 1;
+            CHECK_EQ(d.way_osm_ids[k], int64_t(100 + i));
+            CHECK_EQ(d.way_parent_ids[k], 200 + i);
+            CHECK_EQ(d.way_postcode_ids[k], 300 + i);
+        }
+        CHECK_EQ(d.street_nodes.size(), size_t(10));
+        CHECK(same_pairs(d.sorted_way_cells, {{10, 0}, {20, 1}, {20, 2}, {40, 0}}));
+        CHECK_EQ(d.addr_points[0].parent_way_id, 0u);
+        CHECK_EQ(d.addr_points[1].parent_way_id, 2u);
+        CHECK_EQ(d.addr_points[2].parent_way_id, 1u);
+        CHECK_EQ(d.addr_points[3].parent_way_id, 3u);
+        CHECK_EQ(d.addr_points[4].parent_way_id, NO_DATA);
+    }
+}
+
+TEST(reorder_addr_points_puts_folded_copies_under_the_least_cell_of_either) {
+    for (unsigned threads : kThreadCounts) {
+        ParsedData d;
+        AddrPoint a{};
+        a.lat = 1.5f;
+        a.lng = -2.25f;
+        a.housenumber_id = 3;
+        a.street_id = 4;
+        a.parent_way_id = NO_DATA;
+        a.vertex_count = 2;
+        AddrPoint b = a;
+        b.street_id = 2;  // ahead of a by street
+        b.vertex_count = 1;
+        // b, then two copies of a, each with its own copy of the footprint.
+        d.addr_points = {b, a, a};
+        d.addr_points[0].vertex_offset = 0;
+        d.addr_points[1].vertex_offset = 1;
+        d.addr_points[2].vertex_offset = 3;
+        d.addr_vertices = {{7.0f, 7.5f}, {8.0f, 8.5f}, {9.0f, 9.5f}, {8.0f, 8.5f}, {9.0f, 9.5f}};
+        d.addr_osm_ids = {50, 61, 60};
+        d.addr_postcode_ids = {70, NO_DATA, 81};
+        // The copies' exact points lie in two cells, one each side of b's.
+        d.sorted_addr_cells = {{5, 2}, {7, 0}, {9, 1}};
+        reorder_addr_points(d, threads);
+
+        // The copies fold into one record, which cell 5 puts ahead of b; it
+        // keeps the first copy's osm id (60) and the first postcode set.
+        REQUIRE(d.addr_points.size() == size_t(2));
+        CHECK_EQ(d.addr_points[0].street_id, 4u);
+        CHECK_EQ(d.addr_points[0].vertex_offset, 0u);
+        CHECK_EQ(d.addr_points[1].street_id, 2u);
+        CHECK_EQ(d.addr_points[1].vertex_offset, 4u);
+        CHECK(same_bytes(d.addr_vertices, std::vector<NodeCoord>({{8.0f, 8.5f}, {9.0f, 9.5f}, {8.0f, 8.5f},
+                                                                    {9.0f, 9.5f}, {7.0f, 7.5f}})));
+        CHECK(d.addr_osm_ids == std::vector<uint64_t>({60, 50}));
+        CHECK(d.addr_postcode_ids == std::vector<uint32_t>({81, 70}));
+        CHECK(same_pairs(d.sorted_addr_cells, {{5, 0}, {7, 1}, {9, 0}}));
+    }
+}
+
+TEST(reorder_interps_puts_them_in_cell_order_and_interps_of_one_cell_in_street_order) {
+    for (unsigned threads : kThreadCounts) {
+        ParsedData d;
+        // Interp i has street 3 - i and one node at latitude 20 + i.
+        for (uint32_t i = 0; i < 4; i++) {
+            InterpWay iw{};
+            iw.node_offset = i;
+            iw.node_count = 1;
+            iw.street_id = 3 - i;
+            iw.start_number = 1;
+            iw.end_number = 9;
+            d.interp_nodes.push_back({20.0f + i, 0.5f});
+            d.interp_ways.push_back(iw);
+        }
+        d.interp_osm_ids = {100, 101, 102, 103};
+        d.interp_postcode_ids = {300, 301, 302, 303};
+        // Interps 1 and 3 share cell 6, interp 0 lies in cell 8, interp 2 in
+        // none.
+        d.sorted_interp_cells = {{6, 1}, {6, 3}, {8, 0}};
+        reorder_interps(d, threads);
+
+        REQUIRE(d.interp_ways.size() == size_t(4));
+        const uint32_t want[] = {3, 1, 0, 2};
+        for (uint32_t k = 0; k < 4; k++) {
+            const uint32_t i = want[k];
+            CHECK_EQ(d.interp_ways[k].street_id, 3 - i);
+            CHECK_EQ(d.interp_ways[k].node_offset, k);
+            CHECK_EQ(d.interp_nodes[k].lat, 20.0f + i);
+            CHECK_EQ(d.interp_osm_ids[k], uint64_t(100 + i));
+            CHECK_EQ(d.interp_postcode_ids[k], 300 + i);
+        }
+        CHECK(same_pairs(d.sorted_interp_cells, {{6, 0}, {6, 1}, {8, 2}}));
+    }
+}
+
 TEST(partition_strings_matches_the_serial_reference) {
     check_partition_matches_reference(11, 400000, 300000, [](ParsedData&) {});
     check_partition_matches_reference(12, 300, 2000, [](ParsedData&) {});

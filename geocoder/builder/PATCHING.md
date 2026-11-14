@@ -141,7 +141,10 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 ### Tools
 - **build-index** (`src/build_index.cpp`): Builder with deterministic ordering. It builds into a
   new or empty output dir and refuses any other, since every file there is diffed and published
-  as the build's
+  as the build's. A fresh build puts street ways, address points and interpolations in cell
+  order (`src/reorder.h`): by the least street cell that lists a record, then by its content.
+  A chained build keeps each record's slot, so new records go to free slots or the end, and
+  the order is restored by the next fresh build (every `build.version` change is one)
 - **geocoder-diff** (`tools/geocoder_diff.cpp`): Compares two builds, produces `.gcpatch`. The
   POI files are R2 records and V2 polygon blocks on disk (`src/poi_files.h`); the diff decodes both
   days' into their logical form (today's 36-byte records and vertex stream) and merges those.
