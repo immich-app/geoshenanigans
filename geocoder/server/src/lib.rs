@@ -31,6 +31,7 @@ pub mod strings;
 pub mod way_files;
 pub use place_files::PlaceFiles;
 pub use poi_files::PoiRecords;
+pub use side_blocks::SideBlocks;
 #[cfg(test)]
 mod scratch_dir;
 
@@ -1084,10 +1085,10 @@ pub struct Index {
     pub addr_vertices: Option<FileBytes>,
     pub interp_ways: Option<FileBytes>,
     pub interp_nodes: Option<FileBytes>,
-    // TIGER per-segment ZIP sidecar: u32 postcode string offset per interp
+    // TIGER per-segment ZIP side file: a postcode string offset per interp
     // way (NO_DATA for OSM interpolations). Absent on builds without TIGER
-    // data and on pre-sidecar indexes — individually optional.
-    pub interp_postcodes: Option<FileBytes>,
+    // data.
+    pub interp_postcodes: Option<SideBlocks>,
     pub admin_index: CellPairs,
     pub admin_polygons: FileBytes,
     pub admin_geometry: AdminGeometry,
@@ -1098,10 +1099,10 @@ pub struct Index {
     /// The place nodes: place_cells.bin, place_nodes.bin and place_hidden.bin (place_files.rs).
     pub places: Option<PlaceFiles>,
     // Parent chain files (Nominatim-style address walk)
-    pub way_parents: Option<FileBytes>,    // u32 per way → smallest containing admin poly
-    pub admin_parents: Option<FileBytes>,  // u32 per poly → next-larger containing admin poly
-    pub addr_postcodes: Option<FileBytes>, // u32 per addr_point → postcode string (optional)
-    pub way_postcodes: Option<FileBytes>,  // u32 per way → postcode string from postal boundary
+    pub way_parents: Option<SideBlocks>,    // per way → smallest containing admin poly
+    pub admin_parents: Option<FileBytes>,   // u32 per poly → next-larger containing admin poly
+    pub addr_postcodes: Option<SideBlocks>, // per addr_point → postcode string (optional)
+    pub way_postcodes: Option<SideBlocks>,  // per way → postcode string from postal boundary
     pub postcode_centroids: Option<FileBytes>,
     pub postcode_centroid_index: Option<CellPairs>,
     pub admin_config: AdminLevelConfig,
@@ -1274,6 +1275,19 @@ fn load_places(dir: &str) -> Result<Option<PlaceFiles>, String> {
     }
 }
 
+/// The side file `name` of the index in `dir` (side_blocks.rs), mapped; none without it. Its
+/// values are read by the ids of the records of `parent`, the file it sits beside: an error
+/// where it holds another count than `records`, the parent's, or the dir has no such parent.
+fn load_side(dir: &str, name: &str, parent: &str, records: Option<u64>) -> Result<Option<SideBlocks>, String> {
+    let Some(bytes) = mmap_file_optional(&format!("{dir}/{name}")) else { return Ok(None) };
+    let side = SideBlocks::open(bytes, name).map_err(|e| format!("{dir}: {e}"))?;
+    match records {
+        Some(records) if records == u64::from(side.count()) => Ok(Some(side)),
+        Some(records) => Err(format!("{dir}: {name} holds {} values for the {records} records of {parent}", side.count())),
+        None => Err(format!("{dir}: {name} without {parent}")),
+    }
+}
+
 impl Index {
     pub fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
         // Distance budget used by the primary-feature selection. The
@@ -1305,8 +1319,8 @@ impl Index {
         // groups (whole-group-absent = a thinner index variant; half-present
         // = corruption). addr_vertices is NOT part of the addr group — it
         // was added in v9 (building footprints) and older indexes
-        // legitimately lack it. The way_/admin_parents and *_postcodes
-        // sidecars are individually optional for the same version reason.
+        // legitimately lack it. admin_parents is individually optional for
+        // the same version reason.
         let addr_points = mmap_file_optional(&format!("{}/addr_points.bin", dir));
         let [interp_ways, interp_nodes]: [Option<FileBytes>; 2] =
             mmap_group(dir, &["interp_ways.bin", "interp_nodes.bin"])?
@@ -1334,16 +1348,28 @@ impl Index {
         };
         let admin_index = pairs("admin", mmap_file(&format!("{}/admin_cells.bin", dir))?,
                                 mmap_file(&format!("{}/admin_entries.bin", dir))?, cell_pairs::ADMIN)?;
+        let street_ways = required_geo("street_ways.bin")?;
+        let street_nodes = required_geo("street_nodes.bin")?;
+        // Each side file is optional, and holds a value for each record of the file it sits
+        // beside.
+        let records = |file: &Option<FileBytes>, record_bytes: usize| file.as_ref().map(|f| f.len() / record_bytes as u64);
+        let streets = records(&street_ways, std::mem::size_of::<WayHeader>());
+        let way_parents = load_side(dir, "way_parents.bin", "street_ways.bin", streets)?;
+        let way_postcodes = load_side(dir, "way_postcodes.bin", "street_ways.bin", streets)?;
+        let addr_postcodes =
+            load_side(dir, "addr_postcodes.bin", "addr_points.bin", records(&addr_points, std::mem::size_of::<AddrPoint>()))?;
+        let interp_postcodes =
+            load_side(dir, "interp_postcodes.bin", "interp_ways.bin", records(&interp_ways, std::mem::size_of::<InterpWay>()))?;
 
         Ok(Index {
             geo_index,
-            street_ways: required_geo("street_ways.bin")?,
-            street_nodes: required_geo("street_nodes.bin")?,
+            street_ways,
+            street_nodes,
             addr_points,
             addr_vertices: mmap_file_optional(&format!("{}/addr_vertices.bin", dir)),
             interp_ways,
             interp_nodes,
-            interp_postcodes: mmap_file_optional(&format!("{}/interp_postcodes.bin", dir)),
+            interp_postcodes,
             admin_index,
             admin_polygons: mmap_file(&format!("{}/admin_polygons.bin", dir))?,
             admin_geometry: AdminGeometry::load(dir)?,
@@ -1352,10 +1378,10 @@ impl Index {
             poi_vertices,
             poi_meta: PoiMeta::load(dir),
             places,
-            way_parents: mmap_file_optional(&format!("{}/way_parents.bin", dir)),
+            way_parents,
             admin_parents: mmap_file_optional(&format!("{}/admin_parents.bin", dir)),
-            addr_postcodes: mmap_file_optional(&format!("{}/addr_postcodes.bin", dir)),
-            way_postcodes: mmap_file_optional(&format!("{}/way_postcodes.bin", dir)),
+            addr_postcodes,
+            way_postcodes,
             postcode_centroids,
             postcode_centroid_index,
             admin_config: AdminLevelConfig::load(),
@@ -2786,16 +2812,10 @@ impl Index {
     // at index time. The postcode areas (the level-11 admin polygons) are
     // consumed at BUILD time only (for way_postcodes.bin /
     // PoiRecord.parent_postcode_id inheritance); they are not consulted here.
-    /// Read one u32 from a per-record sidecar file (addr_postcodes /
-    /// way_postcodes / interp_postcodes: u32 per record, NO_DATA = absent).
-    fn sidecar_u32(f: &FileBytes, idx: u64) -> Option<u32> {
-        let off = idx * 4;
-        if off + 4 > f.len() {
-            return None;
-        }
-        let bytes = f.read_chunk(off, 4);
-        let v = u32::from_le_bytes(bytes[..].try_into().unwrap());
-        if v == NO_DATA { None } else { Some(v) }
+    /// Record `idx`'s value in a side file (way_parents / addr_postcodes /
+    /// way_postcodes / interp_postcodes: a u32 per record, NO_DATA = absent).
+    fn sidecar_u32(f: &SideBlocks, idx: u64) -> Option<u32> {
+        f.get(u32::try_from(idx).ok()?).filter(|&v| v != NO_DATA)
     }
 
     pub fn resolve_postcode(&self, lat: f64, lng: f64, street: Option<(usize, &WayHeader)>, addr: Option<(usize, &AddrPoint)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, country_code: Option<[u8; 2]>) -> Option<Cow<'_, str>> {
@@ -2931,13 +2951,7 @@ impl Index {
         let admin_chain = (|| -> Option<AdminResult<'_>> {
             let wp = self.way_parents.as_ref()?;
             let (_, _, way_idx) = street?;
-            // way_parents is u32 per way.
-            let way_id = *way_idx as u64;
-            let off = way_id * 4;
-            if off + 4 > wp.len() { return None; }
-            let pbytes = wp.read_chunk(off, 4);
-            let start = u32::from_le_bytes(pbytes[..].try_into().unwrap());
-            if start == NO_DATA { return None; }
+            let start = Self::sidecar_u32(wp, u64::from(*way_idx))?;
             Some(self.find_admin_from_chain_in(start, scan))
         })();
         // Nominatim's answer puts, at each rank, a boundary holding the
@@ -6553,12 +6567,6 @@ mod query_path_tests {
         [("addr_points.bin", points), ("addr_vertices.bin", vertices)]
     }
 
-    /// A side file of `values`, one a record of the file it sits beside, as the builder writes
-    /// way_parents.bin, way_postcodes.bin, addr_postcodes.bin and interp_postcodes.bin.
-    fn side_file(values: &[u32]) -> Vec<u8> {
-        values.iter().flat_map(|value| value.to_le_bytes()).collect()
-    }
-
     #[derive(Default)]
     struct TestIndex {
         origin: (f64, f64),
@@ -6758,7 +6766,8 @@ mod query_path_tests {
         /// an interpolation way in the street cells along it; an address in
         /// the street cell of its point. The street files come with the geo
         /// index, the interpolation and address files where there are such
-        /// records, a side file where one of its values is set.
+        /// records, a side file (side_blocks.rs) where one of its values is
+        /// set, with NO_DATA for every other record.
         fn files(&self) -> Vec<(&'static str, Vec<u8>)> {
             let mut arcs = arc_fixture::ArcFixture::new();
             let mut admin_cells: BTreeMap<u64, Vec<u32>> = BTreeMap::new();
@@ -6808,7 +6817,7 @@ mod query_path_tests {
                     for &(record, value) in set {
                         values[record as usize] = value;
                     }
-                    files.push((name, side_file(&values)));
+                    files.push((name, side_blocks::encode(&values)));
                 }
             }
 
@@ -6990,9 +6999,8 @@ mod query_path_tests {
         // S2 wraps a point off the globe onto cells of the globe, and where those cells list a
         // street the query's admin walks that street's parent chain, however far the street is:
         // Main Street's chain names Testland.
-        let mut index = TestIndex::new().street("Main Street", &[(0.0, -500.0), (0.0, 500.0)]).load();
         // Main Street (way 0) in Testland (polygon 0), the top of its chain.
-        index.way_parents = Some(FileBytes::Owned(0u32.to_le_bytes().to_vec()));
+        let mut index = TestIndex::new().street("Main Street", &[(0.0, -500.0), (0.0, 500.0)]).way_parent(0).load();
         index.admin_parents = Some(FileBytes::Owned(NO_DATA.to_le_bytes().to_vec()));
         let on = address_at(&index, 10.0, 0.0);
         assert_eq!((on["road"].as_str(), on["country"].as_str()), (Some("Main Street"), Some("Testland")));
@@ -7537,6 +7545,86 @@ mod query_path_tests {
         assert_eq!(address_at(&index, 1010.0, 0.0)["country"], "Farland");
         // Mill Lane has no parent: the boundaries at the point answer.
         assert_eq!(address_at(&index, 2010.0, 0.0)["country"], "Testland");
+    }
+
+    /// Two streets, two addresses and two interpolation ways, the first of each with a value in
+    /// each of its side files.
+    fn two_of_each() -> TestIndex {
+        let mut dataset = TestIndex::new();
+        dataset
+            .street("Main Street", &parallel(0.0, 200.0)).way_parent(0).way_postcode("2020")
+            .address("7", 30.0, 0.0).addr_postcode("1010")
+            .interpolation("Main St", (1, 99, 0), &parallel(5.0, 100.0)).interp_postcode("3030")
+            .street("High Street", &parallel(1000.0, 200.0))
+            .address("9", 1030.0, 0.0)
+            .interpolation("High St", (1, 99, 0), &parallel(1005.0, 100.0));
+        dataset
+    }
+
+    /// Each side file and the file whose records its values are for.
+    const SIDE_FILES: [(&str, &str); 4] = [
+        ("way_parents.bin", "street_ways.bin"), ("way_postcodes.bin", "street_ways.bin"),
+        ("addr_postcodes.bin", "addr_points.bin"), ("interp_postcodes.bin", "interp_ways.bin"),
+    ];
+
+    /// What Index::load refuses the files of `dataset` with once `edit` has changed them in
+    /// their dir; none where it loads them.
+    fn load_refusal(dataset: &TestIndex, edit: impl FnOnce(&std::path::Path)) -> Option<String> {
+        let dir = ScratchDir::new();
+        dataset.write(dir.path());
+        edit(dir.path());
+        Index::load(dir.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).err()
+    }
+
+    #[test]
+    fn load_refuses_a_side_file_of_another_count_than_its_parent() {
+        let dataset = two_of_each();
+        assert_eq!(load_refusal(&dataset, |_| ()), None);
+        for (name, parent) in SIDE_FILES {
+            let holding = |values: &[u32]| {
+                load_refusal(&dataset, |dir| std::fs::write(dir.join(name), side_blocks::encode(values)).unwrap())
+            };
+            assert_eq!(holding(&[0, 0]), None, "{name}");
+            let others: [&[u32]; 3] = [&[0], &[0, 0, 0], &[]];
+            for values in others {
+                let said = holding(values).unwrap_or_default();
+                let want = format!(": {name} holds {} values for the 2 records of {parent}", values.len());
+                assert!(said.ends_with(&want), "{name}: {said}");
+            }
+        }
+    }
+
+    #[test]
+    fn load_refuses_a_side_file_whose_parent_is_absent() {
+        let dataset = two_of_each();
+        // The street files come with the geo index. Without them the other side file of the
+        // streets goes too, so that the one left is the one refused.
+        let streets = ["geo_cells.bin", "geo_entries.bin", "street_ways.bin", "street_nodes.bin"];
+        let cases: [(&str, &str, Vec<&str>); 4] = [
+            ("way_parents.bin", "street_ways.bin", [&streets[..], &["way_postcodes.bin"][..]].concat()),
+            ("way_postcodes.bin", "street_ways.bin", [&streets[..], &["way_parents.bin"][..]].concat()),
+            ("addr_postcodes.bin", "addr_points.bin", vec!["addr_points.bin", "addr_vertices.bin"]),
+            ("interp_postcodes.bin", "interp_ways.bin", vec!["interp_ways.bin", "interp_nodes.bin"]),
+        ];
+        for (name, parent, without) in cases {
+            let said = load_refusal(&dataset, |dir| {
+                for file in &without {
+                    std::fs::remove_file(dir.join(file)).unwrap();
+                }
+            });
+            let said = said.unwrap_or_default();
+            assert!(said.ends_with(&format!(": {name} without {parent}")), "{name}: {said}");
+        }
+    }
+
+    #[test]
+    fn load_refuses_a_side_file_that_is_not_side_blocks() {
+        let dataset = two_of_each();
+        for (name, _) in SIDE_FILES {
+            // A u32 a record, and no footer.
+            let said = load_refusal(&dataset, |dir| std::fs::write(dir.join(name), [0u8; 8]).unwrap()).unwrap_or_default();
+            assert!(said.ends_with(&format!(": {name} has no SDB1 footer")), "{name}: {said}");
+        }
     }
 
     #[test]

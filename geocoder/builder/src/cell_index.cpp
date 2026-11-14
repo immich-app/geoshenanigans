@@ -31,6 +31,7 @@
 #include "polygon_rings.h"
 #include "postcode_validation.h"
 #include "ranked_bits.h"
+#include "record_files_io.h"
 #include "s2_helpers.h"
 #include "strategy2_remap.h"
 #include "string_files.h"
@@ -654,9 +655,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
         // Way parent chain (parallel array indexed by way_id)
         if (!data.way_parent_ids.empty()) {
             write_futures.push_back(std::async(std::launch::async, [&] {
-                write_binary_file(output_dir + "/way_parents.bin",
-                                  reinterpret_cast<const char*>(data.way_parent_ids.data()),
-                                  data.way_parent_ids.size() * sizeof(uint32_t));
+                write_side_file(output_dir, "way_parents.bin", data.way_parent_ids, "street_ways.bin", data.ways.size());
             }));
         }
         // Admin parent chain (parallel array indexed by polygon_id), empty
@@ -670,9 +669,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
         // Per-way postcode (parallel array indexed by way_id)
         if (!data.way_postcode_ids.empty()) {
             write_futures.push_back(std::async(std::launch::async, [&] {
-                write_binary_file(output_dir + "/way_postcodes.bin",
-                                  reinterpret_cast<const char*>(data.way_postcode_ids.data()),
-                                  data.way_postcode_ids.size() * sizeof(uint32_t));
+                write_side_file(output_dir, "way_postcodes.bin", data.way_postcode_ids, "street_ways.bin", data.ways.size());
             }));
         }
         if (write_addresses) {
@@ -746,9 +743,8 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             // Per-addr postcode (optional separate file, parallel to addr_points)
             if (!data.addr_postcode_ids.empty()) {
                 write_futures.push_back(std::async(std::launch::async, [&] {
-                    write_binary_file(output_dir + "/addr_postcodes.bin",
-                                      reinterpret_cast<const char*>(data.addr_postcode_ids.data()),
-                                      data.addr_postcode_ids.size() * sizeof(uint32_t));
+                    write_side_file(output_dir, "addr_postcodes.bin", data.addr_postcode_ids, "addr_points.bin",
+                                    data.addr_points.size());
                 }));
             }
             write_futures.push_back(std::async(std::launch::async, [&] {
@@ -760,9 +756,8 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             }));
             if (!data.interp_postcode_ids.empty()) {
                 write_futures.push_back(std::async(std::launch::async, [&] {
-                    write_binary_file(output_dir + "/interp_postcodes.bin",
-                                      reinterpret_cast<const char*>(data.interp_postcode_ids.data()),
-                                      data.interp_postcode_ids.size() * sizeof(uint32_t));
+                    write_side_file(output_dir, "interp_postcodes.bin", data.interp_postcode_ids, "interp_ways.bin",
+                                    data.interp_ways.size());
                 }));
             }
             write_futures.push_back(std::async(std::launch::async, [&] {

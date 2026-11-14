@@ -7,9 +7,10 @@
 // set or its ends. A previous build without its arc sidecars leaves every
 // arc slot cold and the admin slots as they were; one without their fallback
 // sidecars, the slots of arcs whose keys changed. Without --multi-output,
-// each region's dir is a whole index the server answers from; with it, a
-// build without --multi-quality is refused. A fresh build writes its streets
-// and addresses in cell order, whatever their names.
+// each region's dir is a whole index the server answers from, its side files
+// a value for each street and each address; with it, a build without
+// --multi-quality is refused. A fresh build writes its streets and addresses
+// in cell order, whatever their names.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -28,6 +29,7 @@
 #include "id_allocator.h"
 #include "pbf_test_objects.h"
 #include "scratch_dir.h"
+#include "side_blocks.h"
 #include "string_files.h"
 #include "test_framework.h"
 #include "tool_runs.h"
@@ -154,9 +156,10 @@ std::map<std::string, std::vector<char>> tree(const std::string& dir) {
     return files;
 }
 
-std::set<std::string> names_of(const std::map<std::string, std::vector<char>>& files) {
+template <class Value>
+std::set<std::string> names_of(const std::map<std::string, Value>& files) {
     std::set<std::string> out;
-    for (const auto& [name, bytes] : files) out.insert(name);
+    for (const auto& [name, value] : files) out.insert(name);
     return out;
 }
 
@@ -276,6 +279,32 @@ template <class Record>
 std::vector<Record> records_of(const std::vector<char>& bytes) {
     std::vector<Record> out(bytes.size() / sizeof(Record));
     if (!out.empty()) std::memcpy(out.data(), bytes.data(), out.size() * sizeof(Record));
+    return out;
+}
+
+// The side files `dir` of a tree holds, by name, each one's values: one for
+// each record of the file it sits beside.
+std::map<std::string, std::vector<uint32_t>> side_files(const std::map<std::string, std::vector<char>>& files,
+                                                        const std::string& dir) {
+    struct SideFile {
+        const char* name;
+        const char* parent;
+        size_t record_bytes;
+    };
+    std::map<std::string, std::vector<uint32_t>> out;
+    for (const SideFile& side : {SideFile{"way_parents.bin", "street_ways.bin", sizeof(WayHeader)},
+                                 SideFile{"way_postcodes.bin", "street_ways.bin", sizeof(WayHeader)},
+                                 SideFile{"addr_postcodes.bin", "addr_points.bin", sizeof(AddrPoint)},
+                                 SideFile{"interp_postcodes.bin", "interp_ways.bin", sizeof(InterpWay)}}) {
+        const auto file = files.find(dir + side.name);
+        if (file == files.end()) continue;
+        std::vector<uint32_t>& values = out[side.name];
+        const std::vector<char>& bytes = file->second;
+        side_blocks::decode(side.name, reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(),
+                            [&](const uint32_t* v, size_t n) { values.insert(values.end(), v, v + n); });
+        const auto parent = files.find(dir + side.parent);
+        CHECK(parent != files.end() && values.size() == parent->second.size() / side.record_bytes);
+    }
     return out;
 }
 
@@ -404,6 +433,15 @@ TEST(a_build_without_the_multi_flags_writes_whole_dirs_the_server_answers_from) 
         CHECK(files.at("planet/" + f) == with_tiers.at("planet/" + f));
     }
     CHECK_EQ(files.at("planet/admin_polygons.bin").size(), 7 * sizeof(AdminPolygonRecord));
+    // Its side files hold a value for each street and each address: the
+    // street's parent, one of the seven polygons, and no postcode, of which
+    // the fixture has none; no interpolations, so no file of their postcodes.
+    const auto side = side_files(files, "planet/");
+    CHECK(names_of(side) == std::set<std::string>({"addr_postcodes.bin", "way_parents.bin", "way_postcodes.bin"}));
+    for (const auto& [name, values] : side) {
+        REQUIRE(values.size() == 1);
+        CHECK(name == "way_parents.bin" ? values[0] < 7 : values[0] == NO_DATA);
+    }
 
     // The server loads the dir and puts each point on its side of the border
     // of the first two municipalities, 0.0005 degrees off it (its ways stray
@@ -430,6 +468,10 @@ TEST(a_build_without_the_multi_flags_writes_whole_dirs_the_server_answers_from) 
         for (const std::string& f : geometry) CHECK(regions.count(region + "/" + f));
     for (const char* f : {"admin_rings.bin", "arc_index.bin", "arc_vertices.bin"})
         CHECK(regions.at(std::string("europe/") + f) == regions.at(std::string("planet/") + f));
+    // Europe's street and address have their side values; a region without
+    // streets has no side file.
+    for (const std::string& region : kRegions)
+        CHECK_EQ(names_of(side_files(regions, region + "/")).size(), kRegionsHeld.count(region) ? size_t(3) : size_t(0));
     check_answers(continents, "continents");
 }
 
