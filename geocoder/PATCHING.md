@@ -87,7 +87,7 @@ The entry point for all clients:
 ```json
 {
   "build_version": 19,
-  "patch_version": 15,
+  "patch_version": 17,
   "latest": "2026-04-10",
   "previous": "2026-04-09",
   "oldest_indexes": "2026-04-08",
@@ -118,7 +118,7 @@ files belong to each axis value), constraints, presets, and the flat
   "schema_version": 1,
   "build": {
     "version": 19,
-    "patch_version": 15,
+    "patch_version": 17,
     "date": "2026-04-10",
     "previous": "2026-04-09",
     "built_at": "2026-04-10T09:00:14Z",

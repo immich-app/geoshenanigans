@@ -401,7 +401,7 @@ v8 data patch that day; applying the delta also needs memory for the whole
 old file (1.0 GB for poi.fst). Rebuilding costs no download and two to three
 and a half minutes of one core.
 
-## Patch Format (.gcpatch, version 15)
+## Patch Format (.gcpatch, version 17)
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
 pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
@@ -411,8 +411,8 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=15 (u32) + flags=0 (u32)
-  (a v15 patcher accepts only v15 patches; the v8 to v15 changes are marked
+Header: "GCPATCH\0" (8) + version=17 (u32) + flags=0 (u32)
+  (a v17 patcher accepts only v17 patches; the v8 to v17 changes are marked
   below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
@@ -473,9 +473,17 @@ Parent-id remap: marker 0xFFFFFFF3 (u32)
   street_ways pairs as well is refused. At most one such section: the
   patcher refuses a second ("Malformed POI parent-id remap: a second one").
 
-Old POI vertices' hash: marker 0xFFFFFFF8 (u32) + lane_hash of the old
-  poi_vertices.bin file (u64; `tools/patch_format.h`), right before the POI records' section of a dir
-  with POI files. The patcher replays the POI records and their blocks on R2
+Old file hash: marker 0xFFFFFFF8 (u32) + file_id (u32) + lane_hash of the
+  old file as the dir holds it (u64; `tools/patch_format.h`), before the
+  section of the file's parent records. (v17: the section names its file;
+  before, it was the old poi_vertices.bin's alone and had no file id.) One
+  for each file a replay copies from without decoding it, when the old dir
+  holds the file and its family has a section: `poi_vertices.bin` (15),
+  right before the POI records' section of a dir with POI files. The patcher
+  refuses a second hash of a file, a hash of any other file, and a replay
+  without the hash it checks by; a hash whose replay does not run (both of
+  the family's sections unchanged, or an old file without records) is read
+  and checks nothing. The patcher replays the POI records and their blocks on R2
   and V2 as they sit (`tools/poi_replay.h`): a new record whose polygon is
   the old record's, one MATCH of its block's logical bytes, at the same lat
   and lng, gets that block as it is (a V2 block is a function of its polygon

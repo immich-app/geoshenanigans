@@ -9,7 +9,7 @@
 // passed last (read again), or else from a cursor that decodes only the blocks it is asked for
 // (gcs::poi::Dec, vertices_only), made when one is. Rows are decoded and encoded again one by one (their string
 // ids move every day). A copied block is never decoded: the old poi_vertices.bin is hashed as the
-// replay passes it and checked against the diff's hash (POI_VERTICES_HASH_MARKER).
+// replay passes it and checked against the diff's hash (OLD_FILE_HASH_MARKER).
 #pragma once
 
 #include <cstdint>

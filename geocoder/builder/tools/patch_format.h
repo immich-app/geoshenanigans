@@ -237,7 +237,10 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // as one logical stream of 24-byte rows under place_nodes.bin's id, the
 // visible nodes in cell order, which the patcher encodes again as the three
 // files.
-static constexpr uint32_t GCPATCH_VERSION = 16;
+// v17: an old file's hash (OLD_FILE_HASH_MARKER) names its file, so a patch
+// carries one for each file a replay copies from without decoding it
+// (HASHED_OLD_FILES).
+static constexpr uint32_t GCPATCH_VERSION = 17;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -744,11 +747,21 @@ inline void close_patch_outputs(std::initializer_list<std::pair<FILE*, std::stri
 // (parse_parent_id_remap).
 static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 
-// The old poi_vertices.bin's hash: marker(4), lane_hash of the file (u64),
-// right before the POI records' section. The patcher's POI replay
-// (poi_replay.h) copies the old blocks a day leaves whole without decoding
-// them, and checks them by it.
-static constexpr uint32_t POI_VERTICES_HASH_MARKER = 0xFFFFFFF8;
+// An old file's hash: marker(4), file id (u32), lane_hash of the file as the
+// old dir holds it (u64), before the section of the file's parent records. A
+// replay that copies bytes of an old file without decoding them checks them
+// by it: the POI replay (poi_replay.h) the old blocks a day leaves whole. The
+// diff sends one for each file of HASHED_OLD_FILES the old dir holds and
+// whose family has a section. The patcher refuses a second hash of a file, a
+// hash of any other file, and a replay without the hash it checks by; a hash
+// whose replay does not run (both of the family's sections unchanged, or an
+// old file without records) is read and checks nothing.
+static constexpr uint32_t OLD_FILE_HASH_MARKER = 0xFFFFFFF8;
+static constexpr PatchFileId HASHED_OLD_FILES[] = {PatchFileId::POI_VERTICES};
+inline bool is_hashed_old_file(uint32_t fid) {
+    return std::find(std::begin(HASHED_OLD_FILES), std::end(HASHED_OLD_FILES), static_cast<PatchFileId>(fid)) !=
+           std::end(HASHED_OLD_FILES);
+}
 
 // --- Reading a part of the patch ---
 

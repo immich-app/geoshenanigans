@@ -700,6 +700,22 @@ static StringFixups string_fixups_of(const FileMergeResult& r, const std::string
     return fixups;
 }
 
+// The hash section (OLD_FILE_HASH_MARKER) of a file of HASHED_OLD_FILES as
+// old_dir holds it; none for a file the dir lacks.
+static void append_old_file_hash(std::vector<char>& patch, const std::string& old_dir, PatchFileId file) {
+    const std::string path = old_dir + "/" + patch_file_names[static_cast<uint32_t>(file)];
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return;
+    MappedFile f = mmap_file(path);
+    if (!f.data) throw std::runtime_error("Cannot read " + path);
+    const uint64_t h = lane_hash(f.data, f.size);
+    unmap_file(f);
+    const uint32_t marker = OLD_FILE_HASH_MARKER, fid = static_cast<uint32_t>(file);
+    patch.insert(patch.end(), reinterpret_cast<const char*>(&marker), reinterpret_cast<const char*>(&marker) + 4);
+    patch.insert(patch.end(), reinterpret_cast<const char*>(&fid), reinterpret_cast<const char*>(&fid) + 4);
+    patch.insert(patch.end(), reinterpret_cast<const char*>(&h), reinterpret_cast<const char*>(&h) + 8);
+}
+
 // Serialize a pre-computed merge result into the patch buffer. Refuses
 // offset fixups past offset_limits, which the section's header could not
 // give, before writing a byte of the section.
@@ -1776,15 +1792,7 @@ static int run(int argc, char* argv[]) {
     }
     // The old V2 file's hash, before the POI records' section: the patcher's POI replay copies the
     // blocks the day leaves whole and checks them by it.
-    if (struct stat vst; (res_poi_r.old_size || res_poi_r.new_size) && stat((old_dir + "/poi_vertices.bin").c_str(), &vst) == 0) {
-        MappedFile v = mmap_file(old_dir + "/poi_vertices.bin");
-        if (!v.data) throw std::runtime_error("Cannot read " + old_dir + "/poi_vertices.bin");
-        const uint64_t h = lane_hash(v.data, v.size);
-        unmap_file(v);
-        const uint32_t marker = POI_VERTICES_HASH_MARKER;
-        patch.insert(patch.end(), reinterpret_cast<const char*>(&marker), reinterpret_cast<const char*>(&marker) + 4);
-        patch.insert(patch.end(), reinterpret_cast<const char*>(&h), reinterpret_cast<const char*>(&h) + 8);
-    }
+    if (res_poi_r.old_size || res_poi_r.new_size) append_old_file_hash(patch, old_dir, PatchFileId::POI_VERTICES);
     serialize_merge(patch, res_poi_r, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     serialize_merge(patch, res_poi_v, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     { std::vector<char>().swap(res_poi_v.seq.data); }

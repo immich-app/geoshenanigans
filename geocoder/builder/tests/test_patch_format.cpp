@@ -381,15 +381,26 @@ TEST(patch_format_section_marker_values) {
     CHECK_EQ(SECONDARY_REMAP_MARKER, uint32_t(0xFFFFFFF6));
     CHECK_EQ(POI_PARENT_REMAP_MARKER, uint32_t(0xFFFFFFF3));
     CHECK_EQ(CLIENT_FILES_MARKER, uint32_t(0xFFFFFFF2));
+    CHECK_EQ(OLD_FILE_HASH_MARKER, uint32_t(0xFFFFFFF8));
+}
+
+TEST(patch_format_hashed_old_files_are_the_ones_a_replay_copies_unread) {
+    // poi_vertices.bin's blocks are copied undecoded; its records are decoded
+    // row by row, and no id past the table names a file.
+    CHECK(is_hashed_old_file(static_cast<uint32_t>(PatchFileId::POI_VERTICES)));
+    CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::POI_RECORDS)));
+    CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::STRINGS)));
+    CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::COUNT)));
+    CHECK(!is_hashed_old_file(OLD_FILE_HASH_MARKER));
 }
 
 // --- Format identity / enum constants ---
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v16 = 16-byte admin polygon records (v15: cell list
-    // deltas as runs). The patcher accepts this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(16));
+    // diff/patch tools. v17 = an old file's hash names its file (v16: 16-byte
+    // admin polygon records). The patcher accepts this version only.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(17));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
