@@ -29,6 +29,7 @@
 
 #include "cell_pairs.h"
 #include "checked_size.h"
+#include "coord_keys.h"
 #include "sequential_file_reader.h"
 #include "string_files.h"
 
@@ -1383,8 +1384,10 @@ inline size_t varint_size(uint32_t value) {
     return n;
 }
 
-inline uint32_t zigzag32(uint32_t v) { return (v << 1) ^ (0u - (v >> 31)); }
-inline uint32_t unzigzag32(uint32_t v) { return (v >> 1) ^ (0u - (v & 1)); }
+// The zigzag of a difference mod 2^32, and back: coord_keys.h's own, so a
+// header that calls them under `using namespace coord_keys` finds one of each.
+using coord_keys::unzigzag32;
+using coord_keys::zigzag32;
 
 // --- Cell index rebuild ---
 

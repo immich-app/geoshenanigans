@@ -309,35 +309,101 @@ std::vector<char> side_file_of(const std::string& family, const std::vector<uint
     return std::vector<char>(f.begin(), f.end());
 }
 
-// Today's street (12-byte) or interpolation (24-byte) ways of 0 to 3 nodes,
-// node_offset the running node count (0 for a way without nodes).
+// A logical way pair (way_files.h): the ways' records, 12 bytes a street and
+// 24 an interpolation, and their nodes back to back, 8 bytes a node.
 struct WaySet {
     std::vector<uint8_t> ways, nodes;
 };
-WaySet way_set(bool street) {
+
+// The pair of ways of these node counts, each record's node_offset the nodes
+// before it (0 of a way without nodes), its name and numbers anything. A
+// way's nodes walk in steps of up to 1e-4 from a start of its own, coordinates
+// of seven decimals (the hybrid key); every seventh way's are any bits (the
+// order key, but for a few).
+WaySet way_set(const way_files::Kind& kind, const std::vector<uint32_t>& counts, std::mt19937& rng) {
     WaySet s;
-    uint32_t off = 0;
-    for (uint32_t w = 0; w < 40; w++) {
-        const uint16_t cnt = uint16_t(w % 4);
-        std::vector<uint8_t> r = le(cnt ? off : 0, 4);
-        for (uint8_t b : le(cnt, 2)) r.push_back(b);
-        r.resize(8, 0);
-        for (uint8_t b : le(1000 + w, 4)) r.push_back(b);  // name, or the interpolation's street
-        if (!street) {
-            for (uint8_t b : le(2 * w, 4)) r.push_back(b);      // start
-            for (uint8_t b : le(2 * w + 9, 4)) r.push_back(b);  // end
-            r.push_back(uint8_t(w % 3));
-            r.resize(24, 0);
+    uint32_t before = 0;
+    for (size_t w = 0; w < counts.size(); w++) {
+        const uint32_t cnt = counts[w];
+        uint8_t r[way_files::MAX_STRIDE] = {};
+        wr32(r, cnt ? before : 0);
+        wr16(r + 4, uint16_t(cnt));
+        wr32(r + 8, uint32_t(rng()));
+        if (kind.interp) {
+            const uint32_t start = uint32_t(rng());
+            wr32(r + 12, start);
+            wr32(r + 16, rng() % 4 ? start + uint32_t(rng() % 200) : uint32_t(rng()));
+            r[20] = uint8_t(rng());
         }
-        s.ways.insert(s.ways.end(), r.begin(), r.end());
-        for (uint16_t j = 0; j < cnt; j++) {
-            for (uint8_t b : le(f32_bits(47.0f + float(w) * 1e-4f + float(j) * 1e-5f), 4)) s.nodes.push_back(b);
-            for (uint8_t b : le(f32_bits(8.0f + float(w) * 1e-4f - float(j) * 1e-5f), 4)) s.nodes.push_back(b);
+        s.ways.insert(s.ways.end(), r, r + kind.stride);
+        int64_t lat = int64_t(rng() % 1800000001u) - 900000000, lng = int64_t(rng() % 3600000001u) - 1800000000;
+        for (uint32_t j = 0; j < cnt; j++) {
+            uint8_t node[8];
+            if (w % 7 == 6) {
+                wr32(node, uint32_t(rng()));
+                wr32(node + 4, uint32_t(rng()));
+            } else {
+                wr32(node, f32_bits(float(double(lat) / 1e7)));
+                wr32(node + 4, f32_bits(float(double(lng) / 1e7)));
+                lat += int64_t(rng() % 2001) - 1000;
+                lng += int64_t(rng() % 2001) - 1000;
+            }
+            s.nodes.insert(s.nodes.end(), node, node + 8);
         }
-        off += cnt;
+        before += cnt;
     }
     return s;
 }
+
+// The node counts of n ways: 0 to 5, but 3000 of a way in forty and none in
+// ways 32 to 47, a group without nodes.
+std::vector<uint32_t> way_counts(size_t n, std::mt19937& rng) {
+    std::vector<uint32_t> counts(n);
+    for (size_t w = 0; w < n; w++) counts[w] = w >= 32 && w < 48 ? 0 : w % 40 == 39 ? 3000 : uint32_t(rng() % 6);
+    return counts;
+}
+
+// The nodes' bytes of the way whose record is at r.
+size_t node_bytes(const uint8_t* r) { return way_files::NODE_BYTES * size_t(rd16(r + way_files::NODE_COUNT_AT)); }
+
+// The two files the builder writes of a pair (way_files::Encoder, a way at a
+// time), by name.
+std::map<std::string, std::vector<char>> way_files_of(const way_files::Kind& kind, const WaySet& s) {
+    std::vector<char> rows, blocks;
+    auto into = [](std::vector<char>& v) {
+        return [&v](const uint8_t* p, size_t n) { v.insert(v.end(), p, p + n); };
+    };
+    way_files::Encoder enc(kind, into(rows), into(blocks));
+    size_t np = 0;
+    for (size_t at = 0; at < s.ways.size(); at += kind.stride) {
+        enc.add(&s.ways[at], s.nodes.data() + np);
+        np += node_bytes(&s.ways[at]);
+    }
+    enc.finish();
+    const auto ways_footer = enc.ways_footer();
+    const auto nodes_footer = enc.nodes_footer();
+    rows.insert(rows.end(), ways_footer.begin(), ways_footer.end());
+    blocks.insert(blocks.end(), nodes_footer.begin(), nodes_footer.end());
+    return {{kind.ways_file, rows}, {kind.nodes_file, blocks}};
+}
+
+// Encodes a pair way by way into dir, each way's record and its nodes in
+// pieces of up to max_piece bytes, every third way's nodes before its record.
+void encode_ways(const way_files::Kind& kind, const WaySet& s, const std::string& dir, std::mt19937& rng, size_t max_piece) {
+    ways::Enc enc(dir, kind);
+    enc.state = {1, 1};
+    size_t np = 0;
+    for (size_t at = 0, w = 0; at < s.ways.size(); at += kind.stride, w++) {
+        const size_t nb = node_bytes(&s.ways[at]);
+        if (w % 3 != 2) write_in_pieces(enc, 0, &s.ways[at], kind.stride, rng, max_piece);
+        if (nb) write_in_pieces(enc, 1, &s.nodes[np], nb, rng, max_piece);
+        if (w % 3 == 2) write_in_pieces(enc, 0, &s.ways[at], kind.stride, rng, max_piece);
+        np += nb;
+    }
+    finish_all(enc);
+}
+
+const way_files::Kind* const WAY_KINDS[] = {&way_files::STREETS, &way_files::INTERPS};
 
 }  // namespace
 
@@ -847,146 +913,250 @@ TEST(gcs_reader_rejects_a_varint_past_64_bits) {
     }
 }
 
-TEST(gcs_ways_decoder_rejects_codes_wider_than_the_encoder_writes) {
-    // One street way of two nodes, its block 2 wf bytes then (wl + wg) bits:
-    // a first coordinate past 4 bytes or deltas past 32 bits are refused
-    // instead of shifting a u32 past its width; the widest valid code decodes.
+TEST(gcs_ways_round_trip_in_odd_pieces_and_equal_the_builders_encoder) {
+    // Ways written a record and its nodes at a time, in pieces that cut them
+    // anywhere (of 1 to 7 bytes, and of up to 5000), give the builder's two
+    // files, whatever their count: none (the two footers alone), one, a group
+    // less one, a group, a group and one, and many groups, one of them without
+    // a node. The decoder gives the pair back, and the decoded sizes are the
+    // footers' without a decoder. Streets and interpolations.
+    std::mt19937 rng(20261114);
+    for (const way_files::Kind* kind : WAY_KINDS)
+        for (const size_t n : {size_t(0), size_t(1), size_t(15), size_t(16), size_t(17), size_t(1000)})
+            for (const size_t max_piece : {size_t(7), size_t(5000)}) {
+                const WaySet s = way_set(*kind, way_counts(n, rng), rng);
+                ScratchDir dir("gcs-test");
+                encode_ways(*kind, s, dir.path(), rng, max_piece);
+
+                const auto files = dir_files(dir.path());
+                CHECK(files == way_files_of(*kind, s));
+                if (n == 0) CHECK(files.at(kind->ways_file).size() == 8 && files.at(kind->nodes_file).size() == 16);
+                CHECK_EQ(ways::decoded_size(dir.path(), *kind, 0), uint64_t(s.ways.size()));
+                CHECK_EQ(ways::decoded_size(dir.path(), *kind, 1), uint64_t(s.nodes.size()));
+                ways::Dec dec(dir.path(), *kind);
+                CHECK_EQ(dec.decoded_size(0), uint64_t(s.ways.size()));
+                CHECK_EQ(dec.decoded_size(1), uint64_t(s.nodes.size()));
+                const auto out = decode_all(dec);
+                CHECK(out[0] == s.ways);
+                CHECK(out[1] == s.nodes);
+            }
+}
+
+TEST(gcs_ways_decoder_takes_a_dir_without_its_files_as_no_ways_and_refuses_one_of_them) {
+    // A variant without streets has neither street file: it decodes to no
+    // ways, beside the interpolations' pair. A dir with one file of a pair is
+    // refused by name, by the decoder and by the decoded size alone.
+    std::mt19937 rng(20261114);
+    ScratchDir dir("gcs-test");
+    encode_ways(way_files::INTERPS, way_set(way_files::INTERPS, way_counts(20, rng), rng), dir.path(), rng, 100);
+
+    for (int port = 0; port < 2; port++) CHECK_EQ(ways::decoded_size(dir.path(), way_files::STREETS, port), uint64_t(0));
+    ways::Dec none(dir.path(), way_files::STREETS);
+    CHECK_EQ(none.decoded_size(0) + none.decoded_size(1), uint64_t(0));
+    const auto out = decode_all(none);
+    CHECK(out[0].empty() && out[1].empty());
+
+    REQUIRE(std::filesystem::remove(dir.path() + "/interp_nodes.bin"));
+    const std::string refusal = "Malformed way files: interp_ways.bin without interp_nodes.bin";
+    CHECK_EQ(refusal_of([&] { ways::Dec dec(dir.path(), way_files::INTERPS); }), refusal);
+    CHECK_EQ(refusal_of([&] { ways::decoded_size(dir.path(), way_files::INTERPS, 0); }), refusal);
+}
+
+TEST(gcs_ways_decoder_refuses_what_the_strict_decoder_refuses) {
+    // A pair of 40 ways, damaged 400 times a kind: bytes of the rows, of the
+    // blocks or of a footer overwritten, a byte cut or added before a footer,
+    // a file gone, the second group's blocks a byte further than the first's
+    // end, a node more in the footer's count, and every tenth time nothing.
+    // The decoder, which reads a way at a time, refuses each with the message
+    // of way_files::decode, which reads the two files whole, and gives that
+    // one's pair where it takes the files. The decoded size alone refuses
+    // what the two footers show.
+    std::mt19937 rng(20261114);
+    auto u8 = [](const std::vector<char>& v) { return std::vector<uint8_t>(v.begin(), v.end()); };
+    for (const way_files::Kind* kind : WAY_KINDS) {
+        const WaySet s = way_set(*kind, way_counts(40, rng), rng);
+        const auto written = way_files_of(*kind, s);
+        const std::vector<uint8_t> rows = u8(written.at(kind->ways_file)), blocks = u8(written.at(kind->nodes_file));
+        size_t refused = 0, taken = 0, by_footers = 0, differ = 0;
+        for (int round = 0; round < 400; round++) {
+            std::vector<uint8_t> r = rows, b = blocks;
+            bool has_rows = true, has_blocks = true;
+            auto overwrite = [&](std::vector<uint8_t>& f) { f[rng() % f.size()] = uint8_t(rng()); };
+            switch (round % 10) {
+            case 0: overwrite(r); break;
+            case 1: overwrite(b); break;
+            case 2:
+                for (int k = 0; k < 3; k++) overwrite(rng() % 2 ? r : b);
+                break;
+            case 3: b.erase(b.end() - 17); break;
+            case 4: b.insert(b.end() - 16, uint8_t(rng())); break;
+            case 5: r.erase(r.begin() + long(rng() % (r.size() - 8))); break;
+            case 6: (round % 20 < 10 ? has_rows : has_blocks) = false; break;
+            case 7: r[kind->row_bytes(way_files::GROUP_WAYS)]++; break;
+            case 8: b[b.size() - 16]++; break;
+            default: break;
+            }
+            ScratchDir dir("gcs-test");
+            if (has_rows) write_bytes(dir.path() + "/" + kind->ways_file, r);
+            if (has_blocks) write_bytes(dir.path() + "/" + kind->nodes_file, b);
+            const uint64_t rows_size = has_rows ? r.size() : way_files::ABSENT, blocks_size = has_blocks ? b.size() : way_files::ABSENT;
+
+            WaySet whole, stepped;
+            const std::string strict = refusal_of([&] {
+                way_files::decode(
+                    *kind, r.data(), rows_size, b.data(), blocks_size,
+                    [&](const uint8_t* record) { whole.ways.insert(whole.ways.end(), record, record + kind->stride); },
+                    [&](const uint8_t* p, size_t n) { whole.nodes.insert(whole.nodes.end(), p, p + n); });
+            });
+            const std::string ours = refusal_of([&] {
+                ways::Dec dec(dir.path(), *kind);
+                auto out = decode_all(dec);
+                stepped.ways = std::move(out[0]);
+                stepped.nodes = std::move(out[1]);
+            });
+            const std::string footers = refusal_of([&] {
+                way_files::read_footers(*kind, r.data() + (r.size() - 8), rows_size, b.data() + (b.size() - 16), blocks_size);
+            });
+            const std::string sized = refusal_of([&] { ways::decoded_size(dir.path(), *kind, 0); });
+
+            const bool same = ours == strict && sized == footers &&
+                              (!strict.empty() || (stepped.ways == whole.ways && stepped.nodes == whole.nodes));
+            if (!same && differ++ < 3)
+                std::printf("    round %d: decode \"%s\", the codec \"%s\"; footers \"%s\", the size \"%s\"\n", round, strict.c_str(),
+                            ours.c_str(), footers.c_str(), sized.c_str());
+            refused += !strict.empty();
+            taken += strict.empty();
+            by_footers += !footers.empty();
+            if (round % 10 == 9) CHECK(strict.empty() && stepped.ways == s.ways && stepped.nodes == s.nodes);
+            if (round % 10 == 7 || round % 10 == 8) CHECK(!strict.empty() && footers.empty());
+        }
+        std::printf("    %s: %zu refused (%zu by the footers), %zu taken\n", kind->ways_file, refused, by_footers, taken);
+        CHECK_EQ(differ, size_t(0));
+        CHECK(refused > 200 && taken > 60 && by_footers > 60);
+    }
+}
+
+TEST(gcs_ways_decoder_refuses_a_way_starting_past_node_u32) {
+    // A way's node_offset is a u32: ways whose nodes sum past it are refused
+    // at the first way that starts past node 2^32 - 1 (narrowed, it read as a
+    // small offset). 40 street ways decoded from node 2^32 - 1: the first way
+    // with nodes starts there, the next one past it.
+    std::mt19937 rng(5);
+    const WaySet s = way_set(way_files::STREETS, way_counts(40, rng), rng);
+    ScratchDir dir("gcs-test");
+    encode_ways(way_files::STREETS, s, dir.path(), rng, 7);
+    uint64_t second_with_nodes = 0;
+    for (size_t w = 0, with_nodes = 0; w < 40 && with_nodes < 2; w++)
+        if (node_bytes(&s.ways[12 * w]) && ++with_nodes == 2) second_with_nodes = w;
+    REQUIRE(second_with_nodes > 0);
+
+    ways::Dec dec(dir.path(), way_files::STREETS);
+    dec.node = UINT32_MAX;
+    for (auto& st : dec.state) st = 1;
+    const std::string refusal = refusal_of([&] {
+        while (dec.step())
+            for (auto& q : dec.out) q.pop(q.size());
+    });
+
+    CHECK_EQ(refusal, std::string("Malformed way files: street_ways.bin has a way with nodes after 2^32 nodes or more"));
+    CHECK_EQ(dec.way, second_with_nodes);
+}
+
+TEST(gcs_ways_encoder_refuses_a_stream_that_is_not_whole_ways_and_their_nodes) {
+    // Three street ways of 2, 0 and 1 nodes. A record whose node_offset is
+    // not the nodes before it is refused as it comes, by the way; a stream
+    // that ends inside a way's nodes or inside a record, or holds a node past
+    // the last way's, at the finish, not written as a shorter pair.
+    std::mt19937 rng(20261114);
+    const WaySet s = way_set(way_files::STREETS, {2, 0, 1}, rng);
     struct Case {
-        int wf, wl, wg;
-        const char* refusal;  // nullptr: decodes
+        size_t ways, nodes;  // the bytes of each stream written
+        uint32_t offset;     // the last way's node_offset
+        const char* refusal;
     };
-    const Case cases[] = {{4, 32, 32, nullptr},
-                          {0, 0, 0, nullptr},
-                          {5, 0, 0, "gcs: street: way 0 has a bad code 0xa000"},
-                          {7, 0, 0, "gcs: street: way 0 has a bad code 0xe000"},
-                          {0, 33, 0, "gcs: street: way 0 has a bad code 0x21"},
-                          {4, 32, 63, "gcs: street: way 0 has a bad code 0x8fe0"}};
+    const Case cases[] = {{36, 24, 2, ""},
+                          {36, 24, 3, "Malformed way files: street_ways.bin way 2 has a node_offset of 3, not the 2 nodes before it"},
+                          {36, 23, 2, "gcs: streets: 12 bytes left over on input 0"},
+                          {35, 16, 2, "gcs: streets: 11 bytes left over on input 0"},
+                          {24, 24, 2, "gcs: streets: 8 bytes left over on input 1"}};
     for (const Case& c : cases) {
         ScratchDir dir("gcs-test");
-        const uint16_t cnt = 2, code = uint16_t(c.wl | c.wg << 6 | c.wf << 13);
-        write_bytes(dir.path() + "/street.groups", std::vector<uint8_t>(12));
-        write_bytes(dir.path() + "/street.nodes2", std::vector<uint8_t>(ways::block_size(cnt, code), 0x5A));
-        write_bytes(dir.path() + "/street.cnt", le(cnt, 2));
-        write_bytes(dir.path() + "/street.code", le(code, 2));
-        write_bytes(dir.path() + "/street.name", le(7, 4));
-        const int status = exit_status_in_child(
-            [&] {
-                return refusal_code(
-                    [&] {
-                        Manifest m;
-                        m.set("street.ways", 1);
-                        m.set("street.nodes", cnt);
-                        m.set("street.G", 16);
-                        ways::Dec dec(dir.path(), true, m);
-                        dec.state = {1, 1};
-                        while (dec.step()) {}
-                    },
-                    c.refusal ? c.refusal : "");
-            },
-            5);
-        CHECK_EQ(status, c.refusal ? 2 : 0);
-    }
-}
-
-TEST(gcs_ways_decoder_rejects_bytes_past_the_end_of_a_column) {
-    // A street or interpolation set with a byte appended to any one of its
-    // columns fails instead of decoding and dropping it; the set as encoded
-    // decodes to its input.
-    for (bool street : {true, false}) {
-        const WaySet s = way_set(street);
-        ScratchDir enc_dir("gcs-test");
-        Manifest m;
-        {
-            std::mt19937 rng(5);
-            ways::Enc enc(enc_dir.path(), street);
-            enc.state = {1, 1};
-            const size_t stride = street ? 12 : 24;
-            size_t np = 0;
-            for (size_t w = 0; w < s.ways.size() / stride; w++) {
-                write_in_pieces(enc, 0, &s.ways[stride * w], stride, rng, 5);
-                const size_t nb = 8 * size_t(rd16(&s.ways[stride * w + 4]));
-                if (nb) write_in_pieces(enc, 1, &s.nodes[np], nb, rng, 7);
-                np += nb;
-            }
-            m = finish_all(enc);
-        }
-        {
-            ways::Dec dec(enc_dir.path(), street, m);
-            const auto out = decode_all(dec);
-            CHECK(out[0] == s.ways);
-            CHECK(out[1] == s.nodes);
-        }
-        const std::string fam = street ? "street" : "interp";
-        const std::vector<std::string> columns = street ? std::vector<std::string>{"cnt", "code", "name"}
-                                                        : std::vector<std::string>{"cntcode", "street", "start", "span", "interp"};
-        for (const std::string& column : columns) {
-            ScratchDir bad("gcs-test");
-            std::filesystem::copy(enc_dir.path(), bad.path(),
-                                  std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
-            {
-                std::ofstream f(bad.path() + "/" + fam + "." + column, std::ios::binary | std::ios::app);
-                f.put('\x5a');
-            }
-            const int status = exit_status_in_child(
-                [&] {
-                    return refusal_code(
-                        [&] {
-                            ways::Dec dec(bad.path(), street, m);
-                            for (auto& st : dec.state) st = 1;
-                            while (dec.step())
-                                for (auto& q : dec.out) q.pop(q.size());
-                        },
-                        "gcs: " + fam + ": columns not fully consumed");
-                },
-                20);
-            if (status != 2) std::printf("    %s.%s: exit %d\n", fam.c_str(), column.c_str(), status);
-            CHECK_EQ(status, 2);
-        }
-    }
-}
-
-TEST(gcs_ways_decoder_rejects_a_way_starting_past_node_u32) {
-    // A way's node_offset is a u32: counts that sum past it, while the total
-    // matches the manifest's node count, are rejected at the first way that
-    // starts past node 2^32 - 1 (narrowed, it read as a small offset). The 40
-    // street ways of 0 to 3 nodes decoded from node 2^32 - 1: the first way
-    // with nodes starts there, the next one past it.
-    const WaySet s = way_set(true);
-    ScratchDir dir("gcs-test");
-    Manifest m;
-    {
-        std::mt19937 rng(5);
-        ways::Enc enc(dir.path(), true);
+        std::vector<uint8_t> ways = s.ways;
+        wr32(&ways[24], c.offset);
+        ways::Enc enc(dir.path(), way_files::STREETS);
         enc.state = {1, 1};
-        size_t np = 0;
-        for (size_t w = 0; w < s.ways.size() / 12; w++) {
-            write_in_pieces(enc, 0, &s.ways[12 * w], 12, rng, 5);
-            const size_t nb = 8 * size_t(rd16(&s.ways[12 * w + 4]));
-            if (nb) write_in_pieces(enc, 1, &s.nodes[np], nb, rng, 7);
-            np += nb;
-        }
-        m = finish_all(enc);
+
+        CHECK_EQ(refusal_of([&] {
+                     enc.write(1, s.nodes.data(), c.nodes);
+                     enc.write(0, ways.data(), c.ways);
+                     finish_all(enc);
+                 }),
+                 std::string(c.refusal));
+        if (!*c.refusal) CHECK(dir_files(dir.path()) == way_files_of(way_files::STREETS, s));
     }
-    m.set("street.nodes", UINT32_MAX + m.num("street.nodes"));
-    size_t second_with_nodes = 0;
-    for (size_t w = 0, with_nodes = 0; w < s.ways.size() / 12 && with_nodes < 2; w++)
-        if (rd16(&s.ways[12 * w + 4]) && ++with_nodes == 2) second_with_nodes = w;
+}
 
-    const int status = exit_status_in_child(
-        [&] {
-            return refusal_code(
-                [&] {
-                    ways::Dec dec(dir.path(), true, m);
-                    dec.node_off = UINT32_MAX;
-                    for (auto& st : dec.state) st = 1;
-                    while (dec.step())
-                        for (auto& q : dec.out) q.pop(q.size());
-                },
-                "gcs: street: way " + std::to_string(second_with_nodes) + " starts past node 4294967295");
-        },
-        20);
+TEST(gcs_ways_codec_holds_one_way) {
+    // 3,000 interpolations of 20 to 200 nodes, two of them of the most nodes
+    // a way has (65,535: 524,280 B, one's of any bits, whose block is as
+    // long), 3.6 MB of nodes: each way's record and then its nodes in one
+    // write (as the patcher's FILE passes a long write), read back as the
+    // patcher reads them (a record, then its nodes in 64 KiB views). The
+    // encoder's queues hold the record and the nodes of the way in flight;
+    // the decoder's what a read asks ahead and one way; the rows' reader its
+    // buffer, and the blocks' the largest block. The files are the builder's.
+    const way_files::Kind& kind = way_files::INTERPS;
+    const size_t most = way_files::NODE_BYTES * size_t(way_files::MAX_WAY_NODES);
+    std::mt19937 rng(20261114);
+    std::vector<uint32_t> counts(3000);
+    for (size_t w = 0; w < counts.size(); w++)
+        counts[w] = w == 699 || w == 2100 ? uint32_t(way_files::MAX_WAY_NODES) : 20 + uint32_t(rng() % 181);
+    const WaySet s = way_set(kind, counts, rng);
+    ScratchDir dir("gcs-test");
+    ways::Enc enc(dir.path(), kind);
+    enc.state = {1, 1};
+    size_t np = 0;
+    for (size_t at = 0; at < s.ways.size(); at += kind.stride) {
+        enc.write(0, &s.ways[at], kind.stride);
+        enc.write(1, &s.nodes[np], node_bytes(&s.ways[at]));
+        np += node_bytes(&s.ways[at]);
+    }
+    const size_t encoder_records = enc.peak(0), encoder_nodes = enc.peak(1);
+    finish_all(enc);
 
-    CHECK_EQ(status, 2);
+    ways::Dec dec(dir.path(), kind);
+    dec.state = {1, 1};
+    WaySet out;
+    std::vector<char> view(size_t(64) << 10);
+    auto read = [&](int port, size_t n, std::vector<uint8_t>& to) {
+        while (n) {
+            const size_t k = dec.read(port, view.data(), std::min(n, view.size()));
+            if (!k) return false;
+            to.insert(to.end(), view.data(), view.data() + k);
+            n -= k;
+        }
+        return true;
+    };
+    bool complete = true;
+    for (size_t at = 0; at < s.ways.size(); at += kind.stride)
+        complete &= read(0, kind.stride, out.ways) && read(1, node_bytes(&s.ways[at]), out.nodes);
+    REQUIRE(dec.R && dec.B);
+    const size_t rows_reader = dec.R->buf.size(), blocks_reader = dec.B->buf.size();
+    std::printf("    %zu B of nodes: encoder queue peaks %zu %zu B, decoder queue peaks %zu %zu B, readers %zu %zu B\n", s.nodes.size(),
+                encoder_records, encoder_nodes, dec.peak(0), dec.peak(1), rows_reader, blocks_reader);
+
+    CHECK(s.nodes.size() > 6 * most);
+    CHECK_EQ(encoder_records, kind.stride);
+    CHECK_EQ(encoder_nodes, most);
+    CHECK(dec.peak(0) <= Decoder::READ_AHEAD);
+    CHECK(dec.peak(1) <= Decoder::READ_AHEAD + most);
+    CHECK(rows_reader <= ways::ROWS_BUF + READ_SLACK);
+    CHECK(blocks_reader > most && blocks_reader <= most + 8 + READ_SLACK);
+    CHECK(complete);
+    CHECK(dec.read(0, view.data(), 1) == 0);
+    CHECK(out.ways == s.ways);
+    CHECK(out.nodes == s.nodes);
+    CHECK(dir_files(dir.path()) == way_files_of(kind, s));
 }
 
 namespace {

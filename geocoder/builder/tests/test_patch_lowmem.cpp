@@ -766,7 +766,7 @@ std::vector<Poi> pois_of(std::mt19937& rng, uint32_t n, uint32_t vertices, bool 
 
 // n address points, every third without a footprint, the others with one of
 // 1 to 8 random vertices, on a street of their own: geocoder-gc's address
-// family and its streets, into d.
+// family beside the street pair, into d.
 void put_addr_family(BuildDir& d, std::mt19937& rng, uint32_t n) {
     std::vector<GeoRow> rows;
     for (uint32_t k = 0; k < 50; k++) rows.push_back({k, {k % 10}});
@@ -1291,7 +1291,7 @@ TEST(patch_lowmem_applies_to_a_set_with_empty_address_files) {
     const LowMemCase c{dir.path(), "empty-addresses"};
     REQUIRE(prepare(c, old_d, new_d).empty());
 
-    CHECK(apply_both_modes(c).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
 // A parent's REPLACE run (the same street ways, renamed) whose children stay
@@ -1310,7 +1310,7 @@ TEST(patch_lowmem_drops_the_old_records_of_a_replace_run) {
     const LowMemCase c{dir.path(), "replaced-parents"};
     REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta).empty());
 
-    CHECK(apply_both_modes(c, decoder_peaks_at_most("streets", DECODER_HOLD)).empty());
+    CHECK(apply_modes(c, ALL_MODES, decoder_peaks_at_most("streets", DECODER_HOLD)).bad.empty());
 }
 
 // An INSERT stretch of POI polygons (2 MB of new vertex blocks between kept
@@ -2090,7 +2090,7 @@ TEST(patch_lowmem_new_manifest_names_only_the_families_the_patch_ships) {
     CHECK(apply_both_modes(c).empty());
     auto r = run_tool({GEOCODER_GC_BIN, "decode", c.dir("out.sync"), c.dir("out.dec")}, c.log());
     CHECK(r.ok);
-    CHECK(r.ok && read_dir(c.dir("out.dec")) == new_d);
+    CHECK(r.ok && read_dir(c.dir("out.dec")) == gctest::as_written(new_d));
 }
 
 // A new set with part of an encoded family (the address family without its
@@ -2719,6 +2719,58 @@ TEST(patch_refuses_an_old_side_file_the_builder_would_not_write) {
     for (const char* set : {"old", "old.enc"}) REQUIRE(write_file(c.dir(set) + "/way_parents.bin", file));
 
     CHECK(not_refused(c, ALL_MODES, c.patch(), "mode-byte", "Malformed way_parents.bin: block 0 is neither FOR nor a dictionary").empty());
+}
+
+// Old street files the builder would not write are refused by name in every
+// mode as the patcher reads them, though their footers give the sizes the
+// patch expects: a group's row whose blocks start a byte past where the
+// blocks before them end, and a nodes file a byte short of its last block. A
+// dir with one file of the pair is refused before anything is read. The patch
+// applies to the files as written.
+TEST(patch_refuses_old_way_files_the_builder_would_not_write) {
+    ScratchDir dir("patch-old-ways");
+    std::vector<uint32_t> names(40), renamed(40);
+    for (uint32_t i = 0; i < 40; i++) {
+        names[i] = i;
+        renamed[i] = i == 30 ? 1000 : i;
+    }
+    BuildDir old_d, new_d, old_meta, new_meta;
+    put_named_ways(old_d, old_meta, names);
+    put_named_ways(new_d, new_meta, renamed);
+    const LowMemCase c{dir.path(), "ways"};
+    REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    const std::vector<char> rows = read_file(c.dir("old") + "/street_ways.bin"), nodes = read_file(c.dir("old") + "/street_nodes.bin");
+    // Three groups' rows, 12 bytes and 8 a way, and the footer.
+    REQUIRE(rows.size() == 2 * (12 + 16 * 8) + (12 + 8 * 8) + 8 && nodes.size() > 16);
+    // (The encoded set's files are the old dir's or copies of them.)
+    auto put = [&](const char* name, const std::optional<std::vector<char>>& bytes) {
+        for (const char* set : {"old", "old.enc"}) {
+            const std::string path = c.dir(set) + "/" + name;
+            std::filesystem::remove(path);
+            if (bytes) REQUIRE(write_file(path, *bytes));
+        }
+    };
+    std::vector<char> moved = rows, cut = nodes;
+    moved[12 + 16 * 8]++;
+    cut.erase(cut.end() - 17);
+    struct Edit {
+        std::string name;
+        const char* file;
+        std::optional<std::vector<char>> bytes;
+        std::string refusal;
+    };
+    for (const Edit& e : {Edit{"row", "street_ways.bin", moved, "street_ways.bin group 1 is not where the blocks before it end"},
+                          Edit{"block", "street_nodes.bin", cut, "street_nodes.bin ends inside the block of way 39"},
+                          Edit{"half", "street_nodes.bin", std::nullopt, "street_ways.bin without street_nodes.bin"}}) {
+        put(e.file, e.bytes);
+
+        CHECK(not_refused(c, ALL_MODES, c.patch(), e.name, "Malformed way files: " + e.refusal).empty());
+
+        put("street_ways.bin", rows);
+        put("street_nodes.bin", nodes);
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
 // A client file list of more files than a variant holds (1025, past
@@ -4304,9 +4356,9 @@ TEST(patch_lowmem_refuses_a_manifest_naming_the_admin_family) {
     const std::string manifest = c.dir("old.enc") + "/gc.manifest";
     const std::vector<char> was = read_file(manifest);
     std::string text(was.begin(), was.end());
-    const size_t at = text.find("gc.families streets,addr\n");
-    REQUIRE(at != std::string::npos);
-    text.replace(at, 25, "gc.families streets,addr,admin\n");
+    const size_t at = text.find("gc.families "), end = text.find('\n', at);
+    REQUIRE(at != std::string::npos && end != std::string::npos);
+    text.insert(end, ",admin");
     REQUIRE(write_file(manifest, std::vector<char>(text.begin(), text.end())));
     const std::string refusal = "unknown family admin in gc.manifest";
 

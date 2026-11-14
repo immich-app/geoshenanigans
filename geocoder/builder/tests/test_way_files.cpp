@@ -11,7 +11,6 @@
 #include <vector>
 
 #include "coord_keys.h"
-#include "gcs_codec.h"
 #include "test_framework.h"
 #include "types.h"
 #include "way_files.h"
@@ -783,49 +782,19 @@ TEST(a_logical_pair_has_one_encoding) {
     }
 }
 
-// The patch codec's packed ways (tools/gcs_codec.h) code a way's nodes the
-// same: the code and the block of ways of every shape, near their anchor and
-// far from it.
-TEST(a_node_block_is_the_patch_codecs_on_random_ways) {
+// A node block goes after what its vector holds, the same bytes and code as
+// into an empty one.
+TEST(a_node_block_is_appended_to_what_its_vector_holds) {
     std::mt19937_64 rng(20261115);
-    std::vector<uint8_t> nodes, ours, theirs;
-    std::vector<uint32_t> kl, kg;
-    size_t hybrid = 0, order = 0, wide = 0, differ = 0;
-    for (int t = 0; t < 20000; t++) {
-        const uint64_t shape = rng() % 8;
-        const size_t count = 1 + size_t(rng() % (t % 500 == 0 ? 20000 : 60));
-        const std::vector<uint32_t> way =
-            random_nodes(rng, count, shape < 4 ? SEVEN_DECIMALS : shape < 6 ? NEAR_ZERO : shape == 6 ? ANY_BITS : ONE_NODE_OVER);
-        nodes.clear();
-        for (uint32_t x : way) append32(nodes, x);
-        // The anchor: the first node, one a few floats away, or any bits.
-        const uint64_t far = rng() % 3;
-        const uint32_t jitter = uint32_t(rng() % 70000);
-        const uint32_t any = uint32_t(rng());
-        const uint32_t al = far == 0 ? way[0] : far == 1 ? way[0] + jitter : any;
-        const uint32_t ag = far == 0 ? way[1] : far == 1 ? way[1] - jitter / 300 : ~any;
-        ours.clear();
-        theirs.clear();
-        const uint16_t code = way_files::encode_block(nodes.data(), count, al, ag, ours);
-        const uint16_t their_code = gcs::ways::encode_way(nodes.data(), count, al, ag, theirs, kl, kg);
-        differ += code != their_code || ours != theirs || ours.size() != way_files::block_bytes(uint16_t(count), code);
-        hybrid += way_files::is_hybrid(code);
-        order += !way_files::is_hybrid(code);
-        wide += way_files::lat_bits(code) == 32;
-    }
-    CHECK_EQ(differ, size_t(0));
-    CHECK(hybrid > 5000 && order > 5000 && wide > 500);
-    // Appended to what the block vector holds.
     const std::vector<uint32_t> way = random_nodes(rng, 9, SEVEN_DECIMALS);
-    nodes.clear();
+    std::vector<uint8_t> nodes, alone, after = {1, 2, 3};
     for (uint32_t x : way) append32(nodes, x);
-    std::vector<uint8_t> after = {1, 2, 3};
-    ours.clear();
-    const uint16_t code = way_files::encode_block(nodes.data(), 9, way[0], way[1], ours);
+    const uint16_t code = way_files::encode_block(nodes.data(), 9, way[0], way[1], alone);
     CHECK_EQ(way_files::encode_block(nodes.data(), 9, way[0], way[1], after), code);
-    REQUIRE(after.size() == 3 + ours.size());
+    CHECK_EQ(alone.size(), way_files::block_bytes(9, code));
+    REQUIRE(after.size() == 3 + alone.size());
     CHECK(std::vector<uint8_t>(after.begin(), after.begin() + 3) == std::vector<uint8_t>({1, 2, 3}));
-    CHECK(std::vector<uint8_t>(after.begin() + 3, after.end()) == ours);
+    CHECK(std::vector<uint8_t>(after.begin() + 3, after.end()) == alone);
 }
 
 TEST(a_group_put_as_coded_bytes_is_the_group_encoded) {

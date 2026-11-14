@@ -5,7 +5,6 @@
 // tool never writes its source, refuses an encoded dir as encode input and an
 // output dir holding files. (The patcher's decoders: tests/test_gcs_codec.cpp.)
 #include "gc_addr.h"
-#include "gc_ways.h"
 
 #include <csignal>
 #include <cstring>
@@ -68,37 +67,6 @@ uint32_t f32_bits(float f) {
 }
 
 void putf(std::vector<uint8_t>& o, float f) { put32(o, f32_bits(f)); }
-
-// 40 street (or interpolation) ways of 0 to 3 nodes; node_offset is the
-// running node count (0 for a way without nodes).
-void ways_today_set(const std::string& dir, bool street) {
-    std::vector<uint8_t> ways, nodes;
-    uint32_t off = 0;
-    for (uint32_t w = 0; w < 40; w++) {
-        const uint16_t cnt = uint16_t(w % 4);
-        const size_t at = ways.size();
-        put32(ways, cnt ? off : 0);
-        ways.push_back(uint8_t(cnt));
-        ways.push_back(uint8_t(cnt >> 8));
-        ways.push_back(0);
-        ways.push_back(0);
-        put32(ways, 1000 + w);  // name, or the interpolation's street
-        if (!street) {
-            put32(ways, 2 * w);      // start
-            put32(ways, 2 * w + 9);  // end
-            ways.push_back(uint8_t(w % 3));
-            ways.resize(at + 24, 0);
-        }
-        for (uint16_t j = 0; j < cnt; j++) {
-            putf(nodes, 47.0f + float(w) * 1e-4f + float(j) * 1e-5f);
-            putf(nodes, 8.0f + float(w) * 1e-4f - float(j) * 1e-5f);
-        }
-        off += cnt;
-    }
-    std::filesystem::create_directories(dir);
-    write_bytes(dir + (street ? "/street_ways.bin" : "/interp_ways.bin"), ways);
-    write_bytes(dir + (street ? "/street_nodes.bin" : "/interp_nodes.bin"), nodes);
-}
 
 // Address points with footprints of up to 120000 vertices: 69999 still fit
 // abs2, 70000 open and 70001 closed (70000 once the closing vertex is
@@ -306,132 +274,6 @@ TEST(gc_address_encoders_refuse_a_footprint_past_the_end_of_the_file) {
 
         if (status != 2) std::printf("    %s: exit %d\n", passes ? "two passes" : "one pass", status);
         CHECK_EQ(status, 2);
-    }
-}
-
-// A way's code with widths the encoder never writes (first coordinate past 4
-// bytes, deltas past 32 bits) is refused instead of shifting a u32 past its
-// width; the widest valid code decodes. One street way of two nodes: its
-// block is 2 wf bytes then (wl + wg) bits.
-TEST(gc_ways_decoder_refuses_codes_it_never_writes) {
-    struct Case { int wf, wl, wg; bool valid; };
-    const Case cases[] = {{4, 32, 32, true}, {0, 0, 0, true}, {5, 0, 0, false}, {7, 0, 0, false},
-                          {0, 33, 0, false}, {4, 32, 63, false}};
-    ScratchDir dir("gc-ways-code");
-    const std::string src = dir.path() + "/in", out = dir.path() + "/out";
-    std::filesystem::create_directories(src);
-    std::filesystem::create_directories(out);
-    for (const Case& c : cases) {
-        const uint16_t cnt = 2, code = uint16_t(c.wl | c.wg << 6 | c.wf << 13);
-        write_bytes(src + "/street.groups", std::vector<uint8_t>(12));
-        write_bytes(src + "/street.nodes2", std::vector<uint8_t>(gcset::ways::block_size(cnt, code), 0x5A));
-        write_bytes(src + "/street.cnt", le(cnt, 2));
-        write_bytes(src + "/street.code", le(code, 2));
-        write_bytes(src + "/street.name", le(7, 4));
-
-        const int status = exit_status_in_child(
-            [&] {
-                gcset::Manifest m;
-                m.set("street.ways", 1);
-                m.set("street.nodes", cnt);
-                m.set("street.G", 16);
-                gcset::ways::decode(src, out, true, m);
-                return 0;
-            },
-            5);
-
-        if (status != (c.valid ? 0 : 2)) std::printf("    wf=%d wl=%d wg=%d: exit %d\n", c.wf, c.wl, c.wg, status);
-        CHECK_EQ(status, c.valid ? 0 : 2);
-    }
-}
-
-// An encoded street or interpolation set with bytes past the end of any one
-// of its columns fails in both ways decoders (the full and the ways-only
-// decode) instead of decoding and dropping them; the set as encoded decodes
-// in both. (A streets ways-only decode doesn't read street.code: the
-// nodes-only decode it runs beside does, and checks it.)
-TEST(gc_ways_decoders_refuse_bytes_past_a_column) {
-    ScratchDir dir("gc-ways-columns");
-    const std::string& root = dir.path();
-    for (const bool street : {true, false}) {
-        const std::string fam = street ? "street" : "interp";
-        const std::string src = root + "/" + fam + ".src", enc = root + "/" + fam + ".enc";
-        ways_today_set(src, street);
-        std::filesystem::create_directories(enc);
-        gcset::Manifest m;
-        gcset::ways::encode(src, enc, street, m);
-        const std::vector<std::string> columns = street ? std::vector<std::string>{"cnt", "code", "name"}
-                                                        : std::vector<std::string>{"cntcode", "street", "start", "span", "interp"};
-        std::vector<std::string> cases{""};  // "": the set as encoded
-        cases.insert(cases.end(), columns.begin(), columns.end());
-        for (const std::string& column : cases) {
-            const std::string bad = root + "/" + fam + "." + (column.empty() ? "as-encoded" : column);
-            std::filesystem::copy(enc, bad);
-            if (!column.empty()) {
-                std::ofstream f(bad + "/" + fam + "." + column, std::ios::binary | std::ios::app);
-                f.put('\x5a');
-            }
-            for (const bool ways_only : {false, true}) {
-                if (ways_only && street && column == "code") continue;
-                const std::string out = bad + (ways_only ? ".ways-only" : ".full");
-                std::filesystem::create_directories(out);
-
-                const int status = exit_status_in_child(
-                    [&] {
-                        if (ways_only) gcset::want_files() = {street ? "street_ways.bin" : "interp_ways.bin"};
-                        gcset::ways::decode(bad, out, street, m);
-                        return 0;
-                    },
-                    20);
-
-                if (status != (column.empty() ? 0 : 2))
-                    std::printf("    %s.%s (%s decode): exit %d\n", fam.c_str(), column.empty() ? "<as encoded>" : column.c_str(),
-                                ways_only ? "ways-only" : "full", status);
-                CHECK_EQ(status, column.empty() ? 0 : 2);
-            }
-        }
-    }
-}
-
-// A way's node_offset is a u32: street counts that sum past it, while the
-// total matches the manifest's node count, are refused at the first way that
-// starts past node 2^32 - 1 (narrowed, it read as a small offset). 65538 ways
-// of 65535 nodes decode, the last starting at node 2^32 - 1; a 65539th is
-// refused. Through the ways-only decode (the full decode's nodes would be 32
-// GiB), whose offset check the full decode shares.
-TEST(gc_ways_decoders_refuse_a_way_starting_past_node_u32) {
-    for (const uint32_t ways : {65538u, 65539u}) {
-        ScratchDir dir("gc-ways-offset");
-        const std::string src = dir.path() + "/in", out = dir.path() + "/out";
-        std::filesystem::create_directories(src);
-        std::filesystem::create_directories(out);
-        std::vector<uint8_t> cnt, name;
-        for (uint32_t w = 0; w < ways; w++) {
-            for (uint8_t b : le(65535, 2)) cnt.push_back(b);
-            put32(name, w);
-        }
-        write_bytes(src + "/street.cnt", cnt);
-        write_bytes(src + "/street.name", name);
-
-        const int status = exit_status_in_child(
-            [&] {
-                gcset::Manifest m;
-                m.set("street.ways", ways);
-                m.set("street.nodes", uint64_t(ways) * 65535);
-                m.set("street.G", 16);
-                gcset::want_files() = {"street_ways.bin"};
-                gcset::ways::decode(src, out, true, m);
-                return 0;
-            },
-            20);
-
-        if (status != (ways == 65538 ? 0 : 2)) std::printf("    %u ways: exit %d\n", ways, status);
-        CHECK_EQ(status, ways == 65538 ? 0 : 2);
-        if (ways == 65538) {
-            const std::vector<uint8_t> recs = read_bytes(out + "/street_ways.bin");
-            REQUIRE(recs.size() == size_t(12) * ways);
-            CHECK_EQ(gcset::rd32(&recs[recs.size() - 12]), UINT32_MAX);
-        }
     }
 }
 

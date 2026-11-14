@@ -151,14 +151,18 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 - **geocoder-diff** (`tools/geocoder_diff.cpp`): Compares two builds, produces `.gcpatch`. The
   POI files are R2 records and V2 polygon blocks on disk (`src/poi_files.h`); the diff decodes both
   days' into their logical form (today's 36-byte records and vertex stream) and merges those.
+  The street and the interpolation ways are way files on disk (`src/way_files.h`), a rows file and
+  a file of node blocks a kind; the diff decodes each pair a dir holds into its logical form
+  (today's 12- and 24-byte records and their nodes, 8 bytes each) and merges those. A dir without
+  street files of its own merges no streets: no other dir's are read for it.
   The string tiers are FCC2 files, front-coded buckets cut by content (`src/string_files.h`);
   the diff decodes each tier it reads into its pool and diffs the pools.
   The four per-record side files (`way_parents.bin`, `way_postcodes.bin`, `interp_postcodes.bin`,
   `addr_postcodes.bin`) are side blocks on disk (`src/side_blocks.h`); the diff decodes each into
   its u32 values, and a side file's section carries those: its sizes are 4 bytes a value, and a
   file the old day lacks goes as a full replacement of its values.
-  `geocoder-diff --decode-logical DIR OUT` writes the logical files it would read of DIR's POI,
-  place and side files into OUT, a new or empty dir, and no patch.
+  `geocoder-diff --decode-logical DIR OUT` writes the logical files it would read of DIR's way,
+  POI, place and side files into OUT, a new or empty dir, and no patch.
   `geocoder-diff --logical-size DIR` prints the bytes a diff maps for DIR's record files and the
   bytes it writes to scratch for DIR, from file sizes and footers alone;
   `tools/generate_patches.sh` starts its diffs and verifies by them, within a memory budget and
@@ -170,16 +174,17 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 - **patch_format.h** (`tools/patch_format.h`): Shared format definitions + rebuild functions
 - **geocoder-gc** (`tools/gc.cpp`, `tools/gc_*.h`): Encodes a variant dir into the compact installed
   set (the encoded files and a `gc.manifest`) and decodes one back to today's files, byte for byte,
-  each into a new or empty dir. The POI files and the side files are compact in every dir, and it
-  links them as they are
+  each into a new or empty dir. The way files, the POI files and the side files are compact in
+  every dir, and it links them as they are
 - **gcs_\*.h** (`tools/gcs_patch.h`, `gcs_codec.h`, `gcs_io.h`, `gcs_async.h`): geocoder-patch's
   in-process codecs. The POI files are decoded and their new ones encoded in every dir (one record
-  and one polygon in flight; a polygon past 256 KiB a piece at a time), and so are the side files
-  (a block of 64 values in flight, the new file's block table in a scratch file beside it until
-  the file is closed). In low-memory mode, when the old dir is an encoded installed set (a
-  `gc.manifest` beside the files, as geocoder-gc writes it), gc's families too, and the output is
-  the new encoded set, geocoder-gc's encoding of the new dir. An encoded family's records and
-  their child stream replay together; `--threads` gives each codec a thread
+  and one polygon in flight; a polygon past 256 KiB a piece at a time), and so are the way files
+  (one way and its nodes in flight, 512 KiB of them at most) and the side files (a block of 64
+  values in flight, the new file's block table in a scratch file beside it until the file is
+  closed). In low-memory mode, when the old dir is an encoded installed set (a `gc.manifest`
+  beside the files, as geocoder-gc writes it), gc's family too, and the output is the new encoded
+  set, geocoder-gc's encoding of the new dir. An encoded family's records and their child stream
+  replay together; `--threads` gives each codec a thread
 
 ### Patcher memory and speed
 
@@ -547,9 +552,9 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   position: its MATCH bytes are the old bytes of the parent records at the
   same places, a MATCH or REPLACE record's own or, where a DELETE run is
   followed by an INSERT run, the deleted record's for the inserted one at the
-  same place in the run. An encoded family (the POI files in every dir,
-  gc's in low-memory mode) decodes both files from one stream, and the
-  patcher refuses a replay that reads one of them 4 MiB
+  same place in the run. An encoded family (the way files and the POI files
+  in every dir, gc's in low-memory mode) decodes both files from one stream,
+  and the patcher refuses a replay that reads one of them 4 MiB
   (MAX_DECODER_SKEW) ahead of the other ("Malformed merge sequence: <file>
   runs ahead of <file>").
   Offset fixups (node_offset / vertex_offset of MATCH records, see

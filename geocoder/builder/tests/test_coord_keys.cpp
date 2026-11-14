@@ -14,7 +14,6 @@
 #include <vector>
 
 #include "coord_keys.h"
-#include "gcs_codec.h"
 #include "test_framework.h"
 
 using namespace coord_keys;
@@ -245,45 +244,6 @@ TEST(a_biased_hybrid_key_sorts_unsigned_as_the_key_does_signed) {
     for (size_t k = 0; k + 1 < std::size(keys); k++) CHECK(biased(keys[k]) < biased(keys[k + 1]));
     for (uint32_t key : keys) CHECK_EQ(biased(biased(key)), key);
     CHECK_EQ(biased(0), 0x80000000u);
-}
-
-// The patch codec's copy of the key (tools/gcs_codec.h), on patterns of every
-// kind: any 32 bits, the floats at and beside a multiple of 1e-7, and
-// coordinates of seven decimals.
-TEST(the_hybrid_key_is_the_patch_codecs_on_ten_million_bit_patterns) {
-    std::mt19937_64 rng(20261114);
-    size_t bad = 0, small_keys = 0, without = 0;
-    for (int t = 0; t < 10000000; t++) {
-        const uint64_t r = rng();
-        uint32_t bits;
-        if (t % 3 == 0) {
-            bits = uint32_t(r);
-        } else if (t % 3 == 1) {
-            bits = (from_hybrid_key(uint32_t(r % TEN_MILLION)) + uint32_t((r >> 32) % 3) - 1) ^ (r >> 40 & 1 ? SIGN : 0);
-        } else {
-            bits = bits_of(float(double(int64_t(r % 3600000001ull) - 1800000000) / 1e7));
-        }
-        uint32_t ours = 1, theirs = 2;
-        const bool has = hybrid_key(bits, ours);
-        bad += has != gcs::ways::hyb_key(bits, theirs) || (has && ours != theirs);
-        bad += from_hybrid_key(bits) != gcs::ways::hyb_decode(bits);
-        small_keys += has && (bits & ~SIGN) < ONE_BITS;
-        without += !has;
-    }
-    CHECK_EQ(bad, size_t(0));
-    CHECK(small_keys > 1000000);
-    CHECK(without > 1000000);
-    const uint32_t edges[] = {0u,       1u,           SIGN,            SIGN + 1,    0x7FFFFFFFu,       0xFFFFFFFFu,
-                              ONE_BITS, ONE_BITS - 1, ONE_BITS | SIGN, TEN_MILLION, HYBRID_KEY_MAX + 1};
-    for (uint32_t x : edges) {
-        uint32_t ours = 1, theirs = 2;
-        const bool has = hybrid_key(x, ours);
-        CHECK_EQ(has, gcs::ways::hyb_key(x, theirs));
-        CHECK(!has || ours == theirs);
-        CHECK_EQ(from_hybrid_key(x), gcs::ways::hyb_decode(x));
-        CHECK_EQ(order_key(x), gcs::ways::ulp_key(x));
-        CHECK_EQ(from_order_key(x), gcs::ways::ulp_unkey(x));
-    }
 }
 
 TEST(a_zigzag_holds_a_small_difference_of_either_sign_in_few_bits_and_comes_back) {

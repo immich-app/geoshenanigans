@@ -1,11 +1,11 @@
 // The patcher's side of the in-process codecs: every today's-format file of an encoded family is
 // a virtual old file (a SequentialFileReader reads it from the family's decoder) and a virtual
 // output (open_out hands back a FILE* whose bytes go to the family's encoder). A native family
-// (the POI files, R2 and V2 in every dir: poi_files.h; the place files, place_files.h; each of the
-// four side files, side_blocks.h) is encoded in every dir under today's names, the place files'
-// logical stream as place_nodes.bin; gc's families only in an encoded installed set (a dir with a
-// gc.manifest), whose new dir gets the merged gc.manifest. No today's-format file of an encoded
-// family touches the disk.
+// (the street and the interpolation ways, way_files.h; the POI files, R2 and V2 in every dir:
+// poi_files.h; the place files, place_files.h; each of the four side files, side_blocks.h) is
+// encoded in every dir under today's names, the place files' logical stream as place_nodes.bin;
+// gc's family only in an encoded installed set (a dir with a gc.manifest), whose new dir gets the
+// merged gc.manifest. No today's-format file of an encoded family touches the disk.
 #pragma once
 #include <malloc.h>
 #include <set>
@@ -33,15 +33,17 @@ struct FamilyDesc {
     Encoder* (*encoder)(const std::string& dir, const ListedSizes& sizes);
     uint64_t (*decoded_size)(const std::string& dir, int port);
 };
-// gc's families in gc's order (tools/gc.cpp; gc.families lists them in it), and the native ones.
+// The native families and gc's (tools/gc.cpp; gc.families lists those an installed set encodes).
 static const std::vector<FamilyDesc>& families() {
     static const std::vector<FamilyDesc> f = {
-        {"streets", {"street_ways.bin", "street_nodes.bin"}, false,
-         [](const std::string& dir, const Manifest& m) -> Decoder* { return new ways::Dec(dir, true, m); },
-         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new ways::Enc(dir, true); }, nullptr},
-        {"interps", {"interp_ways.bin", "interp_nodes.bin"}, false,
-         [](const std::string& dir, const Manifest& m) -> Decoder* { return new ways::Dec(dir, false, m); },
-         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new ways::Enc(dir, false); }, nullptr},
+        {"streets", {"street_ways.bin", "street_nodes.bin"}, true,
+         [](const std::string& dir, const Manifest&) -> Decoder* { return new ways::Dec(dir, way_files::STREETS); },
+         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new ways::Enc(dir, way_files::STREETS); },
+         [](const std::string& dir, int port) { return ways::decoded_size(dir, way_files::STREETS, port); }},
+        {"interps", {"interp_ways.bin", "interp_nodes.bin"}, true,
+         [](const std::string& dir, const Manifest&) -> Decoder* { return new ways::Dec(dir, way_files::INTERPS); },
+         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new ways::Enc(dir, way_files::INTERPS); },
+         [](const std::string& dir, int port) { return ways::decoded_size(dir, way_files::INTERPS, port); }},
         {"way_parents", {"way_parents.bin"}, true,
          [](const std::string& dir, const Manifest&) -> Decoder* { return new side::Dec(dir, "way_parents"); },
          [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::Enc(dir, "way_parents"); },

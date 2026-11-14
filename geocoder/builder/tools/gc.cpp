@@ -9,14 +9,13 @@
 // length), --no-link (don't hardlink the other files), --manifest-out FILE (write the manifest
 // there: each streamed pass writes its own, the caller merges them).
 //
-// Families (each runs when its input files are present): streets, interps, addr. The POI files (R2
-// and V2, src/poi_files.h) and the side files (src/side_blocks.h) are compact in every dir already
-// and are hardlinked as they are.
+// Families (each runs when its input files are present): addr. The street and the interpolation
+// ways (src/way_files.h), the POI files (R2 and V2, src/poi_files.h) and the side files
+// (src/side_blocks.h) are compact in every dir already and are hardlinked as they are.
 // Every other file is hardlinked (copied across filesystems). OUT_DIR, new or empty, gets gc.manifest
 // (counts and parameters the decoder needs). Prints one "phase" line per family: wall and CPU
 // seconds, bytes in/out.
 #include "gc_addr.h"
-#include "gc_ways.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -39,17 +38,6 @@ struct Family {
 static std::vector<Family> families() {
     using V = std::vector<std::string>;
     std::vector<Family> f;
-    f.push_back({"streets", {"street_ways.bin", "street_nodes.bin"}, {},
-                 [](const Manifest&) { return V{"street.groups", "street.nodes2", "street.cnt", "street.code", "street.name"}; },
-                 [](auto& s, auto& o, Manifest& m) { ways::encode(s, o, true, m); },
-                 [](auto& s, auto& o, const Manifest& m) { ways::decode(s, o, true, m); }});
-    f.push_back({"interps", {"interp_ways.bin", "interp_nodes.bin"}, {},
-                 [](const Manifest&) {
-                     return V{"interp.groups", "interp.nodes2", "interp.cntcode", "interp.street", "interp.start",
-                              "interp.span", "interp.interp"};
-                 },
-                 [](auto& s, auto& o, Manifest& m) { ways::encode(s, o, false, m); },
-                 [](auto& s, auto& o, const Manifest& m) { ways::decode(s, o, false, m); }});
     f.push_back({"addr", {"addr_points.bin", "addr_vertices.bin"}, {},
                  [](const Manifest&) { return V{"addr_points.col", "addr_vertices.abs2"}; },
                  [](auto& s, auto& o, Manifest& m) { addr::encode(s, o, m); },

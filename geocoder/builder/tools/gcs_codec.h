@@ -10,13 +10,13 @@
 // big_block() (256 KiB): a larger POI block is decoded a piece at a time, and encoded through the
 // new file (its vertices written as they come, then packed in place).
 #pragma once
-#include <cmath>
 #include <functional>
 #include <memory>
 #include "gcs_io.h"
 #include "place_files.h"
 #include "poi_files.h"
 #include "side_blocks.h"
+#include "way_files.h"
 
 namespace gcs {
 
@@ -162,285 +162,142 @@ struct Encoder {
     }
 };
 
-// ------------------------------------------------------------------ streets / interps (packed ways)
+// ------------------------------------------------------------------ streets / interps (way_files.h)
+// The street and the interpolation ways are way files in every dir, a rows file and a nodes file
+// a kind: these codecs turn a pair into its logical form, the ways' records (a WayHeader or an
+// InterpWay each) and their nodes back to back, for the replay and back.
 namespace ways {
-static const size_t G = 16;
-static inline uint32_t ulp_key(uint32_t b) { return (b & 0x80000000u) ? ~b : (b | 0x80000000u); }
-static inline uint32_t ulp_unkey(uint32_t k) { return (k & 0x80000000u) ? (k & 0x7fffffffu) : ~k; }
-static constexpr uint32_t ONE_BITS = 0x3f800000u, TEN_MILLION = 10000000u;
-static inline uint32_t hyb_decode(uint32_t k) {
-    const int32_t s = int32_t(k);
-    const uint32_t sign = s < 0 ? 0x80000000u : 0;
-    const uint32_t mag = s < 0 ? uint32_t(-int64_t(s)) : uint32_t(s);
-    if (mag >= TEN_MILLION) return (mag - TEN_MILLION + ONE_BITS) | sign;
-    const float f = float(double(mag) / 1e7);
-    uint32_t b;
-    memcpy(&b, &f, 4);
-    return b | sign;
-}
-static inline bool hyb_key(uint32_t b, uint32_t& k) {
-    const uint32_t a = b & 0x7fffffffu;
-    uint32_t mag;
-    if (a >= ONE_BITS) {
-        const uint64_t m = uint64_t(a) - ONE_BITS + TEN_MILLION;
-        if (m > 0x7fffffffu) return false;
-        mag = uint32_t(m);
-    } else {
-        float f;
-        memcpy(&f, &a, 4);
-        const double n = std::nearbyint(double(f) * 1e7);
-        if (n >= TEN_MILLION) return false;
-        mag = uint32_t(n);
-    }
-    if ((b >> 31) && mag == 0) return false;
-    k = (b >> 31) ? uint32_t(-int64_t(mag)) : mag;
-    return hyb_decode(k) == b;
-}
-static inline uint32_t zz(uint32_t d) { return (d << 1) ^ uint32_t(int32_t(d) >> 31); }
-static inline uint32_t unzz(uint32_t z) { return (z >> 1) ^ uint32_t(-int32_t(z & 1)); }
-static inline int bitlen(uint32_t v) { return v ? 32 - __builtin_clz(v) : 0; }
-static inline int bytelen(uint32_t v) { return (bitlen(v) + 7) / 8; }
-static inline size_t block_size(uint16_t cnt, uint16_t code) {
-    if (!cnt) return 0;
-    const size_t wl = code & 63, wg = (code >> 6) & 63, wf = (code >> 13) & 7;
-    return 2 * wf + ((size_t(cnt) - 1) * (wl + wg) + 7) / 8;
-}
-// The widths an encoder writes: the first node in at most 4 bytes, the deltas in at most 32 bits.
-static inline bool valid_code(uint16_t code) { return (code & 63) <= 32 && ((code >> 6) & 63) <= 32 && (code >> 13) <= 4; }
-struct Names { const char *ways, *nodes, *pre; size_t stride; };
-static Names names(bool street) {
-    return street ? Names{"street_ways.bin", "street_nodes.bin", "street", 12} : Names{"interp_ways.bin", "interp_nodes.bin", "interp", 24};
-}
+namespace wf = way_files;
+// The codec's buffers: the rows file streams a group's row (284 bytes at most) at a time, the
+// nodes file a way's block (a way of 65,535 nodes grows its buffer to the block's 512 KiB).
+static const size_t ROWS_BUF = size_t(4) << 10, BLOCKS_BUF = size_t(16) << 10;
 
-// One way's nodes (2 u32 per node, unaligned) into blk (appended). Returns the code.
-static uint16_t encode_way(const uint8_t* nodes, size_t cnt, uint32_t al, uint32_t ag, std::vector<uint8_t>& blk,
-                           std::vector<uint32_t>& kl, std::vector<uint32_t>& kg) {
-    auto bits = [&](size_t j, size_t c) { return rd32(nodes + 8 * j + 4 * c); };
-    const uint32_t zfl = zz(ulp_key(bits(0, 0)) - ulp_key(al)), zfg = zz(ulp_key(bits(0, 1)) - ulp_key(ag));
-    const int wf = std::max(bytelen(zfl), bytelen(zfg));
-    for (int b = 0; b < wf; b++) blk.push_back(uint8_t(zfl >> (8 * b)));
-    for (int b = 0; b < wf; b++) blk.push_back(uint8_t(zfg >> (8 * b)));
-    kl.resize(cnt);
-    kg.resize(cnt);
-    bool hyb = true;
-    for (size_t j = 0; j < cnt && hyb; j++) hyb = hyb_key(bits(j, 0), kl[j]) && hyb_key(bits(j, 1), kg[j]);
-    if (!hyb)
-        for (size_t j = 0; j < cnt; j++) { kl[j] = ulp_key(bits(j, 0)); kg[j] = ulp_key(bits(j, 1)); }
-    for (size_t j = cnt - 1; j >= 1; j--) { kl[j] -= kl[j - 1]; kg[j] -= kg[j - 1]; }
-    for (size_t j = cnt - 1; j >= 2; j--) { kl[j] -= kl[j - 1]; kg[j] -= kg[j - 1]; }
-    uint32_t ml = 0, mg = 0;
-    for (size_t j = 1; j < cnt; j++) { kl[j] = zz(kl[j]); kg[j] = zz(kg[j]); ml |= kl[j]; mg |= kg[j]; }
-    const int wl = bitlen(ml), wg = bitlen(mg);
-    uint64_t acc = 0;
-    int nb = 0;
-    auto put = [&](uint32_t v, int w) {
-        acc |= uint64_t(v) << nb;
-        nb += w;
-        while (nb >= 8) { blk.push_back(uint8_t(acc)); acc >>= 8; nb -= 8; }
-    };
-    if (wl) for (size_t j = 1; j < cnt; j++) put(kl[j], wl);
-    if (wg) for (size_t j = 1; j < cnt; j++) put(kg[j], wg);
-    if (nb) blk.push_back(uint8_t(acc));
-    return uint16_t(wl | (wg << 6) | (hyb ? 1 << 12 : 0) | (wf << 13));
-}
+inline const char* family_of(const wf::Kind& kind) { return kind.interp ? "interps" : "streets"; }
 
-// Ports: 0 = ways file, 1 = nodes file. A step emits one way's record and its nodes.
-struct Dec : Decoder {
-    bool street;
-    Names nm;
-    uint64_t nw, nn, i = 0, node_off = 0;
-    std::unique_ptr<Reader> groups, nodes2, c0, c1, c2, c3, c4;
-    uint32_t al = 0, ag = 0;
-    Dec(const std::string& src, bool st, const Manifest& m)
-        : Decoder(st ? "streets" : "interps", {names(st).ways, names(st).nodes}), street(st), nm(names(st)) {
-        const std::string k = nm.pre, p = src + "/" + nm.pre;
-        nw = m.num(k + ".ways");
-        nn = m.num(k + ".nodes");
-        if (m.num(k + ".G") != G) die("unsupported G");
-        groups.reset(new Reader(p + ".groups", 16 << 10));
-        nodes2.reset(new Reader(p + ".nodes2"));
-        c0.reset(new Reader(p + (street ? ".cnt" : ".cntcode"), 32 << 10));
-        c1.reset(new Reader(p + (street ? ".code" : ".street"), 32 << 10));
-        c2.reset(new Reader(p + (street ? ".name" : ".start"), 32 << 10));
-        if (!street) {
-            c3.reset(new Reader(p + ".span", 32 << 10));
-            c4.reset(new Reader(p + ".interp", 16 << 10));
+// The footers of dir's pair of the kind, from each file's size and last bytes alone: those of no
+// ways for a dir with neither file.
+inline wf::Footers footers_of(const std::string& dir, const wf::Kind& kind) {
+    uint8_t w[wf::WAYS_FOOTER_BYTES] = {}, n[wf::NODES_FOOTER_BYTES] = {};
+    // The file's size, its footer into `to` when it is long enough to have one.
+    auto footer = [&](const char* file, uint8_t* to, size_t bytes) -> uint64_t {
+        const std::string path = dir + "/" + file;
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) return wf::ABSENT;
+        const uint64_t size = uint64_t(st.st_size);
+        if (size >= bytes) {
+            Reader end(path, bytes, size - bytes);
+            memcpy(to, end.take(bytes), bytes);
         }
-        if (groups->size() != 12 * ((nw + G - 1) / G)) die("%s.groups size", nm.pre);
+        return size;
+    };
+    const uint64_t ways_size = footer(kind.ways_file, w, sizeof w), nodes_size = footer(kind.nodes_file, n, sizeof n);
+    return wf::read_footers(kind, w, ways_size, n, nodes_size);
+}
+
+// A dir's pair's decoded sizes (Dec::decoded_size), from the two footers alone: 0 without the
+// files.
+inline uint64_t decoded_size(const std::string& dir, const wf::Kind& kind, int port) {
+    const wf::LogicalSizes sizes = wf::logical_sizes(kind, footers_of(dir, kind));
+    return port == 0 ? sizes.ways : sizes.nodes;
+}
+
+// Ports: 0 = the ways' records, 1 = their nodes. A step: a way's record and its nodes. A dir
+// without the two files decodes to none. It checks between the units what way_files::decode
+// checks: each row's blocks start where those before them end, the last block ends at the
+// footer, and the ways' nodes are the footer's.
+struct Dec : Decoder {
+    const wf::Kind& kind;
+    wf::Footers f;
+    std::unique_ptr<Reader> R, B;  // the rows, and the node blocks
+    wf::Row row;
+    uint64_t way = 0, node = 0, at = 0;  // the ways and nodes decoded, and the bytes of their blocks
+    Dec(const std::string& src, const wf::Kind& k)
+        : Decoder(family_of(k), {k.ways_file, k.nodes_file}), kind(k), f(footers_of(src, k)) {
+        if (!f.ways) return;
+        R.reset(new Reader(src + "/" + k.ways_file, ROWS_BUF, 0, f.rows_bytes));
+        B.reset(new Reader(src + "/" + k.nodes_file, BLOCKS_BUF, 0, f.blocks_bytes));
     }
-    uint64_t decoded_size(int port) const override { return port == 0 ? nw * nm.stride : nn * 8; }
+    uint64_t decoded_size(int port) const override {
+        const wf::LogicalSizes sizes = wf::logical_sizes(kind, f);
+        return port == 0 ? sizes.ways : sizes.nodes;
+    }
     bool step() override {
-        if (i == nw) {
-            if (!nodes2->eof() || node_off != nn) die("%s: nodes2 not fully consumed", nm.pre);
-            if (!c0->eof() || !c1->eof() || !c2->eof() || (c3 && !c3->eof()) || (c4 && !c4->eof()))
-                die("%s: columns not fully consumed", nm.pre);
+        if (way == f.ways) {
+            if (!R) return false;
+            if (at != f.blocks_bytes) wf::malformed(std::string(kind.nodes_file) + " has bytes between its last block and its footer");
+            if (node != f.nodes)
+                wf::malformed(std::string(kind.nodes_file) + " counts " + std::to_string(f.nodes) + " nodes and its ways have " +
+                              std::to_string(node));
+            R.reset();
+            B.reset();
             return false;
         }
-        if (i % G == 0) {
-            const uint32_t goff = groups->u32();
-            al = groups->u32();
-            ag = groups->u32();
-            if (goff != nodes2->tell()) die("%s: group offset %u is not the stream position", nm.pre, goff);
+        const size_t j = size_t(way % wf::GROUP_WAYS);
+        if (j == 0) {
+            const uint64_t g = way / wf::GROUP_WAYS;
+            const size_t n = f.group_ways(g);
+            row = wf::decode_row(kind, R->take(kind.row_bytes(n)), n);
+            if (row.off != at)
+                wf::malformed(std::string(kind.ways_file) + " group " + std::to_string(g) + " is not where the blocks before it end");
         }
-        uint8_t rec[24];
-        memset(rec, 0, sizeof rec);
-        uint16_t cnt, code;
-        if (street) {
-            cnt = c0->u16();
-            code = c1->u16();
-            memcpy(rec + 8, c2->take(4), 4);
-        } else {
-            cnt = c0->u16();
-            code = c0->u16();
-            memcpy(rec + 8, c1->take(4), 4);
-            const uint32_t start = c2->u32();
-            wr32(rec + 12, start);
-            wr32(rec + 16, start + c3->u32());
-            rec[20] = c4->u8();
+        uint8_t record[wf::MAX_STRIDE];
+        wf::logical_record(kind, row, j, node, record);
+        emit(0, record, kind.stride);
+        if (const uint16_t cnt = row.cnt[j]) {
+            const size_t bytes = row.block_bytes(j);
+            if (bytes > f.blocks_bytes - at)
+                wf::malformed(std::string(kind.nodes_file) + " ends inside the block of way " + std::to_string(way));
+            // Decoded where the reader holds the block, with the 8 bytes decode_block may load past it.
+            const uint8_t* block = B->need(bytes + 8, true);
+            wf::decode_block(block, cnt, row.code[j], row.anchor_lat, row.anchor_lng, emit_reserve(1, wf::NODE_BYTES * size_t(cnt)));
+            B->skip(bytes);
+            at += bytes;
+            node += cnt;
         }
-        wr16(rec + 4, cnt);
-        if (cnt) {
-            if (!valid_code(code)) die("%s: way %llu has a bad code %#x", nm.pre, (unsigned long long)i, unsigned(code));
-            // node_offset is a u32: the counts can sum past it while the total matches the manifest's.
-            if (node_off > UINT32_MAX) die("%s: way %llu starts past node %u", nm.pre, (unsigned long long)i, UINT32_MAX);
-            wr32(rec, uint32_t(node_off));
-            const size_t bs = block_size(cnt, code);
-            const uint8_t* q = nodes2->need(bs + 8, true);
-            const int wl = code & 63, wg = (code >> 6) & 63, wf = (code >> 13) & 7;
-            const bool hyb = (code >> 12) & 1;
-            uint32_t zl = 0, zg = 0;
-            for (int b = 0; b < wf; b++) zl |= uint32_t(q[b]) << (8 * b);
-            for (int b = 0; b < wf; b++) zg |= uint32_t(q[wf + b]) << (8 * b);
-            const uint8_t* bp = q + 2 * wf;
-            const uint32_t fl = ulp_unkey(ulp_key(al) + unzz(zl)), fg = ulp_unkey(ulp_key(ag) + unzz(zg));
-            emit(0, rec, nm.stride);  // the record first: the queue reservation below may move
-            uint8_t* o = emit_reserve(1, 8 * size_t(cnt));
-            wr32(o, fl);
-            wr32(o + 4, fg);
-            if (cnt > 1) {
-                uint32_t kl, kg;
-                if (hyb) {
-                    if (!hyb_key(fl, kl) || !hyb_key(fg, kg)) die("%s: way %llu hybrid key", nm.pre, (unsigned long long)i);
-                } else {
-                    kl = ulp_key(fl);
-                    kg = ulp_key(fg);
-                }
-                const size_t mcount = size_t(cnt) - 1;
-                const uint64_t mlk = wl == 32 ? 0xffffffffull : ((1ull << wl) - 1);
-                const uint64_t mgk = wg == 32 ? 0xffffffffull : ((1ull << wg) - 1);
-                size_t gl = 0, gg = mcount * size_t(wl);
-                uint32_t dl = 0, dg = 0;
-                for (size_t j = 0; j < mcount; j++) {
-                    const uint32_t vl = unzz(uint32_t((rd64(bp + (gl >> 3)) >> (gl & 7)) & mlk));
-                    const uint32_t vg = unzz(uint32_t((rd64(bp + (gg >> 3)) >> (gg & 7)) & mgk));
-                    gl += size_t(wl);
-                    gg += size_t(wg);
-                    if (j == 0) { dl = vl; dg = vg; } else { dl += vl; dg += vg; }
-                    kl += dl;
-                    kg += dg;
-                    wr32(o + 8 * (j + 1), hyb ? hyb_decode(kl) : ulp_unkey(kl));
-                    wr32(o + 8 * (j + 1) + 4, hyb ? hyb_decode(kg) : ulp_unkey(kg));
-                }
-            }
-            nodes2->skip(bs);
-            node_off += cnt;
-        } else {
-            emit(0, rec, nm.stride);
-        }
-        i++;
+        way++;
         return true;
     }
 };
 
-// Ports: 0 = ways, 1 = nodes. A way is encoded once its record and all its nodes are in. The group
-// header (nodes2 offset at the group start, anchor = first node of the group's first way with
-// nodes) is written when that way arrives, or at the group's end when it has none.
+// Ports: 0 = the ways' records in, 1 = their nodes in; the pair's two files out. A way is encoded
+// once its record and all its nodes are in: its block goes to the nodes file then, and its group's
+// row to the rows file when the group's last way has come. The footers go out in finish.
 struct Enc : Encoder {
-    bool street;
-    Names nm;
-    size_t S;
-    std::unique_ptr<Writer> groups, nodes2, c0, c1, c2, c3, c4;
-    std::vector<uint8_t> blk;
-    std::vector<uint32_t> kl, kg;
-    uint64_t i = 0, expect_off = 0, nodes = 0, group_start = 0;
-    bool group_pending = false;
-    uint32_t al = 0, ag = 0;
-    Enc(const std::string& od, bool st) : Encoder(st ? "streets" : "interps", od, 2), street(st), nm(names(st)), S(nm.stride) {
-        const std::string p = od + "/" + nm.pre;
-        groups.reset(new Writer(p + ".groups", 16 << 10));
-        nodes2.reset(new Writer(p + ".nodes2"));
-        c0.reset(new Writer(p + (street ? ".cnt" : ".cntcode"), 32 << 10));
-        c1.reset(new Writer(p + (street ? ".code" : ".street"), 32 << 10));
-        c2.reset(new Writer(p + (street ? ".name" : ".start"), 32 << 10));
-        if (!street) {
-            c3.reset(new Writer(p + ".span", 32 << 10));
-            c4.reset(new Writer(p + ".interp", 16 << 10));
-        }
-    }
-    void write_group(uint32_t l, uint32_t g) {
-        if (group_start > 0xFFFFFFFFull) die("%s: nodes2 offset overflow", nm.pre);
-        groups->u32(uint32_t(group_start));
-        groups->u32(l);
-        groups->u32(g);
-        al = l;
-        ag = g;
-        group_pending = false;
-    }
+    struct Sink {
+        Writer* to;
+        void operator()(const uint8_t* p, size_t n) const { to->put(p, n); }
+    };
+    const wf::Kind& kind;
+    std::unique_ptr<Writer> RW, BW;
+    wf::Encoder<Sink, Sink> files;
+    Enc(const std::string& od, const wf::Kind& k)
+        : Encoder(family_of(k), od, 2),
+          kind(k),
+          RW(new Writer(od + "/" + k.ways_file, ROWS_BUF)),
+          BW(new Writer(od + "/" + k.nodes_file, BLOCKS_BUF)),
+          files(k, Sink{RW.get()}, Sink{BW.get()}) {}
     void pump() override {
         ByteQueue &W = in[0], &N = in[1];
-        while (W.size() >= S) {
-            const uint8_t* r = W.data();
-            const uint32_t off = rd32(r);
-            const uint16_t cnt = rd16(r + 4);
-            if (cnt && N.size() < 8 * size_t(cnt)) return;  // its nodes are not all in yet
-            if (rd16(r + 6) || (!street && (r[21] | r[22] | r[23])))
-                die("%s: way %llu has non-zero padding", nm.ways, (unsigned long long)i);
-            if (cnt ? off != expect_off : off != 0)
-                die("%s: way %llu node_offset %u is not the prefix sum %llu", nm.ways, (unsigned long long)i, off,
-                    (unsigned long long)expect_off);
-            if (i % G == 0) {
-                if (group_pending) write_group(0, 0);
-                group_pending = true;
-                group_start = nodes2->tell();
-            }
-            uint16_t code = 0;
-            if (cnt) {
-                const uint8_t* nb = N.data();
-                if (group_pending) write_group(rd32(nb), rd32(nb + 4));
-                blk.clear();
-                code = encode_way(nb, cnt, al, ag, blk, kl, kg);
-                nodes2->put(blk);
-                N.pop(8 * size_t(cnt));
-                expect_off += cnt;
-                nodes += cnt;
-            }
-            if (street) {
-                c0->u16(cnt);
-                c1->u16(code);
-                c2->put(r + 8, 4);
-            } else {
-                c0->u16(cnt);
-                c0->u16(code);
-                c1->put(r + 8, 4);
-                c2->put(r + 12, 4);
-                c3->u32(rd32(r + 16) - rd32(r + 12));
-                c4->u8(r[20]);
-            }
-            W.pop(S);
-            i++;
+        while (W.size() >= kind.stride) {
+            const uint8_t* record = W.data();
+            const size_t nodes = wf::NODE_BYTES * size_t(wf::get16(record + wf::NODE_COUNT_AT));
+            if (N.size() < nodes) return;  // its nodes are not all in yet
+            files.add(record, N.data());
+            N.pop(nodes);
+            W.pop(kind.stride);
         }
     }
-    void finish(Manifest& m) override {
+    void finish(Manifest&) override {
         require_empty();
-        if (group_pending) write_group(0, 0);
-        const std::string k = nm.pre;
-        m.set(k + ".ways", i);
-        m.set(k + ".nodes", nodes);
-        m.set(k + ".G", G);
-        m.set(k + ".nodes2_bytes", nodes2->tell());
-        for (Writer* x : {groups.get(), nodes2.get(), c0.get(), c1.get(), c2.get(), c3.get(), c4.get()})
-            if (x) x->finish();
-        groups.reset(); nodes2.reset(); c0.reset(); c1.reset(); c2.reset(); c3.reset(); c4.reset();
+        files.finish();
+        const auto ways_footer = files.ways_footer();
+        const auto nodes_footer = files.nodes_footer();
+        RW->put(ways_footer.data(), ways_footer.size());
+        BW->put(nodes_footer.data(), nodes_footer.size());
+        RW->finish();
+        BW->finish();
+        RW.reset();
+        BW.reset();
     }
 };
 }  // namespace ways

@@ -69,6 +69,7 @@
 #include "side_blocks.h"
 #include "string_offset_map.h"
 #include "types.h"
+#include "way_files.h"
 
 // Section offset probes for the section-size breakdown (built with -DSEC_PROBES).
 #ifdef SEC_PROBES
@@ -530,8 +531,9 @@ struct FileMergeResult {
 // (sent_unchanged), so the diff derives its dependents with the ids the
 // patcher keeps.
 // The merges and the side files' deltas diff the logical form of the families
-// the builder writes encoded (logical_families): each dir's POI files (R2 and
-// V2, poi_files.h), place files (place_files.h, their logical stream as
+// the builder writes encoded (logical_families): each dir's way pairs
+// (way_files.h, the ways' records and their nodes), POI files (R2 and V2,
+// poi_files.h), place files (place_files.h, their logical stream as
 // place_nodes.bin) and side files (side_blocks.h, each its u32 values) are
 // decoded at the start into a scratch dir of their own, which merge_path
 // reads them from.
@@ -554,6 +556,61 @@ struct LogicalFamily {
     bool (*decode)(const LogicalFamily& family, const std::string& dir, const std::string& to);
     uint64_t (*logical_size)(const LogicalFamily& family, const std::string& dir);
 };
+// The kind of a way pair's family, by its ways file.
+static const way_files::Kind& way_kind(const LogicalFamily& family) {
+    return family.files[0] == std::string(way_files::STREETS.ways_file) ? way_files::STREETS : way_files::INTERPS;
+}
+// A file of a way pair mapped whole, of the size way_files::ABSENT when the
+// dir has no such file.
+struct WayFileMap {
+    MappedFile map;
+    uint64_t size;
+    explicit WayFileMap(const std::string& path) : map{nullptr, 0}, size(way_files::ABSENT) {
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) return;
+        map = mmap_file(path);
+        if (static_cast<uint64_t>(st.st_size) != map.size) throw std::runtime_error("Cannot read " + path);
+        size = map.size;
+    }
+    WayFileMap(const WayFileMap&) = delete;
+    ~WayFileMap() {
+        if (map.data) unmap_file(map);
+    }
+    const uint8_t* data() const { return reinterpret_cast<const uint8_t*>(map.data); }
+    // Its last `bytes` bytes, or all of a shorter file.
+    const uint8_t* end(size_t bytes) const {
+        return size == way_files::ABSENT ? nullptr : data() + (size - std::min<uint64_t>(size, bytes));
+    }
+};
+// The footers of a pair's two files.
+static way_files::Footers way_footers(const way_files::Kind& kind, const WayFileMap& ways, const WayFileMap& nodes) {
+    return way_files::read_footers(kind, ways.end(way_files::WAYS_FOOTER_BYTES), ways.size, nodes.end(way_files::NODES_FOOTER_BYTES),
+                                   nodes.size);
+}
+// Decodes dir's way pair of the family, its ways file and its nodes file,
+// into the ways' records and their nodes in to; false: dir has neither file.
+static bool decode_way_files(const LogicalFamily& family, const std::string& dir, const std::string& to) {
+    const way_files::Kind& kind = way_kind(family);
+    const WayFileMap ways(dir + "/" + kind.ways_file), nodes(dir + "/" + kind.nodes_file);
+    if (ways.size == way_files::ABSENT && nodes.size == way_files::ABSENT) return false;
+    // A dir with one file of the pair is refused before anything is written.
+    way_footers(kind, ways, nodes);
+    std::ofstream wo(to + "/" + kind.ways_file, std::ios::binary), no(to + "/" + kind.nodes_file, std::ios::binary);
+    way_files::decode(
+        kind, ways.data(), ways.size, nodes.data(), nodes.size,
+        [&](const uint8_t* record) { wo.write(reinterpret_cast<const char*>(record), static_cast<std::streamsize>(kind.stride)); },
+        [&](const uint8_t* p, size_t n) { no.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n)); });
+    if (!wo.flush() || !no.flush()) throw std::runtime_error(std::string("Cannot write the decoded ") + kind.ways_file + " of " + dir);
+    return true;
+}
+// The bytes decode_way_files writes for dir, from the two files' footers
+// alone; 0 without the files.
+static uint64_t way_logical_size(const LogicalFamily& family, const std::string& dir) {
+    const way_files::Kind& kind = way_kind(family);
+    const WayFileMap ways(dir + "/" + kind.ways_file), nodes(dir + "/" + kind.nodes_file);
+    const way_files::LogicalSizes sizes = way_files::logical_sizes(kind, way_footers(kind, ways, nodes));
+    return sizes.ways + sizes.nodes;
+}
 // Decodes dir's POI files into to; false: dir has none.
 static bool decode_poi_files(const LogicalFamily&, const std::string& dir, const std::string& to) {
     const std::string rp = dir + "/poi_records.bin", vp = dir + "/poi_vertices.bin";
@@ -660,6 +717,8 @@ static uint64_t side_logical_size(const LogicalFamily& family, const std::string
 }
 static const std::vector<LogicalFamily>& logical_families() {
     static const std::vector<LogicalFamily> f = {
+        {"streets", {"street_ways.bin", "street_nodes.bin"}, {"street_ways.bin", "street_nodes.bin"}, decode_way_files, way_logical_size},
+        {"interps", {"interp_ways.bin", "interp_nodes.bin"}, {"interp_ways.bin", "interp_nodes.bin"}, decode_way_files, way_logical_size},
         {"poi", {"poi_records.bin", "poi_vertices.bin"}, {"poi_records.bin", "poi_vertices.bin"}, decode_poi_files, poi_logical_size},
         {"places",
          {place_files::NODES_FILE},
@@ -1071,11 +1130,6 @@ static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uin
     return mask;
 }
 
-// Where a variant without its own street ways and nodes (the admin and POI
-// variants) borrows its sibling's, in the order tried
-// (try_load_with_fallback).
-static constexpr std::initializer_list<const char*> FULL_SIBLINGS = {"../full/", "../../full/"};
-
 // The stride addr_points.bin merges at, by its size: an empty or absent one,
 // or one that isn't whole address points, goes out as stride 16, as patches
 // have always sent it.
@@ -1088,30 +1142,28 @@ static size_t fixed_stride(uint64_t) {
 }
 
 // The record files the merges read, by the stride their merge sections give
-// for a new file of its size (a byte stream's is 1, a node's lat and lng 8),
-// and the siblings a variant without its own borrows them from. The admin
-// geometry files merge at their own strides (ADMIN_SLOT_FAMILIES): an arc
-// index at 4, never the admin polygons' 24 that ids 26 and 27 merged at as
-// the postal files.
+// for a new file of its size (a byte stream's is 1, a node's lat and lng 8).
+// The admin geometry files merge at their own strides (ADMIN_SLOT_FAMILIES):
+// an arc index at 4, never the admin polygons' 24 that ids 26 and 27 merged
+// at as the postal files.
 struct MergedFile {
     PatchFileId id;
     size_t (*stride_of)(uint64_t new_size);
-    std::initializer_list<const char*> siblings;
 };
 static constexpr MergedFile MERGED_FILES[] = {
-    {PatchFileId::STREET_WAYS, fixed_stride<WAY_HEADER_STRIDE>, FULL_SIBLINGS},
-    {PatchFileId::STREET_NODES, fixed_stride<8>, FULL_SIBLINGS},
-    {PatchFileId::INTERP_WAYS, fixed_stride<INTERP_WAY_STRIDE>, {}},
-    {PatchFileId::INTERP_NODES, fixed_stride<8>, {}},
-    {PatchFileId::ADDR_POINTS, addr_points_stride, {}},
-    {PatchFileId::ADDR_VERTICES, fixed_stride<1>, {}},
-    {PatchFileId::POI_RECORDS, fixed_stride<POI_RECORD_STRIDE>, {}},
-    {PatchFileId::POI_VERTICES, fixed_stride<1>, {}},
-    {PatchFileId::PLACE_NODES, fixed_stride<PLACE_NODE_STRIDE>, {}},
-    {PatchFileId::ARC_INDEX, fixed_stride<ARC_INDEX_STRIDE>, {}},
-    {PatchFileId::ARC_VERTICES, fixed_stride<1>, {}},
-    {PatchFileId::ADMIN_POLYGONS, fixed_stride<ADMIN_POLYGON_STRIDE>, {}},
-    {PatchFileId::ADMIN_RINGS, fixed_stride<1>, {}},
+    {PatchFileId::STREET_WAYS, fixed_stride<WAY_HEADER_STRIDE>},
+    {PatchFileId::STREET_NODES, fixed_stride<8>},
+    {PatchFileId::INTERP_WAYS, fixed_stride<INTERP_WAY_STRIDE>},
+    {PatchFileId::INTERP_NODES, fixed_stride<8>},
+    {PatchFileId::ADDR_POINTS, addr_points_stride},
+    {PatchFileId::ADDR_VERTICES, fixed_stride<1>},
+    {PatchFileId::POI_RECORDS, fixed_stride<POI_RECORD_STRIDE>},
+    {PatchFileId::POI_VERTICES, fixed_stride<1>},
+    {PatchFileId::PLACE_NODES, fixed_stride<PLACE_NODE_STRIDE>},
+    {PatchFileId::ARC_INDEX, fixed_stride<ARC_INDEX_STRIDE>},
+    {PatchFileId::ARC_VERTICES, fixed_stride<1>},
+    {PatchFileId::ADMIN_POLYGONS, fixed_stride<ADMIN_POLYGON_STRIDE>},
+    {PatchFileId::ADMIN_RINGS, fixed_stride<1>},
 };
 
 static int run(int argc, char* argv[]) {
@@ -1257,49 +1309,17 @@ static int run(int argc, char* argv[]) {
         if (m.size > 0 || m.data != nullptr) return m;
         return load_tier(dir + "/../../full/" + fname);
     };
-    // Fallback loader for street_ways.bin, which a variant subdir without
-    // its own (e.g. <region>/poi/<tier>/) finds in <region>/full/. Returns
-    // whether it fell back, so the caller can suppress emitting a merge
-    // section that would target the wrong output directory.
-    auto try_load_with_fallback = [&](const std::string& dir, const char* fname,
-                                       std::initializer_list<const char*> fallbacks)
-            -> std::pair<MappedFile, bool> {
-        MappedFile m = mmap_file(dir + "/" + fname);
-        if (m.size > 0) return {m, false};
-        for (const char* fb : fallbacks) {
-            if (m.data) unmap_file(m);
-            m = mmap_file(dir + "/" + fb + fname);
-            if (m.size > 0) return {m, true};
-        }
-        return {m, false};
-    };
-    auto try_load_with_fallback_rw = [&](const std::string& dir, const char* fname,
-                                          std::initializer_list<const char*> fallbacks)
-            -> std::pair<MappedFileRW, bool> {
-        MappedFileRW m = mmap_file_rw(dir + "/" + fname);
-        if (m.size > 0) return {m, false};
-        for (const char* fb : fallbacks) {
-            if (m.data) unmap_file(m);
-            m = mmap_file_rw(dir + "/" + fb + fname);
-            if (m.size > 0) return {m, true};
-        }
-        return {m, false};
-    };
     // Every record file the merges read, old and new, is refused before it is
     // diffed when it holds more records than a patch can index. Its size is
-    // the first non-empty one of the dir's own and its siblings', as the
-    // merges' loads find it, but from stat: a mapping's is narrowed to a 32-bit
-    // size_t, and 0 for a file that can't be mapped.
+    // the dir's own file's, as the merges' loads find it (merge_path), but
+    // from stat: a mapping's is narrowed to a 32-bit size_t, and 0 for a file
+    // that can't be mapped. A dir without the file has none: no other dir's
+    // is read for it.
     for (const MergedFile& f : MERGED_FILES) {
         const char* name = patch_file_names[static_cast<uint32_t>(f.id)];
         auto size_in = [&](const std::string& dir) -> uint64_t {
-            std::vector<std::string> paths{merge_path(dir, name)};
-            for (const char* sibling : f.siblings) paths.push_back(dir + "/" + sibling + name);
-            for (const std::string& path : paths) {
-                struct stat st;
-                if (stat(path.c_str(), &st) == 0 && st.st_size > 0) return static_cast<uint64_t>(st.st_size);
-            }
-            return 0;
+            struct stat st;
+            return stat(merge_path(dir, name).c_str(), &st) == 0 ? static_cast<uint64_t>(st.st_size) : 0;
         };
         const uint64_t old_size = size_in(old_dir), new_size = size_in(new_dir);
         require_merge_records(name, old_size, new_size, f.stride_of(new_size), file_records_max);
@@ -1619,42 +1639,24 @@ static int run(int argc, char* argv[]) {
         log_rss("addr_points");
     });
 
-    // Group 2: street_ways → street_nodes
+    // Group 2: street_ways → street_nodes, the dir's own pair in its logical
+    // form (way_files.h). A variant without street files (admin,
+    // admin-minimal, the POI tiers) merges none: its sections are those of a
+    // pair of no ways, and no other variant's streets are read for it.
     // old_w = COW mmap (needs string remap + offset fixup), new_w = read-only mmap
     // nodes = read-only mmap (huge files, never modified — biggest memory win)
-    bool street_from_fallback = false;
     std::thread t_street([&]() {
         double gs = now_ms();
-        auto [old_w, ow_fb] = try_load_with_fallback_rw(old_dir, "street_ways.bin", FULL_SIBLINGS);
-        auto [new_w, nw_fb] = try_load_with_fallback(new_dir, "street_ways.bin", FULL_SIBLINGS);
-        street_from_fallback = (ow_fb || nw_fb);
-        const bool unchanged = !street_from_fallback && sent_unchanged(old_w.data, old_w.size, new_w.data, new_w.size);
+        auto old_w = mmap_file_rw(merge_path(old_dir, "street_ways.bin"));
+        auto new_w = mmap_file(merge_path(new_dir, "street_ways.bin"));
+        const bool unchanged = sent_unchanged(old_w.data, old_w.size, new_w.data, new_w.size);
         std::pair<std::vector<uint32_t>, std::vector<uint32_t>> street_ids;
-        if (!street_from_fallback && !same_bytes(old_w.data, old_w.size, new_w.data, new_w.size))
+        if (!same_bytes(old_w.data, old_w.size, new_w.data, new_w.size))
             street_ids = identity_of("street", street_way_tombstone(), old_w.data, old_w.size, new_w.data, new_w.size);
 
-        // Variants without their own street_ways (admin, admin-minimal,
-        // poi tiers) borrow the sibling /full/ copy. They emit no street
-        // records and carry no addr_points, the only consumer of a street
-        // id remap, so skip the street pipeline entirely (it costs ~10 GiB
-        // per planet invocation), string remap included.
-        if (street_from_fallback) {
-            res_ways = {PatchFileId::STREET_WAYS, "street_ways.bin", way_stride,
-                        0, 0, MergeSequence{}, {}};
-            res_nodes = {PatchFileId::STREET_NODES, "street_nodes.bin", 8,
-                         0, 0, MergeSequence{}, {}};
-            log_merge(res_ways);
-            log_merge(res_nodes);
-            street_remap_ready.set_value();
-            unmap_file(old_w); unmap_file(new_w);
-            log_time("  group:streets (fallback)", gs);
-            log_rss("streets");
-            return;
-        }
-
         remap_string_fields(old_w.data, old_w.size, PatchFileId::STREET_WAYS, way_stride, str_remap);
-        auto [old_n, _on_fb] = try_load_with_fallback(old_dir, "street_nodes.bin", FULL_SIBLINGS);
-        auto [new_n, _nn_fb] = try_load_with_fallback(new_dir, "street_nodes.bin", FULL_SIBLINGS);
+        auto old_n = mmap_file(merge_path(old_dir, "street_nodes.bin"));
+        auto new_n = mmap_file(merge_path(new_dir, "street_nodes.bin"));
         madvise(const_cast<char*>(old_n.data), old_n.size, MADV_SEQUENTIAL);
         madvise(const_cast<char*>(new_n.data), new_n.size, MADV_SEQUENTIAL);
         // Fixup node_offsets
@@ -1707,18 +1709,6 @@ static int run(int argc, char* argv[]) {
                          0, 0, MergeSequence{}, {}};
         }
         log_merge(res_nodes);
-        // Should not happen now that the fallback branch returns early,
-        // but kept as a safety net for any future code path that loads
-        // ways from a fallback dir without taking the fast path above.
-        if (street_from_fallback) {
-            res_ways.seq = MergeSequence{};
-            res_ways.old_size = 0;
-            res_ways.new_size = 0;
-            res_ways.fixups = {};
-            res_nodes.seq = MergeSequence{};
-            res_nodes.old_size = 0;
-            res_nodes.new_size = 0;
-        }
         unmap_file(old_w); unmap_file(new_w); unmap_file(old_n); unmap_file(new_n);
         log_time("  group:streets", gs);
         log_rss("streets");
@@ -1727,15 +1717,15 @@ static int run(int argc, char* argv[]) {
     // Group 3: interp_ways → interp_nodes
     std::thread t_interp([&]() {
         double gs = now_ms();
-        auto old_data = mmap_file_rw(old_dir + "/interp_ways.bin");
-        auto new_data = mmap_file_rw(new_dir + "/interp_ways.bin");
+        auto old_data = mmap_file_rw(merge_path(old_dir, "interp_ways.bin"));
+        auto new_data = mmap_file_rw(merge_path(new_dir, "interp_ways.bin"));
         std::pair<std::vector<uint32_t>, std::vector<uint32_t>> interp_ids;
         if (!same_bytes(old_data.data, old_data.size, new_data.data, new_data.size))
             interp_ids = identity_of("interp", interp_way_tombstone(), old_data.data, old_data.size, new_data.data, new_data.size);
         const bool unchanged = sent_unchanged(old_data.data, old_data.size, new_data.data, new_data.size);
         remap_string_fields(old_data.data, old_data.size, PatchFileId::INTERP_WAYS, interp_stride, str_remap);
-        auto old_n = mmap_file(old_dir + "/interp_nodes.bin");
-        auto new_n = mmap_file(new_dir + "/interp_nodes.bin");
+        auto old_n = mmap_file(merge_path(old_dir, "interp_nodes.bin"));
+        auto new_n = mmap_file(merge_path(new_dir, "interp_nodes.bin"));
         size_t n = old_data.size / interp_stride;
         std::vector<uint32_t> old_offsets(n);
         for (size_t i = 0; i < n; i++) memcpy(&old_offsets[i], old_data.data + i * interp_stride, 4);

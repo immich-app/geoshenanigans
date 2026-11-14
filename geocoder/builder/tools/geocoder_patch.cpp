@@ -440,9 +440,9 @@ static int run(int argc, char* argv[]) {
     }
     // The output is exactly the patch's file set, so stale files can't stay.
     if (!std::filesystem::is_empty(out_dir)) throw std::runtime_error("Output dir is not empty: " + out_dir);
-    // The encoded families' old files are decoded and their new ones encoded in process: the POI,
-    // place and side files in every dir, and, in low-memory mode (an encoded installed set, a
-    // gc.manifest), gc's families too.
+    // The encoded families' old files are decoded and their new ones encoded in process: the way,
+    // POI, place and side files in every dir, and, in low-memory mode (an encoded installed set, a
+    // gc.manifest), gc's family too.
     gcs::store().init(cur_dir, out_dir);
     stream_source_factory() = [](const std::string& p) { return gcs::store().open_source(p); };
     virtual_size_hook() = [](const std::string& dir, const std::string& name, uint64_t expected) -> bool {

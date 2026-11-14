@@ -18,14 +18,17 @@
 #include "poi_files.h"
 #include "sanitizer_report.h"
 #include "side_blocks.h"
+#include "way_files.h"
 
 namespace gctest {
 
-// A build dir's files by name. Its POI files, side files and string tiers are
-// logical: poi_records.bin the 36-byte records, poi_vertices.bin the vertex
-// stream they point into, a side file (way_parents.bin, way_postcodes.bin,
-// interp_postcodes.bin, addr_postcodes.bin) its u32 values, a strings_*.bin
-// its pool.
+// A build dir's files by name. Its POI files, way pairs, side files and
+// string tiers are logical: poi_records.bin the 36-byte records,
+// poi_vertices.bin the vertex stream they point into, street_ways.bin and
+// interp_ways.bin the 12- and 24-byte records, street_nodes.bin and
+// interp_nodes.bin their ways' nodes back to back, a side file
+// (way_parents.bin, way_postcodes.bin, interp_postcodes.bin,
+// addr_postcodes.bin) its u32 values, a strings_*.bin its pool.
 using BuildDir = std::map<std::string, std::vector<char>>;
 
 inline bool is_string_tier(const std::string& name) {
@@ -69,9 +72,44 @@ inline void write_side_file(const WrittenFamily& family, const BuildDir& files, 
     out[family.records].assign(f.begin(), f.end());
 }
 
+// A way pair, the family's ways file and its nodes file, as way files
+// (way_files.h), a missing nodes file an empty node stream.
+inline void write_way_pair(const WrittenFamily& family, const BuildDir& files, BuildDir& out) {
+    const way_files::Kind& kind = family.records == std::string(way_files::STREETS.ways_file) ? way_files::STREETS : way_files::INTERPS;
+    const std::vector<char>& ways = files.at(kind.ways_file);
+    if (ways.size() % kind.stride) throw std::runtime_error(std::string(kind.ways_file) + " is not whole records");
+    auto n = files.find(kind.nodes_file);
+    static const std::vector<char> none;
+    const std::vector<char>& nodes = n == files.end() ? none : n->second;
+    std::vector<char>& rows = out[kind.ways_file];
+    std::vector<char>& blocks = out[kind.nodes_file];
+    rows.clear();
+    blocks.clear();
+    auto into = [](std::vector<char>& v) {
+        return [&v](const uint8_t* p, size_t bytes) { v.insert(v.end(), p, p + bytes); };
+    };
+    way_files::Encoder enc(kind, into(rows), into(blocks));
+    size_t at = 0;
+    for (size_t w = 0; w < ways.size(); w += kind.stride) {
+        const uint8_t* record = reinterpret_cast<const uint8_t*>(ways.data()) + w;
+        const size_t bytes = way_files::NODE_BYTES * way_files::get16(record + way_files::NODE_COUNT_AT);
+        if (bytes > nodes.size() - at) throw std::runtime_error(std::string(kind.nodes_file) + " ends before its ways' nodes do");
+        enc.add(record, reinterpret_cast<const uint8_t*>(nodes.data()) + at);
+        at += bytes;
+    }
+    if (at != nodes.size()) throw std::runtime_error(std::string(kind.nodes_file) + " holds nodes past its ways'");
+    enc.finish();
+    const auto ways_footer = enc.ways_footer();
+    const auto nodes_footer = enc.nodes_footer();
+    rows.insert(rows.end(), ways_footer.begin(), ways_footer.end());
+    blocks.insert(blocks.end(), nodes_footer.begin(), nodes_footer.end());
+}
+
 inline const std::vector<WrittenFamily>& written_families() {
     static const std::vector<WrittenFamily> f = {
         {"poi_records.bin", write_poi_family},
+        {"street_ways.bin", write_way_pair},
+        {"interp_ways.bin", write_way_pair},
         {"way_parents.bin", write_side_file},
         {"way_postcodes.bin", write_side_file},
         {"interp_postcodes.bin", write_side_file},

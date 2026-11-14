@@ -782,9 +782,9 @@ TEST(decode_logical_writes_the_poi_and_place_files_a_dir_holds_and_none_it_lacks
         bool poi, places;
     };
     for (const Case& e : {Case{"both", true, true}, {"poi", true, false}, {"places", false, true}, {"neither", false, false}}) {
-        // Beside a string tier and a street file, which are no such family's.
+        // Beside a string tier and a file of u32s, which are no such family's.
         BuildDir d = with_pool(OLD_POOL), want;
-        d["street_ways.bin"] = bytes_of(std::vector<WayHeader>{{0, 0, 0, NAME_2}});
+        d["admin_parents.bin"] = bytes_of(std::vector<uint32_t>{NAME_2});
         if (e.poi) {
             d.insert(pois.begin(), pois.end());
             want.insert(pois.begin(), pois.end());
@@ -876,13 +876,78 @@ TEST(decode_logical_writes_the_values_of_the_side_files_a_dir_holds) {
     CHECK(r.second.find("Malformed addr_postcodes.bin: no SDB1 in its footer") != std::string::npos);
 }
 
+// --decode-logical writes each way pair a dir holds as the merges read it:
+// the 12-byte street ways or 24-byte interpolations, and their ways' nodes
+// back to back, 8 bytes a node. A pair of no ways, two footers on disk, gives
+// two empty files, and a pair the dir lacks none. A dir with one file of a
+// pair, and a file the builder would not write, are refused by name.
+TEST(decode_logical_writes_the_way_pairs) {
+    ScratchDir dir("decode-logical-ways");
+    const std::string log = dir.path() + "/tools.log";
+    auto decode = [&](const std::string& in) {
+        std::filesystem::remove(log);
+        const bool ok = run({GEOCODER_DIFF_BIN, "--decode-logical", in, in + ".logical"}, log);
+        const std::vector<char> text = read_file(log);
+        return std::pair<bool, std::string>(ok, std::string(text.begin(), text.end()));
+    };
+    const std::vector<WayHeader> street_ways = {{0, 2, 0, NAME_2}, {0, 0, 0, NAME_4}, {2, 3, 0, NO_DATA}};
+    const std::vector<InterpWay> interp_ways = {{0, 1, 0, NAME_2, 1, 9, 1}, {1, 2, 0, NAME_4, 2, 8, 2}};
+    const BuildDir streets = {{"street_ways.bin", bytes_of(street_ways)}, {"street_nodes.bin", nodes_of({1, 2, 3, 4, 5})}};
+    const BuildDir interps = {{"interp_ways.bin", bytes_of(interp_ways)}, {"interp_nodes.bin", nodes_of({6, 7, 8})}};
+    const BuildDir no_streets = {{"street_ways.bin", {}}, {"street_nodes.bin", {}}};
+    struct Case {
+        std::string name;
+        BuildDir streets, interps;
+        std::string streets_line, interps_line;
+    };
+    for (const Case& e : {Case{"both", streets, interps, "  streets: 76 logical bytes", "  interps: 72 logical bytes"},
+                          Case{"streets", streets, {}, "  streets: 76 logical bytes", "  interps: none"},
+                          Case{"no-ways", no_streets, interps, "  streets: 0 logical bytes", "  interps: 72 logical bytes"}}) {
+        BuildDir want = e.streets;
+        want.insert(e.interps.begin(), e.interps.end());
+        // Beside a file of u32s, which is no pair's.
+        BuildDir d = want;
+        d["admin_parents.bin"] = bytes_of(std::vector<uint32_t>{1, 2, 3});
+        const std::string in = dir.path() + "/" + e.name;
+        REQUIRE(write_dir(in, d));
+        REQUIRE(read_file(in + "/street_ways.bin") != e.streets.at("street_ways.bin"));
+
+        const auto [ok, text] = decode(in);
+
+        CHECK(ok);
+        CHECK(gctest::read_dir(in + ".logical") == want);
+        CHECK(text.find(e.streets_line) != std::string::npos);
+        CHECK(text.find(e.interps_line) != std::string::npos);
+    }
+    REQUIRE(read_file(dir.path() + "/no-ways/street_ways.bin").size() == 8);
+    REQUIRE(read_file(dir.path() + "/no-ways/street_nodes.bin").size() == 16);
+
+    const std::string half = dir.path() + "/half", other = dir.path() + "/other";
+    BuildDir both = streets;
+    both.insert(interps.begin(), interps.end());
+    REQUIRE(write_dir(half, both) && write_dir(other, both));
+    REQUIRE(std::filesystem::remove(half + "/street_nodes.bin"));
+    auto r = decode(half);
+    CHECK(!r.first);
+    CHECK(r.second.find("Malformed way files: street_ways.bin without street_nodes.bin") != std::string::npos);
+
+    // The interpolations' count of their nodes, the first byte of the nodes
+    // file's footer.
+    std::vector<char> nodes = read_file(other + "/interp_nodes.bin");
+    nodes[nodes.size() - 16]++;
+    REQUIRE(write_file(other + "/interp_nodes.bin", nodes));
+    r = decode(other);
+    CHECK(!r.first);
+    CHECK(r.second.find("Malformed way files: interp_nodes.bin counts 4 nodes and its ways have 3") != std::string::npos);
+}
+
 // geocoder-diff --logical-size DIR prints two numbers, from DIR's file sizes
 // and footers alone. The bytes a diff maps for DIR's record files: every .bin
-// but the string tiers at its size, the POI, place and side files at their
-// logical size. And the bytes it writes to scratch for DIR: those logical
-// files and the pool of each string tier as the diff finds it, in DIR, else
-// ../full, else ../../full, an empty pool as none. A DIR that is no dir, and
-// the option without its one path, are refused.
+// but the string tiers at its size, the way pairs and the POI, place and side
+// files at their logical size. And the bytes it writes to scratch for DIR:
+// those logical files and the pool of each string tier as the diff finds it,
+// in DIR, else ../full, else ../../full, an empty pool as none. A DIR that is
+// no dir, and the option without its one path, are refused.
 TEST(logical_size_prints_the_mapped_and_the_scratch_bytes_of_a_dir) {
     ScratchDir dir("logical-size");
     const std::string log = dir.path() + "/tools.log", region = dir.path() + "/region";
@@ -906,14 +971,17 @@ TEST(logical_size_prints_the_mapped_and_the_scratch_bytes_of_a_dir) {
     const uint64_t place_bytes = nodes.size() * place_files::LOGICAL_STRIDE;
     const std::vector<char> way_parents = bytes_of(std::vector<uint32_t>{5, 6});
     const uint64_t side_bytes = way_parents.size();
+    const std::vector<char> street_ways = bytes_of(std::vector<WayHeader>{{0, 2, 0, NAME_2}, {2, 1, 0, NAME_4}});
+    const std::vector<char> street_nodes = nodes_of({1, 2, 3});
+    const uint64_t street_bytes = street_ways.size() + street_nodes.size();
     const std::string street_pool("Elm\0Oak\0Pine\0", 13);
 
-    // full: two string tiers of its own, street files, a geo index, the POI
-    // and place files, a side file, and files that are no .bin.
+    // full: two string tiers of its own, the street pair, a geo index, the
+    // POI and place files, a side file, and files that are no .bin.
     BuildDir full = with_pool(OLD_POOL);
     full["strings_street.bin"] = pool(street_pool);
-    full["street_ways.bin"] = bytes_of(std::vector<WayHeader>{{0, 2, 0, NAME_2}, {2, 1, 0, NAME_4}});
-    full["street_nodes.bin"] = nodes_of({1, 2, 3});
+    full["street_ways.bin"] = street_ways;
+    full["street_nodes.bin"] = street_nodes;
     full["way_parents.bin"] = way_parents;
     put_geo_cells(full, {{CELL, {0, 1}, {}, {}}});
     full.insert(pois.begin(), pois.end());
@@ -922,18 +990,18 @@ TEST(logical_size_prints_the_mapped_and_the_scratch_bytes_of_a_dir) {
     full["street_ways.bin.osm_ids"] = std::vector<char>(64, 'i');
     REQUIRE(write_dir(region + "/full", full));
     const BuildDir written = gctest::as_written(full);
-    const uint64_t raw_bytes = written.at("street_ways.bin").size() + written.at("street_nodes.bin").size() +
-                               written.at("geo_cells.bin").size() + written.at("geo_entries.bin").size();
+    const uint64_t raw_bytes = written.at("geo_cells.bin").size() + written.at("geo_entries.bin").size();
     // The encoded files are not their logical size, so neither number is a
     // sum of file sizes.
+    REQUIRE(written.at("street_ways.bin").size() + written.at("street_nodes.bin").size() != street_bytes);
     REQUIRE(written.at("poi_records.bin").size() + written.at("poi_vertices.bin").size() != poi_bytes);
     REQUIRE(written.at("way_parents.bin").size() != side_bytes);
     REQUIRE(written.at("strings_street.bin").size() != street_pool.size());
 
     auto r = sizes_of({region + "/full"});
     CHECK(r.first);
-    CHECK_EQ(r.second, two(raw_bytes + poi_bytes + place_bytes + side_bytes,
-                           poi_bytes + place_bytes + side_bytes + OLD_POOL.size() + street_pool.size()));
+    CHECK_EQ(r.second, two(raw_bytes + street_bytes + poi_bytes + place_bytes + side_bytes,
+                           street_bytes + poi_bytes + place_bytes + side_bytes + OLD_POOL.size() + street_pool.size()));
 
     // A dir beside full with one tier of its own, another of its own that
     // is an empty pool, and no family: the tiers it lacks are ../full's.
@@ -1299,6 +1367,86 @@ TEST(patch_round_trip_keeps_a_side_file_of_no_values) {
     CHECK(round_trip(empty, empty).mismatches.empty());
     CHECK(round_trip(with, empty).mismatches.empty());
     CHECK(round_trip(empty, with).mismatches.empty());
+}
+
+// A full dir holds both way pairs, and a pair of no ways is its two footers
+// (8 and 16 bytes): a family without records, which merges as nothing and
+// which the patcher writes again, beside the other pair's day and with both
+// pairs so. A dir gains the footers and loses them, and its first
+// interpolations come and its last go, from and to the footers and from and
+// to no files.
+TEST(patch_round_trip_of_a_dir_with_no_ways_no_interpolations_or_neither) {
+    const BuildDir no_streets = {{"street_ways.bin", {}}, {"street_nodes.bin", {}}};
+    const BuildDir no_interps = {{"interp_ways.bin", {}}, {"interp_nodes.bin", {}}};
+    const BuildDir footers = gctest::as_written(no_interps);
+    REQUIRE(footers.at("interp_ways.bin").size() == 8 && footers.at("interp_nodes.bin").size() == 16);
+    struct Shape {
+        bool streets, interps;
+    };
+    for (const Shape shape : {Shape{true, false}, Shape{false, true}, Shape{false, false}}) {
+        BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+        Identity ids;
+        if (shape.streets) put_identity_streets(old_d, new_d, ids);
+        if (shape.interps) put_identity_interps(old_d, new_d, ids);
+        for (BuildDir* d : {&old_d, &new_d}) {
+            if (!shape.streets) d->insert(no_streets.begin(), no_streets.end());
+            if (!shape.interps) d->insert(no_interps.begin(), no_interps.end());
+        }
+
+        const RoundTrip r = round_trip(old_d, new_d, ids);
+
+        CHECK(r.mismatches.empty());
+        CHECK_EQ(logged(r, "street_ways identity: match=2 replace=1 insert=2 delete=2 moved=1"), shape.streets);
+        CHECK_EQ(logged(r, "interp_ways identity: match=1 replace=1 insert=2 delete=2 moved=1"), shape.interps);
+    }
+
+    const BuildDir without = with_pool(OLD_POOL);
+    BuildDir empty = without, some = without;
+    empty.insert(no_streets.begin(), no_streets.end());
+    empty.insert(no_interps.begin(), no_interps.end());
+    some.insert(no_streets.begin(), no_streets.end());
+    some["interp_ways.bin"] = bytes_of(std::vector<InterpWay>{{0, 2, 0, OLD_B, 1, 9, 0}, {2, 1, 0, OLD_C, 2, 8, 0}});
+    some["interp_nodes.bin"] = nodes_of({1, 2, 3});
+    CHECK(round_trip(without, empty).mismatches.empty());
+    CHECK(round_trip(empty, without).mismatches.empty());
+    CHECK(round_trip(empty, some).mismatches.empty());
+    CHECK(round_trip(some, empty).mismatches.empty());
+    CHECK(round_trip(without, some).mismatches.empty());
+    CHECK(round_trip(some, without).mismatches.empty());
+}
+
+// A dir without street files of its own (an admin or a POI variant) merges
+// no streets, and the diff reads none of the full dir's beside or above it,
+// which are another variant's: under a limit of 3 records a file, a POI dir
+// two levels below a full dir of 40 street ways diffs and round-trips.
+TEST(patch_diff_takes_no_streets_from_a_sibling) {
+    ScratchDir dir("patch-sibling");
+    const std::string& root = dir.path();
+    const std::string old_dir = root + "/old/poi/major", new_dir = root + "/new/poi/major", log = root + "/tools.log";
+    BuildDir full = with_pool(OLD_POOL), old_d, new_d;
+    std::vector<WayHeader> ways;
+    std::vector<int> nodes;
+    for (uint32_t w = 0; w < 40; w++) {
+        ways.push_back({w, 1, 0, NAME_2});
+        nodes.push_back(static_cast<int>(w));
+    }
+    full["street_ways.bin"] = bytes_of(ways);
+    full["street_nodes.bin"] = nodes_of(nodes);
+    old_d["poi_records.bin"] = bytes_of(std::vector<PoiRecord>{poi(NAME_2), poi(NAME_4)});
+    new_d["poi_records.bin"] = bytes_of(std::vector<PoiRecord>{poi(NAME_2), poi(NAME_4), poi(NAME_2)});
+    REQUIRE(write_dir(root + "/old/full", full) && write_dir(root + "/new/full", full));
+    REQUIRE(write_dir(old_dir, old_d) && write_dir(new_dir, new_d));
+
+    const bool diffed = run({GEOCODER_DIFF_BIN, old_dir, new_dir, "-o", root + "/p.gcpatch", "--file-records-max", "3"}, log);
+    const bool patched = diffed && run({GEOCODER_PATCH_BIN, old_dir, root + "/p.gcpatch", "-o", root + "/out"}, log);
+
+    if (!patched) {
+        const std::vector<char> text = read_file(log);
+        std::printf("%s\n", std::string(text.begin(), text.end()).c_str());
+    }
+    CHECK(diffed);
+    CHECK(patched);
+    CHECK(patched && gctest::read_dir(root + "/out") == gctest::as_written(new_d));
 }
 
 // A sidecar that is not one key per record (short, long or missing) is
