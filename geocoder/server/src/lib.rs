@@ -16,6 +16,7 @@ mod arc_blocks;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod arc_fixture;
 pub mod cell_pairs;
+pub mod coord_keys;
 pub mod geo_index;
 pub use cell_pairs::CellPairs;
 pub use geo_index::{GeoIndex, GeoLists};
