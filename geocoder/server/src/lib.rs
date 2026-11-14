@@ -10,6 +10,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub mod addr_files;
 mod admin_geometry;
 pub use admin_geometry::{AdminGeometry, AdminPoint, PipMemo, ADMIN_GEOMETRY_FILES};
 mod arc_blocks;
