@@ -1,11 +1,12 @@
 // The patcher's side of the in-process codecs: every today's-format file of an encoded family is
 // a virtual old file (a SequentialFileReader reads it from the family's decoder) and a virtual
 // output (open_out hands back a FILE* whose bytes go to the family's encoder). A native family
-// (the street and the interpolation ways, way_files.h; the POI files, R2 and V2 in every dir:
-// poi_files.h; the place files, place_files.h; each of the four side files, side_blocks.h) is
-// encoded in every dir under today's names, the place files' logical stream as place_nodes.bin;
-// gc's family only in an encoded installed set (a dir with a gc.manifest), whose new dir gets the
-// merged gc.manifest. No today's-format file of an encoded family touches the disk.
+// (the street and the interpolation ways, way_files.h; the address files, addr_files.h; the POI
+// files, R2 and V2 in every dir: poi_files.h; the place files, place_files.h; each of the four
+// side files, side_blocks.h) is encoded in every dir under today's names, the place files'
+// logical stream as place_nodes.bin; a gc family (tools/gc.cpp has none) only in an encoded
+// installed set (a dir with a gc.manifest), whose new dir gets the merged gc.manifest. No
+// today's-format file of an encoded family touches the disk.
 #pragma once
 #include <malloc.h>
 #include <set>
@@ -21,10 +22,10 @@ namespace gcs {
 using ListedSizes = std::map<std::string, uint64_t>;
 
 // A family and its codecs. decoder: over the installed set in dir (m: its manifest, which holds a
-// gc family's counts). encoder: into the new set in dir (sizes: for one that needs a file's listed
-// size). decoded_size: a native family's decoded size of a port, from dir's files alone and with
-// no decoder made (the POI replay reads the files itself); none for a gc family, whose decoder
-// gives the manifest's.
+// gc family's counts). encoder: into the new set in dir (sizes: the files the patch lists, for one
+// that writes a file no section names). decoded_size: a native family's decoded size of a port,
+// from dir's files alone and with no decoder made (the POI replay reads the files itself); none
+// for a gc family, whose decoder gives the manifest's.
 struct FamilyDesc {
     const char* name;
     std::vector<const char*> today;
@@ -60,14 +61,14 @@ static const std::vector<FamilyDesc>& families() {
          [](const std::string& dir, const Manifest&) -> Decoder* { return new side::Dec(dir, "addr_postcodes"); },
          [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::Enc(dir, "addr_postcodes"); },
          [](const std::string& dir, int) { return side::decoded_size(dir, "addr_postcodes"); }},
-        {"addr", {"addr_points.bin", "addr_vertices.bin"}, false,
-         [](const std::string& dir, const Manifest& m) -> Decoder* { return new addr::Dec(dir, m); },
+        {"addr", {"addr_points.bin", "addr_vertices.bin"}, true,
+         [](const std::string& dir, const Manifest&) -> Decoder* { return new addr::Dec(dir); },
          [](const std::string& dir, const ListedSizes& sizes) -> Encoder* {
-             auto it = sizes.find("addr_points.bin");
-             if (it == sizes.end()) die("addr: the patch lists no addr_points.bin size");
-             return new addr::Enc(dir, it->second);
+             // The encoder writes the index beside the two files its sections name.
+             if (!sizes.count(addr_files::INDEX_FILE)) die("addr: the patch lists no %s", addr_files::INDEX_FILE);
+             return new addr::Enc(dir);
          },
-         nullptr},
+         [](const std::string& dir, int port) { return addr::decoded_size(dir, port); }},
         {"poi", {"poi_records.bin", "poi_vertices.bin"}, true,
          [](const std::string& dir, const Manifest&) -> Decoder* { return new poi::Dec(dir); },
          [](const std::string& dir, const ListedSizes&) -> Encoder* { return new poi::Enc(dir); }, poi::decoded_size},

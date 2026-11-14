@@ -1,17 +1,19 @@
-// In-process incremental codecs for the low-memory client update. The same formats as gc
-// (tools/gc.cpp) byte for byte, restructured so the patcher drives them:
+// In-process incremental codecs for the low-memory client update. The formats the builder writes
+// (src/way_files.h, addr_files.h, poi_files.h, place_files.h, side_blocks.h) byte for byte,
+// structured so the patcher drives them:
 //   Decoder: produces today's-format bytes on demand, one unit (way, row, record, block piece) per
 //            step(), into one queue per today's file (a coupled family fills several queues).
 //   Encoder: consumes today's-format bytes as the patcher writes them, one queue per today's file,
 //            and processes every unit whose bytes are all there (pump()).
 // Nothing is held beyond the buffers, the unit in flight and the queues' skew. A unit held whole is
-// bounded by the format (a way <= 65535 nodes, an abs2 address footprint <= 69999 vertices; a
-// footprint escaped raw, of any size, is copied through in pieces) or, for a polygon block, by
-// big_block() (256 KiB): a larger POI block is decoded a piece at a time, and encoded through the
-// new file (its vertices written as they come, then packed in place).
+// bounded by the format (a way <= 65535 nodes, an address footprint <= 65535 vertices; an escaped
+// footprint, of any size, is copied through in pieces) or, for a polygon block, by big_block()
+// (256 KiB): a larger POI block is decoded a piece at a time, and encoded through the new file
+// (its vertices written as they come, then packed in place).
 #pragma once
 #include <functional>
 #include <memory>
+#include "addr_files.h"
 #include "gcs_io.h"
 #include "place_files.h"
 #include "poi_files.h"
@@ -442,256 +444,247 @@ struct Enc : Encoder {
 };
 }  // namespace side
 
-// ------------------------------------------------------------------ address points + footprints
+// ------------------------------------------------------------------ address points + footprints (addr_files.h)
+// The address points and their footprints are the address files in every dir, the blocks of
+// addr_points.bin, the blobs of addr_vertices.bin and addr_index.bin: these codecs turn the three
+// into their logical form, the points' records (an AddrPoint each) and their footprints' logical
+// blobs back to back, for the replay and back.
 namespace addr {
-static const double SCALE[3] = {1e-5, 1e-4, 1e-6};
-// The most vertices (closing vertex included) an abs2 blob holds; a larger footprint is escaped.
-static const uint32_t ABS2_MAX_VERTICES = 69999;
-static inline int64_t fkey(uint32_t b) { return (b & 0x80000000u) ? int64_t(0xFFFFFFFFu) - b : int64_t(b ^ 0x80000000u); }
-static inline uint32_t unfkey(int64_t k) { return (k & 0x80000000) ? uint32_t(k ^ 0x80000000) : uint32_t(0xFFFFFFFFu - k); }
-static inline uint32_t pred_bits(uint32_t point_bits, int64_t sum_q, uint32_t n, int enc) {
-    float p;
-    memcpy(&p, &point_bits, 4);
-    const float f = float(double(p) - (double(sum_q) / double(n)) * SCALE[enc]);
-    uint32_t b;
-    memcpy(&b, &f, 4);
-    return b;
-}
-// The col file's region k: lat b0..b3, lng b0..b3, housenumber, street, parent_way, poly_offset b0..b3.
-static inline uint64_t col_region(int k, uint64_t N) {
-    uint64_t at = 0;
-    for (int j = 0; j < k; j++) at += (j >= 8 && j <= 10) ? 4 * N : N;
-    return at;
-}
-static inline size_t region_buf(int k) { return (k >= 8 && k <= 10) ? size_t(32) << 10 : size_t(PLANE_BUF); }
+namespace af = addr_files;
+// The codec's buffers: the blocks file streams a block (415 bytes at most) at a time and the index
+// a row's head or a block's entry; the blobs file a blob (one of 65,535 vertices grows its buffer
+// to the blob's 256 KiB), an escape in pieces of the buffer.
+static const size_t BLOCKS_BUF = size_t(16) << 10, BLOBS_BUF = size_t(16) << 10, INDEX_BUF = size_t(4) << 10;
 
-// Ports: 0 = addr_points, 1 = addr_vertices. A step: one record and its footprint, or a piece of an
-// escaped footprint (copied through in READ_BUF pieces, so neither the reader nor a queue holds it).
+// The footers of dir's address files, from each file's size and last bytes alone: those of no
+// records for a dir with none of the three. Refuses a dir with some of them, and footers that
+// give a logical addr_vertices.bin or records past what a patch indexes.
+inline af::Footers footers_of(const std::string& dir) {
+    uint8_t p[af::POINTS_FOOTER_BYTES] = {}, v[af::VERTICES_FOOTER_BYTES] = {}, x[af::INDEX_FOOTER_BYTES] = {};
+    // The file's size, its footer into `to` when it is long enough to have one.
+    auto footer = [&](const char* file, uint8_t* to, size_t bytes) -> uint64_t {
+        const std::string path = dir + "/" + file;
+        struct stat st;
+        if (stat(path.c_str(), &st) != 0) return af::ABSENT;
+        const uint64_t size = uint64_t(st.st_size);
+        if (size >= bytes) {
+            Reader end(path, bytes, size - bytes);
+            memcpy(to, end.take(bytes), bytes);
+        }
+        return size;
+    };
+    const uint64_t points_size = footer(af::POINTS_FILE, p, sizeof p), vertices_size = footer(af::VERTICES_FILE, v, sizeof v),
+                   index_size = footer(af::INDEX_FILE, x, sizeof x);
+    return af::read_footers(p, points_size, v, vertices_size, x, index_size);
+}
+
+// A dir's address files' decoded sizes (Dec::decoded_size), from the three footers alone: 0
+// without the files.
+inline uint64_t decoded_size(const std::string& dir, int port) {
+    const af::LogicalSizes sizes = af::logical_sizes(footers_of(dir));
+    return port == 0 ? sizes.points : sizes.vertices;
+}
+
+// Ports: 0 = the address points' records, 1 = their footprints' logical blobs. A step: a record
+// and its footprint, its block decoded as its first record is due; or a piece of an escaped
+// footprint, which neither the reader nor a queue holds whole. A dir without the three files
+// decodes to none. It checks between the units what addr_files::decode checks: each block and
+// each blob starts where those before it end and where addr_index.bin puts it, the last ones end
+// at the footers, and the blobs and their logical bytes are the footer's.
 struct Dec : Decoder {
-    uint64_t N, i = 0, raw = 0;
-    uint64_t escaped_left = 0;  // bytes of the escaped footprint in progress still to emit
-    std::vector<std::unique_ptr<Reader>> rg;
-    std::unique_ptr<Reader> A;
-    Dec(const std::string& src, const Manifest& m) : Decoder("addr", {"addr_points.bin", "addr_vertices.bin"}) {
-        N = m.num("addr.n");
-        const std::string cp = src + "/addr_points.col";
-        if (file_size(cp) != 24 * N) die("addr_points.col size");
-        for (int k = 0; k < 15; k++) rg.emplace_back(new Reader(cp, region_buf(k), col_region(k, N), col_region(k + 1, N)));
-        A.reset(new Reader(src + "/addr_vertices.abs2"));
+    af::Footers f;
+    std::unique_ptr<Reader> P, V, X;  // the blocks, the blobs, and the index's rows
+    af::Block block;                  // the block at hand
+    size_t j = 0;                     // its records emitted
+    uint64_t b = 0, record = 0;       // the blocks decoded, and the records emitted
+    // The bytes of the blocks and of the blobs passed, and of those before the index row at hand.
+    uint64_t blocks_at = 0, blobs_at = 0, row_blocks_at = 0, row_blobs_at = 0;
+    uint64_t logical = 0, blobs = 0;  // the footprints passed: their logical bytes, and how many
+    uint64_t escaped_left = 0;        // bytes of the escaped footprint in progress still to emit
+    bool ended = false;
+    explicit Dec(const std::string& src) : Decoder("addr", {af::POINTS_FILE, af::VERTICES_FILE}), f(footers_of(src)) {
+        if (!f.records) return;
+        P.reset(new Reader(src + "/" + af::POINTS_FILE, BLOCKS_BUF));
+        V.reset(new Reader(src + "/" + af::VERTICES_FILE, BLOBS_BUF));
+        X.reset(new Reader(src + "/" + af::INDEX_FILE, INDEX_BUF));
     }
-    uint64_t decoded_size(int port) const override { return port == 0 ? 28 * N : ~0ull; }
+    uint64_t decoded_size(int port) const override {
+        const af::LogicalSizes sizes = af::logical_sizes(f);
+        return port == 0 ? sizes.points : sizes.vertices;
+    }
     void emit_escaped_piece() {
-        const size_t k = size_t(std::min<uint64_t>(escaped_left, READ_BUF));
-        emit(1, A->take(k), k);
+        const size_t k = size_t(std::min<uint64_t>(escaped_left, BLOBS_BUF));
+        emit(1, V->take(k), k);
         escaped_left -= k;
+    }
+    // The next block into `block`, where the index puts it.
+    void next_block() {
+        const std::string index_file = af::INDEX_FILE;
+        const char* const misplaced = " is not where the blocks and the blobs before it end";
+        if (b % af::SUPERBLOCK_BLOCKS == 0) {
+            const uint8_t* head = X->take(af::INDEX_HEAD_BYTES);
+            if (af::get64(head) != blocks_at || af::get64(head + 8) != blobs_at)
+                af::malformed(index_file + " superblock " + std::to_string(b / af::SUPERBLOCK_BLOCKS) + misplaced);
+            row_blocks_at = blocks_at;
+            row_blobs_at = blobs_at;
+        }
+        const uint8_t* entry = X->take(af::INDEX_ENTRY_BYTES);
+        if (af::get16(entry) != blocks_at - row_blocks_at || af::get32(entry + 2) != blobs_at - row_blobs_at)
+            af::malformed(index_file + " block " + std::to_string(b) + misplaced);
+        // Decoded where the reader holds it, with the 8 bytes decode_block may load past it: the
+        // next block's, or the footer's.
+        const size_t avail = size_t(std::min<uint64_t>(P->left(), af::BLOCK_MAX_BYTES + 8));
+        const size_t bytes = af::decode_block(b, P->need(avail), avail, f.block_records(b), block);
+        P->skip(bytes);
+        blocks_at += bytes;
+        b++;
+        j = 0;
+    }
+    // The block's next record, and its footprint or an escaped one's first piece.
+    void emit_record() {
+        const uint32_t len = block.len[j];
+        uint8_t rec[af::LOGICAL_STRIDE];
+        if (!len) {
+            af::logical_record(block, j, NO_DATA, 0, rec);
+            emit(0, rec, sizeof rec);
+        } else {
+            if (len > f.blobs_bytes - blobs_at)
+                af::malformed(std::string(af::VERTICES_FILE) + " ends inside the blob of record " + std::to_string(record));
+            uint64_t logical_bytes = 0;
+            try {
+                const af::BlobHeader h = af::blob_header(V->need(size_t(std::min<uint64_t>(len, af::BLOB_HEAD_MAX))), len);
+                logical_bytes = h.logical_bytes();
+                if (logical_bytes > f.logical_vertex_bytes - logical)
+                    af::malformed("a footprint past the footer's logical vertex stream of " +
+                                  std::to_string(f.logical_vertex_bytes) + " bytes");
+                af::logical_record(block, j, uint32_t(logical), uint32_t(h.vertex_count()), rec);
+                if (h.escape) {
+                    V->skip(h.bytes);
+                    escaped_left = logical_bytes;
+                } else {
+                    // Its len is what its count and its widths give, before the reader holds as
+                    // many bytes; then with the 8 bytes decode_blob may load past it: the next
+                    // blob's, or the footer's.
+                    af::blob_values(h, V->need(size_t(std::min<uint64_t>(len, h.bytes + 9))), len);
+                    uint8_t* to = emit_reserve(1, size_t(logical_bytes));
+                    af::decode_blob(h, V->need(size_t(len) + 8), len, block.lat[j], block.lng[j], to);
+                    V->skip(len);
+                }
+            } catch (const std::runtime_error& e) {
+                // What a blob is refused for, with whose it is.
+                throw std::runtime_error(std::string(e.what()) + ": " + af::VERTICES_FILE + ", record " + std::to_string(record));
+            }
+            emit(0, rec, sizeof rec);
+            if (escaped_left) emit_escaped_piece();
+            blobs_at += len;
+            logical += logical_bytes;
+            blobs++;
+        }
+        j++;
+        record++;
     }
     bool step() override {
         if (escaped_left) {
             emit_escaped_piece();
             return true;
         }
-        if (i == N) {
-            if (!A->eof()) die("addr_vertices.abs2 not fully consumed");
-            return false;
+        if (j == block.records) {
+            if (b == f.blocks()) {
+                if (ended) return false;
+                ended = true;
+                const std::string vertices_file = af::VERTICES_FILE;
+                if (blocks_at != f.blocks_bytes)
+                    af::malformed(std::string(af::POINTS_FILE) + " has bytes between its last block and its footer");
+                if (blobs_at != f.blobs_bytes) af::malformed(vertices_file + " has bytes between its last blob and its footer");
+                if (logical != f.logical_vertex_bytes)
+                    af::malformed(vertices_file + " counts " + std::to_string(f.logical_vertex_bytes) +
+                                  " bytes of logical blobs and its blobs hold " + std::to_string(logical));
+                if (blobs != f.blobs)
+                    af::malformed(vertices_file + " counts " + std::to_string(f.blobs) + " blobs and holds " +
+                                  std::to_string(blobs));
+                P.reset();
+                V.reset();
+                X.reset();
+                return false;
+            }
+            next_block();
         }
-        uint32_t v[6] = {0, 0, 0, 0, 0, 0};
-        for (int b = 0; b < 4; b++) v[0] |= uint32_t(rg[size_t(b)]->u8()) << (8 * b);
-        for (int b = 0; b < 4; b++) v[1] |= uint32_t(rg[size_t(4 + b)]->u8()) << (8 * b);
-        v[2] = rg[8]->u32();
-        v[3] = rg[9]->u32();
-        v[4] = rg[10]->u32();
-        for (int b = 0; b < 4; b++) v[5] |= uint32_t(rg[size_t(11 + b)]->u8()) << (8 * b);
-        uint32_t rec[7] = {v[0], v[1], v[2], v[3], v[4], NO, 0};
-        if (v[5] == NO) {
-            emit(0, rec, 28);
-            i++;
-            return true;
-        }
-        if (v[5] != A->tell()) die("addr %llu: poly_offset %u is not the stream position", (unsigned long long)i, v[5]);
-        if (raw >= 0xFFFFFFFFull) die("addr_vertices offset overflow");
-        rec[5] = uint32_t(raw);
-        const uint8_t tag = A->u8();
-        if (tag == 0x20) {
-            const uint64_t vcnt = A->uv();
-            if (!vcnt || vcnt > 0xFFFFFFFFull) die("addr %llu: bad count", (unsigned long long)i);
-            const uint8_t enc = *A->need(1);
-            const size_t size = A->unit_size(10, vcnt, enc == 3 ? 8 : 4);
-            rec[6] = uint32_t(vcnt);
-            emit(0, rec, 28);
-            raw += size;
-            i++;
-            escaped_left = size;
-            emit_escaped_piece();
-            return true;
-        }
-        const int enc = tag & 3, wide = (tag >> 2) & 1, small = (tag >> 3) & 1, closed = (tag >> 4) & 1;
-        if (enc > 2 || (tag & 0xE0)) die("addr %llu: bad tag", (unsigned long long)i);
-        const uint64_t cnt = A->uv();
-        if (cnt > ABS2_MAX_VERTICES - uint64_t(closed) || (closed && !cnt)) die("addr %llu: bad count", (unsigned long long)i);
-        const uint32_t full = uint32_t(cnt) + uint32_t(closed);
-        rec[6] = full;
-        emit(0, rec, 28);
-        const size_t bsz = 10 + 4 * size_t(full);
-        uint8_t bm[8];
-        memcpy(bm, A->take(small ? 2 : 8), small ? 2 : 8);
-        const uint8_t* p = A->take(2 * size_t(cnt) * (wide ? 2 : 1));
-        uint8_t* blob = emit_reserve(1, bsz);
-        memset(blob, 0, 10);
-        blob[0] = uint8_t(enc);
-        int64_t sl = 0, sg = 0;
-        for (uint64_t k = 0; k < cnt; k++) {
-            const uint16_t ql = wide ? rd16(p + 2 * k) : p[k];
-            const uint16_t qg = wide ? rd16(p + 2 * (cnt + k)) : p[cnt + k];
-            sl += ql;
-            sg += qg;
-            wr16(blob + 10 + 4 * k, ql);
-            wr16(blob + 12 + 4 * k, qg);
-        }
-        if (closed) {
-            memcpy(blob + 10 + 4 * cnt, blob + 10, 4);
-            sl += rd16(blob + 10);
-            sg += rd16(blob + 12);
-        }
-        uint32_t bl, bg;
-        if (small) {
-            bl = unfkey(fkey(pred_bits(v[0], sl, full, enc)) + int8_t(bm[0]));
-            bg = unfkey(fkey(pred_bits(v[1], sg, full, enc)) + int8_t(bm[1]));
-        } else {
-            bl = rd32(bm);
-            bg = rd32(bm + 4);
-        }
-        wr32(blob + 2, bl);
-        wr32(blob + 6, bg);
-        raw += bsz;
-        i++;
+        emit_record();
         return true;
     }
 };
 
-// Ports: 0 = addr_points, 1 = addr_vertices; a record is encoded once its footprint is all in, or,
-// when its footprint is escaped (which its first two bytes and vertex_count decide), once those are,
-// the footprint then copied through as it comes.
-// N (for addr_points.col's regions) comes from the expected size of addr_points.bin.
+// Ports: 0 = the address points' records in, 1 = their footprints' logical blobs in; the three
+// files out. A record is encoded once its footprint is all in: its blob goes to addr_vertices.bin
+// then, its block to addr_points.bin when the block's last record has come, and an index row to
+// addr_index.bin when its superblock's last block has. A record whose footprint is an escape,
+// which its vertex_count and the footprint's first byte decide, is encoded once the footprint's
+// header is in, and the footprint then passes through as it comes. The footers go out in finish.
 struct Enc : Encoder {
-    uint64_t N = 0, i = 0, vexp = 0;
-    uint64_t escaped_left = 0;  // bytes of the escaped footprint in progress still to copy
-    int fd = -1;
-    std::vector<std::unique_ptr<Writer>> w;
-    std::unique_ptr<Writer> A;
-    Enc(const std::string& od, uint64_t points_size) : Encoder("addr", od, 2) {
-        if (points_size % 28) die("addr_points.bin size");
-        N = points_size / 28;
-        const std::string cp = od + "/addr_points.col";
-        if (unlink(cp.c_str()) && errno != ENOENT) die("unlink %s", cp.c_str());
-        fd = open(cp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-        if (fd < 0) die("create %s", cp.c_str());
-        for (int k = 0; k < 15; k++) w.emplace_back(new Writer(fd, cp, col_region(k, N), region_buf(k)));
-        A.reset(new Writer(od + "/addr_vertices.abs2"));
-    }
-    ~Enc() override {
-        if (fd >= 0) close(fd);
-    }
-    void put_po(uint32_t v) { for (int b = 0; b < 4; b++) w[size_t(11 + b)]->u8(uint8_t(v >> (8 * b))); }
+    struct Sink {
+        Writer* to;
+        void operator()(const uint8_t* p, size_t n) const { to->put(p, n); }
+    };
+    std::unique_ptr<Writer> PW, VW, XW;
+    af::Encoder<Sink, Sink, Sink> files;
+    explicit Enc(const std::string& od)
+        : Encoder("addr", od, 2),
+          PW(new Writer(od + "/" + af::POINTS_FILE, BLOCKS_BUF)),
+          VW(new Writer(od + "/" + af::VERTICES_FILE, BLOBS_BUF)),
+          XW(new Writer(od + "/" + af::INDEX_FILE, INDEX_BUF)),
+          files(Sink{PW.get()}, Sink{VW.get()}, Sink{XW.get()}) {}
     void pump() override {
         ByteQueue &P = in[0], &V = in[1];
         for (;;) {
-            if (escaped_left) {
+            if (const uint64_t owed = files.escape_owed()) {
                 if (!V.size()) return;
-                const size_t k = size_t(std::min<uint64_t>(escaped_left, V.size()));
-                A->put(V.data(), k);
+                const size_t k = size_t(std::min<uint64_t>(owed, V.size()));
+                files.put_escape_bytes(V.data(), k);
                 V.pop(k);
-                escaped_left -= k;
-                if (escaped_left) return;
+                if (k < owed) return;
             }
-            if (P.size() < 28) return;
-            const uint8_t* r = P.data();
-            const uint32_t lat = rd32(r), lng = rd32(r + 4), voff = rd32(r + 20), vcnt = rd32(r + 24);
-            size_t size = 0;
-            bool escaped = false;
-            if (vcnt) {
-                if (V.size() < 1) return;
-                const uint8_t enc = V.data()[0];
-                if (enc > 3) die("addr_vertices: unknown encoding %u", enc);
-                size = unit_size(1, 10, vcnt, enc == 3 ? 8 : 4);
-                if (V.size() < 2) return;
-                escaped = enc == 3 || V.data()[1] != 0 || vcnt > ABS2_MAX_VERTICES;
-                if (!escaped && V.size() < size) return;
-            }
-            if (i >= N) die("addr: more records than addr_points.bin's size gives");
-            for (int b = 0; b < 4; b++) w[size_t(b)]->u8(uint8_t(lat >> (8 * b)));
-            for (int b = 0; b < 4; b++) w[size_t(4 + b)]->u8(uint8_t(lng >> (8 * b)));
-            w[8]->put(r + 8, 4);
-            w[9]->put(r + 12, 4);
-            w[10]->put(r + 16, 4);
-            if (!vcnt) {
-                if (voff != NO) die("addr_points %llu: vertex_count 0 with vertex_offset %u", (unsigned long long)i, voff);
-                put_po(NO);
-                P.pop(28);
-                i++;
+            if (P.size() < af::LOGICAL_STRIDE) return;
+            const uint8_t* rec = P.data();
+            const uint32_t count = rd32(rec + af::VERTEX_COUNT_AT);
+            if (!count) {
+                files.add(rec, nullptr);
+                P.pop(af::LOGICAL_STRIDE);
                 continue;
             }
-            if (voff != vexp) die("addr_points %llu: vertex_offset %u is not the running offset %llu", (unsigned long long)i, voff,
-                                  (unsigned long long)vexp);
-            if (A->tell() >= 0xFFFFFFFFull) die("addr_vertices.abs2 offset overflow");
-            put_po(uint32_t(A->tell()));
-            const uint8_t* b = V.data();
-            const uint8_t enc = b[0];
-            vexp += size;
-            if (escaped) {
-                A->u8(0x20);
-                A->uv(vcnt);
-                escaped_left = size;
-            } else {
-                const uint32_t bl = rd32(b + 2), bg = rd32(b + 6);
-                int64_t sl = 0, sg = 0;
-                uint32_t span = 0;
-                for (uint32_t k = 0; k < vcnt; k++) {
-                    const uint32_t ql = rd16(b + 10 + 4 * size_t(k)), qg = rd16(b + 12 + 4 * size_t(k));
-                    sl += ql;
-                    sg += qg;
-                    span = std::max(span, std::max(ql, qg));
-                }
-                const bool closed = vcnt >= 2 && rd16(b + 10) == rd16(b + 10 + 4 * size_t(vcnt - 1)) &&
-                                    rd16(b + 12) == rd16(b + 12 + 4 * size_t(vcnt - 1));
-                const uint32_t oc = vcnt - (closed ? 1 : 0);
-                const bool wide = span >= 256;
-                const int64_t rl = fkey(bl) - fkey(pred_bits(lat, sl, vcnt, enc));
-                const int64_t rgg = fkey(bg) - fkey(pred_bits(lng, sg, vcnt, enc));
-                const bool small = rl > -128 && rl < 128 && rgg > -128 && rgg < 128;
-                A->u8(uint8_t(enc | (wide << 2) | (small << 3) | (closed << 4)));
-                A->uv(oc);
-                if (small) {
-                    A->u8(uint8_t(int8_t(rl)));
-                    A->u8(uint8_t(int8_t(rgg)));
-                } else {
-                    A->u32(bl);
-                    A->u32(bg);
-                }
-                for (int c = 0; c < 2; c++)
-                    for (uint32_t k = 0; k < oc; k++) {
-                        const uint16_t q = rd16(b + 10 + 4 * size_t(k) + 2 * size_t(c));
-                        if (wide) A->u16(q);
-                        else A->u8(uint8_t(q));
-                    }
-                V.pop(size);
+            if (V.size() < af::LOGICAL_HEADER) return;
+            const uint8_t* logical = V.data();
+            // A header no footprint has is add's to refuse, with no vertex read.
+            const bool footprint = logical[0] <= 3 && !logical[1];
+            if (footprint && af::is_escape(logical[0], count)) {
+                files.begin_escape(rec, logical);
+                V.pop(af::LOGICAL_HEADER);
+                P.pop(af::LOGICAL_STRIDE);
+                continue;
             }
-            P.pop(28);
-            i++;
+            const size_t bytes = footprint ? size_t(af::logical_blob_bytes(logical[0], count)) : af::LOGICAL_HEADER;
+            if (V.size() < bytes) return;  // its vertices are not all in yet
+            files.add(rec, logical);
+            V.pop(bytes);
+            P.pop(af::LOGICAL_STRIDE);
         }
     }
-    void finish(Manifest& m) override {
+    void finish(Manifest&) override {
         require_empty();
-        if (escaped_left) die("addr_vertices: stream ends inside a footprint");
-        if (i != N) die("addr: %llu records, addr_points.bin's size gives %llu", (unsigned long long)i, (unsigned long long)N);
-        for (auto& x : w) x->finish();
-        w.clear();
-        const int f = fd;
-        fd = -1;
-        if (close(f)) die("close addr_points.col");
-        m.set("addr.n", N);
-        m.set("addr.abs2_bytes", A->tell());
-        A->finish();
-        A.reset();
+        if (const uint64_t owed = files.escape_owed())
+            die("%s: the stream ends %llu bytes before its last footprint does", af::VERTICES_FILE, (unsigned long long)owed);
+        files.finish();
+        const auto points_footer = files.points_footer();
+        const auto vertices_footer = files.vertices_footer();
+        const auto index_footer = files.index_footer();
+        PW->put(points_footer.data(), points_footer.size());
+        VW->put(vertices_footer.data(), vertices_footer.size());
+        XW->put(index_footer.data(), index_footer.size());
+        PW->finish();
+        VW->finish();
+        XW->finish();
+        PW.reset();
+        VW.reset();
+        XW.reset();
     }
 };
 }  // namespace addr

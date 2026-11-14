@@ -45,9 +45,9 @@ constexpr uint32_t NO = 0xFFFFFFFFu;
 // The most bytes a family's decoder may hold queued while the replay skips
 // old bytes (a deleted run, replaced children or parents).
 constexpr uint64_t DECODER_HOLD = 1 << 20;
-// The most vertices an abs2 address footprint holds (closing vertex
-// included); one of more goes through the raw escape.
-constexpr uint32_t ABS2_MAX_VERTICES = 69999;
+// The most vertices an address footprint's blob holds (addr_files.h); one of
+// more is an escape.
+constexpr uint32_t MAX_BLOB_VERTICES = static_cast<uint32_t>(addr_files::MAX_BLOB_VERTICES);
 // The most bytes a family's encoder may hold queued, however large a write:
 // a piece of it (64 KiB) and the largest unit the encoder takes whole. Each
 // family's own, so each check is as tight as its encoder allows (one bound
@@ -56,11 +56,11 @@ constexpr uint32_t ABS2_MAX_VERTICES = 69999;
 // may):
 //   POI: a block up to big_block(), 256 KiB; a larger one goes plane by
 //   plane;
-//   addr: an abs2 footprint, a 10-byte header and 4-byte vertices, 280,006 B
-//   at ABS2_MAX_VERTICES; an escaped one goes through in pieces.
+//   addr: a footprint a blob holds, a 10-byte header and 4-byte vertices,
+//   262,150 B at MAX_BLOB_VERTICES; an escaped one goes through in pieces.
 constexpr uint64_t ENCODER_PIECE = 64 << 10;
 constexpr uint64_t POI_ENCODER_HOLD = ENCODER_PIECE + (256 << 10);
-constexpr uint64_t ADDR_ENCODER_HOLD = ENCODER_PIECE + 10 + 4 * uint64_t(ABS2_MAX_VERTICES);
+constexpr uint64_t ADDR_ENCODER_HOLD = ENCODER_PIECE + 10 + 4 * uint64_t(MAX_BLOB_VERTICES);
 // The most the patcher's heap peak may grow when a heap test's case grows
 // tenfold in the one structure it varies, which the patcher reads in place.
 constexpr uint64_t HEAP_GROWTH_SLACK = 256 << 10;
@@ -765,8 +765,8 @@ std::vector<Poi> pois_of(std::mt19937& rng, uint32_t n, uint32_t vertices, bool 
 }
 
 // n address points, every third without a footprint, the others with one of
-// 1 to 8 random vertices, on a street of their own: geocoder-gc's address
-// family beside the street pair, into d.
+// 1 to 8 random vertices, on a street of their own: the address family
+// beside the street pair, into d.
 void put_addr_family(BuildDir& d, std::mt19937& rng, uint32_t n) {
     std::vector<GeoRow> rows;
     for (uint32_t k = 0; k < 50; k++) rows.push_back({k, {k % 10}});
@@ -1274,10 +1274,10 @@ TEST(patch_lowmem_replays_records_edited_in_place) {
     CHECK(apply_both_modes(c, decoder_peaks_at_most("poi", DECODER_HOLD)).empty());
 }
 
-// An encoded set whose two address files are empty: the diff sends
-// addr_points.bin's (empty) merge with the streets after it and
-// addr_vertices.bin later, as a full replacement. An empty parent has no
-// child bytes to replay with it.
+// A set whose address files hold no address, their three footers: the diff
+// sends addr_points.bin's (empty) merge with the streets after it and
+// addr_vertices.bin later, as a full replacement of no bytes. An empty parent
+// has no child bytes to replay with it.
 TEST(patch_lowmem_applies_to_a_set_with_empty_address_files) {
     ScratchDir dir("lowmem-noaddr");
     std::vector<GeoRow> rows;
@@ -1334,14 +1334,14 @@ TEST(patch_lowmem_encodes_a_poi_insert_stretch_within_its_hold) {
     CHECK(apply_both_modes(c, encoder_peaks_at_most("poi", POI_ENCODER_HOLD)).empty());
 }
 
-// An escaped address footprint (encoding 3, 800K vertices: 6.4 MB) kept
-// between small ones and abs2 ones of ABS2_MAX_VERTICES while the address
-// before them goes, so the replay MATCHes them and moves their
-// vertex_offsets; and another of ABS2_MAX_VERTICES inserted, which reaches
-// the encoder in one write of most of it: the decoder hands the escaped one
-// over and the encoder takes it in pieces, neither holding more than
-// DECODER_HOLD, nor the encoder more than a piece and the largest abs2
-// footprint, which it takes whole.
+// Two escaped address footprints (one in encoding 3, 800K vertices: 6.4 MB;
+// one of a vertex more than a blob holds) kept between small ones and ones of
+// MAX_BLOB_VERTICES while the address before them goes, so the replay MATCHes
+// them and moves their vertex_offsets; and another of MAX_BLOB_VERTICES
+// inserted, which reaches the encoder in one write of most of it: the decoder
+// hands the escaped ones over and the encoder takes them in pieces, neither
+// holding more than DECODER_HOLD, nor the encoder more than a piece and the
+// largest footprint a blob holds, which it takes whole. In every mode.
 TEST(patch_lowmem_copies_an_escaped_footprint_through_in_pieces) {
     ScratchDir dir("lowmem-footprint");
     std::mt19937 rng(20261030);
@@ -1351,9 +1351,10 @@ TEST(patch_lowmem_copies_an_escaped_footprint_through_in_pieces) {
     std::vector<char> escaped = block(rng, 2 * 800000);
     escaped[0] = 3;
     addrs[150].block = escaped;
-    for (const uint32_t i : {60u, 61u, 240u}) addrs[i].block = block(rng, ABS2_MAX_VERTICES);
+    addrs[151].block = block(rng, MAX_BLOB_VERTICES + 1);
+    for (const uint32_t i : {60u, 61u, 240u}) addrs[i].block = block(rng, MAX_BLOB_VERTICES);
     std::vector<Addr> fewer_addrs(addrs.begin() + 1, addrs.end());
-    fewer_addrs.insert(fewer_addrs.begin() + 200, Addr{48.0f, block(rng, ABS2_MAX_VERTICES)});
+    fewer_addrs.insert(fewer_addrs.begin() + 200, Addr{48.0f, block(rng, MAX_BLOB_VERTICES)});
     BuildDir old_d, new_d;
     put_addrs(old_d, addrs);
     put_addrs(new_d, fewer_addrs);
@@ -1361,10 +1362,10 @@ TEST(patch_lowmem_copies_an_escaped_footprint_through_in_pieces) {
     REQUIRE(prepare(c, old_d, new_d).empty());
     const LogCheck decoder = decoder_peaks_at_most("addr", DECODER_HOLD), encoder = encoder_peaks_at_most("addr", ADDR_ENCODER_HOLD);
 
-    CHECK(apply_both_modes(c, [&](const std::string& log) {
+    CHECK(apply_modes(c, ALL_MODES, [&](const std::string& log) {
               const std::string e = decoder(log);
               return e.empty() ? encoder(log) : e;
-          }).empty());
+          }).bad.empty());
 }
 
 // The memory checks of the replay tests above, on report lines as the
@@ -2016,6 +2017,34 @@ TEST(patch_heap_stays_flat_as_side_files_grow) {
     }, 400000).empty());
 }
 
+// n address points, two in three with a footprint of 1 to 8 vertices, and
+// the new day's without every fiftieth: the address merge keeps runs of 49
+// records, whose footprints the replay takes from the old stream. The codecs
+// hold a block's records, one footprint and an index row of either day's
+// files.
+TEST(patch_heap_stays_flat_as_addresses_grow) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::mt19937 rng(20261114);
+        std::vector<Addr> addrs, kept;
+        for (uint32_t i = 0; i < n; i++) {
+            const std::vector<char> footprint = i % 3 == 0 ? std::vector<char>{} : block(rng, 1 + rng() % 8);
+            addrs.push_back({47.0f + static_cast<float>(i) * 1e-4f, footprint});
+            if (i % 50 != 7) kept.push_back(addrs.back());
+        }
+        BuildDir old_d, new_d;
+        put_addrs(old_d, addrs);
+        put_addrs(new_d, kept);
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        // The address points' merge: n old records, n less a fiftieth new.
+        std::vector<char> head;
+        append(head, static_cast<uint32_t>(PatchFileId::ADDR_POINTS));
+        append(head, static_cast<uint32_t>(ADDR_POINT_STRIDE));
+        append(head, uint64_t{ADDR_POINT_STRIDE} * n);
+        append(head, uint64_t{ADDR_POINT_STRIDE} * kept.size());
+        return patch_holds(c, head, "merge of " + std::to_string(n) + " address points");
+    }, 100000).empty());
+}
+
 // The diff sends the moved strings as pairs up to its cap and as string
 // fixups past it (GCPATCH v12): 99 moved POI names go as 99 pairs under a cap
 // of 99, and as the POI merge's 99 string fixups, with no pair, under a cap of
@@ -2093,19 +2122,50 @@ TEST(patch_lowmem_new_manifest_names_only_the_families_the_patch_ships) {
     CHECK(r.ok && read_dir(c.dir("out.dec")) == gctest::as_written(new_d));
 }
 
-// A new set with part of an encoded family (the address family without its
-// addr_vertices.bin) is refused before the replay.
+// A new set with part of an encoded family is refused, in every mode: a
+// client file list without the address family's addr_vertices.bin before the
+// replay, and one without its addr_index.bin, which no section names, before
+// an address file is written. The builder writes the three or none, so the
+// lists are the diff's with an entry cut out. The patch as made applies.
 TEST(patch_lowmem_refuses_a_new_set_with_part_of_a_family) {
     ScratchDir dir("lowmem-part");
     std::mt19937 rng(20261027);
-    BuildDir old_d;
+    BuildDir old_d, new_d;
     put_addr_family(old_d, rng, 40);
-    BuildDir new_d = old_d;
-    new_d.erase("addr_vertices.bin");
-    const LowMemCase c{dir.path(), "without-addr_vertices.bin"};
+    put_addr_family(new_d, rng, 40);
+    const LowMemCase c{dir.path(), "part"};
     REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    // The list follows the magic, the version and the flags: its marker, its
+    // count, then each file's name length, name, size and inline byte.
+    const size_t list_at = 16;
+    uint32_t marker = 0, listed = 0;
+    REQUIRE(raw.size() > list_at + 8);
+    memcpy(&marker, raw.data() + list_at, 4);
+    memcpy(&listed, raw.data() + list_at + 4, 4);
+    REQUIRE(marker == CLIENT_FILES_MARKER);
+    struct Cut {
+        std::string file, refusal;
+    };
+    for (const Cut& e : {Cut{"addr_vertices.bin", "family addr: the patch ships 1 of its 2 files"},
+                         Cut{"addr_index.bin", "addr: the patch lists no addr_index.bin"}}) {
+        std::vector<char> entry;
+        append(entry, static_cast<uint16_t>(e.file.size()));
+        entry.insert(entry.end(), e.file.begin(), e.file.end());
+        const size_t at = find_once(raw, entry);
+        REQUIRE(at != std::string::npos);
+        std::vector<char> cut = raw;
+        cut.erase(cut.begin() + static_cast<std::ptrdiff_t>(at),
+                  cut.begin() + static_cast<std::ptrdiff_t>(at + entry.size() + 8 + 1));
+        put_at(cut, list_at + 4, listed - 1);
+        const std::string patch = c.dir(e.file + ".gcpatch");
+        REQUIRE(write_patch(c, patch, cut));
 
-    CHECK(not_refused(c, ENCODED_MODES, c.patch(), "part", "family addr: the patch ships 1 of its 2 files").empty());
+        CHECK(not_refused(c, ALL_MODES, patch, "without-" + e.file, e.refusal).empty());
+        for (const std::string& mode : ALL_MODES)
+            CHECK(!std::filesystem::exists(c.dir("without-" + e.file + ".out." + mode) + "/addr_points.bin"));
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
 // A MATCH run longer than what is left of the old file is refused in the
@@ -2150,7 +2210,7 @@ TEST(patch_lowmem_refuses_a_match_run_past_the_old_file) {
 }
 
 // A merge of an encoded family's parent at a stride other than its records'
-// is refused before the replay, in sync and --threads: addresses at 24 bytes
+// is refused before the replay, in every mode: addresses at 24 bytes
 // (the string and vertex_offset fields fit, the vertex_count at 24 that sizes
 // a record's child bytes does not; with the first footprint deleted, the
 // first record replayed moves its vertex_offset, so it is rewritten in a
@@ -2197,9 +2257,9 @@ TEST(patch_lowmem_refuses_a_parent_stride_other_than_its_records) {
         const std::string patch = c.dir(name + ".gcpatch");
         REQUIRE(write_patch(c, patch, edited));
 
-        CHECK(not_refused(c, ENCODED_MODES, patch, name, "Malformed record stride: " + name).empty());
+        CHECK(not_refused(c, ALL_MODES, patch, name, "Malformed record stride: " + name).empty());
     }
-    CHECK(apply_both_modes(c).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
 // The street ways' merge (MATCH, REPLACE and INSERT runs, replayed with their
@@ -2769,6 +2829,67 @@ TEST(patch_refuses_old_way_files_the_builder_would_not_write) {
 
         put("street_ways.bin", rows);
         put("street_nodes.bin", nodes);
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// Old address files the builder would not write are refused by name in every
+// mode, though their footers give the sizes the patch expects: a block the
+// index puts a byte past where the blocks before it end, a first block with
+// a flag no block has, and a vertices file a byte short of its last blob. A
+// footer that gives a logical footprint stream a byte past what a patch
+// indexes, and a dir with two of the three files, are refused before a block
+// is read. The patch applies to the files as written.
+TEST(patch_refuses_old_address_files_the_builder_would_not_write) {
+    ScratchDir dir("patch-old-addrs");
+    std::mt19937 rng(20261114);
+    std::vector<Addr> addrs;
+    for (uint32_t i = 0; i < 40; i++)
+        addrs.push_back({47.0f + static_cast<float>(i) * 1e-4f, i % 3 == 2 ? std::vector<char>{} : block(rng, 3 + rng() % 8)});
+    std::vector<Addr> fewer_addrs(addrs.begin() + 1, addrs.end());
+    BuildDir old_d, new_d;
+    put_addrs(old_d, addrs);
+    put_addrs(new_d, fewer_addrs);
+    const LowMemCase c{dir.path(), "addrs"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    const char* const names[] = {"addr_points.bin", "addr_vertices.bin", "addr_index.bin"};
+    std::map<std::string, std::vector<char>> written;
+    for (const char* name : names) written[name] = read_file(c.dir("old") + "/" + name);
+    // One superblock's row, 16 bytes and 6 a block, and the footer.
+    REQUIRE(written["addr_index.bin"].size() == 16 + 3 * 6 + 8 && written["addr_vertices.bin"].size() > 16);
+    // (The encoded set's files are the old dir's or copies of them.)
+    auto put = [&](const std::string& name, const std::optional<std::vector<char>>& bytes) {
+        for (const char* set : {"old", "old.enc"}) {
+            const std::string path = c.dir(set) + "/" + name;
+            std::filesystem::remove(path);
+            if (bytes) REQUIRE(write_file(path, *bytes));
+        }
+    };
+    std::vector<char> moved = written["addr_index.bin"], flagged = written["addr_points.bin"], cut = written["addr_vertices.bin"];
+    std::vector<char> past = written["addr_vertices.bin"];
+    moved[16 + 6]++;
+    flagged[0] = static_cast<char>(0x80);
+    cut.erase(cut.end() - 17);
+    put_at(past, past.size() - 16, uint64_t{FILE_RECORDS_MAX} + 1);
+    struct Edit {
+        std::string name, file;
+        std::optional<std::vector<char>> bytes;
+        std::string refusal;
+    };
+    for (const Edit& e :
+         {Edit{"index", "addr_index.bin", moved, "addr_index.bin block 1 is not where the blocks and the blobs before it end"},
+          Edit{"block", "addr_points.bin", flagged, "addr_points.bin block 0 has a flag no block has"},
+          Edit{"blob", "addr_vertices.bin", cut, "addr_vertices.bin ends inside the blob of record 39"},
+          Edit{"limit", "addr_vertices.bin", past,
+               "a logical addr_vertices.bin of 4294967295 bytes is more than the 4294967294 a patch can index"},
+          Edit{"part", "addr_index.bin", std::nullopt,
+               "a dir with some of addr_points.bin, addr_vertices.bin and addr_index.bin and not all three"}}) {
+        put(e.file, e.bytes);
+
+        CHECK(not_refused(c, ALL_MODES, c.patch(), e.name, "Malformed address files: " + e.refusal).empty());
+
+        for (const char* name : names) put(name, written[name]);
     }
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
@@ -3938,12 +4059,11 @@ TEST(patch_lowmem_round_trips_an_admin_minimal_arc_dir) {
     CHECK(apply_modes(c, ALL_MODES, merged_by_slot(old_d, new_d)).bad.empty());
 }
 
-// An encoded family (the address points, encoded by geocoder-gc) beside the
-// plain arc files: the low-memory mode replays the family through its codecs
-// and the arc files as plain merge sections, and the new set is gc's encoding
-// of the new dir, byte for byte. The parent sent the admin geometry files
-// whole.
-TEST(patch_lowmem_applies_an_encoded_set_beside_plain_arc_files) {
+// The address files beside the plain arc files: every mode replays the
+// address family through its codecs and the arc files as plain merge
+// sections, and the new dir holds the address files as the builder writes
+// them, byte for byte. The parent sent the admin geometry files whole.
+TEST(patch_lowmem_applies_the_address_files_beside_plain_arc_files) {
     ScratchDir dir("lowmem-arcs-beside");
     std::mt19937 rng(20261103);
     const ArcGeometry old_g = arc_geometry(rng, 60, 200);
@@ -3957,13 +4077,12 @@ TEST(patch_lowmem_applies_an_encoded_set_beside_plain_arc_files) {
     put_addr_family(new_d, rng, 300);
     const LowMemCase c{dir.path(), "beside"};
     REQUIRE(prepare(c, old_d, new_d).empty());
-    REQUIRE(read_dir(c.dir("old.enc")).count("addr_points.col") == 1);
 
     const LogCheck merged = merged_by_slot(old_d, new_d);
-    CHECK(apply_both_modes(c, [&](const std::string& log) -> std::string {
+    CHECK(apply_modes(c, ALL_MODES, [&](const std::string& log) -> std::string {
               if (log.find("encode addr:") == std::string::npos) return "no encode addr line";
               return merged(log);
-          }).empty());
+          }).bad.empty());
 }
 
 // One interior vertex of one arc moved, its box and every delta's length

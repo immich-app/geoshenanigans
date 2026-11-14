@@ -1,19 +1,16 @@
 // geocoder-gc, the encoder and decoder of installed sets (tools/gc.cpp and
-// tools/gc_*.h): malformed encoded sets fail through gc's die() (exit 2) in
-// its decoders, before anything is sized from a bad count, each case in a
-// child process; address footprints past abs2's bound round trip; and the
-// tool never writes its source, refuses an encoded dir as encode input and an
-// output dir holding files. (The patcher's decoders: tests/test_gcs_codec.cpp.)
-#include "gc_addr.h"
+// tools/gc_io.h), which encodes no family: its readers and writers fail
+// through gc's die() (exit 2), each case in a child process, and the tool
+// refuses an encoded dir as encode input. (The patcher's decoders:
+// tests/test_gcs_codec.cpp.)
+#include "gc_io.h"
 
 #include <csignal>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <grp.h>
-#include <iterator>
 #include <new>
-#include <random>
 #include <string>
 #include <sys/prctl.h>
 #include <sys/resource.h>
@@ -35,117 +32,11 @@ void write_bytes(const std::string& path, const std::vector<uint8_t>& bytes) {
     out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
 }
 
-std::vector<uint8_t> read_bytes(const std::string& path) {
-    std::ifstream in(path, std::ios::binary);
-    return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), {});
-}
-
 // n little-endian bytes of v.
 std::vector<uint8_t> le(uint64_t v, int n) {
     std::vector<uint8_t> b;
     for (int k = 0; k < n; k++) b.push_back(uint8_t(v >> (8 * k)));
     return b;
-}
-
-// LEB128, as the encoded columns hold counts.
-void uv(std::vector<uint8_t>& o, uint64_t v) {
-    while (v >= 0x80) {
-        o.push_back(uint8_t(v) | 0x80);
-        v >>= 7;
-    }
-    o.push_back(uint8_t(v));
-}
-
-void put32(std::vector<uint8_t>& o, uint32_t v) {
-    for (int b = 0; b < 4; b++) o.push_back(uint8_t(v >> (8 * b)));
-}
-
-uint32_t f32_bits(float f) {
-    uint32_t b;
-    memcpy(&b, &f, 4);
-    return b;
-}
-
-void putf(std::vector<uint8_t>& o, float f) { put32(o, f32_bits(f)); }
-
-// Address points with footprints of up to 120000 vertices: 69999 still fit
-// abs2, 70000 open and 70001 closed (70000 once the closing vertex is
-// dropped) do not. Narrow (u8) and wide (u16) values, every encoding.
-struct AddrSet {
-    std::vector<uint8_t> points, verts;
-};
-
-AddrSet big_footprints() {
-    std::mt19937 rng(20261027);
-    struct Spec { uint32_t vc; uint8_t enc; bool closed; uint32_t span; };
-    const Spec specs[] = {{0, 0, false, 0},        {70000, 0, false, 65536}, {5, 1, true, 200},          {69999, 2, false, 65536},
-                          {70001, 0, true, 65536},  {0, 0, false, 0},         {70000, 1, false, 256 - 1}, {3, 3, false, 65536},
-                          {80000, 3, false, 65536}, {120000, 2, true, 200}};
-    AddrSet s;
-    for (const Spec& sp : specs) {
-        uint32_t rec[7] = {f32_bits(float(rng() % 1800000) / 1e4f - 90.f), f32_bits(float(rng() % 3600000) / 1e4f - 180.f),
-                           uint32_t(rng()), uint32_t(rng()), uint32_t(rng()), gcset::NO, 0};
-        if (sp.vc) {
-            rec[5] = uint32_t(s.verts.size());
-            rec[6] = sp.vc;
-            uint8_t h[10] = {sp.enc, 0};
-            gcset::wr32(h + 2, f32_bits(float(rng() % 1800000) / 1e4f - 90.f));
-            gcset::wr32(h + 6, f32_bits(float(rng() % 3600000) / 1e4f - 180.f));
-            s.verts.insert(s.verts.end(), h, h + 10);
-            const size_t vs = sp.enc == 3 ? 8 : 4, first = s.verts.size();
-            for (uint32_t k = 0; k < sp.vc; k++) {
-                uint8_t v[8];
-                if (vs == 8) {
-                    for (auto& b : v) b = uint8_t(rng());
-                } else {
-                    gcset::wr16(v, uint16_t(rng() % sp.span));
-                    gcset::wr16(v + 2, uint16_t(rng() % sp.span));
-                }
-                if (k + 1 == sp.vc && sp.closed) memcpy(v, &s.verts[first], vs);
-                s.verts.insert(s.verts.end(), v, v + vs);
-            }
-        }
-        const uint8_t* r = reinterpret_cast<const uint8_t*>(rec);
-        s.points.insert(s.points.end(), r, r + 28);
-    }
-    return s;
-}
-
-// Three street ways of two nodes each and a file of no family.
-void street_today_set(const std::string& dir) {
-    std::vector<uint8_t> ways, nodes;
-    for (uint32_t w = 0; w < 3; w++) {
-        put32(ways, 2 * w);
-        ways.push_back(2);
-        ways.insert(ways.end(), {0, 0, 0});
-        put32(ways, 100 + w);
-        for (const float f : {47.0f + float(w) * 1e-4f, 8.0f, 47.001f, 8.001f + float(w) * 1e-4f}) putf(nodes, f);
-    }
-    std::filesystem::create_directories(dir);
-    write_bytes(dir + "/a.bin", {'k', 'e', 'e', 'p'});
-    write_bytes(dir + "/street_ways.bin", ways);
-    write_bytes(dir + "/street_nodes.bin", nodes);
-}
-
-// Three address points, the second with a footprint of three vertices, and a
-// file of no family.
-void addr_today_set(const std::string& dir) {
-    std::vector<uint8_t> points, verts;
-    for (uint32_t a = 0; a < 3; a++) {
-        putf(points, 47.0f + float(a) * 1e-4f);
-        putf(points, 8.0f);
-        for (const uint32_t w : {200 + a, 300 + a, a}) put32(points, w);  // house number, street, parent way
-        put32(points, a == 1 ? 0 : gcset::NO);                            // vertex_offset
-        put32(points, a == 1 ? 3 : 0);                                    // vertex_count
-    }
-    verts.insert(verts.end(), {0, 0});  // encoding 0, pad
-    putf(verts, 47.0f);
-    putf(verts, 8.0f);
-    for (const uint8_t q : {1, 2, 30, 4, 5, 60}) verts.insert(verts.end(), {q, 0});  // u16 latitude and longitude steps
-    std::filesystem::create_directories(dir);
-    write_bytes(dir + "/a.bin", {'k', 'e', 'e', 'p'});
-    write_bytes(dir + "/addr_points.bin", points);
-    write_bytes(dir + "/addr_vertices.bin", verts);
 }
 
 // A gc run: exit status 0, and its log.
@@ -168,157 +59,10 @@ GcRun run_gc(const std::vector<std::string>& args, const std::string& log) {
 }  // namespace
 
 // A child whose body throws (a bad_alloc from an unchecked size, say) ends
-// there with its own status: the cases here run their decoders in children.
+// there with its own status: the cases here run gc's readers in children.
 TEST(exit_status_in_child_ends_a_child_whose_body_throws) {
     CHECK_EQ(exit_status_in_child([]() -> int { throw std::bad_alloc(); }, 5), gctest::EXCEPTION_ESCAPED);
     CHECK_EQ(exit_status_in_child([] { return 7; }, 5), 7);
-}
-
-// tag 0x04: an abs2 blob (wide, 2 + 2 count bytes per vertex after an 8-byte
-// bmin); 0x20: the raw escape (today's blob, 10 + 4 count bytes), whose count
-// must fit the record's u32. Both decoders: points only and whole.
-TEST(gc_address_decoders_refuse_a_footprint_count_past_u32) {
-    ScratchDir dir("gc-addr-count");
-    const std::string src = dir.path() + "/in", out = dir.path() + "/out";
-    std::filesystem::create_directories(src);
-    std::filesystem::create_directories(out);
-    write_bytes(src + "/addr_points.col", std::vector<uint8_t>(24));
-    for (const uint8_t tag : {uint8_t(0x04), uint8_t(0x20)}) {
-        for (const uint64_t count : {uint64_t(5), (uint64_t(1) << 32) + 5, (uint64_t(1) << 63) + 5}) {
-            std::vector<uint8_t> bytes{tag};
-            uv(bytes, count);
-            bytes.resize(bytes.size() + (tag == 0x20 ? 30 : 28));
-            write_bytes(src + "/addr_vertices.abs2", bytes);
-            for (const bool whole : {false, true}) {
-                const int status = exit_status_in_child(
-                    [&] {
-                        gcset::Manifest m;
-                        m.set("addr.n", 1);
-                        if (whole) gcset::addr::decode(src, out, m);
-                        else gcset::addr::decode_points_only(src, m, out);
-                        return 0;
-                    },
-                    5);
-
-                CHECK_EQ(status, count == 5 ? 0 : 2);
-            }
-        }
-    }
-}
-
-// An escaped footprint (0x20) whose count fits the record's u32 but not the
-// file is refused as a truncated file before the reader's buffer grows to the
-// footprint's 16 GiB, which the child's capped address space can't hold: and
-// 2^30 vertices in a ten-byte payload (10 + 4 x 2^30 bytes, which a 32-bit
-// size_t wraps to the payload's 10). Both decoders: points only and whole.
-TEST(gc_address_decoders_refuse_a_footprint_past_the_end_before_reading_it) {
-    ScratchDir dir("gc-addr-end");
-    const std::string src = dir.path() + "/in", out = dir.path() + "/out";
-    std::filesystem::create_directories(src);
-    std::filesystem::create_directories(out);
-    write_bytes(src + "/addr_points.col", std::vector<uint8_t>(24));
-    for (const auto& [count, payload] : {std::pair<uint64_t, size_t>{0xFFFFFFFF, 30}, {0x40000000, 10}}) {
-        std::vector<uint8_t> bytes{0x20};
-        uv(bytes, count);
-        bytes.resize(bytes.size() + payload);
-        write_bytes(src + "/addr_vertices.abs2", bytes);
-        for (const bool whole : {false, true}) {
-            const int status = exit_status_in_child(
-                [&] {
-#ifndef __SANITIZE_ADDRESS__
-                    struct rlimit as{size_t(4) << 30, size_t(4) << 30};
-                    setrlimit(RLIMIT_AS, &as);
-#endif
-                    gcset::Manifest m;
-                    m.set("addr.n", 1);
-                    if (whole) gcset::addr::decode(src, out, m);
-                    else gcset::addr::decode_points_only(src, m, out);
-                    return 0;
-                },
-                5);
-
-            if (status != 2)
-                std::printf("    count %llu, %s decode: exit %d\n", (unsigned long long)count, whole ? "whole" : "points-only", status);
-            CHECK_EQ(status, 2);
-        }
-    }
-}
-
-// A record of 2^30 vertices with a ten-byte addr_vertices.bin (10 + 4 x 2^30
-// bytes, which a 32-bit size_t wraps to the file's 10) is refused as a
-// truncated file by both encoders: in one pass and its vertices pass.
-TEST(gc_address_encoders_refuse_a_footprint_past_the_end_of_the_file) {
-    ScratchDir dir("gc-addr-enc-end");
-    const std::string src = dir.path() + "/in";
-    std::filesystem::create_directories(src);
-    std::vector<uint8_t> rec(20, 0);
-    put32(rec, 0);           // vertex_offset
-    put32(rec, 0x40000000);  // vertex_count
-    write_bytes(src + "/addr_points.bin", rec);
-    write_bytes(src + "/addr_vertices.bin", std::vector<uint8_t>(10));
-    for (const bool passes : {false, true}) {
-        const std::string out = dir.path() + (passes ? "/passes" : "/one");
-        std::filesystem::create_directories(out);
-        const int status = exit_status_in_child(
-            [&] {
-                gcset::Manifest m;
-                if (passes) {
-                    gcset::want_files() = {"addr_points.bin"};
-                    gcset::addr::encode(src, out, m);
-                    gcset::want_files() = {"addr_vertices.bin"};
-                }
-                gcset::addr::encode(src, out, m);
-                return 0;
-            },
-            5);
-
-        if (status != 2) std::printf("    %s: exit %d\n", passes ? "two passes" : "one pass", status);
-        CHECK_EQ(status, 2);
-    }
-}
-
-// Footprints past abs2's bound round trip through the raw escape, byte for
-// byte: the encoder in one pass and in its two streamed passes, and the
-// decoders whole, points only and vertices only.
-TEST(gc_address_footprints_past_abs2s_bound_round_trip) {
-    ScratchDir dir("gc-addr-big");
-    const std::string& root = dir.path();
-    const std::string src = root + "/src", col = root + "/col";
-    std::filesystem::create_directories(src);
-    const AddrSet set = big_footprints();
-    write_bytes(src + "/addr_points.bin", set.points);
-    write_bytes(src + "/addr_vertices.bin", set.verts);
-    {
-        const std::string dec = col + ".dec";
-        std::filesystem::create_directories(col);
-        std::filesystem::create_directories(dec);
-        gcset::Manifest m;
-        gcset::addr::encode(src, col, m);
-        gcset::addr::decode(col, dec, m);
-
-        CHECK(read_bytes(dec + "/addr_points.bin") == set.points);
-        CHECK(read_bytes(dec + "/addr_vertices.bin") == set.verts);
-    }
-    const std::string split = root + "/split";
-    std::filesystem::create_directories(split);
-    gcset::Manifest ms;
-    gcset::want_files() = {"addr_points.bin"};
-    gcset::addr::encode(src, split, ms);
-    gcset::want_files() = {"addr_vertices.bin"};
-    gcset::addr::encode(src, split, ms);
-    gcset::want_files().clear();
-    for (const char* f : {"/addr_points.col", "/addr_vertices.abs2"}) CHECK(read_bytes(split + f) == read_bytes(col + f));
-    gcset::Manifest m;  // the keys the decoders read
-    m.set("addr.n", uint64_t(set.points.size() / 28));
-    for (const std::string f : {"addr_points.bin", "addr_vertices.bin"}) {
-        const std::string dec = root + "/only." + f;
-        std::filesystem::create_directories(dec);
-        gcset::want_files() = {f};
-        gcset::addr::decode(col, dec, m);
-        gcset::want_files().clear();
-
-        CHECK(read_bytes(dec + "/" + f) == (f == "addr_points.bin" ? set.points : set.verts));
-    }
 }
 
 // When a FIFO's pipe can't be enlarged, the grouped FIFO writers fail at once
@@ -433,90 +177,6 @@ TEST(gc_fifo_writers_fail_when_the_pipe_cannot_grow) {
     CHECK(WIFEXITED(status));
     CHECK_EQ(WEXITSTATUS(status), 2);
     CHECK(said.find("the pipe can't hold") != std::string::npos);
-}
-
-// A source dir, named as itself or through a symlink, is never written to:
-// the encode cases use a today's-format dir, the decode cases gc's encoding
-// of it, so only the alias check stops them. Into a separate dir both round
-// trip.
-TEST(gc_never_writes_its_source_dir) {
-    ScratchDir dir("gc-cli");
-    const std::string& root = dir.path();
-    const std::string src = root + "/source", encoded = root + "/encoded", log = root + "/gc.log";
-    addr_today_set(src);
-    REQUIRE(run_gc({"encode", src, encoded}, log).ok);
-    REQUIRE(std::filesystem::exists(encoded + "/gc.manifest"));
-    for (const auto& [mode, source] : {std::pair<std::string, std::string>{"encode", src}, {"decode", encoded}}) {
-        const std::string alias = source + ".alias";
-        std::filesystem::create_directory_symlink(source, alias);
-        for (const std::string& dest : {source, alias}) {
-            const auto before = gctest::read_dir(source);
-
-            auto r = run_gc({mode, source, dest}, log);
-
-            CHECK(!r.ok);
-            CHECK(gctest::read_dir(source) == before);
-        }
-    }
-    REQUIRE(run_gc({"encode", src, root + "/separate.encode"}, log).ok);
-    REQUIRE(run_gc({"decode", encoded, root + "/separate.decode"}, log).ok);
-    CHECK(gctest::read_dir(root + "/separate.encode") == gctest::read_dir(encoded));
-    CHECK(gctest::read_dir(root + "/separate.decode") == gctest::read_dir(src));
-}
-
-// A dir decoded in part (--only), the other families' encoded files linked
-// across, is an encoded set of those families: its gc.manifest names them,
-// and it decodes to the whole today's dir.
-TEST(gc_decode_of_some_families_leaves_an_encoded_set_of_the_rest) {
-    ScratchDir dir("gc-decode-part");
-    const std::string& root = dir.path();
-    const std::string src = root + "/source", enc = root + "/encoded", part = root + "/part", log = root + "/gc.log";
-    addr_today_set(src);
-    street_today_set(src);
-    REQUIRE(run_gc({"encode", src, enc}, log).ok);
-    REQUIRE(run_gc({"decode", enc, part, "--only", "streets"}, log).ok);
-    const auto manifest = read_file(part + "/gc.manifest");
-
-    auto r = run_gc({"decode", part, root + "/whole"}, log);
-
-    CHECK(std::string(manifest.begin(), manifest.end()).find("gc.families addr\n") != std::string::npos);
-    CHECK(r.ok);
-    CHECK(r.ok && gctest::read_dir(root + "/whole") == gctest::read_dir(src));
-}
-
-// A run writing a set refuses an OUT_DIR holding files (here an earlier
-// encoded set: a decode beside its gc.manifest would read as that set) and
-// leaves it as it was; an empty one it uses. A streamed pass (--files) writes
-// into a dir its caller owns: the second pass of a two-pass decode, beside
-// the first's file.
-TEST(gc_refuses_an_out_dir_holding_files) {
-    ScratchDir dir("gc-out-dir");
-    const std::string& root = dir.path();
-    const std::string src = root + "/source", enc = root + "/encoded", log = root + "/gc.log";
-    addr_today_set(src);
-    REQUIRE(run_gc({"encode", src, enc}, log).ok);
-    const std::vector<std::vector<std::string>> runs = {{"decode", enc}, {"decode", enc, "--only", "addr"}, {"encode", src}};
-    for (size_t k = 0; k < runs.size(); k++) {
-        const std::string reused = root + "/reused" + std::to_string(k);
-        std::filesystem::copy(enc, reused);
-        const auto before = gctest::read_dir(reused);
-        std::vector<std::string> args = runs[k];
-        args.insert(args.begin() + 2, reused);
-
-        auto r = run_gc(args, log);
-
-        CHECK(!r.ok);
-        CHECK(r.log.find("OUT_DIR " + reused + " is not empty") != std::string::npos);
-        CHECK(gctest::read_dir(reused) == before);
-    }
-    const std::string empty = root + "/empty", streamed = root + "/streamed";
-    std::filesystem::create_directories(empty);
-    REQUIRE(run_gc({"decode", enc, empty}, log).ok);
-    CHECK(gctest::read_dir(empty) == gctest::read_dir(src));
-    REQUIRE(run_gc({"decode", enc, streamed, "--files", "addr_vertices.bin", "--no-link"}, log).ok);
-    auto r = run_gc({"decode", enc, streamed, "--files", "addr_points.bin", "--no-link"}, log);
-    CHECK(r.ok);
-    for (const char* f : {"/addr_points.bin", "/addr_vertices.bin"}) CHECK(read_bytes(streamed + f) == read_bytes(src + f));
 }
 
 // An encoded dir is refused as encode input, whole or one more family with

@@ -87,6 +87,9 @@ static constexpr size_t POI_RECORD_STRIDE = 36;
 static constexpr size_t PLACE_NODE_STRIDE = 24;
 // The client files place_nodes.bin's section writes besides it.
 static constexpr const char* PLACE_SIDE_FILES[] = {"place_cells.bin", "place_hidden.bin"};
+// The client file addr_points.bin's and addr_vertices.bin's sections write
+// besides them (addr_files.h).
+static constexpr const char* ADDR_SIDE_FILES[] = {"addr_index.bin"};
 
 // name_id byte offset within a street WayHeader record.
 static constexpr size_t WAY_HEADER_NAME_ID_OFF = 8;

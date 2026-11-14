@@ -155,6 +155,13 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
   a file of node blocks a kind; the diff decodes each pair a dir holds into its logical form
   (today's 12- and 24-byte records and their nodes, 8 bytes each) and merges those. A dir without
   street files of its own merges no streets: no other dir's are read for it.
+  The address points and their footprints are the address files on disk (`src/addr_files.h`):
+  blocks of 16 records in `addr_points.bin`, a blob a footprint in `addr_vertices.bin`, and
+  `addr_index.bin`, which places both; the diff decodes the three into their logical form
+  (today's 28-byte records and their footprints' vertex blocks back to back) and merges those,
+  and the patch lists `addr_index.bin` with no section of its own. Address files of no address
+  are three footers, which merge as a dir without the files does; a dir that gets its first
+  address point or loses its last has no patch (the diff says so and exits 2).
   The string tiers are FCC2 files, front-coded buckets cut by content (`src/string_files.h`);
   the diff decodes each tier it reads into its pool and diffs the pools.
   The four per-record side files (`way_parents.bin`, `way_postcodes.bin`, `interp_postcodes.bin`,
@@ -162,7 +169,7 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
   its u32 values, and a side file's section carries those: its sizes are 4 bytes a value, and a
   file the old day lacks goes as a full replacement of its values.
   `geocoder-diff --decode-logical DIR OUT` writes the logical files it would read of DIR's way,
-  POI, place and side files into OUT, a new or empty dir, and no patch.
+  address, POI, place and side files into OUT, a new or empty dir, and no patch.
   `geocoder-diff --logical-size DIR` prints the bytes a diff maps for DIR's record files and the
   bytes it writes to scratch for DIR, from file sizes and footers alone;
   `tools/generate_patches.sh` starts its diffs and verifies by them, within a memory budget and
@@ -172,19 +179,21 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
   `cmake -DGEOCODER_PATCH_LIBZSTD=OFF` builds it on the `zstd` command on PATH instead, for a host
   without libzstd
 - **patch_format.h** (`tools/patch_format.h`): Shared format definitions + rebuild functions
-- **geocoder-gc** (`tools/gc.cpp`, `tools/gc_*.h`): Encodes a variant dir into the compact installed
+- **geocoder-gc** (`tools/gc.cpp`, `tools/gc_io.h`): Encodes a variant dir into the compact installed
   set (the encoded files and a `gc.manifest`) and decodes one back to today's files, byte for byte,
-  each into a new or empty dir. The way files, the POI files and the side files are compact in
-  every dir, and it links them as they are
+  each into a new or empty dir. It encodes no family: the way files, the address files, the POI
+  files and the side files are compact in every dir, and it links them as they are
 - **gcs_\*.h** (`tools/gcs_patch.h`, `gcs_codec.h`, `gcs_io.h`, `gcs_async.h`): geocoder-patch's
   in-process codecs. The POI files are decoded and their new ones encoded in every dir (one record
   and one polygon in flight; a polygon past 256 KiB a piece at a time), and so are the way files
-  (one way and its nodes in flight, 512 KiB of them at most) and the side files (a block of 64
-  values in flight, the new file's block table in a scratch file beside it until the file is
-  closed). In low-memory mode, when the old dir is an encoded installed set (a `gc.manifest`
-  beside the files, as geocoder-gc writes it), gc's family too, and the output is the new encoded
-  set, geocoder-gc's encoding of the new dir. An encoded family's records and their child stream
-  replay together; `--threads` gives each codec a thread
+  (one way and its nodes in flight, 512 KiB of them at most), the address files (a block of 16
+  records, an index row and one footprint in flight, 256 KiB of it at most; an escaped footprint,
+  of any size, a piece at a time) and the side files (a block of 64 values in flight, the new
+  file's block table in a scratch file beside it until the file is closed). In low-memory mode,
+  when the old dir is an encoded installed set (a `gc.manifest` beside the files, as geocoder-gc
+  writes it), the output is the new encoded set, geocoder-gc's encoding of the new dir. An
+  encoded family's records and their child stream replay together; `--threads` gives each codec
+  a thread
 
 ### Patcher memory and speed
 

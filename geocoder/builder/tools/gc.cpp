@@ -9,13 +9,14 @@
 // length), --no-link (don't hardlink the other files), --manifest-out FILE (write the manifest
 // there: each streamed pass writes its own, the caller merges them).
 //
-// Families (each runs when its input files are present): addr. The street and the interpolation
-// ways (src/way_files.h), the POI files (R2 and V2, src/poi_files.h) and the side files
-// (src/side_blocks.h) are compact in every dir already and are hardlinked as they are.
+// Families (each runs when its input files are present): none. The street and the interpolation
+// ways (src/way_files.h), the address files (src/addr_files.h), the POI files (R2 and V2,
+// src/poi_files.h) and the side files (src/side_blocks.h) are compact in every dir already and
+// are hardlinked as they are.
 // Every other file is hardlinked (copied across filesystems). OUT_DIR, new or empty, gets gc.manifest
 // (counts and parameters the decoder needs). Prints one "phase" line per family: wall and CPU
 // seconds, bytes in/out.
-#include "gc_addr.h"
+#include "gc_io.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -35,15 +36,7 @@ struct Family {
     std::function<void(const std::string&, const std::string&, const Manifest&)> dec;
 };
 
-static std::vector<Family> families() {
-    using V = std::vector<std::string>;
-    std::vector<Family> f;
-    f.push_back({"addr", {"addr_points.bin", "addr_vertices.bin"}, {},
-                 [](const Manifest&) { return V{"addr_points.col", "addr_vertices.abs2"}; },
-                 [](auto& s, auto& o, Manifest& m) { addr::encode(s, o, m); },
-                 [](auto& s, auto& o, const Manifest& m) { addr::decode(s, o, m); }});
-    return f;
-}
+static std::vector<Family> families() { return {}; }
 
 static std::set<std::string> split(const std::string& s) {
     std::set<std::string> out;

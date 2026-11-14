@@ -3,7 +3,6 @@
 // byte for byte, and malformed encoded sets fail with an error instead of
 // decoding wrong bytes or exhausting memory.
 #include "gcs_codec.h"
-#include "gc_addr.h"
 
 #include <cerrno>
 #include <csignal>
@@ -219,34 +218,44 @@ uint32_t f32_bits(float f) {
     return b;
 }
 
-// A synthetic address set: addr_points.bin records (28 bytes, the vertex
-// offset and count last) and their footprints (a 10-byte header: encoding, pad
-// byte, then the base latitude and longitude bits; then vc vertices, 8 random
-// bytes each at encoding 3, else two u16 below span; a closed ring repeats its
-// first vertex last). sizes: each record's footprint bytes (0: none).
+// A logical address pair (addr_files.h): the points' records, 28 bytes each
+// with the vertex offset and count last, and their footprints' logical blobs
+// back to back (a 10-byte header: the encoding, a zero byte, the bbox
+// minimum's latitude and longitude bits; then 4 bytes a vertex, 8 in encoding
+// 3). sizes: each record's footprint bytes (0: none).
+struct AddrSet {
+    std::vector<uint8_t> points, verts;
+    std::vector<size_t> sizes;
+};
+// A record: a point (vc 0), a dead slot, or a footprint of vc vertices in an
+// encoding, 8 random bytes each in encoding 3, else two u16 below span; a
+// closed one repeats its first vertex last.
 struct AddrSpec {
     uint32_t vc;
     uint8_t enc;
     bool closed;
     uint32_t span;
-    uint8_t pad = 0;
+    bool dead = false;
 };
-struct AddrSet {
-    std::vector<uint8_t> points, verts;
-    std::vector<size_t> sizes;
-};
+// The pair of specs' records, the points anywhere, a few streets and parent
+// ways among them. Half the footprints have their bbox minimum at their
+// point, so a narrow one's goes as its residuals; the others' is anywhere.
 AddrSet addr_set(const std::vector<AddrSpec>& specs, std::mt19937& rng) {
     AddrSet s;
     for (const AddrSpec& sp : specs) {
-        uint32_t rec[7] = {f32_bits(float(rng() % 1800000) / 1e4f - 90.f), f32_bits(float(rng() % 3600000) / 1e4f - 180.f),
-                           uint32_t(rng()), uint32_t(rng()), uint32_t(rng()), NO, 0};
+        const uint32_t lat = f32_bits(float(rng() % 1800000) / 1e4f - 90.f);
+        const uint32_t lng = f32_bits(float(rng() % 3600000) / 1e4f - 180.f);
+        const uint32_t street = 1000 + uint32_t(rng() % 6);
+        uint32_t rec[7] = {lat, lng, uint32_t(rng() % 5000), street, rng() % 4 ? street + 7 : uint32_t(rng()), NO, 0};
+        if (sp.dead) rec[0] = rec[1] = rec[2] = rec[3] = 0, rec[4] = NO;
         const size_t first = s.verts.size();
         if (sp.vc) {
             rec[5] = uint32_t(first);
             rec[6] = sp.vc;
-            uint8_t h[10] = {sp.enc, sp.pad};
-            wr32(h + 2, f32_bits(float(rng() % 1800000) / 1e4f - 90.f));
-            wr32(h + 6, f32_bits(float(rng() % 3600000) / 1e4f - 180.f));
+            uint8_t h[10] = {sp.enc, 0};
+            const bool at_point = rng() % 2;
+            wr32(h + 2, at_point ? lat : f32_bits(float(rng() % 1800000) / 1e4f - 90.f));
+            wr32(h + 6, at_point ? lng : f32_bits(float(rng() % 3600000) / 1e4f - 180.f));
             s.verts.insert(s.verts.end(), h, h + 10);
             const size_t vs = sp.enc == 3 ? 8 : 4, first_vertex = s.verts.size();
             for (uint32_t k = 0; k < sp.vc; k++) {
@@ -268,19 +277,89 @@ AddrSet addr_set(const std::vector<AddrSpec>& specs, std::mt19937& rng) {
     return s;
 }
 
-// Whether geocoder-gc encodes the set's today's files (written to dir/today)
-// into the encoded files in dir, byte for byte.
-bool gc_encodes_the_same(const AddrSet& s, const std::string& dir) {
-    const std::string today = dir + "/today", gc = dir + "/gc";
-    std::filesystem::create_directories(today);
-    std::filesystem::create_directories(gc);
-    write_bytes(today + "/addr_points.bin", s.points);
-    write_bytes(today + "/addr_vertices.bin", s.verts);
-    gcset::Manifest gm;
-    gcset::addr::encode(today, gc, gm);
-    bool same = true;
-    for (const char* f : {"/addr_points.col", "/addr_vertices.abs2"}) same &= slurp(gc + f) == slurp(dir + f);
-    return same;
+// n records: a point in five, a dead slot in seventeen, an escape in forty
+// (encoding 3, of 1 to 6 vertices), the others footprints of 1 to 12 vertices
+// in encodings 0 to 2, closed and open, narrow and wide.
+std::vector<AddrSpec> addr_specs(size_t n, std::mt19937& rng) {
+    std::vector<AddrSpec> specs(n);
+    for (size_t i = 0; i < n; i++) {
+        const uint32_t vc = 1 + uint32_t(rng() % 12);
+        const uint32_t spans[] = {40, 300, 65536};
+        specs[i] = i % 5 == 0    ? AddrSpec{0, 0, false, 0}
+                   : i % 17 == 3 ? AddrSpec{0, 0, false, 0, true}
+                   : i % 40 == 39 ? AddrSpec{1 + uint32_t(rng() % 6), 3, false, 0}
+                                  : AddrSpec{vc, uint8_t(rng() % 3), vc >= 2 && rng() % 2 == 0, spans[rng() % 3]};
+    }
+    return specs;
+}
+
+// The three files the builder writes of a pair (addr_files::encode), by name.
+std::map<std::string, std::vector<char>> addr_files_of(const AddrSet& s) {
+    const addr_files::Files f = addr_files::encode(s.points.data(), s.points.size() / 28, s.verts.data(), s.verts.size());
+    return {{addr_files::POINTS_FILE, std::vector<char>(f.points.begin(), f.points.end())},
+            {addr_files::VERTICES_FILE, std::vector<char>(f.vertices.begin(), f.vertices.end())},
+            {addr_files::INDEX_FILE, std::vector<char>(f.index.begin(), f.index.end())}};
+}
+
+// Encodes a pair record by record into dir, each record and its footprint in
+// pieces of up to max_piece bytes, every third record's footprint before its
+// record.
+void encode_addrs(const AddrSet& s, const std::string& dir, std::mt19937& rng, size_t max_piece) {
+    addr::Enc enc(dir);
+    enc.state = {1, 1};
+    size_t vp = 0;
+    for (size_t i = 0; i < s.sizes.size(); i++) {
+        if (i % 3 != 2) write_in_pieces(enc, 0, &s.points[28 * i], 28, rng, max_piece);
+        if (s.sizes[i]) write_in_pieces(enc, 1, &s.verts[vp], s.sizes[i], rng, max_piece);
+        if (i % 3 == 2) write_in_pieces(enc, 0, &s.points[28 * i], 28, rng, max_piece);
+        vp += s.sizes[i];
+    }
+    finish_all(enc);
+}
+
+// A pair read back as the patcher reads it: each record, then its footprint
+// in views of 64 KiB. Whether the decoder gave every byte and then ended.
+bool read_addrs(addr::Dec& dec, const AddrSet& s, AddrSet& out) {
+    for (auto& st : dec.state) st = 1;
+    std::vector<char> view(size_t(64) << 10);
+    auto read = [&](int port, size_t n, std::vector<uint8_t>& to) {
+        while (n) {
+            const size_t k = dec.read(port, view.data(), std::min(n, view.size()));
+            if (!k) return false;
+            to.insert(to.end(), view.data(), view.data() + k);
+            n -= k;
+        }
+        return true;
+    };
+    bool complete = true;
+    for (const size_t size : s.sizes) complete &= read(0, 28, out.points) && read(1, size, out.verts);
+    return complete && dec.read(0, view.data(), 1) == 0 && dec.read(1, view.data(), 1) == 0;
+}
+
+// The address files of one record at 48, 11 whose blob is `blob` and then
+// zeros up to len bytes (a hole in the file), their footers giving `logical`
+// bytes of footprints: files no encoder writes, block and index as one would.
+void write_one_address(const std::string& dir, const std::vector<uint8_t>& blob, uint32_t len, uint64_t logical) {
+    addr_files::Block b;
+    b.records = 1;
+    b.lat[0] = f32_bits(48.0f);
+    b.lng[0] = f32_bits(11.0f);
+    b.len[0] = len;
+    std::vector<uint8_t> points(addr_files::BLOCK_MAX_BYTES + 8);
+    std::vector<uint8_t> index(addr_files::INDEX_HEAD_BYTES + addr_files::INDEX_ENTRY_BYTES, 0);
+    points.resize(addr_files::encode_block(b, points.data()));
+    const auto points_footer = addr_files::points_footer(1);
+    const auto vertices_footer = addr_files::vertices_footer(logical, 1);
+    const auto index_footer = addr_files::index_footer(1);
+    points.insert(points.end(), points_footer.begin(), points_footer.end());
+    index.insert(index.end(), index_footer.begin(), index_footer.end());
+    write_bytes(dir + "/" + addr_files::POINTS_FILE, points);
+    write_bytes(dir + "/" + addr_files::INDEX_FILE, index);
+    const std::string vertices = dir + "/" + addr_files::VERTICES_FILE;
+    write_bytes(vertices, blob);
+    std::filesystem::resize_file(vertices, len);
+    std::ofstream out(vertices, std::ios::binary | std::ios::app);
+    out.write(reinterpret_cast<const char*>(vertices_footer.data()), std::streamsize(vertices_footer.size()));
 }
 
 // The families of the four side files, each <family>.bin.
@@ -652,224 +731,427 @@ TEST(gcs_encoder_queues_one_large_write_a_piece_at_a_time) {
     }
 }
 
-TEST(gcs_addr_footprints_past_the_abs2_bound_round_trip) {
-    // Footprints of more than ABS2_MAX_VERTICES vertices (70000 open, 70001
-    // closed, which is 70000 once the closing vertex is dropped, 80000,
-    // 120000) go through the raw escape; 69999 still fits abs2. Narrow (u8)
-    // and wide (u16) values, every encoding. The encoder (fed in odd pieces)
-    // writes geocoder-gc's files, and its decoder reads them back.
-    std::mt19937 rng(20261027);
-    const AddrSet s = addr_set({{0, 0, false, 0},
-                                {70000, 0, false, 65536},
-                                {5, 1, true, 200},
-                                {69999, 2, false, 65536},
-                                {70001, 0, true, 65536},
-                                {0, 0, false, 0},
-                                {70000, 1, false, 256 - 1},
-                                {3, 3, false, 65536},
-                                {80000, 3, false, 65536},
-                                {120000, 2, true, 200}},
-                               rng);
-    ScratchDir dir("gcs-test");
-    addr::Enc enc(dir.path(), s.points.size());
-    enc.state = {1, 1};
-    size_t vp = 0;
-    for (size_t i = 0; i < s.sizes.size(); i++) {
-        enc.write(0, &s.points[28 * i], 28);
-        write_in_pieces(enc, 1, &s.verts[vp], s.sizes[i], rng, 65521);
-        vp += s.sizes[i];
-    }
-    const Manifest m = finish_all(enc);
-    addr::Dec dec(dir.path(), m);
-    const auto out = decode_all(dec);
-    CHECK(out[0] == s.points);
-    CHECK(out[1] == s.verts);
-    // The files geocoder-gc encodes from the same today's files, byte for byte.
-    CHECK(gc_encodes_the_same(s, dir.path()));
-}
+TEST(gcs_addr_round_trip_in_odd_pieces_and_equal_the_builders_encoder) {
+    // Address points written a record and its footprint at a time, in pieces
+    // that cut them anywhere (of 1 to 7 bytes, and of up to 5000), give the
+    // builder's three files, whatever their count: none (the three footers
+    // alone), one, a block less one, a block, a block and one, and two
+    // superblocks, with points, dead slots, footprints of every encoding and
+    // escapes among them. The decoder gives the pair back, and the decoded
+    // sizes are the footers' without a decoder.
+    std::mt19937 rng(20261114);
+    for (const size_t n : {size_t(0), size_t(1), size_t(15), size_t(16), size_t(17), size_t(1100)})
+        for (const size_t max_piece : {size_t(7), size_t(5000)}) {
+            const AddrSet s = addr_set(addr_specs(n, rng), rng);
+            ScratchDir dir("gcs-test");
+            encode_addrs(s, dir.path(), rng, max_piece);
 
-TEST(gcs_addr_codecs_copy_an_escaped_footprint_through_in_pieces) {
-    // An escaped footprint (encoding 3) of 80K and of 800K vertices, 640 KB
-    // and 6.4 MB, among small abs2 ones and a small one escaped for its pad
-    // byte, each file in one write (as the patcher's FILE passes a long
-    // stretch) and read back as the patcher reads them (a record, then its
-    // footprint in 64 KiB views): at both sizes the encoder's queue holds at
-    // most a piece and the decoder's a READ_BUF, each with the largest
-    // footprint here either takes whole (the closed abs2 one, 10 + 4 * 9 B),
-    // and the decoder's footprint reader a READ_BUF and its slack; the files
-    // decode back to the same bytes, and geocoder-gc encodes the same files.
-    const size_t whole = 10 + 4 * 9;
-    std::mt19937 rng(20261030);
-    for (const uint32_t big : {80000u, 800000u}) {
-        const AddrSet s = addr_set({{5, 1, true, 200}, {big, 3, false, 0}, {0, 0, false, 0}, {12, 2, false, 65536, 7}, {9, 0, true, 256 - 1}}, rng);
-        ScratchDir dir("gcs-test");
-        addr::Enc enc(dir.path(), s.points.size());
-        enc.state = {1, 1};
-        enc.expect = {s.points.size(), s.verts.size()};
-        enc.write(0, s.points.data(), s.points.size());
-        enc.write(1, s.verts.data(), s.verts.size());
-        const size_t encoder_peak = std::max(enc.peak(0), enc.peak(1));
-        const Manifest m = finish_all(enc);
-
-        addr::Dec dec(dir.path(), m);
-        for (auto& st : dec.state) st = 1;
-        std::vector<uint8_t> points, verts;
-        std::vector<char> view(size_t(64) << 10);
-        auto read = [&](int port, size_t n, std::vector<uint8_t>& out) {
-            while (n) {
-                const size_t k = dec.read(port, view.data(), std::min(n, view.size()));
-                if (!k) return false;
-                out.insert(out.end(), view.data(), view.data() + k);
-                n -= k;
-            }
-            return true;
-        };
-        bool complete = true;
-        for (const size_t size : s.sizes) complete &= read(0, 28, points) && read(1, size, verts);
-        const size_t decoder_peak = std::max(dec.peak(0), dec.peak(1)), reader = dec.A->buf.size();
-        std::printf("    %u vertices: encoder queue peak %zu B, decoder queue peak %zu B, footprint reader %zu B\n", big, encoder_peak,
-                    decoder_peak, reader);
-
-        CHECK(encoder_peak <= ENCODER_PIECE + whole);
-        CHECK(decoder_peak <= READ_BUF + whole);
-        CHECK(reader <= READ_BUF + READ_SLACK);
-        CHECK(complete);
-        CHECK(dec.read(0, view.data(), 1) == 0);
-        CHECK(points == s.points);
-        CHECK(verts == s.verts);
-        CHECK(gc_encodes_the_same(s, dir.path()));
-    }
-}
-
-TEST(gcs_addr_encoder_holds_at_most_a_piece_and_the_largest_abs2_footprint) {
-    // addr_vertices.bin in one write (as the patcher's FILE passes an INSERT
-    // stretch), which the encoder takes a piece (64 KiB) at a time: its queue
-    // peaks at no more than a piece and the largest footprint it takes whole,
-    // an abs2 one of ABS2_MAX_VERTICES vertices (10 + 4 x 69,999 =
-    // 280,006 B), and the files are geocoder-gc's. The case comes within 2
-    // bytes of that: 47,676 B of footprints before the largest put its last
-    // 2 bytes at the start of a piece, so the queue holds the rest of it and
-    // then that whole piece (another of the largest follows), 64 KiB +
-    // 280,004 B, past the 320 KiB a POI encoder may hold.
-    const size_t largest = 10 + 4 * size_t(addr::ABS2_MAX_VERTICES);
-    std::mt19937 rng(20261030);
-    const AddrSet s = addr_set({{5000, 1, false, 65536},
-                                {6914, 2, true, 200},
-                                {addr::ABS2_MAX_VERTICES, 0, false, 65536},
-                                {0, 0, false, 0},
-                                {addr::ABS2_MAX_VERTICES, 1, true, 256 - 1}},
-                               rng);
-    REQUIRE(s.sizes[0] + s.sizes[1] == 47676 && s.sizes[2] == largest);
-    ScratchDir dir("gcs-test");
-    addr::Enc enc(dir.path(), s.points.size());
-    enc.state = {1, 1};
-    enc.expect = {s.points.size(), s.verts.size()};
-    enc.write(0, s.points.data(), s.points.size());
-    enc.write(1, s.verts.data(), s.verts.size());
-    std::printf("    %zu B in one write: queue peaks %zu %zu B\n", s.verts.size(), enc.peak(0), enc.peak(1));
-    CHECK(enc.peak(1) <= ENCODER_PIECE + largest);
-    finish_all(enc);
-    CHECK(gc_encodes_the_same(s, dir.path()));
-}
-
-TEST(gcs_addr_encoder_refuses_a_stream_ending_inside_an_escaped_footprint) {
-    // The encoder copies an escaped footprint through as it comes, its record
-    // already encoded: a stream that ends inside it is refused at the finish,
-    // not taken as a shorter file. It follows the largest abs2 footprint,
-    // whose wait grows the queue past what it keeps once drained, so the
-    // finish pumps an empty queue without a buffer.
-    std::mt19937 rng(20261030);
-    const AddrSet s = addr_set({{69999, 0, false, 65536}, {3, 3, false, 0}}, rng);
-    ScratchDir dir("gcs-test");
-    addr::Enc enc(dir.path(), s.points.size());
-    enc.state = {1, 1};
-    enc.write(0, s.points.data(), s.points.size());
-    enc.write(1, s.verts.data(), s.verts.size() - 1);
-
-    CHECK_EQ(refusal_of([&] { finish_all(enc); }), std::string("gcs: addr_vertices: stream ends inside a footprint"));
-}
-
-TEST(gcs_addr_decoder_rejects_a_footprint_count_past_its_record) {
-    // One record whose footprint is an abs2 blob (tag 0x04: 2 + 2 count bytes
-    // per vertex after an 8-byte bmin) or the raw escape (tag 0x20: today's
-    // block, 10 + 4 count bytes), whose count must fit the record's u32.
-    ScratchDir dir("gcs-test");
-    write_bytes(dir.path() + "/addr_points.col", std::vector<uint8_t>(24));
-    for (const uint8_t tag : {uint8_t(0x04), uint8_t(0x20)})
-        for (const uint64_t count : {uint64_t(5), (uint64_t(1) << 32) + 5, (uint64_t(1) << 63) + 5}) {
-            std::vector<uint8_t> bytes{tag};
-            uv(bytes, count);
-            bytes.resize(bytes.size() + (tag == 0x20 ? 30 : 28));
-            write_bytes(dir.path() + "/addr_vertices.abs2", bytes);
-            const int status = exit_status_in_child(
-                [&] {
-                    return refusal_code(
-                        [&] {
-                            Manifest m;
-                            m.set("addr.n", 1);
-                            addr::Dec dec(dir.path(), m);
-                            while (dec.step()) {}
-                        },
-                        "gcs: addr 0: bad count");
-                },
-                5);
-            CHECK_EQ(status, count == 5 ? 0 : 2);
+            const auto files = dir_files(dir.path());
+            CHECK(files == addr_files_of(s));
+            if (n == 0)
+                CHECK(files.at("addr_points.bin").size() == 8 && files.at("addr_vertices.bin").size() == 16 &&
+                      files.at("addr_index.bin").size() == 8);
+            CHECK_EQ(addr::decoded_size(dir.path(), 0), uint64_t(s.points.size()));
+            CHECK_EQ(addr::decoded_size(dir.path(), 1), uint64_t(s.verts.size()));
+            addr::Dec dec(dir.path());
+            CHECK_EQ(dec.decoded_size(0), uint64_t(s.points.size()));
+            CHECK_EQ(dec.decoded_size(1), uint64_t(s.verts.size()));
+            const auto out = decode_all(dec);
+            CHECK(out[0] == s.points);
+            CHECK(out[1] == s.verts);
         }
 }
 
-TEST(gcs_addr_decoder_refuses_a_footprint_past_the_end_before_reading_it) {
-    // An escaped footprint (tag 0x20) whose count fits the record's u32 but
-    // not the file is refused as a truncated file, and the reader's buffer
-    // never grows to the footprint: 4 MiB, or 16 GiB at the largest count
-    // (each case in a child whose address space can't hold that); and 2^30
-    // vertices in a ten-byte payload (10 + 4 x 2^30 bytes, which a 32-bit
-    // size_t wraps to the payload's 10).
+TEST(gcs_addr_decoder_takes_a_dir_without_its_files_as_no_addresses_and_refuses_part_of_them) {
+    // A variant without addresses has none of the three files: it decodes to
+    // no records, beside another family's file. A dir with two of the three
+    // is refused by name, by the decoder and by the decoded size alone.
+    std::mt19937 rng(20261114);
     ScratchDir dir("gcs-test");
-    write_bytes(dir.path() + "/addr_points.col", std::vector<uint8_t>(24));
-    for (const auto& [count, payload] :
-         {std::pair<uint64_t, size_t>{uint64_t(1) << 20, 30}, {0xFFFFFFFF, 30}, {0x40000000, 10}}) {
-        std::vector<uint8_t> bytes{0x20};
-        uv(bytes, count);
-        // The footprint starts past its tag and count.
-        const std::string refusal = "gcs: " + dir.path() + "/addr_vertices.abs2: unexpected end of file at " +
-                                    std::to_string(bytes.size()) + " (need 10 + " + std::to_string(count) + " x 4 bytes, " +
-                                    std::to_string(payload) + " left)";
-        bytes.resize(bytes.size() + payload);
-        write_bytes(dir.path() + "/addr_vertices.abs2", bytes);
+    write_bytes(dir.path() + "/addr_postcodes.bin", std::vector<uint8_t>(40, 0x5A));
+
+    for (int port = 0; port < 2; port++) CHECK_EQ(addr::decoded_size(dir.path(), port), uint64_t(0));
+    addr::Dec none(dir.path());
+    CHECK_EQ(none.decoded_size(0) + none.decoded_size(1), uint64_t(0));
+    const auto out = decode_all(none);
+    CHECK(out[0].empty() && out[1].empty());
+
+    const std::string refusal =
+        "Malformed address files: a dir with some of addr_points.bin, addr_vertices.bin and addr_index.bin and not all three";
+    for (const char* gone : {"addr_points.bin", "addr_vertices.bin", "addr_index.bin"}) {
+        ScratchDir part("gcs-test");
+        encode_addrs(addr_set(addr_specs(20, rng), rng), part.path(), rng, 100);
+        REQUIRE(std::filesystem::remove(part.path() + "/" + gone));
+
+        CHECK_EQ(refusal_of([&] { addr::Dec dec(part.path()); }), refusal);
+        CHECK_EQ(refusal_of([&] { addr::decoded_size(part.path(), 0); }), refusal);
+    }
+}
+
+TEST(gcs_addr_codec_refuses_a_footprint_stream_past_the_limit_by_the_footers_alone) {
+    // The logical addr_vertices.bin is a byte stream a patch indexes in a u32
+    // below NO_DATA, and a vertex_offset is one. Files whose footer gives a
+    // byte more are refused by the file's name and the bytes, by the decoded
+    // size and by the decoder as it is made: before a block is read, though
+    // the first is one no encoder writes. At the limit the footer passes, and
+    // the decoder refuses that first block.
+    std::mt19937 rng(20261114);
+    ScratchDir dir("gcs-test");
+    encode_addrs(addr_set(addr_specs(20, rng), rng), dir.path(), rng, 100);
+    std::vector<char> points = slurp(dir.path() + "/addr_points.bin"), vertices = slurp(dir.path() + "/addr_vertices.bin");
+    points[0] = char(0xFF);
+    write_bytes(dir.path() + "/addr_points.bin", std::vector<uint8_t>(points.begin(), points.end()));
+    auto with_logical_bytes = [&](uint64_t bytes) {
+        wr64(reinterpret_cast<uint8_t*>(&vertices[vertices.size() - 16]), bytes);
+        write_bytes(dir.path() + "/addr_vertices.bin", std::vector<uint8_t>(vertices.begin(), vertices.end()));
+    };
+    const std::string past =
+        "Malformed address files: a logical addr_vertices.bin of 4294967295 bytes is more than the 4294967294 a patch can index";
+
+    with_logical_bytes(0xFFFFFFFF);
+    CHECK_EQ(refusal_of([&] { addr::decoded_size(dir.path(), 1); }), past);
+    CHECK_EQ(refusal_of([&] { addr::Dec dec(dir.path()); }), past);
+
+    with_logical_bytes(0xFFFFFFFE);
+    CHECK_EQ(addr::decoded_size(dir.path(), 1), uint64_t(0xFFFFFFFE));
+    CHECK_EQ(refusal_of([&] {
+                 addr::Dec dec(dir.path());
+                 decode_all(dec);
+             }),
+             std::string("Malformed address files: addr_points.bin block 0 has a flag no block has"));
+}
+
+TEST(gcs_addr_decoder_refuses_what_the_strict_decoder_refuses) {
+    // The three files of 40 records, damaged 600 times: bytes of the blocks,
+    // of the blobs, of the index or of a footer overwritten, a file's first
+    // byte cut, a byte added or cut before a footer, a file gone or its last
+    // byte cut, a block or a superblock a byte further in the index, a byte or
+    // a blob more in the footer's counts, and every twelfth time nothing. The
+    // decoder, which reads a record at a time, refuses each with the message
+    // of addr_files::decode, which reads the three files whole, and gives
+    // that one's pair where it takes the files. The decoded size alone
+    // refuses what the three footers show.
+    std::mt19937 rng(20261114);
+    auto u8 = [](const std::vector<char>& v) { return std::vector<uint8_t>(v.begin(), v.end()); };
+    const AddrSet s = addr_set(addr_specs(40, rng), rng);
+    const auto written = addr_files_of(s);
+    const std::vector<uint8_t> blocks = u8(written.at("addr_points.bin")), blobs = u8(written.at("addr_vertices.bin")),
+                               rows = u8(written.at("addr_index.bin"));
+    size_t refused = 0, taken = 0, by_footers = 0, differ = 0;
+    for (int round = 0; round < 600; round++) {
+        std::vector<uint8_t> p = blocks, v = blobs, x = rows;
+        bool has[3] = {true, true, true};
+        auto overwrite = [&](std::vector<uint8_t>& f) { f[rng() % f.size()] = uint8_t(rng()); };
+        switch (round % 12) {
+        case 0: overwrite(p); break;
+        case 1: overwrite(v); break;
+        case 2: overwrite(x); break;
+        case 3:
+            for (int k = 0; k < 3; k++) overwrite(rng() % 3 == 0 ? p : rng() % 2 ? v : x);
+            break;
+        case 4: {
+            std::vector<uint8_t>& f = rng() % 2 ? p : v;
+            f.erase(f.begin());
+            break;
+        }
+        case 5:
+            if (round % 24 < 12) v.insert(v.end() - 16, uint8_t(rng()));
+            else v.erase(v.end() - 17);
+            break;
+        case 6:
+            if (round % 24 < 12) p.insert(p.end() - 8, uint8_t(rng()));
+            else p.erase(p.end() - 9);
+            break;
+        case 7: {
+            const size_t k = rng() % 3;
+            if (round % 24 < 12) has[k] = false;
+            else (k == 0 ? p : k == 1 ? v : x).pop_back();
+            break;
+        }
+        case 8: x[16 + 6 * (1 + rng() % 2)]++; break;
+        case 9: x[round % 24 < 12 ? 0 : 8]++; break;
+        case 10: v[v.size() - (round % 24 < 12 ? 16 : 8)]++; break;
+        default: break;
+        }
+        ScratchDir dir("gcs-test");
+        if (has[0]) write_bytes(dir.path() + "/addr_points.bin", p);
+        if (has[1]) write_bytes(dir.path() + "/addr_vertices.bin", v);
+        if (has[2]) write_bytes(dir.path() + "/addr_index.bin", x);
+        const uint64_t ps = has[0] ? p.size() : addr_files::ABSENT, vs = has[1] ? v.size() : addr_files::ABSENT,
+                       xs = has[2] ? x.size() : addr_files::ABSENT;
+
+        AddrSet whole, stepped;
+        const std::string strict = refusal_of([&] {
+            addr_files::decode(
+                p.data(), ps, v.data(), vs, x.data(), xs,
+                [&](const uint8_t* record) { whole.points.insert(whole.points.end(), record, record + 28); },
+                [&](const uint8_t* q, size_t n) { whole.verts.insert(whole.verts.end(), q, q + n); });
+        });
+        const std::string ours = refusal_of([&] {
+            addr::Dec dec(dir.path());
+            auto out = decode_all(dec);
+            stepped.points = std::move(out[0]);
+            stepped.verts = std::move(out[1]);
+        });
+        // Each file's footer, or all of a shorter file.
+        auto end_of = [](const std::vector<uint8_t>& f, size_t footer) {
+            return f.data() + (f.size() - std::min(f.size(), footer));
+        };
+        const std::string footers =
+            refusal_of([&] { addr_files::read_footers(end_of(p, 8), ps, end_of(v, 16), vs, end_of(x, 8), xs); });
+        const std::string sized = refusal_of([&] { addr::decoded_size(dir.path(), 0); });
+
+        const bool same = ours == strict && sized == footers &&
+                          (!strict.empty() || (stepped.points == whole.points && stepped.verts == whole.verts));
+        if (!same && differ++ < 3)
+            std::printf("    round %d: decode \"%s\", the codec \"%s\"; footers \"%s\", the size \"%s\"\n", round, strict.c_str(),
+                        ours.c_str(), footers.c_str(), sized.c_str());
+        refused += !strict.empty();
+        taken += strict.empty();
+        by_footers += !footers.empty();
+        if (round % 12 == 11) CHECK(strict.empty() && stepped.points == s.points && stepped.verts == s.verts);
+        if (round % 12 == 8 || round % 12 == 9) CHECK(!strict.empty() && footers.empty());
+    }
+    std::printf("    %zu refused (%zu by the footers), %zu taken\n", refused, by_footers, taken);
+    CHECK_EQ(differ, size_t(0));
+    CHECK(refused > 300 && taken >= 50 && by_footers >= 50);
+}
+
+TEST(gcs_addr_decoder_refuses_a_blob_that_is_not_its_len_before_reading_it) {
+    // One record whose blob the block gives a gigabyte, most of it a hole in
+    // the file: a footprint of five vertices whose widths give it 21 bytes,
+    // an escape whose count gives it 36, and an escape whose count is past a
+    // record's u32. Each is refused from the blob's first bytes, the reader's
+    // buffer never growing to the len (each case in a child whose address
+    // space can't hold that). The same footprints at their own len decode.
+    const uint32_t gigabyte = uint32_t(1) << 30;
+    struct Case {
+        std::vector<uint8_t> blob;
+        uint32_t len;
+        uint64_t logical;
+        const char* refusal;  // nullptr: decodes
+    };
+    // Five vertices of 8 + 8 bits after an 8-byte bbox minimum, any values but
+    // a last vertex that is the first; and three 8-byte vertices raw.
+    std::vector<uint8_t> five = {0, 5}, escape = {addr_files::ESCAPE_TAG, 3, 3, 0}, wide = {addr_files::ESCAPE_TAG};
+    for (const uint8_t b : le(0x42400000, 4)) five.push_back(b);
+    for (const uint8_t b : le(0x41300000, 4)) five.push_back(b);
+    five.push_back(0x88);
+    for (const uint8_t q : {200, 3, 255, 4, 5, 6, 7, 128, 9, 10}) five.push_back(q);
+    escape.resize(4 + 8 + 24, 7);
+    uv(wide, (uint64_t(1) << 32) + 5);
+    wide.resize(wide.size() + 40, 0);
+    const Case cases[] = {
+        {five, uint32_t(five.size()), 30, nullptr},
+        {five, gigabyte, 30, "a footprint blob that is not its record's len"},
+        {escape, uint32_t(escape.size()), 34, nullptr},
+        {escape, gigabyte, 34, "a footprint blob that is not its record's len"},
+        {wide, gigabyte, 34, "an escaped footprint whose count is not a varint of 1 to 4294967295 vertices"},
+    };
+    for (const Case& c : cases) {
+        ScratchDir dir("gcs-test");
+        write_one_address(dir.path(), c.blob, c.len, c.logical);
+        const std::string refusal =
+            c.refusal ? std::string("Malformed address files: ") + c.refusal + ": addr_vertices.bin, record 0" : std::string();
         const int status = exit_status_in_child(
             [&] {
-                cap_address_space(size_t(1) << 30);
-                Manifest m;
-                m.set("addr.n", 1);
-                addr::Dec dec(dir.path(), m);
-                const int code = refusal_code([&] { while (dec.step()) {} }, refusal);
-                return dec.A->buf.size() > READ_BUF + 64 ? 4 : code;
+                cap_address_space(size_t(256) << 20);
+                addr::Dec dec(dir.path());
+                for (auto& st : dec.state) st = 1;
+                size_t reader = 0;
+                const int code = refusal_code(
+                    [&] {
+                        while (dec.step()) reader = std::max(reader, dec.V ? dec.V->buf.size() : 0);
+                    },
+                    refusal);
+                if (dec.V) reader = std::max(reader, dec.V->buf.size());
+                if (reader > addr::BLOBS_BUF + READ_SLACK) return 4;
+                if (!c.refusal && dec.out[1].size() != c.logical) return 6;
+                return code;
             },
-            5);
+            20);
 
-        if (status != 2) std::printf("    count %llu: exit %d\n", (unsigned long long)count, status);
-        CHECK_EQ(status, 2);
+        if (status != (c.refusal ? 2 : 0))
+            std::printf("    a blob of %zu bytes at len %u: exit %d\n", c.blob.size(), c.len, status);
+        CHECK_EQ(status, c.refusal ? 2 : 0);
+    }
+}
+
+TEST(gcs_addr_codecs_copy_an_escaped_footprint_through_in_pieces) {
+    // An escaped footprint in encoding 3 of 80K and of 800K vertices, 640 KB
+    // and 6.4 MB, and one escaped for a vertex more than a blob holds (65,536
+    // in encoding 1, 262 KB), among small ones, each stream in one write (as
+    // the patcher's FILE passes a long stretch) and read back as the patcher
+    // reads them (a record, then its footprint in 64 KiB views): at both
+    // sizes the encoder's queue holds at most a piece and the decoder's what
+    // a read asks ahead and a piece of the blobs' buffer, each with the
+    // largest footprint here either takes whole (the one of 12 vertices, 10
+    // + 4 x 12 B); the files are the builder's and decode back to the same
+    // bytes.
+    const size_t whole = 10 + 4 * 12;
+    std::mt19937 rng(20261030);
+    for (const uint32_t big : {80000u, 800000u}) {
+        const AddrSet s = addr_set({{5, 1, true, 200},
+                                    {big, 3, false, 0},
+                                    {0, 0, false, 0},
+                                    {uint32_t(addr_files::MAX_BLOB_VERTICES) + 1, 1, false, 65536},
+                                    {12, 2, false, 65536},
+                                    {9, 0, true, 256 - 1}},
+                                   rng);
+        ScratchDir dir("gcs-test");
+        addr::Enc enc(dir.path());
+        enc.state = {1, 1};
+        enc.write(0, s.points.data(), s.points.size());
+        enc.write(1, s.verts.data(), s.verts.size());
+        const size_t encoder_peak = std::max(enc.peak(0), enc.peak(1));
+        finish_all(enc);
+
+        addr::Dec dec(dir.path());
+        AddrSet out;
+        const bool complete = read_addrs(dec, s, out);
+        const size_t decoder_peak = std::max(dec.peak(0), dec.peak(1));
+        std::printf("    %u vertices: encoder queue peak %zu B, decoder queue peak %zu B\n", big, encoder_peak, decoder_peak);
+
+        CHECK(encoder_peak <= ENCODER_PIECE + whole);
+        CHECK(decoder_peak <= Decoder::READ_AHEAD + addr::BLOBS_BUF + whole);
+        CHECK(complete);
+        CHECK(out.points == s.points);
+        CHECK(out.verts == s.verts);
+        CHECK(dir_files(dir.path()) == addr_files_of(s));
+    }
+}
+
+TEST(gcs_addr_codec_holds_a_piece_and_one_footprint_of_the_most_vertices) {
+    // Footprints of the most vertices a blob holds (65,535: 262,150 B), four
+    // of them in one block, in one write of each stream (as the patcher's
+    // FILE passes an INSERT stretch), which the encoder takes a piece (64
+    // KiB) at a time: its queue peaks at no more than a piece and one such
+    // footprint, which it takes whole. Read back as the patcher reads them (a
+    // record, then its footprint in 64 KiB views), the decoder's queue holds
+    // what a read asks ahead and one footprint, not its block's four, and its
+    // blob reader the largest blob. The files are the builder's.
+    const uint32_t most = uint32_t(addr_files::MAX_BLOB_VERTICES);
+    const size_t largest = 10 + 4 * size_t(most);
+    std::mt19937 rng(20261030);
+    const AddrSet s = addr_set({{5000, 1, false, 65536},
+                                {6914, 2, true, 200},
+                                {most, 0, false, 65536},
+                                {0, 0, false, 0},
+                                {most, 1, true, 256 - 1},
+                                {most, 2, false, 65536},
+                                {most, 0, true, 65536},
+                                {3, 0, false, 40}},
+                               rng);
+    REQUIRE(s.sizes[2] == largest);
+    ScratchDir dir("gcs-test");
+    addr::Enc enc(dir.path());
+    enc.state = {1, 1};
+    enc.write(0, s.points.data(), s.points.size());
+    enc.write(1, s.verts.data(), s.verts.size());
+    const size_t encoder_records = enc.peak(0), encoder_footprints = enc.peak(1);
+    finish_all(enc);
+
+    addr::Dec dec(dir.path());
+    dec.state = {1, 1};
+    AddrSet out;
+    std::vector<char> view(size_t(64) << 10);
+    size_t reader = 0;
+    auto read = [&](int port, size_t n, std::vector<uint8_t>& to) {
+        while (n) {
+            const size_t k = dec.read(port, view.data(), std::min(n, view.size()));
+            if (!k) return false;
+            if (dec.V) reader = std::max(reader, dec.V->buf.size());
+            to.insert(to.end(), view.data(), view.data() + k);
+            n -= k;
+        }
+        return true;
+    };
+    bool complete = true;
+    for (const size_t size : s.sizes) complete &= read(0, 28, out.points) && read(1, size, out.verts);
+    std::printf("    %zu B of footprints: encoder queue peaks %zu %zu B, decoder queue peaks %zu %zu B, blob reader %zu B\n",
+                s.verts.size(), encoder_records, encoder_footprints, dec.peak(0), dec.peak(1), reader);
+
+    CHECK(encoder_records <= s.points.size());
+    CHECK(encoder_footprints >= largest && encoder_footprints <= ENCODER_PIECE + largest);
+    CHECK(dec.peak(0) <= Decoder::READ_AHEAD);
+    CHECK(dec.peak(1) >= largest && dec.peak(1) <= Decoder::READ_AHEAD + largest);
+    CHECK(reader > largest / 2 && reader <= addr_files::BLOB_MAX_BYTES + 8 + READ_SLACK);
+    CHECK(complete);
+    CHECK(dec.read(0, view.data(), 1) == 0);
+    CHECK(out.points == s.points);
+    CHECK(out.verts == s.verts);
+    CHECK(dir_files(dir.path()) == addr_files_of(s));
+}
+
+TEST(gcs_addr_encoder_refuses_a_stream_that_is_not_whole_records_and_their_footprints) {
+    // Four records: a point, a footprint of two vertices, a footprint of
+    // three, and an escape of three in encoding 3. A record whose
+    // vertex_offset is not the footprints' bytes before it, and a footprint
+    // in an encoding none has or with its zero byte set, are refused as they
+    // come, by the record, the footprint's vertices unread; a stream that
+    // ends inside a footprint, inside an escaped one (which the encoder took
+    // as it came, its record already in the block) or inside a record, or
+    // holds a byte past the last footprint, at the finish, not written as
+    // shorter files.
+    std::mt19937 rng(20261114);
+    const AddrSet s = addr_set({{0, 0, false, 0}, {2, 0, false, 300}, {3, 1, true, 40}, {3, 3, false, 0}}, rng);
+    REQUIRE(s.verts.size() == 18 + 22 + 34);
+    struct Case {
+        size_t points, verts;                // the bytes of each stream written
+        std::function<void(AddrSet&)> edit;  // of the pair, before it is written
+        const char* refusal;
+    };
+    const Case cases[] = {
+        {112, 74, [](AddrSet&) {}, ""},
+        {112, 74, [](AddrSet& e) { wr32(&e.points[2 * 28 + 20], 19); },
+         "Malformed address files: addr_points.bin record 2 has a vertex_offset of 19, not the 18 bytes of the footprints before "
+         "it"},
+        {112, 28, [](AddrSet& e) { e.verts[18] = 4; },
+         "Malformed address files: addr_points.bin record 2 has a footprint in encoding 4"},
+        {112, 28, [](AddrSet& e) { e.verts[19] = 1; },
+         "Malformed address files: addr_points.bin record 2 has a footprint with its pad byte set"},
+        {112, 39, [](AddrSet&) {}, "gcs: addr: 56 bytes left over on input 0"},
+        {112, 73, [](AddrSet&) {}, "gcs: addr_vertices.bin: the stream ends 1 bytes before its last footprint does"},
+        {111, 40, [](AddrSet&) {}, "gcs: addr: 27 bytes left over on input 0"},
+        {84, 41, [](AddrSet&) {}, "gcs: addr: 1 bytes left over on input 1"},
+    };
+    for (const Case& c : cases) {
+        ScratchDir dir("gcs-test");
+        AddrSet e = s;
+        c.edit(e);
+        addr::Enc enc(dir.path());
+        enc.state = {1, 1};
+
+        CHECK_EQ(refusal_of([&] {
+                     enc.write(1, e.verts.data(), c.verts);
+                     enc.write(0, e.points.data(), c.points);
+                     finish_all(enc);
+                 }),
+                 std::string(c.refusal));
+        if (!*c.refusal) CHECK(dir_files(dir.path()) == addr_files_of(s));
     }
 }
 
 TEST(gcs_encoders_refuse_a_unit_past_the_end_of_its_file) {
     // A footprint or POI block of 2^30 vertices (10 + 4 x 2^30
-    // bytes, which a 32-bit size_t wraps to 10) whose file the patch gives as
-    // ten bytes: refused as those bytes come, not waited for while the queue
-    // takes the rest of the file.
+    // bytes, which a 32-bit size_t wraps to 10) whose stream is ten bytes:
+    // refused as those bytes come, not waited for while the queue takes the
+    // rest of the file. The footprint is one of more bytes than a patch
+    // indexes, the POI block one past the end of its file as the patch gives
+    // it.
     ScratchDir dir("gcs-test");
     const std::vector<uint8_t> ten(10, 0);
     {
         std::vector<uint8_t> rec(28, 0);
         wr32(&rec[20], 0);
         wr32(&rec[24], 0x40000000);
-        addr::Enc enc(dir.path(), rec.size());
+        addr::Enc enc(dir.path());
         enc.state = {1, 1};
-        enc.expect = {rec.size(), ten.size()};
         enc.write(0, rec.data(), rec.size());
 
         CHECK_EQ(refusal_of([&] { enc.write(1, ten.data(), ten.size()); }),
-                 std::string("gcs: addr: a unit of 10 + 1073741824 x 4 bytes at 0 runs past the end of input 1 (10 bytes left)"));
+                 std::string("Malformed address files: a logical addr_vertices.bin of 4294967306 bytes is more than the "
+                             "4294967294 a patch can index"));
     }
     {
         std::vector<uint8_t> rec(36, 0);

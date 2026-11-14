@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "addr_files.h"
 #include "patch_format.h"
 #include "poi_files.h"
 #include "sanitizer_report.h"
@@ -22,13 +23,15 @@
 
 namespace gctest {
 
-// A build dir's files by name. Its POI files, way pairs, side files and
-// string tiers are logical: poi_records.bin the 36-byte records,
+// A build dir's files by name. Its POI files, way pairs, address files, side
+// files and string tiers are logical: poi_records.bin the 36-byte records,
 // poi_vertices.bin the vertex stream they point into, street_ways.bin and
 // interp_ways.bin the 12- and 24-byte records, street_nodes.bin and
-// interp_nodes.bin their ways' nodes back to back, a side file
-// (way_parents.bin, way_postcodes.bin, interp_postcodes.bin,
-// addr_postcodes.bin) its u32 values, a strings_*.bin its pool.
+// interp_nodes.bin their ways' nodes back to back, addr_points.bin the
+// 28-byte records, addr_vertices.bin their footprints' logical blobs back to
+// back, a side file (way_parents.bin, way_postcodes.bin,
+// interp_postcodes.bin, addr_postcodes.bin) its u32 values, a strings_*.bin
+// its pool.
 using BuildDir = std::map<std::string, std::vector<char>>;
 
 inline bool is_string_tier(const std::string& name) {
@@ -105,11 +108,29 @@ inline void write_way_pair(const WrittenFamily& family, const BuildDir& files, B
     blocks.insert(blocks.end(), nodes_footer.begin(), nodes_footer.end());
 }
 
+// The address points and their footprints as the address files
+// (addr_files.h): addr_points.bin, addr_vertices.bin and addr_index.bin, a
+// missing addr_vertices.bin an empty stream of footprints.
+inline void write_addr_family(const WrittenFamily& family, const BuildDir& files, BuildDir& out) {
+    const std::vector<char>& points = files.at(family.records);
+    if (points.size() % addr_files::LOGICAL_STRIDE) throw std::runtime_error("addr_points.bin is not whole records");
+    auto v = files.find(addr_files::VERTICES_FILE);
+    static const std::vector<char> none;
+    const std::vector<char>& vertices = v == files.end() ? none : v->second;
+    const addr_files::Files f =
+        addr_files::encode(reinterpret_cast<const uint8_t*>(points.data()), points.size() / addr_files::LOGICAL_STRIDE,
+                           reinterpret_cast<const uint8_t*>(vertices.data()), vertices.size());
+    out[addr_files::POINTS_FILE].assign(f.points.begin(), f.points.end());
+    out[addr_files::VERTICES_FILE].assign(f.vertices.begin(), f.vertices.end());
+    out[addr_files::INDEX_FILE].assign(f.index.begin(), f.index.end());
+}
+
 inline const std::vector<WrittenFamily>& written_families() {
     static const std::vector<WrittenFamily> f = {
         {"poi_records.bin", write_poi_family},
         {"street_ways.bin", write_way_pair},
         {"interp_ways.bin", write_way_pair},
+        {"addr_points.bin", write_addr_family},
         {"way_parents.bin", write_side_file},
         {"way_postcodes.bin", write_side_file},
         {"interp_postcodes.bin", write_side_file},
