@@ -624,10 +624,9 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
 
     std::vector<std::future<void>> write_futures;
     if (write_streets) {
+        // street_ways.bin and street_nodes.bin (way_files.h).
         write_futures.push_back(std::async(std::launch::async, [&] {
-            write_binary_file(output_dir + "/street_ways.bin",
-                              reinterpret_cast<const char*>(data.ways.data()),
-                              data.ways.size() * sizeof(WayHeader));
+            write_way_files(output_dir, data.ways, data.street_nodes);
         }));
         // Strategy-2 sidecar (cached only — workflow excludes *.osm_ids
         // from user-facing upload). If apply_strategy2_remaps ran,
@@ -646,11 +645,6 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             }
             emit_strategy2_sidecar(output_dir + "/street_ways.osm_ids",
                                     data.way_sidecar_blob, packed_fallback);
-        }));
-        write_futures.push_back(std::async(std::launch::async, [&] {
-            write_binary_file(output_dir + "/street_nodes.bin",
-                              reinterpret_cast<const char*>(data.street_nodes.data()),
-                              data.street_nodes.size() * sizeof(NodeCoord));
         }));
         // Way parent chain (parallel array indexed by way_id)
         if (!data.way_parent_ids.empty()) {
@@ -747,10 +741,10 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                                     data.addr_points.size());
                 }));
             }
+            // interp_ways.bin and interp_nodes.bin (way_files.h): the two
+            // footers in a region without interpolations.
             write_futures.push_back(std::async(std::launch::async, [&] {
-                write_binary_file(output_dir + "/interp_ways.bin",
-                                  reinterpret_cast<const char*>(data.interp_ways.data()),
-                                  data.interp_ways.size() * sizeof(InterpWay));
+                write_way_files(output_dir, data.interp_ways, data.interp_nodes);
                 emit_strategy2_sidecar(output_dir + "/interp_ways.osm_ids",
                                         data.interp_sidecar_blob, data.interp_osm_ids);
             }));
@@ -760,11 +754,6 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                                     data.interp_ways.size());
                 }));
             }
-            write_futures.push_back(std::async(std::launch::async, [&] {
-                write_binary_file(output_dir + "/interp_nodes.bin",
-                                  reinterpret_cast<const char*>(data.interp_nodes.data()),
-                                  data.interp_nodes.size() * sizeof(NodeCoord));
-            }));
         }
     }
     // Per-tier strings files, FCC2 (string_files.h). Each mode writes the tiers its records can

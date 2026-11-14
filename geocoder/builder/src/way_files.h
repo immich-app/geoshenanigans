@@ -184,8 +184,8 @@ struct OrderKey {
 inline uint16_t encode_block(const uint8_t* nodes, size_t cnt, uint32_t anchor_lat, uint32_t anchor_lng, std::vector<uint8_t>& out) {
     using namespace coord_keys;
     if (!cnt || cnt > MAX_WAY_NODES) throw std::logic_error("a node block holds 1 to 65,535 nodes");
-    const uint32_t zl = zigzag32(order_key(get32(nodes)) - order_key(anchor_lat)),
-                   zg = zigzag32(order_key(get32(nodes + 4)) - order_key(anchor_lng));
+    const uint32_t zl = coord_keys::zigzag32(order_key(get32(nodes)) - order_key(anchor_lat)),
+                   zg = coord_keys::zigzag32(order_key(get32(nodes + 4)) - order_key(anchor_lng));
     const uint32_t wf = std::max(byte_length(zl), byte_length(zg));
     // The widths under the hybrid key, where every coordinate has one, else
     // under the order key. The keys are made again to pack them, so no way's
@@ -236,8 +236,8 @@ inline void decode_block(const uint8_t* p, uint16_t cnt, uint16_t code, uint32_t
         zg |= uint32_t(p[wf + b]) << (8 * b);
     }
     if (std::max(byte_length(zl), byte_length(zg)) != wf) malformed("a way's first node in more bytes than it needs");
-    const uint32_t lat0 = from_order_key(order_key(anchor_lat) + unzigzag32(zl)),
-                   lng0 = from_order_key(order_key(anchor_lng) + unzigzag32(zg));
+    const uint32_t lat0 = from_order_key(order_key(anchor_lat) + coord_keys::unzigzag32(zl)),
+                   lng0 = from_order_key(order_key(anchor_lng) + coord_keys::unzigzag32(zg));
     put32(out, lat0);
     put32(out + 4, lng0);
     // Whether every coordinate so far has a hybrid key: the encoder's choice.
@@ -255,8 +255,8 @@ inline void decode_block(const uint8_t* p, uint16_t cnt, uint16_t code, uint32_t
         const uint32_t vl = get_bits(bits, uint64_t(j - 1) * wl, wl), vg = get_bits(bits, lng_at + uint64_t(j - 1) * wg, wg);
         any_lat |= vl;
         any_lng |= vg;
-        step_lat += unzigzag32(vl);
-        step_lng += unzigzag32(vg);
+        step_lat += coord_keys::unzigzag32(vl);
+        step_lng += coord_keys::unzigzag32(vg);
         key_lat += step_lat;
         key_lng += step_lng;
         uint32_t lat, lng;
