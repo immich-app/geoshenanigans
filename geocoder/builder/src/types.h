@@ -197,6 +197,27 @@ inline AdminPolygon admin_polygon_tombstone() {
     return p;
 }
 
+// The strategy-2 slots with no living street way, interpolation way or
+// address point: every byte zero but the name, the street, and the parent
+// way and footprint offset, which are NO_DATA. The patch tools know a
+// tombstone by these bytes.
+inline WayHeader street_way_tombstone() {
+    WayHeader w{};
+    w.name_id = NO_DATA;
+    return w;
+}
+inline InterpWay interp_way_tombstone() {
+    InterpWay w{};
+    w.street_id = NO_DATA;
+    return w;
+}
+inline AddrPoint addr_point_tombstone() {
+    AddrPoint p{};
+    p.parent_way_id = NO_DATA;
+    p.vertex_offset = NO_DATA;
+    return p;
+}
+
 // FNV-1a 64-bit hash parameters, used to derive deterministic SYNTHETIC
 // stable ids for TIGER interpolation ways and place nodes (build_index.cpp).
 static const uint64_t FNV1A_OFFSET_BASIS = 14695981039346656037ULL;

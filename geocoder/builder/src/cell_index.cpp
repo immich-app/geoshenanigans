@@ -166,11 +166,7 @@ static std::vector<uint32_t> apply_strategy2_streets(ParsedData& data, const std
     }
 
     // Reorder data.ways into a tombstoned dense layout indexed by remap[i].
-    WayHeader tomb_way{};
-    tomb_way.node_offset = 0;
-    tomb_way.node_count  = 0;
-    tomb_way.name_id     = NO_DATA;
-    reorder_by_remap(data.ways, remap, n_new, tomb_way);
+    reorder_by_remap(data.ways, remap, n_new, street_way_tombstone());
     reorder_by_remap(data.way_osm_ids, remap, n_new, int64_t(0));
     // Build-time only, and already dropped by the string-tier pass.
     if (!data.way_orig_name_ids.empty()) reorder_by_remap(data.way_orig_name_ids, remap, n_new, NO_DATA);
@@ -303,11 +299,7 @@ static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir)
         return;
     }
 
-    AddrPoint tomb_addr{};
-    std::memset(&tomb_addr, 0, sizeof(tomb_addr));
-    tomb_addr.parent_way_id = NO_DATA;
-    tomb_addr.vertex_offset = NO_DATA;
-    reorder_by_remap(data.addr_points, remap, n_new, tomb_addr);
+    reorder_by_remap(data.addr_points, remap, n_new, addr_point_tombstone());
     reorder_by_remap(data.addr_osm_ids, remap, n_new, uint64_t(0));
     if (!data.addr_postcode_ids.empty()) reorder_by_remap(data.addr_postcode_ids, remap, n_new, NO_DATA);
 
@@ -387,13 +379,10 @@ static void apply_strategy2_interps(ParsedData& data, const std::string& prev_di
         return;
     }
 
-    InterpWay tomb_iw{};
-    std::memset(&tomb_iw, 0, sizeof(tomb_iw));
-    tomb_iw.street_id = NO_DATA;
     // Strict parallel-array gate, matching reorder_deterministically: a
     // desynced sidecar is skipped whole rather than partially copied.
     const bool have_pc = (data.interp_postcode_ids.size() == n_old);
-    reorder_by_remap(data.interp_ways, remap, n_new, tomb_iw);
+    reorder_by_remap(data.interp_ways, remap, n_new, interp_way_tombstone());
     reorder_by_remap(data.interp_osm_ids, remap, n_new, uint64_t(0));
     if (have_pc) reorder_by_remap(data.interp_postcode_ids, remap, n_new, NO_DATA);
 
