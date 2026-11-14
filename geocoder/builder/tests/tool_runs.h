@@ -29,9 +29,40 @@ inline bool is_string_tier(const std::string& name) {
     return false;
 }
 
+// A family of files a fixture names in logical form and the builder writes
+// encoded. records: the logical file a fixture with the family names.
+// encode: the files the builder writes for the family of `files`, into out
+// in place of its logical ones; it takes the family's own row, so families
+// of one format share it.
+struct WrittenFamily {
+    const char* records;
+    void (*encode)(const WrittenFamily& family, const BuildDir& files, BuildDir& out);
+};
+
+// The POI files as R2 and V2 (poi_files.h), a missing poi_vertices.bin an
+// empty vertex stream.
+inline void write_poi_family(const WrittenFamily& family, const BuildDir& files, BuildDir& out) {
+    const std::vector<char>& records = files.at(family.records);
+    if (records.size() % poi_files::LOGICAL_STRIDE) throw std::runtime_error("poi_records.bin is not whole records");
+    auto v = files.find("poi_vertices.bin");
+    static const std::vector<char> none;
+    const std::vector<char>& verts = v == files.end() ? none : v->second;
+    const poi_files::Files f =
+        poi_files::encode(reinterpret_cast<const uint8_t*>(records.data()), records.size() / poi_files::LOGICAL_STRIDE,
+                          reinterpret_cast<const uint8_t*>(verts.data()), verts.size());
+    out["poi_records.bin"].assign(f.records.begin(), f.records.end());
+    out["poi_vertices.bin"].assign(f.vertices.begin(), f.vertices.end());
+}
+
+inline const std::vector<WrittenFamily>& written_families() {
+    static const std::vector<WrittenFamily> f = {
+        {"poi_records.bin", write_poi_family},
+    };
+    return f;
+}
+
 // The dir as the builder writes it: its string tiers as FCC2
-// (string_files.h), and the POI files of a dir with poi_records.bin as R2 and
-// V2 (poi_files.h), a missing poi_vertices.bin an empty vertex stream.
+// (string_files.h), and each family of written_families it holds encoded.
 inline BuildDir as_written(const BuildDir& files) {
     BuildDir out = files;
     for (auto& [name, bytes] : out) {
@@ -39,17 +70,8 @@ inline BuildDir as_written(const BuildDir& files) {
         const std::vector<uint8_t> f = string_files::encode(bytes.data(), bytes.size());
         bytes.assign(f.begin(), f.end());
     }
-    auto r = files.find("poi_records.bin");
-    if (r == files.end()) return out;
-    if (r->second.size() % poi_files::LOGICAL_STRIDE) throw std::runtime_error("poi_records.bin is not whole records");
-    auto v = files.find("poi_vertices.bin");
-    static const std::vector<char> none;
-    const std::vector<char>& verts = v == files.end() ? none : v->second;
-    const poi_files::Files f =
-        poi_files::encode(reinterpret_cast<const uint8_t*>(r->second.data()), r->second.size() / poi_files::LOGICAL_STRIDE,
-                          reinterpret_cast<const uint8_t*>(verts.data()), verts.size());
-    out["poi_records.bin"].assign(f.records.begin(), f.records.end());
-    out["poi_vertices.bin"].assign(f.vertices.begin(), f.vertices.end());
+    for (const WrittenFamily& f : written_families())
+        if (files.count(f.records)) f.encode(f, files, out);
     return out;
 }
 

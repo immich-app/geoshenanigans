@@ -9,6 +9,10 @@
 //
 // Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META] [--string-pairs-max N]
 //                      [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N] [--file-records-max N]
+//        geocoder-diff --decode-logical <dir> <out-dir>
+//
+// --decode-logical writes the logical files the merges read of the families
+// the builder writes encoded (logical_families), and no patch.
 //
 // GCPATCH v8: with --identity, street / interp / addr records match across
 // days by the server-side identity sidecars <META>/{street,interp,addr}.slot.u32
@@ -514,28 +518,30 @@ struct FileMergeResult {
 // A record file that feeds entry corrections merges as itself when unchanged
 // (sent_unchanged), so the diff derives its dependents with the ids the
 // patcher keeps.
-// The merges diff the POI and place files' logical form: each dir's R2 and V2
-// files (poi_files.h) and its place files (place_files.h, their logical
-// stream as place_nodes.bin) are decoded at the start into a scratch dir of
-// their own, which merge_path reads them from.
+// The merges diff the logical form of the families the builder writes encoded
+// (logical_families): each dir's POI files (R2 and V2, poi_files.h) and place
+// files (place_files.h, their logical stream as place_nodes.bin) are decoded
+// at the start into a scratch dir of their own, which merge_path reads them
+// from.
 static std::map<std::string, std::string>& logical_dirs() {
     static std::map<std::string, std::string> dirs;
     return dirs;
 }
-static bool is_logical_file(const std::string& name) {
-    return name == "poi_records.bin" || name == "poi_vertices.bin" || name == place_files::NODES_FILE;
-}
-// The file a merge reads for name in dir: the decoded one for a POI file or
-// place_nodes.bin.
-static std::string merge_path(const std::string& dir, const std::string& name) {
-    if (is_logical_file(name)) {
-        auto it = logical_dirs().find(dir);
-        if (it != logical_dirs().end()) return it->second + "/" + name;
-    }
-    return dir + "/" + name;
-}
+// A family of files the builder writes encoded and the merges diff in
+// logical form. files: its logical files, which the merges and the patch's
+// sections name. decode: dir's files of the family decoded into those files
+// in `to`; false, and nothing written: dir has none of them. logical_size:
+// the bytes decode writes for dir, from its files' footers and sizes alone;
+// 0 for a dir without the family. Both take the family's own row, so
+// families of one format share them.
+struct LogicalFamily {
+    const char* name;
+    std::vector<const char*> files;
+    bool (*decode)(const LogicalFamily& family, const std::string& dir, const std::string& to);
+    uint64_t (*logical_size)(const LogicalFamily& family, const std::string& dir);
+};
 // Decodes dir's POI files into to; false: dir has none.
-static bool decode_poi_files(const std::string& dir, const std::string& to) {
+static bool decode_poi_files(const LogicalFamily&, const std::string& dir, const std::string& to) {
     const std::string rp = dir + "/poi_records.bin", vp = dir + "/poi_vertices.bin";
     struct stat st;
     const bool has_r = stat(rp.c_str(), &st) == 0, has_v = stat(vp.c_str(), &st) == 0;
@@ -552,9 +558,22 @@ static bool decode_poi_files(const std::string& dir, const std::string& to) {
     if (!ro.flush() || !vo.flush()) throw std::runtime_error("Cannot write the decoded POI files of " + dir);
     return true;
 }
+// The bytes decode_poi_files writes for dir, from poi_records.bin's footer
+// alone; 0 without the file.
+static uint64_t poi_logical_size(const LogicalFamily&, const std::string& dir) {
+    const std::string rp = dir + "/poi_records.bin";
+    struct stat st;
+    if (stat(rp.c_str(), &st) != 0) return 0;
+    MappedFile r = mmap_file(rp);
+    if (static_cast<uint64_t>(st.st_size) != r.size) throw std::runtime_error("Cannot read " + rp);
+    const poi_files::Footer ft = poi_files::read_footer(
+        reinterpret_cast<const uint8_t*>(r.data) + r.size - std::min<size_t>(r.size, poi_files::FOOTER_BYTES), r.size);
+    unmap_file(r);
+    return ft.rows * poi_files::LOGICAL_STRIDE + ft.logical_vertex_bytes;
+}
 // Decodes dir's place files into to's place_nodes.bin, their logical stream;
 // false: dir has none.
-static bool decode_place_files(const std::string& dir, const std::string& to) {
+static bool decode_place_files(const LogicalFamily&, const std::string& dir, const std::string& to) {
     const std::string names[] = {place_files::CELLS_FILE, place_files::NODES_FILE, place_files::HIDDEN_FILE};
     MappedFile m[3];
     int has = 0;
@@ -580,12 +599,88 @@ static bool decode_place_files(const std::string& dir, const std::string& to) {
     if (!o.flush()) throw std::runtime_error("Cannot write the decoded place files of " + dir);
     return true;
 }
-// Decodes dir's POI and place files into to (a new dir); false: dir has
-// neither.
+// The bytes decode_place_files writes for dir, from place_nodes.bin's footer
+// and place_hidden.bin's size alone; 0 without place_nodes.bin.
+static uint64_t place_logical_size(const LogicalFamily&, const std::string& dir) {
+    const std::string np = dir + "/" + place_files::NODES_FILE, hp = dir + "/" + place_files::HIDDEN_FILE;
+    struct stat st;
+    if (stat(np.c_str(), &st) != 0) return 0;
+    MappedFile n = mmap_file(np);
+    if (static_cast<uint64_t>(st.st_size) != n.size) throw std::runtime_error("Cannot read " + np);
+    const place_files::Footer f = place_files::read_footer(
+        reinterpret_cast<const uint8_t*>(n.data) + n.size - std::min<size_t>(n.size, place_files::FOOTER_BYTES), n.size);
+    unmap_file(n);
+    const uint64_t hidden = stat(hp.c_str(), &st) == 0 ? static_cast<uint64_t>(st.st_size) / place_files::HIDDEN_ROW_BYTES : 0;
+    return place_files::LOGICAL_STRIDE * (uint64_t{f.rows} + hidden);
+}
+static const std::vector<LogicalFamily>& logical_families() {
+    static const std::vector<LogicalFamily> f = {
+        {"poi", {"poi_records.bin", "poi_vertices.bin"}, decode_poi_files, poi_logical_size},
+        {"places", {place_files::NODES_FILE}, decode_place_files, place_logical_size},
+    };
+    return f;
+}
+static bool is_logical_file(const std::string& name) {
+    for (const LogicalFamily& f : logical_families())
+        for (const char* file : f.files)
+            if (name == file) return true;
+    return false;
+}
+// The file a merge reads for name in dir: the decoded one for a logical
+// family's file.
+static std::string merge_path(const std::string& dir, const std::string& name) {
+    if (is_logical_file(name)) {
+        auto it = logical_dirs().find(dir);
+        if (it != logical_dirs().end()) return it->second + "/" + name;
+    }
+    return dir + "/" + name;
+}
+// Decodes dir's files of every logical family into the dir `to`, each family
+// on a thread of its own: per family, whether dir has it.
+static std::vector<char> decode_logical_families(const std::string& dir, const std::string& to) {
+    const std::vector<LogicalFamily>& families = logical_families();
+    std::vector<char> has(families.size(), 0);
+    parallel_for(
+        families.size(),
+        [&](size_t begin, size_t end, unsigned) {
+            for (size_t f = begin; f < end; f++) has[f] = families[f].decode(families[f], dir, to);
+        },
+        static_cast<unsigned>(families.size()));
+    return has;
+}
+// Decodes dir's logical families into to (a new dir); false: dir has none.
 static bool decode_logical_files(const std::string& dir, const std::string& to) {
     if (mkdir(to.c_str(), 0700) != 0) throw std::runtime_error("Cannot create " + to);
-    const bool poi = decode_poi_files(dir, to);
-    return decode_place_files(dir, to) || poi;
+    const std::vector<char> has = decode_logical_families(dir, to);
+    return std::find(has.begin(), has.end(), 1) != has.end();
+}
+// geocoder-diff --decode-logical: the logical files a diff of dir reads, into
+// out (made, or empty), and nothing for a family dir lacks. Refuses a family
+// whose decoded bytes are not what its logical_size gives.
+static int decode_logical(const std::string& dir, const std::string& out) {
+    if (!std::filesystem::is_directory(dir)) throw std::runtime_error("Not a dir: " + dir);
+    std::filesystem::create_directories(out);
+    if (!std::filesystem::is_empty(out)) throw std::runtime_error("Output dir is not empty: " + out);
+    const std::vector<LogicalFamily>& families = logical_families();
+    const std::vector<char> has = decode_logical_families(dir, out);
+    for (size_t f = 0; f < families.size(); f++) {
+        if (!has[f]) {
+            std::cerr << "  " << families[f].name << ": none" << std::endl;
+            continue;
+        }
+        uint64_t written = 0;
+        for (const char* file : families[f].files) {
+            struct stat st;
+            if (stat((out + "/" + file).c_str(), &st) != 0) throw std::runtime_error("Cannot read " + out + "/" + file);
+            written += static_cast<uint64_t>(st.st_size);
+        }
+        const uint64_t expected = families[f].logical_size(families[f], dir);
+        if (written != expected)
+            throw std::runtime_error(std::string(families[f].name) + " of " + dir + " decodes to " + std::to_string(written) +
+                                     " bytes, its files give " + std::to_string(expected));
+        std::cerr << "  " << families[f].name << ": " << written << " logical bytes" << std::endl;
+    }
+    return 0;
 }
 
 // A string tier's pool, as the diff reads it: the file at path (FCC2,
@@ -917,7 +1012,15 @@ static constexpr MergedFile MERGED_FILES[] = {
 static int run(int argc, char* argv[]) {
     const char* usage =
         "Usage: geocoder-diff <old-dir> <new-dir> -o <patch-file> [--identity OLD_META NEW_META] [--string-pairs-max N]"
-        " [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N] [--file-records-max N]";
+        " [--string-fixup-bytes-max N] [--offset-fixup-bytes-max N] [--file-records-max N]\n"
+        "       geocoder-diff --decode-logical <dir> <out-dir>";
+    if (argc >= 2 && std::string(argv[1]) == "--decode-logical") {
+        if (argc != 4) {
+            std::cerr << usage << std::endl;
+            return 1;
+        }
+        return decode_logical(argv[2], argv[3]);
+    }
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << usage << std::endl;
         return 1;

@@ -149,7 +149,9 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
   POI files are R2 records and V2 polygon blocks on disk (`src/poi_files.h`); the diff decodes both
   days' into their logical form (today's 36-byte records and vertex stream) and merges those.
   The string tiers are FCC2 files, front-coded buckets cut by content (`src/string_files.h`);
-  the diff decodes each tier it reads into its pool and diffs the pools
+  the diff decodes each tier it reads into its pool and diffs the pools.
+  `geocoder-diff --decode-logical DIR OUT` writes the logical files it would read of DIR's POI
+  and place files into OUT, a new or empty dir, and no patch
 - **geocoder-patch** (`tools/geocoder_patch.cpp`): Applies patch, produces new build. It links
   the static libzstd (`libzstd.a`) and decompresses the patch in process;
   `cmake -DGEOCODER_PATCH_LIBZSTD=OFF` builds it on the `zstd` command on PATH instead, for a host

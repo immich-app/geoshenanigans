@@ -16,22 +16,55 @@
 
 namespace gcs {
 
+// The client list's sizes by today's name (Store::expect_out).
+using ListedSizes = std::map<std::string, uint64_t>;
+
+// A family and its codecs. decoder: over the installed set in dir (m: its manifest, which holds a
+// gc family's counts). encoder: into the new set in dir (sizes: for one that needs a file's listed
+// size). decoded_size: a native family's decoded size of a port, from dir's files alone and with
+// no decoder made (the POI replay reads the files itself); none for a gc family, whose decoder
+// gives the manifest's.
 struct FamilyDesc {
     const char* name;
     std::vector<const char*> today;
-    bool native = false;  // encoded in every dir, as its today's files' names
+    bool native;  // encoded in every dir, as its today's files' names
+    Decoder* (*decoder)(const std::string& dir, const Manifest& m);
+    Encoder* (*encoder)(const std::string& dir, const ListedSizes& sizes);
+    uint64_t (*decoded_size)(const std::string& dir, int port);
 };
 // gc's family order (tools/gc.cpp; gc.families lists them in it), then the native ones.
 static const std::vector<FamilyDesc>& families() {
     static const std::vector<FamilyDesc> f = {
-        {"streets", {"street_ways.bin", "street_nodes.bin"}},
-        {"interps", {"interp_ways.bin", "interp_nodes.bin"}},
-        {"way_parents", {"way_parents.bin"}},
-        {"way_postcodes", {"way_postcodes.bin"}},
-        {"interp_postcodes", {"interp_postcodes.bin"}},
-        {"addr", {"addr_points.bin", "addr_vertices.bin"}},
-        {"poi", {"poi_records.bin", "poi_vertices.bin"}, true},
-        {"places", {"place_nodes.bin"}, true},
+        {"streets", {"street_ways.bin", "street_nodes.bin"}, false,
+         [](const std::string& dir, const Manifest& m) -> Decoder* { return new ways::Dec(dir, true, m); },
+         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new ways::Enc(dir, true); }, nullptr},
+        {"interps", {"interp_ways.bin", "interp_nodes.bin"}, false,
+         [](const std::string& dir, const Manifest& m) -> Decoder* { return new ways::Dec(dir, false, m); },
+         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new ways::Enc(dir, false); }, nullptr},
+        {"way_parents", {"way_parents.bin"}, false,
+         [](const std::string& dir, const Manifest& m) -> Decoder* { return new side::U24Dec(dir, m); },
+         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::U24Enc(dir); }, nullptr},
+        {"way_postcodes", {"way_postcodes.bin"}, false,
+         [](const std::string& dir, const Manifest& m) -> Decoder* { return new side::DictDec(dir, "way_postcodes", m); },
+         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::DictEnc(dir, "way_postcodes"); }, nullptr},
+        {"interp_postcodes", {"interp_postcodes.bin"}, false,
+         [](const std::string& dir, const Manifest& m) -> Decoder* { return new side::DictDec(dir, "interp_postcodes", m); },
+         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::DictEnc(dir, "interp_postcodes"); }, nullptr},
+        {"addr", {"addr_points.bin", "addr_vertices.bin"}, false,
+         [](const std::string& dir, const Manifest& m) -> Decoder* { return new addr::Dec(dir, m); },
+         [](const std::string& dir, const ListedSizes& sizes) -> Encoder* {
+             auto it = sizes.find("addr_points.bin");
+             if (it == sizes.end()) die("addr: the patch lists no addr_points.bin size");
+             return new addr::Enc(dir, it->second);
+         },
+         nullptr},
+        {"poi", {"poi_records.bin", "poi_vertices.bin"}, true,
+         [](const std::string& dir, const Manifest&) -> Decoder* { return new poi::Dec(dir); },
+         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new poi::Enc(dir); }, poi::decoded_size},
+        {"places", {"place_nodes.bin"}, true,
+         [](const std::string& dir, const Manifest&) -> Decoder* { return new place::Dec(dir); },
+         [](const std::string& dir, const ListedSizes&) -> Encoder* { return new place::Enc(dir); },
+         [](const std::string& dir, int) { return place::decoded_size(dir); }},
     };
     return f;
 }
@@ -142,17 +175,7 @@ struct Store {
     // Decoders and encoders are made on first use and freed when their last port closes.
     Decoder* decoder(int fi) {
         if (!dec[size_t(fi)]) {
-            const std::string f = families()[size_t(fi)].name;
-            const std::string& s = cur_dir;
-            Decoder* d;
-            if (f == "streets") d = new ways::Dec(s, true, old_m);
-            else if (f == "interps") d = new ways::Dec(s, false, old_m);
-            else if (f == "way_parents") d = new side::U24Dec(s, old_m);
-            else if (f == "way_postcodes" || f == "interp_postcodes") d = new side::DictDec(s, f, old_m);
-            else if (f == "addr") d = new addr::Dec(s, old_m);
-            else if (f == "poi") d = new poi::Dec(s);
-            else if (f == "places") d = new place::Dec(s);
-            else die("no decoder for %s", f.c_str());
+            Decoder* d = families()[size_t(fi)].decoder(cur_dir, old_m);
             dec[size_t(fi)].reset(d);
             if (threads) adec[size_t(fi)].reset(new AsyncDec(d));
         }
@@ -161,20 +184,7 @@ struct Store {
     Encoder* encoder(int fi) {
         if (!enc[size_t(fi)]) {
             const auto& F = families()[size_t(fi)];
-            const std::string f = F.name;
-            const std::string& o = out_dir;
-            Encoder* e;
-            if (f == "streets") e = new ways::Enc(o, true);
-            else if (f == "interps") e = new ways::Enc(o, false);
-            else if (f == "way_parents") e = new side::U24Enc(o);
-            else if (f == "way_postcodes" || f == "interp_postcodes") e = new side::DictEnc(o, f);
-            else if (f == "addr") {
-                auto it = expect_out.find("addr_points.bin");
-                if (it == expect_out.end()) die("addr: the patch lists no addr_points.bin size");
-                e = new addr::Enc(o, it->second);
-            } else if (f == "poi") e = new poi::Enc(o);
-            else if (f == "places") e = new place::Enc(o);
-            else die("no encoder for %s", f.c_str());
+            Encoder* e = F.encoder(out_dir, expect_out);
             for (size_t p = 0; p < F.today.size() && !F.native; p++) {
                 auto it = expect_out.find(F.today[p]);
                 if (it != expect_out.end()) e->expect[p] = it->second;
@@ -187,14 +197,11 @@ struct Store {
 
     // --- old side ---
     // The decoded size check for require_old_file_size: the manifest's size when it gives one.
-    // A native family's from its footer, with no decoder made (the POI replay reads the files
-    // itself).
+    // A native family's from its files (FamilyDesc::decoded_size).
     void check_old_size(const std::string& name, uint64_t expected) {
         auto [fi, port] = file_port.at(name);
         const FamilyDesc& F = families()[size_t(fi)];
-        const uint64_t ds = !F.native ? decoder(fi)->decoded_size(port)
-                            : std::string(F.name) == "poi" ? poi::decoded_size(cur_dir, port)
-                                                           : place::decoded_size(cur_dir);
+        const uint64_t ds = F.decoded_size ? F.decoded_size(cur_dir, port) : decoder(fi)->decoded_size(port);
         if (ds != ~0ull && ds != expected)
             die("old %s decodes to %llu bytes, the patch expects %llu", name.c_str(), (unsigned long long)ds, (unsigned long long)expected);
     }

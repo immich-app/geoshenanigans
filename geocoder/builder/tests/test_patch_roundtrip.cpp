@@ -652,6 +652,94 @@ TEST(patch_round_trip_keeps_the_place_files) {
     CHECK(r.mismatches.empty());
 }
 
+// geocoder-diff --decode-logical DIR OUT writes the logical form the merges
+// read of each family the builder writes encoded: the POI files as 36-byte
+// records and their vertex stream, the place files as place_nodes.bin's
+// 24-byte rows (the visible nodes with their cells' keys, then the hidden
+// ones). A dir with one of the families gives that family's files and a dir
+// with neither an empty OUT; no other file of DIR is written. An OUT that
+// holds a file, a DIR that is no dir and a DIR with one of the two POI files
+// are refused.
+TEST(decode_logical_writes_the_poi_and_place_files_a_dir_holds_and_none_it_lacks) {
+    ScratchDir dir("decode-logical");
+    const std::string log = dir.path() + "/tools.log";
+    // The tool's exit status 0, and its log.
+    auto decode = [&](const std::string& in, const std::string& out) {
+        std::filesystem::remove(log);
+        const bool ok = run({GEOCODER_DIFF_BIN, "--decode-logical", in, out}, log);
+        const std::vector<char> text = read_file(log);
+        return std::pair<bool, std::string>(ok, std::string(text.begin(), text.end()));
+    };
+    const BuildDir pois = poi_polygons(false);
+    PlaceNode hidden = place(NAME_4);
+    hidden._pad1 = PLACE_FLAG_HIDDEN;
+    const std::vector<PlaceNode> visible = {place(NAME_2), place(NAME_4), place(NAME_2), place(NAME_4), place(NAME_2)};
+    std::vector<PlaceNode> nodes = visible;
+    nodes.insert(nodes.begin() + 2, hidden);
+    // put_places' rows: visible node i in the cell of key i / 3.
+    std::vector<place_files::LogicalPlace> rows;
+    for (uint32_t i = 0; i < visible.size(); i++) rows.push_back({visible[i], i / 3});
+    rows.push_back({hidden, NO_DATA});
+    const BuildDir places = {{place_files::NODES_FILE, bytes_of(rows)}};
+
+    struct Case {
+        std::string name;
+        bool poi, places;
+    };
+    for (const Case& e : {Case{"both", true, true}, {"poi", true, false}, {"places", false, true}, {"neither", false, false}}) {
+        // Beside a string tier and a street file, which are no such family's.
+        BuildDir d = with_pool(OLD_POOL), want;
+        d["street_ways.bin"] = bytes_of(std::vector<WayHeader>{{0, 0, 0, NAME_2}});
+        if (e.poi) {
+            d.insert(pois.begin(), pois.end());
+            want.insert(pois.begin(), pois.end());
+        }
+        if (e.places) {
+            put_places(d, nodes);
+            want.insert(places.begin(), places.end());
+        }
+        const std::string in = dir.path() + "/" + e.name, out = in + ".logical";
+        REQUIRE(write_dir(in, d));
+
+        const auto [ok, text] = decode(in, out);
+
+        CHECK(ok);
+        CHECK(gctest::read_dir(out) == want);
+        // Each family's logical bytes, as its files' footers give them.
+        const std::string poi_line = "  poi: " + std::to_string(pois.at("poi_records.bin").size() + pois.at("poi_vertices.bin").size()) +
+                                     " logical bytes";
+        const std::string places_line = "  places: " + std::to_string(rows.size() * sizeof(rows[0])) + " logical bytes";
+        CHECK_EQ(text.find(poi_line) != std::string::npos, e.poi);
+        CHECK_EQ(text.find(places_line) != std::string::npos, e.places);
+        CHECK_EQ(text.find("  poi: none") != std::string::npos, !e.poi);
+        CHECK_EQ(text.find("  places: none") != std::string::npos, !e.places);
+    }
+
+    const std::string both = dir.path() + "/both", used = dir.path() + "/used";
+    const BuildDir held = {{"held.bin", {'x'}}};
+    REQUIRE(write_dir(used, held));
+    auto r = decode(both, used);
+    CHECK(!r.first);
+    CHECK(r.second.find("Output dir is not empty: " + used) != std::string::npos);
+    CHECK(gctest::read_dir(used) == held);
+
+    r = decode(dir.path() + "/nowhere", dir.path() + "/nowhere.logical");
+    CHECK(!r.first);
+    CHECK(r.second.find("Not a dir: " + dir.path() + "/nowhere") != std::string::npos);
+    CHECK(!std::filesystem::exists(dir.path() + "/nowhere.logical"));
+
+    REQUIRE(std::filesystem::remove(dir.path() + "/poi/poi_vertices.bin"));
+    r = decode(dir.path() + "/poi", dir.path() + "/half.logical");
+    CHECK(!r.first);
+    CHECK(r.second.find("has one of poi_records.bin and poi_vertices.bin") != std::string::npos);
+
+    // Without both of its paths the option is a usage error.
+    std::filesystem::remove(log);
+    CHECK(!run({GEOCODER_DIFF_BIN, "--decode-logical", both}, log));
+    const std::vector<char> usage = read_file(log);
+    CHECK(std::string(usage.begin(), usage.end()).find("geocoder-diff --decode-logical <dir> <out-dir>") != std::string::npos);
+}
+
 // An admin or POI cell index in dirs that hold none of its records (admin
 // polygons, POI records) still comes as a cell index delta, which the patcher
 // needs to rebuild it: a cell's list changes and a cell is added.
