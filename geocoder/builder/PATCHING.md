@@ -512,7 +512,10 @@ Old file hash: marker 0xFFFFFFF8 (u32) + file_id (u32) + lane_hash of the
   refuses a second hash of a file, a hash of any other file, and a replay
   without the hashes it checks by; a hash whose replay does not run (both of
   the family's sections unchanged, or an old file without records) is read
-  and checks nothing. The patcher replays the POI records and their blocks on R2
+  and checks nothing. POI records sent unchanged over blocks that change go
+  through the codecs, and the patcher holds both old POI files to their
+  hashes before it reads them ("Old poi_records.bin is not the one the patch
+  was made from"). The patcher replays the POI records and their blocks on R2
   and V2 as they sit (`tools/poi_replay.h`): a new record whose polygon is
   the old record's, one MATCH of its block's logical bytes, at the same lat
   and lng, gets that block as it is (a V2 block is a function of its polygon

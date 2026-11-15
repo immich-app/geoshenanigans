@@ -7675,7 +7675,9 @@ TEST(patch_refuses_old_files_with_a_byte_between_their_last_unit_and_what_follow
         BuildDir old_d, new_d;
         put_pois(old_d, pois);
         put_pois(new_d, edited);
-        cases.push_back({"poi", old_d, new_d, "poi_vertices.bin", poi_files::VERTEX_PAD, "Malformed POI files: poi_vertices.bin has bytes past its last block"});
+        // Records sent unchanged over one block that changes: the old POI files are held to
+        // their hashes before the codecs read them.
+        cases.push_back({"poi", old_d, new_d, "poi_vertices.bin", poi_files::VERTEX_PAD, "Old poi_vertices.bin is not the one the patch was made from"});
     }
     {
         std::vector<PlaceNode> places = some_places(20);
@@ -7774,4 +7776,49 @@ TEST(the_poi_replay_refuses_an_old_record_moved_under_a_block_it_would_copy) {
         REQUIRE(write_file(path, written));
     }
     CHECK(apply_modes(c, ALL_MODES, copied).bad.empty());
+}
+
+TEST(patch_holds_the_old_poi_files_to_their_hashes_when_only_the_blocks_change) {
+    ScratchDir dir("lowmem-poi-unchanged-records");
+    std::mt19937 rng(20261115);
+    BuildDir d;
+    put_pois(d, pois_of(rng, 30, 0, true));
+    const LowMemCase c{dir.path(), "records"};
+    REQUIRE(prepare(c, d, d).empty());
+    const std::vector<char>& records = d.at("poi_records.bin");
+    const std::vector<char>& vertices = d.at("poi_vertices.bin");
+
+    // The unchanged day's patch with the records still sent unchanged and the
+    // vertices as a merge, every byte a MATCH: the codecs replay the family.
+    const std::vector<char> raw = raw_patch(c);
+    const std::vector<char> copied_records = copy_old_section(PatchFileId::POI_RECORDS, records.size());
+    const std::vector<char> copied_vertices = copy_old_section(PatchFileId::POI_VERTICES, vertices.size());
+    std::vector<char> copies = copied_records;
+    copies.insert(copies.end(), copied_vertices.begin(), copied_vertices.end());
+    const size_t at = find_once(raw, copies);
+    REQUIRE(at != std::string::npos);
+    std::vector<char> vertex_ops;
+    put_op(vertex_ops, OP_MATCH_RUN, static_cast<uint32_t>(vertices.size()));
+    const std::vector<char> section = merge_of(PatchFileId::POI_VERTICES, 1, vertices.size(), vertices.size(), vertex_ops);
+    std::vector<char> merged(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(at));
+    merged.insert(merged.end(), copied_records.begin(), copied_records.end());
+    merged.insert(merged.end(), section.begin(), section.end());
+    merged.insert(merged.end(), raw.begin() + static_cast<std::ptrdiff_t>(at + copies.size()), raw.end());
+    REQUIRE(write_patch(c, c.patch(), merged));
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+
+    // A combo of the records' dictionary changed (the file still decodes), then
+    // a byte of the blocks: each file is refused by its hash, in every mode.
+    const std::string records_path = c.dir("old") + "/poi_records.bin", blocks_path = c.dir("old") + "/poi_vertices.bin";
+    const std::vector<char> written = read_file(records_path), blocks = read_file(blocks_path);
+    std::vector<char> another_combo = written, another_block = blocks;
+    another_combo[30 * poi_files::ROW_BYTES + 3] ^= 5;
+    another_block[blocks.size() / 2] ^= 1;
+    REQUIRE(write_file(records_path, another_combo));
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "combo", "Old poi_records.bin is not the one the patch was made from").empty());
+    REQUIRE(write_file(records_path, written));
+    REQUIRE(write_file(blocks_path, another_block));
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "block", "Old poi_vertices.bin is not the one the patch was made from").empty());
+    REQUIRE(write_file(blocks_path, blocks));
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }

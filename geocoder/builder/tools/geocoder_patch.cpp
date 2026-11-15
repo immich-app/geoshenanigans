@@ -378,6 +378,22 @@ private:
     size_t dropped_ = 0;  // a page multiple
 };
 
+// The old dir's `file` read front to back through a window and held to `hash`, the one the
+// patch gives for it. For old files the codecs replay: a decoder takes a damaged record that
+// is still a record.
+static void require_old_file_hash(const std::string& cur_dir, PatchFileId file, uint64_t hash) {
+    const std::string name = patch_file_names[static_cast<uint32_t>(file)];
+    SequentialFileReader in(SequentialFileReader::RAW, cur_dir + "/" + name);
+    if (!in.is_open()) throw std::runtime_error("Old " + name + " is missing");
+    LaneHasher hasher(in.size());
+    for (uint64_t at = 0; at < in.size();) {
+        const size_t n = static_cast<size_t>(std::min<uint64_t>(in.size() - at, SEQUENTIAL_READ_BUFFER_BYTES));
+        hasher.update(in.at(at, n), n);
+        at += n;
+    }
+    if (hasher.hash() != hash) throw std::runtime_error("Old " + name + " is not the one the patch was made from");
+}
+
 // The POI records' merge section at P[seq_at, seq_end) and the vertex section after it, replayed
 // on R2 + V2 as they sit (poi_replay.h), the MATCH records' fields moved as the generic replay
 // moves them; their MATCH and REPLACE runs go to remap (when given). The old R2 and V2 files must
@@ -976,6 +992,12 @@ static int run(int argc, char* argv[]) {
                 // one MATCH of every record, each followed by its child bytes.
                 const size_t rs = joint_parent_stride(file_id);
                 if (in.size() % rs) throw std::runtime_error(std::string("Old ") + fname + " is not whole records");
+                // POI records sent unchanged over blocks that change: both old files are held
+                // to their hashes before the codecs use a byte of them.
+                if (file_id == (uint32_t)PatchFileId::POI_RECORDS && old_size > 0) {
+                    for (const PatchFileId file : {PatchFileId::POI_RECORDS, PatchFileId::POI_VERTICES})
+                        require_old_file_hash(cur_dir, file, old_hash_of(file, "POI records"));
+                }
                 std::unique_ptr<JointChild> jc = open_joint_child(file_id, out, pos);
                 for (uint64_t off = 0; off < in.size(); off += rs) {
                     jc->hint();

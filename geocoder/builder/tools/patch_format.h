@@ -771,7 +771,9 @@ static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 // family has a section. The patcher refuses a second hash of a file, a hash
 // of any other file, and a replay without the hashes it checks by; a hash
 // whose replay does not run (both of the family's sections unchanged, or an
-// old file without records) is read and checks nothing.
+// old file without records) is read and checks nothing. POI records sent
+// unchanged over blocks that change go through the codecs, and the patcher
+// holds both old POI files to their hashes before it reads them.
 static constexpr uint32_t OLD_FILE_HASH_MARKER = 0xFFFFFFF8;
 static constexpr PatchFileId HASHED_OLD_FILES[] = {
     PatchFileId::POI_RECORDS,
