@@ -1408,10 +1408,15 @@ TEST(gcs_ways_codec_holds_one_way) {
     dec.state = {1, 1};
     WaySet out;
     std::vector<char> view(size_t(64) << 10);
+    size_t rows_reader = 0, blocks_reader = 0;
     auto read = [&](int port, size_t n, std::vector<uint8_t>& to) {
         while (n) {
             const size_t k = dec.read(port, view.data(), std::min(n, view.size()));
             if (!k) return false;
+            if (dec.R) {
+                rows_reader = std::max(rows_reader, dec.R->buf.size());
+                blocks_reader = std::max(blocks_reader, dec.B->buf.size());
+            }
             to.insert(to.end(), view.data(), view.data() + k);
             n -= k;
         }
@@ -1420,8 +1425,6 @@ TEST(gcs_ways_codec_holds_one_way) {
     bool complete = true;
     for (size_t at = 0; at < s.ways.size(); at += kind.stride)
         complete &= read(0, kind.stride, out.ways) && read(1, node_bytes(&s.ways[at]), out.nodes);
-    REQUIRE(dec.R && dec.B);
-    const size_t rows_reader = dec.R->buf.size(), blocks_reader = dec.B->buf.size();
     std::printf("    %zu B of nodes: encoder queue peaks %zu %zu B, decoder queue peaks %zu %zu B, readers %zu %zu B\n", s.nodes.size(),
                 encoder_records, encoder_nodes, dec.peak(0), dec.peak(1), rows_reader, blocks_reader);
 
@@ -1535,6 +1538,235 @@ TEST(gcs_reader_rejects_a_unit_past_what_its_buffer_holds) {
         20);
 
     CHECK_EQ(status, 2);
+}
+
+namespace {
+
+// A port's stream read as the patcher reads an old file whose decoded size
+// it knows: views of up to 64 KiB and none past that size, the other ports
+// closed. What it gave.
+std::vector<uint8_t> read_to_its_size(Decoder& dec, int port) {
+    for (size_t p = 0; p < dec.state.size(); p++) dec.state[p] = int(p) == port ? 1 : 2;
+    const uint64_t size = dec.decoded_size(port);
+    std::vector<uint8_t> out;
+    std::vector<char> view(size_t(64) << 10);
+    while (out.size() < size) {
+        const size_t k = dec.read(port, view.data(), size_t(std::min<uint64_t>(view.size(), size - out.size())));
+        if (!k) break;
+        out.insert(out.end(), view.data(), view.data() + k);
+    }
+    return out;
+}
+
+using Files = std::map<std::string, std::vector<char>>;
+
+void write_files(const std::string& dir, const Files& files) {
+    for (const auto& [name, bytes] : files) write_bytes(dir + "/" + name, std::vector<uint8_t>(bytes.begin(), bytes.end()));
+}
+
+const uint8_t* u8(const std::vector<char>& v) { return reinterpret_cast<const uint8_t*>(v.data()); }
+
+// The three place files of `visible` nodes, three a cell, and `hidden`
+// hidden ones after them (place_files::Encoder).
+Files place_files_of(uint32_t visible, uint32_t hidden) {
+    std::vector<char> cells, blocks, hidden_rows;
+    auto into = [](std::vector<char>& v) {
+        return [&v](const uint8_t* p, size_t n) { v.insert(v.end(), p, p + n); };
+    };
+    place_files::Encoder enc(into(cells), into(blocks), into(hidden_rows));
+    for (uint32_t i = 0; i < visible + hidden; i++) {
+        PlaceNode n{};
+        n.lat = 47.0f + float(i) * 1e-3f;
+        n.lng = 8.0f;
+        n.name_id = 16 * i;
+        n.place_type = 1;
+        if (i >= visible) n._pad1 = PLACE_FLAG_HIDDEN;
+        enc.add({n, i < visible ? i / 3 : NO_DATA});
+    }
+    enc.finish();
+    for (const auto& e : enc.table()) blocks.insert(blocks.end(), e.begin(), e.end());
+    const auto footer = enc.footer();
+    blocks.insert(blocks.end(), footer.begin(), footer.end());
+    return {{place_files::CELLS_FILE, cells}, {place_files::NODES_FILE, blocks}, {place_files::HIDDEN_FILE, hidden_rows}};
+}
+
+// A family's files as the builder writes them, with its decoder over a dir
+// that holds them, the ports whose stream ends with the files' last unit
+// (the records' unless the last record's child bytes come in pieces after
+// it, the child's when the last record has some), the whole-file decoder's
+// refusal of a set ("" when it takes it), and files a byte or a count away
+// from the written ones where they end.
+struct FilesEnd {
+    std::string name;
+    Files files;
+    std::function<std::unique_ptr<Decoder>(const std::string& dir)> decoder;
+    std::vector<int> ports;
+    std::function<std::string(const Files&)> strict;
+    struct Damage {
+        std::string what, file;
+        std::function<void(std::vector<char>&)> edit;
+    };
+    std::vector<Damage> damages;
+};
+
+// A byte put in `before` bytes from the file's end.
+std::function<void(std::vector<char>&)> a_byte_before_the_last(size_t before) {
+    return [before](std::vector<char>& f) { f.insert(f.end() - std::ptrdiff_t(before), char(0)); };
+}
+// The byte `before` bytes from the file's end, one more.
+std::function<void(std::vector<char>&)> one_more_at(size_t before) {
+    return [before](std::vector<char>& f) { f[f.size() - before]++; };
+}
+
+std::vector<FilesEnd> files_ends(std::mt19937& rng) {
+    std::vector<FilesEnd> ends;
+    for (const size_t n : {size_t(100), size_t(2048), size_t(4096)}) {
+        const std::string family = "way_postcodes", file = family + ".bin";
+        const size_t table = 4 * ((n + 63) / 64) + 8;
+        ends.push_back({"side file of " + std::to_string(n) + " values",
+                        {{file, side_file_of(family, side_values(n, rng))}},
+                        [family](const std::string& dir) { return std::unique_ptr<Decoder>(new side::Dec(dir, family)); },
+                        {0},
+                        [file](const Files& f) {
+                            return refusal_of([&] { side_blocks::decode(file, u8(f.at(file)), f.at(file).size(), [](const uint32_t*, size_t) {}); });
+                        },
+                        {{"a byte between the blocks and the table", file, a_byte_before_the_last(table)}}});
+    }
+    for (const way_files::Kind* kind : WAY_KINDS) {
+        // Ways that end without nodes (the records' stream alone ends with the last way), and ways that all have some.
+        for (const bool nodes_last : {false, true}) {
+            const std::vector<uint32_t> counts = nodes_last ? std::vector<uint32_t>(50, 3) : way_counts(40, rng);
+            ends.push_back({std::string(kind->ways_file) + (nodes_last ? ", every way with nodes" : ", the last ways without nodes"),
+                            way_files_of(*kind, way_set(*kind, counts, rng)),
+                            [kind](const std::string& dir) { return std::unique_ptr<Decoder>(new ways::Dec(dir, *kind)); },
+                            nodes_last ? std::vector<int>{0, 1} : std::vector<int>{0},
+                            [kind](const Files& f) {
+                                const std::vector<char>&rows = f.at(kind->ways_file), &blocks = f.at(kind->nodes_file);
+                                return refusal_of([&] {
+                                    way_files::decode(
+                                        *kind, u8(rows), rows.size(), u8(blocks), blocks.size(), [](const uint8_t*) {}, [](const uint8_t*, size_t) {});
+                                });
+                            },
+                            {{"a byte between the last block and the footer", kind->nodes_file, a_byte_before_the_last(way_files::NODES_FOOTER_BYTES)},
+                             {"a node more in the footer", kind->nodes_file, one_more_at(way_files::NODES_FOOTER_BYTES)}}});
+        }
+    }
+    for (const bool escape_last : {false, true}) {
+        // Addresses that end with points, and ones whose last footprint is an escape, which the decoder gives in pieces.
+        std::vector<AddrSpec> specs = addr_specs(40, rng);
+        specs.push_back(escape_last ? AddrSpec{9000, 3, false, 0} : AddrSpec{0, 0, false, 0});
+        const auto strict = [](const Files& f) {
+            const std::vector<char>&points = f.at(addr_files::POINTS_FILE), &vertices = f.at(addr_files::VERTICES_FILE),
+                              &index = f.at(addr_files::INDEX_FILE);
+            return refusal_of([&] { addr_files::decode(u8(points), points.size(), u8(vertices), vertices.size(), u8(index), index.size()); });
+        };
+        ends.push_back({escape_last ? "addresses, the last an escape" : "addresses, the last a point",
+                        addr_files_of(addr_set(specs, rng)),
+                        [](const std::string& dir) { return std::unique_ptr<Decoder>(new addr::Dec(dir)); },
+                        {escape_last ? 1 : 0},
+                        strict,
+                        {{"a byte between the last block and the footer", addr_files::POINTS_FILE, a_byte_before_the_last(addr_files::POINTS_FOOTER_BYTES)},
+                         {"a byte between the last blob and the footer", addr_files::VERTICES_FILE,
+                          a_byte_before_the_last(addr_files::VERTICES_FOOTER_BYTES)},
+                         {"a blob more in the footer", addr_files::VERTICES_FILE, one_more_at(8)}}});
+    }
+    for (const bool polygon_last : {false, true}) {
+        // POIs that end with a point, and ones whose last polygon is past big_block() (set to 4 KiB: decoded in pieces).
+        std::vector<PoiSpec> specs = {{0, 0, false}, {30, 2, false}, {5, 4, true}, {0, 0, false}, {700, 2, true}, {12, 2, false}};
+        specs.push_back(polygon_last ? PoiSpec{20000, 2, false} : PoiSpec{0, 0, false});
+        ends.push_back({polygon_last ? "POIs, the last a polygon in pieces" : "POIs, the last a point",
+                        poi_files_of(poi_set(specs, rng)),
+                        [](const std::string& dir) { return std::unique_ptr<Decoder>(new poi::Dec(dir)); },
+                        {polygon_last ? 1 : 0},
+                        [](const Files& f) {
+                            const std::vector<char>&r2 = f.at("poi_records.bin"), &v2 = f.at("poi_vertices.bin");
+                            return refusal_of([&] { poi_files::decode(u8(r2), r2.size(), u8(v2), v2.size()); });
+                        },
+                        {{"a byte between the last block and the pad", "poi_vertices.bin", a_byte_before_the_last(poi_files::VERTEX_PAD)},
+                         {"a pad that is not zero", "poi_vertices.bin", one_more_at(1)},
+                         {"a vertex byte more in the footer", "poi_records.bin", one_more_at(12)}}});
+    }
+    for (const uint32_t hidden : {0u, 300u}) {
+        // Place nodes that end with a block of visible ones, and with a run of hidden ones.
+        ends.push_back({hidden ? "places, the last hidden" : "places, all visible",
+                        place_files_of(500, hidden),
+                        [](const std::string& dir) { return std::unique_ptr<Decoder>(new place::Dec(dir)); },
+                        {0},
+                        [](const Files& f) {
+                            const std::vector<char>&cells = f.at(place_files::CELLS_FILE), &nodes = f.at(place_files::NODES_FILE),
+                                              &hidden_rows = f.at(place_files::HIDDEN_FILE);
+                            return refusal_of([&] {
+                                place_files::decode(u8(cells), cells.size(), u8(nodes), nodes.size(), u8(hidden_rows), hidden_rows.size(),
+                                                    [](const place_files::LogicalPlace&) {});
+                            });
+                        },
+                        {{"a byte between the blocks and the table", place_files::NODES_FILE,
+                          a_byte_before_the_last(place_files::TABLE_ENTRY_BYTES * ((500 + place_files::BLOCK_ROWS - 1) / place_files::BLOCK_ROWS) +
+                                                 place_files::FOOTER_BYTES)},
+                         {"a cell past the last visible node", place_files::CELLS_FILE,
+                          [](std::vector<char>& f) {
+                              // The next key, from the row past the last.
+                              uint8_t row[place_files::CELL_ROW_BYTES];
+                              wr32(row, rd32(u8(f) + f.size() - place_files::CELL_ROW_BYTES) + 1);
+                              wr32(row + 4, 500);
+                              f.insert(f.end(), row, row + sizeof row);
+                          }}}});
+    }
+    return ends;
+}
+
+}  // namespace
+
+TEST(gcs_decoders_check_how_their_files_end_with_the_last_unit_they_decode) {
+    // A reader that knows an old file's decoded size asks a decoder for no
+    // byte past it, so no step follows the one that decodes the files' last
+    // unit: that step makes the checks of how the files end. Each family's
+    // files as written, a port that ends with the last unit read to its
+    // decoded size, give its stream and leave the decoder at its end. With a
+    // byte between the last unit and what follows it, or a footer that
+    // counts one more, the read that reaches the last unit refuses them in
+    // the whole-file decoder's words: side files of less than a read ahead,
+    // of one and of two; way pairs that end with ways without nodes and with
+    // ways that have them; addresses that end with a point and with an
+    // escape, given in pieces; POIs that end with a point and with a polygon
+    // past big_block(), decoded in pieces; places that end with visible
+    // nodes and with hidden ones.
+    std::mt19937 rng(20261115);
+    BigBlock small(4096);
+    for (const FilesEnd& end : files_ends(rng)) {
+        const int failures_before = gctest::failures();
+        REQUIRE(end.strict(end.files).empty());
+        {
+            ScratchDir dir("gcs-test");
+            write_files(dir.path(), end.files);
+            for (const int port : end.ports) {
+                const std::unique_ptr<Decoder> dec = end.decoder(dir.path());
+                const uint64_t size = dec->decoded_size(port);
+                std::vector<uint8_t> out;
+                CHECK_EQ(refusal_of([&] { out = read_to_its_size(*dec, port); }), std::string());
+                CHECK(out.size() == size && !out.empty());
+                // The decoder is at its end: it has nothing more for any port.
+                CHECK(!dec->step());
+            }
+        }
+        for (const FilesEnd::Damage& damage : end.damages) {
+            Files damaged = end.files;
+            damage.edit(damaged.at(damage.file));
+            const std::string strict = end.strict(damaged);
+            CHECK(!strict.empty());
+            ScratchDir dir("gcs-test");
+            write_files(dir.path(), damaged);
+            for (const int port : end.ports) {
+                const std::string ours = refusal_of([&] {
+                    const std::unique_ptr<Decoder> dec = end.decoder(dir.path());
+                    read_to_its_size(*dec, port);
+                });
+                if (ours != strict) std::printf("    %s, %s, port %d: \"%s\", not \"%s\"\n", end.name.c_str(), damage.what.c_str(), port, ours.c_str(), strict.c_str());
+                CHECK_EQ(ours, strict);
+            }
+        }
+        if (gctest::failures() > failures_before) std::printf("    in: %s\n", end.name.c_str());
+    }
 }
 
 namespace {

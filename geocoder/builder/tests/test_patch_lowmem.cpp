@@ -7600,3 +7600,83 @@ TEST(patch_refuses_bytes_no_record_of_a_family_owns_as_they_come) {
     }
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
+
+// A reader that knows an old file's decoded size reads no byte past it, so a
+// decoder makes the checks of how its files end as it decodes their last
+// unit. Old files with a byte between the last unit and what follows it,
+// which a day's patch reads to their end, are refused in every mode in the
+// whole-file decoder's words: a side file alone (a sparse delta) and beside
+// its ways (a parallel delta along ways sent unchanged), of 100 values, of
+// 2,048 (a read ahead of the decoder's) and of 4,096, a byte between its
+// blocks and its table; POI files whose records stay while a polygon changes
+// (the records sent unchanged replay with their vertices through the codecs),
+// a byte between the last block and the pad; and place files with a place
+// renamed, a byte between the blocks and the table. Each patch applies to the
+// files as written.
+TEST(patch_refuses_old_files_with_a_byte_between_their_last_unit_and_what_follows_it) {
+    ScratchDir dir("lowmem-file-ends");
+    std::mt19937 rng(20261115);
+    struct Case {
+        std::string name;
+        BuildDir old_d, new_d;
+        std::string file;
+        size_t before;  // the byte goes in this many bytes from the file's end
+        std::string refusal;
+    };
+    std::vector<Case> cases;
+    const std::string side = "Malformed way_parents.bin: bytes between its blocks and its table";
+    for (const uint32_t n : {100u, 2048u, 4096u}) {
+        std::vector<char> parents, changed;
+        for (uint32_t v = 0; v < n; v++) {
+            append(parents, v % 700);
+            append(changed, v % 700 + (v == n / 2));
+        }
+        const size_t table = size_t{4} * ((n + 63) / 64) + 8;
+        cases.push_back({"side-" + std::to_string(n), {{"way_parents.bin", parents}}, {{"way_parents.bin", changed}}, "way_parents.bin", table, side});
+        BuildDir with_ways, meta;
+        std::vector<uint32_t> names(n);
+        for (uint32_t w = 0; w < n; w++) names[w] = w % 9;
+        put_named_ways(with_ways, meta, names);
+        BuildDir with_ways_changed = with_ways;
+        with_ways["way_parents.bin"] = parents;
+        with_ways_changed["way_parents.bin"] = changed;
+        cases.push_back({"side-beside-" + std::to_string(n), with_ways, with_ways_changed, "way_parents.bin", table, side});
+    }
+    {
+        const std::vector<Poi> pois = pois_of(rng, 300, 0, true);
+        std::vector<Poi> edited = pois;
+        std::fill(edited[100].block.begin() + 10, edited[100].block.end(), 0);
+        BuildDir old_d, new_d;
+        put_pois(old_d, pois);
+        put_pois(new_d, edited);
+        cases.push_back({"poi", old_d, new_d, "poi_vertices.bin", poi_files::VERTEX_PAD, "Malformed POI files: poi_vertices.bin has bytes past its last block"});
+    }
+    {
+        std::vector<PlaceNode> places = some_places(20);
+        BuildDir old_d, new_d;
+        put_places(old_d, places);
+        places[5].name_id = 1000;
+        put_places(new_d, places);
+        // 15 visible nodes: one block.
+        cases.push_back({"places", old_d, new_d, "place_nodes.bin", place_files::TABLE_ENTRY_BYTES + place_files::FOOTER_BYTES,
+                         "Malformed place files: place_nodes.bin has bytes between its blocks and its table"});
+    }
+    for (const Case& e : cases) {
+        const int failures_before = gctest::failures();
+        const LowMemCase c{dir.path(), e.name};
+        REQUIRE(prepare(c, e.old_d, e.new_d).empty());
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
+        const std::string path = c.dir("old") + "/" + e.file;
+        const std::vector<char> written = read_file(path);
+        REQUIRE(written.size() > e.before);
+        std::vector<char> longer = written;
+        longer.insert(longer.end() - static_cast<std::ptrdiff_t>(e.before), 0);
+        REQUIRE(write_file(path, longer));
+
+        CHECK(not_refused(c, ALL_MODES, c.patch(), "longer", e.refusal).empty());
+
+        REQUIRE(write_file(path, written));
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
+        if (gctest::failures() > failures_before) std::printf("    in: %s\n", e.name.c_str());
+    }
+}

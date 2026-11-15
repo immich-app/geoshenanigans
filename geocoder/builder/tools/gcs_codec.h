@@ -34,7 +34,10 @@ struct Decoder {
     Decoder(const std::string& n, std::vector<std::string> port_files)
         : out(port_files.size()), state(port_files.size(), 0), drop(port_files.size(), 0), name(n), files(std::move(port_files)) {}
     virtual ~Decoder() = default;
-    virtual bool step() = 0;  // emits the next unit; false at the end
+    // Emits the next unit; false at the end. The step that emits the files' last unit makes the
+    // checks of how they end: a reader that knows a file's decoded size asks for no byte past
+    // it, so no step follows that one.
+    virtual bool step() = 0;
     // The decoded size of a port's file, from the footers alone.
     virtual uint64_t decoded_size(int port) const = 0;
     inline void emit(int port, const void* p, size_t n) {
@@ -215,8 +218,8 @@ inline uint64_t decoded_size(const std::string& dir, const wf::Kind& kind, int p
 
 // Ports: 0 = the ways' records, 1 = their nodes. A step: a way's record and its nodes. A dir
 // without the two files decodes to none. It checks between the units what way_files::decode
-// checks: each row's blocks start where those before them end, the last block ends at the
-// footer, and the ways' nodes are the footer's.
+// checks: each row's blocks start where those before them end, and with the last way that the
+// last block ends at the footer and the ways' nodes are the footer's.
 struct Dec : Decoder {
     const wf::Kind& kind;
     wf::Footers f;
@@ -225,7 +228,10 @@ struct Dec : Decoder {
     uint64_t way = 0, node = 0, at = 0;  // the ways and nodes decoded, and the bytes of their blocks
     Dec(const std::string& src, const wf::Kind& k)
         : Decoder(family_of(k), {k.ways_file, k.nodes_file}), kind(k), f(footers_of(src, k)) {
-        if (!f.ways) return;
+        if (!f.ways) {
+            end();
+            return;
+        }
         R.reset(new Reader(src + "/" + k.ways_file, ROWS_BUF, 0, f.rows_bytes));
         B.reset(new Reader(src + "/" + k.nodes_file, BLOCKS_BUF, 0, f.blocks_bytes));
     }
@@ -233,17 +239,17 @@ struct Dec : Decoder {
         const wf::LogicalSizes sizes = wf::logical_sizes(kind, f);
         return port == 0 ? sizes.ways : sizes.nodes;
     }
+    // After the last way: how the files end.
+    void end() {
+        if (at != f.blocks_bytes) wf::malformed(std::string(kind.nodes_file) + " has bytes between its last block and its footer");
+        if (node != f.nodes)
+            wf::malformed(std::string(kind.nodes_file) + " counts " + std::to_string(f.nodes) + " nodes and its ways have " +
+                          std::to_string(node));
+        R.reset();
+        B.reset();
+    }
     bool step() override {
-        if (way == f.ways) {
-            if (!R) return false;
-            if (at != f.blocks_bytes) wf::malformed(std::string(kind.nodes_file) + " has bytes between its last block and its footer");
-            if (node != f.nodes)
-                wf::malformed(std::string(kind.nodes_file) + " counts " + std::to_string(f.nodes) + " nodes and its ways have " +
-                              std::to_string(node));
-            R.reset();
-            B.reset();
-            return false;
-        }
+        if (!R) return false;
         const size_t j = size_t(way % wf::GROUP_WAYS);
         if (j == 0) {
             const uint64_t g = way / wf::GROUP_WAYS;
@@ -266,7 +272,7 @@ struct Dec : Decoder {
             at += bytes;
             node += cnt;
         }
-        way++;
+        if (++way == f.ways) end();
         return true;
     }
 };
@@ -342,7 +348,9 @@ inline uint64_t decoded_size(const std::string& dir, const std::string& family) 
     return footer_of(path, file, uint64_t(st.st_size)).logical_bytes();
 }
 
-// Port 0 = the file's values. A step: a block. A dir without the file decodes to none.
+// Port 0 = the file's values. A step: a block. A dir without the file decodes to none. It
+// checks what side_blocks::decode checks: each block is where the table puts it, and with the
+// last block that the blocks end where the table starts.
 struct Dec : Decoder {
     std::string file;
     std::unique_ptr<Reader> B, T;  // the blocks, and their table
@@ -354,18 +362,22 @@ struct Dec : Decoder {
         if (stat(path.c_str(), &st) != 0) return;
         const uint64_t size = uint64_t(st.st_size);
         f = footer_of(path, file, size);
+        if (!f.blocks) {
+            end();
+            return;
+        }
         B.reset(new Reader(path, BLOCKS_BUF, 0, f.table_at));
         T.reset(new Reader(path, TABLE_BUF, f.table_at, size - side_blocks::FOOTER_BYTES));
     }
     uint64_t decoded_size(int) const override { return f.logical_bytes(); }
+    // After the last block: how the file ends.
+    void end() {
+        if (at != f.table_at) side_blocks::malformed(file, "bytes between its blocks and its table");
+        B.reset();
+        T.reset();
+    }
     bool step() override {
         if (!B) return false;
-        if (b == f.blocks) {
-            if (at != f.table_at) side_blocks::malformed(file, "bytes between its blocks and its table");
-            B.reset();
-            T.reset();
-            return false;
-        }
         if (side_blocks::get32(T->take(side_blocks::TABLE_ENTRY_BYTES)) != at)
             side_blocks::malformed(file, "block " + std::to_string(b) + " is not where the blocks before it end");
         const size_t count = f.values_of(b), avail = size_t(std::min<uint64_t>(B->left(), side_blocks::BLOCK_MAX_BYTES));
@@ -375,7 +387,7 @@ struct Dec : Decoder {
         B->skip(bytes);
         emit(0, values.data(), 4 * count);
         at += bytes;
-        b++;
+        if (++b == f.blocks) end();
         return true;
     }
 };
@@ -500,8 +512,9 @@ inline uint64_t decoded_size(const std::string& dir, int port) {
 // and its footprint, its block decoded as its first record is due; or a piece of an escaped
 // footprint, which neither the reader nor a queue holds whole. A dir without the three files
 // decodes to none. It checks between the units what addr_files::decode checks: each block and
-// each blob starts where those before it end and where addr_index.bin puts it, the last ones end
-// at the footers, and the blobs and their logical bytes are the footer's.
+// each blob starts where those before it end and where addr_index.bin puts it, and with the last
+// record and its footprint that the last ones end at the footers and that the blobs and their
+// logical bytes are the footer's.
 struct Dec : Decoder {
     af::Footers f;
     std::unique_ptr<Reader> P, V, X;  // the blocks, the blobs, and the index's rows
@@ -512,9 +525,11 @@ struct Dec : Decoder {
     uint64_t blocks_at = 0, blobs_at = 0, row_blocks_at = 0, row_blobs_at = 0;
     uint64_t logical = 0, blobs = 0;  // the footprints passed: their logical bytes, and how many
     uint64_t escaped_left = 0;        // bytes of the escaped footprint in progress still to emit
-    bool ended = false;
     explicit Dec(const std::string& src) : Decoder("addr", {af::POINTS_FILE, af::VERTICES_FILE}), f(footers_of(src)) {
-        if (!f.records) return;
+        if (!f.records) {
+            end();
+            return;
+        }
         P.reset(new Reader(src + "/" + af::POINTS_FILE, BLOCKS_BUF));
         V.reset(new Reader(src + "/" + af::VERTICES_FILE, BLOBS_BUF));
         X.reset(new Reader(src + "/" + af::INDEX_FILE, INDEX_BUF));
@@ -594,33 +609,29 @@ struct Dec : Decoder {
         j++;
         record++;
     }
+    // After the last record and its footprint: how the files end.
+    void end() {
+        const std::string vertices_file = af::VERTICES_FILE;
+        if (blocks_at != f.blocks_bytes) af::malformed(std::string(af::POINTS_FILE) + " has bytes between its last block and its footer");
+        if (blobs_at != f.blobs_bytes) af::malformed(vertices_file + " has bytes between its last blob and its footer");
+        if (logical != f.logical_vertex_bytes)
+            af::malformed(vertices_file + " counts " + std::to_string(f.logical_vertex_bytes) + " bytes of logical blobs and its blobs hold " +
+                          std::to_string(logical));
+        if (blobs != f.blobs)
+            af::malformed(vertices_file + " counts " + std::to_string(f.blobs) + " blobs and holds " + std::to_string(blobs));
+        P.reset();
+        V.reset();
+        X.reset();
+    }
     bool step() override {
+        if (!P) return false;
         if (escaped_left) {
             emit_escaped_piece();
-            return true;
+        } else {
+            if (j == block.records) next_block();
+            emit_record();
         }
-        if (j == block.records) {
-            if (b == f.blocks()) {
-                if (ended) return false;
-                ended = true;
-                const std::string vertices_file = af::VERTICES_FILE;
-                if (blocks_at != f.blocks_bytes)
-                    af::malformed(std::string(af::POINTS_FILE) + " has bytes between its last block and its footer");
-                if (blobs_at != f.blobs_bytes) af::malformed(vertices_file + " has bytes between its last blob and its footer");
-                if (logical != f.logical_vertex_bytes)
-                    af::malformed(vertices_file + " counts " + std::to_string(f.logical_vertex_bytes) +
-                                  " bytes of logical blobs and its blobs hold " + std::to_string(logical));
-                if (blobs != f.blobs)
-                    af::malformed(vertices_file + " counts " + std::to_string(f.blobs) + " blobs and holds " +
-                                  std::to_string(blobs));
-                P.reset();
-                V.reset();
-                X.reset();
-                return false;
-            }
-            next_block();
-        }
-        emit_record();
+        if (record == f.records && !escaped_left) end();
         return true;
     }
 };
@@ -742,9 +753,11 @@ inline uint64_t decoded_size(const std::string& dir, int port) {
 }
 
 // Ports: 0 = poi_records (36 B), 1 = poi_vertices. A step: one record and its block, or a piece of a
-// block too large to take whole. A dir without the two files decodes to none. vertices_only: the
-// POI replay's vertex cursor (poi_replay.h), which reads port 1 alone (port 0 closed) and skips
-// ahead: a block its pending skip covers whole passes undecoded.
+// block too large to take whole. A dir without the two files decodes to none. With the last record
+// and its block it checks how the files end, as poi_files::decode does: every dictionary entry
+// used, no byte between the last block and the pad, a pad of zeros, and the footer's vertex
+// stream. vertices_only: the POI replay's vertex cursor (poi_replay.h), which reads port 1 alone
+// (port 0 closed) and skips ahead: a block its pending skip covers whole passes undecoded.
 struct Dec : Decoder {
     poi_files::RowDecoder rows;
     std::unique_ptr<Reader> R, V;
@@ -765,12 +778,32 @@ struct Dec : Decoder {
         V.reset(new Reader(vp));
         if (V->size() < poi_files::VERTEX_PAD) poi_files::malformed("poi_vertices.bin is shorter than its pad");
         blocks_end = V->size() - poi_files::VERTEX_PAD;
+        if (!n) end();
     }
     uint64_t decoded_size(int port) const override {
-        if (!R) return 0;
         return port == 0 ? poi_files::LOGICAL_STRIDE * n : rows.footer().logical_vertex_bytes;
     }
+    // After the last record and its block: how the files end.
+    void end() {
+        rows.finish();
+        if (V->tell() != blocks_end) poi_files::malformed("poi_vertices.bin has bytes past its last block");
+        const uint8_t* pad = V->take(poi_files::VERTEX_PAD);
+        for (size_t k = 0; k < poi_files::VERTEX_PAD; k++)
+            if (pad[k]) poi_files::malformed("poi_vertices.bin's pad is not zero");
+        if (logical != rows.footer().logical_vertex_bytes)
+            poi_files::malformed("the vertex stream is " + std::to_string(logical) + " bytes, the footer gives " +
+                                 std::to_string(rows.footer().logical_vertex_bytes));
+        R.reset();
+        V.reset();
+    }
     bool step() override {
+        if (!R) return false;
+        unit();
+        if (i == n && !big) end();
+        return true;
+    }
+    // The next record and its block, or the next piece of a block in pieces.
+    void unit() {
         if (big) {
             const size_t vs = poi_files::vertex_bytes(blk.encoding);
             const uint64_t k = big->done(), c = std::min<uint64_t>(VERTS_PER_STEP, blk.m - k);
@@ -783,21 +816,7 @@ struct Dec : Decoder {
                 big->finish(nb ? p[nb - 1] : 0, o + c * vs);
                 big.reset();
             }
-            return true;
-        }
-        if (i == n) {
-            if (!R) return false;
-            rows.finish();
-            if (V->tell() != blocks_end) poi_files::malformed("poi_vertices.bin has bytes past its last block");
-            const uint8_t* pad = V->take(poi_files::VERTEX_PAD);
-            for (size_t k = 0; k < poi_files::VERTEX_PAD; k++)
-                if (pad[k]) poi_files::malformed("poi_vertices.bin's pad is not zero");
-            if (logical != rows.footer().logical_vertex_bytes)
-                poi_files::malformed("the vertex stream is " + std::to_string(logical) + " bytes, the footer gives " +
-                                     std::to_string(rows.footer().logical_vertex_bytes));
-            R.reset();
-            V.reset();
-            return false;
+            return;
         }
         uint8_t rec[poi_files::LOGICAL_STRIDE];
         bool polygon;
@@ -808,7 +827,7 @@ struct Dec : Decoder {
         i++;
         if (!polygon) {
             emit(0, rec, poi_files::LOGICAL_STRIDE);
-            return true;
+            return;
         }
         const uint64_t left = blocks_end - std::min(V->tell(), blocks_end);
         const uint8_t* h = V->need(poi_files::MAX_BLOCK_HEADER, true);
@@ -821,7 +840,7 @@ struct Dec : Decoder {
             V->seek(V->tell() + blk.bytes());
             drop[1] -= blk.logical_bytes();
             if (!drop[1]) dropping--;
-            return true;
+            return;
         }
         wr32(rec + poi_files::OFF_VERTEX_OFFSET, uint32_t(logical));
         wr32(rec + poi_files::OFF_VERTEX_COUNT, uint32_t(blk.vertex_count()));
@@ -837,13 +856,12 @@ struct Dec : Decoder {
             poi_files::VertexDecoder vd(blk);
             vd.decode(p, pb, blk.m, o + poi_files::LOGICAL_HEADER);
             vd.finish(pb ? p[pb - 1] : 0, o + poi_files::LOGICAL_HEADER + blk.m * bvs);
-            return true;
+            return;
         }
         uint8_t hdr[poi_files::LOGICAL_HEADER];
         poi_files::logical_header(blk, hdr);
         emit(1, hdr, poi_files::LOGICAL_HEADER);
         big.reset(new poi_files::VertexDecoder(blk));
-        return true;
     }
 };
 
@@ -1020,14 +1038,16 @@ inline uint64_t decoded_size(const std::string& dir) {
 }
 
 // Port 0 = place_nodes.bin's logical stream (pf::LogicalPlace). A step: a block of visible rows, or
-// a run of hidden rows. A dir without the three files decodes to none.
+// a run of hidden rows. A dir without the three files decodes to none. With the last of them it
+// checks how the files end, as place_files::decode does: the blocks end where their table starts,
+// and no cell is left over.
 struct Dec : Decoder {
     static constexpr size_t HIDDEN_PER_STEP = SMALL_BUF / pf::HIDDEN_ROW_BYTES;
     std::unique_ptr<Reader> C, N, T, H;  // place_cells.bin, place_nodes.bin's blocks and its table, place_hidden.bin
     pf::Footer f;
     std::unique_ptr<pf::CellCursor> cells;
     size_t b = 0;
-    uint64_t at = 0;
+    uint64_t at = 0, hidden = 0;  // the bytes of the blocks decoded, and the hidden rows of the set
     explicit Dec(const std::string& src) : Decoder("places", {pf::NODES_FILE}) {
         const std::string cp = src + "/" + pf::CELLS_FILE, np = src + "/" + pf::NODES_FILE, hp = src + "/" + pf::HIDDEN_FILE;
         struct stat st;
@@ -1048,10 +1068,18 @@ struct Dec : Decoder {
         N.reset(new Reader(np, BLOCKS_BUF, 0, f.table_at));
         T.reset(new Reader(np, SMALL_BUF, f.table_at, size - pf::FOOTER_BYTES));
         H.reset(new Reader(hp, SMALL_BUF));
+        hidden = hs / pf::HIDDEN_ROW_BYTES;
+        if (!f.blocks && !hidden) end();
     }
-    uint64_t decoded_size(int) const override {
-        if (!N) return 0;
-        return pf::LOGICAL_STRIDE * (uint64_t(f.rows) + H->size() / pf::HIDDEN_ROW_BYTES);
+    uint64_t decoded_size(int) const override { return pf::LOGICAL_STRIDE * (uint64_t(f.rows) + hidden); }
+    // After the last block and the last hidden row: how the files end.
+    void end() {
+        if (at != f.table_at) pf::malformed("place_nodes.bin has bytes between its blocks and its table");
+        cells->finish();
+        C.reset();
+        N.reset();
+        T.reset();
+        H.reset();
     }
     bool step() override {
         if (!N) return false;
@@ -1070,9 +1098,7 @@ struct Dec : Decoder {
                 });
             at += bytes;
             b++;
-            return true;
-        }
-        if (!H->eof()) {
+        } else {
             const size_t n = size_t(std::min<uint64_t>(H->left() / pf::HIDDEN_ROW_BYTES, HIDDEN_PER_STEP));
             const uint8_t* p = H->take(n * pf::HIDDEN_ROW_BYTES);
             uint8_t* o = emit_reserve(0, n * pf::LOGICAL_STRIDE);
@@ -1080,15 +1106,9 @@ struct Dec : Decoder {
                 const pf::LogicalPlace pl = pf::hidden_place(p + k * pf::HIDDEN_ROW_BYTES);
                 memcpy(o + k * pf::LOGICAL_STRIDE, &pl, pf::LOGICAL_STRIDE);
             }
-            return true;
         }
-        if (at != f.table_at) pf::malformed("place_nodes.bin has bytes between its blocks and its table");
-        cells->finish();
-        C.reset();
-        N.reset();
-        T.reset();
-        H.reset();
-        return false;
+        if (b == f.blocks && H->eof()) end();
+        return true;
     }
 };
 
