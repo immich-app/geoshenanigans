@@ -7,7 +7,7 @@
 //! decoded from its blob. geocoder/testdata/addr_files.tsv holds blobs and files the builder's
 //! encoder and this reader must agree on.
 
-use crate::coord_keys::{biased, bits_at, from_hybrid_key, from_order_key, is_hybrid_key, order_key, unzigzag16, varint};
+use crate::coord_keys::{biased, bit_length, bits_at, from_hybrid_key, from_order_key, is_hybrid_key, order_key, unzigzag16, varint};
 use crate::{FileBytes, NodeCoord};
 
 pub const POINTS_FILE: &str = "addr_points.bin";
@@ -27,6 +27,10 @@ const INDEX_FOOTER_BYTES: usize = 8;
 const INDEX_HEAD_BYTES: usize = 16;
 const INDEX_ENTRY_BYTES: usize = 6;
 const INDEX_ROW_BYTES: usize = INDEX_HEAD_BYTES + SUPERBLOCK_BLOCKS * INDEX_ENTRY_BYTES;
+/// The most records the files hold, and the most bytes of their footprints' logical blobs: a
+/// patch indexes either in a u32 below NO_DATA.
+const MAX_RECORDS: u64 = u32::MAX as u64 - 1;
+const MAX_LOGICAL_VERTEX_BYTES: u64 = u32::MAX as u64 - 1;
 
 const FLAG_LAT_ORDER: u8 = 1;
 const FLAG_LNG_ORDER: u8 = 2;
@@ -107,8 +111,10 @@ struct Block<'a> {
     /// From the records' fields to the end of the file: the footer after the blocks holds the 8
     /// bytes a field's load takes past the block.
     fields: &'a [u8],
-    /// Where the first blob of the block's records starts in addr_vertices.bin.
+    /// Where the first blob of the block's records starts in addr_vertices.bin, and where their
+    /// last one ends at the latest: where the next block's first starts, or the blobs end.
     blobs_at: u64,
+    blobs_end: u64,
 }
 
 impl Block<'_> {
@@ -173,15 +179,21 @@ impl BlobHead {
     }
 }
 
-/// The head of a blob, given all of its bytes; None for a blob no builder writes: a tag or a
-/// count none has, or bytes that are not the ones its count and its widths take.
-fn blob_head(blob: &[u8]) -> Option<BlobHead> {
+/// The head of the blob of `record`'s footprint, given all of the blob's bytes; None for a blob
+/// no builder writes: a tag or a count none has, an escape of a footprint a blob holds, bytes
+/// that are not the ones its count and its widths take or that end in bits past its last value,
+/// two residuals at a point that is not finite, a residual of -128.
+fn blob_head(blob: &[u8], record: &AddrRecord) -> Option<BlobHead> {
     let tag = *blob.first()?;
     let mut at = 1;
     if tag == ESCAPE_TAG {
         let count = varint(blob, &mut at, 5)?;
         let enc = *blob.get(at)?;
         if count == 0 || enc > 3 || *blob.get(at + 1)? != 0 {
+            return None;
+        }
+        // An escape is of a footprint in encoding 3, or of more vertices than a blob holds.
+        if enc != 3 && count <= MAX_BLOB_VERTICES {
             return None;
         }
         let vertex_bytes = if enc == 3 { 8 } else { 4 };
@@ -209,12 +221,25 @@ fn blob_head(blob: &[u8]) -> Option<BlobHead> {
     if stored == 0 || stored + u64::from(closed) > MAX_BLOB_VERTICES {
         return None;
     }
+    if small {
+        // Two residuals are a finite point's, whose predictions then are finite: the mean of a
+        // footprint's steps is below 7 degrees. Each is within 127 floats: a byte's -128 is none.
+        let finite = record.lat.is_finite() && record.lng.is_finite();
+        if !finite || *blob.get(at)? == 0x80 || *blob.get(at + 1)? == 0x80 {
+            return None;
+        }
+    }
     // Two residuals, or the bbox minimum in full, and then the widths' byte.
     let values_at = at + if small { 2 } else { 8 } + 1;
     let widths = *blob.get(values_at - 1)?;
     let bits = |nibble: u8| if nibble == 15 { 16 } else { u32::from(nibble) };
     let (wl, wg) = (bits(widths & 15), bits(widths >> 4));
-    if blob.len() as u64 != values_at as u64 + (stored * u64::from(wl + wg)).div_ceil(8) {
+    // The values, which end in zero bits to the blob's last byte's end.
+    let values = stored * u64::from(wl + wg);
+    if blob.len() as u64 != values_at as u64 + values.div_ceil(8) {
+        return None;
+    }
+    if values % 8 != 0 && *blob.last()? >> (values % 8) != 0 {
         return None;
     }
     Some(BlobHead { enc: tag & 3, escape: false, closed, small, delta: tag & TAG_DELTA != 0, stored: stored as u32, bbox_at: at, values_at, wl, wg })
@@ -302,10 +327,10 @@ fn footer_count(bytes: &[u8], len: usize, magic: &str, file: &str) -> Result<u32
 impl AddrFiles {
     /// The files of a dir, mapped, each None where the dir has no such file: None of a dir with
     /// none of the three, which has no addresses. An error for files no builder writes: some of
-    /// the three without the others, a footer without its magic, an index that counts other
-    /// records than the blocks' footer or is not their rows, more blobs than records. What a
-    /// block or a blob holds is not checked here: a record or a footprint that can't be read
-    /// reads as none.
+    /// the three without the others, a footer without its magic, more records or bytes of
+    /// logical blobs than a patch indexes, an index that counts other records than the blocks'
+    /// footer or is not their rows, more blobs than records. What a block or a blob holds is
+    /// not checked here: a record or a footprint that can't be read reads as none.
     pub fn open(points: Option<FileBytes>, vertices: Option<FileBytes>, index: Option<FileBytes>) -> Result<Option<AddrFiles>, String> {
         let (points, vertices, index) = match (points, vertices, index) {
             (Some(points), Some(vertices), Some(index)) => (points, vertices, index),
@@ -319,7 +344,16 @@ impl AddrFiles {
         let (p, v, x) = (points.as_slice(), vertices.as_slice(), index.as_slice());
         let records = footer_count(p, POINTS_FOOTER_BYTES, "ADB1", POINTS_FILE)?;
         let blobs = footer_count(v, VERTICES_FOOTER_BYTES, "ADF1", VERTICES_FILE)?;
-        if footer_count(x, INDEX_FOOTER_BYTES, "ADX1", INDEX_FILE)? != records {
+        let indexed = footer_count(x, INDEX_FOOTER_BYTES, "ADX1", INDEX_FILE)?;
+        // The bytes of the logical blobs, which addr_vertices.bin's footer starts with.
+        let logical_bytes = u64_at(v, v.len() - VERTICES_FOOTER_BYTES).unwrap_or(0);
+        if logical_bytes > MAX_LOGICAL_VERTEX_BYTES {
+            return Err(format!("a logical {VERTICES_FILE} of {logical_bytes} bytes is more than the {MAX_LOGICAL_VERTEX_BYTES} a patch can index"));
+        }
+        if u64::from(records) > MAX_RECORDS {
+            return Err(format!("{records} records in {POINTS_FILE} are more than the {MAX_RECORDS} a patch can index"));
+        }
+        if indexed != records {
             return Err(format!("{POINTS_FILE} and {INDEX_FILE} count different records"));
         }
         // A row's head a superblock and an entry a block, the last row as short as its blocks.
@@ -341,8 +375,8 @@ impl AddrFiles {
     }
 
     /// Record `id`; None past the last record and for one that can't be read: a block no builder
-    /// writes or one placed past the blocks' end, a key or an id past 32 bits, an index past
-    /// the block's dictionary, a blob placed past the blobs' end.
+    /// writes or one that is not the bytes up to the next block's start, a key or an id past 32
+    /// bits, an index past the block's dictionary, a blob placed past its block's blobs' end.
     pub fn record(&self, id: u32) -> Option<AddrRecord> {
         Run::new(self).record(id, None)
     }
@@ -373,13 +407,13 @@ impl AddrFiles {
     /// The vertices of a record's footprint, from its blob's first bytes: 0 for a point and for
     /// a blob that can't be read (`footprint`).
     pub fn vertex_count(&self, record: &AddrRecord) -> u32 {
-        self.blob(record).and_then(|(blob, _)| blob_head(blob)).map_or(0, |head| head.vertex_count())
+        self.blob(record).and_then(|(blob, _)| blob_head(blob, record)).map_or(0, |head| head.vertex_count())
     }
 
     /// A record's footprint into `vertices`, which is cleared first: a closed ring's first
     /// vertex is also its last. False, and no vertices, for a point and for a blob that can't be
-    /// read: one placed past the blobs' end, a head no builder writes, bytes that are not the
-    /// ones its count and its widths take.
+    /// read: one placed past the blobs' end, a head no builder writes for a footprint at the
+    /// record's point, bytes that are not the ones its count and its widths take.
     pub fn footprint(&self, record: &AddrRecord, vertices: &mut Vec<NodeCoord>) -> bool {
         vertices.clear();
         let read = self.read_footprint(record, vertices).is_some();
@@ -402,26 +436,46 @@ impl AddrFiles {
         read
     }
 
-    /// Block `b`, one of the blocks; None for one that can't be read: one placed past the blocks'
-    /// end or that ends past it, a head no builder writes.
+    /// Block `b`, one of the blocks; None for one that can't be read: one that is not the bytes
+    /// from where the index places it to where it places the next (the blocks' end for the
+    /// last), a superblock's first that is not where the superblock starts or the first of all
+    /// that does not start the file, a head no builder writes.
     fn block(&self, b: usize) -> Option<Block<'_>> {
-        let records = BLOCK_RECORDS.min(self.records as usize - b * BLOCK_RECORDS);
+        let left = self.records as usize - b * BLOCK_RECORDS;
+        let records = BLOCK_RECORDS.min(left);
         // The superblock's row: where its first block and its first blob start, and how far
         // after them this block's do.
         let row = self.index.as_slice().get(b / SUPERBLOCK_BLOCKS * INDEX_ROW_BYTES..)?;
         let entry = INDEX_HEAD_BYTES + b % SUPERBLOCK_BLOCKS * INDEX_ENTRY_BYTES;
-        let at = usize::try_from(u64_at(row, 0)?.checked_add(u16_at(row, entry)?.into())?).ok()?;
-        let blobs_at = u64_at(row, 8)?.checked_add(u32_at(row, entry + 2)?.into())?;
-        // From the block's first byte to the blocks' end: its own end is its head's to give.
+        let (row_at, row_blobs_at) = (u64_at(row, 0)?, u64_at(row, 8)?);
+        let after_row = u16_at(row, entry)?;
+        let at = usize::try_from(row_at.checked_add(after_row.into())?).ok()?;
+        let blobs_at = row_blobs_at.checked_add(u32_at(row, entry + 2)?.into())?;
+        // The block and its records' blobs end where the next block and its blobs start: at the
+        // files' footers for the last block, where the next row says for a superblock's last,
+        // else where the row's next entry says.
+        let next = entry + INDEX_ENTRY_BYTES;
+        let (end, blobs_end) = if left <= BLOCK_RECORDS {
+            (self.blocks_end as u64, self.blobs_end as u64)
+        } else if next == INDEX_ROW_BYTES {
+            (u64_at(row, next)?, u64_at(row, next + 8)?)
+        } else {
+            (row_at.checked_add(u16_at(row, next)?.into())?, row_blobs_at.checked_add(u32_at(row, next + 2)?.into())?)
+        };
+        // A superblock's first block starts where its row says the superblock does, and the
+        // first superblock where the file does.
+        if entry == INDEX_HEAD_BYTES && (after_row != 0 || (b == 0 && row_at != 0)) {
+            return None;
+        }
         let points = self.points.as_slice();
-        let block = points.get(at..self.blocks_end)?;
+        let block = points.get(..self.blocks_end)?.get(at..usize::try_from(end).ok()?)?;
         let head = block.first_chunk::<BLOCK_HEAD_BYTES>()?;
         let (flags, entries) = (head[0], usize::from(head[1]));
-        if flags & !(FLAG_LAT_ORDER | FLAG_LNG_ORDER | FLAG_SPLIT) != 0 || entries > records {
+        if flags & !(FLAG_LAT_ORDER | FLAG_LNG_ORDER | FLAG_SPLIT) != 0 || entries == 0 || entries > records {
             return None;
         }
         // Six widths of 6 bits in 5 bytes, the 4 bits after them 0. A width past 32 bits gives
-        // no field, and a dictionary of no entries no index.
+        // no field.
         let widths = head[2..7].iter().rev().fold(0u64, |all, &byte| all << 8 | u64::from(byte));
         if widths >> (6 * WIDTHS) != 0 {
             return None;
@@ -432,12 +486,14 @@ impl AddrFiles {
             field_at[k + 1] = field_at[k] + w[k] as usize;
         }
         let split = flags & FLAG_SPLIT != 0;
-        // Only a split block's records have a parent field: a paired block's entries hold theirs.
-        if !split && w[W_PARENT] != 0 {
+        // An index is the bits the last entry's takes. Only a split block's records have a
+        // parent field: a paired block's entries hold theirs.
+        if w[W_INDEX] != bit_length(entries as u32 - 1) || (!split && w[W_PARENT] != 0) {
             return None;
         }
+        // The block is its head, its dictionary and its records' fields to the byte.
         let fields_at = BLOCK_HEAD_BYTES + if split { 4 * entries + 4 } else { 8 * entries };
-        if fields_at + (records * field_at[WIDTHS]).div_ceil(8) > block.len() {
+        if fields_at + (records * field_at[WIDTHS]).div_ceil(8) != block.len() {
             return None;
         }
         Some(Block {
@@ -454,6 +510,7 @@ impl AddrFiles {
             dictionary: block.get(BLOCK_HEAD_BYTES..fields_at)?,
             fields: points.get(at + fields_at..)?,
             blobs_at,
+            blobs_end: blobs_end.min(self.blobs_end as u64),
         })
     }
 
@@ -477,7 +534,7 @@ impl AddrFiles {
     /// left as it is or longer.
     fn read_footprint(&self, record: &AddrRecord, out: &mut Vec<NodeCoord>) -> Option<()> {
         let (blob, from) = self.blob(record)?;
-        let head = blob_head(blob)?;
+        let head = blob_head(blob, record)?;
         let scale = SCALE[usize::from(head.enc)];
         let stored = head.stored as usize;
         // A footprint whose vertices no buffer holds reads as none, not as a failed allocation.
@@ -514,7 +571,7 @@ impl AddrFiles {
     /// it has none, with `out` left as it is or longer.
     fn read_logical_blob(&self, record: &AddrRecord, out: &mut Vec<u8>) -> Option<()> {
         let (blob, from) = self.blob(record)?;
-        let head = blob_head(blob)?;
+        let head = blob_head(blob, record)?;
         if head.escape {
             // The logical blob as it is, after the escape's tag and count.
             let logical = blob.get(head.values_at - LOGICAL_HEADER..)?;
@@ -585,7 +642,7 @@ impl<'a> Run<'a> {
                 self.summed += 1;
             }
             blob_at = block.blobs_at.checked_add(self.blob_bytes)?;
-            if blob_at.checked_add(blob_len.into())? > self.files.blobs_end as u64 {
+            if blob_at.checked_add(blob_len.into())? > block.blobs_end {
                 return None;
             }
         }

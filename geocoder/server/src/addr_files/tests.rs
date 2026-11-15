@@ -635,7 +635,7 @@ fn files_no_builder_writes_are_refused_at_open_by_name() {
     // An index that is not the rows of the records both count: a block more or fewer, a byte
     // more or fewer, a count no file holds.
     let rows = |count: usize| format!("addr_index.bin is not the rows of its {count} records");
-    for count in [n + BLOCK_RECORDS, n - BLOCK_RECORDS, 0, u32::MAX as usize] {
+    for count in [n + BLOCK_RECORDS, n - BLOCK_RECORDS, 0, u32::MAX as usize - 1] {
         assert_eq!(said(&counting(p, count), v, &counting(x, count)), rows(count));
     }
     assert_eq!(said(p, v, &x[1..]), rows(n));
@@ -649,6 +649,23 @@ fn files_no_builder_writes_are_refused_at_open_by_name() {
     // More blobs than records.
     assert_eq!(said(p, &counting(v, n), x), "");
     assert_eq!(said(p, &counting(v, n + 1), x), "addr_vertices.bin counts more blobs than addr_points.bin has records");
+
+    // More records, or more bytes of logical blobs, than a patch can index: 2^32 - 2 of either.
+    assert_eq!(
+        said(&counting(p, u32::MAX as usize), v, &counting(x, u32::MAX as usize)),
+        "4294967295 records in addr_points.bin are more than the 4294967294 a patch can index"
+    );
+    let logical = |bytes: u64| {
+        let mut b = v.to_vec();
+        let at = b.len() - 16;
+        b[at..at + 8].copy_from_slice(&bytes.to_le_bytes());
+        b
+    };
+    assert_eq!(said(p, &logical(u32::MAX as u64 - 1), x), "");
+    for bytes in [u32::MAX as u64, u64::MAX] {
+        let more = format!("a logical addr_vertices.bin of {bytes} bytes is more than the 4294967294 a patch can index");
+        assert_eq!(said(p, &logical(bytes), x), more);
+    }
 }
 
 /// A copy of the files, for an edit.
@@ -840,12 +857,17 @@ fn a_block_or_a_blob_no_builder_writes_reads_as_none_and_the_records_beside_it_s
 /// The files of one block of points at 52.37, 4.89, record j's blob `blobs[j]`, whatever its
 /// bytes.
 fn files_of_blobs(blobs: &[Vec<u8>]) -> AddrFileBytes {
+    files_of_blobs_at((52.37f32.to_bits(), 4.89f32.to_bits()), blobs)
+}
+
+/// The same of points at `point` (lat, lng as f32 bits).
+fn files_of_blobs_at(point: (u32, u32), blobs: &[Vec<u8>]) -> AddrFileBytes {
     assert!(!blobs.is_empty() && blobs.len() <= BLOCK_RECORDS);
     let column = |value: u32| vec![value; blobs.len()];
     let lens: Vec<u32> = blobs.iter().map(|blob| blob.len() as u32).collect();
     // The block and its blobs start where their files do: a row of zeros.
     let mut b = AddrFileBytes { points: Vec::new(), vertices: blobs.concat(), index: vec![0; INDEX_HEAD_BYTES + INDEX_ENTRY_BYTES] };
-    encode_block([&column(52.37f32.to_bits()), &column(4.89f32.to_bits()), &column(1), &column(2), &column(3)], &lens, &mut b.points);
+    encode_block([&column(point.0), &column(point.1), &column(1), &column(2), &column(3)], &lens, &mut b.points);
     b.vertices.extend([0; 8]);
     for (file, magic) in [(&mut b.points, b"ADB1"), (&mut b.vertices, b"ADF1"), (&mut b.index, b"ADX1")] {
         file.extend((blobs.len() as u32).to_le_bytes());
@@ -898,12 +920,15 @@ fn a_blob_written_by_hand_reads_only_where_its_head_is_one_a_blob_has() {
         blob.extend(vec![0; steps]);
         blob
     };
-    // In any encoding up to 3, of as many vertices as its bytes hold: the reader takes an
-    // escape of a footprint the builder writes a blob for.
+    // In encoding 3, of as many vertices as its bytes hold; in an encoding below it, of more
+    // vertices than a blob holds.
     assert_eq!(read(&escape(&[1], 3, 0, 8)), at_the_point(1));
     assert_eq!(read(&escape(&[3], 3, 0, 24)), at_the_point(3));
-    assert_eq!(read(&escape(&[2], 2, 0, 8)), at_the_point(2));
-    assert_eq!(read(&escape(&[0x80, 0x01], 0, 0, 4 * 128)), at_the_point(128));
+    assert_eq!(read(&escape(&[0x80, 0x80, 0x04], 0, 0, 4 * 65_536)), at_the_point(65_536));
+    // An escape of a footprint a blob holds: the most vertices of one, and fewer.
+    assert_eq!(read(&escape(&[0xFF, 0xFF, 0x03], 0, 0, 4 * 65_535)), None);
+    assert_eq!(read(&escape(&[2], 2, 0, 8)), None);
+    assert_eq!(read(&escape(&[0x80, 0x01], 1, 0, 4 * 128)), None);
     // No vertices; an encoding past 3; the zero byte set; bytes that are not its count's; a
     // count that is not in its fewest bytes, and one of six bytes; an escape that ends before
     // its steps.
@@ -933,6 +958,236 @@ fn a_blob_written_by_hand_reads_only_where_its_head_is_one_a_blob_has() {
         let made_up = AddrRecord { blob_at, blob_len, ..r };
         assert!(!draws(&f, &made_up, &mut buf), "a blob of {blob_len} bytes at {blob_at}");
     }
+}
+
+/// The one vertex of `blob`, the footprint of a record at `point`: read as its vertices, its
+/// count and its logical blob (`draws`), none where it is no footprint's.
+fn vertex_at(point: (u32, u32), blob: &[u8]) -> Option<(u32, u32)> {
+    let f = files(&files_of_blobs_at(point, &[blob.to_vec()]));
+    let r = f.record(0).unwrap();
+    assert_eq!((r.lat.to_bits(), r.lng.to_bits(), r.blob_len as usize), (point.0, point.1, blob.len()));
+    // A buffer that holds another footprint's vertices.
+    let mut buf = vec![NodeCoord { lat: 1.0, lng: 2.0 }];
+    draws(&f, &r, &mut buf).then(|| {
+        assert_eq!(buf.len(), 1);
+        bits(&buf)[0]
+    })
+}
+
+#[test]
+fn a_bbox_minimum_is_read_from_residuals_of_up_to_127_floats_either_way() {
+    let here = (52.37f32.to_bits(), 4.89f32.to_bits());
+    // One vertex a step of 0 from a bbox minimum of two residuals.
+    let read = |rl: u8, rg: u8| vertex_at(here, &[2 | 8, 1, rl, rg, 0]);
+    assert_eq!(read(0, 0), Some(here));
+    // A residual of -128, on either axis, is none a blob has.
+    assert_eq!(read(0x80, 0), None);
+    assert_eq!(read(0, 0x80), None);
+    assert_eq!(read(0x80, 0x80), None);
+    // The residuals beside it, and the ends on the other side.
+    for (byte, floats) in [(0x81u8, -127i64), (0x82, -126), (0xFF, -1), (1, 1), (0x7F, 127)] {
+        assert_eq!(read(byte, 0), Some((floats_after(here.0, floats), here.1)), "{floats}");
+        assert_eq!(read(0, byte), Some((here.0, floats_after(here.1, floats))), "{floats}");
+    }
+}
+
+#[test]
+fn a_bbox_minimum_is_read_from_residuals_only_at_a_point_that_is_finite() {
+    const SIGN: u32 = 0x8000_0000;
+    let here = (52.37f32.to_bits(), 4.89f32.to_bits());
+    let (most, infinity, nan) = (f32::MAX.to_bits(), f32::INFINITY.to_bits(), f32::NAN.to_bits());
+    // One vertex a step of 0 from a bbox minimum of two residuals.
+    let small = |rl: u8, rg: u8| [2 | 8, 1, rl, rg, 0];
+    // The largest float either way is a point, and the infinity after it a bbox minimum.
+    assert_eq!(vertex_at((most, here.1), &small(1, 0)), Some((infinity, here.1)));
+    assert_eq!(vertex_at((most | SIGN, here.1), &small(0xFF, 0)), Some((infinity | SIGN, here.1)));
+    assert_eq!(vertex_at((here.0, most), &small(0, 1)), Some((here.0, infinity)));
+    assert_eq!(vertex_at((here.0, most | SIGN), &small(0, 0xFF)), Some((here.0, infinity | SIGN)));
+    // An infinity or a NaN, on either axis, is no point of a blob of residuals: its bbox
+    // minimum is written in full.
+    let full = |lat: u32, lng: u32| [&[2u8, 1][..], &lat.to_le_bytes()[..], &lng.to_le_bytes()[..], &[0u8][..]].concat();
+    for bad in [infinity, infinity | SIGN, nan, nan | SIGN, infinity + 1, u32::MAX] {
+        assert!(!f32::from_bits(bad).is_finite());
+        for point in [(bad, here.1), (here.0, bad)] {
+            assert_eq!(vertex_at(point, &small(0, 0)), None, "{point:x?}");
+            assert!(vertex_at(point, &full(point.0, point.1)).is_some(), "{point:x?}");
+        }
+    }
+    // A finite point's predictions are finite whatever its steps, whose mean is below 7
+    // degrees: no blob of residuals is refused for a prediction.
+    for point in [most, most | SIGN, 0, SIGN, here.0] {
+        for (vertices, scale) in [(1, 1e-4), (65_535, 1e-4), (65_535, 1e-5), (2, 1e-6)] {
+            assert!(f32::from_bits(predicted(point, 65_535 * u64::from(vertices), vertices, scale)).is_finite(), "{point:#x}");
+        }
+    }
+}
+
+#[test]
+fn a_blob_with_bits_set_past_its_last_value_is_no_footprint() {
+    let here = (52.37f32.to_bits(), 4.89f32.to_bits());
+    let (lat, lng) = (10.0f32.to_bits(), (-20.0f32).to_bits());
+    // One vertex a step north of a bbox minimum far from the point, which is written in full:
+    // a lat value of one bit, and seven bits to the byte's end.
+    let blob = |values: u8| [&[2u8, 1][..], &lat.to_le_bytes()[..], &lng.to_le_bytes()[..], &[1, values][..]].concat();
+    assert_eq!(encode_blob(&logical_blob(2, lat, lng, &[(1, 0)]), here.0, here.1), blob(1));
+    assert_eq!(vertex_at(here, &blob(1)), Some((((10.0f64 + 1e-6) as f32).to_bits(), lng)));
+    for values in [0b11, 0b101, 0x81] {
+        assert_eq!(vertex_at(here, &blob(values)), None, "{values:#x}");
+    }
+    // A lat and a lng value of one bit each, and six bits to the byte's end.
+    let both = |values: u8| [&[2u8, 1][..], &lat.to_le_bytes()[..], &lng.to_le_bytes()[..], &[1 | 1 << 4, values][..]].concat();
+    assert!(vertex_at(here, &both(0b11)).is_some());
+    for values in [0b111, 0x83] {
+        assert_eq!(vertex_at(here, &both(values)), None, "{values:#x}");
+    }
+}
+
+/// The ids of `n` records that read, alone and in a run.
+fn reading(b: &AddrFileBytes, n: u32) -> Vec<u32> {
+    let f = files(b);
+    let alone: Vec<u32> = (0..n).filter(|&id| f.record(id).is_some()).collect();
+    let mut run = Vec::new();
+    f.for_ids(0..n, |id, _| run.push(id));
+    assert_eq!(run, alone);
+    alone
+}
+
+#[test]
+fn a_block_is_the_bytes_up_to_the_next_blocks_start_and_no_field_is_read_from_past_them() {
+    let here = (52.37f32.to_bits(), 4.89f32.to_bits());
+    let point = Logical { lat: here.0, lng: here.1, housenumber: 100, street: 7, parent: 40, footprint: Vec::new() };
+    // Blocks of one point over and over: a head and one pair, the records' fields of no bits.
+    let block = BLOCK_HEAD_BYTES + 8;
+    let n = (BLOCK_RECORDS + 1) as u32;
+    let good = encoded(&vec![point.clone(); n as usize]);
+    assert_eq!(good.points.len(), 2 * block + POINTS_FOOTER_BYTES);
+    assert_eq!(reading(&good, n), (0..n).collect::<Vec<u32>>());
+    // The first block's housenumbers of one bit (bit 12 of its widths): its records' fields
+    // would take two bytes, and the next block starts where they would. No record's is read
+    // from that block's bytes, and it still reads.
+    let mut wide = copy_of(&good);
+    wide.points[3] |= 1 << 4;
+    assert_eq!(files(&wide).record(8).map(|r| r.housenumber_id), None);
+    assert_eq!(reading(&wide, n), [n - 1]);
+
+    // A block of a byte more than its records take is no block, whether the next block's
+    // start ends it or the footer; nor is one of a byte fewer, and the block that starts in it
+    // is none either.
+    let with_byte_at = |at: usize, second_at: usize| {
+        let mut b = copy_of(&good);
+        b.points.insert(at, 0);
+        let entry = INDEX_HEAD_BYTES + INDEX_ENTRY_BYTES;
+        b.index[entry..entry + 2].copy_from_slice(&(second_at as u16).to_le_bytes());
+        b
+    };
+    assert_eq!(reading(&with_byte_at(block, block + 1), n), [n - 1]);
+    assert_eq!(reading(&with_byte_at(2 * block, block), n), (0..n - 1).collect::<Vec<u32>>());
+    let mut short = copy_of(&good);
+    let entry = INDEX_HEAD_BYTES + INDEX_ENTRY_BYTES;
+    short.index[entry..entry + 2].copy_from_slice(&(block as u16 - 1).to_le_bytes());
+    assert_eq!(reading(&short, n), Vec::<u32>::new());
+
+    // A superblock's last block ends where the next row says its superblock starts.
+    let n = (SUPERBLOCK_RECORDS + 1) as u32;
+    let good = encoded(&vec![point.clone(); n as usize]);
+    assert_eq!(good.points.len(), (SUPERBLOCK_BLOCKS + 1) * block + POINTS_FOOTER_BYTES);
+    assert_eq!(reading(&good, n), (0..n).collect::<Vec<u32>>());
+    // A byte after it, and the next row counting from past that byte: the block is a byte
+    // more than its records take, and the next superblock's still reads.
+    let mut moved = copy_of(&good);
+    moved.points.insert(SUPERBLOCK_BLOCKS * block, 0);
+    moved.index[INDEX_ROW_BYTES..INDEX_ROW_BYTES + 8].copy_from_slice(&((SUPERBLOCK_BLOCKS * block) as u64 + 1).to_le_bytes());
+    assert_eq!(reading(&moved, n), [(0..n - 1 - BLOCK_RECORDS as u32).collect::<Vec<u32>>(), vec![n - 1]].concat());
+}
+
+#[test]
+fn a_block_with_indexes_of_another_width_than_its_dictionary_needs_gives_no_record() {
+    let here = (52.37f32.to_bits(), 4.89f32.to_bits());
+    let on = |street: u32, parent: u32| Logical { lat: here.0, lng: here.1, housenumber: 1, street, parent, footprint: Vec::new() };
+    // The width of the index (bits 18 to 23 of the widths) of a block of four records set to
+    // `bits`: four indexes of one bit or of two fill the same byte.
+    let with_index_bits = |records: &[Logical], was: u8, bits: u8| {
+        let mut b = encoded(records);
+        assert_eq!((b.points[0], b.points[4] >> 2 & 63), (0, was));
+        b.points[4] = b.points[4] & !(63 << 2) | bits << 2;
+        reading(&b, 4)
+    };
+    // Two pairs take indexes of one bit, three of two.
+    let two = [on(7, 40), on(9, 1 << 30), on(7, 40), on(9, 1 << 30)];
+    let three = [on(7, 40), on(9, 1 << 30), on(11, 1 << 31), on(7, 40)];
+    assert_eq!(with_index_bits(&two, 1, 1), [0, 1, 2, 3]);
+    assert_eq!(with_index_bits(&two, 1, 2), Vec::<u32>::new());
+    assert_eq!(with_index_bits(&three, 2, 2), [0, 1, 2, 3]);
+    assert_eq!(with_index_bits(&three, 2, 1), Vec::<u32>::new());
+}
+
+#[test]
+fn a_blob_is_read_within_the_blobs_of_its_block() {
+    let here = (52.37f32.to_bits(), 4.89f32.to_bits());
+    // Buildings of one vertex at one point: blobs of 5 bytes, a block's 80.
+    let footprint = footprint_at(2, here.0, here.1, &[(0, 0)], 0, 0);
+    let building = Logical { lat: here.0, lng: here.1, housenumber: 1, street: 2, parent: 3, footprint };
+    let n = (SUPERBLOCK_RECORDS + BLOCK_RECORDS + 1) as u32;
+    let good = encoded(&vec![building; n as usize]);
+    let blobs = BLOCK_RECORDS * 5;
+    assert_eq!(good.vertices.len(), n as usize * 5 + VERTICES_FOOTER_BYTES);
+    assert_eq!(reading(&good, n), (0..n).collect::<Vec<u32>>());
+    // The ids that do not read where the index's bytes at `at` are `value`.
+    let unread = |at: usize, value: &[u8]| {
+        let mut b = copy_of(&good);
+        b.index[at..at + value.len()].copy_from_slice(value);
+        let read = reading(&b, n);
+        (0..n).filter(|id| !read.contains(id)).collect::<Vec<u32>>()
+    };
+    // The second block's blobs a byte before the first block's end: that block's last record
+    // has its blob across them.
+    let second = INDEX_HEAD_BYTES + INDEX_ENTRY_BYTES + 2;
+    assert_eq!(unread(second, &(blobs as u32).to_le_bytes()), Vec::<u32>::new());
+    assert_eq!(unread(second, &(blobs as u32 - 1).to_le_bytes()), [BLOCK_RECORDS as u32 - 1]);
+    // The same of a superblock's last block and the next row.
+    let next_row = INDEX_ROW_BYTES + 8;
+    let last = SUPERBLOCK_RECORDS as u32 - 1;
+    assert_eq!(unread(next_row, &((SUPERBLOCK_BLOCKS * blobs) as u64).to_le_bytes()), Vec::<u32>::new());
+    assert_eq!(unread(next_row, &((SUPERBLOCK_BLOCKS * blobs) as u64 - 1).to_le_bytes()), [last]);
+}
+
+#[test]
+fn a_superblocks_first_block_starts_where_its_row_says_and_the_first_superblock_at_the_files_first_byte() {
+    let here = (52.37f32.to_bits(), 4.89f32.to_bits());
+    let point = Logical { lat: here.0, lng: here.1, housenumber: 100, street: 7, parent: 40, footprint: Vec::new() };
+    // Blocks of one point over and over, a head and one pair each: a superblock, and two blocks
+    // of the next.
+    let block = BLOCK_HEAD_BYTES + 8;
+    let n = (SUPERBLOCK_RECORDS + BLOCK_RECORDS + 1) as u32;
+    let good = encoded(&vec![point; n as usize]);
+    assert_eq!(reading(&good, n), (0..n).collect::<Vec<u32>>());
+    let but = |blocks: std::ops::Range<usize>| (0..n).filter(|&id| !blocks.contains(&(id as usize / BLOCK_RECORDS))).collect::<Vec<u32>>();
+    // A byte before the blocks, which the second row counts.
+    let mut shifted = copy_of(&good);
+    shifted.points.insert(0, 0xAA);
+    shifted.index[INDEX_ROW_BYTES..INDEX_ROW_BYTES + 8].copy_from_slice(&((SUPERBLOCK_BLOCKS * block) as u64 + 1).to_le_bytes());
+    // The ids that read where the first row says its superblock starts at `row_at` and its
+    // first block `first` bytes after that.
+    let by_the_row = |row_at: u64, first: u16| {
+        let mut b = copy_of(&shifted);
+        b.index[..8].copy_from_slice(&row_at.to_le_bytes());
+        b.index[INDEX_HEAD_BYTES..INDEX_HEAD_BYTES + 2].copy_from_slice(&first.to_le_bytes());
+        reading(&b, n)
+    };
+    // The row counting the byte: every block is where the index says, and the first is none.
+    assert_eq!(by_the_row(1, 0), but(0..1));
+    // The row's first entry counting it: the first block is where the index says, and none;
+    // the superblock's other blocks are placed a byte before they start.
+    assert_eq!(by_the_row(0, 1), but(0..SUPERBLOCK_BLOCKS));
+    // A byte between the two superblocks, which the second row's entries count: its first
+    // block is none, and the blocks around it read.
+    let mut apart = copy_of(&good);
+    apart.points.insert(SUPERBLOCK_BLOCKS * block, 0xAA);
+    let second = INDEX_ROW_BYTES + INDEX_HEAD_BYTES;
+    assert_eq!(apart.index[second..second + 2], [0, 0]);
+    apart.index[second..second + 2].copy_from_slice(&1u16.to_le_bytes());
+    apart.index[second + INDEX_ENTRY_BYTES..second + INDEX_ENTRY_BYTES + 2].copy_from_slice(&(block as u16 + 1).to_le_bytes());
+    assert_eq!(reading(&apart, n), but(SUPERBLOCK_BLOCKS..SUPERBLOCK_BLOCKS + 1));
 }
 
 #[test]
@@ -975,8 +1230,10 @@ fn damaged_files_read_without_a_panic_and_what_no_byte_changed_in_still_reads() 
                     1 => {
                         let at = (rng.next() % (index.len() as u64 - 8)) as usize;
                         index[at] = rng.next() as u8;
+                        // The superblock's blocks, and the one before them, which ends where the
+                        // row says they start.
                         let first = at / INDEX_ROW_BYTES * SUPERBLOCK_BLOCKS;
-                        hit.iter_mut().skip(first).take(SUPERBLOCK_BLOCKS).for_each(|h| *h = true);
+                        hit.iter_mut().skip(first.saturating_sub(1)).take(SUPERBLOCK_BLOCKS + 1).for_each(|h| *h = true);
                     }
                     _ => {
                         let at = rng.next() % (vertices.len() as u64 - 16);
