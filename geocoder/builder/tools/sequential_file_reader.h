@@ -130,19 +130,14 @@ public:
             copy_unsupported_ = true;
             return;
         }
-        fd_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-        if (fd_ < 0) return;
-        struct stat st;
-        if (fstat(fd_, &st) != 0) {
-            int err = errno;
-            ::close(fd_);
-            throw std::runtime_error("Cannot read " + path + ": " + std::strerror(err));
-        }
-        size_ = static_cast<uint64_t>(st.st_size);
-#ifdef POSIX_FADV_SEQUENTIAL
-        // Advice only: a failure changes nothing but readahead.
-        posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
-#endif
+        open_file();
+    }
+    // The file as the dir holds it, though a stream source claims its path (an encoded family's
+    // old file, copied as it sits): the factory is never asked.
+    enum Raw { RAW };
+    SequentialFileReader(Raw, const std::string& path, size_t capacity = SEQUENTIAL_READ_BUFFER_BYTES)
+        : path_(path), capacity_(std::max<size_t>(capacity, 1)) {
+        open_file();
     }
     ~SequentialFileReader() {
         // The window is an anonymous mapping, not the heap: glibc moves its
@@ -243,6 +238,21 @@ public:
     }
 
 private:
+    void open_file() {
+        fd_ = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd_ < 0) return;
+        struct stat st;
+        if (fstat(fd_, &st) != 0) {
+            int err = errno;
+            ::close(fd_);
+            throw std::runtime_error("Cannot read " + path_ + ": " + std::strerror(err));
+        }
+        size_ = static_cast<uint64_t>(st.st_size);
+#ifdef POSIX_FADV_SEQUENTIAL
+        // Advice only: a failure changes nothing but readahead.
+        posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+    }
     struct PreadAt {
         int fd;
         ssize_t operator()(char* dst, size_t n, uint64_t off) const { return ::pread(fd, dst, n, static_cast<off_t>(off)); }

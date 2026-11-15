@@ -186,7 +186,9 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
   records, an index row and one footprint in flight, 256 KiB of it at most; an escaped footprint,
   of any size, a piece at a time) and the side files (a block of 64 values in flight, the new
   file's block table in a scratch file beside it until the file is closed). An encoded family's
-  records and their child stream replay together; `--threads` gives each codec a thread
+  records and their child stream replay together; a family whose every section a patch sends as
+  unchanged goes through no codec: its files are copied from the old dir as they sit, those no
+  section names with them. `--threads` gives each codec a thread
 
 ### Patcher memory and speed
 
@@ -518,7 +520,9 @@ Old file hash: marker 0xFFFFFFF8 (u32) + file_id (u32) + lane_hash of the
 Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64) + ...
   (the patcher refuses an old file of another size, 0 meaning absent)
   stride=0: full replacement (n_fixups=0 u32, size u64, data)
-  stride=0xFD: unchanged, copy from cur_dir
+  stride=0xFD: unchanged, copy from cur_dir (a file of an encoded family is unchanged in its
+    logical form: the patcher copies the family's files when each of its sections is 0xFD, and
+    else replays this one as a MATCH of every record)
   stride=0xFC: sparse delta (value_stride, remap_kind, n, [(pos, value)] × n;
     remap_kind 0 raw, 2 a string offset, 3 a postcode centroid, as its file's
     row of SPARSE_DELTA_FILES gives it, and the patcher refuses any other.

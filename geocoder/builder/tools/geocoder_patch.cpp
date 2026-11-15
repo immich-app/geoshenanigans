@@ -18,7 +18,8 @@
 //
 // The encoded families' old files (the way, address, POI, place and side
 // files, see gcs_patch.h) are decoded and their new files encoded in process.
-// A family's records and their child stream replay together (JointChild).
+// A family's records and their child stream replay together (JointChild); a
+// family the patch leaves unchanged is copied as its files sit.
 // --threads runs each family's decoder and encoder in a thread of its own.
 
 #include <algorithm>
@@ -50,6 +51,7 @@
 #include <vector>
 
 #include "checked_size.h"
+#include "child_ops.h"
 #include "geo_index.h"
 #include "merge_sequence.h"
 #include "patch_format.h"
@@ -126,6 +128,16 @@ static uint32_t joint_child_of(uint32_t fid) {
     case PatchFileId::ADDR_POINTS: return (uint32_t)PatchFileId::ADDR_VERTICES;
     case PatchFileId::POI_RECORDS: return (uint32_t)PatchFileId::POI_VERTICES;
     default: return UINT32_MAX;
+    }
+}
+
+// The bytes a run of a child stream's merge section counts by: a node's lat and lng, or a byte
+// of a vertex stream.
+static uint32_t joint_child_stride(uint32_t child_fid) {
+    switch ((PatchFileId)child_fid) {
+    case PatchFileId::STREET_NODES:
+    case PatchFileId::INTERP_NODES: return 8;
+    default: return 1;
     }
 }
 
@@ -642,6 +654,32 @@ static int run(int argc, char* argv[]) {
         pos = jc->section_end;
         jc.reset();
     };
+    // An encoded family the patch leaves unchanged, its every section COPY_OLD: its files are the
+    // one encoding of their logical form (way_files.h, addr_files.h, poi_files.h, place_files.h,
+    // side_blocks.h), so the new dir's are the old dir's, copied as they sit with those no section
+    // names (Store::copied_files). No codec runs, and nothing is read of the files but the footers
+    // their sections' old sizes were checked by. They go where the family's encoder writes: the
+    // output dir when the patch lists the family, else the scratch dir. False, said, when the old
+    // dir lacks one.
+    auto copy_old_family = [&](const gcs::FamilyDesc& family, const IoCounters& section_start) {
+        const std::string& to = listed.count(family.today[0]) ? out_dir : tmpdir;
+        for (const std::string& name : gcs::store().copied_files(family)) {
+            SequentialFileReader in(SequentialFileReader::RAW, cur_dir + "/" + name);
+            if (!in.is_open()) {
+                std::cerr << "  ERROR: " << name << ": copy-old failed (src MISSING)" << std::endl;
+                return false;
+            }
+            const std::string path = to + "/" + name;
+            FILE* out = fopen(path.c_str(), "wb");
+            if (!out) throw std::runtime_error("Cannot write " + path);
+            __fsetlocking(out, FSETLOCKING_BYCALLER);
+            append_old_range(in, out, 0, in.size(), name.c_str());
+            close_patch_outputs({{out, name}});
+            std::cerr << "  " << name << ": unchanged (copied " << in.size() << " bytes from old) ["
+                      << io_delta(section_start, get_io_counters()) << "]" << std::endl;
+        }
+        return true;
+    };
     // A cell changes section's lists, where they sit (the label names them in the log).
     auto read_cell_changes = [&](const char* label) {
         uint32_t na = patch.u32(), nr = patch.u32();
@@ -751,6 +789,26 @@ static int run(int argc, char* argv[]) {
             // Unchanged file: the diff verified old==new and emitted no
             // data. Reproduce by copying the old (current) file verbatim.
             uint32_t nf = patch.u32(); (void)nf; patch.take(patch.u64(), "copy-old payload"); // empty
+            // An encoded family is unchanged when this section is all of it (a side file, the place
+            // files), or its parent's with the child's, the next one, COPY_OLD too.
+            if (const gcs::FamilyDesc* family = gcs::store().family_of(fname)) {
+                bool unchanged = family->today.size() == 1;
+                size_t family_end = pos;
+                if (const uint32_t child_fid = joint_child_of(file_id); child_fid != UINT32_MAX) {
+                    ChildOps child(static_cast<PatchFileId>(child_fid), joint_child_stride(child_fid));
+                    child.parse(P, patch_size, pos, file_records_max);
+                    if (child.kind == ChildOps::COPY_OLD) {
+                        require_old_file_size(cur_dir, child.name, child.old_size);
+                        unchanged = true;
+                        family_end = child.section_end;
+                    }
+                }
+                if (unchanged) {
+                    if (!copy_old_family(*family, section_start)) return 1;
+                    pos = family_end;
+                    continue;
+                }
+            }
             SequentialFileReader in(cur_dir + "/" + fname);
             if (!in.is_open()) {
                 // The diff only emits COPY_OLD for a file that existed (and was
@@ -762,8 +820,8 @@ static int run(int argc, char* argv[]) {
             }
             FILE* out = open_out(fname);
             if (gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX) {
-                // An unchanged parent of an encoded family: one MATCH of every record, each followed
-                // by its child bytes (from the child section, which may still change them).
+                // An unchanged parent of an encoded family whose child section changes the child:
+                // one MATCH of every record, each followed by its child bytes.
                 const size_t rs = joint_parent_stride(file_id);
                 if (in.size() % rs) throw std::runtime_error(std::string("Old ") + fname + " is not whole records");
                 std::unique_ptr<JointChild> jc = open_joint_child(file_id, out, pos);
@@ -1018,7 +1076,7 @@ static int run(int argc, char* argv[]) {
                 remap_hints, track ? &remap : nullptr);
             fixups.finish(n_old_records);
             string_fixups.finish();
-            if (r.child.kind == poi_replay::ChildOps::MERGE)
+            if (r.child.kind == ChildOps::MERGE)
                 merge_seqs[(uint32_t)PatchFileId::POI_VERTICES] = {r.child.seq, r.child.seq_end - r.child.seq, 1};
             pos = r.child.section_end;
             if (track) remap.finish_runs();

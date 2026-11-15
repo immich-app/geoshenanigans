@@ -347,21 +347,28 @@ struct PatternSource : StreamSource {
     }
 };
 
-// One virtual file for the test's scope: its path gets a PatternSource and,
-// when `registered`, the size require_old_file_size would have registered.
-// `source` is the one the last reader opened.
+// One virtual file for the test's scope: its path (at; a file's own, for a
+// source that claims it) gets a PatternSource and, when `registered`, the size
+// require_old_file_size would have registered. `source` is the one the last
+// reader opened, `asked` how many paths the factory was asked for.
 struct VirtualFile {
-    std::string path = "/virtual/old.bin";
+    std::string path;
+    static std::string claimed;
     static const std::vector<char>* bytes;
-    static size_t piece;
+    static size_t piece, asked;
     static bool skippable;
     static PatternSource* source;
-    VirtualFile(const std::vector<char>& b, size_t p, bool registered = true, bool can_skip = false) {
+    VirtualFile(const std::vector<char>& b, size_t p, bool registered = true, bool can_skip = false,
+                const std::string& at = "/virtual/old.bin")
+        : path(at) {
+        claimed = at;
         bytes = &b;
         piece = p;
+        asked = 0;
         skippable = can_skip;
         stream_source_factory() = [](const std::string& path) -> std::unique_ptr<StreamSource> {
-            if (path != "/virtual/old.bin") return nullptr;
+            asked++;
+            if (path != claimed) return nullptr;
             source = new PatternSource(*bytes, piece, skippable);
             return std::unique_ptr<StreamSource>(source);
         };
@@ -372,8 +379,10 @@ struct VirtualFile {
         virtual_file_sizes().erase(path);
     }
 };
+std::string VirtualFile::claimed;
 const std::vector<char>* VirtualFile::bytes = nullptr;
 size_t VirtualFile::piece = 0;
+size_t VirtualFile::asked = 0;
 bool VirtualFile::skippable = false;
 PatternSource* VirtualFile::source = nullptr;
 
@@ -471,4 +480,54 @@ TEST(sequential_reader_skip_to_leaves_a_real_file_readable_anywhere) {
     sut.skip_to(900);
     CHECK(file.same(sut.at(100, 10), 100, 10));
     CHECK(file.same(sut.at(950, 50), 950, 50));
+}
+
+// An old file of an encoded family is a stream source under its own path, its
+// decoder's bytes. A raw reader reads the file the path names all the same:
+// it never asks the factory, its size is the file's, not the registered one,
+// its views are the file's bytes at any offset, and a long range of it is
+// offered to the kernel, which a stream source's never is. A missing file is
+// not open and empty, as for any reader.
+TEST(a_raw_reader_reads_the_file_though_a_stream_source_claims_its_path) {
+    ByteFile file(3 * COPY_RANGE_MIN_BYTES + 100);
+    const std::vector<char> decoded(1000, 'd');
+    VirtualFile v(decoded, 64, true, false, file.path);
+    {
+        SequentialFileReader claimed(file.path, 64);
+        CHECK_EQ(claimed.size(), uint64_t(1000));
+        CHECK(!claimed.copy_supported());
+        CHECK_EQ(*claimed.at(7, 1), 'd');
+    }
+    REQUIRE(VirtualFile::asked == 1);
+
+    SequentialFileReader sut(SequentialFileReader::RAW, file.path, 64);
+    CHECK_EQ(VirtualFile::asked, size_t(1));
+    CHECK(sut.is_open());
+    CHECK_EQ(sut.size(), uint64_t(file.bytes.size()));
+    CHECK(sut.copy_supported());
+    CHECK(file.same(sut.at(0, 10), 0, 10));
+    CHECK(file.same(sut.at(5000, 300), 5000, 300));
+    CHECK(file.same(sut.at(100, 10), 100, 10));
+    CHECK_EQ(sut.rewinds(), uint64_t(1));
+    std::vector<char> copy(200);
+    sut.read(file.bytes.size() - 200, copy.data(), copy.size());
+    CHECK(file.same(copy.data(), file.bytes.size() - 200, copy.size()));
+
+    const std::string out_path = file.dir.path() + "/out.bin";
+    FILE* out = std::fopen(out_path.c_str(), "wb");
+    REQUIRE(out != nullptr);
+    SequentialFileReader old(SequentialFileReader::RAW, file.path);
+    append_old_range(old, out, 0, old.size(), "out.bin");
+    REQUIRE(std::fclose(out) == 0);
+    std::FILE* f = std::fopen(out_path.c_str(), "rb");
+    REQUIRE(f != nullptr);
+    std::vector<char> got(file.bytes.size() + 1);
+    CHECK_EQ(std::fread(got.data(), 1, got.size(), f), file.bytes.size());
+    std::fclose(f);
+    CHECK(file.same(got.data(), 0, file.bytes.size()));
+
+    SequentialFileReader missing(SequentialFileReader::RAW, file.dir.path() + "/missing.bin");
+    CHECK(!missing.is_open());
+    CHECK_EQ(missing.size(), uint64_t(0));
+    CHECK_EQ(VirtualFile::asked, size_t(1));
 }

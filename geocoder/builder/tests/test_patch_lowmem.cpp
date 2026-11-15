@@ -1162,9 +1162,9 @@ TEST(patch_rebuilds_the_builders_string_tiers_on_random_days) {
     }
 }
 
-// An unchanged parent of an encoded family (poi_records.bin sent as kept)
-// replays with its child: both files unchanged, then the records unchanged
-// and one vertex block edited.
+// An unchanged parent of an encoded family (poi_records.bin sent as kept):
+// both files unchanged, which are copied, then the records unchanged and one
+// vertex block edited, which replay together.
 TEST(patch_lowmem_replays_an_unchanged_parent_with_its_child) {
     ScratchDir dir("lowmem-same");
     std::mt19937 rng(20261027);
@@ -1180,6 +1180,250 @@ TEST(patch_lowmem_replays_an_unchanged_parent_with_its_child) {
 
         CHECK(apply_modes(c, ALL_MODES).bad.empty());
     }
+}
+
+namespace {
+
+// An encoded family by the name its codecs report under, and its files as a
+// dir holds them.
+struct FamilyFiles {
+    const char* family;
+    std::vector<const char*> files;
+};
+const std::vector<FamilyFiles> FAMILY_FILES = {
+    {"streets", {"street_ways.bin", "street_nodes.bin"}},
+    {"interps", {"interp_ways.bin", "interp_nodes.bin"}},
+    {"addr", {"addr_points.bin", "addr_vertices.bin", "addr_index.bin"}},
+    {"poi", {"poi_records.bin", "poi_vertices.bin"}},
+    {"places", {"place_cells.bin", "place_nodes.bin", "place_hidden.bin"}},
+    {"way_parents", {"way_parents.bin"}},
+    {"addr_postcodes", {"addr_postcodes.bin"}},
+};
+
+// n place nodes, every fourth the hidden label of a polygon.
+std::vector<PlaceNode> some_places(uint32_t n) {
+    std::vector<PlaceNode> places;
+    for (uint32_t i = 0; i < n; i++) {
+        PlaceNode p = test_place(47.0f + static_cast<float>(i) * 1e-4f, 8.0f, i);
+        if (i % 4 == 3) {
+            p._pad1 = PLACE_FLAG_HIDDEN | PLACE_FLAG_LABEL_OF;
+            p.parent_poly_id = i;
+        }
+        places.push_back(p);
+    }
+    return places;
+}
+
+// A dir of every encoded family: 40 street ways of two nodes in a geo cell,
+// with a parent each; 30 interpolations of three nodes; 60 address points,
+// two in three with a footprint, with a postcode each; 50 POIs, two in three
+// polygons; 20 place nodes.
+BuildDir every_family(std::mt19937& rng) {
+    BuildDir d, meta;
+    std::vector<uint32_t> names;
+    for (uint32_t w = 0; w < 40; w++) names.push_back(w % 7);
+    put_named_ways(d, meta, names);
+    std::vector<char> interps, interp_nodes, parents, postcodes;
+    for (uint32_t i = 0; i < 30; i++) {
+        append(interps, InterpWay{3 * i, 3, 0, i % 5, 1 + 2 * i, 21 + 2 * i, 1});
+        for (uint32_t k = 0; k < 3; k++) {
+            append(interp_nodes, 47.5f + static_cast<float>(i) * 1e-3f + static_cast<float>(k) * 1e-4f);
+            append(interp_nodes, 8.5f + static_cast<float>(k) * 1e-4f);
+        }
+    }
+    d["interp_ways.bin"] = interps;
+    d["interp_nodes.bin"] = interp_nodes;
+    std::vector<Addr> addrs;
+    for (uint32_t i = 0; i < 60; i++) {
+        addrs.push_back({47.0f + static_cast<float>(i) * 1e-4f, i % 3 == 0 ? std::vector<char>{} : block(rng, 1 + rng() % 8)});
+        append(postcodes, i / 3 * 8);
+    }
+    put_addrs(d, addrs);
+    for (uint32_t w = 0; w < 40; w++) append(parents, w % 9);
+    d["way_parents.bin"] = parents;
+    d["addr_postcodes.bin"] = postcodes;
+    put_pois(d, pois_of(rng, 50, 0, true));
+    put_places(d, some_places(20));
+    return d;
+}
+
+// The patcher's log of a day that changes the families of `replayed` and no
+// other: each of those went through its decoder and its encoder (their
+// report lines), and every other family had no codec run and each of its
+// files, as `written` holds them, copied from the old dir at its size there.
+// "" or what is wrong.
+LogCheck copied_all_but(const std::vector<std::string>& replayed, const BuildDir& written) {
+    return [replayed, written](const std::string& log) -> std::string {
+        for (const FamilyFiles& f : FAMILY_FILES) {
+            const bool decoded = log.find(std::string("decode ") + f.family + ":") != std::string::npos;
+            const bool encoded = log.find(std::string("encode ") + f.family + ":") != std::string::npos;
+            if (std::find(replayed.begin(), replayed.end(), f.family) != replayed.end()) {
+                if (!decoded || !encoded) return std::string("no codec of ") + f.family + " ran";
+                continue;
+            }
+            if (decoded || encoded) return std::string("a codec of ") + f.family + " ran";
+            for (const char* file : f.files) {
+                const std::string line =
+                    std::string("  ") + file + ": unchanged (copied " + std::to_string(written.at(file).size()) + " bytes from old)";
+                if (log.find(line) == std::string::npos) return "no \"" + line + "\"";
+            }
+        }
+        return "";
+    };
+}
+
+// raw without the client list's entry of `file` (the list follows the magic,
+// the version and the flags: its marker, its count, then each file's name
+// length, name, size and inline byte); nothing when it lists no such file.
+std::vector<char> unlisted(const std::vector<char>& raw, const std::string& file) {
+    const size_t list_at = 16;
+    uint32_t marker = 0, listed = 0;
+    if (raw.size() < list_at + 8) return {};
+    memcpy(&marker, raw.data() + list_at, 4);
+    memcpy(&listed, raw.data() + list_at + 4, 4);
+    std::vector<char> entry;
+    append(entry, static_cast<uint16_t>(file.size()));
+    entry.insert(entry.end(), file.begin(), file.end());
+    const size_t at = find_once(raw, entry);
+    if (marker != CLIENT_FILES_MARKER || at == std::string::npos) return {};
+    std::vector<char> cut = raw;
+    cut.erase(cut.begin() + static_cast<std::ptrdiff_t>(at), cut.begin() + static_cast<std::ptrdiff_t>(at + entry.size() + 8 + 1));
+    put_at(cut, list_at + 4, listed - 1);
+    return cut;
+}
+
+}  // namespace
+
+// A family the day leaves as it is, each of its sections sent as unchanged
+// (a way pair's, the address files', the POI files': the records' section and
+// the child's after it; the place files' and a side file's: their one
+// section), is copied from the old dir as its files sit there, the files no
+// section names with them (addr_index.bin; place_cells.bin and
+// place_hidden.bin), and none of its codecs runs: on a day that changes
+// nothing, and beside each family in turn that a day does change, in its
+// records alone or in its child alone, which goes through its codecs. In
+// every mode the patched dir is the new dir.
+TEST(patch_copies_a_family_both_of_whose_sections_are_unchanged) {
+    ScratchDir dir("lowmem-family-copy");
+    std::mt19937 rng(20261115);
+    const BuildDir base = every_family(rng);
+    struct Day {
+        std::string name;
+        std::vector<std::string> replayed;
+        std::function<void(BuildDir&)> edit;
+    };
+    const Day days[] = {
+        {"same", {}, [](BuildDir&) {}},
+        {"street-renamed", {"streets"},
+         [](BuildDir& d) { put_at(d["street_ways.bin"], 7 * WAY_HEADER_STRIDE + WAY_HEADER_NAME_ID_OFF, 1000u); }},
+        {"street-node-moved", {"streets"}, [](BuildDir& d) { put_at(d["street_nodes.bin"], 11 * 8, 46.0f); }},
+        {"interp-renamed", {"interps"},
+         [](BuildDir& d) { put_at(d["interp_ways.bin"], 4 * INTERP_WAY_STRIDE + INTERP_WAY_STREET_ID_OFF, 1000u); }},
+        {"interp-node-moved", {"interps"}, [](BuildDir& d) { put_at(d["interp_nodes.bin"], 20 * 8, 46.0f); }},
+        {"address-moved", {"addr"}, [](BuildDir& d) { put_at(d["addr_points.bin"], 10 * ADDR_POINT_STRIDE + 4, 9.0f); }},
+        {"footprint-edited", {"addr"}, [](BuildDir& d) { d["addr_vertices.bin"][10] ^= 1; }},
+        {"poi-edited", {"poi"}, [](BuildDir& d) { d["poi_records.bin"][20 * POI_RECORD_STRIDE + offsetof(PoiRecord, importance)] ^= 1; }},
+        {"poi-polygon-edited", {"poi"}, [](BuildDir& d) { d["poi_vertices.bin"][10] ^= 1; }},
+        {"place-renamed", {"places"},
+         [](BuildDir& d) {
+             std::vector<PlaceNode> places = some_places(20);
+             places[5].name_id = 1000;
+             put_places(d, places);
+         }},
+        {"way-parent", {"way_parents"}, [](BuildDir& d) { put_at(d["way_parents.bin"], 11 * 4, 99u); }},
+        {"postcode", {"addr_postcodes"}, [](BuildDir& d) { put_at(d["addr_postcodes.bin"], 11 * 4, 800u); }},
+    };
+    for (const Day& day : days) {
+        BuildDir new_d = base;
+        day.edit(new_d);
+        REQUIRE((new_d == base) == day.replayed.empty());
+        const LowMemCase c{dir.path(), day.name};
+        REQUIRE(prepare(c, base, new_d).empty());
+
+        const Applied a = apply_modes(c, ALL_MODES, copied_all_but(day.replayed, gctest::as_written(new_d)));
+        if (!a.bad.empty()) std::printf("    %s\n", day.name.c_str());
+        CHECK(a.bad.empty());
+    }
+}
+
+// What the patcher checks of an old family it copies as its files sit,
+// refused in every mode: old files whose footers give the child stream
+// another size than the patch (a street way of three nodes for one of two:
+// the records' bytes are as many), an address family without its index, a
+// place family without its cells file, and in the patch the family's sections
+// a second time, the records' section without the child's after it, and a
+// client list without a file the family holds that no section names. The
+// patch as made applies.
+TEST(patch_refuses_what_it_can_check_of_a_family_it_copies) {
+    ScratchDir dir("lowmem-family-copy-checks");
+    std::mt19937 rng(20261115);
+    const BuildDir base = every_family(rng);
+    const LowMemCase c{dir.path(), "same"};
+    REQUIRE(prepare(c, base, base).empty());
+    const BuildDir written = gctest::as_written(base);
+    const LogCheck copied = copied_all_but({}, written);
+    CHECK(apply_modes(c, ALL_MODES, copied).bad.empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+
+    // The street pair's two sections, the nodes' after the ways'.
+    const std::vector<char> ways = copy_old_section(PatchFileId::STREET_WAYS, base.at("street_ways.bin").size()),
+                            nodes = copy_old_section(PatchFileId::STREET_NODES, base.at("street_nodes.bin").size());
+    std::vector<char> pair = ways;
+    pair.insert(pair.end(), nodes.begin(), nodes.end());
+    const size_t at = find_once(raw, pair);
+    REQUIRE(at != std::string::npos);
+    std::vector<char> twice = raw, childless = raw;
+    twice.insert(twice.begin() + static_cast<std::ptrdiff_t>(at), pair.begin(), pair.end());
+    childless.erase(childless.begin() + static_cast<std::ptrdiff_t>(at + ways.size()),
+                    childless.begin() + static_cast<std::ptrdiff_t>(at + pair.size()));
+    struct Edit {
+        std::string name;
+        std::vector<char> patch;
+        std::string refusal;
+    };
+    for (const Edit& e : {Edit{"twice", twice, "old street_ways.bin opened twice"},
+                          Edit{"childless", childless, "Encoded family: street_nodes.bin does not follow its parent in the patch"},
+                          Edit{"index-unlisted", unlisted(raw, "addr_index.bin"), "addr: the patch lists no addr_index.bin"},
+                          Edit{"cells-unlisted", unlisted(raw, "place_cells.bin"), "places: the patch lists no place_cells.bin"},
+                          Edit{"hidden-unlisted", unlisted(raw, "place_hidden.bin"), "places: the patch lists no place_hidden.bin"}}) {
+        REQUIRE(!e.patch.empty());
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, e.patch));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+    }
+    // Nothing of a family is written before its list is checked.
+    for (const std::string& mode : ALL_MODES) {
+        CHECK(!std::filesystem::exists(c.dir("index-unlisted.out." + mode) + "/addr_points.bin"));
+        CHECK(!std::filesystem::exists(c.dir("cells-unlisted.out." + mode) + "/place_nodes.bin"));
+    }
+
+    auto put = [&](const std::string& name, const std::optional<std::vector<char>>& bytes) {
+        const std::string path = c.dir("old") + "/" + name;
+        std::filesystem::remove(path);
+        if (bytes) REQUIRE(write_file(path, *bytes));
+    };
+    BuildDir longer = {{"street_ways.bin", base.at("street_ways.bin")}, {"street_nodes.bin", base.at("street_nodes.bin")}};
+    put_at(longer["street_ways.bin"], 39 * WAY_HEADER_STRIDE + 4, uint16_t{3});
+    for (const float v : {47.002f, 8.002f}) append(longer["street_nodes.bin"], v);
+    const BuildDir stale = gctest::as_written(longer);
+    for (const char* file : {"street_ways.bin", "street_nodes.bin"}) put(file, stale.at(file));
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "stale-nodes", "old street_nodes.bin decodes to 648 bytes, the patch expects 640").empty());
+    for (const char* file : {"street_ways.bin", "street_nodes.bin"}) put(file, written.at(file));
+
+    put("addr_index.bin", std::nullopt);
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "no-index",
+                      "Malformed address files: a dir with some of addr_points.bin, addr_vertices.bin and addr_index.bin and not all three")
+              .empty());
+    put("addr_index.bin", written.at("addr_index.bin"));
+
+    // A file no footer of the family counts: missed as it is copied.
+    put("place_cells.bin", std::nullopt);
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "no-cells", "place_cells.bin: copy-old failed (src MISSING)").empty());
+    put("place_cells.bin", written.at("place_cells.bin"));
+
+    CHECK(apply_modes(c, ALL_MODES, copied).bad.empty());
 }
 
 // Old child bytes the replay skips are dropped as the shared decoder produces
@@ -1737,10 +1981,11 @@ TEST(patch_heap_stays_flat_as_poi_cells_change) {
 // cells do) and a ninth whose POI changes: the patcher holds a long list as
 // few times as the rebuild needs (the old index's row, the writer's previous
 // list and its encoding), so from n = 6,000 to 60,000 its heap peak grows by
-// at most three times the ids added (0.94 times). It grew by 4.7 times them
-// when the old index's reader kept its own copy of a shared list, and the
-// rebuild a second list it swapped with the reader's. Skipped without a heap
-// shim (the sanitizer build).
+// at most three times the ids added (2.42 times; the POI files, which stay,
+// are copied and hold nothing). It grew by 4.7 times them when the old
+// index's reader kept its own copy of a shared list, and the rebuild a second
+// list it swapped with the reader's. Skipped without a heap shim (the
+// sanitizer build).
 TEST(patch_heap_holds_a_long_shared_poi_cell_list_at_most_three_times) {
     if (!gctest::heap_peak_shim()) {
         std::printf("    SKIP heap peaks: no heap shim under the sanitizers\n");
@@ -2030,6 +2275,29 @@ TEST(patch_heap_stays_flat_as_addresses_grow) {
         append(head, uint64_t{ADDR_POINT_STRIDE} * n);
         append(head, uint64_t{ADDR_POINT_STRIDE} * kept.size());
         return patch_holds(c, head, "merge of " + std::to_string(n) + " address points");
+    }, 100000).empty());
+}
+
+// A family a day leaves as it is, n street ways of two nodes with a parent
+// each: its files go from the old dir to the new one as they sit, through no
+// codec, and the patcher holds none of them.
+TEST(patch_heap_stays_flat_as_a_copied_family_grows) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        BuildDir d, meta;
+        std::vector<uint32_t> names(n);
+        std::vector<char> parents;
+        for (uint32_t w = 0; w < n; w++) {
+            names[w] = w % 1000;
+            append(parents, w % 50000);
+        }
+        put_named_ways(d, meta, names);
+        d["way_parents.bin"] = parents;
+        if (std::string e = prepare(c, d, d); !e.empty()) return e;
+        // The street pair's two sections, each sent as unchanged.
+        std::vector<char> pair = copy_old_section(PatchFileId::STREET_WAYS, uint64_t{WAY_HEADER_STRIDE} * n);
+        const std::vector<char> nodes = copy_old_section(PatchFileId::STREET_NODES, uint64_t{16} * n);
+        pair.insert(pair.end(), nodes.begin(), nodes.end());
+        return patch_holds(c, pair, "unchanged street pair of " + std::to_string(n) + " ways");
     }, 100000).empty());
 }
 
