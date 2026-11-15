@@ -62,7 +62,10 @@ if args[0] == "--logical-size":
         sys.exit("no footer in " + args[1])
     print(*scenario["logical"][args[1]])
     sys.exit(0)
-run_job("diff:" + os.path.relpath(args[1], scenario["new_root"]), {"args": args, "scratch": os.listdir(os.environ["TMPDIR"])})
+variant = os.path.relpath(args[1], scenario["new_root"])
+run_job("diff:" + variant, {"args": args, "scratch": os.listdir(os.environ["TMPDIR"])})
+if variant in scenario["raw"]:
+    print("Uncompressed patch: %d bytes (0 MiB) RSS=0 MiB" % scenario["raw"][variant], file=sys.stderr)
 print("diffed", file=sys.stderr)
 open(args[3], "wb").close()
 """
@@ -100,7 +103,7 @@ class Night:
         # What the fake tools read: where they leave their marks and events, what --logical-size answers for
         # each dir, which job waits to meet which, how long each holds, and how long one waits to meet another.
         self.scenario = {"marks": self.root, "events": os.path.join(self.root, "events.jsonl"),
-                         "new_root": self.new_root, "logical": {}, "meet": {}, "hold": {}, "patience": 10}
+                         "new_root": self.new_root, "logical": {}, "raw": {}, "meet": {}, "hold": {}, "patience": 10}
         for d in ("started", "ended", "scratch"):
             os.makedirs(os.path.join(self.root, d))
         # Two record files a day: 48 bytes of client files, which a verify counts as 1 KiB.
@@ -327,7 +330,23 @@ class GeneratePatchesTest(unittest.TestCase):
                          % (3 * GIB + 1 + PATCHER_SCRATCH_KIB, free))
         self.assertNotIn("verify:r/a", night.events)
 
-    # Without GEOCODER_PATCH_SCRATCH_FREE_KIB the free space is what df says
+    # A patch that decompresses to 3 GiB, which the patcher writes to scratch:
+    # its verify does not start in 3.5 GiB.
+    def test_a_verifys_need_counts_the_decompressed_patch(self):
+        night = Night(self, ["r/a"])
+        night.sizes("r/a", 1, 1)
+        night.scenario["raw"]["r/a"] = 3 * GIB * 1024
+        free = 3 * GIB + GIB // 2
+
+        night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=AMPLE_MEMORY_KIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=free)
+
+        self.assertEqual(night.result("r/a"), ["FAIL", "1", "0", "0"])
+        self.assertEqual(night.mismatches("r/a"),
+                         "the verify needs %d KiB of scratch, more than the %d KiB free less the reserve of 0 KiB\n"
+                         % (3 * GIB + 1 + PATCHER_SCRATCH_KIB, free))
+        self.assertIn("diff:r/a", night.events)
+        self.assertNotIn("verify:r/a", night.events)
+
     # of the scratch dir's volume: half a GiB here, where no verify starts.
     def test_the_free_space_is_dfs_figure_for_the_scratch_dir(self):
         night = Night(self, ["r/a"])

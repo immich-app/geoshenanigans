@@ -33,7 +33,8 @@
 # A diff holds, from its start to its end, the second number of geocoder-diff
 # --logical-size for both days: the logical files and the string pools it
 # decodes there. A verify holds the new variant's client files, which the
-# patcher writes there, and 1 GiB for the patcher's own scratch. A job starts
+# patcher writes there, the decompressed patch (its size is in the diff's
+# log) and 1 GiB for the patcher's spills. A job starts
 # while the needs of the running jobs plus its own are within the volume's
 # free space, read at that moment, less the reserve: what the caller says
 # other writers may still add to the volume. What a running job has written
@@ -68,8 +69,9 @@ verify=$tools/verify_patch.sh
 link=$tools/link_client_files.sh
 scratch_root=${TMPDIR:-/tmp}
 reserve_kib=${GEOCODER_PATCH_SCRATCH_RESERVE_KIB:-0}
-# What a verify holds for the patcher's own scratch: the decompressed patch
-# and its spills.
+# What a verify holds for the patcher's spills. The decompressed patch, which
+# the patcher writes to scratch too, is added when the variant's diff ends
+# (queue_verify).
 patcher_scratch_kib=$((1024 * 1024))
 mkdir -p "$results_dir" "$log_dir"
 
@@ -229,6 +231,16 @@ for variant in $(cd "$new_root" && find . -name '*.bin' -printf '%h\n' | sed 's|
     "verify ${verify_scratch[$variant]} KiB of scratch"
 done
 
+# Queues the verify of a variant whose diff ended, its scratch need raised by
+# the decompressed patch: the "Uncompressed patch: N bytes" line of the diff's
+# log (none for a diff that failed, whose result is written).
+queue_verify() {
+  local variant=$1 raw
+  raw=$(sed -n 's/^Uncompressed patch: \([0-9][0-9]*\) bytes.*/\1/p' "$log_dir/${variant//\//_}.log" 2> /dev/null | tail -1) || true
+  verify_scratch[$variant]=$(( verify_scratch[$variant] + $(kib_of "${raw:-0}") ))
+  verifies+=("$variant")
+}
+
 # running: pid -> memory weight held (verifies hold none); held: pid ->
 # scratch held; stage/name: what it runs. A diff that ends queues its
 # variant's verify.
@@ -300,7 +312,7 @@ while [ $next -lt ${#pending[@]} ] || [ ${#verifies[@]} -gt 0 ] || [ ${#running[
     # the budgets.
     wait "${!running[@]}"
     for pid in "${!running[@]}"; do
-      [ "${stage[$pid]}" = diff ] && verifies+=("${name[$pid]}")
+      [ "${stage[$pid]}" = diff ] && queue_verify "${name[$pid]}"
     done
     running=(); held=(); stage=(); name=()
     running_kib=0
@@ -309,6 +321,6 @@ while [ $next -lt ${#pending[@]} ] || [ ${#verifies[@]} -gt 0 ] || [ ${#running[
   fi
   running_kib=$((running_kib - running[$finished]))
   held_kib=$((held_kib - held[$finished]))
-  [ "${stage[$finished]}" = diff ] && verifies+=("${name[$finished]}")
+  [ "${stage[$finished]}" = diff ] && queue_verify "${name[$finished]}"
   unset "running[$finished]" "held[$finished]" "stage[$finished]" "name[$finished]"
 done
