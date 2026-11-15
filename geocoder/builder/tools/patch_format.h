@@ -761,7 +761,8 @@ static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 // old dir holds it (u64), before the section of the file's parent records. A
 // replay that copies bytes of an old file without decoding them checks them
 // by it, with the old values they are copied under: the POI replay
-// (poi_replay.h) the old blocks a day leaves whole, the way replay
+// (poi_replay.h) the old blocks a day leaves whole and the rows whose lat and
+// lng they sit under (poi_vertices.bin and poi_records.bin), the way replay
 // (way_replay.h) the node blocks of the groups a day leaves whole and their
 // rows' anchors, counts and codes (both files of each way pair), the address
 // replay (addr_replay.h) the old footprint blobs and the records whose
@@ -773,6 +774,7 @@ static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 // old file without records) is read and checks nothing.
 static constexpr uint32_t OLD_FILE_HASH_MARKER = 0xFFFFFFF8;
 static constexpr PatchFileId HASHED_OLD_FILES[] = {
+    PatchFileId::POI_RECORDS,
     PatchFileId::POI_VERTICES,
     PatchFileId::STREET_WAYS,
     PatchFileId::STREET_NODES,

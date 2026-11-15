@@ -8,10 +8,12 @@
 // (gcs::poi::Enc), its old bytes decoded from the old block the replay is at or one of those it
 // passed last (read again), or else from a cursor that decodes only the blocks it is asked for
 // (gcs::poi::Dec, vertices_only), made when one is. Rows are decoded and encoded again one by one (their string
-// ids move every day). A copied block is never decoded: the old poi_vertices.bin is hashed as the
-// replay passes it and checked against the diff's hash (OLD_FILE_HASH_MARKER).
+// ids move every day). A copied block is never decoded, and the record whose lat and lng it is
+// copied under is the old file's: the old poi_vertices.bin and poi_records.bin are hashed as the
+// replay passes them and checked against the diff's hashes (OLD_FILE_HASH_MARKER).
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -25,18 +27,26 @@
 
 namespace poi_replay {
 
+// The hashes (lane_hash) of the old poi_records.bin and poi_vertices.bin.
+struct Hashes {
+    uint64_t records = 0, vertices = 0;
+};
+
 // The old R2 and V2 files front to back, a row and its block at a time: the row's logical record
 // (vertex_offset its block's offset in the logical vertex stream, vertex_count its vertices) and
-// its block, parsed but not read until copied or passed. Every V2 byte is hashed in order.
+// its block, parsed but not read until copied or passed. Every byte of both files is hashed in
+// order: a row as it is decoded, the dictionaries and the footer after the last.
 class OldRows {
 public:
     explicit OldRows(const std::string& dir) {
         const std::string rp = dir + "/poi_records.bin", vp = dir + "/poi_vertices.bin";
-        rows_ = gcs::poi::open_rows(rp, gcs::file_size(rp));
+        const uint64_t records_size = gcs::file_size(rp);
+        rows_ = gcs::poi::open_rows(rp, records_size);
         R_.reset(new gcs::Reader(rp, 32 << 10, 0, rows_.footer().rows_end()));
         V_.reset(new gcs::Reader(vp));
         if (V_->size() < poi_files::VERTEX_PAD) poi_files::malformed("poi_vertices.bin is shorter than its pad");
         blocks_end_ = V_->size() - poi_files::VERTEX_PAD;
+        records_hash_.reset(new LaneHasher(records_size));
         hash_.reset(new LaneHasher(V_->size()));
     }
     uint64_t rows() const { return rows_.footer().rows; }
@@ -52,7 +62,9 @@ public:
         decoded_ = false;
         if (i_ == rows()) poi_files::malformed("a row past the last");
         bool polygon;
-        const uint32_t voff = rows_.decode(R_->take(poi_files::ROW_BYTES), rec_, polygon);
+        const uint8_t* row = R_->take(poi_files::ROW_BYTES);
+        records_hash_->update(reinterpret_cast<const char*>(row), poi_files::ROW_BYTES);
+        const uint32_t voff = rows_.decode(row, rec_, polygon);
         if (voff != V_->tell())
             poi_files::malformed("row " + std::to_string(i_) + ": voff " + std::to_string(voff) + " where the blocks are at " +
                                  std::to_string(V_->tell()));
@@ -141,12 +153,17 @@ public:
     void pass_block() {
         copy_block([](const uint8_t*, size_t) {});
     }
-    // Passes the rows left, checks the files end as the encoder ends them, and returns the V2 file's
-    // hash (lane_hash).
-    uint64_t finish() {
+    // Passes the rows left, checks the files end as the encoder ends them, and returns the two
+    // files' hashes.
+    Hashes finish() {
         while (i_ < rows()) next();
         pass_block();
         rows_.finish();
+        // What follows the rows, which open_rows read: the dictionaries and the footer.
+        for (gcs::Reader tail(R_->path, TAIL_PIECE, rows_.footer().rows_end()); !tail.eof();) {
+            const size_t n = size_t(std::min<uint64_t>(tail.left(), TAIL_PIECE));
+            records_hash_->update(reinterpret_cast<const char*>(tail.take(n)), n);
+        }
         if (V_->tell() != blocks_end_) poi_files::malformed("poi_vertices.bin has bytes past its last block");
         const uint8_t* pad = V_->take(poi_files::VERTEX_PAD);
         for (size_t k = 0; k < poi_files::VERTEX_PAD; k++)
@@ -155,11 +172,11 @@ public:
         if (logical_ != logical_vertex_bytes())
             poi_files::malformed("the vertex stream is " + std::to_string(logical_) + " bytes, the footer gives " +
                                  std::to_string(logical_vertex_bytes()));
-        return hash_->hash();
+        return {records_hash_->hash(), hash_->hash()};
     }
 
 private:
-    static constexpr size_t PIECE = 64 << 10;
+    static constexpr size_t PIECE = 64 << 10, TAIL_PIECE = 16 << 10;
     // The blocks passed last that reread() reads again: a day's changed polygons match bytes of the
     // few blocks before their own (a planet day: 1,004 reads, none further back than 64 KiB).
     static constexpr size_t HISTORY_BLOCKS = 1024;
@@ -174,7 +191,7 @@ private:
     std::vector<uint8_t> raw_, reread_buf_;
     poi_files::RowDecoder rows_;
     std::unique_ptr<gcs::Reader> R_, V_;
-    std::unique_ptr<LaneHasher> hash_;
+    std::unique_ptr<LaneHasher> records_hash_, hash_;  // poi_records.bin's, and poi_vertices.bin's
     uint64_t i_ = 0, logical_ = 0, blocks_end_ = 0, block_logical_ = 0, block_left_ = 0;
     uint8_t rec_[poi_files::LOGICAL_STRIDE] = {};
     bool block_ = false, decoded_ = false;
@@ -196,11 +213,11 @@ struct Result {
 // seq_end from the old files in cur_dir into new ones in out_dir. fix(rec, old_index, k_in_run, run)
 // moves a MATCH record's string fields and vertex_offset as the generic replay does (run: the
 // run's first old index and count). on_run(old_start, new_start, count) for each MATCH and
-// REPLACE run (the record remap). The old V2 file must hash to old_vertices_hash.
+// REPLACE run (the record remap). The old R2 and V2 files must hash to old_hashes.
 template <typename Fix, typename OnRun>
 Result replay(const char* P, size_t patch_size, size_t pos, size_t seq_end, const std::string& cur_dir,
               const std::string& out_dir, uint64_t old_size, uint64_t new_size, uint32_t file_records_max,
-              uint64_t old_vertices_hash, Fix fix, OnRun on_run) {
+              const Hashes& old_hashes, Fix fix, OnRun on_run) {
     using namespace poi_files;
     Result r;
     OldRows old(cur_dir);
@@ -356,7 +373,9 @@ Result replay(const char* P, size_t patch_size, size_t pos, size_t seq_end, cons
     if (r.records_bytes != new_size) throw std::runtime_error("Rebuilt poi_records.bin does not match the new build");
     if (child.written != child.new_size) throw std::runtime_error("Rebuilt poi_vertices.bin does not match the new build");
     r.vertex_bytes = child.written;
-    if (old.finish() != old_vertices_hash) throw std::runtime_error("Old poi_vertices.bin is not the one the patch was made from");
+    const Hashes hashes = old.finish();
+    if (hashes.records != old_hashes.records) throw std::runtime_error("Old poi_records.bin is not the one the patch was made from");
+    if (hashes.vertices != old_hashes.vertices) throw std::runtime_error("Old poi_vertices.bin is not the one the patch was made from");
     enc.finish();
     for (int p = 0; p < 2; p++) {
         r.decode_peaks[p] = vd ? vd->peak(p) : 0;

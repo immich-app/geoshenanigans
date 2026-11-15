@@ -504,12 +504,13 @@ Old file hash: marker 0xFFFFFFF8 (u32) + file_id (u32) + lane_hash of the
   before, it was the old poi_vertices.bin's alone and had no file id.) One
   for each file a replay copies from without decoding it, or takes the
   values such bytes are copied under from, when the old dir holds the file
-  and its family has a section: `poi_vertices.bin` (15), right before the
-  POI records' section of a dir with POI files, and `addr_points.bin` (3)
-  and `addr_vertices.bin` (28), in that order right before the address
-  points' section of a dir with address points. The patcher
+  and its family has a section: `poi_records.bin` (14) and
+  `poi_vertices.bin` (15), in that order right before the POI records'
+  section of a dir with POI files, and `addr_points.bin` (3) and
+  `addr_vertices.bin` (28), in that order right before the address points'
+  section of a dir with address points. The patcher
   refuses a second hash of a file, a hash of any other file, and a replay
-  without the hash it checks by; a hash whose replay does not run (both of
+  without the hashes it checks by; a hash whose replay does not run (both of
   the family's sections unchanged, or an old file without records) is read
   and checks nothing. The patcher replays the POI records and their blocks on R2
   and V2 as they sit (`tools/poi_replay.h`): a new record whose polygon is
@@ -518,9 +519,11 @@ Old file hash: marker 0xFFFFFFF8 (u32) + file_id (u32) + lane_hash of the
   and its record's lat and lng alone); every other polygon is decoded from
   the old file (the blocks asked for alone) and encoded again, and every row
   decoded and encoded again (its string ids move). The copied blocks are
-  never decoded: the replay hashes the old file as it passes it and refuses
-  one of another hash ("Old poi_vertices.bin is not the one the patch was
-  made from"), and a POI records section without the hash before it.
+  never decoded, and the rows they are copied under are rows like any other
+  whatever their lat and lng: the replay hashes both old files as it passes
+  them and refuses one of another hash ("Old poi_records.bin is not the one
+  the patch was made from", "Old poi_vertices.bin is not the one the patch
+  was made from"), and a POI records section without both hashes before it.
   The two files of each way pair are hashed too (`street_ways.bin` (1) and
   `street_nodes.bin` (2), `interp_ways.bin` (4) and `interp_nodes.bin` (5)),
   their two hashes right before the ways' section of a dir with such ways.

@@ -877,7 +877,9 @@ TEST(patch_rebuilds_the_builders_poi_files_on_random_days) {
 // byte, copying the blocks of the polygons kept at their place (the log counts
 // them) and encoding the others, their old bytes decoded from the old blocks
 // at hand. A byte flipped in a copied block of the old
-// dir goes through undecoded, and the old poi_vertices.bin's hash refuses it.
+// dir goes through undecoded, and the old poi_vertices.bin's hash refuses it;
+// a bit flipped in the longitude of that block's row is a row like any other,
+// and the old poi_records.bin's hash refuses it.
 TEST(patch_copies_the_poi_blocks_a_day_leaves_whole) {
     ScratchDir dir("lowmem-poi-copy");
     constexpr uint32_t NAME = 12, NAMES = 64, N = 500;
@@ -1002,14 +1004,22 @@ TEST(patch_copies_the_poi_blocks_a_day_leaves_whole) {
     const auto r = run_tool(patch_words(c, "sync", c.patch(), c.dir("out.flipped")), c.log());
     CHECK(!r.ok);
     CHECK(r.log.find("Old poi_vertices.bin is not the one the patch was made from") != std::string::npos);
+    v2[voff + poi_files::MAX_BLOCK_HEADER + 100] ^= 0x10;
+    REQUIRE(write_file(c.dir("old") + "/poi_vertices.bin", v2.data(), v2.size()));
+
+    std::vector<char> moved = r2;
+    moved[200 * poi_files::ROW_BYTES + poi_files::ROW_LAT + 4] ^= 0x10;
+    REQUIRE(write_file(c.dir("old") + "/poi_records.bin", moved.data(), moved.size()));
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "moved", "Old poi_records.bin is not the one the patch was made from").empty());
 }
 
-// The old poi_vertices.bin's hash, which the diff writes once before the POI
-// records' section, is refused in every mode when the patch holds a second
-// one (the same hash or another, before it or after), and so is the hash of
-// a file no replay copies from: poi_records.bin, or a file id past the
-// table. A patch whose POI replay would copy blocks without the hash is
-// refused too. The patch as made applies.
+// The hashes of the old poi_records.bin and poi_vertices.bin, which the diff
+// writes once each, the records' and then the vertices', right before the POI
+// records' section. In every mode a patch with a second hash of either (the
+// same hash or another, before it or after) is refused, and so is the hash of
+// a file no replay checks: place_nodes.bin, or a file id past the table. A
+// patch whose POI replay would copy blocks without either hash is refused
+// too. The patch as made applies.
 TEST(patch_refuses_a_second_hash_of_a_file_and_a_hash_for_a_file_outside_the_hashed_set) {
     ScratchDir dir("patch-old-file-hash");
     std::mt19937 rng(20261114);
@@ -1025,65 +1035,77 @@ TEST(patch_refuses_a_second_hash_of_a_file_and_a_hash_for_a_file_outside_the_has
     REQUIRE(prepare(c, old_d, new_d).empty());
     const std::vector<char> raw = raw_patch(c);
     REQUIRE(!raw.empty());
-    const std::vector<char> v2 = read_file(c.dir("old") + "/poi_vertices.bin");
-    const uint64_t hash = lane_hash(v2.data(), v2.size());
-    const std::vector<char> made = old_file_hash(PatchFileId::POI_VERTICES, hash);
-    const size_t at = find_once(raw, made);
-    REQUIRE(at != std::string::npos);
-    const size_t end = at + made.size();
-
-    const std::string second = "Malformed patch: a second hash of the old poi_vertices.bin";
     struct Case {
         std::string name;
         size_t at;
         std::vector<char> section;
         std::string refusal;
     };
-    const Case cases[] = {
-        {"twice-after", end, made, second},
-        {"twice-before", at, made, second},
-        {"another-hash", end, old_file_hash(PatchFileId::POI_VERTICES, hash ^ 1), second},
-        {"records", at, old_file_hash(PatchFileId::POI_RECORDS, hash),
-         "Malformed patch: a hash of the old poi_records.bin, which no replay checks"},
-        {"past-the-table", at, old_file_hash(PatchFileId::COUNT, hash),
-         "Malformed patch: a hash of the old file " + std::to_string(static_cast<uint32_t>(PatchFileId::COUNT)) +
-             ", which no replay checks"},
-    };
+    std::vector<Case> cases;
+    size_t records_hash_end = 0;
+    for (const PatchFileId hashed : {PatchFileId::POI_RECORDS, PatchFileId::POI_VERTICES}) {
+        const std::string file = patch_file_names[static_cast<uint32_t>(hashed)];
+        const std::vector<char> bytes = read_file(c.dir("old") + "/" + file);
+        const uint64_t hash = lane_hash(bytes.data(), bytes.size());
+        const std::vector<char> made = old_file_hash(hashed, hash);
+        const size_t at = find_once(raw, made);
+        if (at == std::string::npos) std::printf("    no hash of the old %s\n", file.c_str());
+        REQUIRE(at != std::string::npos);
+        const size_t end = at + made.size();
+        // The vertices' hash follows the records', and the POI records' section the two.
+        if (hashed == PatchFileId::POI_RECORDS) records_hash_end = end;
+        else CHECK_EQ(at, records_hash_end);
+        const std::string second = "Malformed patch: a second hash of the old " + file;
+        cases.push_back({file + "-twice-after", end, made, second});
+        cases.push_back({file + "-twice-before", at, made, second});
+        cases.push_back({file + "-another-hash", end, old_file_hash(hashed, hash ^ 1), second});
+        if (hashed == PatchFileId::POI_VERTICES) {
+            cases.push_back({"places", at, old_file_hash(PatchFileId::PLACE_NODES, hash),
+                             "Malformed patch: a hash of the old place_nodes.bin, which no replay checks"});
+            cases.push_back({"past-the-table", at, old_file_hash(PatchFileId::COUNT, hash),
+                             "Malformed patch: a hash of the old file " + std::to_string(static_cast<uint32_t>(PatchFileId::COUNT)) +
+                                 ", which no replay checks"});
+        }
+        std::vector<char> cut = raw;
+        cut.erase(cut.begin() + static_cast<std::ptrdiff_t>(at), cut.begin() + static_cast<std::ptrdiff_t>(end));
+        const std::string patch = c.dir(file + "-cut.gcpatch");
+        REQUIRE(write_patch(c, patch, cut));
+
+        CHECK(not_refused(c, ALL_MODES, patch, file + "-cut", "Malformed patch: POI records without the old " + file + "'s hash").empty());
+    }
     for (const Case& e : cases) {
         std::vector<char> edited_patch = raw;
-        edited_patch.insert(edited_patch.begin() + e.at, e.section.begin(), e.section.end());
+        edited_patch.insert(edited_patch.begin() + static_cast<std::ptrdiff_t>(e.at), e.section.begin(), e.section.end());
         const std::string patch = c.dir(e.name + ".gcpatch");
         REQUIRE(write_patch(c, patch, edited_patch));
 
         CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
     }
-    {
-        std::vector<char> cut = raw;
-        cut.erase(cut.begin() + at, cut.begin() + end);
-        const std::string patch = c.dir("cut.gcpatch");
-        REQUIRE(write_patch(c, patch, cut));
-
-        CHECK(not_refused(c, ALL_MODES, patch, "cut", "Malformed patch: POI records without the old poi_vertices.bin's hash").empty());
-    }
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
-// A day that leaves both POI files as they are: the diff sends the old
-// poi_vertices.bin's hash before the two unchanged sections all the same, and
-// the patcher, whose POI replay does not run, reads it and checks nothing by
-// it. A patch with another hash in its place applies in every mode.
-TEST(patch_reads_and_does_not_use_the_poi_hash_when_both_poi_sections_are_unchanged) {
+// A day that leaves both POI files as they are: the diff sends the hashes of
+// the old poi_records.bin and poi_vertices.bin before the two unchanged
+// sections all the same, and the patcher, whose POI replay does not run,
+// reads them and checks nothing by them. A patch with another hash in the
+// place of either applies in every mode.
+TEST(patch_reads_and_does_not_use_the_poi_hashes_when_both_poi_sections_are_unchanged) {
     ScratchDir dir("patch-unused-poi-hash");
     std::mt19937 rng(20261115);
     BuildDir d;
     put_pois(d, pois_of(rng, 300, 0, true));
     const LowMemCase c{dir.path(), "unused"};
     REQUIRE(prepare(c, d, d).empty());
-    std::vector<char> raw = raw_patch(c);
+    const std::vector<char> raw = raw_patch(c);
     REQUIRE(!raw.empty());
-    const std::vector<char> v2 = read_file(c.dir("old") + "/poi_vertices.bin");
-    const uint64_t hash = lane_hash(v2.data(), v2.size());
-    std::vector<char> sections = old_file_hash(PatchFileId::POI_VERTICES, hash);
+    std::vector<char> sections;
+    for (const char* name : {"poi_records.bin", "poi_vertices.bin"}) {
+        const std::vector<char> bytes = read_file(c.dir("old") + "/" + name);
+        const std::vector<char> hash =
+            old_file_hash(name == std::string("poi_records.bin") ? PatchFileId::POI_RECORDS : PatchFileId::POI_VERTICES,
+                          lane_hash(bytes.data(), bytes.size()));
+        sections.insert(sections.end(), hash.begin(), hash.end());
+    }
     for (const auto& [file, name] : {std::pair<PatchFileId, const char*>{PatchFileId::POI_RECORDS, "poi_records.bin"},
                                      {PatchFileId::POI_VERTICES, "poi_vertices.bin"}}) {
         const std::vector<char> unchanged = copy_old_section(file, d.at(name).size());
@@ -1096,9 +1118,13 @@ TEST(patch_reads_and_does_not_use_the_poi_hash_when_both_poi_sections_are_unchan
         return log.find("replayed with poi_records.bin: blocks ") == std::string::npos ? std::string() : std::string("the POI replay ran");
     };
     CHECK(apply_modes(c, ALL_MODES, no_replay).bad.empty());
-    put_at(raw, at + 8, hash ^ 1);
-    REQUIRE(write_patch(c, c.patch(), raw));
-    CHECK(apply_modes(c, ALL_MODES, no_replay).bad.empty());
+    // Each hash section is its marker, its file and the hash: 16 bytes.
+    for (const size_t hash_at : {at + 8, at + 16 + 8}) {
+        std::vector<char> another = raw;
+        another[hash_at] ^= 1;
+        REQUIRE(write_patch(c, c.patch(), another));
+        CHECK(apply_modes(c, ALL_MODES, no_replay).bad.empty());
+    }
 }
 
 // Random days of the five string tiers: old pools of random strings (empty
@@ -7679,4 +7705,73 @@ TEST(patch_refuses_old_files_with_a_byte_between_their_last_unit_and_what_follow
         CHECK(apply_modes(c, ALL_MODES).bad.empty());
         if (gctest::failures() > failures_before) std::printf("    in: %s\n", e.name.c_str());
     }
+}
+
+// A V2 block holds its polygon's bbox minimum as steps from its record's lat
+// and lng, and a MATCH record is the old row's, so the old records the POI
+// replay copies blocks under are checked as the blocks are, by their file's
+// hash. 30 POIs, 20 with a polygon, and a patch that MATCHes every record and
+// every vertex byte: each block is copied. With one bit of a row's latitude
+// flipped in the old poi_records.bin, or a byte of a combo of its dictionary
+// changed, the files are still ones the encoder writes (poi_files::decode
+// takes them) and poi_vertices.bin is as it was: the patched files would hold
+// a POI and its polygon the new day does not. In every mode the patcher
+// refuses the old poi_records.bin by its hash; the patch applies to the files
+// as written.
+TEST(the_poi_replay_refuses_an_old_record_moved_under_a_block_it_would_copy) {
+    ScratchDir dir("lowmem-poi-point");
+    std::mt19937 rng(20261115);
+    BuildDir d;
+    put_pois(d, pois_of(rng, 30, 0, true));
+    const LowMemCase c{dir.path(), "point"};
+    REQUIRE(prepare(c, d, d).empty());
+    const std::vector<char>& records = d.at("poi_records.bin");
+    const std::vector<char>& vertices = d.at("poi_vertices.bin");
+
+    // The unchanged day's patch with its two POI sections as merges: every
+    // record a MATCH, every vertex byte a MATCH.
+    const std::vector<char> raw = raw_patch(c);
+    std::vector<char> copies = copy_old_section(PatchFileId::POI_RECORDS, records.size());
+    const std::vector<char> copied_vertices = copy_old_section(PatchFileId::POI_VERTICES, vertices.size());
+    copies.insert(copies.end(), copied_vertices.begin(), copied_vertices.end());
+    const size_t at = find_once(raw, copies);
+    REQUIRE(at != std::string::npos);
+    std::vector<char> record_ops, vertex_ops;
+    put_op(record_ops, OP_MATCH_RUN, 30);
+    put_op(vertex_ops, OP_MATCH_RUN, static_cast<uint32_t>(vertices.size()));
+    std::vector<char> matched(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(at));
+    for (const std::vector<char>& section :
+         {merge_of(PatchFileId::POI_RECORDS, static_cast<uint32_t>(POI_RECORD_STRIDE), records.size(), records.size(), record_ops),
+          merge_of(PatchFileId::POI_VERTICES, 1, vertices.size(), vertices.size(), vertex_ops)})
+        matched.insert(matched.end(), section.begin(), section.end());
+    matched.insert(matched.end(), raw.begin() + static_cast<std::ptrdiff_t>(at + copies.size()), raw.end());
+    REQUIRE(write_patch(c, c.patch(), matched));
+    const LogCheck copied = [](const std::string& log) {
+        return log.find("replayed with poi_records.bin: blocks 20 copied, 0 encoded") == std::string::npos ? std::string("not 20 blocks copied")
+                                                                                                             : std::string();
+    };
+    CHECK(apply_modes(c, ALL_MODES, copied).bad.empty());
+
+    const std::string path = c.dir("old") + "/poi_records.bin";
+    const std::vector<char> written = read_file(path), blocks = read_file(c.dir("old") + "/poi_vertices.bin");
+    // Record 1 has a polygon; the combos follow the 30 rows.
+    std::vector<char> moved = written, another_combo = written;
+    moved[1 * poi_files::ROW_BYTES + poi_files::ROW_LAT] ^= 1;
+    another_combo[30 * poi_files::ROW_BYTES + 3] ^= 5;
+    for (const auto& [name, damaged] : {std::pair<const char*, const std::vector<char>&>{"moved", moved}, {"combo", another_combo}}) {
+        std::string strict;
+        try {
+            poi_files::decode(reinterpret_cast<const uint8_t*>(damaged.data()), damaged.size(), reinterpret_cast<const uint8_t*>(blocks.data()),
+                              blocks.size());
+        } catch (const std::runtime_error& e) {
+            strict = e.what();
+        }
+        if (!strict.empty()) std::printf("    %s: %s\n", name, strict.c_str());
+        REQUIRE(strict.empty());
+        REQUIRE(write_file(path, damaged));
+        const std::vector<std::string> bad = not_refused(c, ALL_MODES, c.patch(), name, "Old poi_records.bin is not the one the patch was made from");
+        CHECK(bad.empty());
+        REQUIRE(write_file(path, written));
+    }
+    CHECK(apply_modes(c, ALL_MODES, copied).bad.empty());
 }

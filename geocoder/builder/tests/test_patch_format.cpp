@@ -384,20 +384,23 @@ TEST(patch_format_section_marker_values) {
     CHECK_EQ(OLD_FILE_HASH_MARKER, uint32_t(0xFFFFFFF8));
 }
 
-TEST(patch_format_hashed_old_files_are_the_ones_a_replay_copies_unread) {
-    // poi_vertices.bin's blocks are copied undecoded; its records are decoded
-    // row by row, and no id past the table names a file. A way pair's node
-    // blocks are copied a group at a time, and its rows give the copied
-    // groups' anchors, counts and codes.
-    CHECK(is_hashed_old_file(static_cast<uint32_t>(PatchFileId::POI_VERTICES)));
+TEST(patch_format_hashed_old_files_are_the_ones_a_replay_copies_unread_or_copies_under) {
+    // poi_vertices.bin's blocks are copied undecoded, each under its row's
+    // lat and lng, which poi_records.bin gives. A way pair's node blocks are
+    // copied a group at a time, and its rows give the copied groups' anchors,
+    // counts and codes.
+    for (const PatchFileId poi_file : {PatchFileId::POI_RECORDS, PatchFileId::POI_VERTICES}) CHECK(is_hashed_old_file(static_cast<uint32_t>(poi_file)));
     for (const PatchFileId way_file : {PatchFileId::STREET_WAYS, PatchFileId::STREET_NODES, PatchFileId::INTERP_WAYS, PatchFileId::INTERP_NODES})
         CHECK(is_hashed_old_file(static_cast<uint32_t>(way_file)));
-    CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::POI_RECORDS)));
     // addr_vertices.bin's blobs are copied undecoded, each under its
     // record's point, which a block of addr_points.bin gives; addr_index.bin
     // is checked against the two.
     CHECK(is_hashed_old_file(static_cast<uint32_t>(PatchFileId::ADDR_VERTICES)));
     CHECK(is_hashed_old_file(static_cast<uint32_t>(PatchFileId::ADDR_POINTS)));
+    // The place files and the side files are decoded, and no id past the
+    // table names a file.
+    for (const PatchFileId decoded : {PatchFileId::PLACE_NODES, PatchFileId::WAY_PARENTS, PatchFileId::ADDR_POSTCODES})
+        CHECK(!is_hashed_old_file(static_cast<uint32_t>(decoded)));
     CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::STRINGS)));
     CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::COUNT)));
     CHECK(!is_hashed_old_file(OLD_FILE_HASH_MARKER));

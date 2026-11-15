@@ -2093,9 +2093,13 @@ static int run(int argc, char* argv[]) {
         serialize_merge(patch, res_addr_v, old_dir, new_dir, patcher_strings, offset_fixup_limits);
         { std::vector<char>().swap(res_addr_v.seq.data); }
     }
-    // The old V2 file's hash, before the POI records' section: the patcher's POI replay copies the
-    // blocks the day leaves whole and checks them by it.
-    if (res_poi_r.old_size || res_poi_r.new_size) append_old_file_hash(patch, old_dir, PatchFileId::POI_VERTICES);
+    // The hashes of the old R2 and V2 files, before the POI records' section: the patcher's POI
+    // replay copies the blocks the day leaves whole, each under its old row's lat and lng, and
+    // checks both files by them.
+    if (res_poi_r.old_size || res_poi_r.new_size) {
+        append_old_file_hash(patch, old_dir, PatchFileId::POI_RECORDS);
+        append_old_file_hash(patch, old_dir, PatchFileId::POI_VERTICES);
+    }
     serialize_merge(patch, res_poi_r, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     serialize_merge(patch, res_poi_v, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     { std::vector<char>().swap(res_poi_v.seq.data); }

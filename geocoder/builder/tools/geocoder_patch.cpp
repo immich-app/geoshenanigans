@@ -380,12 +380,12 @@ private:
 
 // The POI records' merge section at P[seq_at, seq_end) and the vertex section after it, replayed
 // on R2 + V2 as they sit (poi_replay.h), the MATCH records' fields moved as the generic replay
-// moves them; their MATCH and REPLACE runs go to remap (when given). Out of run() and never
-// inlined into it: run()'s own record loops keep the code they had. Writes its log line and the
-// codecs' reports.
+// moves them; their MATCH and REPLACE runs go to remap (when given). The old R2 and V2 files must
+// hash to hashes. Out of run() and never inlined into it: run()'s own record loops keep the code
+// they had. Writes its log line and the codecs' reports.
 [[gnu::noinline]] static poi_replay::Result replay_poi_section(
     const char* P, size_t patch_size, size_t seq_at, size_t seq_end, const std::string& cur_dir, const std::string& to,
-    uint64_t old_size, uint64_t new_size, uint32_t file_records_max, uint64_t vertices_hash, bool has_fixups,
+    uint64_t old_size, uint64_t new_size, uint32_t file_records_max, const poi_replay::Hashes& hashes, bool has_fixups,
     size_t fixup_off, OffsetFixupReader& fixups, StringFixupReader& string_fixups, const StringRemap& str_remap,
     const std::vector<size_t>& remap_offs, std::vector<size_t>& remap_hints, RecordRemap* remap) {
     auto fix = [&](uint8_t* rec, uint64_t old_index, uint32_t k, uint64_t run_first, uint32_t run_count) {
@@ -404,7 +404,7 @@ private:
         }
     };
     const poi_replay::Result r = poi_replay::replay(
-        P, patch_size, seq_at, seq_end, cur_dir, to, old_size, new_size, file_records_max, vertices_hash, fix,
+        P, patch_size, seq_at, seq_end, cur_dir, to, old_size, new_size, file_records_max, hashes, fix,
         [&](uint64_t o, uint64_t n, uint32_t count) {
             if (remap) remap->add_match(static_cast<uint32_t>(o), static_cast<uint32_t>(n), count);
         });
@@ -690,9 +690,9 @@ static int run(int argc, char* argv[]) {
     SortedTable<RemapPair> poi_street_remap;
     bool saw_parent_remap = false;  // a patch gives one
     // The old files' hashes (OLD_FILE_HASH_MARKER) by file id, which a replay checks the bytes it
-    // copies undecoded by: the POI replay the old poi_vertices.bin's blocks, a way replay the old
-    // pair's rows and node blocks, the address replay the old blobs and the records they are
-    // copied under.
+    // copies undecoded by, and the records it copies them under: the POI replay the old blocks
+    // and rows, a way replay the old pair's rows and node blocks, the address replay the old blobs
+    // and blocks.
     std::map<uint32_t, uint64_t> old_file_hashes;
     // The hash the patch gave of an old file that the replay of `records` checks: refused without.
     auto old_hash_of = [&](PatchFileId file, const char* records) {
@@ -1272,9 +1272,8 @@ static int run(int argc, char* argv[]) {
         // The POI records and their blocks replay on R2 + V2 as they sit (poi_replay.h): a block
         // the day leaves whole is copied, the rest decoded and encoded again.
         if (joint && file_id == (uint32_t)PatchFileId::POI_RECORDS && old_size > 0) {
-            const auto poi_vertices_hash = old_file_hashes.find((uint32_t)PatchFileId::POI_VERTICES);
-            if (poi_vertices_hash == old_file_hashes.end())
-                throw std::runtime_error("Malformed patch: POI records without the old poi_vertices.bin's hash");
+            const poi_replay::Hashes hashes{old_hash_of(PatchFileId::POI_RECORDS, "POI records"),
+                                            old_hash_of(PatchFileId::POI_VERTICES, "POI records")};
             const uint64_t seq_size = patch.u64();
             patch.require(seq_size, "merge sequence");
             const size_t seq_at = pos, seq_end = pos + seq_size;
@@ -1284,7 +1283,7 @@ static int run(int argc, char* argv[]) {
             RecordRemap remap(track ? static_cast<uint32_t>(n_old_records) : 0, tmpdir);
             const poi_replay::Result r = replay_poi_section(
                 P, patch_size, seq_at, seq_end, cur_dir, listed.count(fname) ? out_dir : tmpdir, old_size, new_size,
-                file_records_max, poi_vertices_hash->second, has_fixups, fixup_off, fixups, string_fixups, str_remap, remap_offs,
+                file_records_max, hashes, has_fixups, fixup_off, fixups, string_fixups, str_remap, remap_offs,
                 remap_hints, track ? &remap : nullptr);
             fixups.finish(n_old_records);
             string_fixups.finish();
