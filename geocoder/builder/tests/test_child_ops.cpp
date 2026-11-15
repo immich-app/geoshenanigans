@@ -233,8 +233,9 @@ TEST(child_ops_read_an_unchanged_child_as_one_match_and_a_replaced_one_as_one_in
 // What is not the child's section is refused by name as it is parsed: the
 // section of another file, a merge at another stride than the child's or of
 // another kind, one with offset fixups or string fixups, a full replacement
-// that is not the new file's bytes, a file of more records than a patch
-// indexes, and a section cut anywhere.
+// that is not the new file's bytes, a copy of the old stream to a new one of
+// another size, a file of more records than a patch indexes, and a section
+// cut anywhere.
 TEST(child_ops_refuse_a_section_that_is_not_the_childs) {
     const PatchFileId file = PatchFileId::STREET_NODES;
     std::vector<char> seq;
@@ -267,6 +268,8 @@ TEST(child_ops_refuse_a_section_that_is_not_the_childs) {
         {"string fixup bytes", merge_section(file, 8, 72, 72, seq, {0, 0, 0, 0, 0, 4}), "Encoded family: a child stream with string fixups"},
         {"short replacement", whole_section(file, 0, 72, 72, bytes_from('a', 64)), "Malformed child full replacement"},
         {"long replacement", whole_section(file, 0, 72, 72, bytes_from('a', 80)), "Malformed child full replacement"},
+        {"longer copy", whole_section(file, COPY_OLD_STRIDE, 72, 80), "Malformed copy-old section: street_nodes.bin is 72 bytes old and 80 new"},
+        {"shorter copy", whole_section(file, COPY_OLD_STRIDE, 72, 64), "Malformed copy-old section: street_nodes.bin is 72 bytes old and 64 new"},
     };
     for (const Case& c : cases) {
         const std::string got = parse_refusal(file, 8, c.section);

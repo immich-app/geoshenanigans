@@ -7429,3 +7429,63 @@ TEST(the_address_replay_refuses_an_old_record_moved_under_a_blob_it_would_copy) 
     REQUIRE(write_file(points_path, points));
     CHECK(apply_modes(c, ALL_MODES, addr_replayed_is(1, 0)).bad.empty());
 }
+
+// A section sent as unchanged says the new file is the old one, so its two
+// sizes are one. In every mode the patcher refuses, by the file's name, such
+// a section whose new size is not its old one, though the old file has the
+// old size and the client list holds the new dir's files: each section of a
+// day that changes nothing (the records' and the child's of a way pair, of
+// the address files and of the POI files, the place files' and a side
+// file's, families the patcher copies as their files sit), and that of a file
+// of no family (the arcs' index). The patches as made apply.
+TEST(patch_refuses_a_section_sent_as_unchanged_whose_new_size_is_not_its_old_one) {
+    ScratchDir dir("lowmem-copy-old-sizes");
+    std::mt19937 rng(20261115);
+    BuildDir families = every_family(rng), arcs;
+    put_arc_slots(arcs, arc_slots(40, 30, 12));
+    CellLists cells;
+    for (uint32_t k = 0; k < 12; k++) cells[pair_cell(k)] = {k};
+    put_cells(arcs, "admin", cells);
+    struct Section {
+        PatchFileId file;
+        uint64_t size, more;  // its bytes, and those of one of its records
+    };
+    auto logical = [&](const char* name) { return static_cast<uint64_t>(families.at(name).size()); };
+    const std::vector<Section> of_families = {
+        {PatchFileId::STREET_WAYS, logical("street_ways.bin"), WAY_HEADER_STRIDE},
+        {PatchFileId::STREET_NODES, logical("street_nodes.bin"), 8},
+        {PatchFileId::INTERP_WAYS, logical("interp_ways.bin"), INTERP_WAY_STRIDE},
+        {PatchFileId::INTERP_NODES, logical("interp_nodes.bin"), 8},
+        {PatchFileId::ADDR_POINTS, logical("addr_points.bin"), ADDR_POINT_STRIDE},
+        {PatchFileId::ADDR_VERTICES, logical("addr_vertices.bin"), 1},
+        {PatchFileId::POI_RECORDS, logical("poi_records.bin"), POI_RECORD_STRIDE},
+        {PatchFileId::POI_VERTICES, logical("poi_vertices.bin"), 1},
+        {PatchFileId::PLACE_NODES, place_files::LOGICAL_STRIDE * 20, place_files::LOGICAL_STRIDE},
+        {PatchFileId::WAY_PARENTS, logical("way_parents.bin"), 4},
+        {PatchFileId::ADDR_POSTCODES, logical("addr_postcodes.bin"), 4},
+    };
+    const std::vector<Section> of_arcs = {{PatchFileId::ARC_INDEX, arcs.at("arc_index.bin").size(), ARC_INDEX_STRIDE}};
+    for (const auto& [name, d, sections] : {std::tuple<const char*, const BuildDir&, const std::vector<Section>&>{"families", families, of_families},
+                                            {"arcs", arcs, of_arcs}}) {
+        const LowMemCase c{dir.path(), name};
+        REQUIRE(prepare(c, d, d).empty());
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
+        const std::vector<char> raw = raw_patch(c);
+        REQUIRE(!raw.empty());
+        for (const Section& s : sections) {
+            const std::string file = patch_file_names[static_cast<uint32_t>(s.file)];
+            const size_t at = find_once(raw, copy_old_section(s.file, s.size));
+            if (at == std::string::npos) std::printf("    no unchanged section of %s\n", file.c_str());
+            REQUIRE(at != std::string::npos);
+            std::vector<char> longer = raw;
+            put_at(longer, at + 16, s.size + s.more);
+            const std::string patch = c.dir(file + ".gcpatch");
+            REQUIRE(write_patch(c, patch, longer));
+
+            CHECK(not_refused(c, ALL_MODES, patch, file,
+                              "Malformed copy-old section: " + file + " is " + std::to_string(s.size) + " bytes old and " +
+                                  std::to_string(s.size + s.more) + " new")
+                      .empty());
+        }
+    }
+}

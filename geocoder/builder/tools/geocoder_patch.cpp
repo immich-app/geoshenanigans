@@ -182,6 +182,7 @@ struct JointChild {
             data = at;
             in.take(ds);
             if (kind == FULL && ds != new_size) throw std::runtime_error("Malformed child full replacement");
+            if (kind == COPY_OLD) require_copy_old_sizes(patch_file_names[fid], old_size, new_size);
             stride = 1;
         } else if (stride == SPARSE_DELTA_STRIDE || stride == CELL_LIST_DELTA_STRIDE || stride == PARALLEL_DELTA_STRIDE) {
             throw std::runtime_error("Encoded family: unexpected section kind for a child stream");
@@ -907,6 +908,7 @@ static int run(int argc, char* argv[]) {
             // Unchanged file: the diff verified old==new and emitted no
             // data. Reproduce by copying the old (current) file verbatim.
             uint32_t nf = patch.u32(); (void)nf; patch.take(patch.u64(), "copy-old payload"); // empty
+            require_copy_old_sizes(fname, old_size, new_size);
             // An encoded family is unchanged when this section is all of it (a side file, the place
             // files), or its parent's with the child's, the next one, COPY_OLD too.
             if (const gcs::FamilyDesc* family = gcs::store().family_of(fname)) {

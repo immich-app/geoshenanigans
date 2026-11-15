@@ -559,7 +559,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   stride=0: full replacement (n_fixups=0 u32, size u64, data)
   stride=0xFD: unchanged, copy from cur_dir (a file of an encoded family is unchanged in its
     logical form: the patcher copies the family's files when each of its sections is 0xFD, and
-    else replays this one as a MATCH of every record)
+    else replays this one as a MATCH of every record). new_size is old_size, and the patcher
+    refuses any other ("Malformed copy-old section")
   stride=0xFC: sparse delta (value_stride, remap_kind, n, [(pos, value)] × n;
     remap_kind 0 raw, 2 a string offset, 3 a postcode centroid, as its file's
     row of SPARSE_DELTA_FILES gives it, and the patcher refuses any other.

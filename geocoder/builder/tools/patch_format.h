@@ -650,6 +650,12 @@ constexpr uint32_t SPARSE_DELTA_STRIDE = 0xFC;
 // fixup passes are skipped for identical files), so the patcher's identity
 // reconstruction matches.
 constexpr uint32_t COPY_OLD_STRIDE = 0xFD;
+// A COPY_OLD section's two sizes are one, the new file being the old one: refused otherwise.
+inline void require_copy_old_sizes(const std::string& name, uint64_t old_size, uint64_t new_size) {
+    if (new_size != old_size)
+        throw std::runtime_error("Malformed copy-old section: " + name + " is " + std::to_string(old_size) + " bytes old and " +
+                                 std::to_string(new_size) + " new");
+}
 
 // Stride sentinel: a cell index (<name>_cells.bin + <name>_entries.bin)
 // patched by runs (v15). Strategy-2 ids keep most lists unchanged day to day,

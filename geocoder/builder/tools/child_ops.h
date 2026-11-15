@@ -35,7 +35,7 @@ struct ChildOps {
         : fid(static_cast<uint32_t>(file)), name(patch_file_names[static_cast<uint32_t>(file)]), stride(run_stride) {}
 
     // Reads the section at p[at, size): refused unless it is the child's, a merge at its stride
-    // without fixups, a copy or a full replacement.
+    // without fixups, a copy of the old stream as the new one or a full replacement.
     void parse(const char* p, size_t size, size_t at, uint32_t file_records_max) {
         P = p;
         SectionReader in(P, size, at, "patch: child section");
@@ -50,6 +50,7 @@ struct ChildOps {
             data = at;
             in.take(ds);
             if (kind == FULL && ds != new_size) throw std::runtime_error("Malformed child full replacement");
+            if (kind == COPY_OLD) require_copy_old_sizes(name, old_size, new_size);
         } else if (section_stride != stride) {
             throw std::runtime_error("Encoded family: unexpected section kind for a child stream");
         } else {
