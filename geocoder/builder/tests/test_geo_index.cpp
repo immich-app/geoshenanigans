@@ -6,6 +6,7 @@
 // refuses what it can't write and the Reader each malformed part.
 #include "geo_index.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -104,17 +105,23 @@ std::vector<uint32_t> shape(std::mt19937_64& rng, const std::vector<uint32_t>& p
     return l;
 }
 
-// `n` rows at `level`: steps of 1 to 3 and escaped ones of 4 up to a face
-// or more, from the level's first cell (or near it) and up to its last, each
-// with one to three tables' lists of every shape, addresses most often
-// fresh ranges as the builder numbers them.
-Rows random_rows(std::mt19937_64& rng, size_t n, int level = 17) {
+// `n` rows at `level` (as many as the level has cells from the first row's,
+// when those are fewer): steps of 1 to 3 and escaped ones of 4 up to a face
+// or more, from the level's first cell or near it, each with one to three
+// tables' lists of every shape, addresses most often fresh ranges as the
+// builder numbers them. A step leaves a cell for every row still to come,
+// and the longest ones at most half of what those rows can spare, so the
+// rows are never cut short. With `last_cell`, one more row at the level's
+// last cell when the rows stop before it.
+Rows random_rows(std::mt19937_64& rng, size_t n, int level = 17, bool last_cell = false) {
     Rows out;
     const uint64_t cells = cells_at(level);
     uint64_t number = rng() % 2 ? 0 : rng() % 1000;
+    if (number >= cells) number = 0;
+    const uint64_t rows = std::min<uint64_t>(n, cells - number);
     std::array<std::vector<uint32_t>, TABLES> prev = {{{1}, {1}, {1}}};
     uint32_t next_addr = 0;
-    for (size_t i = 0; i < n && number < cells; i++) {
+    for (uint64_t i = 0; i < rows; i++) {
         Row r{cell_of(number, level), {}};
         const unsigned mask = 1 + static_cast<unsigned>(rng() % 7);
         for (size_t t = 0; t < TABLES; t++) {
@@ -129,13 +136,16 @@ Rows random_rows(std::mt19937_64& rng, size_t n, int level = 17) {
             prev[t] = r.lists[t];
         }
         out.push_back(r);
+        const uint64_t to_come = rows - 1 - i;
+        if (to_come == 0) break;
+        // The cells past this one that the rows to come can spare: 1 or more.
+        const uint64_t spare = cells - 1 - number - (to_come - 1);
         const uint64_t kind = rng() % 10;
-        const uint64_t step = kind < 4 ? 1 + kind % 3 : kind < 8 ? 4 + rng() % 200 : kind < 9 ? 1 + (rng() >> (rng() % 40 + 24)) : 3;
-        if (step >= cells - number) break;
-        number += step;
+        uint64_t step = kind < 4 ? 1 + kind % 3 : kind < 8 ? 4 + rng() % 200 : kind < 9 ? 1 + (rng() >> (rng() % 40 + 24)) : 3;
+        if (kind == 8) step = std::min(step, std::max<uint64_t>(1, spare / 2));
+        number += std::min(step, spare);
     }
-    // The level's last cell.
-    if (number + 1 < cells && rng() % 2) out.push_back({cell_of(cells - 1, level), {{{5}, {}, {}}}});
+    if (last_cell && number + 1 < cells) out.push_back({cell_of(cells - 1, level), {{{5}, {}, {}}}});
     return out;
 }
 
@@ -148,11 +158,16 @@ void write_bytes(const std::string& path, const std::vector<char>& bytes) {
 TEST(geo_index_random_rows_read_back_and_are_the_writers) {
     std::mt19937_64 rng(20261109);
     ScratchDir dir("gctest-geoindex");
-    // Around a block's and a group's rows: one row, a block, a block and one, a group, a group and one, more.
+    // Around a block's and a group's rows, exactly: one row, a block, a block and one, a group, a group and one,
+    // more. Then four rounds that end on their level's last cell: level 17 again, a level of 24 cells, the
+    // deepest and one between.
     const size_t sizes[] = {1, 63, 64, 65, 200, 4095, 4096, 4097, 9000};
-    for (size_t round = 0; round < std::size(sizes) + 3; round++) {
-        const int level = round < std::size(sizes) ? 17 : round == std::size(sizes) ? 1 : round == std::size(sizes) + 1 ? 30 : 10;
-        const Rows rows = random_rows(rng, round < std::size(sizes) ? sizes[round] : 3000, level);
+    const int levels[] = {17, 1, 30, 10};
+    for (size_t round = 0; round < std::size(sizes) + std::size(levels); round++) {
+        const bool sized = round < std::size(sizes);
+        const Rows rows = sized ? random_rows(rng, sizes[round]) : random_rows(rng, 3000, levels[round - std::size(sizes)], true);
+        if (sized) CHECK_EQ(rows.size(), sizes[round]);
+        else CHECK_EQ(rows.back().cell, cell_of(cells_at(levels[round - std::size(sizes)]) - 1, levels[round - std::size(sizes)]));
         const Files files = encode(rows);
         CHECK(decode(files) == rows);
         bool canonical = false;
@@ -170,7 +185,9 @@ TEST(geo_index_random_rows_read_back_and_are_the_writers) {
         for (size_t i = 0; i < rows.size(); i += 1 + rng() % 7) {
             const size_t b = view.block_of(rows[i].cell);
             CHECK_EQ(b, i / BLOCK_ROWS);
-            CHECK_EQ(view.block_of(rows[i].cell - 2), i % BLOCK_ROWS == 0 ? (i == 0 ? view.blocks() : b - 1) : b);
+            // The first leaf cell, id 1, has no id before it.
+            if (rows[i].cell > 2)
+                CHECK_EQ(view.block_of(rows[i].cell - 2), i % BLOCK_ROWS == 0 ? (i == 0 ? view.blocks() : b - 1) : b);
         }
     }
 }

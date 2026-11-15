@@ -40,7 +40,7 @@ A complete geocoder index for a given region and configuration consists of files
 
 | Mode | Files | Description |
 |------|-------|-------------|
-| `full/` | 22 files (+4 optional) | Streets + addresses + interpolation + admin + postcodes |
+| `full/` | 20 files (+4 optional) | Streets + addresses + interpolation + admin + postcodes |
 | `no-addresses/` | 14 files (+3 optional) | Streets + admin + postcodes (no address points) |
 | `admin/` | 6 files (+3 optional) | Admin cell indexes + place nodes + postcodes |
 | `admin-minimal/` | 9 files | Admin levels 2-8 + place nodes, with its own polygons over the minimal arc set, simplified to within 37.5 m on an 11 m grid (a ring that grid would collapse keeps the 1.1 m one; takes the place of the quality dir, so pick simplified), and only the core strings its records name. For POI tier `none` |
