@@ -6,13 +6,18 @@
 //! geocoder/testdata/way_files.tsv holds pairs the builder's encoder and this reader must agree
 //! on.
 
-use crate::coord_keys::{bits_at, from_hybrid_key, from_order_key, hybrid_key, order_key, unzigzag32};
+use crate::coord_keys::{bits_at, byte_length, from_hybrid_key, from_order_key, hybrid_key, is_hybrid_key, order_key, unzigzag32};
 use crate::{FileBytes, NodeCoord};
 
 pub const GROUP_WAYS: usize = 16;
 const ROW_HEAD_BYTES: usize = 12;
 const WAYS_FOOTER_BYTES: usize = 8;
 const NODES_FOOTER_BYTES: usize = 16;
+/// The most nodes a way has, the bytes a node fills at the most, and the most bytes a nodes
+/// file is: a row's off is a u32.
+const MAX_WAY_NODES: u64 = u16::MAX as u64;
+const NODE_BYTES: u64 = 8;
+const MAX_NODES_FILE_BYTES: u64 = u32::MAX as u64;
 
 #[inline(always)]
 fn u16_at(b: &[u8], at: usize) -> u16 {
@@ -80,14 +85,16 @@ pub struct WayRow {
     pub interpolation: u8,
 }
 
-/// The bytes of the block of a way of `cnt` nodes packed as `code` says, whatever the code.
+/// The bytes of the block of a way of `cnt` nodes packed as `code` says: none of a way without
+/// nodes. None for a code no way of that many nodes has: any but 0 without nodes, else a width
+/// past 32 bits or a first node in more than 4 bytes an axis.
 #[inline]
-fn block_bytes(cnt: u16, code: u16) -> u64 {
+fn block_bytes(cnt: u16, code: u16) -> Option<u64> {
     if cnt == 0 {
-        return 0;
+        return (code == 0).then_some(0);
     }
     let (wl, wg, wf) = (u64::from(code & 63), u64::from(code >> 6 & 63), u64::from(code >> 13));
-    2 * wf + ((u64::from(cnt) - 1) * (wl + wg)).div_ceil(8)
+    (wl <= 32 && wg <= 32 && wf <= 4).then(|| 2 * wf + ((u64::from(cnt) - 1) * (wl + wg)).div_ceil(8))
 }
 
 /// A way's node block: its first node, and what its other nodes are read with.
@@ -95,7 +102,10 @@ struct Block<'a> {
     cnt: usize,
     lat: u32,
     lng: u32,
+    /// Whether the way's key is the hybrid key, not the order key; and its first node's keys.
     hybrid: bool,
+    key_lat: u32,
+    key_lng: u32,
     wl: u32,
     wg: u32,
     /// The values' bits, with the 8 bytes after them a field's load takes.
@@ -115,8 +125,10 @@ pub struct WayFiles {
 
 impl WayFiles {
     /// The files of a dir, mapped; an error for files no builder writes: a footer without its
-    /// magic, footers that count different ways, a rows file that is not the rows of its ways.
-    /// What a row or a block holds is not checked here: a way that can't be read reads as none.
+    /// magic, footers that count different ways or 2^32 - 1 of them, a rows file that is not
+    /// the rows of its ways, a nodes file of 4 GiB or more, more nodes than the ways can have,
+    /// blocks longer than the nodes can fill. What a row or a block holds is not checked here:
+    /// a way that can't be read reads as none.
     pub fn open(kind: Kind, ways: FileBytes, nodes: FileBytes) -> Result<WayFiles, String> {
         let (r, n) = (ways.as_slice(), nodes.as_slice());
         let (ways_file, nodes_file) = (kind.ways_file(), kind.nodes_file());
@@ -130,12 +142,25 @@ impl WayFiles {
         if u32_at(n, n.len() - 8) != count {
             return Err(format!("{ways_file} and {nodes_file} count different ways"));
         }
+        if count == u32::MAX {
+            return Err(format!("{ways_file} holds 2^32 - 1 ways or more: NO_DATA is no way's id"));
+        }
         let groups = u64::from(count).div_ceil(GROUP_WAYS as u64);
         let rows_bytes = groups * ROW_HEAD_BYTES as u64 + u64::from(count) * kind.row_way_bytes() as u64;
         if (r.len() - WAYS_FOOTER_BYTES) as u64 != rows_bytes {
             return Err(format!("{ways_file} is not the rows of its {count} ways"));
         }
+        if n.len() as u64 > MAX_NODES_FILE_BYTES {
+            return Err(format!("{nodes_file} is 4 GiB or more"));
+        }
         let blocks_end = n.len() - NODES_FOOTER_BYTES;
+        let node_count = u64::from_le_bytes(n[blocks_end..blocks_end + 8].try_into().unwrap());
+        if node_count > u64::from(count) * MAX_WAY_NODES {
+            return Err(format!("{nodes_file} counts more nodes than its ways can have"));
+        }
+        if blocks_end as u64 > node_count * NODE_BYTES {
+            return Err(format!("{nodes_file} is longer than its nodes can fill"));
+        }
         Ok(WayFiles { kind, rows: ways, nodes, ways: count, blocks_end })
     }
 
@@ -173,45 +198,73 @@ impl WayFiles {
         Some(WayRow { node_count: u16_at(row, ROW_HEAD_BYTES + 4 * j), name: u32_at(row, at + 4 * j), start_number, end_number, interpolation })
     }
 
-    /// The block of way `j` of a group's row: None for a way without nodes, and for a row or a
-    /// block no builder writes (a width out of range, a block past the blocks' end).
+    /// The block of way `j` of a group's row, the file's first group where `first_group`: None
+    /// for a way without nodes, and for a row or a block no builder writes: a code that the
+    /// way, or a way before it in the group, can't have, a block past the blocks' end, a first
+    /// group whose blocks do not start the nodes file, a group whose first way with nodes is
+    /// not at its anchor, a first node in more bytes than it needs or without the hybrid key
+    /// its way is under, bits set past the last value.
     #[inline]
-    fn block(&self, row: &[u8], j: usize) -> Option<Block<'_>> {
+    fn block(&self, row: &[u8], j: usize, first_group: bool) -> Option<Block<'_>> {
         let way = |k: usize| (u16_at(row, ROW_HEAD_BYTES + 4 * k), u16_at(row, ROW_HEAD_BYTES + 4 * k + 2));
         let (cnt, code) = way(j);
         if cnt == 0 {
             return None;
         }
+        let bytes = block_bytes(cnt, code)?;
         let (wl, wg, wf) = (u32::from(code & 63), u32::from(code >> 6 & 63), usize::from(code >> 13));
-        if wl > 32 || wg > 32 || wf > 4 {
+        // The group's blocks start at its off, this way's after those of the ways before it.
+        // The first of the group's ways with nodes is at its anchor: its first node takes no
+        // bytes.
+        let (mut before, mut anchored) = (0u64, false);
+        for k in 0..j {
+            let (cnt, code) = way(k);
+            before += block_bytes(cnt, code)?;
+            if cnt != 0 && !anchored {
+                if code >> 13 != 0 {
+                    return None;
+                }
+                anchored = true;
+            }
+        }
+        // The first group's blocks start where the nodes file does.
+        let off = u32_at(row, 0);
+        if (!anchored && wf != 0) || (first_group && off != 0) {
             return None;
         }
-        // The group's blocks start at its off, this way's after those of the ways before it.
-        let before: u64 = (0..j).map(|k| block_bytes(way(k).0, way(k).1)).sum();
-        let at = usize::try_from(u64::from(u32_at(row, 0)) + before).ok()?;
-        let end = at.checked_add(usize::try_from(block_bytes(cnt, code)).ok()?)?;
+        let at = usize::try_from(u64::from(off) + before).ok()?;
+        let end = at.checked_add(usize::try_from(bytes).ok()?)?;
         if end > self.blocks_end {
             return None;
         }
         // The footer after the blocks holds the 8 bytes a field's load takes past the block.
         let block = self.nodes.as_slice().get(at..end + 8)?;
+        // The first node's steps from the anchor in the order keys, as zigzags, in the fewest
+        // bytes that hold both.
         let first = |from: usize| (0..wf).fold(0u32, |z, b| z | u32::from(block[from + b]) << (8 * b));
-        let (anchor_lat, anchor_lng) = (u32_at(row, 4), u32_at(row, 8));
-        Some(Block {
-            cnt: usize::from(cnt),
-            lat: from_order_key(order_key(anchor_lat).wrapping_add(unzigzag32(first(0)))),
-            lng: from_order_key(order_key(anchor_lng).wrapping_add(unzigzag32(first(wf)))),
-            hybrid: code >> 12 & 1 != 0,
-            wl,
-            wg,
-            bits: &block[2 * wf..],
-        })
+        let (zl, zg) = (first(0), first(wf));
+        if byte_length(zl).max(byte_length(zg)) as usize != wf {
+            return None;
+        }
+        // The values end in zero bits to their last byte's end.
+        let values = (usize::from(cnt) - 1) * (wl + wg) as usize;
+        if values % 8 != 0 && block[2 * wf + values / 8] >> (values % 8) != 0 {
+            return None;
+        }
+        let (order_lat, order_lng) = (order_key(u32_at(row, 4)).wrapping_add(unzigzag32(zl)), order_key(u32_at(row, 8)).wrapping_add(unzigzag32(zg)));
+        let (lat, lng) = (from_order_key(order_lat), from_order_key(order_lng));
+        // The way's key: the hybrid key, which its first node then has, or the order key.
+        let hybrid = code >> 12 & 1 != 0;
+        let (key_lat, key_lng) = if hybrid { (hybrid_key(lat)?, hybrid_key(lng)?) } else { (order_lat, order_lng) };
+        Some(Block { cnt: usize::from(cnt), lat, lng, hybrid, key_lat, key_lng, wl, wg, bits: &block[2 * wf..] })
     }
 
-    /// Way `id`'s first node; None for a way without nodes or one that can't be read.
+    /// Way `id`'s first node; None for a way without nodes or one whose block can't be read.
+    /// Only the first node is read: a way that `way` gives no nodes of for a later node's key
+    /// has a first node here.
     pub fn first_node(&self, id: u32) -> Option<NodeCoord> {
         let (row, _, j) = self.group(id)?;
-        let b = self.block(row, j)?;
+        let b = self.block(row, j, id < GROUP_WAYS as u32)?;
         Some(NodeCoord { lat: f32::from_bits(b.lat), lng: f32::from_bits(b.lng) })
     }
 
@@ -229,16 +282,13 @@ impl WayFiles {
     fn read_nodes(&self, id: u32, nodes: &mut Vec<NodeCoord>) -> Option<()> {
         let (row, _, j) = self.group(id)?;
         if u16_at(row, ROW_HEAD_BYTES + 4 * j) == 0 {
-            return Some(());
+            // A way without nodes has no block, and no code.
+            return (u16_at(row, ROW_HEAD_BYTES + 4 * j + 2) == 0).then_some(());
         }
-        let b = self.block(row, j)?;
+        let b = self.block(row, j, id < GROUP_WAYS as u32)?;
         nodes.reserve(b.cnt);
         nodes.push(NodeCoord { lat: f32::from_bits(b.lat), lng: f32::from_bits(b.lng) });
-        if b.cnt == 1 {
-            return Some(());
-        }
-        // The way's key: the hybrid key, which its first node then has, or the order key.
-        let (mut lat, mut lng) = if b.hybrid { (hybrid_key(b.lat)?, hybrid_key(b.lng)?) } else { (order_key(b.lat), order_key(b.lng)) };
+        let (mut lat, mut lng) = (b.key_lat, b.key_lng);
         let (wl, wg) = (b.wl as usize, b.wg as usize);
         let lng_at = (b.cnt - 1) * wl;
         let (mut step_lat, mut step_lng) = (0u32, 0u32);
@@ -247,7 +297,15 @@ impl WayFiles {
             step_lng = step_lng.wrapping_add(unzigzag32(bits_at(b.bits, lng_at + k * wg, b.wg)?));
             lat = lat.wrapping_add(step_lat);
             lng = lng.wrapping_add(step_lng);
-            let (lat_bits, lng_bits) = if b.hybrid { (from_hybrid_key(lat), from_hybrid_key(lng)) } else { (from_order_key(lat), from_order_key(lng)) };
+            let (lat_bits, lng_bits) = if b.hybrid {
+                // A hybrid key past the largest is no coordinate's.
+                if !is_hybrid_key(lat) || !is_hybrid_key(lng) {
+                    return None;
+                }
+                (from_hybrid_key(lat), from_hybrid_key(lng))
+            } else {
+                (from_order_key(lat), from_order_key(lng))
+            };
             nodes.push(NodeCoord { lat: f32::from_bits(lat_bits), lng: f32::from_bits(lng_bits) });
         }
         Some(())
@@ -304,7 +362,7 @@ pub fn encode(kind: Kind, ways: &[(WayRow, Vec<NodeCoord>)]) -> WayFileBytes {
 /// A way's node block under its group's anchor, appended to `out`; its code.
 #[cfg(any(test, feature = "fixtures"))]
 fn encode_block(nodes: &[NodeCoord], anchor: (u32, u32), out: &mut Vec<u8>) -> u16 {
-    use crate::coord_keys::{bit_length, byte_length, zigzag32, BitWriter};
+    use crate::coord_keys::{bit_length, zigzag32, BitWriter};
     let bits = |c: &NodeCoord| (c.lat.to_bits(), c.lng.to_bits());
     let (lat0, lng0) = bits(&nodes[0]);
     let zl = zigzag32(order_key(lat0).wrapping_sub(order_key(anchor.0)));

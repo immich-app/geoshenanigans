@@ -1,5 +1,5 @@
 use super::*;
-use crate::coord_keys::ONE_BITS;
+use crate::coord_keys::{zigzag32, HYBRID_KEY_MAX, ONE_BITS};
 use crate::test_rng::Rng;
 use crate::NO_DATA;
 
@@ -117,6 +117,66 @@ fn same(a: &Ways, b: &Ways) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.0 == y.0 && bits(&x.1) == bits(&y.1))
 }
 
+/// The hybrid flag of a code.
+const HYBRID: u16 = 1 << 12;
+
+/// One group of streets written by hand: where its blocks start, its anchor, each way's node
+/// count and code (its name is its place), and the nodes file's bytes before its footer.
+fn hand_streets(off: u32, anchor: (u32, u32), ways: &[(u16, u16)], blocks: &[u8]) -> WayFileBytes {
+    let mut rows = Vec::new();
+    for field in [off, anchor.0, anchor.1] {
+        rows.extend(field.to_le_bytes());
+    }
+    for &(cnt, code) in ways {
+        rows.extend(cnt.to_le_bytes());
+        rows.extend(code.to_le_bytes());
+    }
+    for name in 0..ways.len() as u32 {
+        rows.extend(name.to_le_bytes());
+    }
+    rows.extend((ways.len() as u32).to_le_bytes());
+    rows.extend(b"SWY1");
+    let mut nodes = blocks.to_vec();
+    nodes.extend(ways.iter().map(|way| u64::from(way.0)).sum::<u64>().to_le_bytes());
+    nodes.extend((ways.len() as u32).to_le_bytes());
+    nodes.extend(b"SWN1");
+    WayFileBytes { ways: rows, nodes }
+}
+
+/// The streets of the nodes (as bits), each named by its place, through the test encoder: what
+/// `hand_streets` writes by hand where the builder writes it.
+fn encoded_streets(ways: &[&[(u32, u32)]]) -> WayFileBytes {
+    let ways: Ways = ways
+        .iter()
+        .enumerate()
+        .map(|(name, nodes)| {
+            let row = WayRow { node_count: nodes.len() as u16, name: name as u32, start_number: 0, end_number: 0, interpolation: 0 };
+            (row, nodes.iter().map(|&(lat, lng)| node(lat, lng)).collect())
+        })
+        .collect();
+    encode(Kind::Streets, &ways)
+}
+
+fn same_bytes(a: &WayFileBytes, b: &WayFileBytes) -> bool {
+    a.ways == b.ways && a.nodes == b.nodes
+}
+
+/// Way `id`'s nodes, as bits; None where they do not read, the buffer then left empty.
+fn nodes_of(f: &WayFiles, id: u32) -> Option<Vec<(u32, u32)>> {
+    // A buffer that holds another way's nodes.
+    let mut buf = vec![node(1, 2); 3];
+    if !f.way(id, &mut buf) {
+        assert!(buf.is_empty());
+        return None;
+    }
+    Some(bits(&buf))
+}
+
+/// Way `id`'s first node, as bits, read alone.
+fn first_of(f: &WayFiles, id: u32) -> Option<(u32, u32)> {
+    f.first_node(id).map(|c| (c.lat.to_bits(), c.lng.to_bits()))
+}
+
 /// A reader that takes the files a bit at a time, in id order, as the format is laid out:
 /// every way's row fields and nodes.
 fn read_bit_by_bit(kind: Kind, rows: &[u8], nodes: &[u8]) -> Ways {
@@ -215,7 +275,7 @@ fn ways_of_no_one_two_and_the_most_nodes_read_back() {
         // Any bit patterns fill the widths: the largest block a way has.
         let code = u16_at(&bytes.ways, 12 + 4 * 4 + 2);
         assert_eq!((code & 63, code >> 6 & 63, code >> 12 & 1), (32, 32, 0));
-        assert_eq!(block_bytes(65535, code), 2 * u64::from(code >> 13) + 65534 * 8);
+        assert_eq!(block_bytes(65535, code), Some(2 * u64::from(code >> 13) + 65534 * 8));
     }
 }
 
@@ -277,7 +337,7 @@ fn files_no_builder_writes_are_refused_at_open_by_name() {
     assert_eq!(said(Kind::Streets, &counting(w, 41), &counting(n, 41)), "street_ways.bin is not the rows of its 41 ways");
     assert_eq!(said(Kind::Streets, &counting(w, 39), &counting(n, 39)), "street_ways.bin is not the rows of its 39 ways");
     assert_eq!(said(Kind::Streets, &counting(w, 0), &counting(n, 0)), "street_ways.bin is not the rows of its 0 ways");
-    assert_eq!(said(Kind::Streets, &counting(w, u32::MAX), &counting(n, u32::MAX)), "street_ways.bin is not the rows of its 4294967295 ways");
+    assert_eq!(said(Kind::Streets, &counting(w, u32::MAX - 1), &counting(n, u32::MAX - 1)), "street_ways.bin is not the rows of its 4294967294 ways");
     assert_eq!(said(Kind::Streets, &w[1..], n), "street_ways.bin is not the rows of its 40 ways");
     let mut longer = vec![0u8];
     longer.extend_from_slice(w);
@@ -330,12 +390,224 @@ fn a_way_whose_block_no_builder_writes_reads_as_none_and_its_row_still_reads() {
     });
     assert!(!f.way(0, &mut buf) && f.first_node(0).is_none() && f.way(1, &mut buf));
     // A way under the hybrid key whose first node has none: the anchor moved to a float between
-    // two decimals. Its first node still reads.
+    // two decimals. It has no nodes to give, and no first node.
     let between = 0.1f32.to_bits() + 1;
     assert!(between < ONE_BITS && hybrid_key(between).is_none());
     let f = with(&|rows, _| rows[4..8].copy_from_slice(&between.to_le_bytes()));
-    assert!(!f.way(0, &mut buf) && buf.is_empty());
-    assert_eq!(f.first_node(0).map(|c| c.lat.to_bits()), Some(between));
+    assert!(!f.way(0, &mut buf) && buf.is_empty() && f.first_node(0).is_none());
+    // The same of a way of that one node; under the order key it reads.
+    let alone = |code: u16| files(Kind::Streets, &hand_streets(0, (between, 0), &[(1, code)], &[]));
+    assert_eq!((nodes_of(&alone(HYBRID), 0), first_of(&alone(HYBRID), 0)), (None, None));
+    assert_eq!((nodes_of(&alone(0), 0), first_of(&alone(0), 0)), (Some(vec![(between, 0)]), Some((between, 0))));
+    assert!(same_bytes(&hand_streets(0, (between, 0), &[(1, 0)], &[]), &encoded_streets(&[&[(between, 0)]])));
+}
+
+#[test]
+fn a_way_under_the_hybrid_key_reads_only_where_each_of_its_keys_is_a_coordinates() {
+    // Two nodes from 0, 0, the second's lat value 32 bits of ones: a step to the key 0x80000000,
+    // which no coordinate has.
+    let f = files(Kind::Streets, &hand_streets(0, (0, 0), &[(2, 32 | HYBRID)], &[0xFF; 4]));
+    assert_eq!(nodes_of(&f, 0), None);
+    // On either axis the largest key either side of zero is a coordinate's, in the bytes the
+    // encoder writes for it, and no key past it is one's.
+    let most = HYBRID_KEY_MAX;
+    let keys = [
+        (most, Some(0x7FFF_FFFF)),
+        (most + 1, None),
+        (0x7FFF_FFFF, None),
+        (most.wrapping_neg(), Some(u32::MAX)),
+        ((most + 1).wrapping_neg(), None),
+        (0x8000_0000, None),
+    ];
+    for (key, pattern) in keys {
+        for lat in [true, false] {
+            let code = if lat { 32 | HYBRID } else { 32 << 6 | HYBRID };
+            let hand = hand_streets(0, (0, 0), &[(2, code)], &zigzag32(key).to_le_bytes());
+            let nodes = pattern.map(|p| vec![(0, 0), if lat { (p, 0) } else { (0, p) }]);
+            assert_eq!(nodes_of(&files(Kind::Streets, &hand), 0), nodes, "the key {key:#x}, lat {lat}");
+            if let Some(nodes) = nodes {
+                assert!(same_bytes(&hand, &encoded_streets(&[&nodes])), "the key {key:#x}, lat {lat}");
+            }
+        }
+    }
+}
+
+#[test]
+fn a_ways_first_node_reads_only_in_the_bytes_its_steps_from_the_anchor_need() {
+    let anchor = (52.0f32.to_bits(), 4.0f32.to_bits());
+    // The node `zl` and `zg` from the anchor: zigzags of steps in the floats' order.
+    let from_anchor = |zl: u32, zg: u32| {
+        let step = |bits: u32, z: u32| from_order_key(order_key(bits).wrapping_add(unzigzag32(z)));
+        (step(anchor.0, zl), step(anchor.1, zg))
+    };
+    // Two streets of one node, the first at the anchor: the second's nodes, its first node
+    // written in `wf` bytes an axis, and the files.
+    let read = |wf: u16, zl: u32, zg: u32| {
+        let block = [&zl.to_le_bytes()[..wf as usize], &zg.to_le_bytes()[..wf as usize]].concat();
+        let hand = hand_streets(0, anchor, &[(1, HYBRID), (1, wf << 13 | HYBRID)], &block);
+        let f = files(Kind::Streets, &hand);
+        let nodes = nodes_of(&f, 1);
+        assert_eq!(first_of(&f, 1), nodes.as_ref().map(|nodes| nodes[0]));
+        (nodes, hand)
+    };
+    assert_eq!(read(0, 0, 0).0, Some(vec![anchor]));
+    for wf in 1..=4u16 {
+        // The least zigzag of `wf` bytes on either axis is the encoder's; the largest of a
+        // byte fewer on both is none's.
+        let least = 1u32 << (8 * (wf - 1));
+        for (zl, zg) in [(least, 0), (0, least), (least, least)] {
+            let (nodes, hand) = read(wf, zl, zg);
+            assert_eq!(nodes, Some(vec![from_anchor(zl, zg)]), "{wf} bytes");
+            assert!(same_bytes(&hand, &encoded_streets(&[&[anchor], &[from_anchor(zl, zg)]])), "{wf} bytes");
+        }
+        assert_eq!(read(wf, least - 1, least - 1).0, None, "{wf} bytes");
+    }
+}
+
+#[test]
+fn a_way_reads_only_where_its_groups_first_way_with_nodes_is_at_the_anchor() {
+    let anchor = (52.0f32.to_bits(), 4.0f32.to_bits());
+    // A node one float north of the anchor, in one byte an axis.
+    let (beside, one_byte) = ((anchor.0 + 1, anchor.1), 1 << 13 | HYBRID);
+    let read = |ways: &[(u16, u16)], blocks: &[u8], id: u32| {
+        let f = files(Kind::Streets, &hand_streets(0, anchor, ways, blocks));
+        let nodes = nodes_of(&f, id);
+        assert_eq!(first_of(&f, id), nodes.as_ref().map(|nodes| nodes[0]));
+        nodes
+    };
+    // After a way with nodes it reads; as the group's first way with nodes, alone or after
+    // ways without nodes, it does not.
+    assert_eq!(read(&[(1, HYBRID), (1, one_byte)], &[2, 0], 1), Some(vec![beside]));
+    assert_eq!(read(&[(1, one_byte)], &[2, 0], 0), None);
+    assert_eq!(read(&[(0, 0), (1, one_byte)], &[2, 0], 1), None);
+    assert_eq!(read(&[(0, 0), (0, 0), (1, one_byte)], &[2, 0], 2), None);
+    // Nor does a way after it, at the anchor or beside it: the anchor is no way's first node.
+    assert_eq!(read(&[(1, one_byte), (1, HYBRID)], &[2, 0], 1), None);
+    assert_eq!(read(&[(0, 0), (1, one_byte), (0, 0), (1, one_byte)], &[2, 0, 2, 0], 3), None);
+    assert_eq!(read(&[(0, 0), (1, HYBRID), (0, 0), (1, one_byte)], &[2, 0], 3), Some(vec![beside]));
+}
+
+#[test]
+fn a_way_reads_only_where_it_and_the_ways_before_it_in_its_group_have_codes_they_can_have() {
+    let anchor = (52.0f32.to_bits(), 4.0f32.to_bits());
+    let mut buf = vec![node(1, 2)];
+    // A way without nodes has the code 0: with another it has no nodes to give, not even
+    // none, and neither has the way after it. Its row reads.
+    for code in [0u16, 1, 1 << 6, HYBRID, 1 << 13, u16::MAX] {
+        let f = files(Kind::Streets, &hand_streets(0, anchor, &[(0, code), (1, HYBRID)], &[]));
+        assert_eq!(f.way(0, &mut buf), code == 0, "{code:#x}");
+        assert!(buf.is_empty() && f.first_node(0).is_none(), "{code:#x}");
+        assert_eq!(f.row(0).map(|row| (row.node_count, row.name)), Some((0, 0)), "{code:#x}");
+        assert_eq!((nodes_of(&f, 1), first_of(&f, 1)), ((code == 0).then(|| vec![anchor]), (code == 0).then_some(anchor)), "{code:#x}");
+    }
+    // A way with nodes has widths of up to 32 bits and a first node of up to 4 bytes an axis:
+    // after a way with a width of 33 bits, or a first node of 5 bytes, a way is none.
+    for (code, fits) in [(32, true), (33, false), (32 << 6, true), (33 << 6, false), (5 << 13, false)] {
+        let f = files(Kind::Streets, &hand_streets(0, anchor, &[(1, code | HYBRID), (1, HYBRID)], &[]));
+        assert_eq!((nodes_of(&f, 1), first_of(&f, 1)), (fits.then(|| vec![anchor]), fits.then_some(anchor)), "{code:#x}");
+        assert_eq!(nodes_of(&f, 0), fits.then(|| vec![anchor]), "{code:#x}");
+        assert_eq!(f.row(1).map(|row| (row.node_count, row.name)), Some((1, 1)), "{code:#x}");
+    }
+}
+
+#[test]
+fn a_way_with_bits_set_past_its_blocks_last_value_reads_as_none() {
+    let read = |cnt: u16, code: u16, block: &[u8]| {
+        let f = files(Kind::Streets, &hand_streets(0, (0, 0), &[(cnt, code)], block));
+        (nodes_of(&f, 0), first_of(&f, 0))
+    };
+    // Two nodes from 0, 0 under the hybrid key, the second a step of 1e-7 south: one value of
+    // one bit, and seven bits to the byte's end.
+    let south = e7(-1);
+    assert_eq!(read(2, 1 | HYBRID, &[1]), (Some(vec![(0, 0), (south, 0)]), Some((0, 0))));
+    assert!(same_bytes(&hand_streets(0, (0, 0), &[(2, 1 | HYBRID)], &[1]), &encoded_streets(&[&[(0, 0), (south, 0)]])));
+    for byte in [0b11, 0b101, 0x81] {
+        assert_eq!(read(2, 1 | HYBRID, &[byte]), (None, None), "{byte:#x}");
+    }
+    // A lat and a lng value of one bit each, and six bits to the byte's end.
+    assert_eq!(read(2, 1 | 1 << 6 | HYBRID, &[0b11]).0, Some(vec![(0, 0), (south, south)]));
+    for byte in [0b111, 0x83] {
+        assert_eq!(read(2, 1 | 1 << 6 | HYBRID, &[byte]), (None, None), "{byte:#x}");
+    }
+    // Eight values of one bit fill their byte: each step a unit further south than the last.
+    let steps: Vec<(u32, u32)> = [0, 1, 3, 6, 10, 15, 21, 28, 36].iter().map(|&n| (e7(-n), 0)).collect();
+    assert_eq!(read(9, 1 | HYBRID, &[0xFF]).0, Some(steps));
+}
+
+#[test]
+fn the_first_groups_blocks_start_at_the_nodes_files_first_byte() {
+    // A street of two nodes whose block is one byte.
+    let south = e7(-1);
+    let f = files(Kind::Streets, &hand_streets(0, (0, 0), &[(2, 1 | HYBRID)], &[1]));
+    assert_eq!(nodes_of(&f, 0), Some(vec![(0, 0), (south, 0)]));
+    // A byte before it, and the group's off counting from it.
+    let f = files(Kind::Streets, &hand_streets(1, (0, 0), &[(2, 1 | HYBRID)], &[0xAA, 1]));
+    assert_eq!((nodes_of(&f, 0), first_of(&f, 0)), (None, None));
+}
+
+#[test]
+fn footers_that_count_what_no_ways_hold_are_refused_at_open() {
+    let said = |ways: &[u8], nodes: &[u8]| open(Kind::Streets, ways, nodes).err().unwrap_or_default();
+    let streets = random_ways(&mut Rng::new(7), Kind::Streets, 40);
+    let bytes = encode(Kind::Streets, &streets);
+    let (w, n) = (&bytes.ways, &bytes.nodes);
+    // The nodes file with a footer that counts `nodes` nodes.
+    let counting = |nodes: u64| {
+        let mut b = n.clone();
+        let at = b.len() - 16;
+        b[at..at + 8].copy_from_slice(&nodes.to_le_bytes());
+        b
+    };
+    assert_eq!(counting(streets.iter().map(|way| way.1.len() as u64).sum()), *n);
+    // As many nodes as its 40 ways can have, 65,535 each, and one more.
+    let more = "street_nodes.bin counts more nodes than its ways can have";
+    assert_eq!(said(w, &counting(40 * 65_535)), "");
+    assert_eq!(said(w, &counting(40 * 65_535 + 1)), more);
+    assert_eq!(said(w, &counting(u64::MAX)), more);
+    // Blocks of 8 bytes a node at the most: the fewest nodes that fill them, and one fewer.
+    let blocks = (n.len() - 16) as u64;
+    assert!(blocks > 8);
+    let longer = "street_nodes.bin is longer than its nodes can fill";
+    assert_eq!(said(w, &counting(blocks.div_ceil(8))), "");
+    assert_eq!(said(w, &counting(blocks.div_ceil(8) - 1)), longer);
+    assert_eq!(said(w, &counting(0)), longer);
+    // 2^32 - 1 ways, whatever the files' sizes.
+    let ways_counting = |bytes: &[u8], count: u32| {
+        let mut b = bytes.to_vec();
+        let at = b.len() - 8;
+        b[at..at + 4].copy_from_slice(&count.to_le_bytes());
+        b
+    };
+    assert_eq!(
+        said(&ways_counting(w, u32::MAX), &ways_counting(n, u32::MAX)),
+        "street_ways.bin holds 2^32 - 1 ways or more: NO_DATA is no way's id"
+    );
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[test]
+fn a_nodes_file_of_4_gib_or_more_is_refused_at_open() {
+    use std::os::unix::fs::FileExt;
+    // The fewest ways whose nodes fill 4 GiB, 8 bytes a node: rows of zeros, and a footer that
+    // counts 2^29 nodes.
+    let (ways, nodes) = (8193u32, 1u64 << 29);
+    assert!(u64::from(ways - 1) * 65_535 < nodes && nodes <= u64::from(ways) * 65_535);
+    let mut rows = vec![0u8; (ways.div_ceil(16) * 12 + ways * 8) as usize];
+    rows.extend(ways.to_le_bytes());
+    rows.extend(b"SWY1");
+    let footer = [&nodes.to_le_bytes()[..], &ways.to_le_bytes()[..], &b"SWN1"[..]].concat();
+    // A nodes file of `size` bytes, zeros but for its footer: a sparse file, mapped.
+    let dir = crate::scratch_dir::ScratchDir::new();
+    let said = |size: u64| {
+        let path = dir.path().join(format!("{size}.bin"));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(size).unwrap();
+        file.write_all_at(&footer, size - 16).unwrap();
+        let nodes = crate::mmap_file(path.to_str().unwrap()).unwrap();
+        WayFiles::open(Kind::Streets, FileBytes::Owned(rows.clone()), nodes).err().unwrap_or_default()
+    };
+    assert_eq!(said(u32::MAX as u64), "");
+    assert_eq!(said(1 << 32), "street_nodes.bin is 4 GiB or more");
 }
 
 #[test]
