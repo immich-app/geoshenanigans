@@ -1334,8 +1334,11 @@ static StringSubset admin_minimal_names(const ParsedData& data, const std::vecto
     return StringSubset(core, used);
 }
 
+// Holds the nodes' keys and order and the three files until they are written:
+// write_schedule.h's kPlaceWriterTimes counts them.
 void write_place_files(const std::string& dir, const std::vector<PlaceNode>& nodes) {
     std::vector<uint32_t> order, keys(nodes.size(), NO_DATA);
+    order.reserve(nodes.size());
     for (size_t i = 0; i < nodes.size(); i++) {
         if (!place_files::is_visible(nodes[i])) continue;
         keys[i] = place_files::cell_key(

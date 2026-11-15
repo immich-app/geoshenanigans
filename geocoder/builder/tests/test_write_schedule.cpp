@@ -95,9 +95,10 @@ TEST(region_peak_holds_the_arc_geometry_stages_beside_the_steps_at_once_or_as_on
     const KindValues bytes = kinds(4 * kGiB, 8 * kGiB, kGiB, 3 * kGiB, kGiB / 8, 24 * kGiB);
     const KindValues counts = kinds(0, 0, 0, 0, 0, 0);  // no strategy-2 passes past the steps
     const StageCosts stages = stage_costs(bytes);
-    // The boundary tiers and both admin-minimal dirs, which write the arcs.
+    // The boundary tiers and both admin-minimal dirs, which write the arcs;
+    // an admin-minimal dir also holds its place nodes and their writer's.
     CHECK_EQ(stages.admin_tiers, 24 * kGiB / kAdminTierAdminDivisor);
-    CHECK_EQ(stages.admin_minimal, 24 * kGiB / kAdminMinimalAdminDivisor);
+    CHECK_EQ(stages.admin_minimal, 24 * kGiB / kAdminMinimalAdminDivisor + kGiB / 8 * (1 + kPlaceWriterTimes));
     REQUIRE(stages.admin_minimal > std::max({stages.modes, stages.admin_tiers, stages.places, stages.poi_tiers}));
     // At once: beside every other stage.
     CHECK_EQ(region_peak(bytes, counts, 0, RunOrder::Concurrent),
@@ -115,7 +116,8 @@ TEST(a_continents_reservation_holds_its_share_of_the_arc_geometry_stages_in_eith
     const KindValues counts = kinds(0, 0, 0, 0, 0, 0);
     const StageCosts stages = stage_costs(bytes);
     CHECK_EQ(stages.admin_tiers, at(bytes, RecordKind::Admins) / kAdminTierAdminDivisor);
-    CHECK_EQ(stages.admin_minimal, at(bytes, RecordKind::Admins) / kAdminMinimalAdminDivisor);
+    CHECK_EQ(stages.admin_minimal, at(bytes, RecordKind::Admins) / kAdminMinimalAdminDivisor +
+                                       at(bytes, RecordKind::Places) * (1 + kPlaceWriterTimes));
     // Its write takes no stage leases: with room for every stage at once,
     // all are reserved, the arc geometry stages among them.
     const uint64_t at_once =
@@ -127,6 +129,29 @@ TEST(a_continents_reservation_holds_its_share_of_the_arc_geometry_stages_in_eith
     const RegionCost tight = continent_cost(bytes, counts, 0, at_once - 1);
     CHECK(tight.order == RunOrder::Serial);
     CHECK_EQ(tight.bytes, sum(bytes) + stages.admin_minimal);
+}
+
+TEST(the_place_writers_working_set_is_in_the_place_stage_and_in_admin_minimal) {
+    const KindValues counts = kinds(0, 0, 0, 0, 0, 0);
+    const KindValues without = kinds(kGiB, 0, 0, 0, 0, 3 * kGiB), with = kinds(kGiB, 0, 0, 0, kGiB / 4, 3 * kGiB);
+    const StageCosts bare = stage_costs(without), stages = stage_costs(with);
+    CHECK_EQ(bare.places, uint64_t(0));
+    // The keys, the order and the three encoded files beside the nodes.
+    CHECK_EQ(stages.places, kGiB / 4 * kPlaceWriterTimes);
+    // An admin-minimal dir's own copy of the nodes, and the writer's.
+    CHECK_EQ(stages.admin_minimal - bare.admin_minimal, kGiB / 4 * (1 + kPlaceWriterTimes));
+    CHECK_EQ(stages.total() - bare.total(), kGiB / 4 * (1 + 2 * kPlaceWriterTimes));
+    // Both reach a region's peak: at once as the sum, one at a time as the
+    // largest stage, which the place nodes make admin-minimal here.
+    CHECK_EQ(region_peak(with, counts, 0, RunOrder::Concurrent), sum(with) + stages.total());
+    CHECK_EQ(region_peak(with, counts, 0, RunOrder::Concurrent) - region_peak(without, counts, 0, RunOrder::Concurrent),
+             kGiB / 4 + kGiB / 4 * (1 + 2 * kPlaceWriterTimes));
+    REQUIRE(stages.largest() == stages.admin_minimal && bare.largest() == bare.admin_minimal);
+    CHECK_EQ(region_peak(with, counts, 0, RunOrder::Serial), sum(with) + stages.admin_minimal);
+    // Place nodes alone: both stages grow with them, admin-minimal's the larger by its copy.
+    const KindValues only = kinds(0, 0, 0, 0, 4 * kGiB, 0);
+    CHECK_EQ(stage_costs(only).places, 4 * kGiB * kPlaceWriterTimes);
+    CHECK_EQ(stage_costs(only).largest(), 4 * kGiB * (1 + kPlaceWriterTimes));
 }
 
 TEST(region_peak_counts_the_records_and_the_largest_step) {
