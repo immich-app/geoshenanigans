@@ -230,7 +230,17 @@ structure tenfold, applies the patch with the codecs in the patcher's thread and
 `--threads`, and fails when the output differs or the heap peak grows by more than 256 KiB
 (HEAP_GROWTH_SLACK).
 
-Measured on planet from 2026-10-18 to 10-19 (GCPATCH v12), for a normal day and for the
+Measured on planet from 2026-10-18 to 10-19 with GCPATCH v17 (2026-11-15), where the street,
+interpolation and address files are the packed ones and the patcher has one mode: over every
+one of the 90 variant dirs, with the codecs in the patcher's thread and with `--threads`, no
+run's heap peaks above 2.09 MiB or its anonymous memory above 2.08 MiB. One run at a time, one
+core, cold cache: planet/full 118.6 s (136.0 s in a 32 MiB limit), planet/no-addresses 51.6 s,
+planet/poi/all 8.2 s, planet/admin 1.3 s. On the same days the v16 tools take 103.5 s for
+planet/full on the fixed-width files (314.4 s in 32 MiB) and 156.2 s on the encoded set.
+
+The figures below are GCPATCH v12's, when the patcher had two modes: plain, on the files as the
+builder wrote them, and low-memory, on a set `geocoder-gc` had encoded. They were measured on
+the same days, for a normal day and for the
 transition (the first patch after POI names went into record order, which moves 12.8M of
 planet/poi/all's strings), every one of the 126 variant dirs in both modes: no run's heap peaks
 above 2.11 MiB or its anonymous memory (sampled every 20 ms) above 2.12 MiB, and no transition
@@ -603,11 +613,11 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   same places, a MATCH or REPLACE record's own or, where a DELETE run is
   followed by an INSERT run, the deleted record's for the inserted one at the
   same place in the run. An encoded family replayed through its codecs (the
-  address files) decodes both files from one stream,
+  POI files when only their blocks change) decodes both files from one stream,
   and the patcher refuses a replay that reads one of them 4 MiB
   (MAX_DECODER_SKEW) ahead of the other ("Malformed merge sequence: <file>
-  runs ahead of <file>"); the way pairs and the POI files, replayed on their
-  files as they sit, read each file on its own. Its encoder takes a record
+  runs ahead of <file>"); the way pairs, the address files and the POI files,
+  replayed on their files as they sit, read each file on its own. Its encoder takes a record
   once its child bytes are in, and refuses bytes of one file that wait for
   the other's once that file is closed ("<family>: N bytes left over on input
   k") or once they pass 1 MiB (MAX_ENCODER_SKEW; "<family>: input k runs N
@@ -784,6 +794,9 @@ COPY_OLD never stands for an empty file.
 | Patch peak anonymous memory (plain / low-memory) | **0.83 / 1.61 MiB** | **0.66 / 1.84 MiB** |
 
 Measured from 2026-10-18 to 10-19 with GCPATCH v12; see "Patcher memory and speed" above.
+With GCPATCH v17 and the packed street, interpolation and address files (2026-11-15, the same
+days): planet `full` takes 119 s, 136 s in a 32 MiB limit, and no variant's patch more than
+2.08 MiB of anonymous memory.
 
 One deterministic `build-index` run writes the planet and every continent in
 about 5 minutes on 64 cores, and `geocoder-diff` makes the patches of all the

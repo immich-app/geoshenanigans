@@ -261,8 +261,8 @@ The patch tool:
   Its scratch dir, which holds the decompressed patch, is under `$TMPDIR`:
   keep that on disk, since a RAM-backed one counts against memory
 - Runs on one core inside a 32 MiB memory limit (page cache included): one
-  day of `planet/full` takes about 4 minutes, `europe/full` about 1.5 minutes
-  on an SSD. On a slow disk it is disk-bound: it reads the old variant and
-  writes the new one, two to three times the variant's size in IO
+  day of `planet/full` takes a little over 2 minutes on an SSD. On a slow
+  disk it is disk-bound: it reads the old variant and writes the new one,
+  two to three times the variant's size in IO
 - Needs free space for the new copy of the variant (it never patches in place)
 - Produces byte-identical output to a fresh build

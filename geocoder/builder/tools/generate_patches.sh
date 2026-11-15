@@ -21,8 +21,8 @@
 # mapped bytes are the first number of geocoder-diff --logical-size: a dir's
 # non-string .bin files, those the builder writes encoded at their logical
 # size, which is what the diff maps of them. Measured vs estimated GiB:
-# planet/full 114.8 vs 122.5, planet/poi/all 24.6 vs 25.1,
-# planet/quality/exact 1.5 vs 11.0 (its admin geometry merged by slot). The
+# planet/full 24.8 vs 78.5, planet/poi/all 4.4 vs 16.7,
+# planet/quality/exact 1.3 vs 6.6 (its admin geometry merged by slot). The
 # budget is 3/4 of the memory available at start, or of the job's cgroup limit
 # if lower. A variant holds its estimate only while its diff runs: the patch
 # + verify after it stream in about 10 MiB, so they run alongside later diffs.
