@@ -6,7 +6,7 @@ use crate::constants::SUB_INDEXES;
 use crate::model::PLACE_FLAG_LABEL_OF;
 use query_server::arc_fixture::{self, ArcFixture};
 use query_server::{
-    cell_id_at_level, cell_pairs, poi_files, strings, AdminPolygon, Index, PlaceNode, PointE7, PoiRecord, DEFAULT_ADMIN_CELL_LEVEL,
+    cell_id_at_level, cell_pairs, place_files, poi_files, strings, AdminPolygon, Index, PlaceNode, PointE7, PoiRecord, DEFAULT_ADMIN_CELL_LEVEL,
     DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL, NO_DATA, PLACE_FLAG_HIDDEN, STR_TIER_COUNT,
 };
 use std::path::{Path, PathBuf};
@@ -117,7 +117,7 @@ impl Geo {
         admin.sort_unstable();
         admin.dedup();
         let (admin_cells, admin_entries) = cell_pairs::write_pairs(admin, cell_pairs::ADMIN);
-        let nodes: Vec<u8> = self.nodes.iter().flat_map(node_bytes).collect();
+        let (places, _) = place_files::encode(&self.nodes, DEFAULT_ADMIN_CELL_LEVEL);
         let end = self.strings.len();
         let tiers: Vec<String> = (0..STR_TIER_COUNT)
             .map(|t| format!("{{\"start\": {}, \"end\": {end}}}", if t == 0 { 0 } else { end }))
@@ -125,7 +125,8 @@ impl Geo {
         let mut files: Vec<(&'static str, Vec<u8>)> = arcs.files().into();
         files.extend([
             ("admin_cells.bin", admin_cells), ("admin_entries.bin", admin_entries),
-            ("place_nodes.bin", nodes),
+            (place_files::CELLS_FILE, places.cells), (place_files::NODES_FILE, places.nodes),
+            (place_files::HIDDEN_FILE, places.hidden),
             ("strings_core.bin", strings::encode(&self.strings)),
             ("strings_layout.json", format!("{{\"tiers\": [{}]}}", tiers.join(", ")).into_bytes()),
         ]);
@@ -174,13 +175,4 @@ fn e7_ring(ring: &[(f32, f32)]) -> Vec<PointE7> {
     ring.iter().map(|&(lat, lng)| arc_fixture::e7(lat as f64, lng as f64)).collect()
 }
 
-fn node_bytes(p: &PlaceNode) -> Vec<u8> {
-    let b = [
-        &p.lat.to_le_bytes()[..], &p.lng.to_le_bytes(), &p.name_id.to_le_bytes(), &[p.place_type, p._pad1],
-        &p._pad2.to_le_bytes(), &p.parent_poly_id.to_le_bytes(),
-    ]
-    .concat();
-    assert_eq!(b.len(), std::mem::size_of::<PlaceNode>());
-    b
-}
 

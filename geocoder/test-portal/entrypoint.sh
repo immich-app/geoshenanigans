@@ -26,12 +26,11 @@ selection_files() {
     if [ "$MINIMAL" = "1" ]; then
         # Everything comes from the admin-minimal/ subdir (filtered: admin
         # polygons of levels 2-8, place types in {city,town,village,hamlet}):
-        # its own polygons on the minimal arc set, cell index, place_nodes,
-        # core strings and layout. The server derives the place index from
-        # place_nodes.bin at its first load.
+        # its own polygons on the minimal arc set, cell index, place nodes,
+        # core strings and layout.
         for f in admin_cells.bin admin_entries.bin \
                  admin_polygons.bin admin_rings.bin arc_index.bin arc_vertices.bin \
-                 place_nodes.bin strings_core.bin strings_layout.json; do
+                 place_cells.bin place_hidden.bin place_nodes.bin strings_core.bin strings_layout.json; do
             echo "admin-minimal $f"
         done
         return
@@ -41,7 +40,7 @@ selection_files() {
              addr_points.bin addr_vertices.bin addr_postcodes.bin \
              interp_ways.bin interp_nodes.bin interp_postcodes.bin \
              admin_cells.bin admin_entries.bin admin_parents.bin \
-             place_nodes.bin \
+             place_cells.bin place_hidden.bin place_nodes.bin \
              postcode_centroids.bin postcode_centroid_cells.bin postcode_centroid_entries.bin \
              way_parents.bin way_postcodes.bin \
              strings_core.bin strings_street.bin strings_addr.bin strings_postcode.bin; do

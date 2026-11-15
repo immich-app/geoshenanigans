@@ -77,10 +77,15 @@ inline void unmap_file(MappedFileRW& f) {
 static constexpr size_t WAY_HEADER_STRIDE = 12;
 static constexpr size_t ADDR_POINT_STRIDE = 28;
 static constexpr size_t INTERP_WAY_STRIDE = 24;
-static constexpr size_t ADMIN_POLYGON_STRIDE = 24;
+static constexpr size_t ADMIN_POLYGON_STRIDE = 16;
 static constexpr size_t ARC_INDEX_STRIDE = 4;
 static constexpr size_t POI_RECORD_STRIDE = 36;
-static constexpr size_t PLACE_NODE_STRIDE = 20;
+// place_nodes.bin's logical rows (place_files.h LogicalPlace): its section
+// replays the place files' logical stream, which their codec (gcs_codec.h
+// place) writes as place_cells.bin, place_nodes.bin and place_hidden.bin.
+static constexpr size_t PLACE_NODE_STRIDE = 24;
+// The client files place_nodes.bin's section writes besides it.
+static constexpr const char* PLACE_SIDE_FILES[] = {"place_cells.bin", "place_hidden.bin"};
 
 // name_id byte offset within a street WayHeader record.
 static constexpr size_t WAY_HEADER_NAME_ID_OFF = 8;
@@ -105,8 +110,8 @@ inline uint32_t record_node_count(const char* rec) {
     return n;
 }
 
-// name_id byte offset within an AdminPolygon record (string-pool offset).
-static constexpr size_t ADMIN_POLYGON_NAME_ID_OFF = 8;
+// name_id byte offset within an AdminPolygonRecord (string-pool offset).
+static constexpr size_t ADMIN_POLYGON_NAME_ID_OFF = 4;
 
 // Byte offsets within a PoiRecord (lat, lng, vertex_offset, vertex_count,
 // name_id, 4×u8, parent_street_id, parent_postcode_id, parent_poly_id).
@@ -225,7 +230,14 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // file, geo_entries.bin, beside its top file geo_cells.bin (8), and ids 9 to
 // 11 name its street, address and interpolation lists, which the geo entry
 // deltas correct, not files of their own.
-static constexpr uint32_t GCPATCH_VERSION = 15;
+// v16: admin_polygons.bin records are 16 bytes (AdminPolygonRecord): the
+// ring block's offset at byte 0, every record's the running one, a
+// tombstone's included, so a block runs to the next record's offset as an arc
+// block does, and the name at byte 4. The place files (place_files.h) merge
+// as one logical stream of 24-byte rows under place_nodes.bin's id, the
+// visible nodes in cell order, which the patcher encodes again as the three
+// files.
+static constexpr uint32_t GCPATCH_VERSION = 16;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -364,8 +376,8 @@ static constexpr StringRecordFile STRING_RECORD_FILES[] = {
 
 // The admin geometry files by family, in the order a patch sends them: a file
 // of slots of `stride` bytes, each record's u32 at byte 0 the offset of its
-// slot's block in the byte stream after it (a dead arc's block empty, a dead
-// polygon's offset NO_DATA). The diff merges each family by slot
+// slot's block in the byte stream after it (a dead slot's block empty, at the
+// running offset). The diff merges each family by slot
 // (build_slot_merge_seq), the stream a block per record along its slots.
 struct AdminSlotFamily {
     PatchFileId slots, blocks;

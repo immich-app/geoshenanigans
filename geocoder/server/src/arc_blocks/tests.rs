@@ -1,5 +1,5 @@
 use super::*;
-use crate::arc_fixture::{encode_arc, encode_ring, mix64, put_varint, zigzag, ArcFixture, RawBox, Ref, CHUNK_BOX_MIN_REFS, REF_CHUNK_MIN};
+use crate::arc_fixture::{arc_block_of_deltas, encode_arc, encode_ring, mix64, put_varint, zigzag, ArcFixture, RawBox, Ref, CHUNK_BOX_MIN_REFS, REF_CHUNK_MIN};
 use crate::test_rng::Rng;
 
 /// A random walk of `n` vertices on the 10^k grid from `start` (e7, on that grid), steps of up to
@@ -61,7 +61,7 @@ fn arc_blocks_decode_at_every_grid_with_and_without_a_box() {
                 let start = PointE7 { lat: 471_234 * step, lng: -1_224_194 * step / 10 * 10 };
                 let v = random_arc(&mut rng, k, n, start, 300);
                 let block = encode_arc(k, &v, boxed);
-                assert_eq!(block[0], k | if boxed { HAS_BOX } else { 0 });
+                assert_eq!(block[0] & (GRID_MASK | HAS_BOX), k | if boxed { HAS_BOX } else { 0 });
                 assert_eq!(decoded(&block).as_deref(), Some(&v[..]), "k {k} n {n} boxed {boxed}");
                 for p in probes(&mut rng, &v, 200) {
                     let want = odd_crossings(&v, p);
@@ -83,6 +83,26 @@ fn arc_blocks_decode_at_every_grid_with_and_without_a_box() {
 }
 
 #[test]
+fn arc_blocks_decode_to_the_shared_vectors_and_the_test_encoder_writes_them() {
+    // geocoder/testdata/arc_blocks.tsv, written by the builder's encode_arc.
+    let rows = crate::exact_pip::tests::testdata_rows("arc_blocks.tsv");
+    assert!(rows.len() > 100);
+    for row in &rows {
+        let k: u8 = row[0].parse().unwrap();
+        let v: Vec<PointE7> = row[2]
+            .split(';')
+            .map(|pair| {
+                let (lat, lng) = pair.split_once(',').unwrap();
+                PointE7 { lat: lat.parse().unwrap(), lng: lng.parse().unwrap() }
+            })
+            .collect();
+        let block: Vec<u8> = (0..row[3].len()).step_by(2).map(|i| u8::from_str_radix(&row[3][i..i + 2], 16).unwrap()).collect();
+        assert_eq!(decoded(&block).as_deref(), Some(&v[..]), "{} {}", row[0], row[1]);
+        assert_eq!(encode_arc(k, &v, v.len() >= 16), block, "{} {}", row[0], row[1]);
+    }
+}
+
+#[test]
 fn an_arcs_box_skips_exactly_the_points_its_edges_cannot_cross() {
     // A box's three sides at grid 3: points on the west side and south of the top are read, points
     // east of the east side or at its longitude, or at or north of the top, are not.
@@ -100,58 +120,44 @@ fn truncated_overlong_and_empty_arc_blocks_never_panic() {
     let block = encode_arc(0, &v, true);
     let p = PointE7 { lat: 0, lng: 0 };
     for len in 0..block.len() {
+        // A prefix reads as some shorter arc or as malformed, never past its end.
         let prefix = &block[..len];
-        // A prefix ends either in a vertex, reading as the vertices before it, or as malformed.
         if let Some(got) = decoded(prefix) {
-            assert!(got.len() < v.len() && got[..] == v[..got.len()], "len {len}");
+            assert!(got.len() < v.len() && got[0] == v[0], "len {len}");
         }
         let _ = arc_crossings(prefix, p);
     }
     assert_eq!(decoded(&[]), None);
     assert_eq!(arc_crossings(&[], p), None);
-    // A flag the format doesn't have.
-    let mut bad_flags = block.clone();
-    bad_flags[0] |= 0x04;
-    assert_eq!(decoded(&bad_flags), None);
-    assert_eq!(arc_crossings(&bad_flags, p), None);
-    // A varint of eleven bytes, and one of ten whose last byte runs past 64 bits.
-    for tail in [&[0x80u8; 10][..], &[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]] {
-        let mut overlong = encode_arc(0, &v[..2], false);
-        overlong.extend(tail);
-        overlong.push(0x01);
-        assert_eq!(decoded(&overlong), None);
-        assert_eq!(arc_crossings(&overlong, p), None);
+    // A short group whose widths sum to under 8 bits can't say its count, and one too short for a
+    // vertex says none.
+    let head = encode_arc(0, &v[..1], false);
+    for group in [&[0x21u8, 0x05][..], &[0x55, 0x00]] {
+        let bad = [&head[..], group].concat();
+        assert_eq!(decoded(&bad), None, "{group:?}");
+        assert_eq!(arc_crossings(&bad, p), None, "{group:?}");
     }
 }
 
 #[test]
 fn arc_blocks_past_i32_e7_are_malformed_as_the_builder_reads_them() {
     let p = PointE7 { lat: 0, lng: 5 };
-    let delta = |d: i64| { let mut b = Vec::new(); put_varint(zigzag(d), &mut b); b };
-    let head = |k: u8, lat: i32, lng: i32| [&[k][..], &lat.to_le_bytes(), &lng.to_le_bytes()].concat();
     // A closed arc whose second vertex is one unit past i32, at the first grid and the coarsest.
     for (k, past) in [(0u8, i32::MAX as i64 + 1), (3, i32::MAX as i64 / 1000 + 1)] {
-        let edge = |lat: i64| [head(k, 0, 0), delta(lat), delta(10), delta(-lat), delta(10), delta(0), delta(-20)].concat();
+        let edge = |lat: i64| arc_block_of_deltas(k, (0, 0), &[(lat, 10), (-lat, 10), (0, -20)]);
         assert!(decoded(&edge(past - 1)).is_some() && arc_crossings(&edge(past - 1), p).is_some(), "k {k}");
         assert_eq!(decoded(&edge(past)), None, "k {k}");
         assert_eq!(arc_crossings(&edge(past), p), None, "k {k}");
     }
-    // Vertices of short deltas that climb to the edge of the range or past it and come back, in
-    // the middle of the arc, however many vertices that takes, at every grid and on every side.
+    // Vertices that climb to the edge of the range or past it and come back, in the middle of the
+    // arc and across groups, at every grid and on every side.
     for k in [0u8, 1, 2, 3] {
         let units = GRID_UNITS[k as usize];
         let (lo, hi) = (units.lo, units.lo + units.span);
         let walk = |lat0: i64, lng0: i64, d_lat: i64, d_lng: i64, steps: usize| {
-            let mut block = head(k, lat0 as i32, lng0 as i32);
-            for _ in 0..steps {
-                block.extend([delta(d_lat), delta(d_lng)].concat());
-            }
-            for _ in 0..steps {
-                block.extend([delta(-d_lat), delta(-d_lng)].concat());
-            }
-            block
+            let deltas: Vec<(i64, i64)> = std::iter::repeat((d_lat, d_lng)).take(steps).chain(std::iter::repeat((-d_lat, -d_lng)).take(steps)).collect();
+            arc_block_of_deltas(k, (lat0 as i32, lng0 as i32), &deltas)
         };
-        let p = PointE7 { lat: 0, lng: 5 };
         for steps in [1i64, 2, 5, 40] {
             for (at_edge, past, d_lat, d_lng) in [
                 ((hi - steps * 8191, 0), (hi - steps * 8191 + 1, 0), 8191, 0),
@@ -166,17 +172,18 @@ fn arc_blocks_past_i32_e7_are_malformed_as_the_builder_reads_them() {
                 assert_eq!(arc_crossings(&over, p), None, "k {k} steps {steps} {past:?}");
             }
         }
-        // A long delta past the range and straight back, from well inside it: no vertex before
-        // it was due a test.
-        let (past, back) = (hi + 1, -(hi + 1));
-        let out_and_back = [head(k, 0, 0), delta(past), delta(0), delta(back), delta(0), delta(1), delta(0)].concat();
+        // A long delta past the range and straight back, from well inside it.
+        let out_and_back = arc_block_of_deltas(k, (0, 0), &[(hi + 1, 0), (-(hi + 1), 0), (1, 0)]);
         assert_eq!(decoded(&out_and_back), None, "k {k}");
         assert_eq!(arc_crossings(&out_and_back, p), None, "k {k}");
     }
-    // The largest varint, a delta no grid holds.
-    let widest = [head(0, 0, 0), vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01, 0x00]].concat();
+    // The widest group: deltas of 45 bits, which no grid holds.
+    let mut widest = arc_block_of_deltas(0, (0, 0), &[]);
+    widest[0] |= 15 << BASE_WIDTH_SHIFT;
+    widest.extend([0xff; 13]);
     assert_eq!((decoded(&widest), arc_crossings(&widest, p)), (None, None));
     // A first vertex or a box past i32 once scaled by the grid.
+    let head = |k: u8, lat: i32, lng: i32| [&[k][..], &lat.to_le_bytes(), &lng.to_le_bytes()].concat();
     let far = i32::MAX / 1000 + 1;
     assert_eq!(decoded(&head(3, far, 0)), None);
     assert_eq!(decoded(&head(3, 0, -far)), None);
@@ -513,54 +520,64 @@ fn a_full_memo_ends_a_probe_at_a_free_entry_nearby() {
     }
 }
 
-/// An arc block's vertices with every varint read a byte at a time (`varint`): what
-/// `arc_vertices` must give.
-fn vertices_bytewise(block: &[u8]) -> Option<Vec<PointE7>> {
+/// An arc block's vertices with every delta read a bit at a time: what `arc_vertices` must give.
+fn vertices_bitwise(block: &[u8]) -> Option<Vec<PointE7>> {
     let head = arc_head(block)?;
     let e7 = |lat: i64, lng: i64| PointE7 { lat: lat * head.step, lng: lng * head.step };
     let (mut lat, mut lng) = (head.lat, head.lng);
     let mut out = vec![e7(lat, lng)];
-    let mut at = head.deltas;
+    let (mut at, mut prev) = (head.deltas, (0i64, 0i64));
     while at < block.len() {
-        lat = lat.checked_add(unzigzag(varint(block, &mut at)?))?;
-        lng = lng.checked_add(unzigzag(varint(block, &mut at)?))?;
-        if !(head.units.hold(lat) && head.units.hold(lng)) {
+        let h = u32::from(block[at]);
+        at += 1;
+        let (wl, wg) = (head.base_width + (h >> 4), head.base_width + (h & 15));
+        let w = (wl + wg) as usize;
+        let rem = block.len() - at;
+        let c = if rem >= 2 * w {
+            ARC_GROUP
+        } else if w < 8 {
+            return None;
+        } else {
+            rem * 8 / w
+        };
+        let used = (c * w).div_ceil(8);
+        if c == 0 || (c < ARC_GROUP && used != rem) {
             return None;
         }
-        out.push(e7(lat, lng));
+        let bit = |i: usize| u64::from(block[at + i / 8] >> (i % 8) & 1);
+        let read = |from: usize, width: u32| (0..width as usize).fold(0u64, |v, j| v | bit(from + j) << j);
+        for i in 0..c {
+            let (mut dl, mut dg) = (unzigzag(read(i * wl as usize, wl)), unzigzag(read(c * wl as usize + i * wg as usize, wg)));
+            if head.second_order {
+                (dl, dg) = (dl + prev.0, dg + prev.1);
+            }
+            prev = (dl, dg);
+            (lat, lng) = (lat + dl, lng + dg);
+            if !(head.units.hold(lat) && head.units.hold(lng)) {
+                return None;
+            }
+            out.push(e7(lat, lng));
+        }
+        at += used;
     }
     Some(out)
 }
 
-/// A varint of `v`, sometimes padded with continuation bytes of no value (as a reader must take
-/// them, though the builder writes none).
-fn padded_varint(rng: &mut Rng, v: u64, out: &mut Vec<u8>) {
-    let mut bytes = Vec::new();
-    put_varint(v, &mut bytes);
-    if rng.next() % 8 == 0 && bytes.len() < 9 {
-        let last = bytes.len() - 1;
-        bytes[last] |= 0x80;
-        for _ in 0..rng.next() % (9 - bytes.len() as u64) {
-            bytes.push(0x80);
-        }
-        bytes.push(0x00);
-    }
-    out.extend(bytes);
-}
-
 #[test]
-fn the_vertex_loops_read_what_a_byte_at_a_time_reads() {
-    // Blocks of deltas of every varint length (1 to 10 bytes, padded ones too), values that leave
-    // the grid's i32 range, every prefix and single flipped bits: the vertices, the count and the
-    // crossing parity are the byte-at-a-time reader's, malformed blocks included.
-    let mut rng = Rng::new(20261107);
+fn the_vertex_loops_read_what_a_bit_at_a_time_reads() {
+    // Blocks of random groups (narrow and wide widths, second-order deltas, base widths up to 30),
+    // values that leave the grid's i32 range, every prefix and single flipped bits: the vertices,
+    // the count and the crossing parity are the bit-at-a-time reader's, malformed blocks included.
+    let mut rng = Rng::new(20261113);
     let (mut whole, mut malformed) = (0, 0);
     for case in 0..2000 {
         let k = [0u8, 2, 3][case % 3];
         let units = GRID_UNITS[k as usize];
         let boxed = case % 5 == 0;
+        let base = if rng.next() % 6 == 0 { 2 * (rng.next() % 16) as u32 } else { 0 };
+        let second = rng.next() % 3 == 0;
         let coordinate = |rng: &mut Rng| (rng.next() % units.span as u64) as i64 + units.lo;
-        let mut block = vec![k | if boxed { HAS_BOX } else { 0 }];
+        let mut block = vec![k | if second { SECOND_ORDER } else { 0 } | ((base / 2) as u8) << BASE_WIDTH_SHIFT | if boxed { HAS_BOX } else { 0 }];
         let (lat0, lng0) = (coordinate(&mut rng) / 2, coordinate(&mut rng) / 2);
         block.extend((lat0 as i32).to_le_bytes());
         block.extend((lng0 as i32).to_le_bytes());
@@ -569,21 +586,26 @@ fn the_vertex_loops_read_what_a_byte_at_a_time_reads() {
                 block.extend((coordinate(&mut rng) as i32).to_le_bytes());
             }
         }
-        // The short varints most often.
-        for _ in 0..rng.next() % 60 {
-            for _ in 0..2 {
-                let bits = [3u32, 6, 6, 9, 13, 13, 13, 20, 27, 34, 45, 63][(rng.next() % 12) as usize];
-                let d = (rng.next() & ((1u64 << bits) - 1)) as i64 * if rng.next() % 2 == 0 { 1 } else { -1 };
-                padded_varint(&mut rng, zigzag(d), &mut block);
+        let groups = rng.next() % 5;
+        for g in 0..groups {
+            // Mostly narrow widths, so most blocks stay in range.
+            let nibble = |rng: &mut Rng| if rng.next() % 4 == 0 { (rng.next() % 16) as u32 } else { (rng.next() % 7) as u32 };
+            let (dl, dg) = (nibble(&mut rng), nibble(&mut rng));
+            let w = (2 * base + dl + dg) as usize;
+            block.push((dl << 4 | dg) as u8);
+            let c = if g + 1 < groups || w < 8 { ARC_GROUP } else { 1 + (rng.next() % ARC_GROUP as u64) as usize };
+            for _ in 0..(c * w).div_ceil(8) {
+                // Small bytes most often: deltas near 0.
+                block.push(if rng.next() % 3 == 0 { rng.next() as u8 } else { (rng.next() % 4) as u8 });
             }
         }
         let p = PointE7 { lat: lat0 * 10i64.pow(k as u32), lng: lng0 * 10i64.pow(k as u32) + 1 };
         let mut check = |b: &[u8]| {
-            let want = vertices_bytewise(b);
+            let want = vertices_bitwise(b);
             assert_eq!(decoded(b), want, "case {case} {} bytes", b.len());
             let got = arc_crossings(b, p);
             // Bytes after the block, the next one's in the file, change nothing.
-            for after in [&[0xff, 0xff, 0xff][..], &[0x00, 0x00, 0x00], &[0x80, 0xff], &[0xff], &[0x83, 0x00, 0xff]] {
+            for after in [&[0xff; 7][..], &[0x00; 7], &[0x80, 0xff], &[0xff], &[0x83, 0x00, 0xff, 0x12, 0x34, 0x56, 0x78]] {
                 assert_eq!(arc_crossings_in(&[b, after].concat(), b.len(), p), got, "case {case} {} bytes, then {after:?}", b.len());
             }
             match (&want, got) {

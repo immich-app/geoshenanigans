@@ -2,6 +2,7 @@
 //! the `fixtures` feature, for the crates that read them: arcs given as e7 vertices, admin polygon
 //! records whose rings are refs to those arcs, and the four files they make.
 
+use crate::arc_blocks::{ARC_GROUP, BASE_WIDTH_SHIFT, HAS_BOX, SECOND_ORDER};
 use crate::exact_pip::{to_e7, PointE7};
 use crate::{AdminPolygon, NO_DATA};
 
@@ -86,8 +87,66 @@ impl RawBox {
     }
 }
 
+fn bit_width(v: u64) -> u32 {
+    64 - v.leading_zeros()
+}
+
+/// The deltas of `units` (grid units) as zz values, first-order (Δ) or second-order (Δ minus the Δ
+/// before it, 0 before the first), as the builder's arc_deltas.
+fn arc_deltas(units: &[(i64, i64)], second_order: bool) -> (Vec<u64>, Vec<u64>) {
+    let (mut zl, mut zg, mut prev) = (Vec::new(), Vec::new(), (0i64, 0i64));
+    for e in units.windows(2) {
+        let (dl, dg) = (e[1].0 - e[0].0, e[1].1 - e[0].1);
+        zl.push(zigzag(if second_order { dl - prev.0 } else { dl }));
+        zg.push(zigzag(if second_order { dg - prev.1 } else { dg }));
+        prev = (dl, dg);
+    }
+    (zl, zg)
+}
+
+/// The base width (even, at most 30) of zz deltas, as the builder's arc_base_width.
+pub fn base_width(zl: &[u64], zg: &[u64]) -> u32 {
+    let widest = zl.iter().chain(zg).map(|&z| bit_width(z)).max().unwrap_or(0);
+    assert!(widest <= 45, "a delta past 45 bits");
+    2 * ((widest.saturating_sub(15) + 1) / 2)
+}
+
+/// An arc's delta groups at base width `b`, as the builder's put_arc_groups packs them.
+pub fn pack_groups(zl: &[u64], zg: &[u64], b: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (gl, gg) in zl.chunks(ARC_GROUP).zip(zg.chunks(ARC_GROUP)) {
+        let mut wl = gl.iter().map(|&z| bit_width(z)).max().unwrap_or(0).max(b);
+        let mut wg = gg.iter().map(|&z| bit_width(z)).max().unwrap_or(0).max(b);
+        if gl.len() < ARC_GROUP {
+            while wl + wg < 8 {
+                if wl - b < 15 {
+                    wl += 1;
+                } else {
+                    wg += 1;
+                }
+            }
+        }
+        out.push(((wl - b) << 4 | (wg - b)) as u8);
+        let (mut acc, mut n) = (0u128, 0u32);
+        for (&z, w) in gl.iter().map(|z| (z, wl)).chain(gg.iter().map(|z| (z, wg))) {
+            acc |= u128::from(z & ((1u64 << w) - 1)) << n;
+            n += w;
+            while n >= 8 {
+                out.push(acc as u8);
+                acc >>= 8;
+                n -= 8;
+            }
+        }
+        if n > 0 {
+            out.push(acc as u8);
+        }
+    }
+    out
+}
+
 /// The arc block of `vertices` (e7 units, each a multiple of 10^k, at least one), with the box of
-/// its vertices when `boxed`.
+/// its vertices when `boxed`, its deltas first- or second-order whichever takes fewer bytes (first
+/// on a tie), as the builder's encode_arc.
 pub fn encode_arc(k: u8, vertices: &[PointE7], boxed: bool) -> Vec<u8> {
     assert!(k <= 3 && !vertices.is_empty());
     let step = 10i64.pow(k as u32);
@@ -95,20 +154,40 @@ pub fn encode_arc(k: u8, vertices: &[PointE7], boxed: bool) -> Vec<u8> {
         assert_eq!(c % step, 0, "a vertex off the 10^{k} grid");
         i32::try_from(c / step).expect("a coordinate past i32 grid units")
     };
-    let mut out = vec![k | if boxed { 0x80 } else { 0 }];
-    out.extend(unit(vertices[0].lat).to_le_bytes());
-    out.extend(unit(vertices[0].lng).to_le_bytes());
+    let units: Vec<(i64, i64)> = vertices.iter().map(|v| (unit(v.lat) as i64, unit(v.lng) as i64)).collect();
+    let pick = |second: bool| {
+        let (zl, zg) = arc_deltas(&units, second);
+        let b = base_width(&zl, &zg);
+        (pack_groups(&zl, &zg, b), b)
+    };
+    let ((first, b1), (second, b2)) = (pick(false), pick(true));
+    let second_order = second.len() < first.len();
+    let (groups, b) = if second_order { (second, b2) } else { (first, b1) };
+    let mut out = vec![k | if second_order { SECOND_ORDER } else { 0 } | ((b / 2) as u8) << BASE_WIDTH_SHIFT | if boxed { HAS_BOX } else { 0 }];
+    out.extend((units[0].0 as i32).to_le_bytes());
+    out.extend((units[0].1 as i32).to_le_bytes());
     if boxed {
-        let units: Vec<PointE7> = vertices.iter().map(|v| PointE7 { lat: unit(v.lat) as i64, lng: unit(v.lng) as i64 }).collect();
-        let b = RawBox::of(&units);
-        for c in [b.min_lng, b.max_lng, b.max_lat] {
+        let pts: Vec<PointE7> = units.iter().map(|&(lat, lng)| PointE7 { lat, lng }).collect();
+        let bx = RawBox::of(&pts);
+        for c in [bx.min_lng, bx.max_lng, bx.max_lat] {
             out.extend(c.to_le_bytes());
         }
     }
-    for e in vertices.windows(2) {
-        put_varint(zigzag(unit(e[1].lat) as i64 - unit(e[0].lat) as i64), &mut out);
-        put_varint(zigzag(unit(e[1].lng) as i64 - unit(e[0].lng) as i64), &mut out);
-    }
+    out.extend(groups);
+    out
+}
+
+/// An arc block of grid exponent `k`, first vertex `first` (grid units) and first-order `deltas`
+/// (grid units), packed at the narrowest base width as given: no range check, for blocks a
+/// decoder must refuse.
+pub fn arc_block_of_deltas(k: u8, first: (i32, i32), deltas: &[(i64, i64)]) -> Vec<u8> {
+    let zl: Vec<u64> = deltas.iter().map(|d| zigzag(d.0)).collect();
+    let zg: Vec<u64> = deltas.iter().map(|d| zigzag(d.1)).collect();
+    let b = base_width(&zl, &zg);
+    let mut out = vec![k | ((b / 2) as u8) << BASE_WIDTH_SHIFT];
+    out.extend(first.0.to_le_bytes());
+    out.extend(first.1.to_le_bytes());
+    out.extend(pack_groups(&zl, &zg, b));
     out
 }
 
@@ -149,24 +228,16 @@ pub fn encode_ring(refs: &[Ref], box_of: impl Fn(u32) -> RawBox) -> Vec<u8> {
     out
 }
 
-/// A record's 24 bytes as admin_polygons.bin stores it.
+/// A record's 16 bytes as admin_polygons.bin stores it.
 pub fn record_bytes(p: &AdminPolygon) -> Vec<u8> {
-    let b = [
-        &p.ring_offset.to_le_bytes()[..], &p.ring_bytes.to_le_bytes(), &p.name_id.to_le_bytes(),
-        &[p.admin_level, p.place_type_override, p._pad2, p._pad3], &p.area.to_le_bytes(),
-        &p.country_code.to_le_bytes(), &p.hole_count.to_le_bytes(),
-    ]
-    .concat();
-    assert_eq!(b.len(), std::mem::size_of::<AdminPolygon>());
-    b
+    p.record_bytes().to_vec()
 }
 
 /// A record with every field but the name, level and area at 0, for `ArcFixture::polygon` to
 /// give its rings.
 pub fn record(name_id: u32, admin_level: u8, area: f32) -> AdminPolygon {
     AdminPolygon {
-        ring_offset: 0, ring_bytes: 0, name_id, admin_level, place_type_override: 0, _pad2: 0, _pad3: 0, area,
-        country_code: 0, hole_count: 0,
+        ring_offset: 0, ring_bytes: 0, name_id, admin_level, place_type_override: 0, area, country_code: 0,
     }
 }
 
@@ -217,7 +288,7 @@ impl ArcFixture {
     }
 
     /// A polygon whose rings, outer first, are the refs given (none: a polygon without rings).
-    /// The record's ring_offset, ring_bytes and hole_count are set from them; its slot.
+    /// The record's ring_offset and ring_bytes are set from them; its slot.
     pub fn polygon(&mut self, record: AdminPolygon, rings: &[Vec<Ref>]) -> u32 {
         self.polygons.push((record, rings.to_vec()));
         self.polygons.len() as u32 - 1
@@ -231,7 +302,7 @@ impl ArcFixture {
 
     /// A polygon slot's tombstone: no rings and no name.
     pub fn tombstone(&mut self) -> u32 {
-        self.polygon(AdminPolygon { ring_offset: NO_DATA, name_id: NO_DATA, ..record(0, 0, 0.0) }, &[])
+        self.polygon(AdminPolygon { name_id: NO_DATA, ..record(0, 0, 0.0) }, &[])
     }
 
     pub fn arc_index(&self) -> Vec<u8> {
@@ -255,18 +326,11 @@ impl ArcFixture {
     }
 
     /// Each polygon's record as written: its ring block's offset and length in admin_rings.bin
-    /// and its hole count (a tombstone keeps NO_DATA).
+    /// (a tombstone's empty block at the running offset).
     pub fn records(&self) -> Vec<AdminPolygon> {
         let mut offset = 0u32;
-        self.polygons.iter().zip(self.ring_blocks()).map(|((record, rings), block)| {
-            let written = if record.ring_offset == NO_DATA {
-                *record
-            } else {
-                AdminPolygon {
-                    ring_offset: offset, ring_bytes: block.len() as u32,
-                    hole_count: rings.len().saturating_sub(1).min(u16::MAX as usize) as u16, ..*record
-                }
-            };
+        self.polygons.iter().zip(self.ring_blocks()).map(|((record, _), block)| {
+            let written = AdminPolygon { ring_offset: offset, ring_bytes: block.len() as u32, ..*record };
             offset += block.len() as u32;
             written
         }).collect()

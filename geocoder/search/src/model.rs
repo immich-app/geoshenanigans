@@ -8,10 +8,7 @@ use crate::varint;
 pub const POI_BIT: u32 = 1 << 31;
 
 pub const PLACE_NODE_TYPES: [&str; 7] = ["city", "town", "village", "suburb", "hamlet", "neighbourhood", "quarter"];
-/// PlaceNode._pad1 bit: parent_poly_id is the boundary that claims (hides) this node.
-pub const PLACE_FLAG_LABEL_OF: u8 = 0x01;
-/// AdminPolygon._pad2 bit: the boundary's largest ring (its one search entity).
-pub const POLY_FLAG_PRIMARY_RING: u8 = 0x01;
+pub use query_server::PLACE_FLAG_LABEL_OF;
 /// PoiRecord.flags bit: a secondary ring of a multi-ring POI (not searchable on its own).
 pub const POI_FLAG_SECONDARY_RING: u8 = 0x08;
 

@@ -464,9 +464,8 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
     log_phase("      Admin arcs: lossless", t, cpu);
 
     // The counts, as ARC_CHECK lines (tools/o11y_report.py).
-    size_t saturated = 0, polygons = 0, minimal_polygons = 0;
+    size_t polygons = 0, minimal_polygons = 0;
     for (const AdminArcPolygon& p : out.polygons) {
-        saturated += p.ring_count > 0 && p.ring_count - 1 > UINT16_MAX;
         polygons += p.blocks[0].size > 0;
         minimal_polygons += p.blocks[1].size > 0;
     }
@@ -478,7 +477,7 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
          << " hash_collisions=" << c.hash_collisions << " duplicate_keys=" << c.duplicate_keys
          << " arcs_without_ways=" << c.arcs_without_ways << " shared_way_sets=" << c.shared_way_sets
          << " shared_ends=" << c.shared_ends
-         << " saturated_hole_counts=" << saturated << " rings_nest_raw=" << arcs.rings_nest_raw
+         << " rings_nest_raw=" << arcs.rings_nest_raw
          << " slots=" << full.sidecar.size() << " ring_block_bytes=" << full.ring_blocks.size() << "\n";
     line << "ARC_CHECK set=minimal arcs=" << m.arcs << " closed_arcs=" << m.closed_arcs << " refs=" << m.refs
          << " rings=" << m.rings << " polygons=" << minimal_polygons << " joined_junctions=" << m.joined_junctions
@@ -611,20 +610,20 @@ void write_arc_files(const std::string& dir, const ArcSetBlocks& set, const ArcB
 }
 
 size_t write_ring_files(const std::vector<std::string>& dirs, const AdminArcBlocks& blocks, ArcSet set,
-                        std::vector<AdminPolygon> records, const std::vector<uint32_t>& polygon_of) {
+                        const std::vector<AdminPolygon>& records, const std::vector<uint32_t>& polygon_of) {
     if (records.size() != polygon_of.size()) throw std::logic_error("admin records out of step with their polygons");
     const ArcSetBlocks& s = blocks.set(set);
     std::vector<std::ofstream> files;
     for (const std::string& dir : dirs) files.emplace_back(dir + "/admin_rings.bin", std::ios::binary);
+    // Every record at the running offset, a tombstone's included (its block is
+    // empty): a ring block runs to the next record's offset.
+    std::vector<AdminPolygonRecord> out(records.size());
     uint64_t at = 0;
     for (size_t slot = 0; slot < records.size(); slot++) {
+        out[slot] = admin_polygon_record(records[slot], static_cast<uint32_t>(at));
         if (polygon_of[slot] == NO_DATA) continue;
         const AdminArcPolygon& p = blocks.polygons[polygon_of[slot]];
         const BlockSpan span = p.blocks[set_index(set)];
-        AdminPolygon& r = records[slot];
-        r.ring_offset = static_cast<uint32_t>(at);
-        r.ring_bytes = span.size;
-        r.hole_count = static_cast<uint16_t>(std::min<uint32_t>(p.ring_count ? p.ring_count - 1 : 0, UINT16_MAX));
         for (std::ofstream& f : files) f.write(reinterpret_cast<const char*>(s.ring_blocks.data() + span.offset), span.size);
         at += span.size;
         if (at > UINT32_MAX) throw std::length_error("admin_rings.bin past 4 GiB: admin_polygons.bin holds 32-bit offsets");
@@ -632,8 +631,8 @@ size_t write_ring_files(const std::vector<std::string>& dirs, const AdminArcBloc
     for (size_t d = 0; d < dirs.size(); d++) {
         files[d].flush();
         if (!files[d]) throw std::runtime_error("failed to write " + dirs[d] + "/admin_rings.bin");
-        write_binary_file(dirs[d] + "/admin_polygons.bin", reinterpret_cast<const char*>(records.data()),
-                          records.size() * sizeof(AdminPolygon));
+        write_binary_file(dirs[d] + "/admin_polygons.bin", reinterpret_cast<const char*>(out.data()),
+                          out.size() * sizeof(AdminPolygonRecord));
     }
     return at;
 }

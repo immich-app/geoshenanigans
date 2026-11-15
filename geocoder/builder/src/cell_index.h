@@ -114,6 +114,11 @@ void write_admin_tiers(const ParsedData& data, const std::string& region_dir);
 // tier's rings.
 void write_exact_admin_geometry(const ParsedData& data, const std::string& dir);
 
+// Writes nodes' place files into dir (place_files.h): the visible ones
+// stably sorted by their admin cell (at kAdminCellLevel), then the hidden ones
+// in their order.
+void write_place_files(const std::string& dir, const std::vector<PlaceNode>& nodes);
+
 // Writes admin-minimal, the smallest useful set, in two dirs under
 // region_dir. Both hold the minimal arc set (admin_minimal_keeps' polygons:
 // its ring blocks, arc_index.bin and arc_vertices.bin, the same arc files in

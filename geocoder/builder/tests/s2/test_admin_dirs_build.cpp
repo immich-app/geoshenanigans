@@ -303,8 +303,8 @@ TEST(build_index_writes_every_regions_admin_dirs_as_arcs_and_a_chained_build_wri
     CHECK(file("planet", "quality/simplified/admin_rings.bin") == file("planet", "quality/exact/admin_rings.bin"));
     for (const char* f : {"arc_index.bin", "arc_vertices.bin"})
         CHECK(file("planet", std::string("admin-minimal/") + f) == file("planet", std::string("admin-minimal-poi/") + f));
-    // In the shared slots, one 24 B record each: the seven boundaries.
-    CHECK_EQ(file("planet", "quality/exact/admin_polygons.bin").size(), 7 * sizeof(AdminPolygon));
+    // In the shared slots, one 16 B record each: the seven boundaries.
+    CHECK_EQ(file("planet", "quality/exact/admin_polygons.bin").size(), 7 * sizeof(AdminPolygonRecord));
     CHECK(file("planet", "quality/exact/arc_vertices.bin").size() > file("planet", "quality/simplified/arc_vertices.bin").size());
     CHECK(!file("planet", "admin-minimal/admin_rings.bin").empty());
     // Every polygon is in Europe, whose arcs are then the planet's in the
@@ -370,7 +370,7 @@ TEST(a_build_without_the_multi_flags_writes_whole_dirs_the_server_answers_from) 
         CHECK(files.at("planet/" + f) == with_tiers.at("planet/quality/exact/" + f));
         CHECK(files.at("planet/" + f) == with_tiers.at("planet/" + f));
     }
-    CHECK_EQ(files.at("planet/admin_polygons.bin").size(), 7 * sizeof(AdminPolygon));
+    CHECK_EQ(files.at("planet/admin_polygons.bin").size(), 7 * sizeof(AdminPolygonRecord));
 
     // The server loads the dir and puts each point on its side of the border
     // of the first two municipalities, 0.0005 degrees off it (its ways stray
@@ -422,7 +422,7 @@ TEST(an_admin_polygon_is_built_whatever_simplifying_would_leave_of_its_ring) {
     REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf, "--multi-output", "--multi-quality"}, log));
     const auto files = tree(out);
     for (const char* dir : {"quality/simplified", "quality/exact"})
-        CHECK_EQ(files.at(std::string("planet/") + dir + "/admin_polygons.bin").size(), 8 * sizeof(AdminPolygon));
+        CHECK_EQ(files.at(std::string("planet/") + dir + "/admin_polygons.bin").size(), 8 * sizeof(AdminPolygonRecord));
     const std::vector<char>& file = files.at("planet/full/strings_core.bin");
     std::string strings;
     string_files::decode(reinterpret_cast<const uint8_t*>(file.data()), file.size(),

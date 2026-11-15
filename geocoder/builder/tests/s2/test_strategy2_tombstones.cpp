@@ -1,5 +1,6 @@
-// apply_strategy2_remaps (cell_index.h) keeps every record in the slot the
-// previous build gave it; the slot of a record that is gone holds a tombstone.
+// apply_strategy2_remaps (cell_index.h) keeps every record but the place
+// nodes in the slot the previous build gave it; the slot of a record that is
+// gone holds a tombstone.
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -16,10 +17,11 @@
 using gc::id_alloc::IdAllocator;
 using gc::id_alloc::ObjectType;
 
-TEST(a_place_tombstone_names_no_polygon) {
-    // The previous build held nodes 1 and 2, this one holds node 2: node 1's
-    // slot becomes a tombstone.
-    const ScratchDir prev("strategy2-tombstones");
+TEST(place_nodes_keep_no_slots) {
+    // The place files hold their nodes in cell order, so no place node keeps
+    // the slot an earlier build gave it: one gone since leaves no tombstone,
+    // whatever sidecar the earlier build left.
+    const ScratchDir prev("strategy2-places");
     std::filesystem::create_directories(prev.path() + "/admin");
     IdAllocator::write_sidecar(prev.path() + "/admin/place_nodes.osm_ids",
                                {{uint8_t(ObjectType::OSM_NODE), 0, 0, 0, 1}, {uint8_t(ObjectType::OSM_NODE), 0, 0, 0, 2}});
@@ -31,10 +33,8 @@ TEST(a_place_tombstone_names_no_polygon) {
 
     apply_strategy2_remaps(data, prev.path(), RunOrder::Serial);
 
-    REQUIRE(data.place_nodes.size() == 2u);
-    CHECK_EQ(data.place_nodes[1].name_id, 0u);
-    CHECK_EQ(data.place_nodes[0].name_id, NO_DATA);
-    CHECK_EQ(data.place_nodes[0].parent_poly_id, NO_DATA);
+    REQUIRE(data.place_nodes.size() == 1u);
+    CHECK_EQ(data.place_nodes[0].name_id, 0u);
 }
 
 TEST(each_admin_polygons_arc_rings_follow_it_into_its_slot) {

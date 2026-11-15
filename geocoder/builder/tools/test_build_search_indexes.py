@@ -140,8 +140,8 @@ def flat(paths):
 
 class TemplateTest(unittest.TestCase):
     MINIMAL_FILES = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_rings.bin",
-                     "arc_index.bin", "arc_vertices.bin", "place_nodes.bin", "strings_core.bin",
-                     "strings_layout.json"]
+                     "arc_index.bin", "arc_vertices.bin", "place_cells.bin", "place_hidden.bin", "place_nodes.bin",
+                     "strings_core.bin", "strings_layout.json"]
 
     def test_admin_minimal_takes_its_poi_dir_beside_a_poi_tier(self):
         # admin-minimal/ holds strings of its own, which a POI tier's names and parent polygons don't

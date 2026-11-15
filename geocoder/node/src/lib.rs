@@ -95,10 +95,7 @@ pub struct PlaceSearchOptions {
 
 #[napi]
 impl Geocoder {
-    /// Load an index directory (mmap; near-instant, ~3 MiB resident). The first load after an
-    /// install or a patch also builds the place index from place_nodes.bin, into `<dir>/derived`
-    /// (or a dir of the temp dir when `dir` can't be written): about a second on planet, in a
-    /// heap of 5.4 MiB.
+    /// Load an index directory (mmap; near-instant, ~3 MiB resident).
     #[napi(factory)]
     pub fn load(dir: String) -> Result<Geocoder> {
         let (idx, loaded) = dataset::load(Path::new(&dir), || {

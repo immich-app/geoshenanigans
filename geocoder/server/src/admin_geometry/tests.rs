@@ -5,7 +5,7 @@ use crate::arc_fixture::{e7, exact_area, record, ArcFixture, Ref};
 use crate::test_rng::Rng;
 use crate::exact_pip::tests::testdata_rows;
 use crate::scratch_dir::ScratchDir;
-use crate::{cell_id_at_level, AdminScan, Index, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL, STR_TIER_COUNT};
+use crate::{cell_id_at_level, AdminScan, Index, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL, NO_DATA, STR_TIER_COUNT};
 
 const fn pt(lat: i64, lng: i64) -> PointE7 {
     PointE7 { lat, lng }
@@ -297,7 +297,7 @@ fn a_point_in_a_hole_is_outside_and_the_island_filling_it_inside() {
     for p in band(&hole, 2) {
         assert!(at(holed, p.lat, p.lng) != at(island, p.lat, p.lng), "{p:?}");
     }
-    assert_eq!(polys[holed as usize].hole_count, 1);
+    assert_eq!(geom.rings(&polys[holed as usize]).len(), 2);
 }
 
 #[test]
@@ -740,8 +740,7 @@ fn has_rings_is_false_for_tombstones_empty_and_out_of_file_blocks() {
     let p = AdminPoint::new(10.0, 20.0);
     assert!(geom.has_rings(&live) && geom.contains_once(&live, p));
     for (what, poly) in [
-        ("tombstone", AdminPolygon { ring_offset: NO_DATA, ring_bytes: 0, name_id: NO_DATA, ..live }),
-        ("tombstone with bytes", AdminPolygon { ring_offset: NO_DATA, ..live }),
+        ("tombstone", AdminPolygon { ring_bytes: 0, name_id: NO_DATA, ..live }),
         ("empty", AdminPolygon { ring_bytes: 0, ..live }),
         ("past the end", AdminPolygon { ring_offset: len, ..live }),
         ("running past the end", AdminPolygon { ring_bytes: len + 1, ..live }),

@@ -4,11 +4,18 @@
 // through zigzag.
 //
 // An arc block is a flags byte (bits 0-1 the grid exponent k: coordinates
-// are in units of 10^k e7; bit 7 a box follows), the first vertex (i32
-// latitude, i32 longitude), the box of its vertices when it has
-// kArcBboxMinVertices or more (i32 min longitude, max longitude, max
-// latitude), then each later vertex as varint zz(Δlat), varint zz(Δlng).
-// Its vertex count is implied by its length.
+// are in units of 10^k e7; bit 2 second-order deltas; bits 3-6 the base
+// width b / 2; bit 7 a box follows), the first vertex (i32 latitude, i32
+// longitude), the box of its vertices when it has kArcBboxMinVertices or
+// more (i32 min longitude, max longitude, max latitude), then its deltas in
+// bit-packed groups of up to kArcGroup vertices. A delta is zz(Δ) of the
+// vertex's coordinate and the one before it, or with second-order deltas
+// zz(Δ - the Δ before it) (0 before the first), whichever block is smaller.
+// A group is a header byte dl << 4 | dg, then its kArcGroup (fewer in the
+// last group) latitude deltas at b + dl bits each, then its longitude
+// deltas at b + dg bits, LSB first, padded to a byte. A short last group's
+// two widths sum to at least 8 bits, so its vertex count follows from its
+// bytes, and so the arc's from its block's length.
 //
 // A ring block is a polygon's rings, its outer ring first, back to back. A
 // ring is one or more chunks of refs to arc slots: a head varint
@@ -22,6 +29,7 @@
 // the chunk around it and the cuts are the planet's in every region.
 #pragma once
 
+#include <algorithm>
 #include <climits>
 #include <cstdint>
 #include <cstring>
@@ -113,7 +121,93 @@ inline bool get_i32(const uint8_t*& p, const uint8_t* end, int32_t& v) {
 }
 
 constexpr uint8_t kGridMask = 0x03;
+constexpr uint8_t kSecondOrder = 0x04;
+constexpr int kBaseWidthShift = 3;  // bits 3-6: the base width b / 2
 constexpr uint8_t kHasBox = 0x80;
+// Vertices (deltas) per bit-packed group.
+constexpr size_t kArcGroup = 16;
+// The widest delta a group stores: b <= 30 and b + 15.
+constexpr int kArcMaxDeltaBits = 45;
+
+inline int bit_width(uint64_t v) { return v ? 64 - __builtin_clzll(v) : 0; }
+
+// The deltas of an arc's vertices `lat`/`lng` (grid units) as zz values,
+// first-order (Δ) or second-order (Δ minus the Δ before it).
+inline void arc_deltas(const std::vector<int64_t>& lat, const std::vector<int64_t>& lng, bool second_order,
+                       std::vector<uint64_t>& zl, std::vector<uint64_t>& zg) {
+    const size_t m = lat.size() - 1;
+    zl.resize(m);
+    zg.resize(m);
+    int64_t prev_lat = 0, prev_lng = 0;
+    for (size_t i = 0; i < m; i++) {
+        const int64_t dl = lat[i + 1] - lat[i], dg = lng[i + 1] - lng[i];
+        zl[i] = zigzag(second_order ? dl - prev_lat : dl);
+        zg[i] = zigzag(second_order ? dg - prev_lng : dg);
+        prev_lat = dl;
+        prev_lng = dg;
+    }
+}
+
+// The base width (even, at most 30) of an arc's zz deltas: the narrowest
+// from which every group's widths are at most 15 bits wider.
+inline int arc_base_width(const std::vector<uint64_t>& zl, const std::vector<uint64_t>& zg) {
+    int widest = 0;
+    for (size_t i = 0; i < zl.size(); i++) widest = std::max({widest, bit_width(zl[i]), bit_width(zg[i])});
+    if (widest > kArcMaxDeltaBits) throw std::logic_error("an arc delta past 45 bits");
+    const int over = std::max(0, widest - 15);
+    return 2 * ((over + 1) / 2);
+}
+
+// The bytes of an arc's delta groups at base width b; writes them at `out`
+// unless it is null.
+inline size_t put_arc_groups(const std::vector<uint64_t>& zl, const std::vector<uint64_t>& zg, int b, uint8_t* out) {
+    const size_t m = zl.size();
+    size_t at = 0;
+    for (size_t g = 0; g < m; g += kArcGroup) {
+        const size_t c = std::min(kArcGroup, m - g);
+        int wl = b, wg = b;
+        for (size_t i = g; i < g + c; i++) {
+            wl = std::max(wl, bit_width(zl[i]));
+            wg = std::max(wg, bit_width(zg[i]));
+        }
+        // A short group's widths sum to 8 or more, so its count follows from its bytes.
+        if (c < kArcGroup)
+            while (wl + wg < 8) {
+                if (wl - b < 15) wl++;
+                else wg++;
+            }
+        if (out) out[at] = static_cast<uint8_t>((wl - b) << 4 | (wg - b));
+        at++;
+        const size_t bytes = (c * static_cast<size_t>(wl + wg) + 7) / 8;
+        if (out) {
+            uint64_t acc = 0;
+            int n = 0;
+            size_t o = at;
+            auto put = [&](uint64_t v, int w) {
+                // w <= 45 and n < 8 before, so acc holds every bit: a 45-bit value
+                // goes in as two parts.
+                while (w > 0) {
+                    const int take = std::min(w, 56 - n);
+                    acc |= (v & ((uint64_t(1) << take) - 1)) << n;
+                    n += take;
+                    v >>= take;
+                    w -= take;
+                    while (n >= 8) {
+                        out[o++] = static_cast<uint8_t>(acc);
+                        acc >>= 8;
+                        n -= 8;
+                    }
+                }
+            };
+            for (size_t i = g; i < g + c; i++) put(zl[i], wl);
+            for (size_t i = g; i < g + c; i++) put(zg[i], wg);
+            if (n) out[o++] = static_cast<uint8_t>(acc);
+            if (o != at + bytes) throw std::logic_error("an arc group's bytes don't add up");
+        }
+        at += bytes;
+    }
+    return at;
+}
 
 // The grid exponent k of a tier whose grid step is grid_e7 = 10^k e7 units.
 inline uint8_t grid_exponent(int32_t grid_e7) {
@@ -139,29 +233,39 @@ size_t encode_arc(size_t n, VertexAt vertex, uint8_t k, uint8_t* out) {
         return c / step;
     };
     const bool boxed = n >= kArcBboxMinVertices;
+    // Per thread, so the builder's workers each reuse theirs.
+    thread_local std::vector<int64_t> lat, lng;
+    thread_local std::vector<uint64_t> z1l, z1g, z2l, z2g;
+    lat.resize(n);
+    lng.resize(n);
+    ArcBox box;
+    for (size_t i = 0; i < n; i++) {
+        const PackedLocation v = vertex(i);
+        lat[i] = unit(v.lat_e7);
+        lng[i] = unit(v.lon_e7);
+        if (boxed) box.add(v);
+    }
+    // First- or second-order deltas, whichever takes fewer bytes (first on a tie).
+    arc_deltas(lat, lng, false, z1l, z1g);
+    arc_deltas(lat, lng, true, z2l, z2g);
+    const int b1 = arc_base_width(z1l, z1g), b2 = arc_base_width(z2l, z2g);
+    const size_t bytes1 = put_arc_groups(z1l, z1g, b1, nullptr), bytes2 = put_arc_groups(z2l, z2g, b2, nullptr);
+    const bool second = bytes2 < bytes1;
+    const int b = second ? b2 : b1;
     size_t at = 0;
     auto put = [&](size_t bytes) { at += bytes; };
-    if (out) out[0] = static_cast<uint8_t>(k | (boxed ? kHasBox : 0));
+    if (out)
+        out[0] = static_cast<uint8_t>(k | (second ? kSecondOrder : 0) | (b / 2) << kBaseWidthShift | (boxed ? kHasBox : 0));
     put(1);
-    const PackedLocation first = vertex(0);
-    put(put_i32(unit(first.lat_e7), out ? out + at : nullptr));
-    put(put_i32(unit(first.lon_e7), out ? out + at : nullptr));
+    put(put_i32(static_cast<int32_t>(lat[0]), out ? out + at : nullptr));
+    put(put_i32(static_cast<int32_t>(lng[0]), out ? out + at : nullptr));
     if (boxed) {
-        ArcBox box;
-        for (size_t i = 0; i < n; i++) box.add(vertex(i));
         put(put_i32(unit(box.min_lng), out ? out + at : nullptr));
         put(put_i32(unit(box.max_lng), out ? out + at : nullptr));
         put(put_i32(unit(box.max_lat), out ? out + at : nullptr));
     }
-    int64_t lat = unit(first.lat_e7), lng = unit(first.lon_e7);
-    for (size_t i = 1; i < n; i++) {
-        const PackedLocation v = vertex(i);
-        const int64_t vlat = unit(v.lat_e7), vlng = unit(v.lon_e7);
-        put(put_varint(zigzag(vlat - lat), out ? out + at : nullptr));
-        put(put_varint(zigzag(vlng - lng), out ? out + at : nullptr));
-        lat = vlat;
-        lng = vlng;
-    }
+    put(second ? put_arc_groups(z2l, z2g, b, out ? out + at : nullptr)
+               : put_arc_groups(z1l, z1g, b, out ? out + at : nullptr));
     return at;
 }
 
@@ -181,9 +285,10 @@ inline bool decode_arc(const uint8_t* data, size_t size, DecodedArc& out) {
     out.box = {};
     if (p == end) return false;
     const uint8_t flags = *p++;
-    if (flags & ~(kGridMask | kHasBox)) return false;
     out.k = flags & kGridMask;
     out.has_box = (flags & kHasBox) != 0;
+    const bool second_order = (flags & kSecondOrder) != 0;
+    const int b = 2 * ((flags >> kBaseWidthShift) & 15);
     const int64_t step = grid_step(out.k);
     auto e7 = [&](int64_t units, int32_t& c) {
         const int64_t v = units * step;
@@ -194,27 +299,50 @@ inline bool decode_arc(const uint8_t* data, size_t size, DecodedArc& out) {
     int32_t lat0 = 0, lng0 = 0;
     if (!get_i32(p, end, lat0) || !get_i32(p, end, lng0)) return false;
     if (out.has_box) {
-        int32_t b[3];
-        for (int32_t& v : b)
-            if (!get_i32(p, end, v)) return false;
-        if (!e7(b[0], out.box.min_lng) || !e7(b[1], out.box.max_lng) || !e7(b[2], out.box.max_lat)) return false;
+        int32_t bx[3];
+        for (int32_t& c : bx)
+            if (!get_i32(p, end, c)) return false;
+        if (!e7(bx[0], out.box.min_lng) || !e7(bx[1], out.box.max_lng) || !e7(bx[2], out.box.max_lat)) return false;
     }
     int64_t lat = lat0, lng = lng0;
     PackedLocation v;
     if (!e7(lat, v.lat_e7) || !e7(lng, v.lon_e7)) return false;
     out.vertices.push_back(v);
-    // A delta past the coordinates' whole range is no arc's, and summing one
-    // could overflow.
-    constexpr int64_t kMaxDelta = int64_t(1) << 33;
+    // Each vertex stays in range, so the sums below can't overflow: a delta is
+    // at most 45 bits and a first-order one is the difference of two vertices.
+    int64_t prev_lat = 0, prev_lng = 0;
     while (p != end) {
-        uint64_t dlat = 0, dlng = 0;
-        if (!get_varint(p, end, dlat) || !get_varint(p, end, dlng)) return false;
-        const int64_t a = unzigzag(dlat), b = unzigzag(dlng);
-        if (a > kMaxDelta || a < -kMaxDelta || b > kMaxDelta || b < -kMaxDelta) return false;
-        lat += a;
-        lng += b;
-        if (!e7(lat, v.lat_e7) || !e7(lng, v.lon_e7)) return false;
-        out.vertices.push_back(v);
+        const uint8_t h = *p++;
+        const int wl = b + (h >> 4), wg = b + (h & 15), w = wl + wg;
+        const size_t rem = static_cast<size_t>(end - p);
+        size_t c = kArcGroup;
+        if (rem < kArcGroup * static_cast<size_t>(w) / 8) {
+            // A short last group: its widths sum to 8 or more.
+            if (w < 8) return false;
+            c = rem * 8 / static_cast<size_t>(w);
+        }
+        const size_t bytes = (c * static_cast<size_t>(w) + 7) / 8;
+        if (c == 0 || bytes > rem || (c < kArcGroup && bytes != rem)) return false;
+        size_t bit = 0;
+        auto get = [&](int width) {
+            uint64_t z = 0;
+            for (int i = 0; i < width; i++, bit++) z |= static_cast<uint64_t>((p[bit >> 3] >> (bit & 7)) & 1) << i;
+            return z;
+        };
+        int64_t dl[kArcGroup], dg[kArcGroup];
+        for (size_t i = 0; i < c; i++) dl[i] = unzigzag(get(wl));
+        for (size_t i = 0; i < c; i++) dg[i] = unzigzag(get(wg));
+        p += bytes;
+        for (size_t i = 0; i < c; i++) {
+            const int64_t a = second_order ? prev_lat + dl[i] : dl[i];
+            const int64_t g = second_order ? prev_lng + dg[i] : dg[i];
+            prev_lat = a;
+            prev_lng = g;
+            lat += a;
+            lng += g;
+            if (!e7(lat, v.lat_e7) || !e7(lng, v.lon_e7)) return false;
+            out.vertices.push_back(v);
+        }
     }
     return true;
 }

@@ -4,9 +4,14 @@
 //! `arc_vertices.bin` holds one arc block per arc slot, at the u32 offset `arc_index.bin` gives
 //! the slot; a block runs to the next slot's offset, the last to the end of the file, and a dead
 //! slot's is empty. An arc block is a flags byte (bits 0-1 the grid exponent k: coordinates are
-//! in units of 10^k e7; bit 7 a box follows), the first vertex (i32 latitude, i32 longitude), the
-//! box of its vertices (i32 min longitude, max longitude, max latitude) when bit 7 says so, then
-//! each later vertex as varint zz(Δlat), varint zz(Δlng).
+//! in units of 10^k e7; bit 2 second-order deltas; bits 3-6 the base width b / 2; bit 7 a box
+//! follows), the first vertex (i32 latitude, i32 longitude), the box of its vertices (i32 min
+//! longitude, max longitude, max latitude) when bit 7 says so, then its deltas in bit-packed
+//! groups of up to ARC_GROUP vertices. A delta is zz(Δ) of a vertex's coordinate and the one before
+//! it, or with second-order deltas zz(Δ - the Δ before it) (0 before the first). A group is a
+//! header byte dl << 4 | dg, then its ARC_GROUP (fewer in the last group) latitude deltas at b + dl
+//! bits each and its longitude deltas at b + dg bits, LSB first, padded to a byte; a short last
+//! group's widths sum to at least 8 bits, so its vertex count follows from its bytes.
 //!
 //! `admin_rings.bin` holds one ring block per polygon slot: its rings, the outer ring first, each
 //! one or more chunks of refs to arc slots. A chunk is a head varint (refs << 2 | has_box << 1 |
@@ -25,9 +30,14 @@ use crate::exact_pip::{edge_crosses, PointE7};
 pub(crate) const CHUNK_BOX_SLACK_E7: i64 = 500;
 /// The most refs a chunk holds (builder kRefChunkMax).
 pub(crate) const REF_CHUNK_MAX: u64 = 16;
-/// An arc block's flags: the grid exponent k, and that a box follows the first vertex.
+/// An arc block's flags: the grid exponent k, second-order deltas, the base width b / 2 (bits
+/// 3-6), and that a box follows the first vertex.
 pub(crate) const GRID_MASK: u8 = 0x03;
+pub(crate) const SECOND_ORDER: u8 = 0x04;
+pub(crate) const BASE_WIDTH_SHIFT: u32 = 3;
 pub(crate) const HAS_BOX: u8 = 0x80;
+/// Vertices (deltas) per bit-packed group.
+pub(crate) const ARC_GROUP: usize = 16;
 /// 10^k for each grid exponent k.
 const GRID_STEPS: [i64; 4] = [1, 10, 100, 1000];
 /// For each grid exponent k, the grid units whose e7 value fits i32.
@@ -209,17 +219,18 @@ impl<'a> ArcFiles<'a> {
         Some(&self.vertices[start..end])
     }
 
-    /// Arc slot `slot`'s block as `block` gives it, with up to DELTA_LOAD - 1 of the bytes after
+    /// Arc slot `slot`'s block as `block` gives it, with up to BIT_LOAD - 1 of the bytes after
     /// it, and its length (`arc_crossings_in`).
     #[inline]
     fn block_and_after(&self, slot: u32) -> Option<(&'a [u8], usize)> {
         let (start, end) = self.span(slot)?;
-        Some((&self.vertices[start..(end + DELTA_LOAD - 1).min(self.vertices.len())], end - start))
+        Some((&self.vertices[start..(end + BIT_LOAD - 1).min(self.vertices.len())], end - start))
     }
 }
 
 /// An arc block's head: its grid step, its first vertex and its box (min lng, max lng, max lat)
-/// in grid units, where its deltas start, and the grid units whose e7 value fits i32.
+/// in grid units, where its delta groups start, the grid units whose e7 value fits i32, whether
+/// its deltas are second-order and their base width.
 struct ArcHead {
     step: i64,
     lat: i64,
@@ -227,6 +238,8 @@ struct ArcHead {
     bbox: Option<[i64; 3]>,
     deltas: usize,
     units: GridUnits,
+    second_order: bool,
+    base_width: u32,
 }
 
 /// The grid units, lo..=lo + span, whose e7 value fits i32 (GRID_UNITS, one per grid).
@@ -246,33 +259,79 @@ impl GridUnits {
 #[inline(always)]
 fn arc_head(block: &[u8]) -> Option<ArcHead> {
     let flags = *block.first()?;
-    if flags & !(GRID_MASK | HAS_BOX) != 0 {
-        return None;
-    }
     let (step, units) = (GRID_STEPS[(flags & GRID_MASK) as usize], GRID_UNITS[(flags & GRID_MASK) as usize]);
     let mut at = 1;
     let mut coordinate = || i32_at(block, &mut at).map(i64::from).filter(|&c| units.hold(c));
     let (lat, lng) = (coordinate()?, coordinate()?);
     let bbox = if flags & HAS_BOX != 0 { Some([coordinate()?, coordinate()?, coordinate()?]) } else { None };
-    Some(ArcHead { step, lat, lng, bbox, deltas: at, units })
+    let (second_order, base_width) = (flags & SECOND_ORDER != 0, 2 * u32::from(flags >> BASE_WIDTH_SHIFT & 15));
+    Some(ArcHead { step, lat, lng, bbox, deltas: at, units, second_order, base_width })
 }
 
-/// The largest delta between two coordinates that fit i32.
-const MAX_DELTA: u64 = 1 << 32;
+/// The bytes `bits_at` loads at once.
+const BIT_LOAD: usize = 8;
 
-/// The next vertex of an arc block in grid units, from the deltas at `*at`; None past i32 e7.
-/// Inlined into each vertex loop: a vertex of short deltas comes from one 4-byte load, any other
-/// through `varint` a byte at a time, to the same values.
+/// The `w` bits (w <= 45) at bit `pos` of `bytes`, LSB first; bits past the end of `bytes` read
+/// as 0.
 #[inline(always)]
-fn next_vertex(block: &[u8], at: &mut usize, units: GridUnits, lat: i64, lng: i64) -> Option<(i64, i64)> {
-    if let Some((d_lat, d_lng, used)) = block.get(*at..).and_then(<[u8]>::first_chunk::<DELTA_LOAD>).and_then(|w| short_deltas(u32::from_le_bytes(*w))) {
-        *at += used;
-        let (lat, lng) = (lat + d_lat, lng + d_lng);
-        return (units.hold(lat) && units.hold(lng)).then_some((lat, lng));
+fn bits_at(bytes: &[u8], pos: usize, w: u32) -> u64 {
+    let byte = pos >> 3;
+    let word = match bytes.get(byte..).and_then(<[u8]>::first_chunk::<BIT_LOAD>) {
+        Some(b) => u64::from_le_bytes(*b),
+        None => {
+            let mut buf = [0u8; BIT_LOAD];
+            let tail = bytes.get(byte..).unwrap_or(&[]);
+            buf[..tail.len()].copy_from_slice(tail);
+            u64::from_le_bytes(buf)
+        }
+    };
+    (word >> (pos & 7)) & ((1u64 << w) - 1)
+}
+
+/// The delta group at `*at` of an arc block ending at `end` (`bytes` may go on past it): its
+/// deltas into `dl` and `dg`, second-order ones summed carrying `prev`, and its vertex count; None
+/// for a malformed group. A delta is at most 45 bits and every vertex before this group was in
+/// range, so the sums can't overflow.
+#[inline(always)]
+fn bit_group(bytes: &[u8], at: &mut usize, end: usize, head: &ArcHead, prev: &mut (i64, i64), dl: &mut [i64; ARC_GROUP], dg: &mut [i64; ARC_GROUP]) -> Option<usize> {
+    let h = u32::from(*bytes.get(*at)?);
+    *at += 1;
+    let (wl, wg) = (head.base_width + (h >> 4), head.base_width + (h & 15));
+    let w = (wl + wg) as usize;
+    let rem = end.checked_sub(*at)?;
+    let c = if rem >= 2 * w {
+        ARC_GROUP
+    } else {
+        // A short last group: its widths sum to 8 or more, and its bytes are the block's last.
+        if w < 8 {
+            return None;
+        }
+        rem * 8 / w
+    };
+    let used = (c * w).div_ceil(8);
+    if c == 0 || (c < ARC_GROUP && used != rem) {
+        return None;
     }
-    let lat = lat.checked_add(unzigzag(varint(block, at)?))?;
-    let lng = lng.checked_add(unzigzag(varint(block, at)?))?;
-    (units.hold(lat) && units.hold(lng)).then_some((lat, lng))
+    let bit0 = *at * 8;
+    for i in 0..c {
+        dl[i] = unzigzag(bits_at(bytes, bit0 + i * wl as usize, wl));
+    }
+    let lng0 = bit0 + c * wl as usize;
+    for i in 0..c {
+        dg[i] = unzigzag(bits_at(bytes, lng0 + i * wg as usize, wg));
+    }
+    if head.second_order {
+        let (mut a, mut b) = *prev;
+        for i in 0..c {
+            a += dl[i];
+            b += dg[i];
+            dl[i] = a;
+            dg[i] = b;
+        }
+        *prev = (a, b);
+    }
+    *at += used;
+    Some(c)
 }
 
 /// Calls `f` with each vertex of an arc block in e7 units, in the order it stores them; their
@@ -283,10 +342,17 @@ pub(crate) fn arc_vertices(block: &[u8], mut f: impl FnMut(PointE7)) -> Option<u
     let (mut lat, mut lng) = (head.lat, head.lng);
     f(e7(lat, lng));
     let (mut at, mut n) = (head.deltas, 1u32);
+    let (mut dl, mut dg, mut prev) = ([0i64; ARC_GROUP], [0i64; ARC_GROUP], (0i64, 0i64));
     while at < block.len() {
-        (lat, lng) = next_vertex(block, &mut at, head.units, lat, lng)?;
-        f(e7(lat, lng));
-        n = n.wrapping_add(1);
+        let c = bit_group(block, &mut at, block.len(), &head, &mut prev, &mut dl, &mut dg)?;
+        for i in 0..c {
+            (lat, lng) = (lat + dl[i], lng + dg[i]);
+            if !head.units.hold(lat) || !head.units.hold(lng) {
+                return None;
+            }
+            f(e7(lat, lng));
+            n = n.wrapping_add(1);
+        }
     }
     Some(n)
 }
@@ -316,11 +382,12 @@ fn arc_crossings(block: &[u8], p: PointE7) -> Option<ArcCrossings> {
 }
 
 /// `arc_crossings` of the block in the first `len` of `bytes`, which go on for up to
-/// DELTA_LOAD - 1 bytes where the file does: whether a load still fits is then the vertex loop's
-/// only test for the block's end.
+/// BIT_LOAD - 1 bytes where the file does, so that a group's bits load a word at a time.
 ///
-/// The hot loop of an admin lookup, kept out of line so that its few values stay in registers,
-/// and everything rare (a varint past 2 bytes, an edge straddling p) out of its way.
+/// The hot loop of an admin lookup, kept out of line so that its few values stay in registers.
+/// Longitudes are relative to the first grid column east of p, so a sign change says an edge
+/// straddles p, and only those edges are taken to e7 for `edge_crosses`. Every vertex is checked
+/// against the grid's range.
 #[inline(never)]
 fn arc_crossings_in(bytes: &[u8], len: usize, p: PointE7) -> Option<ArcCrossings> {
     let head = arc_head(bytes.get(..len)?)?;
@@ -330,126 +397,46 @@ fn arc_crossings_in(bytes: &[u8], len: usize, p: PointE7) -> Option<ArcCrossings
             return Some(ArcCrossings::Boxed);
         }
     }
-    let mut walk = DeltaWalk::new(&head, p);
-    let mut tail = &bytes[head.deltas..];
-    let after = bytes.len() - len;
-    loop {
-        while let Some((d_lat, d_lng, used)) = tail.first_chunk::<DELTA_LOAD>().and_then(|w| short_deltas(u32::from_le_bytes(*w))) {
-            tail = &tail[used..];
-            walk.next_vertex(d_lat, d_lng)?;
-        }
-        // Into the bytes after the block only when the block is over or a varint ran off it.
-        let in_block = tail.len().checked_sub(after)?;
-        if in_block == 0 {
-            return Some(ArcCrossings::Read { odd: walk.odd, vertices: walk.vertices });
-        }
-        let (d_lat, d_lng, used) = long_deltas(&tail[..in_block])?;
-        tail = &tail[used..];
-        walk.test_at = walk.vertices + 1;
-        walk.next_vertex(d_lat, d_lng)?;
-    }
-}
-
-/// `arc_crossings_in`'s place along an arc block's vertices, in grid units. Longitude is relative
-/// to the first grid column east of p, so its sign says which side of p a vertex lies on and
-/// the straddle test needs no comparison with p: only the edges that straddle p are taken to e7
-/// for `edge_crosses`.
-struct DeltaWalk {
-    lat: i64,
-    lng: i64,
-    odd: bool,
-    vertices: u32,
-    /// The next vertex to test against the grid's range: a vertex of short deltas moves at most
-    /// 1 << SHORT_DELTA_BITS, so no vertex before this one can be past it.
-    test_at: u32,
-    units: GridUnits,
-    step: i64,
-    first_east: i64,
-    p: PointE7,
-}
-
-impl DeltaWalk {
-    #[inline(always)]
-    fn new(head: &ArcHead, p: PointE7) -> Self {
-        // A vertex is east of p exactly when its grid longitude is east of p's, floored to the
-        // grid (each step a constant divisor, which the compiler turns into a multiplication).
-        let floored = match head.step {
-            1 => p.lng,
-            10 => p.lng.div_euclid(10),
-            100 => p.lng.div_euclid(100),
-            _ => p.lng.div_euclid(1000),
-        };
-        // Clamped past every vertex, so that the sums below can't overflow.
-        let first_east = floored.clamp(-(1 << 40), 1 << 40) + 1;
-        let mut walk = DeltaWalk { lat: head.lat, lng: head.lng - first_east, odd: false, vertices: 1, test_at: 0, units: head.units, step: head.step, first_east, p };
-        // The arc head's coordinates are in range.
-        walk.test_at = 2 + (walk.room(walk.lat, walk.lng) >> SHORT_DELTA_BITS) as u32;
-        walk
-    }
-
-    /// How far a vertex lies inside the grid's range; negative past it.
-    #[inline(always)]
-    fn room(&self, lat: i64, relative_lng: i64) -> i64 {
-        let (lng, lo, hi) = (relative_lng + self.first_east, self.units.lo, self.units.lo + self.units.span);
-        (lat - lo).min(hi - lat).min(lng - lo).min(hi - lng)
-    }
-
-    /// Moves on to the vertex at these deltas, each at most MAX_DELTA; None past the grid's range.
-    #[inline(always)]
-    fn next_vertex(&mut self, d_lat: i64, d_lng: i64) -> Option<()> {
-        let (next_lat, next_lng) = (self.lat + d_lat, self.lng + d_lng);
-        self.vertices += 1;
-        if self.vertices == self.test_at {
-            let room = self.room(next_lat, next_lng);
-            if room < 0 {
+    let first_east = first_east_of(step, p);
+    let (mut lat, mut lng) = (head.lat, head.lng - first_east);
+    let (lo, hi) = (head.units.lo, head.units.lo + head.units.span);
+    // The relative longitudes whose grid longitude is in range.
+    let (rlo, rhi) = (lo - first_east, hi - first_east);
+    let (mut odd, mut n) = (false, 1u32);
+    let (mut dl, mut dg, mut prev) = ([0i64; ARC_GROUP], [0i64; ARC_GROUP], (0i64, 0i64));
+    let mut at = head.deltas;
+    while at < len {
+        let c = bit_group(bytes, &mut at, len, &head, &mut prev, &mut dl, &mut dg)?;
+        for i in 0..c {
+            let (next_lat, next_lng) = (lat + dl[i], lng + dg[i]);
+            if next_lat < lo || next_lat > hi || next_lng < rlo || next_lng > rhi {
                 return None;
             }
-            self.test_at = self.vertices + 1 + (room >> SHORT_DELTA_BITS) as u32;
+            if (lng ^ next_lng) < 0 {
+                odd ^= straddling_edge_crosses(step, first_east, (lat, lng), (next_lat, next_lng), p);
+            }
+            (lat, lng) = (next_lat, next_lng);
         }
-        if (self.lng ^ next_lng) < 0 {
-            self.odd ^= straddling_edge_crosses(self.step, self.first_east, (self.lat, self.lng), (next_lat, next_lng), self.p);
-        }
-        (self.lat, self.lng) = (next_lat, next_lng);
-        Some(())
+        n = n.wrapping_add(c as u32);
     }
+    Some(ArcCrossings::Read { odd, vertices: n })
 }
 
-/// The bytes `short_deltas` looks at.
-const DELTA_LOAD: usize = 4;
-/// The largest move of a delta `short_deltas` gives is 1 << SHORT_DELTA_BITS.
-const SHORT_DELTA_BITS: u32 = 13;
-
-/// The two deltas of a vertex from the 4 bytes at its start, and the bytes they take; None if
-/// either takes more than 2, or the vertex after this one starts with a longer one. In the
-/// simplified tiers 99.8 % of the varints hold 1 or 2 bytes (22 % and 78 %), so a branch on each
-/// one's length mispredicts often: the lengths come from two continuation bits instead.
+/// The first grid column east of p's longitude, in grid units: a vertex is east of p exactly when
+/// its grid longitude is this or more (each step a constant divisor, which the compiler turns into
+/// a multiplication). Clamped past every vertex, so that sums with it can't overflow.
 #[inline(always)]
-fn short_deltas(w: u32) -> Option<(i64, i64, usize)> {
-    // No two bytes in a row with their continuation bits set: no varint here takes 3 bytes.
-    if w & w >> 8 & 0x0080_8080 != 0 {
-        return None;
-    }
-    // Whether the latitude's varint has a second byte, the bytes after it, and whether the
-    // longitude's has one.
-    let lat2 = w >> 7 & 1;
-    let rest = w >> (8 + 8 * lat2);
-    let lng2 = rest >> 7 & 1;
-    let lat_v = w & 0x7f | w >> 1 & 0x3f80 & 0u32.wrapping_sub(lat2);
-    let lng_v = rest & 0x7f | rest >> 1 & 0x3f80 & 0u32.wrapping_sub(lng2);
-    Some((unzigzag(u64::from(lat_v)), unzigzag(u64::from(lng_v)), (2 + lat2 + lng2) as usize))
+fn first_east_of(step: i64, p: PointE7) -> i64 {
+    let floored = match step {
+        1 => p.lng,
+        10 => p.lng.div_euclid(10),
+        100 => p.lng.div_euclid(100),
+        _ => p.lng.div_euclid(1000),
+    };
+    floored.clamp(-(1 << 40), 1 << 40) + 1
 }
 
-/// The two deltas of a vertex a byte at a time, for any length, and the bytes they take; None
-/// for a malformed varint or a delta no two coordinates that fit i32 are apart.
-#[inline]
-fn long_deltas(tail: &[u8]) -> Option<(i64, i64, usize)> {
-    let mut at = 0;
-    let d_lat = unzigzag(varint(tail, &mut at)?);
-    let d_lng = unzigzag(varint(tail, &mut at)?);
-    (d_lat.unsigned_abs() <= MAX_DELTA && d_lng.unsigned_abs() <= MAX_DELTA).then_some((d_lat, d_lng, at))
-}
-
-/// `edge_crosses` of an edge whose two vertices are given in `DeltaWalk`'s terms.
+/// `edge_crosses` of an edge whose two vertices are given in `arc_crossings_in`'s terms.
 #[cold]
 #[inline(never)]
 fn straddling_edge_crosses(step: i64, first_east: i64, (lat_a, lng_a): (i64, i64), (lat_b, lng_b): (i64, i64), p: PointE7) -> bool {

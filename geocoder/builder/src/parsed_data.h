@@ -389,7 +389,7 @@ struct ParsedData {
     std::vector<NodeCoord> interp_nodes;
     // The records of admin_polygons.bin before their dirs lay their ring
     // blocks out (write_ring_files): ring_offset 0, or NO_DATA for a
-    // strategy-2 tombstone, and ring_bytes 0.
+    // strategy-2 tombstone.
     std::vector<AdminPolygon> admin_polygons;
     // Parallel to admin_polygons. Packed (ObjectType<<56 | 56-bit id):
     // OSM_RELATION + (relation_id<<16 | ring_index) for relation-sourced
@@ -401,7 +401,6 @@ struct ParsedData {
     std::vector<uint32_t> admin_planet_ids;
     std::vector<gc::id_alloc::SidecarSlot> admin_sidecar_blob;
     std::vector<gc::id_alloc::SidecarSlot> addr_sidecar_blob;
-    std::vector<gc::id_alloc::SidecarSlot> place_sidecar_blob;
     std::vector<gc::id_alloc::SidecarSlot> poi_sidecar_blob;
     std::vector<gc::id_alloc::SidecarSlot> interp_sidecar_blob;
     // Freed once the postcode centroids, its last user, have their countries.

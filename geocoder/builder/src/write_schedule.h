@@ -48,7 +48,7 @@ inline KindValues record_bytes(const ParsedData& d) {
     at(b, RecordKind::Pois) = vector_bytes(d.poi_records) + vector_bytes(d.poi_osm_ids)
         + vector_bytes(d.poi_sidecar_blob) + vector_bytes(d.poi_vertices) + vector_bytes(d.sorted_poi_cells);
     at(b, RecordKind::Places) = vector_bytes(d.place_nodes) + vector_bytes(d.place_osm_ids)
-        + vector_bytes(d.place_sidecar_blob) + vector_bytes(d.sorted_place_cells);
+        + vector_bytes(d.sorted_place_cells);
     uint64_t strings = d.string_pool.data().size();
     for (const auto& tier : d.strings_tiers) strings += tier.size();
     at(b, RecordKind::Admins) = vector_bytes(d.admin_polygons) + vector_bytes(d.admin_osm_ids)
@@ -122,6 +122,14 @@ constexpr uint64_t kAdminTierAdminDivisor = 16;
 constexpr uint64_t kAdminMinimalAdminDivisor = 3;
 constexpr uint64_t kPoiTierPoiTenths = 4;
 
+// What write_place_files holds beside the nodes it is given, as a multiple
+// of their bytes (20 a node): each node's cell key, the order and the sort's
+// scratch (4 bytes each), and the three files in memory until they are
+// written (a visible row is under 13 bytes, its cell row 8, a block's table
+// entry 16 for 64 rows; a hidden node 16), in vectors that hold up to three
+// times their bytes while they grow: at most 74 bytes a node.
+constexpr uint64_t kPlaceWriterTimes = 4;
+
 // A continent's records can run past its share of the planet's cell pairs
 // (Europe's by 5%, North America's addrs by 16%); the share estimates carry
 // this margin.
@@ -192,13 +200,16 @@ struct StageCosts {
     uint64_t largest() const { return std::max({modes, admin_tiers, places, admin_minimal, poi_tiers}); }
 };
 
-// The place files are written straight from the records.
+// The place stage writes its dirs one after another, each through the place
+// writer; an admin-minimal dir writes the nodes it keeps, a copy of at most
+// all of them, through the same writer.
 inline StageCosts stage_costs(const KindValues& bytes) {
     StageCosts c;
-    const uint64_t admins = at(bytes, RecordKind::Admins);
+    const uint64_t admins = at(bytes, RecordKind::Admins), places = at(bytes, RecordKind::Places);
     c.modes = 3 * kModeBytes;
     c.admin_tiers = admins / kAdminTierAdminDivisor;
-    c.admin_minimal = admins / kAdminMinimalAdminDivisor;
+    c.places = places * kPlaceWriterTimes;
+    c.admin_minimal = admins / kAdminMinimalAdminDivisor + places * (1 + kPlaceWriterTimes);
     c.poi_tiers = at(bytes, RecordKind::Pois) * kPoiTierPoiTenths / 10;
     return c;
 }

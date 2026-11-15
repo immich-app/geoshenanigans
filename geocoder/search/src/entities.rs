@@ -4,7 +4,7 @@
 use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI, KIND_POLYGON};
 use crate::model::*;
 use memmap2::Mmap;
-use query_server::{AdminPolygon, FileBytes, Index, PlaceNode, PoiRecord, NO_DATA};
+use query_server::{AdminPolygon, Index, PlaceNode, PoiRecord, NO_DATA};
 use std::borrow::Cow;
 
 /// Derived boundary slot: polygon index, label node (NO_DATA without one) and label point
@@ -60,16 +60,12 @@ pub fn slot_name_ids(geo: &Index, s: &BoundarySlot) -> (u32, Option<u32>) {
     (own, None)
 }
 
-pub fn record_count<T>(f: &FileBytes) -> u32 {
-    (f.len() / std::mem::size_of::<T>() as u64) as u32
-}
-
 pub fn place_node_raw(geo: &Index, i: u32) -> PlaceNode {
-    geo.place_nodes.as_ref().expect("place_nodes").read_at::<PlaceNode>(i as u64)
+    geo.place_node_record(i).expect("place node")
 }
 
 pub fn polygon_raw(geo: &Index, i: u32) -> AdminPolygon {
-    geo.admin_polygons.read_at::<AdminPolygon>(i as u64)
+    geo.admin_polygon_record(i).expect("admin polygon record")
 }
 
 pub fn poi_raw(geo: &Index, i: u32) -> PoiRecord {
@@ -87,7 +83,7 @@ pub fn cc_str(cc: &[u8; 2]) -> &str {
 /// Country of a record through its parent polygon: a POI's containing one, a place node's
 /// claiming boundary (NO_DATA unless the node is its label).
 pub fn parent_cc(geo: &Index, parent: u32) -> [u8; 2] {
-    let n = record_count::<AdminPolygon>(&geo.admin_polygons);
+    let n = geo.admin_polygon_count();
     if parent == NO_DATA || parent >= n {
         return [0, 0];
     }
