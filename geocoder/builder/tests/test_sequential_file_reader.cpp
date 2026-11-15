@@ -320,7 +320,7 @@ TEST(sequential_reader_grows_its_default_window_for_the_largest_cell_list) {
     CHECK_EQ(sut.rewinds(), uint64_t(0));
 }
 
-// --- stream sources (the low-memory mode's in-process decoders) ---
+// --- stream sources (the patcher's in-process decoders) ---
 
 namespace {
 

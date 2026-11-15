@@ -16,10 +16,9 @@
 // kept, cell list deltas as runs, 16-byte admin polygon records, and an old
 // file's hash by file id).
 //
-// Low-memory mode: when <current-dir> is an encoded installed set (it has a
-// gc.manifest, see gcs_patch.h), the encoded families' old files are decoded
-// and their new files encoded in process, and the output is the new encoded
-// set. A family's records and their child stream replay together (JointChild).
+// The encoded families' old files (the way, address, POI, place and side
+// files, see gcs_patch.h) are decoded and their new files encoded in process.
+// A family's records and their child stream replay together (JointChild).
 // --threads runs each family's decoder and encoder in a thread of its own.
 
 #include <algorithm>
@@ -441,8 +440,7 @@ static int run(int argc, char* argv[]) {
     // The output is exactly the patch's file set, so stale files can't stay.
     if (!std::filesystem::is_empty(out_dir)) throw std::runtime_error("Output dir is not empty: " + out_dir);
     // The encoded families' old files are decoded and their new ones encoded in process: the way,
-    // address, POI, place and side files, in every dir; an encoded installed set (a gc.manifest)
-    // adds none.
+    // address, POI, place and side files.
     gcs::store().init(cur_dir, out_dir);
     stream_source_factory() = [](const std::string& p) { return gcs::store().open_source(p); };
     virtual_size_hook() = [](const std::string& dir, const std::string& name, uint64_t expected) -> bool {
@@ -451,7 +449,6 @@ static int run(int argc, char* argv[]) {
         s.check_old_size(name, expected);
         return true;
     };
-    if (gcs::store().active) std::cerr << "Encoded set: " << gcs::store().old_m.get("gc.families") << std::endl;
     ScratchDir scratch("geocoder-patch");
     const std::string& tmpdir = scratch.path();
     double t_start = now_ms();
@@ -618,10 +615,10 @@ static int run(int argc, char* argv[]) {
     struct SeqRef { size_t start, size; size_t stride; };
     std::unordered_map<uint32_t, SeqRef> merge_seqs;
 
-    // Low-memory mode: an encoded family's records and their child stream (ways and
-    // their nodes, address points and their footprints, POI records and their vertices) come
-    // from one decoder and go to one encoder, so the two sections replay together: each new
-    // record, then its child bytes. The child section (at `at`) must follow the parent's.
+    // An encoded family's records and their child stream (ways and their nodes, address points
+    // and their footprints, POI records and their vertices) come from one decoder and go to one
+    // encoder, so the two sections replay together: each new record, then its child bytes. The
+    // child section (at `at`) must follow the parent's.
     auto open_joint_child = [&](uint32_t parent_fid, FILE* parent_out, size_t at) {
         std::unique_ptr<JointChild> jc(new JointChild());
         jc->parse(P, patch_size, at, joint_child_of(parent_fid), file_records_max);
@@ -1411,14 +1408,6 @@ static int run(int argc, char* argv[]) {
     unmap_file(patch_map);
 
     for (const auto& f : client_files) {
-        if (gcs::store().sized_by_encoder(f.name)) {
-            auto it = gcs::store().got_out.find(f.name);
-            if (it == gcs::store().got_out.end()) throw std::runtime_error("Patch did not produce " + f.name);
-            if (it->second != f.size)
-                throw std::runtime_error("Output size mismatch: " + f.name + " is " + std::to_string(it->second) +
-                                         " bytes, the patch lists " + std::to_string(f.size));
-            continue;
-        }
         std::string p = out_dir + "/" + f.name;
         struct stat st;
         if (stat(p.c_str(), &st) != 0) {

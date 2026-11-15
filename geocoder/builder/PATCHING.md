@@ -179,26 +179,18 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
   `cmake -DGEOCODER_PATCH_LIBZSTD=OFF` builds it on the `zstd` command on PATH instead, for a host
   without libzstd
 - **patch_format.h** (`tools/patch_format.h`): Shared format definitions + rebuild functions
-- **geocoder-gc** (`tools/gc.cpp`, `tools/gc_io.h`): Encodes a variant dir into the compact installed
-  set (the encoded files and a `gc.manifest`) and decodes one back to today's files, byte for byte,
-  each into a new or empty dir. It encodes no family: the way files, the address files, the POI
-  files and the side files are compact in every dir, and it links them as they are
 - **gcs_\*.h** (`tools/gcs_patch.h`, `gcs_codec.h`, `gcs_io.h`, `gcs_async.h`): geocoder-patch's
   in-process codecs. The POI files are decoded and their new ones encoded in every dir (one record
   and one polygon in flight; a polygon past 256 KiB a piece at a time), and so are the way files
   (one way and its nodes in flight, 512 KiB of them at most), the address files (a block of 16
   records, an index row and one footprint in flight, 256 KiB of it at most; an escaped footprint,
   of any size, a piece at a time) and the side files (a block of 64 values in flight, the new
-  file's block table in a scratch file beside it until the file is closed). In low-memory mode,
-  when the old dir is an encoded installed set (a `gc.manifest` beside the files, as geocoder-gc
-  writes it), the output is the new encoded set, geocoder-gc's encoding of the new dir. An
-  encoded family's records and their child stream replay together; `--threads` gives each codec
-  a thread
+  file's block table in a scratch file beside it until the file is closed). An encoded family's
+  records and their child stream replay together; `--threads` gives each codec a thread
 
 ### Patcher memory and speed
 
-geocoder-patch's own memory doesn't grow with the data or the patch, in either mode. Three rules
-keep it so:
+geocoder-patch's own memory doesn't grow with the data or the patch. Three rules keep it so:
 
 - **Lists are ascending and read in place.** Every list in a patch that grows with the data is
   read where it sits in the decompressed patch, which the patcher maps, and none is copied whole:
@@ -230,8 +222,9 @@ keep it so:
   in pieces of at most 64 KiB (ENCODER_PIECE).
 
 The heap tests in `tests/test_patch_lowmem.cpp` hold the patcher to these rules: each grows one
-structure tenfold, applies the patch in plain, low-memory and `--threads` mode, and fails when
-the output differs or the heap peak grows by more than 256 KiB (HEAP_GROWTH_SLACK).
+structure tenfold, applies the patch with the codecs in the patcher's thread and with
+`--threads`, and fails when the output differs or the heap peak grows by more than 256 KiB
+(HEAP_GROWTH_SLACK).
 
 Measured on planet from 2026-10-18 to 10-19 (GCPATCH v12), for a normal day and for the
 transition (the first patch after POI names went into record order, which moves 12.8M of
@@ -561,8 +554,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   position: its MATCH bytes are the old bytes of the parent records at the
   same places, a MATCH or REPLACE record's own or, where a DELETE run is
   followed by an INSERT run, the deleted record's for the inserted one at the
-  same place in the run. An encoded family (the way files and the POI files
-  in every dir, gc's in low-memory mode) decodes both files from one stream,
+  same place in the run. An encoded family (the way files, the address files
+  and the POI files) decodes both files from one stream,
   and the patcher refuses a replay that reads one of them 4 MiB
   (MAX_DECODER_SKEW) ahead of the other ("Malformed merge sequence: <file>
   runs ahead of <file>").
@@ -578,8 +571,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   over, the runs and values it didn't reach (a deleted or replaced record's)
   lie within the old file's records, and no byte follows the last of either.
   The patcher refuses anything else ("Malformed offset fixups"). A child
-  stream carries none: the low-memory mode refuses a count or a byte of them
-  there ("Encoded set: a child stream with offset fixups"). The diff refuses
+  stream carries none: the patcher refuses a count or a byte of them there
+  ("Encoded family: a child stream with offset fixups"). The diff refuses
   a merge whose offset fixups would pass the header's u32s, or move a record
   past the last u32 record index ("Offset fixups of <file>: ..."), so the
   patcher leaves the offset of a record at or past 0xFFFFFFFF as it is.
@@ -593,8 +586,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   fixup for a slot the replay passes without matching (a deleted or replaced
   record's), one left over at the end, and bytes past the last ("Malformed
   string fixups"). A file without string fields carries 0 and 0; the
-  low-memory mode refuses anything else in a child stream ("Encoded set: a
-  child stream with string fixups"). The diff refuses a merge whose fixups
+  patcher refuses anything else in a child stream ("Encoded family: a child
+  stream with string fixups"). The diff refuses a merge whose fixups
   would pass the header's u32s, or skip more slots between two than a varint
   holds ("String fixups of <file>: more than ...").
 

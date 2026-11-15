@@ -875,8 +875,8 @@ TEST(patch_format_old_file_must_be_the_size_the_patch_was_made_from) {
 }
 
 TEST(patch_format_old_file_size_of_a_virtual_file_comes_from_the_hook) {
-    // Low-memory mode: an encoded family's old file isn't on disk; the hook
-    // checks its decoded size and the reader takes the patch's.
+    // An encoded family's logical old file isn't on disk; the hook checks its
+    // decoded size and the reader takes the patch's.
     ScratchDir dir("old-size");
     virtual_size_hook() = [](const std::string&, const std::string& name, uint64_t expected) -> bool {
         if (name != "street_ways.bin") return false;

@@ -121,8 +121,7 @@ TEST(gcs_poi_round_trip_through_interrupted_and_short_positional_io) {
         }
         enc.state = {2, 2};
         enc.pump();
-        Manifest m;
-        enc.finish(m);
+        enc.finish();
         poi::Dec dec(dir.path());
         dec.state = {1, 1};
         while (dec.step()) {}

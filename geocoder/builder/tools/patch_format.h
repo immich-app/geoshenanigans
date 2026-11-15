@@ -160,7 +160,7 @@ inline bool write_file(const std::string& path, const std::vector<char>& data) {
 // that refuses a dir from another day for variants that ship no string tier
 // (quality dirs): every other read clamps to what is there.
 inline void require_old_file_size(const std::string& dir, const std::string& name, uint64_t expected) {
-    // Low-memory mode: an encoded family's old file is decoded in process.
+    // An encoded family's old file is decoded in process.
     if (virtual_size_hook() && virtual_size_hook()(dir, name, expected)) {
         virtual_file_sizes()[dir + "/" + name] = expected;
         return;

@@ -1,14 +1,13 @@
 // The patcher's side of the in-process codecs: every today's-format file of an encoded family is
 // a virtual old file (a SequentialFileReader reads it from the family's decoder) and a virtual
-// output (open_out hands back a FILE* whose bytes go to the family's encoder). A native family
-// (the street and the interpolation ways, way_files.h; the address files, addr_files.h; the POI
-// files, R2 and V2 in every dir: poi_files.h; the place files, place_files.h; each of the four
-// side files, side_blocks.h) is encoded in every dir under today's names, the place files'
-// logical stream as place_nodes.bin; a gc family (tools/gc.cpp has none) only in an encoded
-// installed set (a dir with a gc.manifest), whose new dir gets the merged gc.manifest. No
-// today's-format file of an encoded family touches the disk.
+// output (open_out hands back a FILE* whose bytes go to the family's encoder). A family (the
+// street and the interpolation ways, way_files.h; the address files, addr_files.h; the POI
+// files, R2 and V2: poi_files.h; the place files, place_files.h; each of the four side files,
+// side_blocks.h) is encoded in every dir under today's names, the place files' logical stream
+// as place_nodes.bin. No today's-format file of an encoded family touches the disk.
 #pragma once
 #include <malloc.h>
+#include <map>
 #include <set>
 #include <stdio.h>
 #include <stdio_ext.h>
@@ -21,59 +20,57 @@ namespace gcs {
 // The client list's sizes by today's name (Store::expect_out).
 using ListedSizes = std::map<std::string, uint64_t>;
 
-// A family and its codecs. decoder: over the installed set in dir (m: its manifest, which holds a
-// gc family's counts). encoder: into the new set in dir (sizes: the files the patch lists, for one
-// that writes a file no section names). decoded_size: a native family's decoded size of a port,
-// from dir's files alone and with no decoder made (the POI replay reads the files itself); none
-// for a gc family, whose decoder gives the manifest's.
+// A family and its codecs. decoder: over the old dir's files. encoder: into the new dir (sizes:
+// the files the patch lists, for one that writes a file no section names). decoded_size: the
+// decoded size of a port, from dir's files alone and with no decoder made (the POI replay reads
+// the files itself).
 struct FamilyDesc {
     const char* name;
     std::vector<const char*> today;
-    bool native;  // encoded in every dir, as its today's files' names
-    Decoder* (*decoder)(const std::string& dir, const Manifest& m);
+    Decoder* (*decoder)(const std::string& dir);
     Encoder* (*encoder)(const std::string& dir, const ListedSizes& sizes);
     uint64_t (*decoded_size)(const std::string& dir, int port);
 };
-// The native families and gc's (tools/gc.cpp; gc.families lists those an installed set encodes).
+// The encoded families.
 static const std::vector<FamilyDesc>& families() {
     static const std::vector<FamilyDesc> f = {
-        {"streets", {"street_ways.bin", "street_nodes.bin"}, true,
-         [](const std::string& dir, const Manifest&) -> Decoder* { return new ways::Dec(dir, way_files::STREETS); },
+        {"streets", {"street_ways.bin", "street_nodes.bin"},
+         [](const std::string& dir) -> Decoder* { return new ways::Dec(dir, way_files::STREETS); },
          [](const std::string& dir, const ListedSizes&) -> Encoder* { return new ways::Enc(dir, way_files::STREETS); },
          [](const std::string& dir, int port) { return ways::decoded_size(dir, way_files::STREETS, port); }},
-        {"interps", {"interp_ways.bin", "interp_nodes.bin"}, true,
-         [](const std::string& dir, const Manifest&) -> Decoder* { return new ways::Dec(dir, way_files::INTERPS); },
+        {"interps", {"interp_ways.bin", "interp_nodes.bin"},
+         [](const std::string& dir) -> Decoder* { return new ways::Dec(dir, way_files::INTERPS); },
          [](const std::string& dir, const ListedSizes&) -> Encoder* { return new ways::Enc(dir, way_files::INTERPS); },
          [](const std::string& dir, int port) { return ways::decoded_size(dir, way_files::INTERPS, port); }},
-        {"way_parents", {"way_parents.bin"}, true,
-         [](const std::string& dir, const Manifest&) -> Decoder* { return new side::Dec(dir, "way_parents"); },
+        {"way_parents", {"way_parents.bin"},
+         [](const std::string& dir) -> Decoder* { return new side::Dec(dir, "way_parents"); },
          [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::Enc(dir, "way_parents"); },
          [](const std::string& dir, int) { return side::decoded_size(dir, "way_parents"); }},
-        {"way_postcodes", {"way_postcodes.bin"}, true,
-         [](const std::string& dir, const Manifest&) -> Decoder* { return new side::Dec(dir, "way_postcodes"); },
+        {"way_postcodes", {"way_postcodes.bin"},
+         [](const std::string& dir) -> Decoder* { return new side::Dec(dir, "way_postcodes"); },
          [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::Enc(dir, "way_postcodes"); },
          [](const std::string& dir, int) { return side::decoded_size(dir, "way_postcodes"); }},
-        {"interp_postcodes", {"interp_postcodes.bin"}, true,
-         [](const std::string& dir, const Manifest&) -> Decoder* { return new side::Dec(dir, "interp_postcodes"); },
+        {"interp_postcodes", {"interp_postcodes.bin"},
+         [](const std::string& dir) -> Decoder* { return new side::Dec(dir, "interp_postcodes"); },
          [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::Enc(dir, "interp_postcodes"); },
          [](const std::string& dir, int) { return side::decoded_size(dir, "interp_postcodes"); }},
-        {"addr_postcodes", {"addr_postcodes.bin"}, true,
-         [](const std::string& dir, const Manifest&) -> Decoder* { return new side::Dec(dir, "addr_postcodes"); },
+        {"addr_postcodes", {"addr_postcodes.bin"},
+         [](const std::string& dir) -> Decoder* { return new side::Dec(dir, "addr_postcodes"); },
          [](const std::string& dir, const ListedSizes&) -> Encoder* { return new side::Enc(dir, "addr_postcodes"); },
          [](const std::string& dir, int) { return side::decoded_size(dir, "addr_postcodes"); }},
-        {"addr", {"addr_points.bin", "addr_vertices.bin"}, true,
-         [](const std::string& dir, const Manifest&) -> Decoder* { return new addr::Dec(dir); },
+        {"addr", {"addr_points.bin", "addr_vertices.bin"},
+         [](const std::string& dir) -> Decoder* { return new addr::Dec(dir); },
          [](const std::string& dir, const ListedSizes& sizes) -> Encoder* {
              // The encoder writes the index beside the two files its sections name.
              if (!sizes.count(addr_files::INDEX_FILE)) die("addr: the patch lists no %s", addr_files::INDEX_FILE);
              return new addr::Enc(dir);
          },
          [](const std::string& dir, int port) { return addr::decoded_size(dir, port); }},
-        {"poi", {"poi_records.bin", "poi_vertices.bin"}, true,
-         [](const std::string& dir, const Manifest&) -> Decoder* { return new poi::Dec(dir); },
+        {"poi", {"poi_records.bin", "poi_vertices.bin"},
+         [](const std::string& dir) -> Decoder* { return new poi::Dec(dir); },
          [](const std::string& dir, const ListedSizes&) -> Encoder* { return new poi::Enc(dir); }, poi::decoded_size},
-        {"places", {"place_nodes.bin"}, true,
-         [](const std::string& dir, const Manifest&) -> Decoder* { return new place::Dec(dir); },
+        {"places", {"place_nodes.bin"},
+         [](const std::string& dir) -> Decoder* { return new place::Dec(dir); },
          [](const std::string& dir, const ListedSizes&) -> Encoder* { return new place::Enc(dir); },
          [](const std::string& dir, int) { return place::decoded_size(dir); }},
     };
@@ -87,17 +84,15 @@ inline size_t heap_in_use() {
 }
 
 struct Store {
-    bool active = false, threads = false;
+    bool threads = false;
     std::string cur_dir, out_dir;
-    Manifest old_m, new_m;
-    std::vector<int> fam_on;   // per family: encoded in the installed set
-    std::vector<int> fam_out;  // per family: encoded in the new set (plan_outputs)
+    std::vector<int> fam_out;  // per family: the new dir holds it (plan_outputs)
     std::map<std::string, std::pair<int, int>> file_port;  // today's name -> (family, port)
     std::vector<std::unique_ptr<Decoder>> dec;
     std::vector<std::unique_ptr<Encoder>> enc;
     std::vector<std::unique_ptr<AsyncDec>> adec;  // --threads: the codec's worker
     std::vector<std::unique_ptr<AsyncEnc>> aenc;
-    std::map<std::string, uint64_t> expect_out, got_out;  // today's name -> bytes (client list / encoder)
+    std::map<std::string, uint64_t> expect_out;           // today's name -> bytes (the client list)
     std::vector<std::string> report;                      // per family: queue peaks
     std::string sink_error;
     std::set<std::string> opened_old, opened_new;
@@ -126,48 +121,19 @@ struct Store {
         cur_dir = cur;
         out_dir = out;
         const auto& F = families();
-        fam_on.assign(F.size(), 0);
         dec.resize(F.size());
         enc.resize(F.size());
         adec.resize(F.size());
         aenc.resize(F.size());
         for (size_t fi = 0; fi < F.size(); fi++)
-            if (F[fi].native) turn_on(fi);
-        struct stat st;
-        if (stat((cur + "/gc.manifest").c_str(), &st) != 0) return;
-        active = true;
-        old_m.load(cur + "/gc.manifest");
-        std::set<std::string> on;
-        {
-            const std::string fl = old_m.get("gc.families");
-            size_t a = 0;
-            while (a <= fl.size()) {
-                size_t b = fl.find(',', a);
-                if (b == std::string::npos) b = fl.size();
-                if (b > a) on.insert(fl.substr(a, b - a));
-                a = b + 1;
-            }
-        }
-        for (size_t fi = 0; fi < F.size(); fi++)
-            if (on.count(F[fi].name) && !F[fi].native) turn_on(fi);
-        for (const auto& n : on) {
-            bool known = false;
-            for (const auto& f : F) known |= n == f.name && !f.native;
-            if (!known) die("unknown family %s in gc.manifest", n.c_str());
-        }
+            for (size_t p = 0; p < F[fi].today.size(); p++) file_port[F[fi].today[p]] = {int(fi), int(p)};
     }
-    void turn_on(size_t fi) {
-        fam_on[fi] = 1;
-        const auto& F = families()[fi];
-        for (size_t p = 0; p < F.today.size(); p++) file_port[F.today[p]] = {int(fi), int(p)};
-    }
-    // Once expect_out holds the patch's client list: an encoded family the new set drops whole (it
-    // lists none of its today's files) leaves gc.families, and one it ships in part can't be encoded.
+    // Once expect_out holds the patch's client list: a family the new dir drops whole (it lists
+    // none of its today's files) has no output, and one it ships in part can't be encoded.
     void plan_outputs() {
         const auto& F = families();
         fam_out.assign(F.size(), 0);
         for (size_t fi = 0; fi < F.size(); fi++) {
-            if (!fam_on[fi]) continue;
             size_t listed = 0;
             for (const char* t : F[fi].today) listed += expect_out.count(t);
             if (listed && listed < F[fi].today.size())
@@ -176,17 +142,11 @@ struct Store {
         }
     }
     bool is_encoded(const std::string& name) const { return file_port.count(name) != 0; }
-    // An encoded file whose new size is what its encoder took (gc's families: the client list
-    // gives a today's-format size); a native family's is its own file's.
-    bool sized_by_encoder(const std::string& name) const {
-        auto it = file_port.find(name);
-        return it != file_port.end() && !families()[size_t(it->second.first)].native;
-    }
     std::string path_of(const std::string& name) const { return cur_dir + "/" + name; }
     // Decoders and encoders are made on first use and freed when their last port closes.
     Decoder* decoder(int fi) {
         if (!dec[size_t(fi)]) {
-            Decoder* d = families()[size_t(fi)].decoder(cur_dir, old_m);
+            Decoder* d = families()[size_t(fi)].decoder(cur_dir);
             dec[size_t(fi)].reset(d);
             if (threads) adec[size_t(fi)].reset(new AsyncDec(d));
         }
@@ -194,12 +154,7 @@ struct Store {
     }
     Encoder* encoder(int fi) {
         if (!enc[size_t(fi)]) {
-            const auto& F = families()[size_t(fi)];
-            Encoder* e = F.encoder(out_dir, expect_out);
-            for (size_t p = 0; p < F.today.size() && !F.native; p++) {
-                auto it = expect_out.find(F.today[p]);
-                if (it != expect_out.end()) e->expect[p] = it->second;
-            }
+            Encoder* e = families()[size_t(fi)].encoder(out_dir, expect_out);
             enc[size_t(fi)].reset(e);
             if (threads) aenc[size_t(fi)].reset(new AsyncEnc(e));
         }
@@ -207,13 +162,12 @@ struct Store {
     }
 
     // --- old side ---
-    // The decoded size check for require_old_file_size: the manifest's size when it gives one.
-    // A native family's from its files (FamilyDesc::decoded_size).
+    // The decoded size check for require_old_file_size, from the old files alone
+    // (FamilyDesc::decoded_size).
     void check_old_size(const std::string& name, uint64_t expected) {
         auto [fi, port] = file_port.at(name);
-        const FamilyDesc& F = families()[size_t(fi)];
-        const uint64_t ds = F.decoded_size ? F.decoded_size(cur_dir, port) : decoder(fi)->decoded_size(port);
-        if (ds != ~0ull && ds != expected)
+        const uint64_t ds = families()[size_t(fi)].decoded_size(cur_dir, port);
+        if (ds != expected)
             die("old %s decodes to %llu bytes, the patch expects %llu", name.c_str(), (unsigned long long)ds, (unsigned long long)expected);
     }
     struct PortSource : StreamSource {
@@ -327,9 +281,8 @@ struct Store {
         const auto& F = families()[size_t(fi)];
         std::string r = std::string("encode ") + F.name;
         if (AsyncEnc* a = aenc[size_t(fi)].get()) {
-            got_out[F.today[size_t(port)]] = a->got[size_t(port)];
             if (!a->close(port)) return;  // (the last close joins the worker)
-            e->finish(new_m);
+            e->finish();
             r += ": thread cpu " + std::to_string(a->cpu_s) + " s, ring peaks";
             for (size_t p = 0; p < a->ring.size(); p++) r += " " + std::to_string(a->peak(int(p)));
             r += " B, queue peaks";
@@ -341,28 +294,18 @@ struct Store {
         }
         e->state[size_t(port)] = 2;
         e->pump();
-        got_out[F.today[size_t(port)]] = e->got[size_t(port)];
         if (!e->all_closed()) return;
-        e->finish(new_m);
+        e->finish();
         r += ": queue peaks";
         for (size_t p = 0; p < e->in.size(); p++) r += " " + std::to_string(e->peak(int(p)));
         report.push_back(r + " B");
         enc[size_t(fi)].reset();
     }
-    // Every new family's outputs closed; for an encoded set, the merged manifest: every new gc
-    // family's keys, gc.families and gc.version, as gc writes it.
+    // Every new family's outputs closed.
     void finish_outputs() {
-        std::string fl;
         const auto& F = families();
-        for (size_t fi = 0; fi < F.size(); fi++) {
-            if (!fam_out[fi]) continue;
-            if (enc[fi]) die("family %s: an output was never closed", F[fi].name);
-            if (!F[fi].native) fl += (fl.empty() ? "" : ",") + std::string(F[fi].name);
-        }
-        if (!active) return;
-        new_m.set("gc.version", 1);
-        new_m.set("gc.families", fl);
-        new_m.save(out_dir + "/gc.manifest");
+        for (size_t fi = 0; fi < F.size(); fi++)
+            if (fam_out[fi] && enc[fi]) die("family %s: an output was never closed", F[fi].name);
     }
 };
 

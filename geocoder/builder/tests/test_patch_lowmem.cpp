@@ -1,9 +1,9 @@
-// geocoder-patch's low-memory mode end to end: small synthetic today's-format
-// dirs, the geocoder-diff patch between them, geocoder-gc's encoding of the
-// old dir patched (in sync and --threads) and the new encoded set compared
-// byte for byte with geocoder-gc's encoding of the new dir. Then the
-// patcher's heap peak, in every mode, as a case grows tenfold; and patches
-// and command lines the patcher must refuse.
+// geocoder-patch end to end: small synthetic dirs as the builder writes
+// them, the geocoder-diff patch between them, the old dir patched (its codecs
+// in the patcher's thread and with --threads) and the output compared byte
+// for byte with the new dir. Then the patcher's heap peak, in every mode, as
+// a case grows tenfold; and patches and command lines the patcher must
+// refuse.
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -481,8 +481,8 @@ LogCheck peaks_at_most(const std::string& codec, const std::string& family, uint
 LogCheck decoder_peaks_at_most(const std::string& family, uint64_t limit) { return peaks_at_most("decode", family, limit); }
 LogCheck encoder_peaks_at_most(const std::string& family, uint64_t limit) { return peaks_at_most("encode", family, limit); }
 
-// The old and new dirs of a case under root/<name>.{old,new}, their encoded
-// sets, the patch between them, and what applying it gave.
+// The old and new dirs of a case under root/<name>.{old,new}, the patch
+// between them, and what applying it gave.
 struct LowMemCase {
     std::string root, name;
     std::string dir(const std::string& kind) const { return root + "/" + name + "." + kind; }
@@ -490,9 +490,8 @@ struct LowMemCase {
     std::string log() const { return dir("log"); }
 };
 
-// Writes old and new (and their sidecars when given), diffs them (with
-// diff_options), and encodes both with geocoder-gc. Empty on success, else
-// what failed.
+// Writes old and new (and their sidecars when given) and diffs them (with
+// diff_options). Empty on success, else what failed.
 std::string prepare(const LowMemCase& c, const BuildDir& old_d, const BuildDir& new_d, const BuildDir& old_meta = {},
                     const BuildDir& new_meta = {}, const std::vector<std::string>& diff_options = {}) {
     if (!write_dir(c.dir("old"), old_d) || !write_dir(c.dir("new"), new_d)) return "fixture not written";
@@ -502,11 +501,8 @@ std::string prepare(const LowMemCase& c, const BuildDir& old_d, const BuildDir& 
         diff.insert(diff.end(), {"--identity", c.dir("old-meta"), c.dir("new-meta")});
     }
     diff.insert(diff.end(), diff_options.begin(), diff_options.end());
-    for (const auto& words : {diff, {GEOCODER_GC_BIN, "encode", c.dir("old"), c.dir("old.enc")},
-                              {GEOCODER_GC_BIN, "encode", c.dir("new"), c.dir("new.enc")}}) {
-        auto r = run_tool(words, c.log());
-        if (!r.ok) return words[0] + " failed: " + r.log;
-    }
+    auto r = run_tool(diff, c.log());
+    if (!r.ok) return diff[0] + " failed: " + r.log;
     return "";
 }
 
@@ -528,16 +524,15 @@ std::string patch_holds(const LowMemCase& c, const std::vector<char>& head, cons
     return find_once(raw_patch(c), head) == std::string::npos ? "no " + what : "";
 }
 
-// The modes a patch applies in: to the old dir, and to its encoded set (the
-// low-memory mode) in sync and with --threads.
-const std::vector<std::string> ENCODED_MODES = {"sync", "threads"};
-const std::vector<std::string> ALL_MODES = {"plain", "sync", "threads"};
+// The modes a patch applies in: the codecs in the patcher's own thread
+// ("sync"), or each in a thread of its own ("threads", with --threads).
+const std::vector<std::string> ALL_MODES = {"sync", "threads"};
 
-// The patcher's command line applying patch to c's old dir ("plain") or
-// encoded set ("sync", "threads") into out, with options.
+// The patcher's command line applying patch to c's old dir into out in the
+// mode, with options.
 std::vector<std::string> patch_words(const LowMemCase& c, const std::string& mode, const std::string& patch, const std::string& out,
                                      const std::vector<std::string>& options = {}) {
-    std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir(mode == "plain" ? "old" : "old.enc"), patch, "-o", out};
+    std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir("old"), patch, "-o", out};
     if (mode == "threads") words.push_back("--threads");
     words.insert(words.end(), options.begin(), options.end());
     return words;
@@ -594,10 +589,9 @@ struct Applied {
     std::map<std::string, std::string> codec_states;
 };
 
-// The patch applied in each of modes ("plain": to the old dir, compared with
-// the new dir; "sync" and "threads": to the old encoded set, compared with
-// the new encoded set), the patcher under the heap shim and given options;
-// check runs on each log. Every mismatch, printed.
+// The patch applied to the old dir in each of modes and the output compared
+// with the new dir, the patcher under the heap shim and given options; check
+// runs on each log. Every mismatch, printed.
 Applied apply_modes(const LowMemCase& c, const std::vector<std::string>& modes, const LogCheck& check = {},
                     const std::vector<std::string>& options = {}) {
     Applied a;
@@ -605,7 +599,6 @@ Applied apply_modes(const LowMemCase& c, const std::vector<std::string>& modes, 
     // from none.
     for (const std::string& mode : modes) std::filesystem::remove_all(c.dir("out." + mode));
     for (const std::string& mode : modes) {
-        const bool plain = mode == "plain";
         const std::string out = c.dir("out." + mode);
         std::filesystem::remove(c.log());
         const auto [ok, heap_peak] = gctest::run_with_heap_peak(patch_words(c, mode, c.patch(), out, options), c.log());
@@ -617,18 +610,12 @@ Applied apply_modes(const LowMemCase& c, const std::vector<std::string>& modes, 
             a.bad.push_back(mode + ": patch failed: " + log);
             continue;
         }
-        if (read_dir(out) != read_dir(c.dir(plain ? "new" : "new.enc")))
-            a.bad.push_back(mode + (plain ? ": the patched dir is not the new dir" : ": the new set is not gc's encoding of the new dir"));
+        if (read_dir(out) != read_dir(c.dir("new"))) a.bad.push_back(mode + ": the patched dir is not the new dir");
         if (check)
             if (std::string e = check(log); !e.empty()) a.bad.push_back(mode + ": " + e);
     }
     for (const auto& b : a.bad) std::printf("    %s: %s\n", c.name.c_str(), b.c_str());
     return a;
-}
-
-// The low-memory mode's mismatches.
-std::vector<std::string> apply_both_modes(const LowMemCase& c, const LogCheck& check = {}) {
-    return apply_modes(c, ENCODED_MODES, check).bad;
 }
 
 // A heap test's case of n elements of the one structure it varies, written
@@ -707,8 +694,8 @@ ThreadsCheck threads_check(const std::vector<ThreadsRun>& runs_n, const std::vec
 
 // The case at n and at factor n (10 n unless said), each applied in every
 // mode: each output as apply_modes checks it, and in each mode the heap peak
-// at factor n at most HEAP_GROWTH_SLACK above the one at n. Plain and sync runs peak the same
-// every time, so one run at each size decides; --threads runs
+// at factor n at most HEAP_GROWTH_SLACK above the one at n. A sync run peaks
+// the same every time, so one run at each size decides; --threads runs
 // THREADS_HEAP_RUNS times at each size, the sizes taking turns so that both
 // see the same load, and threads_check decides, both sizes running again
 // while its failures aren't settled, up to THREADS_HEAP_MAX_RUNS times.
@@ -733,7 +720,7 @@ std::vector<std::string> heap_flat(const CaseOfSize& make_case, uint32_t n, uint
             return bad;
         }
     }
-    // Each size's plain and sync heap peaks, and its --threads runs.
+    // Each size's sync heap peak, and its --threads runs.
     std::map<std::string, uint64_t> peaks[2];
     std::vector<ThreadsRun> threads[2];
     for (int run = 0; run < THREADS_HEAP_MAX_RUNS && (run == 0 || bad.empty()) &&
@@ -1006,7 +993,7 @@ TEST(patch_copies_the_poi_blocks_a_day_leaves_whole) {
     v2[voff + poi_files::MAX_BLOCK_HEADER + 100] ^= 0x10;
     REQUIRE(write_file(c.dir("old") + "/poi_vertices.bin", v2.data(), v2.size()));
     std::filesystem::remove_all(c.dir("out.flipped"));
-    const auto r = run_tool(patch_words(c, "plain", c.patch(), c.dir("out.flipped")), c.log());
+    const auto r = run_tool(patch_words(c, "sync", c.patch(), c.dir("out.flipped")), c.log());
     CHECK(!r.ok);
     CHECK(r.log.find("Old poi_vertices.bin is not the one the patch was made from") != std::string::npos);
 }
@@ -1185,7 +1172,7 @@ TEST(patch_lowmem_replays_an_unchanged_parent_with_its_child) {
         const LowMemCase c{dir.path(), name};
         REQUIRE(prepare(c, old_d, new_d).empty());
 
-        CHECK(apply_both_modes(c).empty());
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
     }
 }
 
@@ -1215,7 +1202,7 @@ TEST(patch_lowmem_drops_the_child_bytes_of_deleted_and_replaced_records) {
         const LowMemCase c{dir.path(), name};
         REQUIRE(prepare(c, old_d, new_d).empty());
 
-        CHECK(apply_both_modes(c, decoder_peaks_at_most("poi", DECODER_HOLD)).empty());
+        CHECK(apply_modes(c, ALL_MODES, decoder_peaks_at_most("poi", DECODER_HOLD)).bad.empty());
     }
 }
 
@@ -1242,8 +1229,7 @@ TEST(patch_lowmem_replays_a_long_run_of_tombstones) {
     REQUIRE(prepare(c, old_d, new_d).empty());
 
     CHECK(raw_patch(c).size() < size_t(DEAD + TAIL / 2) * POI_RECORD_STRIDE);
-    CHECK(apply_modes(c, {"plain"}).bad.empty());
-    CHECK(apply_both_modes(c, decoder_peaks_at_most("poi", DECODER_HOLD)).empty());
+    CHECK(apply_modes(c, ALL_MODES, decoder_peaks_at_most("poi", DECODER_HOLD)).bad.empty());
 }
 
 // The 2026-11-03 nightly raised the importance of ~1 planet poi/all record in
@@ -1270,8 +1256,7 @@ TEST(patch_lowmem_replays_records_edited_in_place) {
     const size_t raw = raw_patch(c).size();
     std::printf("    raw patch %zu bytes, %zu records edited\n", raw, n_edited);
     CHECK(raw < n_edited * POI_RECORD_STRIDE * 2);
-    CHECK(apply_modes(c, {"plain"}).bad.empty());
-    CHECK(apply_both_modes(c, decoder_peaks_at_most("poi", DECODER_HOLD)).empty());
+    CHECK(apply_modes(c, ALL_MODES, decoder_peaks_at_most("poi", DECODER_HOLD)).bad.empty());
 }
 
 // A set whose address files hold no address, their three footers: the diff
@@ -1331,7 +1316,7 @@ TEST(patch_lowmem_encodes_a_poi_insert_stretch_within_its_hold) {
     const LowMemCase c{dir.path(), "poi-insert"};
     REQUIRE(prepare(c, old_d, new_d).empty());
 
-    CHECK(apply_both_modes(c, encoder_peaks_at_most("poi", POI_ENCODER_HOLD)).empty());
+    CHECK(apply_modes(c, ALL_MODES, encoder_peaks_at_most("poi", POI_ENCODER_HOLD)).bad.empty());
 }
 
 // Two escaped address footprints (one in encoding 3, 800K vertices: 6.4 MB;
@@ -1647,8 +1632,8 @@ TEST(patch_heap_stays_flat_as_geo_cells_change) {
     }, 20000).empty());
 }
 
-// The plain patcher's walk over a geo index of 60,000 cells whose street
-// lists all change (a blocks file of ~190 KiB, past a read window) holds a
+// The patcher's walk over a geo index of 60,000 cells whose street lists
+// all change (a blocks file of ~190 KiB, past a read window) holds a
 // read window for the old blocks and a few pages besides: the old top file
 // and the group footers, read 12 and 768 bytes at a time, each through a
 // page, and the new blocks handed to the output's FILE buffer a page at a
@@ -1677,12 +1662,12 @@ TEST(patch_heap_of_the_geo_walk_is_a_read_window_and_a_few_pages) {
         REQUIRE(prepare(c, old_d, new_d).empty());
         blocks[s] = read_file(c.dir("old") + "/geo_entries.bin").size();
         if (s == 1) REQUIRE(blocks[s] > 2 * SEQUENTIAL_READ_BUFFER_BYTES);
-        const Applied a = apply_modes(c, {"plain"});
+        const Applied a = apply_modes(c, {"sync"});
         CHECK(a.bad.empty());
-        REQUIRE(a.heap_peaks.count("plain"));
-        peaks[s] = a.heap_peaks.at("plain");
+        REQUIRE(a.heap_peaks.count("sync"));
+        peaks[s] = a.heap_peaks.at("sync");
     }
-    std::printf("    plain: heap peak %llu B over an empty geo index, %llu B over %u cells of %llu B of blocks (%lld B above)\n",
+    std::printf("    heap peak %llu B over an empty geo index, %llu B over %u cells of %llu B of blocks (%lld B above)\n",
                 (unsigned long long)peaks[0], (unsigned long long)peaks[1], sizes[1], (unsigned long long)blocks[1],
                 (long long)peaks[1] - (long long)peaks[0]);
     CHECK(peaks[1] <= peaks[0] + SEQUENTIAL_READ_BUFFER_BYTES + (48 << 10));
@@ -1745,11 +1730,11 @@ TEST(patch_heap_stays_flat_as_poi_cells_change) {
 // Eight POI cells that share one list of n POIs (as a dense city's poi/all
 // cells do) and a ninth whose POI changes: the patcher holds a long list as
 // few times as the rebuild needs (the old index's row, the writer's previous
-// list and its encoding), so from n = 6,000 to 60,000 its heap peak, plain
-// and sync, grows by at most three times the ids added (2.7 and 1.2 times).
-// It grew by 4.7 and 3.4 times them when the old index's reader kept its own
-// copy of a shared list, and the rebuild a second list it swapped with the
-// reader's. Skipped without a heap shim (the sanitizer build).
+// list and its encoding), so from n = 6,000 to 60,000 its heap peak grows by
+// at most three times the ids added (0.94 times). It grew by 4.7 times them
+// when the old index's reader kept its own copy of a shared list, and the
+// rebuild a second list it swapped with the reader's. Skipped without a heap
+// shim (the sanitizer build).
 TEST(patch_heap_holds_a_long_shared_poi_cell_list_at_most_three_times) {
     if (!gctest::heap_peak_shim()) {
         std::printf("    SKIP heap peaks: no heap shim under the sanitizers\n");
@@ -1759,7 +1744,7 @@ TEST(patch_heap_holds_a_long_shared_poi_cell_list_at_most_three_times) {
     std::mt19937 rng(20261110);
     const uint32_t sizes[] = {6000, 60000};
     const auto pois = pois_of(rng, sizes[1] + 2, 0, true);
-    std::map<std::string, uint64_t> peaks[2];
+    uint64_t peaks[2] = {};
     for (size_t s = 0; s < 2; s++) {
         const LowMemCase c{dir.path(), "n" + std::to_string(sizes[s])};
         std::vector<uint32_t> shared(sizes[s]);
@@ -1774,19 +1759,16 @@ TEST(patch_heap_holds_a_long_shared_poi_cell_list_at_most_three_times) {
         put_cells(old_d, "poi", old_cells);
         put_cells(new_d, "poi", new_cells);
         REQUIRE(prepare(c, old_d, new_d).empty());
-        const Applied a = apply_modes(c, {"plain", "sync"});
+        const Applied a = apply_modes(c, {"sync"});
         CHECK(a.bad.empty());
-        peaks[s] = a.heap_peaks;
+        REQUIRE(a.heap_peaks.count("sync"));
+        peaks[s] = a.heap_peaks.at("sync");
     }
-    const uint64_t added = 4 * uint64_t(sizes[1] - sizes[0]);
-    for (const std::string mode : {"plain", "sync"}) {
-        REQUIRE(peaks[0].count(mode) && peaks[1].count(mode));
-        const uint64_t from = peaks[0][mode], to = peaks[1][mode];
-        std::printf("    %s: heap peak %llu B at n = %u, %llu B at n = %u (%.2f times the %llu B of ids added)\n",
-                    mode.c_str(), (unsigned long long)from, sizes[0], (unsigned long long)to, sizes[1],
-                    to > from ? double(to - from) / double(added) : 0.0, (unsigned long long)added);
-        CHECK(to <= from + 3 * added);
-    }
+    const uint64_t added = 4 * uint64_t(sizes[1] - sizes[0]), from = peaks[0], to = peaks[1];
+    std::printf("    heap peak %llu B at n = %u, %llu B at n = %u (%.2f times the %llu B of ids added)\n", (unsigned long long)from,
+                sizes[0], (unsigned long long)to, sizes[1], to > from ? double(to - from) / double(added) : 0.0,
+                (unsigned long long)added);
+    CHECK(to <= from + 3 * added);
 }
 
 namespace {
@@ -2078,8 +2060,8 @@ TEST(patch_diff_sends_moved_strings_as_string_fixups_past_the_pair_cap) {
 
 // The POI string tier in record order (GCPATCH v9): the new pool moves a name
 // out of sorted order (zoo cafe bank -> zoo bank cafe tea), so the tier's
-// diff sends new indices and a moved-string pair, and the encoded POI records
-// take the remapped names as the plain patcher's do.
+// diff sends new indices and a moved-string pair, and the POI records take
+// the remapped names.
 TEST(patch_lowmem_rebuilds_a_string_tier_in_any_order) {
     ScratchDir dir("lowmem-strings");
     std::mt19937 rng(20261027);
@@ -2095,16 +2077,13 @@ TEST(patch_lowmem_rebuilds_a_string_tier_in_any_order) {
     const LowMemCase c{dir.path(), "strings"};
     REQUIRE(prepare(c, old_d, new_d).empty());
 
-    CHECK(apply_both_modes(c).empty());
-    auto r = run_tool({GEOCODER_GC_BIN, "decode", c.dir("out.sync"), c.dir("out.dec")}, c.log());
-    REQUIRE(r.ok);
-    CHECK(read_dir(c.dir("out.dec")) == read_dir(c.dir("new")));
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
-// A new set without an encoded family's files (the POI family, both files
-// gone) gets a gc.manifest naming only the families it ships, as gc's
-// encoding of the new dir does, and decodes to the new dir.
-TEST(patch_lowmem_new_manifest_names_only_the_families_the_patch_ships) {
+// A new dir without an encoded family's files (the POI family, both files
+// gone) gets none of them, in every mode: the patch lists neither, so what
+// their sections replay to goes to the patcher's scratch dir.
+TEST(patch_lowmem_writes_no_file_of_a_family_the_new_dir_lacks) {
     ScratchDir dir("lowmem-family");
     std::mt19937 rng(20261027);
     std::vector<GeoRow> rows;
@@ -2116,10 +2095,7 @@ TEST(patch_lowmem_new_manifest_names_only_the_families_the_patch_ships) {
     const LowMemCase c{dir.path(), "removed-family"};
     REQUIRE(prepare(c, old_d, new_d).empty());
 
-    CHECK(apply_both_modes(c).empty());
-    auto r = run_tool({GEOCODER_GC_BIN, "decode", c.dir("out.sync"), c.dir("out.dec")}, c.log());
-    CHECK(r.ok);
-    CHECK(r.ok && read_dir(c.dir("out.dec")) == gctest::as_written(new_d));
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
 // A new set with part of an encoded family is refused, in every mode: a
@@ -2168,10 +2144,10 @@ TEST(patch_lowmem_refuses_a_new_set_with_part_of_a_family) {
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
-// A MATCH run longer than what is left of the old file is refused in the
-// low-memory mode too: the last run of POI records (replayed with their
-// child), 5 longer, as the plain replay refuses it; of their vertices (the
-// child stream, which the records size), as bytes past the last record.
+// A MATCH run longer than what is left of the old file is refused in every
+// mode: the last run of POI records (replayed with their child), 5 longer;
+// of their vertices (the child stream, which the records size), as bytes
+// past the last record.
 TEST(patch_lowmem_refuses_a_match_run_past_the_old_file) {
     ScratchDir dir("lowmem-match");
     std::mt19937 rng(20261027);
@@ -2204,9 +2180,9 @@ TEST(patch_lowmem_refuses_a_match_run_past_the_old_file) {
         const std::string patch = c.dir(e.name + ".gcpatch");
         REQUIRE(write_patch(c, patch, longer));
 
-        CHECK(not_refused(c, ENCODED_MODES, patch, e.name, e.refusal).empty());
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
     }
-    CHECK(apply_both_modes(c).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
 // A merge of an encoded family's parent at a stride other than its records'
@@ -2264,7 +2240,7 @@ TEST(patch_lowmem_refuses_a_parent_stride_other_than_its_records) {
 
 // The street ways' merge (MATCH, REPLACE and INSERT runs, replayed with their
 // nodes) with a run's count 2^30 past the patch's, or the merge sequence's or
-// the nodes section's length 2^32 past it, is refused, in sync and --threads.
+// the nodes section's length 2^32 past it, is refused in every mode.
 // A 32-bit size_t wraps 12 x 2^30 and 2^32 to nothing: the lengths read as the
 // patch's, and a run sized as the patch's replayed its records one by one past
 // it.
@@ -2333,9 +2309,9 @@ TEST(patch_lowmem_refuses_counts_and_lengths_that_wrap_32_bits) {
         const std::string patch = c.dir(e.name + ".gcpatch");
         REQUIRE(write_patch(c, patch, edited));
 
-        CHECK(not_refused(c, ENCODED_MODES, patch, e.name, e.refusal).empty());
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
     }
-    CHECK(apply_both_modes(c).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
 // The POI replay copies an old block only for a new record at its old
@@ -2402,7 +2378,7 @@ TEST(patch_encodes_the_poi_blocks_it_cannot_copy) {
         const std::string patch = c.dir(std::string(name) + ".gcpatch"), out = c.dir(std::string("out.") + name);
         REQUIRE(write_patch(c, patch, edited));
         std::filesystem::remove_all(out);
-        const auto r = run_tool(patch_words(c, "plain", patch, out), c.log());
+        const auto r = run_tool(patch_words(c, "sync", patch, out), c.log());
         CHECK(r.ok);
         for (const char* f : {"poi_records.bin", "poi_vertices.bin"}) CHECK(read_file(out + "/" + f) == want.at(f));
         if (gctest::failures() > failures_before) std::printf("    in the %s day\n", name);
@@ -2775,8 +2751,7 @@ TEST(patch_refuses_an_old_side_file_the_builder_would_not_write) {
     std::vector<char> file = read_file(c.dir("old") + "/way_parents.bin");
     REQUIRE(!file.empty() && file[0] == 0);
     file[0] = 2;
-    // (The encoded set's file is the old dir's or a copy of it.)
-    for (const char* set : {"old", "old.enc"}) REQUIRE(write_file(c.dir(set) + "/way_parents.bin", file));
+    REQUIRE(write_file(c.dir("old") + "/way_parents.bin", file));
 
     CHECK(not_refused(c, ALL_MODES, c.patch(), "mode-byte", "Malformed way_parents.bin: block 0 is neither FOR nor a dictionary").empty());
 }
@@ -2803,13 +2778,10 @@ TEST(patch_refuses_old_way_files_the_builder_would_not_write) {
     const std::vector<char> rows = read_file(c.dir("old") + "/street_ways.bin"), nodes = read_file(c.dir("old") + "/street_nodes.bin");
     // Three groups' rows, 12 bytes and 8 a way, and the footer.
     REQUIRE(rows.size() == 2 * (12 + 16 * 8) + (12 + 8 * 8) + 8 && nodes.size() > 16);
-    // (The encoded set's files are the old dir's or copies of them.)
     auto put = [&](const char* name, const std::optional<std::vector<char>>& bytes) {
-        for (const char* set : {"old", "old.enc"}) {
-            const std::string path = c.dir(set) + "/" + name;
-            std::filesystem::remove(path);
-            if (bytes) REQUIRE(write_file(path, *bytes));
-        }
+        const std::string path = c.dir("old") + "/" + name;
+        std::filesystem::remove(path);
+        if (bytes) REQUIRE(write_file(path, *bytes));
     };
     std::vector<char> moved = rows, cut = nodes;
     moved[12 + 16 * 8]++;
@@ -2858,13 +2830,10 @@ TEST(patch_refuses_old_address_files_the_builder_would_not_write) {
     for (const char* name : names) written[name] = read_file(c.dir("old") + "/" + name);
     // One superblock's row, 16 bytes and 6 a block, and the footer.
     REQUIRE(written["addr_index.bin"].size() == 16 + 3 * 6 + 8 && written["addr_vertices.bin"].size() > 16);
-    // (The encoded set's files are the old dir's or copies of them.)
     auto put = [&](const std::string& name, const std::optional<std::vector<char>>& bytes) {
-        for (const char* set : {"old", "old.enc"}) {
-            const std::string path = c.dir(set) + "/" + name;
-            std::filesystem::remove(path);
-            if (bytes) REQUIRE(write_file(path, *bytes));
-        }
+        const std::string path = c.dir("old") + "/" + name;
+        std::filesystem::remove(path);
+        if (bytes) REQUIRE(write_file(path, *bytes));
     };
     std::vector<char> moved = written["addr_index.bin"], flagged = written["addr_points.bin"], cut = written["addr_vertices.bin"];
     std::vector<char> past = written["addr_vertices.bin"];
@@ -3660,13 +3629,10 @@ TEST(patch_refuses_a_stale_old_string_tier) {
     new_d["strings_core.bin"].assign(new_pool.begin(), new_pool.end());
     const LowMemCase c{dir.path(), "stale"};
     REQUIRE(prepare(c, old_d, new_d).empty());
-    // The old dir's tier and the encoded set's (a link to it, or a copy):
-    // whether both were written.
+    // The old dir's tier: whether it was written.
     auto put_old_pool = [&](const std::string& pool) {
         const std::vector<uint8_t> f = string_files::encode(pool.data(), pool.size());
-        const char* p = reinterpret_cast<const char*>(f.data());
-        return write_file(c.dir("old") + "/strings_core.bin", p, f.size()) &&
-               write_file(c.dir("old.enc") + "/strings_core.bin", p, f.size());
+        return write_file(c.dir("old") + "/strings_core.bin", reinterpret_cast<const char*>(f.data()), f.size());
     };
     std::string letter = old_pool, fewer = old_pool;
     letter[3] = 'E';
@@ -3688,11 +3654,9 @@ TEST(patch_refuses_a_stale_old_string_tier) {
         f.back() = '3';  // FCC3
         const char* p = reinterpret_cast<const char*>(f.data());
         REQUIRE(write_file(c.dir("old") + "/strings_core.bin", p, f.size()));
-        REQUIRE(write_file(c.dir("old.enc") + "/strings_core.bin", p, f.size()));
         CHECK(not_refused(c, ALL_MODES, c.patch(), "not-fcc2", "Malformed old strings_core.bin: no FCC2 footer").empty());
     }
     REQUIRE(unlink((c.dir("old") + "/strings_core.bin").c_str()) == 0);
-    REQUIRE(unlink((c.dir("old.enc") + "/strings_core.bin").c_str()) == 0);
     CHECK(not_refused(c, ALL_MODES, c.patch(), "missing", stale + " (missing)").empty());
     REQUIRE(put_old_pool(old_pool));
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
@@ -3717,12 +3681,12 @@ TEST(patch_refuses_a_frame_declaring_content_past_32_bits) {
     CHECK(logged(r, sizeof(size_t) > 4 ? "Bad magic" : "Failed to decompress"));
 }
 
-// An option other than --threads (a staged apply's --only, on an encoded
-// installed set among them) is refused before anything is written.
+// An option other than --threads (a staged apply's --only among them) is
+// refused before anything is written.
 TEST(patch_refuses_an_unknown_option) {
     ScratchDir dir("patch-option");
     const std::string& root = dir.path();
-    REQUIRE(write_dir(root + "/cur", {{"gc.manifest", {}}}));
+    REQUIRE(write_dir(root + "/cur", {}));
     REQUIRE(write_file(root + "/p.gcpatch", std::vector<char>{'n', 'o', 't'}));
 
     auto r = run_tool({GEOCODER_PATCH_BIN, root + "/cur", root + "/p.gcpatch", "-o", root + "/out", "--only", "street_ways.bin"},
@@ -3750,8 +3714,8 @@ TEST(patch_creates_the_output_dir_as_named) {
 
 // An output dir that holds a file already is refused before anything is
 // written, so no output can be a current file (a hard link or a symlink to
-// one, in a plain or an encoded set) and the current set keeps its bytes;
-// and so is the current dir itself.
+// one) and the current dir keeps its bytes; and so is the current dir
+// itself.
 TEST(patch_refuses_an_output_dir_holding_files) {
     ScratchDir dir("patch-alias");
     const std::string& root = dir.path();
@@ -3764,13 +3728,14 @@ TEST(patch_refuses_an_output_dir_holding_files) {
     REQUIRE(prepare(c, {{"way_parents.bin", parents}, {"meta.json", {'{', '}'}}},
                     {{"way_parents.bin", changed}, {"meta.json", {'{', ' ', '}'}}}).empty());
     struct Alias {
-        std::string cur, name;
+        std::string name;
         bool symlink;
     };
+    const std::string cur = c.dir("old");
     int n = 0;
-    for (const Alias& a : {Alias{"old", "meta.json", false}, Alias{"old", "way_parents.bin", true},
-                           Alias{"old.enc", "way_parents.bin", false}, Alias{"old.enc", "gc.manifest", true}}) {
-        const std::string cur = c.dir(a.cur), out = root + "/out" + std::to_string(n++);
+    for (const Alias& a : {Alias{"meta.json", false}, Alias{"meta.json", true}, Alias{"way_parents.bin", false},
+                           Alias{"way_parents.bin", true}}) {
+        const std::string out = root + "/out" + std::to_string(n++);
         std::filesystem::create_directories(out);
         if (a.symlink) std::filesystem::create_symlink(cur + "/" + a.name, out + "/" + a.name);
         else std::filesystem::create_hard_link(cur + "/" + a.name, out + "/" + a.name);
@@ -3782,13 +3747,13 @@ TEST(patch_refuses_an_output_dir_holding_files) {
         CHECK(logged(r, "Output dir is not empty"));
         CHECK(read_dir(cur) == before);
     }
-    const BuildDir before = read_dir(c.dir("old.enc"));
+    const BuildDir before = read_dir(cur);
 
-    auto r = run_tool({GEOCODER_PATCH_BIN, c.dir("old.enc"), c.patch(), "-o", c.dir("old.enc")}, c.log());
+    auto r = run_tool({GEOCODER_PATCH_BIN, cur, c.patch(), "-o", cur}, c.log());
 
     CHECK(!r.ok);
     CHECK(logged(r, "Output dir must differ from the current dir"));
-    CHECK(read_dir(c.dir("old.enc")) == before);
+    CHECK(read_dir(cur) == before);
 }
 
 // A TMPDIR too small for the decompressed patch fails the run with an error
@@ -4458,33 +4423,6 @@ TEST(patch_heap_stays_flat_as_rings_change) {
         return patch_holds(c, section_head(PatchFileId::ADMIN_RINGS, 1, old_size, new_size),
                            "merge of " + std::to_string(n) + " edited rings");
     }, 20000).empty());
-}
-
-// The low-memory admin family (layout B of admin_vertices.bin) is gone: an
-// encoded set whose gc.manifest names it is refused by the patcher in either
-// encoded mode and by geocoder-gc's decode, never read as a set without it.
-// The parent took the family, and applied the patch beside it.
-TEST(patch_lowmem_refuses_a_manifest_naming_the_admin_family) {
-    ScratchDir dir("lowmem-admin-family");
-    std::mt19937 rng(20261103);
-    BuildDir old_d, new_d;
-    put_addr_family(old_d, rng, 40);
-    put_addr_family(new_d, rng, 40);
-    const LowMemCase c{dir.path(), "admin-family"};
-    REQUIRE(prepare(c, old_d, new_d).empty());
-    const std::string manifest = c.dir("old.enc") + "/gc.manifest";
-    const std::vector<char> was = read_file(manifest);
-    std::string text(was.begin(), was.end());
-    const size_t at = text.find("gc.families "), end = text.find('\n', at);
-    REQUIRE(at != std::string::npos && end != std::string::npos);
-    text.insert(end, ",admin");
-    REQUIRE(write_file(manifest, std::vector<char>(text.begin(), text.end())));
-    const std::string refusal = "unknown family admin in gc.manifest";
-
-    CHECK(not_refused(c, ENCODED_MODES, c.patch(), "admin-family", refusal).empty());
-    const ToolRun decoded = run_tool({GEOCODER_GC_BIN, "decode", c.dir("old.enc"), c.dir("old.dec")}, c.log());
-    CHECK(!decoded.ok);
-    CHECK(logged(decoded, refusal));
 }
 
 // v14's parent-id remap is its street leg alone: one carrying v13's three

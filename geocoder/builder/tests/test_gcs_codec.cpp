@@ -1,6 +1,6 @@
-// Unit tests for the low-memory mode's in-process codecs (tools/gcs_codec.h):
+// Unit tests for the patcher's in-process codecs (tools/gcs_codec.h):
 // today's-format bytes written to an encoder in odd-sized pieces decode back
-// byte for byte, and malformed encoded sets fail with an error instead of
+// byte for byte, and malformed encoded files fail with an error instead of
 // decoding wrong bytes or exhausting memory.
 #include "gcs_codec.h"
 
@@ -41,13 +41,11 @@ void write_in_pieces(Encoder& enc, int port, const std::vector<uint8_t>& bytes, 
     write_in_pieces(enc, port, bytes.data(), bytes.size(), rng, max_piece);
 }
 
-// Every port closed and pumped, then the manifest.
-Manifest finish_all(Encoder& enc) {
+// Every port closed and pumped, then the encoder finished.
+void finish_all(Encoder& enc) {
     for (auto& s : enc.state) s = 2;
     enc.pump();
-    Manifest m;
-    enc.finish(m);
-    return m;
+    enc.finish();
 }
 
 // The decoder's bytes per port, decoded to the end.
@@ -1465,8 +1463,7 @@ int writer_case(int mode, const std::string& dir) {
             enc.state[0] = 1;
             enc.write(0, v.data(), v.size() * 4);
             enc.state[0] = 2;
-            Manifest m;
-            enc.finish(m);
+            enc.finish();
         } else {  // a writer whose finish() fails (1), or whose put() fails writing straight through (2)
             Writer w(file, 48 << 10);
             std::vector<uint8_t> bytes(mode == 1 ? 40000 : 100000);

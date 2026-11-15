@@ -45,6 +45,13 @@ def tools_the_unit_tests_run(cmake=None):
     return set(depends.group(1).split()) | set(re.findall(r"\$<TARGET_FILE:([\w-]+)>", cmake))
 
 
+# The targets the nightly's build can make: its executables and libraries.
+def targets_the_build_makes():
+    with open(os.path.join(HERE, "..", "CMakeLists.txt")) as f:
+        cmake = without_sanitizer_block(f.read())
+    return set(re.findall(r"^\s*add_(?:executable|library)\(([\w-]+)", cmake, re.M))
+
+
 # The words of the nightly's apt-get install command, its continued lines too.
 def nightly_packages():
     with open(os.path.join(WORKFLOWS, "geocoder-build.yml")) as f:
@@ -67,6 +74,12 @@ class ToolsCacheTest(unittest.TestCase):
 
     def test_the_cache_holds_the_unit_tests(self):
         self.assertIn("geocoder-tests", cached_tools())
+
+    # ci_build_tools.sh hands make every cached tool by name, so one the build
+    # has no target for fails the night's compile, which PR CI, building its
+    # own targets, wouldn't show.
+    def test_the_build_makes_every_cached_tool(self):
+        self.assertEqual(cached_tools() - targets_the_build_makes(), set())
 
     def test_a_sanitizer_only_tool_needs_no_cache_entry(self):
         cmake = "\n".join([

@@ -85,11 +85,10 @@ KernelCopy copy_in_kernel(uint64_t off, uint64_t n, CopyAt copy_at, const std::s
     return c;
 }
 
-// Low-memory mode (an encoded installed set): an old file may be produced in
-// process by its family's decoder. A StreamSource reads front to back;
-// read() returns at least one byte unless the stream is done.
-// stream_source_factory(), when set, hands one back for a virtual path
-// (nullptr for a real file).
+// An old file of an encoded family is produced in process by its family's
+// decoder. A StreamSource reads front to back; read() returns at least one
+// byte unless the stream is done. stream_source_factory(), when set, hands
+// one back for a virtual path (nullptr for a real file).
 struct StreamSource {
     virtual ~StreamSource() = default;
     virtual size_t read(char* dst, size_t max) = 0;

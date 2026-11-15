@@ -454,8 +454,7 @@ Result replay(const char* P, size_t patch_size, size_t pos, size_t seq_end, cons
     if (child.written != child.new_size) throw std::runtime_error("Rebuilt poi_vertices.bin does not match the new build");
     r.vertex_bytes = child.written;
     if (old.finish() != old_vertices_hash) throw std::runtime_error("Old poi_vertices.bin is not the one the patch was made from");
-    gcs::Manifest m;
-    enc.finish(m);
+    enc.finish();
     for (int p = 0; p < 2; p++) {
         r.decode_peaks[p] = vd ? vd->peak(p) : 0;
         r.encode_peaks[p] = enc.peak(p);

@@ -35,8 +35,8 @@ struct Decoder {
         : out(port_files.size()), state(port_files.size(), 0), drop(port_files.size(), 0), name(n), files(std::move(port_files)) {}
     virtual ~Decoder() = default;
     virtual bool step() = 0;  // emits the next unit; false at the end
-    // The decoded file's size when the manifest gives it, else ~0.
-    virtual uint64_t decoded_size(int) const { return ~0ull; }
+    // The decoded size of a port's file, from the footers alone.
+    virtual uint64_t decoded_size(int port) const = 0;
     inline void emit(int port, const void* p, size_t n) {
         if (state[size_t(port)] != 2) out[size_t(port)].push(p, n);
     }
@@ -118,8 +118,8 @@ struct Encoder {
     explicit Encoder(const std::string& n, const std::string& od, int ports)
         : in(size_t(ports)), state(size_t(ports), 0), got(size_t(ports), 0), expect(size_t(ports), ~0ull), name(n), out_dir(od) {}
     virtual ~Encoder() = default;
-    virtual void pump() = 0;               // processes every complete unit
-    virtual void finish(Manifest& m) = 0;  // every port closed and pumped
+    virtual void pump() = 0;    // processes every complete unit
+    virtual void finish() = 0;  // every port closed and pumped
     // Optional: processes complete units straight from the writer's bytes (the port's queue is
     // empty); returns the bytes taken.
     virtual size_t consume(int, const uint8_t*, size_t) { return 0; }
@@ -289,7 +289,7 @@ struct Enc : Encoder {
             W.pop(kind.stride);
         }
     }
-    void finish(Manifest&) override {
+    void finish() override {
         require_empty();
         files.finish();
         const auto ways_footer = files.ways_footer();
@@ -420,7 +420,7 @@ struct Enc : Encoder {
     void pump() override {
         if (in[0].size()) in[0].pop(consume(0, in[0].data(), in[0].size()));
     }
-    void finish(Manifest&) override {
+    void finish() override {
         require_empty();
         if (carried) die("%s: the stream ends %zu bytes into a value", file.c_str(), carried);
         blocks.finish();
@@ -668,7 +668,7 @@ struct Enc : Encoder {
             P.pop(af::LOGICAL_STRIDE);
         }
     }
-    void finish(Manifest&) override {
+    void finish() override {
         require_empty();
         if (const uint64_t owed = files.escape_owed())
             die("%s: the stream ends %llu bytes before its last footprint does", af::VERTICES_FILE, (unsigned long long)owed);
@@ -690,8 +690,8 @@ struct Enc : Encoder {
 }  // namespace addr
 
 // ------------------------------------------------------------------ POI R2 + V2
-// The POI files are R2 and V2 (poi_files.h) in every dir, not only an encoded set: these codecs
-// turn them into today's logical records and vertex stream for the replay and back.
+// The POI files are R2 and V2 (poi_files.h) in every dir: these codecs turn them into today's
+// logical records and vertex stream for the replay and back.
 namespace poi {
 // Vertices a step decodes or packs of a block too large to take whole: a multiple of 8, so each
 // piece's bits start on a byte.
@@ -965,7 +965,7 @@ struct Enc : Encoder {
             raw.reset(new Writer(O->fd, opath, big_start + poi_files::MAX_BLOCK_HEADER, PLANE_BUF));
         }
     }
-    void finish(Manifest&) override {
+    void finish() override {
         require_empty();
         if (big) die("poi_vertices: stream ends inside a block");
         const std::vector<uint8_t> t = rows.tail(logical);
@@ -1135,7 +1135,7 @@ struct Enc : Encoder {
             q.pop(pf::LOGICAL_STRIDE);
         }
     }
-    void finish(Manifest&) override {
+    void finish() override {
         require_empty();
         if (carried) die("places: the stream ends %zu bytes into a row", carried);
         enc.finish();
