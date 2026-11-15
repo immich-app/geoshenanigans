@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <functional>
 #include <random>
 #include <string>
@@ -189,7 +190,8 @@ TEST(string_files_encoder_writers_and_pieces_write_one_file) {
     CHECK(read("built.bin") == want);
     CHECK(read("patched.bin") == want);
     CHECK(read("put.bin") == want);
-    CHECK(read("patched.table").empty());  // the spill is gone
+    CHECK(!std::filesystem::exists(dir.path() + "/patched.table"));  // the spill is gone
+    CHECK(!std::filesystem::exists(dir.path() + "/put.table"));
     // The empty pool is the footer alone.
     CHECK(encode("") == hex("0000000000000000" "46434332"));
     CHECK(decode(hex("0000000000000000" "46434332")).empty());
