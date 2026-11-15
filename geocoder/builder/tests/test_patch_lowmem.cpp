@@ -5899,7 +5899,8 @@ TEST(patch_refuses_merge_sequences_the_way_replay_cannot_apply) {
     std::vector<char> grown = s.merges(every_way, every_node);
     put_at(grown, grown.size() - (56 + every_node.size()) + 16, uint64_t{nodes.size() + 8});
     std::vector<char> twice = s.merges(every_way, every_node);
-    twice.insert(twice.end(), twice.begin(), twice.end());
+    const std::vector<char> duplicate = twice;
+    twice.insert(twice.end(), duplicate.begin(), duplicate.end());
 
     struct Edit {
         std::string name;
