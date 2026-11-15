@@ -801,7 +801,9 @@ TEST(patch_rebuilds_the_builders_poi_files_on_random_days) {
             for (uint32_t k = 0; k < vc; k++) {
                 const size_t at = b.size();
                 if (closed && k + 1 == vc) {
-                    b.insert(b.end(), b.begin() + 10, b.begin() + 10 + (e == 3 ? 8 : 4));
+                    // The first vertex again, through a copy: insert takes no range of its own vector.
+                    const std::vector<char> first(b.begin() + 10, b.begin() + 10 + (e == 3 ? 8 : 4));
+                    b.insert(b.end(), first.begin(), first.end());
                     continue;
                 }
                 b.resize(at + (e == 3 ? 8 : 4));
@@ -955,6 +957,13 @@ TEST(patch_copies_the_poi_blocks_a_day_leaves_whole) {
     const BuildDir old_d = dir_of(old_day), new_d = dir_of(new_day);
     const LowMemCase c{dir.path(), "copy"};
     REQUIRE(prepare(c, old_d, new_d).empty());
+    // Every mode's own counts. The polygons kept at their place are copied
+    // (the one past big_block() too) but for those the vertex merge resyncs
+    // on past an edit before them (their first bytes go as the patch's), and
+    // the others are encoded. The old vertex bytes the encoded polygons keep
+    // come from the old block the replay is at, or from one it passed just
+    // before (where the vertex merge matched a few), none through the vertex
+    // cursor.
     uint64_t copied = 0, encoded = 0, at_hand = 0, by_cursor = 0;
     const LogCheck counts = [&](const std::string& log) {
         const size_t at = log.find("replayed with poi_records.bin: blocks ");
@@ -964,25 +973,22 @@ TEST(patch_copies_the_poi_blocks_a_day_leaves_whole) {
                         " at hand, %" SCNu64 " by the cursor",
                         &copied, &encoded, &at_hand, &by_cursor) != 4)
             return std::string("no block counts in the log");
+        const std::string got = std::to_string(copied) + " copied, " + std::to_string(encoded) + " encoded, " +
+                                std::to_string(at_hand) + " old vertex bytes at hand, " + std::to_string(by_cursor) + " by the cursor";
+        if (copied > kept_in_place || copied * 10 < uint64_t(kept_in_place) * 9)
+            return "not nine in ten of the " + std::to_string(kept_in_place) + " polygons kept in place copied: " + got;
+        if (encoded <= 30) return "30 polygons or fewer encoded: " + got;
+        if (at_hand == 0) return "no old vertex bytes at hand: " + got;
+        if (by_cursor != 0) return "old vertex bytes read through the cursor: " + got;
         return std::string();
     };
     CHECK(apply_modes(c, ALL_MODES, counts).bad.empty());
     const BuildDir want = gctest::as_written(new_d);
     for (const std::string& mode : ALL_MODES)
         for (const char* f : {"poi_records.bin", "poi_vertices.bin"}) CHECK(read_file(c.dir("out." + mode) + "/" + f) == want.at(f));
-    // The polygons kept at their place are copied (the one past big_block()
-    // too) but for those the vertex merge resyncs on past an edit before
-    // them (their first bytes go as the patch's), and the others are encoded.
     std::printf("    %u polygons kept in place: %" PRIu64 " copied, %" PRIu64 " encoded; old vertex bytes %" PRIu64
-                " at hand, %" PRIu64 " by the cursor\n",
+                " at hand, %" PRIu64 " by the cursor (the last mode's)\n",
                 kept_in_place, copied, encoded, at_hand, by_cursor);
-    CHECK(copied <= kept_in_place && copied * 10 >= uint64_t(kept_in_place) * 9);
-    CHECK(encoded > 30);
-    // The old vertex bytes the encoded polygons keep come from the old block
-    // the replay is at, or from one it passed just before (where the vertex
-    // merge matched a few), none through the vertex cursor.
-    CHECK(at_hand > 0);
-    CHECK_EQ(by_cursor, uint64_t(0));
 
     // A byte flipped in the kept big polygon's block (record 200's, the first
     // vertex past its header): copied, and refused by the hash.

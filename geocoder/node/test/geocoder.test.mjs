@@ -62,7 +62,7 @@ function adminIndex(cell, id) {
 // front-coded in buckets cut by content, the bucket table and the footer after them.
 function fcc2(strings) {
   const fnv = (b) => {
-    let h = 0xcbf29ce484222325n;
+    let h = 1469598103934665603n;
     for (const c of b) h = ((h ^ BigInt(c)) * 0x100000001b3n) & 0xffffffffffffffffn;
     return h;
   };

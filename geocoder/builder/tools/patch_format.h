@@ -1086,6 +1086,15 @@ static constexpr size_t TABLE_DIRECTORY_KEYS = 4096;
 // 8 KiB of them, each a u16 count of directory keys.
 static constexpr size_t TABLE_BUCKETS = 4096;
 static_assert(TABLE_DIRECTORY_KEYS <= UINT16_MAX, "a bucket counts the directory's keys in a u16");
+// Whether bucket b is past the last of a table's `counts` running bucket
+// counts (one more than its buckets; none for a table of no keys), so that
+// no directory key lies in it. Not b + 1 >= counts: the bucket of
+// UINT32_MAX under a shift of 0 is the largest Index where size_t is 32
+// bits, and b + 1 wraps to 0 there.
+template <typename Index>
+constexpr bool past_last_bucket(Index b, size_t counts) {
+    return counts == 0 || b >= counts - 1;
+}
 // A SortedTable's key filter: 2^15 bits, 4 KiB. A normal day's tables (90
 // moved strings, a parent id or two) set under 1% of them, so nearly every
 // lookup in them ends at the filter.
@@ -1194,7 +1203,7 @@ private:
         // key's, and of its own up to key. A key past the last bucket is
         // above them all.
         const size_t b = bucket_of(key);
-        const size_t d = b + 1 >= buckets_.size()
+        const size_t d = past_last_bucket(b, buckets_.size())
             ? directory_.size()
             : static_cast<size_t>(std::upper_bound(directory_.begin() + buckets_[b], directory_.begin() + buckets_[b + 1], key) -
                                   directory_.begin());

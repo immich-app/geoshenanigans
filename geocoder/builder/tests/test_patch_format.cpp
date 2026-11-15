@@ -1719,6 +1719,33 @@ TEST(patch_format_sorted_table_floors_keys_crowded_into_few_buckets_or_at_bucket
     CHECK_EQ(wrong, size_t(0));
 }
 
+TEST(patch_format_sorted_table_floors_the_largest_key_whatever_size_t_holds) {
+    // Tables whose buckets are one key wide (a shift of 0), probed with the
+    // largest key: its bucket is past them all.
+    const std::vector<char> none;
+    CHECK_EQ(pair_table(none).floor(UINT32_MAX), size_t(0));
+    CHECK_EQ(SortedTable<RemapPair>().floor(UINT32_MAX), size_t(0));
+    const std::vector<char> zero = complement_pair_bytes({0});
+    CHECK_EQ(pair_table(zero).floor(UINT32_MAX), size_t(0));
+    CHECK_EQ(pair_table(zero).floor(0), size_t(0));
+    const std::vector<char> few = complement_pair_bytes({0, 1, 2});
+    CHECK_EQ(pair_table(few).floor(UINT32_MAX), size_t(2));
+    CHECK(!pair_table(few).find(UINT32_MAX));
+
+    // The bound itself, with the bucket held in 32 bits as a 32-bit size_t
+    // holds it: the largest bucket is past any table's, where b + 1 would
+    // wrap to bucket 0.
+    CHECK(past_last_bucket<uint32_t>(UINT32_MAX, 2));
+    CHECK(past_last_bucket<uint32_t>(UINT32_MAX, 4097));
+    CHECK(past_last_bucket<uint32_t>(UINT32_MAX, 0));
+    CHECK(past_last_bucket<uint32_t>(0, 0));
+    CHECK(past_last_bucket<uint32_t>(1, 2));
+    CHECK(!past_last_bucket<uint32_t>(0, 2));
+    CHECK(!past_last_bucket<uint32_t>(4095, 4097));
+    CHECK(past_last_bucket<uint32_t>(4096, 4097));
+    CHECK(past_last_bucket<size_t>(SIZE_MAX, 2));
+}
+
 TEST(patch_format_scratch_table_refuses_a_key_out_of_order_or_twice) {
     // The last case steps back past the first buffer, which went to the file.
     std::vector<uint32_t> many(3 * SCRATCH_TABLE_BUF / sizeof(RemapPair));
