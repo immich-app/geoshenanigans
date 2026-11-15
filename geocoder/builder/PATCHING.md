@@ -504,7 +504,9 @@ Old file hash: marker 0xFFFFFFF8 (u32) + file_id (u32) + lane_hash of the
   before, it was the old poi_vertices.bin's alone and had no file id.) One
   for each file a replay copies from without decoding it, when the old dir
   holds the file and its family has a section: `poi_vertices.bin` (15),
-  right before the POI records' section of a dir with POI files. The patcher
+  right before the POI records' section of a dir with POI files, and
+  `addr_vertices.bin` (28), right before the address points' section of a
+  dir with address points. The patcher
   refuses a second hash of a file, a hash of any other file, and a replay
   without the hash it checks by; a hash whose replay does not run (both of
   the family's sections unchanged, or an old file without records) is read
@@ -533,6 +535,19 @@ Old file hash: marker 0xFFFFFFF8 (u32) + file_id (u32) + lane_hash of the
   as it passes them and refuses one of another hash ("Old street_nodes.bin
   is not the one the patch was made from"), and a pair it would replay
   without both hashes.
+  The address points and their footprints replay the same way on the address
+  files as they sit (`tools/addr_replay.h`), whenever one of their two
+  sections changes (the other then reads as one MATCH of all of it): a new
+  record that is the old record at its place (a MATCH or a REPLACE of it)
+  with its lat, lng and vertex count, whose footprint is one MATCH of the old
+  blob's logical bytes, gets that blob as it is (a blob is a function of its
+  footprint and its record's lat and lng alone), an escape in pieces; every
+  other footprint is encoded again, its old bytes decoded from the old blob
+  the replay is at, from one it passed last, or by a second decoder of the
+  old files; and every block is decoded and encoded again (its ids move).
+  The replay hashes the old `addr_vertices.bin` as it passes it and refuses
+  one of another hash ("Old addr_vertices.bin is not the one the patch was
+  made from"), and address points without the hash before them.
 
 Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64) + ...
   (the patcher refuses an old file of another size, 0 meaning absent)

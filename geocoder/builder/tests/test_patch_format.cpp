@@ -393,6 +393,10 @@ TEST(patch_format_hashed_old_files_are_the_ones_a_replay_copies_unread) {
     for (const PatchFileId way_file : {PatchFileId::STREET_WAYS, PatchFileId::STREET_NODES, PatchFileId::INTERP_WAYS, PatchFileId::INTERP_NODES})
         CHECK(is_hashed_old_file(static_cast<uint32_t>(way_file)));
     CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::POI_RECORDS)));
+    // addr_vertices.bin's blobs are copied undecoded; the blocks of
+    // addr_points.bin are decoded, and addr_index.bin is checked against them.
+    CHECK(is_hashed_old_file(static_cast<uint32_t>(PatchFileId::ADDR_VERTICES)));
+    CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::ADDR_POINTS)));
     CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::STRINGS)));
     CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::COUNT)));
     CHECK(!is_hashed_old_file(OLD_FILE_HASH_MARKER));

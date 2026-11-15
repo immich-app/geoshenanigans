@@ -754,15 +754,15 @@ static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 // An old file's hash: marker(4), file id (u32), lane_hash of the file as the
 // old dir holds it (u64), before the section of the file's parent records. A
 // replay that copies bytes of an old file without decoding them checks them
-// by it: the POI replay (poi_replay.h) the old blocks a day leaves whole. The
-// diff sends one for each file of HASHED_OLD_FILES the old dir holds and
-// whose family has a section. The patcher refuses a second hash of a file, a
-// hash of any other file, and a replay without the hash it checks by; a hash
-// whose replay does not run (both of the family's sections unchanged, or an
-// old file without records) is read and checks nothing.
-// A way replay (way_replay.h) copies the node blocks of the groups a day
-// leaves whole and takes their rows' anchors, counts and codes as they are:
-// both files of each way pair.
+// by it: the POI replay (poi_replay.h) the old blocks a day leaves whole, the
+// way replay (way_replay.h) the node blocks of the groups a day leaves whole
+// and their rows' anchors, counts and codes (both files of each way pair),
+// the address replay (addr_replay.h) the old footprint blobs. The diff sends
+// one for each file of HASHED_OLD_FILES the old dir holds and whose family
+// has a section. The patcher refuses a second hash of a file, a hash of any
+// other file, and a replay without the hash it checks by; a hash whose replay
+// does not run (both of the family's sections unchanged, or an old file
+// without records) is read and checks nothing.
 static constexpr uint32_t OLD_FILE_HASH_MARKER = 0xFFFFFFF8;
 static constexpr PatchFileId HASHED_OLD_FILES[] = {
     PatchFileId::POI_VERTICES,
@@ -770,6 +770,7 @@ static constexpr PatchFileId HASHED_OLD_FILES[] = {
     PatchFileId::STREET_NODES,
     PatchFileId::INTERP_WAYS,
     PatchFileId::INTERP_NODES,
+    PatchFileId::ADDR_VERTICES,
 };
 inline bool is_hashed_old_file(uint32_t fid) {
     return std::find(std::begin(HASHED_OLD_FILES), std::end(HASHED_OLD_FILES), static_cast<PatchFileId>(fid)) !=
