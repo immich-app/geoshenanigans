@@ -160,8 +160,13 @@ fn damaged_blocks_and_tables_read_without_a_panic() {
                 // Keep the footer, so the file opens.
                 let at = (rng.next() % (bytes.len() as u64 - 8)) as usize;
                 bytes[at] = rng.next() as u8;
-                // The block the byte is in, or whose table entry it is in.
-                hit[if at >= table_at { (at - table_at) / 4 } else { starts.partition_point(|&s| s <= at) - 1 }] = true;
+                // The block the byte is in, or whose table entry it is in; and the block before
+                // that one, which ends where the entry says.
+                let b = if at >= table_at { (at - table_at) / 4 } else { starts.partition_point(|&s| s <= at) - 1 };
+                hit[b] = true;
+                if at >= table_at && b > 0 {
+                    hit[b - 1] = true;
+                }
             }
             let f = open(&bytes).unwrap();
             for id in 0..f.count() + 2 {
@@ -184,13 +189,13 @@ fn a_block_no_builder_writes_reads_as_no_value_where_it_has_none() {
     assert_eq!(read(&dictionary, 4), [Some(0), Some(far), Some(5), Some(far)]);
     // A base and a difference that pass 32 bits.
     assert_eq!(read(&file_of(&[for_block(u32::MAX, 1, &[0, 1])], 2), 2), [Some(u32::MAX), None]);
-    // A width past 32 bits, in either mode, with bytes for its fields.
+    // A width past 32 bits, in either mode, with the bytes its fields take.
     let mut wide = for_block(5, 33, &[]);
-    wide.extend([0; 16]);
+    wide.extend([0; 9]);
     assert_eq!(read(&file_of(&[wide], 2), 2), [None, None]);
     let mut wide = dictionary_block(&[0, far], 1, &[0, 1]);
     wide[10] = 40;
-    wide.extend([0; 16]);
+    wide.extend([0; 9]);
     assert_eq!(read(&file_of(&[wide], 2), 2), [None, None]);
     // An index past the dictionary's entries.
     assert_eq!(read(&file_of(&[dictionary_block(&[0, far, 5], 2, &[0, 1, 2, 3])], 4), 4), [Some(0), Some(far), Some(5), None]);
@@ -200,12 +205,10 @@ fn a_block_no_builder_writes_reads_as_no_value_where_it_has_none() {
     let mut neither = for_block(5, 8, &[0, 1, 2, 3]);
     neither[0] = 2;
     assert_eq!(read(&file_of(&[neither], 4), 4), [None; 4]);
-    // More values than the block has fields for: none is read from the table after it.
-    assert_eq!(
-        read(&file_of(&[for_block(5, 8, &[0, 1, 2, 3])], 9), 9),
-        [Some(5), Some(6), Some(7), Some(8), None, None, None, None, None]
-    );
-    assert_eq!(read(&file_of(&[for_block(5, 12, &[0, 1, 2, 3])], 5), 5), [Some(5), Some(6), Some(7), Some(8), None]);
+    // More values than the block has fields for: it is not the bytes its values take, and none
+    // of them reads.
+    assert_eq!(read(&file_of(&[for_block(5, 8, &[0, 1, 2, 3])], 9), 9), [None; 9]);
+    assert_eq!(read(&file_of(&[for_block(5, 12, &[0, 1, 2, 3])], 5), 5), [None; 5]);
     // A table entry at the blocks' end and past it; the next block still reads.
     let two = file_of(&[for_block(9, 0, &[]), for_block(5, 8, &[0, 1, 2, 3])], 68);
     let table_at = 6 + 10;
@@ -217,6 +220,76 @@ fn a_block_no_builder_writes_reads_as_no_value_where_it_has_none() {
         assert_eq!(got[64..], [Some(5), Some(6), Some(7), Some(8)], "{entry}");
     }
     assert_eq!(read(&two, 68)[..64], [Some(9); 64]);
+}
+
+#[test]
+fn a_block_is_the_bytes_up_to_the_next_blocks_start_and_no_value_is_read_from_past_them() {
+    let some = |values: &[u32]| values.iter().map(|&v| Some(v)).collect::<Vec<_>>();
+    // 64 values of 9 and one of 5: two FOR blocks of no bits a value, 6 bytes each.
+    let values = [vec![9; 64], vec![5]].concat();
+    let good = file_of(&[for_block(9, 0, &[]), for_block(5, 0, &[])], 65);
+    assert_eq!(encode(&values), good);
+    assert_eq!(read(&good, 65), some(&values));
+    // The first block's width set to 1: its 64 fields would take 8 bytes, and the next block
+    // starts where they would. None is read from that block's bytes, and it still reads.
+    let mut wide = good.clone();
+    wide[5] = 1;
+    assert_eq!(open(&wide).unwrap().get(8), None);
+    assert_eq!(read(&wide, 65), [vec![None; 64], vec![Some(5)]].concat());
+
+    // A block of a byte more than its values take, or of a byte fewer, is no block, whether the
+    // next block's start ends it or the table's; the block beside it reads.
+    let ones = for_block(9, 1, &[1; 64]);
+    let four = for_block(5, 8, &[0, 1, 2, 3]);
+    assert_eq!((ones.len(), four.len()), (14, 10));
+    let (tens, from_five) = (vec![Some(10); 64], some(&[5, 6, 7, 8]));
+    assert_eq!(read(&file_of(&[ones.clone(), four.clone()], 68), 68), [tens.clone(), from_five.clone()].concat());
+    let longer = |block: &[u8]| [block, &[0u8][..]].concat();
+    let shorter = |block: &[u8]| block[..block.len() - 1].to_vec();
+    for first in [longer(&ones), shorter(&ones)] {
+        assert_eq!(read(&file_of(&[first, four.clone()], 68), 68), [vec![None; 64], from_five.clone()].concat());
+    }
+    for last in [longer(&four), shorter(&four)] {
+        assert_eq!(read(&file_of(&[ones.clone(), last], 68), 68), [tens.clone(), vec![None; 4]].concat());
+    }
+    // The same of a dictionary, its entries and its indexes.
+    let far = 1 << 28;
+    let dictionary = dictionary_block(&[7, far], 1, &[0, 1, 1, 0]);
+    assert_eq!(read(&file_of(&[dictionary.clone()], 4), 4), some(&[7, far, far, 7]));
+    for block in [longer(&dictionary), shorter(&dictionary)] {
+        assert_eq!(read(&file_of(&[block], 4), 4), [None; 4]);
+    }
+}
+
+#[test]
+fn a_dictionary_of_more_entries_than_values_or_of_indexes_of_another_width_gives_no_value() {
+    let far = 1 << 28;
+    // As many entries as the block has values, and one more.
+    assert_eq!(read(&file_of(&[dictionary_block(&[7, far], 1, &[0, 1])], 2), 2), [Some(7), Some(far)]);
+    assert_eq!(read(&file_of(&[dictionary_block(&[7, far], 1, &[1])], 1), 1), [None]);
+    // Two entries take indexes of 1 bit and three of 2. Four indexes of a bit more or fewer
+    // fill the same byte, so the block is the bytes its values take.
+    assert_eq!(read(&file_of(&[dictionary_block(&[7, far, 5], 2, &[0, 1, 2, 0])], 4), 4), [Some(7), Some(far), Some(5), Some(7)]);
+    assert_eq!(read(&file_of(&[dictionary_block(&[7, far], 2, &[0, 1, 1, 0])], 4), 4), [None; 4]);
+    assert_eq!(read(&file_of(&[dictionary_block(&[7, far, 5], 1, &[0, 1, 1, 0])], 4), 4), [None; 4]);
+    assert_eq!(read(&file_of(&[dictionary_block(&[7, far, 5], 3, &[0, 1, 2, 0])], 4), 4), [None; 4]);
+}
+
+#[test]
+fn the_first_block_starts_at_the_files_first_byte() {
+    // A byte before the blocks, and the table counting from it: the first block is none, and
+    // the one after it reads.
+    let mut shifted = vec![0xAA];
+    shifted.extend(for_block(9, 0, &[]));
+    shifted.extend(for_block(5, 8, &[0, 1, 2, 3]));
+    for entry in [1u32, 7] {
+        shifted.extend(entry.to_le_bytes());
+    }
+    shifted.extend(68u32.to_le_bytes());
+    shifted.extend(b"SDB1");
+    let got = read(&shifted, 68);
+    assert!(got[..64].iter().all(Option::is_none), "{got:?}");
+    assert_eq!(got[64..], [Some(5), Some(6), Some(7), Some(8)]);
 }
 
 #[test]

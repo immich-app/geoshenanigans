@@ -4,7 +4,7 @@
 //! dictionary, with a table of the blocks' offsets and a footer after them. A value's id is its
 //! record's, and it is read from its block in place. NO_DATA is a value like any other.
 
-use crate::coord_keys::bits_at;
+use crate::coord_keys::{bit_length, bits_at};
 use crate::FileBytes;
 
 pub const BLOCK_VALUES: usize = 64;
@@ -55,25 +55,34 @@ impl SideBlocks {
     }
 
     /// Value `id`; None past the last, and where the table or its block gives none (bytes no
-    /// builder writes).
+    /// builder writes): a block that is not the bytes from its start to the next block's, a
+    /// mode or a width no block has, a value past 32 bits, an index past the dictionary.
     pub fn get(&self, id: u32) -> Option<u32> {
         if id >= self.count {
             return None;
         }
         let file = self.bytes.as_slice();
         let (b, j) = (id as usize / BLOCK_VALUES, id as usize % BLOCK_VALUES);
-        let at = u32_at(file, self.table_at + b * TABLE_ENTRY_BYTES)? as usize;
-        // From the block's first byte to the blocks' end: its own end is not stored.
-        let block = file.get(at..self.table_at)?;
-        // Field j of the w-bit fields that start `head` bytes into the block: one 8-byte load,
-        // which the table and the footer after the blocks leave room for. None for a field past
-        // the blocks, and for a width past 32 bits.
+        let entry = self.table_at + b * TABLE_ENTRY_BYTES;
+        let at = u32_at(file, entry)? as usize;
+        // The block's values, and where it ends: BLOCK_VALUES and the next block's start, or
+        // for the last block the values left and the table's start.
+        let left = self.count as usize - b * BLOCK_VALUES;
+        let (c, end) = if left > BLOCK_VALUES { (BLOCK_VALUES, u32_at(file, entry + TABLE_ENTRY_BYTES)? as usize) } else { (left, self.table_at) };
+        // The first block starts where the file does.
+        if b == 0 && at != 0 {
+            return None;
+        }
+        let block = file.get(at..end)?;
+        // Field j of the block's c fields of w bits, which start `head` bytes into it and end
+        // where it does: one 8-byte load, which the bytes after the block (blocks, the table,
+        // the footer) leave room for. None for a block of other bytes than its head and its
+        // fields take, and for a width past 32 bits.
         let field = |head: usize, w: u32| {
-            let bit = j * w as usize;
-            if head + (bit + w as usize).div_ceil(8) > block.len() {
+            if block.len() != head + (c * w as usize).div_ceil(8) {
                 return None;
             }
-            bits_at(file.get(at + head..)?, bit, w)
+            bits_at(file.get(at + head..)?, j * w as usize, w)
         };
         match *block.first()? {
             MODE_FOR => {
@@ -81,9 +90,16 @@ impl SideBlocks {
                 u32_at(block, 1)?.checked_add(field(FOR_HEAD_BYTES, w)?)
             }
             MODE_DICTIONARY => {
+                // 1 to c entries, and indexes of the bits the last entry's takes.
                 let k = *block.get(1)? as usize;
+                if k == 0 || k > c {
+                    return None;
+                }
                 let head = 3 + 4 * k;
                 let w = *block.get(head - 1)? as u32;
+                if w != bit_length(k as u32 - 1) {
+                    return None;
+                }
                 let x = field(head, w)? as usize;
                 if x >= k {
                     return None;
@@ -98,7 +114,7 @@ impl SideBlocks {
 /// The file's bytes for `values` (fixtures and tests), the builder's encoding.
 #[cfg(any(test, feature = "fixtures"))]
 pub fn encode(values: &[u32]) -> Vec<u8> {
-    use crate::coord_keys::{bit_length, BitWriter};
+    use crate::coord_keys::BitWriter;
     let (mut blocks, mut table) = (Vec::new(), Vec::new());
     for chunk in values.chunks(BLOCK_VALUES) {
         table.extend((blocks.len() as u32).to_le_bytes());
