@@ -6148,14 +6148,14 @@ LogCheck addr_replayed_is(uint64_t copied, uint64_t encoded, uint64_t at_hand = 
     };
 }
 
-// The old addr_vertices.bin's hash section as the diff writes it for c's old
-// dir.
-std::vector<char> old_footprints_hash(const LowMemCase& c) {
-    const std::vector<char> file = read_file(c.dir("old") + "/addr_vertices.bin");
-    return old_file_hash(PatchFileId::ADDR_VERTICES, lane_hash(file.data(), file.size()));
+// The hash section of an old file as the diff writes it for c's old dir.
+std::vector<char> old_hash_section(const LowMemCase& c, PatchFileId file) {
+    const std::vector<char> bytes = read_file(c.dir("old") + "/" + patch_file_names[static_cast<uint32_t>(file)]);
+    return old_file_hash(file, lane_hash(bytes.data(), bytes.size()));
 }
 
 const char* const ADDRESS_FILES[] = {"addr_points.bin", "addr_vertices.bin", "addr_index.bin"};
+const std::string NOT_THE_PATCHS_POINTS = "Old addr_points.bin is not the one the patch was made from";
 const std::string NOT_THE_PATCHS_FOOTPRINTS = "Old addr_vertices.bin is not the one the patch was made from";
 
 // The old dir's addr_vertices.bin with the byte at `at` flipped is refused in
@@ -6390,15 +6390,17 @@ TEST(patch_copies_the_address_blobs_a_day_leaves_whole) {
     CHECK(apply_modes(c, ALL_MODES, counts).bad.empty());
 }
 
-// The old addr_vertices.bin's hash, which the diff writes once, right before
-// the address points' section. On a day that changes the points, and on one
-// that changes a footprint alone (the points sent unchanged), the address
-// replay copies old blobs unread, so in every mode a patch without the hash
-// is refused, one with a second is, and one with another hash in its place
-// ends on an old file that is not the patch's. On a day that leaves both
-// files as they are the replay does not run and the hash, sent all the same,
-// checks nothing: a patch with another in its place applies.
-TEST(patch_refuses_an_address_replay_without_the_old_footprint_files_hash) {
+// The hashes of the old addr_points.bin and addr_vertices.bin, which the diff
+// writes once each, the points' and then the footprints', right before the
+// address points' section. On a day that changes the points, and on one that
+// changes a footprint alone (the points sent unchanged), the address replay
+// copies old blobs unread under the old records' points, so in every mode a
+// patch without either hash is refused, one with a second of either is, and
+// one with another hash in the place of either ends on an old file that is
+// not the patch's. On a day that leaves both files as they are the replay
+// does not run and the hashes, sent all the same, check nothing: a patch with
+// another in the place of either applies.
+TEST(patch_refuses_an_address_replay_without_the_old_address_files_hashes) {
     ScratchDir dir("patch-addr-hash");
     std::mt19937 rng(20261118);
     std::vector<Address> addresses;
@@ -6415,6 +6417,16 @@ TEST(patch_refuses_an_address_replay_without_the_old_footprint_files_hash) {
         std::vector<Address> addresses;
         bool replayed;
     };
+    // A hashed file, what an old one of another hash is refused as, and the
+    // first word of what follows its hash in the patch: the footprints' hash
+    // after the points', the address points' section after that.
+    struct Hashed {
+        PatchFileId file;
+        std::string tag, stale;
+        uint32_t next;
+    };
+    const Hashed hashed[] = {{PatchFileId::ADDR_POINTS, "points", NOT_THE_PATCHS_POINTS, OLD_FILE_HASH_MARKER},
+                             {PatchFileId::ADDR_VERTICES, "footprints", NOT_THE_PATCHS_FOOTPRINTS, static_cast<uint32_t>(PatchFileId::ADDR_POINTS)}};
     for (const Day& day : {Day{"points", renumbered, true}, Day{"footprint", edited, true}, Day{"same", addresses, false}}) {
         BuildDir old_d, new_d;
         put_addresses(old_d, addresses);
@@ -6423,43 +6435,46 @@ TEST(patch_refuses_an_address_replay_without_the_old_footprint_files_hash) {
         REQUIRE(prepare(c, old_d, new_d).empty());
         const std::vector<char> raw = raw_patch(c);
         REQUIRE(!raw.empty());
-        const std::vector<char> made = old_footprints_hash(c);
-        const size_t at = find_once(raw, made);
-        REQUIRE(at != std::string::npos);
-        const size_t end = at + made.size();
-        // The address points' section follows it.
-        uint32_t next = 0;
-        REQUIRE(raw.size() >= end + 4);
-        memcpy(&next, raw.data() + end, 4);
-        CHECK_EQ(next, static_cast<uint32_t>(PatchFileId::ADDR_POINTS));
-
         const LogCheck replay = [&](const std::string& log) -> std::string {
             return addr_replayed(log).found == day.replayed ? "" : day.replayed ? "no address replay ran" : "the address replay ran";
         };
         CHECK(apply_modes(c, ALL_MODES, replay).bad.empty());
-        std::vector<char> another = raw, cut = raw, twice = raw;
-        another[at + 8] ^= 1;
-        cut.erase(cut.begin() + static_cast<std::ptrdiff_t>(at), cut.begin() + static_cast<std::ptrdiff_t>(end));
-        twice.insert(twice.begin() + static_cast<std::ptrdiff_t>(end), made.begin(), made.end());
-        struct Edit {
-            std::string name;
-            std::vector<char> patch;
-            std::string refusal;  // none: it applies
-        };
-        for (const Edit& e :
-             {Edit{"another", another, day.replayed ? NOT_THE_PATCHS_FOOTPRINTS : ""},
-              Edit{"cut", cut, day.replayed ? "Malformed patch: address points without the old addr_vertices.bin's hash" : ""},
-              Edit{"twice", twice, "Malformed patch: a second hash of the old addr_vertices.bin"}}) {
-            const std::string patch = c.dir(e.name + ".gcpatch");
-            REQUIRE(write_patch(c, patch, e.patch));
-            if (!e.refusal.empty()) {
-                CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
-                continue;
+        for (const Hashed& h : hashed) {
+            const std::string file = patch_file_names[static_cast<uint32_t>(h.file)];
+            const std::vector<char> made = old_hash_section(c, h.file);
+            const size_t at = find_once(raw, made);
+            if (at == std::string::npos) std::printf("    %s: no hash of the old %s\n", day.name.c_str(), file.c_str());
+            REQUIRE(at != std::string::npos);
+            const size_t end = at + made.size();
+            uint32_t next = 0;
+            REQUIRE(raw.size() >= end + 4);
+            memcpy(&next, raw.data() + end, 4);
+            CHECK_EQ(next, h.next);
+
+            std::vector<char> another = raw, cut = raw, twice = raw;
+            another[at + 8] ^= 1;
+            cut.erase(cut.begin() + static_cast<std::ptrdiff_t>(at), cut.begin() + static_cast<std::ptrdiff_t>(end));
+            twice.insert(twice.begin() + static_cast<std::ptrdiff_t>(end), made.begin(), made.end());
+            struct Edit {
+                std::string name;
+                std::vector<char> patch;
+                std::string refusal;  // none: it applies
+            };
+            for (const Edit& e : {Edit{h.tag + "-another", another, day.replayed ? h.stale : ""},
+                                  Edit{h.tag + "-cut", cut, day.replayed ? "Malformed patch: address points without the old " + file + "'s hash" : ""},
+                                  Edit{h.tag + "-twice", twice, "Malformed patch: a second hash of the old " + file}}) {
+                const std::string patch = c.dir(e.name + ".gcpatch");
+                REQUIRE(write_patch(c, patch, e.patch));
+                if (!e.refusal.empty()) {
+                    CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+                    continue;
+                }
+                REQUIRE(write_patch(c, c.patch(), e.patch));
+                const Applied a = apply_modes(c, ALL_MODES, replay);
+                if (!a.bad.empty()) std::printf("    %s, %s\n", day.name.c_str(), e.name.c_str());
+                CHECK(a.bad.empty());
             }
-            REQUIRE(write_patch(c, c.patch(), e.patch));
-            const Applied a = apply_modes(c, ALL_MODES, replay);
-            if (!a.bad.empty()) std::printf("    %s, %s\n", day.name.c_str(), e.name.c_str());
-            CHECK(a.bad.empty());
+            REQUIRE(write_patch(c, c.patch(), raw));
         }
     }
 }
@@ -6945,12 +6960,12 @@ Walked walk_address_files(const std::vector<char>& points_file, const std::vecto
 // index or a block, or by a blob's header or len when addr_vertices.bin holds
 // the damage, is refused there in the decoder's words, which name the old
 // record, before a byte of it is used. Blobs' values the replay does not
-// decode: any set whose addr_vertices.bin is not the patch's is refused, at
-// the latest by the old file's hash; and no set the decoder's checks between
-// the units refuse applies. Then three sets the decoder refuses only where
-// the files end, each refused in its words: a byte between the last block and
-// its footer, one between the last blob and its footer, and a footer that
-// counts a blob more.
+// decode, and a block that decodes to other records is one the encoder
+// writes: any set whose addr_points.bin or addr_vertices.bin is not the
+// patch's is refused, at the latest by the old file's hash. No set applies.
+// Then three sets the decoder refuses only where the files end, each refused
+// in its words: a byte between the last block and its footer, one between
+// the last blob and its footer, and a footer that counts a blob more.
 TEST(the_address_replay_refuses_old_address_files_as_the_strict_decoder_does) {
     ScratchDir dir("lowmem-addr-damage");
     std::mt19937 rng(20261126);
@@ -7017,13 +7032,12 @@ TEST(the_address_replay_refuses_old_address_files_as_the_strict_decoder_does) {
         // walk's: then in the strict decoder's words.
         if (at_the_damage && !(!r.ok && (logged(r, w.refusal) || (!strict.empty() && logged(r, strict)))))
             bad = "not refused as \"" + w.refusal + "\"";
-        else if (w.stage != Walked::NONE && r.ok) bad = "applied, though \"" + w.refusal + "\"";
-        else if (damaged["addr_vertices.bin"] != written["addr_vertices.bin"] && r.ok) bad = "applied with another addr_vertices.bin";
+        else if (r.ok) bad = w.stage != Walked::NONE ? "applied, though \"" + w.refusal + "\"" : "applied with another " + file;
         // Whatever else the replay says of the old files, the strict decoder says.
         else if (!r.ok && w.stage == Walked::NONE && logged(r, "Malformed address files: ") && !logged(r, "addr_points.bin record ") &&
                  (strict.empty() || !logged(r, strict)))
             bad = "refused in words that are not the strict decoder's \"" + strict + "\"";
-        by_hash += !r.ok && logged(r, NOT_THE_PATCHS_FOOTPRINTS);
+        by_hash += !r.ok && (logged(r, NOT_THE_PATCHS_POINTS) || logged(r, NOT_THE_PATCHS_FOOTPRINTS));
         if (!bad.empty()) {
             wrong++;
             std::printf("    %s: %s: %s\n", what.c_str(), bad.c_str(), r.ok ? "applied" : r.log.substr(0, 600).c_str());
@@ -7056,6 +7070,7 @@ TEST(the_address_replay_refuses_old_address_files_as_the_strict_decoder_does) {
                 at_stage[Walked::FOOTERS], at_stage[Walked::INDEX], at_stage[Walked::BLOCK], at_stage[Walked::BLOB], at_stage[Walked::END],
                 at_stage[Walked::NONE], by_hash, applied);
     CHECK_EQ(wrong, size_t{0});
+    CHECK_EQ(applied, size_t{0});
     // Every kind of refusal came up.
     CHECK(at_stage[Walked::FOOTERS] >= 3);
     CHECK(at_stage[Walked::INDEX] >= 20);
@@ -7339,4 +7354,78 @@ TEST(the_address_replay_encodes_the_blobs_it_cannot_copy) {
                       "Malformed merge sequence: addr_points.bin (a REPLACE run past the old file)")
               .empty());
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// A blob is its footprint's under its record's point alone: a small one holds
+// the bbox minimum as two residuals from where the point predicts it. So the
+// old points the address replay copies blobs under are checked as the blobs
+// are, by their file's hash. One address at (1, 1) whose footprint is one
+// vertex at its bbox minimum, (1, 1): its blob is 08 01 00 00 00, and a patch
+// that MATCHes the record and its footprint's 14 bytes copies it. With bit 6
+// of the top byte of the block's latitude base flipped in the old
+// addr_points.bin, the block is one the encoder writes, of a record at
+// latitude +infinity; every length is as it was, and so is addr_vertices.bin.
+// Under that point the encoder writes the bbox minimum in full and the strict
+// decoder refuses the small blob. In every mode the patcher refuses the old
+// addr_points.bin by its hash; the patch applies to the files as written.
+TEST(the_address_replay_refuses_an_old_record_moved_under_a_blob_it_would_copy) {
+    ScratchDir dir("lowmem-addr-point");
+    Address address{1.0f, 1.0f, 0, 0, 0, std::vector<char>(addr_files::LOGICAL_HEADER + 4, 0)};
+    put_at(address.blob, 2, 1.0f);
+    put_at(address.blob, 6, 1.0f);
+    BuildDir d;
+    put_addresses(d, {address});
+    const LowMemCase c{dir.path(), "point"};
+    REQUIRE(prepare(c, d, d).empty());
+    const std::string points_path = c.dir("old") + "/addr_points.bin";
+    const std::vector<char> points = read_file(points_path), blobs = read_file(c.dir("old") + "/addr_vertices.bin");
+    const std::vector<char> blob = {0x08, 0x01, 0x00, 0x00, 0x00};
+    REQUIRE(blobs.size() == blob.size() + addr_files::VERTICES_FOOTER_BYTES && std::equal(blob.begin(), blob.end(), blobs.begin()));
+
+    // The unchanged day's patch with its two address sections as merges: the
+    // record a MATCH, its footprint's bytes a MATCH.
+    const std::vector<char> raw = raw_patch(c);
+    std::vector<char> copies = copy_old_section(PatchFileId::ADDR_POINTS, ADDR_POINT_STRIDE);
+    const std::vector<char> copied_footprints = copy_old_section(PatchFileId::ADDR_VERTICES, address.blob.size());
+    copies.insert(copies.end(), copied_footprints.begin(), copied_footprints.end());
+    const size_t at = find_once(raw, copies);
+    REQUIRE(at != std::string::npos);
+    std::vector<char> record_ops, footprint_ops;
+    put_op(record_ops, OP_MATCH_RUN, 1);
+    put_op(footprint_ops, OP_MATCH_RUN, static_cast<uint32_t>(address.blob.size()));
+    std::vector<char> matched(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(at));
+    for (const std::vector<char>& section :
+         {merge_of(PatchFileId::ADDR_POINTS, static_cast<uint32_t>(ADDR_POINT_STRIDE), ADDR_POINT_STRIDE, ADDR_POINT_STRIDE, record_ops),
+          merge_of(PatchFileId::ADDR_VERTICES, 1, address.blob.size(), address.blob.size(), footprint_ops)})
+        matched.insert(matched.end(), section.begin(), section.end());
+    matched.insert(matched.end(), raw.begin() + static_cast<std::ptrdiff_t>(at + copies.size()), raw.end());
+    REQUIRE(write_patch(c, c.patch(), matched));
+    CHECK(apply_modes(c, ALL_MODES, addr_replayed_is(1, 0)).bad.empty());
+
+    std::vector<char> moved = points;
+    moved[addr_files::LAT_BASE_AT + 3] = static_cast<char>(moved[addr_files::LAT_BASE_AT + 3] ^ 0x40);
+    addr_files::Block block;
+    REQUIRE(addr_files::decode_block(0, reinterpret_cast<const uint8_t*>(moved.data()), moved.size(), 1, block) ==
+            moved.size() - addr_files::POINTS_FOOTER_BYTES);
+    REQUIRE(block.lat[0] == 0x7F800000u && block.lng[0] == coord_keys::bits_of(1.0f) && block.len[0] == blob.size());
+    REQUIRE(write_file(points_path, moved));
+    const std::vector<std::string> bad = not_refused(c, ALL_MODES, c.patch(), "moved", "Old addr_points.bin is not the one the patch was made from");
+    CHECK(bad.empty());
+    // What the whole-file decoder says of the files a mode wrote.
+    if (!bad.empty())
+        for (const std::string& mode : ALL_MODES) {
+            std::map<std::string, std::vector<char>> out;
+            for (const char* f : ADDRESS_FILES) out[f] = read_file(c.dir("moved.out." + mode) + "/" + f);
+            std::string refusal;
+            try {
+                auto u8 = [&](const char* f) { return reinterpret_cast<const uint8_t*>(out[f].data()); };
+                addr_files::decode(u8("addr_points.bin"), out["addr_points.bin"].size(), u8("addr_vertices.bin"), out["addr_vertices.bin"].size(),
+                                   u8("addr_index.bin"), out["addr_index.bin"].size());
+            } catch (const std::runtime_error& e) {
+                refusal = e.what();
+            }
+            std::printf("    %s: the patched address files decode: %s\n", mode.c_str(), refusal.empty() ? "yes" : refusal.c_str());
+        }
+    REQUIRE(write_file(points_path, points));
+    CHECK(apply_modes(c, ALL_MODES, addr_replayed_is(1, 0)).bad.empty());
 }

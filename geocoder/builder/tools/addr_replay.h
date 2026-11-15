@@ -10,8 +10,9 @@
 // passed last (read again), or else from a cursor that decodes the old files once more up to the
 // bytes asked for (gcs::addr::Dec), made when one is. The blocks are decoded and encoded again
 // record by record (their ids move every day), with the checks addr_files::decode makes between
-// the units. A copied blob is never decoded: the old addr_vertices.bin is hashed as the replay
-// passes it and checked against the diff's hash (OLD_FILE_HASH_MARKER).
+// the units. A copied blob is never decoded, and the record whose point it is copied under is
+// the old file's: the old addr_vertices.bin and addr_points.bin are hashed as the replay passes
+// them and checked against the diff's hashes (OLD_FILE_HASH_MARKER).
 #pragma once
 
 #include <algorithm>
@@ -31,11 +32,17 @@
 namespace addr_replay {
 namespace af = addr_files;
 
+// The hashes (lane_hash) of the old addr_points.bin and addr_vertices.bin.
+struct Hashes {
+    uint64_t points = 0, vertices = 0;
+};
+
 // The old address files front to back, a record at a time: its logical record (vertex_offset its
 // footprint's offset in the logical stream, vertex_count its vertices) and its blob, whose header
 // is read and whose bytes are not until they are copied, decoded or passed. It makes the checks
-// gcs::addr::Dec makes between the units, in its words, and leaves a blob's values to the hash:
-// every byte of addr_vertices.bin is hashed in order.
+// gcs::addr::Dec makes between the units, in its words, and leaves a blob's values, and the
+// records a block decodes to, to the hashes: every byte of addr_vertices.bin and of
+// addr_points.bin is hashed in order, a block's as it is decoded.
 class OldFiles {
 public:
     explicit OldFiles(const std::string& dir)
@@ -43,7 +50,8 @@ public:
           P_(dir + "/" + af::POINTS_FILE, gcs::addr::BLOCKS_BUF),
           V_(dir + "/" + af::VERTICES_FILE, gcs::addr::BLOBS_BUF),
           X_(dir + "/" + af::INDEX_FILE, gcs::addr::INDEX_BUF),
-          hash_(V_.size()) {}
+          points_hash_(P_.size()),
+          vertices_hash_(V_.size()) {}
 
     uint64_t records() const { return f_.records; }
     uint64_t logical_vertex_bytes() const { return f_.logical_vertex_bytes; }
@@ -146,9 +154,9 @@ public:
         return g;
     }
 
-    // Passes the records left, checks the files end as the encoder ends them, and returns
-    // addr_vertices.bin's hash (lane_hash).
-    uint64_t finish() {
+    // Passes the records left, checks the files end as the encoder ends them, and returns the
+    // two files' hashes.
+    Hashes finish() {
         while (record_ < f_.records) next();
         pass_blob();
         const std::string vertices_file = af::VERTICES_FILE;
@@ -160,7 +168,8 @@ public:
         if (blobs_ != f_.blobs)
             af::malformed(vertices_file + " counts " + std::to_string(f_.blobs) + " blobs and holds " + std::to_string(blobs_));
         take(af::VERTICES_FOOTER_BYTES);
-        return hash_.hash();
+        points_hash_.update(reinterpret_cast<const char*>(P_.take(af::POINTS_FOOTER_BYTES)), af::POINTS_FOOTER_BYTES);
+        return {points_hash_.hash(), vertices_hash_.hash()};
     }
 
     // The most bytes held of the old footprints at once, at most: the blobs' read window, which
@@ -195,7 +204,7 @@ private:
     // n of addr_vertices.bin's next bytes, hashed.
     const uint8_t* take(size_t n) {
         const uint8_t* p = V_.take(n);
-        hash_.update(reinterpret_cast<const char*>(p), n);
+        vertices_hash_.update(reinterpret_cast<const char*>(p), n);
         return p;
     }
     void pass_blob() {
@@ -218,7 +227,9 @@ private:
         // Decoded where the reader holds it, with the 8 bytes decode_block may load past it: the
         // next block's, or the footer's.
         const size_t avail = size_t(std::min<uint64_t>(P_.left(), af::BLOCK_MAX_BYTES + 8));
-        const size_t bytes = af::decode_block(b_, P_.need(avail), avail, f_.block_records(b_), block_);
+        const uint8_t* block = P_.need(avail);
+        const size_t bytes = af::decode_block(b_, block, avail, f_.block_records(b_), block_);
+        points_hash_.update(reinterpret_cast<const char*>(block), bytes);
         P_.skip(bytes);
         blocks_at_ += bytes;
         b_++;
@@ -262,7 +273,7 @@ private:
 
     af::Footers f_;
     gcs::Reader P_, V_, X_;  // the blocks, the blobs, and the index's rows
-    LaneHasher hash_;
+    LaneHasher points_hash_, vertices_hash_;
     af::Block block_;              // the block at hand
     size_t j_ = 0;                 // its records passed
     uint64_t b_ = 0, record_ = 0;  // the blocks decoded, and the records passed
@@ -337,10 +348,11 @@ struct Result {
 // at P[child_at, patch_size) from the old files in cur_dir into new ones in out_dir, the index
 // among them. fix(rec, old_index, k_in_run, run_first, run_count) moves a MATCH record's fields as
 // the generic replay does (FieldMoves). on_run(old_start, new_start, count) for each MATCH and
-// REPLACE run (the record remap). The old addr_vertices.bin must hash to old_vertices_hash.
+// REPLACE run (the record remap). The old addr_points.bin and addr_vertices.bin must hash to
+// old_hashes.
 template <typename Fix, typename OnRun>
 Result replay(const char* seq, size_t seq_size, const char* P, size_t patch_size, size_t child_at, const std::string& cur_dir,
-              const std::string& out_dir, uint64_t old_size, uint64_t new_size, uint32_t file_records_max, uint64_t old_vertices_hash,
+              const std::string& out_dir, uint64_t old_size, uint64_t new_size, uint32_t file_records_max, const Hashes& old_hashes,
               Fix fix, OnRun on_run) {
     static constexpr size_t PIECE = gcs::ENCODER_PIECE;
     Result r;
@@ -513,7 +525,9 @@ Result replay(const char* seq, size_t seq_size, const char* P, size_t patch_size
     if (r.records_bytes != new_size) throw std::runtime_error("Rebuilt addr_points.bin does not match the new build");
     if (child.written != child.new_size) throw std::runtime_error("Rebuilt addr_vertices.bin does not match the new build");
     r.vertex_bytes = child.written;
-    if (old.finish() != old_vertices_hash) throw std::runtime_error("Old addr_vertices.bin is not the one the patch was made from");
+    const Hashes hashes = old.finish();
+    if (hashes.points != old_hashes.points) throw std::runtime_error("Old addr_points.bin is not the one the patch was made from");
+    if (hashes.vertices != old_hashes.vertices) throw std::runtime_error("Old addr_vertices.bin is not the one the patch was made from");
     enc.finish();
     r.decode_peaks[0] = old.records() ? af::BLOCK_RECORDS * af::LOGICAL_STRIDE : 0;
     r.decode_peaks[1] = old.footprint_peak() + (vd ? vd->peak(1) : 0);

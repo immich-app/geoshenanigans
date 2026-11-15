@@ -475,15 +475,16 @@ private:
 
 // The address points' merge sequence seq[0, seq_size) and the footprint section at child_at,
 // replayed on the address files as they sit (addr_replay.h), fix moving the MATCH records' fields;
-// their MATCH and REPLACE runs go to remap (when given). Out of run() and never inlined into it,
-// as the POI replay is. Writes its log line and the codecs' reports.
+// their MATCH and REPLACE runs go to remap (when given). The old addr_points.bin and
+// addr_vertices.bin must hash to hashes. Out of run() and never inlined into it, as the POI replay
+// is. Writes its log line and the codecs' reports.
 template <typename Fix>
 [[gnu::noinline]] static addr_replay::Result replay_addr_section(
     const char* seq, size_t seq_size, const char* P, size_t patch_size, size_t child_at, const std::string& cur_dir,
-    const std::string& to, uint64_t old_size, uint64_t new_size, uint32_t file_records_max, uint64_t vertices_hash, Fix fix,
+    const std::string& to, uint64_t old_size, uint64_t new_size, uint32_t file_records_max, const addr_replay::Hashes& hashes, Fix fix,
     RecordRemap* remap) {
     const addr_replay::Result r = addr_replay::replay(
-        seq, seq_size, P, patch_size, child_at, cur_dir, to, old_size, new_size, file_records_max, vertices_hash, fix,
+        seq, seq_size, P, patch_size, child_at, cur_dir, to, old_size, new_size, file_records_max, hashes, fix,
         [&](uint64_t o, uint64_t n, uint32_t count) {
             if (remap) remap->add_match(static_cast<uint32_t>(o), static_cast<uint32_t>(n), count);
         });
@@ -689,8 +690,17 @@ static int run(int argc, char* argv[]) {
     bool saw_parent_remap = false;  // a patch gives one
     // The old files' hashes (OLD_FILE_HASH_MARKER) by file id, which a replay checks the bytes it
     // copies undecoded by: the POI replay the old poi_vertices.bin's blocks, a way replay the old
-    // pair's rows and node blocks.
+    // pair's rows and node blocks, the address replay the old blobs and the records they are
+    // copied under.
     std::map<uint32_t, uint64_t> old_file_hashes;
+    // The hash the patch gave of an old file that the replay of `records` checks: refused without.
+    auto old_hash_of = [&](PatchFileId file, const char* records) {
+        const auto hash = old_file_hashes.find((uint32_t)file);
+        if (hash == old_file_hashes.end())
+            throw std::runtime_error(std::string("Malformed patch: ") + records + " without the old " + patch_file_names[(uint32_t)file] +
+                                     "'s hash");
+        return hash->second;
+    };
     auto poi_remap_lookup = [](const SortedTable<RemapPair>& t, uint32_t old_id) {
         const std::optional<RemapPair> p = t.find(old_id);
         return p ? p->to : old_id;
@@ -768,19 +778,19 @@ static int run(int argc, char* argv[]) {
     };
     // The address points' section, its merge sequence at seq (one MATCH of every record for points
     // sent unchanged), with the footprints' section at child_at, through the address replay
-    // (replay_addr_section). It copies old blobs undecoded, so the patch must have given the old
-    // addr_vertices.bin's hash; and it writes the family's files itself, so they count as opened
-    // and the patch lists the index, as for a family copied (Store::copied_files). The patch
-    // position moves past the footprints' section.
+    // (replay_addr_section). It copies old blobs undecoded, each under its old record's point, so
+    // the patch must have given the hashes of the old addr_points.bin and addr_vertices.bin; and it
+    // writes the family's files itself, so they count as opened and the patch lists the index, as
+    // for a family copied (Store::copied_files). The patch position moves past the footprints'
+    // section.
     auto replay_addresses = [&](const char* seq, size_t seq_size, size_t child_at, uint64_t old_size, uint64_t new_size, auto fix,
                                 RecordRemap* remap) {
-        const auto hash = old_file_hashes.find((uint32_t)PatchFileId::ADDR_VERTICES);
-        if (hash == old_file_hashes.end())
-            throw std::runtime_error("Malformed patch: address points without the old addr_vertices.bin's hash");
+        const addr_replay::Hashes hashes{old_hash_of(PatchFileId::ADDR_POINTS, "address points"),
+                                         old_hash_of(PatchFileId::ADDR_VERTICES, "address points")};
         gcs::store().copied_files(*gcs::store().family_of(addr_files::POINTS_FILE));
         const addr_replay::Result r =
             replay_addr_section(seq, seq_size, P, patch_size, child_at, cur_dir, listed.count(addr_files::POINTS_FILE) ? out_dir : tmpdir,
-                                old_size, new_size, file_records_max, hash->second, fix, remap);
+                                old_size, new_size, file_records_max, hashes, fix, remap);
         if (r.child.kind == ChildOps::MERGE)
             merge_seqs[(uint32_t)PatchFileId::ADDR_VERTICES] = {r.child.seq, r.child.seq_end - r.child.seq, 1};
         pos = r.child.section_end;

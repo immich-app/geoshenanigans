@@ -502,11 +502,12 @@ Old file hash: marker 0xFFFFFFF8 (u32) + file_id (u32) + lane_hash of the
   old file as the dir holds it (u64; `tools/patch_format.h`), before the
   section of the file's parent records. (v17: the section names its file;
   before, it was the old poi_vertices.bin's alone and had no file id.) One
-  for each file a replay copies from without decoding it, when the old dir
-  holds the file and its family has a section: `poi_vertices.bin` (15),
-  right before the POI records' section of a dir with POI files, and
-  `addr_vertices.bin` (28), right before the address points' section of a
-  dir with address points. The patcher
+  for each file a replay copies from without decoding it, or takes the
+  values such bytes are copied under from, when the old dir holds the file
+  and its family has a section: `poi_vertices.bin` (15), right before the
+  POI records' section of a dir with POI files, and `addr_points.bin` (3)
+  and `addr_vertices.bin` (28), in that order right before the address
+  points' section of a dir with address points. The patcher
   refuses a second hash of a file, a hash of any other file, and a replay
   without the hash it checks by; a hash whose replay does not run (both of
   the family's sections unchanged, or an old file without records) is read
@@ -545,9 +546,13 @@ Old file hash: marker 0xFFFFFFF8 (u32) + file_id (u32) + lane_hash of the
   other footprint is encoded again, its old bytes decoded from the old blob
   the replay is at, from one it passed last, or by a second decoder of the
   old files; and every block is decoded and encoded again (its ids move).
-  The replay hashes the old `addr_vertices.bin` as it passes it and refuses
-  one of another hash ("Old addr_vertices.bin is not the one the patch was
-  made from"), and address points without the hash before them.
+  A copied blob goes under its old record's point as the old
+  `addr_points.bin` gives it, and a block that decodes to other records is
+  still a block the encoder writes, so the replay hashes both old files as
+  it passes them, `addr_points.bin` a block at a time as it decodes it, and
+  refuses one of another hash ("Old addr_points.bin is not the one the patch
+  was made from", "Old addr_vertices.bin is not the one the patch was made
+  from"), and address points without both hashes before them.
 
 Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64) + ...
   (the patcher refuses an old file of another size, 0 meaning absent)

@@ -2077,9 +2077,13 @@ static int run(int argc, char* argv[]) {
     serialize_merge(patch, res_interp_w, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     serialize_merge(patch, res_interp_n, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     { std::vector<char>().swap(res_interp_n.seq.data); }
-    // The old addr_vertices.bin's hash, before the address points' section: the patcher's address
-    // replay copies the blobs the day leaves whole and checks them by it.
-    if (res_addr.old_size || res_addr.new_size) append_old_file_hash(patch, old_dir, PatchFileId::ADDR_VERTICES);
+    // The hashes of the old addr_points.bin and addr_vertices.bin, before the address points'
+    // section: the patcher's address replay copies the blobs the day leaves whole, each under its
+    // old record's point, and checks both files by them.
+    if (res_addr.old_size || res_addr.new_size) {
+        append_old_file_hash(patch, old_dir, PatchFileId::ADDR_POINTS);
+        append_old_file_hash(patch, old_dir, PatchFileId::ADDR_VERTICES);
+    }
     serialize_merge(patch, res_addr, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     // res_addr_v is built in t_addr only when the dir has address points;
     // without them it keeps stride=0 and old/new sizes 0, which we treat as
