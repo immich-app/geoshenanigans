@@ -3998,6 +3998,9 @@ mod query_tests {
         assert_eq!(read, 4);
     }
 
+    /// A name of the jumble's pool with its NUL: "Lieu00" to "Lieu29".
+    const JUMBLE_NAME_BYTES: u32 = 7;
+
     /// 150 POIs of POI_META's categories on a 300 m grid around origin(), named from 30 names:
     /// points and polygons (squares and triangles 40 to 400 m across, of every vertex encoding,
     /// open and closed rings), one in fifteen a tombstone, two in three with a parent street.
@@ -4034,9 +4037,9 @@ mod query_tests {
                 });
                 let record = PoiRecord {
                     lat: lat as f32, lng: lng as f32, vertex_offset: 0,
-                    name_id: if pick(15) == 0 { NO_DATA } else { 6 * pick(30) as u32 },
+                    name_id: if pick(15) == 0 { NO_DATA } else { JUMBLE_NAME_BYTES * pick(30) as u32 },
                     category: [0, 1, 2, 60, 93][pick(5)], tier: 1 + pick(3) as u8, flags: 0, importance: [0, 1, 20, 100][pick(4)],
-                    parent_street_id: if pick(3) == 0 { NO_DATA } else { 6 * pick(30) as u32 },
+                    parent_street_id: if pick(3) == 0 { NO_DATA } else { JUMBLE_NAME_BYTES * pick(30) as u32 },
                     parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
                 };
                 let _ = k;
@@ -4052,6 +4055,7 @@ mod query_tests {
         let own = cell_id_at_level(origin().0, origin().1, DEFAULT_ADMIN_CELL_LEVEL);
         let pairs = pois.iter().enumerate().filter(|(_, (r, _))| r.name_id != NO_DATA).map(|(i, _)| (own, i as u32));
         let strings: Vec<u8> = (0..30).flat_map(|k| format!("Lieu{k:02}").into_bytes().into_iter().chain([0])).collect();
+        assert_eq!(strings.len() as u32, 30 * JUMBLE_NAME_BYTES);
         let end = strings.len() as u32;
         let (records, vertices) = poi_files::encode(&pois);
         let idx = Index {
@@ -4084,7 +4088,7 @@ mod query_tests {
     fn poi_lookups_answer_as_the_old_reader_did() {
         // The answers today's 36-byte records and vertex stream gave for the jumble (the reader
         // before R2 and V2, at 447a8a3), match for match and bit for bit.
-        assert_eq!(poi_jumble_answers(), (1593, 103, 6_893_521_405_585_614_420));
+        assert_eq!(poi_jumble_answers(), (1593, 122, 4_340_307_441_197_094_589));
     }
 
     #[test]
