@@ -237,6 +237,13 @@ fn a_block_is_the_bytes_up_to_the_next_blocks_start_and_no_value_is_read_from_pa
     assert_eq!(open(&wide).unwrap().get(8), None);
     assert_eq!(read(&wide, 65), [vec![None; 64], vec![Some(5)]].concat());
 
+    // A next block's start past the table's start ends no block: a FOR block of 64 one-bit
+    // fields with 6 of its 8 field bytes, the table's entries [0, 14] right after them. No
+    // value is read from the table's bytes.
+    let forged = [&[0, 5, 0, 0, 0, 1][..], &[0xaa; 6], &0u32.to_le_bytes(), &14u32.to_le_bytes(), &65u32.to_le_bytes(), b"SDB1"].concat();
+    assert_eq!(open(&forged).unwrap().count(), 65);
+    assert_eq!(read(&forged, 65), vec![None; 65]);
+
     // A block of a byte more than its values take, or of a byte fewer, is no block, whether the
     // next block's start ends it or the table's; the block beside it reads.
     let ones = for_block(9, 1, &[1; 64]);

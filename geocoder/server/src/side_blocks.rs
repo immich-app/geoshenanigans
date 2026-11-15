@@ -73,7 +73,8 @@ impl SideBlocks {
         if b == 0 && at != 0 {
             return None;
         }
-        let block = file.get(at..end)?;
+        // The blocks end where the table starts: a block is none of the table's bytes.
+        let block = file.get(..self.table_at)?.get(at..end)?;
         // Field j of the block's c fields of w bits, which start `head` bytes into it and end
         // where it does: one 8-byte load, which the bytes after the block (blocks, the table,
         // the footer) leave room for. None for a block of other bytes than its head and its
