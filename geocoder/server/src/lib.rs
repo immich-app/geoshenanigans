@@ -1497,7 +1497,7 @@ impl Index {
                 if point.is_building() && addrs.footprint(&point, footprint) {
                     dist = polygon_distance_sq(lat, lng, footprint, cos_lat);
                 }
-                if beats(dist, best_addr_dist, || best_addr.as_ref().map(|b| (addr_key(&point), addr_key(b)))) {
+                if beats(dist, best_addr_dist, || best_addr.as_ref().filter(|_| best_addr_id != id).map(|b| (addr_key(&point), addr_key(b)))) {
                     best_addr_dist = dist;
                     best_addr = Some(point);
                     best_addr_id = id;
@@ -1536,7 +1536,9 @@ impl Index {
                             nodes[i + 1].lat as f64, nodes[i + 1].lng as f64,
                             cos_lat,
                         );
-                        let keys = || best_street.map(|best| (self.street_tie_key(streets, id), self.street_tie_key(streets, best)));
+                        // A tie with the way's own earlier segment (the node two segments
+                        // share is the nearest point) needs no key.
+                        let keys = || best_street.filter(|&best| best != id).map(|best| (self.street_tie_key(streets, id), self.street_tie_key(streets, best)));
                         if beats(dist, best_street_dist, keys) {
                             best_street_dist = dist;
                             best_street = Some(id);
@@ -1567,7 +1569,8 @@ impl Index {
                 let Some(iw) = interps.row(id) else { continue };
                 if iw.start_number == 0 || iw.end_number == 0 { continue; }
                 let Some((dist, t)) = self.interp_way_position(interps, id, lat, lng, cos_lat) else { continue };
-                let keys = || best_interp.as_ref().map(|(best, b)| (self.interp_tie_key(interps, id, &iw), self.interp_tie_key(interps, *best, b)));
+                // A line several cells list ties with itself, which needs no key.
+                let keys = || best_interp.as_ref().filter(|(best, _)| *best != id).map(|(best, b)| (self.interp_tie_key(interps, id, &iw), self.interp_tie_key(interps, *best, b)));
                 if beats(dist, best_interp_dist, keys) {
                     best_interp_dist = dist;
                     best_interp = Some((id, iw));
@@ -1658,6 +1661,7 @@ impl Index {
                         || (dist == *bd
                             && (range(&iw) < range(bw)
                                 || (range(&iw) == range(bw)
+                                    && *best_id != id
                                     && self.interp_tie_key(interps, id, &iw) < self.interp_tie_key(interps, *best_id, bw)))),
                 };
                 if better { best = Some((dist, id, iw, t)); }
