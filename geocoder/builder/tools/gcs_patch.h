@@ -255,9 +255,18 @@ struct Store {
         int fi, port;
         std::vector<char> buf;
     };
+    // A stream's write function gives the bytes it took, 0 for an error and never a negative
+    // number (fopencookie): stdio takes a negative one as a count, and a write larger than its
+    // buffer then goes on from past the caller's bytes.
     static ssize_t cookie_write(void* c, const char* p, size_t n) {
         Cookie* k = static_cast<Cookie*>(c);
         if (k->s->abandoned) return ssize_t(n);  // dropped
+        // An encoder that refused its input takes no more of it: stdio hands a failed write's
+        // bytes over again with each later one, and the encoder would queue them each time.
+        if (!k->s->sink_error.empty()) {
+            errno = EIO;
+            return 0;
+        }
         try {
             Encoder* e = k->s->encoder(k->fi);
             if (AsyncEnc* a = k->s->aenc[size_t(k->fi)].get()) a->write(k->port, p, n);
@@ -265,7 +274,7 @@ struct Store {
         } catch (const std::exception& e) {
             if (k->s->sink_error.empty()) k->s->sink_error = e.what();
             errno = EIO;
-            return -1;
+            return 0;
         }
         return ssize_t(n);
     }

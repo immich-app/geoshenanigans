@@ -601,7 +601,11 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   and the patcher refuses a replay that reads one of them 4 MiB
   (MAX_DECODER_SKEW) ahead of the other ("Malformed merge sequence: <file>
   runs ahead of <file>"); the way pairs and the POI files, replayed on their
-  files as they sit, read each file on its own.
+  files as they sit, read each file on its own. Its encoder takes a record
+  once its child bytes are in, and refuses bytes of one file that wait for
+  the other's once that file is closed ("<family>: N bytes left over on input
+  k") or once they pass 1 MiB (MAX_ENCODER_SKEW; "<family>: input k runs N
+  bytes ahead of input j"): the bytes of a child section without its records.
   Offset fixups (node_offset / vertex_offset of MATCH records, see
   OffsetFixups in tools/patch_format.h): runs of varint (records skipped since
   the previous run, run length, zigzag change of the shift); the patcher adds

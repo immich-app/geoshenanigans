@@ -194,12 +194,13 @@ struct AsyncEnc {
                     }
                 }
                 cv_writer.notify_all();
+                // A file is closed once its last bytes are in, before the bytes of the files after
+                // it: bytes that come for a unit of a closed file are refused as they come.
                 for (size_t p = 0; p < take.size(); p++) {
                     if (take[p].size()) inner->write(int(p), take[p].data(), take[p].size());
                     take[p].pop(take[p].size());
-                }
-                for (size_t p = 0; p < newly.size(); p++)
                     if (newly[p]) inner->state[p] = 2;
+                }
                 inner->pump();
                 if (all) break;
             }

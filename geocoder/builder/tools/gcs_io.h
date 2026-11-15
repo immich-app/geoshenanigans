@@ -33,6 +33,11 @@ static const size_t ENCODER_PIECE = size_t(64) << 10;
 // the replay reads a parent and its child stream in step (PATCHING.md), so only a malformed merge
 // sequence leaves one this far behind.
 static const size_t MAX_DECODER_SKEW = size_t(4) << 20;
+// The most a coupled family's encoder holds of one of its files while it waits for bytes of the
+// other: the replay writes a record and then its child bytes, and what the patcher's buffers and
+// a --threads ring put between the two files is a few hundred KiB, so only a patch whose sections
+// are out of step leaves one this far ahead.
+static const size_t MAX_ENCODER_SKEW = size_t(1) << 20;
 // The bytes a Reader's buffer holds past its capacity, for the bit readers' 8-byte loads past a
 // unit's last byte.
 static const size_t READ_SLACK = 64;

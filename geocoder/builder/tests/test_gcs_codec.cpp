@@ -1536,3 +1536,78 @@ TEST(gcs_reader_rejects_a_unit_past_what_its_buffer_holds) {
 
     CHECK_EQ(status, 2);
 }
+
+namespace {
+
+// A two-file family's encoder into a dir, and a record of it that has child
+// bytes, with the least of them.
+struct CoupledEncoder {
+    const char* family;
+    std::function<std::unique_ptr<Encoder>(const std::string& dir)> encoder;
+    std::vector<uint8_t> record, child;
+};
+
+std::vector<CoupledEncoder> coupled_encoders() {
+    // A street way of one node; an address with a footprint of one vertex; a POI with a polygon of one vertex.
+    std::vector<uint8_t> way(12, 0), address(28, 0), poi(36, 0);
+    wr16(&way[4], 1);
+    wr32(&address[24], 1);
+    wr32(&poi[12], 1);
+    return {{"streets", [](const std::string& dir) { return std::unique_ptr<Encoder>(new ways::Enc(dir, way_files::STREETS)); }, way,
+             std::vector<uint8_t>(8, 0)},
+            {"addr", [](const std::string& dir) { return std::unique_ptr<Encoder>(new addr::Enc(dir)); }, address, std::vector<uint8_t>(14, 0)},
+            {"poi", [](const std::string& dir) { return std::unique_ptr<Encoder>(new poi::Enc(dir)); }, poi, std::vector<uint8_t>(14, 0)}};
+}
+
+}  // namespace
+
+TEST(gcs_coupled_encoders_refuse_bytes_no_unit_takes_as_they_come) {
+    // A two-file family's encoder takes a record once its child bytes are
+    // in, and child bytes once their record is. Bytes of one file that wait
+    // for the other's are refused as they come when the other file is
+    // closed, as no unit will take them: child bytes after the records' file
+    // closed without a record for them, and a record with child bytes after
+    // the child file closed without them. While both files are open one may
+    // run ahead of the other by what a replay's buffers put between them,
+    // and no further: 4 MiB of child bytes without a record, and 4 MiB of
+    // records without their child bytes, are refused once the queue holds
+    // MAX_ENCODER_SKEW, not held until the files close. The way pair, the
+    // address files and the POI files.
+    const size_t skew = MAX_ENCODER_SKEW;
+    for (const CoupledEncoder& c : coupled_encoders()) {
+        const int failures_before = gctest::failures();
+        const std::string family = c.family;
+        {
+            ScratchDir dir("gcs-test");
+            const std::unique_ptr<Encoder> enc = c.encoder(dir.path());
+            enc->state = {2, 1};
+            CHECK_EQ(refusal_of([&] { enc->write(1, c.child.data(), c.child.size()); }),
+                     "gcs: " + family + ": " + std::to_string(c.child.size()) + " bytes left over on input 1");
+        }
+        {
+            ScratchDir dir("gcs-test");
+            const std::unique_ptr<Encoder> enc = c.encoder(dir.path());
+            enc->state = {1, 2};
+            CHECK_EQ(refusal_of([&] { enc->write(0, c.record.data(), c.record.size()); }),
+                     "gcs: " + family + ": " + std::to_string(c.record.size()) + " bytes left over on input 0");
+        }
+        for (const int port : {0, 1}) {
+            // Whole units, 64 KiB of them a write.
+            const std::vector<uint8_t>& unit = port == 0 ? c.record : c.child;
+            std::vector<uint8_t> piece;
+            while (piece.size() + unit.size() <= ENCODER_PIECE) piece.insert(piece.end(), unit.begin(), unit.end());
+            ScratchDir dir("gcs-test");
+            const std::unique_ptr<Encoder> enc = c.encoder(dir.path());
+            enc->state = {1, 1};
+            size_t written = 0;
+            const std::string refusal = refusal_of([&] {
+                for (; written < (size_t(4) << 20); written += piece.size()) enc->write(port, piece.data(), piece.size());
+            });
+            const size_t held = (skew / piece.size() + 1) * piece.size();
+            CHECK_EQ(refusal, "gcs: " + family + ": input " + std::to_string(port) + " runs " + std::to_string(held) + " bytes ahead of input " +
+                                  std::to_string(1 - port));
+            CHECK(enc->peak(port) <= skew + ENCODER_PIECE);
+        }
+        if (gctest::failures() > failures_before) std::printf("    in: %s\n", c.family);
+    }
+}

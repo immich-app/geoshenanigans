@@ -162,6 +162,16 @@ struct Encoder {
         for (size_t p = 0; p < in.size(); p++)
             if (in[p].size()) die("%s: %zu bytes left over on input %zu", name.c_str(), in[p].size(), p);
     }
+    // A coupled family's pump stops with bytes on port `held` that wait for port `wanted`'s: a
+    // record for its child bytes, or child bytes for their record. Refused once `wanted` is
+    // closed, as no unit will take them; and past MAX_ENCODER_SKEW, so the queue holds no more
+    // of a file whose other file never comes.
+    void waits(int held, int wanted) const {
+        const size_t h = size_t(held), w = size_t(wanted);
+        if (!in[h].size()) return;
+        if (state[w] == 2) die("%s: %zu bytes left over on input %zu", name.c_str(), in[h].size(), h);
+        if (in[h].size() > MAX_ENCODER_SKEW) die("%s: input %zu runs %zu bytes ahead of input %zu", name.c_str(), h, in[h].size(), w);
+    }
 };
 
 // ------------------------------------------------------------------ streets / interps (way_files.h)
@@ -283,11 +293,12 @@ struct Enc : Encoder {
         while (W.size() >= kind.stride) {
             const uint8_t* record = W.data();
             const size_t nodes = wf::NODE_BYTES * size_t(wf::get16(record + wf::NODE_COUNT_AT));
-            if (N.size() < nodes) return;  // its nodes are not all in yet
+            if (N.size() < nodes) return waits(0, 1);  // its nodes are not all in yet
             files.add(record, N.data());
             N.pop(nodes);
             W.pop(kind.stride);
         }
+        waits(1, 0);  // nodes whose way's record is not in yet
     }
     void finish() override {
         require_empty();
@@ -637,13 +648,12 @@ struct Enc : Encoder {
         ByteQueue &P = in[0], &V = in[1];
         for (;;) {
             if (const uint64_t owed = files.escape_owed()) {
-                if (!V.size()) return;
                 const size_t k = size_t(std::min<uint64_t>(owed, V.size()));
-                files.put_escape_bytes(V.data(), k);
+                if (k) files.put_escape_bytes(V.data(), k);
                 V.pop(k);
-                if (k < owed) return;
+                if (k < owed) return waits(0, 1);  // the records after the escape's
             }
-            if (P.size() < af::LOGICAL_STRIDE) return;
+            if (P.size() < af::LOGICAL_STRIDE) return waits(1, 0);  // a footprint whose record is not in yet
             const uint8_t* rec = P.data();
             const uint32_t count = rd32(rec + af::VERTEX_COUNT_AT);
             if (!count) {
@@ -651,7 +661,7 @@ struct Enc : Encoder {
                 P.pop(af::LOGICAL_STRIDE);
                 continue;
             }
-            if (V.size() < af::LOGICAL_HEADER) return;
+            if (V.size() < af::LOGICAL_HEADER) return waits(0, 1);
             const uint8_t* logical = V.data();
             // A header no footprint has is add's to refuse, with no vertex read.
             const bool footprint = logical[0] <= 3 && !logical[1];
@@ -662,7 +672,7 @@ struct Enc : Encoder {
                 continue;
             }
             const size_t bytes = footprint ? size_t(af::logical_blob_bytes(logical[0], count)) : af::LOGICAL_HEADER;
-            if (V.size() < bytes) return;  // its vertices are not all in yet
+            if (V.size() < bytes) return waits(0, 1);  // its vertices are not all in yet
             files.add(rec, logical);
             V.pop(bytes);
             P.pop(af::LOGICAL_STRIDE);
@@ -915,21 +925,21 @@ struct Enc : Encoder {
                     V.pop(vs);
                     big_k++;
                 }
-                if (big_k < big_vc) return;
+                if (big_k < big_vc) return waits(0, 1);  // the records after the block's
                 finish_big();
                 continue;
             }
-            if (R.size() < poi_files::LOGICAL_STRIDE) return;
+            if (R.size() < poi_files::LOGICAL_STRIDE) return waits(1, 0);  // vertices whose record is not in yet
             const uint8_t* r = R.data();
             const uint32_t vo = rd32(r + poi_files::OFF_VERTEX_OFFSET), vc = rd32(r + poi_files::OFF_VERTEX_COUNT);
             size_t size = 0;
             uint8_t e = 0;
             if (vc && vo != NO) {
-                if (V.size() < 1) return;
+                if (V.size() < 1) return waits(0, 1);
                 e = V.data()[0];
                 if (e > 3) die("poi_vertices: bad encoding %u", e);
                 size = unit_size(1, poi_files::LOGICAL_HEADER, vc, poi_files::vertex_bytes(e));
-                if (size <= big_block() ? V.size() < size : V.size() < poi_files::LOGICAL_HEADER) return;
+                if (size <= big_block() ? V.size() < size : V.size() < poi_files::LOGICAL_HEADER) return waits(0, 1);
             }
             uint8_t row[poi_files::ROW_BYTES];
             rows.encode(r, O->tell(), row);

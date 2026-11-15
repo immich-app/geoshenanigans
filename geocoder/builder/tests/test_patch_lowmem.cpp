@@ -7489,3 +7489,114 @@ TEST(patch_refuses_a_section_sent_as_unchanged_whose_new_size_is_not_its_old_one
         }
     }
 }
+
+namespace {
+
+// The patcher's heap peak as it refuses `patch` in the mode: none without a
+// heap shim, or when the patch applied.
+std::optional<uint64_t> refused_heap_peak(const LowMemCase& c, const std::string& mode, const std::string& patch, const std::string& name) {
+    const std::string out = c.dir(name + ".heap." + mode);
+    std::filesystem::remove_all(out);
+    const auto [ok, peak] = gctest::run_with_heap_peak(patch_words(c, mode, patch, out), c.log());
+    return ok ? std::nullopt : peak;
+}
+
+}  // namespace
+
+// A family's encoder takes a record once its child bytes are in and child
+// bytes once their record is, so bytes of one file that no unit will take are
+// refused as they reach it, not held until the family's files close. A dir
+// whose street pair, address files and POI files hold no record, and patches
+// of an unchanged day with megabytes of bytes no record owns: each family's
+// child file replaced whole after its records' section, of no record, closed
+// the records' file; the street ways' section given records of one node each
+// and no node; and the street nodes replaced whole before the ways' section.
+// In every mode the patcher refuses each as the first bytes come (the bytes
+// of a file that is closed for good) or once one file runs a megabyte ahead of
+// the other (while both may still come), and its heap peak is the same for 4
+// MiB of them as for 40. The patch as made applies.
+TEST(patch_refuses_bytes_no_record_of_a_family_owns_as_they_come) {
+    ScratchDir dir("lowmem-unowned");
+    BuildDir d;
+    for (const char* file : {"street_ways.bin", "street_nodes.bin", "addr_points.bin", "addr_vertices.bin", "poi_records.bin", "poi_vertices.bin"})
+        d[file] = {};
+    const LowMemCase c{dir.path(), "empty"};
+    REQUIRE(prepare(c, d, d).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    // Where the patch holds a section, and where the section ends.
+    auto found = [&](const std::vector<char>& section) {
+        const size_t at = find_once(raw, section);
+        return std::pair<size_t, size_t>{at, at == std::string::npos ? at : at + section.size()};
+    };
+    // The sections of the files without a byte on either day: merges without
+    // an op, and the footprints' a full replacement by nothing.
+    const auto ways = found(merge_of(PatchFileId::STREET_WAYS, static_cast<uint32_t>(WAY_HEADER_STRIDE), 0, 0, {})),
+               nodes = found(merge_of(PatchFileId::STREET_NODES, 8, 0, 0, {})), footprints = found(replacement_of(PatchFileId::ADDR_VERTICES, 0, {})),
+               vertices = found(merge_of(PatchFileId::POI_VERTICES, 1, 0, 0, {}));
+    REQUIRE(ways.first != std::string::npos && nodes.first == ways.second && footprints.first != std::string::npos &&
+            vertices.first != std::string::npos);
+    // The patch with [at.first, at.second) replaced by section.
+    auto with = [&](std::pair<size_t, size_t> at, const std::vector<char>& section) {
+        std::vector<char> edited(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(at.first));
+        edited.insert(edited.end(), section.begin(), section.end());
+        edited.insert(edited.end(), raw.begin() + static_cast<std::ptrdiff_t>(at.second), raw.end());
+        return edited;
+    };
+    auto whole = [](PatchFileId fid, uint32_t mib) { return replacement_of(fid, 0, std::vector<char>(size_t{mib} << 20, 0)); };
+    struct Unowned {
+        std::string name;
+        std::function<std::vector<char>(uint32_t mib)> patch;
+        std::string refusal;
+    };
+    const Unowned cases[] = {
+        {"nodes", [&](uint32_t mib) { return with(nodes, whole(PatchFileId::STREET_NODES, mib)); }, "streets: 65536 bytes left over on input 1"},
+        {"footprints", [&](uint32_t mib) { return with(footprints, whole(PatchFileId::ADDR_VERTICES, mib)); },
+         "addr: 65536 bytes left over on input 1"},
+        {"vertices", [&](uint32_t mib) { return with(vertices, whole(PatchFileId::POI_VERTICES, mib)); }, "poi: 65536 bytes left over on input 1"},
+        {"ways",
+         [&](uint32_t mib) {
+             const uint32_t n = (mib << 20) / static_cast<uint32_t>(WAY_HEADER_STRIDE);
+             std::vector<char> records;
+             for (uint32_t w = 0; w < n; w++) append(records, WayHeader{w, 1, 0, 0});
+             std::vector<char> ops;
+             put_op(ops, OP_INSERT_RUN, n, records.data(), WAY_HEADER_STRIDE);
+             return with(ways, merge_of(PatchFileId::STREET_WAYS, static_cast<uint32_t>(WAY_HEADER_STRIDE), 0, 0, ops));
+         },
+         "streets: input 0 runs 1114112 bytes ahead of input 1"},
+        {"nodes-first",
+         [&](uint32_t mib) {
+             std::vector<char> both = whole(PatchFileId::STREET_NODES, mib);
+             both.insert(both.end(), raw.begin() + static_cast<std::ptrdiff_t>(ways.first), raw.begin() + static_cast<std::ptrdiff_t>(ways.second));
+             return with({ways.first, nodes.second}, both);
+         },
+         "streets: input 1 runs 1114112 bytes ahead of input 0"},
+    };
+    constexpr uint32_t MIB = 4, FACTOR = 10, THREADS_RUNS = 3;
+    for (const Unowned& u : cases) {
+        const int failures_before = gctest::failures();
+        const std::string patch = c.dir(u.name + ".gcpatch"), larger = c.dir(u.name + ".larger.gcpatch");
+        REQUIRE(write_patch(c, patch, u.patch(MIB)));
+        REQUIRE(write_patch(c, larger, u.patch(MIB * FACTOR)));
+
+        CHECK(not_refused(c, ALL_MODES, patch, u.name, u.refusal).empty());
+        CHECK(not_refused(c, ALL_MODES, larger, u.name + ".larger", u.refusal).empty());
+        if (gctest::heap_peak_shim()) {
+            for (const std::string& mode : ALL_MODES) {
+                std::vector<uint64_t> peaks[2];
+                for (uint32_t run = 0; run < (mode == "threads" ? THREADS_RUNS : 1); run++)
+                    for (size_t s = 0; s < 2; s++)
+                        if (const auto peak = refused_heap_peak(c, mode, s == 0 ? patch : larger, u.name)) peaks[s].push_back(*peak);
+                REQUIRE(!peaks[0].empty() && !peaks[1].empty());
+                const std::string grew = peak_grew(mode, peaks[0], peaks[1], MIB, FACTOR);
+                if (!grew.empty()) std::printf("    %s\n", grew.c_str());
+                CHECK(grew.empty());
+            }
+        } else {
+            std::printf("    SKIP heap peaks of %s: no heap shim under the sanitizers\n", u.name.c_str());
+        }
+        if (gctest::failures() > failures_before) std::printf("    in: %s\n", u.name.c_str());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
