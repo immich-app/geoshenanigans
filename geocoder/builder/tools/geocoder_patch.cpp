@@ -49,6 +49,7 @@
 #include <vector>
 
 #include "checked_size.h"
+#include "geo_index.h"
 #include "merge_sequence.h"
 #include "patch_format.h"
 #include "scratch_dir.h"
@@ -648,8 +649,8 @@ static int run(int argc, char* argv[]) {
         auto section_io = [&] { return " [" + io_delta(section_start, get_io_counters()) + "]"; };
         uint32_t stride = patch.u32();
         uint64_t old_size = patch.u64(), new_size = patch.u64();
-        // No patch sends the legacy strings.bin (file 0).
-        if (file_id >= (uint32_t)PatchFileId::COUNT || file_id == (uint32_t)PatchFileId::STRINGS) {
+        // No patch sends the legacy strings.bin (file 0), nor a file for the geo index's lists (they name none).
+        if (file_id >= (uint32_t)PatchFileId::COUNT || file_id == (uint32_t)PatchFileId::STRINGS || is_geo_list_id(file_id)) {
             std::cerr << "Unknown file " << file_id << std::endl;
             return 1;
         }
@@ -716,7 +717,10 @@ static int run(int argc, char* argv[]) {
             const std::string suffix = "_cells.bin";
             if (cells_name.size() < suffix.size() || cells_name.compare(cells_name.size() - suffix.size(), suffix.size(), suffix) != 0)
                 throw std::runtime_error("Cell list delta for " + cells_name);
-            std::string entries_name = cells_name.substr(0, cells_name.size() - suffix.size()) + "_entries.bin";
+            const std::string prefix = cells_name.substr(0, cells_name.size() - suffix.size());
+            const std::optional<cell_pairs::Format> format = cell_pairs::format_named(prefix);
+            if (!format) throw std::runtime_error("Cell list delta for " + cells_name);
+            std::string entries_name = prefix + "_entries.bin";
             uint64_t payload_size = patch.u64();
             if (payload_size < 8) throw std::runtime_error("Malformed cell list delta");
             const char* payload = patch.take(payload_size, "cell list delta");
@@ -725,18 +729,17 @@ static int run(int argc, char* argv[]) {
             SequentialFileReader old_e(cur_dir + "/" + entries_name);
             FILE* fc = open_out(cells_name);
             FILE* fe = open_out(entries_name);
-            uint64_t cells_written = 0;
-            uint64_t entries_written = stream_cell_list_delta(
-                old_c, old_e, payload + 8, payload_size - 8,
-                [&](const char* p, size_t n) { fwrite(p, 1, n, fc); cells_written += n; },
+            const CellIndexWritten written = stream_cell_list_delta(
+                old_c, old_e, *format, payload + 8, payload_size - 8,
+                [&](const char* p, size_t n) { fwrite(p, 1, n, fc); },
                 [&](const char* p, size_t n) { fwrite(p, 1, n, fe); });
             close_patch_outputs({{fc, cells_name}, {fe, entries_name}});
             log_rewinds(old_c);
             log_rewinds(old_e);
-            if (cells_written != new_size || entries_written != new_entries_size)
+            if (written.cells_bytes != new_size || written.entries_bytes != new_entries_size)
                 throw std::runtime_error("Rebuilt " + cells_name + " does not match the new build");
             std::cerr << "  " << cells_name << " + " << entries_name << ": cell list delta, "
-                      << cells_written / 12 << " cells" << section_io() << std::endl;
+                      << written.rows << " cells" << section_io() << std::endl;
             continue;
         }
         if (stride == PARALLEL_DELTA_STRIDE) {
@@ -1136,7 +1139,7 @@ static int run(int argc, char* argv[]) {
     malloc_trim(0);
 
     // --- Phase 4: Streaming entry pipeline ---
-    // Walk old geo_cells, remap IDs, apply corrections, write output directly to files.
+    // Walk the old geo index, remap IDs, apply corrections, write the new one directly to its files.
     {
         double t_entry = now_ms();
         std::cerr << "Entry pipeline (lean streaming)..." << std::endl;
@@ -1151,17 +1154,20 @@ static int run(int argc, char* argv[]) {
         const RecordRemap& a_rm = remap_of(PatchFileId::ADDR_POINTS);
         const RecordRemap& i_rm = remap_of(PatchFileId::INTERP_WAYS);
 
-        // The geo walk's old files, decoders and outputs close at the end of
-        // this block, before the admin / POI / place rebuilds.
+        // The geo walk's old files and outputs close at the end of this
+        // block, before the admin / POI / place rebuilds.
         {
-        // The old geo index and its entries files, each read front to back:
-        // the builder writes every list in cell order, removed cells and
-        // NO_DATA lists only leave gaps.
-        SequentialFileReader old_geo(cur_dir + "/geo_cells.bin");
-        SequentialFileReader old_se(cur_dir + "/street_entries.bin");
-        SequentialFileReader old_ae(cur_dir + "/addr_entries.bin");
-        SequentialFileReader old_ie(cur_dir + "/interp_entries.bin");
-        size_t n_old = old_geo.size() / 20;
+        // The old geo index read front to back (geo_index.h): its top file,
+        // and its blocks file through two readers, the second ahead of the
+        // first at each group's footer. The top file and the footers are
+        // read an entry (12 bytes) and a footer (768) at a time, so their
+        // readers read a page each instead of a 64 KiB window.
+        constexpr size_t GEO_TOP_AND_FOOTER_READ_BYTES = 4 << 10;
+        static_assert(GEO_TOP_AND_FOOTER_READ_BYTES >= geo_index::GROUP_BLOCKS * geo_index::ENTRY_BYTES);
+        SequentialFileReader old_top(cur_dir + "/geo_cells.bin", GEO_TOP_AND_FOOTER_READ_BYTES);
+        SequentialFileReader old_blocks(cur_dir + "/geo_entries.bin");
+        SequentialFileReader old_footers(cur_dir + "/geo_entries.bin", GEO_TOP_AND_FOOTER_READ_BYTES);
+        geo_index::Reader old_geo(old_top, old_blocks, old_footers);
 
         // Added and removed cells and the diff's per-cell corrections, in
         // cell id order like the walk, read where they sit through forward
@@ -1176,23 +1182,18 @@ static int run(int argc, char* argv[]) {
             advise_sequential(P + ref->pos, ref->size);
             return GeoListDeltaCursor(P, *ref);
         };
-        GeoListDeltaCursor cur_s = cursor_of(PatchFileId::STREET_ENTRIES);
-        GeoListDeltaCursor cur_a = cursor_of(PatchFileId::ADDR_ENTRIES);
-        GeoListDeltaCursor cur_i = cursor_of(PatchFileId::INTERP_ENTRIES);
+        std::array<GeoListDeltaCursor, geo_index::TABLES> deltas = {
+            cursor_of(GEO_ENTRIES_FILES[0]), cursor_of(GEO_ENTRIES_FILES[1]), cursor_of(GEO_ENTRIES_FILES[2])};
+        const std::array<const RecordRemap*, geo_index::TABLES> remaps = {&w_rm, &a_rm, &i_rm};
         std::vector<uint32_t> scratch;
         log_phase("  Setup", t_entry);
 
-        // Open 4 output files
-        FILE* f_geo = open_out("geo_cells.bin");
-        struct EntriesOut { FILE* f; uint64_t written; };
-        EntriesOut o_se{open_out("street_entries.bin"), 0};
-        EntriesOut o_ae{open_out("addr_entries.bin"), 0};
-        EntriesOut o_ie{open_out("interp_entries.bin"), 0};
-        constexpr uint32_t NO = 0xFFFFFFFF;
-
-        // Reusable buffer (one per entry type to avoid aliasing issues)
-        std::vector<uint32_t> buf;
-        buf.reserve(4096);
+        // The new index through a geo_index::Writer, the builder's bytes for
+        // the same rows.
+        FILE* f_top = open_out("geo_cells.bin");
+        FILE* f_blocks = open_out("geo_entries.bin");
+        geo_index::Writer geo_out([&](const char* p, size_t n) { fwrite(p, 1, n, f_top); },
+                                  [&](const char* p, size_t n) { fwrite(p, 1, n, f_blocks); });
 
         auto remap = [&](std::vector<uint32_t>& ids, const RecordRemap& rm) {
             constexpr uint32_t NO2 = 0xFFFFFFFF;
@@ -1206,101 +1207,53 @@ static int run(int argc, char* argv[]) {
             }
             std::sort(ids.begin(), ids.end());
         };
-        // Write entry and return offset, or NO if empty. Offsets come from a
-        // running count per output: ftell per list cost ~40 s of client CPU
-        // on planet (~460M lists).
-        // Encoded set: the four streams flush as a group whenever one of them would (lists, then
-        // rows), so the encoder always has every list of the rows it is handed and holds at most
-        // the lists of the cell in progress.
-        auto gflush = [&] { for (FILE* f : {o_se.f, o_ae.f, o_ie.f, f_geo}) fflush(f); };
-        auto emit = [&](EntriesOut& out, const uint32_t* ids, size_t n) -> uint32_t {
-            if (n == 0) return NO;
-            if (gcs::store().active && __fpending(out.f) + 2 + n * 4 > gcs::Store::SINK_BUF) gflush();
-            uint32_t off = (uint32_t)out.written;
-            // One libc call per list: the u16 count goes into the stream's buffer in place.
-            const uint16_t c = (uint16_t)n;
-            char count[2];
-            memcpy(count, &c, 2);
-            putc_unlocked(count[0], out.f);
-            putc_unlocked(count[1], out.f);
-            fwrite(ids, 4, n, out.f);
-            out.written += 2 + n * 4;
-            return off;
+
+        // A cell's lists: the old ones (none for a new cell) with their ids
+        // remapped, then corrected by the diff where it sent a correction.
+        // An old cell's lists are remapped where the reader gave them: its
+        // next row replaces them (the reader codes each against its own copy
+        // of the row before), so they aren't copied first.
+        geo_index::RowLists old_lists, new_cell_lists;
+        uint64_t cells_written = 0;
+        auto process_cell = [&](uint64_t cid, geo_index::RowLists& lists) {
+            bool any = false;
+            for (size_t t = 0; t < geo_index::TABLES; t++) {
+                std::vector<uint32_t>& ids = lists[t];
+                if (!ids.empty()) remap(ids, *remaps[t]);
+                if (deltas[t].at(cid)) deltas[t].apply(ids, scratch);
+                any |= !ids.empty();
+            }
+            if (!any) throw std::runtime_error("Malformed patch: geo cell " + std::to_string(cid) + " left without lists");
+            geo_out.add(cid, geo_index::ids_of(lists));
+            cells_written++;
         };
 
         // Merge-walk: old cells + added cells in sorted order
         // Both are sorted by cell_id. Merge them, skip removed.
-        size_t old_i = 0;
-        size_t cells_written = 0;
-
-        // The cell's derived list (old list, ids remapped), then its
-        // correction from the diff, if it sent one.
-        auto do_entry = [&](uint64_t cid, SequentialFileReader& old_e, uint32_t old_off, const RecordRemap& rm,
-                            GeoListDeltaCursor& deltas, EntriesOut& outf) -> uint32_t {
-            read_entry_list(old_e, old_off, buf);
-            if (!buf.empty()) remap(buf, rm);
-            if (deltas.at(cid)) deltas.apply(buf, scratch);
-            if (buf.empty()) return NO;
-            return emit(outf, buf.data(), buf.size());
-        };
-        // old_offs: the cell's street / addr / interp list offsets in the
-        // old entries files, NO for a new cell.
-        using ListOffsets = std::array<uint32_t, 3>;
-        auto process_cell = [&](uint64_t cid, const ListOffsets& old_offs) {
-            uint32_t so = do_entry(cid, old_se, old_offs[0], w_rm, cur_s, o_se);
-            uint32_t ao = do_entry(cid, old_ae, old_offs[1], a_rm, cur_a, o_ae);
-            uint32_t io = do_entry(cid, old_ie, old_offs[2], i_rm, cur_i, o_ie);
-            char rec[20];  // cell id, then the three list offsets, as the old records read
-            memcpy(rec, &cid, 8);
-            memcpy(rec + 8, &so, 4);
-            memcpy(rec + 12, &ao, 4);
-            memcpy(rec + 16, &io, 4);
-            if (gcs::store().active && __fpending(f_geo) + sizeof rec > gcs::Store::SINK_BUF) gflush();
-            fwrite(rec, sizeof rec, 1, f_geo);
-            cells_written++;
-        };
-        const ListOffsets added_cell = {NO, NO, NO};
-
-        while (old_i < n_old || !added.done()) {
-            uint64_t old_cid = UINT64_MAX, add_cid = UINT64_MAX;
-            ListOffsets old_offs = added_cell;
-            if (old_i < n_old) {
-                // One 20-byte record: cell id, then the three list offsets.
-                // size_t: planet has ~380M cells and `old_i * 20` passes 2^31.
-                const char* rec = old_geo.at((uint64_t)old_i * 20, 20);
-                memcpy(&old_cid, rec, 8);
-                memcpy(old_offs.data(), rec + 8, 12);
-            }
-            if (!added.done()) add_cid = added.front();
-
-            if (old_cid <= add_cid) {
-                if (!removed.skip_to(old_cid)) {
-                    process_cell(old_cid, old_offs);
-                } else {
-                    // An encoded set's lists come in row order: those before a removed row's are
-                    // never read, and the gxc decoder drops them instead of queueing a removed
-                    // stretch's lists for the next row kept.
-                    SequentialFileReader* es[3] = {&old_se, &old_ae, &old_ie};
-                    for (int t = 0; t < 3; t++)
-                        if (old_offs[size_t(t)] != NO) es[t]->skip_to(old_offs[size_t(t)]);
-                }
-                old_i++;
-                if (!added.done() && old_cid == add_cid) added.pop(); // skip duplicate add
+        uint64_t old_cid = 0;
+        bool have_old = old_geo.next(old_cid, old_lists);
+        while (have_old || !added.done()) {
+            const uint64_t at_old = have_old ? old_cid : UINT64_MAX, add_cid = added.done() ? UINT64_MAX : added.front();
+            if (at_old <= add_cid) {
+                if (!removed.skip_to(at_old)) process_cell(at_old, old_lists);
+                have_old = old_geo.next(old_cid, old_lists);
+                if (!added.done() && at_old == add_cid) added.pop(); // skip duplicate add
             } else {
-                process_cell(add_cid, added_cell);
+                for (std::vector<uint32_t>& l : new_cell_lists) l.clear();
+                process_cell(add_cid, new_cell_lists);
                 added.pop();
             }
 
             if (cells_written % 10000000 == 0 && cells_written > 0) {
-                std::cerr << "    " << cells_written << " cells, se=" << o_se.written/1024/1024
-                          << "M ae=" << o_ae.written/1024/1024 << "M anon=" << get_rss_anon_mb() << "M" << std::endl;
+                std::cerr << "    " << cells_written << " cells, " << geo_out.blocks_bytes() / 1024 / 1024
+                          << "M blocks, anon=" << get_rss_anon_mb() << "M" << std::endl;
             }
         }
         removed.require_ascending();
+        geo_out.finish();
 
-        close_patch_outputs({{f_geo, "geo_cells.bin"}, {o_se.f, "street_entries.bin"}, {o_ae.f, "addr_entries.bin"},
-                             {o_ie.f, "interp_entries.bin"}});
-        for (const SequentialFileReader* r : {&old_geo, &old_se, &old_ae, &old_ie}) log_rewinds(*r);
+        close_patch_outputs({{f_top, "geo_cells.bin"}, {f_blocks, "geo_entries.bin"}});
+        for (const SequentialFileReader* r : {&old_top, &old_blocks, &old_footers}) log_rewinds(*r);
         std::cerr << "  Geo: " << cells_written << " cells written" << std::endl;
         malloc_trim(0);
         log_phase("  Geo entries complete", t_entry);
@@ -1321,14 +1274,15 @@ static int run(int argc, char* argv[]) {
                 SequentialFileReader old_e(cur_dir + "/" + entries_name);
                 FILE* fc = open_out(cells_name);
                 FILE* fe = open_out(entries_name);
-                size_t n_out = 0;
-                stream_cell_index(old_c, old_e, changes.added, changes.removed, remap, P + delta->pos, delta->size,
-                                  [&](const char* p, size_t len) { fwrite(p, 1, len, fc); n_out += len; },
-                                  [&](const char* p, size_t len) { fwrite(p, 1, len, fe); });
+                const CellIndexWritten written =
+                    stream_cell_index(old_c, old_e, cell_pairs::format_of(prefix), changes.added, changes.removed, remap,
+                                      P + delta->pos, delta->size,
+                                      [&](const char* p, size_t len) { fwrite(p, 1, len, fc); },
+                                      [&](const char* p, size_t len) { fwrite(p, 1, len, fe); });
                 close_patch_outputs({{fc, cells_name}, {fe, entries_name}});
                 log_rewinds(old_c);
                 log_rewinds(old_e);
-                std::cerr << "  " << label << ": " << n_out / 12 << " cells, cell index delta" << std::endl;
+                std::cerr << "  " << label << ": " << written.rows << " cells, cell index delta" << std::endl;
             } else if (listed.count(cells_name) || stat((cur_dir + "/" + cells_name).c_str(), &st) == 0) {
                 throw std::runtime_error("Patch has no cell index delta for " + prefix);
             }

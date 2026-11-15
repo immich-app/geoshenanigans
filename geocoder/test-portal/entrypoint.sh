@@ -36,10 +36,10 @@ selection_files() {
         done
         return
     fi
-    for f in geo_cells.bin \
-             street_entries.bin street_ways.bin street_nodes.bin \
-             addr_entries.bin addr_points.bin addr_vertices.bin addr_postcodes.bin \
-             interp_entries.bin interp_ways.bin interp_nodes.bin interp_postcodes.bin \
+    for f in geo_cells.bin geo_entries.bin \
+             street_ways.bin street_nodes.bin \
+             addr_points.bin addr_vertices.bin addr_postcodes.bin \
+             interp_ways.bin interp_nodes.bin interp_postcodes.bin \
              admin_cells.bin admin_entries.bin admin_parents.bin \
              place_nodes.bin \
              postcode_centroids.bin postcode_centroid_cells.bin postcode_centroid_entries.bin \

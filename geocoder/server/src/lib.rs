@@ -15,6 +15,10 @@ pub use admin_geometry::{AdminGeometry, AdminPoint, PipMemo, ADMIN_GEOMETRY_FILE
 mod arc_blocks;
 #[cfg(any(test, feature = "fixtures"))]
 pub mod arc_fixture;
+pub mod cell_pairs;
+pub mod geo_index;
+pub use cell_pairs::CellPairs;
+pub use geo_index::{GeoIndex, GeoLists};
 mod exact_pip;
 pub use exact_pip::{edge_crosses, on_edge, to_e7, PointE7};
 mod file_stamp;
@@ -783,6 +787,12 @@ pub struct StringPool {
     pub bases: [u32; STR_TIER_COUNT + 1],
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The strings `StringPool::get` has read on this thread, for tests that count a lookup's reads.
+    static STRING_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl StringPool {
     /// Construct directly from tier buffers + parsed bases.  Used by
     /// the loader (which mmaps then wraps).
@@ -822,6 +832,8 @@ impl StringPool {
     }
 
     pub fn get(&self, offset: u32) -> &str {
+        #[cfg(test)]
+        STRING_READS.with(|n| n.set(n.get() + 1));
         if offset == NO_DATA { return ""; }
         for t in 0..STR_TIER_COUNT {
             if offset < self.bases[t + 1] {
@@ -976,15 +988,15 @@ impl AdminScan {
             return AdminScan { rings: Vec::new(), pip: ScanPip { point, memo: PipMemo::new() } };
         }
         let (lat, lng) = point.degrees();
-        let list = Index::lookup_admin_cell_fb(&index.admin_cells, cell_id_at_level(lat, lng, index.admin_cell_level));
-        // The list, each record and most ring headers are read below wherever the point is, so
-        // they are requested before the first one is needed: their cache misses overlap.
-        if list != NO_DATA { index.admin_entries.prefetch(list as u64); }
+        // Each record and most ring headers are read below wherever the point is, so they are
+        // requested before the first one is needed: their cache misses overlap.
         let record_bytes = std::mem::size_of::<AdminPolygon>() as u64;
-        Index::for_each_entry_fb(&index.admin_entries, list, |id| index.admin_polygons.prefetch((id & ID_MASK) as u64 * record_bytes));
         let mut rings = Vec::new();
-        Index::for_each_entry_fb(&index.admin_entries, list, |id| {
-            if let Some(poly) = index.admin_polygon(id & ID_MASK) { rings.push((id, poly)); }
+        index.admin_index.with_ids(cell_id_at_level(lat, lng, index.admin_cell_level), |ids| {
+            ids.iter().for_each(|&id| index.admin_polygons.prefetch((id & ID_MASK) as u64 * record_bytes));
+            for &id in ids {
+                if let Some(poly) = index.admin_polygon(id & ID_MASK) { rings.push((id, poly)); }
+            }
         });
         for (_, poly) in &rings {
             index.admin_geometry.prefetch(poly);
@@ -1024,26 +1036,23 @@ impl ScanPip {
 // --- Index data ---
 
 pub struct Index {
-    pub geo_cells: Option<FileBytes>,
-    pub street_entries: Option<FileBytes>,
+    /// The cells' lists of street ways, address points and interpolation ways (geo_index.rs);
+    /// none in a dir without streets.
+    pub geo_index: GeoIndex,
     pub street_ways: Option<FileBytes>,
     pub street_nodes: Option<FileBytes>,
-    pub addr_entries: Option<FileBytes>,
     pub addr_points: Option<FileBytes>,
     pub addr_vertices: Option<FileBytes>,
-    pub interp_entries: Option<FileBytes>,
     pub interp_ways: Option<FileBytes>,
     pub interp_nodes: Option<FileBytes>,
     // TIGER per-segment ZIP sidecar: u32 postcode string offset per interp
     // way (NO_DATA for OSM interpolations). Absent on builds without TIGER
     // data and on pre-sidecar indexes — individually optional.
     pub interp_postcodes: Option<FileBytes>,
-    pub admin_cells: FileBytes,
-    pub admin_entries: FileBytes,
+    pub admin_index: CellPairs,
     pub admin_polygons: FileBytes,
     pub admin_geometry: AdminGeometry,
-    pub poi_cells: Option<FileBytes>,
-    pub poi_entries: Option<FileBytes>,
+    pub poi_index: Option<CellPairs>,
     pub poi_records: Option<FileBytes>,
     pub poi_vertices: Option<FileBytes>,
     pub poi_meta: PoiMeta,
@@ -1058,8 +1067,7 @@ pub struct Index {
     pub addr_postcodes: Option<FileBytes>, // u32 per addr_point → postcode string (optional)
     pub way_postcodes: Option<FileBytes>,  // u32 per way → postcode string from postal boundary
     pub postcode_centroids: Option<FileBytes>,
-    pub postcode_centroid_cells: Option<FileBytes>,
-    pub postcode_centroid_entries: Option<FileBytes>,
+    pub postcode_centroid_index: Option<CellPairs>,
     pub admin_config: AdminLevelConfig,
     pub strings: StringPool,
     pub street_cell_level: u64,
@@ -1154,17 +1162,17 @@ fn interpolate_house_number(start: u32, end: u32, interpolation: u8, t: f64) -> 
 
 pub const NO_DATA: u32 = 0xFFFFFFFF;
 
+thread_local! {
+    /// The lists of a query's geo lookups (geo_index.rs), taken while the lookup's caller reads
+    /// them and put back after.
+    static GEO_LISTS: std::cell::Cell<GeoLists> = Default::default();
+}
+
 // Entry-ID encoding for admin/POI cell entries: the high bit flags an
 // "interior" entry (cell fully inside the polygon, a fast path for PIP),
 // and the low 31 bits carry the polygon/POI index.
 pub const INTERIOR_FLAG: u32 = 0x80000000;
 pub const ID_MASK: u32 = 0x7FFFFFFF;
-
-pub struct GeoCellOffsets {
-    pub street: u32,
-    pub addr: u32,
-    pub interp: u32,
-}
 
 pub fn mmap_file(path: &str) -> Result<FileBytes, String> {
     let file = File::open(path).map_err(|e| format!("Failed to open {}: {}", path, e))?;
@@ -1242,8 +1250,14 @@ impl Index {
         let radians = search_distance / 6_371_000.0;
         let max_distance_sq = radians * radians;
 
-        let geo_cells = mmap_file_optional(&format!("{}/geo_cells.bin", dir));
+        let [geo_cells, geo_entries]: [Option<FileBytes>; 2] =
+            mmap_group(dir, &["geo_cells.bin", "geo_entries.bin"])?.try_into().map_err(|_| "geo group arity")?;
         let has_geo = geo_cells.is_some();
+        let geo_index = match (geo_cells, geo_entries) {
+            (Some(top), Some(blocks)) => GeoIndex::open(top, blocks, street_cell_level)
+                .map_err(|e| format!("{dir}/geo_cells.bin: {e}"))?,
+            _ => GeoIndex::none(),
+        };
 
         let required_geo = |name: &str| -> Result<Option<FileBytes>, String> {
             let path = format!("{}/{}", dir, name);
@@ -1260,11 +1274,9 @@ impl Index {
         // was added in v9 (building footprints) and older indexes
         // legitimately lack it. The way_/admin_parents and *_postcodes
         // sidecars are individually optional for the same version reason.
-        let [addr_entries, addr_points]: [Option<FileBytes>; 2] =
-            mmap_group(dir, &["addr_entries.bin", "addr_points.bin"])?
-                .try_into().map_err(|_| "addr group arity")?;
-        let [interp_entries, interp_ways, interp_nodes]: [Option<FileBytes>; 3] =
-            mmap_group(dir, &["interp_entries.bin", "interp_ways.bin", "interp_nodes.bin"])?
+        let addr_points = mmap_file_optional(&format!("{}/addr_points.bin", dir));
+        let [interp_ways, interp_nodes]: [Option<FileBytes>; 2] =
+            mmap_group(dir, &["interp_ways.bin", "interp_nodes.bin"])?
                 .try_into().map_err(|_| "interp group arity")?;
         let [poi_cells, poi_entries, poi_records, poi_vertices]: [Option<FileBytes>; 4] =
             mmap_group(dir, &["poi_cells.bin", "poi_entries.bin", "poi_records.bin", "poi_vertices.bin"])?
@@ -1277,25 +1289,34 @@ impl Index {
         let [postcode_centroids, postcode_centroid_cells, postcode_centroid_entries]: [Option<FileBytes>; 3] =
             mmap_group(dir, &["postcode_centroids.bin", "postcode_centroid_cells.bin", "postcode_centroid_entries.bin"])?
                 .try_into().map_err(|_| "centroid group arity")?;
+        // A cell pair index (cell_pairs.rs) of the dir, an error naming its cells file.
+        let pairs = |prefix: &str, cells: FileBytes, entries: FileBytes, format: cell_pairs::Format| {
+            CellPairs::open(cells, entries, format, admin_cell_level).map_err(|e| format!("{dir}/{prefix}_cells.bin: {e}"))
+        };
+        let poi_index = match (poi_cells, poi_entries) {
+            (Some(c), Some(e)) => Some(pairs("poi", c, e, cell_pairs::POI)?),
+            _ => None,
+        };
+        let postcode_centroid_index = match (postcode_centroid_cells, postcode_centroid_entries) {
+            (Some(c), Some(e)) => Some(pairs("postcode_centroid", c, e, cell_pairs::POSTCODE_CENTROID)?),
+            _ => None,
+        };
+        let admin_index = pairs("admin", mmap_file(&format!("{}/admin_cells.bin", dir))?,
+                                mmap_file(&format!("{}/admin_entries.bin", dir))?, cell_pairs::ADMIN)?;
 
         Ok(Index {
-            geo_cells,
-            street_entries: required_geo("street_entries.bin")?,
+            geo_index,
             street_ways: required_geo("street_ways.bin")?,
             street_nodes: required_geo("street_nodes.bin")?,
-            addr_entries,
             addr_points,
             addr_vertices: mmap_file_optional(&format!("{}/addr_vertices.bin", dir)),
-            interp_entries,
             interp_ways,
             interp_nodes,
             interp_postcodes: mmap_file_optional(&format!("{}/interp_postcodes.bin", dir)),
-            admin_cells: mmap_file(&format!("{}/admin_cells.bin", dir))?,
-            admin_entries: mmap_file(&format!("{}/admin_entries.bin", dir))?,
+            admin_index,
             admin_polygons: mmap_file(&format!("{}/admin_polygons.bin", dir))?,
             admin_geometry: AdminGeometry::load(dir)?,
-            poi_cells,
-            poi_entries,
+            poi_index,
             poi_records,
             poi_vertices,
             poi_meta: PoiMeta::load(dir),
@@ -1307,8 +1328,7 @@ impl Index {
             addr_postcodes: mmap_file_optional(&format!("{}/addr_postcodes.bin", dir)),
             way_postcodes: mmap_file_optional(&format!("{}/way_postcodes.bin", dir)),
             postcode_centroids,
-            postcode_centroid_cells,
-            postcode_centroid_entries,
+            postcode_centroid_index,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::load(dir)?,
             street_cell_level,
@@ -1384,7 +1404,7 @@ impl Index {
         Some(ap)
     }
 
-    /// Call `f` for each ID in the cell-entry list at `offset`.  Wire
+    /// Call `f` for each ID in the place index's list at `offset`.  Wire
     /// format: u16 count, then count u32 IDs.  Bulk-reads the entries into a Cow once so the inner
     /// loop doesn't pay per-id chunk-fetch overhead.
     pub fn for_each_entry_fb(entries: &FileBytes, offset: u32, mut f: impl FnMut(u32)) {
@@ -1402,9 +1422,9 @@ impl Index {
         }
     }
 
-    /// Chunked-aware admin-cell lookup: 12-byte stride sorted index
-    /// (u64 cell_id + u32 entries_offset) over a FileBytes source.
-    pub fn lookup_admin_cell_fb(cells: &FileBytes, cell_id: u64) -> u32 {
+    /// The place index's lookup (place_index.rs): its cells file is a 12-byte stride sorted
+    /// index (u64 cell_id + u32 entries_offset) over a FileBytes source.
+    pub fn lookup_place_cell_fb(cells: &FileBytes, cell_id: u64) -> u32 {
         const STRIDE: u64 = 12;
         let count = cells.len() / STRIDE;
         if count == 0 { return NO_DATA; }
@@ -1421,72 +1441,31 @@ impl Index {
         NO_DATA
     }
 
-    // geo_cells is a 20-byte-stride sorted index — binary search it
-    // with read_chunk.
-    pub fn lookup_geo_cell_fb(geo_cells: &FileBytes, target: u64) -> GeoCellOffsets {
-        let entry_size: u64 = 20;
-        let count = geo_cells.len() / entry_size;
-        let empty = GeoCellOffsets { street: NO_DATA, addr: NO_DATA, interp: NO_DATA };
-        if count == 0 { return empty; }
-        let mut lo: u64 = 0;
-        let mut hi = count;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let bytes = geo_cells.read_chunk(mid * entry_size, entry_size as usize);
-            let mid_id = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-            if mid_id == target {
-                return GeoCellOffsets {
-                    street: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-                    addr:   u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-                    interp: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-                };
-            } else if mid_id < target { lo = mid + 1; } else { hi = mid; }
-        }
-        empty
-    }
-
-    // Read entries blob as Cow so it works on chunked sources.
-    // Same wire format as `for_each_entry_fb` (u16 count, then count
-    // u32 IDs), but materialises the IDs into a Vec for callers that
-    // need to iterate them more than once.
-    pub fn read_entries_fb(source: &FileBytes, offset: u32) -> Vec<u32> {
-        if offset == NO_DATA { return Vec::new(); }
-        let off = offset as u64;
-        if off + 2 > source.len() { return Vec::new(); }
-        let header = source.read_chunk(off, 2);
-        let count = u16::from_le_bytes([header[0], header[1]]) as usize;
-        if count == 0 { return Vec::new(); }
-        // Bound the payload: a corrupt count must not read past EOF.
-        if off + 2 + (count as u64) * 4 > source.len() { return Vec::new(); }
-        let blob = source.read_chunk(off + 2, count * 4);
-        let mut out = Vec::with_capacity(count);
-        for i in 0..count {
-            out.push(u32::from_le_bytes(blob[i*4..i*4+4].try_into().unwrap()));
-        }
-        out
-    }
-
-
     // --- Geo lookup (streets, addresses, interpolation from merged index) ---
+
+    /// The point's street-level cell and its neighbours, in the order the geo lookups read them.
+    fn geo_cells_around(&self, lat: f64, lng: f64) -> Vec<u64> {
+        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
+        std::iter::once(cell).chain(cell_neighbors_at_level(cell, self.street_cell_level)).collect()
+    }
 
     pub fn query_geo(&self, lat: f64, lng: f64)
         -> (Option<(f64, AddrPoint, u32)>, Option<(f64, &str, u32, u32)>, Option<(f64, WayHeader, u32)>)
     {
-        let geo_cells = match &self.geo_cells {
-            Some(gc) => gc,
-            None => return (None, None, None),
-        };
-        // Street files always accompany geo_cells in a well-formed index
+        if self.geo_index.is_empty() {
+            return (None, None, None);
+        }
+        // Street files always accompany the geo index in a well-formed dir
         // (required_geo enforces all-or-nothing at load). Guard rather than
         // unwrap so a partial/admin-only index degrades gracefully instead
         // of panicking.
-        let (Some(street_entries), Some(street_ways), Some(street_nodes)) =
-            (self.street_entries.as_ref(), self.street_ways.as_ref(), self.street_nodes.as_ref())
+        let (Some(street_ways), Some(street_nodes)) = (self.street_ways.as_ref(), self.street_nodes.as_ref())
         else {
             return (None, None, None);
         };
-        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
-        let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
+        let cells = self.geo_cells_around(lat, lng);
+        let mut lists = GEO_LISTS.with(std::cell::Cell::take);
+        self.geo_index.lookup_many(&cells, geo_index::ALL_TABLES, &mut lists);
 
         let cos_lat = lat.to_radians().cos();
         let addr_key = |a: &AddrPoint| {
@@ -1512,14 +1491,12 @@ impl Index {
         // Fixed-size hash set on stack to skip duplicate street IDs across cells
         let mut seen_streets: [u32; 64] = [u32::MAX; 64];
 
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            let offsets = Self::lookup_geo_cell_fb(geo_cells, c);
-
+        for i in 0..cells.len() {
             // Addresses. Building-sourced points (vertex_count > 0)
             // use polygon distance, matching ST_Distance behaviour.
-            if let (Some(addr_entries), Some(addr_points)) = (self.addr_entries.as_ref(), self.addr_points.as_ref()) {
+            if let Some(addr_points) = self.addr_points.as_ref() {
                 let total_addr = addr_points.len() / std::mem::size_of::<AddrPoint>() as u64;
-                for id in Self::read_entries_fb(addr_entries, offsets.addr) {
+                for &id in lists.list(i, geo_index::ADDRESSES) {
                     let idx = id as u64;
                     if idx >= total_addr { continue; }
                     let point: AddrPoint = addr_points.read_at(idx);
@@ -1540,7 +1517,7 @@ impl Index {
             // Streets
             let total_ways = street_ways.len() / std::mem::size_of::<WayHeader>() as u64;
             let total_street_nodes = street_nodes.len() / std::mem::size_of::<NodeCoord>() as u64;
-            for id in Self::read_entries_fb(street_entries, offsets.street) {
+            for &id in lists.list(i, geo_index::STREETS) {
                 let slot = (id as usize) & 0x3F;
                 if seen_streets[slot] == id { continue; }
                 seen_streets[slot] = id;
@@ -1572,11 +1549,9 @@ impl Index {
             }
 
             // Interpolation
-            if let (Some(interp_entries), Some(interp_ways)) =
-                (self.interp_entries.as_ref(), self.interp_ways.as_ref())
-            {
+            if let Some(interp_ways) = self.interp_ways.as_ref() {
                 let total_interps = interp_ways.len() / std::mem::size_of::<InterpWay>() as u64;
-                for id in Self::read_entries_fb(interp_entries, offsets.interp) {
+                for &id in lists.list(i, geo_index::INTERPOLATIONS) {
                     // Corrupt cell entries must not read past the record files.
                     if (id as u64) >= total_interps { continue; }
                     let iw: InterpWay = interp_ways.read_at(id as u64);
@@ -1591,6 +1566,8 @@ impl Index {
                 }
             }
         }
+
+        GEO_LISTS.with(|g| g.set(lists));
 
         let addr_result = best_addr.map(|p| (best_addr_dist, p, best_addr_id));
         let street_result = best_street.map(|w| (best_street_dist, w, best_street_idx));
@@ -1611,13 +1588,12 @@ impl Index {
     pub fn find_addr_on_way(&self, lat: f64, lng: f64, parent_way_idx: u32, max_dist_sq: f64)
         -> Option<AddrPoint>
     {
-        let geo_cells = self.geo_cells.as_ref()?;
-        let addr_entries = self.addr_entries.as_ref()?;
         let addr_points = self.addr_points.as_ref()?;
         let total_addr = addr_points.len() / std::mem::size_of::<AddrPoint>() as u64;
 
-        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
-        let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
+        let cells = self.geo_cells_around(lat, lng);
+        let mut lists = GEO_LISTS.with(std::cell::Cell::take);
+        self.geo_index.lookup_many(&cells, 1 << geo_index::ADDRESSES, &mut lists);
         let cos_lat = lat.to_radians().cos();
         let addr_key = |a: &AddrPoint| {
             let d = dist_sq((a.lat as f64 - lat).to_radians(), (a.lng as f64 - lng).to_radians(), cos_lat);
@@ -1626,9 +1602,8 @@ impl Index {
 
         let mut best_dist = max_dist_sq;
         let mut best: Option<AddrPoint> = None;
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            let offsets = Self::lookup_geo_cell_fb(geo_cells, c);
-            for id in Self::read_entries_fb(addr_entries, offsets.addr) {
+        for i in 0..cells.len() {
+            for &id in lists.list(i, geo_index::ADDRESSES) {
                 let idx = id as u64;
                 if idx >= total_addr { continue; }
                 let point: AddrPoint = addr_points.read_at(idx);
@@ -1645,6 +1620,7 @@ impl Index {
                 }
             }
         }
+        GEO_LISTS.with(|g| g.set(lists));
         best
     }
 
@@ -1672,19 +1648,17 @@ impl Index {
     /// Equally near lines (TIGER's odd and even sides share the street
     /// centreline) go to the lower start number, not to record order.
     pub fn find_interp_on_way(&self, lat: f64, lng: f64, street_name: &str, max_dist_sq: f64) -> Option<u32> {
-        let geo_cells = self.geo_cells.as_ref()?;
-        let interp_entries = self.interp_entries.as_ref()?;
         let interp_ways = self.interp_ways.as_ref()?;
         let total_interps = interp_ways.len() / std::mem::size_of::<InterpWay>() as u64;
 
-        let cell = cell_id_at_level(lat, lng, self.street_cell_level);
-        let neighbors = cell_neighbors_at_level(cell, self.street_cell_level);
+        let cells = self.geo_cells_around(lat, lng);
+        let mut lists = GEO_LISTS.with(std::cell::Cell::take);
+        self.geo_index.lookup_many(&cells, 1 << geo_index::INTERPOLATIONS, &mut lists);
         let cos_lat = lat.to_radians().cos();
 
         let mut best: Option<(f64, InterpWay, f64)> = None;
-        for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            let offsets = Self::lookup_geo_cell_fb(geo_cells, c);
-            for id in Self::read_entries_fb(interp_entries, offsets.interp) {
+        for i in 0..cells.len() {
+            for &id in lists.list(i, geo_index::INTERPOLATIONS) {
                 if (id as u64) >= total_interps { continue; }
                 let iw: InterpWay = interp_ways.read_at(id as u64);
                 if iw.start_number == 0 || iw.end_number == 0 { continue; }
@@ -1699,6 +1673,7 @@ impl Index {
                 if better { best = Some((dist, iw, t)); }
             }
         }
+        GEO_LISTS.with(|g| g.set(lists));
         best.map(|(_, iw, t)| interpolate_house_number(iw.start_number, iw.end_number, iw.interpolation, t))
     }
 
@@ -1757,7 +1732,7 @@ impl Index {
         // The cells find_places looks in around the point.
         let mut nearby: Vec<serde_json::Value> = Vec::new();
         for c in cells_near_point(lat, lng, MAX_PLACE_FUZZY_HALF_SIDE_M, self.admin_cell_level) {
-            Self::for_each_entry_fb(place_entries, Self::lookup_admin_cell_fb(place_cells, c), |id| {
+            Self::for_each_entry_fb(place_entries, Self::lookup_place_cell_fb(place_cells, c), |id| {
                 let Some(pn) = self.place_node(id) else { return; };
                 let pt = pn.place_type as usize;
                 if pt >= 7 { return; }
@@ -1805,7 +1780,7 @@ impl Index {
         let mut seen_in_level: [Vec<serde_json::Value>; 12] = Default::default();
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
+            self.admin_index.for_each(c, |id| {
                 // The interior flag on a (cell, polygon) entry proves
                 // containment only for queries INSIDE that cell. Neighbor
                 // cells are iterated for near-miss distance work; honoring
@@ -1881,7 +1856,7 @@ impl Index {
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
         let (mut seen, mut hits) = (std::collections::HashSet::new(), Vec::new());
         for c in std::iter::once(cell).chain(cell_neighbors_at_level(cell, self.admin_cell_level)) {
-            Self::for_each_entry_fb(&self.admin_entries, Self::lookup_admin_cell_fb(&self.admin_cells, c), |id| {
+            self.admin_index.for_each(c, |id| {
                 if seen.insert(id & ID_MASK) { hits.push(id & ID_MASK); }
             });
         }
@@ -2218,7 +2193,7 @@ impl Index {
         };
         let mut ids: Vec<u32> = Vec::new();
         for c in cells {
-            Self::for_each_entry_fb(place_entries, Self::lookup_admin_cell_fb(place_cells, c), |id| ids.push(id));
+            Self::for_each_entry_fb(place_entries, Self::lookup_place_cell_fb(place_cells, c), |id| ids.push(id));
         }
         ids.sort_unstable();
         ids.dedup();
@@ -2321,8 +2296,7 @@ impl Index {
     // the polygon, otherwise the distance to the nearest edge. None for
     // a point off the globe (see find_pois).
     pub fn find_nearest_poi_with_parent(&self, lat: f64, lng: f64) -> Option<(f64, PoiRecord)> {
-        let poi_cells = self.poi_cells.as_ref()?;
-        let poi_entries = self.poi_entries.as_ref()?;
+        let poi_index = self.poi_index.as_ref()?;
         if self.poi_records.is_none() || !coords_in_range(lat, lng) { return None; }
 
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
@@ -2340,7 +2314,7 @@ impl Index {
         let mut fallback_idx: Option<u32> = None;
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry_fb(poi_entries, Self::lookup_admin_cell_fb(poi_cells, c), |id| {
+            poi_index.for_each(c, |id| {
                 // The interior flag on a (cell, polygon) entry proves
                 // containment only for queries INSIDE that cell. Neighbor
                 // cells are iterated for near-miss distance work; honoring
@@ -2423,14 +2397,7 @@ impl Index {
     /// The POIs near (lat, lng); none for a point off the globe, or NaN: S2 would wrap it onto a
     /// cell of the globe, whose interior entries hold that cell's points, not this one.
     pub fn find_pois(&self, lat: f64, lng: f64) -> Vec<PoiMatch<'_>> {
-        let poi_cells = match &self.poi_cells {
-            Some(c) => c,
-            None => return vec![],
-        };
-        let poi_entries = match &self.poi_entries {
-            Some(e) => e,
-            None => return vec![],
-        };
+        let Some(poi_index) = &self.poi_index else { return vec![] };
         if self.poi_records.is_none() || !coords_in_range(lat, lng) { return vec![]; }
 
         let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
@@ -2439,7 +2406,7 @@ impl Index {
         let mut results: Vec<PoiMatch<'_>> = Vec::new();
 
         for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-            Self::for_each_entry_fb(poi_entries, Self::lookup_admin_cell_fb(poi_cells, c), |id| {
+            poi_index.for_each(c, |id| {
                 // The interior flag on a (cell, polygon) entry proves
                 // containment only for queries INSIDE that cell. Neighbor
                 // cells are iterated for near-miss distance work; honoring
@@ -2451,8 +2418,6 @@ impl Index {
                 let is_interior = c == cell && (id & INTERIOR_FLAG) != 0;
                 let poi_id = (id & ID_MASK) as u32;
                 let Some(poi) = self.poi_record(poi_id) else { return; };
-                let name = self.get_string(poi.name_id);
-                if name.is_empty() { return; }
 
                 let ref_dist = self.poi_meta.reference_distance(poi.category);
                 let importance = if poi.importance > 0 {
@@ -2542,6 +2507,10 @@ impl Index {
                 };
                 let score = importance * proximity_weight;
                 if score < 0.5 { return; }
+                // Read the name only now: none of the filters above needs it, and most
+                // candidates fail one of them.
+                let name = self.get_string(poi.name_id);
+                if name.is_empty() { return; }
 
                 results.push(PoiMatch {
                     name,
@@ -2837,17 +2806,20 @@ impl Index {
                 let dlng = (lng - pc.lng as f64).to_radians();
                 let d = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
                 if d >= max_dist_sq { return; }
+                // A centroid farther than the best so far can't win (nearer_postcode), so its
+                // postcode isn't read.
+                if best.is_some_and(|(best_d, _)| d > best_d) { return; }
                 let s = self.get_string(pc.postcode_id);
                 if centroid_postcode_ok(s) && nearer_postcode(d, s, best) {
                     best = Some((d, s));
                 }
             };
 
-            if let (Some(ref cells), Some(ref entries)) = (&self.postcode_centroid_cells, &self.postcode_centroid_entries) {
+            if let Some(ref centroid_index) = self.postcode_centroid_index {
                 let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
                 let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
                 for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-                    Self::for_each_entry_fb(entries, Self::lookup_admin_cell_fb(cells, c), |id| {
+                    centroid_index.for_each(c, |id| {
                         if let Some(pc) = self.postcode_centroid(id) { consider(pc); }
                     });
                 }
@@ -3767,18 +3739,6 @@ mod query_tests {
         }
     }
 
-    /// The `*_cells.bin` and `*_entries.bin` of (cell, id) pairs.
-    fn cell_index(mut pairs: Vec<(u64, u32)>) -> (FileBytes, FileBytes) {
-        pairs.sort();
-        let (mut cells, mut entries) = (Vec::new(), Vec::new());
-        for group in pairs.chunk_by(|a, b| a.0 == b.0) {
-            cells.extend_from_slice(&group[0].0.to_le_bytes());
-            u32s(&mut cells, &[entries.len() as u32]);
-            entries.extend_from_slice(&(group.len() as u16).to_le_bytes());
-            u32s(&mut entries, &group.iter().map(|p| p.1).collect::<Vec<_>>());
-        }
-        (FileBytes::Owned(cells), FileBytes::Owned(entries))
-    }
 
     /// An index of boundaries (in the admin cell of their centre) and place
     /// nodes only, without streets, POIs or countries, like Antarctica's.
@@ -3808,30 +3768,25 @@ mod query_tests {
             u32s(&mut records, &[NO_DATA]);
         }
         assert_eq!(records.len(), nodes.len() * std::mem::size_of::<PlaceNode>());
-        let (admin_cells, admin_entries) = cell_index(admin_pairs);
+        let admin_index = cell_pairs::from_pairs(admin_pairs, cell_pairs::ADMIN);
         // Derived as a load derives it; a few nodes fit one run, so nothing spills.
         let (mut place_cells, mut place_entries) = (Vec::new(), Vec::new());
         place_index::derive(&records[..], DEFAULT_ADMIN_CELL_LEVEL, place_index::RUN_BYTES, &std::env::temp_dir(),
                             &mut place_cells, &mut place_entries).unwrap();
         let end = strings.len() as u32;
         Index {
-            geo_cells: None,
-            street_entries: None,
+            geo_index: GeoIndex::none(),
             street_ways: None,
             street_nodes: None,
-            addr_entries: None,
             addr_points: None,
             addr_vertices: None,
-            interp_entries: None,
             interp_ways: None,
             interp_nodes: None,
             interp_postcodes: None,
-            admin_cells,
-            admin_entries,
+            admin_index,
             admin_polygons: FileBytes::Owned(polygons),
             admin_geometry: AdminGeometry::new(FileBytes::Owned(rings), FileBytes::Owned(arc_index), FileBytes::Owned(arc_vertices)),
-            poi_cells: None,
-            poi_entries: None,
+            poi_index: None,
             poi_records: None,
             poi_vertices: None,
             poi_meta: PoiMeta::from_json("{}"),
@@ -3843,8 +3798,7 @@ mod query_tests {
             addr_postcodes: None,
             way_postcodes: None,
             postcode_centroids: None,
-            postcode_centroid_cells: None,
-            postcode_centroid_entries: None,
+            postcode_centroid_index: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(FileBytes::Owned(strings)), None, None, None, None], [0, end, end, end, end, end]),
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
@@ -3912,6 +3866,192 @@ mod query_tests {
 
         assert_eq!(village(elsewhere), None);
         assert_eq!(village(AdminPolygon { ring_bytes: 0, ..elsewhere }), Some("Shoals Village"));
+    }
+
+    /// (metres north of `origin()`, metres east, name or None for a tombstone, category,
+    /// importance) of a point POI.
+    type Poi<'a> = (f64, f64, Option<&'a str>, u8, u8);
+    /// (metres north of `origin()`, metres east, postcode, country code or [0, 0]) of a postcode
+    /// centroid.
+    type Centroid<'a> = (f64, f64, &'a str, [u8; 2]);
+
+    /// The centre of an admin cell in Paris.
+    fn origin() -> (f64, f64) {
+        let centre = LatLng::from(CellID(cell_id_at_level(48.8566, 2.3522, DEFAULT_ADMIN_CELL_LEVEL)));
+        (centre.lat.deg(), centre.lng.deg())
+    }
+
+    /// The point `north` and `east` metres from `origin()`.
+    fn at(north: f64, east: f64) -> (f64, f64) {
+        let (lat, lng) = origin();
+        let per_degree = 6_371_000.0_f64.to_radians();
+        (lat + north / per_degree, lng + east / (per_degree * lat.to_radians().cos()))
+    }
+
+    /// The POI categories of `pois_and_centroids`: 100 m reference distance, 500 m max distance,
+    /// importance 5.
+    const POI_META: &str = r#"{"0": {"name": "cafe", "max_distance": 500}, "1": {"name": "museum", "max_distance": 500},
+        "2": {"name": "fountain", "max_distance": 500}, "60": {"name": "park", "max_distance": 500},
+        "93": {"name": "island", "max_distance": 500}}"#;
+
+    /// An index of point POIs (of POI_META's categories) and postcode centroids only, all in
+    /// `origin()`'s cell, so its cell lists hold them in record order.
+    fn pois_and_centroids(pois: &[Poi<'_>], centroids: &[Centroid<'_>]) -> Index {
+        let own = cell_id_at_level(origin().0, origin().1, DEFAULT_ADMIN_CELL_LEVEL);
+        let cell = |(lat, lng): (f64, f64)| {
+            assert_eq!(cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL), own, "({lat}, {lng})");
+            own
+        };
+        let mut strings = Vec::new();
+        let mut string = |s: &str| {
+            let id = strings.len() as u32;
+            strings.extend_from_slice(s.as_bytes());
+            strings.push(0);
+            id
+        };
+        let (mut records, mut poi_pairs) = (Vec::new(), Vec::new());
+        for (id, &(north, east, name, category, importance)) in pois.iter().enumerate() {
+            let (lat, lng) = at(north, east);
+            records.extend_from_slice(&(lat as f32).to_le_bytes());
+            records.extend_from_slice(&(lng as f32).to_le_bytes());
+            u32s(&mut records, &[NO_DATA, 0, name.map_or(NO_DATA, &mut string)]);
+            records.extend_from_slice(&[category, 0, 0, importance]);
+            u32s(&mut records, &[NO_DATA, NO_DATA, NO_DATA]);
+            poi_pairs.push((cell((lat, lng)), id as u32));
+        }
+        assert_eq!(records.len(), pois.len() * std::mem::size_of::<PoiRecord>());
+        let (mut centroid_records, mut centroid_pairs) = (Vec::new(), Vec::new());
+        for (id, &(north, east, postcode, country)) in centroids.iter().enumerate() {
+            let (lat, lng) = at(north, east);
+            centroid_records.extend_from_slice(&(lat as f32).to_le_bytes());
+            centroid_records.extend_from_slice(&(lng as f32).to_le_bytes());
+            u32s(&mut centroid_records, &[string(postcode)]);
+            centroid_records.extend_from_slice(&u16::from_be_bytes(country).to_le_bytes());
+            centroid_records.extend_from_slice(&[0, 0]);
+            centroid_pairs.push((cell((lat, lng)), id as u32));
+        }
+        assert_eq!(centroid_records.len(), centroids.len() * std::mem::size_of::<PostcodeCentroid>());
+        let end = strings.len() as u32;
+        Index {
+            poi_index: Some(cell_pairs::from_pairs(poi_pairs, cell_pairs::POI)),
+            poi_records: Some(FileBytes::Owned(records)),
+            poi_meta: PoiMeta::from_json(POI_META),
+            postcode_centroids: Some(FileBytes::Owned(centroid_records)),
+            postcode_centroid_index: Some(cell_pairs::from_pairs(centroid_pairs, cell_pairs::POSTCODE_CENTROID)),
+            strings: StringPool::from_parts([Some(FileBytes::Owned(strings)), None, None, None, None], [0, end, end, end, end, end]),
+            ..index(&[], &[])
+        }
+    }
+
+    /// `f`'s result and the number of strings it read.
+    fn reads<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        let before = STRING_READS.with(|n| n.get());
+        let got = f();
+        (got, STRING_READS.with(|n| n.get()) - before)
+    }
+
+    #[test]
+    fn a_poi_name_is_read_only_once_the_poi_passes_every_filter() {
+        // Cafes (category 0) and a museum (1), with POI_META's distances and importance.
+        let idx = pois_and_centroids(&[
+            (50.0, 0.0, Some("Kept"), 0, 0),
+            (2000.0, 0.0, Some("Too far"), 0, 0),  // past 550 m, the max at importance 5
+            (50.0, 0.0, Some("Island"), 93, 0),    // islands never list
+            (400.0, 0.0, Some("Faint"), 0, 1),     // scores 1 / (1 + 4²), under 0.5
+            (60.0, 0.0, Some(""), 0, 0),           // passes every filter, but has no name
+            (120.0, 0.0, Some("Also kept"), 1, 0),
+        ], &[]);
+
+        let (names, read) = reads(|| idx.find_pois(origin().0, origin().1).iter().map(|p| p.name).collect::<Vec<_>>());
+
+        assert_eq!(names, ["Kept", "Also kept"]);
+        assert_eq!(read, 3);
+    }
+
+    #[test]
+    fn a_centroid_farther_than_the_best_so_far_leaves_its_postcode_unread() {
+        // Read in record order.
+        let idx = pois_and_centroids(&[], &[
+            (1000.0, 0.0, "75001", *b"fr"),
+            (2000.0, 0.0, "75002", *b"fr"),  // farther: not read
+            (1000.0, 0.0, "75003", *b"fr"),  // as near, a larger postcode
+            (500.0, 0.0, "75;04", *b"fr"),   // nearer, not a postcode
+            (300.0, 0.0, "10115", *b"de"),   // another country's: not read
+            (1000.0, 0.0, "75000", *b"fr"),  // as near, a smaller postcode: the answer
+            (1500.0, 0.0, "75005", *b"fr"),  // farther: not read
+        ]);
+
+        let (postcode, read) = reads(|| idx.resolve_postcode(origin().0, origin().1, None, None, None, None, Some(*b"fr")));
+
+        assert_eq!(postcode, Some("75000"));
+        assert_eq!(read, 4);
+    }
+
+    #[test]
+    fn every_poi_name_and_postcode_answers_as_reading_them_all_would() {
+        // A jumble on a 300 m grid, so centroids coincide and tie: POIs of every filter's kind,
+        // one in five without a name, and centroids of three countries (one none), some with no
+        // valid postcode.
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut pick = move |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % n as u64) as usize
+        };
+        let grid = |k: usize| (k as f64 - 5.0) * 300.0;
+        let names: Vec<String> = (0..40).map(|k| format!("Lieu {k}")).collect();
+        let pois: Vec<Poi<'_>> = (0..300).map(|_| {
+            let (north, east) = (grid(pick(11)), grid(pick(11)));
+            let name = if pick(5) == 0 { "" } else { names[pick(names.len())].as_str() };
+            (north, east, Some(name), [0, 1, 2, 60, 93][pick(5)], [0, 1, 20, 100][pick(4)])
+        }).collect();
+        let postcodes = ["75001", "75002", "75003", "75004", "75005", "", "75;06", "75001-2345", "10115"];
+        let centroids: Vec<Centroid<'_>> = (0..300).map(|_| {
+            let (north, east) = (grid(pick(11)), grid(pick(11)));
+            (north, east, postcodes[pick(postcodes.len())], [*b"fr", *b"de", [0, 0]][pick(3)])
+        }).collect();
+        // Reading every name first drops a nameless POI before any filter, as a tombstone is.
+        let tombstoned: Vec<Poi<'_>> = pois.iter().map(|&(n, e, name, c, i)| (n, e, name.filter(|s| !s.is_empty()), c, i)).collect();
+        let (idx, eager) = (pois_and_centroids(&pois, &centroids), pois_and_centroids(&tombstoned, &centroids));
+        fn listed(idx: &Index, lat: f64, lng: f64) -> Vec<(&str, u8, u64, bool, bool, u64, u64)> {
+            idx.find_pois(lat, lng).iter()
+                .map(|p| (p.name, p.category_id, p.distance_m.to_bits(), p.contained, p.is_point, p.score.to_bits(), p.area.to_bits()))
+                .collect()
+        }
+        // Reading every centroid's postcode: the nearest valid one of the country, or of none,
+        // ties to the smaller postcode; and whether another postcode is as near.
+        let nearest = |lat: f64, lng: f64, country: Option<[u8; 2]>| {
+            let cos_lat = lat.to_radians().cos();
+            let mut found: Vec<(f64, &str)> = centroids.iter()
+                .filter(|c| country.is_none_or(|cc| c.3 == [0, 0] || c.3 == cc))
+                .filter_map(|&(north, east, postcode, _)| {
+                    let (c_lat, c_lng) = at(north, east);
+                    let dlat = (lat - c_lat as f32 as f64).to_radians();
+                    let dlng = (lng - c_lng as f32 as f64).to_radians();
+                    let d = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
+                    (d < 0.05_f64.to_radians().powi(2) && centroid_postcode_ok(postcode)).then_some((d, postcode))
+                })
+                .collect();
+            found.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)));
+            let tied = found.len() > 1 && found[0].0 == found[1].0 && found[0].1 != found[1].1;
+            (found.first().map(|&(_, s)| s), tied)
+        };
+
+        // The nameless POIs that pass every filter, and the answers another postcode ties.
+        let (mut nameless, mut tied) = (0, 0);
+        for (north, east) in pois.iter().map(|p| (p.0, p.1)).chain(centroids.iter().map(|c| (c.0, c.1))) {
+            let (lat, lng) = at(north, east);
+            let ((got, read), (want, read_named)) = (reads(|| listed(&idx, lat, lng)), reads(|| listed(&eager, lat, lng)));
+            assert_eq!(got, want, "({lat}, {lng})");
+            nameless += read - read_named;
+            for country in [None, Some(*b"fr"), Some(*b"de")] {
+                let (want, tie) = nearest(lat, lng, country);
+                assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, country), want, "({lat}, {lng}) {country:?}");
+                tied += usize::from(tie);
+            }
+        }
+        assert!(nameless > 1000 && tied > 500, "{nameless} {tied}");
     }
 }
 
@@ -6152,8 +6292,8 @@ mod query_path_tests {
         coverer.covering(&rect).0.iter().map(|c| c.0).collect()
     }
 
-    /// A cell file (u64 cell id, u32 entry offset; sorted) and its entry
-    /// file (u16 count, then the u32 ids) for `cells`.
+    /// A place index's cell file (u64 cell id, u32 entry offset; sorted) and its
+    /// entry file (u16 count, then the u32 ids) for `cells`, as place_index.rs lays them out.
     fn cell_files(cells: &BTreeMap<u64, Vec<u32>>) -> (Vec<u8>, Vec<u8>) {
         let (mut index, mut entries) = (Vec::new(), Vec::new());
         for (cell, ids) in cells {
@@ -6265,7 +6405,7 @@ mod query_path_tests {
                     admin_cells.entry(cell).or_default().push(id as u32 | if interior { INTERIOR_FLAG } else { 0 });
                 }
             }
-            let (cells, entries) = cell_files(&admin_cells);
+            let (cells, entries) = cell_pairs::write(&admin_cells.into_iter().collect::<Vec<_>>(), cell_pairs::ADMIN);
             let mut files: Vec<(&'static str, Vec<u8>)> = arcs.files().into();
             files.extend([("admin_cells.bin", cells), ("admin_entries.bin", entries)]);
 
@@ -6303,16 +6443,11 @@ mod query_path_tests {
                     }
                 }
                 assert_eq!(ways.len(), self.streets.len() * std::mem::size_of::<WayHeader>());
-                let (mut geo_cells, mut entries) = (Vec::new(), Vec::new());
-                for (cell, ids) in &street_cells {
-                    geo_cells.extend_from_slice(&cell.to_le_bytes());
-                    geo_cells.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-                    geo_cells.extend_from_slice(&NO_DATA.to_le_bytes());
-                    geo_cells.extend_from_slice(&NO_DATA.to_le_bytes());
-                    entries.extend_from_slice(&(ids.len() as u16).to_le_bytes());
-                    ids.iter().for_each(|id| entries.extend_from_slice(&id.to_le_bytes()));
-                }
-                files.extend([("geo_cells.bin", geo_cells), ("street_entries.bin", entries),
+                let rows: Vec<(u64, [Vec<u32>; geo_index::TABLES])> = street_cells.into_iter()
+                    .map(|(cell, mut ids)| { ids.sort_unstable(); (cell, [ids, vec![], vec![]]) })
+                    .collect();
+                let (top, blocks) = geo_index::write(&rows);
+                files.extend([("geo_cells.bin", top), ("geo_entries.bin", blocks),
                               ("street_ways.bin", ways), ("street_nodes.bin", nodes)]);
             }
 
@@ -6514,7 +6649,7 @@ mod query_path_tests {
             .chain(cell_neighbors_at_level(cell, DEFAULT_ADMIN_CELL_LEVEL))
             .filter(|&c| {
                 let mut listed = false;
-                Index::for_each_entry_fb(&index.admin_entries, Index::lookup_admin_cell_fb(&index.admin_cells, c), |id| {
+                index.admin_index.for_each(c, |id| {
                     listed |= (id & ID_MASK) == postcode_area
                 });
                 listed
@@ -6754,28 +6889,21 @@ mod admin_scan_tests {
             }
         }
         let [(_, polygons), (_, ring_blocks), (_, arc_index), (_, arc_vertices)] = arcs.files();
-        let (mut cells, mut entries) = (Vec::new(), Vec::new());
-        for (cell, mut ids) in by_cell {
-            ids.sort_unstable(); // the builder sorts each cell's entries by value
-            cells.extend_from_slice(&cell.to_le_bytes());
-            cells.extend_from_slice(&(entries.len() as u32).to_le_bytes());
-            entries.extend_from_slice(&(ids.len() as u16).to_le_bytes());
-            for id in ids { entries.extend_from_slice(&id.to_le_bytes()); }
-        }
+        // The builder sorts each cell's entries by value (cell_pairs::write does).
+        let (cells, entries) = cell_pairs::write(&by_cell.into_iter().collect::<Vec<_>>(), cell_pairs::ADMIN);
         let len = strings.len() as u32;
         Index {
-            geo_cells: None, street_entries: None, street_ways: None, street_nodes: None,
-            addr_entries: None, addr_points: None, addr_vertices: None,
-            interp_entries: None, interp_ways: None, interp_nodes: None, interp_postcodes: None,
-            admin_cells: FileBytes::Owned(cells),
-            admin_entries: FileBytes::Owned(entries),
+            geo_index: GeoIndex::none(), street_ways: None, street_nodes: None,
+            addr_points: None, addr_vertices: None,
+            interp_ways: None, interp_nodes: None, interp_postcodes: None,
+            admin_index: CellPairs::open(FileBytes::Owned(cells), FileBytes::Owned(entries), cell_pairs::ADMIN, DEFAULT_ADMIN_CELL_LEVEL).unwrap(),
             admin_polygons: FileBytes::Owned(polygons),
             admin_geometry: AdminGeometry::new(FileBytes::Owned(ring_blocks), FileBytes::Owned(arc_index), FileBytes::Owned(arc_vertices)),
-            poi_cells: None, poi_entries: None, poi_records: None, poi_vertices: None,
+            poi_index: None, poi_records: None, poi_vertices: None,
             poi_meta: PoiMeta { categories: HashMap::new() },
             place_nodes: None, place_cells: None, place_entries: None,
             way_parents: None, admin_parents: None, addr_postcodes: None, way_postcodes: None,
-            postcode_centroids: None, postcode_centroid_cells: None, postcode_centroid_entries: None,
+            postcode_centroids: None, postcode_centroid_index: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(FileBytes::Owned(strings)), None, None, None, None], [0, len, len, len, len, len]),
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
@@ -7105,8 +7233,7 @@ mod admin_scan_tests {
             &name_id.to_le_bytes(), &[1u8, 0, 0, 0], &name_id.to_le_bytes(), &NO_DATA.to_le_bytes(), &NO_DATA.to_le_bytes()].concat();
         assert_eq!(record.len(), std::mem::size_of::<PoiRecord>());
         let entry = if interior { INTERIOR_FLAG } else { 0 };
-        idx.poi_cells = Some(FileBytes::Owned([&cells()[0].to_le_bytes()[..], &0u32.to_le_bytes()].concat()));
-        idx.poi_entries = Some(FileBytes::Owned([&1u16.to_le_bytes()[..], &entry.to_le_bytes()].concat()));
+        idx.poi_index = Some(cell_pairs::from_pairs([(cells()[0], entry)], cell_pairs::POI));
         idx.poi_records = Some(FileBytes::Owned(record));
         idx.poi_vertices = Some(FileBytes::Owned(vertices));
         idx

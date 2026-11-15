@@ -30,8 +30,7 @@ static const uint32_t NO = 0xFFFFFFFFu;
 // A today's-format file may be a FIFO another process writes as gc-encode reads it, or reads as
 // gc-decode writes it. A FIFO has no size, so gc --size NAME=BYTES registers the bytes an input FIFO will
 // carry (by file name). Readers of a FIFO read() only as far as the bytes they need; writers of a
-// FIFO write() through a 512 KiB buffer, and writers of several FIFOs that a reader consumes row by
-// row flush as a group (FlushGroup) so no stream runs ahead of another by more than a pipe holds.
+// FIFO write() through a 512 KiB buffer.
 inline std::map<std::string, uint64_t>& stream_sizes() {
     static std::map<std::string, uint64_t> m;
     return m;
@@ -44,7 +43,7 @@ inline bool is_fifo(const std::string& p) {
     struct stat st;
     return stat(p.c_str(), &st) == 0 && S_ISFIFO(st.st_mode);
 }
-static const size_t FIFO_BUF = size_t(512) << 10, FIFO_PIPE = size_t(1) << 20, FIFO_GROUP_FLUSH = size_t(128) << 10;
+static const size_t FIFO_BUF = size_t(512) << 10, FIFO_PIPE = size_t(1) << 20;
 // --files: the today's files this run reads (encode) or writes (decode); empty = all of them.
 inline std::set<std::string>& want_files() {
     static std::set<std::string> s;
@@ -62,9 +61,9 @@ inline bool want(const std::string& name) { return want_files().empty() || want_
     exit(2);
 }
 
-// Every FIFO's pipe is enlarged to FIFO_PIPE: a FlushGroup writer runs FIFO_GROUP_FLUSH plus a row
-// ahead on one stream while its reader waits on another, and a default (or, past the user's pipe
-// page limit, 8 KiB) pipe can't hold that, so the two would wait on each other for ever.
+// Every FIFO's pipe is enlarged to FIFO_PIPE: a writer of two FIFOs one reader reads side by side
+// runs a buffer ahead on one while its reader waits on the other, and a default (or, past the
+// user's pipe page limit, 8 KiB) pipe can't hold that, so the two would wait on each other for ever.
 inline void widen_fifo(int fd, const std::string& p) {
     const int got = fcntl(fd, F_SETPIPE_SZ, int(FIFO_PIPE));
     if (got < int(FIFO_PIPE))
@@ -318,25 +317,6 @@ struct Writer {
         if (len + 10 > cap) flush();
         while (v >= 0x80) { buf[len++] = uint8_t(v) | 0x80; v >>= 7; }
         buf[len++] = uint8_t(v);
-    }
-};
-
-// Writers whose streams one reader consumes row by row: after each row, if any buffer holds more
-// than FIFO_GROUP_FLUSH, all are flushed, so every pipe always holds whole rows and none needs more
-// than FIFO_GROUP_FLUSH plus one row of room while another is drained. A no-op for regular files.
-struct FlushGroup {
-    std::vector<Writer*> w;
-    bool on = false;
-    explicit FlushGroup(std::vector<Writer*> ws) : w(std::move(ws)) {
-        for (Writer* x : w) on |= x->fifo;
-    }
-    inline void row_done() {
-        if (!on) return;
-        for (Writer* x : w)
-            if (x->len > FIFO_GROUP_FLUSH) {
-                for (Writer* y : w) y->flush();
-                return;
-            }
     }
 };
 

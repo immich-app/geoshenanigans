@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "build": {
-    "version": 18,
+    "version": 19,
     "patch_version": 15
   },
   "axes": {
@@ -206,7 +206,7 @@
     "mode.no-addresses": {
       "files": [
         "{region}/no-addresses/geo_cells.bin",
-        "{region}/no-addresses/street_entries.bin",
+        "{region}/no-addresses/geo_entries.bin",
         "{region}/no-addresses/street_ways.bin",
         "{region}/no-addresses/street_nodes.bin",
         "{region}/no-addresses/admin_cells.bin",
@@ -229,14 +229,12 @@
     "mode.full": {
       "files": [
         "{region}/full/geo_cells.bin",
-        "{region}/full/street_entries.bin",
+        "{region}/full/geo_entries.bin",
         "{region}/full/street_ways.bin",
         "{region}/full/street_nodes.bin",
-        "{region}/full/addr_entries.bin",
         "{region}/full/addr_points.bin",
         "{region}/full/addr_vertices.bin",
         "{region}/full/addr_postcodes.bin",
-        "{region}/full/interp_entries.bin",
         "{region}/full/interp_ways.bin",
         "{region}/full/interp_nodes.bin",
         "{region}/full/admin_cells.bin",

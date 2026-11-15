@@ -16,6 +16,7 @@
 #include <tuple>
 #include <vector>
 
+#include "geo_index.h"
 #include "in_place_edits.h"
 #include "merge_sequence.h"
 #include "patch_decompress.h"
@@ -62,42 +63,29 @@ BuildDir with_pool(const std::string& pool) {
     return d;
 }
 
-std::vector<char> entry_list(const std::vector<uint32_t>& ids) {
-    std::vector<char> out;
-    append(out, static_cast<uint16_t>(ids.size()));
-    for (uint32_t id : ids) append(out, id);
-    return out;
-}
-
 // A geo cell and the street, addr and interp ids it lists.
 struct GeoCell {
     uint64_t id;
     std::vector<uint32_t> streets, addrs, interps;
 };
 
-// geo_cells.bin and the entries files of `cells` (ascending ids), laid out as
-// the builder writes them: each list after the one before, an empty one NO_DATA.
+// The geo index of `cells` (ascending ids), as the builder writes it
+// (geo_index.h): its top file and its blocks file.
 void put_geo_cells(BuildDir& d, const std::vector<GeoCell>& cells) {
-    std::vector<char> geo;
-    for (const auto& cell : cells) {
-        append(geo, cell.id);
-        const std::pair<const char*, const std::vector<uint32_t>*> lists[] = {
-            {"street_entries.bin", &cell.streets}, {"addr_entries.bin", &cell.addrs},
-            {"interp_entries.bin", &cell.interps}};
-        for (const auto& [name, ids] : lists) {
-            if (ids->empty()) { append(geo, NO_DATA); continue; }
-            auto& entries = d[name];
-            append(geo, static_cast<uint32_t>(entries.size()));
-            auto list = entry_list(*ids);
-            entries.insert(entries.end(), list.begin(), list.end());
-        }
-    }
-    d["geo_cells.bin"] = geo;
+    std::vector<char> top, blocks;
+    geo_index::Writer writer([&](const char* p, size_t n) { top.insert(top.end(), p, p + n); },
+                             [&](const char* p, size_t n) { blocks.insert(blocks.end(), p, p + n); });
+    for (const auto& cell : cells) writer.add(cell.id, {{{cell.streets.data(), cell.streets.size()},
+                                                         {cell.addrs.data(), cell.addrs.size()},
+                                                         {cell.interps.data(), cell.interps.size()}}});
+    writer.finish();
+    d["geo_cells.bin"] = top;
+    d["geo_entries.bin"] = blocks;
 }
 
 // <prefix>_cells.bin and <prefix>_entries.bin holding CELL, which lists ids.
 void put_cell_index(BuildDir& d, const std::string& prefix, const std::vector<uint32_t>& ids) {
-    auto [cells, entries] = write_cell_lists({{CELL, ids}});
+    auto [cells, entries] = write_cell_lists({{CELL, ids}}, cell_pairs::format_of(prefix));
     d[prefix + "_cells.bin"] = cells;
     d[prefix + "_entries.bin"] = entries;
 }
@@ -551,6 +539,73 @@ TEST(patch_round_trip_keeps_the_interp_ids_of_unchanged_interp_ways) {
     CHECK(round_trip(old_d, new_d).mismatches.empty());
 }
 
+// A geo index of many blocks in three groups, whose lists repeat and edit
+// the row before's as the builder's do, a day on: cells dropped, cells new,
+// lists that gain and lose ids in every table. The patcher's index is the
+// builder's, byte for byte (geo_index::Writer on both sides).
+TEST(patch_round_trip_rebuilds_a_geo_index_of_many_groups_as_the_builder_writes_it) {
+    std::mt19937_64 rng(20261109);
+    std::vector<GeoCell> old_cells, new_cells;
+    std::vector<uint32_t> prev[3] = {{1, 2}, {1}, {4}};
+    for (uint64_t k = 0; old_cells.size() < 9000; k += 2 * (1 + rng() % 3)) {
+        GeoCell c{geo_index::cell_of(1000 + k, 17), {}, {}, {}};
+        std::vector<uint32_t>* lists[3] = {&c.streets, &c.addrs, &c.interps};
+        for (int t = 0; t < 3; t++) {
+            const uint64_t kind = rng() % 6;
+            if (kind == 0) continue;
+            std::vector<uint32_t>& l = *lists[t];
+            if (kind < 3) l = prev[t];
+            else if (kind == 3) { l = prev[t]; l.push_back(static_cast<uint32_t>(rng() % 3000)); }
+            else for (int j = 0; j < 1 + int(rng() % 4); j++) l.push_back(static_cast<uint32_t>(rng() % 3000));
+            std::sort(l.begin(), l.end());
+            l.erase(std::unique(l.begin(), l.end()), l.end());
+            prev[t] = l;
+        }
+        if (c.streets.empty() && c.addrs.empty() && c.interps.empty()) c.streets = {7};
+        old_cells.push_back(c);
+    }
+    for (const GeoCell& c : old_cells) {
+        const uint64_t fate = rng() % 10;
+        if (fate == 0) continue;  // dropped
+        GeoCell n = c;
+        if (fate == 1) {
+            std::vector<uint32_t>& l = rng() % 2 ? n.streets : n.interps;
+            if (!l.empty()) l.erase(l.begin());
+            l.push_back(3000 + static_cast<uint32_t>(rng() % 100));
+            std::sort(l.begin(), l.end());
+        }
+        if (fate == 2) n.addrs.push_back(5000 + static_cast<uint32_t>(new_cells.size()));
+        new_cells.push_back(n);
+        if (fate == 3) new_cells.push_back({c.id + (uint64_t(1) << 27), {9}, {}, {2}});  // a new cell beside it
+    }
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(OLD_POOL);
+    // The records the lists name, the same on both days: every id keeps its value.
+    std::vector<WayHeader> ways;
+    std::vector<InterpWay> interps;
+    std::vector<NodeCoord> nodes;
+    std::vector<AddrPoint> points;
+    for (uint32_t w = 0; w < 3200; w++) {
+        ways.push_back({w, 1, 0, NO_DATA});
+        interps.push_back({w, 1, 0, NO_DATA, 1, 9, 0});
+        nodes.push_back({10.0f + float(w) * 1e-4f, 20.0f});
+    }
+    for (uint32_t k = 0; k < 15000; k++) points.push_back({48.0f + float(k) * 1e-5f, 11.0f, NO_DATA, NO_DATA, NO_DATA, NO_DATA, 0});
+    for (BuildDir* d : {&old_d, &new_d}) {
+        (*d)["street_ways.bin"] = bytes_of(ways);
+        (*d)["street_nodes.bin"] = (*d)["interp_nodes.bin"] = bytes_of(nodes);
+        (*d)["interp_ways.bin"] = bytes_of(interps);
+        (*d)["addr_points.bin"] = bytes_of(points);
+    }
+    put_geo_cells(old_d, old_cells);
+    put_geo_cells(new_d, new_cells);
+    REQUIRE(old_d["geo_cells.bin"].size() == 8 + 3 * 12 + 8);
+
+    auto r = round_trip(old_d, new_d);
+
+    CHECK(r.mismatches.empty());
+    CHECK(logged(r, "Geo: " + std::to_string(new_cells.size()) + " cells written"));
+}
+
 TEST(patch_round_trip_keeps_the_poi_ids_of_unchanged_poi_records) {
     BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
     old_d["poi_records.bin"] = new_d["poi_records.bin"] = bytes_of(std::vector<PoiRecord>{poi(NAME_2), poi(NAME_4)});
@@ -601,8 +656,10 @@ TEST(patch_round_trip_keeps_place_nodes_without_a_cell_index) {
 TEST(patch_round_trip_rebuilds_a_cell_index_without_its_records) {
     for (const std::string prefix : {"admin", "poi"}) {
         BuildDir old_d, new_d;
-        std::tie(old_d[prefix + "_cells.bin"], old_d[prefix + "_entries.bin"]) = write_cell_lists({{CELL, {0, 1}}});
-        std::tie(new_d[prefix + "_cells.bin"], new_d[prefix + "_entries.bin"]) = write_cell_lists({{CELL, {0, 2}}, {CELL_2, {1}}});
+        const cell_pairs::Format format = cell_pairs::format_of(prefix);
+        std::tie(old_d[prefix + "_cells.bin"], old_d[prefix + "_entries.bin"]) = write_cell_lists({{CELL, {0, 1}}}, format);
+        std::tie(new_d[prefix + "_cells.bin"], new_d[prefix + "_entries.bin"]) =
+            write_cell_lists({{CELL, {0, 2}}, {CELL_2, {1}}}, format);
 
         CHECK(round_trip(old_d, new_d).mismatches.empty());
     }
@@ -1106,12 +1163,12 @@ TEST(patch_diff_refuses_a_dir_of_more_client_files_than_a_patch_may_list) {
     CHECK(round_trip(json_files(1), json_files(1024)).mismatches.empty());
 }
 
-// A new admin or POI cell index whose empty list is NO_DATA (the geo
-// index's layout, not the one write_cell_lists writes and the patcher's
-// rebuild gives) fails the diff, and no patch is written: the patcher could
-// not rebuild it. The same lists in the builder's layout, the empty one a
-// zero count, round-trip.
-TEST(patch_diff_refuses_a_cell_index_with_a_no_data_list) {
+// A new admin or POI cell index in a layout the patcher's rebuild doesn't
+// write (cell_pairs::Writer: its first list, {0, 1}, flags repeats it doesn't
+// have, so its gap is 1, not 0) fails the diff, and no patch is written: the
+// patcher could not rebuild it. The same lists as the builder writes them
+// round-trip.
+TEST(patch_diff_refuses_a_cell_index_the_writer_wouldnt_write) {
     const std::pair<std::string, BuildDir> indexes[] = {
         {"admin", {}},
         {"poi", {{"poi_records.bin", bytes_of(std::vector<PoiRecord>{poi(NAME_2), poi(NAME_4)})}}},
@@ -1123,17 +1180,21 @@ TEST(patch_diff_refuses_a_cell_index_with_a_no_data_list) {
         BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
         for (const auto& [name, bytes] : records) old_d[name] = new_d[name] = bytes;
         put_cell_index(old_d, prefix, {0, 1});
-        BuildDir no_data = new_d;
         // CELL lists 0 and 1, CELL_2 none.
-        std::tie(new_d[prefix + "_cells.bin"], new_d[prefix + "_entries.bin"]) = write_cell_lists({{CELL, {0, 1}}, {CELL_2, {}}});
-        auto& cells = no_data[prefix + "_cells.bin"];
-        append(cells, CELL);
-        append(cells, uint32_t{0});
-        append(cells, CELL_2);
-        append(cells, NO_DATA);
-        no_data[prefix + "_entries.bin"] = entry_list({0, 1});
+        std::tie(new_d[prefix + "_cells.bin"], new_d[prefix + "_entries.bin"]) =
+            write_cell_lists({{CELL, {0, 1}}, {CELL_2, {}}}, cell_pairs::format_of(prefix));
+        BuildDir unwritten = new_d;
+        // Admin: a block (2 bytes of codes), then {0, 1} as PLAIN, its header, no flagged ids, 0, the gap. POI: the
+        // list alone, its gap after a byte of gap lengths.
+        std::vector<char>& entries = unwritten[prefix + "_entries.bin"];
+        const size_t list = prefix == "admin" ? 2 : 0, gap = prefix == "admin" ? 5 : 4;
+        REQUIRE(entries[list] == 4 && entries[gap] == 0);
+        entries[list] = 5;
+        entries[gap] = 1;
+        REQUIRE(parse_cell_lists(unwritten[prefix + "_cells.bin"], entries, cell_pairs::format_of(prefix)) ==
+                CellLists({{CELL, {0, 1}}, {CELL_2, {}}}));
         REQUIRE(write_dir(root + "/old", old_d));
-        REQUIRE(write_dir(root + "/new", no_data));
+        REQUIRE(write_dir(root + "/new", unwritten));
 
         CHECK(!run({GEOCODER_DIFF_BIN, root + "/old", root + "/new", "-o", patch}, log));
 

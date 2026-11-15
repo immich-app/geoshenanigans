@@ -39,8 +39,7 @@ inline bool cell_ids_ascending(const char* data, size_t n, size_t stride, unsign
 // The ids new holds and old doesn't (added) and the reverse (removed), as
 // multisets in ascending order: what std::set_difference over sorted copies
 // of both id lists gives. Cell files are written sorted, so the mapped files
-// are merge-walked as they are (planet geo_cells: no 3.2 GB copy per side to
-// sort); a list out of order still gets the copies.
+// are merge-walked as they are; a list out of order still gets the copies.
 inline CellIdDiff diff_cell_ids(const char* old_data, size_t old_n, const char* new_data, size_t new_n,
                                 size_t stride, unsigned threads = 0) {
     CellIdDiff out;

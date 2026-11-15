@@ -6,7 +6,7 @@ use crate::constants::SUB_INDEXES;
 use crate::model::PLACE_FLAG_LABEL_OF;
 use query_server::arc_fixture::{self, ArcFixture};
 use query_server::{
-    cell_id_at_level, AdminPolygon, Index, PlaceNode, PointE7, PoiRecord, DEFAULT_ADMIN_CELL_LEVEL,
+    cell_id_at_level, cell_pairs, AdminPolygon, Index, PlaceNode, PointE7, PoiRecord, DEFAULT_ADMIN_CELL_LEVEL,
     DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL, NO_DATA, PLACE_FLAG_HIDDEN, STR_TIER_COUNT,
 };
 use std::path::{Path, PathBuf};
@@ -114,7 +114,9 @@ impl Geo {
                 }
             }
         }
-        let (admin_cells, admin_entries) = cell_files(admin);
+        admin.sort_unstable();
+        admin.dedup();
+        let (admin_cells, admin_entries) = cell_pairs::write_pairs(admin, cell_pairs::ADMIN);
         let nodes: Vec<u8> = self.nodes.iter().flat_map(node_bytes).collect();
         let end = self.strings.len();
         let tiers: Vec<String> = (0..STR_TIER_COUNT)
@@ -128,8 +130,10 @@ impl Geo {
             ("strings_layout.json", format!("{{\"tiers\": [{}]}}", tiers.join(", ")).into_bytes()),
         ]);
         if !self.pois.is_empty() {
-            let (poi_cells, poi_entries) =
-                cell_files(self.pois.iter().enumerate().map(|(i, p)| (cell(p.lat, p.lng), i as u32)).collect());
+            let (poi_cells, poi_entries) = cell_pairs::write_pairs(
+                self.pois.iter().enumerate().map(|(i, p)| (cell(p.lat, p.lng), i as u32)),
+                cell_pairs::POI,
+            );
             files.extend([
                 ("poi_records.bin", self.pois.iter().flat_map(poi_bytes).collect()),
                 ("poi_cells.bin", poi_cells), ("poi_entries.bin", poi_entries), ("poi_vertices.bin", Vec::new()),
@@ -162,23 +166,6 @@ pub fn build_search(geo: &Index, out: &Path, extras: Option<&Path>) {
     let opts = BuildOpts { extras: extras.map(|p| p.to_str().unwrap().to_string()), ..BuildOpts::new(out.join("tmp")) };
     let meta = index_meta(geo, &opts).into();
     build_all(geo, &held_subs(geo, SUB_INDEXES), out, &opts, || Ok(meta)).unwrap();
-}
-
-/// A `*_cells.bin` (u64 cell, u32 entry offset; sorted) and its `*_entries.bin` (u16 count, then
-/// the u32 ids) of (cell, id) pairs.
-fn cell_files(mut pairs: Vec<(u64, u32)>) -> (Vec<u8>, Vec<u8>) {
-    pairs.sort();
-    pairs.dedup();
-    let (mut cells, mut entries) = (Vec::new(), Vec::new());
-    for group in pairs.chunk_by(|a, b| a.0 == b.0) {
-        cells.extend(group[0].0.to_le_bytes());
-        cells.extend((entries.len() as u32).to_le_bytes());
-        entries.extend((group.len() as u16).to_le_bytes());
-        for (_, id) in group {
-            entries.extend(id.to_le_bytes());
-        }
-    }
-    (cells, entries)
 }
 
 /// A ring of (lat, lng) degrees on the e7 grid.

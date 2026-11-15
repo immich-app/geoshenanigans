@@ -82,24 +82,25 @@ std::vector<std::string> strings_of(const std::vector<char>& pool) {
     return out;
 }
 
+// The level-10 cell of number n: the index holds cells of one level.
+uint64_t c10(uint64_t n) { return cell_pairs::cell_of(n, 10); }
+
+// A file's bytes behind the size() / at(off, n) interface cell_pairs::Reader reads through.
+struct Bytes {
+    std::vector<char> data;
+    uint64_t size() const { return data.size(); }
+    const char* at(uint64_t off, size_t) const { return data.data() + off; }
+};
+
 // The admin cell index of a dir as (cell, id) pairs in file order.
-std::vector<std::pair<uint64_t, uint32_t>> cell_pairs(const std::string& dir) {
-    const std::vector<char> cells = file_bytes(dir + "/admin_cells.bin");
-    const std::vector<char> entries = file_bytes(dir + "/admin_entries.bin");
+std::vector<std::pair<uint64_t, uint32_t>> admin_pairs_of(const std::string& dir) {
+    Bytes cells{file_bytes(dir + "/admin_cells.bin")}, entries{file_bytes(dir + "/admin_entries.bin")};
+    cell_pairs::Reader reader(cells, entries, cell_pairs::ADMIN);
     std::vector<std::pair<uint64_t, uint32_t>> out;
-    for (size_t row = 0; row + 12 <= cells.size(); row += 12) {
-        uint64_t cell;
-        uint32_t at;
-        uint16_t count;
-        std::memcpy(&cell, cells.data() + row, 8);
-        std::memcpy(&at, cells.data() + row + 8, 4);
-        std::memcpy(&count, entries.data() + at, 2);
-        for (uint16_t i = 0; i < count; i++) {
-            uint32_t id;
-            std::memcpy(&id, entries.data() + at + 2 + 4 * i, 4);
-            out.push_back({cell, id});
-        }
-    }
+    uint64_t cell;
+    std::vector<uint32_t> ids;
+    while (reader.next(cell, ids))
+        for (uint32_t id : ids) out.push_back({cell, id});
     return out;
 }
 
@@ -201,8 +202,8 @@ struct Region {
 
         // As compute_admin_index_cells leaves them: the kept polygons'
         // cells, in canonical order.
-        data.admin_minimal_index_cells = {{100, 0}, {100, 2 | INTERIOR_FLAG}, {200, 5}, {200, 0 | INTERIOR_FLAG},
-                                          {300, 5 | INTERIOR_FLAG}};
+        data.admin_minimal_index_cells = {{c10(100), 0}, {c10(100), 2 | INTERIOR_FLAG}, {c10(200), 5},
+                                          {c10(200), 0 | INTERIOR_FLAG}, {c10(300), 5 | INTERIOR_FLAG}};
 
         partition_strings_into_tiers(data);
 
@@ -282,9 +283,9 @@ TEST(admin_minimal_poi_keeps_the_shared_polygon_slots) {
     CHECK_EQ(polygons[r.data.poi_records[1].parent_poly_id].name_id, NO_DATA);
 
     // Its cell index lists the shared ids.
-    CHECK(cell_pairs(r.poi_dir) == (std::vector<std::pair<uint64_t, uint32_t>>{
-                                   {100, 0}, {100, 2 | INTERIOR_FLAG}, {200, 5}, {200, 0 | INTERIOR_FLAG},
-                                   {300, 5 | INTERIOR_FLAG}}));
+    CHECK(admin_pairs_of(r.poi_dir) == (std::vector<std::pair<uint64_t, uint32_t>>{
+                                       {c10(100), 0}, {c10(100), 2 | INTERIOR_FLAG}, {c10(200), 5},
+                                       {c10(200), 0 | INTERIOR_FLAG}, {c10(300), 5 | INTERIOR_FLAG}}));
 }
 
 TEST(admin_minimal_poi_places_name_the_shared_slots_and_strings) {
