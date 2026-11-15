@@ -40,7 +40,7 @@ A complete geocoder index for a given region and configuration consists of files
 
 | Mode | Files | Description |
 |------|-------|-------------|
-| `full/` | 22 files (+4 optional) | Streets + addresses + interpolation + admin + postcodes |
+| `full/` | 23 files (+4 optional) | Streets + addresses + interpolation + admin + postcodes |
 | `no-addresses/` | 16 files (+3 optional) | Streets + admin + postcodes (no address points) |
 | `admin/` | 8 files (+3 optional) | Admin cell indexes + place nodes + postcodes |
 | `admin-minimal/` | 11 files | Admin levels 2-8 + place nodes, with its own polygons over the minimal arc set, simplified to within 37.5 m on an 11 m grid (a ring that grid would collapse keeps the 1.1 m one; takes the place of the quality dir, so pick simplified), and only the core strings its records name. For POI tier `none` |
@@ -165,7 +165,7 @@ the `.bin` files, because the server can't load a region without them.
    list (their `files`, the `optional_files` that appear in `files`, minus
    any `replaces`), each as
    <path>.zst, decompress, and check it against its sha256:
-   - builds/{date}/europe/full/…                (22 files + up to 4 optional)
+   - builds/{date}/europe/full/…                (23 files + up to 4 optional)
    - builds/{date}/europe/quality/simplified/…  (4 files)
    - builds/{date}/europe/poi/notable/…         (7 files, optional)
    The JSON files (strings_layout.json, poi_meta.json) are part of the set:

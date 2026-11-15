@@ -217,8 +217,8 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
     // addr_vertices buffer for addr_points with building footprints,
     // remapping vertex_offset to the new buffer.  Without this, the
     // continent's data.addr_vertices stays empty and any polygon-aware
-    // downstream consumer (e.g. cell_index.cpp's addr_vertices packer
-    // added in v15) crashes on out-of-bounds access.
+    // downstream consumer (e.g. record_files_io.h's address writer)
+    // crashes on out-of-bounds access.
     auto copy_addrs = [&]() {
         addr_remap = copy_subset(used_addr_ids, full.addr_points, full.addr_vertices,
             [&](uint32_t id) {

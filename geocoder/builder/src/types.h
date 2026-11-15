@@ -24,7 +24,7 @@ struct AddrPoint {
     uint32_t housenumber_id;
     uint32_t street_id;
     uint32_t parent_way_id;   // nearest street way index (for housenumber refinement)
-    uint32_t vertex_offset;   // into addr_vertices.bin (NO_DATA for node-sourced points)
+    uint32_t vertex_offset;   // into the footprint stream below (NO_DATA for node-sourced points)
     uint32_t vertex_count;    // 0 for nodes, >0 for building polygons
 };
 static_assert(sizeof(AddrPoint) == 28, "AddrPoint must be 28 bytes");
@@ -91,8 +91,9 @@ enum class VertexEncoding : uint8_t {
 static constexpr uint8_t VERTEX_STRIDE[4] = {4, 4, 4, 8};
 static constexpr double VERTEX_SCALE[4] = {1e-5, 1e-4, 1e-6, 1e-7};  // degrees per delta step
 
-// poi_vertices.bin / addr_vertices.bin layout per
-// polygon (only present when vertex_count > 0):
+// A polygon in the builder's poi_vertices and addr_vertices streams, which
+// the patch tools merge and the dirs' files store encoded (addr_files.h for
+// the addresses); only present when vertex_count > 0:
 //
 //   byte 0     : VertexEncoding tag
 //   byte 1     : padding (alignment)
