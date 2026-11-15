@@ -11,6 +11,7 @@ use crate::reader::{SearchIndex, SubIndex};
 use query_server::{cell_id_at_level, AdminPoint, AdminPolygon, Index, ID_MASK, INTERIOR_FLAG, NO_DATA};
 use fst::{Automaton, IntoStreamer, Streamer};
 use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA, SINK_STATE};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 
@@ -34,10 +35,10 @@ pub struct Hit {
 /// A result's context for display: the geocoder's admin lookup at its point.
 pub struct Ctx<'g> {
     pub cc: [u8; 2],
-    pub country: &'g str,
-    pub state: &'g str,
-    pub county: &'g str,
-    pub district: &'g str,
+    pub country: Cow<'g, str>,
+    pub state: Cow<'g, str>,
+    pub county: Cow<'g, str>,
+    pub district: Cow<'g, str>,
 }
 
 pub struct Found<'g> {
@@ -60,7 +61,7 @@ impl Found<'_> {
             "latitude": self.lat,
             "longitude": self.lng,
             "admin1name": c.state,
-            "admin2name": if !c.county.is_empty() { c.county } else { c.district },
+            "admin2name": if !c.county.is_empty() { &c.county } else { &c.district },
             "country": c.country,
             "country_code": std::str::from_utf8(&c.cc).unwrap_or(""),
             "type": self.typ,
@@ -312,10 +313,10 @@ impl<'a, 'g> Searcher<'a, 'g> {
         let admin = self.idx.geo.find_admin(lat as f64, lng as f64);
         Ctx {
             cc: admin.country_code.map(|c| [c[0].to_ascii_uppercase(), c[1].to_ascii_uppercase()]).unwrap_or([0, 0]),
-            country: admin.country.unwrap_or(""),
-            state: admin.state.or(admin.province).unwrap_or(""),
-            county: admin.county.unwrap_or(""),
-            district: admin.state_district.or(admin.district).unwrap_or(""),
+            country: admin.country.unwrap_or_default(),
+            state: admin.state.or(admin.province).unwrap_or_default(),
+            county: admin.county.unwrap_or_default(),
+            district: admin.state_district.or(admin.district).unwrap_or_default(),
         }
     }
 
@@ -353,7 +354,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
         let mut m = 0u64;
         for (_, ap, interior) in self.cell_polygons(lat, lng) {
             let nm = *names.entry(context_mask_key(ap.name_id, ap.country_code, ap.admin_level)).or_insert_with(|| {
-                let folded = normalize(geo.get_string(ap.name_id));
+                let folded = normalize(&geo.get_string(ap.name_id));
                 let cc = cc_of(ap.country_code);
                 let mut nm = ctx.mask_of(&folded);
                 if ap.admin_level == 2 && ap.country_code != 0 {
@@ -616,7 +617,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
     /// below a settlement of the same name that lies inside it.
     fn place_before_its_area(&self, hits: &mut [Hit]) {
         let ents = &self.idx.ents;
-        let label = |h: &Hit| normalize(ents.base_name(h.entity));
+        let label = |h: &Hit| normalize(&ents.base_name(h.entity));
         let mut changed = false;
         let top = hits.len().min(AREA_CHECK_TOP);
         for i in 0..top {
@@ -650,7 +651,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
             return base.to_string();
         }
         let matched = self.idx.ents.name(h.entity, h.ord);
-        if !normalize(base).starts_with(phrase) && normalize(&matched).starts_with(phrase) {
+        if !normalize(&base).starts_with(phrase) && normalize(&matched).starts_with(phrase) {
             return matched.into_owned();
         }
         base.to_string()

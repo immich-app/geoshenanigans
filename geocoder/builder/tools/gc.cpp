@@ -10,12 +10,12 @@
 // there: each streamed pass writes its own, the caller merges them).
 //
 // Families (each runs when its input files are present): streets, interps, way_parents,
-// way_postcodes, interp_postcodes, addr, poi.
+// way_postcodes, interp_postcodes, addr. The POI files are compact in every dir already (R2 and V2,
+// src/poi_files.h) and are hardlinked as they are.
 // Every other file is hardlinked (copied across filesystems). OUT_DIR, new or empty, gets gc.manifest
 // (counts and parameters the decoder needs). Prints one "phase" line per family: wall and CPU
 // seconds, bytes in/out.
 #include "gc_addr.h"
-#include "gc_poly.h"
 #include "gc_side.h"
 #include "gc_ways.h"
 
@@ -64,10 +64,6 @@ static std::vector<Family> families() {
                  [](const Manifest&) { return V{"addr_points.col", "addr_vertices.abs2"}; },
                  [](auto& s, auto& o, Manifest& m) { addr::encode(s, o, m); },
                  [](auto& s, auto& o, const Manifest& m) { addr::decode(s, o, m); }});
-    f.push_back({"poi", {"poi_records.bin", "poi_vertices.bin"}, {},
-                 [](const Manifest&) { return V{"poi_records.r3", "poi_vertices.bopen"}; },
-                 [](auto& s, auto& o, Manifest& m) { poly::encode_poi(s, o, m); },
-                 [](auto& s, auto& o, const Manifest& m) { poly::decode_poi(s, o, m); }});
     return f;
 }
 

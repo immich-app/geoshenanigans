@@ -1,8 +1,9 @@
-// The patcher's side of the in-process codecs: when the current dir is an encoded installed set
-// (it has a gc.manifest), every today's-format file of an encoded family is a virtual old file
-// (a SequentialFileReader reads it from the family's decoder) and a virtual output (open_out hands
-// back a FILE* whose bytes go to the family's encoder). The new dir gets the encoded files and the
-// merged gc.manifest; no today's-format file of an encoded family touches the disk.
+// The patcher's side of the in-process codecs: every today's-format file of an encoded family is
+// a virtual old file (a SequentialFileReader reads it from the family's decoder) and a virtual
+// output (open_out hands back a FILE* whose bytes go to the family's encoder). A native family
+// (the POI files, R2 and V2 in every dir: poi_files.h) is encoded in every dir under today's
+// names; gc's families only in an encoded installed set (a dir with a gc.manifest), whose new dir
+// gets the merged gc.manifest. No today's-format file of an encoded family touches the disk.
 #pragma once
 #include <malloc.h>
 #include <set>
@@ -17,8 +18,9 @@ namespace gcs {
 struct FamilyDesc {
     const char* name;
     std::vector<const char*> today;
+    bool native = false;  // encoded in every dir, as its today's files' names
 };
-// gc's family order (tools/gc.cpp; gc.families lists them in it).
+// gc's family order (tools/gc.cpp; gc.families lists them in it), then the native ones.
 static const std::vector<FamilyDesc>& families() {
     static const std::vector<FamilyDesc> f = {
         {"streets", {"street_ways.bin", "street_nodes.bin"}},
@@ -27,7 +29,7 @@ static const std::vector<FamilyDesc>& families() {
         {"way_postcodes", {"way_postcodes.bin"}},
         {"interp_postcodes", {"interp_postcodes.bin"}},
         {"addr", {"addr_points.bin", "addr_vertices.bin"}},
-        {"poi", {"poi_records.bin", "poi_vertices.bin"}},
+        {"poi", {"poi_records.bin", "poi_vertices.bin"}, true},
     };
     return f;
 }
@@ -77,6 +79,14 @@ struct Store {
     void init(const std::string& cur, const std::string& out) {
         cur_dir = cur;
         out_dir = out;
+        const auto& F = families();
+        fam_on.assign(F.size(), 0);
+        dec.resize(F.size());
+        enc.resize(F.size());
+        adec.resize(F.size());
+        aenc.resize(F.size());
+        for (size_t fi = 0; fi < F.size(); fi++)
+            if (F[fi].native) turn_on(fi);
         struct stat st;
         if (stat((cur + "/gc.manifest").c_str(), &st) != 0) return;
         active = true;
@@ -92,27 +102,22 @@ struct Store {
                 a = b + 1;
             }
         }
-        const auto& F = families();
-        fam_on.assign(F.size(), 0);
-        dec.resize(F.size());
-        enc.resize(F.size());
-        adec.resize(F.size());
-        aenc.resize(F.size());
-        for (size_t fi = 0; fi < F.size(); fi++) {
-            if (!on.count(F[fi].name)) continue;
-            fam_on[fi] = 1;
-            for (size_t p = 0; p < F[fi].today.size(); p++) file_port[F[fi].today[p]] = {int(fi), int(p)};
-        }
+        for (size_t fi = 0; fi < F.size(); fi++)
+            if (on.count(F[fi].name) && !F[fi].native) turn_on(fi);
         for (const auto& n : on) {
             bool known = false;
-            for (const auto& f : F) known |= n == f.name;
+            for (const auto& f : F) known |= n == f.name && !f.native;
             if (!known) die("unknown family %s in gc.manifest", n.c_str());
         }
+    }
+    void turn_on(size_t fi) {
+        fam_on[fi] = 1;
+        const auto& F = families()[fi];
+        for (size_t p = 0; p < F.today.size(); p++) file_port[F.today[p]] = {int(fi), int(p)};
     }
     // Once expect_out holds the patch's client list: an encoded family the new set drops whole (it
     // lists none of its today's files) leaves gc.families, and one it ships in part can't be encoded.
     void plan_outputs() {
-        if (!active) return;
         const auto& F = families();
         fam_out.assign(F.size(), 0);
         for (size_t fi = 0; fi < F.size(); fi++) {
@@ -124,7 +129,13 @@ struct Store {
             fam_out[fi] = listed != 0;
         }
     }
-    bool is_encoded(const std::string& name) const { return active && file_port.count(name); }
+    bool is_encoded(const std::string& name) const { return file_port.count(name) != 0; }
+    // An encoded file whose new size is what its encoder took (gc's families: the client list
+    // gives a today's-format size); a native family's is its own file's.
+    bool sized_by_encoder(const std::string& name) const {
+        auto it = file_port.find(name);
+        return it != file_port.end() && !families()[size_t(it->second.first)].native;
+    }
     std::string path_of(const std::string& name) const { return cur_dir + "/" + name; }
     // Decoders and encoders are made on first use and freed when their last port closes.
     Decoder* decoder(int fi) {
@@ -137,7 +148,7 @@ struct Store {
             else if (f == "way_parents") d = new side::U24Dec(s, old_m);
             else if (f == "way_postcodes" || f == "interp_postcodes") d = new side::DictDec(s, f, old_m);
             else if (f == "addr") d = new addr::Dec(s, old_m);
-            else if (f == "poi") d = new poly::PoiDec(s, old_m);
+            else if (f == "poi") d = new poi::Dec(s);
             else die("no decoder for %s", f.c_str());
             dec[size_t(fi)].reset(d);
             if (threads) adec[size_t(fi)].reset(new AsyncDec(d));
@@ -158,9 +169,9 @@ struct Store {
                 auto it = expect_out.find("addr_points.bin");
                 if (it == expect_out.end()) die("addr: the patch lists no addr_points.bin size");
                 e = new addr::Enc(o, it->second);
-            } else if (f == "poi") e = new poly::PoiEnc(o);
+            } else if (f == "poi") e = new poi::Enc(o);
             else die("no encoder for %s", f.c_str());
-            for (size_t p = 0; p < F.today.size(); p++) {
+            for (size_t p = 0; p < F.today.size() && !F.native; p++) {
                 auto it = expect_out.find(F.today[p]);
                 if (it != expect_out.end()) e->expect[p] = it->second;
             }
@@ -172,9 +183,11 @@ struct Store {
 
     // --- old side ---
     // The decoded size check for require_old_file_size: the manifest's size when it gives one.
+    // A native family's from its footer, with no decoder made (the POI replay reads the files
+    // itself).
     void check_old_size(const std::string& name, uint64_t expected) {
         auto [fi, port] = file_port.at(name);
-        const uint64_t ds = decoder(fi)->decoded_size(port);
+        const uint64_t ds = families()[size_t(fi)].native ? poi::decoded_size(cur_dir, port) : decoder(fi)->decoded_size(port);
         if (ds != ~0ull && ds != expected)
             die("old %s decodes to %llu bytes, the patch expects %llu", name.c_str(), (unsigned long long)ds, (unsigned long long)expected);
     }
@@ -196,7 +209,7 @@ struct Store {
         ~PortSource() override { s->close_source(fi, port); }
     };
     std::unique_ptr<StreamSource> open_source(const std::string& path) {
-        if (!active || path.compare(0, cur_dir.size() + 1, cur_dir + "/") != 0) return nullptr;
+        if (path.compare(0, cur_dir.size() + 1, cur_dir + "/") != 0) return nullptr;
         const std::string name = path.substr(cur_dir.size() + 1);
         auto it = file_port.find(name);
         if (it == file_port.end()) return nullptr;
@@ -311,15 +324,17 @@ struct Store {
         report.push_back(r + " B");
         enc[size_t(fi)].reset();
     }
-    // The merged manifest: every new family's keys, gc.families and gc.version, as gc writes it.
-    void save_manifest() {
+    // Every new family's outputs closed; for an encoded set, the merged manifest: every new gc
+    // family's keys, gc.families and gc.version, as gc writes it.
+    void finish_outputs() {
         std::string fl;
         const auto& F = families();
         for (size_t fi = 0; fi < F.size(); fi++) {
             if (!fam_out[fi]) continue;
             if (enc[fi]) die("family %s: an output was never closed", F[fi].name);
-            fl += (fl.empty() ? "" : ",") + std::string(F[fi].name);
+            if (!F[fi].native) fl += (fl.empty() ? "" : ",") + std::string(F[fi].name);
         }
+        if (!active) return;
         new_m.set("gc.version", 1);
         new_m.set("gc.families", fl);
         new_m.save(out_dir + "/gc.manifest");

@@ -32,6 +32,7 @@
 #include "ranked_bits.h"
 #include "s2_helpers.h"
 #include "strategy2_remap.h"
+#include "string_files.h"
 #include "string_subset.h"
 #include "vertex_pack.h"
 #include "write_schedule.h"
@@ -823,7 +824,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             }));
         }
     }
-    // Per-tier strings files. Each mode writes the tiers its records can
+    // Per-tier strings files, FCC2 (string_files.h). Each mode writes the tiers its records can
     // reference (see string_home_tier): admin → CORE+POSTCODE, no-addresses
     // → +STREET, full → +ADDR. The postcode tier also holds house numbers
     // and street names that double as postcodes, so it ships even in a
@@ -832,8 +833,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     auto write_tier = [&](size_t tier_idx) {
         const auto& buf = data.strings_tiers[tier_idx];
         write_futures.push_back(std::async(std::launch::async, [&, tier_idx] {
-            write_binary_file(output_dir + "/" + STR_TIER_FILENAMES[tier_idx],
-                              buf.data(), buf.size());
+            string_files::write_file(output_dir + "/" + STR_TIER_FILENAMES[tier_idx], buf.data(), buf.size());
         }));
     };
     write_tier(0);  // core — always
@@ -1442,7 +1442,7 @@ void write_admin_minimal_dir(const ParsedData& data, const std::string& dir, con
     parallel_sort(cells.begin(), cells.end(), cell_item_less);
     write_cell_index_sorted(dir + "/admin_cells.bin", dir + "/admin_entries.bin", cell_pairs::ADMIN, cells);
 
-    write_binary_file(dir + "/" + STR_TIER_FILENAMES[0], strings.core.data(), strings.core.size());
+    string_files::write_file(dir + "/" + STR_TIER_FILENAMES[0], strings.core.data(), strings.core.size());
     write_strings_layout(dir, strings.bases);
 
     size_t kept = 0;

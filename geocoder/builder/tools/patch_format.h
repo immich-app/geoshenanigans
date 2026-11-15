@@ -30,6 +30,7 @@
 #include "cell_pairs.h"
 #include "checked_size.h"
 #include "sequential_file_reader.h"
+#include "string_files.h"
 
 // --- Memory-mapped file helpers ---
 
@@ -463,8 +464,9 @@ inline bool is_remapped_record_file(uint32_t fid) {
 //   sent u32: bit t = runs follow for tier t, which the dir doesn't ship but
 //     its own old files reference,
 //   per tier t in order:
-//     shipped: old_hash u64, new_hash u64, n_added u32, n_deleted u32,
-//              order u32 (STRING_TIER_SORTED: the new pool sorts and the
+//     shipped: old_hash u64, new_hash u64 (the tier files', as
+//              string_tier_file_hash), n_added u32, n_deleted u32,
+//              order u32 (STRING_TIER_SORTED: both pools sort and the
 //              added strings go where they sort; STRING_TIER_INDEXED: their
 //              new string indices follow them), added strings
 //              (NUL-terminated), indexed only: their new string indices
@@ -530,6 +532,69 @@ private:
 
 inline uint64_t content_hash(const char* data, size_t n) {
     ContentHasher h(n);
+    h.update(data, n);
+    return h.hash();
+}
+
+// content_hash's step in four lanes, for whole files the patcher hashes as
+// it passes them (lane_hash): a 32-byte stride's words go one to each lane,
+// which run side by side (one lane is a chain of multiplies, so four go about
+// four times as fast), and the lanes and the last stride's bytes (zeros past
+// them) mix at the end. Seeded with the total length n, fed in any split.
+class LaneHasher {
+public:
+    explicit LaneHasher(uint64_t n) {
+        for (uint64_t i = 0; i < LANES; i++) h_[i] = (0x9E3779B97F4A7C15ull * (i + 1)) ^ n;
+    }
+    void update(const char* p, size_t n) {
+        if (n == 0) return;
+        if (carried_ > 0) {
+            const size_t k = std::min(n, STRIDE - carried_);
+            memcpy(carry_ + carried_, p, k);
+            carried_ += k;
+            p += k;
+            n -= k;
+            if (carried_ < STRIDE) return;
+            stride(h_, carry_);
+            carried_ = 0;
+        }
+        uint64_t h[LANES] = {h_[0], h_[1], h_[2], h_[3]};
+        for (; n >= STRIDE; p += STRIDE, n -= STRIDE) stride(h, p);
+        memcpy(h_, h, sizeof h);
+        memcpy(carry_, p, n);
+        carried_ = n;
+    }
+    uint64_t hash() const {
+        uint64_t h[LANES] = {h_[0], h_[1], h_[2], h_[3]};
+        char tail[STRIDE] = {};
+        memcpy(tail, carry_, carried_);
+        stride(h, tail);
+        uint64_t x = h[0];
+        for (size_t i = 1; i < LANES; i++) x = step(x, h[i]);
+        x *= 0xC4CEB9FE1A85EC53ull;
+        return x ^ (x >> 29);
+    }
+
+private:
+    static constexpr size_t LANES = 4, STRIDE = 32;
+    static uint64_t step(uint64_t h, uint64_t w) {
+        h = (h ^ w) * 0xFF51AFD7ED558CCDull;
+        return h ^ (h >> 32);
+    }
+    static void stride(uint64_t* h, const char* p) {
+        for (size_t i = 0; i < LANES; i++) {
+            uint64_t w;
+            memcpy(&w, p + 8 * i, 8);
+            h[i] = step(h[i], w);
+        }
+    }
+    uint64_t h_[LANES];
+    char carry_[STRIDE];
+    size_t carried_ = 0;
+};
+
+inline uint64_t lane_hash(const char* data, size_t n) {
+    LaneHasher h(n);
     h.update(data, n);
     return h.hash();
 }
@@ -667,6 +732,12 @@ inline void close_patch_outputs(std::initializer_list<std::pair<FILE*, std::stri
 // (parse_parent_id_remap).
 static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 
+// The old poi_vertices.bin's hash: marker(4), lane_hash of the file (u64),
+// right before the POI records' section. The patcher's POI replay
+// (poi_replay.h) copies the old blocks a day leaves whole without decoding
+// them, and checks them by it.
+static constexpr uint32_t POI_VERTICES_HASH_MARKER = 0xFFFFFFF8;
+
 // --- Reading a part of the patch ---
 
 // How a SectionReader words its refusal of a read past its end.
@@ -703,7 +774,7 @@ public:
     }
     uint8_t u8() { return value<uint8_t>("u8"); }
     uint16_t u16() { return value<uint16_t>("u16"); }
-    uint32_t u32() { return value<uint32_t>("u32"); }
+    [[gnu::always_inline]] uint32_t u32() { return value<uint32_t>("u32"); }
     uint64_t u64() { return value<uint64_t>("u64"); }
     // A u32 as a varint (write_varint). One longer than 5 bytes, or of 2^32
     // or more, is malformed.
@@ -988,9 +1059,8 @@ static constexpr size_t TABLE_DIRECTORY_KEYS = 4096;
 static constexpr unsigned TABLE_FILTER_BITS_LOG2 = 15;
 // The buffer a ScratchTable appends through: 64 KiB.
 static constexpr size_t SCRATCH_TABLE_BUF = 64 << 10;
-// A shipped string tier's walk writes and hashes its new pool in pieces of at
-// most this (a longer string goes alone), and hashes and gives back its old
-// pool in steps of at least this: 64 KiB.
+// A shipped string tier's walk gives back its old file's body in steps of at
+// least this: 64 KiB.
 static constexpr size_t STRING_WALK_PIECE = 64 << 10;
 // The most moved-string pairs a strings section carries (512 KiB of them),
 // which the patcher looks up at random where they sit. A normal day moves a
@@ -2057,7 +2127,8 @@ inline StringTierRuns encode_string_tier_runs(const char* old_pool, size_t old_s
 // with `added` (each NUL-terminated, pointing into the new pool) put in. A
 // sorted new pool (every tier but the POI one) puts each added string where
 // it sorts among the kept ones, as the tier's order says where; any other
-// carries the added strings' new indices `added_at` (ascending).
+// carries the added strings' new indices `added_at` (ascending). old_hash and
+// new_hash are the tier files' (string_tier_file_hash).
 struct StringTierDiff {
     uint64_t old_hash = 0, new_hash = 0;
     bool sorted = false;
@@ -2079,13 +2150,17 @@ inline bool string_pool_sorted(const char* pool, size_t size) {
     return true;
 }
 
-// The diff of a shipped tier whose edit keeps `kept` (kept_strings).
+// The diff of a shipped tier whose edit keeps `kept` (kept_strings), between
+// pools whose files hash to old_file_hash and new_file_hash.
 inline StringTierDiff string_tier_diff(const char* old_pool, size_t old_size, const char* new_pool, size_t new_size,
-                                       const std::vector<std::pair<uint32_t, uint32_t>>& kept) {
+                                       const std::vector<std::pair<uint32_t, uint32_t>>& kept, uint64_t old_file_hash,
+                                       uint64_t new_file_hash) {
     StringTierDiff d;
-    d.old_hash = content_hash(old_pool, old_size);
-    d.new_hash = content_hash(new_pool, new_size);
-    d.sorted = string_pool_sorted(new_pool, new_size);
+    d.old_hash = old_file_hash;
+    d.new_hash = new_file_hash;
+    // Sorted only when both pools sort: the patcher then places a sorted
+    // edit's added strings among old buckets by their first strings alone.
+    d.sorted = string_pool_sorted(new_pool, new_size) && string_pool_sorted(old_pool, old_size);
     size_t k = 0;
     uint32_t i = 0;
     for (size_t o = 0; o < old_size; o += strnlen(old_pool + o, old_size - o) + 1, i++) {
@@ -2172,57 +2247,49 @@ inline StringTierEdit parse_string_tier_edit(const char* data, size_t size, size
     return e;
 }
 
-// No old string: an added one (for_each_new_string).
-constexpr size_t NO_OLD_STRING = SIZE_MAX;
-
-// A shipped tier's new pool string by string, from its old pool and edit:
-// on_string(p, len, old_off) for each new string in order, with the offset of
-// a kept string in the old pool, or NO_OLD_STRING for an added one, and
-// on_consumed(old_end) as the walk passes each old string, kept (after its
-// on_string) or deleted, with the offset just past it: the walk reads no old
-// byte before old_end again. The edit's indices ascend
-// (parse_string_tier_edit). Returns whether the old pool placed every one of
-// them: the walk passes the whole old pool either way. A sorted edit puts an
-// added string before the next kept one it sorts before.
-template <typename OnString, typename OnConsumed>
-[[nodiscard]] bool for_each_new_string(const char* old_pool, size_t old_size, const StringTierEdit& edit, OnString on_string,
-                                       OnConsumed on_consumed) {
-    size_t o = 0;
-    uint32_t oi = 0, ni = 0, d = 0, a = 0;
-    const char* added = edit.added;  // the next added string
-    // The old pool isn't checked yet as the walk reads it, so a last string
-    // without its NUL ends at the pool's end.
-    auto old_len = [&] { return std::min(strnlen(old_pool + o, old_size - o) + 1, old_size - o); };
-    auto skip_deleted = [&] {
-        for (; o < old_size && d < edit.n_deleted && string_index_at(edit.deleted, d) == oi; d++, oi++) {
-            o += old_len();
-            on_consumed(o);
-        }
-    };
-    skip_deleted();
-    auto added_next = [&] {
-        if (a >= edit.n_added) return false;
-        if (!edit.sorted) return string_index_at(edit.added_at, a) == ni;
-        return o >= old_size || strncmp(added, old_pool + o, old_size - o) < 0;
-    };
-    for (;; ni++) {
-        if (added_next()) {
-            const size_t len = strlen(added) + 1;
-            on_string(added, len, NO_OLD_STRING);
-            added += len;
-            a++;
-        } else if (o < old_size) {
-            const size_t len = old_len();
-            on_string(old_pool + o, len, o);
-            o += len;
-            oi++;
-            on_consumed(o);
-            skip_deleted();
-        } else {
-            break;
-        }
+// A string tier file's hash, as the strings section carries it (old_hash,
+// new_hash): lane_hash, seeded with the pool's size, of each bucket's coded
+// bytes then its table entry, bucket by bucket, then the footer. They are the
+// file's bytes in the order a walk passes them, so the patcher hashes the old
+// file and the new one as it passes their buckets once, copied or decoded,
+// and reads no table entry twice.
+class StringTierHasher {
+public:
+    explicit StringTierHasher(uint32_t raw_size) : h_(raw_size) {}
+    void bucket(const uint8_t* coded, size_t size, uint32_t span) {
+        h_.update(reinterpret_cast<const char*>(coded), size);
+        uint8_t e[string_files::ENTRY_BYTES];
+        string_files::put_entry(e, size, span);
+        h_.update(reinterpret_cast<const char*>(e), sizeof e);
     }
-    return a == edit.n_added && d == edit.n_deleted;
+    uint64_t finish(uint32_t buckets, uint32_t raw_size) {
+        uint8_t f[string_files::FOOTER_BYTES];
+        string_files::put_footer(f, buckets, raw_size);
+        h_.update(reinterpret_cast<const char*>(f), sizeof f);
+        return h_.hash();
+    }
+
+private:
+    LaneHasher h_;
+};
+
+// The hash of a tier's FCC2 file (StringTierHasher), read through its table.
+inline uint64_t string_tier_file_hash(const uint8_t* file, size_t size, const std::string& name = "string tier") {
+    string_files::Decoder d(file, size, name);
+    StringTierHasher h(d.raw_size());
+    string_files::Decoder::Entry e;
+    while (d.peek(e)) {
+        h.bucket(e.coded, e.size, e.span);
+        d.skip(e);
+    }
+    return h.finish(d.buckets(), d.raw_size());
+}
+
+// a's alen bytes against b's blen as strcmp orders them, with no NUL among
+// either's.
+inline int compare_strings(const char* a, size_t alen, const char* b, size_t blen) {
+    const int c = memcmp(a, b, std::min(alen, blen));
+    return c ? c : (alen < blen ? -1 : alen > blen ? 1 : 0);
 }
 
 // The patcher's old → new string offset map. Between two edits every
@@ -2352,12 +2419,14 @@ inline PatchFileId string_tier_file_id(int t) {
 }
 
 // One tier's old and new pool as the diff loaded them (the dir's own, or
-// borrowed from ../full); null and 0 for a tier found nowhere.
+// borrowed from ../full), and the hashes of the files it decoded them from
+// (string_tier_file_hash); null and 0 for a tier found nowhere.
 struct StringTierPools {
     const char* old_data = nullptr;
     size_t old_size = 0;
     const char* new_data = nullptr;
     size_t new_size = 0;
+    uint64_t old_hash = 0, new_hash = 0;
 };
 
 // What append_strings_section wrote, for the diff's log, and the moved
@@ -2446,7 +2515,7 @@ StringsSectionStats append_strings_section(std::vector<char>& out,
             continue;
         }
         if (!(shipped >> t & 1)) continue;
-        const StringTierDiff d = string_tier_diff(p.old_data, p.old_size, p.new_data, p.new_size, kept);
+        const StringTierDiff d = string_tier_diff(p.old_data, p.old_size, p.new_data, p.new_size, kept, p.old_hash, p.new_hash);
         append_string_tier_diff(out, d);
         stats.n_added[t] = static_cast<uint32_t>(d.added.size());
         stats.n_deleted[t] = static_cast<uint32_t>(d.deleted.size());
@@ -2525,68 +2594,143 @@ inline void require_shipped_tiers_listed(uint32_t shipped, const std::unordered_
                                      ", which the client files don't list");
 }
 
-// What a shipped tier's walk (rebuild_string_tier) read and wrote: the hash of
-// the whole old pool, the size of the new pool written and its hash as the
-// place's new_size bytes, and whether the old pool placed every index of the
-// edit.
+// What a shipped tier's walk (rebuild_string_tier) read and wrote: the old
+// file's hash (StringTierHasher), the new pool's size and whether the old pool
+// placed every index of the edit; the new file's hash, which its writer's
+// buckets give (StringTierHasher), is the caller's to fill. And the old
+// buckets the walk copied as they are and those it decoded.
 struct StringTierRebuild {
     uint64_t old_hash = 0, new_hash = 0, new_size = 0;
     bool placed = false;
+    uint64_t copied = 0, decoded = 0;
 };
 
-// Rebuilds a shipped tier in one walk of its old pool and edit: writes the new
-// pool (the old pool's kept strings with the added ones at their indices)
-// through write(bytes, n), in pieces of contiguous strings, adds the runs of
-// the kept strings that moved to remap, and hashes the old pool as the walk
-// passes it and the new one as it writes it. on_passed(old_off) at the end of
-// the first old string, kept or deleted, that puts STRING_WALK_PIECE or more
-// of old pool behind the last call: the walk has hashed those bytes and
-// written every string it took from them, and reads none of them again. A
-// run of deleted strings, a whole old pool of them included, goes back in
-// pieces like a run of kept ones; under a piece is left for the walk's end to
-// hash. The old pool isn't checked before the walk, which is why the walk
-// hashes all of it even when the edit doesn't fit
-// (require_string_tier_rebuilt).
-template <typename Write, typename OnPassed>
-StringTierRebuild rebuild_string_tier(const char* old_pool, size_t old_size, const StringTierEdit& edit,
-                                      const StringTierPlace& at, StringRemap& remap, Write write, OnPassed on_passed) {
+// Rebuilds a shipped tier in one walk of its old file and edit: writes the new
+// pool (the old pool's kept strings with the added ones at their indices) to
+// out, adds the runs of the kept strings that moved to remap, and hashes the
+// old file as it passes it. An old bucket the edit leaves whole goes to out as
+// it is, undecoded: one whose strings the edit all keeps, with no added string
+// among or right after them, whose next old string is kept too (or the pool
+// ends), and that out would start a bucket at (Encoder::cut_before). The cut
+// rule reads only a bucket's bytes and the string after it, so out would make
+// that very bucket and cut after it as the old encoding did: the new file is
+// byte for byte the encoding of the new pool. Any other bucket is decoded,
+// its strings checked as the decoder checks them, and goes to out string by
+// string. on_passed(coded_off, table_off) once the walk has passed
+// STRING_WALK_PIECE or more of the old file's body since the last call: it
+// reads none of the body before coded_off again, nor of the bucket table
+// (which follows the body) before table_off bytes into it. The walk passes the
+// whole old file even when the edit doesn't fit (require_string_tier_rebuilt);
+// a bucket it copies is checked by the old file's hash, not decoded.
+template <typename OnPassed>
+StringTierRebuild rebuild_string_tier(string_files::Decoder& old, const StringTierEdit& edit, const StringTierPlace& at,
+                                      StringRemap& remap, string_files::Encoder& out, OnPassed on_passed) {
     StringTierRebuild r;
-    ContentHasher old_hash(old_size), new_hash(at.new_size);
-    size_t old_hashed = 0;
-    const char* piece = nullptr;  // the strings not written yet, contiguous
-    size_t piece_size = 0;
-    auto write_piece = [&] {
-        if (piece_size == 0) return;
-        new_hash.update(piece, piece_size);
-        write(piece, piece_size);
-        r.new_size += piece_size;
-        piece_size = 0;
-    };
+    StringTierHasher old_hash(old.raw_size());
     StringRunJoiner joiner([&](uint32_t start, uint32_t end, uint32_t shift) { remap.add_run(start, end, shift); });
     uint32_t new_start = at.new_base;
-    auto on_string = [&](const char* p, size_t len, size_t old_off) {
-        if (piece_size > 0 && (p != piece + piece_size || piece_size + len > STRING_WALK_PIECE)) write_piece();
-        if (piece_size == 0) piece = p;
-        piece_size += len;
-        if (old_off != NO_OLD_STRING) {
-            const uint32_t start = at.old_base + static_cast<uint32_t>(old_off);
-            joiner.kept(start, start + static_cast<uint32_t>(len), new_start);
+    // The old and new string index the walk is at, the next deleted and
+    // added string, and the added one's bytes.
+    uint64_t oi = 0, ni = 0;
+    uint32_t d = 0, a = 0;
+    const char* added = edit.added;
+    size_t added_len = edit.n_added ? strlen(added) : 0;
+    constexpr uint64_t NONE = UINT64_MAX;
+    auto next_deleted = [&]() -> uint64_t { return d < edit.n_deleted ? string_index_at(edit.deleted, d) : NONE; };
+    auto next_added_at = [&]() -> uint64_t { return a < edit.n_added ? string_index_at(edit.added_at, a) : NONE; };
+    auto put_added = [&] {
+        out.put(added, added_len);
+        r.new_size += added_len + 1;
+        new_start += static_cast<uint32_t>(added_len + 1);
+        ni++;
+        added += added_len + 1;
+        added_len = ++a < edit.n_added ? strlen(added) : 0;
+    };
+    // The added strings that go before the kept old string s (len bytes): an
+    // indexed edit's at the walk's new index, a sorted one's that sort before s.
+    auto put_added_before = [&](const char* s, size_t len) {
+        if (edit.sorted)
+            while (a < edit.n_added && compare_strings(added, added_len, s, len) < 0) put_added();
+        else
+            while (next_added_at() == ni) put_added();
+    };
+    uint64_t passed = 0;
+    auto passed_bucket = [&] {
+        if (old.coded_end() - passed < STRING_WALK_PIECE) return;
+        passed = old.coded_end();
+        on_passed(static_cast<size_t>(passed), static_cast<size_t>(old.table_read()));
+    };
+
+    string_files::Decoder::Entry e, after;
+    while (old.peek(e)) {
+        old_hash.bucket(e.coded, e.size, e.span);
+        // Its strings count only while an edit's index lies ahead.
+        const bool counting = next_deleted() != NONE || (!edit.sorted && a < edit.n_added);
+        const uint64_t n = counting ? old.count_of(e) : 0;
+        if (next_deleted() != oi) {
+            const char* first;
+            size_t first_len;
+            old.first_of(e, first, first_len);
+            put_added_before(first, first_len);
+            // Whole: no deleted string in it or right after it, and no added
+            // one among or right after its strings (a sorted edit's next one
+            // sorts at or past the next bucket's first string).
+            bool whole = next_deleted() == NONE || next_deleted() > oi + n;
+            if (whole && a < edit.n_added) {
+                if (!edit.sorted) {
+                    whole = next_added_at() > ni + n;
+                } else if (old.peek_after(e, after)) {
+                    const char* next_first;
+                    size_t next_len;
+                    old.first_of(after, next_first, next_len);
+                    whole = compare_strings(added, added_len, next_first, next_len) >= 0;
+                } else {
+                    whole = false;
+                }
+            }
+            if (whole && out.cut_before(first, first_len)) {
+                out.put_bucket(e.coded, e.size, e.span);
+                const uint32_t start = at.old_base + static_cast<uint32_t>(e.raw_at);
+                joiner.kept(start, start + e.span, new_start);
+                new_start += e.span;
+                r.new_size += e.span;
+                oi += n;
+                ni += n;
+                old.skip(e);
+                r.copied++;
+                passed_bucket();
+                continue;
+            }
         }
-        new_start += static_cast<uint32_t>(len);
-    };
-    auto on_consumed = [&](size_t old_end) {
-        if (old_end - old_hashed < STRING_WALK_PIECE) return;
-        write_piece();  // it may hold kept strings from before old_end
-        old_hash.update(old_pool + old_hashed, old_end - old_hashed);
-        old_hashed = old_end;
-        on_passed(old_hashed);
-    };
-    r.placed = for_each_new_string(old_pool, old_size, edit, on_string, on_consumed);
+        old.next();
+        r.decoded++;
+        const char* p = old.data();
+        for (size_t o = 0; o < old.size();) {
+            const size_t len = strlen(p + o);
+            if (next_deleted() == oi) {
+                d++;
+            } else {
+                put_added_before(p + o, len);
+                out.put(p + o, len);
+                const uint32_t start = at.old_base + static_cast<uint32_t>(old.raw_start() + o);
+                joiner.kept(start, start + static_cast<uint32_t>(len + 1), new_start);
+                new_start += static_cast<uint32_t>(len + 1);
+                r.new_size += len + 1;
+                ni++;
+            }
+            oi++;
+            o += len + 1;
+        }
+        passed_bucket();
+    }
+    old.next();  // the walk's end: refuses buckets that don't add up to the footer's
+    if (edit.sorted)
+        while (a < edit.n_added) put_added();
+    else
+        while (next_added_at() == ni) put_added();
     joiner.finish();
-    write_piece();
-    old_hash.update(old_pool + old_hashed, old_size - old_hashed);
-    r.old_hash = old_hash.hash();
-    r.new_hash = new_hash.hash();
+    r.placed = a == edit.n_added && d == edit.n_deleted;
+    r.old_hash = old_hash.finish(old.buckets(), old.raw_size());
     return r;
 }
 
@@ -2745,8 +2889,9 @@ public:
         return END - first < count ? static_cast<uint32_t>(END - first) : count;
     }
     // Record idx's offset after the fixups, given its old offset; idx below
-    // END, as reach gives them.
-    uint32_t apply(uint32_t idx, uint32_t old) {
+    // END, as reach gives them. Inlined into the replays' record loops, where
+    // it runs per record, wherever else it is called.
+    [[gnu::always_inline]] uint32_t apply(uint32_t idx, uint32_t old) {
         while (value_idx_ < idx) next_value();
         if (value_idx_ == idx) {
             if (old != END) malformed();

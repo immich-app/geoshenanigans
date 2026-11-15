@@ -6,7 +6,7 @@ use crate::constants::SUB_INDEXES;
 use crate::model::PLACE_FLAG_LABEL_OF;
 use query_server::arc_fixture::{self, ArcFixture};
 use query_server::{
-    cell_id_at_level, cell_pairs, AdminPolygon, Index, PlaceNode, PointE7, PoiRecord, DEFAULT_ADMIN_CELL_LEVEL,
+    cell_id_at_level, cell_pairs, poi_files, strings, AdminPolygon, Index, PlaceNode, PointE7, PoiRecord, DEFAULT_ADMIN_CELL_LEVEL,
     DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL, NO_DATA, PLACE_FLAG_HIDDEN, STR_TIER_COUNT,
 };
 use std::path::{Path, PathBuf};
@@ -86,7 +86,7 @@ impl Geo {
     pub fn poi(&mut self, name: &str, lat: f32, lng: f32, importance: u8) -> u32 {
         let name_id = self.string(name);
         self.pois.push(PoiRecord {
-            lat, lng, vertex_offset: NO_DATA, vertex_count: 0, name_id, category: 0, tier: 1, flags: 0, importance,
+            lat, lng, vertex_offset: NO_DATA, name_id, category: 0, tier: 1, flags: 0, importance,
             parent_street_id: NO_DATA, parent_postcode_id: NO_DATA, parent_poly_id: NO_DATA,
         });
         self.pois.len() as u32 - 1
@@ -126,7 +126,7 @@ impl Geo {
         files.extend([
             ("admin_cells.bin", admin_cells), ("admin_entries.bin", admin_entries),
             ("place_nodes.bin", nodes),
-            ("strings_core.bin", self.strings.clone()),
+            ("strings_core.bin", strings::encode(&self.strings)),
             ("strings_layout.json", format!("{{\"tiers\": [{}]}}", tiers.join(", ")).into_bytes()),
         ]);
         if !self.pois.is_empty() {
@@ -134,9 +134,10 @@ impl Geo {
                 self.pois.iter().enumerate().map(|(i, p)| (cell(p.lat, p.lng), i as u32)),
                 cell_pairs::POI,
             );
+            let (records, vertices) = poi_files::encode(&self.pois.iter().map(|&p| (p, None)).collect::<Vec<_>>());
             files.extend([
-                ("poi_records.bin", self.pois.iter().flat_map(poi_bytes).collect()),
-                ("poi_cells.bin", poi_cells), ("poi_entries.bin", poi_entries), ("poi_vertices.bin", Vec::new()),
+                ("poi_records.bin", records),
+                ("poi_cells.bin", poi_cells), ("poi_entries.bin", poi_entries), ("poi_vertices.bin", vertices),
             ]);
         }
         files
@@ -183,13 +184,3 @@ fn node_bytes(p: &PlaceNode) -> Vec<u8> {
     b
 }
 
-fn poi_bytes(p: &PoiRecord) -> Vec<u8> {
-    let b = [
-        &p.lat.to_le_bytes()[..], &p.lng.to_le_bytes(), &p.vertex_offset.to_le_bytes(), &p.vertex_count.to_le_bytes(),
-        &p.name_id.to_le_bytes(), &[p.category, p.tier, p.flags, p.importance], &p.parent_street_id.to_le_bytes(),
-        &p.parent_postcode_id.to_le_bytes(), &p.parent_poly_id.to_le_bytes(),
-    ]
-    .concat();
-    assert_eq!(b.len(), std::mem::size_of::<PoiRecord>());
-    b
-}

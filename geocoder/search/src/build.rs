@@ -12,7 +12,7 @@ use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI};
 use crate::model::*;
 use crate::normalize::{join, tokens, transliterate};
 use memmap2::Mmap;
-use query_server::{AdminPolygon, Index, PlaceNode, PoiRecord, NO_DATA};
+use query_server::{AdminPolygon, Index, PlaceNode, NO_DATA};
 use serde_json::json;
 use std::collections::{BinaryHeap, HashSet};
 use std::fs::File;
@@ -262,7 +262,7 @@ pub struct PoiSource<'a> {
 
 impl<'a> PoiSource<'a> {
     pub fn new(geo: &'a Index, opts: &BuildOpts, extras: Option<&'a Extras>) -> std::io::Result<Self> {
-        let n = record_count::<PoiRecord>(geo.poi_records.as_ref().expect("poi_records"));
+        let n = geo.poi_records.as_ref().expect("poi_records").len();
         let imp_poi = map_importance(opts.imp_dir.as_deref(), "imp_poi.u8", n)?;
         Ok(PoiSource { geo, n, max_tier: opts.poi_max_tier, imp_poi, extras })
     }

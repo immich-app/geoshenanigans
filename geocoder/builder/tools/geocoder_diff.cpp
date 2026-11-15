@@ -29,11 +29,13 @@
 #include <iomanip>
 #include <iostream>
 #include <list>
+#include <map>
 #include <malloc.h>
 #include <mutex>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -47,6 +49,8 @@
 #include "merge_sequence.h"
 #include "parallel.h"
 #include "patch_format.h"
+#include "poi_files.h"
+#include "scratch_dir.h"
 #include "record_match.h"
 #include "string_offset_map.h"
 
@@ -513,6 +517,73 @@ struct FileMergeResult {
 // A record file that feeds entry corrections merges as itself when unchanged
 // (sent_unchanged), so the diff derives its dependents with the ids the
 // patcher keeps.
+// The merges diff the POI files' logical form: each dir's R2 and V2 files
+// (poi_files.h) are decoded at the start into a scratch dir of their own,
+// which merge_path reads them from.
+static std::map<std::string, std::string>& logical_poi_dirs() {
+    static std::map<std::string, std::string> dirs;
+    return dirs;
+}
+static bool is_poi_file(const std::string& name) { return name == "poi_records.bin" || name == "poi_vertices.bin"; }
+// The file a merge reads for name in dir: the decoded one for a POI file.
+static std::string merge_path(const std::string& dir, const std::string& name) {
+    if (is_poi_file(name)) {
+        auto it = logical_poi_dirs().find(dir);
+        if (it != logical_poi_dirs().end()) return it->second + "/" + name;
+    }
+    return dir + "/" + name;
+}
+// Decodes dir's POI files into to (a new dir); false: dir has none.
+static bool decode_poi_files(const std::string& dir, const std::string& to) {
+    const std::string rp = dir + "/poi_records.bin", vp = dir + "/poi_vertices.bin";
+    struct stat st;
+    const bool has_r = stat(rp.c_str(), &st) == 0, has_v = stat(vp.c_str(), &st) == 0;
+    if (!has_r && !has_v) return false;
+    if (!has_r || !has_v) throw std::runtime_error(dir + " has one of poi_records.bin and poi_vertices.bin");
+    if (mkdir(to.c_str(), 0700) != 0) throw std::runtime_error("Cannot create " + to);
+    MappedFile r = mmap_file(rp), v = mmap_file(vp);
+    if (!r.data || !v.data) throw std::runtime_error("Cannot read the POI files of " + dir);
+    std::ofstream ro(to + "/poi_records.bin", std::ios::binary), vo(to + "/poi_vertices.bin", std::ios::binary);
+    poi_files::decode(reinterpret_cast<const uint8_t*>(r.data), r.size, reinterpret_cast<const uint8_t*>(v.data), v.size,
+                      [&](const uint8_t* rec) { ro.write(reinterpret_cast<const char*>(rec), poi_files::LOGICAL_STRIDE); },
+                      [&](const uint8_t* p, size_t n) { vo.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n)); });
+    unmap_file(r);
+    unmap_file(v);
+    if (!ro.flush() || !vo.flush()) throw std::runtime_error("Cannot write the decoded POI files of " + dir);
+    return true;
+}
+
+// A string tier's pool, as the diff reads it: the file at path (FCC2,
+// string_files.h) decoded into the scratch file `to` and mapped, as mmap_file
+// maps a file: {nullptr, 0} for a missing file or an empty pool. The scratch
+// file goes at once; its pages stay until the pool is unmapped.
+static MappedFile map_string_pool(const std::string& path, const std::string& to) {
+    struct stat st;
+    if (stat(path.c_str(), &st) != 0) return {nullptr, 0};
+    MappedFile f = mmap_file(path);
+    {
+        std::ofstream o(to, std::ios::binary);
+        string_files::decode(
+            reinterpret_cast<const uint8_t*>(f.data), f.size,
+            [&](const char* p, size_t n) { o.write(p, static_cast<std::streamsize>(n)); }, path);
+        if (!o.flush()) throw std::runtime_error("Cannot write the decoded pool of " + path);
+    }
+    unmap_file(f);
+    MappedFile pool = mmap_file(to);
+    unlink(to.c_str());
+    return pool;
+}
+
+// A string tier file's hash (string_tier_file_hash): the strings section's
+// check of a shipped tier, old and new.
+static uint64_t string_tier_file_hash_of(const std::string& path) {
+    MappedFile f = mmap_file(path);
+    if (!f.data) throw std::runtime_error("Cannot read " + path);
+    const uint64_t h = string_tier_file_hash(reinterpret_cast<const uint8_t*>(f.data), f.size, path);
+    unmap_file(f);
+    return h;
+}
+
 static bool try_emit_copy_old(std::vector<char>& patch, uint32_t fid,
                               const std::string& old_path, const std::string& new_path,
                               uint64_t old_size, uint64_t new_size, const char* log_name) {
@@ -567,7 +638,7 @@ static StringFixups string_fixups_of(const FileMergeResult& r, const std::string
     StringFixups fixups(r.name, strings.fixup_limits());
     const std::vector<size_t> fields = string_field_offsets(r.id);
     if (strings.sent_every_pair() || fields.empty() || r.old_size == 0 || r.new_size == 0) return fixups;
-    MappedFile old_m = mmap_file(old_dir + "/" + r.name), new_m = mmap_file(new_dir + "/" + r.name);
+    MappedFile old_m = mmap_file(merge_path(old_dir, r.name)), new_m = mmap_file(merge_path(new_dir, r.name));
     if (old_m.size != r.old_size || new_m.size != r.new_size)
         throw std::runtime_error("String fixups of " + r.name + ": the files are not the ones merged");
     madvise(const_cast<char*>(old_m.data), old_m.size, MADV_SEQUENTIAL);
@@ -613,7 +684,7 @@ static void serialize_merge(std::vector<char>& patch, const FileMergeResult& r, 
     // either file isn't present at <dir>/<name> (mmap returns null).
     if (!old_dir.empty() &&
         try_emit_copy_old(patch, static_cast<uint32_t>(r.id),
-                          old_dir + "/" + r.name, new_dir + "/" + r.name,
+                          merge_path(old_dir, r.name), merge_path(new_dir, r.name),
                           r.old_size, r.new_size, r.name.c_str()))
         return;
     uint32_t fid = static_cast<uint32_t>(r.id);
@@ -735,7 +806,7 @@ static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uin
     uint32_t mask = 0;
     auto scan = [&](PatchFileId fid, size_t stride, const std::vector<size_t>& fields) {
         const std::string name = patch_file_names[(uint32_t)fid];
-        MappedFile m = mmap_file(old_dir + "/" + name);
+        MappedFile m = mmap_file(merge_path(old_dir, name));
         if (!m.data) return;
         mask |= referenced_string_tiers(m.data, m.size, stride, fields, tier_ends, name);
         unmap_file(m);
@@ -827,6 +898,29 @@ static int run(int argc, char* argv[]) {
         }
         else { std::cerr << "Unknown argument " << arg << std::endl << usage << std::endl; return 1; }
     }
+    ScratchDir scratch("geocoder-diff");
+    {
+        const std::string old_to = scratch.path() + "/old-poi", new_to = scratch.path() + "/new-poi";
+        bool old_has = false, new_has = false;
+        std::exception_ptr old_failed, new_failed;
+        std::thread t_old([&] {
+            try {
+                old_has = decode_poi_files(old_dir, old_to);
+            } catch (...) {
+                old_failed = std::current_exception();
+            }
+        });
+        try {
+            new_has = decode_poi_files(new_dir, new_to);
+        } catch (...) {
+            new_failed = std::current_exception();
+        }
+        t_old.join();
+        if (old_failed) std::rethrow_exception(old_failed);
+        if (new_failed) std::rethrow_exception(new_failed);
+        if (old_has) logical_poi_dirs()[old_dir] = old_to;
+        if (new_has && new_dir != old_dir) logical_poi_dirs()[new_dir] = new_to;
+    }
     // A family's keys from one day's sidecar (see identity_keys). A sidecar
     // that is not one key per record is rejected with a warning: the family
     // then merges by content.
@@ -849,8 +943,9 @@ static int run(int argc, char* argv[]) {
         return {std::move(ok), std::move(nk)};
     };
 
-    // Build string remap (mmap each tier's pool — read-only sequential
-    // scan) over the global-offset layout that record name_ids point into.
+    // Build string remap (each tier's pool, decoded from its FCC2 file and
+    // mapped: map_string_pool) over the global-offset layout that record
+    // name_ids point into.
     // Tier bases are the cumulative sizes of the tiers found; a tier found
     // nowhere is empty (strings_poi.bin beside full/).
     std::cerr << "Building string remap... (RSS=" << get_rss_mb() << " MiB)" << std::endl;
@@ -864,12 +959,16 @@ static int run(int argc, char* argv[]) {
     // ends up empty and records that should match (after name_id
     // re-tier) get classified as INSERT/DELETE → byte-block walker
     // produces patches the size of the whole vertex stream.
+    size_t pools = 0;
+    auto load_tier = [&](const std::string& path) {
+        return map_string_pool(path, scratch.path() + "/pool-" + std::to_string(pools++));
+    };
     auto try_load_tier = [&](const std::string& dir, const char* fname) -> MappedFile {
-        MappedFile m = mmap_file(dir + "/" + fname);
+        MappedFile m = load_tier(dir + "/" + fname);
         if (m.size > 0 || m.data != nullptr) return m;
-        m = mmap_file(dir + "/../full/" + fname);
+        m = load_tier(dir + "/../full/" + fname);
         if (m.size > 0 || m.data != nullptr) return m;
-        return mmap_file(dir + "/../../full/" + fname);
+        return load_tier(dir + "/../../full/" + fname);
     };
     // Fallback loader for street_ways.bin, which a variant subdir without
     // its own (e.g. <region>/poi/<tier>/) finds in <region>/full/. Returns
@@ -907,7 +1006,7 @@ static int run(int argc, char* argv[]) {
     for (const MergedFile& f : MERGED_FILES) {
         const char* name = patch_file_names[static_cast<uint32_t>(f.id)];
         auto size_in = [&](const std::string& dir) -> uint64_t {
-            std::vector<std::string> paths{dir + "/" + name};
+            std::vector<std::string> paths{merge_path(dir, name)};
             for (const char* sibling : f.siblings) paths.push_back(dir + "/" + sibling + name);
             for (const std::string& path : paths) {
                 struct stat st;
@@ -923,11 +1022,16 @@ static int run(int argc, char* argv[]) {
     // and may be borrowed; a newly shipped one is sent whole at the end.
     const ShippedStringTiers tier_files = shipped_string_tiers(old_dir, new_dir);
     const uint32_t shipped = tier_files.shipped;
+    std::array<uint64_t, 5> old_tier_hash{}, new_tier_hash{};
     for (int t = 0; t < 5; t++) {
         const bool own = shipped >> t & 1;
-        old_tier_maps[t] = own ? mmap_file(old_dir + "/" + STRING_TIER_FILES[t]) : try_load_tier(old_dir, STRING_TIER_FILES[t]);
-        new_tier_maps[t] = own ? mmap_file(new_dir + "/" + STRING_TIER_FILES[t]) : try_load_tier(new_dir, STRING_TIER_FILES[t]);
+        old_tier_maps[t] = own ? load_tier(old_dir + "/" + STRING_TIER_FILES[t]) : try_load_tier(old_dir, STRING_TIER_FILES[t]);
+        new_tier_maps[t] = own ? load_tier(new_dir + "/" + STRING_TIER_FILES[t]) : try_load_tier(new_dir, STRING_TIER_FILES[t]);
         old_tier_bases[t + 1] = old_tier_bases[t] + static_cast<uint32_t>(old_tier_maps[t].size);
+        if (own) {
+            old_tier_hash[t] = string_tier_file_hash_of(old_dir + "/" + STRING_TIER_FILES[t]);
+            new_tier_hash[t] = string_tier_file_hash_of(new_dir + "/" + STRING_TIER_FILES[t]);
+        }
     }
     SortedU32Map str_remap;
     {
@@ -969,7 +1073,8 @@ static int run(int argc, char* argv[]) {
         std::array<StringTierPools, STRING_TIER_COUNT> tiers;
         uint32_t tier_ends[STRING_TIER_COUNT];
         for (int t = 0; t < STRING_TIER_COUNT; t++) {
-            tiers[t] = {old_tier_maps[t].data, old_tier_maps[t].size, new_tier_maps[t].data, new_tier_maps[t].size};
+            tiers[t] = {old_tier_maps[t].data, old_tier_maps[t].size, new_tier_maps[t].data, new_tier_maps[t].size,
+                        old_tier_hash[t], new_tier_hash[t]};
             tier_ends[t] = old_tier_bases[t + 1];
         }
         const uint32_t referenced =
@@ -1390,8 +1495,8 @@ static int run(int argc, char* argv[]) {
     // Group 4: poi_records → poi_vertices (may not exist in old builds)
     std::thread t_poi([&]() {
         double gs = now_ms();
-        auto old_data = mmap_file_rw(old_dir + "/poi_records.bin");
-        auto new_data = mmap_file(new_dir + "/poi_records.bin");
+        auto old_data = mmap_file_rw(merge_path(old_dir, "poi_records.bin"));
+        auto new_data = mmap_file(merge_path(new_dir, "poi_records.bin"));
         // Handle missing POI files gracefully (new feature, old builds may not have them)
         if (new_data.size == 0 && old_data.size == 0) {
             res_poi_r = {PatchFileId::POI_RECORDS, "poi_records.bin", poi_stride, 0, 0, MergeSequence{}, {}};
@@ -1412,8 +1517,8 @@ static int run(int argc, char* argv[]) {
         if (old_data.size > 0)
             remap_string_fields(old_data.data, old_data.size, PatchFileId::POI_RECORDS, poi_stride, str_remap);
 
-        auto old_v = mmap_file(old_dir + "/poi_vertices.bin");
-        auto new_v = mmap_file(new_dir + "/poi_vertices.bin");
+        auto old_v = mmap_file(merge_path(old_dir, "poi_vertices.bin"));
+        auto new_v = mmap_file(merge_path(new_dir, "poi_vertices.bin"));
         if (old_v.data) madvise(const_cast<char*>(old_v.data), old_v.size, MADV_SEQUENTIAL);
         if (new_v.data) madvise(const_cast<char*>(new_v.data), new_v.size, MADV_SEQUENTIAL);
         size_t n = old_data.size / poi_stride;
@@ -1634,6 +1739,17 @@ static int run(int argc, char* argv[]) {
     if (res_addr_v.stride == 1) {
         serialize_merge(patch, res_addr_v, old_dir, new_dir, patcher_strings, offset_fixup_limits);
         { std::vector<char>().swap(res_addr_v.seq.data); }
+    }
+    // The old V2 file's hash, before the POI records' section: the patcher's POI replay copies the
+    // blocks the day leaves whole and checks them by it.
+    if (struct stat vst; (res_poi_r.old_size || res_poi_r.new_size) && stat((old_dir + "/poi_vertices.bin").c_str(), &vst) == 0) {
+        MappedFile v = mmap_file(old_dir + "/poi_vertices.bin");
+        if (!v.data) throw std::runtime_error("Cannot read " + old_dir + "/poi_vertices.bin");
+        const uint64_t h = lane_hash(v.data, v.size);
+        unmap_file(v);
+        const uint32_t marker = POI_VERTICES_HASH_MARKER;
+        patch.insert(patch.end(), reinterpret_cast<const char*>(&marker), reinterpret_cast<const char*>(&marker) + 4);
+        patch.insert(patch.end(), reinterpret_cast<const char*>(&h), reinterpret_cast<const char*>(&h) + 8);
     }
     serialize_merge(patch, res_poi_r, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     serialize_merge(patch, res_poi_v, old_dir, new_dir, patcher_strings, offset_fixup_limits);

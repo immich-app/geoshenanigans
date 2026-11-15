@@ -13,16 +13,49 @@
 #include <vector>
 
 #include "patch_format.h"
+#include "poi_files.h"
 #include "sanitizer_report.h"
 
 namespace gctest {
 
-// A build dir's files by name.
+// A build dir's files by name. Its POI files and string tiers are logical:
+// poi_records.bin the 36-byte records, poi_vertices.bin the vertex stream they
+// point into, a strings_*.bin its pool.
 using BuildDir = std::map<std::string, std::vector<char>>;
+
+inline bool is_string_tier(const std::string& name) {
+    for (const char* t : STRING_TIER_FILES)
+        if (name == t) return true;
+    return false;
+}
+
+// The dir as the builder writes it: its string tiers as FCC2
+// (string_files.h), and the POI files of a dir with poi_records.bin as R2 and
+// V2 (poi_files.h), a missing poi_vertices.bin an empty vertex stream.
+inline BuildDir as_written(const BuildDir& files) {
+    BuildDir out = files;
+    for (auto& [name, bytes] : out) {
+        if (!is_string_tier(name)) continue;
+        const std::vector<uint8_t> f = string_files::encode(bytes.data(), bytes.size());
+        bytes.assign(f.begin(), f.end());
+    }
+    auto r = files.find("poi_records.bin");
+    if (r == files.end()) return out;
+    if (r->second.size() % poi_files::LOGICAL_STRIDE) throw std::runtime_error("poi_records.bin is not whole records");
+    auto v = files.find("poi_vertices.bin");
+    static const std::vector<char> none;
+    const std::vector<char>& verts = v == files.end() ? none : v->second;
+    const poi_files::Files f =
+        poi_files::encode(reinterpret_cast<const uint8_t*>(r->second.data()), r->second.size() / poi_files::LOGICAL_STRIDE,
+                          reinterpret_cast<const uint8_t*>(verts.data()), verts.size());
+    out["poi_records.bin"].assign(f.records.begin(), f.records.end());
+    out["poi_vertices.bin"].assign(f.vertices.begin(), f.vertices.end());
+    return out;
+}
 
 inline bool write_dir(const std::string& path, const BuildDir& files) {
     std::filesystem::create_directories(path);
-    for (const auto& [name, bytes] : files)
+    for (const auto& [name, bytes] : as_written(files))
         if (!write_file(path + "/" + name, bytes)) return false;
     return true;
 }

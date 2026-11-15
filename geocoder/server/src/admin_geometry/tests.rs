@@ -662,7 +662,7 @@ fn write_index(dir: &std::path::Path, fx: &ArcFixture, cells: &[(u64, u32)], nam
     let tiers: Vec<String> = (0..STR_TIER_COUNT).map(|t| format!("{{\"start\": {}, \"end\": {end}}}", if t == 0 { 0 } else { end })).collect();
     let mut files: Vec<(&str, Vec<u8>)> = fx.files().into();
     files.extend([
-        ("admin_cells.bin", index), ("admin_entries.bin", entries), ("strings_core.bin", names.to_vec()),
+        ("admin_cells.bin", index), ("admin_entries.bin", entries), ("strings_core.bin", crate::strings::encode(names)),
         ("strings_layout.json", format!("{{\"tiers\": [{}]}}", tiers.join(", ")).into_bytes()),
     ]);
     for (name, bytes) in files {
@@ -688,7 +688,7 @@ fn index_load_reads_the_arc_files_and_names_a_missing_one() {
     let (fx, cells, names) = testland();
     let dir = ScratchDir::new();
     write_index(dir.path(), &fx, &cells, &names);
-    assert_eq!(load(dir.path()).unwrap().find_admin(10.0, 20.0).country, Some("Testland"));
+    assert_eq!(load(dir.path()).unwrap().find_admin(10.0, 20.0).country.as_deref(), Some("Testland"));
     for name in ADMIN_GEOMETRY_FILES {
         let dir = ScratchDir::new();
         write_index(dir.path(), &fx, &cells, &names);

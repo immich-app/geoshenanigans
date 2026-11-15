@@ -35,12 +35,14 @@
 #include <s2/s2latlng.h>
 
 #include "types.h"
+#include "string_files.h"
 #include "string_pool.h"
 #include "geometry.h"
 #include "country_code.h"
 #include "postcode_validation.h"
 #include "id_allocator.h"
 #include "parsed_data.h"
+#include "poi_files.h"
 #include "reorder.h"
 
 #include "s2_helpers.h"
@@ -67,6 +69,12 @@
 #include "output_dir.h"
 #include "write_schedule.h"
 
+// The POI writer reads PoiRecord as the logical record it encodes.
+static_assert(sizeof(PoiRecord) == poi_files::LOGICAL_STRIDE && offsetof(PoiRecord, vertex_offset) == poi_files::OFF_VERTEX_OFFSET &&
+              offsetof(PoiRecord, vertex_count) == poi_files::OFF_VERTEX_COUNT && offsetof(PoiRecord, name_id) == poi_files::OFF_NAME &&
+              offsetof(PoiRecord, category) == poi_files::OFF_COMBO && offsetof(PoiRecord, parent_street_id) == poi_files::OFF_STREET &&
+              offsetof(PoiRecord, parent_postcode_id) == poi_files::OFF_POSTCODE &&
+              offsetof(PoiRecord, parent_poly_id) == poi_files::OFF_POLY);
 
 // --- Place type override classification ---
 
@@ -1336,6 +1344,7 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                                 pr.vertex_offset = static_cast<uint32_t>(offset);
                             } else {
                                 pr.vertex_offset = NO_DATA;
+                                pr.vertex_count = 0;
                             }
                             filtered_records[k] = pr;
                             return bytes;
@@ -1357,16 +1366,19 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                             out.push_back({p.cell_id, id_remap[raw_id] | flags});
                         });
 
-                    // Write files
+                    // Write files: the records as R2 and their polygons as V2
+                    // blocks (poi_files.h), one record at a time.
                     {
-                        std::ofstream f(poi_dir + "/poi_records.bin", std::ios::binary);
-                        f.write(reinterpret_cast<const char*>(filtered_records.data()),
-                                filtered_records.size() * sizeof(PoiRecord));
-                    }
-                    {
-                        std::ofstream f(poi_dir + "/poi_vertices.bin", std::ios::binary);
-                        f.write(reinterpret_cast<const char*>(filtered_vertex_bytes.data()),
-                                filtered_vertex_bytes.size());
+                        std::ofstream rf(poi_dir + "/poi_records.bin", std::ios::binary);
+                        std::ofstream vf(poi_dir + "/poi_vertices.bin", std::ios::binary);
+                        poi_files::Writer w(
+                            [&](const uint8_t* p, size_t n) { rf.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n)); },
+                            [&](const uint8_t* p, size_t n) { vf.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n)); });
+                        for (const PoiRecord& pr : filtered_records)
+                            w.add(reinterpret_cast<const uint8_t*>(&pr),
+                                  pr.vertex_count ? filtered_vertex_bytes.data() + pr.vertex_offset : nullptr);
+                        w.finish();
+                        if (!rf.flush() || !vf.flush()) throw std::runtime_error("Cannot write the POI files of " + poi_dir);
                     }
                     // No per-tier sidecar emission — the canonical sidecar
                     // for apply_strategy2_pois lives at base_dir/poi/all/
@@ -1387,8 +1399,8 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                     // shorter file moves no offset.
                     {
                         const std::string_view names = poi_dir_strings(d, tier_var.max_tier);
-                        std::ofstream f(poi_dir + "/" + STR_TIER_FILENAMES[STR_TIER_POI], std::ios::binary);
-                        f.write(names.data(), static_cast<std::streamsize>(names.size()));
+                        string_files::write_file(poi_dir + "/" + STR_TIER_FILENAMES[STR_TIER_POI], names.data(),
+                                                 names.size());
                     }
                     write_strings_layout(poi_dir, d.strings_tier_bases);
 
