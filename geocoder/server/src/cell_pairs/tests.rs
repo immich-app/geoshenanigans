@@ -190,7 +190,7 @@ fn a_lookup_past_its_entries_stops_there() {
             let pairs = open((c.clone(), e[..cut].to_vec()), format).unwrap();
             for (cell, l) in &lists {
                 let got = pairs.ids(*cell);
-                assert!(l.starts_with(&got) || format.kind == Kind::Blocks, "{format:?} cut {cut}");
+                assert!(l.starts_with(&got), "{format:?} cut {cut}");
             }
         }
     }
