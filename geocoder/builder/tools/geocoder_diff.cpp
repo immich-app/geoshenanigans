@@ -2056,13 +2056,24 @@ static int run(int argc, char* argv[]) {
         std::cerr << "  POI parent-id remap: street_pairs=" << ns << std::endl;
     }
 
+    // The hashes of a way pair's two old files, before the ways' section: the patcher's way replay
+    // copies the node blocks of the groups the day leaves whole, with their rows' anchors, counts
+    // and codes, and checks both files by them.
+    auto append_way_pair_hashes = [&](const FileMergeResult& ways, PatchFileId nodes) {
+        if (!ways.old_size && !ways.new_size) return;
+        append_old_file_hash(patch, old_dir, ways.id);
+        append_old_file_hash(patch, old_dir, nodes);
+    };
+
     // Serialize merge results to patch in canonical order, freeing as we go.
     // v8: street ways go before addresses, whose parent_way_id the patcher
     // remaps through the street replay's remap. The parent seqs stay alive
     // for the side files (PARALLEL_DELTA_STRIDE).
+    append_way_pair_hashes(res_ways, PatchFileId::STREET_NODES);
     serialize_merge(patch, res_ways, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     serialize_merge(patch, res_nodes, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     { std::vector<char>().swap(res_nodes.seq.data); }
+    append_way_pair_hashes(res_interp_w, PatchFileId::INTERP_NODES);
     serialize_merge(patch, res_interp_w, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     serialize_merge(patch, res_interp_n, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     { std::vector<char>().swap(res_interp_n.seq.data); }

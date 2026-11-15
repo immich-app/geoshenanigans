@@ -188,7 +188,9 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
   file's block table in a scratch file beside it until the file is closed). An encoded family's
   records and their child stream replay together; a family whose every section a patch sends as
   unchanged goes through no codec: its files are copied from the old dir as they sit, those no
-  section names with them. `--threads` gives each codec a thread
+  section names with them. A way pair a patch changes replays on its two files as they sit: the
+  node blocks of the groups a day leaves whole are copied, the others decoded and encoded a way
+  at a time (see the old file hash below). `--threads` gives each codec a thread
 
 ### Patcher memory and speed
 
@@ -516,6 +518,21 @@ Old file hash: marker 0xFFFFFFF8 (u32) + file_id (u32) + lane_hash of the
   never decoded: the replay hashes the old file as it passes it and refuses
   one of another hash ("Old poi_vertices.bin is not the one the patch was
   made from"), and a POI records section without the hash before it.
+  The two files of each way pair are hashed too (`street_ways.bin` (1) and
+  `street_nodes.bin` (2), `interp_ways.bin` (4) and `interp_nodes.bin` (5)),
+  their two hashes right before the ways' section of a dir with such ways.
+  The patcher replays a pair on its files as they sit
+  (`tools/way_replay.h`): a new group of 16 ways whose ways have, way for
+  way, the node counts of the old group the replay is at, and whose nodes
+  are one MATCH of that group's, gets that group's node blocks as they are
+  (a group's blocks are a function of its ways' nodes alone), its row
+  written with the old anchor, counts and codes and the new names and
+  numbers; every other group is encoded again, the old nodes it keeps
+  decoded from their blocks alone. Neither the copied blocks nor the rows
+  they go with are checked by a decoder: the replay hashes both old files
+  as it passes them and refuses one of another hash ("Old street_nodes.bin
+  is not the one the patch was made from"), and a pair it would replay
+  without both hashes.
 
 Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64) + ...
   (the patcher refuses an old file of another size, 0 meaning absent)
@@ -558,11 +575,12 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   position: its MATCH bytes are the old bytes of the parent records at the
   same places, a MATCH or REPLACE record's own or, where a DELETE run is
   followed by an INSERT run, the deleted record's for the inserted one at the
-  same place in the run. An encoded family (the way files, the address files
-  and the POI files) decodes both files from one stream,
+  same place in the run. An encoded family replayed through its codecs (the
+  address files) decodes both files from one stream,
   and the patcher refuses a replay that reads one of them 4 MiB
   (MAX_DECODER_SKEW) ahead of the other ("Malformed merge sequence: <file>
-  runs ahead of <file>").
+  runs ahead of <file>"); the way pairs and the POI files, replayed on their
+  files as they sit, read each file on its own.
   Offset fixups (node_offset / vertex_offset of MATCH records, see
   OffsetFixups in tools/patch_format.h): runs of varint (records skipped since
   the previous run, run length, zigzag change of the shift); the patcher adds

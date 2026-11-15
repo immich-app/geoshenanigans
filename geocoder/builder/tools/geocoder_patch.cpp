@@ -19,7 +19,9 @@
 // The encoded families' old files (the way, address, POI, place and side
 // files, see gcs_patch.h) are decoded and their new files encoded in process.
 // A family's records and their child stream replay together (JointChild); a
-// family the patch leaves unchanged is copied as its files sit.
+// family the patch leaves unchanged is copied as its files sit. A way pair
+// replays on its files as they sit, the groups a day leaves whole copied
+// (way_replay.h).
 // --threads runs each family's decoder and encoder in a thread of its own.
 
 #include <algorithm>
@@ -60,6 +62,7 @@
 #include "gcs_patch.h"
 #include "patch_decompress.h"
 #include "poi_replay.h"
+#include "way_replay.h"
 
 
 // --- Helpers ---
@@ -412,6 +415,62 @@ private:
     return r;
 }
 
+// A way pair's records' merge sequence seq[0, seq_size) (one MATCH of every record for a section
+// sent as unchanged) and the nodes' section at P[child_at, patch_size), replayed on the pair's two
+// files as they sit (way_replay.h), the MATCH records' fields moved as the generic replay moves
+// them; their MATCH and REPLACE runs go to remap (when given). The replay copies from both old
+// files undecoded, so the patch must have given the hash of each (old_file_hashes), and no other
+// section reads or writes the pair. Out of run() and never inlined into it, as replay_poi_section
+// is. Writes its log line and the codecs' reports.
+[[gnu::noinline]] static way_replay::Result replay_way_section(
+    const way_files::Kind& kind, const char* seq, size_t seq_size, const char* P, size_t patch_size, size_t child_at,
+    const std::string& cur_dir, const std::string& to, uint64_t old_size, uint64_t new_size, uint32_t file_records_max,
+    const std::map<uint32_t, uint64_t>& old_file_hashes, bool has_fixups, OffsetFixupReader& fixups,
+    StringFixupReader& string_fixups, const StringRemap& str_remap, const std::vector<size_t>& remap_offs,
+    std::vector<size_t>& remap_hints, RecordRemap* remap) {
+    auto hash_of = [&](PatchFileId file) {
+        const auto hash = old_file_hashes.find(static_cast<uint32_t>(file));
+        if (hash == old_file_hashes.end())
+            throw std::runtime_error(std::string("Malformed patch: ") + kind.ways_file + " replayed without the old " +
+                                     patch_file_names[static_cast<uint32_t>(file)] + "'s hash");
+        return hash->second;
+    };
+    const way_replay::Hashes hashes{hash_of(way_replay::ways_id(kind)), hash_of(way_replay::nodes_id(kind))};
+    for (const char* file : {kind.ways_file, kind.nodes_file}) {
+        if (!gcs::store().opened_old.insert(file).second) gcs::die("old %s opened twice", file);
+        if (!gcs::store().opened_new.insert(file).second) gcs::die("new %s opened twice", file);
+    }
+    auto fix = [&](uint8_t* rec, uint64_t old_index, uint32_t k, uint64_t run_first, uint32_t run_count) {
+        if (has_fixups && k < OffsetFixupReader::reach(run_first, run_count)) {
+            uint32_t old_off;
+            memcpy(&old_off, rec + way_files::NODE_OFFSET_AT, 4);
+            const uint32_t new_off = fixups.apply(static_cast<uint32_t>(old_index), old_off);
+            memcpy(rec + way_files::NODE_OFFSET_AT, &new_off, 4);
+        }
+        const uint64_t slot = old_index * remap_offs.size();
+        for (size_t f = 0; f < remap_offs.size(); f++) {
+            uint32_t v;
+            memcpy(&v, rec + remap_offs[f], 4);
+            const uint32_t nv = string_fixups.fixes(slot + f) ? string_fixups.take() : str_remap.lookup(v, remap_hints[f]);
+            memcpy(rec + remap_offs[f], &nv, 4);
+        }
+    };
+    const way_replay::Result r = way_replay::replay(
+        kind, seq, seq_size, P, patch_size, child_at, cur_dir, to, old_size, new_size, file_records_max, hashes, fix,
+        [&](uint64_t o, uint64_t n, uint32_t count) {
+            if (remap) remap->add_match(static_cast<uint32_t>(o), static_cast<uint32_t>(n), count);
+        });
+    std::cerr << "  " << kind.nodes_file << ": " << r.nodes_bytes << " bytes, replayed with " << kind.ways_file << ": groups "
+              << r.copied << " copied, " << r.encoded << " encoded; old node bytes " << r.at_hand << " at hand, " << r.passed
+              << " read again, " << r.by_cursor << " by the cursor" << std::endl;
+    const std::string family = gcs::ways::family_of(kind);
+    gcs::store().report.push_back("decode " + family + ": queue peaks " + std::to_string(r.decode_peaks[0]) + " " +
+                                  std::to_string(r.decode_peaks[1]) + " B");
+    gcs::store().report.push_back("encode " + family + ": queue peaks " + std::to_string(r.encode_peaks[0]) + " " +
+                                  std::to_string(r.encode_peaks[1]) + " B");
+    return r;
+}
+
 static int run(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << "Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--threads] [--file-records-max N]"
@@ -603,7 +662,8 @@ static int run(int argc, char* argv[]) {
     SortedTable<RemapPair> poi_street_remap;
     bool saw_parent_remap = false;  // a patch gives one
     // The old files' hashes (OLD_FILE_HASH_MARKER) by file id, which a replay checks the bytes it
-    // copies undecoded by: the POI replay the old poi_vertices.bin's blocks.
+    // copies undecoded by: the POI replay the old poi_vertices.bin's blocks, a way replay the old
+    // pair's rows and node blocks.
     std::map<uint32_t, uint64_t> old_file_hashes;
     auto poi_remap_lookup = [](const SortedTable<RemapPair>& t, uint32_t old_id) {
         const std::optional<RemapPair> p = t.find(old_id);
@@ -808,6 +868,26 @@ static int run(int argc, char* argv[]) {
                     pos = family_end;
                     continue;
                 }
+            }
+            // An unchanged parent of a way pair whose nodes change: one MATCH of every way, replayed on
+            // the pair's files as they sit (way_replay.h).
+            if (const way_files::Kind* kind = old_size > 0 ? way_replay::kind_of(file_id) : nullptr) {
+                char every_way[5] = {static_cast<char>(OP_MATCH_RUN)};
+                const uint32_t ways = static_cast<uint32_t>(old_size / kind->stride);
+                memcpy(every_way + 1, &ways, 4);
+                OffsetFixupReader no_fixups(nullptr, 0, 0, nullptr, 0, 0);
+                StringFixupReader no_string_fixups(nullptr, 0, 0);
+                std::vector<size_t> no_hints;
+                const way_replay::Result r =
+                    replay_way_section(*kind, every_way, sizeof every_way, P, patch_size, pos, cur_dir, listed.count(fname) ? out_dir : tmpdir,
+                                       old_size, new_size, file_records_max, old_file_hashes, false, no_fixups, no_string_fixups,
+                                       str_remap, {}, no_hints, nullptr);
+                if (r.child.kind == ChildOps::MERGE) merge_seqs[r.child.fid] = {r.child.seq, r.child.seq_end - r.child.seq, r.child.stride};
+                pos = r.child.section_end;
+                std::cerr << "  " << fname << ": unchanged (copied " << r.ways_bytes << " bytes from old)" << section_io() << std::endl;
+                madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
+                malloc_trim(0);
+                continue;
             }
             SequentialFileReader in(cur_dir + "/" + fname);
             if (!in.is_open()) {
@@ -1056,6 +1136,39 @@ static int run(int argc, char* argv[]) {
         // A run hint per field: a field whose offsets ascend in record order
         // (POI names, the POI tier's order) mostly skips the run search.
         std::vector<size_t> remap_hints(remap_offs.size(), 0);
+
+        // A way pair's records and their nodes replay on the pair's files as they sit
+        // (way_replay.h): a group of ways whose nodes the day leaves whole is copied, the rest
+        // decoded and encoded again.
+        if (const way_files::Kind* kind = joint && old_size > 0 ? way_replay::kind_of(file_id) : nullptr) {
+            const uint64_t seq_size = patch.u64();
+            patch.require(seq_size, "merge sequence");
+            const size_t seq_at = pos;
+            merge_seqs[file_id] = {seq_at, (size_t)seq_size, actual_stride};
+            const uint64_t n_old_records = old_size / actual_stride;
+            const bool track = is_remapped_record_file(file_id);
+            RecordRemap remap(track ? static_cast<uint32_t>(n_old_records) : 0, tmpdir);
+            const way_replay::Result r =
+                replay_way_section(*kind, P + seq_at, (size_t)seq_size, P, patch_size, seq_at + (size_t)seq_size, cur_dir,
+                                   listed.count(fname) ? out_dir : tmpdir, old_size, new_size, file_records_max, old_file_hashes,
+                                   has_fixups, fixups, string_fixups, str_remap, remap_offs, remap_hints, track ? &remap : nullptr);
+            fixups.finish(n_old_records);
+            string_fixups.finish();
+            if (r.child.kind == ChildOps::MERGE) merge_seqs[r.child.fid] = {r.child.seq, r.child.seq_end - r.child.seq, r.child.stride};
+            pos = r.child.section_end;
+            if (track) remap.finish_runs();
+            // The moved ways' pairs (parent-id remap, street leg) complete the street remap the
+            // address replay reads.
+            if (track && file_id == (uint32_t)PatchFileId::STREET_WAYS) remap.set_pairs(poi_street_remap);
+            const std::string fixed_strings =
+                n_string_fixups > 0 ? ", " + std::to_string(n_string_fixups) + " string fixups" : std::string();
+            std::cerr << "  " << fname << ": " << r.ways_bytes << " bytes (remap of " << n_old_records << " records, "
+                      << remap.run_count() << " runs" << fixed_strings << ")" << section_io() << std::endl;
+            if (track) record_remaps[file_id] = std::move(remap);
+            madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
+            malloc_trim(0);
+            continue;
+        }
 
         // The POI records and their blocks replay on R2 + V2 as they sit (poi_replay.h): a block
         // the day leaves whole is copied, the rest decoded and encoded again.

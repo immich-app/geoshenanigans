@@ -386,8 +386,12 @@ TEST(patch_format_section_marker_values) {
 
 TEST(patch_format_hashed_old_files_are_the_ones_a_replay_copies_unread) {
     // poi_vertices.bin's blocks are copied undecoded; its records are decoded
-    // row by row, and no id past the table names a file.
+    // row by row, and no id past the table names a file. A way pair's node
+    // blocks are copied a group at a time, and its rows give the copied
+    // groups' anchors, counts and codes.
     CHECK(is_hashed_old_file(static_cast<uint32_t>(PatchFileId::POI_VERTICES)));
+    for (const PatchFileId way_file : {PatchFileId::STREET_WAYS, PatchFileId::STREET_NODES, PatchFileId::INTERP_WAYS, PatchFileId::INTERP_NODES})
+        CHECK(is_hashed_old_file(static_cast<uint32_t>(way_file)));
     CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::POI_RECORDS)));
     CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::STRINGS)));
     CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::COUNT)));
