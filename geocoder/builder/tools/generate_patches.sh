@@ -102,10 +102,11 @@ side_weight_kib() {
 }
 
 # The bytes of a variant dir's client files: the set link_client_files.sh
-# links and verify_patch.sh compares.
+# links and verify_patch.sh compares. Printed as %.0f: an awk whose %d is 32
+# bits wide would cap the sum at 2 GiB.
 client_bytes() {
   find "$1" -maxdepth 1 -type f ! -name '.*' ! -name '*.osm_ids' ! -name '*.gcpatch' ! -name '*.zst' -printf '%s\n' \
-    | awk '{s += $1} END {printf "%d", s}'
+    | awk '{s += $1} END {printf "%.0f", s}'
 }
 
 # The tightest memory limit on this process's cgroup path (v2 memory.max or

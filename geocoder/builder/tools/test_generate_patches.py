@@ -310,6 +310,23 @@ class GeneratePatchesTest(unittest.TestCase):
         self.assertIn("diff:r/a", night.events)
         self.assertNotIn("verify:r/a", night.events)
 
+    # A variant whose client files pass 2 GiB (a sparse file of 3 GiB here) is
+    # counted whole: its verify does not start in 3.5 GiB.
+    def test_a_verifys_need_counts_client_files_past_two_gib_whole(self):
+        night = Night(self, ["r/a"])
+        night.sizes("r/a", 1, 1)
+        with open(os.path.join(night.new("r/a"), "addr_points.bin"), "wb") as f:
+            f.truncate(3 * GIB * 1024)
+        free = 3 * GIB + GIB // 2
+
+        night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=AMPLE_MEMORY_KIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=free)
+
+        self.assertEqual(night.result("r/a"), ["FAIL", "1", "0", "0"])
+        self.assertEqual(night.mismatches("r/a"),
+                         "the verify needs %d KiB of scratch, more than the %d KiB free less the reserve of 0 KiB\n"
+                         % (3 * GIB + 1 + PATCHER_SCRATCH_KIB, free))
+        self.assertNotIn("verify:r/a", night.events)
+
     # Without GEOCODER_PATCH_SCRATCH_FREE_KIB the free space is what df says
     # of the scratch dir's volume: half a GiB here, where no verify starts.
     def test_the_free_space_is_dfs_figure_for_the_scratch_dir(self):
