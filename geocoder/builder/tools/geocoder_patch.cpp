@@ -19,7 +19,8 @@
 // The encoded families' old files (the way, address, POI, place and side
 // files, see gcs_patch.h) are decoded and their new files encoded in process.
 // A family's records and their child stream replay together (JointChild); a
-// family the patch leaves unchanged is copied as its files sit. A way pair
+// family the patch leaves unchanged is copied as its files sit, those the
+// patch gives a hash of held to it first. A way pair
 // replays on its files as they sit, the groups a day leaves whole copied
 // (way_replay.h), and so do the address files, the footprint blobs a day
 // leaves whole copied (addr_replay.h).
@@ -379,8 +380,9 @@ private:
 };
 
 // The old dir's `file` read front to back through a window and held to `hash`, the one the
-// patch gives for it. For old files the codecs replay: a decoder takes a damaged record that
-// is still a record.
+// patch gives for it. For old files no replay hashes as it passes them: those of a family
+// copied as its files sit, and those the codecs replay, since a decoder takes a damaged
+// record that is still a record.
 static void require_old_file_hash(const std::string& cur_dir, PatchFileId file, uint64_t hash) {
     const std::string name = patch_file_names[static_cast<uint32_t>(file)];
     SequentialFileReader in(SequentialFileReader::RAW, cur_dir + "/" + name);
@@ -774,13 +776,19 @@ static int run(int argc, char* argv[]) {
     // their sections' old sizes were checked by. They go where the family's encoder writes: the
     // output dir when the patch lists the family, else the scratch dir. False, said, when the old
     // dir lacks one.
-    auto copy_old_family = [&](const gcs::FamilyDesc& family, const IoCounters& section_start) {
+    auto copy_old_family = [&](const gcs::FamilyDesc& family, uint64_t old_size, const IoCounters& section_start) {
         const std::string& to = listed.count(family.today[0]) ? out_dir : tmpdir;
         for (const std::string& name : gcs::store().copied_files(family)) {
             SequentialFileReader in(SequentialFileReader::RAW, cur_dir + "/" + name);
             if (!in.is_open()) {
                 std::cerr << "  ERROR: " << name << ": copy-old failed (src MISSING)" << std::endl;
                 return false;
+            }
+            // No codec reads a copied file: one the patch gives a hash of (a family with
+            // records) is held to it before a byte of it is written.
+            for (const PatchFileId file : HASHED_OLD_FILES) {
+                if (old_size > 0 && name == patch_file_names[static_cast<uint32_t>(file)])
+                    require_old_file_hash(cur_dir, file, old_hash_of(file, family.name));
             }
             const std::string path = to + "/" + name;
             FILE* out = fopen(path.c_str(), "wb");
@@ -940,7 +948,7 @@ static int run(int argc, char* argv[]) {
                     }
                 }
                 if (unchanged) {
-                    if (!copy_old_family(*family, section_start)) return 1;
+                    if (!copy_old_family(*family, old_size, section_start)) return 1;
                     pos = family_end;
                     continue;
                 }

@@ -1086,10 +1086,10 @@ TEST(patch_refuses_a_second_hash_of_a_file_and_a_hash_for_a_file_outside_the_has
 
 // A day that leaves both POI files as they are: the diff sends the hashes of
 // the old poi_records.bin and poi_vertices.bin before the two unchanged
-// sections all the same, and the patcher, whose POI replay does not run,
-// reads them and checks nothing by them. A patch with another hash in the
-// place of either applies in every mode.
-TEST(patch_reads_and_does_not_use_the_poi_hashes_when_both_poi_sections_are_unchanged) {
+// sections all the same, and the patcher, which copies the family as its
+// files sit, holds each file to its hash first. A patch with another hash in
+// the place of either is refused in every mode.
+TEST(patch_holds_an_unchanged_poi_family_to_its_hashes) {
     ScratchDir dir("patch-unused-poi-hash");
     std::mt19937 rng(20261115);
     BuildDir d;
@@ -1119,11 +1119,12 @@ TEST(patch_reads_and_does_not_use_the_poi_hashes_when_both_poi_sections_are_unch
     };
     CHECK(apply_modes(c, ALL_MODES, no_replay).bad.empty());
     // Each hash section is its marker, its file and the hash: 16 bytes.
-    for (const size_t hash_at : {at + 8, at + 16 + 8}) {
+    const char* const files[] = {"poi_records.bin", "poi_vertices.bin"};
+    for (size_t k = 0; k < 2; k++) {
         std::vector<char> another = raw;
-        another[hash_at] ^= 1;
+        another[at + 16 * k + 8] ^= 1;
         REQUIRE(write_patch(c, c.patch(), another));
-        CHECK(apply_modes(c, ALL_MODES, no_replay).bad.empty());
+        CHECK(not_refused(c, ALL_MODES, c.patch(), files[k], std::string("Old ") + files[k] + " is not the one the patch was made from").empty());
     }
 }
 
@@ -1370,6 +1371,30 @@ TEST(patch_copies_a_family_both_of_whose_sections_are_unchanged) {
         if (!a.bad.empty()) std::printf("    %s\n", day.name.c_str());
         CHECK(a.bad.empty());
     }
+}
+
+// A family a day leaves unchanged is copied as its files sit, and each of its
+// files the patch gives a hash of is held to it first: with one byte of such
+// a file changed, its size kept, no mode applies the patch.
+TEST(patch_holds_the_files_of_a_family_it_copies_to_their_hashes) {
+    ScratchDir dir("lowmem-copied-hashes");
+    std::mt19937 rng(20261116);
+    const BuildDir d = every_family(rng);
+    const LowMemCase c{dir.path(), "copied"};
+    REQUIRE(prepare(c, d, d).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    for (const PatchFileId file : HASHED_OLD_FILES) {
+        const std::string name = patch_file_names[static_cast<uint32_t>(file)];
+        const std::string path = c.dir("old") + "/" + name;
+        const std::vector<char> written = read_file(path);
+        REQUIRE(written.size() > 8);
+        std::vector<char> damaged = written;
+        damaged[written.size() / 2] ^= 1;
+        REQUIRE(write_file(path, damaged));
+        CHECK(not_refused(c, ALL_MODES, c.patch(), name, "Old " + name + " is not the one the patch was made from").empty());
+        REQUIRE(write_file(path, written));
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
 // What the patcher checks of an old family it copies as its files sit,
@@ -5493,10 +5518,11 @@ TEST(patch_heap_stays_flat_as_way_groups_are_copied_and_encoded) {
 // copies by: a patch without either is refused in every mode before a way is
 // replayed, and one with another hash for either when the replay has passed
 // the file. 40 streets, one renamed, and 30 interpolations, a node of one
-// moved; the patch as made applies. A hash whose replay does not run is read
-// and checks nothing: on a day that changes neither pair, whose files are
-// copied, and for a pair the old day holds without ways, which has nothing
-// to copy, a patch with other hashes applies.
+// moved; the patch as made applies. On a day that changes neither pair the
+// pairs are copied as their files sit, each file held to its hash first: a
+// patch with another hash for any of the four is refused. The hash of a pair
+// the old day holds without ways, which has nothing to copy, is read and
+// checks nothing: a patch with other hashes applies.
 TEST(patch_refuses_a_way_replay_without_its_hashes) {
     ScratchDir dir("lowmem-way-hashes");
     std::mt19937 rng(20261123);
@@ -5578,7 +5604,20 @@ TEST(patch_refuses_a_way_replay_without_its_hashes) {
             return way_replay_of(log, way_files::INTERPS) || way_replay_of(log, way_files::STREETS) ? std::string("a way replay ran") : std::string();
         };
         CHECK(apply_modes(day, ALL_MODES, no_replay).bad.empty());
-        for (const Hash& h : sent) other[h.at + 8] ^= 1;
+        if (std::string(u.name) == "unchanged") {
+            for (const Hash& h : sent) {
+                std::vector<char> another = other;
+                another[h.at + 8] ^= 1;
+                REQUIRE(write_patch(day, day.patch(), another));
+                const std::string file = patch_file_names[static_cast<uint32_t>(h.file)];
+                CHECK(not_refused(day, ALL_MODES, day.patch(), file, "Old " + file + " is not the one the patch was made from").empty());
+            }
+            continue;
+        }
+        // The interpolations' first ways: the old pair holds nothing to copy or to check.
+        for (const Hash& h : sent) {
+            if (h.kind == &way_files::INTERPS) other[h.at + 8] ^= 1;
+        }
         REQUIRE(write_patch(day, day.patch(), other));
         CHECK(apply_modes(day, ALL_MODES, no_replay).bad.empty());
     }
@@ -6423,9 +6462,10 @@ TEST(patch_copies_the_address_blobs_a_day_leaves_whole) {
 // copies old blobs unread under the old records' points, so in every mode a
 // patch without either hash is refused, one with a second of either is, and
 // one with another hash in the place of either ends on an old file that is
-// not the patch's. On a day that leaves both files as they are the replay
-// does not run and the hashes, sent all the same, check nothing: a patch with
-// another in the place of either applies.
+// not the patch's. On a day that leaves both files as they are the family is
+// copied as its files sit, each of the two held to its hash first: a patch
+// without either hash, or with another in the place of either, is refused
+// all the same.
 TEST(patch_refuses_an_address_replay_without_the_old_address_files_hashes) {
     ScratchDir dir("patch-addr-hash");
     std::mt19937 rng(20261118);
@@ -6486,8 +6526,9 @@ TEST(patch_refuses_an_address_replay_without_the_old_address_files_hashes) {
                 std::vector<char> patch;
                 std::string refusal;  // none: it applies
             };
-            for (const Edit& e : {Edit{h.tag + "-another", another, day.replayed ? h.stale : ""},
-                                  Edit{h.tag + "-cut", cut, day.replayed ? "Malformed patch: address points without the old " + file + "'s hash" : ""},
+            for (const Edit& e : {Edit{h.tag + "-another", another, h.stale},
+                                  Edit{h.tag + "-cut", cut,
+                                       std::string("Malformed patch: ") + (day.replayed ? "address points" : "addr") + " without the old " + file + "'s hash"},
                                   Edit{h.tag + "-twice", twice, "Malformed patch: a second hash of the old " + file}}) {
                 const std::string patch = c.dir(e.name + ".gcpatch");
                 REQUIRE(write_patch(c, patch, e.patch));
