@@ -37,6 +37,15 @@ pub use side_blocks::SideBlocks;
 pub use way_files::{WayFiles, WayRow};
 #[cfg(test)]
 mod scratch_dir;
+// The example that dumps a dir's logical files, as a module of the tests: its own tests run
+// with them, and `query_path_tests` dumps its datasets' dirs with it. It names this crate
+// query_server, and its main is not run here.
+#[cfg(test)]
+extern crate self as query_server;
+#[cfg(test)]
+#[allow(dead_code)]
+#[path = "../examples/dump_logical.rs"]
+mod dump_logical;
 
 // Byte-source abstraction.  Index files are memory-mapped; readers go
 // through `read_chunk(off, len)` and `read_at::<T>(idx)`.
@@ -6293,11 +6302,10 @@ mod query_path_tests {
         [(kind.ways_file(), files.ways), (kind.nodes_file(), files.nodes)]
     }
 
-    /// The three files of `addrs` as the builder writes them (addr_files.rs): addr_points.bin,
-    /// addr_vertices.bin and addr_index.bin, from their logical pair: a record of seven u32s an
-    /// address, and each footprint's logical blob (its 10-byte header, then its steps as u16
-    /// pairs) at the record's vertex_offset.
-    fn addr_triple(addrs: &[Addr]) -> [(&'static str, Vec<u8>); 3] {
+    /// The logical pair of `addrs`, addr_points.bin and addr_vertices.bin: a record of seven
+    /// u32s an address, and each footprint's logical blob (its 10-byte header, then its steps as
+    /// u16 pairs) at the record's vertex_offset.
+    fn addr_logical(addrs: &[Addr]) -> (Vec<u8>, Vec<u8>) {
         let (mut points, mut vertices) = (Vec::new(), Vec::new());
         for addr in addrs {
             let (vertex_offset, vertex_count) = match &addr.footprint {
@@ -6317,6 +6325,13 @@ mod query_path_tests {
                 }
             }
         }
+        (points, vertices)
+    }
+
+    /// The three files of `addrs` as the builder writes them (addr_files.rs): addr_points.bin,
+    /// addr_vertices.bin and addr_index.bin, from their logical pair.
+    fn addr_triple(addrs: &[Addr]) -> [(&'static str, Vec<u8>); 3] {
+        let (points, vertices) = addr_logical(addrs);
         let files = addr_files::encode(&points, &vertices);
         [(addr_files::POINTS_FILE, files.points), (addr_files::VERTICES_FILE, files.vertices), (addr_files::INDEX_FILE, files.index)]
     }
@@ -6514,6 +6529,27 @@ mod query_path_tests {
             self
         }
 
+        /// The side files with a value set, each with its values: NO_DATA for every other record
+        /// of the file it sits beside.
+        fn side_values(&self) -> Vec<(&'static str, Vec<u32>)> {
+            let side_files = [
+                ("way_parents.bin", &self.way_parents, self.streets.len()),
+                ("way_postcodes.bin", &self.way_postcodes, self.streets.len()),
+                ("addr_postcodes.bin", &self.addr_postcodes, self.addrs.len()),
+                ("interp_postcodes.bin", &self.interp_postcodes, self.interps.len()),
+            ];
+            side_files.into_iter()
+                .filter(|(_, set, _)| !set.is_empty())
+                .map(|(name, set, records)| {
+                    let mut values = vec![NO_DATA; records];
+                    for &(record, value) in set {
+                        values[record as usize] = value;
+                    }
+                    (name, values)
+                })
+                .collect()
+        }
+
         /// The files as the builder writes them, by name. A boundary is
         /// listed in every admin cell meeting its box, flagged interior where
         /// the cell lies inside it; a place node in its own cell; a street or
@@ -6559,20 +6595,7 @@ mod query_path_tests {
                 if !self.addrs.is_empty() {
                     files.extend(addr_triple(&self.addrs));
                 }
-                let side_files = [
-                    ("way_parents.bin", &self.way_parents, self.streets.len()),
-                    ("way_postcodes.bin", &self.way_postcodes, self.streets.len()),
-                    ("addr_postcodes.bin", &self.addr_postcodes, self.addrs.len()),
-                    ("interp_postcodes.bin", &self.interp_postcodes, self.interps.len()),
-                ];
-                for (name, set, records) in side_files {
-                    if set.is_empty() { continue; }
-                    let mut values = vec![NO_DATA; records];
-                    for &(record, value) in set {
-                        values[record as usize] = value;
-                    }
-                    files.push((name, side_blocks::encode(&values)));
-                }
+                files.extend(self.side_values().into_iter().map(|(name, values)| (name, side_blocks::encode(&values))));
             }
 
             let end = self.strings.len();
@@ -7804,16 +7827,22 @@ mod query_path_tests {
     #[test]
     fn a_way_of_more_nodes_than_the_way_buffer_keeps_room_for_leaves_it_no_larger() {
         // A street and an interpolation line of as many nodes as a way's count holds, a metre
-        // apart, and a short street with a short line 5 km north of them.
+        // apart, and a short street with a short line 5 km north of them. The long street runs
+        // through Northshire and its parent is Farshire.
         const NODES: usize = u16::MAX as usize;
         let half_m = (NODES / 2) as f64;
         let line = |north_m: f64| (0..NODES).map(|i| (north_m, i as f64 - half_m)).collect::<Vec<(f64, f64)>>();
-        let index = TestIndex::in_country(b"US")
-            .street("Long Road", &line(0.0))
+        let mut dataset = TestIndex::in_country(b"US");
+        dataset
+            .boundary("Northshire", 4, 0, (-100.0, -40_000.0, 100.0, 40_000.0))
+            .boundary("Farshire", 4, 0, (60_000.0, 60_000.0, 70_000.0, 70_000.0))
+            .street("Long Road", &line(0.0)).way_parent(2)
             .interpolation("Long Rd", (1, 65535, 0), &line(5.0))
             .street("Short Street", &parallel(5000.0, 200.0))
-            .interpolation("Short St", (2, 100, 1), &parallel(5008.0, 100.0))
-            .load();
+            .interpolation("Short St", (2, 100, 1), &parallel(5008.0, 100.0));
+        let mut index = dataset.load();
+        // Farshire's parent is Testland, the top of the chain.
+        index.admin_parents = Some(FileBytes::Owned([NO_DATA, NO_DATA, 0].iter().flat_map(|parent| parent.to_le_bytes()).collect()));
         assert_eq!(way_buffer_room(), 0);
 
         // A query of the short ways leaves the buffer with the room it keeps.
@@ -7822,9 +7851,11 @@ mod query_path_tests {
         assert_eq!(way_buffer_room(), WAY_NODES_KEPT);
 
         // Every read of the long ways: the two scans, the street's line for its place nodes,
-        // the house number along the interpolation line.
+        // the house number along the interpolation line, and the street's point nearest the
+        // query, where its state is read: the query's is not its parent's.
         let long = address_at(&index, 1.0, 0.0);
         assert_eq!((long["road"].as_str(), long["house_number"].as_str()), (Some("Long Road"), Some("32768")));
+        assert_eq!(long["state"], "Northshire");
         let primary = primary_at(&index, 1.0, 0.0);
         assert_eq!((primary["street"]["name"].as_str(), primary["interp"]["street"].as_str()), (Some("Long Road"), Some("Long Rd")));
         assert!(way_buffer_room() <= WAY_NODES_KEPT, "{}", way_buffer_room());
@@ -7850,6 +7881,463 @@ mod query_path_tests {
         // The hamlet's square crosses the street's first kilometre, 65 km from its last node.
         let address = address_at(&index, 10.0, half_m);
         assert_eq!((address["road"].as_str(), address["hamlet"].as_str()), (Some("Long Road"), Some("West End")));
+    }
+
+    /// The logical files of `ways` as the builder's types.h lays their records out: a WayHeader
+    /// a street or an InterpWay an interpolation way, its node_offset the nodes of the ways
+    /// before it (0 of a way without nodes), and the ways' nodes back to back.
+    fn logical_ways(ways: &[Way], kind: way_files::Kind) -> [(&'static str, Vec<u8>); 2] {
+        let (mut records, mut nodes) = (Vec::new(), Vec::new());
+        let mut nodes_before = 0u32;
+        for way in ways {
+            let (start_number, end_number, interpolation) = way.numbers;
+            records.extend((if way.nodes.is_empty() { 0 } else { nodes_before }).to_le_bytes());
+            records.extend((way.nodes.len() as u16).to_le_bytes());
+            records.extend([0; 2]);
+            records.extend(way.name_id.to_le_bytes());
+            if kind == way_files::Kind::Interps {
+                records.extend(start_number.to_le_bytes());
+                records.extend(end_number.to_le_bytes());
+                records.extend([interpolation, 0, 0, 0]);
+            }
+            for node in &way.nodes {
+                nodes.extend(node.lat.to_le_bytes());
+                nodes.extend(node.lng.to_le_bytes());
+            }
+            nodes_before += way.nodes.len() as u32;
+        }
+        [(kind.ways_file(), records), (kind.nodes_file(), nodes)]
+    }
+
+    /// The logical files of the dataset's street, interpolation, address and side files, by
+    /// name: a family's where `TestIndex::files` writes the family's.
+    fn logical_files(dataset: &TestIndex) -> BTreeMap<String, Vec<u8>> {
+        let mut files: Vec<(&'static str, Vec<u8>)> = Vec::new();
+        if !(dataset.streets.is_empty() && dataset.addrs.is_empty() && dataset.interps.is_empty()) {
+            files.extend(logical_ways(&dataset.streets, way_files::Kind::Streets));
+            if !dataset.interps.is_empty() {
+                files.extend(logical_ways(&dataset.interps, way_files::Kind::Interps));
+            }
+            if !dataset.addrs.is_empty() {
+                let (points, vertices) = addr_logical(&dataset.addrs);
+                files.extend([(addr_files::POINTS_FILE, points), (addr_files::VERTICES_FILE, vertices)]);
+            }
+            let bytes = |values: Vec<u32>| values.iter().flat_map(|value| value.to_le_bytes()).collect();
+            files.extend(dataset.side_values().into_iter().map(|(name, values)| (name, bytes(values))));
+        }
+        files.into_iter().map(|(name, bytes)| (name.to_owned(), bytes)).collect()
+    }
+
+    /// What a dump of a dir gave (examples/dump_logical.rs): its exit status, its report, what
+    /// it said of an error, and the files it wrote, by name.
+    struct Dump {
+        status: u8,
+        report: String,
+        errors: String,
+        files: BTreeMap<String, Vec<u8>>,
+    }
+
+    /// The dump of `dir` into `out`.
+    fn dump_into(dir: &std::path::Path, out: &std::path::Path) -> Dump {
+        let args = [dir, out].map(|path| path.to_str().unwrap().to_owned());
+        let (mut report, mut errors) = (Vec::new(), Vec::new());
+        let status = crate::dump_logical::run(&args, &mut report, &mut errors);
+        let files = std::fs::read_dir(out).unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name().into_string().unwrap(), std::fs::read(entry.path()).unwrap())
+            })
+            .collect();
+        Dump { status, report: String::from_utf8(report).unwrap(), errors: String::from_utf8(errors).unwrap(), files }
+    }
+
+    /// The dump of `dir` into a fresh dir.
+    fn dump_of(dir: &std::path::Path) -> Dump {
+        dump_into(dir, ScratchDir::new().path())
+    }
+
+    /// The dump of the dataset's dir once `edit` has changed it.
+    fn dump_after(dataset: &TestIndex, edit: impl FnOnce(&std::path::Path)) -> Dump {
+        let dir = ScratchDir::new();
+        dataset.write(dir.path());
+        edit(dir.path());
+        dump_of(dir.path())
+    }
+
+    /// The families a dump reports, each by its first file.
+    const DUMP_FAMILIES: [&str; 7] = [
+        "street_ways.bin", "interp_ways.bin", "addr_points.bin",
+        "way_parents.bin", "way_postcodes.bin", "addr_postcodes.bin", "interp_postcodes.bin",
+    ];
+
+    /// The report of a dump in which no read disagreed with another: for each family what it
+    /// read and how many of its reads gave nothing, and none of a family the dir is without.
+    fn dump_report(families: [Option<(String, u64)>; 7]) -> String {
+        let (mut report, mut nothing) = (String::new(), 0);
+        for (file, family) in DUMP_FAMILIES.iter().zip(families) {
+            report += &match family {
+                Some((read, gave_nothing)) => {
+                    nothing += gave_nothing;
+                    format!("{file}: {read}, {gave_nothing} reads gave nothing, 0 disagreed\n")
+                }
+                None => format!("{file}: none\n"),
+            };
+        }
+        report + &format!("{nothing} reads gave nothing, 0 disagreed\n")
+    }
+
+    /// What a dump reports of the dataset's families, every read giving its record.
+    fn whole_dump_report(dataset: &TestIndex) -> [Option<(String, u64)>; 7] {
+        let ways = |ways: &[Way]| {
+            let nodes: usize = ways.iter().map(|way| way.nodes.len()).sum();
+            (format!("{} ways, {nodes} nodes", ways.len()), 0)
+        };
+        let footprints = dataset.addrs.iter().filter(|addr| addr.footprint.is_some()).count();
+        let has = !(dataset.streets.is_empty() && dataset.addrs.is_empty() && dataset.interps.is_empty());
+        let sides = dataset.side_values();
+        let side = |name: &str| sides.iter().find(|side| side.0 == name).map(|side| (format!("{} values", side.1.len()), 0));
+        [
+            has.then(|| ways(&dataset.streets)),
+            (!dataset.interps.is_empty()).then(|| ways(&dataset.interps)),
+            (!dataset.addrs.is_empty()).then(|| (format!("{} records, {footprints} footprints", dataset.addrs.len()), 0)),
+            side("way_parents.bin"), side("way_postcodes.bin"), side("addr_postcodes.bin"), side("interp_postcodes.bin"),
+        ]
+    }
+
+    /// Asserts that the dump wrote the files of `want`, each with its bytes there but the ones
+    /// `other` names, which have the bytes it gives.
+    fn assert_dumped(dump: &Dump, want: &BTreeMap<String, Vec<u8>>, other: &[(&str, Vec<u8>)]) {
+        assert_eq!(dump.files.keys().collect::<Vec<_>>(), want.keys().collect::<Vec<_>>());
+        for (name, bytes) in want {
+            let bytes = other.iter().find(|(other, _)| other == name).map_or(bytes, |(_, bytes)| bytes);
+            assert!(dump.files[name] == *bytes, "{name}: {} bytes for {}", dump.files[name].len(), bytes.len());
+        }
+    }
+
+    /// Testland with every kind of record the dumped files hold, across the groups, blocks and
+    /// superblocks their files keep them in: tombstones of each kind, the first record and
+    /// among the others; streets of one node, of two and of as many as a way's count holds;
+    /// interpolations of every type, one counting down; addresses that are nodes, closed and
+    /// open outlines, a single vertex, a building kilometres from its point and an outline of
+    /// more vertices than a blob holds; one before any street; and each side file with values
+    /// for some of its records.
+    fn every_kind_of_record() -> TestIndex {
+        let mut dataset = TestIndex::new();
+        dataset.address("1", -500.0, 0.0).dead_street().dead_interpolation();
+        for i in 0..40u32 {
+            let north = 20.0 * f64::from(i);
+            dataset.street(&format!("Street {i}"), &parallel(north, 200.0));
+            if i % 3 == 0 {
+                dataset.way_parent(0);
+            }
+            if i % 4 == 1 {
+                dataset.way_postcode(&format!("{}", 1000 + i));
+            }
+            for j in 0..30u32 {
+                let (south, west) = (north + 3.0, 10.0 * f64::from(j) - 150.0);
+                let house_number = format!("{}", 2 * j + 1);
+                match j % 3 {
+                    0 => dataset.address(&house_number, south, west),
+                    1 => dataset.building(&house_number, (south, west, south + 6.0, west + 7.0)),
+                    _ => {
+                        let outline = [at(south, west), at(south + 5.0, west), at(south + 5.0, west + 4.0)];
+                        dataset.address_point(&house_number, at(south + 2.0, west + 2.0), Some(Footprint::of(&outline)))
+                    }
+                };
+                if j % 7 == 2 {
+                    dataset.addr_postcode(&format!("{}", 2000 + j));
+                }
+            }
+            dataset.interpolation(&format!("Street {i}"), (1 + 2 * i, 199 - i, (i % 3) as u8), &parallel(north + 1.0, 100.0));
+            if i % 5 == 3 {
+                dataset.interp_postcode(&format!("{}", 3000 + i));
+            }
+            if i == 17 {
+                dataset.dead_street().dead_interpolation();
+            }
+        }
+        dataset.interpolation("Street 0", (99, 1, 0), &parallel(-5.0, 100.0));
+        dataset.street("Stub", &[(900.0, 0.0)]).address_point("S", at(905.0, 0.0), Some(Footprint::of(&[at(906.0, 1.0)])));
+        let far: Vec<NodeCoord> = [(3000.0, 0.0), (3000.0, 9.0), (3009.0, 9.0), (3000.0, 0.0)].iter().map(|&(n, e)| at(n, e)).collect();
+        dataset.address_point("F", at(905.0, 10.0), Some(Footprint::of(&far)));
+        let many: Vec<NodeCoord> = (0..65_536).map(|i| at(4000.0 + f64::from(i % 256) * 0.5, f64::from(i / 256) * 0.5)).collect();
+        dataset.address_point("M", at(4064.0, 64.0), Some(Footprint::of(&many))).dead_address();
+        // No cell lists the long street: the dump reads it by its id.
+        let name_id = dataset.string("Long Road");
+        dataset.streets.push(Way { name_id, nodes: (0..65_535).map(|i| at(2000.0, f64::from(i))).collect(), numbers: (0, 0, 0) });
+        dataset
+    }
+
+    #[test]
+    fn a_dump_of_a_dir_is_the_logical_files_of_the_records_it_was_built_from() {
+        let dataset = every_kind_of_record();
+        let nodes = |ways: &[Way]| ways.iter().map(|way| way.nodes.len()).collect::<Vec<usize>>();
+        assert!([0, 1, 2, 65_535].iter().all(|count| nodes(&dataset.streets).contains(count)) && dataset.streets.len() == 44);
+        // A way without nodes after ways with nodes, of each kind.
+        assert_eq!((nodes(&dataset.streets)[19], nodes(&dataset.interps)[19], dataset.interps.len()), (0, 0, 43));
+        let vertices = |addr: &Addr| addr.footprint.as_ref().map_or(0, |footprint| footprint.steps.len());
+        let outlines: Vec<usize> = dataset.addrs.iter().map(vertices).collect();
+        assert!([0, 1, 3, 4, 5, 65_536].iter().all(|count| outlines.contains(count)) && dataset.addrs.len() == 1205);
+        assert_eq!(dataset.side_values().len(), 4);
+
+        let dir = ScratchDir::new();
+        dataset.write(dir.path());
+        let dump = dump_of(dir.path());
+        assert_eq!((dump.status, dump.errors.as_str()), (0, ""));
+        let want = logical_files(&dataset);
+        assert_eq!(want.len(), 10);
+        assert_dumped(&dump, &want, &[]);
+        assert_eq!(dump.report, dump_report(whole_dump_report(&dataset)));
+        let lines: Vec<&str> = dump.report.lines().collect();
+        assert_eq!(lines.len(), 8);
+        assert_eq!(lines[0], "street_ways.bin: 44 ways, 65616 nodes, 0 reads gave nothing, 0 disagreed");
+        assert_eq!(lines[1], "interp_ways.bin: 43 ways, 82 nodes, 0 reads gave nothing, 0 disagreed");
+        assert_eq!(lines[2], "addr_points.bin: 1205 records, 803 footprints, 0 reads gave nothing, 0 disagreed");
+        assert_eq!(lines[6], "interp_postcodes.bin: 43 values, 0 reads gave nothing, 0 disagreed");
+        assert_eq!(lines[7], "0 reads gave nothing, 0 disagreed");
+
+        // The dir is one the server answers from.
+        let address = address_at(&load_dir(dir.path()), 4.0, -148.0);
+        assert_eq!((address["road"].as_str(), address["house_number"].as_str()), (Some("Street 0"), Some("1")));
+    }
+
+    #[test]
+    fn a_dump_holds_a_footprint_of_each_encoding_as_its_logical_blob() {
+        let here = NodeCoord { lat: 52.37, lng: 4.89 };
+        // A corner, a wall along each axis, the far corner and the first again; the same in
+        // steps of 32 bits.
+        let ring = [(0u32, 0u32), (0, 310), (120, 310), (120, 0), (0, 0)];
+        let wide = ring.map(|(north, east)| (north << 14, east << 14));
+        // The bbox minimum where the point puts it, and a degree south-west of that.
+        let near = |scale: f64, north: u32, east: u32| NodeCoord {
+            lat: (f64::from(here.lat) - f64::from(north) * scale) as f32,
+            lng: (f64::from(here.lng) - f64::from(east) * scale) as f32,
+        };
+        let far = NodeCoord { lat: here.lat - 1.0, lng: here.lng - 1.0 };
+        let footprints: [(u8, NodeCoord, &[(u32, u32)]); 9] = [
+            (0, near(1e-5, 48, 124), &ring), (0, far, &ring),
+            (1, near(1e-4, 48, 124), &ring), (1, far, &ring[..2]),
+            (2, near(1e-6, 48, 124), &ring), (2, far, &ring[..1]),
+            (3, near(1e-7, 48 << 14, 124 << 14), &wide), (3, far, &wide[..4]), (3, far, &wide[..1]),
+        ];
+        let (mut points, mut vertices) = (Vec::new(), Vec::new());
+        let mut record = |footprint: Option<&(u8, NodeCoord, &[(u32, u32)])>| {
+            let (vertex_offset, vertex_count) = footprint.map_or((NO_DATA, 0), |footprint| (vertices.len() as u32, footprint.2.len() as u32));
+            for field in [here.lat.to_bits(), here.lng.to_bits(), 1, 2, 3, vertex_offset, vertex_count] {
+                points.extend(field.to_le_bytes());
+            }
+            let Some(&(encoding, min, steps)) = footprint else { return };
+            vertices.extend([encoding, 0]);
+            vertices.extend(min.lat.to_le_bytes());
+            vertices.extend(min.lng.to_le_bytes());
+            for &(north, east) in steps {
+                if encoding == 3 {
+                    vertices.extend(north.to_le_bytes());
+                    vertices.extend(east.to_le_bytes());
+                } else {
+                    vertices.extend((north as u16).to_le_bytes());
+                    vertices.extend((east as u16).to_le_bytes());
+                }
+            }
+        };
+        record(None);
+        footprints.iter().for_each(|footprint| record(Some(footprint)));
+        record(None);
+        let files = addr_files::encode(&points, &vertices);
+        // Each blob's tag: its encoding, 4 of a closed ring, 8 of a bbox minimum in two residuals;
+        // and escapes.
+        let tags: Vec<u8> = {
+            let addrs = AddrFiles::open(Some(FileBytes::Owned(files.points.clone())), Some(FileBytes::Owned(files.vertices.clone())),
+                                        Some(FileBytes::Owned(files.index.clone()))).unwrap().unwrap();
+            (1..10).map(|id| files.vertices[addrs.record(id).unwrap().blob_at as usize]).collect()
+        };
+        assert_eq!(tags, [4 | 8, 4, 1 | 4 | 8, 1, 2 | 4 | 8, 2, 0x80, 0x80, 0x80]);
+
+        // A dir of the three files alone.
+        let dir = ScratchDir::new();
+        let three = [(addr_files::POINTS_FILE, &files.points), (addr_files::VERTICES_FILE, &files.vertices), (addr_files::INDEX_FILE, &files.index)];
+        for (name, bytes) in three {
+            std::fs::write(dir.path().join(name), bytes).unwrap();
+        }
+        let dump = dump_of(dir.path());
+        assert_eq!((dump.status, dump.errors.as_str()), (0, ""));
+        let want = BTreeMap::from([(addr_files::POINTS_FILE.to_owned(), points), (addr_files::VERTICES_FILE.to_owned(), vertices)]);
+        assert_dumped(&dump, &want, &[]);
+        let read = Some(("11 records, 9 footprints".to_owned(), 0));
+        assert_eq!(dump.report, dump_report([None, None, read, None, None, None, None]));
+    }
+
+    /// `two_of_each` with a building, the third address.
+    fn two_of_each_and_a_building() -> TestIndex {
+        let mut dataset = two_of_each();
+        dataset.building("11", (1040.0, 10.0, 1050.0, 20.0));
+        dataset
+    }
+
+    #[test]
+    fn a_dump_counts_the_reads_that_give_nothing_and_fails() {
+        let dataset = two_of_each_and_a_building();
+        let want = logical_files(&dataset);
+        let whole = dump_after(&dataset, |_| ());
+        assert_eq!((whole.status, whole.errors.as_str(), whole.report.as_str()), (0, "", dump_report(whole_dump_report(&dataset)).as_str()));
+        assert_dumped(&whole, &want, &[]);
+
+        // The dump of the dir with a change to one byte of one file, and what it reports with
+        // `read` in place of the family's line.
+        let damaged = |file: &'static str, at: usize, change: fn(u8) -> u8, family: usize, read: (&str, u64)| {
+            let dump = dump_after(&dataset, |dir| {
+                let mut bytes = std::fs::read(dir.join(file)).unwrap();
+                bytes[at] = change(bytes[at]);
+                std::fs::write(dir.join(file), bytes).unwrap();
+            });
+            let mut families = whole_dump_report(&dataset);
+            families[family] = Some((read.0.to_owned(), read.1));
+            assert_eq!((dump.status, dump.errors.as_str(), dump.report.as_str()), (1, "", dump_report(families).as_str()), "{file}");
+            dump
+        };
+        // The second way of a pair, its block of a width no block has (byte 18 of its row is
+        // its code's): its row reads, its nodes do not, and the way before it is whole.
+        for (ways, nodes, family) in [("street_ways.bin", "street_nodes.bin", 0), ("interp_ways.bin", "interp_nodes.bin", 1)] {
+            let dump = damaged(ways, 18, |_| 33, family, ("2 ways, 2 nodes", 1));
+            assert_dumped(&dump, &want, &[(nodes, want[nodes][..16].to_vec())]);
+        }
+        // A block of addresses with a flag no block has: none of its three records reads, in
+        // the run or alone, and each is written as zeros.
+        let dump = damaged(addr_files::POINTS_FILE, 0, |flags| flags | 8, 2, ("3 records, 0 footprints", 6));
+        assert_dumped(&dump, &want, &[(addr_files::POINTS_FILE, vec![0; 3 * 28]), (addr_files::VERTICES_FILE, Vec::new())]);
+        // The building's blob with a tag no blob has: no vertices, no logical blob and no
+        // count, and its record is written as a point's.
+        let dump = damaged(addr_files::VERTICES_FILE, 0, |tag| tag | 0x20, 2, ("3 records, 0 footprints", 3));
+        let mut as_a_point = want[addr_files::POINTS_FILE][..3 * 28 - 8].to_vec();
+        as_a_point.extend([NO_DATA, 0].iter().flat_map(|field| field.to_le_bytes()));
+        assert_dumped(&dump, &want, &[(addr_files::POINTS_FILE, as_a_point), (addr_files::VERTICES_FILE, Vec::new())]);
+        // A side file's block in a mode no block has: neither of its values reads.
+        for (family, (name, _)) in SIDE_FILES.into_iter().enumerate() {
+            let values = want[name].len() / 4;
+            let dump = damaged(name, 0, |_| 7, 3 + family, (&format!("{values} values"), values as u64));
+            assert_dumped(&dump, &want, &[(name, vec![0; 4 * values])]);
+        }
+
+        // The reads of every family that gave nothing are counted together.
+        let dump = dump_after(&dataset, |dir| {
+            for (file, at, byte) in [("street_ways.bin", 18, 33), ("addr_points.bin", 0, 8), ("way_postcodes.bin", 0, 7)] {
+                let mut bytes = std::fs::read(dir.join(file)).unwrap();
+                bytes[at] = byte;
+                std::fs::write(dir.join(file), bytes).unwrap();
+            }
+        });
+        assert_eq!(dump.status, 1);
+        assert!(dump.report.ends_with("\n9 reads gave nothing, 0 disagreed\n"), "{}", dump.report);
+    }
+
+    #[test]
+    fn a_dump_refuses_a_dir_with_part_of_a_family_and_writes_nothing() {
+        let dataset = two_of_each_and_a_building();
+        // What the dump says of the dir after the edit, after the dir's name.
+        let refusal = |edit: &dyn Fn(&std::path::Path)| {
+            let dump = dump_after(&dataset, |dir| edit(dir));
+            assert_eq!((dump.status, dump.report.as_str(), dump.files.len()), (2, "", 0), "{}", dump.errors);
+            let said = dump.errors.strip_prefix("dump_logical: ").and_then(|said| said.strip_suffix('\n')).expect("a line").to_owned();
+            said.split_once(": ").map(|(_, said)| said.to_owned()).unwrap_or(said)
+        };
+        let without = |files: &[&str]| refusal(&|dir| files.iter().for_each(|file| std::fs::remove_file(dir.join(file)).unwrap()));
+        // One file of a pair of way files.
+        for (ways, nodes) in WAY_FILES {
+            assert_eq!(without(&[ways]), format!("{nodes} without {ways}"));
+            assert_eq!(without(&[nodes]), format!("{ways} without {nodes}"));
+        }
+        // Some of the three address files.
+        let (points, vertices, index) = (addr_files::POINTS_FILE, addr_files::VERTICES_FILE, addr_files::INDEX_FILE);
+        assert_eq!(without(&[index]), format!("{points} and {vertices} without {index}"));
+        assert_eq!(without(&[vertices]), format!("{points} and {index} without {vertices}"));
+        assert_eq!(without(&[points, vertices]), format!("{index} without {points} and {vertices}"));
+        // A side file without the file its values' records are in, or of another count.
+        assert_eq!(without(&["street_ways.bin", "street_nodes.bin"]), "way_parents.bin without street_ways.bin");
+        assert_eq!(without(&["street_ways.bin", "street_nodes.bin", "way_parents.bin"]), "way_postcodes.bin without street_ways.bin");
+        assert_eq!(without(&[points, vertices, index]), format!("addr_postcodes.bin without {points}"));
+        assert_eq!(without(&["interp_ways.bin", "interp_nodes.bin"]), "interp_postcodes.bin without interp_ways.bin");
+        for (name, parent) in SIDE_FILES {
+            let records = if parent == points { 3 } else { 2 };
+            let said = refusal(&|dir| std::fs::write(dir.join(name), side_blocks::encode(&[5; 4])).unwrap());
+            assert_eq!(said, format!("{name} holds 4 values for the {records} records of {parent}"));
+        }
+        // Files no builder writes: fixed-width records, without a footer.
+        let fixed_width = |file: &'static str| refusal(&|dir| std::fs::write(dir.join(file), [0u8; 24]).unwrap());
+        assert_eq!(fixed_width("street_ways.bin"), "street_ways.bin has no SWY1 footer");
+        assert_eq!(fixed_width("interp_nodes.bin"), "interp_nodes.bin has no IWN1 footer");
+        assert_eq!(fixed_width(points), "addr_points.bin has no ADB1 footer");
+        assert_eq!(fixed_width("way_parents.bin"), "way_parents.bin has no SDB1 footer");
+        // A dir that is not there.
+        assert!(refusal(&|dir| std::fs::remove_dir_all(dir).unwrap()).ends_with(" is not a dir"));
+    }
+
+    #[test]
+    fn a_dump_writes_into_a_dir_it_makes_or_an_empty_one_and_takes_two_dirs() {
+        let dataset = two_of_each_and_a_building();
+        let want = logical_files(&dataset);
+        let dir = ScratchDir::new();
+        dataset.write(dir.path());
+        let out = ScratchDir::new();
+        // A dir that is not there yet, under one that is not either.
+        let deep = out.path().join("day-b").join("planet-full");
+        let dump = dump_into(dir.path(), &deep);
+        assert_eq!((dump.status, dump.errors.as_str()), (0, ""));
+        assert_dumped(&dump, &want, &[]);
+        // A dir that holds a file, which is left as it is, beside nothing else.
+        let again = dump_into(dir.path(), &deep);
+        assert_eq!((again.status, again.report.as_str()), (2, ""));
+        assert_eq!(again.errors, format!("dump_logical: {} is not empty\n", deep.display()));
+        assert_dumped(&again, &want, &[]);
+        let held = out.path().join("held");
+        std::fs::create_dir(&held).unwrap();
+        std::fs::write(held.join("notes"), b"kept").unwrap();
+        let dump = dump_into(dir.path(), &held);
+        assert_eq!((dump.status, dump.files), (2, BTreeMap::from([("notes".to_owned(), b"kept".to_vec())])));
+
+        // Anything but the two dirs is told how to call it.
+        let usage = "usage: dump_logical <build-dir> <out-dir>\n";
+        let arg = |path: &std::path::Path| path.to_str().unwrap().to_owned();
+        let fresh = out.path().join("fresh");
+        for args in [vec![], vec![arg(dir.path())], vec![arg(dir.path()), arg(&fresh), arg(&fresh)]] {
+            let (mut report, mut errors) = (Vec::new(), Vec::new());
+            assert_eq!(crate::dump_logical::run(&args, &mut report, &mut errors), 2);
+            assert_eq!((String::from_utf8(report).unwrap().as_str(), String::from_utf8(errors).unwrap().as_str()), ("", usage));
+        }
+        assert!(!fresh.exists());
+    }
+
+    #[test]
+    fn a_dump_writes_no_file_of_a_family_the_dir_is_without_and_empty_ones_of_a_family_without_records() {
+        // A dir of boundaries alone: no family, no file.
+        let admin = TestIndex::new();
+        let dump = dump_after(&admin, |_| ());
+        assert_eq!((dump.status, dump.errors.as_str(), dump.files.len()), (0, "", 0));
+        assert_eq!(dump.report, dump_report([None, None, None, None, None, None, None]));
+        assert!(dump.report.starts_with("street_ways.bin: none\ninterp_ways.bin: none\naddr_points.bin: none\nway_parents.bin: none\n"));
+
+        // Streets alone, one with a postcode.
+        let mut streets = TestIndex::new();
+        streets.street("Main Street", &parallel(0.0, 200.0)).way_postcode("2020").street("High Street", &parallel(1000.0, 200.0));
+        let want = logical_files(&streets);
+        assert_eq!(want.keys().collect::<Vec<_>>(), ["street_nodes.bin", "street_ways.bin", "way_postcodes.bin"]);
+        let dump = dump_after(&streets, |_| ());
+        assert_eq!((dump.status, dump.errors.as_str(), dump.report.as_str()), (0, "", dump_report(whole_dump_report(&streets)).as_str()));
+        assert_dumped(&dump, &want, &[]);
+
+        // The same beside interpolation and address files of no records, the footers a full dir
+        // holds without them: a family of no records has its files, of no bytes.
+        let dump = dump_after(&streets, |dir| {
+            let empty = way_pair(&[], way_files::Kind::Interps).into_iter().chain(addr_triple(&[]));
+            for (name, bytes) in empty {
+                std::fs::write(dir.join(name), bytes).unwrap();
+            }
+        });
+        let mut families = whole_dump_report(&streets);
+        (families[1], families[2]) = (Some(("0 ways, 0 nodes".to_owned(), 0)), Some(("0 records, 0 footprints".to_owned(), 0)));
+        assert_eq!((dump.status, dump.errors.as_str(), dump.report.as_str()), (0, "", dump_report(families).as_str()));
+        let mut want = want;
+        want.extend(["interp_ways.bin", "interp_nodes.bin", "addr_points.bin", "addr_vertices.bin"].map(|name| (name.to_owned(), Vec::new())));
+        assert_dumped(&dump, &want, &[]);
     }
 }
 

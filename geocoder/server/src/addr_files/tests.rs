@@ -213,12 +213,33 @@ fn assert_reads(f: &AddrFiles, id: u32, want: &Logical, buf: &mut Vec<NodeCoord>
     assert_eq!(r.is_building(), !want.footprint.is_empty(), "{what}: record {id}");
     assert_eq!(f.vertex_count(&r), count_of(&want.footprint), "{what}: record {id}");
     assert_eq!(f.footprint(&r, buf), r.is_building(), "{what}: record {id}");
+    // A buffer that holds another footprint's logical blob.
+    let mut logical = vec![0xAA; 7];
+    assert_eq!(f.logical_blob(&r, &mut logical), r.is_building(), "{what}: record {id}");
+    assert!(logical == want.footprint, "{what}: record {id}'s logical blob");
     if r.is_building() {
         assert!(bits(buf) == logical_vertices(&want.footprint), "{what}: record {id}'s footprint");
     } else {
         // A point has no blob, and leaves nothing in the buffer.
         assert!(buf.is_empty() && (r.blob_at, r.blob_len) == (0, 0), "{what}: record {id}");
     }
+}
+
+/// Whether record `r` has a footprint, read into `buf`: the vertices its blob's head counts,
+/// which are its logical blob's. Without one it has no vertices, no count and no logical blob.
+fn draws(f: &AddrFiles, r: &AddrRecord, buf: &mut Vec<NodeCoord>) -> bool {
+    let count = f.vertex_count(r);
+    let drawn = f.footprint(r, buf);
+    assert_eq!((drawn, buf.len()), (count > 0, count as usize));
+    // A buffer that holds another footprint's logical blob.
+    let mut logical = vec![0xAA; 7];
+    assert_eq!(f.logical_blob(r, &mut logical), drawn);
+    if drawn {
+        assert!(count_of(&logical) == count && logical_vertices(&logical) == bits(buf), "a footprint of {count} vertices");
+    } else {
+        assert!(logical.is_empty());
+    }
+    drawn
 }
 
 fn logical_blob(enc: u8, bmin_lat: u32, bmin_lng: u32, q: &[(u32, u32)]) -> Vec<u8> {
@@ -779,8 +800,7 @@ fn a_block_or_a_blob_no_builder_writes_reads_as_none_and_the_records_beside_it_s
         assert_eq!(fields(&r), fields(&was[id]));
         // A buffer that holds another footprint's vertices.
         let mut buf = vec![NodeCoord { lat: 1.0, lng: 2.0 }];
-        let drawn = f.footprint(&r, &mut buf);
-        assert_eq!((drawn, buf.len()), (f.vertex_count(&r) > 0, f.vertex_count(&r) as usize));
+        let drawn = draws(&f, &r, &mut buf);
         for other in (0..4).filter(|&other| other != id) {
             assert_reads(&f, other as u32, &records[other], &mut buf, "beside an edited blob");
         }
@@ -845,9 +865,7 @@ fn a_blob_written_by_hand_reads_only_where_its_head_is_one_a_blob_has() {
         assert_eq!((r.blob_at, r.blob_len as usize), (1, blob.len()));
         // A buffer that holds another footprint's vertices.
         let mut buf = vec![NodeCoord { lat: 1.0, lng: 2.0 }];
-        let drawn = f.footprint(&r, &mut buf);
-        assert_eq!((drawn, buf.len()), (f.vertex_count(&r) > 0, f.vertex_count(&r) as usize));
-        drawn.then(|| bits(&buf))
+        draws(&f, &r, &mut buf).then(|| bits(&buf))
     };
     let at_the_point = |vertices: usize| Some(vec![here; vertices]);
     // Two residuals of 0 and values of no bits: vertices where the point is, as many as the
@@ -913,7 +931,7 @@ fn a_blob_written_by_hand_reads_only_where_its_head_is_one_a_blob_has() {
     let mut buf = Vec::new();
     for (blob_at, blob_len) in [(0, 5), (2, 5), (1, 1), (u64::MAX, 5), (0, u32::MAX)] {
         let made_up = AddrRecord { blob_at, blob_len, ..r };
-        assert!(!f.footprint(&made_up, &mut buf) && f.vertex_count(&made_up) == 0, "a blob of {blob_len} bytes at {blob_at}");
+        assert!(!draws(&f, &made_up, &mut buf), "a blob of {blob_len} bytes at {blob_at}");
     }
 }
 
@@ -989,12 +1007,11 @@ fn damaged_files_read_without_a_panic_and_what_no_byte_changed_in_still_reads() 
                 if block_whole {
                     assert_eq!(fields(&r), fields(was), "record {id}");
                 }
-                // A footprint is the vertices its blob's head counts, or none.
-                let count = f.vertex_count(&r);
-                assert_eq!(f.footprint(&r, &mut buf), count > 0, "record {id}");
-                assert_eq!(buf.len(), count as usize, "record {id}");
-                drawn += (count > 0) as usize;
-                undrawn += (count == 0 && r.is_building()) as usize;
+                // A footprint is the vertices its blob's head counts and its logical blob has,
+                // or none.
+                let has_footprint = draws(&f, &r, &mut buf);
+                drawn += has_footprint as usize;
+                undrawn += (!has_footprint && r.is_building()) as usize;
                 if block_whole && !blobs_hit.iter().any(|&at| at >= r.blob_at && at < r.blob_at + r.blob_len as u64) {
                     assert!(bits(&buf) == *was_vertices, "record {id}'s footprint");
                 }
@@ -1176,6 +1193,8 @@ fn a_footprint_is_decoded_into_the_callers_buffer() {
     let f = files(&encoded(&random_records(&mut rng, 500, 0, true)));
     let mut buf: Vec<NodeCoord> = Vec::with_capacity(128);
     let (start, mut buildings) = (buf.as_ptr(), 0);
+    let mut logical: Vec<u8> = Vec::with_capacity(1024);
+    let logical_start = logical.as_ptr();
     for id in 0..f.count() {
         let r = f.record(id).unwrap();
         // A buffer that holds another footprint's vertices.
@@ -1183,6 +1202,10 @@ fn a_footprint_is_decoded_into_the_callers_buffer() {
         let drawn = f.footprint(&r, &mut buf);
         assert_eq!((drawn, buf.len()), (r.is_building(), f.vertex_count(&r) as usize));
         assert!(buf.len() <= 128 && buf.as_ptr() == start && buf.capacity() == 128, "record {id}");
+        // Its logical blob, into a buffer that holds another's.
+        logical.resize(3, 0xAA);
+        assert_eq!((f.logical_blob(&r, &mut logical), count_of(&logical) as usize), (drawn, buf.len()), "record {id}");
+        assert!(logical.is_empty() != drawn && logical.as_ptr() == logical_start && logical.capacity() == 1024, "record {id}");
         buildings += drawn as usize;
     }
     assert!(buildings > 100);

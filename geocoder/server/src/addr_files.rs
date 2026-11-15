@@ -227,6 +227,53 @@ fn predicted(point: u32, sum: u64, vertex_count: u32, scale: f64) -> u32 {
     ((f64::from(f32::from_bits(point)) - (sum as f64 * scale) / f64::from(vertex_count)) as f32).to_bits()
 }
 
+/// Calls `vertex` with the lat and lng steps of each vertex of a blob that is no escape, in the
+/// footprint's order, a closed ring's first again as its last. `values` is the file from the
+/// blob's values on. The steps' sums over the vertices, lat and lng; None where a value's load
+/// passes the file.
+#[inline(always)]
+fn for_steps(head: &BlobHead, values: &[u8], mut vertex: impl FnMut(u16, u16)) -> Option<(u64, u64)> {
+    // The lat values, then the lng values.
+    let (stored, wl, wg) = (head.stored as usize, head.wl as usize, head.wg as usize);
+    let lng_at = stored * wl;
+    let (mut first, mut step) = ((0u16, 0u16), (0u16, 0u16));
+    let (mut sum_lat, mut sum_lng) = (0u64, 0u64);
+    for k in 0..stored {
+        // A value of 16 bits at the most: a step, or as a delta its step from the one before.
+        let (vl, vg) = (bits_at(values, k * wl, head.wl)? as u16, bits_at(values, lng_at + k * wg, head.wg)? as u16);
+        step = if head.delta && k > 0 { (step.0.wrapping_add(unzigzag16(vl)), step.1.wrapping_add(unzigzag16(vg))) } else { (vl, vg) };
+        if k == 0 {
+            first = step;
+        }
+        sum_lat += u64::from(step.0);
+        sum_lng += u64::from(step.1);
+        vertex(step.0, step.1);
+    }
+    if head.closed {
+        // A closed ring's first vertex is its last too, and counts twice in the sums.
+        sum_lat += u64::from(first.0);
+        sum_lng += u64::from(first.1);
+        vertex(first.0, first.1);
+    }
+    Some((sum_lat, sum_lng))
+}
+
+/// The bbox minimum of a blob that is no escape, lat and lng as f32 bits: the bits the blob
+/// holds in full, or where its two residuals put it from the prediction the record's point and
+/// the steps' `sums` give.
+#[inline]
+fn bbox_minimum(head: &BlobHead, blob: &[u8], record: &AddrRecord, sums: (u64, u64)) -> Option<(u32, u32)> {
+    if !head.small {
+        return Some((u32_at(blob, head.bbox_at)?, u32_at(blob, head.bbox_at + 4)?));
+    }
+    let scale = SCALE[usize::from(head.enc)];
+    let near = |point: f32, sum: u64, residual: u8| {
+        let key = order_key(predicted(point.to_bits(), sum, head.vertex_count(), scale));
+        from_order_key(key.wrapping_add_signed((residual as i8).into()))
+    };
+    Some((near(record.lat, sums.0, *blob.get(head.bbox_at)?), near(record.lng, sums.1, *blob.get(head.bbox_at + 1)?)))
+}
+
 /// The three files in place: a record's fields read from its block as they sit, its footprint
 /// decoded from its blob.
 pub struct AddrFiles {
@@ -342,6 +389,19 @@ impl AddrFiles {
         read
     }
 
+    /// A record's footprint into `logical`, which is cleared first, as its logical blob, the
+    /// bytes it has in the logical addr_vertices.bin the files hold: the encoding, a zero byte,
+    /// the bbox minimum's lat and lng (f32) and each vertex's lat and lng steps from it (u16
+    /// each, u32 each in encoding 3). False, and no bytes, where `footprint` is false.
+    pub fn logical_blob(&self, record: &AddrRecord, logical: &mut Vec<u8>) -> bool {
+        logical.clear();
+        let read = self.read_logical_blob(record, logical).is_some();
+        if !read {
+            logical.clear();
+        }
+        read
+    }
+
     /// Block `b`, one of the blocks; None for one that can't be read: one placed past the blocks'
     /// end or that ends past it, a head no builder writes.
     fn block(&self, b: usize) -> Option<Block<'_>> {
@@ -437,43 +497,42 @@ impl AddrFiles {
             }
             return Some(());
         }
-        // The lat values, then the lng values. Each vertex's steps are kept in its place until
-        // the bbox minimum they are counted from is known: of two residuals, it is their sums'.
-        let values = from.get(head.values_at..)?;
-        let (wl, wg) = (head.wl as usize, head.wg as usize);
-        let lng_at = stored * wl;
-        let (mut first, mut step) = ((0u16, 0u16), (0u16, 0u16));
-        let (mut sum_lat, mut sum_lng) = (0u64, 0u64);
-        for k in 0..stored {
-            // A value of 16 bits at the most: a step, or as a delta its step from the one before.
-            let (vl, vg) = (bits_at(values, k * wl, head.wl)? as u16, bits_at(values, lng_at + k * wg, head.wg)? as u16);
-            step = if head.delta && k > 0 { (step.0.wrapping_add(unzigzag16(vl)), step.1.wrapping_add(unzigzag16(vg))) } else { (vl, vg) };
-            if k == 0 {
-                first = step;
-            }
-            sum_lat += u64::from(step.0);
-            sum_lng += u64::from(step.1);
-            out.push(NodeCoord { lat: step.0.into(), lng: step.1.into() });
-        }
-        if head.closed {
-            // A closed ring's first vertex is its last too, and counts twice in the sums.
-            out.extend_from_within(..1);
-            sum_lat += u64::from(first.0);
-            sum_lng += u64::from(first.1);
-        }
-        let (bmin_lat, bmin_lng) = if head.small {
-            let near = |point: f32, sum: u64, residual: u8| {
-                let key = order_key(predicted(point.to_bits(), sum, head.vertex_count(), scale));
-                from_order_key(key.wrapping_add_signed((residual as i8).into()))
-            };
-            bmin(near(record.lat, sum_lat, *blob.get(head.bbox_at)?), near(record.lng, sum_lng, *blob.get(head.bbox_at + 1)?))
-        } else {
-            bmin(u32_at(blob, head.bbox_at)?, u32_at(blob, head.bbox_at + 4)?)
-        };
-        for vertex in out.iter_mut() {
+        // Each vertex's steps are kept in its place until the bbox minimum they are counted from
+        // is known: of two residuals, it is their sums'.
+        let from_here = out.len();
+        let sums = for_steps(&head, from.get(head.values_at..)?, |lat, lng| out.push(NodeCoord { lat: lat.into(), lng: lng.into() }))?;
+        let (bmin_lat, bmin_lng) = bbox_minimum(&head, blob, record, sums)?;
+        let (bmin_lat, bmin_lng) = bmin(bmin_lat, bmin_lng);
+        for vertex in &mut out[from_here..] {
             vertex.lat = (bmin_lat + f64::from(vertex.lat) * scale) as f32;
             vertex.lng = (bmin_lng + f64::from(vertex.lng) * scale) as f32;
         }
+        Some(())
+    }
+
+    /// A record's footprint appended to `out` as its logical blob (`logical_blob`); None where
+    /// it has none, with `out` left as it is or longer.
+    fn read_logical_blob(&self, record: &AddrRecord, out: &mut Vec<u8>) -> Option<()> {
+        let (blob, from) = self.blob(record)?;
+        let head = blob_head(blob)?;
+        if head.escape {
+            // The logical blob as it is, after the escape's tag and count.
+            let logical = blob.get(head.values_at - LOGICAL_HEADER..)?;
+            out.try_reserve(logical.len()).ok()?;
+            out.extend_from_slice(logical);
+            return Some(());
+        }
+        out.try_reserve(LOGICAL_HEADER + 4 * head.vertex_count() as usize).ok()?;
+        // The bbox minimum is known after the steps: of two residuals, it is their sums'.
+        let header_at = out.len();
+        out.extend_from_slice(&[head.enc, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        let sums = for_steps(&head, from.get(head.values_at..)?, |lat, lng| {
+            out.extend_from_slice(&lat.to_le_bytes());
+            out.extend_from_slice(&lng.to_le_bytes());
+        })?;
+        let (bmin_lat, bmin_lng) = bbox_minimum(&head, blob, record, sums)?;
+        out[header_at + 2..header_at + 6].copy_from_slice(&bmin_lat.to_le_bytes());
+        out[header_at + 6..header_at + LOGICAL_HEADER].copy_from_slice(&bmin_lng.to_le_bytes());
         Some(())
     }
 }
