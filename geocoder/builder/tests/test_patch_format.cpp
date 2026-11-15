@@ -1668,6 +1668,73 @@ TEST(patch_format_sorted_and_scratch_tables_floor_as_upper_bound_does) {
     }
 }
 
+TEST(patch_format_sorted_table_floors_keys_crowded_into_few_buckets_or_at_bucket_edges) {
+    // The directory's buckets cut the key range evenly; these keys don't
+    // fill it evenly: all in one bucket, all at the top of the range, pairs
+    // at each multiple of 2^18 and the key just below the next, one key far
+    // above a crowd.
+    std::vector<std::vector<uint32_t>> shapes;
+    std::vector<uint32_t> crowd, top, edges, outlier;
+    for (uint32_t i = 0; i < 10000; i++) {
+        crowd.push_back(1000 + i);
+        top.push_back(UINT32_MAX - 10000 + i);
+        edges.push_back((i / 2) << 18 | (i % 2 ? 0x3FFFF : 0));
+        outlier.push_back(3 * i);
+    }
+    outlier.push_back(UINT32_MAX);
+    for (const size_t n : {size_t(1), size_t(2), size_t(3), size_t(100), size_t(10000)})
+        for (const std::vector<uint32_t>* shape : {&crowd, &top, &edges, &outlier}) {
+            std::vector<uint32_t> keys(shape->begin(), shape->begin() + n);
+            if (shape == &outlier && n > 1) keys.back() = UINT32_MAX;
+            shapes.push_back(keys);
+        }
+    shapes.push_back({0});
+    shapes.push_back({UINT32_MAX});
+    shapes.push_back({0, UINT32_MAX});
+
+    size_t wrong = 0;
+    for (const std::vector<uint32_t>& keys : shapes) {
+        const std::vector<char> bytes = complement_pair_bytes(keys);
+        const SortedTable<RemapPair> sut = pair_table(bytes);
+        std::vector<uint32_t> probes = {0, 1, 1u << 18, UINT32_MAX - 1, UINT32_MAX};
+        for (const uint32_t key : keys) probes.insert(probes.end(), {key - 1, key, key + 1});
+        std::mt19937 rng(23);
+        for (int i = 0; i < 20000; i++) probes.push_back(rng());
+        for (const uint32_t probe : probes) {
+            const size_t above = static_cast<size_t>(std::upper_bound(keys.begin(), keys.end(), probe) - keys.begin());
+            wrong += sut.floor(probe) != (above == 0 ? keys.size() : above - 1);
+        }
+    }
+    CHECK_EQ(wrong, size_t(0));
+}
+
+TEST(patch_format_sorted_table_floors_the_largest_key_whatever_size_t_holds) {
+    // Tables whose buckets are one key wide (a shift of 0), probed with the
+    // largest key: its bucket is past them all.
+    const std::vector<char> none;
+    CHECK_EQ(pair_table(none).floor(UINT32_MAX), size_t(0));
+    CHECK_EQ(SortedTable<RemapPair>().floor(UINT32_MAX), size_t(0));
+    const std::vector<char> zero = complement_pair_bytes({0});
+    CHECK_EQ(pair_table(zero).floor(UINT32_MAX), size_t(0));
+    CHECK_EQ(pair_table(zero).floor(0), size_t(0));
+    const std::vector<char> few = complement_pair_bytes({0, 1, 2});
+    CHECK_EQ(pair_table(few).floor(UINT32_MAX), size_t(2));
+    CHECK(!pair_table(few).find(UINT32_MAX));
+
+    // The bound itself, with the bucket held in 32 bits as a 32-bit size_t
+    // holds it: the largest bucket is past any table's, where b + 1 would
+    // wrap to bucket 0.
+    CHECK(past_last_bucket<uint32_t>(UINT32_MAX, 2));
+    CHECK(past_last_bucket<uint32_t>(UINT32_MAX, 4097));
+    CHECK(past_last_bucket<uint32_t>(UINT32_MAX, 0));
+    CHECK(past_last_bucket<uint32_t>(0, 0));
+    CHECK(past_last_bucket<uint32_t>(1, 2));
+    CHECK(!past_last_bucket<uint32_t>(0, 2));
+    CHECK(!past_last_bucket<uint32_t>(4095, 4097));
+    CHECK(past_last_bucket<uint32_t>(4096, 4097));
+    CHECK(past_last_bucket<size_t>(SIZE_MAX, 2));
+}
+
 TEST(patch_format_scratch_table_refuses_a_key_out_of_order_or_twice) {
     // The last case steps back past the first buffer, which went to the file.
     std::vector<uint32_t> many(3 * SCRATCH_TABLE_BUF / sizeof(RemapPair));

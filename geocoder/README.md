@@ -149,11 +149,11 @@ in [PATCHING.md](PATCHING.md) and `builder/configurations.template.json`.
 | Files | Description |
 |------|-------------|
 | `geo_cells.bin`, `geo_entries.bin` | S2 cell index for streets, addresses and interpolations: each cell's three lists, in blocks of 64 cells, each list against the one before (GXT2, `builder/src/geo_index.h`); the server reads a query's cell and its neighbours in one walk per block |
-| `street_ways.bin`, `street_nodes.bin` | Street way headers (node offset, name), node coordinates |
+| `street_ways.bin`, `street_nodes.bin` | Street way headers (node offset, name), node coordinates. A fresh build writes the ways in cell order: by the least street cell that lists a way, then by name and nodes, so the ways of one place sit together (a continent's files keep the planet's order) |
 | `way_parents.bin`, `way_postcodes.bin` | Per street: smallest containing admin polygon, postcode from its postal boundary |
-| `addr_points.bin`, `addr_vertices.bin` | Address point data (coordinates, house number, street), building outlines |
+| `addr_points.bin`, `addr_vertices.bin` | Address point data (coordinates, house number, street), building outlines; in cell order as the ways are, then by street and house number |
 | `addr_postcodes.bin` | Per address point: its own `addr:postcode` |
-| `interp_ways.bin`, `interp_nodes.bin` | Interpolation way headers, node coordinates |
+| `interp_ways.bin`, `interp_nodes.bin` | Interpolation way headers, node coordinates; in cell order as the ways are, then by street and range |
 | `interp_postcodes.bin` | Per interpolation way: its TIGER ZIP (TIGER regions only) |
 | `admin_cells.bin`, `admin_entries.bin` | S2 cell index for admin boundaries: lists in blocks of 8 cells, each against the one before (the cell pair layout, `builder/src/cell_pairs.h`) |
 | `admin_polygons.bin`, `admin_rings.bin` | Admin polygon records (postcode areas among them, at level 11) and their rings, as refs to arcs |
