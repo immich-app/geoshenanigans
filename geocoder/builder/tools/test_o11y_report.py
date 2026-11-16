@@ -28,6 +28,9 @@ BUILD_LOG = """Using 87 worker threads.
   [35.3s 60.9/88cores 69% 36031MiB] Pass 2: node processing
   [1.2s 9.1/88cores 10% 30000MiB]       planet/full: pack + write
 ARC_CHECK tier=quality/simplified set=full crossings_left=4691 rings_nest_introduced=11
+STREAM_BYTES dir=europe/full stream=addr_vertices bytes=1215752192 limit=8589934588 share=14.1%
+STREAM_BYTES dir=planet/poi/all stream=poi_vertices bytes=536870912 limit=4294967294 share=12.5%
+STREAM_BYTES dir=planet/full stream=addr_vertices bytes=3693937536 limit=8589934588 share=43.0%
   [322.4s 9.8/88cores 11% 25143MiB] All index writing (total)
 """
 MEMWATCH_LOG = """[memwatch 06:30:01] cgroup=91675Mi/98304Mi anon=113Mi file=88832Mi file_dirty=0Mi file_writeback=0Mi build_index_rss=16Mi others_rss=310Mi
@@ -188,6 +191,22 @@ class ArcChecksTest(unittest.TestCase):
         self.assertEqual(sut.arc_checks(["Error: ARC_CHECK failed", "ARC_CHECK", "  Admin arcs: 5 junctions"]), [])
 
 
+class StreamBytesTest(unittest.TestCase):
+    def test_takes_each_streams_bytes_and_their_limit_by_its_dir_and_name(self):
+        self.assertEqual(sut.stream_bytes(BUILD_LOG.splitlines()), {
+            ("europe/full", "addr_vertices"): (1215752192, 8589934588),
+            ("planet/poi/all", "poi_vertices"): (536870912, 4294967294),
+            ("planet/full", "addr_vertices"): (3693937536, 8589934588),
+        })
+
+    def test_takes_no_line_that_only_mentions_it_or_lacks_a_number(self):
+        self.assertEqual(sut.stream_bytes([
+            "Error: STREAM_BYTES dir=planet/full stream=addr_vertices bytes=1 limit=2 share=50.0%",
+            "STREAM_BYTES", "STREAM_BYTES dir=planet/full stream=addr_vertices bytes= limit=8589934588 share=0.0%",
+            "STREAM_BYTES dir=planet/full stream=addr_vertices bytes=12",
+        ]), {})
+
+
 class PeakMemoryTest(unittest.TestCase):
     def test_takes_the_largest_sample_of_each_kind_in_bytes(self):
         self.assertEqual(sut.peak_memory(MEMWATCH_LOG.splitlines()), {
@@ -288,6 +307,22 @@ class NightlyTest(WorkDirTest):
             (("check", "crossings_left"), ("set", "full"), ("tier", "quality/simplified")): 4691,
             (("check", "rings_nest_introduced"), ("set", "full"), ("tier", "quality/simplified")): 11,
         })
+
+    def test_reports_the_planets_footprint_stream_and_the_limit_it_may_not_pass(self):
+        samples, _ = self.run_sut()
+
+        self.assertEqual(by_name(samples, "geocoder_footprint_stream_bytes"), {(("variant", "planet/full"),): 3693937536})
+        self.assertEqual(by_name(samples, "geocoder_footprint_stream_limit_bytes"),
+                         {(("variant", "planet/full"),): 8589934588})
+
+    def test_a_build_that_wrote_no_planet_addresses_reports_no_footprint_stream(self):
+        write(self.path("build.log"), "STREAM_BYTES dir=europe/full stream=addr_vertices bytes=5 limit=8589934588 share=0.0%\n"
+                                      "STREAM_BYTES dir=planet/poi/all stream=poi_vertices bytes=5 limit=4294967294 share=0.0%\n")
+
+        samples, _ = self.run_sut()
+
+        self.assertEqual({name for name, *_ in samples} & {
+            "geocoder_footprint_stream_bytes", "geocoder_footprint_stream_limit_bytes"}, set())
 
     def test_leaves_the_runs_outcome_to_the_watchdog(self):
         samples, _ = self.run_sut()

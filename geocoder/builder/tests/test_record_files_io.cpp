@@ -693,6 +693,24 @@ TEST(address_files_are_the_serial_encoders_files_and_three_footers_without_addre
     CHECK(addr_files_of(dir.path()) == no_addresses());
 }
 
+// The writer gives the bytes of the logical addr_vertices.bin it wrote: the
+// footer's count, which the builder logs beside the most a patch indexes.
+TEST(the_address_writer_gives_the_bytes_of_the_footprints_logical_stream) {
+    std::mt19937_64 rng(73);
+    const Addresses a = random_addresses(rng, 3000);
+    const uint64_t logical_bytes = logical(a).vertices.size();
+    REQUIRE(logical_bytes > 1000);
+    auto drop = [](const uint8_t*, size_t) {};
+    CHECK_EQ(write_addr_pair(a.points, a.vertices, drop, drop, drop, 2, 1), logical_bytes);
+    const Addresses none;
+    CHECK_EQ(write_addr_pair(none.points, none.vertices, drop, drop, drop, 2, 1), uint64_t(0));
+    const ScratchDir dir("addr-files-bytes");
+    CHECK_EQ(write_addr_files(dir.path(), a.points, a.vertices), logical_bytes);
+    const AddrFiles f = addr_files_of(dir.path());
+    REQUIRE(f.vertices.size() >= addr_files::VERTICES_FOOTER_BYTES);
+    CHECK_EQ(addr_files::get64(f.vertices.data() + f.vertices.size() - addr_files::VERTICES_FOOTER_BYTES), logical_bytes);
+}
+
 TEST(a_record_whose_footprint_the_vertices_do_not_hold_is_written_as_a_point) {
     Addresses a;
     std::mt19937_64 rng(71);

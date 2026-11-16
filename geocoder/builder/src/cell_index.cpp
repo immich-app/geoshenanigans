@@ -672,7 +672,12 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             write_futures.push_back(std::async(std::launch::async, [&] {
                 auto _at = std::chrono::steady_clock::now();
                 auto _ac = CpuTicks::now();
-                write_addr_files(output_dir, data.addr_points, data.addr_vertices);
+                const uint64_t footprint_bytes = write_addr_files(output_dir, data.addr_points, data.addr_vertices);
+                // How near the footprints' logical stream is to the most a
+                // patch indexes, which the writer refuses past.
+                if (!data.addr_points.empty())
+                    std::cerr << stream_bytes_line(dir_label(output_dir), "addr_vertices", footprint_bytes,
+                                                   addr_files::MAX_LOGICAL_VERTEX_BYTES);
                 emit_strategy2_sidecar(output_dir + "/addr_points.osm_ids",
                                         data.addr_sidecar_blob, data.addr_osm_ids);
                 log_phase((label + "addr points").c_str(), _at, _ac);

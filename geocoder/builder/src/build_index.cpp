@@ -1418,6 +1418,12 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                               << selection.tombstones << " tombstones), "
                               << filtered_vertex_bytes.size() << " vertex bytes, "
                               << count_cells(filtered_cells) << " cells" << std::endl;
+                    // How near the tier's logical vertex stream is to the
+                    // most a patch indexes of one: a byte a record, below
+                    // NO_DATA (tools/patch_format.h, FILE_RECORDS_MAX).
+                    if (!filtered_records.empty())
+                        std::cerr << stream_bytes_line(region + "/" + tier_var.name, "poi_vertices", filtered_vertex_bytes.size(),
+                                                       uint64_t{UINT32_MAX} - 1);
                     log_phase(("    " + region + ": " + tier_var.name).c_str(), _pt, _pc);
                 }
             }

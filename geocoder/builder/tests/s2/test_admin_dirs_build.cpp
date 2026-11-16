@@ -866,6 +866,46 @@ TEST(a_building_is_written_with_its_footprint_which_the_server_takes_its_distanc
     if (!says(answers[0], "7")) std::printf("    %s\n", answers[0].c_str());
 }
 
+// A build logs, for each dir it writes with addresses and for each POI tier,
+// the bytes of the dir's logical vertex stream, the most a patch indexes of
+// them and their share of that: a STREAM_BYTES line, which the nightly's
+// report reads (tools/o11y_report.py). A building of five vertices and a
+// hospital of five: each stream is one block of 30 bytes.
+TEST(a_build_logs_each_vertex_streams_bytes_and_their_share_of_what_a_patch_indexes) {
+    const ScratchDir root("stream-bytes-build");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log", out = root.path() + "/out";
+    const int32_t south = 470000000 + 1409000, north = south + 2000, west = 80000000 + 1501000;
+    std::vector<TestObject> objects = fixture();
+    // Two rectangles 8 m wide, the hospital 150 m east of the building.
+    auto rectangle = [&](int64_t first_node, int32_t w) {
+        const int32_t corners[4][2] = {{south, w}, {south, w + 8000}, {north, w + 8000}, {north, w}};
+        for (int k = 0; k < 4; k++) objects.push_back(node(first_node + k, corners[k][0], corners[k][1]));
+        return std::vector<int64_t>{first_node, first_node + 1, first_node + 2, first_node + 3, first_node};
+    };
+    objects.push_back(way(4010, rectangle(970, west), {{"addr:housenumber", "7"}, {"addr:street", "Teststrasse"}, {"building", "yes"}}));
+    objects.push_back(way(4011, rectangle(980, west + 20000), {{"amenity", "hospital"}, {"name", "Spital"}}));
+    std::stable_sort(objects.begin(), objects.end(), [](const TestObject& a, const TestObject& b) {
+        return a.type != b.type ? a.type < b.type : a.id < b.id;
+    });
+    write_test_pbf(pbf, objects, 1000);
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf, "--multi-output", "--multi-quality"}, log));
+    REQUIRE(addresses_of(tree(out), "planet/full/").vertices.size() == 30);
+
+    const std::vector<char> text = bytes_of(log);
+    const std::string said(text.begin(), text.end());
+    auto count = [&](const std::string& part) {
+        size_t n = 0;
+        for (size_t at = said.find(part); at != std::string::npos; at = said.find(part, at + 1)) n++;
+        return n;
+    };
+    const int failures_before = gctest::failures();
+    CHECK_EQ(count("\nSTREAM_BYTES dir=planet/full stream=addr_vertices bytes=30 limit=8589934588 share=0.0%\n"), size_t(1));
+    CHECK_EQ(count("\nSTREAM_BYTES dir=planet/poi/all stream=poi_vertices bytes=30 limit=4294967294 share=0.0%\n"), size_t(1));
+    // The modes without address files have no line.
+    CHECK_EQ(count("stream=addr_vertices"), size_t(1));
+    if (gctest::failures() > failures_before) std::printf("%s\n", said.c_str());
+}
+
 TEST(a_fresh_build_writes_streets_and_addresses_in_cell_order_whatever_their_names) {
     const ScratchDir root("record-order-build");
     const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";

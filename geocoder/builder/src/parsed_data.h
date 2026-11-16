@@ -174,6 +174,18 @@ inline void timed_phase(const std::string& name, Fn&& fn) {
     log_phase(name.c_str(), t, cpu);
 }
 
+// A STREAM_BYTES line (tools/o11y_report.py): the bytes of the logical vertex
+// stream `stream` of the dir a build wrote at `dir` ("<region>/<mode>"), the
+// most bytes a patch indexes of such a stream, and the share of them the
+// stream takes, in tenths of a percent, rounded down.
+inline std::string stream_bytes_line(const std::string& dir, const char* stream, uint64_t bytes, uint64_t limit) {
+    const uint64_t tenths = bytes * 1000 / limit;
+    std::ostringstream line;
+    line << "STREAM_BYTES dir=" << dir << " stream=" << stream << " bytes=" << bytes << " limit=" << limit
+         << " share=" << tenths / 10 << "." << tenths % 10 << "%\n";
+    return line.str();
+}
+
 // Approximate heap bytes held by a vector (size + capacity slack).
 template <class V>
 inline size_t vec_bytes(const V& v) {
