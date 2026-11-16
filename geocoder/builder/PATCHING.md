@@ -234,9 +234,9 @@ Measured on planet from 2026-10-18 to 10-19 with GCPATCH v17 (2026-11-15), where
 interpolation and address files are the packed ones and the patcher has one mode: over every
 one of the 90 variant dirs, with the codecs in the patcher's thread and with `--threads`, no
 run's heap peaks above 2.09 MiB or its anonymous memory above 2.08 MiB. One run at a time, one
-core, cold cache: planet/full 118.6 s (136.0 s in a 32 MiB limit), planet/no-addresses 51.6 s,
-planet/poi/all 8.2 s, planet/admin 1.3 s. On the same days the v16 tools take 103.5 s for
-planet/full on the fixed-width files (314.4 s in 32 MiB) and 156.2 s on the encoded set.
+core, cold cache: planet/full 122.4 s (137.7 s in a 32 MiB limit), planet/no-addresses 54.2 s,
+planet/poi/all 8.2 s, planet/admin 1.3 s. On the same days the v16 tools take 103.4 s for
+planet/full on the fixed-width files (310.0 s in 32 MiB) and 156.3 s on the encoded set.
 
 The figures below are GCPATCH v12's, when the patcher had two modes: plain, on the files as the
 builder wrote them, and low-memory, on a set `geocoder-gc` had encoded. They were measured on
@@ -795,7 +795,7 @@ COPY_OLD never stands for an empty file.
 
 Measured from 2026-10-18 to 10-19 with GCPATCH v12; see "Patcher memory and speed" above.
 With GCPATCH v17 and the packed street, interpolation and address files (2026-11-15, the same
-days): planet `full` takes 119 s, 136 s in a 32 MiB limit, and no variant's patch more than
+days): planet `full` takes 122 s, 138 s in a 32 MiB limit, and no variant's patch more than
 2.08 MiB of anonymous memory.
 
 One deterministic `build-index` run writes the planet and every continent in
