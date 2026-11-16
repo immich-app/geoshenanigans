@@ -233,22 +233,23 @@ static bool v15_fixup_skipped(const char* old_polys, size_t old_polys_size,
            (old_verts_size == 0 || memcmp(old_verts, new_verts, old_verts_size) == 0);  // empty maps are null
 }
 
-// The v15 fixup's keys: (record key, vertex block hash) of every record.
+// The v15 fixup's keys: (record key, vertex block hash) of every record,
+// whose vertex offset counts `unit` bytes.
 static FixupKeys v15_fixup_keys(const char* old_polys, size_t old_polys_size,
                                 const char* old_verts, size_t old_verts_size,
                                 const char* new_polys, size_t new_polys_size,
                                 const char* new_verts, size_t new_verts_size,
-                                size_t stride, size_t off_field_pos,
+                                size_t stride, size_t off_field_pos, size_t unit,
                                 uint64_t (*key_fn)(const char* rec)) {
-    auto block_hash = [&](const char* verts, size_t verts_size, uint32_t off, size_t bsize) -> uint64_t {
+    auto block_hash = [&](const char* verts, size_t verts_size, const ChildBlock& block) -> uint64_t {
         uint64_t h = 14695981039346656037ULL;
-        size_t end = std::min((size_t)off + bsize, verts_size);
-        size_t hash_len = std::min(bsize, (size_t)64); // first 64 bytes are enough — header (10) + ~13 vertices
-        for (size_t j = 0; j < hash_len && (size_t)off + j < end; j++) {
-            h ^= (uint8_t)verts[off + j];
+        size_t end = std::min(block.off + block.size, verts_size);
+        size_t hash_len = std::min(block.size, (size_t)64); // first 64 bytes are enough — header (10) + ~13 vertices
+        for (size_t j = 0; j < hash_len && block.off + j < end; j++) {
+            h ^= (uint8_t)verts[block.off + j];
             h *= 1099511628211ULL;
         }
-        h = fnv_mix(h, (uint64_t)bsize); // distinguish blocks of same head bytes but different lengths
+        h = fnv_mix(h, (uint64_t)block.size); // distinguish blocks of same head bytes but different lengths
         return h;
     };
 
@@ -261,10 +262,9 @@ static FixupKeys v15_fixup_keys(const char* old_polys, size_t old_polys_size,
     };
     // Each record's (record_key, block_hash) key, the blocks freed per side.
     auto keys_of = [&](const char* polys, size_t polys_size, const char* verts, size_t verts_size) {
-        auto blocks = vertex_blocks(polys, polys_size, stride, off_field_pos, verts_size);
+        auto blocks = vertex_blocks(polys, polys_size, stride, off_field_pos, verts_size, unit);
         return keyed_records(polys_size / stride, [&](size_t i) {
-            return compose_key(key_fn(polys + i * stride),
-                               block_hash(verts, verts_size, blocks.offsets[i], blocks.sizes[i]));
+            return compose_key(key_fn(polys + i * stride), block_hash(verts, verts_size, blocks.block(i)));
         });
     };
 
@@ -284,13 +284,13 @@ static void fixup_v15_offsets(char* old_polys, size_t old_polys_size,
                               const char* old_verts, size_t old_verts_size,
                               const char* new_polys, size_t new_polys_size,
                               const char* new_verts, size_t new_verts_size,
-                              size_t stride, size_t off_field_pos,
+                              size_t stride, size_t off_field_pos, size_t unit,
                               uint64_t (*key_fn)(const char* rec)) {
     if (v15_fixup_skipped(old_polys, old_polys_size, old_verts, old_verts_size,
                           new_polys, new_polys_size, new_verts, new_verts_size))
         return;
     copy_paired_offsets(v15_fixup_keys(old_polys, old_polys_size, old_verts, old_verts_size, new_polys,
-                                       new_polys_size, new_verts, new_verts_size, stride, off_field_pos, key_fn),
+                                       new_polys_size, new_verts, new_verts_size, stride, off_field_pos, unit, key_fn),
                         old_polys, new_polys, stride, off_field_pos);
 }
 
@@ -1183,40 +1183,30 @@ static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uin
     return mask;
 }
 
-// The stride addr_points.bin merges at, by the size of its logical file: one
-// of no address points, or a dir without the address files, goes out as
-// stride 16, as patches have always sent it.
-static size_t addr_points_stride(uint64_t size) {
-    return size > 0 ? ADDR_POINT_STRIDE : 16;
-}
-template <size_t STRIDE>
-static size_t fixed_stride(uint64_t) {
-    return STRIDE;
-}
-
-// The record files the merges read, by the stride their merge sections give
-// for a new file of its size (a byte stream's is 1, a node's lat and lng 8).
+// The record files the merges read, by the stride of their merge sections (a
+// byte stream's is 1, the address footprints' ADDR_VERTEX_STRIDE, a node's
+// lat and lng 8).
 // The admin geometry files merge at their own strides (ADMIN_SLOT_FAMILIES):
 // an arc index at 4, never the admin polygons' 24 that ids 26 and 27 merged
 // at as the postal files.
 struct MergedFile {
     PatchFileId id;
-    size_t (*stride_of)(uint64_t new_size);
+    size_t stride;
 };
 static constexpr MergedFile MERGED_FILES[] = {
-    {PatchFileId::STREET_WAYS, fixed_stride<WAY_HEADER_STRIDE>},
-    {PatchFileId::STREET_NODES, fixed_stride<8>},
-    {PatchFileId::INTERP_WAYS, fixed_stride<INTERP_WAY_STRIDE>},
-    {PatchFileId::INTERP_NODES, fixed_stride<8>},
-    {PatchFileId::ADDR_POINTS, addr_points_stride},
-    {PatchFileId::ADDR_VERTICES, fixed_stride<1>},
-    {PatchFileId::POI_RECORDS, fixed_stride<POI_RECORD_STRIDE>},
-    {PatchFileId::POI_VERTICES, fixed_stride<1>},
-    {PatchFileId::PLACE_NODES, fixed_stride<PLACE_NODE_STRIDE>},
-    {PatchFileId::ARC_INDEX, fixed_stride<ARC_INDEX_STRIDE>},
-    {PatchFileId::ARC_VERTICES, fixed_stride<1>},
-    {PatchFileId::ADMIN_POLYGONS, fixed_stride<ADMIN_POLYGON_STRIDE>},
-    {PatchFileId::ADMIN_RINGS, fixed_stride<1>},
+    {PatchFileId::STREET_WAYS, WAY_HEADER_STRIDE},
+    {PatchFileId::STREET_NODES, 8},
+    {PatchFileId::INTERP_WAYS, INTERP_WAY_STRIDE},
+    {PatchFileId::INTERP_NODES, 8},
+    {PatchFileId::ADDR_POINTS, ADDR_POINT_STRIDE},
+    {PatchFileId::ADDR_VERTICES, ADDR_VERTEX_STRIDE},
+    {PatchFileId::POI_RECORDS, POI_RECORD_STRIDE},
+    {PatchFileId::POI_VERTICES, 1},
+    {PatchFileId::PLACE_NODES, PLACE_NODE_STRIDE},
+    {PatchFileId::ARC_INDEX, ARC_INDEX_STRIDE},
+    {PatchFileId::ARC_VERTICES, 1},
+    {PatchFileId::ADMIN_POLYGONS, ADMIN_POLYGON_STRIDE},
+    {PatchFileId::ADMIN_RINGS, 1},
 };
 
 static int run(int argc, char* argv[]) {
@@ -1316,6 +1306,8 @@ static int run(int argc, char* argv[]) {
     static_assert(sizeof(WayHeader) == WAY_HEADER_STRIDE && sizeof(InterpWay) == INTERP_WAY_STRIDE &&
                       sizeof(AddrPoint) == ADDR_POINT_STRIDE,
                   "a family's tombstone is one record of its merge's stride");
+    static_assert(ADDR_VERTEX_STRIDE == addr_files::VERTEX_OFFSET_UNIT,
+                  "the footprints' runs count the units a vertex_offset counts");
     // A family's keys on both days, when both have one per record: from the
     // records its merge maps, before any remap (--identity-slots; tombstone
     // is the family's, types.h), or from the days' sidecars (--identity).
@@ -1375,19 +1367,7 @@ static int run(int argc, char* argv[]) {
     for (const MergedFile& f : MERGED_FILES) {
         const char* name = patch_file_names[static_cast<uint32_t>(f.id)];
         const uint64_t old_size = merged_size(old_dir, name), new_size = merged_size(new_dir, name);
-        require_merge_records(name, old_size, new_size, f.stride_of(new_size), file_records_max);
-    }
-    // The address points merge at one stride, so a dir that gains its first
-    // address point or loses its last can't be patched: said before any merge
-    // starts, and run() returns with nothing left in scratch.
-    {
-        const size_t old_stride = addr_points_stride(merged_size(old_dir, addr_files::POINTS_FILE));
-        const size_t new_stride = addr_points_stride(merged_size(new_dir, addr_files::POINTS_FILE));
-        if (old_stride != new_stride) {
-            std::cerr << "  addr_points: stride mismatch (old=" << old_stride << ", new=" << new_stride << ") — cannot patch"
-                      << std::endl;
-            return 2;
-        }
+        require_merge_records(name, old_size, new_size, f.stride, file_records_max);
     }
     // A shipped tier is rebuilt from the client's own old file, so both
     // sides come from the dir itself. The others are only remapped through
@@ -1494,23 +1474,21 @@ static int run(int argc, char* argv[]) {
     // blocks shifted, MATCH records would have stale vertex_offset values).
     //
     // off_field_pos: byte offset of vertex_offset on the parent record.
+    // unit: the bytes a vertex_offset and a run of the merge count by.
     auto build_vertex_byte_merge = [](const MergeSequence& parent_seq,
                                        const char* old_parent, size_t old_parent_size,
                                        const char* new_parent, size_t new_parent_size,
                                        const char* old_verts, size_t old_verts_size,
                                        const char* new_verts, size_t new_verts_size,
                                        size_t parent_stride,
-                                       size_t off_field_pos) -> MergeSequence {
+                                       size_t off_field_pos, size_t unit) -> MergeSequence {
         // Precompute block sizes O(n) so the walker's per-record lookup is O(1).
-        auto old_off_sz = vertex_blocks(old_parent, old_parent_size, parent_stride, off_field_pos, old_verts_size);
-        auto new_off_sz = vertex_blocks(new_parent, new_parent_size, parent_stride, off_field_pos, new_verts_size);
+        auto old_off_sz = vertex_blocks(old_parent, old_parent_size, parent_stride, off_field_pos, old_verts_size, unit);
+        auto new_off_sz = vertex_blocks(new_parent, new_parent_size, parent_stride, off_field_pos, new_verts_size, unit);
         auto block_of = [](const VertexBlocks& v) {
-            return [&v](size_t i) -> ChildBlock {
-                if (i >= v.offsets.size() || v.sizes[i] == 0) return {0, 0};
-                return {v.offsets[i], v.sizes[i]};
-            };
+            return [&v](size_t i) { return v.block(i); };
         };
-        return merge_child_blocks(parent_seq, parent_stride, 1, old_verts, old_verts_size,
+        return merge_child_blocks(parent_seq, parent_stride, unit, old_verts, old_verts_size,
                                   new_verts, new_verts_size, block_of(old_off_sz), block_of(new_off_sz));
     };
 
@@ -1562,13 +1540,16 @@ static int run(int argc, char* argv[]) {
         double gs = now_ms();
         auto old_m = mmap_file_rw(merge_path(old_dir, "addr_points.bin"));
         auto new_m = mmap_file(merge_path(new_dir, "addr_points.bin"));
-        // Old and new merge at one stride: a dir that gains or loses its
-        // address points was refused before the merges.
-        const size_t addr_stride = addr_points_stride(new_m.size);
+        // The points merge at their records' stride with or without records:
+        // a dir's first address points are one INSERT and its last one
+        // DELETE, and their footprints the child stream of either. A family
+        // without a record on either day has no child stream to merge.
+        const size_t addr_stride = ADDR_POINT_STRIDE;
+        const bool has_records = old_m.size > 0 || new_m.size > 0;
         // Identity matching (v8) unless the files are byte-identical (the
         // patcher then copies old and derives no remap).
         std::pair<std::vector<uint32_t>, std::vector<uint32_t>> addr_ids;
-        if (addr_stride >= 28 && !same_bytes(old_m.data, old_m.size, new_m.data, new_m.size))
+        if (has_records && !same_bytes(old_m.data, old_m.size, new_m.data, new_m.size))
             addr_ids = identity_of("addr", addr_point_tombstone(), old_m.data, old_m.size, new_m.data, new_m.size);
         const bool addr_identity = !addr_ids.first.empty();
         const bool unchanged = sent_unchanged(old_m.data, old_m.size, new_m.data, new_m.size);
@@ -1592,7 +1573,7 @@ static int run(int argc, char* argv[]) {
         FixupKeys addr_keys;
         const char* old_av_data = "";
         const char* new_av_data = "";
-        if (addr_stride >= 28) {
+        if (has_records) {
             old_av = mmap_file(merge_path(old_dir, "addr_vertices.bin"));
             new_av = mmap_file(merge_path(new_dir, "addr_vertices.bin"));
             if (old_av.data) old_av_data = old_av.data;
@@ -1605,7 +1586,7 @@ static int run(int argc, char* argv[]) {
             if (!addr_identity && !unchanged)
                 addr_keys = v15_fixup_keys(old_m.data, old_m.size, old_av_data, old_av.size,
                                            new_m.data, new_m.size, new_av_data, new_av.size,
-                                           addr_stride, /*off_field_pos*/ 20,
+                                           addr_stride, /*off_field_pos*/ 20, ADDR_VERTEX_STRIDE,
                                            /*key_fn*/ [](const char*) -> uint64_t { return 0; });
         }
         // parent_way_id (byte 16-19) is a foreign id into street_ways.bin.
@@ -1632,7 +1613,7 @@ static int run(int argc, char* argv[]) {
             std::lock_guard<std::mutex> lock(log_mutex);
             std::cerr << "  addr_points identity: " << f.stats << std::endl;
         } else {
-            if (addr_stride >= 28 &&
+            if (has_records &&
                 !v15_fixup_skipped(old_m.data, old_m.size, old_av_data, old_av.size, new_m.data, new_m.size,
                                    new_av_data, new_av.size))
                 copy_paired_offsets(addr_keys, old_m.data, new_m.data, addr_stride, /*off_field_pos*/ 20);
@@ -1668,7 +1649,7 @@ static int run(int argc, char* argv[]) {
         // parent slots drop their old block, INSERT parent slots emit
         // new block bytes. Mirrors build_vertex_byte_merge usage for
         // poi_vertices.
-        if (addr_stride >= 28) {
+        if (has_records) {
             // Restore old's original vertex_offsets so build_vertex_byte_merge
             // reads each polygon's old block from the *original* byte
             // position (it was rewritten by fixup_v15_offsets to match new).
@@ -1681,13 +1662,13 @@ static int run(int argc, char* argv[]) {
                 new_m.data, new_m.size,
                 old_av_data, old_av.size,
                 new_av_data, new_av.size,
-                addr_stride, /*off_field_pos*/ 20);
-            res_addr_v = {PatchFileId::ADDR_VERTICES, "addr_vertices.bin", 1,
+                addr_stride, /*off_field_pos*/ 20, ADDR_VERTEX_STRIDE);
+            res_addr_v = {PatchFileId::ADDR_VERTICES, "addr_vertices.bin", ADDR_VERTEX_STRIDE,
                           old_av.size, new_av.size, std::move(av_seq), {}};
             log_merge(res_addr_v);
         } else {
-            // No address points: the dir's addr_vertices.bin, if any,
-            // goes whole (emit_raw) later.
+            // No address point on either day: the dir's addr_vertices.bin,
+            // if any, goes whole (emit_raw) later.
             res_addr_v = {PatchFileId::ADDR_VERTICES, "addr_vertices.bin", 0,
                           0, 0, MergeSequence{}, {}};
         }
@@ -1865,7 +1846,7 @@ static int run(int argc, char* argv[]) {
         if (old_data.size > 0 && new_data.size > 0 && !unchanged) {
             fixup_v15_offsets(old_data.data, old_data.size, old_v.data, old_v.size,
                               new_data.data, new_data.size, new_v.data, new_v.size,
-                              poi_stride, /*off_field_pos=*/8,
+                              poi_stride, /*off_field_pos=*/8, /*unit=*/1,
                               [](const char* rec) -> uint64_t {
                                   uint32_t name_id; memcpy(&name_id, rec + 16, 4);
                                   uint8_t cat = static_cast<uint8_t>(rec[20]);
@@ -1896,7 +1877,7 @@ static int run(int argc, char* argv[]) {
             old_data.data, old_data.size, new_data.data, new_data.size,
             old_v.data ? old_v.data : "", old_v.size,
             new_v.data ? new_v.data : "", new_v.size,
-            poi_stride, /*off_field_pos=*/8);
+            poi_stride, /*off_field_pos=*/8, /*unit=*/1);
         res_poi_v = {PatchFileId::POI_VERTICES, "poi_vertices.bin", 1,
                      old_v.size, new_v.size, std::move(pv_seq), {}, {}, {}};
         log_merge(res_poi_v);
@@ -2015,7 +1996,7 @@ static int run(int argc, char* argv[]) {
             }
             auto block_seq = build_vertex_byte_merge(seq, old_r.data, old_r.size, new_r.data, new_r.size,
                                                      old_b.data ? old_b.data : "", old_b.size,
-                                                     new_b.data ? new_b.data : "", new_b.size, stride, 0);
+                                                     new_b.data ? new_b.data : "", new_b.size, stride, 0, 1);
             res_slots[f] = {family.slots, slots_name, stride, old_r.size, new_r.size, std::move(seq), std::move(fixups), {}, {}};
             res_blocks[f] = {family.blocks, blocks_name, 1, old_b.size, new_b.size, std::move(block_seq), {}, {}, {}};
             log_merge(res_slots[f]);
@@ -2085,11 +2066,11 @@ static int run(int argc, char* argv[]) {
         append_old_file_hash(patch, old_dir, PatchFileId::ADDR_VERTICES);
     }
     serialize_merge(patch, res_addr, old_dir, new_dir, patcher_strings, offset_fixup_limits);
-    // res_addr_v is built in t_addr only when the dir has address points;
+    // res_addr_v is built in t_addr only when a day has address points;
     // without them it keeps stride=0 and old/new sizes 0, which we treat as
     // "not built" → fall through to the emit_raw(ADDR_VERTICES) call later
-    // in the section pipeline. stride=1 marks a byte-merge ready to ship.
-    if (res_addr_v.stride == 1) {
+    // in the section pipeline. Any other stride marks a merge ready to ship.
+    if (res_addr_v.stride != 0) {
         serialize_merge(patch, res_addr_v, old_dir, new_dir, patcher_strings, offset_fixup_limits);
         { std::vector<char>().swap(res_addr_v.seq.data); }
     }
@@ -2268,9 +2249,9 @@ static int run(int argc, char* argv[]) {
     // tool, so embedding raw file bytes here does not inflate the
     // final .gcpatch much.
     //
-    // The footprints of an address family without records go this way: the
-    // section's sizes and bytes are the logical file's (merge_path), and it
-    // holds none.
+    // The footprints of an address family without records on either day go
+    // this way: the section's sizes and bytes are the logical file's
+    // (merge_path), and it holds none.
     auto emit_raw = [&](PatchFileId fid, const std::string& fname) {
         SEC("raw:" << fname);
         struct stat nst;
@@ -2613,9 +2594,10 @@ static int run(int argc, char* argv[]) {
     emit_cell_index(PatchFileId::POSTCODE_CENTROID_CELLS, "postcode_centroid_cells.bin",
                     PatchFileId::POSTCODE_CENTROID_ENTRIES, "postcode_centroid_entries.bin");
     // ADDR_VERTICES was already serialized as a byte-merge just after
-    // res_addr when the dir has address points. Only fall back to
-    // FULL_REPLACE here for a dir without them (res_addr_v.stride == 0).
-    if (res_addr_v.stride != 1) {
+    // res_addr when a day has address points. Only fall back to
+    // FULL_REPLACE here for a dir without them on both
+    // (res_addr_v.stride == 0).
+    if (res_addr_v.stride == 0) {
         emit_raw(PatchFileId::ADDR_VERTICES, "addr_vertices.bin");
     }
     // A string tier the old dir lacks has no old file to rebuild from.

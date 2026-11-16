@@ -102,7 +102,10 @@ static constexpr double VERTEX_SCALE[4] = {1e-5, 1e-4, 1e-6, 1e-7};  // degrees 
 //   bytes 10.. : vertex_count vertices, packed at the encoding's stride
 //
 // vertex_offset on the record is the BYTE offset to byte 0 of this
-// header.  Header is omitted for vertex_count == 0 (point-only records,
+// header, which an address's logical record counts in units of
+// addr_files::VERTEX_OFFSET_UNIT bytes (the builder's own AddrPoint holds
+// the footprint's first vertex in its addr_vertices instead).  Header is
+// omitted for vertex_count == 0 (point-only records,
 // vertex_offset = NO_DATA).  Storing the header inline saves the
 // per-record 12-byte tax on PoiRecord/AddrPoint where most records are
 // point-only and would otherwise carry unused bbox_min fields.

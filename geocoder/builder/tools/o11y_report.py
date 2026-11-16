@@ -10,13 +10,15 @@ Usage:
 
 nightly reports what only the build's runner has, from the files the run left
 in its work dir: the build phases, the arc stage's check counts, peak memory,
-patch verify counts, patch and index sizes and the data's age, and log lines
-for build.log, the memwatch samples and the patch verify results. An input a run never wrote leaves its
-metrics out. watchdog, every 2 hours on a GitHub-hosted runner, reports the
-published build's dates from latest.json with a heartbeat, and the outcome,
-duration and steps of the latest finished nightly (--run and --job, the GitHub
-API's run and job objects): a run whose runner died or that timed out never
-reaches its own report, so its outcome comes from here.
+the bytes of the planet's address footprint stream beside the most a patch
+indexes of them, patch verify counts, patch and index sizes and the data's
+age, and log lines for build.log, the memwatch samples and the patch verify
+results. An input a run never wrote leaves its metrics out. watchdog, every 2
+hours on a GitHub-hosted runner, reports the published build's dates from
+latest.json with a heartbeat, and the outcome, duration and steps of the
+latest finished nightly (--run and --job, the GitHub API's run and job
+objects): a run whose runner died or that timed out never reaches its own
+report, so its outcome comes from here.
 
 Both push to o11y's gateway at --base-url, with the bearer token in
 $O11Y_TOKEN: the metrics as Prometheus text to VictoriaMetrics, the log lines
@@ -81,6 +83,13 @@ MEMWATCH_FIELD = re.compile(r"(\w+)=(\d+)Mi\b")
 # value is a count and those that say what they count (set=full,
 # tier=quality/simplified).
 ARC_CHECK_LINE = re.compile(r"^\s*ARC_CHECK((?: [\w-]+=\S+)+)\s*$")
+# A STREAM_BYTES line of build-index: the bytes of a logical vertex stream of
+# a dir it wrote and the most bytes a patch indexes of that stream, which the
+# stream may not pass.
+STREAM_BYTES_LINE = re.compile(r"^\s*STREAM_BYTES dir=(\S+) stream=(\S+) bytes=(\d+) limit=(\d+)(?: |$)")
+# The stream reported as metrics: the planet's address footprints, the nearest
+# to its limit of the dirs' (a region's are part of the planet's).
+FOOTPRINT_STREAM = ("planet/full", "addr_vertices")
 
 
 def unix_time(text):
@@ -137,6 +146,16 @@ def arc_checks(build_log):
         words = [word.split("=", 1) for word in match[1].split()]
         labels = {key: value for key, value in words if not value.isdigit()}
         found += [(labels, key, int(value)) for key, value in words if value.isdigit()]
+    return found
+
+
+def stream_bytes(build_log):
+    """(bytes, limit) of each (dir, stream) of build.log's STREAM_BYTES lines."""
+    found = {}
+    for line in build_log:
+        match = STREAM_BYTES_LINE.match(line)
+        if match:
+            found[match[1], match[2]] = (int(match[3]), int(match[4]))
     return found
 
 
@@ -278,6 +297,11 @@ def nightly(opts, now):
                 for labels, check, count in arc_checks(build_log)]
     samples += [("geocoder_build_peak_memory_bytes", {"kind": kind}, peak)
                 for kind, peak in peak_memory(memwatch_log).items()]
+    footprints = stream_bytes(build_log).get(FOOTPRINT_STREAM)
+    if footprints:
+        variant = {"variant": FOOTPRINT_STREAM[0]}
+        samples += [("geocoder_footprint_stream_bytes", variant, footprints[0]),
+                    ("geocoder_footprint_stream_limit_bytes", variant, footprints[1])]
     if opts.data_timestamp:
         samples.append(("geocoder_build_data_timestamp_seconds", {}, unix_time(opts.data_timestamp)))
     samples += patch_samples(opts.results_dir, opts.output_dir, log)

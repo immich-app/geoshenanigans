@@ -8,13 +8,13 @@
 //
 // Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--threads] [--file-records-max N]
 //
-// Reads GCPATCH v17 (REPLACE runs, street remap derived from the
+// Reads GCPATCH v18 (REPLACE runs, street remap derived from the
 // street_ways replay, PARALLEL_DELTA_STRIDE side files, unmapped ids dropped
 // from street / addr / interp cell lists, a cell index delta for every admin /
 // POI index and none for places, remap pairs ascending, the MATCH records'
 // string fixups, the admin geometry files merged by slot, with admin slots
-// kept, cell list deltas as runs, 16-byte admin polygon records, and an old
-// file's hash by file id).
+// kept, cell list deltas as runs, 16-byte admin polygon records, an old
+// file's hash by file id, and the address footprints in 2-byte units).
 //
 // The encoded families' old files (the way, address, POI, place and side
 // files, see gcs_patch.h) are decoded and their new files encoded in process.
@@ -137,19 +137,21 @@ static uint32_t joint_child_of(uint32_t fid) {
     }
 }
 
-// The bytes a run of a child stream's merge section counts by: a node's lat and lng, or a byte
-// of a vertex stream.
+// The bytes a run of a child stream's merge section counts by: a node's lat and lng, the unit of
+// an address's vertex_offset, or a byte of a vertex stream.
 static uint32_t joint_child_stride(uint32_t child_fid) {
     switch ((PatchFileId)child_fid) {
     case PatchFileId::STREET_NODES:
     case PatchFileId::INTERP_NODES: return 8;
+    case PatchFileId::ADDR_VERTICES: return ADDR_VERTEX_STRIDE;
     default: return 1;
     }
 }
 
 // A child section (the one right after its parent's) replayed on demand: produce(n) writes the
 // next n bytes of the new child file, taking MATCH bytes from the old child file, INSERT / REPLACE
-// bytes from the patch, and skipping DELETE runs as it meets them.
+// bytes from the patch, and skipping DELETE runs as it meets them. A merge at another stride than
+// the child's (joint_child_stride) is refused.
 struct JointChild {
     enum Kind { MERGE, COPY_OLD, FULL };
     Kind kind = MERGE;
@@ -185,7 +187,7 @@ struct JointChild {
             if (kind == FULL && ds != new_size) throw std::runtime_error("Malformed child full replacement");
             if (kind == COPY_OLD) require_copy_old_sizes(patch_file_names[fid], old_size, new_size);
             stride = 1;
-        } else if (stride == SPARSE_DELTA_STRIDE || stride == CELL_LIST_DELTA_STRIDE || stride == PARALLEL_DELTA_STRIDE) {
+        } else if (stride != joint_child_stride(want_fid)) {
             throw std::runtime_error("Encoded family: unexpected section kind for a child stream");
         } else {
             require_merge_records(patch_file_names[fid], old_size, new_size, stride, file_records_max);
@@ -817,7 +819,7 @@ static int run(int argc, char* argv[]) {
             replay_addr_section(seq, seq_size, P, patch_size, child_at, cur_dir, listed.count(addr_files::POINTS_FILE) ? out_dir : tmpdir,
                                 old_size, new_size, file_records_max, hashes, fix, remap);
         if (r.child.kind == ChildOps::MERGE)
-            merge_seqs[(uint32_t)PatchFileId::ADDR_VERTICES] = {r.child.seq, r.child.seq_end - r.child.seq, 1};
+            merge_seqs[(uint32_t)PatchFileId::ADDR_VERTICES] = {r.child.seq, r.child.seq_end - r.child.seq, r.child.stride};
         pos = r.child.section_end;
         madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
         malloc_trim(0);
@@ -1204,13 +1206,13 @@ static int run(int argc, char* argv[]) {
             if (off + 4 > actual_stride) throw std::runtime_error(std::string("Malformed record stride: ") + fname);
         // An encoded family's parent replays with its child stream (open_joint_child): its records go
         // to the encoder whole, and each sizes its child bytes from fields up to its last byte (an
-        // address's vertex_count at 24). A parent without records, old or new, has no child bytes
-        // to replay with it: the diff sends an empty addr_points.bin's addr_vertices.bin later, as a
-        // section of its own.
-        const bool joint =
-            gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX && (old_size || new_size);
-        if (joint && actual_stride != joint_parent_stride(file_id))
+        // address's vertex_count at 24), so its merge is at its records' stride, with records or
+        // without. A parent without records, old or new, has no child bytes to replay with it: the
+        // diff sends an empty addr_points.bin's addr_vertices.bin later, as a section of its own.
+        const bool family_parent = gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX;
+        if (family_parent && actual_stride != joint_parent_stride(file_id))
             throw std::runtime_error(std::string("Malformed record stride: ") + fname);
+        const bool joint = family_parent && (old_size || new_size);
         bool needs_remap = !string_fields.empty();
 
         // Offset fixups, decoded lazily during merge replay (zero allocation).

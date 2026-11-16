@@ -454,20 +454,32 @@ inline MergeSequence build_merge_seq(
     return seq;
 }
 
+// A parent record's block of its child stream: where it starts and its
+// bytes.
+struct ChildBlock { size_t off, size; };
+
 // Each parent record's block of a v15 vertex byte stream: a block runs from
 // its record's vertex offset to the next record's that has one, or to the
 // end of the stream; a NO_DATA or out-of-range offset owns no block (POIs
-// can be points between polygon POIs), nor does one past its successor.
+// can be points between polygon POIs), nor does one past its successor. The
+// offsets and the sizes count units of `unit` bytes.
 struct VertexBlocks {
     std::vector<uint32_t> offsets, sizes;
+    size_t unit = 1;
+    // Record i's block, in bytes: none of a record that owns none, or of one
+    // past the last.
+    ChildBlock block(size_t i) const {
+        if (i >= offsets.size() || sizes[i] == 0) return {0, 0};
+        return {static_cast<size_t>(uint64_t{offsets[i]} * unit), static_cast<size_t>(uint64_t{sizes[i]} * unit)};
+    }
 };
 
 inline VertexBlocks vertex_blocks(const char* parent, size_t parent_size, size_t stride, size_t off_field_pos,
-                                  size_t verts_size, unsigned threads = 0) {
+                                  size_t verts_size, size_t unit, unsigned threads = 0) {
     constexpr uint32_t NO_DATA = 0xFFFFFFFFu;
     size_t total_n = parent_size / stride;
-    VertexBlocks b{std::vector<uint32_t>(total_n), std::vector<uint32_t>(total_n)};
-    auto owns_block = [&](uint32_t off) { return off != NO_DATA && (size_t)off <= verts_size; };
+    VertexBlocks b{std::vector<uint32_t>(total_n), std::vector<uint32_t>(total_n), unit};
+    auto owns_block = [&](uint32_t off) { return off != NO_DATA && uint64_t{off} * unit <= verts_size; };
     // Chunks walk from their end so each i finds its next non-NO_DATA
     // neighbour cheaply, starting from the first one after the chunk.
     size_t chunks = std::max<size_t>(1, std::min<size_t>(total_n, threads ? threads : parallel_threads()));
@@ -481,7 +493,7 @@ inline VertexBlocks vertex_blocks(const char* parent, size_t parent_size, size_t
             }
         }
     }, threads);
-    next_after[chunks - 1] = static_cast<uint32_t>(verts_size);
+    next_after[chunks - 1] = static_cast<uint32_t>(verts_size / unit);
     for (size_t c = chunks - 1; c-- > 0;)
         next_after[c] = first_owner[c + 1] != NO_DATA ? first_owner[c + 1] : next_after[c + 1];
     parallel_for(chunks, [&](size_t cb, size_t ce, unsigned) {
@@ -506,8 +518,6 @@ inline VertexBlocks vertex_blocks(const char* parent, size_t parent_size, size_t
 // bytes are equal, a DELETE drops the old block and an INSERT appends the
 // new one. old_block(i) / new_block(i) give parent i's block; ops count
 // `unit`-byte child records.
-struct ChildBlock { size_t off, size; };
-
 template <typename OldBlock, typename NewBlock>
 MergeSequence merge_child_blocks(const MergeSequence& parent_seq, size_t parent_stride, size_t unit,
                                  const char* old_child, size_t old_child_size,

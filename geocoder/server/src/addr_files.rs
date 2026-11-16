@@ -27,10 +27,13 @@ const INDEX_FOOTER_BYTES: usize = 8;
 const INDEX_HEAD_BYTES: usize = 16;
 const INDEX_ENTRY_BYTES: usize = 6;
 const INDEX_ROW_BYTES: usize = INDEX_HEAD_BYTES + SUPERBLOCK_BLOCKS * INDEX_ENTRY_BYTES;
-/// The most records the files hold, and the most bytes of their footprints' logical blobs: a
-/// patch indexes either in a u32 below NO_DATA.
+/// The most records the files hold: a patch indexes them in a u32 below NO_DATA.
 const MAX_RECORDS: u64 = u32::MAX as u64 - 1;
-const MAX_LOGICAL_VERTEX_BYTES: u64 = u32::MAX as u64 - 1;
+/// The bytes a logical record's vertex_offset counts by, which every logical blob is a whole
+/// number of, and the most bytes of the footprints' logical blobs: as many of them as a u32
+/// below NO_DATA counts.
+pub const VERTEX_OFFSET_UNIT: u64 = 2;
+pub const MAX_LOGICAL_VERTEX_BYTES: u64 = VERTEX_OFFSET_UNIT * (u32::MAX as u64 - 1);
 
 const FLAG_LAT_ORDER: u8 = 1;
 const FLAG_LNG_ORDER: u8 = 2;
@@ -650,6 +653,15 @@ impl<'a> Run<'a> {
     }
 }
 
+/// The vertex_offset of a footprint with `bytes_before` bytes of logical blobs before it: none
+/// of bytes that are not whole units, or are more than the logical blobs may be.
+pub fn vertex_offset_of(bytes_before: u64) -> Option<u32> {
+    if bytes_before % VERTEX_OFFSET_UNIT != 0 || bytes_before > MAX_LOGICAL_VERTEX_BYTES {
+        return None;
+    }
+    u32::try_from(bytes_before / VERTEX_OFFSET_UNIT).ok()
+}
+
 /// The three files (fixtures and tests).
 #[cfg(any(test, feature = "fixtures"))]
 pub struct AddrFileBytes {
@@ -662,10 +674,10 @@ pub struct AddrFileBytes {
 /// them (fixtures and tests). A logical record is seven u32: lat and lng (f32 bits),
 /// housenumber_id, street_id, parent_way_id, vertex_offset and vertex_count; a point's
 /// vertex_offset is NO_DATA and its vertex_count 0. A footprint's logical blob sits at its
-/// record's vertex_offset, the bytes of the footprints before it: the encoding (0 to 3), a zero
-/// byte, the bbox minimum's lat and lng (f32) and vertex_count vertices, each its lat and lng
-/// steps from the bbox minimum (u16 each, u32 each in encoding 3). Panics on a pair the files
-/// can't hold.
+/// record's vertex_offset, the bytes of the footprints before it in units of
+/// VERTEX_OFFSET_UNIT: the encoding (0 to 3), a zero byte, the bbox minimum's lat and lng (f32)
+/// and vertex_count vertices, each its lat and lng steps from the bbox minimum (u16 each, u32
+/// each in encoding 3). Panics on a pair the files can't hold.
 #[cfg(any(test, feature = "fixtures"))]
 pub fn encode(points: &[u8], vertices: &[u8]) -> AddrFileBytes {
     const STRIDE: usize = 28;
@@ -694,7 +706,7 @@ pub fn encode(points: &[u8], vertices: &[u8]) -> AddrFileBytes {
                     assert_eq!(offset, crate::NO_DATA, "record {i} is a point with a vertex_offset");
                     return 0;
                 }
-                assert_eq!(offset as usize, logical, "record {i}'s vertex_offset is the bytes of the footprints before it");
+                assert_eq!(Some(offset), vertex_offset_of(logical as u64), "record {i}'s vertex_offset is the units of the footprints before it");
                 assert!(logical < vertices.len() && vertices[logical] <= 3, "record {i}'s footprint is in an encoding of 0 to 3");
                 let bytes = LOGICAL_HEADER + count * if vertices[logical] == 3 { 8 } else { 4 };
                 assert!(bytes <= vertices.len() - logical, "record {i}'s footprint ends in the logical addr_vertices.bin");

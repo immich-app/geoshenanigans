@@ -161,7 +161,8 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
   (today's 28-byte records and their footprints' vertex blocks back to back) and merges those,
   and the patch lists `addr_index.bin` with no section of its own. Address files of no address
   are three footers, which merge as a dir without the files does; a dir that gets its first
-  address point or loses its last has no patch (the diff says so and exits 2).
+  address point or loses its last is patched like any other day: its points go as one INSERT
+  or one DELETE, and their footprints as the child stream of that merge.
   The string tiers are FCC2 files, front-coded buckets cut by content (`src/string_files.h`);
   the diff decodes each tier it reads into its pool and diffs the pools.
   The four per-record side files (`way_parents.bin`, `way_postcodes.bin`, `interp_postcodes.bin`,
@@ -436,7 +437,7 @@ v8 data patch that day; applying the delta also needs memory for the whole
 old file (1.0 GB for poi.fst). Rebuilding costs no download and two to three
 and a half minutes of one core.
 
-## Patch Format (.gcpatch, version 17)
+## Patch Format (.gcpatch, version 18)
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
 pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
@@ -446,8 +447,8 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=17 (u32) + flags=0 (u32)
-  (a v17 patcher accepts only v17 patches; the v8 to v17 changes are marked
+Header: "GCPATCH\0" (8) + version=18 (u32) + flags=0 (u32)
+  (a v18 patcher accepts only v18 patches; the v8 to v18 changes are marked
   below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
@@ -601,6 +602,18 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     index is a u32 below NO_DATA: the diff refuses a record file with more
     before it diffs it, and the patcher a merge section that gives one ("Old
     <file> holds <n> records, more than the 4294967294 a patch can index").
+    (v18) The address footprints' logical stream is counted in units of 2
+    bytes, which every footprint's block is a whole number of (10 bytes and
+    4 or 8 a vertex): addr_vertices merges at stride 2, and a logical address
+    record's vertex_offset is the units of the blocks before its own. The
+    stream holds at most 8,589,934,588 bytes; the builder, the diff, the
+    patcher and the server refuse address files whose footer gives more ("a
+    logical addr_vertices.bin of <n> bytes is more than the 8589934588 a
+    patch can index").
+    The records of an encoded family that has a child stream (street_ways,
+    interp_ways, addr_points, poi_records) merge at their own stride (the
+    table below) with records or without, an empty merge too: the patcher
+    refuses one at any other ("Malformed record stride: <file>").
   Ops: MATCH(count:u32) | INSERT(count:u32, data) | DELETE(count:u32)
     | REPLACE(count:u32, data) (v8: the same entities with new bytes, written
     like an INSERT, mapped old → new like a MATCH)
@@ -612,7 +625,10 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   position: its MATCH bytes are the old bytes of the parent records at the
   same places, a MATCH or REPLACE record's own or, where a DELETE run is
   followed by an INSERT run, the deleted record's for the inserted one at the
-  same place in the run. An encoded family replayed through its codecs (the
+  same place in the run. Its merge section is at its file's stride (the
+  table below): the patcher refuses one at any other ("Encoded family:
+  unexpected section kind for a child stream").
+  An encoded family replayed through its codecs (the
   POI files when only their blocks change) decodes both files from one stream,
   and the patcher refuses a replay that reads one of them 4 MiB
   (MAX_DECODER_SKEW) ahead of the other ("Malformed merge sequence: <file>
@@ -747,7 +763,7 @@ layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
 | 0 | `strings.bin` | never: a section for it is refused ("Unknown file 0") |
 | 1 | `street_ways.bin` | merge at stride 12, string field `name_id` |
 | 2 | `street_nodes.bin` | child stream of street_ways, at stride 8 |
-| 3 | `addr_points.bin` | merge at stride 28, string fields `housenumber_id` and `street_id` |
+| 3 | `addr_points.bin` | merge at stride 28, with or without records (v18; a dir without any sent 16), string fields `housenumber_id` and `street_id` |
 | 4 | `interp_ways.bin` | merge at stride 24, string field `street_id` |
 | 5 | `interp_nodes.bin` | child stream of interp_ways, at stride 8 |
 | 6 | `admin_polygons.bin` | merge by slot at stride 16 (v16; v14–v15: 24), string field `name_id`, offset field `ring_offset` (v14) |
@@ -767,7 +783,7 @@ layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
 | 24, 25 | `postcode_centroid_cells.bin`, `postcode_centroid_entries.bin` | cell list delta (stride 0xFB), or whole |
 | 26 | `arc_index.bin` | merge by slot at stride 4, the record its block's offset (v14; v13: `postal_polygons.bin`) |
 | 27 | `arc_vertices.bin` | child stream of arc_index, at stride 1 (v14; v13: `postal_vertices.bin`) |
-| 28 | `addr_vertices.bin` | child stream of addr_points at stride 1; whole in a dir without address points |
+| 28 | `addr_vertices.bin` | child stream of addr_points, of the footprints' logical stream, at stride 2 (v18; was 1); whole in a dir whose address family has no record on either day |
 | 29-33 | `strings_core.bin` … `strings_poi.bin` | the strings section, of the decoded pools; a tier the old dir lacks, whole (its FCC2 file) |
 | 34 | `interp_postcodes.bin` | parallel delta along interp_ways, remap kind 2 |
 | 35 | `geo_entries.bin` | the geo index's blocks, rebuilt with `geo_cells.bin` (8) |

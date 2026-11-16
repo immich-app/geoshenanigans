@@ -200,16 +200,18 @@ inline constexpr size_t kAddrSliceSuperblocks = 64;
 // its footprint's first vertex in vertices and its vertex_count how many
 // follow it there; vertices gives each by operator[] as a reference into one
 // array. A footprint is written as its packed polygon (vertex_pack.h), the
-// logical blob, its record's vertex_offset the bytes of the ones before it; a
-// record whose footprint the vertices do not hold is written as a point. Each
+// logical blob, its record's vertex_offset the bytes of the ones before it in
+// the logical record's units (addr_files::vertex_offset_of); a record whose
+// footprint the vertices do not hold is written as a point. Each
 // slice's blocks go through put_points(const uint8_t*, size_t) in one call,
 // its blobs through put_vertices and its index rows through put_index, then
 // each file's footer. Refuses, before anything is put, more records than a
 // patch indexes and footprints whose logical blobs are more bytes than one
 // indexes; and what the serial encoder refuses of the pair, in its words.
+// Returns the bytes of the logical addr_vertices.bin.
 template <class Points, class Vertices, class PutPoints, class PutVertices, class PutIndex>
-void write_addr_pair(const Points& points, const Vertices& vertices, PutPoints put_points, PutVertices put_vertices,
-                     PutIndex put_index, unsigned threads = 0, size_t slice_superblocks = kAddrSliceSuperblocks) {
+uint64_t write_addr_pair(const Points& points, const Vertices& vertices, PutPoints put_points, PutVertices put_vertices,
+                         PutIndex put_index, unsigned threads = 0, size_t slice_superblocks = kAddrSliceSuperblocks) {
     struct Slice {
         // The index rows' offsets count from the slice's first block and
         // first blob.
@@ -261,7 +263,7 @@ void write_addr_pair(const Points& points, const Vertices& vertices, PutPoints p
                 const PolygonPacking packing = plan_polygon(ring, p.vertex_count);
                 logical.resize(packing.bytes);
                 pack_polygon(logical.data(), packing, ring, p.vertex_count);
-                p.vertex_offset = static_cast<uint32_t>(logical_at);
+                p.vertex_offset = addr_files::vertex_offset_of(logical_at);
                 logical_at += packing.bytes;
             } else {
                 p.vertex_offset = NO_DATA;
@@ -291,13 +293,14 @@ void write_addr_pair(const Points& points, const Vertices& vertices, PutPoints p
     put_points(points_footer.data(), points_footer.size());
     put_vertices(vertices_footer.data(), vertices_footer.size());
     put_index(index_footer.data(), index_footer.size());
+    return before[slices];
 }
 
 // Writes the three address files of `dir` for the builder's addresses, the
 // three footers of no addresses. Addresses the writer refuses are refused
-// under the dir's name.
-inline void write_addr_files(const std::string& dir, const std::vector<AddrPoint>& points, const std::vector<NodeCoord>& vertices,
-                             unsigned threads = 0) {
+// under the dir's name. Returns the bytes of the logical addr_vertices.bin.
+inline uint64_t write_addr_files(const std::string& dir, const std::vector<AddrPoint>& points,
+                                 const std::vector<NodeCoord>& vertices, unsigned threads = 0) {
     const char* const names[3] = {addr_files::POINTS_FILE, addr_files::VERTICES_FILE, addr_files::INDEX_FILE};
     std::string paths[3];
     std::ofstream files[3];
@@ -311,8 +314,9 @@ inline void write_addr_files(const std::string& dir, const std::vector<AddrPoint
             file.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n));
         };
     };
+    uint64_t logical_vertex_bytes = 0;
     try {
-        write_addr_pair(points, vertices, to(0), to(1), to(2), threads);
+        logical_vertex_bytes = write_addr_pair(points, vertices, to(0), to(1), to(2), threads);
     } catch (const std::runtime_error& e) {
         throw std::runtime_error(dir + ": " + e.what());
     }
@@ -320,4 +324,5 @@ inline void write_addr_files(const std::string& dir, const std::vector<AddrPoint
         files[f].flush();
         if (!files[f]) throw std::runtime_error("failed to write " + paths[f]);
     }
+    return logical_vertex_bytes;
 }

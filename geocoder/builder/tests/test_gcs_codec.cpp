@@ -248,7 +248,7 @@ AddrSet addr_set(const std::vector<AddrSpec>& specs, std::mt19937& rng) {
         if (sp.dead) rec[0] = rec[1] = rec[2] = rec[3] = 0, rec[4] = NO;
         const size_t first = s.verts.size();
         if (sp.vc) {
-            rec[5] = uint32_t(first);
+            rec[5] = addr_files::vertex_offset_of(first);
             rec[6] = sp.vc;
             uint8_t h[10] = {sp.enc, 0};
             const bool at_point = rng() % 2;
@@ -787,12 +787,12 @@ TEST(gcs_addr_decoder_takes_a_dir_without_its_files_as_no_addresses_and_refuses_
 }
 
 TEST(gcs_addr_codec_refuses_a_footprint_stream_past_the_limit_by_the_footers_alone) {
-    // The logical addr_vertices.bin is a byte stream a patch indexes in a u32
-    // below NO_DATA, and a vertex_offset is one. Files whose footer gives a
-    // byte more are refused by the file's name and the bytes, by the decoded
-    // size and by the decoder as it is made: before a block is read, though
-    // the first is one no encoder writes. At the limit the footer passes, and
-    // the decoder refuses that first block.
+    // The logical addr_vertices.bin is a stream a patch indexes by its 2-byte
+    // units in a u32 below NO_DATA, as a vertex_offset does. Files whose
+    // footer gives a unit more are refused by the file's name and the bytes,
+    // by the decoded size and by the decoder as it is made: before a block is
+    // read, though the first is one no encoder writes. At the limit the
+    // footer passes, and the decoder refuses that first block.
     std::mt19937 rng(20261114);
     ScratchDir dir("gcs-test");
     encode_addrs(addr_set(addr_specs(20, rng), rng), dir.path(), rng, 100);
@@ -804,14 +804,14 @@ TEST(gcs_addr_codec_refuses_a_footprint_stream_past_the_limit_by_the_footers_alo
         write_bytes(dir.path() + "/addr_vertices.bin", std::vector<uint8_t>(vertices.begin(), vertices.end()));
     };
     const std::string past =
-        "Malformed address files: a logical addr_vertices.bin of 4294967295 bytes is more than the 4294967294 a patch can index";
+        "Malformed address files: a logical addr_vertices.bin of 8589934590 bytes is more than the 8589934588 a patch can index";
 
-    with_logical_bytes(0xFFFFFFFF);
+    with_logical_bytes(0x1FFFFFFFEull);
     CHECK_EQ(refusal_of([&] { addr::decoded_size(dir.path(), 1); }), past);
     CHECK_EQ(refusal_of([&] { addr::Dec dec(dir.path()); }), past);
 
-    with_logical_bytes(0xFFFFFFFE);
-    CHECK_EQ(addr::decoded_size(dir.path(), 1), uint64_t(0xFFFFFFFE));
+    with_logical_bytes(0x1FFFFFFFCull);
+    CHECK_EQ(addr::decoded_size(dir.path(), 1), uint64_t(0x1FFFFFFFCull));
     CHECK_EQ(refusal_of([&] {
                  addr::Dec dec(dir.path());
                  decode_all(dec);
@@ -1084,7 +1084,7 @@ TEST(gcs_addr_codec_holds_a_piece_and_one_footprint_of_the_most_vertices) {
 TEST(gcs_addr_encoder_refuses_a_stream_that_is_not_whole_records_and_their_footprints) {
     // Four records: a point, a footprint of two vertices, a footprint of
     // three, and an escape of three in encoding 3. A record whose
-    // vertex_offset is not the footprints' bytes before it, and a footprint
+    // vertex_offset is not the footprints' units before it, and a footprint
     // in an encoding none has or with its zero byte set, are refused as they
     // come, by the record, the footprint's vertices unread; a stream that
     // ends inside a footprint, inside an escaped one (which the encoder took
@@ -1101,9 +1101,9 @@ TEST(gcs_addr_encoder_refuses_a_stream_that_is_not_whole_records_and_their_footp
     };
     const Case cases[] = {
         {112, 74, [](AddrSet&) {}, ""},
-        {112, 74, [](AddrSet& e) { wr32(&e.points[2 * 28 + 20], 19); },
-         "Malformed address files: addr_points.bin record 2 has a vertex_offset of 19, not the 18 bytes of the footprints before "
-         "it"},
+        {112, 74, [](AddrSet& e) { wr32(&e.points[2 * 28 + 20], 10); },
+         "Malformed address files: addr_points.bin record 2 has a vertex_offset of 10, not the 9 units of 2 bytes of the "
+         "footprints before it"},
         {112, 28, [](AddrSet& e) { e.verts[18] = 4; },
          "Malformed address files: addr_points.bin record 2 has a footprint in encoding 4"},
         {112, 28, [](AddrSet& e) { e.verts[19] = 1; },
@@ -1131,25 +1131,25 @@ TEST(gcs_addr_encoder_refuses_a_stream_that_is_not_whole_records_and_their_footp
 }
 
 TEST(gcs_encoders_refuse_a_unit_past_the_end_of_its_file) {
-    // A footprint or POI block of 2^30 vertices (10 + 4 x 2^30
-    // bytes, which a 32-bit size_t wraps to 10) whose stream is ten bytes:
-    // refused as those bytes come, not waited for while the queue takes the
-    // rest of the file. The footprint is one of more bytes than a patch
-    // indexes, the POI block one past the end of its file as the patch gives
-    // it.
+    // A footprint of 2^31 vertices or a POI block of 2^30 (10 + 4 x 2^31 and
+    // 10 + 4 x 2^30 bytes, which a 32-bit size_t wraps to 10) whose stream is
+    // ten bytes: refused as those bytes come, not waited for while the queue
+    // takes the rest of the file. The footprint is one of more bytes than a
+    // patch indexes, the POI block one past the end of its file as the patch
+    // gives it.
     ScratchDir dir("gcs-test");
     const std::vector<uint8_t> ten(10, 0);
     {
         std::vector<uint8_t> rec(28, 0);
         wr32(&rec[20], 0);
-        wr32(&rec[24], 0x40000000);
+        wr32(&rec[24], 0x80000000);
         addr::Enc enc(dir.path());
         enc.state = {1, 1};
         enc.write(0, rec.data(), rec.size());
 
         CHECK_EQ(refusal_of([&] { enc.write(1, ten.data(), ten.size()); }),
-                 std::string("Malformed address files: a logical addr_vertices.bin of 4294967306 bytes is more than the "
-                             "4294967294 a patch can index"));
+                 std::string("Malformed address files: a logical addr_vertices.bin of 8589934602 bytes is more than the "
+                             "8589934588 a patch can index"));
     }
     {
         std::vector<uint8_t> rec(36, 0);

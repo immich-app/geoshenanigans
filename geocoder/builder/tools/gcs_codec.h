@@ -571,7 +571,7 @@ struct Dec : Decoder {
         const uint32_t len = block.len[j];
         uint8_t rec[af::LOGICAL_STRIDE];
         if (!len) {
-            af::logical_record(block, j, NO_DATA, 0, rec);
+            af::logical_record(block, j, af::NO_FOOTPRINT, 0, rec);
             emit(0, rec, sizeof rec);
         } else {
             if (len > f.blobs_bytes - blobs_at)
@@ -583,7 +583,7 @@ struct Dec : Decoder {
                 if (logical_bytes > f.logical_vertex_bytes - logical)
                     af::malformed("a footprint past the footer's logical vertex stream of " +
                                   std::to_string(f.logical_vertex_bytes) + " bytes");
-                af::logical_record(block, j, uint32_t(logical), uint32_t(h.vertex_count()), rec);
+                af::logical_record(block, j, logical, uint32_t(h.vertex_count()), rec);
                 if (h.escape) {
                     V->skip(h.bytes);
                     escaped_left = logical_bytes;

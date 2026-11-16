@@ -31,6 +31,7 @@
 
 namespace addr_replay {
 namespace af = addr_files;
+static_assert(ADDR_VERTEX_STRIDE == af::VERTEX_OFFSET_UNIT, "the footprints' runs count the units a vertex_offset counts");
 
 // The hashes (lane_hash) of the old addr_points.bin and addr_vertices.bin.
 struct Hashes {
@@ -68,7 +69,7 @@ public:
         if (j_ == block_.records) next_block();
         const uint32_t len = block_.len[j_];
         if (!len) {
-            af::logical_record(block_, j_, NO_DATA, 0, rec_);
+            af::logical_record(block_, j_, af::NO_FOOTPRINT, 0, rec_);
         } else {
             if (len > f_.blobs_bytes - blobs_at_)
                 af::malformed(std::string(af::VERTICES_FILE) + " ends inside the blob of record " + std::to_string(record_));
@@ -82,7 +83,7 @@ public:
             } catch (const std::runtime_error& e) {
                 throw in_blob(e, record_);
             }
-            af::logical_record(block_, j_, uint32_t(logical_), uint32_t(h_.vertex_count()), rec_);
+            af::logical_record(block_, j_, logical_, uint32_t(h_.vertex_count()), rec_);
             blob_ = true;
             len_ = len;
             blob_left_ = len;
@@ -338,7 +339,7 @@ struct Result {
     // hand, one passed and read again, the cursor.
     uint64_t at_hand = 0, read_again = 0, by_cursor = 0;
     // The footprint section after the points', its ops read in place as the records take their bytes.
-    ChildOps child{PatchFileId::ADDR_VERTICES, 1};
+    ChildOps child{PatchFileId::ADDR_VERTICES, ADDR_VERTEX_STRIDE};
     // The most bytes held at once of the old records and footprints, and of the new ones before the
     // encoder took them, in the form of the codecs' queue peaks.
     size_t decode_peaks[2] = {0, 0}, encode_peaks[2] = {0, 0};
