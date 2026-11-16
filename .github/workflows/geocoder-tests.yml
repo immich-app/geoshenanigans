@@ -34,9 +34,14 @@ jobs:
       # they must run (GEOCODER_TESTS_NEED_PRIVATE_TMPFS fails them if not).
       - name: Allow user namespaces
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      # GEOCODER_TESTS_PAST_4GIB: the cases that put more than 4 GiB of
+      # address footprints through the writer and the patcher run in this
+      # step alone. The nightly's tools step leaves them out: its unit tests
+      # gate the night.
       - name: Build + run tests
         env:
           GEOCODER_TESTS_NEED_PRIVATE_TMPFS: "1"
+          GEOCODER_TESTS_PAST_4GIB: "1"
         run: |
           cd geocoder/builder && mkdir -p build && cd build
           cmake .. -DCMAKE_BUILD_TYPE=Release

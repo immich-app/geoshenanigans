@@ -417,6 +417,71 @@ struct WatchedVertices {
     }
 };
 
+// Buildings that share one ring of `ring` vertices, 10 degrees across, which
+// takes 8 bytes a vertex and an escape; 1,023 nodes after each, so a
+// superblock holds one building.
+Addresses buildings_of_one_ring(uint32_t buildings, uint32_t ring) {
+    Addresses a;
+    a.vertices.resize(ring);
+    for (size_t i = 0; i < a.vertices.size(); i++) a.vertices[i] = {float(i % 1000) * 0.01f, float(i / 1000 % 1000) * 0.01f};
+    for (uint32_t i = 0; i < buildings; i++) {
+        a.points.push_back({1.0f, 2.0f, i, 0, 0, 0, ring});
+        for (int node = 0; node < 1023; node++) a.points.push_back({1.0f, 2.0f, i, 0, 0, NO_DATA, 0});
+    }
+    return a;
+}
+
+// What the address writer puts for buildings_of_one_ring at 2 threads, a
+// superblock a slice, without the blobs being kept: addr_points.bin and
+// addr_index.bin, and of addr_vertices.bin its bytes, how many of the
+// writer's puts were the one building's blob, and the last 16 bytes of a put
+// that was not, which the footer is.
+struct OneRingFiles {
+    std::vector<uint8_t> points, index, blob, vertices_end;
+    uint64_t vertices_bytes = 0;
+    size_t blobs = 0, vertices_puts = 0;
+};
+OneRingFiles written_for_one_ring(const Addresses& a) {
+    OneRingFiles f;
+    // The building's blob: an escape's head, then its packed polygon.
+    const uint32_t ring = uint32_t(a.vertices.size());
+    f.blob.resize(addr_files::ESCAPE_HEAD_MAX);
+    f.blob.resize(addr_files::escape_head(ring, f.blob.data()));
+    const size_t head = f.blob.size();
+    f.blob.resize(head + plan_polygon(a.vertices.data(), ring).bytes);
+    pack_polygon_at(f.blob.data() + head, a.vertices.data(), ring);
+    write_addr_pair(a.points, a.vertices, into(f.points), [&f](const uint8_t* p, size_t n) {
+        f.vertices_bytes += n;
+        f.vertices_puts++;
+        if (n == f.blob.size() && std::memcmp(p, f.blob.data(), n) == 0) f.blobs++;
+        else f.vertices_end.assign(p + n - std::min<size_t>(n, 16), p + n);
+    }, into(f.index), 2, 1);
+    return f;
+}
+
+// The writer's files for `buildings` buildings of one ring are a blob a
+// building and the footers of their counts, and each superblock's index row
+// places its blob at the blobs' bytes before it.
+void check_the_files_of_buildings_of_one_ring(const OneRingFiles& f, uint32_t buildings, uint64_t logical_blob_bytes) {
+    using addr_files::get32;
+    using addr_files::get64;
+    CHECK_EQ(f.blobs, size_t(buildings));
+    CHECK_EQ(f.vertices_puts, size_t(buildings) + 1);
+    CHECK_EQ(f.vertices_bytes, uint64_t(buildings) * f.blob.size() + addr_files::VERTICES_FOOTER_BYTES);
+    const auto footer = addr_files::vertices_footer(uint64_t(buildings) * logical_blob_bytes, buildings);
+    CHECK(f.vertices_end == std::vector<uint8_t>(footer.begin(), footer.end()));
+    REQUIRE(f.vertices_end.size() == 16);
+    CHECK_EQ(get64(f.vertices_end.data()), uint64_t(buildings) * logical_blob_bytes);
+    CHECK_EQ(get32(f.vertices_end.data() + 8), buildings);
+    REQUIRE(f.index.size() == size_t(buildings) * addr_files::INDEX_ROW_BYTES + addr_files::INDEX_FOOTER_BYTES);
+    size_t misplaced = 0;
+    for (uint32_t k = 0; k < buildings; k++) misplaced += get64(f.index.data() + size_t(k) * addr_files::INDEX_ROW_BYTES + 8) != uint64_t(k) * f.blob.size();
+    CHECK_EQ(misplaced, size_t(0));
+    REQUIRE(f.points.size() > addr_files::POINTS_FOOTER_BYTES);
+    CHECK_EQ(get32(f.points.data() + f.points.size() - addr_files::POINTS_FOOTER_BYTES), buildings * 1024);
+    CHECK_EQ(get32(f.index.data() + f.index.size() - addr_files::INDEX_FOOTER_BYTES), buildings * 1024);
+}
+
 template <class Record>
 void check_the_way_writer_puts_the_serial_encoders_files(uint64_t seed) {
     std::mt19937_64 rng(seed);
@@ -692,6 +757,49 @@ TEST(the_address_writer_refuses_footprints_of_more_logical_bytes_than_a_patch_in
              "failed to write " + dir.path() + "/none/addr_points.bin");
     CHECK_EQ(refusal_of([&] { write_addr_files(dir.path() + "/none", std::vector<AddrPoint>{}, std::vector<NodeCoord>{}); }),
              "failed to write " + dir.path() + "/none/addr_points.bin");
+}
+
+// Each slice's encoder starts at the logical bytes of the footprints before
+// its slice. Six buildings of one ring of 70,000 vertices, a slice each: the
+// files are the serial encoder's, and what the case past 4 GiB checks of them
+// holds.
+TEST(the_address_writer_starts_each_slice_at_the_footprints_before_it) {
+    const uint32_t buildings = 6, ring = 70000;
+    const Addresses a = buildings_of_one_ring(buildings, ring);
+    REQUIRE(plan_polygon(a.vertices.data(), ring).bytes == 560010);
+
+    const OneRingFiles f = written_for_one_ring(a);
+
+    check_the_files_of_buildings_of_one_ring(f, buildings, 560010);
+    const AddrFiles want = serial(a);
+    CHECK(f.points == want.points);
+    CHECK(f.index == want.index);
+    REQUIRE(want.vertices.size() == f.vertices_bytes && f.vertices_bytes > buildings * f.blob.size());
+    for (uint32_t k = 0; k < buildings; k++) CHECK(std::equal(f.blob.begin(), f.blob.end(), want.vertices.begin() + k * f.blob.size()));
+    CHECK(std::equal(f.vertices_end.begin(), f.vertices_end.end(), want.vertices.end() - 16));
+}
+
+// Footprints that start past 4 GiB of logical bytes: 538 buildings of one
+// ring of 1,000,000 vertices, 8,000,010 bytes each, are 4,304,005,380, and the
+// last starts at 4,296,005,370, so its slice's encoder starts past 2^32 bytes
+// and its record's vertex_offset past 2^31 units, which the encoder checks.
+// Nothing is refused, every building's blob is the one blob, the footer holds
+// the bytes in 64 bits and the last index rows place their blobs past 4 GiB.
+// The blobs are counted and compared as the writer puts them, a slice of 8 MB
+// at a time, and not kept.
+TEST(the_address_writer_writes_footprints_that_start_past_4_gib) {
+    if (!gctest::past_4gib_cases_run("the address writer on footprints that start past 4 GiB")) return;
+    const uint32_t buildings = 538, ring = 1000000;
+    const Addresses a = buildings_of_one_ring(buildings, ring);
+    REQUIRE(plan_polygon(a.vertices.data(), ring).bytes == 8000010);
+    REQUIRE(uint64_t(buildings - 1) * 8000010 == 4296005370ull && 4296005370ull > uint64_t(1) << 32);
+
+    const OneRingFiles f = written_for_one_ring(a);
+
+    check_the_files_of_buildings_of_one_ring(f, buildings, 8000010);
+    REQUIRE(f.vertices_end.size() == 16);
+    CHECK_EQ(addr_files::get64(f.vertices_end.data()), uint64_t(4304005380ull));
+    CHECK(std::equal(f.vertices_end.begin() + 12, f.vertices_end.end(), addr_files::VERTICES_MAGIC));
 }
 
 TEST(a_slice_writer_runs_no_more_than_its_window_ahead_of_the_consumer) {

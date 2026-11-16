@@ -1846,6 +1846,55 @@ TEST(a_logical_vertex_stream_past_8589934588_bytes_is_refused) {
              std::string("Malformed address files: addr_points.bin block 0 has a flag no block has"));
 }
 
+// Footprints that start past 4 GiB of logical bytes. An encoder that starts
+// 18 bytes short of 2^32 takes four footprints of 18 bytes: the first ends at
+// 4 GiB, so the second's vertex_offset is 2^31 units; the third comes as the
+// blob another pair's files hold and the fourth as an escape in pieces. A
+// record that gives the low 32 bits of the bytes before its footprint, or a
+// unit more than their units, is refused. The sinks drop what they are given.
+TEST(the_encoder_takes_footprints_past_4_gib_of_logical_bytes) {
+    auto drop = [](const uint8_t*, size_t) {};
+    const uint64_t four_gib = uint64_t(1) << 32;
+    const Record here = {HERE.lat, HERE.lng, 1, 2, 3, {}};
+    const Bytes ring = footprint(2, HERE, {{1, 2}, {3, 4}}), blob = encode(ring, HERE);
+    const Bytes wide = logical_blob(3, FAR_LAT, FAR_LNG, {{70000, 5}});
+    REQUIRE(ring.size() == 18 && wide.size() == 18);
+    af::Encoder enc(drop, drop, drop, 1024, four_gib - 18);
+    auto refused = [&](uint32_t vertex_offset) {
+        return refusal_of([&] { enc.add(record_bytes(here, vertex_offset, 2).data(), ring.data()); });
+    };
+    CHECK_EQ(refused(0x7FFFFFF7u), std::string());
+    CHECK_EQ(enc.logical_vertex_bytes(), four_gib);
+    const std::string record = "Malformed address files: addr_points.bin record 1025 has a vertex_offset of ";
+    const std::string before = ", not the 2147483648 units of 2 bytes of the footprints before it";
+    CHECK_EQ(refused(0), record + "0" + before);
+    CHECK_EQ(refused(0x80000001u), record + "2147483649" + before);
+    CHECK_EQ(refused(0x80000000u), std::string());
+    enc.add_coded(record_bytes(here, 0x80000009u, 2).data(), blob.data(), blob.size());
+    enc.begin_escape(record_bytes(here, 0x80000012u, 1).data(), wide.data());
+    enc.put_escape_bytes(wide.data() + 10, 3);
+    enc.put_escape_bytes(wide.data() + 13, 5);
+    enc.finish();
+    CHECK_EQ(enc.records(), uint64_t(1028));
+    CHECK_EQ(enc.blobs(), uint64_t(4));
+    CHECK_EQ(enc.logical_vertex_bytes(), four_gib + 54);
+    // The footer holds the bytes in 64 bits.
+    CHECK(af::vertices_footer(enc.logical_vertex_bytes(), enc.blobs()) ==
+          (std::array<uint8_t, 16>{0x36, 0, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 'A', 'D', 'F', '1'}));
+
+    // A decoder gives a record the units of the bytes before its footprint.
+    af::Block block;
+    block.records = 1;
+    block.lat[0] = HERE.lat;
+    block.lng[0] = HERE.lng;
+    block.housenumber[0] = 1;
+    block.street[0] = 2;
+    block.parent[0] = 3;
+    Bytes logical(af::LOGICAL_STRIDE);
+    af::logical_record(block, 0, four_gib + 18, 2, logical.data());
+    CHECK(logical == record_bytes(here, 0x80000009u, 2));
+}
+
 TEST(more_records_than_a_patch_indexes_a_blob_of_4_gib_and_a_superblock_of_4_gib_of_blobs_are_refused) {
     auto drop = [](const uint8_t*, size_t) {};
     const Record here = {HERE.lat, HERE.lng, 1, 2, 3, {}};

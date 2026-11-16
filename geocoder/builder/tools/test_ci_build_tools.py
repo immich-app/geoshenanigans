@@ -59,6 +59,23 @@ def nightly_packages():
     return set(install.group(1).replace("\\\n", " ").split())
 
 
+# The steps of geocoder-tests.yml that run geocoder-tests, each (job, step
+# name) with the variables its env sets.
+def unit_test_steps():
+    with open(os.path.join(WORKFLOWS, "geocoder-tests.yml")) as f:
+        jobs = f.read().split("\njobs:\n", 1)[1]
+    steps = {}
+    for job in re.split(r"^(?=  [\w-]+:\n)", jobs, flags=re.M):
+        name = re.match(r"  ([\w-]+):\n", job)
+        for step in re.split(r"^(?=      - )", job, flags=re.M):
+            if not name or "./geocoder-tests" not in step:
+                continue
+            env = re.search(r"^        env:\n((?:          .*\n)*)", step, re.M)
+            steps[name[1], re.search(r"- name: (.+)", step)[1]] = dict(
+                re.findall(r'^          (\w+): "([^"]*)"$', env[1] if env else "", re.M))
+    return steps
+
+
 # The pull_request paths of geocoder-tests.yml, the workflow that runs these tests.
 def paths_that_run_the_tests():
     with open(os.path.join(WORKFLOWS, "geocoder-tests.yml")) as f:
@@ -107,6 +124,29 @@ class NightlyPackagesTest(unittest.TestCase):
     # only that workflow, dropping libzstd-dev say, must run it.
     def test_a_change_to_the_nightly_runs_these_tests(self):
         self.assertIn(".github/workflows/geocoder-build.yml", paths_that_run_the_tests())
+
+
+class Past4GibCasesTest(unittest.TestCase):
+    VARIABLE = "GEOCODER_TESTS_PAST_4GIB"
+
+    # The cases that put more than 4 GiB of address footprints through the
+    # writer and the patcher run once a pull request, in the Release unit
+    # tests of the default build.
+    def test_the_pull_requests_release_unit_tests_run_the_cases_past_4_gib(self):
+        steps = unit_test_steps()
+
+        self.assertEqual(len(steps), 3)
+        self.assertEqual({step for step, env in steps.items() if env.get(self.VARIABLE) == "1"},
+                         {("builder-tests", "Build + run tests")})
+        self.assertEqual({step for step, env in steps.items() if self.VARIABLE in env},
+                         {("builder-tests", "Build + run tests")})
+
+    # The nightly's unit tests gate the night on its runner, on cached tools
+    # too: a case that is slow or fails there holds up the planet build.
+    def test_the_nightly_runs_none_of_them(self):
+        for path in (os.path.join(HERE, "ci_build_tools.sh"), os.path.join(WORKFLOWS, "geocoder-build.yml")):
+            with open(path) as f:
+                self.assertNotIn(self.VARIABLE, f.read(), path)
 
 
 if __name__ == "__main__":

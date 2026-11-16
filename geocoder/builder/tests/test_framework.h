@@ -14,6 +14,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -61,6 +62,16 @@ struct Registrar {
 
 // Thrown by REQUIRE to abort the current test; caught by the runner.
 struct RequireFailed {};
+
+// Whether the cases that put gigabytes through a writer or read them from a
+// file run: under GEOCODER_TESTS_PAST_4GIB=1. Says which case is skipped
+// where they don't.
+inline bool past_4gib_cases_run(const char* skipped) {
+    const char* set = std::getenv("GEOCODER_TESTS_PAST_4GIB");
+    if (set && std::string(set) == "1") return true;
+    std::printf("    SKIP %s: runs under GEOCODER_TESTS_PAST_4GIB=1\n", skipped);
+    return false;
+}
 
 }  // namespace gctest
 
