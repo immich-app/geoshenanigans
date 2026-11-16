@@ -148,7 +148,7 @@ void put_addrs(BuildDir& d, const std::vector<Addr>& addrs) {
         append(points, 0u);
         append(points, 0u);
         append(points, 0u);
-        append(points, a.block.empty() ? NO : static_cast<uint32_t>(verts.size()));
+        append(points, a.block.empty() ? NO : addr_files::vertex_offset_of(verts.size()));
         append(points, a.block.empty() ? 0u : static_cast<uint32_t>((a.block.size() - 10) / (a.block[0] == 3 ? 8 : 4)));
         verts.insert(verts.end(), a.block.begin(), a.block.end());
     }
@@ -5623,6 +5623,31 @@ TEST(patch_refuses_a_way_replay_without_its_hashes) {
     }
 }
 
+// A child stream's merge section counts its runs by its file's unit, a
+// node's 8 bytes: one at another stride is refused in every mode. On the day
+// a dir gets its first interpolation ways the nodes replay beside their ways
+// with no old pair to replay on: their section at a stride of 4 is refused by
+// name. The patch as made applies.
+TEST(patch_refuses_a_child_section_at_another_stride_than_its_files) {
+    ScratchDir dir("lowmem-child-stride");
+    std::mt19937 rng(20261116);
+    BuildDir none, some;
+    put_ways(none, way_files::INTERPS, {});
+    put_ways(some, way_files::INTERPS, ways_with_nodes(rng, true, 20));
+    const LowMemCase c{dir.path(), "first-ways"};
+    REQUIRE(prepare(c, none, some).empty());
+    const std::vector<char> raw = raw_patch(c);
+    const size_t at = find_once(raw, section_head(PatchFileId::INTERP_NODES, 8, 0, some.at("interp_nodes.bin").size()));
+    REQUIRE(at != std::string::npos);
+    std::vector<char> edited = raw;
+    put_at(edited, at + 4, 4u);
+    const std::string patch = c.dir("stride.gcpatch");
+    REQUIRE(write_patch(c, patch, edited));
+
+    CHECK(not_refused(c, ALL_MODES, patch, "stride", "Encoded family: unexpected section kind for a child stream").empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
 // A byte of an old way file that is not the one the diff read is refused,
 // whichever it is: every byte of the pair's two files flipped in turn (one
 // in five under the sanitizers), of 20 streets and of 18 interpolations of 2
@@ -6093,7 +6118,7 @@ void put_addresses(BuildDir& d, const std::vector<Address>& addresses) {
         append(points, a.housenumber);
         append(points, a.street);
         append(points, a.parent);
-        append(points, a.blob.empty() ? NO : static_cast<uint32_t>(verts.size()));
+        append(points, a.blob.empty() ? NO : addr_files::vertex_offset_of(verts.size()));
         append(points, a.blob.empty() ? 0u : vertices_of(a.blob));
         verts.insert(verts.end(), a.blob.begin(), a.blob.end());
     }
@@ -6575,11 +6600,11 @@ TEST(the_address_replay_copies_blobs_under_points_or_footprints_sent_unchanged) 
         PatchFileId unchanged;
         LogCheck replayed;
     };
-    // The edited footprint keeps its bytes but the last: its old ones are a
-    // MATCH of the old blob at hand, as the whole footprint of the address
+    // The edited footprint keeps its bytes but the last unit: its old ones are
+    // a MATCH of the old blob at hand, as the whole footprint of the address
     // inserted under its new number is.
     const Day days[] = {
-        {"vertex", edited, {}, PatchFileId::ADDR_POINTS, addr_replayed_is(footprints - 1, 1, bytes - 1)},
+        {"vertex", edited, {}, PatchFileId::ADDR_POINTS, addr_replayed_is(footprints - 1, 1, bytes - ADDR_VERTEX_STRIDE)},
         {"number-by-slot", renumbered, {"--identity-slots"}, PatchFileId::ADDR_VERTICES, addr_replayed_is(footprints, 0)},
         {"number-by-content", renumbered, {}, PatchFileId::ADDR_VERTICES, addr_replayed_is(footprints - 1, 1, bytes)},
     };
@@ -7154,8 +7179,8 @@ TEST(the_address_replay_refuses_old_address_files_as_the_strict_decoder_does) {
 // DELETE, a MATCH and an INSERT with the footprints' beside it; then, in the
 // patch: the points' last MATCH run or their DELETE run past the old records;
 // the footprints' last MATCH run past the old stream; the new record's
-// vertex_offset two bytes off and its footprint in an encoding none has; the
-// footprints' section at another stride than a byte's, its sequence's length
+// vertex_offset one off and its footprint in an encoding none has; the
+// footprints' section at another stride than its own, its sequence's length
 // 2^32 past the patch, and its old size a byte more than the old files';
 // both sections a second time; the points' new size a record more than the
 // merge gives, or the footprints' a byte more; and, left over when the replay
@@ -7184,7 +7209,7 @@ TEST(the_address_replay_refuses_sections_that_do_not_fit_the_old_files_or_each_o
     const uint64_t old_bytes = old_d.at("addr_vertices.bin").size(), new_bytes = new_d.at("addr_vertices.bin").size();
     // The two sections' heads, and the points' and the footprints' runs.
     const size_t points = find_once(raw, section_head(PatchFileId::ADDR_POINTS, static_cast<uint32_t>(ADDR_POINT_STRIDE), old_points, new_points));
-    const size_t footprints = find_once(raw, section_head(PatchFileId::ADDR_VERTICES, 1, old_bytes, new_bytes));
+    const size_t footprints = find_once(raw, section_head(PatchFileId::ADDR_VERTICES, ADDR_VERTEX_STRIDE, old_bytes, new_bytes));
     REQUIRE(points != std::string::npos && footprints != std::string::npos && points < footprints);
     uint64_t before = 0;
     for (uint32_t i = 0; i < 21; i++) before += addresses[i].blob.size();
@@ -7194,9 +7219,9 @@ TEST(the_address_replay_refuses_sections_that_do_not_fit_the_old_files_or_each_o
     put_op(point_runs, OP_MATCH_RUN, 21);
     put_op(point_runs, OP_DELETE_RUN, 1);
     put_op(point_runs, OP_MATCH_RUN, 38);
-    put_op(footprint_runs, OP_MATCH_RUN, static_cast<uint32_t>(before));
-    put_op(footprint_runs, OP_DELETE_RUN, gone);
-    put_op(footprint_runs, OP_MATCH_RUN, static_cast<uint32_t>(old_bytes - before - gone));
+    put_op(footprint_runs, OP_MATCH_RUN, static_cast<uint32_t>(before / ADDR_VERTEX_STRIDE));
+    put_op(footprint_runs, OP_DELETE_RUN, gone / ADDR_VERTEX_STRIDE);
+    put_op(footprint_runs, OP_MATCH_RUN, static_cast<uint32_t>((old_bytes - before - gone) / ADDR_VERTEX_STRIDE));
     const size_t point_runs_at = find_once(raw, point_runs), footprint_runs_at = find_once(raw, footprint_runs);
     REQUIRE(point_runs_at != std::string::npos && footprint_runs_at != std::string::npos);
     // The new record and its footprint, as the patch carries them.
@@ -7234,13 +7259,16 @@ TEST(the_address_replay_refuses_sections_that_do_not_fit_the_old_files_or_each_o
          "Malformed merge sequence: addr_points.bin (a MATCH run past the old file)"},
         {"points-delete", [&](std::vector<char>& p) { put_at(p, point_runs_at + 6, 40u); },
          "Malformed merge sequence: addr_points.bin (a DELETE run past the old file)"},
-        {"footprints-match", [&](std::vector<char>& p) { put_at(p, footprint_runs_at + 11, static_cast<uint32_t>(old_bytes - before - gone + 5)); },
+        {"footprints-match",
+         [&](std::vector<char>& p) {
+             put_at(p, footprint_runs_at + 11, static_cast<uint32_t>((old_bytes - before - gone + 6) / ADDR_VERTEX_STRIDE));
+         },
          "Malformed merge sequence: addr_vertices.bin"},
-        {"vertex-offset", [&](std::vector<char>& p) { put_at(p, record_at + ADDR_POINT_VERTEX_OFFSET_OFF, vertex_offset + 2); },
-         "addr_points.bin record 59 has a vertex_offset of " + std::to_string(vertex_offset + 2) + ", not the " + std::to_string(vertex_offset) +
+        {"vertex-offset", [&](std::vector<char>& p) { put_at(p, record_at + ADDR_POINT_VERTEX_OFFSET_OFF, vertex_offset + 1); },
+         "addr_points.bin record 59 has a vertex_offset of " + std::to_string(vertex_offset + 1) + ", not the " + std::to_string(vertex_offset) +
              " bytes of the footprints before it"},
         {"encoding", [&](std::vector<char>& p) { p[blob_at] = 7; }, "addr_points.bin record 59 has a footprint in encoding 7"},
-        {"stride", [&](std::vector<char>& p) { put_at(p, footprints + 4, 2u); }, "Encoded family: unexpected section kind for a child stream"},
+        {"stride", [&](std::vector<char>& p) { put_at(p, footprints + 4, 3u); }, "Encoded family: unexpected section kind for a child stream"},
         {"length", [&](std::vector<char>& p) { put_at(p, footprints_len_at, footprints_len + (uint64_t{1} << 32)); },
          "Truncated patch: child section"},
         {"twice",
@@ -7301,7 +7329,7 @@ TEST(the_address_replay_refuses_sections_that_do_not_fit_the_old_files_or_each_o
 //     from the blob it is at;
 //   whole: the records MATCHed, or sent unchanged, over footprints sent
 //     whole: all from the patch.
-// And the footprints one MATCH five bytes longer than the old stream, or five
+// And the footprints one MATCH six bytes longer than the old stream, or six
 // shorter, is refused by name, as is a REPLACE run of a record more than the
 // old file's.
 TEST(the_address_replay_encodes_the_blobs_it_cannot_copy) {
@@ -7323,6 +7351,8 @@ TEST(the_address_replay_encodes_the_blobs_it_cannot_copy) {
     const std::vector<char>& vertices = d.at("addr_vertices.bin");
     const uint32_t n = 4, b = static_cast<uint32_t>(addresses[0].blob.size()), v = static_cast<uint32_t>(vertices.size());
     REQUIRE(v == n * b);
+    // The footprints' runs count units of this many bytes.
+    const uint32_t unit = ADDR_VERTEX_STRIDE;
     std::vector<char> copies = copy_old_section(PatchFileId::ADDR_POINTS, records.size());
     const std::vector<char> copied_vertices = copy_old_section(PatchFileId::ADDR_VERTICES, vertices.size());
     copies.insert(copies.end(), copied_vertices.begin(), copied_vertices.end());
@@ -7336,7 +7366,7 @@ TEST(the_address_replay_encodes_the_blobs_it_cannot_copy) {
         std::vector<char> points = copy_old_section(PatchFileId::ADDR_POINTS, records.size());
         if (!rec_ops.empty())
             points = merge_of(PatchFileId::ADDR_POINTS, static_cast<uint32_t>(ADDR_POINT_STRIDE), records.size(), records.size(), rec_ops);
-        std::vector<char> footprints = merge_of(PatchFileId::ADDR_VERTICES, 1, v, v, vert_ops);
+        std::vector<char> footprints = merge_of(PatchFileId::ADDR_VERTICES, unit, v, v, vert_ops);
         if (whole) {
             footprints = section_head(PatchFileId::ADDR_VERTICES, 0, v, whole->size());
             append(footprints, 0u);
@@ -7376,23 +7406,23 @@ TEST(the_address_replay_encodes_the_blobs_it_cannot_copy) {
     put_addresses(moved_d, moved);
     std::vector<char> rec_ops, vert_ops;
     put_op(rec_ops, OP_REPLACE_RUN, n, moved_d.at("addr_points.bin").data(), ADDR_POINT_STRIDE);
-    put_op(vert_ops, OP_MATCH_RUN, v);
+    put_op(vert_ops, OP_MATCH_RUN, v / unit);
     check("moved", moved, rec_ops, vert_ops, addr_replayed_is(0, n, v));
 
     rec_ops.clear();
     vert_ops.clear();
     put_op(rec_ops, OP_MATCH_RUN, n);
-    put_op(vert_ops, OP_DELETE_RUN, b);
-    put_op(vert_ops, OP_MATCH_RUN, b);
-    put_op(vert_ops, OP_INSERT_RUN, b, vertices.data() + b, 1);
-    put_op(vert_ops, OP_MATCH_RUN, 2 * b);
+    put_op(vert_ops, OP_DELETE_RUN, b / unit);
+    put_op(vert_ops, OP_MATCH_RUN, b / unit);
+    put_op(vert_ops, OP_INSERT_RUN, b / unit, vertices.data() + b, unit);
+    put_op(vert_ops, OP_MATCH_RUN, 2 * b / unit);
     check("second", second, rec_ops, vert_ops, addr_replayed_is(2, 2, 0, 0, b));
 
     rec_ops.clear();
     vert_ops.clear();
     put_op(rec_ops, OP_INSERT_RUN, n, records.data(), ADDR_POINT_STRIDE);
     put_op(rec_ops, OP_DELETE_RUN, n);
-    put_op(vert_ops, OP_MATCH_RUN, v);
+    put_op(vert_ops, OP_MATCH_RUN, v / unit);
     check("ahead", addresses, rec_ops, vert_ops, addr_replayed_is(0, n, 0, 0, v));
 
     rec_ops.clear();
@@ -7406,10 +7436,10 @@ TEST(the_address_replay_encodes_the_blobs_it_cannot_copy) {
     check("whole-under-unchanged", addresses, {}, {}, addr_replayed_is(0, n), &vertices);
 
     for (const auto& [name, bytes, refusal] :
-         {std::tuple<const char*, uint32_t, const char*>{"long", v + 5, "addr_vertices.bin has bytes past its last record"},
-          {"short", v - 5, "addr_vertices.bin ends before its records do"}}) {
+         {std::tuple<const char*, uint32_t, const char*>{"long", v + 6, "addr_vertices.bin has bytes past its last record"},
+          {"short", v - 6, "addr_vertices.bin ends before its records do"}}) {
         vert_ops.clear();
-        put_op(vert_ops, OP_MATCH_RUN, bytes);
+        put_op(vert_ops, OP_MATCH_RUN, bytes / unit);
         CHECK(not_refused(c, ALL_MODES, rebuilt(name, rec_ops, vert_ops), name, refusal).empty());
     }
     std::vector<char> one_more = records;
@@ -7417,7 +7447,7 @@ TEST(the_address_replay_encodes_the_blobs_it_cannot_copy) {
     rec_ops.clear();
     vert_ops.clear();
     put_op(rec_ops, OP_REPLACE_RUN, n + 1, one_more.data(), ADDR_POINT_STRIDE);
-    put_op(vert_ops, OP_MATCH_RUN, v);
+    put_op(vert_ops, OP_MATCH_RUN, v / unit);
     CHECK(not_refused(c, ALL_MODES, rebuilt("replace-past", rec_ops, vert_ops), "replace-past",
                       "Malformed merge sequence: addr_points.bin (a REPLACE run past the old file)")
               .empty());
@@ -7460,11 +7490,11 @@ TEST(the_address_replay_refuses_an_old_record_moved_under_a_blob_it_would_copy) 
     REQUIRE(at != std::string::npos);
     std::vector<char> record_ops, footprint_ops;
     put_op(record_ops, OP_MATCH_RUN, 1);
-    put_op(footprint_ops, OP_MATCH_RUN, static_cast<uint32_t>(address.blob.size()));
+    put_op(footprint_ops, OP_MATCH_RUN, static_cast<uint32_t>(address.blob.size() / ADDR_VERTEX_STRIDE));
     std::vector<char> matched(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(at));
     for (const std::vector<char>& section :
          {merge_of(PatchFileId::ADDR_POINTS, static_cast<uint32_t>(ADDR_POINT_STRIDE), ADDR_POINT_STRIDE, ADDR_POINT_STRIDE, record_ops),
-          merge_of(PatchFileId::ADDR_VERTICES, 1, address.blob.size(), address.blob.size(), footprint_ops)})
+          merge_of(PatchFileId::ADDR_VERTICES, ADDR_VERTEX_STRIDE, address.blob.size(), address.blob.size(), footprint_ops)})
         matched.insert(matched.end(), section.begin(), section.end());
     matched.insert(matched.end(), raw.begin() + static_cast<std::ptrdiff_t>(at + copies.size()), raw.end());
     REQUIRE(write_patch(c, c.patch(), matched));
@@ -7525,7 +7555,7 @@ TEST(patch_refuses_a_section_sent_as_unchanged_whose_new_size_is_not_its_old_one
         {PatchFileId::INTERP_WAYS, logical("interp_ways.bin"), INTERP_WAY_STRIDE},
         {PatchFileId::INTERP_NODES, logical("interp_nodes.bin"), 8},
         {PatchFileId::ADDR_POINTS, logical("addr_points.bin"), ADDR_POINT_STRIDE},
-        {PatchFileId::ADDR_VERTICES, logical("addr_vertices.bin"), 1},
+        {PatchFileId::ADDR_VERTICES, logical("addr_vertices.bin"), ADDR_VERTEX_STRIDE},
         {PatchFileId::POI_RECORDS, logical("poi_records.bin"), POI_RECORD_STRIDE},
         {PatchFileId::POI_VERTICES, logical("poi_vertices.bin"), 1},
         {PatchFileId::PLACE_NODES, place_files::LOGICAL_STRIDE * 20, place_files::LOGICAL_STRIDE},

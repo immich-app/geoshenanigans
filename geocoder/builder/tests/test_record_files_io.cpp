@@ -271,7 +271,7 @@ LogicalAddresses logical(const Addresses& a) {
         if (has_footprint(a, p)) {
             const NodeCoord* ring = &a.vertices[p.vertex_offset];
             const size_t at = out.vertices.size();
-            p.vertex_offset = uint32_t(at);
+            p.vertex_offset = addr_files::vertex_offset_of(at);
             out.vertices.resize(at + plan_polygon(ring, p.vertex_count).bytes);
             pack_polygon_at(out.vertices.data() + at, ring, p.vertex_count);
         } else {
@@ -616,10 +616,11 @@ TEST(address_files_are_the_serial_encoders_files_and_three_footers_without_addre
     // The large footprint's blob is an escape: its head, then its logical blob.
     AddrPoint escaped;
     std::memcpy(&escaped, l.points.data() + 90000 * sizeof(AddrPoint), sizeof escaped);
-    REQUIRE(escaped.vertex_count == 70000 && size_t(escaped.vertex_offset) + 280010 <= l.vertices.size());
+    const size_t escaped_at = size_t(addr_files::vertex_offset_bytes(escaped.vertex_offset));
+    REQUIRE(escaped.vertex_count == 70000 && escaped_at + 280010 <= l.vertices.size());
     std::vector<uint8_t> blob(addr_files::ESCAPE_HEAD_MAX);
     blob.resize(addr_files::escape_head(70000, blob.data()));
-    blob.insert(blob.end(), l.vertices.begin() + escaped.vertex_offset, l.vertices.begin() + escaped.vertex_offset + 280010);
+    blob.insert(blob.end(), l.vertices.begin() + escaped_at, l.vertices.begin() + escaped_at + 280010);
     CHECK(std::search(f.vertices.begin(), f.vertices.end(), blob.begin(), blob.end()) != f.vertices.end());
 
     // No addresses: the three footers, in place of the files before.

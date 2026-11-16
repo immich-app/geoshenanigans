@@ -102,6 +102,9 @@ static constexpr size_t ADDR_POINT_HOUSENUMBER_ID_OFF = 8;
 static constexpr size_t ADDR_POINT_STREET_ID_OFF = 12;
 static constexpr size_t ADDR_POINT_PARENT_WAY_ID_OFF = 16;
 static constexpr size_t ADDR_POINT_VERTEX_OFFSET_OFF = 20;
+// The bytes a run of addr_vertices.bin's merge section counts by: the unit
+// of a logical record's vertex_offset (addr_files.h).
+static constexpr uint32_t ADDR_VERTEX_STRIDE = 1;
 
 // street_id byte offset within an InterpWay record (after node_count and
 // its padding).

@@ -261,7 +261,7 @@ void write_addr_pair(const Points& points, const Vertices& vertices, PutPoints p
                 const PolygonPacking packing = plan_polygon(ring, p.vertex_count);
                 logical.resize(packing.bytes);
                 pack_polygon(logical.data(), packing, ring, p.vertex_count);
-                p.vertex_offset = static_cast<uint32_t>(logical_at);
+                p.vertex_offset = addr_files::vertex_offset_of(logical_at);
                 logical_at += packing.bytes;
             } else {
                 p.vertex_offset = NO_DATA;

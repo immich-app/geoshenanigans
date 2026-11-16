@@ -61,10 +61,8 @@ const SIDE_FILES: [(&str, &str); 4] = [
 /// does.
 const RUN: u32 = 1000;
 
-/// The most nodes before a way with nodes, whose node_offset is a u32, and the most bytes of
-/// logical blobs, where a vertex_offset is a u32 below NO_DATA.
+/// The most nodes before a way with nodes, whose node_offset is a u32.
 const MAX_NODES_BEFORE: u64 = u32::MAX as u64;
-const MAX_LOGICAL_VERTEX_BYTES: u64 = u32::MAX as u64 - 1;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -220,12 +218,13 @@ impl Out {
 }
 
 /// `before`, the nodes or the bytes before a record's own `own` in `file`, as the record's
-/// offset holds them; an error where the record's end is past the `most` its offset counts.
-fn offset(file: &str, before: u64, own: u64, most: u64) -> Result<u32, String> {
+/// offset holds them, in units of `unit`; an error where the record's end is past the `most`
+/// its offset counts.
+fn offset(file: &str, before: u64, own: u64, most: u64, unit: u64) -> Result<u32, String> {
     if before + own > most {
         return Err(format!("{file} holds more than the {most} a logical record's offset counts"));
     }
-    Ok(before as u32)
+    Ok((before / unit) as u32)
 }
 
 fn bits(node: &NodeCoord) -> (u32, u32) {
@@ -254,7 +253,7 @@ fn dump_ways(kind: Kind, files: Option<&WayFiles>, out: &str) -> Result<Family, 
         failed.add(way_tally(row.as_ref(), read, &nodes, files.first_node(id)));
         let mut record = [0u8; 24];
         if let Some(row) = row {
-            let node_offset = if row.node_count == 0 { 0 } else { offset(kind.nodes_file(), nodes_before, 0, MAX_NODES_BEFORE)? };
+            let node_offset = if row.node_count == 0 { 0 } else { offset(kind.nodes_file(), nodes_before, 0, MAX_NODES_BEFORE, 1)? };
             record[..4].copy_from_slice(&node_offset.to_le_bytes());
             record[4..6].copy_from_slice(&row.node_count.to_le_bytes());
             record[8..12].copy_from_slice(&row.name.to_le_bytes());
@@ -347,7 +346,8 @@ fn dump_addrs(addrs: Option<&AddrFiles>, out: &str) -> Result<Family, String> {
                     let has_logical = addrs.logical_blob(&record, &mut logical);
                     failed.add(footprint_tally(drawn, &vertices, has_logical, &logical, addrs.vertex_count(&record)));
                     if has_logical {
-                        vertex_offset = offset(addr_files::VERTICES_FILE, logical_bytes, logical.len() as u64, MAX_LOGICAL_VERTEX_BYTES)?;
+                        let (most, unit) = (addr_files::MAX_LOGICAL_VERTEX_BYTES, addr_files::VERTEX_OFFSET_UNIT);
+                        vertex_offset = offset(addr_files::VERTICES_FILE, logical_bytes, logical.len() as u64, most, unit)?;
                         vertex_count = vertices_of(&logical) as u32;
                         blobs.put(&logical)?;
                         logical_bytes += logical.len() as u64;
@@ -530,17 +530,18 @@ mod tests {
 
     #[test]
     fn an_offset_is_what_is_before_a_record_up_to_the_most_it_counts() {
-        assert_eq!(offset("street_nodes.bin", 0, 0, MAX_NODES_BEFORE), Ok(0));
-        assert_eq!(offset("street_nodes.bin", 4_000_000_000, 0, MAX_NODES_BEFORE), Ok(4_000_000_000));
-        assert_eq!(offset("street_nodes.bin", u64::from(u32::MAX), 0, MAX_NODES_BEFORE), Ok(u32::MAX));
+        assert_eq!(offset("street_nodes.bin", 0, 0, MAX_NODES_BEFORE, 1), Ok(0));
+        assert_eq!(offset("street_nodes.bin", 4_000_000_000, 0, MAX_NODES_BEFORE, 1), Ok(4_000_000_000));
+        assert_eq!(offset("street_nodes.bin", u64::from(u32::MAX), 0, MAX_NODES_BEFORE, 1), Ok(u32::MAX));
         assert_eq!(
-            offset("street_nodes.bin", u64::from(u32::MAX) + 1, 0, MAX_NODES_BEFORE),
+            offset("street_nodes.bin", u64::from(u32::MAX) + 1, 0, MAX_NODES_BEFORE, 1),
             Err("street_nodes.bin holds more than the 4294967295 a logical record's offset counts".to_owned())
         );
         // A footprint's bytes end no later than the most a patch indexes.
-        assert_eq!(offset("addr_vertices.bin", 4_294_967_000, 294, MAX_LOGICAL_VERTEX_BYTES), Ok(4_294_967_000));
+        let (most, unit) = (addr_files::MAX_LOGICAL_VERTEX_BYTES, addr_files::VERTEX_OFFSET_UNIT);
+        assert_eq!(offset("addr_vertices.bin", 4_294_967_000, 294, most, unit), Ok(4_294_967_000));
         assert_eq!(
-            offset("addr_vertices.bin", 4_294_967_000, 295, MAX_LOGICAL_VERTEX_BYTES),
+            offset("addr_vertices.bin", 4_294_967_000, 295, most, unit),
             Err("addr_vertices.bin holds more than the 4294967294 a logical record's offset counts".to_owned())
         );
     }

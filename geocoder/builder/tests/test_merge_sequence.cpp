@@ -2,6 +2,9 @@
 // for street/interp nodes and the *_vertices byte streams.
 #include "merge_sequence.h"
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include <cstdint>
 #include <cstring>
 #include <random>
@@ -113,11 +116,72 @@ TEST(vertex_blocks_run_to_the_next_record_with_an_offset) {
     const uint32_t offs[] = {0, 0xFFFFFFFFu, 10, 5, 30, 100, 40};
     std::string parent(sizeof(offs) / 4 * 8, 'x');
     for (size_t i = 0; i < sizeof(offs) / 4; i++) std::memcpy(&parent[i * 8 + 4], &offs[i], 4);
-    VertexBlocks b = vertex_blocks(parent.data(), parent.size(), 8, 4, 50);
+    VertexBlocks b = vertex_blocks(parent.data(), parent.size(), 8, 4, 50, 1);
     CHECK(b.offsets == std::vector<uint32_t>(std::begin(offs), std::end(offs)));
     // NO_DATA and past-the-stream offsets own nothing; 10 lies past its
     // successor's 5 and owns nothing either.
     CHECK(b.sizes == std::vector<uint32_t>({10, 0, 0, 25, 10, 0, 10}));
+}
+
+namespace {
+
+// 8-byte records with these vertex offsets at byte 4.
+std::string records_at(const std::vector<uint32_t>& offs) {
+    std::string parent(offs.size() * 8, 'x');
+    for (size_t i = 0; i < offs.size(); i++) std::memcpy(&parent[i * 8 + 4], &offs[i], 4);
+    return parent;
+}
+
+bool same_block(const ChildBlock& a, const ChildBlock& b) { return a.off == b.off && a.size == b.size; }
+
+}  // namespace
+
+// The address footprints' offsets count 2-byte units: a block's place and
+// size in bytes are twice its record's offset and twice the units to the next
+// record's, or to the stream's end.
+TEST(vertex_blocks_count_offsets_and_sizes_in_units) {
+    const std::string parent = records_at({0, 9, 0xFFFFFFFFu, 19});
+    const VertexBlocks b = vertex_blocks(parent.data(), parent.size(), 8, 4, 36, 2, 1);
+    CHECK(b.offsets == std::vector<uint32_t>({0, 9, 0xFFFFFFFFu, 19}));
+    CHECK(b.sizes == std::vector<uint32_t>({9, 9, 0, 0}));
+    CHECK(same_block(b.block(0), {0, 18}));
+    CHECK(same_block(b.block(1), {18, 18}));
+    // A point owns no block, nor does an offset past the stream's 18 units,
+    // nor a record past the last.
+    CHECK(same_block(b.block(2), {0, 0}));
+    CHECK(same_block(b.block(3), {0, 0}));
+    CHECK(same_block(b.block(4), {0, 0}));
+    // The stream's last unit is an offset's to own, of no bytes.
+    const std::string at_end = records_at({0, 18});
+    const VertexBlocks e = vertex_blocks(at_end.data(), at_end.size(), 8, 4, 36, 2, 1);
+    CHECK(e.sizes == std::vector<uint32_t>({18, 0}));
+    CHECK(same_block(e.block(0), {0, 36}));
+    // In bytes the same records are blocks of half the size.
+    const VertexBlocks bytes = vertex_blocks(parent.data(), parent.size(), 8, 4, 36, 1, 1);
+    CHECK(same_block(bytes.block(0), {0, 9}));
+    CHECK(same_block(bytes.block(1), {9, 10}));
+    CHECK(same_block(bytes.block(3), {19, 17}));
+}
+
+// A stream of 6 GiB holds 0xC0000000 units of 2 bytes: offsets and sizes past
+// 2^31 units are blocks past 4 GiB. No stream is read.
+TEST(vertex_blocks_reach_past_4_gib_at_two_byte_units) {
+    if (sizeof(size_t) < 8) return;
+    const uint64_t gib = uint64_t{1} << 30;
+    const std::string parent = records_at({0, 0x80000000u, 0xA0000000u});
+    for (unsigned threads : {1u, 3u}) {
+        const VertexBlocks b =
+            vertex_blocks(parent.data(), parent.size(), 8, 4, static_cast<size_t>(6 * gib), 2, threads);
+        CHECK(b.sizes == std::vector<uint32_t>({0x80000000u, 0x20000000u, 0x20000000u}));
+        CHECK(same_block(b.block(0), {0, static_cast<size_t>(4 * gib)}));
+        CHECK(same_block(b.block(1), {static_cast<size_t>(4 * gib), static_cast<size_t>(gib)}));
+        CHECK(same_block(b.block(2), {static_cast<size_t>(5 * gib), static_cast<size_t>(gib)}));
+    }
+    // An offset of the stream's units and one more: the first owns no byte,
+    // the second no block.
+    const std::string ends = records_at({0xC0000000u, 0xC0000001u});
+    const VertexBlocks e = vertex_blocks(ends.data(), ends.size(), 8, 4, static_cast<size_t>(6 * gib), 2, 1);
+    CHECK(e.sizes == std::vector<uint32_t>({0, 0}));
 }
 
 TEST(vertex_blocks_same_for_any_thread_count) {
@@ -134,9 +198,9 @@ TEST(vertex_blocks_same_for_any_thread_count) {
             else if (kind < 4) off = at += rng() % 60;
             std::memcpy(&parent[i * 12 + 8], &off, 4);
         }
-        VertexBlocks one = vertex_blocks(parent.data(), parent.size(), 12, 8, 300000, 1);
+        VertexBlocks one = vertex_blocks(parent.data(), parent.size(), 12, 8, 300000, 1, 1);
         for (unsigned threads : {2u, 7u, 64u}) {
-            VertexBlocks many = vertex_blocks(parent.data(), parent.size(), 12, 8, 300000, threads);
+            VertexBlocks many = vertex_blocks(parent.data(), parent.size(), 12, 8, 300000, 1, threads);
             CHECK(many.offsets == one.offsets);
             CHECK(many.sizes == one.sizes);
         }
@@ -456,10 +520,10 @@ ArcIndex arc_index_of(const std::vector<uint32_t>& sizes, const std::string& lab
 
 // The arc_vertices merge along an arc_index merge, as the diff makes it.
 MergeSequence arc_blocks_along(const MergeSequence& parent, const ArcIndex& o, const ArcIndex& n) {
-    const VertexBlocks ob = vertex_blocks(o.index.data(), o.index.size(), 4, 0, o.stream.size());
-    const VertexBlocks nb = vertex_blocks(n.index.data(), n.index.size(), 4, 0, n.stream.size());
+    const VertexBlocks ob = vertex_blocks(o.index.data(), o.index.size(), 4, 0, o.stream.size(), 1);
+    const VertexBlocks nb = vertex_blocks(n.index.data(), n.index.size(), 4, 0, n.stream.size(), 1);
     auto block = [](const VertexBlocks& b) {
-        return [&b](size_t i) { return ChildBlock{b.offsets[i], b.sizes[i]}; };
+        return [&b](size_t i) { return b.block(i); };
     };
     return merge_child_blocks(parent, 4, 1, o.stream.data(), o.stream.size(), n.stream.data(), n.stream.size(),
                               block(ob), block(nb));
@@ -606,4 +670,56 @@ TEST(merge_child_blocks_replace_keeps_blocks_like_a_match) {
     std::vector<Op> want = {{OP_MATCH_RUN, 8, ""}, {OP_DELETE_RUN, 2, ""}, {OP_INSERT_RUN, 3, "YYY"},
                             {OP_MATCH_RUN, 4, ""}, {OP_INSERT_RUN, 2, "ZZ"}};
     CHECK(got == want);
+}
+
+namespace {
+
+// `bytes` of address space no page of which is read or written but those
+// from `at` that hold `used` bytes: reserved without access, so they count
+// against no memory limit.
+struct SparseBytes {
+    char* data = nullptr;
+    size_t bytes = 0;
+    SparseBytes(size_t size, size_t at, size_t used) : bytes(size) {
+        void* p = mmap(nullptr, bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) return;
+        const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE)), first = at - at % page;
+        if (mprotect(static_cast<char*>(p) + first, at + used - first, PROT_READ | PROT_WRITE) != 0) {
+            munmap(p, bytes);
+            return;
+        }
+        data = static_cast<char*>(p);
+    }
+    ~SparseBytes() {
+        if (data) munmap(data, bytes);
+    }
+    SparseBytes(const SparseBytes&) = delete;
+    SparseBytes& operator=(const SparseBytes&) = delete;
+};
+
+}  // namespace
+
+// Three footprints of 18 bytes that start 4 GiB into each day's stream, the
+// middle one with its byte 14 changed: the blocks are placed and compared
+// past 4 GiB, and the edited one keeps its head and tail in whole 2-byte
+// units. The streams are address space: a page of each is written.
+TEST(merge_child_blocks_take_blocks_past_4_gib) {
+    if (sizeof(size_t) < 8) return;
+    const size_t at = static_cast<size_t>(uint64_t{1} << 32), blob = 18, size = at + 3 * blob;
+    SparseBytes o(size, at, 3 * blob), n(size, at, 3 * blob);
+    REQUIRE(o.data && n.data);
+    for (size_t i = 0; i < 3 * blob; i++) o.data[at + i] = n.data[at + i] = static_cast<char>('a' + i % 26);
+    n.data[at + blob + 14] = 'X';
+    MergeSequence parent;
+    parent.add_match(3);
+    auto block = [&](size_t i) { return ChildBlock{at + i * blob, blob}; };
+
+    const MergeSequence seq = merge_child_blocks(parent, PARENT_STRIDE, 2, o.data, size, n.data, size, block, block);
+
+    // The first footprint's 9 units and the second's first 7; the changed
+    // unit; the second's last unit and the third's 9.
+    const std::vector<Op> want = {{OP_MATCH_RUN, 16, ""}, {OP_DELETE_RUN, 1, ""},
+                                  {OP_INSERT_RUN, 1, std::string(n.data + at + blob + 14, 2)}, {OP_MATCH_RUN, 10, ""}};
+    CHECK(ops_of(seq, 2) == want);
+    CHECK_EQ(want[2].data, std::string("Xh"));
 }

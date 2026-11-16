@@ -124,8 +124,8 @@ static void files(const std::string& what, const Records& records) {
     for (const Record& r : records) {
         const bool point = r.footprint.empty();
         const uint32_t count = point ? 0 : uint32_t((r.footprint.size() - 10) / (r.footprint[0] == 3 ? 8 : 4));
-        for (uint32_t v : {r.lat, r.lng, r.housenumber, r.street, r.parent, point ? NO_DATA : uint32_t(vertices.size()), count})
-            put(points, v, 4);
+        const uint32_t offset = point ? NO_DATA : addr_files::vertex_offset_of(vertices.size());
+        for (uint32_t v : {r.lat, r.lng, r.housenumber, r.street, r.parent, offset, count}) put(points, v, 4);
         vertices.insert(vertices.end(), r.footprint.begin(), r.footprint.end());
     }
     const addr_files::Files f = addr_files::encode(points.data(), records.size(), vertices.data(), vertices.size());

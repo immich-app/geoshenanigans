@@ -612,7 +612,10 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   position: its MATCH bytes are the old bytes of the parent records at the
   same places, a MATCH or REPLACE record's own or, where a DELETE run is
   followed by an INSERT run, the deleted record's for the inserted one at the
-  same place in the run. An encoded family replayed through its codecs (the
+  same place in the run. Its merge section is at its file's stride (the
+  table below): the patcher refuses one at any other ("Encoded family:
+  unexpected section kind for a child stream").
+  An encoded family replayed through its codecs (the
   POI files when only their blocks change) decodes both files from one stream,
   and the patcher refuses a replay that reads one of them 4 MiB
   (MAX_DECODER_SKEW) ahead of the other ("Malformed merge sequence: <file>

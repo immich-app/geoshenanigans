@@ -98,7 +98,7 @@ TEST(child_ops_walk_a_merge_sequence_in_bytes_of_the_childs_stride) {
     };
     const Child children[] = {{PatchFileId::STREET_NODES, 8, "street_nodes.bin"},
                               {PatchFileId::INTERP_NODES, 8, "interp_nodes.bin"},
-                              {PatchFileId::ADDR_VERTICES, 1, "addr_vertices.bin"},
+                              {PatchFileId::ADDR_VERTICES, ADDR_VERTEX_STRIDE, "addr_vertices.bin"},
                               {PatchFileId::POI_VERTICES, 1, "poi_vertices.bin"}};
     for (const Child& child : children) {
         const uint64_t u = child.stride;
@@ -293,6 +293,41 @@ TEST(child_ops_refuse_a_section_that_is_not_the_childs) {
     // A full replacement that declares bytes past the patch.
     CHECK_EQ(parse_refusal(file, 8, whole_section(file, 0, 72, 16, bytes_from('a', 16), uint64_t{1} << 40)),
              std::string("Truncated patch: child section"));
+}
+
+// A stream counted in 2-byte units holds as many units as a patch indexes,
+// 8,589,934,588 bytes: a run of them all is that many bytes, past 32 bits,
+// and a stream of a unit more is refused on either day.
+TEST(child_ops_count_the_most_units_of_a_two_byte_stream_in_64_bits) {
+    const PatchFileId file = PatchFileId::ADDR_VERTICES;
+    const uint64_t most = uint64_t{2} * FILE_RECORDS_MAX;
+    CHECK_EQ(most, uint64_t{8589934588ull});
+    std::vector<char> matched, dropped;
+    run(matched, OP_MATCH_RUN, FILE_RECORDS_MAX);
+    run(dropped, OP_DELETE_RUN, FILE_RECORDS_MAX);
+    run(dropped, OP_INSERT_RUN, 1, bytes_from('a', 2));
+    const std::vector<char> kept = merge_section(file, 2, most, most, matched), replaced = merge_section(file, 2, most, 2, dropped);
+
+    ChildOps sut = parsed(file, 2, kept);
+    sut.at_bytes();
+    CHECK(sut.op == OP_MATCH_RUN);
+    CHECK_EQ(sut.left, most);
+    sut.took(most);
+    CHECK_EQ(sut.old, most);
+    CHECK_EQ(sut.written, most);
+    sut.finish();
+
+    // A DELETE run of them all is passed on the way to the next bytes.
+    ChildOps after = parsed(file, 2, replaced);
+    after.at_bytes();
+    CHECK(after.op == OP_INSERT_RUN);
+    CHECK_EQ(after.old, most);
+    CHECK_EQ(after.left, uint64_t{2});
+
+    CHECK_EQ(parse_refusal(file, 2, merge_section(file, 2, most + 2, most, matched)),
+             std::string("Old addr_vertices.bin holds 4294967295 records, more than the 4294967294 a patch can index"));
+    CHECK_EQ(parse_refusal(file, 2, merge_section(file, 2, most, most + 2, matched)),
+             std::string("New addr_vertices.bin holds 4294967295 records, more than the 4294967294 a patch can index"));
 }
 
 // A malformed merge sequence is refused by the child's name when its ops are

@@ -38,7 +38,7 @@ fn count_of(logical: &[u8]) -> u32 {
 fn logical_pair(records: &[Logical]) -> (Vec<u8>, Vec<u8>) {
     let (mut points, mut vertices) = (Vec::new(), Vec::new());
     for r in records {
-        let offset = if r.footprint.is_empty() { NO_DATA } else { vertices.len() as u32 };
+        let offset = if r.footprint.is_empty() { NO_DATA } else { vertex_offset_of(vertices.len() as u64).unwrap() };
         for field in [r.lat, r.lng, r.housenumber, r.street, r.parent, offset, count_of(&r.footprint)] {
             points.extend(field.to_le_bytes());
         }
@@ -53,7 +53,7 @@ fn logical_records(points: &[u8], vertices: &[u8]) -> Vec<Logical> {
         .chunks_exact(28)
         .map(|r| {
             let field = |k: usize| u32::from_le_bytes(r[4 * k..4 * k + 4].try_into().unwrap());
-            let (offset, count) = (field(5) as usize, field(6) as usize);
+            let (offset, count) = ((u64::from(field(5)) * VERTEX_OFFSET_UNIT) as usize, field(6) as usize);
             let footprint = if count == 0 {
                 Vec::new()
             } else {

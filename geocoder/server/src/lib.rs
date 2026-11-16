@@ -6317,7 +6317,7 @@ mod query_path_tests {
         let (mut points, mut vertices) = (Vec::new(), Vec::new());
         for addr in addrs {
             let (vertex_offset, vertex_count) = match &addr.footprint {
-                Some(footprint) => (vertices.len() as u32, footprint.steps.len() as u32),
+                Some(footprint) => (addr_files::vertex_offset_of(vertices.len() as u64).unwrap(), footprint.steps.len() as u32),
                 None => (NO_DATA, 0),
             };
             let fields = [addr.point.lat.to_bits(), addr.point.lng.to_bits(), addr.housenumber_id, addr.street_id,
@@ -8130,7 +8130,9 @@ mod query_path_tests {
         ];
         let (mut points, mut vertices) = (Vec::new(), Vec::new());
         let mut record = |footprint: Option<&(u8, NodeCoord, &[(u32, u32)])>| {
-            let (vertex_offset, vertex_count) = footprint.map_or((NO_DATA, 0), |footprint| (vertices.len() as u32, footprint.2.len() as u32));
+            let (vertex_offset, vertex_count) = footprint.map_or((NO_DATA, 0), |footprint| {
+                (addr_files::vertex_offset_of(vertices.len() as u64).unwrap(), footprint.2.len() as u32)
+            });
             for field in [here.lat.to_bits(), here.lng.to_bits(), 1, 2, 3, vertex_offset, vertex_count] {
                 points.extend(field.to_le_bytes());
             }

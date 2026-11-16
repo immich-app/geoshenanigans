@@ -137,19 +137,21 @@ static uint32_t joint_child_of(uint32_t fid) {
     }
 }
 
-// The bytes a run of a child stream's merge section counts by: a node's lat and lng, or a byte
-// of a vertex stream.
+// The bytes a run of a child stream's merge section counts by: a node's lat and lng, the unit of
+// an address's vertex_offset, or a byte of a vertex stream.
 static uint32_t joint_child_stride(uint32_t child_fid) {
     switch ((PatchFileId)child_fid) {
     case PatchFileId::STREET_NODES:
     case PatchFileId::INTERP_NODES: return 8;
+    case PatchFileId::ADDR_VERTICES: return ADDR_VERTEX_STRIDE;
     default: return 1;
     }
 }
 
 // A child section (the one right after its parent's) replayed on demand: produce(n) writes the
 // next n bytes of the new child file, taking MATCH bytes from the old child file, INSERT / REPLACE
-// bytes from the patch, and skipping DELETE runs as it meets them.
+// bytes from the patch, and skipping DELETE runs as it meets them. A merge at another stride than
+// the child's (joint_child_stride) is refused.
 struct JointChild {
     enum Kind { MERGE, COPY_OLD, FULL };
     Kind kind = MERGE;
@@ -185,7 +187,7 @@ struct JointChild {
             if (kind == FULL && ds != new_size) throw std::runtime_error("Malformed child full replacement");
             if (kind == COPY_OLD) require_copy_old_sizes(patch_file_names[fid], old_size, new_size);
             stride = 1;
-        } else if (stride == SPARSE_DELTA_STRIDE || stride == CELL_LIST_DELTA_STRIDE || stride == PARALLEL_DELTA_STRIDE) {
+        } else if (stride != joint_child_stride(want_fid)) {
             throw std::runtime_error("Encoded family: unexpected section kind for a child stream");
         } else {
             require_merge_records(patch_file_names[fid], old_size, new_size, stride, file_records_max);
@@ -817,7 +819,7 @@ static int run(int argc, char* argv[]) {
             replay_addr_section(seq, seq_size, P, patch_size, child_at, cur_dir, listed.count(addr_files::POINTS_FILE) ? out_dir : tmpdir,
                                 old_size, new_size, file_records_max, hashes, fix, remap);
         if (r.child.kind == ChildOps::MERGE)
-            merge_seqs[(uint32_t)PatchFileId::ADDR_VERTICES] = {r.child.seq, r.child.seq_end - r.child.seq, 1};
+            merge_seqs[(uint32_t)PatchFileId::ADDR_VERTICES] = {r.child.seq, r.child.seq_end - r.child.seq, r.child.stride};
         pos = r.child.section_end;
         madvise(const_cast<char*>(patch_map.data), pos, MADV_DONTNEED);
         malloc_trim(0);

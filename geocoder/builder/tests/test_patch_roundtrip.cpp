@@ -269,19 +269,19 @@ void put_identity_streets(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
 //   0:  0 -> 1  MATCH       (B, on moved street 3 -> 0)
 //   21: 1 -> 2  REPLACE     (C -> D, on street 2), footprint of vertices 1 2 -> 1 9 2
 //   22: 2 -> gone           (A, on the deleted street 0)
-//   3:  3 -> 3  MATCH       (B, on street 4 -> 3), footprint 3 4, vertex offset 18 -> 22
+//   3:  3 -> 3  MATCH       (B, on street 4 -> 3), footprint 3 4, at byte 18 -> 22 of the footprints
 //   24: 4 -> 0  moved       (C, on street 1)
 //   25:      4  new         (D, on the new street 4)
 // addr_postcodes follows the addresses; new 3's postcode changes.
 void put_identity_addresses(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
     old_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{
         {48.0f, 11.0f, OLD_B, OLD_B, 3, NO_DATA, 0}, {48.0f, 11.0f, OLD_C, OLD_C, 2, 0, 2},
-        {48.0f, 11.0f, OLD_A, OLD_A, 0, NO_DATA, 0}, {48.0f, 11.0f, OLD_B, OLD_B, 4, 18, 2},
+        {48.0f, 11.0f, OLD_A, OLD_A, 0, NO_DATA, 0}, {48.0f, 11.0f, OLD_B, OLD_B, 4, addr_files::vertex_offset_of(18), 2},
         {48.0f, 11.0f, OLD_C, OLD_C, 1, NO_DATA, 0}});
     old_d["addr_vertices.bin"] = footprints_of({{1, 2}, {3, 4}});
     new_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{
         {48.0f, 11.0f, NEW_C, NEW_C, 1, NO_DATA, 0}, {48.0f, 11.0f, NEW_B, NEW_B, 0, NO_DATA, 0},
-        {48.0f, 11.0f, NEW_D, NEW_D, 2, 0, 3}, {48.0f, 11.0f, NEW_B, NEW_B, 3, 22, 2},
+        {48.0f, 11.0f, NEW_D, NEW_D, 2, 0, 3}, {48.0f, 11.0f, NEW_B, NEW_B, 3, addr_files::vertex_offset_of(22), 2},
         {48.0f, 11.0f, NEW_D, NEW_D, 4, NO_DATA, 0}});
     new_d["addr_vertices.bin"] = footprints_of({{1, 9, 2}, {3, 4}});
     ids.old_keys["addr"] = {0, 21, 22, 3, 24};
@@ -344,16 +344,16 @@ void put_slot_streets(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
 //   1: refilled            (a tombstone -> D, on the appended street 5)
 //   2: REPLACE             (C -> D, on street 2), footprint of vertices 1 2 -> 1 9 2
 //   3: dies                (A, on the dead street 1 -> a tombstone)
-//   4: MATCH               (B, on street 4), footprint 3 4, vertex offset 18 -> 22
+//   4: MATCH               (B, on street 4), footprint 3 4, at byte 18 -> 22 of the footprints
 void put_slot_addresses(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
     const AddrPoint dead = addr_point_tombstone();
     old_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{
         {48.0f, 11.0f, OLD_B, OLD_B, 0, NO_DATA, 0}, dead, {48.0f, 11.0f, OLD_C, OLD_C, 2, 0, 2},
-        {48.0f, 11.0f, OLD_A, OLD_A, 1, NO_DATA, 0}, {48.0f, 11.0f, OLD_B, OLD_B, 4, 18, 2}});
+        {48.0f, 11.0f, OLD_A, OLD_A, 1, NO_DATA, 0}, {48.0f, 11.0f, OLD_B, OLD_B, 4, addr_files::vertex_offset_of(18), 2}});
     old_d["addr_vertices.bin"] = footprints_of({{1, 2}, {3, 4}});
     new_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{
         {48.0f, 11.0f, NEW_B, NEW_B, 0, NO_DATA, 0}, {48.0f, 11.0f, NEW_D, NEW_D, 5, NO_DATA, 0},
-        {48.0f, 11.0f, NEW_D, NEW_D, 2, 0, 3}, dead, {48.0f, 11.0f, NEW_B, NEW_B, 4, 22, 2}});
+        {48.0f, 11.0f, NEW_D, NEW_D, 2, 0, 3}, dead, {48.0f, 11.0f, NEW_B, NEW_B, 4, addr_files::vertex_offset_of(22), 2}});
     new_d["addr_vertices.bin"] = footprints_of({{1, 9, 2}, {3, 4}});
     ids.old_keys["addr"] = slot_keys(5, {1});
     ids.new_keys["addr"] = slot_keys(5, {3});
@@ -979,7 +979,7 @@ TEST(decode_logical_writes_the_address_pair) {
     const std::vector<AddrPoint> points = {{48.0f, 11.0f, NAME_2, NAME_4, 7, NO_DATA, 0},
                                            {48.1f, 11.1f, NAME_4, NAME_2, NO_DATA, 0, 2},
                                            addr_point_tombstone(),
-                                           {48.2f, 11.2f, NAME_2, NAME_2, 9, 18, 3}};
+                                           {48.2f, 11.2f, NAME_2, NAME_2, 9, addr_files::vertex_offset_of(18), 3}};
     const BuildDir addrs = {{"addr_points.bin", bytes_of(points)}, {"addr_vertices.bin", footprints_of({{1, 2}, {3, 4, 3}})}};
     const BuildDir no_addrs = {{"addr_points.bin", {}}, {"addr_vertices.bin", {}}};
     struct Case {

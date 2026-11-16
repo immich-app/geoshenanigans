@@ -248,7 +248,7 @@ AddrSet addr_set(const std::vector<AddrSpec>& specs, std::mt19937& rng) {
         if (sp.dead) rec[0] = rec[1] = rec[2] = rec[3] = 0, rec[4] = NO;
         const size_t first = s.verts.size();
         if (sp.vc) {
-            rec[5] = uint32_t(first);
+            rec[5] = addr_files::vertex_offset_of(first);
             rec[6] = sp.vc;
             uint8_t h[10] = {sp.enc, 0};
             const bool at_point = rng() % 2;

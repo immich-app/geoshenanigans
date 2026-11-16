@@ -94,15 +94,15 @@
 // Varints are LEB128 in their fewest bytes.
 //
 // What the files leave out of a logical record is derived: vertex_offset is
-// the bytes of the logical blobs of the records before it (NO_DATA for a
-// point) and vertex_count its blob's (0 for a point). The encoder refuses a
-// pair in which they are anything else, and one the files can't hold: a
-// footprint in an encoding past 3, with its zero byte set or of no vertices;
-// more than MAX_RECORDS records or a logical addr_vertices.bin of more than
-// MAX_LOGICAL_VERTEX_BYTES (a patch indexes a file's records, and a byte
-// stream's bytes, in a u32 below NO_DATA, and a vertex_offset is a u32); a
-// blob of 4 GiB or more (len is a u32), or as many bytes of a superblock's
-// blobs before one of its blocks.
+// the bytes of the logical blobs of the records before it, in units of
+// VERTEX_OFFSET_UNIT (NO_DATA for a point), and vertex_count its blob's (0
+// for a point). The encoder refuses a pair in which they are anything else,
+// and one the files can't hold: a footprint in an encoding past 3, with its
+// zero byte set or of no vertices; more than MAX_RECORDS records or a logical
+// addr_vertices.bin of more than MAX_LOGICAL_VERTEX_BYTES (a patch indexes a
+// file's records, and a byte stream's bytes, in a u32 below NO_DATA, and a
+// vertex_offset is a u32); a blob of 4 GiB or more (len is a u32), or as many
+// bytes of a superblock's blobs before one of its blocks.
 #pragma once
 
 #include <algorithm>
@@ -139,9 +139,15 @@ inline constexpr size_t BLOCK_MAX_BYTES =
     (BLOCK_RECORDS * (5 * 32 + coord_keys::bit_length(uint32_t(BLOCK_RECORDS - 1))) + 7) / 8;
 static_assert(BLOCK_RECORDS >= 1 && BLOCK_RECORDS <= 255, "a block's dictionary entries are counted in a byte");
 static_assert((SUPERBLOCK_BLOCKS - 1) * BLOCK_MAX_BYTES <= UINT16_MAX, "a block's start from its superblock's is a u16");
-// The most records a pair holds, and the most bytes a logical
-// addr_vertices.bin is.
-inline constexpr uint64_t MAX_RECORDS = UINT32_MAX - 1, MAX_LOGICAL_VERTEX_BYTES = UINT32_MAX - 1;
+// The most records a pair holds.
+inline constexpr uint64_t MAX_RECORDS = UINT32_MAX - 1;
+// The bytes a vertex_offset counts by, which every logical blob is a whole
+// number of, and the most bytes a logical addr_vertices.bin is: as many of
+// them as a u32 below NO_DATA counts.
+inline constexpr uint64_t VERTEX_OFFSET_UNIT = 1, MAX_LOGICAL_VERTEX_BYTES = VERTEX_OFFSET_UNIT * (UINT32_MAX - 1);
+// The bytes before the footprint of a record that has none
+// (logical_record).
+inline constexpr uint64_t NO_FOOTPRINT = ~uint64_t(0);
 // The size to give for a file the dir does not have. A file of no bytes is
 // a file, and a malformed one.
 inline constexpr uint64_t ABSENT = ~uint64_t(0);
@@ -172,6 +178,19 @@ static_assert(LOGICAL_HEADER == POLY_HEADER_BYTES && vertex_bytes(0) == VERTEX_S
                   vertex_bytes(2) == VERTEX_STRIDE[2] && vertex_bytes(3) == VERTEX_STRIDE[3] && SCALE[0] == VERTEX_SCALE[0] &&
                   SCALE[1] == VERTEX_SCALE[1] && SCALE[2] == VERTEX_SCALE[2],
               "a logical blob is a packed polygon (vertex_pack.h)");
+static_assert(LOGICAL_HEADER % VERTEX_OFFSET_UNIT == 0 && vertex_bytes(0) % VERTEX_OFFSET_UNIT == 0 &&
+                  vertex_bytes(3) % VERTEX_OFFSET_UNIT == 0,
+              "a logical blob is whole units of a vertex_offset");
+
+// The vertex_offset of a footprint with this many bytes of logical blobs
+// before it, and the bytes a vertex_offset counts. Bytes that are not whole
+// units, or more than a logical addr_vertices.bin is, are the caller's error.
+inline uint32_t vertex_offset_of(uint64_t bytes_before) {
+    if (bytes_before % VERTEX_OFFSET_UNIT || bytes_before > MAX_LOGICAL_VERTEX_BYTES)
+        throw std::logic_error("no vertex_offset counts " + std::to_string(bytes_before) + " bytes of logical blobs");
+    return uint32_t(bytes_before / VERTEX_OFFSET_UNIT);
+}
+constexpr uint64_t vertex_offset_bytes(uint32_t vertex_offset) { return vertex_offset * VERTEX_OFFSET_UNIT; }
 
 [[noreturn]] inline void malformed(const std::string& what) { throw std::runtime_error("Malformed address files: " + what); }
 
@@ -514,14 +533,15 @@ struct Block {
 };
 
 // The logical record of the block's record j, LOGICAL_STRIDE bytes to out,
-// given its vertex_offset and vertex_count.
-inline void logical_record(const Block& b, size_t j, uint32_t vertex_offset, uint32_t vertex_count, uint8_t* out) {
+// given the bytes of the logical blobs before its footprint (NO_FOOTPRINT
+// for a point) and its vertex_count.
+inline void logical_record(const Block& b, size_t j, uint64_t footprint_at, uint32_t vertex_count, uint8_t* out) {
     put32(out + LAT_AT, b.lat[j]);
     put32(out + LNG_AT, b.lng[j]);
     put32(out + HOUSENUMBER_AT, b.housenumber[j]);
     put32(out + STREET_AT, b.street[j]);
     put32(out + PARENT_AT, b.parent[j]);
-    put32(out + VERTEX_OFFSET_AT, vertex_offset);
+    put32(out + VERTEX_OFFSET_AT, footprint_at == NO_FOOTPRINT ? NO_DATA : vertex_offset_of(footprint_at));
     put32(out + VERTEX_COUNT_AT, vertex_count);
 }
 
@@ -886,6 +906,8 @@ public:
         : blocks_(blocks), blobs_(blobs), index_(index), records_(records_before), logical_(logical_vertex_bytes_before) {
         if (records_before % SUPERBLOCK_RECORDS)
             throw std::logic_error("an address encoder starts at a superblock's first record");
+        if (logical_vertex_bytes_before % VERTEX_OFFSET_UNIT)
+            throw std::logic_error("an address encoder starts at whole units of a vertex_offset");
     }
 
     // The next record (LOGICAL_STRIDE bytes, at any alignment) and its
@@ -982,7 +1004,7 @@ private:
         const uint32_t offset = get32(record + VERTEX_OFFSET_AT), count = get32(record + VERTEX_COUNT_AT);
         if (!count && offset != NO_DATA) refuse("has a vertex_offset and no vertices");
         if (count && offset == NO_DATA) refuse("has vertices and no vertex_offset");
-        if (count && offset != logical_)
+        if (count && vertex_offset_bytes(offset) != logical_)
             refuse("has a vertex_offset of " + std::to_string(offset) + ", not the " + std::to_string(logical_) +
                    " bytes of the footprints before it");
         return count;
@@ -1098,16 +1120,16 @@ inline Files encode(const uint8_t* records, uint64_t n, const uint8_t* vertices,
     Encoder enc(into(f.points), into(f.vertices), into(f.index));
     for (uint64_t i = 0; i < n; i++) {
         const uint8_t* record = records + i * LOGICAL_STRIDE;
-        const uint64_t offset = get32(record + VERTEX_OFFSET_AT), count = get32(record + VERTEX_COUNT_AT);
+        const uint64_t at = enc.logical_vertex_bytes(), count = get32(record + VERTEX_COUNT_AT);
         // What the encoder reads of a footprint at its place is there: the logical blob's header,
         // and the vertices of an encoding a blob holds. It refuses any other before it reads it.
         const uint8_t* logical = nullptr;
-        if (count && offset == enc.logical_vertex_bytes()) {
-            if (vertices_size - std::min(offset, vertices_size) < LOGICAL_HEADER ||
-                (vertices[offset] <= 3 && (vertices_size - offset - LOGICAL_HEADER) / vertex_bytes(vertices[offset]) < count))
+        if (count && vertex_offset_bytes(get32(record + VERTEX_OFFSET_AT)) == at) {
+            if (vertices_size - std::min(at, vertices_size) < LOGICAL_HEADER ||
+                (vertices[at] <= 3 && (vertices_size - at - LOGICAL_HEADER) / vertex_bytes(vertices[at]) < count))
                 malformed(std::string(POINTS_FILE) + " record " + std::to_string(i) +
                           " has a footprint past the end of the logical " + VERTICES_FILE);
-            logical = vertices + offset;
+            logical = vertices + at;
         }
         enc.add(record, logical);
     }
@@ -1167,7 +1189,7 @@ void decode(const uint8_t* points, uint64_t points_size, const uint8_t* vertices
             const uint32_t len = block.len[j];
             uint8_t record[LOGICAL_STRIDE];
             if (!len) {
-                logical_record(block, j, NO_DATA, 0, record);
+                logical_record(block, j, NO_FOOTPRINT, 0, record);
                 put_record(static_cast<const uint8_t*>(record));
                 continue;
             }
@@ -1179,7 +1201,7 @@ void decode(const uint8_t* points, uint64_t points_size, const uint8_t* vertices
                               " bytes");
                 out.resize(size_t(h.logical_bytes()));
                 decode_blob(h, vertices + blobs_at, len, block.lat[j], block.lng[j], out.data());
-                logical_record(block, j, uint32_t(logical), uint32_t(h.vertex_count()), record);
+                logical_record(block, j, logical, uint32_t(h.vertex_count()), record);
             } catch (const std::runtime_error& e) {
                 // What a blob is refused for, with whose it is.
                 throw std::runtime_error(std::string(e.what()) + ": " + vertices_file + ", record " + std::to_string(i));
