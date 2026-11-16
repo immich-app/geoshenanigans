@@ -29,6 +29,7 @@
 
 #include "cell_pairs.h"
 #include "checked_size.h"
+#include "coord_keys.h"
 #include "sequential_file_reader.h"
 #include "string_files.h"
 
@@ -86,6 +87,9 @@ static constexpr size_t POI_RECORD_STRIDE = 36;
 static constexpr size_t PLACE_NODE_STRIDE = 24;
 // The client files place_nodes.bin's section writes besides it.
 static constexpr const char* PLACE_SIDE_FILES[] = {"place_cells.bin", "place_hidden.bin"};
+// The client file addr_points.bin's and addr_vertices.bin's sections write
+// besides them (addr_files.h).
+static constexpr const char* ADDR_SIDE_FILES[] = {"addr_index.bin"};
 
 // name_id byte offset within a street WayHeader record.
 static constexpr size_t WAY_HEADER_NAME_ID_OFF = 8;
@@ -156,7 +160,7 @@ inline bool write_file(const std::string& path, const std::vector<char>& data) {
 // that refuses a dir from another day for variants that ship no string tier
 // (quality dirs): every other read clamps to what is there.
 inline void require_old_file_size(const std::string& dir, const std::string& name, uint64_t expected) {
-    // Low-memory mode: an encoded family's old file is decoded in process.
+    // An encoded family's old file is decoded in process.
     if (virtual_size_hook() && virtual_size_hook()(dir, name, expected)) {
         virtual_file_sizes()[dir + "/" + name] = expected;
         return;
@@ -237,7 +241,10 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // as one logical stream of 24-byte rows under place_nodes.bin's id, the
 // visible nodes in cell order, which the patcher encodes again as the three
 // files.
-static constexpr uint32_t GCPATCH_VERSION = 16;
+// v17: an old file's hash (OLD_FILE_HASH_MARKER) names its file, so a patch
+// carries one for each file a replay copies from without decoding it, or
+// copies such bytes under values of (HASHED_OLD_FILES).
+static constexpr uint32_t GCPATCH_VERSION = 17;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -643,6 +650,12 @@ constexpr uint32_t SPARSE_DELTA_STRIDE = 0xFC;
 // fixup passes are skipped for identical files), so the patcher's identity
 // reconstruction matches.
 constexpr uint32_t COPY_OLD_STRIDE = 0xFD;
+// A COPY_OLD section's two sizes are one, the new file being the old one: refused otherwise.
+inline void require_copy_old_sizes(const std::string& name, uint64_t old_size, uint64_t new_size) {
+    if (new_size != old_size)
+        throw std::runtime_error("Malformed copy-old section: " + name + " is " + std::to_string(old_size) + " bytes old and " +
+                                 std::to_string(new_size) + " new");
+}
 
 // Stride sentinel: a cell index (<name>_cells.bin + <name>_entries.bin)
 // patched by runs (v15). Strategy-2 ids keep most lists unchanged day to day,
@@ -744,11 +757,39 @@ inline void close_patch_outputs(std::initializer_list<std::pair<FILE*, std::stri
 // (parse_parent_id_remap).
 static constexpr uint32_t POI_PARENT_REMAP_MARKER = 0xFFFFFFF3;
 
-// The old poi_vertices.bin's hash: marker(4), lane_hash of the file (u64),
-// right before the POI records' section. The patcher's POI replay
-// (poi_replay.h) copies the old blocks a day leaves whole without decoding
-// them, and checks them by it.
-static constexpr uint32_t POI_VERTICES_HASH_MARKER = 0xFFFFFFF8;
+// An old file's hash: marker(4), file id (u32), lane_hash of the file as the
+// old dir holds it (u64), before the section of the file's parent records. A
+// replay that copies bytes of an old file without decoding them checks them
+// by it, with the old values they are copied under: the POI replay
+// (poi_replay.h) the old blocks a day leaves whole and the rows whose lat and
+// lng they sit under (poi_vertices.bin and poi_records.bin), the way replay
+// (way_replay.h) the node blocks of the groups a day leaves whole and their
+// rows' anchors, counts and codes (both files of each way pair), the address
+// replay (addr_replay.h) the old footprint blobs and the records whose
+// points they sit under (addr_vertices.bin and addr_points.bin). The diff
+// sends one for each file of HASHED_OLD_FILES the old dir holds and whose
+// family has a section. The patcher refuses a second hash of a file, a hash
+// of any other file, and a replay without the hashes it checks by. A family
+// both of whose sections are unchanged is copied as its files sit, and POI
+// records sent unchanged over blocks that change go through the codecs: the
+// patcher holds each hashed file of such a family to its hash before it
+// reads it. The hash of an old file without records is read and checks
+// nothing.
+static constexpr uint32_t OLD_FILE_HASH_MARKER = 0xFFFFFFF8;
+static constexpr PatchFileId HASHED_OLD_FILES[] = {
+    PatchFileId::POI_RECORDS,
+    PatchFileId::POI_VERTICES,
+    PatchFileId::STREET_WAYS,
+    PatchFileId::STREET_NODES,
+    PatchFileId::INTERP_WAYS,
+    PatchFileId::INTERP_NODES,
+    PatchFileId::ADDR_POINTS,
+    PatchFileId::ADDR_VERTICES,
+};
+inline bool is_hashed_old_file(uint32_t fid) {
+    return std::find(std::begin(HASHED_OLD_FILES), std::end(HASHED_OLD_FILES), static_cast<PatchFileId>(fid)) !=
+           std::end(HASHED_OLD_FILES);
+}
 
 // --- Reading a part of the patch ---
 
@@ -1379,8 +1420,10 @@ inline size_t varint_size(uint32_t value) {
     return n;
 }
 
-inline uint32_t zigzag32(uint32_t v) { return (v << 1) ^ (0u - (v >> 31)); }
-inline uint32_t unzigzag32(uint32_t v) { return (v >> 1) ^ (0u - (v & 1)); }
+// The zigzag of a difference mod 2^32, and back: coord_keys.h's own, so a
+// header that calls them under `using namespace coord_keys` finds one of each.
+using coord_keys::unzigzag32;
+using coord_keys::zigzag32;
 
 // --- Cell index rebuild ---
 

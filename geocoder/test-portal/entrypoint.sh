@@ -37,7 +37,7 @@ selection_files() {
     fi
     for f in geo_cells.bin geo_entries.bin \
              street_ways.bin street_nodes.bin \
-             addr_points.bin addr_vertices.bin addr_postcodes.bin \
+             addr_points.bin addr_vertices.bin addr_index.bin addr_postcodes.bin \
              interp_ways.bin interp_nodes.bin interp_postcodes.bin \
              admin_cells.bin admin_entries.bin admin_parents.bin \
              place_cells.bin place_hidden.bin place_nodes.bin \

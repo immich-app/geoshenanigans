@@ -1,7 +1,7 @@
 // In-process codec I/O for the low-memory client update: buffered pread / pwrite over regular
-// files (the encoded installed set and the new encoded set), byte queues between the patcher and
-// the codecs, and the gc manifest. Small buffers: the kernel's sequential readahead decides the
-// request size, not the buffer (the md4 small-device profile caps a request at 128 KiB anyway).
+// files (the old dir's encoded files and the new dir's) and byte queues between the patcher and
+// the codecs. Small buffers: the kernel's sequential readahead decides the request size, not the
+// buffer (the md4 small-device profile caps a request at 128 KiB anyway).
 #pragma once
 
 #include <algorithm>
@@ -11,7 +11,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -34,6 +33,11 @@ static const size_t ENCODER_PIECE = size_t(64) << 10;
 // the replay reads a parent and its child stream in step (PATCHING.md), so only a malformed merge
 // sequence leaves one this far behind.
 static const size_t MAX_DECODER_SKEW = size_t(4) << 20;
+// The most a coupled family's encoder holds of one of its files while it waits for bytes of the
+// other: the replay writes a record and then its child bytes, and what the patcher's buffers and
+// a --threads ring put between the two files is a few hundred KiB, so only a patch whose sections
+// are out of step leaves one this far ahead.
+static const size_t MAX_ENCODER_SKEW = size_t(1) << 20;
 // The bytes a Reader's buffer holds past its capacity, for the bit readers' 8-byte loads past a
 // unit's last byte.
 static const size_t READ_SLACK = 64;
@@ -365,40 +369,6 @@ struct ByteQueue {
                 cap = 0;
             }
         }
-    }
-};
-
-// key value pairs kept next to the encoded files (gc.manifest)
-struct Manifest {
-    std::map<std::string, std::string> kv;
-    void set(const std::string& k, const std::string& v) { kv[k] = v; }
-    void set(const std::string& k, uint64_t v) { kv[k] = std::to_string(v); }
-    bool has(const std::string& k) const { return kv.count(k) != 0; }
-    const std::string& get(const std::string& k) const {
-        auto it = kv.find(k);
-        if (it == kv.end()) die("manifest: missing %s", k.c_str());
-        return it->second;
-    }
-    uint64_t num(const std::string& k) const { return std::stoull(get(k)); }
-    void save(const std::string& path) const {
-        std::string s;
-        for (auto& [k, v] : kv) s += k + " " + v + "\n";
-        Writer w(path, 1 << 12);
-        w.put(s.data(), s.size());
-        w.finish();
-    }
-    void load(const std::string& path) {
-        FILE* f = fopen(path.c_str(), "r");
-        if (!f) die("open %s", path.c_str());
-        char line[4096];
-        while (fgets(line, sizeof line, f)) {
-            std::string l = line;
-            while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
-            const size_t sp = l.find(' ');
-            if (sp == std::string::npos) continue;
-            kv[l.substr(0, sp)] = l.substr(sp + 1);
-        }
-        fclose(f);
     }
 };
 

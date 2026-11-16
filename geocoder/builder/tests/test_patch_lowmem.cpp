@@ -1,9 +1,9 @@
-// geocoder-patch's low-memory mode end to end: small synthetic today's-format
-// dirs, the geocoder-diff patch between them, geocoder-gc's encoding of the
-// old dir patched (in sync and --threads) and the new encoded set compared
-// byte for byte with geocoder-gc's encoding of the new dir. Then the
-// patcher's heap peak, in every mode, as a case grows tenfold; and patches
-// and command lines the patcher must refuse.
+// geocoder-patch end to end: small synthetic dirs as the builder writes
+// them, the geocoder-diff patch between them, the old dir patched (its codecs
+// in the patcher's thread and with --threads) and the output compared byte
+// for byte with the new dir. Then the patcher's heap peak, in every mode, as
+// a case grows tenfold; and patches and command lines the patcher must
+// refuse.
 #include <algorithm>
 #include <array>
 #include <cinttypes>
@@ -45,9 +45,9 @@ constexpr uint32_t NO = 0xFFFFFFFFu;
 // The most bytes a family's decoder may hold queued while the replay skips
 // old bytes (a deleted run, replaced children or parents).
 constexpr uint64_t DECODER_HOLD = 1 << 20;
-// The most vertices an abs2 address footprint holds (closing vertex
-// included); one of more goes through the raw escape.
-constexpr uint32_t ABS2_MAX_VERTICES = 69999;
+// The most vertices an address footprint's blob holds (addr_files.h); one of
+// more is an escape.
+constexpr uint32_t MAX_BLOB_VERTICES = static_cast<uint32_t>(addr_files::MAX_BLOB_VERTICES);
 // The most bytes a family's encoder may hold queued, however large a write:
 // a piece of it (64 KiB) and the largest unit the encoder takes whole. Each
 // family's own, so each check is as tight as its encoder allows (one bound
@@ -56,11 +56,11 @@ constexpr uint32_t ABS2_MAX_VERTICES = 69999;
 // may):
 //   POI: a block up to big_block(), 256 KiB; a larger one goes plane by
 //   plane;
-//   addr: an abs2 footprint, a 10-byte header and 4-byte vertices, 280,006 B
-//   at ABS2_MAX_VERTICES; an escaped one goes through in pieces.
+//   addr: a footprint a blob holds, a 10-byte header and 4-byte vertices,
+//   262,150 B at MAX_BLOB_VERTICES; an escaped one goes through in pieces.
 constexpr uint64_t ENCODER_PIECE = 64 << 10;
 constexpr uint64_t POI_ENCODER_HOLD = ENCODER_PIECE + (256 << 10);
-constexpr uint64_t ADDR_ENCODER_HOLD = ENCODER_PIECE + 10 + 4 * uint64_t(ABS2_MAX_VERTICES);
+constexpr uint64_t ADDR_ENCODER_HOLD = ENCODER_PIECE + 10 + 4 * uint64_t(MAX_BLOB_VERTICES);
 // The most the patcher's heap peak may grow when a heap test's case grows
 // tenfold in the one structure it varies, which the patcher reads in place.
 constexpr uint64_t HEAP_GROWTH_SLACK = 256 << 10;
@@ -400,6 +400,27 @@ std::vector<char> poi_merge_head(uint32_t old_n, uint32_t new_n, uint32_t string
     return head;
 }
 
+// An old file's hash section as the diff writes it.
+std::vector<char> old_file_hash(PatchFileId file, uint64_t hash) {
+    std::vector<char> section;
+    append(section, OLD_FILE_HASH_MARKER);
+    append(section, static_cast<uint32_t>(file));
+    append(section, hash);
+    return section;
+}
+
+// A COPY_OLD section of a file of `size` logical bytes as the diff writes it.
+std::vector<char> copy_old_section(PatchFileId file, uint64_t size) {
+    std::vector<char> section;
+    append(section, static_cast<uint32_t>(file));
+    append(section, static_cast<uint32_t>(COPY_OLD_STRIDE));
+    append(section, size);
+    append(section, size);
+    append(section, 0u);
+    append(section, uint64_t{0});
+    return section;
+}
+
 // The secondary remap's head as the diff writes it, up to the POI records'
 // pair count: no street, address or interp pairs, then poi_pairs.
 std::vector<char> secondary_remap_head(uint32_t poi_pairs) {
@@ -460,8 +481,8 @@ LogCheck peaks_at_most(const std::string& codec, const std::string& family, uint
 LogCheck decoder_peaks_at_most(const std::string& family, uint64_t limit) { return peaks_at_most("decode", family, limit); }
 LogCheck encoder_peaks_at_most(const std::string& family, uint64_t limit) { return peaks_at_most("encode", family, limit); }
 
-// The old and new dirs of a case under root/<name>.{old,new}, their encoded
-// sets, the patch between them, and what applying it gave.
+// The old and new dirs of a case under root/<name>.{old,new}, the patch
+// between them, and what applying it gave.
 struct LowMemCase {
     std::string root, name;
     std::string dir(const std::string& kind) const { return root + "/" + name + "." + kind; }
@@ -469,9 +490,8 @@ struct LowMemCase {
     std::string log() const { return dir("log"); }
 };
 
-// Writes old and new (and their sidecars when given), diffs them (with
-// diff_options), and encodes both with geocoder-gc. Empty on success, else
-// what failed.
+// Writes old and new (and their sidecars when given) and diffs them (with
+// diff_options). Empty on success, else what failed.
 std::string prepare(const LowMemCase& c, const BuildDir& old_d, const BuildDir& new_d, const BuildDir& old_meta = {},
                     const BuildDir& new_meta = {}, const std::vector<std::string>& diff_options = {}) {
     if (!write_dir(c.dir("old"), old_d) || !write_dir(c.dir("new"), new_d)) return "fixture not written";
@@ -481,11 +501,8 @@ std::string prepare(const LowMemCase& c, const BuildDir& old_d, const BuildDir& 
         diff.insert(diff.end(), {"--identity", c.dir("old-meta"), c.dir("new-meta")});
     }
     diff.insert(diff.end(), diff_options.begin(), diff_options.end());
-    for (const auto& words : {diff, {GEOCODER_GC_BIN, "encode", c.dir("old"), c.dir("old.enc")},
-                              {GEOCODER_GC_BIN, "encode", c.dir("new"), c.dir("new.enc")}}) {
-        auto r = run_tool(words, c.log());
-        if (!r.ok) return words[0] + " failed: " + r.log;
-    }
+    auto r = run_tool(diff, c.log());
+    if (!r.ok) return diff[0] + " failed: " + r.log;
     return "";
 }
 
@@ -507,16 +524,15 @@ std::string patch_holds(const LowMemCase& c, const std::vector<char>& head, cons
     return find_once(raw_patch(c), head) == std::string::npos ? "no " + what : "";
 }
 
-// The modes a patch applies in: to the old dir, and to its encoded set (the
-// low-memory mode) in sync and with --threads.
-const std::vector<std::string> ENCODED_MODES = {"sync", "threads"};
-const std::vector<std::string> ALL_MODES = {"plain", "sync", "threads"};
+// The modes a patch applies in: the codecs in the patcher's own thread
+// ("sync"), or each in a thread of its own ("threads", with --threads).
+const std::vector<std::string> ALL_MODES = {"sync", "threads"};
 
-// The patcher's command line applying patch to c's old dir ("plain") or
-// encoded set ("sync", "threads") into out, with options.
+// The patcher's command line applying patch to c's old dir into out in the
+// mode, with options.
 std::vector<std::string> patch_words(const LowMemCase& c, const std::string& mode, const std::string& patch, const std::string& out,
                                      const std::vector<std::string>& options = {}) {
-    std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir(mode == "plain" ? "old" : "old.enc"), patch, "-o", out};
+    std::vector<std::string> words = {GEOCODER_PATCH_BIN, c.dir("old"), patch, "-o", out};
     if (mode == "threads") words.push_back("--threads");
     words.insert(words.end(), options.begin(), options.end());
     return words;
@@ -573,10 +589,9 @@ struct Applied {
     std::map<std::string, std::string> codec_states;
 };
 
-// The patch applied in each of modes ("plain": to the old dir, compared with
-// the new dir; "sync" and "threads": to the old encoded set, compared with
-// the new encoded set), the patcher under the heap shim and given options;
-// check runs on each log. Every mismatch, printed.
+// The patch applied to the old dir in each of modes and the output compared
+// with the new dir, the patcher under the heap shim and given options; check
+// runs on each log. Every mismatch, printed.
 Applied apply_modes(const LowMemCase& c, const std::vector<std::string>& modes, const LogCheck& check = {},
                     const std::vector<std::string>& options = {}) {
     Applied a;
@@ -584,7 +599,6 @@ Applied apply_modes(const LowMemCase& c, const std::vector<std::string>& modes, 
     // from none.
     for (const std::string& mode : modes) std::filesystem::remove_all(c.dir("out." + mode));
     for (const std::string& mode : modes) {
-        const bool plain = mode == "plain";
         const std::string out = c.dir("out." + mode);
         std::filesystem::remove(c.log());
         const auto [ok, heap_peak] = gctest::run_with_heap_peak(patch_words(c, mode, c.patch(), out, options), c.log());
@@ -596,18 +610,12 @@ Applied apply_modes(const LowMemCase& c, const std::vector<std::string>& modes, 
             a.bad.push_back(mode + ": patch failed: " + log);
             continue;
         }
-        if (read_dir(out) != read_dir(c.dir(plain ? "new" : "new.enc")))
-            a.bad.push_back(mode + (plain ? ": the patched dir is not the new dir" : ": the new set is not gc's encoding of the new dir"));
+        if (read_dir(out) != read_dir(c.dir("new"))) a.bad.push_back(mode + ": the patched dir is not the new dir");
         if (check)
             if (std::string e = check(log); !e.empty()) a.bad.push_back(mode + ": " + e);
     }
     for (const auto& b : a.bad) std::printf("    %s: %s\n", c.name.c_str(), b.c_str());
     return a;
-}
-
-// The low-memory mode's mismatches.
-std::vector<std::string> apply_both_modes(const LowMemCase& c, const LogCheck& check = {}) {
-    return apply_modes(c, ENCODED_MODES, check).bad;
 }
 
 // A heap test's case of n elements of the one structure it varies, written
@@ -686,8 +694,8 @@ ThreadsCheck threads_check(const std::vector<ThreadsRun>& runs_n, const std::vec
 
 // The case at n and at factor n (10 n unless said), each applied in every
 // mode: each output as apply_modes checks it, and in each mode the heap peak
-// at factor n at most HEAP_GROWTH_SLACK above the one at n. Plain and sync runs peak the same
-// every time, so one run at each size decides; --threads runs
+// at factor n at most HEAP_GROWTH_SLACK above the one at n. A sync run peaks
+// the same every time, so one run at each size decides; --threads runs
 // THREADS_HEAP_RUNS times at each size, the sizes taking turns so that both
 // see the same load, and threads_check decides, both sizes running again
 // while its failures aren't settled, up to THREADS_HEAP_MAX_RUNS times.
@@ -712,7 +720,7 @@ std::vector<std::string> heap_flat(const CaseOfSize& make_case, uint32_t n, uint
             return bad;
         }
     }
-    // Each size's plain and sync heap peaks, and its --threads runs.
+    // Each size's sync heap peak, and its --threads runs.
     std::map<std::string, uint64_t> peaks[2];
     std::vector<ThreadsRun> threads[2];
     for (int run = 0; run < THREADS_HEAP_MAX_RUNS && (run == 0 || bad.empty()) &&
@@ -744,8 +752,8 @@ std::vector<Poi> pois_of(std::mt19937& rng, uint32_t n, uint32_t vertices, bool 
 }
 
 // n address points, every third without a footprint, the others with one of
-// 1 to 8 random vertices, on a street of their own: geocoder-gc's address
-// family and its streets, into d.
+// 1 to 8 random vertices, on a street of their own: the address family
+// beside the street pair, into d.
 void put_addr_family(BuildDir& d, std::mt19937& rng, uint32_t n) {
     std::vector<GeoRow> rows;
     for (uint32_t k = 0; k < 50; k++) rows.push_back({k, {k % 10}});
@@ -869,7 +877,9 @@ TEST(patch_rebuilds_the_builders_poi_files_on_random_days) {
 // byte, copying the blocks of the polygons kept at their place (the log counts
 // them) and encoding the others, their old bytes decoded from the old blocks
 // at hand. A byte flipped in a copied block of the old
-// dir goes through undecoded, and the old poi_vertices.bin's hash refuses it.
+// dir goes through undecoded, and the old poi_vertices.bin's hash refuses it;
+// a bit flipped in the longitude of that block's row is a row like any other,
+// and the old poi_records.bin's hash refuses it.
 TEST(patch_copies_the_poi_blocks_a_day_leaves_whole) {
     ScratchDir dir("lowmem-poi-copy");
     constexpr uint32_t NAME = 12, NAMES = 64, N = 500;
@@ -991,9 +1001,131 @@ TEST(patch_copies_the_poi_blocks_a_day_leaves_whole) {
     v2[voff + poi_files::MAX_BLOCK_HEADER + 100] ^= 0x10;
     REQUIRE(write_file(c.dir("old") + "/poi_vertices.bin", v2.data(), v2.size()));
     std::filesystem::remove_all(c.dir("out.flipped"));
-    const auto r = run_tool(patch_words(c, "plain", c.patch(), c.dir("out.flipped")), c.log());
+    const auto r = run_tool(patch_words(c, "sync", c.patch(), c.dir("out.flipped")), c.log());
     CHECK(!r.ok);
     CHECK(r.log.find("Old poi_vertices.bin is not the one the patch was made from") != std::string::npos);
+    v2[voff + poi_files::MAX_BLOCK_HEADER + 100] ^= 0x10;
+    REQUIRE(write_file(c.dir("old") + "/poi_vertices.bin", v2.data(), v2.size()));
+
+    std::vector<char> moved = r2;
+    moved[200 * poi_files::ROW_BYTES + poi_files::ROW_LAT + 4] ^= 0x10;
+    REQUIRE(write_file(c.dir("old") + "/poi_records.bin", moved.data(), moved.size()));
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "moved", "Old poi_records.bin is not the one the patch was made from").empty());
+}
+
+// The hashes of the old poi_records.bin and poi_vertices.bin, which the diff
+// writes once each, the records' and then the vertices', right before the POI
+// records' section. In every mode a patch with a second hash of either (the
+// same hash or another, before it or after) is refused, and so is the hash of
+// a file no replay checks: place_nodes.bin, or a file id past the table. A
+// patch whose POI replay would copy blocks without either hash is refused
+// too. The patch as made applies.
+TEST(patch_refuses_a_second_hash_of_a_file_and_a_hash_for_a_file_outside_the_hashed_set) {
+    ScratchDir dir("patch-old-file-hash");
+    std::mt19937 rng(20261114);
+    const auto pois = pois_of(rng, 300, 0, true);
+    // A block edited and a POI appended: the records change, so they replay.
+    auto edited = pois;
+    std::fill(edited[100].block.begin() + 10, edited[100].block.end(), 0);
+    edited.push_back({300, block(rng, 5)});
+    BuildDir old_d, new_d;
+    put_pois(old_d, pois);
+    put_pois(new_d, edited);
+    const LowMemCase c{dir.path(), "hash"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    struct Case {
+        std::string name;
+        size_t at;
+        std::vector<char> section;
+        std::string refusal;
+    };
+    std::vector<Case> cases;
+    size_t records_hash_end = 0;
+    for (const PatchFileId hashed : {PatchFileId::POI_RECORDS, PatchFileId::POI_VERTICES}) {
+        const std::string file = patch_file_names[static_cast<uint32_t>(hashed)];
+        const std::vector<char> bytes = read_file(c.dir("old") + "/" + file);
+        const uint64_t hash = lane_hash(bytes.data(), bytes.size());
+        const std::vector<char> made = old_file_hash(hashed, hash);
+        const size_t at = find_once(raw, made);
+        if (at == std::string::npos) std::printf("    no hash of the old %s\n", file.c_str());
+        REQUIRE(at != std::string::npos);
+        const size_t end = at + made.size();
+        // The vertices' hash follows the records', and the POI records' section the two.
+        if (hashed == PatchFileId::POI_RECORDS) records_hash_end = end;
+        else CHECK_EQ(at, records_hash_end);
+        const std::string second = "Malformed patch: a second hash of the old " + file;
+        cases.push_back({file + "-twice-after", end, made, second});
+        cases.push_back({file + "-twice-before", at, made, second});
+        cases.push_back({file + "-another-hash", end, old_file_hash(hashed, hash ^ 1), second});
+        if (hashed == PatchFileId::POI_VERTICES) {
+            cases.push_back({"places", at, old_file_hash(PatchFileId::PLACE_NODES, hash),
+                             "Malformed patch: a hash of the old place_nodes.bin, which no replay checks"});
+            cases.push_back({"past-the-table", at, old_file_hash(PatchFileId::COUNT, hash),
+                             "Malformed patch: a hash of the old file " + std::to_string(static_cast<uint32_t>(PatchFileId::COUNT)) +
+                                 ", which no replay checks"});
+        }
+        std::vector<char> cut = raw;
+        cut.erase(cut.begin() + static_cast<std::ptrdiff_t>(at), cut.begin() + static_cast<std::ptrdiff_t>(end));
+        const std::string patch = c.dir(file + "-cut.gcpatch");
+        REQUIRE(write_patch(c, patch, cut));
+
+        CHECK(not_refused(c, ALL_MODES, patch, file + "-cut", "Malformed patch: POI records without the old " + file + "'s hash").empty());
+    }
+    for (const Case& e : cases) {
+        std::vector<char> edited_patch = raw;
+        edited_patch.insert(edited_patch.begin() + static_cast<std::ptrdiff_t>(e.at), e.section.begin(), e.section.end());
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited_patch));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// A day that leaves both POI files as they are: the diff sends the hashes of
+// the old poi_records.bin and poi_vertices.bin before the two unchanged
+// sections all the same, and the patcher, which copies the family as its
+// files sit, holds each file to its hash first. A patch with another hash in
+// the place of either is refused in every mode.
+TEST(patch_holds_an_unchanged_poi_family_to_its_hashes) {
+    ScratchDir dir("patch-unused-poi-hash");
+    std::mt19937 rng(20261115);
+    BuildDir d;
+    put_pois(d, pois_of(rng, 300, 0, true));
+    const LowMemCase c{dir.path(), "unused"};
+    REQUIRE(prepare(c, d, d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    std::vector<char> sections;
+    for (const char* name : {"poi_records.bin", "poi_vertices.bin"}) {
+        const std::vector<char> bytes = read_file(c.dir("old") + "/" + name);
+        const std::vector<char> hash =
+            old_file_hash(name == std::string("poi_records.bin") ? PatchFileId::POI_RECORDS : PatchFileId::POI_VERTICES,
+                          lane_hash(bytes.data(), bytes.size()));
+        sections.insert(sections.end(), hash.begin(), hash.end());
+    }
+    for (const auto& [file, name] : {std::pair<PatchFileId, const char*>{PatchFileId::POI_RECORDS, "poi_records.bin"},
+                                     {PatchFileId::POI_VERTICES, "poi_vertices.bin"}}) {
+        const std::vector<char> unchanged = copy_old_section(file, d.at(name).size());
+        sections.insert(sections.end(), unchanged.begin(), unchanged.end());
+    }
+    const size_t at = find_once(raw, sections);
+    REQUIRE(at != std::string::npos);
+
+    const LogCheck no_replay = [](const std::string& log) {
+        return log.find("replayed with poi_records.bin: blocks ") == std::string::npos ? std::string() : std::string("the POI replay ran");
+    };
+    CHECK(apply_modes(c, ALL_MODES, no_replay).bad.empty());
+    // Each hash section is its marker, its file and the hash: 16 bytes.
+    const char* const files[] = {"poi_records.bin", "poi_vertices.bin"};
+    for (size_t k = 0; k < 2; k++) {
+        std::vector<char> another = raw;
+        another[at + 16 * k + 8] ^= 1;
+        REQUIRE(write_patch(c, c.patch(), another));
+        CHECK(not_refused(c, ALL_MODES, c.patch(), files[k], std::string("Old ") + files[k] + " is not the one the patch was made from").empty());
+    }
 }
 
 // Random days of the five string tiers: old pools of random strings (empty
@@ -1057,9 +1189,9 @@ TEST(patch_rebuilds_the_builders_string_tiers_on_random_days) {
     }
 }
 
-// An unchanged parent of an encoded family (poi_records.bin sent as kept)
-// replays with its child: both files unchanged, then the records unchanged
-// and one vertex block edited.
+// An unchanged parent of an encoded family (poi_records.bin sent as kept):
+// both files unchanged, which are copied, then the records unchanged and one
+// vertex block edited, which replay together.
 TEST(patch_lowmem_replays_an_unchanged_parent_with_its_child) {
     ScratchDir dir("lowmem-same");
     std::mt19937 rng(20261027);
@@ -1073,8 +1205,276 @@ TEST(patch_lowmem_replays_an_unchanged_parent_with_its_child) {
         const LowMemCase c{dir.path(), name};
         REQUIRE(prepare(c, old_d, new_d).empty());
 
-        CHECK(apply_both_modes(c).empty());
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
     }
+}
+
+namespace {
+
+// An encoded family by the name its codecs report under, and its files as a
+// dir holds them.
+struct FamilyFiles {
+    const char* family;
+    std::vector<const char*> files;
+};
+const std::vector<FamilyFiles> FAMILY_FILES = {
+    {"streets", {"street_ways.bin", "street_nodes.bin"}},
+    {"interps", {"interp_ways.bin", "interp_nodes.bin"}},
+    {"addr", {"addr_points.bin", "addr_vertices.bin", "addr_index.bin"}},
+    {"poi", {"poi_records.bin", "poi_vertices.bin"}},
+    {"places", {"place_cells.bin", "place_nodes.bin", "place_hidden.bin"}},
+    {"way_parents", {"way_parents.bin"}},
+    {"addr_postcodes", {"addr_postcodes.bin"}},
+};
+
+// n place nodes, every fourth the hidden label of a polygon.
+std::vector<PlaceNode> some_places(uint32_t n) {
+    std::vector<PlaceNode> places;
+    for (uint32_t i = 0; i < n; i++) {
+        PlaceNode p = test_place(47.0f + static_cast<float>(i) * 1e-4f, 8.0f, i);
+        if (i % 4 == 3) {
+            p._pad1 = PLACE_FLAG_HIDDEN | PLACE_FLAG_LABEL_OF;
+            p.parent_poly_id = i;
+        }
+        places.push_back(p);
+    }
+    return places;
+}
+
+// A dir of every encoded family: 40 street ways of two nodes in a geo cell,
+// with a parent each; 30 interpolations of three nodes; 60 address points,
+// two in three with a footprint, with a postcode each; 50 POIs, two in three
+// polygons; 20 place nodes.
+BuildDir every_family(std::mt19937& rng) {
+    BuildDir d, meta;
+    std::vector<uint32_t> names;
+    for (uint32_t w = 0; w < 40; w++) names.push_back(w % 7);
+    put_named_ways(d, meta, names);
+    std::vector<char> interps, interp_nodes, parents, postcodes;
+    for (uint32_t i = 0; i < 30; i++) {
+        append(interps, InterpWay{3 * i, 3, 0, i % 5, 1 + 2 * i, 21 + 2 * i, 1});
+        for (uint32_t k = 0; k < 3; k++) {
+            append(interp_nodes, 47.5f + static_cast<float>(i) * 1e-3f + static_cast<float>(k) * 1e-4f);
+            append(interp_nodes, 8.5f + static_cast<float>(k) * 1e-4f);
+        }
+    }
+    d["interp_ways.bin"] = interps;
+    d["interp_nodes.bin"] = interp_nodes;
+    std::vector<Addr> addrs;
+    for (uint32_t i = 0; i < 60; i++) {
+        addrs.push_back({47.0f + static_cast<float>(i) * 1e-4f, i % 3 == 0 ? std::vector<char>{} : block(rng, 1 + rng() % 8)});
+        append(postcodes, i / 3 * 8);
+    }
+    put_addrs(d, addrs);
+    for (uint32_t w = 0; w < 40; w++) append(parents, w % 9);
+    d["way_parents.bin"] = parents;
+    d["addr_postcodes.bin"] = postcodes;
+    put_pois(d, pois_of(rng, 50, 0, true));
+    put_places(d, some_places(20));
+    return d;
+}
+
+// The patcher's log of a day that changes the families of `replayed` and no
+// other: each of those went through its decoder and its encoder (their
+// report lines), and every other family had no codec run and each of its
+// files, as `written` holds them, copied from the old dir at its size there.
+// "" or what is wrong.
+LogCheck copied_all_but(const std::vector<std::string>& replayed, const BuildDir& written) {
+    return [replayed, written](const std::string& log) -> std::string {
+        for (const FamilyFiles& f : FAMILY_FILES) {
+            const bool decoded = log.find(std::string("decode ") + f.family + ":") != std::string::npos;
+            const bool encoded = log.find(std::string("encode ") + f.family + ":") != std::string::npos;
+            if (std::find(replayed.begin(), replayed.end(), f.family) != replayed.end()) {
+                if (!decoded || !encoded) return std::string("no codec of ") + f.family + " ran";
+                continue;
+            }
+            if (decoded || encoded) return std::string("a codec of ") + f.family + " ran";
+            for (const char* file : f.files) {
+                const std::string line =
+                    std::string("  ") + file + ": unchanged (copied " + std::to_string(written.at(file).size()) + " bytes from old)";
+                if (log.find(line) == std::string::npos) return "no \"" + line + "\"";
+            }
+        }
+        return "";
+    };
+}
+
+// raw without the client list's entry of `file` (the list follows the magic,
+// the version and the flags: its marker, its count, then each file's name
+// length, name, size and inline byte); nothing when it lists no such file.
+std::vector<char> unlisted(const std::vector<char>& raw, const std::string& file) {
+    const size_t list_at = 16;
+    uint32_t marker = 0, listed = 0;
+    if (raw.size() < list_at + 8) return {};
+    memcpy(&marker, raw.data() + list_at, 4);
+    memcpy(&listed, raw.data() + list_at + 4, 4);
+    std::vector<char> entry;
+    append(entry, static_cast<uint16_t>(file.size()));
+    entry.insert(entry.end(), file.begin(), file.end());
+    const size_t at = find_once(raw, entry);
+    if (marker != CLIENT_FILES_MARKER || at == std::string::npos) return {};
+    std::vector<char> cut = raw;
+    cut.erase(cut.begin() + static_cast<std::ptrdiff_t>(at), cut.begin() + static_cast<std::ptrdiff_t>(at + entry.size() + 8 + 1));
+    put_at(cut, list_at + 4, listed - 1);
+    return cut;
+}
+
+}  // namespace
+
+// A family the day leaves as it is, each of its sections sent as unchanged
+// (a way pair's, the address files', the POI files': the records' section and
+// the child's after it; the place files' and a side file's: their one
+// section), is copied from the old dir as its files sit there, the files no
+// section names with them (addr_index.bin; place_cells.bin and
+// place_hidden.bin), and none of its codecs runs: on a day that changes
+// nothing, and beside each family in turn that a day does change, in its
+// records alone or in its child alone, which goes through its codecs. In
+// every mode the patched dir is the new dir.
+TEST(patch_copies_a_family_both_of_whose_sections_are_unchanged) {
+    ScratchDir dir("lowmem-family-copy");
+    std::mt19937 rng(20261115);
+    const BuildDir base = every_family(rng);
+    struct Day {
+        std::string name;
+        std::vector<std::string> replayed;
+        std::function<void(BuildDir&)> edit;
+    };
+    const Day days[] = {
+        {"same", {}, [](BuildDir&) {}},
+        {"street-renamed", {"streets"},
+         [](BuildDir& d) { put_at(d["street_ways.bin"], 7 * WAY_HEADER_STRIDE + WAY_HEADER_NAME_ID_OFF, 1000u); }},
+        {"street-node-moved", {"streets"}, [](BuildDir& d) { put_at(d["street_nodes.bin"], 11 * 8, 46.0f); }},
+        {"interp-renamed", {"interps"},
+         [](BuildDir& d) { put_at(d["interp_ways.bin"], 4 * INTERP_WAY_STRIDE + INTERP_WAY_STREET_ID_OFF, 1000u); }},
+        {"interp-node-moved", {"interps"}, [](BuildDir& d) { put_at(d["interp_nodes.bin"], 20 * 8, 46.0f); }},
+        {"address-moved", {"addr"}, [](BuildDir& d) { put_at(d["addr_points.bin"], 10 * ADDR_POINT_STRIDE + 4, 9.0f); }},
+        {"footprint-edited", {"addr"}, [](BuildDir& d) { d["addr_vertices.bin"][10] ^= 1; }},
+        {"poi-edited", {"poi"}, [](BuildDir& d) { d["poi_records.bin"][20 * POI_RECORD_STRIDE + offsetof(PoiRecord, importance)] ^= 1; }},
+        {"poi-polygon-edited", {"poi"}, [](BuildDir& d) { d["poi_vertices.bin"][10] ^= 1; }},
+        {"place-renamed", {"places"},
+         [](BuildDir& d) {
+             std::vector<PlaceNode> places = some_places(20);
+             places[5].name_id = 1000;
+             put_places(d, places);
+         }},
+        {"way-parent", {"way_parents"}, [](BuildDir& d) { put_at(d["way_parents.bin"], 11 * 4, 99u); }},
+        {"postcode", {"addr_postcodes"}, [](BuildDir& d) { put_at(d["addr_postcodes.bin"], 11 * 4, 800u); }},
+    };
+    for (const Day& day : days) {
+        BuildDir new_d = base;
+        day.edit(new_d);
+        REQUIRE((new_d == base) == day.replayed.empty());
+        const LowMemCase c{dir.path(), day.name};
+        REQUIRE(prepare(c, base, new_d).empty());
+
+        const Applied a = apply_modes(c, ALL_MODES, copied_all_but(day.replayed, gctest::as_written(new_d)));
+        if (!a.bad.empty()) std::printf("    %s\n", day.name.c_str());
+        CHECK(a.bad.empty());
+    }
+}
+
+// A family a day leaves unchanged is copied as its files sit, and each of its
+// files the patch gives a hash of is held to it first: with one byte of such
+// a file changed, its size kept, no mode applies the patch.
+TEST(patch_holds_the_files_of_a_family_it_copies_to_their_hashes) {
+    ScratchDir dir("lowmem-copied-hashes");
+    std::mt19937 rng(20261116);
+    const BuildDir d = every_family(rng);
+    const LowMemCase c{dir.path(), "copied"};
+    REQUIRE(prepare(c, d, d).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    for (const PatchFileId file : HASHED_OLD_FILES) {
+        const std::string name = patch_file_names[static_cast<uint32_t>(file)];
+        const std::string path = c.dir("old") + "/" + name;
+        const std::vector<char> written = read_file(path);
+        REQUIRE(written.size() > 8);
+        std::vector<char> damaged = written;
+        damaged[written.size() / 2] ^= 1;
+        REQUIRE(write_file(path, damaged));
+        CHECK(not_refused(c, ALL_MODES, c.patch(), name, "Old " + name + " is not the one the patch was made from").empty());
+        REQUIRE(write_file(path, written));
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// What the patcher checks of an old family it copies as its files sit,
+// refused in every mode: old files whose footers give the child stream
+// another size than the patch (a street way of three nodes for one of two:
+// the records' bytes are as many), an address family without its index, a
+// place family without its cells file, and in the patch the family's sections
+// a second time, the records' section without the child's after it, and a
+// client list without a file the family holds that no section names. The
+// patch as made applies.
+TEST(patch_refuses_what_it_can_check_of_a_family_it_copies) {
+    ScratchDir dir("lowmem-family-copy-checks");
+    std::mt19937 rng(20261115);
+    const BuildDir base = every_family(rng);
+    const LowMemCase c{dir.path(), "same"};
+    REQUIRE(prepare(c, base, base).empty());
+    const BuildDir written = gctest::as_written(base);
+    const LogCheck copied = copied_all_but({}, written);
+    CHECK(apply_modes(c, ALL_MODES, copied).bad.empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+
+    // The street pair's two sections, the nodes' after the ways'.
+    const std::vector<char> ways = copy_old_section(PatchFileId::STREET_WAYS, base.at("street_ways.bin").size()),
+                            nodes = copy_old_section(PatchFileId::STREET_NODES, base.at("street_nodes.bin").size());
+    std::vector<char> pair = ways;
+    pair.insert(pair.end(), nodes.begin(), nodes.end());
+    const size_t at = find_once(raw, pair);
+    REQUIRE(at != std::string::npos);
+    std::vector<char> twice = raw, childless = raw;
+    twice.insert(twice.begin() + static_cast<std::ptrdiff_t>(at), pair.begin(), pair.end());
+    childless.erase(childless.begin() + static_cast<std::ptrdiff_t>(at + ways.size()),
+                    childless.begin() + static_cast<std::ptrdiff_t>(at + pair.size()));
+    struct Edit {
+        std::string name;
+        std::vector<char> patch;
+        std::string refusal;
+    };
+    for (const Edit& e : {Edit{"twice", twice, "old street_ways.bin opened twice"},
+                          Edit{"childless", childless, "Encoded family: street_nodes.bin does not follow its parent in the patch"},
+                          Edit{"index-unlisted", unlisted(raw, "addr_index.bin"), "addr: the patch lists no addr_index.bin"},
+                          Edit{"cells-unlisted", unlisted(raw, "place_cells.bin"), "places: the patch lists no place_cells.bin"},
+                          Edit{"hidden-unlisted", unlisted(raw, "place_hidden.bin"), "places: the patch lists no place_hidden.bin"}}) {
+        REQUIRE(!e.patch.empty());
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, e.patch));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+    }
+    // Nothing of a family is written before its list is checked.
+    for (const std::string& mode : ALL_MODES) {
+        CHECK(!std::filesystem::exists(c.dir("index-unlisted.out." + mode) + "/addr_points.bin"));
+        CHECK(!std::filesystem::exists(c.dir("cells-unlisted.out." + mode) + "/place_nodes.bin"));
+    }
+
+    auto put = [&](const std::string& name, const std::optional<std::vector<char>>& bytes) {
+        const std::string path = c.dir("old") + "/" + name;
+        std::filesystem::remove(path);
+        if (bytes) REQUIRE(write_file(path, *bytes));
+    };
+    BuildDir longer = {{"street_ways.bin", base.at("street_ways.bin")}, {"street_nodes.bin", base.at("street_nodes.bin")}};
+    put_at(longer["street_ways.bin"], 39 * WAY_HEADER_STRIDE + 4, uint16_t{3});
+    for (const float v : {47.002f, 8.002f}) append(longer["street_nodes.bin"], v);
+    const BuildDir stale = gctest::as_written(longer);
+    for (const char* file : {"street_ways.bin", "street_nodes.bin"}) put(file, stale.at(file));
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "stale-nodes", "old street_nodes.bin decodes to 648 bytes, the patch expects 640").empty());
+    for (const char* file : {"street_ways.bin", "street_nodes.bin"}) put(file, written.at(file));
+
+    put("addr_index.bin", std::nullopt);
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "no-index",
+                      "Malformed address files: a dir with some of addr_points.bin, addr_vertices.bin and addr_index.bin and not all three")
+              .empty());
+    put("addr_index.bin", written.at("addr_index.bin"));
+
+    // A file no footer of the family counts: missed as it is copied.
+    put("place_cells.bin", std::nullopt);
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "no-cells", "place_cells.bin: copy-old failed (src MISSING)").empty());
+    put("place_cells.bin", written.at("place_cells.bin"));
+
+    CHECK(apply_modes(c, ALL_MODES, copied).bad.empty());
 }
 
 // Old child bytes the replay skips are dropped as the shared decoder produces
@@ -1103,7 +1503,7 @@ TEST(patch_lowmem_drops_the_child_bytes_of_deleted_and_replaced_records) {
         const LowMemCase c{dir.path(), name};
         REQUIRE(prepare(c, old_d, new_d).empty());
 
-        CHECK(apply_both_modes(c, decoder_peaks_at_most("poi", DECODER_HOLD)).empty());
+        CHECK(apply_modes(c, ALL_MODES, decoder_peaks_at_most("poi", DECODER_HOLD)).bad.empty());
     }
 }
 
@@ -1130,8 +1530,7 @@ TEST(patch_lowmem_replays_a_long_run_of_tombstones) {
     REQUIRE(prepare(c, old_d, new_d).empty());
 
     CHECK(raw_patch(c).size() < size_t(DEAD + TAIL / 2) * POI_RECORD_STRIDE);
-    CHECK(apply_modes(c, {"plain"}).bad.empty());
-    CHECK(apply_both_modes(c, decoder_peaks_at_most("poi", DECODER_HOLD)).empty());
+    CHECK(apply_modes(c, ALL_MODES, decoder_peaks_at_most("poi", DECODER_HOLD)).bad.empty());
 }
 
 // The 2026-11-03 nightly raised the importance of ~1 planet poi/all record in
@@ -1158,14 +1557,13 @@ TEST(patch_lowmem_replays_records_edited_in_place) {
     const size_t raw = raw_patch(c).size();
     std::printf("    raw patch %zu bytes, %zu records edited\n", raw, n_edited);
     CHECK(raw < n_edited * POI_RECORD_STRIDE * 2);
-    CHECK(apply_modes(c, {"plain"}).bad.empty());
-    CHECK(apply_both_modes(c, decoder_peaks_at_most("poi", DECODER_HOLD)).empty());
+    CHECK(apply_modes(c, ALL_MODES, decoder_peaks_at_most("poi", DECODER_HOLD)).bad.empty());
 }
 
-// An encoded set whose two address files are empty: the diff sends
-// addr_points.bin's (empty) merge with the streets after it and
-// addr_vertices.bin later, as a full replacement. An empty parent has no
-// child bytes to replay with it.
+// A set whose address files hold no address, their three footers: the diff
+// sends addr_points.bin's (empty) merge with the streets after it and
+// addr_vertices.bin later, as a full replacement of no bytes. An empty parent
+// has no child bytes to replay with it.
 TEST(patch_lowmem_applies_to_a_set_with_empty_address_files) {
     ScratchDir dir("lowmem-noaddr");
     std::vector<GeoRow> rows;
@@ -1179,12 +1577,12 @@ TEST(patch_lowmem_applies_to_a_set_with_empty_address_files) {
     const LowMemCase c{dir.path(), "empty-addresses"};
     REQUIRE(prepare(c, old_d, new_d).empty());
 
-    CHECK(apply_both_modes(c).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
 // A parent's REPLACE run (the same street ways, renamed) whose children stay
-// one MATCH run: the old records are dropped as the node reads make the
-// shared decoder produce them, not queued for the whole run (2.4 MB of them).
+// one MATCH run: the replay holds a group's row of the old records, not the
+// whole run (2.4 MB of them).
 TEST(patch_lowmem_drops_the_old_records_of_a_replace_run) {
     ScratchDir dir("lowmem-named");
     std::vector<uint32_t> names(200000), renamed(200000);
@@ -1198,7 +1596,7 @@ TEST(patch_lowmem_drops_the_old_records_of_a_replace_run) {
     const LowMemCase c{dir.path(), "replaced-parents"};
     REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta).empty());
 
-    CHECK(apply_both_modes(c, decoder_peaks_at_most("streets", DECODER_HOLD)).empty());
+    CHECK(apply_modes(c, ALL_MODES, decoder_peaks_at_most("streets", DECODER_HOLD)).bad.empty());
 }
 
 // An INSERT stretch of POI polygons (2 MB of new vertex blocks between kept
@@ -1219,17 +1617,17 @@ TEST(patch_lowmem_encodes_a_poi_insert_stretch_within_its_hold) {
     const LowMemCase c{dir.path(), "poi-insert"};
     REQUIRE(prepare(c, old_d, new_d).empty());
 
-    CHECK(apply_both_modes(c, encoder_peaks_at_most("poi", POI_ENCODER_HOLD)).empty());
+    CHECK(apply_modes(c, ALL_MODES, encoder_peaks_at_most("poi", POI_ENCODER_HOLD)).bad.empty());
 }
 
-// An escaped address footprint (encoding 3, 800K vertices: 6.4 MB) kept
-// between small ones and abs2 ones of ABS2_MAX_VERTICES while the address
-// before them goes, so the replay MATCHes them and moves their
-// vertex_offsets; and another of ABS2_MAX_VERTICES inserted, which reaches
-// the encoder in one write of most of it: the decoder hands the escaped one
-// over and the encoder takes it in pieces, neither holding more than
-// DECODER_HOLD, nor the encoder more than a piece and the largest abs2
-// footprint, which it takes whole.
+// Two escaped address footprints (one in encoding 3, 800K vertices: 6.4 MB;
+// one of a vertex more than a blob holds) kept between small ones and ones of
+// MAX_BLOB_VERTICES while the address before them goes, so the replay MATCHes
+// them and moves their vertex_offsets; and another of MAX_BLOB_VERTICES
+// inserted, which reaches the encoder in one write of most of it: the decoder
+// hands the escaped ones over and the encoder takes them in pieces, neither
+// holding more than DECODER_HOLD, nor the encoder more than a piece and the
+// largest footprint a blob holds, which it takes whole. In every mode.
 TEST(patch_lowmem_copies_an_escaped_footprint_through_in_pieces) {
     ScratchDir dir("lowmem-footprint");
     std::mt19937 rng(20261030);
@@ -1239,9 +1637,10 @@ TEST(patch_lowmem_copies_an_escaped_footprint_through_in_pieces) {
     std::vector<char> escaped = block(rng, 2 * 800000);
     escaped[0] = 3;
     addrs[150].block = escaped;
-    for (const uint32_t i : {60u, 61u, 240u}) addrs[i].block = block(rng, ABS2_MAX_VERTICES);
+    addrs[151].block = block(rng, MAX_BLOB_VERTICES + 1);
+    for (const uint32_t i : {60u, 61u, 240u}) addrs[i].block = block(rng, MAX_BLOB_VERTICES);
     std::vector<Addr> fewer_addrs(addrs.begin() + 1, addrs.end());
-    fewer_addrs.insert(fewer_addrs.begin() + 200, Addr{48.0f, block(rng, ABS2_MAX_VERTICES)});
+    fewer_addrs.insert(fewer_addrs.begin() + 200, Addr{48.0f, block(rng, MAX_BLOB_VERTICES)});
     BuildDir old_d, new_d;
     put_addrs(old_d, addrs);
     put_addrs(new_d, fewer_addrs);
@@ -1249,10 +1648,10 @@ TEST(patch_lowmem_copies_an_escaped_footprint_through_in_pieces) {
     REQUIRE(prepare(c, old_d, new_d).empty());
     const LogCheck decoder = decoder_peaks_at_most("addr", DECODER_HOLD), encoder = encoder_peaks_at_most("addr", ADDR_ENCODER_HOLD);
 
-    CHECK(apply_both_modes(c, [&](const std::string& log) {
+    CHECK(apply_modes(c, ALL_MODES, [&](const std::string& log) {
               const std::string e = decoder(log);
               return e.empty() ? encoder(log) : e;
-          }).empty());
+          }).bad.empty());
 }
 
 // The memory checks of the replay tests above, on report lines as the
@@ -1534,8 +1933,8 @@ TEST(patch_heap_stays_flat_as_geo_cells_change) {
     }, 20000).empty());
 }
 
-// The plain patcher's walk over a geo index of 60,000 cells whose street
-// lists all change (a blocks file of ~190 KiB, past a read window) holds a
+// The patcher's walk over a geo index of 60,000 cells whose street lists
+// all change (a blocks file of ~190 KiB, past a read window) holds a
 // read window for the old blocks and a few pages besides: the old top file
 // and the group footers, read 12 and 768 bytes at a time, each through a
 // page, and the new blocks handed to the output's FILE buffer a page at a
@@ -1564,12 +1963,12 @@ TEST(patch_heap_of_the_geo_walk_is_a_read_window_and_a_few_pages) {
         REQUIRE(prepare(c, old_d, new_d).empty());
         blocks[s] = read_file(c.dir("old") + "/geo_entries.bin").size();
         if (s == 1) REQUIRE(blocks[s] > 2 * SEQUENTIAL_READ_BUFFER_BYTES);
-        const Applied a = apply_modes(c, {"plain"});
+        const Applied a = apply_modes(c, {"sync"});
         CHECK(a.bad.empty());
-        REQUIRE(a.heap_peaks.count("plain"));
-        peaks[s] = a.heap_peaks.at("plain");
+        REQUIRE(a.heap_peaks.count("sync"));
+        peaks[s] = a.heap_peaks.at("sync");
     }
-    std::printf("    plain: heap peak %llu B over an empty geo index, %llu B over %u cells of %llu B of blocks (%lld B above)\n",
+    std::printf("    heap peak %llu B over an empty geo index, %llu B over %u cells of %llu B of blocks (%lld B above)\n",
                 (unsigned long long)peaks[0], (unsigned long long)peaks[1], sizes[1], (unsigned long long)blocks[1],
                 (long long)peaks[1] - (long long)peaks[0]);
     CHECK(peaks[1] <= peaks[0] + SEQUENTIAL_READ_BUFFER_BYTES + (48 << 10));
@@ -1632,11 +2031,12 @@ TEST(patch_heap_stays_flat_as_poi_cells_change) {
 // Eight POI cells that share one list of n POIs (as a dense city's poi/all
 // cells do) and a ninth whose POI changes: the patcher holds a long list as
 // few times as the rebuild needs (the old index's row, the writer's previous
-// list and its encoding), so from n = 6,000 to 60,000 its heap peak, plain
-// and sync, grows by at most three times the ids added (2.7 and 1.2 times).
-// It grew by 4.7 and 3.4 times them when the old index's reader kept its own
-// copy of a shared list, and the rebuild a second list it swapped with the
-// reader's. Skipped without a heap shim (the sanitizer build).
+// list and its encoding), so from n = 6,000 to 60,000 its heap peak grows by
+// at most three times the ids added (2.42 times; the POI files, which stay,
+// are copied and hold nothing). It grew by 4.7 times them when the old
+// index's reader kept its own copy of a shared list, and the rebuild a second
+// list it swapped with the reader's. Skipped without a heap shim (the
+// sanitizer build).
 TEST(patch_heap_holds_a_long_shared_poi_cell_list_at_most_three_times) {
     if (!gctest::heap_peak_shim()) {
         std::printf("    SKIP heap peaks: no heap shim under the sanitizers\n");
@@ -1646,7 +2046,7 @@ TEST(patch_heap_holds_a_long_shared_poi_cell_list_at_most_three_times) {
     std::mt19937 rng(20261110);
     const uint32_t sizes[] = {6000, 60000};
     const auto pois = pois_of(rng, sizes[1] + 2, 0, true);
-    std::map<std::string, uint64_t> peaks[2];
+    uint64_t peaks[2] = {};
     for (size_t s = 0; s < 2; s++) {
         const LowMemCase c{dir.path(), "n" + std::to_string(sizes[s])};
         std::vector<uint32_t> shared(sizes[s]);
@@ -1661,19 +2061,16 @@ TEST(patch_heap_holds_a_long_shared_poi_cell_list_at_most_three_times) {
         put_cells(old_d, "poi", old_cells);
         put_cells(new_d, "poi", new_cells);
         REQUIRE(prepare(c, old_d, new_d).empty());
-        const Applied a = apply_modes(c, {"plain", "sync"});
+        const Applied a = apply_modes(c, {"sync"});
         CHECK(a.bad.empty());
-        peaks[s] = a.heap_peaks;
+        REQUIRE(a.heap_peaks.count("sync"));
+        peaks[s] = a.heap_peaks.at("sync");
     }
-    const uint64_t added = 4 * uint64_t(sizes[1] - sizes[0]);
-    for (const std::string mode : {"plain", "sync"}) {
-        REQUIRE(peaks[0].count(mode) && peaks[1].count(mode));
-        const uint64_t from = peaks[0][mode], to = peaks[1][mode];
-        std::printf("    %s: heap peak %llu B at n = %u, %llu B at n = %u (%.2f times the %llu B of ids added)\n",
-                    mode.c_str(), (unsigned long long)from, sizes[0], (unsigned long long)to, sizes[1],
-                    to > from ? double(to - from) / double(added) : 0.0, (unsigned long long)added);
-        CHECK(to <= from + 3 * added);
-    }
+    const uint64_t added = 4 * uint64_t(sizes[1] - sizes[0]), from = peaks[0], to = peaks[1];
+    std::printf("    heap peak %llu B at n = %u, %llu B at n = %u (%.2f times the %llu B of ids added)\n", (unsigned long long)from,
+                sizes[0], (unsigned long long)to, sizes[1], to > from ? double(to - from) / double(added) : 0.0,
+                (unsigned long long)added);
+    CHECK(to <= from + 3 * added);
 }
 
 namespace {
@@ -1875,6 +2272,86 @@ TEST(patch_heap_stays_flat_as_streets_move) {
     }, 10000).empty());
 }
 
+// Two side files of n values that follow no records: way_parents.bin, a
+// value in a thousand another on the new day (a sparse delta over the old
+// values), and way_postcodes.bin, which the old day lacks (a full replacement,
+// handed to its encoder whole). The codecs hold a block of either, and each
+// new file's block table waits in its scratch file.
+TEST(patch_heap_stays_flat_as_side_files_grow) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::vector<char> parents, changed, postcodes;
+        for (uint32_t v = 0; v < n; v++) {
+            append(parents, v % 50000);
+            append(changed, v % 50000 + (v % 1000 == 7));
+            append(postcodes, v / 3 * 8);
+        }
+        if (std::string e = prepare(c, {{"way_parents.bin", parents}}, {{"way_parents.bin", changed}, {"way_postcodes.bin", postcodes}});
+            !e.empty())
+            return e;
+        // way_postcodes.bin's section: a full replacement (stride 0, no
+        // fixups) of no old values by the new ones' bytes.
+        std::vector<char> head;
+        append(head, static_cast<uint32_t>(PatchFileId::WAY_POSTCODES));
+        append(head, 0u);
+        append(head, uint64_t{0});
+        append(head, uint64_t{4} * n);
+        append(head, 0u);
+        append(head, uint64_t{4} * n);
+        return patch_holds(c, head, "full replacement of " + std::to_string(n) + " values");
+    }, 400000).empty());
+}
+
+// n address points, two in three with a footprint of 1 to 8 vertices, and
+// the new day's without every fiftieth: the address merge keeps runs of 49
+// records, whose footprints the replay takes from the old stream. The codecs
+// hold a block's records, one footprint and an index row of either day's
+// files.
+TEST(patch_heap_stays_flat_as_addresses_grow) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::mt19937 rng(20261114);
+        std::vector<Addr> addrs, kept;
+        for (uint32_t i = 0; i < n; i++) {
+            const std::vector<char> footprint = i % 3 == 0 ? std::vector<char>{} : block(rng, 1 + rng() % 8);
+            addrs.push_back({47.0f + static_cast<float>(i) * 1e-4f, footprint});
+            if (i % 50 != 7) kept.push_back(addrs.back());
+        }
+        BuildDir old_d, new_d;
+        put_addrs(old_d, addrs);
+        put_addrs(new_d, kept);
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        // The address points' merge: n old records, n less a fiftieth new.
+        std::vector<char> head;
+        append(head, static_cast<uint32_t>(PatchFileId::ADDR_POINTS));
+        append(head, static_cast<uint32_t>(ADDR_POINT_STRIDE));
+        append(head, uint64_t{ADDR_POINT_STRIDE} * n);
+        append(head, uint64_t{ADDR_POINT_STRIDE} * kept.size());
+        return patch_holds(c, head, "merge of " + std::to_string(n) + " address points");
+    }, 100000).empty());
+}
+
+// A family a day leaves as it is, n street ways of two nodes with a parent
+// each: its files go from the old dir to the new one as they sit, through no
+// codec, and the patcher holds none of them.
+TEST(patch_heap_stays_flat_as_a_copied_family_grows) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        BuildDir d, meta;
+        std::vector<uint32_t> names(n);
+        std::vector<char> parents;
+        for (uint32_t w = 0; w < n; w++) {
+            names[w] = w % 1000;
+            append(parents, w % 50000);
+        }
+        put_named_ways(d, meta, names);
+        d["way_parents.bin"] = parents;
+        if (std::string e = prepare(c, d, d); !e.empty()) return e;
+        // The street pair's two sections, each sent as unchanged.
+        std::vector<char> pair = copy_old_section(PatchFileId::STREET_WAYS, uint64_t{WAY_HEADER_STRIDE} * n);
+        const std::vector<char> nodes = copy_old_section(PatchFileId::STREET_NODES, uint64_t{16} * n);
+        pair.insert(pair.end(), nodes.begin(), nodes.end());
+        return patch_holds(c, pair, "unchanged street pair of " + std::to_string(n) + " ways");
+    }, 100000).empty());
+}
+
 // The diff sends the moved strings as pairs up to its cap and as string
 // fixups past it (GCPATCH v12): 99 moved POI names go as 99 pairs under a cap
 // of 99, and as the POI merge's 99 string fixups, with no pair, under a cap of
@@ -1908,8 +2385,8 @@ TEST(patch_diff_sends_moved_strings_as_string_fixups_past_the_pair_cap) {
 
 // The POI string tier in record order (GCPATCH v9): the new pool moves a name
 // out of sorted order (zoo cafe bank -> zoo bank cafe tea), so the tier's
-// diff sends new indices and a moved-string pair, and the encoded POI records
-// take the remapped names as the plain patcher's do.
+// diff sends new indices and a moved-string pair, and the POI records take
+// the remapped names.
 TEST(patch_lowmem_rebuilds_a_string_tier_in_any_order) {
     ScratchDir dir("lowmem-strings");
     std::mt19937 rng(20261027);
@@ -1925,16 +2402,13 @@ TEST(patch_lowmem_rebuilds_a_string_tier_in_any_order) {
     const LowMemCase c{dir.path(), "strings"};
     REQUIRE(prepare(c, old_d, new_d).empty());
 
-    CHECK(apply_both_modes(c).empty());
-    auto r = run_tool({GEOCODER_GC_BIN, "decode", c.dir("out.sync"), c.dir("out.dec")}, c.log());
-    REQUIRE(r.ok);
-    CHECK(read_dir(c.dir("out.dec")) == read_dir(c.dir("new")));
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
-// A new set without an encoded family's files (the POI family, both files
-// gone) gets a gc.manifest naming only the families it ships, as gc's
-// encoding of the new dir does, and decodes to the new dir.
-TEST(patch_lowmem_new_manifest_names_only_the_families_the_patch_ships) {
+// A new dir without an encoded family's files (the POI family, both files
+// gone) gets none of them, in every mode: the patch lists neither, so what
+// their sections replay to goes to the patcher's scratch dir.
+TEST(patch_lowmem_writes_no_file_of_a_family_the_new_dir_lacks) {
     ScratchDir dir("lowmem-family");
     std::mt19937 rng(20261027);
     std::vector<GeoRow> rows;
@@ -1946,31 +2420,59 @@ TEST(patch_lowmem_new_manifest_names_only_the_families_the_patch_ships) {
     const LowMemCase c{dir.path(), "removed-family"};
     REQUIRE(prepare(c, old_d, new_d).empty());
 
-    CHECK(apply_both_modes(c).empty());
-    auto r = run_tool({GEOCODER_GC_BIN, "decode", c.dir("out.sync"), c.dir("out.dec")}, c.log());
-    CHECK(r.ok);
-    CHECK(r.ok && read_dir(c.dir("out.dec")) == new_d);
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
-// A new set with part of an encoded family (the address family without its
-// addr_vertices.bin) is refused before the replay.
+// A new set with part of an encoded family is refused, in every mode: a
+// client file list without the address family's addr_vertices.bin before the
+// replay, and one without its addr_index.bin, which no section names, before
+// an address file is written. The builder writes the three or none, so the
+// lists are the diff's with an entry cut out. The patch as made applies.
 TEST(patch_lowmem_refuses_a_new_set_with_part_of_a_family) {
     ScratchDir dir("lowmem-part");
     std::mt19937 rng(20261027);
-    BuildDir old_d;
+    BuildDir old_d, new_d;
     put_addr_family(old_d, rng, 40);
-    BuildDir new_d = old_d;
-    new_d.erase("addr_vertices.bin");
-    const LowMemCase c{dir.path(), "without-addr_vertices.bin"};
+    put_addr_family(new_d, rng, 40);
+    const LowMemCase c{dir.path(), "part"};
     REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    // The list follows the magic, the version and the flags: its marker, its
+    // count, then each file's name length, name, size and inline byte.
+    const size_t list_at = 16;
+    uint32_t marker = 0, listed = 0;
+    REQUIRE(raw.size() > list_at + 8);
+    memcpy(&marker, raw.data() + list_at, 4);
+    memcpy(&listed, raw.data() + list_at + 4, 4);
+    REQUIRE(marker == CLIENT_FILES_MARKER);
+    struct Cut {
+        std::string file, refusal;
+    };
+    for (const Cut& e : {Cut{"addr_vertices.bin", "family addr: the patch ships 1 of its 2 files"},
+                         Cut{"addr_index.bin", "addr: the patch lists no addr_index.bin"}}) {
+        std::vector<char> entry;
+        append(entry, static_cast<uint16_t>(e.file.size()));
+        entry.insert(entry.end(), e.file.begin(), e.file.end());
+        const size_t at = find_once(raw, entry);
+        REQUIRE(at != std::string::npos);
+        std::vector<char> cut = raw;
+        cut.erase(cut.begin() + static_cast<std::ptrdiff_t>(at),
+                  cut.begin() + static_cast<std::ptrdiff_t>(at + entry.size() + 8 + 1));
+        put_at(cut, list_at + 4, listed - 1);
+        const std::string patch = c.dir(e.file + ".gcpatch");
+        REQUIRE(write_patch(c, patch, cut));
 
-    CHECK(not_refused(c, ENCODED_MODES, c.patch(), "part", "family addr: the patch ships 1 of its 2 files").empty());
+        CHECK(not_refused(c, ALL_MODES, patch, "without-" + e.file, e.refusal).empty());
+        for (const std::string& mode : ALL_MODES)
+            CHECK(!std::filesystem::exists(c.dir("without-" + e.file + ".out." + mode) + "/addr_points.bin"));
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
-// A MATCH run longer than what is left of the old file is refused in the
-// low-memory mode too: the last run of POI records (replayed with their
-// child), 5 longer, as the plain replay refuses it; of their vertices (the
-// child stream, which the records size), as bytes past the last record.
+// A MATCH run longer than what is left of the old file is refused in every
+// mode: the last run of POI records (replayed with their child), 5 longer;
+// of their vertices (the child stream, which the records size), as bytes
+// past the last record.
 TEST(patch_lowmem_refuses_a_match_run_past_the_old_file) {
     ScratchDir dir("lowmem-match");
     std::mt19937 rng(20261027);
@@ -2003,13 +2505,13 @@ TEST(patch_lowmem_refuses_a_match_run_past_the_old_file) {
         const std::string patch = c.dir(e.name + ".gcpatch");
         REQUIRE(write_patch(c, patch, longer));
 
-        CHECK(not_refused(c, ENCODED_MODES, patch, e.name, e.refusal).empty());
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
     }
-    CHECK(apply_both_modes(c).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
 // A merge of an encoded family's parent at a stride other than its records'
-// is refused before the replay, in sync and --threads: addresses at 24 bytes
+// is refused before the replay, in every mode: addresses at 24 bytes
 // (the string and vertex_offset fields fit, the vertex_count at 24 that sizes
 // a record's child bytes does not; with the first footprint deleted, the
 // first record replayed moves its vertex_offset, so it is rewritten in a
@@ -2056,14 +2558,14 @@ TEST(patch_lowmem_refuses_a_parent_stride_other_than_its_records) {
         const std::string patch = c.dir(name + ".gcpatch");
         REQUIRE(write_patch(c, patch, edited));
 
-        CHECK(not_refused(c, ENCODED_MODES, patch, name, "Malformed record stride: " + name).empty());
+        CHECK(not_refused(c, ALL_MODES, patch, name, "Malformed record stride: " + name).empty());
     }
-    CHECK(apply_both_modes(c).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
 // The street ways' merge (MATCH, REPLACE and INSERT runs, replayed with their
 // nodes) with a run's count 2^30 past the patch's, or the merge sequence's or
-// the nodes section's length 2^32 past it, is refused, in sync and --threads.
+// the nodes section's length 2^32 past it, is refused in every mode.
 // A 32-bit size_t wraps 12 x 2^30 and 2^32 to nothing: the lengths read as the
 // patch's, and a run sized as the patch's replayed its records one by one past
 // it.
@@ -2132,9 +2634,9 @@ TEST(patch_lowmem_refuses_counts_and_lengths_that_wrap_32_bits) {
         const std::string patch = c.dir(e.name + ".gcpatch");
         REQUIRE(write_patch(c, patch, edited));
 
-        CHECK(not_refused(c, ENCODED_MODES, patch, e.name, e.refusal).empty());
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
     }
-    CHECK(apply_both_modes(c).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
 // The POI replay copies an old block only for a new record at its old
@@ -2201,7 +2703,7 @@ TEST(patch_encodes_the_poi_blocks_it_cannot_copy) {
         const std::string patch = c.dir(std::string(name) + ".gcpatch"), out = c.dir(std::string("out.") + name);
         REQUIRE(write_patch(c, patch, edited));
         std::filesystem::remove_all(out);
-        const auto r = run_tool(patch_words(c, "plain", patch, out), c.log());
+        const auto r = run_tool(patch_words(c, "sync", patch, out), c.log());
         CHECK(r.ok);
         for (const char* f : {"poi_records.bin", "poi_vertices.bin"}) CHECK(read_file(out + "/" + f) == want.at(f));
         if (gctest::failures() > failures_before) std::printf("    in the %s day\n", name);
@@ -2555,6 +3057,135 @@ TEST(patch_refuses_cell_index_delta_ranks_that_wrap_32_bits) {
         {"gone", cell_delta_payload({two32 + 2}, {}, {}, {}), "Malformed cell list delta: a gone rank past the last source cell"},
         {"count", counted, "Malformed cell list delta"},
     });
+}
+
+// An old side file the builder would not write (its first block's mode byte
+// is neither of the two) is refused by name in every mode as the patcher
+// reads its values, though its footer gives the size the patch expects. The
+// patch applies to the file as written.
+TEST(patch_refuses_an_old_side_file_the_builder_would_not_write) {
+    ScratchDir dir("patch-old-side");
+    std::vector<char> parents, changed;
+    for (uint32_t v = 0; v < 4096; v++) {
+        append(parents, v);
+        append(changed, v + (v == 2000));
+    }
+    const LowMemCase c{dir.path(), "side"};
+    REQUIRE(prepare(c, {{"way_parents.bin", parents}}, {{"way_parents.bin", changed}}).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    std::vector<char> file = read_file(c.dir("old") + "/way_parents.bin");
+    REQUIRE(!file.empty() && file[0] == 0);
+    file[0] = 2;
+    REQUIRE(write_file(c.dir("old") + "/way_parents.bin", file));
+
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "mode-byte", "Malformed way_parents.bin: block 0 is neither FOR nor a dictionary").empty());
+}
+
+// Old street files the builder would not write are refused by name in every
+// mode as the patcher reads them, though their footers give the sizes the
+// patch expects: a group's row whose blocks start a byte past where the
+// blocks before them end, and a nodes file a byte short of its last block. A
+// dir with one file of the pair is refused before anything is read. The patch
+// applies to the files as written.
+TEST(patch_refuses_old_way_files_the_builder_would_not_write) {
+    ScratchDir dir("patch-old-ways");
+    std::vector<uint32_t> names(40), renamed(40);
+    for (uint32_t i = 0; i < 40; i++) {
+        names[i] = i;
+        renamed[i] = i == 30 ? 1000 : i;
+    }
+    BuildDir old_d, new_d, old_meta, new_meta;
+    put_named_ways(old_d, old_meta, names);
+    put_named_ways(new_d, new_meta, renamed);
+    const LowMemCase c{dir.path(), "ways"};
+    REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    const std::vector<char> rows = read_file(c.dir("old") + "/street_ways.bin"), nodes = read_file(c.dir("old") + "/street_nodes.bin");
+    // Three groups' rows, 12 bytes and 8 a way, and the footer.
+    REQUIRE(rows.size() == 2 * (12 + 16 * 8) + (12 + 8 * 8) + 8 && nodes.size() > 16);
+    auto put = [&](const char* name, const std::optional<std::vector<char>>& bytes) {
+        const std::string path = c.dir("old") + "/" + name;
+        std::filesystem::remove(path);
+        if (bytes) REQUIRE(write_file(path, *bytes));
+    };
+    std::vector<char> moved = rows, cut = nodes;
+    moved[12 + 16 * 8]++;
+    cut.erase(cut.end() - 17);
+    struct Edit {
+        std::string name;
+        const char* file;
+        std::optional<std::vector<char>> bytes;
+        std::string refusal;
+    };
+    for (const Edit& e : {Edit{"row", "street_ways.bin", moved, "street_ways.bin group 1 is not where the blocks before it end"},
+                          Edit{"block", "street_nodes.bin", cut, "street_nodes.bin ends inside the block of way 39"},
+                          Edit{"half", "street_nodes.bin", std::nullopt, "street_ways.bin without street_nodes.bin"}}) {
+        put(e.file, e.bytes);
+
+        CHECK(not_refused(c, ALL_MODES, c.patch(), e.name, "Malformed way files: " + e.refusal).empty());
+
+        put("street_ways.bin", rows);
+        put("street_nodes.bin", nodes);
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// Old address files the builder would not write are refused by name in every
+// mode, though their footers give the sizes the patch expects: a block the
+// index puts a byte past where the blocks before it end, a first block with
+// a flag no block has, and a vertices file a byte short of its last blob. A
+// footer that gives a logical footprint stream a byte past what a patch
+// indexes, and a dir with two of the three files, are refused before a block
+// is read. The patch applies to the files as written.
+TEST(patch_refuses_old_address_files_the_builder_would_not_write) {
+    ScratchDir dir("patch-old-addrs");
+    std::mt19937 rng(20261114);
+    std::vector<Addr> addrs;
+    for (uint32_t i = 0; i < 40; i++)
+        addrs.push_back({47.0f + static_cast<float>(i) * 1e-4f, i % 3 == 2 ? std::vector<char>{} : block(rng, 3 + rng() % 8)});
+    std::vector<Addr> fewer_addrs(addrs.begin() + 1, addrs.end());
+    BuildDir old_d, new_d;
+    put_addrs(old_d, addrs);
+    put_addrs(new_d, fewer_addrs);
+    const LowMemCase c{dir.path(), "addrs"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    const char* const names[] = {"addr_points.bin", "addr_vertices.bin", "addr_index.bin"};
+    std::map<std::string, std::vector<char>> written;
+    for (const char* name : names) written[name] = read_file(c.dir("old") + "/" + name);
+    // One superblock's row, 16 bytes and 6 a block, and the footer.
+    REQUIRE(written["addr_index.bin"].size() == 16 + 3 * 6 + 8 && written["addr_vertices.bin"].size() > 16);
+    auto put = [&](const std::string& name, const std::optional<std::vector<char>>& bytes) {
+        const std::string path = c.dir("old") + "/" + name;
+        std::filesystem::remove(path);
+        if (bytes) REQUIRE(write_file(path, *bytes));
+    };
+    std::vector<char> moved = written["addr_index.bin"], flagged = written["addr_points.bin"], cut = written["addr_vertices.bin"];
+    std::vector<char> past = written["addr_vertices.bin"];
+    moved[16 + 6]++;
+    flagged[0] = static_cast<char>(0x80);
+    cut.erase(cut.end() - 17);
+    put_at(past, past.size() - 16, uint64_t{FILE_RECORDS_MAX} + 1);
+    struct Edit {
+        std::string name, file;
+        std::optional<std::vector<char>> bytes;
+        std::string refusal;
+    };
+    for (const Edit& e :
+         {Edit{"index", "addr_index.bin", moved, "addr_index.bin block 1 is not where the blocks and the blobs before it end"},
+          Edit{"block", "addr_points.bin", flagged, "addr_points.bin block 0 has a flag no block has"},
+          Edit{"blob", "addr_vertices.bin", cut, "addr_vertices.bin ends inside the blob of record 39"},
+          Edit{"limit", "addr_vertices.bin", past,
+               "a logical addr_vertices.bin of 4294967295 bytes is more than the 4294967294 a patch can index"},
+          Edit{"part", "addr_index.bin", std::nullopt,
+               "a dir with some of addr_points.bin, addr_vertices.bin and addr_index.bin and not all three"}}) {
+        put(e.file, e.bytes);
+
+        CHECK(not_refused(c, ALL_MODES, c.patch(), e.name, "Malformed address files: " + e.refusal).empty());
+
+        for (const char* name : names) put(name, written[name]);
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
 // A client file list of more files than a variant holds (1025, past
@@ -3323,13 +3954,10 @@ TEST(patch_refuses_a_stale_old_string_tier) {
     new_d["strings_core.bin"].assign(new_pool.begin(), new_pool.end());
     const LowMemCase c{dir.path(), "stale"};
     REQUIRE(prepare(c, old_d, new_d).empty());
-    // The old dir's tier and the encoded set's (a link to it, or a copy):
-    // whether both were written.
+    // The old dir's tier: whether it was written.
     auto put_old_pool = [&](const std::string& pool) {
         const std::vector<uint8_t> f = string_files::encode(pool.data(), pool.size());
-        const char* p = reinterpret_cast<const char*>(f.data());
-        return write_file(c.dir("old") + "/strings_core.bin", p, f.size()) &&
-               write_file(c.dir("old.enc") + "/strings_core.bin", p, f.size());
+        return write_file(c.dir("old") + "/strings_core.bin", reinterpret_cast<const char*>(f.data()), f.size());
     };
     std::string letter = old_pool, fewer = old_pool;
     letter[3] = 'E';
@@ -3351,11 +3979,9 @@ TEST(patch_refuses_a_stale_old_string_tier) {
         f.back() = '3';  // FCC3
         const char* p = reinterpret_cast<const char*>(f.data());
         REQUIRE(write_file(c.dir("old") + "/strings_core.bin", p, f.size()));
-        REQUIRE(write_file(c.dir("old.enc") + "/strings_core.bin", p, f.size()));
         CHECK(not_refused(c, ALL_MODES, c.patch(), "not-fcc2", "Malformed old strings_core.bin: no FCC2 footer").empty());
     }
     REQUIRE(unlink((c.dir("old") + "/strings_core.bin").c_str()) == 0);
-    REQUIRE(unlink((c.dir("old.enc") + "/strings_core.bin").c_str()) == 0);
     CHECK(not_refused(c, ALL_MODES, c.patch(), "missing", stale + " (missing)").empty());
     REQUIRE(put_old_pool(old_pool));
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
@@ -3380,12 +4006,12 @@ TEST(patch_refuses_a_frame_declaring_content_past_32_bits) {
     CHECK(logged(r, sizeof(size_t) > 4 ? "Bad magic" : "Failed to decompress"));
 }
 
-// An option other than --threads (a staged apply's --only, on an encoded
-// installed set among them) is refused before anything is written.
+// An option other than --threads (a staged apply's --only among them) is
+// refused before anything is written.
 TEST(patch_refuses_an_unknown_option) {
     ScratchDir dir("patch-option");
     const std::string& root = dir.path();
-    REQUIRE(write_dir(root + "/cur", {{"gc.manifest", {}}}));
+    REQUIRE(write_dir(root + "/cur", {}));
     REQUIRE(write_file(root + "/p.gcpatch", std::vector<char>{'n', 'o', 't'}));
 
     auto r = run_tool({GEOCODER_PATCH_BIN, root + "/cur", root + "/p.gcpatch", "-o", root + "/out", "--only", "street_ways.bin"},
@@ -3413,8 +4039,8 @@ TEST(patch_creates_the_output_dir_as_named) {
 
 // An output dir that holds a file already is refused before anything is
 // written, so no output can be a current file (a hard link or a symlink to
-// one, in a plain or an encoded set) and the current set keeps its bytes;
-// and so is the current dir itself.
+// one) and the current dir keeps its bytes; and so is the current dir
+// itself.
 TEST(patch_refuses_an_output_dir_holding_files) {
     ScratchDir dir("patch-alias");
     const std::string& root = dir.path();
@@ -3427,13 +4053,14 @@ TEST(patch_refuses_an_output_dir_holding_files) {
     REQUIRE(prepare(c, {{"way_parents.bin", parents}, {"meta.json", {'{', '}'}}},
                     {{"way_parents.bin", changed}, {"meta.json", {'{', ' ', '}'}}}).empty());
     struct Alias {
-        std::string cur, name;
+        std::string name;
         bool symlink;
     };
+    const std::string cur = c.dir("old");
     int n = 0;
-    for (const Alias& a : {Alias{"old", "meta.json", false}, Alias{"old", "way_parents.bin", true},
-                           Alias{"old.enc", "way_parents.u24", false}, Alias{"old.enc", "gc.manifest", true}}) {
-        const std::string cur = c.dir(a.cur), out = root + "/out" + std::to_string(n++);
+    for (const Alias& a : {Alias{"meta.json", false}, Alias{"meta.json", true}, Alias{"way_parents.bin", false},
+                           Alias{"way_parents.bin", true}}) {
+        const std::string out = root + "/out" + std::to_string(n++);
         std::filesystem::create_directories(out);
         if (a.symlink) std::filesystem::create_symlink(cur + "/" + a.name, out + "/" + a.name);
         else std::filesystem::create_hard_link(cur + "/" + a.name, out + "/" + a.name);
@@ -3445,13 +4072,13 @@ TEST(patch_refuses_an_output_dir_holding_files) {
         CHECK(logged(r, "Output dir is not empty"));
         CHECK(read_dir(cur) == before);
     }
-    const BuildDir before = read_dir(c.dir("old.enc"));
+    const BuildDir before = read_dir(cur);
 
-    auto r = run_tool({GEOCODER_PATCH_BIN, c.dir("old.enc"), c.patch(), "-o", c.dir("old.enc")}, c.log());
+    auto r = run_tool({GEOCODER_PATCH_BIN, cur, c.patch(), "-o", cur}, c.log());
 
     CHECK(!r.ok);
     CHECK(logged(r, "Output dir must differ from the current dir"));
-    CHECK(read_dir(c.dir("old.enc")) == before);
+    CHECK(read_dir(cur) == before);
 }
 
 // A TMPDIR too small for the decompressed patch fails the run with an error
@@ -3722,12 +4349,11 @@ TEST(patch_lowmem_round_trips_an_admin_minimal_arc_dir) {
     CHECK(apply_modes(c, ALL_MODES, merged_by_slot(old_d, new_d)).bad.empty());
 }
 
-// An encoded family (the address points, encoded by geocoder-gc) beside the
-// plain arc files: the low-memory mode replays the family through its codecs
-// and the arc files as plain merge sections, and the new set is gc's encoding
-// of the new dir, byte for byte. The parent sent the admin geometry files
-// whole.
-TEST(patch_lowmem_applies_an_encoded_set_beside_plain_arc_files) {
+// The address files beside the plain arc files: every mode replays the
+// address family through its codecs and the arc files as plain merge
+// sections, and the new dir holds the address files as the builder writes
+// them, byte for byte. The parent sent the admin geometry files whole.
+TEST(patch_lowmem_applies_the_address_files_beside_plain_arc_files) {
     ScratchDir dir("lowmem-arcs-beside");
     std::mt19937 rng(20261103);
     const ArcGeometry old_g = arc_geometry(rng, 60, 200);
@@ -3741,13 +4367,12 @@ TEST(patch_lowmem_applies_an_encoded_set_beside_plain_arc_files) {
     put_addr_family(new_d, rng, 300);
     const LowMemCase c{dir.path(), "beside"};
     REQUIRE(prepare(c, old_d, new_d).empty());
-    REQUIRE(read_dir(c.dir("old.enc")).count("addr_points.col") == 1);
 
     const LogCheck merged = merged_by_slot(old_d, new_d);
-    CHECK(apply_both_modes(c, [&](const std::string& log) -> std::string {
+    CHECK(apply_modes(c, ALL_MODES, [&](const std::string& log) -> std::string {
               if (log.find("encode addr:") == std::string::npos) return "no encode addr line";
               return merged(log);
-          }).empty());
+          }).bad.empty());
 }
 
 // One interior vertex of one arc moved, its box and every delta's length
@@ -4125,33 +4750,6 @@ TEST(patch_heap_stays_flat_as_rings_change) {
     }, 20000).empty());
 }
 
-// The low-memory admin family (layout B of admin_vertices.bin) is gone: an
-// encoded set whose gc.manifest names it is refused by the patcher in either
-// encoded mode and by geocoder-gc's decode, never read as a set without it.
-// The parent took the family, and applied the patch beside it.
-TEST(patch_lowmem_refuses_a_manifest_naming_the_admin_family) {
-    ScratchDir dir("lowmem-admin-family");
-    std::mt19937 rng(20261103);
-    BuildDir old_d, new_d;
-    put_addr_family(old_d, rng, 40);
-    put_addr_family(new_d, rng, 40);
-    const LowMemCase c{dir.path(), "admin-family"};
-    REQUIRE(prepare(c, old_d, new_d).empty());
-    const std::string manifest = c.dir("old.enc") + "/gc.manifest";
-    const std::vector<char> was = read_file(manifest);
-    std::string text(was.begin(), was.end());
-    const size_t at = text.find("gc.families streets,addr\n");
-    REQUIRE(at != std::string::npos);
-    text.replace(at, 25, "gc.families streets,addr,admin\n");
-    REQUIRE(write_file(manifest, std::vector<char>(text.begin(), text.end())));
-    const std::string refusal = "unknown family admin in gc.manifest";
-
-    CHECK(not_refused(c, ENCODED_MODES, c.patch(), "admin-family", refusal).empty());
-    const ToolRun decoded = run_tool({GEOCODER_GC_BIN, "decode", c.dir("old.enc"), c.dir("old.dec")}, c.log());
-    CHECK(!decoded.ok);
-    CHECK(logged(decoded, refusal));
-}
-
 // v14's parent-id remap is its street leg alone: one carrying v13's three
 // (an admin leg before the street leg, a postcode leg after it), empty or
 // with an admin pair, is refused in every mode, its stray words read as a
@@ -4187,5 +4785,3082 @@ TEST(patch_refuses_a_three_leg_parent_id_remap) {
 
         CHECK(not_refused(c, ALL_MODES, patch, e.name, "Unknown file 0").empty());
     }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// --- A way pair replayed on its files as they sit (tools/way_replay.h) ---
+
+namespace {
+
+const way_files::Kind* const BOTH_WAY_KINDS[] = {&way_files::STREETS, &way_files::INTERPS};
+
+PatchFileId ways_id(const way_files::Kind& kind) { return kind.interp ? PatchFileId::INTERP_WAYS : PatchFileId::STREET_WAYS; }
+PatchFileId nodes_id(const way_files::Kind& kind) { return kind.interp ? PatchFileId::INTERP_NODES : PatchFileId::STREET_NODES; }
+
+// A way of a pair: a street's name, or an interpolation's street, numbers
+// and kind, and its nodes, a lat and a lng each as f32 bits.
+struct Way {
+    uint32_t name = 0, start = 0, end = 0;
+    uint8_t interpolation = 0;
+    std::vector<uint32_t> nodes;
+    uint16_t count() const { return static_cast<uint16_t>(nodes.size() / 2); }
+};
+// A slot without a way, as strategy 2 leaves it (types.h).
+const Way DEAD_WAY{NO, 0, 0, 0, {}};
+
+// The kind's logical pair of ways, into d: each way's record, its nodes after
+// those of the ways before it, and the nodes back to back.
+void put_ways(BuildDir& d, const way_files::Kind& kind, const std::vector<Way>& ways) {
+    std::vector<char> records, nodes;
+    uint32_t before = 0;
+    for (const Way& w : ways) {
+        const uint16_t cnt = w.count();
+        const uint32_t offset = cnt ? before : 0;
+        if (kind.interp) append(records, InterpWay{offset, cnt, 0, w.name, w.start, w.end, w.interpolation});
+        else append(records, WayHeader{offset, cnt, 0, w.name});
+        for (const uint32_t bits : w.nodes) append(nodes, bits);
+        before += cnt;
+    }
+    d[kind.ways_file] = records;
+    d[kind.nodes_file] = nodes;
+}
+
+// The f32 nearest v x 1e-7 degrees, which has a hybrid key (coord_keys.h).
+uint32_t seven_decimals(int64_t v) { return coord_keys::bits_of(static_cast<float>(static_cast<double>(v) / 1e7)); }
+
+// cnt nodes of a way. Flavour 0: a walk in steps of up to 2,000 x 1e-7
+// degrees, every coordinate with a hybrid key, one walk in five below 1.0 in
+// magnitude; 1: floats below 1.0 as they come and a -0 among them, which has
+// no hybrid key, so the way packs under the order key (way_files.h); 2: any
+// float below 16,384 in magnitude (the diff's content merge takes a
+// coordinate x 1e5 as an int), so the way's values take up to 32 bits.
+std::vector<uint32_t> way_nodes(std::mt19937& rng, uint32_t cnt, uint32_t flavour) {
+    std::vector<uint32_t> nodes;
+    if (flavour == 0) {
+        const bool small = rng() % 5 == 0;
+        int64_t lat = small ? static_cast<int64_t>(rng() % 9000000) : 400000000 + static_cast<int64_t>(rng() % 200000000);
+        int64_t lng = small ? -static_cast<int64_t>(rng() % 9000000) : -static_cast<int64_t>(rng() % 1500000000);
+        for (uint32_t k = 0; k < cnt; k++) {
+            nodes.push_back(seven_decimals(lat));
+            nodes.push_back(seven_decimals(lng));
+            lat += static_cast<int64_t>(rng() % 4001) - 2000;
+            lng += static_cast<int64_t>(rng() % 4001) - 2000;
+        }
+        return nodes;
+    }
+    for (uint32_t k = 0; k < 2 * cnt; k++) {
+        const uint32_t sign = static_cast<uint32_t>(rng()) & 0x80000000u, any = static_cast<uint32_t>(rng());
+        nodes.push_back(sign | (flavour == 1 ? any % coord_keys::ONE_BITS : (any & 0x007FFFFFu) | (((any >> 23) % 141) << 23)));
+    }
+    if (flavour == 1 && cnt) nodes[2 * (rng() % cnt)] = 0x80000000u;
+    return nodes;
+}
+
+// A random way's fields: one of 300 names, and an interpolation's numbers
+// (its last below its first one time in four) and kind.
+Way way_fields(std::mt19937& rng, bool interp) {
+    Way w;
+    w.name = static_cast<uint32_t>(rng() % 300) * 8;
+    if (interp) {
+        w.start = 1 + static_cast<uint32_t>(rng() % 500);
+        w.end = rng() % 4 ? w.start + static_cast<uint32_t>(rng() % 60) * 2 : w.start - 1;
+        w.interpolation = static_cast<uint8_t>(1 + rng() % 3);
+    }
+    return w;
+}
+
+// A random way: one in sixteen without nodes, one in sixteen of one node,
+// the others of 2 to 31; one in eight on coordinates without a hybrid key and
+// one in eight on any floats.
+Way random_way(std::mt19937& rng, bool interp) {
+    Way w = way_fields(rng, interp);
+    const uint32_t r = rng() % 16, flavour = rng() % 8;
+    w.nodes = way_nodes(rng, r == 0 ? 0 : r == 1 ? 1 : 2 + rng() % 30, flavour == 0 ? 1 : flavour == 1 ? 2 : 0);
+    return w;
+}
+
+// n ways of 3 to 9 nodes, the sixth of every sixteen on coordinates without
+// a hybrid key and the tenth on any floats: each group of the pair's files
+// holds a way under each key.
+std::vector<Way> ways_with_nodes(std::mt19937& rng, bool interp, uint32_t n) {
+    std::vector<Way> ways;
+    for (uint32_t i = 0; i < n; i++) {
+        Way w = way_fields(rng, interp);
+        w.nodes = way_nodes(rng, 3 + rng() % 7, i % 16 == 5 ? 1 : i % 16 == 9 ? 2 : 0);
+        ways.push_back(w);
+    }
+    return ways;
+}
+
+// The nodes of ways [from, to) of day.
+uint64_t nodes_in(const std::vector<Way>& day, size_t from, size_t to) {
+    uint64_t n = 0;
+    for (size_t i = from; i < std::min(to, day.size()); i++) n += day[i].count();
+    return n;
+}
+
+// The groups of new_day whose node blocks are the old day's group's at the
+// same place: way for way the same nodes, and a node among them.
+uint64_t groups_kept(const std::vector<Way>& old_day, const std::vector<Way>& new_day) {
+    uint64_t kept = 0;
+    for (size_t first = 0; first < new_day.size(); first += way_files::GROUP_WAYS) {
+        const size_t end = std::min(new_day.size(), first + way_files::GROUP_WAYS);
+        bool same = end <= old_day.size();
+        for (size_t i = first; same && i < end; i++) same = new_day[i].nodes == old_day[i].nodes;
+        kept += same && nodes_in(new_day, first, end) > 0;
+    }
+    return kept;
+}
+
+// What the way replay of a kind's pair did, from the patcher's log: the new
+// groups it copied and those it encoded, and the old node bytes the encoded
+// ones kept, by where their blocks were: in the old group the replay was at,
+// in one it had passed (read again), or anywhere else (found by its cursor).
+struct WayReplay {
+    uint64_t copied = 0, encoded = 0, at_hand = 0, again = 0, by_cursor = 0;
+    std::string text() const {
+        return std::to_string(copied) + " copied, " + std::to_string(encoded) + " encoded; old node bytes " + std::to_string(at_hand) +
+               " at hand, " + std::to_string(again) + " read again, " + std::to_string(by_cursor) + " by the cursor";
+    }
+    bool operator==(const WayReplay& o) const {
+        return copied == o.copied && encoded == o.encoded && at_hand == o.at_hand && again == o.again && by_cursor == o.by_cursor;
+    }
+};
+
+std::optional<WayReplay> way_replay_of(const std::string& log, const way_files::Kind& kind) {
+    const std::string head = std::string("replayed with ") + kind.ways_file + ": groups ";
+    const size_t at = log.find(head);
+    WayReplay r;
+    if (at == std::string::npos ||
+        std::sscanf(log.c_str() + at + head.size(),
+                    "%" SCNu64 " copied, %" SCNu64 " encoded; old node bytes %" SCNu64 " at hand, %" SCNu64 " read again, %" SCNu64
+                    " by the cursor",
+                    &r.copied, &r.encoded, &r.at_hand, &r.again, &r.by_cursor) != 5)
+        return std::nullopt;
+    return r;
+}
+
+// The log of a patcher run whose way replay of the kind's pair did `want`:
+// "" or what it did instead.
+LogCheck way_replay_did(const way_files::Kind& kind, const WayReplay& want) {
+    return [&kind, want](const std::string& log) -> std::string {
+        const std::optional<WayReplay> got = way_replay_of(log, kind);
+        if (!got) return std::string("no way replay of ") + kind.ways_file + " in the log";
+        return *got == want ? "" : std::string(kind.ways_file) + ": " + got->text() + ", not " + want.text();
+    };
+}
+
+// Every check of checks on a log: the first failure.
+LogCheck every_check(std::vector<LogCheck> checks) {
+    return [checks](const std::string& log) -> std::string {
+        for (const LogCheck& check : checks)
+            if (std::string e = check(log); !e.empty()) return e;
+        return "";
+    };
+}
+
+// The out dir's two files of the kind's pair are the builder's for day.
+bool wrote_the_builders_pair(const std::string& out, const way_files::Kind& kind, const BuildDir& day) {
+    const BuildDir want = gctest::as_written(day);
+    return read_file(out + "/" + kind.ways_file) == want.at(kind.ways_file) && read_file(out + "/" + kind.nodes_file) == want.at(kind.nodes_file);
+}
+
+// An op of a merge sequence, with its records (count of them at stride) when
+// it carries some.
+void put_op(std::vector<char>& ops, uint8_t kind, uint32_t count, const char* data = nullptr, size_t stride = 0) {
+    append(ops, kind);
+    append(ops, count);
+    if (data) ops.insert(ops.end(), data, data + size_t{count} * stride);
+}
+
+// A merge section of a file of old_size bytes and new_size: no offset fixup
+// runs, the offset fixup values of `values` and the string fixups of
+// `strings`, each its count and its bytes (none unless given).
+using Fixups = std::pair<uint32_t, std::vector<char>>;
+std::vector<char> merge_of(PatchFileId fid, uint32_t stride, uint64_t old_size, uint64_t new_size, const std::vector<char>& ops,
+                           const Fixups& values = {}, const Fixups& strings = {}) {
+    std::vector<char> s = section_head(fid, stride, old_size, new_size);
+    for (const uint32_t w : {0u, values.first, 0u, static_cast<uint32_t>(values.second.size())}) append(s, w);
+    s.insert(s.end(), values.second.begin(), values.second.end());
+    for (const uint32_t w : {strings.first, static_cast<uint32_t>(strings.second.size())}) append(s, w);
+    s.insert(s.end(), strings.second.begin(), strings.second.end());
+    append(s, static_cast<uint64_t>(ops.size()));
+    s.insert(s.end(), ops.begin(), ops.end());
+    return s;
+}
+
+// Where the merge section at `at` of a raw patch ends.
+size_t merge_section_end(const std::vector<char>& raw, size_t at) {
+    auto u32_at = [&](size_t p) {
+        uint32_t v;
+        memcpy(&v, raw.data() + p, 4);
+        return v;
+    };
+    const size_t strings = at + 40 + u32_at(at + 32) + u32_at(at + 36), seq = strings + 8 + u32_at(strings + 4);
+    uint64_t seq_size;
+    memcpy(&seq_size, raw.data() + seq, 8);
+    return seq + 8 + static_cast<size_t>(seq_size);
+}
+
+// A full replacement of a file of old_size bytes by `bytes`.
+std::vector<char> replacement_of(PatchFileId fid, uint64_t old_size, const std::vector<char>& bytes) {
+    std::vector<char> s = section_head(fid, 0, old_size, bytes.size());
+    append(s, uint32_t{0});
+    append(s, static_cast<uint64_t>(bytes.size()));
+    s.insert(s.end(), bytes.begin(), bytes.end());
+    return s;
+}
+
+// A day that leaves the kind's pair of d as it is, diffed, and the patch
+// with the pair's two sections (each sent as unchanged) put again by hand.
+struct WaySections {
+    LowMemCase c;
+    std::vector<char> raw;
+    size_t at = std::string::npos, size = 0;
+    uint64_t ways_bytes = 0, nodes_bytes = 0;
+    const way_files::Kind* kind = nullptr;
+
+    WaySections(const std::string& root, const std::string& name, const BuildDir& d, const way_files::Kind& k) : c{root, name}, kind(&k) {
+        if (!prepare(c, d, d).empty()) return;
+        raw = raw_patch(c);
+        ways_bytes = d.at(k.ways_file).size();
+        nodes_bytes = d.at(k.nodes_file).size();
+        std::vector<char> pair = copy_old_section(ways_id(k), ways_bytes);
+        const std::vector<char> nodes = copy_old_section(nodes_id(k), nodes_bytes);
+        pair.insert(pair.end(), nodes.begin(), nodes.end());
+        at = find_once(raw, pair);
+        size = pair.size();
+    }
+    bool found() const { return at != std::string::npos; }
+    // The patch with `sections` in place of the pair's two.
+    std::vector<char> with(const std::vector<char>& sections) const {
+        std::vector<char> edited(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(at));
+        edited.insert(edited.end(), sections.begin(), sections.end());
+        edited.insert(edited.end(), raw.begin() + static_cast<std::ptrdiff_t>(at + size), raw.end());
+        return edited;
+    }
+    // The ways' merge by ways_ops (with the offset fixup values and the
+    // string fixups given) and the nodes' by nodes_ops, each file of its size
+    // on both days.
+    std::vector<char> merges(const std::vector<char>& ways_ops, const std::vector<char>& nodes_ops, const Fixups& values = {},
+                             const Fixups& strings = {}) const {
+        std::vector<char> s = merge_of(ways_id(*kind), static_cast<uint32_t>(kind->stride), ways_bytes, ways_bytes, ways_ops, values, strings);
+        const std::vector<char> n = merge_of(nodes_id(*kind), 8, nodes_bytes, nodes_bytes, nodes_ops);
+        s.insert(s.end(), n.begin(), n.end());
+        return s;
+    }
+};
+
+}  // namespace
+
+// Random days of both way pairs as strategy 2 leaves them: an old day of 300
+// to 500 ways a kind (without nodes, of one node, of up to 31; on
+// coordinates of seven decimals, on ones without a hybrid key and on any
+// floats; dead slots among them) and a new day that renames some, moves, adds
+// or drops a node of some or gives them other nodes, kills some in place,
+// fills dead slots and appends up to 40. Merged by slot identity and by
+// content, in every mode the patcher writes the builder's way files of the
+// new day byte for byte, copying the groups whose ways keep their nodes (the
+// log counts them: each of them when merged by slot, nine in ten at least
+// when by content) and encoding the others, their old nodes decoded from the
+// old group the replay is at.
+TEST(patch_rebuilds_the_builders_way_files_on_random_days) {
+    ScratchDir dir("lowmem-way-days");
+    for (uint32_t seed = 1; seed <= 4; seed++) {
+        std::mt19937 rng(20261116 + seed);
+        const bool by_slot = seed % 2 == 1;
+        BuildDir old_d, new_d;
+        struct Pair {
+            const way_files::Kind* kind;
+            uint64_t groups, kept;
+        };
+        std::vector<Pair> pairs;
+        for (const way_files::Kind* kind : BOTH_WAY_KINDS) {
+            std::vector<Way> old_day;
+            for (uint32_t i = 0, n = 300 + rng() % 200; i < n; i++) old_day.push_back(i % 41 == 7 ? DEAD_WAY : random_way(rng, kind->interp));
+            std::vector<Way> new_day = old_day;
+            for (Way& w : new_day) {
+                const uint32_t r = rng() % 160, cnt = w.count();
+                const bool dead = w.name == NO;
+                if (dead && r < 40) w = random_way(rng, kind->interp);                         // a dead slot filled
+                if (dead) continue;
+                if (r == 0) w.name += 8;                                                       // renamed
+                if (r == 1 && kind->interp) w.end += 2;                                        // another last number
+                if (r == 2 && cnt) w.nodes[rng() % w.nodes.size()] ^= 1u << (rng() % 12);      // a node moved
+                if (r == 3) w.nodes.insert(w.nodes.end(), {seven_decimals(471234567), seven_decimals(81234567)});  // a node more
+                if (r == 4 && cnt) w.nodes.resize(w.nodes.size() - 2);                         // a node fewer
+                if (r == 5) w.nodes = way_nodes(rng, cnt, rng() % 3);                          // other nodes
+                if (r == 6) w = DEAD_WAY;                                                      // dead in place
+            }
+            for (uint32_t i = 0, n = rng() % 41; i < n; i++) new_day.push_back(random_way(rng, kind->interp));
+            put_ways(old_d, *kind, old_day);
+            put_ways(new_d, *kind, new_day);
+            pairs.push_back({kind, (new_day.size() + way_files::GROUP_WAYS - 1) / way_files::GROUP_WAYS, groups_kept(old_day, new_day)});
+        }
+        const LowMemCase c{dir.path(), "seed-" + std::to_string(seed)};
+        REQUIRE(prepare(c, old_d, new_d, {}, {}, by_slot ? std::vector<std::string>{"--identity-slots"} : std::vector<std::string>{}).empty());
+
+        std::string did;
+        const LogCheck counts = [&](const std::string& log) -> std::string {
+            did.clear();
+            for (const Pair& p : pairs) {
+                const std::optional<WayReplay> r = way_replay_of(log, *p.kind);
+                if (!r) return std::string("no way replay of ") + p.kind->ways_file + " in the log";
+                did += std::string(did.empty() ? "" : "; ") + p.kind->ways_file + ": " + std::to_string(p.kept) + " of " + std::to_string(p.groups) +
+                       " groups kept, " + r->text();
+                if (r->copied + r->encoded != p.groups) return "not every group copied or encoded: " + did;
+                if (r->copied > p.kept || (by_slot ? r->copied != p.kept : r->copied * 10 < p.kept * 9)) return "kept groups not copied: " + did;
+                if (r->encoded == 0 || r->at_hand == 0) return "no group encoded from the old group at hand: " + did;
+                if (r->by_cursor != 0) return "old nodes read through the cursor: " + did;
+            }
+            return "";
+        };
+        CHECK(apply_modes(c, ALL_MODES, counts).bad.empty());
+        for (const std::string& mode : ALL_MODES)
+            for (const Pair& p : pairs) CHECK(wrote_the_builders_pair(c.dir("out." + mode), *p.kind, new_d));
+        std::printf("    seed %u, by %s: %s (the last mode's)\n", seed, by_slot ? "slot" : "content", did.c_str());
+    }
+}
+
+// A group with one edited way is encoded and the groups beside it are
+// copied. 87 ways of 3 to 9 nodes, five groups and one of seven ways, a way
+// under each key in each. The new day moves the second node of way 20,
+// gives way 40 a node more and moves the first node of way 64, its group's
+// anchor; it renames way 50. Groups 1, 2 and 4 are encoded, every node they
+// keep decoded from the old group at hand (all but the two moved ones), and
+// groups 0, 3 (its row written again with the new name) and 5 are copied.
+// The same by slot identity, where the changed records go as REPLACE runs,
+// and by content, where each is deleted and inserted in its place.
+TEST(patch_encodes_a_way_group_with_one_edited_way) {
+    ScratchDir dir("lowmem-way-edit");
+    for (const way_files::Kind* kind : BOTH_WAY_KINDS)
+        for (const bool by_slot : {true, false}) {
+            std::mt19937 rng(20261117);
+            const std::vector<Way> old_day = ways_with_nodes(rng, kind->interp, 87);
+            std::vector<Way> new_day = old_day;
+            new_day[20].nodes[2] ^= 0x10;
+            new_day[40].nodes.insert(new_day[40].nodes.end(), {new_day[40].nodes[0], new_day[40].nodes[1]});
+            new_day[50].name += 8;
+            new_day[64].nodes[0] ^= 4;
+            BuildDir old_d, new_d;
+            put_ways(old_d, *kind, old_day);
+            put_ways(new_d, *kind, new_day);
+            const LowMemCase c{dir.path(), std::string(kind->interp ? "interps" : "streets") + (by_slot ? "-by-slot" : "-by-content")};
+            REQUIRE(prepare(c, old_d, new_d, {}, {}, by_slot ? std::vector<std::string>{"--identity-slots"} : std::vector<std::string>{}).empty());
+            const MergeSection merge = merge_section(raw_patch(c), ways_id(*kind), static_cast<uint32_t>(kind->stride),
+                                                     old_d.at(kind->ways_file).size(), new_d.at(kind->ways_file).size());
+            REQUIRE(merge.found);
+            const uint8_t sent_as = by_slot ? OP_REPLACE_RUN : OP_INSERT_RUN;
+            REQUIRE(std::count_if(merge.ops.begin(), merge.ops.end(), [&](const auto& op) { return op.first == sent_as; }) > 0);
+            REQUIRE(merge.fixup_runs + merge.fixup_values > 0);
+
+            const WayReplay want{3, 3, 8 * (nodes_in(old_day, 16, 32) - 1 + nodes_in(old_day, 32, 48) + nodes_in(old_day, 64, 80) - 1), 0, 0};
+            CHECK(apply_modes(c, ALL_MODES, way_replay_did(*kind, want)).bad.empty());
+            for (const std::string& mode : ALL_MODES) CHECK(wrote_the_builders_pair(c.dir("out." + mode), *kind, new_d));
+        }
+}
+
+// A run of ways that is not at its old position is encoded: the blocks of a
+// group are packed against its first node, so they are another group's only
+// when the group holds the same ways. 100 ways of 3 to 9 nodes, merged by
+// content:
+//   a way more at index 20: group 0 is copied and the six after it are
+//     encoded, each from the old group the replay is at and the last way of
+//     the one before it, which it reads again;
+//   way 20 gone: the same, each group from the old group the replay passed
+//     last and the first way of the one it is at;
+//   sixteen ways more at index 32: only their own group is encoded, since
+//     every later group is an old group again, one further on;
+//   ways 32 to 47 gone: every group is an old one.
+TEST(patch_encodes_a_run_of_ways_that_is_not_at_its_old_position) {
+    ScratchDir dir("lowmem-way-shift");
+    for (const way_files::Kind* kind : BOTH_WAY_KINDS) {
+        std::mt19937 rng(20261118);
+        const std::vector<Way> old_day = ways_with_nodes(rng, kind->interp, 100);
+        const std::vector<Way> more = ways_with_nodes(rng, kind->interp, 16);
+        auto nodes_of = [&](std::initializer_list<size_t> ways) {
+            uint64_t n = 0;
+            for (const size_t i : ways) n += old_day[i].count();
+            return n;
+        };
+        struct Case {
+            std::string name;
+            std::vector<Way> new_day;
+            WayReplay want;
+        };
+        std::vector<Case> cases(4);
+        cases[0].name = "a-way-more";
+        cases[0].new_day = old_day;
+        cases[0].new_day.insert(cases[0].new_day.begin() + 20, more[0]);
+        const uint64_t before_each = nodes_of({31, 47, 63, 79, 95});
+        cases[0].want = {1, 6, 8 * (nodes_in(old_day, 16, 100) - before_each), 8 * before_each, 0};
+        cases[1].name = "a-way-fewer";
+        cases[1].new_day = old_day;
+        cases[1].new_day.erase(cases[1].new_day.begin() + 20);
+        const uint64_t at_hand = nodes_of({32, 48, 64, 80, 96, 97, 98, 99});
+        cases[1].want = {1, 6, 8 * at_hand, 8 * (nodes_in(old_day, 16, 100) - old_day[20].count() - at_hand), 0};
+        cases[2].name = "a-group-more";
+        cases[2].new_day = old_day;
+        cases[2].new_day.insert(cases[2].new_day.begin() + 32, more.begin(), more.end());
+        cases[2].want = {7, 1, 0, 0, 0};
+        cases[3].name = "a-group-fewer";
+        cases[3].new_day = old_day;
+        cases[3].new_day.erase(cases[3].new_day.begin() + 32, cases[3].new_day.begin() + 48);
+        cases[3].want = {6, 0, 0, 0, 0};
+        for (const Case& e : cases) {
+            BuildDir old_d, new_d;
+            put_ways(old_d, *kind, old_day);
+            put_ways(new_d, *kind, e.new_day);
+            const LowMemCase c{dir.path(), std::string(kind->interp ? "interps-" : "streets-") + e.name};
+            REQUIRE(prepare(c, old_d, new_d).empty());
+
+            CHECK(apply_modes(c, ALL_MODES, way_replay_did(*kind, e.want)).bad.empty());
+            for (const std::string& mode : ALL_MODES) CHECK(wrote_the_builders_pair(c.dir("out." + mode), *kind, new_d));
+        }
+    }
+}
+
+// The last group of a pair as the new day shortens it, lengthens it or
+// leaves it without nodes. 40 ways, two groups and one of eight ways, the
+// first two of those without nodes, merged by content:
+//   the last five ways gone: the three left are the old group's first three
+//     and the last of them has nodes, so their blocks are copied and the row
+//     cut;
+//   the last six gone: the two left have no nodes, and the old row's anchor
+//     is the first node of a way that is gone, so the group is encoded,
+//     with no anchor;
+//   five ways more: the group is encoded, its old ways' nodes from the old
+//     group at hand;
+//   five ways without nodes more: they have no block, so the group's blocks
+//     are the old group's, copied;
+//   the pair's every way gone: the patcher writes the two footers.
+// And 32 ways without nodes, one renamed: a group without nodes has no block
+// to copy.
+TEST(patch_replays_a_last_way_group_that_shrinks_or_grows) {
+    ScratchDir dir("lowmem-way-last");
+    for (const way_files::Kind* kind : BOTH_WAY_KINDS) {
+        std::mt19937 rng(20261119);
+        std::vector<Way> old_day = ways_with_nodes(rng, kind->interp, 40);
+        old_day[32].nodes.clear();
+        old_day[33].nodes.clear();
+        const std::vector<Way> more = ways_with_nodes(rng, kind->interp, 5);
+        struct Case {
+            std::string name;
+            std::vector<Way> new_day;
+            WayReplay want;
+        };
+        std::vector<Case> cases(5);
+        cases[0] = {"five-fewer", {old_day.begin(), old_day.begin() + 35}, {3, 0, 0, 0, 0}};
+        cases[1] = {"six-fewer", {old_day.begin(), old_day.begin() + 34}, {2, 1, 0, 0, 0}};
+        cases[2] = {"five-more", old_day, {2, 1, 8 * nodes_in(old_day, 32, 40), 0, 0}};
+        cases[2].new_day.insert(cases[2].new_day.end(), more.begin(), more.end());
+        cases[3] = {"five-bare-more", old_day, {3, 0, 0, 0, 0}};
+        for (Way w : more) {
+            w.nodes.clear();
+            cases[3].new_day.push_back(w);
+        }
+        cases[4] = {"none", {}, {0, 0, 0, 0, 0}};
+        for (const Case& e : cases) {
+            // A street pair cannot lose its last node by patch.
+            if (e.new_day.empty() && !kind->interp) continue;
+            BuildDir old_d, new_d;
+            put_ways(old_d, *kind, old_day);
+            put_ways(new_d, *kind, e.new_day);
+            const LowMemCase c{dir.path(), std::string(kind->interp ? "interps-" : "streets-") + e.name};
+            REQUIRE(prepare(c, old_d, new_d).empty());
+
+            CHECK(apply_modes(c, ALL_MODES, way_replay_did(*kind, e.want)).bad.empty());
+            for (const std::string& mode : ALL_MODES) CHECK(wrote_the_builders_pair(c.dir("out." + mode), *kind, new_d));
+        }
+
+        std::vector<Way> bare(32), renamed;
+        for (Way& w : bare) w = way_fields(rng, kind->interp);
+        renamed = bare;
+        renamed[20].name += 8;
+        BuildDir old_d, new_d;
+        put_ways(old_d, *kind, bare);
+        put_ways(new_d, *kind, renamed);
+        const LowMemCase c{dir.path(), std::string(kind->interp ? "interps" : "streets") + "-without-nodes"};
+        REQUIRE(prepare(c, old_d, new_d).empty());
+        CHECK(apply_modes(c, ALL_MODES, way_replay_did(*kind, {0, 2, 0, 0, 0})).bad.empty());
+    }
+}
+
+// The dedicated replay runs when one of a pair's two sections is sent as
+// unchanged, that side read as one MATCH of all of it, and copies the groups
+// the day leaves whole. 87 ways of 3 to 9 nodes:
+//   a node of way 20 moved: the records are unchanged and the nodes merge;
+//     group 1 is encoded and the other five copied;
+//   way 50 renamed: the records merge and the nodes are unchanged; every
+//     group is copied, group 3's row with the new name;
+//   the last node of way 20 given to way 21 as its first: the nodes are
+//     unchanged and group 1 is encoded all the same, since its blocks are
+//     packed a way at a time.
+// In each the log names the pair's decoder and encoder, as it does for any
+// family that is replayed.
+TEST(patch_copies_way_groups_under_an_unchanged_parent_or_child) {
+    ScratchDir dir("lowmem-way-half");
+    for (const way_files::Kind* kind : BOTH_WAY_KINDS) {
+        std::mt19937 rng(20261120);
+        const std::vector<Way> old_day = ways_with_nodes(rng, kind->interp, 87);
+        std::vector<Way> moved = old_day, renamed = old_day, handed = old_day;
+        moved[20].nodes[2] ^= 0x10;
+        renamed[50].name += 8;
+        handed[21].nodes.insert(handed[21].nodes.begin(), handed[20].nodes.end() - 2, handed[20].nodes.end());
+        handed[20].nodes.resize(handed[20].nodes.size() - 2);
+        const std::string family = kind->interp ? "interps" : "streets";
+        struct Case {
+            std::string name;
+            const std::vector<Way>& new_day;
+            PatchFileId unchanged;
+            WayReplay want;
+        };
+        const Case cases[] = {
+            {"nodes-moved", moved, ways_id(*kind), {5, 1, 8 * (nodes_in(old_day, 16, 32) - 1), 0, 0}},
+            {"renamed", renamed, nodes_id(*kind), {6, 0, 0, 0, 0}},
+            {"node-handed-over", handed, nodes_id(*kind), {5, 1, 8 * nodes_in(old_day, 16, 32), 0, 0}},
+        };
+        for (const Case& e : cases) {
+            BuildDir old_d, new_d;
+            put_ways(old_d, *kind, old_day);
+            put_ways(new_d, *kind, e.new_day);
+            const LowMemCase c{dir.path(), family + "-" + e.name};
+            REQUIRE(prepare(c, old_d, new_d).empty());
+            const std::string unchanged = patch_file_names[static_cast<uint32_t>(e.unchanged)];
+            REQUIRE(copied_old_at(raw_patch(c), e.unchanged, old_d.at(unchanged).size()) != std::string::npos);
+
+            const LogCheck codecs = [&](const std::string& log) -> std::string {
+                for (const char* codec : {"decode ", "encode "})
+                    if (log.find(codec + family + ": queue peaks ") == std::string::npos) return "no " + std::string(codec) + family + " line";
+                return "";
+            };
+            CHECK(apply_modes(c, ALL_MODES, every_check({way_replay_did(*kind, e.want), codecs})).bad.empty());
+            for (const std::string& mode : ALL_MODES) CHECK(wrote_the_builders_pair(c.dir("out." + mode), *kind, new_d));
+        }
+    }
+}
+
+// Old nodes the encoded groups keep that are not in the old group the replay
+// is at: 6,000 ways of two nodes on a day that changes nothing, the pair's
+// two sections put again by hand, each giving the old pair back in every
+// mode:
+//   every way deleted and then inserted, the nodes one MATCH: the replay is
+//     at the old pair's last group when the first new way comes. That group
+//     it copies; the ways of the groups it passed last it reads again, and
+//     those of the groups before them it finds with its cursor;
+//   every way inserted and then deleted, the nodes one MATCH: no old group
+//     is at hand, and the cursor finds every way;
+//   the first group's ways matched, every other way inserted and then
+//     deleted, the nodes one MATCH: the first group is copied, and the cursor
+//     finds every way after it, the first of them the one right after the
+//     group at hand;
+//   every way matched, the nodes sent whole but for the last way's, which
+//     are the first way's and MATCH those: the cursor finds the first way
+//     from the pair's last group.
+// The cursor reads a row before the replay has checked it: with the last
+// group's row giving its blocks a megabyte past the nodes file, a patch that
+// inserts every way first is refused by name at that group.
+TEST(patch_way_replay_reads_old_nodes_again_and_through_its_cursor) {
+    ScratchDir dir("lowmem-way-cursor");
+    constexpr uint32_t WAYS = 6000;
+    for (const way_files::Kind* kind : BOTH_WAY_KINDS) {
+        std::mt19937 rng(20261121);
+        std::vector<Way> day;
+        for (uint32_t i = 0; i < WAYS; i++) {
+            Way w = way_fields(rng, kind->interp);
+            w.nodes = way_nodes(rng, 2, i % 16 == 5 ? 1 : 0);
+            day.push_back(w);
+        }
+        day[WAYS - 1].nodes = day[0].nodes;
+        BuildDir d;
+        put_ways(d, *kind, day);
+        const WaySections s(dir.path(), kind->interp ? "interps" : "streets", d, *kind);
+        REQUIRE(s.found());
+        const std::vector<char>& records = d.at(kind->ways_file);
+        const std::vector<char>& nodes = d.at(kind->nodes_file);
+        const uint32_t n_nodes = static_cast<uint32_t>(nodes.size() / 8);
+        const uint64_t groups = WAYS / way_files::GROUP_WAYS, group_bytes = 8 * 2 * way_files::GROUP_WAYS;
+
+        struct Case {
+            std::string name;
+            std::vector<char> ways_ops, nodes_ops;
+            std::function<std::string(const WayReplay&)> wrong;
+        };
+        Case deleted_first{"deleted-first", {}, {}, [&](const WayReplay& r) {
+            return r.copied == 1 && r.encoded == groups - 1 && r.at_hand == 0 && r.again > 0 && r.by_cursor > 0 &&
+                           r.again + r.by_cursor == (groups - 1) * group_bytes
+                       ? ""
+                       : "not the last group copied and the others encoded from groups read again and found by the cursor";
+        }};
+        put_op(deleted_first.ways_ops, OP_DELETE_RUN, WAYS);
+        put_op(deleted_first.ways_ops, OP_INSERT_RUN, WAYS, records.data(), kind->stride);
+        put_op(deleted_first.nodes_ops, OP_MATCH_RUN, n_nodes);
+        Case inserted_first{"inserted-first", {}, {}, [&](const WayReplay& r) {
+            return r.copied == 0 && r.encoded == groups && r.at_hand == 0 && r.again == 0 && r.by_cursor == groups * group_bytes
+                       ? ""
+                       : "not every group encoded from ways the cursor found";
+        }};
+        put_op(inserted_first.ways_ops, OP_INSERT_RUN, WAYS, records.data(), kind->stride);
+        put_op(inserted_first.ways_ops, OP_DELETE_RUN, WAYS);
+        put_op(inserted_first.nodes_ops, OP_MATCH_RUN, n_nodes);
+        Case one_matched{"one-group-matched", {}, {}, [&](const WayReplay& r) {
+            return r.copied == 1 && r.encoded == groups - 1 && r.at_hand == 0 && r.again == 0 && r.by_cursor == (groups - 1) * group_bytes
+                       ? ""
+                       : "not the first group copied and the others encoded from ways the cursor found";
+        }};
+        put_op(one_matched.ways_ops, OP_MATCH_RUN, way_files::GROUP_WAYS);
+        put_op(one_matched.ways_ops, OP_INSERT_RUN, WAYS - way_files::GROUP_WAYS, records.data() + way_files::GROUP_WAYS * kind->stride,
+               kind->stride);
+        put_op(one_matched.ways_ops, OP_DELETE_RUN, WAYS - way_files::GROUP_WAYS);
+        put_op(one_matched.nodes_ops, OP_MATCH_RUN, n_nodes);
+        Case matched_late{"matched-late", {}, {}, [&](const WayReplay& r) {
+            return r.copied == 0 && r.encoded == groups && r.at_hand == 0 && r.again == 0 && r.by_cursor == 16
+                       ? ""
+                       : "not every group encoded and the first way found by the cursor";
+        }};
+        put_op(matched_late.ways_ops, OP_MATCH_RUN, WAYS);
+        put_op(matched_late.nodes_ops, OP_INSERT_RUN, n_nodes - 2, nodes.data(), 8);
+        put_op(matched_late.nodes_ops, OP_MATCH_RUN, 2);
+        for (const Case& e : {deleted_first, inserted_first, one_matched, matched_late}) {
+            REQUIRE(write_patch(s.c, s.c.patch(), s.with(s.merges(e.ways_ops, e.nodes_ops))));
+            const LogCheck check = [&](const std::string& log) -> std::string {
+                const std::optional<WayReplay> r = way_replay_of(log, *kind);
+                if (!r) return "no way replay in the log";
+                const std::string wrong = e.wrong(*r);
+                return wrong.empty() ? "" : e.name + ": " + wrong + ": " + r->text();
+            };
+            CHECK(apply_modes(s.c, ALL_MODES, check).bad.empty());
+        }
+
+        // The last group's row: its off, the row's first four bytes.
+        const std::string rows_path = s.c.dir("old") + "/" + kind->ways_file;
+        const std::vector<char> rows = read_file(rows_path);
+        const size_t last_row = (groups - 1) * kind->row_bytes(way_files::GROUP_WAYS);
+        REQUIRE(rows.size() == groups * kind->row_bytes(way_files::GROUP_WAYS) + way_files::WAYS_FOOTER_BYTES);
+        std::vector<char> far = rows;
+        uint32_t off;
+        memcpy(&off, rows.data() + last_row, 4);
+        put_at(far, last_row, off + (1u << 20));
+        REQUIRE(write_file(rows_path, far));
+        const std::string patch = s.c.dir("inserted-first.gcpatch");
+        REQUIRE(write_patch(s.c, patch, s.with(s.merges(inserted_first.ways_ops, inserted_first.nodes_ops))));
+        CHECK(not_refused(s.c, ALL_MODES, patch, "far-row",
+                          std::string("Malformed way files: ") + kind->nodes_file + " ends inside the block of way " +
+                              std::to_string(WAYS - way_files::GROUP_WAYS))
+                  .empty());
+        REQUIRE(write_file(rows_path, rows));
+
+        REQUIRE(write_patch(s.c, s.c.patch(), s.raw));
+        CHECK(apply_modes(s.c, ALL_MODES).bad.empty());
+    }
+}
+
+// A way of the most nodes a way holds, 65,535 (524,280 bytes of them), on
+// any floats: way 10 in a group the day leaves alone, whose blocks are copied
+// in pieces; way 20 beside a way that moves a node, decoded and encoded
+// whole; and way 37 with its own last node moved, its other nodes taken from
+// its old block. The replay holds one old way's block and its nodes and one
+// new way's nodes, and none of the pair's files.
+TEST(patch_way_replay_holds_one_way_of_the_most_nodes) {
+    ScratchDir dir("lowmem-way-most");
+    constexpr uint32_t MOST = way_files::MAX_WAY_NODES;
+    constexpr uint64_t WAY_BYTES = 8 * uint64_t{MOST};
+    std::mt19937 rng(20261122);
+    std::vector<Way> old_day = ways_with_nodes(rng, false, 48);
+    for (const size_t i : {10, 20, 37}) old_day[i].nodes = way_nodes(rng, MOST, 2);
+    std::vector<Way> new_day = old_day;
+    new_day[21].nodes[2] ^= 0x10;
+    new_day[37].nodes[2 * MOST - 2] ^= 0x10;
+    BuildDir old_d, new_d;
+    put_ways(old_d, way_files::STREETS, old_day);
+    put_ways(new_d, way_files::STREETS, new_day);
+    const LowMemCase c{dir.path(), "most"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+
+    const WayReplay want{1, 2, 8 * (nodes_in(old_day, 16, 48) - 2), 0, 0};
+    // An old way's block and its nodes, and the blocks of a small group read
+    // with one read; a new way's nodes and its group's records.
+    const LogCheck hold = every_check({way_replay_did(way_files::STREETS, want), decoder_peaks_at_most("streets", 2 * WAY_BYTES + (64 << 10)),
+                                  encoder_peaks_at_most("streets", WAY_BYTES)});
+    CHECK(apply_modes(c, ALL_MODES, hold).bad.empty());
+    for (const std::string& mode : ALL_MODES) CHECK(wrote_the_builders_pair(c.dir("out." + mode), way_files::STREETS, new_d));
+}
+
+// The patcher's heap as a pair it replays grows tenfold: n street ways of two
+// nodes, merged by slot identity, one in 777 renamed (its group copied, the
+// row written again) and one in 1,000 with a node moved (its group encoded).
+// The replay holds a group's row and blocks of each day's files.
+TEST(patch_heap_stays_flat_as_way_groups_are_copied_and_encoded) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::vector<Way> old_day(n);
+        for (uint32_t i = 0; i < n; i++) {
+            old_day[i].name = i % 1000 * 8;
+            const int64_t lat = 470000000 + static_cast<int64_t>(i % 100000) * 37, lng = 80000000 + static_cast<int64_t>(i % 77777) * 53;
+            old_day[i].nodes = {seven_decimals(lat), seven_decimals(lng), seven_decimals(lat + 1234), seven_decimals(lng - 987)};
+        }
+        std::vector<Way> new_day = old_day;
+        for (uint32_t i = 0; i < n; i++) {
+            if (i % 777 == 5) new_day[i].name += 8;
+            if (i % 1000 == 9) new_day[i].nodes[2] ^= 0x10;
+        }
+        BuildDir old_d, new_d;
+        put_ways(old_d, way_files::STREETS, old_day);
+        put_ways(new_d, way_files::STREETS, new_day);
+        if (std::string e = prepare(c, old_d, new_d, {}, {}, {"--identity-slots"}); !e.empty()) return e;
+        const uint64_t bytes = uint64_t{WAY_HEADER_STRIDE} * n;
+        return patch_holds(c, section_head(PatchFileId::STREET_WAYS, WAY_HEADER_STRIDE, bytes, bytes),
+                           "merge of " + std::to_string(n) + " street ways");
+    }, 100000).empty());
+}
+
+// The hashes of a pair's two old files, which the diff sends before the
+// ways' section, each once, are what the way replay checks the bytes it
+// copies by: a patch without either is refused in every mode before a way is
+// replayed, and one with another hash for either when the replay has passed
+// the file. 40 streets, one renamed, and 30 interpolations, a node of one
+// moved; the patch as made applies. On a day that changes neither pair the
+// pairs are copied as their files sit, each file held to its hash first: a
+// patch with another hash for any of the four is refused. The hash of a pair
+// the old day holds without ways, which has nothing to copy, is read and
+// checks nothing: a patch with other hashes applies.
+TEST(patch_refuses_a_way_replay_without_its_hashes) {
+    ScratchDir dir("lowmem-way-hashes");
+    std::mt19937 rng(20261123);
+    const std::vector<Way> streets = ways_with_nodes(rng, false, 40), interps = ways_with_nodes(rng, true, 30);
+    std::vector<Way> renamed = streets, moved = interps;
+    renamed[30].name += 8;
+    moved[5].nodes[2] ^= 0x10;
+    // The four hash sections of c's patch, where they sit, each before its
+    // pair's first section; none unless each is there once.
+    struct Hash {
+        const way_files::Kind* kind;
+        PatchFileId file;
+        size_t at;
+    };
+    auto hashes_of = [](const LowMemCase& c, const std::vector<char>& raw) {
+        std::vector<Hash> hashes;
+        for (const way_files::Kind* kind : BOTH_WAY_KINDS) {
+            std::vector<char> first;
+            append(first, static_cast<uint32_t>(ways_id(*kind)));
+            for (const PatchFileId file : {ways_id(*kind), nodes_id(*kind)}) {
+                const std::vector<char> old_file = read_file(c.dir("old") + "/" + patch_file_names[static_cast<uint32_t>(file)]);
+                const size_t at = find_once(raw, old_file_hash(file, lane_hash(old_file.data(), old_file.size())));
+                if (at == std::string::npos) return std::vector<Hash>{};
+                hashes.push_back({kind, file, at});
+            }
+            // The two back to back, and the ways' section after them.
+            const size_t n = hashes.size();
+            if (hashes[n - 1].at != hashes[n - 2].at + 16 || raw.size() < hashes[n - 1].at + 20 ||
+                memcmp(raw.data() + hashes[n - 1].at + 16, first.data(), 4) != 0)
+                return std::vector<Hash>{};
+        }
+        return hashes;
+    };
+
+    BuildDir old_d, new_d;
+    put_ways(old_d, way_files::STREETS, streets);
+    put_ways(old_d, way_files::INTERPS, interps);
+    put_ways(new_d, way_files::STREETS, renamed);
+    put_ways(new_d, way_files::INTERPS, moved);
+    const LowMemCase c{dir.path(), "replayed"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    const std::vector<Hash> hashes = hashes_of(c, raw);
+    REQUIRE(hashes.size() == 4);
+    for (const Hash& h : hashes) {
+        const std::string file = patch_file_names[static_cast<uint32_t>(h.file)];
+        std::vector<char> cut = raw, other = raw;
+        cut.erase(cut.begin() + static_cast<std::ptrdiff_t>(h.at), cut.begin() + static_cast<std::ptrdiff_t>(h.at + 16));
+        other[h.at + 8] ^= 1;
+        REQUIRE(write_patch(c, c.dir(file + ".cut.gcpatch"), cut));
+        REQUIRE(write_patch(c, c.dir(file + ".other.gcpatch"), other));
+
+        CHECK(not_refused(c, ALL_MODES, c.dir(file + ".cut.gcpatch"), file + ".cut",
+                          std::string("Malformed patch: ") + h.kind->ways_file + " replayed without the old " + file + "'s hash")
+                  .empty());
+        CHECK(not_refused(c, ALL_MODES, c.dir(file + ".other.gcpatch"), file + ".other", "Old " + file + " is not the one the patch was made from")
+                  .empty());
+        // Refused before the pair is replayed: no file of it is written.
+        for (const std::string& mode : ALL_MODES)
+            CHECK(!std::filesystem::exists(c.dir(file + ".cut.out." + mode) + "/" + h.kind->ways_file));
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+
+    BuildDir none;
+    put_ways(none, way_files::STREETS, streets);
+    put_ways(none, way_files::INTERPS, {});
+    struct Unused {
+        std::string name;
+        const BuildDir& old_day;
+        const BuildDir& new_day;
+    };
+    for (const Unused& u : {Unused{"unchanged", old_d, old_d}, Unused{"first-ways", none, old_d}}) {
+        const LowMemCase day{dir.path(), u.name};
+        REQUIRE(prepare(day, u.old_day, u.new_day).empty());
+        std::vector<char> other = raw_patch(day);
+        const std::vector<Hash> sent = hashes_of(day, other);
+        REQUIRE(sent.size() == 4);
+        const LogCheck no_replay = [&](const std::string& log) {
+            return way_replay_of(log, way_files::INTERPS) || way_replay_of(log, way_files::STREETS) ? std::string("a way replay ran") : std::string();
+        };
+        CHECK(apply_modes(day, ALL_MODES, no_replay).bad.empty());
+        if (std::string(u.name) == "unchanged") {
+            for (const Hash& h : sent) {
+                std::vector<char> another = other;
+                another[h.at + 8] ^= 1;
+                REQUIRE(write_patch(day, day.patch(), another));
+                const std::string file = patch_file_names[static_cast<uint32_t>(h.file)];
+                CHECK(not_refused(day, ALL_MODES, day.patch(), file, "Old " + file + " is not the one the patch was made from").empty());
+            }
+            continue;
+        }
+        // The interpolations' first ways: the old pair holds nothing to copy or to check.
+        for (const Hash& h : sent) {
+            if (h.kind == &way_files::INTERPS) other[h.at + 8] ^= 1;
+        }
+        REQUIRE(write_patch(day, day.patch(), other));
+        CHECK(apply_modes(day, ALL_MODES, no_replay).bad.empty());
+    }
+}
+
+// A byte of an old way file that is not the one the diff read is refused,
+// whichever it is: every byte of the pair's two files flipped in turn (one
+// in five under the sanitizers), of 20 streets and of 18 interpolations of 2
+// to 4 nodes on a day that moves a node of way 3, so that its group is
+// encoded, and renames way 17, whose group is copied. The files' own checks
+// refuse some (a footer, a row's place, a block the decoder refuses), the
+// replay some as a patch whose nodes do not fit the ways, and the hash of the
+// file every other: a block of the copied group, which the replay never
+// decodes, and that group's anchor and the name of a way that keeps it,
+// which go into the new row as they are.
+TEST(patch_refuses_a_flipped_byte_in_an_old_way_file_by_its_hash) {
+    ScratchDir dir("lowmem-way-flip");
+    const size_t step = gctest::heap_peak_shim() ? 1 : 5;
+    for (const way_files::Kind* kind : BOTH_WAY_KINDS) {
+        std::mt19937 rng(20261124);
+        std::vector<Way> old_day;
+        for (uint32_t i = 0; i < (kind->interp ? 18u : 20u); i++) {
+            Way w = way_fields(rng, kind->interp);
+            w.nodes = way_nodes(rng, 2 + rng() % 3, i % 16 == 5 ? 1 : 0);
+            old_day.push_back(w);
+        }
+        std::vector<Way> new_day = old_day;
+        new_day[3].nodes[2] ^= 0x10;
+        new_day[17].name += 8;
+        BuildDir old_d, new_d;
+        put_ways(old_d, *kind, old_day);
+        put_ways(new_d, *kind, new_day);
+        const LowMemCase c{dir.path(), kind->interp ? "interps" : "streets"};
+        REQUIRE(prepare(c, old_d, new_d, {}, {}, {"--identity-slots"}).empty());
+        CHECK(apply_modes(c, ALL_MODES, way_replay_did(*kind, {1, 1, 8 * (nodes_in(old_day, 0, 16) - 1), 0, 0})).bad.empty());
+
+        // The second group's row, after the first's, and where its blocks
+        // start.
+        const std::vector<char> rows = read_file(c.dir("old") + "/" + kind->ways_file);
+        const size_t row_at = kind->row_bytes(way_files::GROUP_WAYS), second_ways = old_day.size() - way_files::GROUP_WAYS;
+        REQUIRE(rows.size() == row_at + kind->row_bytes(second_ways) + way_files::WAYS_FOOTER_BYTES);
+        const way_files::Row second = way_files::decode_row(*kind, reinterpret_cast<const uint8_t*>(rows.data()) + row_at, second_ways);
+        const std::string hash_of[2] = {std::string("Old ") + kind->ways_file + " is not the one the patch was made from",
+                                        std::string("Old ") + kind->nodes_file + " is not the one the patch was made from"};
+        // What the files' checks say, and what the replay says of a patch
+        // that does not fit the old files.
+        const std::string checks = "Malformed way files: ";
+        const std::vector<std::string> misfits = {"decodes to ", "ends before its records do", "has bytes past its last record",
+                                                  "does not match the new build", "Malformed merge sequence: "};
+        for (int f = 0; f < 2; f++) {
+            const std::string name = f == 0 ? kind->ways_file : kind->nodes_file, path = c.dir("old") + "/" + name;
+            const std::vector<char> file = read_file(path);
+            // How the patcher refuses the old file with the bit at % 8 of
+            // byte `at` flipped: by the hash, by the files' checks, as a
+            // misfit, or "" when it does not refuse it by any of those.
+            auto refused_by = [&](size_t at) -> std::string {
+                std::vector<char> flipped = file;
+                flipped[at] = static_cast<char>(flipped[at] ^ (1 << (at % 8)));
+                if (!write_file(path, flipped)) return "";
+                const std::string out = c.dir("out.flipped");
+                std::filesystem::remove_all(out);
+                const ToolRun r = run_tool(patch_words(c, "sync", c.patch(), out), c.log());
+                if (r.ok) return "";
+                if (logged(r, hash_of[f])) return "hash";
+                if (logged(r, checks)) return "checks";
+                for (const std::string& misfit : misfits)
+                    if (logged(r, misfit)) return "misfit";
+                return "";
+            };
+            // The bytes only the hash holds: the copied group's anchor (its
+            // lat and its lng) and its first way's name, which that way
+            // keeps; the first and the last byte of its blocks.
+            const std::vector<size_t> by_hash_alone =
+                f == 0 ? std::vector<size_t>{row_at + 4, row_at + 9,
+                                             row_at + way_files::ROW_HEAD_BYTES + second_ways * (kind->row_way_bytes - 4)}
+                       : std::vector<size_t>{second.off, second.off + static_cast<size_t>(second.blocks_bytes()) - 1};
+            for (const size_t at : by_hash_alone) CHECK_EQ(refused_by(at), std::string("hash"));
+            std::map<std::string, size_t> refused;
+            for (size_t at = 0; at < file.size(); at += step) {
+                const std::string by = refused_by(at);
+                if (by.empty()) std::printf("    %s: byte %zu flipped is not refused by name\n", name.c_str(), at);
+                refused[by]++;
+            }
+            REQUIRE(write_file(path, file));
+            CHECK_EQ(refused[""], size_t{0});
+            CHECK(refused["hash"] > 0);
+            CHECK(refused["checks"] > 0);
+            std::printf("    %s: %zu bytes flipped in turn: %zu refused by the hash, %zu by the files' checks, %zu as a patch that does not fit\n",
+                        name.c_str(), (file.size() + step - 1) / step, refused["hash"], refused["checks"], refused["misfit"]);
+        }
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    }
+}
+
+// The nodes of a pair sent whole, as a full replacement, are the patch's and
+// not the old pair's, whatever the old group at hand holds: 40 ways of 3 to 9
+// nodes, the second node of each moved, so that every group has the old
+// group's node counts and none its nodes. The diff's patch, its nodes'
+// section put again by hand as the new nodes whole, gives the new pair in
+// every mode, every group encoded and no old node read: under the ways'
+// section sent as unchanged, and under their merge when a way is renamed too.
+TEST(patch_way_replay_takes_the_nodes_a_patch_sends_whole) {
+    ScratchDir dir("lowmem-way-whole");
+    for (const way_files::Kind* kind : BOTH_WAY_KINDS) {
+        std::mt19937 rng(20261127);
+        const std::vector<Way> old_day = ways_with_nodes(rng, kind->interp, 40);
+        std::vector<Way> moved = old_day;
+        for (Way& w : moved) w.nodes[2] ^= 0x10;
+        std::vector<Way> renamed = moved;
+        renamed[30].name += 8;
+        for (const auto& [name, new_day] : {std::pair<std::string, std::vector<Way>>{"nodes-alone", moved}, {"renamed-too", renamed}}) {
+            BuildDir old_d, new_d;
+            put_ways(old_d, *kind, old_day);
+            put_ways(new_d, *kind, new_day);
+            const LowMemCase c{dir.path(), std::string(kind->interp ? "interps-" : "streets-") + name};
+            REQUIRE(prepare(c, old_d, new_d).empty());
+            const std::vector<char> raw = raw_patch(c);
+            const std::vector<char>& nodes = new_d.at(kind->nodes_file);
+            const size_t at = find_once(raw, section_head(nodes_id(*kind), 8, nodes.size(), nodes.size()));
+            REQUIRE(at != std::string::npos);
+            std::vector<char> whole(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(at));
+            const std::vector<char> sent = replacement_of(nodes_id(*kind), nodes.size(), nodes);
+            whole.insert(whole.end(), sent.begin(), sent.end());
+            whole.insert(whole.end(), raw.begin() + static_cast<std::ptrdiff_t>(merge_section_end(raw, at)), raw.end());
+            REQUIRE(write_patch(c, c.patch(), whole));
+
+            CHECK(apply_modes(c, ALL_MODES, way_replay_did(*kind, {0, 3, 0, 0, 0})).bad.empty());
+            for (const std::string& mode : ALL_MODES) CHECK(wrote_the_builders_pair(c.dir("out." + mode), *kind, new_d));
+        }
+    }
+}
+
+// Old way files whose rows do not give the nodes file its footer counts are
+// refused by name in every mode, though each row's blocks start where the
+// blocks before it end and the footers give the sizes the patch expects. 40
+// street ways, the last of three nodes at one place, whose block is its
+// first node alone whatever its count:
+//   that way's count 4 in its row, on a day that drops the way: the ways
+//     have a node more than the footer counts;
+//   its code a byte less for its first node, on that day: its block ends two
+//     bytes before the footer;
+//   its count 2, on a day that renames the way: the patch keeps three nodes
+//     of it, and the replay's cursor, looking for the third, finds the ways
+//     a node short.
+// The patches apply to the files as written.
+TEST(patch_refuses_old_way_files_whose_rows_do_not_give_their_nodes) {
+    ScratchDir dir("patch-old-way-rows");
+    std::mt19937 rng(20261128);
+    std::vector<Way> day = ways_with_nodes(rng, false, 40);
+    const uint32_t lat = seven_decimals(471234567), lng = seven_decimals(81234567);
+    day[39].nodes = {lat, lng, lat, lng, lat, lng};
+    std::vector<Way> dropped(day.begin(), day.begin() + 39), renamed = day;
+    renamed[39].name += 8;
+    const uint64_t nodes = nodes_in(day, 0, 40);
+    // The last way's count and code, the eighth pair of the third row's.
+    const size_t count_at = 2 * way_files::STREETS.row_bytes(way_files::GROUP_WAYS) + way_files::ROW_HEAD_BYTES + 7 * 4;
+    struct Edit {
+        std::string name;
+        const std::vector<Way>& new_day;
+        size_t at;
+        int by;
+        std::string refusal;
+    };
+    const Edit edits[] = {
+        {"a-node-more", dropped, count_at, 1,
+         "street_nodes.bin counts " + std::to_string(nodes) + " nodes and its ways have " + std::to_string(nodes + 1)},
+        {"a-shorter-block", dropped, count_at + 2, -0x2000, "street_nodes.bin has bytes between its last block and its footer"},
+        {"a-node-fewer", renamed, count_at, -1,
+         "street_nodes.bin counts " + std::to_string(nodes) + " nodes and its ways have " + std::to_string(nodes - 1)},
+    };
+    for (const Edit& e : edits) {
+        BuildDir old_d, new_d;
+        put_ways(old_d, way_files::STREETS, day);
+        put_ways(new_d, way_files::STREETS, e.new_day);
+        const LowMemCase c{dir.path(), e.name};
+        REQUIRE(prepare(c, old_d, new_d).empty());
+        const std::string path = c.dir("old") + "/street_ways.bin";
+        const std::vector<char> rows = read_file(path);
+        std::vector<char> edited = rows;
+        uint16_t field;
+        memcpy(&field, rows.data() + e.at, 2);
+        // The way is not its group's first with nodes: its first node takes bytes.
+        REQUIRE((e.at == count_at ? field == 3 : way_files::first_bytes(field) > 0));
+        put_at(edited, e.at, static_cast<uint16_t>(field + e.by));
+        REQUIRE(write_file(path, edited));
+
+        CHECK(not_refused(c, ALL_MODES, c.patch(), e.name, "Malformed way files: " + e.refusal).empty());
+
+        REQUIRE(write_file(path, rows));
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    }
+}
+
+// An old pair whose footers give its nodes another size than the patch is
+// refused by name in every mode before a way is replayed: 40 ways, and in
+// the old dir the pair of a day whose last way has a node more (the records'
+// bytes are as many), under the records' merge of a day that renames a way
+// and under their section sent as unchanged on a day that moves a node. The
+// patches apply to the pair they were made from.
+TEST(patch_refuses_to_replay_an_old_way_pair_whose_nodes_are_of_another_size) {
+    ScratchDir dir("patch-old-way-sizes");
+    for (const way_files::Kind* kind : BOTH_WAY_KINDS) {
+        std::mt19937 rng(20261129);
+        const std::vector<Way> day = ways_with_nodes(rng, kind->interp, 40);
+        std::vector<Way> renamed = day, moved = day, longer = day;
+        renamed[30].name += 8;
+        moved[5].nodes[2] ^= 0x10;
+        longer[39].nodes.insert(longer[39].nodes.end(), {longer[39].nodes[0], longer[39].nodes[1]});
+        BuildDir old_d, other;
+        put_ways(old_d, *kind, day);
+        put_ways(other, *kind, longer);
+        const BuildDir stale = gctest::as_written(other), written = gctest::as_written(old_d);
+        const uint64_t nodes_bytes = old_d.at(kind->nodes_file).size();
+        for (const auto& [name, new_day] : {std::pair<std::string, std::vector<Way>>{"renamed", renamed}, {"moved", moved}}) {
+            BuildDir new_d;
+            put_ways(new_d, *kind, new_day);
+            const LowMemCase c{dir.path(), std::string(kind->interp ? "interps-" : "streets-") + name};
+            REQUIRE(prepare(c, old_d, new_d).empty());
+            for (const char* file : {kind->ways_file, kind->nodes_file}) REQUIRE(write_file(c.dir("old") + "/" + file, stale.at(file)));
+
+            CHECK(not_refused(c, ALL_MODES, c.patch(), name,
+                              std::string("old ") + kind->nodes_file + " decodes to " + std::to_string(nodes_bytes + 8) +
+                                  " bytes, the patch expects " + std::to_string(nodes_bytes))
+                      .empty());
+            for (const std::string& mode : ALL_MODES) CHECK(!std::filesystem::exists(c.dir(name + ".out." + mode) + "/" + kind->ways_file));
+
+            for (const char* file : {kind->ways_file, kind->nodes_file}) REQUIRE(write_file(c.dir("old") + "/" + file, written.at(file)));
+            CHECK(apply_modes(c, ALL_MODES).bad.empty());
+        }
+    }
+}
+
+// Merge sequences the way replay cannot apply are refused by name in every
+// mode. 40 street ways of 3 to 9 nodes on a day that changes nothing, the
+// pair's two sections put again by hand:
+//   the ways: a DELETE and a REPLACE run past the old pair's last way, an op
+//     no merge has, an INSERT run longer than its records, a way more and a
+//     way fewer than the section's new size, and a way whose node_offset is
+//     not the nodes before it;
+//   the ways' fixups: an offset fixup value and a string fixup for a way
+//     past the old pair's last, which the replay leaves over;
+//   the nodes: a MATCH run that ends past the old pair's last node, a
+//     sequence that ends before the ways' nodes do, one with a node after
+//     them, and a new size the sequence does not give;
+//   the two sections a second time.
+// The sections as one MATCH run each, and the patch as made, apply.
+TEST(patch_refuses_merge_sequences_the_way_replay_cannot_apply) {
+    ScratchDir dir("lowmem-way-refusals");
+    std::mt19937 rng(20261125);
+    const std::vector<Way> day = ways_with_nodes(rng, false, 40);
+    BuildDir d;
+    put_ways(d, way_files::STREETS, day);
+    const WaySections s(dir.path(), "streets", d, way_files::STREETS);
+    REQUIRE(s.found());
+    const std::vector<char>& records = d.at("street_ways.bin");
+    const std::vector<char>& nodes = d.at("street_nodes.bin");
+    const uint32_t n_nodes = static_cast<uint32_t>(nodes.size() / 8);
+    std::vector<char> every_way, every_node;
+    put_op(every_way, OP_MATCH_RUN, 40);
+    put_op(every_node, OP_MATCH_RUN, n_nodes);
+    auto ways_then = [&](uint8_t op, uint32_t count, const char* data = nullptr) {
+        std::vector<char> ops = every_way;
+        put_op(ops, op, count, data, WAY_HEADER_STRIDE);
+        return ops;
+    };
+    std::vector<char> cut_insert = ways_then(OP_INSERT_RUN, 1, records.data());
+    put_at(cut_insert, cut_insert.size() - WAY_HEADER_STRIDE - 4, 2u);
+    std::vector<char> one_fewer, misplaced, late_nodes, early_end, node_more = every_node;
+    put_op(one_fewer, OP_MATCH_RUN, 39);
+    put_op(one_fewer, OP_DELETE_RUN, 1);
+    std::vector<char> last(records.end() - WAY_HEADER_STRIDE, records.end());
+    put_at(last, 0, 7u);
+    put_op(misplaced, OP_MATCH_RUN, 39);
+    put_op(misplaced, OP_REPLACE_RUN, 1, last.data(), WAY_HEADER_STRIDE);
+    put_op(late_nodes, OP_DELETE_RUN, 1);
+    put_op(late_nodes, OP_MATCH_RUN, n_nodes);
+    put_op(early_end, OP_MATCH_RUN, n_nodes - 1);
+    put_op(node_more, OP_INSERT_RUN, 1, nodes.data(), 8);
+    std::vector<char> grown = s.merges(every_way, every_node);
+    put_at(grown, grown.size() - (56 + every_node.size()) + 16, uint64_t{nodes.size() + 8});
+    std::vector<char> twice = s.merges(every_way, every_node);
+    const std::vector<char> duplicate = twice;
+    twice.insert(twice.end(), duplicate.begin(), duplicate.end());
+
+    struct Edit {
+        std::string name;
+        std::vector<char> sections;
+        std::string refusal;
+    };
+    const Edit edits[] = {
+        {"delete-past", s.merges(ways_then(OP_DELETE_RUN, 1), every_node),
+         "Malformed merge sequence: street_ways.bin (a DELETE run past the old file)"},
+        {"replace-past", s.merges(ways_then(OP_REPLACE_RUN, 1, records.data()), every_node),
+         "Malformed merge sequence: street_ways.bin (a REPLACE run past the old file)"},
+        {"no-such-op", s.merges(ways_then(9, 1), every_node), "Malformed merge sequence: street_ways.bin"},
+        {"cut-insert", s.merges(cut_insert, every_node), "Malformed merge sequence: street_ways.bin"},
+        {"a-way-more", s.merges(ways_then(OP_INSERT_RUN, 1, records.data()), every_node), "Rebuilt street_ways.bin does not match the new build"},
+        {"a-way-fewer", s.merges(one_fewer, every_node), "Rebuilt street_ways.bin does not match the new build"},
+        {"node-offset", s.merges(misplaced, every_node), "Malformed way files: street_ways.bin way 39 has a node_offset of 7, not the "},
+        // Varints: way 40 from way 0, an offset of 0; slot 40 from slot 0, no change of the value.
+        {"offset-fixup-left", s.merges(every_way, every_node, {1, {40, 0}}), "Malformed offset fixups"},
+        {"string-fixup-left", s.merges(every_way, every_node, {}, {1, {40, 0}}), "Malformed string fixups"},
+        {"match-past", s.merges(every_way, late_nodes), "Malformed merge sequence: street_nodes.bin"},
+        {"nodes-end-early", s.merges(every_way, early_end), "street_nodes.bin ends before its records do"},
+        {"a-node-more", s.merges(every_way, node_more), "street_nodes.bin has bytes past its last record"},
+        {"nodes-grown", grown, "Rebuilt street_nodes.bin does not match the new build"},
+        {"twice", twice, "old street_ways.bin opened twice"},
+    };
+    for (const Edit& e : edits) {
+        const std::string patch = s.c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(s.c, patch, s.with(e.sections)));
+
+        CHECK(not_refused(s.c, ALL_MODES, patch, e.name, e.refusal).empty());
+    }
+    REQUIRE(write_patch(s.c, s.c.patch(), s.with(s.merges(every_way, every_node))));
+    CHECK(apply_modes(s.c, ALL_MODES, way_replay_did(way_files::STREETS, {3, 0, 0, 0, 0})).bad.empty());
+    REQUIRE(write_patch(s.c, s.c.patch(), s.raw));
+    CHECK(apply_modes(s.c, ALL_MODES).bad.empty());
+}
+
+// What the files after a way pair need of its replay, on a day that moves
+// street ways: 40 street ways by entity, the first 16 swapped in pairs and
+// every way after the fortieth renamed, named from a street tier whose
+// strings the new day reverses; a parent and a postcode a way; 30
+// interpolations, one gone and one with a node moved, with a postcode each;
+// 100 address points on the first entity's way; and a geo index whose cells
+// list ways, address points and interpolations. The ways' merge sequences are
+// where the side files' deltas walk them, their MATCH and REPLACE runs and
+// the moved ways' pairs make the remaps the address points' parent ways and
+// the geo lists move by, and their MATCH records' names move by the string
+// remap or, with every moved string sent past the pairs, by the section's
+// string fixups, their node_offsets by its offset fixups. In every mode the
+// patched dir is the new dir.
+TEST(the_way_replay_records_the_sequences_and_runs_the_side_files_and_geo_lists_need) {
+    ScratchDir dir("lowmem-way-duties");
+    constexpr uint32_t STREETS = 56, SWAPPED = 16, NAMES = 20, NAME = 12, INTERPS = 30;  // "way 0000000\0"
+    std::string old_pool, new_pool;
+    for (uint32_t i = 0; i < NAMES; i++) {
+        char b[16];
+        std::snprintf(b, sizeof b, "way %07u", i);
+        old_pool += std::string(b, NAME);
+        std::snprintf(b, sizeof b, "way %07u", NAMES - 1 - i);
+        new_pool += std::string(b, NAME);
+    }
+    // The dir of a day: its street ways' entities in record order.
+    auto day = [&](const std::vector<uint32_t>& entities, bool is_new) {
+        std::mt19937 rng(20261126);
+        BuildDir d;
+        std::vector<Way> streets(STREETS), interps;
+        std::vector<char> slots, parents, way_postcodes, interp_postcodes;
+        // An entity's name in the day's pool; the renamed ones take the next.
+        auto name_of = [&](uint32_t name) { return (is_new ? NAMES - 1 - name : name) * NAME; };
+        std::vector<uint32_t> record_of(STREETS);
+        for (uint32_t w = 0; w < STREETS; w++) {
+            const uint32_t e = entities[w];
+            record_of[e] = w;
+            std::mt19937 own(1000 + e);
+            streets[w].name = name_of((e + (is_new && e >= 40)) % NAMES);
+            streets[w].nodes = way_nodes(own, 2 + e % 5, e % 16 == 5 ? 1 : 0);
+            append(slots, e);
+            append(parents, e % 9);
+            append(way_postcodes, e % 3 ? name_of(e % 7) : NO);
+        }
+        for (uint32_t i = 0; i < INTERPS; i++) {
+            if (is_new && i == 12) continue;
+            std::mt19937 own(5000 + i);
+            Way w = way_fields(own, true);
+            w.name = name_of(i % NAMES);
+            w.nodes = way_nodes(own, 3, 0);
+            if (is_new && i == 20) w.nodes[2] ^= 0x10;
+            interps.push_back(w);
+            append(interp_postcodes, name_of(i % 5));
+        }
+        put_ways(d, way_files::STREETS, streets);
+        put_ways(d, way_files::INTERPS, interps);
+        d["way_parents.bin"] = parents;
+        d["way_postcodes.bin"] = way_postcodes;
+        d["interp_postcodes.bin"] = interp_postcodes;
+        std::vector<Addr> addrs;
+        for (uint32_t i = 0; i < 100; i++) addrs.push_back({47.0f + static_cast<float>(i) * 1e-4f, {}});
+        put_addrs(d, addrs);
+        std::vector<char>& points = d["addr_points.bin"];
+        for (size_t at = ADDR_POINT_PARENT_WAY_ID_OFF; at < points.size(); at += ADDR_POINT_STRIDE) put_at(points, at, record_of[0]);
+        // Twenty cells: each lists two street entities' ways, five address
+        // points and its own interpolation, while the day has it.
+        std::vector<char> top, blocks;
+        geo_index::Writer writer([&](const char* p, size_t n) { top.insert(top.end(), p, p + n); },
+                                 [&](const char* p, size_t n) { blocks.insert(blocks.end(), p, p + n); });
+        for (uint32_t k = 0; k < 20; k++) {
+            geo_index::RowLists lists;
+            lists[0] = {record_of[2 * k], record_of[2 * k + 1]};
+            std::sort(lists[0].begin(), lists[0].end());
+            for (uint32_t a = 0; a < 5; a++) lists[1].push_back(5 * k + a);
+            if (!(is_new && k == 12)) lists[2] = {is_new && k > 12 ? k - 1 : k};
+            writer.add(cell_id(k), geo_index::ids_of(lists));
+        }
+        writer.finish();
+        d["geo_cells.bin"] = top;
+        d["geo_entries.bin"] = blocks;
+        const std::string& pool = is_new ? new_pool : old_pool;
+        d["strings_street.bin"].assign(pool.begin(), pool.end());
+        BuildDir meta;
+        meta["street.slot.u32"] = slots;
+        return std::pair<BuildDir, BuildDir>{d, meta};
+    };
+    std::vector<uint32_t> entities, new_entities;
+    for (uint32_t w = 0; w < STREETS; w++) {
+        entities.push_back(w);
+        new_entities.push_back(w < SWAPPED ? w ^ 1 : w);
+    }
+    const auto [old_d, old_meta] = day(entities, false);
+    const auto [new_d, new_meta] = day(new_entities, true);
+    for (const bool pairs : {true, false}) {
+        const LowMemCase c{dir.path(), pairs ? "string-pairs" : "string-fixups"};
+        REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta, pairs ? std::vector<std::string>{} : NO_STRING_PAIRS).empty());
+        const std::vector<char> raw = raw_patch(c);
+        // The moved ways' pairs, in the parent-id remap's street leg.
+        std::vector<char> leg;
+        for (const uint32_t w : {POI_PARENT_REMAP_MARKER, SWAPPED / 2}) append(leg, w);
+        REQUIRE(find_once(raw, leg) != std::string::npos);
+        // The street ways' section: its offset fixups, and its string fixups
+        // when no pair is sent.
+        const size_t ways_at = find_once(raw, section_head(PatchFileId::STREET_WAYS, WAY_HEADER_STRIDE, old_d.at("street_ways.bin").size(),
+                                                           new_d.at("street_ways.bin").size()));
+        REQUIRE(ways_at != std::string::npos);
+        uint32_t offset_fixups[2] = {0, 0}, fixup_bytes[2] = {0, 0}, string_fixups = 0;
+        memcpy(offset_fixups, raw.data() + ways_at + 24, 8);
+        memcpy(fixup_bytes, raw.data() + ways_at + 32, 8);
+        memcpy(&string_fixups, raw.data() + ways_at + 40 + fixup_bytes[0] + fixup_bytes[1], 4);
+        REQUIRE(offset_fixups[0] + offset_fixups[1] > 0);
+        REQUIRE((string_fixups > 0) == !pairs);
+
+        const LogCheck ran = [](const std::string& log) -> std::string {
+            for (const way_files::Kind* kind : BOTH_WAY_KINDS)
+                if (!way_replay_of(log, *kind)) return std::string("no way replay of ") + kind->ways_file;
+            for (const char* line : {"way_parents.bin: parallel delta along street_ways.bin",
+                                     "way_postcodes.bin: parallel delta along street_ways.bin",
+                                     "interp_postcodes.bin: parallel delta along interp_ways.bin"})
+                if (log.find(line) == std::string::npos) return std::string("no \"") + line + "\"";
+            return "";
+        };
+        CHECK(apply_modes(c, ALL_MODES, ran).bad.empty());
+    }
+}
+
+// --- The address replay: the address files replayed as they sit ---
+
+namespace {
+
+// An address by record: its point, its ids and its footprint's logical blob
+// (none: a point).
+struct Address {
+    float lat, lng;
+    uint32_t housenumber, street, parent;
+    std::vector<char> blob;
+};
+
+// The record the builder fills a slot without an address with.
+Address dead_slot() { return {0.0f, 0.0f, 0, 0, NO, {}}; }
+
+// The vertices of a footprint's logical blob: 8 bytes each in encoding 3,
+// else 4.
+uint32_t vertices_of(const std::vector<char>& blob) {
+    return static_cast<uint32_t>((blob.size() - addr_files::LOGICAL_HEADER) / addr_files::vertex_bytes(static_cast<uint8_t>(blob[0])));
+}
+
+// addr_points.bin and addr_vertices.bin of addresses, into d.
+void put_addresses(BuildDir& d, const std::vector<Address>& addresses) {
+    std::vector<char> points, verts;
+    for (const Address& a : addresses) {
+        append(points, a.lat);
+        append(points, a.lng);
+        append(points, a.housenumber);
+        append(points, a.street);
+        append(points, a.parent);
+        append(points, a.blob.empty() ? NO : static_cast<uint32_t>(verts.size()));
+        append(points, a.blob.empty() ? 0u : vertices_of(a.blob));
+        verts.insert(verts.end(), a.blob.begin(), a.blob.end());
+    }
+    d["addr_points.bin"] = points;
+    d["addr_vertices.bin"] = verts;
+}
+
+// The logical blob of a footprint of n vertices in encoding enc (0 to 2)
+// under a record at (lat, lng): steps below span (closed: the last vertex the
+// first) from a bbox minimum `off` order keys past where the point predicts
+// each axis's (addr_files.h). Within 127 either way its blob holds the two
+// residuals, a byte each, and so is that point's alone: the same footprint
+// under a point one step away has another blob.
+std::vector<char> footprint_at(std::mt19937& rng, float lat, float lng, uint32_t n, uint8_t enc = 0, int off = 3,
+                               uint32_t span = 4000, bool closed = false) {
+    std::vector<char> b(addr_files::LOGICAL_HEADER + size_t{4} * n, 0);
+    b[0] = static_cast<char>(enc);
+    uint64_t sum_lat = 0, sum_lng = 0;
+    for (uint32_t k = 0; k < n; k++) {
+        uint16_t q_lat = static_cast<uint16_t>(rng() % span), q_lng = static_cast<uint16_t>(rng() % span);
+        if (closed && k > 0 && k + 1 == n) {
+            memcpy(&q_lat, b.data() + addr_files::LOGICAL_HEADER, 2);
+            memcpy(&q_lng, b.data() + addr_files::LOGICAL_HEADER + 2, 2);
+        }
+        put_at(b, addr_files::LOGICAL_HEADER + size_t{4} * k, q_lat);
+        put_at(b, addr_files::LOGICAL_HEADER + size_t{4} * k + 2, q_lng);
+        sum_lat += q_lat;
+        sum_lng += q_lng;
+    }
+    const addr_files::Prediction p = addr_files::predict(coord_keys::bits_of(lat), coord_keys::bits_of(lng), sum_lat, sum_lng, n, enc);
+    put_at(b, 2, coord_keys::from_order_key(coord_keys::order_key(p.lat) + static_cast<uint32_t>(off)));
+    put_at(b, 6, coord_keys::from_order_key(coord_keys::order_key(p.lng) + static_cast<uint32_t>(off)));
+    return b;
+}
+
+// The logical blob of an escaped footprint: n vertices of 8 random bytes in
+// encoding 3.
+std::vector<char> escape_of(std::mt19937& rng, uint32_t n) {
+    std::vector<char> b = block(rng, 2 * n);
+    b[0] = 3;
+    return b;
+}
+
+// Where each address's blob starts in the addr_vertices.bin the builder
+// writes, and its bytes there (none for a point).
+struct BlobAt {
+    uint64_t at;
+    uint32_t len;
+};
+std::vector<BlobAt> blobs_at(const std::vector<Address>& addresses) {
+    std::vector<BlobAt> at;
+    uint64_t pos = 0;
+    std::vector<uint8_t> blob;
+    for (const Address& a : addresses) {
+        blob.clear();
+        if (!a.blob.empty())
+            addr_files::encode_blob(reinterpret_cast<const uint8_t*>(a.blob.data()), vertices_of(a.blob), coord_keys::bits_of(a.lat),
+                                    coord_keys::bits_of(a.lng), blob);
+        at.push_back({pos, static_cast<uint32_t>(blob.size())});
+        pos += blob.size();
+    }
+    return at;
+}
+
+// How many of the addresses have a footprint.
+uint64_t footprints_in(const std::vector<Address>& addresses) {
+    uint64_t n = 0;
+    for (const Address& a : addresses) n += !a.blob.empty();
+    return n;
+}
+
+// Whether an address keeps its point and its footprint, byte for byte: its
+// blob in the old files is the builder's for it in the new ones.
+bool keeps_its_blob(const Address& was, const Address& is) {
+    return !is.blob.empty() && is.blob == was.blob && coord_keys::bits_of(is.lat) == coord_keys::bits_of(was.lat) &&
+           coord_keys::bits_of(is.lng) == coord_keys::bits_of(was.lng);
+}
+
+// What the address replay says of the new footprints in the patcher's log:
+// the blobs it copied from the old file as bytes and those it encoded, and
+// the old footprint bytes the encoded ones kept, by where it read them: the
+// blob of the old record it was at, one it had passed (read again), or the
+// cursor that decodes the old files a second time. found: the log has the
+// line.
+struct AddrReplayed {
+    bool found = false;
+    uint64_t copied = 0, encoded = 0, at_hand = 0, read_again = 0, by_cursor = 0;
+    std::string text() const {
+        return std::to_string(copied) + " copied, " + std::to_string(encoded) + " encoded; old footprint bytes " + std::to_string(at_hand) +
+               " at hand, " + std::to_string(read_again) + " read again, " + std::to_string(by_cursor) + " by the cursor";
+    }
+};
+
+AddrReplayed addr_replayed(const std::string& log) {
+    AddrReplayed n;
+    const size_t at = log.find("replayed with addr_points.bin: blobs ");
+    if (at == std::string::npos) return n;
+    n.found = std::sscanf(log.c_str() + at,
+                          "replayed with addr_points.bin: blobs %" SCNu64 " copied, %" SCNu64 " encoded; old footprint bytes %" SCNu64
+                          " at hand, %" SCNu64 " read again, %" SCNu64 " by the cursor",
+                          &n.copied, &n.encoded, &n.at_hand, &n.read_again, &n.by_cursor) == 5;
+    return n;
+}
+
+// A check that the address replay ran and copied and encoded exactly these
+// many blobs, with these many old footprint bytes from each place.
+LogCheck addr_replayed_is(uint64_t copied, uint64_t encoded, uint64_t at_hand = 0, uint64_t read_again = 0, uint64_t by_cursor = 0) {
+    return [=](const std::string& log) -> std::string {
+        const AddrReplayed n = addr_replayed(log);
+        if (!n.found) return "no address replay in the log";
+        AddrReplayed want;
+        want.copied = copied;
+        want.encoded = encoded;
+        want.at_hand = at_hand;
+        want.read_again = read_again;
+        want.by_cursor = by_cursor;
+        return n.text() == want.text() ? "" : "the address replay gave " + n.text() + ", not " + want.text();
+    };
+}
+
+// The hash section of an old file as the diff writes it for c's old dir.
+std::vector<char> old_hash_section(const LowMemCase& c, PatchFileId file) {
+    const std::vector<char> bytes = read_file(c.dir("old") + "/" + patch_file_names[static_cast<uint32_t>(file)]);
+    return old_file_hash(file, lane_hash(bytes.data(), bytes.size()));
+}
+
+const char* const ADDRESS_FILES[] = {"addr_points.bin", "addr_vertices.bin", "addr_index.bin"};
+const std::string NOT_THE_PATCHS_POINTS = "Old addr_points.bin is not the one the patch was made from";
+const std::string NOT_THE_PATCHS_FOOTPRINTS = "Old addr_vertices.bin is not the one the patch was made from";
+
+// The old dir's addr_vertices.bin with the byte at `at` flipped is refused in
+// every mode by its hash; the file is then as it was. Every mode that did not
+// refuse it so.
+std::vector<std::string> flipped_blob_byte_not_refused(const LowMemCase& c, const std::string& name, uint64_t at) {
+    const std::string path = c.dir("old") + "/addr_vertices.bin";
+    const std::vector<char> file = read_file(path);
+    if (at >= file.size()) return {name + ": no byte " + std::to_string(at)};
+    std::vector<char> flipped = file;
+    flipped[at] ^= 0x10;
+    if (!write_file(path, flipped)) return {name + ": not written"};
+    const std::vector<std::string> bad = not_refused(c, ALL_MODES, c.patch(), name, NOT_THE_PATCHS_FOOTPRINTS);
+    if (!write_file(path, file)) return {name + ": not restored"};
+    return bad;
+}
+
+}  // namespace
+
+// Random days of addresses as strategy 2 leaves them: an old day of 700 slots
+// (points, footprints in every encoding, closed and open, at every width,
+// their bbox minimum a residual's byte from where the point predicts it or
+// further off, an escape by its vertices and the largest footprint a blob
+// holds, dead slots) on named streets, and a new day that changes ids, moves
+// points a step, edits, replaces, drops and adds footprints, kills addresses
+// and appends 40, while the names move: in runs, as pairs, or as the string
+// fixups of the records that keep them. By slot every address stays at its
+// record; by content the new day drops and inserts records too. In every mode
+// the patcher writes the builder's address files of the new day (write_dir
+// writes them through addr_files::encode), byte for byte, and its log counts
+// the blobs it copied: by slot those of the addresses that keep their point
+// and their footprint, each one.
+TEST(patch_rebuilds_the_builders_address_files_on_random_days) {
+    ScratchDir dir("lowmem-addr-days");
+    constexpr uint32_t NAME = 12, NAMES = 60, N = 700;  // "str 0000000\0"
+    std::string names;
+    for (uint32_t i = 0; i < NAMES; i++) {
+        char b[16];
+        std::snprintf(b, sizeof b, "str %07u", i);
+        names += std::string(b, NAME);
+    }
+    struct Slot {
+        Address a;  // its housenumber and street the names' numbers
+        bool dead;
+    };
+    for (uint32_t seed = 1; seed <= 4; seed++) {
+        std::mt19937 rng(20261116 + seed);
+        const bool by_slot = seed % 2 == 0, reversed = seed > 2;
+        // The new day's names: without every fifth, so that the others move in
+        // runs; or in reverse order, so that each moves on its own.
+        std::string new_names;
+        for (uint32_t i = 0; i < NAMES; i++) {
+            const uint32_t k = reversed ? NAMES - 1 - i : i;
+            if (reversed || k % 5 != 4) new_names += names.substr(size_t{k} * NAME, NAME);
+        }
+        const std::function<uint32_t(uint32_t)> old_name = [&](uint32_t i) { return i * NAME; };
+        const std::function<uint32_t(uint32_t)> new_name = [&](uint32_t i) {
+            return reversed ? (NAMES - 1 - i) * NAME : (i - (i + 1) / 5) * NAME;
+        };
+        auto name = [&] {
+            uint32_t i = rng() % NAMES;
+            while (i % 5 == 4) i = rng() % NAMES;
+            return i;
+        };
+        auto footprint = [&](float lat, float lng) {
+            const uint32_t r = rng() % 12;
+            if (r == 0) return escape_of(rng, 1 + rng() % 30);
+            const int off = r < 3 ? static_cast<int>(rng() % 2000) - 1000 : static_cast<int>(rng() % 255) - 127;
+            return footprint_at(rng, lat, lng, 1 + rng() % 40, static_cast<uint8_t>(rng() % 3), off, uint32_t{1} << (1 + rng() % 16),
+                                rng() % 2 == 0);
+        };
+        auto slot = [&] {
+            Slot s{{static_cast<float>(47.0 + (rng() % 200000) * 1e-5), static_cast<float>(-8.0 + (rng() % 200000) * 1e-5), name(), name(),
+                    static_cast<uint32_t>(rng() % 500), {}},
+                   false};
+            if (rng() % 3) s.a.blob = footprint(s.a.lat, s.a.lng);
+            return s;
+        };
+        const Slot dead{dead_slot(), true};
+        std::vector<Slot> old_day;
+        for (uint32_t i = 0; i < N; i++) old_day.push_back(i % 37 == 5 ? dead : slot());
+        old_day[123].a.blob = block(rng, MAX_BLOB_VERTICES + 1);
+        old_day[321].a.blob = footprint_at(rng, old_day[321].a.lat, old_day[321].a.lng, MAX_BLOB_VERTICES, 1, 9, 50000);
+        // Each new record and the old one it was, when it keeps its record's
+        // point and footprint.
+        std::vector<Slot> new_day;
+        uint64_t kept = 0, untouched = 0;
+        for (uint32_t i = 0; i < N; i++) {
+            Slot s = old_day[i];
+            const uint32_t r = s.dead || i == 123 || i == 321 ? 99 : rng() % 30;
+            if (r == 0) s.a.housenumber = name();
+            if (r == 1) s.a.street = name();
+            if (r == 2) s.a.parent = static_cast<uint32_t>(rng() % 500);
+            if (r == 3) s.a.lat = std::nextafter(s.a.lat, 100.0f);          // a step away, its footprint's bytes kept
+            if (r == 4 && !s.a.blob.empty()) s.a.blob.back() ^= 1;         // a vertex moved
+            if (r == 5) s.a.blob = footprint(s.a.lat, s.a.lng);            // replaced, or a point given one
+            if (r == 6) s.a.blob.clear();                                  // dropped
+            if (r == 7) s = dead;                                          // killed in place
+            if (r == 8 && !by_slot) continue;                              // gone
+            if (r == 9 && !by_slot) new_day.push_back(slot());             // one before it
+            if (!s.dead && keeps_its_blob(old_day[i].a, s.a)) {
+                kept++;
+                untouched += r > 9;
+            }
+            new_day.push_back(s);
+        }
+        for (uint32_t i = 0; i < 40; i++) new_day.push_back(slot());
+        auto dir_of = [&](const std::vector<Slot>& day, const std::function<uint32_t(uint32_t)>& name_at, const std::string& pool,
+                          uint64_t& footprints) {
+            std::vector<Address> addresses;
+            for (const Slot& s : day) {
+                addresses.push_back(s.a);
+                if (s.dead) continue;
+                addresses.back().housenumber = name_at(s.a.housenumber);
+                addresses.back().street = name_at(s.a.street);
+            }
+            BuildDir d;
+            put_addresses(d, addresses);
+            d[reversed ? "strings_poi.bin" : "strings_street.bin"].assign(pool.begin(), pool.end());
+            footprints = footprints_in(addresses);
+            return d;
+        };
+        uint64_t old_footprints = 0, footprints = 0;
+        const BuildDir old_d = dir_of(old_day, old_name, names, old_footprints), new_d = dir_of(new_day, new_name, new_names, footprints);
+        std::vector<std::string> options;
+        if (by_slot) options.push_back("--identity-slots");
+        if (seed == 4) options.insert(options.end(), NO_STRING_PAIRS.begin(), NO_STRING_PAIRS.end());
+        const LowMemCase c{dir.path(), "seed-" + std::to_string(seed)};
+        REQUIRE(prepare(c, old_d, new_d, {}, {}, options).empty());
+
+        AddrReplayed n;
+        const LogCheck counts = [&](const std::string& log) -> std::string {
+            n = addr_replayed(log);
+            if (!n.found) return "no address replay in the log";
+            if (n.copied + n.encoded != footprints) return "not the new day's " + std::to_string(footprints) + " footprints: " + n.text();
+            if (by_slot ? n.copied != kept : n.copied > kept || n.copied * 10 < untouched * 9)
+                return "of " + std::to_string(kept) + " blobs to keep (" + std::to_string(untouched) + " of records untouched): " + n.text();
+            return "";
+        };
+        CHECK(apply_modes(c, ALL_MODES, counts).bad.empty());
+        const BuildDir want = gctest::as_written(new_d);
+        for (const std::string& mode : ALL_MODES)
+            for (const char* f : ADDRESS_FILES) CHECK(read_file(c.dir("out." + mode) + "/" + f) == want.at(f));
+        std::printf("    seed %u, by %s: %" PRIu64 " old footprints, %" PRIu64 " to keep: %s (the last mode's)\n", seed,
+                    by_slot ? "slot" : "content", old_footprints, kept, n.text().c_str());
+    }
+}
+
+// A day that leaves most footprints alone, by slot: addresses with another
+// house number (the footprint kept), moved a step of latitude or of longitude
+// with their footprint's bytes kept, a footprint's last vertex moved or one
+// added after it (the old footprint's bytes all kept), a footprint replaced,
+// dropped or given to a point, addresses killed in place and appended; an
+// escape kept and one under another house number, and the largest footprint
+// a blob holds kept. In every mode the patcher writes the builder's address
+// files of the new day, copying the blob of each address that keeps its point
+// and its footprint (the log counts them) and encoding every other, its old
+// bytes from the old blob the replay is at. A byte flipped in a copied blob
+// of the old dir (a small one, each escape, the largest) goes through
+// undecoded, and one in the blob of a killed address is never read for a
+// footprint: the old addr_vertices.bin's hash refuses each.
+TEST(patch_copies_the_address_blobs_a_day_leaves_whole) {
+    ScratchDir dir("lowmem-addr-copy");
+    constexpr uint32_t N = 600;
+    std::mt19937 rng(20261117);
+    std::vector<Address> old_day;
+    for (uint32_t i = 0; i < N; i++) {
+        Address a{47.0f + static_cast<float>(i) * 1e-4f, 8.0f + static_cast<float>(i % 7) * 1e-4f, i, 0, i % 30, {}};
+        if (i == 200) a.blob = escape_of(rng, 3000);
+        else if (i == 300) a.blob = block(rng, MAX_BLOB_VERTICES + 1);
+        else if (i == 400) a.blob = footprint_at(rng, a.lat, a.lng, MAX_BLOB_VERTICES, 0, 5, 60000);
+        else if (i % 4) a.blob = footprint_at(rng, a.lat, a.lng, 8 + rng() % 30, static_cast<uint8_t>(i % 3), static_cast<int>(rng() % 200) - 100);
+        old_day.push_back(a);
+    }
+    std::vector<Address> new_day = old_day;
+    for (uint32_t i = 0; i < N; i++) {
+        Address& a = new_day[i];
+        const uint32_t r = i == 200 || i == 400 ? 99 : i == 300 ? 0 : i % 16;
+        if (r == 0) a.housenumber += 1000000;
+        if (r == 1) a.lat = std::nextafter(a.lat, 100.0f);
+        if (r == 2) a.blob.back() ^= 1;
+        if (r == 3) a.blob = footprint_at(rng, a.lat, a.lng, 8 + rng() % 30);
+        if (r == 4) a.blob = footprint_at(rng, a.lat, a.lng, 8 + rng() % 30);
+        if (r == 5) a.blob.clear();
+        if (r == 6) a.blob.insert(a.blob.end(), {1, 2, 3, 4});
+        if (r == 7) a = dead_slot();
+        if (r == 9) a.lng = std::nextafter(a.lng, 100.0f);
+    }
+    for (uint32_t i = 0; i < 30; i++) {
+        Address a{48.0f + static_cast<float>(i) * 1e-4f, 8.0f, 5000 + i, 0, i % 30, {}};
+        if (i % 3) a.blob = footprint_at(rng, a.lat, a.lng, 8 + rng() % 30);
+        new_day.push_back(a);
+    }
+    uint64_t kept = 0, moved_bytes = 0;
+    for (uint32_t i = 0; i < N; i++) {
+        kept += keeps_its_blob(old_day[i], new_day[i]);
+        // Moved a step, or a vertex more: the old footprint's bytes are all kept.
+        if (i % 16 == 1 || i % 16 == 6 || i % 16 == 9) moved_bytes += old_day[i].blob.size();
+    }
+    const uint64_t footprints = footprints_in(new_day);
+    BuildDir old_d, new_d;
+    put_addresses(old_d, old_day);
+    put_addresses(new_d, new_day);
+    const LowMemCase c{dir.path(), "copy"};
+    REQUIRE(prepare(c, old_d, new_d, {}, {}, {"--identity-slots"}).empty());
+
+    AddrReplayed n;
+    const LogCheck counts = [&](const std::string& log) -> std::string {
+        n = addr_replayed(log);
+        if (!n.found) return "no address replay in the log";
+        if (n.copied != kept || n.encoded != footprints - kept)
+            return "not " + std::to_string(kept) + " blobs copied and " + std::to_string(footprints - kept) + " encoded: " + n.text();
+        // An edited or replaced footprint keeps what the footprint merge matched
+        // of its old bytes.
+        if (n.at_hand < moved_bytes) return "fewer than the " + std::to_string(moved_bytes) + " old bytes kept whole at hand: " + n.text();
+        if (n.read_again || n.by_cursor) return "old footprint bytes from a blob the replay was not at: " + n.text();
+        return "";
+    };
+    CHECK(apply_modes(c, ALL_MODES, counts).bad.empty());
+    const BuildDir want = gctest::as_written(new_d);
+    for (const std::string& mode : ALL_MODES)
+        for (const char* f : ADDRESS_FILES) CHECK(read_file(c.dir("out." + mode) + "/" + f) == want.at(f));
+    std::printf("    %" PRIu64 " of %" PRIu64 " footprints kept at their address: %s (the last mode's)\n", kept, footprints, n.text().c_str());
+
+    const std::vector<BlobAt> at = blobs_at(old_day);
+    REQUIRE(keeps_its_blob(old_day[10], new_day[10]) && at[10].len > 20 && new_day[7].blob.empty() && at[7].len > 20);
+    CHECK(flipped_blob_byte_not_refused(c, "small", at[10].at + at[10].len - 1).empty());
+    CHECK(flipped_blob_byte_not_refused(c, "escape", at[200].at + 2000).empty());
+    CHECK(flipped_blob_byte_not_refused(c, "escape-by-count", at[300].at + 5000).empty());
+    CHECK(flipped_blob_byte_not_refused(c, "largest", at[400].at + 100000).empty());
+    CHECK(flipped_blob_byte_not_refused(c, "killed", at[7].at + at[7].len - 1).empty());
+    CHECK(apply_modes(c, ALL_MODES, counts).bad.empty());
+}
+
+// The hashes of the old addr_points.bin and addr_vertices.bin, which the diff
+// writes once each, the points' and then the footprints', right before the
+// address points' section. On a day that changes the points, and on one that
+// changes a footprint alone (the points sent unchanged), the address replay
+// copies old blobs unread under the old records' points, so in every mode a
+// patch without either hash is refused, one with a second of either is, and
+// one with another hash in the place of either ends on an old file that is
+// not the patch's. On a day that leaves both files as they are the family is
+// copied as its files sit, each of the two held to its hash first: a patch
+// without either hash, or with another in the place of either, is refused
+// all the same.
+TEST(patch_refuses_an_address_replay_without_the_old_address_files_hashes) {
+    ScratchDir dir("patch-addr-hash");
+    std::mt19937 rng(20261118);
+    std::vector<Address> addresses;
+    for (uint32_t i = 0; i < 90; i++) {
+        Address a{47.0f + static_cast<float>(i) * 1e-4f, 8.0f, i, 0, 0, {}};
+        if (i % 3) a.blob = footprint_at(rng, a.lat, a.lng, 4 + rng() % 9);
+        addresses.push_back(a);
+    }
+    std::vector<Address> renumbered = addresses, edited = addresses;
+    renumbered[31].housenumber = 5000;
+    edited[31].blob.back() ^= 1;
+    struct Day {
+        std::string name;
+        std::vector<Address> addresses;
+        bool replayed;
+    };
+    // A hashed file, what an old one of another hash is refused as, and the
+    // first word of what follows its hash in the patch: the footprints' hash
+    // after the points', the address points' section after that.
+    struct Hashed {
+        PatchFileId file;
+        std::string tag, stale;
+        uint32_t next;
+    };
+    const Hashed hashed[] = {{PatchFileId::ADDR_POINTS, "points", NOT_THE_PATCHS_POINTS, OLD_FILE_HASH_MARKER},
+                             {PatchFileId::ADDR_VERTICES, "footprints", NOT_THE_PATCHS_FOOTPRINTS, static_cast<uint32_t>(PatchFileId::ADDR_POINTS)}};
+    for (const Day& day : {Day{"points", renumbered, true}, Day{"footprint", edited, true}, Day{"same", addresses, false}}) {
+        BuildDir old_d, new_d;
+        put_addresses(old_d, addresses);
+        put_addresses(new_d, day.addresses);
+        const LowMemCase c{dir.path(), day.name};
+        REQUIRE(prepare(c, old_d, new_d).empty());
+        const std::vector<char> raw = raw_patch(c);
+        REQUIRE(!raw.empty());
+        const LogCheck replay = [&](const std::string& log) -> std::string {
+            return addr_replayed(log).found == day.replayed ? "" : day.replayed ? "no address replay ran" : "the address replay ran";
+        };
+        CHECK(apply_modes(c, ALL_MODES, replay).bad.empty());
+        for (const Hashed& h : hashed) {
+            const std::string file = patch_file_names[static_cast<uint32_t>(h.file)];
+            const std::vector<char> made = old_hash_section(c, h.file);
+            const size_t at = find_once(raw, made);
+            if (at == std::string::npos) std::printf("    %s: no hash of the old %s\n", day.name.c_str(), file.c_str());
+            REQUIRE(at != std::string::npos);
+            const size_t end = at + made.size();
+            uint32_t next = 0;
+            REQUIRE(raw.size() >= end + 4);
+            memcpy(&next, raw.data() + end, 4);
+            CHECK_EQ(next, h.next);
+
+            std::vector<char> another = raw, cut = raw, twice = raw;
+            another[at + 8] ^= 1;
+            cut.erase(cut.begin() + static_cast<std::ptrdiff_t>(at), cut.begin() + static_cast<std::ptrdiff_t>(end));
+            twice.insert(twice.begin() + static_cast<std::ptrdiff_t>(end), made.begin(), made.end());
+            struct Edit {
+                std::string name;
+                std::vector<char> patch;
+                std::string refusal;  // none: it applies
+            };
+            for (const Edit& e : {Edit{h.tag + "-another", another, h.stale},
+                                  Edit{h.tag + "-cut", cut,
+                                       std::string("Malformed patch: ") + (day.replayed ? "address points" : "addr") + " without the old " + file + "'s hash"},
+                                  Edit{h.tag + "-twice", twice, "Malformed patch: a second hash of the old " + file}}) {
+                const std::string patch = c.dir(e.name + ".gcpatch");
+                REQUIRE(write_patch(c, patch, e.patch));
+                if (!e.refusal.empty()) {
+                    CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+                    continue;
+                }
+                REQUIRE(write_patch(c, c.patch(), e.patch));
+                const Applied a = apply_modes(c, ALL_MODES, replay);
+                if (!a.bad.empty()) std::printf("    %s, %s\n", day.name.c_str(), e.name.c_str());
+                CHECK(a.bad.empty());
+            }
+            REQUIRE(write_patch(c, c.patch(), raw));
+        }
+    }
+}
+
+// Address points sent unchanged over footprints that change (a vertex moved:
+// as many vertices, so the records keep their bytes), and footprints sent
+// unchanged under points that change (another house number, by slot a REPLACE
+// and by content a DELETE and an INSERT): the address replay runs with the
+// unchanged side as one MATCH of all of it, copies every blob the day leaves
+// at its record and encodes the other. In every mode.
+TEST(the_address_replay_copies_blobs_under_points_or_footprints_sent_unchanged) {
+    ScratchDir dir("lowmem-addr-unchanged-side");
+    std::mt19937 rng(20261119);
+    std::vector<Address> addresses;
+    for (uint32_t i = 0; i < 90; i++) {
+        Address a{47.0f + static_cast<float>(i) * 1e-4f, 8.0f, i, 0, 0, {}};
+        if (i % 3) a.blob = footprint_at(rng, a.lat, a.lng, 4 + rng() % 9);
+        addresses.push_back(a);
+    }
+    const uint64_t footprints = footprints_in(addresses), bytes = addresses[31].blob.size();
+    std::vector<Address> renumbered = addresses, edited = addresses;
+    renumbered[31].housenumber = 5000;
+    edited[31].blob.back() ^= 1;
+    BuildDir old_d;
+    put_addresses(old_d, addresses);
+    struct Day {
+        std::string name;
+        std::vector<Address> addresses;
+        std::vector<std::string> options;
+        PatchFileId unchanged;
+        LogCheck replayed;
+    };
+    // The edited footprint keeps its bytes but the last: its old ones are a
+    // MATCH of the old blob at hand, as the whole footprint of the address
+    // inserted under its new number is.
+    const Day days[] = {
+        {"vertex", edited, {}, PatchFileId::ADDR_POINTS, addr_replayed_is(footprints - 1, 1, bytes - 1)},
+        {"number-by-slot", renumbered, {"--identity-slots"}, PatchFileId::ADDR_VERTICES, addr_replayed_is(footprints, 0)},
+        {"number-by-content", renumbered, {}, PatchFileId::ADDR_VERTICES, addr_replayed_is(footprints - 1, 1, bytes)},
+    };
+    for (const Day& day : days) {
+        BuildDir new_d;
+        put_addresses(new_d, day.addresses);
+        const LowMemCase c{dir.path(), day.name};
+        REQUIRE(prepare(c, old_d, new_d, {}, {}, day.options).empty());
+        const std::vector<char> raw = raw_patch(c);
+        // One of the two files goes as unchanged, the other does not.
+        for (const PatchFileId fid : {PatchFileId::ADDR_POINTS, PatchFileId::ADDR_VERTICES}) {
+            const char* file = patch_file_names[static_cast<uint32_t>(fid)];
+            REQUIRE((copied_old_at(raw, fid, old_d.at(file).size()) != std::string::npos) == (fid == day.unchanged));
+        }
+
+        const Applied a = apply_modes(c, ALL_MODES, day.replayed);
+        if (!a.bad.empty()) std::printf("    %s\n", day.name.c_str());
+        CHECK(a.bad.empty());
+    }
+}
+
+// A record that moves its point one step of latitude and keeps its footprint,
+// byte for byte, gets a new blob: a blob holds its bbox minimum as residuals
+// from where the point predicts it, so the old record's is not the builder's
+// for the new one, though the footprints go as unchanged. By slot the record
+// is a REPLACE, by content a DELETE and an INSERT: either way the replay
+// encodes that one footprint from the old blob's bytes and copies the others.
+TEST(the_address_replay_gives_a_record_that_moved_its_point_a_new_blob) {
+    ScratchDir dir("lowmem-addr-moved");
+    std::mt19937 rng(20261120);
+    std::vector<Address> addresses;
+    for (uint32_t i = 0; i < 90; i++) {
+        Address a{47.0f + static_cast<float>(i) * 1e-4f, 8.0f, i, 0, 0, {}};
+        if (i % 3) a.blob = footprint_at(rng, a.lat, a.lng, 4 + rng() % 9);
+        addresses.push_back(a);
+    }
+    std::vector<Address> moved = addresses;
+    moved[31].lat = std::nextafter(moved[31].lat, 100.0f);
+    BuildDir old_d, new_d;
+    put_addresses(old_d, addresses);
+    put_addresses(new_d, moved);
+    // The same footprints, and another blob for the moved record's.
+    REQUIRE(old_d.at("addr_vertices.bin") == new_d.at("addr_vertices.bin"));
+    const std::vector<BlobAt> old_at = blobs_at(addresses), new_at = blobs_at(moved);
+    REQUIRE(old_at[31].at == new_at[31].at && old_at[31].len == new_at[31].len);
+    const std::vector<char> old_blobs = gctest::as_written(old_d).at("addr_vertices.bin"),
+                            new_blobs = gctest::as_written(new_d).at("addr_vertices.bin");
+    REQUIRE(!std::equal(old_blobs.begin() + old_at[31].at, old_blobs.begin() + old_at[31].at + old_at[31].len, new_blobs.begin() + new_at[31].at));
+    const uint64_t footprints = footprints_in(addresses);
+    for (const bool by_slot : {true, false}) {
+        const LowMemCase c{dir.path(), by_slot ? "by-slot" : "by-content"};
+        REQUIRE(prepare(c, old_d, new_d, {}, {}, by_slot ? std::vector<std::string>{"--identity-slots"} : std::vector<std::string>{}).empty());
+
+        CHECK(apply_modes(c, ALL_MODES, addr_replayed_is(footprints - 1, 1, addresses[31].blob.size())).bad.empty());
+    }
+}
+
+// A footprint that changes under a record sent unchanged (its vertices' steps
+// grow from 4 bits to 16; as many vertices, so the logical record keeps its
+// bytes) gets a new blob, and its record's block the new blob's len: the
+// points are sent unchanged and the patcher writes another addr_points.bin,
+// the builder's.
+TEST(the_address_replay_gives_a_footprint_that_changed_under_an_unchanged_record_a_new_blob_and_len) {
+    ScratchDir dir("lowmem-addr-len");
+    std::mt19937 rng(20261121);
+    std::vector<Address> addresses;
+    for (uint32_t i = 0; i < 90; i++) {
+        Address a{47.0f + static_cast<float>(i) * 1e-4f, 8.0f, i, 0, 0, {}};
+        if (i % 3) a.blob = footprint_at(rng, a.lat, a.lng, 20, 0, 3, 16);
+        addresses.push_back(a);
+    }
+    std::vector<Address> wider = addresses;
+    wider[31].blob = footprint_at(rng, wider[31].lat, wider[31].lng, 20, 0, 3, 60000);
+    BuildDir old_d, new_d;
+    put_addresses(old_d, addresses);
+    put_addresses(new_d, wider);
+    REQUIRE(old_d.at("addr_points.bin") == new_d.at("addr_points.bin"));
+    REQUIRE(blobs_at(addresses)[31].len < blobs_at(wider)[31].len);
+    REQUIRE(gctest::as_written(old_d).at("addr_points.bin") != gctest::as_written(new_d).at("addr_points.bin"));
+    const LowMemCase c{dir.path(), "wider"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    REQUIRE(copied_old_at(raw_patch(c), PatchFileId::ADDR_POINTS, old_d.at("addr_points.bin").size()) != std::string::npos);
+
+    const uint64_t footprints = footprints_in(addresses);
+    AddrReplayed n;
+    CHECK(apply_modes(c, ALL_MODES, [&](const std::string& log) -> std::string {
+              n = addr_replayed(log);
+              return n.found && n.copied == footprints - 1 && n.encoded == 1 ? "" : "not every blob but one copied: " + n.text();
+          }).bad.empty());
+}
+
+// Escaped footprints through the address replay, none held whole. By slot: one
+// kept at its record and one under another house number (each copied from the
+// old file in pieces), one whose record moves a step (its bytes read from the
+// old file where they sit, a piece at a time, into the encoder) and a new one
+// (from the patch). By content: one whose record and the next change their
+// house numbers, two records deleted and two inserted over footprints sent
+// unchanged, so that the replay reads the escape again after passing it. In
+// every mode the replay holds no more of the old files than DECODER_HOLD, nor
+// more of the new ones than a piece and the largest footprint a blob holds;
+// and a byte flipped in the escape copied from the old dir is refused by the
+// old addr_vertices.bin's hash.
+TEST(the_address_replay_passes_an_escape_in_pieces) {
+    ScratchDir dir("lowmem-addr-escape");
+    std::mt19937 rng(20261122);
+    std::vector<Address> addresses;
+    for (uint32_t i = 0; i < 120; i++) {
+        Address a{47.0f + static_cast<float>(i) * 1e-4f, 8.0f, i, 0, 0, {}};
+        if (i % 3 != 2) a.blob = footprint_at(rng, a.lat, a.lng, 4 + rng() % 9);
+        addresses.push_back(a);
+    }
+    addresses[30].blob = escape_of(rng, 200000);
+    addresses[60].blob = block(rng, MAX_BLOB_VERTICES + 1);
+    addresses[90].blob = escape_of(rng, 100000);
+    const uint64_t footprints = footprints_in(addresses);
+    std::vector<Address> by_slot = addresses, by_content = addresses;
+    by_slot[60].housenumber = 5000;
+    by_slot[90].lat = std::nextafter(by_slot[90].lat, 100.0f);
+    by_slot.push_back({48.0f, 8.0f, 6000, 0, 0, escape_of(rng, 50000)});
+    by_content[30].housenumber = 5000;
+    by_content[31].housenumber = 5001;
+    REQUIRE(!addresses[31].blob.empty());
+    struct Day {
+        std::string name;
+        std::vector<Address> addresses;
+        std::vector<std::string> options;
+        LogCheck replayed;
+    };
+    const Day days[] = {
+        {"by-slot", by_slot, {"--identity-slots"}, addr_replayed_is(footprints - 1, 2, addresses[90].blob.size())},
+        {"by-content", by_content, {}, addr_replayed_is(footprints - 2, 2, addresses[31].blob.size(), addresses[30].blob.size())},
+    };
+    BuildDir old_d;
+    put_addresses(old_d, addresses);
+    const LogCheck decoder = decoder_peaks_at_most("addr", DECODER_HOLD), encoder = encoder_peaks_at_most("addr", ADDR_ENCODER_HOLD);
+    for (const Day& day : days) {
+        BuildDir new_d;
+        put_addresses(new_d, day.addresses);
+        const LowMemCase c{dir.path(), day.name};
+        REQUIRE(prepare(c, old_d, new_d, {}, {}, day.options).empty());
+
+        const Applied a = apply_modes(c, ALL_MODES, [&](const std::string& log) {
+            for (const LogCheck& check : {day.replayed, decoder, encoder})
+                if (const std::string e = check(log); !e.empty()) return e;
+            return std::string();
+        });
+        if (!a.bad.empty()) std::printf("    %s\n", day.name.c_str());
+        CHECK(a.bad.empty());
+        if (day.name == "by-slot") CHECK(flipped_blob_byte_not_refused(c, "flipped", blobs_at(addresses)[30].at + 700000).empty());
+    }
+}
+
+// Street ways moved by the identity sidecars (each pair of the first 40 swaps
+// its records) under addresses on every way: the address records stay MATCHed,
+// each parent_way_id moved by the street replay's remap, the ways that stay
+// in order by its runs and the moved ones by the parent-id remap's pairs, and
+// their blobs are copied. In every mode the patched dir is the new dir.
+TEST(the_address_replay_moves_parent_ways_by_the_street_remap) {
+    ScratchDir dir("lowmem-addr-parents");
+    constexpr uint32_t MOVED = 20, KEPT = 30, WAYS = 2 * MOVED + KEPT;
+    std::mt19937 rng(20261123);
+    BuildDir old_d, new_d, old_meta, new_meta;
+    put_moved_ways(old_d, new_d, old_meta, new_meta, MOVED, KEPT);
+    std::vector<Address> old_addresses, new_addresses;
+    for (uint32_t i = 0; i < 280; i++) {
+        // On the way of entity i mod WAYS: its old record, and its new one.
+        const uint32_t way = i % WAYS;
+        Address a{47.0f + static_cast<float>(i) * 1e-4f, 8.0f, i, 0, way, {}};
+        if (i % 3) a.blob = footprint_at(rng, a.lat, a.lng, 4 + rng() % 9);
+        old_addresses.push_back(a);
+        a.parent = way < 2 * MOVED ? way ^ 1 : way;
+        new_addresses.push_back(a);
+    }
+    put_addresses(old_d, old_addresses);
+    put_addresses(new_d, new_addresses);
+    REQUIRE(old_d.at("addr_points.bin") != new_d.at("addr_points.bin"));
+    const LowMemCase c{dir.path(), "parents"};
+    REQUIRE(prepare(c, old_d, new_d, old_meta, new_meta).empty());
+    // The street leg: the moved ways' pairs.
+    std::vector<char> leg;
+    for (const uint32_t w : {POI_PARENT_REMAP_MARKER, MOVED}) append(leg, w);
+    REQUIRE(find_once(raw_patch(c), leg) != std::string::npos);
+
+    CHECK(apply_modes(c, ALL_MODES, addr_replayed_is(footprints_in(old_addresses), 0)).bad.empty());
+    const BuildDir want = gctest::as_written(new_d);
+    for (const std::string& mode : ALL_MODES) CHECK(read_file(c.dir("out." + mode) + "/addr_points.bin") == want.at("addr_points.bin"));
+}
+
+// Street ways sent unchanged have no replay and so no remap: address points
+// then move their parent_way_id by the parent-id remap's street leg alone.
+// No day gives such a patch (ways that move change their file), so one made
+// by hand from the diff's patch of an unchanged set: a pair in the street leg
+// (way 3 to way 7) and the address points' section one MATCH of every record.
+// In every mode the addresses on way 3 are on way 7, the others where they
+// were, and every blob is copied.
+TEST(the_address_replay_moves_parent_ways_by_the_street_legs_pairs_under_street_ways_sent_unchanged) {
+    ScratchDir dir("lowmem-addr-leg");
+    std::mt19937 rng(20261129);
+    std::vector<Address> addresses;
+    for (uint32_t i = 0; i < 40; i++) {
+        Address a{47.0f + static_cast<float>(i) * 1e-4f, 8.0f, i, 0, i % 5, {}};
+        if (i % 3) a.blob = footprint_at(rng, a.lat, a.lng, 4 + rng() % 9);
+        addresses.push_back(a);
+    }
+    std::vector<Address> moved = addresses;
+    for (Address& a : moved)
+        if (a.parent == 3) a.parent = 7;
+    BuildDir d, moved_d;
+    put_geo(d, {{0, {0}}}, 10);
+    put_addresses(d, addresses);
+    moved_d = d;
+    put_addresses(moved_d, moved);
+    const LowMemCase c{dir.path(), "leg"};
+    REQUIRE(prepare(c, d, d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    std::vector<char> leg, pair;
+    for (const uint32_t w : {POI_PARENT_REMAP_MARKER, 0u}) append(leg, w);
+    for (const uint32_t w : {3u, 7u}) append(pair, w);
+    const std::vector<char>& records = d.at("addr_points.bin");
+    const std::vector<char> unchanged = copy_old_section(PatchFileId::ADDR_POINTS, records.size());
+    const size_t leg_at = find_once(raw, leg), points_at = find_once(raw, unchanged);
+    REQUIRE(leg_at != std::string::npos && points_at != std::string::npos && leg_at < points_at);
+    REQUIRE(copied_old_at(raw, PatchFileId::STREET_WAYS, d.at("street_ways.bin").size()) != std::string::npos);
+    std::vector<char> every_record;
+    put_op(every_record, OP_MATCH_RUN, static_cast<uint32_t>(addresses.size()));
+    const std::vector<char> merge =
+        merge_of(PatchFileId::ADDR_POINTS, static_cast<uint32_t>(ADDR_POINT_STRIDE), records.size(), records.size(), every_record);
+    // The later edit first: the points' section a merge, then the pair.
+    std::vector<char> edited = raw;
+    edited.erase(edited.begin() + static_cast<std::ptrdiff_t>(points_at), edited.begin() + static_cast<std::ptrdiff_t>(points_at + unchanged.size()));
+    edited.insert(edited.begin() + static_cast<std::ptrdiff_t>(points_at), merge.begin(), merge.end());
+    put_at(edited, leg_at + 4, 1u);
+    edited.insert(edited.begin() + static_cast<std::ptrdiff_t>(leg_at + 8), pair.begin(), pair.end());
+    const std::string patch = c.dir("leg.gcpatch");
+    REQUIRE(write_patch(c, patch, edited));
+
+    const BuildDir want = gctest::as_written(moved_d);
+    const LogCheck replayed = addr_replayed_is(footprints_in(addresses), 0);
+    for (const std::string& mode : ALL_MODES) {
+        const std::string out = c.dir("out.leg." + mode);
+        std::filesystem::remove_all(out);
+        const ToolRun r = run_tool(patch_words(c, mode, patch, out), c.log());
+        CHECK(r.ok);
+        CHECK(read_dir(out) == want);
+        CHECK_EQ(replayed(r.log), std::string());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// What follows the address records through a day that deletes, inserts and
+// renumbers them: addr_postcodes.bin, a value an address, which the patch
+// sends as a parallel delta along the address points' merge sequence, and the
+// geo index's address lists, whose ids move by the address replay's record
+// remap. The replay leaves the patcher both, as the generic replay does: in
+// every mode the patched dir is the new dir.
+TEST(the_address_replay_records_the_sequence_and_the_runs_the_side_file_and_the_geo_lists_need) {
+    ScratchDir dir("lowmem-addr-followers");
+    constexpr uint32_t CELLS = 50;
+    std::mt19937 rng(20261124);
+    struct Entity {
+        Address a;
+        uint32_t postcode, cell;
+    };
+    std::vector<Entity> old_day, new_day;
+    for (uint32_t e = 0; e < 300; e++) {
+        Address a{47.0f + static_cast<float>(e) * 1e-4f, 8.0f, e, 0, e % 10, {}};
+        if (e % 3) a.blob = footprint_at(rng, a.lat, a.lng, 4 + rng() % 9);
+        old_day.push_back({a, e / 3 * 8, e % CELLS});
+    }
+    for (uint32_t e = 0; e < 300; e++) {
+        Entity n = old_day[e];
+        if (e % 40 == 20) {
+            Address a{48.0f + static_cast<float>(e) * 1e-4f, 8.0f, 1000 + e, 0, e % 10, {}};
+            if (e % 80) a.blob = footprint_at(rng, a.lat, a.lng, 4 + rng() % 9);
+            new_day.push_back({a, 4000 + e, (e + 7) % CELLS});
+        }
+        if (e % 11 == 3) continue;
+        if (e % 13 == 5) n.a.housenumber += 5000;
+        if (e % 17 == 2) n.postcode += 8;
+        new_day.push_back(n);
+    }
+    // A day's dir: its addresses, their postcodes, and the geo index of
+    // CELLS cells over 10 street ways, cell k listing street k mod 10 and the
+    // addresses in it.
+    auto dir_of = [&](const std::vector<Entity>& day) {
+        BuildDir d;
+        std::vector<Address> addresses;
+        std::vector<char> postcodes, street_ways, top, blocks;
+        std::vector<geo_index::RowLists> rows(CELLS);
+        for (uint32_t k = 0; k < CELLS; k++) rows[k][0] = {k % 10};
+        for (uint32_t id = 0; id < day.size(); id++) {
+            addresses.push_back(day[id].a);
+            append(postcodes, day[id].postcode);
+            rows[day[id].cell][geo_index::ADDRESSES].push_back(id);
+        }
+        put_addresses(d, addresses);
+        d["addr_postcodes.bin"] = postcodes;
+        for (uint32_t w = 0; w < 10; w++) {
+            append(street_ways, 0u);
+            append(street_ways, uint16_t{0});
+            append(street_ways, uint16_t{0});
+            append(street_ways, w);
+        }
+        geo_index::Writer writer([&](const char* p, size_t n) { top.insert(top.end(), p, p + n); },
+                                 [&](const char* p, size_t n) { blocks.insert(blocks.end(), p, p + n); });
+        for (uint32_t k = 0; k < CELLS; k++) writer.add(cell_id(k), geo_index::ids_of(rows[k]));
+        writer.finish();
+        d["street_ways.bin"] = street_ways;
+        d["street_nodes.bin"] = {};
+        d["geo_cells.bin"] = top;
+        d["geo_entries.bin"] = blocks;
+        return d;
+    };
+    const BuildDir old_d = dir_of(old_day), new_d = dir_of(new_day);
+    REQUIRE(old_d.at("geo_entries.bin") != new_d.at("geo_entries.bin"));
+    const LowMemCase c{dir.path(), "followers"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+
+    CHECK(apply_modes(c, ALL_MODES, [](const std::string& log) -> std::string {
+              if (!addr_replayed(log).found) return "no address replay in the log";
+              if (log.find("addr_postcodes.bin: parallel delta along addr_points.bin") == std::string::npos)
+                  return "addr_postcodes.bin did not follow the address points' merge";
+              return "";
+          }).bad.empty());
+    const BuildDir want = gctest::as_written(new_d);
+    for (const std::string& mode : ALL_MODES)
+        for (const char* f : {"addr_postcodes.bin", "geo_cells.bin", "geo_entries.bin"})
+            CHECK(read_file(c.dir("out." + mode) + "/" + f) == want.at(f));
+}
+
+// n address points, two in three with a footprint of 1 to 8 vertices; the new
+// day's with another house number on every fiftieth and the one after it (by
+// content each pair goes as two records deleted and two inserted, so the
+// replay reads the first one's old blob again after passing it and the
+// second's where it is at) and a vertex moved in every ninety-seventh's
+// footprint (encoded from the old blob at hand, under a record kept). The
+// replay holds a block's records, a blob and the places of the blobs it
+// passed last, whatever n.
+TEST(patch_heap_stays_flat_as_address_blobs_are_copied_and_encoded) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::mt19937 rng(20261125);
+        std::vector<Address> addresses;
+        for (uint32_t i = 0; i < n; i++) {
+            Address a{47.0f + static_cast<float>(i % 100000) * 1e-4f, 8.0f + static_cast<float>(i / 100000) * 1e-2f, i, 0, 0, {}};
+            if (i % 3) a.blob = footprint_at(rng, a.lat, a.lng, 1 + rng() % 8);
+            addresses.push_back(a);
+        }
+        std::vector<Address> changed = addresses;
+        for (uint32_t i = 0; i < n; i++) {
+            if (i % 50 == 7 || i % 50 == 8) changed[i].housenumber += n;
+            if (i % 97 == 11 && !changed[i].blob.empty()) changed[i].blob.back() ^= 1;
+        }
+        BuildDir old_d, new_d;
+        put_addresses(old_d, addresses);
+        put_addresses(new_d, changed);
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        return patch_holds(c, section_head(PatchFileId::ADDR_POINTS, static_cast<uint32_t>(ADDR_POINT_STRIDE), uint64_t{ADDR_POINT_STRIDE} * n,
+                                           uint64_t{ADDR_POINT_STRIDE} * n),
+                           "merge of " + std::to_string(n) + " address points");
+    }, 50000).empty());
+}
+
+namespace {
+
+// What addr_files::decode checks of the address files between its units,
+// the blobs' values left unread: the footers, each block where the index puts
+// it, each blob's header and len, and the files' ends. The stage that refused
+// them and its words, or none.
+struct Walked {
+    enum Stage { NONE, FOOTERS, INDEX, BLOCK, BLOB, END };
+    Stage stage = NONE;
+    std::string refusal;
+};
+
+Walked walk_address_files(const std::vector<char>& points_file, const std::vector<char>& vertices_file, const std::vector<char>& index_file) {
+    namespace af = addr_files;
+    const uint8_t* points = reinterpret_cast<const uint8_t*>(points_file.data());
+    const uint8_t* vertices = reinterpret_cast<const uint8_t*>(vertices_file.data());
+    const uint8_t* index = reinterpret_cast<const uint8_t*>(index_file.data());
+    Walked w;
+    w.stage = Walked::FOOTERS;
+    try {
+        auto end_of = [](const uint8_t* file, size_t size, size_t footer) { return file + (size - std::min(size, footer)); };
+        const af::Footers f = af::read_footers(end_of(points, points_file.size(), af::POINTS_FOOTER_BYTES), points_file.size(),
+                                               end_of(vertices, vertices_file.size(), af::VERTICES_FOOTER_BYTES), vertices_file.size(),
+                                               end_of(index, index_file.size(), af::INDEX_FOOTER_BYTES), index_file.size());
+        const char* const misplaced = " is not where the blocks and the blobs before it end";
+        af::Block block;
+        uint64_t blocks_at = 0, blobs_at = 0, row_blocks_at = 0, row_blobs_at = 0, logical = 0, blobs = 0;
+        for (uint64_t b = 0; b < f.blocks(); b++) {
+            w.stage = Walked::INDEX;
+            const uint8_t* row = index + (b / af::SUPERBLOCK_BLOCKS) * af::INDEX_ROW_BYTES;
+            if (b % af::SUPERBLOCK_BLOCKS == 0) {
+                if (af::get64(row) != blocks_at || af::get64(row + 8) != blobs_at)
+                    af::malformed(std::string(af::INDEX_FILE) + " superblock " + std::to_string(b / af::SUPERBLOCK_BLOCKS) + misplaced);
+                row_blocks_at = blocks_at;
+                row_blobs_at = blobs_at;
+            }
+            const uint8_t* entry = row + af::INDEX_HEAD_BYTES + (b % af::SUPERBLOCK_BLOCKS) * af::INDEX_ENTRY_BYTES;
+            if (af::get16(entry) != blocks_at - row_blocks_at || af::get32(entry + 2) != blobs_at - row_blobs_at)
+                af::malformed(std::string(af::INDEX_FILE) + " block " + std::to_string(b) + misplaced);
+            w.stage = Walked::BLOCK;
+            const size_t n = f.block_records(b);
+            blocks_at += af::decode_block(b, points + blocks_at, points_file.size() - blocks_at, n, block);
+            w.stage = Walked::BLOB;
+            for (size_t j = 0; j < n; j++) {
+                const uint64_t i = b * af::BLOCK_RECORDS + j;
+                const uint32_t len = block.len[j];
+                if (!len) continue;
+                if (len > f.blobs_bytes - blobs_at) af::malformed(std::string(af::VERTICES_FILE) + " ends inside the blob of record " + std::to_string(i));
+                try {
+                    const af::BlobHeader h = af::blob_header(vertices + blobs_at, len);
+                    if (h.logical_bytes() > f.logical_vertex_bytes - logical)
+                        af::malformed("a footprint past the footer's logical vertex stream of " + std::to_string(f.logical_vertex_bytes) + " bytes");
+                    if (!h.escape) af::blob_values(h, vertices + blobs_at, len);
+                    logical += h.logical_bytes();
+                } catch (const std::runtime_error& e) {
+                    throw std::runtime_error(std::string(e.what()) + ": " + af::VERTICES_FILE + ", record " + std::to_string(i));
+                }
+                blobs_at += len;
+                blobs++;
+            }
+        }
+        w.stage = Walked::END;
+        if (blocks_at != f.blocks_bytes) af::malformed(std::string(af::POINTS_FILE) + " has bytes between its last block and its footer");
+        if (blobs_at != f.blobs_bytes) af::malformed(std::string(af::VERTICES_FILE) + " has bytes between its last blob and its footer");
+        if (logical != f.logical_vertex_bytes)
+            af::malformed(std::string(af::VERTICES_FILE) + " counts " + std::to_string(f.logical_vertex_bytes) +
+                          " bytes of logical blobs and its blobs hold " + std::to_string(logical));
+        if (blobs != f.blobs)
+            af::malformed(std::string(af::VERTICES_FILE) + " counts " + std::to_string(f.blobs) + " blobs and holds " + std::to_string(blobs));
+        w.stage = Walked::NONE;
+    } catch (const std::runtime_error& e) {
+        w.refusal = e.what();
+    }
+    return w;
+}
+
+}  // namespace
+
+// Old address files the builder would not write, 300 sets each a byte away
+// from the files a patch was made from (a bit or a byte of any of the three
+// files changed, or a byte cut out or added): the address replay refuses them
+// as addr_files::decode does. A set the decoder refuses by its footers, its
+// index or a block, or by a blob's header or len when addr_vertices.bin holds
+// the damage, is refused there in the decoder's words, which name the old
+// record, before a byte of it is used. Blobs' values the replay does not
+// decode, and a block that decodes to other records is one the encoder
+// writes: any set whose addr_points.bin or addr_vertices.bin is not the
+// patch's is refused, at the latest by the old file's hash. No set applies.
+// Then three sets the decoder refuses only where the files end, each refused
+// in its words: a byte between the last block and its footer, one between
+// the last blob and its footer, and a footer that counts a blob more.
+TEST(the_address_replay_refuses_old_address_files_as_the_strict_decoder_does) {
+    ScratchDir dir("lowmem-addr-damage");
+    std::mt19937 rng(20261126);
+    std::vector<Address> addresses;
+    for (uint32_t i = 0; i < 60; i++) {
+        Address a{47.0f + static_cast<float>(i) * 1e-4f, 8.0f + static_cast<float>(i % 5) * 1e-4f, i * 3, i % 4, i % 6, {}};
+        if (i % 3) a.blob = footprint_at(rng, a.lat, a.lng, 2 + rng() % 9, static_cast<uint8_t>(i % 3), static_cast<int>(rng() % 200) - 100);
+        addresses.push_back(a);
+    }
+    addresses[22].blob = escape_of(rng, 5);
+    // The day, by content: an address moved a step, a vertex moved, an address
+    // more, and two gone, the first early: a record's place in the old files
+    // is not its place in the new ones.
+    std::vector<Address> changed = addresses;
+    changed[26].lat = std::nextafter(changed[26].lat, 100.0f);
+    changed[40].blob.back() ^= 1;
+    changed.push_back({48.0f, 8.0f, 6000, 0, 0, footprint_at(rng, 48.0f, 8.0f, 7)});
+    changed.erase(changed.begin() + 50);
+    changed.erase(changed.begin() + 4);
+    BuildDir old_d, new_d;
+    put_addresses(old_d, addresses);
+    put_addresses(new_d, changed);
+    const LowMemCase c{dir.path(), "damage"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    std::map<std::string, std::vector<char>> written;
+    for (const char* f : ADDRESS_FILES) written[f] = read_file(c.dir("old") + "/" + f);
+    REQUIRE(walk_address_files(written["addr_points.bin"], written["addr_vertices.bin"], written["addr_index.bin"]).stage == Walked::NONE);
+
+    size_t at_stage[6] = {}, by_hash = 0, applied = 0, wrong = 0;
+    for (uint32_t k = 0; k < 300; k++) {
+        std::map<std::string, std::vector<char>> damaged = written;
+        const std::string file = ADDRESS_FILES[rng() % 3];
+        std::vector<char>& bytes = damaged[file];
+        const size_t at = rng() % bytes.size();
+        const uint32_t how = rng() % 20;
+        if (how == 0) bytes.erase(bytes.begin() + static_cast<std::ptrdiff_t>(at));
+        else if (how == 1) bytes.insert(bytes.begin() + static_cast<std::ptrdiff_t>(at), static_cast<char>(rng()));
+        else if (how < 11) bytes[at] = static_cast<char>(bytes[at] ^ (1 << (rng() % 8)));
+        else bytes[at] = static_cast<char>(bytes[at] ^ (1 + rng() % 255));
+        const std::string what = "set " + std::to_string(k) + " (" + file + " at " + std::to_string(at) + ")";
+        const Walked w = walk_address_files(damaged["addr_points.bin"], damaged["addr_vertices.bin"], damaged["addr_index.bin"]);
+        std::string strict;
+        try {
+            auto u8 = [&](const char* f) { return reinterpret_cast<const uint8_t*>(damaged[f].data()); };
+            addr_files::decode(u8("addr_points.bin"), damaged["addr_points.bin"].size(), u8("addr_vertices.bin"), damaged["addr_vertices.bin"].size(),
+                               u8("addr_index.bin"), damaged["addr_index.bin"].size());
+        } catch (const std::runtime_error& e) {
+            strict = e.what();
+        }
+        for (const char* f : ADDRESS_FILES) REQUIRE(write_file(c.dir("old") + "/" + f, damaged[f]));
+        std::filesystem::remove_all(c.dir("out.damaged"));
+        const ToolRun r = run_tool(patch_words(c, "sync", c.patch(), c.dir("out.damaged")), c.log());
+
+        at_stage[w.stage]++;
+        applied += r.ok;
+        // Refused where the damage is: by the footers, the index or a block,
+        // or by a blob's header when the blobs' file holds the damage (the
+        // blocks then give each blob its place).
+        const bool at_the_damage = w.stage == Walked::FOOTERS || w.stage == Walked::INDEX || w.stage == Walked::BLOCK ||
+                                   (w.stage == Walked::BLOB && file == "addr_vertices.bin");
+        std::string bad;
+        // The replay decodes a few blobs, and so may refuse one before the
+        // walk's: then in the strict decoder's words.
+        if (at_the_damage && !(!r.ok && (logged(r, w.refusal) || (!strict.empty() && logged(r, strict)))))
+            bad = "not refused as \"" + w.refusal + "\"";
+        else if (r.ok) bad = w.stage != Walked::NONE ? "applied, though \"" + w.refusal + "\"" : "applied with another " + file;
+        // Whatever else the replay says of the old files, the strict decoder says.
+        else if (!r.ok && w.stage == Walked::NONE && logged(r, "Malformed address files: ") && !logged(r, "addr_points.bin record ") &&
+                 (strict.empty() || !logged(r, strict)))
+            bad = "refused in words that are not the strict decoder's \"" + strict + "\"";
+        by_hash += !r.ok && (logged(r, NOT_THE_PATCHS_POINTS) || logged(r, NOT_THE_PATCHS_FOOTPRINTS));
+        if (!bad.empty()) {
+            wrong++;
+            std::printf("    %s: %s: %s\n", what.c_str(), bad.c_str(), r.ok ? "applied" : r.log.substr(0, 600).c_str());
+        }
+    }
+    {
+        std::map<std::string, std::vector<char>> between_blocks = written, between_blobs = written, a_blob_more = written;
+        std::vector<char>& blocks = between_blocks["addr_points.bin"];
+        blocks.insert(blocks.end() - static_cast<std::ptrdiff_t>(addr_files::POINTS_FOOTER_BYTES), 0);
+        std::vector<char>& blobs = between_blobs["addr_vertices.bin"];
+        blobs.insert(blobs.end() - static_cast<std::ptrdiff_t>(addr_files::VERTICES_FOOTER_BYTES), 0);
+        std::vector<char>& counted = a_blob_more["addr_vertices.bin"];
+        uint32_t n_blobs = 0;
+        memcpy(&n_blobs, counted.data() + counted.size() - 8, 4);
+        put_at(counted, counted.size() - 8, n_blobs + 1);
+        for (const auto& [name, set] : {std::pair<const char*, std::map<std::string, std::vector<char>>>{"between-blocks", between_blocks},
+                                        {"between-blobs", between_blobs},
+                                        {"a-blob-more", a_blob_more}}) {
+            const Walked w = walk_address_files(set.at("addr_points.bin"), set.at("addr_vertices.bin"), set.at("addr_index.bin"));
+            REQUIRE(w.stage == Walked::END);
+            for (const char* f : ADDRESS_FILES) REQUIRE(write_file(c.dir("old") + "/" + f, set.at(f)));
+            const std::vector<std::string> bad = not_refused(c, ALL_MODES, c.patch(), name, w.refusal);
+            if (!bad.empty()) std::printf("    not refused as \"%s\"\n", w.refusal.c_str());
+            CHECK(bad.empty());
+        }
+    }
+    for (const char* f : ADDRESS_FILES) REQUIRE(write_file(c.dir("old") + "/" + f, written[f]));
+    std::printf("    300 sets: the walk refused %zu by the footers, %zu by the index, %zu by a block, %zu by a blob, %zu at the end, %zu not; "
+                "%zu refused by the hash, %zu applied\n",
+                at_stage[Walked::FOOTERS], at_stage[Walked::INDEX], at_stage[Walked::BLOCK], at_stage[Walked::BLOB], at_stage[Walked::END],
+                at_stage[Walked::NONE], by_hash, applied);
+    CHECK_EQ(wrong, size_t{0});
+    CHECK_EQ(applied, size_t{0});
+    // Every kind of refusal came up.
+    CHECK(at_stage[Walked::FOOTERS] >= 3);
+    CHECK(at_stage[Walked::INDEX] >= 20);
+    CHECK(at_stage[Walked::BLOCK] >= 20);
+    CHECK(at_stage[Walked::BLOB] >= 5);
+    CHECK(by_hash >= 20);
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// An address replay's sections that do not fit the old files or each other
+// are refused by name in every mode. A day by content that drops an address
+// with a footprint and appends one, so the points' merge is a MATCH, a
+// DELETE, a MATCH and an INSERT with the footprints' beside it; then, in the
+// patch: the points' last MATCH run or their DELETE run past the old records;
+// the footprints' last MATCH run past the old stream; the new record's
+// vertex_offset two bytes off and its footprint in an encoding none has; the
+// footprints' section at another stride than a byte's, its sequence's length
+// 2^32 past the patch, and its old size a byte more than the old files';
+// both sections a second time; the points' new size a record more than the
+// merge gives, or the footprints' a byte more; and, left over when the replay
+// ends, an offset fixup for a record past the old file's and a string fixup
+// for a slot past them. The patch as made applies.
+TEST(the_address_replay_refuses_sections_that_do_not_fit_the_old_files_or_each_other) {
+    ScratchDir dir("lowmem-addr-sections");
+    std::mt19937 rng(20261127);
+    std::vector<Address> addresses;
+    for (uint32_t i = 0; i < 60; i++) {
+        Address a{47.0f + static_cast<float>(i) * 1e-4f, 8.0f, i, 0, 0, {}};
+        if (i % 3 != 2) a.blob = footprint_at(rng, a.lat, a.lng, 4 + rng() % 9);
+        addresses.push_back(a);
+    }
+    std::vector<Address> changed = addresses;
+    changed.erase(changed.begin() + 21);
+    changed.push_back({48.0f, 8.0f, 6000, 0, 0, footprint_at(rng, 48.0f, 8.0f, 12)});
+    BuildDir old_d, new_d;
+    put_addresses(old_d, addresses);
+    put_addresses(new_d, changed);
+    const LowMemCase c{dir.path(), "sections"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    const uint64_t old_points = old_d.at("addr_points.bin").size(), new_points = new_d.at("addr_points.bin").size();
+    const uint64_t old_bytes = old_d.at("addr_vertices.bin").size(), new_bytes = new_d.at("addr_vertices.bin").size();
+    // The two sections' heads, and the points' and the footprints' runs.
+    const size_t points = find_once(raw, section_head(PatchFileId::ADDR_POINTS, static_cast<uint32_t>(ADDR_POINT_STRIDE), old_points, new_points));
+    const size_t footprints = find_once(raw, section_head(PatchFileId::ADDR_VERTICES, 1, old_bytes, new_bytes));
+    REQUIRE(points != std::string::npos && footprints != std::string::npos && points < footprints);
+    uint64_t before = 0;
+    for (uint32_t i = 0; i < 21; i++) before += addresses[i].blob.size();
+    const uint32_t gone = static_cast<uint32_t>(addresses[21].blob.size());
+    REQUIRE(gone > 0);
+    std::vector<char> point_runs, footprint_runs;
+    put_op(point_runs, OP_MATCH_RUN, 21);
+    put_op(point_runs, OP_DELETE_RUN, 1);
+    put_op(point_runs, OP_MATCH_RUN, 38);
+    put_op(footprint_runs, OP_MATCH_RUN, static_cast<uint32_t>(before));
+    put_op(footprint_runs, OP_DELETE_RUN, gone);
+    put_op(footprint_runs, OP_MATCH_RUN, static_cast<uint32_t>(old_bytes - before - gone));
+    const size_t point_runs_at = find_once(raw, point_runs), footprint_runs_at = find_once(raw, footprint_runs);
+    REQUIRE(point_runs_at != std::string::npos && footprint_runs_at != std::string::npos);
+    // The new record and its footprint, as the patch carries them.
+    const std::vector<char>& new_records = new_d.at("addr_points.bin");
+    const std::vector<char> record(new_records.end() - static_cast<std::ptrdiff_t>(ADDR_POINT_STRIDE), new_records.end());
+    const size_t record_at = find_once(raw, record), blob_at = find_once(raw, changed.back().blob);
+    REQUIRE(record_at != std::string::npos && blob_at != std::string::npos);
+    // The footprints' sequence length: after the head, the offset fixups'
+    // counts and sizes (none) and the string fixups' (none).
+    const size_t footprints_len_at = footprints + 24 + 24;
+    uint64_t footprints_len = 0;
+    memcpy(&footprints_len, raw.data() + footprints_len_at, 8);
+    const size_t footprints_end = footprints_len_at + 8 + footprints_len;
+    REQUIRE(footprints_end <= raw.size() && footprint_runs_at == footprints_len_at + 8);
+
+    // The points' offset fixups: after the head their run and value counts and
+    // sizes, the runs, the values (none); then the string fixups' count and
+    // size (none).
+    uint32_t fixup_words[4] = {}, string_fixup_words[2] = {};
+    memcpy(fixup_words, raw.data() + points + 24, sizeof fixup_words);
+    const size_t values_at = points + 40 + fixup_words[2];
+    memcpy(string_fixup_words, raw.data() + values_at, sizeof string_fixup_words);
+    REQUIRE(fixup_words[0] > 0 && fixup_words[1] == 0 && fixup_words[3] == 0 && string_fixup_words[0] == 0 && string_fixup_words[1] == 0);
+
+    using Edit = std::function<void(std::vector<char>&)>;
+    struct Case {
+        std::string name;
+        Edit edit;
+        std::string refusal;
+    };
+    uint32_t vertex_offset = 0;
+    memcpy(&vertex_offset, record.data() + ADDR_POINT_VERTEX_OFFSET_OFF, 4);
+    const Case cases[] = {
+        {"points-match", [&](std::vector<char>& p) { put_at(p, point_runs_at + 11, 43u); },
+         "Malformed merge sequence: addr_points.bin (a MATCH run past the old file)"},
+        {"points-delete", [&](std::vector<char>& p) { put_at(p, point_runs_at + 6, 40u); },
+         "Malformed merge sequence: addr_points.bin (a DELETE run past the old file)"},
+        {"footprints-match", [&](std::vector<char>& p) { put_at(p, footprint_runs_at + 11, static_cast<uint32_t>(old_bytes - before - gone + 5)); },
+         "Malformed merge sequence: addr_vertices.bin"},
+        {"vertex-offset", [&](std::vector<char>& p) { put_at(p, record_at + ADDR_POINT_VERTEX_OFFSET_OFF, vertex_offset + 2); },
+         "addr_points.bin record 59 has a vertex_offset of " + std::to_string(vertex_offset + 2) + ", not the " + std::to_string(vertex_offset) +
+             " bytes of the footprints before it"},
+        {"encoding", [&](std::vector<char>& p) { p[blob_at] = 7; }, "addr_points.bin record 59 has a footprint in encoding 7"},
+        {"stride", [&](std::vector<char>& p) { put_at(p, footprints + 4, 2u); }, "Encoded family: unexpected section kind for a child stream"},
+        {"length", [&](std::vector<char>& p) { put_at(p, footprints_len_at, footprints_len + (uint64_t{1} << 32)); },
+         "Truncated patch: child section"},
+        {"twice",
+         [&](std::vector<char>& p) {
+             const std::vector<char> both(raw.begin() + static_cast<std::ptrdiff_t>(points), raw.begin() + static_cast<std::ptrdiff_t>(footprints_end));
+             p.insert(p.begin() + static_cast<std::ptrdiff_t>(footprints_end), both.begin(), both.end());
+         },
+         "old addr_points.bin opened twice"},
+        {"new-size", [&](std::vector<char>& p) { put_at(p, points + 16, new_points + ADDR_POINT_STRIDE); },
+         "Rebuilt addr_points.bin does not match the new build"},
+        {"footprints-old-size", [&](std::vector<char>& p) { put_at(p, footprints + 8, old_bytes + 1); },
+         "Old addr_vertices.bin is not the one the patch was made from (" + std::to_string(old_bytes) + " bytes, the patch expects " +
+             std::to_string(old_bytes + 1) + ")"},
+        {"footprints-new-size", [&](std::vector<char>& p) { put_at(p, footprints + 16, new_bytes + 1); },
+         "Rebuilt addr_vertices.bin does not match the new build"},
+        // A value for record 60 (from record 0), offset 0.
+        {"offset-fixup",
+         [&](std::vector<char>& p) {
+             put_at(p, points + 28, 1u);
+             put_at(p, points + 36, 2u);
+             p.insert(p.begin() + static_cast<std::ptrdiff_t>(values_at), {60, 0});
+         },
+         "Malformed offset fixups"},
+        // A fixup for the 128th slot, value unchanged: the 60 records have 120.
+        {"string-fixup",
+         [&](std::vector<char>& p) {
+             put_at(p, values_at, 1u);
+             put_at(p, values_at + 4, 2u);
+             p.insert(p.begin() + static_cast<std::ptrdiff_t>(values_at + 8), {0x7F, 0});
+         },
+         "Malformed string fixups"},
+    };
+    for (const Case& e : cases) {
+        std::vector<char> edited = raw;
+        e.edit(edited);
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES, addr_replayed_is(footprints_in(addresses) - 1, 1)).bad.empty());
+}
+
+// The address replay copies an old blob only for a new record that is its old
+// record at its point, whose footprint is that very blob's bytes. Four
+// addresses and five days made by hand from the diff's patch of the unchanged
+// set, its two address sections rebuilt, each giving the day's own files:
+//   moved: the records REPLACEd a step of latitude away, their footprints one
+//     MATCH of the old stream: each encoded from the old blob the replay is
+//     at;
+//   second: the records MATCHed, the first one's footprint MATCHed from the
+//     second's old blob (its own deleted) and the second's inserted: the first
+//     through the cursor, the replay not being at that blob yet;
+//   ahead: every record inserted before the old ones are deleted, their
+//     footprints one MATCH: all through the cursor;
+//   behind: every old record deleted before the new ones are inserted: the
+//     footprints of the three the replay passed read again, the last one's
+//     from the blob it is at;
+//   whole: the records MATCHed, or sent unchanged, over footprints sent
+//     whole: all from the patch.
+// And the footprints one MATCH five bytes longer than the old stream, or five
+// shorter, is refused by name, as is a REPLACE run of a record more than the
+// old file's.
+TEST(the_address_replay_encodes_the_blobs_it_cannot_copy) {
+    ScratchDir dir("lowmem-addr-nocopy");
+    std::mt19937 rng(20261128);
+    std::vector<Address> addresses;
+    for (uint32_t i = 0; i < 4; i++) {
+        Address a{47.0f + static_cast<float>(i) * 1e-4f, 8.0f, i, 0, 0, {}};
+        a.blob = footprint_at(rng, a.lat, a.lng, 8);
+        addresses.push_back(a);
+    }
+    BuildDir d;
+    put_addresses(d, addresses);
+    const LowMemCase c{dir.path(), "nocopy"};
+    REQUIRE(prepare(c, d, d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    const std::vector<char>& records = d.at("addr_points.bin");
+    const std::vector<char>& vertices = d.at("addr_vertices.bin");
+    const uint32_t n = 4, b = static_cast<uint32_t>(addresses[0].blob.size()), v = static_cast<uint32_t>(vertices.size());
+    REQUIRE(v == n * b);
+    std::vector<char> copies = copy_old_section(PatchFileId::ADDR_POINTS, records.size());
+    const std::vector<char> copied_vertices = copy_old_section(PatchFileId::ADDR_VERTICES, vertices.size());
+    copies.insert(copies.end(), copied_vertices.begin(), copied_vertices.end());
+    const size_t at = find_once(raw, copies);
+    REQUIRE(at != std::string::npos);
+    // The patch with the address sections rebuilt (the points' a merge of
+    // rec_ops, or sent unchanged when it has none; the footprints' a merge of
+    // vert_ops, or sent whole when whole is given), and where it is written.
+    auto rebuilt = [&](const char* name, const std::vector<char>& rec_ops, const std::vector<char>& vert_ops, const std::vector<char>* whole = nullptr) {
+        std::vector<char> edited(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(at));
+        std::vector<char> points = copy_old_section(PatchFileId::ADDR_POINTS, records.size());
+        if (!rec_ops.empty())
+            points = merge_of(PatchFileId::ADDR_POINTS, static_cast<uint32_t>(ADDR_POINT_STRIDE), records.size(), records.size(), rec_ops);
+        std::vector<char> footprints = merge_of(PatchFileId::ADDR_VERTICES, 1, v, v, vert_ops);
+        if (whole) {
+            footprints = section_head(PatchFileId::ADDR_VERTICES, 0, v, whole->size());
+            append(footprints, 0u);
+            append(footprints, static_cast<uint64_t>(whole->size()));
+            footprints.insert(footprints.end(), whole->begin(), whole->end());
+        }
+        for (const auto& section : {points, footprints})
+            edited.insert(edited.end(), section.begin(), section.end());
+        edited.insert(edited.end(), raw.begin() + static_cast<std::ptrdiff_t>(at + copies.size()), raw.end());
+        const std::string patch = c.dir(std::string(name) + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+        return patch;
+    };
+    // The rebuilt patch applied to the old dir: the patched address files
+    // against the day's own, and what the replay says it did.
+    auto check = [&](const char* name, const std::vector<Address>& day, const std::vector<char>& rec_ops, const std::vector<char>& vert_ops,
+                     const LogCheck& replayed, const std::vector<char>* whole = nullptr) {
+        const int failures_before = gctest::failures();
+        BuildDir day_d;
+        put_addresses(day_d, day);
+        const BuildDir want = gctest::as_written(day_d);
+        const std::string patch = rebuilt(name, rec_ops, vert_ops, whole);
+        for (const std::string& mode : ALL_MODES) {
+            const std::string out = c.dir(std::string("out.") + name + "." + mode);
+            std::filesystem::remove_all(out);
+            const ToolRun r = run_tool(patch_words(c, mode, patch, out), c.log());
+            CHECK(r.ok);
+            for (const char* f : ADDRESS_FILES) CHECK(read_file(out + "/" + f) == want.at(f));
+            CHECK_EQ(replayed(r.log), std::string());
+        }
+        if (gctest::failures() > failures_before) std::printf("    in the %s day\n", name);
+    };
+    std::vector<Address> moved = addresses, second = addresses;
+    for (Address& a : moved) a.lat = std::nextafter(a.lat, 100.0f);
+    second[0].blob = addresses[1].blob;
+    BuildDir moved_d;
+    put_addresses(moved_d, moved);
+    std::vector<char> rec_ops, vert_ops;
+    put_op(rec_ops, OP_REPLACE_RUN, n, moved_d.at("addr_points.bin").data(), ADDR_POINT_STRIDE);
+    put_op(vert_ops, OP_MATCH_RUN, v);
+    check("moved", moved, rec_ops, vert_ops, addr_replayed_is(0, n, v));
+
+    rec_ops.clear();
+    vert_ops.clear();
+    put_op(rec_ops, OP_MATCH_RUN, n);
+    put_op(vert_ops, OP_DELETE_RUN, b);
+    put_op(vert_ops, OP_MATCH_RUN, b);
+    put_op(vert_ops, OP_INSERT_RUN, b, vertices.data() + b, 1);
+    put_op(vert_ops, OP_MATCH_RUN, 2 * b);
+    check("second", second, rec_ops, vert_ops, addr_replayed_is(2, 2, 0, 0, b));
+
+    rec_ops.clear();
+    vert_ops.clear();
+    put_op(rec_ops, OP_INSERT_RUN, n, records.data(), ADDR_POINT_STRIDE);
+    put_op(rec_ops, OP_DELETE_RUN, n);
+    put_op(vert_ops, OP_MATCH_RUN, v);
+    check("ahead", addresses, rec_ops, vert_ops, addr_replayed_is(0, n, 0, 0, v));
+
+    rec_ops.clear();
+    put_op(rec_ops, OP_DELETE_RUN, n);
+    put_op(rec_ops, OP_INSERT_RUN, n, records.data(), ADDR_POINT_STRIDE);
+    check("behind", addresses, rec_ops, vert_ops, addr_replayed_is(0, n, b, 3 * b));
+
+    rec_ops.clear();
+    put_op(rec_ops, OP_MATCH_RUN, n);
+    check("whole", addresses, rec_ops, {}, addr_replayed_is(0, n), &vertices);
+    check("whole-under-unchanged", addresses, {}, {}, addr_replayed_is(0, n), &vertices);
+
+    for (const auto& [name, bytes, refusal] :
+         {std::tuple<const char*, uint32_t, const char*>{"long", v + 5, "addr_vertices.bin has bytes past its last record"},
+          {"short", v - 5, "addr_vertices.bin ends before its records do"}}) {
+        vert_ops.clear();
+        put_op(vert_ops, OP_MATCH_RUN, bytes);
+        CHECK(not_refused(c, ALL_MODES, rebuilt(name, rec_ops, vert_ops), name, refusal).empty());
+    }
+    std::vector<char> one_more = records;
+    one_more.insert(one_more.end(), records.begin(), records.begin() + static_cast<std::ptrdiff_t>(ADDR_POINT_STRIDE));
+    rec_ops.clear();
+    vert_ops.clear();
+    put_op(rec_ops, OP_REPLACE_RUN, n + 1, one_more.data(), ADDR_POINT_STRIDE);
+    put_op(vert_ops, OP_MATCH_RUN, v);
+    CHECK(not_refused(c, ALL_MODES, rebuilt("replace-past", rec_ops, vert_ops), "replace-past",
+                      "Malformed merge sequence: addr_points.bin (a REPLACE run past the old file)")
+              .empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// A blob is its footprint's under its record's point alone: a small one holds
+// the bbox minimum as two residuals from where the point predicts it. So the
+// old points the address replay copies blobs under are checked as the blobs
+// are, by their file's hash. One address at (1, 1) whose footprint is one
+// vertex at its bbox minimum, (1, 1): its blob is 08 01 00 00 00, and a patch
+// that MATCHes the record and its footprint's 14 bytes copies it. With bit 6
+// of the top byte of the block's latitude base flipped in the old
+// addr_points.bin, the block is one the encoder writes, of a record at
+// latitude +infinity; every length is as it was, and so is addr_vertices.bin.
+// Under that point the encoder writes the bbox minimum in full and the strict
+// decoder refuses the small blob. In every mode the patcher refuses the old
+// addr_points.bin by its hash; the patch applies to the files as written.
+TEST(the_address_replay_refuses_an_old_record_moved_under_a_blob_it_would_copy) {
+    ScratchDir dir("lowmem-addr-point");
+    Address address{1.0f, 1.0f, 0, 0, 0, std::vector<char>(addr_files::LOGICAL_HEADER + 4, 0)};
+    put_at(address.blob, 2, 1.0f);
+    put_at(address.blob, 6, 1.0f);
+    BuildDir d;
+    put_addresses(d, {address});
+    const LowMemCase c{dir.path(), "point"};
+    REQUIRE(prepare(c, d, d).empty());
+    const std::string points_path = c.dir("old") + "/addr_points.bin";
+    const std::vector<char> points = read_file(points_path), blobs = read_file(c.dir("old") + "/addr_vertices.bin");
+    const std::vector<char> blob = {0x08, 0x01, 0x00, 0x00, 0x00};
+    REQUIRE(blobs.size() == blob.size() + addr_files::VERTICES_FOOTER_BYTES && std::equal(blob.begin(), blob.end(), blobs.begin()));
+
+    // The unchanged day's patch with its two address sections as merges: the
+    // record a MATCH, its footprint's bytes a MATCH.
+    const std::vector<char> raw = raw_patch(c);
+    std::vector<char> copies = copy_old_section(PatchFileId::ADDR_POINTS, ADDR_POINT_STRIDE);
+    const std::vector<char> copied_footprints = copy_old_section(PatchFileId::ADDR_VERTICES, address.blob.size());
+    copies.insert(copies.end(), copied_footprints.begin(), copied_footprints.end());
+    const size_t at = find_once(raw, copies);
+    REQUIRE(at != std::string::npos);
+    std::vector<char> record_ops, footprint_ops;
+    put_op(record_ops, OP_MATCH_RUN, 1);
+    put_op(footprint_ops, OP_MATCH_RUN, static_cast<uint32_t>(address.blob.size()));
+    std::vector<char> matched(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(at));
+    for (const std::vector<char>& section :
+         {merge_of(PatchFileId::ADDR_POINTS, static_cast<uint32_t>(ADDR_POINT_STRIDE), ADDR_POINT_STRIDE, ADDR_POINT_STRIDE, record_ops),
+          merge_of(PatchFileId::ADDR_VERTICES, 1, address.blob.size(), address.blob.size(), footprint_ops)})
+        matched.insert(matched.end(), section.begin(), section.end());
+    matched.insert(matched.end(), raw.begin() + static_cast<std::ptrdiff_t>(at + copies.size()), raw.end());
+    REQUIRE(write_patch(c, c.patch(), matched));
+    CHECK(apply_modes(c, ALL_MODES, addr_replayed_is(1, 0)).bad.empty());
+
+    std::vector<char> moved = points;
+    moved[addr_files::LAT_BASE_AT + 3] = static_cast<char>(moved[addr_files::LAT_BASE_AT + 3] ^ 0x40);
+    addr_files::Block block;
+    REQUIRE(addr_files::decode_block(0, reinterpret_cast<const uint8_t*>(moved.data()), moved.size(), 1, block) ==
+            moved.size() - addr_files::POINTS_FOOTER_BYTES);
+    REQUIRE(block.lat[0] == 0x7F800000u && block.lng[0] == coord_keys::bits_of(1.0f) && block.len[0] == blob.size());
+    REQUIRE(write_file(points_path, moved));
+    const std::vector<std::string> bad = not_refused(c, ALL_MODES, c.patch(), "moved", "Old addr_points.bin is not the one the patch was made from");
+    CHECK(bad.empty());
+    // What the whole-file decoder says of the files a mode wrote.
+    if (!bad.empty())
+        for (const std::string& mode : ALL_MODES) {
+            std::map<std::string, std::vector<char>> out;
+            for (const char* f : ADDRESS_FILES) out[f] = read_file(c.dir("moved.out." + mode) + "/" + f);
+            std::string refusal;
+            try {
+                auto u8 = [&](const char* f) { return reinterpret_cast<const uint8_t*>(out[f].data()); };
+                addr_files::decode(u8("addr_points.bin"), out["addr_points.bin"].size(), u8("addr_vertices.bin"), out["addr_vertices.bin"].size(),
+                                   u8("addr_index.bin"), out["addr_index.bin"].size());
+            } catch (const std::runtime_error& e) {
+                refusal = e.what();
+            }
+            std::printf("    %s: the patched address files decode: %s\n", mode.c_str(), refusal.empty() ? "yes" : refusal.c_str());
+        }
+    REQUIRE(write_file(points_path, points));
+    CHECK(apply_modes(c, ALL_MODES, addr_replayed_is(1, 0)).bad.empty());
+}
+
+// A section sent as unchanged says the new file is the old one, so its two
+// sizes are one. In every mode the patcher refuses, by the file's name, such
+// a section whose new size is not its old one, though the old file has the
+// old size and the client list holds the new dir's files: each section of a
+// day that changes nothing (the records' and the child's of a way pair, of
+// the address files and of the POI files, the place files' and a side
+// file's, families the patcher copies as their files sit), and that of a file
+// of no family (the arcs' index). The patches as made apply.
+TEST(patch_refuses_a_section_sent_as_unchanged_whose_new_size_is_not_its_old_one) {
+    ScratchDir dir("lowmem-copy-old-sizes");
+    std::mt19937 rng(20261115);
+    BuildDir families = every_family(rng), arcs;
+    put_arc_slots(arcs, arc_slots(40, 30, 12));
+    CellLists cells;
+    for (uint32_t k = 0; k < 12; k++) cells[pair_cell(k)] = {k};
+    put_cells(arcs, "admin", cells);
+    struct Section {
+        PatchFileId file;
+        uint64_t size, more;  // its bytes, and those of one of its records
+    };
+    auto logical = [&](const char* name) { return static_cast<uint64_t>(families.at(name).size()); };
+    const std::vector<Section> of_families = {
+        {PatchFileId::STREET_WAYS, logical("street_ways.bin"), WAY_HEADER_STRIDE},
+        {PatchFileId::STREET_NODES, logical("street_nodes.bin"), 8},
+        {PatchFileId::INTERP_WAYS, logical("interp_ways.bin"), INTERP_WAY_STRIDE},
+        {PatchFileId::INTERP_NODES, logical("interp_nodes.bin"), 8},
+        {PatchFileId::ADDR_POINTS, logical("addr_points.bin"), ADDR_POINT_STRIDE},
+        {PatchFileId::ADDR_VERTICES, logical("addr_vertices.bin"), 1},
+        {PatchFileId::POI_RECORDS, logical("poi_records.bin"), POI_RECORD_STRIDE},
+        {PatchFileId::POI_VERTICES, logical("poi_vertices.bin"), 1},
+        {PatchFileId::PLACE_NODES, place_files::LOGICAL_STRIDE * 20, place_files::LOGICAL_STRIDE},
+        {PatchFileId::WAY_PARENTS, logical("way_parents.bin"), 4},
+        {PatchFileId::ADDR_POSTCODES, logical("addr_postcodes.bin"), 4},
+    };
+    const std::vector<Section> of_arcs = {{PatchFileId::ARC_INDEX, arcs.at("arc_index.bin").size(), ARC_INDEX_STRIDE}};
+    for (const auto& [name, d, sections] : {std::tuple<const char*, const BuildDir&, const std::vector<Section>&>{"families", families, of_families},
+                                            {"arcs", arcs, of_arcs}}) {
+        const LowMemCase c{dir.path(), name};
+        REQUIRE(prepare(c, d, d).empty());
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
+        const std::vector<char> raw = raw_patch(c);
+        REQUIRE(!raw.empty());
+        for (const Section& s : sections) {
+            const std::string file = patch_file_names[static_cast<uint32_t>(s.file)];
+            const size_t at = find_once(raw, copy_old_section(s.file, s.size));
+            if (at == std::string::npos) std::printf("    no unchanged section of %s\n", file.c_str());
+            REQUIRE(at != std::string::npos);
+            std::vector<char> longer = raw;
+            put_at(longer, at + 16, s.size + s.more);
+            const std::string patch = c.dir(file + ".gcpatch");
+            REQUIRE(write_patch(c, patch, longer));
+
+            CHECK(not_refused(c, ALL_MODES, patch, file,
+                              "Malformed copy-old section: " + file + " is " + std::to_string(s.size) + " bytes old and " +
+                                  std::to_string(s.size + s.more) + " new")
+                      .empty());
+        }
+    }
+}
+
+namespace {
+
+// The patcher's heap peak as it refuses `patch` in the mode: none without a
+// heap shim, or when the patch applied.
+std::optional<uint64_t> refused_heap_peak(const LowMemCase& c, const std::string& mode, const std::string& patch, const std::string& name) {
+    const std::string out = c.dir(name + ".heap." + mode);
+    std::filesystem::remove_all(out);
+    const auto [ok, peak] = gctest::run_with_heap_peak(patch_words(c, mode, patch, out), c.log());
+    return ok ? std::nullopt : peak;
+}
+
+}  // namespace
+
+// A family's encoder takes a record once its child bytes are in and child
+// bytes once their record is, so bytes of one file that no unit will take are
+// refused as they reach it, not held until the family's files close. A dir
+// whose street pair, address files and POI files hold no record, and patches
+// of an unchanged day with megabytes of bytes no record owns: each family's
+// child file replaced whole after its records' section, of no record, closed
+// the records' file; the street ways' section given records of one node each
+// and no node; and the street nodes replaced whole before the ways' section.
+// In every mode the patcher refuses each as the first bytes come (the bytes
+// of a file that is closed for good) or once one file runs a megabyte ahead of
+// the other (while both may still come), and its heap peak is the same for 4
+// MiB of them as for 40. The patch as made applies.
+TEST(patch_refuses_bytes_no_record_of_a_family_owns_as_they_come) {
+    ScratchDir dir("lowmem-unowned");
+    BuildDir d;
+    for (const char* file : {"street_ways.bin", "street_nodes.bin", "addr_points.bin", "addr_vertices.bin", "poi_records.bin", "poi_vertices.bin"})
+        d[file] = {};
+    const LowMemCase c{dir.path(), "empty"};
+    REQUIRE(prepare(c, d, d).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    // Where the patch holds a section, and where the section ends.
+    auto found = [&](const std::vector<char>& section) {
+        const size_t at = find_once(raw, section);
+        return std::pair<size_t, size_t>{at, at == std::string::npos ? at : at + section.size()};
+    };
+    // The sections of the files without a byte on either day: merges without
+    // an op, and the footprints' a full replacement by nothing.
+    const auto ways = found(merge_of(PatchFileId::STREET_WAYS, static_cast<uint32_t>(WAY_HEADER_STRIDE), 0, 0, {})),
+               nodes = found(merge_of(PatchFileId::STREET_NODES, 8, 0, 0, {})), footprints = found(replacement_of(PatchFileId::ADDR_VERTICES, 0, {})),
+               vertices = found(merge_of(PatchFileId::POI_VERTICES, 1, 0, 0, {}));
+    REQUIRE(ways.first != std::string::npos && nodes.first == ways.second && footprints.first != std::string::npos &&
+            vertices.first != std::string::npos);
+    // The patch with [at.first, at.second) replaced by section.
+    auto with = [&](std::pair<size_t, size_t> at, const std::vector<char>& section) {
+        std::vector<char> edited(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(at.first));
+        edited.insert(edited.end(), section.begin(), section.end());
+        edited.insert(edited.end(), raw.begin() + static_cast<std::ptrdiff_t>(at.second), raw.end());
+        return edited;
+    };
+    auto whole = [](PatchFileId fid, uint32_t mib) { return replacement_of(fid, 0, std::vector<char>(size_t{mib} << 20, 0)); };
+    struct Unowned {
+        std::string name;
+        std::function<std::vector<char>(uint32_t mib)> patch;
+        std::string refusal;
+    };
+    const Unowned cases[] = {
+        {"nodes", [&](uint32_t mib) { return with(nodes, whole(PatchFileId::STREET_NODES, mib)); }, "streets: 65536 bytes left over on input 1"},
+        {"footprints", [&](uint32_t mib) { return with(footprints, whole(PatchFileId::ADDR_VERTICES, mib)); },
+         "addr: 65536 bytes left over on input 1"},
+        {"vertices", [&](uint32_t mib) { return with(vertices, whole(PatchFileId::POI_VERTICES, mib)); }, "poi: 65536 bytes left over on input 1"},
+        {"ways",
+         [&](uint32_t mib) {
+             const uint32_t n = (mib << 20) / static_cast<uint32_t>(WAY_HEADER_STRIDE);
+             std::vector<char> records;
+             for (uint32_t w = 0; w < n; w++) append(records, WayHeader{w, 1, 0, 0});
+             std::vector<char> ops;
+             put_op(ops, OP_INSERT_RUN, n, records.data(), WAY_HEADER_STRIDE);
+             return with(ways, merge_of(PatchFileId::STREET_WAYS, static_cast<uint32_t>(WAY_HEADER_STRIDE), 0, 0, ops));
+         },
+         "streets: input 0 runs 1114112 bytes ahead of input 1"},
+        {"nodes-first",
+         [&](uint32_t mib) {
+             std::vector<char> both = whole(PatchFileId::STREET_NODES, mib);
+             both.insert(both.end(), raw.begin() + static_cast<std::ptrdiff_t>(ways.first), raw.begin() + static_cast<std::ptrdiff_t>(ways.second));
+             return with({ways.first, nodes.second}, both);
+         },
+         "streets: input 1 runs 1114112 bytes ahead of input 0"},
+    };
+    constexpr uint32_t MIB = 4, FACTOR = 10, THREADS_RUNS = 3;
+    for (const Unowned& u : cases) {
+        const int failures_before = gctest::failures();
+        const std::string patch = c.dir(u.name + ".gcpatch"), larger = c.dir(u.name + ".larger.gcpatch");
+        REQUIRE(write_patch(c, patch, u.patch(MIB)));
+        REQUIRE(write_patch(c, larger, u.patch(MIB * FACTOR)));
+
+        CHECK(not_refused(c, ALL_MODES, patch, u.name, u.refusal).empty());
+        CHECK(not_refused(c, ALL_MODES, larger, u.name + ".larger", u.refusal).empty());
+        if (gctest::heap_peak_shim()) {
+            for (const std::string& mode : ALL_MODES) {
+                std::vector<uint64_t> peaks[2];
+                for (uint32_t run = 0; run < (mode == "threads" ? THREADS_RUNS : 1); run++)
+                    for (size_t s = 0; s < 2; s++)
+                        if (const auto peak = refused_heap_peak(c, mode, s == 0 ? patch : larger, u.name)) peaks[s].push_back(*peak);
+                REQUIRE(!peaks[0].empty() && !peaks[1].empty());
+                const std::string grew = peak_grew(mode, peaks[0], peaks[1], MIB, FACTOR);
+                if (!grew.empty()) std::printf("    %s\n", grew.c_str());
+                CHECK(grew.empty());
+            }
+        } else {
+            std::printf("    SKIP heap peaks of %s: no heap shim under the sanitizers\n", u.name.c_str());
+        }
+        if (gctest::failures() > failures_before) std::printf("    in: %s\n", u.name.c_str());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// A reader that knows an old file's decoded size reads no byte past it, so a
+// decoder makes the checks of how its files end as it decodes their last
+// unit. Old files with a byte between the last unit and what follows it,
+// which a day's patch reads to their end, are refused in every mode in the
+// whole-file decoder's words: a side file alone (a sparse delta) and beside
+// its ways (a parallel delta along ways sent unchanged), of 100 values, of
+// 2,048 (a read ahead of the decoder's) and of 4,096, a byte between its
+// blocks and its table; POI files whose records stay while a polygon changes
+// (the records sent unchanged replay with their vertices through the codecs),
+// a byte between the last block and the pad; and place files with a place
+// renamed, a byte between the blocks and the table. Each patch applies to the
+// files as written.
+TEST(patch_refuses_old_files_with_a_byte_between_their_last_unit_and_what_follows_it) {
+    ScratchDir dir("lowmem-file-ends");
+    std::mt19937 rng(20261115);
+    struct Case {
+        std::string name;
+        BuildDir old_d, new_d;
+        std::string file;
+        size_t before;  // the byte goes in this many bytes from the file's end
+        std::string refusal;
+    };
+    std::vector<Case> cases;
+    const std::string side = "Malformed way_parents.bin: bytes between its blocks and its table";
+    for (const uint32_t n : {100u, 2048u, 4096u}) {
+        std::vector<char> parents, changed;
+        for (uint32_t v = 0; v < n; v++) {
+            append(parents, v % 700);
+            append(changed, v % 700 + (v == n / 2));
+        }
+        const size_t table = size_t{4} * ((n + 63) / 64) + 8;
+        cases.push_back({"side-" + std::to_string(n), {{"way_parents.bin", parents}}, {{"way_parents.bin", changed}}, "way_parents.bin", table, side});
+        BuildDir with_ways, meta;
+        std::vector<uint32_t> names(n);
+        for (uint32_t w = 0; w < n; w++) names[w] = w % 9;
+        put_named_ways(with_ways, meta, names);
+        BuildDir with_ways_changed = with_ways;
+        with_ways["way_parents.bin"] = parents;
+        with_ways_changed["way_parents.bin"] = changed;
+        cases.push_back({"side-beside-" + std::to_string(n), with_ways, with_ways_changed, "way_parents.bin", table, side});
+    }
+    {
+        const std::vector<Poi> pois = pois_of(rng, 300, 0, true);
+        std::vector<Poi> edited = pois;
+        std::fill(edited[100].block.begin() + 10, edited[100].block.end(), 0);
+        BuildDir old_d, new_d;
+        put_pois(old_d, pois);
+        put_pois(new_d, edited);
+        // Records sent unchanged over one block that changes: the old POI files are held to
+        // their hashes before the codecs read them.
+        cases.push_back({"poi", old_d, new_d, "poi_vertices.bin", poi_files::VERTEX_PAD, "Old poi_vertices.bin is not the one the patch was made from"});
+    }
+    {
+        std::vector<PlaceNode> places = some_places(20);
+        BuildDir old_d, new_d;
+        put_places(old_d, places);
+        places[5].name_id = 1000;
+        put_places(new_d, places);
+        // 15 visible nodes: one block.
+        cases.push_back({"places", old_d, new_d, "place_nodes.bin", place_files::TABLE_ENTRY_BYTES + place_files::FOOTER_BYTES,
+                         "Malformed place files: place_nodes.bin has bytes between its blocks and its table"});
+    }
+    for (const Case& e : cases) {
+        const int failures_before = gctest::failures();
+        const LowMemCase c{dir.path(), e.name};
+        REQUIRE(prepare(c, e.old_d, e.new_d).empty());
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
+        const std::string path = c.dir("old") + "/" + e.file;
+        const std::vector<char> written = read_file(path);
+        REQUIRE(written.size() > e.before);
+        std::vector<char> longer = written;
+        longer.insert(longer.end() - static_cast<std::ptrdiff_t>(e.before), 0);
+        REQUIRE(write_file(path, longer));
+
+        CHECK(not_refused(c, ALL_MODES, c.patch(), "longer", e.refusal).empty());
+
+        REQUIRE(write_file(path, written));
+        CHECK(apply_modes(c, ALL_MODES).bad.empty());
+        if (gctest::failures() > failures_before) std::printf("    in: %s\n", e.name.c_str());
+    }
+}
+
+// A V2 block holds its polygon's bbox minimum as steps from its record's lat
+// and lng, and a MATCH record is the old row's, so the old records the POI
+// replay copies blocks under are checked as the blocks are, by their file's
+// hash. 30 POIs, 20 with a polygon, and a patch that MATCHes every record and
+// every vertex byte: each block is copied. With one bit of a row's latitude
+// flipped in the old poi_records.bin, or a byte of a combo of its dictionary
+// changed, the files are still ones the encoder writes (poi_files::decode
+// takes them) and poi_vertices.bin is as it was: the patched files would hold
+// a POI and its polygon the new day does not. In every mode the patcher
+// refuses the old poi_records.bin by its hash; the patch applies to the files
+// as written.
+TEST(the_poi_replay_refuses_an_old_record_moved_under_a_block_it_would_copy) {
+    ScratchDir dir("lowmem-poi-point");
+    std::mt19937 rng(20261115);
+    BuildDir d;
+    put_pois(d, pois_of(rng, 30, 0, true));
+    const LowMemCase c{dir.path(), "point"};
+    REQUIRE(prepare(c, d, d).empty());
+    const std::vector<char>& records = d.at("poi_records.bin");
+    const std::vector<char>& vertices = d.at("poi_vertices.bin");
+
+    // The unchanged day's patch with its two POI sections as merges: every
+    // record a MATCH, every vertex byte a MATCH.
+    const std::vector<char> raw = raw_patch(c);
+    std::vector<char> copies = copy_old_section(PatchFileId::POI_RECORDS, records.size());
+    const std::vector<char> copied_vertices = copy_old_section(PatchFileId::POI_VERTICES, vertices.size());
+    copies.insert(copies.end(), copied_vertices.begin(), copied_vertices.end());
+    const size_t at = find_once(raw, copies);
+    REQUIRE(at != std::string::npos);
+    std::vector<char> record_ops, vertex_ops;
+    put_op(record_ops, OP_MATCH_RUN, 30);
+    put_op(vertex_ops, OP_MATCH_RUN, static_cast<uint32_t>(vertices.size()));
+    std::vector<char> matched(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(at));
+    for (const std::vector<char>& section :
+         {merge_of(PatchFileId::POI_RECORDS, static_cast<uint32_t>(POI_RECORD_STRIDE), records.size(), records.size(), record_ops),
+          merge_of(PatchFileId::POI_VERTICES, 1, vertices.size(), vertices.size(), vertex_ops)})
+        matched.insert(matched.end(), section.begin(), section.end());
+    matched.insert(matched.end(), raw.begin() + static_cast<std::ptrdiff_t>(at + copies.size()), raw.end());
+    REQUIRE(write_patch(c, c.patch(), matched));
+    const LogCheck copied = [](const std::string& log) {
+        return log.find("replayed with poi_records.bin: blocks 20 copied, 0 encoded") == std::string::npos ? std::string("not 20 blocks copied")
+                                                                                                             : std::string();
+    };
+    CHECK(apply_modes(c, ALL_MODES, copied).bad.empty());
+
+    const std::string path = c.dir("old") + "/poi_records.bin";
+    const std::vector<char> written = read_file(path), blocks = read_file(c.dir("old") + "/poi_vertices.bin");
+    // Record 1 has a polygon; the combos follow the 30 rows.
+    std::vector<char> moved = written, another_combo = written;
+    moved[1 * poi_files::ROW_BYTES + poi_files::ROW_LAT] ^= 1;
+    another_combo[30 * poi_files::ROW_BYTES + 3] ^= 5;
+    for (const auto& [name, damaged] : {std::pair<const char*, const std::vector<char>&>{"moved", moved}, {"combo", another_combo}}) {
+        std::string strict;
+        try {
+            poi_files::decode(reinterpret_cast<const uint8_t*>(damaged.data()), damaged.size(), reinterpret_cast<const uint8_t*>(blocks.data()),
+                              blocks.size());
+        } catch (const std::runtime_error& e) {
+            strict = e.what();
+        }
+        if (!strict.empty()) std::printf("    %s: %s\n", name, strict.c_str());
+        REQUIRE(strict.empty());
+        REQUIRE(write_file(path, damaged));
+        const std::vector<std::string> bad = not_refused(c, ALL_MODES, c.patch(), name, "Old poi_records.bin is not the one the patch was made from");
+        CHECK(bad.empty());
+        REQUIRE(write_file(path, written));
+    }
+    CHECK(apply_modes(c, ALL_MODES, copied).bad.empty());
+}
+
+TEST(patch_holds_the_old_poi_files_to_their_hashes_when_only_the_blocks_change) {
+    ScratchDir dir("lowmem-poi-unchanged-records");
+    std::mt19937 rng(20261115);
+    BuildDir d;
+    put_pois(d, pois_of(rng, 30, 0, true));
+    const LowMemCase c{dir.path(), "records"};
+    REQUIRE(prepare(c, d, d).empty());
+    const std::vector<char>& records = d.at("poi_records.bin");
+    const std::vector<char>& vertices = d.at("poi_vertices.bin");
+
+    // The unchanged day's patch with the records still sent unchanged and the
+    // vertices as a merge, every byte a MATCH: the codecs replay the family.
+    const std::vector<char> raw = raw_patch(c);
+    const std::vector<char> copied_records = copy_old_section(PatchFileId::POI_RECORDS, records.size());
+    const std::vector<char> copied_vertices = copy_old_section(PatchFileId::POI_VERTICES, vertices.size());
+    std::vector<char> copies = copied_records;
+    copies.insert(copies.end(), copied_vertices.begin(), copied_vertices.end());
+    const size_t at = find_once(raw, copies);
+    REQUIRE(at != std::string::npos);
+    std::vector<char> vertex_ops;
+    put_op(vertex_ops, OP_MATCH_RUN, static_cast<uint32_t>(vertices.size()));
+    const std::vector<char> section = merge_of(PatchFileId::POI_VERTICES, 1, vertices.size(), vertices.size(), vertex_ops);
+    std::vector<char> merged(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(at));
+    merged.insert(merged.end(), copied_records.begin(), copied_records.end());
+    merged.insert(merged.end(), section.begin(), section.end());
+    merged.insert(merged.end(), raw.begin() + static_cast<std::ptrdiff_t>(at + copies.size()), raw.end());
+    REQUIRE(write_patch(c, c.patch(), merged));
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+
+    // A combo of the records' dictionary changed (the file still decodes), then
+    // a byte of the blocks: each file is refused by its hash, in every mode.
+    const std::string records_path = c.dir("old") + "/poi_records.bin", blocks_path = c.dir("old") + "/poi_vertices.bin";
+    const std::vector<char> written = read_file(records_path), blocks = read_file(blocks_path);
+    std::vector<char> another_combo = written, another_block = blocks;
+    another_combo[30 * poi_files::ROW_BYTES + 3] ^= 5;
+    another_block[blocks.size() / 2] ^= 1;
+    REQUIRE(write_file(records_path, another_combo));
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "combo", "Old poi_records.bin is not the one the patch was made from").empty());
+    REQUIRE(write_file(records_path, written));
+    REQUIRE(write_file(blocks_path, another_block));
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "block", "Old poi_vertices.bin is not the one the patch was made from").empty());
+    REQUIRE(write_file(blocks_path, blocks));
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }

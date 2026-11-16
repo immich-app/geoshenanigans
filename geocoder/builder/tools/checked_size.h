@@ -3,7 +3,7 @@
 // the input has left and against the size type before anything is read or allocated. In size_t, a
 // 32-bit build wraps 10 + 4 * 2^30 to 10, so a ten-byte unit would pass for a billion vertices.
 // And a u32 id an input file gives as a delta from another, checked against the u32 range.
-// geocoder-gc's codecs (gc_*.h) and the patcher's (gcs_*.h) share them.
+// The patcher's codecs (gcs_*.h), its replays and patch_format.h share them.
 #pragma once
 #include <cstddef>
 #include <cstdint>

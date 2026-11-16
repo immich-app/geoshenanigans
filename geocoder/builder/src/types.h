@@ -16,7 +16,7 @@ struct WayHeader {
 };
 static_assert(sizeof(WayHeader) == 12, "WayHeader must be 12 bytes");
 static_assert(offsetof(WayHeader, node_count) == 4 && offsetof(WayHeader, name_id) == 8,
-              "geocoder-diff and the server read WayHeader fields at fixed offsets");
+              "geocoder-diff reads WayHeader fields at fixed offsets");
 
 struct AddrPoint {
     float lat;
@@ -24,7 +24,7 @@ struct AddrPoint {
     uint32_t housenumber_id;
     uint32_t street_id;
     uint32_t parent_way_id;   // nearest street way index (for housenumber refinement)
-    uint32_t vertex_offset;   // into addr_vertices.bin (NO_DATA for node-sourced points)
+    uint32_t vertex_offset;   // into the footprint stream below (NO_DATA for node-sourced points)
     uint32_t vertex_count;    // 0 for nodes, >0 for building polygons
 };
 static_assert(sizeof(AddrPoint) == 28, "AddrPoint must be 28 bytes");
@@ -52,7 +52,7 @@ struct InterpWay {
 };
 static_assert(sizeof(InterpWay) == 24, "InterpWay must be 24 bytes");
 static_assert(offsetof(InterpWay, node_count) == 4 && offsetof(InterpWay, street_id) == 8,
-              "geocoder-diff and the server read InterpWay fields at fixed offsets");
+              "geocoder-diff reads InterpWay fields at fixed offsets");
 
 // Place type override for admin polygons, derived from either a place/
 // linked_place tag on the boundary itself, or the place type of a
@@ -91,8 +91,9 @@ enum class VertexEncoding : uint8_t {
 static constexpr uint8_t VERTEX_STRIDE[4] = {4, 4, 4, 8};
 static constexpr double VERTEX_SCALE[4] = {1e-5, 1e-4, 1e-6, 1e-7};  // degrees per delta step
 
-// poi_vertices.bin / addr_vertices.bin layout per
-// polygon (only present when vertex_count > 0):
+// A polygon in the builder's poi_vertices and addr_vertices streams, which
+// the patch tools merge and the dirs' files store encoded (addr_files.h for
+// the addresses); only present when vertex_count > 0:
 //
 //   byte 0     : VertexEncoding tag
 //   byte 1     : padding (alignment)
@@ -194,6 +195,27 @@ inline AdminPolygon admin_polygon_tombstone() {
     AdminPolygon p{};
     p.ring_offset = NO_DATA;
     p.name_id = NO_DATA;
+    return p;
+}
+
+// The strategy-2 slots with no living street way, interpolation way or
+// address point: every byte zero but the name, the street, and the parent
+// way and footprint offset, which are NO_DATA. The patch tools know a
+// tombstone by these bytes.
+inline WayHeader street_way_tombstone() {
+    WayHeader w{};
+    w.name_id = NO_DATA;
+    return w;
+}
+inline InterpWay interp_way_tombstone() {
+    InterpWay w{};
+    w.street_id = NO_DATA;
+    return w;
+}
+inline AddrPoint addr_point_tombstone() {
+    AddrPoint p{};
+    p.parent_way_id = NO_DATA;
+    p.vertex_offset = NO_DATA;
     return p;
 }
 

@@ -7,9 +7,13 @@
 // set or its ends. A previous build without its arc sidecars leaves every
 // arc slot cold and the admin slots as they were; one without their fallback
 // sidecars, the slots of arcs whose keys changed. Without --multi-output,
-// each region's dir is a whole index the server answers from; with it, a
-// build without --multi-quality is refused. A fresh build writes its streets
-// and addresses in cell order, whatever their names.
+// each region's dir is a whole index the server answers from, its side files
+// a value for each street and each address, its interpolation files the two
+// footers of no ways, its address files the ones their records have, the
+// three footers without a record; with it, a build without --multi-quality is
+// refused. A building's address is written with its footprint, which the
+// server takes its distance from. A fresh build writes its streets and
+// addresses in cell order, whatever their names.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -25,13 +29,17 @@
 
 #include <s2/s2cell_id.h>
 
+#include "addr_files.h"
 #include "id_allocator.h"
 #include "pbf_test_objects.h"
 #include "scratch_dir.h"
+#include "side_blocks.h"
 #include "string_files.h"
 #include "test_framework.h"
 #include "tool_runs.h"
 #include "types.h"
+#include "vertex_pack.h"
+#include "way_files.h"
 
 namespace fs = std::filesystem;
 
@@ -154,9 +162,10 @@ std::map<std::string, std::vector<char>> tree(const std::string& dir) {
     return files;
 }
 
-std::set<std::string> names_of(const std::map<std::string, std::vector<char>>& files) {
+template <class Value>
+std::set<std::string> names_of(const std::map<std::string, Value>& files) {
     std::set<std::string> out;
-    for (const auto& [name, bytes] : files) out.insert(name);
+    for (const auto& [name, value] : files) out.insert(name);
     return out;
 }
 
@@ -271,11 +280,108 @@ bool says(const std::string& answer, const std::string& name) {
     return answer.find("\"" + name + "\"") != std::string::npos;
 }
 
-// A file of fixed-width records.
+// The ways of a kind `dir` of a tree holds, as its two way files decode: each
+// way's logical record, a WayHeader or an InterpWay, and the ways' nodes back
+// to back. A dir without either file holds none.
 template <class Record>
-std::vector<Record> records_of(const std::vector<char>& bytes) {
-    std::vector<Record> out(bytes.size() / sizeof(Record));
-    if (!out.empty()) std::memcpy(out.data(), bytes.data(), out.size() * sizeof(Record));
+struct Ways {
+    std::vector<Record> ways;
+    std::vector<NodeCoord> nodes;
+};
+
+template <class Record>
+Ways<Record> ways_of(const way_files::Kind& kind, const std::map<std::string, std::vector<char>>& files,
+                     const std::string& dir) {
+    REQUIRE(kind.stride == sizeof(Record));
+    auto bytes = [&](const char* name) {
+        const auto file = files.find(dir + name);
+        return file == files.end() ? nullptr : reinterpret_cast<const uint8_t*>(file->second.data());
+    };
+    auto size = [&](const char* name) {
+        const auto file = files.find(dir + name);
+        return file == files.end() ? way_files::ABSENT : uint64_t(file->second.size());
+    };
+    Ways<Record> out;
+    way_files::decode(
+        kind, bytes(kind.ways_file), size(kind.ways_file), bytes(kind.nodes_file), size(kind.nodes_file),
+        [&](const uint8_t* record) {
+            out.ways.emplace_back();
+            std::memcpy(&out.ways.back(), record, sizeof(Record));
+        },
+        [&](const uint8_t* nodes, size_t n) {
+            const size_t at = out.nodes.size();
+            out.nodes.resize(at + n / sizeof(NodeCoord));
+            std::memcpy(out.nodes.data() + at, nodes, n);
+        });
+    return out;
+}
+
+// The addresses `dir` of a tree holds, as its three address files decode:
+// each one's logical record, an AddrPoint, and the footprints' logical blobs
+// back to back. A dir without any of the files holds none. The files are the
+// ones the serial encoder writes for the addresses: addr_index.bin is what
+// the other two give.
+struct Addresses {
+    std::vector<AddrPoint> points;
+    std::vector<uint8_t> vertices;
+};
+
+Addresses addresses_of(const std::map<std::string, std::vector<char>>& files, const std::string& dir) {
+    auto bytes = [&](const char* name) {
+        const auto file = files.find(dir + name);
+        return file == files.end() ? nullptr : reinterpret_cast<const uint8_t*>(file->second.data());
+    };
+    auto size = [&](const char* name) {
+        const auto file = files.find(dir + name);
+        return file == files.end() ? addr_files::ABSENT : uint64_t(file->second.size());
+    };
+    const char* const points = addr_files::POINTS_FILE;
+    const char* const vertices = addr_files::VERTICES_FILE;
+    const char* const index = addr_files::INDEX_FILE;
+    Addresses out;
+    addr_files::decode(
+        bytes(points), size(points), bytes(vertices), size(vertices), bytes(index), size(index),
+        [&](const uint8_t* record) {
+            out.points.emplace_back();
+            std::memcpy(&out.points.back(), record, sizeof(AddrPoint));
+        },
+        [&](const uint8_t* blob, size_t n) { out.vertices.insert(out.vertices.end(), blob, blob + n); });
+    if (size(points) == addr_files::ABSENT) return out;
+    const addr_files::Files encoded = addr_files::encode(reinterpret_cast<const uint8_t*>(out.points.data()), out.points.size(),
+                                                         out.vertices.data(), out.vertices.size());
+    auto same = [&](const char* name, const std::vector<uint8_t>& want) {
+        return size(name) == want.size() && std::memcmp(bytes(name), want.data(), want.size()) == 0;
+    };
+    CHECK(same(points, encoded.points) && same(vertices, encoded.vertices) && same(index, encoded.index));
+    return out;
+}
+
+// The side files `dir` of a tree holds, by name, each one's values: one for
+// each record of the file it sits beside.
+std::map<std::string, std::vector<uint32_t>> side_files(const std::map<std::string, std::vector<char>>& files,
+                                                        const std::string& dir) {
+    struct SideFile {
+        const char* name;
+        const char* parent;
+    };
+    std::map<std::string, std::vector<uint32_t>> out;
+    for (const SideFile& side : {SideFile{"way_parents.bin", "street_ways.bin"}, SideFile{"way_postcodes.bin", "street_ways.bin"},
+                                 SideFile{"addr_postcodes.bin", "addr_points.bin"},
+                                 SideFile{"interp_postcodes.bin", "interp_ways.bin"}}) {
+        const auto file = files.find(dir + side.name);
+        if (file == files.end()) continue;
+        std::vector<uint32_t>& values = out[side.name];
+        const std::vector<char>& bytes = file->second;
+        side_blocks::decode(side.name, reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(),
+                            [&](const uint32_t* v, size_t n) { values.insert(values.end(), v, v + n); });
+        const auto parent = files.find(dir + side.parent);
+        REQUIRE(parent != files.end());
+        const std::string of = side.parent;
+        const size_t records = of == "street_ways.bin"   ? ways_of<WayHeader>(way_files::STREETS, files, dir).ways.size()
+                               : of == "interp_ways.bin" ? ways_of<InterpWay>(way_files::INTERPS, files, dir).ways.size()
+                                                         : addresses_of(files, dir).points.size();
+        CHECK_EQ(values.size(), records);
+    }
     return out;
 }
 
@@ -404,6 +510,28 @@ TEST(a_build_without_the_multi_flags_writes_whole_dirs_the_server_answers_from) 
         CHECK(files.at("planet/" + f) == with_tiers.at("planet/" + f));
     }
     CHECK_EQ(files.at("planet/admin_polygons.bin").size(), 7 * sizeof(AdminPolygonRecord));
+    // Its side files hold a value for each street and each address: the
+    // street's parent, one of the seven polygons, and no postcode, of which
+    // the fixture has none; no interpolations, so no file of their postcodes.
+    const auto side = side_files(files, "planet/");
+    CHECK(names_of(side) == std::set<std::string>({"addr_postcodes.bin", "way_parents.bin", "way_postcodes.bin"}));
+    for (const auto& [name, values] : side) {
+        REQUIRE(values.size() == 1);
+        CHECK(name == "way_parents.bin" ? values[0] < 7 : values[0] == NO_DATA);
+    }
+    // Its street files hold the fixture's street, and its interpolation
+    // files, of which the fixture has none, are the two footers.
+    const auto streets = ways_of<WayHeader>(way_files::STREETS, files, "planet/");
+    REQUIRE(streets.ways.size() == 1);
+    CHECK(streets.ways[0].node_count == 2 && streets.nodes.size() == 2);
+    REQUIRE(files.count("planet/interp_ways.bin") && files.count("planet/interp_nodes.bin"));
+    CHECK(files.at("planet/interp_ways.bin") == std::vector<char>({0, 0, 0, 0, 'I', 'W', 'Y', '1'}));
+    CHECK(files.at("planet/interp_nodes.bin") == std::vector<char>({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'I', 'W', 'N', '1'}));
+    CHECK(ways_of<InterpWay>(way_files::INTERPS, files, "planet/").ways.empty());
+    // Its address files hold the fixture's address, a node.
+    const Addresses addresses = addresses_of(files, "planet/");
+    REQUIRE(addresses.points.size() == 1);
+    CHECK(addresses.points[0].vertex_count == 0 && addresses.points[0].vertex_offset == NO_DATA && addresses.vertices.empty());
 
     // The server loads the dir and puts each point on its side of the border
     // of the first two municipalities, 0.0005 degrees off it (its ways stray
@@ -430,6 +558,25 @@ TEST(a_build_without_the_multi_flags_writes_whole_dirs_the_server_answers_from) 
         for (const std::string& f : geometry) CHECK(regions.count(region + "/" + f));
     for (const char* f : {"admin_rings.bin", "arc_index.bin", "arc_vertices.bin"})
         CHECK(regions.at(std::string("europe/") + f) == regions.at(std::string("planet/") + f));
+    // Europe's street and address have their side values; a region without
+    // streets has no side file, and its way files and address files are the
+    // footers.
+    for (const std::string& region : kRegions) {
+        CHECK_EQ(addresses_of(regions, region + "/").points.size(), kRegionsHeld.count(region) ? size_t(1) : size_t(0));
+        for (const char* f : {addr_files::POINTS_FILE, addr_files::VERTICES_FILE, addr_files::INDEX_FILE})
+            CHECK(regions.count(region + "/" + f));
+        if (!kRegionsHeld.count(region)) {
+            CHECK(regions.at(region + "/addr_points.bin") == std::vector<char>({0, 0, 0, 0, 'A', 'D', 'B', '1'}));
+            CHECK(regions.at(region + "/addr_vertices.bin") ==
+                  std::vector<char>({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 'A', 'D', 'F', '1'}));
+            CHECK(regions.at(region + "/addr_index.bin") == std::vector<char>({0, 0, 0, 0, 'A', 'D', 'X', '1'}));
+        }
+        CHECK_EQ(names_of(side_files(regions, region + "/")).size(), kRegionsHeld.count(region) ? size_t(3) : size_t(0));
+        CHECK_EQ(ways_of<WayHeader>(way_files::STREETS, regions, region + "/").ways.size(),
+                 kRegionsHeld.count(region) ? size_t(1) : size_t(0));
+        CHECK(ways_of<InterpWay>(way_files::INTERPS, regions, region + "/").ways.empty());
+        CHECK_EQ(regions.count(region + "/interp_ways.bin") + regions.count(region + "/interp_nodes.bin"), size_t(2));
+    }
     check_answers(continents, "continents");
 }
 
@@ -675,6 +822,50 @@ TEST(a_chained_build_on_a_previous_build_without_arc_fallback_sidecars_takes_slo
         }
 }
 
+TEST(a_building_is_written_with_its_footprint_which_the_server_takes_its_distance_from) {
+    const ScratchDir root("building-footprint-build");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    // A building of house number 7, 22 m by 60 m, its west wall 8 m east of
+    // the node of the fixture's house number 1.
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    const int32_t south = lat0 + 1409000, north = lat0 + 1411000, west = lng0 + 1501000, east = lng0 + 1509000;
+    const int32_t corners[5][2] = {{south, west}, {south, east}, {north, east}, {north, west}, {south, west}};
+    std::vector<TestObject> objects = fixture();
+    for (int k = 0; k < 4; k++) objects.push_back(node(970 + k, corners[k][0], corners[k][1]));
+    objects.push_back(way(4010, {970, 971, 972, 973, 970},
+                          {{"addr:housenumber", "7"}, {"addr:street", "Teststrasse"}, {"building", "yes"}}));
+    std::stable_sort(objects.begin(), objects.end(), [](const TestObject& a, const TestObject& b) {
+        return a.type != b.type ? a.type < b.type : a.id < b.id;
+    });
+    write_test_pbf(pbf, objects, 1000);
+    const std::string out = root.path() + "/single";
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
+
+    // The node's record is a point; the building's has the way's five
+    // vertices, the last the first again, on the grid a building's span
+    // takes.
+    const Addresses addresses = addresses_of(tree(out), "planet/");
+    REQUIRE(addresses.points.size() == 2);
+    const bool building_first = addresses.points[0].vertex_count != 0;
+    const AddrPoint& building = addresses.points[building_first ? 0 : 1];
+    const AddrPoint& house = addresses.points[building_first ? 1 : 0];
+    CHECK(house.vertex_count == 0 && house.vertex_offset == NO_DATA);
+    REQUIRE(building.vertex_count == 5 && building.vertex_offset == 0 && addresses.vertices.size() == POLY_HEADER_BYTES + 5 * 4);
+    CHECK_EQ(addresses.vertices[0], static_cast<uint8_t>(VertexEncoding::U16_011M));
+    const std::vector<NodeCoord> ring = unpack_polygon(addresses.vertices.data(), 5);
+    for (int k = 0; k < 5; k++)
+        CHECK(std::fabs(ring[k].lat - corners[k][0] / 1e7) < 1e-5 && std::fabs(ring[k].lng - corners[k][1] / 1e7) < 1e-5);
+    CHECK(building.lat > south / 1e7 && building.lat < north / 1e7 && building.lng > west / 1e7 && building.lng < east / 1e7);
+
+    // A point inside the building's west end is 11 m from the node and 20 m
+    // from the building's own point: the server answers the building, by its
+    // walls.
+    const std::vector<std::string> answers = server_answers(out + "/planet", {{47.1410, 8.15015}}, root.path() + "/q", log);
+    REQUIRE(answers.size() == 1);
+    CHECK(says(answers[0], "7") && !says(answers[0], "1"));
+    if (!says(answers[0], "7")) std::printf("    %s\n", answers[0].c_str());
+}
+
 TEST(a_fresh_build_writes_streets_and_addresses_in_cell_order_whatever_their_names) {
     const ScratchDir root("record-order-build");
     const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
@@ -742,9 +933,9 @@ TEST(a_fresh_build_writes_streets_and_addresses_in_cell_order_whatever_their_nam
     // from "Weg F" to "Weg A", and its addresses by the cell of their point.
     auto check_order = [&](const std::map<std::string, std::vector<char>>& files, const std::string& dir) {
         REQUIRE(files.count(dir + "street_ways.bin") && files.count(dir + "street_nodes.bin") &&
-                files.count(dir + "addr_points.bin"));
-        const auto ways = records_of<WayHeader>(files.at(dir + "street_ways.bin"));
-        const auto nodes = records_of<NodeCoord>(files.at(dir + "street_nodes.bin"));
+                files.count(dir + "addr_points.bin") && files.count(dir + "addr_vertices.bin") &&
+                files.count(dir + "addr_index.bin"));
+        const auto [ways, nodes] = ways_of<WayHeader>(way_files::STREETS, files, dir);
         REQUIRE(ways.size() == spots.size() + 1);
         std::vector<size_t> streets;
         uint64_t last = 0;
@@ -758,7 +949,7 @@ TEST(a_fresh_build_writes_streets_and_addresses_in_cell_order_whatever_their_nam
                 if (close_to(first->lat, degrees(spots[i].lat)) && close_to(first->lng, degrees(spots[i].lon))) streets.push_back(i);
         }
         CHECK(streets == std::vector<size_t>({0, 1, 2, 3, 4, 5}));
-        const auto points = records_of<AddrPoint>(files.at(dir + "addr_points.bin"));
+        const std::vector<AddrPoint> points = addresses_of(files, dir).points;
         REQUIRE(points.size() == addresses.size());
         for (size_t k = 0; k < points.size(); k++)
             CHECK(close_to(points[k].lat, addresses[k].lat) && close_to(points[k].lng, addresses[k].lng));

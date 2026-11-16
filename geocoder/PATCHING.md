@@ -40,7 +40,7 @@ A complete geocoder index for a given region and configuration consists of files
 
 | Mode | Files | Description |
 |------|-------|-------------|
-| `full/` | 22 files (+4 optional) | Streets + addresses + interpolation + admin + postcodes |
+| `full/` | 23 files (+4 optional) | Streets + addresses + interpolation + admin + postcodes |
 | `no-addresses/` | 16 files (+3 optional) | Streets + admin + postcodes (no address points) |
 | `admin/` | 8 files (+3 optional) | Admin cell indexes + place nodes + postcodes |
 | `admin-minimal/` | 11 files | Admin levels 2-8 + place nodes, with its own polygons over the minimal arc set, simplified to within 37.5 m on an 11 m grid (a ring that grid would collapse keeps the 1.1 m one; takes the place of the quality dir, so pick simplified), and only the core strings its records name. For POI tier `none` |
@@ -87,7 +87,7 @@ The entry point for all clients:
 ```json
 {
   "build_version": 19,
-  "patch_version": 15,
+  "patch_version": 17,
   "latest": "2026-04-10",
   "previous": "2026-04-09",
   "oldest_indexes": "2026-04-08",
@@ -118,7 +118,7 @@ files belong to each axis value), constraints, presets, and the flat
   "schema_version": 1,
   "build": {
     "version": 19,
-    "patch_version": 15,
+    "patch_version": 17,
     "date": "2026-04-10",
     "previous": "2026-04-09",
     "built_at": "2026-04-10T09:00:14Z",
@@ -165,7 +165,7 @@ the `.bin` files, because the server can't load a region without them.
    list (their `files`, the `optional_files` that appear in `files`, minus
    any `replaces`), each as
    <path>.zst, decompress, and check it against its sha256:
-   - builds/{date}/europe/full/…                (22 files + up to 4 optional)
+   - builds/{date}/europe/full/…                (23 files + up to 4 optional)
    - builds/{date}/europe/quality/simplified/…  (4 files)
    - builds/{date}/europe/poi/notable/…         (7 files, optional)
    The JSON files (strings_layout.json, poi_meta.json) are part of the set:
@@ -253,17 +253,16 @@ The patch tool:
   runs it spills to its scratch dir are mmapped. Long unchanged runs and
   unchanged files are copied in the kernel (`copy_file_range`), or through
   `pread` where the kernel, the filesystem or a seccomp profile refuses that
-- Peak anonymous memory: about 1 MiB, or 2 MiB in low-memory mode (an
-  encoded installed set, see `builder/PATCHING.md`), for every variant and
-  whatever the patch; everything else is reclaimable page cache. That is the
+- Peak anonymous memory: about 2 MiB for every variant and whatever the
+  patch; everything else is reclaimable page cache. That is the
   default build, which decompresses the patch with libzstd; one built with
   `-DGEOCODER_PATCH_LIBZSTD=OFF` also runs a `zstd` child that allocates
   about 11.3 MiB beside it.
   Its scratch dir, which holds the decompressed patch, is under `$TMPDIR`:
   keep that on disk, since a RAM-backed one counts against memory
 - Runs on one core inside a 32 MiB memory limit (page cache included): one
-  day of `planet/full` takes about 4 minutes, `europe/full` about 1.5 minutes
-  on an SSD. On a slow disk it is disk-bound: it reads the old variant and
-  writes the new one, two to three times the variant's size in IO
+  day of `planet/full` takes a little over 2 minutes on an SSD. On a slow
+  disk it is disk-bound: it reads the old variant and writes the new one,
+  two to three times the variant's size in IO
 - Needs free space for the new copy of the variant (it never patches in place)
 - Produces byte-identical output to a fresh build

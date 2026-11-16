@@ -1,9 +1,8 @@
-// Unit tests for the low-memory mode's in-process codecs (tools/gcs_codec.h):
+// Unit tests for the patcher's in-process codecs (tools/gcs_codec.h):
 // today's-format bytes written to an encoder in odd-sized pieces decode back
-// byte for byte, and malformed encoded sets fail with an error instead of
+// byte for byte, and malformed encoded files fail with an error instead of
 // decoding wrong bytes or exhausting memory.
 #include "gcs_codec.h"
-#include "gc_addr.h"
 
 #include <cerrno>
 #include <csignal>
@@ -42,13 +41,11 @@ void write_in_pieces(Encoder& enc, int port, const std::vector<uint8_t>& bytes, 
     write_in_pieces(enc, port, bytes.data(), bytes.size(), rng, max_piece);
 }
 
-// Every port closed and pumped, then the manifest.
-Manifest finish_all(Encoder& enc) {
+// Every port closed and pumped, then the encoder finished.
+void finish_all(Encoder& enc) {
     for (auto& s : enc.state) s = 2;
     enc.pump();
-    Manifest m;
-    enc.finish(m);
-    return m;
+    enc.finish();
 }
 
 // The decoder's bytes per port, decoded to the end.
@@ -219,34 +216,44 @@ uint32_t f32_bits(float f) {
     return b;
 }
 
-// A synthetic address set: addr_points.bin records (28 bytes, the vertex
-// offset and count last) and their footprints (a 10-byte header: encoding, pad
-// byte, then the base latitude and longitude bits; then vc vertices, 8 random
-// bytes each at encoding 3, else two u16 below span; a closed ring repeats its
-// first vertex last). sizes: each record's footprint bytes (0: none).
+// A logical address pair (addr_files.h): the points' records, 28 bytes each
+// with the vertex offset and count last, and their footprints' logical blobs
+// back to back (a 10-byte header: the encoding, a zero byte, the bbox
+// minimum's latitude and longitude bits; then 4 bytes a vertex, 8 in encoding
+// 3). sizes: each record's footprint bytes (0: none).
+struct AddrSet {
+    std::vector<uint8_t> points, verts;
+    std::vector<size_t> sizes;
+};
+// A record: a point (vc 0), a dead slot, or a footprint of vc vertices in an
+// encoding, 8 random bytes each in encoding 3, else two u16 below span; a
+// closed one repeats its first vertex last.
 struct AddrSpec {
     uint32_t vc;
     uint8_t enc;
     bool closed;
     uint32_t span;
-    uint8_t pad = 0;
+    bool dead = false;
 };
-struct AddrSet {
-    std::vector<uint8_t> points, verts;
-    std::vector<size_t> sizes;
-};
+// The pair of specs' records, the points anywhere, a few streets and parent
+// ways among them. Half the footprints have their bbox minimum at their
+// point, so a narrow one's goes as its residuals; the others' is anywhere.
 AddrSet addr_set(const std::vector<AddrSpec>& specs, std::mt19937& rng) {
     AddrSet s;
     for (const AddrSpec& sp : specs) {
-        uint32_t rec[7] = {f32_bits(float(rng() % 1800000) / 1e4f - 90.f), f32_bits(float(rng() % 3600000) / 1e4f - 180.f),
-                           uint32_t(rng()), uint32_t(rng()), uint32_t(rng()), NO, 0};
+        const uint32_t lat = f32_bits(float(rng() % 1800000) / 1e4f - 90.f);
+        const uint32_t lng = f32_bits(float(rng() % 3600000) / 1e4f - 180.f);
+        const uint32_t street = 1000 + uint32_t(rng() % 6);
+        uint32_t rec[7] = {lat, lng, uint32_t(rng() % 5000), street, rng() % 4 ? street + 7 : uint32_t(rng()), NO, 0};
+        if (sp.dead) rec[0] = rec[1] = rec[2] = rec[3] = 0, rec[4] = NO;
         const size_t first = s.verts.size();
         if (sp.vc) {
             rec[5] = uint32_t(first);
             rec[6] = sp.vc;
-            uint8_t h[10] = {sp.enc, sp.pad};
-            wr32(h + 2, f32_bits(float(rng() % 1800000) / 1e4f - 90.f));
-            wr32(h + 6, f32_bits(float(rng() % 3600000) / 1e4f - 180.f));
+            uint8_t h[10] = {sp.enc, 0};
+            const bool at_point = rng() % 2;
+            wr32(h + 2, at_point ? lat : f32_bits(float(rng() % 1800000) / 1e4f - 90.f));
+            wr32(h + 6, at_point ? lng : f32_bits(float(rng() % 3600000) / 1e4f - 180.f));
             s.verts.insert(s.verts.end(), h, h + 10);
             const size_t vs = sp.enc == 3 ? 8 : 4, first_vertex = s.verts.size();
             for (uint32_t k = 0; k < sp.vc; k++) {
@@ -268,169 +275,350 @@ AddrSet addr_set(const std::vector<AddrSpec>& specs, std::mt19937& rng) {
     return s;
 }
 
-// Whether geocoder-gc encodes the set's today's files (written to dir/today)
-// into the encoded files in dir, byte for byte.
-bool gc_encodes_the_same(const AddrSet& s, const std::string& dir) {
-    const std::string today = dir + "/today", gc = dir + "/gc";
-    std::filesystem::create_directories(today);
-    std::filesystem::create_directories(gc);
-    write_bytes(today + "/addr_points.bin", s.points);
-    write_bytes(today + "/addr_vertices.bin", s.verts);
-    gcset::Manifest gm;
-    gcset::addr::encode(today, gc, gm);
-    bool same = true;
-    for (const char* f : {"/addr_points.col", "/addr_vertices.abs2"}) same &= slurp(gc + f) == slurp(dir + f);
-    return same;
+// n records: a point in five, a dead slot in seventeen, an escape in forty
+// (encoding 3, of 1 to 6 vertices), the others footprints of 1 to 12 vertices
+// in encodings 0 to 2, closed and open, narrow and wide.
+std::vector<AddrSpec> addr_specs(size_t n, std::mt19937& rng) {
+    std::vector<AddrSpec> specs(n);
+    for (size_t i = 0; i < n; i++) {
+        const uint32_t vc = 1 + uint32_t(rng() % 12);
+        const uint32_t spans[] = {40, 300, 65536};
+        specs[i] = i % 5 == 0    ? AddrSpec{0, 0, false, 0}
+                   : i % 17 == 3 ? AddrSpec{0, 0, false, 0, true}
+                   : i % 40 == 39 ? AddrSpec{1 + uint32_t(rng() % 6), 3, false, 0}
+                                  : AddrSpec{vc, uint8_t(rng() % 3), vc >= 2 && rng() % 2 == 0, spans[rng() % 3]};
+    }
+    return specs;
 }
 
-// Today's street (12-byte) or interpolation (24-byte) ways of 0 to 3 nodes,
-// node_offset the running node count (0 for a way without nodes).
+// The three files the builder writes of a pair (addr_files::encode), by name.
+std::map<std::string, std::vector<char>> addr_files_of(const AddrSet& s) {
+    const addr_files::Files f = addr_files::encode(s.points.data(), s.points.size() / 28, s.verts.data(), s.verts.size());
+    return {{addr_files::POINTS_FILE, std::vector<char>(f.points.begin(), f.points.end())},
+            {addr_files::VERTICES_FILE, std::vector<char>(f.vertices.begin(), f.vertices.end())},
+            {addr_files::INDEX_FILE, std::vector<char>(f.index.begin(), f.index.end())}};
+}
+
+// Encodes a pair record by record into dir, each record and its footprint in
+// pieces of up to max_piece bytes, every third record's footprint before its
+// record.
+void encode_addrs(const AddrSet& s, const std::string& dir, std::mt19937& rng, size_t max_piece) {
+    addr::Enc enc(dir);
+    enc.state = {1, 1};
+    size_t vp = 0;
+    for (size_t i = 0; i < s.sizes.size(); i++) {
+        if (i % 3 != 2) write_in_pieces(enc, 0, &s.points[28 * i], 28, rng, max_piece);
+        if (s.sizes[i]) write_in_pieces(enc, 1, &s.verts[vp], s.sizes[i], rng, max_piece);
+        if (i % 3 == 2) write_in_pieces(enc, 0, &s.points[28 * i], 28, rng, max_piece);
+        vp += s.sizes[i];
+    }
+    finish_all(enc);
+}
+
+// A pair read back as the patcher reads it: each record, then its footprint
+// in views of 64 KiB. Whether the decoder gave every byte and then ended.
+bool read_addrs(addr::Dec& dec, const AddrSet& s, AddrSet& out) {
+    for (auto& st : dec.state) st = 1;
+    std::vector<char> view(size_t(64) << 10);
+    auto read = [&](int port, size_t n, std::vector<uint8_t>& to) {
+        while (n) {
+            const size_t k = dec.read(port, view.data(), std::min(n, view.size()));
+            if (!k) return false;
+            to.insert(to.end(), view.data(), view.data() + k);
+            n -= k;
+        }
+        return true;
+    };
+    bool complete = true;
+    for (const size_t size : s.sizes) complete &= read(0, 28, out.points) && read(1, size, out.verts);
+    return complete && dec.read(0, view.data(), 1) == 0 && dec.read(1, view.data(), 1) == 0;
+}
+
+// The address files of one record at 48, 11 whose blob is `blob` and then
+// zeros up to len bytes (a hole in the file), their footers giving `logical`
+// bytes of footprints: files no encoder writes, block and index as one would.
+void write_one_address(const std::string& dir, const std::vector<uint8_t>& blob, uint32_t len, uint64_t logical) {
+    addr_files::Block b;
+    b.records = 1;
+    b.lat[0] = f32_bits(48.0f);
+    b.lng[0] = f32_bits(11.0f);
+    b.len[0] = len;
+    std::vector<uint8_t> points(addr_files::BLOCK_MAX_BYTES + 8);
+    std::vector<uint8_t> index(addr_files::INDEX_HEAD_BYTES + addr_files::INDEX_ENTRY_BYTES, 0);
+    points.resize(addr_files::encode_block(b, points.data()));
+    const auto points_footer = addr_files::points_footer(1);
+    const auto vertices_footer = addr_files::vertices_footer(logical, 1);
+    const auto index_footer = addr_files::index_footer(1);
+    points.insert(points.end(), points_footer.begin(), points_footer.end());
+    index.insert(index.end(), index_footer.begin(), index_footer.end());
+    write_bytes(dir + "/" + addr_files::POINTS_FILE, points);
+    write_bytes(dir + "/" + addr_files::INDEX_FILE, index);
+    const std::string vertices = dir + "/" + addr_files::VERTICES_FILE;
+    write_bytes(vertices, blob);
+    std::filesystem::resize_file(vertices, len);
+    std::ofstream out(vertices, std::ios::binary | std::ios::app);
+    out.write(reinterpret_cast<const char*>(vertices_footer.data()), std::streamsize(vertices_footer.size()));
+}
+
+// The families of the four side files, each <family>.bin.
+const char* const SIDE_FAMILIES[] = {"way_parents", "way_postcodes", "interp_postcodes", "addr_postcodes"};
+
+// n side values in stretches of 100, which cut the blocks of 64 anywhere: one
+// value, a few values in turn with NO_DATA among them (a dictionary), a
+// narrow range and any u32 (both FOR).
+std::vector<uint32_t> side_values(size_t n, std::mt19937& rng) {
+    std::vector<uint32_t> v(n);
+    for (size_t j = 0; j < n; j++) {
+        const uint32_t stretch = uint32_t(j / 100);
+        switch (stretch % 4) {
+        case 0: v[j] = 7000 + stretch; break;
+        case 1: v[j] = rng() % 4 ? 900000 * (rng() % 3) : NO; break;
+        case 2: v[j] = 100000 + rng() % 500; break;
+        default: v[j] = uint32_t(rng()); break;
+        }
+    }
+    return v;
+}
+
+// The file the builder writes of a side family's values (side_blocks.h).
+std::vector<char> side_file_of(const std::string& family, const std::vector<uint32_t>& values) {
+    const std::vector<uint8_t> f = side_blocks::encode(family + ".bin", values.data(), values.size());
+    return std::vector<char>(f.begin(), f.end());
+}
+
+// A logical way pair (way_files.h): the ways' records, 12 bytes a street and
+// 24 an interpolation, and their nodes back to back, 8 bytes a node.
 struct WaySet {
     std::vector<uint8_t> ways, nodes;
 };
-WaySet way_set(bool street) {
+
+// The pair of ways of these node counts, each record's node_offset the nodes
+// before it (0 of a way without nodes), its name and numbers anything. A
+// way's nodes walk in steps of up to 1e-4 from a start of its own, coordinates
+// of seven decimals (the hybrid key); every seventh way's are any bits (the
+// order key, but for a few).
+WaySet way_set(const way_files::Kind& kind, const std::vector<uint32_t>& counts, std::mt19937& rng) {
     WaySet s;
-    uint32_t off = 0;
-    for (uint32_t w = 0; w < 40; w++) {
-        const uint16_t cnt = uint16_t(w % 4);
-        std::vector<uint8_t> r = le(cnt ? off : 0, 4);
-        for (uint8_t b : le(cnt, 2)) r.push_back(b);
-        r.resize(8, 0);
-        for (uint8_t b : le(1000 + w, 4)) r.push_back(b);  // name, or the interpolation's street
-        if (!street) {
-            for (uint8_t b : le(2 * w, 4)) r.push_back(b);      // start
-            for (uint8_t b : le(2 * w + 9, 4)) r.push_back(b);  // end
-            r.push_back(uint8_t(w % 3));
-            r.resize(24, 0);
+    uint32_t before = 0;
+    for (size_t w = 0; w < counts.size(); w++) {
+        const uint32_t cnt = counts[w];
+        uint8_t r[way_files::MAX_STRIDE] = {};
+        wr32(r, cnt ? before : 0);
+        wr16(r + 4, uint16_t(cnt));
+        wr32(r + 8, uint32_t(rng()));
+        if (kind.interp) {
+            const uint32_t start = uint32_t(rng());
+            wr32(r + 12, start);
+            wr32(r + 16, rng() % 4 ? start + uint32_t(rng() % 200) : uint32_t(rng()));
+            r[20] = uint8_t(rng());
         }
-        s.ways.insert(s.ways.end(), r.begin(), r.end());
-        for (uint16_t j = 0; j < cnt; j++) {
-            for (uint8_t b : le(f32_bits(47.0f + float(w) * 1e-4f + float(j) * 1e-5f), 4)) s.nodes.push_back(b);
-            for (uint8_t b : le(f32_bits(8.0f + float(w) * 1e-4f - float(j) * 1e-5f), 4)) s.nodes.push_back(b);
+        s.ways.insert(s.ways.end(), r, r + kind.stride);
+        int64_t lat = int64_t(rng() % 1800000001u) - 900000000, lng = int64_t(rng() % 3600000001u) - 1800000000;
+        for (uint32_t j = 0; j < cnt; j++) {
+            uint8_t node[8];
+            if (w % 7 == 6) {
+                wr32(node, uint32_t(rng()));
+                wr32(node + 4, uint32_t(rng()));
+            } else {
+                wr32(node, f32_bits(float(double(lat) / 1e7)));
+                wr32(node + 4, f32_bits(float(double(lng) / 1e7)));
+                lat += int64_t(rng() % 2001) - 1000;
+                lng += int64_t(rng() % 2001) - 1000;
+            }
+            s.nodes.insert(s.nodes.end(), node, node + 8);
         }
-        off += cnt;
+        before += cnt;
     }
     return s;
 }
 
+// The node counts of n ways: 0 to 5, but 3000 of a way in forty and none in
+// ways 32 to 47, a group without nodes.
+std::vector<uint32_t> way_counts(size_t n, std::mt19937& rng) {
+    std::vector<uint32_t> counts(n);
+    for (size_t w = 0; w < n; w++) counts[w] = w >= 32 && w < 48 ? 0 : w % 40 == 39 ? 3000 : uint32_t(rng() % 6);
+    return counts;
+}
+
+// The nodes' bytes of the way whose record is at r.
+size_t node_bytes(const uint8_t* r) { return way_files::NODE_BYTES * size_t(rd16(r + way_files::NODE_COUNT_AT)); }
+
+// The two files the builder writes of a pair (way_files::Encoder, a way at a
+// time), by name.
+std::map<std::string, std::vector<char>> way_files_of(const way_files::Kind& kind, const WaySet& s) {
+    std::vector<char> rows, blocks;
+    auto into = [](std::vector<char>& v) {
+        return [&v](const uint8_t* p, size_t n) { v.insert(v.end(), p, p + n); };
+    };
+    way_files::Encoder enc(kind, into(rows), into(blocks));
+    size_t np = 0;
+    for (size_t at = 0; at < s.ways.size(); at += kind.stride) {
+        enc.add(&s.ways[at], s.nodes.data() + np);
+        np += node_bytes(&s.ways[at]);
+    }
+    enc.finish();
+    const auto ways_footer = enc.ways_footer();
+    const auto nodes_footer = enc.nodes_footer();
+    rows.insert(rows.end(), ways_footer.begin(), ways_footer.end());
+    blocks.insert(blocks.end(), nodes_footer.begin(), nodes_footer.end());
+    return {{kind.ways_file, rows}, {kind.nodes_file, blocks}};
+}
+
+// Encodes a pair way by way into dir, each way's record and its nodes in
+// pieces of up to max_piece bytes, every third way's nodes before its record.
+void encode_ways(const way_files::Kind& kind, const WaySet& s, const std::string& dir, std::mt19937& rng, size_t max_piece) {
+    ways::Enc enc(dir, kind);
+    enc.state = {1, 1};
+    size_t np = 0;
+    for (size_t at = 0, w = 0; at < s.ways.size(); at += kind.stride, w++) {
+        const size_t nb = node_bytes(&s.ways[at]);
+        if (w % 3 != 2) write_in_pieces(enc, 0, &s.ways[at], kind.stride, rng, max_piece);
+        if (nb) write_in_pieces(enc, 1, &s.nodes[np], nb, rng, max_piece);
+        if (w % 3 == 2) write_in_pieces(enc, 0, &s.ways[at], kind.stride, rng, max_piece);
+        np += nb;
+    }
+    finish_all(enc);
+}
+
+const way_files::Kind* const WAY_KINDS[] = {&way_files::STREETS, &way_files::INTERPS};
+
 }  // namespace
 
-TEST(gcs_way_parents_round_trip_with_no_data) {
-    ScratchDir dir("gcs-test");
-    std::mt19937 rng(7);
-    const std::vector<uint32_t> values = {0, 1, NO, 0xFFFFFE, 12345, NO, 0x10000};
-    side::U24Enc enc(dir.path());
-    enc.state = {1};
-    write_in_pieces(enc, 0, u32s(values), rng, 7);
-    const Manifest m = finish_all(enc);
-    CHECK_EQ(m.num("way_parents.n"), uint64_t(values.size()));
-    CHECK_EQ(slurp(dir.path() + "/way_parents.u24").size(), 3 * values.size());
-    side::U24Dec dec(dir.path(), m);
-    CHECK_EQ(dec.decoded_size(0), uint64_t(4 * values.size()));
-    CHECK(decode_all(dec)[0] == u32s(values));
+TEST(gcs_side_blocks_round_trip_in_odd_pieces_and_equal_the_builders_encoder) {
+    // Values written in pieces that cut them anywhere (of 1 to 7 bytes, and of
+    // up to 5000) give the builder's file, whatever their count: none (the
+    // footer alone), one, a block less one, a block, a block and one, and
+    // many blocks of every kind. The table's scratch file is gone from the
+    // dir. The decoder gives the values back, and the decoded size is the
+    // footer's without a decoder. Each of the four side files in turn.
+    std::mt19937 rng(20261114);
+    size_t k = 0;
+    for (const size_t n : {size_t(0), size_t(1), size_t(63), size_t(64), size_t(65), size_t(5000)})
+        for (const size_t max_piece : {size_t(7), size_t(5000)}) {
+            const std::string family = SIDE_FAMILIES[k++ % std::size(SIDE_FAMILIES)];
+            const std::vector<uint32_t> values = side_values(n, rng);
+            ScratchDir dir("gcs-test");
+            side::Enc enc(dir.path(), family);
+            enc.state = {1};
+            write_in_pieces(enc, 0, u32s(values), rng, max_piece);
+            finish_all(enc);
+
+            CHECK(dir_files(dir.path()) == (std::map<std::string, std::vector<char>>{{family + ".bin", side_file_of(family, values)}}));
+            CHECK_EQ(side::decoded_size(dir.path(), family), uint64_t(4 * n));
+            side::Dec dec(dir.path(), family);
+            CHECK_EQ(dec.decoded_size(0), uint64_t(4 * n));
+            CHECK(decode_all(dec)[0] == u32s(values));
+        }
 }
 
-TEST(gcs_way_parents_rejects_a_value_past_24_bits) {
+TEST(gcs_side_decoder_takes_a_dir_without_its_file_as_no_values) {
+    // A side file is written only for a day that has a value: a dir without
+    // it decodes to none, beside another family's file.
     ScratchDir dir("gcs-test");
-    side::U24Enc enc(dir.path());
-    enc.state = {1};
-    const std::vector<uint8_t> bytes = u32s({0xFFFFFF});
-    CHECK_EQ(refusal_of([&] { enc.write(0, bytes.data(), bytes.size()); }),
-             std::string("gcs: way_parents value 16777215 does not fit 24 bits"));
+    write_bytes(dir.path() + "/way_parents.bin", std::vector<uint8_t>(side_file_of("way_parents", {1, 2, 3}).size(), 0x5A));
+
+    CHECK_EQ(side::decoded_size(dir.path(), "way_postcodes"), uint64_t(0));
+    side::Dec dec(dir.path(), "way_postcodes");
+    CHECK_EQ(dec.decoded_size(0), uint64_t(0));
+    CHECK(decode_all(dec)[0].empty());
 }
 
-TEST(gcs_dictionary_round_trip_renumbers_in_value_order) {
-    ScratchDir dir("gcs-test");
-    std::mt19937 rng(11);
-    // First seen out of value order, repeats, NO_DATA, and enough distinct
-    // values to grow the table past its first size.
-    std::vector<uint32_t> values = {900, 5, NO, 900, 7, 5};
-    for (uint32_t i = 0; i < 5000; i++) values.push_back(100000 - (i * 7919) % 6000);
-    side::DictEnc enc(dir.path(), "way_postcodes");
-    enc.state = {1};
-    write_in_pieces(enc, 0, u32s(values), rng, 4096);
-    const Manifest m = finish_all(enc);
-    const std::vector<char> dict = slurp(dir.path() + "/way_postcodes.dict");
-    bool ascending = true;
-    for (size_t i = 4; i + 4 <= dict.size(); i += 4)
-        ascending &= rd32(reinterpret_cast<const uint8_t*>(&dict[i - 4])) < rd32(reinterpret_cast<const uint8_t*>(&dict[i]));
-    CHECK(ascending);
-    CHECK_EQ(m.num("way_postcodes.dict"), uint64_t(dict.size() / 4));
-    side::DictDec dec(dir.path(), "way_postcodes", m);
-    CHECK(decode_all(dec)[0] == u32s(values));
-}
-
-TEST(gcs_dictionary_decoder_rejects_a_dict_past_the_manifest) {
-    // A dictionary family's .dict holds the manifest's count of values, fewer
-    // than the u16 index's 0xFFFF, and is rejected before it is read otherwise:
-    // a value more than the manifest's, 0xFFFF values (as many as the manifest
-    // says), and a sparse 64 MiB file under a dictionary of none (reserved and
-    // read in, before). Two values and three indexes decode, and so do 0xFFFE
-    // values.
+TEST(gcs_side_decoder_refuses_a_malformed_block_or_table) {
+    // Three blocks: 64 values of 7 (FOR, 6 bytes at 0), 64 of NO_DATA and 5 in
+    // turn (a dictionary, 19 bytes at 6) and 22 from 1000 up (FOR at 5 bits,
+    // 20 bytes at 25); their table at 45 and the footer at 57. The file
+    // decodes as written. With a block where the table does not put it, a
+    // byte between the last block and the table, a block the encoder would
+    // not write or cut short, or a footer of another file or count, it is
+    // refused by name, by the decoder and, for the footer, by the decoded
+    // size alone.
+    std::vector<uint32_t> values(64, 7);
+    for (uint32_t j = 0; j < 64; j++) values.push_back(j % 2 ? 5 : NO);
+    for (uint32_t j = 0; j < 22; j++) values.push_back(1000 + j);
+    const std::vector<char> written = side_file_of("way_postcodes", values);
+    REQUIRE(written.size() == 65 && rd32(reinterpret_cast<const uint8_t*>(&written[49])) == 6);
     struct Case {
-        uint64_t manifest, values;  // the manifest's dictionary count, the file's
-        uint64_t sparse_bytes;      // instead: a sparse file of these bytes
-        const char* error;          // nullptr: decodes
+        std::function<void(std::vector<uint8_t>&)> edit;
+        const char* refusal;  // nullptr: decodes
+        bool footer = false;
     };
     const Case cases[] = {
-        {2, 2, 0, nullptr},
-        {2, 3, 0, "gcs: way_postcodes.dict size"},
-        {0xFFFE, 0xFFFE, 0, nullptr},
-        {0xFFFF, 0xFFFF, 0, "gcs: way_postcodes: 65535 dictionary values, past a u16 index"},
-        {0, 0, uint64_t(64) << 20, "gcs: way_postcodes.dict size"},
+        {[](std::vector<uint8_t>&) {}, nullptr},
+        {[](std::vector<uint8_t>& f) { f[49] = 7; }, "block 1 is not where the blocks before it end"},
+        {[](std::vector<uint8_t>& f) { f.insert(f.begin() + 45, 0); }, "bytes between its blocks and its table"},
+        {[](std::vector<uint8_t>& f) { f.erase(f.begin() + 44); }, "block 2 runs past the blocks' end"},
+        {[](std::vector<uint8_t>& f) { f[0] = 2; }, "block 0 is neither FOR nor a dictionary"},
+        {[](std::vector<uint8_t>& f) { f[17] = 0x55; }, "block 1 has an index out of first-use order, or past its dictionary"},
+        {[](std::vector<uint8_t>& f) { f[44] |= 0x80; }, "block 2 has bits set past its last value"},
+        {[](std::vector<uint8_t>& f) { f.back() = '2'; }, "no SDB1 in its footer", true},
+        {[](std::vector<uint8_t>& f) { f.resize(7); }, "shorter than its footer", true},
+        {[](std::vector<uint8_t>& f) { wr32(&f[57], 100000); }, "shorter than its block table", true},
     };
     for (const Case& c : cases) {
         ScratchDir dir("gcs-test");
-        std::vector<uint32_t> dict;
-        for (uint64_t v = 0; v < c.values; v++) dict.push_back(uint32_t(100 + v));
-        write_bytes(dir.path() + "/way_postcodes.dict", u32s(dict));
-        if (c.sparse_bytes) std::filesystem::resize_file(dir.path() + "/way_postcodes.dict", c.sparse_bytes);
-        const std::vector<uint16_t> ids = c.manifest ? std::vector<uint16_t>{0, 1, 0xFFFF} : std::vector<uint16_t>{};
-        std::vector<uint8_t> index;
-        for (uint16_t x : ids) for (uint8_t b : le(x, 2)) index.push_back(b);
-        write_bytes(dir.path() + "/way_postcodes.u16", index);
+        std::vector<uint8_t> file(written.begin(), written.end());
+        c.edit(file);
+        write_bytes(dir.path() + "/way_postcodes.bin", file);
+        const std::string refusal = c.refusal ? std::string("Malformed way_postcodes.bin: ") + c.refusal : "";
+        std::vector<uint8_t> decoded;
 
-        const int status = exit_status_in_child(
-            [&] {
-                return refusal_code(
-                    [&] {
-                        Manifest m;
-                        m.set("way_postcodes.n", ids.size());
-                        m.set("way_postcodes.dict", c.manifest);
-                        side::DictDec dec(dir.path(), "way_postcodes", m);
-                        decode_all(dec);
-                    },
-                    c.error ? c.error : "");
-            },
-            20);
-
-        CHECK_EQ(status, c.error ? 2 : 0);
+        CHECK_EQ(refusal_of([&] {
+                     side::Dec dec(dir.path(), "way_postcodes");
+                     decoded = decode_all(dec)[0];
+                 }),
+                 refusal);
+        CHECK_EQ(refusal_of([&] { side::decoded_size(dir.path(), "way_postcodes"); }), c.footer ? refusal : "");
+        if (!c.refusal) CHECK(decoded == u32s(values));
     }
 }
 
-TEST(gcs_dictionary_encoder_writes_fewer_than_0xffff_values) {
-    // As gc's encoder: 0xFFFE distinct values (indexes 0 to 0xFFFD; 0xFFFF is
-    // NO_DATA) round trip through the decoder, and a 0xFFFF-th is rejected, as
-    // the decoders reject a dictionary of 0xFFFF values.
-    for (const uint32_t distinct : {0xFFFEu, 0xFFFFu}) {
-        ScratchDir dir("gcs-test");
-        std::vector<uint32_t> values{NO};
-        for (uint32_t v = 0; v < distinct; v++) values.push_back(3 * v);
-        const std::vector<uint8_t> bytes = u32s(values);
-        side::DictEnc enc(dir.path(), "way_postcodes");
-        enc.state = {1};
+TEST(gcs_side_encoder_refuses_a_stream_ending_inside_a_value) {
+    // A full replacement whose payload is not whole u32s: refused at the
+    // finish, not written as a file of the whole ones.
+    ScratchDir dir("gcs-test");
+    side::Enc enc(dir.path(), "way_parents");
+    enc.state = {1};
+    const std::vector<uint8_t> bytes = u32s({1, 2, 3});
+    enc.write(0, bytes.data(), bytes.size() - 1);
 
-        const int status = refusal_code(
-            [&] {
-                enc.write(0, bytes.data(), bytes.size());
-                const Manifest m = finish_all(enc);
-                side::DictDec dec(dir.path(), "way_postcodes", m);
-                if (decode_all(dec)[0] != bytes) throw std::runtime_error("decodes to other values");
-            },
-            "gcs: way_postcodes: too many distinct values for a u16 index");
+    CHECK_EQ(refusal_of([&] { finish_all(enc); }), std::string("gcs: way_parents.bin: the stream ends 3 bytes into a value"));
+}
 
-        CHECK_EQ(status, distinct == 0xFFFE ? 0 : 2);
+TEST(gcs_side_codec_holds_one_block) {
+    // 4 MiB of values in one write (as the patcher's FILE passes a full
+    // replacement), read back as the patcher reads them (64 KiB views). The
+    // encoder queues none of the write and keeps no table entry of a block it
+    // has written; the decoder's queue holds what a read asks ahead and one
+    // block's values, and its readers their buffers. The file is the
+    // builder's.
+    std::mt19937 rng(20261114);
+    const std::vector<uint32_t> values = side_values(size_t(1) << 20, rng);
+    const std::vector<uint8_t> bytes = u32s(values);
+    ScratchDir dir("gcs-test");
+    side::Enc enc(dir.path(), "addr_postcodes");
+    enc.state = {1};
+    enc.write(0, bytes.data(), bytes.size());
+    const size_t encoder_peak = enc.peak(0), table_held = enc.blocks.table().size();
+    finish_all(enc);
+
+    side::Dec dec(dir.path(), "addr_postcodes");
+    dec.state = {1};
+    std::vector<uint8_t> out;
+    std::vector<char> view(size_t(64) << 10);
+    size_t readers = 0;
+    for (size_t got; (got = dec.read(0, view.data(), view.size())) != 0;) {
+        out.insert(out.end(), view.data(), view.data() + got);
+        if (dec.B) readers = std::max(readers, dec.B->buf.size() + dec.T->buf.size());
     }
+    std::printf("    %zu values: encoder queue peak %zu B, decoder queue peak %zu B, readers %zu B\n", values.size(), encoder_peak,
+                dec.peak(0), readers);
+
+    CHECK_EQ(encoder_peak, size_t(0));
+    CHECK_EQ(table_held, size_t(0));
+    CHECK(dec.peak(0) < Decoder::READ_AHEAD + 4 * side_blocks::BLOCK_VALUES);
+    CHECK(readers > 0 && readers <= side::BLOCKS_BUF + side::TABLE_BUF + 2 * READ_SLACK);
+    CHECK(out == bytes);
+    CHECK(slurp(dir.path() + "/addr_postcodes.bin") == side_file_of("addr_postcodes", values));
 }
 
 TEST(gcs_poi_round_trip_whole_and_in_pieces) {
@@ -541,224 +729,427 @@ TEST(gcs_encoder_queues_one_large_write_a_piece_at_a_time) {
     }
 }
 
-TEST(gcs_addr_footprints_past_the_abs2_bound_round_trip) {
-    // Footprints of more than ABS2_MAX_VERTICES vertices (70000 open, 70001
-    // closed, which is 70000 once the closing vertex is dropped, 80000,
-    // 120000) go through the raw escape; 69999 still fits abs2. Narrow (u8)
-    // and wide (u16) values, every encoding. The encoder (fed in odd pieces)
-    // writes geocoder-gc's files, and its decoder reads them back.
-    std::mt19937 rng(20261027);
-    const AddrSet s = addr_set({{0, 0, false, 0},
-                                {70000, 0, false, 65536},
-                                {5, 1, true, 200},
-                                {69999, 2, false, 65536},
-                                {70001, 0, true, 65536},
-                                {0, 0, false, 0},
-                                {70000, 1, false, 256 - 1},
-                                {3, 3, false, 65536},
-                                {80000, 3, false, 65536},
-                                {120000, 2, true, 200}},
-                               rng);
-    ScratchDir dir("gcs-test");
-    addr::Enc enc(dir.path(), s.points.size());
-    enc.state = {1, 1};
-    size_t vp = 0;
-    for (size_t i = 0; i < s.sizes.size(); i++) {
-        enc.write(0, &s.points[28 * i], 28);
-        write_in_pieces(enc, 1, &s.verts[vp], s.sizes[i], rng, 65521);
-        vp += s.sizes[i];
-    }
-    const Manifest m = finish_all(enc);
-    addr::Dec dec(dir.path(), m);
-    const auto out = decode_all(dec);
-    CHECK(out[0] == s.points);
-    CHECK(out[1] == s.verts);
-    // The files geocoder-gc encodes from the same today's files, byte for byte.
-    CHECK(gc_encodes_the_same(s, dir.path()));
-}
+TEST(gcs_addr_round_trip_in_odd_pieces_and_equal_the_builders_encoder) {
+    // Address points written a record and its footprint at a time, in pieces
+    // that cut them anywhere (of 1 to 7 bytes, and of up to 5000), give the
+    // builder's three files, whatever their count: none (the three footers
+    // alone), one, a block less one, a block, a block and one, and two
+    // superblocks, with points, dead slots, footprints of every encoding and
+    // escapes among them. The decoder gives the pair back, and the decoded
+    // sizes are the footers' without a decoder.
+    std::mt19937 rng(20261114);
+    for (const size_t n : {size_t(0), size_t(1), size_t(15), size_t(16), size_t(17), size_t(1100)})
+        for (const size_t max_piece : {size_t(7), size_t(5000)}) {
+            const AddrSet s = addr_set(addr_specs(n, rng), rng);
+            ScratchDir dir("gcs-test");
+            encode_addrs(s, dir.path(), rng, max_piece);
 
-TEST(gcs_addr_codecs_copy_an_escaped_footprint_through_in_pieces) {
-    // An escaped footprint (encoding 3) of 80K and of 800K vertices, 640 KB
-    // and 6.4 MB, among small abs2 ones and a small one escaped for its pad
-    // byte, each file in one write (as the patcher's FILE passes a long
-    // stretch) and read back as the patcher reads them (a record, then its
-    // footprint in 64 KiB views): at both sizes the encoder's queue holds at
-    // most a piece and the decoder's a READ_BUF, each with the largest
-    // footprint here either takes whole (the closed abs2 one, 10 + 4 * 9 B),
-    // and the decoder's footprint reader a READ_BUF and its slack; the files
-    // decode back to the same bytes, and geocoder-gc encodes the same files.
-    const size_t whole = 10 + 4 * 9;
-    std::mt19937 rng(20261030);
-    for (const uint32_t big : {80000u, 800000u}) {
-        const AddrSet s = addr_set({{5, 1, true, 200}, {big, 3, false, 0}, {0, 0, false, 0}, {12, 2, false, 65536, 7}, {9, 0, true, 256 - 1}}, rng);
-        ScratchDir dir("gcs-test");
-        addr::Enc enc(dir.path(), s.points.size());
-        enc.state = {1, 1};
-        enc.expect = {s.points.size(), s.verts.size()};
-        enc.write(0, s.points.data(), s.points.size());
-        enc.write(1, s.verts.data(), s.verts.size());
-        const size_t encoder_peak = std::max(enc.peak(0), enc.peak(1));
-        const Manifest m = finish_all(enc);
-
-        addr::Dec dec(dir.path(), m);
-        for (auto& st : dec.state) st = 1;
-        std::vector<uint8_t> points, verts;
-        std::vector<char> view(size_t(64) << 10);
-        auto read = [&](int port, size_t n, std::vector<uint8_t>& out) {
-            while (n) {
-                const size_t k = dec.read(port, view.data(), std::min(n, view.size()));
-                if (!k) return false;
-                out.insert(out.end(), view.data(), view.data() + k);
-                n -= k;
-            }
-            return true;
-        };
-        bool complete = true;
-        for (const size_t size : s.sizes) complete &= read(0, 28, points) && read(1, size, verts);
-        const size_t decoder_peak = std::max(dec.peak(0), dec.peak(1)), reader = dec.A->buf.size();
-        std::printf("    %u vertices: encoder queue peak %zu B, decoder queue peak %zu B, footprint reader %zu B\n", big, encoder_peak,
-                    decoder_peak, reader);
-
-        CHECK(encoder_peak <= ENCODER_PIECE + whole);
-        CHECK(decoder_peak <= READ_BUF + whole);
-        CHECK(reader <= READ_BUF + READ_SLACK);
-        CHECK(complete);
-        CHECK(dec.read(0, view.data(), 1) == 0);
-        CHECK(points == s.points);
-        CHECK(verts == s.verts);
-        CHECK(gc_encodes_the_same(s, dir.path()));
-    }
-}
-
-TEST(gcs_addr_encoder_holds_at_most_a_piece_and_the_largest_abs2_footprint) {
-    // addr_vertices.bin in one write (as the patcher's FILE passes an INSERT
-    // stretch), which the encoder takes a piece (64 KiB) at a time: its queue
-    // peaks at no more than a piece and the largest footprint it takes whole,
-    // an abs2 one of ABS2_MAX_VERTICES vertices (10 + 4 x 69,999 =
-    // 280,006 B), and the files are geocoder-gc's. The case comes within 2
-    // bytes of that: 47,676 B of footprints before the largest put its last
-    // 2 bytes at the start of a piece, so the queue holds the rest of it and
-    // then that whole piece (another of the largest follows), 64 KiB +
-    // 280,004 B, past the 320 KiB a POI encoder may hold.
-    const size_t largest = 10 + 4 * size_t(addr::ABS2_MAX_VERTICES);
-    std::mt19937 rng(20261030);
-    const AddrSet s = addr_set({{5000, 1, false, 65536},
-                                {6914, 2, true, 200},
-                                {addr::ABS2_MAX_VERTICES, 0, false, 65536},
-                                {0, 0, false, 0},
-                                {addr::ABS2_MAX_VERTICES, 1, true, 256 - 1}},
-                               rng);
-    REQUIRE(s.sizes[0] + s.sizes[1] == 47676 && s.sizes[2] == largest);
-    ScratchDir dir("gcs-test");
-    addr::Enc enc(dir.path(), s.points.size());
-    enc.state = {1, 1};
-    enc.expect = {s.points.size(), s.verts.size()};
-    enc.write(0, s.points.data(), s.points.size());
-    enc.write(1, s.verts.data(), s.verts.size());
-    std::printf("    %zu B in one write: queue peaks %zu %zu B\n", s.verts.size(), enc.peak(0), enc.peak(1));
-    CHECK(enc.peak(1) <= ENCODER_PIECE + largest);
-    finish_all(enc);
-    CHECK(gc_encodes_the_same(s, dir.path()));
-}
-
-TEST(gcs_addr_encoder_refuses_a_stream_ending_inside_an_escaped_footprint) {
-    // The encoder copies an escaped footprint through as it comes, its record
-    // already encoded: a stream that ends inside it is refused at the finish,
-    // not taken as a shorter file. It follows the largest abs2 footprint,
-    // whose wait grows the queue past what it keeps once drained, so the
-    // finish pumps an empty queue without a buffer.
-    std::mt19937 rng(20261030);
-    const AddrSet s = addr_set({{69999, 0, false, 65536}, {3, 3, false, 0}}, rng);
-    ScratchDir dir("gcs-test");
-    addr::Enc enc(dir.path(), s.points.size());
-    enc.state = {1, 1};
-    enc.write(0, s.points.data(), s.points.size());
-    enc.write(1, s.verts.data(), s.verts.size() - 1);
-
-    CHECK_EQ(refusal_of([&] { finish_all(enc); }), std::string("gcs: addr_vertices: stream ends inside a footprint"));
-}
-
-TEST(gcs_addr_decoder_rejects_a_footprint_count_past_its_record) {
-    // One record whose footprint is an abs2 blob (tag 0x04: 2 + 2 count bytes
-    // per vertex after an 8-byte bmin) or the raw escape (tag 0x20: today's
-    // block, 10 + 4 count bytes), whose count must fit the record's u32.
-    ScratchDir dir("gcs-test");
-    write_bytes(dir.path() + "/addr_points.col", std::vector<uint8_t>(24));
-    for (const uint8_t tag : {uint8_t(0x04), uint8_t(0x20)})
-        for (const uint64_t count : {uint64_t(5), (uint64_t(1) << 32) + 5, (uint64_t(1) << 63) + 5}) {
-            std::vector<uint8_t> bytes{tag};
-            uv(bytes, count);
-            bytes.resize(bytes.size() + (tag == 0x20 ? 30 : 28));
-            write_bytes(dir.path() + "/addr_vertices.abs2", bytes);
-            const int status = exit_status_in_child(
-                [&] {
-                    return refusal_code(
-                        [&] {
-                            Manifest m;
-                            m.set("addr.n", 1);
-                            addr::Dec dec(dir.path(), m);
-                            while (dec.step()) {}
-                        },
-                        "gcs: addr 0: bad count");
-                },
-                5);
-            CHECK_EQ(status, count == 5 ? 0 : 2);
+            const auto files = dir_files(dir.path());
+            CHECK(files == addr_files_of(s));
+            if (n == 0)
+                CHECK(files.at("addr_points.bin").size() == 8 && files.at("addr_vertices.bin").size() == 16 &&
+                      files.at("addr_index.bin").size() == 8);
+            CHECK_EQ(addr::decoded_size(dir.path(), 0), uint64_t(s.points.size()));
+            CHECK_EQ(addr::decoded_size(dir.path(), 1), uint64_t(s.verts.size()));
+            addr::Dec dec(dir.path());
+            CHECK_EQ(dec.decoded_size(0), uint64_t(s.points.size()));
+            CHECK_EQ(dec.decoded_size(1), uint64_t(s.verts.size()));
+            const auto out = decode_all(dec);
+            CHECK(out[0] == s.points);
+            CHECK(out[1] == s.verts);
         }
 }
 
-TEST(gcs_addr_decoder_refuses_a_footprint_past_the_end_before_reading_it) {
-    // An escaped footprint (tag 0x20) whose count fits the record's u32 but
-    // not the file is refused as a truncated file, and the reader's buffer
-    // never grows to the footprint: 4 MiB, or 16 GiB at the largest count
-    // (each case in a child whose address space can't hold that); and 2^30
-    // vertices in a ten-byte payload (10 + 4 x 2^30 bytes, which a 32-bit
-    // size_t wraps to the payload's 10).
+TEST(gcs_addr_decoder_takes_a_dir_without_its_files_as_no_addresses_and_refuses_part_of_them) {
+    // A variant without addresses has none of the three files: it decodes to
+    // no records, beside another family's file. A dir with two of the three
+    // is refused by name, by the decoder and by the decoded size alone.
+    std::mt19937 rng(20261114);
     ScratchDir dir("gcs-test");
-    write_bytes(dir.path() + "/addr_points.col", std::vector<uint8_t>(24));
-    for (const auto& [count, payload] :
-         {std::pair<uint64_t, size_t>{uint64_t(1) << 20, 30}, {0xFFFFFFFF, 30}, {0x40000000, 10}}) {
-        std::vector<uint8_t> bytes{0x20};
-        uv(bytes, count);
-        // The footprint starts past its tag and count.
-        const std::string refusal = "gcs: " + dir.path() + "/addr_vertices.abs2: unexpected end of file at " +
-                                    std::to_string(bytes.size()) + " (need 10 + " + std::to_string(count) + " x 4 bytes, " +
-                                    std::to_string(payload) + " left)";
-        bytes.resize(bytes.size() + payload);
-        write_bytes(dir.path() + "/addr_vertices.abs2", bytes);
+    write_bytes(dir.path() + "/addr_postcodes.bin", std::vector<uint8_t>(40, 0x5A));
+
+    for (int port = 0; port < 2; port++) CHECK_EQ(addr::decoded_size(dir.path(), port), uint64_t(0));
+    addr::Dec none(dir.path());
+    CHECK_EQ(none.decoded_size(0) + none.decoded_size(1), uint64_t(0));
+    const auto out = decode_all(none);
+    CHECK(out[0].empty() && out[1].empty());
+
+    const std::string refusal =
+        "Malformed address files: a dir with some of addr_points.bin, addr_vertices.bin and addr_index.bin and not all three";
+    for (const char* gone : {"addr_points.bin", "addr_vertices.bin", "addr_index.bin"}) {
+        ScratchDir part("gcs-test");
+        encode_addrs(addr_set(addr_specs(20, rng), rng), part.path(), rng, 100);
+        REQUIRE(std::filesystem::remove(part.path() + "/" + gone));
+
+        CHECK_EQ(refusal_of([&] { addr::Dec dec(part.path()); }), refusal);
+        CHECK_EQ(refusal_of([&] { addr::decoded_size(part.path(), 0); }), refusal);
+    }
+}
+
+TEST(gcs_addr_codec_refuses_a_footprint_stream_past_the_limit_by_the_footers_alone) {
+    // The logical addr_vertices.bin is a byte stream a patch indexes in a u32
+    // below NO_DATA, and a vertex_offset is one. Files whose footer gives a
+    // byte more are refused by the file's name and the bytes, by the decoded
+    // size and by the decoder as it is made: before a block is read, though
+    // the first is one no encoder writes. At the limit the footer passes, and
+    // the decoder refuses that first block.
+    std::mt19937 rng(20261114);
+    ScratchDir dir("gcs-test");
+    encode_addrs(addr_set(addr_specs(20, rng), rng), dir.path(), rng, 100);
+    std::vector<char> points = slurp(dir.path() + "/addr_points.bin"), vertices = slurp(dir.path() + "/addr_vertices.bin");
+    points[0] = char(0xFF);
+    write_bytes(dir.path() + "/addr_points.bin", std::vector<uint8_t>(points.begin(), points.end()));
+    auto with_logical_bytes = [&](uint64_t bytes) {
+        wr64(reinterpret_cast<uint8_t*>(&vertices[vertices.size() - 16]), bytes);
+        write_bytes(dir.path() + "/addr_vertices.bin", std::vector<uint8_t>(vertices.begin(), vertices.end()));
+    };
+    const std::string past =
+        "Malformed address files: a logical addr_vertices.bin of 4294967295 bytes is more than the 4294967294 a patch can index";
+
+    with_logical_bytes(0xFFFFFFFF);
+    CHECK_EQ(refusal_of([&] { addr::decoded_size(dir.path(), 1); }), past);
+    CHECK_EQ(refusal_of([&] { addr::Dec dec(dir.path()); }), past);
+
+    with_logical_bytes(0xFFFFFFFE);
+    CHECK_EQ(addr::decoded_size(dir.path(), 1), uint64_t(0xFFFFFFFE));
+    CHECK_EQ(refusal_of([&] {
+                 addr::Dec dec(dir.path());
+                 decode_all(dec);
+             }),
+             std::string("Malformed address files: addr_points.bin block 0 has a flag no block has"));
+}
+
+TEST(gcs_addr_decoder_refuses_what_the_strict_decoder_refuses) {
+    // The three files of 40 records, damaged 600 times: bytes of the blocks,
+    // of the blobs, of the index or of a footer overwritten, a file's first
+    // byte cut, a byte added or cut before a footer, a file gone or its last
+    // byte cut, a block or a superblock a byte further in the index, a byte or
+    // a blob more in the footer's counts, and every twelfth time nothing. The
+    // decoder, which reads a record at a time, refuses each with the message
+    // of addr_files::decode, which reads the three files whole, and gives
+    // that one's pair where it takes the files. The decoded size alone
+    // refuses what the three footers show.
+    std::mt19937 rng(20261114);
+    auto u8 = [](const std::vector<char>& v) { return std::vector<uint8_t>(v.begin(), v.end()); };
+    const AddrSet s = addr_set(addr_specs(40, rng), rng);
+    const auto written = addr_files_of(s);
+    const std::vector<uint8_t> blocks = u8(written.at("addr_points.bin")), blobs = u8(written.at("addr_vertices.bin")),
+                               rows = u8(written.at("addr_index.bin"));
+    size_t refused = 0, taken = 0, by_footers = 0, differ = 0;
+    for (int round = 0; round < 600; round++) {
+        std::vector<uint8_t> p = blocks, v = blobs, x = rows;
+        bool has[3] = {true, true, true};
+        auto overwrite = [&](std::vector<uint8_t>& f) { f[rng() % f.size()] = uint8_t(rng()); };
+        switch (round % 12) {
+        case 0: overwrite(p); break;
+        case 1: overwrite(v); break;
+        case 2: overwrite(x); break;
+        case 3:
+            for (int k = 0; k < 3; k++) overwrite(rng() % 3 == 0 ? p : rng() % 2 ? v : x);
+            break;
+        case 4: {
+            std::vector<uint8_t>& f = rng() % 2 ? p : v;
+            f.erase(f.begin());
+            break;
+        }
+        case 5:
+            if (round % 24 < 12) v.insert(v.end() - 16, uint8_t(rng()));
+            else v.erase(v.end() - 17);
+            break;
+        case 6:
+            if (round % 24 < 12) p.insert(p.end() - 8, uint8_t(rng()));
+            else p.erase(p.end() - 9);
+            break;
+        case 7: {
+            const size_t k = rng() % 3;
+            if (round % 24 < 12) has[k] = false;
+            else (k == 0 ? p : k == 1 ? v : x).pop_back();
+            break;
+        }
+        case 8: x[16 + 6 * (1 + rng() % 2)]++; break;
+        case 9: x[round % 24 < 12 ? 0 : 8]++; break;
+        case 10: v[v.size() - (round % 24 < 12 ? 16 : 8)]++; break;
+        default: break;
+        }
+        ScratchDir dir("gcs-test");
+        if (has[0]) write_bytes(dir.path() + "/addr_points.bin", p);
+        if (has[1]) write_bytes(dir.path() + "/addr_vertices.bin", v);
+        if (has[2]) write_bytes(dir.path() + "/addr_index.bin", x);
+        const uint64_t ps = has[0] ? p.size() : addr_files::ABSENT, vs = has[1] ? v.size() : addr_files::ABSENT,
+                       xs = has[2] ? x.size() : addr_files::ABSENT;
+
+        AddrSet whole, stepped;
+        const std::string strict = refusal_of([&] {
+            addr_files::decode(
+                p.data(), ps, v.data(), vs, x.data(), xs,
+                [&](const uint8_t* record) { whole.points.insert(whole.points.end(), record, record + 28); },
+                [&](const uint8_t* q, size_t n) { whole.verts.insert(whole.verts.end(), q, q + n); });
+        });
+        const std::string ours = refusal_of([&] {
+            addr::Dec dec(dir.path());
+            auto out = decode_all(dec);
+            stepped.points = std::move(out[0]);
+            stepped.verts = std::move(out[1]);
+        });
+        // Each file's footer, or all of a shorter file.
+        auto end_of = [](const std::vector<uint8_t>& f, size_t footer) {
+            return f.data() + (f.size() - std::min(f.size(), footer));
+        };
+        const std::string footers =
+            refusal_of([&] { addr_files::read_footers(end_of(p, 8), ps, end_of(v, 16), vs, end_of(x, 8), xs); });
+        const std::string sized = refusal_of([&] { addr::decoded_size(dir.path(), 0); });
+
+        const bool same = ours == strict && sized == footers &&
+                          (!strict.empty() || (stepped.points == whole.points && stepped.verts == whole.verts));
+        if (!same && differ++ < 3)
+            std::printf("    round %d: decode \"%s\", the codec \"%s\"; footers \"%s\", the size \"%s\"\n", round, strict.c_str(),
+                        ours.c_str(), footers.c_str(), sized.c_str());
+        refused += !strict.empty();
+        taken += strict.empty();
+        by_footers += !footers.empty();
+        if (round % 12 == 11) CHECK(strict.empty() && stepped.points == s.points && stepped.verts == s.verts);
+        if (round % 12 == 8 || round % 12 == 9) CHECK(!strict.empty() && footers.empty());
+    }
+    std::printf("    %zu refused (%zu by the footers), %zu taken\n", refused, by_footers, taken);
+    CHECK_EQ(differ, size_t(0));
+    CHECK(refused > 300 && taken >= 50 && by_footers >= 50);
+}
+
+TEST(gcs_addr_decoder_refuses_a_blob_that_is_not_its_len_before_reading_it) {
+    // One record whose blob the block gives a gigabyte, most of it a hole in
+    // the file: a footprint of five vertices whose widths give it 21 bytes,
+    // an escape whose count gives it 36, and an escape whose count is past a
+    // record's u32. Each is refused from the blob's first bytes, the reader's
+    // buffer never growing to the len (each case in a child whose address
+    // space can't hold that). The same footprints at their own len decode.
+    const uint32_t gigabyte = uint32_t(1) << 30;
+    struct Case {
+        std::vector<uint8_t> blob;
+        uint32_t len;
+        uint64_t logical;
+        const char* refusal;  // nullptr: decodes
+    };
+    // Five vertices of 8 + 8 bits after an 8-byte bbox minimum, any values but
+    // a last vertex that is the first; and three 8-byte vertices raw.
+    std::vector<uint8_t> five = {0, 5}, escape = {addr_files::ESCAPE_TAG, 3, 3, 0}, wide = {addr_files::ESCAPE_TAG};
+    for (const uint8_t b : le(0x42400000, 4)) five.push_back(b);
+    for (const uint8_t b : le(0x41300000, 4)) five.push_back(b);
+    five.push_back(0x88);
+    for (const uint8_t q : {200, 3, 255, 4, 5, 6, 7, 128, 9, 10}) five.push_back(q);
+    escape.resize(4 + 8 + 24, 7);
+    uv(wide, (uint64_t(1) << 32) + 5);
+    wide.resize(wide.size() + 40, 0);
+    const Case cases[] = {
+        {five, uint32_t(five.size()), 30, nullptr},
+        {five, gigabyte, 30, "a footprint blob that is not its record's len"},
+        {escape, uint32_t(escape.size()), 34, nullptr},
+        {escape, gigabyte, 34, "a footprint blob that is not its record's len"},
+        {wide, gigabyte, 34, "an escaped footprint whose count is not a varint of 1 to 4294967295 vertices"},
+    };
+    for (const Case& c : cases) {
+        ScratchDir dir("gcs-test");
+        write_one_address(dir.path(), c.blob, c.len, c.logical);
+        const std::string refusal =
+            c.refusal ? std::string("Malformed address files: ") + c.refusal + ": addr_vertices.bin, record 0" : std::string();
         const int status = exit_status_in_child(
             [&] {
-                cap_address_space(size_t(1) << 30);
-                Manifest m;
-                m.set("addr.n", 1);
-                addr::Dec dec(dir.path(), m);
-                const int code = refusal_code([&] { while (dec.step()) {} }, refusal);
-                return dec.A->buf.size() > READ_BUF + 64 ? 4 : code;
+                cap_address_space(size_t(256) << 20);
+                addr::Dec dec(dir.path());
+                for (auto& st : dec.state) st = 1;
+                size_t reader = 0;
+                const int code = refusal_code(
+                    [&] {
+                        while (dec.step()) reader = std::max(reader, dec.V ? dec.V->buf.size() : 0);
+                    },
+                    refusal);
+                if (dec.V) reader = std::max(reader, dec.V->buf.size());
+                if (reader > addr::BLOBS_BUF + READ_SLACK) return 4;
+                if (!c.refusal && dec.out[1].size() != c.logical) return 6;
+                return code;
             },
-            5);
+            20);
 
-        if (status != 2) std::printf("    count %llu: exit %d\n", (unsigned long long)count, status);
-        CHECK_EQ(status, 2);
+        if (status != (c.refusal ? 2 : 0))
+            std::printf("    a blob of %zu bytes at len %u: exit %d\n", c.blob.size(), c.len, status);
+        CHECK_EQ(status, c.refusal ? 2 : 0);
+    }
+}
+
+TEST(gcs_addr_codecs_copy_an_escaped_footprint_through_in_pieces) {
+    // An escaped footprint in encoding 3 of 80K and of 800K vertices, 640 KB
+    // and 6.4 MB, and one escaped for a vertex more than a blob holds (65,536
+    // in encoding 1, 262 KB), among small ones, each stream in one write (as
+    // the patcher's FILE passes a long stretch) and read back as the patcher
+    // reads them (a record, then its footprint in 64 KiB views): at both
+    // sizes the encoder's queue holds at most a piece and the decoder's what
+    // a read asks ahead and a piece of the blobs' buffer, each with the
+    // largest footprint here either takes whole (the one of 12 vertices, 10
+    // + 4 x 12 B); the files are the builder's and decode back to the same
+    // bytes.
+    const size_t whole = 10 + 4 * 12;
+    std::mt19937 rng(20261030);
+    for (const uint32_t big : {80000u, 800000u}) {
+        const AddrSet s = addr_set({{5, 1, true, 200},
+                                    {big, 3, false, 0},
+                                    {0, 0, false, 0},
+                                    {uint32_t(addr_files::MAX_BLOB_VERTICES) + 1, 1, false, 65536},
+                                    {12, 2, false, 65536},
+                                    {9, 0, true, 256 - 1}},
+                                   rng);
+        ScratchDir dir("gcs-test");
+        addr::Enc enc(dir.path());
+        enc.state = {1, 1};
+        enc.write(0, s.points.data(), s.points.size());
+        enc.write(1, s.verts.data(), s.verts.size());
+        const size_t encoder_peak = std::max(enc.peak(0), enc.peak(1));
+        finish_all(enc);
+
+        addr::Dec dec(dir.path());
+        AddrSet out;
+        const bool complete = read_addrs(dec, s, out);
+        const size_t decoder_peak = std::max(dec.peak(0), dec.peak(1));
+        std::printf("    %u vertices: encoder queue peak %zu B, decoder queue peak %zu B\n", big, encoder_peak, decoder_peak);
+
+        CHECK(encoder_peak <= ENCODER_PIECE + whole);
+        CHECK(decoder_peak <= Decoder::READ_AHEAD + addr::BLOBS_BUF + whole);
+        CHECK(complete);
+        CHECK(out.points == s.points);
+        CHECK(out.verts == s.verts);
+        CHECK(dir_files(dir.path()) == addr_files_of(s));
+    }
+}
+
+TEST(gcs_addr_codec_holds_a_piece_and_one_footprint_of_the_most_vertices) {
+    // Footprints of the most vertices a blob holds (65,535: 262,150 B), four
+    // of them in one block, in one write of each stream (as the patcher's
+    // FILE passes an INSERT stretch), which the encoder takes a piece (64
+    // KiB) at a time: its queue peaks at no more than a piece and one such
+    // footprint, which it takes whole. Read back as the patcher reads them (a
+    // record, then its footprint in 64 KiB views), the decoder's queue holds
+    // what a read asks ahead and one footprint, not its block's four, and its
+    // blob reader the largest blob. The files are the builder's.
+    const uint32_t most = uint32_t(addr_files::MAX_BLOB_VERTICES);
+    const size_t largest = 10 + 4 * size_t(most);
+    std::mt19937 rng(20261030);
+    const AddrSet s = addr_set({{5000, 1, false, 65536},
+                                {6914, 2, true, 200},
+                                {most, 0, false, 65536},
+                                {0, 0, false, 0},
+                                {most, 1, true, 256 - 1},
+                                {most, 2, false, 65536},
+                                {most, 0, true, 65536},
+                                {3, 0, false, 40}},
+                               rng);
+    REQUIRE(s.sizes[2] == largest);
+    ScratchDir dir("gcs-test");
+    addr::Enc enc(dir.path());
+    enc.state = {1, 1};
+    enc.write(0, s.points.data(), s.points.size());
+    enc.write(1, s.verts.data(), s.verts.size());
+    const size_t encoder_records = enc.peak(0), encoder_footprints = enc.peak(1);
+    finish_all(enc);
+
+    addr::Dec dec(dir.path());
+    dec.state = {1, 1};
+    AddrSet out;
+    std::vector<char> view(size_t(64) << 10);
+    size_t reader = 0;
+    auto read = [&](int port, size_t n, std::vector<uint8_t>& to) {
+        while (n) {
+            const size_t k = dec.read(port, view.data(), std::min(n, view.size()));
+            if (!k) return false;
+            if (dec.V) reader = std::max(reader, dec.V->buf.size());
+            to.insert(to.end(), view.data(), view.data() + k);
+            n -= k;
+        }
+        return true;
+    };
+    bool complete = true;
+    for (const size_t size : s.sizes) complete &= read(0, 28, out.points) && read(1, size, out.verts);
+    std::printf("    %zu B of footprints: encoder queue peaks %zu %zu B, decoder queue peaks %zu %zu B, blob reader %zu B\n",
+                s.verts.size(), encoder_records, encoder_footprints, dec.peak(0), dec.peak(1), reader);
+
+    CHECK(encoder_records <= s.points.size());
+    CHECK(encoder_footprints >= largest && encoder_footprints <= ENCODER_PIECE + largest);
+    CHECK(dec.peak(0) <= Decoder::READ_AHEAD);
+    CHECK(dec.peak(1) >= largest && dec.peak(1) <= Decoder::READ_AHEAD + largest);
+    CHECK(reader > largest / 2 && reader <= addr_files::BLOB_MAX_BYTES + 8 + READ_SLACK);
+    CHECK(complete);
+    CHECK(dec.read(0, view.data(), 1) == 0);
+    CHECK(out.points == s.points);
+    CHECK(out.verts == s.verts);
+    CHECK(dir_files(dir.path()) == addr_files_of(s));
+}
+
+TEST(gcs_addr_encoder_refuses_a_stream_that_is_not_whole_records_and_their_footprints) {
+    // Four records: a point, a footprint of two vertices, a footprint of
+    // three, and an escape of three in encoding 3. A record whose
+    // vertex_offset is not the footprints' bytes before it, and a footprint
+    // in an encoding none has or with its zero byte set, are refused as they
+    // come, by the record, the footprint's vertices unread; a stream that
+    // ends inside a footprint, inside an escaped one (which the encoder took
+    // as it came, its record already in the block) or inside a record, or
+    // holds a byte past the last footprint, at the finish, not written as
+    // shorter files.
+    std::mt19937 rng(20261114);
+    const AddrSet s = addr_set({{0, 0, false, 0}, {2, 0, false, 300}, {3, 1, true, 40}, {3, 3, false, 0}}, rng);
+    REQUIRE(s.verts.size() == 18 + 22 + 34);
+    struct Case {
+        size_t points, verts;                // the bytes of each stream written
+        std::function<void(AddrSet&)> edit;  // of the pair, before it is written
+        const char* refusal;
+    };
+    const Case cases[] = {
+        {112, 74, [](AddrSet&) {}, ""},
+        {112, 74, [](AddrSet& e) { wr32(&e.points[2 * 28 + 20], 19); },
+         "Malformed address files: addr_points.bin record 2 has a vertex_offset of 19, not the 18 bytes of the footprints before "
+         "it"},
+        {112, 28, [](AddrSet& e) { e.verts[18] = 4; },
+         "Malformed address files: addr_points.bin record 2 has a footprint in encoding 4"},
+        {112, 28, [](AddrSet& e) { e.verts[19] = 1; },
+         "Malformed address files: addr_points.bin record 2 has a footprint with its pad byte set"},
+        {112, 39, [](AddrSet&) {}, "gcs: addr: 56 bytes left over on input 0"},
+        {112, 73, [](AddrSet&) {}, "gcs: addr_vertices.bin: the stream ends 1 bytes before its last footprint does"},
+        {111, 40, [](AddrSet&) {}, "gcs: addr: 27 bytes left over on input 0"},
+        {84, 41, [](AddrSet&) {}, "gcs: addr: 1 bytes left over on input 1"},
+    };
+    for (const Case& c : cases) {
+        ScratchDir dir("gcs-test");
+        AddrSet e = s;
+        c.edit(e);
+        addr::Enc enc(dir.path());
+        enc.state = {1, 1};
+
+        CHECK_EQ(refusal_of([&] {
+                     enc.write(1, e.verts.data(), c.verts);
+                     enc.write(0, e.points.data(), c.points);
+                     finish_all(enc);
+                 }),
+                 std::string(c.refusal));
+        if (!*c.refusal) CHECK(dir_files(dir.path()) == addr_files_of(s));
     }
 }
 
 TEST(gcs_encoders_refuse_a_unit_past_the_end_of_its_file) {
     // A footprint or POI block of 2^30 vertices (10 + 4 x 2^30
-    // bytes, which a 32-bit size_t wraps to 10) whose file the patch gives as
-    // ten bytes: refused as those bytes come, not waited for while the queue
-    // takes the rest of the file.
+    // bytes, which a 32-bit size_t wraps to 10) whose stream is ten bytes:
+    // refused as those bytes come, not waited for while the queue takes the
+    // rest of the file. The footprint is one of more bytes than a patch
+    // indexes, the POI block one past the end of its file as the patch gives
+    // it.
     ScratchDir dir("gcs-test");
     const std::vector<uint8_t> ten(10, 0);
     {
         std::vector<uint8_t> rec(28, 0);
         wr32(&rec[20], 0);
         wr32(&rec[24], 0x40000000);
-        addr::Enc enc(dir.path(), rec.size());
+        addr::Enc enc(dir.path());
         enc.state = {1, 1};
-        enc.expect = {rec.size(), ten.size()};
         enc.write(0, rec.data(), rec.size());
 
         CHECK_EQ(refusal_of([&] { enc.write(1, ten.data(), ten.size()); }),
-                 std::string("gcs: addr: a unit of 10 + 1073741824 x 4 bytes at 0 runs past the end of input 1 (10 bytes left)"));
+                 std::string("Malformed address files: a logical addr_vertices.bin of 4294967306 bytes is more than the "
+                             "4294967294 a patch can index"));
     }
     {
         std::vector<uint8_t> rec(36, 0);
@@ -802,171 +1193,280 @@ TEST(gcs_reader_rejects_a_varint_past_64_bits) {
     }
 }
 
-TEST(gcs_ways_decoder_rejects_codes_wider_than_the_encoder_writes) {
-    // One street way of two nodes, its block 2 wf bytes then (wl + wg) bits:
-    // a first coordinate past 4 bytes or deltas past 32 bits are refused
-    // instead of shifting a u32 past its width; the widest valid code decodes.
+TEST(gcs_ways_round_trip_in_odd_pieces_and_equal_the_builders_encoder) {
+    // Ways written a record and its nodes at a time, in pieces that cut them
+    // anywhere (of 1 to 7 bytes, and of up to 5000), give the builder's two
+    // files, whatever their count: none (the two footers alone), one, a group
+    // less one, a group, a group and one, and many groups, one of them without
+    // a node. The decoder gives the pair back, and the decoded sizes are the
+    // footers' without a decoder. Streets and interpolations.
+    std::mt19937 rng(20261114);
+    for (const way_files::Kind* kind : WAY_KINDS)
+        for (const size_t n : {size_t(0), size_t(1), size_t(15), size_t(16), size_t(17), size_t(1000)})
+            for (const size_t max_piece : {size_t(7), size_t(5000)}) {
+                const WaySet s = way_set(*kind, way_counts(n, rng), rng);
+                ScratchDir dir("gcs-test");
+                encode_ways(*kind, s, dir.path(), rng, max_piece);
+
+                const auto files = dir_files(dir.path());
+                CHECK(files == way_files_of(*kind, s));
+                if (n == 0) CHECK(files.at(kind->ways_file).size() == 8 && files.at(kind->nodes_file).size() == 16);
+                CHECK_EQ(ways::decoded_size(dir.path(), *kind, 0), uint64_t(s.ways.size()));
+                CHECK_EQ(ways::decoded_size(dir.path(), *kind, 1), uint64_t(s.nodes.size()));
+                ways::Dec dec(dir.path(), *kind);
+                CHECK_EQ(dec.decoded_size(0), uint64_t(s.ways.size()));
+                CHECK_EQ(dec.decoded_size(1), uint64_t(s.nodes.size()));
+                const auto out = decode_all(dec);
+                CHECK(out[0] == s.ways);
+                CHECK(out[1] == s.nodes);
+            }
+}
+
+TEST(gcs_ways_decoder_takes_a_dir_without_its_files_as_no_ways_and_refuses_one_of_them) {
+    // A variant without streets has neither street file: it decodes to no
+    // ways, beside the interpolations' pair. A dir with one file of a pair is
+    // refused by name, by the decoder and by the decoded size alone.
+    std::mt19937 rng(20261114);
+    ScratchDir dir("gcs-test");
+    encode_ways(way_files::INTERPS, way_set(way_files::INTERPS, way_counts(20, rng), rng), dir.path(), rng, 100);
+
+    for (int port = 0; port < 2; port++) CHECK_EQ(ways::decoded_size(dir.path(), way_files::STREETS, port), uint64_t(0));
+    ways::Dec none(dir.path(), way_files::STREETS);
+    CHECK_EQ(none.decoded_size(0) + none.decoded_size(1), uint64_t(0));
+    const auto out = decode_all(none);
+    CHECK(out[0].empty() && out[1].empty());
+
+    REQUIRE(std::filesystem::remove(dir.path() + "/interp_nodes.bin"));
+    const std::string refusal = "Malformed way files: interp_ways.bin without interp_nodes.bin";
+    CHECK_EQ(refusal_of([&] { ways::Dec dec(dir.path(), way_files::INTERPS); }), refusal);
+    CHECK_EQ(refusal_of([&] { ways::decoded_size(dir.path(), way_files::INTERPS, 0); }), refusal);
+}
+
+TEST(gcs_ways_decoder_refuses_what_the_strict_decoder_refuses) {
+    // A pair of 40 ways, damaged 400 times a kind: bytes of the rows, of the
+    // blocks or of a footer overwritten, a byte cut or added before a footer,
+    // a file gone, the second group's blocks a byte further than the first's
+    // end, a node more in the footer's count, and every tenth time nothing.
+    // The decoder, which reads a way at a time, refuses each with the message
+    // of way_files::decode, which reads the two files whole, and gives that
+    // one's pair where it takes the files. The decoded size alone refuses
+    // what the two footers show.
+    std::mt19937 rng(20261114);
+    auto u8 = [](const std::vector<char>& v) { return std::vector<uint8_t>(v.begin(), v.end()); };
+    for (const way_files::Kind* kind : WAY_KINDS) {
+        const WaySet s = way_set(*kind, way_counts(40, rng), rng);
+        const auto written = way_files_of(*kind, s);
+        const std::vector<uint8_t> rows = u8(written.at(kind->ways_file)), blocks = u8(written.at(kind->nodes_file));
+        size_t refused = 0, taken = 0, by_footers = 0, differ = 0;
+        for (int round = 0; round < 400; round++) {
+            std::vector<uint8_t> r = rows, b = blocks;
+            bool has_rows = true, has_blocks = true;
+            auto overwrite = [&](std::vector<uint8_t>& f) { f[rng() % f.size()] = uint8_t(rng()); };
+            switch (round % 10) {
+            case 0: overwrite(r); break;
+            case 1: overwrite(b); break;
+            case 2:
+                for (int k = 0; k < 3; k++) overwrite(rng() % 2 ? r : b);
+                break;
+            case 3: b.erase(b.end() - 17); break;
+            case 4: b.insert(b.end() - 16, uint8_t(rng())); break;
+            case 5: r.erase(r.begin() + long(rng() % (r.size() - 8))); break;
+            case 6: (round % 20 < 10 ? has_rows : has_blocks) = false; break;
+            case 7: r[kind->row_bytes(way_files::GROUP_WAYS)]++; break;
+            case 8: b[b.size() - 16]++; break;
+            default: break;
+            }
+            ScratchDir dir("gcs-test");
+            if (has_rows) write_bytes(dir.path() + "/" + kind->ways_file, r);
+            if (has_blocks) write_bytes(dir.path() + "/" + kind->nodes_file, b);
+            const uint64_t rows_size = has_rows ? r.size() : way_files::ABSENT, blocks_size = has_blocks ? b.size() : way_files::ABSENT;
+
+            WaySet whole, stepped;
+            const std::string strict = refusal_of([&] {
+                way_files::decode(
+                    *kind, r.data(), rows_size, b.data(), blocks_size,
+                    [&](const uint8_t* record) { whole.ways.insert(whole.ways.end(), record, record + kind->stride); },
+                    [&](const uint8_t* p, size_t n) { whole.nodes.insert(whole.nodes.end(), p, p + n); });
+            });
+            const std::string ours = refusal_of([&] {
+                ways::Dec dec(dir.path(), *kind);
+                auto out = decode_all(dec);
+                stepped.ways = std::move(out[0]);
+                stepped.nodes = std::move(out[1]);
+            });
+            const std::string footers = refusal_of([&] {
+                way_files::read_footers(*kind, r.data() + (r.size() - 8), rows_size, b.data() + (b.size() - 16), blocks_size);
+            });
+            const std::string sized = refusal_of([&] { ways::decoded_size(dir.path(), *kind, 0); });
+
+            const bool same = ours == strict && sized == footers &&
+                              (!strict.empty() || (stepped.ways == whole.ways && stepped.nodes == whole.nodes));
+            if (!same && differ++ < 3)
+                std::printf("    round %d: decode \"%s\", the codec \"%s\"; footers \"%s\", the size \"%s\"\n", round, strict.c_str(),
+                            ours.c_str(), footers.c_str(), sized.c_str());
+            refused += !strict.empty();
+            taken += strict.empty();
+            by_footers += !footers.empty();
+            if (round % 10 == 9) CHECK(strict.empty() && stepped.ways == s.ways && stepped.nodes == s.nodes);
+            if (round % 10 == 7 || round % 10 == 8) CHECK(!strict.empty() && footers.empty());
+        }
+        std::printf("    %s: %zu refused (%zu by the footers), %zu taken\n", kind->ways_file, refused, by_footers, taken);
+        CHECK_EQ(differ, size_t(0));
+        CHECK(refused > 200 && taken > 60 && by_footers > 60);
+    }
+}
+
+TEST(gcs_ways_decoder_refuses_a_way_starting_past_node_u32) {
+    // A way's node_offset is a u32: ways whose nodes sum past it are refused
+    // at the first way that starts past node 2^32 - 1 (narrowed, it read as a
+    // small offset). 40 street ways decoded from node 2^32 - 1: the first way
+    // with nodes starts there, the next one past it.
+    std::mt19937 rng(5);
+    const WaySet s = way_set(way_files::STREETS, way_counts(40, rng), rng);
+    ScratchDir dir("gcs-test");
+    encode_ways(way_files::STREETS, s, dir.path(), rng, 7);
+    uint64_t second_with_nodes = 0;
+    for (size_t w = 0, with_nodes = 0; w < 40 && with_nodes < 2; w++)
+        if (node_bytes(&s.ways[12 * w]) && ++with_nodes == 2) second_with_nodes = w;
+    REQUIRE(second_with_nodes > 0);
+
+    ways::Dec dec(dir.path(), way_files::STREETS);
+    dec.node = UINT32_MAX;
+    for (auto& st : dec.state) st = 1;
+    const std::string refusal = refusal_of([&] {
+        while (dec.step())
+            for (auto& q : dec.out) q.pop(q.size());
+    });
+
+    CHECK_EQ(refusal, std::string("Malformed way files: street_ways.bin has a way with nodes after 2^32 nodes or more"));
+    CHECK_EQ(dec.way, second_with_nodes);
+}
+
+TEST(gcs_ways_encoder_refuses_a_stream_that_is_not_whole_ways_and_their_nodes) {
+    // Three street ways of 2, 0 and 1 nodes. A record whose node_offset is
+    // not the nodes before it is refused as it comes, by the way; a stream
+    // that ends inside a way's nodes or inside a record, or holds a node past
+    // the last way's, at the finish, not written as a shorter pair.
+    std::mt19937 rng(20261114);
+    const WaySet s = way_set(way_files::STREETS, {2, 0, 1}, rng);
     struct Case {
-        int wf, wl, wg;
-        const char* refusal;  // nullptr: decodes
+        size_t ways, nodes;  // the bytes of each stream written
+        uint32_t offset;     // the last way's node_offset
+        const char* refusal;
     };
-    const Case cases[] = {{4, 32, 32, nullptr},
-                          {0, 0, 0, nullptr},
-                          {5, 0, 0, "gcs: street: way 0 has a bad code 0xa000"},
-                          {7, 0, 0, "gcs: street: way 0 has a bad code 0xe000"},
-                          {0, 33, 0, "gcs: street: way 0 has a bad code 0x21"},
-                          {4, 32, 63, "gcs: street: way 0 has a bad code 0x8fe0"}};
+    const Case cases[] = {{36, 24, 2, ""},
+                          {36, 24, 3, "Malformed way files: street_ways.bin way 2 has a node_offset of 3, not the 2 nodes before it"},
+                          {36, 23, 2, "gcs: streets: 12 bytes left over on input 0"},
+                          {35, 16, 2, "gcs: streets: 11 bytes left over on input 0"},
+                          {24, 24, 2, "gcs: streets: 8 bytes left over on input 1"}};
     for (const Case& c : cases) {
         ScratchDir dir("gcs-test");
-        const uint16_t cnt = 2, code = uint16_t(c.wl | c.wg << 6 | c.wf << 13);
-        write_bytes(dir.path() + "/street.groups", std::vector<uint8_t>(12));
-        write_bytes(dir.path() + "/street.nodes2", std::vector<uint8_t>(ways::block_size(cnt, code), 0x5A));
-        write_bytes(dir.path() + "/street.cnt", le(cnt, 2));
-        write_bytes(dir.path() + "/street.code", le(code, 2));
-        write_bytes(dir.path() + "/street.name", le(7, 4));
-        const int status = exit_status_in_child(
-            [&] {
-                return refusal_code(
-                    [&] {
-                        Manifest m;
-                        m.set("street.ways", 1);
-                        m.set("street.nodes", cnt);
-                        m.set("street.G", 16);
-                        ways::Dec dec(dir.path(), true, m);
-                        dec.state = {1, 1};
-                        while (dec.step()) {}
-                    },
-                    c.refusal ? c.refusal : "");
-            },
-            5);
-        CHECK_EQ(status, c.refusal ? 2 : 0);
-    }
-}
-
-TEST(gcs_ways_decoder_rejects_bytes_past_the_end_of_a_column) {
-    // A street or interpolation set with a byte appended to any one of its
-    // columns fails instead of decoding and dropping it; the set as encoded
-    // decodes to its input.
-    for (bool street : {true, false}) {
-        const WaySet s = way_set(street);
-        ScratchDir enc_dir("gcs-test");
-        Manifest m;
-        {
-            std::mt19937 rng(5);
-            ways::Enc enc(enc_dir.path(), street);
-            enc.state = {1, 1};
-            const size_t stride = street ? 12 : 24;
-            size_t np = 0;
-            for (size_t w = 0; w < s.ways.size() / stride; w++) {
-                write_in_pieces(enc, 0, &s.ways[stride * w], stride, rng, 5);
-                const size_t nb = 8 * size_t(rd16(&s.ways[stride * w + 4]));
-                if (nb) write_in_pieces(enc, 1, &s.nodes[np], nb, rng, 7);
-                np += nb;
-            }
-            m = finish_all(enc);
-        }
-        {
-            ways::Dec dec(enc_dir.path(), street, m);
-            const auto out = decode_all(dec);
-            CHECK(out[0] == s.ways);
-            CHECK(out[1] == s.nodes);
-        }
-        const std::string fam = street ? "street" : "interp";
-        const std::vector<std::string> columns = street ? std::vector<std::string>{"cnt", "code", "name"}
-                                                        : std::vector<std::string>{"cntcode", "street", "start", "span", "interp"};
-        for (const std::string& column : columns) {
-            ScratchDir bad("gcs-test");
-            std::filesystem::copy(enc_dir.path(), bad.path(),
-                                  std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing);
-            {
-                std::ofstream f(bad.path() + "/" + fam + "." + column, std::ios::binary | std::ios::app);
-                f.put('\x5a');
-            }
-            const int status = exit_status_in_child(
-                [&] {
-                    return refusal_code(
-                        [&] {
-                            ways::Dec dec(bad.path(), street, m);
-                            for (auto& st : dec.state) st = 1;
-                            while (dec.step())
-                                for (auto& q : dec.out) q.pop(q.size());
-                        },
-                        "gcs: " + fam + ": columns not fully consumed");
-                },
-                20);
-            if (status != 2) std::printf("    %s.%s: exit %d\n", fam.c_str(), column.c_str(), status);
-            CHECK_EQ(status, 2);
-        }
-    }
-}
-
-TEST(gcs_ways_decoder_rejects_a_way_starting_past_node_u32) {
-    // A way's node_offset is a u32: counts that sum past it, while the total
-    // matches the manifest's node count, are rejected at the first way that
-    // starts past node 2^32 - 1 (narrowed, it read as a small offset). The 40
-    // street ways of 0 to 3 nodes decoded from node 2^32 - 1: the first way
-    // with nodes starts there, the next one past it.
-    const WaySet s = way_set(true);
-    ScratchDir dir("gcs-test");
-    Manifest m;
-    {
-        std::mt19937 rng(5);
-        ways::Enc enc(dir.path(), true);
+        std::vector<uint8_t> ways = s.ways;
+        wr32(&ways[24], c.offset);
+        ways::Enc enc(dir.path(), way_files::STREETS);
         enc.state = {1, 1};
-        size_t np = 0;
-        for (size_t w = 0; w < s.ways.size() / 12; w++) {
-            write_in_pieces(enc, 0, &s.ways[12 * w], 12, rng, 5);
-            const size_t nb = 8 * size_t(rd16(&s.ways[12 * w + 4]));
-            if (nb) write_in_pieces(enc, 1, &s.nodes[np], nb, rng, 7);
-            np += nb;
-        }
-        m = finish_all(enc);
+
+        CHECK_EQ(refusal_of([&] {
+                     enc.write(1, s.nodes.data(), c.nodes);
+                     enc.write(0, ways.data(), c.ways);
+                     finish_all(enc);
+                 }),
+                 std::string(c.refusal));
+        if (!*c.refusal) CHECK(dir_files(dir.path()) == way_files_of(way_files::STREETS, s));
     }
-    m.set("street.nodes", UINT32_MAX + m.num("street.nodes"));
-    size_t second_with_nodes = 0;
-    for (size_t w = 0, with_nodes = 0; w < s.ways.size() / 12 && with_nodes < 2; w++)
-        if (rd16(&s.ways[12 * w + 4]) && ++with_nodes == 2) second_with_nodes = w;
+}
 
-    const int status = exit_status_in_child(
-        [&] {
-            return refusal_code(
-                [&] {
-                    ways::Dec dec(dir.path(), true, m);
-                    dec.node_off = UINT32_MAX;
-                    for (auto& st : dec.state) st = 1;
-                    while (dec.step())
-                        for (auto& q : dec.out) q.pop(q.size());
-                },
-                "gcs: street: way " + std::to_string(second_with_nodes) + " starts past node 4294967295");
-        },
-        20);
+TEST(gcs_ways_codec_holds_one_way) {
+    // 3,000 interpolations of 20 to 200 nodes, two of them of the most nodes
+    // a way has (65,535: 524,280 B, one's of any bits, whose block is as
+    // long), 3.6 MB of nodes: each way's record and then its nodes in one
+    // write (as the patcher's FILE passes a long write), read back as the
+    // patcher reads them (a record, then its nodes in 64 KiB views). The
+    // encoder's queues hold the record and the nodes of the way in flight;
+    // the decoder's what a read asks ahead and one way; the rows' reader its
+    // buffer, and the blocks' the largest block. The files are the builder's.
+    const way_files::Kind& kind = way_files::INTERPS;
+    const size_t most = way_files::NODE_BYTES * size_t(way_files::MAX_WAY_NODES);
+    std::mt19937 rng(20261114);
+    std::vector<uint32_t> counts(3000);
+    for (size_t w = 0; w < counts.size(); w++)
+        counts[w] = w == 699 || w == 2100 ? uint32_t(way_files::MAX_WAY_NODES) : 20 + uint32_t(rng() % 181);
+    const WaySet s = way_set(kind, counts, rng);
+    ScratchDir dir("gcs-test");
+    ways::Enc enc(dir.path(), kind);
+    enc.state = {1, 1};
+    size_t np = 0;
+    for (size_t at = 0; at < s.ways.size(); at += kind.stride) {
+        enc.write(0, &s.ways[at], kind.stride);
+        enc.write(1, &s.nodes[np], node_bytes(&s.ways[at]));
+        np += node_bytes(&s.ways[at]);
+    }
+    const size_t encoder_records = enc.peak(0), encoder_nodes = enc.peak(1);
+    finish_all(enc);
 
-    CHECK_EQ(status, 2);
+    ways::Dec dec(dir.path(), kind);
+    dec.state = {1, 1};
+    WaySet out;
+    std::vector<char> view(size_t(64) << 10);
+    size_t rows_reader = 0, blocks_reader = 0;
+    auto read = [&](int port, size_t n, std::vector<uint8_t>& to) {
+        while (n) {
+            const size_t k = dec.read(port, view.data(), std::min(n, view.size()));
+            if (!k) return false;
+            if (dec.R) {
+                rows_reader = std::max(rows_reader, dec.R->buf.size());
+                blocks_reader = std::max(blocks_reader, dec.B->buf.size());
+            }
+            to.insert(to.end(), view.data(), view.data() + k);
+            n -= k;
+        }
+        return true;
+    };
+    bool complete = true;
+    for (size_t at = 0; at < s.ways.size(); at += kind.stride)
+        complete &= read(0, kind.stride, out.ways) && read(1, node_bytes(&s.ways[at]), out.nodes);
+    std::printf("    %zu B of nodes: encoder queue peaks %zu %zu B, decoder queue peaks %zu %zu B, readers %zu %zu B\n", s.nodes.size(),
+                encoder_records, encoder_nodes, dec.peak(0), dec.peak(1), rows_reader, blocks_reader);
+
+    CHECK(s.nodes.size() > 6 * most);
+    CHECK_EQ(encoder_records, kind.stride);
+    CHECK_EQ(encoder_nodes, most);
+    CHECK(dec.peak(0) <= Decoder::READ_AHEAD);
+    CHECK(dec.peak(1) <= Decoder::READ_AHEAD + most);
+    CHECK(rows_reader <= ways::ROWS_BUF + READ_SLACK);
+    CHECK(blocks_reader > most && blocks_reader <= most + 8 + READ_SLACK);
+    CHECK(complete);
+    CHECK(dec.read(0, view.data(), 1) == 0);
+    CHECK(out.ways == s.ways);
+    CHECK(out.nodes == s.nodes);
+    CHECK(dir_files(dir.path()) == way_files_of(kind, s));
 }
 
 namespace {
 
-std::vector<uint32_t> u24_values() {
-    std::vector<uint32_t> v(15000);  // 45000 bytes of u24: one buffer (48 KiB), written at finish
-    for (size_t j = 0; j < v.size(); j++) v[j] = uint32_t(j * 7919 % 0xFFFFFF);
+// 128,000 values, one value a block: 2,000 blocks of 6 bytes, 12 KB that
+// wait in the encoder's buffer for finish(), which adds their table (8 KB)
+// and the footer.
+std::vector<uint32_t> one_value_blocks() {
+    std::vector<uint32_t> v(128000);
+    for (size_t j = 0; j < v.size(); j++) v[j] = uint32_t(j / 64 * 7919 % 0xFFFFFF);
     return v;
 }
 
 // 0: the write is refused with the error naming its file, too large for
-// the limit (mode 3, no limit: every byte is in the file); 3: another
+// the limit (mode 3, no limit: the file holds the values); 3: another
 // refusal; 4: none; 5, 6: mode 3's file is wrong; 8: a refusal in mode 3.
 int writer_case(int mode, const std::string& dir) {
-    const bool u24 = mode == 0 || mode == 3;
-    const std::string file = dir + (u24 ? "/way_parents.u24" : "/output");
-    const std::vector<uint32_t> v = u24_values();
+    const bool side = mode == 0 || mode == 3;
+    const std::string file = dir + (side ? "/way_parents.bin" : "/output");
+    const std::vector<uint32_t> v = one_value_blocks();
     const std::string refusal = refusal_of([&] {
-        if (u24) {  // U24Enc: its last buffer goes out in finish()
-            side::U24Enc enc(dir);
+        if (side) {  // side::Enc: its blocks' last buffer, their table and the footer go out in finish()
+            side::Enc enc(dir, "way_parents");
             enc.state[0] = 1;
             enc.write(0, v.data(), v.size() * 4);
             enc.state[0] = 2;
-            Manifest m;
-            enc.finish(m);
+            enc.finish();
         } else {  // a writer whose finish() fails (1), or whose put() fails writing straight through (2)
             Writer w(file, 48 << 10);
             std::vector<uint8_t> bytes(mode == 1 ? 40000 : 100000);
@@ -979,13 +1479,14 @@ int writer_case(int mode, const std::string& dir) {
         return refusal == "gcs: write " + file + ": " + std::strerror(EFBIG) ? 0 : 3;
     }
     if (!refusal.empty()) return 8;
-    Reader r(file);
-    if (r.size() != 3 * v.size()) return 5;
-    for (uint32_t x : v) {
-        const uint8_t* b = r.take(3);
-        if ((uint32_t(b[0]) | uint32_t(b[1]) << 8 | uint32_t(b[2]) << 16) != x) return 6;
-    }
-    return 0;
+    const std::vector<char> bytes = slurp(file);
+    std::vector<uint32_t> values;
+    if (!refusal_of([&] {
+             side_blocks::decode("way_parents.bin", reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(),
+                                 [&](const uint32_t* p, size_t n) { values.insert(values.end(), p, p + n); });
+         }).empty())
+        return 5;
+    return values == v ? 0 : 6;
 }
 
 }  // namespace
@@ -1037,4 +1538,308 @@ TEST(gcs_reader_rejects_a_unit_past_what_its_buffer_holds) {
         20);
 
     CHECK_EQ(status, 2);
+}
+
+namespace {
+
+// A port's stream read as the patcher reads an old file whose decoded size
+// it knows: views of up to 64 KiB and none past that size, the other ports
+// closed. What it gave.
+std::vector<uint8_t> read_to_its_size(Decoder& dec, int port) {
+    for (size_t p = 0; p < dec.state.size(); p++) dec.state[p] = int(p) == port ? 1 : 2;
+    const uint64_t size = dec.decoded_size(port);
+    std::vector<uint8_t> out;
+    std::vector<char> view(size_t(64) << 10);
+    while (out.size() < size) {
+        const size_t k = dec.read(port, view.data(), size_t(std::min<uint64_t>(view.size(), size - out.size())));
+        if (!k) break;
+        out.insert(out.end(), view.data(), view.data() + k);
+    }
+    return out;
+}
+
+using Files = std::map<std::string, std::vector<char>>;
+
+void write_files(const std::string& dir, const Files& files) {
+    for (const auto& [name, bytes] : files) write_bytes(dir + "/" + name, std::vector<uint8_t>(bytes.begin(), bytes.end()));
+}
+
+const uint8_t* u8(const std::vector<char>& v) { return reinterpret_cast<const uint8_t*>(v.data()); }
+
+// The three place files of `visible` nodes, three a cell, and `hidden`
+// hidden ones after them (place_files::Encoder).
+Files place_files_of(uint32_t visible, uint32_t hidden) {
+    std::vector<char> cells, blocks, hidden_rows;
+    auto into = [](std::vector<char>& v) {
+        return [&v](const uint8_t* p, size_t n) { v.insert(v.end(), p, p + n); };
+    };
+    place_files::Encoder enc(into(cells), into(blocks), into(hidden_rows));
+    for (uint32_t i = 0; i < visible + hidden; i++) {
+        PlaceNode n{};
+        n.lat = 47.0f + float(i) * 1e-3f;
+        n.lng = 8.0f;
+        n.name_id = 16 * i;
+        n.place_type = 1;
+        if (i >= visible) n._pad1 = PLACE_FLAG_HIDDEN;
+        enc.add({n, i < visible ? i / 3 : NO_DATA});
+    }
+    enc.finish();
+    for (const auto& e : enc.table()) blocks.insert(blocks.end(), e.begin(), e.end());
+    const auto footer = enc.footer();
+    blocks.insert(blocks.end(), footer.begin(), footer.end());
+    return {{place_files::CELLS_FILE, cells}, {place_files::NODES_FILE, blocks}, {place_files::HIDDEN_FILE, hidden_rows}};
+}
+
+// A family's files as the builder writes them, with its decoder over a dir
+// that holds them, the ports whose stream ends with the files' last unit
+// (the records' unless the last record's child bytes come in pieces after
+// it, the child's when the last record has some), the whole-file decoder's
+// refusal of a set ("" when it takes it), and files a byte or a count away
+// from the written ones where they end.
+struct FilesEnd {
+    std::string name;
+    Files files;
+    std::function<std::unique_ptr<Decoder>(const std::string& dir)> decoder;
+    std::vector<int> ports;
+    std::function<std::string(const Files&)> strict;
+    struct Damage {
+        std::string what, file;
+        std::function<void(std::vector<char>&)> edit;
+    };
+    std::vector<Damage> damages;
+};
+
+// A byte put in `before` bytes from the file's end.
+std::function<void(std::vector<char>&)> a_byte_before_the_last(size_t before) {
+    return [before](std::vector<char>& f) { f.insert(f.end() - std::ptrdiff_t(before), char(0)); };
+}
+// The byte `before` bytes from the file's end, one more.
+std::function<void(std::vector<char>&)> one_more_at(size_t before) {
+    return [before](std::vector<char>& f) { f[f.size() - before]++; };
+}
+
+std::vector<FilesEnd> files_ends(std::mt19937& rng) {
+    std::vector<FilesEnd> ends;
+    for (const size_t n : {size_t(100), size_t(2048), size_t(4096)}) {
+        const std::string family = "way_postcodes", file = family + ".bin";
+        const size_t table = 4 * ((n + 63) / 64) + 8;
+        ends.push_back({"side file of " + std::to_string(n) + " values",
+                        {{file, side_file_of(family, side_values(n, rng))}},
+                        [family](const std::string& dir) { return std::unique_ptr<Decoder>(new side::Dec(dir, family)); },
+                        {0},
+                        [file](const Files& f) {
+                            return refusal_of([&] { side_blocks::decode(file, u8(f.at(file)), f.at(file).size(), [](const uint32_t*, size_t) {}); });
+                        },
+                        {{"a byte between the blocks and the table", file, a_byte_before_the_last(table)}}});
+    }
+    for (const way_files::Kind* kind : WAY_KINDS) {
+        // Ways that end without nodes (the records' stream alone ends with the last way), and ways that all have some.
+        for (const bool nodes_last : {false, true}) {
+            const std::vector<uint32_t> counts = nodes_last ? std::vector<uint32_t>(50, 3) : way_counts(40, rng);
+            ends.push_back({std::string(kind->ways_file) + (nodes_last ? ", every way with nodes" : ", the last ways without nodes"),
+                            way_files_of(*kind, way_set(*kind, counts, rng)),
+                            [kind](const std::string& dir) { return std::unique_ptr<Decoder>(new ways::Dec(dir, *kind)); },
+                            nodes_last ? std::vector<int>{0, 1} : std::vector<int>{0},
+                            [kind](const Files& f) {
+                                const std::vector<char>&rows = f.at(kind->ways_file), &blocks = f.at(kind->nodes_file);
+                                return refusal_of([&] {
+                                    way_files::decode(
+                                        *kind, u8(rows), rows.size(), u8(blocks), blocks.size(), [](const uint8_t*) {}, [](const uint8_t*, size_t) {});
+                                });
+                            },
+                            {{"a byte between the last block and the footer", kind->nodes_file, a_byte_before_the_last(way_files::NODES_FOOTER_BYTES)},
+                             {"a node more in the footer", kind->nodes_file, one_more_at(way_files::NODES_FOOTER_BYTES)}}});
+        }
+    }
+    for (const bool escape_last : {false, true}) {
+        // Addresses that end with points, and ones whose last footprint is an escape, which the decoder gives in pieces.
+        std::vector<AddrSpec> specs = addr_specs(40, rng);
+        specs.push_back(escape_last ? AddrSpec{9000, 3, false, 0} : AddrSpec{0, 0, false, 0});
+        const auto strict = [](const Files& f) {
+            const std::vector<char>&points = f.at(addr_files::POINTS_FILE), &vertices = f.at(addr_files::VERTICES_FILE),
+                              &index = f.at(addr_files::INDEX_FILE);
+            return refusal_of([&] { addr_files::decode(u8(points), points.size(), u8(vertices), vertices.size(), u8(index), index.size()); });
+        };
+        ends.push_back({escape_last ? "addresses, the last an escape" : "addresses, the last a point",
+                        addr_files_of(addr_set(specs, rng)),
+                        [](const std::string& dir) { return std::unique_ptr<Decoder>(new addr::Dec(dir)); },
+                        {escape_last ? 1 : 0},
+                        strict,
+                        {{"a byte between the last block and the footer", addr_files::POINTS_FILE, a_byte_before_the_last(addr_files::POINTS_FOOTER_BYTES)},
+                         {"a byte between the last blob and the footer", addr_files::VERTICES_FILE,
+                          a_byte_before_the_last(addr_files::VERTICES_FOOTER_BYTES)},
+                         {"a blob more in the footer", addr_files::VERTICES_FILE, one_more_at(8)}}});
+    }
+    for (const bool polygon_last : {false, true}) {
+        // POIs that end with a point, and ones whose last polygon is past big_block() (set to 4 KiB: decoded in pieces).
+        std::vector<PoiSpec> specs = {{0, 0, false}, {30, 2, false}, {5, 4, true}, {0, 0, false}, {700, 2, true}, {12, 2, false}};
+        specs.push_back(polygon_last ? PoiSpec{20000, 2, false} : PoiSpec{0, 0, false});
+        ends.push_back({polygon_last ? "POIs, the last a polygon in pieces" : "POIs, the last a point",
+                        poi_files_of(poi_set(specs, rng)),
+                        [](const std::string& dir) { return std::unique_ptr<Decoder>(new poi::Dec(dir)); },
+                        {polygon_last ? 1 : 0},
+                        [](const Files& f) {
+                            const std::vector<char>&r2 = f.at("poi_records.bin"), &v2 = f.at("poi_vertices.bin");
+                            return refusal_of([&] { poi_files::decode(u8(r2), r2.size(), u8(v2), v2.size()); });
+                        },
+                        {{"a byte between the last block and the pad", "poi_vertices.bin", a_byte_before_the_last(poi_files::VERTEX_PAD)},
+                         {"a pad that is not zero", "poi_vertices.bin", one_more_at(1)},
+                         {"a vertex byte more in the footer", "poi_records.bin", one_more_at(12)}}});
+    }
+    for (const uint32_t hidden : {0u, 300u}) {
+        // Place nodes that end with a block of visible ones, and with a run of hidden ones.
+        ends.push_back({hidden ? "places, the last hidden" : "places, all visible",
+                        place_files_of(500, hidden),
+                        [](const std::string& dir) { return std::unique_ptr<Decoder>(new place::Dec(dir)); },
+                        {0},
+                        [](const Files& f) {
+                            const std::vector<char>&cells = f.at(place_files::CELLS_FILE), &nodes = f.at(place_files::NODES_FILE),
+                                              &hidden_rows = f.at(place_files::HIDDEN_FILE);
+                            return refusal_of([&] {
+                                place_files::decode(u8(cells), cells.size(), u8(nodes), nodes.size(), u8(hidden_rows), hidden_rows.size(),
+                                                    [](const place_files::LogicalPlace&) {});
+                            });
+                        },
+                        {{"a byte between the blocks and the table", place_files::NODES_FILE,
+                          a_byte_before_the_last(place_files::TABLE_ENTRY_BYTES * ((500 + place_files::BLOCK_ROWS - 1) / place_files::BLOCK_ROWS) +
+                                                 place_files::FOOTER_BYTES)},
+                         {"a cell past the last visible node", place_files::CELLS_FILE,
+                          [](std::vector<char>& f) {
+                              // The next key, from the row past the last.
+                              uint8_t row[place_files::CELL_ROW_BYTES];
+                              wr32(row, rd32(u8(f) + f.size() - place_files::CELL_ROW_BYTES) + 1);
+                              wr32(row + 4, 500);
+                              f.insert(f.end(), row, row + sizeof row);
+                          }}}});
+    }
+    return ends;
+}
+
+}  // namespace
+
+TEST(gcs_decoders_check_how_their_files_end_with_the_last_unit_they_decode) {
+    // A reader that knows an old file's decoded size asks a decoder for no
+    // byte past it, so no step follows the one that decodes the files' last
+    // unit: that step makes the checks of how the files end. Each family's
+    // files as written, a port that ends with the last unit read to its
+    // decoded size, give its stream and leave the decoder at its end. With a
+    // byte between the last unit and what follows it, or a footer that
+    // counts one more, the read that reaches the last unit refuses them in
+    // the whole-file decoder's words: side files of less than a read ahead,
+    // of one and of two; way pairs that end with ways without nodes and with
+    // ways that have them; addresses that end with a point and with an
+    // escape, given in pieces; POIs that end with a point and with a polygon
+    // past big_block(), decoded in pieces; places that end with visible
+    // nodes and with hidden ones.
+    std::mt19937 rng(20261115);
+    BigBlock small(4096);
+    for (const FilesEnd& end : files_ends(rng)) {
+        const int failures_before = gctest::failures();
+        REQUIRE(end.strict(end.files).empty());
+        {
+            ScratchDir dir("gcs-test");
+            write_files(dir.path(), end.files);
+            for (const int port : end.ports) {
+                const std::unique_ptr<Decoder> dec = end.decoder(dir.path());
+                const uint64_t size = dec->decoded_size(port);
+                std::vector<uint8_t> out;
+                CHECK_EQ(refusal_of([&] { out = read_to_its_size(*dec, port); }), std::string());
+                CHECK(out.size() == size && !out.empty());
+                // The decoder is at its end: it has nothing more for any port.
+                CHECK(!dec->step());
+            }
+        }
+        for (const FilesEnd::Damage& damage : end.damages) {
+            Files damaged = end.files;
+            damage.edit(damaged.at(damage.file));
+            const std::string strict = end.strict(damaged);
+            CHECK(!strict.empty());
+            ScratchDir dir("gcs-test");
+            write_files(dir.path(), damaged);
+            for (const int port : end.ports) {
+                const std::string ours = refusal_of([&] {
+                    const std::unique_ptr<Decoder> dec = end.decoder(dir.path());
+                    read_to_its_size(*dec, port);
+                });
+                if (ours != strict) std::printf("    %s, %s, port %d: \"%s\", not \"%s\"\n", end.name.c_str(), damage.what.c_str(), port, ours.c_str(), strict.c_str());
+                CHECK_EQ(ours, strict);
+            }
+        }
+        if (gctest::failures() > failures_before) std::printf("    in: %s\n", end.name.c_str());
+    }
+}
+
+namespace {
+
+// A two-file family's encoder into a dir, and a record of it that has child
+// bytes, with the least of them.
+struct CoupledEncoder {
+    const char* family;
+    std::function<std::unique_ptr<Encoder>(const std::string& dir)> encoder;
+    std::vector<uint8_t> record, child;
+};
+
+std::vector<CoupledEncoder> coupled_encoders() {
+    // A street way of one node; an address with a footprint of one vertex; a POI with a polygon of one vertex.
+    std::vector<uint8_t> way(12, 0), address(28, 0), poi(36, 0);
+    wr16(&way[4], 1);
+    wr32(&address[24], 1);
+    wr32(&poi[12], 1);
+    return {{"streets", [](const std::string& dir) { return std::unique_ptr<Encoder>(new ways::Enc(dir, way_files::STREETS)); }, way,
+             std::vector<uint8_t>(8, 0)},
+            {"addr", [](const std::string& dir) { return std::unique_ptr<Encoder>(new addr::Enc(dir)); }, address, std::vector<uint8_t>(14, 0)},
+            {"poi", [](const std::string& dir) { return std::unique_ptr<Encoder>(new poi::Enc(dir)); }, poi, std::vector<uint8_t>(14, 0)}};
+}
+
+}  // namespace
+
+TEST(gcs_coupled_encoders_refuse_bytes_no_unit_takes_as_they_come) {
+    // A two-file family's encoder takes a record once its child bytes are
+    // in, and child bytes once their record is. Bytes of one file that wait
+    // for the other's are refused as they come when the other file is
+    // closed, as no unit will take them: child bytes after the records' file
+    // closed without a record for them, and a record with child bytes after
+    // the child file closed without them. While both files are open one may
+    // run ahead of the other by what a replay's buffers put between them,
+    // and no further: 4 MiB of child bytes without a record, and 4 MiB of
+    // records without their child bytes, are refused once the queue holds
+    // MAX_ENCODER_SKEW, not held until the files close. The way pair, the
+    // address files and the POI files.
+    const size_t skew = MAX_ENCODER_SKEW;
+    for (const CoupledEncoder& c : coupled_encoders()) {
+        const int failures_before = gctest::failures();
+        const std::string family = c.family;
+        {
+            ScratchDir dir("gcs-test");
+            const std::unique_ptr<Encoder> enc = c.encoder(dir.path());
+            enc->state = {2, 1};
+            CHECK_EQ(refusal_of([&] { enc->write(1, c.child.data(), c.child.size()); }),
+                     "gcs: " + family + ": " + std::to_string(c.child.size()) + " bytes left over on input 1");
+        }
+        {
+            ScratchDir dir("gcs-test");
+            const std::unique_ptr<Encoder> enc = c.encoder(dir.path());
+            enc->state = {1, 2};
+            CHECK_EQ(refusal_of([&] { enc->write(0, c.record.data(), c.record.size()); }),
+                     "gcs: " + family + ": " + std::to_string(c.record.size()) + " bytes left over on input 0");
+        }
+        for (const int port : {0, 1}) {
+            // Whole units, 64 KiB of them a write.
+            const std::vector<uint8_t>& unit = port == 0 ? c.record : c.child;
+            std::vector<uint8_t> piece;
+            while (piece.size() + unit.size() <= ENCODER_PIECE) piece.insert(piece.end(), unit.begin(), unit.end());
+            ScratchDir dir("gcs-test");
+            const std::unique_ptr<Encoder> enc = c.encoder(dir.path());
+            enc->state = {1, 1};
+            size_t written = 0;
+            const std::string refusal = refusal_of([&] {
+                for (; written < (size_t(4) << 20); written += piece.size()) enc->write(port, piece.data(), piece.size());
+            });
+            const size_t held = (skew / piece.size() + 1) * piece.size();
+            CHECK_EQ(refusal, "gcs: " + family + ": input " + std::to_string(port) + " runs " + std::to_string(held) + " bytes ahead of input " +
+                                  std::to_string(1 - port));
+            CHECK(enc->peak(port) <= skew + ENCODER_PIECE);
+        }
+        if (gctest::failures() > failures_before) std::printf("    in: %s\n", c.family);
+    }
 }

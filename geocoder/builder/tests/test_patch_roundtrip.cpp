@@ -133,11 +133,12 @@ bool write_sidecars(const std::string& path, const Sidecars& keys) {
 }
 
 // The files of the patched dir that are missing, extra or not new's bytes
-// ("diff failed" / "patch failed" when a tool exits non-zero), and the
-// tools' log.
+// ("diff failed" / "patch failed" when a tool exits non-zero), the tools'
+// log, and the patch file the diff wrote.
 struct RoundTrip {
     std::vector<std::string> mismatches;
     std::string log;
+    std::vector<char> patch;
 };
 
 // Diffs old -> new (with diff_options), applies the patch to old and
@@ -171,6 +172,7 @@ RoundTrip round_trip(const BuildDir& old_files, const BuildDir& new_files, const
     }
     auto text = read_file(log);
     r.log.assign(text.begin(), text.end());
+    r.patch = read_file(patch);
     if (!bad.empty()) {
         for (const auto& b : bad) std::printf("    round trip: %s\n", b.c_str());
         std::printf("%s\n", r.log.c_str());
@@ -208,11 +210,30 @@ PoiRecord poi(uint32_t name) {
 
 PlaceNode place(uint32_t name) { return test_place(48.0f, 11.0f, name); }
 
-// Nodes (or vertices) numbered i, as street_nodes.bin holds them.
+// Nodes numbered i, as street_nodes.bin holds them.
 std::vector<char> nodes_of(const std::vector<int>& numbers) {
     std::vector<NodeCoord> nodes;
     for (int i : numbers) nodes.push_back({10.0f + i, 20.0f + i});
     return bytes_of(nodes);
+}
+
+// Footprints back to back, as the logical addr_vertices.bin holds them
+// (addr_files.h): each a header of encoding 0 and the bbox minimum 48, 11,
+// then its numbered vertices, vertex i that many steps north and east of the
+// minimum: 10 bytes and 4 a vertex.
+std::vector<char> footprints_of(const std::vector<std::vector<int>>& footprints) {
+    std::vector<char> blobs;
+    for (const std::vector<int>& numbers : footprints) {
+        append(blobs, uint8_t{0});
+        append(blobs, uint8_t{0});
+        append(blobs, 48.0f);
+        append(blobs, 11.0f);
+        for (int i : numbers) {
+            append(blobs, static_cast<uint16_t>(i));
+            append(blobs, static_cast<uint16_t>(i));
+        }
+    }
+    return blobs;
 }
 
 // Streets matched by identity, one of each kind of record an identity merge
@@ -246,23 +267,23 @@ void put_identity_streets(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
 // Addresses on put_identity_streets' streets, matched by identity
 // (key: old id -> new id):
 //   0:  0 -> 1  MATCH       (B, on moved street 3 -> 0)
-//   21: 1 -> 2  REPLACE     (C -> D, on street 2), polygon of vertices 1 2 -> 1 9 2
+//   21: 1 -> 2  REPLACE     (C -> D, on street 2), footprint of vertices 1 2 -> 1 9 2
 //   22: 2 -> gone           (A, on the deleted street 0)
-//   3:  3 -> 3  MATCH       (B, on street 4 -> 3), polygon 3 4, vertex offset 16 -> 24
+//   3:  3 -> 3  MATCH       (B, on street 4 -> 3), footprint 3 4, vertex offset 18 -> 22
 //   24: 4 -> 0  moved       (C, on street 1)
 //   25:      4  new         (D, on the new street 4)
 // addr_postcodes follows the addresses; new 3's postcode changes.
 void put_identity_addresses(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
     old_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{
         {48.0f, 11.0f, OLD_B, OLD_B, 3, NO_DATA, 0}, {48.0f, 11.0f, OLD_C, OLD_C, 2, 0, 2},
-        {48.0f, 11.0f, OLD_A, OLD_A, 0, NO_DATA, 0}, {48.0f, 11.0f, OLD_B, OLD_B, 4, 16, 2},
+        {48.0f, 11.0f, OLD_A, OLD_A, 0, NO_DATA, 0}, {48.0f, 11.0f, OLD_B, OLD_B, 4, 18, 2},
         {48.0f, 11.0f, OLD_C, OLD_C, 1, NO_DATA, 0}});
-    old_d["addr_vertices.bin"] = nodes_of({1, 2, 3, 4});
+    old_d["addr_vertices.bin"] = footprints_of({{1, 2}, {3, 4}});
     new_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{
         {48.0f, 11.0f, NEW_C, NEW_C, 1, NO_DATA, 0}, {48.0f, 11.0f, NEW_B, NEW_B, 0, NO_DATA, 0},
-        {48.0f, 11.0f, NEW_D, NEW_D, 2, 0, 3}, {48.0f, 11.0f, NEW_B, NEW_B, 3, 24, 2},
+        {48.0f, 11.0f, NEW_D, NEW_D, 2, 0, 3}, {48.0f, 11.0f, NEW_B, NEW_B, 3, 22, 2},
         {48.0f, 11.0f, NEW_D, NEW_D, 4, NO_DATA, 0}});
-    new_d["addr_vertices.bin"] = nodes_of({1, 9, 2, 3, 4});
+    new_d["addr_vertices.bin"] = footprints_of({{1, 9, 2}, {3, 4}});
     ids.old_keys["addr"] = {0, 21, 22, 3, 24};
     ids.new_keys["addr"] = {24, 0, 21, 3, 25};
     old_d["addr_postcodes.bin"] = bytes_of(std::vector<uint32_t>{OLD_B, OLD_C, OLD_A, NO_DATA, OLD_C});
@@ -289,6 +310,72 @@ void put_identity_interps(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
     new_d["interp_postcodes.bin"] = bytes_of(std::vector<uint32_t>{NEW_C, NEW_B, NEW_D, NO_DATA});
 }
 
+// A day's keys by slot, as geocoder-diff --identity-slots takes them from the
+// records: record i's key is i, or NO_DATA where `dead` lists it.
+std::vector<uint32_t> slot_keys(uint32_t n, const std::vector<uint32_t>& dead) {
+    std::vector<uint32_t> keys(n);
+    for (uint32_t i = 0; i < n; i++) keys[i] = i;
+    for (uint32_t i : dead) keys[i] = NO_DATA;
+    return keys;
+}
+
+// Streets of two days built in stable slots (slot: old -> new), and the
+// sidecars of their slot keys:
+//   0: MATCH               (B, nodes 1 2)
+//   1: dies                (A, node 3 -> a tombstone)
+//   2: REPLACE             (C -> D, nodes 4 5 -> 4 9 5), node offset 3 -> 2
+//   3: refilled            (a tombstone -> B, node 6)
+//   4: MATCH               (C, node 7), node offset 5 -> 6
+//   5: appended            (C, node 8)
+void put_slot_streets(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
+    const WayHeader dead = street_way_tombstone();
+    old_d["street_ways.bin"] = bytes_of(std::vector<WayHeader>{
+        {0, 2, 0, OLD_B}, {2, 1, 0, OLD_A}, {3, 2, 0, OLD_C}, dead, {5, 1, 0, OLD_C}});
+    old_d["street_nodes.bin"] = nodes_of({1, 2, 3, 4, 5, 7});
+    new_d["street_ways.bin"] = bytes_of(std::vector<WayHeader>{
+        {0, 2, 0, NEW_B}, dead, {2, 3, 0, NEW_D}, {5, 1, 0, NEW_B}, {6, 1, 0, NEW_C}, {7, 1, 0, NEW_C}});
+    new_d["street_nodes.bin"] = nodes_of({1, 2, 4, 9, 5, 6, 7, 8});
+    ids.old_keys["street"] = slot_keys(5, {3});
+    ids.new_keys["street"] = slot_keys(6, {1});
+}
+
+// Addresses on put_slot_streets' streets, in stable slots (slot: old -> new):
+//   0: MATCH               (B, on street 0)
+//   1: refilled            (a tombstone -> D, on the appended street 5)
+//   2: REPLACE             (C -> D, on street 2), footprint of vertices 1 2 -> 1 9 2
+//   3: dies                (A, on the dead street 1 -> a tombstone)
+//   4: MATCH               (B, on street 4), footprint 3 4, vertex offset 18 -> 22
+void put_slot_addresses(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
+    const AddrPoint dead = addr_point_tombstone();
+    old_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{
+        {48.0f, 11.0f, OLD_B, OLD_B, 0, NO_DATA, 0}, dead, {48.0f, 11.0f, OLD_C, OLD_C, 2, 0, 2},
+        {48.0f, 11.0f, OLD_A, OLD_A, 1, NO_DATA, 0}, {48.0f, 11.0f, OLD_B, OLD_B, 4, 18, 2}});
+    old_d["addr_vertices.bin"] = footprints_of({{1, 2}, {3, 4}});
+    new_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{
+        {48.0f, 11.0f, NEW_B, NEW_B, 0, NO_DATA, 0}, {48.0f, 11.0f, NEW_D, NEW_D, 5, NO_DATA, 0},
+        {48.0f, 11.0f, NEW_D, NEW_D, 2, 0, 3}, dead, {48.0f, 11.0f, NEW_B, NEW_B, 4, 22, 2}});
+    new_d["addr_vertices.bin"] = footprints_of({{1, 9, 2}, {3, 4}});
+    ids.old_keys["addr"] = slot_keys(5, {1});
+    ids.new_keys["addr"] = slot_keys(5, {3});
+}
+
+// Interpolations in stable slots (slot: old -> new):
+//   0: REPLACE             (B 1-9 -> 1-11, nodes 1 2 -> 1 9 2)
+//   1: MATCH               (C 2-8, node 3), node offset 2 -> 3
+//   2: dies                (A 1-5, node 4 -> a tombstone)
+//   3: refilled            (a tombstone -> D 1-3, node 6)
+void put_slot_interps(BuildDir& old_d, BuildDir& new_d, Identity& ids) {
+    const InterpWay dead = interp_way_tombstone();
+    old_d["interp_ways.bin"] = bytes_of(std::vector<InterpWay>{
+        {0, 2, 0, OLD_B, 1, 9, 0}, {2, 1, 0, OLD_C, 2, 8, 0}, {3, 1, 0, OLD_A, 1, 5, 0}, dead});
+    old_d["interp_nodes.bin"] = nodes_of({1, 2, 3, 4});
+    new_d["interp_ways.bin"] = bytes_of(std::vector<InterpWay>{
+        {0, 3, 0, NEW_B, 1, 11, 0}, {3, 1, 0, NEW_C, 2, 8, 0}, dead, {4, 1, 0, NEW_D, 1, 3, 0}});
+    new_d["interp_nodes.bin"] = nodes_of({1, 9, 2, 3, 6});
+    ids.old_keys["interp"] = slot_keys(4, {3});
+    ids.new_keys["interp"] = slot_keys(4, {2});
+}
+
 // way_parents.bin of SPARSE_RECORDS admin slots, the SPARSE_CHANGES
 // (position, slot) changed on the new day. With no street ways to follow, the diff sends
 // the new file as a sparse delta.
@@ -307,6 +394,11 @@ std::vector<uint32_t> new_way_parents() {
     return ids;
 }
 
+// way_parents.bin of ids as the builder writes it.
+std::vector<char> written_way_parents(const std::vector<uint32_t>& ids) {
+    return gctest::as_written({{"way_parents.bin", bytes_of(ids)}}).at("way_parents.bin");
+}
+
 template <typename T>
 void put_at(std::vector<char>& out, size_t at, T v) {
     memcpy(out.data() + at, &v, sizeof v);
@@ -322,16 +414,17 @@ size_t find_once(const std::vector<char>& hay, const std::vector<char>& needle) 
 
 // The diff of old_way_parents() -> new_way_parents(), uncompressed, and
 // where it holds the fields a test edits. raw is empty when a tool failed or
-// the patch holds no single way_parents sparse delta.
+// the patch holds no single way_parents sparse delta of the values' logical
+// sizes, or does not list the file once at its size on disk.
 struct SparsePatch {
     std::vector<char> raw;
     size_t new_size_at = 0, last_pos_at = 0, listed_size_at = 0;
 
-    // The client file list is kept in step, so only the section is wrong.
-    void set_new_size(uint64_t size) {
-        put_at(raw, new_size_at, size);
-        put_at(raw, listed_size_at, size);
-    }
+    // The section's new size, the values' logical bytes.
+    void set_new_size(uint64_t size) { put_at(raw, new_size_at, size); }
+    // The client file list's size of the file on disk, which the patcher
+    // holds its output to.
+    void set_listed_size(uint64_t size) { put_at(raw, listed_size_at, size); }
     void set_last_pos(uint32_t pos) { put_at(raw, last_pos_at, pos); }
 };
 
@@ -360,7 +453,7 @@ SparsePatch diff_way_parents(const std::string& root) {
     std::vector<char> listed;
     append(listed, static_cast<uint16_t>(name.size()));
     listed.insert(listed.end(), name.begin(), name.end());
-    append(listed, size);
+    append(listed, static_cast<uint64_t>(written_way_parents(new_way_parents()).size()));
     append(listed, uint8_t{0});
     const size_t section_at = find_once(bytes, section), listed_at = find_once(bytes, listed);
     if (section_at == std::string::npos || listed_at == std::string::npos) return p;
@@ -501,7 +594,28 @@ TEST(patch_round_trip_walks_the_side_files_of_unchanged_street_ways_as_kept) {
     old_d["way_postcodes.bin"] = bytes_of(std::vector<uint32_t>{NAME_2, NAME_4});
     new_d["way_postcodes.bin"] = bytes_of(std::vector<uint32_t>{NAME_4, NAME_2});
 
-    CHECK(round_trip(old_d, new_d).mismatches.empty());
+    const RoundTrip r = round_trip(old_d, new_d);
+
+    CHECK(r.mismatches.empty());
+    // The second way's postcode is the old one where the remap puts it; the
+    // first's is another.
+    CHECK(logged(r, "way_postcodes.bin: parallel delta along street_ways.bin, 0 inserted, 1 changes"));
+}
+
+// A side file whose values a day keeps goes as unchanged, beside its parent's
+// records and without them, and the patched dir holds it as the builder
+// writes it.
+TEST(patch_round_trip_keeps_a_side_file_a_day_leaves_unchanged) {
+    for (const bool with_parent : {true, false}) {
+        BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(OLD_POOL);
+        if (with_parent) put_shifted_streets(old_d, new_d);
+        old_d["way_parents.bin"] = new_d["way_parents.bin"] = bytes_of(std::vector<uint32_t>{7, NO_DATA});
+
+        const RoundTrip r = round_trip(old_d, new_d);
+
+        CHECK(r.mismatches.empty());
+        CHECK(logged(r, "way_parents.bin: unchanged (copy old, 8 bytes saved)"));
+    }
 }
 
 TEST(patch_round_trip_keeps_the_parent_ways_of_unchanged_street_ways) {
@@ -652,6 +766,371 @@ TEST(patch_round_trip_keeps_the_place_files) {
     CHECK(r.mismatches.empty());
 }
 
+// geocoder-diff --decode-logical DIR OUT writes the logical form the merges
+// read of each family the builder writes encoded: the POI files as 36-byte
+// records and their vertex stream, the place files as place_nodes.bin's
+// 24-byte rows (the visible nodes with their cells' keys, then the hidden
+// ones). A dir with one of the families gives that family's files and a dir
+// with neither an empty OUT; no other file of DIR is written. An OUT that
+// holds a file, a DIR that is no dir and a DIR with one of the two POI files
+// are refused.
+TEST(decode_logical_writes_the_poi_and_place_files_a_dir_holds_and_none_it_lacks) {
+    ScratchDir dir("decode-logical");
+    const std::string log = dir.path() + "/tools.log";
+    // The tool's exit status 0, and its log.
+    auto decode = [&](const std::string& in, const std::string& out) {
+        std::filesystem::remove(log);
+        const bool ok = run({GEOCODER_DIFF_BIN, "--decode-logical", in, out}, log);
+        const std::vector<char> text = read_file(log);
+        return std::pair<bool, std::string>(ok, std::string(text.begin(), text.end()));
+    };
+    const BuildDir pois = poi_polygons(false);
+    PlaceNode hidden = place(NAME_4);
+    hidden._pad1 = PLACE_FLAG_HIDDEN;
+    const std::vector<PlaceNode> visible = {place(NAME_2), place(NAME_4), place(NAME_2), place(NAME_4), place(NAME_2)};
+    std::vector<PlaceNode> nodes = visible;
+    nodes.insert(nodes.begin() + 2, hidden);
+    // put_places' rows: visible node i in the cell of key i / 3.
+    std::vector<place_files::LogicalPlace> rows;
+    for (uint32_t i = 0; i < visible.size(); i++) rows.push_back({visible[i], i / 3});
+    rows.push_back({hidden, NO_DATA});
+    const BuildDir places = {{place_files::NODES_FILE, bytes_of(rows)}};
+
+    struct Case {
+        std::string name;
+        bool poi, places;
+    };
+    for (const Case& e : {Case{"both", true, true}, {"poi", true, false}, {"places", false, true}, {"neither", false, false}}) {
+        // Beside a string tier and a file of u32s, which are no such family's.
+        BuildDir d = with_pool(OLD_POOL), want;
+        d["admin_parents.bin"] = bytes_of(std::vector<uint32_t>{NAME_2});
+        if (e.poi) {
+            d.insert(pois.begin(), pois.end());
+            want.insert(pois.begin(), pois.end());
+        }
+        if (e.places) {
+            put_places(d, nodes);
+            want.insert(places.begin(), places.end());
+        }
+        const std::string in = dir.path() + "/" + e.name, out = in + ".logical";
+        REQUIRE(write_dir(in, d));
+
+        const auto [ok, text] = decode(in, out);
+
+        CHECK(ok);
+        CHECK(gctest::read_dir(out) == want);
+        // Each family's logical bytes, as its files' footers give them.
+        const std::string poi_line = "  poi: " + std::to_string(pois.at("poi_records.bin").size() + pois.at("poi_vertices.bin").size()) +
+                                     " logical bytes";
+        const std::string places_line = "  places: " + std::to_string(rows.size() * sizeof(rows[0])) + " logical bytes";
+        CHECK_EQ(text.find(poi_line) != std::string::npos, e.poi);
+        CHECK_EQ(text.find(places_line) != std::string::npos, e.places);
+        CHECK_EQ(text.find("  poi: none") != std::string::npos, !e.poi);
+        CHECK_EQ(text.find("  places: none") != std::string::npos, !e.places);
+    }
+
+    const std::string both = dir.path() + "/both", used = dir.path() + "/used";
+    const BuildDir held = {{"held.bin", {'x'}}};
+    REQUIRE(write_dir(used, held));
+    auto r = decode(both, used);
+    CHECK(!r.first);
+    CHECK(r.second.find("Output dir is not empty: " + used) != std::string::npos);
+    CHECK(gctest::read_dir(used) == held);
+
+    r = decode(dir.path() + "/nowhere", dir.path() + "/nowhere.logical");
+    CHECK(!r.first);
+    CHECK(r.second.find("Not a dir: " + dir.path() + "/nowhere") != std::string::npos);
+    CHECK(!std::filesystem::exists(dir.path() + "/nowhere.logical"));
+
+    REQUIRE(std::filesystem::remove(dir.path() + "/poi/poi_vertices.bin"));
+    r = decode(dir.path() + "/poi", dir.path() + "/half.logical");
+    CHECK(!r.first);
+    CHECK(r.second.find("has one of poi_records.bin and poi_vertices.bin") != std::string::npos);
+
+    // Without both of its paths the option is a usage error.
+    std::filesystem::remove(log);
+    CHECK(!run({GEOCODER_DIFF_BIN, "--decode-logical", both}, log));
+    const std::vector<char> usage = read_file(log);
+    CHECK(std::string(usage.begin(), usage.end()).find("geocoder-diff --decode-logical <dir> <out-dir>") != std::string::npos);
+}
+
+// --decode-logical writes the values of each side file a dir holds, 4 bytes a
+// value, and nothing for one it lacks or for a file of u32s that is no side
+// file. A side file the builder would not write is refused by name.
+TEST(decode_logical_writes_the_values_of_the_side_files_a_dir_holds) {
+    ScratchDir dir("decode-logical-side");
+    const std::string log = dir.path() + "/tools.log", in = dir.path() + "/in", out = dir.path() + "/out";
+    auto decode = [&](const std::string& to) {
+        std::filesystem::remove(log);
+        const bool ok = run({GEOCODER_DIFF_BIN, "--decode-logical", in, to}, log);
+        const std::vector<char> text = read_file(log);
+        return std::pair<bool, std::string>(ok, std::string(text.begin(), text.end()));
+    };
+    std::vector<uint32_t> parents, postcodes;
+    for (uint32_t i = 0; i < 200; i++) {
+        parents.push_back(i % 7 == 3 ? NO_DATA : 5000 + i * i);
+        postcodes.push_back(i < 70 ? NAME_2 : NAME_4);
+    }
+    const BuildDir sides = {{"way_parents.bin", bytes_of(parents)}, {"addr_postcodes.bin", bytes_of(postcodes)}};
+    BuildDir d = sides;
+    d["admin_parents.bin"] = bytes_of(std::vector<uint32_t>{1, 2, 3});
+    REQUIRE(write_dir(in, d));
+    REQUIRE(read_file(in + "/way_parents.bin") != sides.at("way_parents.bin"));
+
+    auto r = decode(out);
+
+    CHECK(r.first);
+    CHECK(gctest::read_dir(out) == sides);
+    CHECK(r.second.find("  way_parents: 800 logical bytes") != std::string::npos);
+    CHECK(r.second.find("  addr_postcodes: 800 logical bytes") != std::string::npos);
+    CHECK(r.second.find("  way_postcodes: none") != std::string::npos);
+    CHECK(r.second.find("  interp_postcodes: none") != std::string::npos);
+
+    // The file's magic, its last byte.
+    std::vector<char> other = read_file(in + "/addr_postcodes.bin");
+    other.back() = '2';
+    REQUIRE(write_file(in + "/addr_postcodes.bin", other));
+    r = decode(dir.path() + "/refused");
+    CHECK(!r.first);
+    CHECK(r.second.find("Malformed addr_postcodes.bin: no SDB1 in its footer") != std::string::npos);
+}
+
+// --decode-logical writes each way pair a dir holds as the merges read it:
+// the 12-byte street ways or 24-byte interpolations, and their ways' nodes
+// back to back, 8 bytes a node. A pair of no ways, two footers on disk, gives
+// two empty files, and a pair the dir lacks none. A dir with one file of a
+// pair, and a file the builder would not write, are refused by name.
+TEST(decode_logical_writes_the_way_pairs) {
+    ScratchDir dir("decode-logical-ways");
+    const std::string log = dir.path() + "/tools.log";
+    auto decode = [&](const std::string& in) {
+        std::filesystem::remove(log);
+        const bool ok = run({GEOCODER_DIFF_BIN, "--decode-logical", in, in + ".logical"}, log);
+        const std::vector<char> text = read_file(log);
+        return std::pair<bool, std::string>(ok, std::string(text.begin(), text.end()));
+    };
+    const std::vector<WayHeader> street_ways = {{0, 2, 0, NAME_2}, {0, 0, 0, NAME_4}, {2, 3, 0, NO_DATA}};
+    const std::vector<InterpWay> interp_ways = {{0, 1, 0, NAME_2, 1, 9, 1}, {1, 2, 0, NAME_4, 2, 8, 2}};
+    const BuildDir streets = {{"street_ways.bin", bytes_of(street_ways)}, {"street_nodes.bin", nodes_of({1, 2, 3, 4, 5})}};
+    const BuildDir interps = {{"interp_ways.bin", bytes_of(interp_ways)}, {"interp_nodes.bin", nodes_of({6, 7, 8})}};
+    const BuildDir no_streets = {{"street_ways.bin", {}}, {"street_nodes.bin", {}}};
+    struct Case {
+        std::string name;
+        BuildDir streets, interps;
+        std::string streets_line, interps_line;
+    };
+    for (const Case& e : {Case{"both", streets, interps, "  streets: 76 logical bytes", "  interps: 72 logical bytes"},
+                          Case{"streets", streets, {}, "  streets: 76 logical bytes", "  interps: none"},
+                          Case{"no-ways", no_streets, interps, "  streets: 0 logical bytes", "  interps: 72 logical bytes"}}) {
+        BuildDir want = e.streets;
+        want.insert(e.interps.begin(), e.interps.end());
+        // Beside a file of u32s, which is no pair's.
+        BuildDir d = want;
+        d["admin_parents.bin"] = bytes_of(std::vector<uint32_t>{1, 2, 3});
+        const std::string in = dir.path() + "/" + e.name;
+        REQUIRE(write_dir(in, d));
+        REQUIRE(read_file(in + "/street_ways.bin") != e.streets.at("street_ways.bin"));
+
+        const auto [ok, text] = decode(in);
+
+        CHECK(ok);
+        CHECK(gctest::read_dir(in + ".logical") == want);
+        CHECK(text.find(e.streets_line) != std::string::npos);
+        CHECK(text.find(e.interps_line) != std::string::npos);
+    }
+    REQUIRE(read_file(dir.path() + "/no-ways/street_ways.bin").size() == 8);
+    REQUIRE(read_file(dir.path() + "/no-ways/street_nodes.bin").size() == 16);
+
+    const std::string half = dir.path() + "/half", other = dir.path() + "/other";
+    BuildDir both = streets;
+    both.insert(interps.begin(), interps.end());
+    REQUIRE(write_dir(half, both) && write_dir(other, both));
+    REQUIRE(std::filesystem::remove(half + "/street_nodes.bin"));
+    auto r = decode(half);
+    CHECK(!r.first);
+    CHECK(r.second.find("Malformed way files: street_ways.bin without street_nodes.bin") != std::string::npos);
+
+    // The interpolations' count of their nodes, the first byte of the nodes
+    // file's footer.
+    std::vector<char> nodes = read_file(other + "/interp_nodes.bin");
+    nodes[nodes.size() - 16]++;
+    REQUIRE(write_file(other + "/interp_nodes.bin", nodes));
+    r = decode(other);
+    CHECK(!r.first);
+    CHECK(r.second.find("Malformed way files: interp_nodes.bin counts 4 nodes and its ways have 3") != std::string::npos);
+}
+
+// --decode-logical writes the address files a dir holds as the merges read
+// them: the 28-byte address points, a dead slot's among them, and their
+// footprints' logical blobs back to back; addr_index.bin has no logical
+// form. The three footers of no address give two empty files, and a dir
+// without the files none. A dir with some of the three, and files the builder
+// would not write, are refused by name.
+TEST(decode_logical_writes_the_address_pair) {
+    ScratchDir dir("decode-logical-addr");
+    const std::string log = dir.path() + "/tools.log";
+    auto decode = [&](const std::string& in) {
+        std::filesystem::remove(log);
+        const bool ok = run({GEOCODER_DIFF_BIN, "--decode-logical", in, in + ".logical"}, log);
+        const std::vector<char> text = read_file(log);
+        return std::pair<bool, std::string>(ok, std::string(text.begin(), text.end()));
+    };
+    // A point, an open footprint, a dead slot and a closed footprint.
+    const std::vector<AddrPoint> points = {{48.0f, 11.0f, NAME_2, NAME_4, 7, NO_DATA, 0},
+                                           {48.1f, 11.1f, NAME_4, NAME_2, NO_DATA, 0, 2},
+                                           addr_point_tombstone(),
+                                           {48.2f, 11.2f, NAME_2, NAME_2, 9, 18, 3}};
+    const BuildDir addrs = {{"addr_points.bin", bytes_of(points)}, {"addr_vertices.bin", footprints_of({{1, 2}, {3, 4, 3}})}};
+    const BuildDir no_addrs = {{"addr_points.bin", {}}, {"addr_vertices.bin", {}}};
+    struct Case {
+        std::string name;
+        BuildDir addrs;
+        std::string line;
+    };
+    for (const Case& e : {Case{"some", addrs, "  addr: 152 logical bytes"}, Case{"none", no_addrs, "  addr: 0 logical bytes"},
+                          Case{"without", {}, "  addr: none"}}) {
+        // Beside a file of u32s, which is no address file.
+        BuildDir d = e.addrs;
+        d["admin_parents.bin"] = bytes_of(std::vector<uint32_t>{1, 2, 3});
+        const std::string in = dir.path() + "/" + e.name;
+        REQUIRE(write_dir(in, d));
+        REQUIRE(std::filesystem::exists(in + "/addr_index.bin") == !e.addrs.empty());
+
+        const auto [ok, text] = decode(in);
+
+        CHECK(ok);
+        CHECK(gctest::read_dir(in + ".logical") == e.addrs);
+        CHECK(text.find(e.line) != std::string::npos);
+    }
+    REQUIRE(read_file(dir.path() + "/some/addr_points.bin") != addrs.at("addr_points.bin"));
+    REQUIRE(read_file(dir.path() + "/none/addr_points.bin").size() == 8);
+    REQUIRE(read_file(dir.path() + "/none/addr_vertices.bin").size() == 16);
+    REQUIRE(read_file(dir.path() + "/none/addr_index.bin").size() == 8);
+
+    const std::string part = dir.path() + "/part", other = dir.path() + "/other";
+    REQUIRE(write_dir(part, addrs) && write_dir(other, addrs));
+    REQUIRE(std::filesystem::remove(part + "/addr_index.bin"));
+    auto r = decode(part);
+    CHECK(!r.first);
+    CHECK(r.second.find("Malformed address files: a dir with some of addr_points.bin, addr_vertices.bin and addr_index.bin "
+                        "and not all three") != std::string::npos);
+
+    // The footprints' count, after the eight bytes of the logical stream's
+    // length in addr_vertices.bin's footer.
+    std::vector<char> vertices = read_file(other + "/addr_vertices.bin");
+    vertices[vertices.size() - 8]++;
+    REQUIRE(write_file(other + "/addr_vertices.bin", vertices));
+    r = decode(other);
+    CHECK(!r.first);
+    CHECK(r.second.find("Malformed address files: addr_vertices.bin counts 3 blobs and holds 2") != std::string::npos);
+}
+
+// geocoder-diff --logical-size DIR prints two numbers, from DIR's file sizes
+// and footers alone. The bytes a diff maps for DIR's record files: every .bin
+// but the string tiers at its size, the way pairs and the address, POI, place
+// and side files at their logical size. And the bytes it writes to scratch for DIR:
+// those logical files and the pool of each string tier as the diff finds it,
+// in DIR, else ../full, else ../../full, an empty pool as none. A DIR that is
+// no dir, and the option without its one path, are refused.
+TEST(logical_size_prints_the_mapped_and_the_scratch_bytes_of_a_dir) {
+    ScratchDir dir("logical-size");
+    const std::string log = dir.path() + "/tools.log", region = dir.path() + "/region";
+    // The tool's exit status 0, and its output.
+    auto sizes_of = [&](const std::vector<std::string>& paths) {
+        std::filesystem::remove(log);
+        std::vector<std::string> words = {GEOCODER_DIFF_BIN, "--logical-size"};
+        words.insert(words.end(), paths.begin(), paths.end());
+        const bool ok = run(words, log);
+        const std::vector<char> text = read_file(log);
+        return std::pair<bool, std::string>(ok, std::string(text.begin(), text.end()));
+    };
+    auto two = [](uint64_t mapped, uint64_t scratch) { return std::to_string(mapped) + " " + std::to_string(scratch) + "\n"; };
+    auto pool = [](const std::string& strings) { return std::vector<char>(strings.begin(), strings.end()); };
+
+    const BuildDir pois = poi_polygons(false);
+    const uint64_t poi_bytes = pois.at("poi_records.bin").size() + pois.at("poi_vertices.bin").size();
+    PlaceNode hidden = place(NAME_4);
+    hidden._pad1 = PLACE_FLAG_HIDDEN;
+    const std::vector<PlaceNode> nodes = {place(NAME_2), place(NAME_4), hidden, place(NAME_2)};
+    const uint64_t place_bytes = nodes.size() * place_files::LOGICAL_STRIDE;
+    const std::vector<char> way_parents = bytes_of(std::vector<uint32_t>{5, 6});
+    const uint64_t side_bytes = way_parents.size();
+    const std::vector<char> street_ways = bytes_of(std::vector<WayHeader>{{0, 2, 0, NAME_2}, {2, 1, 0, NAME_4}});
+    const std::vector<char> street_nodes = nodes_of({1, 2, 3});
+    const uint64_t street_bytes = street_ways.size() + street_nodes.size();
+    const std::vector<char> addr_points =
+        bytes_of(std::vector<AddrPoint>{addr_point(NAME_2, 0), {48.0f, 11.0f, NAME_4, NAME_4, 1, 0, 2}});
+    const std::vector<char> addr_vertices = footprints_of({{1, 2}});
+    const uint64_t addr_bytes = addr_points.size() + addr_vertices.size();
+    const std::string street_pool("Elm\0Oak\0Pine\0", 13);
+
+    // full: two string tiers of its own, the street pair, the address files,
+    // a geo index, the POI and place files, a side file, and files that are
+    // no .bin.
+    BuildDir full = with_pool(OLD_POOL);
+    full["strings_street.bin"] = pool(street_pool);
+    full["street_ways.bin"] = street_ways;
+    full["street_nodes.bin"] = street_nodes;
+    full["addr_points.bin"] = addr_points;
+    full["addr_vertices.bin"] = addr_vertices;
+    full["way_parents.bin"] = way_parents;
+    put_geo_cells(full, {{CELL, {0, 1}, {}, {}}});
+    full.insert(pois.begin(), pois.end());
+    put_places(full, nodes);
+    full["strings_layout.json"] = {'{', '}'};
+    full["street_ways.bin.osm_ids"] = std::vector<char>(64, 'i');
+    REQUIRE(write_dir(region + "/full", full));
+    const BuildDir written = gctest::as_written(full);
+    const uint64_t raw_bytes = written.at("geo_cells.bin").size() + written.at("geo_entries.bin").size();
+    // The encoded files are not their logical size, so neither number is a
+    // sum of file sizes.
+    REQUIRE(written.at("street_ways.bin").size() + written.at("street_nodes.bin").size() != street_bytes);
+    REQUIRE(written.at("addr_points.bin").size() + written.at("addr_vertices.bin").size() + written.at("addr_index.bin").size() !=
+            addr_bytes);
+    REQUIRE(written.at("poi_records.bin").size() + written.at("poi_vertices.bin").size() != poi_bytes);
+    REQUIRE(written.at("way_parents.bin").size() != side_bytes);
+    REQUIRE(written.at("strings_street.bin").size() != street_pool.size());
+
+    auto r = sizes_of({region + "/full"});
+    CHECK(r.first);
+    const uint64_t family_bytes = street_bytes + addr_bytes + poi_bytes + place_bytes + side_bytes;
+    CHECK_EQ(r.second, two(raw_bytes + family_bytes, family_bytes + OLD_POOL.size() + street_pool.size()));
+
+    // A dir beside full with one tier of its own, another of its own that
+    // is an empty pool, and no family: the tiers it lacks are ../full's.
+    const std::string own_pool("X\0Y\0", 4);
+    BuildDir beside;
+    beside["strings_core.bin"] = pool(own_pool);
+    beside["strings_street.bin"] = {};
+    beside["admin_parents.bin"] = bytes_of(std::vector<uint32_t>{5, 6, 7, 8});
+    REQUIRE(write_dir(region + "/admin", beside));
+    r = sizes_of({region + "/admin"});
+    CHECK(r.first);
+    CHECK_EQ(r.second, two(16, own_pool.size() + street_pool.size()));
+
+    // A dir two levels below full's parent, with a family and no tier.
+    REQUIRE(write_dir(region + "/poi/major", pois));
+    r = sizes_of({region + "/poi/major"});
+    CHECK(r.first);
+    CHECK_EQ(r.second, two(poi_bytes, poi_bytes + OLD_POOL.size() + street_pool.size()));
+
+    // No full beside or above it: nothing is decoded for it.
+    REQUIRE(write_dir(dir.path() + "/alone/deep/lone", {{"admin_parents.bin", bytes_of(std::vector<uint32_t>{5, 6})}}));
+    r = sizes_of({dir.path() + "/alone/deep/lone"});
+    CHECK(r.first);
+    CHECK_EQ(r.second, two(8, 0));
+
+    r = sizes_of({dir.path() + "/nowhere"});
+    CHECK(!r.first);
+    CHECK_EQ(r.second, "Not a dir: " + dir.path() + "/nowhere\n");
+
+    for (const std::vector<std::string>& paths : {std::vector<std::string>{}, {region + "/full", region + "/admin"}}) {
+        r = sizes_of(paths);
+        CHECK(!r.first);
+        CHECK(r.second.find("geocoder-diff --logical-size <dir>") != std::string::npos);
+    }
+}
+
 // An admin or POI cell index in dirs that hold none of its records (admin
 // polygons, POI records) still comes as a cell index delta, which the patcher
 // needs to rebuild it: a cell's list changes and a cell is added.
@@ -798,8 +1277,9 @@ TEST(patch_diff_refuses_offset_fixups_past_the_sections_limit) {
 // FILE_RECORDS_MAX: the u32 record indices' own, lower for tests) is refused
 // before it is diffed, by its name and day, and no patch is written: street
 // ways of 2 and 3 records, either way round, under a limit of 2; and their
-// nodes (8 bytes a record), 2 and 4, under 3. Under 3 the ways round-trip. A
-// limit past FILE_RECORDS_MAX is refused.
+// nodes (8 bytes a record), 2 and 4, under 3. Under 3 the ways round-trip. So
+// are address points, and their footprints by the byte. A limit past
+// FILE_RECORDS_MAX is refused.
 TEST(patch_diff_refuses_a_record_file_past_the_limit) {
     const NodeCoord x{10.0f, 20.0f}, y{11.0f, 21.0f}, z{12.0f, 22.0f}, w{13.0f, 23.0f};
     BuildDir two = with_pool(OLD_POOL), three = with_pool(OLD_POOL), four_nodes = with_pool(OLD_POOL);
@@ -829,48 +1309,57 @@ TEST(patch_diff_refuses_a_record_file_past_the_limit) {
     CHECK(refused_with(refusal("grows", two, three, "2"), "New street_ways.bin holds 3 records, more than the 2 a patch can index"));
     CHECK(refused_with(refusal("shrinks", three, two, "2"), "Old street_ways.bin holds 3 records, more than the 2 a patch can index"));
     CHECK(refused_with(refusal("nodes", two, four_nodes, "3"), "New street_nodes.bin holds 4 records, more than the 3 a patch can index"));
-    // Address points that aren't whole 28-byte points merge at stride 16, as
-    // an empty file's do, and the patcher counts a section's records at its
-    // stride: 3 old and 2 new (48 and 32 bytes, 1 point each at 28) round-trip
-    // under 3 and are refused under 2.
-    BuildDir addrs_16_old = with_pool(OLD_POOL), addrs_16_new = with_pool(OLD_POOL);
-    addrs_16_old["addr_points.bin"] = std::vector<char>(3 * 16, 0);
-    addrs_16_new["addr_points.bin"] = std::vector<char>(2 * 16, 0);
-    CHECK(round_trip(addrs_16_old, addrs_16_new, {}, {"--file-records-max", "3"}).mismatches.empty());
-    CHECK(refused_with(refusal("stride-16", addrs_16_old, addrs_16_new, "2"),
+    // The address files count by their logical form, not by their bytes on
+    // disk: 3 old and 2 new address points round-trip under 3 and are refused
+    // under 2, and a footprint of two vertices, a logical blob of 18 bytes,
+    // round-trips under 18 and is refused under 17.
+    BuildDir three_addrs = with_pool(OLD_POOL), two_addrs = with_pool(OLD_POOL), footprint = with_pool(OLD_POOL);
+    const AddrPoint a = addr_point(NAME_2, NO_DATA), b = addr_point(NAME_4, NO_DATA);
+    three_addrs["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{a, b, a});
+    two_addrs["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{a, b});
+    footprint["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{a, {48.0f, 11.0f, NAME_4, NAME_4, NO_DATA, 0, 2}});
+    footprint["addr_vertices.bin"] = footprints_of({{1, 2}});
+    REQUIRE(footprint.at("addr_vertices.bin").size() == 18 && gctest::as_written(footprint).at("addr_vertices.bin").size() != 18);
+    CHECK(round_trip(three_addrs, two_addrs, {}, {"--file-records-max", "3"}).mismatches.empty());
+    CHECK(refused_with(refusal("addresses", three_addrs, two_addrs, "2"),
                        "Old addr_points.bin holds 3 records, more than the 2 a patch can index"));
+    CHECK(round_trip(two_addrs, footprint, {}, {"--file-records-max", "18"}).mismatches.empty());
+    CHECK(refused_with(refusal("footprints", two_addrs, footprint, "17"),
+                       "New addr_vertices.bin holds 18 records, more than the 17 a patch can index"));
     CHECK(refused_with(refusal("option", two, three, "4294967295"), "--file-records-max takes 0 to 4294967294, not 4294967295"));
 }
 
-// The diff sizes a record file for the limit by the file, not by a mapping of
-// it: a new addr_vertices.bin one byte past FILE_RECORDS_MAX (sparse), in a
-// diff whose address space is capped below it so the file can't be mapped, is
-// refused by name and no patch is written. (A 32-bit build's size_t can't
-// hold a mapping of it either.)
-TEST(patch_diff_refuses_a_record_file_past_the_limit_it_cannot_map) {
-#ifdef __SANITIZE_ADDRESS__
-    std::printf("    SKIP a capped address space: the sanitizers' shadow memory needs more\n");
-#else
-    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(OLD_POOL);
-    old_d["addr_points.bin"] = new_d["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{addr_point(NAME_2, NO_DATA)});
-    new_d["addr_vertices.bin"] = {};
-    ScratchDir dir("patch-diff-unmappable");
-    const std::string root = dir.path(), patch = root + "/p.gcpatch", log = root + "/diff.log";
-    REQUIRE(write_dir(root + "/old", old_d) && write_dir(root + "/new", new_d));
-    std::filesystem::resize_file(root + "/new/addr_vertices.bin", uint64_t(FILE_RECORDS_MAX) + 1);
-    const bool ran = run({"/bin/sh", "-c", "ulimit -v 2097152 && exec \"$0\" \"$@\"", GEOCODER_DIFF_BIN, root + "/old",
-                          root + "/new", "-o", patch},
-                         log);
-    const std::vector<char> text = read_file(log);
-    const std::string said(text.begin(), text.end());
-    const bool refused = said.find("New addr_vertices.bin holds 4294967295 records, more than the 4294967294 a patch can index") !=
-                         std::string::npos;
-    if (!refused)
-        std::printf("    the capped diff (exit %s) ends: %s\n", ran ? "0" : "non-zero",
-                    said.substr(said.size() > 300 ? said.size() - 300 : 0).c_str());
-    CHECK(!ran && refused);
-    CHECK(!std::filesystem::exists(patch));
-#endif
+// The logical addr_vertices.bin is a byte stream a patch indexes in a u32
+// below NO_DATA. Address files whose footer gives one byte more, on the old
+// day or the new, are refused by the file's name and the bytes before a
+// block or a blob is decoded (the first block is one no encoder writes, and
+// is not what the diff refuses), and no patch is written.
+TEST(patch_diff_refuses_address_files_whose_footer_gives_a_footprint_stream_past_the_limit) {
+    BuildDir day = with_pool(OLD_POOL);
+    day["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{{48.0f, 11.0f, NAME_2, NAME_2, NO_DATA, 0, 2}});
+    day["addr_vertices.bin"] = footprints_of({{1, 2}});
+    ScratchDir dir("patch-diff-footprint-limit");
+    for (const std::string past : {"old", "new"}) {
+        const std::string root = dir.path() + "/" + past, patch = root + "/p.gcpatch", log = root + "/diff.log";
+        REQUIRE(write_dir(root + "/old", day) && write_dir(root + "/new", day));
+        std::vector<char> points = read_file(root + "/" + past + "/addr_points.bin");
+        std::vector<char> vertices = read_file(root + "/" + past + "/addr_vertices.bin");
+        REQUIRE(points.size() > addr_files::POINTS_FOOTER_BYTES && vertices.size() > addr_files::VERTICES_FOOTER_BYTES);
+        points[0] = static_cast<char>(0xFF);
+        put_at(vertices, vertices.size() - addr_files::VERTICES_FOOTER_BYTES, uint64_t{FILE_RECORDS_MAX} + 1);
+        REQUIRE(write_file(root + "/" + past + "/addr_points.bin", points));
+        REQUIRE(write_file(root + "/" + past + "/addr_vertices.bin", vertices));
+
+        const bool ran = run({GEOCODER_DIFF_BIN, root + "/old", root + "/new", "-o", patch}, log);
+
+        const std::vector<char> text = read_file(log);
+        const std::string said(text.begin(), text.end());
+        CHECK(!ran);
+        CHECK(said.find("Malformed address files: a logical addr_vertices.bin of 4294967295 bytes is more than the 4294967294 a "
+                        "patch can index") != std::string::npos);
+        CHECK(said.find("block 0") == std::string::npos);
+        CHECK(!std::filesystem::exists(patch));
+    }
 }
 
 // The second cell of each identity round trip lists only records the day
@@ -921,6 +1410,238 @@ TEST(patch_round_trip_by_identity_rebuilds_interp_ways) {
     CHECK(logged(r, "interp_ways identity: match=1 replace=1 insert=2 delete=2 moved=1"));
 }
 
+// The four side files, each beside the records it follows.
+const char* const SIDE_FILES[] = {"way_parents.bin", "way_postcodes.bin", "interp_postcodes.bin", "addr_postcodes.bin"};
+
+// A side file is written only on a day that has a value for it. One the old
+// day lacks comes whole, a full replacement of its values (4 bytes each),
+// which the patcher writes as the builder does; the other files follow their
+// records as on any day.
+TEST(patch_round_trip_adds_a_side_file_the_old_day_lacks) {
+    for (const char* added : SIDE_FILES) {
+        BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+        Identity ids;
+        put_identity_streets(old_d, new_d, ids);
+        put_identity_addresses(old_d, new_d, ids);
+        put_identity_interps(old_d, new_d, ids);
+        const std::string values = std::to_string(new_d.at(added).size());
+        old_d.erase(added);
+
+        const RoundTrip r = round_trip(old_d, new_d, ids);
+
+        CHECK(r.mismatches.empty());
+        CHECK(logged(r, std::string(added) + ": no old file, using full replace (" + values + " bytes)"));
+        CHECK(logged(r, std::string(added) + ": full replace " + values + " bytes"));
+        for (const char* kept : SIDE_FILES)
+            if (kept != added) CHECK(logged(r, std::string(kept) + ": parallel delta along "));
+    }
+}
+
+// A side file the new day lacks gets no section, and the patched dir does not
+// hold it; the other files follow their records.
+TEST(patch_round_trip_drops_a_side_file_the_new_day_lacks) {
+    for (const char* dropped : SIDE_FILES) {
+        BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+        Identity ids;
+        put_identity_streets(old_d, new_d, ids);
+        put_identity_addresses(old_d, new_d, ids);
+        put_identity_interps(old_d, new_d, ids);
+        new_d.erase(dropped);
+
+        const RoundTrip r = round_trip(old_d, new_d, ids);
+
+        CHECK(r.mismatches.empty());
+        CHECK(!logged(r, dropped));
+        for (const char* kept : SIDE_FILES)
+            if (kept != dropped) CHECK(logged(r, std::string(kept) + ": parallel delta along "));
+    }
+}
+
+// A side file of no values is its footer alone, which no build writes: the
+// patcher still gives it for a day that has it, from an old day without the
+// file, with an empty one or with values, and takes it as an old file of no
+// values.
+TEST(patch_round_trip_keeps_a_side_file_of_no_values) {
+    const std::vector<char> none, some = bytes_of(std::vector<uint32_t>{5, NO_DATA, 7});
+    REQUIRE(gctest::as_written({{"way_parents.bin", none}}).at("way_parents.bin").size() == 8);
+    const BuildDir without, empty = {{"way_parents.bin", none}}, with = {{"way_parents.bin", some}};
+
+    CHECK(round_trip(without, empty).mismatches.empty());
+    CHECK(round_trip(empty, empty).mismatches.empty());
+    CHECK(round_trip(with, empty).mismatches.empty());
+    CHECK(round_trip(empty, with).mismatches.empty());
+}
+
+// A full dir holds both way pairs, and a pair of no ways is its two footers
+// (8 and 16 bytes): a family without records, which merges as nothing and
+// which the patcher writes again, beside the other pair's day and with both
+// pairs so. A dir gains the footers and loses them, and its first
+// interpolations come and its last go, from and to the footers and from and
+// to no files.
+TEST(patch_round_trip_of_a_dir_with_no_ways_no_interpolations_or_neither) {
+    const BuildDir no_streets = {{"street_ways.bin", {}}, {"street_nodes.bin", {}}};
+    const BuildDir no_interps = {{"interp_ways.bin", {}}, {"interp_nodes.bin", {}}};
+    const BuildDir footers = gctest::as_written(no_interps);
+    REQUIRE(footers.at("interp_ways.bin").size() == 8 && footers.at("interp_nodes.bin").size() == 16);
+    struct Shape {
+        bool streets, interps;
+    };
+    for (const Shape shape : {Shape{true, false}, Shape{false, true}, Shape{false, false}}) {
+        BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+        Identity ids;
+        if (shape.streets) put_identity_streets(old_d, new_d, ids);
+        if (shape.interps) put_identity_interps(old_d, new_d, ids);
+        for (BuildDir* d : {&old_d, &new_d}) {
+            if (!shape.streets) d->insert(no_streets.begin(), no_streets.end());
+            if (!shape.interps) d->insert(no_interps.begin(), no_interps.end());
+        }
+
+        const RoundTrip r = round_trip(old_d, new_d, ids);
+
+        CHECK(r.mismatches.empty());
+        CHECK_EQ(logged(r, "street_ways identity: match=2 replace=1 insert=2 delete=2 moved=1"), shape.streets);
+        CHECK_EQ(logged(r, "interp_ways identity: match=1 replace=1 insert=2 delete=2 moved=1"), shape.interps);
+    }
+
+    const BuildDir without = with_pool(OLD_POOL);
+    BuildDir empty = without, some = without;
+    empty.insert(no_streets.begin(), no_streets.end());
+    empty.insert(no_interps.begin(), no_interps.end());
+    some.insert(no_streets.begin(), no_streets.end());
+    some["interp_ways.bin"] = bytes_of(std::vector<InterpWay>{{0, 2, 0, OLD_B, 1, 9, 0}, {2, 1, 0, OLD_C, 2, 8, 0}});
+    some["interp_nodes.bin"] = nodes_of({1, 2, 3});
+    CHECK(round_trip(without, empty).mismatches.empty());
+    CHECK(round_trip(empty, without).mismatches.empty());
+    CHECK(round_trip(empty, some).mismatches.empty());
+    CHECK(round_trip(some, empty).mismatches.empty());
+    CHECK(round_trip(without, some).mismatches.empty());
+    CHECK(round_trip(some, without).mismatches.empty());
+}
+
+// A full dir holds the address files, and those of no address are three
+// footers (8, 16 and 8 bytes): a family without records, which merges as
+// nothing and which the patcher writes again, beside streets that move. Their
+// moved pairs go in the secondary remap, as in a dir without the files. A dir
+// gains the footers and loses them.
+TEST(patch_round_trip_of_a_full_dir_with_no_addresses) {
+    const BuildDir no_addrs = {{"addr_points.bin", {}}, {"addr_vertices.bin", {}}};
+    const BuildDir footers = gctest::as_written(no_addrs);
+    REQUIRE(footers.size() == 3 && footers.at("addr_points.bin").size() == 8 && footers.at("addr_vertices.bin").size() == 16 &&
+            footers.at("addr_index.bin").size() == 8);
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+    Identity ids;
+    put_identity_streets(old_d, new_d, ids);
+    for (BuildDir* d : {&old_d, &new_d}) d->insert(no_addrs.begin(), no_addrs.end());
+
+    const RoundTrip r = round_trip(old_d, new_d, ids);
+
+    CHECK(r.mismatches.empty());
+    CHECK(logged(r, "street_ways identity: match=2 replace=1 insert=2 delete=2 moved=1"));
+    CHECK(logged(r, "Secondary remap 1: 1 pairs"));
+    CHECK(logged(r, "addr_vertices.bin: full replace 0 bytes"));
+
+    const BuildDir without = with_pool(OLD_POOL);
+    BuildDir empty = without;
+    empty.insert(no_addrs.begin(), no_addrs.end());
+    CHECK(round_trip(empty, empty).mismatches.empty());
+    CHECK(round_trip(without, empty).mismatches.empty());
+    CHECK(round_trip(empty, without).mismatches.empty());
+}
+
+// The footprints merge as the address points' child stream whether or not
+// either day has one, so the day a dir's address points get their first
+// footprint and the day they lose their last have a patch: an
+// addr_vertices.bin of no blob, its footer alone, on one side.
+TEST(patch_round_trip_of_address_points_that_gain_their_first_footprint_or_lose_their_last) {
+    BuildDir points = with_pool(OLD_POOL), footprints = with_pool(OLD_POOL);
+    const AddrPoint a = addr_point(NAME_2, NO_DATA), b = addr_point(NAME_4, NO_DATA);
+    points["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{a, b, a});
+    footprints["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{a, {48.0f, 11.0f, NAME_4, NAME_4, NO_DATA, 0, 3}, a});
+    footprints["addr_vertices.bin"] = footprints_of({{1, 2, 1}});
+    REQUIRE(gctest::as_written(points).at("addr_vertices.bin").size() == addr_files::VERTICES_FOOTER_BYTES);
+    REQUIRE(gctest::as_written(footprints).at("addr_vertices.bin").size() > addr_files::VERTICES_FOOTER_BYTES);
+
+    for (const RoundTrip& r : {round_trip(points, footprints), round_trip(footprints, points)}) {
+        CHECK(r.mismatches.empty());
+        CHECK(logged(r, "  addr_vertices.bin: seq="));
+        CHECK(!logged(r, "addr_vertices.bin: full replace"));
+    }
+}
+
+// The address points of a dir without any merge at another stride than
+// address points do (16 against their 28), so the day a dir gets its first
+// address point or loses its last has no patch: the diff says so, exits 2,
+// writes no patch and leaves nothing in its scratch dir. From and to the
+// three footers, and from and to a dir without the files.
+TEST(patch_diff_refuses_a_dir_that_gains_its_first_address_or_loses_its_last) {
+    const BuildDir without = with_pool(OLD_POOL);
+    BuildDir empty = without, some = without;
+    empty["addr_points.bin"] = {};
+    some["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{addr_point(NAME_2, NO_DATA)});
+    struct Day {
+        std::string name;
+        BuildDir old_d, new_d;
+        std::string said;
+    };
+    ScratchDir dir("patch-diff-first-address");
+    for (const Day& day : {Day{"gains", empty, some, "addr_points: stride mismatch (old=16, new=28)"},
+                           Day{"loses", some, empty, "addr_points: stride mismatch (old=28, new=16)"},
+                           Day{"gains-the-files", without, some, "addr_points: stride mismatch (old=16, new=28)"},
+                           Day{"loses-the-files", some, without, "addr_points: stride mismatch (old=28, new=16)"}}) {
+        const std::string root = dir.path() + "/" + day.name, patch = root + "/p.gcpatch", log = root + "/diff.log";
+        const std::string scratch = root + "/scratch";
+        REQUIRE(write_dir(root + "/old", day.old_d) && write_dir(root + "/new", day.new_d));
+        std::filesystem::create_directories(scratch);
+
+        // The diff's exit status, which the shell compares.
+        const bool exit_2 = run({"env", "TMPDIR=" + scratch, "/bin/sh", "-c", "\"$0\" \"$@\"; test $? -eq 2", GEOCODER_DIFF_BIN,
+                                 root + "/old", root + "/new", "-o", patch},
+                                log);
+
+        const std::vector<char> text = read_file(log);
+        const std::string said(text.begin(), text.end());
+        if (!exit_2) std::printf("    %s: %s\n", day.name.c_str(), said.c_str());
+        CHECK(exit_2);
+        CHECK(said.find(day.said) != std::string::npos);
+        CHECK(!std::filesystem::exists(patch));
+        CHECK(std::filesystem::is_empty(scratch));
+    }
+}
+
+// A dir without street files of its own (an admin or a POI variant) merges
+// no streets, and the diff reads none of the full dir's beside or above it,
+// which are another variant's: under a limit of 3 records a file, a POI dir
+// two levels below a full dir of 40 street ways diffs and round-trips.
+TEST(patch_diff_takes_no_streets_from_a_sibling) {
+    ScratchDir dir("patch-sibling");
+    const std::string& root = dir.path();
+    const std::string old_dir = root + "/old/poi/major", new_dir = root + "/new/poi/major", log = root + "/tools.log";
+    BuildDir full = with_pool(OLD_POOL), old_d, new_d;
+    std::vector<WayHeader> ways;
+    std::vector<int> nodes;
+    for (uint32_t w = 0; w < 40; w++) {
+        ways.push_back({w, 1, 0, NAME_2});
+        nodes.push_back(static_cast<int>(w));
+    }
+    full["street_ways.bin"] = bytes_of(ways);
+    full["street_nodes.bin"] = nodes_of(nodes);
+    old_d["poi_records.bin"] = bytes_of(std::vector<PoiRecord>{poi(NAME_2), poi(NAME_4)});
+    new_d["poi_records.bin"] = bytes_of(std::vector<PoiRecord>{poi(NAME_2), poi(NAME_4), poi(NAME_2)});
+    REQUIRE(write_dir(root + "/old/full", full) && write_dir(root + "/new/full", full));
+    REQUIRE(write_dir(old_dir, old_d) && write_dir(new_dir, new_d));
+
+    const bool diffed = run({GEOCODER_DIFF_BIN, old_dir, new_dir, "-o", root + "/p.gcpatch", "--file-records-max", "3"}, log);
+    const bool patched = diffed && run({GEOCODER_PATCH_BIN, old_dir, root + "/p.gcpatch", "-o", root + "/out"}, log);
+
+    if (!patched) {
+        const std::vector<char> text = read_file(log);
+        std::printf("%s\n", std::string(text.begin(), text.end()).c_str());
+    }
+    CHECK(diffed);
+    CHECK(patched);
+    CHECK(patched && gctest::read_dir(root + "/out") == gctest::as_written(new_d));
+}
+
 // A sidecar that is not one key per record (short, long or missing) is
 // rejected: the log names its family, which merges by content.
 TEST(patch_round_trip_warns_of_each_rejected_identity_sidecar_and_merges_its_family_by_content) {
@@ -941,6 +1662,77 @@ TEST(patch_round_trip_warns_of_each_rejected_identity_sidecar_and_merges_its_fam
     CHECK(logged(r, "old-meta/interp.slot.u32 rejected (0 bytes for 4 records); interp merges by content"));
     CHECK(!logged(r, "old-meta/street.slot.u32"));
     CHECK(!logged(r, " identity: match="));
+}
+
+// geocoder-diff --identity-slots takes the keys of a day built in stable
+// slots from its records, a live record's index and NO_DATA for a tombstone:
+// the patch is the one --identity writes from sidecars of those keys, byte
+// for byte.
+TEST(patch_round_trip_by_slot_identity_gives_the_patch_the_sidecars_gave) {
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+    Identity ids;
+    put_slot_streets(old_d, new_d, ids);
+    put_slot_addresses(old_d, new_d, ids);
+    put_slot_interps(old_d, new_d, ids);
+    put_geo_cells(old_d, {{CELL, {0, 1, 2, 4}, {0, 2, 3, 4}, {0, 1, 2}}, {CELL_2, {2, 4}, {0, 4}, {1}}});
+    put_geo_cells(new_d, {{CELL, {0, 2, 3, 4, 5}, {0, 1, 2, 4}, {0, 1, 3}}, {CELL_2, {2, 4}, {0, 4}, {1}}});
+
+    const RoundTrip by_sidecar = round_trip(old_d, new_d, ids);
+    const RoundTrip by_slot = round_trip(old_d, new_d, {}, {"--identity-slots"});
+
+    for (const RoundTrip* r : {&by_sidecar, &by_slot}) {
+        CHECK(r->mismatches.empty());
+        CHECK(logged(*r, "street_ways identity: match=2 replace=1 insert=3 delete=2 moved=0"));
+        CHECK(logged(*r, "addr_points identity: match=2 replace=1 insert=2 delete=2 moved=0"));
+        CHECK(logged(*r, "interp_ways identity: match=1 replace=1 insert=2 delete=2 moved=0"));
+    }
+    CHECK(!by_slot.patch.empty());
+    CHECK(by_slot.patch == by_sidecar.patch);
+}
+
+// A family a day has no record of has no keys that day: under
+// --identity-slots it merges by content, as it does without its sidecar, and
+// the other families by slot.
+TEST(patch_round_trip_by_slot_identity_merges_a_family_a_day_lacks_by_content) {
+    BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+    Identity ids, interp_ids;
+    put_slot_streets(old_d, new_d, ids);
+    BuildDir no_interps;
+    put_slot_interps(no_interps, new_d, interp_ids);
+    ids.new_keys["interp"] = interp_ids.new_keys["interp"];
+    put_geo_cells(old_d, {{CELL, {0, 1, 2, 4}, {}, {}}});
+    put_geo_cells(new_d, {{CELL, {0, 2, 3, 4, 5}, {}, {0, 1, 3}}});
+
+    const RoundTrip by_sidecar = round_trip(old_d, new_d, ids);
+    const RoundTrip by_slot = round_trip(old_d, new_d, {}, {"--identity-slots"});
+
+    for (const RoundTrip* r : {&by_sidecar, &by_slot}) {
+        CHECK(r->mismatches.empty());
+        CHECK(logged(*r, "street_ways identity: match=2 replace=1 insert=3 delete=2 moved=0"));
+        CHECK(!logged(*r, "interp_ways identity:"));
+        CHECK(!logged(*r, "addr_points identity:"));
+    }
+    CHECK(!by_slot.patch.empty());
+    CHECK(by_slot.patch == by_sidecar.patch);
+}
+
+// The keys come from the sidecars or from the records, never both.
+TEST(patch_diff_refuses_identity_slots_beside_identity_sidecars) {
+    ScratchDir dir("identity-options");
+    const std::string old_dir = dir.path() + "/old", new_dir = dir.path() + "/new", patch = dir.path() + "/p.gcpatch";
+    const std::string log = dir.path() + "/tools.log";
+    REQUIRE(write_dir(old_dir, with_pool(OLD_POOL)) && write_dir(new_dir, with_pool(NEW_POOL)));
+
+    for (const std::vector<std::string>& options : {std::vector<std::string>{"--identity", old_dir, new_dir, "--identity-slots"},
+                                                    std::vector<std::string>{"--identity-slots", "--identity", old_dir, new_dir}}) {
+        std::filesystem::remove(log);
+        std::vector<std::string> diff = {GEOCODER_DIFF_BIN, old_dir, new_dir, "-o", patch};
+        diff.insert(diff.end(), options.begin(), options.end());
+        CHECK(!run(diff, log));
+        const std::vector<char> text = read_file(log);
+        CHECK(std::string(text.begin(), text.end()).find("--identity and --identity-slots both give the keys") != std::string::npos);
+        CHECK(!std::filesystem::exists(patch));
+    }
 }
 
 // The patch path is one argument to the decompressor whatever its
@@ -986,7 +1778,7 @@ TEST(patch_needs_no_zstd_on_path_unless_built_on_the_zstd_cli) {
     CHECK(logged(r, "Failed to decompress"));
 #else
     CHECK(r.ok);
-    CHECK(read_file(root + "/out/way_parents.bin") == bytes_of(new_way_parents()));
+    CHECK(read_file(root + "/out/way_parents.bin") == written_way_parents(new_way_parents()));
 #endif
 }
 
@@ -1019,7 +1811,7 @@ TEST(patch_holds_a_zstd_window_no_larger_than_the_diffs) {
 #endif
         CHECK_EQ(r.ok, !refused);
         if (refused) CHECK(logged(r, "Failed to decompress"));
-        else CHECK(read_file(root + "/" + name + "/way_parents.bin") == bytes_of(new_way_parents()));
+        else CHECK(read_file(root + "/" + name + "/way_parents.bin") == written_way_parents(new_way_parents()));
     }
 }
 
@@ -1064,21 +1856,75 @@ TEST(patch_refuses_a_patch_shorter_than_its_magic) {
 }
 
 // A sparse delta's change at its file's last record applies: the patcher
-// refuses records past the end, not the last one.
+// refuses records past the end, not the last one. The value moves from one
+// block of the file to another and with it the bits a value of each takes, so
+// the patch lists the size of the file the edit gives.
 TEST(patch_applies_a_sparse_delta_change_at_the_last_record) {
     ScratchDir dir("patch-sparse");
     SparsePatch p = diff_way_parents(dir.path());
     REQUIRE(!p.raw.empty());
-    p.set_last_pos(SPARSE_RECORDS - 1);
-
-    auto r = apply_raw(dir.path(), p.raw, "out");
-
     auto want = new_way_parents();
     const auto [last_pos, last_id] = SPARSE_CHANGES[std::size(SPARSE_CHANGES) - 1];
     want[last_pos] = old_way_parents()[last_pos];
     want[SPARSE_RECORDS - 1] = last_id;
+    REQUIRE(written_way_parents(want).size() != written_way_parents(new_way_parents()).size());
+    p.set_last_pos(SPARSE_RECORDS - 1);
+    p.set_listed_size(written_way_parents(want).size());
+
+    auto r = apply_raw(dir.path(), p.raw, "out");
+
     CHECK(r.ok);
-    CHECK(read_file(dir.path() + "/out/way_parents.bin") == bytes_of(want));
+    CHECK(read_file(dir.path() + "/out/way_parents.bin") == written_way_parents(want));
+}
+
+// The diff reads a side file as side blocks and as nothing else: one of bare
+// u32s is refused by name, and no patch is written.
+TEST(patch_diff_refuses_a_side_file_that_is_not_side_blocks) {
+    ScratchDir dir("patch-diff-side");
+    const std::string& root = dir.path();
+    const std::string patch = root + "/p.gcpatch", log = root + "/tools.log";
+    const BuildDir day = {{"way_parents.bin", bytes_of(std::vector<uint32_t>{5, 6, 7, 8})}};
+    REQUIRE(write_dir(root + "/old", day) && write_dir(root + "/new", day));
+    REQUIRE(write_file(root + "/new/way_parents.bin", day.at("way_parents.bin")));
+
+    CHECK(!run({GEOCODER_DIFF_BIN, root + "/old", root + "/new", "-o", patch}, log));
+
+    const std::vector<char> text = read_file(log);
+    CHECK(std::string(text.begin(), text.end()).find("Malformed way_parents.bin: no SDB1 in its footer") != std::string::npos);
+    CHECK(!std::filesystem::exists(patch));
+}
+
+// A side file's size on disk follows its values' widths, its section their
+// count: the client file list gives the file's size on disk, which the
+// patcher holds its output to, and the section the old and the new values'
+// logical bytes, 4 a value, which it holds the old file's values to.
+TEST(patch_lists_a_side_file_at_its_encoded_size_and_sends_its_section_at_its_logical_size) {
+    ScratchDir dir("patch-side-sizes");
+    const std::string& root = dir.path();
+    const uint64_t logical = uint64_t{SPARSE_RECORDS} * 4, written = written_way_parents(new_way_parents()).size();
+    REQUIRE(written != logical);
+    // The section and the list's entry, found by those sizes.
+    SparsePatch p = diff_way_parents(root);
+    REQUIRE(!p.raw.empty());
+    const size_t old_size_at = p.new_size_at - 8;
+
+    auto r = apply_raw(root, p.raw, "out");
+    CHECK(r.ok);
+    CHECK(read_file(root + "/out/way_parents.bin") == written_way_parents(new_way_parents()));
+
+    SparsePatch listed_logical = p;
+    listed_logical.set_listed_size(logical);
+    r = apply_raw(root, listed_logical.raw, "listed-logical");
+    CHECK(!r.ok);
+    CHECK(logged(r, "Output size mismatch: way_parents.bin is " + std::to_string(written) + " bytes, the patch lists " +
+                        std::to_string(logical)));
+
+    SparsePatch old_written = p;
+    put_at(old_written.raw, old_size_at, static_cast<uint64_t>(written_way_parents(old_way_parents()).size()));
+    r = apply_raw(root, old_written.raw, "old-written");
+    CHECK(!r.ok);
+    CHECK(logged(r, "old way_parents.bin decodes to " + std::to_string(logical) + " bytes, the patch expects " +
+                        std::to_string(written_way_parents(old_way_parents()).size())));
 }
 
 // A change writes its record whole, so a sparse delta whose new size ends in

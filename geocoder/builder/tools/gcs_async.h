@@ -154,7 +154,6 @@ struct AsyncEnc {
     Encoder* inner;
     std::vector<ByteQueue> ring;
     std::vector<int> closed, closed_seen;
-    std::vector<uint64_t> got;
     std::mutex mu;
     std::condition_variable cv_writer, cv_worker;
     std::thread worker;
@@ -162,7 +161,7 @@ struct AsyncEnc {
     std::string error;
     double cpu_s = 0;
 
-    explicit AsyncEnc(Encoder* e) : inner(e), ring(e->in.size()), closed(e->in.size(), 0), closed_seen(e->in.size(), 0), got(e->in.size(), 0) {}
+    explicit AsyncEnc(Encoder* e) : inner(e), ring(e->in.size()), closed(e->in.size(), 0), closed_seen(e->in.size(), 0) {}
     // A run that fails with a file still open: the worker stops without draining.
     ~AsyncEnc() {
         {
@@ -195,12 +194,13 @@ struct AsyncEnc {
                     }
                 }
                 cv_writer.notify_all();
+                // A file is closed once its last bytes are in, before the bytes of the files after
+                // it: bytes that come for a unit of a closed file are refused as they come.
                 for (size_t p = 0; p < take.size(); p++) {
                     if (take[p].size()) inner->write(int(p), take[p].data(), take[p].size());
                     take[p].pop(take[p].size());
-                }
-                for (size_t p = 0; p < newly.size(); p++)
                     if (newly[p]) inner->state[p] = 2;
+                }
                 inner->pump();
                 if (all) break;
             }
@@ -232,7 +232,6 @@ struct AsyncEnc {
         cv_writer.wait(lk, [&] { return done || q.size() == 0 || q.size() + n <= RING_CAP; });
         if (!error.empty() || done) die("%s (encoder thread)", error.empty() ? "encoder stopped" : error.c_str());
         q.push(p, n);
-        got[size_t(port)] += n;
         cv_worker.notify_one();
     }
     // Returns true when every file is closed: the worker has then drained everything and stopped.

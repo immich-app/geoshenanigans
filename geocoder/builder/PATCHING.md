@@ -51,10 +51,12 @@ Most of the old bytes were bookkeeping the patcher can derive:
 
 ### GCPATCH v8 on planet (2026-10-11 → 12 and 10-12 → 13)
 
-v8 matches street / interp / addr records across days by a server-side
-identity sidecar instead of by content (`geocoder-diff --identity`; on the
-published stable-slot days the key is the slot, see
-`tools/gen_identity_sidecar.py`). Measured 2026-10-14 on planet/full of the
+v8 matches street / interp / addr records across days by one stable entity
+key per record instead of by content. On the published stable-slot days the
+key is the slot: `geocoder-diff --identity-slots` takes it from the records,
+a live record's index and none for a tombstone (`tools/identity_sidecar.h`).
+`geocoder-diff --identity` reads the keys from sidecar files instead, one u32
+per record. Measured 2026-10-14 on planet/full of the
 published days against the nightly's v7 patches (cold cache, `geocoder-patch`
 on 1 core, every apply byte-identical to the new day):
 
@@ -64,11 +66,12 @@ on 1 core, every apply byte-identical to the new day):
 | 10-11 → 12 | 2.78 MiB | **2.46 MiB** (−11.6%) | 209 s | **165 s** (−21%) | 390 s / 36.7 GiB | 211 s / 24.9 GiB |
 
 planet/quality/uncapped and planet/poi/all patch to within a few bytes of v7
-(no street / interp / addr records). Without `--identity` the families merge
+(no street / interp / addr records). Without either option the families merge
 by content as in v7, with the rest of the v8 format. The nightly diffs every
-variant by identity: `tools/generate_patches.sh` writes both days' sidecars
-(each day is built with `--prev-output` from the last), and the diff warns of
-a sidecar it rejects, naming the family that then merges by content.
+variant by slot: `tools/generate_patches.sh` passes `--identity-slots` (each
+day is built with `--prev-output` from the last). A family one of the days
+has no record of merges by content, and so does one whose `--identity`
+sidecar the diff rejects, with a warning that names it.
 
 The tables below predate all of these changes.
 
@@ -148,29 +151,50 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
 - **geocoder-diff** (`tools/geocoder_diff.cpp`): Compares two builds, produces `.gcpatch`. The
   POI files are R2 records and V2 polygon blocks on disk (`src/poi_files.h`); the diff decodes both
   days' into their logical form (today's 36-byte records and vertex stream) and merges those.
+  The street and the interpolation ways are way files on disk (`src/way_files.h`), a rows file and
+  a file of node blocks a kind; the diff decodes each pair a dir holds into its logical form
+  (today's 12- and 24-byte records and their nodes, 8 bytes each) and merges those. A dir without
+  street files of its own merges no streets: no other dir's are read for it.
+  The address points and their footprints are the address files on disk (`src/addr_files.h`):
+  blocks of 16 records in `addr_points.bin`, a blob a footprint in `addr_vertices.bin`, and
+  `addr_index.bin`, which places both; the diff decodes the three into their logical form
+  (today's 28-byte records and their footprints' vertex blocks back to back) and merges those,
+  and the patch lists `addr_index.bin` with no section of its own. Address files of no address
+  are three footers, which merge as a dir without the files does; a dir that gets its first
+  address point or loses its last has no patch (the diff says so and exits 2).
   The string tiers are FCC2 files, front-coded buckets cut by content (`src/string_files.h`);
-  the diff decodes each tier it reads into its pool and diffs the pools
+  the diff decodes each tier it reads into its pool and diffs the pools.
+  The four per-record side files (`way_parents.bin`, `way_postcodes.bin`, `interp_postcodes.bin`,
+  `addr_postcodes.bin`) are side blocks on disk (`src/side_blocks.h`); the diff decodes each into
+  its u32 values, and a side file's section carries those: its sizes are 4 bytes a value, and a
+  file the old day lacks goes as a full replacement of its values.
+  `geocoder-diff --decode-logical DIR OUT` writes the logical files it would read of DIR's way,
+  address, POI, place and side files into OUT, a new or empty dir, and no patch.
+  `geocoder-diff --logical-size DIR` prints the bytes a diff maps for DIR's record files and the
+  bytes it writes to scratch for DIR, from file sizes and footers alone;
+  `tools/generate_patches.sh` starts its diffs and verifies by them, within a memory budget and
+  the free space of the scratch volume (see its header)
 - **geocoder-patch** (`tools/geocoder_patch.cpp`): Applies patch, produces new build. It links
   the static libzstd (`libzstd.a`) and decompresses the patch in process;
   `cmake -DGEOCODER_PATCH_LIBZSTD=OFF` builds it on the `zstd` command on PATH instead, for a host
   without libzstd
 - **patch_format.h** (`tools/patch_format.h`): Shared format definitions + rebuild functions
-- **geocoder-gc** (`tools/gc.cpp`, `tools/gc_*.h`): Encodes a variant dir into the compact installed
-  set (the encoded files and a `gc.manifest`) and decodes one back to today's files, byte for byte,
-  each into a new or empty dir. The POI files are compact in every dir, and it links them as they
-  are
 - **gcs_\*.h** (`tools/gcs_patch.h`, `gcs_codec.h`, `gcs_io.h`, `gcs_async.h`): geocoder-patch's
   in-process codecs. The POI files are decoded and their new ones encoded in every dir (one record
-  and one polygon in flight; a polygon past 256 KiB a piece at a time). In low-memory mode, when
-  the old dir is an encoded installed set (a `gc.manifest` beside the files, as geocoder-gc writes
-  it), gc's families too, and the output is the new encoded set, geocoder-gc's encoding of the new
-  dir. An encoded family's records and their child stream replay together; `--threads` gives each
-  codec a thread
+  and one polygon in flight; a polygon past 256 KiB a piece at a time), and so are the way files
+  (one way and its nodes in flight, 512 KiB of them at most), the address files (a block of 16
+  records, an index row and one footprint in flight, 256 KiB of it at most; an escaped footprint,
+  of any size, a piece at a time) and the side files (a block of 64 values in flight, the new
+  file's block table in a scratch file beside it until the file is closed). An encoded family's
+  records and their child stream replay together; a family whose every section a patch sends as
+  unchanged goes through no codec: its files are copied from the old dir as they sit, those no
+  section names with them. A way pair a patch changes replays on its two files as they sit: the
+  node blocks of the groups a day leaves whole are copied, the others decoded and encoded a way
+  at a time (see the old file hash below). `--threads` gives each codec a thread
 
 ### Patcher memory and speed
 
-geocoder-patch's own memory doesn't grow with the data or the patch, in either mode. Three rules
-keep it so:
+geocoder-patch's own memory doesn't grow with the data or the patch. Three rules keep it so:
 
 - **Lists are ascending and read in place.** Every list in a patch that grows with the data is
   read where it sits in the decompressed patch, which the patcher maps, and none is copied whole:
@@ -197,15 +221,26 @@ keep it so:
   (MAX_RECORD_STRIDE), 0xFFFFFFFE records in a merged file (FILE_RECORDS_MAX), secondary remap
   pairs for the five remapped record files only, 0xFFFF ids in the lost and in the gained runs
   over a cell of a cell list delta (v15: 8 bytes an id, so 512 KiB each, however many runs),
-  a child stream at most 4 MiB ahead of its parent (MAX_DECODER_SKEW), fewer than 0xFFFF values
-  in a `.dict`, and, on the `zstd` command, an 8 MiB zstd window (PATCH_ZSTD_WINDOW_LOG). The
-  encoders take what they're given in pieces of at most 64 KiB (ENCODER_PIECE).
+  a child stream at most 4 MiB ahead of its parent (MAX_DECODER_SKEW), and, on the `zstd`
+  command, an 8 MiB zstd window (PATCH_ZSTD_WINDOW_LOG). The encoders take what they're given
+  in pieces of at most 64 KiB (ENCODER_PIECE).
 
 The heap tests in `tests/test_patch_lowmem.cpp` hold the patcher to these rules: each grows one
-structure tenfold, applies the patch in plain, low-memory and `--threads` mode, and fails when
-the output differs or the heap peak grows by more than 256 KiB (HEAP_GROWTH_SLACK).
+structure tenfold, applies the patch with the codecs in the patcher's thread and with
+`--threads`, and fails when the output differs or the heap peak grows by more than 256 KiB
+(HEAP_GROWTH_SLACK).
 
-Measured on planet from 2026-10-18 to 10-19 (GCPATCH v12), for a normal day and for the
+Measured on planet from 2026-10-18 to 10-19 with GCPATCH v17 (2026-11-15), where the street,
+interpolation and address files are the packed ones and the patcher has one mode: over every
+one of the 90 variant dirs, with the codecs in the patcher's thread and with `--threads`, no
+run's heap peaks above 2.09 MiB or its anonymous memory above 2.08 MiB. One run at a time, one
+core, cold cache: planet/full 122.4 s (137.7 s in a 32 MiB limit), planet/no-addresses 54.2 s,
+planet/poi/all 8.2 s, planet/admin 1.3 s. On the same days the v16 tools take 103.4 s for
+planet/full on the fixed-width files (310.0 s in 32 MiB) and 156.3 s on the encoded set.
+
+The figures below are GCPATCH v12's, when the patcher had two modes: plain, on the files as the
+builder wrote them, and low-memory, on a set `geocoder-gc` had encoded. They were measured on
+the same days, for a normal day and for the
 transition (the first patch after POI names went into record order, which moves 12.8M of
 planet/poi/all's strings), every one of the 126 variant dirs in both modes: no run's heap peaks
 above 2.11 MiB or its anonymous memory (sampled every 20 ms) above 2.12 MiB, and no transition
@@ -401,7 +436,7 @@ v8 data patch that day; applying the delta also needs memory for the whole
 old file (1.0 GB for poi.fst). Rebuilding costs no download and two to three
 and a half minutes of one core.
 
-## Patch Format (.gcpatch, version 15)
+## Patch Format (.gcpatch, version 17)
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
 pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
@@ -411,8 +446,8 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=15 (u32) + flags=0 (u32)
-  (a v15 patcher accepts only v15 patches; the v8 to v15 changes are marked
+Header: "GCPATCH\0" (8) + version=17 (u32) + flags=0 (u32)
+  (a v17 patcher accepts only v17 patches; the v8 to v17 changes are marked
   below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
@@ -473,23 +508,75 @@ Parent-id remap: marker 0xFFFFFFF3 (u32)
   street_ways pairs as well is refused. At most one such section: the
   patcher refuses a second ("Malformed POI parent-id remap: a second one").
 
-Old POI vertices' hash: marker 0xFFFFFFF8 (u32) + lane_hash of the old
-  poi_vertices.bin file (u64; `tools/patch_format.h`), right before the POI records' section of a dir
-  with POI files. The patcher replays the POI records and their blocks on R2
+Old file hash: marker 0xFFFFFFF8 (u32) + file_id (u32) + lane_hash of the
+  old file as the dir holds it (u64; `tools/patch_format.h`), before the
+  section of the file's parent records. (v17: the section names its file;
+  before, it was the old poi_vertices.bin's alone and had no file id.) One
+  for each file a replay copies from without decoding it, or takes the
+  values such bytes are copied under from, when the old dir holds the file
+  and its family has a section: `poi_records.bin` (14) and
+  `poi_vertices.bin` (15), in that order right before the POI records'
+  section of a dir with POI files, and `addr_points.bin` (3) and
+  `addr_vertices.bin` (28), in that order right before the address points'
+  section of a dir with address points. The patcher
+  refuses a second hash of a file, a hash of any other file, and a replay
+  without the hashes it checks by. A family both of whose sections are
+  unchanged is copied as its files sit, and POI records sent unchanged over
+  blocks that change go through the codecs: the patcher holds each hashed
+  file of such a family to its hash before it reads it ("Old poi_records.bin
+  is not the one the patch was made from"). The hash of an old file without
+  records is read and checks nothing. The patcher replays the POI records and their blocks on R2
   and V2 as they sit (`tools/poi_replay.h`): a new record whose polygon is
   the old record's, one MATCH of its block's logical bytes, at the same lat
   and lng, gets that block as it is (a V2 block is a function of its polygon
   and its record's lat and lng alone); every other polygon is decoded from
   the old file (the blocks asked for alone) and encoded again, and every row
   decoded and encoded again (its string ids move). The copied blocks are
-  never decoded: the replay hashes the old file as it passes it and refuses
-  one of another hash ("Old poi_vertices.bin is not the one the patch was
-  made from"), and a POI records section without the hash before it.
+  never decoded, and the rows they are copied under are rows like any other
+  whatever their lat and lng: the replay hashes both old files as it passes
+  them and refuses one of another hash ("Old poi_records.bin is not the one
+  the patch was made from", "Old poi_vertices.bin is not the one the patch
+  was made from"), and a POI records section without both hashes before it.
+  The two files of each way pair are hashed too (`street_ways.bin` (1) and
+  `street_nodes.bin` (2), `interp_ways.bin` (4) and `interp_nodes.bin` (5)),
+  their two hashes right before the ways' section of a dir with such ways.
+  The patcher replays a pair on its files as they sit
+  (`tools/way_replay.h`): a new group of 16 ways whose ways have, way for
+  way, the node counts of the old group the replay is at, and whose nodes
+  are one MATCH of that group's, gets that group's node blocks as they are
+  (a group's blocks are a function of its ways' nodes alone), its row
+  written with the old anchor, counts and codes and the new names and
+  numbers; every other group is encoded again, the old nodes it keeps
+  decoded from their blocks alone. Neither the copied blocks nor the rows
+  they go with are checked by a decoder: the replay hashes both old files
+  as it passes them and refuses one of another hash ("Old street_nodes.bin
+  is not the one the patch was made from"), and a pair it would replay
+  without both hashes.
+  The address points and their footprints replay the same way on the address
+  files as they sit (`tools/addr_replay.h`), whenever one of their two
+  sections changes (the other then reads as one MATCH of all of it): a new
+  record that is the old record at its place (a MATCH or a REPLACE of it)
+  with its lat, lng and vertex count, whose footprint is one MATCH of the old
+  blob's logical bytes, gets that blob as it is (a blob is a function of its
+  footprint and its record's lat and lng alone), an escape in pieces; every
+  other footprint is encoded again, its old bytes decoded from the old blob
+  the replay is at, from one it passed last, or by a second decoder of the
+  old files; and every block is decoded and encoded again (its ids move).
+  A copied blob goes under its old record's point as the old
+  `addr_points.bin` gives it, and a block that decodes to other records is
+  still a block the encoder writes, so the replay hashes both old files as
+  it passes them, `addr_points.bin` a block at a time as it decodes it, and
+  refuses one of another hash ("Old addr_points.bin is not the one the patch
+  was made from", "Old addr_vertices.bin is not the one the patch was made
+  from"), and address points without both hashes before them.
 
 Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64) + ...
   (the patcher refuses an old file of another size, 0 meaning absent)
   stride=0: full replacement (n_fixups=0 u32, size u64, data)
-  stride=0xFD: unchanged, copy from cur_dir
+  stride=0xFD: unchanged, copy from cur_dir (a file of an encoded family is unchanged in its
+    logical form: the patcher copies the family's files when each of its sections is 0xFD, and
+    else replays this one as a MATCH of every record). new_size is old_size, and the patcher
+    refuses any other ("Malformed copy-old section")
   stride=0xFC: sparse delta (value_stride, remap_kind, n, [(pos, value)] × n;
     remap_kind 0 raw, 2 a string offset, 3 a postcode centroid, as its file's
     row of SPARSE_DELTA_FILES gives it, and the patcher refuses any other.
@@ -525,11 +612,16 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   position: its MATCH bytes are the old bytes of the parent records at the
   same places, a MATCH or REPLACE record's own or, where a DELETE run is
   followed by an INSERT run, the deleted record's for the inserted one at the
-  same place in the run. An encoded family (the POI files in every dir,
-  gc's in low-memory mode) decodes both files from one stream, and the
-  patcher refuses a replay that reads one of them 4 MiB
+  same place in the run. An encoded family replayed through its codecs (the
+  POI files when only their blocks change) decodes both files from one stream,
+  and the patcher refuses a replay that reads one of them 4 MiB
   (MAX_DECODER_SKEW) ahead of the other ("Malformed merge sequence: <file>
-  runs ahead of <file>").
+  runs ahead of <file>"); the way pairs, the address files and the POI files,
+  replayed on their files as they sit, read each file on its own. Its encoder takes a record
+  once its child bytes are in, and refuses bytes of one file that wait for
+  the other's once that file is closed ("<family>: N bytes left over on input
+  k") or once they pass 1 MiB (MAX_ENCODER_SKEW; "<family>: input k runs N
+  bytes ahead of input j"): the bytes of a child section without its records.
   Offset fixups (node_offset / vertex_offset of MATCH records, see
   OffsetFixups in tools/patch_format.h): runs of varint (records skipped since
   the previous run, run length, zigzag change of the shift); the patcher adds
@@ -542,8 +634,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   over, the runs and values it didn't reach (a deleted or replaced record's)
   lie within the old file's records, and no byte follows the last of either.
   The patcher refuses anything else ("Malformed offset fixups"). A child
-  stream carries none: the low-memory mode refuses a count or a byte of them
-  there ("Encoded set: a child stream with offset fixups"). The diff refuses
+  stream carries none: the patcher refuses a count or a byte of them there
+  ("Encoded family: a child stream with offset fixups"). The diff refuses
   a merge whose offset fixups would pass the header's u32s, or move a record
   past the last u32 record index ("Offset fixups of <file>: ..."), so the
   patcher leaves the offset of a record at or past 0xFFFFFFFF as it is.
@@ -557,8 +649,8 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   fixup for a slot the replay passes without matching (a deleted or replaced
   record's), one left over at the end, and bytes past the last ("Malformed
   string fixups"). A file without string fields carries 0 and 0; the
-  low-memory mode refuses anything else in a child stream ("Encoded set: a
-  child stream with string fixups"). The diff refuses a merge whose fixups
+  patcher refuses anything else in a child stream ("Encoded family: a child
+  stream with string fixups"). The diff refuses a merge whose fixups
   would pass the header's u32s, or skip more slots between two than a varint
   holds ("String fixups of <file>: more than ...").
 
@@ -702,6 +794,9 @@ COPY_OLD never stands for an empty file.
 | Patch peak anonymous memory (plain / low-memory) | **0.83 / 1.61 MiB** | **0.66 / 1.84 MiB** |
 
 Measured from 2026-10-18 to 10-19 with GCPATCH v12; see "Patcher memory and speed" above.
+With GCPATCH v17 and the packed street, interpolation and address files (2026-11-15, the same
+days): planet `full` takes 122 s, 138 s in a 32 MiB limit, and no variant's patch more than
+2.08 MiB of anonymous memory.
 
 One deterministic `build-index` run writes the planet and every continent in
 about 5 minutes on 64 cores, and `geocoder-diff` makes the patches of all the

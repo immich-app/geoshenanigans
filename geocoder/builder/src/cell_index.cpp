@@ -31,11 +31,11 @@
 #include "polygon_rings.h"
 #include "postcode_validation.h"
 #include "ranked_bits.h"
+#include "record_files_io.h"
 #include "s2_helpers.h"
 #include "strategy2_remap.h"
 #include "string_files.h"
 #include "string_subset.h"
-#include "vertex_pack.h"
 #include "write_schedule.h"
 
 #include <s2/s2latlng.h>
@@ -166,11 +166,7 @@ static std::vector<uint32_t> apply_strategy2_streets(ParsedData& data, const std
     }
 
     // Reorder data.ways into a tombstoned dense layout indexed by remap[i].
-    WayHeader tomb_way{};
-    tomb_way.node_offset = 0;
-    tomb_way.node_count  = 0;
-    tomb_way.name_id     = NO_DATA;
-    reorder_by_remap(data.ways, remap, n_new, tomb_way);
+    reorder_by_remap(data.ways, remap, n_new, street_way_tombstone());
     reorder_by_remap(data.way_osm_ids, remap, n_new, int64_t(0));
     // Build-time only, and already dropped by the string-tier pass.
     if (!data.way_orig_name_ids.empty()) reorder_by_remap(data.way_orig_name_ids, remap, n_new, NO_DATA);
@@ -303,11 +299,7 @@ static void apply_strategy2_addrs(ParsedData& data, const std::string& prev_dir)
         return;
     }
 
-    AddrPoint tomb_addr{};
-    std::memset(&tomb_addr, 0, sizeof(tomb_addr));
-    tomb_addr.parent_way_id = NO_DATA;
-    tomb_addr.vertex_offset = NO_DATA;
-    reorder_by_remap(data.addr_points, remap, n_new, tomb_addr);
+    reorder_by_remap(data.addr_points, remap, n_new, addr_point_tombstone());
     reorder_by_remap(data.addr_osm_ids, remap, n_new, uint64_t(0));
     if (!data.addr_postcode_ids.empty()) reorder_by_remap(data.addr_postcode_ids, remap, n_new, NO_DATA);
 
@@ -387,13 +379,10 @@ static void apply_strategy2_interps(ParsedData& data, const std::string& prev_di
         return;
     }
 
-    InterpWay tomb_iw{};
-    std::memset(&tomb_iw, 0, sizeof(tomb_iw));
-    tomb_iw.street_id = NO_DATA;
     // Strict parallel-array gate, matching reorder_deterministically: a
     // desynced sidecar is skipped whole rather than partially copied.
     const bool have_pc = (data.interp_postcode_ids.size() == n_old);
-    reorder_by_remap(data.interp_ways, remap, n_new, tomb_iw);
+    reorder_by_remap(data.interp_ways, remap, n_new, interp_way_tombstone());
     reorder_by_remap(data.interp_osm_ids, remap, n_new, uint64_t(0));
     if (have_pc) reorder_by_remap(data.interp_postcode_ids, remap, n_new, NO_DATA);
 
@@ -634,10 +623,9 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
 
     std::vector<std::future<void>> write_futures;
     if (write_streets) {
+        // street_ways.bin and street_nodes.bin (way_files.h).
         write_futures.push_back(std::async(std::launch::async, [&] {
-            write_binary_file(output_dir + "/street_ways.bin",
-                              reinterpret_cast<const char*>(data.ways.data()),
-                              data.ways.size() * sizeof(WayHeader));
+            write_way_files(output_dir, data.ways, data.street_nodes);
         }));
         // Strategy-2 sidecar (cached only — workflow excludes *.osm_ids
         // from user-facing upload). If apply_strategy2_remaps ran,
@@ -657,17 +645,10 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             emit_strategy2_sidecar(output_dir + "/street_ways.osm_ids",
                                     data.way_sidecar_blob, packed_fallback);
         }));
-        write_futures.push_back(std::async(std::launch::async, [&] {
-            write_binary_file(output_dir + "/street_nodes.bin",
-                              reinterpret_cast<const char*>(data.street_nodes.data()),
-                              data.street_nodes.size() * sizeof(NodeCoord));
-        }));
         // Way parent chain (parallel array indexed by way_id)
         if (!data.way_parent_ids.empty()) {
             write_futures.push_back(std::async(std::launch::async, [&] {
-                write_binary_file(output_dir + "/way_parents.bin",
-                                  reinterpret_cast<const char*>(data.way_parent_ids.data()),
-                                  data.way_parent_ids.size() * sizeof(uint32_t));
+                write_side_file(output_dir, "way_parents.bin", data.way_parent_ids, "street_ways.bin", data.ways.size());
             }));
         }
         // Admin parent chain (parallel array indexed by polygon_id), empty
@@ -681,75 +662,17 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
         // Per-way postcode (parallel array indexed by way_id)
         if (!data.way_postcode_ids.empty()) {
             write_futures.push_back(std::async(std::launch::async, [&] {
-                write_binary_file(output_dir + "/way_postcodes.bin",
-                                  reinterpret_cast<const char*>(data.way_postcode_ids.data()),
-                                  data.way_postcode_ids.size() * sizeof(uint32_t));
+                write_side_file(output_dir, "way_postcodes.bin", data.way_postcode_ids, "street_ways.bin", data.ways.size());
             }));
         }
         if (write_addresses) {
-            // Pack addr_point polygon footprints with the same encoding
-            // scheme used for admin/POI vertices.  Most addr_points are
-            // single-coord (vertex_count == 0) and contribute nothing
-            // to the byte stream; the ~5% with building footprints get
-            // a 10-byte header + delta-encoded vertices.  Cuts the
-            // 5 GB planet addr_vertices.bin to ~2.5 GB.
+            // addr_points.bin, addr_vertices.bin and addr_index.bin
+            // (addr_files.h): the three footers in a region without
+            // addresses.
             write_futures.push_back(std::async(std::launch::async, [&] {
                 auto _at = std::chrono::steady_clock::now();
                 auto _ac = CpuTicks::now();
-                // Point address, polygon footprint missing, or out-of-range
-                // index (defends against caller passing addr_points without
-                // matching addr_vertices) all pack as points.
-                auto footprint = [&](const AddrPoint& ap) -> const NodeCoord* {
-                    if (ap.vertex_count == 0 || ap.vertex_offset == NO_DATA
-                        || (size_t)ap.vertex_offset + ap.vertex_count > data.addr_vertices.size())
-                        return nullptr;
-                    return &data.addr_vertices[ap.vertex_offset];
-                };
-                // Packed and written a slice at a time: the packed copies
-                // run to 8.7 GB on planet.
-                constexpr size_t kPointsPerSlice = size_t(1) << 16;
-                struct Slice {
-                    std::vector<AddrPoint> points;
-                    std::vector<uint8_t> bytes;
-                };
-                const std::string points_path = output_dir + "/addr_points.bin";
-                const std::string bytes_path = output_dir + "/addr_vertices.bin";
-                std::ofstream points_file(points_path, std::ios::binary);
-                std::ofstream bytes_file(bytes_path, std::ios::binary);
-                parallel_prefix_stream(data.addr_points.size(), kPointsPerSlice,
-                    [&](size_t i) -> size_t {
-                        const AddrPoint& ap = data.addr_points[i];
-                        const NodeCoord* verts = footprint(ap);
-                        return verts ? plan_polygon(verts, ap.vertex_count).bytes : 0;
-                    },
-                    [&](size_t begin, size_t end, size_t offset, size_t bytes) {
-                        Slice out;
-                        out.points.resize(end - begin);
-                        out.bytes.resize(bytes);
-                        size_t at = 0;
-                        for (size_t i = begin; i < end; i++) {
-                            AddrPoint ap = data.addr_points[i];
-                            if (const NodeCoord* verts = footprint(ap)) {
-                                ap.vertex_offset = static_cast<uint32_t>(offset + at);
-                                at += pack_polygon_at(out.bytes.data() + at, verts, ap.vertex_count);
-                            } else {
-                                ap.vertex_offset = NO_DATA;
-                                ap.vertex_count = 0;
-                            }
-                            out.points[i - begin] = ap;
-                        }
-                        return out;
-                    },
-                    [&](Slice&& slice) {
-                        points_file.write(reinterpret_cast<const char*>(slice.points.data()),
-                                          static_cast<std::streamsize>(slice.points.size() * sizeof(AddrPoint)));
-                        bytes_file.write(reinterpret_cast<const char*>(slice.bytes.data()),
-                                         static_cast<std::streamsize>(slice.bytes.size()));
-                    }, 0, parallel_threads());
-                points_file.flush();
-                if (!points_file) throw std::runtime_error("failed to write " + points_path);
-                bytes_file.flush();
-                if (!bytes_file) throw std::runtime_error("failed to write " + bytes_path);
+                write_addr_files(output_dir, data.addr_points, data.addr_vertices);
                 emit_strategy2_sidecar(output_dir + "/addr_points.osm_ids",
                                         data.addr_sidecar_blob, data.addr_osm_ids);
                 log_phase((label + "addr points").c_str(), _at, _ac);
@@ -757,30 +680,23 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             // Per-addr postcode (optional separate file, parallel to addr_points)
             if (!data.addr_postcode_ids.empty()) {
                 write_futures.push_back(std::async(std::launch::async, [&] {
-                    write_binary_file(output_dir + "/addr_postcodes.bin",
-                                      reinterpret_cast<const char*>(data.addr_postcode_ids.data()),
-                                      data.addr_postcode_ids.size() * sizeof(uint32_t));
+                    write_side_file(output_dir, "addr_postcodes.bin", data.addr_postcode_ids, "addr_points.bin",
+                                    data.addr_points.size());
                 }));
             }
+            // interp_ways.bin and interp_nodes.bin (way_files.h): the two
+            // footers in a region without interpolations.
             write_futures.push_back(std::async(std::launch::async, [&] {
-                write_binary_file(output_dir + "/interp_ways.bin",
-                                  reinterpret_cast<const char*>(data.interp_ways.data()),
-                                  data.interp_ways.size() * sizeof(InterpWay));
+                write_way_files(output_dir, data.interp_ways, data.interp_nodes);
                 emit_strategy2_sidecar(output_dir + "/interp_ways.osm_ids",
                                         data.interp_sidecar_blob, data.interp_osm_ids);
             }));
             if (!data.interp_postcode_ids.empty()) {
                 write_futures.push_back(std::async(std::launch::async, [&] {
-                    write_binary_file(output_dir + "/interp_postcodes.bin",
-                                      reinterpret_cast<const char*>(data.interp_postcode_ids.data()),
-                                      data.interp_postcode_ids.size() * sizeof(uint32_t));
+                    write_side_file(output_dir, "interp_postcodes.bin", data.interp_postcode_ids, "interp_ways.bin",
+                                    data.interp_ways.size());
                 }));
             }
-            write_futures.push_back(std::async(std::launch::async, [&] {
-                write_binary_file(output_dir + "/interp_nodes.bin",
-                                  reinterpret_cast<const char*>(data.interp_nodes.data()),
-                                  data.interp_nodes.size() * sizeof(NodeCoord));
-            }));
         }
     }
     // Per-tier strings files, FCC2 (string_files.h). Each mode writes the tiers its records can

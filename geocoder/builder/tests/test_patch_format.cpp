@@ -381,15 +381,38 @@ TEST(patch_format_section_marker_values) {
     CHECK_EQ(SECONDARY_REMAP_MARKER, uint32_t(0xFFFFFFF6));
     CHECK_EQ(POI_PARENT_REMAP_MARKER, uint32_t(0xFFFFFFF3));
     CHECK_EQ(CLIENT_FILES_MARKER, uint32_t(0xFFFFFFF2));
+    CHECK_EQ(OLD_FILE_HASH_MARKER, uint32_t(0xFFFFFFF8));
+}
+
+TEST(patch_format_hashed_old_files_are_the_ones_a_replay_copies_unread_or_copies_under) {
+    // poi_vertices.bin's blocks are copied undecoded, each under its row's
+    // lat and lng, which poi_records.bin gives. A way pair's node blocks are
+    // copied a group at a time, and its rows give the copied groups' anchors,
+    // counts and codes.
+    for (const PatchFileId poi_file : {PatchFileId::POI_RECORDS, PatchFileId::POI_VERTICES}) CHECK(is_hashed_old_file(static_cast<uint32_t>(poi_file)));
+    for (const PatchFileId way_file : {PatchFileId::STREET_WAYS, PatchFileId::STREET_NODES, PatchFileId::INTERP_WAYS, PatchFileId::INTERP_NODES})
+        CHECK(is_hashed_old_file(static_cast<uint32_t>(way_file)));
+    // addr_vertices.bin's blobs are copied undecoded, each under its
+    // record's point, which a block of addr_points.bin gives; addr_index.bin
+    // is checked against the two.
+    CHECK(is_hashed_old_file(static_cast<uint32_t>(PatchFileId::ADDR_VERTICES)));
+    CHECK(is_hashed_old_file(static_cast<uint32_t>(PatchFileId::ADDR_POINTS)));
+    // The place files and the side files are decoded, and no id past the
+    // table names a file.
+    for (const PatchFileId decoded : {PatchFileId::PLACE_NODES, PatchFileId::WAY_PARENTS, PatchFileId::ADDR_POSTCODES})
+        CHECK(!is_hashed_old_file(static_cast<uint32_t>(decoded)));
+    CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::STRINGS)));
+    CHECK(!is_hashed_old_file(static_cast<uint32_t>(PatchFileId::COUNT)));
+    CHECK(!is_hashed_old_file(OLD_FILE_HASH_MARKER));
 }
 
 // --- Format identity / enum constants ---
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v16 = 16-byte admin polygon records (v15: cell list
-    // deltas as runs). The patcher accepts this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(16));
+    // diff/patch tools. v17 = an old file's hash names its file (v16: 16-byte
+    // admin polygon records). The patcher accepts this version only.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(17));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }
@@ -864,8 +887,8 @@ TEST(patch_format_old_file_must_be_the_size_the_patch_was_made_from) {
 }
 
 TEST(patch_format_old_file_size_of_a_virtual_file_comes_from_the_hook) {
-    // Low-memory mode: an encoded family's old file isn't on disk; the hook
-    // checks its decoded size and the reader takes the patch's.
+    // An encoded family's logical old file isn't on disk; the hook checks its
+    // decoded size and the reader takes the patch's.
     ScratchDir dir("old-size");
     virtual_size_hook() = [](const std::string&, const std::string& name, uint64_t expected) -> bool {
         if (name != "street_ways.bin") return false;
