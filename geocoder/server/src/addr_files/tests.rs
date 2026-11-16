@@ -33,8 +33,8 @@ fn count_of(logical: &[u8]) -> u32 {
     ((logical.len() - 10) / if logical[0] == 3 { 8 } else { 4 }) as u32
 }
 
-/// The logical pair of the records: addr_points.bin, each footprint's vertex_offset the bytes of
-/// the ones before it, and addr_vertices.bin.
+/// The logical pair of the records: addr_points.bin, each footprint's vertex_offset the 2-byte
+/// units of the ones before it, and addr_vertices.bin.
 fn logical_pair(records: &[Logical]) -> (Vec<u8>, Vec<u8>) {
     let (mut points, mut vertices) = (Vec::new(), Vec::new());
     for r in records {
@@ -650,7 +650,8 @@ fn files_no_builder_writes_are_refused_at_open_by_name() {
     assert_eq!(said(p, &counting(v, n), x), "");
     assert_eq!(said(p, &counting(v, n + 1), x), "addr_vertices.bin counts more blobs than addr_points.bin has records");
 
-    // More records, or more bytes of logical blobs, than a patch can index: 2^32 - 2 of either.
+    // More records, or more bytes of logical blobs, than a patch can index: 2^32 - 2 records, and
+    // as many 2-byte units of blobs.
     assert_eq!(
         said(&counting(p, u32::MAX as usize), v, &counting(x, u32::MAX as usize)),
         "4294967295 records in addr_points.bin are more than the 4294967294 a patch can index"
@@ -661,9 +662,9 @@ fn files_no_builder_writes_are_refused_at_open_by_name() {
         b[at..at + 8].copy_from_slice(&bytes.to_le_bytes());
         b
     };
-    assert_eq!(said(p, &logical(u32::MAX as u64 - 1), x), "");
-    for bytes in [u32::MAX as u64, u64::MAX] {
-        let more = format!("a logical addr_vertices.bin of {bytes} bytes is more than the 4294967294 a patch can index");
+    assert_eq!(said(p, &logical(2 * (u32::MAX as u64 - 1)), x), "");
+    for bytes in [2 * (u32::MAX as u64 - 1) + 2, u64::MAX] {
+        let more = format!("a logical addr_vertices.bin of {bytes} bytes is more than the 8589934588 a patch can index");
         assert_eq!(said(p, &logical(bytes), x), more);
     }
 }

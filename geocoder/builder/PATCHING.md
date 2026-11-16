@@ -436,7 +436,7 @@ v8 data patch that day; applying the delta also needs memory for the whole
 old file (1.0 GB for poi.fst). Rebuilding costs no download and two to three
 and a half minutes of one core.
 
-## Patch Format (.gcpatch, version 17)
+## Patch Format (.gcpatch, version 18)
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
 pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
@@ -446,8 +446,8 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=17 (u32) + flags=0 (u32)
-  (a v17 patcher accepts only v17 patches; the v8 to v17 changes are marked
+Header: "GCPATCH\0" (8) + version=18 (u32) + flags=0 (u32)
+  (a v18 patcher accepts only v18 patches; the v8 to v18 changes are marked
   below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
@@ -601,6 +601,14 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     index is a u32 below NO_DATA: the diff refuses a record file with more
     before it diffs it, and the patcher a merge section that gives one ("Old
     <file> holds <n> records, more than the 4294967294 a patch can index").
+    (v18) The address footprints' logical stream is counted in units of 2
+    bytes, which every footprint's block is a whole number of (10 bytes and
+    4 or 8 a vertex): addr_vertices merges at stride 2, and a logical address
+    record's vertex_offset is the units of the blocks before its own. The
+    stream holds at most 8,589,934,588 bytes; the builder, the diff, the
+    patcher and the server refuse address files whose footer gives more ("a
+    logical addr_vertices.bin of <n> bytes is more than the 8589934588 a
+    patch can index").
   Ops: MATCH(count:u32) | INSERT(count:u32, data) | DELETE(count:u32)
     | REPLACE(count:u32, data) (v8: the same entities with new bytes, written
     like an INSERT, mapped old → new like a MATCH)
@@ -770,7 +778,7 @@ layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
 | 24, 25 | `postcode_centroid_cells.bin`, `postcode_centroid_entries.bin` | cell list delta (stride 0xFB), or whole |
 | 26 | `arc_index.bin` | merge by slot at stride 4, the record its block's offset (v14; v13: `postal_polygons.bin`) |
 | 27 | `arc_vertices.bin` | child stream of arc_index, at stride 1 (v14; v13: `postal_vertices.bin`) |
-| 28 | `addr_vertices.bin` | child stream of addr_points at stride 1; whole in a dir without address points |
+| 28 | `addr_vertices.bin` | child stream of addr_points, of the footprints' logical stream, at stride 2 (v18; was 1); whole in a dir without address points |
 | 29-33 | `strings_core.bin` … `strings_poi.bin` | the strings section, of the decoded pools; a tier the old dir lacks, whole (its FCC2 file) |
 | 34 | `interp_postcodes.bin` | parallel delta along interp_ways, remap kind 2 |
 | 35 | `geo_entries.bin` | the geo index's blocks, rebuilt with `geo_cells.bin` (8) |

@@ -104,7 +104,7 @@ static constexpr size_t ADDR_POINT_PARENT_WAY_ID_OFF = 16;
 static constexpr size_t ADDR_POINT_VERTEX_OFFSET_OFF = 20;
 // The bytes a run of addr_vertices.bin's merge section counts by: the unit
 // of a logical record's vertex_offset (addr_files.h).
-static constexpr uint32_t ADDR_VERTEX_STRIDE = 1;
+static constexpr uint32_t ADDR_VERTEX_STRIDE = 2;
 
 // street_id byte offset within an InterpWay record (after node_count and
 // its padding).
@@ -247,7 +247,12 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // v17: an old file's hash (OLD_FILE_HASH_MARKER) names its file, so a patch
 // carries one for each file a replay copies from without decoding it, or
 // copies such bytes under values of (HASHED_OLD_FILES).
-static constexpr uint32_t GCPATCH_VERSION = 17;
+// v18: the address footprints' logical stream is counted in units of 2 bytes
+// (ADDR_VERTEX_STRIDE): addr_vertices.bin's merge section is at that stride,
+// and a logical address record's vertex_offset counts the units of the
+// footprints before its own, so the stream may hold twice FILE_RECORDS_MAX
+// bytes.
+static constexpr uint32_t GCPATCH_VERSION = 18;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -686,8 +691,9 @@ constexpr uint32_t PARALLEL_DELTA_STRIDE = 0xFA;
 static constexpr uint32_t MAX_RECORD_STRIDE = 0xFF;
 // The most records a merge section's old or new file may hold: record indices are u32s below
 // NO_DATA (0xFFFFFFFF) in the diff's id remaps and secondary matches and in the patcher's
-// RecordRemap, so a file of more would wrap them. A byte stream's records are its bytes. Lower for
-// tests (--file-records-max).
+// RecordRemap, so a file of more would wrap them. A byte stream's records are its bytes, the
+// address footprints' their units of ADDR_VERTEX_STRIDE bytes. Lower for tests
+// (--file-records-max).
 static constexpr uint32_t FILE_RECORDS_MAX = 0xFFFFFFFE;
 
 // Refuses a merge of `file` whose old or new file (of old_size and new_size bytes) holds more than

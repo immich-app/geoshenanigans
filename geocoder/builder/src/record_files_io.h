@@ -200,8 +200,9 @@ inline constexpr size_t kAddrSliceSuperblocks = 64;
 // its footprint's first vertex in vertices and its vertex_count how many
 // follow it there; vertices gives each by operator[] as a reference into one
 // array. A footprint is written as its packed polygon (vertex_pack.h), the
-// logical blob, its record's vertex_offset the bytes of the ones before it; a
-// record whose footprint the vertices do not hold is written as a point. Each
+// logical blob, its record's vertex_offset the bytes of the ones before it in
+// the logical record's units (addr_files::vertex_offset_of); a record whose
+// footprint the vertices do not hold is written as a point. Each
 // slice's blocks go through put_points(const uint8_t*, size_t) in one call,
 // its blobs through put_vertices and its index rows through put_index, then
 // each file's footer. Refuses, before anything is put, more records than a

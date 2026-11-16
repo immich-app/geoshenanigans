@@ -649,7 +649,8 @@ TEST(a_record_whose_footprint_the_vertices_do_not_hold_is_written_as_a_point) {
         const bool building = i == 0 || i == 4;
         CHECK(got[i].housenumber_id == i + 1 && got[i].street_id == 7 && got[i].parent_way_id == 9);
         CHECK_EQ(got[i].vertex_count, building ? 5u : 0u);
-        CHECK_EQ(got[i].vertex_offset, i == 0 ? 0u : i == 4 ? 30u : NO_DATA);
+        // The second building's 30 bytes before it are 15 units.
+        CHECK_EQ(got[i].vertex_offset, i == 0 ? 0u : i == 4 ? 15u : NO_DATA);
     }
     // Each building's footprint is the ring, packed.
     std::vector<uint8_t> ring(30);
@@ -658,22 +659,23 @@ TEST(a_record_whose_footprint_the_vertices_do_not_hold_is_written_as_a_point) {
 }
 
 TEST(the_address_writer_refuses_footprints_of_more_logical_bytes_than_a_patch_indexes_before_it_writes) {
-    // 536 footprints of one array's vertices, wide enough to take 8 bytes a
-    // vertex: 535 of 1,000,000 vertices and one of 1,870,242 are 2^32 bytes
-    // of logical blobs, which no vertex_offset counts. Three nodes after
-    // each put them in three slices of a superblock, the last of which holds
-    // the footprint that passes the limit: none of them is put.
+    // 1,073 footprints of one array's vertices, wide enough to take 8 bytes a
+    // vertex: 1,072 of 1,000,000 vertices and one of 1,740,483 are
+    // 8,589,934,594 bytes of logical blobs, 6 more than a vertex_offset
+    // counts. Three nodes after each put them in five slices of a superblock,
+    // the last of which holds the footprint that passes the limit: none of
+    // them is put.
     Addresses a;
     a.vertices.resize(1870242);
     for (size_t i = 0; i < a.vertices.size(); i++) a.vertices[i] = {float(i % 1000) * 0.01f, float(i / 1000 % 1000) * 0.01f};
-    for (uint32_t i = 0; i < 536; i++) {
-        a.points.push_back({1.0f, 2.0f, i, 0, 0, 0, i == 535 ? 1870242u : 1000000u});
+    for (uint32_t i = 0; i < 1073; i++) {
+        a.points.push_back({1.0f, 2.0f, i, 0, 0, 0, i == 1072 ? 1740483u : 1000000u});
         for (int node = 0; node < 3; node++) a.points.push_back({1.0f, 2.0f, i, 0, 0, NO_DATA, 0});
     }
-    REQUIRE(plan_polygon(a.vertices.data(), 1000000).bytes == 8000010);
-    REQUIRE(a.points.size() > 2 * addr_files::SUPERBLOCK_RECORDS);
+    REQUIRE(plan_polygon(a.vertices.data(), 1000000).bytes == 8000010 && plan_polygon(a.vertices.data(), 1740483).bytes == 13923874);
+    REQUIRE(a.points.size() > 4 * addr_files::SUPERBLOCK_RECORDS);
     const std::string refused =
-        "Malformed address files: a logical addr_vertices.bin of 4294967296 bytes is more than the 4294967294 a patch can index";
+        "Malformed address files: a logical addr_vertices.bin of 8589934594 bytes is more than the 8589934588 a patch can index";
     size_t puts = 0;
     auto count = [&puts](const uint8_t*, size_t) { puts++; };
     CHECK_EQ(refusal_of([&] { write_addr_pair(a.points, a.vertices, count, count, count, 4, 1); }), refused);

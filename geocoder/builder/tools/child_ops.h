@@ -12,11 +12,11 @@
 #include "merge_sequence.h"
 #include "patch_format.h"
 
-// The child's file and the bytes a run of its merge section counts by (a node's 8, a vertex
-// stream's 1). After parse: op and left of the run at hand, in bytes; old the old stream's offset
-// there; data the patch's offset of an INSERT's or a REPLACE's bytes; written the new stream's
-// bytes taken so far. A copy of the old stream reads as one MATCH of it, a new stream sent whole
-// as one INSERT.
+// The child's file and the bytes a run of its merge section counts by (a node's 8, the address
+// footprints' ADDR_VERTEX_STRIDE, another vertex stream's 1). After parse: op and left of the run
+// at hand, in bytes; old the old stream's offset there; data the patch's offset of an INSERT's or
+// a REPLACE's bytes; written the new stream's bytes taken so far. A copy of the old stream reads
+// as one MATCH of it, a new stream sent whole as one INSERT.
 struct ChildOps {
     enum Kind { MERGE, COPY_OLD, FULL };
     uint32_t fid;

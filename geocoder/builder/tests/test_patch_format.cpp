@@ -410,9 +410,10 @@ TEST(patch_format_hashed_old_files_are_the_ones_a_replay_copies_unread_or_copies
 
 TEST(patch_format_magic_and_version) {
     // GCPATCH_VERSION is bound to the value actually emitted/checked by the
-    // diff/patch tools. v17 = an old file's hash names its file (v16: 16-byte
-    // admin polygon records). The patcher accepts this version only.
-    CHECK_EQ(GCPATCH_VERSION, uint32_t(17));
+    // diff/patch tools. v18 = the address footprints' stream in 2-byte units
+    // (v17: an old file's hash names its file). The patcher accepts this
+    // version only.
+    CHECK_EQ(GCPATCH_VERSION, uint32_t(18));
     const char expect[8] = {'G','C','P','A','T','C','H','\0'};
     for (int i = 0; i < 8; i++) CHECK_EQ(GCPATCH_MAGIC[i], expect[i]);
 }

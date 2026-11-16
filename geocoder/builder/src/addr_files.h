@@ -95,14 +95,15 @@
 //
 // What the files leave out of a logical record is derived: vertex_offset is
 // the bytes of the logical blobs of the records before it, in units of
-// VERTEX_OFFSET_UNIT (NO_DATA for a point), and vertex_count its blob's (0
-// for a point). The encoder refuses a pair in which they are anything else,
-// and one the files can't hold: a footprint in an encoding past 3, with its
-// zero byte set or of no vertices; more than MAX_RECORDS records or a logical
-// addr_vertices.bin of more than MAX_LOGICAL_VERTEX_BYTES (a patch indexes a
-// file's records, and a byte stream's bytes, in a u32 below NO_DATA, and a
-// vertex_offset is a u32); a blob of 4 GiB or more (len is a u32), or as many
-// bytes of a superblock's blobs before one of its blocks.
+// VERTEX_OFFSET_UNIT, 2 bytes, which a header and a vertex are whole numbers
+// of (NO_DATA for a point), and vertex_count its blob's (0 for a point). The
+// encoder refuses a pair in which they are anything else, and one the files
+// can't hold: a footprint in an encoding past 3, with its zero byte set or of
+// no vertices; more than MAX_RECORDS records or a logical addr_vertices.bin
+// of more than MAX_LOGICAL_VERTEX_BYTES (a patch indexes a file's records,
+// and this stream's units, in a u32 below NO_DATA, and a vertex_offset is a
+// u32); a blob of 4 GiB or more (len is a u32), or as many bytes of a
+// superblock's blobs before one of its blocks.
 #pragma once
 
 #include <algorithm>
@@ -144,7 +145,7 @@ inline constexpr uint64_t MAX_RECORDS = UINT32_MAX - 1;
 // The bytes a vertex_offset counts by, which every logical blob is a whole
 // number of, and the most bytes a logical addr_vertices.bin is: as many of
 // them as a u32 below NO_DATA counts.
-inline constexpr uint64_t VERTEX_OFFSET_UNIT = 1, MAX_LOGICAL_VERTEX_BYTES = VERTEX_OFFSET_UNIT * (UINT32_MAX - 1);
+inline constexpr uint64_t VERTEX_OFFSET_UNIT = 2, MAX_LOGICAL_VERTEX_BYTES = VERTEX_OFFSET_UNIT * (UINT32_MAX - 1);
 // The bytes before the footprint of a record that has none
 // (logical_record).
 inline constexpr uint64_t NO_FOOTPRINT = ~uint64_t(0);
@@ -1005,7 +1006,8 @@ private:
         if (!count && offset != NO_DATA) refuse("has a vertex_offset and no vertices");
         if (count && offset == NO_DATA) refuse("has vertices and no vertex_offset");
         if (count && vertex_offset_bytes(offset) != logical_)
-            refuse("has a vertex_offset of " + std::to_string(offset) + ", not the " + std::to_string(logical_) +
+            refuse("has a vertex_offset of " + std::to_string(offset) + ", not the " +
+                   std::to_string(logical_ / VERTEX_OFFSET_UNIT) + " units of " + std::to_string(VERTEX_OFFSET_UNIT) +
                    " bytes of the footprints before it");
         return count;
     }

@@ -8,13 +8,13 @@
 //
 // Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--threads] [--file-records-max N]
 //
-// Reads GCPATCH v17 (REPLACE runs, street remap derived from the
+// Reads GCPATCH v18 (REPLACE runs, street remap derived from the
 // street_ways replay, PARALLEL_DELTA_STRIDE side files, unmapped ids dropped
 // from street / addr / interp cell lists, a cell index delta for every admin /
 // POI index and none for places, remap pairs ascending, the MATCH records'
 // string fixups, the admin geometry files merged by slot, with admin slots
-// kept, cell list deltas as runs, 16-byte admin polygon records, and an old
-// file's hash by file id).
+// kept, cell list deltas as runs, 16-byte admin polygon records, an old
+// file's hash by file id, and the address footprints in 2-byte units).
 //
 // The encoded families' old files (the way, address, POI, place and side
 // files, see gcs_patch.h) are decoded and their new files encoded in process.

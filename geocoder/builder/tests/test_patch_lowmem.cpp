@@ -3165,7 +3165,7 @@ TEST(patch_refuses_old_address_files_the_builder_would_not_write) {
     moved[16 + 6]++;
     flagged[0] = static_cast<char>(0x80);
     cut.erase(cut.end() - 17);
-    put_at(past, past.size() - 16, uint64_t{FILE_RECORDS_MAX} + 1);
+    put_at(past, past.size() - 16, addr_files::MAX_LOGICAL_VERTEX_BYTES + 1);
     struct Edit {
         std::string name, file;
         std::optional<std::vector<char>> bytes;
@@ -3176,7 +3176,7 @@ TEST(patch_refuses_old_address_files_the_builder_would_not_write) {
           Edit{"block", "addr_points.bin", flagged, "addr_points.bin block 0 has a flag no block has"},
           Edit{"blob", "addr_vertices.bin", cut, "addr_vertices.bin ends inside the blob of record 39"},
           Edit{"limit", "addr_vertices.bin", past,
-               "a logical addr_vertices.bin of 4294967295 bytes is more than the 4294967294 a patch can index"},
+               "a logical addr_vertices.bin of 8589934589 bytes is more than the 8589934588 a patch can index"},
           Edit{"part", "addr_index.bin", std::nullopt,
                "a dir with some of addr_points.bin, addr_vertices.bin and addr_index.bin and not all three"}}) {
         put(e.file, e.bytes);
@@ -7266,7 +7266,7 @@ TEST(the_address_replay_refuses_sections_that_do_not_fit_the_old_files_or_each_o
          "Malformed merge sequence: addr_vertices.bin"},
         {"vertex-offset", [&](std::vector<char>& p) { put_at(p, record_at + ADDR_POINT_VERTEX_OFFSET_OFF, vertex_offset + 1); },
          "addr_points.bin record 59 has a vertex_offset of " + std::to_string(vertex_offset + 1) + ", not the " + std::to_string(vertex_offset) +
-             " bytes of the footprints before it"},
+             " units of 2 bytes of the footprints before it"},
         {"encoding", [&](std::vector<char>& p) { p[blob_at] = 7; }, "addr_points.bin record 59 has a footprint in encoding 7"},
         {"stride", [&](std::vector<char>& p) { put_at(p, footprints + 4, 3u); }, "Encoded family: unexpected section kind for a child stream"},
         {"length", [&](std::vector<char>& p) { put_at(p, footprints_len_at, footprints_len + (uint64_t{1} << 32)); },

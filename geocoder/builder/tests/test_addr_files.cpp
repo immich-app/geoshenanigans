@@ -1602,7 +1602,15 @@ TEST(the_files_are_the_same_wherever_slices_are_cut_and_however_a_footprint_come
 TEST(a_vertex_offset_counts_the_logical_bytes_before_in_units) {
     using Logic = std::logic_error;
     const uint64_t unit = af::VERTEX_OFFSET_UNIT, most = af::MAX_LOGICAL_VERTEX_BYTES;
+    CHECK_EQ(unit, uint64_t(2));
     CHECK_EQ(most, unit * 0xFFFFFFFEull);
+    // 18 bytes are 9 units, 4 GiB are 2^31, and a footprint of one vertex that
+    // ends at the most starts at the largest offset there is.
+    CHECK_EQ(af::vertex_offset_of(18), 9u);
+    CHECK_EQ(af::vertex_offset_of(0x100000000ull), 0x80000000u);
+    CHECK_EQ(af::vertex_offset_of(most - af::logical_blob_bytes(0, 1)), 0xFFFFFFF7u);
+    CHECK_EQ(af::vertex_offset_bytes(0xFFFFFFF7u), uint64_t(0x1FFFFFFEEull));
+    CHECK(!refusal_of<Logic>([&] { af::vertex_offset_of(17); }).empty());
     for (const uint64_t k : {uint64_t(0), uint64_t(1), uint64_t(9), uint64_t(0x80000000ull), uint64_t(0xFFFFFFFEull)}) {
         CHECK_EQ(af::vertex_offset_of(k * unit), uint32_t(k));
         CHECK_EQ(af::vertex_offset_bytes(uint32_t(k)), k * unit);
@@ -1636,6 +1644,7 @@ TEST(a_vertex_offset_counts_the_logical_bytes_before_in_units) {
     const Bytes ring = footprint(2, HERE, {{1, 2}, {3, 4}});
     for (uint64_t part = 1; part < unit; part++)
         CHECK(!refusal_of<Logic>([&] { af::Encoder enc(drop, drop, drop, 1024, 18 * unit + part); }).empty());
+    CHECK(!refusal_of<Logic>([&] { af::Encoder enc(drop, drop, drop, 1024, 37); }).empty());
     af::Encoder enc(drop, drop, drop, 1024, 18 * unit);
     enc.add(record_bytes(here, 18, 2).data(), ring.data());
     CHECK_EQ(enc.logical_vertex_bytes(), 18 * unit + ring.size());
@@ -1670,18 +1679,20 @@ TEST(the_encoder_refuses_a_pair_the_files_cant_hold) {
     const std::string past = "has a footprint past the end of the logical addr_vertices.bin";
     const std::string after = "bytes after the last footprint of the logical addr_vertices.bin";
     const Refused cases[] = {
-        // A vertex_offset without vertices, vertices without one, and one that is not the bytes
-        // of the footprints before it.
+        // A vertex_offset without vertices, vertices without one, and one that is not the units
+        // of the footprints before it: their bytes among them.
         {with_word(good, 0, offset, 0), "addr_points.bin record 0 has a vertex_offset and no vertices"},
         {with_word(good, 1, offset, NO_DATA), "addr_points.bin record 1 has vertices and no vertex_offset"},
         {with_word(good, 1, offset, 4),
-         "addr_points.bin record 1 has a vertex_offset of 4, not the 0 bytes of the footprints before it"},
+         "addr_points.bin record 1 has a vertex_offset of 4, not the 0 units of 2 bytes of the footprints before it"},
         {with_word(good, 2, offset, 0),
-         "addr_points.bin record 2 has a vertex_offset of 0, not the 18 bytes of the footprints before it"},
-        {with_word(good, 2, offset, 19),
-         "addr_points.bin record 2 has a vertex_offset of 19, not the 18 bytes of the footprints before it"},
+         "addr_points.bin record 2 has a vertex_offset of 0, not the 9 units of 2 bytes of the footprints before it"},
+        {with_word(good, 2, offset, 10),
+         "addr_points.bin record 2 has a vertex_offset of 10, not the 9 units of 2 bytes of the footprints before it"},
+        {with_word(good, 2, offset, 18),
+         "addr_points.bin record 2 has a vertex_offset of 18, not the 9 units of 2 bytes of the footprints before it"},
         {with_word(good, 1, count, 1),
-         "addr_points.bin record 2 has a vertex_offset of 18, not the 14 bytes of the footprints before it"},
+         "addr_points.bin record 2 has a vertex_offset of 9, not the 7 units of 2 bytes of the footprints before it"},
         // A footprint no blob holds.
         {with_byte(good, 18, 4), "addr_points.bin record 2 has a footprint in encoding 4"},
         {with_byte(good, 0, 0xFF), "addr_points.bin record 1 has a footprint in encoding 255"},
@@ -1769,17 +1780,18 @@ TEST(the_encoder_throws_a_logic_error_where_its_caller_breaks_its_order) {
     }
 }
 
-TEST(a_logical_vertex_stream_past_4294967294_bytes_is_refused) {
-    const uint64_t limit = 0xFFFFFFFEull;
+TEST(a_logical_vertex_stream_past_8589934588_bytes_is_refused) {
+    const uint64_t limit = 0x1FFFFFFFCull;
     CHECK_EQ(af::MAX_LOGICAL_VERTEX_BYTES, limit);
     const std::string past =
-        "Malformed address files: a logical addr_vertices.bin of 4294967312 bytes is more than the 4294967294 a patch "
+        "Malformed address files: a logical addr_vertices.bin of 8589934606 bytes is more than the 8589934588 a patch "
         "can index";
     auto drop = [](const uint8_t*, size_t) {};
     const Record here = {HERE.lat, HERE.lng, 1, 2, 3, {}};
     const Bytes ring = footprint(2, HERE, {{1, 2}, {3, 4}});
-    // By the encoder: one that starts 18 bytes short of the most takes a footprint of 18 bytes
-    // and no other.
+    // By the encoder: one that starts 18 bytes short of the most takes a footprint of 18 bytes,
+    // at the offset 0xFFFFFFF5, and no other.
+    CHECK_EQ(af::vertex_offset_of(limit - 18), 0xFFFFFFF5u);
     {
         af::Encoder enc(drop, drop, drop, 1024, limit - 18);
         enc.add(record_bytes(here, af::vertex_offset_of(limit - 18), 2).data(), ring.data());
@@ -1801,7 +1813,7 @@ TEST(a_logical_vertex_stream_past_4294967294_bytes_is_refused) {
     CHECK_EQ(encode(ring, HERE).size(), size_t(7));
     // By the footer the encoder would write.
     CHECK(af::vertices_footer(limit, 1) ==
-          (std::array<uint8_t, 16>{0xFE, 0xFF, 0xFF, 0xFF, 0, 0, 0, 0, 1, 0, 0, 0, 'A', 'D', 'F', '1'}));
+          (std::array<uint8_t, 16>{0xFC, 0xFF, 0xFF, 0xFF, 1, 0, 0, 0, 1, 0, 0, 0, 'A', 'D', 'F', '1'}));
     CHECK_EQ(refusal_of([&] { af::vertices_footer(limit + 18, 1); }), past);
     CHECK_EQ(refusal_of([&] { af::check_logical_vertex_bytes(limit + 18); }), past);
     CHECK_EQ(refusal_of([&] { af::check_logical_vertex_bytes(limit); }), std::string());
@@ -1817,14 +1829,14 @@ TEST(a_logical_vertex_stream_past_4294967294_bytes_is_refused) {
         return g;
     };
     const std::string footer =
-        "Malformed address files: a logical addr_vertices.bin of 4294967295 bytes is more than the 4294967294 a "
+        "Malformed address files: a logical addr_vertices.bin of 8589934590 bytes is more than the 8589934588 a "
         "patch can index";
-    CHECK_EQ(files_refusal(with_length(f, limit + 1)), footer);
-    CHECK_EQ(refusal_of([&] { footers_of(with_length(f, limit + 1)); }), footer);
+    CHECK_EQ(files_refusal(with_length(f, limit + 2)), footer);
+    CHECK_EQ(refusal_of([&] { footers_of(with_length(f, limit + 2)); }), footer);
     CHECK_EQ(
         refusal_of([&] { footers_of(with_length(f, uint64_t(1) << 40)); }),
         std::string(
-            "Malformed address files: a logical addr_vertices.bin of 1099511627776 bytes is more than the 4294967294 a patch "
+            "Malformed address files: a logical addr_vertices.bin of 1099511627776 bytes is more than the 8589934588 a patch "
             "can index"));
     // A length of the most passes the footers, and the block is read.
     CHECK_EQ(refusal_of([&] { footers_of(with_length(f, limit)); }), std::string());

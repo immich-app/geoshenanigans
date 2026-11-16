@@ -18,8 +18,8 @@
 //   way_parents.bin, way_postcodes.bin, addr_postcodes.bin,
 //   interp_postcodes.bin                a u32 a record
 // A way's node_offset is the nodes of the ways before it (0 of a way without
-// nodes), a footprint's vertex_offset the bytes of the blobs before it
-// (NO_DATA of a point).
+// nodes), a footprint's vertex_offset the bytes of the blobs before it in
+// units of addr_files::VERTEX_OFFSET_UNIT (NO_DATA of a point).
 //
 // Every way is read as the scans read one: its row (WayFiles::row), its nodes
 // (way) and its first node (first_node). Every address is read in a run of
@@ -537,12 +537,13 @@ mod tests {
             offset("street_nodes.bin", u64::from(u32::MAX) + 1, 0, MAX_NODES_BEFORE, 1),
             Err("street_nodes.bin holds more than the 4294967295 a logical record's offset counts".to_owned())
         );
-        // A footprint's bytes end no later than the most a patch indexes.
+        // A footprint's bytes end no later than the most a patch indexes, and its offset counts
+        // the bytes before it in units of 2.
         let (most, unit) = (addr_files::MAX_LOGICAL_VERTEX_BYTES, addr_files::VERTEX_OFFSET_UNIT);
-        assert_eq!(offset("addr_vertices.bin", 4_294_967_000, 294, most, unit), Ok(4_294_967_000));
+        assert_eq!(offset("addr_vertices.bin", 8_589_934_000, 588, most, unit), Ok(4_294_967_000));
         assert_eq!(
-            offset("addr_vertices.bin", 4_294_967_000, 295, most, unit),
-            Err("addr_vertices.bin holds more than the 4294967294 a logical record's offset counts".to_owned())
+            offset("addr_vertices.bin", 8_589_934_000, 590, most, unit),
+            Err("addr_vertices.bin holds more than the 8589934588 a logical record's offset counts".to_owned())
         );
     }
 
