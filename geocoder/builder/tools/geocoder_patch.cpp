@@ -1206,13 +1206,13 @@ static int run(int argc, char* argv[]) {
             if (off + 4 > actual_stride) throw std::runtime_error(std::string("Malformed record stride: ") + fname);
         // An encoded family's parent replays with its child stream (open_joint_child): its records go
         // to the encoder whole, and each sizes its child bytes from fields up to its last byte (an
-        // address's vertex_count at 24). A parent without records, old or new, has no child bytes
-        // to replay with it: the diff sends an empty addr_points.bin's addr_vertices.bin later, as a
-        // section of its own.
-        const bool joint =
-            gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX && (old_size || new_size);
-        if (joint && actual_stride != joint_parent_stride(file_id))
+        // address's vertex_count at 24), so its merge is at its records' stride, with records or
+        // without. A parent without records, old or new, has no child bytes to replay with it: the
+        // diff sends an empty addr_points.bin's addr_vertices.bin later, as a section of its own.
+        const bool family_parent = gcs::store().is_encoded(fname) && joint_child_of(file_id) != UINT32_MAX;
+        if (family_parent && actual_stride != joint_parent_stride(file_id))
             throw std::runtime_error(std::string("Malformed record stride: ") + fname);
+        const bool joint = family_parent && (old_size || new_size);
         bool needs_remap = !string_fields.empty();
 
         // Offset fixups, decoded lazily during merge replay (zero allocation).

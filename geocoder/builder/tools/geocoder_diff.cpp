@@ -1183,41 +1183,30 @@ static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uin
     return mask;
 }
 
-// The stride addr_points.bin merges at, by the size of its logical file: one
-// of no address points, or a dir without the address files, goes out as
-// stride 16, as patches have always sent it.
-static size_t addr_points_stride(uint64_t size) {
-    return size > 0 ? ADDR_POINT_STRIDE : 16;
-}
-template <size_t STRIDE>
-static size_t fixed_stride(uint64_t) {
-    return STRIDE;
-}
-
-// The record files the merges read, by the stride their merge sections give
-// for a new file of its size (a byte stream's is 1, the address footprints'
-// ADDR_VERTEX_STRIDE, a node's lat and lng 8).
+// The record files the merges read, by the stride of their merge sections (a
+// byte stream's is 1, the address footprints' ADDR_VERTEX_STRIDE, a node's
+// lat and lng 8).
 // The admin geometry files merge at their own strides (ADMIN_SLOT_FAMILIES):
 // an arc index at 4, never the admin polygons' 24 that ids 26 and 27 merged
 // at as the postal files.
 struct MergedFile {
     PatchFileId id;
-    size_t (*stride_of)(uint64_t new_size);
+    size_t stride;
 };
 static constexpr MergedFile MERGED_FILES[] = {
-    {PatchFileId::STREET_WAYS, fixed_stride<WAY_HEADER_STRIDE>},
-    {PatchFileId::STREET_NODES, fixed_stride<8>},
-    {PatchFileId::INTERP_WAYS, fixed_stride<INTERP_WAY_STRIDE>},
-    {PatchFileId::INTERP_NODES, fixed_stride<8>},
-    {PatchFileId::ADDR_POINTS, addr_points_stride},
-    {PatchFileId::ADDR_VERTICES, fixed_stride<ADDR_VERTEX_STRIDE>},
-    {PatchFileId::POI_RECORDS, fixed_stride<POI_RECORD_STRIDE>},
-    {PatchFileId::POI_VERTICES, fixed_stride<1>},
-    {PatchFileId::PLACE_NODES, fixed_stride<PLACE_NODE_STRIDE>},
-    {PatchFileId::ARC_INDEX, fixed_stride<ARC_INDEX_STRIDE>},
-    {PatchFileId::ARC_VERTICES, fixed_stride<1>},
-    {PatchFileId::ADMIN_POLYGONS, fixed_stride<ADMIN_POLYGON_STRIDE>},
-    {PatchFileId::ADMIN_RINGS, fixed_stride<1>},
+    {PatchFileId::STREET_WAYS, WAY_HEADER_STRIDE},
+    {PatchFileId::STREET_NODES, 8},
+    {PatchFileId::INTERP_WAYS, INTERP_WAY_STRIDE},
+    {PatchFileId::INTERP_NODES, 8},
+    {PatchFileId::ADDR_POINTS, ADDR_POINT_STRIDE},
+    {PatchFileId::ADDR_VERTICES, ADDR_VERTEX_STRIDE},
+    {PatchFileId::POI_RECORDS, POI_RECORD_STRIDE},
+    {PatchFileId::POI_VERTICES, 1},
+    {PatchFileId::PLACE_NODES, PLACE_NODE_STRIDE},
+    {PatchFileId::ARC_INDEX, ARC_INDEX_STRIDE},
+    {PatchFileId::ARC_VERTICES, 1},
+    {PatchFileId::ADMIN_POLYGONS, ADMIN_POLYGON_STRIDE},
+    {PatchFileId::ADMIN_RINGS, 1},
 };
 
 static int run(int argc, char* argv[]) {
@@ -1378,19 +1367,7 @@ static int run(int argc, char* argv[]) {
     for (const MergedFile& f : MERGED_FILES) {
         const char* name = patch_file_names[static_cast<uint32_t>(f.id)];
         const uint64_t old_size = merged_size(old_dir, name), new_size = merged_size(new_dir, name);
-        require_merge_records(name, old_size, new_size, f.stride_of(new_size), file_records_max);
-    }
-    // The address points merge at one stride, so a dir that gains its first
-    // address point or loses its last can't be patched: said before any merge
-    // starts, and run() returns with nothing left in scratch.
-    {
-        const size_t old_stride = addr_points_stride(merged_size(old_dir, addr_files::POINTS_FILE));
-        const size_t new_stride = addr_points_stride(merged_size(new_dir, addr_files::POINTS_FILE));
-        if (old_stride != new_stride) {
-            std::cerr << "  addr_points: stride mismatch (old=" << old_stride << ", new=" << new_stride << ") — cannot patch"
-                      << std::endl;
-            return 2;
-        }
+        require_merge_records(name, old_size, new_size, f.stride, file_records_max);
     }
     // A shipped tier is rebuilt from the client's own old file, so both
     // sides come from the dir itself. The others are only remapped through
@@ -1563,13 +1540,16 @@ static int run(int argc, char* argv[]) {
         double gs = now_ms();
         auto old_m = mmap_file_rw(merge_path(old_dir, "addr_points.bin"));
         auto new_m = mmap_file(merge_path(new_dir, "addr_points.bin"));
-        // Old and new merge at one stride: a dir that gains or loses its
-        // address points was refused before the merges.
-        const size_t addr_stride = addr_points_stride(new_m.size);
+        // The points merge at their records' stride with or without records:
+        // a dir's first address points are one INSERT and its last one
+        // DELETE, and their footprints the child stream of either. A family
+        // without a record on either day has no child stream to merge.
+        const size_t addr_stride = ADDR_POINT_STRIDE;
+        const bool has_records = old_m.size > 0 || new_m.size > 0;
         // Identity matching (v8) unless the files are byte-identical (the
         // patcher then copies old and derives no remap).
         std::pair<std::vector<uint32_t>, std::vector<uint32_t>> addr_ids;
-        if (addr_stride >= 28 && !same_bytes(old_m.data, old_m.size, new_m.data, new_m.size))
+        if (has_records && !same_bytes(old_m.data, old_m.size, new_m.data, new_m.size))
             addr_ids = identity_of("addr", addr_point_tombstone(), old_m.data, old_m.size, new_m.data, new_m.size);
         const bool addr_identity = !addr_ids.first.empty();
         const bool unchanged = sent_unchanged(old_m.data, old_m.size, new_m.data, new_m.size);
@@ -1593,7 +1573,7 @@ static int run(int argc, char* argv[]) {
         FixupKeys addr_keys;
         const char* old_av_data = "";
         const char* new_av_data = "";
-        if (addr_stride >= 28) {
+        if (has_records) {
             old_av = mmap_file(merge_path(old_dir, "addr_vertices.bin"));
             new_av = mmap_file(merge_path(new_dir, "addr_vertices.bin"));
             if (old_av.data) old_av_data = old_av.data;
@@ -1633,7 +1613,7 @@ static int run(int argc, char* argv[]) {
             std::lock_guard<std::mutex> lock(log_mutex);
             std::cerr << "  addr_points identity: " << f.stats << std::endl;
         } else {
-            if (addr_stride >= 28 &&
+            if (has_records &&
                 !v15_fixup_skipped(old_m.data, old_m.size, old_av_data, old_av.size, new_m.data, new_m.size,
                                    new_av_data, new_av.size))
                 copy_paired_offsets(addr_keys, old_m.data, new_m.data, addr_stride, /*off_field_pos*/ 20);
@@ -1669,7 +1649,7 @@ static int run(int argc, char* argv[]) {
         // parent slots drop their old block, INSERT parent slots emit
         // new block bytes. Mirrors build_vertex_byte_merge usage for
         // poi_vertices.
-        if (addr_stride >= 28) {
+        if (has_records) {
             // Restore old's original vertex_offsets so build_vertex_byte_merge
             // reads each polygon's old block from the *original* byte
             // position (it was rewritten by fixup_v15_offsets to match new).
@@ -1687,8 +1667,8 @@ static int run(int argc, char* argv[]) {
                           old_av.size, new_av.size, std::move(av_seq), {}};
             log_merge(res_addr_v);
         } else {
-            // No address points: the dir's addr_vertices.bin, if any,
-            // goes whole (emit_raw) later.
+            // No address point on either day: the dir's addr_vertices.bin,
+            // if any, goes whole (emit_raw) later.
             res_addr_v = {PatchFileId::ADDR_VERTICES, "addr_vertices.bin", 0,
                           0, 0, MergeSequence{}, {}};
         }
@@ -2086,7 +2066,7 @@ static int run(int argc, char* argv[]) {
         append_old_file_hash(patch, old_dir, PatchFileId::ADDR_VERTICES);
     }
     serialize_merge(patch, res_addr, old_dir, new_dir, patcher_strings, offset_fixup_limits);
-    // res_addr_v is built in t_addr only when the dir has address points;
+    // res_addr_v is built in t_addr only when a day has address points;
     // without them it keeps stride=0 and old/new sizes 0, which we treat as
     // "not built" → fall through to the emit_raw(ADDR_VERTICES) call later
     // in the section pipeline. Any other stride marks a merge ready to ship.
@@ -2269,9 +2249,9 @@ static int run(int argc, char* argv[]) {
     // tool, so embedding raw file bytes here does not inflate the
     // final .gcpatch much.
     //
-    // The footprints of an address family without records go this way: the
-    // section's sizes and bytes are the logical file's (merge_path), and it
-    // holds none.
+    // The footprints of an address family without records on either day go
+    // this way: the section's sizes and bytes are the logical file's
+    // (merge_path), and it holds none.
     auto emit_raw = [&](PatchFileId fid, const std::string& fname) {
         SEC("raw:" << fname);
         struct stat nst;
@@ -2614,8 +2594,9 @@ static int run(int argc, char* argv[]) {
     emit_cell_index(PatchFileId::POSTCODE_CENTROID_CELLS, "postcode_centroid_cells.bin",
                     PatchFileId::POSTCODE_CENTROID_ENTRIES, "postcode_centroid_entries.bin");
     // ADDR_VERTICES was already serialized as a byte-merge just after
-    // res_addr when the dir has address points. Only fall back to
-    // FULL_REPLACE here for a dir without them (res_addr_v.stride == 0).
+    // res_addr when a day has address points. Only fall back to
+    // FULL_REPLACE here for a dir without them on both
+    // (res_addr_v.stride == 0).
     if (res_addr_v.stride == 0) {
         emit_raw(PatchFileId::ADDR_VERTICES, "addr_vertices.bin");
     }

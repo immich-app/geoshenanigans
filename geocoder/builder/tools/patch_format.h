@@ -251,7 +251,9 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // (ADDR_VERTEX_STRIDE): addr_vertices.bin's merge section is at that stride,
 // and a logical address record's vertex_offset counts the units of the
 // footprints before its own, so the stream may hold twice FILE_RECORDS_MAX
-// bytes.
+// bytes. addr_points.bin merges at its records' stride with or without
+// records (a family without any sent 16), so a dir's first address points
+// and its last have a patch.
 static constexpr uint32_t GCPATCH_VERSION = 18;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.

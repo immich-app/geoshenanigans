@@ -2331,6 +2331,36 @@ TEST(patch_heap_stays_flat_as_addresses_grow) {
     }, 100000).empty());
 }
 
+// A dir's first addresses: the old day's address files are the three footers,
+// the new day's hold n address points, two in three with a footprint of 1 to
+// 8 vertices and one with an escape of 70,000. The points' merge is one
+// INSERT, which the joint replay hands the encoder a record at a time, each
+// record's footprint after it, from the patch: the encoder holds a block's
+// records, one footprint a blob holds or a piece of an escape, and an index
+// row.
+TEST(patch_writes_a_dirs_first_addresses_in_flat_heap) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::mt19937 rng(20261116);
+        std::vector<Addr> addrs;
+        for (uint32_t i = 0; i < n; i++) {
+            const std::vector<char> footprint = i % 3 == 0 ? std::vector<char>{} : block(rng, 1 + rng() % 8);
+            addrs.push_back({47.0f + static_cast<float>(i) * 1e-4f, footprint});
+        }
+        addrs[n / 2].block = block(rng, 70000);
+        BuildDir old_d, new_d;
+        put_addrs(old_d, {});
+        put_addrs(new_d, addrs);
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        // The address points' merge: no old record, n new ones.
+        std::vector<char> head;
+        append(head, static_cast<uint32_t>(PatchFileId::ADDR_POINTS));
+        append(head, static_cast<uint32_t>(ADDR_POINT_STRIDE));
+        append(head, uint64_t{0});
+        append(head, uint64_t{ADDR_POINT_STRIDE} * n);
+        return patch_holds(c, head, "merge of the first " + std::to_string(n) + " address points");
+    }, 20000).empty());
+}
+
 // A family a day leaves as it is, n street ways of two nodes with a parent
 // each: its files go from the old dir to the new one as they sit, through no
 // codec, and the patcher holds none of them.
@@ -2553,6 +2583,43 @@ TEST(patch_lowmem_refuses_a_parent_stride_other_than_its_records) {
         append(header, e.stride);
         append(header, uint64_t{e.records} * e.stride);
         append(header, uint64_t{e.records - 1} * e.stride);
+        const size_t at = find_once(raw, header);
+        REQUIRE(at != std::string::npos);
+        std::vector<char> edited = raw;
+        put_at(edited, at + 4, e.wrong);
+        const std::string patch = c.dir(name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ALL_MODES, patch, name, "Malformed record stride: " + name).empty());
+    }
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// An encoded family's parent merges at its records' stride whether or not a
+// day has records of it. A dir whose address files are the three footers and
+// whose POI files hold no record, on both days: the empty merge of
+// addr_points.bin at 16 bytes and that of poi_records.bin at 32, strides
+// their string fields fit, are refused in every mode. The patch as made
+// applies.
+TEST(patch_refuses_an_empty_parent_at_another_stride_than_its_records) {
+    ScratchDir dir("lowmem-empty-stride");
+    BuildDir d;
+    put_addrs(d, {});
+    put_pois(d, {});
+    const LowMemCase c{dir.path(), "empty-stride"};
+    REQUIRE(prepare(c, d, d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    struct Edit {
+        PatchFileId fid;
+        uint32_t stride, wrong;
+    };
+    for (const Edit& e : {Edit{PatchFileId::ADDR_POINTS, ADDR_POINT_STRIDE, 16}, Edit{PatchFileId::POI_RECORDS, POI_RECORD_STRIDE, 32}}) {
+        const std::string name = patch_file_names[static_cast<uint32_t>(e.fid)];
+        std::vector<char> header;
+        append(header, static_cast<uint32_t>(e.fid));
+        append(header, e.stride);
+        for (int size = 0; size < 2; size++) append(header, uint64_t{0});
         const size_t at = find_once(raw, header);
         REQUIRE(at != std::string::npos);
         std::vector<char> edited = raw;
@@ -7530,6 +7597,43 @@ TEST(the_address_replay_refuses_an_old_record_moved_under_a_blob_it_would_copy) 
     CHECK(apply_modes(c, ALL_MODES, addr_replayed_is(1, 0)).bad.empty());
 }
 
+// A dir's last addresses: 300 address points, two in three with a footprint
+// and one with an escape, to the three footers. The patch is the two merges of
+// one DELETE each, of every record and of every unit of the footprints, and
+// the address replay passes the old files under them and writes the footers,
+// in every mode. It copies no blob, and holds the old files to their hashes
+// all the same: a byte of the escape flipped is refused.
+TEST(patch_drops_a_dirs_last_addresses) {
+    ScratchDir dir("lowmem-last-addrs");
+    std::mt19937 rng(20261116);
+    std::vector<Address> addresses;
+    for (uint32_t i = 0; i < 300; i++) {
+        Address a{47.0f + static_cast<float>(i) * 1e-4f, 8.0f, i, 0, 0, {}};
+        if (i % 3 != 2) a.blob = footprint_at(rng, a.lat, a.lng, 4 + rng() % 9);
+        addresses.push_back(a);
+    }
+    addresses[150].blob = escape_of(rng, 70000);
+    BuildDir old_d, new_d;
+    put_addresses(old_d, addresses);
+    put_addresses(new_d, {});
+    const LowMemCase c{dir.path(), "last"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    const uint64_t records = old_d.at("addr_points.bin").size(), footprints = old_d.at("addr_vertices.bin").size();
+    std::vector<char> every_record, every_unit;
+    put_op(every_record, OP_DELETE_RUN, 300);
+    put_op(every_unit, OP_DELETE_RUN, static_cast<uint32_t>(footprints / ADDR_VERTEX_STRIDE));
+    std::vector<char> sections = merge_of(PatchFileId::ADDR_POINTS, static_cast<uint32_t>(ADDR_POINT_STRIDE), records, 0, every_record);
+    const std::vector<char> child = merge_of(PatchFileId::ADDR_VERTICES, ADDR_VERTEX_STRIDE, footprints, 0, every_unit);
+    sections.insert(sections.end(), child.begin(), child.end());
+    CHECK(find_once(raw, sections) != std::string::npos);
+
+    CHECK(apply_modes(c, ALL_MODES, addr_replayed_is(0, 0)).bad.empty());
+    CHECK(flipped_blob_byte_not_refused(c, "flipped", blobs_at(addresses)[150].at + 1000).empty());
+    CHECK(apply_modes(c, ALL_MODES, addr_replayed_is(0, 0)).bad.empty());
+}
+
 // --- Old address files whose footprints pass 4 GiB ---
 
 namespace {
@@ -7874,18 +7978,25 @@ TEST(patch_refuses_bytes_no_record_of_a_family_owns_as_they_come) {
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
     const std::vector<char> raw = raw_patch(c);
     REQUIRE(!raw.empty());
-    // Where the patch holds a section, and where the section ends.
-    auto found = [&](const std::vector<char>& section) {
-        const size_t at = find_once(raw, section);
-        return std::pair<size_t, size_t>{at, at == std::string::npos ? at : at + section.size()};
+    // Where the patch holds a section from `from` on, and where the section
+    // ends.
+    auto found = [&](const std::vector<char>& section, size_t from = 0) {
+        const size_t at = find_once(std::vector<char>(raw.begin() + static_cast<std::ptrdiff_t>(from), raw.end()), section);
+        return at == std::string::npos ? std::pair<size_t, size_t>{at, at} : std::pair<size_t, size_t>{from + at, from + at + section.size()};
     };
     // The sections of the files without a byte on either day: merges without
-    // an op, and the footprints' a full replacement by nothing.
+    // an op, and the footprints' a full replacement by nothing. The points'
+    // merge holds that section's bytes too (its stride is the footprints'
+    // file id, 28, and the words after both are zero): the footprints' own
+    // comes after it.
     const auto ways = found(merge_of(PatchFileId::STREET_WAYS, static_cast<uint32_t>(WAY_HEADER_STRIDE), 0, 0, {})),
-               nodes = found(merge_of(PatchFileId::STREET_NODES, 8, 0, 0, {})), footprints = found(replacement_of(PatchFileId::ADDR_VERTICES, 0, {})),
+               nodes = found(merge_of(PatchFileId::STREET_NODES, 8, 0, 0, {})),
+               points = found(merge_of(PatchFileId::ADDR_POINTS, static_cast<uint32_t>(ADDR_POINT_STRIDE), 0, 0, {})),
                vertices = found(merge_of(PatchFileId::POI_VERTICES, 1, 0, 0, {}));
-    REQUIRE(ways.first != std::string::npos && nodes.first == ways.second && footprints.first != std::string::npos &&
+    REQUIRE(ways.first != std::string::npos && nodes.first == ways.second && points.first != std::string::npos &&
             vertices.first != std::string::npos);
+    const auto footprints = found(replacement_of(PatchFileId::ADDR_VERTICES, 0, {}), points.second);
+    REQUIRE(footprints.first != std::string::npos);
     // The patch with [at.first, at.second) replaced by section.
     auto with = [&](std::pair<size_t, size_t> at, const std::vector<char>& section) {
         std::vector<char> edited(raw.begin(), raw.begin() + static_cast<std::ptrdiff_t>(at.first));

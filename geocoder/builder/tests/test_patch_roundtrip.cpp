@@ -566,6 +566,15 @@ std::vector<char> zstd_frame(const std::vector<char>& raw, int window_log) {
     return frame;
 }
 
+// A patch file's bytes decompressed, as the patcher reads them; none when
+// zstd fails.
+std::vector<char> unpacked(const std::vector<char>& patch) {
+    ScratchDir dir("patch-unpacked");
+    const std::string packed = dir.path() + "/p.gcpatch", raw = dir.path() + "/p.raw";
+    if (!write_file(packed, patch) || !run({"zstd", "-d", "-q", "-f", packed, "-o", raw}, dir.path() + "/zstd.log")) return {};
+    return read_file(raw);
+}
+
 // n small JSON files: client files the diff carries inline, whatever their
 // names.
 BuildDir json_files(int n) {
@@ -1636,43 +1645,82 @@ TEST(patch_round_trip_of_address_points_that_gain_their_first_footprint_or_lose_
     }
 }
 
-// The address points of a dir without any merge at another stride than
-// address points do (16 against their 28), so the day a dir gets its first
-// address point or loses its last has no patch: the diff says so, exits 2,
-// writes no patch and leaves nothing in its scratch dir. From and to the
-// three footers, and from and to a dir without the files.
-TEST(patch_diff_refuses_a_dir_that_gains_its_first_address_or_loses_its_last) {
-    const BuildDir without = with_pool(OLD_POOL);
-    BuildDir empty = without, some = without;
-    empty["addr_points.bin"] = {};
-    some["addr_points.bin"] = bytes_of(std::vector<AddrPoint>{addr_point(NAME_2, NO_DATA)});
+// A dir gets its first address, or loses its last, on a day with a patch like
+// any other: addr_points.bin merges at its records' stride with or without
+// records, so the points go as one INSERT of every record or one DELETE, and
+// their footprints as that merge's child stream. From and to the three
+// footers, and from and to a dir without the files, each merged by content
+// and by slot. The day with addresses holds five on streets that move, two
+// with a footprint, the second's after the first's, in geo cells that list
+// them, with their postcodes; the day without has no addr_postcodes.bin.
+TEST(patch_round_trip_of_a_dir_that_gains_its_first_address_or_loses_its_last) {
     struct Day {
         std::string name;
-        BuildDir old_d, new_d;
-        std::string said;
+        // Whether the old day is the one without addresses, and whether that
+        // day holds the three footers.
+        bool gains, footers;
     };
-    ScratchDir dir("patch-diff-first-address");
-    for (const Day& day : {Day{"gains", empty, some, "addr_points: stride mismatch (old=16, new=28)"},
-                           Day{"loses", some, empty, "addr_points: stride mismatch (old=28, new=16)"},
-                           Day{"gains-the-files", without, some, "addr_points: stride mismatch (old=16, new=28)"},
-                           Day{"loses-the-files", some, without, "addr_points: stride mismatch (old=28, new=16)"}}) {
-        const std::string root = dir.path() + "/" + day.name, patch = root + "/p.gcpatch", log = root + "/diff.log";
-        const std::string scratch = root + "/scratch";
-        REQUIRE(write_dir(root + "/old", day.old_d) && write_dir(root + "/new", day.new_d));
-        std::filesystem::create_directories(scratch);
+    const std::vector<uint32_t> every = {0, 1, 2, 3, 4}, none;
+    for (const Day& day : {Day{"gains", true, true}, Day{"loses", false, true}, Day{"gains-the-files", true, false},
+                           Day{"loses-the-files", false, false}})
+        for (const bool by_slot : {false, true}) {
+            BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+            Identity ids;
+            put_identity_streets(old_d, new_d, ids);
+            put_identity_addresses(old_d, new_d, ids);
+            BuildDir& without = day.gains ? old_d : new_d;
+            for (const char* file : {"addr_points.bin", "addr_vertices.bin", "addr_postcodes.bin"}) without.erase(file);
+            if (day.footers) without["addr_points.bin"] = without["addr_vertices.bin"] = {};
+            put_geo_cells(old_d, {{CELL, every, day.gains ? none : every, {}},
+                                  {CELL_2, {2, 3, 4}, day.gains ? none : std::vector<uint32_t>{1, 4}, {}}});
+            put_geo_cells(new_d, {{CELL, every, day.gains ? every : none, {}},
+                                  {CELL_2, {0, 2, 3}, day.gains ? std::vector<uint32_t>{0, 2} : none, {}}});
 
-        // The diff's exit status, which the shell compares.
-        const bool exit_2 = run({"env", "TMPDIR=" + scratch, "/bin/sh", "-c", "\"$0\" \"$@\"; test $? -eq 2", GEOCODER_DIFF_BIN,
-                                 root + "/old", root + "/new", "-o", patch},
-                                log);
+            const RoundTrip r = round_trip(old_d, new_d, {}, by_slot ? std::vector<std::string>{"--identity-slots"} : std::vector<std::string>{});
 
-        const std::vector<char> text = read_file(log);
-        const std::string said(text.begin(), text.end());
-        if (!exit_2) std::printf("    %s: %s\n", day.name.c_str(), said.c_str());
-        CHECK(exit_2);
-        CHECK(said.find(day.said) != std::string::npos);
-        CHECK(!std::filesystem::exists(patch));
-        CHECK(std::filesystem::is_empty(scratch));
+            const int failures_before = gctest::failures();
+            CHECK(r.mismatches.empty());
+            CHECK(!r.patch.empty());
+            CHECK_EQ(merge_records(r, "addr_points.bin"), std::string(day.gains ? "m/i/d/r=0/5/0/0" : "m/i/d/r=0/0/5/0"));
+            CHECK(logged(r, "  addr_vertices.bin: seq="));
+            CHECK(!logged(r, "addr_vertices.bin: full replace"));
+            CHECK(!logged(r, "addr_points: stride mismatch"));
+            if (gctest::failures() > failures_before) std::printf("    on the day that %s, %s\n", day.name.c_str(), by_slot ? "by slot" : "by content");
+        }
+}
+
+// An address family without a record on either day has its sections all the
+// same: addr_points.bin's is an empty merge at its records' stride, in a dir
+// with the three footers and in one without the files, and the footers'
+// addr_vertices.bin goes whole, as no bytes.
+TEST(patch_sends_an_empty_address_family_at_its_records_stride) {
+    const BuildDir footers = {{"addr_points.bin", {}}, {"addr_vertices.bin", {}}};
+    for (const bool with_footers : {true, false}) {
+        BuildDir old_d = with_pool(OLD_POOL), new_d = with_pool(NEW_POOL);
+        Identity ids;
+        put_identity_streets(old_d, new_d, ids);
+        if (with_footers)
+            for (BuildDir* d : {&old_d, &new_d}) d->insert(footers.begin(), footers.end());
+
+        const RoundTrip r = round_trip(old_d, new_d, ids);
+
+        CHECK(r.mismatches.empty());
+        CHECK_EQ(logged(r, "addr_vertices.bin: full replace 0 bytes"), with_footers);
+        const std::vector<char> raw = unpacked(r.patch);
+        // The section's head (its file, its stride and both sizes), then no
+        // offset fixups, no string fixups and a sequence of no bytes.
+        auto empty_merge_at = [](uint32_t stride) {
+            std::vector<char> section;
+            append(section, static_cast<uint32_t>(PatchFileId::ADDR_POINTS));
+            append(section, stride);
+            for (int size = 0; size < 2; size++) append(section, uint64_t{0});
+            for (int word = 0; word < 6; word++) append(section, uint32_t{0});
+            append(section, uint64_t{0});
+            return section;
+        };
+        CHECK(find_once(raw, empty_merge_at(static_cast<uint32_t>(ADDR_POINT_STRIDE))) != std::string::npos);
+        const std::vector<char> at_16 = empty_merge_at(16);
+        CHECK(std::search(raw.begin(), raw.end(), at_16.begin(), at_16.end()) == raw.end());
     }
 }
 
