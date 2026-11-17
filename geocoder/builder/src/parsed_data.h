@@ -177,11 +177,13 @@ inline void timed_phase(const std::string& name, Fn&& fn) {
 // A STREAM_BYTES line (tools/o11y_report.py): the bytes of the logical vertex
 // stream `stream` of the dir a build wrote at `dir` ("<region>/<mode>"), the
 // most bytes a patch indexes of such a stream, and the share of them the
-// stream takes, in tenths of a percent, rounded down.
+// stream takes, in tenths of a percent, rounded down. It starts with a line
+// break, so it begins a line of the log even after another thread's unfinished
+// line: write it in one piece.
 inline std::string stream_bytes_line(const std::string& dir, const char* stream, uint64_t bytes, uint64_t limit) {
     const uint64_t tenths = bytes * 1000 / limit;
     std::ostringstream line;
-    line << "STREAM_BYTES dir=" << dir << " stream=" << stream << " bytes=" << bytes << " limit=" << limit
+    line << "\nSTREAM_BYTES dir=" << dir << " stream=" << stream << " bytes=" << bytes << " limit=" << limit
          << " share=" << tenths / 10 << "." << tenths % 10 << "%\n";
     return line.str();
 }
