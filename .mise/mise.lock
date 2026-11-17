@@ -26,43 +26,50 @@ url = "https://cache.agilebits.com/dist/1P/op2/pkg/v2.39.0/op_darwin_amd64_v2.39
 url = "https://cache.agilebits.com/dist/1P/op2/pkg/v2.39.0/op_windows_amd64_v2.39.0.zip"
 
 [[tools.opentofu]]
-version = "1.13.1"
+version = "1.13.9"
 backend = "aqua:opentofu/opentofu"
 
 [tools.opentofu."platforms.linux-arm64"]
-checksum = "sha256:9c1ef375aa1852db0b2888aa921b640c71f8140d4682aa4fec99378a64fa7dc3"
-url = "https://github.com/opentofu/opentofu/releases/download/v1.13.1/tofu_1.13.1_linux_arm64.tar.gz"
-url_api = "https://api.github.com/repos/opentofu/opentofu/releases/assets/603708055"
+checksum = "sha256:5dc196dde75b667e4806d358310ec96742774cd0993c54c1237efee5644b69b8"
+checksum_source = "mise-versions"
+url = "https://github.com/opentofu/opentofu/releases/download/v1.13.9/tofu_1.13.9_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/opentofu/opentofu/releases/assets/714326765"
 
 [tools.opentofu."platforms.linux-arm64-musl"]
-checksum = "sha256:9c1ef375aa1852db0b2888aa921b640c71f8140d4682aa4fec99378a64fa7dc3"
-url = "https://github.com/opentofu/opentofu/releases/download/v1.13.1/tofu_1.13.1_linux_arm64.tar.gz"
-url_api = "https://api.github.com/repos/opentofu/opentofu/releases/assets/603708055"
+checksum = "sha256:5dc196dde75b667e4806d358310ec96742774cd0993c54c1237efee5644b69b8"
+checksum_source = "mise-versions"
+url = "https://github.com/opentofu/opentofu/releases/download/v1.13.9/tofu_1.13.9_linux_arm64.tar.gz"
+url_api = "https://api.github.com/repos/opentofu/opentofu/releases/assets/714326765"
 
 [tools.opentofu."platforms.linux-x64"]
-checksum = "sha256:378ada19d4bc70c43732004e8159be771b23b9a5afdf059e5f8a2b3fa2c70a69"
-url = "https://github.com/opentofu/opentofu/releases/download/v1.13.1/tofu_1.13.1_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/opentofu/opentofu/releases/assets/603708017"
+checksum = "sha256:b34b327cc1ef07178207b6f2cd1f5276537d3e5b7be316500f6dac50d4c0a857"
+checksum_source = "mise-versions"
+url = "https://github.com/opentofu/opentofu/releases/download/v1.13.9/tofu_1.13.9_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/opentofu/opentofu/releases/assets/714326349"
 
 [tools.opentofu."platforms.linux-x64-musl"]
-checksum = "sha256:378ada19d4bc70c43732004e8159be771b23b9a5afdf059e5f8a2b3fa2c70a69"
-url = "https://github.com/opentofu/opentofu/releases/download/v1.13.1/tofu_1.13.1_linux_amd64.tar.gz"
-url_api = "https://api.github.com/repos/opentofu/opentofu/releases/assets/603708017"
+checksum = "sha256:b34b327cc1ef07178207b6f2cd1f5276537d3e5b7be316500f6dac50d4c0a857"
+checksum_source = "mise-versions"
+url = "https://github.com/opentofu/opentofu/releases/download/v1.13.9/tofu_1.13.9_linux_amd64.tar.gz"
+url_api = "https://api.github.com/repos/opentofu/opentofu/releases/assets/714326349"
 
 [tools.opentofu."platforms.macos-arm64"]
-checksum = "sha256:be78f659f04ef06a9dbd9b3934d46af95d787a3aa38396d459dea395261816a9"
-url = "https://github.com/opentofu/opentofu/releases/download/v1.13.1/tofu_1.13.1_darwin_arm64.tar.gz"
-url_api = "https://api.github.com/repos/opentofu/opentofu/releases/assets/603708059"
+checksum = "sha256:496f4c3064b5c3bff79174b3dae4faaf65a66774eb8e2bf074f895412c5f124f"
+checksum_source = "mise-versions"
+url = "https://github.com/opentofu/opentofu/releases/download/v1.13.9/tofu_1.13.9_darwin_arm64.tar.gz"
+url_api = "https://api.github.com/repos/opentofu/opentofu/releases/assets/714325678"
 
 [tools.opentofu."platforms.macos-x64"]
-checksum = "sha256:a73720443ba38712d7d96dc1e857add02c15a790919c653ad07492e9952f8c27"
-url = "https://github.com/opentofu/opentofu/releases/download/v1.13.1/tofu_1.13.1_darwin_amd64.tar.gz"
-url_api = "https://api.github.com/repos/opentofu/opentofu/releases/assets/603708142"
+checksum = "sha256:347e2e5a2cfe2f368829572d308b2e7c1e0486b20a1779090ff06360f7551e4f"
+checksum_source = "mise-versions"
+url = "https://github.com/opentofu/opentofu/releases/download/v1.13.9/tofu_1.13.9_darwin_amd64.tar.gz"
+url_api = "https://api.github.com/repos/opentofu/opentofu/releases/assets/714325682"
 
 [tools.opentofu."platforms.windows-x64"]
-checksum = "sha256:6825ae311e9a15747ce2ede7b7e97c8bb744a4d271fa8113259eeeee3d09438c"
-url = "https://github.com/opentofu/opentofu/releases/download/v1.13.1/tofu_1.13.1_windows_amd64.tar.gz"
-url_api = "https://api.github.com/repos/opentofu/opentofu/releases/assets/603708102"
+checksum = "sha256:e0772c2fb51e68b58f8dad47452ae965478b696cfa4c42054b1da5b7538df4ef"
+checksum_source = "mise-versions"
+url = "https://github.com/opentofu/opentofu/releases/download/v1.13.9/tofu_1.13.9_windows_amd64.tar.gz"
+url_api = "https://api.github.com/repos/opentofu/opentofu/releases/assets/714327099"
 
 [[tools.rclone]]
 version = "1.75.1"
