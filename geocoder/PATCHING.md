@@ -6,21 +6,24 @@
 builds/
   latest.json                              # entry point for all clients
   2026-04-07/
-    configurations.json                    # build metadata + axes/components/files + sha256s
+    configurations.json                    # build metadata + axes/components/files/units + sha256s
     checksums.sha256                       # on-wire hashes (*.zst, *.gcpatch, *.json)
     planet/
-      full/            *.bin.zst + strings_layout.json(.zst) + patch.gcpatch
-      no-addresses/    ...
-      admin/           ...
-      admin-minimal/   ...
+      full/            *.bin.zst + places.tt.zst + postcode_centroids.tt.zst
+                       + street_ways.tt.zst + interp_ways.tt.zst + addr_index.tt.zst
+                       + strings_layout.json(.zst) + patch.gcpatch
+      no-addresses/    ... (places, postcode_centroids, street_ways units)
+      admin/           ... (places, postcode_centroids units)
+      admin-minimal/   ... (places, arcs, admin_polygons units)
       admin-minimal-poi/ ...
       quality/
-        simplified/    admin_polygons.bin.zst + admin_rings.bin.zst + arc_index.bin.zst
-                       + arc_vertices.bin.zst + patch.gcpatch
+        simplified/    admin_rings.bin.zst + arcs.tt.zst + admin_polygons.tt.zst
+                       + patch.gcpatch
         exact/         ...
       poi/
-        major/         poi_*.bin.zst + strings_poi.bin.zst + strings_layout.json(.zst)
-                       + poi_meta.json(.zst) + patch.gcpatch
+        major/         poi_cells.bin.zst + poi_entries.bin.zst + strings_poi.bin.zst
+                       + pois.tt.zst + strings_layout.json(.zst) + poi_meta.json(.zst)
+                       + patch.gcpatch
         notable/       ...
         all/           ...
     europe/
@@ -31,6 +34,9 @@ builds/
       poi/             ...
     africa/            ...
 ```
+
+A file is published either as its own `<path>.zst` or inside a transport unit
+(`*.tt.zst`, below), never both.
 
 ## Files Overview
 
@@ -80,6 +86,44 @@ stored once; those two files are what the tiers differ in.
 
 POI files: `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin`, `strings_poi.bin`, `strings_layout.json`, `poi_meta.json`. POIs with Wikipedia/Wikidata tags are promoted one tier.
 
+## Transport units
+
+Some files download as a transport unit: a download-only form of them, their
+values in byte-aligned columns, which compress better than the packed files
+do (`server/src/transport.rs`; [builder/PATCHING.md](builder/PATCHING.md#transport-units)
+has the format). Every dir holding all of a unit's files publishes the unit as
+`<dir>/<unit>`, and that is the only form those files are published in:
+
+| Unit | Files | Dirs |
+|------|-------|------|
+| `places.tt.zst` | `place_cells.bin`, `place_nodes.bin`, `place_hidden.bin` | `full/`, `no-addresses/`, `admin/`, `admin-minimal/`, `admin-minimal-poi/` |
+| `pois.tt.zst` | `poi_records.bin`, `poi_vertices.bin` | `poi/*/` |
+| `arcs.tt.zst` | `arc_index.bin`, `arc_vertices.bin` | `quality/*/`, `admin-minimal/`, `admin-minimal-poi/` |
+| `postcode_centroids.tt.zst` | `postcode_centroids.bin` | `full/`, `no-addresses/`, `admin/` (where the region has postcodes) |
+| `admin_polygons.tt.zst` | `admin_polygons.bin` | `quality/*/`, `admin-minimal/`, `admin-minimal-poi/` |
+| `street_ways.tt.zst` | `street_ways.bin` | `full/`, `no-addresses/` |
+| `interp_ways.tt.zst` | `interp_ways.bin` | `full/` |
+| `addr_index.tt.zst` | `addr_index.bin` | `full/` |
+
+A unit decodes into exactly the files it holds, byte for byte, each checked
+against its `sha256` in `files`; the client then holds what a plain download
+gives, so patches apply to it as to any other copy. Only the geocoder's code
+decodes a unit: the query-server library (`query_server::transport::decode_into_dir`,
+which the server's downloader runs), the node binding
+(`createTransportDecoder(dir, files)`: `write(chunk)` each chunk of the unit
+as it downloads, then `finish()`) or the CLI
+(`geocoder-transport decode <unit.tt.zst | -> <dir>`, a bin of
+`geocoder/search`). zstd alone does not give the files.
+
+Each decoder writes a unit's files to `<name>.tmp` and renames them into
+place together once the whole unit has decoded and, but for the CLI's
+`decode`, which checks no hash, every file's sha256 is the one `files` gives;
+on any error none of them is left. So a download needs the largest
+unit's files' size free beside the dataset (planet `poi/all`: 1.16 GB), and a
+unit that fails is fetched again whole. Decoding holds the zstd window (8 MiB)
+and one chunk of the unit's columns (1 MiB, more only for a single polygon or
+arc larger than that).
+
 ## latest.json
 
 The entry point for all clients:
@@ -110,8 +154,10 @@ The entry point for all clients:
 Each build date has a `configurations.json` covering both the per-build
 metadata (formerly in `manifest.json`) and the schema that drives the
 client UI — axes (region/mode/quality/poi_tier), components (which
-files belong to each axis value), constraints, presets, and the flat
-`files` map keyed by relative path with `size_zst`/`size_raw`/`sha256`:
+files belong to each axis value), constraints, presets, the flat
+`files` map keyed by relative path with `size_raw`/`sha256` and either
+`size_zst` (the file's own `.zst`) or `unit` (the transport unit that holds
+it), and the `units` map of the build's transport units:
 
 ```json
 {
@@ -128,17 +174,29 @@ files belong to each axis value), constraints, presets, and the flat
   "components":  { "mode.full": { "files": ["{region}/full/...", ... ] }, ... },
   "constraints": [ { "when": { "mode": "admin-minimal" }, "requires": { "quality": "simplified" } } ],
   "presets":     [ { "id": "smallest", "selections": { ... } }, ... ],
+  "transport":   { "version": 1, "units": [ { "unit": "places.tt.zst", "kind": "places", "files": [ ... ] }, ... ] },
   "files": {
     "planet/full/admin_cells.bin": { "size_zst": 6393328, "size_raw": 24807168, "sha256": "..." },
+    "planet/full/place_nodes.bin": { "size_raw": 30573231, "sha256": "...", "unit": "planet/full/places.tt.zst" },
+    "...": "..."
+  },
+  "units": {
+    "planet/full/places.tt.zst": {
+      "kind": "places", "transport_version": 1, "size": 30427178,
+      "files": ["planet/full/place_cells.bin", "planet/full/place_nodes.bin", "planet/full/place_hidden.bin"]
+    },
     "...": "..."
   }
 }
 ```
 
-The static portions (axes/components/constraints/presets) come from
-`geocoder/builder/configurations.template.json` and are stable across
-builds. CI splices in `build.*` and the `files` table during the
-build's compress step.
+The static portions (axes/components/constraints/presets/transport) come
+from `geocoder/builder/configurations.template.json` and are stable across
+builds. CI splices in `build.*` and the `files` and `units` tables during
+the build's compress step. `transport` lists the units a dir publishes when
+it holds all of their files; `units` the ones this build has, each with its
+kind, the transport version it was written in, its bytes on the wire and its
+files. A client refuses a unit of a `transport_version` it doesn't read.
 
 A component's `optional_files` are written only when the data has them
 (`interp_postcodes.bin` in TIGER regions, the postcode centroids where a
@@ -163,8 +221,12 @@ the `.bin` files, because the server can't load a region without them.
 4. Choose region (e.g. europe), mode (e.g. full), quality (e.g. simplified), and POI tier (e.g. notable)
 5. Download every file the selected components and the variants they pick
    list (their `files`, the `optional_files` that appear in `files`, minus
-   any `replaces`), each as
-   <path>.zst, decompress, and check it against its sha256:
+   any `replaces`):
+   - a file with a `unit`: through that unit, once for all the files it
+     holds (builds/{date}/{unit}), decoded into them (Transport units,
+     above) and each checked against its sha256; a selection takes every
+     file of each unit it needs
+   - any other: as <path>.zst, decompressed and checked against its sha256
    - builds/{date}/europe/full/…                (23 files + up to 4 optional)
    - builds/{date}/europe/quality/simplified/…  (4 files)
    - builds/{date}/europe/poi/notable/…         (7 files, optional)
@@ -210,7 +272,8 @@ the same date and swap the whole set in together.
 ```
 1. build_version changed → file structure is different, must fresh install
 2. patch_version changed → patch format is different, must fresh install
-3. Follow "Fresh Install" steps above
+3. Follow "Fresh Install" steps above; a unit of a transport_version the
+   client doesn't read takes a client that does
 ```
 
 ### Switching Quality
@@ -220,7 +283,8 @@ Quality changes don't require patching — just download the new quality files:
 ```
 1. Download the files the quality.{new_quality} component lists for
    {current_date} (its `files` and the `optional_files` that appear in
-   `files`), each as <path>.zst, decompress, and check it against its sha256
+   `files`), each through its unit (arcs.tt.zst, admin_polygons.tt.zst) or
+   as <path>.zst, as a fresh install does, and check it against its sha256
 2. Replace the local quality dir with them: admin_polygons.bin,
    admin_rings.bin, arc_index.bin and arc_vertices.bin
 ```
@@ -233,7 +297,7 @@ Regions are independent. Download the new region's mode + quality directories.
 
 | Data | Retention | Notes |
 |------|-----------|-------|
-| Index files (`.bin`) | 3 days | Full index available for fresh downloads |
+| Index files (`.bin.zst`, `.tt.zst`) | 3 days | Full index available for fresh downloads |
 | Patch files (`.gcpatch`) and `configurations.json` | 14 days | Small files, allow long catch-up windows; `configurations.json` stays so the chain walk works |
 | Cached PBFs | 2 days | Build server cache only, not client-facing: today's and yesterday's, the only ones a run reads |
 | Incomplete multipart uploads | 1 day | Both buckets; left by a killed upload, invisible to listings |
