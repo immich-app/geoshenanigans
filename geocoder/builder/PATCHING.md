@@ -280,9 +280,11 @@ core, cold cache: planet/full 122.4 s (137.7 s in a 32 MiB limit), planet/no-add
 planet/poi/all 8.2 s, planet/admin 1.3 s. On the same days the v16 tools take 103.4 s for
 planet/full on the fixed-width files (310.0 s in 32 MiB) and 156.3 s on the encoded set.
 With GCPATCH v19 (2026-11-17), where the postcode centroids are the packed files, one core,
-cold, the median of 3 runs a side: planet/admin 1.76 s (v18: 1.29 s), planet/no-addresses
-56.4 s (51.3 s), planet/full 124.8 s (118.3 s); the heap peaks at 0.40 MiB in each of the
-three (v18: 0.51 to 0.56 MiB).
+cold, the median of 3 runs a side: planet/admin 1.79 s (v18: 1.29 s), planet/no-addresses
+50.6 s (51.0 s), planet/full 118.3 s (118.5 s); the heap peaks at 0.40 MiB in each of the
+three (v18: 0.51 to 0.55 MiB). The geo index walk is 39 s of planet/no-addresses, and its
+time moves with where its code lands: v18's patcher built with -falign-functions=64 takes
+54.0 s there.
 
 The figures below are GCPATCH v12's, when the patcher had two modes: plain, on the files as the
 builder wrote them, and low-memory, on a set `geocoder-gc` had encoded. They were measured on

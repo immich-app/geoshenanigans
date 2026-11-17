@@ -521,6 +521,87 @@ template <typename Fix>
     return r;
 }
 
+// The old geo index read front to back (geo_index.h): its top file, and its blocks file through
+// two readers, the second ahead of the first at each group's footer.
+using GeoIndexReader = geo_index::Reader<SequentialFileReader, SequentialFileReader, SequentialFileReader>;
+
+// The geo index walk: old_geo's cells merged with the ones the patch adds (cells.added), less the
+// ones it removes, in cell id order, each old cell's lists remapped by its table's record remap
+// (no_remap for a file sent unchanged: its ids keep their values) and each cell's corrected where
+// the diff sent a correction (deltas); the new index written to top and blocks through a
+// geo_index::Writer, the builder's bytes for the same rows. Returns the cells written. Out of
+// run() and never inlined into it, as the replays are: the loop runs for each of planet's 361M
+// cells, and in run(), which main() calls once, GCC kept its state in run()'s frame and divided
+// by the progress interval with a div, and the loop's place moved with each change to run().
+[[gnu::noinline]] static uint64_t walk_geo_index(GeoIndexReader& old_geo, CellChanges& cells,
+                                                 std::array<GeoListDeltaCursor, geo_index::TABLES>& deltas,
+                                                 const std::array<const RecordRemap*, geo_index::TABLES>& remaps,
+                                                 const RecordRemap& no_remap, FILE* top, FILE* blocks) {
+    AscendingIds& added = cells.added;
+    AscendingIds& removed = cells.removed;
+    std::vector<uint32_t> scratch;
+    geo_index::Writer geo_out([top](const char* p, size_t n) { fwrite(p, 1, n, top); },
+                              [blocks](const char* p, size_t n) { fwrite(p, 1, n, blocks); });
+
+    auto remap = [&](std::vector<uint32_t>& ids, const RecordRemap& rm) {
+        constexpr uint32_t NO2 = 0xFFFFFFFF;
+        if (&rm != &no_remap) {
+            // v8: an old id the replay doesn't map is a deleted record.
+            size_t w = 0;
+            for (uint32_t id : ids) { uint32_t n = rm[id]; if (n != NO2) ids[w++] = n; }
+            ids.resize(w);
+        } else {
+            for (auto& id : ids) if (id < rm.size() && rm[id] != NO2) id = rm[id];
+        }
+        std::sort(ids.begin(), ids.end());
+    };
+
+    // A cell's lists: the old ones (none for a new cell) with their ids
+    // remapped, then corrected by the diff where it sent a correction.
+    // An old cell's lists are remapped where the reader gave them: its
+    // next row replaces them (the reader codes each against its own copy
+    // of the row before), so they aren't copied first.
+    geo_index::RowLists old_lists, new_cell_lists;
+    uint64_t cells_written = 0;
+    auto process_cell = [&](uint64_t cid, geo_index::RowLists& lists) {
+        bool any = false;
+        for (size_t t = 0; t < geo_index::TABLES; t++) {
+            std::vector<uint32_t>& ids = lists[t];
+            if (!ids.empty()) remap(ids, *remaps[t]);
+            if (deltas[t].at(cid)) deltas[t].apply(ids, scratch);
+            any |= !ids.empty();
+        }
+        if (!any) throw std::runtime_error("Malformed patch: geo cell " + std::to_string(cid) + " left without lists");
+        geo_out.add(cid, geo_index::ids_of(lists));
+        cells_written++;
+    };
+
+    // Merge-walk: old cells + added cells in sorted order
+    // Both are sorted by cell_id. Merge them, skip removed.
+    uint64_t old_cid = 0;
+    bool have_old = old_geo.next(old_cid, old_lists);
+    while (have_old || !added.done()) {
+        const uint64_t at_old = have_old ? old_cid : UINT64_MAX, add_cid = added.done() ? UINT64_MAX : added.front();
+        if (at_old <= add_cid) {
+            if (!removed.skip_to(at_old)) process_cell(at_old, old_lists);
+            have_old = old_geo.next(old_cid, old_lists);
+            if (!added.done() && at_old == add_cid) added.pop(); // skip duplicate add
+        } else {
+            for (std::vector<uint32_t>& l : new_cell_lists) l.clear();
+            process_cell(add_cid, new_cell_lists);
+            added.pop();
+        }
+
+        if (cells_written % 10000000 == 0 && cells_written > 0) {
+            std::cerr << "    " << cells_written << " cells, " << geo_out.blocks_bytes() / 1024 / 1024
+                      << "M blocks, anon=" << get_rss_anon_mb() << "M" << std::endl;
+        }
+    }
+    removed.require_ascending();
+    geo_out.finish();
+    return cells_written;
+}
+
 static int run(int argc, char* argv[]) {
     if (argc < 5 || std::string(argv[3]) != "-o") {
         std::cerr << "Usage: geocoder-patch <current-dir> <patch-file> -o <output-dir> [--threads] [--file-records-max N]"
@@ -1536,24 +1617,20 @@ static int run(int argc, char* argv[]) {
         // The geo walk's old files and outputs close at the end of this
         // block, before the admin / POI / place rebuilds.
         {
-        // The old geo index read front to back (geo_index.h): its top file,
-        // and its blocks file through two readers, the second ahead of the
-        // first at each group's footer. The top file and the footers are
-        // read an entry (12 bytes) and a footer (768) at a time, so their
-        // readers read a page each instead of a 64 KiB window.
+        // The old geo index (GeoIndexReader). The top file and the footers
+        // are read an entry (12 bytes) and a footer (768) at a time, so
+        // their readers read a page each instead of a 64 KiB window.
         constexpr size_t GEO_TOP_AND_FOOTER_READ_BYTES = 4 << 10;
         static_assert(GEO_TOP_AND_FOOTER_READ_BYTES >= geo_index::GROUP_BLOCKS * geo_index::ENTRY_BYTES);
         SequentialFileReader old_top(cur_dir + "/geo_cells.bin", GEO_TOP_AND_FOOTER_READ_BYTES);
         SequentialFileReader old_blocks(cur_dir + "/geo_entries.bin");
         SequentialFileReader old_footers(cur_dir + "/geo_entries.bin", GEO_TOP_AND_FOOTER_READ_BYTES);
-        geo_index::Reader old_geo(old_top, old_blocks, old_footers);
+        GeoIndexReader old_geo(old_top, old_blocks, old_footers);
 
         // Added and removed cells and the diff's per-cell corrections, in
         // cell id order like the walk, read where they sit through forward
         // cursors: a hash lookup plus three binary searches per cell cost
         // ~17 s of client CPU on planet's ~380M cells.
-        AscendingIds& added = geo_cells.added;
-        AscendingIds& removed = geo_cells.removed;
         advise_sequential(geo_cells);
         auto cursor_of = [&](PatchFileId fid) {
             const PatchRef* ref = geo_deltas.find(fid);
@@ -1564,72 +1641,11 @@ static int run(int argc, char* argv[]) {
         std::array<GeoListDeltaCursor, geo_index::TABLES> deltas = {
             cursor_of(GEO_ENTRIES_FILES[0]), cursor_of(GEO_ENTRIES_FILES[1]), cursor_of(GEO_ENTRIES_FILES[2])};
         const std::array<const RecordRemap*, geo_index::TABLES> remaps = {&w_rm, &a_rm, &i_rm};
-        std::vector<uint32_t> scratch;
         log_phase("  Setup", t_entry);
 
-        // The new index through a geo_index::Writer, the builder's bytes for
-        // the same rows.
         FILE* f_top = open_out("geo_cells.bin");
         FILE* f_blocks = open_out("geo_entries.bin");
-        geo_index::Writer geo_out([&](const char* p, size_t n) { fwrite(p, 1, n, f_top); },
-                                  [&](const char* p, size_t n) { fwrite(p, 1, n, f_blocks); });
-
-        auto remap = [&](std::vector<uint32_t>& ids, const RecordRemap& rm) {
-            constexpr uint32_t NO2 = 0xFFFFFFFF;
-            if (&rm != &no_remap) {
-                // v8: an old id the replay doesn't map is a deleted record.
-                size_t w = 0;
-                for (uint32_t id : ids) { uint32_t n = rm[id]; if (n != NO2) ids[w++] = n; }
-                ids.resize(w);
-            } else {
-                for (auto& id : ids) if (id < rm.size() && rm[id] != NO2) id = rm[id];
-            }
-            std::sort(ids.begin(), ids.end());
-        };
-
-        // A cell's lists: the old ones (none for a new cell) with their ids
-        // remapped, then corrected by the diff where it sent a correction.
-        // An old cell's lists are remapped where the reader gave them: its
-        // next row replaces them (the reader codes each against its own copy
-        // of the row before), so they aren't copied first.
-        geo_index::RowLists old_lists, new_cell_lists;
-        uint64_t cells_written = 0;
-        auto process_cell = [&](uint64_t cid, geo_index::RowLists& lists) {
-            bool any = false;
-            for (size_t t = 0; t < geo_index::TABLES; t++) {
-                std::vector<uint32_t>& ids = lists[t];
-                if (!ids.empty()) remap(ids, *remaps[t]);
-                if (deltas[t].at(cid)) deltas[t].apply(ids, scratch);
-                any |= !ids.empty();
-            }
-            if (!any) throw std::runtime_error("Malformed patch: geo cell " + std::to_string(cid) + " left without lists");
-            geo_out.add(cid, geo_index::ids_of(lists));
-            cells_written++;
-        };
-
-        // Merge-walk: old cells + added cells in sorted order
-        // Both are sorted by cell_id. Merge them, skip removed.
-        uint64_t old_cid = 0;
-        bool have_old = old_geo.next(old_cid, old_lists);
-        while (have_old || !added.done()) {
-            const uint64_t at_old = have_old ? old_cid : UINT64_MAX, add_cid = added.done() ? UINT64_MAX : added.front();
-            if (at_old <= add_cid) {
-                if (!removed.skip_to(at_old)) process_cell(at_old, old_lists);
-                have_old = old_geo.next(old_cid, old_lists);
-                if (!added.done() && at_old == add_cid) added.pop(); // skip duplicate add
-            } else {
-                for (std::vector<uint32_t>& l : new_cell_lists) l.clear();
-                process_cell(add_cid, new_cell_lists);
-                added.pop();
-            }
-
-            if (cells_written % 10000000 == 0 && cells_written > 0) {
-                std::cerr << "    " << cells_written << " cells, " << geo_out.blocks_bytes() / 1024 / 1024
-                          << "M blocks, anon=" << get_rss_anon_mb() << "M" << std::endl;
-            }
-        }
-        removed.require_ascending();
-        geo_out.finish();
+        const uint64_t cells_written = walk_geo_index(old_geo, geo_cells, deltas, remaps, no_remap, f_top, f_blocks);
 
         close_patch_outputs({{f_top, "geo_cells.bin"}, {f_blocks, "geo_entries.bin"}});
         for (const SequentialFileReader* r : {&old_top, &old_blocks, &old_footers}) log_rewinds(*r);
