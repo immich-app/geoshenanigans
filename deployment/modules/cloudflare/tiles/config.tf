@@ -7,7 +7,7 @@ terraform {
   required_providers {
     cloudflare = {
       source  = "cloudflare/cloudflare"
-      version = "4.52.9"
+      version = "5.29.0"
     }
     tigris = {
       source = "tigrisdata/tigris"
