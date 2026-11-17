@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Tests entrypoint.sh's index cache: a server starts on the dataset it finds
 # only when that is a finished download of the selection it serves, and
-# otherwise downloads the whole selection afresh. curl and query-server are
+# otherwise downloads the whole selection afresh, the files of a transport
+# unit through the unit. curl, geocoder-transport and query-server are
 # stubbed out; a directory stands in for the bucket.
 #
 #   geocoder/test-portal/entrypoint.test.sh
@@ -15,10 +16,11 @@ failures=0
 build=2026-11-01
 
 # curl serves <bucket>/<path after builds/> and logs each URL; the bucket holds
-# its files plain, which the entrypoint fetches when a .zst is missing. With
-# -w it writes the HTTP status, 404 for a file the bucket lacks. A file in
-# $FLAKY (its path under planet/, one a line) breaks off halfway, as a dropped
-# connection does: half of it is written, then curl's error.
+# its files plain, which the entrypoint fetches when a .zst is missing, and its
+# units. With -w it writes the HTTP status, 404 for a file the bucket lacks. An
+# object in $FLAKY (its path under planet/, a file's without .zst, one a line)
+# breaks off halfway, as a dropped connection does: half of it is written,
+# then curl's error.
 mkdir -p "$work/bin"
 cat > "$work/bin/curl" <<'STUB'
 #!/usr/bin/env bash
@@ -35,9 +37,10 @@ echo "$url" >> "$CURL_LOG"
 rel=${url#*/builds/}
 src="$BUCKET/$rel"
 key=${rel#*/planet/}
-if [ -n "${FLAKY:-}" ] && printf '%s\n' "$FLAKY" | grep -qxF -- "${key%.zst}"; then
-  plain="$BUCKET/${rel%.zst}"
-  head -c $(($(stat -c%s "$plain") / 2)) "$plain" > "$out"
+if [ -n "${FLAKY:-}" ] && printf '%s\n' "$FLAKY" | grep -qxF -e "$key" -e "${key%.zst}"; then
+  whole="$BUCKET/$rel"
+  [ -f "$whole" ] || whole="$BUCKET/${rel%.zst}"
+  head -c $(($(stat -c%s "$whole") / 2)) "$whole" > "$out"
   [ -z "$fmt" ] || printf 200
   exit 18
 fi
@@ -48,26 +51,61 @@ fi
 if [ -n "$out" ]; then cp "$src" "$out"; else cat "$src"; fi
 [ -z "$fmt" ] || printf 200
 STUB
+# geocoder-transport decode <unit> <dir>: the stub's units are tar archives of
+# their files, all written or, for one it can't read whole, none. Each decode
+# is logged.
+cat > "$work/bin/geocoder-transport" <<'STUB'
+#!/usr/bin/env bash
+echo "$*" >> "$TRANSPORT_LOG"
+[ "$1" = decode ] || exit 2
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+if ! tar -xf "$2" -C "$tmp" 2> /dev/null || [ -z "$(ls -A "$tmp")" ]; then
+  echo "geocoder-transport: $2: not a whole unit" >&2
+  exit 1
+fi
+mv "$tmp"/* "$3"/
+STUB
 printf '#!/bin/sh\necho "query-server $*"\n' > "$work/bin/query-server"
 chmod +x "$work/bin/"*
-export PATH="$work/bin:$PATH" CURL_LOG="$work/curl.log"
+export PATH="$work/bin:$PATH" CURL_LOG="$work/curl.log" TRANSPORT_LOG="$work/transport.log"
 
 # list [VAR=value...]: the "<dir> <file>" lines of the selection.
 list() {
   env "$@" DATA_DIR="$work/unused" sh "$entrypoint" --list-files
 }
 
-# The bucket: every file of each selection the cases run, 1 KiB, its first line
-# naming its build and path.
+# unit_of <file>: the transport unit that holds it, or nothing.
+unit_of() {
+  env DATA_DIR="$work/unused" sh "$entrypoint" --unit-of "$1"
+}
+
+# The build: every file of each selection the cases run, 1 KiB, its first line
+# naming its build and path. The bucket publishes each plain, but those a
+# transport unit holds, which go in the unit (a tar of them, as the stub reads).
+files="$work/files"
 bucket="$work/bucket"
 mkdir -p "$bucket"
 printf '{\n  "latest": "%s"\n}\n' "$build" > "$bucket/latest.json"
 { list; list QUALITY=exact; list MINIMAL=1; } | sort -u | while read -r dir f; do
-  mkdir -p "$bucket/$build/planet/$dir"
-  { echo "$build $dir/$f"; head -c 1024 /dev/zero; } > "$bucket/$build/planet/$dir/$f"
+  mkdir -p "$files/$dir" "$bucket/$build/planet/$dir"
+  { echo "$build $dir/$f"; head -c 1024 /dev/zero; } > "$files/$dir/$f"
+  unit=$(unit_of "$f")
+  if [ -z "$unit" ]; then
+    cp "$files/$dir/$f" "$bucket/$build/planet/$dir/$f"
+  else
+    tar -b 1 -rf "$bucket/$build/planet/$dir/$unit" -C "$files/$dir" "$f"
+  fi
 done
 
-# bucket_without <file under planet/>: a copy of the bucket lacking it.
+# published <dir> <file>: whether $BUCKET has the file, plain or in its unit.
+published() {
+  local unit
+  unit=$(unit_of "$2")
+  [ -f "$BUCKET/$build/planet/$1/${unit:-$2}" ]
+}
+
+# bucket_without <file or unit under planet/>: a copy of the bucket lacking it.
 bucket_without() {
   local copy="$work/bucket-$RANDOM"
   cp -r "$bucket" "$copy"
@@ -77,11 +115,13 @@ bucket_without() {
 
 # start <data dir> [VAR=value...]: runs the entrypoint as the container does,
 # on the bucket in $BUCKET; its output is in $work/out, its exit status in
-# $status and the URLs it fetched in $CURL_LOG.
+# $status, the URLs it fetched in $CURL_LOG and the units it decoded in
+# $TRANSPORT_LOG.
 start() {
   local data=$1
   shift
   : > "$CURL_LOG"
+  : > "$TRANSPORT_LOG"
   set +e
   env DATA_DIR="$data" "$@" sh "$entrypoint" > "$work/out" 2>&1
   status=$?
@@ -95,8 +135,8 @@ holds() {
   local index=$1/index dir f
   shift
   while read -r dir f; do
-    if [ -f "$BUCKET/$build/planet/$dir/$f" ]; then
-      cmp -s "$BUCKET/$build/planet/$dir/$f" "$index/$f" || { echo "$dir/$f is not the build's"; return 1; }
+    if published "$dir" "$f"; then
+      cmp -s "$files/$dir/$f" "$index/$f" || { echo "$dir/$f is not the build's"; return 1; }
     elif [ -e "$index/$f" ]; then
       echo "$f is not in the build"; return 1
     fi
@@ -136,6 +176,9 @@ d="$work/fresh"
 start "$d"
 check "a fresh volume downloads the selection" holds "$d"
 check "a fresh volume serves it" served "$d"
+check "a unit is fetched once for all its files" test "$(grep -c '/planet/full/places\.tt\.zst$' "$CURL_LOG")" = 1
+check "a unit's files are fetched only through it" eval '! grep -q "/place_.*\.bin" "$CURL_LOG"'
+check "each unit is decoded into the index" test "$(wc -l < "$TRANSPORT_LOG")" = "$(list | while read -r dir f; do unit_of "$f"; done | sort -u | grep -c .)"
 
 # A finished download of the selection is served as it is.
 d="$work/finished"
@@ -204,10 +247,18 @@ start "$d"
 check "a dataset without an optional file is not fetched again" eval '! fetched'
 BUCKET=$bucket
 
+# So is a unit the build may lack (the postcode centroids').
+d="$work/optional-unit"
+BUCKET=$(bucket_without full/postcode_centroids.tt.zst)
+start "$d"
+check "a missing optional unit still serves" served "$d"
+check "a missing optional unit leaves the rest of the selection" holds "$d"
+BUCKET=$bucket
+
 # A file the server needs that the build lacks fails the download, naming it,
 # and the next start tries again.
 d="$work/required"
-BUCKET=$(bucket_without quality/simplified/arc_vertices.bin)
+BUCKET=$(bucket_without quality/simplified/arcs.tt.zst)
 start "$d"
 check "a missing required file fails the start" test "$status" != 0
 check "a missing required file is named" grep -qx 'quality/simplified/arc_vertices.bin' "$work/out"
@@ -216,16 +267,18 @@ BUCKET=$bucket
 start "$d"
 check "a failed download is downloaded afresh next time" holds "$d"
 
-# A fetch that breaks off partway fails the start, of an optional file the
+# A fetch that breaks off partway fails the start, of an optional unit the
 # build has (its miss would be taken for the build lacking it) as of a
-# required one (its half would pass for the file). None of either is left,
-# no marker vouches for the download, and the next start downloads afresh.
+# required unit or file (its half would pass for the file). None of their
+# files is left, nor a unit's download, no marker vouches for the download,
+# and the next start downloads afresh.
 d="$work/broken-off"
-start "$d" FLAKY="$(printf '%s\n' full/postcode_centroids.bin quality/simplified/arc_index.bin)"
+start "$d" FLAKY="$(printf '%s\n' full/postcode_centroids.tt.zst quality/simplified/arcs.tt.zst full/geo_cells.bin)"
 check "a fetch that breaks off fails the start" test "$status" != 0
-check "a broken-off optional file is named" grep -q 'failed: .*/planet/full/postcode_centroids.bin$' "$work/out"
-check "a broken-off required file is named" grep -q 'failed: .*/planet/quality/simplified/arc_index.bin$' "$work/out"
-check "a broken-off fetch leaves none of its file" eval '! ls -A "$d/index" | grep -E "^(postcode_centroids|arc_index)\.bin"'
+check "a broken-off optional unit is named" grep -q 'failed: .*/planet/full/postcode_centroids.tt.zst$' "$work/out"
+check "a broken-off required unit is named" grep -q 'failed: .*/planet/quality/simplified/arcs.tt.zst$' "$work/out"
+check "a broken-off required file is named" grep -q 'failed: .*/planet/full/geo_cells.bin$' "$work/out"
+check "a broken-off fetch leaves none of its files" eval '! ls -A "$d/index" | grep -E "^(postcode_centroids|arc_index|arc_vertices|geo_cells)\.bin|\.tt\.zst$"'
 check "a broken-off download leaves no marker" test ! -e "$d/index/.selection"
 start "$d"
 check "a broken-off download is downloaded afresh next time" holds "$d"
