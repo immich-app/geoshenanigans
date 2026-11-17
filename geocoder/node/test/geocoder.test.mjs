@@ -1,13 +1,17 @@
 // The binding: reverse geocoding finds a place in its cell, a boundary by its arcs and nothing
 // off the globe. Place search uses an index shipped beside its dataset as is,
 // rebuilds one shipped for other files, builds a missing one on the device, and refuses files
-// replaced under a loaded geocoder.
+// replaced under a loaded geocoder. A transport unit streamed into its decoder becomes its files,
+// each of its sha256, or leaves the dir as it was.
 //
 //   cargo build --release && node --test test/*.test.mjs
 //
-// GEOCODER_NODE overrides the addon path (default: this crate's release build).
+// GEOCODER_NODE overrides the addon path (default: this crate's release build). The transport
+// cases compress their units with the zstd command.
 import assert from 'node:assert/strict';
-import { cpSync, mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { cpSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
@@ -16,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 const addon = { exports: {} };
 process.dlopen(addon, process.env.GEOCODER_NODE ?? join(here, '../target/release/libgeocoder_node.so'));
-const { Geocoder } = addon.exports;
+const { Geocoder, createTransportDecoder } = addon.exports;
 
 const root = mkdtempSync(join(tmpdir(), 'geocoder-node-search-'));
 after(() => rmSync(root, { recursive: true, force: true }));
@@ -298,4 +302,108 @@ test('search before opening is refused', () => {
   const geocoder = Geocoder.load(dataset(['Testville', 'Otherton']));
 
   assert.throws(() => geocoder.searchPlaces('testville'), /Place search is not open/);
+});
+
+// --- transport units ---
+
+const u64 = (v) => { const b = Buffer.alloc(8); b.writeBigUInt64LE(BigInt(v)); return b; };
+const sha256 = (b) => createHash('sha256').update(b).digest('hex');
+// A unit as published: its stream through zstd.
+const published = (stream) => execFileSync('zstd', ['-q', '-c'], { input: stream });
+
+// The golden units of geocoder/testdata/transport_units.tsv, a kind each: { kind, members: [[name,
+// bytes]], stream }.
+function goldenUnits() {
+  const rows = readFileSync(join(here, '../../testdata/transport_units.tsv'), 'utf8').split('\n').filter((l) => l && !l.startsWith('#')).slice(1);
+  return rows.map((row) => {
+    const [, kind, , members, unit] = row.split('\t');
+    const hex = (h) => Buffer.from(h === '-' ? '' : h, 'hex');
+    return { kind, members: members.split(';').map((m) => [m.split(':')[0], hex(m.split(':')[1])]), stream: hex(unit) };
+  });
+}
+
+// A cols unit (server/src/transport.rs) of one file whose rows are fields of `widths` bytes: the
+// header, one chunk of its whole rows with each field raw (R) in a column of its own, and the
+// bytes after them as the tail.
+function colsUnit(name, bytes, widths) {
+  const stride = widths.reduce((a, w) => a + w, 0);
+  const rows = Math.floor(bytes.length / stride);
+  const head = Buffer.concat([Buffer.from('GTT1'), u32(1), Buffer.from([4, 1, name.length]), Buffer.from(name), u64(bytes.length),
+    u16(widths.length), ...widths.map((w, c) => Buffer.concat([Buffer.from([w]), u16(c)]))]);
+  let at = 0;
+  const cols = widths.map((w) => {
+    const field = at;
+    at += w;
+    return Buffer.concat(Array.from({ length: rows }, (_, r) => bytes.subarray(r * stride + field, r * stride + field + w)));
+  });
+  const chunk = rows ? Buffer.concat([u32(rows), ...cols.map((c) => Buffer.concat([Buffer.from('R'), u32(c.length)])), ...cols]) : Buffer.alloc(0);
+  const tail = bytes.subarray(rows * stride);
+  return Buffer.concat([head, chunk, u32(0), u32(tail.length), tail]);
+}
+
+// Streams `unit` into a decoder for `dir` and `files` in chunks of `step` bytes, then finishes it.
+async function decodeInto(dir, files, unit, step = 7) {
+  const decoder = createTransportDecoder(dir, files);
+  for (let at = 0; at < unit.length; at += step) await decoder.write(unit.subarray(at, at + step));
+  return decoder.finish();
+}
+
+const filesOf = (members) => members.map(([name, bytes]) => ({ name, sha256: sha256(bytes) }));
+const held = (dir) => Object.fromEntries(readdirSync(dir).sort().map((n) => [n, readFileSync(join(dir, n)).toString('hex')]));
+
+test('a unit streamed into its decoder becomes its files', async () => {
+  const units = goldenUnits();
+  assert.deepEqual(units.map((u) => u.kind), ['places', 'pois', 'arcs', 'cols']);
+  for (const { kind, members, stream } of units) {
+    const dir = mkdtempSync(join(root, `unit-${kind}-`));
+
+    assert.deepEqual(await decodeInto(dir, filesOf(members).reverse(), published(stream)), members.map(([name]) => name), kind);
+
+    assert.deepEqual(held(dir), Object.fromEntries(members.map(([n, b]) => [n, b.toString('hex')]).sort()), kind);
+  }
+});
+
+test('a geocoder loads a dataset whose files came through a unit', async () => {
+  const dir = dataset(['Testville', 'Otherton']);
+  const polygons = readFileSync(join(dir, 'admin_polygons.bin'));
+  rmSync(join(dir, 'admin_polygons.bin'));
+  const unit = colsUnit('admin_polygons.bin', polygons, [4, 4, 4, 2, 1, 1]);
+
+  await decodeInto(dir, filesOf([['admin_polygons.bin', polygons]]), published(unit), 5);
+
+  assert.deepEqual(readFileSync(join(dir, 'admin_polygons.bin')), polygons);
+  assert.equal(JSON.parse(await Geocoder.load(dir).reverseGeocode(10.5, 20.5)).address.country, 'Testland');
+});
+
+test('a unit cut short, of another sha256 or of files not named leaves the dir as it was', async () => {
+  const { members, stream } = goldenUnits()[0];
+  const unit = published(stream);
+  const dir = mkdtempSync(join(root, 'refused-'));
+  for (const [name] of members) writeFileSync(join(dir, name), 'an older build\'s');
+  const before = held(dir);
+  const files = filesOf(members);
+
+  await assert.rejects(decodeInto(dir, files, unit.subarray(0, unit.length - 5)));
+  assert.deepEqual(held(dir), before);
+  const wrong = files.map((f) => (f.name === 'place_nodes.bin' ? { ...f, sha256: '0'.repeat(64) } : f));
+  await assert.rejects(decodeInto(dir, wrong, unit), /place_nodes\.bin's sha256 is [0-9a-f]{64}, not 0{64}/);
+  assert.deepEqual(held(dir), before);
+  await assert.rejects(decodeInto(dir, files.slice(1), unit), /place_cells\.bin is no file this unit is to hold/);
+  assert.deepEqual(held(dir), before);
+  await assert.rejects(decodeInto(dir, [...files, { name: 'poi_records.bin', sha256: '0'.repeat(64) }], unit), /the unit lacks poi_records\.bin/);
+  assert.deepEqual(held(dir), before);
+});
+
+test('a decoder takes one write at a time and none after its finish', async () => {
+  const { members, stream } = goldenUnits()[3];
+  const unit = published(stream);
+  const decoder = createTransportDecoder(mkdtempSync(join(root, 'once-')), filesOf(members));
+  const first = decoder.write(unit.subarray(0, 3));
+
+  assert.throws(() => decoder.write(unit.subarray(3)), /A write is still running/);
+  await first;
+  await decoder.write(unit.subarray(3));
+  await decoder.finish();
+  assert.throws(() => decoder.write(unit), /finished/);
+  assert.throws(() => decoder.finish(), /finished/);
 });
