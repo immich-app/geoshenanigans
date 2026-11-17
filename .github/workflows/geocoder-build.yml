@@ -1071,11 +1071,13 @@ jobs:
           fi
 
           # ── Update latest.json ──
-          # Skip latest.json update on patch verify failure — we still
-          # want the dated-build artifacts uploaded for local debugging,
-          # but consumers of latest.json shouldn't switch to a broken
-          # build.
-          if [ -z "$PATCH_VERIFY_FAILED" ]; then
+          # Skip latest.json update on patch verify failure, or when a
+          # transport unit failed and its files went as .zst, which a client
+          # that fetches those files only as the unit (the test portal)
+          # can't download — we still want the dated-build artifacts
+          # uploaded for local debugging, but consumers of latest.json
+          # shouldn't switch to a broken build.
+          if [ -z "${PATCH_VERIFY_FAILED:-}" ] && [ -z "${TRANSPORT_UNIT_FAILED:-}" ]; then
             PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "null" )"
             BUILD_V=$(jq -r .build.version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
             PATCH_V=$(jq -r .build.patch_version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
@@ -1122,7 +1124,7 @@ jobs:
               '{build_version: $build_version, patch_version: $patch_version, latest: $latest, previous: (if $previous == "null" then null else $previous end), oldest_indexes: $oldest_indexes, oldest_patches: $oldest_patches, updated_at: $updated_at}' \
               | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.json"
           else
-            echo "::warning::Skipping latest.json update — patch verify failed"
+            echo "::warning::Skipping latest.json update — patch verify or a transport unit failed"
           fi
 
           echo "Upload complete."
@@ -1144,13 +1146,14 @@ jobs:
       #   - Patches (patch.gcpatch + configurations.json): keep next 11 days (14 total)
       #   - Older than 14 days: delete entirely
       # Skip cleanup if:
-      #   - This run had patch verify failures (don't trash history when
-      #     the new build is unhealthy)
+      #   - This run had patch verify failures or a failed transport unit
+      #     (latest.json still names an older build; don't trash history
+      #     when the new build is unhealthy)
       #   - Today's build directory isn't present in Tigris (defensive
       #     check — refuses to delete anything if the new data didn't
       #     actually land)
       - name: Cleanup old Tigris builds
-        if: env.PATCH_VERIFY_FAILED != '1'
+        if: env.PATCH_VERIFY_FAILED != '1' && env.TRANSPORT_UNIT_FAILED != '1'
         env:
           NEW_DATE: ${{ steps.setup.outputs.today }}
         run: |
@@ -1285,6 +1288,7 @@ jobs:
 
       # A unit that failed its encode or verify was published as its files'
       # .zst: the build is whole, but the units must hold every file again.
+      # latest.json still names the build before it, and no build was pruned.
       - name: Fail run on transport unit failure
         if: env.TRANSPORT_UNIT_FAILED == '1'
         run: |

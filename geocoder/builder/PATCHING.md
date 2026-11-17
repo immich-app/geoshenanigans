@@ -475,7 +475,9 @@ them, whichever way a client got them.
   `TRANSPORT_VERSION` bump), and the nightly's verify of every unit against
   the files it was made from, in every region and variant, before upload. A
   format change the transport doesn't follow fails that verify: the unit's
-  files go as `.zst` that night and the run fails at its end.
+  files go as `.zst` that night and the run fails at its end, leaving
+  latest.json on the build before (the test portal fetches those files only
+  as the unit) and pruning no build.
 - **Versioned**: the stream and configurations.json's `units` carry the
   transport version (the template's `transport.version`, held to the
   library's). Setup builds fresh when yesterday's units are of another
