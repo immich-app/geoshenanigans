@@ -302,16 +302,20 @@ impl<'a> PoiSource<'a> {
         Ok(PoiSource { geo, n, max_tier: opts.poi_max_tier, imp_poi, extras })
     }
 
-    fn fill(&self, pos: u32, e: &mut EntityBuf) -> bool {
+    /// The entity of POI record `pos` (below `n`); false when it is not one (a tombstone, a
+    /// secondary ring, a tier left out) or has no name, an error for a row that does not read,
+    /// which would leave the POI out of every index built over the file.
+    fn fill(&self, pos: u32, e: &mut EntityBuf) -> Result<bool, String> {
         e.names.clear();
-        let Some(r) = poi_raw(self.geo, pos) else { return false };
+        let r = poi_raw(self.geo, pos)
+            .ok_or_else(|| format!("poi_records.bin: row {pos} names a combo or a postcode its dictionaries do not hold"))?;
         if r.name_id == NO_DATA || r.flags & POI_FLAG_SECONDARY_RING != 0 || r.tier > self.max_tier {
-            return false;
+            return Ok(false);
         }
         e.id = pos;
         e.imp = poi_importance(r.importance, byte_at(&self.imp_poi, pos));
         e.cc_poly = r.parent_poly_id;
-        fill_names(self.geo, self.extras, &[record_ref(KIND_POI, pos)], r.name_id, e)
+        Ok(fill_names(self.geo, self.extras, &[record_ref(KIND_POI, pos)], r.name_id, e))
     }
 }
 
@@ -343,13 +347,14 @@ impl Source<'_> {
             Source::Poi(s) => s.n,
         }
     }
-    /// Calls `f` with the entity of each position of [lo, hi) that is one, each once.
-    fn for_each_entity<E>(&self, lo: u32, hi: u32, e: &mut EntityBuf, f: &mut impl FnMut(&EntityBuf) -> Result<(), E>) -> Result<(), E> {
+    /// Calls `f` with the entity of each position of [lo, hi) that is one, each once; an error
+    /// of `f`'s, or for a record that does not read (`PoiSource::fill`).
+    fn for_each_entity(&self, lo: u32, hi: u32, e: &mut EntityBuf, f: &mut impl FnMut(&EntityBuf) -> Result<(), String>) -> Result<(), String> {
         match self {
             Source::Places(s) => s.for_each_entity(lo, hi, e, f),
             Source::Poi(s) => {
                 for pos in lo..hi {
-                    if s.fill(pos, e) {
+                    if s.fill(pos, e)? {
                         f(e)?;
                     }
                 }
@@ -1752,6 +1757,38 @@ mod tests {
         let err = build(&geo, &["places"], &dir.0.join("idx"), &opts).err();
 
         assert!(err.as_deref().is_some_and(|e| e.contains("65536 bytes")), "{err:?}");
+    }
+
+    #[test]
+    fn a_build_fails_on_a_poi_row_that_does_not_read() {
+        use crate::fixture::{Geo, TempDir};
+        use query_server::{DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
+        let mut g = Geo::default();
+        g.place("Testburg", 1, 10.1, 20.1);
+        for (k, name) in ["Old Mill", "Test Hall", "Mill Pond"].iter().enumerate() {
+            g.poi(name, 10.0 + k as f32, 20.0, 0);
+        }
+        let dir = TempDir::new("poi-row");
+        let set = dir.0.join("geo");
+        g.write(&set);
+        let records = std::fs::read(set.join("poi_records.bin")).unwrap();
+
+        // Row 1 (27 bytes a row) naming a combo, then a postcode, past its dictionary.
+        for (case, at) in [("a combo", 27 + 25), ("a postcode", 27 + 23)] {
+            let mut bad = records.clone();
+            bad[at..at + 2].copy_from_slice(&0xFFFEu16.to_le_bytes());
+            std::fs::write(set.join("poi_records.bin"), bad).unwrap();
+            let geo = Index::load(set.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+            assert!(geo.poi_records.as_ref().unwrap().record(1).is_none(), "{case}");
+
+            for threads in [1, 3] {
+                let opts = BuildOpts { threads, ..BuildOpts::new(dir.0.join("tmp")) };
+
+                let err = build(&geo, &["poi"], &dir.0.join("idx"), &opts).err();
+
+                assert!(err.as_deref().is_some_and(|e| e.contains("poi_records.bin") && e.contains("row 1")), "{case}, {threads} threads: {err:?}");
+            }
+        }
     }
 
     #[test]

@@ -135,14 +135,14 @@ impl Node {
         Some(Node { shape: Shape::Any, end, ntrans, is_final, final_output, tsize, osize, input: 0, inputs_end })
     }
 
-    /// The node `step` bytes below this one's first byte (EMPTY for a step of 0); None below the
-    /// start of the file.
+    /// The node `step` bytes below this one's first byte (EMPTY for a step of 0); None for an
+    /// address below the nodes, EMPTY's among them (only a step of 0 leads to EMPTY).
     #[inline]
     fn below(&self, step: u64) -> Option<usize> {
         if step == 0 {
             return Some(EMPTY);
         }
-        self.end.checked_sub(usize::try_from(step).ok()?)
+        self.end.checked_sub(usize::try_from(step).ok()?).filter(|&addr| addr >= HEADER_BYTES)
     }
 
     /// Transition `i` (below `ntrans`) of the node, whose bytes are in `b`; None for one that
@@ -172,9 +172,10 @@ impl Node {
         match self.shape {
             Shape::Empty => None,
             Shape::Next | Shape::One => (self.input == input).then_some(0),
+            // The table's entry is a transition of that input, or of none (at or past ntrans).
             Shape::Any if self.ntrans > TRANS_INDEX_THRESHOLD => {
                 let i = b[self.inputs_end + input as usize] as usize;
-                (i < self.ntrans).then_some(i)
+                (i < self.ntrans && b[self.inputs_end - 1 - i] == input).then_some(i)
             }
             Shape::Any => {
                 let inputs = &b[self.inputs_end - self.ntrans..self.inputs_end];
@@ -208,18 +209,33 @@ impl<D: AsRef<[u8]>> Keys<D> {
         Ok(keys)
     }
 
-    /// The value of `key`; None for a key the map does not hold, or one below a node or a
-    /// transition that does not read.
+    /// The value of `key`; None for a key the map does not hold, one below a node or a
+    /// transition that does not read, or one whose outputs add up past 64 bits.
     pub fn get(&self, key: impl AsRef<[u8]>) -> Option<u64> {
         let b = self.data.as_ref();
         let mut node = Node::read(b, self.root)?;
         let mut out = 0u64;
         for &x in key.as_ref() {
             let t = node.trans(b, node.find(b, x)?)?;
-            out = out.wrapping_add(t.out);
+            out = out.checked_add(t.out)?;
             node = Node::read(b, t.addr)?;
         }
-        node.is_final.then(|| out.wrapping_add(node.final_output))
+        if !node.is_final {
+            return None;
+        }
+        out.checked_add(node.final_output)
+    }
+
+    /// Whether the map's bytes are those its build wrote, by the checksum after its footer (the
+    /// fst crate's `verify`): a read of every byte, for a tool that walks every key (a damaged
+    /// file's walk can be as long as its paths are many); no query takes it.
+    pub fn verify(&self) -> Result<(), String> {
+        let checked = fst::raw::Fst::new(self.data.as_ref()).and_then(|f| f.verify());
+        // The crate's error says only "FST error"; the one it holds says which.
+        checked.map_err(|e| match e {
+            fst::Error::Fst(e) => e.to_string(),
+            e => e.to_string(),
+        })
     }
 
     /// Every key and its value, in key order: a tool's walk, as long as the map.
@@ -301,12 +317,16 @@ impl<A: Automaton> Stream<'_, A> {
                 return None;
             }
             self.steps_left -= 1;
-            // A transition, or a node it leads to, that does not read is as if it were not there.
+            // A transition, or a node it leads to, that does not read is as if it were not there,
+            // as is one whose outputs add up past 64 bits (and every key below it).
             let Some((t, next)) = f.node.trans(b, f.trans).and_then(|t| Some((t, Node::read(b, t.addr)?))) else {
                 self.stack.push(Frame { trans: f.trans + 1, ..f });
                 continue;
             };
-            let out = f.out.wrapping_add(t.out);
+            let Some(out) = f.out.checked_add(t.out) else {
+                self.stack.push(Frame { trans: f.trans + 1, ..f });
+                continue;
+            };
             let state = self.aut.accept(&f.state, t.input);
             let mut is_match = self.aut.is_match(&state);
             if next.is_final {
@@ -318,8 +338,9 @@ impl<A: Automaton> Stream<'_, A> {
             self.stack.push(Frame { trans: f.trans + 1, ..f });
             let found = (next.is_final && is_match).then(|| map(&state));
             self.stack.push(Frame { node: next, trans: 0, out, state });
-            if let Some(mapped) = found {
-                return Some((&self.key, out.wrapping_add(next.final_output), mapped));
+            // A key whose value is past 64 bits is none, the keys below it still are.
+            if let (Some(mapped), Some(value)) = (found, out.checked_add(next.final_output)) {
+                return Some((&self.key, value, mapped));
             }
         }
         None
@@ -446,6 +467,76 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// fst's header and footer around `nodes` (written from HEADER_BYTES), the last node's state
+    /// byte the root, a checksum of 0.
+    fn fst_around(nodes: &[u8], keys: u64) -> Vec<u8> {
+        let root = (HEADER_BYTES + nodes.len() - 1) as u64;
+        [&VERSION.to_le_bytes()[..], &0u64.to_le_bytes(), nodes, &keys.to_le_bytes(), &root.to_le_bytes(), &[0; 4]].concat()
+    }
+
+    /// A node of one transition on `input` of 8-byte output `out`, `step` bytes below its first
+    /// byte: [output][step][pack sizes][input][state].
+    fn one(out: u64, step: u8, input: u8) -> Vec<u8> {
+        [&out.to_le_bytes()[..], &[step, 0x18, input, 0x80]].concat()
+    }
+
+    #[test]
+    fn a_step_to_before_the_nodes_is_no_transition_but_a_step_of_0_is_the_final_leaf() {
+        // The root's one transition, on 'a', of a 1-byte step and no output: [step][pack sizes]
+        // [input][state] from address 16, its first byte.
+        let root = |step: u8| fst_around(&[step, 0x10, b'a', 0x80], 1);
+        let (leaf, before) = (root(0), root(16));
+
+        let leaf_keys = Keys::new(leaf.clone()).unwrap();
+        assert_eq!(leaf_keys.get("a"), fst::Map::new(leaf).unwrap().get("a"));
+        assert_eq!((leaf_keys.get("a"), pairs!(leaf_keys.stream())), (Some(0), vec![(b"a".to_vec(), 0)]));
+        // A step down to address 0 counts the transition's node below the start of the file.
+        let before = Keys::new(before).unwrap();
+        assert_eq!((before.get("a"), pairs!(before.stream())), (None, vec![]));
+    }
+
+    #[test]
+    fn outputs_past_64_bits_are_no_value() {
+        // 'a' of output 2^64 - 1 to a final node of output 2 and no transition: [final output]
+        // [pack sizes][transition count][state], then the root.
+        let final_past = fst_around(&[[2, 0x01, 0, 0x40].as_slice(), &one(u64::MAX, 1, b'a')].concat(), 1);
+        // 'a' of output 2^64 - 1, then 'b' of output 2 to the final leaf.
+        let trans_past = fst_around(&[[2, 0, 0x11, b'b', 0x80].as_slice(), &one(u64::MAX, 1, b'a')].concat(), 1);
+        // 'a' of output 2^64 - 1 to a final node of output 2 (past 64 bits) whose one transition,
+        // 'b' of output 0, leads to the final leaf (2^64 - 1): [final output][output][step][input]
+        // [pack sizes][state], then the root.
+        let below_past = fst_around(&[[2, 0, 0, b'b', 0x11, 0x41].as_slice(), &one(u64::MAX, 1, b'a')].concat(), 2);
+        let none: Vec<(Vec<u8>, u64)> = vec![];
+
+        for (case, bytes, key, streamed) in [
+            ("a final output", final_past, "a", none.clone()),
+            ("a transition's output", trans_past, "ab", none),
+            ("a final output above a key", below_past, "a", vec![(b"ab".to_vec(), u64::MAX)]),
+        ] {
+            let keys = Keys::new(bytes).unwrap();
+
+            assert_eq!(keys.get(key), None, "{case}");
+            assert_eq!(pairs!(keys.stream()), streamed, "{case}");
+            assert_eq!(pairs!(keys.search(Str::new(key).starts_with())), streamed, "{case}");
+        }
+    }
+
+    #[test]
+    fn an_entry_of_a_wide_nodes_table_names_a_transition_of_its_input_or_none() {
+        // A root of 40 transitions, 'A' to 'h', the k-th of value k: it holds a table by input.
+        let entries: Vec<(Vec<u8>, u64)> = (0..40u8).map(|k| (vec![b'A' + k], k as u64)).collect();
+        let mut b = build(&entries);
+        let root = Node::read(&b, b.len() - FOOTER_BYTES - 1).unwrap();
+        assert_eq!((root.ntrans, b[root.inputs_end + b'C' as usize]), (40, 2));
+
+        // 'B' names the transition of 'C', 'z' (of none) that of 'D'.
+        b[root.inputs_end + b'B' as usize] = 2;
+        b[root.inputs_end + b'z' as usize] = 3;
+        let keys = Keys::new(b).unwrap();
+
+        assert_eq!([keys.get("B"), keys.get("z"), keys.get("C"), keys.get("D")], [None, None, Some(2), Some(3)]);
     }
 
     #[test]

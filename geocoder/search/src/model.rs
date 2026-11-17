@@ -412,10 +412,19 @@ mod tests {
             decode_prefix_hits(buf, off, &mut got);
             got.iter().map(|h| h.entity).collect::<Vec<_>>()
         };
-        // Cut anywhere: the hits before the cut.
-        for cut in 0..whole.len() {
+        // Cut anywhere: the hits that end at or before the cut. Each hit ends where a list of it
+        // and those before it would end (its count takes one byte too).
+        let ends: Vec<usize> = (1..=hits.len())
+            .map(|k| {
+                let mut b = Vec::new();
+                encode_prefix_hits(&mut b, &hits[..k]);
+                b.len()
+            })
+            .collect();
+        for cut in 0..=whole.len() {
             let got = decode(&whole[..cut], 0);
-            assert!(got.len() < hits.len() && hits.iter().zip(&got).all(|(h, &e)| h.entity == e), "cut at {cut}: {got:?}");
+            let want: Vec<u32> = hits.iter().zip(&ends).filter(|&(_, &end)| end <= cut).map(|(h, _)| h.entity).collect();
+            assert_eq!(got, want, "cut at {cut}");
         }
         // Any byte replaced: no panic, no more hits than the table keeps.
         for at in 0..whole.len() {

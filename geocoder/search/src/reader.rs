@@ -54,6 +54,18 @@ impl SubIndex {
         })
     }
 
+    /// `open`, and an error, naming the file, for an fst whose bytes are not those its build
+    /// wrote (`Keys::verify`, a read of each whole file): for a tool that walks every key, which
+    /// a damaged file can make a walk of no end. A query's open does not take it.
+    pub fn open_verified(dir: &Path, name: &str, entities: u32) -> Result<Self, String> {
+        let sub = Self::open(dir, name, entities)?;
+        let [keys, _, pfx_keys, _] = sub_index_files(name).map(|f| dir.join(f));
+        for (fst, path) in [(&sub.map, keys), (&sub.pfx_map, pfx_keys)] {
+            fst.verify().map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        Ok(sub)
+    }
+
     fn tag(&self, mut p: Posting) -> Posting {
         if self.poi {
             p.entity |= POI_BIT;
@@ -83,7 +95,11 @@ impl SubIndex {
     /// The prefix-table hits of `phrase` (None without an entry), read up to a hit of no entity
     /// of the sub-index, as lists are (`decode_prefix_hits` for a damaged one).
     pub fn prefix_hits(&self, phrase: &str) -> Option<Vec<PrefixHit>> {
-        let off = self.pfx_map.get(phrase)?;
+        Some(self.prefix_hits_at(self.pfx_map.get(phrase)?))
+    }
+
+    /// The hits of the prefix-table list at `off` (`prefix_hits`).
+    fn prefix_hits_at(&self, off: u64) -> Vec<PrefixHit> {
         let mut out = Vec::new();
         if let Ok(off) = usize::try_from(off) {
             decode_prefix_hits(&self.pfx, off, &mut out);
@@ -96,7 +112,7 @@ impl SubIndex {
                 h.entity |= POI_BIT;
             }
         }
-        Some(out)
+        out
     }
 }
 
@@ -324,21 +340,34 @@ mod tests {
         let (geo, out) = built(&dir);
         let le = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>();
         let (lat, lng) = (10.1f32.to_bits(), 20.1f32.to_bits());
-        let off = |lat: f32, lng: f32| le(&[1, 0, 0, lat.to_bits(), lng.to_bits(), 1]);
-        let cases = [
-            ("a label node past the place nodes", le(&[1, u32::MAX, 0, lat, lng, 1])),
-            ("no slot of the boundaries", le(&[0])),
-            ("slots out of order", le(&[5, 0, 1, 0, 2])),
-            ("a polygon past the boundaries", le(&[1, 0, 7, lat, lng, 1])),
-            ("an infinite point", off(f32::INFINITY, 20.1)),
-            ("a point of NaN", off(10.1, f32::NAN)),
-            ("a point off the globe", off(95.0, 200.0)),
+        // Testville's node, the label of polygon 1 (the built file's labelled slot), and a node
+        // that labels none.
+        let bnd = std::fs::read(out.join(BOUNDARY_FILE)).unwrap();
+        let label = u32::from_le_bytes(bnd[4..8].try_into().unwrap());
+        let visible = (0..geo.place_node_count()).find(|&i| geo.place_node_record(i).unwrap().is_visible()).unwrap();
+        let off = |lat: f32, lng: f32| le(&[1, label, 0, lat.to_bits(), lng.to_bits(), 1]);
+        // Each case's bytes and the slots that are none.
+        let cases: [(&str, Vec<u8>, &[usize]); 9] = [
+            ("a label node past the place nodes", le(&[1, u32::MAX, 0, lat, lng, 1]), &[0]),
+            ("a label node of another polygon", le(&[0, label, 1]), &[0]),
+            ("a visible label node", le(&[1, visible, 1]), &[0]),
+            ("no slot of the boundaries", le(&[0]), &[0]),
+            ("slots out of order", le(&[5, label, 1, label, 2]), &[0]),
+            ("a polygon past the boundaries", le(&[1, label, 7, lat, lng, 1]), &[1]),
+            ("an infinite point", off(f32::INFINITY, 20.1), &[1]),
+            ("a point of NaN", off(10.1, f32::NAN), &[1]),
+            ("a point off the globe", off(95.0, 200.0), &[1]),
         ];
         let mut failed = Vec::new();
-        for (case, bytes) in cases {
+        for (case, bytes, none) in cases {
             std::fs::write(out.join(BOUNDARY_FILE), bytes).unwrap();
             let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
 
+            for &pos in none {
+                if let Some(slot) = idx.ents.bnd.at(&geo, pos) {
+                    failed.push(format!("{case}: slot {pos}: {slot:?}"));
+                }
+            }
             for q in ["testville", "testland", "test", "alpha", "testland, testland", "alpha, testland"] {
                 let found = panic_of(|| Searcher::new(&idx).search(q, 5).0.iter().map(|f| (f.lat, f.lng)).collect::<Vec<_>>());
                 match found {
@@ -438,7 +467,7 @@ mod tests {
             std::fs::write(out.join("places.fst"), bytes).unwrap();
             let found = panic_of(|| {
                 let Ok(idx) = SearchIndex::open(&geo, &out, None, None) else { return };
-                for q in ["alpha", "a", "ab", "al", "alp", "alpah", "alpha hill", "testville", "alpha, testland"] {
+                for q in ["alpha", "a", "ab", "al", "alp", "alpah", "alpha hill", "testville", "alpha, testland", "ab, testland"] {
                     Searcher::new(&idx).search(q, 5);
                 }
             });
@@ -451,18 +480,46 @@ mod tests {
 
     #[test]
     fn walks_of_damaged_key_files_end() {
-        for (case, bytes) in [("a transition to its own node", a_loop()), ("2^60 paths", paths(60))] {
+        // Each fst, and whether its open may refuse it.
+        for (case, bytes, refusable) in [("a transition to its own node", a_loop(), true), ("2^60 paths", paths(60), false)] {
             let ended = ends_within(120, move || {
                 let dir = TempDir::new("fst-walks");
                 let (geo, out) = built(&dir);
                 std::fs::write(out.join("places.fst"), bytes).unwrap();
-                let Ok(idx) = SearchIndex::open(&geo, &out, None, None) else { return };
+                let idx = match SearchIndex::open(&geo, &out, None, None) {
+                    Ok(idx) => idx,
+                    Err(_) if refusable => return,
+                    Err(e) => panic!("refused at open: {e}"),
+                };
                 // A prefix of no edit, of one and of two.
                 for q in ["aaa", "aaaaaa", "aaaaaaaaaa"] {
                     Searcher::new(&idx).search(q, 5);
                 }
             });
             assert!(ended.is_ok(), "{case}: {ended:?}");
+        }
+    }
+
+    #[test]
+    fn a_sub_index_for_a_walk_of_every_key_opens_only_with_the_checksums_of_its_fsts() {
+        let dir = TempDir::new("fst-verified");
+        let (geo, out) = built(&dir);
+        let n = geo.place_node_count() + geo.admin_polygon_count();
+        assert!(SubIndex::open_verified(&out, "places", n).is_ok());
+        assert!(SubIndex::open_verified(&out, "poi", 5).is_ok());
+        // A bit of the first node (written from address 16, below the root) flipped.
+        let mut flipped = std::fs::read(out.join("places.fst")).unwrap();
+        flipped[16] ^= 1;
+
+        for (case, f, bytes) in [("2^60 paths", "places.fst", paths(60)), ("a bit flipped", "places.fst", flipped), ("2^60 paths", "places.pfx.fst", paths(60))] {
+            let whole = std::fs::read(out.join(f)).unwrap();
+            std::fs::write(out.join(f), bytes).unwrap();
+
+            let (open, verified) = (SubIndex::open(&out, "places", n), SubIndex::open_verified(&out, "places", n));
+
+            assert!(open.is_ok(), "{case} {f}: {:?}", open.err());
+            assert!(verified.as_ref().err().is_some_and(|e| e.contains(f) && e.contains("checksum")), "{case} {f}: {:?}", verified.err());
+            std::fs::write(out.join(f), whole).unwrap();
         }
     }
 
@@ -499,10 +556,12 @@ mod tests {
         let dir = TempDir::new("pfx-entities");
         let (geo, out) = built(&dir);
         let n = geo.place_node_count() + geo.admin_polygon_count();
-        // One list under the prefixes "al" and "ol": a hit of `entity`.
+        // One list under the prefixes "al" and "ol": hits of entities 1, `entity` and 2 (each of
+        // both sub-indexes).
         let list = |entity: u32| {
+            let hit = |entity: u32| PrefixHit { entity, partial: false, text: 1.0, imp_q: 250, class: 0, ord: 0 };
             let mut b = Vec::new();
-            encode_prefix_hits(&mut b, &[PrefixHit { entity, partial: false, text: 1.0, imp_q: 250, class: 0, ord: 0 }]);
+            encode_prefix_hits(&mut b, &[hit(1), hit(entity), hit(2)]);
             b
         };
         let cases = [
@@ -522,13 +581,16 @@ mod tests {
             std::fs::write(out.join(&pfx.1), bytes).unwrap();
             let found = panic_of(|| {
                 let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
-                ["a", "al", "ol", "o", "t", "te", "alpha", "old mill"].map(|q| Searcher::new(&idx).search(q, 5).0.iter().map(|f| f.hit.entity).collect::<Vec<_>>())
+                let hits = idx.sub((sub == "poi") as u8).prefix_hits("al").map(|h| h.iter().map(|h| h.entity).collect::<Vec<_>>());
+                (hits, ["a", "al", "ol", "o", "t", "te", "alpha", "old mill"].map(|q| Searcher::new(&idx).search(q, 5).0.iter().map(|f| f.hit.entity).collect::<Vec<_>>()))
             });
-            // The entity as a result would carry it.
-            let bad = if sub == "poi" { entity | POI_BIT } else { entity };
+            // The entity as a result would carry it; the list's hits read up to it.
+            let tag = if sub == "poi" { POI_BIT } else { 0 };
+            let bad = entity | tag;
             match found {
                 Err(p) => failed.push(format!("{case}: {p}")),
-                Ok(found) if found.iter().flatten().any(|&e| e == bad) => failed.push(format!("{case}: {found:?}")),
+                Ok((_, found)) if found.iter().flatten().any(|&e| e == bad) => failed.push(format!("{case}: {found:?}")),
+                Ok((hits, _)) if entity != u32::MAX && hits.as_deref() != Some(&[1 | tag][..]) => failed.push(format!("{case}: hits {hits:?}")),
                 Ok(_) => {}
             }
             for (bytes, f) in [keys, pfx] {
@@ -615,12 +677,8 @@ mod tests {
                 sub.first_imp(v);
             }
             let mut s = sub.pfx_map.stream();
-            let mut prefixes = Vec::new();
-            while let Some((k, _)) = s.next() {
-                prefixes.push(String::from_utf8_lossy(k).into_owned());
-            }
-            for p in prefixes {
-                sub.prefix_hits(&p);
+            while let Some((_, off)) = s.next() {
+                sub.prefix_hits_at(off);
             }
         }
     }

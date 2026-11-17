@@ -218,9 +218,15 @@ fn cmd_ctxbench(args: &[String]) {
 fn cmd_diff(args: &[String]) {
     use fst::Streamer;
     let (a, b, name) = (Path::new(&args[2]), Path::new(&args[3]), &args[4]);
-    // Every posting of each list, whatever its entity.
-    let sa = place_search::reader::SubIndex::open(a, name, u32::MAX).expect("A");
-    let sb = place_search::reader::SubIndex::open(b, name, u32::MAX).expect("B");
+    // Every posting of each list, whatever its entity; each fst verified first, as a walk of a
+    // damaged one may not end.
+    let open = |dir: &Path| {
+        place_search::reader::SubIndex::open_verified(dir, name, u32::MAX).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1)
+        })
+    };
+    let (sa, sb) = (open(a), open(b));
     let mut ia = sa.map.stream();
     let mut ib = sb.map.stream();
     let (mut only_a, mut only_b, mut same, mut changed) = (0u64, 0u64, 0u64, 0u64);

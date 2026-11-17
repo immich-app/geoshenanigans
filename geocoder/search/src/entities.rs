@@ -163,14 +163,18 @@ impl Boundaries {
     }
 
     /// Slot `pos` of the labelled ones, then the unlabelled ones; None past the last, and for a
-    /// slot no build writes: of a polygon the dataset does not hold, labelled by a node the place
-    /// nodes do not hold, or with a label point off the globe (NaN among them).
+    /// slot no build writes: of a polygon the dataset does not hold, labelled by a node that is
+    /// not a hidden label of that polygon (PlacesSource::new), or with a label point off the
+    /// globe (NaN among them).
     pub fn at(&self, geo: &Index, pos: usize) -> Option<BoundarySlot> {
         let slot = if pos < self.labelled {
             let at = pos * LABELLED_SLOT_BYTES;
-            let node = self.u32_at(at + 4);
+            let (poly, node) = (self.u32_at(at), self.u32_at(at + 4));
             let pn = geo.place_node_record(node)?;
-            BoundarySlot { poly: self.u32_at(at), node, lat: pn.lat, lng: pn.lng }
+            if pn.is_visible() || pn._pad1 & PLACE_FLAG_LABEL_OF == 0 || pn.parent_poly_id != poly {
+                return None;
+            }
+            BoundarySlot { poly, node, lat: pn.lat, lng: pn.lng }
         } else if pos < self.len() {
             let at = self.labelled * LABELLED_SLOT_BYTES + (pos - self.labelled) * UNLABELLED_SLOT_BYTES;
             let (lat, lng) = (f32::from_bits(self.u32_at(at + 4)), f32::from_bits(self.u32_at(at + 8)));
