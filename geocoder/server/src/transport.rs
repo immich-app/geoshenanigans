@@ -73,6 +73,7 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 
 pub use cols::COLS_FILES;
@@ -230,66 +231,177 @@ pub struct Expected {
     pub size: Option<u64>,
 }
 
-/// Decodes `unit`, a unit as published (through zstd), into its members in `dir`: each one to
-/// <name>.tmp there, all of them renamed into place once the whole unit has decoded. With
-/// `expect`, the members must be those files, in any order, each of its sha256 and size;
-/// without, any. On an error no .tmp file stays and no member is renamed, so `dir` holds what it
-/// held. A unit's members lie in `dir` together for a while: it needs their size free there.
-/// Returns the unit's kind and members.
+/// Decodes `unit`, a unit as published (through zstd), into its members in `dir`, each under its
+/// name, all of them put in place once the whole unit has decoded. With `expect`, the members
+/// must be those files, in any order, each of its sha256 and size; without, any. Returns the
+/// unit's kind and members.
+///
+/// The decode makes a dir of its own in `dir` (a hidden name, which no member has and no other
+/// decode takes) and writes the members there; then it moves them into place one by one, the
+/// file each one replaces moved into its dir first, and once all are in it removes those files
+/// and its dir. It touches nothing else in `dir`: a `<member>.tmp` there, say, stays as it is.
+///
+/// On an error `dir` is as it was: the members moved in so far are taken out again, the files
+/// they replaced put back, and nothing of the decode is left. A member's path that is a directory
+/// is an error.
+///
+/// Decodes of a unit into one dir at once each put complete, checked members in place, the last
+/// to move a member in winning; one that fails while another is putting its members in may undo
+/// some of that one's.
+///
+/// A unit's members lie in `dir` beside the files they replace for a while: it needs their size
+/// free there.
 pub fn decode_into_dir(unit: impl Read, dir: &Path, expect: Option<&[Expected]>) -> io::Result<(Kind, Vec<Member>)> {
-    let mut tmps: Vec<PathBuf> = Vec::new();
+    let mut staging = Staging::new_in(dir)?;
+    let scratch = staging.path.clone();
     let mut wanted: Vec<Option<&Expected>> = Vec::new();
-    let decoded = zstd::stream::read::Decoder::new(unit).and_then(|input| {
-        decode(input, dir, |m| {
-            let e = match expect {
-                None => None,
-                Some(files) => {
-                    let e = files.iter().find(|e| e.name == m.name).ok_or_else(|| container::invalid(format!("{} is no file this unit is to hold", m.name)))?;
-                    if let Some(size) = e.size.filter(|&size| size != m.size) {
-                        return Err(container::invalid(format!("{} is {} bytes in the unit, not {size}", m.name, m.size)));
-                    }
-                    Some(e)
+    let decoded = decode(zstd::stream::read::Decoder::new(unit)?, &scratch, |m| {
+        let e = match expect {
+            None => None,
+            Some(files) => {
+                let e = files.iter().find(|e| e.name == m.name).ok_or_else(|| container::invalid(format!("{} is no file this unit is to hold", m.name)))?;
+                if let Some(size) = e.size.filter(|&size| size != m.size) {
+                    return Err(container::invalid(format!("{} is {} bytes in the unit, not {size}", m.name, m.size)));
                 }
-            };
-            let tmp = dir.join(format!("{}.tmp", m.name));
-            let file = File::create(&tmp).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", tmp.display())))?;
-            tmps.push(tmp);
-            wanted.push(e);
-            Ok(Hashed { file, sha: Sha256::new() })
-        })
-    });
-    let checked = decoded.and_then(|d| {
-        if let Some(missing) = expect.unwrap_or(&[]).iter().find(|e| !d.members.iter().any(|(m, _)| m.name == e.name)) {
-            return Err(container::invalid(format!("the unit lacks {}", missing.name)));
-        }
-        let mut members = Vec::with_capacity(d.members.len());
-        for ((m, w), e) in d.members.into_iter().zip(&wanted) {
-            let got = format!("{:x}", w.sha.finalize());
-            if let Some(e) = e.filter(|e| e.sha256 != got) {
-                return Err(container::invalid(format!("{}'s sha256 is {got}, not {}", m.name, e.sha256)));
+                Some(e)
             }
-            members.push(m);
+        };
+        let file = staging.file(&m.name)?;
+        wanted.push(e);
+        Ok(Hashed { file, sha: Sha256::new() })
+    })?;
+    if let Some(missing) = expect.unwrap_or(&[]).iter().find(|e| !decoded.members.iter().any(|(m, _)| m.name == e.name)) {
+        return Err(container::invalid(format!("the unit lacks {}", missing.name)));
+    }
+    let kind = decoded.kind;
+    let mut members = Vec::with_capacity(decoded.members.len());
+    for ((m, w), e) in decoded.members.into_iter().zip(&wanted) {
+        let got = format!("{:x}", w.sha.finalize());
+        if let Some(e) = e.filter(|e| e.sha256 != got) {
+            return Err(container::invalid(format!("{}'s sha256 is {got}, not {}", m.name, e.sha256)));
         }
-        Ok((d.kind, members))
-    });
-    let (kind, members) = match checked {
-        Ok(done) => done,
-        Err(e) => {
-            for tmp in &tmps {
-                let _ = std::fs::remove_file(tmp);
+        members.push(m);
+    }
+    staging.put_in_place(dir, &members)?;
+    Ok((kind, members))
+}
+
+/// An io error of `path`.
+fn at(path: &Path, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+}
+
+/// How many dirs this process's decodes into a dir have made, for their names.
+static STAGINGS: AtomicU64 = AtomicU64::new(0);
+
+/// The dir of a decode into a dir, in that dir: it holds the members as they decode (and a place
+/// unit's block table), then the files they replace while they go in place. Dropped, it removes
+/// the members it still holds, then itself if empty.
+struct Staging {
+    path: PathBuf,
+    /// The members' files made in it.
+    made: Vec<PathBuf>,
+}
+
+/// A member moved into place (once `installed`), the file it replaced moved to `earlier`.
+struct Moved {
+    dest: PathBuf,
+    earlier: Option<PathBuf>,
+    installed: bool,
+}
+
+impl Staging {
+    /// A new dir in `dir`, under a name no member has: one an earlier process of this pid left
+    /// is skipped, never taken or removed.
+    fn new_in(dir: &Path) -> io::Result<Staging> {
+        loop {
+            let path = dir.join(format!(".transport.{}.{}", std::process::id(), STAGINGS.fetch_add(1, Ordering::Relaxed)));
+            match std::fs::create_dir(&path) {
+                Ok(()) => return Ok(Staging { path, made: Vec::new() }),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(at(&path, e)),
             }
-            return Err(e);
-        }
-    };
-    for (i, (m, tmp)) in members.iter().zip(&tmps).enumerate() {
-        if let Err(e) = std::fs::rename(tmp, dir.join(&m.name)) {
-            for tmp in &tmps[i..] {
-                let _ = std::fs::remove_file(tmp);
-            }
-            return Err(io::Error::new(e.kind(), format!("{}: {e}", tmp.display())));
         }
     }
-    Ok((kind, members))
+
+    /// The new file the member `name` decodes to.
+    fn file(&mut self, name: &str) -> io::Result<File> {
+        let path = self.path.join(name);
+        let file = File::options().write(true).create_new(true).open(&path).map_err(|e| at(&path, e))?;
+        self.made.push(path);
+        Ok(file)
+    }
+
+    /// Moves `members`, all decoded here, into place in `dir`, in order, the file each replaces
+    /// moved here first; once all are in, removes those files. On an error puts back what it
+    /// moved.
+    fn put_in_place(&self, dir: &Path, members: &[Member]) -> io::Result<()> {
+        let mut moved = Vec::with_capacity(members.len());
+        for m in members {
+            if let Err(e) = self.move_in(dir, &m.name, &mut moved) {
+                return Err(put_back(moved, e));
+            }
+        }
+        for earlier in moved.iter().filter_map(|m| m.earlier.as_ref()) {
+            let _ = std::fs::remove_file(earlier);
+        }
+        Ok(())
+    }
+
+    /// Moves the member `name` into place in `dir`, the file there first moved here, and adds it
+    /// to `moved` as soon as anything of it has moved.
+    fn move_in(&self, dir: &Path, name: &str, moved: &mut Vec<Moved>) -> io::Result<()> {
+        let dest = dir.join(name);
+        let earlier = match std::fs::symlink_metadata(&dest) {
+            Ok(meta) if meta.is_dir() => return Err(io::Error::other(format!("{}: is a directory", dest.display()))),
+            Ok(_) => {
+                // A hidden name, which no member's file here has.
+                let earlier = self.path.join(format!(".earlier.{name}"));
+                match std::fs::rename(&dest, &earlier) {
+                    Ok(()) => Some(earlier),
+                    // Moved away since, by another decode of this dir.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(at(&dest, e)),
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(at(&dest, e)),
+        };
+        moved.push(Moved { dest, earlier, installed: false });
+        let m = moved.last_mut().expect("just pushed");
+        std::fs::rename(self.path.join(name), &m.dest).map_err(|e| at(&m.dest, e))?;
+        m.installed = true;
+        Ok(())
+    }
+}
+
+/// Undoes `moved`, the last first, after the error `e`: each replaced file back in its place,
+/// a member that replaced none removed. Returns `e`, naming what it couldn't undo (a replaced
+/// file it couldn't put back stays in the decode's dir, which then stays too).
+fn put_back(moved: Vec<Moved>, e: io::Error) -> io::Error {
+    let mut left = Vec::new();
+    for m in moved.into_iter().rev() {
+        let undone = match (&m.earlier, m.installed) {
+            (Some(earlier), _) => std::fs::rename(earlier, &m.dest).map_err(|re| format!("the file {} replaced stays at {}: {re}", m.dest.display(), earlier.display())),
+            (None, true) => std::fs::remove_file(&m.dest).map_err(|re| format!("{}, this decode's, stays: {re}", m.dest.display())),
+            (None, false) => Ok(()),
+        };
+        left.extend(undone.err());
+    }
+    if left.is_empty() {
+        e
+    } else {
+        io::Error::new(e.kind(), format!("{e}; {}", left.join("; ")))
+    }
+}
+
+impl Drop for Staging {
+    fn drop(&mut self) {
+        for f in &self.made {
+            let _ = std::fs::remove_file(f);
+        }
+        let _ = std::fs::remove_dir(&self.path);
+    }
 }
 
 /// The bytes of a channel's chunks, in order, as one stream, which ends once the channel's

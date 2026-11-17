@@ -1068,6 +1068,128 @@ fn a_unit_refused_or_not_of_the_files_expected_leaves_the_dir_as_it_was() {
     assert_eq!(dir_files(dir.path()), before);
 }
 
+/// A unit's bytes, which once all are read tell `at_end` and wait for `go` before they end: a
+/// decode held with its members written, before it puts any in place.
+struct HeldAtEnd {
+    bytes: Vec<u8>,
+    at: usize,
+    at_end: Option<std::sync::mpsc::Sender<()>>,
+    go: std::sync::mpsc::Receiver<()>,
+}
+
+impl Read for HeldAtEnd {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.at == self.bytes.len() {
+            if let Some(at_end) = self.at_end.take() {
+                at_end.send(()).unwrap();
+                self.go.recv().unwrap();
+            }
+            return Ok(0);
+        }
+        let n = buf.len().min(self.bytes.len() - self.at);
+        buf[..n].copy_from_slice(&self.bytes[self.at..self.at + n]);
+        self.at += n;
+        Ok(n)
+    }
+}
+
+#[test]
+fn two_decodes_of_a_unit_into_one_dir_at_once_each_put_its_files_in_place() {
+    // Both decodes write all their members before either puts one in place; the first then puts
+    // its members in, and the second after it.
+    let (unit, members, dir) = published_places();
+    let expect = expected(&members);
+    let (path, expect) = (dir.path(), &expect);
+
+    let got: Vec<Result<(), String>> = std::thread::scope(|s| {
+        let decodes: Vec<_> = (0..2)
+            .map(|_| {
+                let (at_end, held) = std::sync::mpsc::channel();
+                let (go, wait) = std::sync::mpsc::channel();
+                let unit = HeldAtEnd { bytes: unit.clone(), at: 0, at_end: Some(at_end), go: wait };
+                let decode = s.spawn(move || decode_into_dir(unit, path, Some(expect)).map(|_| ()).map_err(|e| e.to_string()));
+                held.recv().unwrap();
+                (go, decode)
+            })
+            .collect();
+        decodes
+            .into_iter()
+            .map(|(go, decode)| {
+                go.send(()).unwrap();
+                decode.join().unwrap()
+            })
+            .collect()
+    });
+
+    assert_eq!(got, vec![Ok(()), Ok(())]);
+    let mut want: Vec<(String, Vec<u8>)> = members.iter().map(|(n, b)| (n.to_string(), b.clone())).collect();
+    want.sort();
+    assert_eq!(dir_files(dir.path()), want);
+}
+
+#[test]
+fn a_decode_leaves_the_files_named_as_its_members_and_tmp_alone() {
+    let (unit, members, dir) = published_places();
+    let theirs: Vec<(String, Vec<u8>)> = members.iter().map(|(n, _)| (format!("{n}.tmp"), b"not the decode's".to_vec())).collect();
+    for (name, bytes) in &theirs {
+        std::fs::write(dir.path().join(name), bytes).unwrap();
+    }
+    let before = dir_files(dir.path());
+    let mut wrong = expected(&members);
+    wrong[2].sha256 = "0".repeat(64);
+
+    assert!(decode_into_dir(&unit[..], dir.path(), Some(&wrong)).is_err());
+    assert_eq!(dir_files(dir.path()), before);
+    decode_into_dir(&unit[..], dir.path(), Some(&expected(&members))).unwrap();
+    let mut want: Vec<(String, Vec<u8>)> = members.iter().map(|(n, b)| (n.to_string(), b.clone())).chain(theirs).collect();
+    want.sort();
+    assert_eq!(dir_files(dir.path()), want);
+}
+
+/// Every path under `dir`, relative to it, with a file's bytes; none for a dir.
+fn tree(dir: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+    let mut paths = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            let rel = p.strip_prefix(dir).unwrap().to_string_lossy().into_owned();
+            if p.is_dir() {
+                paths.push((rel, None));
+                dirs.push(p);
+            } else {
+                paths.push((rel, Some(std::fs::read(&p).unwrap())));
+            }
+        }
+    }
+    paths.sort();
+    paths
+}
+
+#[test]
+fn a_member_that_cant_go_in_place_puts_back_the_files_of_the_members_before_it() {
+    // A directory where a member goes, the second or the last: the members before it have gone
+    // in place by then, and are taken out again, the files they replaced put back.
+    for (blocked, earlier_files) in [(1, true), (1, false), (2, true)] {
+        let (unit, members, dir) = published_places();
+        if !earlier_files {
+            for (name, _) in &members[..blocked] {
+                std::fs::remove_file(dir.path().join(name)).unwrap();
+            }
+        }
+        let name = members[blocked].0;
+        std::fs::remove_file(dir.path().join(name)).unwrap();
+        std::fs::create_dir(dir.path().join(name)).unwrap();
+        std::fs::write(dir.path().join(name).join("inside"), b"a file of the dir's").unwrap();
+        let before = tree(dir.path());
+
+        let e = decode_into_dir(&unit[..], dir.path(), Some(&expected(&members))).unwrap_err().to_string();
+
+        assert_eq!(tree(dir.path()), before, "{blocked} {earlier_files}");
+        assert!(e.contains(&format!("{name}: is a directory")), "{blocked} {earlier_files}: {e}");
+    }
+}
+
 #[test]
 fn a_chunk_reader_reads_a_channels_chunks_as_one_stream() {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);

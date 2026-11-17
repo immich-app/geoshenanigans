@@ -4,7 +4,8 @@
 //!   transport::COLS_FILES.
 //! geocoder-transport decode <unit.tt.zst | -> <dir>
 //!   decodes a unit (zstd-compressed; - reads it from stdin) into its members in <dir>, each
-//!   written to <member>.tmp and all renamed into place once the whole unit has decoded.
+//!   written in a hidden dir of the decode's own there and all moved into place once the whole
+//!   unit has decoded; on an error <dir> is as it was (transport::decode_into_dir).
 //! geocoder-transport verify <unit.tt.zst | -> <dir>
 //!   decodes a unit and compares each member with the file of its name in <dir>, writing nothing
 //!   there (a places unit's block table goes to a scratch file in the temp dir while it runs).
@@ -45,7 +46,7 @@ fn encode(kind: &str, dir: &str, file: Option<&str>) -> io::Result<String> {
     Ok(String::new())
 }
 
-/// The members of `unit` in `dir`, each through its .tmp file, renamed once all decoded.
+/// The members of `unit` in `dir`, moved into place once all decoded.
 fn decode(unit: &str, dir: &str) -> io::Result<String> {
     let (kind, members) = transport::decode_into_dir(published(unit)?, Path::new(dir), None)?;
     Ok(summary("decoded", kind, &members))
