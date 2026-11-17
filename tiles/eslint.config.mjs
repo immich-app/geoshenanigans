@@ -27,7 +27,6 @@ export default defineConfig([
       curly: 2,
       '@typescript-eslint/no-floating-promises': 'error',
       '@typescript-eslint/no-explicit-any': 'off',
-      'preserve-caught-error': 'off',
       'import-x/no-unresolved': ['error', { ignore: ['^cloudflare:'] }],
     },
   },

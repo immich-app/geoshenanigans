@@ -20,6 +20,6 @@ export async function openArchiveFile(path: string): Promise<{ archive: Archive;
     return { archive: await Archive.open(read), close: () => file.close() };
   } catch (error) {
     await file.close();
-    throw new Error(`${path}: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(`${path}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
   }
 }
