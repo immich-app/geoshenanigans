@@ -513,8 +513,9 @@ verified and decoded back byte for byte, 2026-11-17), the presets' data files
 download 85.22, 245.78, 6,097.08 and 6,541.34 MiB (smallest,
 immich-recommended, with-addresses, max-quality) against 95.61, 295.06,
 6,345.99 and 6,794.44 as plain `.zst`: 10.4, 49.3, 248.9 and 253.1 MiB less
-(the full presets' shipped place search index, 418.6 MiB, is unchanged).
-Planet `poi/all` saves the most, 814.5 to 681.9 MiB.
+(the full presets' shipped place search index is no unit: it goes as `.zst`
+either way, 364.4 MiB in the layout of format 2). Planet `poi/all` saves the
+most, 814.5 to 681.9 MiB.
 
 ## Patch Format (.gcpatch, version 18)
 
