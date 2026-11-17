@@ -1262,6 +1262,9 @@ static int run(int argc, char* argv[]) {
         return 1;
     }
     ScratchDir scratch("geocoder-diff");
+    // The logical files, removed beside the patch's last sections once they
+    // are read; the diff ends once they are gone.
+    logical_decode::Remover removing;
     // A shipped tier is rebuilt from the client's own old file, so both
     // sides come from the dir itself. The others are only remapped through
     // and may be borrowed; a newly shipped one is sent whole at the end.
@@ -2113,6 +2116,18 @@ static int run(int argc, char* argv[]) {
         }
     malloc_trim(0); // return freed heap to OS
     log_rss("serialize");
+    // The record families' logical files are read no more: removed beside
+    // the corrections. The side files' deltas read theirs at the end, and an
+    // address family without records its footprints (emit_raw).
+    {
+        std::vector<std::string> paths;
+        for (const auto& dirs : logical_dirs())
+            for (const LogicalFamily& family : logical_families())
+                for (const char* file : family.files)
+                    if (family.decode != decode_side_file && (res_addr_v.stride != 0 || file != std::string(addr_files::VERTICES_FILE)))
+                        paths.push_back(dirs.second + "/" + file);
+        removing.remove(std::move(paths));
+    }
     double t0 = now_ms();
 
     // ID remaps were pre-computed in the parallel merge groups.
@@ -2609,6 +2624,18 @@ static int run(int argc, char* argv[]) {
     for (int t = 0; t < STRING_TIER_COUNT; t++)
         if (tier_files.newly_shipped >> t & 1) emit_raw(string_tier_file_id(t), STRING_TIER_FILES[t]);
 
+    // Every logical file is read: the rest go beside the compression.
+    {
+        std::vector<std::string> paths;
+        for (const auto& dirs : logical_dirs()) {
+            std::error_code ec;
+            for (auto e = std::filesystem::directory_iterator(dirs.second, ec); !ec && e != std::filesystem::directory_iterator();
+                 e.increment(ec))
+                paths.push_back(e->path().string());
+        }
+        removing.remove(std::move(paths));
+    }
+
     // Now safe to free str_remap — all consumers (sparse_delta above)
     // have finished using it.
     str_remap = SortedU32Map();
@@ -2641,6 +2668,9 @@ static int run(int argc, char* argv[]) {
                   << cst.st_size / 1024 / 1024 << " MiB)" << std::endl;
         log_time("zstd -19 -T0 compression", tc);
     }
+    const double tr = now_ms();
+    removing.wait();
+    log_time("waited for the logical files' removal", tr);
     return 0;
 }
 

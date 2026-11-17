@@ -22,6 +22,9 @@
 // taken. A range no thread could place (one past a footer's nodes, say) is
 // decoded there, its output not written: what it refuses is the one
 // decoder's refusal, and files that hold such a range always hold one.
+//
+// Once the diff has read them, the logical files go on threads of their own
+// (Remover), beside the patch's last sections.
 #pragma once
 
 #include <algorithm>
@@ -34,6 +37,7 @@
 #include <deque>
 #include <exception>
 #include <fcntl.h>
+#include <future>
 #include <mutex>
 #include <new>
 #include <stdexcept>
@@ -281,6 +285,36 @@ private:
     Buffer buffer_;
     uint64_t at_ = 0;
     size_t used_ = 0;
+};
+
+// Files removed on threads of their own, beside what the diff does next:
+// unlinking a planet day's logical files (18 GB) takes one thread seconds,
+// the biggest file over one, which the scratch dir's removal spent after
+// the patch was written. A batch's files go on a thread each. The diff holds
+// its Remover until it ends, and the destructor waits for every batch: no
+// file of a diff's scratch outlives it, as generate_patches.sh counts a
+// diff's scratch until the diff exits.
+class Remover {
+public:
+    Remover() = default;
+    Remover(const Remover&) = delete;
+    Remover& operator=(const Remover&) = delete;
+    ~Remover() { wait(); }
+
+    // Removes the files beside, a missing one as none.
+    void remove(std::vector<std::string> paths) {
+        batches_.push_back(std::async(std::launch::async, [paths = std::move(paths)] {
+            parallel_for_each(
+                paths.size(), [&](size_t i, unsigned) { ::unlink(paths[i].c_str()); }, unsigned(std::max<size_t>(paths.size(), 1)));
+        }));
+    }
+    // Waits until every file given is gone.
+    void wait() {
+        for (std::future<void>& b : batches_) b.wait();
+    }
+
+private:
+    std::vector<std::future<void>> batches_;
 };
 
 // The workers of a decode of `ranges` ranges on up to `threads` threads (0 =
