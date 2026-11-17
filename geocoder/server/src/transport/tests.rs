@@ -955,3 +955,33 @@ fn decode_holds_a_unit_past_chunk_bytes_and_no_more() {
         assert!(peak >= largest as i64 && peak <= (largest + DECODE_OVERHEAD) as i64, "{peak} bytes of heap for a unit of {largest}");
     }
 }
+
+// ------------------------------------------------------------------ the template's units
+
+/// configurations.template.json's transport block: the units a dir publishes when it holds their
+/// files (compress_index.py), at this module's version. A unit of each kind but cols, named after
+/// it, holds the kind's members in order; a cols unit, named after its file, each cols file.
+#[test]
+fn the_templates_units_are_this_versions_kinds_and_their_members() {
+    let template: serde_json::Value = serde_json::from_str(include_str!("../../../builder/configurations.template.json")).unwrap();
+    let transport = &template["transport"];
+    assert_eq!(transport["version"], TRANSPORT_VERSION);
+    let got: Vec<(String, String, Vec<String>)> = transport["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| {
+            let files = u["files"].as_array().unwrap().iter().map(|f| f.as_str().unwrap().to_string()).collect();
+            (u["unit"].as_str().unwrap().to_string(), u["kind"].as_str().unwrap().to_string(), files)
+        })
+        .collect();
+    let mut want: Vec<(String, String, Vec<String>)> = Kind::ALL
+        .iter()
+        .filter(|&&k| k != Kind::Cols)
+        .map(|k| (format!("{}.tt.zst", k.name()), k.name().to_string(), k.members().iter().map(|m| m.to_string()).collect()))
+        .collect();
+    for f in COLS_FILES {
+        want.push((format!("{}.tt.zst", f.strip_suffix(".bin").unwrap()), "cols".to_string(), vec![f.to_string()]));
+    }
+    assert_eq!(got, want);
+}
