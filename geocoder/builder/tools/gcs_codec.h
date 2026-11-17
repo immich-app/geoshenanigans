@@ -1,5 +1,6 @@
 // In-process incremental codecs for the low-memory client update. The formats the builder writes
-// (src/way_files.h, addr_files.h, poi_files.h, place_files.h, side_blocks.h) byte for byte,
+// (src/way_files.h, addr_files.h, poi_files.h, place_files.h, postcode_files.h, side_blocks.h) byte
+// for byte,
 // structured so the patcher drives them:
 //   Decoder: produces today's-format bytes on demand, one unit (way, row, record, block piece) per
 //            step(), into one queue per today's file (a coupled family fills several queues).
@@ -17,6 +18,8 @@
 #include "gcs_io.h"
 #include "place_files.h"
 #include "poi_files.h"
+#include "postcode_files.h"
+#include "sequential_file_reader.h"
 #include "side_blocks.h"
 #include "way_files.h"
 
@@ -1192,5 +1195,174 @@ struct Enc : Encoder {
     }
 };
 }  // namespace place
+
+// ------------------------------------------------------------------ postcode centroids (postcode_files.h)
+namespace postcodes {
+namespace pcf = postcode_files;
+// The codec's buffers: the files stream front to back in units of a block (under 1 KiB) and a parent
+// record of the cells index (under 5 KiB), so a few KiB each do.
+static const size_t SMALL_BUF = size_t(4) << 10, BLOCKS_BUF = size_t(16) << 10;
+
+// Whether dir holds the family: both files, or neither; refused with one.
+inline bool has_files(const std::string& dir) {
+    struct stat st;
+    const int has = (stat((dir + "/" + pcf::CENTROIDS_FILE).c_str(), &st) == 0) + (stat((dir + "/" + pcf::CELLS_FILE).c_str(), &st) == 0);
+    if (has == 1) die("%s has one of %s and %s", dir.c_str(), pcf::CENTROIDS_FILE, pcf::CELLS_FILE);
+    return has == 2;
+}
+
+// postcode_centroids.bin's footer, of a file of `size` bytes.
+inline pcf::Footer footer_of(const std::string& path, uint64_t size) {
+    uint8_t f[pcf::FOOTER_BYTES] = {};
+    if (size >= pcf::FOOTER_BYTES) {
+        Reader footer(path, pcf::FOOTER_BYTES, size - pcf::FOOTER_BYTES);
+        memcpy(f, footer.take(pcf::FOOTER_BYTES), pcf::FOOTER_BYTES);
+    }
+    return pcf::read_footer(f, size);
+}
+
+// A dir's centroids' decoded size, LOGICAL_STRIDE a centroid, from postcode_centroids.bin's footer
+// alone: 0 without the files.
+inline uint64_t decoded_size(const std::string& dir) {
+    if (!has_files(dir)) return 0;
+    const std::string cp = dir + "/" + pcf::CENTROIDS_FILE;
+    return pcf::logical_size(footer_of(cp, file_size(cp)));
+}
+
+// Port 0 = postcode_centroids.bin's logical stream (pcf::LogicalCentroid). A step: a block of rows,
+// each with its cell's key from the cells file, checked as postcode_files::decode checks it (the
+// strict decoder encodes each block again). A dir without the two files decodes to none. With the
+// last block it checks how the files end: the cells end with the rows.
+struct Dec : Decoder {
+    std::unique_ptr<Reader> N, T;                // the blocks' bits, and the table
+    std::unique_ptr<SequentialFileReader> C;     // postcode_centroid_cells.bin
+    std::unique_ptr<pcf::Decoder<SequentialFileReader>> d;
+    pcf::Footer f;
+    size_t b = 0;
+    uint64_t at = 0;  // the bytes of the blocks decoded
+    uint8_t entry[pcf::TABLE_ENTRY_BYTES] = {}, next[pcf::TABLE_ENTRY_BYTES] = {};
+    explicit Dec(const std::string& src) : Decoder("postcodes", {pcf::CENTROIDS_FILE}) {
+        if (!has_files(src)) return;
+        const std::string cp = src + "/" + pcf::CENTROIDS_FILE, kp = src + "/" + pcf::CELLS_FILE;
+        const uint64_t size = file_size(cp);
+        f = footer_of(cp, size);
+        C.reset(new SequentialFileReader(SequentialFileReader::RAW, kp, SMALL_BUF));
+        d.reset(new pcf::Decoder<SequentialFileReader>(f, *C));
+        N.reset(new Reader(cp, BLOCKS_BUF, 0, f.table_at));
+        T.reset(new Reader(cp, SMALL_BUF, f.table_at, size - pcf::FOOTER_BYTES));
+        if (f.blocks) memcpy(entry, T->take(pcf::TABLE_ENTRY_BYTES), pcf::TABLE_ENTRY_BYTES);
+        else end();
+    }
+    uint64_t decoded_size(int) const override { return pcf::logical_size(f); }
+    // After the last block: how the files end.
+    void end() {
+        d->finish();
+        d.reset();
+        C.reset();
+        N.reset();
+        T.reset();
+    }
+    bool step() override {
+        if (!d) return false;
+        // The block runs to the next one's offset, the last to the table.
+        uint64_t stop = f.table_at;
+        if (b + 1 < f.blocks) {
+            memcpy(next, T->take(pcf::TABLE_ENTRY_BYTES), pcf::TABLE_ENTRY_BYTES);
+            stop = pcf::get32(next + 12);
+        }
+        if (pcf::get32(entry + 12) != at) pcf::malformed("block " + std::to_string(b) + " is not where the blocks before it end");
+        if (stop < at || stop > f.table_at) pcf::malformed("block " + std::to_string(b) + " ends past the blocks or before it starts");
+        const size_t n = size_t(stop - at);
+        static const uint8_t none = 0;
+        const uint8_t* p = n ? N->take(n) : &none;
+        uint8_t* o = emit_reserve(0, f.rows_of(b) * pcf::LOGICAL_STRIDE);
+        d->block(entry, p, n, [&](const pcf::LogicalCentroid& c) {
+            memcpy(o, &c, pcf::LOGICAL_STRIDE);
+            o += pcf::LOGICAL_STRIDE;
+        });
+        at = stop;
+        memcpy(entry, next, pcf::TABLE_ENTRY_BYTES);
+        if (++b == f.blocks) end();
+        return true;
+    }
+};
+
+// Port 0 = the logical stream in; the two files out. The blocks go to postcode_centroids.bin as
+// they are packed, the cells file as its records end, and the blocks' table entries to a scratch
+// file beside them, which finish appends with the footer: nothing grows with the set but the
+// files.
+struct Enc : Encoder {
+    using Sink = std::function<void(const uint8_t*, size_t)>;
+    std::unique_ptr<Writer> NW, CW, TW;
+    std::string tpath;
+    pcf::Encoder<Sink> enc;
+    explicit Enc(const std::string& od)
+        : Encoder("postcodes", od, 1),
+          NW(new Writer(od + "/" + pcf::CENTROIDS_FILE, BLOCKS_BUF)),
+          CW(new Writer(od + "/" + pcf::CELLS_FILE, SMALL_BUF)),
+          TW(new Writer(od + "/.postcode_centroids.table", SMALL_BUF, true)),
+          tpath(od + "/.postcode_centroids.table"),
+          enc([this](const uint8_t* p, size_t n) { NW->put(p, n); }, [this](const uint8_t* p, size_t n) { CW->put(p, n); }) {}
+    void spill() {
+        if (enc.table().empty()) return;
+        for (const auto& e : enc.table()) TW->put(e.data(), e.size());
+        enc.clear_table();
+    }
+    void add(const uint8_t* row) {
+        pcf::LogicalCentroid c;
+        memcpy(&c, row, pcf::LOGICAL_STRIDE);
+        enc.add(c);
+        spill();
+    }
+    // Every byte straight from the writer (nothing queued): a row a write cuts waits in carry.
+    uint8_t carry[pcf::LOGICAL_STRIDE];
+    size_t carried = 0;
+    size_t consume(int, const uint8_t* p, size_t n) override {
+        size_t used = 0;
+        if (carried) {
+            used = std::min(pcf::LOGICAL_STRIDE - carried, n);
+            memcpy(carry + carried, p, used);
+            carried += used;
+            if (carried < pcf::LOGICAL_STRIDE) return n;
+            add(carry);
+            carried = 0;
+        }
+        for (; n - used >= pcf::LOGICAL_STRIDE; used += pcf::LOGICAL_STRIDE) add(p + used);
+        memcpy(carry, p + used, n - used);
+        carried = n - used;
+        return n;
+    }
+    void pump() override {
+        ByteQueue& q = in[0];
+        while (q.size() >= pcf::LOGICAL_STRIDE) {
+            add(q.data());
+            q.pop(pcf::LOGICAL_STRIDE);
+        }
+    }
+    void finish() override {
+        require_empty();
+        if (carried) die("postcodes: the stream ends %zu bytes into a row", carried);
+        enc.finish();
+        spill();
+        TW->flush();
+        std::vector<uint8_t> buf(BLOCKS_BUF);
+        for (uint64_t off = 0, n = TW->tell(); off < n;) {
+            const size_t k = size_t(std::min<uint64_t>(buf.size(), n - off));
+            pread_all(TW->fd, buf.data(), k, off, tpath);
+            NW->put(buf.data(), k);
+            off += k;
+        }
+        const auto footer = enc.footer();
+        NW->put(footer.data(), footer.size());
+        TW->finish();
+        if (unlink(tpath.c_str())) die("unlink %s: %s", tpath.c_str(), strerror(errno));
+        NW->finish();
+        CW->finish();
+        TW.reset();
+        NW.reset();
+        CW.reset();
+    }
+};
+}  // namespace postcodes
 
 }  // namespace gcs

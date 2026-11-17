@@ -87,6 +87,16 @@ static constexpr size_t POI_RECORD_STRIDE = 36;
 static constexpr size_t PLACE_NODE_STRIDE = 24;
 // The client files place_nodes.bin's section writes besides it.
 static constexpr const char* PLACE_SIDE_FILES[] = {"place_cells.bin", "place_hidden.bin"};
+// postcode_centroids.bin's logical rows (postcode_files.h LogicalCentroid):
+// its section replays the postcode centroid files' logical stream, which
+// their codec (gcs_codec.h postcodes) writes as postcode_centroids.bin and
+// postcode_centroid_cells.bin.
+static constexpr size_t POSTCODE_CENTROID_STRIDE = 20;
+// postcode_id's byte offset within a logical postcode centroid (a string
+// offset).
+static constexpr size_t POSTCODE_CENTROID_POSTCODE_ID_OFF = 8;
+// The client file postcode_centroids.bin's section writes beside it.
+static constexpr const char* POSTCODE_SIDE_FILES[] = {"postcode_centroid_cells.bin"};
 // The client file addr_points.bin's and addr_vertices.bin's sections write
 // besides them (addr_files.h).
 static constexpr const char* ADDR_SIDE_FILES[] = {"addr_index.bin"};
@@ -227,16 +237,17 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // their slots, so nothing is remapped by an admin id: the parent-id remap
 // is its street leg alone, the sparse and parallel deltas lose remap kind 1,
 // and the admin cell index is rebuilt from the old one's ids as they are.
-// v15: a cell index delta (CELL_INDEX_DELTA_MARKER, CELL_LIST_DELTA_STRIDE) is
-// runs: the source cells the new index drops by rank, the cells new to it by
-// id, then the runs of consecutive cells of the new index that lose or gain an
-// id, in varints (append_cell_list_delta). A polygon whose boundary moved costs
-// a run, not its id in every cell, and the patcher holds only the ids of the
-// runs over its cell, at most 0xFFFF each way. The geo index's GXT2 layout
-// (build 19, geo_index.h) keeps v15's sections: file id 35 names its blocks
-// file, geo_entries.bin, beside its top file geo_cells.bin (8), and ids 9 to
-// 11 name its street, address and interpolation lists, which the geo entry
-// deltas correct, not files of their own.
+// v15: a cell index delta (CELL_INDEX_DELTA_MARKER; to v18 also a cell list
+// delta, stride 0xFB) is runs: the source cells the new index drops by rank,
+// the cells new to it by id, then the runs of consecutive cells of the new
+// index that lose or gain an id, in varints (append_cell_list_delta). A
+// polygon whose boundary moved costs a run, not its id in every cell, and the
+// patcher holds only the ids of the runs over its cell, at most 0xFFFF each
+// way. The geo index's GXT2 layout (build 19, geo_index.h) keeps v15's
+// sections: file id 35 names its blocks file, geo_entries.bin, beside its top
+// file geo_cells.bin (8), and ids 9 to 11 name its street, address and
+// interpolation lists, which the geo entry deltas correct, not files of their
+// own.
 // v16: admin_polygons.bin records are 16 bytes (AdminPolygonRecord): the
 // ring block's offset at byte 0, every record's the running one, a
 // tombstone's included, so a block runs to the next record's offset as an arc
@@ -254,7 +265,13 @@ static constexpr char GCPATCH_MAGIC[8] = {'G','C','P','A','T','C','H','\0'};
 // bytes. addr_points.bin merges at its records' stride with or without
 // records (a family without any sent 16), so a dir's first address points
 // and its last have a patch.
-static constexpr uint32_t GCPATCH_VERSION = 18;
+// v19: the postcode centroids (postcode_files.h) merge as one logical stream
+// of 20-byte rows in cell order under postcode_centroids.bin's id, the
+// postcode_id at byte 8 a string field, which the patcher encodes again as
+// postcode_centroids.bin and postcode_centroid_cells.bin. No sparse delta
+// carries them (remap kind 3 is gone), no cell list delta (stride 0xFB)
+// carries any index, and file ids 24 and 25 name no file.
+static constexpr uint32_t GCPATCH_VERSION = 19;
 // The zstd window a patch is compressed with (8 MiB, level 19's own): a decoder that runs the zstd
 // command holds the window, so the diff pins it and the patcher refuses a larger one.
 static constexpr int PATCH_ZSTD_WINDOW_LOG = 23;
@@ -281,12 +298,14 @@ enum class PatchFileId : uint32_t {
     POI_ENTRIES = 17,
     PLACE_NODES = 18,
     // Secondary parallel arrays (SPARSE_DELTA_FILES), the postcode
-    // centroid index (a cell list delta) and the admin arcs.
+    // centroids and the admin arcs.
     ADDR_POSTCODES = 19,
     ADMIN_PARENTS = 20,
     WAY_PARENTS = 21,
     WAY_POSTCODES = 22,
     POSTCODE_CENTROIDS = 23,
+    // No files (v19): the postcode centroid cells, written beside
+    // postcode_centroids.bin, and the entries file the centroids had.
     POSTCODE_CENTROID_CELLS = 24,
     POSTCODE_CENTROID_ENTRIES = 25,
     ARC_INDEX = 26,
@@ -320,7 +339,7 @@ static const char* patch_file_names[] = {
     "poi_records.bin", "poi_vertices.bin", "poi_cells.bin", "poi_entries.bin",
     "place_nodes.bin",
     "addr_postcodes.bin", "admin_parents.bin", "way_parents.bin", "way_postcodes.bin",
-    "postcode_centroids.bin", "postcode_centroid_cells.bin", "postcode_centroid_entries.bin",
+    "postcode_centroids.bin", "postcode centroid cells (written beside 23)", "postcode centroid entries (gone)",
     "arc_index.bin", "arc_vertices.bin",
     "addr_vertices.bin",
     "strings_core.bin", "strings_street.bin", "strings_addr.bin",
@@ -341,16 +360,17 @@ inline std::vector<size_t> string_field_offsets(PatchFileId fid) {
     case PatchFileId::POI_RECORDS:
         return {POI_RECORD_NAME_ID_OFF, POI_RECORD_PARENT_STREET_ID_OFF, POI_RECORD_PARENT_POSTCODE_ID_OFF};
     case PatchFileId::PLACE_NODES: return {PLACE_NODE_NAME_ID_OFF};
+    case PatchFileId::POSTCODE_CENTROIDS: return {POSTCODE_CENTROID_POSTCODE_ID_OFF};
     default: return {};
     }
 }
 
 // The files sent as SPARSE_DELTA_STRIDE sections, in emission order, with
 // the value each position holds:
-//   remap_kind 0 = raw, 2 = string offset,
-//   3 = postcode_centroid (16 bytes, string offset at byte 8).
+//   remap_kind 0 = raw, 2 = string offset.
 // Admin parents are admin slots, which polygons keep, so they go raw; kind 1
-// (an admin id the patch remapped) names no file.
+// (an admin id the patch remapped) and kind 3 (a 16-byte postcode centroid,
+// to v18) name no file.
 struct SparseDeltaFile { PatchFileId fid; uint32_t value_stride, remap_kind; };
 static constexpr SparseDeltaFile SPARSE_DELTA_FILES[] = {
     {PatchFileId::ADDR_POSTCODES, 4, 2},
@@ -358,9 +378,7 @@ static constexpr SparseDeltaFile SPARSE_DELTA_FILES[] = {
     {PatchFileId::WAY_PARENTS, 4, 0},
     {PatchFileId::WAY_POSTCODES, 4, 2},
     {PatchFileId::INTERP_POSTCODES, 4, 2},
-    {PatchFileId::POSTCODE_CENTROIDS, 16, 3},
 };
-static constexpr size_t POSTCODE_CENTROID_POSTCODE_ID_OFF = 8;
 
 inline const SparseDeltaFile* sparse_delta_file(PatchFileId fid) {
     for (const auto& f : SPARSE_DELTA_FILES)
@@ -389,6 +407,7 @@ static constexpr StringRecordFile STRING_RECORD_FILES[] = {
     {PatchFileId::ADMIN_POLYGONS, ADMIN_POLYGON_STRIDE},
     {PatchFileId::POI_RECORDS, POI_RECORD_STRIDE},
     {PatchFileId::PLACE_NODES, PLACE_NODE_STRIDE},
+    {PatchFileId::POSTCODE_CENTROIDS, POSTCODE_CENTROID_STRIDE},
 };
 
 // The admin geometry files by family, in the order a patch sends them: a file
@@ -457,6 +476,15 @@ static constexpr EntriesFiles<2> CELL_INDEX_ENTRIES_FILES = {PatchFileId::ADMIN_
 inline bool is_geo_list_id(uint32_t id) {
     return std::find(GEO_ENTRIES_FILES.begin(), GEO_ENTRIES_FILES.end(), static_cast<PatchFileId>(id)) !=
            GEO_ENTRIES_FILES.end();
+}
+
+// Whether an id of the file table names no file, so no file section's: the
+// legacy strings.bin (no patch sends it), the geo index's lists, and (v19)
+// ids 24 and 25, the postcode centroid cells, which the patcher writes beside
+// postcode_centroids.bin, and the entries file the centroids had.
+inline bool names_no_file(uint32_t id) {
+    return id == uint32_t(PatchFileId::STRINGS) || is_geo_list_id(id) || id == uint32_t(PatchFileId::POSTCODE_CENTROID_CELLS) ||
+           id == uint32_t(PatchFileId::POSTCODE_CENTROID_ENTRIES);
 }
 
 // Secondary ID remap marker: 0xFFFFFFF6
@@ -642,13 +670,10 @@ inline uint64_t lane_hash(const char* data, size_t n) {
 //   file_id(u32),
 //   stride = SPARSE_DELTA_STRIDE (u32),
 //   old_size(u64), new_size(u64),
-//   value_stride(u32) — bytes per record (4 for uint32 arrays, 16 for postcode_centroid),
-//   remap_kind(u32)  — 0=none, 2=string offset, 3=postcode_centroid struct (SPARSE_DELTA_FILES),
+//   value_stride(u32) — bytes per record (4: every file's a u32 array),
+//   remap_kind(u32)  — 0=none, 2=string offset (SPARSE_DELTA_FILES),
 //   n_changes(u32),
 //   [(pos:u32, value:value_stride bytes)] × n_changes.
-//
-// remap_kind 3 means a 16-byte postcode_centroid record: lat(4) lng(4)
-// postcode_id(4) cc(2) pad(2). Only the postcode_id field uses str_remap.
 constexpr uint32_t SPARSE_DELTA_STRIDE = 0xFC;
 
 // Stride sentinel: the new file is byte-identical to the old build. The section
@@ -667,15 +692,6 @@ inline void require_copy_old_sizes(const std::string& name, uint64_t old_size, u
                                  std::to_string(new_size) + " new");
 }
 
-// Stride sentinel: a cell index (<name>_cells.bin + <name>_entries.bin)
-// patched by runs (v15). Strategy-2 ids keep most lists unchanged day to day,
-// so only the runs of cells that lost or gained ids travel. The section names
-// the cells file and the patcher writes both files.
-//   file_id(u32), stride = CELL_LIST_DELTA_STRIDE (u32),
-//   old_size(u64), new_size(u64) of the cells file,
-//   payload_size(u64), new entries size(u64), append_cell_list_delta bytes.
-constexpr uint32_t CELL_LIST_DELTA_STRIDE = 0xFB;
-
 // Stride sentinel (v8): a per-record side file (one value per record of a
 // parent file: way_parents / way_postcodes per street way, addr_postcodes per
 // address, interp_postcodes per interpolation) rebuilt along the parent's
@@ -689,8 +705,9 @@ constexpr uint32_t CELL_LIST_DELTA_STRIDE = 0xFB;
 //   n_changes(u32) + [(pos:u32, value:u32)] x n_changes (pos ascending)
 constexpr uint32_t PARALLEL_DELTA_STRIDE = 0xFA;
 // The widest record a merge section may give (the patcher sizes a record buffer by it): the
-// widest real record is 36 bytes, and every stride from 0xFA up to here is a section kind.
-static constexpr uint32_t MAX_RECORD_STRIDE = 0xFF;
+// widest real record is 36 bytes, and a stride from 0xFA (PARALLEL_DELTA_STRIDE) up is a section
+// kind's or none's, refused as a record stride: 0xFB (a cell list delta to v18), 0xFE and 0xFF.
+static constexpr uint32_t MAX_RECORD_STRIDE = 0xF9;
 // The most records a merge section's old or new file may hold: record indices are u32s below
 // NO_DATA (0xFFFFFFFF) in the diff's id remaps and secondary matches and in the patcher's
 // RecordRemap, so a file of more would wrap them. A byte stream's records are its bytes, the
@@ -998,15 +1015,14 @@ inline std::vector<ClientFile> parse_client_files(const char* data, size_t size,
 
 // --- Old sizes of the files no section names (v7) ---
 // Every section names the size of the old file it replays. The patcher also
-// reads old files no section names: the cell indexes of the entry pipeline
-// and the entries file beside a cell list delta. Right after the client
-// files, the diff records their sizes in the old dir (0 when absent):
+// reads old files no section names: the cell indexes of the entry pipeline.
+// Right after the client files, the diff records their sizes in the old dir
+// (0 when absent):
 //   n(4), n × {file_id(4), old_size(8)}
 // and the patcher checks them before it reads anything else.
 static constexpr PatchFileId UNSECTIONED_OLD_FILES[] = {
     PatchFileId::GEO_CELLS, PatchFileId::GEO_ENTRIES,
     PatchFileId::ADMIN_CELLS, PatchFileId::ADMIN_ENTRIES, PatchFileId::POI_CELLS, PatchFileId::POI_ENTRIES,
-    PatchFileId::POSTCODE_CENTROID_ENTRIES,
 };
 
 inline void append_old_file_sizes(std::vector<char>& out, const std::string& old_dir) {
@@ -1447,9 +1463,8 @@ struct ByteSpan {
     const char* at(uint64_t off, size_t) const { return data + off; }
 };
 
-// cell_id → its ids (sorted), in cell order: an admin / POI / postcode
-// centroid index (cell_pairs.h) as the patch sees it, whatever the layout of
-// its files.
+// cell_id → its ids (sorted), in cell order: an admin or POI index
+// (cell_pairs.h) as the patch sees it, whatever the layout of its files.
 using CellLists = std::map<uint64_t, std::vector<uint32_t>>;
 
 // The lists of a cell pair index of `format` from its files' bytes.
@@ -1501,14 +1516,14 @@ inline CellLists rebuild_cell_lists(const CellLists& old, const std::unordered_m
     return out;
 }
 
-// --- Cell index deltas as runs (CELL_INDEX_DELTA_MARKER, CELL_LIST_DELTA_STRIDE) ---
+// --- Cell index deltas as runs (CELL_INDEX_DELTA_MARKER) ---
 
 // The most ids a cell lists.
 static constexpr uint32_t CELL_LIST_MAX = cell_pairs::LIST_MAX;
 
-// A cell list delta (v15) turns one cell index, the source, into the new one: for a postcode centroid index
-// (CELL_LIST_DELTA_STRIDE) the old index, for an admin or POI index (CELL_INDEX_DELTA_MARKER) the one the patcher
-// rebuilds from it. A source cell has a rank, its place among the source's cells, and so has a cell of the new index
+// A cell list delta (v15) turns one cell index, the source, into the new one: an admin or POI index
+// (CELL_INDEX_DELTA_MARKER), the source the one the patcher rebuilds from the old index. A source cell has a rank,
+// its place among the source's cells, and so has a cell of the new index
 // among the new index's cells. Every number is a varint (write_varint64; the ids' write_varint):
 //   n_gone, then the rank of each source cell the new index doesn't hold, ascending, each as the gap from the one
 //     after the previous (the first from rank 0);
@@ -1934,16 +1949,6 @@ CellIndexWritten stream_cell_index(Cells&& cells, Entries&& entries, cell_pairs:
         refuse_cell_list_delta("a run past the last rank");
     out.finish();
     return {out.rows(), out.cells_bytes(), out.entries_bytes()};
-}
-
-// stream_cell_index for an index whose ids don't move (the postcode centroid
-// index): the old index plus the delta.
-template <typename Cells, typename Entries, typename OutCells, typename OutEntries>
-CellIndexWritten stream_cell_list_delta(Cells&& cells, Entries&& entries, cell_pairs::Format format,
-                                        const char* delta, size_t delta_size, OutCells out_cells,
-                                        OutEntries out_entries) {
-    return stream_cell_index(cells, entries, format, {}, {}, [](uint32_t id) { return id; },
-                             delta, delta_size, out_cells, out_entries);
 }
 
 // --- Geo entry list deltas (GEO_ENTRY_DELTA_MARKER) ---

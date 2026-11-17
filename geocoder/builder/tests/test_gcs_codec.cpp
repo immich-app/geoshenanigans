@@ -1590,6 +1590,40 @@ Files place_files_of(uint32_t visible, uint32_t hidden) {
     return {{place_files::CELLS_FILE, cells}, {place_files::NODES_FILE, blocks}, {place_files::HIDDEN_FILE, hidden_rows}};
 }
 
+// n postcode centroids in cell order, nine to a cell, every third of a
+// second country, half at four decimals: their logical rows, and their two
+// files as the builder writes them (postcode_files::Encoder).
+std::vector<postcode_files::LogicalCentroid> centroid_rows(uint32_t n) {
+    std::vector<postcode_files::LogicalCentroid> rows;
+    for (uint32_t i = 0; i < n; i++) {
+        postcode_files::LogicalCentroid c;
+        c.lat = i % 2 ? 51.5f + float(i % 9) * 1e-3f : float(515000 + i % 9) / 1e4f;
+        c.lng = -0.1f + float(i % 9) * 7e-4f;
+        c.postcode_id = 3 * i;
+        c.country_code = i % 3 ? uint16_t('G' << 8 | 'B') : uint16_t('I' << 8 | 'E');
+        c.cell_key = uint32_t(cell_pairs::cell_of(4000 + i / 9, 10) >> 32);
+        rows.push_back(c);
+    }
+    return rows;
+}
+Files postcode_files_of(const std::vector<postcode_files::LogicalCentroid>& rows) {
+    std::vector<char> centroids, cells;
+    auto into = [](std::vector<char>& v) {
+        return [&v](const uint8_t* p, size_t n) { v.insert(v.end(), p, p + n); };
+    };
+    postcode_files::Encoder enc(into(centroids), into(cells));
+    for (const postcode_files::LogicalCentroid& c : rows) enc.add(c);
+    enc.finish();
+    for (const auto& e : enc.table()) centroids.insert(centroids.end(), e.begin(), e.end());
+    const auto footer = enc.footer();
+    centroids.insert(centroids.end(), footer.begin(), footer.end());
+    return {{postcode_files::CENTROIDS_FILE, centroids}, {postcode_files::CELLS_FILE, cells}};
+}
+std::vector<uint8_t> logical_of(const std::vector<postcode_files::LogicalCentroid>& rows) {
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(rows.data());
+    return std::vector<uint8_t>(p, p + rows.size() * postcode_files::LOGICAL_STRIDE);
+}
+
 // A family's files as the builder writes them, with its decoder over a dir
 // that holds them, the ports whose stream ends with the files' last unit
 // (the records' unless the last record's child bytes come in pieces after
@@ -1712,6 +1746,23 @@ std::vector<FilesEnd> files_ends(std::mt19937& rng) {
                               f.insert(f.end(), row, row + sizeof row);
                           }}}});
     }
+    for (const uint32_t n : {320u, 333u}) {
+        // Postcode centroids whose last block is whole, and one of 13 rows.
+        const size_t blocks = (n + postcode_files::BLOCK_ROWS - 1) / postcode_files::BLOCK_ROWS;
+        ends.push_back({"postcode centroids, " + std::to_string(n),
+                        postcode_files_of(centroid_rows(n)),
+                        [](const std::string& dir) { return std::unique_ptr<Decoder>(new postcodes::Dec(dir)); },
+                        {0},
+                        [](const Files& f) {
+                            const std::vector<char>&c = f.at(postcode_files::CENTROIDS_FILE), &k = f.at(postcode_files::CELLS_FILE);
+                            return refusal_of([&] {
+                                postcode_files::decode(u8(c), c.size(), u8(k), k.size(), [](const postcode_files::LogicalCentroid&) {});
+                            });
+                        },
+                        {{"a byte between the blocks and the table", postcode_files::CENTROIDS_FILE,
+                          a_byte_before_the_last(postcode_files::TABLE_ENTRY_BYTES * blocks + postcode_files::FOOTER_BYTES)},
+                         {"a row more in the footer", postcode_files::CENTROIDS_FILE, one_more_at(postcode_files::FOOTER_BYTES)}}});
+    }
     return ends;
 }
 
@@ -1730,7 +1781,8 @@ TEST(gcs_decoders_check_how_their_files_end_with_the_last_unit_they_decode) {
     // ways that have them; addresses that end with a point and with an
     // escape, given in pieces; POIs that end with a point and with a polygon
     // past big_block(), decoded in pieces; places that end with visible
-    // nodes and with hidden ones.
+    // nodes and with hidden ones; postcode centroids whose last block is
+    // whole and one that is not.
     std::mt19937 rng(20261115);
     BigBlock small(4096);
     for (const FilesEnd& end : files_ends(rng)) {
@@ -1841,5 +1893,75 @@ TEST(gcs_coupled_encoders_refuse_bytes_no_unit_takes_as_they_come) {
             CHECK(enc->peak(port) <= skew + ENCODER_PIECE);
         }
         if (gctest::failures() > failures_before) std::printf("    in: %s\n", c.family);
+    }
+}
+
+// Postcode centroids written a row at a time, in pieces that cut rows
+// anywhere (of 1 to 7 bytes, and of up to 5000), give the builder's two
+// files, whatever their count: none (the footer alone and an empty cells
+// file), one, a block less one, a block, a block and one, and many blocks
+// over many cells. The decoder gives the rows back, and the decoded size is
+// the footer's without a decoder.
+TEST(gcs_postcodes_round_trip_in_odd_pieces_and_equal_the_builders_encoder) {
+    std::mt19937 rng(20261117);
+    for (const uint32_t n : {0u, 1u, 31u, 32u, 33u, 3000u})
+        for (const size_t max_piece : {size_t(7), size_t(5000)}) {
+            const std::vector<postcode_files::LogicalCentroid> rows = centroid_rows(n);
+            const std::vector<uint8_t> logical = logical_of(rows);
+            ScratchDir dir("gcs-test");
+            {
+                postcodes::Enc enc(dir.path());
+                enc.state = {1};
+                write_in_pieces(enc, 0, logical, rng, max_piece);
+                finish_all(enc);
+            }
+            const auto files = dir_files(dir.path());
+            CHECK(files == postcode_files_of(rows));
+            if (n == 0) CHECK(files.at(postcode_files::CENTROIDS_FILE).size() == 8 && files.at(postcode_files::CELLS_FILE).empty());
+            CHECK_EQ(postcodes::decoded_size(dir.path()), uint64_t(logical.size()));
+            postcodes::Dec dec(dir.path());
+            CHECK_EQ(dec.decoded_size(0), uint64_t(logical.size()));
+            const auto out = decode_all(dec);
+            CHECK(out[0] == logical);
+        }
+}
+
+// A dir without the two files decodes to no centroids; one with either of
+// them alone is refused by name, by the decoder and by the decoded size
+// alone. The encoder refuses a stream that ends inside a row, and a row the
+// files can't hold.
+TEST(gcs_postcodes_decoder_takes_a_dir_without_its_files_as_none_and_refuses_one_of_them) {
+    ScratchDir dir("gcs-test");
+    CHECK_EQ(postcodes::decoded_size(dir.path()), uint64_t(0));
+    postcodes::Dec none(dir.path());
+    CHECK_EQ(none.decoded_size(0), uint64_t(0));
+    CHECK(decode_all(none)[0].empty());
+    write_files(dir.path(), postcode_files_of(centroid_rows(50)));
+    for (const char* gone : {postcode_files::CELLS_FILE, postcode_files::CENTROIDS_FILE}) {
+        ScratchDir one("gcs-test");
+        Files f = postcode_files_of(centroid_rows(50));
+        f.erase(gone);
+        write_files(one.path(), f);
+        const std::string refusal = "gcs: " + one.path() + " has one of postcode_centroids.bin and postcode_centroid_cells.bin";
+        CHECK_EQ(refusal_of([&] { postcodes::Dec dec(one.path()); }), refusal);
+        CHECK_EQ(refusal_of([&] { postcodes::decoded_size(one.path()); }), refusal);
+    }
+    const std::vector<uint8_t> logical = logical_of(centroid_rows(5));
+    {
+        ScratchDir out("gcs-test");
+        postcodes::Enc enc(out.path());
+        enc.state = {1};
+        enc.write(0, logical.data(), logical.size() - 3);
+        enc.state = {2};
+        CHECK_EQ(refusal_of([&] { enc.finish(); }), std::string("gcs: postcodes: the stream ends 17 bytes into a row"));
+    }
+    {
+        ScratchDir out("gcs-test");
+        postcodes::Enc enc(out.path());
+        enc.state = {1};
+        std::vector<uint8_t> twice = logical;
+        twice.insert(twice.end(), logical.begin(), logical.begin() + postcode_files::LOGICAL_STRIDE);
+        CHECK_EQ(refusal_of([&] { enc.write(0, twice.data(), twice.size()); }),
+                 std::string("Malformed postcode centroid files: centroids out of order in a cell"));
     }
 }

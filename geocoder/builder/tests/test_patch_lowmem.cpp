@@ -30,6 +30,7 @@
 #include "merge_sequence.h"
 #include "patch_format.h"
 #include "place_test_files.h"
+#include "postcode_test_files.h"
 #include "scratch_dir.h"
 #include "sequential_file_reader.h"
 #include "test_framework.h"
@@ -1225,6 +1226,7 @@ const std::vector<FamilyFiles> FAMILY_FILES = {
     {"addr", {"addr_points.bin", "addr_vertices.bin", "addr_index.bin"}},
     {"poi", {"poi_records.bin", "poi_vertices.bin"}},
     {"places", {"place_cells.bin", "place_nodes.bin", "place_hidden.bin"}},
+    {"postcodes", {"postcode_centroids.bin", "postcode_centroid_cells.bin"}},
     {"way_parents", {"way_parents.bin"}},
     {"addr_postcodes", {"addr_postcodes.bin"}},
 };
@@ -1243,10 +1245,21 @@ std::vector<PlaceNode> some_places(uint32_t n) {
     return places;
 }
 
+// n postcode centroids in cell order, seven to a cell, every other one at
+// four decimals, each its own postcode.
+std::vector<postcode_files::LogicalCentroid> some_centroids(uint32_t n) {
+    std::vector<postcode_files::LogicalCentroid> rows;
+    for (uint32_t i = 0; i < n; i++) {
+        const float lat = i % 2 ? 47.0f + static_cast<float>(i) * 1e-4f : static_cast<float>(470000 + i) / 1e4f;
+        rows.push_back(test_centroid(lat, 8.0f + static_cast<float>(i % 7) * 1e-3f, i, DE, 50 + i / 7));
+    }
+    return rows;
+}
+
 // A dir of every encoded family: 40 street ways of two nodes in a geo cell,
 // with a parent each; 30 interpolations of three nodes; 60 address points,
 // two in three with a footprint, with a postcode each; 50 POIs, two in three
-// polygons; 20 place nodes.
+// polygons; 20 place nodes; 30 postcode centroids.
 BuildDir every_family(std::mt19937& rng) {
     BuildDir d, meta;
     std::vector<uint32_t> names;
@@ -1273,6 +1286,7 @@ BuildDir every_family(std::mt19937& rng) {
     d["addr_postcodes.bin"] = postcodes;
     put_pois(d, pois_of(rng, 50, 0, true));
     put_places(d, some_places(20));
+    put_centroids(d, some_centroids(30));
     return d;
 }
 
@@ -1325,10 +1339,11 @@ std::vector<char> unlisted(const std::vector<char>& raw, const std::string& file
 
 // A family the day leaves as it is, each of its sections sent as unchanged
 // (a way pair's, the address files', the POI files': the records' section and
-// the child's after it; the place files' and a side file's: their one
-// section), is copied from the old dir as its files sit there, the files no
-// section names with them (addr_index.bin; place_cells.bin and
-// place_hidden.bin), and none of its codecs runs: on a day that changes
+// the child's after it; the place files', the postcode centroid files' and a
+// side file's: their one section), is copied from the old dir as its files
+// sit there, the files no section names with them (addr_index.bin;
+// place_cells.bin and place_hidden.bin; postcode_centroid_cells.bin), and
+// none of its codecs runs: on a day that changes
 // nothing, and beside each family in turn that a day does change, in its
 // records alone or in its child alone, which goes through its codecs. In
 // every mode the patched dir is the new dir.
@@ -1358,6 +1373,12 @@ TEST(patch_copies_a_family_both_of_whose_sections_are_unchanged) {
              std::vector<PlaceNode> places = some_places(20);
              places[5].name_id = 1000;
              put_places(d, places);
+         }},
+        {"centroid-moved", {"postcodes"},
+         [](BuildDir& d) {
+             std::vector<postcode_files::LogicalCentroid> centroids = some_centroids(30);
+             centroids[11].lat += 1e-3f;
+             put_centroids(d, centroids);
          }},
         {"way-parent", {"way_parents"}, [](BuildDir& d) { put_at(d["way_parents.bin"], 11 * 4, 99u); }},
         {"postcode", {"addr_postcodes"}, [](BuildDir& d) { put_at(d["addr_postcodes.bin"], 11 * 4, 800u); }},
@@ -1403,7 +1424,8 @@ TEST(patch_holds_the_files_of_a_family_it_copies_to_their_hashes) {
 // refused in every mode: old files whose footers give the child stream
 // another size than the patch (a street way of three nodes for one of two:
 // the records' bytes are as many), an address family without its index, a
-// place family without its cells file, and in the patch the family's sections
+// place family and a postcode centroid family without their cells files, and
+// in the patch the family's sections
 // a second time, the records' section without the child's after it, and a
 // client list without a file the family holds that no section names. The
 // patch as made applies.
@@ -1439,7 +1461,9 @@ TEST(patch_refuses_what_it_can_check_of_a_family_it_copies) {
                           Edit{"childless", childless, "Encoded family: street_nodes.bin does not follow its parent in the patch"},
                           Edit{"index-unlisted", unlisted(raw, "addr_index.bin"), "addr: the patch lists no addr_index.bin"},
                           Edit{"cells-unlisted", unlisted(raw, "place_cells.bin"), "places: the patch lists no place_cells.bin"},
-                          Edit{"hidden-unlisted", unlisted(raw, "place_hidden.bin"), "places: the patch lists no place_hidden.bin"}}) {
+                          Edit{"hidden-unlisted", unlisted(raw, "place_hidden.bin"), "places: the patch lists no place_hidden.bin"},
+                          Edit{"centroid-cells-unlisted", unlisted(raw, "postcode_centroid_cells.bin"),
+                               "postcodes: the patch lists no postcode_centroid_cells.bin"}}) {
         REQUIRE(!e.patch.empty());
         const std::string patch = c.dir(e.name + ".gcpatch");
         REQUIRE(write_patch(c, patch, e.patch));
@@ -1450,6 +1474,7 @@ TEST(patch_refuses_what_it_can_check_of_a_family_it_copies) {
     for (const std::string& mode : ALL_MODES) {
         CHECK(!std::filesystem::exists(c.dir("index-unlisted.out." + mode) + "/addr_points.bin"));
         CHECK(!std::filesystem::exists(c.dir("cells-unlisted.out." + mode) + "/place_nodes.bin"));
+        CHECK(!std::filesystem::exists(c.dir("centroid-cells-unlisted.out." + mode) + "/postcode_centroids.bin"));
     }
 
     auto put = [&](const std::string& name, const std::optional<std::vector<char>>& bytes) {
@@ -1475,6 +1500,11 @@ TEST(patch_refuses_what_it_can_check_of_a_family_it_copies) {
     put("place_cells.bin", std::nullopt);
     CHECK(not_refused(c, ALL_MODES, c.patch(), "no-cells", "place_cells.bin: copy-old failed (src MISSING)").empty());
     put("place_cells.bin", written.at("place_cells.bin"));
+    // The postcode centroid files' decoded size is read from both: refused before anything is copied.
+    put("postcode_centroid_cells.bin", std::nullopt);
+    CHECK(not_refused(c, ALL_MODES, c.patch(), "no-centroid-cells", "has one of postcode_centroids.bin and postcode_centroid_cells.bin")
+              .empty());
+    put("postcode_centroid_cells.bin", written.at("postcode_centroid_cells.bin"));
 
     CHECK(apply_modes(c, ALL_MODES, copied).bad.empty());
 }
@@ -2887,7 +2917,7 @@ TEST(patch_lowmem_replays_poi_records_and_vertices_out_of_step) {
 // it holds, are refused in every mode: a parallel delta's inserted values and
 // changes (way_parents along the street ways' merge), a sparse delta's
 // changes (admin_parents), and the lengths of a full replacement
-// (postcode_centroids.bin, new) and of an unchanged file's empty payload
+// (strings_poi.bin, a tier new to the dir) and of an unchanged file's empty payload
 // (place_nodes.bin). A 32-bit size_t wrapped each back to what the patch
 // holds: the deltas read the bytes after their changes as more of them, and
 // the lengths applied as the patch's. The patch as made applies.
@@ -2901,7 +2931,7 @@ TEST(patch_refuses_change_counts_and_lengths_that_wrap_32_bits) {
     BuildDir old_d, new_d, old_meta, new_meta;
     put_named_ways(old_d, old_meta, names);
     put_named_ways(new_d, new_meta, renamed);
-    std::vector<char> old_parents, new_parents, old_admin_parents, new_admin_parents, centroids;
+    std::vector<char> old_parents, new_parents, old_admin_parents, new_admin_parents;
     for (uint32_t i = 0; i < 31; i++) {
         if (i < 30) append(old_parents, 100 + i);
         append(new_parents, i == 20 ? 777u : 100 + i);
@@ -2910,15 +2940,14 @@ TEST(patch_refuses_change_counts_and_lengths_that_wrap_32_bits) {
         append(old_admin_parents, i);
         append(new_admin_parents, i % 16 == 5 ? i + 1000 : i);
     }
-    for (uint32_t i = 0; i < 4; i++)
-        for (const uint32_t w : {i, i, NO, 0u}) append(centroids, w);
     std::vector<PlaceNode> places;
     for (uint32_t i = 0; i < 5; i++) places.push_back(test_place(float(i), float(i), i));
     old_d["way_parents.bin"] = old_parents;
     new_d["way_parents.bin"] = new_parents;
     old_d["admin_parents.bin"] = old_admin_parents;
     new_d["admin_parents.bin"] = new_admin_parents;
-    new_d["postcode_centroids.bin"] = centroids;
+    new_d["strings_poi.bin"] = {'P', 'O', 'I', 0, 'Q', 0};
+    const std::vector<char> tier = gctest::as_written(new_d).at("strings_poi.bin");
     put_places(old_d, places);
     put_places(new_d, places);
     const LowMemCase c{dir.path(), "wrap32"};
@@ -2946,11 +2975,11 @@ TEST(patch_refuses_change_counts_and_lengths_that_wrap_32_bits) {
     // Sparse: value stride, remap kind, then n_changes.
     const size_t sparse_changes_at = at_of(PatchFileId::ADMIN_PARENTS, SPARSE_DELTA_STRIDE, 64 * 4, 64 * 4, {4, 0}) + 32;
     // Full replacement and copy: a u32 (no fixups), then the data's length.
-    const size_t full_length_at = at_of(PatchFileId::POSTCODE_CENTROIDS, 0, 0, centroids.size(), {0}) + 28;
+    const size_t full_length_at = at_of(PatchFileId::STRINGS_POI, 0, 0, tier.size(), {0}) + 28;
     const uint64_t place_rows = places.size() * PLACE_NODE_STRIDE;
     const size_t copy_length_at = at_of(PatchFileId::PLACE_NODES, COPY_OLD_STRIDE, place_rows, place_rows, {0}) + 28;
     REQUIRE(u32_at(inserted_at) > 0 && u32_at(parallel_changes_at) > 0 && u32_at(sparse_changes_at) > 0);
-    REQUIRE(u64_at(full_length_at) == centroids.size() && u64_at(copy_length_at) == 0);
+    REQUIRE(u64_at(full_length_at) == tier.size() && u64_at(copy_length_at) == 0);
     struct Edit {
         std::string name;
         size_t at;
@@ -7914,6 +7943,7 @@ TEST(patch_refuses_a_section_sent_as_unchanged_whose_new_size_is_not_its_old_one
         {PatchFileId::POI_RECORDS, logical("poi_records.bin"), POI_RECORD_STRIDE},
         {PatchFileId::POI_VERTICES, logical("poi_vertices.bin"), 1},
         {PatchFileId::PLACE_NODES, place_files::LOGICAL_STRIDE * 20, place_files::LOGICAL_STRIDE},
+        {PatchFileId::POSTCODE_CENTROIDS, postcode_files::LOGICAL_STRIDE * 30, postcode_files::LOGICAL_STRIDE},
         {PatchFileId::WAY_PARENTS, logical("way_parents.bin"), 4},
         {PatchFileId::ADDR_POSTCODES, logical("addr_postcodes.bin"), 4},
     };
@@ -8070,9 +8100,9 @@ TEST(patch_refuses_bytes_no_record_of_a_family_owns_as_they_come) {
 // 2,048 (a read ahead of the decoder's) and of 4,096, a byte between its
 // blocks and its table; POI files whose records stay while a polygon changes
 // (the records sent unchanged replay with their vertices through the codecs),
-// a byte between the last block and the pad; and place files with a place
-// renamed, a byte between the blocks and the table. Each patch applies to the
-// files as written.
+// a byte between the last block and the pad; place files with a place
+// renamed and postcode centroid files with a centroid moved, a byte between
+// the blocks and the table. Each patch applies to the files as written.
 TEST(patch_refuses_old_files_with_a_byte_between_their_last_unit_and_what_follows_it) {
     ScratchDir dir("lowmem-file-ends");
     std::mt19937 rng(20261115);
@@ -8122,6 +8152,16 @@ TEST(patch_refuses_old_files_with_a_byte_between_their_last_unit_and_what_follow
         // 15 visible nodes: one block.
         cases.push_back({"places", old_d, new_d, "place_nodes.bin", place_files::TABLE_ENTRY_BYTES + place_files::FOOTER_BYTES,
                          "Malformed place files: place_nodes.bin has bytes between its blocks and its table"});
+    }
+    {
+        std::vector<postcode_files::LogicalCentroid> centroids = some_centroids(30);
+        BuildDir old_d, new_d;
+        put_centroids(old_d, centroids);
+        centroids[5].lat += 1e-3f;
+        put_centroids(new_d, centroids);
+        // 30 centroids: one block, its bits one byte longer.
+        cases.push_back({"postcodes", old_d, new_d, "postcode_centroids.bin", postcode_files::TABLE_ENTRY_BYTES + postcode_files::FOOTER_BYTES,
+                         "Malformed postcode centroid files: block 0 is not the encoder's"});
     }
     for (const Case& e : cases) {
         const int failures_before = gctest::failures();
@@ -8254,5 +8294,127 @@ TEST(patch_holds_the_old_poi_files_to_their_hashes_when_only_the_blocks_change) 
     REQUIRE(write_file(blocks_path, another_block));
     CHECK(not_refused(c, ALL_MODES, c.patch(), "block", "Old poi_vertices.bin is not the one the patch was made from").empty());
     REQUIRE(write_file(blocks_path, blocks));
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+}
+
+// The postcode centroid family as a dir gains its first centroid (from no
+// files, and from the files of none: the footer alone and an empty cells
+// file), loses its last (to no files, and to the files of none), holds the
+// files of none on both days, and gains or drops those. In every mode the
+// patched dir is the new dir, the files of none among it.
+TEST(patch_postcode_centroids_come_and_go_and_hold_none) {
+    ScratchDir dir("lowmem-centroid-edges");
+    struct Day {
+        std::string name;
+        int old_rows, new_rows;  // -1: no centroid files
+    };
+    for (const Day& day : {Day{"first", -1, 40}, {"first-of-none", 0, 40}, {"last", 40, -1}, {"last-to-none", 40, 0},
+                           {"none-both", 0, 0}, {"files-of-none-new", -1, 0}, {"files-of-none-gone", 0, -1}}) {
+        BuildDir old_d, new_d;
+        // Beside the place files, a family each day keeps.
+        put_places(old_d, some_places(10));
+        put_places(new_d, some_places(10));
+        const std::vector<postcode_files::LogicalCentroid> all = some_centroids(40);
+        if (day.old_rows >= 0) put_centroids(old_d, {all.begin(), all.begin() + day.old_rows});
+        if (day.new_rows >= 0) put_centroids(new_d, {all.begin(), all.begin() + day.new_rows});
+        const LowMemCase c{dir.path(), day.name};
+        REQUIRE(prepare(c, old_d, new_d).empty());
+
+        const Applied a = apply_modes(c, ALL_MODES);
+        if (!a.bad.empty()) std::printf("    %s\n", day.name.c_str());
+        CHECK(a.bad.empty());
+        for (const std::string& mode : ALL_MODES) {
+            const BuildDir out = read_dir(c.dir("out." + mode));
+            CHECK_EQ(out.count("postcode_centroids.bin") != 0, day.new_rows >= 0);
+            CHECK_EQ(out.count("postcode_centroid_cells.bin") != 0, day.new_rows >= 0);
+        }
+    }
+}
+
+// n postcode centroids in cell order, every hundredth of which the new day
+// moves in its cell (a delete and an insert in the merge): the family's
+// codecs hold a block of rows and the cells index's parent record, so the
+// patcher's heap peak at 100 n is its peak at n.
+TEST(patch_heap_stays_flat_as_postcode_centroids_grow) {
+    CHECK(heap_flat([](const LowMemCase& c, uint32_t n) {
+        std::vector<postcode_files::LogicalCentroid> rows, moved;
+        for (uint32_t i = 0; i < n; i++) {
+            const float lat = 51.0f + static_cast<float>(i % 30) * 1e-3f, lng = static_cast<float>(i / 30 % 1000) * 1e-3f;
+            rows.push_back(test_centroid(lat, lng, i, DE, 1000 + i / 30));
+        }
+        moved = rows;
+        for (size_t i = 0; i < moved.size(); i += 100) moved[i].lng += 1e-4f;
+        BuildDir old_d, new_d;
+        put_centroids(old_d, rows);
+        put_centroids(new_d, moved);
+        if (std::string e = prepare(c, old_d, new_d); !e.empty()) return e;
+        std::vector<char> head;
+        append(head, static_cast<uint32_t>(PatchFileId::POSTCODE_CENTROIDS));
+        append(head, static_cast<uint32_t>(POSTCODE_CENTROID_STRIDE));
+        append(head, uint64_t{postcode_files::LOGICAL_STRIDE} * n);
+        append(head, uint64_t{postcode_files::LOGICAL_STRIDE} * n);
+        return patch_holds(c, head, "merge of " + std::to_string(n) + " centroids");
+    }, 2000, 100).empty());
+}
+
+// A section for file id 24 or 25, which name no file from v19 (the cells
+// file is written beside postcode_centroids.bin, and there is no entries
+// file), a sparse delta for postcode_centroids.bin (its 16-byte records'
+// remap kind 3 to v18), and a section at the cell list delta's stride 0xFB:
+// each put in a patch of a day that moves a centroid is refused in every
+// mode. The patch as made applies.
+TEST(patch_refuses_the_postcode_sections_of_v18) {
+    ScratchDir dir("patch-postcode-v18");
+    std::vector<postcode_files::LogicalCentroid> centroids = some_centroids(30);
+    BuildDir old_d, new_d;
+    put_centroids(old_d, centroids);
+    centroids[3].lat += 1e-3f;
+    put_centroids(new_d, centroids);
+    const LowMemCase c{dir.path(), "postcode-v18"};
+    REQUIRE(prepare(c, old_d, new_d).empty());
+    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+    const std::vector<char> raw = raw_patch(c);
+    REQUIRE(!raw.empty());
+    // The centroids' merge section: file id, stride, old and new sizes.
+    std::vector<char> merge;
+    append(merge, static_cast<uint32_t>(PatchFileId::POSTCODE_CENTROIDS));
+    append(merge, static_cast<uint32_t>(POSTCODE_CENTROID_STRIDE));
+    const size_t at = find_once(raw, merge);
+    REQUIRE(at != std::string::npos);
+    // file id, stride, old size (the old centroids' logical bytes for id 23), new size, then a full
+    // replacement's words (no files, 4 bytes) or a sparse delta's.
+    const uint64_t old_rows = postcode_files::LOGICAL_STRIDE * 30;
+    auto section = [&](uint32_t id, uint32_t stride, std::initializer_list<uint32_t> words, bool data) {
+        std::vector<char> s;
+        append(s, id);
+        append(s, stride);
+        append(s, id == 23 ? old_rows : uint64_t(0));
+        append(s, uint64_t(data ? 4 : 0));
+        for (const uint32_t w : words) append(s, w);
+        if (data) {
+            append(s, uint64_t(4));
+            append(s, uint32_t(0x01020304));
+        }
+        return s;
+    };
+    struct Edit {
+        std::string name;
+        std::vector<char> section;
+        std::string refusal;
+    };
+    const Edit edits[] = {
+        {"id-24", section(24, 0, {0}, true), "Unknown file 24"},
+        {"id-25", section(25, 0, {0}, true), "Unknown file 25"},
+        {"sparse", section(23, SPARSE_DELTA_STRIDE, {16, 3, 0}, false), "Malformed sparse delta"},
+        {"stride-0xFB", section(23, 0xFB, {}, false), "Malformed record stride: postcode_centroids.bin"},
+    };
+    for (const Edit& e : edits) {
+        std::vector<char> edited = raw;
+        edited.insert(edited.begin() + static_cast<std::ptrdiff_t>(at), e.section.begin(), e.section.end());
+        const std::string patch = c.dir(e.name + ".gcpatch");
+        REQUIRE(write_patch(c, patch, edited));
+
+        CHECK(not_refused(c, ALL_MODES, patch, e.name, e.refusal).empty());
+    }
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }

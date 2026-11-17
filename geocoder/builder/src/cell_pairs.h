@@ -117,7 +117,6 @@ inline constexpr Format POSTCODE_CELLS{Kind::RANGES, false, Gaps::VARINT};
 inline std::optional<Format> format_named(const std::string& prefix) {
     if (prefix == "admin") return ADMIN;
     if (prefix == "poi") return POI;
-    if (prefix == "postcode_centroid") return POSTCODE_CENTROID;
     return std::nullopt;
 }
 inline Format format_of(const std::string& prefix) {
