@@ -1,6 +1,8 @@
 // Region downloader: resolves the file list for a configuration via
-// configurations.json, fetches each .zst file from Tigris, verifies
-// sha256 against the manifest, decompresses, and writes atomically.
+// configurations.json, fetches each file from Tigris as published (its .zst,
+// or the transport unit that holds it, once for all its files), decompresses
+// or decodes it, verifies each file's sha256 against the manifest, and
+// writes atomically.
 //
 // Used by the on-demand download path: when a request lands on a
 // continent we don't have, the request handler triggers this and
@@ -9,6 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
+use query_server::transport::{self, ChunkReader, Expected, TRANSPORT_VERSION};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -26,6 +29,9 @@ pub enum DownloadError {
     /// The manifest names a component (as a parent or a variant) that it
     /// doesn't define.
     MissingComponent(String),
+    /// A transport unit that can't be taken or failed to decode into its
+    /// files: the unit's path and why.
+    Transport(String),
 }
 
 impl std::fmt::Display for DownloadError {
@@ -46,6 +52,7 @@ impl std::fmt::Display for DownloadError {
             DownloadError::MissingComponent(id) => {
                 write!(f, "the manifest names component \"{id}\" but does not define it")
             }
+            DownloadError::Transport(s) => write!(f, "transport unit {}", s),
         }
     }
 }
@@ -59,6 +66,9 @@ pub struct Configurations {
     pub build: BuildMeta,
     pub components: BTreeMap<String, Component>,
     pub files: BTreeMap<String, FileEntry>,
+    /// The build's transport units, by path.
+    #[serde(default)]
+    pub units: BTreeMap<String, UnitEntry>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -95,9 +105,25 @@ pub struct Variant {
 
 #[derive(Deserialize, Debug, Clone)]
 pub struct FileEntry {
-    pub size_zst: u64,
+    /// The bytes of the file's .zst; none for a file a transport unit holds.
+    #[serde(default)]
+    pub size_zst: Option<u64>,
     pub size_raw: u64,
     pub sha256: String,
+    /// The transport unit holding the file, its only published form.
+    #[serde(default)]
+    pub unit: Option<String>,
+}
+
+/// A transport unit (query_server::transport): the download-only form of
+/// the files it holds, all in one dir.
+#[derive(Deserialize, Debug, Clone)]
+pub struct UnitEntry {
+    pub transport_version: u32,
+    /// Its bytes on the wire.
+    pub size: u64,
+    /// The paths of its files.
+    pub files: Vec<String>,
 }
 
 /// The axes a selection takes one component of, `<axis>.<value>`.
@@ -219,8 +245,37 @@ pub fn resolve_files(cfg: &Configurations, sel: &RegionSelection) -> Result<Reso
 
 // --- Download a single file -------------------------------------------------
 
-/// Fetch `{base_url}/builds/{date}/{path}.zst`, decompress, verify
-/// sha256 against `expected.sha256`, write atomically to `dest`.
+/// Feeds the body of `resp` to a blocking decoder through `tx`, chunk by
+/// chunk; stops early when the decoder has gone (its error tells why). The
+/// body's read error, if any.
+async fn send_body(resp: reqwest::Response, tx: &std::sync::mpsc::SyncSender<bytes::Bytes>, url: &str) -> Option<DownloadError> {
+    use futures_util::StreamExt;
+    let mut stream = resp.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(b) => {
+                if tx.send(b).is_err() {
+                    return None; // writer died — its error surfaces below
+                }
+            }
+            Err(e) => return Some(DownloadError::Http(format!("{}: read body: {}", url, e))),
+        }
+    }
+    None
+}
+
+async fn get(client: &reqwest::Client, url: &str) -> Result<reqwest::Response, DownloadError> {
+    let resp = client.get(url).send().await
+        .map_err(|e| DownloadError::Http(format!("{}: {}", url, e)))?;
+    if !resp.status().is_success() {
+        return Err(DownloadError::Http(format!("{}: HTTP {}", url, resp.status())));
+    }
+    Ok(resp)
+}
+
+/// Fetch `{base_url}/builds/{date}/{path}.zst`, a file published as its own
+/// .zst, decompress, verify sha256 against `expected.sha256`, write
+/// atomically to `dest`.
 async fn download_file(
     client: &reqwest::Client,
     base_url: &str,
@@ -230,11 +285,7 @@ async fn download_file(
     dest: &Path,
 ) -> Result<(), DownloadError> {
     let url = format!("{}/builds/{}/{}.zst", base_url.trim_end_matches('/'), date, path);
-    let resp = client.get(&url).send().await
-        .map_err(|e| DownloadError::Http(format!("{}: {}", url, e)))?;
-    if !resp.status().is_success() {
-        return Err(DownloadError::Http(format!("{}: HTTP {}", url, resp.status())));
-    }
+    let resp = get(client, &url).await?;
     // Stream: HTTP chunks → zstd streaming decoder → sha256 + tmp file.
     // The old path buffered the whole compressed body AND the whole
     // decompressed output in RAM (multi-GiB peaks on planet addr_* files),
@@ -253,22 +304,7 @@ async fn download_file(
         decode_hash_write(rx, &tmp_for_writer, &path_owned)
     });
 
-    let mut stream = resp.bytes_stream();
-    let mut stream_err: Option<DownloadError> = None;
-    use futures_util::StreamExt;
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(b) => {
-                if tx.send(b).is_err() {
-                    break; // writer died — its error surfaces below
-                }
-            }
-            Err(e) => {
-                stream_err = Some(DownloadError::Http(format!("{}: read body: {}", url, e)));
-                break;
-            }
-        }
-    }
+    let stream_err = send_body(resp, &tx, &url).await;
     drop(tx);
     let writer_result = writer.await
         .map_err(|e| DownloadError::Io(format!("writer task: {}", e)));
@@ -336,6 +372,46 @@ fn decode_hash_write(
     Ok(format!("{:x}", hw.hasher.finalize()))
 }
 
+// --- Download a transport unit -----------------------------------------------
+
+/// Fetch the transport unit `{base_url}/builds/{date}/{unit}` and decode it
+/// into `dir` as it streams in (transport::decode_into_dir, on a blocking
+/// thread fed through a bounded channel): its files are written and hashed
+/// as they come, must be `files` with their sizes and sha256, and are
+/// renamed into place together once all are; on an error none is. RAM use
+/// is the channel, the zstd window and one chunk of the unit's columns.
+async fn download_unit(
+    client: &reqwest::Client,
+    base_url: &str,
+    date: &str,
+    unit: &str,
+    files: &[(&str, &FileEntry)],
+    dir: &Path,
+) -> Result<(), DownloadError> {
+    let url = format!("{}/builds/{}/{}", base_url.trim_end_matches('/'), date, unit);
+    let resp = get(client, &url).await?;
+    let expect: Vec<Expected> = files.iter()
+        .map(|(path, e)| Expected { name: basename(path).to_string(), sha256: e.sha256.clone(), size: Some(e.size_raw) })
+        .collect();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(8);
+    let dir = dir.to_path_buf();
+    let decoder = tokio::task::spawn_blocking(move || {
+        transport::decode_into_dir(ChunkReader::new(rx), &dir, Some(&expect)).map(|_| ())
+    });
+    let stream_err = send_body(resp, &tx, &url).await;
+    drop(tx);
+    let decoded = decoder.await
+        .map_err(|e| DownloadError::Io(format!("decoder task: {}", e)))?;
+    if let Some(e) = stream_err {
+        return Err(e);
+    }
+    decoded.map_err(|e| DownloadError::Transport(format!("{}: {}", unit, e)))
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
 // --- Region download ---------------------------------------------------------
 
 #[derive(Debug, Clone, Default)]
@@ -346,14 +422,86 @@ pub struct DownloadProgress {
     pub bytes_total: u64,
 }
 
+/// One object a region's download fetches.
+enum Fetch<'a> {
+    /// A file, through its own .zst of `size` bytes.
+    File { path: &'a str, entry: &'a FileEntry, size: u64 },
+    /// A transport unit of `size` bytes, for its files.
+    Unit { path: &'a str, size: u64, files: Vec<(&'a str, &'a FileEntry)> },
+}
+
+impl Fetch<'_> {
+    fn size(&self) -> u64 {
+        match self {
+            Fetch::File { size, .. } | Fetch::Unit { size, .. } => *size,
+        }
+    }
+
+    fn files(&self) -> usize {
+        match self {
+            Fetch::File { .. } => 1,
+            Fetch::Unit { files, .. } => files.len(),
+        }
+    }
+}
+
+/// What a download of `paths` fetches, in path order: each file's .zst, or
+/// its transport unit, once for all the files it holds. A unit must be of
+/// this build's transport version, and the selection must take all of its
+/// files: decoding it writes every one.
+fn fetches<'a>(cfg: &'a Configurations, paths: &[&'a String]) -> Result<Vec<Fetch<'a>>, DownloadError> {
+    let taken: HashSet<&str> = paths.iter().map(|p| p.as_str()).collect();
+    let mut units = HashSet::new();
+    let mut out = Vec::new();
+    for path in paths {
+        let entry = cfg.files.get(*path)
+            .ok_or_else(|| DownloadError::NotInManifest((*path).clone()))?;
+        let Some(u) = entry.unit.as_deref() else {
+            let size = entry.size_zst.ok_or_else(|| DownloadError::NotInManifest(format!("{}.zst", path)))?;
+            out.push(Fetch::File { path: path.as_str(), entry, size });
+            continue;
+        };
+        if !units.insert(u) {
+            continue;
+        }
+        let unit = cfg.units.get(u)
+            .ok_or_else(|| DownloadError::Transport(format!("{}: not in the manifest's units", u)))?;
+        if unit.transport_version != TRANSPORT_VERSION {
+            return Err(DownloadError::Transport(format!(
+                "{}: a unit of transport version {}: this build reads version {} only",
+                u, unit.transport_version, TRANSPORT_VERSION
+            )));
+        }
+        if !unit.files.iter().any(|f| f == *path) {
+            return Err(DownloadError::Transport(format!("{}: doesn't hold {}, which names it", u, path)));
+        }
+        let mut files = Vec::with_capacity(unit.files.len());
+        for f in &unit.files {
+            if !taken.contains(f.as_str()) {
+                return Err(DownloadError::Transport(format!("{}: holds {}, which the selection doesn't take", u, f)));
+            }
+            files.push((f.as_str(), cfg.files.get(f).ok_or_else(|| DownloadError::NotInManifest(f.clone()))?));
+        }
+        out.push(Fetch::Unit { path: u, size: unit.size, files });
+    }
+    Ok(out)
+}
+
+/// Whether the file at `path` is in `dir` at its size.
+async fn on_disk(dir: &Path, path: &str, entry: &FileEntry) -> bool {
+    matches!(tokio::fs::metadata(dir.join(basename(path))).await, Ok(m) if m.len() == entry.size_raw)
+}
+
 /// Resolve and download every file for a single region. Files that
-/// already exist on disk with the right size are skipped (full sha256
-/// re-verification on every restart would be expensive on planet-
-/// sized data — size match is good enough as a fast path; the
-/// complete sha256 check happens on first download).
+/// already exist on disk with the right size are skipped, and a transport
+/// unit when all its files are (full sha256 re-verification on every
+/// restart would be expensive on planet-sized data — size match is good
+/// enough as a fast path; the complete sha256 check happens on first
+/// download). A unit's files land together, so a download needs the
+/// largest unit's files' size free beside the region.
 ///
-/// `progress` fires after each file completes with the running total;
-/// the caller logs it.
+/// `progress` fires after each file or unit completes with the running
+/// total; the caller logs it.
 pub async fn download_region(
     client: &reqwest::Client,
     base_url: &str,
@@ -369,12 +517,12 @@ pub async fn download_region(
     let paths: Vec<&String> = resolved.paths.iter()
         .filter(|p| cfg.files.contains_key(*p) || !resolved.optional.contains(*p))
         .collect();
+    let fetches = fetches(cfg, &paths)?;
 
-    let bytes_total: u64 = paths.iter()
-        .filter_map(|p| cfg.files.get(*p).map(|f| f.size_zst))
-        .sum();
+    let bytes_total: u64 = fetches.iter().map(Fetch::size).sum();
     let mut bytes_done: u64 = 0;
     let files_total = paths.len();
+    let mut files_done = 0;
 
     progress(DownloadProgress {
         files_total,
@@ -400,27 +548,28 @@ pub async fn download_region(
         tokio::fs::write(&stamp, &cfg.build.date).await
             .map_err(|e| DownloadError::Io(format!("write {}: {}", stamp.display(), e)))?;
     }
-
-    for (i, path) in paths.iter().enumerate() {
-        let entry = cfg.files.get(*path)
-            .ok_or_else(|| DownloadError::NotInManifest((*path).clone()))?;
-
-        let fname = Path::new(path).file_name()
-            .ok_or_else(|| DownloadError::Io(format!("bad manifest path: {}", path)))?;
-        let dest = region_dir.join(fname);
-
-        let already_correct = !fresh_build && match tokio::fs::metadata(&dest).await {
-            Ok(m) => m.len() == entry.size_raw,
-            Err(_) => false,
-        };
-
-        if !already_correct {
-            download_file(client, base_url, &cfg.build.date, path, entry, &dest).await?;
+    for fetch in &fetches {
+        match fetch {
+            Fetch::File { path, entry, .. } => {
+                if fresh_build || !on_disk(&region_dir, path, entry).await {
+                    download_file(client, base_url, &cfg.build.date, path, entry, &region_dir.join(basename(path))).await?;
+                }
+            }
+            Fetch::Unit { path, files, .. } => {
+                let mut all_on_disk = !fresh_build;
+                for (f, entry) in files {
+                    all_on_disk = all_on_disk && on_disk(&region_dir, f, entry).await;
+                }
+                if !all_on_disk {
+                    download_unit(client, base_url, &cfg.build.date, path, files, &region_dir).await?;
+                }
+            }
         }
 
-        bytes_done = bytes_done.saturating_add(entry.size_zst);
+        files_done += fetch.files();
+        bytes_done = bytes_done.saturating_add(fetch.size());
         progress(DownloadProgress {
-            files_done: i + 1,
+            files_done,
             files_total,
             bytes_done,
             bytes_total,
@@ -481,6 +630,7 @@ mod tests {
             build: BuildMeta { date: "2026-01-01".into() },
             components: components.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             files: BTreeMap::new(),
+            units: BTreeMap::new(),
         }
     }
 
@@ -604,6 +754,7 @@ mod tests {
                 build: BuildMeta { date: "2026-01-01".into() },
                 components: serde_json::from_value(components).unwrap(),
                 files: BTreeMap::new(),
+                units: BTreeMap::new(),
             };
             match resolve_files(&c, &sel("eu", "full", "simplified", "none")) {
                 Err(DownloadError::MissingComponent(id)) => id,
@@ -646,6 +797,7 @@ mod tests {
                 "poi_tier.major": { "files": ["{region}/poi/{poi_tier}/p.bin"] }
             })).unwrap(),
             files: BTreeMap::new(),
+            units: BTreeMap::new(),
         };
 
         assert_eq!(resolve_files(&c, &sel("eu", "small", "simplified", "none")).unwrap().paths,
@@ -682,6 +834,7 @@ mod tests {
             build: BuildMeta { date: "2026-01-01".into() },
             components: serde_json::from_value(v["components"].clone()).unwrap(),
             files: BTreeMap::new(),
+            units: BTreeMap::new(),
         };
         (v, c)
     }
@@ -716,10 +869,6 @@ mod tests {
             all.push(sel(&axis("region"), &axis("mode"), &axis("quality"), &axis("poi_tier")));
         }
         all
-    }
-
-    fn basename(path: &str) -> &str {
-        path.rsplit('/').next().unwrap()
     }
 
     // Index::load needs strings_layout.json in every region dir and
@@ -859,18 +1008,161 @@ mod tests {
         assert_eq!(bucket.files_served(), 0);
     }
 
-    // The checks refuse no selection the template allows, nor a preset's.
+    /// The names in a region dir and their bytes.
+    fn held(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir).unwrap()
+            .map(|e| e.unwrap())
+            .map(|e| (e.file_name().into_string().unwrap(), std::fs::read(e.path()).unwrap()))
+            .collect()
+    }
+
+    /// What a download of `s` should leave in its region dir: each file the
+    /// bucket has, by its name, and the build's stamp.
+    fn files_of(bucket: &TestBucket, s: &RegionSelection) -> BTreeMap<String, Vec<u8>> {
+        let mut want: BTreeMap<String, Vec<u8>> = resolve_files(&bucket.manifest, s).unwrap().paths.iter()
+            .filter(|p| bucket.manifest.files.contains_key(*p))
+            .map(|p| (basename(p).to_string(), bucket.file(p).to_vec()))
+            .collect();
+        want.insert(".build_date".into(), test_bucket::DATE.as_bytes().to_vec());
+        want
+    }
+
+    // The checks refuse no selection the template allows, nor a preset's, and
+    // each gets the bucket's files byte for byte, its transport units' among
+    // them.
     #[tokio::test]
-    async fn every_template_selection_downloads_its_admin_geometry() {
+    async fn every_template_selection_downloads_its_files_byte_for_byte() {
         let (v, _) = template();
         let bucket = test_bucket::serve(v["components"].clone()).await;
+        let mut units = 0;
         for s in template_selections(&v) {
             let root = ScratchDir::new();
 
             download(&bucket, &s, root.path()).await.unwrap_or_else(|e| panic!("{s:?}: {e}"));
 
+            let got = held(&root.path().join(&s.region));
             for name in ["admin_cells.bin", "strings_layout.json", "admin_polygons.bin"].into_iter().chain(query_server::ADMIN_GEOMETRY_FILES) {
-                assert!(root.path().join(&s.region).join(name).exists(), "{s:?} {name}");
+                assert!(got.contains_key(name), "{s:?} {name}");
+            }
+            assert!(got == files_of(&bucket, &s), "{s:?}: {:?}", got.keys().collect::<Vec<_>>());
+            units += resolve_files(&bucket.manifest, &s).unwrap().paths.iter().filter(|p| bucket.manifest.files[*p].unit.is_some()).count();
+        }
+        assert!(units > 0);
+    }
+
+    // A unit's files come down together, each to its sha256: the unit once
+    // for all of them, counted once in the bytes.
+    #[tokio::test]
+    async fn a_unit_is_fetched_once_for_all_its_files() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let s = sel("europe", "admin", "simplified", "major");
+        let root = ScratchDir::new();
+        let seen = std::sync::Mutex::new(Vec::new());
+
+        download_region(&reqwest::Client::new(), &bucket.url, &bucket.manifest, &s, root.path(), |p| seen.lock().unwrap().push(p)).await.unwrap();
+
+        let paths = resolve_files(&bucket.manifest, &s).unwrap().paths;
+        let units: BTreeSet<&str> = paths.iter().filter_map(|p| bucket.manifest.files[p].unit.as_deref()).collect();
+        assert_eq!(units, BTreeSet::from(["europe/admin/places.tt.zst", "europe/admin/postcode_centroids.tt.zst", "europe/poi/major/pois.tt.zst",
+                                          "europe/quality/simplified/admin_polygons.tt.zst", "europe/quality/simplified/arcs.tt.zst"]));
+        let plain = paths.iter().filter(|p| bucket.manifest.files[*p].unit.is_none()).count();
+        assert_eq!(bucket.files_served(), plain + units.len());
+        let bytes: u64 = paths.iter().filter_map(|p| bucket.manifest.files[p].size_zst).sum::<u64>()
+            + units.iter().map(|u| bucket.manifest.units[*u].size).sum::<u64>();
+        let last = seen.lock().unwrap().last().cloned().unwrap();
+        assert_eq!((last.files_done, last.files_total, last.bytes_done, last.bytes_total), (paths.len(), paths.len(), bytes, bytes));
+        assert!(held(&root.path().join("europe")) == files_of(&bucket, &s));
+    }
+
+    // Resume: a unit whose files are all there at their size is not fetched
+    // again; one that lost a file is, for all of them.
+    #[tokio::test]
+    async fn a_unit_is_fetched_again_only_when_one_of_its_files_is_missing() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let s = sel("europe", "admin-minimal", "simplified", "none");
+        let root = ScratchDir::new();
+        download(&bucket, &s, root.path()).await.unwrap();
+        let served = bucket.files_served();
+
+        download(&bucket, &s, root.path()).await.unwrap();
+        assert_eq!(bucket.files_served(), served);
+
+        std::fs::remove_file(root.path().join("europe/place_nodes.bin")).unwrap();
+        download(&bucket, &s, root.path()).await.unwrap();
+        assert_eq!(bucket.files_served(), served + 1);
+        assert!(held(&root.path().join("europe")) == files_of(&bucket, &s));
+    }
+
+    // A unit with one bad byte, in a file's bytes (decoded, of another
+    // sha256) or in its stream (refused), fails its download, leaving none of
+    // its files and no .tmp.
+    #[tokio::test]
+    async fn a_unit_with_one_bad_byte_fails_its_download_and_leaves_none_of_its_files() {
+        let s = sel("europe", "admin", "simplified", "none");
+        for (unit, at_end, why) in [
+            ("europe/admin/postcode_centroids.tt.zst", true, "postcode_centroids.bin's sha256 is "),
+            ("europe/admin/places.tt.zst", false, "a unit of transport version "),
+        ] {
+            let bucket = test_bucket::serve_tampered(test_bucket::template_components(), |path, bytes| {
+                if path == unit {
+                    let at = if at_end { bytes.len() - 1 } else { 5 };
+                    bytes[at] ^= 0x10;
+                }
+            }).await;
+            let root = ScratchDir::new();
+
+            let got = download(&bucket, &s, root.path()).await.map_err(|e| e.to_string());
+
+            let error = got.unwrap_err();
+            assert!(error.starts_with(&format!("transport unit {unit}: transport: {why}")), "{error}");
+            let left = held(&root.path().join("europe"));
+            for f in &bucket.manifest.units[unit].files {
+                assert!(!left.contains_key(basename(f)), "{unit}: {f} left");
+            }
+            assert!(left.keys().all(|n| !n.ends_with(".tmp")), "{unit}: {:?}", left.keys().collect::<Vec<_>>());
+        }
+    }
+
+    // Before a byte is fetched: a unit of another transport version, or one
+    // holding a file the selection doesn't take, which its decode would
+    // write beside the selection's.
+    #[tokio::test]
+    async fn a_unit_this_build_cant_take_is_refused_before_fetching_a_file() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let s = sel("europe", "admin", "simplified", "none");
+        let unit = "europe/admin/places.tt.zst";
+        for (change, error) in [
+            (Box::new(|u: &mut UnitEntry| u.transport_version = 2) as Box<dyn Fn(&mut UnitEntry)>,
+             format!("transport unit {unit}: a unit of transport version 2: this build reads version {TRANSPORT_VERSION} only")),
+            (Box::new(|u: &mut UnitEntry| u.files.push("europe/full/street_ways.bin".into())),
+             format!("transport unit {unit}: holds europe/full/street_ways.bin, which the selection doesn't take")),
+        ] {
+            let mut manifest = bucket.manifest.clone();
+            change(manifest.units.get_mut(unit).unwrap());
+            let root = ScratchDir::new();
+
+            let got = download_region(&reqwest::Client::new(), &bucket.url, &manifest, &s, root.path(), |_| {}).await.map_err(|e| e.to_string());
+
+            assert_eq!(got, Err(error));
+        }
+        assert_eq!(bucket.files_served(), 0);
+    }
+
+    // compress_index.py publishes a unit for each dir holding all its files,
+    // and a download decodes all of them: every selection takes all of a
+    // unit's files in a dir or none.
+    #[test]
+    fn template_selections_take_all_of_a_units_files_or_none() {
+        let (v, c) = template();
+        for s in template_selections(&v) {
+            let paths: BTreeSet<String> = resolve_files(&c, &s).unwrap().paths.into_iter().collect();
+            let dirs: BTreeSet<&str> = paths.iter().map(|p| p.rsplit_once('/').unwrap().0).collect();
+            for dir in dirs {
+                for u in v["transport"]["units"].as_array().unwrap() {
+                    let files: Vec<String> = u["files"].as_array().unwrap().iter().map(|f| format!("{dir}/{}", f.as_str().unwrap())).collect();
+                    let taken = files.iter().filter(|f| paths.contains(*f)).count();
+                    assert!(taken == 0 || taken == files.len(), "{s:?}: {taken} of {files:?}");
+                }
             }
         }
     }
@@ -910,6 +1202,10 @@ mod tests {
         assert_eq!(
             DownloadError::MissingComponent("dir.admin-minimal".into()).to_string(),
             "the manifest names component \"dir.admin-minimal\" but does not define it"
+        );
+        assert_eq!(
+            DownloadError::Transport("europe/admin/places.tt.zst: transport: the unit ends early, past byte 12".into()).to_string(),
+            "transport unit europe/admin/places.tt.zst: transport: the unit ends early, past byte 12"
         );
     }
 }

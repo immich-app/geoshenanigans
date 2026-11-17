@@ -13,19 +13,23 @@
 use query_server::transport::{self, Kind, Member};
 use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage: geocoder-transport encode <kind> <dir> [<file>] | decode <unit.tt.zst|-> <dir> | verify <unit.tt.zst|-> <dir>";
 
-/// The unit at `path` (- for stdin), through zstd.
-fn unit_reader(path: &str) -> io::Result<zstd::stream::read::Decoder<'static, BufReader<Box<dyn Read>>>> {
-    let raw: Box<dyn Read> = if path == "-" {
+/// The unit at `path` (- for stdin), as published.
+fn published(path: &str) -> io::Result<Box<dyn Read>> {
+    Ok(if path == "-" {
         Box::new(io::stdin().lock())
     } else {
         Box::new(File::open(path).map_err(|e| io::Error::new(e.kind(), format!("{path}: {e}")))?)
-    };
-    zstd::stream::read::Decoder::new(raw)
+    })
+}
+
+/// The unit at `path` (- for stdin), through zstd.
+fn unit_reader(path: &str) -> io::Result<zstd::stream::read::Decoder<'static, BufReader<Box<dyn Read>>>> {
+    zstd::stream::read::Decoder::new(published(path)?)
 }
 
 fn summary(verb: &str, kind: Kind, members: &[Member]) -> String {
@@ -43,28 +47,8 @@ fn encode(kind: &str, dir: &str, file: Option<&str>) -> io::Result<String> {
 
 /// The members of `unit` in `dir`, each through its .tmp file, renamed once all decoded.
 fn decode(unit: &str, dir: &str) -> io::Result<String> {
-    let dir = Path::new(dir);
-    let mut tmps: Vec<PathBuf> = Vec::new();
-    let result = transport::decode(unit_reader(unit)?, dir, |m| {
-        let tmp = dir.join(format!("{}.tmp", m.name));
-        let f = File::create(&tmp).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", tmp.display())))?;
-        tmps.push(tmp);
-        Ok(f)
-    });
-    let decoded = match result {
-        Ok(d) => d,
-        Err(e) => {
-            for t in &tmps {
-                let _ = std::fs::remove_file(t);
-            }
-            return Err(e);
-        }
-    };
-    let members: Vec<Member> = decoded.members.into_iter().map(|(m, _)| m).collect();
-    for (m, tmp) in members.iter().zip(&tmps) {
-        std::fs::rename(tmp, dir.join(&m.name))?;
-    }
-    Ok(summary("decoded", decoded.kind, &members))
+    let (kind, members) = transport::decode_into_dir(published(unit)?, Path::new(dir), None)?;
+    Ok(summary("decoded", kind, &members))
 }
 
 /// A member's bytes compared with a file's as they come.

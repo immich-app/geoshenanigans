@@ -985,3 +985,108 @@ fn the_templates_units_are_this_versions_kinds_and_their_members() {
     }
     assert_eq!(got, want);
 }
+
+// ------------------------------------------------------------------ decoding into a dir
+
+fn sha256_hex(b: &[u8]) -> String {
+    use sha2::Digest;
+    format!("{:x}", sha2::Sha256::digest(b))
+}
+
+/// The names in `dir` and their bytes.
+fn dir_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut v: Vec<(String, Vec<u8>)> =
+        std::fs::read_dir(dir).unwrap().map(|e| e.unwrap()).map(|e| (e.file_name().into_string().unwrap(), std::fs::read(e.path()).unwrap())).collect();
+    v.sort();
+    v
+}
+
+/// The golden places unit as published, its members, and a dir holding other bytes under their
+/// names.
+fn published_places() -> (Vec<u8>, Files, ScratchDir) {
+    let (_, _, members, unit) = golden_units().into_iter().next().unwrap();
+    let dir = dir_of(&members.iter().map(|(n, _)| (*n, b"an older build's".to_vec())).collect::<Vec<_>>());
+    (zstd::encode_all(&unit[..], 3).unwrap(), members, dir)
+}
+
+fn expected(members: &Files) -> Vec<Expected> {
+    members.iter().map(|(n, b)| Expected { name: n.to_string(), sha256: sha256_hex(b), size: Some(b.len() as u64) }).collect()
+}
+
+#[test]
+fn a_unit_decodes_into_its_files_in_a_dir_once_they_are_the_files_expected() {
+    let (unit, members, dir) = published_places();
+    let mut expect = expected(&members);
+    expect.reverse();
+
+    let (kind, got) = decode_into_dir(&unit[..], dir.path(), Some(&expect)).unwrap();
+
+    assert_eq!(kind, Kind::Places);
+    let sizes: Vec<(String, u64)> = members.iter().map(|(n, b)| (n.to_string(), b.len() as u64)).collect();
+    assert_eq!(got.into_iter().map(|m| (m.name, m.size)).collect::<Vec<_>>(), sizes);
+    let mut want: Vec<(String, Vec<u8>)> = members.iter().map(|(n, b)| (n.to_string(), b.clone())).collect();
+    want.sort();
+    assert_eq!(dir_files(dir.path()), want);
+    // Of no size, as a caller that knows only the hashes gives them; of any files, as the CLI
+    // decodes.
+    let other = ScratchDir::new();
+    let no_sizes: Vec<Expected> = expect.into_iter().map(|e| Expected { size: None, ..e }).collect();
+    decode_into_dir(&unit[..], other.path(), Some(&no_sizes)).unwrap();
+    assert_eq!(dir_files(other.path()), want);
+    let any = ScratchDir::new();
+    decode_into_dir(&unit[..], any.path(), None).unwrap();
+    assert_eq!(dir_files(any.path()), want);
+}
+
+#[test]
+fn a_unit_refused_or_not_of_the_files_expected_leaves_the_dir_as_it_was() {
+    let (unit, members, dir) = published_places();
+    let before = dir_files(dir.path());
+    let expect = expected(&members);
+    let with = |unit: &[u8], expect: &[Expected]| decode_into_dir(unit, dir.path(), Some(expect)).map(|_| ()).map_err(|e| e.to_string());
+    let changed = |i: usize, f: &dyn Fn(&mut Expected)| {
+        let mut e = expect.clone();
+        f(&mut e[i]);
+        e
+    };
+
+    let zero = "0".repeat(64);
+    assert_eq!(with(&unit, &changed(1, &|e| e.sha256 = zero.clone())), Err(format!("transport: place_nodes.bin's sha256 is {}, not {zero}", expect[1].sha256)));
+    assert_eq!(dir_files(dir.path()), before);
+    assert_eq!(with(&unit, &changed(2, &|e| e.size = Some(1))), Err(format!("transport: place_hidden.bin is {} bytes in the unit, not 1", members[2].1.len())));
+    assert_eq!(dir_files(dir.path()), before);
+    assert_eq!(with(&unit, &changed(0, &|e| e.name = "place_cell.bin".into())), Err("transport: place_cells.bin is no file this unit is to hold".to_string()));
+    assert_eq!(dir_files(dir.path()), before);
+    let mut more = expect.clone();
+    more.push(Expected { name: "poi_records.bin".into(), sha256: zero.clone(), size: None });
+    assert_eq!(with(&unit, &more), Err("transport: the unit lacks poi_records.bin".to_string()));
+    assert_eq!(dir_files(dir.path()), before);
+    let cut = with(&unit[..unit.len() - 9], &expect).unwrap_err();
+    assert!(cut.contains("ends early") || cut.contains("incomplete"), "{cut}");
+    assert_eq!(dir_files(dir.path()), before);
+    assert!(with(b"not zstd", &expect).is_err());
+    assert_eq!(dir_files(dir.path()), before);
+}
+
+#[test]
+fn a_chunk_reader_reads_a_channels_chunks_as_one_stream() {
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+    let bytes: Vec<u8> = (0..100_000u32).map(|i| (i % 251) as u8).collect();
+    let chunks: Vec<Vec<u8>> = bytes.chunks(7_777).map(|c| c.to_vec()).chain([Vec::new()]).collect();
+    let feeder = std::thread::spawn(move || {
+        for c in chunks {
+            tx.send(c).unwrap();
+        }
+    });
+    let mut got = Vec::new();
+    let mut r = ChunkReader::new(rx);
+    let mut buf = [0u8; 1000];
+    loop {
+        match r.read(&mut buf).unwrap() {
+            0 => break,
+            n => got.extend_from_slice(&buf[..n]),
+        }
+    }
+    feeder.join().unwrap();
+    assert!(got == bytes, "{} bytes read of {}", got.len(), bytes.len());
+}

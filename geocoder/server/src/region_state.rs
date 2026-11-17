@@ -40,7 +40,8 @@ const CONFIGURATIONS_TTL: Duration = Duration::from_secs(3600);
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Configuration {
     /// Base URL for the geocoder build artifacts. Latest.json + each
-    /// build's configurations.json + .bin.zst files all hang off this.
+    /// build's configurations.json + its files' .zst and transport units
+    /// all hang off this.
     pub base_url: String,
     /// Address detail level — must match a `mode.*` component.
     pub mode: String,

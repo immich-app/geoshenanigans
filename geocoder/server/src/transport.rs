@@ -69,8 +69,11 @@ mod container;
 mod places;
 mod pois;
 
+use sha2::{Digest, Sha256};
+use std::fs::File;
 use std::io::{self, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 pub use cols::COLS_FILES;
 pub use container::{CHUNK_BYTES, DECODE_OVERHEAD, MAGIC, MAX_CHUNK_BYTES, TRANSPORT_VERSION};
@@ -198,6 +201,132 @@ pub fn decode<W: Write>(input: impl Read, scratch: &Path, mut member: impl FnMut
         members.push((m, o.finish()?));
     }
     Ok(Decoded { kind: head.kind, members })
+}
+
+/// A member file being written and hashed.
+struct Hashed {
+    file: File,
+    sha: Sha256,
+}
+
+impl Write for Hashed {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        self.file.write_all(b)?;
+        self.sha.update(b);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+/// A file a unit is to decode to: its name, its sha256 (lowercase hex) and, where known, its
+/// size.
+#[derive(Clone, Debug)]
+pub struct Expected {
+    pub name: String,
+    pub sha256: String,
+    pub size: Option<u64>,
+}
+
+/// Decodes `unit`, a unit as published (through zstd), into its members in `dir`: each one to
+/// <name>.tmp there, all of them renamed into place once the whole unit has decoded. With
+/// `expect`, the members must be those files, in any order, each of its sha256 and size;
+/// without, any. On an error no .tmp file stays and no member is renamed, so `dir` holds what it
+/// held. A unit's members lie in `dir` together for a while: it needs their size free there.
+/// Returns the unit's kind and members.
+pub fn decode_into_dir(unit: impl Read, dir: &Path, expect: Option<&[Expected]>) -> io::Result<(Kind, Vec<Member>)> {
+    let mut tmps: Vec<PathBuf> = Vec::new();
+    let mut wanted: Vec<Option<&Expected>> = Vec::new();
+    let decoded = zstd::stream::read::Decoder::new(unit).and_then(|input| {
+        decode(input, dir, |m| {
+            let e = match expect {
+                None => None,
+                Some(files) => {
+                    let e = files.iter().find(|e| e.name == m.name).ok_or_else(|| container::invalid(format!("{} is no file this unit is to hold", m.name)))?;
+                    if let Some(size) = e.size.filter(|&size| size != m.size) {
+                        return Err(container::invalid(format!("{} is {} bytes in the unit, not {size}", m.name, m.size)));
+                    }
+                    Some(e)
+                }
+            };
+            let tmp = dir.join(format!("{}.tmp", m.name));
+            let file = File::create(&tmp).map_err(|e| io::Error::new(e.kind(), format!("{}: {e}", tmp.display())))?;
+            tmps.push(tmp);
+            wanted.push(e);
+            Ok(Hashed { file, sha: Sha256::new() })
+        })
+    });
+    let checked = decoded.and_then(|d| {
+        if let Some(missing) = expect.unwrap_or(&[]).iter().find(|e| !d.members.iter().any(|(m, _)| m.name == e.name)) {
+            return Err(container::invalid(format!("the unit lacks {}", missing.name)));
+        }
+        let mut members = Vec::with_capacity(d.members.len());
+        for ((m, w), e) in d.members.into_iter().zip(&wanted) {
+            let got = format!("{:x}", w.sha.finalize());
+            if let Some(e) = e.filter(|e| e.sha256 != got) {
+                return Err(container::invalid(format!("{}'s sha256 is {got}, not {}", m.name, e.sha256)));
+            }
+            members.push(m);
+        }
+        Ok((d.kind, members))
+    });
+    let (kind, members) = match checked {
+        Ok(done) => done,
+        Err(e) => {
+            for tmp in &tmps {
+                let _ = std::fs::remove_file(tmp);
+            }
+            return Err(e);
+        }
+    };
+    for (i, (m, tmp)) in members.iter().zip(&tmps).enumerate() {
+        if let Err(e) = std::fs::rename(tmp, dir.join(&m.name)) {
+            for tmp in &tmps[i..] {
+                let _ = std::fs::remove_file(tmp);
+            }
+            return Err(io::Error::new(e.kind(), format!("{}: {e}", tmp.display())));
+        }
+    }
+    Ok((kind, members))
+}
+
+/// The bytes of a channel's chunks, in order, as one stream, which ends once the channel's
+/// senders are gone: for a decode on a thread of its own, fed as the unit arrives.
+pub struct ChunkReader<B> {
+    rx: mpsc::Receiver<B>,
+    chunk: Option<B>,
+    at: usize,
+}
+
+impl<B> ChunkReader<B> {
+    pub fn new(rx: mpsc::Receiver<B>) -> Self {
+        ChunkReader { rx, chunk: None, at: 0 }
+    }
+}
+
+impl<B: AsRef<[u8]>> Read for ChunkReader<B> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if let Some(c) = &self.chunk {
+                let c = &c.as_ref()[self.at..];
+                if !c.is_empty() {
+                    let n = c.len().min(buf.len());
+                    buf[..n].copy_from_slice(&c[..n]);
+                    self.at += n;
+                    return Ok(n);
+                }
+            }
+            match self.rx.recv() {
+                Ok(c) => {
+                    self.chunk = Some(c);
+                    self.at = 0;
+                }
+                Err(_) => return Ok(0),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
