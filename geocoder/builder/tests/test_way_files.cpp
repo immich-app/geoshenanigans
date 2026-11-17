@@ -4,13 +4,17 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <initializer_list>
+#include <iterator>
 #include <random>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "coord_keys.h"
+#include "logical_decode.h"
+#include "scratch_dir.h"
 #include "test_framework.h"
 #include "types.h"
 #include "way_files.h"
@@ -1004,4 +1008,159 @@ TEST(way_files_are_the_shared_vectors_byte_for_byte) {
     }
     CHECK(cases >= 20 && streets >= 10 && cases - streets >= 6);
     CHECK(hybrid >= 50 && order >= 20);
+}
+
+// ------------------------------------------------------------------ the diff's decode on threads
+namespace {
+
+std::vector<uint8_t> file_bytes(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return std::vector<uint8_t>(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+// What logical_decode::decode_way_files makes of the files on `threads`
+// threads, `range` groups a range, its files in dir: the logical pair, and
+// the refusal ("" for files it takes).
+struct Threaded {
+    Pair logical;
+    std::string refusal;
+};
+Threaded threaded_decode(const std::string& dir, const Kind& kind, const Files& f, unsigned threads, uint64_t range) {
+    const std::string ways = dir + "/ways", nodes = dir + "/nodes";
+    Threaded t;
+    {
+        logical_decode::ScratchFile wo(ways), no(nodes);
+        t.refusal = refusal_of([&] {
+            CHECK(logical_decode::decode_way_files(kind, bytes_of(f.rows), f.rows.size(), bytes_of(f.nodes), f.nodes.size(), wo.fd(),
+                                                   no.fd(), threads, range));
+        });
+        CHECK(wo.flush() && no.flush());
+    }
+    t.logical = {file_bytes(ways), file_bytes(nodes)};
+    return t;
+}
+
+// What the one decoder makes of the files: the logical pair, and the refusal.
+Threaded one_decode(const Kind& kind, const Files& f) {
+    Threaded t;
+    t.refusal = refusal_of([&] { t.logical = decode(kind, f); });
+    return t;
+}
+
+}  // namespace
+
+// geocoder-diff decodes the way pairs on threads, a range of groups at a
+// time, each range written at its place: the logical pair is the one
+// decoder's byte for byte, whatever the threads and the ranges.
+TEST(the_threaded_decode_writes_the_one_decoders_way_pair) {
+    ScratchDir dir("ways-threaded");
+    std::mt19937_64 rng(20261117);
+    uint64_t groups = 0;
+    for (const Kind* kind : {&STREETS, &INTERPS})
+        for (size_t n : {size_t(0), size_t(1), size_t(16), size_t(17), size_t(3000), kind->interp ? size_t(9000) : size_t(70000)}) {
+            const Files f = encode(*kind, logical(*kind, random_ways(rng, *kind, n)));
+            const Pair want = decode(*kind, f);
+            groups = std::max(groups, footers(*kind, f).groups());
+            for (unsigned threads : {1u, 2u, 3u, 8u})
+                for (uint64_t range : {uint64_t(1), uint64_t(2), uint64_t(7), logical_decode::WAY_RANGE_GROUPS}) {
+                    const Threaded t = threaded_decode(dir.path(), *kind, f, threads, range);
+                    CHECK_EQ(t.refusal, std::string());
+                    CHECK(t.logical == want);
+                }
+        }
+    // Ranges of the default size, and a short last one.
+    CHECK_EQ(groups, uint64_t(4375));
+}
+
+// A refusal in a later range fails the threaded decode by name, as the one
+// decoder refuses the pair: a group's off, its row, a block of group 150 of
+// 188, a footer of fewer nodes than the ways have, which no thread can place
+// the last ranges' nodes by, and of two refusals the first in the files'
+// order.
+TEST(the_threaded_decode_refuses_in_a_later_range_what_the_one_decoder_refuses) {
+    ScratchDir dir("ways-threaded-refused");
+    std::mt19937_64 rng(1117);
+    const Files f = encode(STREETS, logical(STREETS, random_ways(rng, STREETS, 3000)));
+    REQUIRE(footers(STREETS, f).groups() == 188);
+    const std::vector<Row> rows = rows_of(STREETS, f);
+    auto edited = [&](const std::function<void(Files&)>& edit) {
+        Files g = f;
+        edit(g);
+        return g;
+    };
+    auto with_row = [&](uint64_t g, const std::function<void(Row&)>& edit) {
+        return edited([&, g](Files& files) {
+            Row r = rows[size_t(g)];
+            edit(r);
+            way_files::encode_row(STREETS, r, files.rows.data() + g * STREETS.row_bytes(G));
+        });
+    };
+    // A bit of a block of group 150 the one decoder refuses the pair for: the first one of the
+    // group's blocks that is.
+    const Row& r = rows[150];
+    Files block = f;
+    for (uint64_t at = r.off; at < r.off + r.blocks_bytes() && one_decode(STREETS, block).refusal.empty(); at++)
+        for (int bit = 0; bit < 8; bit++) {
+            block = f;
+            block.nodes[size_t(at)] ^= uint8_t(1u << bit);
+            if (!one_decode(STREETS, block).refusal.empty()) break;
+        }
+    REQUIRE(!one_decode(STREETS, block).refusal.empty());
+    const size_t footer = f.nodes.size() - way_files::NODES_FOOTER_BYTES;
+    struct Case {
+        Files files;
+        std::string name;
+    };
+    const Case cases[] = {
+        {with_row(150, [](Row& w) { w.off++; }), "street_ways.bin group 150 is not where the blocks before it end"},
+        {with_row(150, [](Row& w) { w.code[0] = w.cnt[0] ? uint16_t(40) : uint16_t(1); }), "Malformed way files: a "},
+        {block, "Malformed way files: "},
+        {edited([&](Files& g) { way_files::put64(g.nodes.data() + footer, way_files::get64(g.nodes.data() + footer) - 1); }),
+         "nodes and its ways have"},
+        {edited([&](Files& g) { way_files::put64(g.nodes.data() + footer, way_files::get64(g.nodes.data() + footer) + 1); }),
+         "nodes and its ways have"},
+        {edited([&](Files& g) {
+             Row w = rows[150];
+             w.off++;
+             way_files::encode_row(STREETS, w, g.rows.data() + 150 * STREETS.row_bytes(G));
+             w = rows[40];
+             w.off++;
+             way_files::encode_row(STREETS, w, g.rows.data() + 40 * STREETS.row_bytes(G));
+         }),
+         "street_ways.bin group 40 is not where the blocks before it end"},
+    };
+    for (const Case& c : cases) {
+        const std::string want = one_decode(STREETS, c.files).refusal;
+        CHECK(says(want, c.name));
+        for (unsigned threads : {2u, 5u})
+            for (uint64_t range : {uint64_t(1), uint64_t(3)})
+                CHECK_EQ(threaded_decode(dir.path(), STREETS, c.files, threads, range).refusal, want);
+    }
+}
+
+// Every pair a byte changed in, or with a file cut short, the threaded
+// decode takes or refuses as the one decoder does: the same logical pair, or
+// the same refusal.
+TEST(the_threaded_decode_takes_and_refuses_what_the_one_decoder_does) {
+    ScratchDir dir("ways-threaded-edits");
+    std::mt19937_64 rng(1118);
+    size_t refused = 0, decoded = 0;
+    for (const Kind* kind : {&STREETS, &INTERPS}) {
+        const Files f = encode(*kind, logical(*kind, random_ways(rng, *kind, 400)));
+        for (int t = 0; t < 1200; t++) {
+            Files g = f;
+            std::vector<uint8_t>& file = t % 2 ? g.rows : g.nodes;
+            if (t % 50 == 0) {
+                file.resize(rng() % file.size());
+            } else {
+                const size_t at = rng() % file.size();
+                file[at] ^= uint8_t(1u << (rng() % 8));
+            }
+            const Threaded want = one_decode(*kind, g), got = threaded_decode(dir.path(), *kind, g, 1 + unsigned(t % 4), 1 + uint64_t(t % 3));
+            CHECK_EQ(got.refusal, want.refusal);
+            if (want.refusal.empty()) CHECK(got.logical == want.logical);
+            (want.refusal.empty() ? decoded : refused)++;
+        }
+    }
+    CHECK(refused > 300 && decoded > 1000);
 }

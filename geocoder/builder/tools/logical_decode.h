@@ -4,23 +4,24 @@
 // takes a call each 8 KiB, which over a planet day's 18 GB of logical files
 // is seconds of system time.
 //
-// The address files, the biggest family, decode on threads, a range of
-// superblocks at a time, each range's bytes written at its place in the
-// logical files by a thread of the file's own (PlacedFile): whatever the
-// threads and the ranges, the bytes are the ones addr_files::decode gives,
-// and a refusal is its own, the first in the files' order.
+// The address files and the way pairs, the biggest families, decode on
+// threads, a range of superblocks or of groups at a time, each range's bytes
+// written at its place in the logical files by a thread of the file's own
+// (PlacedFile): whatever the threads and the ranges, the bytes are the ones
+// addr_files::decode and way_files::decode give, and a refusal is theirs,
+// the first in the files' order.
 //
 // A range's records sit at its first record's place, which its first
-// superblock gives. Its logical bytes before it are the ones of the ranges
-// before it, which each range's walk gives first, on the threads
-// (superblocks_logical_bytes). The walks and the decodes start each range
-// where its first row places it; the ranges are then taken in order, each
-// from where the one before it ends, as the one decoder takes them: a row
-// that places its range elsewhere is refused as that decoder refuses it, and
-// a range's refusal is thrown once every range before it is taken. A range
-// no thread could place (one past a range whose walk refused it) is decoded
-// there, its output not written: what it refuses is the one decoder's
-// refusal, and files that hold such a range always hold one.
+// superblock or group gives. Its logical bytes before it are the ones of the
+// ranges before it, which each range's walk gives first, on the threads
+// (superblocks_logical_bytes, groups_nodes). The walks and the decodes start
+// each range where its first row places it; the ranges are then taken in
+// order, each from where the one before it ends, as the one decoder takes
+// them: a row that places its range elsewhere is refused as that decoder
+// refuses it, and a range's refusal is thrown once every range before it is
+// taken. A range no thread could place (one past a footer's nodes, say) is
+// decoded there, its output not written: what it refuses is the one
+// decoder's refusal, and files that hold such a range always hold one.
 #pragma once
 
 #include <algorithm>
@@ -45,19 +46,20 @@
 
 #include "addr_files.h"
 #include "parallel.h"
+#include "way_files.h"
 
 namespace logical_decode {
 
 // The bytes a writer holds before it writes them.
 inline constexpr size_t BUFFER_BYTES = size_t(1) << 20;
-// The superblocks of a range of the address files: 65,536 records, a few MB
-// of logical bytes.
-inline constexpr uint64_t ADDR_RANGE_SUPERBLOCKS = 64;
+// The superblocks of a range of the address files and the groups of a range
+// of a way pair: 65,536 records or ways a range, a few MB of logical bytes.
+inline constexpr uint64_t ADDR_RANGE_SUPERBLOCKS = 64, WAY_RANGE_GROUPS = 4096;
 
 // The threads a family decodes on. A file takes its writes one at a time
 // (ext4 holds a buffered write's inode lock), about 1 GB a second from one
-// thread: the planet's logical addr_points.bin, 5 GB, takes 5 seconds, and
-// the address files decode on 8 threads in 5.9 (6.4 on 4).
+// thread: the planet's biggest logical files, 5 GB each, take 5 seconds,
+// and its address files decode on 8 threads in 5.9 (6.4 on 4).
 inline unsigned decode_threads() { return std::min(parallel_threads(), 8u); }
 
 // Writes the n bytes at p to fd at `at`, or where fd stands at APPEND;
@@ -392,6 +394,98 @@ inline bool decode_addr_files(const uint8_t* points, uint64_t points_size, const
     }
     af::check_decoded(f, at);
     if (!whole) throw std::logic_error("the address files decode, and a range of them was not decoded at its place");
+    return written;
+}
+
+// The logical pair of a way pair of the kind (each file whole, in memory; of
+// the size ABSENT when the dir lacks it), as way_files::decode gives it,
+// written at its places to ways_fd and nodes_fd (empty files) on up to
+// `threads` threads (0 = every core), `range` groups a range. Refuses what
+// way_files::decode refuses. False, the files decoded: a write failed.
+inline bool decode_way_files(const way_files::Kind& kind, const uint8_t* ways, uint64_t ways_size, const uint8_t* nodes,
+                             uint64_t nodes_size, int ways_fd, int nodes_fd, unsigned threads, uint64_t range = WAY_RANGE_GROUPS) {
+    namespace wf = way_files;
+    auto end_of = [](const uint8_t* file, uint64_t size, size_t footer) {
+        return size == wf::ABSENT ? nullptr : file + (size - std::min<uint64_t>(size, footer));
+    };
+    const wf::Footers f = wf::read_footers(kind, end_of(ways, ways_size, wf::WAYS_FOOTER_BYTES), ways_size,
+                                           end_of(nodes, nodes_size, wf::NODES_FOOTER_BYTES), nodes_size);
+    range = std::max<uint64_t>(range, 1);
+    const uint64_t groups = f.groups(), ranges = (groups + range - 1) / range;
+    const unsigned workers = workers_of(ranges, threads);
+    auto last = [&](uint64_t k) { return std::min(groups, (k + 1) * range); };
+    struct Range {
+        // Its first group's off, its nodes, the nodes before it, and where it ends.
+        uint64_t off = 0, nodes = 0, before = 0;
+        wf::DecodeAt end;
+        bool placed = false;
+        // What its first row is refused for, and what the rest of it is.
+        std::exception_ptr row_refused, refused;
+    };
+    std::vector<Range> rs(static_cast<size_t>(ranges));
+    std::atomic<uint64_t> next{0};
+    on_workers(workers, [&] {
+        for (uint64_t k = next++; k < ranges; k = next++) {
+            Range& r = rs[size_t(k)];
+            r.off = wf::get32(wf::row_of(kind, ways, k * range));
+            r.nodes = wf::groups_nodes(kind, f, ways, k * range, last(k));
+        }
+    });
+    uint64_t before = 0;
+    for (Range& r : rs) {
+        r.before = before;
+        before += r.nodes;
+    }
+    bool written;
+    {
+        PlacedFile ways_out(ways_fd, workers + 4), nodes_out(nodes_fd, workers + 4);
+        next = 0;
+        on_workers(workers, [&] {
+            PlacedWriter wo(ways_out), no(nodes_out);
+            for (uint64_t k = next++; k < ranges; k = next++) {
+                Range& r = rs[size_t(k)];
+                const uint64_t first = k * range;
+                try {
+                    wf::decode_row(kind, wf::row_of(kind, ways, first), f.group_ways(first));
+                } catch (...) {
+                    r.row_refused = std::current_exception();
+                    continue;
+                }
+                // A range past the blocks is refused in order; one past the footer's nodes is too,
+                // at its end or before.
+                if (r.off > f.blocks_bytes || r.before + r.nodes > f.nodes) continue;
+                wo.seek(first * wf::GROUP_WAYS * kind.stride);
+                no.seek(r.before * wf::NODE_BYTES);
+                try {
+                    r.end = wf::decode_groups(
+                        kind, f, ways, nodes, first, last(k), wf::DecodeAt{r.off, r.before},
+                        [&](const uint8_t* record) { wo.write(record, kind.stride); }, [&](const uint8_t* p, size_t n) { no.write(p, n); });
+                } catch (...) {
+                    r.refused = std::current_exception();
+                }
+                r.placed = true;
+            }
+        });
+        const bool ways_written = ways_out.finish(), nodes_written = nodes_out.finish();
+        written = ways_written && nodes_written;
+    }
+    wf::DecodeAt at;
+    bool whole = true;
+    for (uint64_t k = 0; k < ranges; k++) {
+        const Range& r = rs[size_t(k)];
+        // The one decoder reads a group's row before it checks its off.
+        if (r.row_refused) std::rethrow_exception(r.row_refused);
+        if (r.off != at.at) wf::misplaced_group(kind, k * range);
+        if (!r.placed || r.before != at.node) {
+            whole = false;
+            at = wf::decode_groups(kind, f, ways, nodes, k * range, last(k), at, [](const uint8_t*) {}, [](const uint8_t*, size_t) {});
+            continue;
+        }
+        if (r.refused) std::rethrow_exception(r.refused);
+        at = r.end;
+    }
+    wf::check_decoded(kind, f, at);
+    if (!whole) throw std::logic_error(std::string("the ") + kind.ways_file + " pair decodes, and a range of it was not decoded at its place");
     return written;
 }
 

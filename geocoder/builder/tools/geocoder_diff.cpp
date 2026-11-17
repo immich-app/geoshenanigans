@@ -600,10 +600,10 @@ static bool decode_way_files(const LogicalFamily& family, const std::string& dir
     // A dir with one file of the pair is refused before anything is written.
     way_footers(kind, ways, nodes);
     logical_decode::ScratchFile wo(to + "/" + kind.ways_file), no(to + "/" + kind.nodes_file);
-    way_files::decode(
-        kind, ways.data(), ways.size, nodes.data(), nodes.size, [&](const uint8_t* record) { wo.write(record, kind.stride); },
-        [&](const uint8_t* p, size_t n) { no.write(p, n); });
-    if (!wo.flush() || !no.flush()) throw std::runtime_error(std::string("Cannot write the decoded ") + kind.ways_file + " of " + dir);
+    const bool written = logical_decode::decode_way_files(kind, ways.data(), ways.size, nodes.data(), nodes.size, wo.fd(), no.fd(),
+                                                          logical_decode::decode_threads());
+    if (!written || !wo.flush() || !no.flush())
+        throw std::runtime_error(std::string("Cannot write the decoded ") + kind.ways_file + " of " + dir);
     return true;
 }
 // The bytes decode_way_files writes for dir, from the two files' footers

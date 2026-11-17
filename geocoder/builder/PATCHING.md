@@ -171,9 +171,9 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
   file the old day lacks goes as a full replacement of its values.
   `geocoder-diff --decode-logical DIR OUT` writes the logical files it would read of DIR's way,
   address, POI, place and side files into OUT, a new or empty dir, and no patch. The diff
-  decodes the address files on threads, a range of superblocks at a time, each range written at
-  its place in the logical files (`tools/logical_decode.h`): the bytes and the refusals are the
-  one decoder's, whatever the threads.
+  decodes the address files and the way pairs on threads, a range of superblocks or of groups at
+  a time, each range written at its place in the logical files (`tools/logical_decode.h`): the
+  bytes and the refusals are the one decoder's, whatever the threads.
   `geocoder-diff --logical-size DIR` prints the bytes a diff maps for DIR's record files and the
   bytes it writes to scratch for DIR, from file sizes and footers alone;
   `tools/generate_patches.sh` starts its diffs and verifies by them, within a memory budget and
