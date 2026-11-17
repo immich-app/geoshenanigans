@@ -1739,15 +1739,13 @@ static int run(int argc, char* argv[]) {
         street_remap_ready.set_value();
         // Restore original node_offsets for child merge
         for (size_t i = 0; i < wn; i++) memcpy(old_w.data + i * way_stride, &old_offsets[i], 4);
-        if (old_n.data && new_n.data) {
-            auto node_seq = build_child_merge(way_seq, old_w.data, old_w.size, new_w.data, new_w.size,
-                                               old_n.data, old_n.size, new_n.data, new_n.size, way_stride);
-            res_nodes = {PatchFileId::STREET_NODES, "street_nodes.bin", 8,
-                         old_n.size, new_n.size, std::move(node_seq), {}};
-        } else {
-            res_nodes = {PatchFileId::STREET_NODES, "street_nodes.bin", 8,
-                         0, 0, MergeSequence{}, {}};
-        }
+        // The nodes merge as the ways' child stream whether or not either day
+        // has one: a dir's first nodes go as one INSERT and its last as one
+        // DELETE, and a pair of no ways on both days merges as nothing.
+        auto node_seq = build_child_merge(way_seq, old_w.data, old_w.size, new_w.data, new_w.size,
+                                           old_n.data, old_n.size, new_n.data, new_n.size, way_stride);
+        res_nodes = {PatchFileId::STREET_NODES, "street_nodes.bin", 8,
+                     old_n.size, new_n.size, std::move(node_seq), {}};
         log_merge(res_nodes);
         unmap_file(old_w); unmap_file(new_w); unmap_file(old_n); unmap_file(new_n);
         log_time("  group:streets", gs);
