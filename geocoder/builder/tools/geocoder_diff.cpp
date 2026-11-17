@@ -643,11 +643,10 @@ static bool decode_addr_files(const LogicalFamily&, const std::string& dir, cons
     // What the footers alone refuse is refused before anything is written.
     files.footers();
     logical_decode::ScratchFile po(to + "/" + addr_files::POINTS_FILE), vo(to + "/" + addr_files::VERTICES_FILE);
-    addr_files::decode(
-        files.points.data(), files.points.size, files.vertices.data(), files.vertices.size, files.index.data(), files.index.size,
-        [&](const uint8_t* record) { po.write(record, addr_files::LOGICAL_STRIDE); },
-        [&](const uint8_t* p, size_t n) { vo.write(p, n); });
-    if (!po.flush() || !vo.flush()) throw std::runtime_error("Cannot write the decoded address files of " + dir);
+    const bool written = logical_decode::decode_addr_files(files.points.data(), files.points.size, files.vertices.data(),
+                                                           files.vertices.size, files.index.data(), files.index.size, po.fd(),
+                                                           vo.fd(), logical_decode::decode_threads());
+    if (!written || !po.flush() || !vo.flush()) throw std::runtime_error("Cannot write the decoded address files of " + dir);
     return true;
 }
 // The bytes decode_addr_files writes for dir, from the three files' footers

@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <random>
 #include <string>
@@ -18,6 +19,8 @@
 
 #include "addr_files.h"
 #include "coord_keys.h"
+#include "logical_decode.h"
+#include "scratch_dir.h"
 #include "test_framework.h"
 
 namespace af = addr_files;
@@ -2385,4 +2388,146 @@ TEST(address_files_are_the_shared_vectors_byte_for_byte) {
     }
     CHECK(cases >= 14 && empty == 1 && superblocks == 2);
     CHECK(split >= 10 && paired >= 10 && order >= 3 && blobs >= 100 && escapes >= 2);
+}
+
+// ------------------------------------------------------------------ the diff's decode on threads
+namespace {
+
+Bytes file_bytes(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    return Bytes(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+// What logical_decode::decode_addr_files makes of the files on `threads`
+// threads, `range` superblocks a range, its files in dir: the logical pair,
+// and the refusal ("" for files it takes).
+struct Threaded {
+    Pair logical;
+    std::string refusal;
+};
+Threaded threaded_decode(const std::string& dir, const af::Files& f, unsigned threads, uint64_t range) {
+    const std::string points = dir + "/points", vertices = dir + "/vertices";
+    Threaded t;
+    {
+        logical_decode::ScratchFile po(points), vo(vertices);
+        t.refusal = refusal_of([&] {
+            CHECK(logical_decode::decode_addr_files(f.points.data(), f.points.size(), f.vertices.data(), f.vertices.size(),
+                                                    f.index.data(), f.index.size(), po.fd(), vo.fd(), threads, range));
+        });
+        CHECK(po.flush() && vo.flush());
+    }
+    t.logical = {file_bytes(points), file_bytes(vertices)};
+    return t;
+}
+
+// What the one decoder makes of the files: the logical pair, and the refusal.
+Threaded one_decode(const af::Files& f) {
+    Threaded t;
+    t.refusal = refusal_of([&] { t.logical = decode_files(f); });
+    return t;
+}
+
+}  // namespace
+
+// geocoder-diff decodes the address files on threads, a range of superblocks
+// at a time, each range written at its place: the logical pair is the one
+// decoder's byte for byte, whatever the threads and the ranges.
+TEST(the_threaded_decode_writes_the_one_decoders_logical_pair) {
+    ScratchDir dir("addr-threaded");
+    std::mt19937_64 rng(20261117);
+    uint64_t superblocks = 0;
+    for (int kind = 0; kind < 4; kind++)
+        for (size_t n : {size_t(0), size_t(1), size_t(1024), size_t(1025), size_t(9000), kind == 0 ? size_t(70000) : size_t(20000)}) {
+            const af::Files f = files_of(random_records(rng, n, kind));
+            const Pair want = decode_files(f);
+            superblocks = std::max(superblocks, footers_of(f).superblocks());
+            for (unsigned threads : {1u, 2u, 3u, 8u})
+                for (uint64_t range : {uint64_t(1), uint64_t(2), uint64_t(5), logical_decode::ADDR_RANGE_SUPERBLOCKS}) {
+                    const Threaded t = threaded_decode(dir.path(), f, threads, range);
+                    CHECK_EQ(t.refusal, std::string());
+                    CHECK(t.logical == want);
+                }
+        }
+    // Ranges of the default size, and a short last one.
+    CHECK_EQ(superblocks, uint64_t(69));
+}
+
+// A refusal in a later range fails the threaded decode by name, as the one
+// decoder refuses the files: a superblock's row, a block's index entry, a
+// block and a blob of superblock 12 of 16, a footer the last range passes,
+// and of two refusals the first in the files' order.
+TEST(the_threaded_decode_refuses_in_a_later_range_what_the_one_decoder_refuses) {
+    ScratchDir dir("addr-threaded-refused");
+    std::mt19937_64 rng(1117);
+    const af::Files f = files_of(random_records(rng, 16000, 0));
+    REQUIRE(footers_of(f).superblocks() == 16);
+    auto edited = [&](const std::function<void(af::Files&)>& edit) {
+        af::Files g = f;
+        edit(g);
+        return g;
+    };
+    const uint64_t b = 12 * 64 + 5;
+    const size_t row = 11 * af::INDEX_ROW_BYTES, entry = 12 * af::INDEX_ROW_BYTES + 16 + 5 * 6;
+    const size_t block = size_t(block_place(f, b).first), early = size_t(block_place(f, 3 * 64).first);
+    // The first record of block b with a footprint, and its blob.
+    af::Block decoded;
+    af::decode_block(b, f.points.data() + block, f.points.size() - block, 16, decoded);
+    size_t j = 0;
+    while (j < 16 && !decoded.len[j]) j++;
+    REQUIRE(j < 16);
+    const size_t blob = size_t(block_place(f, b).second + decoded.blob_bytes_before(j));
+    const size_t footer = f.vertices.size() - 16;
+    struct Case {
+        af::Files files;
+        std::string name;
+    };
+    const Case cases[] = {
+        {edited([&](af::Files& g) { g.index[row]++; }), "addr_index.bin superblock 11 is not where"},
+        {edited([&](af::Files& g) { g.index[row + 8]++; }), "addr_index.bin superblock 11 is not where"},
+        {edited([&](af::Files& g) { g.index[entry]++; }), "addr_index.bin block 773 is not where"},
+        {edited([&](af::Files& g) { g.points[block] = 0x80; }), "addr_points.bin block 773 has a flag no block has"},
+        {edited([&](af::Files& g) { g.vertices[blob] = 0x29; }), ": addr_vertices.bin, record " + std::to_string(b * 16 + j)},
+        {edited([&](af::Files& g) { af::put64(g.vertices.data() + footer, af::get64(g.vertices.data() + footer) + 2); }),
+         "bytes of logical blobs and its blobs hold"},
+        {edited([&](af::Files& g) { af::put64(g.vertices.data() + footer, af::get64(g.vertices.data() + footer) - 2); }),
+         "a footprint past the footer's logical vertex stream"},
+        {edited([&](af::Files& g) {
+             g.points[block] = 0x80;
+             g.points[early] = 0x80;
+         }),
+         "addr_points.bin block 192 has a flag no block has"},
+    };
+    for (const Case& c : cases) {
+        const std::string want = one_decode(c.files).refusal;
+        CHECK(want.find(c.name) != std::string::npos);
+        for (unsigned threads : {2u, 5u})
+            for (uint64_t range : {uint64_t(1), uint64_t(3)}) CHECK_EQ(threaded_decode(dir.path(), c.files, threads, range).refusal, want);
+    }
+}
+
+// Every set of files a byte changed in, or with a file cut short, the
+// threaded decode takes or refuses as the one decoder does: the same logical
+// pair, or the same refusal.
+TEST(the_threaded_decode_takes_and_refuses_what_the_one_decoder_does) {
+    ScratchDir dir("addr-threaded-edits");
+    std::mt19937_64 rng(1118);
+    size_t refused = 0, decoded = 0;
+    for (int kind = 0; kind < 4; kind++) {
+        const af::Files f = files_of(random_records(rng, 5000, kind));
+        for (int t = 0; t < 600; t++) {
+            af::Files g = f;
+            Bytes& file = t % 3 == 0 ? g.points : t % 3 == 1 ? g.vertices : g.index;
+            if (t % 60 < 3) {
+                file.resize(rng() % file.size());
+            } else {
+                const size_t at = rng() % file.size();
+                file[at] ^= uint8_t(1u << (rng() % 8));
+            }
+            const Threaded want = one_decode(g), got = threaded_decode(dir.path(), g, 1 + unsigned(t % 4), 1 + uint64_t(t % 3));
+            CHECK_EQ(got.refusal, want.refusal);
+            if (want.refusal.empty()) CHECK(got.logical == want.logical);
+            (want.refusal.empty() ? decoded : refused)++;
+        }
+    }
+    CHECK(refused > 1000 && decoded > 200);
 }
