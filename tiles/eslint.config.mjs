@@ -1,20 +1,17 @@
-import { fixupPluginRules } from '@eslint/compat';
-import { FlatCompat } from '@eslint/eslintrc';
 import js from '@eslint/js';
 import typescriptEslint from '@typescript-eslint/eslint-plugin';
 import tsParser from '@typescript-eslint/parser';
-import _import from 'eslint-plugin-import';
+import { importX } from 'eslint-plugin-import-x';
 import { defineConfig } from 'eslint/config';
-
-const compat = new FlatCompat({
-  baseDirectory: import.meta.dirname,
-  recommendedConfig: js.configs.recommended,
-  allConfig: js.configs.all,
-});
 
 export default defineConfig([
   {
-    extends: compat.extends('eslint:recommended', 'plugin:@typescript-eslint/recommended'),
+    extends: [
+      js.configs.recommended,
+      typescriptEslint.configs['flat/recommended'],
+      importX.flatConfigs.recommended,
+      importX.flatConfigs.typescript,
+    ],
 
     languageOptions: {
       parser: tsParser,
@@ -26,15 +23,11 @@ export default defineConfig([
       },
     },
 
-    plugins: {
-      '@typescript-eslint': typescriptEslint,
-      import: fixupPluginRules(_import),
-    },
-
     rules: {
       curly: 2,
       '@typescript-eslint/no-floating-promises': 'error',
       '@typescript-eslint/no-explicit-any': 'off',
+      'import-x/no-unresolved': ['error', { ignore: ['^cloudflare:'] }],
     },
   },
 ]);
