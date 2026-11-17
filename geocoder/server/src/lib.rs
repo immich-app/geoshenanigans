@@ -27,6 +27,7 @@ mod file_stamp;
 pub use file_stamp::FileStamp;
 pub mod place_files;
 pub mod poi_files;
+pub mod postcode_files;
 pub mod side_blocks;
 pub mod strings;
 pub mod way_files;
