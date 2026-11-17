@@ -35,9 +35,9 @@
 # Jobs also start only while what they write to scratch fits $TMPDIR's volume.
 # A diff holds, from its start to its end, the second number of geocoder-diff
 # --logical-size for both days: the logical files and the string pools it
-# decodes there. A verify holds the new variant's client files, which the
-# patcher writes there, the decompressed patch (its size is in the diff's
-# log) and 1 GiB for the patcher's spills. A job starts
+# decodes there, all gone before it exits. A verify holds the new variant's
+# client files, which the patcher writes there, the decompressed patch (its
+# size is in the diff's log) and 1 GiB for the patcher's spills. A job starts
 # while the needs of the running jobs plus its own are within the volume's
 # free space, read at that moment, less the reserve: what the caller says
 # other writers may still add to the volume. What a running job has written

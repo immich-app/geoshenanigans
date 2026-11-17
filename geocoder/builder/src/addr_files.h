@@ -1148,6 +1148,128 @@ inline Files encode(const uint8_t* records, uint64_t n, const uint8_t* vertices,
 }
 
 // ------------------------------------------------------------------ decoder
+// Where a decoder stands at a superblock's first block: the bytes of the
+// blocks and of the blobs before it, the bytes of those blobs' logical blobs,
+// and the blobs.
+struct DecodeAt {
+    uint64_t blocks = 0, blobs = 0, logical = 0, count = 0;
+};
+
+// Where superblock s's row (of the index at `index`) places its first block
+// and its first blob, no logical byte and no blob before it: the row as it
+// is, unchecked.
+inline DecodeAt superblock_at(const uint8_t* index, uint64_t s) {
+    const uint8_t* row = index + s * INDEX_ROW_BYTES;
+    return {get64(row), get64(row + 8), 0, 0};
+}
+
+// The refusal of superblock s, whose row does not place it where the decoder
+// stands.
+[[noreturn]] inline void misplaced_superblock(uint64_t s) {
+    malformed(std::string(INDEX_FILE) + " superblock " + std::to_string(s) + " is not where the blocks and the blobs before it end");
+}
+
+// Superblocks first to end - 1 of the files whose footers are f, decoded from
+// where `at` stands (within the blocks, the blobs and the logical bytes f
+// gives) as decode decodes them: each record to put_record and its
+// footprint's logical blob to put_vertices. Where the decoder stands after
+// them. Refuses what decode refuses of those superblocks, a first one whose
+// row places it elsewhere than `at` among it.
+template <class PutRecord, class PutVertices>
+DecodeAt decode_superblocks(const Footers& f, const uint8_t* points, uint64_t points_size, const uint8_t* vertices,
+                            const uint8_t* index, uint64_t first, uint64_t end, DecodeAt at, PutRecord put_record,
+                            PutVertices put_vertices) {
+    const std::string index_file = INDEX_FILE, vertices_file = VERTICES_FILE;
+    Block block;
+    std::vector<uint8_t> out;
+    uint64_t row_blocks_at = 0, row_blobs_at = 0;
+    const uint64_t last = std::min(end * SUPERBLOCK_BLOCKS, f.blocks());
+    for (uint64_t b = first * SUPERBLOCK_BLOCKS; b < last; b++) {
+        const uint8_t* row = index + (b / SUPERBLOCK_BLOCKS) * INDEX_ROW_BYTES;
+        if (b % SUPERBLOCK_BLOCKS == 0) {
+            if (get64(row) != at.blocks || get64(row + 8) != at.blobs) misplaced_superblock(b / SUPERBLOCK_BLOCKS);
+            row_blocks_at = at.blocks;
+            row_blobs_at = at.blobs;
+        }
+        const uint8_t* entry = row + INDEX_HEAD_BYTES + (b % SUPERBLOCK_BLOCKS) * INDEX_ENTRY_BYTES;
+        if (get16(entry) != at.blocks - row_blocks_at || get32(entry + 2) != at.blobs - row_blobs_at)
+            malformed(index_file + " block " + std::to_string(b) + " is not where the blocks and the blobs before it end");
+        const size_t n = f.block_records(b);
+        at.blocks += decode_block(b, points + at.blocks, points_size - at.blocks, n, block);
+        for (size_t j = 0; j < n; j++) {
+            const uint64_t i = b * BLOCK_RECORDS + j;
+            const uint32_t len = block.len[j];
+            uint8_t record[LOGICAL_STRIDE];
+            if (!len) {
+                logical_record(block, j, NO_FOOTPRINT, 0, record);
+                put_record(static_cast<const uint8_t*>(record));
+                continue;
+            }
+            if (len > f.blobs_bytes - at.blobs) malformed(vertices_file + " ends inside the blob of record " + std::to_string(i));
+            try {
+                const BlobHeader h = blob_header(vertices + at.blobs, len);
+                if (h.logical_bytes() > f.logical_vertex_bytes - at.logical)
+                    malformed("a footprint past the footer's logical vertex stream of " + std::to_string(f.logical_vertex_bytes) +
+                              " bytes");
+                out.resize(size_t(h.logical_bytes()));
+                decode_blob(h, vertices + at.blobs, len, block.lat[j], block.lng[j], out.data());
+                logical_record(block, j, at.logical, uint32_t(h.vertex_count()), record);
+            } catch (const std::runtime_error& e) {
+                // What a blob is refused for, with whose it is.
+                throw std::runtime_error(std::string(e.what()) + ": " + vertices_file + ", record " + std::to_string(i));
+            }
+            put_record(static_cast<const uint8_t*>(record));
+            put_vertices(static_cast<const uint8_t*>(out.data()), out.size());
+            at.blobs += len;
+            at.logical += out.size();
+            at.count++;
+        }
+    }
+    return at;
+}
+
+// Refuses files whose last block and last blob do not end where the footers
+// f say or whose blobs and their logical bytes are not the footer's, `at`
+// where the decoder stands after the last superblock.
+inline void check_decoded(const Footers& f, const DecodeAt& at) {
+    const std::string vertices_file = VERTICES_FILE;
+    if (at.blocks != f.blocks_bytes) malformed(std::string(POINTS_FILE) + " has bytes between its last block and its footer");
+    if (at.blobs != f.blobs_bytes) malformed(vertices_file + " has bytes between its last blob and its footer");
+    if (at.logical != f.logical_vertex_bytes)
+        malformed(vertices_file + " counts " + std::to_string(f.logical_vertex_bytes) +
+                  " bytes of logical blobs and its blobs hold " + std::to_string(at.logical));
+    if (at.count != f.blobs)
+        malformed(vertices_file + " counts " + std::to_string(f.blobs) + " blobs and holds " + std::to_string(at.count));
+}
+
+// The bytes of the logical blobs of superblocks first to end - 1, walked from
+// where `at` stands (within the blocks and the blobs f gives) by their
+// blocks' heads, their records' len and their blobs' headers alone: what
+// decode_superblocks reads of them first, so where it refuses, so has
+// decode_superblocks by the same byte, and where it takes them it counts
+// the logical bytes decode_superblocks does.
+inline uint64_t superblocks_logical_bytes(const Footers& f, const uint8_t* points, uint64_t points_size, const uint8_t* vertices,
+                                          uint64_t first, uint64_t end, DecodeAt at) {
+    uint64_t logical = 0;
+    const uint64_t last = std::min(end * SUPERBLOCK_BLOCKS, f.blocks());
+    for (uint64_t b = first * SUPERBLOCK_BLOCKS; b < last; b++) {
+        const size_t n = f.block_records(b);
+        const BlockHead h = block_head(b, points + at.blocks, points_size - at.blocks, n);
+        const uint8_t* fields = points + at.blocks + h.fields_at;
+        // The len field is a record's last.
+        const uint32_t len_bits = h.w[W_LEN], len_at = h.record_bits - len_bits;
+        at.blocks += h.bytes;
+        for (size_t j = 0; j < n; j++) {
+            const uint32_t len = coord_keys::get_bits(fields, uint64_t(j) * h.record_bits + len_at, len_bits);
+            if (!len) continue;
+            if (len > f.blobs_bytes - at.blobs) malformed(std::string(VERTICES_FILE) + " ends inside a blob");
+            logical += blob_header(vertices + at.blobs, len).logical_bytes();
+            at.blobs += len;
+        }
+    }
+    return logical;
+}
+
 // The logical pair of the three files (each whole, in memory; of the size
 // ABSENT when the dir lacks it), record by record: a record, LOGICAL_STRIDE
 // bytes, to put_record(const uint8_t*), then its footprint's logical blob,
@@ -1168,60 +1290,8 @@ void decode(const uint8_t* points, uint64_t points_size, const uint8_t* vertices
     const Footers f = read_footers(end_of(points, points_size, POINTS_FOOTER_BYTES), points_size,
                                    end_of(vertices, vertices_size, VERTICES_FOOTER_BYTES), vertices_size,
                                    end_of(index, index_size, INDEX_FOOTER_BYTES), index_size);
-    const std::string index_file = INDEX_FILE, vertices_file = VERTICES_FILE;
-    const char* const misplaced = " is not where the blocks and the blobs before it end";
-    Block block;
-    std::vector<uint8_t> out;
-    uint64_t blocks_at = 0, blobs_at = 0, row_blocks_at = 0, row_blobs_at = 0, logical = 0, blobs = 0;
-    for (uint64_t b = 0; b < f.blocks(); b++) {
-        const uint8_t* row = index + (b / SUPERBLOCK_BLOCKS) * INDEX_ROW_BYTES;
-        if (b % SUPERBLOCK_BLOCKS == 0) {
-            if (get64(row) != blocks_at || get64(row + 8) != blobs_at)
-                malformed(index_file + " superblock " + std::to_string(b / SUPERBLOCK_BLOCKS) + misplaced);
-            row_blocks_at = blocks_at;
-            row_blobs_at = blobs_at;
-        }
-        const uint8_t* entry = row + INDEX_HEAD_BYTES + (b % SUPERBLOCK_BLOCKS) * INDEX_ENTRY_BYTES;
-        if (get16(entry) != blocks_at - row_blocks_at || get32(entry + 2) != blobs_at - row_blobs_at)
-            malformed(index_file + " block " + std::to_string(b) + misplaced);
-        const size_t n = f.block_records(b);
-        blocks_at += decode_block(b, points + blocks_at, points_size - blocks_at, n, block);
-        for (size_t j = 0; j < n; j++) {
-            const uint64_t i = b * BLOCK_RECORDS + j;
-            const uint32_t len = block.len[j];
-            uint8_t record[LOGICAL_STRIDE];
-            if (!len) {
-                logical_record(block, j, NO_FOOTPRINT, 0, record);
-                put_record(static_cast<const uint8_t*>(record));
-                continue;
-            }
-            if (len > f.blobs_bytes - blobs_at) malformed(vertices_file + " ends inside the blob of record " + std::to_string(i));
-            try {
-                const BlobHeader h = blob_header(vertices + blobs_at, len);
-                if (h.logical_bytes() > f.logical_vertex_bytes - logical)
-                    malformed("a footprint past the footer's logical vertex stream of " + std::to_string(f.logical_vertex_bytes) +
-                              " bytes");
-                out.resize(size_t(h.logical_bytes()));
-                decode_blob(h, vertices + blobs_at, len, block.lat[j], block.lng[j], out.data());
-                logical_record(block, j, logical, uint32_t(h.vertex_count()), record);
-            } catch (const std::runtime_error& e) {
-                // What a blob is refused for, with whose it is.
-                throw std::runtime_error(std::string(e.what()) + ": " + vertices_file + ", record " + std::to_string(i));
-            }
-            put_record(static_cast<const uint8_t*>(record));
-            put_vertices(static_cast<const uint8_t*>(out.data()), out.size());
-            blobs_at += len;
-            logical += out.size();
-            blobs++;
-        }
-    }
-    if (blocks_at != f.blocks_bytes) malformed(std::string(POINTS_FILE) + " has bytes between its last block and its footer");
-    if (blobs_at != f.blobs_bytes) malformed(vertices_file + " has bytes between its last blob and its footer");
-    if (logical != f.logical_vertex_bytes)
-        malformed(vertices_file + " counts " + std::to_string(f.logical_vertex_bytes) +
-                  " bytes of logical blobs and its blobs hold " + std::to_string(logical));
-    if (blobs != f.blobs)
-        malformed(vertices_file + " counts " + std::to_string(f.blobs) + " blobs and holds " + std::to_string(blobs));
+    check_decoded(f, decode_superblocks(f, points, points_size, vertices, index, 0, f.superblocks(), DecodeAt{}, put_record,
+                                        put_vertices));
 }
 
 // The logical pair of the three files, in memory.

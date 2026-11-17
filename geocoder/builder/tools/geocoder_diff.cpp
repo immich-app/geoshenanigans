@@ -36,7 +36,6 @@
 #include <cstring>
 #include <ctime>
 #include <dirent.h>
-#include <fstream>
 #include <functional>
 #include <future>
 #include <iomanip>
@@ -60,6 +59,7 @@
 #include "cell_id_diff.h"
 #include "geo_corrections.h"
 #include "identity_sidecar.h"
+#include "logical_decode.h"
 #include "merge_sequence.h"
 #include "parallel.h"
 #include "patch_format.h"
@@ -599,12 +599,11 @@ static bool decode_way_files(const LogicalFamily& family, const std::string& dir
     if (ways.size == FamilyFileMap::ABSENT && nodes.size == FamilyFileMap::ABSENT) return false;
     // A dir with one file of the pair is refused before anything is written.
     way_footers(kind, ways, nodes);
-    std::ofstream wo(to + "/" + kind.ways_file, std::ios::binary), no(to + "/" + kind.nodes_file, std::ios::binary);
-    way_files::decode(
-        kind, ways.data(), ways.size, nodes.data(), nodes.size,
-        [&](const uint8_t* record) { wo.write(reinterpret_cast<const char*>(record), static_cast<std::streamsize>(kind.stride)); },
-        [&](const uint8_t* p, size_t n) { no.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n)); });
-    if (!wo.flush() || !no.flush()) throw std::runtime_error(std::string("Cannot write the decoded ") + kind.ways_file + " of " + dir);
+    logical_decode::ScratchFile wo(to + "/" + kind.ways_file), no(to + "/" + kind.nodes_file);
+    const bool written = logical_decode::decode_way_files(kind, ways.data(), ways.size, nodes.data(), nodes.size, wo.fd(), no.fd(),
+                                                          logical_decode::decode_threads());
+    if (!written || !wo.flush() || !no.flush())
+        throw std::runtime_error(std::string("Cannot write the decoded ") + kind.ways_file + " of " + dir);
     return true;
 }
 // The bytes decode_way_files writes for dir, from the two files' footers
@@ -643,13 +642,11 @@ static bool decode_addr_files(const LogicalFamily&, const std::string& dir, cons
     if (files.none()) return false;
     // What the footers alone refuse is refused before anything is written.
     files.footers();
-    std::ofstream po(to + "/" + addr_files::POINTS_FILE, std::ios::binary);
-    std::ofstream vo(to + "/" + addr_files::VERTICES_FILE, std::ios::binary);
-    addr_files::decode(
-        files.points.data(), files.points.size, files.vertices.data(), files.vertices.size, files.index.data(), files.index.size,
-        [&](const uint8_t* record) { po.write(reinterpret_cast<const char*>(record), addr_files::LOGICAL_STRIDE); },
-        [&](const uint8_t* p, size_t n) { vo.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n)); });
-    if (!po.flush() || !vo.flush()) throw std::runtime_error("Cannot write the decoded address files of " + dir);
+    logical_decode::ScratchFile po(to + "/" + addr_files::POINTS_FILE), vo(to + "/" + addr_files::VERTICES_FILE);
+    const bool written = logical_decode::decode_addr_files(files.points.data(), files.points.size, files.vertices.data(),
+                                                           files.vertices.size, files.index.data(), files.index.size, po.fd(),
+                                                           vo.fd(), logical_decode::decode_threads());
+    if (!written || !po.flush() || !vo.flush()) throw std::runtime_error("Cannot write the decoded address files of " + dir);
     return true;
 }
 // The bytes decode_addr_files writes for dir, from the three files' footers
@@ -667,10 +664,10 @@ static bool decode_poi_files(const LogicalFamily&, const std::string& dir, const
     if (!has_r || !has_v) throw std::runtime_error(dir + " has one of poi_records.bin and poi_vertices.bin");
     MappedFile r = mmap_file(rp), v = mmap_file(vp);
     if (!r.data || !v.data) throw std::runtime_error("Cannot read the POI files of " + dir);
-    std::ofstream ro(to + "/poi_records.bin", std::ios::binary), vo(to + "/poi_vertices.bin", std::ios::binary);
+    logical_decode::ScratchFile ro(to + "/poi_records.bin"), vo(to + "/poi_vertices.bin");
     poi_files::decode(reinterpret_cast<const uint8_t*>(r.data), r.size, reinterpret_cast<const uint8_t*>(v.data), v.size,
-                      [&](const uint8_t* rec) { ro.write(reinterpret_cast<const char*>(rec), poi_files::LOGICAL_STRIDE); },
-                      [&](const uint8_t* p, size_t n) { vo.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n)); });
+                      [&](const uint8_t* rec) { ro.write(rec, poi_files::LOGICAL_STRIDE); },
+                      [&](const uint8_t* p, size_t n) { vo.write(p, n); });
     unmap_file(r);
     unmap_file(v);
     if (!ro.flush() || !vo.flush()) throw std::runtime_error("Cannot write the decoded POI files of " + dir);
@@ -708,10 +705,9 @@ static bool decode_place_files(const LogicalFamily&, const std::string& dir, con
     if (!has) return false;
     if (has != 3) throw std::runtime_error(dir + " has some of the place files");
     auto u8 = [](const MappedFile& f) { return reinterpret_cast<const uint8_t*>(f.data); };
-    std::ofstream o(to + "/" + place_files::NODES_FILE, std::ios::binary);
-    place_files::decode(u8(m[0]), m[0].size, u8(m[1]), m[1].size, u8(m[2]), m[2].size, [&](const place_files::LogicalPlace& p) {
-        o.write(reinterpret_cast<const char*>(&p), place_files::LOGICAL_STRIDE);
-    });
+    logical_decode::ScratchFile o(to + "/" + place_files::NODES_FILE);
+    place_files::decode(u8(m[0]), m[0].size, u8(m[1]), m[1].size, u8(m[2]), m[2].size,
+                        [&](const place_files::LogicalPlace& p) { o.write(&p, place_files::LOGICAL_STRIDE); });
     for (MappedFile& f : m)
         if (f.data) unmap_file(f);
     if (!o.flush()) throw std::runtime_error("Cannot write the decoded place files of " + dir);
@@ -740,10 +736,9 @@ static bool decode_side_file(const LogicalFamily& family, const std::string& dir
     if (stat(path.c_str(), &st) != 0) return false;
     MappedFile m = mmap_file(path);
     if (static_cast<uint64_t>(st.st_size) != m.size) throw std::runtime_error("Cannot read " + path);
-    std::ofstream o(to + "/" + name, std::ios::binary);
-    side_blocks::decode(name, reinterpret_cast<const uint8_t*>(m.data), m.size, [&](const uint32_t* values, size_t count) {
-        o.write(reinterpret_cast<const char*>(values), static_cast<std::streamsize>(4 * count));
-    });
+    logical_decode::ScratchFile o(to + "/" + name);
+    side_blocks::decode(name, reinterpret_cast<const uint8_t*>(m.data), m.size,
+                        [&](const uint32_t* values, size_t count) { o.write(values, 4 * count); });
     unmap_file(m);
     if (!o.flush()) throw std::runtime_error("Cannot write the decoded " + path);
     return true;
@@ -908,10 +903,9 @@ static MappedFile map_string_pool(const std::string& path, const std::string& to
     if (stat(path.c_str(), &st) != 0) return {nullptr, 0};
     MappedFile f = mmap_file(path);
     {
-        std::ofstream o(to, std::ios::binary);
+        logical_decode::ScratchFile o(to);
         string_files::decode(
-            reinterpret_cast<const uint8_t*>(f.data), f.size,
-            [&](const char* p, size_t n) { o.write(p, static_cast<std::streamsize>(n)); }, path);
+            reinterpret_cast<const uint8_t*>(f.data), f.size, [&](const char* p, size_t n) { o.write(p, n); }, path);
         if (!o.flush()) throw std::runtime_error("Cannot write the decoded pool of " + path);
     }
     unmap_file(f);
@@ -1268,6 +1262,9 @@ static int run(int argc, char* argv[]) {
         return 1;
     }
     ScratchDir scratch("geocoder-diff");
+    // The logical files, removed beside the patch's last sections once they
+    // are read; the diff ends once they are gone.
+    logical_decode::Remover removing;
     // A shipped tier is rebuilt from the client's own old file, so both
     // sides come from the dir itself. The others are only remapped through
     // and may be borrowed; a newly shipped one is sent whole at the end.
@@ -2119,6 +2116,18 @@ static int run(int argc, char* argv[]) {
         }
     malloc_trim(0); // return freed heap to OS
     log_rss("serialize");
+    // The record families' logical files are read no more: removed beside
+    // the corrections. The side files' deltas read theirs at the end, and an
+    // address family without records its footprints (emit_raw).
+    {
+        std::vector<std::string> paths;
+        for (const auto& dirs : logical_dirs())
+            for (const LogicalFamily& family : logical_families())
+                for (const char* file : family.files)
+                    if (family.decode != decode_side_file && (res_addr_v.stride != 0 || file != std::string(addr_files::VERTICES_FILE)))
+                        paths.push_back(dirs.second + "/" + file);
+        removing.remove(std::move(paths));
+    }
     double t0 = now_ms();
 
     // ID remaps were pre-computed in the parallel merge groups.
@@ -2615,6 +2624,18 @@ static int run(int argc, char* argv[]) {
     for (int t = 0; t < STRING_TIER_COUNT; t++)
         if (tier_files.newly_shipped >> t & 1) emit_raw(string_tier_file_id(t), STRING_TIER_FILES[t]);
 
+    // Every logical file is read: the rest go beside the compression.
+    {
+        std::vector<std::string> paths;
+        for (const auto& dirs : logical_dirs()) {
+            std::error_code ec;
+            for (auto e = std::filesystem::directory_iterator(dirs.second, ec); !ec && e != std::filesystem::directory_iterator();
+                 e.increment(ec))
+                paths.push_back(e->path().string());
+        }
+        removing.remove(std::move(paths));
+    }
+
     // Now safe to free str_remap — all consumers (sparse_delta above)
     // have finished using it.
     str_remap = SortedU32Map();
@@ -2647,6 +2668,9 @@ static int run(int argc, char* argv[]) {
                   << cst.st_size / 1024 / 1024 << " MiB)" << std::endl;
         log_time("zstd -19 -T0 compression", tc);
     }
+    const double tr = now_ms();
+    removing.wait();
+    log_time("waited for the logical files' removal", tr);
     return 0;
 }
 

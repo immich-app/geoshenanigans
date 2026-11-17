@@ -615,6 +615,75 @@ inline void rebase_rows(const Kind& kind, uint8_t* rows, size_t bytes, uint64_t 
 }
 
 // ------------------------------------------------------------------ decoder
+// Where a decoder stands at a group's first way: the bytes of the blocks
+// before it, and the nodes.
+struct DecodeAt {
+    uint64_t at = 0, node = 0;
+};
+
+// Group g's row in the rows file at `ways`: every row before it is a whole
+// group's.
+inline const uint8_t* row_of(const Kind& kind, const uint8_t* ways, uint64_t g) { return ways + g * kind.row_bytes(GROUP_WAYS); }
+
+// The refusal of group g, whose row's off is not where the decoder stands.
+[[noreturn]] inline void misplaced_group(const Kind& kind, uint64_t g) {
+    malformed(std::string(kind.ways_file) + " group " + std::to_string(g) + " is not where the blocks before it end");
+}
+
+// Groups first to end - 1 of the pair whose footers are f, decoded from where
+// `at` stands (within the blocks f gives) as decode decodes them: each way's
+// record to put_way and its nodes to put_nodes. Where the decoder stands
+// after them. Refuses what decode refuses of those groups, a first one whose
+// off is not `at`'s among it.
+template <class PutWay, class PutNodes>
+DecodeAt decode_groups(const Kind& kind, const Footers& f, const uint8_t* ways, const uint8_t* nodes, uint64_t first, uint64_t end,
+                       DecodeAt at, PutWay put_way, PutNodes put_nodes) {
+    std::vector<uint8_t> out;
+    end = std::min(end, f.groups());
+    for (uint64_t g = first; g < end; g++) {
+        const size_t n = f.group_ways(g);
+        const Row r = decode_row(kind, row_of(kind, ways, g), n);
+        if (r.off != at.at) misplaced_group(kind, g);
+        for (size_t j = 0; j < n; j++) {
+            uint8_t record[MAX_STRIDE];
+            logical_record(kind, r, j, at.node, record);
+            put_way(static_cast<const uint8_t*>(record));
+            if (!r.cnt[j]) continue;
+            const size_t bytes = r.block_bytes(j);
+            if (bytes > f.blocks_bytes - at.at)
+                malformed(std::string(kind.nodes_file) + " ends inside the block of way " + std::to_string(g * GROUP_WAYS + j));
+            out.resize(NODE_BYTES * size_t(r.cnt[j]));
+            decode_block(nodes + at.at, r.cnt[j], r.code[j], r.anchor_lat, r.anchor_lng, out.data());
+            put_nodes(static_cast<const uint8_t*>(out.data()), out.size());
+            at.at += bytes;
+            at.node += r.cnt[j];
+        }
+    }
+    return at;
+}
+
+// Refuses a pair whose last block does not end where the footer starts or
+// whose ways' nodes are not the footer's, `at` where the decoder stands after
+// the last group.
+inline void check_decoded(const Kind& kind, const Footers& f, const DecodeAt& at) {
+    if (at.at != f.blocks_bytes) malformed(std::string(kind.nodes_file) + " has bytes between its last block and its footer");
+    if (at.node != f.nodes)
+        malformed(std::string(kind.nodes_file) + " counts " + std::to_string(f.nodes) + " nodes and its ways have " +
+                  std::to_string(at.node));
+}
+
+// The nodes of groups first to end - 1 by their rows' counts alone, of a rows
+// file read_footers took for f: it refuses nothing.
+inline uint64_t groups_nodes(const Kind& kind, const Footers& f, const uint8_t* ways, uint64_t first, uint64_t end) {
+    uint64_t n = 0;
+    end = std::min(end, f.groups());
+    for (uint64_t g = first; g < end; g++) {
+        const uint8_t* counts = row_of(kind, ways, g) + ROW_HEAD_BYTES;
+        for (size_t j = 0; j < f.group_ways(g); j++) n += get16(counts + 4 * j);
+    }
+    return n;
+}
+
 // The logical pair of the two files (each whole, in memory; of the size
 // ABSENT when the dir lacks it), way by way: a way's record, kind.stride
 // bytes, to put_way(const uint8_t*), then its nodes, when it has any, to
@@ -634,32 +703,7 @@ void decode(const Kind& kind, const uint8_t* ways, uint64_t ways_size, const uin
     };
     const Footers f = read_footers(kind, end_of(ways, ways_size, WAYS_FOOTER_BYTES), ways_size, end_of(nodes, nodes_size, NODES_FOOTER_BYTES),
                                    nodes_size);
-    std::vector<uint8_t> out;
-    uint64_t at = 0, node = 0;
-    const uint8_t* row = ways;
-    for (uint64_t g = 0; g < f.groups(); g++) {
-        const size_t n = f.group_ways(g);
-        const Row r = decode_row(kind, row, n);
-        row += kind.row_bytes(n);
-        if (r.off != at) malformed(std::string(kind.ways_file) + " group " + std::to_string(g) + " is not where the blocks before it end");
-        for (size_t j = 0; j < n; j++) {
-            uint8_t record[MAX_STRIDE];
-            logical_record(kind, r, j, node, record);
-            put_way(static_cast<const uint8_t*>(record));
-            if (!r.cnt[j]) continue;
-            const size_t bytes = r.block_bytes(j);
-            if (bytes > f.blocks_bytes - at)
-                malformed(std::string(kind.nodes_file) + " ends inside the block of way " + std::to_string(g * GROUP_WAYS + j));
-            out.resize(NODE_BYTES * size_t(r.cnt[j]));
-            decode_block(nodes + at, r.cnt[j], r.code[j], r.anchor_lat, r.anchor_lng, out.data());
-            put_nodes(static_cast<const uint8_t*>(out.data()), out.size());
-            at += bytes;
-            node += r.cnt[j];
-        }
-    }
-    if (at != f.blocks_bytes) malformed(std::string(kind.nodes_file) + " has bytes between its last block and its footer");
-    if (node != f.nodes)
-        malformed(std::string(kind.nodes_file) + " counts " + std::to_string(f.nodes) + " nodes and its ways have " + std::to_string(node));
+    check_decoded(kind, f, decode_groups(kind, f, ways, nodes, 0, f.groups(), DecodeAt{}, put_way, put_nodes));
 }
 
 }  // namespace way_files
