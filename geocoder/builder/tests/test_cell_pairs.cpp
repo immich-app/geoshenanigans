@@ -23,7 +23,7 @@ namespace {
 using Lists = std::vector<std::pair<uint64_t, std::vector<uint32_t>>>;
 using Files = std::pair<std::vector<char>, std::vector<char>>;
 
-constexpr Format FORMATS[] = {ADMIN, POI, POSTCODE_CENTROID};
+constexpr Format FORMATS[] = {ADMIN, POI};
 
 // The level-10 cell of number n (face * 4^10 + its position).
 uint64_t cell(uint64_t n) { return cell_of(n, 10); }
@@ -158,13 +158,11 @@ TEST(cell_pairs_every_level_reads_back) {
 // read and its fixture writer writes. ADMIN: a block of a PLAIN row, a SAME
 // row, an EDIT (9 toggled, 12 added) and a row repeating an id, then an empty
 // list in another parent. POI: gaps of 1 to 4 bytes and a flagged id, a shared
-// list, another parent. Postcode centroids: a shared list and an id past
-// 2^31, ids alone.
+// list, another parent.
 static const Lists GOLDEN_ADMIN = {{cell(5), {3, 9}}, {cell(6), {3, 9}}, {cell(7), {3, 12, 9 | FLAG}},
                                    {cell(8), {7, 7}}, {cell(1030), {}}};
 static const Lists GOLDEN_POI = {{cell(5), {1, 300, 70000, 20000000, 5 | FLAG}}, {cell(6), {1, 300, 70000, 20000000, 5 | FLAG}},
                                  {cell(2048), {42}}};
-static const Lists GOLDEN_POSTCODE = {{cell(5), {10, 11, 400}}, {cell(6), {10, 11, 400}}, {cell(7), {0xFFFFFFF0u}}};
 
 // FNV-1a 64 of bytes: the long cells files of the golden indexes, compared by hash.
 static uint64_t fnv1a(const std::vector<char>& bytes) {
@@ -184,7 +182,6 @@ TEST(cell_pairs_writer_bytes_are_fixed) {
     const Case cases[] = {
         {&GOLDEN_ADMIN, ADMIN, 312, 0x736bd71a2827593bull, {36, 0, 4, 0, 6, 5, 8, 1, 24, 5, 0, 8, 0, 0, 0, 0, 0}},
         {&GOLDEN_POI, POI, 316, 0xa98150bcae9640a2ull, {8, 1, 1, 57, 42, 1, 67, 16, 1, 143, 27, 48, 1, 5, 2, 0, 42}},
-        {&GOLDEN_POSTCODE, POSTCODE_CENTROID, 180, 0x1b32dba5fd24c3ccull, {6, 10, 0, 132, 3, 2, 240, 255, 255, 255, 15}},
     };
     for (const Case& c : cases) {
         const Files files = encode(*c.lists, c.format);
@@ -487,8 +484,8 @@ TEST(cell_pairs_reader_refuses_each_malformed_range) {
     CHECK_EQ(refusal(cells_by_hand(POSTCODE_CELLS, {{0, {5, 6}, {0, 3}}, {1, {7}, {5, 9}}})), m + "rows out of order");
     // A ranges index has no entries file, and is no index of lists.
     CHECK_EQ(refusal(cells_by_hand(POSTCODE_CELLS, good), bytes({0})), m + "entries beside a ranges index");
-    CHECK_EQ(refusal(cells_by_hand(POSTCODE_CENTROID, {{0, {5}, {0}}})), m + "a cells file of another kind of index");
-    CHECK_EQ(refusal_reading(cells_by_hand(POSTCODE_CELLS, good), {}, POSTCODE_CENTROID),
+    CHECK_EQ(refusal(cells_by_hand(POI, {{0, {5}, {0}}})), m + "a cells file of another kind of index");
+    CHECK_EQ(refusal_reading(cells_by_hand(POSTCODE_CELLS, good), {}, POI),
              m + "a cells file of another kind of index");
 }
 

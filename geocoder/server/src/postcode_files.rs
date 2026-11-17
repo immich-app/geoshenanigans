@@ -24,6 +24,12 @@ const FLAG_MIXED: u32 = 1;
 const FLAG_KIND1: u32 = 2;
 const FLAG_ONE_COUNTRY: u32 = 4;
 
+#[cfg(test)]
+thread_local! {
+    /// The blocks `rows_of` has decoded on this thread, for tests that count a lookup's reads.
+    pub static BLOCK_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A centroid as a block gives it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Centroid {
@@ -148,7 +154,14 @@ impl PostcodeFiles {
         self.cells.range(cell)
     }
 
-    fn blocks(&self) -> u32 {
+    /// Calls `f` with each admin cell holding centroids and its rows, [first, end), in cell
+    /// order.
+    pub fn for_each_cell(&self, f: impl FnMut(u64, u32, u32)) {
+        self.cells.for_each_range(f)
+    }
+
+    /// The blocks: rows below BLOCK_ROWS times this.
+    pub fn blocks(&self) -> u32 {
         self.rows.div_ceil(BLOCK_ROWS as u32)
     }
 
@@ -238,6 +251,8 @@ impl PostcodeFiles {
         if rows == 0 || e.offset > self.table_at {
             return;
         }
+        #[cfg(test)]
+        BLOCK_READS.with(|n| n.set(n.get() + 1));
         let end = match self.entry(block + 1) {
             Some(next) => next.offset.clamp(e.offset, self.table_at),
             None => self.table_at,

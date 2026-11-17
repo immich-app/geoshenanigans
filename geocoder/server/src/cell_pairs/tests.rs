@@ -2,7 +2,7 @@ use super::*;
 use crate::test_rng::Rng;
 use crate::DEFAULT_ADMIN_CELL_LEVEL;
 
-const FORMATS: [Format; 3] = [ADMIN, POI, POSTCODE_CENTROID];
+const FORMATS: [Format; 2] = [ADMIN, POI];
 
 /// The level-10 cell of number n (face * 4^10 + its position).
 fn cell(n: u64) -> u64 {
@@ -207,11 +207,9 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 fn the_builders_bytes_read_back_and_write_gives_them() {
     let admin = vec![(cell(5), vec![3, 9]), (cell(6), vec![3, 9]), (cell(7), vec![3, 12, 9 | FLAG]), (cell(8), vec![7, 7]), (cell(1030), vec![])];
     let poi = vec![(cell(5), vec![1, 300, 70000, 20000000, 5 | FLAG]), (cell(6), vec![1, 300, 70000, 20000000, 5 | FLAG]), (cell(2048), vec![42])];
-    let postcode = vec![(cell(5), vec![10, 11, 400]), (cell(6), vec![10, 11, 400]), (cell(7), vec![0xFFFF_FFF0])];
-    let cases: [(&Vec<(u64, Vec<u32>)>, Format, usize, u64, &[u8]); 3] = [
+    let cases: [(&Vec<(u64, Vec<u32>)>, Format, usize, u64, &[u8]); 2] = [
         (&admin, ADMIN, 312, 0x736b_d71a_2827_593b, &[36, 0, 4, 0, 6, 5, 8, 1, 24, 5, 0, 8, 0, 0, 0, 0, 0]),
         (&poi, POI, 316, 0xa981_50bc_ae96_40a2, &[8, 1, 1, 57, 42, 1, 67, 16, 1, 143, 27, 48, 1, 5, 2, 0, 42]),
-        (&postcode, POSTCODE_CENTROID, 180, 0x1b32_dba5_fd24_c3cc, &[6, 10, 0, 132, 3, 2, 240, 255, 255, 255, 15]),
     ];
     for (lists, format, cells_bytes, cells_hash, entries) in cases {
         let (c, e) = write(lists, format);
@@ -271,6 +269,10 @@ fn every_range_reads_back_and_a_cell_it_doesnt_hold_has_none() {
         assert_eq!(pairs.range(c), (first, end), "cell {c:#x}");
         assert!(pairs.ids(c).is_empty());
     }
+    // The walk gives every cell in order with its range.
+    let mut walked = Vec::new();
+    pairs.for_each_range(|c, first, end| walked.push((c, first, end)));
+    assert_eq!(walked, tiled(&ranges));
     let held: std::collections::HashSet<u64> = ranges.iter().map(|x| x.0).collect();
     let mut absent: Vec<u64> = (0..2000).map(|_| cell(rng.next() % (6 << 20))).filter(|c| !held.contains(c)).collect();
     absent.extend([cell(3 << 10), cell(66 << 10 | 5), ranges[0].0 << 2, ranges[0].0 | 2, 0, u64::MAX]);
@@ -300,6 +302,9 @@ fn ranges_at_every_level_read_back() {
         for (c, first, end) in tiled(&ranges) {
             assert_eq!(pairs.range(c), (first, end), "level {level}, cell {c:#x}");
         }
+        let mut walked = Vec::new();
+        pairs.for_each_range(|c, first, end| walked.push((c, first, end)));
+        assert_eq!(walked, tiled(&ranges), "level {level}");
     }
 }
 
@@ -320,7 +325,11 @@ fn a_ranges_index_of_no_cells_is_an_empty_file_of_no_rows() {
     assert!(write_ranges(&[]).is_empty());
     let pairs = open_ranges(Vec::new(), 0).unwrap();
     assert_eq!(pairs.range(cell(5)), (0, 0));
+    pairs.for_each_range(|c, _, _| panic!("cell {c:#x}"));
     assert!(open_ranges(Vec::new(), 1).is_err());
+    // An index of lists has no ranges to walk.
+    let (cells, entries) = write(&[(cell(5), vec![1, 2])], POI);
+    open((cells, entries), POI).unwrap().for_each_range(|c, _, _| panic!("cell {c:#x}"));
 }
 
 #[test]
@@ -354,7 +363,7 @@ fn open_ranges_refuses_ranges_that_dont_tile_the_rows() {
     // Another kind of index, the lists format asked of a ranges file, and another level.
     let (admin, _) = write(&[(cell(5), vec![1])], ADMIN);
     assert!(open_ranges(admin, 1).err().unwrap().contains("another kind of index"));
-    assert!(open((good.clone(), Vec::new()), POSTCODE_CENTROID).err().unwrap().contains("another kind of index"));
+    assert!(open((good.clone(), Vec::new()), POI).err().unwrap().contains("another kind of index"));
     assert!(open((good.clone(), Vec::new()), POSTCODE_CELLS).is_err());
     assert_eq!(
         CellPairs::open_ranges(FileBytes::Owned(good), 11, 9).err().unwrap(),

@@ -43,7 +43,9 @@ Most of the old bytes were bookkeeping the patcher can derive:
 - place nodes and postal polygons merge instead of being re-sent whole
 - the postcode centroid cell index, the admin / POI / place corrections and
   (v6) the street / addr / interp entry corrections travel as per-cell lost /
-  gained ids (since v13 no place cell index travels: the reader derives it)
+  gained ids (since v13 no place cell index travels: the reader derives it;
+  since v19 no postcode centroid one: the patcher writes it beside the
+  centroids)
 - a replaced record keeps its unchanged geometry, an edited one keeps its
   unchanged head and tail
 - far merge jumps need a run of matches behind them (duplicates no longer
@@ -74,6 +76,34 @@ has no record of merges by content, and so does one whose `--identity`
 sidecar the diff rejects, with a warning that names it.
 
 The tables below predate all of these changes.
+
+### GCPATCH v19 on planet (2026-10-18 → 10-19)
+
+v19 merges the postcode centroids as the packed files' logical rows, in cell
+order, where v18 sent a sparse delta of their slots and a cell list delta of
+their index. Measured 2026-11-17 over the 90 variant dirs of the two days,
+each side's own `generate_patches.sh` and tools (every variant PASS on both):
+
+| Variant | v18 | v19 |
+|---------|-----|-----|
+| planet/admin | 87,780 B | **53,902 B** |
+| planet/no-addresses | 1,291,723 B | **1,256,391 B** |
+| planet/full | 2,486,309 B | **2,452,899 B** |
+| asia/admin | 30,675 B | **12,587 B** |
+| europe/admin | 22,379 B | 23,845 B |
+| north-america/admin | 5,695 B | 6,386 B |
+| all 90 variant dirs | 11,699,955 B | **11,517,479 B** |
+
+The second day has 26,791 fewer planet centroids, which the slots sent as
+tombstones (a sparse delta of 28,747 changed slots, 574,972 B raw, and a
+cell list delta of 3,966 B) and the merge sends as DELETE runs (a merge
+sequence of 63,260 B: 2,792,435 rows matched, 1,891 inserted, 28,682
+deleted): 515,710 B less raw in each planet mode dir. A centroid whose
+point moves, or whose row a moved string reorders within its cell, goes as
+a DELETE and an INSERT: europe/admin's merge deletes 1,372 rows and inserts
+1,381, which cost 17,657 B raw (1,466 B compressed) more than the slots'
+sparse delta did. A dir without centroids carries the empty merge section,
+44 B raw.
 
 ### Europe (7 GiB dataset)
 
@@ -169,8 +199,17 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
   `addr_postcodes.bin`) are side blocks on disk (`src/side_blocks.h`); the diff decodes each into
   its u32 values, and a side file's section carries those: its sizes are 4 bytes a value, and a
   file the old day lacks goes as a full replacement of its values.
+  The postcode centroids are the PCC1 files on disk (`src/postcode_files.h`): the centroids in
+  cell order, Rice-coded in blocks of 32 rows with a table of the blocks, in
+  `postcode_centroids.bin`, and a ranges index of each admin cell's rows in
+  `postcode_centroid_cells.bin`; the diff decodes the two into their logical form (20-byte rows
+  in cell order, each with its cell's key, the strict decoder refusing any block the encoder
+  would not write) and merges those, and the patch lists the cells file with no section of its
+  own. A dir without the files merges no centroids, and one of no centroid holds the footer
+  alone and an empty cells file.
   `geocoder-diff --decode-logical DIR OUT` writes the logical files it would read of DIR's way,
-  address, POI, place and side files into OUT, a new or empty dir, and no patch.
+  address, POI, place, postcode centroid and side files into OUT, a new or empty dir, and no
+  patch.
   `geocoder-diff --logical-size DIR` prints the bytes a diff maps for DIR's record files and the
   bytes it writes to scratch for DIR, from file sizes and footers alone;
   `tools/generate_patches.sh` starts its diffs and verifies by them, within a memory budget and
@@ -185,8 +224,10 @@ geocoder-patch old/ patch.gcpatch → new/  (must be byte-identical to fresh bui
   and one polygon in flight; a polygon past 256 KiB a piece at a time), and so are the way files
   (one way and its nodes in flight, 512 KiB of them at most), the address files (a block of 16
   records, an index row and one footprint in flight, 256 KiB of it at most; an escaped footprint,
-  of any size, a piece at a time) and the side files (a block of 64 values in flight, the new
-  file's block table in a scratch file beside it until the file is closed). An encoded family's
+  of any size, a piece at a time), the side files (a block of 64 values in flight, the new
+  file's block table in a scratch file beside it until the file is closed) and the postcode
+  centroid files (a block of 32 rows and a parent record of the cells index in flight, the new
+  table in a scratch file until the blocks are written). An encoded family's
   records and their child stream replay together; a family whose every section a patch sends as
   unchanged goes through no codec: its files are copied from the old dir as they sit, those no
   section names with them. A way pair a patch changes replays on its two files as they sit: the
@@ -218,7 +259,7 @@ geocoder-patch's own memory doesn't grow with the data or the patch. Three rules
 - **No count is used without a cap.** A count read from the patch either sizes a read of the
   patch, which the patcher checks against the bytes left in its section first (`SectionReader`),
   or has a cap it refuses past: 65,536 moved-string pairs (STRING_PAIRS_MAX), 1024 client files
-  (MAX_CLIENT_FILES) of names at most 255 bytes, a record stride below 0x100
+  (MAX_CLIENT_FILES) of names at most 255 bytes, a record stride of at most 0xF9
   (MAX_RECORD_STRIDE), 0xFFFFFFFE records in a merged file (FILE_RECORDS_MAX), secondary remap
   pairs for the five remapped record files only, 0xFFFF ids in the lost and in the gained runs
   over a cell of a cell list delta (v15: 8 bytes an id, so 512 KiB each, however many runs),
@@ -238,6 +279,10 @@ run's heap peaks above 2.09 MiB or its anonymous memory above 2.08 MiB. One run 
 core, cold cache: planet/full 122.4 s (137.7 s in a 32 MiB limit), planet/no-addresses 54.2 s,
 planet/poi/all 8.2 s, planet/admin 1.3 s. On the same days the v16 tools take 103.4 s for
 planet/full on the fixed-width files (310.0 s in 32 MiB) and 156.3 s on the encoded set.
+With GCPATCH v19 (2026-11-17), where the postcode centroids are the packed files, one core,
+cold, the median of 3 runs a side: planet/admin 1.76 s (v18: 1.29 s), planet/no-addresses
+56.4 s (51.3 s), planet/full 124.8 s (118.3 s); the heap peaks at 0.40 MiB in each of the
+three (v18: 0.51 to 0.56 MiB).
 
 The figures below are GCPATCH v12's, when the patcher had two modes: plain, on the files as the
 builder wrote them, and low-memory, on a set `geocoder-gc` had encoded. They were measured on
@@ -371,7 +416,7 @@ the tier sizes before it, which the patch carries.
   strings section, and its file comes whole in a full-replacement section.
 - **Referenced tier**: a tier that some string field of the dir's own old
   files points into (the fields the patcher remaps, `string_field_offsets`
-  and the sparse files of remap kind 2 and 3).
+  and the sparse files of remap kind 2).
 - **Sent runs**: for a referenced tier the dir doesn't ship, the diff walks
   the tier itself and sends the shift runs.
 - A tier neither shipped nor referenced sends nothing.
@@ -437,7 +482,7 @@ v8 data patch that day; applying the delta also needs memory for the whole
 old file (1.0 GB for poi.fst). Rebuilding costs no download and two to three
 and a half minutes of one core.
 
-## Patch Format (.gcpatch, version 18)
+## Patch Format (.gcpatch, version 19)
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window
 pinned (`--zstd=wlog=23`, PATCH_ZSTD_WINDOW_LOG); a patcher built on the zstd
@@ -447,8 +492,8 @@ files, old file sizes and strings sections are read by position, everything
 after them by marker):
 
 ```
-Header: "GCPATCH\0" (8) + version=18 (u32) + flags=0 (u32)
-  (a v18 patcher accepts only v18 patches; the v8 to v18 changes are marked
+Header: "GCPATCH\0" (8) + version=19 (u32) + flags=0 (u32)
+  (a v19 patcher accepts only v19 patches; the v8 to v19 changes are marked
   below)
 
 Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
@@ -462,8 +507,8 @@ Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
 
 Old file sizes: n (u32) + n × {file_id:u32, old_size:u64}
   (the old files no section names, UNSECTIONED_OLD_FILES: the entry
-  pipeline's cell indexes and the entries file beside a cell list delta;
-  0 = absent. The patcher checks them first.)
+  pipeline's cell indexes (v19: no longer the postcode centroid entries
+  file, which no build writes); 0 = absent. The patcher checks them first.)
 
 Strings: marker 0xFFFFFFF6 (u32)
   + 5 × {old_size:u32, new_size:u32} (core, street, addr, postcode, poi: the
@@ -579,9 +624,10 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     else replays this one as a MATCH of every record). new_size is old_size, and the patcher
     refuses any other ("Malformed copy-old section")
   stride=0xFC: sparse delta (value_stride, remap_kind, n, [(pos, value)] × n;
-    remap_kind 0 raw, 2 a string offset, 3 a postcode centroid, as its file's
-    row of SPARSE_DELTA_FILES gives it, and the patcher refuses any other.
-    v14: no kind 1, an admin id the patch remapped)
+    remap_kind 0 raw, 2 a string offset, as its file's row of
+    SPARSE_DELTA_FILES gives it, and the patcher refuses any other.
+    v14: no kind 1, an admin id the patch remapped; v19: no kind 3, a
+    16-byte postcode centroid, whose file merges instead)
   stride=0xFA (v8): parallel delta for a per-record side file (way_parents,
     way_postcodes, addr_postcodes, interp_postcodes), rebuilt along its
     parent's merge: parent_file_id u32, value_stride u32 = 4, remap_kind u32,
@@ -590,10 +636,10 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
     without the moved strings past the pairs' cap, v12), INSERT takes the next
     inserted value, DELETE skips one; then the changes overwrite positions
     of the new file. A parent sent unchanged counts as one MATCH.
-  stride=0xFB: cell list delta for <name>_cells.bin + <name>_entries.bin
-    (payload_size u64, new entries size u64, then the cell list delta from
-    the old index to the new one: see Cell List Delta below)
-  otherwise (a record stride, at most 0xFF, MAX_RECORD_STRIDE): n_runs (u32)
+  stride=0xFB: none since v19 (to v18 a cell list delta of the postcode
+    centroid index): the patcher refuses it as a record stride ("Malformed
+    record stride: <file>"), with 0xFE and 0xFF
+  otherwise (a record stride, at most 0xF9, MAX_RECORD_STRIDE): n_runs (u32)
     + n_values (u32) + runs_size (u32) + values_size (u32) + runs + values
     + n_string_fixups (u32, v12) + string_fixups_size (u32) + string fixups
     + seq_size (u64) + merge ops
@@ -620,6 +666,20 @@ Per-file section: file_id (u32) + stride (u32) + old_size (u64) + new_size (u64)
   Order (v8): street ways and nodes, interp ways and nodes, then addr
   points, whose parent_way_id the patcher moves through the street replay's
   remap.
+  (v19) The postcode centroids merge as their logical rows (20 bytes:
+  lat, lng, postcode_id, country code, 0, the cell's key, as
+  `src/postcode_files.h` lays a LogicalCentroid out) under
+  `postcode_centroids.bin`'s id, right after the place nodes' section,
+  postcode_id a string field the string remap and string fixups move. Every
+  patch carries the section, an empty merge where neither day has the
+  files; a dir that gets its first centroid or loses its last merges as any
+  other day (one INSERT or one DELETE), and one of no centroid is the
+  footer alone and an empty cells file on its side. The patcher decodes
+  the old files strictly, refusing a block the encoder would not write, and
+  encodes the new rows as `postcode_centroids.bin` and
+  `postcode_centroid_cells.bin`, whose sizes the client list gives; a
+  family sent unchanged is copied as its files sit. The content merge sends
+  a centroid whose point moved as a DELETE and an INSERT.
   A child stream (street_nodes, interp_nodes, addr_vertices, poi_vertices,
   in the section right after its parent's) replays along its parent by
   position: its MATCH bytes are the old bytes of the parent records at the
@@ -706,7 +766,8 @@ Geo Entry Deltas (street / addr / interp lists): marker 0xFFFFFFF0 (u32)
   name cells and ids, not where the files keep them, so they are the same
   whatever the layout.
 
-Cell List Delta (v15; the payload of stride=0xFB and of a Cell Index Delta):
+Cell List Delta (v15; the payload of a Cell Index Delta, and to v18 of
+stride=0xFB):
   runs over the ranks of the cells, every number a varint (LEB128, a u64; an
   id's a u32). The source is the index the delta corrects (the old one, or
   the rebuilt admin / POI index); a cell's rank is its place among its
@@ -756,7 +817,9 @@ Every section names its file by id (`PatchFileId`, `tools/patch_format.h`). v14
 gives ids 7, 26 and 27 to the admin arc files: they named `admin_vertices.bin`
 and the postal files, which no build writes any more. The geo index's GXT2
 layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
-9 to 11 its three lists, which the geo entry deltas name.
+9 to 11 its three lists, which the geo entry deltas name. v19 merges the
+postcode centroids under id 23, and ids 24 and 25 name no file: the patcher
+writes the cells file beside the centroids, and the entries file is gone.
 
 | Id | File | How it travels |
 |----|------|----------------|
@@ -779,8 +842,8 @@ layout (build 19) keeps v15's sections: id 35 names its blocks file, and ids
 | 20 | `admin_parents.bin` | sparse delta, remap kind 0 (v14; was 1) |
 | 21 | `way_parents.bin` | parallel delta along street_ways, remap kind 0 (v14; was 1) |
 | 22 | `way_postcodes.bin` | parallel delta along street_ways, remap kind 2 |
-| 23 | `postcode_centroids.bin` | sparse delta, remap kind 3 |
-| 24, 25 | `postcode_centroid_cells.bin`, `postcode_centroid_entries.bin` | cell list delta (stride 0xFB), or whole |
+| 23 | `postcode_centroids.bin` | merge of the postcode centroid files' logical rows (`builder/src/postcode_files.h`, decoded) at stride 20 (v19; was a sparse delta, remap kind 3), string field `postcode_id`; the patcher encodes `postcode_centroids.bin` and `postcode_centroid_cells.bin` from them, whose sizes the client list gives |
+| 24, 25 | none (v19; were `postcode_centroid_cells.bin` and `postcode_centroid_entries.bin`, a cell list delta) | never: a section naming either is refused ("Unknown file 24") |
 | 26 | `arc_index.bin` | merge by slot at stride 4, the record its block's offset (v14; v13: `postal_polygons.bin`) |
 | 27 | `arc_vertices.bin` | child stream of arc_index, at stride 1 (v14; v13: `postal_vertices.bin`) |
 | 28 | `addr_vertices.bin` | child stream of addr_points, of the footprints' logical stream, at stride 2 (v18; was 1); whole in a dir whose address family has no record on either day |

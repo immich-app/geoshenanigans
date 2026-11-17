@@ -1,9 +1,9 @@
-//! The cell pair indexes, the admin, POI and postcode centroid indexes: each cell's sorted list of
-//! ids, in the cells file and the entries file the builder writes (builder/src/cell_pairs.h, which
-//! lays the format out); and the ranges kind, a cells file alone, each cell's rows of a file of
-//! rows in cell order. A lookup finds the cell's parent record through the parent bitmap, its
-//! rank among the parent's rows through the leaf, and decodes its list: a direct index's own list,
-//! or a block index's block up to the cell's row; or reads its range beside it.
+//! The cell pair indexes, the admin and POI indexes: each cell's sorted list of ids, in the cells
+//! file and the entries file the builder writes (builder/src/cell_pairs.h, which lays the format
+//! out); and the ranges kind, a cells file alone, each cell's rows of a file of rows in cell order
+//! (the postcode centroids'). A lookup finds the cell's parent record through the parent bitmap,
+//! its rank among the parent's rows through the leaf, and decodes its list: a direct index's own
+//! list, or a block index's block up to the cell's row; or reads its range beside it.
 
 use crate::FileBytes;
 use std::cell::Cell;
@@ -55,7 +55,6 @@ impl Format {
 
 pub const ADMIN: Format = Format { kind: Kind::Blocks, groups: true, gaps: Gaps::Varint };
 pub const POI: Format = Format { kind: Kind::Direct, groups: true, gaps: Gaps::GroupVarint };
-pub const POSTCODE_CENTROID: Format = Format { kind: Kind::Direct, groups: false, gaps: Gaps::Varint };
 pub const POSTCODE_CELLS: Format = Format { kind: Kind::Ranges, groups: false, gaps: Gaps::Varint };
 
 /// A cell pair index's two files, checked at open.
@@ -362,6 +361,33 @@ impl CellPairs {
         let c = self.cells.as_slice();
         let payload = at + 4 + LEAF_BYTES + 4 * rank;
         (rd32(c, payload), rd32(c, payload + 4))
+    }
+
+    /// Calls `f` with each cell of a ranges index and its rows, [first, end), in cell order (none
+    /// of an index of lists): the records, checked at open, read front to back.
+    pub fn for_each_range(&self, mut f: impl FnMut(u64, u32, u32)) {
+        let Some(l) = self.layout.as_ref().filter(|l| l.format.kind == Kind::Ranges) else { return };
+        let c = self.cells.as_slice();
+        let mut record = 0;
+        for w in 0..l.pwords {
+            let mut parents = rd64(c, l.pbits_at + 8 * w);
+            while parents != 0 {
+                let parent = (w * 64) as u64 + u64::from(parents.trailing_zeros());
+                parents &= parents - 1;
+                let at = rd32(c, l.dir_at + 4 * record) as usize;
+                record += 1;
+                let mut row = at + 4 + LEAF_BYTES;
+                for i in 0..LEAF_WORDS {
+                    let mut children = rd64(c, at + 4 + 8 * i);
+                    while children != 0 {
+                        let number = parent << (2 * LEAF_LEVELS) | (i * 64) as u64 | u64::from(children.trailing_zeros());
+                        children &= children - 1;
+                        f(number << l.shift | 1 << (l.shift - 1), rd32(c, row), rd32(c, row + 4));
+                        row += 4;
+                    }
+                }
+            }
+        }
     }
 
     /// The ids the cell lists, ascending.

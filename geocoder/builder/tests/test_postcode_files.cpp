@@ -331,7 +331,7 @@ TEST(the_decoder_refuses_files_the_encoder_doesnt_write) {
     refused({f.centroids, {}}, "rows past the last cell");
     std::vector<uint8_t> lists;
     cell_pairs::Writer w(
-        cell_pairs::POSTCODE_CENTROID, [&](const char* p, size_t n) { lists.insert(lists.end(), p, p + n); },
+        cell_pairs::POI, [&](const char* p, size_t n) { lists.insert(lists.end(), p, p + n); },
         [](const char*, size_t) {});
     const uint32_t id = 1;
     w.add(cell_pairs::cell_of(5, 10), &id, 1);

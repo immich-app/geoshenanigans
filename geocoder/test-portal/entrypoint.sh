@@ -41,7 +41,7 @@ selection_files() {
              interp_ways.bin interp_nodes.bin interp_postcodes.bin \
              admin_cells.bin admin_entries.bin admin_parents.bin \
              place_cells.bin place_hidden.bin place_nodes.bin \
-             postcode_centroids.bin postcode_centroid_cells.bin postcode_centroid_entries.bin \
+             postcode_centroids.bin postcode_centroid_cells.bin \
              way_parents.bin way_postcodes.bin \
              strings_core.bin strings_street.bin strings_addr.bin strings_postcode.bin; do
         echo "full $f"
@@ -88,7 +88,7 @@ fetch() {
 # postcode centroids): the template's optional files of mode full.
 optional_file() {
     case "$1" in
-        interp_postcodes.bin|postcode_centroids.bin|postcode_centroid_cells.bin|postcode_centroid_entries.bin)
+        interp_postcodes.bin|postcode_centroids.bin|postcode_centroid_cells.bin)
             return 0 ;;
     esac
     return 1

@@ -34,6 +34,7 @@ pub mod way_files;
 pub use addr_files::{AddrFiles, AddrRecord};
 pub use place_files::PlaceFiles;
 pub use poi_files::PoiRecords;
+pub use postcode_files::PostcodeFiles;
 pub use side_blocks::SideBlocks;
 pub use way_files::{WayFiles, WayRow};
 #[cfg(test)]
@@ -284,16 +285,6 @@ impl PoiRecord {
     pub fn is_polygon(&self) -> bool {
         self.vertex_offset != NO_DATA
     }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct PostcodeCentroid {
-    pub lat: f32,
-    pub lng: f32,
-    pub postcode_id: u32,
-    pub country_code: u16,
-    pub _pad: u16,
 }
 
 /// A place node as place_files.rs reads it from its row.
@@ -980,8 +971,9 @@ pub struct Index {
     pub admin_parents: Option<FileBytes>,   // u32 per poly → next-larger containing admin poly
     pub addr_postcodes: Option<SideBlocks>, // per addr_point → postcode string (optional)
     pub way_postcodes: Option<SideBlocks>,  // per way → postcode string from postal boundary
-    pub postcode_centroids: Option<FileBytes>,
-    pub postcode_centroid_index: Option<CellPairs>,
+    /// The postcode centroids: postcode_centroids.bin and postcode_centroid_cells.bin
+    /// (postcode_files.rs).
+    pub postcode_centroids: Option<PostcodeFiles>,
     pub admin_config: AdminLevelConfig,
     pub strings: StringPool,
     pub street_cell_level: u64,
@@ -1222,6 +1214,11 @@ fn load_side(dir: &str, name: &str, parent: &str, records: Option<u64>) -> Resul
     }
 }
 
+thread_local! {
+    /// The blocks of a postcode centroid lookup (PostcodeFiles::blocks_near), kept for the next.
+    static NEAR_BLOCKS: std::cell::RefCell<Vec<postcode_files::NearBlock>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 impl Index {
     pub fn load(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Self, String> {
         // Distance budget used by the primary-feature selection. The
@@ -1263,9 +1260,15 @@ impl Index {
             mmap_group(dir, &["poi_cells.bin", "poi_entries.bin", "poi_records.bin", "poi_vertices.bin"])?
                 .try_into().map_err(|_| "poi group arity")?;
         let places = load_places(dir)?;
-        let [postcode_centroids, postcode_centroid_cells, postcode_centroid_entries]: [Option<FileBytes>; 3] =
-            mmap_group(dir, &["postcode_centroids.bin", "postcode_centroid_cells.bin", "postcode_centroid_entries.bin"])?
+        let [postcode_centroids, postcode_centroid_cells]: [Option<FileBytes>; 2] =
+            mmap_group(dir, &[postcode_files::CENTROIDS_FILE, postcode_files::CELLS_FILE])?
                 .try_into().map_err(|_| "centroid group arity")?;
+        let postcode_centroids = match (postcode_centroids, postcode_centroid_cells) {
+            (Some(centroids), Some(cells)) => {
+                Some(PostcodeFiles::open(centroids, cells, admin_cell_level).map_err(|e| format!("{dir}: {e}"))?)
+            }
+            _ => None,
+        };
         // A cell pair index (cell_pairs.rs) of the dir, an error naming its cells file.
         let pairs = |prefix: &str, cells: FileBytes, entries: FileBytes, format: cell_pairs::Format| {
             CellPairs::open(cells, entries, format, admin_cell_level).map_err(|e| format!("{dir}/{prefix}_cells.bin: {e}"))
@@ -1274,10 +1277,6 @@ impl Index {
             poi_records.map(|f| PoiRecords::open(f).map_err(|e| format!("{dir}/poi_records.bin: {e}"))).transpose()?;
         let poi_index = match (poi_cells, poi_entries) {
             (Some(c), Some(e)) => Some(pairs("poi", c, e, cell_pairs::POI)?),
-            _ => None,
-        };
-        let postcode_centroid_index = match (postcode_centroid_cells, postcode_centroid_entries) {
-            (Some(c), Some(e)) => Some(pairs("postcode_centroid", c, e, cell_pairs::POSTCODE_CENTROID)?),
             _ => None,
         };
         let admin_index = pairs("admin", mmap_file(&format!("{}/admin_cells.bin", dir))?,
@@ -1312,7 +1311,6 @@ impl Index {
             addr_postcodes,
             way_postcodes,
             postcode_centroids,
-            postcode_centroid_index,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::load(dir)?,
             street_cell_level,
@@ -1373,13 +1371,6 @@ impl Index {
         // The builder ships no unnamed POI, so a nameless record is a tombstone.
         if pr.name_id == NO_DATA { return None; }
         Some(pr)
-    }
-
-    pub fn postcode_centroid(&self, idx: u32) -> Option<PostcodeCentroid> {
-        let m = self.postcode_centroids.as_ref()?;
-        let total = m.len() / std::mem::size_of::<PostcodeCentroid>() as u64;
-        if (idx as u64) >= total { return None; }
-        Some(m.read_at::<PostcodeCentroid>(idx as u64))
     }
 
     /// The records admin_polygons.bin holds, tombstones included.
@@ -2712,7 +2703,7 @@ impl Index {
         f.get(u32::try_from(idx).ok()?).filter(|&v| v != NO_DATA)
     }
 
-    pub fn resolve_postcode(&self, lat: f64, lng: f64, street: Option<(usize, &WayRow)>, addr: Option<(usize, &AddrRecord)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, country_code: Option<[u8; 2]>) -> Option<Cow<'_, str>> {
+    pub fn resolve_postcode<'a>(&'a self, lat: f64, lng: f64, street: Option<(usize, &WayRow)>, addr: Option<(usize, &AddrRecord)>, poi: Option<&PoiRecord>, interp: Option<(usize, f64, &str)>, country_code: Option<[u8; 2]>) -> Option<Cow<'a, str>> {
         // 0. Nearest addr_point's own postcode (from addr_postcodes.bin)
         // Matches Nominatim's token_get_postcode — the feature's own
         // addr:postcode tag is the highest-priority source.
@@ -2782,45 +2773,38 @@ impl Index {
         let country_gate: Option<u16> = country_code.map(|cc| {
             (cc[0] as u16) << 8 | (cc[1] as u16)
         });
-        if let Some(ref pc_mmap) = self.postcode_centroids {
-            let total_centroids = pc_mmap.len() / std::mem::size_of::<PostcodeCentroid>() as u64;
+        if let Some(files) = &self.postcode_centroids {
             // 0.05 deg ~ 5.5km, get_nearest_postcode's radius before Nominatim 5.3
             let max_dist_sq = (0.05_f64).to_radians().powi(2);
             let cos_lat = lat.to_radians().cos();
-            let mut best: Option<(f64, Cow<'_, str>)> = None;
-            let mut consider = |pc: PostcodeCentroid| {
+            let mut best: Option<(f64, Cow<'a, str>)> = None;
+            let consider = |pc: postcode_files::Centroid, best: &mut Option<(f64, Cow<'a, str>)>| {
                 if let Some(cc) = country_gate {
                     if pc.country_code != 0 && pc.country_code != cc { return; }
                 }
-                let dlat = (lat - pc.lat as f64).to_radians();
-                let dlng = (lng - pc.lng as f64).to_radians();
-                let d = dlat * dlat + dlng * dlng * cos_lat * cos_lat;
+                let d = postcode_files::distance(lat, lng, cos_lat, pc.lat as f64, pc.lng as f64);
                 if d >= max_dist_sq { return; }
                 // A centroid farther than the best so far can't win (nearer_postcode), so its
                 // postcode isn't read.
                 if best.as_ref().is_some_and(|&(best_d, _)| d > best_d) { return; }
                 let s = self.get_string(pc.postcode_id);
                 if centroid_postcode_ok(&s) && nearer_postcode(d, &s, best.as_ref().map(|(bd, bs)| (*bd, &**bs))) {
-                    best = Some((d, s));
+                    *best = Some((d, s));
                 }
             };
-
-            if let Some(ref centroid_index) = self.postcode_centroid_index {
-                let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
-                let neighbors = cell_neighbors_at_level(cell, self.admin_cell_level);
-                for c in std::iter::once(cell).chain(neighbors.into_iter()) {
-                    centroid_index.for_each(c, |id| {
-                        if let Some(pc) = self.postcode_centroid(id) { consider(pc); }
-                    });
+            // The blocks of the centroids of the query's cell and its neighbours, the nearest box
+            // first: no centroid is nearer than its block's box, so a block whose box is farther
+            // than the best so far holds none that can win, and is left undecoded.
+            let cell = cell_id_at_level(lat, lng, self.admin_cell_level);
+            let mut cells = cell_neighbors_at_level(cell, self.admin_cell_level);
+            cells.push(cell);
+            NEAR_BLOCKS.with_borrow_mut(|near| {
+                files.blocks_near(&cells, lat, lng, max_dist_sq, near);
+                for n in near.iter() {
+                    if best.as_ref().is_some_and(|&(best_d, _)| n.d > best_d) { continue; }
+                    files.rows_of(n.block, n.rows, |_, pc| consider(pc, &mut best));
                 }
-            } else {
-                // Full-scan fallback when the cell index isn't loaded.
-                // O(N) but only triggers in admin-only deployments
-                // where N is small.
-                for i in 0..total_centroids as u32 {
-                    if let Some(pc) = self.postcode_centroid(i) { consider(pc); }
-                }
-            }
+            });
             return best.map(|(_, s)| s);
         }
 
@@ -3713,12 +3697,6 @@ mod query_tests {
         PlaceFiles::open(FileBytes::Owned(f.cells), FileBytes::Owned(f.nodes), FileBytes::Owned(f.hidden)).unwrap()
     }
 
-    fn u32s(out: &mut Vec<u8>, values: &[u32]) {
-        for v in values {
-            out.extend_from_slice(&v.to_le_bytes());
-        }
-    }
-
 
     /// An index of boundaries (in the admin cell of their centre) and place
     /// nodes only, without streets, POIs or countries, like Antarctica's.
@@ -3763,7 +3741,6 @@ mod query_tests {
             addr_postcodes: None,
             way_postcodes: None,
             postcode_centroids: None,
-            postcode_centroid_index: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, end, end, end, end, end]),
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,
@@ -3857,8 +3834,52 @@ mod query_tests {
         "2": {"name": "fountain", "max_distance": 500}, "60": {"name": "park", "max_distance": 500},
         "93": {"name": "island", "max_distance": 500}}"#;
 
+    /// The postcode centroid files of these centroids (lat, lng, postcode string id, country),
+    /// as the builder writes them, opened.
+    fn centroid_files(centroids: &[(f32, f32, u32, [u8; 2])]) -> PostcodeFiles {
+        let points: Vec<postcode_files::Centroid> = centroids.iter()
+            .map(|&(lat, lng, postcode_id, country)| postcode_files::Centroid { lat, lng, postcode_id, country_code: u16::from_be_bytes(country) })
+            .collect();
+        let (centroids, cells) = postcode_files::encode_points(&points, DEFAULT_ADMIN_CELL_LEVEL);
+        PostcodeFiles::open(FileBytes::Owned(centroids), FileBytes::Owned(cells), DEFAULT_ADMIN_CELL_LEVEL).unwrap()
+    }
+
+    /// An index of postcode centroids anywhere (lat, lng, postcode, country code or [0, 0]), its
+    /// strings their postcodes, one each.
+    fn centroids_at(centroids: &[(f32, f32, &str, [u8; 2])]) -> Index {
+        let mut strings = Vec::new();
+        let mut rows = Vec::new();
+        for &(lat, lng, postcode, country) in centroids {
+            rows.push((lat, lng, strings.len() as u32, country));
+            strings.extend_from_slice(postcode.as_bytes());
+            strings.push(0);
+        }
+        let end = strings.len() as u32;
+        Index {
+            postcode_centroids: Some(centroid_files(&rows)),
+            strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, end, end, end, end, end]),
+            ..index(&[], &[])
+        }
+    }
+
+    /// The postcode the centroid tier answers at (lat, lng) when reading every centroid's:
+    /// the nearest valid one of the country (or of none) within 0.05 degrees, as resolve_postcode
+    /// measures it, ties to the smaller postcode.
+    fn nearest_centroid<'a>(centroids: &[(f32, f32, &'a str, [u8; 2])], lat: f64, lng: f64, country: Option<[u8; 2]>) -> Option<&'a str> {
+        let cos_lat = lat.to_radians().cos();
+        centroids.iter()
+            .filter(|c| country.is_none_or(|cc| c.3 == [0, 0] || c.3 == cc))
+            .filter_map(|&(c_lat, c_lng, postcode, _)| {
+                let d = postcode_files::distance(lat, lng, cos_lat, c_lat as f64, c_lng as f64);
+                (d < 0.05_f64.to_radians().powi(2) && centroid_postcode_ok(postcode)).then_some((d, postcode))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(b.1)))
+            .map(|(_, postcode)| postcode)
+    }
+
     /// An index of point POIs (of POI_META's categories) and postcode centroids only, all in
-    /// `origin()`'s cell, so its cell lists hold them in record order.
+    /// `origin()`'s cell: its POI cell list holds the POIs in record order, and its centroids
+    /// are in the order given.
     fn pois_and_centroids(pois: &[Poi<'_>], centroids: &[Centroid<'_>]) -> Index {
         let own = cell_id_at_level(origin().0, origin().1, DEFAULT_ADMIN_CELL_LEVEL);
         let cell = |(lat, lng): (f64, f64)| {
@@ -3883,25 +3904,22 @@ mod query_tests {
             poi_pairs.push((cell((lat, lng)), id as u32));
         }
         let (records, vertices) = poi_files::encode(&records);
-        let (mut centroid_records, mut centroid_pairs) = (Vec::new(), Vec::new());
-        for (id, &(north, east, postcode, country)) in centroids.iter().enumerate() {
-            let (lat, lng) = at(north, east);
-            centroid_records.extend_from_slice(&(lat as f32).to_le_bytes());
-            centroid_records.extend_from_slice(&(lng as f32).to_le_bytes());
-            u32s(&mut centroid_records, &[string(postcode)]);
-            centroid_records.extend_from_slice(&u16::from_be_bytes(country).to_le_bytes());
-            centroid_records.extend_from_slice(&[0, 0]);
-            centroid_pairs.push((cell((lat, lng)), id as u32));
-        }
-        assert_eq!(centroid_records.len(), centroids.len() * std::mem::size_of::<PostcodeCentroid>());
+        // Each centroid's postcode a string of its own: in the cell, in postcode_id order, the
+        // centroids are in the order given.
+        let rows: Vec<(f32, f32, u32, [u8; 2])> = centroids.iter()
+            .map(|&(north, east, postcode, country)| {
+                let (lat, lng) = at(north, east);
+                cell((lat, lng));
+                (lat as f32, lng as f32, string(postcode), country)
+            })
+            .collect();
         let end = strings.len() as u32;
         Index {
             poi_index: Some(cell_pairs::from_pairs(poi_pairs, cell_pairs::POI)),
             poi_records: Some(PoiRecords::open(FileBytes::Owned(records)).unwrap()),
             poi_vertices: Some(FileBytes::Owned(vertices)),
             poi_meta: PoiMeta::from_json(POI_META),
-            postcode_centroids: Some(FileBytes::Owned(centroid_records)),
-            postcode_centroid_index: Some(cell_pairs::from_pairs(centroid_pairs, cell_pairs::POSTCODE_CENTROID)),
+            postcode_centroids: Some(centroid_files(&rows)),
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, end, end, end, end, end]),
             ..index(&[], &[])
         }
@@ -3932,9 +3950,96 @@ mod query_tests {
         assert_eq!(read, 3);
     }
 
+    /// 2,000 centroids of France 60 m apart in `origin()`'s cell, 32 a row from west to east and
+    /// the rows from south to north, so each block's rows are one row of them: the one at the
+    /// origin is the 1,009th.
+    fn centroid_grid(names: &[String]) -> Vec<Centroid<'_>> {
+        (0..2000).map(|k| ((k / 32) as f64 * 60.0 - 1860.0, (k % 32) as f64 * 60.0 - 960.0, names[k].as_str(), *b"fr")).collect()
+    }
+
+    #[test]
+    fn a_query_beside_one_of_many_centroids_decodes_only_the_blocks_as_near() {
+        let names: Vec<String> = (0..2000).map(|k| format!("{}", 10_000 + k)).collect();
+        let idx = pois_and_centroids(&[], &centroid_grid(&names));
+        let files = idx.postcode_centroids.as_ref().unwrap();
+        assert_eq!(files.rows(), 2000);
+        assert_eq!(files.cell_rows(cell_id_at_level(origin().0, origin().1, DEFAULT_ADMIN_CELL_LEVEL)), (0, 2000));
+
+        // 6 m east of the origin's centroid: its block's box holds the point, and every other
+        // block's box is 50 m or more away, farther than the centroid. Read alone, the block's
+        // centroids are read from the west: its postcode is the 17th read at most.
+        let (lat, lng) = at(0.0, 6.0);
+        let blocks_before = postcode_files::BLOCK_READS.with(|n| n.get());
+        let (postcode, read) = reads(|| idx.resolve_postcode(lat, lng, None, None, None, None, Some(*b"fr")));
+        let blocks = postcode_files::BLOCK_READS.with(|n| n.get()) - blocks_before;
+
+        assert_eq!(postcode.as_deref(), Some("11008"));
+        assert_eq!(blocks, 1);
+        assert!(read <= 17, "{read}");
+    }
+
+    #[test]
+    fn a_query_on_the_edge_of_a_blocks_box_answers_as_reading_every_centroid() {
+        // Each block's box: its corners and the middles of its sides, and the points a metre
+        // either side of them, nearest to a row of the block or of the next row of centroids.
+        let names: Vec<String> = (0..2000).map(|k| format!("{}", 10_000 + k)).collect();
+        let grid = centroid_grid(&names);
+        let idx = pois_and_centroids(&[], &grid);
+        let files = idx.postcode_centroids.as_ref().unwrap();
+        let all: Vec<(f32, f32, &str, [u8; 2])> = grid.iter().map(|&(north, east, postcode, country)| {
+            let (lat, lng) = at(north, east);
+            (lat as f32, lng as f32, postcode, country)
+        }).collect();
+        let metre = 1.0 / 6_371_000.0_f64.to_radians();
+        let mut queries = 0;
+        for b in 0..files.blocks() {
+            let [lat_lo, lat_hi, lng_lo, lng_hi] = files.block_box(b).unwrap();
+            assert!([lat_lo, lat_hi, lng_lo, lng_hi].iter().all(|side| side.is_finite()), "block {b}");
+            for lat in [lat_lo, (lat_lo + lat_hi) / 2.0, lat_hi] {
+                for lng in [lng_lo, (lng_lo + lng_hi) / 2.0, lng_hi] {
+                    for (dlat, dlng) in [(0.0, 0.0), (-metre, 0.0), (metre, 0.0), (0.0, -metre), (0.0, metre)] {
+                        let (lat, lng) = (lat + dlat, lng + dlng);
+                        let want = nearest_centroid(&all, lat, lng, Some(*b"fr"));
+                        assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, Some(*b"fr")).as_deref(), want, "({lat}, {lng}) block {b}");
+                        queries += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(queries, 63 * 45);
+    }
+
+    #[test]
+    fn a_query_beside_the_antimeridian_answers_as_reading_every_centroid() {
+        // Centroids a few hundred metres either side of the antimeridian, in the cells on both
+        // sides, which are each other's neighbours; resolve_postcode measures across it the long
+        // way round, so none answers from the other side.
+        let centroids: Vec<(f32, f32, &str, [u8; 2])> = vec![
+            (-16.75, 179.997, "F1", [0, 0]), (-16.751, 179.9995, "F2", [0, 0]), (-16.749, -179.998, "W1", [0, 0]),
+            (-16.75, -179.9995, "W2", [0, 0]), (-16.76, 179.96, "F3", [0, 0]), (-16.74, -179.97, "W3", [0, 0]),
+        ];
+        let cells: std::collections::BTreeSet<u64> = centroids.iter()
+            .map(|c| cell_id_at_level(c.0 as f64, c.1 as f64, DEFAULT_ADMIN_CELL_LEVEL))
+            .collect();
+        assert!(cells.len() >= 2);
+        let idx = centroids_at(&centroids);
+        let mut answered = 0;
+        for k in 0..=40 {
+            let lng = 179.98 + 0.001 * k as f64;
+            let lng = if lng > 180.0 { lng - 360.0 } else { lng };
+            for lat in [-16.76, -16.75, -16.7495, -16.74] {
+                let want = nearest_centroid(&centroids, lat, lng, None);
+                assert_eq!(idx.resolve_postcode(lat, lng, None, None, None, None, None).as_deref(), want, "({lat}, {lng})");
+                answered += usize::from(want.is_some());
+            }
+        }
+        assert_eq!(answered, 41 * 4);
+    }
+
     #[test]
     fn a_centroid_farther_than_the_best_so_far_leaves_its_postcode_unread() {
-        // Read in record order.
+        // One block, read in the order given (each postcode its own string, in postcode_id
+        // order).
         let idx = pois_and_centroids(&[], &[
             (1000.0, 0.0, "75001", *b"fr"),
             (2000.0, 0.0, "75002", *b"fr"),  // farther: not read
@@ -6362,6 +6467,8 @@ mod query_path_tests {
         way_postcodes: Vec<(u32, u32)>,
         addr_postcodes: Vec<(u32, u32)>,
         interp_postcodes: Vec<(u32, u32)>,
+        /// The postcode centroids, each one's point, postcode and country.
+        centroids: Vec<postcode_files::Centroid>,
     }
 
     impl TestIndex {
@@ -6538,6 +6645,14 @@ mod query_path_tests {
             self
         }
 
+        /// A postcode centroid of Testland's country.
+        fn centroid(&mut self, postcode: &str, north_m: f64, east_m: f64) -> &mut Self {
+            let NodeCoord { lat, lng } = at_from(self.origin, north_m, east_m);
+            let postcode_id = self.string(postcode);
+            self.centroids.push(postcode_files::Centroid { lat, lng, postcode_id, country_code: self.polygons[0].0.country_code });
+            self
+        }
+
         /// The side files with a value set, each with its values: NO_DATA for every other record
         /// of the file it sits beside.
         fn side_values(&self) -> Vec<(&'static str, Vec<u32>)> {
@@ -6591,6 +6706,11 @@ mod query_path_tests {
                               (place_files::HIDDEN_FILE, places.hidden)]);
             }
 
+            if !self.centroids.is_empty() {
+                let (centroids, cells) = postcode_files::encode_points(&self.centroids, DEFAULT_ADMIN_CELL_LEVEL);
+                files.extend([(postcode_files::CENTROIDS_FILE, centroids), (postcode_files::CELLS_FILE, cells)]);
+            }
+
             if !(self.streets.is_empty() && self.addrs.is_empty() && self.interps.is_empty()) {
                 let rows: Vec<(u64, [Vec<u32>; geo_index::TABLES])> = self.geo_cells.iter()
                     .map(|(&cell, lists)| (cell, lists.clone().map(|mut ids| { ids.sort_unstable(); ids })))
@@ -6636,6 +6756,53 @@ mod query_path_tests {
 
     fn load_dir(dir: &std::path::Path) -> Index {
         Index::load(dir.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap()
+    }
+
+    #[test]
+    fn a_dir_holds_its_postcode_centroids_as_both_files_or_neither() {
+        // Two centroids in one admin cell and one 20 km south in another.
+        let mut dataset = TestIndex::new();
+        dataset.centroid("10115", 100.0, 0.0).centroid("10117", 2_000.0, 0.0).centroid("12049", -20_000.0, 0.0);
+        let dir = ScratchDir::new();
+        dataset.write(dir.path());
+        let idx = load_dir(dir.path());
+        assert_eq!(idx.postcode_centroids.as_ref().map(PostcodeFiles::rows), Some(3));
+        for (north, postcode) in [(0.0, "10115"), (2_100.0, "10117"), (-19_000.0, "12049")] {
+            assert_eq!(address_at(&idx, north, 0.0)["postcode"], postcode, "{north} m north");
+        }
+        // Nothing within 0.05 degrees (5.5 km) of the point.
+        assert_eq!(address_at(&idx, 10_000.0, 0.0)["postcode"], serde_json::Value::Null);
+
+        // Without either file the dir has no centroids; one without the other is refused.
+        let path = |name: &str| dir.path().join(name);
+        let (centroids, cells) = (std::fs::read(path(postcode_files::CENTROIDS_FILE)).unwrap(), std::fs::read(path(postcode_files::CELLS_FILE)).unwrap());
+        let load = || Index::load(dir.path().to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE);
+        std::fs::remove_file(path(postcode_files::CELLS_FILE)).unwrap();
+        assert!(load().err().unwrap().ends_with(&format!("missing [{}]", postcode_files::CELLS_FILE)));
+        std::fs::remove_file(path(postcode_files::CENTROIDS_FILE)).unwrap();
+        let without = load().unwrap();
+        assert!(without.postcode_centroids.is_none());
+        assert_eq!(address_at(&without, 0.0, 0.0)["postcode"], serde_json::Value::Null);
+        std::fs::write(path(postcode_files::CELLS_FILE), &cells).unwrap();
+        assert!(load().err().unwrap().ends_with(&format!("missing [{}]", postcode_files::CENTROIDS_FILE)));
+
+        // The files of no centroid: the footer alone and an empty cells file, which answer none.
+        std::fs::write(path(postcode_files::CENTROIDS_FILE), [0, 0, 0, 0, b'P', b'C', b'C', b'1']).unwrap();
+        std::fs::write(path(postcode_files::CELLS_FILE), []).unwrap();
+        let none = load().unwrap();
+        assert_eq!(none.postcode_centroids.as_ref().map(PostcodeFiles::rows), Some(0));
+        assert_eq!(address_at(&none, 0.0, 0.0)["postcode"], serde_json::Value::Null);
+
+        // Files no builder writes: 16-byte records without a footer, and the centroids' cells
+        // file beside another dir's centroids.
+        std::fs::write(path(postcode_files::CENTROIDS_FILE), [0u8; 32]).unwrap();
+        std::fs::write(path(postcode_files::CELLS_FILE), &cells).unwrap();
+        assert!(load().err().unwrap().contains("postcode_centroids.bin has no PCC1 footer"));
+        let (other, _) = postcode_files::encode_points(&dataset.centroids[..2], DEFAULT_ADMIN_CELL_LEVEL);
+        std::fs::write(path(postcode_files::CENTROIDS_FILE), other).unwrap();
+        assert!(load().err().unwrap().contains(postcode_files::CELLS_FILE));
+        std::fs::write(path(postcode_files::CENTROIDS_FILE), &centroids).unwrap();
+        assert_eq!(load().unwrap().postcode_centroids.as_ref().map(PostcodeFiles::rows), Some(3));
     }
 
     /// Testland with Oldtown, a village 1 km north and east of the origin, and Lowfield, a hamlet
@@ -7918,8 +8085,28 @@ mod query_path_tests {
         [(kind.ways_file(), records), (kind.nodes_file(), nodes)]
     }
 
-    /// The logical files of the dataset's street, interpolation, address and side files, by
-    /// name: a family's where `TestIndex::files` writes the family's.
+    /// The dataset's centroids as logical rows (builder postcode_files.h's LogicalCentroid), in
+    /// cell order, and the cells they are in.
+    fn logical_centroids(dataset: &TestIndex) -> (Vec<u8>, usize) {
+        let mut rows: Vec<(u32, u32, u16, f32, f32)> = dataset.centroids.iter()
+            .map(|c| ((cell_id_at_level(c.lat as f64, c.lng as f64, DEFAULT_ADMIN_CELL_LEVEL) >> 32) as u32, c.postcode_id, c.country_code, c.lat, c.lng))
+            .collect();
+        rows.sort_by_key(|r| (r.0, r.1, r.2));
+        let cells = rows.iter().map(|r| r.0).collect::<std::collections::BTreeSet<_>>().len();
+        let mut bytes = Vec::new();
+        for (cell_key, postcode_id, country_code, lat, lng) in rows {
+            bytes.extend(lat.to_le_bytes());
+            bytes.extend(lng.to_le_bytes());
+            bytes.extend(postcode_id.to_le_bytes());
+            bytes.extend(country_code.to_le_bytes());
+            bytes.extend([0, 0]);
+            bytes.extend(cell_key.to_le_bytes());
+        }
+        (bytes, cells)
+    }
+
+    /// The logical files of the dataset's street, interpolation, address, side and postcode
+    /// centroid files, by name: a family's where `TestIndex::files` writes the family's.
     fn logical_files(dataset: &TestIndex) -> BTreeMap<String, Vec<u8>> {
         let mut files: Vec<(&'static str, Vec<u8>)> = Vec::new();
         if !(dataset.streets.is_empty() && dataset.addrs.is_empty() && dataset.interps.is_empty()) {
@@ -7933,6 +8120,9 @@ mod query_path_tests {
             }
             let bytes = |values: Vec<u32>| values.iter().flat_map(|value| value.to_le_bytes()).collect();
             files.extend(dataset.side_values().into_iter().map(|(name, values)| (name, bytes(values))));
+        }
+        if !dataset.centroids.is_empty() {
+            files.push((postcode_files::CENTROIDS_FILE, logical_centroids(dataset).0));
         }
         files.into_iter().map(|(name, bytes)| (name.to_owned(), bytes)).collect()
     }
@@ -7974,14 +8164,14 @@ mod query_path_tests {
     }
 
     /// The families a dump reports, each by its first file.
-    const DUMP_FAMILIES: [&str; 7] = [
+    const DUMP_FAMILIES: [&str; 8] = [
         "street_ways.bin", "interp_ways.bin", "addr_points.bin",
-        "way_parents.bin", "way_postcodes.bin", "addr_postcodes.bin", "interp_postcodes.bin",
+        "way_parents.bin", "way_postcodes.bin", "addr_postcodes.bin", "interp_postcodes.bin", "postcode_centroids.bin",
     ];
 
     /// The report of a dump in which no read disagreed with another: for each family what it
     /// read and how many of its reads gave nothing, and none of a family the dir is without.
-    fn dump_report(families: [Option<(String, u64)>; 7]) -> String {
+    fn dump_report(families: [Option<(String, u64)>; 8]) -> String {
         let (mut report, mut nothing) = (String::new(), 0);
         for (file, family) in DUMP_FAMILIES.iter().zip(families) {
             report += &match family {
@@ -7996,7 +8186,7 @@ mod query_path_tests {
     }
 
     /// What a dump reports of the dataset's families, every read giving its record.
-    fn whole_dump_report(dataset: &TestIndex) -> [Option<(String, u64)>; 7] {
+    fn whole_dump_report(dataset: &TestIndex) -> [Option<(String, u64)>; 8] {
         let ways = |ways: &[Way]| {
             let nodes: usize = ways.iter().map(|way| way.nodes.len()).sum();
             (format!("{} ways, {nodes} nodes", ways.len()), 0)
@@ -8010,6 +8200,8 @@ mod query_path_tests {
             (!dataset.interps.is_empty()).then(|| ways(&dataset.interps)),
             (!dataset.addrs.is_empty()).then(|| (format!("{} records, {footprints} footprints", dataset.addrs.len()), 0)),
             side("way_parents.bin"), side("way_postcodes.bin"), side("addr_postcodes.bin"), side("interp_postcodes.bin"),
+            (!dataset.centroids.is_empty())
+                .then(|| (format!("{} centroids in {} cells", dataset.centroids.len(), logical_centroids(dataset).1), 0)),
         ]
     }
 
@@ -8028,8 +8220,9 @@ mod query_path_tests {
     /// among the others; streets of one node, of two and of as many as a way's count holds;
     /// interpolations of every type, one counting down; addresses that are nodes, closed and
     /// open outlines, a single vertex, a building kilometres from its point and an outline of
-    /// more vertices than a blob holds; one before any street; and each side file with values
-    /// for some of its records.
+    /// more vertices than a blob holds; one before any street; each side file with values for
+    /// some of its records; and postcode centroids, a cell of one, cells of a block's worth either
+    /// side of 32 and one of hundreds, of two countries, a postcode of both.
     fn every_kind_of_record() -> TestIndex {
         let mut dataset = TestIndex::new();
         dataset.address("1", -500.0, 0.0).dead_street().dead_interpolation();
@@ -8074,6 +8267,13 @@ mod query_path_tests {
         // No cell lists the long street: the dump reads it by its id.
         let name_id = dataset.string("Long Road");
         dataset.streets.push(Way { name_id, nodes: (0..65_535).map(|i| at(2000.0, f64::from(i))).collect(), numbers: (0, 0, 0) });
+        for (cell, (count, north)) in [(1, 0.0), (31, 15_000.0), (33, 30_000.0), (300, -15_000.0)].into_iter().enumerate() {
+            for k in 0..count {
+                dataset.centroid(&format!("{}", 10_000 * (cell + 1) + k), north + f64::from(k as u32 % 20) * 30.0, f64::from(k as u32 / 20) * 30.0);
+            }
+        }
+        let shared = dataset.centroids[5];
+        dataset.centroids.push(postcode_files::Centroid { lat: shared.lat + 0.0001, country_code: u16::from_be_bytes(*b"yy"), ..shared });
         dataset
     }
 
@@ -8094,16 +8294,19 @@ mod query_path_tests {
         let dump = dump_of(dir.path());
         assert_eq!((dump.status, dump.errors.as_str()), (0, ""));
         let want = logical_files(&dataset);
-        assert_eq!(want.len(), 10);
+        assert_eq!(want.len(), 11);
         assert_dumped(&dump, &want, &[]);
         assert_eq!(dump.report, dump_report(whole_dump_report(&dataset)));
         let lines: Vec<&str> = dump.report.lines().collect();
-        assert_eq!(lines.len(), 8);
+        assert_eq!(lines.len(), 9);
         assert_eq!(lines[0], "street_ways.bin: 44 ways, 65616 nodes, 0 reads gave nothing, 0 disagreed");
         assert_eq!(lines[1], "interp_ways.bin: 43 ways, 82 nodes, 0 reads gave nothing, 0 disagreed");
         assert_eq!(lines[2], "addr_points.bin: 1205 records, 803 footprints, 0 reads gave nothing, 0 disagreed");
         assert_eq!(lines[6], "interp_postcodes.bin: 43 values, 0 reads gave nothing, 0 disagreed");
-        assert_eq!(lines[7], "0 reads gave nothing, 0 disagreed");
+        let cells = logical_centroids(&dataset).1;
+        assert!(cells >= 4);
+        assert_eq!(lines[7], format!("postcode_centroids.bin: 366 centroids in {cells} cells, 0 reads gave nothing, 0 disagreed"));
+        assert_eq!(lines[8], "0 reads gave nothing, 0 disagreed");
 
         // The dir is one the server answers from.
         let address = address_at(&load_dir(dir.path()), 4.0, -148.0);
@@ -8175,13 +8378,16 @@ mod query_path_tests {
         let want = BTreeMap::from([(addr_files::POINTS_FILE.to_owned(), points), (addr_files::VERTICES_FILE.to_owned(), vertices)]);
         assert_dumped(&dump, &want, &[]);
         let read = Some(("11 records, 9 footprints".to_owned(), 0));
-        assert_eq!(dump.report, dump_report([None, None, read, None, None, None, None]));
+        assert_eq!(dump.report, dump_report([None, None, read, None, None, None, None, None]));
     }
 
-    /// `two_of_each` with a building, the third address.
+    /// `two_of_each` with a building, the third address, and 40 postcode centroids in a cell.
     fn two_of_each_and_a_building() -> TestIndex {
         let mut dataset = two_of_each();
         dataset.building("11", (1040.0, 10.0, 1050.0, 20.0));
+        for k in 0..40 {
+            dataset.centroid(&format!("{}", 1000 + k), 2000.0 + f64::from(k) * 20.0, 0.0);
+        }
         dataset
     }
 
@@ -8228,6 +8434,16 @@ mod query_path_tests {
             let dump = damaged(name, 0, |_| 7, 3 + family, (&format!("{values} values"), values as u64));
             assert_dumped(&dump, &want, &[(name, vec![0; 4 * values])]);
         }
+        // The first block of centroids with its bits past the file (the top byte of its entry's
+        // offset): none of its 32 rows reads, in the run or whole, and each is written as zeros.
+        let centroids = postcode_files::CENTROIDS_FILE;
+        let size = dataset.files().into_iter().find(|(name, _)| *name == centroids).unwrap().1.len();
+        // Two blocks, their entries of 29 bytes before the footer's 8.
+        let read = format!("40 centroids in {} cells", logical_centroids(&dataset).1);
+        let dump = damaged(centroids, size - 8 - 2 * 29 + 15, |_| 0xFF, 7, (&read, 64));
+        let mut first_zeros = vec![0; 32 * 20];
+        first_zeros.extend(&want[centroids][32 * 20..]);
+        assert_dumped(&dump, &want, &[(centroids, first_zeros)]);
 
         // The reads of every family that gave nothing are counted together.
         let dump = dump_after(&dataset, |dir| {
@@ -8267,6 +8483,10 @@ mod query_path_tests {
         assert_eq!(without(&["street_ways.bin", "street_nodes.bin", "way_parents.bin"]), "way_postcodes.bin without street_ways.bin");
         assert_eq!(without(&[points, vertices, index]), format!("addr_postcodes.bin without {points}"));
         assert_eq!(without(&["interp_ways.bin", "interp_nodes.bin"]), "interp_postcodes.bin without interp_ways.bin");
+        // One file of the postcode centroids' pair.
+        let (centroids, cells) = (postcode_files::CENTROIDS_FILE, postcode_files::CELLS_FILE);
+        assert_eq!(without(&[centroids]), format!("{cells} without {centroids}"));
+        assert_eq!(without(&[cells]), format!("{centroids} without {cells}"));
         for (name, parent) in SIDE_FILES {
             let records = if parent == points { 3 } else { 2 };
             let said = refusal(&|dir| std::fs::write(dir.join(name), side_blocks::encode(&[5; 4])).unwrap());
@@ -8278,6 +8498,7 @@ mod query_path_tests {
         assert_eq!(fixed_width("interp_nodes.bin"), "interp_nodes.bin has no IWN1 footer");
         assert_eq!(fixed_width(points), "addr_points.bin has no ADB1 footer");
         assert_eq!(fixed_width("way_parents.bin"), "way_parents.bin has no SDB1 footer");
+        assert_eq!(fixed_width(postcode_files::CENTROIDS_FILE), "postcode_centroids.bin has no PCC1 footer");
         // A dir that is not there.
         assert!(refusal(&|dir| std::fs::remove_dir_all(dir).unwrap()).ends_with(" is not a dir"));
     }
@@ -8323,7 +8544,7 @@ mod query_path_tests {
         let admin = TestIndex::new();
         let dump = dump_after(&admin, |_| ());
         assert_eq!((dump.status, dump.errors.as_str(), dump.files.len()), (0, "", 0));
-        assert_eq!(dump.report, dump_report([None, None, None, None, None, None, None]));
+        assert_eq!(dump.report, dump_report([None, None, None, None, None, None, None, None]));
         assert!(dump.report.starts_with("street_ways.bin: none\ninterp_ways.bin: none\naddr_points.bin: none\nway_parents.bin: none\n"));
 
         // Streets alone, one with a postcode.
@@ -8445,7 +8666,7 @@ mod admin_scan_tests {
             poi_meta: PoiMeta { categories: HashMap::new() },
             places: None,
             way_parents: None, admin_parents: None, addr_postcodes: None, way_postcodes: None,
-            postcode_centroids: None, postcode_centroid_index: None,
+            postcode_centroids: None,
             admin_config: AdminLevelConfig::load(),
             strings: StringPool::from_parts([Some(strings::Tier::of_pool(&strings)), None, None, None, None], [0, len, len, len, len, len]),
             street_cell_level: DEFAULT_STREET_CELL_LEVEL,

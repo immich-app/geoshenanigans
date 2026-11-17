@@ -29,17 +29,6 @@ struct AddrPoint {
 };
 static_assert(sizeof(AddrPoint) == 28, "AddrPoint must be 28 bytes");
 
-// Postcode centroid: one per unique postcode string, stored in
-// postcode_centroids.bin. Matches Nominatim's location_postcode table.
-struct PostcodeCentroid {
-    float lat;
-    float lng;
-    uint32_t postcode_id;  // offset into strings.bin
-    uint16_t country_code;
-    uint16_t _pad = 0;
-};
-static_assert(sizeof(PostcodeCentroid) == 16, "PostcodeCentroid must be 16 bytes");
-
 struct InterpWay {
     uint32_t node_offset;
     uint16_t node_count;

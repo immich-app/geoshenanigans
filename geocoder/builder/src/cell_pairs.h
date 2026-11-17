@@ -1,10 +1,10 @@
-// The cell pair indexes: the admin, POI and postcode centroid indexes, each
-// a sorted list of ids per cell, in a cells file and an entries file that are
-// both written front to back in one pass, so the patcher rebuilds them with a
-// block in memory (Writer) from the old ones read the same way (Reader); and
-// the ranges kind, a cells file alone, the rows each cell holds of a file of
-// rows in cell order. No S2 here, so the tools and the unit tests can read
-// and write them.
+// The cell pair indexes: the admin and POI indexes, each a sorted list of
+// ids per cell, in a cells file and an entries file that are both written
+// front to back in one pass, so the patcher rebuilds them with a block in
+// memory (Writer) from the old ones read the same way (Reader); and the
+// ranges kind, a cells file alone, the rows each cell holds of a file of rows
+// in cell order (the postcode centroids'). No S2 here, so the tools and the
+// unit tests can read and write them.
 //
 // <prefix>_cells.bin, the cells file:
 //   header, 8 bytes: "GCP1", the kind (1 blocks, 2 direct, 3 ranges), flags
@@ -102,13 +102,11 @@ struct Format {
     bool operator==(const Format& o) const { return kind == o.kind && groups == o.groups && gaps == o.gaps; }
 };
 // Admin cells list a few polygons each, much like their neighbours': blocks
-// of 8 rows, each list against the one before. POI and postcode centroid
-// cells are read nine at a time and list many ids: one list per row. A POI
-// list's gaps vary in length (planet poi/all: 22 ids a cell), which varints
-// decode slower than today's u32s; a postcode centroid list's are short and
-// alike, which they decode fastest.
-inline constexpr Format ADMIN{Kind::BLOCKS, true, Gaps::VARINT}, POI{Kind::DIRECT, true, Gaps::GROUP_VARINT},
-                        POSTCODE_CENTROID{Kind::DIRECT, false, Gaps::VARINT};
+// of 8 rows, each list against the one before. POI cells are read nine at a
+// time and list many ids: one list per row. A POI list's gaps vary in length
+// (planet poi/all: 22 ids a cell), which varints decode slower than
+// today's u32s.
+inline constexpr Format ADMIN{Kind::BLOCKS, true, Gaps::VARINT}, POI{Kind::DIRECT, true, Gaps::GROUP_VARINT};
 // The postcode centroids are in cell order, so a cell's are a range of rows.
 inline constexpr Format POSTCODE_CELLS{Kind::RANGES, false, Gaps::VARINT};
 

@@ -29,6 +29,7 @@
 #include "place_claims.h"
 #include "place_files.h"
 #include "polygon_rings.h"
+#include "postcode_files.h"
 #include "postcode_validation.h"
 #include "ranked_bits.h"
 #include "record_files_io.h"
@@ -450,12 +451,6 @@ void apply_strategy2_remaps(ParsedData& data, const std::string& prev_dir, RunOr
     for (auto& f : passes) f.get();
     if (!way_remap.empty())
         parallel_each(data.addr_points, [&](AddrPoint& ap) { remap_index(ap.parent_way_id, way_remap); });
-    // postcode_centroids: their stable identity is (country_code,
-    // postcode_string) and the centroid records get materialized from
-    // the unordered_map<postcode_id, PostcodeAccum> at write time, AFTER
-    // strategy-2 runs. Stability there is handled by deterministic
-    // sorting at write time + the existing postcode_id remap pipeline
-    // in geocoder-diff; revisit once the other types are validated.
 }
 
 // Find the level-2 (country) admin polygon covering (lat, lng) and return
@@ -602,6 +597,26 @@ void collect_postcode_centroids(ParsedData& data) {
     data.postcode_accum = std::move(osm);
 }
 
+// Writes centroids' postcode files into dir (postcode_files.h), the
+// centroids in their logical order; returns the cells they are in.
+static size_t write_postcode_files(const std::string& dir, const std::vector<postcode_files::LogicalCentroid>& centroids) {
+    std::vector<uint8_t> blocks, cells;
+    auto into = [](std::vector<uint8_t>& v) { return [&v](const uint8_t* p, size_t n) { v.insert(v.end(), p, p + n); }; };
+    postcode_files::Encoder enc(into(blocks), into(cells));
+    size_t cell_count = 0;
+    for (size_t i = 0; i < centroids.size(); i++) {
+        cell_count += i == 0 || centroids[i].cell_key != centroids[i - 1].cell_key;
+        enc.add(centroids[i]);
+    }
+    enc.finish();
+    for (const auto& entry : enc.table()) blocks.insert(blocks.end(), entry.begin(), entry.end());
+    const auto footer = enc.footer();
+    blocks.insert(blocks.end(), footer.begin(), footer.end());
+    write_binary_file(dir + "/" + postcode_files::CENTROIDS_FILE, reinterpret_cast<const char*>(blocks.data()), blocks.size());
+    write_binary_file(dir + "/" + postcode_files::CELLS_FILE, reinterpret_cast<const char*>(cells.data()), cells.size());
+    return cell_count;
+}
+
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode) {
     ensure_dir(output_dir);
     const std::string label = "      " + dir_label(output_dir) + ": ";
@@ -728,172 +743,50 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     // load from any mode/opt-in dir without cross-dir discovery.
     write_strings_layout(output_dir, data.strings_tier_bases);
 
-    // Write postcode centroid index (optional files)
-    // Validate each centroid's postcode against the country's pattern
-    // (matching Nominatim's clean_postcodes sanitizer).
-    // Centroids per (country, postcode) were collected once on the full
-    // data (collect_postcode_centroids); continents carry the entries
-    // whose centroid lies inside them.
+    // The postcode centroids (postcode_files.h), optional files: every
+    // (country, postcode) whose postcode passes the country's pattern
+    // (Nominatim's clean_postcodes sanitizer), in cell order. They were
+    // summed once on the full data (collect_postcode_centroids); continents
+    // carry the ones whose centroid lies inside them. A region with postcodes
+    // of which none passes gets the files of no centroid.
     if (!data.postcode_accum.empty()) {
         write_futures.push_back(std::async(std::launch::async, [&] {
             auto _pt = std::chrono::steady_clock::now();
             auto _pc = CpuTicks::now();
-            auto get_str = [&](uint32_t off) -> const char* {
-                return data.get_string(off);
-            };
-
-            // Build centroid vector with validation
-            std::vector<PostcodeCentroid> centroids;
+            std::vector<postcode_files::LogicalCentroid> centroids;
             centroids.reserve(data.postcode_accum.size());
             uint32_t rejected = 0;
             for (const auto& [pk, acc] : data.postcode_accum) {
                 if (acc.count == 0) continue;
-                uint16_t cc = postcode_key_cc(pk);
-                uint32_t pc_id = postcode_key_pc(pk);
-                char cc_str[3] = {
-                    static_cast<char>(std::tolower(cc >> 8)),
-                    static_cast<char>(std::tolower(cc & 0xFF)),
-                    0
-                };
-                const char* pc_str = get_str(pc_id);
-                if (!validate_postcode_for_country(cc_str, pc_str)) {
+                const uint16_t cc = postcode_key_cc(pk);
+                const uint32_t pc_id = postcode_key_pc(pk);
+                const char cc_str[3] = {static_cast<char>(std::tolower(cc >> 8)), static_cast<char>(std::tolower(cc & 0xFF)), 0};
+                if (!validate_postcode_for_country(cc_str, data.get_string(pc_id))) {
                     rejected++;
                     continue;
                 }
-                PostcodeCentroid c{};
+                postcode_files::LogicalCentroid c;
                 c.lat = static_cast<float>(acc.lat());
                 c.lng = static_cast<float>(acc.lng());
                 c.postcode_id = pc_id;
                 c.country_code = cc;
+                c.cell_key = postcode_files::cell_key(
+                    S2CellId(S2LatLng::FromDegrees(c.lat, c.lng)).parent(kAdminCellLevel).id());
                 centroids.push_back(c);
             }
             std::cerr << "Postcode centroids: " << centroids.size() << " valid, "
                       << rejected << " rejected by country pattern"
                       << " (from " << data.postcode_accum.size() << " country+postcode pairs)" << std::endl;
-            // Determinism: iterate-then-sort over `postcode_accum` (an
-            // unordered_map) produces a run-dependent insertion order.
-            // Sorting on postcode_id alone leaves collisions (same pc_id
-            // in different countries, e.g. "90012" in US and FR) in an
-            // undefined relative order — their lat/lng bits end up
-            // run-dependent. Tiebreak by country_code then by lat/lng
-            // for a total order.
+            // postcode_accum is an unordered_map, iterated in no fixed
+            // order; (country, postcode) is its key, so a cell holds one
+            // centroid of each and the order is total.
             std::sort(centroids.begin(), centroids.end(),
-                [](const PostcodeCentroid& a, const PostcodeCentroid& b) {
-                    if (a.postcode_id != b.postcode_id) return a.postcode_id < b.postcode_id;
-                    if (a.country_code != b.country_code) return a.country_code < b.country_code;
-                    uint32_t la, lb, ga, gb;
-                    std::memcpy(&la, &a.lat, 4); std::memcpy(&lb, &b.lat, 4);
-                    if (la != lb) return la < lb;
-                    std::memcpy(&ga, &a.lng, 4); std::memcpy(&gb, &b.lng, 4);
-                    return ga < gb;
-                });
-
-            // Strategy-2 stable IDs for postcode_centroids.
-            //
-            // Centroids aren't OSM entities — they're computed aggregates
-            // per (country_code, postcode_string) bucket. Their stable
-            // identity is that pair, which is exactly the ObjectType::POSTCODE
-            // case the IdAllocator was designed for. Without strategy-2
-            // here, the sorted-by-postcode_id ordering shifts day-over-day
-            // (postcode_id is a string offset that moves with string-pool
-            // reorganization, and any postcode insertion/deletion cascades
-            // subsequent indices), and postcode_centroid_entries.bin
-            // inflates the patch with shifted IDs.
-            //
-            // The cell index below is built AFTER reordering, so cell
-            // entries naturally point into the post-reorder layout — no
-            // separate cell remap needed.
-            //
-            // Identity = FNV-1a of (country_code, postcode_string). Pad
-            // to 56 bits and tag with ObjectType::POSTCODE.
-            {
-                using namespace gc::id_alloc;
-                IdAllocator alloc;
-                std::string prev_path;
-                // Locate previous-build sidecar by reversing the prev-vs-out
-                // dir mapping. write_index doesn't get prev_dir directly —
-                // strategy-2 ran in apply_strategy2_remaps with a per-region
-                // dir. Use the canonical /full/ subdir of the same region's
-                // previous output. output_dir ends in "/<region>/<mode>"; we
-                // need "<prev>/<region>/full". Synthesize via the env var
-                // build-index sets from --prev-output.
-                if (const char* prev_root = std::getenv("GC_PREV_OUTPUT_ROOT")) {
-                    // output_dir like ".../planet/full" → strip trailing
-                    // mode segment to get region root.
-                    std::string od = output_dir;
-                    auto last = od.find_last_of('/');
-                    if (last != std::string::npos) {
-                        std::string region = od.substr(0, last);
-                        auto reg_last = region.find_last_of('/');
-                        if (reg_last != std::string::npos) {
-                            std::string region_name = region.substr(reg_last + 1);
-                            prev_path = std::string(prev_root) + "/" + region_name +
-                                        "/full/postcode_centroids.osm_ids";
-                        }
-                    }
-                }
-                if (!prev_path.empty()) alloc.load_previous(prev_path);
-
-                auto fnv = [](const char* s, uint16_t cc) -> uint64_t {
-                    uint64_t h = FNV1A_OFFSET_BASIS;
-                    h ^= static_cast<uint64_t>(cc); h *= FNV1A_PRIME;
-                    if (s) for (; *s; s++) { h ^= static_cast<uint8_t>(*s); h *= FNV1A_PRIME; }
-                    return h & 0x00FFFFFFFFFFFFFFull;
-                };
-
-                const size_t n_old = centroids.size();
-                const std::vector<uint32_t> remap = alloc.allocate_all(n_old, [&](size_t i) {
-                    return SlotIdentity{ObjectType::POSTCODE,
-                                        fnv(get_str(centroids[i].postcode_id), centroids[i].country_code)};
-                });
-                const bool identity = is_identity(remap);
-                const uint32_t n_new = alloc.total_slots();
-
-                if (!(identity && n_new == n_old)) {
-                    PostcodeCentroid tomb_pc{};
-                    tomb_pc.postcode_id = NO_DATA;
-                    std::vector<PostcodeCentroid> reordered(n_new, tomb_pc);
-                    for (size_t i = 0; i < n_old; i++) reordered[remap[i]] = centroids[i];
-                    centroids = std::move(reordered);
-                }
-
-                std::cerr << "  strategy2 postcodes: " << alloc.live_count()
-                          << " live, " << alloc.tombstone_count()
-                          << " tombstones, " << n_new << " total" << std::endl;
-
-                // Emit sidecar (cached, not user-facing — same exclusion
-                // patterns as the others).
-                alloc.finalize();
-                IdAllocator::write_sidecar(
-                    output_dir + "/postcode_centroids.osm_ids",
-                    alloc.slots());
-            }
-
-            // Write flat centroid array (post-strategy-2 layout — slots in
-            // stable-idx order, with tombstones for indices whose previous
-            // occupant was deleted this build).
-            write_binary_file(output_dir + "/postcode_centroids.bin",
-                              reinterpret_cast<const char*>(centroids.data()),
-                              centroids.size() * sizeof(PostcodeCentroid));
-
-            // Build S2 cell index for spatial lookup. Skip tombstones —
-            // they have postcode_id = NO_DATA and bogus lat/lng (0,0)
-            // which would mis-cell. Cell entries only ever reference
-            // live indices, so the diff doesn't see cascade-shift on
-            // postcode_centroid_entries.bin.
-            std::unordered_map<uint64_t, std::vector<uint32_t>> centroid_cells;
-            for (uint32_t i = 0; i < centroids.size(); i++) {
-                if (centroids[i].postcode_id == NO_DATA) continue;
-                S2CellId cell = S2CellId(S2LatLng::FromDegrees(
-                    centroids[i].lat, centroids[i].lng)).parent(kAdminCellLevel);
-                centroid_cells[cell.id()].push_back(i);
-            }
-            write_cell_index(output_dir + "/postcode_centroid_cells.bin",
-                             output_dir + "/postcode_centroid_entries.bin",
-                             cell_pairs::POSTCODE_CENTROID, centroid_cells);
-
-            std::cerr << "postcode centroids: " << centroids.size() << " entries, "
-                      << centroid_cells.size() << " cells" << std::endl;
+                      [](const postcode_files::LogicalCentroid& a, const postcode_files::LogicalCentroid& b) {
+                          return std::tie(a.cell_key, a.postcode_id, a.country_code) <
+                                 std::tie(b.cell_key, b.postcode_id, b.country_code);
+                      });
+            const size_t cells = write_postcode_files(output_dir, centroids);
+            std::cerr << "postcode centroids: " << centroids.size() << " in " << cells << " cells" << std::endl;
             log_phase((label + "postcode centroids").c_str(), _pt, _pc);
         }));
     }

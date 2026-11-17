@@ -157,7 +157,7 @@ fn files_no_builder_writes_are_refused_at_open() {
     fewer[at..at + 4].copy_from_slice(&99u32.to_le_bytes());
     assert!(open2(&fewer, k, LEVEL).is_err());
     assert!(open2(c, k, LEVEL + 1).err().unwrap().contains("read at level 11"));
-    let (lists, _) = crate::cell_pairs::write(&[(cell_id_at_level(51.5, -0.12, LEVEL), vec![1])], crate::cell_pairs::POSTCODE_CENTROID);
+    let (lists, _) = crate::cell_pairs::write(&[(cell_id_at_level(51.5, -0.12, LEVEL), vec![1])], crate::cell_pairs::POI);
     assert!(open2(c, &lists, LEVEL).err().unwrap().contains("another kind of index"));
 }
 

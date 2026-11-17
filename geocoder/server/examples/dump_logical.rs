@@ -1,9 +1,10 @@
-// Writes the logical files of a build dir's street, interpolation, address
-// and side files, each record read through the readers the queries read it
-// through (way_files.rs, addr_files.rs, side_blocks.rs). They are the files
-// `geocoder-diff --decode-logical` writes for the dir through the builder's
-// decoders, byte for byte, so a dir whose dump differs from that, or from the
-// records the dir was built from, holds a record the server reads as another.
+// Writes the logical files of a build dir's street, interpolation, address,
+// side and postcode centroid files, each record read through the readers the
+// queries read it through (way_files.rs, addr_files.rs, side_blocks.rs,
+// postcode_files.rs). They are the files `geocoder-diff --decode-logical`
+// writes for the dir through the builder's decoders, byte for byte, so a dir
+// whose dump differs from that, or from the records the dir was built from,
+// holds a record the server reads as another.
 //
 //   cargo build --release --example dump_logical
 //   ./target/release/examples/dump_logical <build>/planet/full <out-dir>
@@ -17,6 +18,9 @@
 //                                       footprints' logical blobs back to back
 //   way_parents.bin, way_postcodes.bin, addr_postcodes.bin,
 //   interp_postcodes.bin                a u32 a record
+//   postcode_centroids.bin              a LogicalCentroid a centroid
+//                                       (builder/src/postcode_files.h), in
+//                                       their order, with its cell's key
 // A way's node_offset is the nodes of the ways before it (0 of a way without
 // nodes), a footprint's vertex_offset the bytes of the blobs before it in
 // units of addr_files::VERTEX_OFFSET_UNIT (NO_DATA of a point).
@@ -26,13 +30,18 @@
 // ids, as a cell's list is (AddrFiles::for_ids), and alone (record); a
 // building's footprint as its vertices (footprint), as its logical blob
 // (logical_blob) and as its count (vertex_count). Every side value is read by
-// its record's id (SideBlocks::get).
+// its record's id (SideBlocks::get). Every postcode centroid is read in a run
+// of its cell's rows, as a query reads a cell's (PostcodeFiles::for_rows), and
+// in its block read whole (rows_of); every cell's rows by the walk of the
+// cells file (for_each_cell) and by the cell (cell_rows).
 //
 // A line a family says what was read, how many reads gave nothing, and how
 // many disagreed: a row that counts other nodes than the way has, a first
 // node that is not the way's, a record that reads otherwise alone than in its
-// run, a footprint whose vertices or count are not its logical blob's. What a
-// read does not give is written as zeros, or as no nodes and no footprint.
+// run, a footprint whose vertices or count are not its logical blob's, a
+// centroid that reads otherwise in its block than in its run, a cell whose
+// rows read otherwise by the cell than in the walk. What a read does not give
+// is written as zeros, or as no nodes and no footprint.
 // The exit status is 0 where every read gave what the others did, 1 where one
 // did not, and 2 where nothing was dumped: no such dir, a dir with part of a
 // family (one file of a pair, some of the three address files, a side file
@@ -41,8 +50,12 @@
 //
 // A family is read on a thread of its own, a record at a time from the mapped
 // files into buffered ones, so the memory it takes does not grow with the dir.
+use query_server::postcode_files::{self, Centroid, BLOCK_ROWS};
 use query_server::way_files::Kind;
-use query_server::{addr_files, mmap_file, vertex_scale, AddrFiles, AddrRecord, FileBytes, NodeCoord, SideBlocks, WayFiles, WayRow, NO_DATA};
+use query_server::{
+    addr_files, mmap_file, vertex_scale, AddrFiles, AddrRecord, FileBytes, NodeCoord, PostcodeFiles, SideBlocks, WayFiles, WayRow,
+    DEFAULT_ADMIN_CELL_LEVEL, NO_DATA,
+};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::process::ExitCode;
@@ -150,6 +163,21 @@ fn ways(dir: &str, kind: Kind) -> Result<Option<WayFiles>, String> {
     }
 }
 
+/// The postcode centroid files of `dir`, at the cell level their cells file says (as the
+/// builder's decoder reads them); None where it has neither.
+fn centroids(dir: &str) -> Result<Option<PostcodeFiles>, String> {
+    let (centroids, cells) = (postcode_files::CENTROIDS_FILE, postcode_files::CELLS_FILE);
+    match (map(dir, centroids)?, map(dir, cells)?) {
+        (Some(c), Some(k)) => {
+            let level = k.as_slice().get(6).map_or(DEFAULT_ADMIN_CELL_LEVEL, |&level| u64::from(level));
+            PostcodeFiles::open(c, k, level).map(Some).map_err(|e| format!("{dir}: {e}"))
+        }
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(format!("{dir}: {centroids} without {cells}")),
+        (None, Some(_)) => Err(format!("{dir}: {cells} without {centroids}")),
+    }
+}
+
 /// The side file `name` of `dir`, which holds a value for each of the `records` of `parent`;
 /// None where the dir has no such file.
 fn side(dir: &str, name: &str, parent: &str, records: Option<u32>) -> Result<Option<SideBlocks>, String> {
@@ -163,7 +191,7 @@ fn side(dir: &str, name: &str, parent: &str, records: Option<u32>) -> Result<Opt
 }
 
 /// Dumps the families of `dir` into `out`, each on a thread of its own: what each read, the
-/// streets, the interpolations, the addresses and then each side file.
+/// streets, the interpolations, the addresses, each side file and then the postcode centroids.
 fn dump(dir: &str, out: &str) -> Result<Vec<Family>, String> {
     if !std::path::Path::new(dir).is_dir() {
         return Err(format!("{dir} is not a dir"));
@@ -178,6 +206,7 @@ fn dump(dir: &str, out: &str) -> Result<Vec<Family>, String> {
     for ((name, parent), records) in SIDE_FILES.into_iter().zip(records) {
         sides.push((name, side(dir, name, parent, records)?));
     }
+    let postcodes = centroids(dir)?;
     std::fs::create_dir_all(out).map_err(|e| format!("{out}: {e}"))?;
     if std::fs::read_dir(out).map_err(|e| format!("{out}: {e}"))?.next().is_some() {
         return Err(format!("{out} is not empty"));
@@ -191,6 +220,7 @@ fn dump(dir: &str, out: &str) -> Result<Vec<Family>, String> {
         for &(name, ref side) in &sides {
             threads.push(scope.spawn(move || dump_side(name, side.as_ref(), out)));
         }
+        threads.push(scope.spawn(|| dump_centroids(postcodes.as_ref(), out)));
         threads.into_iter().map(|thread| thread.join().unwrap_or_else(|_| Err("a family's read panicked".to_owned()))).collect()
     })
 }
@@ -382,6 +412,70 @@ fn dump_side(name: &'static str, side: Option<&SideBlocks>, out: &str) -> Result
     Ok(Family { file: name, read: Some((format!("{} values", side.count()), failed)) })
 }
 
+/// A centroid's fields, a float as its bits.
+fn centroid_fields(c: &Centroid) -> (u32, u32, u32, u16) {
+    (c.lat.to_bits(), c.lng.to_bits(), c.postcode_id, c.country_code)
+}
+
+/// The reads of a centroid that failed: the one in its cell's run, and the one in its block.
+fn centroid_tally(in_run: Option<&Centroid>, in_block: Option<&Centroid>) -> Tally {
+    Tally {
+        nothing: u64::from(in_run.is_none()) + u64::from(in_block.is_none()),
+        disagreed: u64::from(in_run.zip(in_block).is_some_and(|(a, b)| centroid_fields(a) != centroid_fields(b))),
+    }
+}
+
+/// A centroid's logical row with its cell's key.
+fn logical_centroid(c: &Centroid, cell_key: u32) -> [u8; 20] {
+    let mut row = [0u8; 20];
+    row[..4].copy_from_slice(&c.lat.to_bits().to_le_bytes());
+    row[4..8].copy_from_slice(&c.lng.to_bits().to_le_bytes());
+    row[8..12].copy_from_slice(&c.postcode_id.to_le_bytes());
+    row[12..14].copy_from_slice(&c.country_code.to_le_bytes());
+    row[16..].copy_from_slice(&cell_key.to_le_bytes());
+    row
+}
+
+/// Dumps the postcode centroids into postcode_centroids.bin of `out`, cell by cell.
+fn dump_centroids(files: Option<&PostcodeFiles>, out: &str) -> Result<Family, String> {
+    let name = postcode_files::CENTROIDS_FILE;
+    let Some(files) = files else { return Ok(Family { file: name, read: None }) };
+    let mut rows = Out::create(out, name)?;
+    let (mut cells, mut failed, mut written) = (0u64, Tally::default(), Ok(()));
+    let mut run: Vec<Option<Centroid>> = Vec::new();
+    // The block read whole last, and its rows.
+    let mut block: (u32, [Option<Centroid>; BLOCK_ROWS]) = (u32::MAX, [None; BLOCK_ROWS]);
+    files.for_each_cell(|cell, first, end| {
+        cells += 1;
+        failed.disagreed += u64::from(files.cell_rows(cell) != (first, end));
+        let cell_key = (cell >> 32) as u32;
+        let mut at = first;
+        while at < end && written.is_ok() {
+            let stop = at + RUN.min(end - at);
+            run.clear();
+            run.resize((stop - at) as usize, None);
+            files.for_rows(at, stop, |row, c| run[(row - at) as usize] = Some(c));
+            for (row, in_run) in (at..stop).zip(&run) {
+                let b = row / BLOCK_ROWS as u32;
+                if block.0 != b {
+                    block = (b, [None; BLOCK_ROWS]);
+                    files.rows_of(b, u32::MAX, |r, c| block.1[r as usize % BLOCK_ROWS] = Some(c));
+                }
+                let in_block = block.1[row as usize % BLOCK_ROWS];
+                failed.add(centroid_tally(in_run.as_ref(), in_block.as_ref()));
+                let logical = in_run.or(in_block).map_or([0; 20], |c| logical_centroid(&c, cell_key));
+                if written.is_ok() {
+                    written = rows.put(&logical);
+                }
+            }
+            at = stop;
+        }
+    });
+    written?;
+    rows.finish()?;
+    Ok(Family { file: name, read: Some((format!("{} centroids in {cells} cells", files.rows()), failed)) })
+}
+
 // The server's tests take this file in as a module (lib.rs): these run with them, and the
 // ones that dump a dataset's dir are there, beside the dataset.
 #[cfg(test)]
@@ -448,6 +542,30 @@ mod tests {
         let (zero, nan) = (AddrRecord { lat: 0.0, ..record }, AddrRecord { lng: f32::NAN, ..record });
         assert_eq!(record_tally(Some(&zero), Some(&AddrRecord { lat: -0.0, ..record })), tally(0, 1));
         assert_eq!(record_tally(Some(&nan), Some(&nan)), tally(0, 0));
+    }
+
+    #[test]
+    fn a_centroids_reads_fail_that_give_nothing_or_differ_in_any_field_and_its_row_holds_its_cells_key() {
+        let centroid = Centroid { lat: 51.5, lng: -0.12, postcode_id: 7, country_code: u16::from_be_bytes(*b"GB") };
+        assert_eq!(centroid_tally(Some(&centroid), Some(&centroid)), tally(0, 0));
+        assert_eq!(centroid_tally(None, Some(&centroid)), tally(1, 0));
+        assert_eq!(centroid_tally(Some(&centroid), None), tally(1, 0));
+        assert_eq!(centroid_tally(None, None), tally(2, 0));
+        for other in [
+            Centroid { lat: -0.0, ..centroid },
+            Centroid { lng: 0.12, ..centroid },
+            Centroid { postcode_id: 8, ..centroid },
+            Centroid { country_code: u16::from_be_bytes(*b"IE"), ..centroid },
+        ] {
+            assert_eq!(centroid_tally(Some(&centroid), Some(&other)), tally(0, 1), "{other:?}");
+        }
+        let nan = Centroid { lat: f32::NAN, ..centroid };
+        assert_eq!(centroid_tally(Some(&nan), Some(&nan)), tally(0, 0));
+        // lat, lng, postcode_id, the country code, two zero bytes and the cell's key.
+        let row = logical_centroid(&centroid, 0x4876_0000);
+        assert_eq!(&row[..4], &51.5f32.to_bits().to_le_bytes());
+        assert_eq!(&row[4..8], &(-0.12f32).to_bits().to_le_bytes());
+        assert_eq!(&row[8..], &[7, 0, 0, 0, b'B', b'G', 0, 0, 0, 0, 0x76, 0x48]);
     }
 
     /// A logical blob in `enc`: its bbox minimum and its vertices' steps from it.

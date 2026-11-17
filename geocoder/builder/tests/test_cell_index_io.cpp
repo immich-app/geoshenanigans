@@ -130,7 +130,7 @@ TEST(write_cell_index_sorted_matches_the_map_writer) {
         for (const auto& p : pairs) map[p.cell_id].push_back(p.item_id);
 
         CHECK_EQ(count_cells(pairs), map.size());
-        for (cell_pairs::Format format : {cell_pairs::ADMIN, cell_pairs::POI, cell_pairs::POSTCODE_CENTROID}) {
+        for (cell_pairs::Format format : {cell_pairs::ADMIN, cell_pairs::POI}) {
             write_cell_index(dir.path() + "/map_cells.bin", dir.path() + "/map_entries.bin", format, map);
             write_cell_index_sorted(dir.path() + "/cells.bin", dir.path() + "/entries.bin", format, pairs);
             CHECK(file_text(dir.path() + "/cells.bin") == file_text(dir.path() + "/map_cells.bin"));
@@ -158,7 +158,7 @@ TEST(write_cell_index_writers_write_the_cell_pair_files_of_their_lists) {
     for (const auto& p : pairs) map[p.cell_id].push_back(p.item_id);
     for (auto& [cell, ids] : map) std::shuffle(ids.begin(), ids.end(), rng);
 
-    for (cell_pairs::Format format : {cell_pairs::ADMIN, cell_pairs::POI, cell_pairs::POSTCODE_CENTROID}) {
+    for (cell_pairs::Format format : {cell_pairs::ADMIN, cell_pairs::POI}) {
         const auto [cells, entries] = write_cell_lists(lists, format);
         write_cell_index_sorted(dir.path() + "/cells.bin", dir.path() + "/entries.bin", format, pairs);
         CHECK(file_text(dir.path() + "/cells.bin") == std::string(cells.begin(), cells.end()));
