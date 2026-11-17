@@ -68,6 +68,43 @@ static void varint(uint64_t v) {
     printf("varint\t%" PRIu64 "\t%s\n", v, hex(std::vector<uint8_t>(b, b + n)).c_str());
 }
 
+static void dec4(uint32_t bits) {
+    int32_t k;
+    if (dec4_key(bits, k)) printf("dec4\t%08x\t%d,%d\n", bits, k, dec4_round(bits));
+    else printf("dec4\t%08x\t-,%d\n", bits, dec4_round(bits));
+}
+
+using Codes = std::vector<std::pair<uint32_t, uint32_t>>;  // z, k
+
+static void rice(const Codes& codes) {
+    uint64_t n = 0;
+    for (const auto& [z, k] : codes) n += rice_bits(z, k);
+    std::vector<uint8_t> buf((n + 7) / 8 + 8, 0);
+    std::string in;
+    uint64_t bit = 0;
+    for (const auto& [z, k] : codes) {
+        put_rice(buf.data(), bit, z, k);
+        char c[24];
+        snprintf(c, sizeof c, "%s%x:%u", in.empty() ? "" : ",", z, k);
+        in += c;
+    }
+    buf.resize(buf.size() - 8);
+    printf("rice\t%s\t%s\n", in.c_str(), hex(buf).c_str());
+}
+
+static void ricek(const std::vector<uint32_t>& z) {
+    const uint32_t k = best_rice_k(z.data(), z.size());
+    uint64_t bits = 0;
+    std::string in;
+    for (uint32_t v : z) {
+        bits += rice_bits(v, k);
+        char c[16];
+        snprintf(c, sizeof c, "%s%x", in.empty() ? "" : ",", v);
+        in += c;
+    }
+    printf("ricek\t%s\t%u,%" PRIu64 "\n", in.empty() ? "-" : in.c_str(), k, bits);
+}
+
 static void novarint(const std::vector<uint8_t>& b, size_t max_bytes) {
     size_t at = 0;
     uint64_t v;
@@ -91,8 +128,14 @@ int main() {
     printf("#             last byte filled with zero bits (hex)\n");
     printf("#   varint    a u64 (decimal): its LEB128 bytes (hex)\n");
     printf("#   novarint  bytes (hex): a limit; no varint of at most that many bytes, in its fewest, starts them\n");
+    printf("#   dec4      an f32 bit pattern (hex): its decimal key (decimal; - when it has none) and its\n");
+    printf("#             decimal round (decimal)\n");
+    printf("#   undec4    an i32 (decimal): the pattern it decodes to as a decimal key (hex)\n");
+    printf("#   rice      codes, z:k each (hex:decimal): the bytes they pack to, LSB first, the last byte\n");
+    printf("#             filled with zero bits (hex)\n");
+    printf("#   ricek     values (hex; - for none): the least Rice parameter of the fewest bits, and the bits\n");
     printf("# Each also holds backwards: a key gives its pattern, a zigzag its difference, the bytes their\n");
-    printf("# fields and their number. Regenerate with geocoder/testdata/gen_coord_vectors.cpp.\n");
+    printf("# fields, codes and their number. Regenerate with geocoder/testdata/gen_coord_vectors.cpp.\n");
     printf("kind\tin\tout\n");
 
     const uint32_t sign = 0x80000000u;
@@ -225,5 +268,84 @@ int main() {
     novarint({0x80, 0x80, 0x01}, 2);
     novarint({0xFF, 0xFF, 0x03}, 2);
     novarint({0x80, 0x01}, 1);
+
+    // Coordinates of four decimals and the floats beside them, zeros, the globe's edges, 1e-4,
+    // halves of 1e-4 (0.03125 and 0.09375 are 312.5 and 937.5 units), floats past 2^31 units,
+    // the infinities, NaNs and the largest floats.
+    const float four[] = {52.3702f, -0.1278f, 4.8952f, 151.2093f, -33.8688f, 1e-4f, -1e-4f, 180.0f, -180.0f, 90.0f, -90.0f};
+    for (float v : four) {
+        dec4(bits_of(v));
+        dec4(bits_of(v) + 1);
+        dec4(bits_of(v) - 1);
+    }
+    const uint32_t odd[] = {
+        0, sign, 1, sign | 1, bits_of(0.00005f), bits_of(-0.00005f), bits_of(0.03125f), bits_of(-0.03125f),
+        bits_of(0.09375f), bits_of(52.37025f), bits_of(214748.359375f), bits_of(214748.375f), bits_of(-214748.375f),
+        bits_of(1e30f), bits_of(-1e30f), bits_of(FLT_MAX), inf, inf | sign, 0x7FC00000, 0xFFC00000, 0x7FFFFFFF,
+    };
+    for (uint32_t b : odd) dec4(b);
+    for (int i = 0; i < 20; i++) {
+        // A coordinate of four decimals up to 180 in magnitude, and the float after it.
+        const int32_t units = int32_t(int64_t(rng() % 3600001) - 1800000);
+        dec4(from_dec4_key(units));
+        dec4(from_dec4_key(units) + 1);
+    }
+    for (int i = 0; i < 10; i++) {
+        const uint32_t any = uint32_t(rng());
+        dec4(any);
+    }
+    const int32_t dec_keys[] = {0, 1, -1, 1800000, -1800000, 2147483594, INT32_MAX, INT32_MIN};
+    for (int32_t k : dec_keys) printf("undec4\t%d\t%08x\n", k, from_dec4_key(k));
+    for (int i = 0; i < 4; i++) {
+        const int32_t k = int32_t(uint32_t(rng()));
+        printf("undec4\t%d\t%08x\n", k, from_dec4_key(k));
+    }
+
+    // Single codes at k 0, 5 and 31: q 0, 11 and 12 (an escape), z 0 and 2^32 - 1; then runs.
+    rice({{0, 0}});
+    rice({{11, 0}});
+    rice({{12, 0}});
+    rice({{0, 5}});
+    rice({{11u << 5 | 31, 5}});
+    rice({{12u << 5, 5}});
+    rice({{0, 31}});
+    rice({{0x7FFFFFFFu, 31}});
+    rice({{0xFFFFFFFFu, 31}});
+    rice({{0xFFFFFFFFu, 0}});
+    rice({{0xFFFFFFFFu, 5}});
+    rice({{0, 0}, {0, 0}, {0, 0}});
+    rice({{2, 1}, {0xFEDCBA98u, 3}});
+    rice({{12, 0}, {1, 0}, {0xFFFFFFFFu, 31}, {5, 2}});
+    for (int i = 0; i < 6; i++) {
+        Codes codes;
+        const size_t n = 1 + rng() % 20;
+        const uint32_t k = uint32_t(rng() % 32);
+        for (size_t c = 0; c < n; c++) {
+            const uint32_t shift = uint32_t(rng() % 32);
+            const uint32_t z = uint32_t(rng()) >> shift;
+            codes.push_back({z, k});
+        }
+        rice(codes);
+    }
+
+    ricek({});
+    ricek({0});
+    ricek({0, 0, 0});
+    ricek({0xFFFFFFFFu});
+    ricek({12});
+    ricek({2, 3});
+    ricek({1, 1, 1, 0x10000000u});
+    for (int i = 0; i < 8; i++) {
+        // Steps of a typical width, a few of them far wider.
+        std::vector<uint32_t> z(1 + rng() % 63);
+        const uint32_t typical = uint32_t(rng() % 25);
+        for (uint32_t& v : z) {
+            const bool wide = rng() % 10 == 0;
+            const uint32_t w = wide ? uint32_t(rng() % 33) : typical;
+            const uint32_t r = uint32_t(rng());
+            v = w == 0 ? 0 : r >> (32 - w);
+        }
+        ricek(z);
+    }
     return 0;
 }
