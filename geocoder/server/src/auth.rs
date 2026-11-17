@@ -4,9 +4,9 @@ use axum::http::HeaderMap;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use query_server::lower_hex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt::Write;
 use std::fs;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, RwLock};
@@ -160,11 +160,7 @@ pub fn check_rate(limiter: &RateLimiter, login: &str, rate_per_second: u32, rate
 fn random_hex(len: usize) -> String {
     let mut bytes = vec![0u8; len];
     getrandom::fill(&mut bytes).expect("getrandom failed");
-    let mut s = String::with_capacity(len * 2);
-    for b in &bytes {
-        write!(s, "{:02x}", b).unwrap();
-    }
-    s
+    lower_hex(&bytes)
 }
 
 pub fn get_session_cookie(headers: &HeaderMap) -> Option<String> {
