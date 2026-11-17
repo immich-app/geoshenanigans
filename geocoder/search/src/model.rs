@@ -259,22 +259,31 @@ pub fn encode_prefix_hits(out: &mut Vec<u8>, hits: &[PrefixHit]) {
     }
 }
 
+/// The hits of the prefix-table list at `off` (`encode_prefix_hits`), read within `buf`: those
+/// before a hit cut short or of an entity past 32 bits; none for a list of more hits than the
+/// table keeps (PREFIX_TABLE_TOP), which no build writes, or at an offset past the end.
 pub fn decode_prefix_hits(buf: &[u8], off: usize, out: &mut Vec<PrefixHit>) {
     let mut pos = off;
-    let n = varint::get(buf, &mut pos) as usize;
+    let Some(n) = varint::try_get(buf, &mut pos).filter(|&n| n <= PREFIX_TABLE_TOP as u64) else { return };
     for _ in 0..n {
-        let ep = varint::get(buf, &mut pos);
-        let text = buf[pos] as f32 / 255.0;
-        let imp_q = buf[pos + 1];
-        pos += 2;
-        let co = if ep & 2 != 0 {
-            pos += 1;
-            buf[pos - 1]
-        } else {
-            0
-        };
-        out.push(PrefixHit { entity: (ep >> 2) as u32, partial: ep & 1 == 1, text, imp_q, class: co >> 4, ord: co & 0x0F });
+        let Some(h) = read_prefix_hit(buf, &mut pos) else { return };
+        out.push(h);
     }
+}
+
+fn read_prefix_hit(buf: &[u8], pos: &mut usize) -> Option<PrefixHit> {
+    let ep = varint::try_get(buf, pos)?;
+    let entity = u32::try_from(ep >> 2).ok()?;
+    let (text, imp_q) = (*buf.get(*pos)?, *buf.get(*pos + 1)?);
+    *pos += 2;
+    let co = if ep & 2 != 0 {
+        let b = *buf.get(*pos)?;
+        *pos += 1;
+        b
+    } else {
+        0
+    };
+    Some(PrefixHit { entity, partial: ep & 1 == 1, text: text as f32 / 255.0, imp_q, class: co >> 4, ord: co & 0x0F })
 }
 
 #[cfg(test)]
@@ -389,4 +398,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_damaged_prefix_list_reads_without_a_panic() {
+        let hits = [
+            PrefixHit { entity: 10, partial: false, text: 1.0, imp_q: 255, class: 3, ord: 0 },
+            PrefixHit { entity: 20, partial: true, text: 0.5, imp_q: 200, class: 0, ord: 14 },
+            PrefixHit { entity: 1 << 20, partial: false, text: 1.0, imp_q: 100, class: 0, ord: 0 },
+        ];
+        let mut whole = Vec::new();
+        encode_prefix_hits(&mut whole, &hits);
+        let decode = |buf: &[u8], off: usize| {
+            let mut got = Vec::new();
+            decode_prefix_hits(buf, off, &mut got);
+            got.iter().map(|h| h.entity).collect::<Vec<_>>()
+        };
+        // Cut anywhere: the hits before the cut.
+        for cut in 0..whole.len() {
+            let got = decode(&whole[..cut], 0);
+            assert!(got.len() < hits.len() && hits.iter().zip(&got).all(|(h, &e)| h.entity == e), "cut at {cut}: {got:?}");
+        }
+        // Any byte replaced: no panic, no more hits than the table keeps.
+        for at in 0..whole.len() {
+            for b in [0x00, 0x01, 0x7F, 0x80, 0xFF] {
+                let mut bad = whole.clone();
+                bad[at] = b;
+                assert!(decode(&bad, 0).len() <= PREFIX_TABLE_TOP, "byte {at} = {b:#x}");
+            }
+        }
+        let varint = |v: u64| {
+            let mut b = Vec::new();
+            varint::put(&mut b, v);
+            b
+        };
+        let hit = [&varint(7 << 2)[..], &[255, 200]].concat();
+        let cases: [(&str, Vec<u8>, usize); 4] = [
+            ("an offset past the end", whole.clone(), whole.len() + 10),
+            ("a count over 64 bits", vec![0x80; 11], 0),
+            ("more hits than the table keeps", [varint(PREFIX_TABLE_TOP as u64 + 1), hit.repeat(PREFIX_TABLE_TOP + 1)].concat(), 0),
+            ("an entity past 32 bits", [&[1][..], &varint((1 << 34) << 2), &[255, 200]].concat(), 0),
+        ];
+        for (case, bytes, off) in cases {
+            assert_eq!(decode(&bytes, off), [0u32; 0], "{case}");
+        }
+    }
 }

@@ -158,7 +158,7 @@ impl<'a> PlacesSource<'a> {
         let mut n_linked = 0u32;
         for p in 0..n_poly {
             let node = link[p as usize];
-            if node == NO_DATA || polygon_raw(geo, p).name_id == NO_DATA {
+            if node == NO_DATA || polygon_raw(geo, p).is_none_or(|ap| ap.name_id == NO_DATA) {
                 continue;
             }
             label_used.set(node);
@@ -172,7 +172,7 @@ impl<'a> PlacesSource<'a> {
             if link[p as usize] != NO_DATA {
                 continue;
             }
-            let ap = polygon_raw(geo, p);
+            let Some(ap) = polygon_raw(geo, p) else { continue };
             let searchable = ap.name_id != NO_DATA && (BOUNDARY_MIN_LEVEL..=BOUNDARY_MAX_LEVEL).contains(&ap.admin_level) && ap.area > 0.0;
             if !searchable {
                 continue;
@@ -213,9 +213,8 @@ impl<'a> PlacesSource<'a> {
         e.names.clear();
         let geo = self.geo;
         let (rrefs, base_id) = {
-            let Some(s) = self.bnd.at(geo, pos) else { return false };
-            let ap = polygon_raw(geo, s.poly);
-            let node = s.linked().then(|| place_node_raw(geo, s.node));
+            let Some((s, ap)) = self.bnd.at(geo, pos).and_then(|s| Some((s, polygon_raw(geo, s.poly)?))) else { return false };
+            let node = s.linked().then(|| place_node_raw(geo, s.node)).flatten();
             let kind = if s.linked() { Kind::Linked } else { Kind::Area };
             let typ = boundary_type(&ap, node.as_ref());
             e.id = self.n_place_nodes + s.poly;
@@ -305,7 +304,7 @@ impl<'a> PoiSource<'a> {
 
     fn fill(&self, pos: u32, e: &mut EntityBuf) -> bool {
         e.names.clear();
-        let r = poi_raw(self.geo, pos);
+        let Some(r) = poi_raw(self.geo, pos) else { return false };
         if r.name_id == NO_DATA || r.flags & POI_FLAG_SECONDARY_RING != 0 || r.tier > self.max_tier {
             return false;
         }
@@ -2030,7 +2029,7 @@ mod tests {
             let f = &found[0];
             assert_eq!(f.hit.entity, poly, "{q}");
             let label = AdminPoint::new(f.lat as f64, f.lng as f64);
-            assert!(geo.admin_geometry.contains_once(&polygon_raw(&geo, poly), label), "{q} at {} {}", f.lat, f.lng);
+            assert!(geo.admin_geometry.contains_once(&polygon_raw(&geo, poly).unwrap(), label), "{q} at {} {}", f.lat, f.lng);
             assert_eq!(f.ctx.county, q);
         }
     }

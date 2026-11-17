@@ -8,21 +8,8 @@ pub fn put(out: &mut Vec<u8>, mut v: u64) {
     out.push(v as u8);
 }
 
-pub fn get(buf: &[u8], pos: &mut usize) -> u64 {
-    let mut v = 0u64;
-    let mut shift = 0;
-    loop {
-        let b = buf[*pos];
-        *pos += 1;
-        v |= ((b & 0x7F) as u64) << shift;
-        if b < 0x80 {
-            return v;
-        }
-        shift += 7;
-    }
-}
-
-/// `get` within `buf`: None for a varint cut short by the end of `buf` or over 64 bits.
+/// The varint at `*pos`, read within `buf`, moving past it: None for one cut short by the end of
+/// `buf` or over 64 bits.
 pub fn try_get(buf: &[u8], pos: &mut usize) -> Option<u64> {
     let mut v = 0u64;
     let mut shift = 0;
@@ -49,7 +36,7 @@ mod tests {
         }
         let mut p = 0;
         for v in [0u64, 1, 127, 128, 300, 1 << 40, u64::MAX] {
-            assert_eq!(get(&b, &mut p), v);
+            assert_eq!(try_get(&b, &mut p), Some(v));
         }
         assert_eq!(p, b.len());
     }
@@ -62,5 +49,7 @@ mod tests {
         assert_eq!(try_get(&b, &mut at), Some(300));
         assert_eq!(try_get(&b[..1], &mut cut), None);
         assert_eq!(try_get(&[0x80; 11], &mut 0), None);
+        // A varint of 64 bits whose last byte holds more: the low 64 bits, no overflow.
+        assert_eq!(try_get(&[[0xFF; 9].as_slice(), &[0x7F]].concat(), &mut 0), Some(u64::MAX));
     }
 }

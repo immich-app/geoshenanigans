@@ -9,7 +9,7 @@ use crate::normalize::{is_ideographic, join, normalize, tokens, Token};
 use crate::entities::{cc_of, polygon_raw, Entities};
 use crate::reader::{SearchIndex, SubIndex};
 use query_server::{cell_id_at_level, AdminPoint, AdminPolygon, Index, ID_MASK, INTERIOR_FLAG, NO_DATA};
-use fst::{Automaton, IntoStreamer, Streamer};
+use fst::{Automaton, Streamer};
 use levenshtein_automata::{Distance, LevenshteinAutomatonBuilder, DFA, SINK_STATE};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
@@ -338,7 +338,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
         geo.admin_index
             .ids(cell)
             .into_iter()
-            .map(|id| (id & ID_MASK, polygon_raw(geo, id & ID_MASK), id & INTERIOR_FLAG != 0))
+            .filter_map(|id| Some((id & ID_MASK, polygon_raw(geo, id & ID_MASK)?, id & INTERIOR_FLAG != 0)))
             .filter(|(_, ap, _)| ap.name_id != NO_DATA)
             .collect()
     }
@@ -399,7 +399,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
         let anchor_chars = if edits >= 2 { ANCHOR_CHARS_TWO_EDITS } else { ANCHOR_CHARS_ONE_EDIT };
         let first: usize = phrase.chars().take(anchor_chars).map(|c| c.len_utf8()).sum();
         let aut = Anchored { first: &phrase.as_bytes()[..first], dfa };
-        let mut s = sub.map.search_with_state(aut).into_stream();
+        let mut s = sub.map.search_with_state(aut);
         let mut n = 0;
         while let Some((k, v, st)) = s.next() {
             let d = match dfa.distance(st.1) {
@@ -439,7 +439,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
         match allowed_edits(chars, PREFIX_NO_TYPO_MAX_CHARS, PREFIX_ONE_TYPO_MAX_CHARS, ideo) {
             0 => {
                 let aut = fst::automaton::Str::new(phrase).starts_with();
-                let mut s = sub.map.search(aut).into_stream();
+                let mut s = sub.map.search(aut);
                 let mut n = 0;
                 while let Some((k, v)) = s.next() {
                     let klen = char_len(k);
@@ -491,7 +491,6 @@ impl<'a, 'g> Searcher<'a, 'g> {
                 pool.offer(Hit { entity, ord, class, score: potential, text, context: false, split });
             }
         };
-        let mut postings = Vec::new();
         for (_, sub) in self.idx.subs() {
             if prefix && chars <= PREFIX_TABLE_MAX_CHARS && !folded_last {
                 match sub.prefix_hits(&phrase) {
@@ -530,8 +529,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
                 if bound <= pool.threshold() {
                     break;
                 }
-                sub.postings(v, &mut postings);
-                for p in &postings {
+                for p in sub.list(v) {
                     st.stats.postings_read += 1;
                     let text = if p.partial { t * PARTIAL_TEXT } else { t };
                     let imp = dequantize(p.imp_q);
@@ -627,8 +625,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
             if !ents.is_area(e) || Entities::is_poi(e) || e < ents.n_place_nodes {
                 continue;
             }
-            let Some(slot) = ents.slot(e - ents.n_place_nodes) else { continue };
-            let area = polygon_raw(self.idx.geo, slot.poly);
+            let Some(area) = ents.slot(e - ents.n_place_nodes).and_then(|s| polygon_raw(self.idx.geo, s.poly)) else { continue };
             if area.admin_level == 2 {
                 continue;
             }

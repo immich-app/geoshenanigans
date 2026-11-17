@@ -9,6 +9,7 @@ pub mod entities;
 pub mod extras;
 #[cfg(test)]
 mod fixture;
+pub mod keys;
 pub mod model;
 pub mod normalize;
 pub mod query;

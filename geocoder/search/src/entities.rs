@@ -5,7 +5,7 @@
 use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI, KIND_POLYGON};
 use crate::model::*;
 use memmap2::Mmap;
-use query_server::{AdminPolygon, Index, PlaceNode, PoiRecord, NO_DATA};
+use query_server::{coords_in_range, AdminPolygon, Index, PlaceNode, PoiRecord, NO_DATA};
 use std::borrow::Cow;
 
 /// Derived boundary slot: polygon index, label node (NO_DATA without one) and label point (the
@@ -53,9 +53,9 @@ impl BoundarySlot {
 
 /// A labelled boundary's primary name: its label node's (when the node kept it), else its own.
 pub fn slot_name_ids(geo: &Index, s: &BoundarySlot) -> (u32, Option<u32>) {
-    let own = polygon_raw(geo, s.poly).name_id;
+    let own = polygon_raw(geo, s.poly).map_or(NO_DATA, |ap| ap.name_id);
     if s.linked() {
-        let n = place_node_raw(geo, s.node).name_id;
+        let n = place_node_raw(geo, s.node).map_or(NO_DATA, |pn| pn.name_id);
         if n != NO_DATA && n != own {
             return (n, Some(own));
         }
@@ -63,16 +63,20 @@ pub fn slot_name_ids(geo: &Index, s: &BoundarySlot) -> (u32, Option<u32>) {
     (own, None)
 }
 
-pub fn place_node_raw(geo: &Index, i: u32) -> PlaceNode {
-    geo.place_node_record(i).expect("place node")
+/// Place node `i`; None past the place nodes.
+pub fn place_node_raw(geo: &Index, i: u32) -> Option<PlaceNode> {
+    geo.place_node_record(i)
 }
 
-pub fn polygon_raw(geo: &Index, i: u32) -> AdminPolygon {
-    geo.admin_polygon_record(i).expect("admin polygon record")
+/// Admin polygon `i`, a tombstone's record too; None past the polygons.
+pub fn polygon_raw(geo: &Index, i: u32) -> Option<AdminPolygon> {
+    geo.admin_polygon_record(i)
 }
 
-pub fn poi_raw(geo: &Index, i: u32) -> PoiRecord {
-    geo.poi_records.as_ref().expect("poi_records").record(i).expect("poi record")
+/// POI record `i`, a tombstone's too; None without POIs, past the records, or for one whose row
+/// does not read.
+pub fn poi_raw(geo: &Index, i: u32) -> Option<PoiRecord> {
+    geo.poi_records.as_ref()?.record(i)
 }
 
 pub fn cc_of(code: u16) -> [u8; 2] {
@@ -86,11 +90,7 @@ pub fn cc_str(cc: &[u8; 2]) -> &str {
 /// Country of a record through its parent polygon: a POI's containing one, a place node's
 /// claiming boundary (NO_DATA unless the node is its label).
 pub fn parent_cc(geo: &Index, parent: u32) -> [u8; 2] {
-    let n = geo.admin_polygon_count();
-    if parent == NO_DATA || parent >= n {
-        return [0, 0];
-    }
-    cc_of(polygon_raw(geo, parent).country_code)
+    polygon_raw(geo, parent).map_or([0, 0], |ap| cc_of(ap.country_code))
 }
 
 pub fn boundary_type(ap: &AdminPolygon, linked_node: Option<&PlaceNode>) -> Cow<'static, str> {
@@ -163,20 +163,25 @@ impl Boundaries {
     }
 
     /// Slot `pos` of the labelled ones, then the unlabelled ones; None past the last, and for a
-    /// labelled slot whose node the place nodes do not hold.
+    /// slot no build writes: of a polygon the dataset does not hold, labelled by a node the place
+    /// nodes do not hold, or with a label point off the globe (NaN among them).
     pub fn at(&self, geo: &Index, pos: usize) -> Option<BoundarySlot> {
-        if pos < self.labelled {
+        let slot = if pos < self.labelled {
             let at = pos * LABELLED_SLOT_BYTES;
             let node = self.u32_at(at + 4);
             let pn = geo.place_node_record(node)?;
-            return Some(BoundarySlot { poly: self.u32_at(at), node, lat: pn.lat, lng: pn.lng });
-        }
-        if pos >= self.len() {
+            BoundarySlot { poly: self.u32_at(at), node, lat: pn.lat, lng: pn.lng }
+        } else if pos < self.len() {
+            let at = self.labelled * LABELLED_SLOT_BYTES + (pos - self.labelled) * UNLABELLED_SLOT_BYTES;
+            let (lat, lng) = (f32::from_bits(self.u32_at(at + 4)), f32::from_bits(self.u32_at(at + 8)));
+            if !coords_in_range(lat as f64, lng as f64) {
+                return None;
+            }
+            BoundarySlot { poly: self.u32_at(at), node: NO_DATA, lat, lng }
+        } else {
             return None;
-        }
-        let at = self.labelled * LABELLED_SLOT_BYTES + (pos - self.labelled) * UNLABELLED_SLOT_BYTES;
-        let (lat, lng) = (f32::from_bits(self.u32_at(at + 4)), f32::from_bits(self.u32_at(at + 8)));
-        Some(BoundarySlot { poly: self.u32_at(at), node: NO_DATA, lat, lng })
+        };
+        (slot.poly < geo.admin_polygon_count()).then_some(slot)
     }
 
     /// The slot of polygon `poly` (each table is searched by polygon); None when there is none.
@@ -196,7 +201,7 @@ impl Boundaries {
         let unlabelled_at = self.labelled * LABELLED_SLOT_BYTES;
         let pos = search(0, self.labelled, LABELLED_SLOT_BYTES)
             .or_else(|| search(unlabelled_at, self.unlabelled, UNLABELLED_SLOT_BYTES).map(|k| self.labelled + k))?;
-        self.at(geo, pos).filter(|s| s.poly < geo.admin_polygon_count())
+        self.at(geo, pos)
     }
 }
 
@@ -219,15 +224,14 @@ impl<'a> Entities<'a> {
         e & POI_BIT != 0
     }
 
-    /// Where entity `e` is; None for a boundary without a slot.
+    /// Where entity `e` is; None for a boundary without a slot, and for an entity whose record
+    /// does not read.
     pub fn point(&self, e: u32) -> Option<(f32, f32)> {
         if Self::is_poi(e) {
-            let r = poi_raw(self.geo, e & !POI_BIT);
-            return Some((r.lat, r.lng));
+            return poi_raw(self.geo, e & !POI_BIT).map(|r| (r.lat, r.lng));
         }
         if e < self.n_place_nodes {
-            let p = place_node_raw(self.geo, e);
-            return Some((p.lat, p.lng));
+            return place_node_raw(self.geo, e).map(|p| (p.lat, p.lng));
         }
         self.slot(e - self.n_place_nodes).map(|s| (s.lat, s.lng))
     }
@@ -243,17 +247,17 @@ impl<'a> Entities<'a> {
         self.slot(e - self.n_place_nodes).map(|s| s.record_refs()).unwrap_or_default()
     }
 
-    /// The record's own name of entity `e` (empty for a boundary without a slot).
+    /// The record's own name of entity `e` (empty for a boundary without a slot, and for an
+    /// entity whose record does not read).
     pub fn base_name(&self, e: u32) -> Cow<'a, str> {
         let id = if Self::is_poi(e) {
-            poi_raw(self.geo, e & !POI_BIT).name_id
+            poi_raw(self.geo, e & !POI_BIT).map(|r| r.name_id)
         } else if e < self.n_place_nodes {
-            place_node_raw(self.geo, e).name_id
+            place_node_raw(self.geo, e).map(|p| p.name_id)
         } else {
-            let Some(s) = self.slot(e - self.n_place_nodes) else { return Cow::Borrowed("") };
-            slot_name_ids(self.geo, &s).0
+            self.slot(e - self.n_place_nodes).map(|s| slot_name_ids(self.geo, &s).0)
         };
-        self.geo.get_string(id)
+        id.map_or(Cow::Borrowed(""), |id| self.geo.get_string(id))
     }
 
     /// The name a posting matched: the record's own (ord 0) or an extra name.
@@ -263,8 +267,8 @@ impl<'a> Entities<'a> {
         }
         if ord == crate::constants::ORD_BOUNDARY_NAME {
             if !Self::is_poi(e) && e >= self.n_place_nodes {
-                if let Some(s) = self.slot(e - self.n_place_nodes) {
-                    return self.geo.get_string(polygon_raw(self.geo, s.poly).name_id);
+                if let Some(ap) = self.slot(e - self.n_place_nodes).and_then(|s| polygon_raw(self.geo, s.poly)) {
+                    return self.geo.get_string(ap.name_id);
                 }
             }
             return self.base_name(e);
@@ -275,21 +279,23 @@ impl<'a> Entities<'a> {
         }
     }
 
-    /// The kind and type of entity `e` (an area of no type for a boundary without a slot).
+    /// The kind and type of entity `e` (an area of no type for a boundary without a slot, of no
+    /// type for an entity whose record does not read).
     pub fn kind_and_type(&self, e: u32) -> (Kind, Cow<'a, str>) {
         if Self::is_poi(e) {
-            let r = poi_raw(self.geo, e & !POI_BIT);
+            let Some(r) = poi_raw(self.geo, e & !POI_BIT) else { return (Kind::Poi, Cow::Borrowed("")) };
             return (Kind::Poi, Cow::Owned(self.geo.poi_meta.category_name(r.category).to_string()));
         }
         if e < self.n_place_nodes {
-            let p = place_node_raw(self.geo, e);
+            let Some(p) = place_node_raw(self.geo, e) else { return (Kind::Place, Cow::Borrowed("")) };
             let t = PLACE_NODE_TYPES.get(p.place_type as usize).copied().unwrap_or("place");
             return (place_node_kind(p.place_type), Cow::Borrowed(t));
         }
-        let Some(s) = self.slot(e - self.n_place_nodes) else { return (Kind::Area, Cow::Borrowed("")) };
-        let ap = polygon_raw(self.geo, s.poly);
+        let Some((s, ap)) = self.slot(e - self.n_place_nodes).and_then(|s| Some((s, polygon_raw(self.geo, s.poly)?))) else {
+            return (Kind::Area, Cow::Borrowed(""));
+        };
         // Typed as the build typed it for ranking (PlacesSource::fill): by its label node.
-        let node = s.linked().then(|| place_node_raw(self.geo, s.node));
+        let node = s.linked().then(|| place_node_raw(self.geo, s.node)).flatten();
         (if s.linked() { Kind::Linked } else { Kind::Area }, boundary_type(&ap, node.as_ref()))
     }
 

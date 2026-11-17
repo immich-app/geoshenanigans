@@ -216,13 +216,13 @@ fn cmd_ctxbench(args: &[String]) {
 /// Key-level churn between two builds of one sub-index: keys only in A, only in B, in both with
 /// the same / a different posting list.
 fn cmd_diff(args: &[String]) {
-    use fst::{IntoStreamer, Streamer};
+    use fst::Streamer;
     let (a, b, name) = (Path::new(&args[2]), Path::new(&args[3]), &args[4]);
     // Every posting of each list, whatever its entity.
     let sa = place_search::reader::SubIndex::open(a, name, u32::MAX).expect("A");
     let sb = place_search::reader::SubIndex::open(b, name, u32::MAX).expect("B");
     let mut ia = sa.map.stream();
-    let mut ib = sb.map.into_stream();
+    let mut ib = sb.map.stream();
     let (mut only_a, mut only_b, mut same, mut changed) = (0u64, 0u64, 0u64, 0u64);
     let (mut pa, mut pb) = (Vec::new(), Vec::new());
     let mut na = ia.next().map(|(k, v)| (k.to_vec(), v));
