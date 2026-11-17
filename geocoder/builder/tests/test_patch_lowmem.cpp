@@ -5717,6 +5717,59 @@ TEST(patch_refuses_a_child_section_at_another_stride_than_its_files) {
     CHECK(apply_modes(c, ALL_MODES).bad.empty());
 }
 
+// A dir gets its first ways of a pair, or loses its last, on a day with a
+// patch like any other: the ways merge as one INSERT of every way or one
+// DELETE, and their nodes as that merge's child stream, every node inserted
+// or deleted. From and to a pair of no ways (its two footers, beside side
+// files of no values) and from and to a dir without the pair's files, merged
+// by content and by slot, beside the other pair's 40 ways, which stay. In
+// every mode the patcher writes the new dir, byte for byte.
+TEST(patch_rebuilds_a_dir_that_gains_its_first_ways_or_loses_its_last) {
+    ScratchDir dir("lowmem-first-ways");
+    for (const way_files::Kind* kind : BOTH_WAY_KINDS) {
+        const way_files::Kind& other = kind->interp ? way_files::STREETS : way_files::INTERPS;
+        std::mt19937 rng(20261117);
+        const std::vector<Way> ways = ways_with_nodes(rng, kind->interp, 40), stay = ways_with_nodes(rng, other.interp, 40);
+        // The side files of the kind's ways: a value a way.
+        const std::vector<const char*> sides =
+            kind->interp ? std::vector<const char*>{"interp_postcodes.bin"} : std::vector<const char*>{"way_parents.bin", "way_postcodes.bin"};
+        BuildDir with, footers, no_files;
+        put_ways(with, *kind, ways);
+        put_ways(footers, *kind, {});
+        for (const char* side : sides) {
+            std::vector<char>& values = with[side];
+            for (size_t i = 0; i < ways.size(); i++) append(values, rng() % 4 ? static_cast<uint32_t>(rng() % 1000) : NO);
+            footers[side] = {};
+        }
+        for (BuildDir* d : {&with, &footers, &no_files}) put_ways(*d, other, stay);
+        const std::string n_ways = std::to_string(ways.size()), n_nodes = std::to_string(nodes_in(ways, 0, ways.size()));
+        for (const bool gains : {true, false})
+            for (const BuildDir* without : {&footers, &no_files})
+                for (const bool by_slot : {false, true}) {
+                    const std::string name = std::string(kind->interp ? "interps" : "streets") + (gains ? "-gains" : "-loses") +
+                                             (without == &footers ? "-footers" : "-files") + (by_slot ? "-by-slot" : "-by-content");
+                    const LowMemCase c{dir.path(), name};
+                    const int failures_before = gctest::failures();
+                    REQUIRE(prepare(c, gains ? *without : with, gains ? with : *without, {}, {},
+                                    by_slot ? std::vector<std::string>{"--identity-slots"} : std::vector<std::string>{})
+                                .empty());
+                    const std::vector<char> text = read_file(c.log());
+                    const std::string log(text.begin(), text.end());
+                    // The records by op of the file's merge, from its line of the diff's log.
+                    auto merged = [&](const char* file) {
+                        const size_t line = log.find(std::string("  ") + file + ": seq=");
+                        const size_t at = line == std::string::npos ? line : log.find("recs m/i/d/r=", line);
+                        return at == std::string::npos ? std::string() : log.substr(at + 13, log.find('\n', at) - at - 13);
+                    };
+                    CHECK_EQ(merged(kind->ways_file), gains ? "0/" + n_ways + "/0/0" : "0/0/" + n_ways + "/0");
+                    CHECK_EQ(merged(kind->nodes_file), gains ? "0/" + n_nodes + "/0/0" : "0/0/" + n_nodes + "/0");
+
+                    CHECK(apply_modes(c, ALL_MODES).bad.empty());
+                    if (gctest::failures() > failures_before) std::printf("    on the day %s\n", name.c_str());
+                }
+    }
+}
+
 // A byte of an old way file that is not the one the diff read is refused,
 // whichever it is: every byte of the pair's two files flipped in turn (one
 // in five under the sanitizers), of 20 streets and of 18 interpolations of 2

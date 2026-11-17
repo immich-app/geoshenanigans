@@ -131,6 +131,9 @@ struct Reader {
     uint64_t tell() const { return fpos + cur; }
     uint64_t left() const { return end - tell(); }
     bool eof() const { return tell() >= end; }
+    // The bytes at the cursor that need() hands out from the buffer as it is: a take of more
+    // moves what the buffer holds.
+    size_t buffered() const { return len - cur; }
     // Moves the cursor forward without reading what it passes.
     void seek(uint64_t to) {
         if (to < tell()) die("%s: backward seek", path.c_str());

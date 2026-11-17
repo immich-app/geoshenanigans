@@ -35,7 +35,8 @@ struct Hashes {
 // The old R2 and V2 files front to back, a row and its block at a time: the row's logical record
 // (vertex_offset its block's offset in the logical vertex stream, vertex_count its vertices) and
 // its block, parsed but not read until copied or passed. Every byte of both files is hashed in
-// order: a row as it is decoded, the dictionaries and the footer after the last.
+// order: the rows as many at a time as the rows' reader holds, the dictionaries and the footer
+// after the last.
 class OldRows {
 public:
     explicit OldRows(const std::string& dir) {
@@ -62,8 +63,7 @@ public:
         decoded_ = false;
         if (i_ == rows()) poi_files::malformed("a row past the last");
         bool polygon;
-        const uint8_t* row = R_->take(poi_files::ROW_BYTES);
-        records_hash_->update(reinterpret_cast<const char*>(row), poi_files::ROW_BYTES);
+        const uint8_t* row = take_row();
         const uint32_t voff = rows_.decode(row, rec_, polygon);
         if (voff != V_->tell())
             poi_files::malformed("row " + std::to_string(i_) + ": voff " + std::to_string(voff) + " where the blocks are at " +
@@ -159,6 +159,7 @@ public:
         while (i_ < rows()) next();
         pass_block();
         rows_.finish();
+        hash_rows();
         // What follows the rows, which open_rows read: the dictionaries and the footer.
         for (gcs::Reader tail(R_->path, TAIL_PIECE, rows_.footer().rows_end()); !tail.eof();) {
             const size_t n = size_t(std::min<uint64_t>(tail.left(), TAIL_PIECE));
@@ -177,6 +178,19 @@ public:
 
 private:
     static constexpr size_t PIECE = 64 << 10, TAIL_PIECE = 16 << 10;
+    // The row at R_'s cursor. The rows taken since the records' hash last took some sit back to
+    // back in R_'s buffer: they are hashed in one piece before a take that moves the buffer.
+    const uint8_t* take_row() {
+        if (R_->buffered() < poi_files::ROW_BYTES) hash_rows();
+        const uint8_t* row = R_->take(poi_files::ROW_BYTES);
+        if (!unhashed_bytes_) unhashed_ = row;
+        unhashed_bytes_ += poi_files::ROW_BYTES;
+        return row;
+    }
+    void hash_rows() {
+        records_hash_->update(reinterpret_cast<const char*>(unhashed_), unhashed_bytes_);
+        unhashed_bytes_ = 0;
+    }
     // The blocks passed last that reread() reads again: a day's changed polygons match bytes of the
     // few blocks before their own (a planet day: 1,004 reads, none further back than 64 KiB).
     static constexpr size_t HISTORY_BLOCKS = 1024;
@@ -192,6 +206,8 @@ private:
     poi_files::RowDecoder rows_;
     std::unique_ptr<gcs::Reader> R_, V_;
     std::unique_ptr<LaneHasher> records_hash_, hash_;  // poi_records.bin's, and poi_vertices.bin's
+    const uint8_t* unhashed_ = nullptr;                 // the rows taken and not yet hashed, in R_'s buffer
+    size_t unhashed_bytes_ = 0;
     uint64_t i_ = 0, logical_ = 0, blocks_end_ = 0, block_logical_ = 0, block_left_ = 0;
     uint8_t rec_[poi_files::LOGICAL_STRIDE] = {};
     bool block_ = false, decoded_ = false;
