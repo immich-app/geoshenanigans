@@ -10,7 +10,7 @@ kustomize = "5.8.1"
 kubeconform = "0.8.0"
 flux2 = "2.9.5"
 # github backend: the aqua backend fails to verify cosign v3's sigstore bundles.
-"github:sigstore/cosign" = "v3.1.3"
+"github:sigstore/cosign" = "v3.1.4"
 
 [tasks."o11y:render"]
 description = "Render the o11y bundle into build/o11y, check it assembles under kustomize and validate it against the CRD schemas"
