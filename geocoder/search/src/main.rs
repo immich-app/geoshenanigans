@@ -1,5 +1,5 @@
 //! place-search build <set dir> <index dir> [--sub places|poi|all] [--threads N] [--mem-mb M]
-//!                    [--tmp DIR] [--no-inline] [--extras extra_names.bin] [--imp DIR] [--area-proxy]
+//!                    [--tmp DIR] [--extras extra_names.bin] [--imp DIR] [--area-proxy]
 //!                    [--poi-max-tier 1|2|3]
 //!   search_meta.json records the set's files (dataset.rs): the index belongs to that set alone,
 //!   so --sub builds only over an index of the same files, and files replaced since the set was
@@ -71,7 +71,6 @@ fn cmd_build(args: &[String]) {
     let opts = BuildOpts {
         threads: opt(args, "--threads").map(|v| v.parse().unwrap()).unwrap_or(base.threads),
         mem_mb: opt(args, "--mem-mb").map(|v| v.parse().unwrap()).unwrap_or(base.mem_mb),
-        inline: !flag(args, "--no-inline"),
         extras: opt(args, "--extras"),
         imp_dir: opt(args, "--imp"),
         area_proxy: flag(args, "--area-proxy"),
@@ -219,8 +218,9 @@ fn cmd_ctxbench(args: &[String]) {
 fn cmd_diff(args: &[String]) {
     use fst::{IntoStreamer, Streamer};
     let (a, b, name) = (Path::new(&args[2]), Path::new(&args[3]), &args[4]);
-    let sa = place_search::reader::SubIndex::open(a, name).expect("A");
-    let sb = place_search::reader::SubIndex::open(b, name).expect("B");
+    // Every posting of each list, whatever its entity.
+    let sa = place_search::reader::SubIndex::open(a, name, u32::MAX).expect("A");
+    let sb = place_search::reader::SubIndex::open(b, name, u32::MAX).expect("B");
     let mut ia = sa.map.stream();
     let mut ib = sb.map.into_stream();
     let (mut only_a, mut only_b, mut same, mut changed) = (0u64, 0u64, 0u64, 0u64);

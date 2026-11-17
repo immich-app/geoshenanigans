@@ -6,7 +6,7 @@
 //! fed as they download.
 
 use napi::bindgen_prelude::*;
-use napi::{Env, JsObject};
+use napi::Env;
 use napi_derive::napi;
 use place_search::constants::{DATASET_SEARCH_DIR, DEFAULT_LIMIT};
 use place_search::dataset::{self, BuildOnDevice, Origin, Stamps};
@@ -129,7 +129,7 @@ impl Geocoder {
     /// load the patched dataset and open place search on that geocoder: this one rejects files
     /// replaced since it loaded them. Resolves to "current" or "built".
     #[napi(ts_return_type = "Promise<'current' | 'built'>")]
-    pub fn open_place_search(&self, env: Env, options: Option<PlaceSearchOptions>) -> Result<JsObject> {
+    pub fn open_place_search<'env>(&self, env: &'env Env, options: Option<PlaceSearchOptions>) -> Result<Object<'env>> {
         let PlaceSearchOptions { index_dir, build_memory_mb } = options.unwrap_or(PlaceSearchOptions { index_dir: None, build_memory_mb: None });
         let geo = self.single_region()?;
         let dataset = self.dir.clone();

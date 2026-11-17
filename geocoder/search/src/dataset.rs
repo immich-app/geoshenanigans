@@ -5,10 +5,13 @@
 //! from before a patch, is built again from the files instead of being read. The files hashed
 //! must be the ones the geocoder index was loaded from (`load`): one replaced under a loaded
 //! index would have the index built from the old files but recorded as built from the new.
-use crate::build::{self, build_held, has_extra_names, has_sub_index, has_unfinished_publish, held_subs, sub_index_files, BuildOpts, Contended, HeldIndexDir};
+use crate::build::{
+    self, build_held, has_extra_names, has_sub_index, has_unfinished_publish, held_subs, is_current_format, sub_index_files, BuildOpts,
+    Contended, HeldIndexDir,
+};
 use crate::constants::*;
 use crate::reader::SearchIndex;
-use query_server::{FileStamp, Index};
+use query_server::{lower_hex, FileStamp, Index};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -129,7 +132,7 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
         }
         sha.update(&buf[..n]);
     }
-    Ok(format!("{:x}", sha.finalize()))
+    Ok(lower_hex(&sha.finalize()))
 }
 
 /// The fingerprint of the dataset in `dir` as loaded, its files stamped `loaded` (`load`), the
@@ -170,8 +173,8 @@ pub fn index_meta(geo: &Index, opts: &BuildOpts, dataset: &Fingerprint) -> serde
 /// The META_FILE of a `place-search build` of the sub-indexes `subs` into `out` from the dataset
 /// in `dir`, loaded as `geo` from files stamped `loaded` (`load`): merged into the one there, so
 /// sub-indexes can be built one at a time. Refused when the files are no longer the ones loaded
-/// (`fingerprint_loaded`), or when a sub-index it keeps was built from other files, as the
-/// fingerprint it records is that of every sub-index there.
+/// (`fingerprint_loaded`), or when a sub-index it keeps was built from other files or in another
+/// format, as the fingerprint and the format it records are those of every sub-index there.
 pub fn merged_meta(geo: &Index, loaded: &Stamps, opts: &BuildOpts, dir: &Path, out: &Path, subs: &[&str]) -> Result<Value, String> {
     // An index never reads the POIs of a dataset without any, so those are not kept.
     let mut replacing = subs.to_vec();
@@ -183,6 +186,9 @@ pub fn merged_meta(geo: &Index, loaded: &Stamps, opts: &BuildOpts, dir: &Path, o
     let kept = SUB_INDEXES.iter().find(|s| !replacing.contains(s) && has_sub_index(out, s));
     if let Some(kept) = kept.filter(|_| built_from(out).as_ref() != Some(&dataset)) {
         return Err(format!("retained {kept} sub-index was built from other dataset files; rebuild with --sub all"));
+    }
+    if let Some(kept) = kept.filter(|_| !meta_of(out).is_some_and(|m| is_current_format(&m))) {
+        return Err(format!("retained {kept} sub-index was built in another format; rebuild with --sub all"));
     }
     let mut meta: Value = std::fs::read_to_string(out.join(META_FILE))
         .ok()
@@ -225,13 +231,13 @@ fn is_complete(geo: &Index, index: &Path) -> bool {
 
 /// Opens the place search index in `index` of the dataset in `dir` (loaded as `geo` from files
 /// stamped `loaded`, by `load`): the one there when it is whole (`is_complete`), no publish into
-/// it was left unfinished and it was built from these files without extra names (it has no
-/// extra-names file to read them with), else one built from them first by `build_held` with the
-/// default options (staged in `index`, every file moved in only once all are complete). Fails when
-/// the files are no longer the ones loaded. The open holds `index` (`HeldIndexDir`, which every
-/// build takes) until the index is mapped, waiting while another open or a build has it: a
-/// second open finds the first's index current, and no build moves files in while one is read,
-/// or has its stage cleared.
+/// it was left unfinished and it was built from these files in this build's format
+/// (INDEX_FORMAT) without extra names (it has no extra-names file to read them with), else one
+/// built from them first by `build_held` with the default options (staged in `index`, every file
+/// moved in only once all are complete). Fails when the files are no longer the ones loaded. The
+/// open holds `index` (`HeldIndexDir`, which every build takes) until the index is mapped,
+/// waiting while another open or a build has it: a second open finds the first's index current,
+/// and no build moves files in while one is read, or has its stage cleared.
 pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_device: &BuildOnDevice) -> Result<(SearchIndex<'g>, Origin), String> {
     let held = HeldIndexDir::take(index, Contended::Wait)?;
     let cache = index.join(HASH_CACHE_FILE);
@@ -242,7 +248,7 @@ pub fn open<'g>(geo: &'g Index, loaded: &Stamps, dir: &Path, index: &Path, on_de
     // the index's before it, whose META_FILE matches whenever both were built from these files.
     let reusable = !has_unfinished_publish(index)
         && is_complete(geo, index)
-        && meta_of(index).is_some_and(|m| !has_extra_names(&m))
+        && meta_of(index).is_some_and(|m| !has_extra_names(&m) && is_current_format(&m))
         && built_from(index).as_ref() == Some(&have);
     let origin = if reusable {
         Origin::Current
@@ -444,6 +450,56 @@ mod tests {
         assert!(!index.join(BUILD_STAGE_DIR).exists());
     }
 
+    /// Sets the META_FILE field `key` of the index in `index` to `value` (removes it for None).
+    fn set_meta(index: &Path, key: &str, value: Option<Value>) {
+        let mut meta = meta_of(index).unwrap();
+        match value {
+            Some(v) => meta[key] = v,
+            None => drop(meta.as_object_mut().unwrap().remove(key)),
+        }
+        std::fs::write(index.join(META_FILE), meta.to_string()).unwrap();
+    }
+
+    #[test]
+    fn a_shipped_index_of_another_format_is_built_again() {
+        for (case, format) in [("format 1", Some(json!(1))), ("no format", None)] {
+            let (ci, ds) = (TempDir::new("ci-format"), TempDir::new("format"));
+            dataset(["Testville", "Otherton"]).write(&ci.0);
+            dataset(["Testville", "Otherton"]).write(&ds.0);
+            let shipped = ci.0.join("out");
+            ship(&ci.0, &shipped);
+            let index = ds.0.join("search");
+            download(&shipped, &index);
+            set_meta(&index, "format", format);
+            let (geo, stamps) = load_dataset(&ds.0);
+
+            let (idx, origin) = open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap();
+
+            assert_eq!(origin, Origin::Built, "{case}");
+            assert_eq!(meta_of(&index).unwrap()["format"], meta_of(&shipped).unwrap()["format"], "{case}");
+            assert_eq!(names(&idx, "otherton"), vec!["Otherton"], "{case}");
+        }
+    }
+
+    #[test]
+    fn a_partial_build_over_an_index_of_another_format_is_refused() {
+        for &kept in SUB_INDEXES {
+            let ds = TempDir::new("partial-format");
+            let index = ds.0.join("search");
+            with_poi(["Testville", "Otherton"], "Old Mill").write(&ds.0);
+            build_subs(&ds.0, &index, SUB_INDEXES).unwrap();
+            set_meta(&index, "format", Some(json!(1)));
+            let building: Vec<&str> = SUB_INDEXES.iter().copied().filter(|&s| s != kept).collect();
+
+            let refused = build_subs(&ds.0, &index, &building);
+
+            assert!(refused.as_ref().is_err_and(|e| e.contains(&format!("retained {kept} sub-index"))), "{kept}: {refused:?}");
+            build_subs(&ds.0, &index, SUB_INDEXES).unwrap();
+            let (geo, stamps) = load_dataset(&ds.0);
+            assert_eq!(open(&geo, &stamps, &ds.0, &index, &BuildOnDevice::default()).unwrap().1, Origin::Current, "{kept}");
+        }
+    }
+
     #[test]
     fn an_index_shipped_beside_one_boundary_tier_is_rebuilt_beside_the_other() {
         // One county in two tiers, which share its record and ring and differ in their arcs: the
@@ -495,11 +551,11 @@ mod tests {
     }
 
     /// Over the index `open` built in `index` of the dataset in `dir` (loaded as `geo`): a
-    /// `place-search build --no-inline` of the same files, killed between moving in its
+    /// `place-search build --area-proxy` of the same files, killed between moving in its
     /// places.fst and its places.post. The old places.post and META_FILE are still in place.
     fn cut_off_publish(geo: &Index, dir: &Path, index: &Path) {
         let stage = index.join(BUILD_STAGE_DIR);
-        let opts = BuildOpts { inline: false, ..BuildOpts::new(dir.join("tmp")) };
+        let opts = BuildOpts { area_proxy: true, ..BuildOpts::new(dir.join("tmp")) };
         let meta = index_meta(geo, &opts, &fingerprint(dir).unwrap());
         build_all(geo, &held_subs(geo, SUB_INDEXES), &stage, &opts, || Ok(meta.into())).unwrap();
         let aside = stage.join(BUILD_ASIDE_DIR);
@@ -800,6 +856,6 @@ mod tests {
 
         assert!(!without.contains_key("strings_poi.bin"));
         assert_eq!(with.len(), without.len() + 1);
-        assert_eq!(with["strings_poi.bin"], format!("{:x}", Sha256::digest(b"\0")));
+        assert_eq!(with["strings_poi.bin"], lower_hex(&Sha256::digest(b"\0")));
     }
 }

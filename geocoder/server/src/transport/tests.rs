@@ -990,7 +990,7 @@ fn the_templates_units_are_this_versions_kinds_and_their_members() {
 
 fn sha256_hex(b: &[u8]) -> String {
     use sha2::Digest;
-    format!("{:x}", sha2::Sha256::digest(b))
+    crate::lower_hex(&sha2::Sha256::digest(b))
 }
 
 /// The names in `dir` and their bytes.

@@ -18,7 +18,7 @@ use axum::response::{IntoResponse, Response};
 use query_server::arc_fixture::ArcFixture;
 use query_server::poi_files::PoiPolygon;
 use query_server::transport::{self, Kind};
-use query_server::{place_files, poi_files, PlaceNode, PoiRecord, PointE7, DEFAULT_ADMIN_CELL_LEVEL, NO_DATA, PLACE_FLAG_HIDDEN};
+use query_server::{lower_hex, place_files, poi_files, PlaceNode, PoiRecord, PointE7, DEFAULT_ADMIN_CELL_LEVEL, NO_DATA, PLACE_FLAG_HIDDEN};
 use sha2::{Digest, Sha256};
 
 use crate::downloader::Configurations;
@@ -176,7 +176,7 @@ fn dataset(dir: &str) -> BTreeMap<&'static str, Vec<u8>> {
 }
 
 fn sha256(b: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(b))
+    lower_hex(&Sha256::digest(b))
 }
 
 /// Serves a build whose manifest has `components`.

@@ -865,8 +865,8 @@ static uint64_t string_pool_size(const std::string& path) {
 // family's logical size instead. And the bytes a diff writes to scratch for
 // dir, which stay on the volume while it runs: the logical files of its
 // families and the pool of each string tier where the diff of a dir that
-// ships none finds one (try_load_tier: dir, ../full, ../../full, an empty
-// pool as none).
+// ships none finds one (load_tiers: dir, ../full, ../../full, an empty pool
+// as none).
 static int logical_size(const std::string& dir) {
     if (!std::filesystem::is_directory(dir)) throw std::runtime_error("Not a dir: " + dir);
     uint64_t mapped = 0, scratch = 0;
@@ -1268,23 +1268,70 @@ static int run(int argc, char* argv[]) {
         return 1;
     }
     ScratchDir scratch("geocoder-diff");
+    // A shipped tier is rebuilt from the client's own old file, so both
+    // sides come from the dir itself. The others are only remapped through
+    // and may be borrowed; a newly shipped one is sent whole at the end.
+    const ShippedStringTiers tier_files = shipped_string_tiers(old_dir, new_dir);
+    const uint32_t shipped = tier_files.shipped;
+    // Each day's string tiers: each tier's pool, decoded from its FCC2 file
+    // into scratch and mapped (map_string_pool), and the hash of a shipped
+    // tier's file. String tiers may be absent from the input dir when
+    // geocoder-diff is invoked on a per-variant subdir (e.g.
+    // <region>/quality/<q>/ or <region>/poi/<tier>/) — strings_*.bin live
+    // under the sibling <region>/full/ directory. Fall back upward through
+    // one or two path levels to find them. Without this fallback the
+    // str_remap ends up empty and records that should match (after name_id
+    // re-tier) get classified as INSERT/DELETE → byte-block walker produces
+    // patches the size of the whole vertex stream.
+    std::array<MappedFile, 5> old_tier_maps{}, new_tier_maps{};
+    std::array<uint64_t, 5> old_tier_hash{}, new_tier_hash{};
+    auto load_tiers = [&](const std::string& dir, const std::string& day, std::array<MappedFile, 5>& maps,
+                          std::array<uint64_t, 5>& hashes) {
+        size_t pools = 0;
+        auto load_tier = [&](const std::string& path) {
+            return map_string_pool(path, scratch.path() + "/pool-" + day + "-" + std::to_string(pools++));
+        };
+        for (int t = 0; t < 5; t++) {
+            const char* name = STRING_TIER_FILES[t];
+            if (shipped >> t & 1) {
+                maps[t] = load_tier(dir + "/" + name);
+                hashes[t] = string_tier_file_hash_of(dir + "/" + name);
+                continue;
+            }
+            for (const char* in : {"/", "/../full/", "/../../full/"}) {
+                maps[t] = load_tier(dir + in + name);
+                if (maps[t].size > 0 || maps[t].data != nullptr) break;
+            }
+        }
+    };
+    // The two days' logical files and string tiers, each of the four beside
+    // the others. A day's families fail the diff first, a tier after the
+    // record limits below.
+    std::exception_ptr old_tiers_failed, new_tiers_failed;
     {
         const std::string old_to = scratch.path() + "/old-logical", new_to = scratch.path() + "/new-logical";
         bool old_has = false, new_has = false;
         std::exception_ptr old_failed, new_failed;
-        std::thread t_old([&] {
-            try {
-                old_has = decode_logical_files(old_dir, old_to);
-            } catch (...) {
-                old_failed = std::current_exception();
-            }
-        });
+        auto beside = [](std::exception_ptr& failed, std::function<void()> work) {
+            return std::thread([&failed, work = std::move(work)] {
+                try {
+                    work();
+                } catch (...) {
+                    failed = std::current_exception();
+                }
+            });
+        };
+        std::thread t_old = beside(old_failed, [&] { old_has = decode_logical_files(old_dir, old_to); });
+        std::thread t_old_tiers = beside(old_tiers_failed, [&] { load_tiers(old_dir, "old", old_tier_maps, old_tier_hash); });
+        std::thread t_new_tiers = beside(new_tiers_failed, [&] { load_tiers(new_dir, "new", new_tier_maps, new_tier_hash); });
         try {
             new_has = decode_logical_files(new_dir, new_to);
         } catch (...) {
             new_failed = std::current_exception();
         }
         t_old.join();
+        t_old_tiers.join();
+        t_new_tiers.join();
         if (old_failed) std::rethrow_exception(old_failed);
         if (new_failed) std::rethrow_exception(new_failed);
         if (old_has) logical_dirs()[old_dir] = old_to;
@@ -1327,33 +1374,11 @@ static int run(int argc, char* argv[]) {
         return {std::move(ok), std::move(nk)};
     };
 
-    // Build string remap (each tier's pool, decoded from its FCC2 file and
-    // mapped: map_string_pool) over the global-offset layout that record
-    // name_ids point into.
+    // Build string remap (the tiers' pools, loaded above) over the
+    // global-offset layout that record name_ids point into.
     // Tier bases are the cumulative sizes of the tiers found; a tier found
     // nowhere is empty (strings_poi.bin beside full/).
     std::cerr << "Building string remap... (RSS=" << get_rss_mb() << " MiB)" << std::endl;
-    std::array<MappedFile, 5> old_tier_maps{}, new_tier_maps{};
-    std::array<uint32_t, 6> old_tier_bases{};
-    // String tiers may be absent from the input dir when geocoder-diff
-    // is invoked on a per-variant subdir (e.g. <region>/quality/<q>/
-    // or <region>/poi/<tier>/) — strings_*.bin live under the sibling
-    // <region>/full/ directory. Fall back upward through one or two
-    // path levels to find them. Without this fallback the str_remap
-    // ends up empty and records that should match (after name_id
-    // re-tier) get classified as INSERT/DELETE → byte-block walker
-    // produces patches the size of the whole vertex stream.
-    size_t pools = 0;
-    auto load_tier = [&](const std::string& path) {
-        return map_string_pool(path, scratch.path() + "/pool-" + std::to_string(pools++));
-    };
-    auto try_load_tier = [&](const std::string& dir, const char* fname) -> MappedFile {
-        MappedFile m = load_tier(dir + "/" + fname);
-        if (m.size > 0 || m.data != nullptr) return m;
-        m = load_tier(dir + "/../full/" + fname);
-        if (m.size > 0 || m.data != nullptr) return m;
-        return load_tier(dir + "/../../full/" + fname);
-    };
     // Every record file the merges read, old and new, is refused before it is
     // diffed when it holds more records than a patch can index. Its size is
     // the dir's own file's, as the merges' loads find it (merge_path), but
@@ -1369,22 +1394,10 @@ static int run(int argc, char* argv[]) {
         const uint64_t old_size = merged_size(old_dir, name), new_size = merged_size(new_dir, name);
         require_merge_records(name, old_size, new_size, f.stride, file_records_max);
     }
-    // A shipped tier is rebuilt from the client's own old file, so both
-    // sides come from the dir itself. The others are only remapped through
-    // and may be borrowed; a newly shipped one is sent whole at the end.
-    const ShippedStringTiers tier_files = shipped_string_tiers(old_dir, new_dir);
-    const uint32_t shipped = tier_files.shipped;
-    std::array<uint64_t, 5> old_tier_hash{}, new_tier_hash{};
-    for (int t = 0; t < 5; t++) {
-        const bool own = shipped >> t & 1;
-        old_tier_maps[t] = own ? load_tier(old_dir + "/" + STRING_TIER_FILES[t]) : try_load_tier(old_dir, STRING_TIER_FILES[t]);
-        new_tier_maps[t] = own ? load_tier(new_dir + "/" + STRING_TIER_FILES[t]) : try_load_tier(new_dir, STRING_TIER_FILES[t]);
-        old_tier_bases[t + 1] = old_tier_bases[t] + static_cast<uint32_t>(old_tier_maps[t].size);
-        if (own) {
-            old_tier_hash[t] = string_tier_file_hash_of(old_dir + "/" + STRING_TIER_FILES[t]);
-            new_tier_hash[t] = string_tier_file_hash_of(new_dir + "/" + STRING_TIER_FILES[t]);
-        }
-    }
+    if (old_tiers_failed) std::rethrow_exception(old_tiers_failed);
+    if (new_tiers_failed) std::rethrow_exception(new_tiers_failed);
+    std::array<uint32_t, 6> old_tier_bases{};
+    for (int t = 0; t < 5; t++) old_tier_bases[t + 1] = old_tier_bases[t] + static_cast<uint32_t>(old_tier_maps[t].size);
     SortedU32Map str_remap;
     {
         std::vector<char> old_concat, new_concat;
@@ -1739,15 +1752,13 @@ static int run(int argc, char* argv[]) {
         street_remap_ready.set_value();
         // Restore original node_offsets for child merge
         for (size_t i = 0; i < wn; i++) memcpy(old_w.data + i * way_stride, &old_offsets[i], 4);
-        if (old_n.data && new_n.data) {
-            auto node_seq = build_child_merge(way_seq, old_w.data, old_w.size, new_w.data, new_w.size,
-                                               old_n.data, old_n.size, new_n.data, new_n.size, way_stride);
-            res_nodes = {PatchFileId::STREET_NODES, "street_nodes.bin", 8,
-                         old_n.size, new_n.size, std::move(node_seq), {}};
-        } else {
-            res_nodes = {PatchFileId::STREET_NODES, "street_nodes.bin", 8,
-                         0, 0, MergeSequence{}, {}};
-        }
+        // The nodes merge as the ways' child stream whether or not either day
+        // has one: a dir's first nodes go as one INSERT and its last as one
+        // DELETE, and a pair of no ways on both days merges as nothing.
+        auto node_seq = build_child_merge(way_seq, old_w.data, old_w.size, new_w.data, new_w.size,
+                                           old_n.data, old_n.size, new_n.data, new_n.size, way_stride);
+        res_nodes = {PatchFileId::STREET_NODES, "street_nodes.bin", 8,
+                     old_n.size, new_n.size, std::move(node_seq), {}};
         log_merge(res_nodes);
         unmap_file(old_w); unmap_file(new_w); unmap_file(old_n); unmap_file(new_n);
         log_time("  group:streets", gs);

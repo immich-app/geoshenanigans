@@ -19,6 +19,8 @@ MIB = 1 << 10  # in KiB
 GIB = 1 << 20
 # What a verify holds besides the new variant's client files: generate_patches.sh's patcher_scratch_kib.
 PATCHER_SCRATCH_KIB = GIB
+# What a diff's estimate holds for each day besides its files: generate_patches.sh's 64 MiB.
+DIFF_DAY_KIB = 64 * MIB
 # A memory budget no test's diffs reach, and free scratch no test's jobs fill.
 AMPLE_MEMORY_KIB = 1 << 40
 AMPLE_SCRATCH_KIB = 1 << 40
@@ -182,10 +184,10 @@ class GeneratePatchesTest(unittest.TestCase):
         self.assertEqual(night.result("r/no-addresses")[:2], ["PASS", "2"])
         self.assertEqual(os.listdir(night.scratch), [])
 
-    # The record files in the dirs are 48 bytes a day: the weight is what the
-    # diff says it maps, twice, and 14 times the string tiers' files; the
-    # diff's scratch what it says it writes; the verify's the new day's
-    # client files and the patcher's own.
+    # The record files in the dirs are 48 bytes a day: the weight is 9/8 of
+    # what the diff says it maps, 4 times the string tiers' files and 64 MiB,
+    # a day each; the diff's scratch what it says it writes; the verify's the
+    # new day's client files and the patcher's own.
     def test_a_variants_weight_and_scratch_need_are_the_diffs_two_logical_sizes(self):
         night = Night(self, ["r/full"])
         night.scenario["logical"][night.old("r/full")] = [3 * MIB * 1024, 5 * MIB * 1024 - 1023]
@@ -198,7 +200,7 @@ class GeneratePatchesTest(unittest.TestCase):
 
         night.run()
 
-        memory = (3 * MIB + 4 * MIB) * 2 + (2 + 4) * 14
+        memory = (3 * MIB + 4 * MIB) * 9 // 8 + (2 + 4) * 4 + 2 * DIFF_DAY_KIB
         verify = 5 + PATCHER_SCRATCH_KIB  # 48 + 4096 bytes of client files
         self.assertEqual(night.stdout, "r/full: diff %d KiB of memory and %d KiB of scratch, verify %d KiB of scratch\n"
                          % (memory, 5 * MIB + 7 * MIB, verify))
@@ -250,10 +252,10 @@ class GeneratePatchesTest(unittest.TestCase):
 
         self.assert_the_diffs_took_turns(night)
 
-    # Each diff's estimate is 2 MiB: over a budget of 3 MiB they take turns,
-    # and over one of 1 MiB each still runs, alone.
+    # Each diff's estimate is 129 MiB (512 KiB mapped a day): over a budget of
+    # 200 MiB they take turns, and over one of 100 MiB each still runs, alone.
     def test_two_diffs_that_fit_the_scratch_and_not_the_memory_budget_run_one_after_the_other(self):
-        for budget in (3 * MIB, 1 * MIB):
+        for budget in (200 * MIB, 100 * MIB):
             with self.subTest(budget=budget):
                 night = Night(self, ["r/a", "r/b"])
                 night.sizes("r/a", 512, 1)

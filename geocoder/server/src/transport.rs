@@ -69,6 +69,7 @@ mod container;
 mod places;
 mod pois;
 
+use crate::lower_hex;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -276,7 +277,7 @@ pub fn decode_into_dir(unit: impl Read, dir: &Path, expect: Option<&[Expected]>)
     let kind = decoded.kind;
     let mut members = Vec::with_capacity(decoded.members.len());
     for ((m, w), e) in decoded.members.into_iter().zip(&wanted) {
-        let got = format!("{:x}", w.sha.finalize());
+        let got = lower_hex(&w.sha.finalize());
         if let Some(e) = e.filter(|e| e.sha256 != got) {
             return Err(container::invalid(format!("{}'s sha256 is {got}, not {}", m.name, e.sha256)));
         }
