@@ -1438,6 +1438,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "unicode-normalization",
+ "zstd",
 ]
 
 [[package]]

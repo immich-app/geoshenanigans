@@ -15,6 +15,12 @@ path = "src/lib.rs"
 name = "place-search"
 path = "src/main.rs"
 
+# The transport units' encoder and decoder (query_server::transport) as a CLI: a bin of this
+# crate, so the nightly's place-search build makes it with no second build of query-server.
+[[bin]]
+name = "geocoder-transport"
+path = "src/transport_cli.rs"
+
 [dependencies]
 fst = "0.4"
 levenshtein_automata = "0.2"
@@ -22,6 +28,7 @@ unicode-normalization = "0.1"
 memmap2 = "0.9"
 serde_json = "1"
 sha2 = "0.10"
+zstd = "0.13"
 query-server = { path = "../server" }
 
 [dev-dependencies]
