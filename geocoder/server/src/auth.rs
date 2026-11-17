@@ -159,7 +159,7 @@ pub fn check_rate(limiter: &RateLimiter, login: &str, rate_per_second: u32, rate
 
 fn random_hex(len: usize) -> String {
     let mut bytes = vec![0u8; len];
-    getrandom::getrandom(&mut bytes).expect("getrandom failed");
+    getrandom::fill(&mut bytes).expect("getrandom failed");
     let mut s = String::with_capacity(len * 2);
     for b in &bytes {
         write!(s, "{:02x}", b).unwrap();
