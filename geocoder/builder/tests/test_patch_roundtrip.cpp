@@ -1610,9 +1610,10 @@ TEST(patch_round_trip_keeps_a_side_file_of_no_values) {
 // A full dir holds both way pairs, and a pair of no ways is its two footers
 // (8 and 16 bytes): a family without records, which merges as nothing and
 // which the patcher writes again, beside the other pair's day and with both
-// pairs so. A dir gains the footers and loses them, and its first
-// interpolations come and its last go, from and to the footers and from and
-// to no files.
+// pairs so. A dir gains the footers and loses them, and its first streets
+// and its first interpolations come and their last go, from and to the
+// footers and from and to no files, their nodes merged as every node
+// inserted or deleted.
 TEST(patch_round_trip_of_a_dir_with_no_ways_no_interpolations_or_neither) {
     const BuildDir no_streets = {{"street_ways.bin", {}}, {"street_nodes.bin", {}}};
     const BuildDir no_interps = {{"interp_ways.bin", {}}, {"interp_nodes.bin", {}}};
@@ -1645,12 +1646,27 @@ TEST(patch_round_trip_of_a_dir_with_no_ways_no_interpolations_or_neither) {
     some.insert(no_streets.begin(), no_streets.end());
     some["interp_ways.bin"] = bytes_of(std::vector<InterpWay>{{0, 2, 0, OLD_B, 1, 9, 0}, {2, 1, 0, OLD_C, 2, 8, 0}});
     some["interp_nodes.bin"] = nodes_of({1, 2, 3});
+    BuildDir streets = without;
+    streets.insert(no_interps.begin(), no_interps.end());
+    streets["street_ways.bin"] = bytes_of(std::vector<WayHeader>{{0, 2, 0, OLD_B}, {2, 1, 0, OLD_C}});
+    streets["street_nodes.bin"] = nodes_of({1, 2, 3});
     CHECK(round_trip(without, empty).mismatches.empty());
     CHECK(round_trip(empty, without).mismatches.empty());
-    CHECK(round_trip(empty, some).mismatches.empty());
-    CHECK(round_trip(some, empty).mismatches.empty());
-    CHECK(round_trip(without, some).mismatches.empty());
-    CHECK(round_trip(some, without).mismatches.empty());
+    struct Day {
+        const BuildDir &old_d, &new_d;
+        const char* nodes;
+        std::string merged;
+    };
+    for (const Day& day : {Day{empty, some, "interp_nodes.bin", "m/i/d/r=0/3/0/0"}, Day{some, empty, "interp_nodes.bin", "m/i/d/r=0/0/3/0"},
+                           Day{without, some, "interp_nodes.bin", "m/i/d/r=0/3/0/0"}, Day{some, without, "interp_nodes.bin", "m/i/d/r=0/0/3/0"},
+                           Day{empty, streets, "street_nodes.bin", "m/i/d/r=0/3/0/0"}, Day{streets, empty, "street_nodes.bin", "m/i/d/r=0/0/3/0"},
+                           Day{without, streets, "street_nodes.bin", "m/i/d/r=0/3/0/0"},
+                           Day{streets, without, "street_nodes.bin", "m/i/d/r=0/0/3/0"}}) {
+        const RoundTrip r = round_trip(day.old_d, day.new_d);
+
+        CHECK(r.mismatches.empty());
+        CHECK_EQ(merge_records(r, day.nodes), day.merged);
+    }
 }
 
 // A full dir holds the address files, and those of no address are three

@@ -140,63 +140,72 @@ impl Posting {
     }
 }
 
-/// fst value: bit 0 set = the key's single posting inline, else the byte offset of its list.
-pub fn inline_value(p: &Posting) -> u64 {
-    1 | ((p.imp_q as u64) << 1) | ((p.partial as u64) << 9) | ((p.class_ord() as u64) << 10) | ((p.entity as u64) << 18)
-}
-
-pub fn decode_inline(v: u64) -> Posting {
-    let co = ((v >> 10) & 0xFF) as u8;
-    Posting {
-        entity: (v >> 18) as u32,
-        imp_q: ((v >> 1) & 0xFF) as u8,
-        partial: (v >> 9) & 1 == 1,
-        class: co >> 4,
-        ord: co & 0x0F,
-    }
-}
-
-/// fst value of a key with a posting list: the list's byte offset and its best importance (so
-/// ranking keys never touches the postings file).
-pub fn list_value(offset: u64, top_imp: u8) -> u64 {
-    (offset << 9) | ((top_imp as u64) << 1)
-}
-
-pub fn list_offset(v: u64) -> usize {
-    (v >> 9) as usize
-}
-
-pub fn value_top_imp(v: u64) -> u8 {
-    ((v >> 1) & 0xFF) as u8
-}
-
-/// A key's list: count, then per posting entity<<2|has_class_ordinal<<1|partial, the importance drop from the
-/// previous posting (lists are best importance first), and an optional class/ordinal byte.
+/// A key's list, at the byte offset its fst value holds: varint count, then per posting a varint
+/// importance (the first as itself, every later one as its drop from the one before), a varint
+/// entity<<2|has_class_ordinal<<1|partial and an optional class/ordinal byte. The entity is
+/// written as the step from the one before when the posting has the importance and the
+/// trailing-word flag of the posting before it. `list` is in the order the build keeps it
+/// (`Group::take`: importance down, whole names first, then entities up), so those steps are
+/// positive.
 pub fn encode_list(out: &mut Vec<u8>, list: &[Posting]) {
     varint::put(out, list.len() as u64);
-    let mut prev = u8::MAX;
+    let mut prev: Option<Posting> = None;
     for p in list {
-        varint::put(out, ((p.entity as u64) << 2) | ((p.class_ord() != 0) as u64) << 1 | p.partial as u64);
-        varint::put(out, (prev - p.imp_q) as u64);
-        prev = p.imp_q;
+        let (imp, entity) = match prev {
+            None => (p.imp_q, p.entity),
+            Some(q) => {
+                assert!(q.imp_q >= p.imp_q, "a list not best importance first");
+                let run = q.imp_q == p.imp_q && q.partial == p.partial;
+                assert!(!run || q.entity < p.entity, "a run of postings not in entity order");
+                (q.imp_q - p.imp_q, if run { p.entity - q.entity } else { p.entity })
+            }
+        };
+        varint::put(out, imp as u64);
+        varint::put(out, ((entity as u64) << 2) | ((p.class_ord() != 0) as u64) << 1 | p.partial as u64);
         if p.class_ord() != 0 {
             out.push(p.class_ord());
         }
+        prev = Some(*p);
     }
 }
 
+/// The postings of the list at `off` (`encode_list`). A list is read within `buf`: one cut short,
+/// or holding a posting no build writes (an importance below 0 or over 255, an entity past 32
+/// bits), ends before that posting; one at an offset past the end has none.
 pub struct ListReader<'a> {
     buf: &'a [u8],
     pos: usize,
-    left: usize,
-    prev: u8,
+    left: u64,
+    prev: Option<Posting>,
 }
 
 impl<'a> ListReader<'a> {
     pub fn new(buf: &'a [u8], off: usize) -> Self {
         let mut pos = off;
-        let left = varint::get(buf, &mut pos) as usize;
-        ListReader { buf, pos, left, prev: u8::MAX }
+        let left = varint::try_get(buf, &mut pos).unwrap_or(0);
+        ListReader { buf, pos, left, prev: None }
+    }
+
+    fn read(&mut self) -> Option<Posting> {
+        let imp = varint::try_get(self.buf, &mut self.pos)?;
+        let ep = varint::try_get(self.buf, &mut self.pos)?;
+        let (partial, field) = (ep & 1 == 1, u32::try_from(ep >> 2).ok()?);
+        let (imp_q, entity) = match self.prev {
+            None => (u8::try_from(imp).ok()?, field),
+            Some(q) => {
+                let imp_q = q.imp_q.checked_sub(u8::try_from(imp).ok()?)?;
+                let run = imp == 0 && q.partial == partial;
+                (imp_q, if run { q.entity.checked_add(field)? } else { field })
+            }
+        };
+        let co = if ep & 2 != 0 {
+            let b = *self.buf.get(self.pos)?;
+            self.pos += 1;
+            b
+        } else {
+            0
+        };
+        Some(Posting { entity, imp_q, partial, class: co >> 4, ord: co & 0x0F })
     }
 }
 
@@ -207,17 +216,22 @@ impl Iterator for ListReader<'_> {
             return None;
         }
         self.left -= 1;
-        let ep = varint::get(self.buf, &mut self.pos);
-        let drop = varint::get(self.buf, &mut self.pos) as u8;
-        self.prev -= drop;
-        let co = if ep & 2 != 0 {
-            self.pos += 1;
-            self.buf[self.pos - 1]
-        } else {
-            0
-        };
-        Some(Posting { entity: (ep >> 2) as u32, imp_q: self.prev, partial: ep & 1 == 1, class: co >> 4, ord: co & 0x0F })
+        let p = self.read();
+        // A posting that does not read ends the list.
+        self.left = if p.is_some() { self.left } else { 0 };
+        self.prev = p;
+        p
     }
+}
+
+/// The best importance of the list at `off`: its first posting's. None for a list without one
+/// that reads.
+pub fn list_top_imp(buf: &[u8], off: usize) -> Option<u8> {
+    let mut pos = off;
+    if varint::try_get(buf, &mut pos)? == 0 {
+        return None;
+    }
+    u8::try_from(varint::try_get(buf, &mut pos)?).ok()
 }
 
 /// Prefix-table hit: entity<<2|has_class_ordinal<<1|partial, the text score as a byte, the importance byte, and an
@@ -278,30 +292,84 @@ mod tests {
         assert_eq!(class_of("name:tg"), 5);
     }
 
-    #[test]
-    fn lists_round_trip() {
-        let list = [
-            Posting { entity: 5_000_000, imp_q: 200, partial: false, class: 0, ord: 0 },
-            Posting { entity: 7, imp_q: 200, partial: true, class: 2, ord: 3 },
-            Posting { entity: 123_456, imp_q: 4, partial: false, class: 5, ord: 15 },
-        ];
-        {
-            let mut b = vec![0xAA];
-            encode_list(&mut b, &list);
-            let got: Vec<Posting> = ListReader::new(&b, 1).collect();
-            assert_eq!(got.len(), list.len());
-            for (g, w) in got.iter().zip(&list) {
-                assert_eq!((g.entity, g.imp_q, g.partial), (w.entity, w.imp_q, w.partial));
-                assert_eq!((g.class, g.ord), (w.class, w.ord));
-            }
-        }
+    fn post(entity: u32, imp_q: u8, partial: bool, class: u8, ord: u8) -> Posting {
+        Posting { entity, imp_q, partial, class, ord }
+    }
+
+    /// A list in the order the build keeps it (importance down, whole names first, entities up),
+    /// with runs, a change of flag, class/ordinal bytes and a first importance of two bytes.
+    fn sample_list() -> Vec<Posting> {
+        vec![
+            post(5_000_000, 200, false, 0, 0),
+            post(5_000_003, 200, false, 2, 3),
+            post(7, 200, true, 0, 0),
+            post(123_456, 4, false, 5, 15),
+            post(123_457, 4, false, 0, 0),
+        ]
     }
 
     #[test]
-    fn inline_round_trips() {
-        let p = Posting { entity: 24_000_000 | POI_BIT, imp_q: 254, partial: true, class: 3, ord: 9 };
-        assert_eq!(decode_inline(inline_value(&p)), p);
-        assert_eq!(inline_value(&p) & 1, 1);
+    fn a_list_is_its_importances_and_its_entities_as_steps_within_a_run() {
+        let list = [post(5, 40, false, 0, 0), post(9, 40, false, 0, 0), post(3, 40, true, 0, 0), post(8, 40, true, 2, 1), post(2, 12, false, 0, 0)];
+        let mut b = Vec::new();
+
+        encode_list(&mut b, &list);
+
+        // count; then per posting the importance (the first as itself, then its drop), the
+        // entity (a step after a posting of the same importance and flag) << 2 | class/ordinal
+        // byte follows << 1 | trailing word, and that byte.
+        assert_eq!(b, [5, 40, 5 << 2, 0, 4 << 2, 0, 3 << 2 | 1, 0, 5 << 2 | 2 | 1, 0x21, 28, 2 << 2]);
+    }
+
+    #[test]
+    fn lists_round_trip() {
+        let list = sample_list();
+        let mut b = vec![0xAA];
+        encode_list(&mut b, &list);
+
+        let got: Vec<Posting> = ListReader::new(&b, 1).collect();
+
+        assert_eq!(got, list);
+    }
+
+    #[test]
+    fn a_damaged_list_reads_without_a_panic() {
+        let list = sample_list();
+        let mut whole = Vec::new();
+        encode_list(&mut whole, &list);
+        // Cut anywhere: the postings before the cut.
+        for cut in 0..whole.len() {
+            let got: Vec<Posting> = ListReader::new(&whole[..cut], 0).collect();
+            assert_eq!(got[..], list[..got.len()], "cut at {cut}");
+        }
+        // Any byte replaced, or read from past its end: no panic, no more postings than it counts.
+        for at in 0..whole.len() {
+            for b in [0x00, 0x01, 0x7F, 0x80, 0xFF] {
+                let mut bad = whole.clone();
+                bad[at] = b;
+                assert!(ListReader::new(&bad, 0).count() <= whole.len() / 2, "byte {at} = {b:#x}");
+            }
+        }
+        assert_eq!(ListReader::new(&whole, whole.len() + 10).count(), 0);
+        assert_eq!(ListReader::new(&[0xFF; 16], 0).count(), 0);
+    }
+
+    #[test]
+    fn a_list_ends_at_a_posting_no_build_writes() {
+        let varint = |v: u64| {
+            let mut b = Vec::new();
+            varint::put(&mut b, v);
+            b
+        };
+        let cases: [(&str, Vec<u8>, usize); 4] = [
+            ("an importance dropping below zero", [&[2, 10, 5 << 2, 11, 6 << 2][..]].concat(), 1),
+            ("a first importance over 255", [&[1][..], &varint(256), &[5 << 2]].concat(), 0),
+            ("an entity over 32 bits", [&[1, 10][..], &varint(1 << 34)].concat(), 0),
+            ("an entity step past 32 bits", [&[2, 10][..], &varint((u32::MAX as u64) << 2), &[0, 1 << 2]].concat(), 1),
+        ];
+        for (case, bytes, n) in cases {
+            assert_eq!(ListReader::new(&bytes, 0).count(), n, "{case}");
+        }
     }
     #[test]
     fn prefix_hits_keep_name_metadata_without_extras() {

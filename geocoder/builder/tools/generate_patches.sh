@@ -16,18 +16,21 @@
 # each variant's estimates, a line a variant, to stdout.
 #
 # Jobs start largest first and only while their estimated peak memory fits:
-# a diff peaks at about 2 × the bytes it maps for its old + new record files
-# plus 14 × the string tiers it loads, its own or borrowed from ../full. The
-# mapped bytes are the first number of geocoder-diff --logical-size: a dir's
-# non-string .bin files, those the builder writes encoded at their logical
-# size, which is what the diff maps of them. Measured vs estimated GiB:
-# planet/full 24.8 vs 78.5, planet/poi/all 4.4 vs 16.7,
-# planet/quality/exact 1.3 vs 6.6 (its admin geometry merged by slot). The
-# budget is 3/4 of the memory available at start, or of the job's cgroup limit
-# if lower. A variant holds its estimate only while its diff runs: the patch
-# + verify after it stream in about 10 MiB, so they run alongside later diffs.
-# A diff bigger than the whole budget still runs, alone. At most nproc jobs
-# run at once.
+# 9/8 × the bytes a diff maps for its old + new record files, plus 4 × the
+# string tiers it loads, its own or borrowed from ../full, plus 64 MiB a day.
+# The mapped bytes are the first number of geocoder-diff --logical-size: a
+# dir's non-string .bin files, those the builder writes encoded at their
+# logical size, which is what the diff maps of them. Measured peak (max RSS)
+# vs estimated GiB on two planet days: planet/full 24.9 vs 43.1,
+# planet/no-addresses 11.9 vs 16.5, europe/full 12.6 vs 17.8, planet/poi/all
+# 4.4 vs 6.6, planet/poi/major 1.25 vs 1.75, planet/admin 1.22 vs 1.69,
+# planet/quality/exact 1.32 vs 2.65 (its admin geometry merged by slot),
+# planet/quality/simplified 1.22 vs 1.66, antarctica/full 0.08 vs 0.13: each
+# estimate 1.36 × its peak or more. The budget is 3/4 of the memory available
+# at start, or of the job's cgroup limit if lower. A variant holds its
+# estimate only while its diff runs: the patch + verify after it stream in
+# about 10 MiB, so they run alongside later diffs. A diff bigger than the
+# whole budget still runs, alone. At most nproc jobs run at once.
 #
 # Jobs also start only while what they write to scratch fits $TMPDIR's volume.
 # A diff holds, from its start to its end, the second number of geocoder-diff
@@ -90,9 +93,10 @@ logical_sizes() {
   echo "$sizes"
 }
 
-# Estimated peak diff memory (KiB) for one side of a variant: the bytes the
-# diff maps for its record files (logical_sizes' first number), plus every
-# string tier as the diff resolves it (dir, ../full, ../../full).
+# Estimated peak diff memory (KiB) for one side of a variant: 9/8 of the
+# bytes the diff maps for its record files (logical_sizes' first number), 4 ×
+# every string tier as the diff resolves it (dir, ../full, ../../full), and
+# 64 MiB.
 side_weight_kib() {
   local dir=$1 mapped=$2 tier f strings=0
   for tier in core street addr postcode poi; do
@@ -100,7 +104,7 @@ side_weight_kib() {
       if [ -s "$f/strings_$tier.bin" ]; then strings=$((strings + $(size_kib "$f/strings_$tier.bin"))); break; fi
     done
   done
-  echo $(( mapped / 1024 * 2 + strings * 14 ))
+  echo $(( mapped / 1024 * 9 / 8 + strings * 4 + 64 * 1024 ))
 }
 
 # The bytes of a variant dir's client files: the set link_client_files.sh

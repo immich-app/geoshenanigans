@@ -320,11 +320,11 @@ impl<'a, 'g> Searcher<'a, 'g> {
         }
     }
 
-    fn ctx_of(&self, st: &mut State<'g>, e: u32) -> Rc<Ctx<'g>> {
+    /// Display context of entity `e`, which is at (`lat`, `lng`).
+    fn ctx_of(&self, st: &mut State<'g>, e: u32, (lat, lng): (f32, f32)) -> Rc<Ctx<'g>> {
         if let Some(c) = st.ctx.get(&e) {
             return c.clone();
         }
-        let (lat, lng) = self.idx.ents.point(e);
         st.stats.reverse_lookups += 1;
         let c = Rc::new(self.context_at(lat, lng));
         st.ctx.insert(e, c.clone());
@@ -349,7 +349,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
     /// of the reverse lookup, without its field mapping.
     fn context_mask(&self, ctx: &Context, names: &mut HashMap<(u32, u16, bool), u64>, e: u32) -> u64 {
         let geo: &Index = self.idx.geo;
-        let (lat, lng) = self.idx.ents.point(e);
+        let Some((lat, lng)) = self.idx.ents.point(e) else { return 0 };
         let point = AdminPoint::new(lat as f64, lng as f64);
         let mut m = 0u64;
         for (_, ap, interior) in self.cell_polygons(lat, lng) {
@@ -382,7 +382,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
     /// Whether entity `e`'s point lies in the boundary whose primary ring is `area` (any of its
     /// rings: same name, level and country).
     fn contained_in(&self, e: u32, area: &AdminPolygon) -> bool {
-        let (lat, lng) = self.idx.ents.point(e);
+        let Some((lat, lng)) = self.idx.ents.point(e) else { return false };
         let point = AdminPoint::new(lat as f64, lng as f64);
         for (_, ap, interior) in self.cell_polygons(lat, lng) {
             if ap.name_id != area.name_id || ap.admin_level != area.admin_level || ap.country_code != area.country_code {
@@ -523,6 +523,8 @@ impl<'a, 'g> Searcher<'a, 'g> {
                 .into_iter()
                 .map(|(v, t)| (v, t, t * t * (IMPORTANCE_FLOOR + dequantize(sub.first_imp(v)))))
                 .collect();
+            // Best bound first; keys that tie in key order (a value is its list's offset, and
+            // the lists are in key order).
             order.sort_by(|a, b| b.2.total_cmp(&a.2).then(a.0.cmp(&b.0)));
             for (v, t, bound) in order {
                 if bound <= pool.threshold() {
@@ -596,7 +598,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
         let mut out: Vec<Found<'g>> = Vec::new();
         let mut kept: Vec<(String, (f32, f32))> = Vec::new();
         for h in hits {
-            let at = self.idx.ents.point(h.entity);
+            let Some(at) = self.idx.ents.point(h.entity) else { continue };
             let name = self.display_name(&h, &phrases[h.split as usize]);
             let label = normalize(&name);
             if kept.iter().any(|(l, p)| *l == label && haversine_km(*p, at) < DEDUPE_KM) {
@@ -604,7 +606,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
             }
             kept.push((label, at));
             let (kind, typ) = self.idx.ents.kind_and_type(h.entity);
-            let ctx = self.ctx_of(&mut st, h.entity);
+            let ctx = self.ctx_of(&mut st, h.entity, at);
             out.push(Found { name, lat: at.0, lng: at.1, kind, typ: typ.into_owned(), ctx, hit: h });
             if out.len() >= limit {
                 break;
@@ -625,7 +627,8 @@ impl<'a, 'g> Searcher<'a, 'g> {
             if !ents.is_area(e) || Entities::is_poi(e) || e < ents.n_place_nodes {
                 continue;
             }
-            let area = polygon_raw(self.idx.geo, ents.slot(e - ents.n_place_nodes).poly);
+            let Some(slot) = ents.slot(e - ents.n_place_nodes) else { continue };
+            let area = polygon_raw(self.idx.geo, slot.poly);
             if area.admin_level == 2 {
                 continue;
             }
@@ -766,6 +769,31 @@ mod tests {
 
             assert_eq!(found.iter().map(|f| f.hit.entity).collect::<Vec<_>>(), want, "{q}");
         }
+    }
+
+    #[test]
+    fn keys_that_tie_are_read_in_key_order() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        let mut g = Geo::default();
+        // "abcd" starts both keys equally well and their postings have the same importance, so the
+        // keys tie, and once CANDIDATE_POOL postings of that score are in, no more enter: the key
+        // read first is found whole. Read in key order, "abcdx" (one POI) comes before "abcdy".
+        g.poi("Elsewhere", 0.0, 0.0, 9);
+        let first = g.poi("Abcdx", -30.0, -60.0, 9) | POI_BIT;
+        let mut second = Vec::new();
+        for k in 0..CANDIDATE_POOL as u32 {
+            second.push(g.poi("Abcdy", (k / 20) as f32 * 5.0 - 25.0, (k % 20) as f32 * 5.0 - 50.0, 9) | POI_BIT);
+        }
+        let dir = TempDir::new("ties");
+        let geo = g.load(&dir.0.join("geo"));
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
+
+        let (found, _) = Searcher::new(&idx).search("abcd", 3);
+
+        let got: Vec<(u32, &str)> = found.iter().map(|f| (f.hit.entity, f.name.as_str())).collect();
+        assert_eq!(got, [(first, "Abcdx"), (second[0], "Abcdy"), (second[1], "Abcdy")]);
     }
 
     #[test]

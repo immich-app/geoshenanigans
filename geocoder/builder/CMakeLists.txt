@@ -207,7 +207,7 @@ target_compile_definitions(geocoder-tests PRIVATE
 add_dependencies(geocoder-tests geocoder-diff geocoder-patch)
 target_link_libraries(geocoder-tests PRIVATE ZLIB::ZLIB libdeflate::libdeflate EXPAT::EXPAT Threads::Threads)
 # As geocoder-patch compiles the codecs.
-set_source_files_properties(tests/test_gcs_codec.cpp tests/test_gcs_patch.cpp tests/test_gcs_poi_io.cpp
+set_source_files_properties(tests/test_gcs_codec.cpp tests/test_gcs_patch.cpp tests/test_gcs_poi_io.cpp tests/test_poi_replay.cpp
     PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 # The tests of the patcher's decompression (tools/patch_decompress.h) expect the
 # zstd CLI build's, or run the libzstd one in process.

@@ -439,10 +439,18 @@ each of them (`dataset`: admin_polygons, admin_rings, arc_index, arc_vertices,
 place_cells, place_hidden, place_nodes, poi_records, strings_core,
 strings_layout.json, strings_poi), so an
 index built beside one boundary tier is built again beside the other, whose
-arcs its label points would not lie on; and the binding
-(`openPlaceSearch`) uses an index only while the files beside it hash the
-same. Any other index, or none, is built there from the files first, on one
-thread, within 32 MiB.
+arcs its label points would not lie on, and the layout of its files
+(`format`, 2); the binding (`openPlaceSearch`) uses an index only while the
+files beside it hash the same and it has the binding's layout. Any other
+index, or none, is built there from the files first, on one thread, within
+32 MiB.
+
+Each sub-index (`places`, `poi`) is an fst of the folded names whose values
+are byte offsets into `<sub>.post`, which holds every key's posting list in
+key order, and a prefix table (`<sub>.pfx.fst`, `<sub>.pfx`). `places.bnd`
+holds a labelled boundary as its polygon and label node, whose point
+`place_hidden.bin` holds, and an unlabelled one as its polygon and point on
+surface.
 
 - **Shipped**: the selections in `search_index.shipped` of
   `configurations.template.json` publish their index in every region under
@@ -458,20 +466,31 @@ thread, within 32 MiB.
   ones or not, the next open builds the index.
 
 A selection ships the index when it adds at most 5% (zstd) to the selection's
-planet pack. That holds for the two full-mode selections only. Measured on
-planet 2026-10-18 (stack/10), pack sizes from the published 2026-10-26 build.
-Device build is the binding's open building it on one thread, in 32 MiB the
-same build in a 32 MiB cgroup (2026-10-19), both on a busy box:
+planet pack. On the published 2026-11-16 packs no selection is under it: the
+two full-mode selections, which `search_index.shipped` lists, are at 5.7% and
+5.3%. Measured 2026-11-17 on a planet build of 2026-10-18's data, pack sizes
+from the published 2026-11-16 build without the index. Index is what it
+downloads (zstd -18 of every file), On disk what it takes in `search/`. Device
+build is `place-search build --threads 1`, the build the binding's open runs
+(the dataset hashed, then the index built), with the selection's files evicted
+from the page cache first, on one core; in 32 MiB the same build in a 32 MiB
+cgroup without swap:
 
-| Selection | Pack | Index | Adds | Ships | Device build | In 32 MiB |
-|-----------|------|-------|------|-------|--------------|-----------|
-| smallest (admin-minimal) | 217.4 MiB | 36.6 MiB | +16.8% | no | 10 s | 12 s |
-| recommended (admin + q2.5 + poi/major) | 547.5 MiB | 61.0 MiB | +11.1% | no | 17 s | 20 s |
-| with-addresses (full + q2.5 + poi/all) | 10,510 MiB | 412.0 MiB | +3.9% | yes | 135 s | 205 s |
-| max-quality (full + uncapped + poi/all) | 11,686 MiB | 411.9 MiB | +3.5% | yes | 131 s | 219 s |
+| Selection | Pack | Index | On disk | Adds | Ships | Device build | In 32 MiB |
+|-----------|------|-------|---------|------|-------|--------------|-----------|
+| smallest (admin-minimal) | 95.8 MiB | 36.1 MiB | 56.3 MiB | +37.7% | no | 11 s | 26 s |
+| recommended (admin + q2.5 + poi/major) | 296.4 MiB | 57.4 MiB | 91.5 MiB | +19.4% | no | 18 s | 50 s |
+| with-addresses (full + q2.5 + poi/all) | 6,371.5 MiB | 364.4 MiB | 634.4 MiB | +5.7% | yes | 132 s | 296 s |
+| max-quality (full + uncapped + poi/all) | 6,822.7 MiB | 364.4 MiB | 634.4 MiB | +5.3% | yes | 134 s | 330 s |
 
-A shipped selection ships it in every region: from +1.4% (north-america,
-54.1 MiB) to +11.2% (africa, 21.8 MiB) of the regional pack.
+The build's peak anonymous memory is 15.4 MiB (smallest) to 24.6 MiB (the
+full selections), and its peak disk, the sort runs beside the index, 151 MiB
+to 1,988 MiB.
+
+A shipped selection ships it in every region. With-addresses' index adds
+from +2.1% (north-america, 47.0 MiB) to +16.5% (africa, 19.9 MiB) to its
+regional pack, and +19.2% to antarctica's 0.55 MiB (the same build, its
+regional packs measured on it at zstd -18).
 
 Why the index is rebuilt rather than patched, measured from 2026-10-18 to
 10-19 on planet with-addresses: 17.7% of the place keys and 98% of the POI
