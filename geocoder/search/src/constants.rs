@@ -72,6 +72,10 @@ pub const BOUNDARY_MAX_LEVEL: u8 = 8;
 pub const DATASET_SEARCH_DIR: &str = "search";
 /// What an index was built from (options, sub-index stats, the dataset's file hashes); written last.
 pub const META_FILE: &str = "search_meta.json";
+/// The layout of the index files (the lists and their offsets, the boundary slots), recorded in
+/// META_FILE as META_FORMAT_KEY: an index of another is built again, never read.
+pub const INDEX_FORMAT: u64 = 2;
+pub const META_FORMAT_KEY: &str = "format";
 /// The META_FILE field that holds the dataset's file hashes (dataset.rs).
 pub const META_DATASET_KEY: &str = "dataset";
 /// The sub-indexes an index can hold, in build order.

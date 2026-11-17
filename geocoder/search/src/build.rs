@@ -2,10 +2,11 @@
 //! names become normalized keys, keys are sorted in bounded-memory runs (spilled to disk) and
 //! merged into an fst (written streaming) with postings and the short-prefix table.
 //!
-//! Output per sub-index `<name>` (places / poi): `<name>.fst` keys -> value (bit 0 set: the
-//! key's one posting inline, else the byte offset of its list in `<name>.post`),
+//! Output per sub-index `<name>` (places / poi): `<name>.fst` keys -> the byte offset of the
+//! key's list in `<name>.post` (every key's, in key order, so the offsets grow with the keys),
 //! `<name>.post`, `<name>.pfx.fst` + `<name>.pfx` (prefix table), and for places `places.bnd`
-//! (boundary slots). Nothing else is stored: names, points and types stay in the geocoder files.
+//! (boundary slots, `Boundaries`). Nothing else is stored: names, points and types stay in the
+//! geocoder files, a labelled boundary's point too (its label node's).
 use crate::constants::*;
 use crate::entities::*;
 use crate::extras::{record_ref, Extras, KIND_PLACE_NODE, KIND_POI};
@@ -24,8 +25,6 @@ pub struct BuildOpts {
     pub threads: usize,
     pub mem_mb: usize,
     pub tmp: PathBuf,
-    /// Single-posting keys carry their posting in the fst value.
-    pub inline: bool,
     pub extras: Option<String>,
     /// Directory with imp_places.u8 / imp_polys.u8 / imp_poi.u8 (the shipped importance bytes, one
     /// per record); a file left out leaves its records without them.
@@ -36,14 +35,13 @@ pub struct BuildOpts {
 }
 
 impl BuildOpts {
-    /// The index as it ships: one thread, the default sort budget, inline postings, every POI tier,
-    /// nothing beyond the geocoder files.
+    /// The index as it ships: one thread, the default sort budget, every POI tier, nothing beyond
+    /// the geocoder files.
     pub fn new(tmp: PathBuf) -> Self {
         BuildOpts {
             threads: 1,
             mem_mb: DEFAULT_RUN_BUDGET_MB,
             tmp,
-            inline: true,
             extras: None,
             imp_dir: None,
             area_proxy: false,
@@ -122,7 +120,7 @@ pub struct PlacesSource<'a> {
     geo: &'a Index,
     n_place_nodes: u32,
     /// The boundary slots, read back from the `places.bnd` just written (paged, not held).
-    bnd: Mmap,
+    bnd: Boundaries,
     n_slots: u32,
     n_linked: u32,
     /// The most bytes the label points' scan line crossings held.
@@ -136,7 +134,8 @@ pub struct PlacesSource<'a> {
 }
 
 impl<'a> PlacesSource<'a> {
-    /// Derives the boundary slots and writes them to `bnd_path` (sorted by polygon).
+    /// Derives the boundary slots and writes them to `bnd_path` (`Boundaries`): the labelled ones
+    /// in one pass over the polygons, then the unlabelled ones and their label points in another.
     pub fn new(geo: &'a Index, opts: &BuildOpts, extras: Option<&'a Extras>, bnd_path: &Path) -> std::io::Result<Self> {
         let n_place_nodes = geo.place_node_count();
         let n_poly = geo.admin_polygon_count();
@@ -156,34 +155,39 @@ impl<'a> PlacesSource<'a> {
         });
         let mut label_used = Bits::new(n_place_nodes as usize);
         let mut w = BufWriter::with_capacity(WRITE_BUFFER, File::create(bnd_path)?);
-        let (mut n_slots, mut n_linked) = (0u32, 0u32);
+        let mut n_linked = 0u32;
+        for p in 0..n_poly {
+            let node = link[p as usize];
+            if node == NO_DATA || polygon_raw(geo, p).name_id == NO_DATA {
+                continue;
+            }
+            label_used.set(node);
+            BoundarySlot { poly: p, node, lat: 0.0, lng: 0.0 }.write(&mut w)?;
+            n_linked += 1;
+        }
+        let mut n_slots = n_linked;
         // The scan line crossings of each label point found, held for the next one.
         let mut crossings = Vec::new();
         for p in 0..n_poly {
-            let ap = polygon_raw(geo, p);
-            if ap.name_id == NO_DATA {
+            if link[p as usize] != NO_DATA {
                 continue;
             }
-            let node = link[p as usize];
-            let slot = if node != NO_DATA {
-                let pn = place_node_raw(geo, node);
-                label_used.set(node);
-                BoundarySlot { poly: p, node, lat: pn.lat, lng: pn.lng }
-            } else if (BOUNDARY_MIN_LEVEL..=BOUNDARY_MAX_LEVEL).contains(&ap.admin_level) && ap.area > 0.0 {
-                // The builder's interior_point (ST_PointOnSurface, Nominatim's centre of an area):
-                // an area centroid can fall outside a concave ring or in a hole.
-                let Some((lat, lng)) = geo.admin_geometry.point_on_surface_with(&ap, &mut crossings) else { continue };
-                BoundarySlot { poly: p, node: NO_DATA, lat, lng }
-            } else {
+            let ap = polygon_raw(geo, p);
+            let searchable = ap.name_id != NO_DATA && (BOUNDARY_MIN_LEVEL..=BOUNDARY_MAX_LEVEL).contains(&ap.admin_level) && ap.area > 0.0;
+            if !searchable {
                 continue;
-            };
-            w.write_all(&slot.to_bytes())?;
+            }
+            // The builder's interior_point (ST_PointOnSurface, Nominatim's centre of an area): an
+            // area centroid can fall outside a concave ring or in a hole.
+            let Some((lat, lng)) = geo.admin_geometry.point_on_surface_with(&ap, &mut crossings) else { continue };
+            BoundarySlot { poly: p, node: NO_DATA, lat, lng }.write(&mut w)?;
             n_slots += 1;
-            n_linked += slot.linked() as u32;
         }
+        w.write_all(&n_linked.to_le_bytes())?;
         w.into_inner().map_err(|e| e.into_error())?;
         drop(link_buf);
-        let bnd = unsafe { Mmap::map(&File::open(bnd_path)?) }?;
+        let map = unsafe { Mmap::map(&File::open(bnd_path)?) }?;
+        let bnd = Boundaries::open(map).map_err(|e| std::io::Error::other(format!("{}: {e}", bnd_path.display())))?;
         let dir = opts.imp_dir.as_deref();
         Ok(PlacesSource {
             geo,
@@ -200,20 +204,16 @@ impl<'a> PlacesSource<'a> {
         })
     }
 
-    fn slot(&self, pos: u32) -> BoundarySlot {
-        BoundarySlot::from_bytes(&self.bnd[pos as usize * SLOT_BYTES..][..SLOT_BYTES])
-    }
-
     fn len(&self) -> u32 {
         self.n_slots + self.n_place_nodes
     }
 
     /// The entity of boundary slot `pos`; false when it has no name.
-    fn fill_slot(&self, pos: u32, e: &mut EntityBuf) -> bool {
+    fn fill_slot(&self, pos: usize, e: &mut EntityBuf) -> bool {
         e.names.clear();
         let geo = self.geo;
         let (rrefs, base_id) = {
-            let s = self.slot(pos);
+            let Some(s) = self.bnd.at(geo, pos) else { return false };
             let ap = polygon_raw(geo, s.poly);
             let node = s.linked().then(|| place_node_raw(geo, s.node));
             let kind = if s.linked() { Kind::Linked } else { Kind::Area };
@@ -251,11 +251,11 @@ impl<'a> PlacesSource<'a> {
         fill_names(self.geo, self.extras, &[record_ref(KIND_PLACE_NODE, i)], pn.name_id, e)
     }
 
-    /// Calls `f` with the entity of each position of [lo, hi) that is one: the boundary slots,
-    /// then the place nodes. The nodes sit in cell order, so their names lie anywhere in the
-    /// string tier: they are read NAME_BATCH_NODES at a time, in id order, and each batch is
-    /// filled in name order, which reads the tier front to back once a batch instead of a page
-    /// here and there for every node.
+    /// Calls `f` with the entity of each position of [lo, hi) that is one: the boundary slots in
+    /// polygon order, then the place nodes. The nodes sit in cell order, so their names lie
+    /// anywhere in the string tier: they are read NAME_BATCH_NODES at a time, in id order, and
+    /// each batch is filled in name order, which reads the tier front to back once a batch
+    /// instead of a page here and there for every node.
     fn for_each_entity<E>(&self, lo: u32, hi: u32, e: &mut EntityBuf, f: &mut impl FnMut(&EntityBuf) -> Result<(), E>) -> Result<(), E> {
         self.for_each_entity_in(lo, hi, NAME_BATCH_NODES, e, f)
     }
@@ -264,7 +264,8 @@ impl<'a> PlacesSource<'a> {
     fn for_each_entity_in<E>(
         &self, lo: u32, hi: u32, batch_nodes: u32, e: &mut EntityBuf, f: &mut impl FnMut(&EntityBuf) -> Result<(), E>,
     ) -> Result<(), E> {
-        for pos in lo..hi.min(self.n_slots) {
+        // As their polygons' records lie: the two tables of slots in one pass.
+        for pos in self.bnd.by_polygon().take(hi.min(self.n_slots) as usize).skip(lo as usize) {
             if self.fill_slot(pos, e) {
                 f(e)?;
             }
@@ -813,29 +814,21 @@ struct Writer {
     post: BufWriter<File>,
     post_len: u64,
     scratch: Vec<u8>,
-    inline: bool,
     slots: Vec<PrefixSlot>,
     keys: u64,
     postings: u64,
-    inline_keys: u64,
     longest: usize,
 }
 
 impl Writer {
-    /// Writes one key with its kept postings (`Group::take`).
+    /// Writes one key with its kept postings (`Group::take`): its list at the end of the postings
+    /// file, and that offset as its value.
     fn add(&mut self, key: &[u8], group: &[Posting]) -> Result<(), String> {
-        let value = if self.inline && group.len() == 1 {
-            self.inline_keys += 1;
-            inline_value(&group[0])
-        } else {
-            self.scratch.clear();
-            encode_list(&mut self.scratch, group);
-            let v = list_value(self.post_len, group[0].imp_q);
-            self.post.write_all(&self.scratch).map_err(|e| e.to_string())?;
-            self.post_len += self.scratch.len() as u64;
-            v
-        };
-        self.fst.insert(key, value).map_err(|e| e.to_string())?;
+        self.scratch.clear();
+        encode_list(&mut self.scratch, group);
+        self.post.write_all(&self.scratch).map_err(|e| e.to_string())?;
+        self.fst.insert(key, self.post_len).map_err(|e| e.to_string())?;
+        self.post_len += self.scratch.len() as u64;
         self.keys += 1;
         self.postings += group.len() as u64;
         self.longest = self.longest.max(group.len());
@@ -1075,7 +1068,6 @@ pub fn merge(mut runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, S
         post: BufWriter::with_capacity(WRITE_BUFFER, mk(&post_path)?),
         post_len: 0,
         scratch: Vec::new(),
-        inline: opts.inline,
         slots: (1..=PREFIX_TABLE_MAX_CHARS)
             .map(|chars| -> Result<PrefixSlot, String> {
                 let path = opts.tmp.join(format!("{name}-pfx{chars}.tmp"));
@@ -1085,7 +1077,6 @@ pub fn merge(mut runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, S
             .collect::<Result<Vec<_>, String>>()?,
         keys: 0,
         postings: 0,
-        inline_keys: 0,
         longest: 0,
     };
     let mut m = Merge::open(&files).map_err(|e| e.to_string())?;
@@ -1109,7 +1100,7 @@ pub fn merge(mut runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, S
     for f in &files {
         let _ = std::fs::remove_file(f);
     }
-    let Writer { fst, mut post, mut slots, keys, postings, inline_keys, longest, .. } = w;
+    let Writer { fst, mut post, mut slots, keys, postings, longest, .. } = w;
     fst.finish().map_err(|e| e.to_string())?;
     post.flush().map_err(|e| e.to_string())?;
     let mut n_prefixes = 0u64;
@@ -1148,7 +1139,6 @@ pub fn merge(mut runs: KeyRuns, out: &Path, opts: &BuildOpts) -> Result<Stats, S
     st.add("key entries", entries);
     st.add("keys", keys);
     st.add("postings", postings);
-    st.add("inline keys", inline_keys);
     st.add("longest list", longest);
     st.add("prefix table prefixes", n_prefixes);
     st.add("sort runs", n_runs);
@@ -1190,8 +1180,8 @@ pub fn index_meta(geo: &Index, opts: &BuildOpts) -> serde_json::Map<String, serd
     let n_place_nodes = geo.place_node_count();
     [
         ("n_place_nodes", json!(n_place_nodes)),
+        (META_FORMAT_KEY, json!(INDEX_FORMAT)),
         ("extras", json!(opts.extras.is_some())),
-        ("inline", json!(opts.inline)),
         ("imp", json!(opts.imp_dir.is_some())),
         ("area_proxy", json!(opts.area_proxy)),
         ("poi_max_tier", json!(opts.poi_max_tier)),
@@ -1205,6 +1195,12 @@ pub fn index_meta(geo: &Index, opts: &BuildOpts) -> serde_json::Map<String, serd
 /// `SearchIndex::open` reads only with their file.
 pub fn has_extra_names(meta: &serde_json::Value) -> bool {
     meta["extras"].as_bool().unwrap_or(false)
+}
+
+/// Whether the index whose META_FILE is `meta` has this build's layout (INDEX_FORMAT): one of
+/// another, or without a format, is no index `SearchIndex::open` reads.
+pub fn is_current_format(meta: &serde_json::Value) -> bool {
+    meta[META_FORMAT_KEY].as_u64() == Some(INDEX_FORMAT)
 }
 
 /// Builds the sub-indexes `subs` of `geo` for the index directory `out`, the value `meta` gives
@@ -1698,7 +1694,6 @@ mod tests {
             threads: 1,
             mem_mb: DEFAULT_RUN_BUDGET_MB,
             tmp: dir.clone(),
-            inline: false,
             extras: None,
             imp_dir: None,
             area_proxy: false,
@@ -1751,7 +1746,7 @@ mod tests {
         crate::extras::pack(tsv.to_str().unwrap(), bin.to_str().unwrap()).unwrap();
         let geo = g.load(&dir.0.join("geo"));
         let opts = BuildOpts {
-            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), inline: true,
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"),
             extras: Some(bin.to_str().unwrap().into()), imp_dir: None, area_proxy: false, poi_max_tier: 3,
         };
 
@@ -1764,7 +1759,10 @@ mod tests {
     fn place_entities_come_once_each_whatever_the_batch_and_range() {
         use crate::fixture::{Geo, TempDir};
         let mut g = Geo::default();
+        // A labelled boundary between two unlabelled ones.
+        g.boundary("Firstshire", 6, [1.0, 1.0, 2.0, 2.0]);
         let land = g.boundary("Testland", 2, [0.0, 0.0, 60.0, 60.0]);
+        g.boundary("Lastshire", 6, [3.0, 3.0, 4.0, 4.0]);
         // Named in this order (their name ids ascend), at points whose cells order them otherwise.
         let names = ["Zulu", "Alpha", "Mike", "Bravo", "Yankee", "Charlie", "Xray", "Delta", "Whiskey"];
         for (k, name) in names.iter().enumerate() {
@@ -1788,10 +1786,12 @@ mod tests {
 
         let mut all = entities(0, n, NAME_BATCH_NODES);
 
-        // The boundary, under its label's name (the claimed capital is no entity of its own), then
-        // the nine nodes of one batch in name order, which is not their id order.
-        assert_eq!(all.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>(), [&["Capital"][..], &names[..]].concat());
-        assert!(all[1..].windows(2).any(|w| w[0].0 > w[1].0), "the fixture's nodes sit in name order");
+        // The boundaries in polygon order, the labelled one under its label's name (the claimed
+        // capital is no entity of its own), then the nine nodes of one batch in name order, which
+        // is not their id order.
+        let boundaries = ["Firstshire", "Capital", "Lastshire"];
+        assert_eq!(all.iter().map(|(_, name)| name.as_str()).collect::<Vec<_>>(), [&boundaries[..], &names[..]].concat());
+        assert!(all[3..].windows(2).any(|w| w[0].0 > w[1].0), "the fixture's nodes sit in name order");
         // Every batch size and every cut of the range gives each entity once.
         all.sort();
         for batch in [1, 2, 3, 4, 100] {
@@ -1812,13 +1812,11 @@ mod tests {
             post: mk("post"),
             post_len: 0,
             scratch: Vec::new(),
-            inline: false,
             slots: (1..=PREFIX_TABLE_MAX_CHARS)
                 .map(|chars| PrefixSlot { prefix: String::new(), chars, keys: 0, hits: Vec::new(), out: mk(&format!("pfx{chars}")), path: dir.join(format!("pfx{chars}")), flushed: 0 })
                 .collect(),
             keys: 0,
             postings: 0,
-            inline_keys: 0,
             longest: 0,
         }
     }
@@ -1936,6 +1934,42 @@ mod tests {
     }
 
     #[test]
+    fn a_build_is_the_same_bytes_whatever_its_thread_count() {
+        use crate::fixture::{Geo, TempDir};
+        let mut g = Geo::default();
+        let land = g.boundary("Testland", 2, [0.0, 0.0, 60.0, 60.0]);
+        g.boundary("Testshire", 6, [10.0, 10.0, 20.0, 20.0]);
+        let capital = g.place("Testville", 0, 30.0, 30.0);
+        g.claim(land, capital);
+        for k in 0..60u32 {
+            g.place(&format!("Place {} {}", k % 7, ["North", "South", "Old"][k as usize % 3]), (k % 7) as u8, 1.0 + k as f32 * 0.9, 2.0);
+            g.poi(&format!("Hall {}", k % 11), 1.0 + k as f32 * 0.9, 3.0, (k * 37 % 256) as u8);
+        }
+        let dir = TempDir::new("threads");
+        let geo = g.load(&dir.0.join("geo"));
+        let files = |threads: usize| {
+            let out = dir.0.join(format!("idx-{threads}"));
+            let opts = BuildOpts { threads, ..BuildOpts::new(dir.0.join(format!("tmp-{threads}"))) };
+            build_all(&geo, &held_subs(&geo, SUB_INDEXES), &out, &opts, || Ok(serde_json::json!({}))).unwrap();
+            let mut v: Vec<(String, Vec<u8>)> = std::fs::read_dir(&out)
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .filter(|p| p.file_name().unwrap() != META_FILE)
+                .map(|p| (p.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read(&p).unwrap()))
+                .collect();
+            v.sort();
+            v
+        };
+
+        let one = files(1);
+
+        assert_eq!(one.len(), 9);
+        for threads in [2, 3, 7] {
+            assert_eq!(files(threads), one, "{threads} threads");
+        }
+    }
+
+    #[test]
     fn a_claimed_label_nodes_extra_names_find_its_boundary() {
         use crate::fixture::{build_search, Geo, TempDir};
         use crate::query::Searcher;
@@ -2028,7 +2062,7 @@ mod tests {
             std::fs::write(imp.join(file), vec![200u8; n]).unwrap();
         }
         let opts = BuildOpts {
-            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), inline: true, extras: None,
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), extras: None,
             imp_dir: Some(imp.to_str().unwrap().into()), area_proxy: false, poi_max_tier: 3,
         };
 
@@ -2061,7 +2095,7 @@ mod tests {
             std::fs::write(imp.join(file), vec![200u8; n]).unwrap();
         }
         let opts = BuildOpts {
-            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: out.join("tmp"), inline: true, extras: None,
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: out.join("tmp"), extras: None,
             imp_dir: Some(imp.to_str().unwrap().into()), area_proxy: false, poi_max_tier: 3,
         };
 
@@ -2164,7 +2198,7 @@ mod tests {
         std::fs::create_dir_all(kept.parent().unwrap()).unwrap();
         std::fs::write(&kept, "old places.fst").unwrap();
         let opts = BuildOpts {
-            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), inline: true, extras: None,
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), extras: None,
             imp_dir: None, area_proxy: false, poi_max_tier: 3,
         };
 
@@ -2197,7 +2231,7 @@ mod tests {
         };
         let before = entries(&out);
         let opts = BuildOpts {
-            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), inline: true, extras: None,
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), extras: None,
             imp_dir: None, area_proxy: false, poi_max_tier: 3,
         };
         let mut read_meta = false;
@@ -2269,7 +2303,7 @@ mod tests {
         let (imp, out) = (dir.0.join("imp"), dir.0.join("idx"));
         std::fs::create_dir_all(&imp).unwrap();
         let opts = BuildOpts {
-            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), inline: true, extras: None,
+            threads: 1, mem_mb: DEFAULT_RUN_BUDGET_MB, tmp: dir.0.join("tmp"), extras: None,
             imp_dir: Some(imp.to_str().unwrap().into()), area_proxy: false, poi_max_tier: 3,
         };
         // One byte per place node, polygon and POI record.
