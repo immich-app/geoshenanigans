@@ -763,7 +763,8 @@ TEST(a_logical_pair_has_one_encoding) {
         size_t refused = 0, decoded = 0;
         for (int t = 0; t < 4000; t++) {
             Files g = f;
-            std::vector<uint8_t>& file = t % 2 ? g.rows : g.nodes;
+            // A cut goes to the rows and the nodes in turn, a flipped bit to either.
+            std::vector<uint8_t>& file = (t % 50 == 0 ? t / 50 : t) % 2 ? g.rows : g.nodes;
             if (t % 50 == 0) {
                 file.resize(rng() % file.size());
             } else {
@@ -1052,6 +1053,12 @@ Threaded one_decode(const Kind& kind, const Files& f) {
 // geocoder-diff decodes the way pairs on threads, a range of groups at a
 // time, each range written at its place: the logical pair is the one
 // decoder's byte for byte, whatever the threads and the ranges.
+TEST(a_scratch_file_that_did_not_open_fails_its_flush_unwritten) {
+    ScratchDir dir("scratch-file-open");
+    logical_decode::ScratchFile f(dir.path() + "/no-such-dir/file");
+    CHECK(!f.flush());
+}
+
 TEST(the_threaded_decode_writes_the_one_decoders_way_pair) {
     ScratchDir dir("ways-threaded");
     std::mt19937_64 rng(20261117);
@@ -1149,7 +1156,8 @@ TEST(the_threaded_decode_takes_and_refuses_what_the_one_decoder_does) {
         const Files f = encode(*kind, logical(*kind, random_ways(rng, *kind, 400)));
         for (int t = 0; t < 1200; t++) {
             Files g = f;
-            std::vector<uint8_t>& file = t % 2 ? g.rows : g.nodes;
+            // A cut goes to the rows and the nodes in turn, a flipped bit to either.
+            std::vector<uint8_t>& file = (t % 50 == 0 ? t / 50 : t) % 2 ? g.rows : g.nodes;
             if (t % 50 == 0) {
                 file.resize(rng() % file.size());
             } else {

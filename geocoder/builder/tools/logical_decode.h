@@ -122,7 +122,8 @@ private:
 // made, makes flush() false from then on.
 class ScratchFile {
 public:
-    explicit ScratchFile(const std::string& path) : fd_(::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666)) {}
+    explicit ScratchFile(const std::string& path)
+        : fd_(::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0666)), ok_(fd_ >= 0) {}
     ~ScratchFile() {
         if (fd_ >= 0) ::close(fd_);
     }
@@ -161,7 +162,7 @@ private:
     int fd_;
     Buffer buffer_;
     size_t used_ = 0;
-    bool ok_ = true;
+    bool ok_;
 };
 
 // A file written at places by a thread of its own: threads take buffers
