@@ -1251,16 +1251,20 @@ TEST(patch_round_trip_merges_postcode_centroids_as_logical_rows) {
     old_d["strings_postcode.bin"] = new_d["strings_postcode.bin"] = std::vector<char>(pool.begin(), pool.end());
     std::vector<postcode_files::LogicalCentroid> old_rows, new_rows;
     for (uint32_t i = 0; i < 40; i++) old_rows.push_back(test_centroid(52.0f + float(i) * 0.001f, 13.0f, 4 * i, DE, 7 + i / 10));
-    new_rows = old_rows;
-    new_rows[3].lat += 0.0005f;                                   // moved in its cell
-    new_rows.erase(new_rows.begin() + 12);                         // gone
+    for (uint32_t i = 0; i < 40; i++) {
+        postcode_files::LogicalCentroid c = old_rows[i];
+        if (i == 3) c.lat += 0.0005f;  // moved in its cell
+        if (i == 12 || i == 25) continue;  // gone, and moved below
+        new_rows.push_back(c);
+    }
+    new_rows.push_back(test_centroid(52.9f, 13.9f, 4 * 25, DE, 29));  // P25 moved from cell 9 to cell 29
     new_rows.push_back(test_centroid(53.0f, 14.0f, 4 * 45, DE, 30));  // born, in a cell of its own
     put_centroids(old_d, old_rows);
     put_centroids(new_d, new_rows);
     const RoundTrip moved = round_trip(old_d, new_d);
     CHECK(moved.mismatches.empty());
     CHECK(logged(moved, "postcode_centroids.bin: seq="));
-    CHECK(logged(moved, "recs m/i/d/r=38/2/2/0"));
+    CHECK(logged(moved, "recs m/i/d/r=37/3/3/0"));
 
     const RoundTrip same = round_trip(old_d, old_d);
     CHECK(same.mismatches.empty());

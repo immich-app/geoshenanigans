@@ -17,6 +17,7 @@
 // in cell order in each mode dir, which a chained build writes as a fresh one
 // does.
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -25,6 +26,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -284,6 +286,84 @@ std::vector<std::string> server_answers(const std::string& dir, const std::vecto
 
 bool says(const std::string& answer, const std::string& name) {
     return answer.find("\"" + name + "\"") != std::string::npos;
+}
+
+// A JSON value's text from i on, the JSON of an answer: its strings with
+// their escapes, its objects by key.
+struct JsonAt {
+    const std::string& s;
+    size_t i;
+    void space() {
+        while (i < s.size() && std::isspace(static_cast<unsigned char>(s[i]))) i++;
+    }
+    // The string at i, unescaped (a \u escape as written), and i past it.
+    std::string string() {
+        std::string out;
+        for (i++; i < s.size() && s[i] != '"'; i++) {
+            if (s[i] != '\\') {
+                out += s[i];
+                continue;
+            }
+            const char e = s[++i];
+            out += e == 'n' ? '\n' : e == 't' ? '\t' : e == 'r' ? '\r' : e == 'b' ? '\b' : e == 'f' ? '\f' : e;
+            if (e == 'u') out.insert(out.size() - 1, "\\");
+        }
+        i++;
+        return out;
+    }
+    // i past the value at i.
+    void skip() {
+        space();
+        if (i >= s.size()) return;
+        if (s[i] == '"') {
+            string();
+        } else if (s[i] == '{' || s[i] == '[') {
+            int depth = 0;
+            do {
+                if (s[i] == '"') {
+                    string();
+                    continue;
+                }
+                depth += s[i] == '{' || s[i] == '[';
+                depth -= s[i] == '}' || s[i] == ']';
+                i++;
+            } while (i < s.size() && depth > 0);
+        } else {
+            while (i < s.size() && s[i] != ',' && s[i] != '}' && s[i] != ']') i++;
+        }
+    }
+    // With an object at i: whether it has `key`, and i at its value.
+    bool member(const std::string& key) {
+        space();
+        if (i >= s.size() || s[i] != '{') return false;
+        i++;
+        for (;;) {
+            space();
+            if (i >= s.size() || s[i] != '"') return false;
+            const std::string k = string();
+            space();
+            i++;  // ':'
+            space();
+            if (k == key) return true;
+            skip();
+            space();
+            if (i < s.size() && s[i] == ',') i++;
+        }
+    }
+};
+
+// The string at `path` (keys from the top object down) in an answer, the
+// JSON after grid_query's point; none where a key of the path is missing or
+// the value is no string.
+std::optional<std::string> answer_string(const std::string& answer, const std::vector<std::string>& path) {
+    const size_t start = answer.find('{');
+    if (start == std::string::npos) return std::nullopt;
+    JsonAt j{answer, start};
+    for (const std::string& key : path)
+        if (!j.member(key)) return std::nullopt;
+    j.space();
+    if (j.i >= answer.size() || answer[j.i] != '"') return std::nullopt;
+    return j.string();
 }
 
 // The ways of a kind `dir` of a tree holds, as its two way files decode: each
@@ -1167,8 +1247,9 @@ TEST(a_build_writes_its_postcode_centroids_in_cell_order_and_the_server_answers_
     const int failures_before = gctest::failures();
     for (size_t i = 0; i < points.size(); i++) {
         CHECK(says(answers[i], "Testland") || says(answers[i], "Testreich"));
-        if (postcodes[i]) CHECK(says(answers[i], postcodes[i]));
-        else CHECK(!says(answers[i], "postcode"));
+        const std::optional<std::string> postcode = answer_string(answers[i], {"address", "postcode"});
+        if (postcodes[i]) CHECK(postcode == std::string(postcodes[i]));
+        else CHECK(!postcode);
     }
     if (gctest::failures() != failures_before)
         for (const std::string& answer : answers) std::printf("    %s\n", answer.c_str());
@@ -1202,8 +1283,22 @@ TEST(postcode_centroids_keep_no_slots_and_a_region_of_no_valid_postcode_has_file
             REQUIRE(fresh.count(at) && chained.count(at) && one.count(at));
             CHECK(chained.at(at) == fresh.at(at));
         }
-    CHECK_EQ(centroids_of(one, "planet/full/").size(), size_t(5));
-    CHECK_EQ(centroids_of(chained, "planet/full/").size(), size_t(5));
+    // Day one holds 8002's centroid and not 8007's, the chained day 8007's and
+    // not 8002's: each the one address of its postcode, at its point.
+    const std::vector<postcode_files::LogicalCentroid> day_one = centroids_of(one, "planet/full/"),
+                                                       day_two = centroids_of(chained, "planet/full/");
+    CHECK_EQ(day_one.size(), size_t(5));
+    CHECK_EQ(day_two.size(), size_t(5));
+    auto at = [](const std::vector<postcode_files::LogicalCentroid>& rows, double lat, double lng) {
+        size_t found = 0;
+        for (const auto& r : rows) found += std::fabs(r.lat - lat) < 1e-5 && std::fabs(r.lng - lng) < 1e-5 && r.country_code == CH;
+        return found;
+    };
+    const double p8002[2] = {47.17, 8.17}, p8007[2] = {47.09, 8.12};
+    CHECK_EQ(at(day_one, p8002[0], p8002[1]), size_t(1));
+    CHECK_EQ(at(day_one, p8007[0], p8007[1]), size_t(0));
+    CHECK_EQ(at(day_two, p8007[0], p8007[1]), size_t(1));
+    CHECK_EQ(at(day_two, p8002[0], p8002[1]), size_t(0));
     for (const auto& tree_files : {one, fresh, chained})
         for (const std::string& name : names_of(tree_files)) CHECK(fs::path(name).filename() != "postcode_centroids.osm_ids");
 
