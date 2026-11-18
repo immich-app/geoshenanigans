@@ -1133,8 +1133,8 @@ mod tests {
         let s = sel("europe", "admin", "simplified", "none");
         let unit = "europe/admin/places.tt.zst";
         for (change, error) in [
-            (Box::new(|u: &mut UnitEntry| u.transport_version = 1) as Box<dyn Fn(&mut UnitEntry)>,
-             format!("transport unit {unit}: a unit of transport version 1: this build reads version {TRANSPORT_VERSION} only")),
+            (Box::new(|u: &mut UnitEntry| u.transport_version = 2) as Box<dyn Fn(&mut UnitEntry)>,
+             format!("transport unit {unit}: a unit of transport version 2: this build reads version {TRANSPORT_VERSION} only")),
             (Box::new(|u: &mut UnitEntry| u.files.push("europe/full/street_ways.bin".into())),
              format!("transport unit {unit}: holds europe/full/street_ways.bin, which the selection doesn't take")),
         ] {

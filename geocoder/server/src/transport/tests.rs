@@ -626,9 +626,9 @@ fn a_unit_with_bytes_past_its_end_or_another_version_or_kind_is_refused() {
     let units = golden_units();
     let unit = &units[0].3;
     assert!(refusal(&[unit.as_slice(), &[0]].concat()).contains("bytes after the last section"));
-    let mut v1 = unit.clone();
-    v1[4] = 1;
-    assert_eq!(refusal(&v1), "transport: a unit of transport version 1: this build reads version 2 only");
+    let mut v2 = unit.clone();
+    v2[4] = 2;
+    assert_eq!(refusal(&v2), "transport: a unit of transport version 2: this build reads version 1 only");
     let mut k9 = unit.clone();
     k9[8] = 9;
     assert_eq!(refusal(&k9), "transport: a unit of kind 9, which this build doesn't know");

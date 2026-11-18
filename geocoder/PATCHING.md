@@ -177,7 +177,7 @@ it), and the `units` map of the build's transport units:
   "components":  { "mode.full": { "files": ["{region}/full/...", ... ] }, ... },
   "constraints": [ { "when": { "mode": "admin-minimal" }, "requires": { "quality": "simplified" } } ],
   "presets":     [ { "id": "smallest", "selections": { ... } }, ... ],
-  "transport":   { "version": 2, "units": [ { "unit": "places.tt.zst", "kind": "places", "files": [ ... ] }, ... ] },
+  "transport":   { "version": 1, "units": [ { "unit": "places.tt.zst", "kind": "places", "files": [ ... ] }, ... ] },
   "files": {
     "planet/full/admin_cells.bin": { "size_zst": 6393328, "size_raw": 24807168, "sha256": "..." },
     "planet/full/place_nodes.bin": { "size_raw": 30573231, "sha256": "...", "unit": "planet/full/places.tt.zst" },
@@ -185,7 +185,7 @@ it), and the `units` map of the build's transport units:
   },
   "units": {
     "planet/full/places.tt.zst": {
-      "kind": "places", "transport_version": 2, "size": 30427178,
+      "kind": "places", "transport_version": 1, "size": 30427178,
       "files": ["planet/full/place_cells.bin", "planet/full/place_nodes.bin", "planet/full/place_hidden.bin"]
     },
     "...": "..."

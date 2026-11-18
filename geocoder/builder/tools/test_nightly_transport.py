@@ -155,12 +155,12 @@ class NightlyTransportTest(unittest.TestCase):
         self.assertIsNotNone(previous)
         with open(TEMPLATE) as f:
             version = jq(expected, json.load(f))
-        self.assertEqual(version, "2")
+        self.assertEqual(version, "1")
         unit = lambda v: {"kind": "places", "transport_version": v, "size": 1, "files": []}  # noqa: E731
         for cfg, compatible in [
-            ({"units": {"a/places.tt.zst": unit(2), "b/arcs.tt.zst": unit(2)}}, True),
-            ({"units": {"a/places.tt.zst": unit(1)}}, False),
-            ({"units": {"a/places.tt.zst": unit(2), "b/arcs.tt.zst": unit(1)}}, False),
+            ({"units": {"a/places.tt.zst": unit(1), "b/arcs.tt.zst": unit(1)}}, True),
+            ({"units": {"a/places.tt.zst": unit(2)}}, False),
+            ({"units": {"a/places.tt.zst": unit(1), "b/arcs.tt.zst": unit(2)}}, False),
             ({"units": {}}, False),
             ({"files": {}}, False),
         ]:

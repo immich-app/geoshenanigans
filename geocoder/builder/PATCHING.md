@@ -524,7 +524,8 @@ them, whichever way a client got them.
   its rows split into their fields). The template's `transport` block names
   each unit and its files. postcode_centroids.bin is no unit: its PCC1
   blocks go as its `.zst`, within 0.14 MiB on the planet of what a unit of
-  the old fixed-width rows downloaded (below).
+  the old fixed-width rows downloaded (below). Dropping that unit changed no
+  other unit's stream, so the transport version stayed 1.
 - **The stream**: `GTT1`, the transport version, the kind and the members'
   names and sizes, then each member's section: chunks of byte-aligned
   columns (at most 1 MiB, or one polygon or arc larger than that alone), each
@@ -552,10 +553,11 @@ them, whichever way a client got them.
   latest.json on the build before (the test portal fetches those files only
   as the unit) and pruning no build.
 - **Versioned**: the stream and configurations.json's `units` carry the
-  transport version (the template's `transport.version`, held to the
-  library's). Setup builds fresh when yesterday's units are of another
-  version, since the fetch of yesterday's index decodes them with tonight's
-  `geocoder-transport`; a client refuses a version it doesn't read.
+  transport version, 1 (the template's `transport.version`, held to the
+  library's `TRANSPORT_VERSION`). Setup builds fresh when yesterday's units
+  are of another version, since the fetch of yesterday's index decodes them
+  with tonight's `geocoder-transport`; a client refuses a version it doesn't
+  read.
 - **Decoding**: the query-server library's `transport::decode_into_dir` (the
   server's downloader), the node binding's `createTransportDecoder` and the
   `geocoder-transport` CLI, a bin of `geocoder/search` that the nightly's
