@@ -520,9 +520,11 @@ them, whichever way a client got them.
 - **Kinds**: `places` (place_cells, place_nodes with its L3 blocks unpacked,
   place_hidden), `pois` (R2's rows, poi_vertices with its V2 blocks
   unpacked), `arcs` (the arc blocks unpacked; arc_index is computed) and
-  `cols` (one of postcode_centroids, admin_polygons, street_ways, interp_ways
-  and addr_index, its rows split into their fields). The template's
-  `transport` block names each unit and its files.
+  `cols` (one of admin_polygons, street_ways, interp_ways and addr_index,
+  its rows split into their fields). The template's `transport` block names
+  each unit and its files. postcode_centroids.bin is no unit: its PCC1
+  blocks go as its `.zst`, within 0.14 MiB on the planet of what a unit of
+  the old fixed-width rows downloaded (below).
 - **The stream**: `GTT1`, the transport version, the kind and the members'
   names and sizes, then each member's section: chunks of byte-aligned
   columns (at most 1 MiB, or one polygon or arc larger than that alone), each
@@ -568,6 +570,14 @@ immich-recommended, with-addresses, max-quality) against 95.61, 295.06,
 (the full presets' shipped place search index is no unit: it goes as `.zst`
 either way, 364.4 MiB in the layout of format 2). Planet `poi/all` saves the
 most, 814.5 to 681.9 MiB.
+
+Those are build 23's files. Build 24's packed postcode centroids go as their
+`.zst`: on the same planet (measured 2026-11-18) postcode_centroids.bin and
+postcode_centroid_cells.bin download 12,308,773 B, against 12,166,908 B for
+build 23's unit of the old rows with their cells and entries files, and take
+13,869,529 B on disk against 49,005,849. So immich-recommended downloads
+257,858,727 B (245.91 MiB), and with-addresses and max-quality, whose full
+dir holds the same two files, 0.14 MiB more than above too.
 
 ## Patch Format (.gcpatch, version 19)
 

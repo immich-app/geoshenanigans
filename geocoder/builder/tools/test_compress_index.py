@@ -122,7 +122,6 @@ class CompressIndexTest(unittest.TestCase):
         self.units = {
             "planet/admin/places.tt.zst": ("places", [f"planet/admin/{n}" for n in places]),
             "planet/full/places.tt.zst": ("places", [f"planet/full/{n}" for n in places]),
-            "planet/admin/postcode_centroids.tt.zst": ("cols", ["planet/admin/postcode_centroids.bin"]),
             "planet/full/street_ways.tt.zst": ("cols", ["planet/full/street_ways.bin"]),
             "planet/quality/simplified/admin_polygons.tt.zst": ("cols", ["planet/quality/simplified/admin_polygons.bin"]),
             "planet/quality/exact/admin_polygons.tt.zst": ("cols", ["planet/quality/exact/admin_polygons.bin"]),
@@ -174,7 +173,7 @@ class CompressIndexTest(unittest.TestCase):
 
         self.assertEqual(sorted(cfg["units"]), sorted(self.units))
         for unit, (kind, members) in self.units.items():
-            self.assertEqual(cfg["units"][unit], {"kind": kind, "transport_version": 1, "size": os.path.getsize(self.path(unit)),
+            self.assertEqual(cfg["units"][unit], {"kind": kind, "transport_version": 2, "size": os.path.getsize(self.path(unit)),
                                                   "files": members}, unit)
             self.assertEqual(unit_members(self.path(unit)), {os.path.basename(m): self.files[m] for m in members}, unit)
             for m in members:
@@ -187,7 +186,6 @@ class CompressIndexTest(unittest.TestCase):
         encoded = sorted(self.transport_calls("encode"))
         self.assertEqual(encoded, sorted([
             ["places", self.path("planet/admin")],
-            ["cols", self.path("planet/admin"), "postcode_centroids.bin"],
             ["cols", self.path("planet/full"), "street_ways.bin"],
             ["cols", self.path("planet/quality/exact"), "admin_polygons.bin"],
             ["arcs", self.path("planet/quality/simplified")],

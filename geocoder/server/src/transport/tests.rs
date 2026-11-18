@@ -7,7 +7,7 @@ use crate::poi_files::{PoiPolygon, PoiRecords};
 use crate::scratch_dir::ScratchDir;
 use crate::test_heap as heap;
 use crate::test_rng::Rng;
-use crate::{FileBytes, PlaceNode, PoiRecord, PointE7, NO_DATA, PLACE_FLAG_HIDDEN, PLACE_FLAG_LABEL_OF};
+use crate::{AdminPolygon, FileBytes, PlaceNode, PoiRecord, PointE7, NO_DATA, PLACE_FLAG_HIDDEN, PLACE_FLAG_LABEL_OF};
 use std::cell::RefCell;
 use std::io::{self, Read, Write};
 use std::ops::Range;
@@ -459,19 +459,6 @@ fn fixture_datasets_come_back_and_the_readers_read_them_as_before() {
     }
     let polygons = fx.files()[0].1.clone();
     round_trip(Kind::Cols, Some("admin_polygons.bin"), &[("admin_polygons.bin", polygons)]);
-    // Postcode centroids.
-    let centroids: Vec<u8> = (0..5000)
-        .flat_map(|i: u32| {
-            let mut row = Vec::with_capacity(16);
-            row.extend((rng.range(-60.0, 70.0) as f32).to_le_bytes());
-            row.extend((rng.range(-170.0, 170.0) as f32).to_le_bytes());
-            row.extend((i * 13 + (rng.next() % 13) as u32).to_le_bytes());
-            row.extend(((rng.next() % 250) as u16).to_le_bytes());
-            row.extend([0, 0]);
-            row
-        })
-        .collect();
-    round_trip(Kind::Cols, Some("postcode_centroids.bin"), &[("postcode_centroids.bin", centroids)]);
 }
 
 #[test]
@@ -543,20 +530,17 @@ fn golden_sets() -> Vec<(&'static str, Kind, Option<&'static str>, Files)> {
     let line: Vec<PointE7> = (0..17).map(|i| PointE7 { lat: 450_000_000 + 300 * i, lng: 80_000_000 - 500 * i + 100 * (i % 3) }).collect();
     fx.arc(2, &line);
     fx.arc(3, &[PointE7 { lat: -1000, lng: 2000 }]);
-    let mut centroids = Vec::new();
-    for (lat, lng, id, cc) in [(52.37f32, 4.89f32, 7u32, 528u16), (52.38, 4.9, 11, 528), (-33.87, 151.21, 12, 36)] {
-        centroids.extend(lat.to_le_bytes());
-        centroids.extend(lng.to_le_bytes());
-        centroids.extend(id.to_le_bytes());
-        centroids.extend(cc.to_le_bytes());
-        centroids.extend([0, 0]);
+    let mut polygons = Vec::new();
+    for (ring_offset, name_id, area, country_code, admin_level) in [(0, 7, 0.5f32, 528u16, 2u8), (96, 11, 0.0625, 528, 8), (160, 12, 3.25, 36, 4)] {
+        let p = AdminPolygon { ring_offset, ring_bytes: 0, name_id, admin_level, place_type_override: (admin_level == 8) as u8, area, country_code };
+        polygons.extend(p.record_bytes());
     }
-    centroids.extend([1, 2, 3, 4, 5]);
+    polygons.extend([1, 2, 3, 4, 5]);
     vec![
         ("two cells, a label and a hidden node", Kind::Places, None, members_of(Kind::Places, vec![hex(&place[2]), hex(&place[3]), hex(&place[4])])),
         ("the widths' and varints' edges", Kind::Pois, None, members_of(Kind::Pois, vec![hex(&pois[3]), hex(&pois[4])])),
         ("three arcs, a dead slot, a box", Kind::Arcs, None, arc_files(&fx)),
-        ("three centroids and part of a row", Kind::Cols, Some("postcode_centroids.bin"), vec![("postcode_centroids.bin", centroids)]),
+        ("three polygons and part of a row", Kind::Cols, Some("admin_polygons.bin"), vec![("admin_polygons.bin", polygons)]),
     ]
 }
 
@@ -642,9 +626,9 @@ fn a_unit_with_bytes_past_its_end_or_another_version_or_kind_is_refused() {
     let units = golden_units();
     let unit = &units[0].3;
     assert!(refusal(&[unit.as_slice(), &[0]].concat()).contains("bytes after the last section"));
-    let mut v2 = unit.clone();
-    v2[4] = 2;
-    assert_eq!(refusal(&v2), "transport: a unit of transport version 2: this build reads version 1 only");
+    let mut v1 = unit.clone();
+    v1[4] = 1;
+    assert_eq!(refusal(&v1), "transport: a unit of transport version 1: this build reads version 2 only");
     let mut k9 = unit.clone();
     k9[8] = 9;
     assert_eq!(refusal(&k9), "transport: a unit of kind 9, which this build doesn't know");
@@ -855,11 +839,14 @@ fn files_the_stream_cant_give_back_are_refused_by_encode() {
     assert_eq!(refused(Kind::Pois, &members_of(Kind::Pois, vec![hex(&row[3]), none])), "transport: poi_vertices.bin: the block at 0: more vertices than a chunk holds");
     let groups = members_of(Kind::Arcs, vec![vec![0; 4], vec![0; 9 + 300_000]]);
     assert_eq!(refused(Kind::Arcs, &groups), "transport: arc_vertices.bin: slot 0's block: more deltas than a chunk holds");
-    // A kind given a file, cols given none or one that is no cols file.
+    // A kind given a file, cols given none or one that is no cols file: the packed postcode
+    // centroids are none, and go as their .zst.
     let dir = ScratchDir::new();
     assert!(encode(Kind::Places, dir.path(), Some("x.bin"), io::sink()).is_err());
     assert!(encode(Kind::Cols, dir.path(), None, io::sink()).is_err());
-    assert_eq!(encode(Kind::Cols, dir.path(), Some("poi_records.bin"), io::sink()).err().unwrap().to_string(), "transport: poi_records.bin is no cols file");
+    for f in ["poi_records.bin", "postcode_centroids.bin"] {
+        assert_eq!(encode(Kind::Cols, dir.path(), Some(f), io::sink()).err().unwrap().to_string(), format!("transport: {f} is no cols file"));
+    }
 }
 
 #[test]

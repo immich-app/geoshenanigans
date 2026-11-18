@@ -328,7 +328,7 @@ function goldenUnits() {
 function colsUnit(name, bytes, widths) {
   const stride = widths.reduce((a, w) => a + w, 0);
   const rows = Math.floor(bytes.length / stride);
-  const head = Buffer.concat([Buffer.from('GTT1'), u32(1), Buffer.from([4, 1, name.length]), Buffer.from(name), u64(bytes.length),
+  const head = Buffer.concat([Buffer.from('GTT1'), u32(2), Buffer.from([4, 1, name.length]), Buffer.from(name), u64(bytes.length),
     u16(widths.length), ...widths.map((w, c) => Buffer.concat([Buffer.from([w]), u16(c)]))]);
   let at = 0;
   const cols = widths.map((w) => {

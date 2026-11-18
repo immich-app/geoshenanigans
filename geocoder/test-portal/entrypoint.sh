@@ -68,7 +68,7 @@ unit_of() {
         place_cells.bin|place_nodes.bin|place_hidden.bin) echo places.tt.zst ;;
         poi_records.bin|poi_vertices.bin) echo pois.tt.zst ;;
         arc_index.bin|arc_vertices.bin) echo arcs.tt.zst ;;
-        postcode_centroids.bin|admin_polygons.bin|street_ways.bin|interp_ways.bin|addr_index.bin) echo "${1%.bin}.tt.zst" ;;
+        admin_polygons.bin|street_ways.bin|interp_ways.bin|addr_index.bin) echo "${1%.bin}.tt.zst" ;;
     esac
 }
 

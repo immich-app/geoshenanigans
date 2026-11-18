@@ -9,11 +9,11 @@ builds/
     configurations.json                    # build metadata + axes/components/files/units + sha256s
     checksums.sha256                       # on-wire hashes (*.zst, *.gcpatch, *.json)
     planet/
-      full/            *.bin.zst + places.tt.zst + postcode_centroids.tt.zst
-                       + street_ways.tt.zst + interp_ways.tt.zst + addr_index.tt.zst
+      full/            *.bin.zst + places.tt.zst + street_ways.tt.zst
+                       + interp_ways.tt.zst + addr_index.tt.zst
                        + strings_layout.json(.zst) + patch.gcpatch
-      no-addresses/    ... (places, postcode_centroids, street_ways units)
-      admin/           ... (places, postcode_centroids units)
+      no-addresses/    ... (places, street_ways units)
+      admin/           ... (places unit)
       admin-minimal/   ... (places, arcs, admin_polygons units)
       admin-minimal-poi/ ...
       quality/
@@ -99,7 +99,6 @@ has the format). Every dir holding all of a unit's files publishes the unit as
 | `places.tt.zst` | `place_cells.bin`, `place_nodes.bin`, `place_hidden.bin` | `full/`, `no-addresses/`, `admin/`, `admin-minimal/`, `admin-minimal-poi/` |
 | `pois.tt.zst` | `poi_records.bin`, `poi_vertices.bin` | `poi/*/` |
 | `arcs.tt.zst` | `arc_index.bin`, `arc_vertices.bin` | `quality/*/`, `admin-minimal/`, `admin-minimal-poi/` |
-| `postcode_centroids.tt.zst` | `postcode_centroids.bin` | `full/`, `no-addresses/`, `admin/` (where the region has postcodes) |
 | `admin_polygons.tt.zst` | `admin_polygons.bin` | `quality/*/`, `admin-minimal/`, `admin-minimal-poi/` |
 | `street_ways.tt.zst` | `street_ways.bin` | `full/`, `no-addresses/` |
 | `interp_ways.tt.zst` | `interp_ways.bin` | `full/` |
@@ -178,7 +177,7 @@ it), and the `units` map of the build's transport units:
   "components":  { "mode.full": { "files": ["{region}/full/...", ... ] }, ... },
   "constraints": [ { "when": { "mode": "admin-minimal" }, "requires": { "quality": "simplified" } } ],
   "presets":     [ { "id": "smallest", "selections": { ... } }, ... ],
-  "transport":   { "version": 1, "units": [ { "unit": "places.tt.zst", "kind": "places", "files": [ ... ] }, ... ] },
+  "transport":   { "version": 2, "units": [ { "unit": "places.tt.zst", "kind": "places", "files": [ ... ] }, ... ] },
   "files": {
     "planet/full/admin_cells.bin": { "size_zst": 6393328, "size_raw": 24807168, "sha256": "..." },
     "planet/full/place_nodes.bin": { "size_raw": 30573231, "sha256": "...", "unit": "planet/full/places.tt.zst" },
@@ -186,7 +185,7 @@ it), and the `units` map of the build's transport units:
   },
   "units": {
     "planet/full/places.tt.zst": {
-      "kind": "places", "transport_version": 1, "size": 30427178,
+      "kind": "places", "transport_version": 2, "size": 30427178,
       "files": ["planet/full/place_cells.bin", "planet/full/place_nodes.bin", "planet/full/place_hidden.bin"]
     },
     "...": "..."

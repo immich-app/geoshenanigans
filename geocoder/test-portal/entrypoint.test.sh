@@ -247,14 +247,6 @@ start "$d"
 check "a dataset without an optional file is not fetched again" eval '! fetched'
 BUCKET=$bucket
 
-# So is a unit the build may lack (the postcode centroids').
-d="$work/optional-unit"
-BUCKET=$(bucket_without full/postcode_centroids.tt.zst)
-start "$d"
-check "a missing optional unit still serves" served "$d"
-check "a missing optional unit leaves the rest of the selection" holds "$d"
-BUCKET=$bucket
-
 # A file the server needs that the build lacks fails the download, naming it,
 # and the next start tries again.
 d="$work/required"
@@ -267,15 +259,15 @@ BUCKET=$bucket
 start "$d"
 check "a failed download is downloaded afresh next time" holds "$d"
 
-# A fetch that breaks off partway fails the start, of an optional unit the
+# A fetch that breaks off partway fails the start, of an optional file the
 # build has (its miss would be taken for the build lacking it) as of a
 # required unit or file (its half would pass for the file). None of their
 # files is left, nor a unit's download, no marker vouches for the download,
 # and the next start downloads afresh.
 d="$work/broken-off"
-start "$d" FLAKY="$(printf '%s\n' full/postcode_centroids.tt.zst quality/simplified/arcs.tt.zst full/geo_cells.bin)"
+start "$d" FLAKY="$(printf '%s\n' full/postcode_centroids.bin quality/simplified/arcs.tt.zst full/geo_cells.bin)"
 check "a fetch that breaks off fails the start" test "$status" != 0
-check "a broken-off optional unit is named" grep -q 'failed: .*/planet/full/postcode_centroids.tt.zst$' "$work/out"
+check "a broken-off optional file is named" grep -q 'failed: .*/planet/full/postcode_centroids.bin$' "$work/out"
 check "a broken-off required unit is named" grep -q 'failed: .*/planet/quality/simplified/arcs.tt.zst$' "$work/out"
 check "a broken-off required file is named" grep -q 'failed: .*/planet/full/geo_cells.bin$' "$work/out"
 check "a broken-off fetch leaves none of its files" eval '! ls -A "$d/index" | grep -E "^(postcode_centroids|arc_index|arc_vertices|geo_cells)\.bin|\.tt\.zst$"'
