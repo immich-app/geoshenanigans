@@ -432,6 +432,12 @@ enum Fetch<'a> {
 }
 
 impl Fetch<'_> {
+    fn path(&self) -> &str {
+        match self {
+            Fetch::File { path, .. } | Fetch::Unit { path, .. } => path,
+        }
+    }
+
     fn size(&self) -> u64 {
         match self {
             Fetch::File { size, .. } | Fetch::Unit { size, .. } => *size,
@@ -493,13 +499,46 @@ async fn on_disk(dir: &Path, path: &str, entry: &FileEntry) -> bool {
     matches!(tokio::fs::metadata(dir.join(basename(path))).await, Ok(m) if m.len() == entry.size_raw)
 }
 
-/// Resolve and download every file for a single region. Files that
-/// already exist on disk with the right size are skipped, and a transport
-/// unit when all its files are (full sha256 re-verification on every
-/// restart would be expensive on planet-sized data — size match is good
-/// enough as a fast path; the complete sha256 check happens on first
-/// download). A unit's files land together, so a download needs the
-/// largest unit's files' size free beside the region.
+/// The paths of the fetches `record` holds, a line each; a last line a
+/// kill cut short, with no newline after it, counts for nothing.
+async fn read_fetched(record: &Path) -> HashSet<String> {
+    let lines = tokio::fs::read_to_string(record).await.unwrap_or_default();
+    match lines.rsplit_once('\n') {
+        Some((whole, _)) => whole.split('\n').map(str::to_string).collect(),
+        None => HashSet::new(),
+    }
+}
+
+/// Adds the fetch at `path`, in place, to `record`.
+async fn add_fetched(record: &Path, path: &str) -> Result<(), DownloadError> {
+    use tokio::io::AsyncWriteExt;
+    let err = |e: std::io::Error| DownloadError::Io(format!("write {}: {}", record.display(), e));
+    let mut f = tokio::fs::OpenOptions::new().create(true).append(true).open(record).await.map_err(err)?;
+    f.write_all(format!("{}\n", path).as_bytes()).await.map_err(err)?;
+    f.flush().await.map_err(err)
+}
+
+/// Removes the records of fetches in `region_dir` but `record`: those of
+/// other builds, whose downloads a download of this one starts over on.
+async fn remove_other_records(region_dir: &Path, record: &Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(region_dir).await else { return };
+    while let Ok(Some(e)) = entries.next_entry().await {
+        if e.file_name().to_str().is_some_and(|n| n.starts_with(".fetched.")) && e.path() != record {
+            let _ = tokio::fs::remove_file(e.path()).await;
+        }
+    }
+}
+
+/// Resolve and download every file for a single region. In a dir that
+/// holds the build already (its .build_date names it), files that exist
+/// on disk with the right size are skipped, and a transport unit when all
+/// its files are (full sha256 re-verification on every restart would be
+/// expensive on planet-sized data — size match is good enough as a fast
+/// path; the complete sha256 check happens on first download). In one that
+/// doesn't, every file is fetched but those an earlier download of the
+/// build that broke off put in place, and only once all are in does the
+/// dir name the build. A unit's files land together, so a download needs
+/// the largest unit's files' size free beside the region.
 ///
 /// `progress` fires after each file or unit completes with the running
 /// total; the caller logs it.
@@ -541,30 +580,48 @@ pub async fn download_region(
         .map_err(|e| DownloadError::Io(format!("mkdir {}: {}", region_dir.display(), e)))?;
 
     // Key the dir by build date: size-only resume checks across different
-    // builds would otherwise mix files from two builds into one index.
+    // builds would otherwise mix files from two builds into one index. The
+    // stamp goes in only once every fetch of a fresh build is in place, so
+    // a dir whose download of one broke off names no build. Meanwhile each
+    // fetch in place is recorded, by its path, in a file of the build's own,
+    // and a retry of the build fetches only the others; a record of another
+    // build is removed, its download started over.
     let stamp = region_dir.join(".build_date");
     let existing = tokio::fs::read_to_string(&stamp).await.unwrap_or_default();
     let fresh_build = existing.trim() != cfg.build.date;
+    let record = region_dir.join(format!(".fetched.{}", cfg.build.date));
+    let mut fetched = HashSet::new();
     if fresh_build {
-        tokio::fs::write(&stamp, &cfg.build.date).await
-            .map_err(|e| DownloadError::Io(format!("write {}: {}", stamp.display(), e)))?;
+        match tokio::fs::remove_file(&stamp).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(DownloadError::Io(format!("remove {}: {}", stamp.display(), e)));
+            }
+            _ => {}
+        }
+        remove_other_records(&region_dir, &record).await;
+        fetched = read_fetched(&record).await;
     }
     for fetch in &fetches {
+        // Whether the fetch's files are this build's, on disk at their size.
+        let mut in_place = !fresh_build || fetched.contains(fetch.path());
         match fetch {
             Fetch::File { path, entry, .. } => {
-                if fresh_build || !on_disk(&region_dir, path, entry).await {
+                in_place = in_place && on_disk(&region_dir, path, entry).await;
+                if !in_place {
                     download_file(client, base_url, &cfg.build.date, path, entry, &region_dir.join(basename(path))).await?;
                 }
             }
             Fetch::Unit { path, files, .. } => {
-                let mut all_on_disk = !fresh_build;
                 for (f, entry) in files {
-                    all_on_disk = all_on_disk && on_disk(&region_dir, f, entry).await;
+                    in_place = in_place && on_disk(&region_dir, f, entry).await;
                 }
-                if !all_on_disk {
+                if !in_place {
                     download_unit(client, base_url, &cfg.build.date, path, files, &region_dir).await?;
                 }
             }
+        }
+        if fresh_build && !in_place {
+            add_fetched(&record, fetch.path()).await?;
         }
 
         files_done += fetch.files();
@@ -577,6 +634,11 @@ pub async fn download_region(
         });
     }
 
+    if fresh_build {
+        tokio::fs::write(&stamp, &cfg.build.date).await
+            .map_err(|e| DownloadError::Io(format!("write {}: {}", stamp.display(), e)))?;
+        let _ = tokio::fs::remove_file(&record).await;
+    }
     Ok(())
 }
 
@@ -1092,6 +1154,103 @@ mod tests {
         download(&bucket, &s, root.path()).await.unwrap();
         assert_eq!(bucket.files_served(), served + 1);
         assert!(held(&root.path().join("europe")) == files_of(&bucket, &s));
+    }
+
+    /// The names whose bytes differ between two region dirs' files, or that
+    /// one lacks.
+    fn differing(got: &BTreeMap<String, Vec<u8>>, want: &BTreeMap<String, Vec<u8>>) -> Vec<String> {
+        got.keys().chain(want.keys()).collect::<BTreeSet<_>>().into_iter().filter(|n| got.get(*n) != want.get(*n)).cloned().collect()
+    }
+
+    /// The region dir of `s` under `root` as a download of an older build
+    /// left it: each file of the size the bucket's has, of other bytes, and
+    /// that build's stamp.
+    fn older_build(bucket: &TestBucket, s: &RegionSelection, root: &Path) {
+        let dir = root.join(&s.region);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, bytes) in files_of(bucket, s) {
+            let older: Vec<u8> = if name == ".build_date" { b"2025-12-01".to_vec() } else { bytes.iter().map(|b| b ^ 0x5a).collect() };
+            std::fs::write(dir.join(name), older).unwrap();
+        }
+    }
+
+    /// The bucket's build, the unit `unit` of one bad byte: its download
+    /// fails, those of the objects before it in path order come down.
+    async fn failing_at(unit: &'static str) -> TestBucket {
+        test_bucket::serve_tampered(test_bucket::template_components(), move |path, bytes| {
+            if path == unit {
+                let at = bytes.len() - 1;
+                bytes[at] ^= 0x10;
+            }
+        }).await
+    }
+
+    /// A unit of the selection the tests below download, in the middle of
+    /// its fetches in path order.
+    const FAILING_UNIT: &str = "europe/poi/major/pois.tt.zst";
+
+    // A download of a fresh build over the dir of an older one that fails
+    // part-way leaves the dir stamped with neither; retried, it leaves none
+    // of the older build's files, not even those of the size the fresh
+    // build's have.
+    #[tokio::test]
+    async fn a_fresh_builds_download_that_failed_part_way_leaves_no_older_file_once_retried() {
+        let s = sel("europe", "admin", "simplified", "major");
+        let (failing, bucket) = (failing_at(FAILING_UNIT).await, test_bucket::serve(test_bucket::template_components()).await);
+        let root = ScratchDir::new();
+        older_build(&bucket, &s, root.path());
+
+        let failed = download(&failing, &s, root.path()).await.map_err(|e| e.to_string());
+        let stamped = std::fs::read_to_string(root.path().join("europe/.build_date")).ok();
+        download(&bucket, &s, root.path()).await.unwrap();
+
+        assert!(failed.as_ref().is_err_and(|e| e.starts_with(&format!("transport unit {FAILING_UNIT}: "))), "{failed:?}");
+        assert_eq!(differing(&held(&root.path().join("europe")), &files_of(&bucket, &s)), Vec::<String>::new());
+        assert_eq!(stamped, None);
+    }
+
+    // The retry fetches again only what had not come down: the object that
+    // failed and those after it.
+    #[tokio::test]
+    async fn a_retry_of_a_fresh_builds_download_fetches_only_what_had_not_come_down() {
+        let s = sel("europe", "admin", "simplified", "major");
+        let (failing, bucket) = (failing_at(FAILING_UNIT).await, test_bucket::serve(test_bucket::template_components()).await);
+        let (root, whole) = (ScratchDir::new(), ScratchDir::new());
+        download(&bucket, &s, whole.path()).await.unwrap();
+        let all = bucket.files_served();
+        older_build(&bucket, &s, root.path());
+        assert!(download(&failing, &s, root.path()).await.is_err());
+        let came_down = failing.files_served() - 1;
+
+        download(&bucket, &s, root.path()).await.unwrap();
+
+        assert!(came_down > 0 && came_down + 1 < all, "{came_down} of {all}");
+        assert_eq!(bucket.files_served() - all, all - came_down);
+        assert!(held(&root.path().join("europe")) == files_of(&bucket, &s));
+    }
+
+    // What a download of another build recorded as come down is no reason
+    // to skip a fetch: all come down again, and the record goes.
+    #[tokio::test]
+    async fn a_record_of_another_builds_fetches_skips_none() {
+        let s = sel("europe", "admin", "simplified", "major");
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (root, whole) = (ScratchDir::new(), ScratchDir::new());
+        download(&bucket, &s, whole.path()).await.unwrap();
+        let all = bucket.files_served();
+        older_build(&bucket, &s, root.path());
+        std::fs::remove_file(root.path().join("europe/.build_date")).unwrap();
+        let paths = resolve_files(&bucket.manifest, &s).unwrap().paths;
+        let fetched: BTreeSet<&str> = paths.iter()
+            .filter_map(|p| bucket.manifest.files.get(p).map(|e| e.unit.as_deref().unwrap_or(p.as_str())))
+            .collect();
+        let record: String = fetched.iter().map(|p| format!("{p}\n")).collect();
+        std::fs::write(root.path().join("europe/.fetched.2025-12-01"), record).unwrap();
+
+        download(&bucket, &s, root.path()).await.unwrap();
+
+        assert_eq!(bucket.files_served() - all, all);
+        assert_eq!(differing(&held(&root.path().join("europe")), &files_of(&bucket, &s)), Vec::<String>::new());
     }
 
     // A unit with one bad byte, in a file's bytes (decoded, of another
