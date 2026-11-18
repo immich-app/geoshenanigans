@@ -1190,6 +1190,88 @@ fn a_member_that_cant_go_in_place_puts_back_the_files_of_the_members_before_it()
     }
 }
 
+/// Writes `files` (paths relative to `dir`, their parent dirs made) into `dir`.
+fn put_tree(dir: &Path, files: &[(&str, &[u8])]) {
+    for (rel, bytes) in files {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+}
+
+/// What decodes killed before they cleaned up leave: their dirs, with members half written, the
+/// files they replaced, and what else.
+const LEFTOVERS: &[(&str, &[u8])] = &[
+    (".transport.4000000.0/place_nodes.bin", b"half a member"),
+    (".transport.4000000.0/.earlier.place_cells.bin", b"a file a member replaced"),
+    (".transport.1.8/a/b", b"deeper"),
+];
+
+/// Names a decode's dir doesn't have, which no decode removes.
+const LOOKALIKES: &[(&str, &[u8])] = &[
+    (".transport.notes/x", b"x"),
+    (".transport.1/x", b"x"),
+    (".transport.1.2.3/x", b"x"),
+    (".transport.-1.2/x", b"x"),
+    ("transport.1.2/x", b"x"),
+    (".transport.5.6", b"a file, not a dir"),
+];
+
+#[test]
+fn a_decode_removes_the_dirs_of_decodes_that_stopped_before_cleaning_up() {
+    let (unit, members, dir) = published_places();
+    let (_, _, clean) = published_places();
+    put_tree(dir.path(), LOOKALIKES);
+    put_tree(clean.path(), LOOKALIKES);
+    put_tree(dir.path(), LEFTOVERS);
+    std::fs::create_dir(dir.path().join(".transport.1.7")).unwrap();
+
+    decode_into_dir(&unit[..], dir.path(), Some(&expected(&members))).unwrap();
+    decode_into_dir(&unit[..], clean.path(), Some(&expected(&members))).unwrap();
+
+    assert_eq!(tree(dir.path()), tree(clean.path()));
+}
+
+#[test]
+fn a_decode_leaves_the_dirs_of_decodes_still_running() {
+    // A decode holds its dir, written, while another runs from start to end; a leftover that
+    // appears meanwhile stays until a decode starts with neither running.
+    let (unit, members, dir) = published_places();
+    let expect = expected(&members);
+    let (path, expect) = (dir.path(), &expect);
+    let decodes_dirs = || -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(path).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).filter(|n| n.starts_with(".transport.")).collect();
+        v.sort();
+        v
+    };
+
+    std::thread::scope(|s| {
+        let (at_end, held) = std::sync::mpsc::channel();
+        let (go, wait) = std::sync::mpsc::channel();
+        let held_unit = HeldAtEnd { bytes: unit.clone(), at: 0, at_end: Some(at_end), go: wait };
+        let first = s.spawn(move || decode_into_dir(held_unit, path, Some(expect)).map(|_| ()).map_err(|e| e.to_string()));
+        held.recv().unwrap();
+        let running = decodes_dirs();
+        assert_eq!(running.len(), 1, "{running:?}");
+        put_tree(path, LEFTOVERS);
+        let with_leftovers = decodes_dirs();
+
+        decode_into_dir(&unit[..], path, Some(expect)).unwrap();
+
+        assert_eq!(decodes_dirs(), with_leftovers);
+        go.send(()).unwrap();
+        assert_eq!(first.join().unwrap(), Ok(()));
+    });
+    assert_eq!(decodes_dirs(), [".transport.1.8", ".transport.4000000.0"]);
+
+    decode_into_dir(&unit[..], path, Some(expect)).unwrap();
+
+    assert!(decodes_dirs().is_empty());
+    let mut want: Vec<(String, Vec<u8>)> = members.iter().map(|(n, b)| (n.to_string(), b.clone())).collect();
+    want.sort();
+    assert_eq!(dir_files(path), want);
+}
+
 #[test]
 fn a_chunk_reader_reads_a_channels_chunks_as_one_stream() {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);

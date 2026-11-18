@@ -128,6 +128,12 @@ fetched again whole. Decoding holds the zstd window (8 MiB)
 and one chunk of the unit's columns (1 MiB, more only for a single polygon or
 arc larger than that).
 
+A decode that stops before it can clean up (its process killed, the machine
+off) leaves its dir behind. On unix every decode holds a shared lock on the
+dataset dir while it runs, and one that starts while no other holds it first
+removes the `.transport.<pid>.<n>` dirs there, so such a dir lasts until the
+next decode into the dataset dir.
+
 ## latest.json
 
 The entry point for all clients:

@@ -240,7 +240,10 @@ pub struct Expected {
 /// The decode makes a dir of its own in `dir` (a hidden name, which no member has and no other
 /// decode takes) and writes the members there; then it moves them into place one by one, the
 /// file each one replaces moved into its dir first, and once all are in it removes those files
-/// and its dir. It touches nothing else in `dir`: a `<member>.tmp` there, say, stays as it is.
+/// and its dir. Besides those it touches only the dirs that decodes into `dir` which stopped
+/// before they could clean up (their process killed, say) left: on unix a decode holds a shared
+/// lock on `dir` while it runs, and one that finds no other decode holding it first removes those
+/// dirs. Nothing else: a `<member>.tmp` there, say, stays as it is.
 ///
 /// On an error `dir` is as it was: the members moved in so far are taken out again, the files
 /// they replaced put back, and nothing of the decode is left. A member's path that is a directory
@@ -297,11 +300,64 @@ static STAGINGS: AtomicU64 = AtomicU64::new(0);
 
 /// The dir of a decode into a dir, in that dir: it holds the members as they decode (and a place
 /// unit's block table), then the files they replace while they go in place. Dropped, it removes
-/// the members it still holds, then itself if empty.
+/// the members it still holds, then itself if empty, and only then lets go of its hold on the dir.
 struct Staging {
     path: PathBuf,
     /// The members' files made in it.
     made: Vec<PathBuf>,
+    /// Dropped after the fields above and Drop::drop.
+    _hold: Hold,
+}
+
+/// A decode's shared lock on the dir it decodes into, held from before its own dir is made until
+/// after that is removed (none where the lock can't be had).
+struct Hold {
+    _lock: Option<File>,
+}
+
+/// Takes a hold on `dir`; if no other decode holds one, first removes the dirs of decodes that
+/// stopped without removing theirs: with every live decode holding its lock, those are all the
+/// decodes' dirs in `dir`. A dir that can't be opened gets no hold (making the decode's dir
+/// there then fails), nor one on a file system without locks, where no decode can tell another's
+/// dir from a leftover and none is removed.
+#[cfg(unix)]
+fn hold(dir: &Path) -> io::Result<Hold> {
+    let Ok(lock) = File::open(dir) else { return Ok(Hold { _lock: None }) };
+    match lock.try_lock() {
+        Ok(()) => {
+            remove_leftovers(dir);
+            lock.unlock().map_err(|e| at(dir, e))?;
+        }
+        Err(std::fs::TryLockError::WouldBlock) => {}
+        Err(std::fs::TryLockError::Error(_)) => return Ok(Hold { _lock: None }),
+    }
+    // Waits while another decode removes leftovers; the dir this one makes comes after.
+    lock.lock_shared().map_err(|e| at(dir, e))?;
+    Ok(Hold { _lock: Some(lock) })
+}
+
+#[cfg(not(unix))]
+fn hold(_dir: &Path) -> io::Result<Hold> {
+    Ok(Hold { _lock: None })
+}
+
+/// Whether `name` is a decode's dir's: `.transport.<pid>.<n>`.
+#[cfg(unix)]
+fn is_staging_name(name: &std::ffi::OsStr) -> bool {
+    let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(".transport.")) else { return false };
+    let Some((pid, n)) = rest.split_once('.') else { return false };
+    pid.parse::<u32>().is_ok() && n.parse::<u64>().is_ok()
+}
+
+/// Removes every decode's dir in `dir`, with what it holds; what can't be read or removed stays.
+#[cfg(unix)]
+fn remove_leftovers(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        if is_staging_name(&e.file_name()) && e.file_type().is_ok_and(|t| t.is_dir()) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 /// A member moved into place (once `installed`), the file it replaced moved to `earlier`.
@@ -312,13 +368,14 @@ struct Moved {
 }
 
 impl Staging {
-    /// A new dir in `dir`, under a name no member has: one an earlier process of this pid left
-    /// is skipped, never taken or removed.
+    /// A new dir in `dir`, under a name no member has, once it holds `dir`: one of that name
+    /// already there (an earlier process of this pid's, say) is skipped, never taken.
     fn new_in(dir: &Path) -> io::Result<Staging> {
+        let hold = hold(dir)?;
         loop {
             let path = dir.join(format!(".transport.{}.{}", std::process::id(), STAGINGS.fetch_add(1, Ordering::Relaxed)));
             match std::fs::create_dir(&path) {
-                Ok(()) => return Ok(Staging { path, made: Vec::new() }),
+                Ok(()) => return Ok(Staging { path, made: Vec::new(), _hold: hold }),
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(at(&path, e)),
             }
@@ -378,7 +435,8 @@ impl Staging {
 
 /// Undoes `moved`, the last first, after the error `e`: each replaced file back in its place,
 /// a member that replaced none removed. Returns `e`, naming what it couldn't undo (a replaced
-/// file it couldn't put back stays in the decode's dir, which then stays too).
+/// file it couldn't put back stays in the decode's dir, which then stays too, until a later
+/// decode into the dir removes it).
 fn put_back(moved: Vec<Moved>, e: io::Error) -> io::Error {
     let mut left = Vec::new();
     for m in moved.into_iter().rev() {
