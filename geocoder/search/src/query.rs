@@ -473,8 +473,8 @@ impl<'a, 'g> Searcher<'a, 'g> {
     }
 
     /// Scores one query split into `pool`. With `READ_FIRST`, an entity whose point does not
-    /// read is left out as it is offered; without, false when the split's context checks meet
-    /// one (`search`).
+    /// read is left out as it is offered; without, false when the split's context checks or a
+    /// cut-back of its pending candidates meet one (`search`).
     fn score_split<const READ_FIRST: bool>(&self, st: &mut State<'g>, split: u8, name: &[Token], ctx_words: &[String], prefix: bool, pool: &mut Pool) -> bool {
         let phrase = join(name);
         if phrase.is_empty() {
@@ -485,35 +485,40 @@ impl<'a, 'g> Searcher<'a, 'g> {
         let chars = phrase.chars().count();
         let folded_last = name.last().is_some_and(|t| t.raw != t.folded);
         let mut cands: Vec<Cand> = Vec::new();
+        // How many of the pending candidates, from the first, are known to read (`cut_back`).
+        let mut read = 0;
         let ents = &self.idx.ents;
         // Without context words a candidate goes straight to the pool; with them it waits for
         // the context check, made best-first and only while it can still reach the results.
+        // False for a cut-back that meets an entity that is nowhere.
         let mut emit = |pool: &mut Pool, entity: u32, ord: u8, class: u8, text: f32, imp: f32| {
             let potential = Self::score(text, imp, class, true);
             if potential <= pool.threshold() {
-                return;
+                return true;
             }
             // Read first, an entity that is nowhere is no candidate (one the pool holds is
             // somewhere).
             if READ_FIRST && !pool.best.contains_key(&entity) && ents.point(entity).is_none() {
-                return;
+                return true;
             }
             if has_ctx {
                 cands.push(Cand { entity, ord, class, text, potential });
-                if cands.len() > MAX_PENDING_CANDIDATES {
-                    cands.sort_by(|a, b| b.potential.total_cmp(&a.potential).then(a.entity.cmp(&b.entity)));
-                    cands.truncate(MAX_PENDING_CANDIDATES / 2);
+                if cands.len() > MAX_PENDING_CANDIDATES && !Self::cut_back::<READ_FIRST>(ents, &mut cands, &mut read) {
+                    return false;
                 }
             } else {
                 pool.offer(Hit { entity, ord, class, score: potential, text, context: false, split });
             }
+            true
         };
         for (_, sub) in self.idx.subs() {
             if prefix && chars <= PREFIX_TABLE_MAX_CHARS && !folded_last {
                 match sub.prefix_hits(&phrase) {
                     Some(hits) => {
                         for h in hits {
-                            emit(pool, h.entity, h.ord, h.class, h.text, dequantize(h.imp_q));
+                            if !emit(pool, h.entity, h.ord, h.class, h.text, dequantize(h.imp_q)) {
+                                return false;
+                            }
                         }
                         continue;
                     }
@@ -556,7 +561,9 @@ impl<'a, 'g> Searcher<'a, 'g> {
                         }
                         continue;
                     }
-                    emit(pool, p.entity, p.ord, p.class, text, imp);
+                    if !emit(pool, p.entity, p.ord, p.class, text, imp) {
+                        return false;
+                    }
                 }
             }
         }
@@ -592,16 +599,36 @@ impl<'a, 'g> Searcher<'a, 'g> {
         true
     }
 
+    /// Cuts the pending candidates back to the half that could score best; the first `read` of
+    /// them are known to read. Without `READ_FIRST` it first reads the others: false, before
+    /// any cut-back, when one is nowhere (`search`). Kept, such a one could push out a candidate
+    /// that, checked, would score above it (a cut-back ranks by the score a candidate could
+    /// reach, not the one it gets); dropped, it brings the cut-back on before a search without
+    /// it cuts back, which keeps what this one drops. Out of line, so that the closure that
+    /// queues the candidates stays inlined in the loop over the postings.
+    #[cold]
+    #[inline(never)]
+    fn cut_back<const READ_FIRST: bool>(ents: &Entities, cands: &mut Vec<Cand>, read: &mut usize) -> bool {
+        if !READ_FIRST && cands[*read..].iter().any(|c| ents.point(c.entity).is_none()) {
+            return false;
+        }
+        cands.sort_by(|a, b| b.potential.total_cmp(&a.potential).then(a.entity.cmp(&b.entity)));
+        cands.truncate(MAX_PENDING_CANDIDATES / 2);
+        *read = cands.len();
+        true
+    }
+
     pub fn search(&self, q: &str, limit: usize) -> (Vec<Found<'g>>, QueryStats) {
         if limit == 0 { return (Vec::new(), QueryStats::default()); }
         let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
         // An entity can be nowhere: its record or its slot does not read (a damaged file).
         // Reading each candidate's point as it is offered would read a record for every one, so
         // a search reads a hit's point where it uses the hit (a context check, the area order, a
-        // result), and until then a hit of an entity that is nowhere ranks as it scores. What
-        // such a hit keeps out of the pool or from a context check scores no higher than it, so
-        // a search that uses only hits ranked above every one of them has the hits it would have
-        // had without them, but for one that ties with it. One that meets one runs again reading
+        // result, a cut-back of a split's pending candidates, which weighs every one of them),
+        // and until then a hit of an entity that is nowhere ranks as it scores. What such a hit
+        // keeps out of the pool or from a context check scores no higher than it, so a search
+        // that uses only hits ranked above every one of them has the hits it would have had
+        // without them, but for one that ties with it. One that meets one runs again reading
         // each entity as it is offered, so that none takes a place a hit that reads could have
         // had; that run has its own budget of context checks.
         let found = match self.search_once::<false>(&mut st, q, limit) {
@@ -874,10 +901,25 @@ mod tests {
         assert_eq!(got, [(first, "Abcdx"), (second[0], "Abcdy"), (second[1], "Abcdy")]);
     }
 
+    /// The index of the set at `set` once the rows of its POIs `rows` do not read: their combo
+    /// past the dictionary (27 bytes a row), in a new file as a patch writes one.
+    fn with_unreadable_pois(set: &std::path::Path, rows: &[u32]) -> Index {
+        use query_server::{DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
+        let mut records = std::fs::read(set.join("poi_records.bin")).unwrap();
+        for &i in rows {
+            let at = i as usize * 27 + 25;
+            records[at..at + 2].copy_from_slice(&0xFFFEu16.to_le_bytes());
+        }
+        std::fs::write(set.join("poi_records.bin.new"), records).unwrap();
+        std::fs::rename(set.join("poi_records.bin.new"), set.join("poi_records.bin")).unwrap();
+        let damaged = Index::load(set.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+        assert!(rows.iter().all(|&i| damaged.poi_records.as_ref().unwrap().record(i).is_none()));
+        damaged
+    }
+
     #[test]
     fn hits_of_records_that_do_not_read_take_no_place_from_those_that_do() {
         use crate::fixture::{build_search, Geo, TempDir};
-        use query_server::{DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
         let mut g = Geo::default();
         // A neighbourhood "A" in a boundary "B"; one "Old Mill" of the least importance, then more
         // than the pool holds of the most; three "A Bay" of the most (the prefix table's hits of
@@ -917,16 +959,7 @@ mod tests {
             assert!(got.first().is_some_and(|e| unreadable.contains(&(e & !POI_BIT))), "{q}: {got:?}");
         }
         unreadable.push(last_hall);
-        // Their combo past the dictionary (27 bytes a row), in a new file as a patch writes one.
-        let mut records = std::fs::read(set.join("poi_records.bin")).unwrap();
-        for &i in &unreadable {
-            let at = i as usize * 27 + 25;
-            records[at..at + 2].copy_from_slice(&0xFFFEu16.to_le_bytes());
-        }
-        std::fs::write(set.join("poi_records.bin.new"), records).unwrap();
-        std::fs::rename(set.join("poi_records.bin.new"), set.join("poi_records.bin")).unwrap();
-        let damaged = Index::load(set.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
-        assert!(damaged.poi_records.as_ref().unwrap().record(unreadable[0]).is_none());
+        let damaged = with_unreadable_pois(&set, &unreadable);
 
         let got = found(&damaged);
 
@@ -934,6 +967,83 @@ mod tests {
         assert_eq!(entities, [&vec![valid], &vec![valid], &vec![a], &halls[..5].to_vec()]);
         // The last "Market Hall" ranks below every hit that search uses: it reads the index once.
         assert_eq!(got[3], readable[3]);
+    }
+
+    /// The results of "old mill, b" (two of them) over `g`, whose POIs `three_named` are also
+    /// "Old Mil" and "Old Mills": as built, and once the rows of its POIs `unreadable` do not
+    /// read. Each of those names is one edit from "old mill".
+    fn old_mill_in_b(g: &crate::fixture::Geo, three_named: &[u32], unreadable: &[u32]) -> [Vec<u32>; 2] {
+        use crate::fixture::{build_search, TempDir};
+        let dir = TempDir::new("crowded-split");
+        let (tsv, bin) = (dir.0.join("extra_names.tsv"), dir.0.join("extra_names.bin"));
+        let rows: String = three_named.iter().map(|e| format!("o\t{e}\t2\tname:de\tOld Mil\no\t{e}\t3\talt_name\tOld Mills\n")).collect();
+        std::fs::write(&tsv, rows).unwrap();
+        crate::extras::pack(tsv.to_str().unwrap(), bin.to_str().unwrap()).unwrap();
+        let set = dir.0.join("geo");
+        let geo = g.load(&set);
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, Some(&bin));
+        let found = |geo: &Index| {
+            let idx = SearchIndex::open(geo, &out, Some(bin.to_str().unwrap()), None).unwrap();
+            let (found, _) = Searcher::new(&idx).search("old mill, b", 2);
+            found.iter().map(|f| f.hit.entity).collect::<Vec<_>>()
+        };
+        [found(&geo), found(&with_unreadable_pois(&set, unreadable))]
+    }
+
+    #[test]
+    fn records_that_do_not_read_crowd_no_candidate_out_of_a_context_split() {
+        let mut g = crate::fixture::Geo::default();
+        // Under "olde mill", best first: one POI of the most importance, as many more as fill the
+        // pending candidates, then one in the boundary "B" of the least, which the cut-back of
+        // the pending candidates it brings on drops. Then under "old mil", "old milk" and "old
+        // mills" fewer POIs than the context checks allow, three names each, all of which score
+        // above those many: the next cut-back drops every one of the many. The rows of the many
+        // are made not to read.
+        g.boundary("B", 8, [10.0, 20.0, 10.2, 20.2]);
+        let lead = g.poi("Olde Mill", -30.0, -60.0, 255) | POI_BIT;
+        let many: Vec<u32> = (0..MAX_PENDING_CANDIDATES as u32 - 1)
+            .map(|k| g.poi("Olde Mill", -1.0 - (k / 100) as f32, -170.0 + (k % 100) as f32 * 3.4, 15))
+            .collect();
+        let inside = g.poi("Olde Mill", 10.1, 20.1, 3) | POI_BIT;
+        // 3/4 of the context checks: three names each are more than the next cut-back keeps.
+        let three_named: Vec<u32> = (0..MAX_CONTEXT_CHECKS as u32 * 3 / 4)
+            .map(|k| g.poi("Old Milk", -1.5 - (k / 50) as f32 * 2.0, -175.0 + (k % 50) as f32 * 7.0, 127))
+            .collect();
+
+        let [built, damaged] = old_mill_in_b(&g, &three_named, &many);
+
+        // While the many read, they keep the one in "B" from its context check: every result
+        // misses the context.
+        assert_eq!(built, [lead, three_named[0] | POI_BIT]);
+        assert_eq!(damaged, [inside, lead]);
+    }
+
+    #[test]
+    fn records_that_do_not_read_bring_on_no_cut_back_of_a_context_split() {
+        let mut g = crate::fixture::Geo::default();
+        // Under "old mil", "old milk" and "old mills", best first: fewer POIs than the context
+        // checks allow, the first of the most importance, three names each, as many names as
+        // half the pending candidates and two more. Then under "olde mill" POIs of less
+        // importance, as many as fill the pending candidates, and one in the boundary "B" of the
+        // least: the cut-back it brings on keeps only POIs of three names, and drops it with the
+        // many. The rows of the many are made not to read.
+        g.boundary("B", 8, [10.0, 20.0, 10.2, 20.2]);
+        let three_named: Vec<u32> = (0..MAX_PENDING_CANDIDATES as u32 / 6 + 1)
+            .map(|k| g.poi("Old Milk", -1.5 - (k / 50) as f32 * 2.0, -175.0 + (k % 50) as f32 * 7.0, if k == 0 { 255 } else { 127 }))
+            .collect();
+        assert!(three_named.len() * 3 > MAX_PENDING_CANDIDATES / 2 && three_named.len() < MAX_CONTEXT_CHECKS);
+        let many: Vec<u32> = (0..(MAX_PENDING_CANDIDATES - three_named.len() * 3) as u32)
+            .map(|k| g.poi("Olde Mill", -1.0 - (k / 100) as f32, -170.0 + (k % 100) as f32 * 3.4, 15))
+            .collect();
+        let inside = g.poi("Olde Mill", 10.1, 20.1, 3) | POI_BIT;
+
+        let [built, damaged] = old_mill_in_b(&g, &three_named, &many);
+
+        // While the many read, the one in "B" is pushed out with them, so it gets no context
+        // check: every result misses the context. Without them there is no cut-back.
+        assert_eq!(built, [three_named[0] | POI_BIT, three_named[1] | POI_BIT]);
+        assert_eq!(damaged, [inside, three_named[0] | POI_BIT]);
     }
 
     #[test]
