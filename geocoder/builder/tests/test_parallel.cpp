@@ -141,11 +141,19 @@ TEST(parallel_for_reuses_its_threads_between_calls) {
         std::sort(seen.begin(), seen.end());
         return seen;
     };
+    // A range's thread goes back to the idle ones just after the range counts
+    // itself done, so a call made at once may find none idle yet: the next
+    // calls come once the first one's threads have had a moment to get there.
     const auto first = ids();
-    const auto second = ids();
-    CHECK(std::any_of(second.begin(), second.end(), [&](std::thread::id t) {
-        return std::binary_search(first.begin(), first.end(), t);
-    }));
+    bool reused = false;
+    for (int attempt = 0; attempt < 20 && !reused; attempt++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        const auto next = ids();
+        reused = std::any_of(next.begin(), next.end(), [&](std::thread::id t) {
+            return std::binary_search(first.begin(), first.end(), t);
+        });
+    }
+    CHECK(reused);
 }
 
 TEST(parallel_for_nests_and_runs_from_many_threads_at_once) {
