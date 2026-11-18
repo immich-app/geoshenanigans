@@ -235,8 +235,9 @@ impl PostcodeFiles {
                 row = stop;
             }
         }
+        // The nearest to the front, the ones before it one place on: the others stay in block order.
         if let Some(m) = (0..out.len()).min_by(|&i, &j| out[i].d.total_cmp(&out[j].d)) {
-            out.swap(0, m);
+            out[..=m].rotate_right(1);
         }
     }
 
@@ -253,11 +254,14 @@ impl PostcodeFiles {
         }
         #[cfg(test)]
         BLOCK_READS.with(|n| n.set(n.get() + 1));
-        let end = match self.entry(block + 1) {
+        // The block's bytes, and its bits from the block's first byte: a bit offset in the file
+        // would pass a 32-bit usize past 512 MiB. The bytes after the block (the next blocks, then
+        // the table) stay in the slice for the 8-byte loads.
+        let len = match self.entry(block + 1) {
             Some(next) => next.offset.clamp(e.offset, self.table_at),
             None => self.table_at,
-        } * 8;
-        let s = self.centroids.as_slice();
+        } - e.offset;
+        let s = &self.centroids.as_slice()[e.offset..];
         let mut c = Centroid { lat: f32::from_bits(e.lat), lng: f32::from_bits(e.lng), postcode_id: e.postcode_id, country_code: e.country_code };
         if rows & 1 != 0 {
             f(first, c);
@@ -265,7 +269,7 @@ impl PostcodeFiles {
         let last = 31 - rows.leading_zeros();
         let (mixed, kind1, one_country) = (e.flags & FLAG_MIXED != 0, e.flags & FLAG_KIND1 != 0, e.flags & FLAG_ONE_COUNTRY != 0);
         let [kl, kg, kp, kc] = e.k;
-        let mut bit = e.offset * 8;
+        let mut bit = 0;
         // The previous row's decimal keys, when it was of kind 1: its rounds.
         let mut keys: Option<(i32, i32)> = None;
         for i in 1..=last {
@@ -285,7 +289,7 @@ impl PostcodeFiles {
                 let Some(z) = get_rice(s, &mut bit, kc) else { return };
                 z
             };
-            if bit > end {
+            if bit.div_ceil(8) > len {
                 return;
             }
             let (dl, dg) = (unzigzag32(zl), unzigzag32(zg));
@@ -405,9 +409,12 @@ pub fn encode(rows: &[LogicalCentroid]) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// The files of centroids anywhere, each with its admin cell at `level` and put in cell order, as
-/// the builder writes them (fixtures and tests).
+/// the builder writes them (fixtures and tests). The level is at most 14: a cell's key is its id
+/// >> 32, which keeps the whole id only where its low 32 bits are zero, as they are at level 14
+/// and coarser; the builder refuses a finer cell (postcode_files.h's cell_key).
 #[cfg(any(test, feature = "fixtures"))]
 pub fn encode_points(points: &[Centroid], level: u64) -> (Vec<u8>, Vec<u8>) {
+    assert!(level <= 14, "postcode centroid cells of level {level}: their keys hold levels up to 14");
     let mut rows: Vec<LogicalCentroid> = points
         .iter()
         .map(|c| LogicalCentroid {

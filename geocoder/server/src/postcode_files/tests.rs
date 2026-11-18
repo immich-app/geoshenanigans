@@ -257,7 +257,7 @@ fn the_walk_finds_the_nearest_centroid_every_row_gives() {
     }).collect();
     queries.extend(points.iter().step_by(97).map(|p| (p.lat as f64, p.lng as f64)));
     queries.extend([(10.0, 179.999), (10.0, -179.999), (51.5072, -0.1276), (30.0, -40.0)]);
-    let (mut decoded, mut held) = (0usize, 0usize);
+    let (mut decoded, mut held, mut nearest_third_or_later) = (0usize, 0usize, 0usize);
     let mut near = Vec::new();
     for (lat, lng) in queries {
         let cell = cell_id_at_level(lat, lng, LEVEL);
@@ -282,6 +282,8 @@ fn the_walk_finds_the_nearest_centroid_every_row_gives() {
         let mut got: Option<(f64, u32)> = None;
         f.blocks_near(&nine, lat, lng, max_d, &mut near);
         assert!(near.iter().all(|n| near[0].d <= n.d), "the nearest first");
+        assert!(near.iter().skip(1).is_sorted_by_key(|n| n.block), "the others in block order");
+        nearest_third_or_later += (near.iter().filter(|n| n.block < near[0].block).count() >= 2) as usize;
         for n in &near {
             assert!(n.d < max_d && n.rows != 0);
             if got.is_some_and(|b| n.d > b.0) {
@@ -299,6 +301,35 @@ fn the_walk_finds_the_nearest_centroid_every_row_gives() {
         assert_eq!(got, want, "({lat}, {lng})");
     }
     assert!(decoded * 2 < held, "{decoded} blocks decoded of {held}");
+    assert!(nearest_third_or_later > 0);
+}
+
+/// The nearest candidate goes first and the others keep their block order, wherever it was among
+/// them: one cell's 128 rows in four blocks, each block's rows around a point of its own, the
+/// third block's at the query.
+#[test]
+fn the_nearest_block_goes_first_and_the_others_keep_their_order() {
+    let (lat, lng) = (52.37f64, 4.89f64);
+    let spots = [(0.002, 0.0), (0.0, 0.002), (0.0, 0.0), (-0.002, 0.0)];
+    let points: Vec<Centroid> = (0..128u32)
+        .map(|i| {
+            let (dlat, dlng) = spots[i as usize / BLOCK_ROWS];
+            Centroid { lat: (lat + dlat + (i % 32) as f64 * 1e-5) as f32, lng: (lng + dlng) as f32, postcode_id: i, country_code: GB }
+        })
+        .collect();
+    let cell = cell_id_at_level(lat, lng, LEVEL);
+    assert!(points.iter().all(|p| cell_id_at_level(p.lat as f64, p.lng as f64, LEVEL) == cell));
+    let f = open(&encode_points(&points, LEVEL)).unwrap();
+    let mut near = Vec::new();
+    f.blocks_near(&[cell], lat, lng, 1.0, &mut near);
+    assert_eq!(near.iter().map(|n| n.block).collect::<Vec<_>>(), [2, 0, 1, 3]);
+}
+
+/// A level past 14 would cut its cells' ids short of their keys.
+#[test]
+#[should_panic(expected = "postcode centroid cells of level 15")]
+fn the_test_encoder_takes_no_level_past_14() {
+    encode_points(&random_points(&mut Rng::new(1), 3), 15);
 }
 
 #[test]
