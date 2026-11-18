@@ -472,10 +472,10 @@ impl<'a, 'g> Searcher<'a, 'g> {
         text * text * (IMPORTANCE_FLOOR + imp) * CLASS_MULT[class.min(5) as usize] * ctx
     }
 
-    /// Scores one query split into `pool`. With `read_first`, an entity whose point does not
+    /// Scores one query split into `pool`. With `READ_FIRST`, an entity whose point does not
     /// read is left out as it is offered; without, false when the split's context checks meet
     /// one (`search`).
-    fn score_split(&self, st: &mut State<'g>, split: u8, name: &[Token], ctx_words: &[String], prefix: bool, pool: &mut Pool, read_first: bool) -> bool {
+    fn score_split<const READ_FIRST: bool>(&self, st: &mut State<'g>, split: u8, name: &[Token], ctx_words: &[String], prefix: bool, pool: &mut Pool) -> bool {
         let phrase = join(name);
         if phrase.is_empty() {
             return true;
@@ -495,7 +495,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
             }
             // Read first, an entity that is nowhere is no candidate (one the pool holds is
             // somewhere).
-            if read_first && !pool.best.contains_key(&entity) && ents.point(entity).is_none() {
+            if READ_FIRST && !pool.best.contains_key(&entity) && ents.point(entity).is_none() {
                 return;
             }
             if has_ctx {
@@ -575,7 +575,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
                 None if st.stats.context_checks >= MAX_CONTEXT_CHECKS => false,
                 None => {
                     let Some(at) = ents.point(c.entity) else {
-                        if read_first {
+                        if READ_FIRST {
                             continue;
                         }
                         return false;
@@ -604,11 +604,11 @@ impl<'a, 'g> Searcher<'a, 'g> {
         // had without them, but for one that ties with it. One that meets one runs again reading
         // each entity as it is offered, so that none takes a place a hit that reads could have
         // had; that run has its own budget of context checks.
-        let found = match self.search_once(&mut st, q, limit, false) {
+        let found = match self.search_once::<false>(&mut st, q, limit) {
             Some(found) => found,
             None => {
                 let first = std::mem::take(&mut st.stats);
-                let found = self.search_once(&mut st, q, limit, true).unwrap_or_default();
+                let found = self.search_once::<true>(&mut st, q, limit).unwrap_or_default();
                 st.stats += first;
                 found
             }
@@ -616,16 +616,16 @@ impl<'a, 'g> Searcher<'a, 'g> {
         (found, st.stats)
     }
 
-    /// `search`'s results; None, without `read_first`, for a search that met an entity that is
+    /// `search`'s results; None, without `READ_FIRST`, for a search that met an entity that is
     /// nowhere (`score_split`).
-    fn search_once(&self, st: &mut State<'g>, q: &str, limit: usize, read_first: bool) -> Option<Vec<Found<'g>>> {
+    fn search_once<const READ_FIRST: bool>(&self, st: &mut State<'g>, q: &str, limit: usize) -> Option<Vec<Found<'g>>> {
         let mut pool = Pool::new(limit * CONTEXT_CUTOFF_FACTOR);
         let mut phrases: Vec<String> = Vec::new();
         if let Some((name, rest)) = q.split_once(',') {
             let name = tokens(name);
             let ctx: Vec<String> = tokens(rest).into_iter().map(|t| t.folded).take(63).collect();
             phrases.push(join(&name));
-            if !self.score_split(st, 0, &name, &ctx, ctx.is_empty(), &mut pool, read_first) {
+            if !self.score_split::<READ_FIRST>(st, 0, &name, &ctx, ctx.is_empty(), &mut pool) {
                 return None;
             }
         } else {
@@ -637,21 +637,21 @@ impl<'a, 'g> Searcher<'a, 'g> {
                 }
                 let ctx: Vec<String> = t[k..].iter().map(|x| x.folded.clone()).collect();
                 phrases.push(join(&t[..k]));
-                if !self.score_split(st, (phrases.len() - 1) as u8, &t[..k], &ctx, k == n, &mut pool, read_first) {
+                if !self.score_split::<READ_FIRST>(st, (phrases.len() - 1) as u8, &t[..k], &ctx, k == n, &mut pool) {
                     return None;
                 }
             }
         }
         let mut hits: Vec<Hit> = pool.best.into_values().collect();
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.entity.cmp(&b.entity)));
-        if !self.place_before_its_area(&mut hits) && !read_first {
+        if !self.place_before_its_area(&mut hits) && !READ_FIRST {
             return None;
         }
         let mut out: Vec<Found<'g>> = Vec::new();
         let mut kept: Vec<(String, (f32, f32))> = Vec::new();
         for h in hits {
             let Some(at) = self.idx.ents.point(h.entity) else {
-                if read_first {
+                if READ_FIRST {
                     continue;
                 }
                 return None;
@@ -682,8 +682,15 @@ impl<'a, 'g> Searcher<'a, 'g> {
         let top = hits.len().min(AREA_CHECK_TOP);
         for i in 0..top {
             let e = hits[i].entity;
+            // Only a boundary moves: of the others, whether they are somewhere.
+            if Entities::is_poi(e) || e < ents.n_place_nodes {
+                if ents.point(e).is_none() {
+                    return false;
+                }
+                continue;
+            }
             let Some((k, t)) = ents.kind_and_type_of(e) else { return false };
-            if !Entities::is_area(k, &t) || Entities::is_poi(e) || e < ents.n_place_nodes {
+            if !Entities::is_area(k, &t) {
                 continue;
             }
             let Some(area) = ents.slot(e - ents.n_place_nodes).and_then(|s| polygon_raw(self.idx.geo, s.poly)) else { continue };
@@ -693,6 +700,13 @@ impl<'a, 'g> Searcher<'a, 'g> {
             let area_label = label(&hits[i]);
             let mut found = None;
             for (j, h) in hits.iter().enumerate().take(i + 1 + AREA_CHECK_TOP).skip(i + 1) {
+                // A POI is no settlement.
+                if Entities::is_poi(h.entity) {
+                    if ents.point(h.entity).is_none() {
+                        return false;
+                    }
+                    continue;
+                }
                 let Some((k, t)) = ents.kind_and_type_of(h.entity) else { return false };
                 if Entities::is_settlement(k, &t) && label(h) == area_label && self.contained_in(h.entity, &area) {
                     found = Some(j);
