@@ -1272,6 +1272,9 @@ struct Dec : Decoder {
         }
         if (pcf::get32(entry + 12) != at) pcf::malformed("block " + std::to_string(b) + " is not where the blocks before it end");
         if (stop < at || stop > f.table_at) pcf::malformed("block " + std::to_string(b) + " ends past the blocks or before it starts");
+        // Before the reader's buffer grows to the block, which a malformed table can make any size.
+        if (stop - at > pcf::max_block_bytes(f.rows_of(b)))
+            pcf::malformed("block " + std::to_string(b) + " has more bytes than its rows can take");
         const size_t n = size_t(stop - at);
         static const uint8_t none = 0;
         const uint8_t* p = n ? N->take(n) : &none;

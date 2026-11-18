@@ -186,6 +186,13 @@ inline uint32_t coordinate_of(uint32_t step, uint32_t prev, bool kind1) {
     return from_dec4_key(int32_t(uint32_t(dec4_round(prev)) + step));
 }
 
+// The most bytes of bits a block of `rows` rows (1 to BLOCK_ROWS) can have:
+// a kind bit and four codes of at most RICE_MAX_BITS a row after row 0. The
+// decoders refuse a longer block before they read it.
+inline constexpr size_t max_block_bytes(size_t rows) {
+    return rows ? ((rows - 1) * (1 + 4 * size_t(coord_keys::RICE_MAX_BITS)) + 7) / 8 : 0;
+}
+
 inline bool is_kind1(const LogicalCentroid& c) {
     int32_t k;
     return coord_keys::dec4_key(coord_keys::bits_of(c.lat), k) && coord_keys::dec4_key(coord_keys::bits_of(c.lng), k);
@@ -365,10 +372,14 @@ inline Footer read_footer(const uint8_t* footer, uint64_t size) {
     if (std::memcmp(footer + 4, MAGIC, 4) != 0) malformed("postcode_centroids.bin has no PCC1 footer");
     Footer f;
     f.rows = get32(footer);
-    f.blocks = (size_t(f.rows) + BLOCK_ROWS - 1) / BLOCK_ROWS;
-    const uint64_t table = uint64_t(f.blocks) * TABLE_ENTRY_BYTES + FOOTER_BYTES;
+    // In 64 bits: a count near 2^32 rounded up would wrap a 32-bit size_t.
+    const uint64_t blocks = (uint64_t(f.rows) + BLOCK_ROWS - 1) / BLOCK_ROWS;
+    f.blocks = size_t(blocks);
+    const uint64_t table = blocks * TABLE_ENTRY_BYTES + FOOTER_BYTES;
     if (table > size) malformed("postcode_centroids.bin is shorter than its block table");
     f.table_at = size - table;
+    // No block holds the bytes before the footer of no rows.
+    if (!f.rows && f.table_at) malformed("postcode_centroids.bin has block bytes but no rows");
     return f;
 }
 // The bytes of the logical stream of files with this footer.
@@ -386,9 +397,10 @@ struct Span {
 // (read front to back through size() and at(off, n)), then each block's
 // table entry and bits in turn, it hands each centroid with its cell's key
 // to put(const LogicalCentroid&) and refuses every block the encoder would
-// not write for its rows (an Encoder writes each again and its entry and bits
-// must be the block's), every row out of the encoder's order, and cells that
-// do not tile the rows. Holds a block's bits and rows and the cells index's
+// not write for its rows (one longer than max_block_bytes of them before it
+// copies its bits; an Encoder writes each again and its entry and bits must
+// be the block's), every row out of the encoder's order, and cells that do
+// not tile the rows. Holds a block's bits and rows and the cells index's
 // parent record.
 template <class Cells>
 class Decoder {
@@ -410,6 +422,7 @@ public:
         const std::string name = "block " + std::to_string(b_);
         const BlockEntry e = read_entry(entry);
         const size_t rows = f_.rows_of(b_);
+        if (n > max_block_bytes(rows)) malformed(name + " has more bytes than its rows can take");
         bits_.assign(p, p + n);
         bits_.resize(n + 8, 0);
         const uint8_t* q = bits_.data();

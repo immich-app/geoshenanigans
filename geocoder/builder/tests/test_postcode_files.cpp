@@ -166,6 +166,13 @@ TEST(postcode_files_of_no_centroids_are_the_footer_and_an_empty_cells_file) {
     Files cells_without_rows = f;
     cells_without_rows.cells = encode({row(1, 1, 1, GB, key(5))}).cells;
     CHECK(refusal_decoding(cells_without_rows).find("cells past the last row") != std::string::npos);
+    // A byte before the footer of no rows: block bytes that no block is, refused
+    // by the footer alone.
+    Files leading = f;
+    leading.centroids.insert(leading.centroids.begin(), 0);
+    const std::string no_rows = "Malformed postcode centroid files: postcode_centroids.bin has block bytes but no rows";
+    CHECK_EQ(refusal_decoding(leading), no_rows);
+    CHECK_EQ(gctest::refusal_of([&] { postcode_files::read_footer(leading.centroids.data() + 1, leading.centroids.size()); }), no_rows);
 }
 
 TEST(a_block_holds_32_rows_its_first_in_its_table_entry) {
@@ -185,12 +192,39 @@ TEST(a_block_holds_32_rows_its_first_in_its_table_entry) {
     CHECK_EQ(postcode_files::logical_size(ft), uint64_t(33 * postcode_files::LOGICAL_STRIDE));
 }
 
-// A block's box holds its rows as an f64 reader computes it, and its open
-// sides are where none of -32766 to 32766 units of 2^-14 degrees from row 0
-// reaches.
+// A block's bits are at most max_block_bytes of its rows, which the decoders
+// hold a block to: 32 rows each a far step from the one before in every
+// field, of both kinds and two countries, and the blocks of random streams.
+TEST(a_blocks_bits_are_within_max_block_bytes) {
+    std::vector<LogicalCentroid> far;
+    for (uint32_t i = 0; i < 32; i++) {
+        const float sign = i % 2 ? 1.0f : -1.0f;
+        const float lat = i % 4 < 2 ? sign * 3e38f : sign * 89.9999f, lng = i % 3 ? -sign * 1e-40f : sign * 179.9999f;
+        far.push_back(row(lat, lng, i * 0x07FFFFFFu, i % 2 ? uint16_t(1) : uint16_t(0xFFFF), key(5)));
+    }
+    std::mt19937_64 rng(13);
+    size_t blocks = 0, most = 0;
+    for (int t = 0; t < 101; t++) {
+        const Files f = encode(t ? random_stream(rng, 1 + rng() % 300) : far);
+        if (t == 0) CHECK(same(decode(f), far));
+        const postcode_files::Footer ft = postcode_files::read_footer(f.centroids.data() + f.centroids.size() - 8, f.centroids.size());
+        for (size_t b = 0; b < ft.blocks; b++, blocks++) {
+            const uint64_t end = b + 1 < ft.blocks ? get32(f.centroids, entry_at(f, b + 1) + 12) : ft.table_at;
+            const uint64_t bytes = end - get32(f.centroids, entry_at(f, b) + 12);
+            CHECK(bytes <= postcode_files::max_block_bytes(ft.rows_of(b)));
+            if (t == 0) most = size_t(bytes);
+        }
+    }
+    CHECK(blocks > 100);
+    std::printf("    the far block: %zu bytes of at most %zu\n", most, postcode_files::max_block_bytes(32));
+}
+
+// A block's box holds its rows as an f64 reader computes it, each side the
+// tightest that does, and its open sides are where none of -32766 to 32766
+// units of 2^-14 degrees from row 0 reaches.
 TEST(a_blocks_box_holds_its_rows_in_f64) {
     std::mt19937_64 rng(5);
-    size_t open = 0, blocks = 0;
+    size_t open = 0, blocks = 0, tight[2] = {0, 0};
     for (int t = 0; t < 200; t++) {
         const std::vector<LogicalCentroid> rows = random_stream(rng, 1 + rng() % 200);
         const Files f = encode(rows);
@@ -207,15 +241,36 @@ TEST(a_blocks_box_holds_its_rows_in_f64) {
                 CHECK(e.box[3] == 32767 || side(lng0, e.box[3]) >= lng);
             }
             for (int s = 0; s < 4; s++) open += e.box[s] == -32767 || e.box[s] == 32767;
-            // The tightest: one unit in from each closed side leaves a row out.
-            double least = 1e9, most = -1e9;
-            for (size_t i = b * 32; i < b * 32 + ft.rows_of(b); i++) least = std::min(least, double(rows[i].lat)), most = std::max(most, double(rows[i].lat));
-            if (e.box[0] != -32767 && e.box[0] < 32766) CHECK(side(lat0, e.box[0] + 1) > least);
-            if (e.box[1] != 32767 && e.box[1] > -32766) CHECK(side(lat0, e.box[1] - 1) < most);
+            // The tightest, lat and lng alike: one unit in from each closed side
+            // leaves a row out, and an open side is one that no closed side
+            // holds the rows in, so the farthest, 32766 units from row 0, leaves
+            // a row out too.
+            const double first[2] = {lat0, lng0};
+            double least[2] = {1e9, 1e9}, most[2] = {-1e9, -1e9};
+            for (size_t i = b * 32; i < b * 32 + ft.rows_of(b); i++) {
+                const double v[2] = {rows[i].lat, rows[i].lng};
+                for (int a = 0; a < 2; a++) least[a] = std::min(least[a], v[a]), most[a] = std::max(most[a], v[a]);
+            }
+            for (int a = 0; a < 2; a++) {
+                const int16_t lo = e.box[2 * a], hi = e.box[2 * a + 1];
+                if (lo == -32767) {
+                    CHECK(side(first[a], -32766) > least[a]);
+                } else if (lo < 32766) {
+                    CHECK(side(first[a], int16_t(lo + 1)) > least[a]);
+                    tight[a]++;
+                }
+                if (hi == 32767) {
+                    CHECK(side(first[a], 32766) < most[a]);
+                } else if (hi > -32766) {
+                    CHECK(side(first[a], int16_t(hi - 1)) < most[a]);
+                    tight[a]++;
+                }
+            }
         }
     }
     CHECK(open > 0);
     CHECK(blocks > 0);
+    CHECK(tight[0] > 0 && tight[1] > 0);
     // Rows 3 degrees apart: past 32766 units (2.0 degrees) on both sides of row 0.
     const Files wide = encode({row(50, 10, 1, GB, key(3)), row(53, 7, 2, GB, key(3)), row(47, 13, 3, GB, key(3))});
     const postcode_files::BlockEntry e = postcode_files::read_entry(wide.centroids.data() + entry_at(wide, 0));
@@ -282,6 +337,12 @@ TEST(the_decoder_refuses_files_the_encoder_doesnt_write) {
         refused(g, "shorter than its block table");
     }
     {
+        // The most rows a footer counts and no table: their blocks are
+        // counted in 64 bits, which a 32-bit size_t would wrap to none.
+        const std::vector<uint8_t> most = {0xFF, 0xFF, 0xFF, 0xFF, 'P', 'C', 'C', '1'};
+        refused({most, {}}, "shorter than its block table");
+    }
+    {
         // 129 rows: a fifth block, the table read an entry early.
         Files g = f;
         set32(g.centroids, g.centroids.size() - 8, 129);
@@ -312,6 +373,17 @@ TEST(the_decoder_refuses_files_the_encoder_doesnt_write) {
         Files g = f;
         g.centroids.insert(g.centroids.begin() + long(entry_at(g, 0)), 0);
         refused(g, "block 3 is not the encoder's");
+    }
+    // More of them than the last block's 4 rows can have: refused for its
+    // length, before its bits are read.
+    {
+        Files g = f;
+        const size_t bits = entry_at(g, 0) - get32(g.centroids, entry_at(g, 3) + 12);
+        g.centroids.insert(g.centroids.begin() + long(entry_at(g, 0)), postcode_files::max_block_bytes(4) + 1 - bits, 0);
+        refused(g, "block 3 has more bytes than its rows can take");
+        Files at_most = f;
+        at_most.centroids.insert(at_most.centroids.begin() + long(entry_at(at_most, 0)), postcode_files::max_block_bytes(4) - bits, 0);
+        refused(at_most, "block 3 is not the encoder's");
     }
     // Cells whose ranges don't tile the rows: one row short, one past, another file's.
     {
@@ -396,31 +468,41 @@ TEST(a_block_has_one_encoding) {
 }
 
 // Every file a byte changed in, or cut short, either is refused or decodes
-// to a stream whose encoding it is: no stream has two encodings.
+// to a stream whose encoding it is: no stream has two encodings. Among them
+// a change that is another stream's encoding, the country of a block of one
+// row, decodes to that stream.
 TEST(a_logical_stream_of_centroids_has_one_encoding) {
     std::mt19937_64 rng(77);
-    const Files f = encode(random_stream(rng, 300));
+    const Files f = encode(random_stream(rng, 289));  // ten blocks, the last of one row
     size_t refused = 0, decoded = 0;
-    for (int t = 0; t < 6000; t++) {
+    for (int t = -1; t < 6000; t++) {
         Files g = f;
-        std::vector<uint8_t>& file = t % 4 == 0 ? g.cells : g.centroids;
-        if (t % 50 == 0) {
-            file.resize(rng() % file.size());
+        if (t < 0) {
+            // Row 288's country, in the last block's table entry.
+            g.centroids[g.centroids.size() - 8 - postcode_files::TABLE_ENTRY_BYTES + 16] ^= 0x5A;
         } else {
-            const size_t at = rng() % file.size();
-            file[at] ^= uint8_t(1u << (rng() % 8));
+            std::vector<uint8_t>& file = t % 4 == 0 ? g.cells : g.centroids;
+            if (t % 50 == 0) {
+                file.resize(rng() % file.size());
+            } else {
+                const size_t at = rng() % file.size();
+                file[at] ^= uint8_t(1u << (rng() % 8));
+            }
         }
         std::vector<LogicalCentroid> rows;
         try {
             rows = decode(g);
         } catch (const std::runtime_error&) {
+            CHECK(t >= 0);
             refused++;
             continue;
         }
         decoded++;
         CHECK(encode(rows) == g);
+        if (t < 0) CHECK(rows.back().country_code == (GB ^ 0x5A) || rows.back().country_code == (IE ^ 0x5A));
     }
     CHECK(refused > 0);
+    CHECK(decoded > 0);
     std::printf("    %zu refused, %zu decoded to their encoding\n", refused, decoded);
 }
 

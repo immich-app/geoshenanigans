@@ -1965,3 +1965,41 @@ TEST(gcs_postcodes_decoder_takes_a_dir_without_its_files_as_none_and_refuses_one
                  std::string("Malformed postcode centroid files: centroids out of order in a cell"));
     }
 }
+
+// Files of no rows with a byte before the footer, which no block decodes, are
+// refused by the decoder and by the decoded size alone, from the footer.
+TEST(gcs_postcodes_refuse_block_bytes_beside_no_rows) {
+    ScratchDir dir("gcs-test");
+    Files f = postcode_files_of({});
+    std::vector<char>& c = f.at(postcode_files::CENTROIDS_FILE);
+    c.insert(c.begin(), char(0));
+    write_files(dir.path(), f);
+    const std::string refusal = "Malformed postcode centroid files: postcode_centroids.bin has block bytes but no rows";
+    CHECK_EQ(refusal_of([&] { postcodes::decoded_size(dir.path()); }), refusal);
+    CHECK_EQ(refusal_of([&] {
+                 postcodes::Dec dec(dir.path());
+                 decode_all(dec);
+             }),
+             refusal);
+}
+
+// A block longer than its rows can be, within the file (a MiB between the
+// blocks and the table, which makes the last block, row 32 alone, that long),
+// is refused in the strict decoder's words before the reader takes it: its
+// buffer stays the size it opened with.
+TEST(gcs_postcodes_refuse_a_block_longer_than_its_rows_before_reading_it) {
+    ScratchDir dir("gcs-test");
+    Files f = postcode_files_of(centroid_rows(33));
+    std::vector<char>& c = f.at(postcode_files::CENTROIDS_FILE);
+    c.insert(c.end() - std::ptrdiff_t(2 * postcode_files::TABLE_ENTRY_BYTES + postcode_files::FOOTER_BYTES), size_t(1) << 20, char(0));
+    const std::vector<char>& k = f.at(postcode_files::CELLS_FILE);
+    const std::string strict = refusal_of([&] {
+        postcode_files::decode(u8(c), c.size(), u8(k), k.size(), [](const postcode_files::LogicalCentroid&) {});
+    });
+    CHECK_EQ(strict, std::string("Malformed postcode centroid files: block 1 has more bytes than its rows can take"));
+    write_files(dir.path(), f);
+    postcodes::Dec dec(dir.path());
+    CHECK_EQ(refusal_of([&] { decode_all(dec); }), strict);
+    REQUIRE(dec.N);
+    CHECK_EQ(dec.N->cap, postcodes::BLOCKS_BUF);
+}
