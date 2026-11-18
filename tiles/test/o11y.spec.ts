@@ -285,9 +285,11 @@ describe('heartbeat', () => {
       await waitOnExecutionContext(ctx);
     };
     const { calls } = mockFetch();
+    // The cron's Bunny jobs (bunny-probe.spec.ts) push their own samples beside it.
+    const heartbeats = () => calls.filter(({ url }) => url === 'https://o11y.test/insert/0/influx/write');
     const o11yEnv = { ...env, ENVIRONMENT: 'prod', O11Y_URL: 'https://o11y.test', O11Y_TOKEN: 'secret' };
     await run(o11yEnv);
-    expect(calls.map(({ url, init }) => [url, String(init.body)])).toEqual([
+    expect(heartbeats().map(({ url, init }) => [url, String(init.body)])).toEqual([
       [
         'https://o11y.test/insert/0/influx/write',
         expect.stringMatching(
@@ -295,9 +297,11 @@ describe('heartbeat', () => {
         ),
       ],
     ]);
+    const sent = calls.length;
     await run(env);
     await run({ ...o11yEnv, WORKER_TYPE: 'D1_PROXY' });
-    expect(calls).toHaveLength(1);
+    expect(heartbeats()).toHaveLength(1);
+    expect(calls).toHaveLength(sent);
   });
 });
 

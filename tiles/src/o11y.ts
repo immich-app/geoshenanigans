@@ -161,7 +161,7 @@ export function influxLines(metric: Metric, identity: Identity): string[] {
  * POSTs to the gateway. Never rejects: a failed push is only logged to the console, never to o11y, as that is what
  * failed.
  */
-async function send(config: O11yConfig, path: string, body: string, contentType: string): Promise<void> {
+export async function send(config: O11yConfig, path: string, body: string, contentType: string): Promise<void> {
   try {
     const response = await fetch(`${config.url}${path}`, {
       method: 'POST',

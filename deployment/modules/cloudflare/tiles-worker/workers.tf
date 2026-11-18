@@ -2,6 +2,13 @@ data "cloudflare_zone" "immich_cloud" {
   name = "immich.cloud"
 }
 
+locals {
+  # Only prod reads Bunny's logs and probes: the Bunny account is production's, and a dev worker would read the same pull
+  # zone's logs again and spend the Globalping quota twice. Whether a secret is set isn't itself secret.
+  bunny_log_reader = var.env == "prod" && nonsensitive(var.bunny_api_key != "") && var.bunny_pull_zone_id != ""
+  bunny_probe      = var.env == "prod" && nonsensitive(var.globalping_token != "") && var.bunny_public_url != ""
+}
+
 resource "cloudflare_workers_script" "tiles" {
   account_id = var.cloudflare_account_id
   name       = "tiles-${var.env}"
@@ -47,6 +54,42 @@ resource "cloudflare_workers_script" "tiles" {
     text = var.tigris_read_access_key
   }
 
+  # Bunny CDN request logs and synthetic probe, run by the cron (tiles/src/bunny-logs).
+  dynamic "secret_text_binding" {
+    for_each = local.bunny_log_reader ? [1] : []
+    content {
+      name = "BUNNY_API_KEY"
+      text = var.bunny_api_key
+    }
+  }
+
+  dynamic "plain_text_binding" {
+    for_each = local.bunny_log_reader ? [var.bunny_pull_zone_id] : []
+    content {
+      name = "BUNNY_PULL_ZONE_ID"
+      text = plain_text_binding.value
+    }
+  }
+
+  dynamic "secret_text_binding" {
+    for_each = local.bunny_probe ? [1] : []
+    content {
+      name = "GLOBALPING_TOKEN"
+      text = var.globalping_token
+    }
+  }
+
+  dynamic "plain_text_binding" {
+    for_each = local.bunny_probe ? {
+      BUNNY_PUBLIC_URL             = var.bunny_public_url
+      BUNNY_PROBE_INTERVAL_MINUTES = tostring(var.bunny_probe_interval_minutes)
+    } : {}
+    content {
+      name = plain_text_binding.key
+      text = plain_text_binding.value
+    }
+  }
+
   d1_database_binding {
     database_id = var.env != "prod" ? data.terraform_remote_state.tiles_state.outputs.d1_dev_database : data.terraform_remote_state.tiles_state.outputs.d1_global_database
     name        = "D1_GLOBAL"
@@ -57,7 +100,8 @@ resource "cloudflare_workers_script" "tiles" {
 }
 
 # Every minute the worker's scheduled handler sends o11y its heartbeat, which the bundle's
-# geoshenanigans-tiles-heartbeat alert watches (o11y/README.md).
+# geoshenanigans-tiles-heartbeat alert watches (o11y/README.md), reads a closed minute of Bunny's request logs and, every
+# bunny_probe_interval_minutes, runs the synthetic probe (tiles/src/bunny-logs).
 resource "cloudflare_workers_cron_trigger" "tiles" {
   account_id  = var.cloudflare_account_id
   script_name = cloudflare_workers_script.tiles.name
