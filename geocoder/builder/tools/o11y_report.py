@@ -210,17 +210,21 @@ def read_patch_sizes(output_dir):
 
 
 def read_index_bytes(output_dir):
-    """Raw and compressed bytes of the index files, from the table
-    compress_index.py writes into configurations.json."""
+    """Raw and compressed bytes of the index files, from the tables
+    compress_index.py writes into configurations.json: a file in a transport
+    unit has no .zst, and its unit counts once for all the files it holds."""
     try:
         with open(os.path.join(output_dir, "configurations.json")) as f:
-            files = json.load(f).get("files") or {}
+            cfg = json.load(f)
     except (OSError, ValueError):
         return {}
+    files = cfg.get("files") or {}
     if not files:
         return {}
+    units = cfg.get("units") or {}
     return {"raw": sum(e["size_raw"] for e in files.values()),
-            "compressed": sum(e["size_zst"] for e in files.values())}
+            "compressed": sum(e["size_zst"] for e in files.values() if "unit" not in e)
+            + sum(u["size"] for u in units.values())}
 
 
 def capped(msg):

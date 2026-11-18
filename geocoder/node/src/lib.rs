@@ -1,7 +1,9 @@
 //! Node native bindings for the geocoder query engine, for embedding
 //! reverse geocoding and place search in-process (no sidecar, no HTTP).
 //! The indexes stay memory-mapped: loading costs a few MiB of RSS, lookups
-//! fault pages from the OS cache on the calling thread.
+//! fault pages from the OS cache on the calling thread. A dataset's
+//! transport units decode into its files through `createTransportDecoder`,
+//! fed as they download.
 
 use napi::bindgen_prelude::*;
 use napi::Env;
@@ -10,9 +12,13 @@ use place_search::constants::{DATASET_SEARCH_DIR, DEFAULT_LIMIT};
 use place_search::dataset::{self, BuildOnDevice, Origin, Stamps};
 use place_search::query::Searcher;
 use place_search::reader::SearchIndex;
+use query_server::transport::{self, ChunkReader, Expected};
 use query_server::Index;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::SyncSender;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::thread::JoinHandle;
 
 #[napi]
 pub struct Geocoder {
@@ -161,5 +167,144 @@ impl Geocoder {
             [slot] if slot.continent.is_none() => slot.index.load_full().ok_or_else(|| Error::from_reason("Dataset not loaded")),
             _ => Err(Error::from_reason("Place search needs the dataset of one region")),
         }
+    }
+}
+
+/// A file a transport unit is to decode to: its name in the dataset dir and its sha256, as the
+/// build's configurations.json gives them (`files[path].sha256` of each path the unit's `files`
+/// list).
+#[napi(object)]
+pub struct TransportFile {
+    pub name: String,
+    pub sha256: String,
+}
+
+/// How many chunks a decoder holds before a write waits for it.
+const QUEUED_CHUNKS: usize = 8;
+
+/// A transport unit's decode into a dataset dir, fed the unit (the .tt.zst as published) chunk
+/// by chunk as it downloads: `write` each chunk, awaiting each before the next, then `finish`.
+/// It decodes on a thread of its own, holding a few chunks, the zstd window and one chunk of the
+/// unit's columns, and writes the files in a dir of its own in the dataset dir; once the whole
+/// unit decoded and every file is of its sha256, it moves them all into place and `finish`
+/// resolves. A unit that fails (cut short, refused, a file of another sha256, one that can't go
+/// in place) leaves the dir as it was; a download that broke off should still `finish`, which
+/// then rejects. Decoders of one unit into a dir at once each put complete files in place
+/// (transport::decode_into_dir).
+#[napi]
+pub struct TransportDecoder {
+    /// The channel to the decode, here between writes; a write holds it until it settles.
+    sender: Arc<Mutex<Option<SyncSender<Vec<u8>>>>>,
+    finished: AtomicBool,
+    decode: Mutex<Option<JoinHandle<std::result::Result<Vec<String>, String>>>>,
+    /// Why the decode stopped, set before its channel closes.
+    failed: Arc<OnceLock<String>>,
+}
+
+/// Starts the decode of a transport unit into `dir`, an existing dir, which must decode to
+/// `files`: each by its name and sha256, in any order.
+#[napi]
+pub fn create_transport_decoder(dir: String, files: Vec<TransportFile>) -> Result<TransportDecoder> {
+    let dir = PathBuf::from(dir);
+    if !dir.is_dir() {
+        return Err(Error::from_reason(format!("{} is no directory", dir.display())));
+    }
+    let expect: Vec<Expected> = files.into_iter().map(|f| Expected { name: f.name, sha256: f.sha256.to_ascii_lowercase(), size: None }).collect();
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(QUEUED_CHUNKS);
+    let failed = Arc::new(OnceLock::new());
+    let failure = failed.clone();
+    let decode = std::thread::spawn(move || {
+        let mut unit = ChunkReader::new(rx);
+        let decoded = transport::decode_into_dir(&mut unit, &dir, Some(&expect))
+            .map(|(_, members)| members.into_iter().map(|m| m.name).collect())
+            .map_err(|e| e.to_string());
+        if let Err(e) = &decoded {
+            let _ = failure.set(e.clone());
+        }
+        // The channel closes only now, so a write it fails tells why.
+        drop(unit);
+        decoded
+    });
+    Ok(TransportDecoder { sender: Arc::new(Mutex::new(Some(tx))), finished: AtomicBool::new(false), decode: Mutex::new(Some(decode)), failed })
+}
+
+pub struct WriteTask {
+    sender: Arc<Mutex<Option<SyncSender<Vec<u8>>>>>,
+    tx: Option<SyncSender<Vec<u8>>>,
+    chunk: Vec<u8>,
+    failed: Arc<OnceLock<String>>,
+}
+
+impl WriteTask {
+    /// The channel goes back to its decoder on the JS thread, once the write settles: a write
+    /// before then finds none.
+    fn settle(&mut self) {
+        *self.sender.lock().unwrap() = self.tx.take();
+    }
+}
+
+impl Task for WriteTask {
+    type Output = ();
+    type JsValue = ();
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let tx = self.tx.as_ref().expect("a write runs once");
+        tx.send(std::mem::take(&mut self.chunk))
+            .map_err(|_| Error::from_reason(self.failed.get().cloned().unwrap_or_else(|| "The unit's decode stopped".to_string())))
+    }
+
+    fn resolve(&mut self, _env: Env, _output: Self::Output) -> Result<Self::JsValue> {
+        self.settle();
+        Ok(())
+    }
+
+    fn reject(&mut self, _env: Env, err: Error) -> Result<Self::JsValue> {
+        self.settle();
+        Err(err)
+    }
+}
+
+pub struct FinishTask {
+    decode: Option<JoinHandle<std::result::Result<Vec<String>, String>>>,
+}
+
+impl Task for FinishTask {
+    type Output = Vec<String>;
+    type JsValue = Vec<String>;
+
+    fn compute(&mut self) -> Result<Self::Output> {
+        let decode = self.decode.take().expect("a finish runs once");
+        decode.join().map_err(|_| Error::from_reason("The unit's decode panicked"))?.map_err(Error::from_reason)
+    }
+
+    fn resolve(&mut self, _env: Env, output: Self::Output) -> Result<Self::JsValue> {
+        Ok(output)
+    }
+}
+
+#[napi]
+impl TransportDecoder {
+    /// Hands the decode the unit's next bytes, on the libuv worker pool: resolves once it has room
+    /// for them, rejects once the decode has failed (with why). One write at a time.
+    #[napi(ts_return_type = "Promise<void>")]
+    pub fn write(&self, chunk: Buffer) -> Result<AsyncTask<WriteTask>> {
+        let tx = self.take_sender()?;
+        Ok(AsyncTask::new(WriteTask { sender: self.sender.clone(), tx: Some(tx), chunk: chunk.to_vec(), failed: self.failed.clone() }))
+    }
+
+    /// Ends the unit: resolves to its files' names, in the unit's order, once they are all in
+    /// place; rejects with why the decode failed, leaving none of them.
+    #[napi(ts_return_type = "Promise<string[]>")]
+    pub fn finish(&self) -> Result<AsyncTask<FinishTask>> {
+        drop(self.take_sender()?);
+        self.finished.store(true, Ordering::SeqCst);
+        Ok(AsyncTask::new(FinishTask { decode: self.decode.lock().unwrap().take() }))
+    }
+
+    fn take_sender(&self) -> Result<SyncSender<Vec<u8>>> {
+        if self.finished.load(Ordering::SeqCst) {
+            return Err(Error::from_reason("The decoder is finished"));
+        }
+        self.sender.lock().unwrap().take().ok_or_else(|| Error::from_reason("A write is still running: await each write before the next"))
     }
 }

@@ -59,13 +59,31 @@ selection_files() {
     done
 }
 
+# The transport unit that holds a file in its dir, the only published form
+# of it (configurations.template.json's transport block;
+# builder/tools/test_build_search_indexes.py checks them against it), or
+# nothing for a file published as its own .zst.
+unit_of() {
+    case "$1" in
+        place_cells.bin|place_nodes.bin|place_hidden.bin) echo places.tt.zst ;;
+        poi_records.bin|poi_vertices.bin) echo pois.tt.zst ;;
+        arc_index.bin|arc_vertices.bin) echo arcs.tt.zst ;;
+        postcode_centroids.bin|admin_polygons.bin|street_ways.bin|interp_ways.bin|addr_index.bin) echo "${1%.bin}.tt.zst" ;;
+    esac
+}
+
 if [ "${1:-}" = "--list-files" ]; then
     selection_files
     exit 0
 fi
+if [ "${1:-}" = "--unit-of" ]; then
+    unit_of "$2"
+    exit 0
+fi
 
-# Files in S3 are zstd-compressed with .zst suffix.  Helper fetches
-# either the .zst (preferred) or plain version, decompresses if needed.
+# Files in S3 are zstd-compressed with .zst suffix, but those a transport
+# unit holds (fetch_unit).  Helper fetches either the .zst (preferred) or
+# plain version, decompresses if needed.
 # A file the build lacks (404 for both) is a miss; any other failure, a
 # transfer that broke off among them, fails the fetch and leaves nothing.
 fetch() {
@@ -81,6 +99,26 @@ fetch() {
     fi
     echo "  failed: $src_path"
     rm -f "$dest" "$dest.zst"
+    return 1
+}
+
+# A transport unit, into $INDEX_DIR: fetched whole to <tmp>, then decoded into
+# its files with geocoder-transport (all of them or, failing, none). A unit the
+# build lacks (404) is a miss, as a file is; any other failure fails the fetch
+# and leaves none of its files.
+fetch_unit() {
+    src_path="$1"; tmp="$2"; code=
+    if code=$(curl -fsSL -w '%{http_code}' "$src_path" -o "$tmp" 2>/dev/null) \
+            && geocoder-transport decode "$tmp" "$INDEX_DIR" > /dev/null; then
+        rm -f "$tmp"
+        return
+    fi
+    rm -f "$tmp"
+    if [ "$code" = 404 ]; then
+        echo "  miss: $src_path"
+        return
+    fi
+    echo "  failed: $src_path"
     return 1
 }
 
@@ -141,12 +179,21 @@ else
 
     # An optional file a region lacks (interp_postcodes.bin outside TIGER
     # regions, the postcode centroids) is a miss, not an error. A fetch that
-    # failed fails the start before the marker vouches for the download.
+    # failed fails the start before the marker vouches for the download. The
+    # files a transport unit holds come through it, once.
     if ! selection_files | {
-        pids=
+        pids=; units=
         while read -r dir f; do
-            echo "  $dir/$f"
-            fetch "$BASE/planet/$dir/$f" "$INDEX_DIR/$f" &
+            unit=$(unit_of "$f")
+            if [ -z "$unit" ]; then
+                echo "  $dir/$f"
+                fetch "$BASE/planet/$dir/$f" "$INDEX_DIR/$f" &
+            else
+                case " $units " in *" $dir/$unit "*) continue ;; esac
+                units="$units $dir/$unit"
+                echo "  $dir/$unit"
+                fetch_unit "$BASE/planet/$dir/$unit" "$INDEX_DIR/.$unit" &
+            fi
             pids="$pids $!"
         done
         ok=1

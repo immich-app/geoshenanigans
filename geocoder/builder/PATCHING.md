@@ -508,6 +508,67 @@ v8 data patch that day; applying the delta also needs memory for the whole
 old file (1.0 GB for poi.fst). Rebuilding costs no download and two to three
 and a half minutes of one core.
 
+## Transport units
+
+A transport unit is the download-only form of some of a dir's files
+(`geocoder/server/src/transport.rs`): the nightly publishes it in place of
+their `.zst` (`tools/compress_index.py`), and a client decodes it into the
+same files, byte for byte. The on-disk formats, the patches, the patcher and
+the readers don't change: patches are made from the files and applied to
+them, whichever way a client got them.
+
+- **Kinds**: `places` (place_cells, place_nodes with its L3 blocks unpacked,
+  place_hidden), `pois` (R2's rows, poi_vertices with its V2 blocks
+  unpacked), `arcs` (the arc blocks unpacked; arc_index is computed) and
+  `cols` (one of postcode_centroids, admin_polygons, street_ways, interp_ways
+  and addr_index, its rows split into their fields). The template's
+  `transport` block names each unit and its files.
+- **The stream**: `GTT1`, the transport version, the kind and the members'
+  names and sizes, then each member's section: chunks of byte-aligned
+  columns (at most 1 MiB, or one polygon or arc larger than that alone), each
+  decoding alone, then the bytes no column holds (dictionaries, footers,
+  pads, a part row) verbatim. Each column has the one encoding the encoder
+  always writes (raw, byte planes, zigzag deltas, steps from the last
+  value, deltas restarting at each polygon), so the publisher chooses
+  nothing either. The whole stream goes through zstd -18.
+- **The device packs and never chooses**: every encoder choice travels in
+  the stream (a place block's bases and widths, a polygon's tag, varints and
+  widths, an arc's flags, base width and group headers), so the decoder packs
+  each value at the width it is given. What it computes is a field's
+  definition, never a choice: where a block starts (where the ones before it
+  end) and an arc's box (the extent of its own vertices). There is no second
+  implementation of the builder's encoders, only of the bit layout the
+  server's readers already read.
+- **What keeps the two in step**: the shared vectors (`geocoder/testdata`:
+  `place_files.tsv`, `arc_blocks.tsv` and `poi_files.tsv`, which the builder's
+  tests hold its encoders to and the transport tests its decoder), the golden
+  units (`transport_units.tsv`, which pin the stream: changing them is a
+  `TRANSPORT_VERSION` bump), and the nightly's verify of every unit against
+  the files it was made from, in every region and variant, before upload. A
+  format change the transport doesn't follow fails that verify: the unit's
+  files go as `.zst` that night and the run fails at its end, leaving
+  latest.json on the build before (the test portal fetches those files only
+  as the unit) and pruning no build.
+- **Versioned**: the stream and configurations.json's `units` carry the
+  transport version (the template's `transport.version`, held to the
+  library's). Setup builds fresh when yesterday's units are of another
+  version, since the fetch of yesterday's index decodes them with tonight's
+  `geocoder-transport`; a client refuses a version it doesn't read.
+- **Decoding**: the query-server library's `transport::decode_into_dir` (the
+  server's downloader), the node binding's `createTransportDecoder` and the
+  `geocoder-transport` CLI, a bin of `geocoder/search` that the nightly's
+  place search build makes (`encode`, `decode`, `verify`). Decoding holds the
+  zstd window (8 MiB), one chunk and a small buffer per file.
+
+Measured on the planet of 2026-10-18 (tip-b, every unit encoded, compressed,
+verified and decoded back byte for byte, 2026-11-17), the presets' data files
+download 85.22, 245.78, 6,097.08 and 6,541.34 MiB (smallest,
+immich-recommended, with-addresses, max-quality) against 95.61, 295.06,
+6,345.99 and 6,794.44 as plain `.zst`: 10.4, 49.3, 248.9 and 253.1 MiB less
+(the full presets' shipped place search index is no unit: it goes as `.zst`
+either way, 364.4 MiB in the layout of format 2). Planet `poi/all` saves the
+most, 814.5 to 681.9 MiB.
+
 ## Patch Format (.gcpatch, version 19)
 
 Whole file is zstd-compressed for transport, at level 19 with its 8 MiB window

@@ -32,6 +32,7 @@ pub mod poi_files;
 pub mod postcode_files;
 pub mod side_blocks;
 pub mod strings;
+pub mod transport;
 pub mod way_files;
 pub use addr_files::{AddrFiles, AddrRecord};
 pub use place_files::PlaceFiles;
@@ -41,6 +42,8 @@ pub use side_blocks::SideBlocks;
 pub use way_files::{WayFiles, WayRow};
 #[cfg(test)]
 mod scratch_dir;
+#[cfg(test)]
+mod test_heap;
 // The example that dumps a dir's logical files, as a module of the tests: its own tests run
 // with them, and `query_path_tests` dumps its datasets' dirs with it. It names this crate
 // query_server, and its main is not run here.
