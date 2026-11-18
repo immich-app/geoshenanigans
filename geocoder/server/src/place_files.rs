@@ -9,13 +9,13 @@ use crate::{FileBytes, PlaceNode, NO_DATA, PLACE_FLAG_HIDDEN, PLACE_FLAG_LABEL_O
 pub const CELLS_FILE: &str = "place_cells.bin";
 pub const NODES_FILE: &str = "place_nodes.bin";
 pub const HIDDEN_FILE: &str = "place_hidden.bin";
-const MAGIC: &[u8; 4] = b"PNL3";
+pub(crate) const MAGIC: &[u8; 4] = b"PNL3";
 pub const BLOCK_ROWS: usize = 64;
-const TABLE_ENTRY_BYTES: usize = 16;
-const FOOTER_BYTES: usize = 8;
-const CELL_ROW_BYTES: usize = 8;
-const HIDDEN_ROW_BYTES: usize = 16;
-const TYPE_BITS: u32 = 3;
+pub(crate) const TABLE_ENTRY_BYTES: usize = 16;
+pub(crate) const FOOTER_BYTES: usize = 8;
+pub(crate) const CELL_ROW_BYTES: usize = 8;
+pub(crate) const HIDDEN_ROW_BYTES: usize = 16;
+pub(crate) const TYPE_BITS: u32 = 3;
 const HIDDEN_NAME_BITS: u32 = 28;
 
 #[inline(always)]

@@ -232,6 +232,30 @@ class TestPortalTest(unittest.TestCase):
         self.assertEqual(self.portal_files({}), self.portal_files(envs["0"]))
         self.assertEqual(self.portal_files({"MINIMAL": "1"}), self.portal_files(envs["1"]))
 
+    def unit_of(self, name):
+        """The transport unit entrypoint.sh --unit-of fetches a file through, or ""."""
+        with tempfile.TemporaryDirectory() as tmp:
+            run = subprocess.run(["sh", os.path.join(PORTAL, "entrypoint.sh"), "--unit-of", name],
+                                 env={"PATH": tmp, "DATA_DIR": tmp}, capture_output=True, text=True,
+                                 executable="/bin/sh", timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        return run.stdout.strip()
+
+    # The bucket holds a unit's files only in the unit: the servers fetch each
+    # through the unit the template puts it in, and decode it with the CLI the
+    # image ships.
+    def test_each_file_comes_through_the_unit_the_template_puts_it_in(self):
+        cfg = load_template()
+        units = {f: u["unit"] for u in cfg["transport"]["units"] for f in u["files"]}
+        names = {os.path.basename(p) for env in ({}, {"MINIMAL": "1"}, {"QUALITY": "exact"}) for p in self.portal_files(env)}
+        self.assertTrue(names & set(units))
+        for name in sorted(names):
+            self.assertEqual(self.unit_of(name), units.get(name, ""), name)
+        with open(os.path.join(PORTAL, "Dockerfile")) as f:
+            image = f.read()
+        self.assertIn("cargo build --release --locked --manifest-path search/Cargo.toml --bin geocoder-transport", image)
+        self.assertIn("COPY --from=builder /src/search/target/release/geocoder-transport /usr/local/bin/", image)
+
 
 class ResolveTest(unittest.TestCase):
     CFG = {"components": {

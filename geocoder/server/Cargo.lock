@@ -1371,6 +1371,7 @@ dependencies = [
  "getrandom 0.4.3",
  "libc",
  "memmap2",
+ "query-server",
  "reqwest",
  "rustls-acme",
  "s2",

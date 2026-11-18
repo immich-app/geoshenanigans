@@ -2,12 +2,14 @@
 // round trips through R2 and V2 to its logical bytes, the builder's writer
 // and the whole-set encoder write the same files, a small set's files are
 // the bytes the format gives (server/src/poi_files.rs reads the same ones),
-// each dictionary holds 65,535 entries and refuses the next, and the codec
-// refuses each logical set it can't hold and each file it never writes.
+// each dictionary holds 65,535 entries and refuses the next, the codec
+// refuses each logical set it can't hold and each file it never writes, and
+// the shared vectors (geocoder/testdata/poi_files.tsv) are its files.
 #include "poi_files.h"
 
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <functional>
 #include <random>
 #include <string>
@@ -376,4 +378,45 @@ TEST(poi_files_decoder_refuses_each_file_the_encoder_never_writes) {
     }
     // The files as written decode.
     CHECK_EQ(refusal_of_edit([](Bytes&, Bytes&) {}), std::string());
+}
+
+TEST(poi_files_are_the_shared_vectors_byte_for_byte) {
+    // geocoder/testdata/poi_files.tsv, which the server's transport reads too.
+    std::ifstream in(std::string(GEOCODER_TESTDATA_DIR) + "/poi_files.tsv");
+    REQUIRE(in.good());
+    auto bytes = [](const std::string& hex) {
+        std::vector<uint8_t> out;
+        if (hex == "-") return out;
+        for (size_t i = 0; i + 1 < hex.size(); i += 2) out.push_back(uint8_t(std::stoi(hex.substr(i, 2), nullptr, 16)));
+        return out;
+    };
+    size_t cases = 0, unlisted = 0;
+    bool header = true;
+    for (std::string line; std::getline(in, line);) {
+        if (line.empty() || line[0] == '#') continue;
+        if (header) {
+            header = false;
+            continue;
+        }
+        std::vector<std::string> field;
+        size_t a = 0;
+        for (size_t b; (b = line.find('\t', a)) != std::string::npos; a = b + 1) field.push_back(line.substr(a, b - a));
+        field.push_back(line.substr(a));
+        REQUIRE(field.size() == 5);
+        const poi_files::Files want{bytes(field[3]), bytes(field[4])};
+        const poi_files::Logical got = decode(want);
+        Set s;
+        s.recs.assign(got.records.begin(), got.records.end());
+        s.verts.assign(got.vertices.begin(), got.vertices.end());
+        CHECK(s.recs == bytes(field[1]));
+        // A stream not listed is the files' decode, which must encode back to them.
+        if (field[2] == "*") unlisted++;
+        else CHECK(s.verts == bytes(field[2]));
+        const poi_files::Files f = encode(s);
+        CHECK(f.records == want.records);
+        CHECK(f.vertices == want.vertices);
+        cases++;
+    }
+    CHECK(cases >= 6);
+    CHECK_EQ(unlisted, size_t(1));
 }

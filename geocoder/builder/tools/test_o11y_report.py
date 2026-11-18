@@ -277,6 +277,21 @@ class ReadIndexBytesTest(WorkDirTest):
 
         self.assertEqual(sut.read_index_bytes(self.dir), {"raw": 1050, "compressed": 320})
 
+    # A unit's files have no size_zst: the unit's size counts once for all of them.
+    def test_counts_each_unit_once_for_the_files_it_holds(self):
+        unit = "planet/admin/places.tt.zst"
+        write(self.path("configurations.json"), json.dumps({
+            "files": {
+                "planet/admin/place_cells.bin": {"size_raw": 100, "sha256": "a", "unit": unit},
+                "planet/admin/place_nodes.bin": {"size_raw": 2000, "sha256": "b", "unit": unit},
+                "planet/admin/strings_core.bin": {"size_raw": 1000, "size_zst": 300, "sha256": "c"},
+            },
+            "units": {unit: {"kind": "places", "transport_version": 1, "size": 700,
+                             "files": ["planet/admin/place_cells.bin", "planet/admin/place_nodes.bin"]}},
+        }))
+
+        self.assertEqual(sut.read_index_bytes(self.dir), {"raw": 3100, "compressed": 1000})
+
     def test_nothing_before_compression(self):
         write(self.path("configurations.json"), json.dumps({"build": {"version": 17}}))
 

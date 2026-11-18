@@ -397,5 +397,71 @@
       }
     ]
   },
+  "transport": {
+    "description": "Transport units: the download-only form of the files they hold, their values in byte-aligned columns, which compress better than the packed files (query_server::transport). Every dir holding all of a unit's files publishes the unit as <dir>/<unit>, and that is the only published form of those files: a client fetches the unit once and decodes it into them (the query-server library, the node binding or the geocoder-transport CLI), each checked against its sha256 in `files`. `units` lists each unit of the build with its kind, version, size and files; a file's `unit` names the one that holds it.",
+    "version": 1,
+    "units": [
+      {
+        "unit": "places.tt.zst",
+        "kind": "places",
+        "files": [
+          "place_cells.bin",
+          "place_nodes.bin",
+          "place_hidden.bin"
+        ]
+      },
+      {
+        "unit": "pois.tt.zst",
+        "kind": "pois",
+        "files": [
+          "poi_records.bin",
+          "poi_vertices.bin"
+        ]
+      },
+      {
+        "unit": "arcs.tt.zst",
+        "kind": "arcs",
+        "files": [
+          "arc_index.bin",
+          "arc_vertices.bin"
+        ]
+      },
+      {
+        "unit": "postcode_centroids.tt.zst",
+        "kind": "cols",
+        "files": [
+          "postcode_centroids.bin"
+        ]
+      },
+      {
+        "unit": "admin_polygons.tt.zst",
+        "kind": "cols",
+        "files": [
+          "admin_polygons.bin"
+        ]
+      },
+      {
+        "unit": "street_ways.tt.zst",
+        "kind": "cols",
+        "files": [
+          "street_ways.bin"
+        ]
+      },
+      {
+        "unit": "interp_ways.tt.zst",
+        "kind": "cols",
+        "files": [
+          "interp_ways.bin"
+        ]
+      },
+      {
+        "unit": "addr_index.tt.zst",
+        "kind": "cols",
+        "files": [
+          "addr_index.bin"
+        ]
+      }
+    ]
+  },
   "files": {}
 }

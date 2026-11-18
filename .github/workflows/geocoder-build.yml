@@ -178,8 +178,11 @@ jobs:
             > "$RUNNER_TEMP/tools.log" 2>&1 < /dev/null &
 
       # place-search, for the place search indexes the bigger packs ship
-      # (Build place search indexes): compiled beside Setup and the downloads
-      # like the tools, detached so it outlives this step.
+      # (Build place search indexes), and geocoder-transport, a bin of the
+      # same crate, which encodes the transport units (Compress index files)
+      # and decodes yesterday's (fetch_previous_index.sh): compiled beside
+      # Setup and the downloads like the tools, detached so it outlives this
+      # step. search.status is written once both are built.
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
@@ -262,7 +265,10 @@ jobs:
           # Check if previous build exists on Tigris with compatible build_version.
           # Look for an index file, not just the directory: dates past the
           # full-index window keep configurations.json beside their patches.
+          # Its transport units must be of this build's transport version too:
+          # the fetch decodes them with tonight's geocoder-transport.
           EXPECTED_BUILD_VERSION=$(jq -r .build.version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
+          EXPECTED_TRANSPORT_VERSION=$(jq -r .transport.version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
           PREV_BUILD="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE"
           if [ "$FORCE_FRESH" = "true" ]; then
             echo "has_previous=false" >> "$GITHUB_OUTPUT"
@@ -271,12 +277,14 @@ jobs:
             # Check build_version in previous configurations.json.
             PREV_CFG=$(s5cmd --endpoint-url $S3_ENDPOINT cat "$PREV_BUILD/configurations.json" 2>/dev/null || echo "")
             PREV_VERSION=$(echo "$PREV_CFG" | jq -r '.build.version // 0' 2>/dev/null || echo 0)
-            if [ "$PREV_VERSION" = "$EXPECTED_BUILD_VERSION" ]; then
+            # Every unit's transport version, one or none ("" for a build of no units).
+            PREV_TRANSPORT=$(echo "$PREV_CFG" | jq -r '[.units // {} | .[].transport_version] | unique | map(tostring) | join(",")' 2>/dev/null || echo "")
+            if [ "$PREV_VERSION" = "$EXPECTED_BUILD_VERSION" ] && [ "$PREV_TRANSPORT" = "$EXPECTED_TRANSPORT_VERSION" ]; then
               echo "has_previous=true" >> "$GITHUB_OUTPUT"
-              echo "Previous build ($PREV_DATE) found, build_version=$PREV_VERSION — compatible"
+              echo "Previous build ($PREV_DATE) found, build_version=$PREV_VERSION, transport_version=$PREV_TRANSPORT — compatible"
             else
               echo "has_previous=false" >> "$GITHUB_OUTPUT"
-              echo "Previous build ($PREV_DATE) found but build_version=$PREV_VERSION (expected $EXPECTED_BUILD_VERSION) — incompatible, building fresh"
+              echo "Previous build ($PREV_DATE) found but build_version=$PREV_VERSION, transport_version=${PREV_TRANSPORT:-none} (expected $EXPECTED_BUILD_VERSION, $EXPECTED_TRANSPORT_VERSION) — incompatible, building fresh"
             fi
           else
             echo "has_previous=false" >> "$GITHUB_OUTPUT"
@@ -628,6 +636,7 @@ jobs:
           WIKIDATA_DATE: ${{ steps.download.outputs.wikidata_date }}
           TIGER_FILE: ${{ steps.download.outputs.tiger_data }}
           GEONAMES_FILE: ${{ steps.download.outputs.postcode_centroids_external }}
+          RUNNER_TEMP: ${{ runner.temp }}
         run: |
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 4"
@@ -637,7 +646,8 @@ jobs:
           # - Today's PBF goes to the cache for tomorrow's run (skipped if it
           #   came from there); Finalize waits for it, then frees the disk.
           # - Yesterday's client files come down and decompress for patch
-          #   generation, which waits for them.
+          #   generation, which waits for them; its transport units decode
+          #   once geocoder-transport is built (Build place search).
           if [ "$PBF_SOURCE" != "today" ]; then
             echo "Caching today's PBF in background..."
             # The inner script expands its own arguments ($0 is the status file).
@@ -652,6 +662,7 @@ jobs:
             # runner and comes first; the fetch fills the gaps around it.
             setsid nohup ionice -c3 nice -n 10 "$GITHUB_WORKSPACE/geocoder/builder/tools/fetch_previous_index.sh" \
               "s3://$S3_BUCKET/$S3_PREFIX/builds/$YESTERDAY" "$WORKDIR/old-output" "$WORKDIR/old-output.status" \
+              "$GITHUB_WORKSPACE/geocoder/search/target/release/geocoder-transport" "$RUNNER_TEMP/search.status" \
               > "$WORKDIR/old-output.log" 2>&1 < /dev/null &
           fi
 
@@ -797,11 +808,13 @@ jobs:
           # Compress the new index alongside the diffs, whose long tail
           # (planet/full) leaves most cores idle. It keeps the .bin files the
           # diffs and verifies read; the compress step removes them. Each
-          # .zst streams to this date's (cleared) Tigris prefix as soon as it
-          # exists: the upload is network-bound, so it hides behind the
-          # compression. Finalize uploads whatever is still missing.
+          # .zst and transport unit streams to this date's (cleared) Tigris
+          # prefix as soon as it exists: the upload is network-bound, so it
+          # hides behind the compression. Finalize uploads whatever is still
+          # missing.
           $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
           nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
+            --transport-bin "$GITHUB_WORKSPACE/geocoder/search/target/release/geocoder-transport" \
             --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE" \
             --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" \
             > "$WORKDIR/compress.log" 2>&1 < /dev/null &
@@ -839,11 +852,20 @@ jobs:
             "$WORKDIR/old-output" "$WORKDIR/output" "$RESULTS_DIR" "$WORKDIR/diff-logs" \
             || echo "::error::generate_patches.sh exited $?"
           echo "Patch generation + verification completed in $(($(date +%s) - START))s"
-          if wait $COMPRESS_PID; then
+          # Exit status 3: done, but a transport unit failed and its files
+          # went as .zst; the run fails at its end.
+          COMPRESS_RC=0
+          wait $COMPRESS_PID || COMPRESS_RC=$?
+          if [ "$COMPRESS_RC" = 0 ] || [ "$COMPRESS_RC" = 3 ]; then
             touch "$WORKDIR/compress.done"
             echo "Compression finished $(($(date +%s) - START))s after patch generation started"
           else
             echo "::warning::Background compression failed; the compress step retries"
+          fi
+          if [ "$COMPRESS_RC" = 3 ]; then
+            grep 'its files go as .zst' "$WORKDIR/compress.log" || true
+            echo "::error::A transport unit failed; its files were published as .zst"
+            echo "TRANSPORT_UNIT_FAILED=1" >> "$GITHUB_ENV"
           fi
           tail -1 "$WORKDIR/compress.log"
 
@@ -917,9 +939,18 @@ jobs:
           else
             COMPRESS_START=$(date +%s)
             s5cmd --endpoint-url "$S3_ENDPOINT" --numworkers 32 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
+            COMPRESS_RC=0
             python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
+              --transport-bin "$GITHUB_WORKSPACE/geocoder/search/target/release/geocoder-transport" \
               --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE" \
-              --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run"
+              --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" || COMPRESS_RC=$?
+            # 3: done, but a transport unit failed and its files went as .zst.
+            if [ "$COMPRESS_RC" = 3 ]; then
+              echo "::error::A transport unit failed; its files were published as .zst"
+              echo "TRANSPORT_UNIT_FAILED=1" >> "$GITHUB_ENV"
+            elif [ "$COMPRESS_RC" != 0 ]; then
+              exit "$COMPRESS_RC"
+            fi
             echo "Compression done in $(($(date +%s) - COMPRESS_START))s"
           fi
           find "$WORKDIR/output" -name "*.bin" -delete
@@ -927,7 +958,8 @@ jobs:
           # stays beside its .zst like the other JSON files.
           find "$WORKDIR/output" -path "*/search/*" -type f ! -name "*.zst" ! -name "*.json" -delete
           ZST_COUNT=$(find "$WORKDIR/output" -name "*.bin.zst" | wc -l)
-          echo "$ZST_COUNT .bin.zst files produced"
+          UNIT_COUNT=$(find "$WORKDIR/output" -name "*.tt.zst" | wc -l)
+          echo "$ZST_COUNT .bin.zst files and $UNIT_COUNT transport units produced"
 
       # ── Finalize upload + configurations.json ──────────────────────
       - name: Finalize upload and configurations.json
@@ -940,8 +972,9 @@ jobs:
         run: |
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
 
-          # Upload the patches, json and sidecars, plus any .zst the
-          # compression stream missed. Tigris occasionally fails multipart
+          # Upload the patches, json and sidecars, plus any .zst (the
+          # transport units' *.tt.zst among them) the compression stream
+          # missed. Tigris occasionally fails multipart
           # uploads under concurrency — the verify loop below re-uploads
           # anything missing.
           echo "Uploading .bin.zst + patches + osm_ids sidecars to Tigris..."
@@ -1038,11 +1071,13 @@ jobs:
           fi
 
           # ── Update latest.json ──
-          # Skip latest.json update on patch verify failure — we still
-          # want the dated-build artifacts uploaded for local debugging,
-          # but consumers of latest.json shouldn't switch to a broken
-          # build.
-          if [ -z "$PATCH_VERIFY_FAILED" ]; then
+          # Skip latest.json update on patch verify failure, or when a
+          # transport unit failed and its files went as .zst, which a client
+          # that fetches those files only as the unit (the test portal)
+          # can't download — we still want the dated-build artifacts
+          # uploaded for local debugging, but consumers of latest.json
+          # shouldn't switch to a broken build.
+          if [ -z "${PATCH_VERIFY_FAILED:-}" ] && [ -z "${TRANSPORT_UNIT_FAILED:-}" ]; then
             PREV_VAL="$( [ "$HAS_PREVIOUS" = "true" ] && echo "$OLD_DATE" || echo "null" )"
             BUILD_V=$(jq -r .build.version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
             PATCH_V=$(jq -r .build.patch_version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
@@ -1089,7 +1124,7 @@ jobs:
               '{build_version: $build_version, patch_version: $patch_version, latest: $latest, previous: (if $previous == "null" then null else $previous end), oldest_indexes: $oldest_indexes, oldest_patches: $oldest_patches, updated_at: $updated_at}' \
               | $S5 pipe "s3://$S3_BUCKET/$S3_PREFIX/builds/latest.json"
           else
-            echo "::warning::Skipping latest.json update — patch verify failed"
+            echo "::warning::Skipping latest.json update — patch verify or a transport unit failed"
           fi
 
           echo "Upload complete."
@@ -1111,13 +1146,14 @@ jobs:
       #   - Patches (patch.gcpatch + configurations.json): keep next 11 days (14 total)
       #   - Older than 14 days: delete entirely
       # Skip cleanup if:
-      #   - This run had patch verify failures (don't trash history when
-      #     the new build is unhealthy)
+      #   - This run had patch verify failures or a failed transport unit
+      #     (latest.json still names an older build; don't trash history
+      #     when the new build is unhealthy)
       #   - Today's build directory isn't present in Tigris (defensive
       #     check — refuses to delete anything if the new data didn't
       #     actually land)
       - name: Cleanup old Tigris builds
-        if: env.PATCH_VERIFY_FAILED != '1'
+        if: env.PATCH_VERIFY_FAILED != '1' && env.TRANSPORT_UNIT_FAILED != '1'
         env:
           NEW_DATE: ${{ steps.setup.outputs.today }}
         run: |
@@ -1248,6 +1284,15 @@ jobs:
         if: env.PATCH_VERIFY_FAILED == '1'
         run: |
           echo "::error::Patch verify reported failures — see Generate patches and verify step"
+          exit 1
+
+      # A unit that failed its encode or verify was published as its files'
+      # .zst: the build is whole, but the units must hold every file again.
+      # latest.json still names the build before it, and no build was pruned.
+      - name: Fail run on transport unit failure
+        if: env.TRANSPORT_UNIT_FAILED == '1'
+        run: |
+          echo "::error::A transport unit failed; its files were published as .zst — see Compress index files (or compress.log of Generate patches and verify)"
           exit 1
 
       # For Report to o11y's token. A failed install doesn't fail the run:

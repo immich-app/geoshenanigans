@@ -6,16 +6,18 @@
 
 use crate::{vertex_scale, FileBytes, NodeCoord, PoiRecord, NO_DATA};
 
-const MAGIC: &[u8; 4] = b"POR2";
-const ROW_BYTES: usize = 27;
+pub(crate) const RECORDS_FILE: &str = "poi_records.bin";
+pub(crate) const VERTICES_FILE: &str = "poi_vertices.bin";
+pub(crate) const MAGIC: &[u8; 4] = b"POR2";
+pub(crate) const ROW_BYTES: usize = 27;
 const COMBO_BYTES: usize = 5;
 const POSTCODE_BYTES: usize = 4;
-const FOOTER_BYTES: usize = 24;
+pub(crate) const FOOTER_BYTES: usize = 24;
 const DICT_MAX: usize = 0xFFFF;
 const NO_POLY: u32 = 0xFF_FFFF;
 const NO_POSTCODE: usize = 0xFFFF;
 /// The zero bytes after the last block, for the decoder's 8-byte loads.
-const VERTEX_PAD: usize = 8;
+pub(crate) const VERTEX_PAD: usize = 8;
 
 #[inline(always)]
 fn u16_at(b: &[u8], at: usize) -> u16 {

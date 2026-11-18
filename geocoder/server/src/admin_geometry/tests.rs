@@ -391,50 +391,7 @@ fn past_its_capacity_the_memo_reads_arcs_again_and_answers_stay_equal() {
     }
 }
 
-mod heap {
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::cell::Cell;
-
-    thread_local! {
-        static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
-    }
-
-    /// The system allocator, counting each thread's allocations.
-    pub struct Counting;
-
-    fn count() {
-        let _ = ALLOCATIONS.try_with(|n| n.set(n.get() + 1));
-    }
-
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            count();
-            System.alloc(layout)
-        }
-
-        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-            count();
-            System.alloc_zeroed(layout)
-        }
-
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            count();
-            System.realloc(ptr, layout, new_size)
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            System.dealloc(ptr, layout)
-        }
-    }
-
-    #[global_allocator]
-    static COUNTING: Counting = Counting;
-
-    /// This thread's allocations so far.
-    pub fn allocations() -> u64 {
-        ALLOCATIONS.with(|n| n.get())
-    }
-}
+use crate::test_heap as heap;
 
 #[test]
 fn reading_arcs_allocates_nothing_beyond_the_scans_own_memo() {
