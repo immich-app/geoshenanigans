@@ -228,9 +228,12 @@ impl<D: AsRef<[u8]>> Keys<D> {
 
     /// Whether the map's bytes are those its build wrote, by the checksum after its footer (the
     /// fst crate's `verify`): a read of every byte, for a tool that walks every key (a damaged
-    /// file's walk can be as long as its paths are many); no query takes it.
+    /// file's walk can be as long as its paths are many); no query takes it. An error too for a
+    /// key count past this system's addresses, which the fst crate's reader panics on.
     pub fn verify(&self) -> Result<(), String> {
-        let checked = fst::raw::Fst::new(self.data.as_ref()).and_then(|f| f.verify());
+        let b = self.data.as_ref();
+        key_count::<usize>(b)?;
+        let checked = fst::raw::Fst::new(b).and_then(|f| f.verify());
         // The crate's error says only "FST error"; the one it holds says which.
         checked.map_err(|e| match e {
             fst::Error::Fst(e) => e.to_string(),
@@ -267,6 +270,14 @@ impl<D: AsRef<[u8]>> Keys<D> {
             steps_left: max_steps,
         }
     }
+}
+
+/// The key count in the footer of the fst `b` (one `Keys::new` took) as a `T`; an error for one
+/// past what a `T` holds.
+fn key_count<T: TryFrom<u64>>(b: &[u8]) -> Result<T, String> {
+    let footer = b.len() - FOOTER_BYTES;
+    let n = uint(&b[footer..footer + 8]);
+    T::try_from(n).map_err(|_| format!("an fst of {n} keys, more than a {}-bit system counts", std::mem::size_of::<T>() * 8))
 }
 
 /// A walk of a map in key order, as fst's own streams walk one: each key the automaton matches,
@@ -537,6 +548,19 @@ mod tests {
         let keys = Keys::new(b).unwrap();
 
         assert_eq!([keys.get("B"), keys.get("z"), keys.get("C"), keys.get("D")], [None, None, Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn a_key_count_past_the_systems_addresses_is_refused_before_the_checksum() {
+        let mut b = build(&[(b"a".to_vec(), 1)]);
+        assert_eq!(key_count::<u32>(&b), Ok(1));
+        let footer = b.len() - FOOTER_BYTES;
+        b[footer..footer + 8].copy_from_slice(&(1u64 << 32).to_le_bytes());
+
+        // As a 32-bit system counts it, and as a 64-bit one does (where the checksum refuses it).
+        assert_eq!(key_count::<u32>(&b), Err("an fst of 4294967296 keys, more than a 32-bit system counts".to_string()));
+        assert_eq!(key_count::<u64>(&b), Ok(1 << 32));
+        assert!(Keys::new(b).unwrap().verify().is_err_and(|e| e.contains("checksum")));
     }
 
     #[test]
