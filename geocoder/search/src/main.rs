@@ -218,8 +218,8 @@ fn cmd_ctxbench(args: &[String]) {
 fn cmd_diff(args: &[String]) {
     use fst::Streamer;
     let (a, b, name) = (Path::new(&args[2]), Path::new(&args[3]), &args[4]);
-    // Every posting of each list, whatever its entity; each fst verified first, as a walk of a
-    // damaged one may not end.
+    // Every posting of each list, whatever its entity; the keys of each verified first, as a
+    // walk of a damaged fst may not end.
     let open = |dir: &Path| {
         place_search::reader::SubIndex::open_verified(dir, name, u32::MAX).unwrap_or_else(|e| {
             eprintln!("{e}");

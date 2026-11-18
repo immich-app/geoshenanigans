@@ -54,15 +54,14 @@ impl SubIndex {
         })
     }
 
-    /// `open`, and an error, naming the file, for an fst whose bytes are not those its build
-    /// wrote (`Keys::verify`, a read of each whole file): for a tool that walks every key, which
-    /// a damaged file can make a walk of no end. A query's open does not take it.
+    /// `open`, and an error, naming the file, for keys (`<name>.fst`) whose bytes are not those
+    /// its build wrote (`Keys::verify`, a read of the whole file): for a tool that walks every
+    /// key, which a damaged file can make a walk of no end. The prefix table's fst is not
+    /// verified: a tool that walks it verifies it as well. A query's open takes neither.
     pub fn open_verified(dir: &Path, name: &str, entities: u32) -> Result<Self, String> {
         let sub = Self::open(dir, name, entities)?;
-        let [keys, _, pfx_keys, _] = sub_index_files(name).map(|f| dir.join(f));
-        for (fst, path) in [(&sub.map, keys), (&sub.pfx_map, pfx_keys)] {
-            fst.verify().map_err(|e| format!("{}: {e}", path.display()))?;
-        }
+        let [keys, ..] = sub_index_files(name).map(|f| dir.join(f));
+        sub.map.verify().map_err(|e| format!("{}: {e}", keys.display()))?;
         Ok(sub)
     }
 
@@ -501,24 +500,39 @@ mod tests {
     }
 
     #[test]
-    fn a_sub_index_for_a_walk_of_every_key_opens_only_with_the_checksums_of_its_fsts() {
+    fn a_sub_index_for_a_walk_of_every_key_opens_only_with_the_checksum_of_its_keys() {
         let dir = TempDir::new("fst-verified");
         let (geo, out) = built(&dir);
         let n = geo.place_node_count() + geo.admin_polygon_count();
         assert!(SubIndex::open_verified(&out, "places", n).is_ok());
         assert!(SubIndex::open_verified(&out, "poi", 5).is_ok());
         // A bit of the first node (written from address 16, below the root) flipped.
-        let mut flipped = std::fs::read(out.join("places.fst")).unwrap();
-        flipped[16] ^= 1;
+        let flipped = |f: &str| {
+            let mut b = std::fs::read(out.join(f)).unwrap();
+            b[16] ^= 1;
+            b
+        };
 
-        for (case, f, bytes) in [("2^60 paths", "places.fst", paths(60)), ("a bit flipped", "places.fst", flipped), ("2^60 paths", "places.pfx.fst", paths(60))] {
+        // Each fst, and whether the walk's open refuses it: the keys' checksum is the walk's, the
+        // prefix table's is left to a walk of that table.
+        let cases = [
+            ("2^60 paths", "places.fst", paths(60), true),
+            ("a bit flipped", "places.fst", flipped("places.fst"), true),
+            ("2^60 paths", "places.pfx.fst", paths(60), false),
+            ("a bit flipped", "places.pfx.fst", flipped("places.pfx.fst"), false),
+        ];
+        for (case, f, bytes, refused) in cases {
             let whole = std::fs::read(out.join(f)).unwrap();
             std::fs::write(out.join(f), bytes).unwrap();
 
             let (open, verified) = (SubIndex::open(&out, "places", n), SubIndex::open_verified(&out, "places", n));
 
             assert!(open.is_ok(), "{case} {f}: {:?}", open.err());
-            assert!(verified.as_ref().err().is_some_and(|e| e.contains(f) && e.contains("checksum")), "{case} {f}: {:?}", verified.err());
+            if refused {
+                assert!(verified.as_ref().err().is_some_and(|e| e.contains(&out.join(f).display().to_string()) && e.contains("checksum")), "{case} {f}: {:?}", verified.err());
+            } else {
+                assert!(verified.is_ok(), "{case} {f}: {:?}", verified.err());
+            }
             std::fs::write(out.join(f), whole).unwrap();
         }
     }
