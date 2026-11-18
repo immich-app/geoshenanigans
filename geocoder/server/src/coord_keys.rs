@@ -2,9 +2,9 @@
 //! files are packed from, as the builder's functions give them (builder/src/coord_keys.h, which
 //! says what each is). geocoder/testdata/coord_keys.tsv holds values both must give.
 //!
-//! The hybrid key is one multiply and one rounding to an integer, its inverse one divide and
-//! one narrowing to f32, each rounded once, to nearest even. Rust rounds so on every target
-//! but x86 without SSE2, where the x87 rounds twice.
+//! The hybrid and decimal keys are one multiply and one rounding to an integer, their inverses
+//! one divide and one narrowing to f32, each rounded once, to nearest even. Rust rounds so on
+//! every target but x86 without SSE2, where the x87 rounds twice.
 
 #[cfg(all(target_arch = "x86", not(target_feature = "sse2")))]
 compile_error!("coord_keys: an x87-only build rounds the hybrid key twice");
@@ -71,6 +71,34 @@ pub fn biased(key: u32) -> u32 {
     key ^ 0x8000_0000
 }
 
+/// The units of a decimal key: 1e-4.
+pub const DEC4_SCALE: f64 = 1e4;
+
+/// The pattern of a decimal key. Any i32 may come in: what is no key gives some pattern that has
+/// another key or none.
+#[inline]
+pub fn from_dec4_key(key: i32) -> u32 {
+    ((key as f64 / DEC4_SCALE) as f32).to_bits()
+}
+
+/// A pattern's decimal round: its float in units of 1e-4, rounded half to even, saturated to
+/// i32; 0 for a NaN (as `as` converts).
+#[inline]
+pub fn dec4_round(bits: u32) -> i32 {
+    (f32::from_bits(bits) as f64 * DEC4_SCALE).round_ties_even() as i32
+}
+
+/// The decimal key of a bit pattern; None when it has none.
+#[inline]
+pub fn dec4_key(bits: u32) -> Option<i32> {
+    let n = (f32::from_bits(bits) as f64 * DEC4_SCALE).round_ties_even();
+    if !(n.abs() < 2_147_483_648.0) {
+        return None;
+    }
+    let key = n as i32;
+    (from_dec4_key(key) == bits).then_some(key)
+}
+
 /// A difference mod 2^32 with its sign moved to bit 0, and back.
 #[inline]
 pub fn zigzag32(d: u32) -> u32 {
@@ -112,6 +140,41 @@ pub fn bits_at(bytes: &[u8], bit: usize, w: u32) -> Option<u32> {
     }
     let word = u64::from_le_bytes(*bytes.get(bit >> 3..)?.first_chunk::<8>()?);
     Some(((word >> (bit & 7)) & ((1u64 << w) - 1)) as u32)
+}
+
+pub const RICE_ESCAPE: u32 = 12;
+pub const RICE_MAX_BITS: u32 = RICE_ESCAPE + 32;
+
+/// The bits of z's Rice code with parameter `k` (at most 31).
+#[inline]
+pub fn rice_bits(z: u32, k: u32) -> u32 {
+    let q = z >> k;
+    if q < RICE_ESCAPE { q + 1 + k } else { RICE_MAX_BITS }
+}
+
+/// The Rice code with parameter `k` at bit `*bit` of `bytes`, which it moves past it: one 8-byte
+/// load at the code's first byte. None for a `k` above 31 and where `bytes` does not hold 8 bytes
+/// from there. Bits that are no z's code (a q past 32 - k bits) give some z whose code is other
+/// bits.
+#[inline(always)]
+pub fn get_rice(bytes: &[u8], bit: &mut usize, k: u32) -> Option<u32> {
+    if k > 31 {
+        return None;
+    }
+    let word = u64::from_le_bytes(*bytes.get(*bit >> 3..)?.first_chunk::<8>()?) >> (*bit & 7);
+    let low = word as u32 & ((1 << RICE_ESCAPE) - 1);
+    if low == 0 {
+        *bit += RICE_MAX_BITS as usize;
+        return Some((word >> RICE_ESCAPE) as u32);
+    }
+    let q = low.trailing_zeros();
+    *bit += (q + 1 + k) as usize;
+    Some(q.wrapping_shl(k) | ((word >> (q + 1)) & ((1u64 << k) - 1)) as u32)
+}
+
+/// The least k (0 to 31) whose Rice codes of `z` take the fewest bits, each k tried; 0 for no z.
+pub fn best_rice_k(z: &[u32]) -> u32 {
+    (0..32).min_by_key(|&k| (z.iter().map(|&v| rice_bits(v, k) as u64).sum::<u64>(), k)).unwrap()
 }
 
 pub const VARINT_MAX_BYTES: usize = 10;
@@ -165,6 +228,20 @@ impl BitWriter {
         }
         self.bytes
     }
+}
+
+/// z's Rice code with parameter `k` (at most 31) appended to `w` (fixtures and tests).
+#[cfg(any(test, feature = "fixtures"))]
+pub fn put_rice(w: &mut BitWriter, z: u32, k: u32) {
+    let q = z >> k;
+    if q >= RICE_ESCAPE {
+        w.put(0, RICE_ESCAPE);
+        w.put(z, 32);
+        return;
+    }
+    w.put(0, q);
+    w.put(1, 1);
+    w.put((u64::from(z) & ((1u64 << k) - 1)) as u32, k);
 }
 
 /// `v`'s varint appended to `out` (fixtures and tests).
@@ -430,6 +507,147 @@ mod tests {
         assert_eq!(whole_varint(&[], 10), None);
     }
 
+    /// The codes (z, k) through a BitWriter.
+    fn rice_packed(codes: &[(u32, u32)]) -> Vec<u8> {
+        let mut w = BitWriter::default();
+        for &(z, k) in codes {
+            put_rice(&mut w, z, k);
+        }
+        w.finish()
+    }
+
+    /// The codes a bit at a time: q zero bits, a one bit and k bits of z, or RICE_ESCAPE zero
+    /// bits and z in 32 bits.
+    fn rice_bit_by_bit(codes: &[(u32, u32)]) -> Vec<u8> {
+        let mut fields = Vec::new();
+        for &(z, k) in codes {
+            let q = z >> k;
+            if q >= RICE_ESCAPE {
+                fields.extend((0..RICE_ESCAPE).map(|_| (0, 1)));
+                fields.push((z, 32));
+                continue;
+            }
+            fields.extend((0..q).map(|_| (0, 1)));
+            fields.push((1, 1));
+            fields.push((if k == 0 { 0 } else { z & ((1 << k) - 1) }, k));
+        }
+        packed_bit_by_bit(&fields)
+    }
+
+    #[test]
+    fn every_four_decimal_coordinate_to_180_is_one_floats_decimal_key() {
+        let mut last = from_dec4_key(-1_800_001);
+        for key in -1_800_000..=1_800_000 {
+            let bits = from_dec4_key(key);
+            assert_eq!(dec4_key(bits), Some(key));
+            assert_eq!(dec4_round(bits), key);
+            assert!(order_key(bits) > order_key(last), "{key}");
+            last = bits;
+        }
+        assert_eq!(dec4_key(52.3702f32.to_bits()), Some(523_702));
+        assert_eq!(dec4_key((-0.1278f32).to_bits()), Some(-1278));
+        assert_eq!(dec4_key(180f32.to_bits()), Some(1_800_000));
+        assert_eq!(dec4_key((-180f32).to_bits()), Some(-1_800_000));
+        assert_eq!(dec4_key(1e-4f32.to_bits()), Some(1));
+        assert_eq!(dec4_key((-1e-4f32).to_bits()), Some(-1));
+        assert_eq!(dec4_key(0), Some(0));
+    }
+
+    #[test]
+    fn a_float_that_is_no_four_decimal_coordinate_has_no_decimal_key() {
+        for v in [52.3702f32, -0.1278, 1e-4, 180.0] {
+            assert_eq!(dec4_key(v.to_bits() + 1), None, "{v}");
+            assert_eq!(dec4_key(v.to_bits() - 1), None, "{v}");
+        }
+        assert_eq!(dec4_key(SIGN), None);
+        assert_eq!(dec4_round(SIGN), 0);
+        for bits in [0x7F80_0000, 0xFF80_0000, 0x7FC0_0000] {
+            assert_eq!(dec4_key(bits), None);
+        }
+        assert_eq!(dec4_key(0.00005f32.to_bits()), None);
+        assert_eq!(dec4_key(52.37025f32.to_bits()), None);
+        // Halves of 1e-4 round to even.
+        assert_eq!(dec4_key(0.03125f32.to_bits()), None);
+        assert_eq!(dec4_round(0.03125f32.to_bits()), 312);
+        assert_eq!(dec4_round((-0.03125f32).to_bits()), -312);
+        assert_eq!(dec4_round(0.09375f32.to_bits()), 938);
+        // Past 2^31 units there is no key, and the round saturates; a NaN's is 0.
+        assert_eq!(dec4_key(214_748.36f32.to_bits()), Some(2_147_483_594));
+        assert_eq!(dec4_key(214_748.375f32.to_bits()), None);
+        assert_eq!(dec4_key((-214_748.375f32).to_bits()), None);
+        assert_eq!(dec4_round(214_748.375f32.to_bits()), i32::MAX);
+        assert_eq!(dec4_round((-1e30f32).to_bits()), i32::MIN);
+        assert_eq!(dec4_round(0x7F80_0000), i32::MAX);
+        assert_eq!((dec4_round(0x7FC0_0000), dec4_round(0xFFC0_0000)), (0, 0));
+        let mut rng = Rng::new(8);
+        let mut keys = 0;
+        for _ in 0..1_000_000 {
+            let bits = rng.next() as u32;
+            if let Some(key) = dec4_key(bits) {
+                keys += 1;
+                assert_eq!((dec4_round(bits), from_dec4_key(key)), (key, bits), "{bits:#x}");
+            }
+        }
+        assert!(keys > 0);
+    }
+
+    #[test]
+    fn rice_codes_read_back_from_the_bytes_a_writer_packs() {
+        assert_eq!((rice_bits(0, 0), rice_bits(11, 0), rice_bits(12, 0)), (1, 12, RICE_ESCAPE + 32));
+        assert_eq!((rice_bits(11 << 5 | 31, 5), rice_bits(12 << 5, 5)), (17, RICE_ESCAPE + 32));
+        assert_eq!((rice_bits(u32::MAX, 31), rice_bits(u32::MAX, 0)), (33, RICE_ESCAPE + 32));
+        assert_eq!(rice_packed(&[(0, 0)]), [0x01]);
+        assert_eq!(rice_packed(&[(3, 0)]), [0x08]);
+        assert_eq!(rice_packed(&[(5, 1)]), [0x0C]);
+        assert_eq!(rice_packed(&[(12, 0)]), [0x00, 0xC0, 0x00, 0x00, 0x00, 0x00]);
+        let mut rng = Rng::new(9);
+        for _ in 0..3000 {
+            let codes: Vec<(u32, u32)> = (0..rng.next() % 80)
+                .map(|_| {
+                    let k = (rng.next() % 32) as u32;
+                    let shift = rng.next() % 33;
+                    (if shift == 32 { 0 } else { (rng.next() as u32) >> shift }, k)
+                })
+                .collect();
+            let bytes = rice_packed(&codes);
+            assert_eq!(bytes, rice_bit_by_bit(&codes));
+            let mut roomy = bytes.clone();
+            roomy.extend([0xFF; 8]);
+            let mut bit = 0;
+            for &(z, k) in &codes {
+                let at = bit;
+                assert_eq!(get_rice(&roomy, &mut bit, k), Some(z));
+                assert_eq!(bit - at, rice_bits(z, k) as usize);
+            }
+        }
+    }
+
+    #[test]
+    fn a_rice_escape_at_the_end_of_a_stream_reads_its_32_bits_from_the_spare_bytes() {
+        let mut bytes = rice_packed(&[(2, 1), (0xFEDC_BA98, 3)]);
+        assert_eq!(bytes.len(), 6);
+        // Without 8 bytes from a code's first byte there is no load, so no code.
+        assert_eq!(get_rice(&bytes, &mut 0, 1), None);
+        bytes.extend([0; 8]);
+        let mut bit = 0;
+        assert_eq!(get_rice(&bytes, &mut bit, 1), Some(2));
+        assert_eq!(get_rice(&bytes, &mut bit, 3), Some(0xFEDC_BA98));
+        assert_eq!(bit, 3 + RICE_ESCAPE as usize + 32);
+        assert_eq!(get_rice(&bytes, &mut 0, 32), None);
+        let mut far = usize::MAX;
+        assert_eq!(get_rice(&bytes, &mut far, 0), None);
+    }
+
+    #[test]
+    fn the_best_rice_parameter_is_the_least_of_the_fewest_bits() {
+        assert_eq!(best_rice_k(&[]), 0);
+        assert_eq!(best_rice_k(&[0, 0, 0]), 0);
+        assert_eq!(best_rice_k(&[u32::MAX]), 31);
+        assert_eq!(best_rice_k(&[12]), 3);
+        assert_eq!(rice_bits(2, 1) + rice_bits(3, 1), rice_bits(2, 2) + rice_bits(3, 2));
+        assert_eq!(best_rice_k(&[2, 3]), 1);
+    }
+
     #[test]
     fn keys_fields_and_varints_are_the_shared_vectors_read_and_written() {
         let rows = crate::exact_pip::tests::testdata_rows("coord_keys.tsv");
@@ -499,11 +717,43 @@ mod tests {
                     // No varint of at most `want` bytes starts the bytes.
                     assert_eq!(varint(&bytes_of(given), &mut 0, want.parse().unwrap()), None, "{r:?}");
                 }
+                "dec4" => {
+                    let bits = hex32(given);
+                    let (key, round) = want.split_once(',').unwrap();
+                    assert_eq!(dec4_key(bits), (key != "-").then(|| key.parse::<i32>().unwrap()), "{r:?}");
+                    assert_eq!(dec4_round(bits), round.parse::<i32>().unwrap(), "{r:?}");
+                    if key != "-" {
+                        assert_eq!(from_dec4_key(key.parse().unwrap()), bits, "{r:?}");
+                    }
+                }
+                "undec4" => assert_eq!(from_dec4_key(given.parse().unwrap()), hex32(want), "{r:?}"),
+                "rice" => {
+                    let codes: Vec<(u32, u32)> = given
+                        .split(',')
+                        .map(|c| {
+                            let (z, k) = c.split_once(':').unwrap();
+                            (hex32(z), k.parse().unwrap())
+                        })
+                        .collect();
+                    assert_eq!(hex(&rice_packed(&codes)), want, "{r:?}");
+                    let mut bytes = bytes_of(want);
+                    bytes.extend([0; 8]);
+                    let mut bit = 0;
+                    for &(z, k) in &codes {
+                        assert_eq!(get_rice(&bytes, &mut bit, k), Some(z), "{r:?}");
+                    }
+                }
+                "ricek" => {
+                    let z: Vec<u32> = given.split(',').filter(|v| *v != "-").map(hex32).collect();
+                    let k = best_rice_k(&z);
+                    let total: u64 = z.iter().map(|&v| rice_bits(v, k) as u64).sum();
+                    assert_eq!(format!("{k},{total}"), want, "{r:?}");
+                }
                 _ => panic!("a row of a kind this test does not read: {r:?}"),
             }
         }
-        let least = [("key", 150), ("hybrid", 30), ("zigzag32", 16), ("zigzag16", 12)];
-        for (kind, rows) in least.into_iter().chain([("length", 16), ("bits", 16), ("varint", 20), ("novarint", 8)]) {
+        let least = [("key", 150), ("hybrid", 30), ("zigzag32", 16), ("zigzag16", 12), ("dec4", 60), ("undec4", 8)];
+        for (kind, rows) in least.into_iter().chain([("length", 16), ("bits", 16), ("varint", 20), ("novarint", 8), ("rice", 16), ("ricek", 12)]) {
             assert!(seen.get(kind).copied().unwrap_or(0) >= rows, "{kind}");
         }
     }

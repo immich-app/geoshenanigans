@@ -1,8 +1,8 @@
 {
   "schema_version": 1,
   "build": {
-    "version": 23,
-    "patch_version": 18
+    "version": 24,
+    "patch_version": 19
   },
   "axes": {
     "region": {
@@ -205,8 +205,7 @@
       ],
       "optional_files": [
         "{region}/admin/postcode_centroids.bin",
-        "{region}/admin/postcode_centroid_cells.bin",
-        "{region}/admin/postcode_centroid_entries.bin"
+        "{region}/admin/postcode_centroid_cells.bin"
       ]
     },
     "mode.no-addresses": {
@@ -230,8 +229,7 @@
       ],
       "optional_files": [
         "{region}/no-addresses/postcode_centroids.bin",
-        "{region}/no-addresses/postcode_centroid_cells.bin",
-        "{region}/no-addresses/postcode_centroid_entries.bin"
+        "{region}/no-addresses/postcode_centroid_cells.bin"
       ]
     },
     "mode.full": {
@@ -263,8 +261,7 @@
       "optional_files": [
         "{region}/full/interp_postcodes.bin",
         "{region}/full/postcode_centroids.bin",
-        "{region}/full/postcode_centroid_cells.bin",
-        "{region}/full/postcode_centroid_entries.bin"
+        "{region}/full/postcode_centroid_cells.bin"
       ]
     },
     "quality.simplified": {
@@ -424,13 +421,6 @@
         "files": [
           "arc_index.bin",
           "arc_vertices.bin"
-        ]
-      },
-      {
-        "unit": "postcode_centroids.tt.zst",
-        "kind": "cols",
-        "files": [
-          "postcode_centroids.bin"
         ]
       },
       {

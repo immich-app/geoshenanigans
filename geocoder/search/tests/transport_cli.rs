@@ -1,7 +1,7 @@
 //! geocoder-transport against a fixture dir of every kind's members.
 use query_server::arc_fixture::ArcFixture;
 use query_server::poi_files::PoiPolygon;
-use query_server::transport::{Kind, COLS_FILES};
+use query_server::transport::Kind;
 use query_server::{place_files, poi_files, PlaceNode, PoiRecord, PointE7, DEFAULT_ADMIN_CELL_LEVEL, NO_DATA, PLACE_FLAG_HIDDEN};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -38,7 +38,7 @@ fn run(args: &[&str], stdin: Option<&[u8]>) -> Output {
 }
 
 /// A dir holding a member set of every kind: places, POIs with polygons, arcs with a dead slot,
-/// postcode centroids.
+/// admin polygons.
 fn fixture_dir() -> TempDir {
     let d = TempDir::new("dir");
     let nodes: Vec<PlaceNode> = (0..200u32)
@@ -86,7 +86,7 @@ fn fixture_dir() -> TempDir {
         let v: Vec<PointE7> = (0..2 + i * 3).map(|k| PointE7 { lat: 1000 * i + 7 * k, lng: -500 * i + 13 * k * (k % 3) }).collect();
         fx.arc(0, &v);
     }
-    let centroids: Vec<u8> = (0..100u32).flat_map(|i| [(1.5 * i as f32).to_bits(), (-2.0 * i as f32).to_bits(), i * 3, 528].into_iter().flat_map(u32::to_le_bytes)).collect();
+    let polygons: Vec<u8> = (0..100u32).flat_map(|i| [i * 48, i * 3, (0.25 * i as f32).to_bits(), 528 | 8 << 20].into_iter().flat_map(u32::to_le_bytes)).collect();
     for (name, bytes) in [
         ("place_cells.bin", places.cells),
         ("place_nodes.bin", places.nodes),
@@ -95,7 +95,7 @@ fn fixture_dir() -> TempDir {
         ("poi_vertices.bin", vertices),
         ("arc_index.bin", fx.arc_index()),
         ("arc_vertices.bin", fx.arc_vertices()),
-        ("postcode_centroids.bin", centroids),
+        ("admin_polygons.bin", polygons),
     ] {
         std::fs::write(d.0.join(name), bytes).unwrap();
     }
@@ -103,7 +103,7 @@ fn fixture_dir() -> TempDir {
 }
 
 fn units() -> Vec<(Kind, Option<&'static str>)> {
-    vec![(Kind::Places, None), (Kind::Pois, None), (Kind::Arcs, None), (Kind::Cols, Some(COLS_FILES[0]))]
+    vec![(Kind::Places, None), (Kind::Pois, None), (Kind::Arcs, None), (Kind::Cols, Some("admin_polygons.bin"))]
 }
 
 fn members(kind: Kind, file: Option<&'static str>) -> Vec<&'static str> {

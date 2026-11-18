@@ -1,12 +1,14 @@
-// The cell pair indexes: the admin, POI and postcode centroid indexes, each
-// a sorted list of ids per cell, in a cells file and an entries file that are
-// both written front to back in one pass, so the patcher rebuilds them with a
-// block in memory (Writer) from the old ones read the same way (Reader). No
-// S2 here, so the tools and the unit tests can read and write them.
+// The cell pair indexes: the admin and POI indexes, each a sorted list of
+// ids per cell, in a cells file and an entries file that are both written
+// front to back in one pass, so the patcher rebuilds them with a block in
+// memory (Writer) from the old ones read the same way (Reader); and the
+// ranges kind, a cells file alone, the rows each cell holds of a file of rows
+// in cell order (the postcode centroids'). No S2 here, so the tools and the
+// unit tests can read and write them.
 //
 // <prefix>_cells.bin, the cells file:
-//   header, 8 bytes: "GCP1", the kind (1 blocks, 2 direct), flags (bit 0:
-//     interior groups; bit 1: group varint gaps), the cell level L, 0.
+//   header, 8 bytes: "GCP1", the kind (1 blocks, 2 direct, 3 ranges), flags
+//     (bit 0: interior groups; bit 1: group varint gaps), the cell level L, 0.
 //   the parent records, ascending by parent. A parent is a cell at level
 //     L - 5, numbered face * 4^(L - 5) + its position along the face; its
 //     record, at a 4-byte boundary:
@@ -15,7 +17,8 @@
 //       level L, in S2 order, has a list; such a cell is a row of the index;
 //       u32 offsets into the entries file: blocks kind, one per block of 8 of
 //       its rows (block m holds its rows 8m to 8m + 7); direct kind, one per
-//       row.
+//       row. Ranges kind: u32 rows of the ranged file, each of its rows' first
+//       row, then the record's end row (its rows + 1 numbers).
 //   0xFFFFFFFF, past the last record;
 //   the parent bitmap: u64 words, bit p % 64 of word p / 64 set for each
 //     parent p with a record, up to the word of the last one;
@@ -24,7 +27,11 @@
 //   footer, 8 bytes: the number of records (u32), of bitmap words (u32).
 //   An index of no cells is an empty cells file and an empty entries file.
 // <prefix>_entries.bin, the entries file: the blocks (blocks kind) or the
-//   lists (direct kind) back to back, each at its offset.
+//   lists (direct kind) back to back, each at its offset. A ranges index has
+//   none: a cell's rows of the ranged file run from its first to the next
+//   cell's (the record's end for its last), at least one; the first record
+//   starts at row 0, each next where the one before ends, and the last ends at
+//   the ranged file's last row.
 //   A block: a u16 of 2-bit codes, row k's at bit 2k (0 past the block's
 //   rows), then each row's payload in order. Code 0 PLAIN: the list. Code 1
 //   SAME: nothing, the list is the previous row's. Code 2 EDIT: the edit of
@@ -85,7 +92,7 @@ inline constexpr uint32_t END_OF_RECORDS = 0xFFFFFFFFu;
 // parent bitmap (6 * 4^(L - 5) bits) outgrows a small region's index.
 inline constexpr int MIN_LEVEL = LEAF_LEVELS, MAX_LEVEL = 13;
 
-enum class Kind : uint8_t { BLOCKS = 1, DIRECT = 2 };
+enum class Kind : uint8_t { BLOCKS = 1, DIRECT = 2, RANGES = 3 };
 enum class Gaps : uint8_t { VARINT = 0, GROUP_VARINT = 1 };
 struct Format {
     Kind kind;
@@ -95,20 +102,19 @@ struct Format {
     bool operator==(const Format& o) const { return kind == o.kind && groups == o.groups && gaps == o.gaps; }
 };
 // Admin cells list a few polygons each, much like their neighbours': blocks
-// of 8 rows, each list against the one before. POI and postcode centroid
-// cells are read nine at a time and list many ids: one list per row. A POI
-// list's gaps vary in length (planet poi/all: 22 ids a cell), which varints
-// decode slower than today's u32s; a postcode centroid list's are short and
-// alike, which they decode fastest.
-inline constexpr Format ADMIN{Kind::BLOCKS, true, Gaps::VARINT}, POI{Kind::DIRECT, true, Gaps::GROUP_VARINT},
-                        POSTCODE_CENTROID{Kind::DIRECT, false, Gaps::VARINT};
+// of 8 rows, each list against the one before. POI cells are read nine at a
+// time and list many ids: one list per row. A POI list's gaps vary in length
+// (planet poi/all: 22 ids a cell), which varints decode slower than
+// today's u32s.
+inline constexpr Format ADMIN{Kind::BLOCKS, true, Gaps::VARINT}, POI{Kind::DIRECT, true, Gaps::GROUP_VARINT};
+// The postcode centroids are in cell order, so a cell's are a range of rows.
+inline constexpr Format POSTCODE_CELLS{Kind::RANGES, false, Gaps::VARINT};
 
 // The format of the index whose files are <prefix>_cells.bin and
 // <prefix>_entries.bin, none for a prefix no index has.
 inline std::optional<Format> format_named(const std::string& prefix) {
     if (prefix == "admin") return ADMIN;
     if (prefix == "poi") return POI;
-    if (prefix == "postcode_centroid") return POSTCODE_CENTROID;
     return std::nullopt;
 }
 inline Format format_of(const std::string& prefix) {
@@ -311,27 +317,28 @@ public:
     // its ids, ascending (repeats allowed), at most LIST_MAX of them.
     void add(uint64_t cell, const uint32_t* ids, size_t n) {
         if (finished_) throw std::logic_error("cell_pairs::Writer: add after finish");
+        if (format_.kind == Kind::RANGES) throw std::logic_error("cell_pairs::Writer: a list in a ranges index");
         if (n > LIST_MAX)
             throw std::runtime_error("Cell holds " + std::to_string(n) + " entries, more than " +
                                      std::to_string(LIST_MAX));
         for (size_t i = 1; i < n; i++)
             if (ids[i] < ids[i - 1]) throw std::runtime_error("cell_pairs::Writer: a list out of order");
-        if (level_ < 0) start(cell);
-        else if (level_of(cell) != level_) throw std::runtime_error("cell_pairs::Writer: cells of two levels");
-        else if (cell <= last_cell_) throw std::runtime_error("cell_pairs::Writer: cells out of order");
-        last_cell_ = cell;
-        const uint64_t number = number_of(cell, level_);
-        const uint64_t parent = number >> (2 * LEAF_LEVELS);
-        if (parent != parent_) {
-            if (parent_ != NONE) end_parent();
-            parent_ = parent;
-            std::fill(leaf_, leaf_ + LEAF_WORDS, 0);
-        }
-        const size_t child = number & (LEAF_CELLS - 1);
-        leaf_[child / 64] |= uint64_t(1) << (child % 64);
-        rows_++;
+        add_row(cell);
         if (format_.kind == Kind::BLOCKS) add_block_row(ids, n);
         else add_direct_row(ids, n);
+    }
+
+    // The next row of a ranges index: a cell past the last one, at the level
+    // of the first, and the rows it holds of the ranged file, at least one;
+    // they follow the rows of the cells before it.
+    void add_range(uint64_t cell, uint32_t rows) {
+        if (finished_) throw std::logic_error("cell_pairs::Writer: add after finish");
+        if (format_.kind != Kind::RANGES) throw std::logic_error("cell_pairs::Writer: a range in an index of lists");
+        if (rows == 0) throw std::runtime_error("cell_pairs::Writer: a cell without rows");
+        if (uint64_t(range_end_) + rows > 0xFFFFFFFFull) throw std::runtime_error("Cell index rows past 2^32 - 1");
+        add_row(cell);
+        offsets_.push_back(range_end_);
+        range_end_ += rows;
     }
 
     // Writes what is left: the last block and record, then the tail.
@@ -361,6 +368,25 @@ public:
 
 private:
     static constexpr uint64_t NONE = ~uint64_t(0);
+
+    // A row's cell: its bit in its parent's leaf, the parent's record ended
+    // when it is a new one's.
+    void add_row(uint64_t cell) {
+        if (level_ < 0) start(cell);
+        else if (level_of(cell) != level_) throw std::runtime_error("cell_pairs::Writer: cells of two levels");
+        else if (cell <= last_cell_) throw std::runtime_error("cell_pairs::Writer: cells out of order");
+        last_cell_ = cell;
+        const uint64_t number = number_of(cell, level_);
+        const uint64_t parent = number >> (2 * LEAF_LEVELS);
+        if (parent != parent_) {
+            if (parent_ != NONE) end_parent();
+            parent_ = parent;
+            std::fill(leaf_, leaf_ + LEAF_WORDS, 0);
+        }
+        const size_t child = number & (LEAF_CELLS - 1);
+        leaf_[child / 64] |= uint64_t(1) << (child % 64);
+        rows_++;
+    }
 
     void start(uint64_t cell) {
         level_ = level_of(cell);
@@ -449,6 +475,8 @@ private:
     void end_parent() {
         // A block never spans two parents: the next parent's rows start one.
         if (format_.kind == Kind::BLOCKS) end_block();
+        // A ranges record ends with its end row.
+        if (format_.kind == Kind::RANGES) offsets_.push_back(range_end_);
         if (cells_bytes_ > 0xFFFFFFFFull) throw std::runtime_error("Cell index cells past 4 GiB");
         directory_.push_back(static_cast<uint32_t>(cells_bytes_));
         pbits_[parent_ / 64] |= uint64_t(1) << (parent_ % 64);
@@ -473,7 +501,7 @@ private:
     uint32_t lf_[2] = {0, 0};
     std::vector<uint32_t> prev_, adds_;
     std::vector<char> used_;
-    uint32_t prev_offset_ = 0;
+    uint32_t prev_offset_ = 0, range_end_ = 0;
     uint64_t rows_ = 0, cells_bytes_ = 0, entries_bytes_ = 0;
 };
 
@@ -519,16 +547,18 @@ private:
 
 // Reads an index's two files front to back (each through size() and
 // at(off, n), as ByteIn), checking them as it goes: next() gives each row's
-// cell and list in cell order, then checks the tail and that both files end
-// there. Holds one parent record, the row's list and the previous one (but
-// for a direct table read through next(cell, ids, repeat): the caller's list
-// alone), and the parent bitmap and record starts (as the Writer). Every
-// refusal is a "Malformed cell index" runtime_error.
+// cell and list in cell order (next_range() a ranges index's cell and rows),
+// then checks the tail and that both files end there. Holds one parent
+// record, the row's list and the previous one (but for a direct table read
+// through next(cell, ids, repeat): the caller's list alone), and the parent
+// bitmap and record starts (as the Writer). Every refusal is a "Malformed
+// cell index" runtime_error.
 template <typename Cells, typename Entries>
 class Reader {
 public:
     Reader(Cells& cells, Entries& entries, Format format)
         : cells_(cells), entries_(entries), in_(entries), format_(format), cells_size_(cells.size()) {
+        if (format.kind == Kind::RANGES && in_.size() != 0) malformed("entries beside a ranges index");
         if (cells_size_ == 0) {
             if (in_.size() != 0) malformed("entries without cells");
             done_ = true;
@@ -551,6 +581,21 @@ public:
     // The index's level, -1 for an index of no cells.
     int level() const { return level_; }
     uint64_t rows() const { return rows_; }
+    // A ranges index's rows of the ranged file so far: the end of the last
+    // cell read.
+    uint32_t ranges_end() const { return ranges_end_; }
+
+    // The next cell of a ranges index and its rows of the ranged file,
+    // [first, end); false past the last.
+    bool next_range(uint64_t& cell, uint32_t& first, uint32_t& end) {
+        if (format_.kind != Kind::RANGES) throw std::logic_error("cell_pairs::Reader: ranges of an index of lists");
+        if (!next_cell(cell)) return false;
+        first = offsets_[row_];
+        end = offsets_[row_ + 1];
+        row_++;
+        rows_++;
+        return true;
+    }
 
     // The next row's cell and list (ids replaced), false past the last.
     bool next(uint64_t& cell, std::vector<uint32_t>& ids) {
@@ -569,7 +614,20 @@ public:
     // direct table's lists. A block index's rows edit the one before, so its
     // reader keeps that one, and repeat stays false.
     bool next(uint64_t& cell, std::vector<uint32_t>& ids, bool& repeat) {
+        if (format_.kind == Kind::RANGES) throw std::logic_error("cell_pairs::Reader: lists of a ranges index");
         repeat = false;
+        if (!next_cell(cell)) return false;
+        if (format_.kind == Kind::BLOCKS) block_row(ids);
+        else repeat = direct_row(ids);
+        row_++;
+        rows_++;
+        return true;
+    }
+
+private:
+    // The next row's cell, its record read when it starts one; false, the
+    // tail checked, past the last.
+    bool next_cell(uint64_t& cell) {
         if (done_) return false;
         while (row_ == row_count_) {
             if (!next_record()) {
@@ -581,14 +639,9 @@ public:
         const unsigned bit = static_cast<unsigned>(__builtin_ctzll(word_bits_));
         word_bits_ &= word_bits_ - 1;
         cell = cell_of(parent_ << (2 * LEAF_LEVELS) | (word_ * 64 + bit), level_);
-        if (format_.kind == Kind::BLOCKS) block_row(ids);
-        else repeat = direct_row(ids);
-        row_++;
-        rows_++;
         return true;
     }
 
-private:
     uint32_t cells_u32(uint64_t off) {
         uint32_t v;
         std::memcpy(&v, cells_.at(off, 4), 4);
@@ -613,11 +666,21 @@ private:
         size_t n = 0;
         for (uint64_t w : leaf_) n += static_cast<size_t>(__builtin_popcountll(w));
         if (n == 0) malformed("a parent record without rows");
-        const size_t m = format_.kind == Kind::BLOCKS ? (n + BLOCK_ROWS - 1) / BLOCK_ROWS : n;
+        const size_t m = format_.kind == Kind::BLOCKS ? (n + BLOCK_ROWS - 1) / BLOCK_ROWS
+                         : format_.kind == Kind::RANGES ? n + 1
+                                                        : n;
         if (pos_ + 4 + LEAF_BYTES + 4 * m > cells_size_) malformed("a parent record past the end of the cells file");
         offsets_.resize(m);
         std::memcpy(offsets_.data(), cells_.at(pos_ + 4 + LEAF_BYTES, 4 * m), 4 * m);
         pos_ += 4 + LEAF_BYTES + 4 * m;
+        if (format_.kind == Kind::RANGES) {
+            if (offsets_[0] != ranges_end_) malformed("a record that doesn't start where the one before ends");
+            for (size_t k = 0; k < n; k++) {
+                if (offsets_[k + 1] == offsets_[k]) malformed("a cell without rows");
+                if (offsets_[k + 1] < offsets_[k]) malformed("rows out of order");
+            }
+            ranges_end_ = offsets_[n];
+        }
         row_ = 0;
         row_count_ = n;
         word_ = 0;
@@ -770,7 +833,7 @@ private:
     std::vector<uint64_t> pbits_;
     uint16_t codes_ = 0;
     uint32_t lf_[2] = {0, 0};
-    uint32_t prev_offset_ = 0;
+    uint32_t prev_offset_ = 0, ranges_end_ = 0;
 };
 
 }  // namespace cell_pairs

@@ -23,7 +23,7 @@ namespace {
 using Lists = std::vector<std::pair<uint64_t, std::vector<uint32_t>>>;
 using Files = std::pair<std::vector<char>, std::vector<char>>;
 
-constexpr Format FORMATS[] = {ADMIN, POI, POSTCODE_CENTROID};
+constexpr Format FORMATS[] = {ADMIN, POI};
 
 // The level-10 cell of number n (face * 4^10 + its position).
 uint64_t cell(uint64_t n) { return cell_of(n, 10); }
@@ -158,13 +158,11 @@ TEST(cell_pairs_every_level_reads_back) {
 // read and its fixture writer writes. ADMIN: a block of a PLAIN row, a SAME
 // row, an EDIT (9 toggled, 12 added) and a row repeating an id, then an empty
 // list in another parent. POI: gaps of 1 to 4 bytes and a flagged id, a shared
-// list, another parent. Postcode centroids: a shared list and an id past
-// 2^31, ids alone.
+// list, another parent.
 static const Lists GOLDEN_ADMIN = {{cell(5), {3, 9}}, {cell(6), {3, 9}}, {cell(7), {3, 12, 9 | FLAG}},
                                    {cell(8), {7, 7}}, {cell(1030), {}}};
 static const Lists GOLDEN_POI = {{cell(5), {1, 300, 70000, 20000000, 5 | FLAG}}, {cell(6), {1, 300, 70000, 20000000, 5 | FLAG}},
                                  {cell(2048), {42}}};
-static const Lists GOLDEN_POSTCODE = {{cell(5), {10, 11, 400}}, {cell(6), {10, 11, 400}}, {cell(7), {0xFFFFFFF0u}}};
 
 // FNV-1a 64 of bytes: the long cells files of the golden indexes, compared by hash.
 static uint64_t fnv1a(const std::vector<char>& bytes) {
@@ -184,7 +182,6 @@ TEST(cell_pairs_writer_bytes_are_fixed) {
     const Case cases[] = {
         {&GOLDEN_ADMIN, ADMIN, 312, 0x736bd71a2827593bull, {36, 0, 4, 0, 6, 5, 8, 1, 24, 5, 0, 8, 0, 0, 0, 0, 0}},
         {&GOLDEN_POI, POI, 316, 0xa98150bcae9640a2ull, {8, 1, 1, 57, 42, 1, 67, 16, 1, 143, 27, 48, 1, 5, 2, 0, 42}},
-        {&GOLDEN_POSTCODE, POSTCODE_CENTROID, 180, 0x1b32dba5fd24c3ccull, {6, 10, 0, 132, 3, 2, 240, 255, 255, 255, 15}},
     };
     for (const Case& c : cases) {
         const Files files = encode(*c.lists, c.format);
@@ -283,6 +280,214 @@ std::string refusal_reading(const std::vector<char>& cells, const std::vector<ch
 }
 
 }  // namespace
+
+namespace {
+
+using Ranges = std::vector<std::pair<uint64_t, uint32_t>>;  // cell, rows
+
+struct Range {
+    uint64_t cell;
+    uint32_t first, end;
+    bool operator==(const Range& o) const { return cell == o.cell && first == o.first && end == o.end; }
+};
+
+std::vector<char> encode_ranges(const Ranges& ranges, int* entries_bytes = nullptr) {
+    std::vector<char> out;
+    int entries = 0;
+    Writer writer(
+        POSTCODE_CELLS, [&](const char* p, size_t n) { out.insert(out.end(), p, p + n); },
+        [&](const char*, size_t n) { entries += int(n); });
+    for (const auto& [c, rows] : ranges) writer.add_range(c, rows);
+    writer.finish();
+    if (entries_bytes) *entries_bytes = entries;
+    return out;
+}
+
+// The ranges a file of rows in cell order has: each cell's first row and the
+// next one's.
+std::vector<Range> tiled(const Ranges& ranges) {
+    std::vector<Range> out;
+    uint32_t row = 0;
+    for (const auto& [c, rows] : ranges) {
+        out.push_back({c, row, row + rows});
+        row += rows;
+    }
+    return out;
+}
+
+template <typename Src>
+std::vector<Range> decode_ranges_from(Src& cells, uint32_t* end = nullptr) {
+    ByteSpan none{nullptr, 0};
+    Reader reader(cells, none, POSTCODE_CELLS);
+    std::vector<Range> out;
+    Range r{};
+    while (reader.next_range(r.cell, r.first, r.end)) out.push_back(r);
+    if (end) *end = reader.ranges_end();
+    return out;
+}
+
+std::vector<Range> decode_ranges(const std::vector<char>& cells, uint32_t* end = nullptr) {
+    ByteSpan c{cells.data(), cells.size()};
+    return decode_ranges_from(c, end);
+}
+
+// Cells over parents at the bitmap's word ends and the last face's last
+// parent, their first and last children, runs of neighbours and lone cells,
+// holding one row, a few, a block's worth either side of 32, and thousands.
+Ranges range_shapes(std::mt19937_64& rng) {
+    Ranges out;
+    for (uint64_t parent : {0, 1, 63, 64, 65, 1000, 4095, 6143}) {
+        std::vector<uint64_t> children = {0, 1, 2, 63, 64, 511, 1022, 1023};
+        for (int k = 0; k < 40; k++) children.push_back(rng() % 1024);
+        std::sort(children.begin(), children.end());
+        children.erase(std::unique(children.begin(), children.end()), children.end());
+        for (uint64_t child : children) {
+            const uint32_t sizes[] = {1, 1, 2, 5, 31, 32, 33, 64, 200, 22690};
+            const uint32_t rows = sizes[rng() % std::size(sizes)];
+            out.push_back({cell(parent << 10 | child), rows});
+        }
+    }
+    return out;
+}
+
+}  // namespace
+
+TEST(cell_pairs_every_range_reads_back) {
+    std::mt19937_64 rng(20261117);
+    ScratchDir dir("gctest-cellranges");
+    const Ranges ranges = range_shapes(rng);
+    int entries = -1;
+    const std::vector<char> cells = encode_ranges(ranges, &entries);
+    CHECK_EQ(entries, 0);
+    uint32_t end = 0;
+    CHECK(decode_ranges(cells, &end) == tiled(ranges));
+    CHECK_EQ(end, tiled(ranges).back().end);
+    // From a file through a 16-byte window: refilled mid-record, read front to back.
+    write_bytes(dir.path() + "/c.bin", cells);
+    SequentialFileReader c(dir.path() + "/c.bin", 16);
+    CHECK(decode_ranges_from(c) == tiled(ranges));
+    CHECK_EQ(c.rewinds(), uint64_t(0));
+}
+
+// Every level an index can be at: ranges in the first and last parents and
+// those at the bitmap's word ends read back.
+TEST(cell_pairs_ranges_at_every_level_read_back) {
+    std::mt19937_64 rng(6);
+    for (int level = MIN_LEVEL; level <= MAX_LEVEL; level++) {
+        const uint64_t parents = parents_at(level);
+        std::vector<uint64_t> at = {0, 1, parents - 2, parents - 1};
+        for (uint64_t p : {63, 64, 65, 127, 128})
+            if (p < parents) at.push_back(p);
+        std::sort(at.begin(), at.end());
+        at.erase(std::unique(at.begin(), at.end()), at.end());
+        Ranges ranges;
+        for (uint64_t parent : at)
+            for (uint64_t child : {0, 1, 512, 1023})
+                ranges.push_back({cell_of(parent << (2 * LEAF_LEVELS) | child, level), uint32_t(1 + rng() % 50)});
+        const std::vector<char> cells = encode_ranges(ranges);
+        CHECK(decode_ranges(cells) == tiled(ranges));
+        uint32_t words;
+        std::memcpy(&words, cells.data() + cells.size() - 4, 4);
+        CHECK_EQ(words, static_cast<uint32_t>((parents - 1) / 64 + 1));
+    }
+}
+
+// The Writer's bytes for a small ranges index, which the server's tests read
+// and its fixture writer writes: three cells of parent 0 holding 3, 1 and 40
+// rows, then a cell of parent 2 holding 2.
+static const Ranges GOLDEN_RANGES = {{cell(5), 3}, {cell(6), 1}, {cell(7), 40}, {cell(2048), 2}};
+
+TEST(cell_pairs_ranges_writer_bytes_are_fixed) {
+    const std::vector<char> cells = encode_ranges(GOLDEN_RANGES);
+    CHECK_EQ(cells.size(), size_t(328));
+    CHECK_EQ(fnv1a(cells), 0x926643484cc72de1ull);
+    CHECK(decode_ranges(cells) == tiled(GOLDEN_RANGES));
+    // The header (kind 3, no flags), parent 0's record, its leaf (rows 5 to 7),
+    // and its rows' first rows and its end: 0, 3, 4, then 44.
+    const std::vector<uint8_t> head = {'G', 'C', 'P', '1', 3, 0, 10, 0, 0, 0, 0, 0, 0xE0, 0};
+    CHECK(std::vector<uint8_t>(cells.begin(), cells.begin() + head.size()) == head);
+    uint32_t payload[4];
+    std::memcpy(payload, cells.data() + HEADER_BYTES + 4 + LEAF_BYTES, sizeof payload);
+    CHECK(std::vector<uint32_t>(payload, payload + 4) == (std::vector<uint32_t>{0, 3, 4, 44}));
+    // Parent 2's record (its child 0), then its payload: 44, then 46.
+    uint32_t second[3];
+    std::memcpy(second, cells.data() + HEADER_BYTES + 4 + LEAF_BYTES + 16, sizeof second);
+    CHECK(std::vector<uint32_t>(second, second + 3) == (std::vector<uint32_t>{2, 1, 0}));
+    std::memcpy(second, cells.data() + HEADER_BYTES + 2 * (4 + LEAF_BYTES) + 16, 8);
+    CHECK(std::vector<uint32_t>(second, second + 2) == (std::vector<uint32_t>{44, 46}));
+}
+
+TEST(a_ranges_index_of_no_cells_is_an_empty_file) {
+    const std::vector<char> none = encode_ranges({});
+    CHECK(none.empty());
+    uint32_t end = 7;
+    CHECK(decode_ranges(none, &end).empty());
+    CHECK_EQ(end, 0u);
+    // One cell: its record holds its first row and its end.
+    const std::vector<char> one = encode_ranges({{cell(5), 9}});
+    CHECK_EQ(one.size(), HEADER_BYTES + (4 + LEAF_BYTES + 8) + 4 + 12 + 4 + FOOTER_BYTES);
+}
+
+TEST(cell_pairs_ranges_writer_refuses_what_it_cant_write) {
+    auto refusal = [](const Ranges& ranges) { return refusal_of<std::exception>([&] { encode_ranges(ranges); }); };
+    CHECK_EQ(refusal({{cell(1), 0xFFFFFFFFu}}), std::string());
+    CHECK_EQ(refusal({{cell(1), 0}}), std::string("cell_pairs::Writer: a cell without rows"));
+    CHECK_EQ(refusal({{cell(1), 0xFFFFFFFFu}, {cell(2), 1}}), std::string("Cell index rows past 2^32 - 1"));
+    CHECK_EQ(refusal({{cell(2), 1}, {cell(1), 1}}), std::string("cell_pairs::Writer: cells out of order"));
+    CHECK_EQ(refusal({{cell(2), 1}, {cell_of(9, 11), 1}}), std::string("cell_pairs::Writer: cells of two levels"));
+    // A ranges index holds no lists, and an index of lists no ranges.
+    CHECK_EQ(refusal_of<std::logic_error>([] {
+                 Writer w(POSTCODE_CELLS, [](const char*, size_t) {}, [](const char*, size_t) {});
+                 const uint32_t id = 1;
+                 w.add(cell(1), &id, 1);
+             }),
+             std::string("cell_pairs::Writer: a list in a ranges index"));
+    CHECK_EQ(refusal_of<std::logic_error>([] {
+                 Writer w(ADMIN, [](const char*, size_t) {}, [](const char*, size_t) {});
+                 w.add_range(cell(1), 1);
+             }),
+             std::string("cell_pairs::Writer: a range in an index of lists"));
+}
+
+// Each part of a ranges index the Reader checks, malformed by hand.
+TEST(cell_pairs_reader_refuses_each_malformed_range) {
+    const std::string m = "Malformed cell index: ";
+    auto refusal = [](const std::vector<char>& cells, const std::vector<char>& entries = {}) {
+        return refusal_of([&] {
+            ByteSpan c{cells.data(), cells.size()}, e{entries.data(), entries.size()};
+            Reader reader(c, e, POSTCODE_CELLS);
+            uint64_t cell;
+            uint32_t first, end;
+            while (reader.next_range(cell, first, end)) {
+            }
+        });
+    };
+    // Two cells of 3 and 2 rows, then a cell of 4 in parent 1.
+    const std::vector<Record> good = {{0, {5, 6}, {0, 3, 5}}, {1, {7}, {5, 9}}};
+    CHECK_EQ(refusal(cells_by_hand(POSTCODE_CELLS, good)), std::string());
+    struct Case { const char* why; std::vector<Record> records; };
+    const Case cases[] = {
+        {"a record that doesn't start where the one before ends", {{0, {5, 6}, {1, 3, 5}}, {1, {7}, {5, 9}}}},
+        {"a record that doesn't start where the one before ends", {{0, {5, 6}, {0, 3, 5}}, {1, {7}, {6, 9}}}},
+        {"a record that doesn't start where the one before ends", {{0, {5, 6}, {0, 3, 5}}, {1, {7}, {4, 9}}}},
+        {"a cell without rows", {{0, {5, 6}, {0, 3, 3}}, {1, {7}, {3, 9}}}},
+        {"a cell without rows", {{0, {5, 6}, {0, 0, 5}}, {1, {7}, {5, 9}}}},
+        {"rows out of order", {{0, {5, 6}, {0, 3, 2}}, {1, {7}, {2, 9}}}},
+        {"rows out of order", {{0, {5, 6}, {0, 3, 5}}, {1, {7}, {5, 1}}}},
+    };
+    for (const Case& c : cases) {
+        const std::string got = refusal(cells_by_hand(POSTCODE_CELLS, c.records));
+        if (got != m + c.why) std::printf("    want %s, got %s\n", c.why, got.c_str());
+        CHECK_EQ(got, m + c.why);
+    }
+    // A record whose payload is one short: its end is the next record's number.
+    CHECK_EQ(refusal(cells_by_hand(POSTCODE_CELLS, {{0, {5, 6}, {0, 3}}, {1, {7}, {5, 9}}})), m + "rows out of order");
+    // A ranges index has no entries file, and is no index of lists.
+    CHECK_EQ(refusal(cells_by_hand(POSTCODE_CELLS, good), bytes({0})), m + "entries beside a ranges index");
+    CHECK_EQ(refusal(cells_by_hand(POI, {{0, {5}, {0}}})), m + "a cells file of another kind of index");
+    CHECK_EQ(refusal_reading(cells_by_hand(POSTCODE_CELLS, good), {}, POI),
+             m + "a cells file of another kind of index");
+}
 
 // Each part the Reader checks, malformed by hand, and refused as it is.
 TEST(cell_pairs_reader_refuses_each_malformed_part) {

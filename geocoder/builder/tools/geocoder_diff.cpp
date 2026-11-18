@@ -65,6 +65,7 @@
 #include "patch_format.h"
 #include "place_files.h"
 #include "poi_files.h"
+#include "postcode_files.h"
 #include "scratch_dir.h"
 #include "record_match.h"
 #include "side_blocks.h"
@@ -536,9 +537,10 @@ struct FileMergeResult {
 // (way_files.h, the ways' records and their nodes), address files
 // (addr_files.h, the address points and their footprints' logical blobs), POI
 // files (R2 and V2, poi_files.h), place files (place_files.h, their logical
-// stream as place_nodes.bin) and side files (side_blocks.h, each its u32
-// values) are decoded at the start into a scratch dir of their own, which
-// merge_path reads them from.
+// stream as place_nodes.bin), postcode centroid files (postcode_files.h,
+// their logical stream as postcode_centroids.bin) and side files
+// (side_blocks.h, each its u32 values) are decoded at the start into a
+// scratch dir of their own, which merge_path reads them from.
 static std::map<std::string, std::string>& logical_dirs() {
     static std::map<std::string, std::string> dirs;
     return dirs;
@@ -727,6 +729,38 @@ static uint64_t place_logical_size(const LogicalFamily&, const std::string& dir)
     const uint64_t hidden = stat(hp.c_str(), &st) == 0 ? static_cast<uint64_t>(st.st_size) / place_files::HIDDEN_ROW_BYTES : 0;
     return place_files::LOGICAL_STRIDE * (uint64_t{f.rows} + hidden);
 }
+// Decodes dir's postcode centroid files into to's postcode_centroids.bin,
+// their logical stream; false: dir has neither. Refuses a dir with one.
+static bool decode_postcode_files(const LogicalFamily&, const std::string& dir, const std::string& to) {
+    const std::string names[] = {postcode_files::CENTROIDS_FILE, postcode_files::CELLS_FILE};
+    int has = 0;
+    for (const std::string& name : names) {
+        struct stat st;
+        has += stat((dir + "/" + name).c_str(), &st) == 0;
+    }
+    if (!has) return false;
+    if (has != 2) throw std::runtime_error(dir + " has one of postcode_centroids.bin and postcode_centroid_cells.bin");
+    const std::vector<char> centroids = read_file(dir + "/" + names[0]), cells = read_file(dir + "/" + names[1]);
+    auto u8 = [](const std::vector<char>& v) { return reinterpret_cast<const uint8_t*>(v.data()); };
+    logical_decode::ScratchFile o(to + "/" + postcode_files::CENTROIDS_FILE);
+    postcode_files::decode(u8(centroids), centroids.size(), u8(cells), cells.size(),
+                           [&](const postcode_files::LogicalCentroid& c) { o.write(&c, postcode_files::LOGICAL_STRIDE); });
+    if (!o.flush()) throw std::runtime_error("Cannot write the decoded postcode centroid files of " + dir);
+    return true;
+}
+// The bytes decode_postcode_files writes for dir, from postcode_centroids.bin's
+// footer alone; 0 without the files.
+static uint64_t postcode_logical_size(const LogicalFamily&, const std::string& dir) {
+    const std::string cp = dir + "/" + postcode_files::CENTROIDS_FILE;
+    struct stat st;
+    if (stat(cp.c_str(), &st) != 0) return 0;
+    MappedFile m = mmap_file(cp);
+    if (static_cast<uint64_t>(st.st_size) != m.size) throw std::runtime_error("Cannot read " + cp);
+    const postcode_files::Footer f = postcode_files::read_footer(
+        reinterpret_cast<const uint8_t*>(m.data) + m.size - std::min<size_t>(m.size, postcode_files::FOOTER_BYTES), m.size);
+    unmap_file(m);
+    return postcode_files::logical_size(f);
+}
 // Decodes dir's side file, the family's one file, into its values in to;
 // false: dir has no such file.
 static bool decode_side_file(const LogicalFamily& family, const std::string& dir, const std::string& to) {
@@ -772,6 +806,11 @@ static const std::vector<LogicalFamily>& logical_families() {
          {place_files::CELLS_FILE, place_files::NODES_FILE, place_files::HIDDEN_FILE},
          decode_place_files,
          place_logical_size},
+        {"postcodes",
+         {postcode_files::CENTROIDS_FILE},
+         {postcode_files::CENTROIDS_FILE, postcode_files::CELLS_FILE},
+         decode_postcode_files,
+         postcode_logical_size},
         {"way_parents", {"way_parents.bin"}, {"way_parents.bin"}, decode_side_file, side_logical_size},
         {"way_postcodes", {"way_postcodes.bin"}, {"way_postcodes.bin"}, decode_side_file, side_logical_size},
         {"interp_postcodes", {"interp_postcodes.bin"}, {"interp_postcodes.bin"}, decode_side_file, side_logical_size},
@@ -1126,9 +1165,12 @@ static uint32_t append_remap_pairs(std::vector<char>& buf, const std::unordered_
 // patched installs.
 static std::vector<ClientFile> list_client_files(const std::string& dir, std::list<std::vector<char>>& contents) {
     std::unordered_set<std::string> section_files(std::begin(patch_file_names), std::end(patch_file_names));
-    section_files.erase("strings.bin");  // legacy single pool, never emitted
     section_files.insert(std::begin(PLACE_SIDE_FILES), std::end(PLACE_SIDE_FILES));
+    section_files.insert(std::begin(POSTCODE_SIDE_FILES), std::end(POSTCODE_SIDE_FILES));
     section_files.insert(std::begin(ADDR_SIDE_FILES), std::end(ADDR_SIDE_FILES));
+    // Ids that name no file name none of a dir's.
+    for (uint32_t id = 0; id < uint32_t(PatchFileId::COUNT); id++)
+        if (names_no_file(id)) section_files.erase(patch_file_names[id]);
     std::vector<ClientFile> files;
     DIR* d = opendir(dir.c_str());
     if (!d) throw std::runtime_error("Cannot read " + dir);
@@ -1157,7 +1199,7 @@ static std::vector<ClientFile> list_client_files(const std::string& dir, std::li
 }
 
 // The string tiers the variant's own old files reference: every string field
-// the patcher remaps (STRING_RECORD_FILES, sparse kinds 2 and 3), read from
+// the patcher remaps (STRING_RECORD_FILES, sparse kind 2), read from
 // old_dir only, never a sibling. Reads the raw bytes through a read-only map,
 // so it must not see the in-place remaps of the merge threads.
 static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uint32_t (&tier_ends)[STRING_TIER_COUNT]) {
@@ -1170,10 +1212,8 @@ static uint32_t referenced_string_tiers_of(const std::string& old_dir, const uin
         unmap_file(m);
     };
     for (const auto& f : STRING_RECORD_FILES) scan(f.fid, f.stride, string_field_offsets(f.fid));
-    for (const auto& f : SPARSE_DELTA_FILES) {
+    for (const auto& f : SPARSE_DELTA_FILES)
         if (f.remap_kind == 2) scan(f.fid, f.value_stride, {0});
-        if (f.remap_kind == 3) scan(f.fid, f.value_stride, {POSTCODE_CENTROID_POSTCODE_ID_OFF});
-    }
     return mask;
 }
 
@@ -1197,6 +1237,7 @@ static constexpr MergedFile MERGED_FILES[] = {
     {PatchFileId::POI_RECORDS, POI_RECORD_STRIDE},
     {PatchFileId::POI_VERTICES, 1},
     {PatchFileId::PLACE_NODES, PLACE_NODE_STRIDE},
+    {PatchFileId::POSTCODE_CENTROIDS, POSTCODE_CENTROID_STRIDE},
     {PatchFileId::ARC_INDEX, ARC_INDEX_STRIDE},
     {PatchFileId::ARC_VERTICES, 1},
     {PatchFileId::ADMIN_POLYGONS, ADMIN_POLYGON_STRIDE},
@@ -1406,6 +1447,7 @@ static int run(int argc, char* argv[]) {
     const size_t interp_stride = INTERP_WAY_STRIDE;
     const size_t poi_stride = POI_RECORD_STRIDE;
     const size_t place_stride = PLACE_NODE_STRIDE;
+    const size_t postcode_stride = POSTCODE_CENTROID_STRIDE;
 
     // Build patch data (uncompressed, will be zstd-compressed at the end)
     std::vector<char> patch;
@@ -1471,7 +1513,8 @@ static int run(int argc, char* argv[]) {
     // Group 1: addr_points (independent)
     // Group 2: street_ways → street_nodes (sequential within group)
     // Group 3: interp_ways → interp_nodes (sequential within group)
-    FileMergeResult res_addr, res_addr_v, res_ways, res_nodes, res_interp_w, res_interp_n, res_poi_r, res_poi_v, res_place_n;
+    FileMergeResult res_addr, res_addr_v, res_ways, res_nodes, res_interp_w, res_interp_n, res_poi_r, res_poi_v, res_place_n,
+        res_postcodes;
 
     // Byte-block merge for the v15 variable-stride vertex stream
     // (poi_vertices / addr_vertices). The vertex bytes for polygon i live
@@ -1963,6 +2006,37 @@ static int run(int argc, char* argv[]) {
         log_rss("place");
     });
 
+    // Group 6b: postcode_centroids (no child files, a fixed-stride merge)
+    std::thread t_postcode([&]() {
+        double gs = now_ms();
+        // The postcode centroid files' logical streams (decode_postcode_files).
+        auto old_data = mmap_file_rw(merge_path(old_dir, postcode_files::CENTROIDS_FILE));
+        auto new_data = mmap_file(merge_path(new_dir, postcode_files::CENTROIDS_FILE));
+        if (new_data.size == 0 && old_data.size == 0) {
+            res_postcodes = {PatchFileId::POSTCODE_CENTROIDS, postcode_files::CENTROIDS_FILE, postcode_stride, 0, 0, MergeSequence{}, {}};
+            if (old_data.data) unmap_file(old_data);
+            if (new_data.data) unmap_file(new_data);
+            log_time("  group:postcode (empty)", gs);
+            return;
+        }
+        const bool unchanged = sent_unchanged(old_data.data, old_data.size, new_data.data, new_data.size);
+        // String remap on the postcode_id field (offset 8).
+        if (old_data.size > 0)
+            remap_string_fields(old_data.data, old_data.size, PatchFileId::POSTCODE_CENTROIDS, postcode_stride, str_remap);
+        // A merge of the logical rows in cell order: a day's new centroid is
+        // an INSERT among MATCH runs, a moved one a DELETE and an INSERT. No
+        // id remap: no file the patch rebuilds holds a centroid's row.
+        auto seq = unchanged ? match_all(old_data.size / postcode_stride)
+                             : build_merge_seq(old_data.data, old_data.size, new_data.data, new_data.size, postcode_stride);
+        res_postcodes = {PatchFileId::POSTCODE_CENTROIDS, postcode_files::CENTROIDS_FILE, postcode_stride, old_data.size, new_data.size,
+                         seq, {}};
+        log_merge(res_postcodes);
+        if (old_data.data) unmap_file(old_data);
+        if (new_data.data) unmap_file(new_data);
+        log_time("  group:postcode", gs);
+        log_rss("postcode");
+    });
+
     // Group 7: the admin geometry by slot, each family's slots (arc_index,
     // admin_polygons) and then its blocks (arc_vertices, admin_rings) along
     // them. A slot on both days is its old record (slot_family), its block
@@ -2018,12 +2092,11 @@ static int run(int argc, char* argv[]) {
         log_rss("admin");
     });
 
-    t_addr.join(); t_street.join(); t_interp.join(); t_poi.join(); t_place.join(); t_cells.join(); t_admin.join();
+    t_addr.join(); t_street.join(); t_interp.join(); t_poi.join(); t_place.join(); t_postcode.join(); t_cells.join(); t_admin.join();
     log_time("All merge sequences + cell changes built", merge_start);
     // str_remap is kept alive for emit_sparse_delta below — it consumes
-    // the map directly to decide which addr_postcodes / way_postcodes /
-    // postcode_centroids positions actually shifted vs just got a
-    // string-tier remap. Freeing it here previously caused sparse_delta to
+    // the map directly to decide which addr_postcodes / way_postcodes
+    // positions actually shifted vs just got a string-tier remap. Freeing it here previously caused sparse_delta to
     // see an empty map → no remap applied during diff, patch applied the
     // full remap → verify mismatch (e.g. oceania/full addr_postcodes.bin
     // first_diff=267889).
@@ -2093,6 +2166,7 @@ static int run(int argc, char* argv[]) {
     serialize_merge(patch, res_poi_v, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     { std::vector<char>().swap(res_poi_v.seq.data); }
     serialize_merge(patch, res_place_n, old_dir, new_dir, patcher_strings, offset_fixup_limits);
+    serialize_merge(patch, res_postcodes, old_dir, new_dir, patcher_strings, offset_fixup_limits);
     // The admin geometry, ahead of the admin cells: arc_index, arc_vertices,
     // admin_polygons, admin_rings. A file the new dir lacks gets no section,
     // as it got no full replacement (emit_raw): the patch lists no such
@@ -2192,7 +2266,7 @@ static int run(int argc, char* argv[]) {
     // Free merge sequences (already serialized to patch)
     { std::vector<char>().swap(res_nodes.seq.data); std::vector<char>().swap(res_interp_n.seq.data);
       std::vector<char>().swap(res_poi_r.seq.data); std::vector<char>().swap(res_poi_v.seq.data);
-      std::vector<char>().swap(res_place_n.seq.data); }
+      std::vector<char>().swap(res_place_n.seq.data); std::vector<char>().swap(res_postcodes.seq.data); }
 
     {
         const GeoIndexMap old_geo(old_dir), new_geo(new_dir);
@@ -2287,9 +2361,7 @@ static int run(int argc, char* argv[]) {
         uint64_t old_size = (stat(old_path.c_str(), &ost) == 0) ? (uint64_t)ost.st_size : 0;
 
         // Unchanged short-circuit: emit a copy-old marker instead of dumping
-        // the whole file when it's byte-identical to old. Raw-emitted files
-        // (postcode_centroid_cells/entries) can be identical day-over-day;
-        // full-replacing the postcode centroid index wasted ~5.8 MiB/planet.
+        // the whole file when it's byte-identical to old.
         if (try_emit_copy_old(patch, static_cast<uint32_t>(fid), old_path, new_path,
                               old_size, new_size, fname.c_str()))
             return;
@@ -2320,7 +2392,6 @@ static int run(int argc, char* argv[]) {
     // remap_kind:
     //   0 = none                  (raw byte compare; admin slots)
     //   2 = string pool offset    (patcher_strings)
-    //   3 = postcode_centroid     (16B struct, patcher_strings on bytes 8-11 only)
     // String offsets are remapped as the patcher will remap them, so a moved
     // string the strings section sends no pair for arrives as a change.
     //
@@ -2419,39 +2490,18 @@ static int run(int argc, char* argv[]) {
         };
 
         // The changed positions are found on every core (planet addr_postcodes:
-        // 179M string remap lookups), then emitted in order.
-        if (remap_kind == 3) {
-            // 16-byte postcode_centroid: the string remap on bytes 8-11
-            // (postcode_id), raw compare on bytes 0-7 (lat/lng) and 12-15 (cc + pad).
-            auto changed = [&](size_t pos) {
-                const char* np = new_m.data + pos * 16;
-                if (pos >= old_n) return true;
-                const char* op = old_m.data + pos * 16;
-                bool d = (memcmp(op, np, 8) != 0) || (memcmp(op + 12, np + 12, 4) != 0);
-                if (!d) {
-                    uint32_t old_pid; memcpy(&old_pid, op + 8, 4);
-                    uint32_t new_pid; memcpy(&new_pid, np + 8, 4);
-                    if (old_pid != NO_DATA) {
-                        old_pid = patcher_strings.map(old_pid);
-                    }
-                    d = (old_pid != new_pid);
-                }
-                return d;
-            };
-            for (size_t pos : parallel_filter<size_t>(new_n, changed)) emit_change((uint32_t)pos, new_m.data + pos * 16);
-        } else {
-            // 4-byte uint32 array with optional remap on the value.
-            auto changed = [&](size_t pos) {
-                uint32_t new_val; memcpy(&new_val, new_m.data + pos * 4, 4);
-                if (pos >= old_n) return true;
-                uint32_t old_val; memcpy(&old_val, old_m.data + pos * 4, 4);
-                const uint32_t remapped = old_val != NO_DATA && remap_kind == 2 ? patcher_strings.map(old_val) : old_val;
-                return remapped != new_val;
-            };
-            for (size_t pos : parallel_filter<size_t>(new_n, changed)) {
-                uint32_t new_val; memcpy(&new_val, new_m.data + pos * 4, 4);
-                emit_change((uint32_t)pos, reinterpret_cast<const char*>(&new_val));
-            }
+        // 179M string remap lookups), then emitted in order: a u32 array, the
+        // string remap on its values for kind 2.
+        auto changed = [&](size_t pos) {
+            uint32_t new_val; memcpy(&new_val, new_m.data + pos * 4, 4);
+            if (pos >= old_n) return true;
+            uint32_t old_val; memcpy(&old_val, old_m.data + pos * 4, 4);
+            const uint32_t remapped = old_val != NO_DATA && remap_kind == 2 ? patcher_strings.map(old_val) : old_val;
+            return remapped != new_val;
+        };
+        for (size_t pos : parallel_filter<size_t>(new_n, changed)) {
+            uint32_t new_val; memcpy(&new_val, new_m.data + pos * 4, 4);
+            emit_change((uint32_t)pos, reinterpret_cast<const char*>(&new_val));
         }
 
         close_run();
@@ -2574,45 +2624,6 @@ static int run(int argc, char* argv[]) {
     }
     { std::vector<char>().swap(res_addr.seq.data); std::vector<char>().swap(res_ways.seq.data);
       std::vector<char>().swap(res_interp_w.seq.data); }
-    // A cell index whose ids are strategy-2 slots barely changes day to day:
-    // send the cells that lost or gained ids instead of both files.
-    // Full-replacing postcode_centroid_* cost ~3.7 MiB per planet mode dir.
-    auto emit_cell_index = [&](PatchFileId cells_fid, const std::string& cells_name,
-                               PatchFileId entries_fid, const std::string& entries_name) {
-        struct stat st;
-        bool present = stat((old_dir + "/" + cells_name).c_str(), &st) == 0 &&
-                       stat((old_dir + "/" + entries_name).c_str(), &st) == 0 &&
-                       stat((new_dir + "/" + cells_name).c_str(), &st) == 0 &&
-                       stat((new_dir + "/" + entries_name).c_str(), &st) == 0;
-        if (present) {
-            const cell_pairs::Format format = cell_pairs::POSTCODE_CENTROID;
-            auto old_c = read_file(old_dir + "/" + cells_name), old_e = read_file(old_dir + "/" + entries_name);
-            auto new_c = read_file(new_dir + "/" + cells_name), new_e = read_file(new_dir + "/" + entries_name);
-            auto new_lists = parse_cell_lists(new_c, new_e, format);
-            bool unchanged = old_c == new_c && old_e == new_e;
-            // Only a layout write_cell_lists reproduces byte for byte can be rebuilt.
-            if (!unchanged && write_cell_lists(new_lists, format) == std::make_pair(new_c, new_e)) {
-                std::vector<char> payload;
-                uint64_t new_entries_size = new_e.size();
-                payload.insert(payload.end(), (const char*)&new_entries_size, (const char*)&new_entries_size + 8);
-                const CellListDeltaCounts n = append_cell_list_delta(payload, parse_cell_lists(old_c, old_e, format), new_lists);
-                SEC("celllist:" << cells_name);
-                uint32_t fid = static_cast<uint32_t>(cells_fid), stride = CELL_LIST_DELTA_STRIDE;
-                uint64_t old_size = old_c.size(), new_size = new_c.size(), payload_size = payload.size();
-                wval(patch, &fid, 4); wval(patch, &stride, 4);
-                wval(patch, &old_size, 8); wval(patch, &new_size, 8); wval(patch, &payload_size, 8);
-                patch.insert(patch.end(), payload.begin(), payload.end());
-                std::cerr << "  " << cells_name << " + " << entries_name << ": cell list delta "
-                          << payload_size << " bytes vs " << new_c.size() + new_e.size() << " full (" << n.gone << " gone and "
-                          << n.fresh << " new cells, " << n.lost_runs << " lost and " << n.gained_runs << " gained runs)" << std::endl;
-                return;
-            }
-        }
-        emit_raw(cells_fid, cells_name);
-        emit_raw(entries_fid, entries_name);
-    };
-    emit_cell_index(PatchFileId::POSTCODE_CENTROID_CELLS, "postcode_centroid_cells.bin",
-                    PatchFileId::POSTCODE_CENTROID_ENTRIES, "postcode_centroid_entries.bin");
     // ADDR_VERTICES was already serialized as a byte-merge just after
     // res_addr when a day has address points. Only fall back to
     // FULL_REPLACE here for a dir without them on both

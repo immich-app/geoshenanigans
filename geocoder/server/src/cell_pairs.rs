@@ -1,8 +1,9 @@
-//! The cell pair indexes, the admin, POI and postcode centroid indexes: each cell's sorted list of
-//! ids, in the cells file and the entries file the builder writes (builder/src/cell_pairs.h, which
-//! lays the format out). A lookup finds the cell's parent record through the parent bitmap, its
-//! rank among the parent's rows through the leaf, and decodes its list: a direct index's own list,
-//! or a block index's block up to the cell's row.
+//! The cell pair indexes, the admin and POI indexes: each cell's sorted list of ids, in the cells
+//! file and the entries file the builder writes (builder/src/cell_pairs.h, which lays the format
+//! out); and the ranges kind, a cells file alone, each cell's rows of a file of rows in cell order
+//! (the postcode centroids'). A lookup finds the cell's parent record through the parent bitmap,
+//! its rank among the parent's rows through the leaf, and decodes its list: a direct index's own
+//! list, or a block index's block up to the cell's row; or reads its range beside it.
 
 use crate::FileBytes;
 use std::cell::Cell;
@@ -27,6 +28,8 @@ pub enum Kind {
     Blocks = 1,
     /// One list per row.
     Direct = 2,
+    /// No lists: each row's first row of a file of rows in cell order.
+    Ranges = 3,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,7 +55,7 @@ impl Format {
 
 pub const ADMIN: Format = Format { kind: Kind::Blocks, groups: true, gaps: Gaps::Varint };
 pub const POI: Format = Format { kind: Kind::Direct, groups: true, gaps: Gaps::GroupVarint };
-pub const POSTCODE_CENTROID: Format = Format { kind: Kind::Direct, groups: false, gaps: Gaps::Varint };
+pub const POSTCODE_CELLS: Format = Format { kind: Kind::Ranges, groups: false, gaps: Gaps::Varint };
 
 /// A cell pair index's two files, checked at open.
 pub struct CellPairs {
@@ -159,8 +162,18 @@ fn group_gaps(k: &[u8], p: &mut usize, n: u64, mut v: u32, inc: u32, flag: u32, 
 impl CellPairs {
     /// The index of `format` at `level` in these files; an error names what is wrong with them.
     pub fn open(cells: FileBytes, entries: FileBytes, format: Format, level: u64) -> Result<CellPairs, String> {
-        let layout = Self::check(cells.as_slice(), entries.as_slice(), format, level)?;
+        if format.kind == Kind::Ranges {
+            return Err("a ranges index opens with the rows it ranges over".into());
+        }
+        let layout = Self::check(cells.as_slice(), entries.as_slice(), format, level, 0)?;
         Ok(CellPairs { cells, entries, layout })
+    }
+
+    /// The ranges index at `level` of a file of `rows` rows in cell order: its cells' ranges must
+    /// tile the rows, each cell holding at least one.
+    pub fn open_ranges(cells: FileBytes, level: u64, rows: u32) -> Result<CellPairs, String> {
+        let layout = Self::check(cells.as_slice(), &[], POSTCODE_CELLS, level, rows)?;
+        Ok(CellPairs { cells, entries: FileBytes::Owned(Vec::new()), layout })
     }
 
     /// An index of no cells.
@@ -168,11 +181,18 @@ impl CellPairs {
         CellPairs { cells: FileBytes::Owned(Vec::new()), entries: FileBytes::Owned(Vec::new()), layout: None }
     }
 
-    fn check(c: &[u8], e: &[u8], format: Format, level: u64) -> Result<Option<Layout>, String> {
-        if c.is_empty() {
-            return if e.is_empty() { Ok(None) } else { Err("entries without cells".into()) };
-        }
+    /// The layout of an index's files, checked; `rows`: the rows a ranges index ranges over.
+    fn check(c: &[u8], e: &[u8], format: Format, level: u64, rows: u32) -> Result<Option<Layout>, String> {
         let bad = |what: &str| Err(format!("not a cell pair index ({what})"));
+        if c.is_empty() {
+            return if !e.is_empty() {
+                Err("entries without cells".into())
+            } else if format.kind == Kind::Ranges && rows != 0 {
+                bad("ranges that don't end at the file's last row")
+            } else {
+                Ok(None)
+            };
+        }
         if c.len() < HEADER_BYTES + 4 + FOOTER_BYTES || &c[0..4] != MAGIC {
             return bad("no GCP1 header");
         }
@@ -213,9 +233,11 @@ impl CellPairs {
         if before != records || rd64(c, pbits_at + 8 * (pwords - 1)) == 0 {
             return bad("a bitmap that isn't its records'");
         }
-        // Each record where the directory says, the parent the bitmap says, its size its leaf's rows'.
+        // Each record where the directory says, the parent the bitmap says, its size its leaf's rows';
+        // a ranges record's rows from the end of the one before, each cell's at least one.
         let mut at = HEADER_BYTES;
         let mut r = 0usize;
+        let mut end = 0u32;
         for w in 0..pwords {
             let mut bits = rd64(c, pbits_at + 8 * w);
             while bits != 0 {
@@ -224,17 +246,40 @@ impl CellPairs {
                 if rd32(c, dir_at + 4 * r) as usize != at || at + 4 + LEAF_BYTES > pbits_at - 4 || rd32(c, at) != parent {
                     return bad("a record that isn't the directory's");
                 }
-                let rows: usize = (0..LEAF_WORDS).map(|i| rd64(c, at + 4 + 8 * i).count_ones() as usize).sum();
-                let offsets = if format.kind == Kind::Blocks { rows.div_ceil(BLOCK_ROWS) } else { rows };
-                at += 4 + LEAF_BYTES + 4 * offsets;
-                if rows == 0 || at > pbits_at - 4 {
+                let cells: usize = (0..LEAF_WORDS).map(|i| rd64(c, at + 4 + 8 * i).count_ones() as usize).sum();
+                let offsets = match format.kind {
+                    Kind::Blocks => cells.div_ceil(BLOCK_ROWS),
+                    Kind::Direct => cells,
+                    Kind::Ranges => cells + 1,
+                };
+                let payload = at + 4 + LEAF_BYTES;
+                at = payload + 4 * offsets;
+                if cells == 0 || at > pbits_at - 4 {
                     return bad("a record past its rows");
+                }
+                if format.kind == Kind::Ranges {
+                    if rd32(c, payload) != end {
+                        return bad("a record that doesn't start where the one before ends");
+                    }
+                    for k in 0..cells {
+                        let (first, next) = (rd32(c, payload + 4 * k), rd32(c, payload + 4 * k + 4));
+                        if next == first {
+                            return bad("a cell without rows");
+                        }
+                        if next < first {
+                            return bad("rows out of order");
+                        }
+                    }
+                    end = rd32(c, payload + 4 * cells);
                 }
                 r += 1;
             }
         }
         if at != pbits_at - 4 {
             return bad("bytes between the records and the tail");
+        }
+        if format.kind == Kind::Ranges && end != rows {
+            return bad("ranges that don't end at the file's last row");
         }
         Ok(Some(Layout { format, shift: 61 - 2 * level as u32, pbits_at, pwords, ranks_at, dir_at }))
     }
@@ -298,6 +343,7 @@ impl CellPairs {
                             cur.clear();
                         }
                     }
+                    Kind::Ranges => {}
                 }
             }
         }
@@ -305,6 +351,43 @@ impl CellPairs {
         cur.clear();
         SCRATCH.set((cur, prev));
         r
+    }
+
+    /// A ranges index's rows of the cell, [first, end) of the file it ranges over: (0, 0) for a
+    /// cell it doesn't hold (and any cell of an index of lists).
+    pub fn range(&self, cell: u64) -> (u32, u32) {
+        let Some(l) = self.layout.as_ref().filter(|l| l.format.kind == Kind::Ranges) else { return (0, 0) };
+        let Some((at, rank)) = self.locate(l, cell) else { return (0, 0) };
+        let c = self.cells.as_slice();
+        let payload = at + 4 + LEAF_BYTES + 4 * rank;
+        (rd32(c, payload), rd32(c, payload + 4))
+    }
+
+    /// Calls `f` with each cell of a ranges index and its rows, [first, end), in cell order (none
+    /// of an index of lists): the records, checked at open, read front to back.
+    pub fn for_each_range(&self, mut f: impl FnMut(u64, u32, u32)) {
+        let Some(l) = self.layout.as_ref().filter(|l| l.format.kind == Kind::Ranges) else { return };
+        let c = self.cells.as_slice();
+        let mut record = 0;
+        for w in 0..l.pwords {
+            let mut parents = rd64(c, l.pbits_at + 8 * w);
+            while parents != 0 {
+                let parent = (w * 64) as u64 + u64::from(parents.trailing_zeros());
+                parents &= parents - 1;
+                let at = rd32(c, l.dir_at + 4 * record) as usize;
+                record += 1;
+                let mut row = at + 4 + LEAF_BYTES;
+                for i in 0..LEAF_WORDS {
+                    let mut children = rd64(c, at + 4 + 8 * i);
+                    while children != 0 {
+                        let number = parent << (2 * LEAF_LEVELS) | (i * 64) as u64 | u64::from(children.trailing_zeros());
+                        children &= children - 1;
+                        f(number << l.shift | 1 << (l.shift - 1), rd32(c, row), rd32(c, row + 4));
+                        row += 4;
+                    }
+                }
+            }
+        }
     }
 
     /// The ids the cell lists, ascending.
@@ -609,6 +692,7 @@ pub fn write(lists: &[(u64, Vec<u32>)], format: Format) -> (Vec<u8>, Vec<u8>) {
                     entries.extend(out);
                 }
             }
+            Kind::Ranges => panic!("a ranges index holds no lists: write_ranges writes it"),
             Kind::Direct => {
                 for (_, l) in &lists[i..end] {
                     if let Some((p, off)) = prev.filter(|(p, _)| *p == l) {
@@ -642,6 +726,58 @@ pub fn write(lists: &[(u64, Vec<u32>)], format: Format) -> (Vec<u8>, Vec<u8>) {
     cells.extend((dir.len() as u32).to_le_bytes());
     cells.extend((words as u32).to_le_bytes());
     (cells, entries)
+}
+
+/// The cells file the builder writes for the cells of a file of rows in cell order, each with
+/// the rows it holds (at least one), ascending at one level (fixtures and tests).
+#[cfg(any(test, feature = "fixtures"))]
+pub fn write_ranges(ranges: &[(u64, u32)]) -> Vec<u8> {
+    let mut cells = Vec::new();
+    let Some(&(first, _)) = ranges.first() else { return cells };
+    assert!(ranges.windows(2).all(|w| w[0].0 < w[1].0), "cells out of order");
+    assert!(ranges.iter().all(|r| r.1 > 0), "a cell without rows");
+    let level = 30 - first.trailing_zeros() as u64 / 2;
+    let shift = 61 - 2 * level as u32;
+    let parent_of = |c: u64| (c >> shift) >> (2 * LEAF_LEVELS);
+    cells.extend_from_slice(MAGIC);
+    cells.extend_from_slice(&[Kind::Ranges as u8, 0, level as u8, 0]);
+    let mut pbits = vec![0u64; parent_words_at(level)];
+    let mut dir = Vec::new();
+    let mut row = 0u32;
+    let mut i = 0;
+    while i < ranges.len() {
+        let parent = parent_of(ranges[i].0);
+        let end = i + ranges[i..].iter().take_while(|(c, _)| parent_of(*c) == parent).count();
+        pbits[parent as usize / 64] |= 1 << (parent % 64);
+        dir.push(cells.len() as u32);
+        cells.extend((parent as u32).to_le_bytes());
+        let mut leaf = [0u64; LEAF_WORDS];
+        for (c, _) in &ranges[i..end] {
+            let child = ((c >> shift) & ((1 << (2 * LEAF_LEVELS)) - 1)) as usize;
+            leaf[child / 64] |= 1 << (child % 64);
+        }
+        leaf.iter().for_each(|w| cells.extend(w.to_le_bytes()));
+        for (_, n) in &ranges[i..end] {
+            cells.extend(row.to_le_bytes());
+            row += n;
+        }
+        cells.extend(row.to_le_bytes());
+        i = end;
+    }
+    cells.extend(END_OF_RECORDS.to_le_bytes());
+    let words = pbits.iter().rposition(|&w| w != 0).unwrap() + 1;
+    let mut before = 0u32;
+    for w in &pbits[..words] {
+        cells.extend(w.to_le_bytes());
+    }
+    for w in &pbits[..words] {
+        cells.extend(before.to_le_bytes());
+        before += w.count_ones();
+    }
+    dir.iter().for_each(|d| cells.extend(d.to_le_bytes()));
+    cells.extend((dir.len() as u32).to_le_bytes());
+    cells.extend((words as u32).to_le_bytes());
+    cells
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@ use super::container::{col, invalid, read_tail, Chunk, ColSpec, Input, Out, Sect
 use std::io::{self, Read, Write};
 
 /// The files a cols unit holds.
-pub const COLS_FILES: [&str; 5] = ["postcode_centroids.bin", "admin_polygons.bin", "street_ways.bin", "interp_ways.bin", "addr_index.bin"];
+pub const COLS_FILES: [&str; 4] = ["admin_polygons.bin", "street_ways.bin", "interp_ways.bin", "addr_index.bin"];
 
 /// A row's fields in order, each its width and the column holding it, and the columns: a column
 /// holds one field, or a field the row repeats (addr_index.bin's 64 block starts), its values in
@@ -53,9 +53,8 @@ impl Layout {
     }
 }
 
-/// A cols file's name as COLS_FILES holds it and its row's layout: postcode_centroids.bin's lat,
-/// lng (f32), postcode id (u32), country code and pad (u16), a column each; admin_polygons.bin's
-/// ring offset, name, area, country code, level and override, reserved byte, a column each; a way
+/// A cols file's name as COLS_FILES holds it and its row's layout: admin_polygons.bin's ring
+/// offset, name, area, country code, level and override, reserved byte, a column each; a way
 /// group's off and anchor lat and lng (u32), a column each, then a column for each field its 16
 /// ways repeat: their counts and codes (u16), an interpolation's starts, spans (u32) and
 /// interpolations (u8), their names (u32); addr_index.bin's superblock starts (u64), a column
@@ -63,7 +62,6 @@ impl Layout {
 pub(super) fn layout_of(file: &str) -> io::Result<(&'static str, Layout)> {
     let name = COLS_FILES.iter().find(|&&f| f == file).ok_or_else(|| invalid(format!("{file} is no cols file")))?;
     let layout = match *name {
-        "postcode_centroids.bin" => Layout::of(&[col(4, D), col(4, D), col(4, S), col(2, R), col(2, R)]),
         "admin_polygons.bin" => Layout::of(&[col(4, S), col(4, S), col(4, B), col(2, R), col(1, R), col(1, R)]),
         "street_ways.bin" | "interp_ways.bin" => {
             let mut l = Layout::of(&[col(4, D), col(4, D), col(4, D)]);

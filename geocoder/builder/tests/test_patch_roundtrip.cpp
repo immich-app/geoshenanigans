@@ -22,6 +22,7 @@
 #include "patch_decompress.h"
 #include "patch_format.h"
 #include "place_test_files.h"
+#include "postcode_test_files.h"
 #include "scratch_dir.h"
 #include "test_framework.h"
 #include "tool_runs.h"
@@ -779,10 +780,12 @@ TEST(patch_round_trip_keeps_the_place_files) {
 // read of each family the builder writes encoded: the POI files as 36-byte
 // records and their vertex stream, the place files as place_nodes.bin's
 // 24-byte rows (the visible nodes with their cells' keys, then the hidden
-// ones). A dir with one of the families gives that family's files and a dir
-// with neither an empty OUT; no other file of DIR is written. An OUT that
-// holds a file, a DIR that is no dir and a DIR with one of the two POI files
-// are refused.
+// ones), the postcode centroid files as postcode_centroids.bin's 20-byte rows
+// (with their cells' keys), none of them for a dir of no centroids. A dir
+// with some of the families gives those families' files and a dir with none
+// an empty OUT; no other file of DIR is written. An OUT that holds a file, a
+// DIR that is no dir and a DIR with one of the two POI files or of the two
+// postcode centroid files are refused.
 TEST(decode_logical_writes_the_poi_and_place_files_a_dir_holds_and_none_it_lacks) {
     ScratchDir dir("decode-logical");
     const std::string log = dir.path() + "/tools.log";
@@ -804,12 +807,17 @@ TEST(decode_logical_writes_the_poi_and_place_files_a_dir_holds_and_none_it_lacks
     for (uint32_t i = 0; i < visible.size(); i++) rows.push_back({visible[i], i / 3});
     rows.push_back({hidden, NO_DATA});
     const BuildDir places = {{place_files::NODES_FILE, bytes_of(rows)}};
+    const std::vector<postcode_files::LogicalCentroid> centroids = {test_centroid(52.5f, 13.4f, NAME_2, DE, 5),
+                                                                     test_centroid(52.51f, 13.4f, NAME_4, DE, 5),
+                                                                     test_centroid(-33.9f, 151.2f, NAME_2, DE, 900)};
 
     struct Case {
         std::string name;
         bool poi, places;
+        int centroids;  // -1: no centroid files; else that many rows
     };
-    for (const Case& e : {Case{"both", true, true}, {"poi", true, false}, {"places", false, true}, {"neither", false, false}}) {
+    for (const Case& e : {Case{"all", true, true, 3}, {"poi", true, false, -1}, {"places", false, true, -1}, {"postcodes", false, false, 3},
+                          {"no-centroids", false, false, 0}, {"none", false, false, -1}}) {
         // Beside a string tier and a file of u32s, which are no such family's.
         BuildDir d = with_pool(OLD_POOL), want;
         d["admin_parents.bin"] = bytes_of(std::vector<uint32_t>{NAME_2});
@@ -820,6 +828,11 @@ TEST(decode_logical_writes_the_poi_and_place_files_a_dir_holds_and_none_it_lacks
         if (e.places) {
             put_places(d, nodes);
             want.insert(places.begin(), places.end());
+        }
+        if (e.centroids >= 0) {
+            const std::vector<postcode_files::LogicalCentroid> some(centroids.begin(), centroids.begin() + e.centroids);
+            put_centroids(d, some);
+            want[postcode_files::CENTROIDS_FILE] = logical_bytes(some);
         }
         const std::string in = dir.path() + "/" + e.name, out = in + ".logical";
         REQUIRE(write_dir(in, d));
@@ -836,9 +849,26 @@ TEST(decode_logical_writes_the_poi_and_place_files_a_dir_holds_and_none_it_lacks
         CHECK_EQ(text.find(places_line) != std::string::npos, e.places);
         CHECK_EQ(text.find("  poi: none") != std::string::npos, !e.poi);
         CHECK_EQ(text.find("  places: none") != std::string::npos, !e.places);
+        const std::string centroid_line = "  postcodes: " + std::to_string(20 * std::max(e.centroids, 0)) + " logical bytes";
+        CHECK_EQ(text.find(centroid_line) != std::string::npos, e.centroids >= 0);
+        CHECK_EQ(text.find("  postcodes: none") != std::string::npos, e.centroids < 0);
+    }
+    {
+        // The centroids without their cells file, and the cells file alone.
+        BuildDir d;
+        put_centroids(d, centroids);
+        for (const std::string& gone : {std::string(postcode_files::CELLS_FILE), std::string(postcode_files::CENTROIDS_FILE)}) {
+            BuildDir one = d;
+            one.erase(gone);
+            const std::string in = dir.path() + "/without-" + gone;
+            REQUIRE(write_dir(in, one));
+            const auto [ok, text] = decode(in, in + ".logical");
+            CHECK(!ok);
+            CHECK(text.find("has one of postcode_centroids.bin and postcode_centroid_cells.bin") != std::string::npos);
+        }
     }
 
-    const std::string both = dir.path() + "/both", used = dir.path() + "/used";
+    const std::string both = dir.path() + "/all", used = dir.path() + "/used";
     const BuildDir held = {{"held.bin", {'x'}}};
     REQUIRE(write_dir(used, held));
     auto r = decode(both, used);
@@ -1174,27 +1204,22 @@ static void put_moved_postcode(BuildDir& old_d, BuildDir& new_d) {
     old_d["addr_vertices.bin"] = new_d["addr_vertices.bin"] = {};
     old_d["addr_postcodes.bin"] = bytes_of(std::vector<uint32_t>{OLD_POSTCODE, KEPT_POSTCODE, NO_DATA});
     new_d["addr_postcodes.bin"] = bytes_of(std::vector<uint32_t>{NEW_POSTCODE, KEPT_POSTCODE, NO_DATA});
-    // lat, lng, postcode, country code and padding
+    // A centroid of each postcode, in cells of their own.
     auto centroids = [&](uint32_t moved) {
-        std::vector<char> out;
-        for (const auto& [lat, postcode] : {std::pair<float, uint32_t>{52.5f, moved}, {53.5f, KEPT_POSTCODE}}) {
-            append(out, lat);
-            append(out, 13.4f);
-            append(out, postcode);
-            append(out, uint32_t{'D' | 'E' << 8});
-        }
-        return out;
+        return std::vector<postcode_files::LogicalCentroid>{test_centroid(52.5f, 13.4f, moved, DE, 100),
+                                                             test_centroid(53.5f, 13.4f, KEPT_POSTCODE, DE, 101)};
     };
-    old_d["postcode_centroids.bin"] = centroids(OLD_POSTCODE);
-    new_d["postcode_centroids.bin"] = centroids(NEW_POSTCODE);
+    put_centroids(old_d, centroids(OLD_POSTCODE));
+    put_centroids(new_d, centroids(NEW_POSTCODE));
 }
 
 // The moved postcode (put_moved_postcode) past the strings section's pairs
 // (--string-pairs-max 0): the patcher's string remap keeps its old offset.
-// The address whose housenumber names it, a MATCH record, takes its new
-// offset as a string fixup, and addr_postcodes (a parallel delta along the
-// addresses, remap kind 2) and postcode_centroids (a sparse delta, kind 3)
-// take it as a change each. With the pair sent instead, neither has a change.
+// The address whose housenumber names it and its postcode's centroid, MATCH
+// records of their merges, take its new offset as a string fixup each, and
+// addr_postcodes (a parallel delta along the addresses, remap kind 2) as a
+// change. With the pair sent instead, none has a fixup or a change: the
+// centroids, their strings moved by the remap, all MATCH.
 TEST(patch_round_trip_sends_moved_postcodes_past_the_pair_table_as_changes) {
     BuildDir old_d, new_d;
     put_moved_postcode(old_d, new_d);
@@ -1202,16 +1227,53 @@ TEST(patch_round_trip_sends_moved_postcodes_past_the_pair_table_as_changes) {
     const RoundTrip fixed = round_trip(old_d, new_d, {}, {"--string-pairs-max", "0"});
     CHECK(fixed.mismatches.empty());
     CHECK(logged(fixed, "addr_points.bin: 1 string fixups ("));
+    CHECK(logged(fixed, "postcode_centroids.bin: 1 string fixups ("));
+    CHECK(logged(fixed, "postcode_centroids.bin: seq=5 "));
     CHECK(logged(fixed, "addr_postcodes.bin: parallel delta along addr_points.bin, 0 inserted, 1 changes"));
-    CHECK(logged(fixed, "postcode_centroids.bin: sparse delta 1 changes"));
     const RoundTrip paired = round_trip(old_d, new_d);
     CHECK(paired.mismatches.empty());
     CHECK(!logged(paired, "string fixups"));
     CHECK(logged(paired, "addr_postcodes.bin: parallel delta along addr_points.bin, 0 inserted, 0 changes"));
-    CHECK(logged(paired, "postcode_centroids.bin: sparse delta 0 changes"));
+    CHECK(logged(paired, "postcode_centroids.bin: seq=5 "));
+    CHECK(logged(paired, "recs m/i/d/r=2/0/0/0"));
 }
 
-// The moved postcode's string fixup takes 2 bytes. Under a limit of 2
+// Postcode centroids in cell order on both days, the string tiers alike: one
+// that moves within its cell, one that moves to another cell, one born and
+// one gone. The content merge sends a moved centroid as a delete and an
+// insert; a day that changes no centroid sends the family unchanged, and the
+// patcher copies both files from the old dir as they sit.
+TEST(patch_round_trip_merges_postcode_centroids_as_logical_rows) {
+    // Postcodes "P00" to "P49", 4 bytes apart in the postcode tier.
+    std::string pool;
+    for (int i = 0; i < 50; i++) pool += std::string("P") + char('0' + i / 10) + char('0' + i % 10) + '\0';
+    BuildDir old_d, new_d;
+    old_d["strings_postcode.bin"] = new_d["strings_postcode.bin"] = std::vector<char>(pool.begin(), pool.end());
+    std::vector<postcode_files::LogicalCentroid> old_rows, new_rows;
+    for (uint32_t i = 0; i < 40; i++) old_rows.push_back(test_centroid(52.0f + float(i) * 0.001f, 13.0f, 4 * i, DE, 7 + i / 10));
+    for (uint32_t i = 0; i < 40; i++) {
+        postcode_files::LogicalCentroid c = old_rows[i];
+        if (i == 3) c.lat += 0.0005f;  // moved in its cell
+        if (i == 12 || i == 25) continue;  // gone, and moved below
+        new_rows.push_back(c);
+    }
+    new_rows.push_back(test_centroid(52.9f, 13.9f, 4 * 25, DE, 29));  // P25 moved from cell 9 to cell 29
+    new_rows.push_back(test_centroid(53.0f, 14.0f, 4 * 45, DE, 30));  // born, in a cell of its own
+    put_centroids(old_d, old_rows);
+    put_centroids(new_d, new_rows);
+    const RoundTrip moved = round_trip(old_d, new_d);
+    CHECK(moved.mismatches.empty());
+    CHECK(logged(moved, "postcode_centroids.bin: seq="));
+    CHECK(logged(moved, "recs m/i/d/r=37/3/3/0"));
+
+    const RoundTrip same = round_trip(old_d, old_d);
+    CHECK(same.mismatches.empty());
+    CHECK(logged(same, "postcode_centroids.bin: unchanged"));
+    CHECK(logged(same, "postcode_centroid_cells.bin: unchanged (copied"));
+    CHECK(!logged(same, "encode postcodes:"));
+}
+
+// The moved postcode's string fixups take 2 bytes each. Under a limit of 2
 // (--string-fixup-bytes-max, lower for tests) it round-trips; under 1 the
 // diff refuses it, and no patch is written: a merge section's header gives
 // its fixups' size as a u32, which fixups past the real limit would wrap,

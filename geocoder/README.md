@@ -163,7 +163,7 @@ to the same files ([builder/PATCHING.md](builder/PATCHING.md#transport-units)).
 | `arc_index.bin`, `arc_vertices.bin` | The boundary arcs those rings share, each border once (per boundary tier: `quality/simplified` or `quality/exact`) |
 | `admin_parents.bin` | Per admin polygon: the next larger polygon containing it |
 | `place_cells.bin`, `place_nodes.bin`, `place_hidden.bin` | Place nodes (city, town, village, suburb, ...): the visible ones in admin cell order, bit-packed in blocks of 64, with each cell's first row; the ones a boundary hides (its label for place search) beside them (`builder/src/place_files.h`) |
-| `postcode_centroids.bin`, `postcode_centroid_cells.bin`, `postcode_centroid_entries.bin` | Postcode centroids and their cell index (a list per cell) |
+| `postcode_centroids.bin`, `postcode_centroid_cells.bin` | Postcode centroids in admin cell order, Rice-coded steps in blocks of 32 with a box per block (PCC1, `builder/src/postcode_files.h`), and each admin cell's rows of them |
 | `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin` | Points of interest and their cell index (a list per cell) |
 | `strings_core.bin`, `strings_street.bin`, `strings_addr.bin`, `strings_postcode.bin`, `strings_poi.bin` | Deduplicated string pool, in five tiers so each variant ships only the strings it uses; each tier front-coded in buckets cut by content (FCC2, `builder/src/string_files.h`), a string's id still its offset in the tier's pool |
 | `strings_layout.json` | Start and end of each string tier, which place every string offset |

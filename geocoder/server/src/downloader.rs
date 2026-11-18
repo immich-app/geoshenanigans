@@ -1064,7 +1064,7 @@ mod tests {
 
         let paths = resolve_files(&bucket.manifest, &s).unwrap().paths;
         let units: BTreeSet<&str> = paths.iter().filter_map(|p| bucket.manifest.files[p].unit.as_deref()).collect();
-        assert_eq!(units, BTreeSet::from(["europe/admin/places.tt.zst", "europe/admin/postcode_centroids.tt.zst", "europe/poi/major/pois.tt.zst",
+        assert_eq!(units, BTreeSet::from(["europe/admin/places.tt.zst", "europe/poi/major/pois.tt.zst",
                                           "europe/quality/simplified/admin_polygons.tt.zst", "europe/quality/simplified/arcs.tt.zst"]));
         let plain = paths.iter().filter(|p| bucket.manifest.files[*p].unit.is_none()).count();
         assert_eq!(bucket.files_served(), plain + units.len());
@@ -1101,7 +1101,7 @@ mod tests {
     async fn a_unit_with_one_bad_byte_fails_its_download_and_leaves_none_of_its_files() {
         let s = sel("europe", "admin", "simplified", "none");
         for (unit, at_end, why) in [
-            ("europe/admin/postcode_centroids.tt.zst", true, "postcode_centroids.bin's sha256 is "),
+            ("europe/quality/simplified/admin_polygons.tt.zst", true, "admin_polygons.bin's sha256 is "),
             ("europe/admin/places.tt.zst", false, "a unit of transport version "),
         ] {
             let bucket = test_bucket::serve_tampered(test_bucket::template_components(), |path, bytes| {

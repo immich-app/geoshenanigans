@@ -9,11 +9,11 @@ builds/
     configurations.json                    # build metadata + axes/components/files/units + sha256s
     checksums.sha256                       # on-wire hashes (*.zst, *.gcpatch, *.json)
     planet/
-      full/            *.bin.zst + places.tt.zst + postcode_centroids.tt.zst
-                       + street_ways.tt.zst + interp_ways.tt.zst + addr_index.tt.zst
+      full/            *.bin.zst + places.tt.zst + street_ways.tt.zst
+                       + interp_ways.tt.zst + addr_index.tt.zst
                        + strings_layout.json(.zst) + patch.gcpatch
-      no-addresses/    ... (places, postcode_centroids, street_ways units)
-      admin/           ... (places, postcode_centroids units)
+      no-addresses/    ... (places, street_ways units)
+      admin/           ... (places unit)
       admin-minimal/   ... (places, arcs, admin_polygons units)
       admin-minimal-poi/ ...
       quality/
@@ -46,9 +46,9 @@ A complete geocoder index for a given region and configuration consists of files
 
 | Mode | Files | Description |
 |------|-------|-------------|
-| `full/` | 23 files (+4 optional) | Streets + addresses + interpolation + admin + postcodes |
-| `no-addresses/` | 16 files (+3 optional) | Streets + admin + postcodes (no address points) |
-| `admin/` | 8 files (+3 optional) | Admin cell indexes + place nodes + postcodes |
+| `full/` | 23 files (+3 optional) | Streets + addresses + interpolation + admin + postcodes |
+| `no-addresses/` | 16 files (+2 optional) | Streets + admin + postcodes (no address points) |
+| `admin/` | 8 files (+2 optional) | Admin cell indexes + place nodes + postcodes |
 | `admin-minimal/` | 11 files | Admin levels 2-8 + place nodes, with its own polygons over the minimal arc set, simplified to within 37.5 m on an 11 m grid (a ring that grid would collapse keeps the 1.1 m one; takes the place of the quality dir, so pick simplified), and only the core strings its records name. For POI tier `none` |
 | `admin-minimal-poi/` | 11 files | The same, on the shared polygon slots and core strings that a POI tier's parent polygons and names point into (a dropped polygon's slot holds a tombstone), with the same arc files. The admin-minimal mode's dir beside a POI tier |
 
@@ -99,7 +99,6 @@ has the format). Every dir holding all of a unit's files publishes the unit as
 | `places.tt.zst` | `place_cells.bin`, `place_nodes.bin`, `place_hidden.bin` | `full/`, `no-addresses/`, `admin/`, `admin-minimal/`, `admin-minimal-poi/` |
 | `pois.tt.zst` | `poi_records.bin`, `poi_vertices.bin` | `poi/*/` |
 | `arcs.tt.zst` | `arc_index.bin`, `arc_vertices.bin` | `quality/*/`, `admin-minimal/`, `admin-minimal-poi/` |
-| `postcode_centroids.tt.zst` | `postcode_centroids.bin` | `full/`, `no-addresses/`, `admin/` (where the region has postcodes) |
 | `admin_polygons.tt.zst` | `admin_polygons.bin` | `quality/*/`, `admin-minimal/`, `admin-minimal-poi/` |
 | `street_ways.tt.zst` | `street_ways.bin` | `full/`, `no-addresses/` |
 | `interp_ways.tt.zst` | `interp_ways.bin` | `full/` |

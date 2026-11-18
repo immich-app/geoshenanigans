@@ -373,6 +373,217 @@ TEST(a_varint_is_read_only_in_its_fewest_bytes) {
     CHECK(!whole_varint({0x80}, VARINT_MAX_BYTES, v));
 }
 
+namespace {
+
+bool has_dec4_key(uint32_t bits) {
+    int32_t key;
+    return dec4_key(bits, key);
+}
+
+int32_t dec4_key_of(uint32_t bits) {
+    int32_t key = 0;
+    REQUIRE(dec4_key(bits, key));
+    return key;
+}
+
+using Codes = std::vector<std::pair<uint32_t, uint32_t>>;  // z, k
+
+// The codes a bit at a time, LSB first: q zero bits, a one bit and k bits
+// of z, or RICE_ESCAPE zero bits and z in 32 bits.
+std::vector<uint8_t> rice_bit_by_bit(const Codes& codes) {
+    Fields fields;
+    for (const auto& [z, k] : codes) {
+        const uint32_t q = z >> k;
+        if (q >= RICE_ESCAPE) {
+            for (uint32_t i = 0; i < RICE_ESCAPE; i++) fields.push_back({0, 1});
+            fields.push_back({z, 32});
+            continue;
+        }
+        for (uint32_t i = 0; i < q; i++) fields.push_back({0, 1});
+        fields.push_back({1, 1});
+        fields.push_back({k ? z & ((1u << k) - 1) : 0, k});
+    }
+    return packed_bit_by_bit(fields);
+}
+
+// The codes through put_rice, in a buffer with the 8 spare bytes it asks for.
+std::vector<uint8_t> rice_packed(const Codes& codes) {
+    uint64_t bits = 0;
+    for (const auto& [z, k] : codes) bits += rice_bits(z, k);
+    std::vector<uint8_t> buf((bits + 7) / 8 + 8, 0);
+    uint64_t bit = 0;
+    for (const auto& [z, k] : codes) put_rice(buf.data(), bit, z, k);
+    CHECK_EQ(bit, bits);
+    buf.resize(buf.size() - 8);
+    return buf;
+}
+
+// The least k of the fewest bits, each k tried.
+uint32_t best_rice_k_by_trial(const std::vector<uint32_t>& z) {
+    uint64_t best = UINT64_MAX;
+    uint32_t best_k = 0;
+    for (uint32_t k = 0; k < 32; k++) {
+        uint64_t total = 0;
+        for (uint32_t v : z) total += rice_bits(v, k);
+        if (total < best) best = total, best_k = k;
+    }
+    return best_k;
+}
+
+}  // namespace
+
+// A coordinate of four decimals is its digits: each multiple of 1e-4 up to
+// 180 in magnitude is one float's key, and that float's round.
+TEST(every_four_decimal_coordinate_to_180_is_one_floats_decimal_key) {
+    size_t bad = 0;
+    uint32_t last = from_dec4_key(-1800001);
+    for (int32_t key = -1800000; key <= 1800000; key++) {
+        const uint32_t bits = from_dec4_key(key);
+        int32_t back = ~key;
+        bad += !(dec4_key(bits, back) && back == key && dec4_round(bits) == key);
+        // Ascending as floats, so a step between neighbours is a small number.
+        bad += !(order_key(bits) > order_key(last));
+        last = bits;
+    }
+    CHECK_EQ(bad, size_t(0));
+    CHECK_EQ(dec4_key_of(bits_of(52.3702f)), 523702);
+    CHECK_EQ(dec4_key_of(bits_of(-0.1278f)), -1278);
+    CHECK_EQ(dec4_key_of(bits_of(180.0f)), 1800000);
+    CHECK_EQ(dec4_key_of(bits_of(-180.0f)), -1800000);
+    CHECK_EQ(dec4_key_of(bits_of(1e-4f)), 1);
+    CHECK_EQ(dec4_key_of(bits_of(-1e-4f)), -1);
+    CHECK_EQ(dec4_key_of(bits_of(0.0f)), 0);
+}
+
+TEST(a_float_that_is_no_four_decimal_coordinate_has_no_decimal_key) {
+    // A coordinate's neighbours one float off, -0 (its key would be +0's),
+    // the non-finite floats and a float nearer no multiple of 1e-4.
+    for (float v : {52.3702f, -0.1278f, 1e-4f, 180.0f}) {
+        CHECK(!has_dec4_key(bits_of(v) + 1));
+        CHECK(!has_dec4_key(bits_of(v) - 1));
+    }
+    CHECK(!has_dec4_key(bits_of(-0.0f)));
+    CHECK_EQ(dec4_round(bits_of(-0.0f)), 0);
+    CHECK(!has_dec4_key(bits_of(std::numeric_limits<float>::infinity())));
+    CHECK(!has_dec4_key(bits_of(-std::numeric_limits<float>::infinity())));
+    CHECK(!has_dec4_key(0x7FC00000u));
+    CHECK(!has_dec4_key(bits_of(0.00005f)));
+    CHECK(!has_dec4_key(bits_of(52.37025f)));
+    // Halves of 1e-4 round to even: 0.03125 is 312.5 units, 0.09375 937.5.
+    CHECK(!has_dec4_key(bits_of(0.03125f)));
+    CHECK_EQ(dec4_round(bits_of(0.03125f)), 312);
+    CHECK_EQ(dec4_round(bits_of(-0.03125f)), -312);
+    CHECK_EQ(dec4_round(bits_of(0.09375f)), 938);
+    // Past 2^31 units there is no key, and the round saturates; a NaN's is 0.
+    CHECK(has_dec4_key(bits_of(214748.359375f)));
+    CHECK_EQ(dec4_key_of(bits_of(214748.359375f)), 2147483594);
+    CHECK(!has_dec4_key(bits_of(214748.375f)));
+    CHECK(!has_dec4_key(bits_of(-214748.375f)));
+    CHECK_EQ(dec4_round(bits_of(214748.375f)), INT32_MAX);
+    CHECK_EQ(dec4_round(bits_of(-1e30f)), INT32_MIN);
+    CHECK_EQ(dec4_round(bits_of(std::numeric_limits<float>::infinity())), INT32_MAX);
+    CHECK_EQ(dec4_round(0x7FC00000u), 0);
+    CHECK_EQ(dec4_round(0xFFC00000u), 0);
+    // Wherever a pattern has a key, the key is its round.
+    std::mt19937_64 rng(8);
+    size_t bad = 0, keys = 0;
+    for (int t = 0; t < 1000000; t++) {
+        const uint32_t bits = uint32_t(rng());
+        int32_t key;
+        if (!dec4_key(bits, key)) continue;
+        keys++;
+        bad += key != dec4_round(bits) || from_dec4_key(key) != bits;
+    }
+    CHECK_EQ(bad, size_t(0));
+    CHECK(keys > 0);
+}
+
+TEST(a_rice_code_is_q_zero_bits_a_one_and_k_bits_or_an_escape) {
+    CHECK_EQ(rice_bits(0, 0), 1u);
+    CHECK_EQ(rice_bits(11, 0), 12u);
+    CHECK_EQ(rice_bits(12, 0), RICE_ESCAPE + 32);
+    CHECK_EQ(rice_bits(11u << 5 | 31, 5), 11u + 1 + 5);
+    CHECK_EQ(rice_bits(12u << 5, 5), RICE_ESCAPE + 32);
+    CHECK_EQ(rice_bits(0xFFFFFFFFu, 31), 1u + 1 + 31);
+    CHECK_EQ(rice_bits(0xFFFFFFFFu, 0), RICE_ESCAPE + 32);
+    CHECK(rice_packed({{0, 0}}) == std::vector<uint8_t>{0x01});
+    CHECK(rice_packed({{3, 0}}) == std::vector<uint8_t>{0x08});
+    CHECK(rice_packed({{5, 1}}) == std::vector<uint8_t>{0x0C});
+    // An escape: 12 zero bits, then z.
+    CHECK(rice_packed({{12, 0}}) == (std::vector<uint8_t>{0x00, 0xC0, 0x00, 0x00, 0x00, 0x00}));
+    std::mt19937_64 rng(9);
+    for (int t = 0; t < 3000; t++) {
+        Codes codes;
+        const size_t n = rng() % 80;
+        for (size_t i = 0; i < n; i++) {
+            const uint32_t k = uint32_t(rng() % 32);
+            const uint32_t shift = uint32_t(rng() % 33);
+            const uint32_t z = shift == 32 ? 0 : uint32_t(rng()) >> shift;
+            codes.push_back({z, k});
+        }
+        const std::vector<uint8_t> want = rice_bit_by_bit(codes);
+        CHECK(rice_packed(codes) == want);
+        std::vector<uint8_t> roomy = want;
+        roomy.resize(want.size() + 8, 0xFF);
+        uint64_t bit = 0;
+        size_t bad = 0;
+        for (const auto& [z, k] : codes) {
+            const uint64_t at = bit;
+            bad += get_rice(roomy.data(), bit, k) != z || bit - at != rice_bits(z, k);
+        }
+        CHECK_EQ(bad, size_t(0));
+    }
+}
+
+TEST(a_rice_escape_at_the_end_of_a_stream_reads_its_32_bits_from_the_spare_bytes) {
+    // Three bits of a code, then an escape whose z ends the stream: its load
+    // starts at the stream's first byte and takes 47 bits.
+    const Codes codes = {{2, 1}, {0xFEDCBA98u, 3}};
+    std::vector<uint8_t> bytes = rice_packed(codes);
+    REQUIRE(bytes.size() == 6);
+    bytes.resize(bytes.size() + 8, 0);
+    uint64_t bit = 0;
+    CHECK_EQ(get_rice(bytes.data(), bit, 1), 2u);
+    CHECK_EQ(get_rice(bytes.data(), bit, 3), 0xFEDCBA98u);
+    CHECK_EQ(bit, uint64_t(3 + RICE_ESCAPE + 32));
+    // An escape from bit 7 of a byte, after seven bits of something else: one
+    // load at that byte holds its 44 bits.
+    std::vector<uint8_t> late(7 + 8, 0);
+    late[0] = 0x7F;
+    uint64_t at = 7;
+    put_rice(late.data(), at, 0xFFFFFFFFu, 0);
+    uint64_t from = 7;
+    CHECK_EQ(get_rice(late.data(), from, 0), 0xFFFFFFFFu);
+    CHECK_EQ(from, at);
+}
+
+TEST(the_best_rice_parameter_is_the_least_of_the_fewest_bits) {
+    CHECK_EQ(best_rice_k(nullptr, 0), 0u);
+    const uint32_t zeros[] = {0, 0, 0};
+    CHECK_EQ(best_rice_k(zeros, 3), 0u);
+    const uint32_t big[] = {0xFFFFFFFFu};
+    CHECK_EQ(best_rice_k(big, 1), 31u);
+    // 12 at k = 0 is an escape (44 bits); k = 2 codes it in 6, k = 3 in 5.
+    const uint32_t twelve[] = {12};
+    CHECK_EQ(best_rice_k(twelve, 1), 3u);
+    // {2, 3} take 6 bits at k = 1 and at k = 2: the least k.
+    const uint32_t tie[] = {2, 3};
+    CHECK_EQ(rice_bits(2, 1) + rice_bits(3, 1), rice_bits(2, 2) + rice_bits(3, 2));
+    CHECK_EQ(best_rice_k(tie, 2), 1u);
+    std::mt19937_64 rng(10);
+    size_t bad = 0;
+    for (int t = 0; t < 20000; t++) {
+        std::vector<uint32_t> z(rng() % 64);
+        const uint32_t typical = uint32_t(rng() % 33);
+        for (uint32_t& v : z) {
+            const uint32_t w = rng() % 8 == 0 ? uint32_t(rng() % 33) : typical;
+            v = w == 0 ? 0 : uint32_t(rng()) >> (32 - w);
+        }
+        bad += best_rice_k(z.data(), z.size()) != best_rice_k_by_trial(z);
+    }
+    CHECK_EQ(bad, size_t(0));
+}
+
 TEST(coord_keys_are_the_shared_vectors_byte_for_byte) {
     // geocoder/testdata/coord_keys.tsv, which the server's functions are checked against too.
     std::ifstream in(std::string(GEOCODER_TESTDATA_DIR) + "/coord_keys.tsv");
@@ -438,6 +649,38 @@ TEST(coord_keys_are_the_shared_vectors_byte_for_byte) {
             size_t at = 0;
             uint64_t got;
             CHECK(!get_varint(bytes.data(), bytes.size(), at, std::stoul(want), got));
+        } else if (kind == "dec4") {
+            const uint32_t bits = hex32(given);
+            int32_t key = 0;
+            const bool has = dec4_key(bits, key);
+            CHECK_EQ((has ? std::to_string(key) : "-") + "," + std::to_string(dec4_round(bits)), want);
+            const std::vector<std::string> keys = split(want, ',');
+            REQUIRE(keys.size() == 2);
+            if (keys[0] != "-") CHECK_EQ(from_dec4_key(int32_t(std::stol(keys[0]))), bits);
+        } else if (kind == "undec4") {
+            // A key of any i32 decodes to some pattern.
+            CHECK_EQ(hex(from_dec4_key(int32_t(std::stol(given)))), want);
+        } else if (kind == "rice") {
+            Codes codes;
+            for (const std::string& c : split(given, ',')) {
+                const std::vector<std::string> zk = split(c, ':');
+                REQUIRE(zk.size() == 2);
+                codes.push_back({hex32(zk[0]), uint32_t(std::stoul(zk[1]))});
+            }
+            CHECK_EQ(hex(rice_packed(codes)), want);
+            std::vector<uint8_t> bytes = bytes_of(want);
+            bytes.resize(bytes.size() + 8, 0);
+            uint64_t bit = 0;
+            for (const auto& [z, k] : codes) CHECK_EQ(get_rice(bytes.data(), bit, k), z);
+            CHECK(padding_is_zero(bytes.data(), bit));
+        } else if (kind == "ricek") {
+            std::vector<uint32_t> z;
+            if (given != "-")
+                for (const std::string& v : split(given, ',')) z.push_back(hex32(v));
+            const uint32_t k = best_rice_k(z.data(), z.size());
+            uint64_t total = 0;
+            for (uint32_t v : z) total += rice_bits(v, k);
+            CHECK_EQ(std::to_string(k) + "," + std::to_string(total), want);
         } else {
             CHECK(kind == "a kind this test reads");
         }
@@ -450,4 +693,8 @@ TEST(coord_keys_are_the_shared_vectors_byte_for_byte) {
     CHECK(rows["bits"] >= 16);
     CHECK(rows["varint"] >= 20);
     CHECK(rows["novarint"] >= 8);
+    CHECK(rows["dec4"] >= 60);
+    CHECK(rows["undec4"] >= 8);
+    CHECK(rows["rice"] >= 16);
+    CHECK(rows["ricek"] >= 12);
 }

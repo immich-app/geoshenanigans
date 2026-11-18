@@ -1490,20 +1490,6 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
         // read the records and the pool.
         timed_phase("    planet: poi names in record order", [&] { order_poi_strings_by_record(data); });
     }
-    // Expose the prev-output root to write_index via env var so the
-    // postcode_centroids strategy-2 pass (which runs inside write_index after
-    // centroids materialize, and so doesn't get prev_dir as a parameter) can
-    // locate <prev_root>/<region>/full/postcode_centroids.osm_ids. Set ONCE
-    // here, single-threaded, before any writer thread can call getenv —
-    // setenv/unsetenv from inside concurrent write_region calls was unsafe.
-    // The value is the same for every region, so it stays set for the whole
-    // write phase.
-    if (!prev_output_dir.empty()) {
-        setenv("GC_PREV_OUTPUT_ROOT", prev_output_dir.c_str(), 1);
-    } else {
-        unsetenv("GC_PREV_OUTPUT_ROOT");
-    }
-
 #ifdef __GLIBC__
     // The earlier phases' freed blocks sit in the malloc arenas; handed back,
     // they leave the write phase and the page cache room.
