@@ -239,19 +239,31 @@ pub struct Expected {
 ///
 /// The decode makes a dir of its own in `dir` (a hidden name, which no member has and no other
 /// decode takes) and writes the members there; then it moves them into place one by one, the
-/// file each one replaces moved into its dir first, and once all are in it removes those files
-/// and its dir. Besides those it touches only the dirs that decodes into `dir` which stopped
-/// before they could clean up (their process killed, say) left: on unix a decode holds a shared
-/// lock on `dir` while it runs, and one that finds no other decode holding it first removes those
-/// dirs. Nothing else: a `<member>.tmp` there, say, stays as it is.
+/// file each one replaces moved into its dir first, and once all are in it marks its dir so
+/// (INSTALLED) and removes those files and its dir.
 ///
-/// On an error `dir` is as it was: the members moved in so far are taken out again, the files
-/// they replaced put back, and nothing of the decode is left. A member's path that is a directory
-/// is an error.
+/// Besides those it touches only what decodes into `dir` that stopped before they could clean up
+/// (their process killed, say) left. On unix a decode holds a shared lock on `dir` while it runs,
+/// and one that finds no other decode holding it first finishes each of those decodes, by its
+/// dir (finish_leftover): one that had put all its members in place loses the files they
+/// replaced, and its dir; one that had not is undone, each file it replaced put back in its
+/// place, over the member that went in or where it had left none, and its dir removed. A member
+/// such a decode put in place that replaced no file stays: it is complete, and checked as that
+/// decode checks its members. A dir that can't be read, or holding a file that can't go back (a
+/// directory in its place, say), stays, as do the files still in it, for a later decode to
+/// finish. None is finished while another decode runs in `dir`, on a file system without locks,
+/// or on platforms other than unix. Nothing else: a `<member>.tmp` there, say, stays as it is.
+///
+/// On an error `dir` is as it was once leftovers were finished: the members moved in so far are
+/// taken out again, the files they replaced put back, and nothing of the decode is left (put_back
+/// tells what it couldn't undo). A member's path that is a directory is an error, as is, on unix,
+/// a `dir` the decode can't open to lock, or a lock that fails but on a file system without
+/// locks.
 ///
 /// Decodes of a unit into one dir at once each put complete, checked members in place, the last
 /// to move a member in winning; one that fails while another is putting its members in may undo
-/// some of that one's.
+/// some of that one's. One killed while others run in the dir is finished only once none does:
+/// undone then, it puts back the files it replaced over any member a decode put in place since.
 ///
 /// A unit's members lie in `dir` beside the files they replace for a while: it needs their size
 /// free there.
@@ -299,8 +311,9 @@ fn at(path: &Path, e: io::Error) -> io::Error {
 static STAGINGS: AtomicU64 = AtomicU64::new(0);
 
 /// The dir of a decode into a dir, in that dir: it holds the members as they decode (and a place
-/// unit's block table), then the files they replace while they go in place. Dropped, it removes
-/// the members it still holds, then itself if empty, and only then lets go of its hold on the dir.
+/// unit's block table), then the files they replace while they go in place, and INSTALLED once
+/// all are in until those files are gone. Dropped, it removes the members it still holds, then
+/// itself if empty, and only then lets go of its hold on the dir.
 struct Staging {
     path: PathBuf,
     /// The members' files made in it.
@@ -310,28 +323,29 @@ struct Staging {
 }
 
 /// A decode's shared lock on the dir it decodes into, held from before its own dir is made until
-/// after that is removed (none where the lock can't be had).
+/// after that is removed (none on a file system without locks).
 struct Hold {
     _lock: Option<File>,
 }
 
-/// Takes a hold on `dir`; if no other decode holds one, first removes the dirs of decodes that
-/// stopped without removing theirs: with every live decode holding its lock, those are all the
-/// decodes' dirs in `dir`. A dir that can't be opened gets no hold (making the decode's dir
-/// there then fails), nor one on a file system without locks, where no decode can tell another's
-/// dir from a leftover and none is removed.
+/// Takes a hold on `dir`; if no other decode holds one, first finishes what the decodes that
+/// stopped without removing their dirs left (finish_leftovers): with every live decode holding
+/// its lock, those are all the decodes' dirs in `dir`. A dir that can't be opened is an error. On
+/// a file system without locks the decode goes without a hold, and finishes none: there no decode
+/// can tell another's dir from a leftover.
 #[cfg(unix)]
 fn hold(dir: &Path) -> io::Result<Hold> {
-    let Ok(lock) = File::open(dir) else { return Ok(Hold { _lock: None }) };
+    let lock = File::open(dir).map_err(|e| at(dir, e))?;
     match lock.try_lock() {
         Ok(()) => {
-            remove_leftovers(dir);
+            finish_leftovers(dir);
             lock.unlock().map_err(|e| at(dir, e))?;
         }
         Err(std::fs::TryLockError::WouldBlock) => {}
-        Err(std::fs::TryLockError::Error(_)) => return Ok(Hold { _lock: None }),
+        Err(std::fs::TryLockError::Error(e)) if no_locks_here(&e) => return Ok(Hold { _lock: None }),
+        Err(std::fs::TryLockError::Error(e)) => return Err(at(dir, e)),
     }
-    // Waits while another decode removes leftovers; the dir this one makes comes after.
+    // Waits while another decode finishes leftovers; the dir this one makes comes after.
     lock.lock_shared().map_err(|e| at(dir, e))?;
     Ok(Hold { _lock: Some(lock) })
 }
@@ -341,23 +355,63 @@ fn hold(_dir: &Path) -> io::Result<Hold> {
     Ok(Hold { _lock: None })
 }
 
-/// Whether `name` is a decode's dir's: `.transport.<pid>.<n>`.
+/// Whether `e`, an error taking a lock, says the file system has no locks.
+#[cfg(unix)]
+fn no_locks_here(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::Unsupported || e.raw_os_error() == Some(libc::ENOLCK)
+}
+
+/// Whether `name` is a decode's dir's, `.transport.<pid>.<n>`, as Staging::new_in writes it:
+/// both numbers in decimal, without a sign or leading zeros.
 #[cfg(unix)]
 fn is_staging_name(name: &std::ffi::OsStr) -> bool {
     let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(".transport.")) else { return false };
     let Some((pid, n)) = rest.split_once('.') else { return false };
-    pid.parse::<u32>().is_ok() && n.parse::<u64>().is_ok()
+    pid.parse::<u32>().is_ok_and(|p| p.to_string() == pid) && n.parse::<u64>().is_ok_and(|v| v.to_string() == n)
 }
 
-/// Removes every decode's dir in `dir`, with what it holds; what can't be read or removed stays.
+/// The empty file a decode's dir holds once all its members are in place, until the files they
+/// replaced are removed: a hidden name, which no member has.
+const INSTALLED: &str = ".installed";
+
+/// Finishes what each decode into `dir` that stopped before it could clean up left: its dir
+/// (finish_leftover); what can't be read stays.
 #[cfg(unix)]
-fn remove_leftovers(dir: &Path) {
+fn finish_leftovers(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         if is_staging_name(&e.file_name()) && e.file_type().is_ok_and(|t| t.is_dir()) {
-            let _ = std::fs::remove_dir_all(e.path());
+            let _ = finish_leftover(dir, &e.path());
         }
     }
+}
+
+/// Finishes the decode into `dir` whose dir is `leftover`. If all its members went in (it holds
+/// INSTALLED), the files they replaced are stale and go. If not, it is undone as put_back would
+/// have: each file it replaced goes back to its place in `dir`, over the member that went in or
+/// into the place left empty; a member that replaced no file stays, complete and checked. Then
+/// the dir goes, with what else it holds. An error reading it, or a file that can't go
+/// back, keeps the dir, and the files still in it, for a later decode to finish.
+#[cfg(unix)]
+fn finish_leftover(dir: &Path, leftover: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let installed = match std::fs::symlink_metadata(leftover.join(INSTALLED)) {
+        Ok(_) => true,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(e) => return Err(e),
+    };
+    let entries = std::fs::read_dir(leftover)?.collect::<io::Result<Vec<_>>>()?;
+    let mut kept = Ok(());
+    for e in entries {
+        let name = e.file_name();
+        let Some(name) = name.as_bytes().strip_prefix(b".earlier.") else { continue };
+        let gone = if installed { std::fs::remove_file(e.path()) } else { std::fs::rename(e.path(), dir.join(std::ffi::OsStr::from_bytes(name))) };
+        if gone.is_err() {
+            kept = gone;
+        }
+    }
+    kept?;
+    std::fs::remove_dir_all(leftover)
 }
 
 /// A member moved into place (once `installed`), the file it replaced moved to `earlier`.
@@ -391,8 +445,9 @@ impl Staging {
     }
 
     /// Moves `members`, all decoded here, into place in `dir`, in order, the file each replaces
-    /// moved here first; once all are in, removes those files. On an error puts back what it
-    /// moved.
+    /// moved here first; once all are in, puts INSTALLED here, so that a decode that finds this
+    /// dir left behind knows those files are stale, then removes them, and INSTALLED once they
+    /// are gone. On an error, INSTALLED not yet made, puts back what it moved.
     fn put_in_place(&self, dir: &Path, members: &[Member]) -> io::Result<()> {
         let mut moved = Vec::with_capacity(members.len());
         for m in members {
@@ -400,8 +455,16 @@ impl Staging {
                 return Err(put_back(moved, e));
             }
         }
+        let installed = self.path.join(INSTALLED);
+        if let Err(e) = File::create(&installed) {
+            return Err(put_back(moved, at(&installed, e)));
+        }
+        let mut removed = true;
         for earlier in moved.iter().filter_map(|m| m.earlier.as_ref()) {
-            let _ = std::fs::remove_file(earlier);
+            removed &= std::fs::remove_file(earlier).is_ok();
+        }
+        if removed {
+            let _ = std::fs::remove_file(&installed);
         }
         Ok(())
     }
@@ -434,14 +497,15 @@ impl Staging {
 }
 
 /// Undoes `moved`, the last first, after the error `e`: each replaced file back in its place,
-/// a member that replaced none removed. Returns `e`, naming what it couldn't undo (a replaced
-/// file it couldn't put back stays in the decode's dir, which then stays too, until a later
-/// decode into the dir removes it).
+/// a member that replaced none removed. Returns `e`, naming what it couldn't undo. A replaced
+/// file it couldn't put back stays in the decode's dir, which then stays too; on unix a later
+/// decode into the dir puts it back (finish_leftover).
 fn put_back(moved: Vec<Moved>, e: io::Error) -> io::Error {
+    let later = if cfg!(unix) { ", for a later decode into the dir to put back" } else { "" };
     let mut left = Vec::new();
     for m in moved.into_iter().rev() {
         let undone = match (&m.earlier, m.installed) {
-            (Some(earlier), _) => std::fs::rename(earlier, &m.dest).map_err(|re| format!("the file {} replaced stays at {}: {re}", m.dest.display(), earlier.display())),
+            (Some(earlier), _) => std::fs::rename(earlier, &m.dest).map_err(|re| format!("the file {} replaced stays at {}{later}: {re}", m.dest.display(), earlier.display())),
             (None, true) => std::fs::remove_file(&m.dest).map_err(|re| format!("{}, this decode's, stays: {re}", m.dest.display())),
             (None, false) => Ok(()),
         };

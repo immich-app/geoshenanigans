@@ -129,10 +129,25 @@ and one chunk of the unit's columns (1 MiB, more only for a single polygon or
 arc larger than that).
 
 A decode that stops before it can clean up (its process killed, the machine
-off) leaves its dir behind. On unix every decode holds a shared lock on the
-dataset dir while it runs, and one that starts while no other holds it first
-removes the `.transport.<pid>.<n>` dirs there, so such a dir lasts until the
-next decode into the dataset dir.
+off) leaves its dir behind, perhaps part way through moving files into place.
+On unix every decode holds a shared lock on the dataset dir while it runs, and
+one that starts while no other holds it first finishes each
+`.transport.<pid>.<n>` dir there. A decode puts an empty `.installed` in its
+dir once all its files are in place, before it removes the ones they replaced:
+a dir holding it is removed, with those files, and the decode's files stay. A
+dir without it is undone: each file the decode replaced (`.earlier.<name>` in
+the dir) goes back to `<name>` in the dataset dir, over the decode's file or
+where there is none, then the dir is removed. A file the decode moved in that
+replaced none stays, complete and checked as any decoded file is. A dir that
+can't be read, or holding a file that can't go back (a directory in its
+place, say), stays with what is still in it, for a later decode to try again;
+so does the dir of a decode that failed and couldn't put back a file it
+replaced (its error names the file). No dir is finished while another decode
+runs in the dataset dir, on a file system without locks (where decodes take
+none), or on platforms other than unix; there they stay until removed by hand.
+A decode killed while others ran in the dataset dir is finished only once none
+runs: undone then, it puts back the files it replaced over any file a decode
+put in place since.
 
 ## latest.json
 

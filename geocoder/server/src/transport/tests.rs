@@ -1213,23 +1213,127 @@ const LOOKALIKES: &[(&str, &[u8])] = &[
     (".transport.1/x", b"x"),
     (".transport.1.2.3/x", b"x"),
     (".transport.-1.2/x", b"x"),
+    (".transport.01.2/x", b"x"),
+    (".transport.+1.2/x", b"x"),
+    (".transport.1.02/x", b"x"),
     ("transport.1.2/x", b"x"),
     (".transport.5.6", b"a file, not a dir"),
 ];
 
+#[cfg(unix)]
 #[test]
 fn a_decode_removes_the_dirs_of_decodes_that_stopped_before_cleaning_up() {
     let (unit, members, dir) = published_places();
     let (_, _, clean) = published_places();
     put_tree(dir.path(), LOOKALIKES);
-    put_tree(clean.path(), LOOKALIKES);
     put_tree(dir.path(), LEFTOVERS);
     std::fs::create_dir(dir.path().join(".transport.1.7")).unwrap();
 
     decode_into_dir(&unit[..], dir.path(), Some(&expected(&members))).unwrap();
     decode_into_dir(&unit[..], clean.path(), Some(&expected(&members))).unwrap();
 
+    put_tree(clean.path(), LOOKALIKES);
     assert_eq!(tree(dir.path()), tree(clean.path()));
+}
+
+/// A pois unit's members, as an older build's files.
+const OLDER_POIS: &[(&str, &[u8])] = &[("poi_records.bin", b"an older build's records"), ("poi_vertices.bin", b"an older build's vertices")];
+
+#[cfg(unix)]
+#[test]
+fn a_decode_finishes_what_a_decode_killed_while_putting_its_members_in_left() {
+    // A decode of a pois unit into the dir, killed while it put its members in place, the files
+    // they replace those of OLDER_POIS: what it left, and what is there once a decode of a places
+    // unit into the dir has run, beside the places unit's members.
+    let cases: [(&str, &[(&str, &[u8])], &[(&str, &[u8])]); 4] = [
+        (
+            "killed between moving a file away and moving its member in: the file goes back",
+            &[
+                (".transport.9.0/.earlier.poi_records.bin", b"an older build's records"),
+                (".transport.9.0/poi_records.bin", b"a member"),
+                (".transport.9.0/poi_vertices.bin", b"a member"),
+                ("poi_vertices.bin", b"an older build's vertices"),
+            ],
+            OLDER_POIS,
+        ),
+        (
+            "killed once a member went in over a file: the file goes back over it",
+            &[(".transport.9.0/.earlier.poi_records.bin", b"an older build's records"), ("poi_records.bin", b"a member"), (".transport.9.0/poi_vertices.bin", b"a member"), ("poi_vertices.bin", b"an older build's vertices")],
+            OLDER_POIS,
+        ),
+        (
+            "killed once all its members were in: they stay, the files they replaced go",
+            &[(".transport.9.0/.installed", b""), (".transport.9.0/.earlier.poi_records.bin", b"an older build's records"), ("poi_records.bin", b"a member"), ("poi_vertices.bin", b"a member")],
+            &[("poi_records.bin", b"a member"), ("poi_vertices.bin", b"a member")],
+        ),
+        (
+            "a file that can't go back, a directory in its place: the dir stays, holding it",
+            &[
+                (".transport.9.0/.earlier.poi_records.bin", b"an older build's records"),
+                (".transport.9.0/.earlier.poi_vertices.bin", b"an older build's vertices"),
+                ("poi_records.bin/inside", b"a file of the dir's"),
+                ("poi_vertices.bin", b"a member"),
+            ],
+            &[(".transport.9.0/.earlier.poi_records.bin", b"an older build's records"), ("poi_records.bin/inside", b"a file of the dir's"), ("poi_vertices.bin", b"an older build's vertices")],
+        ),
+    ];
+    for (case, left, after) in cases {
+        let (unit, members, dir) = published_places();
+        let (_, _, want) = published_places();
+        put_tree(dir.path(), left);
+
+        decode_into_dir(&unit[..], dir.path(), Some(&expected(&members))).unwrap();
+        decode_into_dir(&unit[..], want.path(), Some(&expected(&members))).unwrap();
+
+        put_tree(want.path(), after);
+        assert_eq!(tree(dir.path()), tree(want.path()), "{case}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dir_the_decode_cant_open_fails_the_decode() {
+    // Of mode 0o300 a decode could make its dir in it and move files in and out, but can't open
+    // it to take a lock. Root opens any dir: run as root, the dir is nobody's and the decode runs
+    // on a thread whose file system uid is nobody's, which takes root's power over modes away.
+    use std::os::unix::fs::PermissionsExt;
+    const NOBODY: u32 = 65534;
+    let (unit, members, dir) = published_places();
+    let expect = expected(&members);
+    let before = dir_files(dir.path());
+    let as_root = unsafe { libc::geteuid() } == 0;
+    if as_root {
+        std::os::unix::fs::chown(dir.path(), Some(NOBODY), None).unwrap();
+    }
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o300)).unwrap();
+
+    let got = std::thread::scope(|s| {
+        s.spawn(|| {
+            if as_root {
+                // Returns the uid it had: the second call tells the first took.
+                unsafe { libc::syscall(libc::SYS_setfsuid, NOBODY) };
+                assert_eq!(unsafe { libc::syscall(libc::SYS_setfsuid, NOBODY) }, NOBODY as libc::c_long);
+            }
+            decode_into_dir(&unit[..], dir.path(), Some(&expect)).map(|_| ()).map_err(|e| e.to_string())
+        })
+        .join()
+        .unwrap()
+    });
+
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(got, Err(format!("{}: Permission denied (os error 13)", dir.path().display())));
+    assert_eq!(dir_files(dir.path()), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_decode_goes_without_a_lock_only_where_the_file_system_has_none() {
+    // The errors taking the lock that hold() lets a decode go on after; any other fails it.
+    assert!(no_locks_here(&io::Error::from(io::ErrorKind::Unsupported)));
+    assert!(no_locks_here(&io::Error::from_raw_os_error(libc::ENOLCK)));
+    for code in [libc::EBADF, libc::EINTR, libc::EINVAL, libc::EIO, libc::EACCES, libc::ENOMEM] {
+        assert!(!no_locks_here(&io::Error::from_raw_os_error(code)), "{}", io::Error::from_raw_os_error(code));
+    }
 }
 
 #[test]
@@ -1266,10 +1370,15 @@ fn a_decode_leaves_the_dirs_of_decodes_still_running() {
 
     decode_into_dir(&unit[..], path, Some(expect)).unwrap();
 
-    assert!(decodes_dirs().is_empty());
-    let mut want: Vec<(String, Vec<u8>)> = members.iter().map(|(n, b)| (n.to_string(), b.clone())).collect();
+    if cfg!(unix) {
+        assert!(decodes_dirs().is_empty());
+    } else {
+        // No decode takes a lock there, so none can tell a leftover from a running decode's dir.
+        assert_eq!(decodes_dirs(), [".transport.1.8", ".transport.4000000.0"]);
+    }
+    let mut want: Vec<(String, Option<Vec<u8>>)> = members.iter().map(|(n, b)| (n.to_string(), Some(b.clone()))).collect();
     want.sort();
-    assert_eq!(dir_files(path), want);
+    assert_eq!(tree(path).into_iter().filter(|(rel, _)| !rel.starts_with(".transport.")).collect::<Vec<_>>(), want);
 }
 
 #[test]
