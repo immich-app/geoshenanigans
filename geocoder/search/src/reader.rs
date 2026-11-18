@@ -454,24 +454,36 @@ mod tests {
         for (b, r) in [(&one, r1), (&two, r2)] {
             assert_eq!((b[r] >> 6, b[r - 1]), (0b10, 0x11));
         }
+        // Each case's bytes, whether its open may refuse them (for a root no build writes), and a
+        // key it holds no value for.
         let cases = [
-            ("a root past the end", with(&places, places.len() - 12, &(places.len() as u64).to_le_bytes())),
-            ("a transition to before the file", with(&one, r1 - 2, &[0xFF])),
-            ("transition addresses of 9 bytes", with(&one, r1 - 1, &[0x91])),
-            ("outputs past 64 bits", with(&two, r2 - 3, &[0xFF])),
-            ("a transition to its own node", a_loop()),
+            ("a root past the end", with(&places, places.len() - 12, &(places.len() as u64).to_le_bytes()), true, None),
+            ("a transition to before the file", with(&one, r1 - 2, &[0xFF]), false, Some("alpha")),
+            ("transition addresses of 9 bytes", with(&one, r1 - 1, &[0x91]), true, None),
+            ("outputs past 64 bits", with(&two, r2 - 3, &[0xFF]), false, Some("ab")),
+            ("a transition to its own node", a_loop(), false, Some("a")),
         ];
         let mut failed = Vec::new();
-        for (case, bytes) in cases {
+        for (case, bytes, refusable, none) in cases {
             std::fs::write(out.join("places.fst"), bytes).unwrap();
             let found = panic_of(|| {
-                let Ok(idx) = SearchIndex::open(&geo, &out, None, None) else { return };
+                let idx = match SearchIndex::open(&geo, &out, None, None) {
+                    Ok(idx) => idx,
+                    Err(_) if refusable => return Ok(()),
+                    Err(e) => return Err(format!("refused at open: {e}")),
+                };
+                if let Some(v) = none.and_then(|k| idx.places.map.get(k)) {
+                    return Err(format!("{none:?} reads as {v}"));
+                }
                 for q in ["alpha", "a", "ab", "al", "alp", "alpah", "alpha hill", "testville", "alpha, testland", "ab, testland"] {
                     Searcher::new(&idx).search(q, 5);
                 }
+                Ok(())
             });
-            if let Err(p) = found {
-                failed.push(format!("{case}: {p}"));
+            match found {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => failed.push(format!("{case}: {e}")),
+                Err(p) => failed.push(format!("{case}: {p}")),
             }
         }
         assert!(failed.is_empty(), "{failed:#?}");
@@ -572,39 +584,43 @@ mod tests {
         let n = geo.place_node_count() + geo.admin_polygon_count();
         // One list under the prefixes "al" and "ol": hits of entities 1, `entity` and 2 (each of
         // both sub-indexes).
+        let hit = |entity: u32| PrefixHit { entity, partial: false, text: 1.0, imp_q: 250, class: 0, ord: 0 };
         let list = |entity: u32| {
-            let hit = |entity: u32| PrefixHit { entity, partial: false, text: 1.0, imp_q: 250, class: 0, ord: 0 };
             let mut b = Vec::new();
             encode_prefix_hits(&mut b, &[hit(1), hit(entity), hit(2)]);
             b
         };
+        // That list of Charlie's node (4) second, cut short one byte before the end of its hit:
+        // its count says three hits still.
+        let mut cut = list(4);
+        let mut two = Vec::new();
+        encode_prefix_hits(&mut two, &[hit(1), hit(4)]);
+        cut.truncate(two.len() - 1);
+        // Each case's sub-index, its list, and the entity no result is of.
         let cases = [
-            ("poi", "a POI past the records", 5),
-            ("poi", "a POI far past the records", 1 << 30),
-            ("places", "a POI in the places sub-index", POI_BIT | 7),
-            ("places", "a place past the boundaries", n + 3),
-            ("places", "a list cut short", u32::MAX),
+            ("poi", "a POI past the records", list(5), 5),
+            ("poi", "a POI far past the records", list(1 << 30), 1 << 30),
+            ("places", "a POI in the places sub-index", list(POI_BIT | 7), POI_BIT | 7),
+            ("places", "a place past the boundaries", list(n + 3), n + 3),
+            ("places", "a list cut short", cut, 4),
         ];
         let mut failed = Vec::new();
-        for (sub, case, entity) in cases {
+        for (sub, case, bytes, entity) in cases {
             let [keys, pfx] = [format!("{sub}.pfx.fst"), format!("{sub}.pfx")].map(|f| (std::fs::read(out.join(&f)).unwrap(), f));
-            let bytes = if entity == u32::MAX { pfx.0[..pfx.0.len() / 2].to_vec() } else { list(entity) };
-            if entity != u32::MAX {
-                std::fs::write(out.join(&keys.1), fst_of(&[("al", 0), ("ol", 0)])).unwrap();
-            }
+            std::fs::write(out.join(&keys.1), fst_of(&[("al", 0), ("ol", 0)])).unwrap();
             std::fs::write(out.join(&pfx.1), bytes).unwrap();
             let found = panic_of(|| {
                 let idx = SearchIndex::open(&geo, &out, None, None).unwrap();
                 let hits = idx.sub((sub == "poi") as u8).prefix_hits("al").map(|h| h.iter().map(|h| h.entity).collect::<Vec<_>>());
                 (hits, ["a", "al", "ol", "o", "t", "te", "alpha", "old mill"].map(|q| Searcher::new(&idx).search(q, 5).0.iter().map(|f| f.hit.entity).collect::<Vec<_>>()))
             });
-            // The entity as a result would carry it; the list's hits read up to it.
+            // The entity as a result would carry it; the list's hits read up to it, the first alone.
             let tag = if sub == "poi" { POI_BIT } else { 0 };
             let bad = entity | tag;
             match found {
                 Err(p) => failed.push(format!("{case}: {p}")),
                 Ok((_, found)) if found.iter().flatten().any(|&e| e == bad) => failed.push(format!("{case}: {found:?}")),
-                Ok((hits, _)) if entity != u32::MAX && hits.as_deref() != Some(&[1 | tag][..]) => failed.push(format!("{case}: hits {hits:?}")),
+                Ok((hits, _)) if hits.as_deref() != Some(&[1 | tag][..]) => failed.push(format!("{case}: hits {hits:?}")),
                 Ok(_) => {}
             }
             for (bytes, f) in [keys, pfx] {
