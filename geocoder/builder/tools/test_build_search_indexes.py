@@ -232,6 +232,15 @@ class TestPortalTest(unittest.TestCase):
         self.assertEqual(self.portal_files({}), self.portal_files(envs["0"]))
         self.assertEqual(self.portal_files({"MINIMAL": "1"}), self.portal_files(envs["1"]))
 
+    # A server downloads only a build of the version whose files it reads: the template's.
+    def test_the_build_version_it_downloads_is_the_templates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run = subprocess.run(["sh", os.path.join(PORTAL, "entrypoint.sh"), "--build-version"],
+                                 env={"PATH": tmp, "DATA_DIR": tmp}, capture_output=True, text=True,
+                                 executable="/bin/sh", timeout=60)
+        self.assertEqual(run.returncode, 0, run.stderr)
+        self.assertEqual(run.stdout.strip(), str(load_template()["build"]["version"]))
+
     def unit_of(self, name):
         """The transport unit entrypoint.sh --unit-of fetches a file through, or ""."""
         with tempfile.TemporaryDirectory() as tmp:

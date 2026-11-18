@@ -2,8 +2,10 @@
 # Tests entrypoint.sh's index cache: a server starts on the dataset it finds
 # only when that is a finished download of the selection it serves, and
 # otherwise downloads the whole selection afresh, the files of a transport
-# unit through the unit. curl, geocoder-transport and query-server are
-# stubbed out; a directory stands in for the bucket.
+# unit through the unit, beside the dataset it replaces once the download is
+# whole, and only from a build of the build version the server reads. curl,
+# geocoder-transport and query-server are stubbed out; a directory stands in
+# for the bucket.
 #
 #   geocoder/test-portal/entrypoint.test.sh
 set -euo pipefail
@@ -80,13 +82,22 @@ unit_of() {
   env DATA_DIR="$work/unused" sh "$entrypoint" --unit-of "$1"
 }
 
+# The build version of the files the server reads.
+version=$(env DATA_DIR="$work/unused" sh "$entrypoint" --build-version)
+
+# latest_json <build version>: the bucket's latest.json, naming $build as a
+# build of that version.
+latest_json() {
+  printf '{\n  "build_version": %s,\n  "latest": "%s"\n}\n' "$1" "$build"
+}
+
 # The build: every file of each selection the cases run, 1 KiB, its first line
 # naming its build and path. The bucket publishes each plain, but those a
 # transport unit holds, which go in the unit (a tar of them, as the stub reads).
 files="$work/files"
 bucket="$work/bucket"
 mkdir -p "$bucket"
-printf '{\n  "latest": "%s"\n}\n' "$build" > "$bucket/latest.json"
+latest_json "$version" > "$bucket/latest.json"
 { list; list QUALITY=exact; list MINIMAL=1; } | sort -u | while read -r dir f; do
   mkdir -p "$files/$dir" "$bucket/$build/planet/$dir"
   { echo "$build $dir/$f"; head -c 1024 /dev/zero; } > "$files/$dir/$f"
@@ -110,6 +121,15 @@ bucket_without() {
   local copy="$work/bucket-$RANDOM"
   cp -r "$bucket" "$copy"
   rm "$copy/$build/planet/$1"
+  echo "$copy"
+}
+
+# bucket_of_version <build version>: a copy of the bucket whose latest.json
+# names its build as one of that version.
+bucket_of_version() {
+  local copy="$work/bucket-$RANDOM"
+  cp -r "$bucket" "$copy"
+  latest_json "$1" > "$copy/latest.json"
   echo "$copy"
 }
 
@@ -148,6 +168,12 @@ holds() {
 
 served() { [ "$status" = 0 ] && [ "$(tail -n1 "$work/out")" = "query-server $1/index 0.0.0.0:3000" ]; }
 fetched() { grep -q '/latest.json$' "$CURL_LOG"; }
+# snapshot <data dir>: each file of <data dir>/index (the marker and accounts
+# among them) and its md5sum.
+snapshot() { (cd "$1/index" && find . -type f -exec md5sum {} + | sort -k2); }
+# unstaged <data dir>: whether <data dir> holds nothing but the index, no
+# download left beside it.
+unstaged() { [ -z "$(ls -A "$1" | grep -vx index)" ]; }
 
 # check <name> <condition...>: reports the case; on failure, the entrypoint's output.
 check() {
@@ -179,6 +205,7 @@ check "a fresh volume serves it" served "$d"
 check "a unit is fetched once for all its files" test "$(grep -c '/planet/full/places\.tt\.zst$' "$CURL_LOG")" = 1
 check "a unit's files are fetched only through it" eval '! grep -q "/place_.*\.bin" "$CURL_LOG"'
 check "each unit is decoded into the index" test "$(wc -l < "$TRANSPORT_LOG")" = "$(list | while read -r dir f; do unit_of "$f"; done | sort -u | grep -c .)"
+check "a fresh volume's download leaves nothing beside the index" unstaged "$d"
 
 # A finished download of the selection is served as it is.
 d="$work/finished"
@@ -272,9 +299,62 @@ check "a broken-off required unit is named" grep -q 'failed: .*/planet/quality/s
 check "a broken-off required file is named" grep -q 'failed: .*/planet/full/geo_cells.bin$' "$work/out"
 check "a broken-off fetch leaves none of its files" eval '! ls -A "$d/index" | grep -E "^(postcode_centroids|arc_index|arc_vertices|geo_cells)\.bin|\.tt\.zst$"'
 check "a broken-off download leaves no marker" test ! -e "$d/index/.selection"
+check "a broken-off download leaves nothing beside the index" unstaged "$d"
 start "$d"
 check "a broken-off download is downloaded afresh next time" holds "$d"
 check "a broken-off download: the server starts" served "$d"
+
+# A download that fails leaves the dataset it was to replace as it was, its
+# marker too: the selection comes beside it and replaces it only once whole.
+d="$work/kept"
+finished "$d"
+before=$(snapshot "$d")
+BUCKET=$(bucket_without quality/exact/arcs.tt.zst)
+start "$d" QUALITY=exact
+check "a failed download of another selection fails the start" test "$status" != 0
+check "a failed download leaves the dataset it was to replace" test "$(snapshot "$d")" = "$before"
+check "a failed download leaves nothing beside the index" unstaged "$d"
+BUCKET=$bucket
+start "$d" QUALITY=exact
+check "the next start replaces the dataset" holds "$d" QUALITY=exact
+
+# A cache of an older build (build 23's selection, with its
+# postcode_centroid_entries.bin) while latest.json still names a build of
+# that version: the start says so and fails, and the cache stays as it was,
+# its marker too, for a server of that version to take or this one once a
+# build it reads is out.
+d="$work/older-build"
+mkdir -p "$d/index"
+{ list; echo "full postcode_centroid_entries.bin"; } | while read -r dir f; do
+  { echo "build 23 $dir/$f"; head -c 2048 /dev/zero; } > "$d/index/$f"
+done
+list | sed '/^full postcode_centroid_cells.bin$/a full postcode_centroid_entries.bin' > "$d/index/.selection"
+echo '{"users":{"kept":{}}}' > "$d/index/geocoder.json"
+before=$(snapshot "$d")
+BUCKET=$(bucket_of_version 23)
+start "$d"
+check "a build of another version fails the start" test "$status" != 0
+check "a build of another version is named with this server's" grep -q "build_version 23; this server reads build_version $version" "$work/out"
+check "a build of another version leaves the older cache as it was" test "$(snapshot "$d")" = "$before"
+check "a build of another version: nothing is fetched but latest.json" test "$(grep -vc '/latest.json$' "$CURL_LOG")" = 0
+BUCKET=$bucket
+start "$d"
+check "a build of this version replaces the older cache" holds "$d"
+check "a build of this version keeps the accounts" grep -q kept "$d/index/geocoder.json"
+
+# On a fresh volume too, and a latest.json without a build version.
+d="$work/older-build-fresh"
+BUCKET=$(bucket_of_version 23)
+start "$d"
+check "a fresh volume refuses a build of another version" test "$status" != 0
+check "a fresh volume fetches nothing of it" test "$(grep -vc '/latest.json$' "$CURL_LOG")" = 0
+check "a fresh volume is left without a dataset" test ! -e "$d/index/.selection"
+BUCKET=$(bucket_of_version 23)
+printf '{\n  "latest": "%s"\n}\n' "$build" > "$BUCKET/latest.json"
+start "$d"
+check "a latest.json without a build version fails the start" test "$status" != 0
+check "a latest.json without a build version is named" grep -q "build_version none; this server reads build_version $version" "$work/out"
+BUCKET=$bucket
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures failure(s)"

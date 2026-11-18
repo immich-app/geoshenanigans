@@ -17,6 +17,10 @@ POI_TIER="${POI_TIER:-all}"
 # Smallest possible deployable that resolves admin hierarchy + GeoNames
 # cities500-equivalent detail.
 MINIMAL="${MINIMAL:-0}"
+# The build version of the files this server reads, the build.version of
+# configurations.template.json (builder/tools/test_build_search_indexes.py
+# holds it to that).
+BUILD_VERSION=24
 
 # The planet files this server downloads, one "<dir> <file>" a line: those
 # of the template's selection (mode full or admin-minimal, $QUALITY,
@@ -80,10 +84,14 @@ if [ "${1:-}" = "--unit-of" ]; then
     unit_of "$2"
     exit 0
 fi
+if [ "${1:-}" = "--build-version" ]; then
+    echo "$BUILD_VERSION"
+    exit 0
+fi
 
 # Files in S3 are zstd-compressed with .zst suffix, but those a transport
 # unit holds (fetch_unit).  Helper fetches either the .zst (preferred) or
-# plain version, decompresses if needed.
+# plain version to <dest>, decompresses if needed.
 # A file the build lacks (404 for both) is a miss; any other failure, a
 # transfer that broke off among them, fails the fetch and leaves nothing.
 fetch() {
@@ -102,14 +110,14 @@ fetch() {
     return 1
 }
 
-# A transport unit, into $INDEX_DIR: fetched whole to <tmp>, then decoded into
-# its files with geocoder-transport (all of them or, failing, none). A unit the
+# A transport unit, into <dir>: fetched whole to <tmp>, then decoded into its
+# files with geocoder-transport (all of them or, failing, none). A unit the
 # build lacks (404) is a miss, as a file is; any other failure fails the fetch
 # and leaves none of its files.
 fetch_unit() {
-    src_path="$1"; tmp="$2"; code=
+    src_path="$1"; tmp="$2"; into="$3"; code=
     if code=$(curl -fsSL -w '%{http_code}' "$src_path" -o "$tmp" 2>/dev/null) \
-            && geocoder-transport decode "$tmp" "$INDEX_DIR" > /dev/null; then
+            && geocoder-transport decode "$tmp" "$into" > /dev/null; then
         rm -f "$tmp"
         return
     fi
@@ -134,12 +142,16 @@ optional_file() {
 
 # A finished download leaves the "<dir> <file>" lines of its selection here.
 MARKER="$INDEX_DIR/.selection"
+# A download goes here, beside the index, whose files it replaces once it is
+# whole.
+STAGING="$DATA_DIR/.index-download"
 
-# The selection's files missing from $INDEX_DIR that a region can't lack,
-# one a line.
+# The selection's files missing from <dir> ($INDEX_DIR by default) that a
+# region can't lack, one a line.
 missing_files() {
+    in="${1:-$INDEX_DIR}"
     selection_files | while read -r dir f; do
-        optional_file "$f" || [ -f "$INDEX_DIR/$f" ] || echo "$dir/$f"
+        optional_file "$f" || [ -f "$in/$f" ] || echo "$dir/$f"
     done
 }
 
@@ -158,28 +170,35 @@ if dataset_complete; then
     echo "Index data found at $INDEX_DIR (delete to force re-download)"
 else
     # Download the whole selection afresh, never into what is there: its
-    # cells and strings may be another build's. Only the accounts stay.
-    mkdir -p "$INDEX_DIR"
-    if find "$INDEX_DIR" -mindepth 1 -maxdepth 1 ! -name geocoder.json | grep -q .; then
-        echo "Index data at $INDEX_DIR is not a finished download of this selection — removing it"
-        rm -f "$MARKER"
-        find "$INDEX_DIR" -mindepth 1 -maxdepth 1 ! -name geocoder.json -exec rm -rf {} +
-    fi
-    echo "Downloading index data from Tigris (quality=$QUALITY, poi=$POI_TIER, minimal=$MINIMAL)..."
+    # cells and strings may be another build's. What is there stays until
+    # the download is whole, and only the accounts stay after it.
+    echo "No finished download of this selection at $INDEX_DIR: downloading it (quality=$QUALITY, poi=$POI_TIER, minimal=$MINIMAL)..."
 
     LATEST_JSON=$(curl -sL "$TIGRIS_BASE/latest.json")
     # latest.json is multi-line pretty-printed JSON; flatten with tr
-    # before extracting "latest":"..." with sed.
-    LATEST=$(printf '%s' "$LATEST_JSON" | tr -d '\n\r' | sed 's/.*"latest"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
-    if [ -z "$LATEST" ] || [ "$LATEST" = "$LATEST_JSON" ]; then
+    # before extracting "latest":"..." and "build_version":N with sed.
+    FLAT=$(printf '%s' "$LATEST_JSON" | tr -d '\n\r')
+    LATEST=$(printf '%s' "$FLAT" | sed 's/.*"latest"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
+    if [ -z "$LATEST" ] || [ "$LATEST" = "$FLAT" ]; then
         echo "Error: could not parse latest.json"; echo "$LATEST_JSON"; exit 1
+    fi
+    # A build of another version holds files this server can't read: the
+    # index stays as it is, for a server of that version, or for this one
+    # once a build of its version is out.
+    LATEST_VERSION=$(printf '%s' "$FLAT" | sed -n 's/.*"build_version"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')
+    if [ "$LATEST_VERSION" != "$BUILD_VERSION" ]; then
+        echo "Error: the latest build ($LATEST) is of build_version ${LATEST_VERSION:-none}; this server reads build_version $BUILD_VERSION."
+        echo "The index at $INDEX_DIR is left as it is."
+        exit 1
     fi
     echo "Latest build: $LATEST"
     BASE="$TIGRIS_BASE/$LATEST"
+    rm -rf "$STAGING"
+    mkdir -p "$STAGING"
 
     # An optional file a region lacks (interp_postcodes.bin outside TIGER
     # regions, the postcode centroids) is a miss, not an error. A fetch that
-    # failed fails the start before the marker vouches for the download. The
+    # failed fails the start before the download replaces anything. The
     # files a transport unit holds come through it, once.
     if ! selection_files | {
         pids=; units=
@@ -187,12 +206,12 @@ else
             unit=$(unit_of "$f")
             if [ -z "$unit" ]; then
                 echo "  $dir/$f"
-                fetch "$BASE/planet/$dir/$f" "$INDEX_DIR/$f" &
+                fetch "$BASE/planet/$dir/$f" "$STAGING/$f" &
             else
                 case " $units " in *" $dir/$unit "*) continue ;; esac
                 units="$units $dir/$unit"
                 echo "  $dir/$unit"
-                fetch_unit "$BASE/planet/$dir/$unit" "$INDEX_DIR/.$unit" &
+                fetch_unit "$BASE/planet/$dir/$unit" "$STAGING/.$unit" "$STAGING" &
             fi
             pids="$pids $!"
         done
@@ -200,25 +219,37 @@ else
         for pid in $pids; do wait "$pid" || ok=; done
         [ -n "$ok" ]
     }; then
+        rm -rf "$STAGING"
         echo "Error: a file failed to download (named above); the next start downloads afresh"
         exit 1
     fi
 
     echo "Download complete."
-    MISSING=$(missing_files)
+    MISSING=$(missing_files "$STAGING")
     if [ -n "$MISSING" ]; then
+        rm -rf "$STAGING"
         echo "Error: the download lacks files the server needs:"
         echo "$MISSING"
         exit 1
     fi
-    SENTINEL_SIZE=$(stat -c%s "$INDEX_DIR/$SENTINEL" 2>/dev/null || echo 0)
+    SENTINEL_SIZE=$(stat -c%s "$STAGING/$SENTINEL" 2>/dev/null || echo 0)
     if [ "$SENTINEL_SIZE" -lt 1000 ]; then
+        rm -rf "$STAGING"
         echo "Error: $SENTINEL is only ${SENTINEL_SIZE} bytes — download likely failed"
         exit 1
     fi
     echo "Verified: $SENTINEL is $((SENTINEL_SIZE / 1024 / 1024)) MiB"
-    echo "Total index size: $(du -sh $INDEX_DIR | cut -f1)"
+
+    # The download replaces the index's files but the accounts. The marker
+    # goes first and comes back last, so a start cut short in between
+    # downloads afresh.
+    mkdir -p "$INDEX_DIR"
+    rm -f "$MARKER"
+    find "$INDEX_DIR" -mindepth 1 -maxdepth 1 ! -name geocoder.json -exec rm -rf {} +
+    find "$STAGING" -mindepth 1 -maxdepth 1 -exec mv {} "$INDEX_DIR"/ \;
+    rmdir "$STAGING"
     selection_files > "$MARKER"
+    echo "Total index size: $(du -sh "$INDEX_DIR" | cut -f1)"
 fi
 
 # Test auth config
