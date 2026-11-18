@@ -31,14 +31,12 @@ export function zxyToTileId(z: number, x: number, y: number): number {
 
   const acc = tileZoomValues[z];
   const n = 2 ** z;
-  let rx = 0;
-  let ry = 0;
   let d = 0;
   const xy = [x, y];
   let s = n / 2;
   while (s > 0) {
-    rx = (xy[0] & s) > 0 ? 1 : 0;
-    ry = (xy[1] & s) > 0 ? 1 : 0;
+    const rx = (xy[0] & s) > 0 ? 1 : 0;
+    const ry = (xy[1] & s) > 0 ? 1 : 0;
     d += s * s * ((3 * rx) ^ ry);
     rotate(s, xy, rx, ry);
     s = s / 2;
