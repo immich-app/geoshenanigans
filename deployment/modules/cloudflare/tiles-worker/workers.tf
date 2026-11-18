@@ -3,10 +3,13 @@ data "cloudflare_zone" "immich_cloud" {
 }
 
 locals {
+  # The Bunny unit's output is a number; "" before that unit has applied, and in dev, which doesn't read it.
+  bunny_pull_zone_id = try(tostring(data.terraform_remote_state.bunny_tiles[0].outputs.pull_zone_id), "")
   # Only prod reads Bunny's logs and probes: the Bunny account is production's, and a dev worker would read the same pull
   # zone's logs again and spend the Globalping quota twice. Whether a secret is set isn't itself secret.
-  bunny_log_reader = var.env == "prod" && nonsensitive(var.bunny_api_key != "") && var.bunny_pull_zone_id != ""
-  bunny_probe      = var.env == "prod" && nonsensitive(var.globalping_token != "") && var.bunny_public_url != ""
+  bunny_log_reader = (var.env == "prod" && nonsensitive(var.bunny_api_key != "")
+  && can(regex("^[0-9]+$", local.bunny_pull_zone_id)))
+  bunny_probe = var.env == "prod" && nonsensitive(var.globalping_token != "") && var.bunny_public_url != ""
 }
 
 resource "cloudflare_workers_script" "tiles" {
@@ -64,7 +67,7 @@ resource "cloudflare_workers_script" "tiles" {
   }
 
   dynamic "plain_text_binding" {
-    for_each = local.bunny_log_reader ? [var.bunny_pull_zone_id] : []
+    for_each = local.bunny_log_reader ? [local.bunny_pull_zone_id] : []
     content {
       name = "BUNNY_PULL_ZONE_ID"
       text = plain_text_binding.value

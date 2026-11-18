@@ -26,17 +26,12 @@ variable "tigris_read_key_id" {}
 variable "tigris_read_access_key" {}
 
 # Bunny CDN analytics in the worker's cron (tiles/src/bunny-logs), bound in prod only (see workers.tf). All optional:
-# without the account API key and the pull zone id the log reader is skipped, without the Globalping token and the
-# public URL the probe is.
+# without the account API key and the pull zone id (from the Bunny unit's state, remote-state.tf) the log reader is
+# skipped, without the Globalping token and the public URL the probe is.
 variable "bunny_api_key" {
   type      = string
   sensitive = true
   default   = ""
-}
-
-variable "bunny_pull_zone_id" {
-  type    = string
-  default = ""
 }
 
 variable "globalping_token" {

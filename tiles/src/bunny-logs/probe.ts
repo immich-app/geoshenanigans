@@ -6,6 +6,10 @@
  * The run waits for its own measurements (a few seconds, never much more than RESULT_DEADLINE_MS, against the 15 minutes
  * a cron run may take) instead of reading them on a later run: the worker has nowhere to keep a measurement id between
  * runs, as cron runs land on any machine and the worker has no KV or Durable Object.
+ *
+ * Samples are labelled by `continent` (the probe's), not the spec's `region`, which is an o11y identity label (see
+ * samples.ts), and by the `kind` the edge reported (CDN-Cache), so a hit tile a purge or a cold edge turned into a miss
+ * counts as a miss.
  */
 import { LogFields, O11yConfig, O11yLogger } from '../o11y';
 import { ProbeConfig } from './config';
@@ -154,31 +158,66 @@ function header(result: TestResult, name: string): string | undefined {
   return undefined;
 }
 
-/** A test's time to first byte, or undefined when it didn't get the tile (not finished, or not a 200). */
+/**
+ * A test's time to first byte, or undefined when it didn't get a tile a map can read: not finished, not a 200, or
+ * without Content-Encoding: gzip. The stored tiles are gzip bytes, so without the header (the gzip middleware detached,
+ * or an edge rule not yet everywhere) every client fails to decode them, while the probe would see a 200.
+ */
 export function testTtfb(result: TestResult | undefined): number | undefined {
   if (!result || result.status !== 'finished' || result.statusCode !== 200) {
+    return undefined;
+  }
+  if (header(result, 'content-encoding')?.trim().toLowerCase() !== 'gzip') {
     return undefined;
   }
   return finite(result.timings?.firstByte);
 }
 
 /**
- * The samples and log lines of a measurement's tests: a TTFB and a 0 for each test that got the tile, a 1 for the
- * others, except a probe that went offline before its test (it says nothing about the tiles).
+ * Whether a test's outcome says anything about the tiles: a finished test does, and a failed one unless Globalping puts
+ * the failure on the probe's DNS resolver or on Globalping itself (failureSource, "best-effort" in its API; `target`
+ * covers the target's DNS records and timeouts). An offline probe or a test still in progress at the deadline doesn't.
+ */
+export function testHasVerdict(result: TestResult | undefined): boolean {
+  if (result?.status === 'finished') {
+    return true;
+  }
+  return result?.status === 'failed' && result.failureSource !== 'resolver' && result.failureSource !== 'internal';
+}
+
+/**
+ * What a test measured: the edge's CDN-Cache when it sent one (HIT or STALE is a hit, anything else a miss), else the
+ * target's kind.
+ */
+export function measuredKind(target: Target, result: TestResult | undefined): ProbeKind {
+  const cache = result ? header(result, 'cdn-cache')?.trim().toUpperCase() : undefined;
+  if (!cache) {
+    return target.kind;
+  }
+  return cache === 'HIT' || cache === 'STALE' ? 'hit' : 'miss';
+}
+
+/**
+ * The samples and log lines of a measurement's tests: a TTFB and a 0 for each test that got the tile, a 1 for each
+ * other test with a verdict (testHasVerdict), and how many tests had one.
  */
 export function measurementSamples(
   target: Target,
   measurement: Measurement | undefined,
-): { samples: Sample[]; lines: LogFields[] } {
+): { samples: Sample[]; lines: LogFields[]; tests: number; verdicts: number } {
   const samples: Sample[] = [];
   const lines: LogFields[] = [];
-  for (const { probe, result } of measurement?.results ?? []) {
-    const labels = { continent: continentLabel(probe?.continent), kind: target.kind };
+  let verdicts = 0;
+  const results = measurement?.results ?? [];
+  for (const { probe, result } of results) {
+    const labels = { continent: continentLabel(probe?.continent), kind: measuredKind(target, result) };
     const ttfb = testTtfb(result);
     if (ttfb !== undefined) {
       samples.push({ name: 'tiles_bunny_probe_ttfb_ms', labels, value: ttfb });
     }
-    if (result?.status !== 'offline') {
+    const verdict = testHasVerdict(result);
+    if (verdict) {
+      verdicts++;
       samples.push({ name: 'tiles_bunny_probe_errors', labels, value: ttfb === undefined ? 1 : 0 });
     }
     lines.push({
@@ -196,9 +235,12 @@ export function measurementSamples(
       status: finite(result?.statusCode),
       ttfb_ms: ttfb,
       total_ms: finite(result?.timings?.total),
-      // Bunny's own view: the edge's cache status and the server (PoP) that answered.
+      // Bunny's own view: the edge's cache status and the server (PoP) that answered, and what a map needs to read it.
       cache: result ? header(result, 'cdn-cache') : undefined,
       server: result ? header(result, 'server') : undefined,
+      content_encoding: result ? header(result, 'content-encoding') : undefined,
+      content_type: result ? header(result, 'content-type') : undefined,
+      counted: verdict,
       // Why a test failed (a timeout, a TLS error, a body that isn't the gzip it claims to be); a finished test's raw
       // output is the whole response instead.
       ...(result?.status !== 'finished' && {
@@ -207,7 +249,7 @@ export function measurementSamples(
       }),
     });
   }
-  return { samples, lines };
+  return { samples, lines, tests: results.length, verdicts };
 }
 
 /**
@@ -266,6 +308,16 @@ export async function runProbe(
         });
       }
       const measured = measurementSamples(target, measurement);
+      if (settled(measurement) && measured.verdicts === 0) {
+        // Every test failed on Globalping's side or its probes went offline: nothing about the tiles was measured.
+        result = 'error';
+        logger.error('Globalping measurement has no test with a verdict', undefined, {
+          ...fields,
+          target: target.kind,
+          measurement_id: id,
+          tests: measured.tests,
+        });
+      }
       samples.push(...measured.samples);
       for (const line of measured.lines) {
         logger.info('Probe', { ...fields, ...line });
