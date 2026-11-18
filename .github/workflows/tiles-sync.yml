@@ -1,0 +1,401 @@
+name: Tiles Sync
+
+# Updates the Bunny storage zone behind tiles.immich.cloud in place from the newest Protomaps daily build: the sync
+# CLI (tiles/src/bunny/cli/sync.ts) diffs the build's manifest against the live one, uploads only the positions whose
+# tile changed, waits until every storage region has them, purges the pull zone once and then records the build as
+# live in the state zone. Every run's outcome and numbers go to FUTO o11y from the report job, whatever ended the run;
+# tiles-sync-watchdog.yml reports the live build's age independently (o11y/alerts/geoshenanigans-tiles.yaml).
+
+on:
+  schedule:
+    # Protomaps publishes around 09:05 UTC. Off the hour, as GitHub delays or drops top-of-hour schedule events
+    # under load. The afternoon run picks up a build published late and retries a failed morning; once the build
+    # is live it only skips.
+    - cron: '7 10 * * *'
+    - cron: '7 16 * * *'
+  workflow_dispatch:
+    inputs:
+      build:
+        description: 'Protomaps build to sync (YYYYMMDD), defaults to the newest; an older one rolls back'
+        required: false
+        type: string
+      dry_run:
+        description: 'Download, build the manifest and diff it, but change nothing on Bunny and report nothing to o11y'
+        required: false
+        default: false
+        type: boolean
+      force:
+        description: 'Sync even if the tiles schema version (major.minor) differs from the live build or more than 5% of positions changed'
+        required: false
+        default: false
+        type: boolean
+      runner:
+        # pokedex-huge: 24 cores for the manifest's hashing and 200 GiB of scratch; every pokedex size has 10 Gbps.
+        description: 'Runner for the download and sync (needs ~160 GiB of free disk)'
+        required: false
+        default: pokedex-huge
+        type: string
+
+permissions: {}
+
+# Two syncs must never write the zone at once; a run queues behind the one in flight.
+concurrency:
+  group: tiles-sync
+  cancel-in-progress: false
+
+env:
+  BUNNY_STORAGE_ZONE: immich-tiles
+  BUNNY_STATE_ZONE: immich-tiles-state
+  # The hostname the TileJSON points tiles at. A test hostname until the DNS cutover.
+  BUNNY_PUBLIC_URL: https://tiles.immich.cloud
+  # FUTO o11y's public gateway (geocoder-build.yml's O11Y_URL).
+  O11Y_URL: https://vmauth.futostatus.com
+
+jobs:
+  resolve:
+    name: Resolve build
+    runs-on: ubuntu-latest
+    # A sync writes production, so it runs main's code; a dry run may try a branch.
+    if: github.ref == 'refs/heads/main' || inputs.dry_run
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      action: ${{ steps.decide.outputs.action }}
+      status: ${{ steps.decide.outputs.status }}
+      key: ${{ steps.build.outputs.key }}
+      md5: ${{ steps.build.outputs.md5 }}
+      version: ${{ steps.build.outputs.version }}
+      osm_date: ${{ steps.build.outputs.osm_date }}
+      live: ${{ steps.live.outputs.live }}
+      live_version: ${{ steps.live.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: './tiles/.nvmrc'
+
+      - name: Install tiles dependencies
+        working-directory: ./tiles
+        run: npm ci
+
+      - name: Install 1Password CLI
+        uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
+
+      - name: Pick build
+        id: build
+        env:
+          REQUESTED: ${{ inputs.build }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 https://build-metadata.protomaps.dev/builds.json -o "$RUNNER_TEMP/builds.json"
+          if [ -z "$REQUESTED" ]; then
+            key=$(jq -r '[.[] | .key] | sort | last // empty | rtrimstr(".pmtiles")' "$RUNNER_TEMP/builds.json")
+          else
+            key=$REQUESTED
+          fi
+          if ! [[ "$key" =~ ^[0-9]{8}$ ]]; then
+            echo "::error::Build must be a YYYYMMDD key, got '$key'"
+            exit 1
+          fi
+          build=$(jq -c --arg name "$key.pmtiles" '[.[] | select(.key == $name)] | first // empty' "$RUNNER_TEMP/builds.json")
+          if [ -z "$build" ]; then
+            echo "::error::$key isn't in builds.json; protomaps only keeps recent builds"
+            exit 1
+          fi
+          md5=$(jq -r '.md5sum // empty' <<<"$build")
+          if ! [[ "$md5" =~ ^[A-Za-z0-9+/]{22}==$ ]]; then
+            echo "::error::builds.json has no MD5 for $key"
+            exit 1
+          fi
+          version=$(jq -r '.version // empty' <<<"$build")
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || version=""
+          # The OSM replication time is only in the archive's own metadata: two range requests.
+          osm_date=""
+          if info=$(python3 deployment/scripts/tiles_sync_report.py build-info --url "https://build.protomaps.com/$key.pmtiles"); then
+            osm_date=$(jq -r '.osmDate // empty' <<<"$info")
+            [[ "$osm_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+(Z|[+-][0-9:]+)$ ]] || osm_date=""
+          fi
+          if [ -z "$osm_date" ]; then
+            echo "::warning::Could not read the OSM replication time from $key's metadata; syncing without it"
+          fi
+          {
+            echo "key=$key"
+            echo "md5=$md5"
+            echo "version=$version"
+            echo "osm_date=$osm_date"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Read the live build
+        id: live
+        working-directory: ./tiles
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          BUNNY_STATE_PASSWORD: op://tf_prod/BUNNY_STATE_PASSWORD/password
+        run: |
+          set -euo pipefail
+          op run -- npm run --silent bunny:status -- --json > "$RUNNER_TEMP/live.json"
+          live=$(jq -r '.liveBuild // empty' "$RUNNER_TEMP/live.json" 2>/dev/null || true)
+          if ! [[ "$live" =~ ^[0-9]{8}$ ]]; then
+            echo "::error::bunny:status reported no live build: $(head -c 500 "$RUNNER_TEMP/live.json")"
+            exit 1
+          fi
+          # builds.json keeps about a week of daily builds and the first of each version.
+          version=$(jq -r --arg name "$live.pmtiles" '[.[] | select(.key == $name) | .version] | first // empty' \
+            "$RUNNER_TEMP/builds.json")
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || version=""
+          {
+            echo "live=$live"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      # A schema change may rewrite most tiles and goes in as a full rewrite under a new prefix (the plan's
+      # section 6), so the run stops before the 140 GB download. The diff's guard rail stops one this misses.
+      - name: Decide
+        id: decide
+        env:
+          KEY: ${{ steps.build.outputs.key }}
+          VERSION: ${{ steps.build.outputs.version }}
+          LIVE: ${{ steps.live.outputs.live }}
+          LIVE_VERSION: ${{ steps.live.outputs.version }}
+          REQUESTED: ${{ inputs.build }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          action=sync
+          status=""
+          if [ "$KEY" = "$LIVE" ]; then
+            action=skip
+            status=skipped
+            echo "::notice::$KEY is live already"
+          elif [ -z "$REQUESTED" ] && [[ "$KEY" < "$LIVE" ]]; then
+            action=skip
+            status=skipped
+            echo "::warning::The newest build in builds.json, $KEY, is older than the live $LIVE; a rollback needs the build input"
+          elif [ -z "$VERSION" ] || [ -z "$LIVE_VERSION" ]; then
+            echo "::warning::The schema version of $KEY ('$VERSION') or of the live $LIVE ('$LIVE_VERSION') is unknown; only the diff's guard rail applies"
+          elif [ "$(cut -d. -f1,2 <<<"$VERSION")" != "$(cut -d. -f1,2 <<<"$LIVE_VERSION")" ]; then
+            if [ "$FORCE" = true ]; then
+              echo "::warning::$KEY has tiles schema $VERSION and the live $LIVE has $LIVE_VERSION; syncing in place (force)"
+            else
+              action=stop
+              status=schema_changed
+              echo "::error::$KEY has tiles schema $VERSION but the live $LIVE has $LIVE_VERSION; a schema change needs a full rewrite under a new prefix, or a dispatch with force to sync it in place"
+            fi
+          fi
+          {
+            echo "action=$action"
+            echo "status=$status"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### Tiles sync: $KEY"
+            echo "- live now: $LIVE (tiles ${LIVE_VERSION:-unknown})"
+            echo "- build: $KEY (tiles ${VERSION:-unknown})"
+            echo "- action: $action${status:+ ($status)}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop on a schema change
+        if: steps.decide.outputs.action == 'stop'
+        run: exit 1
+
+  sync:
+    name: Sync ${{ needs.resolve.outputs.key }}
+    needs: resolve
+    if: needs.resolve.outputs.action == 'sync'
+    runs-on: ${{ inputs.runner || 'pokedex-huge' }}
+    # A day's sync: download ~10 min, manifest ~10, diff and upload a few, replication up to its 120 min timeout.
+    # The slack is for a diff near the guard rail, whose upload alone can take an hour or more.
+    timeout-minutes: 360
+    permissions:
+      contents: read
+    outputs:
+      started_at: ${{ steps.start.outputs.at }}
+      finished_at: ${{ steps.result.outputs.finished_at }}
+      download_seconds: ${{ steps.download.outputs.seconds }}
+      download_outcome: ${{ steps.result.outputs.download_outcome }}
+      report: ${{ steps.result.outputs.report }}
+    env:
+      KEY: ${{ needs.resolve.outputs.key }}
+    steps:
+      - name: Record the start
+        id: start
+        run: echo "at=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: token
+        uses: immich-app/devtools/actions/create-workflow-token@2760f037fd3707bb91b16e4c41dc62b8c512393e # create-workflow-token-action-v3.1.0
+        with:
+          client-id: ${{ secrets.PUSH_O_MATIC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PUSH_O_MATIC_APP_KEY }}
+          permission-contents: read
+
+      # rclone and the 1Password CLI.
+      - name: Setup Mise
+        uses: immich-app/devtools/actions/use-mise@caac7f7e4298458a14238959504f411fc6cc7f06 # use-mise-action-v3.2.3
+        with:
+          github_token: ${{ steps.token.outputs.token }}
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: './tiles/.nvmrc'
+
+      - name: Install tiles dependencies
+        working-directory: ./tiles
+        run: npm ci
+
+      - name: Download build
+        id: download
+        timeout-minutes: 60
+        env:
+          MD5: ${{ needs.resolve.outputs.md5 }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          dir="$RUNNER_TEMP/tiles"
+          mkdir -p "$dir"
+          archive="$dir/$KEY.pmtiles"
+          echo "ARCHIVE=$archive" >> "$GITHUB_ENV"
+          # The build (~130 GiB), the live and the new manifest, and headroom.
+          free_gib=$(df --output=avail -B1G "$dir" | tail -1 | tr -d ' ')
+          if [ "$free_gib" -lt 160 ]; then
+            echo "::error::$free_gib GiB free in $dir; a planet build needs ~130 GiB plus its manifests"
+            exit 1
+          fi
+          rclone copyto --http-url https://build.protomaps.com ":http:$KEY.pmtiles" "$archive" \
+            --multi-thread-streams 16 --multi-thread-cutoff 256M --stats 1m --stats-one-line
+          # builds.json has base64 md5 digests.
+          expected=$(base64 -d <<<"$MD5" | od -An -v -tx1 | tr -d ' \n')
+          actual=$(md5sum "$archive" | cut -d' ' -f1)
+          if [ "$expected" != "$actual" ]; then
+            echo "::error::md5 mismatch for $KEY.pmtiles: expected $expected, got $actual"
+            exit 1
+          fi
+          echo "seconds=$(($(date +%s) - start))" >> "$GITHUB_OUTPUT"
+
+      # Exit 3 is the guard rail: more positions changed than --max-changed-fraction allows, nothing uploaded. The
+      # CLI writes its report however it ends.
+      - name: Sync
+        id: sync
+        working-directory: ./tiles
+        timeout-minutes: 270
+        env:
+          # Manifests and other temporary files on the runner's scratch volume, beside the build.
+          TMPDIR: ${{ runner.temp }}
+          OSM_DATE: ${{ needs.resolve.outputs.osm_date }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          FORCE: ${{ inputs.force }}
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          BUNNY_STORAGE_PASSWORD: op://tf_prod/BUNNY_STORAGE_PASSWORD/password
+          BUNNY_STATE_PASSWORD: op://tf_prod/BUNNY_STATE_PASSWORD/password
+          BUNNY_API_KEY: op://tf_prod/BUNNY_API_KEY/password
+          BUNNY_PULL_ZONE_ID: op://tf_prod/BUNNY_PULL_ZONE_ID/password
+        run: |
+          set -euo pipefail
+          args=(--archive "$ARCHIVE" --build "$KEY" --replication-timeout-min 120 --report "$RUNNER_TEMP/report.json")
+          if [ -n "$OSM_DATE" ]; then
+            args+=(--osm-date "$OSM_DATE")
+          fi
+          if [ "$DRY_RUN" = true ]; then
+            args+=(--dry-run)
+          fi
+          if [ "$FORCE" = true ]; then
+            args+=(--max-changed-fraction 1)
+          fi
+          op run -- npm run bunny:sync -- "${args[@]}"
+
+      - name: Read the report
+        id: result
+        if: always()
+        env:
+          DOWNLOAD_OUTCOME: ${{ steps.download.outcome }}
+        run: |
+          set -uo pipefail
+          report=""
+          if [ -s "$RUNNER_TEMP/report.json" ]; then
+            report=$(jq -c 'select(type == "object")' "$RUNNER_TEMP/report.json" 2>/dev/null) || report=""
+          fi
+          {
+            echo "report=$report"
+            echo "download_outcome=$DOWNLOAD_OUTCOME"
+            echo "finished_at=$(date +%s)"
+          } >> "$GITHUB_OUTPUT"
+          if [ -z "$report" ]; then
+            echo "- no sync report" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          jq -r '"- status: \(.status)",
+            "- positions changed: \(.positionsChanged) of \(.positionsTotal) (\(.changedFraction))",
+            "- files uploaded: \(.filesUploaded), \(.bytesUploaded) bytes, \(.retries) retries, \(.rateLimited) rate limited",
+            "- replication complete: \(.replicationComplete), wait per region: \(.replicationWaitSeconds | tojson)",
+            "- step seconds: \(.stepSeconds | tojson)",
+            (if .error then "- error: \(.error)" else empty end)' <<<"$report" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove the build
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/tiles"
+
+  # Whatever ended the run, including a sync job whose runner died: its status is then failed, with the reason.
+  # Main's runs only (the schedule and dispatches from it), and never a dry run.
+  report:
+    name: Report to o11y
+    needs: [resolve, sync]
+    if: always() && github.ref == 'refs/heads/main' && !inputs.dry_run && needs.resolve.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A failed install doesn't fail the run: the report then warns and sends nothing.
+      - name: Install 1Password CLI
+        continue-on-error: true
+        uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
+
+      # Reporting never fails the run. The token is read here and handed to the report alone.
+      - name: Report the run
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          REPORT: ${{ needs.sync.outputs.report }}
+          BUILD: ${{ needs.resolve.outputs.key }}
+          LIVE: ${{ needs.resolve.outputs.live }}
+          VERSION: ${{ needs.resolve.outputs.version }}
+          LIVE_VERSION: ${{ needs.resolve.outputs.live_version }}
+          OSM_DATE: ${{ needs.resolve.outputs.osm_date }}
+          RESOLVED_STATUS: ${{ needs.resolve.outputs.status }}
+          RESOLVE_RESULT: ${{ needs.resolve.result }}
+          SYNC_RESULT: ${{ needs.sync.result }}
+          DOWNLOAD_OUTCOME: ${{ needs.sync.outputs.download_outcome }}
+          DOWNLOAD_SECONDS: ${{ needs.sync.outputs.download_seconds }}
+          STARTED_AT: ${{ needs.sync.outputs.started_at }}
+          FINISHED_AT: ${{ needs.sync.outputs.finished_at }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          printf '%s' "$REPORT" > "$RUNNER_TEMP/report.json"
+          if ! token=$(op read "op://tf_prod/O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD/password"); then
+            echo "::warning::Could not read the o11y token from 1Password; reporting nothing"
+            exit 0
+          fi
+          echo "::add-mask::$token"
+          O11Y_TOKEN="$token" python3 deployment/scripts/tiles_sync_report.py sync --base-url "$O11Y_URL" \
+            --report "$RUNNER_TEMP/report.json" --build "$BUILD" --live "$LIVE" \
+            --version "$VERSION" --live-version "$LIVE_VERSION" --osm-date "$OSM_DATE" \
+            --resolved-status "$RESOLVED_STATUS" --resolve-result "$RESOLVE_RESULT" --sync-result "$SYNC_RESULT" \
+            --download-outcome "$DOWNLOAD_OUTCOME" --download-seconds "$DOWNLOAD_SECONDS" \
+            --started-at "$STARTED_AT" --finished-at "$FINISHED_AT" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" --run-url "$RUN_URL" --trigger "$GITHUB_EVENT_NAME"
