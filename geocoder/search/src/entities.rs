@@ -283,36 +283,48 @@ impl<'a> Entities<'a> {
         }
     }
 
-    /// The kind and type of entity `e` (an area of no type for a boundary without a slot, of no
-    /// type for an entity whose record does not read).
-    pub fn kind_and_type(&self, e: u32) -> (Kind, Cow<'a, str>) {
+    /// The kind and type of entity `e`; None for one that is nowhere (`point`).
+    pub fn kind_and_type_of(&self, e: u32) -> Option<(Kind, Cow<'a, str>)> {
         if Self::is_poi(e) {
-            let Some(r) = poi_raw(self.geo, e & !POI_BIT) else { return (Kind::Poi, Cow::Borrowed("")) };
-            return (Kind::Poi, Cow::Owned(self.geo.poi_meta.category_name(r.category).to_string()));
+            let r = poi_raw(self.geo, e & !POI_BIT)?;
+            return Some((Kind::Poi, Cow::Owned(self.geo.poi_meta.category_name(r.category).to_string())));
         }
         if e < self.n_place_nodes {
-            let Some(p) = place_node_raw(self.geo, e) else { return (Kind::Place, Cow::Borrowed("")) };
+            let p = place_node_raw(self.geo, e)?;
             let t = PLACE_NODE_TYPES.get(p.place_type as usize).copied().unwrap_or("place");
-            return (place_node_kind(p.place_type), Cow::Borrowed(t));
+            return Some((place_node_kind(p.place_type), Cow::Borrowed(t)));
         }
-        let Some((s, ap)) = self.slot(e - self.n_place_nodes).and_then(|s| Some((s, polygon_raw(self.geo, s.poly)?))) else {
-            return (Kind::Area, Cow::Borrowed(""));
-        };
+        let (s, ap) = self.slot(e - self.n_place_nodes).and_then(|s| Some((s, polygon_raw(self.geo, s.poly)?)))?;
         // Typed as the build typed it for ranking (PlacesSource::fill): by its label node.
         let node = s.linked().then(|| place_node_raw(self.geo, s.node)).flatten();
-        (if s.linked() { Kind::Linked } else { Kind::Area }, boundary_type(&ap, node.as_ref()))
+        Some((if s.linked() { Kind::Linked } else { Kind::Area }, boundary_type(&ap, node.as_ref())))
     }
 
-    pub fn is_area(&self, e: u32) -> bool {
-        let (k, t) = self.kind_and_type(e);
-        k == Kind::Area || crate::constants::AREA_TYPES.contains(&t.as_ref())
+    /// The kind and type of entity `e` (`kind_and_type_of`), of no type for one that is nowhere:
+    /// a POI, a place, or an area for a boundary without a slot.
+    pub fn kind_and_type(&self, e: u32) -> (Kind, Cow<'a, str>) {
+        self.kind_and_type_of(e).unwrap_or_else(|| {
+            let k = if Self::is_poi(e) {
+                Kind::Poi
+            } else if e < self.n_place_nodes {
+                Kind::Place
+            } else {
+                Kind::Area
+            };
+            (k, Cow::Borrowed(""))
+        })
+    }
+
+    /// An area: of kind Area, or of an area type, by the kind and type of an entity.
+    pub fn is_area(k: Kind, t: &str) -> bool {
+        k == Kind::Area || crate::constants::AREA_TYPES.contains(&t)
     }
 
     /// A settlement: a visible place node of a settlement type (city, town, village, hamlet) or a
-    /// boundary a place node labels, of no area type; not a suburb-like node and not a POI.
-    pub fn is_settlement(&self, e: u32) -> bool {
-        let (k, t) = self.kind_and_type(e);
-        matches!(k, Kind::Place | Kind::Linked) && !crate::constants::AREA_TYPES.contains(&t.as_ref())
+    /// boundary a place node labels, of no area type; not a suburb-like node and not a POI. By
+    /// the kind and type of an entity.
+    pub fn is_settlement(k: Kind, t: &str) -> bool {
+        matches!(k, Kind::Place | Kind::Linked) && !crate::constants::AREA_TYPES.contains(&t)
     }
 }
 

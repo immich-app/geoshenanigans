@@ -77,6 +77,15 @@ pub struct QueryStats {
     pub postings_read: usize,
 }
 
+impl std::ops::AddAssign for QueryStats {
+    fn add_assign(&mut self, o: QueryStats) {
+        self.reverse_lookups += o.reverse_lookups;
+        self.context_checks += o.context_checks;
+        self.keys_matched += o.keys_matched;
+        self.postings_read += o.postings_read;
+    }
+}
+
 /// A Levenshtein DFA whose first characters must match exactly (Elasticsearch's prefix_length).
 struct Anchored<'a> {
     first: &'a [u8],
@@ -346,10 +355,9 @@ impl<'a, 'g> Searcher<'a, 'g> {
     /// Context words a candidate's point satisfies: the boundaries covering its admin cell whose
     /// name (or ISO code, or country code) matches a word, and that contain the point (the
     /// cell's interior flag, else point-in-polygon only for those boundaries). A one-cell slice
-    /// of the reverse lookup, without its field mapping.
-    fn context_mask(&self, ctx: &Context, names: &mut HashMap<(u32, u16, bool), u64>, e: u32) -> u64 {
+    /// of the reverse lookup, without its field mapping. The candidate is at (`lat`, `lng`).
+    fn context_mask(&self, ctx: &Context, names: &mut HashMap<(u32, u16, bool), u64>, (lat, lng): (f32, f32)) -> u64 {
         let geo: &Index = self.idx.geo;
-        let Some((lat, lng)) = self.idx.ents.point(e) else { return 0 };
         let point = AdminPoint::new(lat as f64, lng as f64);
         let mut m = 0u64;
         for (_, ap, interior) in self.cell_polygons(lat, lng) {
@@ -464,21 +472,30 @@ impl<'a, 'g> Searcher<'a, 'g> {
         text * text * (IMPORTANCE_FLOOR + imp) * CLASS_MULT[class.min(5) as usize] * ctx
     }
 
-    fn score_split(&self, st: &mut State<'g>, split: u8, name: &[Token], ctx_words: &[String], prefix: bool, pool: &mut Pool) {
+    /// Scores one query split into `pool`. With `read_first`, an entity whose point does not
+    /// read is left out as it is offered; without, false when the split's context checks meet
+    /// one (`search`).
+    fn score_split(&self, st: &mut State<'g>, split: u8, name: &[Token], ctx_words: &[String], prefix: bool, pool: &mut Pool, read_first: bool) -> bool {
         let phrase = join(name);
         if phrase.is_empty() {
-            return;
+            return true;
         }
         let ctx = Context { words: ctx_words, phrase: ctx_words.join(" ") };
         let has_ctx = !ctx_words.is_empty();
         let chars = phrase.chars().count();
         let folded_last = name.last().is_some_and(|t| t.raw != t.folded);
         let mut cands: Vec<Cand> = Vec::new();
+        let ents = &self.idx.ents;
         // Without context words a candidate goes straight to the pool; with them it waits for
         // the context check, made best-first and only while it can still reach the results.
         let mut emit = |pool: &mut Pool, entity: u32, ord: u8, class: u8, text: f32, imp: f32| {
             let potential = Self::score(text, imp, class, true);
             if potential <= pool.threshold() {
+                return;
+            }
+            // Read first, an entity that is nowhere is no candidate (one the pool holds is
+            // somewhere).
+            if read_first && !pool.best.contains_key(&entity) && ents.point(entity).is_none() {
                 return;
             }
             if has_ctx {
@@ -544,7 +561,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
             }
         }
         if !has_ctx {
-            return;
+            return true;
         }
         cands.sort_by(|a, b| b.potential.total_cmp(&a.potential).then(a.entity.cmp(&b.entity)));
         let mut names: HashMap<(u32, u16, bool), u64> = HashMap::new();
@@ -557,8 +574,14 @@ impl<'a, 'g> Searcher<'a, 'g> {
                 Some(&ok) => ok,
                 None if st.stats.context_checks >= MAX_CONTEXT_CHECKS => false,
                 None => {
+                    let Some(at) = ents.point(c.entity) else {
+                        if read_first {
+                            continue;
+                        }
+                        return false;
+                    };
                     st.stats.context_checks += 1;
-                    let ok = ctx.satisfied(self.context_mask(&ctx, &mut names, c.entity));
+                    let ok = ctx.satisfied(self.context_mask(&ctx, &mut names, at));
                     checked.insert(c.entity, ok);
                     ok
                 }
@@ -566,18 +589,45 @@ impl<'a, 'g> Searcher<'a, 'g> {
             let score = if ok { c.potential } else { c.potential * CONTEXT_MISS_MULT };
             pool.offer(Hit { entity: c.entity, ord: c.ord, class: c.class, score, text: c.text, context: ok, split });
         }
+        true
     }
 
     pub fn search(&self, q: &str, limit: usize) -> (Vec<Found<'g>>, QueryStats) {
         if limit == 0 { return (Vec::new(), QueryStats::default()); }
         let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
+        // An entity can be nowhere: its record or its slot does not read (a damaged file).
+        // Reading each candidate's point as it is offered would read a record for every one, so
+        // a search reads a hit's point where it uses the hit (a context check, the area order, a
+        // result), and until then a hit of an entity that is nowhere ranks as it scores. What
+        // such a hit keeps out of the pool or from a context check scores no higher than it, so
+        // a search that uses only hits ranked above every one of them has the hits it would have
+        // had without them, but for one that ties with it. One that meets one runs again reading
+        // each entity as it is offered, so that none takes a place a hit that reads could have
+        // had; that run has its own budget of context checks.
+        let found = match self.search_once(&mut st, q, limit, false) {
+            Some(found) => found,
+            None => {
+                let first = std::mem::take(&mut st.stats);
+                let found = self.search_once(&mut st, q, limit, true).unwrap_or_default();
+                st.stats += first;
+                found
+            }
+        };
+        (found, st.stats)
+    }
+
+    /// `search`'s results; None, without `read_first`, for a search that met an entity that is
+    /// nowhere (`score_split`).
+    fn search_once(&self, st: &mut State<'g>, q: &str, limit: usize, read_first: bool) -> Option<Vec<Found<'g>>> {
         let mut pool = Pool::new(limit * CONTEXT_CUTOFF_FACTOR);
         let mut phrases: Vec<String> = Vec::new();
         if let Some((name, rest)) = q.split_once(',') {
             let name = tokens(name);
             let ctx: Vec<String> = tokens(rest).into_iter().map(|t| t.folded).take(63).collect();
             phrases.push(join(&name));
-            self.score_split(&mut st, 0, &name, &ctx, ctx.is_empty(), &mut pool);
+            if !self.score_split(st, 0, &name, &ctx, ctx.is_empty(), &mut pool, read_first) {
+                return None;
+            }
         } else {
             let t = tokens(q);
             let n = t.len();
@@ -587,16 +637,25 @@ impl<'a, 'g> Searcher<'a, 'g> {
                 }
                 let ctx: Vec<String> = t[k..].iter().map(|x| x.folded.clone()).collect();
                 phrases.push(join(&t[..k]));
-                self.score_split(&mut st, (phrases.len() - 1) as u8, &t[..k], &ctx, k == n, &mut pool);
+                if !self.score_split(st, (phrases.len() - 1) as u8, &t[..k], &ctx, k == n, &mut pool, read_first) {
+                    return None;
+                }
             }
         }
         let mut hits: Vec<Hit> = pool.best.into_values().collect();
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.entity.cmp(&b.entity)));
-        self.place_before_its_area(&mut hits);
+        if !self.place_before_its_area(&mut hits) && !read_first {
+            return None;
+        }
         let mut out: Vec<Found<'g>> = Vec::new();
         let mut kept: Vec<(String, (f32, f32))> = Vec::new();
         for h in hits {
-            let Some(at) = self.idx.ents.point(h.entity) else { continue };
+            let Some(at) = self.idx.ents.point(h.entity) else {
+                if read_first {
+                    continue;
+                }
+                return None;
+            };
             let name = self.display_name(&h, &phrases[h.split as usize]);
             let label = normalize(&name);
             if kept.iter().any(|(l, p)| *l == label && haversine_km(*p, at) < DEDUPE_KM) {
@@ -604,25 +663,27 @@ impl<'a, 'g> Searcher<'a, 'g> {
             }
             kept.push((label, at));
             let (kind, typ) = self.idx.ents.kind_and_type(h.entity);
-            let ctx = self.ctx_of(&mut st, h.entity, at);
+            let ctx = self.ctx_of(st, h.entity, at);
             out.push(Found { name, lat: at.0, lng: at.1, kind, typ: typ.into_owned(), ctx, hit: h });
             if out.len() >= limit {
                 break;
             }
         }
-        (out, st.stats)
+        Some(out)
     }
 
     /// "Dubai" the city before "Dubai" the emirate: an area (other than a country) drops just
-    /// below a settlement of the same name that lies inside it.
-    fn place_before_its_area(&self, hits: &mut [Hit]) {
+    /// below a settlement of the same name that lies inside it. False as soon as a hit it looks
+    /// at is of an entity that is nowhere (`search`).
+    fn place_before_its_area(&self, hits: &mut [Hit]) -> bool {
         let ents = &self.idx.ents;
         let label = |h: &Hit| normalize(&ents.base_name(h.entity));
         let mut changed = false;
         let top = hits.len().min(AREA_CHECK_TOP);
         for i in 0..top {
             let e = hits[i].entity;
-            if !ents.is_area(e) || Entities::is_poi(e) || e < ents.n_place_nodes {
+            let Some((k, t)) = ents.kind_and_type_of(e) else { return false };
+            if !Entities::is_area(k, &t) || Entities::is_poi(e) || e < ents.n_place_nodes {
                 continue;
             }
             let Some(area) = ents.slot(e - ents.n_place_nodes).and_then(|s| polygon_raw(self.idx.geo, s.poly)) else { continue };
@@ -630,9 +691,14 @@ impl<'a, 'g> Searcher<'a, 'g> {
                 continue;
             }
             let area_label = label(&hits[i]);
-            let found = (i + 1..hits.len().min(i + 1 + AREA_CHECK_TOP))
-                .filter(|&j| ents.is_settlement(hits[j].entity) && label(&hits[j]) == area_label)
-                .find(|&j| self.contained_in(hits[j].entity, &area));
+            let mut found = None;
+            for (j, h) in hits.iter().enumerate().take(i + 1 + AREA_CHECK_TOP).skip(i + 1) {
+                let Some((k, t)) = ents.kind_and_type_of(h.entity) else { return false };
+                if Entities::is_settlement(k, &t) && label(h) == area_label && self.contained_in(h.entity, &area) {
+                    found = Some(j);
+                    break;
+                }
+            }
             if let Some(j) = found {
                 hits[i].score = hits[j].score * 0.999;
                 changed = true;
@@ -641,6 +707,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
         if changed {
             hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.entity.cmp(&b.entity)));
         }
+        true
     }
 
     /// The matched name when it starts with what was typed (a language the user chose:
@@ -791,6 +858,68 @@ mod tests {
 
         let got: Vec<(u32, &str)> = found.iter().map(|f| (f.hit.entity, f.name.as_str())).collect();
         assert_eq!(got, [(first, "Abcdx"), (second[0], "Abcdy"), (second[1], "Abcdy")]);
+    }
+
+    #[test]
+    fn hits_of_records_that_do_not_read_take_no_place_from_those_that_do() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        use query_server::{DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
+        let mut g = Geo::default();
+        // A neighbourhood "A" in a boundary "B"; one "Old Mill" of the least importance, then more
+        // than the pool holds of the most; three "A Bay" of the most (the prefix table's hits of
+        // "a b"); and more "Market Hall" of the most than the area order looks at, above one of
+        // the least. Once the index is built, the rows of those "Old Mill" and "A Bay" and of
+        // that last "Market Hall" are made not to read.
+        g.boundary("B", 8, [10.0, 20.0, 10.2, 20.2]);
+        let a = g.place("A", 5, 10.1, 20.1);
+        let valid = g.poi("Old Mill", -30.0, -60.0, 0) | POI_BIT;
+        let mut unreadable = Vec::new();
+        for k in 0..=CANDIDATE_POOL as u32 {
+            unreadable.push(g.poi("Old Mill", (k / 20) as f32 * 5.0 - 25.0, (k % 20) as f32 * 5.0 - 50.0, 255));
+        }
+        for k in 0..3 {
+            unreadable.push(g.poi("A Bay", 40.0 + k as f32, 40.0, 255));
+        }
+        let halls: Vec<u32> = (0..=AREA_CHECK_TOP as u32).map(|k| g.poi("Market Hall", 50.0 + k as f32 * 0.5, 100.0, 255) | POI_BIT).collect();
+        let last_hall = g.poi("Market Hall", -50.0, 100.0, 0);
+        let dir = TempDir::new("unreadable-hits");
+        let set = dir.0.join("geo");
+        let geo = g.load(&set);
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let queries = [("old mill", 5), ("old mill, nowhere", 5), ("a b", 1), ("market hall", 5)];
+        // Each query's results, and the postings it read.
+        let found = |geo: &Index| {
+            let idx = SearchIndex::open(geo, &out, None, None).unwrap();
+            let s = Searcher::new(&idx);
+            queries.map(|(q, limit)| {
+                let (found, st) = s.search(q, limit);
+                (found.iter().map(|f| f.hit.entity).collect::<Vec<_>>(), st.postings_read)
+            })
+        };
+        // Each of the first three queries' best hits is of the most importance while its row reads.
+        let readable = found(&geo);
+        for ((got, _), (q, _)) in readable.iter().zip(queries).take(3) {
+            assert!(got.first().is_some_and(|e| unreadable.contains(&(e & !POI_BIT))), "{q}: {got:?}");
+        }
+        unreadable.push(last_hall);
+        // Their combo past the dictionary (27 bytes a row), in a new file as a patch writes one.
+        let mut records = std::fs::read(set.join("poi_records.bin")).unwrap();
+        for &i in &unreadable {
+            let at = i as usize * 27 + 25;
+            records[at..at + 2].copy_from_slice(&0xFFFEu16.to_le_bytes());
+        }
+        std::fs::write(set.join("poi_records.bin.new"), records).unwrap();
+        std::fs::rename(set.join("poi_records.bin.new"), set.join("poi_records.bin")).unwrap();
+        let damaged = Index::load(set.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+        assert!(damaged.poi_records.as_ref().unwrap().record(unreadable[0]).is_none());
+
+        let got = found(&damaged);
+
+        let entities: Vec<&Vec<u32>> = got.iter().map(|(e, _)| e).collect();
+        assert_eq!(entities, [&vec![valid], &vec![valid], &vec![a], &halls[..5].to_vec()]);
+        // The last "Market Hall" ranks below every hit that search uses: it reads the index once.
+        assert_eq!(got[3], readable[3]);
     }
 
     #[test]
