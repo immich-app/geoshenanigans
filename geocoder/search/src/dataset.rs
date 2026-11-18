@@ -11,7 +11,7 @@ use crate::build::{
 };
 use crate::constants::*;
 use crate::reader::SearchIndex;
-use query_server::{FileStamp, Index};
+use query_server::{lower_hex, FileStamp, Index};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -132,7 +132,7 @@ fn sha256_file(path: &Path) -> std::io::Result<String> {
         }
         sha.update(&buf[..n]);
     }
-    Ok(format!("{:x}", sha.finalize()))
+    Ok(lower_hex(&sha.finalize()))
 }
 
 /// The fingerprint of the dataset in `dir` as loaded, its files stamped `loaded` (`load`), the
@@ -856,6 +856,6 @@ mod tests {
 
         assert!(!without.contains_key("strings_poi.bin"));
         assert_eq!(with.len(), without.len() + 1);
-        assert_eq!(with["strings_poi.bin"], format!("{:x}", Sha256::digest(b"\0")));
+        assert_eq!(with["strings_poi.bin"], lower_hex(&Sha256::digest(b"\0")));
     }
 }

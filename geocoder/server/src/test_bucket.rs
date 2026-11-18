@@ -9,6 +9,7 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use query_server::lower_hex;
 use sha2::{Digest, Sha256};
 
 use crate::downloader::Configurations;
@@ -62,7 +63,7 @@ pub async fn serve(components: serde_json::Value) -> TestBucket {
     let template: serde_json::Value = serde_json::from_str(TEMPLATE).unwrap();
     let regions: Vec<&String> = template["axes"]["region"]["values"].as_object().unwrap().keys().collect();
     let body = zstd::encode_all(&[][..], 3).unwrap();
-    let entry = serde_json::json!({ "size_zst": body.len(), "size_raw": 0, "sha256": format!("{:x}", Sha256::digest(b"")) });
+    let entry = serde_json::json!({ "size_zst": body.len(), "size_raw": 0, "sha256": lower_hex(&Sha256::digest(b"")) });
     let mut files = serde_json::Map::new();
     for c in components.as_object().unwrap().values() {
         for f in ["files", "optional_files"].iter().filter_map(|k| c[*k].as_array()).flatten() {

@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
+use query_server::lower_hex;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -333,7 +334,7 @@ fn decode_hash_write(
     let mut hw = dec.into_inner();
     hw.flush()
         .map_err(|e| DownloadError::Io(format!("flush {}: {}", tmp.display(), e)))?;
-    Ok(format!("{:x}", hw.hasher.finalize()))
+    Ok(lower_hex(&hw.hasher.finalize()))
 }
 
 // --- Region download ---------------------------------------------------------
@@ -462,7 +463,7 @@ mod tests {
 
         let mut hasher = Sha256::new();
         hasher.update(&raw);
-        assert_eq!(got, format!("{:x}", hasher.finalize()));
+        assert_eq!(got, lower_hex(&hasher.finalize()));
         assert_eq!(std::fs::read(&tmp).unwrap(), raw);
     }
 

@@ -25,6 +25,8 @@ mod exact_pip;
 pub use exact_pip::{edge_crosses, on_edge, to_e7, PointE7};
 mod file_stamp;
 pub use file_stamp::FileStamp;
+mod hex;
+pub use hex::lower_hex;
 pub mod place_files;
 pub mod poi_files;
 pub mod postcode_files;
