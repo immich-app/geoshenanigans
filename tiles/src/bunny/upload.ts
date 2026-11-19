@@ -55,8 +55,9 @@ export interface UploadStats {
   /** The first MAX_REPORTED_FAILURES failures. */
   failures: UploadFailure[];
   /**
-   * Not every item was settled: stopped by the signal (including items the storage client's signal stopped mid-retry,
-   * which are neither uploaded nor failed), a fatal error or too many failures.
+   * Not every item was settled: stopped by the signal (including items the storage client's signal stopped mid-retry
+   * and items the stop caught before their PUT, such as one whose DESCRIBE was in flight: neither uploaded nor
+   * failed), a fatal error or too many failures.
    */
   stopped: boolean;
   /** Why the upload stopped early, if it did on its own. */
@@ -71,7 +72,10 @@ export interface UploadOptions<T extends UploadItem> {
   concurrency?: number;
   /** DESCRIBE every file before its PUT; items can ask for it one by one, but cannot opt out of this. */
   verify?: boolean;
-  /** Stop taking new items; the ones in flight finish. */
+  /**
+   * Stop taking new items. PUTs already sent finish; an item still being verified gets no PUT after it (it counts as
+   * neither uploaded nor failed, and stats.stopped is set).
+   */
   signal?: AbortSignal;
   /** Stop after this many failed files (default 1000). */
   maxFailures?: number;
@@ -123,6 +127,11 @@ export async function uploadTiles<T extends UploadItem>(
       if ((options.verify || item.verify) && (await storage.holds(path, item.sha256))) {
         stats.skippedExisting++;
         options.onSettled?.(item, 'skipped');
+        return;
+      }
+      if (stopping()) {
+        // Stopped while it was being verified or handed out: a stop lets PUTs already sent finish and starts none.
+        unsettled++;
         return;
       }
       await storage.put(path, item.bytes, item.sha256);
