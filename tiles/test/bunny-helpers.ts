@@ -10,7 +10,8 @@ export const identity = {
 };
 export const o11y: O11yConfig = { url: 'https://o11y.test', token: 'secret', identity };
 
-export type Call = { url: string; method: string; headers: Headers; body: string };
+// redirect: whether the caller lets fetch follow a redirect (and carry its headers along).
+export type Call = { url: string; method: string; headers: Headers; body: string; redirect: RequestRedirect };
 
 /**
  * Replaces fetch: o11y POSTs are recorded and answered 204, anything else is recorded and answered by `route` (a 599
@@ -25,6 +26,7 @@ export function mockFetch(route: (call: Call) => Response | Promise<Response> | 
       method: request.method,
       headers: request.headers,
       body: request.body ? await request.text() : '',
+      redirect: request.redirect,
     };
     calls.push(call);
     if (call.url.startsWith('https://o11y.test/')) {
