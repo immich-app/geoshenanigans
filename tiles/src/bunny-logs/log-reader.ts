@@ -41,7 +41,8 @@ const RETRY_DELAY_MS = 1000;
 export const REQUEST_SPACING_MS = 400;
 export const RATE_LIMIT_WAIT_MS = 10_000;
 const REQUEST_TIMEOUT_MS = 20_000;
-// No request starts after this long, so a slow API can't pile up runs (each request can still take its timeout).
+// A cutoff for request starts, not for the run: no request starts after this long, but one already started still has
+// its own REQUEST_TIMEOUT_MS, so a slow API can stretch a run past the start of the next minute's.
 export const READ_DEADLINE_MS = 50_000;
 // How far back the lag query looks for the newest row.
 const LAG_LOOKBACK_MS = 10 * MINUTE_MS;
