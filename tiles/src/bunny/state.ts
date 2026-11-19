@@ -3,6 +3,11 @@
  * `manifests/<build>.tman.zst` for the next day's diff, and the builds a sync started writing to the tiles zone without
  * making them live (`pending`). Every path can sit under a state prefix, for tests.
  *
+ * A stored manifest's bytes never change: when that name holds another manifest of the build already (one built again,
+ * or a full rewrite's under the live or a pending build's key), the new one goes to a name of its own
+ * (`manifests/<build>-<SHA-256 prefix>.tman.zst`). A state that names a manifest therefore keeps reading what it
+ * recorded, even when the write of the state that was to replace it fails.
+ *
  * Where no pending build differs from the live one, the tiles zone holds the live build's bytes. Where one does, a
  * failed or killed sync may have left either build's bytes, so the next sync plans with every pending manifest
  * (planSync in diff.ts) and checks those positions before writing them. A sync therefore:
@@ -90,6 +95,13 @@ export const statePath = (prefix?: string) => `${statePrefix(prefix)}${STATE_FIL
 export const manifestName = (buildKey: string) => `manifests/${parseDeploymentKey('build', buildKey)}.tman.zst`;
 
 export const manifestPath = (buildKey: string, prefix?: string) => `${statePrefix(prefix)}${manifestName(buildKey)}`;
+
+/**
+ * The name of its own a manifest goes to when manifestName(buildKey) holds another one: the build key and the first 16
+ * hex digits of its SHA-256.
+ */
+export const distinctManifestName = (buildKey: string, sha256: string) =>
+  `manifests/${parseDeploymentKey('build', buildKey)}-${sha256.slice(0, 16).toUpperCase()}.tman.zst`;
 
 export const sha256Hex = (body: Uint8Array) => createHash('sha256').update(body).digest('hex').toUpperCase();
 
@@ -228,6 +240,8 @@ async function checkStored(store: ObjectStore, path: string, sha256: string, len
 }
 
 export interface UploadedManifest {
+  /** Relative to the state prefix, as state.json records it. */
+  name: string;
   path: string;
   sha256: string;
   bytes: number;
@@ -235,6 +249,10 @@ export interface UploadedManifest {
   skipped: boolean;
 }
 
+/**
+ * Stores a build's manifest and reads it back. Its name is manifestName(buildKey), unless that holds another manifest
+ * (one a state may name); then distinctManifestName, so no stored manifest's bytes ever change under a state naming it.
+ */
 export async function uploadManifest(
   store: ObjectStore,
   buildKey: string,
@@ -245,15 +263,24 @@ export async function uploadManifest(
   if (header.buildKey !== buildKey) {
     throw new Error(`${file} is the manifest of ${header.buildKey}, not ${buildKey}`);
   }
-  const path = manifestPath(buildKey, prefix);
   const [sha256, { size }] = await Promise.all([sha256File(file), stat(file)]);
-  const existing = await store.describe(path);
-  if (existing && existing.checksum.toUpperCase() === sha256) {
-    return { path, sha256, bytes: existing.length, skipped: true };
+  let name = manifestName(buildKey);
+  let path = `${statePrefix(prefix)}${name}`;
+  let existing = await store.describe(path);
+  if (existing && existing.checksum.toUpperCase() !== sha256) {
+    name = distinctManifestName(buildKey, sha256);
+    path = `${statePrefix(prefix)}${name}`;
+    existing = await store.describe(path);
+    if (existing && existing.checksum.toUpperCase() !== sha256) {
+      throw new Error(`${path} holds another manifest (${existing.checksum}), not this one (${sha256})`);
+    }
+  }
+  if (existing) {
+    return { name, path, sha256, bytes: existing.length, skipped: true };
   }
   await store.putFile(path, file, sha256);
   await checkStored(store, path, sha256, size);
-  return { path, sha256, bytes: size, skipped: false };
+  return { name, path, sha256, bytes: size, skipped: false };
 }
 
 /**
@@ -321,10 +348,10 @@ export async function beginBuild(store: ObjectStore, current: SyncState, options
     throw new Error('state.json changed since the sync read it; plan again');
   }
   const header = await readManifestHeader(options.manifestFile);
-  await uploadManifest(store, buildKey, options.manifestFile, options.statePrefix);
+  const { name } = await uploadManifest(store, buildKey, options.manifestFile, options.statePrefix);
   const entry: PendingBuild = {
     build: buildKey,
-    manifest: manifestName(buildKey),
+    manifest: name,
     positions: header.positions,
     startedAt: (options.now ?? new Date()).toISOString(),
   };
@@ -348,15 +375,17 @@ export interface PublishOptions {
 
 /**
  * Makes a build live in the state: its manifest is stored and read back first, then state.json switches to it, so
- * state.json never names a manifest that isn't there. `pending` is cleared: call it only once the tiles zone holds
- * the build everywhere, i.e. after applying a plan made with every pending build of the state.
+ * state.json never names a manifest that isn't there. The manifest never takes the place of one the old state names
+ * (the live build's or a pending one's, under the same key: see uploadManifest), so a state write that fails leaves
+ * the old state whole. `pending` is cleared: call it only once the tiles zone holds the build everywhere, i.e. after
+ * applying a plan made with every pending build of the state.
  */
 export async function publishBuild(store: ObjectStore, options: PublishOptions): Promise<SyncState> {
   const header = await readManifestHeader(options.manifestFile);
-  await uploadManifest(store, options.buildKey, options.manifestFile, options.statePrefix);
+  const { name } = await uploadManifest(store, options.buildKey, options.manifestFile, options.statePrefix);
   const state: SyncState = {
     liveBuild: options.buildKey,
-    manifest: manifestName(options.buildKey),
+    manifest: name,
     prefix: options.prefix,
     updatedAt: (options.now ?? new Date()).toISOString(),
     osmDate: options.osmDate === undefined ? header.osmDate : options.osmDate,
@@ -368,7 +397,8 @@ export async function publishBuild(store: ObjectStore, options: PublishOptions):
   return state;
 }
 
-const MANIFEST_FILE = /^\d{8}\.tman\.zst$/;
+/** manifestName's files and distinctManifestName's. */
+const MANIFEST_FILE = /^\d{8}(-[0-9A-F]{16})?\.tman\.zst$/;
 
 /**
  * Deletes the manifests in the state zone that state.json names neither as live nor as pending, but for the newest
@@ -493,10 +523,10 @@ export interface BunnyStateStoreOptions {
 }
 
 /**
- * Small requests fail fast, so `bunny:status` gives up within about a minute (5 x 10 s plus backoff) when the zone
- * hangs, well inside the watchdog's job limit. Transfers have no fixed length limit short of an hour, only an idle
- * one: a 1.3 GB planet manifest took 14-18 s each way from a well-connected server, and Bunny answered its PUT half
- * a second after the last byte.
+ * Small requests fail fast, so `bunny:status` gives up within about a minute when the zone hangs (requestBudgetMs: 5
+ * tries of 10 s and at most 11.25 s of backoff between them), well inside the watchdog's job limit. Transfers have no
+ * fixed length limit short of an hour, only an idle one: a 1.3 GB planet manifest took 14-18 s each way from a
+ * well-connected server, and Bunny answered its PUT half a second after the last byte.
  */
 export const STATE_STORE_DEFAULTS = {
   attempts: 5,
@@ -516,7 +546,26 @@ class HttpError extends Error {
 
 const retryable = (error: unknown) => !(error instanceof HttpError) || error.status === 429 || error.status >= 500;
 
-const backoffMs = (attempt: number) => Math.min(15_000, 500 * 2 ** (attempt - 1)) * (0.5 + Math.random());
+/**
+ * The wait before try `attempt + 1`: doubling from 500 ms up to 15 s, jittered (`random` in [0, 1)) to between half
+ * and 1.5 times that.
+ */
+const backoffMs = (attempt: number, random = Math.random()) =>
+  Math.min(15_000, 500 * 2 ** (attempt - 1)) * (0.5 + random);
+
+/**
+ * The longest a small request (state.json, a DESCRIBE) takes to fail when the zone never answers: every try runs out
+ * its requestTimeoutMs, with the longest backoff (the most jitter) between them.
+ */
+export function requestBudgetMs(settings: Pick<BunnyStateStoreOptions, 'attempts' | 'requestTimeoutMs'> = {}): number {
+  const attempts = settings.attempts ?? STATE_STORE_DEFAULTS.attempts;
+  const requestTimeoutMs = settings.requestTimeoutMs ?? STATE_STORE_DEFAULTS.requestTimeoutMs;
+  let total = attempts * requestTimeoutMs;
+  for (let attempt = 1; attempt < attempts; attempt++) {
+    total += backoffMs(attempt, 1);
+  }
+  return total;
+}
 
 /** A small Bunny storage client for the state zone: a few objects, the large ones streamed. */
 export class BunnyStateStore implements ObjectStore {

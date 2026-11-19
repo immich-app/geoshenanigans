@@ -2,8 +2,9 @@
  * The daily sync of the tiles zone to a new Protomaps build (bunny:sync, run by .github/workflows/tiles-sync.yml):
  * 1. read state.json: the live build, its manifest and any builds an earlier sync started without finishing;
  * 2. build the new build's manifest and plan against the live and pending manifests (planSync in diff.ts). A pending
- *    entry of this very build must hold the same tiles as the new manifest: beginBuild replaces its manifest, the only
- *    record of where that attempt wrote, so another archive under the same key is refused (revert it first, below);
+ *    entry of this very build must hold the same tiles as the new manifest: beginBuild points the entry at the new
+ *    manifest, and the old one is the only record of where that attempt wrote, so another archive under the same key
+ *    is refused (revert it first, below);
  * 3. guard rail: stop before writing anything when more than maxChangedFraction of the positions changed (with
  *    --force-full, when it would delete more than that share of the live build's positions);
  * 4. record the build as pending (beginBuild), then upload the changed positions only. Re-PUTting identical bytes
@@ -15,8 +16,9 @@
  *    leaves the build pending, so the next run checks those files again instead of writing them;
  * 6. upload the TileJSON and styles whose bytes changed, wait until every replica region holds all of them (not just
  *    the ones this run wrote: an earlier attempt may have written them and failed before its gate passed), purge the
- *    pull zone once, and make the build live in state.json (its manifest is stored first, and the archive's identity
- *    is recorded: archive-identity.ts).
+ *    pull zone once, and make the build live in state.json (its manifest is stored first, never over one the old state
+ *    names, so a failed state write leaves that state whole; and the archive's identity is recorded:
+ *    archive-identity.ts).
  *
  * A run for the live build itself while state.json lists pending builds puts the live bytes back where they wrote
  * (step 4 without new bytes): that reverts a failed or cancelled sync.
@@ -795,8 +797,8 @@ class SyncRun {
 
   /**
    * A pending build's manifest, downloaded. When it is this build again it must hold the same tiles as the new
-   * manifest (tile IDs and hashes; its header's times may differ): beginBuild replaces it with the new one, and it is
-   * all that says where the earlier attempt may have written bytes this archive doesn't have. So another archive
+   * manifest (tile IDs and hashes; its header's times may differ): beginBuild points the entry at the new one, and it
+   * is all that says where the earlier attempt may have written bytes this archive doesn't have. So another archive
    * under the key (a build published again, another --max-zoom) is refused before anything is written.
    */
   private async pendingManifest(state: SyncState, build: PendingBuild, manifest: string): Promise<string> {

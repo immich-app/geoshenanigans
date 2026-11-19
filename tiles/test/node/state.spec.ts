@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { writeManifest } from '../../src/bunny/manifest';
 import {
   beginBuild,
@@ -13,6 +13,7 @@ import {
   pruneManifests,
   publishBuild,
   readState,
+  requestBudgetMs,
   STATE_STORE_DEFAULTS,
   statePath,
   SyncState,
@@ -31,13 +32,36 @@ afterEach(async () => {
   await scratch.cleanup();
 });
 
-async function manifestFile(buildKey: string, osmDate: string | null = '2026-11-17T23:59:59Z') {
-  const path = scratch.path(`${buildKey}.tman.zst`);
+let manifestFiles = 0;
+
+/** A manifest of 85 positions; `hash` is the tiles' at zoom 3 (another one: the same positions, other tiles). */
+async function manifestFile(
+  buildKey: string,
+  osmDate: string | null = '2026-11-17T23:59:59Z',
+  hash = 'BBBBBBBBBBBBBBBB',
+) {
+  const path = scratch.path(`${buildKey}-${++manifestFiles}.tman.zst`);
   await writeManifest(path, { buildKey, osmDate }, [
     { tileId: 0, runLength: 21, hash: 'AAAAAAAAAAAAAAAA' },
-    { tileId: 21, runLength: 64, hash: 'BBBBBBBBBBBBBBBB' },
+    { tileId: 21, runLength: 64, hash },
   ]);
   return path;
+}
+
+/** A store that fails every write of state.json, as a state zone that went away after the manifest's upload. */
+function failingStateWrites(memory: MemoryObjectStore): ObjectStore {
+  return {
+    get: (path) => memory.get(path),
+    put: (path, body, sha256) =>
+      /(^|\/)state\.json$/.test(path)
+        ? Promise.reject(new Error('PUT state.json: 503'))
+        : memory.put(path, body, sha256),
+    putFile: (path, file, sha256) => memory.putFile(path, file, sha256),
+    describe: (path) => memory.describe(path),
+    getToFile: (path, file) => memory.getToFile(path, file),
+    list: (dir) => memory.list(dir),
+    delete: (path) => memory.delete(path),
+  };
 }
 
 const state: SyncState = {
@@ -228,6 +252,66 @@ describe('publishBuild', () => {
       publishBuild(faulty(other, /state\.json$/, flip), { buildKey: '20261118', manifestFile: file, prefix: 'v1' }),
     ).rejects.toThrow(/state\.json reads back as \d+ bytes [0-9A-F]{64}$/);
   });
+
+  it("never stores another manifest over one the state names, under the live or a pending build's key", async () => {
+    const memory = new MemoryObjectStore();
+    const liveFile = await manifestFile('20261118');
+    const live = await publishBuild(memory, { buildKey: '20261118', manifestFile: liveFile, prefix: 'v1' });
+    const pendingFile = await manifestFile('20261119');
+    const current = await beginBuild(memory, live, { buildKey: '20261119', manifestFile: pendingFile });
+    const named = new Map(
+      [current.manifest, current.pending[0].manifest].map((name) => [name, memory.objects.get(name)]),
+    );
+    expect([...named.keys()]).toEqual(['manifests/20261118.tman.zst', 'manifests/20261119.tman.zst']);
+
+    // A full rewrite under each key (other tiles at the same positions) whose state write fails: the state, and every
+    // manifest it names, are as they were, so later plans still read what the zone holds.
+    for (const key of ['20261118', '20261119']) {
+      const rewrite = await manifestFile(key, null, 'CCCCCCCCCCCCCCCC');
+      await expect(
+        publishBuild(failingStateWrites(memory), { buildKey: key, manifestFile: rewrite, prefix: 'v1/e2' }),
+      ).rejects.toThrow(/PUT state\.json: 503/);
+      expect(await readState(memory)).toEqual(current);
+      for (const [name, bytes] of named) {
+        expect(memory.objects.get(name), `${key}: ${name}`).toEqual(bytes);
+      }
+      const read = scratch.path(`read-${key}.tman.zst`);
+      await downloadManifest(memory, key === '20261118' ? current : current.pending[0], read);
+      expect(await readFile(read)).toEqual(await readFile(key === '20261118' ? liveFile : pendingFile));
+    }
+
+    // Once the state write goes through, the state names the new manifest, under a name of its own.
+    const rewrite = await manifestFile('20261118', null, 'CCCCCCCCCCCCCCCC');
+    const replaced = await publishBuild(memory, { buildKey: '20261118', manifestFile: rewrite, prefix: 'v1/e2' });
+    const sha256 = hex(await readFile(rewrite));
+    expect(replaced.manifest).toBe(`manifests/20261118-${sha256.slice(0, 16)}.tman.zst`);
+    expect(memory.objects.get(replaced.manifest)).toEqual(new Uint8Array(await readFile(rewrite)));
+    expect(memory.objects.get('manifests/20261118.tman.zst')).toEqual(named.get('manifests/20261118.tman.zst'));
+    const read = scratch.path('replaced.tman.zst');
+    await downloadManifest(memory, replaced, read);
+    expect(await readFile(read)).toEqual(await readFile(rewrite));
+    // Published again, it is found stored under that name and not sent.
+    memory.log.length = 0;
+    expect(await publishBuild(memory, { buildKey: '20261118', manifestFile: rewrite, prefix: 'v1/e2' })).toMatchObject({
+      manifest: replaced.manifest,
+    });
+    expect(memory.log.filter((call) => call.startsWith('put'))).toEqual(['put state.json']);
+  });
+
+  it('refuses a name of its own that holds other bytes rather than store over them', async () => {
+    const memory = new MemoryObjectStore();
+    await publishBuild(memory, { buildKey: '20261118', manifestFile: await manifestFile('20261118'), prefix: 'v1' });
+    const rewrite = await manifestFile('20261118', null, 'CCCCCCCCCCCCCCCC');
+    const taken = `manifests/20261118-${hex(await readFile(rewrite)).slice(0, 16)}.tman.zst`;
+    const other = new TextEncoder().encode('another manifest');
+    await memory.put(taken, other, hex(other));
+    const before = await readState(memory);
+    await expect(
+      publishBuild(memory, { buildKey: '20261118', manifestFile: rewrite, prefix: 'v1/e2' }),
+    ).rejects.toThrow(new RegExp(`${taken} holds another manifest`));
+    expect(memory.objects.get(taken)).toEqual(other);
+    expect(await readState(memory)).toEqual(before);
+  });
 });
 
 describe('beginBuild', () => {
@@ -341,6 +425,25 @@ describe('pruneManifests', () => {
       'state.json',
     ]);
     expect(await pruneManifests(store, { keep: 2 })).toEqual([]);
+  });
+
+  it('deletes manifests under names of their own like the others, keeping the one the state names', async () => {
+    const store = new MemoryObjectStore();
+    await publishBuild(store, { buildKey: '20261118', manifestFile: await manifestFile('20261118'), prefix: 'v1' });
+    const rewrite = await manifestFile('20261118', null, 'CCCCCCCCCCCCCCCC');
+    const replaced = await publishBuild(store, { buildKey: '20261118', manifestFile: rewrite, prefix: 'v1/e2' });
+    expect(replaced.manifest).toMatch(/^manifests\/20261118-[0-9A-F]{16}\.tman\.zst$/);
+    await put(store, 'manifests/20261110-0123456789ABCDEF.tman.zst');
+    // Not a name a manifest is stored under: left alone.
+    await put(store, 'manifests/20261110-0123456789abcdef.tman.zst');
+
+    expect(await pruneManifests(store, { keep: 0 })).toEqual([
+      'manifests/20261118.tman.zst',
+      'manifests/20261110-0123456789ABCDEF.tman.zst',
+    ]);
+    expect([...store.objects.keys()].sort()).toEqual(
+      ['manifests/20261110-0123456789abcdef.tman.zst', replaced.manifest, 'state.json'].sort(),
+    );
   });
 
   it('does nothing without a state', async () => {
@@ -457,18 +560,33 @@ describe('BunnyStateStore', () => {
     await expect(store().put('x.json', new Uint8Array([1, 2, 3]), 'AB'.repeat(32))).rejects.toThrow(/400/);
   });
 
-  it('gives up on a zone that takes requests and never answers, within its per-try limit', async () => {
+  it('gives up on a zone that takes requests and never answers within its budget, backoff included', async () => {
     server.faults.stallNext = 10;
-    const hung = new BunnyStateStore({ ...options, attempts: 2, requestTimeoutMs: 300 });
-    const started = performance.now();
-    await expect(hung.get('state.json')).rejects.toThrow();
-    expect(performance.now() - started).toBeLessThan(3000);
-    expect(server.requests.filter((request) => request.endsWith('(stalled)'))).toHaveLength(2);
-    await hung.close();
+    const settings = { attempts: 3, requestTimeoutMs: 200 };
+    // Every try times out and every backoff takes its most jitter: the request takes its whole budget.
+    const random = vi.spyOn(Math, 'random').mockReturnValue(1 - Number.EPSILON);
+    const hung = new BunnyStateStore({ ...options, ...settings });
+    try {
+      const budget = requestBudgetMs(settings);
+      // 3 tries of 200 ms, and backoffs of 750 and 1500 ms between them.
+      expect(budget).toBe(2_850);
+      const started = performance.now();
+      await expect(hung.get('state.json')).rejects.toThrow();
+      const elapsed = performance.now() - started;
+      expect(elapsed).toBeGreaterThanOrEqual(budget - 20);
+      expect(elapsed).toBeLessThan(budget + 1_500);
+      expect(server.requests.filter((request) => request.endsWith('(stalled)'))).toHaveLength(3);
+    } finally {
+      random.mockRestore();
+      await hung.close();
+    }
   });
 
-  it('keeps a hung status check to about a minute by default, inside the watchdog job', () => {
-    expect(STATE_STORE_DEFAULTS.attempts * STATE_STORE_DEFAULTS.requestTimeoutMs).toBeLessThanOrEqual(60_000);
+  it('keeps a hung status check to about a minute by default, backoff included, inside the watchdog job', () => {
+    // 5 tries of 10 s, and at most 0.75 + 1.5 + 3 + 6 s of backoff between them; the watchdog's job has 10 minutes.
+    expect(requestBudgetMs()).toBe(61_250);
+    expect(requestBudgetMs(STATE_STORE_DEFAULTS)).toBe(requestBudgetMs());
+    expect(requestBudgetMs()).toBeLessThanOrEqual(65_000);
   });
 
   it('streams a manifest over a slow link without timing out while bytes move', async () => {
