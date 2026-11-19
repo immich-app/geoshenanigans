@@ -8,8 +8,10 @@
  * runs, as cron runs land on any machine and the worker has no KV or Durable Object.
  *
  * Samples are labelled by `continent` (the probe's), not the spec's `region`, which is an o11y identity label (see
- * samples.ts), and by the `kind` the edge reported (CDN-Cache), so a hit tile a purge or a cold edge turned into a miss
- * counts as a miss.
+ * samples.ts), by the `kind` the edge reported (CDN-Cache), so a hit tile a purge or a cold edge turned into a miss
+ * counts as a miss, and by the `target` that was asked for (hit or miss). Both targets' samples are stamped at the run's
+ * minute, so without `target` a cold hit tile and the random tile from one continent would be one series at one
+ * timestamp, of which o11y's dedup keeps only the bigger value (samples.ts): one test's TTFB or error would be lost.
  */
 import { LogFields, O11yConfig, O11yLogger } from '../o11y';
 import { ProbeConfig } from './config';
@@ -210,7 +212,12 @@ export function measurementSamples(
   let verdicts = 0;
   const results = measurement?.results ?? [];
   for (const { probe, result } of results) {
-    const labels = { continent: continentLabel(probe?.continent), kind: measuredKind(target, result) };
+    // target keeps the two measurements' samples apart when both report the same kind (see the module comment).
+    const labels = {
+      continent: continentLabel(probe?.continent),
+      kind: measuredKind(target, result),
+      target: target.kind,
+    };
     const ttfb = testTtfb(result);
     if (ttfb !== undefined) {
       samples.push({ name: 'tiles_bunny_probe_ttfb_ms', labels, value: ttfb });

@@ -309,7 +309,11 @@ async function getLogPage(config: LogReaderConfig, query: PageQuery, deps: Deps,
   }
 }
 
-/** Every row of the window into the aggregate, page by page; truncated when MAX_PAGES didn't reach the end. */
+/**
+ * Every row of the window into the aggregate, page by page; truncated when MAX_PAGES didn't reach the end. Only a page
+ * without hasMore ends the window: an empty page that claims more rows can't advance the offset, so it throws rather
+ * than pass part of the minute off as all of it.
+ */
 export async function readWindow(
   config: LogReaderConfig,
   window: Window,
@@ -329,8 +333,11 @@ export async function readWindow(
     for (const row of page.data) {
       aggregate.add(row ?? {});
     }
-    if (!page.hasMore || page.data.length === 0) {
+    if (!page.hasMore) {
       return { pages, truncated: false };
+    }
+    if (page.data.length === 0) {
+      throw new Error(`Logging API answered an empty page with hasMore (offset ${offset})`);
     }
     if (pages >= MAX_PAGES) {
       return { pages, truncated: true };
