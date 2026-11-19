@@ -156,6 +156,20 @@ sample 5 5 tiles_bunny_tile_requests 'zoom="5",cache="MISS"' 40
 sample 5 5 tiles_bunny_tile_requests 'zoom="7",cache="HIT"' 30
 sample 5 5 tiles_bunny_tile_requests 'zoom="7",cache="MISS"' 10
 
+# --- "Probe first byte, misses" and "hits" (panels 53 and 54) -------------
+# Case 15: per continent, every response weighs the same, whichever target it
+# came from. EU misses: the random tile in three runs, the popular one once
+# (after a purge): (100 + 200 + 300 + 1000) / 4, not (200 + 1000) / 2. EU hits:
+# the popular tile in three runs, the random one once.
+sample 15 25 tiles_bunny_probe_ttfb_ms 'continent="EU",kind="miss",target="miss"' 100
+sample 15 15 tiles_bunny_probe_ttfb_ms 'continent="EU",kind="miss",target="miss"' 200
+sample 15 5 tiles_bunny_probe_ttfb_ms 'continent="EU",kind="miss",target="miss"' 300
+sample 15 15 tiles_bunny_probe_ttfb_ms 'continent="EU",kind="miss",target="hit"' 1000
+sample 15 25 tiles_bunny_probe_ttfb_ms 'continent="EU",kind="hit",target="hit"' 20
+sample 15 15 tiles_bunny_probe_ttfb_ms 'continent="EU",kind="hit",target="hit"' 30
+sample 15 5 tiles_bunny_probe_ttfb_ms 'continent="EU",kind="hit",target="hit"' 40
+sample 15 15 tiles_bunny_probe_ttfb_ms 'continent="EU",kind="hit",target="miss"' 200
+
 curl -fsS -X POST --data-binary @"$work/samples.prom" "$vm/api/v1/import/prometheus"
 curl -fsS "$vm/internal/force_flush" >/dev/null
 
@@ -171,6 +185,9 @@ check 'probe-slow: slow misses in two runs, not one, nor one outlier' 4 "$slow" 
 
 check 'cache hits by zoom: zero for misses only, gap for no requests' 5 "$(panel_expr 50 A 10m)" \
   "$(printf '%s\n' 'zoom=5 0' 'zoom=7 0.75')"
+
+check 'first byte, misses: weighted by responses, not by target' 15 "$(panel_expr 53 A 30m)" 'continent=EU 400'
+check 'first byte, hits: weighted by responses, not by target' 15 "$(panel_expr 54 A 30m)" 'continent=EU 72.5'
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures check(s) failed" >&2
