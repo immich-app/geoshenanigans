@@ -9,8 +9,9 @@ import { probeDue, runProbe } from './probe';
  * BUNNY_PROBE_INTERVAL_MINUTES. Each is skipped (and says so in its runs metric) without its settings. Never rejects.
  *
  * Per run the log reader makes one lag query and at most 2 × MAX_PAGES (+ retries) page requests to the Logging API (3
- * requests in all at today's volume), REQUEST_SPACING_MS apart, and two o11y POSTs; a probe run 2 measurements, up to
- * ~90 polls and two POSTs. Both stay far under a scheduled run's subrequest, CPU and 15-minute wall time limits.
+ * requests in all at today's volume), REQUEST_SPACING_MS apart, and two o11y POSTs; a probe run one TileJSON read, 2
+ * measurements, up to ~90 polls and two POSTs. Both stay far under a scheduled run's subrequest, CPU and 15-minute wall
+ * time limits.
  */
 export async function runBunnyCron(
   env: WorkerEnv,
