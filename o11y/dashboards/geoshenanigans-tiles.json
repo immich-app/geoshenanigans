@@ -1414,7 +1414,7 @@
     {
       "type": "stat",
       "title": "Last sync",
-      "description": "The status of the latest Tiles Sync run in the past 26h (tiles-sync.yml, twice a day). skipped: the newest Protomaps build was live already. guard_rail: more positions changed than the guard rail allows; schema_changed: the build's schema version differs from the live one's. Both upload nothing.",
+      "description": "The status of the latest Tiles Sync run in the past 26h (tiles-sync.yml, twice a day). skipped: the newest Protomaps build was live already, or the schedule is held (TILES_SYNC_HOLD). guard_rail: more positions changed than the guard rail allows; schema_changed: the build's schema version differs from the live one's. Both upload nothing. no_state: the state zone has no state.json (before the first load).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1507,6 +1507,21 @@
                 "value": {
                   "mode": "fixed",
                   "fixedColor": "orange"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "no_state"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "yellow"
                 }
               }
             ]
@@ -2731,8 +2746,8 @@
     },
     {
       "type": "timeseries",
-      "title": "Bunny requests/s by edge region",
-      "description": "Every request by the Bunny edge location that served it.",
+      "title": "Bunny requests/s by edge location",
+      "description": "Every request by the Bunny edge location (the log's edgeLocation, e.g. DE or UK) that served it.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2776,8 +2791,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (region) (sum_over_time(tiles_bunny_requests{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])) / ($__interval_ms / 1000)",
-          "legendFormat": "{{region}}",
+          "expr": "sum by (edge_location) (sum_over_time(tiles_bunny_requests{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])) / ($__interval_ms / 1000)",
+          "legendFormat": "{{edge_location}}",
           "refId": "A",
           "range": true
         }
@@ -2792,7 +2807,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Bunny bytes/s by edge region",
+      "title": "Bunny bytes/s by edge location",
       "description": "Bytes sent to clients, by edge location.",
       "datasource": {
         "type": "prometheus",
@@ -2837,8 +2852,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (region) (sum_over_time(tiles_bunny_bytes{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])) / ($__interval_ms / 1000)",
-          "legendFormat": "{{region}}",
+          "expr": "sum by (edge_location) (sum_over_time(tiles_bunny_bytes{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])) / ($__interval_ms / 1000)",
+          "legendFormat": "{{edge_location}}",
           "refId": "A",
           "range": true
         }
@@ -3159,7 +3174,7 @@
     {
       "type": "timeseries",
       "title": "Probe first byte, misses",
-      "description": "The synthetic probe's time to first byte for a never-requested tile, by region. The dashed line is the bunny-probe-slow alert's 1s.",
+      "description": "The synthetic probe's time to first byte for a never-requested tile, by the continent of the Globalping probe. The dashed line is the bunny-probe-slow alert's 1s.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3219,8 +3234,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "avg by (region) (avg_over_time(tiles_bunny_probe_ttfb_ms{project=\"geoshenanigans\", cluster=\"tiles\", kind=\"miss\"}[$__interval]))",
-          "legendFormat": "{{region}}",
+          "expr": "avg by (continent) (avg_over_time(tiles_bunny_probe_ttfb_ms{project=\"geoshenanigans\", cluster=\"tiles\", kind=\"miss\"}[$__interval]))",
+          "legendFormat": "{{continent}}",
           "refId": "A",
           "range": true
         }
@@ -3236,7 +3251,7 @@
     {
       "type": "timeseries",
       "title": "Probe first byte, hits",
-      "description": "The synthetic probe's time to first byte for a cached tile, by region.",
+      "description": "The synthetic probe's time to first byte for a cached tile, by the continent of the Globalping probe.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3280,8 +3295,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "avg by (region) (avg_over_time(tiles_bunny_probe_ttfb_ms{project=\"geoshenanigans\", cluster=\"tiles\", kind=\"hit\"}[$__interval]))",
-          "legendFormat": "{{region}}",
+          "expr": "avg by (continent) (avg_over_time(tiles_bunny_probe_ttfb_ms{project=\"geoshenanigans\", cluster=\"tiles\", kind=\"hit\"}[$__interval]))",
+          "legendFormat": "{{continent}}",
           "refId": "A",
           "range": true
         }
@@ -3297,7 +3312,7 @@
     {
       "type": "timeseries",
       "title": "Probe errors",
-      "description": "Failed probe requests by region and kind, and probe runs that failed as a whole. The bunny-probe-errors alert fires when over half the runs in 15 minutes saw one.",
+      "description": "Failed probe requests by continent and kind, and probe runs that failed as a whole at Globalping. The bunny-probe-errors alert fires when over half the runs in 30 minutes saw an error in a continent and kind, and bunny-probe-failing when over half failed as a whole.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3341,8 +3356,8 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (region, kind) (sum_over_time(tiles_bunny_probe_errors{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval]))",
-          "legendFormat": "{{region}} {{kind}}",
+          "expr": "sum by (continent, kind) (sum_over_time(tiles_bunny_probe_errors{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval]))",
+          "legendFormat": "{{continent}} {{kind}}",
           "refId": "A",
           "range": true
         },
