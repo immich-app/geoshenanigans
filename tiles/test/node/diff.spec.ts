@@ -1,3 +1,7 @@
+import { execFile } from 'node:child_process';
+import { link, mkdir, readdir, readFile, symlink, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ArchiveRanges } from '../../src/bunny/archive-walk';
 import { DiffKind, diffManifests, DiffRange, DiffTotals, planSync, SyncRange, zoomOf } from '../../src/bunny/diff';
@@ -548,5 +552,82 @@ describe('planSync', () => {
     // Planning with the live manifest alone, as before pending builds were recorded, gets both wrong.
     expect(plainStale).toBeGreaterThan(0);
     expect(plainIdentical).toBeGreaterThan(0);
+  });
+});
+
+describe('bunny:diff', () => {
+  const TILES_DIR = join(import.meta.dirname, '../..');
+  const cli = (...args: string[]) =>
+    promisify(execFile)(process.execPath, ['--import=tsx', 'src/bunny/cli/diff.ts', ...args], { cwd: TILES_DIR }).then(
+      (result) => ({ code: 0, ...result }),
+      (error: { code: number; stdout: string; stderr: string }) => error,
+    );
+  const ndjson = async (path: string) =>
+    (await readFile(path, 'utf8'))
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as SyncRange);
+
+  async function builds() {
+    const r = rng(21);
+    const live = randomBuild(r, 30_000, 341, 0.02);
+    const next = mutateBuild(r, live, 0.02);
+    await mkdir(scratch.path('out'));
+    return { live, next, livePath: await manifestOf(live, '20261117'), newPath: await manifestOf(next, '20261118') };
+  }
+
+  it('writes the ranges to a file of its own and puts it in place once complete', async () => {
+    const { live, next, livePath, newPath } = await builds();
+    const ranges = scratch.path('out/ranges.ndjson');
+    await writeFile(ranges, 'from an earlier run\n');
+    const result = await cli('--old', livePath, '--new', newPath, '--ranges', ranges);
+    expect(result).toMatchObject({ code: 0 });
+    expect(JSON.parse(result.stdout)).toMatchObject({ oldBuild: '20261117', newBuild: '20261118' });
+    expect(await ndjson(ranges)).toEqual(bruteForce(live, next).ranges);
+    expect(await readdir(scratch.path('out'))).toEqual(['ranges.ndjson']);
+
+    const pendingPath = await manifestOf(mutateBuild(rng(22), live, 0.02), '20261119');
+    const planned = await cli('--old', livePath, '--new', newPath, '--pending', pendingPath, '--ranges', ranges);
+    expect(planned).toMatchObject({ code: 0 });
+    expect((await ndjson(ranges)).every((range) => typeof range.verify === 'boolean')).toBe(true);
+  });
+
+  it('refuses a ranges file that is one of the manifests, also through a link', async () => {
+    const { livePath, newPath } = await builds();
+    const pendingPath = await manifestOf(randomBuild(rng(23), 100, 0), '20261119');
+    await link(newPath, scratch.path('out/hard.ndjson'));
+    await symlink(pendingPath, scratch.path('out/soft.ndjson'));
+    const before = await Promise.all([livePath, newPath, pendingPath].map((path) => readFile(path)));
+    for (const ranges of [livePath, scratch.path('out/hard.ndjson'), scratch.path('out/soft.ndjson')]) {
+      const refused = await cli('--old', livePath, '--new', newPath, '--pending', pendingPath, '--ranges', ranges);
+      expect(refused, ranges).toMatchObject({ code: 1 });
+      expect(refused.stderr).toMatch(/is the manifest .*: writing it would destroy the input/);
+    }
+    const after = await Promise.all([livePath, newPath, pendingPath].map((path) => readFile(path)));
+    expect(after).toEqual(before);
+    expect(await readdir(scratch.path('out'))).toEqual(['hard.ndjson', 'soft.ndjson']);
+  });
+
+  it('fails through its own error path when the ranges file cannot be written or the plan fails', async () => {
+    const { livePath, newPath } = await builds();
+    const unwritable = await cli('--old', livePath, '--new', newPath, '--ranges', scratch.path('missing/ranges'));
+    expect(unwritable).toMatchObject({ code: 1 });
+    expect(unwritable.stderr).toMatch(/ENOENT/);
+    expect(unwritable.stderr).not.toMatch(/Unhandled 'error' event/);
+
+    // A plan that fails part-way leaves an earlier ranges file as it was, and no partial file.
+    const ranges = scratch.path('out/ranges.ndjson');
+    await writeFile(ranges, 'from an earlier run\n');
+    const end = zoomEnd(MAX_SAFE_ZOOM);
+    const broken = scratch.path('broken.tman.zst');
+    await writeManifest(broken, { buildKey: '20261118' }, [
+      ...expectedEntries(randomBuild(rng(24), 30_000, 341, 0.02)),
+      { tileId: end, runLength: 1, hash: 'A'.repeat(16) },
+    ]);
+    const failed = await cli('--old', livePath, '--new', broken, '--ranges', ranges);
+    expect(failed).toMatchObject({ code: 1 });
+    expect(failed.stderr).toMatch(/go past zoom 26/);
+    expect(await readFile(ranges, 'utf8')).toBe('from an earlier run\n');
+    expect(await readdir(scratch.path('out'))).toEqual(['ranges.ndjson']);
   });
 });
