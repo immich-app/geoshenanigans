@@ -1303,7 +1303,7 @@ fn a_decode_killed_once_its_members_were_in_leaves_its_dir_marked_and_they_stay(
     put_tree(dir.path(), OLDER_POIS);
 
     let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        STOP_ONCE_IN_PLACE.set(true);
+        SEAM.with_borrow_mut(|s| s.stop = Some(Step::AllIn));
         decode_into_dir(&pois_unit[..], dir.path(), Some(&expected(&pois)))
     }));
 
@@ -1381,7 +1381,8 @@ fn a_dir_the_decode_cant_open_fails_the_decode() {
 #[cfg(unix)]
 #[test]
 fn a_decode_goes_without_a_lock_only_where_the_file_system_has_none() {
-    // The errors taking the lock that hold() lets a decode go on after; any other fails it.
+    // The errors taking the install lock after which a decode goes on without locks; any other
+    // fails it.
     assert!(no_locks_here(&io::Error::from(io::ErrorKind::Unsupported)));
     assert!(no_locks_here(&io::Error::from_raw_os_error(libc::ENOLCK)));
     for code in [libc::EBADF, libc::EINTR, libc::EINVAL, libc::EIO, libc::EACCES, libc::ENOMEM] {
@@ -1390,9 +1391,10 @@ fn a_decode_goes_without_a_lock_only_where_the_file_system_has_none() {
 }
 
 #[test]
-fn a_decode_leaves_the_dirs_of_decodes_still_running() {
-    // A decode holds its dir, written, while another runs from start to end; a leftover that
-    // appears meanwhile stays until a decode starts with neither running.
+fn a_decode_finishes_the_dirs_of_decodes_that_are_gone_but_not_of_one_still_running() {
+    // A decode holds its dir, its members written, while another runs from start to end. The
+    // leftovers that appear meanwhile, dirs whose lock no decode holds, go with that one; the
+    // running decode's dir, locked, stays, and its decode then puts its members in place.
     let (unit, members, dir) = published_places();
     let expect = expected(&members);
     let (path, expect) = (dir.path(), &expect);
@@ -1401,37 +1403,155 @@ fn a_decode_leaves_the_dirs_of_decodes_still_running() {
         v.sort();
         v
     };
+    let leftovers = [".transport.1.8", ".transport.4000000.0"];
 
     std::thread::scope(|s| {
-        let (at_end, held) = std::sync::mpsc::channel();
-        let (go, wait) = std::sync::mpsc::channel();
+        let (at_end, held) = mpsc::channel();
+        let (go, wait) = mpsc::channel();
         let held_unit = HeldAtEnd { bytes: unit.clone(), at: 0, at_end: Some(at_end), go: wait };
         let first = s.spawn(move || decode_into_dir(held_unit, path, Some(expect)).map(|_| ()).map_err(|e| e.to_string()));
         held.recv().unwrap();
         let running = decodes_dirs();
         assert_eq!(running.len(), 1, "{running:?}");
         put_tree(path, LEFTOVERS);
-        let with_leftovers = decodes_dirs();
 
         decode_into_dir(&unit[..], path, Some(expect)).unwrap();
 
-        assert_eq!(decodes_dirs(), with_leftovers);
+        if cfg!(unix) {
+            assert_eq!(decodes_dirs(), running);
+        } else {
+            // No decode takes a lock there, so none can tell a leftover from a running decode's
+            // dir, and none finishes either.
+            let mut all: Vec<String> = running.into_iter().chain(leftovers.map(String::from)).collect();
+            all.sort();
+            assert_eq!(decodes_dirs(), all);
+        }
         go.send(()).unwrap();
         assert_eq!(first.join().unwrap(), Ok(()));
     });
-    assert_eq!(decodes_dirs(), [".transport.1.8", ".transport.4000000.0"]);
-
-    decode_into_dir(&unit[..], path, Some(expect)).unwrap();
 
     if cfg!(unix) {
         assert!(decodes_dirs().is_empty());
     } else {
-        // No decode takes a lock there, so none can tell a leftover from a running decode's dir.
-        assert_eq!(decodes_dirs(), [".transport.1.8", ".transport.4000000.0"]);
+        assert_eq!(decodes_dirs(), leftovers);
     }
     let mut want: Vec<(String, Option<Vec<u8>>)> = members.iter().map(|(n, b)| (n.to_string(), Some(b.clone()))).collect();
     want.sort();
     assert_eq!(tree(path).into_iter().filter(|(rel, _)| !rel.starts_with(".transport.")).collect::<Vec<_>>(), want);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_decode_killed_while_putting_its_members_in_is_undone_before_another_puts_its_own_in() {
+    // Two decodes of the places unit into one dir of older files at once: the second decodes
+    // while the first, putting its members in place, stops as a kill would once it moved the
+    // file its first member replaces into its dir. The second undoes it, that file back in its
+    // place, before it puts its own members in; a decode of the pois unit into the dir then
+    // leaves them as they are.
+    let (_, _, pois, pois_unit) = golden_units().swap_remove(1);
+    let pois_unit = zstd::encode_all(&pois_unit[..], 3).unwrap();
+    let (unit, members, dir) = published_places();
+    let (path, expect) = (dir.path(), &expected(&members));
+    let first = members[0].0;
+
+    let (killed, replaced, second) = std::thread::scope(|s| {
+        let (at_end, held) = mpsc::channel();
+        let (go, wait) = mpsc::channel();
+        let held_unit = HeldAtEnd { bytes: unit.clone(), at: 0, at_end: Some(at_end), go: wait };
+        let second = s.spawn(move || decode_into_dir(held_unit, path, Some(expect)).map(|_| ()).map_err(|e| e.to_string()));
+        held.recv().unwrap();
+        let killed = s
+            .spawn(|| {
+                SEAM.with_borrow_mut(|s| s.stop = Some(Step::MovedAway));
+                decode_into_dir(&unit[..], path, Some(expect))
+            })
+            .join()
+            .is_err();
+        // Where the first member goes, and the file it replaces, in the killed decode's dir.
+        let replaced: Vec<(String, Option<Vec<u8>>)> = tree(path)
+            .into_iter()
+            .filter(|(rel, _)| *rel == first || rel.ends_with(&format!("/.earlier.{first}")))
+            .map(|(rel, b)| (rel.rsplit('/').next().unwrap().to_string(), b))
+            .collect();
+        go.send(()).unwrap();
+        (killed, replaced, second.join().unwrap())
+    });
+    decode_into_dir(&pois_unit[..], path, Some(&expected(&pois))).unwrap();
+
+    assert!(killed);
+    assert_eq!(replaced, [(format!(".earlier.{first}"), Some(b"an older build's".to_vec()))]);
+    assert_eq!(second, Ok(()));
+    let (_, _, want) = published_places();
+    for (name, bytes) in members.iter().chain(&pois) {
+        std::fs::write(want.path().join(name), bytes).unwrap();
+    }
+    assert_eq!(tree(path), tree(want.path()));
+}
+
+/// Receives the steps `told` tells onto `seen`, up to `want`.
+fn told_up_to(told: &mpsc::Receiver<(&'static str, Step)>, seen: &mut Vec<(&'static str, Step)>, want: (&'static str, Step)) {
+    loop {
+        let got = told.recv().unwrap();
+        seen.push(got);
+        if got == want {
+            return;
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_decode_puts_its_members_in_only_once_another_let_go_of_the_install_lock() {
+    // Decodes A and B of the places unit into one dir: B decodes while A is held at a step at
+    // which it holds the install lock, making its dir or putting its members in place, up to
+    // having removed its dir. B, its members decoded, waits for the lock while A is held, and
+    // takes it only once A let go of it.
+    for at in [Step::Made, Step::MovedAway, Step::AllIn, Step::Done] {
+        let (unit, members, dir) = published_places();
+        let (path, expect) = (dir.path(), &expected(&members));
+        let (tell, told) = mpsc::channel();
+        let mut seen = Vec::new();
+
+        let (a, b, meanwhile) = std::thread::scope(|s| {
+            let (at_end, held) = mpsc::channel();
+            let (go_b, wait_b) = mpsc::channel();
+            let held_unit = HeldAtEnd { bytes: unit.clone(), at: 0, at_end: Some(at_end), go: wait_b };
+            let tell_b = tell.clone();
+            let b = s.spawn(move || {
+                SEAM.with_borrow_mut(|s| s.tell = Some(("B", tell_b)));
+                decode_into_dir(held_unit, path, Some(expect)).map(|_| ()).map_err(|e| e.to_string())
+            });
+            held.recv().unwrap();
+            let (go_a, wait_a) = mpsc::channel();
+            let tell_a = tell.clone();
+            let unit = &unit;
+            let a = s.spawn(move || {
+                SEAM.with_borrow_mut(|s| {
+                    s.tell = Some(("A", tell_a));
+                    s.hold = Some((at, wait_a));
+                });
+                decode_into_dir(&unit[..], path, Some(expect)).map(|_| ()).map_err(|e| e.to_string())
+            });
+            told_up_to(&told, &mut seen, ("A", at));
+            go_b.send(()).unwrap();
+            told_up_to(&told, &mut seen, ("B", Step::WaitsToInstall));
+            let meanwhile = told.recv_timeout(std::time::Duration::from_millis(500));
+            go_a.send(()).unwrap();
+            (a.join().unwrap(), b.join().unwrap(), meanwhile)
+        });
+        drop(tell);
+        seen.extend(told.iter());
+
+        assert_eq!(meanwhile, Err(mpsc::RecvTimeoutError::Timeout), "{at:?}");
+        assert_eq!((a, b), (Ok(()), Ok(())), "{at:?}");
+        if at != Step::Made {
+            let when = |step| seen.iter().position(|s| *s == step).unwrap();
+            assert!(when(("A", Step::Done)) < when(("B", Step::Installs)), "{at:?}: {seen:?}");
+        }
+        let mut want: Vec<(String, Vec<u8>)> = members.iter().map(|(n, b)| (n.to_string(), b.clone())).collect();
+        want.sort();
+        assert_eq!(dir_files(path), want, "{at:?}");
+    }
 }
 
 #[test]

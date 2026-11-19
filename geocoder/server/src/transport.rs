@@ -243,17 +243,27 @@ pub struct Expected {
 /// (INSTALLED) and removes those files and its dir.
 ///
 /// Besides those it touches only what decodes into `dir` that stopped before they could clean up
-/// (their process killed, say) left. On unix a decode holds a shared lock on `dir` while it runs,
-/// and one that finds no other decode holding it first finishes each of those decodes, by its
-/// dir (finish_leftover): one that had put all its members in place loses the files they
+/// (their process killed, say) left. On unix decodes take two locks, both flock's, exclusive:
+/// the install lock, on `dir`, and each decode's own lock, on its own dir, held from just after
+/// it makes that dir until after it removes it. A decode takes the install lock, finishes what
+/// decodes that are gone left (below), makes its dir and takes its lock, and lets go of the
+/// install lock; it decodes its members, as other decodes do theirs at the same time; then it
+/// takes the install lock again, finishes what decodes that died meanwhile left, puts its
+/// members in place, removes its dir and only then lets go of the install lock. So installs go
+/// one at a time, and one killed part-way is finished before any later one goes in, never after
+/// it.
+///
+/// To finish leftovers a decode tries the lock of each decode's dir in `dir`: one held is a
+/// running decode's, decoding into it, and stays; one it takes is a dead decode's, and is
+/// finished (finish_leftover). One that had put all its members in place loses the files they
 /// replaced, and its dir; one that had not is undone, each file it replaced put back in its
 /// place, over the member that went in or where it had left none, and its dir removed. A member
 /// such a decode put in place that replaced no file stays: it is complete, and checked as that
 /// decode checks its members. A dir that can't be read, or holding a file that can't go back (a
 /// directory in its place, say), stays, as do the files still in it, for a later decode to
-/// finish. None is finished while another decode of this machine runs in `dir`, on a file system
-/// without locks, or on platforms other than unix. Nothing else: a `<member>.tmp` there, say,
-/// stays as it is.
+/// finish. Nothing else: a `<member>.tmp` there, say, stays as it is. On a file system without
+/// locks, or on platforms other than unix, decodes take no locks at all: they finish no
+/// leftovers, which stay until removed by hand, and their installs are not serialised.
 ///
 /// On an error `dir` is as it was once leftovers were finished: the members moved in so far are
 /// taken out again, the files they replaced put back, and nothing of the decode is left (put_back
@@ -262,15 +272,15 @@ pub struct Expected {
 /// locks.
 ///
 /// Decodes of a unit into one dir at once each put complete, checked members in place, the last
-/// to move a member in winning; one that fails while another is putting its members in may undo
-/// some of that one's. One killed while others run in the dir is finished only once none does:
-/// undone then, it puts back the files it replaced over any member a decode put in place since.
+/// to install winning; with installs one at a time, one that fails undoes only its own. Where
+/// decodes take no locks, the last to move a member in wins, and one that fails while another is
+/// putting its members in may undo some of that one's.
 ///
-/// All of this holds for the decodes of one machine. The lock is flock's, and on a network file
-/// system (NFS, SMB) a lock on a dir is seen only by the machine that takes it: a decode on
-/// another machine, into a dir both share, finds no decode holding it and may finish this one's
-/// dir while it runs, leaving older files in place of its members or failing it. Such a dir is
-/// to be decoded into from one machine at a time.
+/// All of this holds for the decodes of one machine. On a network file system (NFS, SMB) a lock
+/// on a dir is seen only by the machine that takes it: a decode on another machine, into a dir
+/// both share, takes the install lock while this one holds it and finds this one's dir unlocked,
+/// so it may finish that dir while this decode runs, leaving older files in place of its members
+/// or failing it. Such a dir is to be decoded into from one machine at a time.
 ///
 /// A unit's members lie in `dir` beside the files they replace for a while: it needs their size
 /// free there.
@@ -305,6 +315,7 @@ pub fn decode_into_dir(unit: impl Read, dir: &Path, expect: Option<&[Expected]>)
         }
         members.push(m);
     }
+    staging.install(dir)?;
     staging.put_in_place(dir, &members)?;
     Ok((kind, members))
 }
@@ -320,47 +331,49 @@ static STAGINGS: AtomicU64 = AtomicU64::new(0);
 /// The dir of a decode into a dir, in that dir: it holds the members as they decode (and a place
 /// unit's block table), then the files they replace while they go in place, and INSTALLED once
 /// all are in until those files are gone. Dropped, it removes the members it still holds, then
-/// itself if empty, and only then lets go of its hold on the dir.
+/// itself if empty, and only then lets go of its own lock and, after that, of the install lock.
 struct Staging {
     path: PathBuf,
     /// The members' files made in it.
     made: Vec<PathBuf>,
-    /// Dropped after the fields above and Drop::drop.
-    _hold: Hold,
+    /// Whether decodes into its dataset dir take locks: not on a file system without them, nor
+    /// on platforms other than unix.
+    locks: bool,
+    /// Its own lock, an exclusive flock on it, from just after it is made: a sweep that finds it
+    /// held leaves the dir alone. Dropped after Drop::drop.
+    _own: Option<File>,
+    /// The install lock, from install() on. Dropped after the own lock.
+    installing: Option<File>,
 }
 
-/// A decode's shared lock on the dir it decodes into, held from before its own dir is made until
-/// after that is removed (none on a file system without locks).
-struct Hold {
-    _lock: Option<File>,
-}
-
-/// Takes a hold on `dir`; if no other decode holds one, first finishes what the decodes that
-/// stopped without removing their dirs left (finish_leftovers): with every live decode holding
-/// its lock, those are all the decodes' dirs in `dir`, unless decodes on other machines run there
-/// too, whose locks this one doesn't see (decode_into_dir). A dir that can't be opened is an
-/// error. On a file system without locks the decode goes without a hold, and finishes none: there
-/// no decode can tell another's dir from a leftover.
+/// Opens `path` and takes an exclusive flock on it, waiting while another holds one.
 #[cfg(unix)]
-fn hold(dir: &Path) -> io::Result<Hold> {
-    let lock = File::open(dir).map_err(|e| at(dir, e))?;
-    match lock.try_lock() {
-        Ok(()) => {
-            finish_leftovers(dir);
-            lock.unlock().map_err(|e| at(dir, e))?;
+fn locked(path: &Path) -> io::Result<File> {
+    let file = File::open(path)?;
+    loop {
+        match file.lock() {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            taken => return taken.map(|()| file),
         }
-        Err(std::fs::TryLockError::WouldBlock) => {}
-        Err(std::fs::TryLockError::Error(e)) if no_locks_here(&e) => return Ok(Hold { _lock: None }),
-        Err(std::fs::TryLockError::Error(e)) => return Err(at(dir, e)),
     }
-    // Waits while another decode finishes leftovers; the dir this one makes comes after.
-    lock.lock_shared().map_err(|e| at(dir, e))?;
-    Ok(Hold { _lock: Some(lock) })
+}
+
+/// The install lock of the dataset dir `dir`: an exclusive flock on it, waiting while another
+/// decode holds it. A decode holds it while it finishes leftovers and makes its own dir, and
+/// again while it finishes leftovers and puts its members in place. None on a file system
+/// without locks. A dir that can't be opened, or a lock that fails otherwise, is an error.
+#[cfg(unix)]
+fn install_lock(dir: &Path) -> io::Result<Option<File>> {
+    match locked(dir) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(e) if no_locks_here(&e) => Ok(None),
+        Err(e) => Err(at(dir, e)),
+    }
 }
 
 #[cfg(not(unix))]
-fn hold(_dir: &Path) -> io::Result<Hold> {
-    Ok(Hold { _lock: None })
+fn install_lock(_dir: &Path) -> io::Result<Option<File>> {
+    Ok(None)
 }
 
 /// Whether `e`, an error taking a lock, says the file system has no locks.
@@ -382,17 +395,27 @@ fn is_staging_name(name: &std::ffi::OsStr) -> bool {
 /// replaced are removed: a hidden name, which no member has.
 const INSTALLED: &str = ".installed";
 
-/// Finishes what each decode into `dir` that stopped before it could clean up left: its dir
-/// (finish_leftover); what can't be read stays.
+/// Finishes what each decode into `dir` that is gone left, its dir (finish_leftover); called with
+/// the install lock held. A decode's dir whose lock it takes is one whose decode is gone (a
+/// running decode holds its dir's lock from just after it made it until after it removed it):
+/// it is finished, the lock held meanwhile. One whose lock is held (WouldBlock) is a running
+/// decode's, decoding into it, and stays, as does one that can't be opened or locked.
 #[cfg(unix)]
 fn finish_leftovers(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
-        if is_staging_name(&e.file_name()) && e.file_type().is_ok_and(|t| t.is_dir()) {
+        if !is_staging_name(&e.file_name()) || !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let Ok(lock) = File::open(e.path()) else { continue };
+        if lock.try_lock().is_ok() {
             let _ = finish_leftover(dir, &e.path());
         }
     }
 }
+
+#[cfg(not(unix))]
+fn finish_leftovers(_dir: &Path) {}
 
 /// Finishes the decode into `dir` whose dir is `leftover`. If all its members went in (it holds
 /// INSTALLED), the files they replaced are stale and go. If not, it is undone as put_back would
@@ -422,12 +445,59 @@ fn finish_leftover(dir: &Path, leftover: &Path) -> io::Result<()> {
     std::fs::remove_dir_all(leftover)
 }
 
+/// Where a decode into a dir is, as it tells the tests' seam (which outside tests does nothing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// Its own dir made, the install lock held, before it locks the dir.
+    Made,
+    /// Its members decoded, before it takes the install lock to put them in place.
+    WaitsToInstall,
+    /// The install lock taken, before it finishes leftovers.
+    Installs,
+    /// A file a member replaces moved into its dir, before the member goes in.
+    MovedAway,
+    /// All its members in place and INSTALLED made, before it removes the files they replaced.
+    AllIn,
+    /// Its dir removed, the install lock taken for its install still held, before it lets go
+    /// of its locks.
+    Done,
+}
+
+#[cfg(not(test))]
+fn seam(_: Step) {}
+
+/// What a test has the decodes on this thread do at each Step.
+#[cfg(test)]
+#[derive(Default)]
+struct Seam {
+    /// Where each step is told, with whose decode it is.
+    tell: Option<(&'static str, mpsc::Sender<(&'static str, Step)>)>,
+    /// The step at which the next decode waits for a word, once.
+    hold: Option<(Step, mpsc::Receiver<()>)>,
+    /// The step at which the next decode stops, as one killed there would: it panics, and its
+    /// dir stays with what it holds but the members it still made there.
+    stop: Option<Step>,
+}
+
 #[cfg(test)]
 thread_local! {
-    /// Set by a test: the next decode on this thread stops once all its members are in place,
-    /// before it removes the files they replaced, as one killed there would (put_in_place
-    /// panics, and its dir stays).
-    static STOP_ONCE_IN_PLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static SEAM: std::cell::RefCell<Seam> = std::cell::RefCell::new(Seam::default());
+}
+
+#[cfg(test)]
+fn seam(step: Step) {
+    let stop = SEAM.with_borrow_mut(|s| {
+        if let Some((who, tell)) = &s.tell {
+            let _ = tell.send((who, step));
+        }
+        if let Some((_, go)) = s.hold.take_if(|(at, _)| *at == step) {
+            let _ = go.recv();
+        }
+        s.stop.take_if(|at| *at == step).is_some()
+    });
+    if stop {
+        panic!("the decode stops here, as one killed here would");
+    }
 }
 
 /// A member moved into place (once `installed`), the file it replaced moved to `earlier`.
@@ -438,18 +508,49 @@ struct Moved {
 }
 
 impl Staging {
-    /// A new dir in `dir`, under a name no member has, once it holds `dir`: one of that name
-    /// already there (an earlier process of this pid's, say) is skipped, never taken.
+    /// A new dir in `dir`, under a name no member has, once it finished what decodes that are
+    /// gone left there (finish_leftovers). It takes the install lock for that, and lets go of it
+    /// only once its dir is made and locked: no sweep finds the dir before its lock is held. One
+    /// of that name already there (an earlier process of this pid's, say) is skipped, never
+    /// taken.
     fn new_in(dir: &Path) -> io::Result<Staging> {
-        let hold = hold(dir)?;
-        loop {
+        let install = install_lock(dir)?;
+        let locks = install.is_some();
+        if locks {
+            finish_leftovers(dir);
+        }
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut staging = loop {
             let path = dir.join(format!(".transport.{}.{}", std::process::id(), STAGINGS.fetch_add(1, Ordering::Relaxed)));
             match std::fs::create_dir(&path) {
-                Ok(()) => return Ok(Staging { path, made: Vec::new(), _hold: hold }),
+                Ok(()) => break Staging { path, made: Vec::new(), locks, _own: None, installing: None },
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(e) => return Err(at(&path, e)),
             }
+        };
+        seam(Step::Made);
+        #[cfg(unix)]
+        if locks {
+            staging._own = Some(locked(&staging.path).map_err(|e| at(&staging.path, e))?);
         }
+        drop(install);
+        Ok(staging)
+    }
+
+    /// Takes the install lock on `dir`, waiting while another decode holds it, and finishes what
+    /// decodes that are gone left (finish_leftovers), before its members go in place: a decode
+    /// killed while it put its members in is undone before any later decode puts its own in,
+    /// never after. The lock is held until this is dropped. Nothing where decodes take no locks.
+    fn install(&mut self, dir: &Path) -> io::Result<()> {
+        if self.locks {
+            seam(Step::WaitsToInstall);
+            self.installing = install_lock(dir)?;
+            seam(Step::Installs);
+            if self.installing.is_some() {
+                finish_leftovers(dir);
+            }
+        }
+        Ok(())
     }
 
     /// The new file the member `name` decodes to.
@@ -475,10 +576,7 @@ impl Staging {
         if let Err(e) = File::create(&installed) {
             return Err(put_back(moved, at(&installed, e)));
         }
-        #[cfg(test)]
-        if STOP_ONCE_IN_PLACE.take() {
-            panic!("the decode stops here, as one killed here would");
-        }
+        seam(Step::AllIn);
         let mut removed = true;
         for earlier in moved.iter().filter_map(|m| m.earlier.as_ref()) {
             removed &= std::fs::remove_file(earlier).is_ok();
@@ -499,8 +597,12 @@ impl Staging {
                 // A hidden name, which no member's file here has.
                 let earlier = self.path.join(format!(".earlier.{name}"));
                 match std::fs::rename(&dest, &earlier) {
-                    Ok(()) => Some(earlier),
-                    // Moved away since, by another decode of this dir.
+                    Ok(()) => {
+                        seam(Step::MovedAway);
+                        Some(earlier)
+                    }
+                    // Moved away since, by another decode of this dir installing at the same time
+                    // (where decodes take no locks).
                     Err(e) if e.kind() == io::ErrorKind::NotFound => None,
                     Err(e) => return Err(at(&dest, e)),
                 }
@@ -544,6 +646,9 @@ impl Drop for Staging {
             let _ = std::fs::remove_file(f);
         }
         let _ = std::fs::remove_dir(&self.path);
+        if self.installing.is_some() {
+            seam(Step::Done);
+        }
     }
 }
 

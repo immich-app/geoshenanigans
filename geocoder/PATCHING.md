@@ -123,39 +123,55 @@ dir first and are removed once all are in. On any error the dataset dir is
 as it was once the decode finished what killed decodes left there (below):
 the files moved in so far are taken out again and the ones they replaced put
 back. Two decodes of one unit into a dir at once on one machine each put
-complete files in place. So a download needs the largest unit's files' size
-free beside the dataset (planet `poi/all`: 1.16 GB), and a unit that fails is
-fetched again whole. Decoding holds the zstd window (8 MiB)
-and one chunk of the unit's columns (1 MiB, more only for a single polygon or
-arc larger than that).
+complete files in place, the later install's standing. So a download needs
+the largest unit's files' size free beside the dataset (planet `poi/all`:
+1.16 GB), and a unit that fails is fetched again whole. Decoding holds the
+zstd window (8 MiB) and one chunk of the unit's columns (1 MiB, more only for
+a single polygon or arc larger than that).
 
 A decode that stops before it can clean up (its process killed, the machine
 off) leaves its dir behind, perhaps part way through moving files into place.
-On unix every decode holds a shared lock on the dataset dir while it runs, and
-one that starts while no other holds it first finishes each
-`.transport.<pid>.<n>` dir there. A decode puts an empty `.installed` in its
-dir once all its files are in place, before it removes the ones they replaced:
-a dir holding it is removed, with those files, and the decode's files stay. A
-dir without it is undone: each file the decode replaced (`.earlier.<name>` in
-the dir) goes back to `<name>` in the dataset dir, over the decode's file or
-where there is none, then the dir is removed. A file the decode moved in that
-replaced none stays, complete and checked as any decoded file is. A dir that
-can't be read, or holding a file that can't go back (a directory in its
-place, say), stays with what is still in it, for a later decode to try again;
-so does the dir of a decode that failed and couldn't put back a file it
-replaced (its error names the file). No dir is finished while another decode
-on the same machine runs in the dataset dir, on a file system without locks
-(where decodes take none), or on platforms other than unix; there they stay
-until removed by hand. A decode killed while others ran in the dataset dir is
-finished only once none runs: undone then, it puts back the files it replaced
-over any file a decode put in place since.
+On unix decodes take two locks, both exclusive flock(2) locks: the install
+lock, on the dataset dir, and each decode's own lock, on its own dir. A
+decode:
 
-The lock is an flock(2) lock, and on a network file system (NFS, SMB) a lock
+1. takes the install lock, waiting while another decode holds it;
+2. finishes the leftovers: it tries the lock of each `.transport.<pid>.<n>`
+   dir there; one held is a running decode's, decoding into it, and stays;
+   one it takes is a dead decode's, and is finished (below);
+3. makes its own dir and takes its lock, held until after the dir is
+   removed, then lets go of the install lock;
+4. decodes the unit's files, as other decodes do theirs at the same time;
+5. takes the install lock again and finishes the leftovers again (decodes
+   that died meanwhile; its own dir is locked, so it stays);
+6. moves its files into place, removes its dir and only then lets go of the
+   install lock (on an error, once it put back what it replaced).
+
+So installs go one at a time, and an install killed part way is finished
+before any later install goes in, never after it.
+
+A decode puts an empty `.installed` in its dir once all its files are in
+place, before it removes the ones they replaced: a leftover holding it is
+removed, with those files, and the decode's files stay. A leftover without it
+is undone: each file the decode replaced (`.earlier.<name>` in the dir) goes
+back to `<name>` in the dataset dir, over the decode's file or where there is
+none, then the dir is removed. A file the decode moved in that replaced none
+stays, complete and checked as any decoded file is. A dir that can't be read,
+or holding a file that can't go back (a directory in its place, say), stays
+with what is still in it, for a later decode to try again; so does the dir of
+a decode that failed and couldn't put back a file it replaced (its error names
+the file). On a file system without locks, or on platforms other than unix,
+decodes take no locks at all: none finishes leftovers, which stay until
+removed by hand, and installs are not serialised (the last to move a file in
+wins, and one that fails while another installs may undo some of that one's
+files).
+
+The locks are flock(2) locks, and on a network file system (NFS, SMB) a lock
 on a dir is seen only by the machine that takes it. A decode on one machine,
-into a dataset dir another machine shares, finds no decode holding it and may
-finish the dir of a decode running on the other machine, leaving older files
-in place of that decode's or failing it. Decode into such a dir from one
-machine at a time.
+into a dataset dir another machine shares, takes the install lock while a
+decode on the other machine holds it, and finds that decode's dir unlocked:
+it may finish that dir while the decode runs, leaving older files in place of
+its files or failing it. Decode into such a dir from one machine at a time.
 
 ## latest.json
 
