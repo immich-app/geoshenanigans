@@ -1,0 +1,177 @@
+name: Tiles Bunny Infra
+# OpenTofu for the Bunny tiles zone (deployment/modules/bunny/tiles/README.md). The Bunny account is production only, so
+# pull requests plan prod and main applies it. The unit is left out of tiles-worker.yml's `terragrunt run --all`.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'deployment/modules/bunny/**'
+      - 'deployment/root.hcl'
+      - '.mise/config.toml'
+      - '.mise/mise.lock'
+      - '.github/workflows/tiles-bunny-infra.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'deployment/modules/bunny/**'
+      - 'deployment/root.hcl'
+      - '.mise/config.toml'
+      - '.mise/mise.lock'
+      - '.github/workflows/tiles-bunny-infra.yml'
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  ENVIRONMENT: prod
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: token
+        uses: immich-app/devtools/actions/create-workflow-token@2760f037fd3707bb91b16e4c41dc62b8c512393e # create-workflow-token-action-v3.1.0
+        with:
+          client-id: ${{ secrets.PUSH_O_MATIC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PUSH_O_MATIC_APP_KEY }}
+          permission-contents: read
+
+      - name: Setup Mise
+        uses: immich-app/devtools/actions/use-mise@caac7f7e4298458a14238959504f411fc6cc7f06 # use-mise-action-v3.2.3
+        with:
+          github_token: ${{ steps.token.outputs.token }}
+
+      - name: Check formatting
+        run: |
+          terragrunt hcl fmt --check --diff --working-dir deployment/modules/bunny
+          tofu fmt -check -diff -recursive deployment/modules/bunny
+
+      # tofu test plans every gzip_mode against a mocked provider (tests/tiles.tftest.hcl).
+      - name: Validate
+        working-directory: deployment/modules/bunny/tiles
+        run: |
+          tofu init -backend=false -input=false
+          tofu validate
+          tofu test
+
+  plan:
+    name: Plan
+    needs: check
+    if: github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: deployment/modules/bunny/tiles
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: token
+        uses: immich-app/devtools/actions/create-workflow-token@2760f037fd3707bb91b16e4c41dc62b8c512393e # create-workflow-token-action-v3.1.0
+        with:
+          client-id: ${{ secrets.PUSH_O_MATIC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PUSH_O_MATIC_APP_KEY }}
+          permission-contents: read
+
+      - name: Setup Mise
+        uses: immich-app/devtools/actions/use-mise@caac7f7e4298458a14238959504f411fc6cc7f06 # use-mise-action-v3.2.3
+        with:
+          github_token: ${{ steps.token.outputs.token }}
+
+      # The provider doesn't mark the middleware script's deployment key sensitive, and a plan that replaces or deletes
+      # the script prints it (as does any later error showing it): masked for the rest of the job.
+      - name: Mask the middleware script's deployment key
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+        run: |
+          set -euo pipefail
+          state=$(op run --env-file=bunny.env -- terragrunt run --non-interactive --tf-forward-stdout -- state pull)
+          jq -r '.resources[]? | select(.type == "bunnynet_compute_script") | .instances[]?.attributes.deployment_key // empty' <<<"$state" |
+            while IFS= read -r key; do
+              echo "::add-mask::$key"
+            done
+
+      - name: Plan
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+        run: op run --env-file=bunny.env -- terragrunt run --non-interactive -- plan
+
+  apply:
+    name: Apply
+    needs: check
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Applies of this state never overlap, whatever ran them.
+    concurrency:
+      group: tiles-bunny-apply
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: deployment/modules/bunny/tiles
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - id: token
+        uses: immich-app/devtools/actions/create-workflow-token@2760f037fd3707bb91b16e4c41dc62b8c512393e # create-workflow-token-action-v3.1.0
+        with:
+          client-id: ${{ secrets.PUSH_O_MATIC_APP_CLIENT_ID }}
+          private-key: ${{ secrets.PUSH_O_MATIC_APP_KEY }}
+          permission-contents: read
+
+      - name: Setup Mise
+        uses: immich-app/devtools/actions/use-mise@caac7f7e4298458a14238959504f411fc6cc7f06 # use-mise-action-v3.2.3
+        with:
+          github_token: ${{ steps.token.outputs.token }}
+
+      # The storage zones existed before this module: applied without them in the state, it would try to create zones
+      # whose names are taken. They are imported by hand once (README.md).
+      - name: Check the storage zones are imported
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+        run: |
+          set -euo pipefail
+          state=$(op run --env-file=bunny.env -- terragrunt run --non-interactive --tf-forward-stdout -- state list)
+          for address in bunnynet_storage_zone.tiles bunnynet_storage_zone.state; do
+            if ! grep -qx "$address" <<<"$state"; then
+              echo "::error::$address is not in the state: import it first (deployment/modules/bunny/tiles/README.md)"
+              exit 1
+            fi
+          done
+
+      # The provider doesn't mark the middleware script's deployment key sensitive, and a plan that replaces or deletes
+      # the script prints it (as does any later error showing it): masked for the rest of the job.
+      - name: Mask the middleware script's deployment key
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+        run: |
+          set -euo pipefail
+          state=$(op run --env-file=bunny.env -- terragrunt run --non-interactive --tf-forward-stdout -- state pull)
+          jq -r '.resources[]? | select(.type == "bunnynet_compute_script") | .instances[]?.attributes.deployment_key // empty' <<<"$state" |
+            while IFS= read -r key; do
+              echo "::add-mask::$key"
+            done
+
+      - name: Apply
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+        run: op run --env-file=bunny.env -- terragrunt run --non-interactive -- apply -auto-approve
