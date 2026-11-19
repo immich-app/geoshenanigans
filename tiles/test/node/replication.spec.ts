@@ -1,7 +1,7 @@
 import { execFile, ExecFileException } from 'node:child_process';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { buildManifest } from '../../src/bunny/manifest';
 import {
   checkReplication,
@@ -13,7 +13,7 @@ import {
   waitForReplication,
 } from '../../src/bunny/replication';
 import { BunnyStateStore, publishBuild, writeState } from '../../src/bunny/state';
-import { BunnyStorage, StorageObject } from '../../src/bunny/storage';
+import { BunnyStorage, DEFAULT_RETRY, StorageObject } from '../../src/bunny/storage';
 import { tilePath, zoomEnd } from '../../src/bunny/tile-id';
 import { runSeed } from '../../src/bunny/upload';
 import { FakeStorage, FakeStorageOptions, sha256Hex } from './fake-storage';
@@ -62,6 +62,33 @@ function stubStorage(
     },
   } as unknown as BunnyStorage;
   return { storage, describes };
+}
+
+/**
+ * A fake whose DESCRIBEs get `fault` (from the `from`th attempt on, the ones before answered or failed by `before`),
+ * and a client whose back-offs (10 s) and request timeout (60 s) outlast any test, with the default half-hour budget
+ * for 429s: only a cancelled call returns in time.
+ */
+async function stuckDescribes(
+  fault: 'rate-limit' | 'server-error' | 'hang',
+  { from = 1, before, maxAttempts }: { from?: number; before?: 'server-error'; maxAttempts?: number } = {},
+) {
+  const fake = await FakeStorage.start({
+    regions: REGIONS,
+    fault: ({ method, attempt }) => (method !== 'DESCRIBE' ? undefined : attempt >= from ? fault : before),
+  });
+  const storage = new BunnyStorage({
+    zone: fake.zone,
+    password: fake.password,
+    host: fake.url,
+    timeoutMs: 60_000,
+    retry: { ...DEFAULT_RETRY, baseDelayMs: 10_000, maxDelayMs: 10_000, ...(maxAttempts && { maxAttempts }) },
+  });
+  cleanup.push(
+    () => fake.close(),
+    () => storage.close(),
+  );
+  return { fake, storage };
 }
 
 async function upload(storage: BunnyStorage, count: number): Promise<ReplicationItem[]> {
@@ -215,6 +242,54 @@ describe('waitForReplication', () => {
     }
   });
 
+  it('cancels a DESCRIBE backing off or in flight at the timeout, and keeps its file pending', async () => {
+    for (const fault of ['rate-limit', 'server-error', 'hang'] as const) {
+      const { fake, storage } = await stuckDescribes(fault);
+      const started = performance.now();
+      const result = await waitForReplication(storage, [{ path: 'r/0.mvt', sha256: 'AA' }], REGIONS, {
+        timeoutMs: 300,
+        intervalMs: 20,
+      });
+      // Not the 10 s back-off (or the 60 s request timeout), nor the 30 min the client would keep retrying 429s.
+      expect(performance.now() - started).toBeLessThan(3_000);
+      // The file got its fault, and no answer: pending, not an error, and not missing.
+      expect(fake.faultsInjected[fault]).toBe(1);
+      expect(result).toMatchObject({
+        complete: false,
+        incomplete: 1,
+        errors: 0,
+        missing: [],
+        mismatched: [],
+        passes: 1,
+      });
+      expect(result.stragglers).toEqual([{ path: 'r/0.mvt', regions: REGIONS }]);
+      // Nothing is sent after the timeout.
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(fake.requests.DESCRIBE).toBe(1);
+      expect(storage.inFlight).toBe(0);
+    }
+  });
+
+  it("keeps a file's last outcome, an answer or a failure, when the timeout cancels its next DESCRIBE", async () => {
+    // Shown missing on the first pass, then rate limited until the timeout.
+    const missing = await stuckDescribes('rate-limit', { from: 2 });
+    const shown = await waitForReplication(missing.storage, [{ path: 'r/0.mvt', sha256: 'AA' }], REGIONS, {
+      timeoutMs: 300,
+      intervalMs: 20,
+    });
+    expect(shown).toMatchObject({ complete: false, missing: ['r/0.mvt'], incomplete: 0, errors: 0, passes: 2 });
+    expect(missing.fake.requests.DESCRIBE).toBe(2);
+
+    // Failed on the first pass (one attempt, so no back-off), then rate limited until the timeout: still an error.
+    const failing = await stuckDescribes('rate-limit', { from: 2, before: 'server-error', maxAttempts: 1 });
+    const failed = await waitForReplication(failing.storage, [{ path: 'r/0.mvt', sha256: 'AA' }], REGIONS, {
+      timeoutMs: 300,
+      intervalMs: 20,
+    });
+    expect(failed).toMatchObject({ complete: false, missing: [], incomplete: 1, errors: 1, passes: 2 });
+    expect(failing.fake.faultsInjected).toEqual({ 'server-error': 1, 'rate-limit': 1 });
+  });
+
   it('keeps a file no DESCRIBE answered for pending, even when no region is followed', async () => {
     const { fake } = await setup();
     // Every DESCRIBE fails (after its retries) with a server error: the file was never seen stored.
@@ -356,6 +431,23 @@ describe('checkReplication', () => {
     expect(report).toMatchObject({ checked: 4, replicated: 0, partial: 4 });
     expect(report.regions).toEqual({ UK: 1, SYD: 0 });
     expect(report.coverage).toEqual({ UK: 0.25, SYD: 0 });
+  });
+});
+
+describe('checkReplication with a signal', () => {
+  it('leaves out a DESCRIBE the signal cancelled mid-retry: not checked, not an error', async () => {
+    const { fake, storage } = await stuckDescribes('rate-limit');
+    const controller = new AbortController();
+    const checking = checkReplication(storage, [{ path: tilePath('v1', 0), sha256: 'AA', tileId: 0 }], REGIONS, {
+      signal: controller.signal,
+    });
+    await vi.waitFor(() => expect(storage.counters.rateLimited).toBe(1));
+    const aborted = performance.now();
+    controller.abort();
+    const report = await checking;
+    expect(performance.now() - aborted).toBeLessThan(1_000);
+    expect(report).toMatchObject({ checked: 0, errors: 0, missing: 0, errorPaths: [], byZoom: {} });
+    expect(fake.requests.DESCRIBE).toBe(1);
   });
 });
 

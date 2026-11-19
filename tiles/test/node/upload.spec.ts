@@ -149,13 +149,25 @@ describe('uploadTiles', () => {
       () => fake.close(),
       () => storage.close(),
     );
-    setTimeout(() => controller.abort(), 50);
+    // Stop only once the client has had a 429 and is backing off, so the stop lands in its retry path.
+    let rateLimitedAtStop = 0;
+    const stopped = vi
+      .waitFor(() => expect(storage.counters.rateLimited).toBeGreaterThan(0), { timeout: 10_000, interval: 5 })
+      .then(() => {
+        rateLimitedAtStop = storage.counters.rateLimited;
+        controller.abort();
+      });
     const settled: string[] = [];
     const stats = await uploadTiles(storage, items(10), {
       concurrency: 4,
       signal: controller.signal,
       onSettled: (item, outcome) => settled.push(`${item.tileId}:${outcome}`),
     });
+    await stopped;
+    expect(rateLimitedAtStop).toBeGreaterThan(0);
+    expect(fake.faultsInjected['rate-limit']).toBeGreaterThan(0);
+    // The stop ended the back-offs: no PUT was sent again.
+    expect(storage.counters.retries).toBe(0);
     expect(stats).toMatchObject({ uploaded: 0, failed: 0, stopped: true });
     expect(settled).toEqual([]);
   });
