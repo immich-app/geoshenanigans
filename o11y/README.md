@@ -42,10 +42,13 @@ The worker's error lines and a 1% sample of its requests (`kind:="request"`, wit
 
 ### The Bunny tiles zone
 
-Three more sources land in the tiles tenant (`6:3`), all pushing samples they compute themselves as Prometheus text to `/insert/0/prometheus/api/v1/import/prometheus` with explicit timestamps, as the geocoder's report step does: names are stored as written, with no `:1m_sum_samples` suffix and no `aggregator` label.
+Four more sources land in the tiles tenant (`6:3`), all pushing samples they compute themselves as Prometheus text to `/insert/0/prometheus/api/v1/import/prometheus` with explicit timestamps, as the geocoder's report step does: names are stored as written, with no `:1m_sum_samples` suffix and no `aggregator` label.
 
 - The worker's every-minute cron reads Bunny's CDN request logs (Logging API v2) one closed minute at a time, 3 minutes behind, and pushes that minute's sums stamped at its end: `tiles_bunny_requests`, `tiles_bunny_bytes`, `tiles_bunny_tile_requests`, `tiles_bunny_country_requests`, `tiles_bunny_log_rows`, `tiles_bunny_log_lag_seconds` and `tiles_bunny_log_reader_runs{result}`. Every tenth minute it also runs a Globalping probe of a cached and an uncached tile per continent: `tiles_bunny_probe_ttfb_ms`, `tiles_bunny_probe_errors` and `tiles_bunny_probe_runs`. They carry the worker's identity labels (`provider=cloudflare`, `region=world`), so Bunny's PoP is `edge_location` and the probe's continent `continent`. Add the minutes up with `sum_over_time()`. A sample of the CDN requests goes to VictoriaLogs as `kind:="request" cdn:="bunny"`, the probe's tests as `kind:="probe"`.
 - `tiles-sync.yml`'s report job pushes each daily sync's outcome from the sync CLI's report (`tiles_sync_*`: status, step seconds, positions changed, files and bytes uploaded, replication wait per `storage_region`), and `tiles-sync-watchdog.yml` every 2 hours the live build's age with its heartbeat. They stamp `project=geoshenanigans`, `cluster=tiles`, `env=prod`, `provider=github` and `region=global`, and log with `app` `tiles-sync` or `tiles-sync-watchdog`.
+- Once a day `tiles-sync-watchdog.yml`'s sample job checks 100 random positions per zoom of the live build against its manifest in every storage region and pushes `tiles_sync_sample_runs{result}`, `tiles_sync_sample_checked`, `tiles_sync_sample_missing`, `tiles_sync_sample_mismatched`, `tiles_sync_sample_errors` and `tiles_sync_sample_lacking{storage_region}`, with the same labels and `app` `tiles-sample-check`.
+
+Before the Bunny path goes live, work through the go-live checklist in [`deployment/modules/bunny/tiles/README.md`](../deployment/modules/bunny/tiles/README.md#go-live-checklist): the 1Password items these jobs read must exist before the branch merges.
 
 ## Dashboards
 

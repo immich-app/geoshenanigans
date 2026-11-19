@@ -27,6 +27,8 @@ op run --env-file=bunny.env -- terragrunt apply
 | `TF_VAR_bunny_api_key` | `op://tf_prod/BUNNY_API_KEY/password` | The Bunny account API key (Account settings, API). The purge and the log reader use the same key. |
 | `TF_VAR_tf_state_postgres_conn_str` | `op://tf/tf_state/postgres_conn_str` | The state backend, as in `deployment/.env`. |
 
+The sync, the watchdog and the worker read more items: every one is in the go-live checklist below, and they must exist before the branch merges.
+
 ## First run: import the existing zones
 
 Both storage zones already exist, so import them before the first apply; until then the workflow's apply job stops at its import check instead of trying to create them. Their ids are the numbers in the Bunny dashboard URL of each zone, or:
@@ -76,7 +78,7 @@ The script is uploaded as written, `npm:` import included. On a throwaway zone i
 
 ### Switching modes
 
-Each step is a configuration change (below): a PoP keeps the old one for up to ~48 minutes, and it can get the parts of one apply (script link, routing, rules) at different times. Going straight from `middleware` to `edge_rule` leaves PoPs with the middleware unlinked but no `Content-Encoding` rule yet, which serve tiles as gzip with no `Content-Encoding`. So switch in two steps, each confirmed from probes at every PoP (cached and uncached tiles decode) before the next, at a quiet hour:
+Each step is a configuration change (below): a PoP keeps the old one for up to ~48 minutes, and it can get the parts of one apply (script link, routing, rules) at different times. Going straight from `middleware` to `edge_rule` leaves PoPs with the middleware unlinked but no `Content-Encoding` rule yet, which serve tiles as gzip with no `Content-Encoding`. So switch in two steps, each confirmed from probes at every PoP (cached and uncached tiles decode) before the next, at a quiet hour. There is no tool for that check in the repo yet: use Globalping HTTP measurements from enough locations to reach each PoP above (the `Server` header names it), and check that both tiles gunzip.
 
 1. `middleware` → `both`. In `both`, a tile cached through the middleware breaks for a client that sends no `Accept-Encoding: gzip` (measured; browsers and MapLibre always send it), so don't stay there longer than the PoPs need.
 2. `both` → `edge_rule`, then one full purge once every PoP has it, so tiles cached through the middleware are fetched again.
@@ -92,16 +94,78 @@ The provider doesn't mark the script's `deployment_key` sensitive, and anyone wi
 ## Hostnames and the cutover
 
 - `test_hostname` (`tiles-bunny.immich.cloud`) serves the zone before the DNS cutover. Point a DNS-only (not proxied) CNAME at the `cdn_domain` output, then add the name to `tls_hostnames`: Bunny obtains its certificate over HTTP, so the apply that lists it fails until the record resolves to Bunny.
-- `public_hostname` (`tiles.immich.cloud`) is attached once `serve_public_hostname` is true. It can only get a managed certificate after its DNS points at Bunny, so with a managed certificate HTTPS fails from the DNS switch until the certificate is issued. Avoid that gap with a certificate obtained beforehand (DNS challenge) passed as the hostname's `certificate` and `certificate_key`, or accept it at a quiet hour. The provider doesn't mark `certificate_key` sensitive either: pass it through a `sensitive = true` variable (from 1Password, like the API key) so plans show `(sensitive value)`. Rolling back is pointing the DNS back at the Worker.
+- `public_hostname` (`tiles.immich.cloud`) is attached once `serve_public_hostname` is true. It can only get a managed certificate after its DNS points at Bunny, so with a managed certificate HTTPS fails from the DNS switch until the certificate is issued. Avoid that gap with a certificate obtained beforehand (DNS challenge) passed as the hostname's `certificate` and `certificate_key`, or accept it at a quiet hour. The provider doesn't mark `certificate_key` sensitive either: pass it through a `sensitive = true` variable (from 1Password, like the API key) so plans show `(sensitive value)`. Rolling back is pointing the DNS back at the Worker (Rolling back to the Worker, below).
 - Configuration changes (pull zone, edge rules, hostnames, the script link) can take ~48 minutes to reach every PoP; a new zone answered "Domain suspended or not configured" at one PoP for 20-30 minutes. Make them well ahead of anything that depends on them, and confirm from probes at every PoP. The daily sync changes no configuration: it uploads, purges the pull zone (output `pull_zone_id`) and writes state.
+
+## Go-live checklist
+
+Work through it in order; the first item comes before the branch merges.
+
+1. **Create the 1Password items** and check that each resolves (`op read <ref> > /dev/null`) with the service account that reads its vault. Without them the next scheduled Tiles Sync fails at `op run` and pages (geoshenanigans-tiles-sync-failed), the watchdog sends no heartbeat (geoshenanigans-tiles-watchdog-silent), and every `op run --env-file=.env` in deployment (the Tiles Worker workflow's fmt check and plans on every PR, its apply on `main`, Tiles Deploy's activation) fails, as `deployment/.env` names the first two items in both vaults.
+
+   | Vault | Item (field `password`) | Value | Read by |
+   | --- | --- | --- | --- |
+   | `tf_prod` | `BUNNY_API_KEY` | the Bunny account API key | this unit (`bunny.env`), the sync's purge, the worker's log reader (`deployment/.env`) |
+   | `tf_prod` | `GLOBALPING_TOKEN` | a Globalping API token | the worker's synthetic probe (`deployment/.env`) |
+   | `tf_dev` | `BUNNY_API_KEY`, `GLOBALPING_TOKEN` | any placeholder | `deployment/.env` in dev runs (dev binds neither) |
+   | `tf_prod` | `BUNNY_STORAGE_PASSWORD` | `immich-tiles`' password (read-write) | Tiles Sync, the watchdog's sample check |
+   | `tf_prod` | `BUNNY_STATE_PASSWORD` | `immich-tiles-state`'s password | Tiles Sync, the watchdog |
+   | `tf_prod` | `BUNNY_PULL_ZONE_ID` | the `pull_zone_id` output (step 3) | Tiles Sync's purge |
+
+   `BUNNY_PULL_ZONE_ID` is copied by hand rather than read from this unit's state: the sync job writes production and has no access to the OpenTofu state backend. The worker reads it from the state. `O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD` (`tf_prod`) and `tf_state` (`tf`) exist already.
+2. **Apply this unit**: import the zones (First run, above), plan, apply. That creates the pull zone, its edge rules, the middleware script and the test hostname.
+3. **Copy `pull_zone_id`** into `tf_prod/BUNNY_PULL_ZONE_ID`. The next Tiles Worker apply on `main` starts the log reader.
+4. **Test hostname**: a DNS-only CNAME `tiles-bunny.immich.cloud` → the `cdn_domain` output, then add the name to `tls_hostnames` and apply again (Hostnames and the cutover, above).
+5. **Hold scheduled syncs**: set the repository variable `TILES_SYNC_HOLD` (any text, e.g. "first load") before anything is seeded.
+6. **Load and verify the tiles, then adopt them** (Loading the tiles, below).
+7. **Turn the probe on**: set `"bunny_public_url": "https://tiles-bunny.immich.cloud"` in `deployment/modules/cloudflare/tiles-worker/tiles.prod.tfvars.json` and run the Tiles Worker workflow on `main`. Not before the hostname has its certificate and the seed covers zoom 15: the probe requests random z15 tiles, and geoshenanigans-tiles-bunny-probe-errors pages on 404s. If the zone serves requests while the probe is still off, geoshenanigans-tiles-bunny-probe-off warns.
+8. **Let replication drain**, then clear `TILES_SYNC_HOLD` (Loading the tiles, step 5).
+9. **A week of daily syncs** on the test hostname (plan phase 5), then the cutover.
+
+### The cutover
+
+One change, made at a quiet hour, after `serve_public_hostname` has been applied ~48 minutes ahead (Hostnames and the cutover, above):
+
+- DNS: `tiles.immich.cloud` is today the Worker's custom domain (`cloudflare_workers_domain.tiles_prod` in `deployment/modules/cloudflare/tiles-worker/workers.tf`, a proxied record Cloudflare manages). It becomes a DNS-only CNAME at `cdn_domain` with a short TTL (60 s), so a rollback spreads fast.
+- `BUNNY_PUBLIC_URL` in `.github/workflows/tiles-sync.yml` and `bunny_public_url` in tiles-worker's `tiles.prod.tfvars.json` become `https://tiles.immich.cloud`. The next sync that uploads a build rewrites `v1.json` and the styles and purges (a run of the live build alone is skipped); until then they point tiles at the test hostname, which keeps serving.
+- The Worker's own alerts (geoshenanigans-tiles-silent, -5xx and -slow) watch the Worker's traffic, which stops: remove them or limit them to `tiles.prod.immich.cloud` in the same change, or geoshenanigans-tiles-silent pages within 20 minutes.
+
+### Rolling back to the Worker
+
+For a Bunny outage (the one on 2026-05-21 took CDN, storage and scripts down for 1.7 hours):
+
+1. Check the Worker still serves current tiles: `curl -s https://tiles.prod.immich.cloud/v1.json` answers, and `pmtiles_deployment_key` in tiles-worker's `tiles.prod.tfvars.json` is recent. Tiles Deploy only runs when dispatched, so after weeks on Bunny that build is weeks old: dispatch Tiles Deploy for prod first when there is time, or accept older tiles for the outage.
+2. Delete the CNAME and put the Worker's custom domain back: revert the cutover change and apply tiles-worker, or, faster, in the Cloudflare dashboard (delete the `tiles.immich.cloud` record, then add it as a custom domain of the `tiles-prod` Worker). Clients follow within the CNAME's TTL.
+3. Tiles Sync can keep running: it only writes the Bunny zones, which keeps them current for going back. During the outage itself every run fails; set `TILES_SYNC_HOLD` to keep scheduled runs quiet, and clear it after.
+4. Restore the Worker's alerts if the cutover removed them. Cutting over again is the cutover above.
 
 ## Loading the tiles
 
-The zone's files come from the tiles tooling (`tiles/src/bunny`, run from `tiles/`), not from this module:
+The zone's files come from the tiles tooling (`tiles/src/bunny`, run from `tiles/`), not from this module. The commands need `BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, `BUNNY_STATE_ZONE` and `BUNNY_STATE_PASSWORD`; `bunny:sync` also the API key, pull zone id and public URL (its header lists them).
 
-1. `npm run bunny:seed -- --archive <build>.pmtiles` uploads every position of a build. It is resumable: run the same command again after a stop.
-2. `npm run bunny:sync -- --archive <same build>.pmtiles --build <YYYYMMDD> --adopt` records it as the live build: it checks a sample of positions, uploads the TileJSON and styles, purges the pull zone and writes `state.json`. Nothing writes tiles over a seed: a later sync DESCRIBEs every file before its PUT.
-3. From then on Tiles Sync (`.github/workflows/tiles-sync.yml`) applies each daily build's changed positions. While the seed's files are still replicating, the account-wide replication queue holds the daily changes up past the sync's replication gate: set the `TILES_SYNC_HOLD` repository variable until it drains.
+1. **Seed** every position with `npm run bunny:seed -- --archive <build>.pmtiles --state-dir <dir>`. Run it as separate resumable jobs (plan section 4), each with its own `--state-dir`, so a failure repeats one range: zooms 0-13 (`--min-zoom 0 --max-zoom 13`), zoom 14 in two (`--from-id 89478485 --to-id 223696213`, `--from-id 223696213 --to-id 357913941`) and zoom 15 in eight, from `--from-id 357913941` in steps of 134,217,728 (492131669, 626349397, 760567125, 894784853, 1029002581, 1163220309, 1297438037, up to `--to-id 1431655765`). One job over everything works too. Each job must end `Seed complete` (exit 0); run a job's command again until it does.
+2. **Verify** before adopting: `npm run bunny:replication -- --listing --prefix v1` lists every column of every zoom (4 listings at once, about 4 hours for the planet) and exits 1 if any position has no file; `npm run bunny:replication -- --archive <build>.pmtiles --sample 1000 --per-zoom` checks bytes. Both report each region's coverage.
+3. **Adopt**: `npm run bunny:sync -- --archive <same build>.pmtiles --build <YYYYMMDD> --adopt --seed-state <dir> [--seed-state <dir> ...]`, one `--seed-state` per job. It refuses unless every state dir says its seed completed, for this archive, zone and prefix, and together they cover every position; then it checks a sample of positions, uploads the TileJSON and styles, purges the pull zone and writes `state.json` (with the archive's fingerprint). It writes no tiles.
+4. **Catch up**: while scheduled syncs are held, dispatch Tiles Sync (newest build) to apply the days since the seeded build. The account's replication queue still holds the seed's backlog, so its gate cannot pass in time: dispatch with the `regions` input set to `none`, or to the regions that keep up.
+5. **Wait for replication to drain**, then clear `TILES_SYNC_HOLD`. Replication runs from the first PUT at ~3.7k files/s in Europe, ~3k in the US and Singapore, ~2-2.5k in Tokyo, Hong Kong, Johannesburg and São Paulo, and ~1.3-1.5k in Sydney: for 1.43B files about 4.5 days for Europe and 11-13 days for Sydney. It has drained when `npm run bunny:replication -- --listing --min-zoom 15 --max-zoom 15` shows 100% in every region and exits 0, and the watchdog's daily sample check reports no region lacking (geoshenanigans-tiles-sample-unreplicated resolves). To sync before then, set the repository variable `TILES_SYNC_REGIONS` to the regions that have drained (e.g. `UK,SE,ES,CZ`) and remove it afterwards: a region the gate skips serves the day's changed tiles from Frankfurt until it catches up.
+
+The zone is not live (no DNS cutover) until steps 2 and 5 pass.
+
+## Repairs
+
+- **Reverting a failed or cancelled sync**: dispatch Tiles Sync with the live build as `build`. A sync that failed after its first PUT leaves the build pending, and the zone serves its bytes on a cache miss wherever it changed a tile; syncing the live build again puts the live bytes back there (DESCRIBEing each first), gates, purges and clears `pending`. `npm run bunny:status` lists pending builds.
+- **Missing or wrong files** (geoshenanigans-tiles-sample-wrong, or a listing): `npm run bunny:seed -- --archive <live build>.pmtiles --min-zoom Z --max-zoom Z --verify-existing --state-dir <new dir>` DESCRIBEs every file of those zooms and writes only the missing or wrong ones. After the first adopt, a seed over the live prefix refuses any archive but the live build's (`state.json` records its fingerprint): an older build's bytes would undo daily syncs, and no later diff repairs a position that doesn't change again. With builds pending, revert first (above).
+- **A file that never replicates**: the same paths show up run after run in the sync's log line ("still not replicated: v1/15/x/y.mvt (not in SYD, ...)") while everything else replicates, and a DESCRIBE of one shows the right `Checksum` with regions missing from `ReplicatedZones`. Bunny drops a file's replica list for good when the same bytes are PUT again; the sync DESCRIBEs before every PUT, but a PUT that timed out after Bunny stored it, followed by a DESCRIBE answered before Bunny committed it, can still lead to a second identical PUT. Each such file blocks every later sync (the build stays pending and the gate waits for it again). Let syncs through by dispatching Tiles Sync with the `regions` input listing every region but those the file lacks (or set `TILES_SYNC_REGIONS`), and raise the path with Bunny. Deleting the file and uploading it again may make Bunny replicate it; that is untested, so try it first on a throwaway file in another zone (PUT it twice with the same bytes, then DELETE and PUT).
+
+## Full rewrites
+
+A Protomaps schema change (Tiles Sync stops with `schema_changed`) or a diff over the forced guard rail (2%) goes in under a new tile prefix while the old one keeps serving (plan section 6). Immich keeps loading `/v1/style/{name}.json` and `/v1.json`: those stay where they are, and only the TileJSON's tile template moves.
+
+1. Pick a prefix beside the live one, not inside its zoom folders: live `v1`, new `v1/e2` (tiles at `/v1/e2/{z}/{x}/{y}.mvt`), then `v1/e3`.
+2. Seed the new build under it (`--prefix v1/e2`), as separate jobs like the first load. Scheduled syncs keep stopping at the schema check meanwhile, so the live build ages and geoshenanigans-tiles-sync-stale and -osm-old fire; that is expected.
+3. Wait until the new prefix has replicated: `npm run bunny:replication -- --listing --prefix v1/e2` exits 0.
+4. Switch: `npm run bunny:sync -- --archive <build>.pmtiles --build <YYYYMMDD> --adopt --replace --prefix v1/e2 --seed-state <dir> [...]`. Besides the adopt checks, the sampled positions must be in every region. It writes `v1.json` with the new tile template, waits until every region has it, purges, and makes the build live under `v1/e2`. Daily syncs follow the live prefix from then on; dispatch one to catch up.
+5. A week later, delete the old tiles: `npm run bunny:delete-prefix -- --prefix v1` says what it would delete, then the same with `--yes` deletes the `v1/<z>/` folders (never `v1.json`, `v1/style/` or `v1/e2/`). It refuses the live prefix and any prefix holding it. Storage is double until then.
 
 ## Outputs
 

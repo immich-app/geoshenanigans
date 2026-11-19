@@ -135,7 +135,19 @@ class SyncTest(WithTempDir):
         metrics = by_name(samples)
         self.assertEqual(metrics["tiles_sync_replication_complete"], {(): 0})
         self.assertEqual(metrics["tiles_sync_replication_wait_seconds"], {(("storage_region", "UK"),): 300})
-        self.assertIn("replication INCOMPLETE", log.records[0]["_msg"])
+        # The region that never caught up comes first, not only the slowest one that did.
+        self.assertIn("replication INCOMPLETE, never in SYD, slowest UK 300s", log.records[0]["_msg"])
+
+    def test_an_incomplete_replication_names_the_files_still_missing_a_region(self):
+        stragglers = [{"path": f"v1/15/{i}/7.mvt", "regions": ["SYD", "BR"]} for i in range(7)]
+        _, log = self.run_sync(report={**REPORT, "status": "failed", "replicationComplete": False,
+                                       "replicationWaitSeconds": {"UK": 300, "SYD": None, "BR": None},
+                                       "replicationStragglers": stragglers, "error": "replication incomplete"})
+
+        msg = log.records[0]["_msg"]
+        self.assertIn("never in BR, SYD", msg)
+        self.assertIn("still not replicated: v1/15/0/7.mvt (not in SYD, BR), v1/15/1/7.mvt (not in SYD, BR)", msg)
+        self.assertIn("v1/15/4/7.mvt (not in SYD, BR) and 2 more", msg)
 
     def test_the_guard_rail_keeps_its_status_and_counts(self):
         samples, _ = self.run_sync(report={**REPORT, "status": "guard_rail", "positionsChanged": 90000000,
@@ -314,16 +326,67 @@ class WatchdogTest(WithTempDir):
         self.assertEqual(log.records[0]["level"], "error")
 
 
-# The measured rates the budgets are sized from (SPEC "Bunny facts"), made slower for headroom: uploads ran at 12,838
-# files/s with ~1,500 in flight (the default is 1,200), and Sydney, the slowest region, replicated 1.3-1.5k files/s.
+# The measured rates the budgets are sized from (SPEC "Bunny facts"), made slower for headroom: PUT-only uploads peaked
+# at 12,838 files/s with ~1,500 in flight, a DESCRIBE takes ~120 ms and a PUT ~115 ms (the sync DESCRIBEs every file
+# before its PUT, both in one slot), and Sydney, the slowest region, replicated 1.3-1.5k files/s.
 POSITIONS = 1_431_655_765
-UPLOAD_FILES_PER_SECOND = 10_000
+UPLOAD_PEAK_FILES_PER_SECOND = 11_500
+DESCRIBE_THEN_PUT_SECONDS = 0.120 + 0.115
 SLOWEST_REPLICATION_FILES_PER_SECOND = 1_300 * 0.8
 MANIFEST_AND_DIFF_SECONDS = 20 * 60
+# The TileJSON and styles' gate gets 10 minutes at least, after the tiles' gate.
+STATIC_GATE_SECONDS = 10 * 60
 STATIC_PURGE_STATE_SECONDS = 10 * 60
 # The sync job's steps before Sync: checkout, mise, npm ci and the decision check, then the download step's timeout.
 SETUP_SECONDS = 10 * 60
 DOWNLOAD_TIMEOUT_SECONDS = 60 * 60
+
+
+class SampleTest(WithTempDir):
+    CHECK = {"mode": "sample-per-zoom", "prefix": "v1", "build": "20261118", "checked": 1616, "missing": 1,
+             "mismatched": 0, "errors": 0, "lacking": {"UK": 0, "SYD": 12}, "missingPaths": ["v1/15/1/2.mvt"],
+             "mismatchedPaths": []}
+
+    def run_sample(self, report, exit_code="1", stderr=""):
+        opts = sut.parse_args(["sample", "--dry-run", "--report", self.write("check.json", report),
+                               "--exit", exit_code, "--stderr", self.write("check.err", stderr)])
+        return sut.sample(opts, NOW)
+
+    def test_sends_the_counts_per_region_and_names_examples(self):
+        samples, log = self.run_sample(json.dumps(self.CHECK))
+
+        self.assertEqual(by_name(samples), {
+            "tiles_sync_sample_runs": {(("result", "ok"),): 1},
+            "tiles_sync_sample_checked": {(): 1616},
+            "tiles_sync_sample_missing": {(): 1},
+            "tiles_sync_sample_mismatched": {(): 0},
+            "tiles_sync_sample_errors": {(): 0},
+            "tiles_sync_sample_lacking": {(("storage_region", "SYD"),): 12, (("storage_region", "UK"),): 0},
+        })
+        self.assertEqual([(r["level"], r["_msg"]) for r in log.records], [
+            ("error", "tiles sample check of 20261118 under v1/: 1,616 positions, 1 missing, 0 with other bytes,"
+                      " 0 DESCRIBE errors; not yet in a region: SYD 12; e.g. v1/15/1/2.mvt")])
+        self.assertEqual(log.records[0]["app"], "tiles-sample-check")
+
+    def test_only_unreplicated_files_warn(self):
+        _, log = self.run_sample(json.dumps({**self.CHECK, "missing": 0, "missingPaths": []}), exit_code="2")
+        self.assertEqual(log.records[0]["level"], "warn")
+        _, log = self.run_sample(json.dumps({**self.CHECK, "missing": 0, "missingPaths": [], "lacking": {}}), "0")
+        self.assertEqual(log.records[0]["level"], "info")
+
+    def test_a_check_skipped_while_builds_are_pending_sends_no_counts(self):
+        samples, log = self.run_sample(json.dumps({"skipped": "pending builds 20261119: a sync has to finish first"}),
+                                       exit_code="0")
+        self.assertEqual(by_name(samples), {"tiles_sync_sample_runs": {(("result", "skipped"),): 1}})
+        self.assertEqual(log.records[0]["level"], "info")
+
+    def test_a_check_that_could_not_run_is_an_error(self):
+        for report, exit_code in (("", "1"), ("{", "1"), (json.dumps(self.CHECK), "3"), (json.dumps(self.CHECK), "")):
+            with self.subTest(report=report, exit_code=exit_code):
+                samples, log = self.run_sample(report, exit_code, "No state.json in the state zone\n")
+                self.assertEqual(by_name(samples), {"tiles_sync_sample_runs": {(("result", "error"),): 1}})
+                self.assertEqual(log.records[0]["level"], "error")
+                self.assertIn("No state.json in the state zone", log.records[0]["_msg"])
 
 
 class BudgetTest(unittest.TestCase):
@@ -331,14 +394,16 @@ class BudgetTest(unittest.TestCase):
         for budget in (sut.DAILY, sut.FORCED):
             with self.subTest(budget=budget):
                 files = budget.max_changed_fraction * POSITIONS
-                upload = files / UPLOAD_FILES_PER_SECOND
+                upload = files / min(UPLOAD_PEAK_FILES_PER_SECOND, budget.concurrency / DESCRIBE_THEN_PUT_SECONDS)
                 # Replication starts with the first PUT; the gate waits from the end of the upload.
                 gate = files / SLOWEST_REPLICATION_FILES_PER_SECOND - upload
 
                 self.assertLessEqual(gate, budget.replication_timeout_min * 60)
                 # The Sync step outlasts a gate that times out, so the CLI always writes its report.
                 self.assertLessEqual(MANIFEST_AND_DIFF_SECONDS + upload + budget.replication_timeout_min * 60
-                                     + STATIC_PURGE_STATE_SECONDS, budget.sync_timeout_min * 60)
+                                     + STATIC_GATE_SECONDS + STATIC_PURGE_STATE_SECONDS, budget.sync_timeout_min * 60)
+                # Within Bunny's 250 connections per zone per storage server, over the 5 servers seen.
+                self.assertLessEqual(budget.concurrency, 5 * 240)
                 self.assertLessEqual(SETUP_SECONDS + DOWNLOAD_TIMEOUT_SECONDS + budget.sync_timeout_min * 60,
                                      budget.job_timeout_min * 60)
 
@@ -358,14 +423,26 @@ class DecideTest(unittest.TestCase):
         self.assertEqual(outputs, {
             "action": "sync", "status": "", "message": "", "key": "20261118", "md5": MD5_A, "version": "4.15.2",
             "live": "20261117", "live_version": "4.15.2", "max_changed_fraction": 0.005,
-            "replication_timeout_min": 120, "sync_timeout_min": 270, "job_timeout_min": 360})
+            "replication_timeout_min": 120, "sync_timeout_min": 270, "job_timeout_min": 360, "concurrency": 1200})
         self.assertEqual(notes, [])
 
     def test_skips_a_live_build(self):
-        outputs, notes = self.decide(status={**LIVE_STATUS, "liveBuild": "20261118"})
+        outputs, notes = self.decide(status={**LIVE_STATUS, "liveBuild": "20261118", "pending": []})
 
         self.assertEqual((outputs["action"], outputs["status"]), ("skip", "skipped"))
         self.assertEqual(notes, [("notice", "20261118 is live already")])
+
+    def test_syncs_the_live_build_again_to_revert_a_pending_one(self):
+        for event in ("schedule", "workflow_dispatch"):
+            with self.subTest(event=event):
+                outputs, notes = self.decide(status={**LIVE_STATUS, "pending": ["20261118"]},
+                                             requested="20261117" if event != "schedule" else "", event=event,
+                                             builds=BUILDS[:3])
+
+                self.assertEqual((outputs["action"], outputs["key"], outputs["live"]),
+                                 ("sync", "20261117", "20261117"))
+                self.assertEqual(notes, [("warning", "20261117 is live with 20261118 pending: syncing 20261117"
+                                                     " again puts its bytes back where they wrote, then purges")])
 
     def test_before_the_first_load_it_skips_without_failing(self):
         outputs, notes = self.decide(status=NO_STATE, status_exit=1)

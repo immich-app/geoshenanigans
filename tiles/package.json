@@ -24,7 +24,8 @@
     "bunny:diff": "node --import=tsx src/bunny/cli/diff.ts",
     "bunny:sync": "node --import=tsx src/bunny/cli/sync.ts",
     "bunny:replication": "node --import=tsx src/bunny/cli/replication.ts",
-    "bunny:status": "node --import=tsx src/bunny/cli/status.ts"
+    "bunny:status": "node --import=tsx src/bunny/cli/status.ts",
+    "bunny:delete-prefix": "node --import=tsx src/bunny/cli/delete-prefix.ts"
   },
   "devDependencies": {
     "@cloudflare/vitest-plugin": "^1.0.0",

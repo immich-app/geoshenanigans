@@ -15,6 +15,7 @@ const state: SyncState = {
   updatedAt: '2026-11-18T10:40:00.000Z',
   osmDate: '2026-11-17T23:59:59Z',
   positions: 1_431_655_765,
+  archive: null,
   pending: [],
 };
 
@@ -26,6 +27,7 @@ describe('liveStatus', () => {
       osmDate: '2026-11-17T23:59:59Z',
       buildAgeHours: 30.1,
       osmAgeHours: 30.1,
+      pending: [],
     });
     expect(liveStatus({ ...state, osmDate: null }, new Date('2026-11-18T12:00:00Z'))).toMatchObject({
       buildAgeHours: 12,
@@ -40,6 +42,7 @@ describe('liveStatus', () => {
       osmDate: null,
       buildAgeHours: null,
       osmAgeHours: null,
+      pending: [],
     });
   });
 });
@@ -69,7 +72,14 @@ describe('bunny:status', () => {
     await writeState(store, state, 'itest-b-1');
     const { stdout } = await status('--json', '--state-prefix', 'itest-b-1');
     const printed = JSON.parse(stdout);
-    expect(Object.keys(printed)).toEqual(['liveBuild', 'updatedAt', 'osmDate', 'buildAgeHours', 'osmAgeHours']);
+    expect(Object.keys(printed)).toEqual([
+      'liveBuild',
+      'updatedAt',
+      'osmDate',
+      'buildAgeHours',
+      'osmAgeHours',
+      'pending',
+    ]);
     expect(printed).toMatchObject({ liveBuild: '20261118', osmDate: '2026-11-17T23:59:59Z' });
     expect(printed.buildAgeHours).toBeGreaterThan(0);
 
@@ -78,7 +88,7 @@ describe('bunny:status', () => {
     expect(human.stdout).not.toMatch(/pending/);
   });
 
-  it('names builds a sync started and did not finish, keeping the JSON as it is', async () => {
+  it('names builds a sync started and did not finish, in the JSON too (the workflow reverts them)', async () => {
     const store = new BunnyStateStore({ zone: 'immich-tiles-state', password: 'zone-password', host: server.host });
     const pending = [
       { build: '20261119', manifest: 'manifests/20261119.tman.zst', positions: 1, startedAt: '2026-11-19T10:00:00Z' },
@@ -87,13 +97,7 @@ describe('bunny:status', () => {
     const human = await status('--state-prefix', 'itest-b-1');
     expect(human.stdout).toMatch(/^pending 20261119 since 2026-11-19T10:00:00Z/m);
     const { stdout } = await status('--json', '--state-prefix', 'itest-b-1');
-    expect(Object.keys(JSON.parse(stdout))).toEqual([
-      'liveBuild',
-      'updatedAt',
-      'osmDate',
-      'buildAgeHours',
-      'osmAgeHours',
-    ]);
+    expect(JSON.parse(stdout)).toMatchObject({ liveBuild: '20261118', pending: ['20261119'] });
   });
 
   it('exits 1 with nulls when nothing has been synced', async () => {

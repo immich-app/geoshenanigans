@@ -67,3 +67,14 @@ export function tilePath(prefix: string, id: number): string {
   const folder = prefix.replace(/^\/+|\/+$/g, '');
   return folder ? `${folder}/${z}/${x}/${y}.mvt` : `${z}/${x}/${y}.mvt`;
 }
+
+/**
+ * Whether one prefix's tile folders (`${prefix}/${z}/`) hold the other prefix or are it: then deleting one would
+ * delete the other's tiles, or their tiles could be the same files. `v1` and `v1/e2` are separate; `v1` and `v1/3`
+ * are not.
+ */
+export function prefixesOverlap(a: string, b: string): boolean {
+  const under = (outer: string, inner: string) =>
+    inner === outer || (inner.startsWith(`${outer}/`) && /^\d+(\/|$)/.test(inner.slice(outer.length + 1)));
+  return under(a, b) || under(b, a);
+}

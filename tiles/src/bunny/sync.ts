@@ -13,27 +13,53 @@
  * 6. upload the TileJSON and styles whose bytes changed, purge the pull zone once, and make the build live in
  *    state.json (its manifest is stored first).
  *
- * Two other modes start a state: --adopt records a build a seed (bunny:seed) already uploaded, checking a sample of
- * positions instead of writing tiles; --force-full writes every position of the build, each DESCRIBEd first, and
- * keeps the files it PUTs in memory for the gate, so it suits a repair or a small zoom range (a planet first load is a
- * seed and then --adopt).
+ * A run for the live build itself while state.json lists pending builds puts the live bytes back where they wrote
+ * (step 4 without new bytes): that reverts a failed or cancelled sync.
+ *
+ * Other modes: --adopt records a build a seed (bunny:seed) already uploaded, given the seed's state dirs (which must
+ * say it completed, for this archive, zone and prefix, over every position) and a sample of positions, instead of
+ * writing tiles; with --replace it switches a live zone to a build seeded under another tile prefix (a full rewrite,
+ * plan section 6), the sample then also checked in every region. --force-full writes every position of the build,
+ * each DESCRIBEd first, so it suits a repair or a small zoom range (a planet first load is a seed and then --adopt).
+ *
+ * The TileJSON and styles stay at the static prefix (`v1.json`, `v1/style/*`) whatever the tile prefix, so a switch
+ * to another tile prefix only changes the TileJSON's tile template. After a run makes a build live, manifests in the
+ * state zone that no state names are deleted, but for the newest few.
  *
  * Every run ends with a SyncReport, whatever stopped it; onReport sees it after every step.
  */
-import { rm } from 'node:fs/promises';
+import { readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { ArchiveRanges, TileRun } from './archive-walk';
 import { diffManifests, DiffTotals, planSync, SyncRange } from './diff';
 import { buildManifest, clipManifest, manifestBatches, ManifestHeader, readManifestHeader } from './manifest';
-import { forEachLimit, REPLICATION_REGIONS, ReplicationItem, waitForReplication } from './replication';
-import { beginBuild, downloadManifest, ObjectStore, PendingBuild, publishBuild, readState, SyncState } from './state';
-import { staticFiles, StyleSource } from './static-files';
+import {
+  classify,
+  forEachLimit,
+  GateItems,
+  gateItems,
+  REPLICATION_REGIONS,
+  ReplicationResult,
+  TileGateList,
+  waitForReplication,
+} from './replication';
+import {
+  beginBuild,
+  downloadManifest,
+  ObjectStore,
+  PendingBuild,
+  pruneManifests,
+  publishBuild,
+  readState,
+  SyncState,
+} from './state';
+import { STATIC_PREFIX, StaticFile, staticFiles, StyleSource } from './static-files';
 import { BunnyStorage, sha256Hex } from './storage';
-import { DEFAULT_PREFIX, MAX_SAFE_ZOOM, tilePath, zoomEnd } from './tile-id';
-import { newUploadStats, UploadItem, UploadStats, uploadTiles } from './upload';
+import { DEFAULT_PREFIX, MAX_SAFE_ZOOM, prefixesOverlap, tilePath, zoomEnd } from './tile-id';
+import { newUploadStats, SeedParams, SeedStatus, UploadItem, UploadStats, uploadTiles } from './upload';
 
 export type SyncStatus = 'success' | 'skipped' | 'guard_rail' | 'failed';
-export type SyncMode = 'diff' | 'force-full' | 'adopt';
+export type SyncMode = 'diff' | 'force-full' | 'adopt' | 'replace';
 export type SyncStep = 'manifest' | 'diff' | 'check' | 'upload' | 'replication' | 'static' | 'purge' | 'state';
 
 /** The run's outcome; the fields up to `error` are the workflow's contract, every one present (null when unknown). */
@@ -72,9 +98,13 @@ export interface SyncReport {
   filesDeleted: number | null;
   /** Files some region still lacked when the gate ended. */
   replicationIncomplete: number | null;
+  /** The first of those, with the regions each lacked: a file that never replicates blocks every later sync. */
+  replicationStragglers: Array<{ path: string; regions: string[] }>;
   /** Of the TileJSON and style files, those whose bytes changed and were uploaded. */
   staticUploaded: number | null;
   purged: boolean;
+  /** Manifests deleted from the state zone once the build was live. */
+  manifestsDeleted: number | null;
   /** The first failed files. */
   failures: Array<{ path: string; error: string }>;
 }
@@ -84,8 +114,10 @@ export interface SyncOptions {
   build: string;
   /** Defaults to the archive metadata's OSM replication time. */
   osmDate?: string | null;
-  /** Tile prefix in the tiles zone (default v1). */
+  /** Tile prefix in the tiles zone (default: the live one, or v1 without a state). */
   prefix?: string;
+  /** Where the TileJSON and styles live: `${staticPrefix}.json`, `${staticPrefix}/style/*` (default v1). */
+  staticPrefix?: string;
   /** Guard rail on the share of positions that changed (default 0.05). */
   maxChangedFraction?: number;
   /** Replication gate (default 120 min). */
@@ -101,8 +133,14 @@ export interface SyncOptions {
   dryRun?: boolean;
   forceFull?: boolean;
   adopt?: boolean;
+  /** With adopt: switch a live zone to a build seeded under another prefix. */
+  replace?: boolean;
+  /** With adopt: the state dirs of the seed (bunny:seed --state-dir) that uploaded the build, one per range. */
+  seedStates?: string[];
   /** Random positions --adopt checks (default 10,000). */
   adoptSamples?: number;
+  /** Manifests kept in the state zone besides those state.json names, newest first (default 7). */
+  keepManifests?: number;
   /**
    * PUT positions no pending build touched without a DESCRIBE first: faster, and safe only while the zone surely holds
    * the live build there.
@@ -138,21 +176,24 @@ export interface SyncDeps {
 }
 
 export const SYNC_DEFAULTS = {
-  prefix: DEFAULT_PREFIX,
+  staticPrefix: STATIC_PREFIX,
   maxChangedFraction: 0.05,
   replicationTimeoutMs: 120 * 60_000,
   replicationIntervalMs: 30_000,
   replicationConcurrency: 512,
   concurrency: 512,
   adoptSamples: 10_000,
+  keepManifests: 7,
   maxFailures: 1_000,
   progressIntervalMs: 10_000,
 };
 
 const MAX_REPORTED_FAILURES = 20;
+/** Least time the TileJSON and styles get to replicate, whatever the tile gate took. */
+const STATIC_GATE_FLOOR_MS = 10 * 60_000;
 
 export function emptyReport(
-  options: Pick<SyncOptions, 'build' | 'prefix' | 'maxZoom' | 'dryRun' | 'forceFull' | 'adopt'>,
+  options: Pick<SyncOptions, 'build' | 'prefix' | 'maxZoom' | 'dryRun' | 'forceFull' | 'adopt' | 'replace'>,
 ) {
   const report: SyncReport = {
     status: 'failed',
@@ -170,9 +211,9 @@ export function emptyReport(
     replicationWaitSeconds: null,
     stepSeconds: {},
     error: null,
-    mode: options.adopt ? 'adopt' : options.forceFull ? 'force-full' : 'diff',
+    mode: options.adopt ? (options.replace ? 'replace' : 'adopt') : options.forceFull ? 'force-full' : 'diff',
     dryRun: options.dryRun === true,
-    prefix: (options.prefix ?? SYNC_DEFAULTS.prefix).replace(/^\/+|\/+$/g, ''),
+    prefix: (options.prefix ?? DEFAULT_PREFIX).replace(/^\/+|\/+$/g, ''),
     maxZoom: options.maxZoom ?? null,
     pendingBuilds: [],
     positionsVerified: null,
@@ -181,8 +222,10 @@ export function emptyReport(
     filesFailed: null,
     filesDeleted: null,
     replicationIncomplete: null,
+    replicationStragglers: [],
     staticUploaded: null,
     purged: false,
+    manifestsDeleted: null,
     failures: [],
   };
   return report;
@@ -213,30 +256,34 @@ export async function runSync(options: SyncOptions, deps: SyncDeps): Promise<Syn
   return report;
 }
 
-/** Ranges of a sync plan in tile-ID order, held compactly. */
+/** Ranges of a sync plan in tile-ID order, held compactly (17 bytes each, outside the JS heap). */
 class RangeList implements Iterable<SyncRange> {
   /** False when ranges were left out (past the guard rail): such a list must never be uploaded. */
   complete = true;
-  private starts: number[] = [];
-  private counts: number[] = [];
-  private flags: number[] = [];
+  length = 0;
+  private starts = new Float64Array(1024);
+  private counts = new Float64Array(1024);
+  private flags = new Uint8Array(1024);
   private static KINDS = ['changed', 'added', 'removed'] as const;
 
-  get length() {
-    return this.starts.length;
-  }
-
   push(range: SyncRange) {
-    this.starts.push(range.start);
-    this.counts.push(range.count);
-    this.flags.push(RangeList.KINDS.indexOf(range.kind) | (range.verify ? 4 : 0));
+    if (this.length === this.starts.length) {
+      const grow = <T extends Float64Array | Uint8Array>(from: T, to: T) => (to.set(from), to);
+      this.starts = grow(this.starts, new Float64Array(this.length * 2));
+      this.counts = grow(this.counts, new Float64Array(this.length * 2));
+      this.flags = grow(this.flags, new Uint8Array(this.length * 2));
+    }
+    this.starts[this.length] = range.start;
+    this.counts[this.length] = range.count;
+    this.flags[this.length] = RangeList.KINDS.indexOf(range.kind) | (range.verify ? 4 : 0);
+    this.length++;
   }
 
   *[Symbol.iterator](): Iterator<SyncRange> {
     if (!this.complete) {
       throw new Error('The plan was cut short at the guard rail');
     }
-    for (let i = 0; i < this.starts.length; i++) {
+    for (let i = 0; i < this.length; i++) {
       yield {
         start: this.starts[i],
         count: this.counts[i],
@@ -341,6 +388,8 @@ class SyncRun {
   private log: (line: string) => void;
   private archive?: ArchiveRanges;
   private files: string[] = [];
+  /** How long the tile gate waited, taken from the static files' share of the replication timeout. */
+  private gateWaitedMs = 0;
 
   constructor(
     options: SyncOptions,
@@ -379,7 +428,6 @@ class SyncRun {
 
   async run() {
     const { report, o } = this;
-    const prefix = normalisePrefix(report.prefix);
     const mode = report.mode;
     if (o.maxZoom !== undefined && (!Number.isInteger(o.maxZoom) || o.maxZoom < 0 || o.maxZoom > MAX_SAFE_ZOOM)) {
       throw new Error(`maxZoom must be an integer 0..${MAX_SAFE_ZOOM}, got ${o.maxZoom}`);
@@ -390,12 +438,18 @@ class SyncRun {
     if (o.adopt && o.forceFull) {
       throw new Error('--adopt and --force-full do not go together');
     }
+    if (o.replace && !o.adopt) {
+      throw new Error('--replace goes with --adopt');
+    }
+    const adopting = mode === 'adopt' || mode === 'replace';
+    const staticPrefix = normalisePrefix(o.staticPrefix);
     if (!o.dryRun) {
       const missing = [
         !this.deps.tiles && 'the tiles zone',
         !this.deps.purge && 'the purge',
         !o.publicUrl && 'the public URL',
         !o.styles?.length && 'the styles',
+        adopting && !o.seedStates?.length && "the seed's state dirs (--seed-state)",
       ].filter(Boolean);
       if (missing.length > 0) {
         throw new Error(`A sync that writes needs ${missing.join(', ')}`);
@@ -405,8 +459,24 @@ class SyncRun {
     const state = await readState(this.deps.state, o.statePrefix);
     report.previousBuild = state?.liveBuild ?? null;
     report.pendingBuilds = state?.pending.map((pending) => pending.build) ?? [];
+    // A daily sync follows the live build's prefix, whatever a full rewrite switched it to.
+    const prefix = normalisePrefix(o.prefix ?? state?.prefix ?? DEFAULT_PREFIX);
+    report.prefix = prefix;
     if (mode === 'adopt' && state) {
-      throw new Error(`state.json exists already (live ${state.liveBuild}); --adopt only starts an empty state`);
+      throw new Error(
+        `state.json exists already (live ${state.liveBuild}); --adopt only starts an empty state, and --adopt ` +
+          '--replace switches a live zone to a build seeded under another prefix',
+      );
+    }
+    if (mode === 'replace') {
+      if (!state) {
+        throw new Error('No state.json to replace: --adopt without --replace starts one');
+      }
+      if (prefixesOverlap(prefix, state.prefix)) {
+        throw new Error(
+          `--adopt --replace needs the build seeded under a prefix apart from the live ${state.prefix}/, got ${prefix}/`,
+        );
+      }
     }
     if (!state && mode === 'diff') {
       throw new Error(
@@ -414,15 +484,22 @@ class SyncRun {
       );
     }
     if (state && mode === 'diff' && state.liveBuild === o.build) {
-      report.status = 'skipped';
-      report.positionsTotal = state.positions;
-      report.osmDate = state.osmDate;
-      this.log(`${o.build} is live already: nothing to do`);
-      return;
+      if (state.pending.length === 0) {
+        report.status = 'skipped';
+        report.positionsTotal = state.positions;
+        report.osmDate = state.osmDate;
+        this.log(`${o.build} is live already: nothing to do`);
+        return;
+      }
+      this.log(
+        `${o.build} is live, with ${report.pendingBuilds.join(', ')} pending: putting the live bytes back where ` +
+          'they may have written',
+      );
     }
     if (state && mode === 'diff' && state.prefix !== prefix) {
       throw new Error(
-        `The live build is under ${state.prefix}/, not ${prefix}/: a sync to another prefix needs --force-full`,
+        `The live build is under ${state.prefix}/, not ${prefix}/: switching prefixes is a seed under the new one ` +
+          'and --adopt --replace',
       );
     }
 
@@ -434,7 +511,7 @@ class SyncRun {
     // The plan.
     let ranges: RangeList | undefined;
     let totals: DiffTotals | undefined;
-    if (mode !== 'adopt') {
+    if (!adopting) {
       ({ ranges, totals } = await this.step('diff', () => this.plan(state, manifest, header)));
     }
     if (totals) {
@@ -461,8 +538,11 @@ class SyncRun {
     const tiles = this.deps.tiles!;
     this.archive = await ArchiveRanges.open(o.archive);
 
-    if (mode === 'adopt') {
-      await this.step('check', () => this.checkSample(tiles, manifest, header));
+    if (adopting) {
+      await this.step('check', async () => {
+        await this.checkSeeds(header.positions, prefix);
+        await this.checkSample(tiles, manifest, header);
+      });
     } else {
       if (state && state.liveBuild !== o.build) {
         // Before the first PUT: a run that dies part-way leaves a state saying which positions may hold this build.
@@ -476,7 +556,11 @@ class SyncRun {
       await this.step('replication', () => this.gate(tiles, written));
     }
 
-    await this.step('static', () => this.uploadStatic(tiles));
+    const changedStatic = await this.step('static', () => this.uploadStatic(tiles, staticPrefix));
+    if (mode !== 'adopt' && changedStatic.length > 0) {
+      // The purge makes PoPs fetch them again, from the nearest replica: it must hold them first.
+      await this.step('replication', () => this.gateStatic(tiles, changedStatic));
+    }
     await this.step('purge', async () => {
       await this.deps.purge!();
       report.purged = true;
@@ -487,11 +571,31 @@ class SyncRun {
         manifestFile: manifest,
         prefix,
         osmDate: report.osmDate,
+        archive: { size: this.archive!.size, fingerprint: this.archive!.fingerprint },
         statePrefix: o.statePrefix,
       }),
     );
     report.status = 'success';
     this.log(`${o.build} is live`);
+    await this.pruneManifests();
+  }
+
+  /** Housekeeping once the build is live: a failure or a stop here leaves the run a success. */
+  private async pruneManifests() {
+    const { o, report } = this;
+    const started = performance.now();
+    try {
+      const deleted = await pruneManifests(this.deps.state, { keep: o.keepManifests, statePrefix: o.statePrefix });
+      report.manifestsDeleted = deleted.length;
+      if (deleted.length > 0) {
+        this.log(`state: deleted ${deleted.length} manifests no state names (${deleted.join(', ')})`);
+      }
+    } catch (error) {
+      this.log(`state: could not delete old manifests: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      report.stepSeconds.state = seconds((report.stepSeconds.state ?? 0) * 1000 + performance.now() - started);
+      o.onReport?.(report);
+    }
   }
 
   private async buildManifest(): Promise<{ manifest: string; header: ManifestHeader }> {
@@ -582,10 +686,10 @@ class SyncRun {
   private async upload(
     tiles: BunnyStorage,
     ranges: AsyncIterable<SyncRange> | Iterable<SyncRange>,
-  ): Promise<ReplicationItem[]> {
+  ): Promise<TileGateList> {
     const { o, report } = this;
     const prefix = report.prefix;
-    const written: ReplicationItem[] = [];
+    const written = new TileGateList(prefix);
     const removed: SyncRange[] = [];
     // Removed ranges are set aside as the plan streams past (under D1b every build has every position, so there
     // are none in practice).
@@ -627,7 +731,7 @@ class SyncRun {
             verified++;
           }
           if (outcome === 'uploaded' || (outcome === 'skipped' && gateSkipped)) {
-            written.push({ path: tilePath(prefix, item.tileId), sha256: item.sha256, tileId: item.tileId });
+            written.push(item.tileId, item.sha256);
           }
         },
       });
@@ -679,12 +783,12 @@ class SyncRun {
     return written;
   }
 
-  private async gate(tiles: BunnyStorage, items: ReplicationItem[]) {
-    const { o, report } = this;
+  private waitFor(tiles: BunnyStorage, items: GateItems, timeoutMs: number, what: string) {
+    const { o } = this;
     const regions = o.regions ?? REPLICATION_REGIONS;
-    this.log(`replication: waiting for ${items.length} files in ${regions.join(', ')}`);
-    const result = await waitForReplication(tiles, items, regions, {
-      timeoutMs: o.replicationTimeoutMs,
+    this.log(`replication: waiting for ${items.length} ${what} in ${regions.join(', ') || 'storage only'}`);
+    return waitForReplication(tiles, items, regions, {
+      timeoutMs,
       intervalMs: o.replicationIntervalMs,
       concurrency: o.replicationConcurrency,
       mismatchGraceMs: o.replicationMismatchGraceMs,
@@ -692,32 +796,117 @@ class SyncRun {
       onPass: ({ pass, pending, elapsedMs, missingByRegion }) => {
         const lacking = nonZero(missingByRegion);
         this.log(
-          `replication pass ${pass} at ${seconds(elapsedMs)} s: ${pending} files pending (${lacking || 'none'})`,
+          `replication pass ${pass} at ${seconds(elapsedMs)} s: ${pending} ${what} pending (${lacking || 'none'})`,
         );
       },
     });
+  }
+
+  /** Records a gate's outcome in the report; throws when it did not complete. */
+  private gateOutcome(result: ReplicationResult, what: string) {
+    const { report } = this;
     report.replicationComplete = result.complete;
-    report.replicationWaitSeconds = Object.fromEntries(
+    report.replicationWaitSeconds ??= Object.fromEntries(
       Object.entries(result.regionWaitMs).map(([region, ms]) => [region, ms === null ? null : seconds(ms)]),
     );
     report.replicationIncomplete = result.incomplete + result.missing.length + result.mismatched.length;
+    report.replicationStragglers = result.stragglers;
+    for (const straggler of result.stragglers) {
+      this.log(`replication: ${straggler.path} is not in ${straggler.regions.join(', ')}`);
+    }
     this.stopIfAsked();
     if (!result.complete) {
       const lacking = nonZero(result.missingByRegion);
+      const straggler = result.stragglers[0];
+      const example = result.missing[0] ?? result.mismatched[0] ?? straggler?.path;
       throw new Error(
-        `Replication incomplete after ${seconds(result.waitedMs)} s: ${result.incomplete} files not in every region` +
-          ` (${lacking}), ${result.missing.length} missing, ${result.mismatched.length} with other bytes` +
+        `Replication of ${what} incomplete after ${seconds(result.waitedMs)} s: ${result.incomplete} files not in ` +
+          `every region (${lacking}), ${result.missing.length} missing, ${result.mismatched.length} with other bytes` +
           (result.errors ? `, ${result.errors} DESCRIBE errors` : '') +
-          (result.missing[0] || result.mismatched[0] ? `, e.g. ${result.missing[0] ?? result.mismatched[0]}` : ''),
+          (example ? `, e.g. ${example}` : '') +
+          (straggler && example === straggler.path ? ` (not in ${straggler.regions.join(', ')})` : ''),
       );
     }
   }
 
-  /** --adopt: the zone must already hold the build at random positions. */
+  private async gate(tiles: BunnyStorage, items: TileGateList) {
+    const started = performance.now();
+    try {
+      this.gateOutcome(await this.waitFor(tiles, items, this.o.replicationTimeoutMs, 'files'), 'the tiles');
+    } finally {
+      this.gateWaitedMs = performance.now() - started;
+    }
+  }
+
+  /** The changed TileJSON and styles, within what the tile gate left of the replication timeout (10 min at least). */
+  private async gateStatic(tiles: BunnyStorage, files: StaticFile[]) {
+    const { o } = this;
+    const timeoutMs = Math.max(
+      Math.min(STATIC_GATE_FLOOR_MS, o.replicationTimeoutMs),
+      o.replicationTimeoutMs - this.gateWaitedMs,
+    );
+    const items = gateItems(files.map((file) => ({ path: file.path, sha256: file.sha256 })));
+    this.gateOutcome(await this.waitFor(tiles, items, timeoutMs, 'static files'), 'the TileJSON and styles');
+  }
+
+  /**
+   * --adopt: the seed's state dirs must say it completed, for this archive, zone and prefix, and cover every position:
+   * a sample alone misses a few failed files or a chunk never done, and under D1b nothing revisits those positions.
+   */
+  private async checkSeeds(positions: number, prefix: string) {
+    const { o } = this;
+    const zone = this.deps.tiles!.zone;
+    const ranges: Array<{ from: number; to: number }> = [];
+    for (const dir of o.seedStates ?? []) {
+      let params: SeedParams;
+      let status: SeedStatus;
+      try {
+        params = JSON.parse(await readFile(join(dir, 'seed.json'), 'utf8')) as SeedParams;
+        status = JSON.parse(await readFile(join(dir, 'status.json'), 'utf8')) as SeedStatus;
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new Error(`${dir} is not a seed's state dir: ${reason}`, { cause: error });
+      }
+      const problems = [
+        status.state !== 'complete' && `its last run ended ${status.state}${status.error ? ` (${status.error})` : ''}`,
+        params.zone !== zone && `it seeded zone ${params.zone}, not ${zone}`,
+        params.prefix !== prefix && `it seeded ${params.prefix}/, not ${prefix}/`,
+        params.archive?.fingerprint !== this.archive!.fingerprint && `it seeded another archive than ${o.archive}`,
+        (status.range?.from !== params.from || status.range?.to !== params.to) && 'its status.json is of another range',
+      ].filter(Boolean);
+      if (problems.length > 0) {
+        throw new Error(`Seed state ${dir}: ${problems.join('; ')}`);
+      }
+      ranges.push({ from: params.from, to: params.to });
+    }
+    ranges.sort((a, b) => a.from - b.from);
+    let covered = 0;
+    for (const range of ranges) {
+      if (range.from > covered) {
+        break;
+      }
+      covered = Math.max(covered, range.to);
+    }
+    if (covered < positions) {
+      throw new Error(
+        `The completed seeds given cover positions up to ${covered}, not all ${positions}: seed tile ${covered} on`,
+      );
+    }
+    this.log(`adopt: ${ranges.length} seed state dir(s) say every position of [0, ${positions}) completed`);
+  }
+
+  /**
+   * --adopt: the zone must already hold the build at random positions; with --replace each must also be in every
+   * region, as the switch sends every client to the new prefix at once.
+   */
   private async checkSample(tiles: BunnyStorage, manifest: string, header: ManifestHeader) {
     const { o, report } = this;
+    const regions = o.regions ?? REPLICATION_REGIONS;
+    const everywhere = report.mode === 'replace';
     const ids = await samplePositions(manifest, header.positions, o.adoptSamples);
     const wrong: string[] = [];
+    const lacking: Record<string, number> = Object.fromEntries(regions.map((region) => [region, 0]));
+    const unreplicated: string[] = [];
     await forEachLimit(
       ids,
       Math.min(256, o.concurrency),
@@ -726,10 +915,21 @@ class SyncRun {
         if (!run) {
           throw new Error(`Tile ${id} is not in ${o.archive}`);
         }
-        const bytes = new Uint8Array(await this.archive!.archive.readTileData(run.offset, run.length));
+        const sha256 = sha256Hex(new Uint8Array(await this.archive!.archive.readTileData(run.offset, run.length)));
         const path = tilePath(report.prefix, id);
-        if (!(await tiles.holds(path, sha256Hex(bytes)))) {
+        if (!everywhere) {
+          if (!(await tiles.holds(path, sha256))) {
+            wrong.push(path);
+          }
+          return;
+        }
+        const { state, missingRegions } = classify(await tiles.describe(path), sha256, regions);
+        if (state === 'missing' || (state === 'mismatched' && !(await tiles.holds(path, sha256)))) {
           wrong.push(path);
+        } else if (state !== 'replicated') {
+          // A DESCRIBE that still lags an overwrite says nothing of the replicas either.
+          unreplicated.push(path);
+          (state === 'mismatched' ? regions : missingRegions).forEach((region) => lacking[region]++);
         }
       },
       o.signal,
@@ -740,10 +940,19 @@ class SyncRun {
       const examples = wrong.slice(0, 3).join(', ');
       throw new Error(`${wrong.length} of ${ids.length} sampled positions don't hold ${o.build}, e.g. ${examples}`);
     }
+    if (unreplicated.length > 0) {
+      throw new Error(
+        `${unreplicated.length} of ${ids.length} sampled positions under ${report.prefix}/ are not in every region ` +
+          `yet (${nonZero(lacking)}), e.g. ${unreplicated[0]}: switch once the seed has replicated`,
+      );
+    }
   }
 
-  /** The TileJSON and styles; only those whose bytes changed are written (identical re-PUTs break replication). */
-  private async uploadStatic(tiles: BunnyStorage) {
+  /**
+   * The TileJSON and styles; only those whose bytes changed are written (identical re-PUTs break replication).
+   * Returns the ones written.
+   */
+  private async uploadStatic(tiles: BunnyStorage, staticPrefix: string): Promise<StaticFile[]> {
     const { o, report } = this;
     const { header, metadata } = this.archive!.archive;
     const files = staticFiles({
@@ -752,15 +961,17 @@ class SyncRun {
       styles: o.styles!,
       publicUrl: o.publicUrl!,
       prefix: report.prefix,
+      staticPrefix,
     });
-    let uploaded = 0;
+    const uploaded: StaticFile[] = [];
     for (const file of files) {
       if (!(await tiles.holds(file.path, file.sha256))) {
         await tiles.put(file.path, file.body, file.sha256);
-        uploaded++;
+        uploaded.push(file);
       }
     }
-    report.staticUploaded = uploaded;
-    this.log(`static: ${uploaded} of ${files.length} files changed and uploaded`);
+    report.staticUploaded = uploaded.length;
+    this.log(`static: ${uploaded.length} of ${files.length} files changed and uploaded`);
+    return uploaded;
   }
 }

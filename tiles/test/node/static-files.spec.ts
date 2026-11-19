@@ -94,6 +94,7 @@ describe('staticFiles', () => {
       styles,
       publicUrl: 'https://tiles-test.example',
       prefix: '/itest-b-1/v1/',
+      staticPrefix: 'itest-b-1/v1',
     });
     expect(files.map((file) => file.path)).toEqual([
       'itest-b-1/v1.json',
@@ -111,11 +112,25 @@ describe('staticFiles', () => {
     expect(text(files[1].body)).toBe(JSON.stringify(style, null, 2));
   });
 
+  it('keeps the TileJSON and styles at the static prefix when the tiles move (a full rewrite)', () => {
+    const files = staticFiles({ header, metadata, styles, publicUrl: PROD, prefix: 'v1/e2' });
+    expect(files.map((file) => file.path)).toEqual([
+      'v1.json',
+      'v1/style/dark.json',
+      'v1/style/dark',
+      'v1/style/light.json',
+      'v1/style/light',
+    ]);
+    expect(JSON.parse(text(files[0].body)).tiles).toEqual([`${PROD}/v1/e2/{z}/{x}/{y}.mvt`]);
+    expect(JSON.parse(text(files[1].body)).sources.vector.url).toBe(`${PROD}/v1.json`);
+  });
+
   it('rejects what the zone could not serve', () => {
     const options = { header, metadata, styles, publicUrl: PROD };
     expect(() => staticFiles({ ...options, styles: [] })).toThrow(/No styles/);
     expect(() => staticFiles({ ...options, styles: [{ name: 'my-style', body: styles[0].body }] })).toThrow(/address/);
     expect(() => staticFiles({ ...options, prefix: 'a/../b' })).toThrow(/Invalid prefix/);
+    expect(() => staticFiles({ ...options, staticPrefix: '/' })).toThrow(/Invalid prefix/);
     expect(() => staticFiles({ ...options, publicUrl: `${PROD}?x=1` })).toThrow(/query/);
     const noSource = { name: 'bare', body: new TextEncoder().encode('{"version":8,"sources":{}}') };
     expect(() => rewriteStyle(noSource, `${PROD}/v1.json`)).toThrow(/no "vector" source/);

@@ -7,6 +7,7 @@
  *     [--concurrency 1200] [--workers 16] [--chunk-size 65536] [--state-dir <dir>] [--verify-existing]
  *     [--max-failures 1000] [--request-timeout-s 60] [--progress-interval-s 10] [--retry-base-ms 500]
  *     [--max-connections-per-address 240] [--addresses ip,ip,...] [--settle-ms 2000]
+ *     [--state-prefix <p> | --no-state-check]
  *
  * --to-id is exclusive. Zooms default to the archive's. The state dir defaults to
  * ./bunny-seed-<zone>-<prefix>-<from>-<to>. --concurrency is lowered to the storage addresses times
@@ -24,14 +25,19 @@
  * on this machine, with another state dir, covers an overlapping range of the same zone and prefix (claims live in
  * $XDG_STATE_HOME/bunny-seed, default ~/.local/state/bunny-seed; seeds on other machines are not seen).
  * Unless the addresses are pinned, the storage host is looked up again every 5 minutes and workers move to the new set.
+ * Once a sync has made a build live (state.json in the state zone), a seed under its prefix refuses any archive but the
+ * live build's: positions a daily sync updated would get older bytes back, which no later diff repairs. So it reads
+ * state.json first (BUNNY_STATE_ZONE and BUNNY_STATE_PASSWORD, --state-prefix as for bunny:sync); --no-state-check is
+ * for a zone no sync uses. Seeding another prefix (a full rewrite) is fine.
  * Needs BUNNY_STORAGE_ZONE and BUNNY_STORAGE_PASSWORD, and BUNNY_STORAGE_HOST unless it is storage.bunnycdn.com.
  * Progress goes to stderr every 10 s and to <state dir>/status.json; the final status is printed to stdout as JSON.
  * Exit codes: 0 complete, 1 failed (rerun to repair), 2 bad arguments, 130 stopped by SIGINT/SIGTERM.
  */
 import { parseArgs } from 'node:util';
 import { ArchiveRanges } from '../archive-walk';
+import { BunnyStateStore, readState } from '../state';
 import { parseAddresses, RetryOptions, storageOptionsFromEnv } from '../storage';
-import { DEFAULT_PREFIX, zoomRange } from '../tile-id';
+import { DEFAULT_PREFIX, prefixesOverlap, zoomRange } from '../tile-id';
 import { DEFAULT_MAX_CONNECTIONS_PER_ADDRESS, formatDuration, runSeed } from '../upload';
 
 class UsageError extends Error {}
@@ -48,6 +54,24 @@ function integer(name: string, value: string | undefined, fallback?: number, min
     throw new UsageError(`--${name} must be an integer of at least ${min}, got ${value}`);
   }
   return parsed;
+}
+
+/** Refuses to seed over the live build's prefix with any other archive (see the header). */
+async function checkLiveState(prefix: string, fingerprint: string, statePrefix: string | undefined) {
+  if (!process.env.BUNNY_STATE_ZONE || !process.env.BUNNY_STATE_PASSWORD) {
+    throw new UsageError(
+      'BUNNY_STATE_ZONE and BUNNY_STATE_PASSWORD are needed to check that the seed does not write over a live build ' +
+        '(--no-state-check for a zone no sync uses)',
+    );
+  }
+  const store = BunnyStateStore.fromEnv();
+  const state = await readState(store, statePrefix).finally(() => store.close());
+  if (state && prefixesOverlap(state.prefix, prefix) && state.archive?.fingerprint !== fingerprint) {
+    throw new Error(
+      `${state.liveBuild} is live under ${state.prefix}/ and this archive is not the one it came from: the seed would ` +
+        "put other bytes back where daily syncs wrote. Repair with the live build's archive, or seed another prefix",
+    );
+  }
 }
 
 async function main(): Promise<number> {
@@ -71,6 +95,8 @@ async function main(): Promise<number> {
       'settle-ms': { type: 'string' },
       'max-connections-per-address': { type: 'string' },
       addresses: { type: 'string' },
+      'state-prefix': { type: 'string' },
+      'no-state-check': { type: 'boolean', default: false },
     },
     strict: true,
   });
@@ -115,9 +141,9 @@ async function main(): Promise<number> {
     }
   }
 
-  const header = await ArchiveRanges.open(values.archive).then(async (ranges) => {
+  const { header, fingerprint } = await ArchiveRanges.open(values.archive).then(async (ranges) => {
     await ranges.close();
-    return ranges.archive.header;
+    return { header: ranges.archive.header, fingerprint: ranges.fingerprint };
   });
   const { from, to } = byId
     ? { from: integer('from-id', values['from-id']), to: integer('to-id', values['to-id']) }
@@ -127,6 +153,9 @@ async function main(): Promise<number> {
       );
   if (to <= from) {
     throw new UsageError(`Empty range [${from}, ${to})`);
+  }
+  if (!values['no-state-check']) {
+    await checkLiveState(prefix, fingerprint, values['state-prefix']);
   }
   const safeName = (text: string) => text.replace(/[^\w.-]+/g, '_');
 

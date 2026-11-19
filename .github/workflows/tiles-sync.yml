@@ -15,6 +15,12 @@ name: Tiles Sync
 # deployment/scripts/tiles_sync_report.py decides (and its tests cover): the build, whether to sync, skip or stop,
 # and the job's time budget. Scheduled runs skip while the repository variable TILES_SYNC_HOLD is set (any text,
 # e.g. why): set it before a rollback, or the next scheduled run syncs the newest build straight back.
+# A run for the live build while state.json lists pending builds syncs it again, which puts the live bytes back
+# where the pending ones wrote: dispatching the live build reverts a failed or cancelled sync.
+# The replication gate waits for every storage region unless the regions input, or else the repository variable
+# TILES_SYNC_REGIONS, lists fewer ("none" checks storage only): for when the account's replication queue is known
+# to be backed up (after a seed, see deployment/modules/bunny/tiles/README.md) and serving changed tiles from
+# Frankfurt until they replicate is acceptable.
 
 on:
   schedule:
@@ -26,7 +32,11 @@ on:
   workflow_dispatch:
     inputs:
       build:
-        description: 'Protomaps build to sync (YYYYMMDD), defaults to the newest; an older one rolls back (set the TILES_SYNC_HOLD variable first)'
+        description: 'Protomaps build to sync (YYYYMMDD), defaults to the newest; an older one rolls back (set the TILES_SYNC_HOLD variable first); the live one reverts a failed sync'
+        required: false
+        type: string
+      regions:
+        description: 'Storage regions the replication gate waits for (comma-separated, or none); defaults to the TILES_SYNC_REGIONS variable, else all'
         required: false
         type: string
       dry_run:
@@ -89,6 +99,7 @@ jobs:
       replication_timeout_min: ${{ steps.decide.outputs.replication_timeout_min }}
       sync_timeout_min: ${{ steps.decide.outputs.sync_timeout_min }}
       job_timeout_min: ${{ steps.decide.outputs.job_timeout_min }}
+      concurrency: ${{ steps.decide.outputs.concurrency }}
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -296,7 +307,11 @@ jobs:
           OSM_DATE: ${{ needs.resolve.outputs.osm_date }}
           MAX_CHANGED_FRACTION: ${{ needs.resolve.outputs.max_changed_fraction }}
           REPLICATION_TIMEOUT_MIN: ${{ needs.resolve.outputs.replication_timeout_min }}
+          CONCURRENCY: ${{ needs.resolve.outputs.concurrency }}
+          REGIONS: ${{ inputs.regions || vars.TILES_SYNC_REGIONS }}
           DRY_RUN: ${{ inputs.dry_run }}
+          # The gate's file list lives outside the JS heap; this is headroom for the rest of a forced run.
+          NODE_OPTIONS: --max-old-space-size=8192
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
           BUNNY_STATE_PASSWORD: op://tf_prod/BUNNY_STATE_PASSWORD/password
           # A dry run (perhaps a branch's code) reads the state zone only: no tiles zone password, purge key or pull
@@ -307,9 +322,14 @@ jobs:
         run: |
           set -euo pipefail
           args=(--archive "$ARCHIVE" --build "$KEY" --max-changed-fraction "$MAX_CHANGED_FRACTION"
-            --replication-timeout-min "$REPLICATION_TIMEOUT_MIN" --report "$RUNNER_TEMP/report.json")
+            --replication-timeout-min "$REPLICATION_TIMEOUT_MIN" --concurrency "$CONCURRENCY"
+            --replication-concurrency "$CONCURRENCY" --report "$RUNNER_TEMP/report.json")
           if [ -n "$OSM_DATE" ]; then
             args+=(--osm-date "$OSM_DATE")
+          fi
+          if [ -n "$REGIONS" ]; then
+            echo "::notice::The replication gate waits for $REGIONS only"
+            args+=(--regions "$REGIONS")
           fi
           if [ "$DRY_RUN" = true ]; then
             args+=(--dry-run)

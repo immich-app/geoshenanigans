@@ -4,8 +4,9 @@
  *   npm run bunny:status -- [--json] [--state-prefix <p>]
  *
  * Needs BUNNY_STATE_ZONE, BUNNY_STATE_PASSWORD and optionally BUNNY_STORAGE_HOST. --json prints
- * {"liveBuild","updatedAt","osmDate","buildAgeHours","osmAgeHours"}; buildAgeHours counts from 00:00 UTC of the build
- * date. Exits 1 when there is no state.json yet (the JSON then has nulls), and within about a minute when the state
+ * {"liveBuild","updatedAt","osmDate","buildAgeHours","osmAgeHours","pending"}; buildAgeHours counts from 00:00 UTC of the
+ * build date, and pending lists builds a sync started and didn't make live (the zone may hold their bytes; a sync of
+ * the live build puts its bytes back). Exits 1 when there is no state.json yet (the JSON then has nulls), and within about a minute when the state
  * zone doesn't answer.
  */
 import { parseArgs } from 'node:util';

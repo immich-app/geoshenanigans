@@ -1,11 +1,22 @@
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
-import { checkReplication, classify, ReplicationItem, waitForReplication } from '../../src/bunny/replication';
+import { buildManifest } from '../../src/bunny/manifest';
+import {
+  checkReplication,
+  checksumMatches,
+  classify,
+  ReplicationItem,
+  TileGateList,
+  waitForReplication,
+} from '../../src/bunny/replication';
+import { BunnyStateStore, publishBuild, writeState } from '../../src/bunny/state';
 import { BunnyStorage } from '../../src/bunny/storage';
 import { tilePath, zoomEnd } from '../../src/bunny/tile-id';
 import { runSeed } from '../../src/bunny/upload';
 import { FakeStorage, FakeStorageOptions, sha256Hex } from './fake-storage';
+import { startStateServer } from './state-server';
 import { scratchDir, writeFixtureArchive } from './upload-fixture';
 
 const TILES_DIR = join(import.meta.dirname, '../..');
@@ -49,6 +60,44 @@ describe('classify', () => {
     expect(classify(null, 'AB', REGIONS).state).toBe('missing');
     expect(classify(object, 'CD', REGIONS).state).toBe('mismatched');
   });
+
+  it("compares a manifest's 8-byte hash with the start of the stored SHA-256", () => {
+    const sha = sha256Hex(new TextEncoder().encode('tile'));
+    expect(checksumMatches(sha, sha.toLowerCase())).toBe(true);
+    expect(checksumMatches(sha, sha.slice(0, 16))).toBe(true);
+    expect(checksumMatches(sha, `${sha.slice(0, 15)}0`)).toBe(sha[15] === '0');
+    // Too short to tell files apart.
+    expect(checksumMatches(sha, sha.slice(0, 8))).toBe(false);
+    expect(checksumMatches(sha, '')).toBe(false);
+  });
+});
+
+describe('TileGateList', () => {
+  it('keeps each file in 40 bytes and gives back its path and checksum', () => {
+    const sha = sha256Hex(new TextEncoder().encode('tile'));
+    const list = new TileGateList('v1');
+    for (let i = 0; i < 3000; i++) {
+      list.push(i * 1000, i === 7 ? sha.toLowerCase() : sha);
+    }
+    expect(list.length).toBe(3000);
+    expect(list.tileId(2999)).toBe(2_999_000);
+    expect(list.path(2)).toBe(tilePath('v1', 2000));
+    expect(list.sha256(7)).toBe(sha);
+    expect(TileGateList.BYTES_PER_FILE).toBe(40);
+    expect(() => list.push(1, 'AB')).toThrow(/Not a hex SHA-256/);
+  });
+
+  it('gates millions of files within a small heap', async () => {
+    // As objects with path and hex strings, 3M files took ~1.3 GB of heap; a 96 MB heap must do.
+    const { stdout } = await promisify(execFile)(
+      process.execPath,
+      ['--max-old-space-size=96', '--import=tsx', 'test/node/gate-heap-fixture.ts', '3000000'],
+      { cwd: TILES_DIR },
+    );
+    const result = JSON.parse(stdout) as { complete: boolean; passes: number; describes: number; heapUsed: number };
+    expect(result).toMatchObject({ complete: true, passes: 2, describes: 4_500_000 });
+    expect(result.heapUsed).toBeLessThan(96 * 2 ** 20);
+  }, 120_000);
 });
 
 describe('waitForReplication', () => {
@@ -161,6 +210,8 @@ describe('waitForReplication', () => {
     const result = await waitForReplication(storage, items, REGIONS, { timeoutMs: 150, intervalMs: 20 });
     expect(result).toMatchObject({ complete: false, incomplete: 1, missingByRegion: { UK: 1, NY: 1, SYD: 1 } });
     expect(result.regionWaitMs).toEqual({ UK: null, NY: null, SYD: null });
+    // The stuck file is named, with the regions it lacks.
+    expect(result.stragglers).toEqual([{ path: items[1].path, regions: REGIONS }]);
   });
 });
 
@@ -269,6 +320,80 @@ describe('bunny:replication CLI', () => {
     ]);
     expect(waited.code, waited.stderr).toBe(1);
     expect(waited.report).toMatchObject({ complete: false, files: 21, missing: [tilePath('itest', 9)] });
+  }, 60_000);
+
+  it('checks a sample against the live manifest with --live, and every column with --listing', async () => {
+    const scratch = await scratchDir();
+    cleanup.push(scratch.remove);
+    const positions = zoomEnd(5);
+    const fixture = await writeFixtureArchive(scratch.dir, positions, 21, 100);
+    const { fake } = await setup({ regions: ['UK', 'SYD'] });
+    await runSeed({
+      archivePath: fixture.path,
+      prefix: 'itest',
+      from: 0,
+      to: positions,
+      chunkSize: 256,
+      workers: 2,
+      concurrency: 16,
+      stateDir: join(scratch.dir, 'state'),
+      claimsDir: join(scratch.dir, 'claims'),
+      verifyExisting: false,
+      storage: { zone: fake.zone, password: fake.password, host: fake.url, retry: fast },
+      log: () => {},
+    });
+    const server = await startStateServer('state-zone', 'state-password');
+    const store = new BunnyStateStore({ zone: 'state-zone', password: 'state-password', host: server.host });
+    cleanup.push(
+      () => server.close(),
+      () => store.close(),
+    );
+    const manifest = join(scratch.dir, '20261118.tman.zst');
+    await buildManifest(fixture.path, { out: manifest, buildKey: '20261118', threads: 2 });
+    const live = await publishBuild(store, { buildKey: '20261118', manifestFile: manifest, prefix: 'itest' });
+    const env = {
+      BUNNY_STATE_ZONE: 'state-zone',
+      BUNNY_STATE_PASSWORD: 'state-password',
+      BUNNY_STATE_HOST: server.host,
+    };
+    const args = ['--live', '--regions', 'UK,SYD', '--sample', '30', '--per-zoom', '--seed', '3'];
+
+    fake.replicate('', ['UK']);
+    const partial = await run(fake, args, env);
+    expect(partial.code, partial.stderr).toBe(2);
+    const checked = 1 + 4 + 16 + 30 * 3;
+    expect(partial.report).toMatchObject({ prefix: 'itest', build: '20261118', checked, missing: 0, mismatched: 0 });
+    expect(partial.report).toMatchObject({ notInArchive: 0, lacking: { UK: 0, SYD: checked } });
+
+    // z0-2 are sampled whole, so these two are among the positions checked.
+    fake.replicate();
+    fake.seed(tilePath('itest', 3), new TextEncoder().encode('wrong'));
+    fake.files.delete(tilePath('itest', 5));
+    const broken = await run(fake, args, env);
+    expect(broken.code, broken.stderr).toBe(1);
+    expect(broken.report).toMatchObject({ missing: 1, mismatched: 1, lacking: { UK: 0, SYD: 0 } });
+    expect(broken.report.mismatchedPaths).toEqual([tilePath('itest', 3)]);
+    expect(broken.report.missingPaths).toEqual([tilePath('itest', 5)]);
+
+    // Every column, the prefix taken from the state.
+    const listed = await run(fake, ['--listing', '--regions', 'UK,SYD', '--max-zoom', '5'], env);
+    expect(listed.code, listed.stderr).toBe(1);
+    expect(listed.report).toMatchObject({ mode: 'listing', prefix: 'itest', expected: positions, missing: 1 });
+    expect(listed.report.missingPaths).toEqual([tilePath('itest', 5)]);
+    // The file just written over is in no region yet.
+    expect(listed.report.held).toEqual({ UK: positions - 2, SYD: positions - 2 });
+    expect(listed.report.byZoom['5']).toMatchObject({ columns: 32, expected: 1024, present: 1024, missing: 0 });
+
+    // A pending build may have written anywhere it differs: nothing is checked until a sync finishes.
+    const pending = [{ build: '20261119', manifest: live.manifest, positions, startedAt: live.updatedAt }];
+    await writeState(store, { ...live, pending });
+    const skipped = await run(fake, args, env);
+    expect(skipped.code, skipped.stderr).toBe(0);
+    expect(skipped.report.skipped).toMatch(/pending builds 20261119/);
+
+    const usage = await run(fake, ['--live'], env);
+    expect(usage.code).toBe(3);
+    expect(usage.stderr).toMatch(/give --sample/);
   }, 60_000);
 
   it('with --wait exits 1 at once when the zone refuses the password', async () => {

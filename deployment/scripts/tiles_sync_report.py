@@ -14,6 +14,7 @@ Usage:
       [--started-at T] [--finished-at T] [--run-id ID] [--run-attempt N] [--run-url URL] [--trigger EVENT]
       (--base-url URL | --dry-run)
   tiles_sync_report.py watchdog --status FILE [--status-exit N] [--stderr FILE] (--base-url URL | --dry-run)
+  tiles_sync_report.py sample --report FILE [--exit N] [--stderr FILE] (--base-url URL | --dry-run)
 
 build-info prints the tiles schema version and the OSM replication time of a
 Protomaps build as JSON ({"version", "osmDate"}, null when the archive's
@@ -40,6 +41,11 @@ when its schema version differs from the live build's) or why the run failed
 before the CLI could report (the jobs' results and the check and download
 steps' outcomes). It adds the download step's seconds and the run's total: the
 sync job's first step to its last.
+
+sample reports the daily sample check of the live build in every storage
+region (`npm run bunny:replication -- --live --sample N --per-zoom --json
+FILE`): positions missing, holding other bytes than the live manifest, or not
+yet in a region, as tiles_sync_sample_*.
 
 watchdog reports the live build from `npm run bunny:status -- --json`, with a
 heartbeat. A watchdog that cannot read the live state sends no heartbeat, so
@@ -70,6 +76,7 @@ import urllib.request
 
 SYNC_APP = "tiles-sync"
 WATCHDOG_APP = "tiles-sync-watchdog"
+SAMPLE_APP = "tiles-sample-check"
 # o11y's identity labels, on every sample and log line, merged last so no label
 # of ours can shadow them. cluster=tiles puts the series in the tiles tenant
 # beside the worker's; provider and region say where the reporter runs, as the
@@ -109,21 +116,29 @@ class Budget(typing.NamedTuple):
     replication_timeout_min: int
     sync_timeout_min: int
     job_timeout_min: int
+    # Files in flight in the upload and DESCRIBEs in the replication gate
+    # (bunny:sync --concurrency and --replication-concurrency).
+    concurrency: int
 
 
 # A job that stops after its first PUT leaves the zone with part of the build
 # and state.json on the old one (the new one pending): the next run checks
 # every changed file again before writing, so it repairs, but only a job that
-# finishes makes the build live. So the guard rail is the diff one job finishes, the upload (~12.8k files/s measured) and then the
-# slowest region's replication (Sydney, ~1.3k files/s, from the first PUT on),
-# within the gate's timeout; anything larger goes in as a full rewrite under a
-# new prefix (plan section 6). The test checks each budget against those rates.
-# Daily: 0.5% (7.2M positions, weeks of daily changes): ~10 min of upload,
-# Sydney done ~90 min after the first PUT.
-DAILY = Budget(max_changed_fraction=0.005, replication_timeout_min=120, sync_timeout_min=270, job_timeout_min=360)
+# finishes makes the build live. So the guard rail is the diff one job
+# finishes: the upload (each file DESCRIBEd, ~120 ms, then PUT, ~115 ms, so
+# ~5.1k files/s at 1,200 in flight, the storage servers' share), then the
+# slowest region's replication (Sydney, ~1.3k files/s, from the first PUT on)
+# within the gate's timeout, then the TileJSON and styles' own gate (10 min at
+# least); anything larger goes in as a full rewrite under a new prefix (plan
+# section 6). The test checks each budget against those rates.
+# Daily: 0.5% (7.2M positions, weeks of daily changes): ~25 min of upload,
+# Sydney done ~2 h after the first PUT.
+DAILY = Budget(max_changed_fraction=0.005, replication_timeout_min=120, sync_timeout_min=270, job_timeout_min=360,
+               concurrency=1200)
 # A forced run (a schema change or a diff over the daily guard rail): 2% (29M
-# positions): ~40 min of upload, Sydney done ~6 h after the first PUT.
-FORCED = Budget(max_changed_fraction=0.02, replication_timeout_min=480, sync_timeout_min=600, job_timeout_min=720)
+# positions): ~95 min of upload, Sydney done ~7.5 h after the first PUT.
+FORCED = Budget(max_changed_fraction=0.02, replication_timeout_min=480, sync_timeout_min=630, job_timeout_min=720,
+                concurrency=1200)
 HOLD_VARIABLE = "TILES_SYNC_HOLD"
 
 # The report's numbers -> metric. Null fields (unknown, or a step the run never
@@ -255,6 +270,12 @@ class Unreadable(Exception):
     """bunny:status could not read the state zone, or builds.json lacks what the run needs."""
 
 
+def pending_builds(status):
+    """The builds `bunny:status --json` lists as pending (a sync started them and didn't finish)."""
+    pending = status.get("pending") if isinstance(status, dict) else None
+    return [key for key in pending if isinstance(key, str) and KEY.fullmatch(key)] if isinstance(pending, list) else []
+
+
 def live_build(status, exit_code=None, stderr=""):
     """The live build key from `bunny:status --json`'s output, or None when the state zone has no state.json yet (it
     then prints nulls and exits 1). Raises Unreadable for anything else: an error prints no JSON."""
@@ -321,7 +342,13 @@ def decide(builds, status, status_exit=None, status_stderr="", requested="", for
     if reason:
         return result("skip", "skipped", "notice", f"{key} not synced: {reason}")
     if key == live:
-        return result("skip", "skipped", "notice", f"{key} is live already")
+        pending = pending_builds(status)
+        if not pending:
+            return result("skip", "skipped", "notice", f"{key} is live already")
+        # A failed or cancelled sync left their bytes where they differ; syncing the live build puts its own back.
+        return {**outputs, "action": "sync", "status": "", "message": ""}, [
+            ("warning", f"{key} is live with {', '.join(pending)} pending: syncing {key} again puts its bytes back"
+                        " where they wrote, then purges")]
     if not requested and key < live:
         return result("skip", "skipped", "warning", f"The newest build in builds.json, {key}, is older than the live"
                       f" {live}; a rollback needs the build input")
@@ -470,9 +497,20 @@ def describe(status, build, previous, previous_version, version, osm_date, repor
     waits = numbers(report.get("replicationWaitSeconds"))
     if isinstance(complete, bool):
         what += "; replication " + ("complete" if complete else "INCOMPLETE")
+        # A region with no wait never held every file: it is the one to look at, not the slowest that did.
+        all_waits = report.get("replicationWaitSeconds")
+        never = sorted(r for r, v in all_waits.items() if v is None) if isinstance(all_waits, dict) else []
+        if never:
+            what += f", never in {', '.join(never)}"
         if waits:
             slowest = max(waits, key=waits.get)
             what += f", slowest {slowest} {waits[slowest]:,.0f}s"
+        stragglers = [s for s in report.get("replicationStragglers") or []
+                      if isinstance(s, dict) and isinstance(s.get("path"), str)]
+        if not complete and stragglers:
+            shown = [f"{s['path']} (not in {', '.join(map(str, s.get('regions') or []))})" for s in stragglers[:5]]
+            what += "; still not replicated: " + ", ".join(shown) + (
+                f" and {len(stragglers) - 5} more" if len(stragglers) > 5 else "")
     if steps:
         what += "; steps " + ", ".join(f"{s} {v:,.0f}s" for s, v in steps.items())
     return what
@@ -540,6 +578,42 @@ def watchdog(opts, now):
     osm_date, updated = status.get("osmDate") or "unknown", status.get("updatedAt") or "unknown"
     log.add(f"live build {live} (OSM {osm_date}), updated {updated}:"
             f" build {hours(status.get('buildAgeHours'))} old, OSM data {hours(status.get('osmAgeHours'))} old")
+    return samples, log
+
+
+# ── sample ──────────────────────────────────────────────────────────────────
+
+
+def sample(opts, now):
+    """The sample check's samples and log line. An unreadable or absent report is result=error, a check skipped
+    while builds are pending result=skipped; both send no counts."""
+    log = Log(app=SAMPLE_APP)
+    report = read_json(opts.report)
+    if report is not None and isinstance(report.get("skipped"), str):
+        log.add(f"tiles sample check skipped: {report['skipped']}")
+        return [("tiles_sync_sample_runs", {"result": "skipped"}, 1)], log
+    checked = number((report or {}).get("checked"))
+    if checked is None or opts.exit not in (0, 1, 2):
+        detail = read_tail(opts.stderr) or "no output"
+        log.add(f"tiles sample check could not run (exit {opts.exit}): {detail}", level="error")
+        return [("tiles_sync_sample_runs", {"result": "error"}, 1)], log
+    samples = [("tiles_sync_sample_runs", {"result": "ok"}, 1), ("tiles_sync_sample_checked", {}, checked)]
+    counts = {field: number(report.get(field)) or 0 for field in ("missing", "mismatched", "errors")}
+    for field, value in counts.items():
+        samples.append((f"tiles_sync_sample_{field}", {}, value))
+    lacking = numbers(report.get("lacking"))
+    for region, value in sorted(lacking.items()):
+        samples.append(("tiles_sync_sample_lacking", {REGION_LABEL: region}, value))
+    examples = [p for key in ("missingPaths", "mismatchedPaths") for p in (report.get(key) or [])[:3]
+                if isinstance(p, str)]
+    short = ", ".join(f"{region} {value:,.0f}" for region, value in sorted(lacking.items()) if value)
+    what = (f"tiles sample check of {report.get('build') or 'the live build'} under {report.get('prefix')}/:"
+            f" {checked:,.0f} positions, {counts['missing']:,.0f} missing, {counts['mismatched']:,.0f} with other"
+            f" bytes, {counts['errors']:,.0f} DESCRIBE errors; not yet in a region: {short or 'none'}")
+    if examples:
+        what += f"; e.g. {', '.join(examples)}"
+    level = "error" if counts["missing"] or counts["mismatched"] else "warn" if short or counts["errors"] else "info"
+    log.add(what, level=level)
     return samples, log
 
 
@@ -679,11 +753,15 @@ def parse_args(argv=None):
     dog.add_argument("--status", default="", help="`npm run bunny:status -- --json`'s output")
     dog.add_argument("--status-exit", default=None, type=optional_int, help="its exit code")
     dog.add_argument("--stderr", default="", help="its stderr, quoted when the status is unreadable")
-    for command in (run, dog):
+    check = commands.add_parser("sample", help="the daily sample check of the live build in every region")
+    check.add_argument("--report", default="", help="`npm run bunny:replication -- --live ... --json`'s file")
+    check.add_argument("--exit", default=None, type=optional_int, help="its exit code")
+    check.add_argument("--stderr", default="", help="its stderr, quoted when it could not run")
+    for command in (run, dog, check):
         command.add_argument("--base-url", default="", help="o11y's gateway, e.g. https://vmauth.futostatus.com")
         command.add_argument("--dry-run", action="store_true", help="print the metrics and log lines; send nothing")
     opts = parser.parse_args(argv)
-    if opts.command in ("sync", "watchdog") and not opts.dry_run and not opts.base_url:
+    if opts.command in ("sync", "watchdog", "sample") and not opts.dry_run and not opts.base_url:
         parser.error("--base-url or --dry-run is required")
     return opts
 
@@ -752,7 +830,7 @@ def main(argv=None):
         return
 
     now = time.time()
-    samples, log = (sync if opts.command == "sync" else watchdog)(opts, now)
+    samples, log = {"sync": sync, "watchdog": watchdog, "sample": sample}[opts.command](opts, now)
     if opts.dry_run:
         sys.stdout.write(exposition(samples, int(now * 1000)) + log_lines(log.records, now))
         return

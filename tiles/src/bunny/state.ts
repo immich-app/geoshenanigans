@@ -8,7 +8,11 @@
  * (planSync in diff.ts) and checks those positions before writing them. A sync therefore:
  * 1. reads the state and plans against the live and pending manifests;
  * 2. calls beginBuild before uploading any tile, which records its build as pending;
- * 3. calls publishBuild once the zone serves the build, which makes it live and clears `pending`.
+ * 3. calls publishBuild once the zone serves the build, which makes it live and clears `pending`;
+ * 4. calls pruneManifests, which deletes manifests no state names but for the newest few (each is ~1.3 GB).
+ *
+ * state.json also records the archive the live build came from (its fingerprint, as bunny:seed checkpoints it), so a
+ * seed can refuse to write another build's bytes over the live prefix.
  *
  * The store is BunnyStateStore below (MemoryObjectStore in tests). The state zone has no replicas, so re-uploading
  * identical bytes is harmless there.
@@ -37,6 +41,10 @@ export interface ObjectStore {
   putFile(path: string, file: string, sha256Hex: string): Promise<void>;
   /** Streams an object down to a file; false when it doesn't exist. */
   getToFile(path: string, file: string): Promise<boolean>;
+  /** Names of the files directly in a folder; empty when there is none. */
+  list(dir: string): Promise<string[]>;
+  /** A missing file is not an error. */
+  delete(path: string): Promise<void>;
 }
 
 /** A build a sync started writing to the tiles zone and hasn't made live. */
@@ -46,6 +54,12 @@ export interface PendingBuild {
   manifest: string;
   positions: number;
   startedAt: string;
+}
+
+/** Identifies a PMTiles archive as bunny:seed's checkpoint does (ArchiveRanges.fingerprint). */
+export interface ArchiveIdentity {
+  size: number;
+  fingerprint: string;
 }
 
 export interface SyncState {
@@ -58,6 +72,8 @@ export interface SyncState {
   updatedAt: string;
   osmDate: string | null;
   positions: number;
+  /** The archive liveBuild came from; null when not recorded. */
+  archive: ArchiveIdentity | null;
   /** Oldest first; empty unless a sync failed after it started uploading. */
   pending: PendingBuild[];
 }
@@ -90,6 +106,17 @@ export async function sha256File(file: string): Promise<string> {
 const isIsoDate = (value: unknown) => typeof value === 'string' && !Number.isNaN(Date.parse(value));
 
 const isPositions = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0;
+
+function parseArchive(value: unknown): ArchiveIdentity | null | undefined {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const archive = value as Partial<ArchiveIdentity>;
+  if (typeof archive !== 'object' || !isPositions(archive.size) || !/^[0-9a-f]{64}$/.test(archive.fingerprint ?? '')) {
+    return undefined;
+  }
+  return { size: archive.size!, fingerprint: archive.fingerprint! };
+}
 
 function parsePending(value: unknown, liveBuild: string): PendingBuild[] | undefined {
   if (value === undefined) {
@@ -150,6 +177,10 @@ export function parseState(value: unknown): SyncState {
   if (!pending) {
     problems.push('pending');
   }
+  const archive = parseArchive(state.archive);
+  if (archive === undefined) {
+    problems.push('archive');
+  }
   if (problems.length > 0) {
     throw new Error(`state.json has invalid ${problems.join(', ')}`);
   }
@@ -160,6 +191,7 @@ export function parseState(value: unknown): SyncState {
     updatedAt: state.updatedAt!,
     osmDate: state.osmDate ?? null,
     positions: state.positions!,
+    archive: archive!,
     pending: pending!,
   };
 }
@@ -299,6 +331,8 @@ export interface PublishOptions {
   prefix: string;
   /** Defaults to the manifest's (the archive metadata's OSM replication time). */
   osmDate?: string | null;
+  /** The archive the build came from. */
+  archive?: ArchiveIdentity | null;
   statePrefix?: string;
   now?: Date;
 }
@@ -318,10 +352,40 @@ export async function publishBuild(store: ObjectStore, options: PublishOptions):
     updatedAt: (options.now ?? new Date()).toISOString(),
     osmDate: options.osmDate === undefined ? header.osmDate : options.osmDate,
     positions: header.positions,
+    archive: options.archive ?? null,
     pending: [],
   };
   await writeState(store, state, options.statePrefix);
   return state;
+}
+
+const MANIFEST_FILE = /^\d{8}\.tman\.zst$/;
+
+/**
+ * Deletes the manifests in the state zone that state.json names neither as live nor as pending, but for the newest
+ * `keep` of them (by build date), for diagnosis. Only those two are ever read: a rollback builds its manifest again
+ * from the archive. Returns the deleted names, relative to the state prefix.
+ */
+export async function pruneManifests(
+  store: ObjectStore,
+  options: { keep?: number; statePrefix?: string } = {},
+): Promise<string[]> {
+  const state = await readState(store, options.statePrefix);
+  if (!state) {
+    return [];
+  }
+  const named = new Set([state.manifest, ...state.pending.map((pending) => pending.manifest)]);
+  const others = (await store.list(`${statePrefix(options.statePrefix)}manifests`))
+    .filter((name) => MANIFEST_FILE.test(name))
+    .map((name) => `manifests/${name}`)
+    .filter((name) => !named.has(name))
+    .sort()
+    .reverse();
+  const doomed = others.slice(Math.max(0, options.keep ?? 7));
+  for (const name of doomed) {
+    await store.delete(`${statePrefix(options.statePrefix)}${name}`);
+  }
+  return doomed;
 }
 
 export interface LiveStatus {
@@ -331,13 +395,15 @@ export interface LiveStatus {
   /** Hours since 00:00 UTC of the live build's date. */
   buildAgeHours: number | null;
   osmAgeHours: number | null;
+  /** Builds a sync started writing and didn't make live: the zone may hold their bytes where they differ. */
+  pending: string[];
 }
 
 const hoursSince = (time: number, now: Date) => Math.round((now.getTime() - time) / 360_000) / 10;
 
 export function liveStatus(state: SyncState | null, now = new Date()): LiveStatus {
   if (!state) {
-    return { liveBuild: null, updatedAt: null, osmDate: null, buildAgeHours: null, osmAgeHours: null };
+    return { liveBuild: null, updatedAt: null, osmDate: null, buildAgeHours: null, osmAgeHours: null, pending: [] };
   }
   const key = state.liveBuild;
   const buildDate = Date.UTC(Number(key.slice(0, 4)), Number(key.slice(4, 6)) - 1, Number(key.slice(6, 8)));
@@ -347,6 +413,7 @@ export function liveStatus(state: SyncState | null, now = new Date()): LiveStatu
     osmDate: state.osmDate,
     buildAgeHours: hoursSince(buildDate, now),
     osmAgeHours: state.osmDate ? hoursSince(Date.parse(state.osmDate), now) : null,
+    pending: state.pending.map((pending) => pending.build),
   };
 }
 
@@ -385,6 +452,19 @@ export class MemoryObjectStore implements ObjectStore {
       await writeFile(file, body);
     }
     return body !== null;
+  }
+
+  async list(dir: string) {
+    const folder = `${dir.replace(/\/+$/, '')}/`;
+    this.log.push(`list ${folder}`);
+    return [...this.objects.keys()]
+      .filter((path) => path.startsWith(folder) && !path.slice(folder.length).includes('/'))
+      .map((path) => path.slice(folder.length));
+  }
+
+  async delete(path: string) {
+    this.log.push(`delete ${path}`);
+    this.objects.delete(path);
   }
 }
 
@@ -567,6 +647,31 @@ export class BunnyStateStore implements ObjectStore {
         'Content-Length': String(size),
       },
       transfer: true,
+    });
+  }
+
+  list(dir: string): Promise<string[]> {
+    const folder = dir.replace(/^\/+|\/+$/g, '');
+    return this.request('GET', folder ? `${folder}/` : '', async (response) => {
+      if (response.statusCode === 404) {
+        return [];
+      }
+      if (response.statusCode !== 200) {
+        BunnyStateStore.fail('GET', `${folder}/`, response);
+      }
+      const rows = (await response.body.json()) as Array<{ ObjectName?: string; IsDirectory?: boolean }>;
+      if (!Array.isArray(rows)) {
+        throw new Error(`GET ${folder}/: unexpected listing`);
+      }
+      return rows.filter((row) => !row.IsDirectory && typeof row.ObjectName === 'string').map((row) => row.ObjectName!);
+    });
+  }
+
+  delete(path: string): Promise<void> {
+    return this.request('DELETE', path, async (response) => {
+      if (response.statusCode !== 200 && response.statusCode !== 204 && response.statusCode !== 404) {
+        BunnyStateStore.fail('DELETE', path, response);
+      }
     });
   }
 

@@ -2517,7 +2517,7 @@
         "uid": "${logs}"
       },
       "timeFrom": "14d",
-      "description": "A line per sync run (status, build, changed positions, uploads, replication, step seconds and the run's URL) and its error, and a line per watchdog tick. Every line carries app, level and the sync's run_id, build and status.",
+      "description": "A line per sync run (status, build, changed positions, uploads, replication, step seconds and the run's URL) and its error, a line per watchdog tick, and a line per daily sample check (app tiles-sample-check: counts and example paths). Every sync line carries app, level and the sync's run_id, build and status.",
       "options": {
         "dedupStrategy": "none",
         "enableLogDetails": true,
@@ -2534,7 +2534,7 @@
             "type": "victoriametrics-logs-datasource",
             "uid": "${logs}"
           },
-          "expr": "project:=\"geoshenanigans\" cluster:=\"tiles\" app:in(\"tiles-sync\", \"tiles-sync-watchdog\") | sort by (_time desc)",
+          "expr": "project:=\"geoshenanigans\" cluster:=\"tiles\" app:in(\"tiles-sync\", \"tiles-sync-watchdog\", \"tiles-sample-check\") | sort by (_time desc)",
           "maxLines": 500,
           "queryType": "instant",
           "refId": "A"
@@ -2549,6 +2549,206 @@
       "id": 41
     },
     {
+      "type": "timeseries",
+      "title": "Sample check: not yet in a region",
+      "description": "Of the daily sample of live positions (100 per zoom), those stored with the right bytes that each storage region does not hold yet; they are served from Frankfurt there. After a seed this is the replication backlog draining: zero in every region is when it has.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "timeFrom": "14d",
+      "interval": "1h",
+      "maxDataPoints": 400,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "always",
+            "pointSize": 5,
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_sample_lacking{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "{{storage_region}}",
+          "refId": "A",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 88
+      },
+      "id": 56
+    },
+    {
+      "type": "timeseries",
+      "title": "Sample check: missing or other bytes",
+      "description": "Of the daily sample of live positions, those with no file (a 404 for users) or with other bytes than the live manifest. Both should be zero; the sample check's log line names examples.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "timeFrom": "14d",
+      "interval": "1h",
+      "maxDataPoints": 400,
+      "fieldConfig": {
+        "defaults": {
+          "unit": "none",
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "always",
+            "pointSize": 5,
+            "spanNulls": true,
+            "axisSoftMin": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "checked"
+            },
+            "properties": [
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_sample_missing{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "missing",
+          "refId": "A",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_sample_mismatched{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "other bytes",
+          "refId": "B",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_sample_errors{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "DESCRIBE errors",
+          "refId": "C",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "editorMode": "code",
+          "expr": "last_over_time(tiles_sync_sample_checked{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])",
+          "legendFormat": "checked",
+          "refId": "D",
+          "range": true
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 88
+      },
+      "id": 57
+    },
+    {
       "type": "row",
       "title": "Bunny: CDN requests",
       "collapsed": false,
@@ -2557,7 +2757,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 88
+        "y": 96
       },
       "id": 42
     },
@@ -2618,7 +2818,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 89
+        "y": 97
       },
       "id": 43
     },
@@ -2679,7 +2879,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 89
+        "y": 97
       },
       "id": 44
     },
@@ -2740,7 +2940,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 89
+        "y": 97
       },
       "id": 45
     },
@@ -2801,7 +3001,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 97
+        "y": 105
       },
       "id": 46
     },
@@ -2862,7 +3062,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 97
+        "y": 105
       },
       "id": 47
     },
@@ -2947,7 +3147,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 97
+        "y": 105
       },
       "id": 48
     },
@@ -3008,7 +3208,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 105
+        "y": 113
       },
       "id": 49
     },
@@ -3071,7 +3271,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 105
+        "y": 113
       },
       "id": 50
     },
@@ -3154,7 +3354,7 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 105
+        "y": 113
       },
       "id": 51
     },
@@ -3167,7 +3367,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 113
+        "y": 121
       },
       "id": 52
     },
@@ -3244,7 +3444,7 @@
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 114
+        "y": 122
       },
       "id": 53
     },
@@ -3305,7 +3505,7 @@
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 114
+        "y": 122
       },
       "id": 54
     },
@@ -3377,9 +3577,47 @@
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 114
+        "y": 122
       },
       "id": 55
+    },
+    {
+      "type": "logs",
+      "title": "Probe tests",
+      "datasource": {
+        "type": "victoriametrics-logs-datasource",
+        "uid": "${logs}"
+      },
+      "description": "Every synthetic probe test (logged at info, so not under Errors and warnings): continent, kind (hit or miss), the URL, the status, the PoP that answered (Server header), first byte and the verdict. Measurement errors are under Errors and warnings.",
+      "options": {
+        "dedupStrategy": "none",
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": false,
+        "showLabels": false,
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "victoriametrics-logs-datasource",
+            "uid": "${logs}"
+          },
+          "expr": "project:=\"geoshenanigans\" cluster:=\"tiles\" kind:=\"probe\" | sort by (_time desc)",
+          "maxLines": 500,
+          "queryType": "instant",
+          "refId": "A"
+        }
+      ],
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 130
+      },
+      "id": 58
     },
     {
       "type": "row",
@@ -3389,7 +3627,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 122
+        "y": 138
       },
       "panels": [],
       "id": 25
@@ -3406,7 +3644,7 @@
         "h": 12,
         "w": 24,
         "x": 0,
-        "y": 123
+        "y": 139
       },
       "options": {
         "dedupStrategy": "none",

@@ -10,6 +10,7 @@ import {
   MemoryObjectStore,
   ObjectStore,
   parseState,
+  pruneManifests,
   publishBuild,
   readState,
   STATE_STORE_DEFAULTS,
@@ -19,6 +20,8 @@ import {
 } from '../../src/bunny/state';
 import { scratchDir } from './manifest-fixtures';
 import { startStateServer } from './state-server';
+
+const hex = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex').toUpperCase();
 
 let scratch: Awaited<ReturnType<typeof scratchDir>>;
 beforeEach(async () => {
@@ -44,6 +47,7 @@ const state: SyncState = {
   updatedAt: '2026-11-18T10:40:00.000Z',
   osmDate: '2026-11-17T23:59:59Z',
   positions: 85,
+  archive: null,
   pending: [],
 };
 
@@ -91,6 +95,16 @@ describe('parseState', () => {
     ]) {
       expect(() => parseState({ ...state, pending }), JSON.stringify(pending)).toThrow(
         'state.json has invalid pending',
+      );
+    }
+  });
+
+  it('checks the archive the live build came from', () => {
+    const archive = { size: 139_600_000_000, fingerprint: 'ab'.repeat(32) };
+    expect(parseState({ ...state, archive }).archive).toEqual(archive);
+    for (const bad of [{}, { ...archive, size: -1 }, { ...archive, fingerprint: 'AB'.repeat(32) }, 'x']) {
+      expect(() => parseState({ ...state, archive: bad }), JSON.stringify(bad)).toThrow(
+        'state.json has invalid archive',
       );
     }
   });
@@ -154,6 +168,8 @@ describe('publishBuild', () => {
       putFile: async (path, file, sha256) => lossy.put(path, await readFile(file), sha256),
       describe: (path) => memory.describe(path),
       getToFile: (path, file) => memory.getToFile(path, file),
+      list: (dir) => memory.list(dir),
+      delete: (path) => memory.delete(path),
     };
     const file = await manifestFile('20261118');
     await expect(publishBuild(lossy, { buildKey: '20261118', manifestFile: file, prefix: 'v1' })).rejects.toThrow(
@@ -237,6 +253,53 @@ describe('beginBuild', () => {
   });
 });
 
+describe('pruneManifests', () => {
+  const put = (store: ObjectStore, path: string) => {
+    const body = new TextEncoder().encode(path);
+    return store.put(path, body, createHash('sha256').update(body).digest('hex').toUpperCase());
+  };
+
+  it('deletes manifests no state names, keeping the newest few', async () => {
+    const store = new MemoryObjectStore();
+    const file = await manifestFile('20261118');
+    await publishBuild(store, { buildKey: '20261118', manifestFile: file, prefix: 'v1' });
+    const pending = {
+      build: '20261101',
+      manifest: 'manifests/20261101.tman.zst',
+      positions: 85,
+      startedAt: state.updatedAt,
+    };
+    await writeState(store, { ...state, pending: [pending] });
+    for (const day of ['01', '05', '10', '12', '15', '17', '19']) {
+      await put(store, `manifests/202611${day}.tman.zst`);
+    }
+    await put(store, 'manifests/notes.txt');
+
+    expect(await pruneManifests(store, { keep: 2 })).toEqual([
+      'manifests/20261115.tman.zst',
+      'manifests/20261112.tman.zst',
+      'manifests/20261110.tman.zst',
+      'manifests/20261105.tman.zst',
+    ]);
+    expect([...store.objects.keys()].sort()).toEqual([
+      'manifests/20261101.tman.zst',
+      'manifests/20261117.tman.zst',
+      'manifests/20261118.tman.zst',
+      'manifests/20261119.tman.zst',
+      'manifests/notes.txt',
+      'state.json',
+    ]);
+    expect(await pruneManifests(store, { keep: 2 })).toEqual([]);
+  });
+
+  it('does nothing without a state', async () => {
+    const store = new MemoryObjectStore();
+    await put(store, 'manifests/20261115.tman.zst');
+    expect(await pruneManifests(store, { keep: 0 })).toEqual([]);
+    expect(store.objects.size).toBe(1);
+  });
+});
+
 describe('downloadManifest', () => {
   it('fetches the live manifest and checks it against state.json', async () => {
     const store = new MemoryObjectStore();
@@ -263,6 +326,8 @@ describe('downloadManifest', () => {
       put: (path, body, sha256) => memory.put(path, body, sha256),
       putFile: (path, file, sha256) => memory.putFile(path, file, sha256),
       describe: (path) => memory.describe(path),
+      list: (dir) => memory.list(dir),
+      delete: (path) => memory.delete(path),
       getToFile: async (path, file) => {
         const bytes = await memory.get(path);
         bytes![bytes!.length - 1] ^= 1;
@@ -309,6 +374,20 @@ describe('BunnyStateStore', () => {
     expect(await readFile(out)).toEqual(await readFile(file));
     expect(await store().describe('itest-b-1/missing')).toBeNull();
     expect(await store().getToFile('itest-b-1/missing', scratch.path('missing'))).toBe(false);
+
+    // Listing and deleting, as pruneManifests does.
+    const older = await manifestFile('20261110');
+    await store().putFile('itest-b-1/manifests/20261110.tman.zst', older, hex(await readFile(older)));
+    expect((await store().list('itest-b-1/manifests')).sort()).toEqual(['20261110.tman.zst', '20261118.tman.zst']);
+    expect(await store().list('itest-b-1/nothing')).toEqual([]);
+    expect(await pruneManifests(store(), { keep: 0, statePrefix: 'itest-b-1' })).toEqual([
+      'manifests/20261110.tman.zst',
+    ]);
+    expect([...server.objects.keys()].sort()).toEqual([
+      'itest-b-1/manifests/20261118.tman.zst',
+      'itest-b-1/state.json',
+    ]);
+    await store().delete('itest-b-1/missing');
   });
 
   it('retries 5xx and 429 answers', async () => {

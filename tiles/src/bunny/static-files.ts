@@ -9,6 +9,9 @@
  *   `v1` is the tiles folder, not a file.)
  * Not reproduced: `/v1` as the TileJSON, and other versions (`/v2.json`, `/v2/style/...`), which the Worker's URL
  * pattern accepts but nothing links to.
+ *
+ * The tiles can sit under another prefix than these files (`prefix`, e.g. `v1/e2` after a full rewrite, plan section
+ * 6): Immich keeps loading `/v1/style/*.json`, and only the TileJSON's tile template follows the tiles.
  */
 import { createHash } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
@@ -36,9 +39,14 @@ export interface StaticFilesOptions {
   styles: StyleSource[];
   /** e.g. https://tiles.immich.cloud (BUNNY_PUBLIC_URL). */
   publicUrl: string;
-  /** Where TileJSON, styles and tiles live: `${prefix}.json`, `${prefix}/style/...`, `${prefix}/{z}/{x}/{y}.mvt`. */
+  /** Where the tiles live: `${prefix}/{z}/{x}/{y}.mvt` (default v1). */
   prefix?: string;
+  /** Where the TileJSON and styles live: `${staticPrefix}.json`, `${staticPrefix}/style/...` (default v1). */
+  staticPrefix?: string;
 }
+
+/** The TileJSON's and styles' prefix, the URLs Immich loads. */
+export const STATIC_PREFIX = 'v1';
 
 const STYLE_NAME = /^\w+$/;
 
@@ -51,16 +59,24 @@ const file = (path: string, body: Uint8Array): StaticFile => ({
   contentType: 'application/json',
 });
 
-function normalise(options: Pick<StaticFilesOptions, 'publicUrl' | 'prefix'>) {
+function checkPrefix(value: string | undefined): string {
+  const prefix = (value ?? STATIC_PREFIX).replace(/^\/+|\/+$/g, '');
+  if (!prefix || prefix.split('/').some((part) => part === '' || part === '.' || part === '..')) {
+    throw new Error(`Invalid prefix ${JSON.stringify(value)}`);
+  }
+  return prefix;
+}
+
+function normalise(options: Pick<StaticFilesOptions, 'publicUrl' | 'prefix' | 'staticPrefix'>) {
   const publicUrl = new URL(options.publicUrl);
   if (publicUrl.search || publicUrl.hash) {
     throw new Error(`Public URL must not have a query or fragment: ${options.publicUrl}`);
   }
-  const prefix = (options.prefix ?? 'v1').replace(/^\/+|\/+$/g, '');
-  if (!prefix || prefix.split('/').some((part) => part === '' || part === '.' || part === '..')) {
-    throw new Error(`Invalid prefix ${JSON.stringify(options.prefix)}`);
-  }
-  return { base: `${publicUrl.origin}${publicUrl.pathname.replace(/\/+$/, '')}`, prefix };
+  return {
+    base: `${publicUrl.origin}${publicUrl.pathname.replace(/\/+$/, '')}`,
+    prefix: checkPrefix(options.prefix),
+    staticPrefix: checkPrefix(options.staticPrefix),
+  };
 }
 
 /** The TileJSON object: the Worker's, with stable tile URLs. */
@@ -89,17 +105,20 @@ export function rewriteStyle(style: StyleSource, tileJsonUrl: string): Uint8Arra
 
 /** Every non-tile file of the zone, ready to upload. */
 export function staticFiles(options: StaticFilesOptions): StaticFile[] {
-  const { base, prefix } = normalise(options);
+  const { base, staticPrefix } = normalise(options);
   if (options.styles.length === 0) {
     throw new Error('No styles');
   }
-  const files = [file(`${prefix}.json`, new TextEncoder().encode(JSON.stringify(tileJson(options))))];
+  const files = [file(`${staticPrefix}.json`, new TextEncoder().encode(JSON.stringify(tileJson(options))))];
   for (const style of options.styles) {
     if (!STYLE_NAME.test(style.name)) {
       throw new Error(`Style name ${JSON.stringify(style.name)} isn't one the tile URLs can address`);
     }
-    const body = rewriteStyle(style, `${base}/${prefix}.json`);
-    files.push(file(`${prefix}/style/${style.name}.json`, body), file(`${prefix}/style/${style.name}`, body));
+    const body = rewriteStyle(style, `${base}/${staticPrefix}.json`);
+    files.push(
+      file(`${staticPrefix}/style/${style.name}.json`, body),
+      file(`${staticPrefix}/style/${style.name}`, body),
+    );
   }
   return files;
 }

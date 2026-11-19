@@ -1,15 +1,21 @@
 /**
  * Syncs the tiles zone to a new build in place (see sync.ts), or starts the state with a seeded build:
  *
- *   npm run bunny:sync -- --archive <path> --build <YYYYMMDD> [--osm-date <ISO>] [--prefix v1]
+ *   npm run bunny:sync -- --archive <path> --build <YYYYMMDD> [--osm-date <ISO>] [--prefix <live prefix, or v1>]
  *     [--max-changed-fraction 0.05] [--replication-timeout-min 120] [--max-zoom Z] [--state-prefix <p>]
- *     [--dry-run] [--force-full | --adopt] [--report <path.json>] [--styles-dir <dir>] [--work-dir <dir>]
+ *     [--dry-run] [--force-full | --adopt --seed-state <dir> [--seed-state <dir> ...] [--replace]]
+ *     [--report <path.json>] [--styles-dir <dir>] [--work-dir <dir>] [--static-prefix v1] [--keep-manifests 7]
  *     [--threads N] [--concurrency 512] [--replication-interval-s 30] [--replication-concurrency 512]
  *     [--regions UK,SE,...] [--adopt-samples 10000] [--max-failures 1000] [--request-timeout-s 60] [--plain-puts]
  *
- * Without state.json it refuses unless --adopt (record a build bunny:seed uploaded: checks --adopt-samples random
- * positions, writes no tiles) or --force-full (write every position, each DESCRIBEd first; for repairs and small zoom
- * ranges). --dry-run builds the manifest and plans, then stops: it needs only the state zone. Every changed position is
+ * Without state.json it refuses unless --adopt (record a build bunny:seed uploaded, writing no tiles: every
+ * --seed-state dir must say its seed completed, for this archive, zone and prefix, together over every position, and
+ * --adopt-samples random positions must hold the build) or --force-full (write every position, each DESCRIBEd first;
+ * for repairs and small zoom ranges). --adopt --replace switches a live zone to a build seeded under another --prefix
+ * (a full rewrite): the same checks, the sample also in every region, then the TileJSON points at the new prefix.
+ * A run for the live build while state.json lists pending builds puts the live bytes back where they wrote (a revert
+ * of a failed or cancelled sync). --dry-run builds the manifest and plans, then stops: it needs only the state zone.
+ * Every changed position is
  * DESCRIBEd before its PUT; --plain-puts skips that where no pending build may have written (faster, but an identical
  * re-PUT clears a file's replication, so only when the zone surely holds the live build).
  * The replication gate waits for every replica region unless --regions lists some; --regions none only checks that
@@ -88,6 +94,10 @@ const OPTIONS = {
   'dry-run': { type: 'boolean', default: false },
   'force-full': { type: 'boolean', default: false },
   adopt: { type: 'boolean', default: false },
+  replace: { type: 'boolean', default: false },
+  'seed-state': { type: 'string', multiple: true },
+  'static-prefix': { type: 'string' },
+  'keep-manifests': { type: 'string' },
   report: { type: 'string' },
   'styles-dir': { type: 'string' },
   'work-dir': { type: 'string' },
@@ -116,6 +126,7 @@ async function main(): Promise<number> {
     dryRun: flag('dry-run'),
     forceFull: flag('force-full'),
     adopt: flag('adopt'),
+    replace: flag('replace'),
   });
   // A report from the start: a run killed outright still leaves one that says it failed.
   report.error = 'the sync did not finish';
@@ -243,6 +254,10 @@ async function main(): Promise<number> {
         dryRun,
         forceFull: flag('force-full'),
         adopt: flag('adopt'),
+        replace: flag('replace'),
+        seedStates: [values['seed-state'] ?? []].flat().filter((dir): dir is string => typeof dir === 'string'),
+        staticPrefix: text('static-prefix'),
+        keepManifests: number('keep-manifests', text('keep-manifests')),
         adoptSamples: number('adopt-samples', text('adopt-samples'), 1),
         plainPuts: flag('plain-puts'),
         publicUrl,

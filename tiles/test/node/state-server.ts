@@ -9,7 +9,8 @@ interface Request {
 }
 
 /**
- * A stand-in for a Bunny storage zone, enough for the state zone: PUT with Checksum validation, GET, DESCRIBE.
+ * A stand-in for a Bunny storage zone, enough for the state zone: PUT with Checksum validation, GET (and folder
+ * listings), DESCRIBE, DELETE.
  * Node's HTTP parser rejects the DESCRIBE method, so this speaks one HTTP/1.1 request per connection over raw
  * sockets. Faults:
  * - `failNext`: the next requests answer with these statuses (e.g. 503) without being handled;
@@ -46,8 +47,23 @@ export async function startStateServer(zone: string, password: string) {
         }
         objects.set(path, request.body);
         return { status: 201, body: '{"HttpCode":201,"Message":"File uploaded."}' };
-      case 'GET':
+      case 'GET': {
+        if (path === '' || path.endsWith('/')) {
+          // A folder listing: the files directly in it.
+          const rows = [...objects.entries()]
+            .filter(([name]) => name.startsWith(path) && !name.slice(path.length).includes('/'))
+            .map(([name, bytes]) => ({
+              ObjectName: name.slice(path.length),
+              Length: bytes.length,
+              Checksum: sha256(bytes),
+              IsDirectory: false,
+            }));
+          return { status: 200, body: JSON.stringify(rows), type: 'application/json' };
+        }
         return object ? { status: 200, body: object, type: 'application/octet-stream' } : { status: 404 };
+      }
+      case 'DELETE':
+        return objects.delete(path) ? { status: 200 } : { status: 404 };
       case 'DESCRIBE':
         return object
           ? {

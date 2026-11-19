@@ -3,9 +3,12 @@ import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { mkdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ArchiveRanges } from '../../src/bunny/archive-walk';
+import { BunnyStateStore, writeState } from '../../src/bunny/state';
 import { tilePath } from '../../src/bunny/tile-id';
 import { Checkpoint, runSeed, SeedOptions, SeedStatus } from '../../src/bunny/upload';
 import { FakeStorage, FakeStorageOptions, Fault } from './fake-storage';
+import { startStateServer } from './state-server';
 import { FixtureArchive, random, scratchDir, writeFixtureArchive } from './upload-fixture';
 
 const TILES_DIR = join(import.meta.dirname, '../..');
@@ -522,7 +525,9 @@ function startSeed(
   args: string[],
   env: Record<string, string> = {},
 ): { child: ChildProcess; done: Promise<ChildResult> } {
-  const child = spawn(process.execPath, ['--import=tsx', 'src/bunny/cli/seed.ts', ...args], {
+  // These seeds write a zone no sync uses, unless a test gives the state zone.
+  const stateCheck = 'BUNNY_STATE_ZONE' in env ? [] : ['--no-state-check'];
+  const child = spawn(process.execPath, ['--import=tsx', 'src/bunny/cli/seed.ts', ...args, ...stateCheck], {
     cwd: TILES_DIR,
     env: {
       ...process.env,
@@ -809,6 +814,55 @@ describe('bunny:seed CLI', () => {
     expect(fake.identicalReputs).toEqual([]);
     expectStored(fake, fixture, 0, 1_365);
   }, 60_000);
+
+  it('refuses to seed the live prefix with another archive than the live build', async () => {
+    const { fake, fixture, dir } = await setup(85);
+    const server = await startStateServer('state-zone', 'state-password');
+    cleanup.push(() => server.close());
+    const store = new BunnyStateStore({ zone: 'state-zone', password: 'state-password', host: server.host });
+    cleanup.push(() => store.close());
+    const ranges = await ArchiveRanges.open(fixture.path);
+    await ranges.close();
+    const live = {
+      liveBuild: '20261118',
+      manifest: 'manifests/20261118.tman.zst',
+      prefix: 'itest',
+      updatedAt: '2026-11-18T10:40:00.000Z',
+      osmDate: null,
+      positions: 85,
+      archive: { size: ranges.size, fingerprint: 'ab'.repeat(32) },
+      pending: [],
+    };
+    await writeState(store, live);
+    const env = {
+      BUNNY_STATE_ZONE: 'state-zone',
+      BUNNY_STATE_PASSWORD: 'state-password',
+      BUNNY_STATE_HOST: server.host,
+      XDG_STATE_HOME: dir,
+    };
+    const args = (prefix: string) => ['--archive', fixture.path, '--prefix', prefix, '--state-dir', join(dir, prefix)];
+
+    const refused = await startSeed(fake, args('itest'), env).done;
+    expect(refused.code).toBe(1);
+    expect(refused.stderr).toMatch(/20261118 is live under itest\/ and this archive is not the one it came from/);
+    expect(fake.requests.PUT ?? 0).toBe(0);
+    const missing = await startSeed(fake, args('itest'), { ...env, BUNNY_STATE_PASSWORD: '' }).done;
+    expect(missing.code).toBe(2);
+    expect(missing.stderr).toMatch(/--no-state-check/);
+
+    // Another prefix (a full rewrite) is fine, and so is the live build's own archive (a repair).
+    const rewrite = await startSeed(fake, args('itest/e2'), env).done;
+    expect(rewrite.code, rewrite.stderr).toBe(0);
+    await writeState(store, { ...live, archive: { size: ranges.size, fingerprint: ranges.fingerprint } });
+    const repair = await startSeed(fake, args('itest'), env).done;
+    expect(repair.code, repair.stderr).toBe(0);
+    for (const prefix of ['itest', 'itest/e2']) {
+      expect([...Array(85).keys()].filter((id) => fake.checksum(tilePath(prefix, id)) !== fixture.sha256(id))).toEqual(
+        [],
+      );
+    }
+    expect(fake.files.size).toBe(170);
+  }, 30_000);
 
   it('rejects bad arguments with exit code 2', async () => {
     const fake = await FakeStorage.start();

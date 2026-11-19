@@ -65,6 +65,8 @@ interface World {
   events: string[];
   purges: number;
   archives: Record<string, { path: string; build: Build }>;
+  /** A completed seed's state dir of each build over every position under v1, as bunny:seed leaves it. */
+  seedStates: Record<string, string>;
   options(build: string, extra?: Partial<SyncOptions>): SyncOptions;
   deps(): Parameters<typeof runSync>[1];
 }
@@ -111,6 +113,10 @@ async function world(tileOptions: FakeStorageOptions = {}): Promise<World> {
     concurrency: 32,
   });
   const state = new BunnyStateStore({ zone: stateZone.zone, password: stateZone.password, host: stateZone.url });
+  const seedStates: World['seedStates'] = {};
+  for (const key of Object.keys(archives)) {
+    seedStates[key] = await seedState({ dir, zone: tiles.zone, archive: archives[key].path });
+  }
   cleanup.push(
     () => tiles.close(),
     () => stateZone.close(),
@@ -126,10 +132,11 @@ async function world(tileOptions: FakeStorageOptions = {}): Promise<World> {
     events,
     purges: 0,
     archives,
+    seedStates,
     options: (build, extra = {}) => ({
       archive: archives[build].path,
       build,
-      prefix: 'v1',
+      seedStates: [seedStates[build]],
       maxChangedFraction: 1,
       replicationTimeoutMs: 5_000,
       replicationIntervalMs: 20,
@@ -154,11 +161,41 @@ async function world(tileOptions: FakeStorageOptions = {}): Promise<World> {
   return w;
 }
 
+let seedStateDirs = 0;
+
+/** The state dir a seed leaves (seed.json and status.json), over [from, to) of an archive. */
+async function seedState(options: {
+  dir: string;
+  zone: string;
+  archive: string;
+  prefix?: string;
+  from?: number;
+  to?: number;
+  state?: string;
+}): Promise<string> {
+  const ranges = await ArchiveRanges.open(options.archive);
+  await ranges.close();
+  const dir = join(options.dir, `seed-state-${++seedStateDirs}`);
+  await mkdir(dir, { recursive: true });
+  const range = { from: options.from ?? 0, to: options.to ?? POSITIONS };
+  const params = {
+    zone: options.zone,
+    host: 'http://127.0.0.1',
+    prefix: options.prefix ?? 'v1',
+    ...range,
+    chunkSize: 64,
+    archive: { size: ranges.size, fingerprint: ranges.fingerprint },
+  };
+  await writeFile(join(dir, 'seed.json'), JSON.stringify(params));
+  await writeFile(join(dir, 'status.json'), JSON.stringify({ state: options.state ?? 'complete', range, error: null }));
+  return dir;
+}
+
 /** Stores build `key` at every position as a seed would have, replicated everywhere. */
-function seedZone(w: World, key: string, prefix = 'v1', end = POSITIONS) {
+function seedZone(w: World, key: string, prefix = 'v1', end = POSITIONS, regions = REGIONS) {
   const { build } = w.archives[key];
   for (let id = 0; id < Math.min(end, build.contents.length); id++) {
-    w.tiles.seed(tilePath(prefix, id), contentBytes(build.contents[id]!), REGIONS);
+    w.tiles.seed(tilePath(prefix, id), contentBytes(build.contents[id]!), regions);
   }
 }
 
@@ -227,6 +264,43 @@ describe('runSync', () => {
     expect(tileJson.tiles).toEqual(['https://tiles.example/v1/{z}/{x}/{y}.mvt']);
     expect(w.tiles.files.has('v1/style/light.json')).toBe(true);
     expect(w.tiles.files.has('v1/style/light')).toBe(true);
+  });
+
+  it("refuses to adopt unless the seed's state dirs say it completed, for this archive, zone and prefix", async () => {
+    const w = await world();
+    seedZone(w, '20261117');
+    const archive = w.archives['20261117'].path;
+    const half = Math.floor(POSITIONS / 2);
+    const cases: Array<[string[], RegExp]> = [
+      [[await seedState({ dir: w.dir, zone: w.tiles.zone, archive, state: 'failed' })], /last run ended failed/],
+      [[await seedState({ dir: w.dir, zone: 'other-zone', archive })], /seeded zone other-zone/],
+      [[await seedState({ dir: w.dir, zone: w.tiles.zone, archive, prefix: 'v2' })], /seeded v2\/, not v1\//],
+      [[w.seedStates['20261118']], /another archive/],
+      [[await seedState({ dir: w.dir, zone: w.tiles.zone, archive, to: half })], new RegExp(`up to ${half}, not all`)],
+      [
+        [
+          await seedState({ dir: w.dir, zone: w.tiles.zone, archive, to: half - 1 }),
+          await seedState({ dir: w.dir, zone: w.tiles.zone, archive, from: half }),
+        ],
+        new RegExp(`seed tile ${half - 1} on`),
+      ],
+      [[join(w.dir, 'nothing')], /not a seed's state dir/],
+      [[], /needs .*--seed-state/],
+    ];
+    for (const [seedStates, error] of cases) {
+      const report = await runSync(w.options('20261117', { adopt: true, seedStates }), w.deps());
+      expect(report.status, String(error)).toBe('failed');
+      expect(report.error).toMatch(error);
+    }
+    expect(await readState(w.state)).toBeNull();
+    expect(w.purges).toBe(0);
+
+    const split = [
+      await seedState({ dir: w.dir, zone: w.tiles.zone, archive, from: half }),
+      await seedState({ dir: w.dir, zone: w.tiles.zone, archive, to: half }),
+    ];
+    const report = await runSync(w.options('20261117', { adopt: true, seedStates: split }), w.deps());
+    expect(report).toMatchObject({ status: 'success', error: null });
   });
 
   it('refuses to adopt a build the zone does not hold', async () => {
@@ -456,7 +530,11 @@ describe('runSync', () => {
     expect(first.replicationIncomplete).toBe(changed.length);
     expect(first.replicationWaitSeconds).toMatchObject({ SYD: null });
     expect(typeof first.replicationWaitSeconds!.UK).toBe('number');
-    expect(first.error).toMatch(/Replication incomplete.*SYD/);
+    expect(first.error).toMatch(/Replication of the tiles incomplete.*SYD/);
+    // The files still lacking a region are named, so one that never replicates can be found.
+    expect(first.replicationStragglers.length).toBe(Math.min(20, changed.length));
+    expect(first.replicationStragglers[0]).toEqual({ path: expect.stringMatching(/^v1\/.*\.mvt$/), regions: ['SYD'] });
+    expect(first.error).toContain(`e.g. ${first.replicationStragglers[0].path} (not in SYD)`);
     expect(w.purges).toBe(0);
     expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', pending: [{ build: '20261118' }] });
 
@@ -517,6 +595,138 @@ describe('runSync', () => {
     expect(w.tiles.identicalReputs).toEqual([]);
     expectHolds(w, '20261118');
     expect(await readState(w.state)).toMatchObject({ liveBuild: '20261118', pending: [] });
+  });
+
+  it('reverts a failed sync when the live build is synced again', async () => {
+    const delays: Record<string, number> = { UK: 5, NY: 10 };
+    const w = await world({ replicationDelayMs: delays });
+    await adopted(w);
+    const changed = changedPositions(w, '20261117', '20261118');
+    const failed = await runSync(w.options('20261118', { replicationTimeoutMs: 200 }), w.deps());
+    expect(failed.status).toBe('failed');
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', pending: [{ build: '20261118' }] });
+    expectHolds(w, '20261118');
+    w.tiles.replicate();
+    delays.SYD = 20;
+    w.tiles.putsByPath.clear();
+
+    const revert = await runSync(w.options('20261117'), w.deps());
+    expect(revert.error).toBeNull();
+    expect(revert).toMatchObject({
+      status: 'success',
+      previousBuild: '20261117',
+      pendingBuilds: ['20261118'],
+      positionsChanged: 0,
+      positionsPending: changed.length,
+      filesUploaded: changed.length,
+      replicationComplete: true,
+      purged: true,
+    });
+    expectHolds(w, '20261117');
+    expect(tilePuts(w)).toHaveLength(changed.length);
+    expect(w.tiles.identicalReputs).toEqual([]);
+    expect(w.purges).toBe(1);
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', pending: [] });
+    // Only now is the live build skipped.
+    expect((await runSync(w.options('20261117'), w.deps())).status).toBe('skipped');
+  });
+
+  it('gates changed static files before the purge', async () => {
+    const w = await world();
+    await adopted(w);
+    const report = await runSync(w.options('20261118', { publicUrl: 'https://tiles-next.example' }), w.deps());
+    expect(report).toMatchObject({ status: 'success', staticUploaded: 3 });
+    const put = w.events.indexOf('tiles PUT v1.json');
+    const purge = w.events.indexOf('purge');
+    expect(put).toBeGreaterThan(
+      lastIndex(w.events, (event) => event.startsWith('tiles PUT ') && event.endsWith('.mvt')),
+    );
+    expect(w.events.indexOf('tiles DESCRIBE v1.json', put + 1)).toBeGreaterThan(put);
+    expect(w.events.indexOf('tiles DESCRIBE v1.json', put + 1)).toBeLessThan(purge);
+  });
+
+  it('fails before the purge when changed static files do not replicate', async () => {
+    const w = await world({ replicationDelayMs: { UK: 5, NY: 10 } });
+    await adopted(w);
+    // A first run leaves the changed tiles stored, and they replicate after it timed out.
+    expect((await runSync(w.options('20261118', { replicationTimeoutMs: 200 }), w.deps())).status).toBe('failed');
+    w.tiles.replicate();
+    w.events.length = 0;
+
+    const report = await runSync(
+      w.options('20261118', { publicUrl: 'https://tiles-next.example', replicationTimeoutMs: 300 }),
+      w.deps(),
+    );
+    expect(report).toMatchObject({ status: 'failed', filesUploaded: 0, staticUploaded: 3, replicationComplete: false });
+    expect(report.error).toMatch(/Replication of the TileJSON and styles incomplete.*e\.g\. v1\.json \(not in SYD\)/);
+    expect(w.purges).toBe(0);
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', pending: [{ build: '20261118' }] });
+  });
+
+  it('switches to a build seeded under another prefix with --adopt --replace, and syncs there after', async () => {
+    const w = await world();
+    await adopted(w);
+    seedZone(w, '20261118', 'v1/e2');
+    const seeded = await seedState({
+      dir: w.dir,
+      zone: w.tiles.zone,
+      archive: w.archives['20261118'].path,
+      prefix: 'v1/e2',
+    });
+    w.tiles.putsByPath.clear();
+    const report = await runSync(
+      w.options('20261118', { adopt: true, replace: true, prefix: 'v1/e2', seedStates: [seeded] }),
+      w.deps(),
+    );
+    expect(report.error).toBeNull();
+    expect(report).toMatchObject({ status: 'success', mode: 'replace', prefix: 'v1/e2', previousBuild: '20261117' });
+    expect(tilePuts(w)).toEqual([]);
+    expect(w.purges).toBe(1);
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261118', prefix: 'v1/e2', pending: [] });
+    // The TileJSON and styles stay where Immich loads them; only the tile template moves.
+    const tileJson = JSON.parse(new TextDecoder().decode(w.tiles.files.get('v1.json')!.bytes)) as { tiles: string[] };
+    expect(tileJson.tiles).toEqual(['https://tiles.example/v1/e2/{z}/{x}/{y}.mvt']);
+    expect(w.tiles.files.has('v1/e2.json')).toBe(false);
+    const put = w.events.indexOf('tiles PUT v1.json');
+    expect(w.events.indexOf('tiles DESCRIBE v1.json', put + 1)).toBeLessThan(w.events.indexOf('purge'));
+
+    // A daily sync follows the live prefix without being told.
+    const back = await runSync(w.options('20261117'), w.deps());
+    expect(back).toMatchObject({ status: 'success', prefix: 'v1/e2' });
+    expectHolds(w, '20261117', 'v1/e2');
+  });
+
+  it('refuses --replace onto an overlapping prefix, or before the new prefix has replicated', async () => {
+    const w = await world();
+    await adopted(w);
+    const archive = w.archives['20261118'].path;
+    for (const prefix of ['v1', 'v1/3']) {
+      const seeded = await seedState({ dir: w.dir, zone: w.tiles.zone, archive, prefix });
+      const report = await runSync(
+        w.options('20261118', { adopt: true, replace: true, prefix, seedStates: [seeded] }),
+        w.deps(),
+      );
+      expect(report.error).toMatch(/a prefix apart from the live v1\//);
+    }
+    seedZone(w, '20261118', 'v2', POSITIONS, ['UK', 'NY']);
+    const seeded = await seedState({ dir: w.dir, zone: w.tiles.zone, archive, prefix: 'v2' });
+    const report = await runSync(
+      w.options('20261118', { adopt: true, replace: true, prefix: 'v2', seedStates: [seeded] }),
+      w.deps(),
+    );
+    expect(report.status).toBe('failed');
+    expect(report.error).toMatch(/200 of 200 sampled positions under v2\/ are not in every region yet \(SYD 200\)/);
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', prefix: 'v1' });
+    expect(w.purges).toBe(0);
+  });
+
+  it('deletes manifests no state names once the build is live', async () => {
+    const w = await world();
+    await adopted(w);
+    const report = await runSync(w.options('20261118', { keepManifests: 0 }), w.deps());
+    expect(report).toMatchObject({ status: 'success', manifestsDeleted: 1 });
+    expect(w.stateZone.files.has('manifests/20261117.tman.zst')).toBe(false);
+    expect(w.stateZone.files.has('manifests/20261118.tman.zst')).toBe(true);
   });
 
   it('does not rewrite static files whose bytes did not change', async () => {
