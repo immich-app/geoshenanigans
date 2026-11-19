@@ -222,7 +222,7 @@ describe('Checkpoint', () => {
     from: 0,
     to: 100,
     chunkSize: 10,
-    archive: { size: 1, fingerprint: 'f' },
+    archive: { size: 1, identity: `sha256-tree-v2:${'f'.repeat(64)}` },
   };
   let dir: string;
   beforeEach(async () => {
@@ -373,10 +373,28 @@ describe('Checkpoint', () => {
     await checkpoint.close();
   });
 
+  it('refuses to resume a checkpoint that records only a v1 archive fingerprint', async () => {
+    // As a bunny:seed before the v2 identity wrote it: the fingerprint covers the header, root directory and size only.
+    const { archive, ...rest } = params;
+    void archive;
+    await writeFile(
+      join(dir, 'seed.json'),
+      JSON.stringify({ ...rest, archive: { size: 1, fingerprint: 'ab'.repeat(32) } }, null, 2),
+    );
+    await writeFile(join(dir, 'checkpoint.log'), 'start 0\ndone 0\n');
+    await expect(Checkpoint.open(dir, params)).rejects.toThrow(/older bunny:seed, which recorded only a v1 archive/);
+    expect(JSON.parse(await readFile(join(dir, 'seed.json'), 'utf8'))).toMatchObject({
+      archive: { fingerprint: 'ab'.repeat(32) },
+    });
+  });
+
   it('refuses a state dir of another seed or a damaged log', async () => {
     await (await Checkpoint.open(dir, params)).close();
     await expect(Checkpoint.open(dir, { ...params, to: 200 })).rejects.toThrow(/to differ/);
-    await expect(Checkpoint.open(dir, { ...params, archive: { size: 1, fingerprint: 'g' } })).rejects.toThrow(
+    await expect(
+      Checkpoint.open(dir, { ...params, archive: { size: 1, identity: `sha256-tree-v2:${'e'.repeat(64)}` } }),
+    ).rejects.toThrow(/archive differ/);
+    await expect(Checkpoint.open(dir, { ...params, archive: { ...params.archive, size: 2 } })).rejects.toThrow(
       /archive differ/,
     );
     await writeFile(join(dir, 'checkpoint.log'), 'start 1\nbogus\n');

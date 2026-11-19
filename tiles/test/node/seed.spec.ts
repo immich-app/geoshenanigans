@@ -3,13 +3,14 @@ import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { mkdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { archiveIdentity } from '../../src/bunny/archive-identity';
 import { ArchiveRanges } from '../../src/bunny/archive-walk';
 import { BunnyStateStore, writeState } from '../../src/bunny/state';
 import { tilePath } from '../../src/bunny/tile-id';
 import { Checkpoint, runSeed, SeedOptions, SeedStatus } from '../../src/bunny/upload';
 import { FakeStorage, FakeStorageOptions, Fault } from './fake-storage';
 import { startStateServer } from './state-server';
-import { FixtureArchive, random, scratchDir, writeFixtureArchive } from './upload-fixture';
+import { FixtureArchive, random, scratchDir, withOtherTileBytes, writeFixtureArchive } from './upload-fixture';
 
 const TILES_DIR = join(import.meta.dirname, '../..');
 const fast = { baseDelayMs: 1, maxDelayMs: 5, settleMs: 5, maxAttempts: 5, maxRateLimitWaitMs: 5_000 };
@@ -821,8 +822,11 @@ describe('bunny:seed CLI', () => {
     cleanup.push(() => server.close());
     const store = new BunnyStateStore({ zone: 'state-zone', password: 'state-password', host: server.host });
     cleanup.push(() => store.close());
-    const ranges = await ArchiveRanges.open(fixture.path);
-    await ranges.close();
+    const identity = await archiveIdentity(fixture.path);
+    // The live build's archive with one tile byte changed: same header, root directory and size.
+    const other = join(dir, 'other.pmtiles');
+    await withOtherTileBytes(fixture.path, other);
+    const otherIdentity = await archiveIdentity(other);
     const live = {
       liveBuild: '20261118',
       manifest: 'manifests/20261118.tman.zst',
@@ -830,7 +834,7 @@ describe('bunny:seed CLI', () => {
       updatedAt: '2026-11-18T10:40:00.000Z',
       osmDate: null,
       positions: 85,
-      archive: { size: ranges.size, fingerprint: 'ab'.repeat(32) },
+      archive: otherIdentity,
       pending: [],
     };
     await writeState(store, live);
@@ -846,6 +850,15 @@ describe('bunny:seed CLI', () => {
     expect(refused.code).toBe(1);
     expect(refused.stderr).toMatch(/20261118 is live under itest\/ and this archive is not the one it came from/);
     expect(fake.requests.PUT ?? 0).toBe(0);
+    // A v1 fingerprint in state.json (header, root directory and size) vouches for no archive, even a matching one.
+    const ranges = await ArchiveRanges.open(fixture.path);
+    await ranges.close();
+    const legacyState = { ...live, archive: { size: ranges.size, fingerprint: ranges.legacyFingerprint } };
+    server.objects.set('state.json', Buffer.from(JSON.stringify(legacyState)));
+    const legacy = await startSeed(fake, args('itest'), env).done;
+    expect(legacy.code).toBe(1);
+    expect(legacy.stderr).toMatch(/records no v2 identity of its archive/);
+    expect(fake.requests.PUT ?? 0).toBe(0);
     const missing = await startSeed(fake, args('itest'), { ...env, BUNNY_STATE_PASSWORD: '' }).done;
     expect(missing.code).toBe(2);
     expect(missing.stderr).toMatch(/--no-state-check/);
@@ -853,7 +866,7 @@ describe('bunny:seed CLI', () => {
     // Another prefix (a full rewrite) is fine, and so is the live build's own archive (a repair).
     const rewrite = await startSeed(fake, args('itest/e2'), env).done;
     expect(rewrite.code, rewrite.stderr).toBe(0);
-    await writeState(store, { ...live, archive: { size: ranges.size, fingerprint: ranges.fingerprint } });
+    await writeState(store, { ...live, archive: identity });
     const repair = await startSeed(fake, args('itest'), env).done;
     expect(repair.code, repair.stderr).toBe(0);
     for (const prefix of ['itest', 'itest/e2']) {

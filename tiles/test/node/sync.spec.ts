@@ -1,8 +1,10 @@
 import { ChildProcess, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { createServer, Server } from 'node:http';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
+import { archiveIdentity } from '../../src/bunny/archive-identity';
 import { ArchiveRanges } from '../../src/bunny/archive-walk';
 import { clipManifest, readManifest, writeManifest } from '../../src/bunny/manifest';
 import { BunnyStateStore, readState, SyncState } from '../../src/bunny/state';
@@ -11,7 +13,7 @@ import { planItems, runSync, SyncOptions, SyncReport } from '../../src/bunny/syn
 import { tilePath, zoomEnd } from '../../src/bunny/tile-id';
 import { FakeStorage, FakeStorageOptions, sha256Hex } from './fake-storage';
 import { Build, contentBytes, mutateBuild, randomBuild, rng, writeArchiveFile } from './manifest-fixtures';
-import { scratchDir } from './upload-fixture';
+import { scratchDir, withOtherTileBytes } from './upload-fixture';
 
 const TILES_DIR = join(import.meta.dirname, '../..');
 const REGIONS = ['UK', 'NY', 'SYD'];
@@ -163,7 +165,10 @@ async function world(tileOptions: FakeStorageOptions = {}): Promise<World> {
 
 let seedStateDirs = 0;
 
-/** The state dir a seed leaves (seed.json and status.json), over [from, to) of an archive. */
+/**
+ * The state dir a seed leaves (seed.json and status.json), over [from, to) of an archive. `legacy`: as a bunny:seed
+ * before the v2 identity left it, with only the v1 fingerprint (header, root directory and size).
+ */
 async function seedState(options: {
   dir: string;
   zone: string;
@@ -172,6 +177,7 @@ async function seedState(options: {
   from?: number;
   to?: number;
   state?: string;
+  legacy?: boolean;
 }): Promise<string> {
   const ranges = await ArchiveRanges.open(options.archive);
   await ranges.close();
@@ -184,7 +190,9 @@ async function seedState(options: {
     prefix: options.prefix ?? 'v1',
     ...range,
     chunkSize: 64,
-    archive: { size: ranges.size, fingerprint: ranges.fingerprint },
+    archive: options.legacy
+      ? { size: ranges.size, fingerprint: ranges.legacyFingerprint }
+      : await archiveIdentity(options.archive),
   };
   await writeFile(join(dir, 'seed.json'), JSON.stringify(params));
   await writeFile(join(dir, 'status.json'), JSON.stringify({ state: options.state ?? 'complete', range, error: null }));
@@ -303,6 +311,56 @@ describe('runSync', () => {
     expect(report).toMatchObject({ status: 'success', error: null });
   });
 
+  it('refuses the seed of an archive sharing the header, root directory and size but not the tile bytes', async () => {
+    const w = await world();
+    seedZone(w, '20261117');
+    const other = join(w.dir, 'other.pmtiles');
+    await withOtherTileBytes(w.archives['20261117'].path, other);
+    const seeded = await seedState({ dir: w.dir, zone: w.tiles.zone, archive: other });
+    const report = await runSync(w.options('20261117', { adopt: true, seedStates: [seeded] }), w.deps());
+    expect(report.status).toBe('failed');
+    expect(report.error).toMatch(/it seeded another archive than/);
+    expect(await readState(w.state)).toBeNull();
+    expect(w.purges).toBe(0);
+  });
+
+  it("adopts a seed state with only a v1 fingerprint only given the archive's MD5", async () => {
+    const w = await world();
+    seedZone(w, '20261117');
+    const archive = w.archives['20261117'].path;
+    const md5 = createHash('md5')
+      .update(await readFile(archive))
+      .digest('base64');
+    const legacy = await seedState({ dir: w.dir, zone: w.tiles.zone, archive, legacy: true });
+    const adopt = (extra: Partial<SyncOptions>) =>
+      runSync(w.options('20261117', { adopt: true, seedStates: [legacy], ...extra }), w.deps());
+
+    const without = await adopt({});
+    expect(without.status).toBe('failed');
+    expect(without.error).toMatch(/only a v1 archive fingerprint .*--archive-md5/);
+    const wrong = await adopt({ archiveMd5: createHash('md5').update('another build').digest('base64') });
+    expect(wrong.status).toBe('failed');
+    expect(wrong.error).toMatch(/has MD5 .*, not the .* given with --archive-md5/);
+    // The archive's MD5 is no use for the seed of another build: its fingerprint must match this archive's.
+    const otherBuild = await seedState({
+      dir: w.dir,
+      zone: w.tiles.zone,
+      archive: w.archives['20261118'].path,
+      legacy: true,
+    });
+    const another = await adopt({ archiveMd5: md5, seedStates: [otherBuild] });
+    expect(another.status).toBe('failed');
+    expect(another.error).toMatch(/it seeded another archive than/);
+    expect(await readState(w.state)).toBeNull();
+    expect(w.purges).toBe(0);
+
+    const report = await adopt({ archiveMd5: md5 });
+    expect(report.error).toBeNull();
+    expect(report).toMatchObject({ status: 'success', mode: 'adopt' });
+    expect((await readState(w.state))?.archive).toEqual(await archiveIdentity(archive));
+    expect(w.purges).toBe(1);
+  });
+
   it('refuses to adopt a build the zone does not hold', async () => {
     const w = await world();
     seedZone(w, '20261118');
@@ -345,8 +403,10 @@ describe('runSync', () => {
       expect(report, field).toHaveProperty(field);
     }
     expect(Object.keys(report.stepSeconds).sort()).toEqual(
-      ['diff', 'manifest', 'purge', 'replication', 'state', 'static', 'upload'].sort(),
+      ['diff', 'identity', 'manifest', 'purge', 'replication', 'state', 'static', 'upload'].sort(),
     );
+    // The live archive is recorded by its v2 identity, a hash of the whole file.
+    expect((await readState(w.state))?.archive).toEqual(await archiveIdentity(w.archives['20261118'].path));
     expect(Object.keys(report.replicationWaitSeconds!).sort()).toEqual([...REGIONS].sort());
     expect(Object.values(report.replicationWaitSeconds!).every((value) => typeof value === 'number')).toBe(true);
 
@@ -663,6 +723,36 @@ describe('runSync', () => {
     expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', pending: [{ build: '20261118' }] });
   });
 
+  it('gates every static file on a retry, also those an earlier attempt wrote', async () => {
+    const w = await world({ replicationDelayMs: { UK: 5, NY: 10 } });
+    await adopted(w);
+    w.tiles.replicate();
+    // A first run stores the changed tiles, which replicate after it timed out.
+    expect((await runSync(w.options('20261118', { replicationTimeoutMs: 200 }), w.deps())).status).toBe('failed');
+    w.tiles.replicate();
+    const next = { publicUrl: 'https://tiles-next.example', replicationTimeoutMs: 300 };
+    // The second writes the new TileJSON and styles, which never reach SYD before its gate gives up.
+    const second = await runSync(w.options('20261118', next), w.deps());
+    expect(second).toMatchObject({ status: 'failed', staticUploaded: 3, replicationComplete: false });
+    expect(w.tiles.checksum('v1.json')).toBeDefined();
+    w.events.length = 0;
+
+    // The retry finds their bytes stored and writes nothing, but SYD still lacks them: no purge.
+    const retry = await runSync(w.options('20261118', next), w.deps());
+    expect(retry).toMatchObject({ status: 'failed', filesUploaded: 0, staticUploaded: 0, replicationComplete: false });
+    expect(retry.error).toMatch(/Replication of the TileJSON and styles incomplete.*e\.g\. v1\.json \(not in SYD\)/);
+    expect(w.events.filter((event) => event.startsWith('tiles PUT'))).toEqual([]);
+    expect(w.events).toContain('tiles DESCRIBE v1.json');
+    expect(w.purges).toBe(0);
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', pending: [{ build: '20261118' }] });
+
+    w.tiles.replicate();
+    const done = await runSync(w.options('20261118', next), w.deps());
+    expect(done).toMatchObject({ status: 'success', staticUploaded: 0, replicationComplete: true });
+    expect(w.purges).toBe(1);
+    expect(w.tiles.identicalReputs).toEqual([]);
+  });
+
   it('switches to a build seeded under another prefix with --adopt --replace, and syncs there after', async () => {
     const w = await world();
     await adopted(w);
@@ -891,6 +981,57 @@ describe('bunny:sync CLI', () => {
     expect(api.calls).toEqual(['POST /pullzone/123/purgeCache test-key']);
     expect(w.tiles.identicalReputs).toEqual([]);
     expect(await readState(w.state)).toMatchObject({ liveBuild: '20261118' });
+  });
+
+  it('adopts a seed state with only a v1 fingerprint with --archive-md5, checked over the whole archive', async () => {
+    const w = await world();
+    seedZone(w, '20261117');
+    const styles = join(w.dir, 'styles');
+    await mkdir(styles);
+    await writeFile(join(styles, 'light.json'), STYLE.body);
+    const api = await purgeApi();
+    const archive = w.archives['20261117'].path;
+    const legacy = await seedState({ dir: w.dir, zone: w.tiles.zone, archive, legacy: true });
+    const md5 = createHash('md5')
+      .update(await readFile(archive))
+      .digest('base64');
+    const args = (extra: string[]) => [
+      '--archive',
+      archive,
+      '--build',
+      '20261117',
+      '--adopt',
+      '--seed-state',
+      legacy,
+      '--styles-dir',
+      styles,
+      '--work-dir',
+      join(w.dir, 'work'),
+      '--threads',
+      '2',
+      '--regions',
+      REGIONS.join(','),
+      '--adopt-samples',
+      '50',
+      ...extra,
+    ];
+    const env = { BUNNY_API_URL: api.url };
+
+    const malformed = await startSync(w, args(['--archive-md5', md5.toLowerCase()]), env).done;
+    expect(malformed.code).toBe(1);
+    expect(malformed.stderr).toMatch(/--archive-md5 must be a base64 MD5/);
+    const without = await startSync(w, args([]), env).done;
+    expect(without.code).toBe(1);
+    expect(without.stderr).toMatch(/only a v1 archive fingerprint/);
+    const wrong = await startSync(w, args(['--archive-md5', 'hKPqtB5lzZzHKO5NlYsxDg==']), env).done;
+    expect(wrong.code).toBe(1);
+    expect(wrong.stderr).toMatch(/not the hKPqtB5lzZzHKO5NlYsxDg== given with --archive-md5/);
+    expect(api.calls).toEqual([]);
+
+    const adopted = await startSync(w, args(['--archive-md5', md5]), env).done;
+    expect(adopted.code, adopted.stderr).toBe(0);
+    expect(api.calls).toHaveLength(1);
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', archive: await archiveIdentity(archive) });
   });
 
   it('dry-runs with only the state zone credentials, as the workflow passes them', async () => {

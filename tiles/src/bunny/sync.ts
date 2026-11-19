@@ -10,17 +10,21 @@
  *    the live one are planned too, even where the new build matches the live one, to put the live bytes back;
  * 5. wait until every replica region holds every changed file (the replication gate); a timeout fails the run and
  *    leaves the build pending, so the next run checks those files again instead of writing them;
- * 6. upload the TileJSON and styles whose bytes changed, purge the pull zone once, and make the build live in
- *    state.json (its manifest is stored first).
+ * 6. upload the TileJSON and styles whose bytes changed, wait until every replica region holds all of them (not just
+ *    the ones this run wrote: an earlier attempt may have written them and failed before its gate passed), purge the
+ *    pull zone once, and make the build live in state.json (its manifest is stored first, and the archive's identity
+ *    is recorded: archive-identity.ts).
  *
  * A run for the live build itself while state.json lists pending builds puts the live bytes back where they wrote
  * (step 4 without new bytes): that reverts a failed or cancelled sync.
  *
  * Other modes: --adopt records a build a seed (bunny:seed) already uploaded, given the seed's state dirs (which must
  * say it completed, for this archive, zone and prefix, over every position) and a sample of positions, instead of
- * writing tiles; with --replace it switches a live zone to a build seeded under another tile prefix (a full rewrite,
- * plan section 6), the sample then also checked in every region. --force-full writes every position of the build,
- * each DESCRIBEd first, so it suits a repair or a small zoom range (a planet first load is a seed and then --adopt).
+ * writing tiles (a state dir an older bunny:seed left, with only a v1 archive fingerprint, counts only with the
+ * archive's MD5, checked over the whole file: see archiveProblem); with --replace it switches a live zone to a build
+ * seeded under another tile prefix (a full rewrite, plan section 6), the sample then also checked in every region.
+ * --force-full writes every position of the build, each DESCRIBEd first, so it suits a repair or a small zoom range
+ * (a planet first load is a seed and then --adopt).
  *
  * The TileJSON and styles stay at the static prefix (`v1.json`, `v1/style/*`) whatever the tile prefix, so a switch
  * to another tile prefix only changes the TileJSON's tile template. After a run makes a build live, manifests in the
@@ -30,6 +34,7 @@
  */
 import { readFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import { ArchiveIdentity, archiveIdentity, fileMd5Base64 } from './archive-identity';
 import { ArchiveRanges, TileRun } from './archive-walk';
 import { diffManifests, DiffTotals, planSync, SyncRange } from './diff';
 import { buildManifest, clipManifest, manifestBatches, ManifestHeader, readManifestHeader } from './manifest';
@@ -60,7 +65,8 @@ import { newUploadStats, SeedParams, SeedStatus, UploadItem, UploadStats, upload
 
 export type SyncStatus = 'success' | 'skipped' | 'guard_rail' | 'failed';
 export type SyncMode = 'diff' | 'force-full' | 'adopt' | 'replace';
-export type SyncStep = 'manifest' | 'diff' | 'check' | 'upload' | 'replication' | 'static' | 'purge' | 'state';
+export type SyncStep =
+  'manifest' | 'diff' | 'identity' | 'check' | 'upload' | 'replication' | 'static' | 'purge' | 'state';
 
 /** The run's outcome; the fields up to `error` are the workflow's contract, every one present (null when unknown). */
 export interface SyncReport {
@@ -137,6 +143,11 @@ export interface SyncOptions {
   replace?: boolean;
   /** With adopt: the state dirs of the seed (bunny:seed --state-dir) that uploaded the build, one per range. */
   seedStates?: string[];
+  /**
+   * With adopt: the archive's MD5 (base64, as builds.json gives it), checked over the whole file. Needed for a seed
+   * state dir an older bunny:seed left, which records only a v1 fingerprint (header, root directory and size).
+   */
+  archiveMd5?: string;
   /** Random positions --adopt checks (default 10,000). */
   adoptSamples?: number;
   /** Manifests kept in the state zone besides those state.json names, newest first (default 7). */
@@ -387,6 +398,9 @@ class SyncRun {
   private o: SyncOptions & typeof SYNC_DEFAULTS;
   private log: (line: string) => void;
   private archive?: ArchiveRanges;
+  /** The archive's v2 identity, and whether its whole-file MD5 matched archiveMd5. */
+  private identity?: ArchiveIdentity;
+  private md5Verified = false;
   private files: string[] = [];
   /** How long the tile gate waited, taken from the static files' share of the replication timeout. */
   private gateWaitedMs = 0;
@@ -440,6 +454,9 @@ class SyncRun {
     }
     if (o.replace && !o.adopt) {
       throw new Error('--replace goes with --adopt');
+    }
+    if (o.archiveMd5 !== undefined && !o.adopt) {
+      throw new Error('--archive-md5 goes with --adopt');
     }
     const adopting = mode === 'adopt' || mode === 'replace';
     const staticPrefix = normalisePrefix(o.staticPrefix);
@@ -537,6 +554,8 @@ class SyncRun {
     }
     const tiles = this.deps.tiles!;
     this.archive = await ArchiveRanges.open(o.archive);
+    // Before anything is written: the state records it, and --adopt compares it with the seed's.
+    await this.step('identity', () => this.identify());
 
     if (adopting) {
       await this.step('check', async () => {
@@ -556,10 +575,11 @@ class SyncRun {
       await this.step('replication', () => this.gate(tiles, written));
     }
 
-    const changedStatic = await this.step('static', () => this.uploadStatic(tiles, staticPrefix));
-    if (mode !== 'adopt' && changedStatic.length > 0) {
-      // The purge makes PoPs fetch them again, from the nearest replica: it must hold them first.
-      await this.step('replication', () => this.gateStatic(tiles, changedStatic));
+    const allStatic = await this.step('static', () => this.uploadStatic(tiles, staticPrefix));
+    if (mode !== 'adopt') {
+      // The purge makes PoPs fetch them again, from the nearest replica: it must hold them first. All of them, not
+      // only those this run wrote: a retry finds the bytes an attempt whose gate failed stored, and writes nothing.
+      await this.step('replication', () => this.gateStatic(tiles, allStatic));
     }
     await this.step('purge', async () => {
       await this.deps.purge!();
@@ -571,7 +591,7 @@ class SyncRun {
         manifestFile: manifest,
         prefix,
         osmDate: report.osmDate,
-        archive: { size: this.archive!.size, fingerprint: this.archive!.fingerprint },
+        archive: this.identity!,
         statePrefix: o.statePrefix,
       }),
     );
@@ -838,7 +858,7 @@ class SyncRun {
     }
   }
 
-  /** The changed TileJSON and styles, within what the tile gate left of the replication timeout (10 min at least). */
+  /** The TileJSON and styles, within what the tile gate left of the replication timeout (10 min at least). */
   private async gateStatic(tiles: BunnyStorage, files: StaticFile[]) {
     const { o } = this;
     const timeoutMs = Math.max(
@@ -871,7 +891,7 @@ class SyncRun {
         status.state !== 'complete' && `its last run ended ${status.state}${status.error ? ` (${status.error})` : ''}`,
         params.zone !== zone && `it seeded zone ${params.zone}, not ${zone}`,
         params.prefix !== prefix && `it seeded ${params.prefix}/, not ${prefix}/`,
-        params.archive?.fingerprint !== this.archive!.fingerprint && `it seeded another archive than ${o.archive}`,
+        this.archiveProblem(params),
         (status.range?.from !== params.from || status.range?.to !== params.to) && 'its status.json is of another range',
       ].filter(Boolean);
       if (problems.length > 0) {
@@ -893,6 +913,55 @@ class SyncRun {
       );
     }
     this.log(`adopt: ${ranges.length} seed state dir(s) say every position of [0, ${positions}) completed`);
+  }
+
+  /** Hashes the archive (and, given archiveMd5, checks its MD5 at the same time). */
+  private async identify() {
+    const { o } = this;
+    // The MD5 pass reads the whole file on its own: stop it if the identity fails.
+    const controller = new AbortController();
+    const [identity, md5] = await Promise.all([
+      archiveIdentity(o.archive, { threads: o.threads }),
+      o.archiveMd5 === undefined ? undefined : fileMd5Base64(o.archive, controller.signal),
+    ]).catch((error: unknown) => {
+      controller.abort();
+      throw error;
+    });
+    if (identity.size !== this.archive!.size) {
+      throw new Error(`${o.archive} changed while it was read`);
+    }
+    if (md5 !== undefined && md5 !== o.archiveMd5) {
+      throw new Error(`${o.archive} has MD5 ${md5}, not the ${o.archiveMd5} given with --archive-md5`);
+    }
+    this.identity = identity;
+    this.md5Verified = md5 !== undefined;
+    this.log(`archive: ${identity.identity}${this.md5Verified ? ', MD5 as given' : ''}`);
+  }
+
+  /**
+   * Why a seed state's archive is not this one, or false. A v2 identity must match. A v1 fingerprint (an older
+   * bunny:seed's, of the header, root directory and size only) must match this archive's, and counts only once the
+   * whole file's MD5 matched the one given with archiveMd5 (from builds.json): the fingerprint alone can't tell
+   * archives with other tile bytes apart.
+   */
+  private archiveProblem(params: SeedParams): string | false {
+    const { o } = this;
+    const recorded = params.archive as Partial<ArchiveIdentity> & { fingerprint?: unknown };
+    const other = `it seeded another archive than ${o.archive}`;
+    if (typeof recorded?.identity === 'string') {
+      return (recorded.identity !== this.identity!.identity || recorded.size !== this.identity!.size) && other;
+    }
+    if (typeof recorded?.fingerprint !== 'string') {
+      return 'its seed.json records no archive identity';
+    }
+    if (recorded.fingerprint !== this.archive!.legacyFingerprint || recorded.size !== this.archive!.size) {
+      return other;
+    }
+    return (
+      !this.md5Verified &&
+      'it records only a v1 archive fingerprint (header, root directory and size), which other tile bytes can share: ' +
+        "adopt it with --archive-md5 <the build's md5sum from builds.json>, checked over the whole archive"
+    );
   }
 
   /**
@@ -950,7 +1019,7 @@ class SyncRun {
 
   /**
    * The TileJSON and styles; only those whose bytes changed are written (identical re-PUTs break replication).
-   * Returns the ones written.
+   * Returns all of them, for the gate; the report counts the ones written.
    */
   private async uploadStatic(tiles: BunnyStorage, staticPrefix: string): Promise<StaticFile[]> {
     const { o, report } = this;
@@ -972,6 +1041,6 @@ class SyncRun {
     }
     report.staticUploaded = uploaded.length;
     this.log(`static: ${uploaded.length} of ${files.length} files changed and uploaded`);
-    return uploaded;
+    return files;
   }
 }

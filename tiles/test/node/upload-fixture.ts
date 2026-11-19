@@ -1,7 +1,8 @@
 import { createHash } from 'node:crypto';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdtemp, open, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { ArchiveRanges } from '../../src/bunny/archive-walk';
 import { buildArchive, FixtureEntry, LeafPointer } from '../pmtiles-fixture';
 
 export interface FixtureArchive {
@@ -107,4 +108,24 @@ export async function writeFixtureArchive(dir: string, positions: number, seed =
 export async function scratchDir(): Promise<{ dir: string; remove: () => Promise<void> }> {
   const dir = await mkdtemp(join(tmpdir(), 'bunny-test-'));
   return { dir, remove: () => rm(dir, { recursive: true, force: true }) };
+}
+
+/**
+ * Copies the archive at `path` to `copy` with one byte of tile data changed: the header, root directory and size stay
+ * the same (and with them the v1 fingerprint), the tile bytes don't.
+ */
+export async function withOtherTileBytes(path: string, copy: string): Promise<void> {
+  const ranges = await ArchiveRanges.open(path);
+  const at = ranges.tileDataOffset + 3;
+  await ranges.close();
+  await copyFile(path, copy);
+  const file = await open(copy, 'r+');
+  try {
+    const byte = Buffer.alloc(1);
+    await file.read(byte, 0, 1, at);
+    byte[0] ^= 0xff;
+    await file.write(byte, 0, 1, at);
+  } finally {
+    await file.close();
+  }
 }
