@@ -35,6 +35,8 @@ REPORT = {
 LIVE_STATUS = {"liveBuild": "20261117", "updatedAt": "2026-11-17T11:02:00Z", "osmDate": "2026-11-17T04:00:00Z",
                "buildAgeHours": 30.1, "osmAgeHours": 40.2}
 NO_STATE = {"liveBuild": None, "updatedAt": None, "osmDate": None, "buildAgeHours": None, "osmAgeHours": None}
+# decide's live_revision for LIVE_STATUS.
+LIVE_REVISION = "20261117 published 2026-11-17T11:02:00Z"
 MD5_A = "1B2M2Y8AsgTpgAmY7PhCfg=="
 
 
@@ -454,7 +456,7 @@ class DecideTest(unittest.TestCase):
 
         self.assertEqual(outputs, {
             "action": "sync", "status": "", "message": "", "key": "20261118", "md5": MD5_A, "version": "4.15.2",
-            "live": "20261117", "live_version": "4.15.2", "max_changed_fraction": 0.005,
+            "live": "20261117", "live_version": "4.15.2", "live_revision": LIVE_REVISION, "max_changed_fraction": 0.005,
             "replication_timeout_min": 120, "sync_timeout_min": 270, "job_timeout_min": 360, "concurrency": 1200})
         self.assertEqual(notes, [])
 
@@ -479,7 +481,8 @@ class DecideTest(unittest.TestCase):
     def test_before_the_first_load_it_skips_without_failing(self):
         outputs, notes = self.decide(status=NO_STATE, status_exit=1)
 
-        self.assertEqual((outputs["action"], outputs["status"], outputs["live"]), ("skip", "no_state", ""))
+        self.assertEqual((outputs["action"], outputs["status"], outputs["live"], outputs["live_revision"]),
+                         ("skip", "no_state", "", ""))
         self.assertIn("no state.json", outputs["message"])
         self.assertEqual(notes[0][0], "notice")
 
@@ -488,6 +491,20 @@ class DecideTest(unittest.TestCase):
             with self.subTest(status=status, code=code):
                 with self.assertRaisesRegex(sut.Unreadable, "could not read the live state"):
                     sut.decide(BUILDS, status, code, "HttpError: 401")
+
+    def test_the_live_revision_names_the_publication_and_the_other_pending_builds(self):
+        outputs, _ = self.decide(status={**LIVE_STATUS, "pending": ["20261119", "20261118", "20261116"]})
+        self.assertEqual(outputs["live_revision"], "20261117 published 2026-11-17T11:02:00Z, pending 20261116 20261119")
+
+        # The live build's own revert: no build is pending but those the revert puts back.
+        outputs, _ = self.decide(status={**LIVE_STATUS, "pending": ["20261118"]}, requested="20261117")
+        self.assertEqual(outputs["live_revision"], "20261117 published 2026-11-17T11:02:00Z, pending 20261118")
+
+    def test_a_live_build_without_its_publication_time_is_unreadable(self):
+        for updated in (None, "", " ", 1795435200):
+            with self.subTest(updated=updated):
+                with self.assertRaisesRegex(sut.Unreadable, "without when it was published"):
+                    self.decide(status={**LIVE_STATUS, "updatedAt": updated})
 
     def test_a_hold_stops_scheduled_runs_only(self):
         outputs, notes = self.decide(hold="rolled back 20261118, bad labels", event="schedule")
@@ -548,10 +565,55 @@ class DecideTest(unittest.TestCase):
 
 class RecheckTest(unittest.TestCase):
     def recheck(self, status=LIVE_STATUS, status_exit=0, **kwargs):
-        return sut.recheck(status, status_exit, "", **{"live": "20261117", "build": "20261118", **kwargs})
+        return sut.recheck(status, status_exit, "", **{"live": "20261117", "build": "20261118",
+                                                       "resolved_revision": LIVE_REVISION, **kwargs})
 
     def test_proceeds_while_the_live_build_is_the_one_resolved_against(self):
         self.assertEqual(self.recheck(), ({"proceed": "true", "status": "", "message": ""}, []))
+
+    def test_a_rerun_after_the_same_build_was_published_again_skips(self):
+        # 20261117 -> 20261118 failed; 20261119 went live, then a rollback made 20261117 live again. Re-running the
+        # failed job finds the key it resolved against, published since: syncing 20261118 now undoes the rollback.
+        sequence = [
+            # The failed attempt left its own build pending: re-running it is a retry, which goes on.
+            ({**LIVE_STATUS, "pending": ["20261118"]}, "true"),
+            ({**LIVE_STATUS, "liveBuild": "20261119", "updatedAt": "2026-11-19T10:40:00Z"}, "false"),
+            ({**LIVE_STATUS, "updatedAt": "2026-11-19T15:12:00Z", "pending": []}, "false"),
+        ]
+        resolved, _ = sut.decide(BUILDS, LIVE_STATUS, 0, "")
+        for status, proceed in sequence:
+            with self.subTest(status=status):
+                outputs, notes = self.recheck(status=status, resolved_revision=resolved["live_revision"])
+
+                self.assertEqual(outputs["proceed"], proceed)
+                if proceed == "false":
+                    self.assertEqual((outputs["status"], notes[0][0]), ("skipped", "warning"))
+        self.assertIn("The live state is '20261117 published 2026-11-19T15:12:00Z' now, not '20261117 published"
+                      " 2026-11-17T11:02:00Z' as when this run resolved 20261118, so it syncs nothing",
+                      outputs["message"])
+
+    def test_a_rerun_after_another_build_went_pending_skips(self):
+        outputs, _ = self.recheck(status={**LIVE_STATUS, "pending": ["20261119"]})
+
+        self.assertEqual((outputs["proceed"], outputs["status"]), ("false", "skipped"))
+        self.assertIn("pending 20261119", outputs["message"])
+
+    def test_a_revert_rerun_still_finds_the_build_it_reverts(self):
+        status = {**LIVE_STATUS, "pending": ["20261118"]}
+        resolved, _ = sut.decide(BUILDS, status, 0, "", requested="20261117", event="workflow_dispatch")
+
+        outputs, _ = self.recheck(status=status, build="20261117", resolved_revision=resolved["live_revision"])
+        self.assertEqual(outputs["proceed"], "true")
+        # Another sync of the live build put its bytes back and cleared pending: nothing left to revert.
+        outputs, _ = self.recheck(status={**LIVE_STATUS, "updatedAt": "2026-11-18T16:20:00Z", "pending": []},
+                                  build="20261117", resolved_revision=resolved["live_revision"])
+        self.assertEqual(outputs["proceed"], "false")
+
+    def test_a_decision_without_a_live_revision_never_holds(self):
+        outputs, _ = self.recheck(resolved_revision="")
+
+        self.assertEqual((outputs["proceed"], outputs["status"]), ("false", "skipped"))
+        self.assertIn("not 'unknown'", outputs["message"])
 
     def test_a_rerun_after_the_live_build_moved_skips(self):
         # Re-run failed jobs of an old run: its resolve outputs say 20261117 was live; 20261119 is now.
@@ -661,6 +723,29 @@ class BuildInfoTest(unittest.TestCase):
 
     def test_missing_keys_are_null(self):
         self.assertEqual(sut.build_info(reader(pmtiles({"version": ""}))), {"version": None, "osmDate": None})
+
+    def test_an_osm_time_that_is_not_a_real_instant_is_null(self):
+        # bunny:sync refuses an --osm-date Date.parse can't read (and the workflow's shape check passes these), so one
+        # would fail the whole sync; a build without an OSM time syncs.
+        for value in ("2026-13-18T04:00:00Z", "2026-00-18T04:00:00Z", "2026-02-30T04:00:00Z", "2026-11-31T04:00:00Z",
+                      "2025-02-29T04:00:00Z", "2026-11-18T24:00:00Z", "2026-11-18T04:60:00Z", "2026-11-18T04:00:60Z",
+                      "2026-11-18T04:00:00+24:00", "2026-11-18T04:00:00+01:60", "2026-11-18T04:00:00+0100",
+                      "2026-11-18T04:00:00+01", "2026-11-18T04:00:00", "2026-11-18T04:00Z", "2026-11-18",
+                      "2026-11-18T04:00:00z", "2026-11-18t04:00:00Z", "2026-11-18 04:00:00Z", "2026-11-18T04:00:00Z\n",
+                      "2026-11-18T04:00:00.Z", "2026-11-18T04:00:00.1234567890Z", "0000-01-01T00:00:00Z",
+                      "0001-01-01T00:00:00+01:00", "\uff12026-11-18T04:00:00Z", "", 1795003200, None, ["x"]):
+            with self.subTest(value=value):
+                info = sut.build_info(reader(pmtiles({**self.METADATA, sut.OSM_TIME_KEY: value})))
+
+                self.assertEqual(info, {"version": "4.15.2", "osmDate": None})
+
+    def test_a_valid_osm_time_is_kept_as_written(self):
+        for value in ("2026-11-18T04:00:00Z", "2024-02-29T23:59:59.123Z", "2026-11-18T04:00:00.123456789Z",
+                      "2026-11-18T09:30:00+05:30", "2026-11-18T04:00:00-23:59", "9999-12-31T23:59:59Z"):
+            with self.subTest(value=value):
+                info = sut.build_info(reader(pmtiles({**self.METADATA, sut.OSM_TIME_KEY: value})))
+
+                self.assertEqual(info["osmDate"], value)
 
     def test_rejects_what_is_not_a_readable_pmtiles_v3_archive(self):
         cases = {
@@ -897,6 +982,40 @@ class MainTest(WithTempDir):
         self.assertIn("max_changed_fraction=0.02", lines)
         self.assertIn("job_timeout_min=720", lines)
         self.assertTrue(out.getvalue().startswith("::warning::Rolling back from 20261117 to 20261116."))
+
+    def test_recheck_compares_the_live_revision_decide_wrote(self):
+        """The revision goes through $GITHUB_OUTPUT and the resolve job's outputs into recheck's --live-revision."""
+        live = self.write("live.json", json.dumps({**LIVE_STATUS, "pending": ["20261116"]}))
+        decision = self.write("decision", "")
+        with contextlib.redirect_stdout(io.StringIO()):
+            sut.main(["decide", "--builds", self.write("builds.json", json.dumps(BUILDS)), "--status", live,
+                      "--status-exit", "0", "--output", decision])
+        with open(decision) as f:
+            outputs = dict(line.split("=", 1) for line in f.read().splitlines())
+        self.assertEqual(outputs["live_revision"], "20261117 published 2026-11-17T11:02:00Z, pending 20261116")
+
+        for status, proceed in ((live, "true"),
+                                (self.write("now.json", json.dumps({**LIVE_STATUS, "updatedAt": "2026-11-19T15:12:00Z",
+                                                                    "pending": ["20261116"]})), "false")):
+            with self.subTest(status=status):
+                output = self.write("github_output", "")
+                with contextlib.redirect_stdout(io.StringIO()):
+                    sut.main(["recheck", "--status", status, "--status-exit", "0", "--live", outputs["live"],
+                              "--live-revision", outputs["live_revision"], "--build", outputs["key"],
+                              "--output", output])
+                with open(output) as f:
+                    self.assertIn(f"proceed={proceed}", f.read().splitlines())
+
+    def test_the_workflow_passes_the_resolved_live_revision_to_recheck(self):
+        import yaml  # The workflow tests' dependency (test_tiles_workflows.py).
+
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        with open(os.path.join(root, ".github", "workflows", "tiles-sync.yml")) as f:
+            jobs = yaml.safe_load(f)["jobs"]
+        self.assertEqual(jobs["resolve"]["outputs"]["live_revision"], "${{ steps.decide.outputs.live_revision }}")
+        step = next(s for s in jobs["sync"]["steps"] if s.get("id") == "recheck")
+        self.assertEqual(step["env"]["LIVE_REVISION"], "${{ needs.resolve.outputs.live_revision }}")
+        self.assertIn('--live-revision "$LIVE_REVISION"', step["run"])
 
     def test_resolve_commands_fail_on_an_unreadable_state(self):
         for command in (["decide", "--builds", self.write("builds.json", json.dumps(BUILDS))],

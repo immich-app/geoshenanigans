@@ -5,8 +5,8 @@ Usage:
   tiles_sync_report.py build-info --url URL
   tiles_sync_report.py decide --builds FILE --status FILE [--status-exit N] [--status-stderr FILE]
       [--requested KEY] [--force true|false] [--hold TEXT] [--event EVENT] [--output FILE]
-  tiles_sync_report.py recheck --status FILE [--status-exit N] [--status-stderr FILE] --live KEY --build KEY
-      [--hold TEXT] [--event EVENT] [--output FILE]
+  tiles_sync_report.py recheck --status FILE [--status-exit N] [--status-stderr FILE] --live KEY
+      --live-revision TEXT --build KEY [--hold TEXT] [--event EVENT] [--output FILE]
   tiles_sync_report.py live-state --status FILE [--status-exit N] [--status-stderr FILE]
   tiles_sync_report.py sync --build KEY [--live KEY] [--version V] [--osm-date TIME]
       [--live-version V] [--resolved-status STATUS] [--resolved-message TEXT] [--report FILE]
@@ -18,21 +18,28 @@ Usage:
 
 build-info prints the tiles schema version and the OSM replication time of a
 Protomaps build as JSON ({"version", "osmDate"}, null when the archive's
-metadata has none), read from the archive's header and metadata with two range
-requests (each answer's Content-Range must be the bytes asked for), before the
-140 GB download.
+metadata has none, and osmDate null too when it is not an RFC 3339 time of a
+real calendar date with a valid UTC offset, which bunny:sync would refuse),
+read from the archive's header and metadata with two range requests (each
+answer's Content-Range must be the bytes asked for), before the 140 GB
+download.
 
 decide is the resolve job's choice: the build (the newest in builds.json, or
 the requested one), the live build from `npm run bunny:status -- --json` (its
 output and exit code), and whether to sync, skip or stop, with the time budget
-of the sync job (the guard rail and its timeouts). It writes them as
-`key=value` lines to --output ($GITHUB_OUTPUT) and prints annotations.
+of the sync job (the guard rail and its timeouts), and the live state's
+revision. It writes them as `key=value` lines to --output ($GITHUB_OUTPUT) and
+prints annotations.
 
 recheck is the sync job's check, just before the download, that the run's
-decision still holds: the live build is still the one it resolved against (a
+decision still holds: the live state is still the one it resolved against (a
 "Re-run failed jobs" of an old run reuses its old decision), and no hold was set
-for a scheduled run since. live-state checks that bunny:status read the state
-zone (a build live, or none yet) for the watchdog, and fails when it could not.
+for a scheduled run since. The live state is its revision: the live build, when
+it was published (state.json's updatedAt) and the other builds pending, so a
+run resolved against a build that has since been replaced and published again
+(a rollback to it) is stale too, though the key is the same. live-state checks
+that bunny:status read the state zone (a build live, or none yet) for the
+watchdog, and fails when it could not.
 
 sync reports one run of the sync workflow: the report JSON `npm run bunny:sync
 -- --report` wrote (tiles/src/bunny/cli/sync.ts) when it ran, and otherwise
@@ -167,6 +174,10 @@ COMPRESSION_NONE = 1
 COMPRESSION_GZIP = 2
 MAX_METADATA_BYTES = 16 << 20
 OSM_TIME_KEY = "planetiler:osm:osmosisreplicationtime"
+# An RFC 3339 date-time with seconds and an explicit offset, as planetiler writes it (2026-11-18T04:00:00Z).
+# osm_time checks the calendar and the offset's range too, so bunny:sync (Date.parse) accepts every one it keeps.
+OSM_TIME = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.[0-9]{1,9})?"
+                      r"(?:Z|([+-])([0-9]{2}):([0-9]{2}))")
 # A 206's Content-Range (RFC 9110 14.4): first and last byte, then the
 # archive's size or * when unknown.
 CONTENT_RANGE = re.compile(r"bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)", re.IGNORECASE)
@@ -269,7 +280,7 @@ def build_info(read):
     metadata = json.loads(data)
     if not isinstance(metadata, dict):
         raise ValueError("metadata is not a JSON object")
-    return {"version": text_or_none(metadata.get("version")), "osmDate": text_or_none(metadata.get(OSM_TIME_KEY))}
+    return {"version": text_or_none(metadata.get("version")), "osmDate": osm_time(metadata.get(OSM_TIME_KEY))}
 
 
 def gunzip_metadata(data, offset, length):
@@ -296,6 +307,27 @@ def text_or_none(value):
     return value if isinstance(value, str) and value else None
 
 
+def osm_time(value):
+    """value, unchanged, when it is an RFC 3339 time (OSM_TIME) of a real calendar date and time of day with an
+    offset under 24 hours, else None: bunny:sync refuses an --osm-date Date.parse can't read, which would fail the
+    whole sync, while a build without one syncs."""
+    match = OSM_TIME.fullmatch(value) if isinstance(value, str) else None
+    if not match:
+        return None
+    year, month, day, hour, minute, second = (int(match[i]) for i in range(1, 7))
+    sign, offset_hours, offset_minutes = match[7], int(match[8] or 0), int(match[9] or 0)
+    if offset_minutes >= 60:
+        return None
+    try:
+        offset = datetime.timedelta(hours=offset_hours, minutes=offset_minutes) * (-1 if sign == "-" else 1)
+        local = datetime.datetime(year, month, day, hour, minute, second, tzinfo=datetime.timezone(offset))
+        # The instant itself must exist too: 0001-01-01T00:00:00+01:00 is before year 1 in UTC.
+        local.astimezone(datetime.timezone.utc)
+    except (ValueError, OverflowError):
+        return None
+    return value
+
+
 # ── decide, recheck, live-state ─────────────────────────────────────────────
 
 
@@ -320,6 +352,23 @@ def live_build(status, exit_code=None, stderr=""):
             return live
     detail = " ".join(stderr.split())[-500:] or "no output"
     raise Unreadable(f"bunny:status could not read the live state (exit {exit_code}): {detail}")
+
+
+def live_revision(status, live, build):
+    """What the live state must still be for a decision about `build` to hold: the live build, when it was
+    published (updatedAt: every publication sets it, a rollback to a build that was live before included) and the
+    builds pending but `build` (a run that failed after its first PUT left its own build pending, and re-running it
+    is a retry). Empty with no build live. Raises Unreadable when the status names a live build without its updatedAt.
+    """
+    if live is None:
+        return ""
+    updated = status.get("updatedAt")
+    if not isinstance(updated, str) or not updated.strip():
+        raise Unreadable(f"bunny:status printed the live build {live} without when it was published (updatedAt)")
+    others = sorted(set(pending_builds(status)) - {build})
+    revision = f"{live} published {updated}" + (f", pending {' '.join(others)}" if others else "")
+    # As github_output writes it, so that what recheck computes compares equal to what decide wrote.
+    return " ".join(revision.split())
 
 
 def held(hold, event):
@@ -359,11 +408,12 @@ def decide(builds, status, status_exit=None, status_stderr="", requested="", for
         raise Unreadable(f"builds.json has no MD5 for {key}")
     version = version_of(entry)
     live = live_build(status, status_exit, status_stderr)
+    revision = live_revision(status, live, key)
     # builds.json keeps about a week of daily builds and the first of each version.
     live_version = version_of(build_entry(builds, live)) if live else ""
     budget = FORCED if force else DAILY
     outputs = {"key": key, "md5": md5, "version": version, "live": live or "", "live_version": live_version,
-               **budget._asdict()}
+               "live_revision": revision, **budget._asdict()}
 
     def result(action, status_, level, message):
         return {**outputs, "action": action, "status": status_, "message": message}, [(level, message)]
@@ -407,15 +457,22 @@ def decide(builds, status, status_exit=None, status_stderr="", requested="", for
     return {**outputs, "action": "sync", "status": "", "message": ""}, notes
 
 
-def recheck(status, status_exit=None, status_stderr="", live="", build="", hold="", event=""):
-    """Whether the sync job goes on with the decision its resolve job made, as (outputs, [(level, message)])."""
+def recheck(status, status_exit=None, status_stderr="", live="", build="", hold="", event="", resolved_revision=""):
+    """Whether the sync job goes on with the decision its resolve job made, as (outputs, [(level, message)]).
+    resolved_revision is decide's live_revision: a decision without one (an old run's) never holds."""
     now = live_build(status, status_exit, status_stderr)
     if now is None:
         message = f"state.json is gone since this run resolved {build} against the live {live}; nothing to sync against"
         return {"proceed": "false", "status": "no_state", "message": message}, [("error", message)]
+    stale = ", so it syncs nothing: re-running an old run's jobs reuses its old decision. Dispatch Tiles Sync instead"
     if now != live:
-        message = (f"The live build is {now} now, not {live} as when this run resolved {build}, so it syncs nothing:"
-                   " re-running an old run's jobs reuses its old decision. Dispatch Tiles Sync instead")
+        message = f"The live build is {now} now, not {live} as when this run resolved {build}" + stale
+        return {"proceed": "false", "status": "skipped", "message": message}, [("warning", message)]
+    revision = live_revision(status, now, build)
+    resolved = " ".join(resolved_revision.split())
+    if revision != resolved:
+        message = (f"The live state is '{revision}' now, not '{resolved or 'unknown'}' as when this run resolved"
+                   f" {build}" + stale)
         return {"proceed": "false", "status": "skipped", "message": message}, [("warning", message)]
     reason = held(hold, event)
     if reason:
@@ -762,6 +819,8 @@ def parse_args(argv=None):
     again = commands.add_parser("recheck", help="the sync job's check that the resolve job's decision still holds")
     again.add_argument("--live", default="", help="the build live when the resolve job ran")
     again.add_argument("--build", default="", help="the build the resolve job picked")
+    again.add_argument("--live-revision", default="", help="the live state's revision when the resolve job ran"
+                       " (decide's live_revision)")
     for command in (pick, again):
         add_status_args(command)
         command.add_argument("--hold", default="", help=f"the {HOLD_VARIABLE} repository variable")
@@ -842,7 +901,8 @@ def resolve_command(opts):
             outputs, notes = decide(read_any_json(opts.builds), status, opts.status_exit, stderr, opts.requested,
                                     opts.force == "true", opts.hold, opts.event)
         elif opts.command == "recheck":
-            outputs, notes = recheck(status, opts.status_exit, stderr, opts.live, opts.build, opts.hold, opts.event)
+            outputs, notes = recheck(status, opts.status_exit, stderr, opts.live, opts.build, opts.hold, opts.event,
+                                     opts.live_revision)
         else:
             live = live_build(status, opts.status_exit, stderr)
             outputs, notes = {}, [("notice", f"live build {live}" if live else "no build is live yet (no state.json)")]
