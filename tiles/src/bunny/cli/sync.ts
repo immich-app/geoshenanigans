@@ -47,6 +47,7 @@ import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { parseMd5Base64 } from '../archive-identity';
 import { purgePullZone, purgeUrl } from '../purge';
+import { normalizeRegions } from '../replication';
 import { BunnyStateStore } from '../state';
 import { checkStaticFiles, readStyles } from '../static-files';
 import { BunnyStorage, resolveStorageAddresses, storageOptionsFromEnv } from '../storage';
@@ -189,10 +190,16 @@ async function main(): Promise<number> {
     const concurrency = number('concurrency', values.concurrency, 1) ?? SYNC_DEFAULTS.concurrency;
     const replicationConcurrency =
       number('replication-concurrency', values['replication-concurrency'], 1) ?? SYNC_DEFAULTS.replicationConcurrency;
+    const replicationTimeoutMin = number('replication-timeout-min', values['replication-timeout-min'], 0, false);
+    if (replicationTimeoutMin === 0) {
+      // The gate starts no DESCRIBE after its timeout, so 0 would fail every run that writes, after writing.
+      throw new Error(
+        '--replication-timeout-min must be more than 0: it bounds the whole gate, its first pass included',
+      );
+    }
     const numbers = {
       maxChangedFraction: number('max-changed-fraction', values['max-changed-fraction'], 0, false),
-      replicationTimeoutMs:
-        (number('replication-timeout-min', values['replication-timeout-min'], 0, false) ?? 120) * 60_000,
+      replicationTimeoutMs: (replicationTimeoutMin ?? 120) * 60_000,
       replicationIntervalMs:
         (number('replication-interval-s', values['replication-interval-s'], 1, false) ?? 30) * 1000,
       maxZoom: number('max-zoom', values['max-zoom']),
@@ -202,13 +209,9 @@ async function main(): Promise<number> {
       maxFailures: number('max-failures', values['max-failures'], 1),
     };
     const regionList = values.regions;
+    // Trimmed, upper-cased and each once, as the zone names its replicas.
     const regions =
-      regionList === 'none'
-        ? []
-        : regionList
-            ?.split(',')
-            .map((region) => region.trim())
-            .filter(Boolean);
+      regionList === undefined ? undefined : regionList === 'none' ? [] : normalizeRegions(regionList.split(','));
     if (regions?.length === 0 && regionList !== 'none') {
       throw new Error('--regions needs region codes, or "none" to check storage only');
     }

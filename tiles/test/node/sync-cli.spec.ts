@@ -171,9 +171,24 @@ describe('bunny:sync CLI', () => {
       expectRefused(w, w.sync(['--max-zoom', '0x2']), /--max-zoom must be an integer/),
       expectRefused(w, w.sync(['--max-changed-fraction', '1e-2']), /--max-changed-fraction must be a number/),
       expectRefused(w, w.sync(['--threads', ' 2']), /--threads must be an integer/),
+      // The gate starts no DESCRIBE after its timeout: 0 would fail the run after it wrote.
+      expectRefused(w, w.sync(['--replication-timeout-min', '0']), /--replication-timeout-min must be more than 0/),
+      expectRefused(w, w.sync(['--regions', ' , ']), /--regions needs region codes/),
       expectRefused(w, w.sync(['dry-run']), /Unexpected argument 'dry-run'/),
       expectRefused(w, w.sync(['--dryrun']), /Unknown option '--dryrun'/),
     ]);
+  });
+
+  it('gates each region once, as the zone names it, however --regions spells it', async () => {
+    const w = await world();
+    const { code, stderr, report } = await w.sync(['--regions', ' uk,UK , Uk', '--replication-timeout-min', '0.5']);
+    expect(code, stderr).toBe(0);
+    expect(report.replicationWaitSeconds).toEqual({ UK: expect.any(Number) });
+    const gates = stderr.split('\n').filter((line) => line.includes('replication: waiting for'));
+    expect(gates.length).toBeGreaterThan(0);
+    for (const line of gates) {
+      expect(line).toMatch(/ in UK$/);
+    }
   });
 
   it('refuses a public URL or style the TileJSON and styles cannot take before any request', async () => {

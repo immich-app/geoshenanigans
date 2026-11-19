@@ -1167,6 +1167,21 @@ describe('runSync', () => {
     expect(report.error).toMatch(/200 of 200 sampled positions under v2\/ are not in every region yet \(SYD 200\)/);
     expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', prefix: 'v1' });
     expect(w.purges).toBe(0);
+
+    // Only the regions given, each once and as the zone names it, however they are spelled.
+    const some = await runSync(
+      w.options('20261118', {
+        adopt: true,
+        replace: true,
+        prefix: 'v2',
+        seedStates: [seeded],
+        regions: [' uk', 'UK', 'ny', ''],
+      }),
+      w.deps(),
+    );
+    expect(some.error).toBeNull();
+    expect(some).toMatchObject({ status: 'success', mode: 'replace', prefix: 'v2' });
+    expect(Object.keys(some.replicationWaitSeconds ?? {}).sort()).toEqual(['NY', 'UK']);
   });
 
   it('deletes manifests no state names once the build is live', async () => {

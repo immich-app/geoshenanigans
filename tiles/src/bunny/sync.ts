@@ -49,6 +49,7 @@ import {
   forEachLimit,
   GateItems,
   gateItems,
+  normalizeRegions,
   REPLICATION_REGIONS,
   ReplicationResult,
   TileGateList,
@@ -425,6 +426,10 @@ class SyncRun {
   ) {
     const defined = Object.fromEntries(Object.entries(options).filter(([, value]) => value !== undefined));
     this.o = { ...SYNC_DEFAULTS, ...(defined as SyncOptions) };
+    // Region codes as the zone names them, each once: the adopt sample counts per region what the gate waits on.
+    if (this.o.regions) {
+      this.o.regions = normalizeRegions(this.o.regions);
+    }
     this.log = options.log ?? (() => {});
   }
 
