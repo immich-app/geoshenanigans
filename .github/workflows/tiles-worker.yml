@@ -128,6 +128,13 @@ jobs:
           TF_VAR_tiles_build_dir: "${{ github.workspace }}/dist"
         run: op run --env-file=".env" -- terragrunt run --all fmt -- -diff -check
 
+      # Plans the worker module against mocked providers (tests/tiles-worker.tftest.hcl): the variables' validation.
+      - name: Test the tiles worker module
+        working-directory: deployment/modules/cloudflare/tiles-worker
+        run: |
+          tofu init -backend=false -input=false
+          tofu test
+
   plan-terragrunt:
     needs: build
     name: Plan Terragrunt
