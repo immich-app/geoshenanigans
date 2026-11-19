@@ -77,11 +77,14 @@ another selection with `PUT /admin/configuration` (a JSON body of `base_url`,
 `mode`, `quality`, `poi_tier` and the regions to `preload`). A value the build
 doesn't offer fails each download, naming those it does, and the PUT is refused
 with them (400) when the server has the build's manifest at hand. A continent
-dir names its build in `.build_date` once all of it is in; until then a download
-of a fresh build keeps a record of its fetches there, `.fetched.<date>`, and a
-server that starts with one in a dir leaves that continent unloaded until a
-query or a preload finishes its download. Queries need an API key from the
-dashboard (see Authentication below).
+dir keeps a ledger of what each of its files holds, `.file_sha256` (a line
+`<name> <sha256>` each, `-` while unknown), and a download skips a file only
+where the ledger names the build's sha256 for it. The dir names its build in
+`.build_date` once a whole selection of it is in; a download that fetches
+anything removes it first. A server that starts with a ledger but no stamp in a
+dir leaves that continent unloaded until a query or a preload finishes its
+download. Queries need an API key from the dashboard (see Authentication
+below).
 
 The test portal is a map page for checking answers, served by every query
 server at `/test`. Its compose file runs two servers on the latest published

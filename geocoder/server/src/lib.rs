@@ -3426,19 +3426,37 @@ impl Index {
 // "world" slot that covers every query. New deployments use per-
 // continent subdirs.
 
-/// The start of the name of the record a continent dir keeps while the
-/// server's downloader fetches a fresh build into it: `.fetched.<date>`,
-/// the fetches that came down. It is there from before the first file of
-/// the build goes in until the dir is stamped with the build, so a dir
-/// holding one may mix two builds' files.
-pub const FETCHED_RECORD_PREFIX: &str = ".fetched.";
+/// The stamp of a continent dir the server's downloader fills: the date of
+/// the build it holds a complete selection of. The downloader removes it
+/// before it writes anything else into the dir and puts it back once the
+/// last of the selection is in.
+pub const BUILD_STAMP: &str = ".build_date";
 
-/// The name of a record of a download that did not finish in `dir`, if
-/// it holds one.
+/// The ledger the server's downloader keeps in a continent dir of what each
+/// file there holds: lines `<name> <sha256>`, or `<name> -` where it is
+/// unknown, the last line of a name the one that counts. A dir holding it
+/// but no BUILD_STAMP is one whose download did not finish, and may mix two
+/// builds' or selections' files.
+pub const FILE_LEDGER: &str = ".file_sha256";
+
+/// Why the continent dir `dir` is left unloaded, if it is: it holds
+/// FILE_LEDGER but not BUILD_STAMP, a download that did not finish, or
+/// either can't be checked. A dir holding neither was laid out by other
+/// means (by hand, by the test portal) and loads.
 fn unfinished_download(dir: &str) -> Option<String> {
-    std::fs::read_dir(dir).ok()?
-        .filter_map(|e| e.ok()?.file_name().into_string().ok())
-        .find(|name| name.starts_with(FETCHED_RECORD_PREFIX))
+    let there = |name: &str| {
+        let path = format!("{}/{}", dir, name);
+        match std::fs::metadata(&path) {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("can't check {}: {}", path, e)),
+        }
+    };
+    match (there(BUILD_STAMP), there(FILE_LEDGER)) {
+        (Err(why), _) | (_, Err(why)) => Some(why),
+        (Ok(false), Ok(true)) => Some(format!("it holds {} but no {}: a download that did not finish", FILE_LEDGER, BUILD_STAMP)),
+        _ => None,
+    }
 }
 
 pub struct ContinentSlot {
@@ -3491,12 +3509,12 @@ impl MultiIndex {
             let dir = format!("{}/{}", root, continent.name);
             let arc_opt = if !std::path::Path::new(&format!("{}/admin_cells.bin", dir)).exists() {
                 None
-            } else if let Some(record) = unfinished_download(&dir) {
-                // A download of a fresh build that broke off can leave
-                // files of the build beside those of the one before, which
+            } else if let Some(why) = unfinished_download(&dir) {
+                // A download that broke off can leave files of a build or
+                // selection beside those of the one before, which
                 // Index::load can't tell apart. The slot stays empty so the
                 // downloader finishes the download first.
-                eprintln!("skipping continent {}: {} records a download that did not finish", continent.name, record);
+                eprintln!("skipping continent {}: {}", continent.name, why);
                 None
             } else {
                 // An interrupted or failed download leaves a dir that has
@@ -6786,7 +6804,7 @@ mod query_path_tests {
     }
 
     /// A root with oldtown() in the dirs of asia and europe, as the test
-    /// portal lays them out: no stamp of a build, no record of a download.
+    /// portal lays them out: no stamp of a build, no ledger of a download.
     fn two_continents() -> ScratchDir {
         let root = ScratchDir::new();
         for name in ["asia", "europe"] {
@@ -6803,23 +6821,48 @@ mod query_path_tests {
         mi.continents.iter().filter(|c| c.index.load().is_some()).map(|c| c.name).collect()
     }
 
-    // A dir holding a record of a download's fetches is one whose download
-    // of a fresh build did not finish, and it may mix two builds' files
-    // that load as one. Its slot stays empty, for the downloader to finish
-    // it; the other continents load.
+    // A dir holding the downloader's ledger but no stamp is one whose
+    // download did not finish, and it may mix two builds' or selections'
+    // files that load as one. Its slot stays empty, for the downloader to
+    // finish it; the other continents load.
     #[test]
-    fn a_continent_dir_holding_a_record_of_a_download_is_skipped() {
+    fn a_continent_dir_holding_the_ledger_but_no_stamp_is_skipped() {
         let root = two_continents();
-        std::fs::write(root.path().join("europe/.fetched.2026-01-01"), "").unwrap();
+        std::fs::write(root.path().join("europe").join(FILE_LEDGER), "admin_cells.bin -\n").unwrap();
 
         assert_eq!(loaded_continents(root.path()), ["asia"]);
     }
 
+    // The stamp goes in once all of a download is: a dir holding it loads,
+    // the ledger beside it.
     #[test]
-    fn a_continent_dir_without_a_record_of_a_download_loads() {
+    fn a_continent_dir_holding_the_stamp_and_the_ledger_loads() {
+        let root = two_continents();
+        std::fs::write(root.path().join("europe").join(FILE_LEDGER), "admin_cells.bin -\n").unwrap();
+        std::fs::write(root.path().join("europe").join(BUILD_STAMP), "2026-01-01").unwrap();
+
+        assert_eq!(loaded_continents(root.path()), ["asia", "europe"]);
+    }
+
+    #[test]
+    fn a_continent_dir_holding_neither_the_ledger_nor_a_stamp_loads() {
         let root = two_continents();
 
         assert_eq!(loaded_continents(root.path()), ["asia", "europe"]);
+    }
+
+    // A stamp or ledger that can't be checked leaves its continent
+    // unloaded: here a link to itself (too many levels of links), which
+    // stops root too, whom a dir's modes don't.
+    #[cfg(unix)]
+    #[test]
+    fn a_continent_dir_whose_stamp_or_ledger_cant_be_checked_is_skipped() {
+        for name in [BUILD_STAMP, FILE_LEDGER] {
+            let root = two_continents();
+            std::os::unix::fs::symlink(name, root.path().join("europe").join(name)).unwrap();
+
+            assert_eq!(loaded_continents(root.path()), ["asia"], "{name}");
+        }
     }
 
     #[test]
