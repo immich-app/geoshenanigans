@@ -639,9 +639,13 @@ class BuildInfoTest(unittest.TestCase):
 
 
 class RangeServer(http.server.BaseHTTPRequestHandler):
-    """Serves DATA with byte ranges, or ignores them (a 200 with everything) when IGNORE_RANGE is set."""
+    """Serves DATA with byte ranges and their Content-Range, or ignores them (a 200 with everything) when
+    IGNORE_RANGE is set. SHIFT serves as many bytes from that much further on, and says so; CONTENT_RANGE, when not
+    None, is sent instead of the true one ("" sends none)."""
     DATA = b""
     IGNORE_RANGE = False
+    SHIFT = 0
+    CONTENT_RANGE = None
     USER_AGENTS = []
 
     def do_GET(self):
@@ -652,9 +656,14 @@ class RangeServer(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(self.DATA)
             return
-        start, end = (int(n) for n in self.headers["Range"].removeprefix("bytes=").split("-"))
+        start, end = (int(n) + self.SHIFT for n in self.headers["Range"].removeprefix("bytes=").split("-"))
         part = self.DATA[start:end + 1]
+        content_range = self.CONTENT_RANGE
+        if content_range is None:
+            content_range = f"bytes {start}-{start + len(part) - 1}/{len(self.DATA)}"
         self.send_response(206)
+        if content_range:
+            self.send_header("Content-Range", content_range)
         self.send_header("Content-Length", str(len(part)))
         self.end_headers()
         self.wfile.write(part)
@@ -670,6 +679,8 @@ class RangeReaderTest(unittest.TestCase):
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}/20261118.pmtiles"
         RangeServer.DATA = pmtiles(BuildInfoTest.METADATA)
         RangeServer.IGNORE_RANGE = False
+        RangeServer.SHIFT = 0
+        RangeServer.CONTENT_RANGE = None
         RangeServer.USER_AGENTS = []
 
     def tearDown(self):
@@ -689,6 +700,27 @@ class RangeReaderTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "expected a 206"):
             sut.range_reader(self.url)(0, sut.PMTILES_HEADER_BYTES)
+
+    def test_bytes_of_the_right_length_from_elsewhere_in_the_archive_are_an_error(self):
+        RangeServer.SHIFT = 10
+        self.assertGreaterEqual(len(RangeServer.DATA), sut.PMTILES_HEADER_BYTES + 10)
+
+        with self.assertRaisesRegex(ValueError, r"expected Content-Range bytes 0-126/<size>, got bytes 10-136/"):
+            sut.range_reader(self.url)(0, sut.PMTILES_HEADER_BYTES)
+
+    def test_the_content_range_must_be_the_requested_bytes(self):
+        read = sut.range_reader(self.url)
+        expected = RangeServer.DATA[:sut.PMTILES_HEADER_BYTES]
+        for header in ("bytes 0-126/*", "Bytes 0-126/5000", f"bytes 0-126/{len(RangeServer.DATA)}"):
+            with self.subTest(accepted=header):
+                RangeServer.CONTENT_RANGE = header
+                self.assertEqual(read(0, sut.PMTILES_HEADER_BYTES), expected)
+        for header in ("", "bytes 1-127/5000", "bytes 0-125/5000", "bytes 0-127/5000", "bytes 0-126/126",
+                       "bytes */5000", "bytes 0-126", "items 0-126/5000"):
+            with self.subTest(rejected=header):
+                RangeServer.CONTENT_RANGE = header
+                with self.assertRaisesRegex(ValueError, "expected Content-Range"):
+                    read(0, sut.PMTILES_HEADER_BYTES)
 
 
 class MainTest(WithTempDir):

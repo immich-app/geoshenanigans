@@ -19,7 +19,8 @@ Usage:
 build-info prints the tiles schema version and the OSM replication time of a
 Protomaps build as JSON ({"version", "osmDate"}, null when the archive's
 metadata has none), read from the archive's header and metadata with two range
-requests, before the 140 GB download.
+requests (each answer's Content-Range must be the bytes asked for), before the
+140 GB download.
 
 decide is the resolve job's choice: the build (the newest in builds.json, or
 the requested one), the live build from `npm run bunny:status -- --json` (its
@@ -163,6 +164,9 @@ COMPRESSION_NONE = 1
 COMPRESSION_GZIP = 2
 MAX_METADATA_BYTES = 16 << 20
 OSM_TIME_KEY = "planetiler:osm:osmosisreplicationtime"
+# A 206's Content-Range (RFC 9110 14.4): first and last byte, then the
+# archive's size or * when unknown.
+CONTENT_RANGE = re.compile(r"bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)", re.IGNORECASE)
 
 
 def number(value):
@@ -226,12 +230,18 @@ class Log:
 def range_reader(url):
     """read(offset, length) of url by HTTP range requests, failing on anything but exactly those bytes."""
     def read(offset, length):
-        request = urllib.request.Request(url, headers={"Range": f"bytes={offset}-{offset + length - 1}",
-                                                       "User-Agent": USER_AGENT})
+        last = offset + length - 1
+        request = urllib.request.Request(url, headers={"Range": f"bytes={offset}-{last}", "User-Agent": USER_AGENT})
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             # A server that ignores Range answers 200 with the whole archive.
             if response.status != 206:
                 raise ValueError(f"expected a 206 range response, got {response.status}")
+            # The body's length doesn't say where in the archive it starts: only Content-Range does.
+            served = " ".join((response.headers.get("Content-Range") or "").split())
+            match = CONTENT_RANGE.fullmatch(served)
+            if (not match or (int(match[1]), int(match[2])) != (offset, last)
+                    or (match[3] != "*" and int(match[3]) <= last)):
+                raise ValueError(f"expected Content-Range bytes {offset}-{last}/<size>, got {served or 'none'}")
             data = response.read(length + 1)
         if len(data) != length:
             raise ValueError(f"expected {length} bytes at {offset}, got {len(data)}")
