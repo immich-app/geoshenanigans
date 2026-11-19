@@ -1779,7 +1779,7 @@
     {
       "type": "stat",
       "title": "Last sync duration",
-      "description": "The latest sync job's time from its first step to its last, download included. The sync-slow alert fires above 2h.",
+      "description": "Time from first step to last, download included, of the most recent sync job that reported a duration in the past 26h. A run the resolver stops before the sync job (the build already live, syncs held, a schema change) reports no duration and leaves the previous job's shown. The sync-slow alert fires above 2h.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1847,7 +1847,7 @@
     {
       "type": "stat",
       "title": "Replication",
-      "description": "Whether every changed file of the latest sync reached every storage region with the right checksum before the purge.",
+      "description": "Result of the most recent replication gate reported in the past 26h; runs that end before the gate report none and leave it shown. Complete means every file the run changed was stored with the right checksum and reached the regions that run waited for: every replica region by default, only those in the regions input or TILES_SYNC_REGIONS when set, or none (primary storage only) with regions set to none.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2551,7 +2551,7 @@
     {
       "type": "timeseries",
       "title": "Sample check: not yet in a region",
-      "description": "Of the daily sample of live positions (100 per zoom), those stored with the right bytes that each storage region does not hold yet; they are served from Frankfurt there. After a seed this is the replication backlog draining: zero in every region is when it has.",
+      "description": "Of the daily sample of live positions (up to 100 per zoom), the files stored with the right bytes that each storage region does not hold yet; that region serves them from Frankfurt. After a seed this is the replication backlog draining, but zero only means no sampled file lacked the region: confirm the backlog has drained with the full zoom-15 listing in the go-live checklist (deployment/modules/bunny/tiles/README.md) before clearing TILES_SYNC_REGIONS or cutting over.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3215,7 +3215,7 @@
     {
       "type": "timeseries",
       "title": "Bunny tile cache hits by zoom",
-      "description": "Share of each zoom level's tile requests the CDN answered from its cache.",
+      "description": "Share of each zoom level's tile requests the CDN answered from its cache: 0 when a zoom had requests but no hits (a cold cache after a purge), a gap when it had no requests.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3261,7 +3261,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sum by (zoom) (sum_over_time(tiles_bunny_tile_requests{project=\"geoshenanigans\", cluster=\"tiles\", cache=~\"(?i)hit\"}[$__interval])) / sum by (zoom) (sum_over_time(tiles_bunny_tile_requests{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval]))",
+          "expr": "(sum by (zoom) (sum_over_time(tiles_bunny_tile_requests{project=\"geoshenanigans\", cluster=\"tiles\", cache=~\"(?i)hit\"}[$__interval])) or on (zoom) (0 * sum by (zoom) (sum_over_time(tiles_bunny_tile_requests{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval])))) / sum by (zoom) (sum_over_time(tiles_bunny_tile_requests{project=\"geoshenanigans\", cluster=\"tiles\"}[$__interval]))",
           "legendFormat": "z{{zoom}}",
           "refId": "A",
           "range": true
@@ -3278,7 +3278,7 @@
     {
       "type": "timeseries",
       "title": "Log reader",
-      "description": "Rows the log reader read from the Logging API per minute, and how far behind real time the last minute it processed was. The bunny-logs-silent alert fires after 15 minutes without a processed minute.",
+      "description": "Log rows per plotted interval, log-reader runs by result, and the lag: the age in seconds of the newest row the Logging API returned from the past 10 minutes, when the reader ran. On a quiet zone that is the age of the last request, not a delay; with no row in 10 minutes there is no lag point. The bunny-logs-silent alert fires when no minute has been processed (no tiles_bunny_log_rows sample) for 15 minutes while the Worker heartbeat arrives and the reader has reported in the past week, after a 5-minute pending period.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3374,7 +3374,7 @@
     {
       "type": "timeseries",
       "title": "Probe first byte, misses",
-      "description": "The synthetic probe's time to first byte for a never-requested tile, by the continent of the Globalping probe. The dashed line is the bunny-probe-slow alert's 1s.",
+      "description": "The synthetic probe's time to first byte for tests the edge answered as a cache miss (a CDN-Cache other than HIT or STALE), by the continent of the Globalping probe: normally the random z15 tile, and the popular tile too after a purge or at a cold edge. A test without a CDN-Cache header counts as the tile it tested. The dashed line is the bunny-probe-slow alert's 1s.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3451,7 +3451,7 @@
     {
       "type": "timeseries",
       "title": "Probe first byte, hits",
-      "description": "The synthetic probe's time to first byte for a cached tile, by the continent of the Globalping probe.",
+      "description": "The synthetic probe's time to first byte for tests the edge answered from its cache (CDN-Cache HIT or STALE), by the continent of the Globalping probe: normally the popular tile, and the random tile when that edge already held it. A test without a CDN-Cache header counts as the tile it tested.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -3512,7 +3512,7 @@
     {
       "type": "timeseries",
       "title": "Probe errors",
-      "description": "Failed probe requests by continent and kind, and probe runs that failed as a whole at Globalping. The bunny-probe-errors alert fires when over half the runs in 30 minutes saw an error in a continent and kind, and bunny-probe-failing when over half failed as a whole.",
+      "description": "Failed probe tests by continent and kind (the cache status the edge reported, as in the first-byte panels), and probe runs that failed as a whole at Globalping. The bunny-probe-errors alert fires when at least 2, and over half, of the tests with a verdict in 30 minutes failed in a continent and kind, and bunny-probe-failing when over half the runs failed as a whole.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

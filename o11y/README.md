@@ -8,14 +8,18 @@ The Grafana dashboards and alert rules of the geocoder nightly and of the tiles 
 | `dashboards/<uid>.json` | a `GrafanaDashboard` with the JSON embedded as `spec.gzipJson` |
 | `alerts/*.yaml`         | `GrafanaAlertRuleGroup`s, shipped as-is                        |
 
-`render-manifests.sh` builds the bundle into `build/o11y` and rejects anything o11y would mis-apply. `.github/workflows/o11y.yml` runs it on every PR that touches this directory, and on `main` pushes the result with `flux push artifact` and signs it keyless with cosign.
+`render-manifests.sh` builds the bundle into `build/o11y` and rejects anything o11y would mis-apply. `.github/workflows/o11y.yml` runs it and `test-queries.sh` on every PR that touches this directory, and on `main` pushes the result with `flux push artifact` and signs it keyless with cosign.
 
 ```bash
 # renders build/o11y, checks it assembles under kustomize and validates it with kubeconform
 MISE_ENV=o11y mise run o11y:render
+# runs the tiles queries test-queries.sh covers on a throwaway VictoriaMetrics with hand-written samples
+MISE_ENV=o11y mise run o11y:test-queries
 ```
 
-The tools (jq, yq, kustomize, kubeconform, flux2, cosign) and the `o11y:render` task are in `.mise/config.o11y.toml`, locked in `.mise/mise.o11y.lock`. After changing a version there, re-lock with `MISE_ENV=o11y mise lock`, using the mise version `o11y.yml` pins (or bump that pin in the same change): a lock written by a newer mise fails CI's `--locked` install.
+`test-queries.sh` takes the expressions from the rule and dashboard files themselves, so a rule or panel it covers that changes shape must still pass its cases; add a case when a query divides sparse series or adds up over a label a pusher sets.
+
+The tools (jq, yq, kustomize, kubeconform, flux2, cosign, victoria-metrics) and the `o11y:render` and `o11y:test-queries` tasks are in `.mise/config.o11y.toml`, locked in `.mise/mise.o11y.lock`. After changing a version there, re-lock with `MISE_ENV=o11y mise lock`, using the mise version `o11y.yml` pins (or bump that pin in the same change): a lock written by a newer mise fails CI's `--locked` install.
 
 ## Where the data comes from
 
@@ -44,7 +48,7 @@ The worker's error lines and a 1% sample of its requests (`kind:="request"`, wit
 
 Four more sources land in the tiles tenant (`6:3`), all pushing samples they compute themselves as Prometheus text to `/insert/0/prometheus/api/v1/import/prometheus` with explicit timestamps, as the geocoder's report step does: names are stored as written, with no `:1m_sum_samples` suffix and no `aggregator` label.
 
-- The worker's every-minute cron reads Bunny's CDN request logs (Logging API v2) one closed minute at a time, 3 minutes behind, and pushes that minute's sums stamped at its end: `tiles_bunny_requests`, `tiles_bunny_bytes`, `tiles_bunny_tile_requests`, `tiles_bunny_country_requests`, `tiles_bunny_log_rows`, `tiles_bunny_log_lag_seconds` and `tiles_bunny_log_reader_runs{result}`. Every tenth minute it also runs a Globalping probe of a cached and an uncached tile per continent: `tiles_bunny_probe_ttfb_ms`, `tiles_bunny_probe_errors` and `tiles_bunny_probe_runs`. They carry the worker's identity labels (`provider=cloudflare`, `region=world`), so Bunny's PoP is `edge_location` and the probe's continent `continent`. Add the minutes up with `sum_over_time()`. A sample of the CDN requests goes to VictoriaLogs as `kind:="request" cdn:="bunny"`, the probe's tests as `kind:="probe"`.
+- The worker's every-minute cron reads Bunny's CDN request logs (Logging API v2) by closed minute and pushes each minute's sums stamped at its end: `tiles_bunny_requests`, `tiles_bunny_bytes`, `tiles_bunny_tile_requests`, `tiles_bunny_country_requests` and `tiles_bunny_log_rows`. Each run reads two minutes: the one 3 minutes behind it for the first time, and the one 4 behind again, which the previous run read first. Both reads of a minute share its end timestamp, and o11y's dedup keeps the bigger sample, so a minute whose first read was short (rows still arriving) or failed grows to its full count when the re-read lands a minute later, and none is counted twice. The run's `tiles_bunny_log_lag_seconds` (the age of the newest row the Logging API returned) and `tiles_bunny_log_reader_runs{result}` are stamped at the newer minute's end. The sampled request lines come from the re-read only. Every tenth minute it also runs a Globalping probe of a cached and an uncached tile per continent: `tiles_bunny_probe_ttfb_ms` and `tiles_bunny_probe_errors`, by `continent`, `kind` (the cache status the edge reported: `hit` for HIT or STALE, else `miss`) and `target` (the tile tested, `hit` or `miss`), and `tiles_bunny_probe_runs{result}`. They carry the worker's identity labels (`provider=cloudflare`, `region=world`), so Bunny's PoP is `edge_location` and the probe's continent `continent`. Add the minutes up with `sum_over_time()`. A sample of the CDN requests goes to VictoriaLogs as `kind:="request" cdn:="bunny"`, the probe's tests as `kind:="probe"`.
 - `tiles-sync.yml`'s report job pushes each daily sync's outcome from the sync CLI's report (`tiles_sync_*`: status, step seconds, positions changed, files and bytes uploaded, replication wait per `storage_region`), and `tiles-sync-watchdog.yml` every 2 hours the live build's age with its heartbeat. They stamp `project=geoshenanigans`, `cluster=tiles`, `env=prod`, `provider=github` and `region=global`, and log with `app` `tiles-sync` or `tiles-sync-watchdog`.
 - Once a day `tiles-sync-watchdog.yml`'s sample job checks 100 random positions per zoom of the live build against its manifest in every storage region and pushes `tiles_sync_sample_runs{result}`, `tiles_sync_sample_checked`, `tiles_sync_sample_missing`, `tiles_sync_sample_mismatched`, `tiles_sync_sample_errors` and `tiles_sync_sample_lacking{storage_region}`, with the same labels and `app` `tiles-sample-check`.
 
@@ -64,7 +68,7 @@ To change a dashboard, edit it in Grafana, export it with "Export for sharing ex
 
 Each `alerts/*.yaml` file holds one `GrafanaAlertRuleGroup` with `folderRef: geoshenanigans`: `geoshenanigans.yaml` the nightly's, `geoshenanigans-tiles.yaml` the tiles worker's. Every rule is labelled `project: geoshenanigans` and with a `severity`: o11y routes `project=geoshenanigans` to the `rootly-geoshenanigans` contact point, and Rootly sets urgency from the severity (`critical` is High, `warning` is Medium). Every query uses `datasourceUid: VictoriaMetricsFleet`. Never set `heartbeat: rootly`, which is o11y's own dead man's switch route.
 
-The threshold stage fires on a value above 0, so a condition on a zero is written `== bool 0`, which turns a match into 1; a bare `== 0` returns 0 and never fires. The rules' comments say why each window and `for` is what it is.
+The threshold stage fires on a value above 0, so a condition on a zero is written `== bool 0`, which turns a match into 1; a bare `== 0` returns 0 and never fires. Queries run on VictoriaMetrics, so MetricsQL functions such as `count_gt_over_time` work. The rules' comments say why each window and `for` is what it is.
 
 o11y's Flux substitutes `${VAR}` in everything it applies, and an unknown name becomes an empty string, so alerts must not contain `${`. Dashboards are safe because their JSON is embedded gzipped.
 
