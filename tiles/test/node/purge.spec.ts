@@ -73,9 +73,18 @@ describe('purgePullZone', () => {
   });
 
   it('gives up after its attempts on network errors', async () => {
-    await expect(purgePullZone('k', 1, { baseUrl: 'http://127.0.0.1:1', attempts: 2, baseDelayMs: 1 })).rejects.toThrow(
-      /after 2 attempts/,
-    );
+    let requests = 0;
+    server = createServer((request) => {
+      requests++;
+      // Dropped without an answer.
+      request.socket.destroy();
+    });
+    await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as { port: number };
+    await expect(
+      purgePullZone('k', 1, { baseUrl: `http://127.0.0.1:${port}`, attempts: 2, baseDelayMs: 1 }),
+    ).rejects.toThrow(/after 2 attempts/);
+    expect(requests).toBe(2);
   });
 
   it('rejects ids that are not numbers', async () => {

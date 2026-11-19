@@ -1,3 +1,4 @@
+import { createServer } from 'node:net';
 import { afterEach, describe, expect, it } from 'vitest';
 import { BunnyStorage, BunnyStorageOptions, StorageError } from '../../src/bunny/storage';
 import { FakeStorage, FakeStorageOptions, Fault, sha256Hex } from './fake-storage';
@@ -98,20 +99,45 @@ describe('BunnyStorage', () => {
     expect(performance.now() - started).toBeLessThan(5_000);
   });
 
-  // The first DESCRIBE comes after settleMs; a file not found then is asked about again once 5 x settleMs has passed
-  // since the failure (one DESCRIBE after a timeout, which already waited that long).
-  it.each<[Fault, number]>([
-    ['server-error', 2],
-    ['reset', 2],
-    ['hang', 1],
-  ])('after %s (not stored) DESCRIBEs, finds nothing and PUTs again', async (fault, describes) => {
-    const { fake, storage } = await setup({ fault: failFirst(fault) });
+  // Whether a second DESCRIBE follows the first depends on how soon the first came back (the two tests after this one
+  // pin that down), so these only require that every failed PUT was checked before it was sent again.
+  it.each<Fault>(['server-error', 'reset', 'hang'])(
+    'after %s (not stored) DESCRIBEs, finds nothing and PUTs again',
+    async (fault) => {
+      const seen: string[] = [];
+      const { fake, storage } = await setup({ fault: failFirst(fault), onRequest: ({ method }) => seen.push(method) });
+      await storage.put('a.mvt', bytes('a'), sha256Hex(bytes('a')));
+      expect(seen.join(' ')).toMatch(/^PUT( DESCRIBE)+ PUT$/);
+      expect(fake.requests.PUT).toBe(2);
+      expect(storage.counters.ambiguousResent).toBe(1);
+      expect(fake.checksum('a.mvt')).toBe(sha256Hex(bytes('a')));
+      expect(fake.identicalReputCount).toBe(0);
+    },
+  );
+
+  it('asks again once the commit window has passed when the first DESCRIBE finds nothing inside it', async () => {
+    const seen: { method: string; at: number }[] = [];
+    const { storage } = await setup(
+      { fault: failFirst('server-error'), onRequest: ({ method }) => seen.push({ method, at: performance.now() }) },
+      { retry: { ...fast, settleMs: 250 } },
+    );
     await storage.put('a.mvt', bytes('a'), sha256Hex(bytes('a')));
-    expect(fake.requests.PUT).toBe(2);
-    expect(fake.requests.DESCRIBE).toBe(describes);
-    expect(storage.counters.ambiguousResent).toBe(1);
-    expect(fake.checksum('a.mvt')).toBe(sha256Hex(bytes('a')));
-    expect(fake.identicalReputCount).toBe(0);
+    // The first DESCRIBE goes out 250 ms after the failure and comes back long before the 1.25 s window ends.
+    expect(seen.map(({ method }) => method)).toEqual(['PUT', 'DESCRIBE', 'DESCRIBE', 'PUT']);
+    expect(seen[2].at - seen[0].at).toBeGreaterThanOrEqual(1_200);
+  });
+
+  it('PUTs again without a second DESCRIBE when the first came back after the commit window', async () => {
+    const seen: string[] = [];
+    const { storage } = await setup({
+      fault: failFirst('server-error'),
+      onRequest: ({ method }) => seen.push(method),
+      // Held well past the 25 ms window (5 x settleMs).
+      hold: ({ method, attempt }) =>
+        method === 'DESCRIBE' && attempt === 1 ? new Promise((resolve) => setTimeout(resolve, 150)) : undefined,
+    });
+    await storage.put('a.mvt', bytes('a'), sha256Hex(bytes('a')));
+    expect(seen).toEqual(['PUT', 'DESCRIBE', 'PUT']);
   });
 
   it.each<Fault>(['stored-server-error', 'stored-request-timeout', 'stored-reset', 'stored-hang'])(
@@ -176,11 +202,17 @@ describe('BunnyStorage', () => {
   });
 
   it('gives up after maxAttempts ambiguous failures, checking each time', async () => {
-    const { fake, storage } = await setup({ fault: failFirst('server-error', 100) });
+    const seen: string[] = [];
+    const { fake, storage } = await setup({
+      fault: failFirst('server-error', 100),
+      onRequest: ({ method }) => seen.push(method),
+    });
     await expect(storage.put('a.mvt', bytes('a'), sha256Hex(bytes('a')))).rejects.toThrow(
       /PUT a.mvt failed 4 times, last: HTTP 500/,
     );
-    expect(fake.requests).toEqual({ PUT: 4, DESCRIBE: 8 });
+    expect(seen.join(' ')).toMatch(/^(PUT( DESCRIBE)+ ){3}PUT( DESCRIBE)+$/);
+    expect(fake.requests.PUT).toBe(4);
+    expect(fake.files.size).toBe(0);
   });
 
   it('gives up on 429 after the rate-limit wait cap', async () => {
@@ -242,9 +274,17 @@ describe('BunnyStorage', () => {
   it('moves to a new address set: new requests go to the new addresses, requests in flight on the old ones finish', async () => {
     let release!: () => void;
     const held = new Promise<void>((resolve) => (release = resolve));
+    let arrived!: () => void;
+    const arrival = new Promise<void>((resolve) => (arrived = resolve));
     const fake = await FakeStorage.start({
       addresses: ['127.0.0.1', '127.0.0.2', '127.0.0.3'],
-      hold: ({ path }) => (path === 'held.mvt' ? held : undefined),
+      hold: ({ path }) => {
+        if (path !== 'held.mvt') {
+          return undefined;
+        }
+        arrived();
+        return held;
+      },
     });
     fakes.push(fake);
     const storage = new BunnyStorage({
@@ -258,14 +298,18 @@ describe('BunnyStorage', () => {
     clients.push(storage);
     const put = (name: string) => storage.put(name, bytes(name), sha256Hex(bytes(name)));
     const inFlight = put('held.mvt');
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(fake.requestsByAddress.get('127.0.0.1')).toBe(1);
+    let moved: Promise<void>;
+    try {
+      await arrival;
+      expect(fake.requestsByAddress.get('127.0.0.1')).toBe(1);
 
-    const moved = storage.setAddresses(['127.0.0.2', '127.0.0.3']);
-    await Promise.all(Array.from({ length: 20 }, (_, i) => put(`f${i}.mvt`)));
-    expect(fake.requestsByAddress.get('127.0.0.1')).toBe(1);
-    expect(fake.requestsByAddress.get('127.0.0.2')! + fake.requestsByAddress.get('127.0.0.3')!).toBe(20);
-    release();
+      moved = storage.setAddresses(['127.0.0.2', '127.0.0.3']);
+      await Promise.all(Array.from({ length: 20 }, (_, i) => put(`f${i}.mvt`)));
+      expect(fake.requestsByAddress.get('127.0.0.1')).toBe(1);
+      expect(fake.requestsByAddress.get('127.0.0.2')! + fake.requestsByAddress.get('127.0.0.3')!).toBe(20);
+    } finally {
+      release();
+    }
     await inFlight;
     await moved;
     expect(fake.files.size).toBe(21);
@@ -383,5 +427,26 @@ describe('BunnyStorage', () => {
     expect(error).toBeInstanceOf(StorageError);
     expect((error as StorageError).stopped).toBe(true);
     expect(performance.now() - started).toBeLessThan(1_000);
+  });
+});
+
+describe('FakeStorage', () => {
+  it('closes the listeners it bound when a later bind fails', async () => {
+    // The same address twice: the second bind of the port the first one took fails.
+    const error = await FakeStorage.start({ addresses: ['127.0.0.1', '127.0.0.1'] }).then(
+      (fake) => {
+        fakes.push(fake);
+        return new Error('started');
+      },
+      (e: unknown) => e,
+    );
+    expect(error).toMatchObject({ code: 'EADDRINUSE', port: expect.any(Number) });
+    // Nothing listens on that port any more, so it binds again.
+    const probe = createServer();
+    await new Promise<void>((resolve, reject) => {
+      probe.once('error', reject);
+      probe.listen((error as { port: number }).port, '127.0.0.1', resolve);
+    });
+    await new Promise((resolve) => probe.close(resolve));
   });
 });
