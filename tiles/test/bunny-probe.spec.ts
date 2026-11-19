@@ -413,6 +413,8 @@ describe('runProbe', () => {
     // No two samples share a series and a timestamp, so o11y's dedup (the biggest of them) drops none of them.
     const series = samples.map(({ name, labels, timestamp }) => `${name}${JSON.stringify(labels)}@${timestamp}`);
     expect(new Set(series).size).toBe(series.length);
+    // The TileJSON read's verdict, under its own labels (continent 'worker'), which the filter below leaves out.
+    expect(metrics(calls)).toContainEqual(tileJsonRead(0));
     expect(
       metrics(calls).filter(({ labels }) => labels.continent === undefined || ['EU', 'NA'].includes(labels.continent)),
     ).toEqual([

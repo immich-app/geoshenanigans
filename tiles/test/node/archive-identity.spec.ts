@@ -92,7 +92,7 @@ describe('archiveIdentity', () => {
 });
 
 describe('identifyArchive', () => {
-  it('ties the identity to the file it hashed, which another file at the path or a write no longer matches', async () => {
+  it('ties the identity to the file it hashed, which another file put at the path does not match', async () => {
     const dir = await scratch();
     const fixture = await writeFixtureArchive(dir, 2_000);
     for (const options of [{}, { threads: 3, blockBytes: 1024 }]) {
@@ -106,7 +106,9 @@ describe('identifyArchive', () => {
     checkOpened(fixture.path, original, source);
     await (await ArchiveRanges.open(fixture.path, source)).close();
 
-    // The same size, header and root directory, other tile bytes, put at the path.
+    // The same size, header and root directory, other tile bytes, put at the path. Nothing is asserted of the
+    // original descriptor after this: losing its name moves the file's change time on ext4 (CI's TMPDIR) and tmpfs
+    // but not on ZFS, so whether its check still passes depends on the filesystem.
     const other = join(dir, 'other.pmtiles');
     await withOtherTileBytes(fixture.path, other);
     await rename(other, fixture.path);
@@ -114,10 +116,28 @@ describe('identifyArchive', () => {
     cleanup.push(async () => closeSync(replaced));
     expect(() => checkOpened(fixture.path, replaced, source)).toThrow(/no longer the file its identity was computed/);
     await expect(ArchiveRanges.open(fixture.path, source)).rejects.toThrow(/no longer the file its identity/);
-    // The file it hashed, still open, is that file until it is written to.
-    checkOpened(fixture.path, original, source);
-    futimesSync(original, new Date(), new Date());
-    expect(() => checkOpened(fixture.path, original, source)).toThrow(/replaced or written to/);
+  });
+
+  it('no longer matches the file it hashed once its modification time moves, as a write moves it', async () => {
+    const dir = await scratch();
+    const fixture = await writeFixtureArchive(dir, 2_000);
+    const { source } = await identifyArchive(fixture.path);
+    const fd = openSync(fixture.path, 'r');
+    cleanup.push(async () => closeSync(fd));
+    const ranges = await ArchiveRanges.open(fixture.path, source);
+    cleanup.push(() => ranges.close());
+    checkOpened(fixture.path, fd, source);
+    await ranges.checkUnchanged();
+
+    // A modification time the file can't have had (it was written just now), so the snapshot differs however
+    // coarse the filesystem's clock is: a write within the same tick could leave both times as they were.
+    const past = new Date('2001-02-03T04:05:06Z');
+    futimesSync(fd, past, past);
+    expect((await stat(fixture.path)).mtime).toEqual(past);
+    expect(() => checkOpened(fixture.path, fd, source)).toThrow(/replaced or written to/);
+    await expect(ranges.checkUnchanged()).rejects.toThrow(/was written to while it was read/);
+    await expect(ArchiveRanges.open(fixture.path, source)).rejects.toThrow(/no longer the file its identity/);
+    await expect(fileMd5Base64(fixture.path, undefined, source)).rejects.toThrow(/replaced or written to/);
   });
 });
 
