@@ -190,7 +190,8 @@ const QUEUED_CHUNKS: usize = 8;
 /// resolves. A decoder first finishes what decoders killed in the dir left, and a unit that fails
 /// (cut short, refused, a file of another sha256, one that can't go in place) leaves the dir as
 /// it was once those were finished; a download that broke off should still `finish`, which then
-/// rejects. Decoders of one unit into a dir at once each put complete files in place
+/// rejects. Decoders of one unit into a dir at once on one machine each put complete files in
+/// place; a dir that several machines share (NFS, SMB) is to be decoded into from one at a time
 /// (transport::decode_into_dir).
 #[napi]
 pub struct TransportDecoder {

@@ -122,8 +122,8 @@ file's sha256 is the one `files` gives; the files they replace go into that
 dir first and are removed once all are in. On any error the dataset dir is
 as it was once the decode finished what killed decodes left there (below):
 the files moved in so far are taken out again and the ones they replaced put
-back. Two decodes of one unit into a dir at once each put complete files in
-place. So a download needs the largest unit's files' size
+back. Two decodes of one unit into a dir at once on one machine each put
+complete files in place. So a download needs the largest unit's files' size
 free beside the dataset (planet `poi/all`: 1.16 GB), and a unit that fails is
 fetched again whole. Decoding holds the zstd window (8 MiB)
 and one chunk of the unit's columns (1 MiB, more only for a single polygon or
@@ -144,11 +144,18 @@ can't be read, or holding a file that can't go back (a directory in its
 place, say), stays with what is still in it, for a later decode to try again;
 so does the dir of a decode that failed and couldn't put back a file it
 replaced (its error names the file). No dir is finished while another decode
-runs in the dataset dir, on a file system without locks (where decodes take
-none), or on platforms other than unix; there they stay until removed by hand.
-A decode killed while others ran in the dataset dir is finished only once none
-runs: undone then, it puts back the files it replaced over any file a decode
-put in place since.
+on the same machine runs in the dataset dir, on a file system without locks
+(where decodes take none), or on platforms other than unix; there they stay
+until removed by hand. A decode killed while others ran in the dataset dir is
+finished only once none runs: undone then, it puts back the files it replaced
+over any file a decode put in place since.
+
+The lock is an flock(2) lock, and on a network file system (NFS, SMB) a lock
+on a dir is seen only by the machine that takes it. A decode on one machine,
+into a dataset dir another machine shares, finds no decode holding it and may
+finish the dir of a decode running on the other machine, leaving older files
+in place of that decode's or failing it. Decode into such a dir from one
+machine at a time.
 
 ## latest.json
 

@@ -251,8 +251,9 @@ pub struct Expected {
 /// such a decode put in place that replaced no file stays: it is complete, and checked as that
 /// decode checks its members. A dir that can't be read, or holding a file that can't go back (a
 /// directory in its place, say), stays, as do the files still in it, for a later decode to
-/// finish. None is finished while another decode runs in `dir`, on a file system without locks,
-/// or on platforms other than unix. Nothing else: a `<member>.tmp` there, say, stays as it is.
+/// finish. None is finished while another decode of this machine runs in `dir`, on a file system
+/// without locks, or on platforms other than unix. Nothing else: a `<member>.tmp` there, say,
+/// stays as it is.
 ///
 /// On an error `dir` is as it was once leftovers were finished: the members moved in so far are
 /// taken out again, the files they replaced put back, and nothing of the decode is left (put_back
@@ -264,6 +265,12 @@ pub struct Expected {
 /// to move a member in winning; one that fails while another is putting its members in may undo
 /// some of that one's. One killed while others run in the dir is finished only once none does:
 /// undone then, it puts back the files it replaced over any member a decode put in place since.
+///
+/// All of this holds for the decodes of one machine. The lock is flock's, and on a network file
+/// system (NFS, SMB) a lock on a dir is seen only by the machine that takes it: a decode on
+/// another machine, into a dir both share, finds no decode holding it and may finish this one's
+/// dir while it runs, leaving older files in place of its members or failing it. Such a dir is
+/// to be decoded into from one machine at a time.
 ///
 /// A unit's members lie in `dir` beside the files they replace for a while: it needs their size
 /// free there.
@@ -330,9 +337,10 @@ struct Hold {
 
 /// Takes a hold on `dir`; if no other decode holds one, first finishes what the decodes that
 /// stopped without removing their dirs left (finish_leftovers): with every live decode holding
-/// its lock, those are all the decodes' dirs in `dir`. A dir that can't be opened is an error. On
-/// a file system without locks the decode goes without a hold, and finishes none: there no decode
-/// can tell another's dir from a leftover.
+/// its lock, those are all the decodes' dirs in `dir`, unless decodes on other machines run there
+/// too, whose locks this one doesn't see (decode_into_dir). A dir that can't be opened is an
+/// error. On a file system without locks the decode goes without a hold, and finishes none: there
+/// no decode can tell another's dir from a leftover.
 #[cfg(unix)]
 fn hold(dir: &Path) -> io::Result<Hold> {
     let lock = File::open(dir).map_err(|e| at(dir, e))?;
