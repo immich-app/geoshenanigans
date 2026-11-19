@@ -1,10 +1,14 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { readFile, writeFile } from 'node:fs/promises';
+import { closeSync, futimesSync, openSync } from 'node:fs';
+import { readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
   archiveIdentity,
+  checkOpened,
   fileMd5Base64,
+  fileSnapshot,
+  identifyArchive,
   IDENTITY_BLOCK_BYTES,
   IDENTITY_PATTERN,
   parseMd5Base64,
@@ -84,6 +88,36 @@ describe('archiveIdentity', () => {
       expect(second.identity).not.toBe(first.identity);
     }
     expect((await archiveIdentity(fixture.path)).identity).toBe(reference(await readFile(fixture.path)));
+  });
+});
+
+describe('identifyArchive', () => {
+  it('ties the identity to the file it hashed, which another file at the path or a write no longer matches', async () => {
+    const dir = await scratch();
+    const fixture = await writeFixtureArchive(dir, 2_000);
+    for (const options of [{}, { threads: 3, blockBytes: 1024 }]) {
+      const identified = await identifyArchive(fixture.path, options);
+      expect(identified.identity).toEqual(await archiveIdentity(fixture.path, options));
+      expect(identified.source).toBe(fileSnapshot(await stat(fixture.path, { bigint: true })));
+    }
+    const { source } = await identifyArchive(fixture.path);
+    const original = openSync(fixture.path, 'r');
+    cleanup.push(async () => closeSync(original));
+    checkOpened(fixture.path, original, source);
+    await (await ArchiveRanges.open(fixture.path, source)).close();
+
+    // The same size, header and root directory, other tile bytes, put at the path.
+    const other = join(dir, 'other.pmtiles');
+    await withOtherTileBytes(fixture.path, other);
+    await rename(other, fixture.path);
+    const replaced = openSync(fixture.path, 'r');
+    cleanup.push(async () => closeSync(replaced));
+    expect(() => checkOpened(fixture.path, replaced, source)).toThrow(/no longer the file its identity was computed/);
+    await expect(ArchiveRanges.open(fixture.path, source)).rejects.toThrow(/no longer the file its identity/);
+    // The file it hashed, still open, is that file until it is written to.
+    checkOpened(fixture.path, original, source);
+    futimesSync(original, new Date(), new Date());
+    expect(() => checkOpened(fixture.path, original, source)).toThrow(/replaced or written to/);
   });
 });
 

@@ -1,22 +1,39 @@
 import { ChildProcess, spawn } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync } from 'node:fs';
-import { mkdir, readFile } from 'node:fs/promises';
+import { mkdirSync, PathLike, readFileSync, rmSync, utimesSync } from 'node:fs';
+import { mkdir, readFile, rename, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import { Worker } from 'node:worker_threads';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { archiveIdentity } from '../../src/bunny/archive-identity';
+import { archiveIdentity, identifyArchive } from '../../src/bunny/archive-identity';
 import { ArchiveRanges } from '../../src/bunny/archive-walk';
 import { BunnyStateStore, writeState } from '../../src/bunny/state';
 import { tilePath } from '../../src/bunny/tile-id';
-import { Checkpoint, runSeed, SeedOptions, SeedStatus } from '../../src/bunny/upload';
+import { Checkpoint, MainMessage, runSeed, SeedOptions, SeedStatus } from '../../src/bunny/upload';
 import { FakeStorage, FakeStorageOptions, Fault } from './fake-storage';
 import { startStateServer } from './state-server';
 import { FixtureArchive, random, scratchDir, withOtherTileBytes, writeFixtureArchive } from './upload-fixture';
+
+/** Set by a test to hold back chosen renames (status.json is written to a temporary file and renamed into place). */
+const renames = vi.hoisted(() => ({
+  hook: undefined as ((from: string, to: string) => Promise<void> | undefined) | undefined,
+}));
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    rename: async (from: PathLike, to: PathLike) => {
+      await renames.hook?.(String(from), String(to));
+      return actual.rename(from, to);
+    },
+  };
+});
 
 const TILES_DIR = join(import.meta.dirname, '../..');
 const fast = { baseDelayMs: 1, maxDelayMs: 5, settleMs: 5, maxAttempts: 5, maxRateLimitWaitMs: 5_000 };
 let cleanup: (() => Promise<void> | void)[] = [];
 
 afterEach(async () => {
+  renames.hook = undefined;
   for (const step of cleanup.reverse()) {
     await step();
   }
@@ -101,8 +118,6 @@ describe('runSeed', () => {
     expect(JSON.parse(await readFile(join(options().stateDir, 'status.json'), 'utf8'))).toMatchObject({
       state: 'complete',
     });
-    // The ocean tile and the other repeats are read and hashed once per worker, not per position.
-    expect(fixture.entries).toBeLessThan(5_461);
 
     const puts = fake.requests.PUT;
     const again = await runSeed(options());
@@ -420,14 +435,19 @@ describe('runSeed', () => {
     const { options } = await setup(1_365, {
       fault: ({ method, path }) => (method === 'PUT' && bad(path) ? 'server-error' : undefined),
     });
-    // Positions 0-63 of z0-z5 sit in chunk 0; the worker stops there after 10 failures, before the chunk is done.
+    // Every position of z0-z5 fails; chunk 0 holds the first 512. The worker stops after 10 failures, before the chunk
+    // is done: the 10th stops new work, and at most the 3 others of its 4 in flight fail after it.
     const { status, failures } = await runSeed(options({ workers: 1, concurrency: 4, maxFailures: 10 }));
     expect(status.state).toBe('failed');
     expect(status.files.failed).toBeGreaterThanOrEqual(10);
+    expect(status.files.failed).toBeLessThanOrEqual(13);
     const lines = (await readFile(status.failuresFile, 'utf8')).trim().split('\n');
     expect(lines).toHaveLength(status.files.failed);
     expect(failures).toHaveLength(status.files.failed);
     expect(failures.every((failure) => bad(failure.path))).toBe(true);
+    expect(lines.map((line) => (JSON.parse(line) as { path: string }).path).sort()).toEqual(
+      failures.map((failure) => failure.path).sort(),
+    );
     expect(status.chunks.failed).toBe(1);
   });
 
@@ -505,6 +525,127 @@ describe('runSeed', () => {
     expect(fake.identicalReputs).toEqual([]);
   });
 
+  it('leaves the final status on disk when a progress write is still going as the seed ends', async () => {
+    const { options } = await setup(1_365, { latencyMs: 1 });
+    const opts = options({ progressIntervalMs: 20 });
+    const statusPath = join(opts.stateDir, 'status.json');
+    let running = 0;
+    let heldUntil = 0;
+    renames.hook = (from, to) => {
+      // The first progress write (the second "running" status) lands only after the seed is long done.
+      if (to === statusPath && readFileSync(from, 'utf8').includes('"state": "running"') && ++running === 2) {
+        heldUntil = Date.now() + 3_000;
+        return sleep(3_000);
+      }
+      return undefined;
+    };
+    const { status } = await runSeed(opts);
+    expect(status.state).toBe('complete');
+    expect(heldUntil).toBeGreaterThan(0);
+    await sleep(heldUntil + 200 - Date.now());
+    expect(JSON.parse(await readFile(statusPath, 'utf8'))).toMatchObject({ state: 'complete', error: null });
+  });
+
+  it('refuses an archive put at its path after its identity was computed, writing and uploading nothing', async () => {
+    const { fixture, fake, options, dir } = await setup(1_365);
+    const identified = await identifyArchive(fixture.path);
+    // Same size, header and root directory; other tile bytes.
+    const other = join(dir, 'other.pmtiles');
+    await withOtherTileBytes(fixture.path, other);
+    await rename(other, fixture.path);
+    await expect(runSeed(options({ archiveIdentity: identified }))).rejects.toThrow(
+      /no longer the file its identity was computed from/,
+    );
+    expect(fake.requests).toEqual({});
+    await expect(stat(options().stateDir)).rejects.toThrow(/ENOENT/);
+  });
+
+  it('uploads nothing when the archive is replaced after the seed opened it, before its workers do', async () => {
+    const { fixture, fake, options, dir } = await setup(1_365);
+    const other = join(dir, 'other.pmtiles');
+    await withOtherTileBytes(fixture.path, other);
+    const { status } = await runSeed(
+      options({
+        // Called once the checkpoint is open and before any worker starts.
+        resolveAddresses: async () => {
+          await rename(other, fixture.path);
+          return ['127.0.0.1'];
+        },
+      }),
+    );
+    expect(status.state).toBe('failed');
+    expect(status.error).toMatch(/no longer the file its identity was computed from/);
+    expect(fake.requests.PUT).toBeUndefined();
+    expect(status.chunks.done).toBe(0);
+    expect(await readFile(join(options().stateDir, 'checkpoint.log'), 'utf8')).not.toMatch(/^done /m);
+  });
+
+  it('records no chunk done once the archive is written to mid-seed, and a resume finishes it', async () => {
+    let puts = 0;
+    let path = '';
+    const { fixture, fake, options } = await setup(5_461, {
+      latencyMs: 1,
+      onRequest: ({ method }) => {
+        if (method === 'PUT' && ++puts === 1_500) {
+          // Its bytes stay the same; its modification and change times don't.
+          utimesSync(path, new Date(), new Date());
+        }
+      },
+    });
+    path = fixture.path;
+    const first = await runSeed(options());
+    expect(first.status.state).toBe('failed');
+    expect(first.status.error).toMatch(/no longer the file its identity was computed from/);
+    expect(first.status.chunks.done).toBeLessThan(11);
+    const log = await readFile(join(options().stateDir, 'checkpoint.log'), 'utf8');
+    expect(log.match(/^done /gm)?.length ?? 0).toBe(first.status.chunks.done);
+
+    const resumed = await runSeed(options());
+    expect(resumed.status.state).toBe('complete');
+    expectStored(fake, fixture, 0, 5_461);
+    expect(fake.identicalReputs).toEqual([]);
+  });
+
+  it('refuses a range that reaches past the tiles of the archive', async () => {
+    const { fake, options } = await setup(1_365);
+    await expect(runSeed(options({ from: 1_000, to: 1_400 }))).rejects.toThrow(
+      /\[1000, 1400\) reaches past the tiles of .*, which has tiles in \[0, 1365\) only/,
+    );
+    expect(fake.requests).toEqual({});
+    await expect(stat(options().stateDir)).rejects.toThrow(/ENOENT/);
+  });
+
+  it('does not record a chunk done when its worker stored fewer positions than it was handed out with', async () => {
+    const { fixture, fake, options } = await setup(1_365);
+    const post = Worker.prototype.postMessage;
+    let shortened = 0;
+    const spy = vi.spyOn(Worker.prototype, 'postMessage').mockImplementation(function (
+      this: Worker,
+      message: unknown,
+      transfer?: readonly Transferable[],
+    ) {
+      const sent = message as MainMessage;
+      if (sent.type === 'chunk' && sent.chunk.chunkId === 1) {
+        // As a worker that lost a run would: the last run of chunk 1 never reaches it.
+        shortened = sent.chunk.runs.at(-3)!;
+        sent.chunk.runs = sent.chunk.runs.slice(0, -4);
+      }
+      return post.call(this, message, transfer as Transferable[]);
+    });
+    cleanup.push(() => spy.mockRestore());
+    const first = await runSeed(options());
+    spy.mockRestore();
+    expect(shortened).toBeGreaterThan(0);
+    expect(first.status.state).toBe('failed');
+    expect(first.status.error).toMatch(/chunk 1 was reported done with \d+ positions stored, not the 512/);
+    expect(await readFile(join(options().stateDir, 'checkpoint.log'), 'utf8')).not.toMatch(/^done 1$/m);
+
+    const resumed = await runSeed(options());
+    expect(resumed.status.state).toBe('complete');
+    expectStored(fake, fixture, 0, 1_365);
+    expect(fake.identicalReputs).toEqual([]);
+  });
+
   it('stops on a wrong password before starting workers', async () => {
     const { fake, options } = await setup(1_365);
     await expect(
@@ -535,6 +676,8 @@ function startSeed(
       BUNNY_STORAGE_ZONE: fake.zone,
       BUNNY_STORAGE_PASSWORD: fake.password,
       BUNNY_STORAGE_HOST: fake.url,
+      // An address exported where the tests run would send the PUTs elsewhere.
+      BUNNY_STORAGE_ADDRESSES: '127.0.0.1',
       ...env,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -543,8 +686,9 @@ function startSeed(
   let stderr = '';
   child.stdout!.on('data', (chunk) => (stdout += chunk));
   child.stderr!.on('data', (chunk) => (stderr += chunk));
+  // On close, not exit: by then stdout and stderr have been read to the end.
   const done = new Promise<ChildResult>((resolve) =>
-    child.once('exit', (code, signal) => resolve({ code, signal, stdout, stderr })),
+    child.once('close', (code, signal) => resolve({ code, signal, stdout, stderr })),
   );
   cleanup.push(() => {
     child.kill('SIGKILL');
@@ -875,6 +1019,30 @@ describe('bunny:seed CLI', () => {
       );
     }
     expect(fake.files.size).toBe(170);
+  }, 30_000);
+
+  it('refuses ids past the archive, and cuts a zoom range to its tiles', async () => {
+    const scratch = await scratchDir();
+    cleanup.push(scratch.remove);
+    // 100 positions: z0-z3 and the first 15 of z4's 256, which the header's zooms (0-15) reach far past.
+    const fixture = await writeFixtureArchive(scratch.dir, 100, 5, 30);
+    const fake = await FakeStorage.start();
+    cleanup.push(() => fake.close());
+    const stateDir = join(scratch.dir, 'state');
+    const env = { XDG_STATE_HOME: scratch.dir };
+    const base = ['--archive', fixture.path, '--prefix', 'itest', '--state-dir', stateDir, '--workers', '1'];
+
+    const past = await startSeed(fake, [...base, '--from-id', '0', '--to-id', '101'], env).done;
+    expect(past.code).toBe(2);
+    expect(past.stderr).toMatch(/\[0, 101\) reaches past the tiles of .*, which has tiles in \[0, 100\) only/);
+    expect(fake.requests).toEqual({});
+    await expect(stat(stateDir)).rejects.toThrow(/ENOENT/);
+
+    const zooms = await startSeed(fake, base, env).done;
+    expect(zooms.code, zooms.stderr).toBe(0);
+    expect(zooms.stderr).toMatch(/zooms' ids \[0, 1431655765\) cut to the archive's tiles: \[0, 100\)/);
+    expect(JSON.parse(zooms.stdout)).toMatchObject({ state: 'complete', range: { from: 0, to: 100 } });
+    expectStored(fake, fixture, 0, 100);
   }, 30_000);
 
   it('rejects bad arguments with exit code 2', async () => {

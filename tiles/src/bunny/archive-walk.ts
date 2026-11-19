@@ -3,6 +3,7 @@ import { open } from 'node:fs/promises';
 import { Archive, RangeReader } from '../deploy/archive';
 import { Entry } from '../pmtiles/types';
 import { decompress, deserializeIndex } from '../pmtiles/utils';
+import { FileSnapshot, fileSnapshot } from './archive-identity-worker';
 
 /** Positions [tileId, tileId + runLength) all hold the tile bytes at (offset, length) of the tile data section. */
 export interface TileRun {
@@ -38,12 +39,18 @@ export class ArchiveRanges {
      * older bunny:seed left, together with the whole file's MD5.
      */
     readonly legacyFingerprint: string,
+    /** The file this reads, as it was when opened (see FileSnapshot). */
+    readonly source: FileSnapshot,
     private read: RangeReader,
     private root: Entry[],
     private closeFile: () => Promise<void>,
   ) {}
 
-  static async open(path: string): Promise<ArchiveRanges> {
+  /**
+   * Opens the archive at `path`; given `source` (from identifyArchive), only if the file it opened is that one,
+   * unchanged, so what it reads is what the identity is of.
+   */
+  static async open(path: string, source?: FileSnapshot): Promise<ArchiveRanges> {
     const file = await open(path);
     const read: RangeReader = async (position, length) => {
       const buffer = Buffer.alloc(length);
@@ -58,9 +65,14 @@ export class ArchiveRanges {
       return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + length) as ArrayBuffer;
     };
     try {
+      const stats = await file.stat({ bigint: true });
+      const opened = fileSnapshot(stats);
+      if (source !== undefined && opened !== source) {
+        throw new Error('it is no longer the file its identity was computed from: it was replaced or written to');
+      }
       const archive = await Archive.open(read);
       const { header } = archive;
-      const size = (await file.stat()).size;
+      const size = Number(stats.size);
       const rootBytes = await read(header.rootDirectoryOffset, header.rootDirectoryLength);
       const root = deserializeIndex(await decompress(rootBytes, header.internalCompression));
       const legacyFingerprint = createHash('sha256')
@@ -68,7 +80,7 @@ export class ArchiveRanges {
         .update(new Uint8Array(rootBytes))
         .update(String(size))
         .digest('hex');
-      return new ArchiveRanges(archive, path, size, legacyFingerprint, read, root, () => file.close());
+      return new ArchiveRanges(archive, path, size, legacyFingerprint, opened, read, root, () => file.close());
     } catch (error) {
       await file.close();
       throw new Error(`${path}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
@@ -82,6 +94,13 @@ export class ArchiveRanges {
   /** Every run that overlaps [from, to), whole (not clipped to the range), in tile-id order. */
   runs(from: number, to: number): AsyncGenerator<TileRun> {
     return this.walk(this.root, from, to, Number.POSITIVE_INFINITY, 0);
+  }
+
+  /** The ids of the archive's first tile and one past its last, or null if it has none. */
+  async bounds(): Promise<{ first: number; end: number } | null> {
+    const first = await this.edge('first');
+    const last = await this.edge('last');
+    return first && last ? { first: first.tileId, end: last.tileId + last.runLength } : null;
   }
 
   /** The run holding `tileId`, or null if the archive has no tile there. */
@@ -102,6 +121,21 @@ export class ArchiveRanges {
 
   close(): Promise<void> {
     return this.closeFile();
+  }
+
+  private async edge(which: 'first' | 'last'): Promise<TileRun | null> {
+    let entries = this.root;
+    for (let depth = 0; depth <= MAX_DEPTH; depth++) {
+      const entry = which === 'first' ? entries[0] : entries.at(-1);
+      if (!entry) {
+        return null;
+      }
+      if (entry.runLength > 0) {
+        return toRun(entry);
+      }
+      entries = await this.leaf(entry);
+    }
+    throw new Error('Directory nesting too deep');
   }
 
   private async *walk(entries: Entry[], from: number, to: number, end: number, depth: number): AsyncGenerator<TileRun> {

@@ -7,9 +7,14 @@
  * A chunk this seed never started may still hold files another seed (another state dir) stored, and PUTting their
  * bytes again would clear their replication, so a few of its positions are DESCRIBEd as soon as it arrives; if any
  * already holds its bytes, the whole chunk runs verified.
+ *
+ * The archive is the file its identity was computed from (WorkerConfig.archiveSource): the worker checks that it
+ * opened that file and, before it reports a chunk done, that the file has not changed since; else it stops and the
+ * chunk stays unfinished.
  */
 import { closeSync, openSync, readSync } from 'node:fs';
 import { parentPort, workerData } from 'node:worker_threads';
+import { checkOpened } from './archive-identity-worker';
 import { BunnyStorage, sha256Hex, StorageCounters } from './storage';
 import { tilePath } from './tile-id';
 import {
@@ -44,6 +49,8 @@ const config = workerData as WorkerConfig;
 const post = (message: WorkerMessage) => port.postMessage(message);
 
 const fd = openSync(config.archivePath, 'r');
+/** Why the archive can't be read any more (another file at the path, or written to), once it is found so. */
+let sourceProblem: string | undefined;
 const cache = new Map<number, { length: number; bytes: Uint8Array; sha256: string }>();
 
 function content(offset: number, length: number): { bytes: Uint8Array; sha256: string } {
@@ -85,7 +92,7 @@ let wake: (() => void) | undefined;
 port.on('message', (message: MainMessage) => {
   if (message.type === 'chunk') {
     queue.push(message.chunk);
-    if (!message.chunk.verify) {
+    if (!message.chunk.verify && sourceProblem === undefined) {
       probes.set(message.chunk.chunkId, probe(message.chunk));
     }
   } else if (message.type === 'addresses') {
@@ -138,11 +145,30 @@ async function probe(chunk: ChunkDescriptor): Promise<string | undefined> {
   return reason;
 }
 
+/** False, with the worker stopping, if the archive is no longer the file its identity is of. */
+function sourceUnchanged(): boolean {
+  if (sourceProblem === undefined) {
+    try {
+      checkOpened(config.archivePath, fd, config.archiveSource);
+    } catch (error) {
+      sourceProblem = error instanceof Error ? error.message : String(error);
+      post({ type: 'fatal', error: sourceProblem });
+      stop.abort();
+    }
+  }
+  return sourceProblem === undefined;
+}
+
 function finish(state: ChunkState) {
-  if (!state.reported && state.emittedAll && state.settled === state.emitted) {
+  if (!state.reported && state.emittedAll && state.settled === state.emitted && sourceUnchanged()) {
     state.reported = true;
     states.delete(state.chunkId);
-    post({ type: 'chunk-done', chunkId: state.chunkId, failures: state.failures });
+    post({
+      type: 'chunk-done',
+      chunkId: state.chunkId,
+      stored: state.settled - state.failures.length,
+      failures: state.failures,
+    });
   }
 }
 
@@ -202,6 +228,9 @@ async function main() {
     PROGRESS_MS,
   );
   try {
+    if (!sourceUnchanged()) {
+      return;
+    }
     const result = await uploadTiles(storage, items(), {
       prefix: config.prefix,
       concurrency: config.concurrency,

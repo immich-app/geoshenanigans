@@ -16,7 +16,16 @@ import { availableParallelism } from 'node:os';
 import { pipeline } from 'node:stream/promises';
 import { URL } from 'node:url';
 import { Worker } from 'node:worker_threads';
-import { hashRange, IdentityWorkerData, readBuffer } from './archive-identity-worker';
+import {
+  checkOpened,
+  FileSnapshot,
+  fileSnapshot,
+  hashRange,
+  IdentityWorkerData,
+  readBuffer,
+} from './archive-identity-worker';
+
+export { checkOpened, fileSnapshot, type FileSnapshot };
 
 export const IDENTITY_PREFIX = 'sha256-tree-v2:';
 export const IDENTITY_PATTERN = /^sha256-tree-v2:[0-9a-f]{64}$/;
@@ -32,6 +41,12 @@ export interface ArchiveIdentity {
   identity: string;
 }
 
+/** An archive's identity, and the file it was computed from. */
+export interface IdentifiedArchive {
+  identity: ArchiveIdentity;
+  source: FileSnapshot;
+}
+
 export interface IdentityOptions {
   /** Hashing threads (default: the cores, at most 16). */
   threads?: number;
@@ -41,32 +56,41 @@ export interface IdentityOptions {
 
 /** The v2 identity of the archive at `path`. A planet build (~140 GB) takes about 15 s from NVMe on 8-16 threads. */
 export async function archiveIdentity(path: string, options: IdentityOptions = {}): Promise<ArchiveIdentity> {
+  return (await identifyArchive(path, options)).identity;
+}
+
+/**
+ * The v2 identity of the archive at `path` and the snapshot of the file it is of: every thread that reads the file
+ * checks that it opened that file, and the file must not have changed by the end.
+ */
+export async function identifyArchive(path: string, options: IdentityOptions = {}): Promise<IdentifiedArchive> {
   const blockBytes = options.blockBytes ?? IDENTITY_BLOCK_BYTES;
   if (!Number.isSafeInteger(blockBytes) || blockBytes < 1) {
     throw new Error(`Bad identity block size ${blockBytes}`);
   }
   const before = await stat(path, { bigint: true });
+  const source = fileSnapshot(before);
   const size = Number(before.size);
   const blocks = Math.ceil(size / blockBytes);
   // One block hashes here at once; more go to threads, so the event loop (signals, progress) keeps running.
   const digests =
     blocks <= 1
-      ? hashHere(path, size)
-      : await hashInWorkers(path, size, blockBytes, blocks, options.threads ?? defaultThreads());
+      ? hashHere(path, size, source)
+      : await hashInWorkers(path, size, source, blockBytes, blocks, options.threads ?? defaultThreads());
   // A file written to while it was read has no identity.
-  const after = await stat(path, { bigint: true });
-  if (after.size !== before.size || after.mtimeNs !== before.mtimeNs || after.ino !== before.ino) {
+  if (fileSnapshot(await stat(path, { bigint: true })) !== source) {
     throw new Error(`${path} changed while its identity was computed`);
   }
   const root = createHash('sha256').update(`${IDENTITY_TAG}${size}\n`).update(digests).digest('hex');
-  return { size, identity: IDENTITY_PREFIX + root };
+  return { identity: { size, identity: IDENTITY_PREFIX + root }, source };
 }
 
 const defaultThreads = () => Math.min(availableParallelism(), MAX_THREADS);
 
-function hashHere(path: string, size: number): Uint8Array {
+function hashHere(path: string, size: number, source: FileSnapshot): Uint8Array {
   const fd = openSync(path, 'r');
   try {
+    checkOpened(path, fd, source);
     return size === 0 ? new Uint8Array(0) : hashRange(fd, 0, size, readBuffer(size));
   } finally {
     closeSync(fd);
@@ -77,13 +101,23 @@ function hashHere(path: string, size: number): Uint8Array {
 async function hashInWorkers(
   path: string,
   size: number,
+  source: FileSnapshot,
   blockBytes: number,
   blocks: number,
   threads: number,
 ): Promise<Uint8Array> {
   const counters = new Int32Array(new SharedArrayBuffer(8));
   const digests = new Uint8Array(new SharedArrayBuffer(blocks * 32));
-  const data: IdentityWorkerData = { archiveIdentityWorker: true, path, size, blockBytes, blocks, counters, digests };
+  const data: IdentityWorkerData = {
+    archiveIdentityWorker: true,
+    path,
+    size,
+    source,
+    blockBytes,
+    blocks,
+    counters,
+    digests,
+  };
   const workers = Array.from(
     { length: Math.max(1, Math.min(threads, blocks)) },
     () =>
