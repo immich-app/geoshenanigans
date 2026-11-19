@@ -1,7 +1,7 @@
 import { createExecutionContext, createScheduledController, env, waitOnExecutionContext } from 'cloudflare:test';
 import worker from '../src';
 import { runBunnyCron } from '../src/bunny-logs';
-import { probeConfig, probeIntervalMinutes } from '../src/bunny-logs/config';
+import { MAX_PROBE_INTERVAL_MINUTES, probeConfig, probeIntervalMinutes } from '../src/bunny-logs/config';
 import { LOGGING_API } from '../src/bunny-logs/log-reader';
 import {
   GLOBALPING_API,
@@ -123,14 +123,18 @@ describe('probe settings', () => {
     );
   });
 
-  it('runs every 10 minutes unless told otherwise, and never more often than every 5', () => {
+  it('runs every 10 minutes unless told otherwise, never more often than every 5 nor less than every 14', () => {
     expect(probeIntervalMinutes(undefined)).toBe(10);
     expect(probeIntervalMinutes('')).toBe(10);
     expect(probeIntervalMinutes('often')).toBe(10);
     expect(probeIntervalMinutes('0')).toBe(10);
     expect(probeIntervalMinutes('2.5')).toBe(10);
     expect(probeIntervalMinutes('1')).toBe(5);
-    expect(probeIntervalMinutes('15')).toBe(15);
+    expect(probeIntervalMinutes('14')).toBe(14);
+    // The probe alerts' 30-minute windows need two runs: 15 or 30 minutes apart they would hold one at times.
+    expect(MAX_PROBE_INTERVAL_MINUTES).toBe(14);
+    expect(probeIntervalMinutes('15')).toBe(14);
+    expect(probeIntervalMinutes('30')).toBe(14);
     expect(probeDue(scheduled, 10)).toBe(true);
     expect(probeDue(scheduled + 59_000, 10)).toBe(true);
     expect(probeDue(scheduled + 60_000, 10)).toBe(false);

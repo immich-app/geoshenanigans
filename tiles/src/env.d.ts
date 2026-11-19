@@ -13,9 +13,9 @@ interface WorkerEnv extends Omit<Env, 'ENVIRONMENT' | 'DEPLOYMENT_KEY'> {
   // log reader is skipped.
   BUNNY_API_KEY?: string;
   BUNNY_PULL_ZONE_ID?: string;
-  // The synthetic probe: the Bunny-served origin it requests tiles from (e.g. https://tiles.immich.cloud), the
-  // Globalping token it measures with and how often it runs (minutes, 10 when unset). Without the URL and token it is
-  // skipped.
+  // The synthetic probe: the Bunny-served origin it requests tiles from (e.g. https://tiles.immich.cloud; the tile URLs
+  // come from its /v1.json), the Globalping token it measures with and how often it runs (minutes from 5 to 14, 10 when
+  // unset; others are brought into that range). Without the URL and token it is skipped.
   BUNNY_PUBLIC_URL?: string;
   GLOBALPING_TOKEN?: string;
   BUNNY_PROBE_INTERVAL_MINUTES?: string;
