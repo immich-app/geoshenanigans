@@ -626,17 +626,27 @@ spec:
         description: >-
           The latest daily sample check of the live build found positions with no file in the tiles storage zone,
           or with a file whose checksum is not the live manifest's. Its log line (app:="tiles-sample-check", in
-          the dashboard's "Sync and watchdog logs") gives the counts and example paths. Missing files serve 404s;
-          other bytes serve another build's tile (a seed run over the live prefix with an older archive, or a
-          file written by hand). `npm run bunny:status` names the live build, its prefix and any pending builds:
-          revert pending builds first (dispatch Tiles Sync with the live build as `build`). Check the whole zone
-          with `npm run bunny:replication -- --listing` (the live prefix; presence and regions), then repair the
-          affected zooms from the live build's archive, under the live prefix and with a new checkpoint
-          directory: `npm run bunny:seed -- --archive <live build>.pmtiles --prefix <live prefix> --min-zoom Z
-          --max-zoom Z --verify-existing --state-dir <new dir>`. It DESCRIBEs every file, writes only missing or
-          wrong ones, and refuses any archive but the live build's. Without --prefix it writes under v1, which
-          is no longer live after a full rewrite, and a reused state dir skips the chunks it completed before
-          (deployment/modules/bunny/tiles/README.md, "Repairs").
+          the dashboard's "Sync and watchdog logs") gives the counts and example paths. Missing files serve 404s,
+          which nothing caches; other bytes serve another build's tile (a seed run over the live prefix with an
+          older archive, or a file written by hand), which the CDN keeps for a year once fetched, as only a sync
+          purges. Repair them as deployment/modules/bunny/tiles/README.md, "Repairs", "Missing or wrong files"
+          says. First hold scheduled syncs (set TILES_SYNC_HOLD) and wait until no Tiles Sync run is in progress
+          or queued, then dispatch none but a revert until the repair is checked: a sync beside the repair can
+          write the same files. `npm run bunny:status` names the live build, its prefix and any pending builds:
+          revert pending builds first (dispatch Tiles Sync with the live build as `build`) and let that run
+          finish. Check the whole zone with `npm run bunny:replication -- --listing` (the live prefix; presence
+          and regions), then repair the affected zooms from the live build's archive, under the live prefix and
+          with a new checkpoint directory: `npm run bunny:seed -- --archive <live build>.pmtiles --prefix <live
+          prefix> --min-zoom Z --max-zoom Z --verify-existing --state-dir <new dir>`. It DESCRIBEs every file,
+          writes only missing or wrong ones, and refuses any archive but the live build's. Without --prefix it
+          writes under v1, which is no longer live after a full rewrite, and a reused state dir skips the chunks
+          it completed before. Then, before purging, check that every region holds the repaired zooms: `npm run
+          bunny:replication -- --listing --prefix <live prefix> --min-zoom Z --max-zoom Z` exits 0 and `npm run
+          bunny:replication -- --live --sample 1000 --per-zoom` finds nothing missing or wrong (a purge before
+          that lets a PoP fetch a wrong tile again from a region that still holds it). Purge the pull zone (the
+          Bunny dashboard's Purge Cache, or the README's API call), check that the example paths answer 200
+          through the public hostname from several locations with a Last-Modified from the repair (an older one
+          is a PoP still serving the wrong tile: purge again), and only then clear TILES_SYNC_HOLD.
       execErrState: Error
       noDataState: OK
       data:
@@ -1079,8 +1089,10 @@ spec:
           against the new build before switching: never force it. That, or a compatible diff over 2%, is a full
           rewrite: seed the build under a new prefix, switch with bunny:sync --adopt --replace once it has
           replicated, with STYLES_DIR the updated map-styles build (the switch writes the styles with the
-          TileJSON), and delete the old prefix a week later (deployment/modules/bunny/tiles/README.md, "Full
-          rewrites"). Until then every run stops here.
+          TileJSON) and with scheduled syncs held (TILES_SYNC_HOLD) and no Tiles Sync run in progress or queued
+          (an in-place sync beside the switch can write v1.json or state.json after it), clear the hold once
+          bunny:status names the new prefix live, and delete the old prefix a week later
+          (deployment/modules/bunny/tiles/README.md, "Full rewrites"). Until then every run stops here.
       execErrState: Error
       noDataState: OK
       data:

@@ -16,7 +16,10 @@ name: Tiles Sync
 # and the job's time budget. Scheduled runs skip while the repository variable TILES_SYNC_HOLD is set (any text,
 # e.g. why): set it before a rollback, or the next scheduled run syncs the newest build straight back.
 # A run for the live build while state.json lists pending builds syncs it again, which puts the live bytes back
-# where the pending ones wrote: dispatching the live build reverts a failed or cancelled sync.
+# where the pending ones wrote: dispatching the live build reverts a failed or cancelled sync. Decide needs the build
+# in builds.json (its MD5 and schema version), which keeps about the last week of daily builds and the first of each
+# version: a rollback to, or a revert of, a build no longer listed runs bunny:sync locally on a kept copy of its
+# archive (deployment/modules/bunny/tiles/README.md, Repairs).
 # The replication gate waits for every storage region unless the regions input, or else the repository variable
 # TILES_SYNC_REGIONS, lists fewer ("none" checks storage only): for when the account's replication queue is known
 # to be backed up (after a seed, see deployment/modules/bunny/tiles/README.md) and serving changed tiles from
@@ -35,7 +38,7 @@ on:
   workflow_dispatch:
     inputs:
       build:
-        description: 'Protomaps build to sync (YYYYMMDD), defaults to the newest; an older one rolls back (set the TILES_SYNC_HOLD variable first); the live one reverts a failed sync'
+        description: 'Protomaps build to sync (YYYYMMDD), defaults to the newest; an older one rolls back (set the TILES_SYNC_HOLD variable first); the live one reverts a failed sync. Only a build Protomaps builds.json still lists (about the last week, and the first of each version): for another, sync a kept copy of its archive locally (deployment/modules/bunny/tiles/README.md, Repairs)'
         required: false
         type: string
       regions:
