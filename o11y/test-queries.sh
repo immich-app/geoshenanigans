@@ -310,6 +310,20 @@ check 'sample-silent: a skipped check is a report' -96 "$sample_silent" ''
 check 'sample-silent: a build live for under a day' -144 "$sample_silent" ''
 check 'sample-silent: the watchdog stopped too' -192 "$sample_silent" ''
 
+# --- panels of sparse series draw their points ------------------------------
+# A panel plotted at more than a minute shows series that report less often than
+# every minute: the probe's every 10 minutes by default in 5-minute buckets, the
+# sync's and watchdog's hours apart. A bucket with a sample can then have empty
+# buckets on both sides, and without its point (spanNulls off) nothing is drawn.
+hidden=$(jq -r '.. | objects | select(.type? == "timeseries" and (.interval // "1m") != "1m"
+  and .fieldConfig.defaults.custom.showPoints != "always") | "\(.id) \(.title)"' "$dashboard")
+if [ -z "$hidden" ]; then
+  echo "ok   panels plotted at more than a minute draw their points"
+else
+  failures=$((failures + 1))
+  printf 'FAIL panels plotted at more than a minute draw their points\n  without points: %s\n' "$(echo "$hidden" | paste -sd ';' -)"
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo "$failures check(s) failed" >&2
   exit 1

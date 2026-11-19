@@ -60,7 +60,7 @@ Each `dashboards/<uid>.json` file is a Grafana export whose `uid` matches the fi
 
 The nightly writes one sample per series per run, so panels read the last sample in a window: `last_over_time(...[$__interval])` with a 1h minimum interval in time series, one point per run, and `last_over_time(...[$__range])` in stats. Stats about the latest run keep only the series with the newest `geocoder_build_last_run_timestamp_seconds`, because a watchdog retry reports under its own `trigger`.
 
-`geoshenanigans-tiles` adds up the per-minute sums per panel interval (1m minimum): `sum_over_time(...[$__interval])`, divided by `($__interval_ms / 1000)` for a rate, and `[15m]` or `[$__range]` in stats and tables.
+`geoshenanigans-tiles` adds up the per-minute sums per panel interval (1m minimum): `sum_over_time(...[$__interval])`, divided by `($__interval_ms / 1000)` for a rate, and `[15m]` or `[$__range]` in stats and tables. Panels of series that report less often than every minute (the probe's, the sync's and the watchdog's) set a longer minimum interval and show their points (`showPoints` `always`): a bucket with a sample can have empty buckets on both sides, and with `spanNulls` off it is drawn only as a point. `test-queries.sh` checks every panel plotted at more than a minute shows them.
 
 To change a dashboard, edit it in Grafana, export it with "Export for sharing externally" off, keep the `uid`, set `"id": null` and save it over the file.
 

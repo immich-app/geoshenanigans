@@ -3390,7 +3390,7 @@
             "drawStyle": "line",
             "lineWidth": 1,
             "fillOpacity": 10,
-            "showPoints": "never",
+            "showPoints": "always",
             "spanNulls": false,
             "stacking": {
               "mode": "none",
@@ -3467,7 +3467,7 @@
             "drawStyle": "line",
             "lineWidth": 1,
             "fillOpacity": 10,
-            "showPoints": "never",
+            "showPoints": "always",
             "spanNulls": false,
             "stacking": {
               "mode": "none",
@@ -3528,7 +3528,7 @@
             "drawStyle": "line",
             "lineWidth": 1,
             "fillOpacity": 60,
-            "showPoints": "never",
+            "showPoints": "always",
             "spanNulls": false,
             "stacking": {
               "mode": "normal",
