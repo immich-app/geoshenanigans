@@ -26,6 +26,7 @@ op run --env-file=bunny.env -- terragrunt apply
 | --- | --- | --- |
 | `TF_VAR_bunny_api_key` | `op://tf_bunny/BUNNY_API_KEY/password` | The Bunny account API key (Account settings, API). The purge and the log reader use the same key. |
 | `TF_VAR_tf_state_postgres_conn_str` | `op://tf/tf_state/postgres_conn_str` | The state backend, as in `deployment/.env`. |
+| `TF_VAR_state_passphrase` | `op://tf_bunny/BUNNY_TILES_STATE_PASSPHRASE/password` | The state's encryption passphrase (State encryption, below). |
 
 The sync, the watchdog and the worker read more items: every one is in the go-live checklist below, and they must exist before the branch merges.
 
@@ -34,11 +35,31 @@ The sync, the watchdog and the worker read more items: every one is in the go-li
 The account key can do anything on the Bunny account, so it sits in a vault of its own, `tf_bunny` (with the Globalping token), which neither `OP_TF_PROD_ENV` nor `OP_TF_DEV_ENV` reads. Its service account, `OP_TF_BUNNY_ENV` below, reads `tf_bunny`, `tf_prod` and `tf` (the jobs that use it resolve those items too), and its token is a secret of two GitHub environments only, never of the repository. A job gets an environment's secrets only by naming that environment and passing its protection rules, so a branch whose workflow drops or renames the environment gets no token:
 
 - `tiles-bunny-plan`: this unit's pull request plans. Required reviewers approve each run.
-- `tiles-bunny`: deployment branches limited to `main`, so a job on any other branch that names it is refused. This unit's apply, the Tiles Worker workflow's apply on `main` and Tiles Deploy's prod activation (which bind the key and the token in the worker, from `deployment/tiles-worker-bunny.env`, beside `.env`), and Tiles Sync's sync job (its purge; a dry run purges nothing and doesn't use it).
+- `tiles-bunny`: deployment branches limited to `main`, so a job on any other branch that names it is refused. This unit's apply, the Tiles Worker workflow's apply on `main` and Tiles Deploy's prod activation (which put the key and the token on the worker, from `deployment/tiles-worker-bunny.env`, beside `.env`), and Tiles Sync's sync job (its purge; a dry run purges nothing and doesn't use it).
 
-Pull requests' Tiles Worker plans pass stand-ins for the two (the worker's bindings plan as they are, with a value the plan hides). A prod plan or apply of tiles-worker that resolved `.env` alone stops at a precondition instead of unbinding them; locally, add `--env-file=deployment/tiles-worker-bunny.env` for prod.
+The state backend's connection string is in `tf`, which every pull request's plan resolves, so neither value is in any state, and the state that holds Bunny's other credentials is encrypted:
 
-What this doesn't cover: once applied, tiles-worker's prod state holds both values (OpenTofu keeps a secret binding's value in the state, as for the worker's other secrets), and the state backend's connection string is in `tf`, which those plans resolve. Closing that takes a state backend credential per unit, or the worker's secrets kept out of OpenTofu.
+- **The worker's two secrets** are Worker secrets, not `secret_text_binding`s (OpenTofu keeps a binding's value in the state). After the upload, `terraform_data.bunny_secrets` in tiles-worker's `workers.tf` puts them through Cloudflare's API (`put-worker-secrets.sh`, with the provider's token), from variables, which the state doesn't keep. The provider (4.52.10) drops every secret it doesn't manage on each upload, and its refresh lists them without their values, so every prod plan of tiles-worker shows the script updating (their bindings going) and `terraform_data.bunny_secrets` replaced: each apply uploads, then puts both back within seconds, the current values from 1Password included. Pull requests' Tiles Worker plans pass stand-ins, which reach no resource. A prod plan or apply of tiles-worker that resolved `.env` alone stops at a precondition instead of turning the log reader and the probe off; locally, add `--env-file=deployment/tiles-worker-bunny.env` for prod, with `bash`, `curl` and `jq` installed.
+- **This unit's state** holds the storage zones' passwords and the middleware script's deployment key: it is encrypted (State encryption, below), and tiles-worker no longer reads it (it takes the pull zone id as the variable `bunny_pull_zone_id`).
+
+### State encryption
+
+`encryption.tf` encrypts this unit's state and plans (AES-GCM, with a key derived from the passphrase `tf_bunny/BUNNY_TILES_STATE_PASSPHRASE`) and refuses to write either unencrypted. The backend holds ciphertext that the shared backend credential can read but not decrypt, and a state written without the passphrase is refused. That credential can still delete the state; the apply job's import check then stops instead of creating the zones again. `terragrunt state pull` and `state list` decrypt with the passphrase, as the workflow's steps do.
+
+Losing the passphrase loses the state (the zones would have to be imported again), so keep the 1Password item. A state written before this encryption (an import, say) is refused too: migrate it once, locally, by changing the `state` block to
+
+```hcl
+    method "unencrypted" "migrate" {}
+
+    state {
+      method = method.aes_gcm.state
+      fallback {
+        method = method.unencrypted.migrate
+      }
+    }
+```
+
+running `op run --env-file=bunny.env -- terragrunt apply` (an apply with no changes rewrites the state, now encrypted), and restoring the block. A new passphrase goes the same way, with a second `pbkdf2` key provider and method for the old one as the fallback.
 
 ## The workflow
 
@@ -125,13 +146,14 @@ Work through it in order; the first item comes before the branch merges.
    | --- | --- | --- | --- |
    | `tf_bunny` | `BUNNY_API_KEY` | the Bunny account API key | this unit (`bunny.env`), the sync's purge, the worker's log reader (`deployment/tiles-worker-bunny.env`) |
    | `tf_bunny` | `GLOBALPING_TOKEN` | a Globalping API token | the worker's synthetic probe (`deployment/tiles-worker-bunny.env`) |
+   | `tf_bunny` | `BUNNY_TILES_STATE_PASSPHRASE` | a random passphrase of at least 16 characters (`op item create --vault tf_bunny --category password --title BUNNY_TILES_STATE_PASSPHRASE --generate-password=64,letters,digits`) | this unit's state encryption (`bunny.env`, State encryption above) |
    | `tf_prod` | `BUNNY_STORAGE_PASSWORD` | `immich-tiles`' password (read-write) | Tiles Sync, the watchdog's sample check |
    | `tf_prod` | `BUNNY_STATE_PASSWORD` | `immich-tiles-state`'s password | Tiles Sync, the watchdog |
    | `tf_prod` | `BUNNY_PULL_ZONE_ID` | the `pull_zone_id` output (step 3) | Tiles Sync's purge |
 
-   `BUNNY_PULL_ZONE_ID` is copied by hand rather than read from this unit's state: the sync job writes production and doesn't run OpenTofu or read its state backend. The worker reads it from the state. `O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD` (`tf_prod`) and `tf_state` (`tf`) exist already.
+   `BUNNY_PULL_ZONE_ID` is copied by hand rather than read from this unit's state: the sync job writes production and doesn't run OpenTofu or read its state backend, and only this unit's jobs can decrypt the state. `O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD` (`tf_prod`) and `tf_state` (`tf`) exist already.
 2. **Apply this unit**: import the zones (First run, above), plan, apply. That creates the pull zone, its edge rules, the middleware script and the test hostname.
-3. **Copy `pull_zone_id`** into `tf_prod/BUNNY_PULL_ZONE_ID`. The next Tiles Worker apply on `main` starts the log reader.
+3. **Copy `pull_zone_id`** into `tf_prod/BUNNY_PULL_ZONE_ID` (the sync's purge) and, as `"bunny_pull_zone_id": "<id>"`, into `deployment/modules/cloudflare/tiles-worker/tiles.prod.tfvars.json` (a pull request). Its Tiles Worker run on `main` starts the log reader. Until then the worker applies without it, with the log reader off.
 4. **Test hostname**: a DNS-only CNAME `tiles-bunny.immich.cloud` → the `cdn_domain` output, then add the name to `tls_hostnames` and apply again (Hostnames and the cutover, above).
 5. **Hold scheduled syncs**: set the repository variable `TILES_SYNC_HOLD` (any text, e.g. "first load") before anything is seeded.
 6. **Load and verify the tiles, then adopt them** (Loading the tiles, below).
@@ -151,7 +173,7 @@ One change, made at a quiet hour, after `serve_public_hostname` has been applied
 
 For a Bunny outage (the one on 2026-05-21 took CDN, storage and scripts down for 1.7 hours):
 
-1. Check the Worker still serves current tiles: `curl -s https://tiles.prod.immich.cloud/v1.json` answers, and `pmtiles_deployment_key` in tiles-worker's `tiles.prod.tfvars.json` is recent. Tiles Deploy only runs when dispatched, so after weeks on Bunny that build is weeks old: dispatch Tiles Deploy for prod first when there is time, or accept older tiles for the outage.
+1. Check the Worker still serves current tiles: `curl -s https://tiles.prod.immich.cloud/v1.json` answers, and `pmtiles_deployment_key` in tiles-worker's `tiles.prod.tfvars.json` is recent. Tiles Deploy only runs when dispatched, so after weeks on Bunny that build is weeks old: dispatch Tiles Deploy for prod first when there is time, or accept older tiles for the outage. Tiles Deploy checks the Worker on its own hostname, `tiles.prod.immich.cloud` (`deployment/scripts/tiles-served-key.sh`), so it works while `tiles.immich.cloud` still points at Bunny, which sends no deployment key.
 2. Delete the CNAME and put the Worker's custom domain back: revert the cutover change and apply tiles-worker, or, faster, in the Cloudflare dashboard (delete the `tiles.immich.cloud` record, then add it as a custom domain of the `tiles-prod` Worker). Clients follow within the CNAME's TTL.
 3. Tiles Sync can keep running: it only writes the Bunny zones, which keeps them current for going back. During the outage itself every run fails; set `TILES_SYNC_HOLD` to keep scheduled runs quiet, and clear it after.
 4. Restore the Worker's alerts if the cutover removed them. Cutting over again is the cutover above.
@@ -193,4 +215,4 @@ A Protomaps schema change (Tiles Sync stops with `schema_changed`) or a diff ove
 
 ## Outputs
 
-`pull_zone_id` (`BUNNY_PULL_ZONE_ID` for the purge and the log reader), `cdn_domain` (the zone's own `{name}.b-cdn.net` hostname, the CNAME target), `hostnames`, `storage_zone_id`, `state_zone_id`, `gzip_script_id`. The storage zone passwords stay out of the outputs: the sync reads them from 1Password.
+`pull_zone_id` (`BUNNY_PULL_ZONE_ID` for the purge, and tiles-worker's `bunny_pull_zone_id` for the log reader), `cdn_domain` (the zone's own `{name}.b-cdn.net` hostname, the CNAME target), `hostnames`, `storage_zone_id`, `state_zone_id`, `gzip_script_id`. The storage zone passwords stay out of the outputs (the sync reads them from 1Password), and the state that holds them is encrypted.

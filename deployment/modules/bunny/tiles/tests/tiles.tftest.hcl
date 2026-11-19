@@ -23,6 +23,7 @@ mock_provider "bunnynet" {
 
 variables {
   bunny_api_key       = "not-a-key"
+  state_passphrase    = "not-a-passphrase-for-tests"
   storage_zone_name   = "immich-tiles"
   state_zone_name     = "immich-tiles-state"
   storage_region      = "DE"

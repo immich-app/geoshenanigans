@@ -5,6 +5,13 @@ variable "bunny_api_key" {
   sensitive = true
 }
 
+# The state's encryption passphrase (1Password tf_bunny/BUNNY_TILES_STATE_PASSPHRASE, see bunny.env and encryption.tf),
+# at least 16 characters. Losing it loses the state: keep it, and change it only through a migration (README.md).
+variable "state_passphrase" {
+  type      = string
+  sensitive = true
+}
+
 # The zone holding every tile position as a file, and the private zone with the sync's manifests and state. Both were
 # created by hand and are imported (README.md); a change to the name, region or tier would replace them.
 variable "storage_zone_name" {

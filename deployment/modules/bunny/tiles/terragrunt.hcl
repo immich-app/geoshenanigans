@@ -30,6 +30,9 @@ locals {
   env = get_env("TF_VAR_env", "prod")
 }
 
+# The same backend credential as every other unit, pull requests' plans included, so the state (the storage zones'
+# passwords, the middleware script's deployment key) is encrypted with a passphrase only this unit's jobs read
+# (encryption.tf).
 remote_state {
   backend = "pg"
 
