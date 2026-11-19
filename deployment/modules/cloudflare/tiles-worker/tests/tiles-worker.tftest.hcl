@@ -238,3 +238,47 @@ run "public_url_under_a_path" {
     error_message = "A URL with a path is the probe's public URL."
   }
 }
+
+# The DNS cutover's origin: the TileJSON may name tiles there too until the next sync rewrites it; any other origin
+# fails the probe's TileJSON test (tiles/src/bunny-logs/probe.ts).
+run "probe_cutover_origin" {
+  command = plan
+
+  variables {
+    bunny_probe_cutover_origin = "https://tiles-test.example.com"
+  }
+
+  assert {
+    condition     = contains([for binding in cloudflare_workers_script.tiles.plain_text_binding : "${binding.name}=${binding.text}"], "BUNNY_PROBE_CUTOVER_ORIGIN=https://tiles-test.example.com")
+    error_message = "The worker gets the cutover origin."
+  }
+}
+
+run "probe_without_a_cutover_origin" {
+  command = plan
+
+  assert {
+    condition     = length([for binding in cloudflare_workers_script.tiles.plain_text_binding : binding if binding.name == "BUNNY_PROBE_CUTOVER_ORIGIN"]) == 0
+    error_message = "Without a cutover origin the TileJSON may name the public origin only."
+  }
+}
+
+run "probe_cutover_origin_with_a_path" {
+  command = plan
+
+  variables {
+    bunny_probe_cutover_origin = "https://tiles-test.example.com/v1"
+  }
+
+  expect_failures = [var.bunny_probe_cutover_origin]
+}
+
+run "probe_cutover_origin_bare_hostname" {
+  command = plan
+
+  variables {
+    bunny_probe_cutover_origin = "tiles-test.example.com"
+  }
+
+  expect_failures = [var.bunny_probe_cutover_origin]
+}

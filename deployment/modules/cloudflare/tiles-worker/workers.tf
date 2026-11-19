@@ -70,10 +70,13 @@ resource "cloudflare_workers_script" "tiles" {
   }
 
   dynamic "plain_text_binding" {
-    for_each = local.bunny_probe ? {
-      BUNNY_PUBLIC_URL             = var.bunny_public_url
-      BUNNY_PROBE_INTERVAL_MINUTES = tostring(var.bunny_probe_interval_minutes)
-    } : {}
+    for_each = local.bunny_probe ? merge(
+      {
+        BUNNY_PUBLIC_URL             = var.bunny_public_url
+        BUNNY_PROBE_INTERVAL_MINUTES = tostring(var.bunny_probe_interval_minutes)
+      },
+      var.bunny_probe_cutover_origin == "" ? {} : { BUNNY_PROBE_CUTOVER_ORIGIN = var.bunny_probe_cutover_origin },
+    ) : {}
     content {
       name = plain_text_binding.key
       text = plain_text_binding.value

@@ -1,7 +1,7 @@
 import { createExecutionContext, createScheduledController, env, waitOnExecutionContext } from 'cloudflare:test';
 import worker from '../src';
 import { runBunnyCron } from '../src/bunny-logs';
-import { MAX_PROBE_INTERVAL_MINUTES, probeConfig, probeIntervalMinutes } from '../src/bunny-logs/config';
+import { MAX_PROBE_INTERVAL_MINUTES, ProbeConfig, probeConfig, probeIntervalMinutes } from '../src/bunny-logs/config';
 import { LOGGING_API } from '../src/bunny-logs/log-reader';
 import {
   GLOBALPING_API,
@@ -85,7 +85,7 @@ function globalping({ create, get, tileJson }: Routes) {
 }
 
 // null: no settings.
-async function probe(routes: Routes, probeSettings: typeof config | null = config) {
+async function probe(routes: Routes, probeSettings: ProbeConfig | null = config) {
   const fetchMock = mockFetch(globalping(routes));
   const deps = testDeps(scheduled + 3000, () => 0.25);
   const logger = new O11yLogger(o11y);
@@ -127,6 +127,33 @@ describe('probe settings', () => {
     expect(probeConfig({ GLOBALPING_TOKEN: 'gp-token', BUNNY_PUBLIC_URL: 'https://tiles.example.com' })).toEqual(
       config,
     );
+  });
+
+  it('takes a cutover origin only when it is an http(s) origin alone', () => {
+    const settings = (origin: string) =>
+      probeConfig({
+        GLOBALPING_TOKEN: 'gp-token',
+        BUNNY_PUBLIC_URL: 'https://tiles.example.com',
+        BUNNY_PROBE_CUTOVER_ORIGIN: origin,
+      });
+    expect(settings('https://tiles-test.example.com')).toEqual({
+      ...config,
+      cutoverOrigin: 'https://tiles-test.example.com',
+    });
+    expect(settings(' https://Tiles-Test.example.com:443/ ')?.cutoverOrigin).toBe('https://tiles-test.example.com');
+    expect(settings('http://tiles-test.example.com:8080')?.cutoverOrigin).toBe('http://tiles-test.example.com:8080');
+    for (const origin of [
+      '',
+      'tiles-test.example.com',
+      'ftp://tiles-test.example.com',
+      'https://tiles-test.example.com/v1',
+      'https://tiles-test.example.com/?v=1',
+      'https://user:pass@tiles-test.example.com',
+    ]) {
+      // The probe still runs; only the public origin is allowed.
+      expect(settings(origin)).toEqual(config);
+      expect(settings(origin)).not.toHaveProperty('cutoverOrigin');
+    }
   });
 
   it('runs every 10 minutes unless told otherwise, never more often than every 5 nor less than every 14', () => {
@@ -610,12 +637,15 @@ describe('runProbe', () => {
     });
   });
 
-  it("probes the TileJSON's path on the public origin when the TileJSON names another hostname", async () => {
+  it("probes the TileJSON's path on the public origin when the TileJSON names the cutover origin", async () => {
     // From a DNS cutover until the next sync, the TileJSON on the public hostname still names the test one.
-    const { result, calls } = await probe({
-      tileJson: () => tileJsonOf('https://tiles-test.example.com/v1/e2/{z}/{x}/{y}.mvt'),
-      get: (id) => measurement(id, 'finished', everywhere([])),
-    });
+    const { result, calls } = await probe(
+      {
+        tileJson: () => tileJsonOf('https://tiles-test.example.com/v1/e2/{z}/{x}/{y}.mvt'),
+        get: (id) => measurement(id, 'finished', everywhere([])),
+      },
+      { ...config, cutoverOrigin: 'https://tiles-test.example.com' },
+    );
     expect(result).toBe('ok');
     expect(creates(calls).map(({ body }) => JSON.parse(body))).toEqual([
       expect.objectContaining({
@@ -632,12 +662,34 @@ describe('runProbe', () => {
     expect(pushedLogs(calls)).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          _msg: 'Probe TileJSON names tiles on another origin',
+          _msg: 'Probe TileJSON names tiles on the cutover origin',
           level: 'warn',
           tile_origin: 'https://tiles-test.example.com',
         }),
       ]),
     );
+    expect(metrics(calls)).toContainEqual(tileJsonRead(0));
+  });
+
+  it('fails the TileJSON test, measuring nothing, when it names another origin than the cutover one', async () => {
+    // Clients would load the tiles from there, even if the same paths work on the public origin.
+    const { result, calls } = await probe(
+      { tileJson: () => tileJsonOf('https://tiles-old.example.com/v1/{z}/{x}/{y}.mvt') },
+      { ...config, cutoverOrigin: 'https://tiles-test.example.com' },
+    );
+    expect(result).toBe('error');
+    expect(calls.filter(({ url }) => url.startsWith(GLOBALPING_API))).toEqual([]);
+    expect(metrics(calls)).toEqual([
+      tileJsonRead(1),
+      { name: 'tiles_bunny_probe_runs', labels: { result: 'error' }, value: 1 },
+    ]);
+    expect(pushedLogs(calls)).toEqual([
+      expect.objectContaining({
+        _msg: 'Probe tile URLs unknown',
+        level: 'error',
+        error: expect.stringContaining('https://tiles-old.example.com'),
+      }),
+    ]);
   });
 
   it("probes tiles within a clipped build's zoom range", async () => {
@@ -676,6 +728,8 @@ describe('runProbe', () => {
     ['is no JSON', () => new Response('<html>', { status: 200 })],
     ['has no tile template', () => json({ tilejson: '3.0.0', tiles: [] })],
     ['names tiles with a query', () => tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt?v=20261118')],
+    // Clients follow it there; without a cutover origin configured only the public one is allowed.
+    ['names tiles on another origin', () => tileJsonOf('https://tiles-test.example.com/v1/{z}/{x}/{y}.mvt')],
     [
       'has a minzoom above its maxzoom',
       () => tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt', { minzoom: 9, maxzoom: 4 }),

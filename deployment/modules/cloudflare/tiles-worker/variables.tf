@@ -68,6 +68,21 @@ variable "bunny_public_url" {
   }
 }
 
+# Only while bunny_public_url changes (the DNS cutover, a rollback): the origin the TileJSON on bunny_public_url still
+# names tiles on until the next sync that uploads a build rewrites it, e.g. https://tiles-bunny.immich.cloud at the
+# cutover (deployment/modules/bunny/tiles/README.md, The cutover). The probe fails its TileJSON test on any origin but
+# bunny_public_url's and this one, as clients load the tiles from there: set it in the change that moves
+# bunny_public_url and remove it once a sync has rewritten the TileJSON.
+variable "bunny_probe_cutover_origin" {
+  type    = string
+  default = ""
+
+  validation {
+    condition     = var.bunny_probe_cutover_origin == "" || can(regex("^https?://[A-Za-z0-9][A-Za-z0-9.-]*/?$", var.bunny_probe_cutover_origin))
+    error_message = "bunny_probe_cutover_origin must be empty or an http(s) origin alone, without a port, path, query or fragment, e.g. https://tiles-bunny.immich.cloud."
+  }
+}
+
 # Each probe run is 12 Globalping tests; every 10 minutes is 72 of the 500 free an hour. From 5 (144 an hour) to 14: the
 # probe alerts' 30-minute windows need two runs at all times (o11y/alerts/geoshenanigans-tiles.yaml), and the worker
 # brings any other value into the same range (tiles/src/bunny-logs/config.ts).

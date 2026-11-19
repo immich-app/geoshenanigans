@@ -108,10 +108,9 @@ const basePath = (publicUrl: URL) => publicUrl.pathname.replace(/\/+$/, '');
 
 /**
  * Tile z/x/y's URL from the TileJSON's tile template. Throws unless the template is an absolute http(s) URL under the
- * public URL's path, without a query or fragment, with one each of {z}, {x} and {y}. Its origin can be another of the
- * pull zone's hostnames: from the DNS cutover until the next sync rewrites v1.json, the TileJSON on the public hostname
- * still names the test one (deployment/modules/bunny/tiles/README.md). The probe requests the path from the public
- * origin either way, so a TileJSON never sends Globalping to another host.
+ * public URL's path, without a query or fragment, with one each of {z}, {x} and {y}. Its origin isn't checked here:
+ * runProbe accepts the public URL's and the configured cutover origin (ProbeConfig), and requests the path from the
+ * public origin either way, so a TileJSON never sends Globalping to another host.
  */
 export function tileUrl(publicUrl: URL, template: string, tile: string): URL {
   const shown = JSON.stringify(template.slice(0, 200));
@@ -382,9 +381,10 @@ export function measurementSamples(
  * Probes the hit and miss tiles, at the URLs the TileJSON advertises, from one probe per continent (the miss
  * measurement reuses the hit one's probes, so the two compare like for like), waits for the results and pushes them
  * with the TileJSON read's verdict (TILEJSON_LABELS) and the run's result at the scheduled minute. The run is an error
- * when the TileJSON gives no tile URL (its verdict then a 1, for the critical alert), Globalping refuses or doesn't
- * finish a measurement, or a measurement has no verdict from some continent (no probe there, or its test failed on
- * Globalping's side): that continent's tiles went unmeasured. Never rejects. Without config it pushes only
+ * when the TileJSON gives no tile URL or names tiles on an origin that is neither the public URL's nor the configured
+ * cutover origin (its verdict then a 1, for the critical alert: clients load the tiles from there), Globalping refuses
+ * or doesn't finish a measurement, or a measurement has no verdict from some continent (no probe there, or its test
+ * failed on Globalping's side): that continent's tiles went unmeasured. Never rejects. Without config it pushes only
  * result="skipped".
  */
 export async function runProbe(
@@ -411,9 +411,18 @@ export async function runProbe(
       { kind: 'miss', path: tileUrl(config.publicUrl, live.template, tiles.miss).pathname },
     ];
     if (hit.origin !== config.publicUrl.origin) {
-      // Expected from a DNS cutover until the next sync rewrites the TileJSON (see tileUrl); anything else is worth a
-      // look, as clients load the tiles from there.
-      logger.warn('Probe TileJSON names tiles on another origin', { ...fields, tile_origin: hit.origin.slice(0, 200) });
+      // Clients load the tiles from the origin the TileJSON names, not from the one probed. From a DNS cutover until a
+      // sync rewrites the TileJSON it still names the test hostname, which serves the same zone: that is the cutover
+      // origin, allowed while it is configured, and still logged. Any other origin fails the TileJSON test.
+      if (hit.origin !== config.cutoverOrigin) {
+        throw new Error(
+          `TileJSON names tiles on ${hit.origin.slice(0, 200)}, neither ${config.publicUrl.origin} nor the cutover origin`,
+        );
+      }
+      logger.warn('Probe TileJSON names tiles on the cutover origin', {
+        ...fields,
+        tile_origin: hit.origin.slice(0, 200),
+      });
     }
   } catch (error) {
     // Not the old prefix instead: after a full rewrite that is the retired build, deleted a week later. Clients can't
