@@ -15,6 +15,13 @@
  * --settle-ms is the least wait before DESCRIBEing a file whose PUT failed ambiguously (five times that after a
  * timeout); it is for tests: below the default, a PUT the server finishes late can be sent again with the same bytes,
  * which clears the file's replication.
+ * Re-PUTting identical bytes clears a file's replication, so: a resume waits until PUTs the last run may have left
+ * in flight are past the window in which the server may still commit them (request timeout + 5 x settle, up to about
+ * 70 s after a kill) before it DESCRIBEs its unfinished chunks; a chunk that was not started is checked at 64 spread
+ * positions and runs verified if any is stored already (another seed); and a seed refuses to start while another one
+ * on this machine, with another state dir, covers an overlapping range of the same zone and prefix (claims live in
+ * $XDG_STATE_HOME/bunny-seed, default ~/.local/state/bunny-seed; seeds on other machines are not seen).
+ * Unless the addresses are pinned, the storage host is looked up again every 5 minutes and workers move to the new set.
  * Needs BUNNY_STORAGE_ZONE and BUNNY_STORAGE_PASSWORD, and BUNNY_STORAGE_HOST unless it is storage.bunnycdn.com.
  * Progress goes to stderr every 10 s and to <state dir>/status.json; the final status is printed to stdout as JSON.
  * Exit codes: 0 complete, 1 failed (rerun to repair), 2 bad arguments, 130 stopped by SIGINT/SIGTERM.

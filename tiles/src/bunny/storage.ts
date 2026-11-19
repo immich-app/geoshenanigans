@@ -8,6 +8,7 @@
  *
  * A storage address that keeps failing is set aside for a while (doubling up to a minute) and probed one request at
  * a time: otherwise a server that fails fast would look the least busy and draw most requests and their retries.
+ * setAddresses() moves a long-lived client to the addresses a later lookup returns.
  */
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
@@ -15,6 +16,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { Pool } from 'undici';
 
 export const DEFAULT_STORAGE_HOST = 'storage.bunnycdn.com';
+export const DEFAULT_TIMEOUT_MS = 60_000;
 
 export interface StorageObject {
   /** Uppercase hex SHA-256 of the stored bytes. */
@@ -63,7 +65,7 @@ export interface BunnyStorageOptions {
   addresses?: string[];
   /** Connections to each address at most (default: concurrency spread over the addresses, rounded up). */
   connectionsPerAddress?: number;
-  /** Per request: time to response headers and between body reads (default 60 s). */
+  /** Per request: time to response headers and between body reads (DEFAULT_TIMEOUT_MS). */
   timeoutMs?: number;
   retry?: Partial<RetryOptions>;
   /** Counters to add to; pass one object to several clients to sum them. */
@@ -198,8 +200,10 @@ type Outcome = ({ status: number; body: Buffer } | { error: Error; kind: 'networ
 };
 
 const TIMEOUT_CODES = new Set(['UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'ETIMEDOUT']);
-// undici writes a request only once its connection is up, so these mean nothing was sent.
+// undici writes a request only once its connection is up, so these mean nothing was sent (a closed pool refuses to
+// dispatch at all).
 const CONNECT_CODES = new Set([
+  'UND_ERR_CLOSED',
   'ECONNREFUSED',
   'UND_ERR_CONNECT_TIMEOUT',
   'ENOTFOUND',
@@ -235,6 +239,7 @@ class Semaphore {
 }
 
 interface PinnedPool {
+  address: string;
   pool: Pool;
   active: number;
   /** Failures in a row (connect and network errors, timeouts, 408, 429, 5xx) since the last good answer. */
@@ -256,7 +261,12 @@ export class BunnyStorage {
   private slots: Semaphore;
   // Bunny serves at most 5 concurrent listings per zone.
   private listSlots = new Semaphore(4);
-  private pools?: Promise<PinnedPool[]>;
+  private pools?: PinnedPool[];
+  private connecting?: Promise<PinnedPool[]>;
+  /** Connections per address, fixed by the first address set so a later one keeps every address within its share. */
+  private perPool?: number;
+  /** Pools of addresses dropped by setAddresses(), closing once their requests finish. */
+  private draining = new Set<Promise<void>>();
   private closed = false;
 
   constructor(private options: BunnyStorageOptions) {
@@ -264,7 +274,7 @@ export class BunnyStorage {
     this.password = options.password;
     this.endpoint = parseHost(options.host ?? DEFAULT_STORAGE_HOST);
     this.retry = { ...DEFAULT_RETRY, ...options.retry };
-    this.timeoutMs = options.timeoutMs ?? 60_000;
+    this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.concurrency = Math.max(1, options.concurrency ?? 64);
     this.slots = new Semaphore(this.concurrency);
     this.counters = options.counters ?? newCounters();
@@ -364,10 +374,35 @@ export class BunnyStorage {
     }
   }
 
+  /**
+   * Spreads requests over `addresses` from now on: pools are added for new addresses, and the pools of addresses no
+   * longer listed take no new requests and close once the requests they carry finish. Each new pool gets the same
+   * connection count as the first ones, so no address goes over its share.
+   */
+  async setAddresses(addresses: string[]): Promise<void> {
+    const next = [...new Set(addresses)];
+    if (next.length === 0 || this.closed) {
+      return;
+    }
+    this.options = { ...this.options, addresses: next };
+    await this.connecting?.catch(() => {});
+    if (!this.pools || this.closed) {
+      // The next request connects to the new addresses.
+      return;
+    }
+    const kept = this.pools.filter((pinned) => next.includes(pinned.address));
+    const dropped = this.pools.filter((pinned) => !next.includes(pinned.address));
+    const added = next
+      .filter((address) => !kept.some((pinned) => pinned.address === address))
+      .map((address) => this.createPool(address));
+    this.pools = [...kept, ...added];
+    await Promise.all(dropped.map((pinned) => this.drain(pinned)));
+  }
+
   async close(): Promise<void> {
     this.closed = true;
-    const pools = await this.pools?.catch(() => []);
-    await Promise.all((pools ?? []).map(({ pool }) => pool.close()));
+    await this.connecting?.catch(() => {});
+    await Promise.all([...(this.pools ?? []).map(({ pool }) => pool.close()), ...this.draining]);
   }
 
   private async idempotent(
@@ -440,9 +475,8 @@ export class BunnyStorage {
     if (this.closed) {
       throw new StorageError('Storage client is closed', undefined, true);
     }
-    let pools: PinnedPool[];
     try {
-      pools = await this.connect();
+      await this.connect();
     } catch (error) {
       if (error instanceof StorageError && error.fatal) {
         throw error;
@@ -451,7 +485,8 @@ export class BunnyStorage {
       return { error: error instanceof Error ? error : new Error(String(error)), kind: 'unsent' };
     }
     await this.slots.acquire();
-    const pinned = choosePool(pools, avoid);
+    // Chosen from the current set and dispatched in the same tick, so a pool setAddresses() drops gets no more.
+    const pinned = choosePool(this.pools!, avoid);
     pinned.active++;
     this.counters.requests++;
     const started = performance.now();
@@ -506,45 +541,55 @@ export class BunnyStorage {
     }
   }
 
-  private connect(): Promise<PinnedPool[]> {
+  private async connect(): Promise<PinnedPool[]> {
     if (this.pools) {
       return this.pools;
     }
-    const pools = (async () => {
+    // A failed lookup is not kept: the next request resolves again.
+    this.connecting ??= (async () => {
       const addresses = this.options.addresses?.length
         ? this.options.addresses
         : await resolveStorageAddresses(this.options.host ?? DEFAULT_STORAGE_HOST);
       if (addresses.length === 0) {
         throw new StorageError(`${this.endpoint.hostname} has no addresses`, undefined, true);
       }
-      const { protocol, port, hostname } = this.endpoint;
-      const perPool = Math.max(1, this.options.connectionsPerAddress ?? Math.ceil(this.concurrency / addresses.length));
-      return addresses.map((address) => {
-        const ip = isIP(address) === 6 ? `[${address}]` : address;
-        const pool = new Pool(`${protocol}//${ip}:${port}`, {
-          connections: perPool,
-          pipelining: 1,
-          allowH2: false,
-          keepAliveTimeout: 30_000,
-          keepAliveMaxTimeout: 60_000,
-          headersTimeout: this.timeoutMs,
-          bodyTimeout: this.timeoutMs,
-          connect: {
-            timeout: Math.min(this.timeoutMs, 15_000),
-            ...(protocol === 'https:' && !isIP(hostname) ? { servername: hostname } : {}),
-          },
-        });
-        return { pool, active: 0, failures: 0, trips: 0, downUntil: 0 };
-      });
-    })();
-    // A failed lookup is not kept: the next request resolves again.
-    this.pools = pools;
-    pools.catch(() => {
-      if (this.pools === pools) {
-        this.pools = undefined;
-      }
+      this.perPool ??= Math.max(
+        1,
+        this.options.connectionsPerAddress ?? Math.ceil(this.concurrency / addresses.length),
+      );
+      // Addresses given to setAddresses() while the lookup ran win over the lookup.
+      const chosen = this.options.addresses?.length ? this.options.addresses : addresses;
+      this.pools = [...new Set(chosen)].map((address) => this.createPool(address));
+      return this.pools;
+    })().finally(() => {
+      this.connecting = undefined;
     });
-    return pools;
+    return this.connecting;
+  }
+
+  private createPool(address: string): PinnedPool {
+    const { protocol, port, hostname } = this.endpoint;
+    const ip = isIP(address) === 6 ? `[${address}]` : address;
+    const pool = new Pool(`${protocol}//${ip}:${port}`, {
+      connections: this.perPool,
+      pipelining: 1,
+      allowH2: false,
+      keepAliveTimeout: 30_000,
+      keepAliveMaxTimeout: 60_000,
+      headersTimeout: this.timeoutMs,
+      bodyTimeout: this.timeoutMs,
+      connect: {
+        timeout: Math.min(this.timeoutMs, 15_000),
+        ...(protocol === 'https:' && !isIP(hostname) ? { servername: hostname } : {}),
+      },
+    });
+    return { address, pool, active: 0, failures: 0, trips: 0, downUntil: 0 };
+  }
+
+  private drain(pinned: PinnedPool): Promise<void> {
+    const closing = pinned.pool.close().finally(() => this.draining.delete(closing));
+    this.draining.add(closing);
+    return closing;
   }
 }
 

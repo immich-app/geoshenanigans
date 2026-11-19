@@ -5,15 +5,19 @@
 import { createHash } from 'node:crypto';
 import { FileHandle, mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import { ArchiveRanges } from './archive-walk';
 import { forEachLimit } from './replication';
+import { claimRange, defaultClaimsDir, isAlive } from './seed-claims';
 import {
   addCounters,
   BunnyStorage,
   BunnyStorageOptions,
+  DEFAULT_RETRY,
+  DEFAULT_TIMEOUT_MS,
   newCounters,
   resolveStorageAddresses,
   StorageCounters,
@@ -193,6 +197,8 @@ const CHECKPOINT_LINE = /^(start|done) (\d+)$/;
  */
 export class Checkpoint {
   private writes: Promise<void> = Promise.resolve();
+  /** Set by a failed append, which may have left part of a line: a later line would join it into one bad line. */
+  private failed?: Error;
 
   private constructor(
     private handle: FileHandle,
@@ -283,8 +289,25 @@ export class Checkpoint {
 
   private append(text: string): Promise<void> {
     const write = this.writes.then(async () => {
-      await this.handle.write(text);
-      await this.handle.sync();
+      if (this.failed) {
+        throw new Error(`checkpoint.log takes no more lines: an earlier write failed (${this.failed.message})`);
+      }
+      try {
+        // One write(2) may take part of the bytes (a nearly full disk); the line counts only once all of it is out.
+        const bytes = Buffer.from(text);
+        for (let done = 0; done < bytes.length;) {
+          const { bytesWritten } = await this.handle.write(bytes, done, bytes.length - done);
+          if (bytesWritten <= 0) {
+            throw new Error('write took no bytes');
+          }
+          done += bytesWritten;
+        }
+        await this.handle.sync();
+      } catch (error) {
+        // The next open drops the torn last line.
+        this.failed = error instanceof Error ? error : new Error(String(error));
+        throw this.failed;
+      }
     });
     this.writes = write.catch(() => {});
     return write;
@@ -310,15 +333,6 @@ async function lock(dir: string): Promise<string> {
     await rm(path, { force: true });
   }
   throw new Error(`Could not take the lock in ${dir}`);
-}
-
-function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === 'EPERM';
-  }
 }
 
 async function readIfExists(path: string): Promise<string | undefined> {
@@ -410,6 +424,12 @@ export interface SeedOptions {
   progressIntervalMs?: number;
   signal?: AbortSignal;
   log?: (line: string) => void;
+  /** Where seeds on this machine record the ranges they are seeding (default: defaultClaimsDir()). */
+  claimsDir?: string;
+  /** How often the storage host is looked up again, unless storage.addresses pins them (default 5 min). */
+  addressRefreshMs?: number;
+  /** Looks up the storage host's addresses (default: resolveStorageAddresses). */
+  resolveAddresses?: (host?: string) => Promise<string[]>;
 }
 
 export type SeedState = 'running' | 'stopping' | 'complete' | 'failed' | 'interrupted';
@@ -425,7 +445,8 @@ export interface SeedStatus {
   workers: number;
   /** Requests in flight at most: --concurrency, lowered to what the addresses' connection cap allows. */
   concurrency: number;
-  chunks: { total: number; done: number; previouslyDone: number; active: number; failed: number };
+  /** `overlapping`: chunks found partly stored already with the same bytes (another seed), so verified. */
+  chunks: { total: number; done: number; previouslyDone: number; active: number; failed: number; overlapping: number };
   files: {
     total: number;
     done: number;
@@ -442,6 +463,14 @@ export interface SeedStatus {
   etaSeconds: number | null;
   current: { tileId: number; zoom: number } | null;
   memory: { rssBytes: number; peakRssBytes: number };
+  /** The storage addresses requests go to. */
+  addresses: string[];
+  /**
+   * When every PUT this run sent, up to its next status write, is past the window in which the server may still
+   * commit it (request timeout + 5 x settle). A resume waits for it before DESCRIBEing unfinished chunks, so it reads
+   * what such a late commit stored instead of "missing" (and PUTting the same bytes again).
+   */
+  settleBy: string;
   failuresFile: string;
   error: string | null;
 }
@@ -464,12 +493,18 @@ export type WorkerMessage =
   | { type: 'progress'; stats: UploadStats; counters: StorageCounters; inFlight: number }
   /** Every position of the chunk was handed to the uploader; some may still be in flight. */
   | { type: 'chunk-emitted'; chunkId: number }
+  /** Sampled positions of a chunk that was not started were stored already (`reason`), so it runs verified. */
+  | { type: 'chunk-overlap'; chunkId: number; reason: string }
   | { type: 'chunk-done'; chunkId: number; failures: UploadFailure[] }
   | { type: 'chunk-stopped'; chunkId: number }
   | { type: 'fatal'; error: string }
   | { type: 'final'; stats: UploadStats; counters: StorageCounters };
 
-export type MainMessage = { type: 'chunk'; chunk: ChunkDescriptor } | { type: 'end' } | { type: 'stop' };
+export type MainMessage =
+  | { type: 'chunk'; chunk: ChunkDescriptor }
+  | { type: 'addresses'; addresses: string[] }
+  | { type: 'end' }
+  | { type: 'stop' };
 
 /**
  * Chunks a worker holds that still have positions to hand out: the one it is on and one queued, so the next starts
@@ -484,6 +519,12 @@ const PREFLIGHT_HEAD = 24;
 const PREFLIGHT_MAX_SAMPLES = 16_384;
 const PREFLIGHT_MAX_CHUNK_STARTS = 65_536;
 const PREFLIGHT_CONCURRENCY = 128;
+/** Positions DESCRIBEd before a chunk that was not started goes out: 0.1% of a 65,536-position chunk. */
+export const CHUNK_PROBE_SAMPLES = 64;
+const DEFAULT_ADDRESS_REFRESH_MS = 5 * 60_000;
+/** Longest a resume waits for the previous run's PUTs to settle, whatever its status.json says. */
+const MAX_SETTLE_WAIT_MS = 15 * 60_000;
+const OVERLAP_LOG_LINES = 20;
 
 interface WorkerSlot {
   worker: Worker;
@@ -509,20 +550,34 @@ export async function runSeed(options: SeedOptions): Promise<SeedResult> {
   }
   const ranges = await ArchiveRanges.open(options.archivePath);
   let checkpoint: Checkpoint | undefined;
+  let unclaim: (() => Promise<void>) | undefined;
   try {
+    const host = storageOrigin(options.storage.host);
     checkpoint = await Checkpoint.open(stateDir, {
       zone: options.storage.zone,
-      host: storageOrigin(options.storage.host),
+      host,
       prefix,
       from,
       to,
       chunkSize,
       archive: { size: ranges.size, fingerprint: ranges.fingerprint },
     });
+    unclaim = await claimRange(options.claimsDir ?? defaultClaimsDir(), {
+      stateDir: resolve(stateDir),
+      zone: options.storage.zone,
+      host,
+      prefix,
+      from,
+      to,
+    });
     const addresses = options.storage.addresses?.length
       ? options.storage.addresses
-      : await resolveStorageAddresses(options.storage.host);
+      : await (options.resolveAddresses ?? resolveStorageAddresses)(options.storage.host);
     const storageOptions = { ...options.storage, addresses };
+    const unfinished = [...checkpoint.started].filter((id) => !checkpoint!.done.has(id)).length;
+    if (unfinished > 0) {
+      await settlePrevious(options, unfinished, log);
+    }
     const perAddress = Math.max(1, options.maxConnectionsPerAddress ?? DEFAULT_MAX_CONNECTIONS_PER_ADDRESS);
     if (checkpoint.fresh && !options.verifyExisting) {
       const ids = preflightIds(from, to, chunkSize);
@@ -536,8 +591,38 @@ export async function runSeed(options: SeedOptions): Promise<SeedResult> {
     }
     return await new SeedRun(options, ranges, checkpoint, storageOptions, log).run();
   } finally {
+    await unclaim?.();
     await checkpoint?.close();
     await ranges.close();
+  }
+}
+
+/** Request timeout + 5 x settle: how long after sending a PUT put() itself allows the server to commit it. */
+function commitWindowMs(options: SeedOptions): number {
+  const timeoutMs = options.storage.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  return timeoutMs + 5 * (options.storage.retry?.settleMs ?? DEFAULT_RETRY.settleMs);
+}
+
+/**
+ * A run that was stopped or killed may have left PUTs the server commits after it is gone (put() would have waited
+ * for them before its DESCRIBE). Verifying their chunks before then reads "missing" and PUTs the same bytes a second
+ * time, so a resume first waits for the `settleBy` the previous run recorded (the full window from now if unknown).
+ */
+async function settlePrevious(options: SeedOptions, unfinished: number, log: (line: string) => void) {
+  const previous = await readFile(join(options.stateDir, 'status.json'), 'utf8')
+    .then((text) => JSON.parse(text) as Partial<SeedStatus>)
+    .catch(() => undefined);
+  const recorded = Date.parse(previous?.settleBy ?? '');
+  const now = Date.now();
+  const until = Number.isFinite(recorded)
+    ? Math.min(recorded, now + MAX_SETTLE_WAIT_MS)
+    : now + (options.progressIntervalMs ?? 10_000) + commitWindowMs(options);
+  if (until > now && !options.signal?.aborted) {
+    log(
+      `Waiting ${Math.ceil((until - now) / 1000)} s before verifying the ${unfinished} chunks the last run left ` +
+        'unfinished: PUTs it had in flight may still be committed',
+    );
+    await sleep(until - now, undefined, { signal: options.signal }).catch(() => {});
   }
 }
 
@@ -563,6 +648,19 @@ export function preflightIds(from: number, to: number, chunkSize: number): numbe
   }
   ids.add(to - 1);
   return [...ids].sort((a, b) => a - b);
+}
+
+/**
+ * The positions DESCRIBEd before a chunk that was not started goes out: its first and last and an even spread between,
+ * `samples` in all. Another seed that stored part of the chunk shows up there unless its part is shorter than
+ * (end - start) / samples and touches neither end.
+ */
+export function chunkProbeIds(start: number, end: number, samples = CHUNK_PROBE_SAMPLES): number[] {
+  const length = end - start;
+  if (length <= samples) {
+    return Array.from({ length }, (_, i) => start + i);
+  }
+  return Array.from({ length: samples }, (_, i) => start + Math.round((i * (length - 1)) / (samples - 1)));
 }
 
 /**
@@ -639,6 +737,12 @@ class SeedRun {
   private failuresFile: string;
   private totalFailed = 0;
   private concurrency: number;
+  private overlapping = 0;
+  /** The workers' shares of requests in flight add up to this, whatever the addresses. */
+  private maxInFlight = 1;
+  private addresses: string[];
+  private lookingUp = false;
+  private lookupFailing = false;
 
   constructor(
     private options: SeedOptions,
@@ -659,17 +763,23 @@ class SeedRun {
     }
     this.failuresFile = join(options.stateDir, 'failures.jsonl');
     this.concurrency = options.concurrency;
+    this.addresses = [...(storageOptions.addresses ?? [])];
+  }
+
+  private get perAddress(): number {
+    return Math.max(1, this.options.maxConnectionsPerAddress ?? DEFAULT_MAX_CONNECTIONS_PER_ADDRESS);
   }
 
   async run(): Promise<SeedResult> {
     const { options } = this;
     const remaining = this.totalChunks - this.previouslyDone;
-    const addresses = this.storageOptions.addresses?.length ?? 1;
-    const perAddress = Math.max(1, options.maxConnectionsPerAddress ?? DEFAULT_MAX_CONNECTIONS_PER_ADDRESS);
+    const addresses = Math.max(1, this.addresses.length);
+    const { perAddress } = this;
     const total = Math.max(1, Math.min(options.concurrency, addresses * perAddress));
     // Every worker needs a connection to each address, and at least one request of the total.
     const workers = Math.max(1, Math.min(options.workers, remaining, total, perAddress));
     this.concurrency = total;
+    this.maxInFlight = total;
     const onAbort = () => this.stop('interrupted');
     options.signal?.addEventListener('abort', onAbort);
     if (options.signal?.aborted) {
@@ -687,8 +797,14 @@ class SeedRun {
         `${addresses} storage addresses`,
     );
 
+    // On disk before any chunk starts, so a resume after a kill knows how long to wait (settleBy).
+    await this.report('running', false);
     const progressTimer = setInterval(() => void this.report('running'), options.progressIntervalMs ?? 10_000);
     const sampleTimer = setInterval(() => this.sample(), 1_000);
+    // Bunny's storage host has several addresses (300 s TTL) and a multi-day seed outlives them.
+    const lookupTimer = this.options.storage.addresses?.length
+      ? undefined
+      : setInterval(() => void this.lookUpAddresses(), options.addressRefreshMs ?? DEFAULT_ADDRESS_REFRESH_MS);
     try {
       if (remaining > 0 && !this.stopping) {
         const { path, execArgv } = workerEntry();
@@ -708,6 +824,7 @@ class SeedRun {
     } finally {
       clearInterval(progressTimer);
       clearInterval(sampleTimer);
+      clearInterval(lookupTimer);
       options.signal?.removeEventListener('abort', onAbort);
       await this.failuresWritten;
     }
@@ -772,6 +889,14 @@ class SeedRun {
         slot.emitting.delete(message.chunkId);
         this.wakeFeeder?.();
         return;
+      case 'chunk-overlap':
+        if (++this.overlapping <= OVERLAP_LOG_LINES) {
+          this.log(
+            `Chunk ${message.chunkId}: ${message.reason}; verifying it (DESCRIBE before every PUT)` +
+              (this.overlapping === OVERLAP_LOG_LINES ? '; further such chunks are only counted in status.json' : ''),
+          );
+        }
+        return;
       case 'chunk-done':
         slot.outstanding.delete(message.chunkId);
         slot.emitting.delete(message.chunkId);
@@ -809,9 +934,13 @@ class SeedRun {
       }
     }
     const lines = failures.map((failure) => JSON.stringify({ chunkId, ...failure, at: new Date().toISOString() }));
-    this.failuresWritten = this.failuresWritten.then(() =>
-      writeFile(this.failuresFile, lines.join('\n') + '\n', { flag: 'a' }),
-    );
+    this.failuresWritten = this.failuresWritten
+      .then(() => writeFile(this.failuresFile, lines.join('\n') + '\n', { flag: 'a' }))
+      .catch((error: Error) => {
+        // The state dir is no longer writable (the checkpoint is next): stop the normal way, with the reason.
+        this.error ??= `could not write ${this.failuresFile}: ${error.message}`;
+        this.stop('failed');
+      });
     if (this.totalFailed >= (this.options.maxFailures ?? 1000)) {
       this.error ??= `${this.totalFailed} files failed; stopping`;
       this.stop('failed');
@@ -831,6 +960,43 @@ class SeedRun {
       slot.worker.postMessage({ type: 'stop' } satisfies MainMessage);
     }
     this.wakeFeeder?.();
+  }
+
+  /** Looks the storage host up again and moves the workers to the new address set if it changed. */
+  private async lookUpAddresses() {
+    if (this.lookingUp || this.stopping) {
+      return;
+    }
+    this.lookingUp = true;
+    try {
+      const found = [
+        ...new Set(await (this.options.resolveAddresses ?? resolveStorageAddresses)(this.options.storage.host)),
+      ].sort();
+      this.lookupFailing = false;
+      const added = found.filter((address) => !this.addresses.includes(address));
+      const removed = this.addresses.filter((address) => !found.includes(address));
+      if (found.length === 0 || (added.length === 0 && removed.length === 0) || this.stopping) {
+        return;
+      }
+      this.addresses = found;
+      this.concurrency = Math.max(1, Math.min(this.maxInFlight, found.length * this.perAddress));
+      this.log(
+        `Storage addresses changed: added ${added.join(', ') || 'none'}, removed ${removed.join(', ') || 'none'}; ` +
+          `now ${found.length}`,
+      );
+      for (const slot of this.slots) {
+        if (!slot.dead) {
+          slot.worker.postMessage({ type: 'addresses', addresses: found } satisfies MainMessage);
+        }
+      }
+    } catch (error) {
+      if (!this.lookupFailing) {
+        this.log(`Could not look up the storage host again (${(error as Error).message}); keeping its addresses`);
+      }
+      this.lookupFailing = true;
+    } finally {
+      this.lookingUp = false;
+    }
   }
 
   /** Hands chunks to workers in tile-id order, each recorded as started (on disk) before it is sent. */
@@ -910,7 +1076,7 @@ class SeedRun {
     }
   }
 
-  private async report(state: SeedState): Promise<SeedStatus> {
+  private async report(state: SeedState, print = true): Promise<SeedStatus> {
     const { options } = this;
     const { stats, counters, inFlight } = this.totals();
     const done = stats.uploaded + stats.skippedExisting;
@@ -939,6 +1105,7 @@ class SeedRun {
         previouslyDone: this.previouslyDone,
         active: this.chunkStarts.size,
         failed: this.failedChunks,
+        overlapping: this.overlapping,
       },
       files: {
         total,
@@ -956,10 +1123,15 @@ class SeedRun {
       etaSeconds: oneMinute > 0 && left > 0 ? Math.round(left / oneMinute) : left <= 0 ? 0 : null,
       current: current === null ? null : { tileId: current, zoom: tileIdZoom(current) },
       memory: { rssBytes: memory.rss, peakRssBytes: process.resourceUsage().maxRSS * 1024 },
+      addresses: this.addresses,
+      // While running, PUTs go out until the next status write (allowed one interval late); once ended, none after.
+      settleBy: new Date(
+        Date.now() + (state === 'running' ? 2 * (options.progressIntervalMs ?? 10_000) : 0) + commitWindowMs(options),
+      ).toISOString(),
       failuresFile: this.failuresFile,
       error: this.error,
     };
-    if (state === 'running') {
+    if (state === 'running' && print) {
       this.log(formatProgress(status));
     }
     await writeAtomic(join(options.stateDir, 'status.json'), JSON.stringify(status, null, 2) + '\n').catch(

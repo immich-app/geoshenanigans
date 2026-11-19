@@ -3,12 +3,18 @@
  * pread (once per run, small repeated tiles such as the ocean once per worker), and uploads every position of the
  * run through its own storage client. Reports when every position of a chunk was handed out (so the main thread
  * sends the next one even while a few slow files of it are in flight) and when every position in it is stored.
+ *
+ * A chunk this seed never started may still hold files another seed (another state dir) stored, and PUTting their
+ * bytes again would clear their replication, so a few of its positions are DESCRIBEd as soon as it arrives; if any
+ * already holds its bytes, the whole chunk runs verified.
  */
 import { closeSync, openSync, readSync } from 'node:fs';
 import { parentPort, workerData } from 'node:worker_threads';
 import { BunnyStorage, StorageCounters } from './storage';
+import { tilePath } from './tile-id';
 import {
   ChunkDescriptor,
+  chunkProbeIds,
   MainMessage,
   newUploadStats,
   sha256Hex,
@@ -70,12 +76,21 @@ function content(offset: number, length: number): { bytes: Uint8Array; sha256: s
 const queue: ChunkDescriptor[] = [];
 const states = new Map<number, ChunkState>();
 const stop = new AbortController();
+// The stop also ends retry back-offs, so a stop is not held up by a file waiting out 429s.
+const storage = new BunnyStorage({ ...config.storage, signal: stop.signal });
+/** Per chunk that was not started: why it must run verified, or undefined if nothing of it is stored. */
+const probes = new Map<number, Promise<string | undefined>>();
 let ended = false;
 let wake: (() => void) | undefined;
 
 port.on('message', (message: MainMessage) => {
   if (message.type === 'chunk') {
     queue.push(message.chunk);
+    if (!message.chunk.verify) {
+      probes.set(message.chunk.chunkId, probe(message.chunk));
+    }
+  } else if (message.type === 'addresses') {
+    void storage.setAddresses(message.addresses);
   } else if (message.type === 'end') {
     ended = true;
   } else {
@@ -83,6 +98,47 @@ port.on('message', (message: MainMessage) => {
   }
   wake?.();
 });
+
+/** The run of `runs` (tileId, runLength, offset, length per run) holding `tileId`. */
+function runAt(runs: Float64Array, tileId: number): { offset: number; length: number } | undefined {
+  let lo = 0;
+  let hi = runs.length / 4 - 1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    const start = runs[mid * 4];
+    if (tileId < start) {
+      hi = mid - 1;
+    } else if (tileId >= start + runs[mid * 4 + 1]) {
+      lo = mid + 1;
+    } else {
+      return { offset: runs[mid * 4 + 2], length: runs[mid * 4 + 3] };
+    }
+  }
+  return undefined;
+}
+
+async function probe(chunk: ChunkDescriptor): Promise<string | undefined> {
+  let reason: string | undefined;
+  await Promise.all(
+    chunkProbeIds(chunk.start, chunk.end).map(async (tileId) => {
+      const run = runAt(chunk.runs, tileId);
+      if (!run) {
+        return;
+      }
+      const path = tilePath(config.prefix, tileId);
+      try {
+        const stored = await storage.describe(path);
+        if (stored && stored.checksum === content(run.offset, run.length).sha256) {
+          reason ??= `${path} is already stored with the same bytes`;
+        }
+      } catch (error) {
+        // Unknown is treated as stored.
+        reason ??= `could not DESCRIBE ${path} (${error instanceof Error ? error.message : String(error)})`;
+      }
+    }),
+  );
+  return reason;
+}
 
 function finish(state: ChunkState) {
   if (!state.reported && state.emittedAll && state.settled === state.emitted) {
@@ -113,6 +169,12 @@ async function* items(): AsyncGenerator<SeedItem> {
       failures: [],
     };
     states.set(chunk.chunkId, state);
+    const overlap = await probes.get(chunk.chunkId);
+    probes.delete(chunk.chunkId);
+    if (overlap !== undefined) {
+      chunk.verify = true;
+      post({ type: 'chunk-overlap', chunkId: chunk.chunkId, reason: overlap });
+    }
     const { runs } = chunk;
     for (let i = 0; i < runs.length; i += 4) {
       const [tileId, runLength, offset, length] = [runs[i], runs[i + 1], runs[i + 2], runs[i + 3]];
@@ -132,8 +194,6 @@ async function* items(): AsyncGenerator<SeedItem> {
 }
 
 async function main() {
-  // The stop also ends retry back-offs, so a stop is not held up by a file waiting out 429s.
-  const storage = new BunnyStorage({ ...config.storage, signal: stop.signal });
   const stats = newUploadStats();
   const snapshot = (): { stats: typeof stats; counters: StorageCounters } => ({
     stats: { ...stats, failures: [] },
@@ -166,6 +226,7 @@ async function main() {
     post({ type: 'fatal', error: error instanceof Error ? error.message : String(error) });
   } finally {
     clearInterval(progress);
+    await Promise.all(probes.values());
     // Whatever was not finished stays "started" in the checkpoint, so a resume verifies it.
     for (const state of states.values()) {
       if (!state.reported) {

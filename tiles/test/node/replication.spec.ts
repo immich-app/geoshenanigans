@@ -180,6 +180,7 @@ describe('bunny:replication CLI', () => {
       workers: 2,
       concurrency: 16,
       stateDir: join(scratch.dir, 'state'),
+      claimsDir: join(scratch.dir, 'claims'),
       verifyExisting: false,
       storage: { zone: fake.zone, password: fake.password, host: fake.url, retry: fast },
       log: () => {},

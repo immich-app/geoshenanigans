@@ -1,10 +1,18 @@
-import { appendFile, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, FileHandle, open, readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ArchiveRanges } from '../../src/bunny/archive-walk';
 import { BunnyStorage } from '../../src/bunny/storage';
 import { tilePath } from '../../src/bunny/tile-id';
-import { Checkpoint, planChunks, SeedParams, UploadItem, uploadTiles } from '../../src/bunny/upload';
+import {
+  Checkpoint,
+  chunkProbeIds,
+  planChunks,
+  preflightIds,
+  SeedParams,
+  UploadItem,
+  uploadTiles,
+} from '../../src/bunny/upload';
 import { FakeStorage, FakeStorageOptions, Fault, sha256Hex } from './fake-storage';
 import { random, scratchDir, writeFixtureArchive } from './upload-fixture';
 
@@ -233,6 +241,58 @@ describe('Checkpoint', () => {
     expect(await readFile(join(dir, 'checkpoint.log'), 'utf8')).toBe('start 4\nstart 12\n');
   });
 
+  /** Makes FileHandle.write take at most `limit(call)` bytes per call (a string counts as its UTF-8 bytes). */
+  async function shortWrites(limit: (call: number) => number | Error) {
+    const handle = await open(join(dir, 'probe'), 'w');
+    await handle.close();
+    const prototype = Object.getPrototypeOf(handle) as FileHandle;
+    const write = prototype.write as (...args: unknown[]) => ReturnType<FileHandle['write']>;
+    let calls = 0;
+    const spy = vi.spyOn(prototype, 'write').mockImplementation(function (this: FileHandle, ...args: unknown[]) {
+      const data = typeof args[0] === 'string' ? Buffer.from(args[0]) : (args[0] as Uint8Array);
+      const offset = typeof args[0] === 'string' ? 0 : ((args[1] as number | undefined) ?? 0);
+      const length =
+        typeof args[0] === 'string' ? data.length : ((args[2] as number | undefined) ?? data.length - offset);
+      const take = limit(++calls);
+      if (take instanceof Error) {
+        return Promise.reject(take);
+      }
+      return write.call(this, data, offset, Math.min(take, length));
+    });
+    cleanup.push(async () => spy.mockRestore());
+    return spy;
+  }
+
+  it('finishes a line the disk took only part of', async () => {
+    const checkpoint = await Checkpoint.open(dir, params);
+    // The first write(2) takes 7 bytes only, as on a nearly full disk; the rest goes in later calls.
+    const spy = await shortWrites((call) => (call === 1 ? 7 : Infinity));
+    await checkpoint.markStarted([123]);
+    spy.mockRestore();
+    await checkpoint.markDone(98);
+    await checkpoint.close();
+    expect(await readFile(join(dir, 'checkpoint.log'), 'utf8')).toBe('start 123\ndone 98\n');
+  });
+
+  it('rejects an append that only got part of its line out, and writes nothing after it', async () => {
+    const checkpoint = await Checkpoint.open(dir, params);
+    await checkpoint.markStarted([1]);
+    const spy = await shortWrites((call) =>
+      call === 1 ? 7 : Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' }),
+    );
+    await expect(checkpoint.markStarted([123])).rejects.toThrow(/ENOSPC/);
+    spy.mockRestore();
+    // The disk has room again, but a line after the torn one would join it into one unreadable line.
+    await expect(checkpoint.markDone(1)).rejects.toThrow(/earlier write failed/);
+    await checkpoint.close();
+    expect(await readFile(join(dir, 'checkpoint.log'), 'utf8')).toBe('start 1\nstart 1');
+
+    const reopened = await Checkpoint.open(dir, params);
+    expect([...reopened.started]).toEqual([1]);
+    expect(reopened.done.size).toBe(0);
+    await reopened.close();
+  });
+
   it('refuses a state dir another live process holds, and takes over a stale lock', async () => {
     await writeFile(join(dir, 'seed.lock'), `${process.ppid}\n`);
     await expect(Checkpoint.open(dir, params)).rejects.toThrow(/in use by process/);
@@ -265,6 +325,77 @@ describe('Checkpoint', () => {
   it('refuses a checkpoint log without the seed.json that says what it is for', async () => {
     await writeFile(join(dir, 'checkpoint.log'), 'start 0\ndone 0\n');
     await expect(Checkpoint.open(dir, params)).rejects.toThrow(/seed\.json is missing/);
+  });
+});
+
+describe('preflightIds', () => {
+  const PLANET = 1_431_655_765;
+
+  function check(from: number, to: number, chunkSize: number) {
+    const ids = preflightIds(from, to, chunkSize);
+    expect(ids).toEqual([...new Set(ids)].sort((a, b) => a - b));
+    expect(ids[0]).toBe(from);
+    expect(ids.at(-1)).toBe(to - 1);
+    const set = new Set(ids);
+    let missingStarts = 0;
+    for (let id = Math.ceil(from / chunkSize) * chunkSize; id < to; id += chunkSize) {
+      missingStarts += set.has(id) ? 0 : 1;
+    }
+    expect(missingStarts).toBe(0);
+    for (let id = from; id < Math.min(to, from + 24); id++) {
+      expect(set.has(id)).toBe(true);
+    }
+    const stride = Math.ceil((to - from) / 16_384);
+    let widest = 0;
+    for (let i = 1; i < ids.length; i++) {
+      widest = Math.max(widest, ids[i] - ids[i - 1]);
+    }
+    expect(widest).toBeLessThanOrEqual(stride);
+    expect(ids.length).toBeLessThanOrEqual(24 + Math.ceil((to - from) / chunkSize) + 16_384 + 2);
+    return ids;
+  }
+
+  it('checks every chunk start, the head, the last id and an even spread at planet scale', () => {
+    const ids = check(0, PLANET, 65_536);
+    // 21,846 chunk starts and 16,384 spread samples (stride 87,382), a few shared.
+    expect(ids.length).toBeGreaterThan(21_846 + 16_000);
+  });
+
+  it('checks the chunk starts of a range that begins and ends inside chunks', () => {
+    // z15 alone: 357,913,941 is not a multiple of 65,536.
+    check(357_913_941, PLANET, 65_536);
+    check(1_000_000, 1_001_000, 65_536);
+  });
+
+  it('falls back to the spread samples when there are too many chunks to check each start', () => {
+    const ids = preflightIds(0, PLANET, 1_000);
+    expect(ids.length).toBeLessThanOrEqual(24 + 16_384 + 2);
+  });
+});
+
+describe('chunkProbeIds', () => {
+  it('samples the first and last position and an even spread between', () => {
+    const ids = chunkProbeIds(65_536, 131_072, 64);
+    expect(ids).toHaveLength(64);
+    expect(ids[0]).toBe(65_536);
+    expect(ids.at(-1)).toBe(131_071);
+    expect(ids).toEqual([...new Set(ids)].sort((a, b) => a - b));
+    for (let i = 1; i < ids.length; i++) {
+      expect(ids[i] - ids[i - 1]).toBeLessThanOrEqual(Math.ceil(65_535 / 63));
+    }
+  });
+
+  it('catches a 1,000-position slice inside a planet chunk that no preflight sample reaches', () => {
+    // --from-id 1000000 --to-id 1001000 lies inside chunk 15 = [983,040, 1,048,576): no chunk start, and between
+    // the preflight's spread samples (stride 87,382).
+    const slice = (id: number) => id >= 1_000_000 && id < 1_001_000;
+    expect(preflightIds(0, 1_431_655_765, 65_536).some(slice)).toBe(false);
+    expect(chunkProbeIds(983_040, 1_048_576).some(slice)).toBe(true);
+  });
+
+  it('takes every position of a chunk smaller than the sample', () => {
+    expect(chunkProbeIds(10, 15, 64)).toEqual([10, 11, 12, 13, 14]);
+    expect(chunkProbeIds(7, 8, 64)).toEqual([7]);
   });
 });
 

@@ -176,6 +176,39 @@ describe('BunnyStorage', () => {
     expect([...fake.hostHeaders]).toEqual([`storage.example.test:${fake.port}`]);
   });
 
+  it('moves to a new address set: new requests go to the new addresses, requests in flight on the old ones finish', async () => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const fake = await FakeStorage.start({
+      addresses: ['127.0.0.1', '127.0.0.2', '127.0.0.3'],
+      hold: ({ path }) => (path === 'held.mvt' ? held : undefined),
+    });
+    fakes.push(fake);
+    const storage = new BunnyStorage({
+      zone: fake.zone,
+      password: fake.password,
+      host: `http://storage.example.test:${fake.port}`,
+      addresses: ['127.0.0.1'],
+      concurrency: 4,
+      retry: fast,
+    });
+    clients.push(storage);
+    const put = (name: string) => storage.put(name, bytes(name), sha256Hex(bytes(name)));
+    const inFlight = put('held.mvt');
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(fake.requestsByAddress.get('127.0.0.1')).toBe(1);
+
+    const moved = storage.setAddresses(['127.0.0.2', '127.0.0.3']);
+    await Promise.all(Array.from({ length: 20 }, (_, i) => put(`f${i}.mvt`)));
+    expect(fake.requestsByAddress.get('127.0.0.1')).toBe(1);
+    expect(fake.requestsByAddress.get('127.0.0.2')! + fake.requestsByAddress.get('127.0.0.3')!).toBe(20);
+    release();
+    await inFlight;
+    await moved;
+    expect(fake.files.size).toBe(21);
+    expect(fake.requests).toEqual({ PUT: 21 });
+  });
+
   // undici's headers timeout ticks at about 1 s, so the 150 ms timeout fires within 0.15-1.5 s, before the late commit.
   it('treats a commit that lands after a timeout as stored when it settles first', async () => {
     const { fake, storage } = await setup(
