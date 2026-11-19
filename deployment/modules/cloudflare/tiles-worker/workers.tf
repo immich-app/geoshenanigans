@@ -3,13 +3,15 @@ data "cloudflare_zone" "immich_cloud" {
 }
 
 locals {
-  # The Bunny unit's output is a number; "" before that unit has applied, and in dev, which doesn't read it.
-  bunny_pull_zone_id = try(tostring(data.terraform_remote_state.bunny_tiles[0].outputs.pull_zone_id), "")
   # Only prod reads Bunny's logs and probes: the Bunny account is production's, and a dev worker would read the same pull
   # zone's logs again and spend the Globalping quota twice. Whether a secret is set isn't itself secret.
-  bunny_log_reader = (var.env == "prod" && nonsensitive(var.bunny_api_key != "")
-  && can(regex("^[0-9]+$", local.bunny_pull_zone_id)))
-  bunny_probe = var.env == "prod" && nonsensitive(var.globalping_token != "") && var.bunny_public_url != ""
+  bunny_log_reader = var.env == "prod" && nonsensitive(var.bunny_api_key != "") && var.bunny_pull_zone_id != ""
+  bunny_probe      = var.env == "prod" && nonsensitive(var.globalping_token != "") && var.bunny_public_url != ""
+  # The Worker secrets terraform_data.bunny_secrets puts (below), by name.
+  bunny_secret_names = concat(
+    local.bunny_log_reader ? ["BUNNY_API_KEY"] : [],
+    local.bunny_probe ? ["GLOBALPING_TOKEN"] : [],
+  )
 }
 
 resource "cloudflare_workers_script" "tiles" {
@@ -57,28 +59,13 @@ resource "cloudflare_workers_script" "tiles" {
     text = var.tigris_read_access_key
   }
 
-  # Bunny CDN request logs and synthetic probe, run by the cron (tiles/src/bunny-logs).
-  dynamic "secret_text_binding" {
-    for_each = local.bunny_log_reader ? [1] : []
-    content {
-      name = "BUNNY_API_KEY"
-      text = var.bunny_api_key
-    }
-  }
-
+  # Bunny CDN request logs and synthetic probe, run by the cron (tiles/src/bunny-logs). Their secrets, BUNNY_API_KEY and
+  # GLOBALPING_TOKEN, are not bindings here: terraform_data.bunny_secrets puts them (below).
   dynamic "plain_text_binding" {
-    for_each = local.bunny_log_reader ? [local.bunny_pull_zone_id] : []
+    for_each = local.bunny_log_reader ? [var.bunny_pull_zone_id] : []
     content {
       name = "BUNNY_PULL_ZONE_ID"
       text = plain_text_binding.value
-    }
-  }
-
-  dynamic "secret_text_binding" {
-    for_each = local.bunny_probe ? [1] : []
-    content {
-      name = "GLOBALPING_TOKEN"
-      text = var.globalping_token
     }
   }
 
@@ -102,11 +89,42 @@ resource "cloudflare_workers_script" "tiles" {
   compatibility_flags = ["nodejs_compat"]
 
   lifecycle {
-    # Prod gets these from deployment/tiles-worker-bunny.env, which .env no longer names: a prod run that resolved .env
-    # alone would otherwise turn the log reader and the probe off.
+    # Prod gets these from deployment/tiles-worker-bunny.env, which .env doesn't name: a prod run that resolved .env
+    # alone would otherwise turn the log reader and the probe off, after an upload that drops their secrets.
     precondition {
       condition     = var.env != "prod" || nonsensitive(var.bunny_api_key != "" && var.globalping_token != "")
       error_message = "Prod needs bunny_api_key and globalping_token: resolve deployment/tiles-worker-bunny.env too (op run --env-file=.env --env-file=tiles-worker-bunny.env)."
+    }
+  }
+}
+
+# The Bunny account key and the Globalping token are Worker secrets put through Cloudflare's API, not
+# secret_text_bindings: OpenTofu keeps a binding's value in the state, which the backend credential every pull
+# request's plan resolves can read. The values come from variables, which the state doesn't keep, and go only to this
+# command's environment. Every upload drops them: provider 4.52.10 uploads only the configured bindings, and its
+# refresh records the secrets it doesn't manage, without their values, so every prod plan updates the script to remove
+# them. Hence this puts them after every upload, and on every apply anyway (plantimestamp), which also sends out a
+# rotated value.
+resource "terraform_data" "bunny_secrets" {
+  count = length(local.bunny_secret_names) > 0 ? 1 : 0
+
+  input            = { script = cloudflare_workers_script.tiles.name, secrets = local.bunny_secret_names }
+  triggers_replace = [plantimestamp()]
+
+  lifecycle {
+    replace_triggered_by = [cloudflare_workers_script.tiles]
+  }
+
+  provisioner "local-exec" {
+    interpreter = ["bash"]
+    command     = "${path.module}/put-worker-secrets.sh"
+    environment = {
+      ACCOUNT_ID           = var.cloudflare_account_id
+      SCRIPT               = self.input.script
+      SECRETS              = join(" ", self.input.secrets)
+      CLOUDFLARE_API_TOKEN = data.terraform_remote_state.api_keys_state.outputs.terraform_key_cloudflare_account
+      BUNNY_API_KEY        = var.bunny_api_key
+      GLOBALPING_TOKEN     = var.globalping_token
     }
   }
 }

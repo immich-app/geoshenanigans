@@ -8,6 +8,7 @@ import glob
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -499,6 +500,321 @@ class SampleCheckStepTest(unittest.TestCase):
 
     def test_a_usage_error_fails_the_step_even_with_a_report(self):
         self.assertNotEqual(self.run_step(3, '{"checked": 0}'), 0)
+
+
+def evaluate(expression, context):
+    """Evaluates the GitHub expressions these workflows use: string literals, context names, ==, !=, &&, || and
+    parentheses, with GitHub's && and || returning an operand."""
+    expression = " ".join(str(expression).split())
+    if expression.startswith("${{") and expression.endswith("}}"):
+        expression = expression[3:-2].strip()
+    parts = top_level(expression, "||")
+    if len(parts) > 1:
+        for part in parts:
+            value = evaluate(part, context)
+            if value:
+                return value
+        return value
+    parts = top_level(expression, "&&")
+    if len(parts) > 1:
+        for part in parts:
+            value = evaluate(part, context)
+            if not value:
+                return value
+        return value
+    for operator, equal in (("!=", False), ("==", True)):
+        parts = top_level(expression, operator)
+        if len(parts) == 2:
+            return (evaluate(parts[0], context) == evaluate(parts[1], context)) == equal
+    if expression.startswith("(") and expression.endswith(")") and top_level(expression[1:-1], ")") == [
+            expression[1:-1].strip()]:
+        return evaluate(expression[1:-1], context)
+    if expression.startswith("'") and expression.endswith("'"):
+        return expression[1:-1].replace("''", "'")
+    return context.get(expression, "")
+
+
+def interpolate(text, context):
+    """A string with ${{ }} expressions in it, as GitHub expands it."""
+    return re.sub(r"\$\{\{(.+?)\}\}", lambda match: str(evaluate(match.group(1), context)), text)
+
+
+WATCHDOG = "tiles-sync-watchdog.yml"
+REPORT_SCHEDULE = "37 */2 * * *"
+SAMPLE_SCHEDULE = "53 4 * * *"
+
+
+class WatchdogConcurrencyTest(unittest.TestCase):
+    """A newer run's report replaces an older one's, and a newer sample check an older one's, but a report never cancels
+    a sample check (a scheduled report during a dispatch's sample check), nor does a refusal off main cancel main's."""
+
+    RUNS = {
+        "report": {"github.ref": "refs/heads/main", "github.event_name": "schedule",
+                   "github.event.schedule": REPORT_SCHEDULE, "github.run_id": "1"},
+        "sample": {"github.ref": "refs/heads/main", "github.event_name": "schedule",
+                   "github.event.schedule": SAMPLE_SCHEDULE, "github.run_id": "2"},
+        "dispatch": {"github.ref": "refs/heads/main", "github.event_name": "workflow_dispatch", "github.run_id": "3"},
+        "branch": {"github.ref": "refs/heads/feature", "github.event_name": "workflow_dispatch", "github.run_id": "4"},
+    }
+
+    def setUp(self):
+        self.workflow = load(WATCHDOG)
+        self.jobs = self.workflow["jobs"]
+
+    def groups(self, run):
+        """{job: its concurrency group} for the jobs a run runs; the workflow's own group under None."""
+        context = self.RUNS[run]
+        groups = {}
+        if "concurrency" in self.workflow:
+            groups[None] = interpolate(self.workflow["concurrency"]["group"], context)
+        for name, job in self.jobs.items():
+            if job.get("if") is not None and not evaluate(job["if"], context):
+                continue
+            concurrency = job.get("concurrency")
+            groups[name] = interpolate(concurrency["group"], context) if concurrency else None
+        return groups
+
+    def test_the_jobs_each_run_runs(self):
+        self.assertEqual(set(self.groups("report")), {"report"})
+        self.assertEqual(set(self.groups("sample")), {"sample"})
+        self.assertEqual(set(self.groups("dispatch")), {"report", "sample"})
+        self.assertEqual(set(self.groups("branch")), {"main-only"})
+
+    def test_a_scheduled_report_replaces_only_the_dispatch_report(self):
+        dispatch, report = self.groups("dispatch"), self.groups("report")
+        self.assertNotIn(None, dispatch)
+        self.assertEqual(report["report"], dispatch["report"])
+        self.assertNotIn(report["report"], set(dispatch.values()) - {dispatch["report"]})
+        for job in ("report", "sample"):
+            self.assertIs(self.jobs[job]["concurrency"]["cancel-in-progress"], True)
+
+    def test_the_daily_sample_check_replaces_only_the_dispatch_check(self):
+        dispatch, sample = self.groups("dispatch"), self.groups("sample")
+        self.assertEqual(sample["sample"], dispatch["sample"])
+        self.assertNotEqual(sample["sample"], dispatch["report"])
+
+    def test_a_refusal_off_main_shares_no_group_with_main(self):
+        self.assertEqual(self.groups("branch"), {"main-only": None})
+        on_main = {group for run in ("report", "sample", "dispatch") for group in self.groups(run).values()}
+        # Even the jobs a run off main skips have groups of their own.
+        context = self.RUNS["branch"]
+        for job in ("report", "sample"):
+            self.assertNotIn(interpolate(self.jobs[job]["concurrency"]["group"], context), on_main)
+
+    def test_the_evaluator(self):
+        context = {"github.ref": "refs/heads/main", "github.run_id": "7", "github.event.schedule": SAMPLE_SCHEDULE}
+        self.assertEqual(evaluate("github.ref == 'refs/heads/main' && 'main' || github.run_id", context), "main")
+        self.assertEqual(evaluate("github.ref != 'refs/heads/main' && 'x' || github.run_id", context), "7")
+        self.assertFalse(evaluate(
+            "github.ref == 'refs/heads/main' && (github.event.schedule != '53 4 * * *' || github.event_name == 'x')",
+            context))
+        self.assertEqual(interpolate("a-${{ github.run_id }}-b", context), "a-7-b")
+
+
+FAKE_CURL_SECRETS = """#!/bin/bash
+# curl ... -H @FILE ... --data-binary @- URL: logs its arguments, the header files' lines and the body to $FAKE_LOG as
+# JSON lines, and prints $FAKE_RESPONSE.
+args=("$@")
+headers=()
+for ((i = 0; i < ${#args[@]}; i++)); do
+  if [ "${args[i]}" = -H ] && [[ "${args[i+1]}" == @* ]]; then headers+=("$(cat "${args[i+1]#@}")"); fi
+done
+body=$(cat)
+jq -cn --args '{args: $ARGS.positional}' -- "$@" >> "$FAKE_LOG"
+jq -cn --arg body "$body" '{body: $body}' >> "$FAKE_LOG"
+for header in "${headers[@]}"; do jq -cn --arg header "$header" '{header: $header}' >> "$FAKE_LOG"; done
+printf '%s' "$FAKE_RESPONSE"
+"""
+
+PUT_SECRETS = os.path.join(ROOT, "deployment", "modules", "cloudflare", "tiles-worker", "put-worker-secrets.sh")
+
+
+class PutWorkerSecretsTest(unittest.TestCase):
+    """put-worker-secrets.sh, which puts the worker's Bunny secrets through Cloudflare's API after every apply, so
+    that OpenTofu's state never holds them (workers.tf, terraform_data.bunny_secrets)."""
+
+    def run_script(self, response='{"success": true, "errors": [], "result": {"name": "x", "type": "secret_text"}}',
+                   **overrides):
+        with tempfile.TemporaryDirectory() as tmp:
+            install(os.path.join(tmp, "bin"), {"curl": FAKE_CURL_SECRETS})
+            log = os.path.join(tmp, "log")
+            env = dict(os.environ, PATH=os.path.join(tmp, "bin") + os.pathsep + os.environ["PATH"], FAKE_LOG=log,
+                       FAKE_RESPONSE=response, ACCOUNT_ID="account", SCRIPT="tiles-prod",
+                       SECRETS="BUNNY_API_KEY GLOBALPING_TOKEN", CLOUDFLARE_API_TOKEN="cf-token-1",
+                       BUNNY_API_KEY="bunny key 2", GLOBALPING_TOKEN='globalping "3"')
+            env.update(overrides)
+            result = subprocess.run(["bash", PUT_SECRETS], env=env, cwd=tmp, capture_output=True, text=True,
+                                    check=False)
+            entries = []
+            if os.path.exists(log):
+                with open(log) as f:
+                    entries = [json.loads(line) for line in f]
+            return result, entries
+
+    def test_puts_each_secret_from_its_variable(self):
+        result, entries = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "Put BUNNY_API_KEY on tiles-prod\nPut GLOBALPING_TOKEN on tiles-prod\n")
+        calls = [entries[i:i + 3] for i in range(0, len(entries), 3)]
+        self.assertEqual(len(calls), 2)
+        for (args, body, header), name, value in zip(calls, ("BUNNY_API_KEY", "GLOBALPING_TOKEN"),
+                                                       ("bunny key 2", 'globalping "3"')):
+            with self.subTest(secret=name):
+                self.assertEqual(args["args"][-1],
+                                 "https://api.cloudflare.com/client/v4/accounts/account/workers/scripts/tiles-prod/secrets")
+                self.assertIn("PUT", args["args"])
+                self.assertEqual(json.loads(body["body"]), {"name": name, "text": value, "type": "secret_text"})
+                self.assertEqual(header["header"], "Authorization: Bearer cf-token-1")
+                # Neither the token nor a value is on curl's command line, which other processes can read.
+                for secret in ("cf-token-1", "bunny key 2", 'globalping "3"'):
+                    self.assertNotIn(secret, " ".join(args["args"]))
+
+    def test_an_empty_secret_stops_before_any_request(self):
+        result, entries = self.run_script(GLOBALPING_TOKEN="")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GLOBALPING_TOKEN is empty", result.stderr)
+        self.assertEqual(len(entries), 3)  # BUNNY_API_KEY went first
+        result, entries = self.run_script(SECRETS="BUNNY_API_KEY", BUNNY_API_KEY="")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(entries, [])
+
+    def test_a_refused_put_fails_without_printing_the_secret(self):
+        result, _ = self.run_script(
+            response='{"success": false, "errors": [{"code": 10000, "message": "Authentication error"}]}')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Could not put BUNNY_API_KEY on tiles-prod", result.stderr)
+        self.assertIn("Authentication error", result.stderr)
+        self.assertNotIn("bunny key 2", result.stderr + result.stdout)
+        result, _ = self.run_script(response="<html>bad gateway</html>")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no API response", result.stderr)
+
+    def test_odd_names_and_missing_settings_fail(self):
+        self.assertNotEqual(self.run_script(SECRETS="bunny-api-key")[0].returncode, 0)
+        self.assertNotEqual(self.run_script(CLOUDFLARE_API_TOKEN="")[0].returncode, 0)
+        self.assertNotEqual(self.run_script(SECRETS="")[0].returncode, 0)
+
+
+class BunnyStateTest(unittest.TestCase):
+    """The Bunny unit's state holds the storage zones' passwords and the middleware script's deployment key, and its
+    backend credential is the one every pull request's plan resolves: it is encrypted with a passphrase in tf_bunny,
+    and nothing else reads it."""
+
+    MODULE = os.path.join(ROOT, "deployment", "modules", "bunny", "tiles")
+
+    def test_the_state_and_plans_are_encrypted_with_a_tf_bunny_passphrase(self):
+        encryption = read(os.path.join(self.MODULE, "encryption.tf"))
+        self.assertIn("passphrase = var.state_passphrase", encryption)
+        for block in ("state", "plan"):
+            with self.subTest(block=block):
+                body = re.search(r"\n    " + block + r" \{\n(.*?)\n    \}", encryption, re.S)
+                self.assertIsNotNone(body)
+                self.assertIn("method   = method.aes_gcm.state", body.group(1))
+                self.assertIn("enforced = true", body.group(1))
+        self.assertNotIn('method "unencrypted"', encryption)
+        self.assertNotIn("fallback", encryption)
+        self.assertIn('export TF_VAR_state_passphrase="op://tf_bunny/BUNNY_TILES_STATE_PASSPHRASE/password"',
+                      read(os.path.join(self.MODULE, "bunny.env")))
+
+    def test_no_other_unit_reads_the_bunny_state(self):
+        readers = []
+        for path in glob.glob(os.path.join(ROOT, "deployment", "**", "*.tf"), recursive=True) + glob.glob(
+                os.path.join(ROOT, "deployment", "**", "*.hcl"), recursive=True):
+            if "bunny_tiles" in read(path) and os.path.dirname(path) != self.MODULE:
+                readers.append(os.path.relpath(path, ROOT))
+        self.assertEqual(readers, [])
+        self.assertIn('schema_name = "${local.env}_bunny_tiles"', read(os.path.join(self.MODULE, "terragrunt.hcl")))
+
+    # Tiles Bunny Infra's check job sets REQUIRE_TOFU, so that there a missing tofu fails instead of skipping.
+    @unittest.skipUnless(shutil.which("tofu") or os.environ.get("REQUIRE_TOFU"), "needs tofu (mise)")
+    def test_the_state_is_written_encrypted(self):
+        """The module's encryption.tf on a local backend: the state file holds ciphertext, which only the passphrase
+        reads back."""
+        marker = "storage-zone-password-stand-in"
+        with tempfile.TemporaryDirectory() as tmp:
+            module = os.path.join(tmp, "module")
+            os.mkdir(module)
+            shutil.copy(os.path.join(self.MODULE, "encryption.tf"), module)
+            with open(os.path.join(module, "main.tf"), "w") as f:
+                f.write('variable "state_passphrase" {\n  type      = string\n  sensitive = true\n}\n\n'
+                        f'resource "terraform_data" "zone" {{\n  input = "{marker}"\n}}\n')
+            env = dict(os.environ, TF_DATA_DIR=os.path.join(tmp, "data"), TF_IN_AUTOMATION="1",
+                       TF_VAR_state_passphrase="correct-passphrase-for-tests")
+
+            def tofu(*args, **overrides):
+                return subprocess.run(["tofu", *args, "-input=false"] if args[0] != "state" else ["tofu", *args],
+                                      cwd=module, env=dict(env, **overrides), capture_output=True, text=True,
+                                      check=False)
+
+            self.assertEqual(tofu("init").returncode, 0)
+            applied = tofu("apply", "-auto-approve")
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            state = read(os.path.join(module, "terraform.tfstate"))
+            self.assertNotIn(marker, state)
+            self.assertIn("encrypted_data", json.loads(state))
+            self.assertIn(marker, tofu("state", "pull").stdout)
+            wrong = tofu("plan", TF_VAR_state_passphrase="another-passphrase-for-tests")
+            self.assertNotEqual(wrong.returncode, 0)
+            self.assertIn("decryption failed", wrong.stderr + wrong.stdout)
+
+
+FAKE_CURL_WORKER = """#!/bin/bash
+# The worker behind tiles.<env>.immich.cloud serves $FAKE_KEY; tiles.immich.cloud is Bunny, which sends no deployment
+# key and whose TileJSON's tile URLs have no ?v=. Logs each URL to $FAKE_LOG.
+url=${@: -1}
+host=${url#https://}
+host=${host%%/*}
+echo "$url" >> "$FAKE_LOG"
+if [ "$host" = tiles.immich.cloud ]; then key=""; else key=$FAKE_KEY; fi
+case " $* " in
+  *" -D - "*)
+    printf 'HTTP/2 200\\r\\ncontent-type: application/json\\r\\n'
+    [ -n "$key" ] && printf 'pmtiles-deployment-key: %s\\r\\n' "$key"
+    printf '\\r\\n'
+    ;;
+  *" -w "*) echo "200" ;;
+  *)
+    if [ -n "$key" ]; then v="?v=$key"; else v=""; fi
+    printf '{"tiles": ["https://%s/v1/{z}/{x}/{y}.mvt%s"]}' "$host" "$v"
+    ;;
+esac
+"""
+
+
+class WorkerHostnameTest(unittest.TestCase):
+    """Tiles Deploy's checks ask the worker on its own hostname: from the cutover on, prod's public one is Bunny's,
+    which sends no deployment key, and the rollback runbook dispatches Tiles Deploy before pointing it back."""
+
+    def workspace(self, tmp):
+        os.makedirs(os.path.join(tmp, "deployment", "scripts"))
+        shutil.copy(os.path.join(ROOT, "deployment", "scripts", "tiles-served-key.sh"),
+                    os.path.join(tmp, "deployment", "scripts"))
+        install(os.path.join(tmp, "bin"), {"curl": FAKE_CURL_WORKER, "sleep": "#!/bin/sh\n"})
+        log = os.path.join(tmp, "log")
+        env = dict(os.environ, PATH=os.path.join(tmp, "bin") + os.pathsep + os.environ["PATH"], FAKE_LOG=log,
+                   FAKE_KEY="20261118")
+        return env, log
+
+    def test_served_key_reads_each_workers_own_hostname(self):
+        for environment in ("prod", "dev"):
+            with self.subTest(environment=environment), tempfile.TemporaryDirectory() as tmp:
+                env, log = self.workspace(tmp)
+                result = subprocess.run(["bash", "deployment/scripts/tiles-served-key.sh", environment], cwd=tmp,
+                                        env=env, capture_output=True, text=True, check=False)
+                self.assertEqual((result.returncode, result.stdout), (0, "20261118\n"), result.stderr)
+                self.assertEqual(read(log), f"https://tiles.{environment}.immich.cloud/v1.json\n")
+
+    def test_activation_checks_the_worker_while_the_public_hostname_is_bunnys(self):
+        check = step(load("tiles-deploy.yml")["jobs"]["activate"], "Check live endpoint")
+        with tempfile.TemporaryDirectory() as tmp:
+            env, log = self.workspace(tmp)
+            summary = os.path.join(tmp, "summary")
+            env.update(ENVIRONMENT="prod", DEPLOYMENT_KEY="20261118", GITHUB_STEP_SUMMARY=summary)
+            result = run_bash(check["run"], tmp, env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            hosts = {line.split("/")[2] for line in read(log).splitlines()}
+            self.assertEqual(hosts, {"tiles.prod.immich.cloud"})
+            self.assertEqual(read(summary), "- https://tiles.prod.immich.cloud now serves 20261118\n")
 
 
 if __name__ == "__main__":

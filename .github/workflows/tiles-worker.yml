@@ -167,8 +167,9 @@ jobs:
 
       # Every pull request runs this with the branch's Terragrunt code, unapproved: it never gets the Bunny account key
       # or the Globalping token. Those live in the tf_bunny vault, which only the tiles-bunny environments' service
-      # account reads (deployment/modules/bunny/tiles/README.md), and .env doesn't name them: prod plans stand-ins, so
-      # the worker's bindings plan as they are, with a value the plan hides.
+      # account reads (deployment/modules/bunny/tiles/README.md), and .env doesn't name them: prod plans with stand-ins,
+      # which reach no resource. Applies put the real values on the worker through Cloudflare's API, never in the state
+      # this plan reads (terraform_data.bunny_secrets in tiles-worker/workers.tf).
       - name: Plan All
         working-directory: ${{ github.workspace }}/deployment
         env:
@@ -184,8 +185,8 @@ jobs:
     name: Deploy Terragrunt
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
-    # Prod's apply binds the Bunny account key and the Globalping token (tiles-worker-bunny.env), which only the
-    # tiles-bunny environment's service account reads: that environment deploys main only. Dev needs neither.
+    # Prod's apply puts the Bunny account key and the Globalping token on the worker (tiles-worker-bunny.env), which only
+    # the tiles-bunny environment's service account reads: that environment deploys main only. Dev needs neither.
     environment: ${{ github.ref == 'refs/heads/main' && 'tiles-bunny' || '' }}
     # Shared with the activate job in tiles-deploy.yml so the two never apply the same state at once.
     concurrency:

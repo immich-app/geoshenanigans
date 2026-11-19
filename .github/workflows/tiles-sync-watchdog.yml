@@ -23,13 +23,6 @@ on:
 
 permissions: {}
 
-# The newer invocation replaces an older one still running (e.g. a manual dispatch during the cron run); the daily
-# sample check has a group of its own, and so does a dispatch from another branch, which only refuses and must not
-# cancel main's run.
-concurrency:
-  group: tiles-sync-watchdog-${{ github.ref != 'refs/heads/main' && github.run_id || github.event.schedule == '53 4 * * *' && 'sample' || 'report' }}
-  cancel-in-progress: true
-
 jobs:
   main-only:
     name: Refuse another branch
@@ -43,9 +36,16 @@ jobs:
           echo "::error::Tiles Sync Watchdog reads production credentials and runs from main only"
           exit 1
 
+  # Each job has its own concurrency group, in which a newer run's job replaces an older one's still running (a
+  # scheduled report a dispatch's, say): a report never cancels a sample check, and the other way round. The refusal
+  # above is in no group, so a dispatch from another branch cancels nothing on main. A run_id off main keeps even a
+  # skipped job out of main's groups.
   report:
     name: Report the live build
     if: github.ref == 'refs/heads/main' && github.event.schedule != '53 4 * * *'
+    concurrency:
+      group: tiles-sync-watchdog-report-${{ github.ref == 'refs/heads/main' && 'main' || github.run_id }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -118,6 +118,9 @@ jobs:
   sample:
     name: Check a sample in every region
     if: github.ref == 'refs/heads/main' && (github.event.schedule == '53 4 * * *' || github.event_name == 'workflow_dispatch')
+    concurrency:
+      group: tiles-sync-watchdog-sample-${{ github.ref == 'refs/heads/main' && 'main' || github.run_id }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

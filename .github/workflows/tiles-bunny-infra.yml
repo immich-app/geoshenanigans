@@ -68,6 +68,12 @@ jobs:
           tofu validate
           tofu test
 
+      # encryption.tf applied on a local backend: the state is ciphertext only the passphrase reads (tofu from mise).
+      - name: Test the state encryption
+        env:
+          REQUIRE_TOFU: 1
+        run: python3 -m unittest discover -s deployment/scripts -p 'test_tiles_workflows.py' -k BunnyStateTest
+
   # The plan runs the branch's Terragrunt configuration with the Bunny token, so no branch run gets it by itself: the
   # token is the tiles-bunny-plan environment's own secret, which GitHub releases once one of the environment's required
   # reviewers approves the run, and with it the run's commit. The check job above needs no credentials.

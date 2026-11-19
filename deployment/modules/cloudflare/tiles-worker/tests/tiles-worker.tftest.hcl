@@ -17,13 +17,6 @@ override_data {
   }
 }
 
-override_data {
-  target = data.terraform_remote_state.bunny_tiles
-  values = {
-    outputs = { pull_zone_id = 12345 }
-  }
-}
-
 variables {
   cloudflare_account_id      = "account"
   tf_state_postgres_conn_str = "postgres://unused"
@@ -39,6 +32,7 @@ variables {
   bunny_api_key              = "not-a-key"
   globalping_token           = "not-a-token"
   bunny_public_url           = "https://tiles.example.com"
+  bunny_pull_zone_id         = "12345"
 }
 
 # The probe alerts' 30-minute windows need two runs at all times (o11y/alerts/geoshenanigans-tiles.yaml): 14 minutes
@@ -87,8 +81,8 @@ run "probe_interval_fraction" {
   expect_failures = [var.bunny_probe_interval_minutes]
 }
 
-# Prod's secrets are in tiles-worker-bunny.env, not .env: an apply that resolved .env alone stops instead of unbinding
-# the log reader and the probe. Dev binds neither and needs neither.
+# Prod's secrets are in tiles-worker-bunny.env, not .env: an apply that resolved .env alone stops instead of turning
+# the log reader and the probe off. Dev runs neither and needs neither.
 run "prod_without_the_bunny_secrets" {
   command = plan
 
@@ -120,12 +114,19 @@ run "dev_without_the_bunny_secrets" {
   }
 
   assert {
-    condition     = length([for binding in cloudflare_workers_script.tiles.secret_text_binding : binding if binding.name == "BUNNY_API_KEY" || binding.name == "GLOBALPING_TOKEN"]) == 0
-    error_message = "Dev binds no Bunny secret."
+    condition     = length(terraform_data.bunny_secrets) == 0
+    error_message = "Dev puts no Bunny secret."
+  }
+
+  assert {
+    condition     = length([for binding in cloudflare_workers_script.tiles.plain_text_binding : binding if startswith(binding.name, "BUNNY_")]) == 0
+    error_message = "Dev runs neither the log reader nor the probe."
   }
 }
 
-run "prod_with_plan_stand_ins" {
+# The two secrets are Worker secrets put through Cloudflare's API after the upload, never bindings: OpenTofu would keep
+# a binding's value in the state.
+run "prod_puts_the_bunny_secrets_outside_the_state" {
   command = plan
 
   variables {
@@ -134,7 +135,61 @@ run "prod_with_plan_stand_ins" {
   }
 
   assert {
-    condition     = length([for binding in cloudflare_workers_script.tiles.secret_text_binding : binding if binding.name == "BUNNY_API_KEY" || binding.name == "GLOBALPING_TOKEN"]) == 2
-    error_message = "A pull request's prod plan keeps both Bunny bindings, with stand-ins for their values."
+    condition     = length([for binding in cloudflare_workers_script.tiles.secret_text_binding : binding if binding.name == "BUNNY_API_KEY" || binding.name == "GLOBALPING_TOKEN"]) == 0
+    error_message = "No Bunny secret is a binding of the script."
   }
+
+  assert {
+    condition     = jsonencode(terraform_data.bunny_secrets[0].input) == jsonencode({ script = "tiles-prod", secrets = ["BUNNY_API_KEY", "GLOBALPING_TOKEN"] })
+    error_message = "Prod puts both secrets on its script, and only their names are in the resource."
+  }
+
+  assert {
+    condition     = contains([for binding in cloudflare_workers_script.tiles.plain_text_binding : "${binding.name}=${binding.text}"], "BUNNY_PULL_ZONE_ID=12345")
+    error_message = "The log reader gets the pull zone id."
+  }
+}
+
+# Until the Bunny unit has applied there is no pull zone id: the log reader stays off and its key isn't put, while the
+# probe runs. No Bunny state is read, so the worker applies either way.
+run "prod_before_the_bunny_unit_applies" {
+  command = plan
+
+  variables {
+    bunny_pull_zone_id = ""
+  }
+
+  assert {
+    condition     = length([for binding in cloudflare_workers_script.tiles.plain_text_binding : binding if binding.name == "BUNNY_PULL_ZONE_ID"]) == 0
+    error_message = "No pull zone id, no log reader."
+  }
+
+  assert {
+    condition     = jsonencode(terraform_data.bunny_secrets[0].input.secrets) == jsonencode(["GLOBALPING_TOKEN"])
+    error_message = "Only the probe's token is put."
+  }
+}
+
+run "prod_before_the_probe_is_on" {
+  command = plan
+
+  variables {
+    bunny_pull_zone_id = ""
+    bunny_public_url   = ""
+  }
+
+  assert {
+    condition     = length(terraform_data.bunny_secrets) == 0
+    error_message = "Neither the log reader nor the probe runs, so no secret is put."
+  }
+}
+
+run "pull_zone_id_not_a_number" {
+  command = plan
+
+  variables {
+    bunny_pull_zone_id = "immich-tiles"
+  }
+
+  expect_failures = [var.bunny_pull_zone_id]
 }
