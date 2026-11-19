@@ -421,12 +421,16 @@ describe('BunnyStorage', () => {
         retry: { ...fast, baseDelayMs: 5_000, maxDelayMs: 5_000, maxRateLimitWaitMs: 60_000 },
       },
     );
+    const put = storage.put('a.mvt', bytes('a'), sha256Hex(bytes('a'))).catch((e: unknown) => e);
+    // Abort only once the client has had a 429 and is backing off.
+    await vi.waitFor(() => expect(storage.counters.rateLimited).toBe(1));
     const started = performance.now();
-    setTimeout(() => controller.abort(), 50);
-    const error = await storage.put('a.mvt', bytes('a'), sha256Hex(bytes('a'))).catch((e: unknown) => e);
+    controller.abort();
+    const error = await put;
     expect(error).toBeInstanceOf(StorageError);
     expect((error as StorageError).stopped).toBe(true);
     expect(performance.now() - started).toBeLessThan(1_000);
+    expect(storage.counters.retries).toBe(0);
   });
 
   describe("describe() with the call's own signal", () => {
