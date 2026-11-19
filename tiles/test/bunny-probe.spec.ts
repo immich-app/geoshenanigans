@@ -69,7 +69,8 @@ function globalping({ create, get, tileJson }: Routes) {
       return tileJson?.() ?? tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt');
     }
     if (call.url === GLOBALPING_API && call.method === 'POST') {
-      return create?.(call, creates++) ?? json({ id: `m${creates}`, probesCount: 6 }, 202);
+      const index = creates++;
+      return create?.(call, index) ?? json({ id: `m${index + 1}`, probesCount: 6 }, 202);
     }
     if (call.url.startsWith(`${GLOBALPING_API}/`) && call.method === 'GET') {
       const id = decodeURIComponent(call.url.slice(GLOBALPING_API.length + 1));
@@ -281,7 +282,13 @@ describe('runProbe', () => {
           everywhere([{ probe: { continent: 'NA' }, result: { status: 'offline', rawOutput: '' } }]),
         ),
     });
-    expect(calls.filter(({ url, method }) => url.startsWith(`${GLOBALPING_API}/`) && method === 'GET')).toHaveLength(2);
+    // One poll of each measurement: the hit one and the miss one, by the ids the fake gives them by default.
+    expect(
+      calls
+        .filter(({ url, method }) => url.startsWith(`${GLOBALPING_API}/`) && method === 'GET')
+        .map(({ url }) => url.slice(GLOBALPING_API.length + 1)),
+    ).toEqual(['m1', 'm2']);
+    expect(JSON.parse(creates(calls)[1].body).locations).toBe('m1');
     expect(metrics(calls).filter(({ labels }) => labels.continent === 'NA')).toEqual([]);
     // Its continent went unmeasured, which the run reports.
     expect(result).toBe('error');
