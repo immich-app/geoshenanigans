@@ -1,4 +1,4 @@
-import { execFile, spawn } from 'node:child_process';
+import { execFile, ExecFileException } from 'node:child_process';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -7,12 +7,13 @@ import {
   checkReplication,
   checksumMatches,
   classify,
+  normalizeRegions,
   ReplicationItem,
   TileGateList,
   waitForReplication,
 } from '../../src/bunny/replication';
 import { BunnyStateStore, publishBuild, writeState } from '../../src/bunny/state';
-import { BunnyStorage } from '../../src/bunny/storage';
+import { BunnyStorage, StorageObject } from '../../src/bunny/storage';
 import { tilePath, zoomEnd } from '../../src/bunny/tile-id';
 import { runSeed } from '../../src/bunny/upload';
 import { FakeStorage, FakeStorageOptions, sha256Hex } from './fake-storage';
@@ -39,6 +40,28 @@ async function setup(options: FakeStorageOptions = {}) {
     () => storage.close(),
   );
   return { fake, storage };
+}
+
+/**
+ * A storage stand-in whose DESCRIBE answers `answer(path, call)` (call counts from 1 per path) after `delayMs`, for
+ * gate tests that need exact answers in order rather than an HTTP fake.
+ */
+function stubStorage(
+  answer: (path: string, call: number) => Partial<StorageObject> | null,
+  delayMs = 0,
+): { storage: BunnyStorage; describes: string[] } {
+  const describes: string[] = [];
+  const storage = {
+    describe: async (path: string) => {
+      describes.push(path);
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+      const object = answer(path, describes.filter((described) => described === path).length);
+      return object && { checksum: 'AB'.repeat(32), length: 1, replicatedZones: [], lastChanged: '', ...object };
+    },
+  } as unknown as BunnyStorage;
+  return { storage, describes };
 }
 
 async function upload(storage: BunnyStorage, count: number): Promise<ReplicationItem[]> {
@@ -100,26 +123,109 @@ describe('TileGateList', () => {
   }, 120_000);
 });
 
+describe('normalizeRegions', () => {
+  it('upper-cases, trims and lists each region once, in order', () => {
+    expect(normalizeRegions([' uk', 'SYD', 'UK', '', 'syd ', 'ny'])).toEqual(['UK', 'SYD', 'NY']);
+  });
+});
+
 describe('waitForReplication', () => {
   it('follows each region until it holds every file, re-checking only what is still missing', async () => {
-    const { fake, storage } = await setup({ replicationDelayMs: { UK: 20, NY: 150, SYD: 400 } });
+    const { fake, storage } = await setup();
     const items = await upload(storage, 60);
+    const hold = (paths: string[], region: string) =>
+      paths.forEach((path) => fake.files.get(path)!.replicatedZones.add(region));
+    // A third of the files are in every region from the start; the rest gain UK, NY and SYD, one after each pass.
+    const ready = items.slice(0, 20).map((item) => item.path);
+    const late = items.slice(20).map((item) => item.path);
+    REGIONS.forEach((region) => hold(ready, region));
     const describesBefore = fake.requests.DESCRIBE ?? 0;
-    const passes: number[] = [];
+    const passes: Array<{ pending: number; describes: number; missingByRegion: Record<string, number> }> = [];
+    let describesSoFar = describesBefore;
     const result = await waitForReplication(storage, items, REGIONS, {
-      timeoutMs: 5_000,
-      intervalMs: 30,
-      onPass: ({ pending }) => passes.push(pending),
+      timeoutMs: 10_000,
+      intervalMs: 1,
+      onPass: ({ pass, pending, missingByRegion }) => {
+        passes.push({ pending, describes: fake.requests.DESCRIBE - describesSoFar, missingByRegion });
+        describesSoFar = fake.requests.DESCRIBE;
+        if (pass <= REGIONS.length) {
+          hold(late, REGIONS[pass - 1]);
+        }
+      },
     });
 
-    expect(result).toMatchObject({ complete: true, missing: [], mismatched: [], incomplete: 0 });
+    expect(result).toMatchObject({ complete: true, missing: [], mismatched: [], incomplete: 0, passes: 4 });
     expect(result.missingByRegion).toEqual({ UK: 0, NY: 0, SYD: 0 });
-    expect(result.regionWaitMs.UK!).toBeLessThan(result.regionWaitMs.NY!);
-    expect(result.regionWaitMs.NY!).toBeLessThan(result.regionWaitMs.SYD!);
-    expect(result.regionWaitMs.SYD!).toBeGreaterThanOrEqual(350);
-    expect(passes.at(-1)).toBe(0);
-    // Later passes only DESCRIBE files that some region still lacked.
-    expect(fake.requests.DESCRIBE - describesBefore).toBeLessThan(60 * result.passes);
+    // Every file once, then only the 40 that some region still lacked.
+    expect(passes).toEqual([
+      { pending: 40, describes: 60, missingByRegion: { UK: 40, NY: 40, SYD: 40 } },
+      { pending: 40, describes: 40, missingByRegion: { UK: 0, NY: 40, SYD: 40 } },
+      { pending: 40, describes: 40, missingByRegion: { UK: 0, NY: 0, SYD: 40 } },
+      { pending: 0, describes: 40, missingByRegion: { UK: 0, NY: 0, SYD: 0 } },
+    ]);
+    expect(fake.requests.DESCRIBE - describesBefore).toBe(180);
+    expect(result.regionWaitMs.UK!).toBeLessThanOrEqual(result.regionWaitMs.NY!);
+    expect(result.regionWaitMs.NY!).toBeLessThanOrEqual(result.regionWaitMs.SYD!);
+  });
+
+  it('needs one answer that names every region, not regions gathered over several', async () => {
+    // UK on the first answer, then only NY (UK lost the file), then both.
+    const answers = [['UK'], ['NY'], ['UK', 'NY']];
+    const { storage, describes } = stubStorage((_, call) => ({ replicatedZones: answers[call - 1] ?? [] }));
+    const result = await waitForReplication(storage, [{ path: 'r/a.mvt', sha256: 'AB'.repeat(32) }], ['UK', 'NY'], {
+      timeoutMs: 10_000,
+      intervalMs: 1,
+    });
+    expect(result).toMatchObject({ complete: true, passes: 3 });
+    expect(describes).toHaveLength(3);
+  });
+
+  it('counts a region listed twice, in any case, once', async () => {
+    const { fake, storage } = await setup();
+    const items = await upload(storage, 4);
+    fake.replicate();
+    const result = await waitForReplication(storage, items, ['UK', 'uk', ' NY', 'SYD'], {
+      timeoutMs: 5_000,
+      intervalMs: 1,
+    });
+    expect(result).toMatchObject({ complete: true, passes: 1 });
+    expect(result.missingByRegion).toEqual({ UK: 0, NY: 0, SYD: 0 });
+    expect(Object.keys(result.regionWaitMs)).toEqual(['UK', 'NY', 'SYD']);
+  });
+
+  it('starts no DESCRIBE once the timeout has passed, and keeps the files it did not reach pending', async () => {
+    const sha256 = 'AB'.repeat(32);
+    const items = Array.from({ length: 200 }, (_, i) => ({ path: `r/${i}.mvt`, sha256 }));
+    for (const regions of [REGIONS, []]) {
+      // Every file is in every region, but a pass over them all takes about 2 s.
+      const { storage, describes } = stubStorage(() => ({ replicatedZones: REGIONS }), 10);
+      const result = await waitForReplication(storage, items, regions, {
+        timeoutMs: 150,
+        intervalMs: 1,
+        concurrency: 1,
+      });
+      expect(describes.length).toBeGreaterThan(0);
+      expect(describes.length).toBeLessThan(60);
+      expect(result.passes).toBe(1);
+      expect(result.waitedMs).toBeLessThan(1_000);
+      // Unchecked files are not taken as replicated, even when no region is followed (storage only).
+      expect(result).toMatchObject({ complete: false, missing: [], mismatched: [], errors: 0 });
+      expect(result.incomplete).toBe(items.length - describes.length);
+      expect(result.stragglers[0]).toEqual({ path: `r/${describes.length}.mvt`, regions });
+    }
+  });
+
+  it('keeps a file no DESCRIBE answered for pending, even when no region is followed', async () => {
+    const { fake } = await setup();
+    // Every DESCRIBE fails (after its retries) with a server error: the file was never seen stored.
+    const storage = new BunnyStorage({ zone: fake.zone, password: fake.password, host: fake.url, retry: fast });
+    cleanup.push(() => storage.close());
+    fake.options.fault = (request) => (request.method === 'DESCRIBE' ? 'server-error' : undefined);
+    const result = await waitForReplication(storage, [{ path: 'r/0.mvt', sha256: 'AA' }], [], {
+      timeoutMs: 300,
+      intervalMs: 20,
+    });
+    expect(result).toMatchObject({ complete: false, incomplete: 1, errors: 1 });
   });
 
   it('with no grace, fails as soon as only missing and mismatched files are left', async () => {
@@ -239,28 +345,58 @@ describe('checkReplication', () => {
     expect(report.missingPaths).toEqual([tilePath('v1', 21)]);
     expect(report.mismatchedPaths).toEqual([tilePath('v1', 20)]);
     expect(report.coverage.UK).toBeCloseTo(5 / 22);
+    expect(fake.requests.DESCRIBE).toBe(items.length);
+  });
+
+  it('counts a region listed twice, in any case, once', async () => {
+    const { fake, storage } = await setup();
+    const items = await upload(storage, 4);
+    fake.replicate('r/0', ['UK']);
+    const report = await checkReplication(storage, items, ['UK', 'uk', 'SYD'], { concurrency: 2 });
+    expect(report).toMatchObject({ checked: 4, replicated: 0, partial: 4 });
+    expect(report.regions).toEqual({ UK: 1, SYD: 0 });
+    expect(report.coverage).toEqual({ UK: 0.25, SYD: 0 });
   });
 });
 
 describe('bunny:replication CLI', () => {
-  function run(fake: FakeStorage, args: string[], env: Record<string, string> = {}) {
-    const child = spawn(process.execPath, ['--import=tsx', 'src/bunny/cli/replication.ts', ...args], {
-      cwd: TILES_DIR,
-      env: {
-        ...process.env,
-        BUNNY_STORAGE_ZONE: fake.zone,
-        BUNNY_STORAGE_PASSWORD: fake.password,
-        BUNNY_STORAGE_HOST: fake.url,
-        ...env,
-      },
-    });
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (chunk) => (stdout += chunk));
-    child.stderr.on('data', (chunk) => (stderr += chunk));
-    return new Promise<{ code: number | null; report: Record<string, any>; stderr: string }>((resolve) =>
-      child.once('exit', (code) => resolve({ code, report: stdout ? JSON.parse(stdout) : {}, stderr })),
-    );
+  /** Runs the CLI to its end; a nonzero exit is a result, a signal or spawn failure or a report not JSON an error. */
+  async function run(
+    fake: FakeStorage,
+    args: string[],
+    env: Record<string, string> = {},
+  ): Promise<{ code: number; report: Record<string, any>; stderr: string }> {
+    let code = 0;
+    let stdout: string;
+    let stderr: string;
+    try {
+      ({ stdout, stderr } = await promisify(execFile)(
+        process.execPath,
+        ['--import=tsx', 'src/bunny/cli/replication.ts', ...args],
+        {
+          cwd: TILES_DIR,
+          maxBuffer: 64 * 2 ** 20,
+          env: {
+            ...process.env,
+            BUNNY_STORAGE_ZONE: fake.zone,
+            BUNNY_STORAGE_PASSWORD: fake.password,
+            BUNNY_STORAGE_HOST: fake.url,
+            // Pinned addresses exported in the shell would win over the fake's host.
+            BUNNY_STORAGE_ADDRESSES: '127.0.0.1',
+            ...env,
+          },
+        },
+      ));
+    } catch (error) {
+      const failed = error as ExecFileException & { stdout?: string; stderr?: string };
+      if (typeof failed.code !== 'number') {
+        throw error;
+      }
+      code = failed.code;
+      stdout = failed.stdout ?? '';
+      stderr = failed.stderr ?? '';
+    }
+    return { code, report: stdout ? (JSON.parse(stdout) as Record<string, any>) : {}, stderr };
   }
 
   it('checks samples and whole ranges against the archive', async () => {
@@ -320,6 +456,17 @@ describe('bunny:replication CLI', () => {
     ]);
     expect(waited.code, waited.stderr).toBe(1);
     expect(waited.report).toMatchObject({ complete: false, files: 21, missing: [tilePath('itest', 9)] });
+
+    // A range or sample with no position in the archive checks nothing: an error, not a pass, and no report.
+    const describes = fake.requests.DESCRIBE;
+    const beyond = [...common, '--from-id', String(positions + 100), '--to-id', String(positions + 200)];
+    for (const extra of [[], ['--wait', '--timeout-min', '1'], ['--sample', '5']]) {
+      const nothing = await run(fake, [...beyond, ...extra]);
+      expect(nothing.code, nothing.stderr).toBe(1);
+      expect(nothing.stderr).toMatch(/No file to check/);
+      expect(nothing.report).toEqual({});
+    }
+    expect(fake.requests.DESCRIBE).toBe(describes);
   }, 60_000);
 
   it('checks a sample against the live manifest with --live, and every column with --listing', async () => {
@@ -384,11 +531,17 @@ describe('bunny:replication CLI', () => {
     expect(listed.report.held).toEqual({ UK: positions - 2, SYD: positions - 2 });
     expect(listed.report.byZoom['5']).toMatchObject({ columns: 32, expected: 1024, present: 1024, missing: 0 });
 
-    // A pending build may have written anywhere it differs: nothing is checked until a sync finishes.
+    // A pending build may have written anywhere it differs: nothing is checked until a sync finishes. Saying so
+    // needs neither the live manifest (here missing) nor the tiles zone (here a host that does not resolve).
     const pending = [{ build: '20261119', manifest: live.manifest, positions, startedAt: live.updatedAt }];
-    await writeState(store, { ...live, pending });
-    const skipped = await run(fake, args, env);
+    await writeState(store, { ...live, manifest: 'manifests/20261117.tman.zst', pending });
+    const skipped = await run(fake, args, {
+      ...env,
+      BUNNY_STORAGE_HOST: 'http://tiles-storage.invalid',
+      BUNNY_STORAGE_ADDRESSES: '',
+    });
     expect(skipped.code, skipped.stderr).toBe(0);
+    expect(skipped.report).toMatchObject({ prefix: 'itest', build: '20261118', mode: 'sample-per-zoom', seed: 3 });
     expect(skipped.report.skipped).toMatch(/pending builds 20261119/);
 
     const usage = await run(fake, ['--live'], env);
@@ -411,6 +564,48 @@ describe('bunny:replication CLI', () => {
         expect(result.stderr).toMatch(message);
         expect(result.report).toEqual({});
       }
+    }
+    expect(fake.requests).toEqual({});
+  }, 30_000);
+
+  it('with --listing counts only canonical file names, and a region listed twice once', async () => {
+    const { fake } = await setup({ regions: ['UK', 'SYD'] });
+    // z0 and z1: 5 positions, each in Sydney and all but one in the UK.
+    for (let tileId = 0; tileId < zoomEnd(1); tileId++) {
+      const regions = tileId === 3 ? ['SYD'] : ['UK', 'SYD'];
+      fake.seed(tilePath('lt', tileId), new TextEncoder().encode(`t${tileId}`), regions);
+    }
+    const args = ['--listing', '--prefix', 'lt', '--max-zoom', '1', '--regions', 'UK,uk,SYD'];
+    const lagging = await run(fake, args);
+    expect(lagging.code, lagging.stderr).toBe(2);
+    expect(lagging.report).toMatchObject({ regions: ['UK', 'SYD'], expected: 5, present: 5, missing: 0 });
+    expect(lagging.report.held).toEqual({ UK: 4, SYD: 5 });
+    expect(lagging.report.coverage).toEqual({ UK: 0.8, SYD: 1 });
+
+    // Clients ask for the name tilePath() gives a position: a leading zero names another object.
+    const canonical = tilePath('lt', 2);
+    const alias = canonical.replace(/\/(\d+)\.mvt$/, '/0$1.mvt');
+    fake.files.delete(canonical);
+    fake.seed(alias, new TextEncoder().encode('t2'), ['UK', 'SYD']);
+    const aliased = await run(fake, args);
+    expect(aliased.code, aliased.stderr).toBe(1);
+    expect(aliased.report).toMatchObject({ present: 4, missing: 1, missingPaths: [canonical] });
+  });
+
+  it('refuses arguments that would check nothing, or something other than asked', async () => {
+    const { fake } = await setup();
+    for (const [args, message] of [
+      [['--listing', '--prefix', 'itest', '--from-id', '0', '--to-id', '5'], /--listing walks whole zooms/],
+      [['--listing', '--prefix', 'itest', '--regions', ' , '], /--regions needs region codes/],
+      [['--archive', 'none.pmtiles', '--sample', '0'], /--sample must be at least 1/],
+      [['--archive', 'none.pmtiles', '--wait', '--timeout-min', '0'], /--timeout-min must be at least 1/],
+      // Before the state zone is read (none is configured here), so a pending-build skip cannot hide it.
+      [['--live', '--sample', '5', '--from-id', '9', '--to-id', '3'], /Empty range \[9, 3\)/],
+    ] as const) {
+      const result = await run(fake, [...args]);
+      expect(result.code, result.stderr).toBe(3);
+      expect(result.stderr).toMatch(message);
+      expect(result.report).toEqual({});
     }
     expect(fake.requests).toEqual({});
   }, 30_000);
