@@ -79,10 +79,12 @@ doesn't offer fails each download, naming those it does, and the PUT is refused
 with them (400) when the server has the build's manifest at hand. A continent
 dir keeps a ledger of what each of its files holds, `.file_sha256` (a line
 `<name> <sha256>` each, `-` while unknown), and a download skips a file only
-where the ledger names the build's sha256 for it, and removes the files the
-ledger names that its selection doesn't take (another selection's or build's).
-The dir names its build in `.build_date` once a whole selection of it is in and
-those are gone; a download that fetches or removes anything removes it first.
+where the ledger names the build's sha256 for it. It removes the files its
+selection doesn't take (another selection's or build's) that the ledger names,
+or whose names files of the build have, the ledger naming them or not; files of
+other names stay. The dir names its build in `.build_date` once a whole
+selection of it is in and those are gone; a download that fetches or removes
+anything removes it first.
 Downloads into a dir go one at a time, those of other servers on the data dir
 too: each holds a lock on the dir's `.download.lock`. A server that starts
 checks and loads a dir that holds that file under a shared lock on it, so that

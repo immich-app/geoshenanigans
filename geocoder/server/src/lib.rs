@@ -3428,9 +3428,10 @@ impl Index {
 
 /// The stamp of a continent dir the server's downloader fills: the date of
 /// the build it holds a complete selection of, and no other file the
-/// downloader put there. The downloader removes it before it writes or
-/// removes anything else in the dir and puts it back once the last of the
-/// selection is in and the files of others are gone.
+/// downloader put there nor of a name a file of the build has. The
+/// downloader removes it before it writes or removes anything else in the
+/// dir and puts it back once the last of the selection is in and the files
+/// of others are gone.
 pub const BUILD_STAMP: &str = ".build_date";
 
 /// The ledger the server's downloader keeps in a continent dir of what each

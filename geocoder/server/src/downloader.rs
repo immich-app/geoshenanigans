@@ -495,6 +495,15 @@ fn fetches<'a>(cfg: &'a Configurations, paths: &[&'a String]) -> Result<Vec<Fetc
     Ok(out)
 }
 
+/// Whether there is anything at `path`.
+async fn there(path: &Path) -> Result<bool, DownloadError> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(DownloadError::Io(format!("stat {}: {}", path.display(), e))),
+    }
+}
+
 /// Whether the file at `path` is in `dir` at its size.
 async fn on_disk(dir: &Path, path: &str, entry: &FileEntry) -> bool {
     matches!(tokio::fs::metadata(dir.join(basename(path))).await, Ok(m) if m.len() == entry.size_raw)
@@ -610,19 +619,21 @@ thread_local! {
 /// left, or a fetch a kill cut short, may hold other bytes. Before a fetch
 /// can replace a file the ledger marks it unknown, and once the fetch is
 /// in place (its bytes checked against the manifest's sha256) names its
-/// sha256. A file the ledger names that the selection doesn't take (an
-/// earlier selection's or build's, which Index::load would read beside
-/// this one's) is removed before the first fetch, and its line goes when
-/// the ledger is rewritten. The dir's stamp (BUILD_STAMP) says it holds a
-/// complete selection of the build it names and no other file the ledger
-/// names: a download that fetches or removes anything removes the stamp
-/// before it writes anything else, and puts it in once the last fetch is
-/// in, the ledger rewritten with a line a file of the selection; one that
-/// has nothing to fetch or remove in a dir stamped with its build writes
-/// nothing. Downloads into the dir go one at a time, across processes too,
-/// and a server starting loads the dir only while none runs
-/// (DOWNLOAD_LOCK). A unit's files land together, so a download needs the
-/// largest unit's files' size free beside the region.
+/// sha256. A file the selection doesn't take (an earlier selection's or
+/// build's, which Index::load would read beside this one's) is removed
+/// before the first fetch: each the ledger names, and each of a name a file
+/// of the build has in any selection, the ledger naming it or not (a dir
+/// laid out by hand, or whose ledger was lost); a file of another name
+/// stays. Their lines go when the ledger is rewritten. The dir's stamp
+/// (BUILD_STAMP) says it holds a complete selection of the build it names
+/// and none of those files: a download that fetches or removes anything
+/// removes the stamp before it writes anything else, and puts it in once
+/// the last fetch is in, the ledger rewritten with a line a file of the
+/// selection; one that has nothing to fetch or remove in a dir stamped with
+/// its build writes nothing. Downloads into the dir go one at a time,
+/// across processes too, and a server starting loads the dir only while
+/// none runs (DOWNLOAD_LOCK). A unit's files land together, so a download
+/// needs the largest unit's files' size free beside the region.
 ///
 /// `progress` fires after each file or unit completes with the running
 /// total; the caller logs it.
@@ -677,7 +688,16 @@ pub async fn download_region(
     }
     let to_fetch = in_place.contains(&false);
     let taken: HashSet<&str> = paths.iter().map(|p| basename(p)).collect();
-    let others: Vec<String> = ledger.held.keys().filter(|name| !taken.contains(name.as_str())).cloned().collect();
+    // The files the selection doesn't take: each the ledger names, and each
+    // in the dir of a name a file of the build has in any selection, the
+    // ledger naming it or not. Other names stay.
+    let mut others: BTreeSet<String> = ledger.held.keys().filter(|name| !taken.contains(name.as_str())).cloned().collect();
+    let build_names: BTreeSet<&str> = cfg.files.keys().map(|p| basename(p)).filter(|name| !taken.contains(name)).collect();
+    for name in build_names {
+        if !others.contains(name) && there(&region_dir.join(name)).await? {
+            others.insert(name.to_string());
+        }
+    }
     let changes = to_fetch || !others.is_empty();
     let stamped = tokio::fs::read_to_string(&stamp).await.is_ok_and(|s| s.trim() == cfg.build.date);
     if changes {
@@ -1624,6 +1644,83 @@ mod tests {
             assert_eq!((left, stamped, fetched), (Vec::<&String>::new(), false, 0), "{mode}");
             assert_eq!(differing(&held(&dir), &files_of(&bucket, &after)), Vec::<String>::new(), "{mode}");
         }
+    }
+
+    /// The names of the files of `before` that `after` doesn't take, and the
+    /// files of names no file of the build has, hidden or not.
+    fn not_taken(bucket: &TestBucket, before: &RegionSelection, after: &RegionSelection) -> (Vec<String>, BTreeMap<String, Vec<u8>>) {
+        let theirs: Vec<String> = files_of(bucket, before).into_keys().filter(|n| !files_of(bucket, after).contains_key(n)).collect();
+        assert!(theirs.len() > 1 && theirs.iter().all(|n| n.starts_with("poi_") || n.starts_with("strings_poi")), "{theirs:?}");
+        let unknown = [("notes.txt", "not the build's"), (".notes", "nor the build's")];
+        (theirs, unknown.into_iter().map(|(n, b)| (n.to_string(), b.as_bytes().to_vec())).collect())
+    }
+
+    // A file of a name a file of the build has, that the selection doesn't
+    // take, goes though the ledger doesn't name it: Index::load would read it
+    // beside the selection's. A dir with no ledger (lost, or laid out by
+    // hand), stamped with the build or not, holding poi tier major's files,
+    // switches to poi tier none: the POI files go, and files of other names
+    // stay.
+    #[tokio::test]
+    async fn a_switch_removes_the_files_of_the_build_it_doesnt_take_that_no_ledger_names() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (before, after) = (sel("europe", "admin", "simplified", "major"), sel("europe", "admin", "simplified", "none"));
+        let (_, unknown) = not_taken(&bucket, &before, &after);
+        for stamped in [true, false] {
+            let root = ScratchDir::new();
+            let dir = root.path().join("europe");
+            download(&bucket, &before, root.path()).await.unwrap();
+            std::fs::remove_file(dir.join(FILE_LEDGER)).unwrap();
+            if !stamped {
+                std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap();
+            }
+            for (name, bytes) in &unknown {
+                std::fs::write(dir.join(name), bytes).unwrap();
+            }
+
+            download(&bucket, &after, root.path()).await.unwrap();
+
+            let mut want = files_of(&bucket, &after);
+            want.extend(unknown.clone());
+            assert_eq!(differing(&held(&dir), &want), Vec::<String>::new(), "stamped: {stamped}");
+        }
+    }
+
+    // Removing such a file is a write: the stamp goes first. A dir holding
+    // the whole selection, stamped with the build, and POI files of the
+    // build that its ledger doesn't name (put there by hand): the download
+    // has nothing to fetch, and removes the stamp, then those files; stopped
+    // there, as a kill would, it leaves no stamp and none of them; retried,
+    // it stamps the dir again, fetching nothing. Files of other names stay.
+    #[tokio::test]
+    async fn a_download_removes_the_stamp_then_the_files_of_the_build_it_doesnt_take_that_no_ledger_names() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (before, after) = (sel("europe", "admin", "simplified", "major"), sel("europe", "admin", "simplified", "none"));
+        let (theirs, unknown) = not_taken(&bucket, &before, &after);
+        let (root, other) = (ScratchDir::new(), ScratchDir::new());
+        download(&bucket, &before, other.path()).await.unwrap();
+        download(&bucket, &after, root.path()).await.unwrap();
+        let dir = root.path().join("europe");
+        for name in &theirs {
+            std::fs::copy(other.path().join("europe").join(name), dir.join(name)).unwrap();
+        }
+        for (name, bytes) in &unknown {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+        let served = bucket.files_served();
+        STOP_ONCE_REMOVED.set(true);
+
+        let stopped = download(&bucket, &after, root.path()).await.map_err(|e| e.to_string());
+        let left: Vec<&String> = theirs.iter().filter(|n| dir.join(n).exists()).collect();
+        let stamped = dir.join(BUILD_STAMP).exists();
+        download(&bucket, &after, root.path()).await.unwrap();
+
+        assert_eq!(stopped, Err("I/O error: stopped once the files the selection doesn't take were removed".to_string()));
+        assert_eq!((left, stamped), (Vec::<&String>::new(), false));
+        assert_eq!(bucket.files_served(), served);
+        let mut want = files_of(&bucket, &after);
+        want.extend(unknown);
+        assert_eq!(differing(&held(&dir), &want), Vec::<String>::new());
     }
 
     // A last line a kill cut short says nothing of its file, though it names
