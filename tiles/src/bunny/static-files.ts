@@ -67,13 +67,34 @@ function checkPrefix(value: string | undefined): string {
   return prefix;
 }
 
-function normalise(options: Pick<StaticFilesOptions, 'publicUrl' | 'prefix' | 'staticPrefix'>) {
-  const publicUrl = new URL(options.publicUrl);
-  if (publicUrl.search || publicUrl.hash) {
-    throw new Error(`Public URL must not have a query or fragment: ${options.publicUrl}`);
+/**
+ * What the TileJSON and styles put before their paths: the public URL's origin and path, without a trailing slash.
+ * Throws for a URL they could not carry as given: not an absolute http(s) URL, or with credentials, a query or a
+ * fragment (an empty `?` or `#` too).
+ */
+export function publicUrlBase(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error(`Public URL must be an absolute http(s) URL, got ${JSON.stringify(value)}`);
   }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    throw new Error(`Public URL must be http(s), got ${JSON.stringify(value)}`);
+  }
+  // Not echoed: the value holds a password.
+  if (url.username || url.password) {
+    throw new Error('Public URL must not have credentials');
+  }
+  if (/[?#]/.test(url.href)) {
+    throw new Error(`Public URL must not have a query or fragment: ${value}`);
+  }
+  return `${url.origin}${url.pathname.replace(/\/+$/, '')}`;
+}
+
+function normalise(options: Pick<StaticFilesOptions, 'publicUrl' | 'prefix' | 'staticPrefix'>) {
   return {
-    base: `${publicUrl.origin}${publicUrl.pathname.replace(/\/+$/, '')}`,
+    base: publicUrlBase(options.publicUrl),
     prefix: checkPrefix(options.prefix),
     staticPrefix: checkPrefix(options.staticPrefix),
   };
@@ -90,8 +111,15 @@ export function tileJson(options: Omit<StaticFilesOptions, 'styles'>) {
 
 /** A style pointed at this zone's TileJSON; unchanged bytes when it already points there. */
 export function rewriteStyle(style: StyleSource, tileJsonUrl: string): Uint8Array {
-  const json = JSON.parse(new TextDecoder().decode(style.body)) as { sources?: Record<string, { url?: string }> };
-  const source = json.sources?.vector;
+  let json: { sources?: Record<string, { url?: string } | null> } | null;
+  try {
+    json = JSON.parse(new TextDecoder().decode(style.body)) as typeof json;
+  } catch (error) {
+    throw new Error(`Style ${style.name} is not JSON: ${error instanceof Error ? error.message : String(error)}`, {
+      cause: error,
+    });
+  }
+  const source = json?.sources?.vector;
   if (!source) {
     throw new Error(`Style ${style.name} has no "vector" source`);
   }
@@ -103,23 +131,39 @@ export function rewriteStyle(style: StyleSource, tileJsonUrl: string): Uint8Arra
   return new TextEncoder().encode(JSON.stringify(json, null, 2));
 }
 
-/** Every non-tile file of the zone, ready to upload. */
-export function staticFiles(options: StaticFilesOptions): StaticFile[] {
-  const { base, staticPrefix } = normalise(options);
-  if (options.styles.length === 0) {
+/** Each style's bytes pointed at the TileJSON, refusing a style the zone could not serve. */
+function styleBodies(styles: StyleSource[], tileJsonUrl: string): Uint8Array[] {
+  if (styles.length === 0) {
     throw new Error('No styles');
   }
-  const files = [file(`${staticPrefix}.json`, new TextEncoder().encode(JSON.stringify(tileJson(options))))];
-  for (const style of options.styles) {
+  return styles.map((style) => {
     if (!STYLE_NAME.test(style.name)) {
       throw new Error(`Style name ${JSON.stringify(style.name)} isn't one the tile URLs can address`);
     }
-    const body = rewriteStyle(style, `${base}/${staticPrefix}.json`);
+    return rewriteStyle(style, tileJsonUrl);
+  });
+}
+
+/**
+ * Throws for anything staticFiles would refuse but the archive: a sync writes these files after the tiles, so it
+ * checks them before it writes anything.
+ */
+export function checkStaticFiles(options: Omit<StaticFilesOptions, 'header' | 'metadata'>): void {
+  const { base, staticPrefix } = normalise(options);
+  styleBodies(options.styles, `${base}/${staticPrefix}.json`);
+}
+
+/** Every non-tile file of the zone, ready to upload. */
+export function staticFiles(options: StaticFilesOptions): StaticFile[] {
+  const { base, staticPrefix } = normalise(options);
+  const bodies = styleBodies(options.styles, `${base}/${staticPrefix}.json`);
+  const files = [file(`${staticPrefix}.json`, new TextEncoder().encode(JSON.stringify(tileJson(options))))];
+  options.styles.forEach((style, i) => {
     files.push(
-      file(`${staticPrefix}/style/${style.name}.json`, body),
-      file(`${staticPrefix}/style/${style.name}`, body),
+      file(`${staticPrefix}/style/${style.name}.json`, bodies[i]),
+      file(`${staticPrefix}/style/${style.name}`, bodies[i]),
     );
-  }
+  });
   return files;
 }
 

@@ -2,7 +2,14 @@ import { createHash } from 'node:crypto';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { readStyles, rewriteStyle, staticFiles, StyleSource } from '../../src/bunny/static-files';
+import {
+  checkStaticFiles,
+  publicUrlBase,
+  readStyles,
+  rewriteStyle,
+  staticFiles,
+  StyleSource,
+} from '../../src/bunny/static-files';
 import { openArchiveFile } from '../../src/deploy/archive-file';
 import { IDatabaseRepository, IMemCacheRepository, IMetricsRepository, IStorageRepository } from '../../src/interface';
 import { PMTilesService } from '../../src/pmtiles.service';
@@ -134,6 +141,55 @@ describe('staticFiles', () => {
     expect(() => staticFiles({ ...options, publicUrl: `${PROD}?x=1` })).toThrow(/query/);
     const noSource = { name: 'bare', body: new TextEncoder().encode('{"version":8,"sources":{}}') };
     expect(() => rewriteStyle(noSource, `${PROD}/v1.json`)).toThrow(/no "vector" source/);
+    const notJson = { name: 'cut', body: new TextEncoder().encode('{"version":8,') };
+    expect(() => rewriteStyle(notJson, `${PROD}/v1.json`)).toThrow(/Style cut is not JSON/);
+    const nullJson = { name: 'empty', body: new TextEncoder().encode('null') };
+    expect(() => rewriteStyle(nullJson, `${PROD}/v1.json`)).toThrow(/no "vector" source/);
+  });
+});
+
+describe('publicUrlBase', () => {
+  it('keeps the origin and path, without a trailing slash', () => {
+    expect(publicUrlBase(PROD)).toBe(PROD);
+    expect(publicUrlBase(`${PROD}/`)).toBe(PROD);
+    expect(publicUrlBase('HTTPS://Tiles.Immich.Cloud:443')).toBe(PROD);
+    expect(publicUrlBase('http://127.0.0.1:8080/tiles//')).toBe('http://127.0.0.1:8080/tiles');
+  });
+
+  it('refuses a URL the TileJSON and styles cannot carry as given', () => {
+    expect(() => publicUrlBase('')).toThrow(/absolute http\(s\) URL/);
+    expect(() => publicUrlBase('tiles.immich.cloud')).toThrow(/absolute http\(s\) URL/);
+    expect(() => publicUrlBase('/v1')).toThrow(/absolute http\(s\) URL/);
+    expect(() => publicUrlBase('ftp://tiles.immich.cloud')).toThrow(/must be http\(s\)/);
+    expect(() => publicUrlBase('data:text/plain,x')).toThrow(/must be http\(s\)/);
+    for (const url of [`${PROD}?v=1`, `${PROD}/?`, `${PROD}#map`, `${PROD}/#`]) {
+      expect(() => publicUrlBase(url), url).toThrow(/must not have a query or fragment/);
+    }
+    expect(() => publicUrlBase('https://user:secret@tiles.immich.cloud')).toThrow(
+      /^Public URL must not have credentials$/,
+    );
+  });
+});
+
+describe('checkStaticFiles', () => {
+  it('passes what staticFiles takes and refuses what it refuses, without the archive', () => {
+    const ok = { styles, publicUrl: PROD };
+    expect(() => checkStaticFiles(ok)).not.toThrow();
+    expect(() => checkStaticFiles({ ...ok, publicUrl: `${PROD}/`, prefix: 'v1/e2', staticPrefix: 'v1' })).not.toThrow();
+    const bad: [Partial<Parameters<typeof checkStaticFiles>[0]>, RegExp][] = [
+      [{ publicUrl: 'tiles.immich.cloud' }, /absolute http\(s\) URL/],
+      [{ publicUrl: `${PROD}?v=1` }, /query/],
+      [{ styles: [] }, /No styles/],
+      [{ styles: [{ name: 'my-style', body: styles[0].body }] }, /address/],
+      [{ styles: [{ name: 'bare', body: new TextEncoder().encode('{"sources":{}}') }] }, /no "vector" source/],
+      [{ styles: [{ name: 'cut', body: new TextEncoder().encode('{') }] }, /not JSON/],
+      [{ prefix: 'a/../b' }, /Invalid prefix/],
+      [{ staticPrefix: '/' }, /Invalid prefix/],
+    ];
+    for (const [change, error] of bad) {
+      expect(() => checkStaticFiles({ ...ok, ...change }), String(error)).toThrow(error);
+      expect(() => staticFiles({ header, metadata, ...ok, ...change }), String(error)).toThrow(error);
+    }
   });
 });
 

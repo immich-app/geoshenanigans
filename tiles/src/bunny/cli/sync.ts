@@ -32,6 +32,9 @@
  * storage.bunnycdn.com, BUNNY_STORAGE_ADDRESSES to pin the storage IPs, STYLES_DIR (the map-styles build) unless
  * --styles-dir is given, and BUNNY_API_URL only to point the purge at a local stand-in. Manifests go to --work-dir
  * (default a new directory under TMPDIR, removed afterwards).
+ * Everything a run needs is checked before it starts: an option it doesn't know, a flag given a value, an option
+ * without one, a public URL the TileJSON can't carry, a style it can't serve or a pull zone id the purge can't use
+ * fails the run before its first request, not after the tiles are written.
  *
  * The report (--report, and stdout) is written however the run ends, including a first SIGINT/SIGTERM, which stops
  * taking new files and lets the requests in flight finish (a second exits at once).
@@ -43,9 +46,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { parseMd5Base64 } from '../archive-identity';
-import { purgePullZoneFromEnv } from '../purge';
+import { purgePullZone, purgeUrl } from '../purge';
 import { BunnyStateStore } from '../state';
-import { readStyles } from '../static-files';
+import { checkStaticFiles, readStyles } from '../static-files';
 import { BunnyStorage, resolveStorageAddresses, storageOptionsFromEnv } from '../storage';
 import { emptyReport, runSync, SYNC_DEFAULTS, SyncReport, SyncStep } from '../sync';
 
@@ -53,12 +56,21 @@ const ADDRESS_REFRESH_MS = 5 * 60_000;
 /** Steps that write to the tiles zone: a stop lets their requests finish rather than exiting at once. */
 const WRITING_STEPS: SyncStep[] = ['upload', 'static'];
 
+const INTEGER = /^\d+$/;
+const DECIMAL = /^(\d+\.?\d*|\.\d+)$/;
+
+/** A number in plain decimal notation: not empty, hex, an exponent or padded, which Number() would all take. */
 function number(name: string, value: string | undefined, min = 0, integer = true): number | undefined {
   if (value === undefined) {
     return undefined;
   }
   const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed < min || (integer && !Number.isSafeInteger(parsed))) {
+  if (
+    !(integer ? INTEGER : DECIMAL).test(value) ||
+    !Number.isFinite(parsed) ||
+    parsed < min ||
+    (integer && !Number.isSafeInteger(parsed))
+  ) {
     throw new Error(`--${name} must be ${integer ? 'an integer' : 'a number'} of at least ${min}, got ${value}`);
   }
   return parsed;
@@ -121,11 +133,26 @@ const OPTIONS = {
 
 const log = (line: string) => process.stderr.write(`[${new Date().toISOString()}] ${line}\n`);
 
+/**
+ * The options every decision of the run reads. Strict: an unknown option, a positional argument, a flag given a value
+ * (`--dry-run=true`), an option missing its value or given an empty one is refused, never read as a default.
+ */
+function parseOptions() {
+  const { values } = parseArgs({ options: OPTIONS, strict: true });
+  for (const [name, value] of Object.entries(values)) {
+    if ([value].flat().includes('')) {
+      throw new Error(`--${name} needs a value`);
+    }
+  }
+  return values;
+}
+
 async function main(): Promise<number> {
-  // Not strict, so a bad option still leaves a report: unknown ones are refused below, once it is written.
-  const { values } = parseArgs({ options: OPTIONS, strict: false });
-  const text = (name: string) => (typeof values[name] === 'string' ? (values[name] as string) : undefined);
-  const flag = (name: string) => values[name] === true;
+  // A permissive parse only to start the report, so a command line parseOptions refuses still leaves one that says
+  // why. Nothing the run does reads it.
+  const { values: given } = parseArgs({ options: OPTIONS, strict: false });
+  const text = (name: keyof typeof OPTIONS) => (typeof given[name] === 'string' ? (given[name] as string) : undefined);
+  const flag = (name: keyof typeof OPTIONS) => given[name] === true;
   const reportFile = new ReportFile(text('report'));
   let report = emptyReport({
     build: text('build') ?? '',
@@ -144,30 +171,37 @@ async function main(): Promise<number> {
   let ownWorkDir: string | undefined;
   let refresh: NodeJS.Timeout | undefined;
   try {
-    const known = new Set(Object.keys(OPTIONS));
-    const unknown = Object.keys(values).filter((name) => !known.has(name));
-    if (unknown.length > 0) {
-      throw new Error(`Unknown option ${unknown.map((name) => `--${name}`).join(', ')}`);
-    }
-    const archive = text('archive');
-    const build = text('build');
+    const values = parseOptions();
+    const { archive, build } = values;
     if (!archive || !build || !/^\d{8}$/.test(build)) {
       throw new Error('Usage: bunny:sync --archive <path> --build <YYYYMMDD> [options]; see src/bunny/cli/sync.ts');
     }
-    const archiveMd5 = text('archive-md5');
+    const archiveMd5 = values['archive-md5'];
     if (archiveMd5 !== undefined) {
       parseMd5Base64(archiveMd5);
     }
-    const osmDate = text('osm-date');
+    const osmDate = values['osm-date'];
     if (osmDate !== undefined && Number.isNaN(Date.parse(osmDate))) {
       throw new Error(`--osm-date must be an ISO date, got ${osmDate}`);
     }
-    const dryRun = flag('dry-run');
-    const requestTimeoutS = number('request-timeout-s', text('request-timeout-s'), 1) ?? 60;
-    const concurrency = number('concurrency', text('concurrency'), 1) ?? SYNC_DEFAULTS.concurrency;
+    const dryRun = values['dry-run'];
+    const requestTimeoutS = number('request-timeout-s', values['request-timeout-s'], 1) ?? 60;
+    const concurrency = number('concurrency', values.concurrency, 1) ?? SYNC_DEFAULTS.concurrency;
     const replicationConcurrency =
-      number('replication-concurrency', text('replication-concurrency'), 1) ?? SYNC_DEFAULTS.replicationConcurrency;
-    const regionList = text('regions');
+      number('replication-concurrency', values['replication-concurrency'], 1) ?? SYNC_DEFAULTS.replicationConcurrency;
+    const numbers = {
+      maxChangedFraction: number('max-changed-fraction', values['max-changed-fraction'], 0, false),
+      replicationTimeoutMs:
+        (number('replication-timeout-min', values['replication-timeout-min'], 0, false) ?? 120) * 60_000,
+      replicationIntervalMs:
+        (number('replication-interval-s', values['replication-interval-s'], 1, false) ?? 30) * 1000,
+      maxZoom: number('max-zoom', values['max-zoom']),
+      keepManifests: number('keep-manifests', values['keep-manifests']),
+      adoptSamples: number('adopt-samples', values['adopt-samples'], 1),
+      threads: number('threads', values.threads, 1),
+      maxFailures: number('max-failures', values['max-failures'], 1),
+    };
+    const regionList = values.regions;
     const regions =
       regionList === 'none'
         ? []
@@ -183,7 +217,7 @@ async function main(): Promise<number> {
     let publicUrl: string | undefined;
     let purge: (() => Promise<unknown>) | undefined;
     if (!dryRun) {
-      const stylesDir = text('styles-dir') ?? process.env.STYLES_DIR;
+      const stylesDir = values['styles-dir'] ?? process.env.STYLES_DIR;
       if (!stylesDir) {
         throw new Error('--styles-dir or STYLES_DIR (the map-styles build) is needed to write the TileJSON and styles');
       }
@@ -192,11 +226,18 @@ async function main(): Promise<number> {
       if (!publicUrl) {
         throw new Error('BUNNY_PUBLIC_URL must be set');
       }
-      if (!process.env.BUNNY_API_KEY || !process.env.BUNNY_PULL_ZONE_ID) {
+      // The TileJSON and styles are written after the tiles, and the purge after the gate: what either would refuse
+      // must stop the run here, not leave a pending build and changed tiles behind.
+      checkStaticFiles({ publicUrl, styles, prefix: values.prefix, staticPrefix: values['static-prefix'] });
+      const apiKey = process.env.BUNNY_API_KEY;
+      const pullZoneId = process.env.BUNNY_PULL_ZONE_ID;
+      if (!apiKey || !pullZoneId) {
         throw new Error('BUNNY_API_KEY and BUNNY_PULL_ZONE_ID must be set');
       }
+      const apiUrl = process.env.BUNNY_API_URL || undefined;
+      purgeUrl(pullZoneId, apiUrl);
       purge = async () => {
-        const result = await purgePullZoneFromEnv(process.env, { baseUrl: process.env.BUNNY_API_URL || undefined });
+        const result = await purgePullZone(apiKey, pullZoneId, { baseUrl: apiUrl });
         log(`purge: HTTP ${result.status} after ${result.attempts} attempt(s) in ${result.ms} ms`);
       };
       const options = storageOptionsFromEnv();
@@ -217,7 +258,7 @@ async function main(): Promise<number> {
     }
     state = BunnyStateStore.fromEnv();
 
-    let workDir = text('work-dir');
+    let workDir = values['work-dir'];
     if (workDir) {
       await mkdir(workDir, { recursive: true });
     } else {
@@ -252,32 +293,23 @@ async function main(): Promise<number> {
         archive,
         build,
         osmDate,
-        prefix: text('prefix'),
-        maxChangedFraction: number('max-changed-fraction', text('max-changed-fraction'), 0, false),
-        replicationTimeoutMs:
-          (number('replication-timeout-min', text('replication-timeout-min'), 0, false) ?? 120) * 60_000,
-        replicationIntervalMs:
-          (number('replication-interval-s', text('replication-interval-s'), 1, false) ?? 30) * 1000,
+        prefix: values.prefix,
+        ...numbers,
         replicationConcurrency,
         regions,
-        maxZoom: number('max-zoom', text('max-zoom')),
-        statePrefix: text('state-prefix'),
+        statePrefix: values['state-prefix'],
         dryRun,
-        forceFull: flag('force-full'),
-        adopt: flag('adopt'),
-        replace: flag('replace'),
-        seedStates: [values['seed-state'] ?? []].flat().filter((dir): dir is string => typeof dir === 'string'),
+        forceFull: values['force-full'],
+        adopt: values.adopt,
+        replace: values.replace,
+        seedStates: values['seed-state'] ?? [],
         archiveMd5,
-        staticPrefix: text('static-prefix'),
-        keepManifests: number('keep-manifests', text('keep-manifests')),
-        adoptSamples: number('adopt-samples', text('adopt-samples'), 1),
-        plainPuts: flag('plain-puts'),
+        staticPrefix: values['static-prefix'],
+        plainPuts: values['plain-puts'],
         publicUrl,
         styles,
         workDir,
-        threads: number('threads', text('threads'), 1),
         concurrency,
-        maxFailures: number('max-failures', text('max-failures'), 1),
         signal: controller.signal,
         log,
         onStep: (step) => (current = step),

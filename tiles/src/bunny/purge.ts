@@ -24,19 +24,31 @@ export interface PurgeResult {
   ms: number;
 }
 
+/**
+ * The purge endpoint of a pull zone. Throws for a pull zone id that isn't numeric or an API URL that isn't http(s), so
+ * a caller that purges only after hours of work can check both before it starts.
+ */
+export function purgeUrl(pullZoneId: string | number, baseUrl = DEFAULT_API_URL): string {
+  const id = String(pullZoneId);
+  if (!/^\d+$/.test(id)) {
+    throw new Error(`Pull zone id must be numeric, got ${JSON.stringify(id)}`);
+  }
+  if (!/^https?:$/.test(URL.parse(baseUrl)?.protocol ?? '')) {
+    throw new Error(`Bunny API URL must be an absolute http(s) URL, got ${JSON.stringify(baseUrl)}`);
+  }
+  return `${baseUrl.replace(/\/+$/, '')}/pullzone/${id}/purgeCache`;
+}
+
 export async function purgePullZone(
   apiKey: string,
   pullZoneId: string | number,
   options: PurgeOptions = {},
 ): Promise<PurgeResult> {
+  const url = purgeUrl(pullZoneId, options.baseUrl);
   const id = String(pullZoneId);
-  if (!/^\d+$/.test(id)) {
-    throw new Error(`Pull zone id must be numeric, got ${JSON.stringify(id)}`);
-  }
   if (!apiKey) {
     throw new Error('Missing Bunny API key');
   }
-  const url = `${(options.baseUrl ?? DEFAULT_API_URL).replace(/\/+$/, '')}/pullzone/${id}/purgeCache`;
   const attempts = options.attempts ?? 6;
   const baseDelay = options.baseDelayMs ?? 2_000;
   const started = performance.now();
@@ -70,12 +82,4 @@ export async function purgePullZone(
     }
   }
   throw new PurgeError(`Purge of pull zone ${id} failed after ${attempts} attempts: ${last}`);
-}
-
-/** Purges BUNNY_PULL_ZONE_ID with BUNNY_API_KEY. */
-export function purgePullZoneFromEnv(env = process.env, options?: PurgeOptions): Promise<PurgeResult> {
-  if (!env.BUNNY_API_KEY || !env.BUNNY_PULL_ZONE_ID) {
-    throw new Error('BUNNY_API_KEY and BUNNY_PULL_ZONE_ID must be set');
-  }
-  return purgePullZone(env.BUNNY_API_KEY, env.BUNNY_PULL_ZONE_ID, options);
 }
