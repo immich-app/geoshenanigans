@@ -11,7 +11,7 @@ import { ArchiveRanges } from '../../src/bunny/archive-walk';
 import { clipManifest, readManifest, writeManifest } from '../../src/bunny/manifest';
 import { BunnyStateStore, readState, SyncState } from '../../src/bunny/state';
 import { BunnyStorage } from '../../src/bunny/storage';
-import { planItems, runSync, SyncOptions, SyncReport } from '../../src/bunny/sync';
+import { planItems, runSync, SYNC_DEFAULTS, SyncOptions, SyncReport } from '../../src/bunny/sync';
 import { tileIdZoom, tilePath, zoomEnd } from '../../src/bunny/tile-id';
 import { FakeStorage, FakeStorageOptions, sha256Hex } from './fake-storage';
 import { Build, contentBytes, mutateBuild, randomBuild, rng, writeArchiveFile } from './manifest-fixtures';
@@ -1078,6 +1078,71 @@ describe('runSync', () => {
     expectHolds(w, '20261119');
     expect(w.tiles.identicalReputs).toEqual([]);
     expect(await readState(w.state)).toMatchObject({ liveBuild: '20261119', pending: [] });
+  });
+
+  it('stops --force-full at the guard rail on what it deletes, before writing anything', async () => {
+    const w = await world();
+    await adopted(w);
+    const before = await w.state.get('state.json');
+    // The CLI's default guard rail (the world's options raise it to 1).
+    const refused = async (extra: Partial<SyncOptions>, removed: number) => {
+      w.events.length = 0;
+      const report = await runSync(
+        w.options('20261118', {
+          forceFull: true,
+          maxChangedFraction: SYNC_DEFAULTS.maxChangedFraction,
+          replicationTimeoutMs: GATE_TIMEOUT_MS,
+          ...extra,
+        }),
+        w.deps(),
+      );
+      expect(report).toMatchObject({ status: 'guard_rail', filesUploaded: 0, filesDeleted: null, purged: false });
+      expect(report.error).toContain(
+        `--force-full would delete ${removed} of the live build's ${POSITIONS} positions (${removed / POSITIONS}), ` +
+          'over the guard rail of 0.05: nothing uploaded',
+      );
+      // Not a DESCRIBE, PUT or DELETE in either zone, no purge, and the state as it was.
+      expect(w.events).toEqual([]);
+      expect(w.purges).toBe(0);
+      expect(await w.state.get('state.json')).toEqual(before);
+      expectHolds(w, '20261117');
+      return report.error!;
+    };
+    // --max-zoom under the live build's top zoom: every position of the live build above it would go, and the cut
+    // manifest would become the live one.
+    const above = POSITIONS - zoomEnd(3);
+    expect(await refused({ maxZoom: 3 }, above)).toMatch(
+      new RegExp(
+        `\\. ${above} of them are above --max-zoom 3, which would also make a manifest cut there the live one$`,
+      ),
+    );
+    // Another, smaller archive given by mistake (the new build without zoom 6): the same, without --max-zoom.
+    const z6 = POSITIONS - zoomEnd(5);
+    const y = w.archives['20261118'].build;
+    const smaller = join(w.dir, 'smaller.pmtiles');
+    await writeArchiveFile(
+      smaller,
+      { base: y.base, contents: y.contents.map((content, id) => (id < zoomEnd(5) ? content : null)) },
+      rng(78),
+      { maxZoom: 6, metadata: METADATA, maxLeafEntries: 40 },
+    );
+    expect(await refused({ archive: smaller }, z6)).toMatch(/nothing uploaded$/);
+    // A dry run stops there too.
+    expect(await refused({ maxZoom: 3, dryRun: true }, above)).toContain('above --max-zoom 3');
+
+    // Raised on purpose, the guard rail lets it delete them and make the cut build live.
+    const report = await runSync(
+      w.options('20261118', {
+        forceFull: true,
+        maxZoom: 3,
+        maxChangedFraction: 1,
+        replicationTimeoutMs: GATE_TIMEOUT_MS,
+      }),
+      w.deps(),
+    );
+    expect(report.error).toBeNull();
+    expect(report).toMatchObject({ status: 'success', filesDeleted: above, positionsTotal: zoomEnd(3) });
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261118', positions: zoomEnd(3), pending: [] });
   });
 
   it('keeps --force-full to the live prefix', async () => {

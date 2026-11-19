@@ -11,7 +11,9 @@
  * Without state.json it refuses unless --adopt (record a build bunny:seed uploaded, writing no tiles: every
  * --seed-state dir must say its seed completed, for this archive, zone and prefix, together over every position, and
  * --adopt-samples random positions must hold the build) or --force-full (write every position, each DESCRIBEd first,
- * and delete those the live or a pending build has and this one doesn't; for repairs and small zoom ranges). Under
+ * and delete those the live or a pending build has and this one doesn't; for repairs and small zoom ranges). Its
+ * guard rail is on those deletions: past --max-changed-fraction of the live build's positions (a --max-zoom under
+ * the live build's top zoom, another archive by mistake) it stops with exit 3 before writing anything. Under
  * the live build's key a run (a repair, a revert) refuses an archive whose tiles differ from the live manifest.
  * --adopt --replace switches a live zone to a build seeded under another --prefix (a full rewrite): the same checks,
  * the sample also in every region, then the TileJSON points at the new prefix.

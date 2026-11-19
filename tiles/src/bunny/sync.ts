@@ -4,7 +4,8 @@
  * 2. build the new build's manifest and plan against the live and pending manifests (planSync in diff.ts). A pending
  *    entry of this very build must hold the same tiles as the new manifest: beginBuild replaces its manifest, the only
  *    record of where that attempt wrote, so another archive under the same key is refused (revert it first, below);
- * 3. guard rail: stop before writing anything when more than maxChangedFraction of the positions changed;
+ * 3. guard rail: stop before writing anything when more than maxChangedFraction of the positions changed (with
+ *    --force-full, when it would delete more than that share of the live build's positions);
  * 4. record the build as pending (beginBuild), then upload the changed positions only. Re-PUTting identical bytes
  *    clears a file's ReplicatedZones for good, so every position is DESCRIBEd first and only written when it doesn't
  *    hold the new bytes yet: a re-run after any failure skips what is stored, and a state that doesn't match the zone
@@ -31,6 +32,10 @@
  * --force-full writes every position of the build, each DESCRIBEd first, so it suits a repair or a small zoom range
  * (a planet first load is a seed and then --adopt). It keeps to the live build's prefix, as a diff does, and deletes
  * what a diff would: the positions the live build or a pending one has and this build doesn't (above --max-zoom too).
+ * Its guard rail counts the live build's positions it would delete (not what it writes, nor where it only takes away
+ * what a pending build added): past maxChangedFraction of them it stops before writing anything, so a --max-zoom under
+ * the live build's top zoom, or another (smaller) archive given by mistake, neither empties the zone nor publishes a
+ * cut manifest over the live one, unless --max-changed-fraction allows it.
  * Under the live build's own key a run (a --force-full repair, or a revert) needs the very tiles of the live manifest:
  * no pending entry is made for a build that is live already, so nothing would record where it wrote others.
  *
@@ -412,6 +417,12 @@ const nonZero = (counts: Record<string, number>) =>
 const changedShare = (totals: DiffTotals, positions: number) =>
   (totals.changed + totals.added + totals.removed) / Math.max(1, positions);
 
+/**
+ * The share of the live build's positions a --force-full run deletes, as its guard rail compares it: the run writes
+ * every position of the build anyway, so what it would take away from the live map is what it must not overdo.
+ */
+const deletedShare = (totals: DiffTotals, livePositions: number) => totals.removed / Math.max(1, livePositions);
+
 class SyncRun {
   private o: SyncOptions & typeof SYNC_DEFAULTS;
   private log: (line: string) => void;
@@ -585,6 +596,21 @@ class SyncRun {
         `over the guard rail of ${o.maxChangedFraction}: nothing uploaded`;
       return;
     }
+    if (mode === 'force-full' && state && totals && deletedShare(totals, state.positions) > o.maxChangedFraction) {
+      const above =
+        o.maxZoom === undefined ? 0 : totals.byZoom.slice(o.maxZoom + 1).reduce((sum, zoom) => sum + zoom.removed, 0);
+      report.status = 'guard_rail';
+      report.filesUploaded = 0;
+      report.error =
+        `--force-full would delete ${totals.removed} of the live build's ${state.positions} positions ` +
+        `(${deletedShare(totals, state.positions)}), over the guard rail of ${o.maxChangedFraction}: nothing ` +
+        `uploaded` +
+        (above > 0
+          ? `. ${above} of them are above --max-zoom ${o.maxZoom}, which would also make a manifest cut there the ` +
+            'live one'
+          : '');
+      return;
+    }
     if (o.dryRun) {
       report.status = 'success';
       this.log('Dry run: nothing written');
@@ -694,7 +720,8 @@ class SyncRun {
 
   /**
    * Downloads the live and pending manifests and plans the sync, keeping the ranges unless over the guard rail. For
-   * --force-full, which writes every position of the build anyway, it keeps only the removed ranges.
+   * --force-full, which writes every position of the build anyway, it keeps only the removed ranges, unless it would
+   * delete more of the live build than its guard rail allows.
    */
   private async plan(state: SyncState | null, manifest: string, header: ManifestHeader) {
     const { o, report } = this;
@@ -714,9 +741,14 @@ class SyncRun {
     for await (const range of plan) {
       if (force) {
         // Every position of the build is written (each DESCRIBEd first); what the live and pending builds have and
-        // it doesn't is deleted, as a diff would.
-        if (range.kind === 'removed') {
+        // it doesn't is deleted, as a diff would. Past the guard rail on deletions the run stops before writing.
+        if (range.kind !== 'removed') {
+          continue;
+        }
+        if (deletedShare(plan.totals.diff, state.positions) <= o.maxChangedFraction) {
           ranges.push(range);
+        } else {
+          ranges.complete = false;
         }
       } else if (changedShare(plan.totals.diff, header.positions) <= o.maxChangedFraction) {
         ranges.push(range);
