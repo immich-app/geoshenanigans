@@ -11,6 +11,13 @@ import { parentPort, workerData } from 'node:worker_threads';
  * Which file an archive is and whether it changed: device, inode, size, and modification and change times. Not part
  * of the identity (a copy of the archive has the same identity and another snapshot), so it is never recorded: within
  * one run it ties every descriptor that reads the archive to the file its identity was computed from.
+ *
+ * The change time moves on any write and on any change to the file's metadata, and on ext4 and tmpfs (not ZFS) also
+ * when the file loses a name: a descriptor held while another file is renamed over its path, or while it is deleted,
+ * no longer matches either, though it still reads the same bytes. The run then stops rather than tell that apart
+ * from a write. Nothing replaces, links, renames or deletes the archive while bunny:sync or bunny:seed reads it (the
+ * sync workflow downloads and checks it in a step before the sync), so only someone doing that by hand stops a run
+ * this way. The legacy adopt check (legacySourceProblem in sync.ts) relies on the same change time.
  */
 export type FileSnapshot = string;
 
