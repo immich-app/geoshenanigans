@@ -89,12 +89,13 @@ transport decode killed part way left there (PATCHING.md), which would
 otherwise put back the files the decode replaced once the download had listed
 the files to remove; one it can't finish fails the download.
 Downloads into a dir go one at a time, those of other servers on the data dir
-too: each holds a lock on the dir's `.download.lock`. A server that starts
-checks and loads a dir that holds that file under a shared lock on it, so that
-it waits for a download into the dir to end and loads what it left. A server
-that starts with a ledger but no stamp in a dir leaves that continent unloaded
-until a query or a preload finishes its download. Queries need an API key from
-the dashboard (see Authentication below).
+too: each holds a lock on the dir's `.download.lock`. A server checks and
+loads a dir that holds that file, when it starts and once its own download
+into the dir is in, under a shared lock on it, so that it waits for a
+download into the dir (another server's) to end and loads what it left. A
+server that finds a ledger but no stamp in a dir leaves that continent
+unloaded until a query or a preload finishes its download. Queries need an
+API key from the dashboard (see Authentication below).
 
 The test portal is a map page for checking answers, served by every query
 server at `/test`. Its compose file runs two servers on the latest published

@@ -248,6 +248,8 @@ impl RegionState {
             },
         ).await?;
 
+        // Another server's download into the dir may begin once this one let
+        // go of it: the dir loads once that one ended, where it finished.
         self.multi_index.install_region(region)
             .map_err(DownloadError::UnknownRegion)?;
         Ok(())

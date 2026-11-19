@@ -646,11 +646,11 @@ thread_local! {
 /// the last fetch is in, the ledger rewritten with a line a file of the
 /// selection; one that has nothing to fetch or remove in a dir stamped with
 /// its build writes nothing. Downloads into the dir go one at a time,
-/// across processes too, and a server starting loads the dir only while
-/// none runs (DOWNLOAD_LOCK). Before it reads the dir a download finishes
-/// what a decode killed part way left there (finish_leftovers), or fails,
-/// writing nothing. A unit's files land together, so a download needs the
-/// largest unit's files' size free beside the region.
+/// across processes too, and a server loads the dir only while none runs
+/// (DOWNLOAD_LOCK). Before it reads the dir a download finishes what a
+/// decode killed part way left there (finish_leftovers), or fails, writing
+/// nothing. A unit's files land together, so a download needs the largest
+/// unit's files' size free beside the region.
 ///
 /// `progress` fires after each file or unit completes with the running
 /// total; the caller logs it.
