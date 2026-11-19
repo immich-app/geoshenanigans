@@ -160,11 +160,14 @@ stays, complete and checked as any decoded file is. A dir that can't be read,
 or holding a file that can't go back (a directory in its place, say), stays
 with what is still in it, for a later decode to try again; so does the dir of
 a decode that failed and couldn't put back a file it replaced (its error names
-the file). On a file system without locks, or on platforms other than unix,
-decodes take no locks at all: none finishes leftovers, which stay until
-removed by hand, and installs are not serialised (the last to move a file in
-wins, and one that fails while another installs may undo some of that one's
-files).
+the file). While such a dir would put a file back over one a decode is to put
+in place, or can't be read, opened or locked, so that no decode can tell, that
+decode fails before it moves a file in, naming the dir: finished after the
+install, the dir would undo it. A decode it holds no file for goes ahead. On a
+file system without locks, or on platforms other than unix, decodes take no
+locks at all: none finishes leftovers, which stay until removed by hand, and
+installs are not serialised (the last to move a file in wins, and one that
+fails while another installs may undo some of that one's files).
 
 The locks are flock(2) locks, and on a network file system (NFS, SMB) a lock
 on a dir is seen only by the machine that takes it. A decode on one machine,

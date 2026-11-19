@@ -261,15 +261,18 @@ pub struct Expected {
 /// such a decode put in place that replaced no file stays: it is complete, and checked as that
 /// decode checks its members. A dir that can't be read, or holding a file that can't go back (a
 /// directory in its place, say), stays, as do the files still in it, for a later decode to
-/// finish. Nothing else: a `<member>.tmp` there, say, stays as it is. On a file system without
+/// finish. While one stays that would put back a file over one of a decode's members once
+/// finished, or that can't be read, opened or locked, so that none can tell, that decode fails
+/// before it puts a member in place, naming the dir: finished after the install, the dir would
+/// undo it. Nothing else: a `<member>.tmp` there, say, stays as it is. On a file system without
 /// locks, or on platforms other than unix, decodes take no locks at all: they finish no
 /// leftovers, which stay until removed by hand, and their installs are not serialised.
 ///
 /// On an error `dir` is as it was once leftovers were finished: the members moved in so far are
 /// taken out again, the files they replaced put back, and nothing of the decode is left (put_back
 /// tells what it couldn't undo). A member's path that is a directory is an error, as is, on unix,
-/// a `dir` the decode can't open to lock, or a lock that fails but on a file system without
-/// locks.
+/// a `dir` the decode can't open to lock or read, or a lock that fails but on a file system
+/// without locks.
 ///
 /// Decodes of a unit into one dir at once each put complete, checked members in place, the last
 /// to install winning; with installs one at a time, one that fails undoes only its own. Where
@@ -315,7 +318,7 @@ pub fn decode_into_dir(unit: impl Read, dir: &Path, expect: Option<&[Expected]>)
         }
         members.push(m);
     }
-    staging.install(dir)?;
+    staging.install(dir, &members)?;
     staging.put_in_place(dir, &members)?;
     Ok((kind, members))
 }
@@ -395,54 +398,93 @@ fn is_staging_name(name: &std::ffi::OsStr) -> bool {
 /// replaced are removed: a hidden name, which no member has.
 const INSTALLED: &str = ".installed";
 
+/// A decode's dir in a dataset dir that a sweep couldn't finish: why, and the names of the files
+/// it would put back once finished (none once its decode's members were all in, INSTALLED), or
+/// None where the sweep couldn't tell (it couldn't open, lock or read the dir).
+#[cfg_attr(not(unix), allow(dead_code))]
+struct Unfinished {
+    path: PathBuf,
+    why: io::Error,
+    puts_back: Option<Vec<std::ffi::OsString>>,
+}
+
 /// Finishes what each decode into `dir` that is gone left, its dir (finish_leftover); called with
 /// the install lock held. A decode's dir whose lock it takes is one whose decode is gone (a
 /// running decode holds its dir's lock from just after it made it until after it removed it):
 /// it is finished, the lock held meanwhile. One whose lock is held (WouldBlock) is a running
-/// decode's, decoding into it, and stays, as does one that can't be opened or locked.
+/// decode's, decoding into it, and stays; one gone meanwhile (NotFound) is skipped. Returns the
+/// dirs it couldn't finish, one that can't be opened or locked among them, which stay. An error
+/// reading `dir` is an error.
 #[cfg(unix)]
-fn finish_leftovers(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for e in entries.flatten() {
-        if !is_staging_name(&e.file_name()) || !e.file_type().is_ok_and(|t| t.is_dir()) {
+fn finish_leftovers(dir: &Path) -> io::Result<Vec<Unfinished>> {
+    let mut unfinished = Vec::new();
+    for e in std::fs::read_dir(dir).map_err(|e| at(dir, e))? {
+        let e = e.map_err(|e| at(dir, e))?;
+        if !is_staging_name(&e.file_name()) {
             continue;
         }
-        let Ok(lock) = File::open(e.path()) else { continue };
-        if lock.try_lock().is_ok() {
-            let _ = finish_leftover(dir, &e.path());
+        let path = e.path();
+        let lock = match e.file_type().and_then(|t| if t.is_dir() { File::open(&path).map(Some) } else { Ok(None) }) {
+            Ok(Some(lock)) => lock,
+            Ok(None) => continue,
+            Err(why) if why.kind() == io::ErrorKind::NotFound => continue,
+            Err(why) => {
+                unfinished.push(Unfinished { path, why, puts_back: None });
+                continue;
+            }
+        };
+        match lock.try_lock() {
+            Ok(()) => {}
+            Err(std::fs::TryLockError::WouldBlock) => continue,
+            Err(std::fs::TryLockError::Error(why)) => {
+                unfinished.push(Unfinished { path, why, puts_back: None });
+                continue;
+            }
+        }
+        if let Err((why, puts_back)) = finish_leftover(dir, &path) {
+            unfinished.push(Unfinished { path, why, puts_back });
         }
     }
+    Ok(unfinished)
 }
 
 #[cfg(not(unix))]
-fn finish_leftovers(_dir: &Path) {}
+fn finish_leftovers(_dir: &Path) -> io::Result<Vec<Unfinished>> {
+    Ok(Vec::new())
+}
 
 /// Finishes the decode into `dir` whose dir is `leftover`. If all its members went in (it holds
 /// INSTALLED), the files they replaced are stale and go. If not, it is undone as put_back would
 /// have: each file it replaced goes back to its place in `dir`, over the member that went in or
 /// into the place left empty; a member that replaced no file stays, complete and checked. Then
-/// the dir goes, with what else it holds. An error reading it, or a file that can't go
-/// back, keeps the dir, and the files still in it, for a later decode to finish.
+/// the dir goes, with what else it holds. An error reading it, or a file that can't go back,
+/// keeps the dir, and the files still in it, for a later decode to finish: the error, with the
+/// names of the files still to go back (None where it couldn't read the dir).
 #[cfg(unix)]
-fn finish_leftover(dir: &Path, leftover: &Path) -> io::Result<()> {
+fn finish_leftover(dir: &Path, leftover: &Path) -> Result<(), (io::Error, Option<Vec<std::ffi::OsString>>)> {
     use std::os::unix::ffi::OsStrExt;
     let installed = match std::fs::symlink_metadata(leftover.join(INSTALLED)) {
         Ok(_) => true,
         Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-        Err(e) => return Err(e),
+        Err(e) => return Err((e, None)),
     };
-    let entries = std::fs::read_dir(leftover)?.collect::<io::Result<Vec<_>>>()?;
+    let entries = std::fs::read_dir(leftover).and_then(|d| d.collect::<io::Result<Vec<_>>>()).map_err(|e| (e, None))?;
     let mut kept = Ok(());
+    let mut to_go_back = Vec::new();
     for e in entries {
         let name = e.file_name();
         let Some(name) = name.as_bytes().strip_prefix(b".earlier.") else { continue };
-        let gone = if installed { std::fs::remove_file(e.path()) } else { std::fs::rename(e.path(), dir.join(std::ffi::OsStr::from_bytes(name))) };
-        if gone.is_err() {
-            kept = gone;
+        let name = std::ffi::OsStr::from_bytes(name);
+        let gone = if installed { std::fs::remove_file(e.path()) } else { std::fs::rename(e.path(), dir.join(name)) };
+        if let Err(why) = gone {
+            kept = Err(why);
+            if !installed {
+                to_go_back.push(name.to_owned());
+            }
         }
     }
-    kept?;
-    std::fs::remove_dir_all(leftover)
+    kept.map_err(|why| (why, Some(to_go_back)))?;
+    std::fs::remove_dir_all(leftover).map_err(|why| (why, Some(Vec::new())))
 }
 
 /// Where a decode into a dir is, as it tells the tests' seam (which outside tests does nothing).
@@ -512,12 +554,13 @@ impl Staging {
     /// gone left there (finish_leftovers). It takes the install lock for that, and lets go of it
     /// only once its dir is made and locked: no sweep finds the dir before its lock is held. One
     /// of that name already there (an earlier process of this pid's, say) is skipped, never
-    /// taken.
+    /// taken. A leftover it can't finish, or a `dir` it can't read, stays for install() to find.
     fn new_in(dir: &Path) -> io::Result<Staging> {
         let install = install_lock(dir)?;
         let locks = install.is_some();
         if locks {
-            finish_leftovers(dir);
+            // Nothing goes in place here: install() sweeps again, and fails on what matters.
+            let _ = finish_leftovers(dir);
         }
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut staging = loop {
@@ -540,14 +583,26 @@ impl Staging {
     /// Takes the install lock on `dir`, waiting while another decode holds it, and finishes what
     /// decodes that are gone left (finish_leftovers), before its members go in place: a decode
     /// killed while it put its members in is undone before any later decode puts its own in,
-    /// never after. The lock is held until this is dropped. Nothing where decodes take no locks.
-    fn install(&mut self, dir: &Path) -> io::Result<()> {
+    /// never after. A leftover it can't finish that would put back a file over one of `members`
+    /// once finished (or of which it can't tell) fails it, as does a `dir` it can't read: no
+    /// member goes in. The lock is held until this is dropped. Nothing where decodes take no
+    /// locks.
+    fn install(&mut self, dir: &Path, members: &[Member]) -> io::Result<()> {
         if self.locks {
             seam(Step::WaitsToInstall);
             self.installing = install_lock(dir)?;
             seam(Step::Installs);
             if self.installing.is_some() {
-                finish_leftovers(dir);
+                for u in finish_leftovers(dir)? {
+                    let what = match &u.puts_back {
+                        None => "it may hold a file a member replaced, which would go back over this decode's".to_string(),
+                        Some(names) => match members.iter().find(|m| names.iter().any(|n| *n == *m.name)) {
+                            Some(m) => format!("it holds the file {} replaced, which would go back over this decode's", m.name),
+                            None => continue,
+                        },
+                    };
+                    return Err(io::Error::new(u.why.kind(), format!("{} can't be finished ({}): {what}", u.path.display(), u.why)));
+                }
             }
         }
         Ok(())

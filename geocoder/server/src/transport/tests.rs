@@ -1148,11 +1148,19 @@ fn a_decode_leaves_the_files_named_as_its_members_and_tmp_alone() {
 
 /// Every path under `dir`, relative to it, with a file's bytes; none for a dir.
 fn tree(dir: &Path) -> Vec<(String, Option<Vec<u8>>)> {
+    tree_but(dir, None)
+}
+
+/// tree() of `dir`, without `skipped`, a path under it, nor what is under that.
+fn tree_but(dir: &Path, skipped: Option<&Path>) -> Vec<(String, Option<Vec<u8>>)> {
     let mut paths = Vec::new();
     let mut dirs = vec![dir.to_path_buf()];
     while let Some(d) = dirs.pop() {
         for e in std::fs::read_dir(&d).unwrap() {
             let p = e.unwrap().path();
+            if Some(p.as_path()) == skipped {
+                continue;
+            }
             let rel = p.strip_prefix(dir).unwrap().to_string_lossy().into_owned();
             if p.is_dir() {
                 paths.push((rel, None));
@@ -1376,6 +1384,84 @@ fn a_dir_the_decode_cant_open_fails_the_decode() {
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(got, Err(format!("{}: Permission denied (os error 13)", dir.path().display())));
     assert_eq!(dir_files(dir.path()), before);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_decode_puts_no_member_in_while_a_leftover_it_cant_finish_would_put_back_the_file_it_replaces() {
+    // A pois decode killed once a member went in over an older build's file left its dir, which
+    // the decodes after it can't finish: of mode 0o555, no file can leave it, or of 0o300, it
+    // can't be opened to lock or read. A pois decode, then a places decode, run while it stays;
+    // then it can be finished, and a places decode finishes it.
+    // - Killed before all its members were in: the pois decode fails before it puts a member
+    //   in, naming the dir, which once finished would put the older file back over its member;
+    //   the places decode, whose members it holds no file of, goes in. Finished, the dir puts
+    //   the older file back: the pois files are all the older build's.
+    // - Killed once all were in: finished, it only removes the older file. Both decodes go in.
+    // - Of 0o300: no decode can tell what it holds, and both fail.
+    // Run as root, the dataset dir is nobody's and the decodes run on a thread whose file system
+    // uid is nobody's (a_dir_the_decode_cant_open_fails_the_decode).
+    use std::os::unix::fs::PermissionsExt;
+    const NOBODY: u32 = 65534;
+    let (_, _, pois, pois_unit) = golden_units().swap_remove(1);
+    let pois_unit = zstd::encode_all(&pois_unit[..], 3).unwrap();
+    let killed_before_all_in: &[(&str, &[u8])] = &[(".transport.9.0/.earlier.poi_records.bin", b"an older build's records"), ("poi_records.bin", b"a member"), ("poi_vertices.bin", b"an older build's vertices")];
+    let killed_once_all_in: &[(&str, &[u8])] = &[(".transport.9.0/.installed", b""), (".transport.9.0/.earlier.poi_records.bin", b"an older build's records"), ("poi_records.bin", b"a member"), ("poi_vertices.bin", b"a member")];
+    let pois_files: Vec<(&str, &[u8])> = pois.iter().map(|(n, b)| (*n, &b[..])).collect();
+    let cases: [(&str, &[(&str, &[u8])], u32, bool, bool, &[(&str, &[u8])]); 3] = [
+        ("killed before all its members were in", killed_before_all_in, 0o555, true, false, OLDER_POIS),
+        ("killed once all its members were in", killed_once_all_in, 0o555, false, false, &pois_files),
+        ("of 0o300", killed_before_all_in, 0o300, true, true, OLDER_POIS),
+    ];
+    for (case, found, mode, pois_fail, places_fail, pois_after) in cases {
+        let (unit, members, dir) = published_places();
+        let leftover = dir.path().join(".transport.9.0");
+        put_tree(dir.path(), found);
+        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(mode)).unwrap();
+        let as_root = unsafe { libc::geteuid() } == 0;
+        if as_root {
+            std::os::unix::fs::chown(dir.path(), Some(NOBODY), None).unwrap();
+        }
+        let before = tree_but(dir.path(), Some(&leftover));
+
+        let (pois_got, after_pois, places_got, after_places) = std::thread::scope(|s| {
+            s.spawn(|| {
+                if as_root {
+                    unsafe { libc::syscall(libc::SYS_setfsuid, NOBODY) };
+                    assert_eq!(unsafe { libc::syscall(libc::SYS_setfsuid, NOBODY) }, NOBODY as libc::c_long);
+                }
+                let pois_got = decode_into_dir(&pois_unit[..], dir.path(), Some(&expected(&pois))).map(|_| ()).map_err(|e| e.to_string());
+                let after_pois = tree_but(dir.path(), Some(&leftover));
+                let places_got = decode_into_dir(&unit[..], dir.path(), Some(&expected(&members))).map(|_| ()).map_err(|e| e.to_string());
+                (pois_got, after_pois, places_got, tree_but(dir.path(), Some(&leftover)))
+            })
+            .join()
+            .unwrap()
+        });
+        let left = leftover.exists();
+        std::fs::set_permissions(&leftover, std::fs::Permissions::from_mode(0o755)).unwrap();
+        decode_into_dir(&unit[..], dir.path(), Some(&expected(&members))).unwrap();
+
+        let refused = |got: &Result<(), String>, what: &str| match got {
+            Ok(()) => false,
+            Err(e) => {
+                assert!(e.starts_with(&format!("{} can't be finished (Permission denied (os error 13)): {what}", leftover.display())), "{case}: {e}");
+                true
+            }
+        };
+        let why = if mode == 0o300 { "it may hold a file a member replaced" } else { "it holds the file poi_records.bin replaced" };
+        assert_eq!((refused(&pois_got, why), refused(&places_got, why), left), (pois_fail, places_fail, true), "{case}");
+        if pois_fail {
+            assert_eq!(after_pois, before, "{case}");
+        }
+        if places_fail {
+            assert_eq!(after_places, after_pois, "{case}");
+        }
+        let (_, _, want) = published_places();
+        decode_into_dir(&unit[..], want.path(), Some(&expected(&members))).unwrap();
+        put_tree(want.path(), pois_after);
+        assert_eq!(tree(dir.path()), tree(want.path()), "{case}");
+    }
 }
 
 #[cfg(unix)]
