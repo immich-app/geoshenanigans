@@ -100,13 +100,25 @@ describe('parseState', () => {
   });
 
   it('checks the archive the live build came from', () => {
-    const archive = { size: 139_600_000_000, fingerprint: 'ab'.repeat(32) };
+    const archive = { size: 139_600_000_000, identity: `sha256-tree-v2:${'ab'.repeat(32)}` };
     expect(parseState({ ...state, archive }).archive).toEqual(archive);
-    for (const bad of [{}, { ...archive, size: -1 }, { ...archive, fingerprint: 'AB'.repeat(32) }, 'x']) {
+    for (const bad of [
+      {},
+      { ...archive, size: -1 },
+      { ...archive, identity: `sha256-tree-v2:${'AB'.repeat(32)}` },
+      { ...archive, identity: 'ab'.repeat(32) },
+      { size: archive.size, fingerprint: 'AB'.repeat(32) },
+      'x',
+    ]) {
       expect(() => parseState({ ...state, archive: bad }), JSON.stringify(bad)).toThrow(
         'state.json has invalid archive',
       );
     }
+  });
+
+  it('reads a v1 archive fingerprint as no identity, which vouches for no archive', () => {
+    const legacy = { size: 139_600_000_000, fingerprint: 'ab'.repeat(32) };
+    expect(parseState({ ...state, archive: legacy }).archive).toBeNull();
   });
 
   it('names every invalid field', () => {

@@ -11,8 +11,9 @@
  * 3. calls publishBuild once the zone serves the build, which makes it live and clears `pending`;
  * 4. calls pruneManifests, which deletes manifests no state names but for the newest few (each is ~1.3 GB).
  *
- * state.json also records the archive the live build came from (its fingerprint, as bunny:seed checkpoints it), so a
- * seed can refuse to write another build's bytes over the live prefix.
+ * state.json also records the archive the live build came from (its v2 identity, a hash of the whole file, as
+ * bunny:seed checkpoints it; see archive-identity.ts), so a seed can refuse to write another build's bytes over the
+ * live prefix.
  *
  * The store is BunnyStateStore below (MemoryObjectStore in tests). The state zone has no replicas, so re-uploading
  * identical bytes is harmless there.
@@ -25,6 +26,7 @@ import { pipeline } from 'node:stream/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { Agent, type Dispatcher } from 'undici';
 import { parseDeploymentKey, requireEnv } from '../deploy/config';
+import { ArchiveIdentity, IDENTITY_PATTERN } from './archive-identity';
 import { readManifestHeader } from './manifest';
 
 export interface StoredObject {
@@ -54,12 +56,6 @@ export interface PendingBuild {
   manifest: string;
   positions: number;
   startedAt: string;
-}
-
-/** Identifies a PMTiles archive as bunny:seed's checkpoint does (ArchiveRanges.fingerprint). */
-export interface ArchiveIdentity {
-  size: number;
-  fingerprint: string;
 }
 
 export interface SyncState {
@@ -107,15 +103,28 @@ const isIsoDate = (value: unknown) => typeof value === 'string' && !Number.isNaN
 
 const isPositions = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0;
 
+const LEGACY_FINGERPRINT = /^[0-9a-f]{64}$/;
+
+/**
+ * The live archive's identity; null when none is recorded. A v1 fingerprint (header, root directory and size only,
+ * from before the v2 identity) reads as none: it cannot tell archives with other tile bytes apart, so a seed over the
+ * live prefix refuses until a sync records a v2 identity.
+ */
 function parseArchive(value: unknown): ArchiveIdentity | null | undefined {
   if (value === undefined || value === null) {
     return null;
   }
-  const archive = value as Partial<ArchiveIdentity>;
-  if (typeof archive !== 'object' || !isPositions(archive.size) || !/^[0-9a-f]{64}$/.test(archive.fingerprint ?? '')) {
+  const archive = value as Partial<ArchiveIdentity> & { fingerprint?: unknown };
+  if (typeof archive !== 'object' || !isPositions(archive.size)) {
     return undefined;
   }
-  return { size: archive.size!, fingerprint: archive.fingerprint! };
+  if (archive.identity === undefined && typeof archive.fingerprint === 'string') {
+    return LEGACY_FINGERPRINT.test(archive.fingerprint) ? null : undefined;
+  }
+  if (typeof archive.identity !== 'string' || !IDENTITY_PATTERN.test(archive.identity)) {
+    return undefined;
+  }
+  return { size: archive.size!, identity: archive.identity };
 }
 
 function parsePending(value: unknown, liveBuild: string): PendingBuild[] | undefined {

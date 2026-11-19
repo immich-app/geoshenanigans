@@ -32,7 +32,12 @@ export class ArchiveRanges {
     readonly archive: Archive,
     readonly path: string,
     readonly size: number,
-    readonly fingerprint: string,
+    /**
+     * The v1 archive fingerprint seeds recorded before the v2 identity (archive-identity.ts): the header, root
+     * directory and size only, so archives with other tile bytes can share it. Only for checking a seed state an
+     * older bunny:seed left, together with the whole file's MD5.
+     */
+    readonly legacyFingerprint: string,
     private read: RangeReader,
     private root: Entry[],
     private closeFile: () => Promise<void>,
@@ -58,13 +63,12 @@ export class ArchiveRanges {
       const size = (await file.stat()).size;
       const rootBytes = await read(header.rootDirectoryOffset, header.rootDirectoryLength);
       const root = deserializeIndex(await decompress(rootBytes, header.internalCompression));
-      // Identifies the build for checkpoints: the header and root directory change with any rebuild.
-      const fingerprint = createHash('sha256')
+      const legacyFingerprint = createHash('sha256')
         .update(new Uint8Array(await read(0, HEADER_SIZE_BYTES)))
         .update(new Uint8Array(rootBytes))
         .update(String(size))
         .digest('hex');
-      return new ArchiveRanges(archive, path, size, fingerprint, read, root, () => file.close());
+      return new ArchiveRanges(archive, path, size, legacyFingerprint, read, root, () => file.close());
     } catch (error) {
       await file.close();
       throw new Error(`${path}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });

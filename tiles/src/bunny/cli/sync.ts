@@ -3,7 +3,7 @@
  *
  *   npm run bunny:sync -- --archive <path> --build <YYYYMMDD> [--osm-date <ISO>] [--prefix <live prefix, or v1>]
  *     [--max-changed-fraction 0.05] [--replication-timeout-min 120] [--max-zoom Z] [--state-prefix <p>]
- *     [--dry-run] [--force-full | --adopt --seed-state <dir> [--seed-state <dir> ...] [--replace]]
+ *     [--dry-run] [--force-full | --adopt --seed-state <dir> [--seed-state <dir> ...] [--replace] [--archive-md5 B]]
  *     [--report <path.json>] [--styles-dir <dir>] [--work-dir <dir>] [--static-prefix v1] [--keep-manifests 7]
  *     [--threads N] [--concurrency 512] [--replication-interval-s 30] [--replication-concurrency 512]
  *     [--regions UK,SE,...] [--adopt-samples 10000] [--max-failures 1000] [--request-timeout-s 60] [--plain-puts]
@@ -13,6 +13,10 @@
  * --adopt-samples random positions must hold the build) or --force-full (write every position, each DESCRIBEd first;
  * for repairs and small zoom ranges). --adopt --replace switches a live zone to a build seeded under another --prefix
  * (a full rewrite): the same checks, the sample also in every region, then the TileJSON points at the new prefix.
+ * Every run that writes first hashes the whole archive (its identity, archive-identity.ts), which state.json records
+ * and --adopt compares with each seed's. A seed state dir an older bunny:seed left records only a v1 fingerprint
+ * (header, root directory and size): --adopt takes it only with --archive-md5, the build's md5sum from builds.json
+ * (base64), which it checks against the MD5 of the whole archive.
  * A run for the live build while state.json lists pending builds puts the live bytes back where they wrote (a revert
  * of a failed or cancelled sync). --dry-run builds the manifest and plans, then stops: it needs only the state zone.
  * Every changed position is
@@ -37,6 +41,7 @@ import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
+import { parseMd5Base64 } from '../archive-identity';
 import { purgePullZoneFromEnv } from '../purge';
 import { BunnyStateStore } from '../state';
 import { readStyles } from '../static-files';
@@ -96,6 +101,7 @@ const OPTIONS = {
   adopt: { type: 'boolean', default: false },
   replace: { type: 'boolean', default: false },
   'seed-state': { type: 'string', multiple: true },
+  'archive-md5': { type: 'string' },
   'static-prefix': { type: 'string' },
   'keep-manifests': { type: 'string' },
   report: { type: 'string' },
@@ -146,6 +152,10 @@ async function main(): Promise<number> {
     const build = text('build');
     if (!archive || !build || !/^\d{8}$/.test(build)) {
       throw new Error('Usage: bunny:sync --archive <path> --build <YYYYMMDD> [options]; see src/bunny/cli/sync.ts');
+    }
+    const archiveMd5 = text('archive-md5');
+    if (archiveMd5 !== undefined) {
+      parseMd5Base64(archiveMd5);
     }
     const osmDate = text('osm-date');
     if (osmDate !== undefined && Number.isNaN(Date.parse(osmDate))) {
@@ -256,6 +266,7 @@ async function main(): Promise<number> {
         adopt: flag('adopt'),
         replace: flag('replace'),
         seedStates: [values['seed-state'] ?? []].flat().filter((dir): dir is string => typeof dir === 'string'),
+        archiveMd5,
         staticPrefix: text('static-prefix'),
         keepManifests: number('keep-manifests', text('keep-manifests')),
         adoptSamples: number('adopt-samples', text('adopt-samples'), 1),

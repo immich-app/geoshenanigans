@@ -25,6 +25,8 @@
  * on this machine, with another state dir, covers an overlapping range of the same zone and prefix (claims live in
  * $XDG_STATE_HOME/bunny-seed, default ~/.local/state/bunny-seed; seeds on other machines are not seen).
  * Unless the addresses are pinned, the storage host is looked up again every 5 minutes and workers move to the new set.
+ * The archive is identified by a hash of the whole file (archive-identity.ts; about 15 s for a planet build from NVMe,
+ * at every start): the checkpoint refuses a resume with another archive.
  * Once a sync has made a build live (state.json in the state zone), a seed under its prefix refuses any archive but the
  * live build's: positions a daily sync updated would get older bytes back, which no later diff repairs. So it reads
  * state.json first (BUNNY_STATE_ZONE and BUNNY_STATE_PASSWORD, --state-prefix as for bunny:sync); --no-state-check is
@@ -34,6 +36,7 @@
  * Exit codes: 0 complete, 1 failed (rerun to repair), 2 bad arguments, 130 stopped by SIGINT/SIGTERM.
  */
 import { parseArgs } from 'node:util';
+import { ArchiveIdentity, archiveIdentity } from '../archive-identity';
 import { ArchiveRanges } from '../archive-walk';
 import { BunnyStateStore, readState } from '../state';
 import { parseAddresses, RetryOptions, storageOptionsFromEnv } from '../storage';
@@ -57,7 +60,7 @@ function integer(name: string, value: string | undefined, fallback?: number, min
 }
 
 /** Refuses to seed over the live build's prefix with any other archive (see the header). */
-async function checkLiveState(prefix: string, fingerprint: string, statePrefix: string | undefined) {
+async function checkLiveState(prefix: string, archive: ArchiveIdentity, statePrefix: string | undefined) {
   if (!process.env.BUNNY_STATE_ZONE || !process.env.BUNNY_STATE_PASSWORD) {
     throw new UsageError(
       'BUNNY_STATE_ZONE and BUNNY_STATE_PASSWORD are needed to check that the seed does not write over a live build ' +
@@ -66,7 +69,17 @@ async function checkLiveState(prefix: string, fingerprint: string, statePrefix: 
   }
   const store = BunnyStateStore.fromEnv();
   const state = await readState(store, statePrefix).finally(() => store.close());
-  if (state && prefixesOverlap(state.prefix, prefix) && state.archive?.fingerprint !== fingerprint) {
+  if (!state || !prefixesOverlap(state.prefix, prefix)) {
+    return;
+  }
+  if (!state.archive) {
+    throw new Error(
+      `${state.liveBuild} is live under ${state.prefix}/ and state.json records no v2 identity of its archive, so ` +
+        'nothing says this archive is the one it came from. Seed another prefix, or let a sync record the live ' +
+        'archive first',
+    );
+  }
+  if (state.archive.identity !== archive.identity || state.archive.size !== archive.size) {
     throw new Error(
       `${state.liveBuild} is live under ${state.prefix}/ and this archive is not the one it came from: the seed would ` +
         "put other bytes back where daily syncs wrote. Repair with the live build's archive, or seed another prefix",
@@ -141,9 +154,9 @@ async function main(): Promise<number> {
     }
   }
 
-  const { header, fingerprint } = await ArchiveRanges.open(values.archive).then(async (ranges) => {
+  const header = await ArchiveRanges.open(values.archive).then(async (ranges) => {
     await ranges.close();
-    return { header: ranges.archive.header, fingerprint: ranges.fingerprint };
+    return ranges.archive.header;
   });
   const { from, to } = byId
     ? { from: integer('from-id', values['from-id']), to: integer('to-id', values['to-id']) }
@@ -154,8 +167,12 @@ async function main(): Promise<number> {
   if (to <= from) {
     throw new UsageError(`Empty range [${from}, ${to})`);
   }
+  const started = performance.now();
+  process.stderr.write(`Hashing ${values.archive} (its identity for the checkpoint and the live state)\n`);
+  const archive = await archiveIdentity(values.archive);
+  process.stderr.write(`Archive ${archive.identity} in ${formatDuration((performance.now() - started) / 1000)}\n`);
   if (!values['no-state-check']) {
-    await checkLiveState(prefix, fingerprint, values['state-prefix']);
+    await checkLiveState(prefix, archive, values['state-prefix']);
   }
   const safeName = (text: string) => text.replace(/[^\w.-]+/g, '_');
 
@@ -189,6 +206,7 @@ async function main(): Promise<number> {
     maxFailures,
     progressIntervalMs,
     signal: controller.signal,
+    archiveIdentity: archive,
   });
 
   const seconds = (Date.parse(status.updatedAt) - Date.parse(status.startedAt)) / 1000;

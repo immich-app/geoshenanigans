@@ -9,6 +9,7 @@ import { join, resolve } from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Worker } from 'node:worker_threads';
+import { ArchiveIdentity, archiveIdentity } from './archive-identity';
 import { ArchiveRanges } from './archive-walk';
 import { forEachLimit } from './replication';
 import { claimRange, defaultClaimsDir, isAlive } from './seed-claims';
@@ -182,7 +183,8 @@ export interface SeedParams {
   from: number;
   to: number;
   chunkSize: number;
-  archive: { size: number; fingerprint: string };
+  /** The archive's v2 identity (archive-identity.ts): a resume of another archive's seed is refused. */
+  archive: ArchiveIdentity;
 }
 
 const CHECKPOINT_LINE = /^(start|done) (\d+)$/;
@@ -236,10 +238,18 @@ export class Checkpoint {
       await writeAtomic(paramsPath, JSON.stringify(params, null, 2) + '\n', true);
     } else {
       const previous = JSON.parse(existing) as SeedParams;
+      const recorded = previous.archive as Partial<ArchiveIdentity> & { fingerprint?: unknown };
+      if (recorded?.identity === undefined && recorded?.fingerprint !== undefined) {
+        // A v1 fingerprint covers the header, root directory and size only: it can't say the archive is the same.
+        throw new Error(
+          `${dir} holds the checkpoint of an older bunny:seed, which recorded only a v1 archive fingerprint: finish ` +
+            'that seed with the bunny:seed that started it, or use another --state-dir',
+        );
+      }
       const mismatch = (['zone', 'host', 'prefix', 'from', 'to', 'chunkSize'] as const).filter(
         (key) => previous[key] !== params[key],
       );
-      if (previous.archive?.fingerprint !== params.archive.fingerprint) {
+      if (recorded?.identity !== params.archive.identity || recorded?.size !== params.archive.size) {
         mismatch.push('archive' as never);
       }
       if (mismatch.length > 0) {
@@ -514,6 +524,8 @@ export interface SeedOptions {
   addressRefreshMs?: number;
   /** Looks up the storage host's addresses (default: resolveStorageAddresses). */
   resolveAddresses?: (host?: string) => Promise<string[]>;
+  /** The archive's v2 identity if the caller has just computed it (default: computed here). */
+  archiveIdentity?: ArchiveIdentity;
 }
 
 export type SeedState = 'running' | 'stopping' | 'complete' | 'failed' | 'interrupted';
@@ -638,6 +650,10 @@ export async function runSeed(options: SeedOptions): Promise<SeedResult> {
   let unclaim: (() => Promise<void>) | undefined;
   try {
     const host = storageOrigin(options.storage.host);
+    const archive = options.archiveIdentity ?? (await archiveIdentity(options.archivePath));
+    if (archive.size !== ranges.size) {
+      throw new Error(`${options.archivePath} is ${ranges.size} bytes, not the ${archive.size} its identity is of`);
+    }
     checkpoint = await Checkpoint.open(stateDir, {
       zone: options.storage.zone,
       host,
@@ -645,7 +661,7 @@ export async function runSeed(options: SeedOptions): Promise<SeedResult> {
       from,
       to,
       chunkSize,
-      archive: { size: ranges.size, fingerprint: ranges.fingerprint },
+      archive,
     });
     unclaim = await claimRange(options.claimsDir ?? defaultClaimsDir(), {
       stateDir: resolve(stateDir),
