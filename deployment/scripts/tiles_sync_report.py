@@ -65,6 +65,7 @@ import argparse
 import datetime
 import gzip
 import http.client
+import io
 import json
 import math
 import os
@@ -262,18 +263,33 @@ def build_info(read):
         raise ValueError(f"unexpected metadata length {length}")
     data = read(offset, length)
     if compression == COMPRESSION_GZIP:
-        # A cut-short or corrupt member is a bad read like any other (a ValueError, which with_retries retries),
-        # not a crash: gzip raises EOFError, zlib.error or BadGzipFile (an OSError) for it.
-        try:
-            data = gzip.decompress(data)
-        except (EOFError, OSError, zlib.error) as e:
-            raise ValueError(f"metadata at {offset} ({length} bytes) is not a whole gzip member: {e}") from e
+        data = gunzip_metadata(data, offset, length)
     elif compression != COMPRESSION_NONE:
         raise ValueError(f"unsupported internal compression {compression}")
     metadata = json.loads(data)
     if not isinstance(metadata, dict):
         raise ValueError("metadata is not a JSON object")
     return {"version": text_or_none(metadata.get("version")), "osmDate": text_or_none(metadata.get(OSM_TIME_KEY))}
+
+
+def gunzip_metadata(data, offset, length):
+    """The gzip metadata decompressed, never more than MAX_METADATA_BYTES of it.
+
+    A few MiB of gzip can stand for gigabytes, so it is read through a stream that stops one byte past the limit
+    instead of gzip.decompress, which would hold all of it before json.loads saw any. A cut-short or corrupt member
+    is a bad read like any other (a ValueError, which with_retries retries), not a crash: gzip raises EOFError,
+    zlib.error or BadGzipFile (an OSError) for it.
+    """
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(data)) as member:
+            # BufferedReader.read(n) returns short only at the end of the last member, after its CRC and size
+            # were checked.
+            out = member.read(MAX_METADATA_BYTES + 1)
+    except (EOFError, OSError, zlib.error) as e:
+        raise ValueError(f"metadata at {offset} ({length} bytes) is not a whole gzip member: {e}") from e
+    if len(out) > MAX_METADATA_BYTES:
+        raise ValueError(f"metadata at {offset} ({length} bytes) decompresses to more than {MAX_METADATA_BYTES} bytes")
+    return out
 
 
 def text_or_none(value):
