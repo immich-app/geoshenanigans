@@ -11,8 +11,9 @@ name: Tiles Sync Watchdog
 # bunny:replication --live DESCRIBEs a sample per zoom and compares each Checksum with the live manifest's hash;
 # geoshenanigans-tiles-sample-wrong and -sample-unreplicated read what it reports.
 #
-# Both jobs resolve production credentials (the sample job the tiles zone's read-write password), so they run
-# main's code only: the schedule, and dispatches from main. A dispatch from another branch fails at once.
+# Both jobs resolve production credentials, so they run main's code only: the schedule, and dispatches from main. A
+# dispatch from another branch fails at once. They only read, with the zones' read-only passwords (tf_prod): the
+# read-write ones are in tf_bunny, which only Tiles Sync's sync job reads (deployment/modules/bunny/tiles/README.md).
 
 on:
   schedule:
@@ -81,7 +82,7 @@ jobs:
         working-directory: ./tiles
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
-          BUNNY_STATE_PASSWORD: op://tf_prod/BUNNY_STATE_PASSWORD/password
+          BUNNY_STATE_PASSWORD: op://tf_prod/BUNNY_STATE_READONLY_PASSWORD/password
         run: |
           # The default shell stops at the first failure; this step reports it instead.
           set +e
@@ -159,8 +160,10 @@ jobs:
         working-directory: ./tiles
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
-          BUNNY_STATE_PASSWORD: op://tf_prod/BUNNY_STATE_PASSWORD/password
-          BUNNY_STORAGE_PASSWORD: op://tf_prod/BUNNY_STORAGE_PASSWORD/password
+          # Read-only passwords: Bunny answers DESCRIBE (Checksum and ReplicatedZones), GET and listings with them, and
+          # refuses PUT and DELETE.
+          BUNNY_STATE_PASSWORD: op://tf_prod/BUNNY_STATE_READONLY_PASSWORD/password
+          BUNNY_STORAGE_PASSWORD: op://tf_prod/BUNNY_STORAGE_READONLY_PASSWORD/password
           TMPDIR: ${{ runner.temp }}
         run: |
           set +e

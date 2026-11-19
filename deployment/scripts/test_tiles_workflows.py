@@ -222,12 +222,113 @@ class BunnyKeyTest(unittest.TestCase):
         for secret in BUNNY_SECRETS:
             self.assertEqual(env[f"TF_VAR_{secret.lower()}"], "plan-stand-in")
 
+    def test_the_exposure_through_the_cloudflare_token_is_written_down_and_in_the_go_live_checklist(self):
+        """The worker's Bunny key and Globalping token are out of every state, but a pull request's plan reads the
+        Cloudflare account token, which can deploy code that reads Worker secrets: the README says so, the go-live
+        step that puts the key on the worker asks for it to be closed or accepted, and no comment claims otherwise."""
+        readme = read(os.path.join(ROOT, "deployment", "modules", "bunny", "tiles", "README.md"))
+        section = readme.split("### What this doesn't cover\n", 1)[1].split("\n#", 1)[0]
+        self.assertIn("prod_cloudflare_api_keys", section)
+        self.assertIn("`BUNNY_API_KEY` and `GLOBALPING_TOKEN`", section)
+        checklist = readme.split("## Go-live checklist\n", 1)[1]
+        step_3 = re.search(r"\n3\. \*\*Copy `pull_zone_id`\*\*.*?(?=\n4\. )", checklist, re.S).group(0)
+        self.assertIn("closes the exposure in What this doesn't cover", step_3)
+        self.assertNotIn("neither value is in any state", readme)
+        for path in (os.path.join(WORKFLOWS, "tiles-worker.yml"), os.path.join(ROOT, "deployment", ".env"),
+                     os.path.join(ROOT, "deployment", "tiles-worker-bunny.env")):
+            with self.subTest(path=os.path.relpath(path, ROOT)):
+                text = read(path)
+                self.assertNotIn("never gets the Bunny account key", text)
+                self.assertIn("What this doesn't cover", text)
+
     def test_the_check_accepts_only_what_it_should(self):
         self.assertIsNotNone(CONDITIONAL_ENVIRONMENT.match("${{ inputs.x == 'prod' && 'tiles-bunny' || '' }}"))
         self.assertIsNone(CONDITIONAL_ENVIRONMENT.match("${{ inputs.x && 'tiles-bunny-plan' || '' }}"))
         self.assertIsNone(CONDITIONAL_ENVIRONMENT.match("${{ inputs.x && 'tiles-bunny' || 'other' }}"))
         self.assertTrue(names_bunny_secrets('export TF_VAR_bunny_api_key="op://tf_prod/BUNNY_API_KEY/password"'))
         self.assertFalse(names_bunny_secrets('export TF_VAR_env=$ENVIRONMENT'))
+
+
+# The storage zones' read-write passwords (1Password item names), which can overwrite or delete every tile and the sync's
+# state: in tf_bunny, beside the account key. Jobs that only read get each zone's read-only password, from tf_prod.
+READ_WRITE_PASSWORDS = ("BUNNY_STORAGE_PASSWORD", "BUNNY_STATE_PASSWORD")
+READ_ONLY_PASSWORDS = {"BUNNY_STORAGE_PASSWORD": "BUNNY_STORAGE_READONLY_PASSWORD",
+                       "BUNNY_STATE_PASSWORD": "BUNNY_STATE_READONLY_PASSWORD"}
+OP_REF = re.compile(r"op://([^/\s'\"]+)/([^/\s'\"]+)")
+
+
+def env_settings():
+    """Every (workflow, job, step, variable, value) a workflow, job or step `env:` sets (step None for job and workflow
+    level, job None for workflow level)."""
+    for name, workflow in workflows().items():
+        for variable, value in (workflow.get("env") or {}).items():
+            yield name, None, None, variable, str(value)
+        for job_name, job in workflow["jobs"].items():
+            for variable, value in (job.get("env") or {}).items():
+                yield name, job_name, None, variable, str(value)
+            for item in job.get("steps", []):
+                for variable, value in (item.get("env") or {}).items():
+                    yield name, job_name, item.get("name"), variable, str(value)
+
+
+class BunnyStoragePasswordTest(unittest.TestCase):
+    """OP_TF_PROD_ENV is a repository secret every same-repository pull request's Tiles Worker plan gets, so tf_prod
+    holds only the zones' read-only passwords; the read-write ones are in tf_bunny, which only the tiles-bunny
+    environments' service account reads, and only Tiles Sync's sync step (not a dry run) resolves them."""
+
+    def test_the_read_write_passwords_live_in_tf_bunny_and_the_read_only_ones_in_tf_prod(self):
+        files = [os.path.join(WORKFLOWS, name) for name in workflows()]
+        files += glob.glob(os.path.join(ROOT, "deployment", "**", "*.env"), recursive=True)
+        files.append(os.path.join(ROOT, "deployment", ".env"))
+        seen = set()
+        for path in files:
+            for vault, item in OP_REF.findall(read(path)):
+                with self.subTest(path=os.path.relpath(path, ROOT), ref=(vault, item)):
+                    if item in READ_WRITE_PASSWORDS:
+                        self.assertEqual(vault, "tf_bunny")
+                    elif item in READ_ONLY_PASSWORDS.values():
+                        self.assertEqual(vault, "tf_prod")
+                    seen.add(item)
+        self.assertLessEqual({*READ_WRITE_PASSWORDS, *READ_ONLY_PASSWORDS.values()}, seen)
+
+    def test_only_the_sync_step_in_the_tiles_bunny_environment_gets_a_read_write_password(self):
+        sync = load("tiles-sync.yml")["jobs"]["sync"]
+        condition = CONDITIONAL_ENVIRONMENT.match(sync["environment"]).group(1)
+        reaching = set()
+        for name, job, step_name, variable, value in env_settings():
+            refs = OP_REF.findall(value)
+            if not any(item in READ_WRITE_PASSWORDS for _, item in refs):
+                if variable in READ_ONLY_PASSWORDS and refs:
+                    with self.subTest(workflow=name, job=job, step=step_name, variable=variable):
+                        self.assertEqual(value, f"op://tf_prod/{READ_ONLY_PASSWORDS[variable]}/password")
+                continue
+            reaching.add((name, job, step_name, variable))
+            with self.subTest(workflow=name, job=job, step=step_name, variable=variable):
+                # On the very condition that puts the job in tiles-bunny; otherwise the read-only one, or none.
+                self.assertIn(value, (
+                    f"${{{{ {condition} && 'op://tf_bunny/{variable}/password' || "
+                    f"'op://tf_prod/{READ_ONLY_PASSWORDS[variable]}/password' }}}}",
+                    f"${{{{ {condition} && 'op://tf_bunny/{variable}/password' || '' }}}}",
+                ))
+        self.assertEqual(reaching, {
+            ("tiles-sync.yml", "sync", "Sync", "BUNNY_STATE_PASSWORD"),
+            ("tiles-sync.yml", "sync", "Sync", "BUNNY_STORAGE_PASSWORD"),
+        })
+        self.assertEqual(step(sync, "Sync")["env"]["OP_SERVICE_ACCOUNT_TOKEN"],
+                         f"${{{{ {condition} && {BUNNY_TOKEN} || {PROD_TOKEN} }}}}")
+
+    def test_the_jobs_that_only_read_get_the_read_only_passwords(self):
+        watchdog = load("tiles-sync-watchdog.yml")["jobs"]
+        sync = load("tiles-sync.yml")["jobs"]
+        for job, name, variables in (
+                (sync["resolve"], "Read the live build", ("BUNNY_STATE_PASSWORD",)),
+                (sync["sync"], "Check the decision", ("BUNNY_STATE_PASSWORD",)),
+                (watchdog["report"], "Read the live build", ("BUNNY_STATE_PASSWORD",)),
+                (watchdog["sample"], "Check the sample", ("BUNNY_STATE_PASSWORD", "BUNNY_STORAGE_PASSWORD"))):
+            for variable in variables:
+                with self.subTest(step=name, variable=variable):
+                    self.assertEqual(step(job, name)["env"][variable],
+                                     f"op://tf_prod/{READ_ONLY_PASSWORDS[variable]}/password")
 
 
 def install(bin_dir, tools):

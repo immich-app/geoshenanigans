@@ -32,15 +32,24 @@ The sync, the watchdog and the worker read more items: every one is in the go-li
 
 ## Who gets the Bunny account key
 
-The account key can do anything on the Bunny account, so it sits in a vault of its own, `tf_bunny` (with the Globalping token), which neither `OP_TF_PROD_ENV` nor `OP_TF_DEV_ENV` reads. Its service account, `OP_TF_BUNNY_ENV` below, reads `tf_bunny`, `tf_prod` and `tf` (the jobs that use it resolve those items too), and its token is a secret of two GitHub environments only, never of the repository. A job gets an environment's secrets only by naming that environment and passing its protection rules, so a branch whose workflow drops or renames the environment gets no token:
+The account key can do anything on the Bunny account, so it sits in a vault of its own, `tf_bunny`, which neither `OP_TF_PROD_ENV` nor `OP_TF_DEV_ENV` reads, with the Globalping token and the storage zones' read-write passwords (which can overwrite or delete every tile, and the sync's state). Its service account, `OP_TF_BUNNY_ENV` below, reads `tf_bunny`, `tf_prod` and `tf` (the jobs that use it resolve those items too), and its token is a secret of two GitHub environments only, never of the repository. A job gets an environment's secrets only by naming that environment and passing its protection rules, so a branch whose workflow drops or renames the environment gets no token:
 
 - `tiles-bunny-plan`: this unit's pull request plans. Required reviewers approve each run.
-- `tiles-bunny`: deployment branches limited to `main`, so a job on any other branch that names it is refused. This unit's apply, the Tiles Worker workflow's apply on `main` and Tiles Deploy's prod activation (which put the key and the token on the worker, from `deployment/tiles-worker-bunny.env`, beside `.env`), and Tiles Sync's sync job (its purge; a dry run purges nothing and doesn't use it).
+- `tiles-bunny`: deployment branches limited to `main`, so a job on any other branch that names it is refused. This unit's apply, the Tiles Worker workflow's apply on `main` and Tiles Deploy's prod activation (which put the key and the token on the worker, from `deployment/tiles-worker-bunny.env`, beside `.env`), and Tiles Sync's sync job (its purge, and its writes to both zones; a dry run writes nothing and uses neither).
 
-The state backend's connection string is in `tf`, which every pull request's plan resolves, so neither value is in any state, and the state that holds Bunny's other credentials is encrypted:
+Every other job that reads the zones only reads, with their read-only passwords, which are in `tf_prod`: Tiles Sync's resolve job, its decision check and its dry runs, and both of the watchdog's jobs. Bunny answers GET, listings and DESCRIBE (`Checksum` and `ReplicatedZones` included) with a zone's read-only password and refuses PUT and DELETE (401; checked on a test zone). `OP_TF_PROD_ENV` is a repository secret, which pull requests' Tiles Worker plans get, so those two passwords are within a pull request's reach: they read the public tiles and the sync's state, nothing more.
+
+The state backend's connection string is in `tf`, which every pull request's plan resolves, so neither of the worker's two values is in a state, and the state that holds Bunny's other credentials is encrypted:
 
 - **The worker's two secrets** are Worker secrets, not `secret_text_binding`s (OpenTofu keeps a binding's value in the state). After the upload, `terraform_data.bunny_secrets` in tiles-worker's `workers.tf` puts them through Cloudflare's API (`put-worker-secrets.sh`, with the provider's token), from variables, which the state doesn't keep. The provider (4.52.10) drops every secret it doesn't manage on each upload, and its refresh lists them without their values, so every prod plan of tiles-worker shows the script updating (their bindings going) and `terraform_data.bunny_secrets` replaced: each apply uploads, then puts both back within seconds, the current values from 1Password included. Pull requests' Tiles Worker plans pass stand-ins, which reach no resource. A prod plan or apply of tiles-worker that resolved `.env` alone stops at a precondition instead of turning the log reader and the probe off; locally, add `--env-file=deployment/tiles-worker-bunny.env` for prod, with `bash`, `curl` and `jq` installed.
 - **This unit's state** holds the storage zones' passwords and the middleware script's deployment key: it is encrypted (State encryption, below), and tiles-worker no longer reads it (it takes the pull zone id as the variable `bunny_pull_zone_id`).
+
+### What this doesn't cover
+
+Keeping the worker's two values out of state doesn't keep them from pull requests' plans. Those plans run the branch's Terragrunt code with the shared backend credential, which also reads `prod_cloudflare_api_keys`: the Cloudflare account token that tiles-worker's provider and `put-worker-secrets.sh` use, which can deploy Workers. With it, code in a pull request can upload a version of `tiles-prod` whose handler reads the Worker's secrets (`BUNNY_API_KEY` and `GLOBALPING_TOKEN`, like `O11Y_TOKEN` and the others) and sends them elsewhere; with the Bunny account key it then has every zone's passwords too. The same token can already change what `tiles-prod` serves and anything else on the Cloudflare account, so this is the exposure every unit of `deployment/` has today; what this module adds is that the Bunny account key is reachable through it from the moment the Worker holds it (go-live step 3), and the Globalping token from step 7. Closing it needs infrastructure outside this module, one of:
+
+- a state backend credential for pull requests' plans that can't read `prod_cloudflare_api_keys`, with a read-only Cloudflare token for those plans instead, so that no pull request gets a token that deploys Workers (every unit's plan, not only tiles-worker's); or
+- the log reader and the probe (`tiles/src/bunny-logs`) moved off the Worker into a scheduled job in the `tiles-bunny` environment, so that the Worker holds neither value.
 
 ### State encryption
 
@@ -147,13 +156,16 @@ Work through it in order; the first item comes before the branch merges.
    | `tf_bunny` | `BUNNY_API_KEY` | the Bunny account API key | this unit (`bunny.env`), the sync's purge, the worker's log reader (`deployment/tiles-worker-bunny.env`) |
    | `tf_bunny` | `GLOBALPING_TOKEN` | a Globalping API token | the worker's synthetic probe (`deployment/tiles-worker-bunny.env`) |
    | `tf_bunny` | `BUNNY_TILES_STATE_PASSPHRASE` | a random passphrase of at least 16 characters (`op item create --vault tf_bunny --category password --title BUNNY_TILES_STATE_PASSPHRASE --generate-password=64,letters,digits`) | this unit's state encryption (`bunny.env`, State encryption above) |
-   | `tf_prod` | `BUNNY_STORAGE_PASSWORD` | `immich-tiles`' password (read-write) | Tiles Sync, the watchdog's sample check |
-   | `tf_prod` | `BUNNY_STATE_PASSWORD` | `immich-tiles-state`'s password | Tiles Sync, the watchdog |
+   | `tf_bunny` | `BUNNY_STORAGE_PASSWORD` | `immich-tiles`' password (read-write) | Tiles Sync's sync job (not a dry run) |
+   | `tf_bunny` | `BUNNY_STATE_PASSWORD` | `immich-tiles-state`'s password (read-write) | Tiles Sync's sync job (not a dry run) |
+   | `tf_prod` | `BUNNY_STORAGE_READONLY_PASSWORD` | `immich-tiles`' read-only password | the watchdog's sample check |
+   | `tf_prod` | `BUNNY_STATE_READONLY_PASSWORD` | `immich-tiles-state`'s read-only password | Tiles Sync's resolve job, decision check and dry runs, the watchdog |
    | `tf_prod` | `BUNNY_PULL_ZONE_ID` | the `pull_zone_id` output (step 3) | Tiles Sync's purge |
 
-   `BUNNY_PULL_ZONE_ID` is copied by hand rather than read from this unit's state: the sync job writes production and doesn't run OpenTofu or read its state backend, and only this unit's jobs can decrypt the state. `O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD` (`tf_prod`) and `tf_state` (`tf`) exist already.
+   Each zone's password and read-only password are on its page in the Bunny dashboard (FTP & API Access). Keep the read-write ones out of `tf_prod`: every pull request's Tiles Worker plan resolves `tf_prod` (Who gets the Bunny account key, above). `BUNNY_PULL_ZONE_ID` is copied by hand rather than read from this unit's state: the sync job writes production and doesn't run OpenTofu or read its state backend, and only this unit's jobs can decrypt the state. `O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD` (`tf_prod`) and `tf_state` (`tf`) exist already.
 2. **Apply this unit**: import the zones (First run, above), plan, apply. That creates the pull zone, its edge rules, the middleware script and the test hostname.
 3. **Copy `pull_zone_id`** into `tf_prod/BUNNY_PULL_ZONE_ID` (the sync's purge) and, as `"bunny_pull_zone_id": "<id>"`, into `deployment/modules/cloudflare/tiles-worker/tiles.prod.tfvars.json` (a pull request). Its Tiles Worker run on `main` starts the log reader. Until then the worker applies without it, with the log reader off.
+   - First, a maintainer closes the exposure in What this doesn't cover (above), or accepts it on the record (in that pull request): from this apply on, the Bunny account key is a secret of `tiles-prod`, which anyone holding the Cloudflare account token can read, pull requests' plans included. Step 7 does the same for the Globalping token.
 4. **Test hostname**: a DNS-only CNAME `tiles-bunny.immich.cloud` → the `cdn_domain` output, then add the name to `tls_hostnames` and apply again (Hostnames and the cutover, above).
 5. **Hold scheduled syncs**: set the repository variable `TILES_SYNC_HOLD` (any text, e.g. "first load") before anything is seeded.
 6. **Load and verify the tiles, then adopt them** (Loading the tiles, below).
@@ -180,7 +192,7 @@ For a Bunny outage (the one on 2026-05-21 took CDN, storage and scripts down for
 
 ## Loading the tiles
 
-The zone's files come from the tiles tooling (`tiles/src/bunny`, run from `tiles/`), not from this module. The commands need `BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, `BUNNY_STATE_ZONE` and `BUNNY_STATE_PASSWORD`; `bunny:sync` also the API key, pull zone id and public URL (its header lists them), and, unless `--dry-run`, the map-styles build, which it uploads beside the TileJSON. Build that once, from the repository root, before the first adopt (Tiles Sync builds its own):
+The zone's files come from the tiles tooling (`tiles/src/bunny`, run from `tiles/`), not from this module. The commands need `BUNNY_STORAGE_ZONE`, `BUNNY_STORAGE_PASSWORD`, `BUNNY_STATE_ZONE` and `BUNNY_STATE_PASSWORD` (the read-write passwords, in `tf_bunny`; a command that only reads, such as `bunny:status` or `bunny:replication`, works with the `tf_prod` read-only ones); `bunny:sync` also the API key, pull zone id and public URL (its header lists them), and, unless `--dry-run`, the map-styles build, which it uploads beside the TileJSON. Build that once, from the repository root, before the first adopt (Tiles Sync builds its own):
 
 ```bash
 (cd map-styles && npm ci && npm run build)
@@ -215,4 +227,4 @@ A Protomaps schema change (Tiles Sync stops with `schema_changed`) or a diff ove
 
 ## Outputs
 
-`pull_zone_id` (`BUNNY_PULL_ZONE_ID` for the purge, and tiles-worker's `bunny_pull_zone_id` for the log reader), `cdn_domain` (the zone's own `{name}.b-cdn.net` hostname, the CNAME target), `hostnames`, `storage_zone_id`, `state_zone_id`, `gzip_script_id`. The storage zone passwords stay out of the outputs (the sync reads them from 1Password), and the state that holds them is encrypted.
+`pull_zone_id` (`BUNNY_PULL_ZONE_ID` for the purge, and tiles-worker's `bunny_pull_zone_id` for the log reader), `cdn_domain` (the zone's own `{name}.b-cdn.net` hostname, the CNAME target), `hostnames`, `storage_zone_id`, `state_zone_id`, `gzip_script_id`. The storage zone passwords stay out of the outputs (the sync and the watchdog read them from 1Password: the read-write ones from `tf_bunny`), and the state that holds them is encrypted.

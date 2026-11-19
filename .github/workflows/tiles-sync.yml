@@ -143,7 +143,8 @@ jobs:
         working-directory: ./tiles
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
-          BUNNY_STATE_PASSWORD: op://tf_prod/BUNNY_STATE_PASSWORD/password
+          # The state zone's read-only password: only the sync job's sync step writes (deployment/modules/bunny/tiles).
+          BUNNY_STATE_PASSWORD: op://tf_prod/BUNNY_STATE_READONLY_PASSWORD/password
         run: |
           set +e
           op run -- npm run --silent bunny:status -- --json > "$RUNNER_TEMP/live.json" 2> "$RUNNER_TEMP/live.err"
@@ -263,7 +264,7 @@ jobs:
         working-directory: ./tiles
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
-          BUNNY_STATE_PASSWORD: op://tf_prod/BUNNY_STATE_PASSWORD/password
+          BUNNY_STATE_PASSWORD: op://tf_prod/BUNNY_STATE_READONLY_PASSWORD/password
           LIVE: ${{ needs.resolve.outputs.live }}
           HOLD: ${{ vars.TILES_SYNC_HOLD }}
         run: |
@@ -332,10 +333,11 @@ jobs:
           NODE_OPTIONS: --max-old-space-size=8192
           # The tiles-bunny service account reads tf_prod too.
           OP_SERVICE_ACCOUNT_TOKEN: ${{ !inputs.dry_run && secrets.OP_TF_BUNNY_ENV || secrets.OP_TF_PROD_ENV }}
-          BUNNY_STATE_PASSWORD: op://tf_prod/BUNNY_STATE_PASSWORD/password
-          # A dry run reads the state zone only: no tiles zone password, purge key or pull zone, so a dry run that
-          # isn't one cannot write or purge production.
-          BUNNY_STORAGE_PASSWORD: ${{ !inputs.dry_run && 'op://tf_prod/BUNNY_STORAGE_PASSWORD/password' || '' }}
+          # The zones' read-write passwords are in tf_bunny, with the account key: only this step, in the tiles-bunny
+          # environment, resolves them. A dry run reads the state zone only, with its read-only password, and gets no
+          # tiles zone password, purge key or pull zone, so a dry run that isn't one cannot write or purge production.
+          BUNNY_STATE_PASSWORD: ${{ !inputs.dry_run && 'op://tf_bunny/BUNNY_STATE_PASSWORD/password' || 'op://tf_prod/BUNNY_STATE_READONLY_PASSWORD/password' }}
+          BUNNY_STORAGE_PASSWORD: ${{ !inputs.dry_run && 'op://tf_bunny/BUNNY_STORAGE_PASSWORD/password' || '' }}
           BUNNY_API_KEY: ${{ !inputs.dry_run && 'op://tf_bunny/BUNNY_API_KEY/password' || '' }}
           BUNNY_PULL_ZONE_ID: ${{ !inputs.dry_run && 'op://tf_prod/BUNNY_PULL_ZONE_ID/password' || '' }}
         run: |

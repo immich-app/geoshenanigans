@@ -165,11 +165,13 @@ jobs:
           name: tiles-build-output
           path: "${{ github.workspace }}/dist"
 
-      # Every pull request runs this with the branch's Terragrunt code, unapproved: it never gets the Bunny account key
-      # or the Globalping token. Those live in the tf_bunny vault, which only the tiles-bunny environments' service
-      # account reads (deployment/modules/bunny/tiles/README.md), and .env doesn't name them: prod plans with stand-ins,
-      # which reach no resource. Applies put the real values on the worker through Cloudflare's API, never in the state
-      # this plan reads (terraform_data.bunny_secrets in tiles-worker/workers.tf).
+      # Every pull request runs this with the branch's Terragrunt code, unapproved: neither 1Password nor the state
+      # gives it the Bunny account key or the Globalping token. Those live in the tf_bunny vault, which only the
+      # tiles-bunny environments' service account reads, and .env doesn't name them: prod plans with stand-ins, which
+      # reach no resource. Applies put the real values on the worker through Cloudflare's API, never in the state this
+      # plan reads (terraform_data.bunny_secrets in tiles-worker/workers.tf). Not covered: this plan reads the Cloudflare
+      # account token through the state backend, and with it code can be deployed to the worker that reads its secrets
+      # (deployment/modules/bunny/tiles/README.md, What this doesn't cover).
       - name: Plan All
         working-directory: ${{ github.workspace }}/deployment
         env:
