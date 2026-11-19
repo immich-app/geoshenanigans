@@ -566,6 +566,40 @@ impl Ledger {
     }
 }
 
+/// The file in a region dir that a download holds an exclusive flock on
+/// from start to end (on unix, where the file system has locks), so that
+/// downloads into the dir go one at a time, those of other processes too:
+/// they share the dir's temp names, ledger and stamp. Not the dir itself,
+/// which its transport decodes lock (the install lock).
+const DOWNLOAD_LOCK: &str = ".download.lock";
+
+/// Takes the download lock of the region dir `dir` (DOWNLOAD_LOCK), waiting
+/// while another download holds it. None on a file system without locks.
+#[cfg(unix)]
+async fn download_lock(dir: &Path) -> Result<Option<std::fs::File>, DownloadError> {
+    let path = dir.join(DOWNLOAD_LOCK);
+    let at = path.clone();
+    let taken = tokio::task::spawn_blocking(move || -> std::io::Result<Option<std::fs::File>> {
+        let file = std::fs::File::options().write(true).create(true).truncate(false).open(&path)?;
+        loop {
+            match file.lock() {
+                Ok(()) => return Ok(Some(file)),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported || e.raw_os_error() == Some(libc::ENOLCK) => return Ok(None),
+                Err(e) => return Err(e),
+            }
+        }
+    })
+    .await
+    .map_err(|e| DownloadError::Io(format!("lock task: {}", e)))?;
+    taken.map_err(|e| DownloadError::Io(format!("lock {}: {}", at.display(), e)))
+}
+
+#[cfg(not(unix))]
+async fn download_lock(_dir: &Path) -> Result<Option<std::fs::File>, DownloadError> {
+    Ok(None)
+}
+
 /// Writes `bytes` to `path` as one: under a temp name beside it, then
 /// renamed over it.
 async fn write_whole(path: &Path, bytes: &[u8]) -> Result<(), DownloadError> {
@@ -605,8 +639,9 @@ thread_local! {
 /// before it writes anything else, and puts it in once the last fetch is
 /// in, the ledger rewritten with a line a file of the selection; one that
 /// has nothing to fetch or remove in a dir stamped with its build writes
-/// nothing. A unit's files land together, so a download needs the largest
-/// unit's files' size free beside the region.
+/// nothing. Downloads into the dir go one at a time, across processes too
+/// (DOWNLOAD_LOCK). A unit's files land together, so a download needs the
+/// largest unit's files' size free beside the region.
 ///
 /// `progress` fires after each file or unit completes with the running
 /// total; the caller logs it.
@@ -646,6 +681,8 @@ pub async fn download_region(
     let region_dir = root.join(&sel.region);
     tokio::fs::create_dir_all(&region_dir).await
         .map_err(|e| DownloadError::Io(format!("mkdir {}: {}", region_dir.display(), e)))?;
+    // Held until the download returns.
+    let _lock = download_lock(&region_dir).await?;
 
     let stamp = region_dir.join(BUILD_STAMP);
     let mut ledger = Ledger::read(&region_dir).await?;
@@ -1162,8 +1199,8 @@ mod tests {
     }
 
     /// What a download of `s` should leave in its region dir: each file the
-    /// bucket has, by its name, the ledger naming each one's sha256 and the
-    /// build's stamp.
+    /// bucket has, by its name, the ledger naming each one's sha256, the
+    /// build's stamp and, on unix, the empty download lock file.
     fn files_of(bucket: &TestBucket, s: &RegionSelection) -> BTreeMap<String, Vec<u8>> {
         let mut want: BTreeMap<String, Vec<u8>> = resolve_files(&bucket.manifest, s).unwrap().paths.iter()
             .filter(|p| bucket.manifest.files.contains_key(*p))
@@ -1172,6 +1209,9 @@ mod tests {
         let ledger: String = want.iter().map(|(name, bytes)| format!("{name} {}\n", sha256_of(bytes))).collect();
         want.insert(FILE_LEDGER.into(), ledger.into_bytes());
         want.insert(BUILD_STAMP.into(), test_bucket::DATE.as_bytes().to_vec());
+        if cfg!(unix) {
+            want.insert(DOWNLOAD_LOCK.into(), Vec::new());
+        }
         want
     }
 
@@ -1261,7 +1301,7 @@ mod tests {
         for (name, bytes) in files_of(bucket, s) {
             match name.as_str() {
                 BUILD_STAMP => std::fs::write(dir.join(name), "2025-12-01").unwrap(),
-                FILE_LEDGER => {}
+                FILE_LEDGER | DOWNLOAD_LOCK => {}
                 _ => {
                     let older: Vec<u8> = bytes.iter().map(|b| b ^ 0x5a).collect();
                     ledger.push_str(&format!("{name} {}\n", sha256_of(&older)));
@@ -1683,6 +1723,55 @@ mod tests {
             }
             assert!(left.keys().all(|n| !n.ends_with(".tmp")), "{unit}: {:?}", left.keys().collect::<Vec<_>>());
         }
+    }
+
+    // Downloads into a region dir go one at a time, those of other processes
+    // too (a second server on the data dir, say): they share the dir's temp
+    // names, ledger and stamp. One waits while another holds the dir's
+    // download lock, fetching and writing nothing; reads the dir only once it
+    // holds the lock, so that it finds what the other put there meanwhile
+    // (here the whole selection, and it fetches nothing); and holds the lock
+    // to its end: a try at it from another open fails each time the download
+    // tells its progress.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_download_waits_while_another_holds_the_dirs_download_lock_and_then_holds_it() {
+        let s = sel("europe", "admin", "simplified", "major");
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (root, whole) = (ScratchDir::new(), ScratchDir::new());
+        download(&bucket, &s, whole.path()).await.unwrap();
+        let all = bucket.files_served();
+        let dir = root.path().join("europe");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Another open of the file: its lock is another's, as another process's would be.
+        let other = std::fs::File::create(dir.join(DOWNLOAD_LOCK)).unwrap();
+        other.lock().unwrap();
+        let (client, free) = (reqwest::Client::new(), std::sync::Mutex::new(Vec::new()));
+        let waiting = download_region(&client, &bucket.url, &bucket.manifest, &s, root.path(), |_| {
+            free.lock().unwrap().push(std::fs::File::open(dir.join(DOWNLOAD_LOCK)).unwrap().try_lock().is_ok());
+        });
+        tokio::pin!(waiting);
+
+        let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut waiting).await.ok().map(|r| r.map_err(|e| e.to_string()));
+        let (served, names) = (bucket.files_served(), held(&dir).into_keys().collect::<Vec<_>>());
+        for (name, bytes) in held(&whole.path().join("europe")) {
+            if name != DOWNLOAD_LOCK {
+                std::fs::write(dir.join(name), bytes).unwrap();
+            }
+        }
+        drop(other);
+        let late = match early {
+            Some(_) => None,
+            None => Some(waiting.await.map_err(|e| e.to_string())),
+        };
+
+        assert_eq!(early, None, "done while the lock was held");
+        assert_eq!((served, names), (all, vec![DOWNLOAD_LOCK.to_string()]));
+        assert_eq!(late, Some(Ok(())));
+        assert_eq!(bucket.files_served(), all);
+        assert!(held(&dir) == files_of(&bucket, &s));
+        let free = free.lock().unwrap();
+        assert!(free.len() > 2 && !free.contains(&true), "{free:?}");
     }
 
     // Before a byte is fetched: a unit of another transport version, or one

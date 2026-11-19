@@ -82,10 +82,12 @@ dir keeps a ledger of what each of its files holds, `.file_sha256` (a line
 where the ledger names the build's sha256 for it, and removes the files the
 ledger names that its selection doesn't take (another selection's or build's).
 The dir names its build in `.build_date` once a whole selection of it is in and
-those are gone; a download that fetches or removes anything removes it first. A
-server that starts with a ledger but no stamp in a dir leaves that continent
-unloaded until a query or a preload finishes its download. Queries need an API
-key from the dashboard (see Authentication below).
+those are gone; a download that fetches or removes anything removes it first.
+Downloads into a dir go one at a time, those of other servers on the data dir
+too: each holds a lock on the dir's `.download.lock`. A server that starts with
+a ledger but no stamp in a dir leaves that continent unloaded until a query or
+a preload finishes its download. Queries need an API key from the dashboard
+(see Authentication below).
 
 The test portal is a map page for checking answers, served by every query
 server at `/test`. Its compose file runs two servers on the latest published
