@@ -172,7 +172,11 @@ a decode that failed and couldn't put back a file it replaced (its error names
 the file). While such a dir would put a file back over one a decode is to put
 in place, or can't be read, opened or locked, so that no decode can tell, that
 decode fails before it moves a file in, naming the dir: finished after the
-install, the dir would undo it. A decode it holds no file for goes ahead. On a
+install, the dir would undo it. A decode it holds no file for goes ahead. The
+server's downloader finishes the leftovers in a dir, as step 2 does, before it
+reads the dir, and fails while one stays that would put a file back: else a
+later decode would put back a file once the download had listed the files to
+remove. On a
 file system without locks, or on platforms other than unix, decodes take no
 locks at all: none finishes leftovers, which stay until removed by hand, and
 installs are not serialised (the last to move a file in wins, and one that

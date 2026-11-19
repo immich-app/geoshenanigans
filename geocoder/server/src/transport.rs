@@ -471,6 +471,26 @@ fn finish_leftovers(_dir: &Path) -> io::Result<Vec<Unfinished>> {
     Ok(Vec::new())
 }
 
+/// Finishes what decodes into `dir` that are gone left (finish_leftovers), under the install
+/// lock, as a decode does before it makes its dir: for a caller about to read what `dir` holds,
+/// which such a dir, finished later by a decode, would change, putting back the files its decode
+/// replaced (the downloader, before it reads its ledger and lists the files to remove). A
+/// running decode's dir stays. One that can't be finished and would put back a file once
+/// finished, or of which none can tell, is an error naming it, as is a `dir` that can't be
+/// opened, locked or read. Nothing where decodes take no locks (decode_into_dir).
+pub fn finish_leftovers_in(dir: &Path) -> io::Result<()> {
+    let Some(_install) = install_lock(dir)? else { return Ok(()) };
+    for u in finish_leftovers(dir)? {
+        let what = match &u.puts_back {
+            Some(names) if names.is_empty() => continue,
+            Some(names) => format!("it would put back {}", names.iter().map(|n| n.to_string_lossy()).collect::<Vec<_>>().join(", ")),
+            None => "it may hold a file a decode replaced, which would go back".to_string(),
+        };
+        return Err(io::Error::new(u.why.kind(), format!("{} can't be finished ({}): {what}", u.path.display(), u.why)));
+    }
+    Ok(())
+}
+
 /// Finishes the decode into `dir` whose dir is `leftover`. If all its members went in (it holds
 /// INSTALLED), the files they replaced are stale and go. If not, it is undone as put_back would
 /// have: each file it replaced goes back to its place in `dir`, over the member that went in or

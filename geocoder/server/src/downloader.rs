@@ -589,6 +589,21 @@ async fn download_lock(dir: &Path) -> Result<Option<std::fs::File>, DownloadErro
         .map_err(|e| DownloadError::Io(format!("lock {}: {}", at.display(), e)))
 }
 
+/// Finishes what decodes into the region dir `dir` killed part way left
+/// (transport::finish_leftovers_in): the dir of each, holding the files its
+/// unit's files replaced, which go back unless all of the unit's were in.
+/// Run before a download reads the dir: finished later, by the download's
+/// first decode, such a dir would put back a file once the download had
+/// listed the files to remove, or over one the download fetched. One that
+/// can't be finished, and would put back a file, fails the download.
+async fn finish_leftovers(dir: &Path) -> Result<(), DownloadError> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || transport::finish_leftovers_in(&dir))
+        .await
+        .map_err(|e| DownloadError::Io(format!("leftovers task: {}", e)))?
+        .map_err(|e| DownloadError::Io(e.to_string()))
+}
+
 /// Writes `bytes` to `path` as one: under a temp name beside it, then
 /// renamed over it.
 async fn write_whole(path: &Path, bytes: &[u8]) -> Result<(), DownloadError> {
@@ -632,8 +647,10 @@ thread_local! {
 /// selection; one that has nothing to fetch or remove in a dir stamped with
 /// its build writes nothing. Downloads into the dir go one at a time,
 /// across processes too, and a server starting loads the dir only while
-/// none runs (DOWNLOAD_LOCK). A unit's files land together, so a download
-/// needs the largest unit's files' size free beside the region.
+/// none runs (DOWNLOAD_LOCK). Before it reads the dir a download finishes
+/// what a decode killed part way left there (finish_leftovers), or fails,
+/// writing nothing. A unit's files land together, so a download needs the
+/// largest unit's files' size free beside the region.
 ///
 /// `progress` fires after each file or unit completes with the running
 /// total; the caller logs it.
@@ -675,6 +692,7 @@ pub async fn download_region(
         .map_err(|e| DownloadError::Io(format!("mkdir {}: {}", region_dir.display(), e)))?;
     // Held until the download returns.
     let _lock = download_lock(&region_dir).await?;
+    finish_leftovers(&region_dir).await?;
 
     let stamp = region_dir.join(BUILD_STAMP);
     let mut ledger = Ledger::read(&region_dir).await?;
@@ -1721,6 +1739,76 @@ mod tests {
         let mut want = files_of(&bucket, &after);
         want.extend(unknown);
         assert_eq!(differing(&held(&dir), &want), Vec::<String>::new());
+    }
+
+    /// The dir of a decode into a region dir (transport::decode_into_dir) of
+    /// a process that is gone, killed while it put the unit's files in place.
+    const KILLED_DECODES_DIR: &str = ".transport.9.0";
+
+    // A download killed while the decode of a unit put the unit's files in
+    // place leaves the decode's dir, holding the files they replaced, which
+    // the next decode into the dir puts back. The next download finishes it
+    // before it reads the dir: a file put back once the download listed the
+    // files to remove would stay, under the stamp. Poi tier all, then a
+    // download of major killed once its poi_records.bin went in over all's;
+    // then a switch to no POIs in admin-minimal, which decodes units, and in
+    // admin, which fetches nothing. Each leaves its selection only.
+    #[tokio::test]
+    async fn a_download_finishes_what_a_killed_decode_left_before_it_lists_the_files_to_remove() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (all, major) = (sel("europe", "admin", "simplified", "all"), sel("europe", "admin", "simplified", "major"));
+        let ours = files_of(&bucket, &major)["poi_records.bin"].clone();
+        assert_ne!(files_of(&bucket, &all)["poi_records.bin"], ours);
+        let mut got = Vec::new();
+        for mode in ["admin-minimal", "admin"] {
+            let after = sel("europe", mode, "simplified", "none");
+            let root = ScratchDir::new();
+            let dir = root.path().join("europe");
+            download(&bucket, &all, root.path()).await.unwrap();
+            // What the download of major left: the ledger naming the pois
+            // unit's files unknown, no stamp, and the decode's dir holding
+            // all's poi_records.bin, major's in its place.
+            let ledger = std::fs::read_to_string(dir.join(FILE_LEDGER)).unwrap();
+            std::fs::write(dir.join(FILE_LEDGER), format!("{ledger}poi_records.bin -\npoi_vertices.bin -\n")).unwrap();
+            std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap();
+            std::fs::create_dir(dir.join(KILLED_DECODES_DIR)).unwrap();
+            std::fs::rename(dir.join("poi_records.bin"), dir.join(KILLED_DECODES_DIR).join(".earlier.poi_records.bin")).unwrap();
+            std::fs::write(dir.join("poi_records.bin"), &ours).unwrap();
+            let served = bucket.files_served();
+
+            download(&bucket, &after, root.path()).await.unwrap();
+
+            let left = dir.join(KILLED_DECODES_DIR).exists();
+            let differ = if left { Vec::new() } else { differing(&held(&dir), &files_of(&bucket, &after)) };
+            got.push((mode, bucket.files_served() > served, left, differ));
+        }
+        assert_eq!(got, [("admin-minimal", true, false, Vec::new()), ("admin", false, false, Vec::new())]);
+    }
+
+    // A killed decode's dir that can't be finished, which would put a file
+    // back once finished, fails the download before it writes anything: the
+    // dir stays as it was, stamped. Here a directory is where the file goes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_download_fails_before_it_writes_while_a_killed_decodes_dir_cant_be_finished() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (before, after) = (sel("europe", "admin", "simplified", "major"), sel("europe", "admin-minimal", "simplified", "none"));
+        let root = ScratchDir::new();
+        let dir = root.path().join("europe");
+        download(&bucket, &before, root.path()).await.unwrap();
+        let was = held(&dir);
+        std::fs::create_dir_all(dir.join(KILLED_DECODES_DIR)).unwrap();
+        std::fs::write(dir.join(KILLED_DECODES_DIR).join(".earlier.notes.txt"), "a file a member replaced").unwrap();
+        std::fs::create_dir(dir.join("notes.txt")).unwrap();
+        let served = bucket.files_served();
+
+        let got = download(&bucket, &after, root.path()).await.map_err(|e| e.to_string());
+
+        assert_eq!(got, Err(format!("I/O error: {} can't be finished (Is a directory (os error 21)): it would put back notes.txt", dir.join(KILLED_DECODES_DIR).display())));
+        assert_eq!(bucket.files_served(), served);
+        std::fs::remove_dir(dir.join("notes.txt")).unwrap();
+        std::fs::remove_dir_all(dir.join(KILLED_DECODES_DIR)).unwrap();
+        assert_eq!(differing(&held(&dir), &was), Vec::<String>::new());
     }
 
     // A last line a kill cut short says nothing of its file, though it names
