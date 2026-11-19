@@ -447,9 +447,13 @@ GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUT
            "GIT_AUTHOR_EMAIL": "t@example.invalid", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
 
 
-class ApplyFreshnessStepTest(unittest.TestCase):
-    """The apply job's check that the run's commit still has main's configuration: a re-run of an older main run, or
-    one delayed behind a newer commit's, must not put the older configuration back."""
+class MainCheckoutTest(unittest.TestCase):
+    """A repository whose main gets commits, and a run's checkout of one of them, for the apply jobs' checks that the
+    run's commit still has main's configuration. Subclasses give initial_files()."""
+
+    def initial_files(self):
+        """{path: text} of main's first commits."""
+        raise NotImplementedError
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -460,8 +464,8 @@ class ApplyFreshnessStepTest(unittest.TestCase):
         self.git(self.tmp.name, "init", "--quiet", "--bare", "--initial-branch=main", self.origin)
         self.git(self.tmp.name, "init", "--quiet", "--initial-branch=main", self.main)
         self.git(self.main, "remote", "add", "origin", self.origin)
-        for path in self.trigger_files() + ["tiles/src/index.ts", "deployment/modules/cloudflare/tiles-worker/a.tf"]:
-            self.commit(path, "first")
+        for path, text in self.initial_files().items():
+            self.commit(path, text)
 
     def git(self, cwd, *args):
         return subprocess.run(["git", *args], cwd=cwd, env=self.env, check=True, capture_output=True,
@@ -477,30 +481,46 @@ class ApplyFreshnessStepTest(unittest.TestCase):
         self.git(self.main, "push", "--quiet", "origin", "main")
         return self.git(self.main, "rev-parse", "HEAD")
 
-    def trigger_files(self):
-        """A file under each path that triggers the workflow on main."""
-        paths = load(BUNNY_INFRA)[True]["push"]["paths"]
-        return [path.removesuffix("/**") + "/tiles/main.tf" if path.endswith("/**") else path for path in paths]
-
     def checkout(self, sha):
         """The run's checkout: actions/checkout fetches the one commit, with origin pointing at the repository."""
-        workspace = os.path.join(self.tmp.name, f"workspace-{sha[:7]}")
+        workspace = tempfile.mkdtemp(prefix=f"workspace-{sha[:7]}-", dir=self.tmp.name)
         self.git(self.tmp.name, "init", "--quiet", workspace)
         self.git(workspace, "remote", "add", "origin", "file://" + self.origin)
         self.git(workspace, "fetch", "--quiet", "--depth=1", "origin", sha)
         self.git(workspace, "checkout", "--quiet", "--detach", sha)
         return workspace
 
-    def run_step(self, sha):
-        check = step(load(BUNNY_INFRA)["jobs"]["apply"], "Check this commit has main's configuration")
+    def run_check(self, check, sha, **env):
+        """Runs a check step's script in the checkout of sha: what it wrote to GITHUB_OUTPUT, and its stdout."""
         workspace = self.checkout(sha)
         output = os.path.join(self.tmp.name, "github_output")
         with open(output, "w"):
             pass
-        result = run_bash(check["run"], workspace, dict(self.env, GITHUB_OUTPUT=output, GITHUB_SHA=sha))
+        result = run_bash(check["run"], workspace, dict(self.env, GITHUB_OUTPUT=output, GITHUB_SHA=sha, **env))
         self.assertEqual(result.returncode, 0, result.stderr)
         with open(output) as f:
             return f.read(), result.stdout
+
+    def head(self):
+        return self.git(self.main, "rev-parse", "HEAD")
+
+
+class ApplyFreshnessStepTest(MainCheckoutTest):
+    """The Bunny unit's apply job's check that the run's commit still has main's configuration: a re-run of an older
+    main run, or one delayed behind a newer commit's, must not put the older configuration back."""
+
+    def initial_files(self):
+        paths = self.trigger_files() + ["tiles/src/index.ts", "deployment/modules/cloudflare/tiles-worker/a.tf"]
+        return {path: "first" for path in paths}
+
+    def trigger_files(self):
+        """A file under each path that triggers the workflow on main."""
+        paths = load(BUNNY_INFRA)[True]["push"]["paths"]
+        return [path.removesuffix("/**") + "/tiles/main.tf" if path.endswith("/**") else path for path in paths]
+
+    def run_step(self, sha):
+        return self.run_check(step(load(BUNNY_INFRA)["jobs"]["apply"], "Check this commit has main's configuration"),
+                              sha)
 
     def test_main_itself_applies(self):
         head = self.git(self.main, "rev-parse", "HEAD")
@@ -525,6 +545,89 @@ class ApplyFreshnessStepTest(unittest.TestCase):
         triggers = load(BUNNY_INFRA)[True]
         self.assertEqual(triggers["pull_request"]["paths"], triggers["push"]["paths"])
         self.assertIn("deployment/modules/bunny/tiles/main.tf", self.trigger_files())
+
+
+WORKER_TFVARS = "deployment/modules/cloudflare/tiles-worker/tiles.{}.tfvars.json"
+
+
+def worker_tfvars(key="20261101", **settings):
+    return json.dumps({"pmtiles_deployment_key": key, "storage_prefix": "", **settings})
+
+
+class WorkerApplyFreshnessTest(MainCheckoutTest):
+    """Tiles Worker's apply jobs' check that the run's commit still has main's configuration: a re-run of an older
+    main run, or one delayed behind a newer commit's, must not put an older deployment key, worker code or Bunny
+    setting back, even with main's deployment key."""
+
+    # A file of each kind of input the apply on main reads.
+    INPUTS = ("tiles/src/index.ts", "tiles/package-lock.json", "deployment/modules/cloudflare/tiles-worker/workers.tf",
+              "deployment/tiles-worker-bunny.env", "deployment/root.hcl", ".mise/config.toml", ".mise/mise.lock",
+              ".github/workflows/tiles-worker.yml")
+    OTHERS = ("README.md", "geocoder/src/main.cpp", "o11y/alerts/geoshenanigans-tiles.yaml")
+
+    # Each file's text is a comment, which a mise config (that the step's tools may read) takes too.
+    def initial_files(self):
+        files = {path: "# first" for path in self.INPUTS + self.OTHERS}
+        files.update({WORKER_TFVARS.format(env): worker_tfvars() for env in ("prod", "dev")})
+        return files
+
+    def check(self, job):
+        return step(load("tiles-worker.yml")["jobs"][job], "Check this commit has main's configuration")
+
+    def run_job(self, job, sha, ref="refs/heads/main", environment="prod"):
+        return self.run_check(self.check(job), sha, GITHUB_REF=ref, ENVIRONMENT=environment)
+
+    def test_the_steps_that_apply_wait_for_the_check(self):
+        jobs = load("tiles-worker.yml")["jobs"]
+        for job, name in (("deploy-terragrunt", "Deploy All"), ("deploy-dev-worker", "Deploy dev worker")):
+            with self.subTest(job=job):
+                self.assertEqual(self.check(job)["id"], "current")
+                for each in ("Get build artifact", name):
+                    self.assertEqual(step(jobs[job], each)["if"], "steps.current.outputs.current == 'true'")
+
+    def test_main_itself_applies(self):
+        for job, environment in (("deploy-terragrunt", "prod"), ("deploy-dev-worker", "dev")):
+            with self.subTest(job=job):
+                self.assertEqual(self.run_job(job, self.head(), environment=environment)[0], "current=true\n")
+
+    def test_an_older_commit_applies_when_main_changed_only_other_files(self):
+        old = self.head()
+        for path in self.OTHERS:
+            self.commit(path, "# newer")
+        for job, environment in (("deploy-terragrunt", "prod"), ("deploy-dev-worker", "dev")):
+            with self.subTest(job=job):
+                self.assertEqual(self.run_job(job, old, environment=environment)[0], "current=true\n")
+
+    def test_an_older_commit_skips_when_main_changed_a_bunny_setting_with_the_same_key(self):
+        old = self.head()
+        for settings in ({"bunny_pull_zone_id": "12345"}, {"bunny_pull_zone_id": "12345",
+                                                           "bunny_public_url": "https://tiles-bunny.example.com"}):
+            head = self.commit(WORKER_TFVARS.format("prod"), worker_tfvars(**settings))
+            for job, environment in (("deploy-terragrunt", "prod"), ("deploy-dev-worker", "dev")):
+                with self.subTest(job=job, settings=settings):
+                    output, stdout = self.run_job(job, old, environment=environment)
+                    self.assertEqual(output, "current=false\n")
+                    self.assertIn(f"::warning::main ({head}) deploys other {environment} inputs than {old}", stdout)
+
+    def test_an_older_commit_skips_when_main_changed_any_input(self):
+        for path in self.INPUTS + (WORKER_TFVARS.format("prod"), WORKER_TFVARS.format("dev")):
+            old = self.head()
+            self.commit(path, f"# newer {path}" if path not in (WORKER_TFVARS.format("prod"), WORKER_TFVARS.format("dev"))
+                        else worker_tfvars(storage_prefix="newer/"))
+            for job, environment in (("deploy-terragrunt", "prod"), ("deploy-dev-worker", "dev")):
+                with self.subTest(path=path, job=job):
+                    self.assertEqual(self.run_job(job, old, environment=environment)[0], "current=false\n")
+
+    def test_a_dispatch_from_a_branch_deploys_its_own_code_to_dev_unless_main_moved_the_key(self):
+        branch = self.commit("tiles/src/index.ts", "# a branch's code")
+        self.git(self.main, "reset", "--quiet", "--hard", "HEAD~1")
+        self.git(self.main, "push", "--quiet", "--force", "origin", "main")
+        self.commit("deployment/modules/cloudflare/tiles-worker/workers.tf", "# main moved on")
+        self.assertEqual(self.run_job("deploy-terragrunt", branch, "refs/heads/feature", "dev")[0], "current=true\n")
+        self.commit(WORKER_TFVARS.format("dev"), worker_tfvars("20261118"))
+        output, stdout = self.run_job("deploy-terragrunt", branch, "refs/heads/feature", "dev")
+        self.assertEqual(output, "current=false\n")
+        self.assertIn("This commit deploys dev tiles 20261101 but main now has 20261118", stdout)
 
 
 FAKE_OP = """#!/bin/sh
