@@ -549,8 +549,11 @@ spec:
           Bunny's replication queue is shared across the account: after a seed or a large forced sync the slow
           regions (Sydney first) lag for days, and a region that lacks a file serves it from Frankfurt, slowly,
           not as an error. While that drains, let syncs through by dispatching Tiles Sync with the regions
-          input, or setting the TILES_SYNC_REGIONS repository variable, to the regions that keep up (or none),
-          and clear it once geoshenanigans-tiles-sample-unreplicated has resolved. If the same few files stay
+          input, or setting the TILES_SYNC_REGIONS repository variable, to the regions that keep up (or none).
+          Clear it only once `npm run bunny:replication -- --listing --min-zoom 15 --max-zoom 15` (the live
+          prefix) shows 100% in every region and exits 0: geoshenanigans-tiles-sample-unreplicated resolving is
+          not enough, as the daily sample checks 100 positions a zoom and can miss a gap, and a check skipped
+          while a build is pending lets it resolve without checking anything. If the same few files stay
           unreplicated run after run while everything else replicates, Bunny has dropped their ReplicatedZones
           (an identical re-upload does that for good): each blocks every later sync. Check one with a DESCRIBE
           of the named path, raise it with Bunny, and let syncs through with the regions input leaving out the
@@ -687,7 +690,8 @@ spec:
     # tiles_sync_sample_lacking{storage_region} counts the sampled positions
     # stored with the right bytes that a region does not hold yet. Per region; a
     # warning, as such a tile comes from Frankfurt, slowly, not as an error. It is
-    # how the replication backlog after a seed is seen to drain.
+    # how the replication backlog after a seed is seen to drain; a sample cannot
+    # show that it has drained, which takes the zoom-15 listing.
     - uid: geoshenanigans-tiles-sample-unreplicated
       title: Tiles sample check found tiles not yet in a storage region
       condition: B
@@ -702,10 +706,13 @@ spec:
           not hold yet, so they are served from Frankfurt there (350-530 ms instead of tens). After a seed this is
           the replication backlog draining (Sydney takes longest; days for a planet), and it resolves by itself:
           keep scheduled syncs held (TILES_SYNC_HOLD) or their gate on fewer regions (TILES_SYNC_REGIONS) until
-          it does. Later, it means the account's replication queue is backed up, or files lost their replica list
-          (an identical re-upload does that for good): the check's log line (app:="tiles-sample-check") names
-          examples only for missing files, so list the region's lag with `npm run bunny:replication -- --listing
-          --min-zoom 15 --max-zoom 15` and raise lasting gaps with Bunny.
+          `npm run bunny:replication -- --listing --min-zoom 15 --max-zoom 15` (the live prefix) shows 100% in
+          every region and exits 0. This alert resolving does not show that: a clean sample checks 100 positions
+          a zoom and can miss a gap, and a check skipped while a build is pending sends no counts, so the alert
+          resolves once the last counts age out. Later, it means the account's replication queue is backed up,
+          or files lost their replica list (an identical re-upload does that for good): the check's log line
+          (app:="tiles-sample-check") names examples only for missing files, so list the region's lag with the
+          same listing and raise lasting gaps with Bunny.
       execErrState: Error
       noDataState: OK
       data:
@@ -969,7 +976,9 @@ spec:
                   params: []
     # The workflow compares the newest build's tiles schema version
     # (major.minor, from builds.json) with the live build's and stops before
-    # the download when they differ.
+    # the download when they differ. force skips that check, so the annotation
+    # keeps style compatibility (which force cannot see) apart from the diff's
+    # size (which its guard rail does).
     - uid: geoshenanigans-tiles-sync-schema
       title: Tiles sync stopped at a schema version change
       condition: B
@@ -981,13 +990,19 @@ spec:
         summary: The newest Protomaps build has another tiles schema version than the live one.
         description: >-
           The latest tiles-sync.yml run found that the newest Protomaps build's schema version differs from
-          the live build's in its major or minor part, and synced nothing. A schema change may rewrite most
-          tiles, and the styles (map-styles' @protomaps/basemaps) target one major. Dispatch Tiles Sync with
-          force to sync it in place when the diff is known to be small (up to 2% of positions; new tiles meet
-          the old styles on uncached requests until the run finishes; a dry run first tells the diff's size).
-          Otherwise it is a full rewrite: seed the build under a new prefix, switch with bunny:sync --adopt
-          --replace once it has replicated, and delete the old prefix a week later
-          (deployment/modules/bunny/tiles/README.md, "Full rewrites"). Until then every run stops here.
+          the live build's in its major or minor part, and synced nothing. Two questions decide what next, and
+          the diff's size answers only the second. First, whether the live styles can render the new tiles:
+          they come from map-styles' pinned @protomaps/basemaps release, which targets one schema, and a small
+          diff says nothing about that. Read the basemaps changelog for the new version and test the current
+          styles on the new build. Only a change known to be compatible may go in with force, which syncs it in
+          place, styles unchanged, when the diff is small (up to 2% of positions; a dry run first tells the
+          diff's size; new tiles meet the old styles on uncached requests until the run finishes). A change the
+          styles cannot render needs map-styles moved to a basemaps release for the new schema and tested
+          against the new build before switching: never force it. That, or a compatible diff over 2%, is a full
+          rewrite: seed the build under a new prefix, switch with bunny:sync --adopt --replace once it has
+          replicated, with STYLES_DIR the updated map-styles build (the switch writes the styles with the
+          TileJSON), and delete the old prefix a week later (deployment/modules/bunny/tiles/README.md, "Full
+          rewrites"). Until then every run stops here.
       execErrState: Error
       noDataState: OK
       data:
@@ -1292,10 +1307,11 @@ spec:
         project: geoshenanigans
         severity: warning
       annotations:
-        summary: Most synthetic probe runs failed at Globalping, so nothing probes the Bunny pull zone.
+        summary: Most synthetic probe runs had a Globalping measurement error, so the probe sees little or nothing of the Bunny pull zone.
         description: >-
-          Over half of the synthetic probe's runs in the past 30 minutes could not measure (result="error"):
-          Globalping refused to create a measurement or did not finish one in time. Tests unfinished at the
+          Over half of the synthetic probe's runs in the past 30 minutes, and at least two, had a measurement
+          error (result="error"): Globalping refused to create a measurement, did not finish one in time, or
+          gave none of a target's tests a verdict. Tests unfinished at the
           deadline are not counted as tile errors, so a stall at Bunny itself also shows here: check
           status.bunny.net and the "Probe tests" panel. The probe's error lines in
           the Logs panel ("Globalping measurement not created" or "unfinished at the deadline") give the
