@@ -594,19 +594,21 @@ pub async fn download_region(
     // fetch in place is recorded, by its path, in a file of the build's own,
     // and a retry of the build fetches only the others; a record of another
     // build is removed, its download started over. The record is there,
-    // empty at first, before the stamp goes, so before the first file of
-    // the build goes in, and goes only once the dir names a build: a dir
-    // holding one may mix two builds' files, and MultiIndex::load leaves
-    // it for a download to finish.
+    // empty at first, before the records of other builds and the stamp go,
+    // so before the first file of the build goes in, and goes only once the
+    // dir names a build: a dir that names none holds a record from the
+    // start of a download that broke off until one finishes. Such a dir
+    // may mix two builds' files, and MultiIndex::load leaves it for a
+    // download to finish.
     let stamp = region_dir.join(".build_date");
     let existing = tokio::fs::read_to_string(&stamp).await.unwrap_or_default();
     let fresh_build = existing.trim() != cfg.build.date;
     let record = region_dir.join(format!("{}{}", FETCHED_RECORD_PREFIX, cfg.build.date));
     let mut fetched = HashSet::new();
     if fresh_build {
+        open_record(&record).await?;
         remove_records(&region_dir, Some(&record)).await;
         fetched = read_fetched(&record).await;
-        open_record(&record).await?;
         match tokio::fs::remove_file(&stamp).await {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 return Err(DownloadError::Io(format!("remove {}: {}", stamp.display(), e)));
@@ -1244,6 +1246,30 @@ mod tests {
         let left = held(&root.path().join("europe"));
         assert_eq!(left.get(&format!(".fetched.{}", test_bucket::DATE)), Some(&Vec::new()));
         assert_eq!(left.get(".build_date"), None);
+    }
+
+    // A dir whose download of a fresh build broke off names no build, and
+    // holds a record so: a download of another build that can't make its
+    // own record (here a directory of its name) fails before it removes
+    // the one there.
+    #[tokio::test]
+    async fn a_fresh_builds_download_that_cant_make_its_record_leaves_the_one_there() {
+        let s = sel("europe", "admin", "simplified", "major");
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let root = ScratchDir::new();
+        older_build(&bucket, &s, root.path());
+        let dir = root.path().join("europe");
+        std::fs::remove_file(dir.join(".build_date")).unwrap();
+        std::fs::write(dir.join(".fetched.2026-02-01"), "europe/admin/places.tt.zst\n").unwrap();
+        let record = dir.join(format!(".fetched.{}", test_bucket::DATE));
+        std::fs::create_dir(&record).unwrap();
+
+        let failed = download(&bucket, &s, root.path()).await.map_err(|e| e.to_string());
+
+        assert!(failed.as_ref().is_err_and(|e| e.starts_with(&format!("I/O error: write {}: ", record.display()))), "{failed:?}");
+        assert_eq!(bucket.files_served(), 0);
+        assert_eq!(std::fs::read_to_string(dir.join(".fetched.2026-02-01")).ok().as_deref(), Some("europe/admin/places.tt.zst\n"));
+        assert!(!dir.join(".build_date").exists());
     }
 
     // A record beside the stamp of a build (a download killed once it
