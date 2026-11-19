@@ -193,7 +193,26 @@ jobs:
               echo "::add-mask::$key"
             done
 
+      # A re-run of an older main run would put its configuration back over a newer one (dropping a hostname the newer
+      # commit attached, say). The newer commit's own run applies it, so an older commit stops here. Inside the apply
+      # concurrency group: a commit that reaches main after this check queues its apply behind this one.
+      - name: Check this commit has main's configuration
+        id: current
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          # The paths that trigger this workflow on main.
+          paths=(deployment/modules/bunny deployment/root.hcl .mise/config.toml .mise/mise.lock .github/workflows/tiles-bunny-infra.yml)
+          git fetch --quiet --depth=1 origin main
+          if git diff --quiet HEAD FETCH_HEAD -- "${paths[@]}"; then
+            echo "current=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::main ($(git rev-parse FETCH_HEAD)) has another Bunny configuration than $GITHUB_SHA; skipping the apply, which main's own run makes"
+            echo "current=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Apply
+        if: steps.current.outputs.current == 'true'
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
         run: op run --env-file=bunny.env -- terragrunt run --non-interactive -- apply -auto-approve

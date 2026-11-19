@@ -32,6 +32,7 @@ The sync, the watchdog and the worker read more items: every one is in the go-li
 ## The workflow
 
 - **Pull requests and branch dispatches** run the checks (formatting, `tofu validate`, and `tofu test` against a mocked provider) with no credentials. Their plan reads the production token and runs the branch's Terragrunt configuration, so it runs in the `tiles-bunny-plan` environment and waits until one of its required reviewers approves the run, which runs that one commit. Create the environment once in the repository's settings (Environments): required reviewers (the maintainers who review this module, with self-review prevented when more than one can approve), deployment branches and tags left at "No restriction" so that every branch's plan can run, and no secrets of its own. GitHub creates an environment a job names without any protection, so until it has a reviewer the plan job stops at its first step, before anything reads a secret.
+- **`main`** applies after the merge. A run whose commit no longer has main's configuration (this directory, `deployment/root.hcl`, the tool versions in `.mise/` or the workflow, as on main now) skips the apply with a warning: that is a re-run of an older run, or one queued behind a newer commit, and putting its configuration back would undo the newer one (a hostname it attached, say). The newer commit's own run applies. Applies never overlap (concurrency group `tiles-bunny-apply`).
 
 ## First run: import the existing zones
 

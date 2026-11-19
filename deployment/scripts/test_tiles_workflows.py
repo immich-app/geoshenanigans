@@ -2,7 +2,7 @@
 """Tests for the tiles sync and Bunny infra workflows' own logic. Run: python3 -m unittest discover -s deployment/scripts
 -p 'test_*.py'
 
-Needs PyYAML (python3-yaml, on GitHub's Ubuntu runners), bash and jq.
+Needs PyYAML (python3-yaml, on GitHub's Ubuntu runners), bash, git and jq.
 """
 import json
 import os
@@ -202,6 +202,90 @@ class PlanEnvironmentStepTest(unittest.TestCase):
     def test_an_unreadable_environment_fails(self):
         self.assertNotEqual(self.run_step('{"message": "Not Found"}', gh_exit=1).returncode, 0)
         self.assertNotEqual(self.run_step("not json").returncode, 0)
+
+
+GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t",
+           "GIT_AUTHOR_EMAIL": "t@example.invalid", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+
+
+class ApplyFreshnessStepTest(unittest.TestCase):
+    """The apply job's check that the run's commit still has main's configuration: a re-run of an older main run, or
+    one delayed behind a newer commit's, must not put the older configuration back."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env = dict(os.environ, **GIT_ENV)
+        self.origin = os.path.join(self.tmp.name, "origin.git")
+        self.main = os.path.join(self.tmp.name, "main")
+        self.git(self.tmp.name, "init", "--quiet", "--bare", "--initial-branch=main", self.origin)
+        self.git(self.tmp.name, "init", "--quiet", "--initial-branch=main", self.main)
+        self.git(self.main, "remote", "add", "origin", self.origin)
+        for path in self.trigger_files() + ["tiles/src/index.ts", "deployment/modules/cloudflare/tiles-worker/a.tf"]:
+            self.commit(path, "first")
+
+    def git(self, cwd, *args):
+        return subprocess.run(["git", *args], cwd=cwd, env=self.env, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def commit(self, path, text):
+        full = os.path.join(self.main, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(text + "\n")
+        self.git(self.main, "add", path)
+        self.git(self.main, "commit", "--quiet", "-m", f"{path}: {text}")
+        self.git(self.main, "push", "--quiet", "origin", "main")
+        return self.git(self.main, "rev-parse", "HEAD")
+
+    def trigger_files(self):
+        """A file under each path that triggers the workflow on main."""
+        paths = load(BUNNY_INFRA)[True]["push"]["paths"]
+        return [path.removesuffix("/**") + "/tiles/main.tf" if path.endswith("/**") else path for path in paths]
+
+    def checkout(self, sha):
+        """The run's checkout: actions/checkout fetches the one commit, with origin pointing at the repository."""
+        workspace = os.path.join(self.tmp.name, f"workspace-{sha[:7]}")
+        self.git(self.tmp.name, "init", "--quiet", workspace)
+        self.git(workspace, "remote", "add", "origin", "file://" + self.origin)
+        self.git(workspace, "fetch", "--quiet", "--depth=1", "origin", sha)
+        self.git(workspace, "checkout", "--quiet", "--detach", sha)
+        return workspace
+
+    def run_step(self, sha):
+        check = step(load(BUNNY_INFRA)["jobs"]["apply"], "Check this commit has main's configuration")
+        workspace = self.checkout(sha)
+        output = os.path.join(self.tmp.name, "github_output")
+        with open(output, "w"):
+            pass
+        result = run_bash(check["run"], workspace, dict(self.env, GITHUB_OUTPUT=output, GITHUB_SHA=sha))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(output) as f:
+            return f.read(), result.stdout
+
+    def test_main_itself_applies(self):
+        head = self.git(self.main, "rev-parse", "HEAD")
+        self.assertEqual(self.run_step(head)[0], "current=true\n")
+
+    def test_an_older_commit_applies_when_main_changed_only_other_files(self):
+        old = self.git(self.main, "rev-parse", "HEAD")
+        self.commit("tiles/src/index.ts", "newer")
+        self.commit("deployment/modules/cloudflare/tiles-worker/a.tf", "newer")
+        self.assertEqual(self.run_step(old)[0], "current=true\n")
+
+    def test_an_older_commit_skips_when_main_changed_any_path_that_triggers_the_workflow(self):
+        for path in self.trigger_files():
+            with self.subTest(path=path):
+                old = self.git(self.main, "rev-parse", "HEAD")
+                head = self.commit(path, f"newer {path}")
+                output, stdout = self.run_step(old)
+                self.assertEqual(output, "current=false\n")
+                self.assertIn(f"::warning::main ({head}) has another Bunny configuration than {old}", stdout)
+
+    def test_the_trigger_paths_are_the_same_for_pull_requests_and_main(self):
+        triggers = load(BUNNY_INFRA)[True]
+        self.assertEqual(triggers["pull_request"]["paths"], triggers["push"]["paths"])
+        self.assertIn("deployment/modules/bunny/tiles/main.tf", self.trigger_files())
 
 
 FAKE_OP = """#!/bin/sh
