@@ -22,10 +22,13 @@ export interface WorkerInit {
   internalCompression: number;
 }
 
-/** Entries of one directory or job, in tile-ID order. Leaf pointers have runLength 0. */
+/**
+ * Entries of one directory or job, in tile-ID order. Leaf pointers have runLength 0. Run lengths are varints up to
+ * 2^53 like tile IDs, so they are doubles too: a 32-bit array would wrap a run of 2^32 positions to a leaf pointer.
+ */
 export interface EntryArrays {
   tileIds: Float64Array;
-  runLengths: Uint32Array;
+  runLengths: Float64Array;
   offsets: Float64Array;
   lengths: Uint32Array;
 }
@@ -40,7 +43,7 @@ export type WorkerReply = { type: 'decoded'; id: number; chainEnd: number } | { 
 export interface JobResult {
   id: number;
   tileIds: Float64Array;
-  runLengths: Uint32Array;
+  runLengths: Float64Array;
   /** First 8 bytes of each entry's SHA-256 as two big-endian words; zero where `unresolved` lists the entry. */
   hashes: Uint32Array;
   /** The chain: entry indexes, offsets and lengths of the tiles this job hashed, in ascending offset order. */
@@ -85,7 +88,7 @@ export function decodeDirectory(buf: Uint8Array): EntryArrays {
   const count = readVarint(buf, pos);
   pos = varintEnd;
   const tileIds = new Float64Array(count);
-  const runLengths = new Uint32Array(count);
+  const runLengths = new Float64Array(count);
   const lengths = new Uint32Array(count);
   const offsets = new Float64Array(count);
   let tileId = 0;
@@ -344,7 +347,7 @@ function concat(parts: EntryArrays[]): EntryArrays {
   const count = parts.reduce((sum, part) => sum + part.tileIds.length, 0);
   const out: EntryArrays = {
     tileIds: new Float64Array(count),
-    runLengths: new Uint32Array(count),
+    runLengths: new Float64Array(count),
     offsets: new Float64Array(count),
     lengths: new Uint32Array(count),
   };
