@@ -2086,7 +2086,7 @@
     {
       "type": "timeseries",
       "title": "Replication wait by region",
-      "description": "Seconds from the start of the tile replication gate until each checked storage region held every tile the gate checked. A region with no point was not selected for that run (the regions input or TILES_SYNC_REGIONS) or did not catch up before the gate ended.",
+      "description": "Seconds the sync's replication gates waited until each checked storage region held every file they checked: the tile gate's wait from its start plus the TileJSON and styles gate's, added up. A region with no point was not selected for that run (the regions input or TILES_SYNC_REGIONS) or did not catch up before one of the gates ended.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

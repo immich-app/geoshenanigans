@@ -1451,9 +1451,10 @@ spec:
                 reducer:
                   type: last
                   params: []
-    # A probe run is result="error" when Globalping refused a measurement (its
-    # hourly quota, which manual probe sets spend too, a bad token, a 5xx), one
-    # was unfinished at the run's deadline, or none of its tests got a verdict.
+    # A probe run is result="error" when the TileJSON gave no tile URL to test,
+    # Globalping refused a measurement (its hourly quota, which manual probe
+    # sets spend too, a bad token, a 5xx), one was unfinished at the run's
+    # deadline, none of its tests got a verdict, or a continent got none.
     # Tests still in progress at the deadline have no verdict and count in
     # neither tiles_bunny_probe_errors nor the TTFB, so a Bunny stall that
     # keeps every test unfinished shows here, not as tile errors. Same window
@@ -1470,13 +1471,17 @@ spec:
         summary: Most synthetic probe runs had a Globalping measurement error, so the probe sees little or nothing of the Bunny pull zone.
         description: >-
           Over half of the synthetic probe's runs in the past 30 minutes, and at least two, had a measurement
-          error (result="error"): Globalping refused to create a measurement, did not finish one in time, or
-          gave none of a target's tests a verdict. Tests unfinished at the
+          error (result="error"): the zone's TileJSON gave no tile URL to test, Globalping refused to create a
+          measurement, did not finish one in time, gave none of a target's tests a verdict, or gave no verdict
+          for some continent. Tests unfinished at the
           deadline are not counted as tile errors, so a stall at Bunny itself also shows here: check
           status.bunny.net and the "Probe tests" panel. The probe's error lines in
-          the Logs panel ("Globalping measurement not created" or "unfinished at the deadline") give the
-          answer: a 429 is the hourly quota (500 tests plus credits, also spent by manual probe sets; it
-          recovers within the hour), a 401 or 403 the GLOBALPING_TOKEN worker secret. Until it recovers,
+          the Logs panel give the answer. "Probe tile URLs unknown": the TileJSON (v1.json) could not be read
+          or names no usable tile URL. "Globalping measurement not created": a 429 is the hourly quota (500
+          tests plus credits, also spent by manual probe sets; it recovers within the hour), a 401 or 403 the
+          GLOBALPING_TOKEN worker secret. "Globalping measurement has no verdict from some continents": its
+          missing field names them; Globalping had no probe there or its tests failed. "Unfinished at the
+          deadline" or "no test with a verdict": see the stall above. Until it recovers,
           geoshenanigans-tiles-bunny-probe-errors and -probe-slow are blind.
       execErrState: Error
       noDataState: OK
