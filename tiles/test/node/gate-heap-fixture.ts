@@ -15,13 +15,13 @@ let describes = 0;
 const storage = {
   describe: async () => {
     describes++;
-    // Half the files lack Sydney on the first pass.
+    // Half the files lack the last region on the first pass.
     const replicatedZones =
       describes <= files && describes % 2 === 0 ? REPLICATION_REGIONS.slice(0, -1) : REPLICATION_REGIONS;
     return { checksum: sha256, length: 4, replicatedZones, lastChanged: '' };
   },
 } as unknown as BunnyStorage;
-void waitForReplication(storage, items, REPLICATION_REGIONS, { timeoutMs: 60_000, intervalMs: 1 }).then((result) => {
+void waitForReplication(storage, items, REPLICATION_REGIONS, { timeoutMs: 600_000, intervalMs: 1 }).then((result) => {
   const { heapUsed } = process.memoryUsage();
   process.stdout.write(
     `${JSON.stringify({ complete: result.complete, passes: result.passes, describes, heapUsed })}\n`,

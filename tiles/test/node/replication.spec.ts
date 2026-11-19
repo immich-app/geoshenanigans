@@ -7,12 +7,13 @@ import {
   checkReplication,
   checksumMatches,
   classify,
+  normalizeRegions,
   ReplicationItem,
   TileGateList,
   waitForReplication,
 } from '../../src/bunny/replication';
 import { BunnyStateStore, publishBuild, writeState } from '../../src/bunny/state';
-import { BunnyStorage } from '../../src/bunny/storage';
+import { BunnyStorage, StorageObject } from '../../src/bunny/storage';
 import { tilePath, zoomEnd } from '../../src/bunny/tile-id';
 import { runSeed } from '../../src/bunny/upload';
 import { FakeStorage, FakeStorageOptions, sha256Hex } from './fake-storage';
@@ -39,6 +40,28 @@ async function setup(options: FakeStorageOptions = {}) {
     () => storage.close(),
   );
   return { fake, storage };
+}
+
+/**
+ * A storage stand-in whose DESCRIBE answers `answer(path, call)` (call counts from 1 per path) after `delayMs`, for
+ * gate tests that need exact answers in order rather than an HTTP fake.
+ */
+function stubStorage(
+  answer: (path: string, call: number) => Partial<StorageObject> | null,
+  delayMs = 0,
+): { storage: BunnyStorage; describes: string[] } {
+  const describes: string[] = [];
+  const storage = {
+    describe: async (path: string) => {
+      describes.push(path);
+      if (delayMs > 0) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+      const object = answer(path, describes.filter((described) => described === path).length);
+      return object && { checksum: 'AB'.repeat(32), length: 1, replicatedZones: [], lastChanged: '', ...object };
+    },
+  } as unknown as BunnyStorage;
+  return { storage, describes };
 }
 
 async function upload(storage: BunnyStorage, count: number): Promise<ReplicationItem[]> {
@@ -100,26 +123,109 @@ describe('TileGateList', () => {
   }, 120_000);
 });
 
+describe('normalizeRegions', () => {
+  it('upper-cases, trims and lists each region once, in order', () => {
+    expect(normalizeRegions([' uk', 'SYD', 'UK', '', 'syd ', 'ny'])).toEqual(['UK', 'SYD', 'NY']);
+  });
+});
+
 describe('waitForReplication', () => {
   it('follows each region until it holds every file, re-checking only what is still missing', async () => {
-    const { fake, storage } = await setup({ replicationDelayMs: { UK: 20, NY: 150, SYD: 400 } });
+    const { fake, storage } = await setup();
     const items = await upload(storage, 60);
+    const hold = (paths: string[], region: string) =>
+      paths.forEach((path) => fake.files.get(path)!.replicatedZones.add(region));
+    // A third of the files are in every region from the start; the rest gain UK, NY and SYD, one after each pass.
+    const ready = items.slice(0, 20).map((item) => item.path);
+    const late = items.slice(20).map((item) => item.path);
+    REGIONS.forEach((region) => hold(ready, region));
     const describesBefore = fake.requests.DESCRIBE ?? 0;
-    const passes: number[] = [];
+    const passes: Array<{ pending: number; describes: number; missingByRegion: Record<string, number> }> = [];
+    let describesSoFar = describesBefore;
     const result = await waitForReplication(storage, items, REGIONS, {
-      timeoutMs: 5_000,
-      intervalMs: 30,
-      onPass: ({ pending }) => passes.push(pending),
+      timeoutMs: 10_000,
+      intervalMs: 1,
+      onPass: ({ pass, pending, missingByRegion }) => {
+        passes.push({ pending, describes: fake.requests.DESCRIBE - describesSoFar, missingByRegion });
+        describesSoFar = fake.requests.DESCRIBE;
+        if (pass <= REGIONS.length) {
+          hold(late, REGIONS[pass - 1]);
+        }
+      },
     });
 
-    expect(result).toMatchObject({ complete: true, missing: [], mismatched: [], incomplete: 0 });
+    expect(result).toMatchObject({ complete: true, missing: [], mismatched: [], incomplete: 0, passes: 4 });
     expect(result.missingByRegion).toEqual({ UK: 0, NY: 0, SYD: 0 });
-    expect(result.regionWaitMs.UK!).toBeLessThan(result.regionWaitMs.NY!);
-    expect(result.regionWaitMs.NY!).toBeLessThan(result.regionWaitMs.SYD!);
-    expect(result.regionWaitMs.SYD!).toBeGreaterThanOrEqual(350);
-    expect(passes.at(-1)).toBe(0);
-    // Later passes only DESCRIBE files that some region still lacked.
-    expect(fake.requests.DESCRIBE - describesBefore).toBeLessThan(60 * result.passes);
+    // Every file once, then only the 40 that some region still lacked.
+    expect(passes).toEqual([
+      { pending: 40, describes: 60, missingByRegion: { UK: 40, NY: 40, SYD: 40 } },
+      { pending: 40, describes: 40, missingByRegion: { UK: 0, NY: 40, SYD: 40 } },
+      { pending: 40, describes: 40, missingByRegion: { UK: 0, NY: 0, SYD: 40 } },
+      { pending: 0, describes: 40, missingByRegion: { UK: 0, NY: 0, SYD: 0 } },
+    ]);
+    expect(fake.requests.DESCRIBE - describesBefore).toBe(180);
+    expect(result.regionWaitMs.UK!).toBeLessThanOrEqual(result.regionWaitMs.NY!);
+    expect(result.regionWaitMs.NY!).toBeLessThanOrEqual(result.regionWaitMs.SYD!);
+  });
+
+  it('needs one answer that names every region, not regions gathered over several', async () => {
+    // UK on the first answer, then only NY (UK lost the file), then both.
+    const answers = [['UK'], ['NY'], ['UK', 'NY']];
+    const { storage, describes } = stubStorage((_, call) => ({ replicatedZones: answers[call - 1] ?? [] }));
+    const result = await waitForReplication(storage, [{ path: 'r/a.mvt', sha256: 'AB'.repeat(32) }], ['UK', 'NY'], {
+      timeoutMs: 10_000,
+      intervalMs: 1,
+    });
+    expect(result).toMatchObject({ complete: true, passes: 3 });
+    expect(describes).toHaveLength(3);
+  });
+
+  it('counts a region listed twice, in any case, once', async () => {
+    const { fake, storage } = await setup();
+    const items = await upload(storage, 4);
+    fake.replicate();
+    const result = await waitForReplication(storage, items, ['UK', 'uk', ' NY', 'SYD'], {
+      timeoutMs: 5_000,
+      intervalMs: 1,
+    });
+    expect(result).toMatchObject({ complete: true, passes: 1 });
+    expect(result.missingByRegion).toEqual({ UK: 0, NY: 0, SYD: 0 });
+    expect(Object.keys(result.regionWaitMs)).toEqual(['UK', 'NY', 'SYD']);
+  });
+
+  it('starts no DESCRIBE once the timeout has passed, and keeps the files it did not reach pending', async () => {
+    const sha256 = 'AB'.repeat(32);
+    const items = Array.from({ length: 200 }, (_, i) => ({ path: `r/${i}.mvt`, sha256 }));
+    for (const regions of [REGIONS, []]) {
+      // Every file is in every region, but a pass over them all takes about 2 s.
+      const { storage, describes } = stubStorage(() => ({ replicatedZones: REGIONS }), 10);
+      const result = await waitForReplication(storage, items, regions, {
+        timeoutMs: 150,
+        intervalMs: 1,
+        concurrency: 1,
+      });
+      expect(describes.length).toBeGreaterThan(0);
+      expect(describes.length).toBeLessThan(60);
+      expect(result.passes).toBe(1);
+      expect(result.waitedMs).toBeLessThan(1_000);
+      // Unchecked files are not taken as replicated, even when no region is followed (storage only).
+      expect(result).toMatchObject({ complete: false, missing: [], mismatched: [], errors: 0 });
+      expect(result.incomplete).toBe(items.length - describes.length);
+      expect(result.stragglers[0]).toEqual({ path: `r/${describes.length}.mvt`, regions });
+    }
+  });
+
+  it('keeps a file no DESCRIBE answered for pending, even when no region is followed', async () => {
+    const { fake } = await setup();
+    // Every DESCRIBE fails (after its retries) with a server error: the file was never seen stored.
+    const storage = new BunnyStorage({ zone: fake.zone, password: fake.password, host: fake.url, retry: fast });
+    cleanup.push(() => storage.close());
+    fake.options.fault = (request) => (request.method === 'DESCRIBE' ? 'server-error' : undefined);
+    const result = await waitForReplication(storage, [{ path: 'r/0.mvt', sha256: 'AA' }], [], {
+      timeoutMs: 300,
+      intervalMs: 20,
+    });
+    expect(result).toMatchObject({ complete: false, incomplete: 1, errors: 1 });
   });
 
   it('with no grace, fails as soon as only missing and mismatched files are left', async () => {
@@ -239,6 +345,17 @@ describe('checkReplication', () => {
     expect(report.missingPaths).toEqual([tilePath('v1', 21)]);
     expect(report.mismatchedPaths).toEqual([tilePath('v1', 20)]);
     expect(report.coverage.UK).toBeCloseTo(5 / 22);
+    expect(fake.requests.DESCRIBE).toBe(items.length);
+  });
+
+  it('counts a region listed twice, in any case, once', async () => {
+    const { fake, storage } = await setup();
+    const items = await upload(storage, 4);
+    fake.replicate('r/0', ['UK']);
+    const report = await checkReplication(storage, items, ['UK', 'uk', 'SYD'], { concurrency: 2 });
+    expect(report).toMatchObject({ checked: 4, replicated: 0, partial: 4 });
+    expect(report.regions).toEqual({ UK: 1, SYD: 0 });
+    expect(report.coverage).toEqual({ UK: 0.25, SYD: 0 });
   });
 });
 

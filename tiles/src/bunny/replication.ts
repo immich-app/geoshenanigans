@@ -24,6 +24,14 @@ export const REPLICATION_REGIONS = [
   'JH',
 ];
 
+/**
+ * Region codes as DESCRIBE writes them (upper case), each once and in the order given: a region listed twice would be
+ * counted twice towards coverage, or wait for a bit no response clears.
+ */
+export function normalizeRegions(regions: readonly string[]): string[] {
+  return [...new Set(regions.map((region) => region.trim().toUpperCase()).filter(Boolean))];
+}
+
 export interface ReplicationItem {
   path: string;
   /**
@@ -168,7 +176,10 @@ export interface ReplicationResult {
   mismatched: string[];
   /** DESCRIBE still found nothing on its last answer. */
   missing: string[];
-  /** Files held by the main region whose replication did not finish in time. */
+  /**
+   * Files not shown missing or mismatched whose replication did not finish in time, or that no DESCRIBE answered for
+   * before the timeout (when a pass outlasts it, or a DESCRIBE keeps failing).
+   */
   incomplete: number;
   /** The first of those (up to `stragglerLimit`) and the regions each lacked, so a stuck file can be named. */
   stragglers: Array<{ path: string; regions: string[] }>;
@@ -205,21 +216,30 @@ export interface WaitOptions {
 /** Regions are bits of a 32-bit mask per file. */
 const MAX_GATE_REGIONS = 31;
 
+/** The longest delay a Node timer takes (about 24.8 days); a longer one fires after 1 ms. */
+const TIMER_MAX_MS = 2 ** 31 - 1;
+
+/** A file no DESCRIBE has answered for yet: the bit above the regions'. */
+const UNCHECKED = 2 ** MAX_GATE_REGIONS;
+
 /**
- * The replication gate: DESCRIBEs every file, then again only the files some region still lacks, until every region
- * holds every file or the timeout passes. A file DESCRIBE shows missing or with other bytes counts as lacking from
- * every region and is asked about again on every pass (DESCRIBE can lag an overwrite); once only such files are left
- * and each has shown so for `mismatchGraceMs`, the gate fails without waiting out the timeout. A DESCRIBE that fails
- * after its retries leaves its file pending; a refused password ends the gate with that error at once.
+ * The replication gate: DESCRIBEs every file, then again only the files some region still lacks, until one answer
+ * shows a file in every region (a replica can drop out, e.g. after an identical re-PUT) or the timeout passes. The
+ * timeout bounds the whole wait: no DESCRIBE starts after it, and the files a pass did not reach stay pending. A file
+ * DESCRIBE shows missing or with other bytes counts as lacking from every region and is asked about again on every
+ * pass (DESCRIBE can lag an overwrite); once only such files are left and each has shown so for `mismatchGraceMs`,
+ * the gate fails without waiting out the timeout. A DESCRIBE that fails after its retries leaves its file pending; a
+ * refused password ends the gate with that error at once. `regions` are normalised (normalizeRegions).
  * What it keeps per file is a region bitmask and an index (8 bytes), so `items` sets the memory: pass a TileGateList
  * for large sets.
  */
 export async function waitForReplication(
   storage: BunnyStorage,
   source: GateItems | ReplicationItem[],
-  regions: string[] = REPLICATION_REGIONS,
+  requested: string[] = REPLICATION_REGIONS,
   options: WaitOptions,
 ): Promise<ReplicationResult> {
+  const regions = normalizeRegions(requested);
   if (regions.length > MAX_GATE_REGIONS) {
     throw new Error(`The gate follows at most ${MAX_GATE_REGIONS} regions, got ${regions.length}`);
   }
@@ -229,8 +249,12 @@ export async function waitForReplication(
   const graceMs = options.mismatchGraceMs ?? 5 * 60_000;
   const all = regions.length === 0 ? 0 : 2 ** regions.length - 1;
   const bit = new Map(regions.map((region, i) => [region, 2 ** i]));
-  /** The regions each file still lacks, as bits. */
-  const lacking = new Uint32Array(items.length).fill(all);
+  /** The regions each file lacked on its last answer, as bits, and UNCHECKED until it has one. */
+  const lacking = new Uint32Array(items.length).fill(all + UNCHECKED);
+  // No DESCRIBE starts once the timeout has passed, even in the middle of a pass (a timer takes whole milliseconds,
+  // at most TIMER_MAX_MS).
+  const deadline = AbortSignal.timeout(Math.min(TIMER_MAX_MS, Math.max(0, Math.ceil(options.timeoutMs))));
+  const signal = options.signal ? AbortSignal.any([deadline, options.signal]) : deadline;
   /** Files whose last answer was missing or mismatched, and since when (elapsed ms) they have answered so. */
   const wrong = new Map<number, { state: 'missing' | 'mismatched'; since: number }>();
   const regionWaitMs: Record<string, number | null> = Object.fromEntries(regions.map((region) => [region, null]));
@@ -267,7 +291,8 @@ export async function waitForReplication(
           return;
         }
         wrong.delete(index);
-        let mask = lacking[index];
+        // Only this answer counts: a region an earlier one named may have lost the file since.
+        let mask = all;
         for (const region of object.replicatedZones) {
           const held = bit.get(region);
           if (held !== undefined && mask & held) {
@@ -276,7 +301,7 @@ export async function waitForReplication(
         }
         lacking[index] = mask;
       },
-      options.signal,
+      signal,
     );
     let kept = 0;
     for (const index of pending) {
@@ -311,12 +336,16 @@ export async function waitForReplication(
       break;
     }
     const remaining = options.timeoutMs - elapsed();
-    if (remaining <= 0) {
+    if (remaining <= 0 || deadline.aborted) {
       break;
     }
     const wait = (options.intervalMs ?? 15_000) - (performance.now() - passStarted);
     if (wait > 0) {
-      await sleep(Math.min(wait, remaining), undefined, { signal: options.signal }).catch(() => {});
+      await sleep(Math.min(wait, remaining), undefined, { signal }).catch(() => {});
+    }
+    // A pass begun after the timeout would ask about nothing, and wipe the last pass's errors.
+    if (signal.aborted || elapsed() >= options.timeoutMs) {
+      break;
     }
   }
 
@@ -380,11 +409,14 @@ const newTally = (regions: string[]): Tally => ({
   regions: Object.fromEntries(regions.map((region) => [region, 0])),
 });
 
-/** One DESCRIBE per file of a (possibly huge, streamed) source: per-region coverage, overall and per zoom. */
+/**
+ * One DESCRIBE per file of a (possibly huge, streamed) source: per-region coverage, overall and per zoom. `regions`
+ * are normalised (normalizeRegions).
+ */
 export async function checkReplication(
   storage: BunnyStorage,
   items: AsyncIterable<ReplicationItem> | Iterable<ReplicationItem>,
-  regions: string[] = REPLICATION_REGIONS,
+  requested: string[] = REPLICATION_REGIONS,
   options: {
     concurrency?: number;
     listLimit?: number;
@@ -393,6 +425,7 @@ export async function checkReplication(
   } = {},
 ): Promise<CoverageReport> {
   const started = performance.now();
+  const regions = normalizeRegions(requested);
   const listLimit = options.listLimit ?? 100;
   const total = newTally(regions);
   const byZoom: Record<string, Tally> = {};
