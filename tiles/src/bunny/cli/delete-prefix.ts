@@ -7,6 +7,10 @@
  *
  * Only the tile folders go (`<prefix>/<z>/` for each zoom, named as tile URLs name them: `8`, never `08`), never the
  * TileJSON or styles (`v1.json`, `v1/style/`) or another prefix inside this one (`v1/e2/` when deleting `v1`).
+ * It refuses, dry run included and before any DELETE, a --static-prefix inside one of the tile folders (`v1/0` keeps
+ * its styles in `v1/0/style/`, which deleting `v1`'s zoom 0 would take) and a zoom folder holding anything but tile
+ * columns (`v1/0/style/` again, with --static-prefix left out): a zoom's folder goes in one DELETE with all it holds.
+ * Each zoom folder is listed again before its own DELETEs, so something put there meanwhile stops it too.
  * It refuses a prefix whose tile folders hold, or sit inside, either the prefix state.json names live or the one the
  * zone's TileJSON (`<static prefix>.json`) points tiles at: a switch that wrote the TileJSON and then failed leaves
  * the two apart, and clients load what the TileJSON says. A state.json or TileJSON that is missing, or a tile template
@@ -47,6 +51,20 @@ function integer(name: string, value: string | undefined, fallback: number, min 
     throw new UsageError(`--${name} must be an integer from ${min} to ${max}, got ${value}`);
   }
   return parsed;
+}
+
+/**
+ * Throws when the TileJSON and styles of `staticPrefix` (`<static>.json`, `<static>/style/`) sit inside one of
+ * `prefix`'s tile folders, `<prefix>/<z>/` for any number z: deleting that folder would delete them.
+ */
+function checkStaticOutside(prefix: string, staticPrefix: string) {
+  const inside = `${staticPrefix}/`;
+  if (inside.startsWith(`${prefix}/`) && /^\d+\//.test(inside.slice(prefix.length + 1))) {
+    throw new Error(
+      `--static-prefix ${staticPrefix} keeps its styles (${staticPrefix}/style/) inside ${prefix}/'s tile folders: ` +
+        'deleting those would delete the styles too, so nothing is deleted',
+    );
+  }
 }
 
 function trimPrefix(name: string, value: string | undefined): string {
@@ -103,11 +121,13 @@ async function main(): Promise<number> {
     throw new UsageError('--prefix is required: the tile prefix to delete, e.g. v1');
   }
   const prefix = trimPrefix('prefix', values.prefix);
-  const tileJsonPath = `${trimPrefix('static-prefix', values['static-prefix'] ?? STATIC_PREFIX)}.json`;
+  const staticPrefix = trimPrefix('static-prefix', values['static-prefix'] ?? STATIC_PREFIX);
+  const tileJsonPath = `${staticPrefix}.json`;
   const minZoom = integer('min-zoom', values['min-zoom'], 0, 0, 20);
   // The default too must not be below --min-zoom: a range that holds no zoom would delete nothing and exit 0.
   const maxZoom = integer('max-zoom', values['max-zoom'] ?? '15', 15, minZoom, 20);
   const concurrency = integer('concurrency', values.concurrency, 4, 1, 64);
+  checkStaticOutside(prefix, staticPrefix);
 
   const stateStore = BunnyStateStore.fromEnv();
   const storage = new BunnyStorage({ ...storageOptionsFromEnv(), concurrency });
@@ -140,6 +160,23 @@ async function main(): Promise<number> {
       process.stderr.write(`No tile folders of zooms ${minZoom}-${maxZoom} under ${prefix}/: nothing to delete\n`);
       return 0;
     }
+    /** The zoom's columns still there (a run stopped part-way deleted the others); throws if it holds anything else. */
+    const columnsOf = async (z: number): Promise<string[]> => {
+      const entries = await storage.list(`${prefix}/${z}`);
+      const foreign = entries.find(
+        (entry) => !entry.isDirectory || !TILE_FOLDER.test(entry.name) || Number(entry.name) >= 2 ** z,
+      );
+      if (foreign) {
+        throw new Error(
+          `${prefix}/${z}/ holds ${prefix}/${z}/${foreign.name}${foreign.isDirectory ? '/' : ''}, not a tile column: ` +
+            `deleting ${prefix}/${z}/ would delete it too, so that folder is not deleted`,
+        );
+      }
+      return entries.map((entry) => entry.name);
+    };
+    for (const z of present) {
+      await columnsOf(z);
+    }
     process.stderr.write(
       `Live: ${state.liveBuild} under ${state.prefix}/. ${values.yes ? 'Deleting' : 'Would delete'} ${prefix}/ ` +
         `zooms ${present.join(', ')}\n`,
@@ -166,12 +203,13 @@ async function main(): Promise<number> {
       }
     };
     for (const z of present) {
+      const columns = await columnsOf(z);
       if (z > WHOLE_ZOOM_MAX) {
-        // The columns still there: a run stopped part-way deleted the others.
-        const columns = (await storage.list(`${prefix}/${z}`))
-          .filter((entry) => entry.isDirectory && TILE_FOLDER.test(entry.name) && Number(entry.name) < 2 ** z)
-          .map((entry) => `${prefix}/${z}/${entry.name}/`);
-        await forEachLimit(columns, concurrency, remove);
+        await forEachLimit(
+          columns.map((x) => `${prefix}/${z}/${x}/`),
+          concurrency,
+          remove,
+        );
       }
       await remove(`${prefix}/${z}/`);
     }

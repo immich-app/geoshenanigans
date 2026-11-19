@@ -177,6 +177,20 @@ describe('bunny:delete-prefix', () => {
     // Another static prefix's TileJSON.
     tiles.seed('v2.json', tileJson('v1/e2'));
     expect((await run('--prefix', 'v1/e2', '--yes', '--static-prefix', 'v2')).stderr).toMatch(/v2\.json points/);
+    // Every template counts, not just the first: here only the second names v1/e2.
+    tiles.seed(
+      'v1.json',
+      new TextEncoder().encode(
+        JSON.stringify({
+          tilejson: '3.0.0',
+          tiles: ['https://tiles.example.com/v3/{z}/{x}/{y}.mvt', 'https://tiles.example.com/v1/e2/{z}/{x}/{y}.mvt'],
+        }),
+      ),
+    );
+    const second = await run('--prefix', 'v1/e2', '--yes');
+    expect(second).toMatchObject({ code: 1 });
+    expect(second.stderr).toMatch(/v1\.json points tiles at v1\/e2\/: they are under v1\/e2\/'s folders/);
+    expect(tiles.requests.DELETE ?? 0).toBe(0);
 
     const unreadable: [Uint8Array | null, RegExp][] = [
       [null, /v1\.json is not in the tiles zone/],
@@ -205,6 +219,42 @@ describe('bunny:delete-prefix', () => {
     }
     expect(tiles.requests.DELETE ?? 0).toBe(0);
     expect(under(tiles, 'v1/e2')).toHaveLength(zoomEnd(8));
+  });
+
+  it('refuses, before any DELETE, a prefix whose tile folders hold the styles or anything else but tile columns', async () => {
+    const { tiles, run } = await setup();
+    // A rewrite to v1/e2 that keeps the TileJSON and styles under --static-prefix v1/0: its styles are in zoom 0's folder.
+    tiles.seed('v1/0.json', tileJson('v1/e2'));
+    tiles.seed('v1/0/style/light.json', new TextEncoder().encode('{}'));
+    for (const args of [['--yes'], []]) {
+      const refused = await run('--prefix', 'v1', '--static-prefix', 'v1/0', ...args);
+      expect(refused).toMatchObject({ code: 1 });
+      expect(refused.stderr).toMatch(
+        /--static-prefix v1\/0 keeps its styles \(v1\/0\/style\/\) inside v1\/'s tile folders/,
+      );
+    }
+    // No request at all: the arguments alone say so.
+    expect(tiles.requests).toEqual({});
+    // Left out, the default v1's TileJSON (a stale one, still pointing at v1/e2) passes, but zoom 0's folder does not.
+    for (const args of [['--yes'], []]) {
+      const refused = await run('--prefix', 'v1', ...args);
+      expect(refused).toMatchObject({ code: 1 });
+      expect(refused.stderr).toMatch(
+        /v1\/0\/ holds v1\/0\/style\/, not a tile column: deleting v1\/0\/ would delete it/,
+      );
+    }
+    expect(tiles.files.has('v1/0/style/light.json')).toBe(true);
+
+    // In a zoom above 7 too, which goes column by column and then as a folder: still before the first DELETE.
+    tiles.files.delete('v1/0/style/light.json');
+    tiles.seed('v1/8/notes.txt', new TextEncoder().encode('kept'));
+    const stray = await run('--prefix', 'v1', '--yes');
+    expect(stray).toMatchObject({ code: 1 });
+    expect(stray.stderr).toMatch(/v1\/8\/ holds v1\/8\/notes\.txt, not a tile column/);
+    expect(tiles.requests.DELETE ?? 0).toBe(0);
+    // Every tile of v1, its v1/0.json and the stray file.
+    expect(under(tiles, 'v1')).toHaveLength(zoomEnd(8) + 2);
+    expect(tiles.files.has('v1/8/notes.txt')).toBe(true);
   });
 
   it('stops before its next folder when the zone switches to the prefix while it deletes', async () => {
