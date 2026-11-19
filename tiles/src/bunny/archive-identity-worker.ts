@@ -4,13 +4,36 @@
  * preads on this thread, so threads read in parallel without queueing on libuv's small thread pool.
  */
 import { createHash } from 'node:crypto';
-import { closeSync, openSync, readSync } from 'node:fs';
+import { BigIntStats, closeSync, fstatSync, openSync, readSync } from 'node:fs';
 import { parentPort, workerData } from 'node:worker_threads';
+
+/**
+ * Which file an archive is and whether it changed: device, inode, size, and modification and change times. Not part
+ * of the identity (a copy of the archive has the same identity and another snapshot), so it is never recorded: within
+ * one run it ties every descriptor that reads the archive to the file its identity was computed from.
+ */
+export type FileSnapshot = string;
+
+export function fileSnapshot(stats: BigIntStats): FileSnapshot {
+  return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
+}
+
+/**
+ * Throws unless `fd` is open on the file `source` is a snapshot of, unchanged: the path may have been replaced (with a
+ * file of the same size, say) or written to since.
+ */
+export function checkOpened(path: string, fd: number, source: FileSnapshot): void {
+  if (fileSnapshot(fstatSync(fd, { bigint: true })) !== source) {
+    throw new Error(`${path} is no longer the file its identity was computed from: it was replaced or written to`);
+  }
+}
 
 export interface IdentityWorkerData {
   archiveIdentityWorker: true;
   path: string;
   size: number;
+  /** The file the identity is of: each thread checks that it opened it. */
+  source: FileSnapshot;
   blockBytes: number;
   blocks: number;
   /** [0]: the next block to take, [1]: blocks hashed. */
@@ -43,6 +66,7 @@ const data = workerData as IdentityWorkerData | undefined;
 if (parentPort && data?.archiveIdentityWorker) {
   const fd = openSync(data.path, 'r');
   try {
+    checkOpened(data.path, fd, data.source);
     const buffer = readBuffer(data.blockBytes);
     for (let block = Atomics.add(data.counters, 0, 1); block < data.blocks; block = Atomics.add(data.counters, 0, 1)) {
       const start = block * data.blockBytes;

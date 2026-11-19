@@ -1,5 +1,7 @@
-import { appendFile, FileHandle, open, readFile, utimes, writeFile } from 'node:fs/promises';
+import { ChildProcess, spawn } from 'node:child_process';
+import { appendFile, FileHandle, open, readdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import { createInterface } from 'node:readline';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ArchiveRanges } from '../../src/bunny/archive-walk';
 import { BunnyStorage } from '../../src/bunny/storage';
@@ -7,15 +9,17 @@ import { tilePath } from '../../src/bunny/tile-id';
 import {
   Checkpoint,
   chunkProbeIds,
-  LOCK_SETTLE_MS,
   planChunks,
   preflightIds,
   SeedParams,
   UploadItem,
   uploadTiles,
 } from '../../src/bunny/upload';
+import { buildArchive, FixtureEntry } from '../pmtiles-fixture';
 import { FakeStorage, FakeStorageOptions, Fault, sha256Hex } from './fake-storage';
 import { random, scratchDir, writeFixtureArchive } from './upload-fixture';
+
+const TILES_DIR = join(import.meta.dirname, '../..');
 
 const fast = { baseDelayMs: 1, maxDelayMs: 5, settleMs: 5, maxAttempts: 5, maxRateLimitWaitMs: 5_000 };
 let cleanup: (() => Promise<void>)[] = [];
@@ -112,9 +116,13 @@ describe('uploadTiles', () => {
   });
 
   it('verifies only the items that ask for it', async () => {
-    const { fake, storage } = await setup();
+    const described: string[] = [];
+    const { fake, storage } = await setup({
+      onRequest: ({ method, path }) => (method === 'DESCRIBE' ? described.push(path) : undefined),
+    });
     const all = items(4).map((item, i) => ({ ...item, verify: i % 2 === 0 }));
     await uploadTiles(storage, all);
+    expect(described.sort()).toEqual([tilePath('v1', 0), tilePath('v1', 2)].sort());
     expect(fake.requests).toEqual({ DESCRIBE: 2, PUT: 4 });
   });
 
@@ -311,54 +319,120 @@ describe('Checkpoint', () => {
     await reopened.close();
   });
 
-  it('refuses a state dir another live process holds, and takes over a stale lock', async () => {
-    const lockPath = join(dir, 'seed.lock');
-    await writeFile(lockPath, `${process.ppid} 0123abcd\n`);
-    await expect(Checkpoint.open(dir, params)).rejects.toThrow(/in use by process/);
-    await writeFile(lockPath, '2147483646 0123abcd\n');
+  /**
+   * A process that opens the checkpoint in `dir` when told `open` (answering `locked` or `refused: <why>`), starts
+   * chunk `n` when told `start <n>` (`started` or `stopped: <why>`) and closes it on `close`. It says `ready` once it
+   * has loaded, so several can be told `open` at the same moment.
+   */
+  function holder(dir: string) {
+    const code = `
+      import { createInterface } from 'node:readline';
+      import { Checkpoint } from './src/bunny/upload.ts';
+      const params = JSON.parse(process.env.SEED_PARAMS);
+      let checkpoint;
+      const say = (line) => process.stdout.write(line + '\\n');
+      say('ready');
+      for await (const line of createInterface({ input: process.stdin })) {
+        try {
+          if (line === 'open') {
+            checkpoint = await Checkpoint.open(process.env.SEED_DIR, params);
+            say('locked');
+          } else if (line.startsWith('start ')) {
+            await checkpoint.markStarted([Number(line.slice(6))]);
+            say('started');
+          } else if (line === 'close') {
+            await checkpoint.close();
+            say('closed');
+          }
+        } catch (error) {
+          say((line === 'open' ? 'refused: ' : 'stopped: ') + error.message);
+        }
+      }
+    `;
+    const child: ChildProcess = spawn(process.execPath, ['--import=tsx', '--input-type=module', '-e', code], {
+      cwd: TILES_DIR,
+      env: { ...process.env, SEED_DIR: dir, SEED_PARAMS: JSON.stringify(params) },
+      stdio: ['pipe', 'pipe', 'inherit'],
+    });
+    cleanup.push(async () => {
+      child.kill('SIGKILL');
+    });
+    const replies = createInterface({ input: child.stdout! })[Symbol.asyncIterator]();
+    const next = async () => {
+      const reply = await replies.next();
+      if (reply.done) {
+        throw new Error('the lock holder exited');
+      }
+      return reply.value as string;
+    };
+    const ready = next().then((line) => expect(line).toBe('ready'));
+    return {
+      ready,
+      /** Sends a command and resolves to the reply. */
+      ask: async (command: string) => {
+        await ready;
+        child.stdin!.write(command + '\n');
+        return next();
+      },
+      killed: () =>
+        new Promise<void>((resolve) => {
+          child.once('exit', () => resolve());
+          child.kill('SIGKILL');
+        }),
+    };
+  }
+
+  it('refuses a state dir another process holds, and takes it at once when that process is killed', async () => {
+    const other = holder(dir);
+    expect(await other.ask('open')).toBe('locked');
+    await expect(Checkpoint.open(dir, params)).rejects.toThrow(/is in use by another bunny:seed/);
+    // No stale lock to judge or take over: the kernel drops the lock with the process.
+    await other.killed();
     const checkpoint = await Checkpoint.open(dir, params);
-    expect(await readFile(lockPath, 'utf8')).toMatch(new RegExp(`^${process.pid} [0-9a-f]{16}\n$`));
-    // A second open in the same process is refused too.
-    await expect(Checkpoint.open(dir, params)).rejects.toThrow(/in use by process/);
+    // A second open in the same process is refused too, and does not loosen the first one's hold.
+    await expect(Checkpoint.open(dir, params)).rejects.toThrow(/is in use by another bunny:seed/);
+    const next = holder(dir);
+    expect(await next.ask('open')).toMatch(/^refused: .*is in use by another bunny:seed/);
     await checkpoint.close();
-    await expect(readFile(lockPath)).rejects.toThrow(/ENOENT/);
+    expect(await next.ask('open')).toBe('locked');
   });
 
-  it('takes an unreadable lock as held unless it is old', async () => {
-    // Locks are linked into place whole; an empty one is only taken over once it is clearly a leftover.
-    const lockPath = join(dir, 'seed.lock');
-    await writeFile(lockPath, '');
-    await expect(Checkpoint.open(dir, params)).rejects.toThrow(/seed\.lock is unreadable/);
-    const old = new Date(Date.now() - 10 * 60_000);
-    await utimes(lockPath, old, old);
-    await (await Checkpoint.open(dir, params)).close();
-  });
+  it("gives the state dir to exactly one of several processes that take a killed seed's lock at once", async () => {
+    const killed = holder(dir);
+    expect(await killed.ask('open')).toBe('locked');
+    expect(await killed.ask('start 1')).toBe('started');
+    await killed.killed();
 
-  it('gives up a stale lock it took over when another process took it over at the same moment', async () => {
-    const lockPath = join(dir, 'seed.lock');
-    await writeFile(lockPath, '2147483646 0123abcd\n');
-    const opening = Checkpoint.open(dir, params);
-    const outcome = opening.then(
-      () => 'opened',
-      (error: Error) => error.message,
-    );
-    // While it waits to confirm the takeover, a second process removes its lock and links its own.
-    await new Promise((resolve) => setTimeout(resolve, LOCK_SETTLE_MS / 2));
-    await writeFile(lockPath, `${process.ppid} 4567cdef\n`);
-    expect(await outcome).toMatch(new RegExp(`seed\\.lock now names process ${process.ppid}: another seed took`));
-    expect(await readFile(lockPath, 'utf8')).toBe(`${process.ppid} 4567cdef\n`);
-  });
+    const takers = Array.from({ length: 4 }, () => holder(dir));
+    await Promise.all(takers.map((taker) => taker.ready));
+    const replies = await Promise.all(takers.map((taker) => taker.ask('open')));
+    const winners = takers.filter((_, i) => replies[i] === 'locked');
+    expect(winners).toHaveLength(1);
+    expect(replies.filter((reply) => /^refused: .*is in use by another bunny:seed/.test(reply))).toHaveLength(3);
+    // The losers' attempts, before and after the winner's, took nothing from it: it still starts chunks.
+    const losers = takers.filter((taker) => taker !== winners[0]);
+    expect(await losers[0].ask('open')).toMatch(/^refused: /);
+    expect(await winners[0].ask('start 2')).toBe('started');
+    expect(await readFile(join(dir, 'checkpoint.log'), 'utf8')).toBe('start 1\nstart 2\n');
+    await winners[0].killed();
+    expect(await losers[1].ask('open')).toBe('locked');
+  }, 30_000);
 
-  it('starts no chunk once another process took the state dir over, and leaves its lock alone', async () => {
-    const checkpoint = await Checkpoint.open(dir, params);
-    await checkpoint.markStarted([1]);
-    const lockPath = join(dir, 'seed.lock');
-    await writeFile(lockPath, `${process.ppid} 4567cdef\n`);
-    await expect(checkpoint.markStarted([2])).rejects.toThrow(/another seed took this state dir over/);
-    expect([...checkpoint.started]).toEqual([1]);
-    await checkpoint.close();
-    expect(await readFile(join(dir, 'checkpoint.log'), 'utf8')).toBe('start 1\n');
-    expect(await readFile(lockPath, 'utf8')).toBe(`${process.ppid} 4567cdef\n`);
+  it('starts no chunk once its lock file was removed or replaced, as another process could lock the new one', async () => {
+    const swaps = {
+      removed: (path: string) => rm(path),
+      replaced: (path: string) => rm(path).then(() => writeFile(path, '')),
+    };
+    for (const [name, swap] of Object.entries(swaps)) {
+      const state = join(dir, name);
+      const checkpoint = await Checkpoint.open(state, params);
+      await checkpoint.markStarted([1]);
+      await swap(join(state, 'seed.lock.db'));
+      await expect(checkpoint.markStarted([2])).rejects.toThrow(/seed\.lock\.db (is gone|was replaced): another seed/);
+      expect([...checkpoint.started]).toEqual([1]);
+      await checkpoint.close();
+      expect(await readFile(join(state, 'checkpoint.log'), 'utf8')).toBe('start 1\n');
+    }
   });
 
   it('flush() rejects once a line failed to reach the disk', async () => {
@@ -373,7 +447,7 @@ describe('Checkpoint', () => {
     await checkpoint.close();
   });
 
-  it('refuses to resume a checkpoint that records only a v1 archive fingerprint', async () => {
+  it('refuses to resume a checkpoint that records only a v1 archive fingerprint, writing nothing in its dir', async () => {
     // As a bunny:seed before the v2 identity wrote it: the fingerprint covers the header, root directory and size only.
     const { archive, ...rest } = params;
     void archive;
@@ -382,10 +456,21 @@ describe('Checkpoint', () => {
       JSON.stringify({ ...rest, archive: { size: 1, fingerprint: 'ab'.repeat(32) } }, null, 2),
     );
     await writeFile(join(dir, 'checkpoint.log'), 'start 0\ndone 0\n');
+    // The older seed's own lock, as it leaves it while it runs.
+    await writeFile(join(dir, 'seed.lock'), `${process.ppid} 0123abcd\n`);
+    const listing = async () =>
+      Promise.all(
+        (await readdir(dir)).sort().map(async (name) => {
+          const { mtimeMs, ctimeMs, size } = await stat(join(dir, name));
+          return { name, mtimeMs, ctimeMs, size };
+        }),
+      );
+    const before = await listing();
+    const dirBefore = await stat(dir);
     await expect(Checkpoint.open(dir, params)).rejects.toThrow(/older bunny:seed, which recorded only a v1 archive/);
-    expect(JSON.parse(await readFile(join(dir, 'seed.json'), 'utf8'))).toMatchObject({
-      archive: { fingerprint: 'ab'.repeat(32) },
-    });
+    // sync --adopt checks such a dir as its seed left it (seed.json's times included): no lock file, no temp files.
+    expect(await listing()).toEqual(before);
+    expect((await stat(dir)).mtimeMs).toBe(dirBefore.mtimeMs);
   });
 
   it('refuses a state dir of another seed or a damaged log', async () => {
@@ -506,6 +591,7 @@ describe('planChunks', () => {
         expect(chunk.chunkId).toBe(lastChunk === -1 ? Math.floor(from / size) : lastChunk + 1);
         lastChunk = chunk.chunkId;
         expect(chunk.start).toBe(Math.max(from, chunk.chunkId * size));
+        expect(chunk.positions).toBe(chunk.end - chunk.start);
         for (let i = 0; i < chunk.runs.length; i += 4) {
           const [tileId, runLength, offset, length] = chunk.runs.subarray(i, i + 4);
           expect(tileId).toBeGreaterThanOrEqual(chunk.start);
@@ -519,6 +605,45 @@ describe('planChunks', () => {
       }
       expect(seen).toEqual(Array.from({ length: to - from }, (_, i) => from + i));
     }
+  });
+
+  it("counts the positions the archive has in each chunk, and knows the archive's first and last tile", async () => {
+    const scratch = await scratchDir();
+    cleanup.push(scratch.remove);
+    // Tiles at 5-7, 20 and 40-49 only, over two leaves.
+    const tile = { offset: 0, length: 4 };
+    const leaves: FixtureEntry[][] = [
+      [
+        { tileId: 5, runLength: 3, ...tile },
+        { tileId: 20, runLength: 1, ...tile },
+      ],
+      [{ tileId: 40, runLength: 10, ...tile }],
+    ];
+    const path = join(scratch.dir, 'sparse.pmtiles');
+    await writeFile(
+      path,
+      await buildArchive({
+        root: [
+          { tileId: 5, leaf: 0 },
+          { tileId: 40, leaf: 1 },
+        ],
+        leaves,
+        tileData: new Uint8Array(4),
+      }),
+    );
+    const ranges = await ArchiveRanges.open(path);
+    cleanup.push(() => ranges.close());
+    expect(await ranges.bounds()).toEqual({ first: 5, end: 50 });
+    const chunks: [number, number, number, number][] = [];
+    for await (const chunk of planChunks(ranges, 5, 50, 16)) {
+      chunks.push([chunk.chunkId, chunk.start, chunk.end, chunk.positions]);
+    }
+    expect(chunks).toEqual([
+      [0, 5, 16, 3],
+      [1, 16, 32, 1],
+      [2, 32, 48, 8],
+      [3, 48, 50, 2],
+    ]);
   });
 
   it('skips the chunks it is told to', async () => {

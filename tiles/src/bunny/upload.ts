@@ -2,17 +2,18 @@
  * Uploading tile positions: the uploader core (any source of tiles, one thread), the seed checkpoint, and the seed
  * engine that walks an archive's tile-id range in chunks and uploads them from worker threads.
  */
-import { randomBytes } from 'node:crypto';
-import { FileHandle, link, mkdir, open, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { BigIntStats } from 'node:fs';
+import { FileHandle, mkdir, open, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { join, resolve } from 'node:path';
+import type { DatabaseSync } from 'node:sqlite';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Worker } from 'node:worker_threads';
-import { ArchiveIdentity, archiveIdentity } from './archive-identity';
+import { ArchiveIdentity, FileSnapshot, IdentifiedArchive, identifyArchive } from './archive-identity';
 import { ArchiveRanges } from './archive-walk';
 import { forEachLimit } from './replication';
-import { claimRange, defaultClaimsDir, isAlive } from './seed-claims';
+import { claimRange, defaultClaimsDir } from './seed-claims';
 import {
   addCounters,
   BunnyStorage,
@@ -192,8 +193,10 @@ const CHECKPOINT_LINE = /^(start|done) (\d+)$/;
 /**
  * The seed's resume state in its state dir: seed.json (what is being seeded) and checkpoint.log, an append-only log
  * of `start <chunk>` (written and fsynced before the chunk's first PUT) and `done <chunk>` (after its last).
- * A chunk with a start but no done may hold some of its files, so a resume DESCRIBEs them before any PUT.
- * seed.lock names the process using the dir (see SeedLock): two seeds on one dir would PUT the same chunks twice.
+ * A chunk with a start but no done may hold some of its files, so a resume DESCRIBEs them before any PUT. A done
+ * chunk holds every tile the archive (seed.json's identity) has in it; ids it has no tile at hold nothing.
+ * seed.lock.db is locked while a process uses the dir (see SeedLock): two seeds on one dir would PUT the same chunks
+ * twice.
  */
 export class Checkpoint {
   private writes: Promise<void> = Promise.resolve();
@@ -214,12 +217,28 @@ export class Checkpoint {
 
   static async open(dir: string, params: SeedParams): Promise<Checkpoint> {
     await mkdir(dir, { recursive: true });
+    // Before anything is written in it: sync --adopt checks an older seed's state dir as that seed left it.
+    await Checkpoint.refuseLegacy(dir);
     const lock = await SeedLock.take(dir);
     try {
       return await Checkpoint.read(dir, params, lock);
     } catch (error) {
-      await lock.release();
+      lock.release();
       throw error;
+    }
+  }
+
+  /** Refuses the state dir of an older bunny:seed, which recorded only a v1 archive fingerprint. */
+  private static async refuseLegacy(dir: string): Promise<void> {
+    const existing = await readIfExists(join(dir, 'seed.json'));
+    const recorded = existing === undefined ? undefined : (JSON.parse(existing) as { archive?: unknown }).archive;
+    const archive = recorded as (Partial<ArchiveIdentity> & { fingerprint?: unknown }) | undefined;
+    if (archive?.identity === undefined && archive?.fingerprint !== undefined) {
+      // A v1 fingerprint covers the header, root directory and size only: it can't say the archive is the same.
+      throw new Error(
+        `${dir} holds the checkpoint of an older bunny:seed, which recorded only a v1 archive fingerprint: finish ` +
+          'that seed with the bunny:seed that started it, or use another --state-dir',
+      );
     }
   }
 
@@ -238,14 +257,7 @@ export class Checkpoint {
       await writeAtomic(paramsPath, JSON.stringify(params, null, 2) + '\n', true);
     } else {
       const previous = JSON.parse(existing) as SeedParams;
-      const recorded = previous.archive as Partial<ArchiveIdentity> & { fingerprint?: unknown };
-      if (recorded?.identity === undefined && recorded?.fingerprint !== undefined) {
-        // A v1 fingerprint covers the header, root directory and size only: it can't say the archive is the same.
-        throw new Error(
-          `${dir} holds the checkpoint of an older bunny:seed, which recorded only a v1 archive fingerprint: finish ` +
-            'that seed with the bunny:seed that started it, or use another --state-dir',
-        );
-      }
+      const recorded = previous.archive as Partial<ArchiveIdentity> | undefined;
       const mismatch = (['zone', 'host', 'prefix', 'from', 'to', 'chunkSize'] as const).filter(
         (key) => previous[key] !== params[key],
       );
@@ -279,8 +291,8 @@ export class Checkpoint {
   }
 
   /**
-   * Records that chunks are about to be uploaded; resolves once that is on disk. Fails, recording nothing, if another
-   * process took the state dir over: its chunks must not be started under it.
+   * Records that chunks are about to be uploaded; resolves once that is on disk. Fails, recording nothing, if the lock
+   * file was removed or replaced: another process could hold the state dir then, and its chunks must not be started.
    */
   async markStarted(chunkIds: number[]): Promise<void> {
     await this.lock.check();
@@ -302,9 +314,12 @@ export class Checkpoint {
   }
 
   async close(): Promise<void> {
-    await this.writes;
-    await this.handle.close();
-    await this.lock.release();
+    try {
+      await this.writes;
+      await this.handle.close();
+    } finally {
+      this.lock.release();
+    }
   }
 
   private append(text: string): Promise<void> {
@@ -336,98 +351,85 @@ export class Checkpoint {
 
 let temporaryFiles = 0;
 
-/** How long a takeover of a stale lock waits before checking that it still holds it. */
-export const LOCK_SETTLE_MS = 1_000;
-/** An unreadable lock younger than this is taken as held. */
-const LOCK_UNREADABLE_STALE_MS = 60_000;
-/** Locks this process holds, so a second open in the same process is refused, not taken as a stale lock. */
-const heldLocks = new Set<string>();
+/** Not seed.lock, the text file an older bunny:seed held a state dir with. */
+const LOCK_FILE = 'seed.lock.db';
+/** SQLITE_BUSY: another connection holds the lock. */
+const SQLITE_BUSY = 5;
 
 /**
- * seed.lock: `<pid> <token>` of the process using a state dir. It is written to a temporary file and linked into
- * place, so it is never seen empty or half written. A lock whose process is gone (a killed run) is taken over; two
- * processes taking over one stale lock at once could both succeed (each removes the lock and links its own), so a
- * takeover waits LOCK_SETTLE_MS and checks that the lock still names it, and the holder checks it again before each
- * chunk it starts (Checkpoint.markStarted). Release removes the lock only while it still names this holder.
+ * seed.lock.db, an empty SQLite database, held in an exclusive transaction while a seed uses the state dir. SQLite
+ * takes it with POSIX advisory locks (fcntl) on its open descriptor, which the kernel drops when the process ends,
+ * however it ends, and grants to one process at a time: a killed run leaves nothing to take over, and no stale lock
+ * can be judged or removed by two processes at once. (Node has no file-lock call of its own.) A second open in the
+ * same process is refused too. Nothing else opens this file: closing any descriptor of a file drops the process's
+ * fcntl locks on it. If the file is removed or replaced while held, another process could lock the new one, so
+ * check() compares it with the file locked.
  */
 class SeedLock {
   private constructor(
     private path: string,
-    private token: string,
+    private db: DatabaseSync,
+    private file: string,
   ) {}
 
   static async take(dir: string): Promise<SeedLock> {
-    const path = join(dir, 'seed.lock');
-    const token = `${process.pid} ${randomBytes(8).toString('hex')}`;
-    const temporary = `${path}.${process.pid}.${++temporaryFiles}.tmp`;
-    await writeFile(temporary, token + '\n');
-    try {
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          await link(temporary, path);
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
-            throw error;
-          }
-          await SeedLock.removeIfStale(dir, path);
-          continue;
+    const { DatabaseSync } = await import('node:sqlite');
+    const path = join(dir, LOCK_FILE);
+    // The file is bound to the lock by its stat before and after: unchanged, the descriptor locked is that file.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const before = await statIfExists(path);
+      const db = new DatabaseSync(path, { timeout: 0 });
+      let after: BigIntStats | undefined;
+      try {
+        db.exec('BEGIN EXCLUSIVE');
+        after = await statIfExists(path);
+      } catch (error) {
+        db.close();
+        if ((error as { errcode?: number }).errcode === SQLITE_BUSY) {
+          throw new Error(
+            `${dir} is in use by another bunny:seed (it holds ${path}; fuser names it): stop it first or use ` +
+              'another --state-dir',
+            { cause: error },
+          );
         }
-        const lock = new SeedLock(path, token);
-        heldLocks.add(token);
-        if (attempt > 0) {
-          // Another process may have taken over the same stale lock at the same moment; the last to link wins.
-          await sleep(LOCK_SETTLE_MS);
-          await lock.check().catch(async (error: Error) => {
-            heldLocks.delete(token);
-            throw error;
-          });
-        }
-        return lock;
+        throw new Error(`Could not lock ${path}: ${(error as Error).message}`, { cause: error });
       }
-      throw new Error(`Could not take the lock in ${dir}`);
-    } finally {
-      await rm(temporary, { force: true });
+      if (before && after && fileKey(before) === fileKey(after)) {
+        return new SeedLock(path, db, fileKey(after));
+      }
+      // Created just now (or replaced meanwhile): lock it again, now that it exists.
+      db.close();
     }
+    throw new Error(`Could not lock ${path}: it kept being replaced`);
   }
 
-  /** Removes the lock at `path` if its process is gone; throws if it is held. */
-  private static async removeIfStale(dir: string, path: string): Promise<void> {
-    const text = await readIfExists(path);
-    if (text === undefined) {
-      return;
-    }
-    const pid = Number(text.trim().split(/\s+/)[0]);
-    const inUse = () => new Error(`${dir} is in use by process ${pid}; stop it first or use another --state-dir`);
-    if (!Number.isSafeInteger(pid) || pid <= 0) {
-      const age = Date.now() - (await stat(path).catch(() => ({ mtimeMs: 0 }))).mtimeMs;
-      if (age < LOCK_UNREADABLE_STALE_MS) {
-        throw new Error(`${dir} is locked (${path} is unreadable); stop the seed using it or use another --state-dir`);
-      }
-    } else if (pid === process.pid ? heldLocks.has(text.trim()) : isAlive(pid)) {
-      throw inUse();
-    }
-    // Only if it is still the lock just judged stale: another process may have taken it over meanwhile.
-    if ((await readIfExists(path)) === text) {
-      await rm(path, { force: true });
-    }
-  }
-
-  /** Throws if the lock no longer names this holder (another process took the state dir over). */
+  /** Throws if the lock file is no longer the one locked (removed or replaced: another seed could hold the dir). */
   async check(): Promise<void> {
-    const text = (await readIfExists(this.path))?.trim();
-    if (text !== this.token) {
+    const now = await statIfExists(this.path);
+    if (!now || fileKey(now) !== this.file) {
       throw new Error(
-        `${this.path} now ${text ? `names process ${text.split(/\s+/)[0]}` : 'is gone'}: another seed took this ` +
-          'state dir over',
+        `${this.path} ${now ? 'was replaced' : 'is gone'}: another seed may have taken this state dir over`,
       );
     }
   }
 
-  async release(): Promise<void> {
-    heldLocks.delete(this.token);
-    if ((await readIfExists(this.path))?.trim() === this.token) {
-      await rm(this.path, { force: true });
+  release(): void {
+    if (this.db.isOpen) {
+      this.db.close();
     }
+  }
+}
+
+const fileKey = (stats: BigIntStats) => `${stats.dev}:${stats.ino}`;
+
+async function statIfExists(path: string): Promise<BigIntStats | undefined> {
+  try {
+    return await stat(path, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      return undefined;
+    }
+    throw error;
   }
 }
 
@@ -465,6 +467,8 @@ export interface ChunkDescriptor {
   verify: boolean;
   /** Per run: tileId, runLength, offset, length. */
   runs: Float64Array;
+  /** The positions the runs hold: those of [start, end) the archive has a tile at. */
+  positions: number;
 }
 
 /** Chunks of the global grid `chunkId * chunkSize` that overlap [from, to), skipping those `skip` names. */
@@ -482,11 +486,13 @@ export async function* planChunks(
     const end = Math.min(to, (chunkId + 1) * chunkSize);
     const skipped = skip(chunkId);
     const parts: number[] = [];
+    let positions = 0;
     while (current && current.tileId < end) {
       const first = Math.max(current.tileId, start);
       const last = Math.min(current.tileId + current.runLength, end);
       if (!skipped && last > first) {
         parts.push(first, last - first, current.offset, current.length);
+        positions += last - first;
       }
       if (current.tileId + current.runLength > end) {
         break;
@@ -494,7 +500,7 @@ export async function* planChunks(
       current = (await runs.next()).value;
     }
     if (!skipped) {
-      yield { chunkId, start, end, runs: Float64Array.from(parts) };
+      yield { chunkId, start, end, runs: Float64Array.from(parts), positions };
     }
   }
 }
@@ -524,8 +530,11 @@ export interface SeedOptions {
   addressRefreshMs?: number;
   /** Looks up the storage host's addresses (default: resolveStorageAddresses). */
   resolveAddresses?: (host?: string) => Promise<string[]>;
-  /** The archive's v2 identity if the caller has just computed it (default: computed here). */
-  archiveIdentity?: ArchiveIdentity;
+  /**
+   * The archive's v2 identity and the file it was computed from, if the caller has just computed it (default:
+   * computed here). The seed reads only that file, unchanged, or stops.
+   */
+  archiveIdentity?: IdentifiedArchive;
 }
 
 export type SeedState = 'running' | 'stopping' | 'complete' | 'failed' | 'interrupted';
@@ -578,6 +587,8 @@ export interface SeedResult {
 
 export interface WorkerConfig {
   archivePath: string;
+  /** The file the archive's identity is of: the worker reads it only while it is that file, unchanged. */
+  archiveSource: FileSnapshot;
   tileDataOffset: number;
   prefix: string;
   concurrency: number;
@@ -591,7 +602,8 @@ export type WorkerMessage =
   | { type: 'chunk-emitted'; chunkId: number }
   /** Sampled positions of a chunk that was not started were stored already (`reason`), so it runs verified. */
   | { type: 'chunk-overlap'; chunkId: number; reason: string }
-  | { type: 'chunk-done'; chunkId: number; failures: UploadFailure[] }
+  /** Every position of the chunk settled; `stored` of them are stored (uploaded or found stored), the rest failed. */
+  | { type: 'chunk-done'; chunkId: number; stored: number; failures: UploadFailure[] }
   /** The worker stopped before the chunk was done; `failures` are the files of it that failed before then. */
   | { type: 'chunk-stopped'; chunkId: number; failures: UploadFailure[] }
   | { type: 'fatal'; error: string }
@@ -645,15 +657,27 @@ export async function runSeed(options: SeedOptions): Promise<SeedResult> {
   if (!(from >= 0 && to > from && chunkSize > 0)) {
     throw new Error(`Bad seed range [${from}, ${to}) / chunk size ${chunkSize}`);
   }
-  const ranges = await ArchiveRanges.open(options.archivePath);
+  const ranges = await ArchiveRanges.open(options.archivePath, options.archiveIdentity?.source);
   let checkpoint: Checkpoint | undefined;
   let unclaim: (() => Promise<void>) | undefined;
   try {
     const host = storageOrigin(options.storage.host);
-    const archive = options.archiveIdentity ?? (await archiveIdentity(options.archivePath));
-    if (archive.size !== ranges.size) {
-      throw new Error(`${options.archivePath} is ${ranges.size} bytes, not the ${archive.size} its identity is of`);
+    // Chunks before the archive's first tile or past its last would be checkpointed done with nothing in them: such a
+    // range is a mistake (bunny:seed cuts a zoom range to the tiles).
+    const bounds = await ranges.bounds();
+    if (!bounds || from < bounds.first || to > bounds.end) {
+      throw new Error(
+        `[${from}, ${to}) reaches past the tiles of ${options.archivePath}` +
+          (bounds ? `, which has tiles in [${bounds.first}, ${bounds.end}) only` : ', which has none'),
+      );
     }
+    // Bound to the file opened here, which the workers check they read too: a file put at the path since can't be
+    // uploaded under this identity.
+    const identified = options.archiveIdentity ?? (await identifyArchive(options.archivePath));
+    if (identified.source !== ranges.source) {
+      throw new Error(`${options.archivePath} was replaced or written to while its identity was computed`);
+    }
+    const archive = identified.identity;
     checkpoint = await Checkpoint.open(stateDir, {
       zone: options.storage.zone,
       host,
@@ -831,6 +855,8 @@ class SeedRun {
   private failuresWritten: Promise<unknown> = Promise.resolve();
   /** `done` lines handed to the checkpoint and not yet on disk (a failure is recorded in `error`). */
   private doneWrites = new Set<Promise<void>>();
+  /** status.json writes, in order: a progress write still going must not land after the final status. */
+  private statusWrites: Promise<void> = Promise.resolve();
   private failedChunks = 0;
   private doneThisRun = 0;
   private previouslyDone = 0;
@@ -842,7 +868,8 @@ class SeedRun {
   private error: string | null = null;
   private startedAt = new Date();
   private samples: [number, number][] = [];
-  private chunkStarts = new Map<number, number>();
+  /** Chunks handed out and not yet reported on: their first id and the positions the archive has in them. */
+  private active = new Map<number, { start: number; positions: number }>();
   private wakeFeeder?: () => void;
   private failuresFile: string;
   private totalFailed = 0;
@@ -936,6 +963,8 @@ class SeedRun {
       clearInterval(sampleTimer);
       clearInterval(lookupTimer);
       options.signal?.removeEventListener('abort', onAbort);
+      // Progress writes still going land first, so the final status below is the one left on disk.
+      await this.statusWrites;
       await this.failuresWritten;
       // A done line that did not reach the disk is a failed run, even if every file is stored.
       await Promise.all(this.doneWrites);
@@ -953,6 +982,7 @@ class SeedRun {
   private spawn(path: string, execArgv: string[], concurrency: number, connectionsPerAddress: number): WorkerSlot {
     const config: WorkerConfig = {
       archivePath: this.options.archivePath,
+      archiveSource: this.ranges.source,
       tileDataOffset: this.ranges.tileDataOffset,
       prefix: this.options.prefix,
       concurrency,
@@ -1009,11 +1039,18 @@ class SeedRun {
           );
         }
         return;
-      case 'chunk-done':
+      case 'chunk-done': {
         slot.outstanding.delete(message.chunkId);
         slot.emitting.delete(message.chunkId);
-        this.chunkStarts.delete(message.chunkId);
-        if (message.failures.length === 0) {
+        const handedOut = this.active.get(message.chunkId);
+        this.active.delete(message.chunkId);
+        if (message.failures.length === 0 && message.stored !== handedOut?.positions) {
+          // Done only with every position of the archive in it stored; else it stays started and a resume verifies it.
+          this.error ??=
+            `chunk ${message.chunkId} was reported done with ${message.stored} positions stored, not the ` +
+            `${handedOut?.positions ?? 'none'} it was handed out with`;
+          this.stop('failed');
+        } else if (message.failures.length === 0) {
           this.doneThisRun++;
           const written = this.checkpoint
             .markDone(message.chunkId)
@@ -1029,10 +1066,11 @@ class SeedRun {
         }
         this.wakeFeeder?.();
         return;
+      }
       case 'chunk-stopped':
         slot.outstanding.delete(message.chunkId);
         slot.emitting.delete(message.chunkId);
-        this.chunkStarts.delete(message.chunkId);
+        this.active.delete(message.chunkId);
         if (message.failures.length > 0) {
           // The chunk stays started, so a rerun repairs these too; they are still listed with the rest.
           this.failedChunks++;
@@ -1144,7 +1182,7 @@ class SeedRun {
       await this.checkpoint.markStarted([chunk.chunkId]);
       slot.outstanding.add(chunk.chunkId);
       slot.emitting.add(chunk.chunkId);
-      this.chunkStarts.set(chunk.chunkId, chunk.start);
+      this.active.set(chunk.chunkId, { start: chunk.start, positions: chunk.positions });
       slot.worker.postMessage({ type: 'chunk', chunk } satisfies MainMessage, [chunk.runs.buffer as ArrayBuffer]);
     }
     await chunks.return(undefined);
@@ -1208,7 +1246,7 @@ class SeedRun {
     const overall = elapsed > 0 ? done / elapsed : 0;
     const total = options.to - options.from;
     const left = total - this.previouslyDoneFiles - done;
-    const current = this.chunkStarts.size > 0 ? Math.min(...this.chunkStarts.values()) : null;
+    const current = this.active.size > 0 ? Math.min(...[...this.active.values()].map((chunk) => chunk.start)) : null;
     const memory = process.memoryUsage();
     const status: SeedStatus = {
       state: state === 'running' && this.stopping ? 'stopping' : state,
@@ -1224,7 +1262,7 @@ class SeedRun {
         total: this.totalChunks,
         done: this.previouslyDone + this.doneThisRun,
         previouslyDone: this.previouslyDone,
-        active: this.chunkStarts.size,
+        active: this.active.size,
         failed: this.failedChunks,
         overlapping: this.overlapping,
       },
@@ -1256,8 +1294,11 @@ class SeedRun {
       this.log(formatProgress(status));
     }
     const path = join(options.stateDir, 'status.json');
+    const text = JSON.stringify(status, null, 2) + '\n';
+    const write = this.statusWrites.then(() => writeAtomic(path, text));
+    this.statusWrites = write.catch(() => {});
     try {
-      await writeAtomic(path, JSON.stringify(status, null, 2) + '\n');
+      await write;
     } catch (error) {
       // A resume waits for the settleBy written here: without it, it could DESCRIBE files that PUTs of this run still
       // land on, and PUT them again. So no PUT goes out after a status that could not be written.
