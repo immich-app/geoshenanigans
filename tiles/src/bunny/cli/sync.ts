@@ -16,7 +16,8 @@
  * Every run that writes first hashes the whole archive (its identity, archive-identity.ts), which state.json records
  * and --adopt compares with each seed's. A seed state dir an older bunny:seed left records only a v1 fingerprint
  * (header, root directory and size): --adopt takes it only with --archive-md5, the build's md5sum from builds.json
- * (base64), which it checks against the MD5 of the whole archive.
+ * (base64), which it checks against the MD5 of the whole archive, and with --archive the very file the seed read (the
+ * path in its status.json), unchanged since the seed began.
  * A run for the live build while state.json lists pending builds puts the live bytes back where they wrote (a revert
  * of a failed or cancelled sync). --dry-run builds the manifest and plans, then stops: it needs only the state zone.
  * Every changed position is

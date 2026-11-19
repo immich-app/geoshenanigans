@@ -21,7 +21,8 @@
  * Other modes: --adopt records a build a seed (bunny:seed) already uploaded, given the seed's state dirs (which must
  * say it completed, for this archive, zone and prefix, over every position) and a sample of positions, instead of
  * writing tiles (a state dir an older bunny:seed left, with only a v1 archive fingerprint, counts only with the
- * archive's MD5, checked over the whole file: see archiveProblem); with --replace it switches a live zone to a build
+ * archive's MD5, checked over the whole file, and for the very file that seed read, unchanged since it began: see
+ * archiveProblem and legacySourceProblem); with --replace it switches a live zone to a build
  * seeded under another tile prefix (a full rewrite, plan section 6), the sample then also checked in every region.
  * --force-full writes every position of the build, each DESCRIBEd first, so it suits a repair or a small zoom range
  * (a planet first load is a seed and then --adopt).
@@ -32,8 +33,8 @@
  *
  * Every run ends with a SyncReport, whatever stopped it; onReport sees it after every step.
  */
-import { readFile, rm } from 'node:fs/promises';
-import { join } from 'node:path';
+import { lstat, readFile, rm, stat } from 'node:fs/promises';
+import { isAbsolute, join } from 'node:path';
 import { ArchiveIdentity, archiveIdentity, fileMd5Base64 } from './archive-identity';
 import { ArchiveRanges, TileRun } from './archive-walk';
 import { diffManifests, DiffTotals, planSync, SyncRange } from './diff';
@@ -145,7 +146,8 @@ export interface SyncOptions {
   seedStates?: string[];
   /**
    * With adopt: the archive's MD5 (base64, as builds.json gives it), checked over the whole file. Needed for a seed
-   * state dir an older bunny:seed left, which records only a v1 fingerprint (header, root directory and size).
+   * state dir an older bunny:seed left, which records only a v1 fingerprint (header, root directory and size); the
+   * archive must then also be the file that seed read, unchanged since it began (see legacySourceProblem).
    */
   archiveMd5?: string;
   /** Random positions --adopt checks (default 10,000). */
@@ -891,7 +893,7 @@ class SyncRun {
         status.state !== 'complete' && `its last run ended ${status.state}${status.error ? ` (${status.error})` : ''}`,
         params.zone !== zone && `it seeded zone ${params.zone}, not ${zone}`,
         params.prefix !== prefix && `it seeded ${params.prefix}/, not ${prefix}/`,
-        this.archiveProblem(params),
+        this.archiveProblem(params) || (await this.legacySourceProblem(dir, params, status)),
         (status.range?.from !== params.from || status.range?.to !== params.to) && 'its status.json is of another range',
       ].filter(Boolean);
       if (problems.length > 0) {
@@ -962,6 +964,57 @@ class SyncRun {
       'it records only a v1 archive fingerprint (header, root directory and size), which other tile bytes can share: ' +
         "adopt it with --archive-md5 <the build's md5sum from builds.json>, checked over the whole archive"
     );
+  }
+
+  /**
+   * Why the archive a v1 seed state's seed read may not be this one, or false (and false for a v2 identity, which
+   * covers the whole file). The MD5 vouches for the archive given here only: a seed that read a damaged copy with the
+   * same header, root directory and size (a download still in progress, say), later replaced by the real build at
+   * that path, would pass the fingerprint and the MD5. So the file status.json names (the path the seed's last run
+   * read) must be this archive (same device and inode), and neither it nor a symlink at that path may have changed
+   * (ctime: any write, replacement or metadata change moves it) since the seed began: since seed.json was written,
+   * at its first start, and since its last run started. A seed resumed from another copy under another path can't be
+   * told from its state.
+   */
+  private async legacySourceProblem(dir: string, params: SeedParams, status: SeedStatus): Promise<string | false> {
+    if (typeof (params.archive as Partial<ArchiveIdentity> | undefined)?.identity === 'string') {
+      return false;
+    }
+    const { o } = this;
+    const seeded = (status as Partial<SeedStatus>).archive;
+    if (typeof seeded !== 'string' || !isAbsolute(seeded)) {
+      return (
+        `its status.json names the archive the seed read as ${JSON.stringify(seeded)}, not an absolute path, so ` +
+        `nothing ties ${o.archive} to the bytes it uploaded`
+      );
+    }
+    const files = await Promise.all([
+      stat(o.archive, { bigint: true }),
+      stat(seeded, { bigint: true }),
+      lstat(seeded, { bigint: true }),
+      stat(join(dir, 'seed.json'), { bigint: true }),
+    ]).catch((error: unknown) => (error instanceof Error ? error.message : String(error)));
+    if (typeof files === 'string') {
+      return `the archive it read, ${seeded}, can't be checked (${files})`;
+    }
+    const [given, read, link, seedJson] = files;
+    if (given.dev !== read.dev || given.ino !== read.ino) {
+      return `it read ${seeded}, not ${o.archive}`;
+    }
+    const started = Date.parse(String((status as Partial<SeedStatus>).startedAt));
+    const began = Number.isFinite(started)
+      ? [seedJson.mtimeNs, BigInt(started) * 1_000_000n].reduce((a, b) => (b < a ? b : a))
+      : seedJson.mtimeNs;
+    const changed = read.ctimeNs > link.ctimeNs ? read.ctimeNs : link.ctimeNs;
+    if (changed > began) {
+      const at = (ns: bigint) => new Date(Number(ns / 1_000_000n)).toISOString();
+      return (
+        `the archive at ${seeded} changed (${at(changed)}) after the seed began (${at(began)}), so it need not hold ` +
+        'the bytes the seed read: run bunny:seed again with this archive, a new --state-dir and --verify-existing ' +
+        '(it writes only the files that differ) and adopt that state dir'
+      );
+    }
+    return false;
   }
 
   /**

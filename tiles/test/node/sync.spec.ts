@@ -1,8 +1,9 @@
 import { ChildProcess, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { createServer, Server } from 'node:http';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { afterEach, describe, expect, it } from 'vitest';
 import { archiveIdentity } from '../../src/bunny/archive-identity';
 import { ArchiveRanges } from '../../src/bunny/archive-walk';
@@ -167,7 +168,9 @@ let seedStateDirs = 0;
 
 /**
  * The state dir a seed leaves (seed.json and status.json), over [from, to) of an archive. `legacy`: as a bunny:seed
- * before the v2 identity left it, with only the v1 fingerprint (header, root directory and size).
+ * before the v2 identity left it, with only the v1 fingerprint (header, root directory and size). status.json names
+ * the archive's path (`statusArchive` instead, if given) and its last run's start, just after seed.json was written
+ * (`startedAt` instead, if given).
  */
 async function seedState(options: {
   dir: string;
@@ -178,6 +181,8 @@ async function seedState(options: {
   to?: number;
   state?: string;
   legacy?: boolean;
+  statusArchive?: string | null;
+  startedAt?: string;
 }): Promise<string> {
   const ranges = await ArchiveRanges.open(options.archive);
   await ranges.close();
@@ -195,7 +200,15 @@ async function seedState(options: {
       : await archiveIdentity(options.archive),
   };
   await writeFile(join(dir, 'seed.json'), JSON.stringify(params));
-  await writeFile(join(dir, 'status.json'), JSON.stringify({ state: options.state ?? 'complete', range, error: null }));
+  const startedAt = options.startedAt ?? new Date(Math.ceil((await stat(join(dir, 'seed.json'))).mtimeMs) + 1);
+  const status = {
+    state: options.state ?? 'complete',
+    startedAt,
+    archive: options.statusArchive === undefined ? options.archive : options.statusArchive,
+    range,
+    error: null,
+  };
+  await writeFile(join(dir, 'status.json'), JSON.stringify(status));
   return dir;
 }
 
@@ -359,6 +372,77 @@ describe('runSync', () => {
     expect(report).toMatchObject({ status: 'success', mode: 'adopt' });
     expect((await readState(w.state))?.archive).toEqual(await archiveIdentity(archive));
     expect(w.purges).toBe(1);
+  });
+
+  it("refuses a v1 seed state whose archive changed after the seed began, though it now has the build's MD5", async () => {
+    const w = await world();
+    seedZone(w, '20261117');
+    const real = w.archives['20261117'].path;
+    const md5 = createHash('md5')
+      .update(await readFile(real))
+      .digest('base64');
+    for (const [name, replace] of [
+      ['rewritten', (path: string) => copyFile(real, path)],
+      [
+        'replaced',
+        async (path: string) => {
+          await copyFile(real, `${path}.new`);
+          await rename(`${path}.new`, path);
+        },
+      ],
+    ] as const) {
+      // The seed read a damaged copy (the build's header, root directory and size, other tile bytes), which the
+      // build itself took the place of once the seed had begun.
+      const path = join(w.dir, `${name}.pmtiles`);
+      await withOtherTileBytes(real, path);
+      const legacy = await seedState({ dir: w.dir, zone: w.tiles.zone, archive: path, legacy: true });
+      await sleep(50);
+      await replace(path);
+      const report = await runSync(
+        w.options('20261117', { archive: path, adopt: true, seedStates: [legacy], archiveMd5: md5 }),
+        w.deps(),
+      );
+      expect(report.status, name).toBe('failed');
+      expect(report.error, name).toMatch(new RegExp(`${name}\\.pmtiles changed \\(.*\\) after the seed began`));
+    }
+    expect(await readState(w.state)).toBeNull();
+    expect(w.purges).toBe(0);
+  });
+
+  it('refuses a v1 seed state whose seed read another file than the archive given, or names none it can check', async () => {
+    const w = await world();
+    seedZone(w, '20261117');
+    const real = w.archives['20261117'].path;
+    const md5 = createHash('md5')
+      .update(await readFile(real))
+      .digest('base64');
+    const copy = join(w.dir, 'copy.pmtiles');
+    await copyFile(real, copy);
+    const cases: Array<[Parameters<typeof seedState>[0], RegExp]> = [
+      // Even a copy with the same bytes: nothing says which file the seed read.
+      [{ dir: w.dir, zone: w.tiles.zone, archive: copy }, /it read .*copy\.pmtiles, not .*20261117\.pmtiles/],
+      [{ dir: w.dir, zone: w.tiles.zone, archive: real, statusArchive: '20261117.pmtiles' }, /not an absolute path/],
+      [{ dir: w.dir, zone: w.tiles.zone, archive: real, statusArchive: null }, /archive the seed read as null/],
+      [{ dir: w.dir, zone: w.tiles.zone, archive: join(w.dir, 'gone.pmtiles') }, /can't be checked \(ENOENT/],
+      // seed.json may be newer than the seed (a copied state dir): its last run's start bounds it too.
+      [
+        { dir: w.dir, zone: w.tiles.zone, archive: real, startedAt: new Date(Date.now() - 3_600_000).toISOString() },
+        /changed \(.*\) after the seed began/,
+      ],
+    ];
+    for (const [options, error] of cases) {
+      // seed.json holds the real archive's v1 fingerprint; status.json names the path under test.
+      const statusArchive = options.statusArchive === undefined ? options.archive : options.statusArchive;
+      const legacy = await seedState({ ...options, archive: real, statusArchive, legacy: true });
+      const report = await runSync(
+        w.options('20261117', { adopt: true, seedStates: [legacy], archiveMd5: md5 }),
+        w.deps(),
+      );
+      expect(report.status, String(error)).toBe('failed');
+      expect(report.error).toMatch(error);
+    }
+    expect(await readState(w.state)).toBeNull();
+    expect(w.purges).toBe(0);
   });
 
   it('refuses to adopt a build the zone does not hold', async () => {
