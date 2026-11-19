@@ -75,6 +75,7 @@ import time
 import typing
 import urllib.error
 import urllib.request
+import zlib
 
 SYNC_APP = "tiles-sync"
 WATCHDOG_APP = "tiles-sync-watchdog"
@@ -261,7 +262,12 @@ def build_info(read):
         raise ValueError(f"unexpected metadata length {length}")
     data = read(offset, length)
     if compression == COMPRESSION_GZIP:
-        data = gzip.decompress(data)
+        # A cut-short or corrupt member is a bad read like any other (a ValueError, which with_retries retries),
+        # not a crash: gzip raises EOFError, zlib.error or BadGzipFile (an OSError) for it.
+        try:
+            data = gzip.decompress(data)
+        except (EOFError, OSError, zlib.error) as e:
+            raise ValueError(f"metadata at {offset} ({length} bytes) is not a whole gzip member: {e}") from e
     elif compression != COMPRESSION_NONE:
         raise ValueError(f"unsupported internal compression {compression}")
     metadata = json.loads(data)

@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Tests for the tiles sync workflows' own logic. Run: python3 -m unittest discover -s deployment/scripts -p 'test_*.py'
+"""Tests for the tiles sync and Bunny infra workflows' own logic. Run: python3 -m unittest discover -s deployment/scripts
+-p 'test_*.py'
 
-Needs PyYAML (python3-yaml, on GitHub's Ubuntu runners), bash and jq.
+Needs PyYAML (python3-yaml, on GitHub's Ubuntu runners), bash, git and jq.
 """
+import json
 import os
 import subprocess
 import tempfile
@@ -93,6 +95,197 @@ class ProductionCredentialsTest(unittest.TestCase):
         self.assertTrue(requires_main("always() && github.ref == 'refs/heads/main' && !inputs.dry_run"))
         self.assertTrue(requires_main(
             "${{ github.ref == 'refs/heads/main' && (github.event.schedule == '53 4 * * *' || inputs.x == 'a||b') }}"))
+
+
+BUNNY_INFRA = "tiles-bunny-infra.yml"
+PLAN_ENVIRONMENT = "tiles-bunny-plan"
+
+
+def install(bin_dir, tools):
+    """Writes each {name: script} into bin_dir, executable."""
+    os.makedirs(bin_dir, exist_ok=True)
+    for tool, text in tools.items():
+        path = os.path.join(bin_dir, tool)
+        with open(path, "w") as f:
+            f.write(text)
+        os.chmod(path, 0o755)
+
+
+def run_bash(script_text, cwd, env):
+    """A step's script as GitHub's bash shell runs it: bash --noprofile --norc -eo pipefail {0}."""
+    script = os.path.join(cwd, ".step.sh")
+    with open(script, "w") as f:
+        f.write(script_text)
+    try:
+        return subprocess.run(["bash", "--noprofile", "--norc", "-eo", "pipefail", script], check=False, env=env,
+                              cwd=cwd, capture_output=True, text=True)
+    finally:
+        os.remove(script)
+
+
+def step(job, name):
+    return next(s for s in job["steps"] if s.get("name") == name)
+
+
+class BunnyInfraCredentialsTest(unittest.TestCase):
+    """tiles-bunny-infra.yml: branch runs check without credentials; their plan runs only once a reviewer approves it."""
+
+    def setUp(self):
+        self.workflow = load(BUNNY_INFRA)
+        self.jobs = self.workflow["jobs"]
+
+    def test_only_the_plan_and_main_apply_read_production_credentials(self):
+        credentialed = {job for job, body in self.jobs.items() if PROD_TOKEN in yaml.safe_dump(body)}
+        self.assertEqual(credentialed, {"plan", "apply"})
+        self.assertNotIn("secrets.OP_", yaml.safe_dump(self.jobs["check"]))
+        self.assertTrue(requires_main(self.jobs["apply"]["if"]))
+        # pull_request runs a fork's code without the repository's secrets; pull_request_target would give them.
+        self.assertEqual(set(self.workflow[True]), {"workflow_dispatch", "pull_request", "push"})
+
+    def test_the_branch_plan_waits_for_approval_and_checks_it_is_required_before_any_secret(self):
+        plan = self.jobs["plan"]
+        self.assertFalse(requires_main(plan["if"]))
+        self.assertEqual(plan["environment"], PLAN_ENVIRONMENT)
+        self.assertNotIn("secrets.", yaml.safe_dump({k: v for k, v in plan.items() if k != "steps"}))
+        guard = plan["steps"][0]
+        self.assertEqual(guard["name"], "Check the environment requires approval")
+        self.assertEqual(guard["env"]["PLAN_ENVIRONMENT"], PLAN_ENVIRONMENT)
+        self.assertNotIn("secrets.", yaml.safe_dump(guard))
+        self.assertEqual(plan["permissions"], {"actions": "read", "contents": "read"})
+
+
+FAKE_GH = """#!/bin/sh
+# gh api PATH: writes its arguments to $FAKE_GH_ARGS, prints $FAKE_ENVIRONMENT and exits $FAKE_GH_EXIT.
+printf '%s\\n' "$*" > "$FAKE_GH_ARGS"
+printf '%s' "$FAKE_ENVIRONMENT"
+exit "${FAKE_GH_EXIT:-0}"
+"""
+
+REVIEWERS = {"type": "required_reviewers", "prevent_self_review": True,
+             "reviewers": [{"type": "User", "reviewer": {"login": "maintainer"}}]}
+
+
+class PlanEnvironmentStepTest(unittest.TestCase):
+    """The plan job's first step: it stops the job unless its environment makes a reviewer approve each run."""
+
+    def run_step(self, environment, gh_exit=0):
+        guard = step(load(BUNNY_INFRA)["jobs"]["plan"], "Check the environment requires approval")
+        with tempfile.TemporaryDirectory() as tmp:
+            install(os.path.join(tmp, "bin"), {"gh": FAKE_GH})
+            args = os.path.join(tmp, "gh_args")
+            env = dict(os.environ, **guard["env"])
+            env.update(PATH=os.path.join(tmp, "bin") + os.pathsep + env["PATH"], GH_TOKEN="token",
+                       GITHUB_REPOSITORY="immich-app/geoshenanigans", FAKE_GH_ARGS=args, FAKE_GH_EXIT=str(gh_exit),
+                       FAKE_ENVIRONMENT=environment if isinstance(environment, str) else json.dumps(environment))
+            result = run_bash(guard["run"], tmp, env)
+            with open(args) as f:
+                self.assertEqual(f.read(), f"api repos/immich-app/geoshenanigans/environments/{PLAN_ENVIRONMENT}\n")
+            return result
+
+    def test_an_environment_with_a_reviewer_passes(self):
+        for rules in ([REVIEWERS], [{"type": "wait_timer", "wait_timer": 5}, REVIEWERS],
+                      [{"type": "branch_policy"}, {**REVIEWERS, "prevent_self_review": False}]):
+            with self.subTest(rules=rules):
+                self.assertEqual(self.run_step({"name": PLAN_ENVIRONMENT, "protection_rules": rules}).returncode, 0)
+
+    def test_an_environment_that_lets_runs_through_fails(self):
+        # What GitHub creates when a job names an environment nobody set up: no protection rules.
+        for environment in ({"name": PLAN_ENVIRONMENT, "protection_rules": []}, {"name": PLAN_ENVIRONMENT},
+                            {"protection_rules": [{"type": "wait_timer", "wait_timer": 30}, {"type": "branch_policy"}]},
+                            {"protection_rules": [{**REVIEWERS, "reviewers": []}]},
+                            {"protection_rules": [{"type": "required_reviewers"}]}):
+            with self.subTest(environment=environment):
+                result = self.run_step(environment)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"::error::The {PLAN_ENVIRONMENT} environment has no required reviewers", result.stdout)
+
+    def test_an_unreadable_environment_fails(self):
+        self.assertNotEqual(self.run_step('{"message": "Not Found"}', gh_exit=1).returncode, 0)
+        self.assertNotEqual(self.run_step("not json").returncode, 0)
+
+
+GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUTHOR_NAME": "t",
+           "GIT_AUTHOR_EMAIL": "t@example.invalid", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
+
+
+class ApplyFreshnessStepTest(unittest.TestCase):
+    """The apply job's check that the run's commit still has main's configuration: a re-run of an older main run, or
+    one delayed behind a newer commit's, must not put the older configuration back."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.env = dict(os.environ, **GIT_ENV)
+        self.origin = os.path.join(self.tmp.name, "origin.git")
+        self.main = os.path.join(self.tmp.name, "main")
+        self.git(self.tmp.name, "init", "--quiet", "--bare", "--initial-branch=main", self.origin)
+        self.git(self.tmp.name, "init", "--quiet", "--initial-branch=main", self.main)
+        self.git(self.main, "remote", "add", "origin", self.origin)
+        for path in self.trigger_files() + ["tiles/src/index.ts", "deployment/modules/cloudflare/tiles-worker/a.tf"]:
+            self.commit(path, "first")
+
+    def git(self, cwd, *args):
+        return subprocess.run(["git", *args], cwd=cwd, env=self.env, check=True, capture_output=True,
+                              text=True).stdout.strip()
+
+    def commit(self, path, text):
+        full = os.path.join(self.main, path)
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w") as f:
+            f.write(text + "\n")
+        self.git(self.main, "add", path)
+        self.git(self.main, "commit", "--quiet", "-m", f"{path}: {text}")
+        self.git(self.main, "push", "--quiet", "origin", "main")
+        return self.git(self.main, "rev-parse", "HEAD")
+
+    def trigger_files(self):
+        """A file under each path that triggers the workflow on main."""
+        paths = load(BUNNY_INFRA)[True]["push"]["paths"]
+        return [path.removesuffix("/**") + "/tiles/main.tf" if path.endswith("/**") else path for path in paths]
+
+    def checkout(self, sha):
+        """The run's checkout: actions/checkout fetches the one commit, with origin pointing at the repository."""
+        workspace = os.path.join(self.tmp.name, f"workspace-{sha[:7]}")
+        self.git(self.tmp.name, "init", "--quiet", workspace)
+        self.git(workspace, "remote", "add", "origin", "file://" + self.origin)
+        self.git(workspace, "fetch", "--quiet", "--depth=1", "origin", sha)
+        self.git(workspace, "checkout", "--quiet", "--detach", sha)
+        return workspace
+
+    def run_step(self, sha):
+        check = step(load(BUNNY_INFRA)["jobs"]["apply"], "Check this commit has main's configuration")
+        workspace = self.checkout(sha)
+        output = os.path.join(self.tmp.name, "github_output")
+        with open(output, "w"):
+            pass
+        result = run_bash(check["run"], workspace, dict(self.env, GITHUB_OUTPUT=output, GITHUB_SHA=sha))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        with open(output) as f:
+            return f.read(), result.stdout
+
+    def test_main_itself_applies(self):
+        head = self.git(self.main, "rev-parse", "HEAD")
+        self.assertEqual(self.run_step(head)[0], "current=true\n")
+
+    def test_an_older_commit_applies_when_main_changed_only_other_files(self):
+        old = self.git(self.main, "rev-parse", "HEAD")
+        self.commit("tiles/src/index.ts", "newer")
+        self.commit("deployment/modules/cloudflare/tiles-worker/a.tf", "newer")
+        self.assertEqual(self.run_step(old)[0], "current=true\n")
+
+    def test_an_older_commit_skips_when_main_changed_any_path_that_triggers_the_workflow(self):
+        for path in self.trigger_files():
+            with self.subTest(path=path):
+                old = self.git(self.main, "rev-parse", "HEAD")
+                head = self.commit(path, f"newer {path}")
+                output, stdout = self.run_step(old)
+                self.assertEqual(output, "current=false\n")
+                self.assertIn(f"::warning::main ({head}) has another Bunny configuration than {old}", stdout)
+
+    def test_the_trigger_paths_are_the_same_for_pull_requests_and_main(self):
+        triggers = load(BUNNY_INFRA)[True]
+        self.assertEqual(triggers["pull_request"]["paths"], triggers["push"]["paths"])
+        self.assertIn("deployment/modules/bunny/tiles/main.tf", self.trigger_files())
 
 
 FAKE_OP = """#!/bin/sh
