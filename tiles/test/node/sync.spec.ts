@@ -1632,7 +1632,7 @@ describe('bunny:sync CLI', () => {
     ];
     const env = { BUNNY_API_URL: api.url };
 
-    const malformed = await startSync(w, args(['--archive-md5', md5.toLowerCase()]), env).done;
+    const malformed = await startSync(w, args(['--archive-md5', '!not-base64!']), env).done;
     expect(malformed.code).toBe(1);
     expect(malformed.stderr).toMatch(/--archive-md5 must be a base64 MD5/);
     const without = await startSync(w, args([]), env).done;
