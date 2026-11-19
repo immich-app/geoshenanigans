@@ -12,7 +12,7 @@ import { clipManifest, readManifest, writeManifest } from '../../src/bunny/manif
 import { BunnyStateStore, readState, SyncState } from '../../src/bunny/state';
 import { BunnyStorage } from '../../src/bunny/storage';
 import { planItems, runSync, SyncOptions, SyncReport } from '../../src/bunny/sync';
-import { tilePath, zoomEnd } from '../../src/bunny/tile-id';
+import { tileIdZoom, tilePath, zoomEnd } from '../../src/bunny/tile-id';
 import { FakeStorage, FakeStorageOptions, sha256Hex } from './fake-storage';
 import { Build, contentBytes, mutateBuild, randomBuild, rng, writeArchiveFile } from './manifest-fixtures';
 import { scratchDir, withOtherTileBytes } from './upload-fixture';
@@ -217,30 +217,41 @@ async function seedState(options: {
   return dir;
 }
 
-/** Stores build `key` at every position as a seed would have, replicated everywhere. */
+/** The checksum of a build's tile at a position, or undefined where it has none (a gap). */
+function checksumAt(build: Build, id: number): string | undefined {
+  const content = build.contents[id - build.base];
+  return content === null || content === undefined ? undefined : sha256Hex(contentBytes(content));
+}
+
+/** Stores build `key` at every position it has as a seed would have, replicated everywhere. */
 function seedZone(w: World, key: string, prefix = 'v1', end = POSITIONS, regions = REGIONS) {
   const { build } = w.archives[key];
   for (let id = 0; id < Math.min(end, build.contents.length); id++) {
-    w.tiles.seed(tilePath(prefix, id), contentBytes(build.contents[id]!), regions);
+    const content = build.contents[id];
+    if (content !== null && content !== undefined) {
+      w.tiles.seed(tilePath(prefix, id), contentBytes(content), regions);
+    }
   }
 }
 
+/** Positions whose tile differs between two builds, a position only one of them has included. */
 function changedPositions(w: World, from: string, to: string, end = POSITIONS): number[] {
-  const a = w.archives[from].build.contents;
-  const b = w.archives[to].build.contents;
+  const a = w.archives[from].build;
+  const b = w.archives[to].build;
   const changed: number[] = [];
   for (let id = 0; id < end; id++) {
-    if (sha256Hex(contentBytes(a[id]!)) !== sha256Hex(contentBytes(b[id]!))) {
+    if (checksumAt(a, id) !== checksumAt(b, id)) {
       changed.push(id);
     }
   }
   return changed;
 }
 
+/** The zone holds build `key`: its tile at every position it has, and no file where it has none. */
 function expectHolds(w: World, key: string, prefix = 'v1', end = POSITIONS) {
   const { build } = w.archives[key];
   for (let id = 0; id < end; id++) {
-    expect(w.tiles.checksum(tilePath(prefix, id)), `position ${id}`).toBe(sha256Hex(contentBytes(build.contents[id]!)));
+    expect(w.tiles.checksum(tilePath(prefix, id)), `position ${id}`).toBe(checksumAt(build, id));
   }
 }
 
@@ -941,6 +952,132 @@ describe('runSync', () => {
     expect(tilePuts(w)).toHaveLength(changed.length);
     expect(w.tiles.identicalReputs).toEqual([]);
     expect(await readState(w.state)).toMatchObject({ liveBuild: '20261118', pending: [] });
+  });
+
+  it('repairs the live build with --force-full under its key, writing only the files that lost its bytes', async () => {
+    const w = await world();
+    await adopted(w);
+    const damaged = tilePath('v1', 3);
+    const lost = tilePath('v1', 7);
+    w.tiles.seed(damaged, contentBytes(424_242), REGIONS);
+    w.tiles.files.delete(lost);
+    const report = await runSync(
+      w.options('20261117', { forceFull: true, replicationTimeoutMs: GATE_TIMEOUT_MS }),
+      w.deps(),
+    );
+    expect(report.error).toBeNull();
+    expect(report).toMatchObject({
+      status: 'success',
+      previousBuild: '20261117',
+      positionsChanged: 0,
+      positionsVerified: POSITIONS,
+      filesUploaded: 2,
+      filesSkipped: POSITIONS - 2,
+      filesDeleted: 0,
+      purged: true,
+    });
+    expect(
+      tilePuts(w)
+        .map(([path]) => path)
+        .sort(),
+    ).toEqual([damaged, lost].sort());
+    expectHolds(w, '20261117');
+    expect(w.tiles.identicalReputs).toEqual([]);
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', pending: [] });
+  });
+
+  it('refuses a sync under the live build key with other tiles than its manifest, before writing anything', async () => {
+    const w = await world();
+    await adopted(w);
+    const changed = changedPositions(w, '20261117', '20261118');
+    const above = POSITIONS - zoomEnd(4);
+    const refused = async (extra: Partial<SyncOptions>, deps = w.deps()) => {
+      const before = await w.state.get('state.json');
+      w.events.length = 0;
+      const report = await runSync(w.options('20261117', extra), deps);
+      expect(report.status).toBe('failed');
+      expect(report.error).toMatch(/^20261117 is the live build, and .* has other tiles than its manifest at /);
+      expect(report.error).toMatch(/a sync under the live key only puts back the live build's own bytes/);
+      // Not a request that writes, nor a DESCRIBE: the plan refused it.
+      expect(w.events).toEqual([]);
+      expect(await w.state.get('state.json')).toEqual(before);
+      return report.error!;
+    };
+    // A --force-full "repair" with another build's tiles, or cut at another zoom: it would record no pending build,
+    // and publish a manifest with those tiles as the live one.
+    const archive = w.archives['20261118'].path;
+    expect(await refused({ forceFull: true, archive })).toContain(
+      `at ${changed.length} positions from zoom ${tileIdZoom(changed[0])} (${changed.length} changed, 0 added, 0 removed)`,
+    );
+    expect(await refused({ forceFull: true, maxZoom: 4 })).toContain(
+      `at ${above} positions from zoom 5 (0 changed, 0 added, ${above} removed, with --max-zoom 4)`,
+    );
+    expect(await refused({ forceFull: true, archive, dryRun: true }, { state: w.state })).toContain('other tiles');
+    expectHolds(w, '20261117');
+
+    // The revert of a pending build under the live key needs the live tiles too.
+    const failing = { ...w.deps(), purge: () => Promise.reject(new Error('purge: 500 from the API')) };
+    expect((await runSync(w.options('20261118'), failing)).status).toBe('failed');
+    expect(await refused({ archive })).toContain(`(${changed.length} changed, 0 added, 0 removed)`);
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', pending: [{ build: '20261118' }] });
+    expect(w.purges).toBe(0);
+    // With the live archive the revert goes ahead, and puts the live bytes back.
+    expect(await runSync(w.options('20261117'), w.deps())).toMatchObject({ status: 'success', error: null });
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', pending: [] });
+    expectHolds(w, '20261117');
+  });
+
+  it('deletes with --force-full what the live or a pending build has and the new one does not', async () => {
+    const w = await world();
+    const x = w.archives['20261117'].build;
+    const y = w.archives['20261118'].build;
+    // Positions only a pending build (20261117) has, and positions only the live one (20261116) has.
+    const pendingOnly = [3, 40, 41, 42, 1500, 5000];
+    const liveOnly = [5, 90, 91, 2000, POSITIONS - 1];
+    const without = (build: Build, ids: number[]): Build => ({
+      base: build.base,
+      contents: build.contents.map((content, id) => (ids.includes(id) ? null : content)),
+    });
+    const r = rng(77);
+    for (const [key, build] of [
+      ['20261116', without(x, pendingOnly)],
+      ['20261119', without(y, [...pendingOnly, ...liveOnly])],
+    ] as const) {
+      const path = join(w.dir, `${key}.pmtiles`);
+      await writeArchiveFile(path, build, r, { maxZoom: 6, metadata: METADATA, maxLeafEntries: 40 });
+      w.archives[key] = { path, build };
+      w.seedStates[key] = await seedState({ dir: w.dir, zone: w.tiles.zone, archive: path });
+    }
+    await adopted(w, '20261116');
+    // A sync to 20261117 writes the positions only it has, then fails at the purge: they stay pending.
+    const failing = { ...w.deps(), purge: () => Promise.reject(new Error('purge: 500 from the API')) };
+    expect(await runSync(w.options('20261117'), failing)).toMatchObject({
+      status: 'failed',
+      filesUploaded: pendingOnly.length,
+    });
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261116', pending: [{ build: '20261117' }] });
+    const obsolete = [...pendingOnly, ...liveOnly].map((id) => tilePath('v1', id));
+    expect(obsolete.filter((path) => !w.tiles.files.has(path))).toEqual([]);
+
+    const report = await runSync(
+      w.options('20261119', { forceFull: true, replicationTimeoutMs: GATE_TIMEOUT_MS }),
+      w.deps(),
+    );
+    expect(report.error).toBeNull();
+    expect(report).toMatchObject({
+      status: 'success',
+      positionsTotal: POSITIONS - obsolete.length,
+      positionsChanged: changedPositions(w, '20261116', '20261119').length,
+      positionsVerified: POSITIONS - obsolete.length,
+      filesDeleted: obsolete.length,
+      purged: true,
+    });
+    // Neither those only the pending build wrote nor those only the live one has are left.
+    expect(pendingOnly.filter((id) => w.tiles.files.has(tilePath('v1', id)))).toEqual([]);
+    expect(liveOnly.filter((id) => w.tiles.files.has(tilePath('v1', id)))).toEqual([]);
+    expectHolds(w, '20261119');
+    expect(w.tiles.identicalReputs).toEqual([]);
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261119', pending: [] });
   });
 
   it('keeps --force-full to the live prefix', async () => {
