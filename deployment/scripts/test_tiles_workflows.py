@@ -237,7 +237,8 @@ class BunnyKeyTest(unittest.TestCase):
         self.assertIn("The maintainers accepted that exposure (What this doesn't cover, above)", step_3)
         self.assertNotIn("neither value is in any state", readme)
         for path in (os.path.join(WORKFLOWS, "tiles-worker.yml"), os.path.join(ROOT, "deployment", ".env"),
-                     os.path.join(ROOT, "deployment", "tiles-worker-bunny.env")):
+                     os.path.join(ROOT, "deployment", "tiles-worker-bunny.env"),
+                     os.path.join(ROOT, "deployment", "modules", "cloudflare", "tiles-worker", "workers.tf")):
             with self.subTest(path=os.path.relpath(path, ROOT)):
                 text = read(path)
                 self.assertNotIn("never gets the Bunny account key", text)
