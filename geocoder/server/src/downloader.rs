@@ -1329,10 +1329,14 @@ mod tests {
 
     // A download into a dir that holds all of the selection, stamped with
     // the build, fetches nothing and writes nothing: not the stamp, nor the
-    // ledger, though it holds more than a line a file.
+    // ledger, though it holds more than a line a file. A file written under
+    // a temp name and renamed into place, of the same bytes, is another
+    // inode.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_download_with_nothing_to_fetch_writes_nothing() {
         use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
         let s = sel("europe", "admin", "simplified", "major");
         let bucket = test_bucket::serve(test_bucket::template_components()).await;
         let root = ScratchDir::new();
@@ -1341,9 +1345,12 @@ mod tests {
         let sha256 = &bucket.manifest.files["europe/admin/admin_cells.bin"].sha256;
         let mut ledger = std::fs::OpenOptions::new().append(true).open(dir.join(FILE_LEDGER)).unwrap();
         write!(ledger, "admin_cells.bin -\nadmin_cells.bin {sha256}\n").unwrap();
-        let entries = || -> Vec<(String, std::time::SystemTime, Vec<u8>)> {
+        let entries = || -> Vec<(String, u64, std::time::SystemTime, Vec<u8>)> {
             let mut v: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap())
-                .map(|e| (e.file_name().into_string().unwrap(), e.metadata().unwrap().modified().unwrap(), std::fs::read(e.path()).unwrap()))
+                .map(|e| {
+                    let meta = e.metadata().unwrap();
+                    (e.file_name().into_string().unwrap(), meta.ino(), meta.modified().unwrap(), std::fs::read(e.path()).unwrap())
+                })
                 .collect();
             v.sort();
             v
@@ -1354,6 +1361,35 @@ mod tests {
 
         assert_eq!(bucket.files_served(), served);
         assert!(entries() == before);
+    }
+
+    // A download with nothing to fetch into a dir whose stamp doesn't name
+    // the build (one killed once its last fetch was in, before the stamp, or
+    // stamped with an older build) fetches nothing, rewrites the ledger with
+    // a line a file and stamps the dir.
+    #[tokio::test]
+    async fn a_download_with_nothing_to_fetch_into_a_dir_not_stamped_with_its_build_stamps_it() {
+        use std::io::Write;
+        let s = sel("europe", "admin", "simplified", "major");
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        for stamp in [None, Some("2025-12-01")] {
+            let root = ScratchDir::new();
+            download(&bucket, &s, root.path()).await.unwrap();
+            let dir = root.path().join("europe");
+            match stamp {
+                None => std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap(),
+                Some(date) => std::fs::write(dir.join(BUILD_STAMP), date).unwrap(),
+            }
+            let sha256 = &bucket.manifest.files["europe/admin/admin_cells.bin"].sha256;
+            let mut ledger = std::fs::OpenOptions::new().append(true).open(dir.join(FILE_LEDGER)).unwrap();
+            write!(ledger, "admin_cells.bin -\nadmin_cells.bin {sha256}\n").unwrap();
+            let served = bucket.files_served();
+
+            download(&bucket, &s, root.path()).await.unwrap();
+
+            assert_eq!(bucket.files_served(), served, "{stamp:?}");
+            assert!(held(&dir) == files_of(&bucket, &s), "{stamp:?}");
+        }
     }
 
     /// How many fetches of `s` a retry makes once a download that stopped at
@@ -1469,10 +1505,14 @@ mod tests {
 
             let switched = download(&bucket, &all, root.path()).await.map_err(|e| e.to_string());
             let (fetched, replaced) = (bucket.files_served() - before, std::fs::read(root.path().join("europe/arc_index.bin")).unwrap());
+            let stamp = std::fs::read_to_string(root.path().join("europe").join(BUILD_STAMP)).ok();
             download(&bucket, &major, root.path()).await.unwrap();
 
             assert_eq!(switched.is_err(), stopped, "{switched:?}");
             assert_eq!((fetched, replaced == theirs), (1, true), "stopped: {stopped}");
+            // The dir was stamped with the build before the switch: one that
+            // stopped part way leaves it stamped with none.
+            assert_eq!(stamp.as_deref(), (!stopped).then_some(test_bucket::DATE), "stopped: {stopped}");
             assert_eq!(bucket.files_served() - before, 2, "stopped: {stopped}");
             assert!(held(&root.path().join("europe")) == files_of(&bucket, &major), "stopped: {stopped}");
         }
