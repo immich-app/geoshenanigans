@@ -68,11 +68,13 @@ jobs:
           tofu validate
           tofu test
 
-      # encryption.tf applied on a local backend: the state is ciphertext only the passphrase reads (tofu from mise).
+      # encryption.tf applied on a local backend: the state is ciphertext only the passphrase reads. use-mise puts only
+      # mise's shims on PATH, and the test's module is in a temporary directory outside the checkout, where a shim finds
+      # no version: mise exec puts the tools' own directories on PATH (and the test runs tofu from the checkout too).
       - name: Test the state encryption
         env:
           REQUIRE_TOFU: 1
-        run: python3 -m unittest discover -s deployment/scripts -p 'test_tiles_workflows.py' -k BunnyStateTest
+        run: mise exec -- python3 -m unittest discover -s deployment/scripts -p 'test_tiles_workflows.py' -k BunnyStateTest
 
   # The plan runs the branch's Terragrunt configuration with the Bunny token, so no branch run gets it by itself: the
   # token is the tiles-bunny-plan environment's own secret, which GitHub releases once one of the environment's required

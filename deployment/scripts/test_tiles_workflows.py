@@ -725,6 +725,14 @@ class BunnyStateTest(unittest.TestCase):
         self.assertEqual(readers, [])
         self.assertIn('schema_name = "${local.env}_bunny_tiles"', read(os.path.join(self.MODULE, "terragrunt.hcl")))
 
+    def test_the_check_job_runs_the_encryption_test_with_the_tools_of_mise(self):
+        """use-mise puts only the shims on PATH, and a shim run outside the checkout finds no tofu version: the
+        step runs under mise exec, with REQUIRE_TOFU so that a missing tofu fails it."""
+        steps = load("tiles-bunny-infra.yml")["jobs"]["check"]["steps"]
+        step = next(step for step in steps if "BunnyStateTest" in step.get("run", ""))
+        self.assertRegex(step["run"], r"^mise exec -- python3 -m unittest .*-k BunnyStateTest$")
+        self.assertEqual(str(step["env"]["REQUIRE_TOFU"]), "1")
+
     # Tiles Bunny Infra's check job sets REQUIRE_TOFU, so that there a missing tofu fails instead of skipping.
     @unittest.skipUnless(shutil.which("tofu") or os.environ.get("REQUIRE_TOFU"), "needs tofu (mise)")
     def test_the_state_is_written_encrypted(self):
@@ -741,12 +749,16 @@ class BunnyStateTest(unittest.TestCase):
             env = dict(os.environ, TF_DATA_DIR=os.path.join(tmp, "data"), TF_IN_AUTOMATION="1",
                        TF_VAR_state_passphrase="correct-passphrase-for-tests")
 
+            # Run from the checkout, pointed at the module with -chdir: tofu may be only mise's shim (as on a runner,
+            # where use-mise puts the shims on PATH), which finds its version in the repo's mise config by the working
+            # directory, and the temporary directory is outside the repo.
             def tofu(*args, **overrides):
-                return subprocess.run(["tofu", *args, "-input=false"] if args[0] != "state" else ["tofu", *args],
-                                      cwd=module, env=dict(env, **overrides), capture_output=True, text=True,
-                                      check=False)
+                command = [*args, "-input=false"] if args[0] != "state" else list(args)
+                return subprocess.run(["tofu", f"-chdir={module}", *command], cwd=ROOT, env=dict(env, **overrides),
+                                      capture_output=True, text=True, check=False)
 
-            self.assertEqual(tofu("init").returncode, 0)
+            initialised = tofu("init")
+            self.assertEqual(initialised.returncode, 0, initialised.stderr)
             applied = tofu("apply", "-auto-approve")
             self.assertEqual(applied.returncode, 0, applied.stderr)
             state = read(os.path.join(module, "terraform.tfstate"))
