@@ -4,14 +4,14 @@
  * Every case runs against zones a sync with the same command line would write to: the first test shows it does.
  */
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { copyFile, link, lstat, mkdir, readdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { SyncReport } from '../../src/bunny/sync';
-import { zoomEnd } from '../../src/bunny/tile-id';
-import { FakeStorage } from './fake-storage';
-import { randomBuild, rng, writeArchiveFile } from './manifest-fixtures';
+import { tilePath, zoomEnd } from '../../src/bunny/tile-id';
+import { FakeStorage, sha256Hex } from './fake-storage';
+import { contentBytes, randomBuild, rng, writeArchiveFile } from './manifest-fixtures';
 import { scratchDir } from './upload-fixture';
 
 const TILES_DIR = join(import.meta.dirname, '../..');
@@ -36,62 +36,43 @@ async function world() {
   cleanup.push(remove);
   const archive = join(dir, '20261118.pmtiles');
   const r = rng(7);
-  await writeArchiveFile(archive, randomBuild(r, zoomEnd(3)), r, {
+  const build = randomBuild(r, zoomEnd(3));
+  await writeArchiveFile(archive, build, r, {
     maxZoom: 3,
     metadata: { name: 'test', 'planetiler:osm:osmosisreplicationtime': '2026-11-18T01:02:03Z' },
   });
   const requests: string[] = [];
+  // Each one's cleanup as it opens: one that fails to start leaves none open behind it.
   const tiles = await FakeStorage.start({
     regions: ['UK'],
     replicationDelayMs: { UK: 5 },
     onRequest: ({ method, path }) => requests.push(`tiles ${method} ${path}`),
   });
+  cleanup.push(() => tiles.close());
   const stateZone = await FakeStorage.start({
     zone: 'state-zone',
     onRequest: ({ method, path }) => requests.push(`state ${method} ${path}`),
   });
+  cleanup.push(() => stateZone.close());
   const purges: string[] = [];
   const api = createServer((request, response) => {
     purges.push(`${request.method} ${request.url}`);
     response.writeHead(204).end();
   });
-  await new Promise<void>((resolve) => api.listen(0, '127.0.0.1', resolve));
-  cleanup.push(
-    () => tiles.close(),
-    () => stateZone.close(),
-    () => new Promise<void>((resolve) => api.close(() => resolve())),
-  );
+  await new Promise<void>((resolve, reject) => {
+    api.once('error', reject);
+    api.listen(0, '127.0.0.1', resolve);
+  });
+  cleanup.push(() => new Promise<void>((resolve) => api.close(() => resolve())));
   const styles = join(dir, 'styles');
   await mkdir(styles);
   await writeFile(join(styles, 'light.json'), STYLE);
 
   let runs = 0;
   /**
-   * Runs bunny:sync with --force-full (every position written, no state needed) and the given arguments after the
-   * rest, the environment overridden by `env`. Returns its exit code, output and the report it left.
+   * Runs bunny:sync with `args` alone, the environment overridden by `env`; returns its exit code and output.
    */
-  const sync = async (extra: string[], env: Record<string, string> = {}) => {
-    const report = join(dir, `report-${++runs}.json`);
-    const args = [
-      '--report',
-      report,
-      '--archive',
-      archive,
-      '--build',
-      '20261118',
-      '--force-full',
-      '--styles-dir',
-      styles,
-      '--work-dir',
-      join(dir, `work-${runs}`),
-      '--threads',
-      '1',
-      '--regions',
-      'UK',
-      '--replication-interval-s',
-      '1',
-      ...extra,
-    ];
+  const run = async (args: string[], env: Record<string, string> = {}) => {
     // Nothing from the caller's environment: no pinned storage addresses, styles or API of its own.
     const inherited = Object.fromEntries(
       Object.entries(process.env).filter(([name]) => !name.startsWith('BUNNY_') && name !== 'STYLES_DIR'),
@@ -123,11 +104,41 @@ async function world() {
     child.stderr.on('data', (chunk) => (stderr += chunk));
     // 'close', not 'exit': the output streams have ended too.
     const code = await new Promise<number | null>((resolve) => child.once('close', (exitCode) => resolve(exitCode)));
-    const written = JSON.parse(await readFile(report, 'utf8')) as SyncReport;
-    return { code, stdout, stderr, report: written };
+    return { code, stdout, stderr };
   };
 
-  return { tiles, requests, purges, styles, sync };
+  /**
+   * Runs bunny:sync with --force-full (every position written, no state needed) and the given arguments after the
+   * rest, the environment overridden by `env`. Returns its exit code, output and the report it left.
+   */
+  const sync = async (extra: string[], env: Record<string, string> = {}) => {
+    const report = join(dir, `report-${++runs}.json`);
+    const args = [
+      '--report',
+      report,
+      '--archive',
+      archive,
+      '--build',
+      '20261118',
+      '--force-full',
+      '--styles-dir',
+      styles,
+      '--work-dir',
+      join(dir, `work-${runs}`),
+      '--threads',
+      '1',
+      '--regions',
+      'UK',
+      '--replication-interval-s',
+      '1',
+      ...extra,
+    ];
+    const result = await run(args, env);
+    const written = JSON.parse(await readFile(report, 'utf8')) as SyncReport;
+    return { ...result, report: written };
+  };
+
+  return { dir, archive, build, tiles, requests, purges, styles, run, sync };
 }
 
 type World = Awaited<ReturnType<typeof world>>;
@@ -151,10 +162,100 @@ describe('bunny:sync CLI', () => {
     const { code, stderr, report } = await w.sync([]);
     expect(code, stderr).toBe(0);
     expect(report).toMatchObject({ status: 'success', mode: 'force-full', purged: true, error: null });
-    expect(report.filesUploaded).toBeGreaterThan(0);
-    expect(w.requests).toContain('tiles PUT v1/0/0/0.mvt');
+    // Every position of the build, each PUT once, holding its own tile's bytes.
+    const expected = w.build.contents.flatMap((content, i) =>
+      content === null ? [] : [[tilePath('v1', w.build.base + i), sha256Hex(contentBytes(content))] as const],
+    );
+    expect(expected).toHaveLength(zoomEnd(3));
+    expect(report.filesUploaded).toBe(expected.length);
+    const puts = w.requests.filter((request) => request.startsWith('tiles PUT ') && request.endsWith('.mvt'));
+    expect(puts.sort()).toEqual(expected.map(([path]) => `tiles PUT ${path}`).sort());
+    const stored = [...w.tiles.files.keys()].filter((path) => path.endsWith('.mvt'));
+    expect(stored.sort()).toEqual(expected.map(([path]) => path).sort());
+    for (const [path, checksum] of expected) {
+      expect(w.tiles.checksum(path), path).toBe(checksum);
+    }
     expect(w.requests).toContain('state PUT state.json');
     expect(w.purges).toEqual(['POST /pullzone/123/purgeCache']);
+  });
+
+  it('refuses a report path that is the archive before writing anything, even on a dry run', async () => {
+    const w = await world();
+    const before = await readFile(w.archive);
+    const hardLink = join(w.dir, 'hard-link.pmtiles');
+    await link(w.archive, hardLink);
+    const softLink = join(w.dir, 'soft-link.json');
+    await symlink(w.archive, softLink);
+    const args = (report: string, archive = w.archive) => [
+      '--report',
+      report,
+      '--archive',
+      archive,
+      '--build',
+      '20261118',
+      '--dry-run',
+    ];
+    for (const [report, archive] of [
+      [w.archive, w.archive],
+      // Another spelling of the same path (bunny:sync runs in TILES_DIR).
+      [relative(TILES_DIR, w.archive), w.archive],
+      [hardLink, w.archive],
+      [softLink, w.archive],
+      // The archive given through a symlink to it, the report at the file itself.
+      [w.archive, softLink],
+    ]) {
+      const { code, stdout, stderr } = await w.run(args(report, archive));
+      expect(code, stderr).toBe(1);
+      const printed = JSON.parse(stdout) as SyncReport;
+      expect(printed).toMatchObject({ status: 'failed', dryRun: true, filesUploaded: null });
+      expect(printed.error).toMatch(/^--report .* is the archive .*: writing the report there would replace it$/);
+      expect(await readFile(w.archive)).toEqual(before);
+      expect((await lstat(softLink)).isSymbolicLink()).toBe(true);
+    }
+    expect(await readFile(hardLink)).toEqual(before);
+    expect((await readdir(w.dir)).filter((name) => name.endsWith('.partial'))).toEqual([]);
+    expect(w.requests).toEqual([]);
+  });
+
+  it('writes the report through a partial file of its own, never over a file already there', async () => {
+    const w = await world();
+    // The archive at the path the report's partial file once had: its writes must not truncate it.
+    const report = join(w.dir, 'report.json');
+    const archive = `${report}.partial`;
+    await copyFile(w.archive, archive);
+    const before = await readFile(archive);
+    const { code, stderr } = await w.run([
+      '--report',
+      report,
+      '--archive',
+      archive,
+      '--build',
+      '20261118',
+      '--dry-run',
+    ]);
+    // A diff without a state is refused (before the archive is read), its report written twice all the same.
+    expect(code, stderr).toBe(1);
+    const written = JSON.parse(await readFile(report, 'utf8')) as SyncReport;
+    expect(written).toMatchObject({ status: 'failed', dryRun: true, positionsTotal: null });
+    expect(written.error).toMatch(/No state\.json/);
+    expect(await readFile(archive)).toEqual(before);
+    expect((await readdir(w.dir)).filter((name) => name.endsWith('.partial'))).toEqual(['report.json.partial']);
+
+    // --force-full reads the archive there (all of it, for its manifest), plans and stops.
+    const forced = await w.run([
+      '--report',
+      report,
+      '--archive',
+      archive,
+      '--build',
+      '20261118',
+      '--dry-run',
+      '--force-full',
+    ]);
+    expect(forced.code, forced.stderr).toBe(0);
+    expect(JSON.parse(await readFile(report, 'utf8'))).toMatchObject({ status: 'success', positionsTotal: zoomEnd(3) });
+    expect(await readFile(archive)).toEqual(before);
+    expect((await readdir(w.dir)).filter((name) => name.endsWith('.partial'))).toEqual(['report.json.partial']);
   });
 
   it('refuses a malformed command line before any request, with a report', async () => {

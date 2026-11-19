@@ -41,13 +41,15 @@
  * fails the run before its first request, not after the tiles are written.
  *
  * The report (--report, and stdout) is written however the run ends, including a first SIGINT/SIGTERM, which stops
- * taking new files and lets the requests in flight finish (a second exits at once).
+ * taking new files and lets the requests in flight finish (a second exits at once). A --report that is the archive
+ * (the same path, a hard link or a symlink) fails the run before any write, on stdout only.
  * Exit codes: 0 success or skipped, 3 guard rail (nothing uploaded), 1 any failure.
  */
+import { randomBytes } from 'node:crypto';
 import { rmSync } from 'node:fs';
-import { mkdir, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, open, rename, rm, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { parseMd5Base64 } from '../archive-identity';
 import { purgePullZone, purgeUrl } from '../purge';
@@ -81,7 +83,11 @@ function number(name: string, value: string | undefined, min = 0, integer = true
   return parsed;
 }
 
-/** Writes the report file atomically, one write after another, so the last one written is the last one asked for. */
+/**
+ * Writes the report file atomically, one write after another, so the last one written is the last one asked for.
+ * Each write goes to a partial file of its own beside it, created exclusively, so it never truncates a file already
+ * there (the archive, say).
+ */
 class ReportFile {
   private chain = Promise.resolve();
 
@@ -95,14 +101,48 @@ class ReportFile {
     const body = `${JSON.stringify(report, null, 2)}\n`;
     this.chain = this.chain
       .then(async () => {
-        await writeFile(`${path}.partial`, body);
-        await rename(`${path}.partial`, path);
+        const partial = `${path}.${process.pid}-${randomBytes(6).toString('hex')}.partial`;
+        // Fails, touching nothing, when a file is there; only what it created is removed on a failure after.
+        const handle = await open(partial, 'wx');
+        try {
+          try {
+            await handle.writeFile(body);
+          } finally {
+            await handle.close();
+          }
+          await rename(partial, path);
+        } catch (error) {
+          await rm(partial, { force: true });
+          throw error;
+        }
       })
       .catch((error: unknown) => {
         process.stderr.write(`Could not write the report: ${error instanceof Error ? error.message : String(error)}\n`);
       });
     return this.chain;
   }
+}
+
+/**
+ * Why `report` may not be written to, or undefined: it is the archive (the same path, a hard link or a symlink to it,
+ * or a path the archive is a symlink to), which writing the report there would replace. Checked before the first write.
+ */
+async function reportProblem(report: string | undefined, archive: string | undefined): Promise<string | undefined> {
+  if (report === undefined || archive === undefined) {
+    return undefined;
+  }
+  const refusal = `--report ${report} is the archive ${archive}: writing the report there would replace it`;
+  if (resolve(report) === resolve(archive)) {
+    return refusal;
+  }
+  const missing = (error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') {
+      return undefined;
+    }
+    throw error;
+  };
+  const [given, existing] = await Promise.all([stat(archive).catch(missing), stat(report).catch(missing)]);
+  return given && existing && given.dev === existing.dev && given.ino === existing.ino ? refusal : undefined;
 }
 
 const OPTIONS = {
@@ -158,7 +198,6 @@ async function main(): Promise<number> {
   const { values: given } = parseArgs({ options: OPTIONS, strict: false });
   const text = (name: keyof typeof OPTIONS) => (typeof given[name] === 'string' ? (given[name] as string) : undefined);
   const flag = (name: keyof typeof OPTIONS) => given[name] === true;
-  const reportFile = new ReportFile(text('report'));
   let report = emptyReport({
     build: text('build') ?? '',
     prefix: text('prefix'),
@@ -167,6 +206,17 @@ async function main(): Promise<number> {
     adopt: flag('adopt'),
     replace: flag('replace'),
   });
+  // Before the report's first write, which a dry run or a command line refused below makes too.
+  const reportPath = text('report');
+  const refused = await reportProblem(reportPath, text('archive')).catch(
+    (error: unknown) =>
+      `--report ${reportPath} can't be checked against the archive: ${error instanceof Error ? error.message : String(error)}`,
+  );
+  if (refused) {
+    report.error = refused;
+    return finish(report, new ReportFile(undefined));
+  }
+  const reportFile = new ReportFile(reportPath);
   // A report from the start: a run killed outright still leaves one that says it failed.
   report.error = 'the sync did not finish';
   await reportFile.write(report);
@@ -338,6 +388,11 @@ async function main(): Promise<number> {
       await rm(ownWorkDir, { recursive: true, force: true });
     }
   }
+  return finish(report, reportFile);
+}
+
+/** Writes the final report (to --report, and stdout); returns the exit code. */
+async function finish(report: SyncReport, reportFile: ReportFile): Promise<number> {
   await reportFile.write(report);
   process.stdout.write(`${JSON.stringify(report)}\n`);
   if (report.error) {
