@@ -24,3 +24,32 @@ variable "grafana_token" {}
 
 variable "tigris_read_key_id" {}
 variable "tigris_read_access_key" {}
+
+# Bunny CDN analytics in the worker's cron (tiles/src/bunny-logs), bound in prod only (see workers.tf). All optional:
+# without the account API key and the pull zone id (from the Bunny unit's state, remote-state.tf) the log reader is
+# skipped, without the Globalping token and the public URL the probe is.
+variable "bunny_api_key" {
+  type      = string
+  sensitive = true
+  default   = ""
+}
+
+variable "globalping_token" {
+  type      = string
+  sensitive = true
+  default   = ""
+}
+
+# The Bunny-served origin the probe requests tiles from, e.g. https://tiles.immich.cloud once DNS points there (a test
+# hostname before). Set it in tiles.<env>.tfvars.json.
+variable "bunny_public_url" {
+  type    = string
+  default = ""
+}
+
+# Each probe run is 12 Globalping tests; every 10 minutes is 72 of the 500 free an hour. The worker never probes more
+# often than every 5.
+variable "bunny_probe_interval_minutes" {
+  type    = number
+  default = 10
+}
