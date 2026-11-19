@@ -663,6 +663,36 @@ describe('runSync', () => {
     expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', pending: [{ build: '20261118' }] });
   });
 
+  it('gates every static file on a retry, also those an earlier attempt wrote', async () => {
+    const w = await world({ replicationDelayMs: { UK: 5, NY: 10 } });
+    await adopted(w);
+    w.tiles.replicate();
+    // A first run stores the changed tiles, which replicate after it timed out.
+    expect((await runSync(w.options('20261118', { replicationTimeoutMs: 200 }), w.deps())).status).toBe('failed');
+    w.tiles.replicate();
+    const next = { publicUrl: 'https://tiles-next.example', replicationTimeoutMs: 300 };
+    // The second writes the new TileJSON and styles, which never reach SYD before its gate gives up.
+    const second = await runSync(w.options('20261118', next), w.deps());
+    expect(second).toMatchObject({ status: 'failed', staticUploaded: 3, replicationComplete: false });
+    expect(w.tiles.checksum('v1.json')).toBeDefined();
+    w.events.length = 0;
+
+    // The retry finds their bytes stored and writes nothing, but SYD still lacks them: no purge.
+    const retry = await runSync(w.options('20261118', next), w.deps());
+    expect(retry).toMatchObject({ status: 'failed', filesUploaded: 0, staticUploaded: 0, replicationComplete: false });
+    expect(retry.error).toMatch(/Replication of the TileJSON and styles incomplete.*e\.g\. v1\.json \(not in SYD\)/);
+    expect(w.events.filter((event) => event.startsWith('tiles PUT'))).toEqual([]);
+    expect(w.events).toContain('tiles DESCRIBE v1.json');
+    expect(w.purges).toBe(0);
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', pending: [{ build: '20261118' }] });
+
+    w.tiles.replicate();
+    const done = await runSync(w.options('20261118', next), w.deps());
+    expect(done).toMatchObject({ status: 'success', staticUploaded: 0, replicationComplete: true });
+    expect(w.purges).toBe(1);
+    expect(w.tiles.identicalReputs).toEqual([]);
+  });
+
   it('switches to a build seeded under another prefix with --adopt --replace, and syncs there after', async () => {
     const w = await world();
     await adopted(w);

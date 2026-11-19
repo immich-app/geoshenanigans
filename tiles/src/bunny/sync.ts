@@ -10,8 +10,9 @@
  *    the live one are planned too, even where the new build matches the live one, to put the live bytes back;
  * 5. wait until every replica region holds every changed file (the replication gate); a timeout fails the run and
  *    leaves the build pending, so the next run checks those files again instead of writing them;
- * 6. upload the TileJSON and styles whose bytes changed, purge the pull zone once, and make the build live in
- *    state.json (its manifest is stored first).
+ * 6. upload the TileJSON and styles whose bytes changed, wait until every replica region holds all of them (not just
+ *    the ones this run wrote: an earlier attempt may have written them and failed before its gate passed), purge the
+ *    pull zone once, and make the build live in state.json (its manifest is stored first).
  *
  * A run for the live build itself while state.json lists pending builds puts the live bytes back where they wrote
  * (step 4 without new bytes): that reverts a failed or cancelled sync.
@@ -556,10 +557,11 @@ class SyncRun {
       await this.step('replication', () => this.gate(tiles, written));
     }
 
-    const changedStatic = await this.step('static', () => this.uploadStatic(tiles, staticPrefix));
-    if (mode !== 'adopt' && changedStatic.length > 0) {
-      // The purge makes PoPs fetch them again, from the nearest replica: it must hold them first.
-      await this.step('replication', () => this.gateStatic(tiles, changedStatic));
+    const allStatic = await this.step('static', () => this.uploadStatic(tiles, staticPrefix));
+    if (mode !== 'adopt') {
+      // The purge makes PoPs fetch them again, from the nearest replica: it must hold them first. All of them, not
+      // only those this run wrote: a retry finds the bytes an attempt whose gate failed stored, and writes nothing.
+      await this.step('replication', () => this.gateStatic(tiles, allStatic));
     }
     await this.step('purge', async () => {
       await this.deps.purge!();
@@ -838,7 +840,7 @@ class SyncRun {
     }
   }
 
-  /** The changed TileJSON and styles, within what the tile gate left of the replication timeout (10 min at least). */
+  /** The TileJSON and styles, within what the tile gate left of the replication timeout (10 min at least). */
   private async gateStatic(tiles: BunnyStorage, files: StaticFile[]) {
     const { o } = this;
     const timeoutMs = Math.max(
@@ -950,7 +952,7 @@ class SyncRun {
 
   /**
    * The TileJSON and styles; only those whose bytes changed are written (identical re-PUTs break replication).
-   * Returns the ones written.
+   * Returns all of them, for the gate; the report counts the ones written.
    */
   private async uploadStatic(tiles: BunnyStorage, staticPrefix: string): Promise<StaticFile[]> {
     const { o, report } = this;
@@ -972,6 +974,6 @@ class SyncRun {
     }
     report.staticUploaded = uploaded.length;
     this.log(`static: ${uploaded.length} of ${files.length} files changed and uploaded`);
-    return uploaded;
+    return files;
   }
 }
