@@ -1,5 +1,6 @@
 import { ChildProcess, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { renameSync, utimesSync } from 'node:fs';
 import { copyFile, mkdir, readdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { createServer, Server } from 'node:http';
 import { join } from 'node:path';
@@ -950,6 +951,50 @@ describe('runSync', () => {
     expect(report.status).toBe('success');
     expectHolds(w, 'again');
     expect(w.tiles.identicalReputs).toEqual([]);
+  });
+
+  it.each(['manifest', 'diff', 'identity'] as const)(
+    'refuses a file put at the archive path at the %s step: its manifest, identity and uploads are of one file',
+    async (at) => {
+      const w = await world();
+      await adopted(w);
+      const before = await readState(w.state);
+      const archive = w.archives['20261118'].path;
+      // The same size, header and root directory, one tile byte flipped: only the whole-file hash tells it apart.
+      const other = join(w.dir, 'other.pmtiles');
+      await withOtherTileBytes(archive, other);
+      const report = await runSync(
+        w.options('20261118', { onStep: (step) => step === at && renameSync(other, archive) }),
+        w.deps(),
+      );
+      expect(report.status).toBe('failed');
+      expect(report.error).toMatch(/replaced or written to/);
+      expect(tilePuts(w)).toEqual([]);
+      expect(w.events).toEqual([]);
+      expect(await readState(w.state)).toEqual(before);
+      expect(w.purges).toBe(0);
+    },
+  );
+
+  it('neither purges nor makes a build live when its archive is written to while it uploads', async () => {
+    const w = await world();
+    await adopted(w);
+    const archive = w.archives['20261118'].path;
+    let written = false;
+    const report = await runSync(
+      w.options('20261118', {
+        // The tile gate, right after the uploads.
+        onStep: (step) =>
+          step === 'replication' && !written && ((written = true), utimesSync(archive, new Date(), new Date())),
+      }),
+      w.deps(),
+    );
+    expect(report.status).toBe('failed');
+    expect(report.error).toMatch(/was written to while it was read/);
+    expect(w.purges).toBe(0);
+    // No TileJSON or style written: the state's PUT is the pending record, from before the uploads.
+    expect(w.events.filter((event) => event.startsWith('tiles PUT') && event.endsWith('.json'))).toEqual([]);
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', pending: [{ build: '20261118' }] });
   });
 
   it('reverts a failed sync when the live build is synced again', async () => {

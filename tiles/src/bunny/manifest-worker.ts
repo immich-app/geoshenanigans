@@ -10,13 +10,16 @@
  *   earlier jobs) are left to the main thread, which resolves them from earlier jobs or its cache.
  */
 import { hash } from 'node:crypto';
-import { openSync, readSync } from 'node:fs';
+import { closeSync, openSync, readSync } from 'node:fs';
 import { parentPort, workerData } from 'node:worker_threads';
 import { gunzipSync } from 'node:zlib';
+import { checkOpened, FileSnapshot } from './archive-identity-worker';
 
 export interface WorkerInit {
   manifestWorker: true;
   path: string;
+  /** Given: the file to read (see FileSnapshot), which each thread checks it opened. */
+  source?: FileSnapshot;
   leafDirectoryOffset: number;
   tileDataOffset: number;
   internalCompression: number;
@@ -123,7 +126,7 @@ export function decompressDirectory(bytes: Uint8Array, compression: number): Uin
   throw new Error(`Unsupported directory compression ${compression}`);
 }
 
-function readFully(fd: number, buffer: Uint8Array, length: number, position: number) {
+export function readFully(fd: number, buffer: Uint8Array, length: number, position: number) {
   let done = 0;
   while (done < length) {
     const read = readSync(fd, buffer, done, length - done, position + done);
@@ -143,6 +146,14 @@ export class JobRunner {
   constructor(init: WorkerInit) {
     this.init = init;
     this.fd = openSync(init.path, 'r');
+    if (init.source !== undefined) {
+      try {
+        checkOpened(init.path, this.fd, init.source);
+      } catch (error) {
+        closeSync(this.fd);
+        throw error;
+      }
+    }
   }
 
   private decoded = new Map<number, { entries: EntryArrays; isChain: Uint8Array; end: number }>();

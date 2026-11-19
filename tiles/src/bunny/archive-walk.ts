@@ -44,6 +44,7 @@ export class ArchiveRanges {
     private read: RangeReader,
     private root: Entry[],
     private closeFile: () => Promise<void>,
+    private statFile: () => Promise<FileSnapshot>,
   ) {}
 
   /**
@@ -80,7 +81,17 @@ export class ArchiveRanges {
         .update(new Uint8Array(rootBytes))
         .update(String(size))
         .digest('hex');
-      return new ArchiveRanges(archive, path, size, legacyFingerprint, opened, read, root, () => file.close());
+      return new ArchiveRanges(
+        archive,
+        path,
+        size,
+        legacyFingerprint,
+        opened,
+        read,
+        root,
+        () => file.close(),
+        async () => fileSnapshot(await file.stat({ bigint: true })),
+      );
     } catch (error) {
       await file.close();
       throw new Error(`${path}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
@@ -117,6 +128,13 @@ export class ArchiveRanges {
       entries = await this.leaf(entry);
     }
     throw new Error('Directory nesting too deep');
+  }
+
+  /** Throws if the file this reads was written to since it was opened (see FileSnapshot). */
+  async checkUnchanged(): Promise<void> {
+    if ((await this.statFile()) !== this.source) {
+      throw new Error(`${this.path} was written to while it was read`);
+    }
   }
 
   close(): Promise<void> {

@@ -22,9 +22,10 @@ import { pipeline } from 'node:stream/promises';
 import { URL } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import { constants, createZstdCompress, createZstdDecompress } from 'node:zlib';
-import { openArchiveFile } from '../deploy/archive-file';
+import { Archive } from '../deploy/archive';
 import { parseDeploymentKey } from '../deploy/config';
 import { Metadata } from '../pmtiles/types';
+import { checkOpened, FileSnapshot, fileSnapshot } from './archive-identity-worker';
 import {
   decodeDirectory,
   decompressDirectory,
@@ -33,6 +34,7 @@ import {
   JobPlan,
   JobResult,
   JobSpec,
+  readFully,
   WorkerInit,
   WorkerReply,
   WorkerRequest,
@@ -509,6 +511,12 @@ export interface BuildManifestOptions {
   cacheEntries?: number;
   level?: number;
   onProgress?: (progress: ManifestProgress) => void;
+  /**
+   * The file to read, as ArchiveRanges or identifyArchive saw it (see FileSnapshot): every descriptor that reads the
+   * archive, on any thread, must be open on that file, and the path must still name it, unchanged, once all is read.
+   * Ties the manifest to the file a sync's identity and uploads are of.
+   */
+  source?: FileSnapshot;
 }
 
 export interface ManifestProgress {
@@ -738,14 +746,21 @@ async function refuseArchiveAsOutput(archivePath: string, out: string): Promise<
 export async function buildManifest(archivePath: string, options: BuildManifestOptions): Promise<ManifestBuildStats> {
   const started = performance.now();
   await refuseArchiveAsOutput(archivePath, options.out);
-  const { archive, close } = await openArchiveFile(archivePath);
-  const { header, metadata } = archive;
-  await close();
-
   const fd = openSync(archivePath, 'r');
   let pool: HashPool | undefined;
   let writer: ManifestWriter | undefined;
   try {
+    if (options.source !== undefined) {
+      checkOpened(archivePath, fd, options.source);
+    }
+    // The header from the descriptor the rest is read from, so all of it is of one file.
+    const { header, metadata } = await Archive.open(async (position, length) => {
+      const buffer = Buffer.allocUnsafe(length);
+      readFully(fd, buffer, length, position);
+      return buffer.buffer.slice(buffer.byteOffset, buffer.byteOffset + length) as ArrayBuffer;
+    }).catch((error: unknown) => {
+      throw new Error(`${archivePath}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+    });
     const rootBytes = Buffer.allocUnsafe(header.rootDirectoryLength);
     if (readSync(fd, rootBytes, 0, rootBytes.length, header.rootDirectoryOffset) !== rootBytes.length) {
       throw new Error(`${archivePath}: short read of the root directory`);
@@ -762,6 +777,7 @@ export async function buildManifest(archivePath: string, options: BuildManifestO
     pool = new HashPool(threads, {
       manifestWorker: true,
       path: archivePath,
+      source: options.source,
       leafDirectoryOffset: header.leafDirectoryOffset,
       tileDataOffset: header.tileDataOffset,
       internalCompression: header.internalCompression,
@@ -818,6 +834,9 @@ export async function buildManifest(archivePath: string, options: BuildManifestO
       });
     }
 
+    if (options.source !== undefined && fileSnapshot(await stat(archivePath, { bigint: true })) !== options.source) {
+      throw new Error(`${archivePath} was replaced or written to while its manifest was built`);
+    }
     const manifestHeader = await writer.finish();
     writer = undefined;
     return {

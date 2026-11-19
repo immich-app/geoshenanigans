@@ -10,8 +10,8 @@
  * fingerprint is never taken as an identity on its own (see checkSeeds in sync.ts).
  */
 import { createHash } from 'node:crypto';
-import { closeSync, createReadStream, openSync } from 'node:fs';
-import { stat } from 'node:fs/promises';
+import { closeSync, openSync } from 'node:fs';
+import { open, stat } from 'node:fs/promises';
 import { availableParallelism } from 'node:os';
 import { pipeline } from 'node:stream/promises';
 import { URL } from 'node:url';
@@ -153,11 +153,25 @@ function workerExecArgv(): string[] {
     : [...process.execArgv, '--import', 'tsx'];
 }
 
-/** The MD5 of the whole file, base64 as builds.json gives it. */
-export async function fileMd5Base64(path: string, signal?: AbortSignal): Promise<string> {
-  const hash = createHash('md5');
-  await pipeline(createReadStream(path, { highWaterMark: 8 * 2 ** 20 }), hash, { signal });
-  return hash.digest('base64');
+/**
+ * The MD5 of the whole file, base64 as builds.json gives it. Given `source` (from identifyArchive), only of that file,
+ * unchanged: the one the identity is of.
+ */
+export async function fileMd5Base64(path: string, signal?: AbortSignal, source?: FileSnapshot): Promise<string> {
+  const file = await open(path);
+  try {
+    if (source !== undefined) {
+      checkOpened(path, file.fd, source);
+    }
+    const hash = createHash('md5');
+    await pipeline(file.createReadStream({ highWaterMark: 8 * 2 ** 20, autoClose: false }), hash, { signal });
+    if (source !== undefined) {
+      checkOpened(path, file.fd, source);
+    }
+    return hash.digest('base64');
+  } finally {
+    await file.close();
+  }
 }
 
 /** A base64 MD5 as builds.json gives it (16 bytes); throws on anything else. */

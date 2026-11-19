@@ -1,8 +1,10 @@
 import { createHash } from 'node:crypto';
-import { link, readdir, readFile, symlink, writeFile } from 'node:fs/promises';
+import { utimesSync } from 'node:fs';
+import { copyFile, link, readdir, readFile, rename, stat, symlink, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { gzipSync } from 'node:zlib';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { fileSnapshot } from '../../src/bunny/archive-identity';
 import {
   buildManifest,
   decodeHeaderFrame,
@@ -13,7 +15,7 @@ import {
   readManifestHeader,
   writeManifest,
 } from '../../src/bunny/manifest';
-import { decodeDirectory } from '../../src/bunny/manifest-worker';
+import { decodeDirectory, JobRunner } from '../../src/bunny/manifest-worker';
 import { MAX_SAFE_ZOOM, zoomEnd } from '../../src/bunny/tile-id';
 import { openArchiveFile } from '../../src/deploy/archive-file';
 import {
@@ -250,6 +252,42 @@ describe('buildManifest', () => {
     await writeFile(out, 'stale');
     await buildManifest(archivePath, { out, buildKey: '20261118', threads: 1 });
     expect((await readManifestHeader(out)).buildKey).toBe('20261118');
+  });
+
+  it('reads only the file of the snapshot it was given, on every thread, still at the path once all is read', async () => {
+    const archivePath = scratch.path('a.pmtiles');
+    await writeArchiveFile(archivePath, randomBuild(rng(7), 2000), rng(7), { maxLeafEntries: 5 });
+    const source = fileSnapshot(await stat(archivePath, { bigint: true }));
+    const options = { buildKey: '20261118', threads: 3, leavesPerJob: 1 };
+    const bound = scratch.path('bound.tman.zst');
+    const plain = scratch.path('plain.tman.zst');
+    await buildManifest(archivePath, { ...options, out: bound, source });
+    await buildManifest(archivePath, { ...options, out: plain });
+    expect(await collect(bound)).toEqual(await collect(plain));
+    // Each hashing thread checks the file it opened too.
+    const init = { manifestWorker: true, path: archivePath, leafDirectoryOffset: 0, tileDataOffset: 0 } as const;
+    expect(() => new JobRunner({ ...init, internalCompression: 2, source: 'another file' })).toThrow(
+      /replaced or written to/,
+    );
+
+    // Written to while it is read: the path no longer names the file as it was.
+    await expect(
+      buildManifest(archivePath, {
+        ...options,
+        out: scratch.path('written.tman.zst'),
+        source,
+        onProgress: () => utimesSync(archivePath, new Date(), new Date()),
+      }),
+    ).rejects.toThrow(/replaced or written to while its manifest was built/);
+    // Another file put at the path: the same bytes, but not the file the snapshot is of.
+    const copy = scratch.path('copy.pmtiles');
+    await copyFile(archivePath, copy);
+    const now = fileSnapshot(await stat(archivePath, { bigint: true }));
+    await rename(copy, archivePath);
+    await expect(
+      buildManifest(archivePath, { ...options, out: scratch.path('replaced.tman.zst'), source: now }),
+    ).rejects.toThrow(/replaced or written to/);
+    expect((await readdir(scratch.dir)).sort()).toEqual(['a.pmtiles', 'bound.tman.zst', 'plain.tman.zst']);
   });
 
   it('rejects a build key that is not a date', async () => {

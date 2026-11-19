@@ -40,7 +40,7 @@
  */
 import { lstat, mkdir, mkdtemp, readFile, rm, stat } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
-import { ArchiveIdentity, archiveIdentity, fileMd5Base64 } from './archive-identity';
+import { ArchiveIdentity, fileMd5Base64, identifyArchive } from './archive-identity';
 import { ArchiveRanges, TileRun } from './archive-walk';
 import { diffManifests, DiffRange, DiffTotals, planSync, SyncRange } from './diff';
 import { buildManifest, clipManifest, manifestBatches, ManifestHeader, readManifestHeader } from './manifest';
@@ -548,6 +548,9 @@ class SyncRun {
       );
     }
 
+    // Opened first: the manifest, the identity and every tile and file uploaded are read from this file (its source),
+    // so a file put at the path during the run can't be recorded under another's manifest or identity.
+    this.archive = await ArchiveRanges.open(o.archive);
     // The new build's manifest, cut to the zoom range.
     const { manifest, header } = await this.step('manifest', () => this.buildManifest());
     report.positionsTotal = header.positions;
@@ -581,7 +584,6 @@ class SyncRun {
       return;
     }
     const tiles = this.deps.tiles!;
-    this.archive = await ArchiveRanges.open(o.archive);
     // Before anything is written: the state records it, and --adopt compares it with the seed's.
     await this.step('identity', () => this.identify());
 
@@ -612,6 +614,9 @@ class SyncRun {
     // The purge makes PoPs fetch them again, from the nearest replica: it must hold them first. All of them, not only
     // those this run wrote: a retry finds the bytes an attempt whose gate failed stored, and writes nothing. An
     // adoption too: the seed's check covers the tiles only.
+    // The last read of the archive is behind: what was uploaded (or sampled) came from the file the identity is of, and
+    // it must not have been written to meanwhile, or nothing of this build is served or recorded.
+    await this.archive.checkUnchanged();
     const allStatic = await this.step('static', () => this.uploadStatic(tiles, staticPrefix));
     await this.step('replication', () => this.gateStatic(tiles, allStatic));
     await this.step('purge', async () => {
@@ -660,6 +665,7 @@ class SyncRun {
       out: full,
       buildKey: o.build,
       threads: o.threads,
+      source: this.archive!.source,
       onProgress: (progress) => {
         const now = performance.now();
         if (now - last >= o.progressIntervalMs) {
@@ -1004,21 +1010,29 @@ class SyncRun {
     this.log(`adopt: ${ranges.length} seed state dir(s) say every tile of the build (in ${coverage}) completed`);
   }
 
-  /** Hashes the archive (and, given archiveMd5, checks its MD5 at the same time). */
+  /**
+   * Hashes the archive (and, given archiveMd5, checks its MD5 at the same time): the file the manifest was built from
+   * and the uploads read, unchanged, or the run stops.
+   */
   private async identify() {
     const { o } = this;
+    const { source } = this.archive!;
     // The MD5 pass reads the whole file on its own: stop it if the identity fails.
     const controller = new AbortController();
-    const [identity, md5] = await Promise.all([
-      archiveIdentity(o.archive, { threads: o.threads }),
-      o.archiveMd5 === undefined ? undefined : fileMd5Base64(o.archive, controller.signal),
+    const [identified, md5] = await Promise.all([
+      identifyArchive(o.archive, { threads: o.threads }),
+      o.archiveMd5 === undefined ? undefined : fileMd5Base64(o.archive, controller.signal, source),
     ]).catch((error: unknown) => {
       controller.abort();
       throw error;
     });
-    if (identity.size !== this.archive!.size) {
-      throw new Error(`${o.archive} changed while it was read`);
+    if (identified.source !== source) {
+      throw new Error(
+        `${o.archive} was replaced or written to since this run opened it: its manifest and uploads are of the ` +
+          'file it opened, not of the one there now',
+      );
     }
+    const { identity } = identified;
     if (md5 !== undefined && md5 !== o.archiveMd5) {
       throw new Error(`${o.archive} has MD5 ${md5}, not the ${o.archiveMd5} given with --archive-md5`);
     }

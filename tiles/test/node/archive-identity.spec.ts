@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { closeSync, futimesSync, openSync } from 'node:fs';
-import { readFile, rename, stat, writeFile } from 'node:fs/promises';
+import { copyFile, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
@@ -130,6 +130,22 @@ describe('fileMd5Base64', () => {
     expect(await fileMd5Base64(path)).toBe(createHash('md5').update(bytes).digest('base64'));
     // bunny:sync stops the pass when the identity beside it fails.
     await expect(fileMd5Base64(path, AbortSignal.abort())).rejects.toThrow(/abort/i);
+  });
+
+  it('hashes only the file the identity is of, given its snapshot', async () => {
+    const dir = await scratch();
+    const fixture = await writeFixtureArchive(dir, 2_000);
+    const { source } = await identifyArchive(fixture.path);
+    const md5 = createHash('md5')
+      .update(await readFile(fixture.path))
+      .digest('base64');
+    expect(await fileMd5Base64(fixture.path, undefined, source)).toBe(md5);
+    // The same bytes in another file at the path: not the file the identity was computed from.
+    const copy = join(dir, 'copy.pmtiles');
+    await copyFile(fixture.path, copy);
+    await rename(copy, fixture.path);
+    await expect(fileMd5Base64(fixture.path, undefined, source)).rejects.toThrow(/replaced or written to/);
+    expect(await fileMd5Base64(fixture.path)).toBe(md5);
   });
 
   it('takes only a base64 MD5', () => {
