@@ -244,6 +244,33 @@ function expectHolds(w: World, key: string, prefix = 'v1', end = POSITIONS) {
   }
 }
 
+/**
+ * A gate timeout for runs whose gate must pass over thousands of files: the timeout bounds the whole gate, first pass
+ * included, so a short one fails on a slow runner whatever the zone holds. What ends such a gate is its files
+ * replicating, on their own or when the test replicates them (afterGatePass). Below vitest's 30 s, so a gate that
+ * never completes fails the test's own assertions.
+ */
+const GATE_TIMEOUT_MS = 20_000;
+
+/**
+ * The timeout of runs whose tile gate must pass, over a few hundred stored tiles, and whose static gate must then time
+ * out (the timeout bounds each): a pass that size fits on a loaded runner with room to spare.
+ */
+const STATIC_TIMEOUT_MS = 1_000;
+
+/**
+ * A `log` that calls `then` once, when the tile gate has finished pass `pass`, with the files it left pending and the
+ * regions they lacked ("UK 3, SYD 12", or "none"), as its log line gives them.
+ */
+function afterGatePass(pass: number, then: (pending: number, lacking: string) => void) {
+  return (line: string) => {
+    const match = /^replication pass (\d+) at [\d.]+ s: (\d+) files pending \((.*)\)$/.exec(line);
+    if (match && Number(match[1]) === pass) {
+      then(Number(match[2]), match[3]);
+    }
+  };
+}
+
 function lastIndex<T>(items: T[], test: (item: T) => boolean): number {
   for (let i = items.length - 1; i >= 0; i--) {
     if (test(items[i])) {
@@ -840,26 +867,35 @@ describe('runSync', () => {
     for (let id = 0; id < POSITIONS; id += 2) {
       w.tiles.seed(tilePath('v1', id), contentBytes(build.contents[id]!));
     }
-    const first = await runSync(w.options('20261118', { forceFull: true, replicationTimeoutMs: 300 }), w.deps());
-    expect(first).toMatchObject({
-      status: 'failed',
+    const stored = Math.ceil(POSITIONS / 2);
+    // Without a state all of it goes live at once: the files it found stored must replicate as well. What it writes
+    // reaches every region within 20 ms, before the gate's second pass begins, so that pass leaves exactly the stored
+    // files pending; only then do they replicate.
+    const waited: string[] = [];
+    const log = afterGatePass(2, (pending, lacking) => {
+      waited.push(`${pending} pending (${lacking})`);
+      w.tiles.replicate();
+      w.events.push('replicated');
+    });
+    const report = await runSync(
+      w.options('20261118', { forceFull: true, replicationTimeoutMs: GATE_TIMEOUT_MS, log }),
+      w.deps(),
+    );
+    expect(report.error).toBeNull();
+    expect(report).toMatchObject({
+      status: 'success',
       mode: 'force-full',
       positionsVerified: POSITIONS,
-      filesSkipped: Math.ceil(POSITIONS / 2),
-      filesUploaded: Math.floor(POSITIONS / 2),
+      filesSkipped: stored,
+      filesUploaded: POSITIONS - stored,
+      filesDeleted: 0,
       positionsChanged: null,
-      // Without a state all of it goes live at once: the files it found stored must replicate as well.
-      replicationComplete: false,
-      replicationIncomplete: Math.ceil(POSITIONS / 2),
-      purged: false,
+      replicationComplete: true,
+      replicationIncomplete: 0,
+      purged: true,
     });
-    expect(first.error).toMatch(/Replication of the tiles incomplete/);
-    expect(await readState(w.state)).toBeNull();
-
-    w.tiles.replicate();
-    const report = await runSync(w.options('20261118', { forceFull: true }), w.deps());
-    expect(report.error).toBeNull();
-    expect(report).toMatchObject({ status: 'success', filesSkipped: POSITIONS, filesUploaded: 0, purged: true });
+    expect(waited).toEqual([`${stored} pending (UK ${stored}, NY ${stored}, SYD ${stored})`]);
+    expect(w.events.indexOf('purge')).toBeGreaterThan(w.events.indexOf('replicated'));
     expect(w.tiles.identicalReputs).toEqual([]);
     expectHolds(w, '20261118');
     expect(await readState(w.state)).toMatchObject({ liveBuild: '20261118', pending: [] });
@@ -870,24 +906,37 @@ describe('runSync', () => {
     await adopted(w);
     w.tiles.replicate();
     const changed = changedPositions(w, '20261117', '20261118');
-    const options = w.options('20261118', { forceFull: true, replicationTimeoutMs: 300 });
-    // The first attempt gates only what it writes (the rest of the zone is the live build's), and SYD never has it.
-    const first = await runSync(options, w.deps());
+    // The first attempt gates only what it writes (the rest of the zone is the live build's), and SYD never has it:
+    // every file of its gate lacks SYD, whether or not a pass reached it before the timeout.
+    const first = await runSync(w.options('20261118', { forceFull: true, replicationTimeoutMs: 300 }), w.deps());
     expect(first).toMatchObject({ status: 'failed', filesUploaded: changed.length, replicationComplete: false });
     expect(first.replicationIncomplete).toBe(changed.length);
+    expect(first.error).toMatch(/Replication of the tiles incomplete.*SYD/);
     expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', pending: [{ build: '20261118' }] });
 
-    // The retry finds those files stored and writes nothing, but SYD still lacks them: no purge.
-    const retry = await runSync(options, w.deps());
-    expect(retry).toMatchObject({ status: 'failed', filesUploaded: 0, filesSkipped: POSITIONS, purged: false });
-    expect(retry).toMatchObject({ replicationComplete: false, replicationIncomplete: changed.length });
-    expect(retry.error).toMatch(/Replication of the tiles incomplete.*SYD/);
-    expect(w.purges).toBe(0);
-
-    w.tiles.replicate();
-    const done = await runSync(w.options('20261118', { forceFull: true }), w.deps());
-    expect(done.error).toBeNull();
-    expect(done).toMatchObject({ status: 'success', filesUploaded: 0, purged: true });
+    // The retry finds those files stored and writes nothing, but gates every position: its first pass leaves exactly
+    // the files the attempt wrote pending, for SYD only, and it purges only once SYD has them.
+    const waited: string[] = [];
+    const log = afterGatePass(1, (pending, lacking) => {
+      waited.push(`${pending} pending (${lacking})`);
+      w.tiles.replicate();
+      w.events.push('replicated');
+    });
+    const retry = await runSync(
+      w.options('20261118', { forceFull: true, replicationTimeoutMs: GATE_TIMEOUT_MS, log }),
+      w.deps(),
+    );
+    expect(retry.error).toBeNull();
+    expect(retry).toMatchObject({
+      status: 'success',
+      filesUploaded: 0,
+      filesSkipped: POSITIONS,
+      positionsVerified: POSITIONS,
+      replicationComplete: true,
+      purged: true,
+    });
+    expect(waited).toEqual([`${changed.length} pending (SYD ${changed.length})`]);
+    expect(w.events.indexOf('purge')).toBeGreaterThan(w.events.indexOf('replicated'));
     expect(w.purges).toBe(1);
     expect(tilePuts(w)).toHaveLength(changed.length);
     expect(w.tiles.identicalReputs).toEqual([]);
@@ -1053,8 +1102,9 @@ describe('runSync', () => {
     w.tiles.replicate();
     w.events.length = 0;
 
+    // Its tile gate must pass, first pass and all, before the timeout that ends both gates (see STATIC_TIMEOUT_MS).
     const report = await runSync(
-      w.options('20261118', { publicUrl: 'https://tiles-next.example', replicationTimeoutMs: 300 }),
+      w.options('20261118', { publicUrl: 'https://tiles-next.example', replicationTimeoutMs: STATIC_TIMEOUT_MS }),
       w.deps(),
     );
     expect(report).toMatchObject({ status: 'failed', filesUploaded: 0, staticUploaded: 3, replicationComplete: false });
@@ -1131,7 +1181,8 @@ describe('runSync', () => {
     // A first run stores the changed tiles, which replicate after it timed out.
     expect((await runSync(w.options('20261118', { replicationTimeoutMs: 200 }), w.deps())).status).toBe('failed');
     w.tiles.replicate();
-    const next = { publicUrl: 'https://tiles-next.example', replicationTimeoutMs: 300 };
+    // Each run's tile gate must pass within the timeout, first pass and all (see STATIC_TIMEOUT_MS).
+    const next = { publicUrl: 'https://tiles-next.example', replicationTimeoutMs: STATIC_TIMEOUT_MS };
     // The second writes the new TileJSON and styles, which never reach SYD before its gate gives up.
     const second = await runSync(w.options('20261118', next), w.deps());
     expect(second).toMatchObject({ status: 'failed', staticUploaded: 3, replicationComplete: false });
