@@ -1327,6 +1327,22 @@ fn a_decode_killed_once_its_members_were_in_leaves_its_dir_marked_and_they_stay(
     assert_eq!(tree(dir.path()), tree(want.path()));
 }
 
+#[cfg(unix)]
+#[test]
+fn a_decode_that_fails_leaves_the_dir_as_it_was_once_it_finished_what_killed_decodes_left() {
+    // A pois decode killed once a member went in over an older build's file left its dir; a
+    // places unit cut short into the dir fails, and the dir is as that decode undone leaves it.
+    let (unit, members, dir) = published_places();
+    let (_, _, want) = published_places();
+    put_tree(dir.path(), &[(".transport.9.0/.earlier.poi_records.bin", b"an older build's records"), ("poi_records.bin", b"a member"), ("poi_vertices.bin", b"an older build's vertices")]);
+
+    let cut = decode_into_dir(&unit[..unit.len() - 9], dir.path(), Some(&expected(&members)));
+
+    assert!(cut.is_err());
+    put_tree(want.path(), OLDER_POIS);
+    assert_eq!(tree(dir.path()), tree(want.path()));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dir_the_decode_cant_open_fails_the_decode() {

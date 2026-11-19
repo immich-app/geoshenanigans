@@ -187,10 +187,11 @@ const QUEUED_CHUNKS: usize = 8;
 /// It decodes on a thread of its own, holding a few chunks, the zstd window and one chunk of the
 /// unit's columns, and writes the files in a dir of its own in the dataset dir; once the whole
 /// unit decoded and every file is of its sha256, it moves them all into place and `finish`
-/// resolves. A unit that fails (cut short, refused, a file of another sha256, one that can't go
-/// in place) leaves the dir as it was; a download that broke off should still `finish`, which
-/// then rejects. Decoders of one unit into a dir at once each put complete files in place, and
-/// one first finishes what decoders killed there left (transport::decode_into_dir).
+/// resolves. A decoder first finishes what decoders killed in the dir left, and a unit that fails
+/// (cut short, refused, a file of another sha256, one that can't go in place) leaves the dir as
+/// it was once those were finished; a download that broke off should still `finish`, which then
+/// rejects. Decoders of one unit into a dir at once each put complete files in place
+/// (transport::decode_into_dir).
 #[napi]
 pub struct TransportDecoder {
     /// The channel to the decode, here between writes; a write holds it until it settles.

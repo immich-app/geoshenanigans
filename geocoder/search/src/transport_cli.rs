@@ -6,7 +6,7 @@
 //!   decodes a unit (zstd-compressed; - reads it from stdin) into its members in <dir>, each
 //!   written in a hidden dir of the decode's own there and all moved into place once the whole
 //!   unit has decoded, once it has finished what decodes killed there left; on an error <dir>
-//!   is as it was (transport::decode_into_dir).
+//!   is as it was once those were finished (transport::decode_into_dir).
 //! geocoder-transport verify <unit.tt.zst | -> <dir>
 //!   decodes a unit and compares each member with the file of its name in <dir>, writing nothing
 //!   there (a places unit's block table goes to a scratch file in the temp dir while it runs).

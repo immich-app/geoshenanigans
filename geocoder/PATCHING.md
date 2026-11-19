@@ -120,9 +120,10 @@ dataset dir (`.transport.<pid>.<n>`) and moves them into place once the whole
 unit has decoded and, but for the CLI's `decode`, which checks no hash, every
 file's sha256 is the one `files` gives; the files they replace go into that
 dir first and are removed once all are in. On any error the dataset dir is
-as it was: the files moved in so far are taken out again and the ones they
-replaced put back. Two decodes of one unit into a dir at once each put
-complete files in place. So a download needs the largest unit's files' size
+as it was once the decode finished what killed decodes left there (below):
+the files moved in so far are taken out again and the ones they replaced put
+back. Two decodes of one unit into a dir at once each put complete files in
+place. So a download needs the largest unit's files' size
 free beside the dataset (planet `poi/all`: 1.16 GB), and a unit that fails is
 fetched again whole. Decoding holds the zstd window (8 MiB)
 and one chunk of the unit's columns (1 MiB, more only for a single polygon or
