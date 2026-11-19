@@ -1060,21 +1060,21 @@ mod tests {
     #[test]
     fn records_that_do_not_read_kept_by_a_cut_back_hide_no_context_match() {
         let mut g = crate::fixture::Geo::default();
-        // Under "olde mill", best first: one POI of the most importance; half as many as the
-        // context checks ("the next"); then the rest of the pending candidates and one more, the
-        // first half of them of more importance than the second. The cut-back the last of them
-        // brings on keeps the one, the next and some of the first half, and drops the second.
-        // Then under "old mil", "old milk" and "old mills" POIs of three names each, every name of
-        // which scores above the next, as many names as half the pending candidates less one: no
-        // cut-back follows. Last, under "old mila", one in the boundary "B" of the least
-        // importance. The rows of the first half are made not to read.
+        // Under "olde mill", best first: one POI of the most importance and "the next", as many
+        // as the context checks with it; then the rest of the pending candidates and one more,
+        // "the first" of more importance than "the last". The cut-back the last of them brings
+        // on keeps the one, the next and some of the first, and drops the last. Then under "old
+        // mil", "old milk" and "old mills" POIs of three names each, every name of which scores
+        // above the next, as many names as half the pending candidates less one: no cut-back
+        // follows. Last, under "old mila", one in the boundary "B" of the least importance. The
+        // rows of the first are made not to read.
         g.boundary("B", 8, [10.0, 20.0, 10.2, 20.2]);
         let lead = g.poi("Olde Mill", -30.0, -60.0, 255) | POI_BIT;
         let at = |k: usize| (-1.0 - (k / 100) as f32, -170.0 + (k % 100) as f32 * 3.4);
-        let (n_next, half) = (MAX_CONTEXT_CHECKS / 2, (MAX_PENDING_CANDIDATES - MAX_CONTEXT_CHECKS / 2) / 2);
+        let (n_next, n_first) = (MAX_CONTEXT_CHECKS - 1, MAX_PENDING_CANDIDATES * 7 / 16);
         let next: Vec<u32> = (0..n_next).map(|k| g.poi("Olde Mill", at(k).0, at(k).1, 31)).collect();
-        let first_half: Vec<u32> = (n_next..n_next + half).map(|k| g.poi("Olde Mill", at(k).0, at(k).1, 15)).collect();
-        for k in n_next + half..n_next + 2 * half {
+        let first: Vec<u32> = (n_next..n_next + n_first).map(|k| g.poi("Olde Mill", at(k).0, at(k).1, 15)).collect();
+        for k in n_next + n_first..MAX_PENDING_CANDIDATES {
             g.poi("Olde Mill", at(k).0, at(k).1, 7);
         }
         let three_named: Vec<u32> = (0..(MAX_PENDING_CANDIDATES as u32 / 2 - 1) / 3)
@@ -1082,18 +1082,15 @@ mod tests {
             .collect();
         let inside = g.poi("Old Mila", 10.1, 20.1, 3) | POI_BIT;
         let names = three_named.len() * 3;
-        assert!(1 + next.len() + 2 * half == MAX_PENDING_CANDIDATES + 1 && 1 + next.len() < MAX_PENDING_CANDIDATES / 2);
-        assert!(MAX_PENDING_CANDIDATES / 2 + names + 1 <= MAX_PENDING_CANDIDATES);
-        // The one, the three-named and the next are more than the context checks. A search
-        // that leaves the first half out cuts back once it has read as many names of the
-        // three-named as that half has POIs, and keeps fewer of the next than the checks have left.
-        assert!(1 + three_named.len() + next.len() > MAX_CONTEXT_CHECKS);
-        assert!(half < names && 1 + three_named.len() + (MAX_PENDING_CANDIDATES / 2 - 1 - half) < MAX_CONTEXT_CHECKS);
+        assert!(1 + next.len() == MAX_CONTEXT_CHECKS && MAX_PENDING_CANDIDATES / 2 + names + 1 <= MAX_PENDING_CANDIDATES);
+        // A search that leaves the first out cuts back once it has read as many names of the
+        // three-named as the first are, and keeps fewer of the next than the checks have left.
+        assert!(n_first < names && 1 + three_named.len() + (MAX_PENDING_CANDIDATES / 2 - 1 - n_first) < MAX_CONTEXT_CHECKS);
 
-        let [built, damaged, read_first] = old_mill_in_b(&g, &three_named, &first_half);
+        let [built, damaged, read_first] = old_mill_in_b(&g, &three_named, &first);
 
-        // While the first half reads, the context checks run out among the next: every result
-        // misses the context.
+        // While the first read, the context checks run out among the next: every result misses
+        // the context.
         assert_eq!(built, [lead, three_named[0] | POI_BIT]);
         assert_eq!(damaged, [inside, lead]);
         assert_eq!(damaged, read_first);
