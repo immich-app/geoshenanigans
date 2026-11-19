@@ -5,13 +5,54 @@
  *
  * Prints the totals (per kind and per zoom) as JSON on stdout. --pending plans a sync instead (planSync): the
  * manifests of builds state.json lists as pending, whose positions are marked for checking first. --ranges also
- * writes every range, one {"start","count","kind"} object per line (plus "verify" when planning).
+ * writes every range, one {"start","count","kind"} object per line (plus "verify" when planning), to a file of its
+ * own beside it that replaces --ranges only once complete; --ranges must not be one of the manifests.
  */
-import { once } from 'node:events';
+import { randomBytes } from 'node:crypto';
 import { createWriteStream } from 'node:fs';
-import { finished } from 'node:stream/promises';
+import { rename, rm, stat } from 'node:fs/promises';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { parseArgs } from 'node:util';
-import { DiffTotals, planSync } from '../diff';
+import { DiffTotals, planSync, SyncPlan } from '../diff';
+
+/** Lines are handed to the file in chunks of about this many characters. */
+const CHUNK_CHARS = 1 << 16;
+
+/** Refuses an output path that names one of the inputs, also through a hard or symbolic link. */
+async function refuseInput(out: string, inputs: string[]) {
+  const target = await stat(out).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') {
+      return undefined;
+    }
+    throw error;
+  });
+  if (!target) {
+    return;
+  }
+  for (const input of inputs) {
+    const { dev, ino } = await stat(input);
+    if (dev === target.dev && ino === target.ino) {
+      throw new Error(`--ranges ${out} is the manifest ${input}: writing it would destroy the input`);
+    }
+  }
+}
+
+/** The plan's ranges as NDJSON, a chunk of lines at a time. */
+async function* rangeLines(plan: SyncPlan, planning: boolean): AsyncGenerator<string> {
+  let chunk = '';
+  for await (const range of plan) {
+    const line = planning ? range : { start: range.start, count: range.count, kind: range.kind };
+    chunk += `${JSON.stringify(line)}\n`;
+    if (chunk.length >= CHUNK_CHARS) {
+      yield chunk;
+      chunk = '';
+    }
+  }
+  if (chunk) {
+    yield chunk;
+  }
+}
 
 async function main() {
   const { values } = parseArgs({
@@ -28,17 +69,24 @@ async function main() {
   }
   const started = performance.now();
   const planning = values.pending.length > 0;
-  const plan = await planSync(values.old, values.new, values.pending);
-  const out = values.ranges ? createWriteStream(values.ranges) : undefined;
-  for await (const range of plan) {
-    const line = planning ? range : { start: range.start, count: range.count, kind: range.kind };
-    if (out && !out.write(`${JSON.stringify(line)}\n`)) {
-      await once(out, 'drain');
-    }
+  if (values.ranges) {
+    await refuseInput(values.ranges, [values.old, values.new, ...values.pending]);
   }
-  if (out) {
-    out.end();
-    await finished(out);
+  const plan = await planSync(values.old, values.new, values.pending);
+  if (values.ranges) {
+    const partial = `${values.ranges}.${process.pid}-${randomBytes(6).toString('hex')}.partial`;
+    try {
+      await pipeline(Readable.from(rangeLines(plan, planning)), createWriteStream(partial, { flags: 'wx' }));
+      await rename(partial, values.ranges);
+    } catch (error) {
+      await rm(partial, { force: true });
+      throw error;
+    }
+  } else {
+    // No --ranges: the plan only runs for its totals.
+    for await (const range of plan) {
+      void range;
+    }
   }
   const totals: DiffTotals = plan.totals.diff;
   const changedFraction = (totals.changed + totals.added + totals.removed) / Math.max(1, totals.positionsNew);

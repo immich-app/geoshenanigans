@@ -10,6 +10,8 @@
  *   bytes of the SHA-256 of the tile bytes as stored in the archive (gzip MVT). Adjacent archive entries with the same
  *   bytes are merged, so the manifest depends only on what each position holds, not on how the archive was laid out;
  * - an end marker (gap 0, run length 0), so a truncated file never reads as a shorter build.
+ * Tile IDs end with zoom 26 (MAX_SAFE_ZOOM, the last whose IDs are exact doubles): the reader refuses positions past
+ * it, whatever reads them.
  */
 import { hash, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
@@ -35,6 +37,7 @@ import {
   WorkerReply,
   WorkerRequest,
 } from './manifest-worker';
+import { MAX_SAFE_ZOOM, zoomEnd } from './tile-id';
 
 const SKIPPABLE_FRAME_MAGIC = 0x184d2a5b;
 const HEADER_SLOT_BYTES = 1024;
@@ -45,6 +48,8 @@ export const MANIFEST_FORMAT_VERSION = 1;
 const HASH_BYTES = 8;
 // Two 8-byte varints (positions stay below 2^53) and the hash.
 const MAX_RECORD_BYTES = 8 + 8 + HASH_BYTES;
+/** One past the highest tile ID a manifest can describe: the end of zoom MAX_SAFE_ZOOM. */
+const TILE_ID_END = zoomEnd(MAX_SAFE_ZOOM);
 const WRITE_CHUNK_BYTES = 1 << 20;
 
 export interface ManifestHeader {
@@ -405,8 +410,15 @@ export async function* manifestBatches(path: string): AsyncGenerator<ManifestBat
         if (afterRun + HASH_BYTES > data.length) {
           break;
         }
+        const tileId = previousEnd + gap;
+        if (tileId + runLength > TILE_ID_END) {
+          throw new Error(
+            `${path}: positions ${tileId}..${tileId + runLength - 1} go past zoom ${MAX_SAFE_ZOOM} (tile IDs end at ` +
+              `${TILE_ID_END})`,
+          );
+        }
         const i = batch.count++;
-        batch.tileIds[i] = previousEnd + gap;
+        batch.tileIds[i] = tileId;
         batch.runLengths[i] = runLength;
         batch.hashHi[i] = data.readUInt32BE(afterRun);
         batch.hashLo[i] = data.readUInt32BE(afterRun + 4);

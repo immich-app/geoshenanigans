@@ -14,6 +14,7 @@ import {
   writeManifest,
 } from '../../src/bunny/manifest';
 import { decodeDirectory } from '../../src/bunny/manifest-worker';
+import { MAX_SAFE_ZOOM, zoomEnd } from '../../src/bunny/tile-id';
 import { openArchiveFile } from '../../src/deploy/archive-file';
 import {
   BIG_CONTENT,
@@ -295,6 +296,23 @@ describe('manifest file', () => {
     }
     await writeManifest(out, { buildKey: '20261118' }, entries);
     expect(await collect(out)).toEqual(entries);
+  });
+
+  it('refuses to read positions past zoom 26, whatever reads them', async () => {
+    const end = zoomEnd(MAX_SAFE_ZOOM);
+    for (const [i, entry] of [
+      { tileId: end - 1, runLength: 2, hash: hash(1) },
+      { tileId: end, runLength: 1, hash: hash(1) },
+      { tileId: Number.MAX_SAFE_INTEGER - 1, runLength: 1, hash: hash(1) },
+    ].entries()) {
+      const out = scratch.path(`past-${i}.tman.zst`);
+      await writeManifest(out, { buildKey: '20261118' }, [{ tileId: 0, runLength: 1, hash: hash(2) }, entry]);
+      await expect(collect(out), `case ${i}`).rejects.toThrow(/go past zoom 26/);
+    }
+    // The last position of zoom 26 still reads.
+    const out = scratch.path('last.tman.zst');
+    await writeManifest(out, { buildKey: '20261118' }, [{ tileId: end - 1, runLength: 1, hash: hash(1) }]);
+    expect(await collect(out)).toEqual([{ tileId: end - 1, runLength: 1, hash: hash(1) }]);
   });
 
   it('rejects entries out of order or overlapping', async () => {

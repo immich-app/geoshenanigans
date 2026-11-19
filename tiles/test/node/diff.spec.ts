@@ -1,17 +1,14 @@
+import { execFile } from 'node:child_process';
+import { link, mkdir, readdir, readFile, symlink, writeFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import {
-  changedTiles,
-  DiffKind,
-  diffManifests,
-  DiffRange,
-  DiffTotals,
-  planSync,
-  SyncRange,
-  zoomOf,
-} from '../../src/bunny/diff';
+import { ArchiveRanges } from '../../src/bunny/archive-walk';
+import { DiffKind, diffManifests, DiffRange, DiffTotals, planSync, SyncRange, zoomOf } from '../../src/bunny/diff';
 import { buildManifest, ManifestEntry, writeManifest } from '../../src/bunny/manifest';
+import { sha256Hex } from '../../src/bunny/state';
+import { planItems } from '../../src/bunny/sync';
 import { MAX_SAFE_ZOOM, zoomEnd } from '../../src/bunny/tile-id';
-import { openArchiveFile } from '../../src/deploy/archive-file';
 import { zxyToTileId } from '../../src/pmtiles/utils';
 import {
   Build,
@@ -218,7 +215,7 @@ describe('diffManifests', () => {
     expect(totals).toMatchObject({ oldBuild: '20261117', newBuild: '20261118', changed: 11, unchanged: 189 });
   });
 
-  it('rejects changed, added and removed positions past zoom 26 instead of hanging', async () => {
+  it('rejects changed, added, removed and unchanged positions past zoom 26 instead of hanging', async () => {
     const end = zoomEnd(MAX_SAFE_ZOOM);
     const cases: [ManifestEntry[], ManifestEntry[]][] = [
       // A changed run crossing into zoom 27, one changed position at its first ID, one added, one removed.
@@ -229,6 +226,15 @@ describe('diffManifests', () => {
       [[{ tileId: end, runLength: 1, hash: 'A'.repeat(16) }], [{ tileId: end, runLength: 1, hash: 'B'.repeat(16) }]],
       [[], [{ tileId: end + 5, runLength: 1, hash: 'A'.repeat(16) }]],
       [[{ tileId: end + 5, runLength: 1, hash: 'A'.repeat(16) }], []],
+      // The same bytes in both builds: no range to count, but still no position a manifest can describe.
+      [
+        [{ tileId: end - 1, runLength: 2, hash: 'A'.repeat(16) }],
+        [{ tileId: end - 1, runLength: 2, hash: 'A'.repeat(16) }],
+      ],
+      [
+        [{ tileId: end + 5, runLength: 1, hash: 'A'.repeat(16) }],
+        [{ tileId: end + 5, runLength: 1, hash: 'A'.repeat(16) }],
+      ],
     ];
     for (const [i, [before, after]] of cases.entries()) {
       const oldPath = scratch.path(`old-${i}.tman.zst`);
@@ -276,7 +282,21 @@ describe('zoomOf', () => {
   });
 });
 
-describe('changedTiles', () => {
+/** The upload items planItems (the sync's uploader input) makes of a plan over an archive. */
+async function itemsOf(archivePath: string, ranges: AsyncIterable<SyncRange> | Iterable<SyncRange>) {
+  const archive = await ArchiveRanges.open(archivePath);
+  try {
+    const items = [];
+    for await (const item of planItems(archive, ranges)) {
+      items.push({ tileId: item.tileId, sha256: item.sha256, verify: item.verify });
+    }
+    return items;
+  } finally {
+    await archive.close();
+  }
+}
+
+describe('planItems over a diff', () => {
   it('finds the archive tile of every changed and added position', async () => {
     const r = rng(5);
     const oldBuild = randomBuild(r, 2000, 85, 0.02);
@@ -286,41 +306,39 @@ describe('changedTiles', () => {
     await writeManifest(oldPath, { buildKey: '20261117' }, expectedEntries(oldBuild));
     await writeManifest(newPath, { buildKey: '20261118' }, expectedEntries(newBuild));
     const archivePath = scratch.path('new.pmtiles');
-    const archive = await writeArchiveFile(archivePath, newBuild, r, { splitChance: 0.5, maxLeafEntries: 3 });
+    await writeArchiveFile(archivePath, newBuild, r, { splitChance: 0.5, maxLeafEntries: 3 });
 
-    const { archive: reader, close } = await openArchiveFile(archivePath);
-    const tiles = [];
-    for await (const tile of changedTiles(reader.tileEntries(), await diffManifests(oldPath, newPath))) {
-      tiles.push(tile);
-    }
-    await close();
-
+    const items = await itemsOf(archivePath, await planSync(oldPath, newPath));
     const expected = bruteForce(oldBuild, newBuild)
       .ranges.filter((range) => range.kind !== 'removed')
       .flatMap((range) => Array.from({ length: range.count }, (_, i) => range.start + i))
-      .map((tileId) => {
-        const content = newBuild.contents[tileId - newBuild.base]!;
-        return {
-          tileId,
-          offset: archive.offsets[tileId - newBuild.base],
-          length: contentBytes(content).length,
-          verify: false,
-        };
-      });
-    expect(tiles.length).toBeGreaterThan(0);
-    expect(tiles).toEqual(expected);
+      .map((tileId) => ({
+        tileId,
+        sha256: sha256Hex(contentBytes(newBuild.contents[tileId - newBuild.base]!)),
+        verify: false,
+      }));
+    expect(items.length).toBeGreaterThan(0);
+    expect(items).toEqual(expected);
   });
 
-  it('rejects positions the archive does not have', async () => {
-    const entries = (async function* () {
-      yield [{ tileId: 0, offset: 0, length: 5, runLength: 2, chunkId: 0 }];
-    })();
-    const iterate = async () => {
-      for await (const tile of changedTiles(entries, [{ start: 1, count: 3, kind: 'changed' }])) {
-        expect(tile.tileId).toBe(1);
-      }
-    };
-    await expect(iterate()).rejects.toThrow(/Tile 2 is not in the archive/);
+  it('marks the positions a plan must check and rejects positions the archive does not have', async () => {
+    const r = rng(6);
+    const build: Build = { base: 0, contents: [1, 1, 2, 3, 3, 3, 4, 5, 6, 7] };
+    const archivePath = scratch.path('small.pmtiles');
+    await writeArchiveFile(archivePath, build, r, { splitChance: 0.5, maxLeafEntries: 2 });
+    const items = await itemsOf(archivePath, [
+      { start: 1, count: 2, kind: 'changed', verify: true },
+      { start: 3, count: 1, kind: 'removed', verify: true },
+      { start: 4, count: 1, kind: 'added', verify: false },
+    ]);
+    expect(items.map((item) => [item.tileId, item.verify])).toEqual([
+      [1, true],
+      [2, true],
+      [4, false],
+    ]);
+    await expect(itemsOf(archivePath, [{ start: 8, count: 3, kind: 'changed', verify: false }])).rejects.toThrow(
+      /Tile 10 is not in/,
+    );
   });
 });
 
@@ -535,23 +553,81 @@ describe('planSync', () => {
     expect(plainStale).toBeGreaterThan(0);
     expect(plainIdentical).toBeGreaterThan(0);
   });
+});
 
-  it('marks the positions a plan must check in changedTiles', async () => {
-    const entries = (async function* () {
-      yield [{ tileId: 0, offset: 0, length: 5, runLength: 10, chunkId: 0 }];
-    })();
-    const tiles = [];
-    for await (const tile of changedTiles(entries, [
-      { start: 1, count: 2, kind: 'changed', verify: true },
-      { start: 3, count: 1, kind: 'removed', verify: true },
-      { start: 4, count: 1, kind: 'added', verify: false },
-    ])) {
-      tiles.push([tile.tileId, tile.verify]);
+describe('bunny:diff', () => {
+  const TILES_DIR = join(import.meta.dirname, '../..');
+  const cli = (...args: string[]) =>
+    promisify(execFile)(process.execPath, ['--import=tsx', 'src/bunny/cli/diff.ts', ...args], { cwd: TILES_DIR }).then(
+      (result) => ({ code: 0, ...result }),
+      (error: { code: number; stdout: string; stderr: string }) => error,
+    );
+  const ndjson = async (path: string) =>
+    (await readFile(path, 'utf8'))
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as SyncRange);
+
+  async function builds() {
+    const r = rng(21);
+    const live = randomBuild(r, 30_000, 341, 0.02);
+    const next = mutateBuild(r, live, 0.02);
+    await mkdir(scratch.path('out'));
+    return { live, next, livePath: await manifestOf(live, '20261117'), newPath: await manifestOf(next, '20261118') };
+  }
+
+  it('writes the ranges to a file of its own and puts it in place once complete', async () => {
+    const { live, next, livePath, newPath } = await builds();
+    const ranges = scratch.path('out/ranges.ndjson');
+    await writeFile(ranges, 'from an earlier run\n');
+    const result = await cli('--old', livePath, '--new', newPath, '--ranges', ranges);
+    expect(result).toMatchObject({ code: 0 });
+    expect(JSON.parse(result.stdout)).toMatchObject({ oldBuild: '20261117', newBuild: '20261118' });
+    expect(await ndjson(ranges)).toEqual(bruteForce(live, next).ranges);
+    expect(await readdir(scratch.path('out'))).toEqual(['ranges.ndjson']);
+
+    const pendingPath = await manifestOf(mutateBuild(rng(22), live, 0.02), '20261119');
+    const planned = await cli('--old', livePath, '--new', newPath, '--pending', pendingPath, '--ranges', ranges);
+    expect(planned).toMatchObject({ code: 0 });
+    expect((await ndjson(ranges)).every((range) => typeof range.verify === 'boolean')).toBe(true);
+  });
+
+  it('refuses a ranges file that is one of the manifests, also through a link', async () => {
+    const { livePath, newPath } = await builds();
+    const pendingPath = await manifestOf(randomBuild(rng(23), 100, 0), '20261119');
+    await link(newPath, scratch.path('out/hard.ndjson'));
+    await symlink(pendingPath, scratch.path('out/soft.ndjson'));
+    const before = await Promise.all([livePath, newPath, pendingPath].map((path) => readFile(path)));
+    for (const ranges of [livePath, scratch.path('out/hard.ndjson'), scratch.path('out/soft.ndjson')]) {
+      const refused = await cli('--old', livePath, '--new', newPath, '--pending', pendingPath, '--ranges', ranges);
+      expect(refused, ranges).toMatchObject({ code: 1 });
+      expect(refused.stderr).toMatch(/is the manifest .*: writing it would destroy the input/);
     }
-    expect(tiles).toEqual([
-      [1, true],
-      [2, true],
-      [4, false],
+    const after = await Promise.all([livePath, newPath, pendingPath].map((path) => readFile(path)));
+    expect(after).toEqual(before);
+    expect(await readdir(scratch.path('out'))).toEqual(['hard.ndjson', 'soft.ndjson']);
+  });
+
+  it('fails through its own error path when the ranges file cannot be written or the plan fails', async () => {
+    const { livePath, newPath } = await builds();
+    const unwritable = await cli('--old', livePath, '--new', newPath, '--ranges', scratch.path('missing/ranges'));
+    expect(unwritable).toMatchObject({ code: 1 });
+    expect(unwritable.stderr).toMatch(/ENOENT/);
+    expect(unwritable.stderr).not.toMatch(/Unhandled 'error' event/);
+
+    // A plan that fails part-way leaves an earlier ranges file as it was, and no partial file.
+    const ranges = scratch.path('out/ranges.ndjson');
+    await writeFile(ranges, 'from an earlier run\n');
+    const end = zoomEnd(MAX_SAFE_ZOOM);
+    const broken = scratch.path('broken.tman.zst');
+    await writeManifest(broken, { buildKey: '20261118' }, [
+      ...expectedEntries(randomBuild(rng(24), 30_000, 341, 0.02)),
+      { tileId: end, runLength: 1, hash: 'A'.repeat(16) },
     ]);
+    const failed = await cli('--old', livePath, '--new', broken, '--ranges', ranges);
+    expect(failed).toMatchObject({ code: 1 });
+    expect(failed.stderr).toMatch(/go past zoom 26/);
+    expect(await readFile(ranges, 'utf8')).toBe('from an earlier run\n');
+    expect(await readdir(scratch.path('out'))).toEqual(['ranges.ndjson']);
   });
 });
