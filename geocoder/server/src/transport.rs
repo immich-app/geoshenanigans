@@ -624,12 +624,12 @@ impl Staging {
         let mut moved = Vec::with_capacity(members.len());
         for m in members {
             if let Err(e) = self.move_in(dir, &m.name, &mut moved) {
-                return Err(put_back(moved, e));
+                return Err(put_back(moved, e, self.locks));
             }
         }
         let installed = self.path.join(INSTALLED);
         if let Err(e) = File::create(&installed) {
-            return Err(put_back(moved, at(&installed, e)));
+            return Err(put_back(moved, at(&installed, e), self.locks));
         }
         seam(Step::AllIn);
         let mut removed = true;
@@ -675,10 +675,11 @@ impl Staging {
 
 /// Undoes `moved`, the last first, after the error `e`: each replaced file back in its place,
 /// a member that replaced none removed. Returns `e`, naming what it couldn't undo. A replaced
-/// file it couldn't put back stays in the decode's dir, which then stays too; on unix a later
-/// decode into the dir puts it back (finish_leftover).
-fn put_back(moved: Vec<Moved>, e: io::Error) -> io::Error {
-    let later = if cfg!(unix) { ", for a later decode into the dir to put back" } else { "" };
+/// file it couldn't put back stays in the decode's dir, which then stays too: where decodes
+/// take locks (`locks`) a later decode into the dir puts it back (finish_leftover); where they
+/// take none, none does, and it is to be moved back by hand.
+fn put_back(moved: Vec<Moved>, e: io::Error, locks: bool) -> io::Error {
+    let later = if locks { ", for a later decode into the dir to put back" } else { ", to be moved back by hand" };
     let mut left = Vec::new();
     for m in moved.into_iter().rev() {
         let undone = match (&m.earlier, m.installed) {

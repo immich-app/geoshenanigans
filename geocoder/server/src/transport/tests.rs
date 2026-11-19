@@ -1464,6 +1464,22 @@ fn a_decode_puts_no_member_in_while_a_leftover_it_cant_finish_would_put_back_the
     }
 }
 
+#[test]
+fn a_file_that_cant_go_back_is_left_for_a_later_decode_only_where_decodes_take_locks() {
+    // put_back after an error, the file a member replaced gone from the decode's dir: it can't
+    // go back. Where decodes take locks, a later decode finishes the dir and puts it back; where
+    // they take none, none does, and it is to be moved back by hand.
+    let dir = ScratchDir::new();
+    let (dest, earlier) = (dir.path().join("a.bin"), dir.path().join(".transport.1.0/.earlier.a.bin"));
+    let told = |locks| put_back(vec![Moved { dest: dest.clone(), earlier: Some(earlier.clone()), installed: true }], io::Error::other("it failed"), locks).to_string();
+    let stays = format!("it failed; the file {} replaced stays at {}", dest.display(), earlier.display());
+
+    let (with, without) = (told(true), told(false));
+
+    assert!(with.starts_with(&format!("{stays}, for a later decode into the dir to put back: ")), "{with}");
+    assert!(without.starts_with(&format!("{stays}, to be moved back by hand: ")), "{without}");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_decode_goes_without_a_lock_only_where_the_file_system_has_none() {
