@@ -55,8 +55,9 @@ export interface UploadStats {
   /** The first MAX_REPORTED_FAILURES failures. */
   failures: UploadFailure[];
   /**
-   * Not every item was settled: stopped by the signal (including items the storage client's signal stopped mid-retry,
-   * which are neither uploaded nor failed), a fatal error or too many failures.
+   * Not every item was settled: stopped by the signal (including items the storage client's signal stopped mid-retry
+   * and items the stop caught before their PUT, such as one whose DESCRIBE was in flight: neither uploaded nor
+   * failed), a fatal error or too many failures.
    */
   stopped: boolean;
   /** Why the upload stopped early, if it did on its own. */
@@ -71,7 +72,10 @@ export interface UploadOptions<T extends UploadItem> {
   concurrency?: number;
   /** DESCRIBE every file before its PUT; items can ask for it one by one, but cannot opt out of this. */
   verify?: boolean;
-  /** Stop taking new items; the ones in flight finish. */
+  /**
+   * Stop taking new items. PUTs already sent finish; an item still being verified gets no PUT after it (it counts as
+   * neither uploaded nor failed, and stats.stopped is set).
+   */
   signal?: AbortSignal;
   /** Stop after this many failed files (default 1000). */
   maxFailures?: number;
@@ -123,6 +127,11 @@ export async function uploadTiles<T extends UploadItem>(
       if ((options.verify || item.verify) && (await storage.holds(path, item.sha256))) {
         stats.skippedExisting++;
         options.onSettled?.(item, 'skipped');
+        return;
+      }
+      if (stopping()) {
+        // Stopped while it was being verified or handed out: a stop lets PUTs already sent finish and starts none.
+        unsettled++;
         return;
       }
       await storage.put(path, item.bytes, item.sha256);
@@ -515,8 +524,15 @@ export interface SeedOptions {
   /** PUTs in flight at most, across all workers. */
   concurrency: number;
   stateDir: string;
-  /** DESCRIBE before every PUT, not just in chunks a previous run left unfinished. */
-  verifyExisting: boolean;
+  /**
+   * A first load: the caller vouches that nothing was uploaded under the prefix in this range before this state dir's
+   * seed, so chunks it has not started are PUT without a DESCRIBE first. Some checks still catch an earlier upload: a
+   * fresh state dir DESCRIBEs positions spread over the range first (preflightIds) and refuses if any is stored, and
+   * each chunk not started runs verified if one of a few of its positions is (chunkProbeIds); a stored stretch that
+   * misses every sample is PUT again, and identical bytes PUT again lose their replication. Without it (the default),
+   * every position is DESCRIBEd before its PUT, as in the chunks a previous run left unfinished.
+   */
+  firstLoad?: boolean;
   storage: Omit<BunnyStorageOptions, 'counters' | 'concurrency' | 'connectionsPerAddress' | 'signal'>;
   /** Connections to one storage address across all workers (default 240); caps the total in flight too. */
   maxConnectionsPerAddress?: number;
@@ -704,7 +720,7 @@ export async function runSeed(options: SeedOptions): Promise<SeedResult> {
       await settlePrevious(options, unfinished, log);
     }
     const perAddress = Math.max(1, options.maxConnectionsPerAddress ?? DEFAULT_MAX_CONNECTIONS_PER_ADDRESS);
-    if (checkpoint.fresh && !options.verifyExisting) {
+    if (checkpoint.fresh && options.firstLoad) {
       const ids = preflightIds(from, to, chunkSize);
       log(`Fresh state dir: checking that none of ${ids.length} positions spread over the range is stored already`);
       const concurrency = Math.max(
@@ -789,8 +805,9 @@ export function chunkProbeIds(start: number, end: number, samples = CHUNK_PROBE_
 }
 
 /**
- * A fresh state dir over files that are already stored would PUT identical bytes and clear their replication, so
- * positions spread over the range are checked first. It also proves the credentials before any worker starts.
+ * A first load (SeedOptions.firstLoad) from a fresh state dir over files that are already stored would PUT identical
+ * bytes and clear their replication, so positions spread over the range are checked first. It also proves the
+ * credentials before any worker starts.
  */
 async function preflight(
   ranges: ArchiveRanges,
@@ -832,8 +849,8 @@ async function preflight(
   if (existing) {
     throw new Error(
       `${existing} is already stored under ${prefix}/ with the same bytes, so an earlier run uploaded part of this ` +
-        'range. PUTting identical bytes again clears their replication: resume with the --state-dir that uploaded ' +
-        'them, or pass --verify-existing to DESCRIBE before every PUT.',
+        'range and it is no first load. PUTting identical bytes again clears their replication: resume with the ' +
+        '--state-dir that uploaded them, or leave out --first-load to DESCRIBE before every PUT.',
     );
   }
 }
@@ -931,7 +948,10 @@ class SeedRun {
     this.log(
       `Seeding ${options.archivePath} [${options.from}, ${options.to}) to ${options.storage.zone}/${options.prefix}/: ` +
         `${this.totalChunks} chunks (${this.previouslyDone} done before), ${workers} workers, ${total} in flight, ` +
-        `${addresses} storage addresses`,
+        `${addresses} storage addresses, ` +
+        (options.firstLoad
+          ? 'first load (no DESCRIBE before a PUT in chunks not started before)'
+          : 'DESCRIBE before every PUT'),
     );
 
     // On disk before any chunk starts, so a resume after a kill knows how long to wait (settleBy).
@@ -1160,7 +1180,7 @@ class SeedRun {
 
   /** Hands chunks to workers in tile-id order, each recorded as started (on disk) before it is sent. */
   private async feed() {
-    const { from, to, chunkSize, verifyExisting } = this.options;
+    const { from, to, chunkSize, firstLoad } = this.options;
     const chunks = planChunks(this.ranges, from, to, chunkSize, (id) => this.checkpoint.done.has(id));
     for (;;) {
       let slot = this.idleSlot();
@@ -1175,9 +1195,10 @@ class SeedRun {
       if (next.done || this.stopping) {
         break;
       }
+      // Only a first load PUTs without a DESCRIBE, and only in chunks no run of it started (see SeedOptions.firstLoad).
       const chunk: ChunkDescriptor = {
         ...next.value,
-        verify: verifyExisting || this.checkpoint.started.has(next.value.chunkId),
+        verify: !firstLoad || this.checkpoint.started.has(next.value.chunkId),
       };
       await this.checkpoint.markStarted([chunk.chunkId]);
       slot.outstanding.add(chunk.chunkId);

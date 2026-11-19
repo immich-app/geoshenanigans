@@ -118,25 +118,26 @@ async function hashInWorkers(
     counters,
     digests,
   };
-  const workers = Array.from(
-    { length: Math.max(1, Math.min(threads, blocks)) },
-    () =>
-      new Worker(new URL('./archive-identity-worker.ts', import.meta.url), {
+  // Each thread is listened to as it starts and stopped in the finally, also when a later one fails to start.
+  const workers: Worker[] = [];
+  const finished: Promise<void>[] = [];
+  try {
+    for (let i = 0; i < Math.max(1, Math.min(threads, blocks)); i++) {
+      const worker = new Worker(new URL('./archive-identity-worker.ts', import.meta.url), {
         workerData: data,
         execArgv: workerExecArgv(),
-      }),
-  );
-  try {
-    await Promise.all(
-      workers.map(
-        (worker) =>
-          new Promise<void>((resolve, reject) => {
-            worker.once('message', () => resolve());
-            worker.once('error', reject);
-            worker.once('exit', (code) => reject(new Error(`Identity thread exited with code ${code}`)));
-          }),
-      ),
-    );
+      });
+      workers.push(worker);
+      const done = new Promise<void>((resolve, reject) => {
+        worker.once('message', () => resolve());
+        worker.once('error', reject);
+        worker.once('exit', (code) => reject(new Error(`Identity thread exited with code ${code}`)));
+      });
+      // Not awaited if a later thread fails to start, and terminating this one then rejects it.
+      done.catch(() => {});
+      finished.push(done);
+    }
+    await Promise.all(finished);
   } finally {
     await Promise.all(workers.map((worker) => worker.terminate()));
   }

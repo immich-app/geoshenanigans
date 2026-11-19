@@ -257,7 +257,8 @@ describe('buildManifest', () => {
   it('reads only the file of the snapshot it was given, on every thread, still at the path once all is read', async () => {
     const archivePath = scratch.path('a.pmtiles');
     await writeArchiveFile(archivePath, randomBuild(rng(7), 2000), rng(7), { maxLeafEntries: 5 });
-    const source = fileSnapshot(await stat(archivePath, { bigint: true }));
+    const before = await stat(archivePath, { bigint: true });
+    const source = fileSnapshot(before);
     const options = { buildKey: '20261118', threads: 3, leavesPerJob: 1 };
     const bound = scratch.path('bound.tman.zst');
     const plain = scratch.path('plain.tman.zst');
@@ -270,15 +271,18 @@ describe('buildManifest', () => {
       /replaced or written to/,
     );
 
-    // Written to while it is read: the path no longer names the file as it was.
+    // Written to while it is read: the path no longer names the file as it was. Its modification time moves a minute
+    // back, which no filesystem's clock granularity hides (a time set to now could land in the same tick).
+    const moved = new Date(Number(before.mtimeMs) - 60_000);
     await expect(
       buildManifest(archivePath, {
         ...options,
         out: scratch.path('written.tman.zst'),
         source,
-        onProgress: () => utimesSync(archivePath, new Date(), new Date()),
+        onProgress: () => utimesSync(archivePath, moved, moved),
       }),
     ).rejects.toThrow(/replaced or written to while its manifest was built/);
+    expect((await stat(archivePath)).mtime).toEqual(moved);
     // Another file put at the path: the same bytes, but not the file the snapshot is of.
     const copy = scratch.path('copy.pmtiles');
     await copyFile(archivePath, copy);

@@ -2,7 +2,8 @@ import { createHash, randomBytes } from 'node:crypto';
 import { closeSync, futimesSync, openSync } from 'node:fs';
 import { copyFile, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import type { Worker as NodeWorker } from 'node:worker_threads';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   archiveIdentity,
   checkOpened,
@@ -15,6 +16,22 @@ import {
 } from '../../src/bunny/archive-identity';
 import { ArchiveRanges } from '../../src/bunny/archive-walk';
 import { scratchDir, withOtherTileBytes, writeFixtureArchive } from './upload-fixture';
+
+/** Set by a test to fail the start of a thread, as Node fails one it can't start; `started` lists those it started. */
+const threads = vi.hoisted(() => ({ failAt: undefined as number | undefined, started: [] as NodeWorker[] }));
+vi.mock('node:worker_threads', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:worker_threads')>();
+  class Worker extends actual.Worker {
+    constructor(...args: ConstructorParameters<typeof actual.Worker>) {
+      if (threads.failAt !== undefined && threads.started.length === threads.failAt) {
+        throw new Error('could not start a thread');
+      }
+      super(...args);
+      threads.started.push(this);
+    }
+  }
+  return { ...actual, Worker };
+});
 
 let cleanup: (() => Promise<void>)[] = [];
 
@@ -92,6 +109,27 @@ describe('archiveIdentity', () => {
 });
 
 describe('identifyArchive', () => {
+  it('stops the threads it started when a later one fails to start', async () => {
+    const dir = await scratch();
+    const path = join(dir, 'blocks.bin');
+    const bytes = randomBytes(8 * 4096);
+    await writeFile(path, bytes);
+    threads.started = [];
+    threads.failAt = 2;
+    cleanup.push(async () => {
+      threads.failAt = undefined;
+    });
+    await expect(identifyArchive(path, { threads: 4, blockBytes: 4096 })).rejects.toThrow(/could not start a thread/);
+    expect(threads.started).toHaveLength(2);
+    // Both were stopped before the call failed, not left reading the file: a thread that no longer runs has id -1.
+    expect(threads.started.map((worker) => worker.threadId)).toEqual([-1, -1]);
+
+    threads.failAt = undefined;
+    expect((await identifyArchive(path, { threads: 4, blockBytes: 4096 })).identity.identity).toBe(
+      reference(bytes, 4096),
+    );
+  });
+
   it('ties the identity to the file it hashed, which another file put at the path does not match', async () => {
     const dir = await scratch();
     const fixture = await writeFixtureArchive(dir, 2_000);

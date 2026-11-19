@@ -127,11 +127,17 @@ describe('uploadTiles', () => {
   });
 
   it('verifies every item when told to, even items that say verify: false', async () => {
-    const { fake, storage } = await setup();
+    const described: string[] = [];
+    const { fake, storage } = await setup({
+      onRequest: ({ method, path }) => (method === 'DESCRIBE' ? described.push(path) : undefined),
+    });
     const all = items(4).map((item) => ({ ...item, verify: false }));
     fake.seed(tilePath('v1', 0), all[0].bytes);
     const stats = await uploadTiles(storage, all, { verify: true });
     expect(stats).toMatchObject({ uploaded: 3, skippedExisting: 1 });
+    // Each of them, not just the one already stored.
+    expect(described.sort()).toEqual(all.map((item) => tilePath('v1', item.tileId)).sort());
+    expect(fake.requests).toEqual({ DESCRIBE: 4, PUT: 3 });
     expect(fake.identicalReputs).toEqual([]);
   });
 
@@ -206,22 +212,90 @@ describe('uploadTiles', () => {
   });
 
   it('stops taking items when the signal aborts and lets the ones in flight finish', async () => {
-    const { fake, storage } = await setup({ latencyMs: 5 });
     const controller = new AbortController();
-    let settled = 0;
-    const stats = await uploadTiles(storage, items(10_000), {
-      concurrency: 8,
-      signal: controller.signal,
-      onSettled: () => {
-        if (++settled === 50) {
-          controller.abort();
-        }
-      },
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const put: string[] = [];
+    const fake = await FakeStorage.start({
+      onRequest: ({ method, path }) => (method === 'PUT' ? put.push(path) : undefined),
+      // The first 4 PUTs (one per slot) are held until after the stop; any later one would be answered at once.
+      hold: ({ method }) => (method === 'PUT' && put.length <= 4 ? held : undefined),
     });
-    expect(stats.stopped).toBe(true);
-    expect(stats.uploaded).toBeGreaterThanOrEqual(50);
-    expect(stats.uploaded).toBeLessThan(70);
-    expect(fake.files.size).toBe(stats.uploaded);
+    // The worker's set-up: the client's signal is the stop too. A long timeout, so no held PUT times out.
+    const storage = new BunnyStorage({
+      zone: fake.zone,
+      password: fake.password,
+      host: fake.url,
+      retry: fast,
+      timeoutMs: 20_000,
+      signal: controller.signal,
+    });
+    cleanup.push(
+      () => fake.close(),
+      () => storage.close(),
+    );
+    const settled: string[] = [];
+    const upload = uploadTiles(storage, items(100), {
+      concurrency: 4,
+      signal: controller.signal,
+      onSettled: (item, outcome) => settled.push(`${item.tileId}:${outcome}`),
+    });
+    try {
+      await vi.waitFor(() => expect(put).toHaveLength(4), { timeout: 10_000, interval: 5 });
+      expect(fake.files.size).toBe(0);
+      controller.abort();
+    } finally {
+      release();
+    }
+    const stats = await upload;
+
+    // The 4 PUTs in flight at the stop finished, were stored and counted; no other PUT started.
+    const inFlight = [0, 1, 2, 3].map((id) => tilePath('v1', id));
+    expect(put.sort()).toEqual(inFlight);
+    expect(stats).toMatchObject({ uploaded: 4, failed: 0, stopped: true });
+    expect(settled.sort()).toEqual(['0:uploaded', '1:uploaded', '2:uploaded', '3:uploaded']);
+    expect([...fake.files.keys()].sort()).toEqual(inFlight);
+    for (const item of items(4)) {
+      expect(fake.checksum(tilePath('v1', item.tileId))).toBe(item.sha256);
+    }
+  });
+
+  it('sends no PUT for an item it was still verifying when the signal aborted', async () => {
+    const controller = new AbortController();
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    const fake = await FakeStorage.start({ hold: ({ method }) => (method === 'DESCRIBE' ? held : undefined) });
+    const storage = new BunnyStorage({
+      zone: fake.zone,
+      password: fake.password,
+      host: fake.url,
+      retry: fast,
+      timeoutMs: 20_000,
+      signal: controller.signal,
+    });
+    cleanup.push(
+      () => fake.close(),
+      () => storage.close(),
+    );
+    const settled: string[] = [];
+    const upload = uploadTiles(storage, items(10), {
+      concurrency: 3,
+      verify: true,
+      signal: controller.signal,
+      onSettled: (item, outcome) => settled.push(`${item.tileId}:${outcome}`),
+    });
+    try {
+      // Three DESCRIBEs in flight, each to answer "missing" once released: after the stop.
+      await vi.waitFor(() => expect(fake.requests.DESCRIBE).toBe(3), { timeout: 10_000, interval: 5 });
+      controller.abort();
+    } finally {
+      release();
+    }
+    const stats = await upload;
+    expect(fake.requests).toEqual({ DESCRIBE: 3 });
+    expect(stats).toMatchObject({ uploaded: 0, skippedExisting: 0, failed: 0, stopped: true });
+    expect(settled).toEqual([]);
+    expect(fake.files.size).toBe(0);
   });
 
   it('takes async sources', async () => {

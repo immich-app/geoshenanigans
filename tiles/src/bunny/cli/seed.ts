@@ -4,7 +4,7 @@
  * failed files, DESCRIBEing everything in chunks it had started before any PUT.
  *
  *   npm run bunny:seed -- --archive <path> [--prefix v1] [--min-zoom 0 --max-zoom 15 | --from-id N --to-id M]
- *     [--concurrency 1200] [--workers 16] [--chunk-size 65536] [--state-dir <dir>] [--verify-existing]
+ *     [--first-load | --verify-existing] [--concurrency 1200] [--workers 16] [--chunk-size 65536] [--state-dir <dir>]
  *     [--max-failures 1000] [--request-timeout-s 60] [--progress-interval-s 10] [--retry-base-ms 500]
  *     [--max-connections-per-address 240] [--addresses ip,ip,...] [--settle-ms 2000]
  *     [--state-prefix <p> | --no-state-check]
@@ -19,12 +19,18 @@
  * --settle-ms is the least wait before DESCRIBEing a file whose PUT failed ambiguously (five times that after a
  * timeout); it is for tests: below the default, a PUT the server finishes late can be sent again with the same bytes,
  * which clears the file's replication.
- * Re-PUTting identical bytes clears a file's replication, so: a resume waits until PUTs the last run may have left
- * in flight are past the window in which the server may still commit them (request timeout + 5 x settle, up to about
- * 70 s after a kill) before it DESCRIBEs its unfinished chunks; a chunk that was not started is checked at 64 spread
- * positions and runs verified if any is stored already (another seed); and a seed refuses to start while another one
- * on this machine, with another state dir, covers an overlapping range of the same zone and prefix (claims live in
- * $XDG_STATE_HOME/bunny-seed, default ~/.local/state/bunny-seed; seeds on other machines are not seen).
+ * Re-PUTting identical bytes clears a file's replication, so by default every position is DESCRIBEd before its PUT
+ * and only files missing or different are written (--verify-existing asks for that explicitly). --first-load is for a
+ * prefix and range nothing was uploaded to before this state dir's seed: the first load of a zone, or a full rewrite's
+ * new prefix. Chunks the state dir has not started then go out without a DESCRIBE per file (half the requests). A few
+ * checks back that up but can't prove it: a fresh state dir first DESCRIBEs about 16k positions spread over the range
+ * (and the first of every chunk) and refuses if any is stored, a chunk not started runs verified if one of 64 of its
+ * positions spread over it is stored already, and a prefix a sync made a build live under is refused; a stored stretch
+ * between those samples is PUT again. Either way, a resume waits until PUTs the last run may have left in flight are
+ * past the window in which the server may still commit them (request timeout + 5 x settle, up to about 70 s after a
+ * kill) before it DESCRIBEs its unfinished chunks, and a seed refuses to start while another one on this machine, with
+ * another state dir, covers an overlapping range of the same zone and prefix (claims live in $XDG_STATE_HOME/bunny-seed,
+ * default ~/.local/state/bunny-seed; seeds on other machines are not seen).
  * Unless the addresses are pinned, the storage host is looked up again every 5 minutes and workers move to the new set.
  * The archive is identified by a hash of the whole file (archive-identity.ts; about 15 s for a planet build from NVMe,
  * at every start): the checkpoint refuses a resume with another archive, and the seed reads only the file that was
@@ -61,8 +67,16 @@ function integer(name: string, value: string | undefined, fallback?: number, min
   return parsed;
 }
 
-/** Refuses to seed over the live build's prefix with any other archive (see the header). */
-async function checkLiveState(prefix: string, archive: ArchiveIdentity, statePrefix: string | undefined) {
+/**
+ * Refuses to seed over the live build's prefix with any other archive, and to take a seed over it for a first load
+ * (see the header).
+ */
+async function checkLiveState(
+  prefix: string,
+  archive: ArchiveIdentity,
+  statePrefix: string | undefined,
+  firstLoad: boolean,
+) {
   if (!process.env.BUNNY_STATE_ZONE || !process.env.BUNNY_STATE_PASSWORD) {
     throw new UsageError(
       'BUNNY_STATE_ZONE and BUNNY_STATE_PASSWORD are needed to check that the seed does not write over a live build ' +
@@ -73,6 +87,12 @@ async function checkLiveState(prefix: string, archive: ArchiveIdentity, statePre
   const state = await readState(store, statePrefix).finally(() => store.close());
   if (!state || !prefixesOverlap(state.prefix, prefix)) {
     return;
+  }
+  if (firstLoad) {
+    throw new Error(
+      `${state.liveBuild} is live under ${state.prefix}/, so ${prefix}/ is no first load: leave out --first-load, ` +
+        'and every position is DESCRIBEd before its PUT',
+    );
   }
   if (!state.archive) {
     throw new Error(
@@ -102,6 +122,7 @@ async function main(): Promise<number> {
       workers: { type: 'string' },
       'chunk-size': { type: 'string' },
       'state-dir': { type: 'string' },
+      'first-load': { type: 'boolean', default: false },
       'verify-existing': { type: 'boolean', default: false },
       'max-failures': { type: 'string' },
       'request-timeout-s': { type: 'string' },
@@ -122,6 +143,9 @@ async function main(): Promise<number> {
   const byZoom = values['min-zoom'] !== undefined || values['max-zoom'] !== undefined;
   if (byId && byZoom) {
     throw new UsageError('Give either --min-zoom/--max-zoom or --from-id/--to-id, not both');
+  }
+  if (values['first-load'] && values['verify-existing']) {
+    throw new UsageError('Give either --first-load or --verify-existing (the default), not both');
   }
 
   // Numbers first, so a typo fails before the archive is opened.
@@ -191,7 +215,7 @@ async function main(): Promise<number> {
   const archive = identified.identity;
   process.stderr.write(`Archive ${archive.identity} in ${formatDuration((performance.now() - started) / 1000)}\n`);
   if (!values['no-state-check']) {
-    await checkLiveState(prefix, archive, values['state-prefix']);
+    await checkLiveState(prefix, archive, values['state-prefix'], values['first-load']);
   }
   const safeName = (text: string) => text.replace(/[^\w.-]+/g, '_');
 
@@ -219,7 +243,7 @@ async function main(): Promise<number> {
     workers,
     concurrency,
     stateDir: values['state-dir'] ?? `bunny-seed-${safeName(storage.zone)}-${safeName(prefix) || 'root'}-${from}-${to}`,
-    verifyExisting: values['verify-existing'],
+    firstLoad: values['first-load'],
     storage: { ...storage, timeoutMs: timeoutSeconds * 1000, retry },
     maxConnectionsPerAddress,
     maxFailures,
