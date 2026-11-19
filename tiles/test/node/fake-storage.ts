@@ -26,7 +26,11 @@ export type Fault =
   /** Never stored, never answered. */
   | 'hang'
   /** Never answered; the body is stored `lateStoreMs` after it arrived, as when the server commits after the client gave up. */
-  | 'late-store';
+  | 'late-store'
+  /** Answered 503 at once, as by a gateway that gave up; the backend stores the body `lateStoreMs` after it arrived. */
+  | 'gateway-late-store'
+  /** Connection dropped at once; the backend stores the body `lateStoreMs` after it arrived. */
+  | 'reset-late-store';
 
 export interface RequestInfo {
   method: string;
@@ -51,8 +55,14 @@ export interface FakeStorageOptions {
   onRequest?: (request: RequestInfo) => void;
   /** Awaited before a request is answered (after onRequest), to hold chosen requests back. */
   hold?: (request: RequestInfo) => Promise<void> | undefined;
-  /** How long after arriving a 'late-store' PUT is stored (default 500 ms). */
+  /** How long after arriving a 'late-store', 'gateway-late-store' or 'reset-late-store' PUT is stored (default 500 ms). */
   lateStoreMs?: number;
+  /**
+   * DESCRIBE lagging an overwrite, as measured on Bunny: a PUT of other bytes that lands within `withinMs` of the
+   * file's previous write leaves DESCRIBE and listings showing the previous version (Checksum, Length, LastChanged,
+   * ReplicatedZones) for `forMs` (Infinity: for good), while GET returns the new bytes.
+   */
+  staleOverwrite?: { withinMs: number; forMs: number };
 }
 
 interface StoredFile {
@@ -63,6 +73,10 @@ interface StoredFile {
   dateCreated: string;
   /** Re-PUT with identical bytes: its replica list never recovers. */
   broken: boolean;
+  /** When it was written (Date.now()). */
+  writtenAt: number;
+  /** What DESCRIBE shows instead until `until` (staleOverwrite). */
+  shown?: { checksum: string; length: number; lastChanged: string; replicatedZones: Set<string>; until: number };
 }
 
 interface ParsedRequest {
@@ -164,6 +178,7 @@ export class FakeStorage {
       lastChanged: now,
       dateCreated: now,
       broken: false,
+      writtenAt: Date.now(),
     });
   }
 
@@ -280,12 +295,18 @@ export class FakeStorage {
       if (checksum && checksum !== actual) {
         return this.send(socket, 400, JSON.stringify({ HttpCode: 400, Message: 'Checksum mismatch' }));
       }
-      if (fault === 'late-store') {
+      if (fault === 'late-store' || fault === 'gateway-late-store' || fault === 'reset-late-store') {
         const timer = setTimeout(() => {
           this.timers.delete(timer);
           this.store(path, request.body, actual);
         }, this.options.lateStoreMs ?? 500);
         this.timers.add(timer);
+        if (fault === 'gateway-late-store') {
+          return this.send(socket, 503, 'gateway timeout');
+        }
+        if (fault === 'reset-late-store') {
+          socket.destroy();
+        }
         return false;
       }
       this.store(path, request.body, actual);
@@ -337,8 +358,10 @@ export class FakeStorage {
       existing.broken = true;
       existing.replicatedZones.clear();
       existing.lastChanged = now;
+      existing.writtenAt = Date.now();
       return;
     }
+    const lag = this.options.staleOverwrite;
     const file: StoredFile = {
       bytes: Buffer.from(bytes),
       checksum,
@@ -346,6 +369,17 @@ export class FakeStorage {
       lastChanged: now,
       dateCreated: existing?.dateCreated ?? now,
       broken: false,
+      writtenAt: Date.now(),
+      shown:
+        existing && lag && Date.now() - existing.writtenAt < lag.withinMs
+          ? {
+              checksum: existing.checksum,
+              length: existing.bytes.length,
+              lastChanged: existing.lastChanged,
+              replicatedZones: new Set(existing.replicatedZones),
+              until: Date.now() + lag.forMs,
+            }
+          : undefined,
     };
     this.files.set(path, file);
     for (const [region, delay] of Object.entries(this.options.replicationDelayMs ?? {})) {
@@ -361,19 +395,23 @@ export class FakeStorage {
 
   private object(path: string, file: StoredFile) {
     const slash = path.lastIndexOf('/');
+    const shown =
+      file.shown && Date.now() < file.shown.until
+        ? file.shown
+        : { ...file, length: file.bytes.length, replicatedZones: file.replicatedZones };
     return {
       Guid: '00000000-0000-0000-0000-000000000000',
       StorageZoneName: this.zone,
       Path: `/${this.zone}/${path.slice(0, slash + 1)}`,
       ObjectName: path.slice(slash + 1),
-      Length: file.bytes.length,
-      LastChanged: file.lastChanged,
+      Length: shown.length,
+      LastChanged: shown.lastChanged,
       ServerId: 1,
       IsDirectory: false,
       DateCreated: file.dateCreated,
       StorageZoneId: 1,
-      Checksum: file.checksum,
-      ReplicatedZones: [...file.replicatedZones].join(','),
+      Checksum: shown.checksum,
+      ReplicatedZones: [...shown.replicatedZones].join(','),
     };
   }
 

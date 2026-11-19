@@ -78,15 +78,37 @@ describe('BunnyStorage', () => {
     expect(fake.identicalReputCount).toBe(0);
   });
 
+  it('rides out more 429s in a row than maxAttempts with plain PUTs', async () => {
+    const { fake, storage } = await setup(
+      { fault: failFirst('rate-limit', 12) },
+      { retry: { ...fast, maxAttempts: 3, maxDelayMs: 2 } },
+    );
+    await storage.put('a.mvt', bytes('a'), sha256Hex(bytes('a')));
+    expect(fake.requests).toEqual({ PUT: 13 });
+    expect(storage.counters).toMatchObject({ rateLimited: 12, describes: 0 });
+  });
+
+  it('still ends a 429 storm at the wait cap when given a zero back-off', async () => {
+    const { storage } = await setup(
+      { fault: failFirst('rate-limit', 1_000_000_000) },
+      { retry: { ...fast, baseDelayMs: 0, maxRateLimitWaitMs: 200 } },
+    );
+    const started = performance.now();
+    await expect(storage.put('a.mvt', bytes('a'), sha256Hex(bytes('a')))).rejects.toThrow(/still rate limited/);
+    expect(performance.now() - started).toBeLessThan(5_000);
+  });
+
+  // The first DESCRIBE comes after settleMs; a file not found then is asked about again once 5 x settleMs has passed
+  // since the failure (one DESCRIBE after a timeout, which already waited that long).
   it.each<[Fault, number]>([
     ['server-error', 2],
     ['reset', 2],
-    ['hang', 2],
-  ])('after %s (not stored) DESCRIBEs, finds nothing and PUTs again', async (fault, puts) => {
+    ['hang', 1],
+  ])('after %s (not stored) DESCRIBEs, finds nothing and PUTs again', async (fault, describes) => {
     const { fake, storage } = await setup({ fault: failFirst(fault) });
     await storage.put('a.mvt', bytes('a'), sha256Hex(bytes('a')));
-    expect(fake.requests.PUT).toBe(puts);
-    expect(fake.requests.DESCRIBE).toBe(1);
+    expect(fake.requests.PUT).toBe(2);
+    expect(fake.requests.DESCRIBE).toBe(describes);
     expect(storage.counters.ambiguousResent).toBe(1);
     expect(fake.checksum('a.mvt')).toBe(sha256Hex(bytes('a')));
     expect(fake.identicalReputCount).toBe(0);
@@ -104,6 +126,47 @@ describe('BunnyStorage', () => {
     },
   );
 
+  it.each<Fault>(['gateway-late-store', 'reset-late-store'])(
+    'after %s waits out the commit window before PUTting again, so the late commit is not sent twice',
+    async (fault) => {
+      // Answered (or dropped) at once, stored 1 s later: after the 300 ms settle DESCRIBE finds nothing, and the
+      // second DESCRIBE at 1.5 s (5 x settle) finds the late commit.
+      const { fake, storage } = await setup(
+        { fault: failFirst(fault), lateStoreMs: 1_000 },
+        { retry: { ...fast, settleMs: 300 } },
+      );
+      await storage.put('a.mvt', bytes('a'), sha256Hex(bytes('a')));
+      await new Promise((resolve) => setTimeout(resolve, 1_200));
+      expect(fake.requests).toEqual({ PUT: 1, DESCRIBE: 2 });
+      expect(storage.counters.ambiguousStored).toBe(1);
+      expect(fake.identicalReputs).toEqual([]);
+    },
+  );
+
+  it('GETs a file whose DESCRIBE still shows the version it overwrote instead of PUTting the same bytes again', async () => {
+    // Measured on Bunny: DESCRIBE can keep showing the previous version after two quick writes, while GET does not.
+    const { fake, storage } = await setup({
+      fault: failFirst('stored-reset'),
+      staleOverwrite: { withinMs: 60_000, forMs: Infinity },
+    });
+    fake.seed('a.mvt', bytes('old'), ['UK', 'NY', 'SYD']);
+    await storage.put('a.mvt', bytes('new'), sha256Hex(bytes('new')));
+    expect((await storage.describe('a.mvt'))?.checksum).toBe(sha256Hex(bytes('old')));
+    expect(fake.requests).toEqual({ PUT: 1, DESCRIBE: 2, GET: 1 });
+    expect(storage.counters).toMatchObject({ ambiguousStored: 1, staleDescribes: 1, ambiguousResent: 0 });
+    expect(fake.identicalReputs).toEqual([]);
+  });
+
+  it('holds() checks the bytes, fetching them when DESCRIBE shows another checksum', async () => {
+    const { fake, storage } = await setup({ staleOverwrite: { withinMs: 60_000, forMs: Infinity } });
+    fake.seed('a.mvt', bytes('old'));
+    await storage.put('a.mvt', bytes('new'), sha256Hex(bytes('new')));
+    expect(await storage.holds('a.mvt', sha256Hex(bytes('new')).toLowerCase())).toBe(true);
+    expect(await storage.holds('a.mvt', sha256Hex(bytes('other')))).toBe(false);
+    expect(await storage.holds('none.mvt', sha256Hex(bytes('new')))).toBe(false);
+    expect(fake.requests).toEqual({ PUT: 1, DESCRIBE: 3, GET: 2 });
+  });
+
   it('PUTs again after an ambiguous failure when the stored copy holds other bytes', async () => {
     const { fake, storage } = await setup({ fault: failFirst('server-error') });
     fake.seed('a.mvt', bytes('old'));
@@ -117,7 +180,7 @@ describe('BunnyStorage', () => {
     await expect(storage.put('a.mvt', bytes('a'), sha256Hex(bytes('a')))).rejects.toThrow(
       /PUT a.mvt failed 4 times, last: HTTP 500/,
     );
-    expect(fake.requests).toEqual({ PUT: 4, DESCRIBE: 4 });
+    expect(fake.requests).toEqual({ PUT: 4, DESCRIBE: 8 });
   });
 
   it('gives up on 429 after the rate-limit wait cap', async () => {

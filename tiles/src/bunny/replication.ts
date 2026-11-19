@@ -94,9 +94,9 @@ export interface ReplicationResult {
   /** Files each region still lacked when the wait ended (missing and mismatched files count for every region). */
   missingByRegion: Record<string, number>;
   waitedMs: number;
-  /** Stored with other bytes than expected. Never polled again. */
+  /** DESCRIBE still showed other bytes than expected on its last answer. */
   mismatched: string[];
-  /** Not stored at all. Never polled again. */
+  /** DESCRIBE still found nothing on its last answer. */
   missing: string[];
   /** Files held by the main region whose replication did not finish in time. */
   incomplete: number;
@@ -113,6 +113,12 @@ export interface WaitOptions {
   concurrency?: number;
   /** Time from the start of one pass to the next (default 15 s). */
   intervalMs?: number;
+  /**
+   * How long a file may keep showing as missing or with other bytes before the gate gives up on it (default 5 min).
+   * DESCRIBE can lag an overwrite (see storage.ts), so such a file is DESCRIBEd again on every pass; once only such
+   * files are left and each has lasted this long, the gate ends without waiting out the timeout.
+   */
+  mismatchGraceMs?: number;
   signal?: AbortSignal;
   onPass?: (pass: {
     pass: number;
@@ -124,9 +130,10 @@ export interface WaitOptions {
 
 /**
  * The replication gate: DESCRIBEs every file, then again only the files some region still lacks, until every region
- * holds every file or the timeout passes. A missing or mismatched file fails the gate at once (it would never
- * replicate the expected bytes) but the others are still followed, for the per-region wait times. A DESCRIBE that
- * fails after its retries leaves its file pending; a refused password ends the gate with that error at once.
+ * holds every file or the timeout passes. A file DESCRIBE shows missing or with other bytes counts as lacking from
+ * every region and is asked about again on every pass (DESCRIBE can lag an overwrite); once only such files are left
+ * and each has shown so for `mismatchGraceMs`, the gate fails without waiting out the timeout. A DESCRIBE that fails
+ * after its retries leaves its file pending; a refused password ends the gate with that error at once.
  */
 export async function waitForReplication(
   storage: BunnyStorage,
@@ -136,9 +143,10 @@ export async function waitForReplication(
 ): Promise<ReplicationResult> {
   const started = performance.now();
   const elapsed = () => performance.now() - started;
+  const graceMs = options.mismatchGraceMs ?? 5 * 60_000;
   const lacking = items.map(() => regions as string[]);
-  const missing = new Set<number>();
-  const mismatched = new Set<number>();
+  /** Files whose last answer was missing or mismatched, and since when (elapsed ms) they have answered so. */
+  const wrong = new Map<number, { state: 'missing' | 'mismatched'; since: number }>();
   const regionWaitMs: Record<string, number | null> = Object.fromEntries(regions.map((region) => [region, null]));
   let pending = items.map((_, index) => index);
   let passes = 0;
@@ -165,19 +173,20 @@ export async function waitForReplication(
           return;
         }
         const { state, missingRegions } = classify(object, item.sha256, lacking[index]);
-        if (state === 'missing') {
-          missing.add(index);
-        } else if (state === 'mismatched') {
-          mismatched.add(index);
+        if (state === 'missing' || state === 'mismatched') {
+          const since = wrong.get(index)?.since ?? elapsed();
+          wrong.set(index, { state, since });
+          lacking[index] = regions;
         } else {
+          wrong.delete(index);
           lacking[index] = missingRegions;
         }
       },
       options.signal,
     );
-    pending = pending.filter((index) => !missing.has(index) && !mismatched.has(index) && lacking[index].length > 0);
+    pending = pending.filter((index) => wrong.has(index) || lacking[index].length > 0);
 
-    missingByRegion = Object.fromEntries(regions.map((region) => [region, missing.size + mismatched.size]));
+    missingByRegion = Object.fromEntries(regions.map((region) => [region, 0]));
     for (const index of pending) {
       for (const region of lacking[index]) {
         missingByRegion[region]++;
@@ -190,7 +199,11 @@ export async function waitForReplication(
     }
     options.onPass?.({ pass: passes, pending: pending.length, elapsedMs: Math.round(elapsed()), missingByRegion });
 
-    if (pending.length === 0 || options.signal?.aborted) {
+    const gaveUp = pending.every((index) => {
+      const since = wrong.get(index)?.since;
+      return since !== undefined && elapsed() - since >= graceMs;
+    });
+    if (pending.length === 0 || gaveUp || options.signal?.aborted) {
       break;
     }
     const remaining = options.timeoutMs - elapsed();
@@ -203,13 +216,15 @@ export async function waitForReplication(
     }
   }
 
+  const paths = (state: 'missing' | 'mismatched') =>
+    [...wrong].filter(([, file]) => file.state === state).map(([index]) => items[index].path);
   return {
-    complete: pending.length === 0 && missing.size === 0 && mismatched.size === 0,
+    complete: pending.length === 0,
     missingByRegion,
     waitedMs: Math.round(elapsed()),
-    mismatched: [...mismatched].map((index) => items[index].path),
-    missing: [...missing].map((index) => items[index].path),
-    incomplete: pending.length,
+    mismatched: paths('mismatched'),
+    missing: paths('missing'),
+    incomplete: pending.filter((index) => !wrong.has(index)).length,
     regionWaitMs,
     passes,
     errors,

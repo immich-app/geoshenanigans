@@ -4,12 +4,19 @@
  * mismatches, with the expected SHA-256 recomputed from the archive.
  *
  *   npm run bunny:replication -- --archive <path> [--prefix v1] [--min-zoom Z --max-zoom Z | --from-id N --to-id M]
- *     [--sample N [--per-zoom] [--seed S]] [--regions UK,SE,...] [--concurrency 256] [--addresses ip,ip,...]
- *     [--wait [--timeout-min 120] [--interval-s 30]] [--json <path>] [--list 100]
+ *     [--sample N [--per-zoom] [--seed S]] [--regions UK,SE,...] [--concurrency 256]
+ *     [--max-connections-per-address 8] [--addresses ip,ip,...]
+ *     [--wait [--timeout-min 120] [--interval-s 30] [--mismatch-grace-s 300]] [--json <path>] [--list 100]
  *
  * Without --sample every position of the range is checked, streamed (zooms default to the archive's). --per-zoom takes
  * N positions from each zoom instead of N overall. --wait polls until every region holds every file (the replication
- * gate) instead of checking once; it keeps the file list in memory, so use it for samples or small ranges.
+ * gate) instead of checking once; it keeps the file list in memory, so use it for samples or small ranges. With --wait,
+ * a file DESCRIBE shows missing or with other bytes is asked about again on every pass (DESCRIBE can lag an overwrite)
+ * and fails the wait once it has shown so for --mismatch-grace-s.
+ * Bunny allows 250 connections per zone per storage server, shared by every tool working on the zone: a seed takes up
+ * to 240 per address, so this check takes 8 per address by default (about 40 in flight over 5 addresses). Raise
+ * --max-connections-per-address only while nothing else uploads to the zone; --concurrency is lowered to the
+ * addresses times that.
  * Needs BUNNY_STORAGE_ZONE and BUNNY_STORAGE_PASSWORD (and BUNNY_STORAGE_HOST unless it is storage.bunnycdn.com).
  * --addresses (or BUNNY_STORAGE_ADDRESSES) pins the storage IPs instead of resolving the host.
  * The report goes to stdout as JSON (and to --json), a summary to stderr.
@@ -27,14 +34,15 @@ import {
   ReplicationResult,
   waitForReplication,
 } from '../replication';
-import { BunnyStorage, parseAddresses, storageOptionsFromEnv } from '../storage';
+import { BunnyStorage, parseAddresses, resolveStorageAddresses, sha256Hex, storageOptionsFromEnv } from '../storage';
 import { DEFAULT_PREFIX, tileIdZoom, tilePath, zoomEnd, zoomRange, zoomStart } from '../tile-id';
-import { sha256Hex } from '../upload';
 
 class UsageError extends Error {}
 
 const SHA_CACHE_MAX_TILE_BYTES = 4096;
 const SHA_CACHE_ENTRIES = 65_536;
+/** Leaves a running seed (240 per address by default) within Bunny's 250 per zone per storage server. */
+const DEFAULT_MAX_CONNECTIONS_PER_ADDRESS = 8;
 
 function integer(name: string, value: string | undefined, fallback?: number): number {
   if (value === undefined) {
@@ -181,6 +189,8 @@ async function main(): Promise<number> {
       wait: { type: 'boolean', default: false },
       'timeout-min': { type: 'string' },
       'interval-s': { type: 'string' },
+      'mismatch-grace-s': { type: 'string' },
+      'max-connections-per-address': { type: 'string' },
       json: { type: 'string' },
       list: { type: 'string' },
       addresses: { type: 'string' },
@@ -197,10 +207,16 @@ async function main(): Promise<number> {
   const regions = values.regions
     ? values.regions.split(',').map((region) => region.trim().toUpperCase())
     : REPLICATION_REGIONS;
-  const concurrency = Math.max(1, integer('concurrency', values.concurrency, 256));
   const prefix = values.prefix.replace(/^\/+|\/+$/g, '');
+  const perAddress = Math.max(
+    1,
+    integer('max-connections-per-address', values['max-connections-per-address'], DEFAULT_MAX_CONNECTIONS_PER_ADDRESS),
+  );
+  const timeoutMs = integer('timeout-min', values['timeout-min'], 120) * 60_000;
+  const intervalMs = integer('interval-s', values['interval-s'], 30) * 1000;
+  const mismatchGraceMs = integer('mismatch-grace-s', values['mismatch-grace-s'], 300) * 1000;
 
-  const storageOptions = { ...storageOptionsFromEnv(), concurrency };
+  const storageOptions = storageOptionsFromEnv();
   if (values.addresses !== undefined) {
     try {
       storageOptions.addresses = parseAddresses(values.addresses);
@@ -208,6 +224,13 @@ async function main(): Promise<number> {
       throw new UsageError((error as Error).message);
     }
   }
+  storageOptions.addresses ??= await resolveStorageAddresses(storageOptions.host);
+  const concurrency = Math.max(
+    1,
+    Math.min(integer('concurrency', values.concurrency, 256), storageOptions.addresses.length * perAddress),
+  );
+  storageOptions.concurrency = concurrency;
+  storageOptions.connectionsPerAddress = perAddress;
   const ranges = await ArchiveRanges.open(values.archive);
   const storage = new BunnyStorage(storageOptions);
   try {
@@ -252,8 +275,9 @@ async function main(): Promise<number> {
         }
       }
       const result: ReplicationResult = await waitForReplication(storage, items, regions, {
-        timeoutMs: integer('timeout-min', values['timeout-min'], 120) * 60_000,
-        intervalMs: integer('interval-s', values['interval-s'], 30) * 1000,
+        timeoutMs,
+        intervalMs,
+        mismatchGraceMs,
         concurrency,
         onPass: ({ pass, pending, elapsedMs, missingByRegion }) =>
           process.stderr.write(

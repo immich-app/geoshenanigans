@@ -4,12 +4,25 @@
  *
  * Re-PUTting a file with identical bytes clears its ReplicatedZones for good, so put() never sends a file twice
  * unless it knows the first copy was not stored: a 429 or a failed connect means it was not; after any other failure
- * (network error, timeout, 5xx) it asks DESCRIBE first and only PUTs again if the file is missing or holds other bytes.
+ * (network error, timeout, 5xx, 408) it asks DESCRIBE first and only PUTs again if the file is missing or holds other
+ * bytes, and not before 5 x settleMs has passed since the failure (the backend may still commit behind a gateway that
+ * gave up, as after a client timeout).
+ *
+ * DESCRIBE's Checksum can lag an overwrite: measured on Bunny, two writes of different bytes to one path within about
+ * a second left 10-25% of files reporting the first version's Checksum, Length and ReplicatedZones for minutes, some
+ * for good, while GET already returned the second (writes 2 s or more apart, and single overwrites of older files, were
+ * always right). So holds(), and put() after an ambiguous failure, GET and hash a file whose DESCRIBE shows another
+ * checksum before deciding it does not hold the bytes. Never write one path twice within a few seconds, and never run
+ * a sync while a seed runs.
+ *
+ * Bunny allows 250 connections per zone per storage server, and that budget is shared by every tool working on the
+ * zone at once (a seed defaults to 240 per address; bunny:replication to 8).
  *
  * A storage address that keeps failing is set aside for a while (doubling up to a minute) and probed one request at
  * a time: otherwise a server that fails fast would look the least busy and draw most requests and their retries.
  * setAddresses() moves a long-lived client to the addresses a later lookup returns.
  */
+import { createHash } from 'node:crypto';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -17,6 +30,9 @@ import { Pool } from 'undici';
 
 export const DEFAULT_STORAGE_HOST = 'storage.bunnycdn.com';
 export const DEFAULT_TIMEOUT_MS = 60_000;
+
+/** Uppercase hex SHA-256, as Bunny's Checksum header and DESCRIBE use. */
+export const sha256Hex = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex').toUpperCase();
 
 export interface StorageObject {
   /** Uppercase hex SHA-256 of the stored bytes. */
@@ -35,13 +51,18 @@ export interface StorageListEntry extends StorageObject {
 export interface RetryOptions {
   /** Attempts per request for retryable failures other than 429 (5xx, network errors, timeouts). */
   maxAttempts: number;
+  /** At least 1: a zero back-off would retry 429s in a tight loop. */
   baseDelayMs: number;
   maxDelayMs: number;
-  /** Total 429 back-off one request may spend before it fails. 429s are otherwise retried without limit. */
+  /**
+   * How long one request may keep getting 429s, from the first, before it fails (wall clock). 429s are otherwise
+   * retried without limit.
+   */
   maxRateLimitWaitMs: number;
   /**
-   * Least wait between an ambiguous PUT failure and its DESCRIBE, so a request the server is still finishing lands
-   * first (five times this after a client timeout).
+   * Least wait between an ambiguous PUT failure and its first DESCRIBE (five times this after a client timeout). A
+   * file not found then is only PUT again once five times this has passed since the failure, so a request the server
+   * is still finishing lands first.
    */
   settleMs: number;
 }
@@ -65,7 +86,7 @@ export interface BunnyStorageOptions {
   addresses?: string[];
   /** Connections to each address at most (default: concurrency spread over the addresses, rounded up). */
   connectionsPerAddress?: number;
-  /** Per request: time to response headers and between body reads (DEFAULT_TIMEOUT_MS). */
+  /** Per request: time to response headers and between body reads (DEFAULT_TIMEOUT_MS; at least 1, as 0 means none). */
   timeoutMs?: number;
   retry?: Partial<RetryOptions>;
   /** Counters to add to; pass one object to several clients to sum them. */
@@ -91,6 +112,8 @@ export interface StorageCounters {
   ambiguousStored: number;
   /** Ambiguous PUT failures where DESCRIBE showed the file missing or different, so it was PUT again. */
   ambiguousResent: number;
+  /** DESCRIBEs that showed another checksum while GET returned the expected bytes (DESCRIBE lagging an overwrite). */
+  staleDescribes: number;
   /** Times a storage address was set aside after failing repeatedly. */
   addressTrips: number;
   /** Time spent in requests that got an answer, summed (divide by requests for the average). */
@@ -108,6 +131,7 @@ export const newCounters = (): StorageCounters => ({
   timeouts: 0,
   ambiguousStored: 0,
   ambiguousResent: 0,
+  staleDescribes: 0,
   addressTrips: 0,
   requestMs: 0,
 });
@@ -274,7 +298,9 @@ export class BunnyStorage {
     this.password = options.password;
     this.endpoint = parseHost(options.host ?? DEFAULT_STORAGE_HOST);
     this.retry = { ...DEFAULT_RETRY, ...options.retry };
-    this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.retry.baseDelayMs = Math.max(1, this.retry.baseDelayMs);
+    // undici reads a timeout of 0 as none, and a request that never ends would hold up a stop for good.
+    this.timeoutMs = Math.max(1, options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     this.concurrency = Math.max(1, options.concurrency ?? 64);
     this.slots = new Semaphore(this.concurrency);
     this.counters = options.counters ?? newCounters();
@@ -289,7 +315,7 @@ export class BunnyStorage {
     const checksum = sha256Hex.toUpperCase();
     const headers = { checksum, 'content-type': 'application/octet-stream' };
     let failures = 0;
-    let rateLimitedFor = 0;
+    let rateLimitedSince: number | undefined;
     let rateLimitedTimes = 0;
     // The address that failed last: the retry and the DESCRIBE go elsewhere if another is usable.
     let avoid: PinnedPool | undefined;
@@ -301,7 +327,8 @@ export class BunnyStorage {
         return;
       }
       if ('status' in outcome && outcome.status === 429) {
-        rateLimitedFor += await this.rateLimitPause(++rateLimitedTimes, rateLimitedFor, `PUT ${path}`);
+        rateLimitedSince ??= performance.now();
+        await this.rateLimitPause(++rateLimitedTimes, rateLimitedSince, `PUT ${path}`);
         this.counters.retries++;
         continue;
       }
@@ -318,14 +345,21 @@ export class BunnyStorage {
         this.counters.retries++;
         continue;
       }
-      // Ambiguous: the server may have stored the body before the failure reached us. After a timeout it may still
-      // be working on it, so give it longer before asking.
-      const settle = 'kind' in outcome && outcome.kind === 'timeout' ? this.retry.settleMs * 5 : this.retry.settleMs;
+      // Ambiguous: the server may have stored the body before the failure reached us, or may still store it: after a
+      // client timeout, or behind a gateway that answered 5xx or dropped the connection while the backend carried on.
+      // Ask after a settle (longer after a timeout); if the file is not there yet, ask again once the full window
+      // since the failure has passed, and only then PUT again.
+      const failedAt = performance.now();
+      const window = this.retry.settleMs * 5;
+      const settle = 'kind' in outcome && outcome.kind === 'timeout' ? window : this.retry.settleMs;
       await this.pause(Math.max(settle, this.backoff(failures)));
-      this.counters.describes++;
-      const described = await this.idempotent('DESCRIBE', path, [200, 404], avoid);
-      const stored = described.status === 404 ? null : parseObject(described.body);
-      if (stored?.checksum.toUpperCase() === checksum) {
+      let stored = await this.storedAs(path, checksum, avoid);
+      const rest = failedAt + window - performance.now();
+      if (!stored && rest > 0) {
+        await this.pause(rest);
+        stored = await this.storedAs(path, checksum, avoid);
+      }
+      if (stored) {
         this.counters.ambiguousStored++;
         return;
       }
@@ -347,6 +381,31 @@ export class BunnyStorage {
   async get(path: string): Promise<Uint8Array | null> {
     const response = await this.idempotent('GET', path, [200, 404]);
     return response.status === 404 ? null : new Uint8Array(response.body);
+  }
+
+  /**
+   * Whether `path` holds exactly the bytes with this SHA-256: DESCRIBE, and if it shows another checksum, GET and hash
+   * the file (DESCRIBE can lag an overwrite, see the module comment), so a caller never PUTs bytes already there.
+   */
+  holds(path: string, sha256: string): Promise<boolean> {
+    return this.storedAs(path, sha256.toUpperCase());
+  }
+
+  private async storedAs(path: string, checksum: string, avoid?: PinnedPool): Promise<boolean> {
+    this.counters.describes++;
+    const described = await this.idempotent('DESCRIBE', path, [200, 404], avoid);
+    if (described.status === 404) {
+      return false;
+    }
+    if (parseObject(described.body).checksum === checksum) {
+      return true;
+    }
+    const fetched = await this.idempotent('GET', path, [200, 404], avoid);
+    const same = fetched.status === 200 && sha256Hex(fetched.body) === checksum;
+    if (same) {
+      this.counters.staleDescribes++;
+    }
+    return same;
   }
 
   /** Deletes a file, or a folder and everything below it if `path` ends with "/". A missing path is not an error. */
@@ -412,7 +471,7 @@ export class BunnyStorage {
     avoid?: PinnedPool,
   ): Promise<{ status: number; body: Buffer }> {
     let failures = 0;
-    let rateLimitedFor = 0;
+    let rateLimitedSince: number | undefined;
     let rateLimitedTimes = 0;
     for (;;) {
       const outcome = await this.send(method, path, {}, avoid);
@@ -421,7 +480,8 @@ export class BunnyStorage {
         return outcome;
       }
       if ('status' in outcome && outcome.status === 429) {
-        rateLimitedFor += await this.rateLimitPause(++rateLimitedTimes, rateLimitedFor, `${method} ${path}`);
+        rateLimitedSince ??= performance.now();
+        await this.rateLimitPause(++rateLimitedTimes, rateLimitedSince, `${method} ${path}`);
         this.counters.retries++;
         continue;
       }
@@ -437,14 +497,15 @@ export class BunnyStorage {
     }
   }
 
-  private async rateLimitPause(times: number, waitedMs: number, what: string): Promise<number> {
+  /** Backs off after a 429, or fails once the 429s that started at `since` would outlast maxRateLimitWaitMs. */
+  private async rateLimitPause(times: number, since: number, what: string): Promise<void> {
     this.counters.rateLimited++;
     const delay = this.backoff(times);
-    if (waitedMs + delay > this.retry.maxRateLimitWaitMs) {
-      throw new StorageError(`${what} still rate limited after ${Math.round(waitedMs / 1000)} s`, 429);
+    const waited = performance.now() - since;
+    if (waited + delay > this.retry.maxRateLimitWaitMs) {
+      throw new StorageError(`${what} still rate limited after ${Math.round(waited / 1000)} s`, 429);
     }
     await this.pause(delay);
-    return delay;
   }
 
   private async pause(ms: number): Promise<void> {

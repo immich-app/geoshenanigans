@@ -10,14 +10,13 @@
  */
 import { closeSync, openSync, readSync } from 'node:fs';
 import { parentPort, workerData } from 'node:worker_threads';
-import { BunnyStorage, StorageCounters } from './storage';
+import { BunnyStorage, sha256Hex, StorageCounters } from './storage';
 import { tilePath } from './tile-id';
 import {
   ChunkDescriptor,
   chunkProbeIds,
   MainMessage,
   newUploadStats,
-  sha256Hex,
   UploadFailure,
   UploadItem,
   uploadTiles,
@@ -127,8 +126,7 @@ async function probe(chunk: ChunkDescriptor): Promise<string | undefined> {
       }
       const path = tilePath(config.prefix, tileId);
       try {
-        const stored = await storage.describe(path);
-        if (stored && stored.checksum === content(run.offset, run.length).sha256) {
+        if (await storage.holds(path, content(run.offset, run.length).sha256)) {
           reason ??= `${path} is already stored with the same bytes`;
         }
       } catch (error) {
@@ -230,11 +228,11 @@ async function main() {
     // Whatever was not finished stays "started" in the checkpoint, so a resume verifies it.
     for (const state of states.values()) {
       if (!state.reported) {
-        post({ type: 'chunk-stopped', chunkId: state.chunkId });
+        post({ type: 'chunk-stopped', chunkId: state.chunkId, failures: state.failures });
       }
     }
     for (const chunk of queue) {
-      post({ type: 'chunk-stopped', chunkId: chunk.chunkId });
+      post({ type: 'chunk-stopped', chunkId: chunk.chunkId, failures: [] });
     }
     post({ type: 'final', ...snapshot() });
     await storage.close();

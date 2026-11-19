@@ -10,8 +10,10 @@
  *
  * --to-id is exclusive. Zooms default to the archive's. The state dir defaults to
  * ./bunny-seed-<zone>-<prefix>-<from>-<to>. --concurrency is lowered to the storage addresses times
- * --max-connections-per-address (Bunny allows 250 per zone per storage server). --addresses (or
- * BUNNY_STORAGE_ADDRESSES) pins the storage IPs instead of resolving the host, e.g. to leave out a failing server.
+ * --max-connections-per-address (Bunny allows 250 per zone per storage server, shared by every tool working on the
+ * zone at once: the default 240 leaves 10, which bunny:replication's default of 8 fits in; lower it to run anything
+ * heavier alongside). --addresses (or BUNNY_STORAGE_ADDRESSES) pins the storage IPs instead of resolving the host,
+ * e.g. to leave out a failing server. --retry-base-ms and --request-timeout-s must be at least 1.
  * --settle-ms is the least wait before DESCRIBEing a file whose PUT failed ambiguously (five times that after a
  * timeout); it is for tests: below the default, a PUT the server finishes late can be sent again with the same bytes,
  * which clears the file's replication.
@@ -34,7 +36,7 @@ import { DEFAULT_MAX_CONNECTIONS_PER_ADDRESS, formatDuration, runSeed } from '..
 
 class UsageError extends Error {}
 
-function integer(name: string, value: string | undefined, fallback?: number): number {
+function integer(name: string, value: string | undefined, fallback?: number, min = 0): number {
   if (value === undefined) {
     if (fallback === undefined) {
       throw new UsageError(`--${name} is required`);
@@ -42,8 +44,8 @@ function integer(name: string, value: string | undefined, fallback?: number): nu
     return fallback;
   }
   const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < 0) {
-    throw new UsageError(`--${name} must be a non-negative integer, got ${value}`);
+  if (!Number.isSafeInteger(parsed) || parsed < min) {
+    throw new UsageError(`--${name} must be an integer of at least ${min}, got ${value}`);
   }
   return parsed;
 }
@@ -81,6 +83,38 @@ async function main(): Promise<number> {
     throw new UsageError('Give either --min-zoom/--max-zoom or --from-id/--to-id, not both');
   }
 
+  // Numbers first, so a typo fails before the archive is opened.
+  const retry: Partial<RetryOptions> = {};
+  if (values['retry-base-ms'] !== undefined) {
+    // 0 would retry 429s in a tight loop.
+    retry.baseDelayMs = integer('retry-base-ms', values['retry-base-ms'], undefined, 1);
+  }
+  if (values['settle-ms'] !== undefined) {
+    retry.settleMs = integer('settle-ms', values['settle-ms']);
+  }
+  // 0 would turn off every request timeout (undici reads 0 as none), so a stop could wait on a request for good.
+  const timeoutSeconds = integer('request-timeout-s', values['request-timeout-s'], 60, 1);
+  const chunkSize = integer('chunk-size', values['chunk-size'], 65_536, 1);
+  const workers = integer('workers', values.workers, 16, 1);
+  const concurrency = integer('concurrency', values.concurrency, 1_200, 1);
+  const maxConnectionsPerAddress = integer(
+    'max-connections-per-address',
+    values['max-connections-per-address'],
+    DEFAULT_MAX_CONNECTIONS_PER_ADDRESS,
+    1,
+  );
+  const maxFailures = integer('max-failures', values['max-failures'], 1_000, 1);
+  const progressIntervalMs = integer('progress-interval-s', values['progress-interval-s'], 10, 1) * 1000;
+  const prefix = values.prefix.replace(/^\/+|\/+$/g, '');
+  const storage = storageOptionsFromEnv();
+  if (values.addresses !== undefined) {
+    try {
+      storage.addresses = parseAddresses(values.addresses);
+    } catch (error) {
+      throw new UsageError((error as Error).message);
+    }
+  }
+
   const header = await ArchiveRanges.open(values.archive).then(async (ranges) => {
     await ranges.close();
     return ranges.archive.header;
@@ -94,23 +128,6 @@ async function main(): Promise<number> {
   if (to <= from) {
     throw new UsageError(`Empty range [${from}, ${to})`);
   }
-  const prefix = values.prefix.replace(/^\/+|\/+$/g, '');
-  const storage = storageOptionsFromEnv();
-  if (values.addresses !== undefined) {
-    try {
-      storage.addresses = parseAddresses(values.addresses);
-    } catch (error) {
-      throw new UsageError((error as Error).message);
-    }
-  }
-  const retry: Partial<RetryOptions> = {};
-  if (values['retry-base-ms'] !== undefined) {
-    retry.baseDelayMs = integer('retry-base-ms', values['retry-base-ms']);
-  }
-  if (values['settle-ms'] !== undefined) {
-    retry.settleMs = integer('settle-ms', values['settle-ms']);
-  }
-  const timeoutSeconds = integer('request-timeout-s', values['request-timeout-s'], 60);
   const safeName = (text: string) => text.replace(/[^\w.-]+/g, '_');
 
   const controller = new AbortController();
@@ -133,22 +150,15 @@ async function main(): Promise<number> {
     prefix,
     from,
     to,
-    chunkSize: Math.max(1, integer('chunk-size', values['chunk-size'], 65_536)),
-    workers: Math.max(1, integer('workers', values.workers, 16)),
-    concurrency: Math.max(1, integer('concurrency', values.concurrency, 1_200)),
+    chunkSize,
+    workers,
+    concurrency,
     stateDir: values['state-dir'] ?? `bunny-seed-${safeName(storage.zone)}-${safeName(prefix) || 'root'}-${from}-${to}`,
     verifyExisting: values['verify-existing'],
     storage: { ...storage, timeoutMs: timeoutSeconds * 1000, retry },
-    maxConnectionsPerAddress: Math.max(
-      1,
-      integer(
-        'max-connections-per-address',
-        values['max-connections-per-address'],
-        DEFAULT_MAX_CONNECTIONS_PER_ADDRESS,
-      ),
-    ),
-    maxFailures: Math.max(1, integer('max-failures', values['max-failures'], 1_000)),
-    progressIntervalMs: Math.max(1, integer('progress-interval-s', values['progress-interval-s'], 10)) * 1000,
+    maxConnectionsPerAddress,
+    maxFailures,
+    progressIntervalMs,
     signal: controller.signal,
   });
 

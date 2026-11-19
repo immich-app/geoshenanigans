@@ -73,7 +73,7 @@ describe('waitForReplication', () => {
     expect(fake.requests.DESCRIBE - describesBefore).toBeLessThan(60 * result.passes);
   });
 
-  it('fails at once on missing and mismatched files', async () => {
+  it('with no grace, fails as soon as only missing and mismatched files are left', async () => {
     const { fake, storage } = await setup({ replicationDelayMs: { UK: 1, NY: 1, SYD: 1 } });
     const items = await upload(storage, 5);
     fake.seed('r/other.mvt', new TextEncoder().encode('other'));
@@ -81,13 +81,60 @@ describe('waitForReplication', () => {
       storage,
       [...items, { path: 'r/none.mvt', sha256: 'AA' }, { path: 'r/other.mvt', sha256: items[0].sha256 }],
       REGIONS,
-      { timeoutMs: 10_000, intervalMs: 20 },
+      { timeoutMs: 10_000, intervalMs: 20, mismatchGraceMs: 0 },
     );
     expect(result.complete).toBe(false);
     expect(result.missing).toEqual(['r/none.mvt']);
     expect(result.mismatched).toEqual(['r/other.mvt']);
+    expect(result.incomplete).toBe(0);
     expect(result.waitedMs).toBeLessThan(5_000);
     expect(result.missingByRegion).toEqual({ UK: 2, NY: 2, SYD: 2 });
+  });
+
+  it('gives up on files that stay missing or mismatched once the grace has passed, not at the timeout', async () => {
+    const { fake, storage } = await setup();
+    fake.seed('r/other.mvt', new TextEncoder().encode('other'), REGIONS);
+    const result = await waitForReplication(
+      storage,
+      [
+        { path: 'r/none.mvt', sha256: 'AA' },
+        { path: 'r/other.mvt', sha256: 'BB' },
+      ],
+      REGIONS,
+      { timeoutMs: 20_000, intervalMs: 20, mismatchGraceMs: 300 },
+    );
+    expect(result).toMatchObject({ complete: false, missing: ['r/none.mvt'], mismatched: ['r/other.mvt'] });
+    expect(result.passes).toBeGreaterThan(3);
+    expect(result.waitedMs).toBeGreaterThanOrEqual(300);
+    expect(result.waitedMs).toBeLessThan(5_000);
+  });
+
+  it('keeps asking about a file whose DESCRIBE lags an overwrite, and one stored late, until they are right', async () => {
+    // Measured on Bunny: after two quick writes DESCRIBE can show the first version for a while.
+    const { fake, storage } = await setup({
+      staleOverwrite: { withinMs: 60_000, forMs: 400 },
+      replicationDelayMs: { UK: 10, NY: 10, SYD: 10 },
+    });
+    const v1 = new TextEncoder().encode('v1');
+    const v2 = new TextEncoder().encode('v2');
+    fake.seed('r/a.mvt', v1, REGIONS);
+    await storage.put('r/a.mvt', v2, sha256Hex(v2));
+    expect((await storage.describe('r/a.mvt'))?.checksum).toBe(sha256Hex(v1));
+    const late = setTimeout(() => fake.seed('r/late.mvt', v2, REGIONS), 200);
+    cleanup.push(async () => clearTimeout(late));
+
+    const result = await waitForReplication(
+      storage,
+      [
+        { path: 'r/a.mvt', sha256: sha256Hex(v2) },
+        { path: 'r/late.mvt', sha256: sha256Hex(v2) },
+      ],
+      REGIONS,
+      { timeoutMs: 5_000, intervalMs: 50 },
+    );
+    expect(result).toMatchObject({ complete: true, missing: [], mismatched: [], incomplete: 0 });
+    expect(result.passes).toBeGreaterThan(2);
+    expect(result.waitedMs).toBeGreaterThanOrEqual(350);
   });
 
   it('fails at once on a fatal DESCRIBE error instead of waiting out the timeout', async () => {
@@ -210,7 +257,16 @@ describe('bunny:replication CLI', () => {
     expect(broken.report.mismatchedPaths).toEqual([tilePath('itest', 7)]);
     expect(broken.report.missingPaths).toEqual([tilePath('itest', 9)]);
 
-    const waited = await run(fake, [...firstZooms, '--wait', '--interval-s', '1', '--timeout-min', '1']);
+    const waited = await run(fake, [
+      ...firstZooms,
+      '--wait',
+      '--interval-s',
+      '1',
+      '--timeout-min',
+      '1',
+      '--mismatch-grace-s',
+      '0',
+    ]);
     expect(waited.code, waited.stderr).toBe(1);
     expect(waited.report).toMatchObject({ complete: false, files: 21, missing: [tilePath('itest', 9)] });
   }, 60_000);

@@ -14,14 +14,19 @@ export interface TileRun {
 
 const HEADER_SIZE_BYTES = 127;
 const MAX_DEPTH = 3;
-const LEAF_CACHE_SIZE = 64;
+/** A planet leaf holds ~61k entries, ~10 MiB as objects; lookups come in tile-id order, so few are needed. */
+const LEAF_CACHE_SIZE = 16;
 
 /**
  * A PMTiles archive on disk walked by tile-id range: leaves outside the range are never read, so a job that starts
  * deep into z15 does not decode every leaf before it.
  */
 export class ArchiveRanges {
-  private leafCache = new Map<number, Entry[]>();
+  /**
+   * Leaves by offset, least recently used first, kept while they load too, so concurrent find()s in one leaf read and
+   * decode it once.
+   */
+  private leafCache = new Map<number, Promise<Entry[]>>();
 
   private constructor(
     readonly archive: Archive,
@@ -117,21 +122,34 @@ export class ArchiveRanges {
     }
   }
 
-  private async leaf(entry: Entry): Promise<Entry[]> {
+  private leaf(entry: Entry): Promise<Entry[]> {
     const cached = this.leafCache.get(entry.offset);
     if (cached) {
+      this.leafCache.delete(entry.offset);
+      this.leafCache.set(entry.offset, cached);
       return cached;
     }
+    const loading = this.loadLeaf(entry);
+    if (this.leafCache.size >= LEAF_CACHE_SIZE) {
+      this.leafCache.delete(this.leafCache.keys().next().value!);
+    }
+    this.leafCache.set(entry.offset, loading);
+    // A failed read is not kept: the next caller tries again.
+    loading.catch(() => {
+      if (this.leafCache.get(entry.offset) === loading) {
+        this.leafCache.delete(entry.offset);
+      }
+    });
+    return loading;
+  }
+
+  private async loadLeaf(entry: Entry): Promise<Entry[]> {
     const { header } = this.archive;
     const bytes = await this.read(header.leafDirectoryOffset + entry.offset, entry.length);
     const entries = deserializeIndex(await decompress(bytes, header.internalCompression));
     if (entries.length === 0) {
       throw new Error(`Empty leaf directory at offset ${entry.offset}`);
     }
-    if (this.leafCache.size >= LEAF_CACHE_SIZE) {
-      this.leafCache.delete(this.leafCache.keys().next().value!);
-    }
-    this.leafCache.set(entry.offset, entries);
     return entries;
   }
 }

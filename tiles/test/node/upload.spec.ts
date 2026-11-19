@@ -1,4 +1,4 @@
-import { appendFile, FileHandle, open, readFile, writeFile } from 'node:fs/promises';
+import { appendFile, FileHandle, open, readFile, utimes, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { ArchiveRanges } from '../../src/bunny/archive-walk';
@@ -7,6 +7,7 @@ import { tilePath } from '../../src/bunny/tile-id';
 import {
   Checkpoint,
   chunkProbeIds,
+  LOCK_SETTLE_MS,
   planChunks,
   preflightIds,
   SeedParams,
@@ -86,10 +87,27 @@ describe('uploadTiles', () => {
 
     const stats = await uploadTiles(storage, all, { verify: true });
     expect(stats).toMatchObject({ uploaded: 20, skippedExisting: 10, failed: 0 });
-    expect(fake.requests).toEqual({ DESCRIBE: 30, PUT: 20 });
+    // A file with another checksum is fetched and hashed before it is replaced (DESCRIBE can lag an overwrite).
+    expect(fake.requests).toEqual({ DESCRIBE: 30, GET: 10, PUT: 20 });
     for (const item of all) {
       expect(fake.checksum(tilePath('v1', item.tileId))).toBe(item.sha256);
     }
+    expect(fake.identicalReputs).toEqual([]);
+  });
+
+  it('in verify mode does not PUT bytes already stored when DESCRIBE still shows the version they overwrote', async () => {
+    const { fake, storage } = await setup({ staleOverwrite: { withinMs: 60_000, forMs: Infinity } });
+    const all = items(10);
+    for (const item of all) {
+      fake.seed(tilePath('v1', item.tileId), new TextEncoder().encode(`older ${item.tileId}`));
+    }
+    await uploadTiles(storage, all.slice(0, 5), { prefix: 'v1' });
+    const puts = fake.requests.PUT;
+
+    const stats = await uploadTiles(storage, all, { verify: true });
+    expect(stats).toMatchObject({ uploaded: 5, skippedExisting: 5, failed: 0 });
+    expect(fake.requests.PUT - puts).toBe(5);
+    expect(storage.counters.staleDescribes).toBe(5);
     expect(fake.identicalReputs).toEqual([]);
   });
 
@@ -294,13 +312,65 @@ describe('Checkpoint', () => {
   });
 
   it('refuses a state dir another live process holds, and takes over a stale lock', async () => {
-    await writeFile(join(dir, 'seed.lock'), `${process.ppid}\n`);
+    const lockPath = join(dir, 'seed.lock');
+    await writeFile(lockPath, `${process.ppid} 0123abcd\n`);
     await expect(Checkpoint.open(dir, params)).rejects.toThrow(/in use by process/);
-    await writeFile(join(dir, 'seed.lock'), '2147483646\n');
+    await writeFile(lockPath, '2147483646 0123abcd\n');
     const checkpoint = await Checkpoint.open(dir, params);
-    expect(await readFile(join(dir, 'seed.lock'), 'utf8')).toBe(`${process.pid}\n`);
+    expect(await readFile(lockPath, 'utf8')).toMatch(new RegExp(`^${process.pid} [0-9a-f]{16}\n$`));
+    // A second open in the same process is refused too.
+    await expect(Checkpoint.open(dir, params)).rejects.toThrow(/in use by process/);
     await checkpoint.close();
-    await expect(readFile(join(dir, 'seed.lock'))).rejects.toThrow(/ENOENT/);
+    await expect(readFile(lockPath)).rejects.toThrow(/ENOENT/);
+  });
+
+  it('takes an unreadable lock as held unless it is old', async () => {
+    // Locks are linked into place whole; an empty one is only taken over once it is clearly a leftover.
+    const lockPath = join(dir, 'seed.lock');
+    await writeFile(lockPath, '');
+    await expect(Checkpoint.open(dir, params)).rejects.toThrow(/seed\.lock is unreadable/);
+    const old = new Date(Date.now() - 10 * 60_000);
+    await utimes(lockPath, old, old);
+    await (await Checkpoint.open(dir, params)).close();
+  });
+
+  it('gives up a stale lock it took over when another process took it over at the same moment', async () => {
+    const lockPath = join(dir, 'seed.lock');
+    await writeFile(lockPath, '2147483646 0123abcd\n');
+    const opening = Checkpoint.open(dir, params);
+    const outcome = opening.then(
+      () => 'opened',
+      (error: Error) => error.message,
+    );
+    // While it waits to confirm the takeover, a second process removes its lock and links its own.
+    await new Promise((resolve) => setTimeout(resolve, LOCK_SETTLE_MS / 2));
+    await writeFile(lockPath, `${process.ppid} 4567cdef\n`);
+    expect(await outcome).toMatch(new RegExp(`seed\\.lock now names process ${process.ppid}: another seed took`));
+    expect(await readFile(lockPath, 'utf8')).toBe(`${process.ppid} 4567cdef\n`);
+  });
+
+  it('starts no chunk once another process took the state dir over, and leaves its lock alone', async () => {
+    const checkpoint = await Checkpoint.open(dir, params);
+    await checkpoint.markStarted([1]);
+    const lockPath = join(dir, 'seed.lock');
+    await writeFile(lockPath, `${process.ppid} 4567cdef\n`);
+    await expect(checkpoint.markStarted([2])).rejects.toThrow(/another seed took this state dir over/);
+    expect([...checkpoint.started]).toEqual([1]);
+    await checkpoint.close();
+    expect(await readFile(join(dir, 'checkpoint.log'), 'utf8')).toBe('start 1\n');
+    expect(await readFile(lockPath, 'utf8')).toBe(`${process.ppid} 4567cdef\n`);
+  });
+
+  it('flush() rejects once a line failed to reach the disk', async () => {
+    const checkpoint = await Checkpoint.open(dir, params);
+    await checkpoint.markStarted([1]);
+    await checkpoint.flush();
+    const spy = await shortWrites(() => Object.assign(new Error('EIO: i/o error, write'), { code: 'EIO' }));
+    const done = checkpoint.markDone(1).catch(() => {});
+    await expect(checkpoint.flush()).rejects.toThrow(/EIO/);
+    await done;
+    spy.mockRestore();
+    await checkpoint.close();
   });
 
   it('refuses a state dir of another seed or a damaged log', async () => {
@@ -444,6 +514,22 @@ describe('planChunks', () => {
       ids.push(chunk.chunkId);
     }
     expect(ids).toEqual([0, 2, 4, 6, 8, 10, 12]);
+  });
+
+  it('reads and decodes a leaf once for concurrent lookups in it', async () => {
+    const scratch = await scratchDir();
+    cleanup.push(scratch.remove);
+    const fixture = await writeFixtureArchive(scratch.dir, 1_365, 5, 300);
+    const ranges = await ArchiveRanges.open(fixture.path);
+    cleanup.push(() => ranges.close());
+    const handle = await open(fixture.path);
+    const read = vi.spyOn(Object.getPrototypeOf(handle) as FileHandle, 'read');
+    await handle.close();
+    cleanup.push(async () => read.mockRestore());
+    // Ids 0-127 all sit in the first leaf (300 entries of at least one position each).
+    const runs = await Promise.all(Array.from({ length: 128 }, (_, id) => ranges.find(id)));
+    expect(runs.every((run, id) => run && run.tileId <= id && id < run.tileId + run.runLength)).toBe(true);
+    expect(read).toHaveBeenCalledTimes(1);
   });
 
   it('finds the run of single ids', async () => {

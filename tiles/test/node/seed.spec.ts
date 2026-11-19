@@ -1,9 +1,10 @@
 import { ChildProcess, spawn } from 'node:child_process';
+import { mkdirSync, readFileSync, rmSync } from 'node:fs';
 import { mkdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { tilePath } from '../../src/bunny/tile-id';
-import { runSeed, SeedOptions, SeedStatus } from '../../src/bunny/upload';
+import { Checkpoint, runSeed, SeedOptions, SeedStatus } from '../../src/bunny/upload';
 import { FakeStorage, FakeStorageOptions, Fault } from './fake-storage';
 import { FixtureArchive, random, scratchDir, writeFixtureArchive } from './upload-fixture';
 
@@ -380,6 +381,107 @@ describe('runSeed', () => {
     expect(fake.identicalReputs).toEqual([]);
   });
 
+  it('verifies a chunk it had started on resume, even where the per-chunk probe sees nothing stored', async () => {
+    // One chunk; its first position never answers and positions 1-20 are stored, all between the probe's samples
+    // (0, 22, 43, ...). Only the checkpoint says the chunk was started, so only it keeps the resume from PUTting
+    // those 20 again.
+    const controller = new AbortController();
+    let blocked = true;
+    const allowed = new Set(Array.from({ length: 20 }, (_, i) => tilePath('itest', i + 1)));
+    const { fixture, fake, options } = await setup(1_365, {
+      fault: ({ method, path }) => (blocked && method === 'PUT' && !allowed.has(path) ? 'hang' : undefined),
+      onRequest: () => {
+        if ([...allowed].every((path) => fake.files.has(path))) {
+          controller.abort();
+        }
+      },
+    });
+    const first = await runSeed(options({ chunkSize: 2_048, workers: 1, concurrency: 32, signal: controller.signal }));
+    expect(first.status.state).toBe('interrupted');
+    expect(fake.files.size).toBe(20);
+
+    blocked = false;
+    const logs: string[] = [];
+    const resumed = await runSeed(options({ chunkSize: 2_048, workers: 1, log: (line) => logs.push(line) }));
+    expect(resumed.status.state).toBe('complete');
+    expect(resumed.status.chunks.overlapping).toBe(0);
+    expect(logs.some((line) => /already stored with the same bytes/.test(line))).toBe(false);
+    expect(resumed.status.files.skippedExisting).toBe(20);
+    expect(fake.identicalReputs).toEqual([]);
+    expectStored(fake, fixture, 0, 1_365);
+  });
+
+  it('lists the failed files of a chunk a worker stopped on partway', async () => {
+    const bad = (path: string) => Number(path.split('/').pop()!.split('.')[0]) < 64 && path.startsWith('itest/');
+    const { options } = await setup(1_365, {
+      fault: ({ method, path }) => (method === 'PUT' && bad(path) ? 'server-error' : undefined),
+    });
+    // Positions 0-63 of z0-z5 sit in chunk 0; the worker stops there after 10 failures, before the chunk is done.
+    const { status, failures } = await runSeed(options({ workers: 1, concurrency: 4, maxFailures: 10 }));
+    expect(status.state).toBe('failed');
+    expect(status.files.failed).toBeGreaterThanOrEqual(10);
+    const lines = (await readFile(status.failuresFile, 'utf8')).trim().split('\n');
+    expect(lines).toHaveLength(status.files.failed);
+    expect(failures).toHaveLength(status.files.failed);
+    expect(failures.every((failure) => bad(failure.path))).toBe(true);
+    expect(status.chunks.failed).toBe(1);
+  });
+
+  it('stops, with the reason, once status.json can no longer be written', async () => {
+    let puts = 0;
+    let statusPath = '';
+    const { fake, options } = await setup(5_461, {
+      latencyMs: 1,
+      onRequest: ({ method }) => {
+        if (method === 'PUT' && ++puts === 500) {
+          // A directory where the file goes: every later status write fails.
+          for (;;) {
+            rmSync(statusPath, { recursive: true, force: true });
+            try {
+              mkdirSync(statusPath);
+              break;
+            } catch {
+              // A status write landed in between; again.
+            }
+          }
+        }
+      },
+    });
+    const opts = options({ progressIntervalMs: 50 });
+    statusPath = join(opts.stateDir, 'status.json');
+    const { status } = await runSeed(opts);
+    expect(status.state).toBe('failed');
+    expect(status.error).toMatch(/could not write .*status\.json/);
+    expect(fake.files.size).toBeLessThan(5_461);
+    expect(fake.identicalReputs).toEqual([]);
+  });
+
+  it('does not report complete when the last done line fails to reach the disk', async () => {
+    const { fake, options } = await setup(1_365);
+    const markDone = Checkpoint.prototype.markDone;
+    const spy = vi.spyOn(Checkpoint.prototype, 'markDone').mockImplementation(function (this: Checkpoint, id: number) {
+      if (id === 2) {
+        // Fails after everything else is done, as a final fsync might.
+        return new Promise<void>((_, reject) => setTimeout(() => reject(new Error('EIO: i/o error, fsync')), 300));
+      }
+      return markDone.call(this, id);
+    });
+    cleanup.push(() => spy.mockRestore());
+    const { status } = await runSeed(options());
+    expect(fake.files.size).toBe(1_365);
+    expect(status.state).toBe('failed');
+    expect(status.error).toMatch(/checkpoint write failed: EIO/);
+  });
+
+  it('checks nothing and uploads nothing when stopped before the fresh-seed check', async () => {
+    const { fake, options } = await setup(5_461);
+    const controller = new AbortController();
+    controller.abort();
+    const { status } = await runSeed(options({ signal: controller.signal }));
+    expect(status.state).toBe('interrupted');
+    expect(fake.requests).toEqual({});
+  });
+
   it('fails files that keep failing, lists them, and repairs them on the next run', async () => {
     let broken = true;
     const bad = new Set([tilePath('itest', 100), tilePath('itest', 2_000)]);
@@ -632,11 +734,93 @@ describe('bunny:seed CLI', () => {
     expectStored(fake, fixture, 0, 85);
   }, 40_000);
 
+  it('after kill -9, waits for a PUT sent late in a status interval, past the window of the status before it', async () => {
+    const scratch = await scratchDir();
+    cleanup.push(scratch.remove);
+    const fixture = await writeFixtureArchive(scratch.dir, 1_365, 5, 50);
+    const stateDir = join(scratch.dir, 'state');
+    const statusPath = join(stateDir, 'status.json');
+    // Commit window: 2 s timeout + 5 x 400 ms settle. Status every 3 s.
+    const commitWindowMs = 4_000;
+    const intervalMs = 3_000;
+    let late: string | undefined;
+    let arrived = 0;
+    const first: { child?: ChildProcess } = {};
+    const fake = await FakeStorage.start({
+      // Slow PUTs keep the upload going for a few seconds; DESCRIBEs answer at once.
+      hold: ({ method }) => (method === 'PUT' ? sleep(20).then(() => {}) : undefined),
+      fault: ({ method, path }) => {
+        if (late !== undefined || method !== 'PUT' || !first.child) {
+          return undefined;
+        }
+        let since: number;
+        try {
+          since = Date.now() - Date.parse((JSON.parse(readFileSync(statusPath, 'utf8')) as SeedStatus).updatedAt);
+        } catch {
+          return undefined;
+        }
+        // Over half an interval after the last status write, killed well before the next one.
+        if (since < 0.55 * intervalMs || since > 0.75 * intervalMs) {
+          return undefined;
+        }
+        late = path;
+        arrived = Date.now();
+        first.child.kill('SIGKILL');
+        // Committed just inside the window counted from the PUT, well after the window counted from the status.
+        fake.options.lateStoreMs = commitWindowMs - 100;
+        return 'late-store';
+      },
+    });
+    cleanup.push(() => fake.close());
+    const args = [
+      '--archive',
+      fixture.path,
+      '--prefix',
+      'itest',
+      '--max-zoom',
+      '5',
+      '--chunk-size',
+      '128',
+      '--state-dir',
+      stateDir,
+      '--request-timeout-s',
+      '2',
+      '--settle-ms',
+      '400',
+      '--progress-interval-s',
+      String(intervalMs / 1000),
+      '--workers',
+      '1',
+      '--concurrency',
+      '8',
+    ];
+    const env = { XDG_STATE_HOME: scratch.dir };
+    const killed = startSeed(fake, args, env);
+    first.child = killed.child;
+    expect((await killed.done).signal).toBe('SIGKILL');
+    expect(late).toBeDefined();
+    const last = JSON.parse(await readFile(statusPath, 'utf8')) as SeedStatus;
+    expect(Date.parse(last.updatedAt) + commitWindowMs).toBeLessThan(arrived + commitWindowMs - 100);
+
+    const resumed = await startSeed(fake, args, env).done;
+    expect(resumed.code, resumed.stderr).toBe(0);
+    await sleep(arrived + commitWindowMs + 300 - Date.now());
+    expect(fake.putsByPath.get(late!)).toBe(1);
+    expect(fake.identicalReputs).toEqual([]);
+    expectStored(fake, fixture, 0, 1_365);
+  }, 60_000);
+
   it('rejects bad arguments with exit code 2', async () => {
     const fake = await FakeStorage.start();
     cleanup.push(() => fake.close());
     const result = await startSeed(fake, ['--archive', 'x.pmtiles', '--max-zoom', '3', '--to-id', '9']).done;
     expect(result.code).toBe(2);
     expect(result.stderr).toMatch(/not both/);
+    // 0 would retry 429s in a tight loop, or turn off every request timeout.
+    for (const flag of ['--retry-base-ms', '--request-timeout-s']) {
+      const zero = await startSeed(fake, ['--archive', 'x.pmtiles', flag, '0']).done;
+      expect(zero.code).toBe(2);
+      expect(zero.stderr).toMatch(new RegExp(`${flag} must be an integer of at least 1, got 0`));
+    }
   });
 });
