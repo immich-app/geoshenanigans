@@ -108,5 +108,54 @@ export function testDeps(
   };
 }
 
+/**
+ * A clock whose sleeps overlap, as real ones do: each ends when the clock reaches its end. `drive` runs a task to its
+ * end, moving the clock to the earliest pending sleep's end whenever everything else has settled (a timer turn after the
+ * microtasks), so what concurrent tasks do at a time happens at that time.
+ */
+export function timerDeps(
+  start: number,
+  random = () => 0.5,
+): Deps & { sleeps: number[]; drive: <T>(task: Promise<T>) => Promise<T> } {
+  let now = start;
+  const sleeps: number[] = [];
+  const pending: { at: number; order: number; wake: () => void }[] = [];
+  let order = 0;
+  const turn = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
+  return {
+    now: () => now,
+    sleep: (ms) => {
+      sleeps.push(ms);
+      return new Promise<void>((wake) => pending.push({ at: now + Math.max(0, ms), order: order++, wake }));
+    },
+    random,
+    sleeps,
+    drive: async <T>(task: Promise<T>) => {
+      let settled = false;
+      const done = task.finally(() => {
+        settled = true;
+      });
+      done.catch(() => {});
+      // A task that waits on neither the clock nor a fetch would loop forever: give up after many idle turns.
+      for (let idle = 0; idle < 1000;) {
+        await turn();
+        if (settled) {
+          return done;
+        }
+        pending.sort((a, b) => a.at - b.at || a.order - b.order);
+        const next = pending.shift();
+        if (next) {
+          now = Math.max(now, next.at);
+          next.wake();
+          idle = 0;
+        } else {
+          idle++;
+        }
+      }
+      throw new Error('the task neither settled nor slept');
+    },
+  };
+}
+
 export const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });

@@ -17,7 +17,7 @@ import {
 } from '../src/bunny-logs/log-reader';
 import { exposition } from '../src/bunny-logs/samples';
 import { O11yLogger } from '../src/o11y';
-import { Call, identity, json, mockFetch, o11y, pushedLogs, pushedSamples, testDeps } from './bunny-helpers';
+import { Call, identity, json, mockFetch, o11y, pushedLogs, pushedSamples, testDeps, timerDeps } from './bunny-helpers';
 
 const config = { apiKey: 'account-key', pullZoneId: '12345' };
 // Scheduled for 12:05 (cron runs start a few seconds late): reads 12:02-12:03 and re-reads 12:01-12:02.
@@ -81,7 +81,10 @@ function loggingApi(pages: { [start: string]: Pages }, newest?: string) {
   };
 }
 
-/** One run: `pages` answer the newest minute, `reread` the minute before (an empty minute by default). */
+/**
+ * One run: `pages` answer the newest minute, `reread` the minute before (an empty minute by default). Its sleeps overlap
+ * as real ones do, and `starts` holds the clock at each Logging API request, in order.
+ */
 async function run(
   pages: Pages,
   {
@@ -92,14 +95,22 @@ async function run(
     at = scheduled,
   }: { newest?: string; sampleRate?: string; readerConfig?: typeof config | null; reread?: Pages; at?: number } = {},
 ) {
-  const fetchMock = mockFetch(
-    loggingApi({ [iso(logWindow(at).start)]: pages, [iso(logWindow(at, REREAD_LAG_MINUTES).start)]: reread }, newest),
+  const deps = timerDeps(at + 4000);
+  const starts: number[] = [];
+  const api = loggingApi(
+    { [iso(logWindow(at).start)]: pages, [iso(logWindow(at, REREAD_LAG_MINUTES).start)]: reread },
+    newest,
   );
-  const deps = testDeps(at + 4000);
+  const fetchMock = mockFetch((call) => {
+    if (isLogQuery(call)) {
+      starts.push(deps.now());
+    }
+    return api(call);
+  });
   const logger = new O11yLogger(o11y);
-  const result = await runLogReader(readerConfig ?? undefined, o11y, logger, at, sampleRate, deps);
+  const result = await deps.drive(runLogReader(readerConfig ?? undefined, o11y, logger, at, sampleRate, deps));
   await logger.flush();
-  return { result, deps, ...fetchMock };
+  return { result, deps, starts, ...fetchMock };
 }
 
 const sampleValue = (
@@ -531,17 +542,17 @@ describe('runLogReader', () => {
     deps.advance(5000);
     expect(await pacer.turn()).toBe(runAt + 2 * REQUEST_SPACING_MS + 5000);
 
-    // A run's lag query and both minutes' pages share one pacer: 6 requests take at least 5 spacings.
-    const {
-      result,
-      calls,
-      deps: runDeps,
-    } = await run([() => page([row()], true), () => page([row()], true), () => page([row()])], {
-      reread: [() => page([row()], true), () => page([row()])],
-    });
+    // A run's lag query and both minutes' pages share one pacer, though the lag query runs beside the reads: every
+    // request starts at least a spacing after the one before it.
+    const { result, calls, starts } = await run(
+      [() => page([row()], true), () => page([row()], true), () => page([row()])],
+      { reread: [() => page([row()], true), () => page([row()])] },
+    );
     expect(result).toBe('ok');
     expect(calls.filter(isLogQuery)).toHaveLength(6);
-    expect(runDeps.now() - runAt).toBeGreaterThanOrEqual(5 * REQUEST_SPACING_MS);
+    expect(starts).toHaveLength(6);
+    expect(starts[0]).toBe(runAt);
+    expect(starts.slice(1).map((start, i) => start - starts[i])).toEqual(Array(5).fill(REQUEST_SPACING_MS));
   });
 
   it('fails a read that loses its connection midway rather than push part of the minute', async () => {
@@ -650,8 +661,22 @@ describe('runLogReader', () => {
     expect(first.length).toBeLessThan(300);
     expect(await sampled()).toEqual(first);
 
-    const { calls } = await run([() => page([])], { sampleRate: '1', reread: [() => page(rows)] });
-    expect(pushedLogs(calls).filter(({ kind }) => kind === 'request')).toHaveLength(MAX_LOG_LINES);
+    // The cap is the minute's, not a page's: three pages of a minute, each with more rows than the cap, keep the first
+    // MAX_LOG_LINES rows of the minute (all of them sampled) and count every row.
+    const perPage = MAX_LOG_LINES + 100;
+    const minute = Array.from({ length: 3 * perPage }, (_, i) => row({ requestId: `request-${i}` }));
+    const { result, calls } = await run([() => page([])], {
+      sampleRate: '1',
+      reread: [0, 1, 2].map((i) => () => page(minute.slice(i * perPage, (i + 1) * perPage), i < 2)),
+    });
+    expect(result).toBe('ok');
+    expect(calls.filter(isRereadQuery)).toHaveLength(3);
+    expect(sampleValue(pushedSamples(calls), 'tiles_bunny_log_rows', {}, windowStart)).toBe(3 * perPage);
+    expect(
+      pushedLogs(calls)
+        .filter(({ kind }) => kind === 'request')
+        .map(({ request_id }) => request_id),
+    ).toEqual(minute.slice(0, MAX_LOG_LINES).map(({ requestId }) => requestId));
   });
 
   it('gives up on a slow API once the read deadline has passed', async () => {
