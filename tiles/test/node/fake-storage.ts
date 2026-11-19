@@ -136,14 +136,20 @@ export class FakeStorage {
     let port = 0;
     const holder: { fake?: FakeStorage } = {};
     const servers: Server[] = [];
-    for (const address of addresses) {
-      const server = createServer((socket) => holder.fake!.accept(socket));
-      await new Promise<void>((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(port, address, () => resolve());
-      });
-      port = (server.address() as { port: number }).port;
-      servers.push(server);
+    try {
+      for (const address of addresses) {
+        const server = createServer((socket) => holder.fake!.accept(socket));
+        await new Promise<void>((resolve, reject) => {
+          server.once('error', reject);
+          server.listen(port, address, () => resolve());
+        });
+        port = (server.address() as { port: number }).port;
+        servers.push(server);
+      }
+    } catch (error) {
+      // No fake comes back for the test to close, so the listeners already bound must not outlive the failure.
+      await Promise.all(servers.map((server) => new Promise((resolve) => server.close(resolve))));
+      throw error;
     }
     const fake = new FakeStorage(options, port);
     fake.servers = servers;
