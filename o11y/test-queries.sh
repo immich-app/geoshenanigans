@@ -30,22 +30,32 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# A random port, and another when it is taken (the store then exits at once).
-start() {
-  local port=$((20000 + RANDOM % 20000))
-  vm=http://127.0.0.1:$port
-  victoria-metrics -storageDataPath="$work/data" -httpListenAddr="127.0.0.1:$port" \
-    -dedup.minScrapeInterval=20s -search.disableCache -loggerLevel=ERROR >"$work/vm.log" 2>&1 &
-  pid=$!
-  for _ in $(seq 150); do
-    curl -fsS "$vm/health" >/dev/null 2>&1 && return 0
-    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; pid=; return 1; }
-    sleep 0.2
-  done
-  return 1
-}
-for _ in 1 2 3 4 5; do start && break; done
-curl -fsS "$vm/health" >/dev/null || { cat "$work/vm.log" >&2; exit 1; }
+# The store listens on a port the OS picks, free when bound and held by this
+# store alone, and logs it ("started server at http://127.0.0.1:PORT/", at the
+# default info level): it is probed only once the store has said where it is,
+# never a port another store might already answer on. Its /metrics then has to
+# name this run's data directory before any sample goes in (read whole into a
+# file first: grep -q quitting mid-pipe would fail curl under pipefail).
+victoria-metrics -storageDataPath="$work/data" -httpListenAddr=127.0.0.1:0 \
+  -dedup.minScrapeInterval=20s -search.disableCache >"$work/vm.log" 2>&1 &
+pid=$!
+vm=
+for _ in $(seq 150); do
+  kill -0 "$pid" 2>/dev/null || break
+  if [ -z "$vm" ]; then
+    vm=$(grep -m 1 -o 'started server at http://127\.0\.0\.1:[0-9][0-9]*/' "$work/vm.log" || true)
+    vm=${vm#started server at }
+    vm=${vm%/}
+  fi
+  [ -n "$vm" ] && curl -fsS "$vm/health" >/dev/null 2>&1 && break
+  sleep 0.2
+done
+if [ -z "$vm" ] || ! kill -0 "$pid" 2>/dev/null || ! curl -fsS -o "$work/metrics" "$vm/metrics" ||
+  ! grep -qxF "flag{name=\"storageDataPath\", value=\"$work/data\", is_set=\"true\"} 1" "$work/metrics"; then
+  echo "the VictoriaMetrics started for this run is not answering at ${vm:-(no address logged)}" >&2
+  cat "$work/vm.log" >&2
+  exit 1
+fi
 
 # The hour case N evaluates at: whole hours, N hours after a day ago.
 base=$(($(date +%s) / 3600 * 3600 - 86400))
