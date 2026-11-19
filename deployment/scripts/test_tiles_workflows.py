@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import textwrap
 import unittest
 
 import yaml
@@ -1051,6 +1052,39 @@ class PutWorkerSecretsTest(unittest.TestCase):
         self.assertNotEqual(self.run_script(CLOUDFLARE_API_TOKEN="")[0].returncode, 0)
         self.assertNotEqual(self.run_script(SECRETS="")[0].returncode, 0)
 
+
+
+class BunnyKeyCommandLineTest(unittest.TestCase):
+    """The Bunny account key never goes on a command line, which any process on the machine can read
+    (/proc/<pid>/cmdline): the module's provisioner and the README's commands give it to curl as a header file, as
+    put-worker-secrets.sh does with Cloudflare's token."""
+
+    MODULE = os.path.join(ROOT, "deployment", "modules", "bunny", "tiles")
+
+    def test_no_access_key_header_is_expanded_into_an_argument(self):
+        for path in sorted(glob.glob(os.path.join(self.MODULE, "*.tf"))) + [os.path.join(self.MODULE, "README.md")]:
+            with self.subTest(path=os.path.relpath(path, ROOT)):
+                self.assertNotRegex(read(path), r"""-H\s+["']?AccessKey:\s*\$""")
+
+    def test_the_publish_provisioner_sends_the_key_in_a_header_file(self):
+        script = read(os.path.join(self.MODULE, "script.tf"))
+        block = re.search(r'resource "terraform_data" "publish_gzip" \{.*?\n\}', script, re.S).group(0)
+        # Process substitution needs bash: local-exec's default, sh -c, would fail on it.
+        self.assertIn('interpreter = ["bash", "-c"]', block)
+        command = textwrap.dedent(re.search(r"command\s*=\s*<<-EOT\n(.*?)\n\s*EOT", block, re.S).group(1))
+        with tempfile.TemporaryDirectory() as tmp:
+            install(os.path.join(tmp, "bin"), {"curl": FAKE_CURL_SECRETS})
+            log = os.path.join(tmp, "log")
+            env = dict(os.environ, PATH=os.path.join(tmp, "bin") + os.pathsep + os.environ["PATH"], FAKE_LOG=log,
+                       FAKE_DIR=tmp, FAKE_PREFIX="https://api.bunny.net", BUNNY_API_KEY="bunny key 2")
+            result = subprocess.run(["bash", "-c", command.replace("${self.input}", "1234")], env=env, cwd=tmp,
+                                    capture_output=True, text=True, check=False)
+            with open(log) as f:
+                calls = [json.loads(line) for line in f]
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([call["url"] for call in calls], ["https://api.bunny.net/compute/script/1234/publish"])
+        self.assertIn("AccessKey: bunny key 2", calls[0]["headers"])
+        self.assertNotIn("bunny key 2", " ".join(calls[0]["args"]))
 
 class BunnyStateTest(unittest.TestCase):
     """The Bunny unit's state holds the storage zones' passwords and the middleware script's deployment key, and its

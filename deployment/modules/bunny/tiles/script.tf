@@ -21,10 +21,13 @@ resource "terraform_data" "publish_gzip" {
   triggers_replace = [bunnynet_compute_script.gzip.id]
 
   provisioner "local-exec" {
-    command = <<-EOT
+    # bash, for -H @<(...): the account key reaches curl as a header file, not on its command line, which any process
+    # on the machine can read.
+    interpreter = ["bash", "-c"]
+    command     = <<-EOT
       curl --silent --show-error --fail-with-body --retry 3 -X POST \
-        -H "AccessKey: $BUNNY_API_KEY" -H 'Content-Type: application/json' --data '{"Note":"opentofu: first release"}' \
-        "https://api.bunny.net/compute/script/${self.input}/publish"
+        -H @<(printf 'AccessKey: %s\n' "$BUNNY_API_KEY") -H 'Content-Type: application/json' \
+        --data '{"Note":"opentofu: first release"}' "https://api.bunny.net/compute/script/${self.input}/publish"
     EOT
     environment = {
       BUNNY_API_KEY = var.bunny_api_key

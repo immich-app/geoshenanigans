@@ -84,7 +84,7 @@ Both storage zones already exist, so import them before the first apply; until t
 ```bash
 cd deployment/modules/bunny/tiles
 export ENVIRONMENT=prod
-op run --env-file=bunny.env -- sh -c 'curl -sS -H "AccessKey: $TF_VAR_bunny_api_key" https://api.bunny.net/storagezone' |
+op run --env-file=bunny.env -- bash -c 'curl -sS -H @<(printf "AccessKey: %s\n" "$TF_VAR_bunny_api_key") https://api.bunny.net/storagezone' |
   jq '.[] | select(.Name == "immich-tiles" or .Name == "immich-tiles-state") | {Id, Name}'
 ```
 
@@ -245,8 +245,10 @@ The zone is not live (no DNS cutover) until steps 2 and 5 pass.
 
      ```bash
      BUNNY_API_KEY=op://tf_bunny/BUNNY_API_KEY/password BUNNY_PULL_ZONE_ID=op://tf_prod/BUNNY_PULL_ZONE_ID/password \
-       op run -- sh -c 'curl -fsS -X POST -H "AccessKey: $BUNNY_API_KEY" "https://api.bunny.net/pullzone/$BUNNY_PULL_ZONE_ID/purgeCache"'
+       op run -- bash -c 'curl -fsS -X POST -H @<(printf "AccessKey: %s\n" "$BUNNY_API_KEY") "https://api.bunny.net/pullzone/$BUNNY_PULL_ZONE_ID/purgeCache"'
      ```
+
+     The key reaches curl as a header file (`-H @<(...)`; `printf` is a bash builtin), not on its command line, where any process on the machine can read it.
 
   5. Check the repaired paths through the CDN: for the example paths in the check's log line (app:="tiles-sample-check") and any others found wrong, `curl -sSI <BUNNY_PUBLIC_URL>/<path>` answers 200 with a `Last-Modified` from the repair, not before it, from several locations (Globalping HTTP measurements, as for Switching modes, above). A PoP that answers with an older `Last-Modified` still has the wrong tile: purge again.
   6. Clear `TILES_SYNC_HOLD`. The alert resolves with the next daily sample check that finds nothing wrong.
