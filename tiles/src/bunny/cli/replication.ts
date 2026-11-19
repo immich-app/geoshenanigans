@@ -13,17 +13,20 @@
  *   npm run bunny:replication -- --listing [--prefix v1] [--min-zoom 0 --max-zoom 15] [--regions ...] [--json <path>]
  *
  * --live takes the prefix and zooms of the live build and needs --sample; while state.json lists pending builds the
- * zone may hold their bytes where they differ, so it then checks nothing and reports why (exit 0).
+ * zone may hold their bytes where they differ, so it then checks nothing and reports why (exit 0), before it reads the
+ * manifest or the tiles zone.
  * --listing walks every `<prefix>/<z>/<x>/` folder of the zooms with directory listings (Bunny serves 5 at once per
  * zone; this takes 4): one listing returns the replica regions of up to 32,768 files in about 1.6 s, so it checks that
  * every position of a planet first load is stored and in every region in hours, where DESCRIBEs would take weeks. It
  * checks presence and replication, not bytes: Bunny checked each file's checksum at its PUT, and samples check bytes.
+ * It walks whole zooms, so it takes --min-zoom/--max-zoom and no --from-id/--to-id.
  *
  * Without --sample every position of the range is checked, streamed (zooms default to the archive's). --per-zoom takes
  * N positions from each zoom instead of N overall. --wait polls until every region holds every file (the replication
  * gate) instead of checking once; it keeps the file list in memory, so use it for samples or small ranges. With --wait,
  * a file DESCRIBE shows missing or with other bytes is asked about again on every pass (DESCRIBE can lag an overwrite)
- * and fails the wait once it has shown so for --mismatch-grace-s.
+ * and fails the wait once it has shown so for --mismatch-grace-s; --timeout-min bounds the whole wait, the first pass
+ * included. --regions codes are matched in upper case, each once.
  * Bunny allows 250 connections per zone per storage server, shared by every tool working on the zone: a seed takes up
  * to 240 per address, so this check takes 8 per address by default (about 40 in flight over 5 addresses). Raise
  * --max-connections-per-address only while nothing else uploads to the zone; --concurrency is lowered to the
@@ -33,7 +36,8 @@
  * The report goes to stdout as JSON (and to --json), a summary to stderr.
  * --live and --listing need BUNNY_STATE_ZONE and BUNNY_STATE_PASSWORD too (--listing only when --prefix is not given).
  * Exit codes: 0 everything stored and on every region, 2 stored but not yet on every region, 1 missing or
- * mismatched files, DESCRIBE errors (on the last pass with --wait) or a refused password, 3 bad arguments.
+ * mismatched files, DESCRIBE errors (on the last pass with --wait), a refused password or no file to check (a range or
+ * sample with no position in the archive or build), 3 bad arguments.
  */
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -45,6 +49,7 @@ import {
   checkReplication,
   CoverageReport,
   forEachLimit,
+  normalizeRegions,
   REPLICATION_REGIONS,
   ReplicationItem,
   ReplicationResult,
@@ -200,28 +205,21 @@ async function manifestSampleItems(
   return { items, notInArchive: ids.length - items.length };
 }
 
-/** The live state and its manifest, downloaded to a temporary directory the caller removes. */
+/** The live build's manifest, downloaded to a temporary directory the caller removes. */
 async function liveManifest(
+  store: BunnyStateStore,
+  state: SyncState,
   statePrefix: string | undefined,
 ): Promise<{ state: SyncState; manifest: string; dir: string }> {
-  const store = BunnyStateStore.fromEnv();
+  const dir = await mkdtemp(join(tmpdir(), 'bunny-replication-'));
+  const manifest = join(dir, `${state.liveBuild}.tman.zst`);
   try {
-    const state = await readState(store, statePrefix);
-    if (!state) {
-      throw new Error('No state.json in the state zone: no build is live to check');
-    }
-    const dir = await mkdtemp(join(tmpdir(), 'bunny-replication-'));
-    const manifest = join(dir, `${state.liveBuild}.tman.zst`);
-    try {
-      await downloadManifest(store, state, manifest, statePrefix);
-    } catch (error) {
-      await rm(dir, { recursive: true, force: true });
-      throw error;
-    }
-    return { state, manifest, dir };
-  } finally {
-    await store.close();
+    await downloadManifest(store, state, manifest, statePrefix);
+  } catch (error) {
+    await rm(dir, { recursive: true, force: true });
+    throw error;
   }
+  return { state, manifest, dir };
 }
 
 interface ColumnTally {
@@ -235,8 +233,8 @@ interface ColumnTally {
 }
 
 /**
- * --listing: every column folder of each zoom, listed. A position is missing when its file is not in the listing;
- * a present file counts for each region its ReplicatedZones names.
+ * --listing: every column folder of each zoom, listed. A position is missing when its file (by the canonical name
+ * tilePath() gives it) is not in the listing; a present file counts for each region its ReplicatedZones names.
  */
 async function checkListings(
   storage: BunnyStorage,
@@ -268,7 +266,8 @@ async function checkListings(
     await forEachLimit(columns, 4, async (x) => {
       const seen = new Uint8Array(size);
       for (const entry of await storage.list(`${prefix}/${z}/${x}`)) {
-        const match = /^(\d+)\.mvt$/.exec(entry.name);
+        // Only the name tilePath() writes and clients ask for: `01.mvt` is another object than `1.mvt`.
+        const match = /^(0|[1-9]\d*)\.mvt$/.exec(entry.name);
         const y = match ? Number(match[1]) : -1;
         if (entry.isDirectory || y < 0 || y >= size || seen[y]) {
           continue;
@@ -382,6 +381,14 @@ async function main(): Promise<number> {
   if (byId && (values['min-zoom'] !== undefined || values['max-zoom'] !== undefined)) {
     throw new UsageError('Give either --min-zoom/--max-zoom or --from-id/--to-id, not both');
   }
+  if (byId && values.listing) {
+    throw new UsageError('--listing walks whole zooms: bound it with --min-zoom/--max-zoom, not --from-id/--to-id');
+  }
+  // Checked before anything is read, so a skip for pending builds cannot hide a bad range.
+  const idRange = byId ? { from: integer('from-id', values['from-id']), to: integer('to-id', values['to-id']) } : null;
+  if (idRange && idRange.to <= idRange.from) {
+    throw new UsageError(`Empty range [${idRange.from}, ${idRange.to})`);
+  }
   // --listing's zooms, checked before anything is read: a reversed range lists no column and would pass.
   let listing: { minZoom: number; maxZoom: number } | undefined;
   if (values.listing) {
@@ -396,17 +403,29 @@ async function main(): Promise<number> {
     }
     listing = { minZoom, maxZoom };
   }
-  const regions = values.regions
-    ? values.regions.split(',').map((region) => region.trim().toUpperCase())
-    : REPLICATION_REGIONS;
+  if (values.sample !== undefined && integer('sample', values.sample) === 0) {
+    throw new UsageError('--sample must be at least 1: a sample of none checks nothing');
+  }
+  // Region codes are compared with DESCRIBE's upper-case ones, each counted once.
+  const regions = values.regions === undefined ? REPLICATION_REGIONS : normalizeRegions(values.regions.split(','));
+  if (regions.length === 0) {
+    throw new UsageError(`--regions needs region codes, e.g. UK,SE; got ${JSON.stringify(values.regions)}`);
+  }
   let prefix = (values.prefix ?? DEFAULT_PREFIX).replace(/^\/+|\/+$/g, '');
   const perAddress = Math.max(
     1,
     integer('max-connections-per-address', values['max-connections-per-address'], DEFAULT_MAX_CONNECTIONS_PER_ADDRESS),
   );
+  const requestedConcurrency = integer('concurrency', values.concurrency, 256);
   const timeoutMs = integer('timeout-min', values['timeout-min'], 120) * 60_000;
+  if (values.wait && timeoutMs === 0) {
+    throw new UsageError('--timeout-min must be at least 1: it bounds the whole wait, the first pass included');
+  }
   const intervalMs = integer('interval-s', values['interval-s'], 30) * 1000;
   const mismatchGraceMs = integer('mismatch-grace-s', values['mismatch-grace-s'], 300) * 1000;
+  const listLimit = integer('list', values.list, 100);
+  const seed = integer('seed', values.seed, Math.floor(Math.random() * 2 ** 31));
+  const mode = values.sample !== undefined ? (values['per-zoom'] ? 'sample-per-zoom' : 'sample') : 'range';
 
   const storageOptions = storageOptionsFromEnv();
   if (values.addresses !== undefined) {
@@ -416,13 +435,13 @@ async function main(): Promise<number> {
       throw new UsageError((error as Error).message);
     }
   }
-  storageOptions.addresses ??= await resolveStorageAddresses(storageOptions.host);
-  const concurrency = Math.max(
-    1,
-    Math.min(integer('concurrency', values.concurrency, 256), storageOptions.addresses.length * perAddress),
-  );
-  storageOptions.concurrency = concurrency;
-  storageOptions.connectionsPerAddress = perAddress;
+  /** The tiles zone's client, its addresses resolved only once something is to be checked. */
+  const tileStorage = async () => {
+    storageOptions.addresses ??= await resolveStorageAddresses(storageOptions.host);
+    const concurrency = Math.max(1, Math.min(requestedConcurrency, storageOptions.addresses.length * perAddress));
+    const storage = new BunnyStorage({ ...storageOptions, concurrency, connectionsPerAddress: perAddress });
+    return { storage, concurrency };
+  };
   const output = async (json: object, code: number) => {
     const text = JSON.stringify(json);
     process.stdout.write(text + '\n');
@@ -441,16 +460,9 @@ async function main(): Promise<number> {
       }
       prefix = state.prefix;
     }
-    const storage = new BunnyStorage(storageOptions);
+    const { storage } = await tileStorage();
     try {
-      const report = await checkListings(
-        storage,
-        prefix,
-        listing.minZoom,
-        listing.maxZoom,
-        regions,
-        integer('list', values.list, 100),
-      );
+      const report = await checkListings(storage, prefix, listing.minZoom, listing.maxZoom, regions, listLimit);
       const lacking = regions.filter((region) => report.held[region] < report.present);
       process.stderr.write(
         `Listed ${n(report.expected)} positions under ${prefix}/ in ${report.seconds.toFixed(1)} s: ` +
@@ -471,15 +483,37 @@ async function main(): Promise<number> {
   let live: Awaited<ReturnType<typeof liveManifest>> | undefined;
   let ranges: ArchiveRanges | undefined;
   if (values.live) {
-    live = await liveManifest(values['state-prefix']);
-    if (values.prefix === undefined) {
-      prefix = live.state.prefix;
+    const store = BunnyStateStore.fromEnv();
+    try {
+      const state = await readState(store, values['state-prefix']);
+      if (!state) {
+        throw new Error('No state.json in the state zone: no build is live to check');
+      }
+      if (values.prefix === undefined) {
+        prefix = state.prefix;
+      }
+      if (state.pending.length > 0) {
+        // The zone may hold a pending build's bytes wherever one differs from the live build. Said before the
+        // manifest or the tiles zone is needed, so neither can keep this report from being written.
+        const reason = `pending builds ${state.pending.map((pending) => pending.build).join(', ')}: a sync has to finish first`;
+        process.stderr.write(`Nothing checked: ${reason}\n`);
+        return await output(
+          { prefix, range: null, mode, seed, build: state.liveBuild, notInArchive: 0, regions, skipped: reason },
+          0,
+        );
+      }
+      live = await liveManifest(store, state, values['state-prefix']);
+    } finally {
+      await store.close();
     }
   } else {
     ranges = await ArchiveRanges.open(values.archive!);
   }
-  const storage = new BunnyStorage(storageOptions);
+  let storage: BunnyStorage | undefined;
   try {
+    const opened = await tileStorage();
+    storage = opened.storage;
+    const { concurrency } = opened;
     const bounds = live
       ? await readManifestHeader(live.manifest).then((header) => ({
           minZoom: header.minZoom ?? 0,
@@ -487,31 +521,24 @@ async function main(): Promise<number> {
           maxZoom: tileIdZoom(Math.max(0, header.positions - 1)),
         }))
       : ranges!.archive.header;
-    const { from, to } = byId
-      ? { from: integer('from-id', values['from-id']), to: integer('to-id', values['to-id']) }
-      : zoomRange(
-          integer('min-zoom', values['min-zoom'], bounds.minZoom),
-          integer('max-zoom', values['max-zoom'], bounds.maxZoom),
-        );
+    const { from, to } =
+      idRange ??
+      zoomRange(
+        integer('min-zoom', values['min-zoom'], bounds.minZoom),
+        integer('max-zoom', values['max-zoom'], bounds.maxZoom),
+      );
     if (to <= from) {
       throw new UsageError(`Empty range [${from}, ${to})`);
     }
-    const seed = integer('seed', values.seed, Math.floor(Math.random() * 2 ** 31));
     const scope = {
       prefix,
       range: { from, to },
-      mode: values.sample !== undefined ? (values['per-zoom'] ? 'sample-per-zoom' : 'sample') : 'range',
+      mode,
       seed: values.sample !== undefined ? seed : null,
       build: live?.state.liveBuild ?? null,
       notInArchive: 0,
       regions,
     };
-    if (live && live.state.pending.length > 0) {
-      // The zone may hold a pending build's bytes wherever one differs from the live build.
-      const reason = `pending builds ${live.state.pending.map((pending) => pending.build).join(', ')}: a sync has to finish first`;
-      process.stderr.write(`Nothing checked: ${reason}\n`);
-      return await output({ ...scope, skipped: reason }, 0);
-    }
     const sample = {
       from,
       to,
@@ -527,6 +554,15 @@ async function main(): Promise<number> {
           ? await manifestSampleItems(live.manifest, prefix, sample)
           : await sampleItems(ranges!, hashes!, prefix, sample);
     scope.notInArchive = sampled?.notInArchive ?? 0;
+    // A check of no file verifies nothing: an error, not a pass.
+    const nothingToCheck = () =>
+      new Error(
+        `No file to check: ${sampled ? `none of the ${n(sampled.notInArchive)} positions sampled` : 'no position'} ` +
+          `of [${from}, ${to}) is in the ${live ? 'live build' : 'archive'}`,
+      );
+    if (sampled?.items.length === 0) {
+      throw nothingToCheck();
+    }
 
     let code: number;
     let result: object;
@@ -536,6 +572,9 @@ async function main(): Promise<number> {
         for await (const item of rangeItems(ranges!, hashes!, prefix, from, to)) {
           items.push(item);
         }
+      }
+      if (items.length === 0) {
+        throw nothingToCheck();
       }
       const waited: ReplicationResult = await waitForReplication(storage, items, regions, {
         timeoutMs,
@@ -560,8 +599,11 @@ async function main(): Promise<number> {
         storage,
         sampled?.items ?? rangeItems(ranges!, hashes!, prefix, from, to),
         regions,
-        { concurrency, listLimit: integer('list', values.list, 100) },
+        { concurrency, listLimit },
       );
+      if (report.checked === 0) {
+        throw nothingToCheck();
+      }
       code = report.missing + report.mismatched + report.errors > 0 ? 1 : report.partial > 0 ? 2 : 0;
       // Files stored with the right bytes that each region lacks: what the sample check alerts on.
       const stored = report.replicated + report.partial;
@@ -571,7 +613,7 @@ async function main(): Promise<number> {
     }
     return await output(result, code);
   } finally {
-    await storage.close();
+    await storage?.close();
     await ranges?.close();
     if (live) {
       await rm(live.dir, { recursive: true, force: true });
