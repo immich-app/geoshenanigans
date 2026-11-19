@@ -162,12 +162,12 @@ describe('runProbe', () => {
     expect(new Set(samples.map(({ timestamp }) => timestamp))).toEqual(new Set([scheduled]));
     expect(metrics(calls)).toEqual(
       expect.arrayContaining([
-        { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'EU', kind: 'hit' }, value: 20 },
-        { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'OC', kind: 'hit' }, value: 60 },
-        { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'EU', kind: 'miss' }, value: 200 },
-        { name: 'tiles_bunny_probe_errors', labels: { continent: 'EU', kind: 'hit' }, value: 0 },
-        { name: 'tiles_bunny_probe_errors', labels: { continent: 'AF', kind: 'hit' }, value: 1 },
-        { name: 'tiles_bunny_probe_errors', labels: { continent: 'AF', kind: 'miss' }, value: 1 },
+        { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'EU', kind: 'hit', target: 'hit' }, value: 20 },
+        { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'OC', kind: 'hit', target: 'hit' }, value: 60 },
+        { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'EU', kind: 'miss', target: 'miss' }, value: 200 },
+        { name: 'tiles_bunny_probe_errors', labels: { continent: 'EU', kind: 'hit', target: 'hit' }, value: 0 },
+        { name: 'tiles_bunny_probe_errors', labels: { continent: 'AF', kind: 'hit', target: 'hit' }, value: 1 },
+        { name: 'tiles_bunny_probe_errors', labels: { continent: 'AF', kind: 'miss', target: 'miss' }, value: 1 },
         { name: 'tiles_bunny_probe_runs', labels: { result: 'ok' }, value: 1 },
       ]),
     );
@@ -219,7 +219,8 @@ describe('runProbe', () => {
     });
     expect(metrics(calls)).toEqual(
       expect.arrayContaining([
-        { name: 'tiles_bunny_probe_errors', labels: { continent: 'EU', kind: 'hit' }, value: 1 },
+        { name: 'tiles_bunny_probe_errors', labels: { continent: 'EU', kind: 'hit', target: 'hit' }, value: 1 },
+        { name: 'tiles_bunny_probe_errors', labels: { continent: 'EU', kind: 'hit', target: 'miss' }, value: 1 },
       ]),
     );
     expect(metrics(calls).filter(({ name }) => name === 'tiles_bunny_probe_ttfb_ms')).toEqual([]);
@@ -237,10 +238,10 @@ describe('runProbe', () => {
     const kept = metrics(calls).filter(({ labels }) => labels.kind === 'hit');
     expect(kept).toEqual(
       expect.arrayContaining([
-        { name: 'tiles_bunny_probe_errors', labels: { continent: 'EU', kind: 'hit' }, value: 1 },
-        { name: 'tiles_bunny_probe_errors', labels: { continent: 'NA', kind: 'hit' }, value: 1 },
-        { name: 'tiles_bunny_probe_errors', labels: { continent: 'AS', kind: 'hit' }, value: 0 },
-        { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'AS', kind: 'hit' }, value: 30 },
+        { name: 'tiles_bunny_probe_errors', labels: { continent: 'EU', kind: 'hit', target: 'hit' }, value: 1 },
+        { name: 'tiles_bunny_probe_errors', labels: { continent: 'NA', kind: 'hit', target: 'hit' }, value: 1 },
+        { name: 'tiles_bunny_probe_errors', labels: { continent: 'AS', kind: 'hit', target: 'hit' }, value: 0 },
+        { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'AS', kind: 'hit', target: 'hit' }, value: 30 },
       ]),
     );
     expect(kept.filter(({ name }) => name === 'tiles_bunny_probe_ttfb_ms')).toHaveLength(1);
@@ -270,12 +271,12 @@ describe('runProbe', () => {
     });
     const ttfb = metrics(calls).filter(({ name }) => name === 'tiles_bunny_probe_ttfb_ms');
     expect(ttfb).toEqual([
-      { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'EU', kind: 'miss' }, value: 90 },
-      { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'NA', kind: 'hit' }, value: 15 },
+      { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'EU', kind: 'miss', target: 'hit' }, value: 90 },
+      { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'NA', kind: 'hit', target: 'hit' }, value: 15 },
       // No CDN-Cache (not served by Bunny): the target's kind.
-      { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'AS', kind: 'hit' }, value: 20 },
-      { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'EU', kind: 'hit' }, value: 12 },
-      { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'NA', kind: 'miss' }, value: 95 },
+      { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'AS', kind: 'hit', target: 'hit' }, value: 20 },
+      { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'EU', kind: 'hit', target: 'miss' }, value: 12 },
+      { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'NA', kind: 'miss', target: 'miss' }, value: 95 },
     ]);
     // The log line keeps what was asked for.
     expect(pushedLogs(calls).filter(({ kind }) => kind === 'probe')[0]).toMatchObject({
@@ -283,6 +284,33 @@ describe('runProbe', () => {
       cache: 'MISS',
       continent: 'EU',
     });
+  });
+
+  it('keeps both targets apart when they report the same kind from one continent, as after a purge', async () => {
+    // The purge left the hit tile cold in EU, so both targets answer MISS there; in NA both fail as misses.
+    const cold = { headers: tileHeaders('MISS') };
+    const { result, calls } = await probe({
+      create: (_call, index) => json({ id: index === 0 ? 'hit-1' : 'miss-1', probesCount: 2 }, 202),
+      get: (id) =>
+        measurement(id, 'finished', [
+          finished('EU', id === 'hit-1' ? 300 : 120, cold),
+          finished('NA', 40, { ...cold, statusCode: 404 }),
+        ]),
+    });
+    expect(result).toBe('ok');
+    const samples = pushedSamples(calls);
+    // No two samples share a series and a timestamp, so o11y's dedup (the biggest of them) drops none of them.
+    const series = samples.map(({ name, labels, timestamp }) => `${name}${JSON.stringify(labels)}@${timestamp}`);
+    expect(new Set(series).size).toBe(series.length);
+    expect(metrics(calls)).toEqual([
+      { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'EU', kind: 'miss', target: 'hit' }, value: 300 },
+      { name: 'tiles_bunny_probe_errors', labels: { continent: 'EU', kind: 'miss', target: 'hit' }, value: 0 },
+      { name: 'tiles_bunny_probe_errors', labels: { continent: 'NA', kind: 'miss', target: 'hit' }, value: 1 },
+      { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'EU', kind: 'miss', target: 'miss' }, value: 120 },
+      { name: 'tiles_bunny_probe_errors', labels: { continent: 'EU', kind: 'miss', target: 'miss' }, value: 0 },
+      { name: 'tiles_bunny_probe_errors', labels: { continent: 'NA', kind: 'miss', target: 'miss' }, value: 1 },
+      { name: 'tiles_bunny_probe_runs', labels: { result: 'ok' }, value: 1 },
+    ]);
   });
 
   it("doesn't count failures Globalping puts on the probe's resolver or on itself, but does a target's", async () => {
@@ -304,9 +332,9 @@ describe('runProbe', () => {
       ({ name, labels }) => name === 'tiles_bunny_probe_errors' && labels.kind === 'hit',
     );
     expect(errors).toEqual([
-      { name: 'tiles_bunny_probe_errors', labels: { continent: 'SA', kind: 'hit' }, value: 1 },
-      { name: 'tiles_bunny_probe_errors', labels: { continent: 'AS', kind: 'hit' }, value: 1 },
-      { name: 'tiles_bunny_probe_errors', labels: { continent: 'OC', kind: 'hit' }, value: 0 },
+      { name: 'tiles_bunny_probe_errors', labels: { continent: 'SA', kind: 'hit', target: 'hit' }, value: 1 },
+      { name: 'tiles_bunny_probe_errors', labels: { continent: 'AS', kind: 'hit', target: 'hit' }, value: 1 },
+      { name: 'tiles_bunny_probe_errors', labels: { continent: 'OC', kind: 'hit', target: 'hit' }, value: 0 },
     ]);
     expect(pushedLogs(calls).filter(({ kind, target }) => kind === 'probe' && target === 'hit')).toEqual(
       expect.arrayContaining([
@@ -350,8 +378,8 @@ describe('runProbe', () => {
       PROBE_CONTINENTS.map((continent) => ({ continent, limit: 1 })),
     );
     expect(metrics(calls)).toEqual([
-      { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'EU', kind: 'miss' }, value: 150 },
-      { name: 'tiles_bunny_probe_errors', labels: { continent: 'EU', kind: 'miss' }, value: 0 },
+      { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'EU', kind: 'miss', target: 'miss' }, value: 150 },
+      { name: 'tiles_bunny_probe_errors', labels: { continent: 'EU', kind: 'miss', target: 'miss' }, value: 0 },
       { name: 'tiles_bunny_probe_runs', labels: { result: 'error' }, value: 1 },
     ]);
     expect(pushedLogs(calls)).toEqual(
@@ -386,7 +414,7 @@ describe('runProbe', () => {
     expect(waited).toBeLessThan(50_000);
     expect(metrics(calls)).toEqual(
       expect.arrayContaining([
-        { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'EU', kind: 'hit' }, value: 25 },
+        { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'EU', kind: 'hit', target: 'hit' }, value: 25 },
         { name: 'tiles_bunny_probe_runs', labels: { result: 'error' }, value: 1 },
       ]),
     );
