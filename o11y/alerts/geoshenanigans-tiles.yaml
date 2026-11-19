@@ -1639,7 +1639,10 @@ spec:
     # result="skipped". Fires when the pull zone serves requests (the log reader
     # counts rows) while every probe run in the past hour was skipped: the probe
     # was left off, so -probe-errors, -probe-slow and -probe-failing are blind.
-    # No run result at all, skipped included, is -probe-silent's.
+    # No run result at all, skipped included, is -probe-silent's. The traffic
+    # gate applies to the whole "skipped unless other results" (bracketed, though
+    # `and` and `unless` share a precedence and group left to right): skipped
+    # runs alone, with no requests to the zone, never fire it.
     - uid: geoshenanigans-tiles-bunny-probe-off
       title: Bunny synthetic probe is off while the pull zone serves requests
       condition: B
@@ -1672,8 +1675,10 @@ spec:
               type: prometheus
               uid: VictoriaMetricsFleet
             expr: >-
-              (sum(sum_over_time(tiles_bunny_probe_runs{project="geoshenanigans", cluster="tiles", env="prod", result="skipped"}[1h])) > 0)
-                unless on () (sum(sum_over_time(tiles_bunny_probe_runs{project="geoshenanigans", cluster="tiles", env="prod", result!="skipped"}[1h])) > 0)
+              (
+                (sum(sum_over_time(tiles_bunny_probe_runs{project="geoshenanigans", cluster="tiles", env="prod", result="skipped"}[1h])) > 0)
+                  unless on () (sum(sum_over_time(tiles_bunny_probe_runs{project="geoshenanigans", cluster="tiles", env="prod", result!="skipped"}[1h])) > 0)
+              )
                 and on () (sum(sum_over_time(tiles_bunny_log_rows{project="geoshenanigans", cluster="tiles", env="prod"}[1h])) > 0)
             instant: true
             range: false
