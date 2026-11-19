@@ -13,7 +13,7 @@ import { Worker } from 'node:worker_threads';
 import { ArchiveIdentity, FileSnapshot, IdentifiedArchive, identifyArchive } from './archive-identity';
 import { ArchiveRanges } from './archive-walk';
 import { forEachLimit } from './replication';
-import { claimRange, defaultClaimsDir } from './seed-claims';
+import { claimRange, defaultClaimsDir, StoppedSeed } from './seed-claims';
 import {
   addCounters,
   BunnyStorage,
@@ -703,18 +703,18 @@ export async function runSeed(options: SeedOptions): Promise<SeedResult> {
       chunkSize,
       archive,
     });
-    unclaim = await claimRange(options.claimsDir ?? defaultClaimsDir(), {
-      stateDir: resolve(stateDir),
-      zone: options.storage.zone,
-      host,
-      prefix,
-      from,
-      to,
-    });
+    const claimed = await claimRange(
+      options.claimsDir ?? defaultClaimsDir(),
+      { stateDir: resolve(stateDir), zone: options.storage.zone, host, prefix, from, to },
+      recordedSettleBy,
+    );
+    unclaim = claimed.release;
     const addresses = options.storage.addresses?.length
       ? options.storage.addresses
       : await (options.resolveAddresses ?? resolveStorageAddresses)(options.storage.host);
     const storageOptions = { ...options.storage, addresses };
+    // Before any request, a first load's preflight included.
+    await settleStopped(options, claimed.stopped, log);
     const unfinished = [...checkpoint.started].filter((id) => !checkpoint!.done.has(id)).length;
     if (unfinished > 0) {
       await settlePrevious(options, unfinished, log);
@@ -745,19 +745,36 @@ function commitWindowMs(options: SeedOptions): number {
 }
 
 /**
+ * When the PUTs of the seed that used `stateDir` may last be committed, as its status.json records it (settleBy), or
+ * undefined when that can't be read. A time over MAX_SETTLE_WAIT_MS after the file was written (a clock set wrong)
+ * counts as that much, so a dead seed's claim doesn't outlive it by more.
+ */
+async function recordedSettleBy(stateDir: string): Promise<number | undefined> {
+  const path = join(stateDir, 'status.json');
+  try {
+    const [text, info] = await Promise.all([readFile(path, 'utf8'), stat(path)]);
+    const recorded = Date.parse((JSON.parse(text) as Partial<SeedStatus>).settleBy ?? '');
+    return Number.isFinite(recorded) ? Math.min(recorded, info.mtimeMs + MAX_SETTLE_WAIT_MS) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Until when to wait for a seed's PUTs to settle: its settleBy, up to MAX_SETTLE_WAIT_MS from now, or a full window. */
+function settleDeadline(settleBy: number | undefined, options: SeedOptions, now: number): number {
+  return settleBy !== undefined
+    ? Math.min(settleBy, now + MAX_SETTLE_WAIT_MS)
+    : now + (options.progressIntervalMs ?? 10_000) + commitWindowMs(options);
+}
+
+/**
  * A run that was stopped or killed may have left PUTs the server commits after it is gone (put() would have waited
  * for them before its DESCRIBE). Verifying their chunks before then reads "missing" and PUTs the same bytes a second
  * time, so a resume first waits for the `settleBy` the previous run recorded (the full window from now if unknown).
  */
 async function settlePrevious(options: SeedOptions, unfinished: number, log: (line: string) => void) {
-  const previous = await readFile(join(options.stateDir, 'status.json'), 'utf8')
-    .then((text) => JSON.parse(text) as Partial<SeedStatus>)
-    .catch(() => undefined);
-  const recorded = Date.parse(previous?.settleBy ?? '');
   const now = Date.now();
-  const until = Number.isFinite(recorded)
-    ? Math.min(recorded, now + MAX_SETTLE_WAIT_MS)
-    : now + (options.progressIntervalMs ?? 10_000) + commitWindowMs(options);
+  const until = settleDeadline(await recordedSettleBy(options.stateDir), options, now);
   if (until > now && !options.signal?.aborted) {
     log(
       `Waiting ${Math.ceil((until - now) / 1000)} s before verifying the ${unfinished} chunks the last run left ` +
@@ -765,6 +782,28 @@ async function settlePrevious(options: SeedOptions, unfinished: number, log: (li
     );
     await sleep(until - now, undefined, { signal: options.signal }).catch(() => {});
   }
+}
+
+/**
+ * The same wait for seeds on this machine that died over an overlapping range under other state dirs (claimRange):
+ * PUTs they left in flight may still be committed, and a DESCRIBE before then reads "missing" and PUTs the same bytes
+ * again. Without this, a seed started with a new --state-dir right after a kill would do just that.
+ */
+async function settleStopped(options: SeedOptions, stopped: StoppedSeed[], log: (line: string) => void) {
+  const now = Date.now();
+  const waiting = stopped
+    .map((seed) => ({ seed, until: settleDeadline(seed.settleBy, options, now) }))
+    .filter(({ until }) => until > now);
+  if (waiting.length === 0 || options.signal?.aborted) {
+    return;
+  }
+  const until = Math.max(...waiting.map(({ until }) => until));
+  const dirs = waiting.map(({ seed }) => `${seed.stateDir} (process ${seed.pid})`).join(', ');
+  log(
+    `Waiting ${Math.ceil((until - now) / 1000)} s for PUTs a stopped seed may still commit: ${dirs} ` +
+      'seeded part of this range',
+  );
+  await sleep(until - now, undefined, { signal: options.signal }).catch(() => {});
 }
 
 /**

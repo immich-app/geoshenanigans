@@ -30,7 +30,8 @@
  * past the window in which the server may still commit them (request timeout + 5 x settle, up to about 70 s after a
  * kill) before it DESCRIBEs its unfinished chunks, and a seed refuses to start while another one on this machine, with
  * another state dir, covers an overlapping range of the same zone and prefix (claims live in $XDG_STATE_HOME/bunny-seed,
- * default ~/.local/state/bunny-seed; seeds on other machines are not seen).
+ * default ~/.local/state/bunny-seed; seeds on other machines are not seen). When that other seed died instead (kill -9,
+ * a second Ctrl-C), a seed with any state dir waits the same way for its PUTs before its first DESCRIBE.
  * Unless the addresses are pinned, the storage host is looked up again every 5 minutes and workers move to the new set.
  * The archive is identified by a hash of the whole file (archive-identity.ts; about 15 s for a planet build from NVMe,
  * at every start): the checkpoint refuses a resume with another archive, and the seed reads only the file that was

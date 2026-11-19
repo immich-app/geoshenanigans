@@ -1,12 +1,13 @@
-import { ChildProcess, spawn } from 'node:child_process';
+import { ChildProcess, spawn, spawnSync } from 'node:child_process';
 import { mkdirSync, PathLike, readFileSync, rmSync, utimesSync } from 'node:fs';
-import { mkdir, readFile, rename, stat } from 'node:fs/promises';
+import { mkdir, readFile, rename, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { archiveIdentity, identifyArchive } from '../../src/bunny/archive-identity';
 import { ArchiveRanges } from '../../src/bunny/archive-walk';
 import { BunnyStateStore, writeState } from '../../src/bunny/state';
+import { storageOrigin } from '../../src/bunny/storage';
 import { tilePath } from '../../src/bunny/tile-id';
 import {
   Checkpoint,
@@ -308,6 +309,83 @@ describe('runSeed', () => {
     // Its claim is gone once it is done: the next seed runs (and finds everything stored).
     const again = await runSeed(options({ stateDir: join(dir, 'd'), firstLoad: false, to: 600 }));
     expect(again.status.files.skippedExisting).toBe(600);
+  });
+
+  /** A process that has exited, and the claim it would have left over [from, to) had it died seeding. */
+  async function deadClaim(
+    claimsDir: string,
+    stateDir: string,
+    fake: FakeStorage,
+    from: number,
+    to: number,
+    settleBy?: number,
+  ) {
+    const { pid } = spawnSync(process.execPath, ['-e', '']);
+    await mkdir(claimsDir, { recursive: true });
+    await mkdir(stateDir, { recursive: true });
+    if (settleBy !== undefined) {
+      await writeFile(join(stateDir, 'status.json'), JSON.stringify({ settleBy: new Date(settleBy).toISOString() }));
+    }
+    const file = join(claimsDir, 'dead.json');
+    const claim = { pid, stateDir, zone: fake.zone, host: storageOrigin(fake.url), prefix: 'itest', from, to };
+    await writeFile(file, JSON.stringify({ ...claim, startedAt: new Date().toISOString() }));
+    return { pid, file };
+  }
+
+  it("waits for a dead seed's PUTs before its first request, and keeps its claim until they settle", async () => {
+    let firstRequest = 0;
+    const { fixture, fake, options, dir } = await setup(1_365, {
+      onRequest: () => (firstRequest ||= Date.now()),
+    });
+    const claims = join(dir, 'claims');
+    // Its status.json says its PUTs may be committed for another 2.5 s.
+    const settleBy = Date.now() + 2_500;
+    const dead = await deadClaim(claims, join(dir, 'dead'), fake, 0, 600, settleBy);
+    const seed = async (overrides: Partial<SeedOptions>) => {
+      const logs: string[] = [];
+      firstRequest = 0;
+      const result = await runSeed(options({ firstLoad: false, log: (line) => logs.push(line), ...overrides }));
+      return { result, waited: logs.filter((line) => line.includes('stopped seed')) };
+    };
+
+    // A range it didn't seed doesn't wait, and the claim stays for the seeds that do.
+    const beside = await seed({ from: 600, stateDir: join(dir, 'beside') });
+    expect(beside.result.status.state).toBe('complete');
+    expect(beside.waited).toEqual([]);
+    expect(await stat(dead.file).then(() => true)).toBe(true);
+
+    const over = await seed({ stateDir: join(dir, 'over') });
+    expect(over.result.status.state).toBe('complete');
+    expect(over.waited).toEqual([
+      expect.stringMatching(
+        new RegExp(`^Waiting [23] s for PUTs a stopped seed may still commit: .*dead \\(process ${dead.pid}\\)`),
+      ),
+    ]);
+    expect(firstRequest).toBeGreaterThanOrEqual(settleBy - 5);
+    expectStored(fake, fixture, 0, 1_365);
+    expect(fake.identicalReputs).toEqual([]);
+
+    // Once they have settled, the next seed over the range removes the claim without waiting.
+    const after = await seed({ to: 100, stateDir: join(dir, 'after') });
+    expect(after.waited).toEqual([]);
+    await expect(stat(dead.file)).rejects.toThrow(/ENOENT/);
+  });
+
+  it('waits a full commit window for a dead seed whose status.json is gone, before even a first load checks', async () => {
+    let firstRequest = 0;
+    const { fake, options, dir } = await setup(1_365, { onRequest: () => (firstRequest ||= Date.now()) });
+    const dead = await deadClaim(join(dir, 'claims'), join(dir, 'dead'), fake, 0, 1_365);
+    const logs: string[] = [];
+    const started = Date.now();
+    const result = await runSeed(options({ log: (line) => logs.push(line), stateDir: join(dir, 'fresh') }));
+    expect(result.status.state).toBe('complete');
+    expect(logs).toContainEqual(
+      expect.stringMatching(new RegExp(`^Waiting 1 s for PUTs a stopped seed .*\\(process ${dead.pid}\\)`)),
+    );
+    // A status write's interval (200 ms) + the 300 ms timeout + 5 x the 5 ms settle, before the preflight's DESCRIBEs.
+    expect(firstRequest - started).toBeGreaterThanOrEqual(525 - 5);
+    // Nothing says when it would be over: only the seeds that saw the claim wait.
+    await expect(stat(dead.file)).rejects.toThrow(/ENOENT/);
   });
 
   it('waits for PUTs a stopped run left pending before verifying the chunks it left unfinished', async () => {
@@ -947,6 +1025,64 @@ describe('bunny:seed CLI', () => {
     const resumed = await startSeed(fake, args, env).done;
     expect(resumed.code, resumed.stderr).toBe(0);
     expect(resumed.stderr).toMatch(/Waiting \d+ s before verifying/);
+    await sleep(arrived + lateStoreMs + 300 - Date.now());
+    expect(fake.putsByPath.get(late)).toBe(1);
+    expect(fake.identicalReputs).toEqual([]);
+    expectStored(fake, fixture, 0, 85);
+  }, 40_000);
+
+  it('after kill -9, a seed with a new state dir waits for the PUTs the dead one had in flight', async () => {
+    const scratch = await scratchDir();
+    cleanup.push(scratch.remove);
+    const fixture = await writeFixtureArchive(scratch.dir, 85, 5, 50);
+    const late = tilePath('itest', 3);
+    // Stored 3.5 s after it arrived, within the 2 s timeout + 5 x 400 ms settle that put() allows a server.
+    const lateStoreMs = 3_500;
+    let arrived = 0;
+    const first: { child?: ChildProcess } = {};
+    const fake = await FakeStorage.start({
+      lateStoreMs,
+      fault: ({ method, path, attempt }) => {
+        if (method === 'PUT' && path === late && attempt === 1) {
+          arrived = Date.now();
+          setTimeout(() => first.child?.kill('SIGKILL'), 500);
+          return 'late-store';
+        }
+        return undefined;
+      },
+    });
+    cleanup.push(() => fake.close());
+    const args = (stateDir: string) => [
+      '--archive',
+      fixture.path,
+      '--prefix',
+      'itest',
+      '--max-zoom',
+      '3',
+      '--state-dir',
+      stateDir,
+      '--request-timeout-s',
+      '2',
+      '--settle-ms',
+      '400',
+      '--progress-interval-s',
+      '1',
+      '--workers',
+      '1',
+      '--concurrency',
+      '8',
+    ];
+    const env = { XDG_STATE_HOME: scratch.dir };
+    const killed = startSeed(fake, args(join(scratch.dir, 'state')), env);
+    first.child = killed.child;
+    expect((await killed.done).signal).toBe('SIGKILL');
+
+    // The repair command's --state-dir <new dir>, in the default mode: nothing of the dead seed's checkpoint applies,
+    // and its claim is what tells this one to wait.
+    const other = await startSeed(fake, args(join(scratch.dir, 'other')), env).done;
+    expect(other.code, other.stderr).toBe(0);
+    expect(other.stderr).toMatch(/Waiting \d+ s for PUTs a stopped seed may still commit: /);
+    expect(other.stderr).toContain(`commit: ${join(scratch.dir, 'state')} (process ${killed.child.pid})`);
     await sleep(arrived + lateStoreMs + 300 - Date.now());
     expect(fake.putsByPath.get(late)).toBe(1);
     expect(fake.identicalReputs).toEqual([]);
