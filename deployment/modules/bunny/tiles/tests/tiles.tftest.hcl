@@ -43,6 +43,12 @@ run "middleware" {
     error_message = "The middleware sets the tile's Content-Type and Content-Encoding."
   }
 
+  # The rules every mode has; the status check below (edge_rule) only looks at the rules there are.
+  assert {
+    condition     = length(setsubtract(["tile-cache-control", "json-cache-control", "json-content-type", "cors", "vary-origin"], keys(bunnynet_pullzone_edgerule.header))) == 0
+    error_message = "Every mode has the tile and JSON Cache-Control, the JSON Content-Type and the CORS headers."
+  }
+
   assert {
     condition     = bunnynet_pullzone.tiles.origin.middleware_script == bunnynet_compute_script.gzip.id && bunnynet_pullzone.tiles.routing.filters == toset(["scripting"])
     error_message = "The middleware is linked, and runs only on scripting PoPs."
@@ -99,6 +105,12 @@ run "edge_rule" {
   assert {
     condition     = bunnynet_pullzone_edgerule.tile_force_compression.actions[0].type == "ForceCompression"
     error_message = "Force Compression on tiles in every mode."
+  }
+
+  # The status check below only looks at the rules there are: a rule removed would pass it.
+  assert {
+    condition     = length(setsubtract(["tile-cache-control", "json-cache-control", "json-content-type", "tile-content-type", "tile-content-encoding"], keys(bunnynet_pullzone_edgerule.header))) == 0
+    error_message = "edge_rule has the tile and JSON Cache-Control and Content-Type rules and the tile Content-Encoding rule."
   }
 
   # Bunny's 404 page for a missing file keeps Bunny's headers: no tile Cache-Control, Content-Type or Content-Encoding.
