@@ -3,9 +3,8 @@
  * whichever run ends first, so a run split across several entries in the other build, runs that start or end at
  * different IDs and moved ocean boundaries all compare by what each position holds.
  */
-import { Entry } from '../pmtiles/types';
 import { ManifestBatch, manifestBatches, ManifestHeader, readManifestHeader } from './manifest';
-import { MAX_SAFE_ZOOM, tileIdZoom, zoomEnd } from './tile-id';
+import { tileIdZoom, zoomEnd } from './tile-id';
 
 /**
  * Consecutive positions of one kind: `changed` holds other bytes in the new build, `added` exists only in the new
@@ -44,18 +43,9 @@ export function zoomOf(tileId: number): number {
   return tileIdZoom(tileId);
 }
 
-/** One past the highest tile ID a manifest can describe: the end of zoom MAX_SAFE_ZOOM. */
-const TILE_ID_END = zoomEnd(MAX_SAFE_ZOOM);
-
+/** Ranges come from manifests, whose reader refuses positions past zoom MAX_SAFE_ZOOM (manifestBatches). */
 function countByZoom(byZoom: ZoomCounts[], kind: DiffKind, start: number, count: number) {
   const end = start + count;
-  // Past the last zoom there is no next zoom to step to: refuse such a range instead of looping on it for ever.
-  if (end > TILE_ID_END) {
-    throw new Error(
-      `${kind} positions ${start}..${end - 1} go past zoom ${MAX_SAFE_ZOOM} (tile IDs end at ${TILE_ID_END}); ` +
-        'a manifest cannot describe them',
-    );
-  }
   let position = start;
   while (position < end) {
     const z = tileIdZoom(position);
@@ -361,64 +351,4 @@ export async function planSync(livePath: string, newPath: string, pendingPaths: 
     ...pendingPaths.map((path) => diffManifests(livePath, path)),
   ]);
   return new SyncPlan(diff, pending);
-}
-
-export interface TilePosition {
-  tileId: number;
-  offset: number;
-  length: number;
-  /** From the range: DESCRIBE before writing. */
-  verify: boolean;
-}
-
-/**
- * The archive tile behind every changed and added position of the ranges, in tile-ID order: what the uploader
- * reads. `entries` is the new build's Archive.tileEntries(); ranges must come in tile-ID order, as a diff or a plan
- * yields them. Removed ranges are skipped.
- */
-export async function* changedTiles(
-  entries: AsyncIterable<Entry[]>,
-  ranges: AsyncIterable<DiffRange | SyncRange> | Iterable<DiffRange | SyncRange>,
-): AsyncGenerator<TilePosition> {
-  const iterator = entries[Symbol.asyncIterator]();
-  let run: Entry[] = [];
-  let index = 0;
-  let previousEnd = 0;
-  try {
-    for await (const range of ranges) {
-      if (range.kind === 'removed') {
-        continue;
-      }
-      if (range.start < previousEnd) {
-        throw new Error(`Range at ${range.start} is out of order`);
-      }
-      const verify = 'verify' in range && range.verify;
-      const end = range.start + range.count;
-      previousEnd = end;
-      for (let position = range.start; position < end;) {
-        while (index >= run.length || run[index].tileId + run[index].runLength <= position) {
-          if (index < run.length) {
-            index++;
-            continue;
-          }
-          const next = await iterator.next();
-          if (next.done) {
-            throw new Error(`Tile ${position} is not in the archive`);
-          }
-          run = next.value;
-          index = 0;
-        }
-        const entry = run[index];
-        if (entry.tileId > position) {
-          throw new Error(`Tile ${position} is not in the archive`);
-        }
-        const entryEnd = Math.min(end, entry.tileId + entry.runLength);
-        for (; position < entryEnd; position++) {
-          yield { tileId: position, offset: entry.offset, length: entry.length, verify };
-        }
-      }
-    }
-  } finally {
-    await iterator.return?.();
-  }
 }

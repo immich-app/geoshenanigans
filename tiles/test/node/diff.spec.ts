@@ -1,17 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import {
-  changedTiles,
-  DiffKind,
-  diffManifests,
-  DiffRange,
-  DiffTotals,
-  planSync,
-  SyncRange,
-  zoomOf,
-} from '../../src/bunny/diff';
+import { ArchiveRanges } from '../../src/bunny/archive-walk';
+import { DiffKind, diffManifests, DiffRange, DiffTotals, planSync, SyncRange, zoomOf } from '../../src/bunny/diff';
 import { buildManifest, ManifestEntry, writeManifest } from '../../src/bunny/manifest';
+import { sha256Hex } from '../../src/bunny/state';
+import { planItems } from '../../src/bunny/sync';
 import { MAX_SAFE_ZOOM, zoomEnd } from '../../src/bunny/tile-id';
-import { openArchiveFile } from '../../src/deploy/archive-file';
 import { zxyToTileId } from '../../src/pmtiles/utils';
 import {
   Build,
@@ -218,7 +211,7 @@ describe('diffManifests', () => {
     expect(totals).toMatchObject({ oldBuild: '20261117', newBuild: '20261118', changed: 11, unchanged: 189 });
   });
 
-  it('rejects changed, added and removed positions past zoom 26 instead of hanging', async () => {
+  it('rejects changed, added, removed and unchanged positions past zoom 26 instead of hanging', async () => {
     const end = zoomEnd(MAX_SAFE_ZOOM);
     const cases: [ManifestEntry[], ManifestEntry[]][] = [
       // A changed run crossing into zoom 27, one changed position at its first ID, one added, one removed.
@@ -229,6 +222,15 @@ describe('diffManifests', () => {
       [[{ tileId: end, runLength: 1, hash: 'A'.repeat(16) }], [{ tileId: end, runLength: 1, hash: 'B'.repeat(16) }]],
       [[], [{ tileId: end + 5, runLength: 1, hash: 'A'.repeat(16) }]],
       [[{ tileId: end + 5, runLength: 1, hash: 'A'.repeat(16) }], []],
+      // The same bytes in both builds: no range to count, but still no position a manifest can describe.
+      [
+        [{ tileId: end - 1, runLength: 2, hash: 'A'.repeat(16) }],
+        [{ tileId: end - 1, runLength: 2, hash: 'A'.repeat(16) }],
+      ],
+      [
+        [{ tileId: end + 5, runLength: 1, hash: 'A'.repeat(16) }],
+        [{ tileId: end + 5, runLength: 1, hash: 'A'.repeat(16) }],
+      ],
     ];
     for (const [i, [before, after]] of cases.entries()) {
       const oldPath = scratch.path(`old-${i}.tman.zst`);
@@ -276,7 +278,21 @@ describe('zoomOf', () => {
   });
 });
 
-describe('changedTiles', () => {
+/** The upload items planItems (the sync's uploader input) makes of a plan over an archive. */
+async function itemsOf(archivePath: string, ranges: AsyncIterable<SyncRange> | Iterable<SyncRange>) {
+  const archive = await ArchiveRanges.open(archivePath);
+  try {
+    const items = [];
+    for await (const item of planItems(archive, ranges)) {
+      items.push({ tileId: item.tileId, sha256: item.sha256, verify: item.verify });
+    }
+    return items;
+  } finally {
+    await archive.close();
+  }
+}
+
+describe('planItems over a diff', () => {
   it('finds the archive tile of every changed and added position', async () => {
     const r = rng(5);
     const oldBuild = randomBuild(r, 2000, 85, 0.02);
@@ -286,41 +302,39 @@ describe('changedTiles', () => {
     await writeManifest(oldPath, { buildKey: '20261117' }, expectedEntries(oldBuild));
     await writeManifest(newPath, { buildKey: '20261118' }, expectedEntries(newBuild));
     const archivePath = scratch.path('new.pmtiles');
-    const archive = await writeArchiveFile(archivePath, newBuild, r, { splitChance: 0.5, maxLeafEntries: 3 });
+    await writeArchiveFile(archivePath, newBuild, r, { splitChance: 0.5, maxLeafEntries: 3 });
 
-    const { archive: reader, close } = await openArchiveFile(archivePath);
-    const tiles = [];
-    for await (const tile of changedTiles(reader.tileEntries(), await diffManifests(oldPath, newPath))) {
-      tiles.push(tile);
-    }
-    await close();
-
+    const items = await itemsOf(archivePath, await planSync(oldPath, newPath));
     const expected = bruteForce(oldBuild, newBuild)
       .ranges.filter((range) => range.kind !== 'removed')
       .flatMap((range) => Array.from({ length: range.count }, (_, i) => range.start + i))
-      .map((tileId) => {
-        const content = newBuild.contents[tileId - newBuild.base]!;
-        return {
-          tileId,
-          offset: archive.offsets[tileId - newBuild.base],
-          length: contentBytes(content).length,
-          verify: false,
-        };
-      });
-    expect(tiles.length).toBeGreaterThan(0);
-    expect(tiles).toEqual(expected);
+      .map((tileId) => ({
+        tileId,
+        sha256: sha256Hex(contentBytes(newBuild.contents[tileId - newBuild.base]!)),
+        verify: false,
+      }));
+    expect(items.length).toBeGreaterThan(0);
+    expect(items).toEqual(expected);
   });
 
-  it('rejects positions the archive does not have', async () => {
-    const entries = (async function* () {
-      yield [{ tileId: 0, offset: 0, length: 5, runLength: 2, chunkId: 0 }];
-    })();
-    const iterate = async () => {
-      for await (const tile of changedTiles(entries, [{ start: 1, count: 3, kind: 'changed' }])) {
-        expect(tile.tileId).toBe(1);
-      }
-    };
-    await expect(iterate()).rejects.toThrow(/Tile 2 is not in the archive/);
+  it('marks the positions a plan must check and rejects positions the archive does not have', async () => {
+    const r = rng(6);
+    const build: Build = { base: 0, contents: [1, 1, 2, 3, 3, 3, 4, 5, 6, 7] };
+    const archivePath = scratch.path('small.pmtiles');
+    await writeArchiveFile(archivePath, build, r, { splitChance: 0.5, maxLeafEntries: 2 });
+    const items = await itemsOf(archivePath, [
+      { start: 1, count: 2, kind: 'changed', verify: true },
+      { start: 3, count: 1, kind: 'removed', verify: true },
+      { start: 4, count: 1, kind: 'added', verify: false },
+    ]);
+    expect(items.map((item) => [item.tileId, item.verify])).toEqual([
+      [1, true],
+      [2, true],
+      [4, false],
+    ]);
+    await expect(itemsOf(archivePath, [{ start: 8, count: 3, kind: 'changed', verify: false }])).rejects.toThrow(
+      /Tile 10 is not in/,
+    );
   });
 });
 
@@ -534,24 +548,5 @@ describe('planSync', () => {
     // Planning with the live manifest alone, as before pending builds were recorded, gets both wrong.
     expect(plainStale).toBeGreaterThan(0);
     expect(plainIdentical).toBeGreaterThan(0);
-  });
-
-  it('marks the positions a plan must check in changedTiles', async () => {
-    const entries = (async function* () {
-      yield [{ tileId: 0, offset: 0, length: 5, runLength: 10, chunkId: 0 }];
-    })();
-    const tiles = [];
-    for await (const tile of changedTiles(entries, [
-      { start: 1, count: 2, kind: 'changed', verify: true },
-      { start: 3, count: 1, kind: 'removed', verify: true },
-      { start: 4, count: 1, kind: 'added', verify: false },
-    ])) {
-      tiles.push([tile.tileId, tile.verify]);
-    }
-    expect(tiles).toEqual([
-      [1, true],
-      [2, true],
-      [4, false],
-    ]);
   });
 });
