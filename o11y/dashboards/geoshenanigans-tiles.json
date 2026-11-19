@@ -3512,7 +3512,7 @@
     {
       "type": "timeseries",
       "title": "Probe errors",
-      "description": "Failed probe tests by continent and observed cache kind (the cache status the edge reported, as in the first-byte panels), plus runs with a Globalping measurement error (one refused or unfinished at the deadline, or none of a target's tests with a verdict; the other target can still have verdicts). The bunny-probe-errors alert requires a majority of verdicts in 30 minutes to be failures in a continent and kind, with the same target failing in at least two runs. The bunny-probe-failing alert requires at least two runs with a measurement error and a majority of runs to have one in 30 minutes.",
+      "description": "Failed probe tests by continent and observed cache kind (the cache status the edge reported, as in the first-byte panels). \"worker tilejson\" is the Worker's own read of the TileJSON (v1.json), which gives the probe its tile URLs: it failed or named no usable tile URL. Plus runs with a measurement error: the TileJSON unreadable or without a usable tile URL (no tile measured that run), a Globalping measurement refused or unfinished at the deadline, none of a target's tests with a verdict (the other target can still have verdicts), or a continent without a verdict (named in the missing field of the probe's error line; the other continents' tests still count). The bunny-probe-errors alert requires a majority of verdicts in 30 minutes to be failures in a continent and kind, with the same target failing in at least two runs. The bunny-probe-failing alert requires at least two runs with a measurement error and a majority of runs to have one in 30 minutes.",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"

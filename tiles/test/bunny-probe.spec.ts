@@ -10,6 +10,7 @@ import {
   PROBE_CONTINENTS,
   probeDue,
   runProbe,
+  TILEJSON_LABELS,
   tileUrl,
 } from '../src/bunny-logs/probe';
 import { O11yLogger } from '../src/o11y';
@@ -98,6 +99,8 @@ const hitAndMiss = (hitResults: unknown[]): Routes => ({
 });
 
 const NO_VERDICT_FROM = 'Globalping measurement has no verdict from some continents';
+// The Worker's read of the TileJSON, a test of its own every run.
+const tileJsonRead = (value: number) => ({ name: 'tiles_bunny_probe_errors', labels: { ...TILEJSON_LABELS }, value });
 
 const creates = (calls: Call[]) => calls.filter(({ url, method }) => url === GLOBALPING_API && method === 'POST');
 const metrics = (calls: Call[]) => pushedSamples(calls).map(({ name, labels, value }) => ({ name, labels, value }));
@@ -235,11 +238,13 @@ describe('runProbe', () => {
         { name: 'tiles_bunny_probe_errors', labels: { continent: 'EU', kind: 'hit', target: 'hit' }, value: 0 },
         { name: 'tiles_bunny_probe_errors', labels: { continent: 'AF', kind: 'hit', target: 'hit' }, value: 1 },
         { name: 'tiles_bunny_probe_errors', labels: { continent: 'AF', kind: 'miss', target: 'miss' }, value: 1 },
+        // The TileJSON read worked.
+        tileJsonRead(0),
         { name: 'tiles_bunny_probe_runs', labels: { result: 'ok' }, value: 1 },
       ]),
     );
     expect(samples.filter(({ name }) => name === 'tiles_bunny_probe_ttfb_ms')).toHaveLength(10);
-    expect(samples.filter(({ name }) => name === 'tiles_bunny_probe_errors')).toHaveLength(12);
+    expect(samples.filter(({ name }) => name === 'tiles_bunny_probe_errors')).toHaveLength(13);
 
     const lines = pushedLogs(calls).filter(({ kind }) => kind === 'probe');
     expect(lines).toHaveLength(12);
@@ -467,7 +472,10 @@ describe('runProbe', () => {
         ]),
     });
     expect(result).toBe('error');
-    expect(metrics(calls)).toEqual([{ name: 'tiles_bunny_probe_runs', labels: { result: 'error' }, value: 1 }]);
+    expect(metrics(calls)).toEqual([
+      tileJsonRead(0),
+      { name: 'tiles_bunny_probe_runs', labels: { result: 'error' }, value: 1 },
+    ]);
     expect(pushedLogs(calls)).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
@@ -492,6 +500,7 @@ describe('runProbe', () => {
       PROBE_CONTINENTS.map((continent) => ({ continent, limit: 1 })),
     );
     expect(metrics(calls)).toEqual([
+      tileJsonRead(0),
       { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'EU', kind: 'miss', target: 'miss' }, value: 150 },
       { name: 'tiles_bunny_probe_errors', labels: { continent: 'EU', kind: 'miss', target: 'miss' }, value: 0 },
       { name: 'tiles_bunny_probe_runs', labels: { result: 'error' }, value: 1 },
@@ -507,11 +516,14 @@ describe('runProbe', () => {
     );
   });
 
-  it('pushes only the run when no measurement could be created', async () => {
+  it('pushes only the TileJSON read and the run when no measurement could be created', async () => {
     const { result, calls } = await probe({ create: () => new Response('down', { status: 503 }) });
     expect(result).toBe('error');
     expect(calls.filter(({ url, method }) => url.startsWith(GLOBALPING_API) && method === 'GET')).toHaveLength(0);
-    expect(metrics(calls)).toEqual([{ name: 'tiles_bunny_probe_runs', labels: { result: 'error' }, value: 1 }]);
+    expect(metrics(calls)).toEqual([
+      tileJsonRead(0),
+      { name: 'tiles_bunny_probe_runs', labels: { result: 'error' }, value: 1 },
+    ]);
   });
 
   it("gives up at the deadline, not counting tests still in progress (Globalping's delay)", async () => {
@@ -597,16 +609,34 @@ describe('runProbe', () => {
   });
 
   it.each([
-    ['is unreadable', () => new Response('not found', { status: 404 })],
+    ['is not found', () => new Response('not found', { status: 404 })],
+    ['answers 503, as in a CDN outage', () => new Response('Domain suspended or not configured', { status: 503 })],
+    [
+      'times out',
+      (): Response => {
+        throw new DOMException('The operation was aborted due to timeout', 'TimeoutError');
+      },
+    ],
+    ['is no JSON', () => new Response('<html>', { status: 200 })],
     ['has no tile template', () => json({ tilejson: '3.0.0', tiles: [] })],
     ['names tiles with a query', () => tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt?v=20261118')],
   ])(
-    'reports an error, measuring nothing, when the TileJSON %s rather than probe the old prefix',
+    'pushes a failed TileJSON test the critical alert counts, measuring no tile, when the TileJSON %s',
     async (_, tileJson) => {
       const { result, calls } = await probe({ tileJson });
       expect(result).toBe('error');
+      // Not the old prefix instead.
       expect(calls.filter(({ url }) => url.startsWith(GLOBALPING_API))).toEqual([]);
-      expect(metrics(calls)).toEqual([{ name: 'tiles_bunny_probe_runs', labels: { result: 'error' }, value: 1 }]);
+      // A test with a verdict, an error, as geoshenanigans-tiles-bunny-probe-errors sums them (by continent and kind).
+      expect(metrics(calls)).toEqual([
+        {
+          name: 'tiles_bunny_probe_errors',
+          labels: { continent: 'worker', kind: 'tilejson', target: 'tilejson' },
+          value: 1,
+        },
+        { name: 'tiles_bunny_probe_runs', labels: { result: 'error' }, value: 1 },
+      ]);
+      expect(new Set(pushedSamples(calls).map(({ timestamp }) => timestamp))).toEqual(new Set([scheduled]));
       expect(pushedLogs(calls)).toEqual([
         expect.objectContaining({ _msg: 'Probe tile URLs unknown', level: 'error', job: 'bunny_probe' }),
       ]);

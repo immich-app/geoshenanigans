@@ -125,6 +125,19 @@ sample 3 20 tiles_bunny_probe_errors 'continent="NA",kind="miss"' 1
 sample 3 15 tiles_bunny_probe_errors 'continent="NA",kind="miss"' 1
 sample 3 10 tiles_bunny_probe_errors 'continent="NA",kind="miss"' 0
 sample 3 5 tiles_bunny_probe_errors 'continent="NA",kind="miss"' 0
+# Case 16: the TileJSON goes down with the CDN at the default 10 minutes: the
+# Worker's read fails in the last two of three runs, so no tile is measured in
+# them, and its own test (continent worker, kind tilejson) fires: 2 of 3.
+for m in 25 15 5; do sample 16 "$m" tiles_bunny_probe_runs 'result="error"' 1; done
+sample 16 25 tiles_bunny_probe_errors 'continent="worker",kind="tilejson",target="tilejson"' 0
+sample 16 15 tiles_bunny_probe_errors 'continent="worker",kind="tilejson",target="tilejson"' 1
+sample 16 5 tiles_bunny_probe_errors 'continent="worker",kind="tilejson",target="tilejson"' 1
+# Case 17: one failed TileJSON read among good ones (a blip): no.
+runs 17 25 5
+sample 17 15 tiles_bunny_probe_runs 'result="error"' 1
+sample 17 25 tiles_bunny_probe_errors 'continent="worker",kind="tilejson",target="tilejson"' 0
+sample 17 15 tiles_bunny_probe_errors 'continent="worker",kind="tilejson",target="tilejson"' 1
+sample 17 5 tiles_bunny_probe_errors 'continent="worker",kind="tilejson",target="tilejson"' 0
 
 # --- geoshenanigans-tiles-bunny-probe-slow ---------------------------------
 # Case 4, by continent:
@@ -234,6 +247,9 @@ check 'probe-errors: errors over verdicts, not runs' 1 "$errors" 'continent=EU,k
 check 'probe-errors: one run after a purge, both targets failing' 2 "$errors" ''
 check 'probe-errors: two failing runs, adding up over target' 6 "$errors" 'continent=EU,kind=miss 0.75'
 check 'probe-errors: one error, a lone error, exactly half' 3 "$errors" ''
+check 'probe-errors: the TileJSON read failing in two runs of three' 16 "$errors" \
+  'continent=worker,kind=tilejson 0.6666666666666666'
+check 'probe-errors: one failed TileJSON read' 17 "$errors" ''
 
 slow=$(rule_expr geoshenanigans-tiles-bunny-probe-slow)
 check 'probe-slow: slow misses in two runs, not one, nor one outlier' 4 "$slow" \

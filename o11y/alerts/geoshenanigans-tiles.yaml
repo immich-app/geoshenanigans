@@ -1372,6 +1372,12 @@ spec:
     # runs only half the time and `for` restarted). `continent`, not `region`:
     # region is an o11y identity label (world). Runs that failed at Globalping
     # itself say nothing about Bunny: geoshenanigans-tiles-bunny-probe-failing.
+    # The Worker's own read of the TileJSON (/v1.json), which gives the probe
+    # its tile URLs, is a test too: one sample a run with continent="worker",
+    # kind="tilejson" (1 when it failed or named no usable tile URL, 0 when it
+    # did), so an outage that takes v1.json down with the tiles (the CDN, the
+    # storage zone, the hostname, a deleted v1.json), when no tile can be
+    # measured, fires here under the same gate, not only -probe-failing.
     - uid: geoshenanigans-tiles-bunny-probe-errors
       title: Bunny synthetic probe sees errors
       condition: B
@@ -1391,8 +1397,13 @@ spec:
           "Probe tests" panel: project:="geoshenanigans" cluster:="tiles" kind:="probe", with the PoP that answered)
           and check status.bunny.net. A 404 for a tile means a missing file in the
           storage zone (every position is uploaded, so none should be); corrupt or empty bodies in a few PoPs
-          are the gzip edge rule bug the middleware script works around. The Tiles dashboard's "Probe errors"
-          shows whether it is one continent or all of them.
+          are the gzip edge rule bug the middleware script works around. Continent "worker", kind "tilejson":
+          the Worker's own read of the TileJSON (v1.json), which every map loads first, failed or named no usable
+          tile URL, so no tile could be measured either: the probe's "Probe tile URLs unknown" lines in the Logs
+          panel give the reason (an HTTP status such as a 404 for a deleted v1.json or Bunny's "Domain suspended
+          or not configured", a timeout, a body with no tile template); try the zone's /v1.json yourself and
+          check status.bunny.net. The Tiles dashboard's "Probe errors" shows whether it is one continent or all
+          of them.
       execErrState: Error
       noDataState: OK
       data:
@@ -1451,7 +1462,8 @@ spec:
                 reducer:
                   type: last
                   params: []
-    # A probe run is result="error" when the TileJSON gave no tile URL to test,
+    # A probe run is result="error" when the TileJSON gave no tile URL to test
+    # (also a failed test for -probe-errors, as continent="worker"),
     # Globalping refused a measurement (its hourly quota, which manual probe
     # sets spend too, a bad token, a 5xx), one was unfinished at the run's
     # deadline, none of its tests got a verdict, or a continent got none.
@@ -1477,7 +1489,8 @@ spec:
           deadline are not counted as tile errors, so a stall at Bunny itself also shows here: check
           status.bunny.net and the "Probe tests" panel. The probe's error lines in
           the Logs panel give the answer. "Probe tile URLs unknown": the TileJSON (v1.json) could not be read
-          or names no usable tile URL. "Globalping measurement not created": a 429 is the hourly quota (500
+          or names no usable tile URL (each such run is also a failed test with continent "worker", kind
+          "tilejson", for geoshenanigans-tiles-bunny-probe-errors). "Globalping measurement not created": a 429 is the hourly quota (500
           tests plus credits, also spent by manual probe sets; it recovers within the hour), a 401 or 403 the
           GLOBALPING_TOKEN worker secret. "Globalping measurement has no verdict from some continents": its
           missing field names them; Globalping had no probe there or its tests failed. "Unfinished at the
@@ -1698,15 +1711,15 @@ spec:
     # Every probe run pushes tiles_bunny_probe_runs{result} at its end, skipped
     # included. A run that ends before that push sends nothing: runProbe
     # rejecting (the cron's guard logs "Bunny cron job failed"), the scheduled
-    # handler killed at a CPU, subrequest or wall time limit, the push refused,
-    # or a BUNNY_PROBE_INTERVAL_MINUTES so long the hour holds no run. Then no
-    # probe rule fires: -probe-off wants skipped runs, the others measurements
-    # or errors. Fires on an hour without a run result of any kind, while the
-    # pull zone serves requests (as -probe-off) and the log reader, in the
-    # same cron, reported in the past 15 minutes: a cron that stops entirely is
-    # -bunny-logs-silent's or -heartbeat's. The hour holds two runs plus the
-    # 45s measurement deadline at an interval of up to 29 minutes (six at the
-    # default 10).
+    # handler killed at a CPU, subrequest or wall time limit, or the push
+    # refused or lost. Then no probe rule fires: -probe-off wants skipped runs,
+    # the others measurements or errors. Fires on an hour without a run result
+    # of any kind, while the pull zone serves requests (as -probe-off) and the
+    # log reader, in the same cron, reported in the past 15 minutes: a cron
+    # that stops entirely is -bunny-logs-silent's or -heartbeat's. Not the
+    # interval: it is 5 to 14 minutes (tiles-worker's validation, and the
+    # Worker clamps it too), so the hour always holds at least four runs, each
+    # with its 45s measurement deadline (six at the default 10).
     - uid: geoshenanigans-tiles-bunny-probe-silent
       title: Bunny synthetic probe stopped reporting
       condition: B
@@ -1722,9 +1735,11 @@ spec:
           geoshenanigans-tiles-bunny-probe-errors, -probe-slow, -probe-failing and -probe-off are all blind. Look
           for the worker's "Bunny cron job failed" line with job:="bunny_probe" in the Logs panel (runProbe
           threw), and for tiles-prod's cron events in the Cloudflare dashboard that ended exceeding CPU,
-          subrequest or wall time limits. Check that BUNNY_PROBE_INTERVAL_MINUTES (tiles-worker's
-          bunny_probe_interval_minutes) is 29 or less, so the hour holds two runs. Skipped runs mean the probe
-          is not configured (geoshenanigans-tiles-bunny-probe-off), not this.
+          subrequest or wall time limits, or whose logs show "o11y: /insert/0/prometheus/api/v1/import/prometheus
+          answered" or "failed" (the probe's push refused or lost). Not the probe interval:
+          BUNNY_PROBE_INTERVAL_MINUTES is 5 to 14 (tiles-worker checks it and the Worker clamps it), so every
+          hour holds at least four runs. Skipped runs mean the probe is not configured
+          (geoshenanigans-tiles-bunny-probe-off), not this.
       execErrState: Error
       noDataState: OK
       data:

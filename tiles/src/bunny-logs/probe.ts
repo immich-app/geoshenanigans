@@ -14,6 +14,12 @@
  * counts as a miss, and by the `target` that was asked for (hit or miss). Both targets' samples are stamped at the run's
  * minute, so without `target` a cold hit tile and the random tile from one continent would be one series at one
  * timestamp, of which o11y's dedup keeps only the bigger value (samples.ts): one test's TTFB or error would be lost.
+ *
+ * The Worker's own read of the TileJSON is a test too, pushed every run as tiles_bunny_probe_errors with
+ * continent="worker", kind="tilejson" (TILEJSON_LABELS): 1 when it couldn't be read or gave no usable tile URL, 0 when
+ * it did. Every map needs that file, and with no tile URL nothing else is measured, so an outage that takes it down
+ * (the CDN, the storage zone, a pull-zone hostname, a deleted v1.json) reaches the critical probe-errors alert like
+ * failed tiles do, not only the probe-failing warning.
  */
 import { LogFields, O11yConfig, O11yLogger } from '../o11y';
 import { ProbeConfig } from './config';
@@ -26,6 +32,8 @@ export const PROBE_CONTINENTS = ['EU', 'NA', 'SA', 'AS', 'OC', 'AF'] as const;
 export const HIT_TILE = '2/2/1';
 // The TileJSON Immich loads (static-files.ts' STATIC_PREFIX), whose tile template says where the live tiles are.
 export const TILEJSON_PATH = '/v1.json';
+// The labels of the Worker's TileJSON read's verdict: a vantage point and a kind of their own, never a probe's.
+export const TILEJSON_LABELS = { continent: 'worker', kind: 'tilejson', target: 'tilejson' } as const;
 const MISS_ZOOM = 15;
 const USER_AGENT = 'immich-tiles-probe/1.0 (+https://github.com/immich-app/geoshenanigans)';
 // A test may take up to 30s on the probe and the API asks clients to allow 10s more; then the run gives up.
@@ -323,10 +331,11 @@ export function measurementSamples(
 /**
  * Probes the hit and miss tiles, at the URLs the TileJSON advertises, from one probe per continent (the miss
  * measurement reuses the hit one's probes, so the two compare like for like), waits for the results and pushes them
- * with the run's result at the scheduled minute. The run is an error when the TileJSON gives no tile URL, Globalping
- * refuses or doesn't finish a measurement, or a measurement has no verdict from some continent (no probe there, or its
- * test failed on Globalping's side): that continent's tiles went unmeasured. Never rejects. Without config it pushes
- * only result="skipped".
+ * with the TileJSON read's verdict (TILEJSON_LABELS) and the run's result at the scheduled minute. The run is an error
+ * when the TileJSON gives no tile URL (its verdict then a 1, for the critical alert), Globalping refuses or doesn't
+ * finish a measurement, or a measurement has no verdict from some continent (no probe there, or its test failed on
+ * Globalping's side): that continent's tiles went unmeasured. Never rejects. Without config it pushes only
+ * result="skipped".
  */
 export async function runProbe(
   config: ProbeConfig | undefined,
@@ -356,9 +365,14 @@ export async function runProbe(
       logger.warn('Probe TileJSON names tiles on another origin', { ...fields, tile_origin: hit.origin.slice(0, 200) });
     }
   } catch (error) {
-    // Not the old prefix instead: after a full rewrite that is the retired build, deleted a week later.
+    // Not the old prefix instead: after a full rewrite that is the retired build, deleted a week later. Clients can't
+    // load the map either, so the read counts as a failed test (see the module comment), not only as a blind run.
     logger.error('Probe tile URLs unknown', error, fields);
-    await pushSamples(o11y, [runs('error')], minute);
+    await pushSamples(
+      o11y,
+      [{ name: 'tiles_bunny_probe_errors', labels: TILEJSON_LABELS, value: 1 }, runs('error')],
+      minute,
+    );
     return 'error';
   }
   const continents = PROBE_CONTINENTS.map((continent) => ({ continent, limit: 1 }));
@@ -376,7 +390,7 @@ export async function runProbe(
       logger.error('Globalping measurement not created', error, { ...fields, target: target.kind });
     }
   }
-  const samples: Sample[] = [];
+  const samples: Sample[] = [{ name: 'tiles_bunny_probe_errors', labels: TILEJSON_LABELS, value: 0 }];
   if (ids.size > 0) {
     const measurements = await awaitMeasurements([...ids.values()], deps);
     for (const target of targets) {
