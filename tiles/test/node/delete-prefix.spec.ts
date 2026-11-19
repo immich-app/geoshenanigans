@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vitest';
 import { BunnyStateStore, SyncState, writeState } from '../../src/bunny/state';
-import { tilePath, zoomEnd } from '../../src/bunny/tile-id';
+import { tilePath, zoomEnd, zoomStart } from '../../src/bunny/tile-id';
 import { FakeStorage } from './fake-storage';
 import { startStateServer } from './state-server';
 
@@ -28,6 +28,10 @@ const live: SyncState = {
   pending: [],
 };
 
+/** A TileJSON as bunny:sync writes it, pointing tiles at `prefix`. */
+const tileJson = (prefix: string, base = 'https://tiles.example.com') =>
+  new TextEncoder().encode(JSON.stringify({ tilejson: '3.0.0', tiles: [`${base}/${prefix}/{z}/{x}/{y}.mvt`] }));
+
 async function setup(state: SyncState | null = live) {
   const tiles = await FakeStorage.start();
   const server = await startStateServer('state-zone', 'state-password');
@@ -45,7 +49,7 @@ async function setup(state: SyncState | null = live) {
     tiles.seed(tilePath('v1', id), new TextEncoder().encode(`old ${id}`));
     tiles.seed(tilePath('v1/e2', id), new TextEncoder().encode(`new ${id}`));
   }
-  tiles.seed('v1.json', new TextEncoder().encode('{}'));
+  tiles.seed('v1.json', tileJson(state?.prefix ?? 'v1/e2'));
   tiles.seed('v1/style/light.json', new TextEncoder().encode('{}'));
   const run = (...args: string[]) =>
     promisify(execFile)(process.execPath, ['--import=tsx', 'src/bunny/cli/delete-prefix.ts', ...args], {
@@ -69,20 +73,47 @@ const under = (tiles: FakeStorage, prefix: string) =>
 describe('bunny:delete-prefix', () => {
   it("deletes an old prefix's tile folders only, after a dry run that deletes nothing", async () => {
     const { tiles, run } = await setup();
+    // Not a tile folder: tile URLs never name zoom 9 `09`.
+    tiles.seed('v1/09/0/0.mvt', new TextEncoder().encode('other'));
     const dry = await run('--prefix', 'v1');
-    expect(dry.stderr).toMatch(/Would delete v1\/ zooms 0, 1, 2, 3, 4, 5, 6, 7, 8/);
-    expect(under(tiles, 'v1')).toHaveLength(zoomEnd(8));
+    expect(dry.stderr).toMatch(/Would delete v1\/ zooms 0, 1, 2, 3, 4, 5, 6, 7, 8\n/);
+    expect(under(tiles, 'v1')).toHaveLength(zoomEnd(8) + 1);
 
+    // Each zoom's folder goes only once every one of its column DELETEs has been answered.
+    tiles.options.latencyMs = () => Math.random() * 3;
+    const inFlightAtParent: number[] = [];
+    tiles.options.onRequest = (request) => {
+      if (request.method === 'DELETE' && request.path === 'v1/8/') {
+        inFlightAtParent.push(tiles.inFlight);
+      }
+    };
     const result = await run('--prefix', 'v1', '--yes', '--concurrency', '8');
-    expect(result.stderr).toMatch(/Deleted v1\/ zooms 0, .*, 8 \((\d+) folders\)/);
-    expect(under(tiles, 'v1')).toEqual([]);
+    expect(result.stderr).toMatch(/Deleted v1\/ zooms 0, 1, 2, 3, 4, 5, 6, 7, 8 \(265 folders\)/);
+    expect(under(tiles, 'v1')).toEqual(['v1/09/0/0.mvt']);
     expect(under(tiles, 'v1/e2')).toHaveLength(zoomEnd(8));
     expect(tiles.files.has('v1.json')).toBe(true);
     expect(tiles.files.has('v1/style/light.json')).toBe(true);
-    // Zoom 8 went column by column.
+    // Zoom 8 went column by column, then its folder; nothing was sent to v1/9/.
     expect(tiles.requests.DELETE).toBe(9 + 2 ** 8);
+    expect(inFlightAtParent).toEqual([1]);
 
     expect((await run('--prefix', 'v1', '--yes')).stderr).toMatch(/nothing to delete/);
+  });
+
+  it('deletes only the folders still there after a run stopped part-way', async () => {
+    const { tiles, run } = await setup();
+    // An earlier run deleted zooms 0-3 and the first half of zoom 8's columns.
+    for (const path of [...tiles.files.keys()]) {
+      const [, z, x] = path.split('/').map(Number);
+      if (path.startsWith('v1/') && (z <= 3 || (z === 8 && x < 128))) {
+        tiles.files.delete(path);
+      }
+    }
+    const result = await run('--prefix', 'v1', '--yes');
+    expect(result.stderr).toMatch(/Deleted v1\/ zooms 4, 5, 6, 7, 8 \(133 folders\)/);
+    expect(tiles.requests.DELETE).toBe(5 + 128);
+    expect(under(tiles, 'v1')).toEqual([]);
+    expect(under(tiles, 'v1/e2')).toHaveLength(zoomEnd(8));
   });
 
   it('refuses the live prefix, a prefix holding it, and a zone without a state', async () => {
@@ -99,5 +130,65 @@ describe('bunny:delete-prefix', () => {
     expect(refused).toMatchObject({ code: 1 });
     expect(refused.stderr).toMatch(/No state.json/);
     expect((await empty.run()).stderr).toMatch(/--prefix is required/);
+  });
+
+  it('refuses the prefix the TileJSON serves when a switch failed before state.json, and an unreadable TileJSON', async () => {
+    // A --replace to v1/e2 wrote v1.json and failed before making the build live: state.json still says v1.
+    const { tiles, run } = await setup({ ...live, prefix: 'v1' });
+    tiles.seed('v1.json', tileJson('v1/e2'));
+    for (const args of [['--yes'], []]) {
+      const refused = await run('--prefix', 'v1/e2', ...args);
+      expect(refused).toMatchObject({ code: 1 });
+      expect(refused.stderr).toMatch(/v1\.json points tiles at v1\/e2\/: they are under v1\/e2\/'s folders/);
+    }
+    // A public URL with a path of its own in front of the prefix.
+    tiles.seed('v1.json', tileJson('v1/e2', 'https://cdn.example.com/maps'));
+    expect((await run('--prefix', 'v1/e2', '--yes')).stderr).toMatch(/v1\.json points tiles at v1\/e2\//);
+    // Another static prefix's TileJSON.
+    tiles.seed('v2.json', tileJson('v1/e2'));
+    expect((await run('--prefix', 'v1/e2', '--yes', '--static-prefix', 'v2')).stderr).toMatch(/v2\.json points/);
+
+    const unreadable: [Uint8Array | null, RegExp][] = [
+      [null, /v1\.json is not in the tiles zone/],
+      [new TextEncoder().encode('<html>'), /v1\.json is not JSON/],
+      [new TextEncoder().encode('{"tiles":[]}'), /v1\.json lists no tile templates/],
+      [new TextEncoder().encode('null'), /v1\.json is not JSON/],
+    ];
+    for (const template of [
+      'https://tiles.example.com/{z}/{x}/{y}.mvt',
+      'https://tiles.example.com/v1/e2/{z}/{y}/{x}.mvt',
+      'https://tiles.example.com/v1/%65%32/{z}/{x}/{y}.mvt',
+      'https://tiles.example.com/v1/../e2/{z}/{x}/{y}.mvt',
+    ]) {
+      unreadable.push([new TextEncoder().encode(JSON.stringify({ tiles: [template] })), /tile template this cannot/]);
+    }
+    for (const [body, message] of unreadable) {
+      if (body) {
+        tiles.seed('v1.json', body);
+      } else {
+        tiles.files.delete('v1.json');
+      }
+      const refused = await run('--prefix', 'v1/e2', '--yes');
+      expect(refused).toMatchObject({ code: 1 });
+      expect(refused.stderr).toMatch(message);
+      expect(refused.stderr).toMatch(/nothing is deleted/);
+    }
+    expect(tiles.requests.DELETE ?? 0).toBe(0);
+    expect(under(tiles, 'v1/e2')).toHaveLength(zoomEnd(8));
+  });
+
+  it('stops before its next folder when the zone switches to the prefix while it deletes', async () => {
+    const { tiles, run } = await setup();
+    tiles.options.onRequest = (request) => {
+      if (request.method === 'DELETE') {
+        // Someone switches back to v1 while the first folder is deleted.
+        tiles.seed('v1.json', tileJson('v1'));
+      }
+    };
+    const refused = await run('--prefix', 'v1', '--yes', '--concurrency', '1');
+    expect(refused).toMatchObject({ code: 1 });
+    expect(refused.stderr).toMatch(/v1\.json points tiles at v1\//);
+    expect(tiles.requests.DELETE).toBe(1);
+    expect(under(tiles, 'v1')).toHaveLength(zoomEnd(8) - zoomStart(1));
   });
 });
