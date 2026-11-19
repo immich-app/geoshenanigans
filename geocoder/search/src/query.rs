@@ -273,11 +273,14 @@ struct Pool {
     size: usize,
     /// results the context cut-off keeps reachable (limit * CONTEXT_CUTOFF_FACTOR)
     top_k: usize,
+    /// Entities taken in unread, held or evicted since, until the pool reads them
+    /// (`read_later`).
+    unread: Vec<u32>,
 }
 
 impl Pool {
     fn new(size: usize, top_k: usize) -> Self {
-        Pool { best: HashMap::new(), scores: BTreeSet::new(), size, top_k }
+        Pool { best: HashMap::new(), scores: BTreeSet::new(), size, top_k, unread: Vec::new() }
     }
 
     fn threshold(&self) -> f32 {
@@ -288,15 +291,21 @@ impl Pool {
         }
     }
 
-    fn offer(&mut self, h: Hit) {
+    /// Takes `h` in if it scores above the threshold and above its entity's hit, if any. An
+    /// entity the pool does not hold enters only if `reads` says it is somewhere (one that is
+    /// nowhere is left out), or, with `LATER`, unread (`read_later`).
+    fn offer<const LATER: bool>(&mut self, h: Hit, reads: impl FnOnce(u32) -> bool) {
         if h.score <= self.threshold() {
             return;
         }
-        if let Some(old) = self.best.get(&h.entity) {
-            if old.score >= h.score {
-                return;
+        match self.best.get(&h.entity) {
+            Some(old) if old.score >= h.score => return,
+            Some(old) => {
+                self.scores.remove(&(Ord32(old.score), h.entity));
             }
-            self.scores.remove(&(Ord32(old.score), h.entity));
+            None if LATER => self.unread.push(h.entity),
+            None if !reads(h.entity) => return,
+            None => {}
         }
         self.scores.insert((Ord32(h.score), h.entity));
         if self.scores.len() > self.size {
@@ -305,6 +314,15 @@ impl Pool {
             }
         }
         self.best.insert(h.entity, h);
+    }
+
+    /// Reads the entities it took in unread, held or evicted since: false when one is nowhere
+    /// (`Searcher::search`); true, and the pool is one that read each as it took it in. Until
+    /// then such an entity decides nothing while the pool has room, as nothing is turned away
+    /// or evicted, and once it is full only which hits at or below its threshold the pool
+    /// holds: above it, the pool holds the hits of one that reads first, and those entities.
+    fn read_later(&mut self, reads: impl FnMut(u32) -> bool) -> bool {
+        self.unread.drain(..).all(reads)
     }
 
     /// No candidate scoring at most this can reach the results: the `top_k`-th best distinct
@@ -494,53 +512,60 @@ impl<'a, 'g> Searcher<'a, 'g> {
         text * text * (IMPORTANCE_FLOOR + imp) * CLASS_MULT[class.min(5) as usize] * ctx
     }
 
-    /// Scores one query split into `pool`. With `READ_FIRST`, an entity whose point does not
-    /// read is left out as it is offered; without, false when the split's context checks or a
-    /// cut-back of its pending candidates meet one (`search`).
+    /// Scores one query split into `pool`. An entity whose point does not read is left out
+    /// where the split reads it: as the pool takes it in, at its context check, and by a
+    /// cut-back of the pending candidates that weighs it; with `READ_FIRST` also as it is
+    /// queued, so that none is pending. Without, a split without context words has the pool
+    /// take its hits in unread, and a split with them first has the pool read those: false
+    /// when one is nowhere (`search`).
     fn score_split<const READ_FIRST: bool>(&self, st: &mut State<'g>, split: u8, name: &[Token], ctx_words: &[String], prefix: bool, pool: &mut Pool) -> bool {
         let phrase = join(name);
+        let ctx = Context { words: ctx_words, phrase: ctx_words.join(" ") };
+        let has_ctx = !ctx_words.is_empty();
+        let ents = &self.idx.ents;
         if phrase.is_empty() {
             return true;
         }
-        let ctx = Context { words: ctx_words, phrase: ctx_words.join(" ") };
-        let has_ctx = !ctx_words.is_empty();
+        // The split weighs its candidates against all the pool's scores.
+        if has_ctx && !pool.read_later(|e| ents.point(e).is_some()) {
+            return false;
+        }
         let chars = phrase.chars().count();
         let folded_last = name.last().is_some_and(|t| t.raw != t.folded);
         let mut cands: Vec<Cand> = Vec::new();
         // How many of the pending candidates, from the first, are known to read (`cut_back`).
         let mut read = 0;
-        let ents = &self.idx.ents;
         // Without context words a candidate goes straight to the pool; with them it waits for
         // the context check, made best-first and only while it can still reach the results.
-        // False for a cut-back that meets an entity that is nowhere.
         let mut emit = |pool: &mut Pool, entity: u32, ord: u8, class: u8, text: f32, imp: f32| {
             let potential = Self::score(text, imp, class, true);
             if potential <= pool.threshold() {
-                return true;
+                return;
             }
-            // Read first, an entity that is nowhere is no candidate (one the pool holds is
-            // somewhere).
-            if READ_FIRST && !pool.best.contains_key(&entity) && ents.point(entity).is_none() {
-                return true;
-            }
-            if has_ctx {
-                cands.push(Cand { entity, ord, class, text, potential });
-                if cands.len() > self.limits.pending && !Self::cut_back::<READ_FIRST>(ents, &mut cands, &mut read, self.limits.pending / 2) {
-                    return false;
+            if !has_ctx {
+                let hit = Hit { entity, ord, class, score: potential, text, context: false, split };
+                if READ_FIRST {
+                    pool.offer::<false>(hit, |e| ents.point(e).is_some());
+                } else {
+                    pool.offer::<true>(hit, |_| true);
                 }
-            } else {
-                pool.offer(Hit { entity, ord, class, score: potential, text, context: false, split });
+                return;
             }
-            true
+            // Read first, an entity is read as it is queued (one the pool holds is somewhere).
+            if READ_FIRST && !pool.best.contains_key(&entity) && ents.point(entity).is_none() {
+                return;
+            }
+            cands.push(Cand { entity, ord, class, text, potential });
+            if cands.len() > self.limits.pending {
+                Self::cut_back(ents, &mut cands, &mut read, self.limits.pending);
+            }
         };
         for (_, sub) in self.idx.subs() {
             if prefix && chars <= PREFIX_TABLE_MAX_CHARS && !folded_last {
                 match sub.prefix_hits(&phrase) {
                     Some(hits) => {
                         for h in hits {
-                            if !emit(pool, h.entity, h.ord, h.class, h.text, dequantize(h.imp_q)) {
-                                return false;
-                            }
+                            emit(pool, h.entity, h.ord, h.class, h.text, dequantize(h.imp_q));
                         }
                         continue;
                     }
@@ -583,9 +608,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
                         }
                         continue;
                     }
-                    if !emit(pool, p.entity, p.ord, p.class, text, imp) {
-                        return false;
-                    }
+                    emit(pool, p.entity, p.ord, p.class, text, imp);
                 }
             }
         }
@@ -601,14 +624,10 @@ impl<'a, 'g> Searcher<'a, 'g> {
             }
             let ok = match checked.get(&c.entity) {
                 Some(&ok) => ok,
+                // A miss, read as the pool would take it in.
                 None if st.stats.context_checks >= self.limits.context_checks => false,
                 None => {
-                    let Some(at) = ents.point(c.entity) else {
-                        if READ_FIRST {
-                            continue;
-                        }
-                        return false;
-                    };
+                    let Some(at) = ents.point(c.entity) else { continue };
                     st.stats.context_checks += 1;
                     let ok = ctx.satisfied(self.context_mask(&ctx, &mut names, at));
                     checked.insert(c.entity, ok);
@@ -616,44 +635,55 @@ impl<'a, 'g> Searcher<'a, 'g> {
                 }
             };
             let score = if ok { c.potential } else { c.potential * CONTEXT_MISS_MULT };
-            pool.offer(Hit { entity: c.entity, ord: c.ord, class: c.class, score, text: c.text, context: ok, split });
+            let hit = Hit { entity: c.entity, ord: c.ord, class: c.class, score, text: c.text, context: ok, split };
+            pool.offer::<false>(hit, |e| checked.contains_key(&e) || ents.point(e).is_some());
         }
         true
     }
 
-    /// Cuts the pending candidates back to the `keep` that could score best (half as many as
-    /// may wait); the first `read` of them are known to read. Without `READ_FIRST` it first
-    /// reads the others: false, before any cut-back, when one is nowhere (`search`). Kept, such
-    /// a one could push out a candidate that, checked, would score above it (a cut-back ranks
-    /// by the score a candidate could reach, not the one it gets); dropped, it brings the
-    /// cut-back on before a search without it cuts back, which keeps what this one drops. Out
-    /// of line, so that the closure that queues the candidates stays inlined in the loop over
-    /// the postings.
+    /// Cuts the pending candidates, more than `max` of them, back to the half of `max` that
+    /// could score best; the first `read` of them are known to read. It first reads the
+    /// others and leaves out those that are nowhere, then cuts back only if more than `max` are
+    /// left: kept, such a one could push out a candidate that, checked, would score above it
+    /// (a cut-back ranks by the score a candidate could reach, not the one it gets); counted,
+    /// it brings the cut-back on before a search without it cuts back, which keeps what this
+    /// one drops. Out of line, so that the closure that queues the candidates stays inlined in
+    /// the loop over the postings.
     #[cold]
     #[inline(never)]
-    fn cut_back<const READ_FIRST: bool>(ents: &Entities, cands: &mut Vec<Cand>, read: &mut usize, keep: usize) -> bool {
-        if !READ_FIRST && cands[*read..].iter().any(|c| ents.point(c.entity).is_none()) {
-            return false;
+    fn cut_back(ents: &Entities, cands: &mut Vec<Cand>, read: &mut usize, max: usize) {
+        let mut at = 0;
+        cands.retain(|c| {
+            at += 1;
+            at <= *read || ents.point(c.entity).is_some()
+        });
+        if cands.len() > max {
+            cands.sort_by(|a, b| b.potential.total_cmp(&a.potential).then(a.entity.cmp(&b.entity)));
+            cands.truncate(max / 2);
         }
-        cands.sort_by(|a, b| b.potential.total_cmp(&a.potential).then(a.entity.cmp(&b.entity)));
-        cands.truncate(keep);
         *read = cands.len();
-        true
     }
 
     pub fn search(&self, q: &str, limit: usize) -> (Vec<Found<'g>>, QueryStats) {
         if limit == 0 { return (Vec::new(), QueryStats::default()); }
         let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
-        // An entity can be nowhere: its record or its slot does not read (a damaged file).
-        // Reading each candidate's point as it is offered would read a record for every one, so
-        // a search reads a hit's point where it uses the hit (a context check, the area order, a
-        // result, a cut-back of a split's pending candidates, which weighs every one of them),
-        // and until then a hit of an entity that is nowhere ranks as it scores. What such a hit
-        // keeps out of the pool or from a context check scores no higher than it, so a search
-        // that uses only hits ranked above every one of them has the hits it would have had
-        // without them, but for one that ties with it. One that meets one runs again reading
-        // each entity as it is offered, so that none takes a place a hit that reads could have
-        // had; that run has its own budget of context checks.
+        // An entity can be nowhere: its record or its slot does not read (a damaged file). A
+        // search answers as the search of the index without such entities, one that reads each
+        // candidate's point as it is queued or offered and leaves it out if it is nowhere
+        // (`READ_FIRST`), but reads fewer. What a search decides comes from the pool (its
+        // threshold and cut-off, by ties too, and its hits), from the context checks made (a
+        // budget its splits share) and from a split's pending candidates.
+        //
+        // A pending candidate is read before its context check, before a cut-back that weighs
+        // it, and before the pool takes it in as a miss, and each of those reads leaves out one
+        // that is nowhere, where a search that reads first has already left it out; one that
+        // gets to none of them decides nothing. A split without context words, most of whose
+        // hits never reach the results, has the pool take them in unread (`Pool::read_later`):
+        // it reads them before a split with context words weighs candidates against its scores
+        // and, once it is full, before the area order or the results take a hit at or below
+        // its threshold; the area order and the results read the hits they take. A search
+        // that meets one of those entities nowhere runs again, reading first, with its own
+        // budget of context checks.
         let found = match self.search_once::<false>(&mut st, q, limit) {
             Some(found) => found,
             None => {
@@ -666,8 +696,8 @@ impl<'a, 'g> Searcher<'a, 'g> {
         (found, st.stats)
     }
 
-    /// `search`'s results; None, without `READ_FIRST`, for a search that met an entity that is
-    /// nowhere (`score_split`).
+    /// `search`'s results; with `READ_FIRST`, those of the search it answers as. None, without,
+    /// for a search that met an entity it took in unread nowhere (`score_split`).
     fn search_once<const READ_FIRST: bool>(&self, st: &mut State<'g>, q: &str, limit: usize) -> Option<Vec<Found<'g>>> {
         let mut pool = Pool::new(self.limits.pool, limit * CONTEXT_CUTOFF_FACTOR);
         let mut phrases: Vec<String> = Vec::new();
@@ -692,19 +722,29 @@ impl<'a, 'g> Searcher<'a, 'g> {
                 }
             }
         }
+        // The pool holds unread entities only after a lone split without context words, and then
+        // only those: the hits taken are read, and a full pool, which has turned hits away for
+        // them, reads them all before a hit at or below its threshold is taken. Else every hit
+        // is somewhere.
+        let ents = &self.idx.ents;
+        let unread = std::mem::take(&mut pool.unread);
+        let lazy = !unread.is_empty();
+        let threshold = pool.threshold();
+        let mut later = Some(unread).filter(|u| !u.is_empty() && pool.scores.len() >= pool.size);
+        let mut ready = |h: &Hit| h.score > threshold || later.take().is_none_or(|u| u.into_iter().all(|e| ents.point(e).is_some()));
         let mut hits: Vec<Hit> = pool.best.into_values().collect();
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.entity.cmp(&b.entity)));
-        if !self.place_before_its_area(&mut hits) && !READ_FIRST {
+        if !self.place_before_its_area(&mut hits, lazy.then_some(&mut ready)) {
             return None;
         }
         let mut out: Vec<Found<'g>> = Vec::new();
         let mut kept: Vec<(String, (f32, f32))> = Vec::new();
         for h in hits {
-            let Some(at) = self.idx.ents.point(h.entity) else {
-                if READ_FIRST {
-                    continue;
+            let Some(at) = ents.point(h.entity).filter(|_| ready(&h)) else {
+                if lazy {
+                    return None;
                 }
-                return None;
+                continue;
             };
             let name = self.display_name(&h, &phrases[h.split as usize]);
             let label = normalize(&name);
@@ -723,9 +763,10 @@ impl<'a, 'g> Searcher<'a, 'g> {
     }
 
     /// "Dubai" the city before "Dubai" the emirate: an area (other than a country) drops just
-    /// below a settlement of the same name that lies inside it. False as soon as a hit it looks
-    /// at is of an entity that is nowhere (`search`).
-    fn place_before_its_area(&self, hits: &mut [Hit]) -> bool {
+    /// below a settlement of the same name that lies inside it. With `ready`, of hits the pool
+    /// took in unread: false as soon as a hit it looks at is of an entity that is nowhere, or
+    /// `ready` is false for it (`search_once`).
+    fn place_before_its_area(&self, hits: &mut [Hit], mut ready: Option<&mut impl FnMut(&Hit) -> bool>) -> bool {
         let ents = &self.idx.ents;
         let label = |h: &Hit| normalize(&ents.base_name(h.entity));
         let mut changed = false;
@@ -733,14 +774,22 @@ impl<'a, 'g> Searcher<'a, 'g> {
         let top = hits.len().min(area_top);
         for i in 0..top {
             let e = hits[i].entity;
+            if ready.as_mut().is_some_and(|r| !r(&hits[i])) {
+                return false;
+            }
             // Only a boundary moves: of the others, whether they are somewhere.
             if Entities::is_poi(e) || e < ents.n_place_nodes {
-                if ents.point(e).is_none() {
+                if ready.is_some() && ents.point(e).is_none() {
                     return false;
                 }
                 continue;
             }
-            let Some((k, t)) = ents.kind_and_type_of(e) else { return false };
+            let Some((k, t)) = ents.kind_and_type_of(e) else {
+                if ready.is_some() {
+                    return false;
+                }
+                continue;
+            };
             if !Entities::is_area(k, &t) {
                 continue;
             }
@@ -751,14 +800,22 @@ impl<'a, 'g> Searcher<'a, 'g> {
             let area_label = label(&hits[i]);
             let mut found = None;
             for (j, h) in hits.iter().enumerate().take(i + 1 + area_top).skip(i + 1) {
+                if ready.as_mut().is_some_and(|r| !r(h)) {
+                    return false;
+                }
                 // A POI is no settlement.
                 if Entities::is_poi(h.entity) {
-                    if ents.point(h.entity).is_none() {
+                    if ready.is_some() && ents.point(h.entity).is_none() {
                         return false;
                     }
                     continue;
                 }
-                let Some((k, t)) = ents.kind_and_type_of(h.entity) else { return false };
+                let Some((k, t)) = ents.kind_and_type_of(h.entity) else {
+                    if ready.is_some() {
+                        return false;
+                    }
+                    continue;
+                };
                 if Entities::is_settlement(k, &t) && label(h) == area_label && self.contained_in(h.entity, &area) {
                     found = Some(j);
                     break;
@@ -834,7 +891,7 @@ mod tests {
     fn zero_limit_has_no_reachable_candidate() {
         let mut pool = Pool::new(CANDIDATE_POOL, 0);
         assert_eq!(pool.cutoff(), f32::INFINITY);
-        pool.offer(hit(1, 1.0));
+        pool.offer::<false>(hit(1, 1.0), |_| true);
         assert_eq!(pool.cutoff(), f32::INFINITY);
     }
 
@@ -843,23 +900,23 @@ mod tests {
         // One entity improving 0.8 -> 0.9 is one candidate: with top_k 2 a context candidate at
         // 0.7 can still reach the results until a second entity is in.
         let mut pool = Pool::new(CANDIDATE_POOL, 2);
-        pool.offer(hit(1, 0.8));
-        pool.offer(hit(1, 0.9));
+        pool.offer::<false>(hit(1, 0.8), |_| true);
+        pool.offer::<false>(hit(1, 0.9), |_| true);
         assert_eq!(pool.cutoff(), 0.0);
-        pool.offer(hit(2, 0.7));
+        pool.offer::<false>(hit(2, 0.7), |_| true);
         assert_eq!(pool.cutoff(), 0.7);
         assert_eq!(pool.best.len(), 2);
         // CANDIDATE_POOL improvements of one entity leave the pool open to everyone else.
         let mut pool = Pool::new(CANDIDATE_POOL, 2);
         for k in 0..CANDIDATE_POOL {
-            pool.offer(hit(1, 0.1 + k as f32 / 1000.0));
+            pool.offer::<false>(hit(1, 0.1 + k as f32 / 1000.0), |_| true);
         }
         assert_eq!(pool.threshold(), 0.0);
         for e in 2..CANDIDATE_POOL as u32 + 1 {
-            pool.offer(hit(e, 0.05));
+            pool.offer::<false>(hit(e, 0.05), |_| true);
         }
         assert_eq!(pool.threshold(), 0.05);
-        pool.offer(hit(1000, 0.04));
+        pool.offer::<false>(hit(1000, 0.04), |_| true);
         assert!(!pool.best.contains_key(&1000));
     }
 
@@ -868,7 +925,7 @@ mod tests {
         let mut pool = Pool::new(CANDIDATE_POOL, 2);
         let n = CANDIDATE_POOL as u32 + 50;
         for e in 0..n {
-            pool.offer(hit(e, 0.1 + e as f32 / 1000.0));
+            pool.offer::<false>(hit(e, 0.1 + e as f32 / 1000.0), |_| true);
         }
         assert_eq!(pool.scores.len(), CANDIDATE_POOL);
         let mut kept: Vec<u32> = pool.best.keys().copied().collect();
@@ -947,9 +1004,9 @@ mod tests {
         let mut g = Geo::default();
         // A neighbourhood "A" in a boundary "B"; one "Old Mill" of the least importance, then more
         // than the pool holds of the most; three "A Bay" of the most (the prefix table's hits of
-        // "a b"); and more "Market Hall" of the most than the area order looks at, above one of
-        // the least. Once the index is built, the rows of those "Old Mill" and "A Bay" and of
-        // that last "Market Hall" are made not to read.
+        // "a b"); and as many "Market Hall" of the most as the pool holds, above one of the
+        // least. Once the index is built, the rows of those "Old Mill" and "A Bay" and of that
+        // last "Market Hall" are made not to read.
         g.boundary("B", 8, [10.0, 20.0, 10.2, 20.2]);
         let a = g.place("A", 5, 10.1, 20.1);
         let valid = g.poi("Old Mill", -30.0, -60.0, 0) | POI_BIT;
@@ -960,7 +1017,9 @@ mod tests {
         for k in 0..3 {
             unreadable.push(g.poi("A Bay", 40.0 + k as f32, 40.0, 255));
         }
-        let halls: Vec<u32> = (0..=AREA_CHECK_TOP as u32).map(|k| g.poi("Market Hall", 50.0 + k as f32 * 0.5, 100.0, 255) | POI_BIT).collect();
+        let halls: Vec<u32> = (0..CANDIDATE_POOL as u32)
+            .map(|k| g.poi("Market Hall", 50.0 + (k / 20) as f32 * 2.0, 100.0 + (k % 20) as f32 * 2.0, 255) | POI_BIT)
+            .collect();
         let last_hall = g.poi("Market Hall", -50.0, 100.0, 0);
         let dir = TempDir::new("unreadable-hits");
         let set = dir.0.join("geo");
@@ -989,7 +1048,7 @@ mod tests {
 
         let entities: Vec<&Vec<u32>> = got.iter().map(|(e, _)| e).collect();
         assert_eq!(entities, [&vec![valid], &vec![valid], &vec![a], &halls[..5].to_vec()]);
-        // The last "Market Hall" ranks below every hit that search uses: it reads the index once.
+        // The pool turns the last "Market Hall" away unread: that search reads the index once.
         assert_eq!(got[3], readable[3]);
     }
 
@@ -1118,6 +1177,118 @@ mod tests {
         assert_eq!(built, [lead, three_named[0] | POI_BIT]);
         assert_eq!(damaged, [inside, lead]);
         assert_eq!(damaged, read_first);
+    }
+
+    /// A result as the tests compare it: the hit, the name and the point.
+    type Answer = Vec<(u32, u8, u32, bool, u8, String, u32, u32)>;
+
+    fn answer(found: &[Found]) -> Answer {
+        found.iter().map(|f| (f.hit.entity, f.hit.ord, f.hit.score.to_bits(), f.hit.context, f.hit.split, f.name.clone(), f.lat.to_bits(), f.lng.to_bits())).collect()
+    }
+
+    /// The results of `q` as a search answers it and as one that reads every entity first does.
+    fn both_answers(s: &Searcher, q: &str, limit: usize) -> [Answer; 2] {
+        let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
+        let read_first = s.search_once::<true>(&mut st, q, limit).unwrap();
+        [answer(&s.search(q, limit).0), answer(&read_first)]
+    }
+
+    #[test]
+    fn a_record_that_does_not_read_turns_away_no_hit_that_ties_with_it() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        let mut g = Geo::default();
+        // A "Mill" of the most importance; as many of less as the pool holds, all of one
+        // importance, the first of them made not to read; then a "Mills" that scores between
+        // them, which the prefix "mill" reads after the "Mill". All far apart.
+        let at = |k: u32| (-60.0 + (k / 20) as f32 * 6.0, -170.0 + (k % 20) as f32 * 17.0);
+        let top = g.poi("Mill", at(0).0, at(0).1, 255) | POI_BIT;
+        let tied: Vec<u32> = (1..=CANDIDATE_POOL as u32).map(|k| g.poi("Mill", at(k).0, at(k).1, 3) | POI_BIT).collect();
+        let mills = g.poi("Mills", 70.0, 0.0, 255) | POI_BIT;
+        let dir = TempDir::new("tied-hits");
+        let set = dir.0.join("geo");
+        let geo = g.load(&set);
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let damaged = with_unreadable_pois(&set, &[tied[0] & !POI_BIT]);
+        let idx = SearchIndex::open(&damaged, &out, None, None).unwrap();
+
+        let [got, read_first] = both_answers(&Searcher::new(&idx), "mill", DEFAULT_LIMIT);
+
+        // Without the first, the pool has room for the last of them, and the "Mills" evicts the
+        // second: the results go on from the third.
+        let want: Vec<u32> = [top, mills].into_iter().chain(tied[2..DEFAULT_LIMIT].iter().copied()).collect();
+        assert_eq!(got.iter().map(|r| r.0).collect::<Vec<_>>(), want);
+        assert_eq!(got, read_first);
+    }
+
+    #[test]
+    fn a_record_that_does_not_read_saves_no_context_check_for_a_later_split() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        let mut g = Geo::default();
+        // As many "A B C" of some importance as the cut-off of a search of the default limit
+        // keeps reachable, the first made not to read; more "A B" than the context checks, of
+        // less, outside the boundary "C"; and as many "A" as "A B C", of the most, inside the
+        // boundaries "B" and "C". All far apart.
+        g.boundary("B", 8, [10.0, 20.0, 14.0, 24.0]);
+        g.boundary("C", 8, [10.0, 20.0, 14.0, 24.0]);
+        let reach = DEFAULT_LIMIT * CONTEXT_CUTOFF_FACTOR;
+        let whole: Vec<u32> = (0..reach as u32).map(|k| g.poi("A B C", -60.0 + k as f32, -60.0, 127) | POI_BIT).collect();
+        for k in 0..MAX_CONTEXT_CHECKS as u32 + 10 {
+            g.poi("A B", -1.0 - (k / 100) as f32, -170.0 + (k % 100) as f32 * 3.4, 15);
+        }
+        for k in 0..reach as u32 {
+            g.poi("A", 10.2 + (k / 7) as f32 * 0.5, 20.2 + (k % 7) as f32 * 0.5, 255);
+        }
+        let dir = TempDir::new("cross-split");
+        let set = dir.0.join("geo");
+        let geo = g.load(&set);
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let damaged = with_unreadable_pois(&set, &[whole[0] & !POI_BIT]);
+        let idx = SearchIndex::open(&damaged, &out, None, None).unwrap();
+
+        let [got, read_first] = both_answers(&Searcher::new(&idx), "a b c", DEFAULT_LIMIT);
+
+        // Without the first "A B C" the "A B" are above the cut-off and take every context
+        // check, the "A" miss the context, and the other "A B C" are the results. With it in the
+        // pool, the "A B" would be below the cut-off, and the "A" would take the checks and rank
+        // above every "A B C".
+        assert_eq!(got.iter().map(|r| r.0).collect::<Vec<_>>(), whole[1..=DEFAULT_LIMIT]);
+        assert_eq!(got, read_first);
+    }
+
+    #[test]
+    fn a_record_that_does_not_read_keeps_no_settlement_out_of_the_area_order() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        let mut g = Geo::default();
+        // A level-6 area "Foxton"; below it as many POIs "Foxton" as the area order looks past
+        // it, of one importance, the first made not to read; below them a village "Foxton"
+        // inside the area.
+        g.place("Foxton", 2, 10.5, 20.5);
+        // The area is entity 1 (one place node) + its polygon.
+        let area = 1 + g.boundary("Foxton", 6, [10.0, 20.0, 11.0, 21.0]);
+        let pois: Vec<u32> = (0..AREA_CHECK_TOP as u32)
+            .map(|k| g.poi("Foxton", -60.0 + (k / 10) as f32 * 5.0, -170.0 + (k % 10) as f32 * 30.0, 3) | POI_BIT)
+            .collect();
+        let dir = TempDir::new("area-order-reads");
+        let set = dir.0.join("geo");
+        let geo = g.load(&set);
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let found = |geo: &Index| {
+            let idx = SearchIndex::open(geo, &out, None, None).unwrap();
+            both_answers(&Searcher::new(&idx), "foxton", 1)
+        };
+        let [built, _] = found(&geo);
+        let damaged = with_unreadable_pois(&set, &[pois[0] & !POI_BIT]);
+
+        let [got, read_first] = found(&damaged);
+
+        // Without the first POI the village is the last hit the area order looks at, and the
+        // area drops below it.
+        assert_eq!(built.iter().map(|r| r.0).collect::<Vec<_>>(), [area]);
+        assert_eq!(got.iter().map(|r| r.0).collect::<Vec<_>>(), [pois[1]]);
+        assert_eq!(got, read_first);
     }
 
     #[test]
