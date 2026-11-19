@@ -193,3 +193,48 @@ run "pull_zone_id_not_a_number" {
 
   expect_failures = [var.bunny_pull_zone_id]
 }
+
+# The worker takes an absolute http(s) URL (tiles/src/bunny-logs/config.ts) and skips the probe on anything else, after
+# the Globalping token has gone on: such a value stops the plan instead.
+run "public_url_bare_hostname" {
+  command = plan
+
+  variables {
+    bunny_public_url = "tiles.example.com"
+  }
+
+  expect_failures = [var.bunny_public_url]
+}
+
+run "public_url_not_http" {
+  command = plan
+
+  variables {
+    bunny_public_url = "ftp://tiles.example.com"
+  }
+
+  expect_failures = [var.bunny_public_url]
+}
+
+run "public_url_with_a_query" {
+  command = plan
+
+  variables {
+    bunny_public_url = "https://tiles.example.com/?v=1"
+  }
+
+  expect_failures = [var.bunny_public_url]
+}
+
+run "public_url_under_a_path" {
+  command = plan
+
+  variables {
+    bunny_public_url = "https://cdn.example.com/tiles"
+  }
+
+  assert {
+    condition     = contains([for binding in cloudflare_workers_script.tiles.plain_text_binding : "${binding.name}=${binding.text}"], "BUNNY_PUBLIC_URL=https://cdn.example.com/tiles")
+    error_message = "A URL with a path is the probe's public URL."
+  }
+}
