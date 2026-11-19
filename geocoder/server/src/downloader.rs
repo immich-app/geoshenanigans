@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
-use query_server::lower_hex;
+use query_server::{lower_hex, FETCHED_RECORD_PREFIX};
 use query_server::transport::{self, ChunkReader, Expected, TRANSPORT_VERSION};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -518,12 +518,18 @@ async fn add_fetched(record: &Path, path: &str) -> Result<(), DownloadError> {
     f.flush().await.map_err(err)
 }
 
-/// Removes the records of fetches in `region_dir` but `record`: those of
-/// other builds, whose downloads a download of this one starts over on.
-async fn remove_other_records(region_dir: &Path, record: &Path) {
+/// Makes `record`, empty, unless it is there.
+async fn open_record(record: &Path) -> Result<(), DownloadError> {
+    tokio::fs::OpenOptions::new().create(true).append(true).open(record).await
+        .map(drop)
+        .map_err(|e| DownloadError::Io(format!("write {}: {}", record.display(), e)))
+}
+
+/// Removes the records of fetches in `region_dir` but `keep`.
+async fn remove_records(region_dir: &Path, keep: Option<&Path>) {
     let Ok(mut entries) = tokio::fs::read_dir(region_dir).await else { return };
     while let Ok(Some(e)) = entries.next_entry().await {
-        if e.file_name().to_str().is_some_and(|n| n.starts_with(".fetched.")) && e.path() != record {
+        if e.file_name().to_str().is_some_and(|n| n.starts_with(FETCHED_RECORD_PREFIX)) && keep != Some(e.path().as_path()) {
             let _ = tokio::fs::remove_file(e.path()).await;
         }
     }
@@ -537,8 +543,10 @@ async fn remove_other_records(region_dir: &Path, record: &Path) {
 /// path; the complete sha256 check happens on first download). In one that
 /// doesn't, every file is fetched but those an earlier download of the
 /// build that broke off put in place, and only once all are in does the
-/// dir name the build. A unit's files land together, so a download needs
-/// the largest unit's files' size free beside the region.
+/// dir name the build; until then it holds a record of the download,
+/// which keeps the server's startup from loading it. A unit's files land
+/// together, so a download needs the largest unit's files' size free
+/// beside the region.
 ///
 /// `progress` fires after each file or unit completes with the running
 /// total; the caller logs it.
@@ -585,21 +593,26 @@ pub async fn download_region(
     // a dir whose download of one broke off names no build. Meanwhile each
     // fetch in place is recorded, by its path, in a file of the build's own,
     // and a retry of the build fetches only the others; a record of another
-    // build is removed, its download started over.
+    // build is removed, its download started over. The record is there,
+    // empty at first, before the stamp goes, so before the first file of
+    // the build goes in, and goes only once the dir names a build: a dir
+    // holding one may mix two builds' files, and MultiIndex::load leaves
+    // it for a download to finish.
     let stamp = region_dir.join(".build_date");
     let existing = tokio::fs::read_to_string(&stamp).await.unwrap_or_default();
     let fresh_build = existing.trim() != cfg.build.date;
-    let record = region_dir.join(format!(".fetched.{}", cfg.build.date));
+    let record = region_dir.join(format!("{}{}", FETCHED_RECORD_PREFIX, cfg.build.date));
     let mut fetched = HashSet::new();
     if fresh_build {
+        remove_records(&region_dir, Some(&record)).await;
+        fetched = read_fetched(&record).await;
+        open_record(&record).await?;
         match tokio::fs::remove_file(&stamp).await {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 return Err(DownloadError::Io(format!("remove {}: {}", stamp.display(), e)));
             }
             _ => {}
         }
-        remove_other_records(&region_dir, &record).await;
-        fetched = read_fetched(&record).await;
     }
     for fetch in &fetches {
         // Whether the fetch's files are this build's, on disk at their size.
@@ -637,8 +650,11 @@ pub async fn download_region(
     if fresh_build {
         tokio::fs::write(&stamp, &cfg.build.date).await
             .map_err(|e| DownloadError::Io(format!("write {}: {}", stamp.display(), e)))?;
-        let _ = tokio::fs::remove_file(&record).await;
     }
+    // The dir names the build, so a record in it is of no download under
+    // way: a download killed once it wrote its stamp, or before it removed
+    // an older one, leaves its record.
+    remove_records(&region_dir, None).await;
     Ok(())
 }
 
@@ -1174,11 +1190,12 @@ mod tests {
         }
     }
 
-    /// The bucket's build, the unit `unit` of one bad byte: its download
-    /// fails, those of the objects before it in path order come down.
-    async fn failing_at(unit: &'static str) -> TestBucket {
+    /// The bucket's build, the object at `object` (a unit, or a file's
+    /// .zst) of one bad byte: its download fails, those of the objects
+    /// before it in path order come down.
+    async fn failing_at(object: &'static str) -> TestBucket {
         test_bucket::serve_tampered(test_bucket::template_components(), move |path, bytes| {
-            if path == unit {
+            if path == object {
                 let at = bytes.len() - 1;
                 bytes[at] ^= 0x10;
             }
@@ -1207,6 +1224,47 @@ mod tests {
         assert!(failed.as_ref().is_err_and(|e| e.starts_with(&format!("transport unit {FAILING_UNIT}: "))), "{failed:?}");
         assert_eq!(differing(&held(&root.path().join("europe")), &files_of(&bucket, &s)), Vec::<String>::new());
         assert_eq!(stamped, None);
+    }
+
+    // The record is there before the first fetch of a fresh build can go
+    // in place, and the dir names no build until all are: a download of
+    // one that fails on its first fetch leaves the record, empty, and no
+    // stamp.
+    #[tokio::test]
+    async fn a_fresh_builds_download_that_failed_on_its_first_fetch_leaves_its_record() {
+        let s = sel("europe", "admin", "simplified", "major");
+        let failing = failing_at("europe/admin/admin_cells.bin.zst").await;
+        let root = ScratchDir::new();
+        older_build(&failing, &s, root.path());
+
+        let failed = download(&failing, &s, root.path()).await.map_err(|e| e.to_string());
+
+        assert!(failed.as_ref().is_err_and(|e| e.starts_with("sha256 mismatch on europe/admin/admin_cells.bin: ")), "{failed:?}");
+        assert_eq!(failing.files_served(), 1);
+        let left = held(&root.path().join("europe"));
+        assert_eq!(left.get(&format!(".fetched.{}", test_bucket::DATE)), Some(&Vec::new()));
+        assert_eq!(left.get(".build_date"), None);
+    }
+
+    // A record beside the stamp of a build (a download killed once it
+    // wrote the stamp, before it removed the record, or before it removed
+    // the stamp of the build it replaced) goes with the next download into
+    // the dir, which fetches nothing the dir has.
+    #[tokio::test]
+    async fn a_download_into_a_dir_that_names_its_build_removes_the_records_there() {
+        let s = sel("europe", "admin", "simplified", "major");
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let root = ScratchDir::new();
+        download(&bucket, &s, root.path()).await.unwrap();
+        let served = bucket.files_served();
+        for date in [test_bucket::DATE, "2026-02-01"] {
+            std::fs::write(root.path().join(format!("europe/.fetched.{date}")), "").unwrap();
+        }
+
+        download(&bucket, &s, root.path()).await.unwrap();
+
+        assert_eq!(bucket.files_served(), served);
+        assert_eq!(differing(&held(&root.path().join("europe")), &files_of(&bucket, &s)), Vec::<String>::new());
     }
 
     // The retry fetches again only what had not come down: the object that

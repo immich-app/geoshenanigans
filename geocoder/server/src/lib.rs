@@ -3426,6 +3426,21 @@ impl Index {
 // "world" slot that covers every query. New deployments use per-
 // continent subdirs.
 
+/// The start of the name of the record a continent dir keeps while the
+/// server's downloader fetches a fresh build into it: `.fetched.<date>`,
+/// the fetches that came down. It is there from before the first file of
+/// the build goes in until the dir is stamped with the build, so a dir
+/// holding one may mix two builds' files.
+pub const FETCHED_RECORD_PREFIX: &str = ".fetched.";
+
+/// The name of a record of a download that did not finish in `dir`, if
+/// it holds one.
+fn unfinished_download(dir: &str) -> Option<String> {
+    std::fs::read_dir(dir).ok()?
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .find(|name| name.starts_with(FETCHED_RECORD_PREFIX))
+}
+
 pub struct ContinentSlot {
     pub name: &'static str,
     /// Boundary that routes queries here; `None` for the flat "world" slot.
@@ -3474,7 +3489,16 @@ impl MultiIndex {
         let mut slots = Vec::with_capacity(continents().len());
         for continent in continents() {
             let dir = format!("{}/{}", root, continent.name);
-            let arc_opt = if std::path::Path::new(&format!("{}/admin_cells.bin", dir)).exists() {
+            let arc_opt = if !std::path::Path::new(&format!("{}/admin_cells.bin", dir)).exists() {
+                None
+            } else if let Some(record) = unfinished_download(&dir) {
+                // A download of a fresh build that broke off can leave
+                // files of the build beside those of the one before, which
+                // Index::load can't tell apart. The slot stays empty so the
+                // downloader finishes the download first.
+                eprintln!("skipping continent {}: {} records a download that did not finish", continent.name, record);
+                None
+            } else {
                 // An interrupted or failed download leaves a dir that has
                 // admin_cells.bin but can't load. It must not take down the
                 // continents that did load; the slot stays empty so the
@@ -3486,8 +3510,6 @@ impl MultiIndex {
                         None
                     }
                 }
-            } else {
-                None
             };
             slots.push(ContinentSlot {
                 name: continent.name,
@@ -6761,6 +6783,43 @@ mod query_path_tests {
             add(&mut dataset, swapped);
             dataset.load()
         })
+    }
+
+    /// A root with oldtown() in the dirs of asia and europe, as the test
+    /// portal lays them out: no stamp of a build, no record of a download.
+    fn two_continents() -> ScratchDir {
+        let root = ScratchDir::new();
+        for name in ["asia", "europe"] {
+            let dir = root.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            oldtown().write(&dir);
+        }
+        root
+    }
+
+    /// The names of the continents MultiIndex::load loads under `root`.
+    fn loaded_continents(root: &std::path::Path) -> Vec<&'static str> {
+        let mi = MultiIndex::load(root.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+        mi.continents.iter().filter(|c| c.index.load().is_some()).map(|c| c.name).collect()
+    }
+
+    // A dir holding a record of a download's fetches is one whose download
+    // of a fresh build did not finish, and it may mix two builds' files
+    // that load as one. Its slot stays empty, for the downloader to finish
+    // it; the other continents load.
+    #[test]
+    fn a_continent_dir_holding_a_record_of_a_download_is_skipped() {
+        let root = two_continents();
+        std::fs::write(root.path().join("europe/.fetched.2026-01-01"), "").unwrap();
+
+        assert_eq!(loaded_continents(root.path()), ["asia"]);
+    }
+
+    #[test]
+    fn a_continent_dir_without_a_record_of_a_download_loads() {
+        let root = two_continents();
+
+        assert_eq!(loaded_continents(root.path()), ["asia", "europe"]);
     }
 
     #[test]
