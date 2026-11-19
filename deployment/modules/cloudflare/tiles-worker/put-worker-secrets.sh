@@ -3,20 +3,30 @@
 # (workers.tf), so that the Bunny account key and the Globalping token never sit in OpenTofu's state.
 #
 #   ACCOUNT_ID=<account> SCRIPT=tiles-prod SECRETS="BUNNY_API_KEY GLOBALPING_TOKEN" CLOUDFLARE_API_TOKEN=<token> \
-#     BUNNY_API_KEY=<value> GLOBALPING_TOKEN=<value> put-worker-secrets.sh
+#     PLANNED_AT=<the plan's time, RFC 3339 UTC> BUNNY_API_KEY=<value> GLOBALPING_TOKEN=<value> put-worker-secrets.sh
 #
 # Each secret's value is the environment variable of its name. Neither the values nor the token go on a command line.
 #
-# The apply's upload of the script has just deployed a version without these secrets (workers.tf). Should putting one
+# An apply that uploads the script has just deployed a version without these secrets (workers.tf). Should putting one
 # fail, the worker would run without its log reader or probe until a later apply, so before putting any this notes the
 # deployment that served before that upload, if the upload dropped a secret that one had; when a PUT then fails it
 # deploys that version again, whose code, bindings and secrets (a version keeps the values it was deployed with) are
 # what served before the apply, and fails the apply. The next apply's refresh sees the older code, so it uploads the
-# script again and puts the secrets.
+# script again and puts the secrets. The upload is the latest deployment only if it is the one deployment made since
+# the plan (PLANNED_AT): an apply that uploaded nothing (as after an earlier one that uploaded and could put no secret)
+# goes back to nothing, since the deployment before the latest then served before an earlier apply, not this one.
 set -euo pipefail
 
-: "${ACCOUNT_ID:?}" "${SCRIPT:?}" "${SECRETS:?}" "${CLOUDFLARE_API_TOKEN:?}"
+: "${ACCOUNT_ID:?}" "${SCRIPT:?}" "${SECRETS:?}" "${CLOUDFLARE_API_TOKEN:?}" "${PLANNED_AT:?}"
 api="https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/scripts/$SCRIPT"
+
+# An RFC 3339 UTC time as seconds since the epoch, fractions kept (Cloudflare's created_on has them; fromdateiso8601
+# doesn't take them); nothing for anything else.
+epoch='def epoch: capture("^(?<s>[^.]+?)(?<f>\\.[0-9]+)?(?:Z|\\+00:00)$") | (.s + "Z" | fromdateiso8601) + ("0" + .f | tonumber);'
+if ! jq -en --arg at "$PLANNED_AT" "$epoch"' $at | epoch' > /dev/null 2>&1; then
+  echo "PLANNED_AT is not an RFC 3339 UTC time: $PLANNED_AT" >&2
+  exit 1
+fi
 
 # Every name and value is checked before anything changes.
 for name in $SECRETS; do
@@ -62,14 +72,21 @@ secret_names() {
     jq -r '.result.resources.bindings[]? | select(.type == "secret_text") | .name' <<<"$version"
 }
 
-# The version that served before the apply's upload (the second deployment: the first, the latest, serves now), if the
-# latest dropped one of the secrets that version had; nothing when either can't be read or one splits its traffic.
+# The version that served before the apply's upload (the latest deployment before it; the first listed, the latest,
+# serves now), if the latest dropped one of the secrets that version had; nothing when the latest isn't this apply's
+# upload (the one deployment since the plan), either can't be read or one splits its traffic.
 version_to_restore() {
-  local deployments live previous live_secrets previous_secrets name
+  local deployments pair live previous live_secrets previous_secrets name
   deployments=$(cloudflare GET /deployments) && succeeded "$deployments" || return 0
-  live=$(jq -er '.result.deployments[0].versions | select(length == 1) | .[0].version_id' <<<"$deployments") || return 0
-  previous=$(jq -er '.result.deployments[1].versions | select(length == 1) | .[0].version_id' <<<"$deployments") ||
-    return 0
+  pair=$(jq -er --arg planned "$PLANNED_AT" "$epoch"'
+    ($planned | epoch) as $planned
+    | .result.deployments
+    | (.[1:] | map({versions, at: (.created_on | epoch)})) as $before
+    | select((.[0].created_on | epoch) >= $planned and ($before | length) > 0 and all($before[]; .at < $planned))
+    | [.[0], ($before | max_by(.at))] | map(.versions | select(length == 1) | .[0].version_id) | select(length == 2)
+    | join(" ")' <<<"$deployments") || return 0
+  live=${pair% *}
+  previous=${pair#* }
   live_secrets=$(secret_names "$live") && previous_secrets=$(secret_names "$previous") || return 0
   for name in $SECRETS; do
     if ! grep -qxF -- "$name" <<<"$live_secrets" && grep -qxF -- "$name" <<<"$previous_secrets"; then

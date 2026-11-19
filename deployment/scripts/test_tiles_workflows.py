@@ -860,11 +860,20 @@ def cloudflare(result=None, success=True, errors=()):
     return json.dumps({"success": success, "errors": list(errors), "messages": [], "result": result})
 
 
-def deployments(*versions):
-    """The script's deployments, the latest (serving) first, each of one version."""
-    return cloudflare({"deployments": [{"id": f"d-{version}", "strategy": "percentage",
+# The plan's time (plantimestamp), which workers.tf passes as PLANNED_AT.
+PLANNED_AT = "2026-11-19T17:00:00Z"
+
+
+def deployments(*versions, since_plan=1):
+    """The script's deployments, the latest (serving) first, each of one version: the first `since_plan` made after the
+    plan, a minute apart (the apply's upload), the others before it, an hour apart."""
+    def created_on(i):
+        if i < since_plan:
+            return f"2026-11-19T17:0{since_plan - i}:30.418244Z"
+        return f"2026-11-19T{16 - (i - since_plan):02d}:59:59.5Z"
+    return cloudflare({"deployments": [{"id": f"d-{version}", "strategy": "percentage", "created_on": created_on(i),
                                         "versions": [{"version_id": version, "percentage": 100}]}
-                                       for version in versions]})
+                                       for i, version in enumerate(versions)]})
 
 
 def version(version_id, secrets):
@@ -919,7 +928,7 @@ class PutWorkerSecretsTest(unittest.TestCase):
             env = dict(os.environ, PATH=os.path.join(tmp, "bin") + os.pathsep + os.environ["PATH"], FAKE_LOG=log,
                        FAKE_DIR=answer_dir, FAKE_PREFIX=SCRIPT_API, ACCOUNT_ID="account", SCRIPT="tiles-prod",
                        SECRETS="BUNNY_API_KEY GLOBALPING_TOKEN", CLOUDFLARE_API_TOKEN="cf-token-1",
-                       BUNNY_API_KEY="bunny key 2", GLOBALPING_TOKEN='globalping "3"')
+                       PLANNED_AT=PLANNED_AT, BUNNY_API_KEY="bunny key 2", GLOBALPING_TOKEN='globalping "3"')
             env.update(overrides)
             result = subprocess.run(["bash", PUT_SECRETS], env=env, cwd=tmp, capture_output=True, text=True,
                                     check=False)
@@ -1028,9 +1037,14 @@ class PutWorkerSecretsTest(unittest.TestCase):
                 ("deployments not json", {"GET /deployments": ("", 7)}),
                 ("one deployment", {"GET /deployments": deployments("v-upload")}),
                 ("split traffic", {"GET /deployments": cloudflare({"deployments": [
-                    {"id": "d-split", "versions": [{"version_id": "v-upload", "percentage": 50},
-                                                   {"version_id": "v-before", "percentage": 50}]},
-                    {"id": "d-before", "versions": [{"version_id": "v-before", "percentage": 100}]}]})}),
+                    {"id": "d-split", "created_on": "2026-11-19T17:01:00Z",
+                     "versions": [{"version_id": "v-upload", "percentage": 50},
+                                  {"version_id": "v-before", "percentage": 50}]},
+                    {"id": "d-before", "created_on": "2026-11-19T16:00:00Z",
+                     "versions": [{"version_id": "v-before", "percentage": 100}]}]})}),
+                ("no creation times", {"GET /deployments": cloudflare({"deployments": [
+                    {"id": f"d-{version}", "versions": [{"version_id": version, "percentage": 100}]}
+                    for version in ("v-upload", "v-before")]})}),
                 ("version unread", {"GET /versions/v-before": REFUSED})):
             with self.subTest(name):
                 result, calls = self.run_script(dict(AFTER_UPLOAD, **answers))
@@ -1039,6 +1053,41 @@ class PutWorkerSecretsTest(unittest.TestCase):
                 result, calls = self.run_script(dict(AFTER_UPLOAD, **answers, **{"PUT /secrets": REFUSED}))
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(self.restores(calls), [])
+
+    def test_nothing_is_put_back_when_this_apply_uploaded_nothing(self):
+        """An earlier apply uploaded v-upload and could put no secret, nor go back; this one uploads nothing (the
+        refresh finds no secrets to drop). v-before served before that earlier apply, not this one: going back to it
+        would bring back its older code and deployment key, so a failed PUT leaves v-upload serving."""
+        for name, listed in (("the latest from before the plan", deployments("v-upload", "v-before", since_plan=0)),
+                             ("two since the plan", deployments("v-upload", "v-before", since_plan=2))):
+            with self.subTest(name):
+                result, calls = self.run_script(dict(AFTER_UPLOAD, **{"GET /deployments": listed,
+                                                                      "PUT /secrets": REFUSED}))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.restores(calls), [])
+                self.assertNotIn("goes back", result.stdout)
+                self.assertIn("Nothing to go back to", result.stderr)
+                # Without the failure the secrets still go on.
+                result, calls = self.run_script(dict(AFTER_UPLOAD, **{"GET /deployments": listed}))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len([call for call in calls if call["method"] == "PUT"]), 2)
+
+    def test_it_goes_back_to_the_latest_deployment_before_the_upload_however_they_are_listed(self):
+        # Cloudflare only says the first one listed is the latest; v-before is the one that served until the upload.
+        listed = cloudflare({"deployments": [
+            {"id": f"d-{version}", "created_on": created_on, "versions": [{"version_id": version, "percentage": 100}]}
+            for version, created_on in (("v-upload", "2026-11-19T17:00:01Z"), ("v-older", "2026-11-19T15:00:00.9Z"),
+                                        ("v-before", "2026-11-19T16:59:59.000001+00:00"))]})
+        _, calls = self.run_script(dict(AFTER_UPLOAD, **{"GET /deployments": listed, "PUT /secrets": REFUSED}))
+        self.assertEqual([body["versions"][0]["version_id"] for body in self.restores(calls)], ["v-before"])
+
+    def test_the_apply_passes_the_plan_time(self):
+        """PLANNED_AT is the plantimestamp that replaces terraform_data.bunny_secrets on every apply: the plan's time,
+        before any upload of the apply it belongs to."""
+        workers = read(os.path.join(os.path.dirname(PUT_SECRETS), "workers.tf"))
+        block = re.search(r'resource "terraform_data" "bunny_secrets" \{.*?\n\}', workers, re.S).group(0)
+        self.assertRegex(block, r"\n  triggers_replace = \[plantimestamp\(\)\]\n")
+        self.assertRegex(block, r"\n      PLANNED_AT\s+= self\.triggers_replace\[0\]\n")
 
     def test_a_refused_restore_says_the_worker_runs_without_them(self):
         answers = dict(AFTER_UPLOAD, **{"PUT /secrets": REFUSED, "POST /deployments?force=true": REFUSED})
@@ -1051,6 +1100,11 @@ class PutWorkerSecretsTest(unittest.TestCase):
     def test_missing_settings_fail(self):
         self.assertNotEqual(self.run_script(CLOUDFLARE_API_TOKEN="")[0].returncode, 0)
         self.assertNotEqual(self.run_script(SECRETS="")[0].returncode, 0)
+        for planned in ("", "yesterday"):
+            with self.subTest(PLANNED_AT=planned):
+                result, calls = self.run_script(PLANNED_AT=planned)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(calls, [])
 
 
 
