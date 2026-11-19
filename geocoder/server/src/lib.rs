@@ -3427,14 +3427,16 @@ impl Index {
 // continent subdirs.
 
 /// The stamp of a continent dir the server's downloader fills: the date of
-/// the build it holds a complete selection of. The downloader removes it
-/// before it writes anything else into the dir and puts it back once the
-/// last of the selection is in.
+/// the build it holds a complete selection of, and no other file the
+/// downloader put there. The downloader removes it before it writes or
+/// removes anything else in the dir and puts it back once the last of the
+/// selection is in and the files of others are gone.
 pub const BUILD_STAMP: &str = ".build_date";
 
 /// The ledger the server's downloader keeps in a continent dir of what each
 /// file there holds: lines `<name> <sha256>`, or `<name> -` where it is
-/// unknown, the last line of a name the one that counts. A dir holding it
+/// unknown, the last line of a name the one that counts. It names every
+/// file a download put there until one removes the file. A dir holding it
 /// but no BUILD_STAMP is one whose download did not finish, and may mix two
 /// builds' or selections' files.
 pub const FILE_LEDGER: &str = ".file_sha256";

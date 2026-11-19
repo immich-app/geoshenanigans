@@ -583,6 +583,9 @@ thread_local! {
     /// this thread stops once its files are in place, before the ledger
     /// names them, as one killed there would.
     static STOP_ONCE_FETCHED: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    /// Set by a test: the next download on this thread stops once it removed
+    /// the files its selection doesn't take, before its first fetch.
+    static STOP_ONCE_REMOVED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// Resolve and download every file for a single region. A fetch (a file's
@@ -593,13 +596,17 @@ thread_local! {
 /// left, or a fetch a kill cut short, may hold other bytes. Before a fetch
 /// can replace a file the ledger marks it unknown, and once the fetch is
 /// in place (its bytes checked against the manifest's sha256) names its
-/// sha256. The dir's stamp (BUILD_STAMP) says it holds a complete
-/// selection of the build it names: a download that fetches anything
-/// removes it before it writes anything else, and puts it in once the
-/// last fetch is in, the ledger rewritten with a line a file; one that
-/// fetches nothing into a dir stamped with its build writes nothing. A
-/// unit's files land together, so a download needs the largest unit's
-/// files' size free beside the region.
+/// sha256. A file the ledger names that the selection doesn't take (an
+/// earlier selection's or build's, which Index::load would read beside
+/// this one's) is removed before the first fetch, and its line goes when
+/// the ledger is rewritten. The dir's stamp (BUILD_STAMP) says it holds a
+/// complete selection of the build it names and no other file the ledger
+/// names: a download that fetches or removes anything removes the stamp
+/// before it writes anything else, and puts it in once the last fetch is
+/// in, the ledger rewritten with a line a file of the selection; one that
+/// has nothing to fetch or remove in a dir stamped with its build writes
+/// nothing. A unit's files land together, so a download needs the largest
+/// unit's files' size free beside the region.
 ///
 /// `progress` fires after each file or unit completes with the running
 /// total; the caller logs it.
@@ -651,14 +658,34 @@ pub async fn download_region(
         in_place.push(held);
     }
     let to_fetch = in_place.contains(&false);
+    let taken: HashSet<&str> = paths.iter().map(|p| basename(p)).collect();
+    let others: Vec<String> = ledger.held.keys().filter(|name| !taken.contains(name.as_str())).cloned().collect();
+    let changes = to_fetch || !others.is_empty();
     let stamped = tokio::fs::read_to_string(&stamp).await.is_ok_and(|s| s.trim() == cfg.build.date);
-    if to_fetch {
+    if changes {
         match tokio::fs::remove_file(&stamp).await {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 return Err(DownloadError::Io(format!("remove {}: {}", stamp.display(), e)));
             }
             _ => {}
         }
+    }
+    // Before the fetches, so that their room is free. Their lines go only
+    // when the ledger is rewritten: a download killed before then leaves
+    // them, and the next finds their files gone.
+    for name in &others {
+        let path = region_dir.join(name);
+        match tokio::fs::remove_file(&path).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(DownloadError::Io(format!("remove {}: {}", path.display(), e)));
+            }
+            _ => {}
+        }
+        ledger.held.remove(name);
+    }
+    #[cfg(test)]
+    if STOP_ONCE_REMOVED.replace(false) {
+        return Err(DownloadError::Io("stopped once the files the selection doesn't take were removed".to_string()));
     }
     for (fetch, &held) in fetches.iter().zip(&in_place) {
         if !held {
@@ -690,7 +717,7 @@ pub async fn download_region(
         });
     }
 
-    if to_fetch || !stamped {
+    if changes || !stamped {
         ledger.compact().await?;
         write_whole(&stamp, cfg.build.date.as_bytes()).await?;
     }
@@ -1515,6 +1542,66 @@ mod tests {
             assert_eq!(stamp.as_deref(), (!stopped).then_some(test_bucket::DATE), "stopped: {stopped}");
             assert_eq!(bucket.files_served() - before, 2, "stopped: {stopped}");
             assert!(held(&root.path().join("europe")) == files_of(&bucket, &major), "stopped: {stopped}");
+        }
+    }
+
+    // A switch to a selection that doesn't take some of the files of the one
+    // before leaves the dir holding the new selection only, its ledger a line
+    // a file and its stamp. Admin-minimal beside poi tier major, then
+    // without POIs: its dir has strings and polygon ids of its own, which the
+    // POI files' names and parents don't point into. Admin beside major, then
+    // without POIs: once the first download is complete the dir holds all of
+    // the new selection, and nothing is fetched. The first download stops
+    // once the pois unit is in (before the boundary files, which come after
+    // it), or completes.
+    #[tokio::test]
+    async fn a_switch_leaves_none_of_the_files_of_the_selection_before_that_it_doesnt_take() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        for (mode, stopped, fetches) in [("admin-minimal", true, true), ("admin-minimal", false, true), ("admin", true, true), ("admin", false, false)] {
+            let (before, after) = (sel("europe", mode, "simplified", "major"), sel("europe", mode, "simplified", "none"));
+            let root = ScratchDir::new();
+            if stopped {
+                STOP_ONCE_FETCHED.set(Some("europe/poi/major/pois.tt.zst"));
+            }
+            let first = download(&bucket, &before, root.path()).await;
+            let served = bucket.files_served();
+
+            download(&bucket, &after, root.path()).await.unwrap();
+
+            let case = format!("{mode}, stopped: {stopped}");
+            assert_eq!(first.is_err(), stopped, "{case}: {first:?}");
+            assert_eq!(bucket.files_served() > served, fetches, "{case}");
+            assert_eq!(differing(&held(&root.path().join("europe")), &files_of(&bucket, &after)), Vec::<String>::new(), "{case}");
+        }
+    }
+
+    // A download removes the stamp, then the files the ledger names that its
+    // selection doesn't take, before it fetches anything: stopped there, as a
+    // kill would, it leaves the dir with no stamp, none of those files and
+    // nothing fetched; retried, it finishes. A switch from poi tier major to
+    // none, in a mode whose dir the switch fetches, and in one whose it
+    // doesn't.
+    #[tokio::test]
+    async fn a_download_removes_the_stamp_then_the_files_its_selection_doesnt_take_before_it_fetches() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        for mode in ["admin-minimal", "admin"] {
+            let (before, after) = (sel("europe", mode, "simplified", "major"), sel("europe", mode, "simplified", "none"));
+            let root = ScratchDir::new();
+            let dir = root.path().join("europe");
+            download(&bucket, &before, root.path()).await.unwrap();
+            let theirs: Vec<String> = files_of(&bucket, &before).into_keys().filter(|n| !files_of(&bucket, &after).contains_key(n)).collect();
+            let served = bucket.files_served();
+            STOP_ONCE_REMOVED.set(true);
+
+            let stopped = download(&bucket, &after, root.path()).await.map_err(|e| e.to_string());
+            let left: Vec<&String> = theirs.iter().filter(|n| dir.join(n).exists()).collect();
+            let (stamped, fetched) = (dir.join(BUILD_STAMP).exists(), bucket.files_served() - served);
+            download(&bucket, &after, root.path()).await.unwrap();
+
+            assert!(theirs.len() > 1 && theirs.iter().all(|n| n.starts_with("poi_") || n.starts_with("strings_poi")), "{mode}: {theirs:?}");
+            assert_eq!(stopped, Err("I/O error: stopped once the files the selection doesn't take were removed".to_string()), "{mode}");
+            assert_eq!((left, stamped, fetched), (Vec::<&String>::new(), false, 0), "{mode}");
+            assert_eq!(differing(&held(&dir), &files_of(&bucket, &after)), Vec::<String>::new(), "{mode}");
         }
     }
 
