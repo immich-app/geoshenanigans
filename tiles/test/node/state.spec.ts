@@ -174,22 +174,59 @@ describe('publishBuild', () => {
     expect(store.objects.size).toBe(0);
   });
 
-  it('fails when the store does not hold what was sent', async () => {
-    const memory = new MemoryObjectStore();
-    const lossy: ObjectStore = {
+  /** A store that acknowledges every PUT, but keeps what `store` makes of the bytes sent to `target` (null: nothing). */
+  function faulty(memory: MemoryObjectStore, target: RegExp, store: (body: Uint8Array) => Uint8Array | null) {
+    const wrapped: ObjectStore = {
       get: (path) => memory.get(path),
-      put: (path, body, sha256) => memory.put(path, body.subarray(0, body.length - 1), sha256).catch(() => {}),
-      putFile: async (path, file, sha256) => lossy.put(path, await readFile(file), sha256),
+      put: async (path, body, sha256) => {
+        if (!target.test(path)) {
+          return memory.put(path, body, sha256);
+        }
+        const kept = store(body);
+        if (kept) {
+          memory.objects.set(path, kept);
+        }
+      },
+      putFile: async (path, file, sha256) => wrapped.put(path, await readFile(file), sha256),
       describe: (path) => memory.describe(path),
       getToFile: (path, file) => memory.getToFile(path, file),
       list: (dir) => memory.list(dir),
       delete: (path) => memory.delete(path),
     };
+    return wrapped;
+  }
+
+  it('fails when the store does not hold what was sent', async () => {
+    const memory = new MemoryObjectStore();
     const file = await manifestFile('20261118');
+    const lossy = faulty(memory, /manifests\//, () => null);
     await expect(publishBuild(lossy, { buildKey: '20261118', manifestFile: file, prefix: 'v1' })).rejects.toThrow(
       /reads back as missing/,
     );
     expect(await readState(memory)).toBeNull();
+  });
+
+  it('fails when the store holds other bytes of the same length than were sent', async () => {
+    const flip = (body: Uint8Array) => {
+      const copy = new Uint8Array(body);
+      copy[copy.length - 1] ^= 1;
+      return copy;
+    };
+    const file = await manifestFile('20261118');
+    const size = (await readFile(file)).length;
+    // The manifest: state.json must not switch to a manifest that isn't there as sent.
+    const memory = new MemoryObjectStore();
+    const corrupting = faulty(memory, /manifests\//, flip);
+    await expect(publishBuild(corrupting, { buildKey: '20261118', manifestFile: file, prefix: 'v1' })).rejects.toThrow(
+      new RegExp(`manifests/20261118\\.tman\\.zst reads back as ${size} bytes [0-9A-F]{64}$`),
+    );
+    expect(memory.objects.get('manifests/20261118.tman.zst')).toHaveLength(size);
+    expect(await readState(memory)).toBeNull();
+    // state.json itself: the publish fails rather than return a state the zone doesn't hold.
+    const other = new MemoryObjectStore();
+    await expect(
+      publishBuild(faulty(other, /state\.json$/, flip), { buildKey: '20261118', manifestFile: file, prefix: 'v1' }),
+    ).rejects.toThrow(/state\.json reads back as \d+ bytes [0-9A-F]{64}$/);
   });
 });
 
