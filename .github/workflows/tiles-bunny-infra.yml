@@ -1,6 +1,7 @@
 name: Tiles Bunny Infra
 # OpenTofu for the Bunny tiles zone (deployment/modules/bunny/tiles/README.md). The Bunny account is production only, so
-# pull requests plan prod and main applies it. The unit is left out of tiles-worker.yml's `terragrunt run --all`.
+# pull requests plan prod, once a reviewer approves the run, and main applies it. The unit is left out of
+# tiles-worker.yml's `terragrunt run --all`.
 on:
   workflow_dispatch:
   pull_request:
@@ -65,17 +66,38 @@ jobs:
           tofu validate
           tofu test
 
+  # The plan runs the branch's Terragrunt configuration with the production token, so no branch run gets it by itself:
+  # the job waits in the tiles-bunny-plan environment until one of its required reviewers approves the run, and with
+  # it the run's commit. The check job above needs no credentials.
   plan:
     name: Plan
     needs: check
     if: github.ref != 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: tiles-bunny-plan
     permissions:
+      actions: read # the environment's protection rules
       contents: read
     defaults:
       run:
         working-directory: deployment/modules/bunny/tiles
     steps:
+      # GitHub creates an environment a job names without protection rules, which would let every run through:
+      # refuse before anything reads a secret until the environment has a reviewer (README.md).
+      - name: Check the environment requires approval
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PLAN_ENVIRONMENT: tiles-bunny-plan
+        run: |
+          set -euo pipefail
+          environment=$(gh api "repos/$GITHUB_REPOSITORY/environments/$PLAN_ENVIRONMENT")
+          reviewers=$(jq '[.protection_rules[]? | select(.type == "required_reviewers") | (.reviewers // []) | length] | add // 0' <<<"$environment")
+          if [ "$reviewers" -lt 1 ]; then
+            echo "::error::The $PLAN_ENVIRONMENT environment has no required reviewers, so this plan would run with the production token unapproved: add them (deployment/modules/bunny/tiles/README.md)"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

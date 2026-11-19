@@ -11,7 +11,7 @@ OpenTofu for tiles.immich.cloud on Bunny, where every tile position is its own f
 | `bunnynet_compute_script.gzip` | The gzip middleware (`script/tiles-gzip.ts`), in every `gzip_mode`; linked to the pull zone unless `gzip_mode = "edge_rule"`. |
 | `bunnynet_pullzone_hostname.custom` | `test_hostname`, and `public_hostname` once `serve_public_hostname` is true. |
 
-The Bunny account is production only and there is no dev zone, so there is one environment, `prod` (`tiles.prod.tfvars.json`, state schema `prod_bunny_tiles`). This unit has its own workflow, `.github/workflows/tiles-bunny-infra.yml`: it plans on pull requests and applies on `main`. The `terragrunt run --all` over `deployment/` that the tiles workflows and `mise run tf` do leaves it out (the `exclude` block in `terragrunt.hcl`), so run it from this directory:
+The Bunny account is production only and there is no dev zone, so there is one environment, `prod` (`tiles.prod.tfvars.json`, state schema `prod_bunny_tiles`). This unit has its own workflow, `.github/workflows/tiles-bunny-infra.yml`: it plans on pull requests, once a reviewer approves the run (The workflow, below), and applies on `main`. The `terragrunt run --all` over `deployment/` that the tiles workflows and `mise run tf` do leaves it out (the `exclude` block in `terragrunt.hcl`), so run it from this directory:
 
 ```bash
 cd deployment/modules/bunny/tiles
@@ -28,6 +28,10 @@ op run --env-file=bunny.env -- terragrunt apply
 | `TF_VAR_tf_state_postgres_conn_str` | `op://tf/tf_state/postgres_conn_str` | The state backend, as in `deployment/.env`. |
 
 The sync, the watchdog and the worker read more items: every one is in the go-live checklist below, and they must exist before the branch merges.
+
+## The workflow
+
+- **Pull requests and branch dispatches** run the checks (formatting, `tofu validate`, and `tofu test` against a mocked provider) with no credentials. Their plan reads the production token and runs the branch's Terragrunt configuration, so it runs in the `tiles-bunny-plan` environment and waits until one of its required reviewers approves the run, which runs that one commit. Create the environment once in the repository's settings (Environments): required reviewers (the maintainers who review this module, with self-review prevented when more than one can approve), deployment branches and tags left at "No restriction" so that every branch's plan can run, and no secrets of its own. GitHub creates an environment a job names without any protection, so until it has a reviewer the plan job stops at its first step, before anything reads a secret.
 
 ## First run: import the existing zones
 
