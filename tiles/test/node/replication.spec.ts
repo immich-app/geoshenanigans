@@ -507,7 +507,7 @@ describe('bunny:replication CLI', () => {
       concurrency: 16,
       stateDir: join(scratch.dir, 'state'),
       claimsDir: join(scratch.dir, 'claims'),
-      verifyExisting: false,
+      firstLoad: true,
       storage: { zone: fake.zone, password: fake.password, host: fake.url, retry: fast },
       log: () => {},
     });
@@ -577,7 +577,7 @@ describe('bunny:replication CLI', () => {
       concurrency: 16,
       stateDir: join(scratch.dir, 'state'),
       claimsDir: join(scratch.dir, 'claims'),
-      verifyExisting: false,
+      firstLoad: true,
       storage: { zone: fake.zone, password: fake.password, host: fake.url, retry: fast },
       log: () => {},
     });

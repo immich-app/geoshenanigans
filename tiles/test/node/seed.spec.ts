@@ -8,7 +8,15 @@ import { archiveIdentity, identifyArchive } from '../../src/bunny/archive-identi
 import { ArchiveRanges } from '../../src/bunny/archive-walk';
 import { BunnyStateStore, writeState } from '../../src/bunny/state';
 import { tilePath } from '../../src/bunny/tile-id';
-import { Checkpoint, MainMessage, runSeed, SeedOptions, SeedStatus } from '../../src/bunny/upload';
+import {
+  Checkpoint,
+  chunkProbeIds,
+  MainMessage,
+  preflightIds,
+  runSeed,
+  SeedOptions,
+  SeedStatus,
+} from '../../src/bunny/upload';
 import { FakeStorage, FakeStorageOptions, Fault } from './fake-storage';
 import { startStateServer } from './state-server';
 import { FixtureArchive, random, scratchDir, withOtherTileBytes, writeFixtureArchive } from './upload-fixture';
@@ -55,7 +63,8 @@ async function setup(positions: number, fakeOptions: FakeStorageOptions = {}) {
     workers: 3,
     concurrency: 24,
     stateDir: join(scratch.dir, 'state'),
-    verifyExisting: false,
+    // Most tests here are of a first load's checks; those of the default say firstLoad: false.
+    firstLoad: true,
     storage: { zone: fake.zone, password: fake.password, host: fake.url, retry: fast, timeoutMs: 300 },
     progressIntervalMs: 200,
     claimsDir: join(scratch.dir, 'claims'),
@@ -149,7 +158,7 @@ describe('runSeed', () => {
         concurrency: 100,
         maxConnectionsPerAddress: 4,
         // No preflight client: its connections would overlap the workers' on the server side.
-        verifyExisting: true,
+        firstLoad: false,
         storage: { ...options().storage, addresses },
       }),
     );
@@ -190,6 +199,45 @@ describe('runSeed', () => {
     await expect(runSeed(options({ chunkSize: 1_023 }))).rejects.toThrow(/itest\/\S+ is already stored/);
     expect(fake.requests.PUT).toBe(1);
   });
+
+  it('DESCRIBEs every position unless told it is a first load, so a file outside every sample is not PUT again', async () => {
+    const positions = 21_845;
+    const { fixture, fake, options, dir } = await setup(positions);
+    const chunkSize = 512;
+    // A position neither a first load's fresh-seed check (every 2nd id here, and each chunk's first) nor its chunk's
+    // probe looks at.
+    const preflight = new Set(preflightIds(0, positions, chunkSize));
+    const probed = (id: number) => {
+      const start = Math.floor(id / chunkSize) * chunkSize;
+      return chunkProbeIds(start, Math.min(positions, start + chunkSize)).includes(id);
+    };
+    const lone = [...Array(positions).keys()].find((id) => !preflight.has(id) && !probed(id))!;
+    expect(lone).toBeGreaterThan(0);
+    // Stored by an earlier seed, under two prefixes.
+    for (const prefix of ['itest', 'first']) {
+      await runSeed(options({ prefix, from: lone, to: lone + 1, stateDir: join(dir, `lone-${prefix}`) }));
+    }
+    expect(fake.files.size).toBe(2);
+
+    const describes = fake.requests.DESCRIBE ?? 0;
+    const logs: string[] = [];
+    const { status } = await runSeed(
+      options({ firstLoad: false, stateDir: join(dir, 'full'), log: (line) => logs.push(line) }),
+    );
+    expect(status).toMatchObject({ state: 'complete', files: { uploaded: positions - 1, skippedExisting: 1 } });
+    expect(fake.requests.DESCRIBE - describes).toBe(positions);
+    expect(fake.putsByPath.get(tilePath('itest', lone))).toBe(1);
+    expect(fake.identicalReputs).toEqual([]);
+    expect(logs.some((line) => /DESCRIBE before every PUT$/.test(line))).toBe(true);
+    for (let id = 0; id < positions; id++) {
+      expect(fake.checksum(tilePath('itest', id))).toBe(fixture.sha256(id));
+    }
+
+    // What --first-load trades for half the requests: its samples miss that file, so it is PUT again.
+    const first = await runSeed(options({ prefix: 'first', stateDir: join(dir, 'first') }));
+    expect(first.status).toMatchObject({ state: 'complete', chunks: { overlapping: 0 } });
+    expect(fake.identicalReputs).toEqual([tilePath('first', lone)]);
+  }, 60_000);
 
   it('verifies the chunks another seed stored part of when an interrupted seed resumes after it', async () => {
     const controller = new AbortController();
@@ -258,7 +306,7 @@ describe('runSeed', () => {
       expect(fake.checksum(tilePath('itest', id))).toBe(fixture.sha256(id));
     }
     // Its claim is gone once it is done: the next seed runs (and finds everything stored).
-    const again = await runSeed(options({ stateDir: join(dir, 'd'), verifyExisting: true, to: 600 }));
+    const again = await runSeed(options({ stateDir: join(dir, 'd'), firstLoad: false, to: 600 }));
     expect(again.status.files.skippedExisting).toBe(600);
   });
 
@@ -380,13 +428,15 @@ describe('runSeed', () => {
     expectStored(fake, fixture, 1_000, 3_333);
   });
 
-  it('refuses a fresh state dir over files already stored, unless told to verify', async () => {
+  it('refuses a first load from a fresh state dir over files already stored, and verifies them without it', async () => {
     const { fixture, fake, options, dir } = await setup(1_365);
     await runSeed(options());
     const puts = fake.requests.PUT;
 
-    await expect(runSeed(options({ stateDir: join(dir, 'other') }))).rejects.toThrow(/already stored under itest/);
-    const verified = await runSeed(options({ stateDir: join(dir, 'third'), verifyExisting: true }));
+    await expect(runSeed(options({ stateDir: join(dir, 'other') }))).rejects.toThrow(
+      /already stored under itest.*leave out --first-load/,
+    );
+    const verified = await runSeed(options({ stateDir: join(dir, 'third'), firstLoad: false }));
     expect(verified.status.files).toMatchObject({ uploaded: 0, skippedExisting: 1_365 });
     expect(fake.requests.PUT).toBe(puts);
     expect(fake.identicalReputs).toEqual([]);
@@ -750,6 +800,8 @@ describe('bunny:seed CLI', () => {
       '20',
       '--progress-interval-s',
       '1',
+      // The first load as documented: chunks it has not started go out without a DESCRIBE per file.
+      '--first-load',
     ];
     const run = () => {
       const started = startSeed(context.fake, args, { XDG_STATE_HOME: context.dir });
@@ -1024,10 +1076,16 @@ describe('bunny:seed CLI', () => {
     expect(missing.code).toBe(2);
     expect(missing.stderr).toMatch(/--no-state-check/);
 
-    // Another prefix (a full rewrite) is fine, and so is the live build's own archive (a repair).
-    const rewrite = await startSeed(fake, args('itest/e2'), env).done;
+    // Another prefix (a full rewrite, loaded as a first load) is fine, and so is the live build's own archive (a
+    // repair), but not as a first load: the live build's files are there.
+    const rewrite = await startSeed(fake, [...args('itest/e2'), '--first-load'], env).done;
     expect(rewrite.code, rewrite.stderr).toBe(0);
     await writeState(store, { ...live, archive: identity });
+    const puts = fake.requests.PUT;
+    const firstLoad = await startSeed(fake, [...args('itest'), '--first-load'], env).done;
+    expect(firstLoad.code).toBe(1);
+    expect(firstLoad.stderr).toMatch(/20261118 is live under itest\/, so itest\/ is no first load/);
+    expect(fake.requests.PUT).toBe(puts);
     const repair = await startSeed(fake, args('itest'), env).done;
     expect(repair.code, repair.stderr).toBe(0);
     for (const prefix of ['itest', 'itest/e2']) {
@@ -1068,6 +1126,9 @@ describe('bunny:seed CLI', () => {
     const result = await startSeed(fake, ['--archive', 'x.pmtiles', '--max-zoom', '3', '--to-id', '9']).done;
     expect(result.code).toBe(2);
     expect(result.stderr).toMatch(/not both/);
+    const both = await startSeed(fake, ['--archive', 'x.pmtiles', '--first-load', '--verify-existing']).done;
+    expect(both.code).toBe(2);
+    expect(both.stderr).toMatch(/either --first-load or --verify-existing \(the default\), not both/);
     // 0 would retry 429s in a tight loop, or turn off every request timeout.
     for (const flag of ['--retry-base-ms', '--request-timeout-s']) {
       const zero = await startSeed(fake, ['--archive', 'x.pmtiles', flag, '0']).done;

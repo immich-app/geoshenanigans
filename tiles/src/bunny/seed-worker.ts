@@ -4,9 +4,9 @@
  * run through its own storage client. Reports when every position of a chunk was handed out (so the main thread
  * sends the next one even while a few slow files of it are in flight) and when every position in it is stored.
  *
- * A chunk this seed never started may still hold files another seed (another state dir) stored, and PUTting their
- * bytes again would clear their replication, so a few of its positions are DESCRIBEd as soon as it arrives; if any
- * already holds its bytes, the whole chunk runs verified.
+ * A chunk sent unverified (one a first load never started, SeedOptions.firstLoad) may still hold files another seed
+ * (another state dir) stored, and PUTting their bytes again would clear their replication, so a few of its positions
+ * are DESCRIBEd as soon as it arrives; if any already holds its bytes, the whole chunk runs verified.
  *
  * The archive is the file its identity was computed from (WorkerConfig.archiveSource): the worker checks that it
  * opened that file and, before it reports a chunk done, that the file has not changed since; else it stops and the
