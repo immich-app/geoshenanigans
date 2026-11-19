@@ -11,21 +11,22 @@ resource "bunnynet_pullzone" "tiles" {
   origin {
     type              = "StorageZone"
     storagezone       = bunnynet_storage_zone.tiles.id
-    middleware_script = local.middleware ? bunnynet_compute_script.gzip[0].id : 0
+    middleware_script = local.gzip_middleware ? bunnynet_compute_script.gzip.id : 0
   }
 
   routing {
     tier = "Standard"
     # A middleware script runs only on the PoPs that support scripting.
-    filters = local.middleware ? ["scripting"] : ["all"]
+    filters = local.gzip_middleware ? ["scripting"] : ["all"]
   }
 
   # Tiles change only through the daily sync, which purges the whole zone once its uploads have replicated, so the CDN
   # keeps every file for a year (smart cache off: whatever its type). The TileJSON and styles get 300 s (edge rule).
-  # What browsers keep comes from the Cache-Control edge rules.
+  # What browsers keep comes from the Cache-Control edge rules; a file no rule matches gets 300 s, where -1 (match the
+  # CDN) would give it a year.
   cache_enabled                 = false
   cache_expiration_time         = 31536000
-  cache_expiration_time_browser = -1
+  cache_expiration_time_browser = 300
   cache_errors                  = false
   cache_chunked                 = false
   # No "querystring" here means IgnoreQueryStrings: one cached copy per path, whatever ?v= a client sends.
@@ -70,9 +71,10 @@ output "pull_zone_id" {
   value = bunnynet_pullzone.tiles.id
 }
 
-# Where the custom hostnames' CNAME records point.
+# Where the custom hostnames' CNAME records point: the zone's own hostname (the provider's cdn_domain is only the
+# suffix, b-cdn.net).
 output "cdn_domain" {
-  value = bunnynet_pullzone.tiles.cdn_domain
+  value = "${bunnynet_pullzone.tiles.name}.${bunnynet_pullzone.tiles.cdn_domain}"
 }
 
 output "hostnames" {

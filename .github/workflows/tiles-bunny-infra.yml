@@ -57,11 +57,13 @@ jobs:
           terragrunt hcl fmt --check --diff --working-dir deployment/modules/bunny
           tofu fmt -check -diff -recursive deployment/modules/bunny
 
+      # tofu test plans every gzip_mode against a mocked provider (tests/tiles.tftest.hcl).
       - name: Validate
         working-directory: deployment/modules/bunny/tiles
         run: |
           tofu init -backend=false -input=false
           tofu validate
+          tofu test
 
   plan:
     name: Plan
@@ -90,6 +92,19 @@ jobs:
         uses: immich-app/devtools/actions/use-mise@caac7f7e4298458a14238959504f411fc6cc7f06 # use-mise-action-v3.2.3
         with:
           github_token: ${{ steps.token.outputs.token }}
+
+      # The provider doesn't mark the middleware script's deployment key sensitive, and a plan that replaces or deletes
+      # the script prints it (as does any later error showing it): masked for the rest of the job.
+      - name: Mask the middleware script's deployment key
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+        run: |
+          set -euo pipefail
+          state=$(op run --env-file=bunny.env -- terragrunt run --non-interactive --tf-forward-stdout -- state pull)
+          jq -r '.resources[]? | select(.type == "bunnynet_compute_script") | .instances[]?.attributes.deployment_key // empty' <<<"$state" |
+            while IFS= read -r key; do
+              echo "::add-mask::$key"
+            done
 
       - name: Plan
         env:
@@ -142,6 +157,19 @@ jobs:
               exit 1
             fi
           done
+
+      # The provider doesn't mark the middleware script's deployment key sensitive, and a plan that replaces or deletes
+      # the script prints it (as does any later error showing it): masked for the rest of the job.
+      - name: Mask the middleware script's deployment key
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+        run: |
+          set -euo pipefail
+          state=$(op run --env-file=bunny.env -- terragrunt run --non-interactive --tf-forward-stdout -- state pull)
+          jq -r '.resources[]? | select(.type == "bunnynet_compute_script") | .instances[]?.attributes.deployment_key // empty' <<<"$state" |
+            while IFS= read -r key; do
+              echo "::add-mask::$key"
+            done
 
       - name: Apply
         env:

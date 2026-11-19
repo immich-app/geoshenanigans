@@ -29,14 +29,15 @@ variable "pull_zone_name" {
 }
 
 # How tiles get Content-Encoding: gzip. An edge rule setting it breaks tiles at some PoPs (README.md), so until Bunny
-# fixes that a middleware script sets it on the origin response.
+# fixes that a middleware script sets it on the origin response. "both" is the step between the two, in either
+# direction.
 variable "gzip_mode" {
   type    = string
   default = "middleware"
 
   validation {
-    condition     = contains(["middleware", "edge_rule"], var.gzip_mode)
-    error_message = "gzip_mode must be \"middleware\" or \"edge_rule\"."
+    condition     = contains(["middleware", "both", "edge_rule"], var.gzip_mode)
+    error_message = "gzip_mode must be \"middleware\", \"both\" or \"edge_rule\"."
   }
 }
 
