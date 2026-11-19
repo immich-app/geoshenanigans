@@ -105,7 +105,8 @@ async function main(): Promise<number> {
   const prefix = trimPrefix('prefix', values.prefix);
   const tileJsonPath = `${trimPrefix('static-prefix', values['static-prefix'] ?? STATIC_PREFIX)}.json`;
   const minZoom = integer('min-zoom', values['min-zoom'], 0, 0, 20);
-  const maxZoom = integer('max-zoom', values['max-zoom'], 15, minZoom, 20);
+  // The default too must not be below --min-zoom: a range that holds no zoom would delete nothing and exit 0.
+  const maxZoom = integer('max-zoom', values['max-zoom'] ?? '15', 15, minZoom, 20);
   const concurrency = integer('concurrency', values.concurrency, 4, 1, 64);
 
   const stateStore = BunnyStateStore.fromEnv();

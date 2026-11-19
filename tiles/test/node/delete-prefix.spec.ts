@@ -132,6 +132,24 @@ describe('bunny:delete-prefix', () => {
     expect((await empty.run()).stderr).toMatch(/--prefix is required/);
   });
 
+  it('refuses a zoom range that holds no zoom, with the default --max-zoom too', async () => {
+    const { tiles, run } = await setup();
+    for (const args of [
+      ['--min-zoom', '16'],
+      ['--min-zoom', '9', '--max-zoom', '8'],
+      ['--max-zoom', '21'],
+    ]) {
+      const refused = await run('--prefix', 'v1', '--yes', ...args);
+      expect(refused, args.join(' ')).toMatchObject({ code: 2 });
+      expect(refused.stderr).toMatch(/--max-zoom must be an integer from \d+ to 20/);
+    }
+    expect(tiles.requests).toEqual({});
+    // Given both, a range above the default is fine: zooms 16-20 hold no folders here.
+    const above = await run('--prefix', 'v1', '--yes', '--min-zoom', '16', '--max-zoom', '20');
+    expect(above.stderr).toMatch(/No tile folders of zooms 16-20 under v1\/: nothing to delete/);
+    expect(tiles.requests.DELETE ?? 0).toBe(0);
+  });
+
   it('refuses the prefix the TileJSON serves when a switch failed before state.json, and an unreadable TileJSON', async () => {
     // A --replace to v1/e2 wrote v1.json and failed before making the build live: state.json still says v1.
     const { tiles, run } = await setup({ ...live, prefix: 'v1' });
