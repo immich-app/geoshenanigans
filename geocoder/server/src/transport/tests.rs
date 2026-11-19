@@ -1290,6 +1290,43 @@ fn a_decode_finishes_what_a_decode_killed_while_putting_its_members_in_left() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_decode_killed_once_its_members_were_in_leaves_its_dir_marked_and_they_stay() {
+    // A pois decode into a dir holding an older build's files, stopped as a kill would once all
+    // its members are in place, before it removes the files they replaced: its dir holds those
+    // files and INSTALLED. A decode of a places unit into the dir then removes them, and the
+    // pois members stay.
+    let (_, _, pois, pois_unit) = golden_units().swap_remove(1);
+    let pois_unit = zstd::encode_all(&pois_unit[..], 3).unwrap();
+    let (unit, members, dir) = published_places();
+    put_tree(dir.path(), OLDER_POIS);
+
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        STOP_ONCE_IN_PLACE.set(true);
+        decode_into_dir(&pois_unit[..], dir.path(), Some(&expected(&pois)))
+    }));
+
+    assert!(stopped.is_err());
+    let decodes_dirs: Vec<std::path::PathBuf> =
+        std::fs::read_dir(dir.path()).unwrap().map(|e| e.unwrap().path()).filter(|p| p.file_name().unwrap().to_str().unwrap().starts_with(".transport.")).collect();
+    assert_eq!(decodes_dirs.len(), 1, "{decodes_dirs:?}");
+    let replaced: Vec<(String, Vec<u8>)> = OLDER_POIS.iter().map(|(n, b)| (format!(".earlier.{n}"), b.to_vec())).chain([(INSTALLED.to_string(), Vec::new())]).collect();
+    assert_eq!(dir_files(&decodes_dirs[0]), replaced);
+    for (name, bytes) in &pois {
+        assert_eq!(&std::fs::read(dir.path().join(name)).unwrap(), bytes, "{name}");
+    }
+
+    decode_into_dir(&unit[..], dir.path(), Some(&expected(&members))).unwrap();
+
+    let (_, _, want) = published_places();
+    decode_into_dir(&unit[..], want.path(), Some(&expected(&members))).unwrap();
+    for (name, bytes) in &pois {
+        std::fs::write(want.path().join(name), bytes).unwrap();
+    }
+    assert_eq!(tree(dir.path()), tree(want.path()));
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn a_dir_the_decode_cant_open_fails_the_decode() {

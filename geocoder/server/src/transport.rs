@@ -414,6 +414,14 @@ fn finish_leftover(dir: &Path, leftover: &Path) -> io::Result<()> {
     std::fs::remove_dir_all(leftover)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Set by a test: the next decode on this thread stops once all its members are in place,
+    /// before it removes the files they replaced, as one killed there would (put_in_place
+    /// panics, and its dir stays).
+    static STOP_ONCE_IN_PLACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// A member moved into place (once `installed`), the file it replaced moved to `earlier`.
 struct Moved {
     dest: PathBuf,
@@ -458,6 +466,10 @@ impl Staging {
         let installed = self.path.join(INSTALLED);
         if let Err(e) = File::create(&installed) {
             return Err(put_back(moved, at(&installed, e)));
+        }
+        #[cfg(test)]
+        if STOP_ONCE_IN_PLACE.take() {
+            panic!("the decode stops here, as one killed here would");
         }
         let mut removed = true;
         for earlier in moved.iter().filter_map(|m| m.earlier.as_ref()) {
