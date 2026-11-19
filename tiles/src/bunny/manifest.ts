@@ -428,6 +428,41 @@ export async function* manifestBatches(path: string): AsyncGenerator<ManifestBat
   }
 }
 
+/**
+ * Writes the part of a manifest below tile ID `end` (a run crossing it is cut there) to `out`, e.g. the positions of
+ * zooms up to Z for a sync limited to them. `maxZoom` replaces the header's when it is lower.
+ */
+export async function clipManifest(
+  source: string,
+  out: string,
+  end: number,
+  maxZoom?: number,
+): Promise<ManifestHeader> {
+  const header = await readManifestHeader(source);
+  const writer = await ManifestWriter.create(out, {
+    buildKey: header.buildKey,
+    minZoom: header.minZoom,
+    maxZoom: maxZoom !== undefined && (header.maxZoom === null || maxZoom < header.maxZoom) ? maxZoom : header.maxZoom,
+    osmDate: header.osmDate,
+  });
+  try {
+    batches: for await (const batch of manifestBatches(source)) {
+      for (let i = 0; i < batch.count; i++) {
+        const tileId = batch.tileIds[i];
+        if (tileId >= end) {
+          break batches;
+        }
+        writer.add(tileId, Math.min(batch.runLengths[i], end - tileId), batch.hashHi[i], batch.hashLo[i]);
+      }
+      await writer.drain();
+    }
+    return await writer.finish();
+  } catch (error) {
+    await writer.abort();
+    throw error;
+  }
+}
+
 /** Every entry of a manifest in tile-ID order. */
 export async function* readManifest(path: string): AsyncGenerator<ManifestEntry> {
   for await (const batch of manifestBatches(path)) {

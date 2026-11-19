@@ -443,12 +443,15 @@ export class BunnyStateStore implements ObjectStore {
     this.agent = new Agent({ connect: { timeout: this.settings.requestTimeoutMs } });
   }
 
-  /** BUNNY_STATE_ZONE, BUNNY_STATE_PASSWORD and optionally BUNNY_STORAGE_HOST. */
+  /**
+   * BUNNY_STATE_ZONE, BUNNY_STATE_PASSWORD and optionally BUNNY_STORAGE_HOST, or BUNNY_STATE_HOST when the state zone
+   * is reached elsewhere than the tiles zone (a local stand-in in tests).
+   */
   static fromEnv(): BunnyStateStore {
     return new BunnyStateStore({
       zone: requireEnv('BUNNY_STATE_ZONE'),
       password: requireEnv('BUNNY_STATE_PASSWORD'),
-      host: process.env.BUNNY_STORAGE_HOST,
+      host: process.env.BUNNY_STATE_HOST || process.env.BUNNY_STORAGE_HOST,
     });
   }
 

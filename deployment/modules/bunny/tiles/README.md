@@ -95,6 +95,14 @@ The provider doesn't mark the script's `deployment_key` sensitive, and anyone wi
 - `public_hostname` (`tiles.immich.cloud`) is attached once `serve_public_hostname` is true. It can only get a managed certificate after its DNS points at Bunny, so with a managed certificate HTTPS fails from the DNS switch until the certificate is issued. Avoid that gap with a certificate obtained beforehand (DNS challenge) passed as the hostname's `certificate` and `certificate_key`, or accept it at a quiet hour. The provider doesn't mark `certificate_key` sensitive either: pass it through a `sensitive = true` variable (from 1Password, like the API key) so plans show `(sensitive value)`. Rolling back is pointing the DNS back at the Worker.
 - Configuration changes (pull zone, edge rules, hostnames, the script link) can take ~48 minutes to reach every PoP; a new zone answered "Domain suspended or not configured" at one PoP for 20-30 minutes. Make them well ahead of anything that depends on them, and confirm from probes at every PoP. The daily sync changes no configuration: it uploads, purges the pull zone (output `pull_zone_id`) and writes state.
 
+## Loading the tiles
+
+The zone's files come from the tiles tooling (`tiles/src/bunny`, run from `tiles/`), not from this module:
+
+1. `npm run bunny:seed -- --archive <build>.pmtiles` uploads every position of a build. It is resumable: run the same command again after a stop.
+2. `npm run bunny:sync -- --archive <same build>.pmtiles --build <YYYYMMDD> --adopt` records it as the live build: it checks a sample of positions, uploads the TileJSON and styles, purges the pull zone and writes `state.json`. Nothing writes tiles over a seed: a later sync DESCRIBEs every file before its PUT.
+3. From then on Tiles Sync (`.github/workflows/tiles-sync.yml`) applies each daily build's changed positions. While the seed's files are still replicating, the account-wide replication queue holds the daily changes up past the sync's replication gate: set the `TILES_SYNC_HOLD` repository variable until it drains.
+
 ## Outputs
 
 `pull_zone_id` (`BUNNY_PULL_ZONE_ID` for the purge and the log reader), `cdn_domain` (the zone's own `{name}.b-cdn.net` hostname, the CNAME target), `hostnames`, `storage_zone_id`, `state_zone_id`, `gzip_script_id`. The storage zone passwords stay out of the outputs: the sync reads them from 1Password.

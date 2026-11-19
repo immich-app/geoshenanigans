@@ -6,10 +6,11 @@ name: Tiles Sync
 # live in the state zone. Every run's outcome and numbers go to FUTO o11y from the report job, whatever ended the run;
 # tiles-sync-watchdog.yml reports the live build's age independently (o11y/alerts/geoshenanigans-tiles.yaml).
 #
-# A run that fails after its first PUT leaves state.json on the old build, so the next one (the afternoon run, a
-# dispatch) diffs the same positions and uploads them again. Retrying relies on bunny:sync DESCRIBing each changed
-# file before its PUT and skipping it when the stored checksum matches: re-PUTting identical bytes clears the file's
-# ReplicatedZones for good (a Bunny bug), and the replication gate could then never pass.
+# A run that fails after its first PUT leaves state.json on the old build with the new one listed as pending, and the
+# next one (the afternoon run, a dispatch) plans with it. bunny:sync DESCRIBEs every changed position before its PUT
+# and skips those that already hold the bytes: re-PUTting identical bytes clears the file's ReplicatedZones for good
+# (a Bunny bug), and the replication gate could then never pass. A replication gate that times out fails the run the
+# same way, before the purge, so the next run waits for those files again.
 #
 # deployment/scripts/tiles_sync_report.py decides (and its tests cover): the build, whether to sync, skip or stop,
 # and the job's time budget. Scheduled runs skip while the repository variable TILES_SYNC_HOLD is set (any text,
@@ -245,6 +246,12 @@ jobs:
             --status-exit "$code" --status-stderr "$RUNNER_TEMP/live.err" --live "$LIVE" --build "$KEY" \
             --hold "$HOLD" --event "$GITHUB_EVENT_NAME" --output "$GITHUB_OUTPUT"
 
+      # The zone serves the styles beside the TileJSON (v1/style/*); a dry run writes neither.
+      - name: Build map styles
+        if: steps.recheck.outputs.proceed == 'true' && !inputs.dry_run
+        working-directory: ./map-styles
+        run: npm ci && npm run build
+
       - name: Download build
         id: download
         if: steps.recheck.outputs.proceed == 'true'
@@ -285,6 +292,7 @@ jobs:
         env:
           # Manifests and other temporary files on the runner's scratch volume, beside the build.
           TMPDIR: ${{ runner.temp }}
+          STYLES_DIR: ${{ github.workspace }}/map-styles/dist
           OSM_DATE: ${{ needs.resolve.outputs.osm_date }}
           MAX_CHANGED_FRACTION: ${{ needs.resolve.outputs.max_changed_fraction }}
           REPLICATION_TIMEOUT_MIN: ${{ needs.resolve.outputs.replication_timeout_min }}

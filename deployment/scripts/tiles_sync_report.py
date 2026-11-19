@@ -111,9 +111,10 @@ class Budget(typing.NamedTuple):
     job_timeout_min: int
 
 
-# The sync can't resume: a job that stops after its first PUT leaves the zone
-# with part of the build and state.json on the old one. So the guard rail is
-# the diff one job finishes, the upload (~12.8k files/s measured) and then the
+# A job that stops after its first PUT leaves the zone with part of the build
+# and state.json on the old one (the new one pending): the next run checks
+# every changed file again before writing, so it repairs, but only a job that
+# finishes makes the build live. So the guard rail is the diff one job finishes, the upload (~12.8k files/s measured) and then the
 # slowest region's replication (Sydney, ~1.3k files/s, from the first PUT on),
 # within the gate's timeout; anything larger goes in as a full rewrite under a
 # new prefix (plan section 6). The test checks each budget against those rates.

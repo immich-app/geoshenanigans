@@ -40,6 +40,13 @@ The serverless path writes only while requests arrive, and o11y's fleet-wide sto
 
 The worker's error lines and a 1% sample of its requests (`kind:="request"`, with `apex_domain`, `as_org`, `country`, `status` and `duration_ms`) go to VictoriaLogs. Each line carries the request's `ray` (its Cf-Ray), `path`, `colo` and `continent`. `project:="geoshenanigans" cluster:="tiles" level:="error"` selects the failures. `REQUEST_LOG_SAMPLE_RATE` changes the sample.
 
+### The Bunny tiles zone
+
+Three more sources land in the tiles tenant (`6:3`), all pushing samples they compute themselves as Prometheus text to `/insert/0/prometheus/api/v1/import/prometheus` with explicit timestamps, as the geocoder's report step does: names are stored as written, with no `:1m_sum_samples` suffix and no `aggregator` label.
+
+- The worker's every-minute cron reads Bunny's CDN request logs (Logging API v2) one closed minute at a time, 3 minutes behind, and pushes that minute's sums stamped at its end: `tiles_bunny_requests`, `tiles_bunny_bytes`, `tiles_bunny_tile_requests`, `tiles_bunny_country_requests`, `tiles_bunny_log_rows`, `tiles_bunny_log_lag_seconds` and `tiles_bunny_log_reader_runs{result}`. Every tenth minute it also runs a Globalping probe of a cached and an uncached tile per continent: `tiles_bunny_probe_ttfb_ms`, `tiles_bunny_probe_errors` and `tiles_bunny_probe_runs`. They carry the worker's identity labels (`provider=cloudflare`, `region=world`), so Bunny's PoP is `edge_location` and the probe's continent `continent`. Add the minutes up with `sum_over_time()`. A sample of the CDN requests goes to VictoriaLogs as `kind:="request" cdn:="bunny"`, the probe's tests as `kind:="probe"`.
+- `tiles-sync.yml`'s report job pushes each daily sync's outcome from the sync CLI's report (`tiles_sync_*`: status, step seconds, positions changed, files and bytes uploaded, replication wait per `storage_region`), and `tiles-sync-watchdog.yml` every 2 hours the live build's age with its heartbeat. They stamp `project=geoshenanigans`, `cluster=tiles`, `env=prod`, `provider=github` and `region=global`, and log with `app` `tiles-sync` or `tiles-sync-watchdog`.
+
 ## Dashboards
 
 Each `dashboards/<uid>.json` file is a Grafana export whose `uid` matches the file name, with `"id": null` and tags `app`, `metrics`, `logs` (if it has log panels) and `geoshenanigans`. Metric queries use the `$datasource` variable, limited to and defaulting to `VictoriaMetrics Fleet`, and every selector carries `project="geoshenanigans"`. Log panels use the `$logs` variable, defaulting to `VictoriaLogs`.
