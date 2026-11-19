@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BunnyStateStore, SyncState, writeState } from '../../src/bunny/state';
 import { tilePath, zoomEnd, zoomStart } from '../../src/bunny/tile-id';
 import { FakeStorage } from './fake-storage';
@@ -11,6 +11,7 @@ const TILES_DIR = join(import.meta.dirname, '../..');
 let cleanup: (() => Promise<void>)[] = [];
 
 afterEach(async () => {
+  vi.unstubAllEnvs();
   for (const step of cleanup.reverse()) {
     await step();
   }
@@ -59,6 +60,8 @@ async function setup(state: SyncState | null = live) {
         BUNNY_STORAGE_ZONE: tiles.zone,
         BUNNY_STORAGE_PASSWORD: tiles.password,
         BUNNY_STORAGE_HOST: tiles.url,
+        // Resolve the fake's host: storage IPs pinned in the shell would send every request elsewhere.
+        BUNNY_STORAGE_ADDRESSES: '',
         BUNNY_STATE_ZONE: 'state-zone',
         BUNNY_STATE_PASSWORD: 'state-password',
         BUNNY_STATE_HOST: server.host,
@@ -148,6 +151,15 @@ describe('bunny:delete-prefix', () => {
     const above = await run('--prefix', 'v1', '--yes', '--min-zoom', '16', '--max-zoom', '20');
     expect(above.stderr).toMatch(/No tile folders of zooms 16-20 under v1\/: nothing to delete/);
     expect(tiles.requests.DELETE ?? 0).toBe(0);
+  });
+
+  it('uses the storage it is given whatever storage IPs the shell pins', async () => {
+    // A developer's shell pinning the real storage servers (here an address nothing listens on).
+    vi.stubEnv('BUNNY_STORAGE_ADDRESSES', '127.0.0.2');
+    const { tiles, run } = await setup();
+    const dry = await run('--prefix', 'v1');
+    expect(dry.stderr).toMatch(/Would delete v1\/ zooms 0, 1, 2, 3, 4, 5, 6, 7, 8\n/);
+    expect(tiles.requests.GET).toBeGreaterThan(0);
   });
 
   it('refuses the prefix the TileJSON serves when a switch failed before state.json, and an unreadable TileJSON', async () => {
