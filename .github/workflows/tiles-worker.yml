@@ -50,9 +50,10 @@ jobs:
         run: npm run test:node
         if: ${{ !cancelled() }}
 
-      - name: Test tiles sync report script
+      # The sync report script, and the tiles sync workflows' credential gating and sample check (PyYAML, jq).
+      - name: Test tiles sync scripts and workflows
         working-directory: .
-        run: python3 -m unittest discover -s deployment/scripts -p 'test_tiles_sync_report.py'
+        run: python3 -m unittest discover -s deployment/scripts -p 'test_tiles_*.py'
         if: ${{ !cancelled() }}
 
       - name: Test tiles cleanup script
