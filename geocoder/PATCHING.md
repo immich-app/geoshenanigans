@@ -148,7 +148,11 @@ decode:
    removed, then lets go of the install lock;
 4. decodes the unit's files, as other decodes do theirs at the same time;
 5. takes the install lock again and finishes the leftovers again (decodes
-   that died meanwhile; its own dir is locked, so it stays);
+   that died meanwhile; its own dir is locked, so it stays): a lock that
+   fails here fails the decode before it moves a file in, whatever the
+   error, ENOLCK too (which flock(2) gives also when the kernel is out of
+   lock records), as only the lock of step 1 tells a file system without
+   locks;
 6. moves its files into place, removes its dir and only then lets go of the
    install lock (on an error, once it put back what it replaced).
 

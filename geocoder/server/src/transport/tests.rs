@@ -1492,6 +1492,26 @@ fn a_decode_goes_without_a_lock_only_where_the_file_system_has_none() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_decode_that_took_the_install_lock_fails_when_it_cant_take_it_again_before_a_member_moves() {
+    // A decode took the install lock to make its dir: decodes into the dir take locks. Taking it
+    // again to put its members in fails, ENOLCK (which flock gives also when the kernel is out of
+    // lock records) as any other error: the decode fails before a member moves, its dir removed,
+    // the dir as it was. Gone on without the lock, its install could go in beside another's, or
+    // before a killed decode's leftover is finished.
+    for code in [libc::ENOLCK, libc::EIO] {
+        let (unit, members, dir) = published_places();
+        let before = tree(dir.path());
+
+        SEAM.with_borrow_mut(|s| s.fail_install_lock = Some(code));
+        let got = decode_into_dir(&unit[..], dir.path(), Some(&expected(&members))).map(|_| ()).map_err(|e| e.to_string());
+
+        assert_eq!(got, Err(format!("{}: {}", dir.path().display(), io::Error::from_raw_os_error(code))), "{code}");
+        assert_eq!(tree(dir.path()), before, "{code}");
+    }
+}
+
 #[test]
 fn a_decode_finishes_the_dirs_of_decodes_that_are_gone_but_not_of_one_still_running() {
     // A decode holds its dir, its members written, while another runs from start to end. The

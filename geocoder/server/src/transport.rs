@@ -251,7 +251,8 @@ pub struct Expected {
 /// takes the install lock again, finishes what decodes that died meanwhile left, puts its
 /// members in place, removes its dir and only then lets go of the install lock. So installs go
 /// one at a time, and one killed part-way is finished before any later one goes in, never after
-/// it.
+/// it. Whether decodes take locks is told by a decode's first lock: once it took that one, a
+/// later one that fails fails the decode, whatever the error, before a member goes in.
 ///
 /// To finish leftovers a decode tries the lock of each decode's dir in `dir`: one held is a
 /// running decode's, decoding into it, and stays; one it takes is a dead decode's, and is
@@ -271,8 +272,8 @@ pub struct Expected {
 /// On an error `dir` is as it was once leftovers were finished: the members moved in so far are
 /// taken out again, the files they replaced put back, and nothing of the decode is left (put_back
 /// tells what it couldn't undo). A member's path that is a directory is an error, as is, on unix,
-/// a `dir` the decode can't open to lock or read, or a lock that fails but on a file system
-/// without locks.
+/// a `dir` the decode can't open to lock or read, or a lock that fails but the first on a file
+/// system without locks.
 ///
 /// Decodes of a unit into one dir at once each put complete, checked members in place, the last
 /// to install winning; with installs one at a time, one that fails undoes only its own. Where
@@ -363,8 +364,9 @@ fn locked(path: &Path) -> io::Result<File> {
 
 /// The install lock of the dataset dir `dir`: an exclusive flock on it, waiting while another
 /// decode holds it. A decode holds it while it finishes leftovers and makes its own dir, and
-/// again while it finishes leftovers and puts its members in place. None on a file system
-/// without locks. A dir that can't be opened, or a lock that fails otherwise, is an error.
+/// again (install_lock_again) while it finishes leftovers and puts its members in place. None
+/// on a file system without locks, which this first taking tells: the decode then takes no
+/// locks. A dir that can't be opened, or a lock that fails otherwise, is an error.
 #[cfg(unix)]
 fn install_lock(dir: &Path) -> io::Result<Option<File>> {
     match locked(dir) {
@@ -377,6 +379,22 @@ fn install_lock(dir: &Path) -> io::Result<Option<File>> {
 #[cfg(not(unix))]
 fn install_lock(_dir: &Path) -> io::Result<Option<File>> {
     Ok(None)
+}
+
+/// The install lock of `dir` taken again, for a decode's install, once the decode took it to make
+/// its dir (new_in): whether decodes take locks is told there, by the first, and here any error
+/// is an error, ENOLCK too (flock gives it also when the kernel is out of lock records). Going on
+/// without the lock, the install could go in beside another, or before a killed decode's leftover
+/// is finished.
+#[cfg(unix)]
+fn install_lock_again(dir: &Path) -> io::Result<File> {
+    install_lock_fault().map_or_else(|| locked(dir), Err).map_err(|e| at(dir, e))
+}
+
+#[cfg(not(unix))]
+fn install_lock_again(_dir: &Path) -> io::Result<File> {
+    // Never taken: there decodes take no locks.
+    Err(io::Error::from(io::ErrorKind::Unsupported))
 }
 
 /// Whether `e`, an error taking a lock, says the file system has no locks.
@@ -508,6 +526,11 @@ enum Step {
 #[cfg(not(test))]
 fn seam(_: Step) {}
 
+#[cfg(all(unix, not(test)))]
+fn install_lock_fault() -> Option<io::Error> {
+    None
+}
+
 /// What a test has the decodes on this thread do at each Step.
 #[cfg(test)]
 #[derive(Default)]
@@ -519,11 +542,20 @@ struct Seam {
     /// The step at which the next decode stops, as one killed there would: it panics, and its
     /// dir stays with what it holds but the members it still made there.
     stop: Option<Step>,
+    /// The error (an errno) the next decode's taking of the install lock for its install fails
+    /// with, once (install_lock_again); its first, to make its dir, goes as it would.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    fail_install_lock: Option<i32>,
 }
 
 #[cfg(test)]
 thread_local! {
     static SEAM: std::cell::RefCell<Seam> = std::cell::RefCell::new(Seam::default());
+}
+
+#[cfg(all(unix, test))]
+fn install_lock_fault() -> Option<io::Error> {
+    SEAM.with_borrow_mut(|s| s.fail_install_lock.take()).map(io::Error::from_raw_os_error)
 }
 
 #[cfg(test)]
@@ -580,30 +612,29 @@ impl Staging {
         Ok(staging)
     }
 
-    /// Takes the install lock on `dir`, waiting while another decode holds it, and finishes what
-    /// decodes that are gone left (finish_leftovers), before its members go in place: a decode
-    /// killed while it put its members in is undone before any later decode puts its own in,
-    /// never after. A leftover it can't finish that would put back a file over one of `members`
-    /// once finished (or of which it can't tell) fails it, as does a `dir` it can't read: no
-    /// member goes in. The lock is held until this is dropped. Nothing where decodes take no
-    /// locks.
+    /// Takes the install lock on `dir` again, waiting while another decode holds it, and finishes
+    /// what decodes that are gone left (finish_leftovers), before its members go in place: a
+    /// decode killed while it put its members in is undone before any later decode puts its own
+    /// in, never after. A lock that fails fails it, whatever the error (install_lock_again): no
+    /// member goes in. So does a leftover it can't finish that would put back a file over one of
+    /// `members` once finished (or of which it can't tell), or a `dir` it can't read. The lock is
+    /// held until this is dropped. Nothing where decodes take no locks.
     fn install(&mut self, dir: &Path, members: &[Member]) -> io::Result<()> {
-        if self.locks {
-            seam(Step::WaitsToInstall);
-            self.installing = install_lock(dir)?;
-            seam(Step::Installs);
-            if self.installing.is_some() {
-                for u in finish_leftovers(dir)? {
-                    let what = match &u.puts_back {
-                        None => "it may hold a file a member replaced, which would go back over this decode's".to_string(),
-                        Some(names) => match members.iter().find(|m| names.iter().any(|n| *n == *m.name)) {
-                            Some(m) => format!("it holds the file {} replaced, which would go back over this decode's", m.name),
-                            None => continue,
-                        },
-                    };
-                    return Err(io::Error::new(u.why.kind(), format!("{} can't be finished ({}): {what}", u.path.display(), u.why)));
-                }
-            }
+        if !self.locks {
+            return Ok(());
+        }
+        seam(Step::WaitsToInstall);
+        self.installing = Some(install_lock_again(dir)?);
+        seam(Step::Installs);
+        for u in finish_leftovers(dir)? {
+            let what = match &u.puts_back {
+                None => "it may hold a file a member replaced, which would go back over this decode's".to_string(),
+                Some(names) => match members.iter().find(|m| names.iter().any(|n| *n == *m.name)) {
+                    Some(m) => format!("it holds the file {} replaced, which would go back over this decode's", m.name),
+                    None => continue,
+                },
+            };
+            return Err(io::Error::new(u.why.kind(), format!("{} can't be finished ({}): {what}", u.path.display(), u.why)));
         }
         Ok(())
     }
