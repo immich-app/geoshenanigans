@@ -5,7 +5,8 @@
  *
  * Needs BUNNY_STATE_ZONE, BUNNY_STATE_PASSWORD and optionally BUNNY_STORAGE_HOST. --json prints
  * {"liveBuild","updatedAt","osmDate","buildAgeHours","osmAgeHours"}; buildAgeHours counts from 00:00 UTC of the build
- * date. Exits 1 when there is no state.json yet (the JSON then has nulls).
+ * date. Exits 1 when there is no state.json yet (the JSON then has nulls), and within about a minute when the state
+ * zone doesn't answer.
  */
 import { parseArgs } from 'node:util';
 import { BunnyStateStore, liveStatus, readState } from '../state';
@@ -15,7 +16,8 @@ async function main() {
     options: { json: { type: 'boolean', default: false }, 'state-prefix': { type: 'string' } },
     strict: true,
   });
-  const state = await readState(BunnyStateStore.fromEnv(), values['state-prefix']);
+  const store = BunnyStateStore.fromEnv();
+  const state = await readState(store, values['state-prefix']).finally(() => store.close());
   const status = liveStatus(state);
   if (values.json) {
     console.log(JSON.stringify(status));
@@ -23,6 +25,9 @@ async function main() {
     console.log(`live build ${status.liveBuild}, ${status.buildAgeHours} h old (prefix ${state.prefix})`);
     console.log(`updated ${status.updatedAt}, ${state.positions} positions, manifest ${state.manifest}`);
     console.log(status.osmDate ? `OSM data from ${status.osmDate}, ${status.osmAgeHours} h old` : 'OSM date unknown');
+    for (const pending of state.pending) {
+      console.log(`pending ${pending.build} since ${pending.startedAt}: a sync started it and didn't finish`);
+    }
   }
   if (!state) {
     console.error('No state.json in the state zone: nothing has been synced yet');

@@ -211,20 +211,173 @@ export async function diffManifests(oldPath: string, newPath: string): Promise<M
   return new ManifestDiff(oldPath, newPath, oldHeader, newHeader);
 }
 
+/**
+ * A range of a sync plan. `changed` and `added` positions get the new build's bytes, `removed` ones are deleted.
+ * With `verify`, a sync that failed part-way may have written there already, so the file is DESCRIBEd first and only
+ * written when its checksum isn't the new one: re-PUTting identical bytes clears Bunny's replica list.
+ */
+export interface SyncRange extends DiffRange {
+  verify: boolean;
+}
+
+export interface SyncPlanTotals {
+  /** Live to new, as diffManifests counts it; complete once iteration ends. */
+  diff: DiffTotals;
+  pendingBuilds: string[];
+  /** Positions to DESCRIBE before writing. */
+  verify: number;
+  /** Of those, positions where the live and new builds agree, so only a pending build can have changed them. */
+  verifyOnly: number;
+  ranges: number;
+}
+
+/** Steps through the ranges of a diff; the current one is [start, end). */
+class RangeCursor {
+  done = false;
+  start = 0;
+  end = 0;
+  kind: DiffKind = 'changed';
+
+  constructor(private ranges: AsyncIterator<DiffRange>) {}
+
+  async next() {
+    const next = await this.ranges.next();
+    if (next.done) {
+      this.done = true;
+    } else {
+      this.start = next.value.start;
+      this.end = next.value.start + next.value.count;
+      this.kind = next.value.kind;
+    }
+  }
+
+  async close() {
+    await this.ranges.return?.();
+  }
+}
+
+/**
+ * What a sync must write to take the tiles zone from the live build to a new one, when earlier syncs may have
+ * written part of other builds (state.json's `pending`) without making them live. Outside the positions where a
+ * pending build differs from the live one the zone holds the live build, so the live-to-new diff applies as is.
+ * Inside them the zone holds the live or a pending build's bytes, so every such position is planned with `verify`:
+ * those the live-to-new diff lists keep its kind; the others hold the same bytes in the live and new builds (or
+ * neither has them), so they are `changed` back to them (or `removed`, where only a pending build had a file).
+ */
+export class SyncPlan implements AsyncIterable<SyncRange> {
+  readonly totals: SyncPlanTotals;
+  private started = false;
+
+  constructor(
+    private diff: ManifestDiff,
+    private pending: ManifestDiff[],
+  ) {
+    this.totals = {
+      diff: diff.totals,
+      pendingBuilds: pending.map((p) => p.totals.newBuild),
+      verify: 0,
+      verifyOnly: 0,
+      ranges: 0,
+    };
+  }
+
+  async *[Symbol.asyncIterator](): AsyncGenerator<SyncRange> {
+    if (this.started) {
+      throw new Error('A sync plan can only be iterated once');
+    }
+    this.started = true;
+    const totals = this.totals;
+    const live = new RangeCursor(this.diff[Symbol.asyncIterator]());
+    const pending = this.pending.map((diff) => new RangeCursor(diff[Symbol.asyncIterator]()));
+    const cursors = [live, ...pending];
+    const out: SyncRange[] = [];
+    let current: SyncRange | undefined;
+    const emit = (kind: DiffKind, verify: boolean, start: number, count: number) => {
+      if (verify) {
+        totals.verify += count;
+      }
+      if (current && current.kind === kind && current.verify === verify && current.start + current.count === start) {
+        current.count += count;
+        return;
+      }
+      if (current) {
+        out.push(current);
+      }
+      current = { start, count, kind, verify };
+    };
+
+    try {
+      await Promise.all(cursors.map((cursor) => cursor.next()));
+      let position = Math.min(...cursors.map((cursor) => (cursor.done ? Infinity : cursor.start)));
+      while (cursors.some((cursor) => !cursor.done)) {
+        let next = Infinity;
+        let touched: DiffKind | undefined;
+        for (const cursor of cursors) {
+          if (!cursor.done) {
+            const inside = cursor.start <= position;
+            next = Math.min(next, inside ? cursor.end : cursor.start);
+            if (inside && cursor !== live) {
+              touched = cursor.kind;
+            }
+          }
+        }
+        const listed = !live.done && live.start <= position;
+        if (listed) {
+          emit(live.kind, touched !== undefined, position, next - position);
+        } else if (touched) {
+          // Relative to the live build: 'added' means it has no file here, so neither has the new one.
+          emit(touched === 'added' ? 'removed' : 'changed', true, position, next - position);
+          totals.verifyOnly += next - position;
+        }
+        position = next;
+        for (const cursor of cursors) {
+          while (!cursor.done && cursor.end <= position) {
+            await cursor.next();
+          }
+        }
+        if (out.length > 0) {
+          totals.ranges += out.length;
+          yield* out.splice(0);
+        }
+      }
+      if (current) {
+        totals.ranges++;
+        yield current;
+      }
+    } finally {
+      await Promise.all(cursors.map((cursor) => cursor.close()));
+    }
+  }
+}
+
+/**
+ * Plans a sync from the live build's manifest to a new one, given the manifests of the builds state.json lists as
+ * pending (including the new build itself when this is a re-run). Without pending builds it is the plain diff.
+ */
+export async function planSync(livePath: string, newPath: string, pendingPaths: string[] = []): Promise<SyncPlan> {
+  const [diff, ...pending] = await Promise.all([
+    diffManifests(livePath, newPath),
+    ...pendingPaths.map((path) => diffManifests(livePath, path)),
+  ]);
+  return new SyncPlan(diff, pending);
+}
+
 export interface TilePosition {
   tileId: number;
   offset: number;
   length: number;
+  /** From the range: DESCRIBE before writing. */
+  verify: boolean;
 }
 
 /**
  * The archive tile behind every changed and added position of the ranges, in tile-ID order: what the uploader
- * reads. `entries` is the new build's Archive.tileEntries(); ranges must come in tile-ID order, as a diff yields
- * them. Removed ranges are skipped.
+ * reads. `entries` is the new build's Archive.tileEntries(); ranges must come in tile-ID order, as a diff or a plan
+ * yields them. Removed ranges are skipped.
  */
 export async function* changedTiles(
   entries: AsyncIterable<Entry[]>,
-  ranges: AsyncIterable<DiffRange> | Iterable<DiffRange>,
+  ranges: AsyncIterable<DiffRange | SyncRange> | Iterable<DiffRange | SyncRange>,
 ): AsyncGenerator<TilePosition> {
   const iterator = entries[Symbol.asyncIterator]();
   let run: Entry[] = [];
@@ -238,6 +391,7 @@ export async function* changedTiles(
       if (range.start < previousEnd) {
         throw new Error(`Range at ${range.start} is out of order`);
       }
+      const verify = 'verify' in range && range.verify;
       const end = range.start + range.count;
       previousEnd = end;
       for (let position = range.start; position < end;) {
@@ -259,7 +413,7 @@ export async function* changedTiles(
         }
         const entryEnd = Math.min(end, entry.tileId + entry.runLength);
         for (; position < entryEnd; position++) {
-          yield { tileId: position, offset: entry.offset, length: entry.length };
+          yield { tileId: position, offset: entry.offset, length: entry.length, verify };
         }
       }
     }

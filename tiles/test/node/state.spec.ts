@@ -1,7 +1,9 @@
-import { readFile } from 'node:fs/promises';
+import { createHash, randomBytes } from 'node:crypto';
+import { readFile, writeFile } from 'node:fs/promises';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { writeManifest } from '../../src/bunny/manifest';
 import {
+  beginBuild,
   BunnyStateStore,
   downloadManifest,
   manifestPath,
@@ -10,6 +12,7 @@ import {
   parseState,
   publishBuild,
   readState,
+  STATE_STORE_DEFAULTS,
   statePath,
   SyncState,
   writeState,
@@ -41,6 +44,7 @@ const state: SyncState = {
   updatedAt: '2026-11-18T10:40:00.000Z',
   osmDate: '2026-11-17T23:59:59Z',
   positions: 85,
+  pending: [],
 };
 
 describe('state paths', () => {
@@ -60,6 +64,35 @@ describe('parseState', () => {
     const withoutOsm: Partial<SyncState> = { ...state };
     delete withoutOsm.osmDate;
     expect(parseState(withoutOsm)).toEqual({ ...state, osmDate: null });
+  });
+
+  it('reads a state.json written before pending builds were recorded', () => {
+    const old: Partial<SyncState> = { ...state };
+    delete old.pending;
+    expect(parseState(old)).toEqual(state);
+  });
+
+  it('checks the pending builds', () => {
+    const entry = {
+      build: '20261119',
+      manifest: 'manifests/20261119.tman.zst',
+      positions: 85,
+      startedAt: state.updatedAt,
+    };
+    expect(parseState({ ...state, pending: [entry] }).pending).toEqual([entry]);
+    for (const pending of [
+      {},
+      [{ ...entry, build: 'latest' }],
+      [{ ...entry, build: '20261118' }],
+      [entry, entry],
+      [{ ...entry, positions: -1 }],
+      [{ ...entry, startedAt: undefined }],
+      [null],
+    ]) {
+      expect(() => parseState({ ...state, pending }), JSON.stringify(pending)).toThrow(
+        'state.json has invalid pending',
+      );
+    }
   });
 
   it('names every invalid field', () => {
@@ -118,13 +151,89 @@ describe('publishBuild', () => {
     const lossy: ObjectStore = {
       get: (path) => memory.get(path),
       put: (path, body, sha256) => memory.put(path, body.subarray(0, body.length - 1), sha256).catch(() => {}),
+      putFile: async (path, file, sha256) => lossy.put(path, await readFile(file), sha256),
       describe: (path) => memory.describe(path),
+      getToFile: (path, file) => memory.getToFile(path, file),
     };
     const file = await manifestFile('20261118');
     await expect(publishBuild(lossy, { buildKey: '20261118', manifestFile: file, prefix: 'v1' })).rejects.toThrow(
       /reads back as missing/,
     );
     expect(await readState(memory)).toBeNull();
+  });
+});
+
+describe('beginBuild', () => {
+  async function live(store: MemoryObjectStore) {
+    return publishBuild(store, { buildKey: '20261118', manifestFile: await manifestFile('20261118'), prefix: 'v1' });
+  }
+
+  it('records the build as pending before any tile is written, keeping the live build', async () => {
+    const store = new MemoryObjectStore();
+    const current = await live(store);
+    store.log.length = 0;
+    const file = await manifestFile('20261119');
+    const begun = await beginBuild(store, current, {
+      buildKey: '20261119',
+      manifestFile: file,
+      now: new Date('2026-11-19T10:00:00Z'),
+    });
+    expect(begun).toEqual({
+      ...current,
+      pending: [
+        {
+          build: '20261119',
+          manifest: 'manifests/20261119.tman.zst',
+          positions: 85,
+          startedAt: '2026-11-19T10:00:00.000Z',
+        },
+      ],
+    });
+    expect(store.log.filter((call) => call.startsWith('put'))).toEqual([
+      'put manifests/20261119.tman.zst',
+      'put state.json',
+    ]);
+    expect(await readState(store)).toEqual(begun);
+    expect(store.objects.get('manifests/20261119.tman.zst')).toEqual(new Uint8Array(await readFile(file)));
+  });
+
+  it('keeps every build that did not go live until one does', async () => {
+    const store = new MemoryObjectStore();
+    let current = await live(store);
+    current = await beginBuild(store, current, { buildKey: '20261119', manifestFile: await manifestFile('20261119') });
+    const file20 = await manifestFile('20261120');
+    current = await beginBuild(store, current, { buildKey: '20261120', manifestFile: file20 });
+    // A re-run of a pending build keeps one entry for it.
+    current = await beginBuild(store, current, { buildKey: '20261119', manifestFile: await manifestFile('20261119') });
+    expect(current.pending.map((p) => p.build)).toEqual(['20261120', '20261119']);
+    expect((await readState(store))?.pending.map((p) => p.build)).toEqual(['20261120', '20261119']);
+
+    const pendingFile = scratch.path('pending.tman.zst');
+    await downloadManifest(store, current.pending[0], pendingFile);
+    expect(await readFile(pendingFile)).toEqual(await readFile(file20));
+
+    const published = await publishBuild(store, {
+      buildKey: '20261121',
+      manifestFile: await manifestFile('20261121'),
+      prefix: 'v1',
+    });
+    expect(published.pending).toEqual([]);
+    expect((await readState(store))?.pending).toEqual([]);
+  });
+
+  it('refuses a live build or a state that changed since the sync read it', async () => {
+    const store = new MemoryObjectStore();
+    const current = await live(store);
+    const file = await manifestFile('20261119');
+    await expect(beginBuild(store, current, { buildKey: '20261118', manifestFile: file })).rejects.toThrow(
+      /already live/,
+    );
+    await beginBuild(store, current, { buildKey: '20261119', manifestFile: file });
+    store.log.length = 0;
+    await expect(
+      beginBuild(store, current, { buildKey: '20261120', manifestFile: await manifestFile('20261120') }),
+    ).rejects.toThrow(/changed since/);
+    expect(store.log.filter((call) => call.startsWith('put'))).toEqual([]);
   });
 });
 
@@ -150,13 +259,16 @@ describe('downloadManifest', () => {
     const file = await manifestFile('20261118');
     const live = await publishBuild(memory, { buildKey: '20261118', manifestFile: file, prefix: 'v1' });
     const corrupting: ObjectStore = {
-      get: async (path) => {
+      get: (path) => memory.get(path),
+      put: (path, body, sha256) => memory.put(path, body, sha256),
+      putFile: (path, file, sha256) => memory.putFile(path, file, sha256),
+      describe: (path) => memory.describe(path),
+      getToFile: async (path, file) => {
         const bytes = await memory.get(path);
         bytes![bytes!.length - 1] ^= 1;
-        return bytes;
+        await writeFile(file, bytes!);
+        return true;
       },
-      put: (path, body, sha256) => memory.put(path, body, sha256),
-      describe: (path) => memory.describe(path),
     };
     await expect(downloadManifest(corrupting, live, scratch.path('live.tman.zst'))).rejects.toThrow(/downloaded as/);
   });
@@ -171,8 +283,11 @@ describe('BunnyStateStore', () => {
     await server.close();
   });
 
-  const store = (password = 'zone-password') =>
-    new BunnyStateStore({ zone: 'immich-tiles-state', password, host: server.host, attempts: 3 });
+  let options: { zone: string; password: string; host: string };
+  beforeEach(() => {
+    options = { zone: 'immich-tiles-state', password: 'zone-password', host: server.host };
+  });
+  const store = (password = 'zone-password') => new BunnyStateStore({ ...options, password, attempts: 3 });
 
   it('publishes, reads and streams manifests through the storage API under a state prefix', async () => {
     const file = await manifestFile('20261118');
@@ -210,6 +325,48 @@ describe('BunnyStateStore', () => {
 
   it('reports a checksum the zone rejects', async () => {
     await expect(store().put('x.json', new Uint8Array([1, 2, 3]), 'AB'.repeat(32))).rejects.toThrow(/400/);
+  });
+
+  it('gives up on a zone that takes requests and never answers, within its per-try limit', async () => {
+    server.faults.stallNext = 10;
+    const hung = new BunnyStateStore({ ...options, attempts: 2, requestTimeoutMs: 300 });
+    const started = performance.now();
+    await expect(hung.get('state.json')).rejects.toThrow();
+    expect(performance.now() - started).toBeLessThan(3000);
+    expect(server.requests.filter((request) => request.endsWith('(stalled)'))).toHaveLength(2);
+    await hung.close();
+  });
+
+  it('keeps a hung status check to about a minute by default, inside the watchdog job', () => {
+    expect(STATE_STORE_DEFAULTS.attempts * STATE_STORE_DEFAULTS.requestTimeoutMs).toBeLessThanOrEqual(60_000);
+  });
+
+  it('streams a manifest over a slow link without timing out while bytes move', async () => {
+    const bytes = randomBytes(32 << 20);
+    const file = scratch.path('big.tman.zst');
+    await writeFile(file, bytes);
+    const sha256 = createHash('sha256').update(bytes).digest('hex').toUpperCase();
+    server.faults.readBytesPerSecond = 12 << 20;
+    const slow = new BunnyStateStore({ ...options, attempts: 1, idleTimeoutMs: 1000 });
+    await slow.putFile('itest-b-1/big.tman.zst', file, sha256);
+    expect(server.objects.get('itest-b-1/big.tman.zst')?.equals(bytes)).toBe(true);
+    await slow.close();
+  });
+
+  it('retries a transfer that stops moving', async () => {
+    const file = scratch.path('m.tman.zst');
+    await writeFile(file, 'manifest');
+    const sha256 = createHash('sha256').update('manifest').digest('hex').toUpperCase();
+    server.faults.stallNext = 1;
+    const quick = new BunnyStateStore({ ...options, attempts: 2, idleTimeoutMs: 300 });
+    await quick.putFile('m.tman.zst', file, sha256);
+    expect(server.requests).toEqual([
+      'PUT /immich-tiles-state/m.tman.zst (stalled)',
+      'PUT /immich-tiles-state/m.tman.zst',
+    ]);
+    server.faults.stallNext = 2;
+    await expect(quick.putFile('m.tman.zst', file, sha256)).rejects.toThrow(/Headers Timeout/);
+    await quick.close();
   });
 
   it('reads its settings from the environment', () => {

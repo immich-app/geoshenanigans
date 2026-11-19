@@ -11,13 +11,17 @@ interface Request {
 /**
  * A stand-in for a Bunny storage zone, enough for the state zone: PUT with Checksum validation, GET, DESCRIBE.
  * Node's HTTP parser rejects the DESCRIBE method, so this speaks one HTTP/1.1 request per connection over raw
- * sockets. `failNext` makes the next requests answer with a status (e.g. 503) without being handled.
+ * sockets. Faults:
+ * - `failNext`: the next requests answer with these statuses (e.g. 503) without being handled;
+ * - `stallNext`: that many requests are read but never answered, like a backend that accepts and then hangs;
+ * - `readBytesPerSecond`: request bodies are read no faster than this, like a slow uplink.
  */
 export async function startStateServer(zone: string, password: string) {
   const objects = new Map<string, Buffer>();
   const requests: string[] = [];
   const failNext: number[] = [];
   const sockets = new Set<Socket>();
+  const faults = { stallNext: 0, readBytesPerSecond: 0 };
 
   const handle = (request: Request): { status: number; body?: Buffer | string; type?: string } => {
     requests.push(`${request.method} ${request.path}`);
@@ -67,40 +71,55 @@ export async function startStateServer(zone: string, password: string) {
     sockets.add(socket);
     socket.on('close', () => sockets.delete(socket));
     socket.on('error', () => {});
-    let buffered = Buffer.alloc(0);
+    let head: Buffer | undefined = Buffer.alloc(0);
+    let request: Omit<Request, 'body'> | undefined;
+    const body: Buffer[] = [];
+    let bodyLength = 0;
+    let contentLength = 0;
     socket.on('data', (chunk: Buffer) => {
-      buffered = Buffer.concat([buffered, chunk]);
-      const headEnd = buffered.indexOf('\r\n\r\n');
-      if (headEnd < 0) {
+      if (faults.readBytesPerSecond > 0) {
+        socket.pause();
+        setTimeout(() => socket.resume(), (chunk.length / faults.readBytesPerSecond) * 1000);
+      }
+      if (!request) {
+        head = Buffer.concat([head!, chunk]);
+        const headEnd = head.indexOf('\r\n\r\n');
+        if (headEnd < 0) {
+          return;
+        }
+        const [requestLine, ...headerLines] = head.subarray(0, headEnd).toString('latin1').split('\r\n');
+        const headers = Object.fromEntries(
+          headerLines.map((line) => {
+            const colon = line.indexOf(':');
+            return [line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim()];
+          }),
+        );
+        const [method, target] = requestLine.split(' ');
+        request = { method, path: new URL(target, 'http://localhost').pathname, headers };
+        contentLength = Number(headers['content-length'] ?? 0);
+        chunk = head.subarray(headEnd + 4);
+        head = undefined;
+      }
+      body.push(chunk);
+      bodyLength += chunk.length;
+      if (bodyLength < contentLength) {
         return;
       }
-      const [requestLine, ...headerLines] = buffered.subarray(0, headEnd).toString('latin1').split('\r\n');
-      const headers = Object.fromEntries(
-        headerLines.map((line) => {
-          const colon = line.indexOf(':');
-          return [line.slice(0, colon).trim().toLowerCase(), line.slice(colon + 1).trim()];
-        }),
-      );
-      const length = Number(headers['content-length'] ?? 0);
-      if (buffered.length < headEnd + 4 + length) {
+      if (faults.stallNext > 0) {
+        faults.stallNext--;
+        requests.push(`${request.method} ${request.path} (stalled)`);
         return;
       }
-      const [method, target] = requestLine.split(' ');
-      const response = handle({
-        method,
-        path: new URL(target, 'http://localhost').pathname,
-        headers,
-        body: buffered.subarray(headEnd + 4, headEnd + 4 + length),
-      });
-      const body = Buffer.from(response.body ?? '');
+      const response = handle({ ...request, body: Buffer.concat(body).subarray(0, contentLength) });
+      const responseBody = Buffer.from(response.body ?? '');
       socket.end(
         Buffer.concat([
           Buffer.from(
-            `HTTP/1.1 ${response.status} Status\r\nContent-Length: ${body.length}\r\n` +
+            `HTTP/1.1 ${response.status} Status\r\nContent-Length: ${responseBody.length}\r\n` +
               (response.type ? `Content-Type: ${response.type}\r\n` : '') +
               'Connection: close\r\n\r\n',
           ),
-          body,
+          responseBody,
         ]),
       );
     });
@@ -112,6 +131,7 @@ export async function startStateServer(zone: string, password: string) {
     objects,
     requests,
     failNext,
+    faults,
     close: () =>
       new Promise<void>((resolve) => {
         for (const socket of sockets) {

@@ -15,6 +15,7 @@ const state: SyncState = {
   updatedAt: '2026-11-18T10:40:00.000Z',
   osmDate: '2026-11-17T23:59:59Z',
   positions: 1_431_655_765,
+  pending: [],
 };
 
 describe('liveStatus', () => {
@@ -74,6 +75,25 @@ describe('bunny:status', () => {
 
     const human = await status('--state-prefix', 'itest-b-1');
     expect(human.stdout).toMatch(/^live build 20261118, [\d.]+ h old \(prefix v1\)/);
+    expect(human.stdout).not.toMatch(/pending/);
+  });
+
+  it('names builds a sync started and did not finish, keeping the JSON as it is', async () => {
+    const store = new BunnyStateStore({ zone: 'immich-tiles-state', password: 'zone-password', host: server.host });
+    const pending = [
+      { build: '20261119', manifest: 'manifests/20261119.tman.zst', positions: 1, startedAt: '2026-11-19T10:00:00Z' },
+    ];
+    await writeState(store, { ...state, pending }, 'itest-b-1');
+    const human = await status('--state-prefix', 'itest-b-1');
+    expect(human.stdout).toMatch(/^pending 20261119 since 2026-11-19T10:00:00Z/m);
+    const { stdout } = await status('--json', '--state-prefix', 'itest-b-1');
+    expect(Object.keys(JSON.parse(stdout))).toEqual([
+      'liveBuild',
+      'updatedAt',
+      'osmDate',
+      'buildAgeHours',
+      'osmAgeHours',
+    ]);
   });
 
   it('exits 1 with nulls when nothing has been synced', async () => {

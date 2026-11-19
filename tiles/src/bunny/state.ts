@@ -1,17 +1,25 @@
 /**
  * Sync state in the state zone (`immich-tiles-state`): `state.json` names the live build and its manifest, kept in
- * `manifests/<build>.tman.zst` for the next day's diff. Every path can sit under a state prefix, for tests.
+ * `manifests/<build>.tman.zst` for the next day's diff, and the builds a sync started writing to the tiles zone without
+ * making them live (`pending`). Every path can sit under a state prefix, for tests.
  *
- * The store is anything with get/put/describe, such as Track A's BunnyStorage or BunnyStateStore below. The state
- * zone has no replicas, so re-uploading identical bytes is harmless there.
+ * Where no pending build differs from the live one, the tiles zone holds the live build's bytes. Where one does, a
+ * failed or killed sync may have left either build's bytes, so the next sync plans with every pending manifest
+ * (planSync in diff.ts) and checks those positions before writing them. A sync therefore:
+ * 1. reads the state and plans against the live and pending manifests;
+ * 2. calls beginBuild before uploading any tile, which records its build as pending;
+ * 3. calls publishBuild once the zone serves the build, which makes it live and clears `pending`.
+ *
+ * The store is BunnyStateStore below (MemoryObjectStore in tests). The state zone has no replicas, so re-uploading
+ * identical bytes is harmless there.
  */
 import { createHash } from 'node:crypto';
 import { createReadStream, createWriteStream } from 'node:fs';
-import { open, rename, rm } from 'node:fs/promises';
+import { readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { fetch, type Response } from 'undici';
+import { Agent, type Dispatcher } from 'undici';
 import { parseDeploymentKey, requireEnv } from '../deploy/config';
 import { readManifestHeader } from './manifest';
 
@@ -25,8 +33,19 @@ export interface ObjectStore {
   get(path: string): Promise<Uint8Array | null>;
   put(path: string, body: Uint8Array, sha256Hex: string): Promise<void>;
   describe(path: string): Promise<StoredObject | null>;
-  /** Optional streaming download, used for manifests when present; false when the object doesn't exist. */
-  getToFile?(path: string, file: string): Promise<boolean>;
+  /** Streams a file up: a planet manifest is over 1 GB, too big to hold in memory (and copies of it). */
+  putFile(path: string, file: string, sha256Hex: string): Promise<void>;
+  /** Streams an object down to a file; false when it doesn't exist. */
+  getToFile(path: string, file: string): Promise<boolean>;
+}
+
+/** A build a sync started writing to the tiles zone and hasn't made live. */
+export interface PendingBuild {
+  build: string;
+  /** Relative to the state prefix, e.g. "manifests/20261119.tman.zst". */
+  manifest: string;
+  positions: number;
+  startedAt: string;
 }
 
 export interface SyncState {
@@ -35,9 +54,12 @@ export interface SyncState {
   manifest: string;
   /** Tile prefix in the tiles zone, e.g. "v1". */
   prefix: string;
+  /** When liveBuild last changed. */
   updatedAt: string;
   osmDate: string | null;
   positions: number;
+  /** Oldest first; empty unless a sync failed after it started uploading. */
+  pending: PendingBuild[];
 }
 
 const STATE_FILE = 'state.json';
@@ -65,34 +87,49 @@ export async function sha256File(file: string): Promise<string> {
   return hash.digest('hex').toUpperCase();
 }
 
-// fs.readFile stops at 2 GiB; a planet manifest is over 1 GB, so read it in pieces.
-async function readWholeFile(file: string): Promise<Uint8Array> {
-  const handle = await open(file, 'r');
-  try {
-    const { size } = await handle.stat();
-    const bytes = Buffer.allocUnsafe(size);
-    let done = 0;
-    while (done < size) {
-      const { bytesRead } = await handle.read(bytes, done, Math.min(size - done, 1 << 30), done);
-      if (bytesRead === 0) {
-        throw new Error(`${file} shrank while reading it`);
-      }
-      done += bytesRead;
-    }
-    return bytes;
-  } finally {
-    await handle.close();
-  }
-}
-
 const isIsoDate = (value: unknown) => typeof value === 'string' && !Number.isNaN(Date.parse(value));
+
+const isPositions = (value: unknown) => Number.isSafeInteger(value) && (value as number) >= 0;
+
+function parsePending(value: unknown, liveBuild: string): PendingBuild[] | undefined {
+  if (value === undefined) {
+    return [];
+  }
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const pending: PendingBuild[] = [];
+  for (const item of value as Array<Partial<PendingBuild> | null>) {
+    if (
+      typeof item !== 'object' ||
+      item === null ||
+      typeof item.build !== 'string' ||
+      !/^\d{8}$/.test(item.build) ||
+      item.build === liveBuild ||
+      pending.some((other) => other.build === item.build) ||
+      typeof item.manifest !== 'string' ||
+      !item.manifest ||
+      !isPositions(item.positions) ||
+      !isIsoDate(item.startedAt)
+    ) {
+      return undefined;
+    }
+    pending.push({
+      build: item.build,
+      manifest: item.manifest,
+      positions: item.positions!,
+      startedAt: item.startedAt!,
+    });
+  }
+  return pending;
+}
 
 export function parseState(value: unknown): SyncState {
   const state = value as Partial<SyncState> | null;
   if (typeof state !== 'object' || state === null) {
     throw new Error('state.json is not an object');
   }
-  parseDeploymentKey('state.json liveBuild', state.liveBuild);
+  const liveBuild = parseDeploymentKey('state.json liveBuild', state.liveBuild);
   const problems: string[] = [];
   if (typeof state.manifest !== 'string' || !state.manifest) {
     problems.push('manifest');
@@ -106,19 +143,24 @@ export function parseState(value: unknown): SyncState {
   if (state.osmDate !== undefined && state.osmDate !== null && !isIsoDate(state.osmDate)) {
     problems.push('osmDate');
   }
-  if (!Number.isSafeInteger(state.positions) || (state.positions as number) < 0) {
+  if (!isPositions(state.positions)) {
     problems.push('positions');
+  }
+  const pending = parsePending(state.pending, liveBuild);
+  if (!pending) {
+    problems.push('pending');
   }
   if (problems.length > 0) {
     throw new Error(`state.json has invalid ${problems.join(', ')}`);
   }
   return {
-    liveBuild: state.liveBuild!,
+    liveBuild,
     manifest: state.manifest!,
     prefix: state.prefix!,
     updatedAt: state.updatedAt!,
     osmDate: state.osmDate ?? null,
     positions: state.positions!,
+    pending: pending!,
   };
 }
 
@@ -133,13 +175,13 @@ export async function readState(store: ObjectStore, prefix?: string): Promise<Sy
 
 export async function writeState(store: ObjectStore, state: SyncState, prefix?: string): Promise<void> {
   const body = new TextEncoder().encode(`${JSON.stringify(parseState(state), null, 2)}\n`);
-  await putVerified(store, statePath(prefix), body, sha256Hex(body));
+  await store.put(statePath(prefix), body, sha256Hex(body));
+  await checkStored(store, statePath(prefix), sha256Hex(body), body.length);
 }
 
-async function putVerified(store: ObjectStore, path: string, body: Uint8Array, sha256: string) {
-  await store.put(path, body, sha256);
+async function checkStored(store: ObjectStore, path: string, sha256: string, length: number) {
   const stored = await store.describe(path);
-  if (!stored || stored.checksum.toUpperCase() !== sha256 || stored.length !== body.length) {
+  if (!stored || stored.checksum.toUpperCase() !== sha256 || stored.length !== length) {
     throw new Error(`${path} reads back as ${stored ? `${stored.length} bytes ${stored.checksum}` : 'missing'}`);
   }
 }
@@ -163,60 +205,91 @@ export async function uploadManifest(
     throw new Error(`${file} is the manifest of ${header.buildKey}, not ${buildKey}`);
   }
   const path = manifestPath(buildKey, prefix);
-  const sha256 = await sha256File(file);
+  const [sha256, { size }] = await Promise.all([sha256File(file), stat(file)]);
   const existing = await store.describe(path);
   if (existing && existing.checksum.toUpperCase() === sha256) {
     return { path, sha256, bytes: existing.length, skipped: true };
   }
-  const body = await readWholeFile(file);
-  await putVerified(store, path, body, sha256);
-  return { path, sha256, bytes: body.length, skipped: false };
+  await store.putFile(path, file, sha256);
+  await checkStored(store, path, sha256, size);
+  return { path, sha256, bytes: size, skipped: false };
 }
 
-/** Downloads the live build's manifest to `file`, checked against the stored checksum and the state. */
+/**
+ * Downloads the manifest of the live build (given the state) or of a pending build to `file`, checked against the
+ * stored checksum and what the state says about it.
+ */
 export async function downloadManifest(
   store: ObjectStore,
-  state: SyncState,
+  build: SyncState | PendingBuild,
   file: string,
   prefix?: string,
 ): Promise<void> {
-  const path = `${statePrefix(prefix)}${state.manifest}`;
+  const buildKey = 'liveBuild' in build ? build.liveBuild : build.build;
+  const path = `${statePrefix(prefix)}${build.manifest}`;
   const stored = await store.describe(path);
   if (!stored) {
     throw new Error(`state.json names ${path}, which doesn't exist`);
   }
   const partial = `${file}.partial`;
   try {
-    if (store.getToFile) {
-      if (!(await store.getToFile(path, partial))) {
-        throw new Error(`${path} disappeared while downloading it`);
-      }
-    } else {
-      const bytes = await store.get(path);
-      if (!bytes) {
-        throw new Error(`${path} disappeared while downloading it`);
-      }
-      const handle = await open(partial, 'w');
-      try {
-        await handle.writeFile(bytes);
-      } finally {
-        await handle.close();
-      }
+    if (!(await store.getToFile(path, partial))) {
+      throw new Error(`${path} disappeared while downloading it`);
     }
     const sha256 = await sha256File(partial);
     if (sha256 !== stored.checksum.toUpperCase()) {
       throw new Error(`${path} downloaded as ${sha256}, stored as ${stored.checksum}`);
     }
     const header = await readManifestHeader(partial);
-    if (header.buildKey !== state.liveBuild || header.positions !== state.positions) {
+    if (header.buildKey !== buildKey || header.positions !== build.positions) {
       throw new Error(
-        `${path} is ${header.buildKey} with ${header.positions} positions; state.json says ${state.liveBuild} with ${state.positions}`,
+        `${path} is ${header.buildKey} with ${header.positions} positions; state.json says ${buildKey} with ${build.positions}`,
       );
     }
     await rename(partial, file);
   } finally {
     await rm(partial, { force: true });
   }
+}
+
+const sameState = (a: SyncState, b: SyncState) =>
+  a.liveBuild === b.liveBuild &&
+  a.updatedAt === b.updatedAt &&
+  a.pending.map((p) => p.build).join() === b.pending.map((p) => p.build).join();
+
+export interface BeginOptions {
+  buildKey: string;
+  manifestFile: string;
+  statePrefix?: string;
+  now?: Date;
+}
+
+/**
+ * Records a build as pending: its manifest is stored and read back, then state.json lists it while the live build
+ * stays. Call it after planning from `current` (the state you read) and before uploading any tile, so that a sync that
+ * dies part-way leaves a state saying which positions may hold this build's bytes. Running a pending build again
+ * keeps one entry for it. Fails if state.json changed since `current` was read, as the plan would be stale.
+ */
+export async function beginBuild(store: ObjectStore, current: SyncState, options: BeginOptions): Promise<SyncState> {
+  const { buildKey } = options;
+  if (current.liveBuild === buildKey) {
+    throw new Error(`${buildKey} is already live`);
+  }
+  const stored = await readState(store, options.statePrefix);
+  if (!stored || !sameState(stored, current)) {
+    throw new Error('state.json changed since the sync read it; plan again');
+  }
+  const header = await readManifestHeader(options.manifestFile);
+  await uploadManifest(store, buildKey, options.manifestFile, options.statePrefix);
+  const entry: PendingBuild = {
+    build: buildKey,
+    manifest: manifestName(buildKey),
+    positions: header.positions,
+    startedAt: (options.now ?? new Date()).toISOString(),
+  };
+  const state: SyncState = { ...current, pending: [...current.pending.filter((p) => p.build !== buildKey), entry] };
+  await writeState(store, state, options.statePrefix);
+  return state;
 }
 
 export interface PublishOptions {
@@ -232,7 +305,8 @@ export interface PublishOptions {
 
 /**
  * Makes a build live in the state: its manifest is stored and read back first, then state.json switches to it, so
- * state.json never names a manifest that isn't there.
+ * state.json never names a manifest that isn't there. `pending` is cleared: call it only once the tiles zone holds
+ * the build everywhere, i.e. after applying a plan made with every pending build of the state.
  */
 export async function publishBuild(store: ObjectStore, options: PublishOptions): Promise<SyncState> {
   const header = await readManifestHeader(options.manifestFile);
@@ -244,6 +318,7 @@ export async function publishBuild(store: ObjectStore, options: PublishOptions):
     updatedAt: (options.now ?? new Date()).toISOString(),
     osmDate: options.osmDate === undefined ? header.osmDate : options.osmDate,
     positions: header.positions,
+    pending: [],
   };
   await writeState(store, state, options.statePrefix);
   return state;
@@ -299,6 +374,18 @@ export class MemoryObjectStore implements ObjectStore {
     const body = this.objects.get(path);
     return body ? { checksum: sha256Hex(body), length: body.length } : null;
   }
+
+  async putFile(path: string, file: string, sha256: string) {
+    await this.put(path, await readFile(file), sha256);
+  }
+
+  async getToFile(path: string, file: string) {
+    const body = await this.get(path);
+    if (body) {
+      await writeFile(file, body);
+    }
+    return body !== null;
+  }
 }
 
 export interface BunnyStateStoreOptions {
@@ -306,9 +393,28 @@ export interface BunnyStateStoreOptions {
   password: string;
   /** Storage hostname (default storage.bunnycdn.com), or a base URL such as http://127.0.0.1:8080 for tests. */
   host?: string;
+  /** Tries per request (default 5), retried on network errors, timeouts, 429 and 5xx. */
   attempts?: number;
-  timeoutMs?: number;
+  /** Limit for each try of a small request (state.json, DESCRIBE), in ms. */
+  requestTimeoutMs?: number;
+  /** A manifest transfer fails when no bytes move, or no answer comes after the last one, for this long. */
+  idleTimeoutMs?: number;
+  /** Limit for each try of a whole manifest transfer, in ms. */
+  transferTimeoutMs?: number;
 }
+
+/**
+ * Small requests fail fast, so `bunny:status` gives up within about a minute (5 x 10 s plus backoff) when the zone
+ * hangs, well inside the watchdog's job limit. Transfers have no fixed length limit short of an hour, only an idle
+ * one: a 1.3 GB planet manifest took 14-18 s each way from a well-connected server, and Bunny answered its PUT half
+ * a second after the last byte.
+ */
+export const STATE_STORE_DEFAULTS = {
+  attempts: 5,
+  requestTimeoutMs: 10_000,
+  idleTimeoutMs: 60_000,
+  transferTimeoutMs: 60 * 60_000,
+};
 
 class HttpError extends Error {
   constructor(
@@ -321,13 +427,20 @@ class HttpError extends Error {
 
 const retryable = (error: unknown) => !(error instanceof HttpError) || error.status === 429 || error.status >= 500;
 
-/** A small Bunny storage client for the state zone: a few objects, retried on network errors, 429 and 5xx. */
-export class BunnyStateStore implements ObjectStore {
-  private base: string;
+const backoffMs = (attempt: number) => Math.min(15_000, 500 * 2 ** (attempt - 1)) * (0.5 + Math.random());
 
-  constructor(private options: BunnyStateStoreOptions) {
+/** A small Bunny storage client for the state zone: a few objects, the large ones streamed. */
+export class BunnyStateStore implements ObjectStore {
+  private origin: string;
+  private settings: Required<Omit<BunnyStateStoreOptions, 'host'>>;
+  private agent: Agent;
+
+  constructor(options: BunnyStateStoreOptions) {
     const host = options.host || 'storage.bunnycdn.com';
-    this.base = /^https?:\/\//.test(host) ? host.replace(/\/+$/, '') : `https://${host}`;
+    this.origin = /^https?:\/\//.test(host) ? host.replace(/\/+$/, '') : `https://${host}`;
+    const defined = Object.entries(options).filter(([, value]) => value !== undefined);
+    this.settings = { ...STATE_STORE_DEFAULTS, ...(Object.fromEntries(defined) as BunnyStateStoreOptions) };
+    this.agent = new Agent({ connect: { timeout: this.settings.requestTimeoutMs } });
   }
 
   /** BUNNY_STATE_ZONE, BUNNY_STATE_PASSWORD and optionally BUNNY_STORAGE_HOST. */
@@ -339,102 +452,134 @@ export class BunnyStateStore implements ObjectStore {
     });
   }
 
-  private url(path: string) {
-    const encoded = path.split('/').map(encodeURIComponent).join('/');
-    return `${this.base}/${encodeURIComponent(this.options.zone)}/${encoded}`;
+  close(): Promise<void> {
+    return this.agent.close();
   }
 
+  private path(path: string) {
+    return `/${encodeURIComponent(this.settings.zone)}/${path.split('/').map(encodeURIComponent).join('/')}`;
+  }
+
+  /**
+   * One request with retries. Small requests get a deadline per try; transfers an inactivity limit instead (undici's
+   * headers and body timeouts, refreshed as the body moves) plus a generous deadline.
+   */
   private async request<T>(
     method: string,
     path: string,
-    handle: (response: Response) => Promise<T>,
-    init: { body?: Uint8Array; headers?: Record<string, string>; timeoutMs?: number } = {},
+    handle: (response: Dispatcher.ResponseData) => Promise<T>,
+    init: { body?: () => Uint8Array | Readable; headers?: Record<string, string>; transfer?: boolean } = {},
   ): Promise<T> {
-    const attempts = this.options.attempts ?? 5;
+    const { attempts, requestTimeoutMs, idleTimeoutMs, transferTimeoutMs } = this.settings;
+    const idle = init.transfer ? idleTimeoutMs : requestTimeoutMs;
     for (let attempt = 1; ; attempt++) {
+      const body = init.body?.();
       try {
-        const response = await fetch(this.url(path), {
+        const response = await this.agent.request({
+          origin: this.origin,
+          path: this.path(path),
           method,
-          headers: { AccessKey: this.options.password, ...init.headers },
-          body: init.body,
-          signal: AbortSignal.timeout(init.timeoutMs ?? this.options.timeoutMs ?? 30 * 60_000),
+          headers: { AccessKey: this.settings.password, ...init.headers },
+          body,
+          signal: AbortSignal.timeout(init.transfer ? transferTimeoutMs : requestTimeoutMs),
+          headersTimeout: idle,
+          bodyTimeout: idle,
         });
         try {
           return await handle(response);
         } finally {
-          if (!response.bodyUsed) {
-            await response.body?.cancel();
-          }
+          // Reads what is left of a small answer (or drops the connection), without an unhandled error event.
+          await response.body.dump().catch(() => {});
         }
       } catch (error) {
         if (attempt >= attempts || !retryable(error)) {
           throw error;
         }
-        await sleep(Math.min(15_000, 500 * 2 ** (attempt - 1)) * (0.5 + Math.random()));
+        await sleep(backoffMs(attempt));
+      } finally {
+        if (body instanceof Readable) {
+          body.destroy();
+        }
       }
     }
   }
 
-  private static fail(method: string, path: string, response: Response): never {
-    throw new HttpError(`${method} ${path}: ${response.status} ${response.statusText}`, response.status);
+  private static fail(method: string, path: string, response: Dispatcher.ResponseData): never {
+    throw new HttpError(`${method} ${path}: ${response.statusCode}`, response.statusCode);
   }
 
   get(path: string): Promise<Uint8Array | null> {
     return this.request('GET', path, async (response) => {
-      if (response.status === 404) {
+      if (response.statusCode === 404) {
         return null;
       }
-      if (response.status !== 200) {
+      if (response.statusCode !== 200) {
         BunnyStateStore.fail('GET', path, response);
       }
-      return new Uint8Array(await response.arrayBuffer());
+      return new Uint8Array(await response.body.arrayBuffer());
     });
   }
 
   getToFile(path: string, file: string): Promise<boolean> {
-    return this.request('GET', path, async (response) => {
-      if (response.status === 404) {
-        return false;
+    return this.request(
+      'GET',
+      path,
+      async (response) => {
+        if (response.statusCode === 404) {
+          return false;
+        }
+        if (response.statusCode !== 200) {
+          BunnyStateStore.fail('GET', path, response);
+        }
+        await pipeline(response.body, createWriteStream(file));
+        return true;
+      },
+      { transfer: true },
+    );
+  }
+
+  private static expectStored(path: string) {
+    return async (response: Dispatcher.ResponseData) => {
+      if (response.statusCode !== 201 && response.statusCode !== 200) {
+        BunnyStateStore.fail('PUT', path, response);
       }
-      if (response.status !== 200 || !response.body) {
-        BunnyStateStore.fail('GET', path, response);
-      }
-      await pipeline(Readable.fromWeb(response.body), createWriteStream(file));
-      return true;
-    });
+    };
   }
 
   put(path: string, body: Uint8Array, sha256: string): Promise<void> {
-    return this.request(
-      'PUT',
-      path,
-      async (response) => {
-        if (response.status !== 201 && response.status !== 200) {
-          BunnyStateStore.fail('PUT', path, response);
-        }
+    return this.request('PUT', path, BunnyStateStore.expectStored(path), {
+      body: () => body,
+      headers: { Checksum: sha256.toUpperCase(), 'Content-Type': 'application/octet-stream' },
+    });
+  }
+
+  /** Read in 1 MB pieces with an explicit length, so memory stays flat and each write keeps the request alive. */
+  async putFile(path: string, file: string, sha256: string): Promise<void> {
+    const { size } = await stat(file);
+    return this.request('PUT', path, BunnyStateStore.expectStored(path), {
+      body: () => createReadStream(file, { highWaterMark: 1 << 20 }),
+      headers: {
+        Checksum: sha256.toUpperCase(),
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': String(size),
       },
-      { body, headers: { Checksum: sha256.toUpperCase(), 'Content-Type': 'application/octet-stream' } },
-    );
+      transfer: true,
+    });
   }
 
   describe(path: string): Promise<StoredObject | null> {
-    return this.request(
-      'DESCRIBE',
-      path,
-      async (response) => {
-        if (response.status === 404) {
-          return null;
-        }
-        if (response.status !== 200) {
-          BunnyStateStore.fail('DESCRIBE', path, response);
-        }
-        const object = (await response.json()) as { Checksum?: string; Length?: number; IsDirectory?: boolean };
-        if (object.IsDirectory || typeof object.Checksum !== 'string' || typeof object.Length !== 'number') {
-          throw new Error(`DESCRIBE ${path}: unexpected answer`);
-        }
-        return { checksum: object.Checksum.toUpperCase(), length: object.Length };
-      },
-      { timeoutMs: 60_000 },
-    );
+    return this.request('DESCRIBE', path, async (response) => {
+      if (response.statusCode === 404) {
+        return null;
+      }
+      if (response.statusCode !== 200) {
+        BunnyStateStore.fail('DESCRIBE', path, response);
+      }
+      const object = (await response.body.json()) as { Checksum?: string; Length?: number; IsDirectory?: boolean };
+      if (object.IsDirectory || typeof object.Checksum !== 'string' || typeof object.Length !== 'number') {
+        throw new Error(`DESCRIBE ${path}: unexpected answer`);
+      }
+      return { checksum: object.Checksum.toUpperCase(), length: object.Length };
+    });
   }
 }

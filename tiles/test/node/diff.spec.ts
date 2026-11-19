@@ -1,5 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { changedTiles, DiffKind, diffManifests, DiffRange, DiffTotals, zoomOf } from '../../src/bunny/diff';
+import {
+  changedTiles,
+  DiffKind,
+  diffManifests,
+  DiffRange,
+  DiffTotals,
+  planSync,
+  SyncRange,
+  zoomOf,
+} from '../../src/bunny/diff';
 import { buildManifest, writeManifest } from '../../src/bunny/manifest';
 import { openArchiveFile } from '../../src/deploy/archive-file';
 import { zxyToTileId } from '../../src/pmtiles/utils';
@@ -261,7 +270,12 @@ describe('changedTiles', () => {
       .flatMap((range) => Array.from({ length: range.count }, (_, i) => range.start + i))
       .map((tileId) => {
         const content = newBuild.contents[tileId - newBuild.base]!;
-        return { tileId, offset: archive.offsets[tileId - newBuild.base], length: contentBytes(content).length };
+        return {
+          tileId,
+          offset: archive.offsets[tileId - newBuild.base],
+          length: contentBytes(content).length,
+          verify: false,
+        };
       });
     expect(tiles.length).toBeGreaterThan(0);
     expect(tiles).toEqual(expected);
@@ -277,5 +291,237 @@ describe('changedTiles', () => {
       }
     };
     await expect(iterate()).rejects.toThrow(/Tile 2 is not in the archive/);
+  });
+});
+
+const hashAt = (build: Build, tileId: number) => {
+  const content = build.contents[tileId - build.base];
+  return content === null || content === undefined ? null : contentHash(content);
+};
+
+/** The plan by brute force, position by position (see SyncPlan). */
+function bruteForcePlan(live: Build, next: Build, pending: Build[]) {
+  const builds = [live, next, ...pending];
+  const first = Math.min(...builds.map((b) => b.base));
+  const last = Math.max(...builds.map((b) => b.base + b.contents.length));
+  const ranges: SyncRange[] = [];
+  let verify = 0;
+  let verifyOnly = 0;
+  for (let tileId = first; tileId < last; tileId++) {
+    const before = hashAt(live, tileId);
+    const after = hashAt(next, tileId);
+    const listed = before !== after;
+    const touched = pending.some((build) => hashAt(build, tileId) !== before);
+    if (!listed && !touched) {
+      continue;
+    }
+    let kind: DiffKind;
+    if (listed) {
+      kind = before === null ? 'added' : after === null ? 'removed' : 'changed';
+    } else {
+      kind = before === null ? 'removed' : 'changed';
+      verifyOnly++;
+    }
+    if (touched) {
+      verify++;
+    }
+    const previous = ranges[ranges.length - 1];
+    if (
+      previous &&
+      previous.kind === kind &&
+      previous.verify === touched &&
+      previous.start + previous.count === tileId
+    ) {
+      previous.count++;
+    } else {
+      ranges.push({ start: tileId, count: 1, kind, verify: touched });
+    }
+  }
+  return { ranges, verify, verifyOnly };
+}
+
+async function runPlan(livePath: string, newPath: string, pendingPaths: string[]) {
+  const plan = await planSync(livePath, newPath, pendingPaths);
+  const ranges: SyncRange[] = [];
+  for await (const range of plan) {
+    ranges.push(range);
+  }
+  return { ranges, totals: plan.totals };
+}
+
+/** Writes a build's manifest under a fresh name. */
+let manifestCount = 0;
+async function manifestOf(build: Build, buildKey: string) {
+  const path = scratch.path(`m${manifestCount++}.tman.zst`);
+  await writeManifest(path, { buildKey }, expectedEntries(build));
+  return path;
+}
+
+/**
+ * A tiles zone: the content hash per position. Writes follow the uploader's rules: a `verify` position is DESCRIBEd
+ * first and only written when it holds other bytes; any PUT of the bytes already there is counted, since on Bunny it
+ * clears the file's replica list for good.
+ */
+class Zone {
+  files = new Map<number, string>();
+  identicalPuts = 0;
+  writes = 0;
+
+  static of(build: Build) {
+    const zone = new Zone();
+    build.contents.forEach((_, i) => {
+      const hash = hashAt(build, build.base + i);
+      if (hash !== null) {
+        zone.files.set(build.base + i, hash);
+      }
+    });
+    return zone;
+  }
+
+  apply(range: SyncRange, tileId: number, build: Build) {
+    const want = range.kind === 'removed' ? null : hashAt(build, tileId);
+    const have = this.files.get(tileId) ?? null;
+    if (range.verify && have === want) {
+      return;
+    }
+    if (want === null) {
+      this.files.delete(tileId);
+    } else {
+      if (have === want) {
+        this.identicalPuts++;
+      }
+      this.files.set(tileId, want);
+    }
+    this.writes++;
+  }
+
+  /** Positions where the zone doesn't hold the build. */
+  stale(build: Build) {
+    const expected = Zone.of(build).files;
+    const positions = new Set([...expected.keys(), ...this.files.keys()]);
+    return [...positions].filter((p) => expected.get(p) !== this.files.get(p)).length;
+  }
+}
+
+describe('planSync', () => {
+  it('is the plain diff without pending builds', async () => {
+    const r = rng(11);
+    const live = randomBuild(r, 1200, 85, 0.02);
+    const next = mutateBuild(r, live, 0.02);
+    const [livePath, newPath] = [await manifestOf(live, '20261117'), await manifestOf(next, '20261118')];
+    const plan = await runPlan(livePath, newPath, []);
+    const diff = await runDiff(livePath, newPath);
+    expect(plan.ranges).toEqual(diff.ranges.map((range) => ({ ...range, verify: false })));
+    expect(plan.totals).toMatchObject({ diff: diff.totals, pendingBuilds: [], verify: 0, verifyOnly: 0 });
+  });
+
+  it('matches a per-position plan with pending builds (property test)', async () => {
+    for (let seed = 1; seed <= 150; seed++) {
+      const r = rng(5000 + seed);
+      const gapChance = r.chance(0.3) ? 0.05 : 0;
+      const live = straddling(r, r.int(1, 1200), gapChance);
+      const pending = Array.from({ length: r.int(1, 3) }, () => mutateBuild(r, live, gapChance));
+      // A re-run plans with the new build among the pending ones.
+      const next = r.chance(0.2) ? pending[pending.length - 1] : mutateBuild(r, pending[0], gapChance);
+      if (r.chance(0.15)) {
+        pending[0] = { base: pending[0].base + r.int(0, 20), contents: [...pending[0].contents, 0, 3, 3] };
+      }
+      const livePath = await manifestOf(live, '20261117');
+      const newPath = await manifestOf(next, '20261121');
+      const pendingPaths = [];
+      for (const [i, build] of pending.entries()) {
+        pendingPaths.push(await manifestOf(build, `202611${18 + i}`));
+      }
+      const result = await runPlan(livePath, newPath, pendingPaths);
+      const expected = bruteForcePlan(live, next, pending);
+      try {
+        expect(result.ranges).toEqual(expected.ranges);
+        expect(result.totals).toMatchObject({
+          verify: expected.verify,
+          verifyOnly: expected.verifyOnly,
+          ranges: expected.ranges.length,
+          pendingBuilds: pending.map((_, i) => `202611${18 + i}`),
+        });
+        expectMatches({ ranges: (await runDiff(livePath, newPath)).ranges, totals: result.totals.diff }, live, next);
+      } catch (error) {
+        throw new Error(`seed ${seed}: ${error instanceof Error ? error.message : String(error)}`, { cause: error });
+      }
+    }
+  });
+
+  /**
+   * Days of syncs, some dying part-way (after a random share of their writes, or with random writes lost), against
+   * a model of the zone. `track` is what state.json does: false plans every day with the plain live-to-new diff.
+   */
+  async function simulate(seed: number, track: boolean) {
+    const r = rng(seed);
+    let live = randomBuild(r, r.int(100, 700), 341, 0.02);
+    let livePath = await manifestOf(live, '20261101');
+    const zone = Zone.of(live);
+    let pending: { build: Build; path: string }[] = [];
+    let stale = 0;
+    let previous = live;
+    for (let day = 2; day <= 9; day++) {
+      // Edits revert: a day's build often goes back to an earlier day's bytes in places.
+      const build = r.chance(0.4) ? mutateBuild(r, live, 0.02) : mutateBuild(r, previous, 0.02);
+      previous = build;
+      const path = await manifestOf(build, `202611${String(day).padStart(2, '0')}`);
+      const plan = await runPlan(livePath, path, track ? pending.map((p) => p.path) : []);
+      if (track) {
+        pending.push({ build, path });
+      }
+      const positions = plan.ranges.flatMap((range) =>
+        Array.from({ length: range.count }, (_, i) => ({ range, tileId: range.start + i })),
+      );
+      const fails = day < 9 && r.chance(0.6);
+      const stopAt = fails && r.chance(0.5) ? r.int(0, positions.length) : positions.length;
+      const lose = fails && stopAt === positions.length ? 0.3 : 0;
+      for (const { range, tileId } of positions.slice(0, stopAt)) {
+        if (!r.chance(lose)) {
+          zone.apply(range, tileId, build);
+        }
+      }
+      if (!fails) {
+        live = build;
+        livePath = path;
+        pending = [];
+        stale += zone.stale(live);
+      }
+    }
+    return { stale, identicalPuts: zone.identicalPuts };
+  }
+
+  it('brings the zone to the live build after failed syncs without re-sending identical bytes (simulation)', async () => {
+    let plainStale = 0;
+    let plainIdentical = 0;
+    for (let seed = 1; seed <= 40; seed++) {
+      const tracked = await simulate(9000 + seed, true);
+      expect(tracked, `seed ${seed}`).toEqual({ stale: 0, identicalPuts: 0 });
+      const plain = await simulate(9000 + seed, false);
+      plainStale += plain.stale;
+      plainIdentical += plain.identicalPuts;
+    }
+    // Planning with the live manifest alone, as before pending builds were recorded, gets both wrong.
+    expect(plainStale).toBeGreaterThan(0);
+    expect(plainIdentical).toBeGreaterThan(0);
+  });
+
+  it('marks the positions a plan must check in changedTiles', async () => {
+    const entries = (async function* () {
+      yield [{ tileId: 0, offset: 0, length: 5, runLength: 10, chunkId: 0 }];
+    })();
+    const tiles = [];
+    for await (const tile of changedTiles(entries, [
+      { start: 1, count: 2, kind: 'changed', verify: true },
+      { start: 3, count: 1, kind: 'removed', verify: true },
+      { start: 4, count: 1, kind: 'added', verify: false },
+    ])) {
+      tiles.push([tile.tileId, tile.verify]);
+    }
+    expect(tiles).toEqual([
+      [1, true],
+      [2, true],
+      [4, false],
+    ]);
   });
 });
