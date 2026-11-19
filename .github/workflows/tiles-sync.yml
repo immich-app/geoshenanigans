@@ -21,6 +21,9 @@ name: Tiles Sync
 # TILES_SYNC_REGIONS, lists fewer ("none" checks storage only): for when the account's replication queue is known
 # to be backed up (after a seed, see deployment/modules/bunny/tiles/README.md) and serving changed tiles from
 # Frankfurt until they replicate is acceptable.
+#
+# Every job resolves production credentials (a dry run reads the live state too), so the workflow runs main's code
+# only: the schedule, and dispatches from main, dry runs included. A dispatch from another branch fails at once.
 
 on:
   schedule:
@@ -60,10 +63,10 @@ permissions: {}
 
 # Two syncs must never write the zone at once; a run queues behind the one in flight. GitHub keeps one pending run
 # per group: a run queued behind a pending one cancels it before it starts (and it reports nothing), so a dispatch
-# made while a sync runs replaces the next scheduled run, or is replaced by it. Dry runs write nothing and get a
-# group of their own, so they never cancel a real run.
+# made while a sync runs replaces the next scheduled run, or is replaced by it. Dry runs write nothing, and a
+# dispatch from another branch only refuses: both get a group of their own, so they never cancel a real run.
 concurrency:
-  group: ${{ inputs.dry_run && format('tiles-sync-dry-run-{0}', github.run_id) || 'tiles-sync' }}
+  group: ${{ (inputs.dry_run || github.ref != 'refs/heads/main') && format('tiles-sync-solo-{0}', github.run_id) || 'tiles-sync' }}
   cancel-in-progress: false
 
 env:
@@ -77,11 +80,23 @@ env:
   O11Y_URL: https://vmauth.futostatus.com
 
 jobs:
+  main-only:
+    name: Refuse another branch
+    if: github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Refuse
+        run: |
+          echo "::error::Tiles Sync reads production credentials and runs from main only, dry runs included"
+          exit 1
+
   resolve:
     name: Resolve build
     runs-on: ubuntu-latest
-    # A sync writes production, so it runs main's code; a dry run may try a branch.
-    if: github.ref == 'refs/heads/main' || inputs.dry_run
+    # Main's code only, dry runs included: the live-state read below runs with the production service account.
+    if: github.ref == 'refs/heads/main'
     timeout-minutes: 15
     permissions:
       contents: read
@@ -189,7 +204,7 @@ jobs:
   sync:
     name: Sync ${{ needs.resolve.outputs.key }}
     needs: resolve
-    if: needs.resolve.outputs.action == 'sync'
+    if: github.ref == 'refs/heads/main' && needs.resolve.outputs.action == 'sync'
     runs-on: ${{ inputs.runner || 'pokedex-huge' }}
     # The budget Decide picked: long enough for the largest diff its guard rail lets through (tiles_sync_report.py).
     timeout-minutes: ${{ fromJSON(needs.resolve.outputs.job_timeout_min) }}
@@ -314,8 +329,8 @@ jobs:
           NODE_OPTIONS: --max-old-space-size=8192
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
           BUNNY_STATE_PASSWORD: op://tf_prod/BUNNY_STATE_PASSWORD/password
-          # A dry run (perhaps a branch's code) reads the state zone only: no tiles zone password, purge key or pull
-          # zone, so a dry run that isn't one cannot write or purge production.
+          # A dry run reads the state zone only: no tiles zone password, purge key or pull zone, so a dry run that
+          # isn't one cannot write or purge production.
           BUNNY_STORAGE_PASSWORD: ${{ !inputs.dry_run && 'op://tf_prod/BUNNY_STORAGE_PASSWORD/password' || '' }}
           BUNNY_API_KEY: ${{ !inputs.dry_run && 'op://tf_prod/BUNNY_API_KEY/password' || '' }}
           BUNNY_PULL_ZONE_ID: ${{ !inputs.dry_run && 'op://tf_prod/BUNNY_PULL_ZONE_ID/password' || '' }}

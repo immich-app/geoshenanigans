@@ -10,6 +10,9 @@ name: Tiles Sync Watchdog
 # gate only sees the files a sync changed, so a file lost, overwritten or never replicated elsewhere is found here.
 # bunny:replication --live DESCRIBEs a sample per zoom and compares each Checksum with the live manifest's hash;
 # geoshenanigans-tiles-sample-wrong and -sample-unreplicated read what it reports.
+#
+# Both jobs resolve production credentials (the sample job the tiles zone's read-write password), so they run
+# main's code only: the schedule, and dispatches from main. A dispatch from another branch fails at once.
 
 on:
   schedule:
@@ -21,15 +24,28 @@ on:
 permissions: {}
 
 # The newer invocation replaces an older one still running (e.g. a manual dispatch during the cron run); the daily
-# sample check has a group of its own.
+# sample check has a group of its own, and so does a dispatch from another branch, which only refuses and must not
+# cancel main's run.
 concurrency:
-  group: tiles-sync-watchdog-${{ github.event.schedule == '53 4 * * *' && 'sample' || 'report' }}
+  group: tiles-sync-watchdog-${{ github.ref != 'refs/heads/main' && github.run_id || github.event.schedule == '53 4 * * *' && 'sample' || 'report' }}
   cancel-in-progress: true
 
 jobs:
+  main-only:
+    name: Refuse another branch
+    if: github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Refuse
+        run: |
+          echo "::error::Tiles Sync Watchdog reads production credentials and runs from main only"
+          exit 1
+
   report:
     name: Report the live build
-    if: github.event.schedule != '53 4 * * *'
+    if: github.ref == 'refs/heads/main' && github.event.schedule != '53 4 * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -77,8 +93,7 @@ jobs:
           python3 ../deployment/scripts/tiles_sync_report.py live-state --status "$RUNNER_TEMP/status.json" \
             --status-exit "$code" --status-stderr "$RUNNER_TEMP/status.err"
 
-      # Reporting never fails the run; a branch's dispatch only prints what it would send. The token is read here
-      # and handed to the report alone.
+      # Reporting never fails the run. The token is read here and handed to the report alone.
       - name: Report to o11y
         continue-on-error: true
         timeout-minutes: 5
@@ -87,10 +102,6 @@ jobs:
           STATUS_EXIT: ${{ steps.status.outputs.exit_code }}
         run: |
           args=(watchdog --status "$RUNNER_TEMP/status.json" --status-exit "$STATUS_EXIT" --stderr "$RUNNER_TEMP/status.err")
-          if [ "$GITHUB_REF" != refs/heads/main ]; then
-            python3 deployment/scripts/tiles_sync_report.py "${args[@]}" --dry-run
-            exit 0
-          fi
           if ! token=$(op read "op://tf_prod/O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD/password"); then
             echo "::warning::Could not read the o11y token from 1Password; reporting nothing"
             exit 0
@@ -106,7 +117,7 @@ jobs:
 
   sample:
     name: Check a sample in every region
-    if: github.event.schedule == '53 4 * * *' || github.event_name == 'workflow_dispatch'
+    if: github.ref == 'refs/heads/main' && (github.event.schedule == '53 4 * * *' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -135,7 +146,9 @@ jobs:
 
       # 100 random positions of each zoom (every position of zooms 0-3), DESCRIBEd at 8 connections per storage
       # address, beside a sync or seed. The live manifest (~1.3 GB) goes to the runner's temporary directory. Exit 1
-      # (missing or other bytes) and 2 (not yet in every region) are findings, reported below like a clean 0.
+      # (missing or other bytes) and 2 (not yet in every region) are findings, reported below like a clean 0, but
+      # only with the report that says so: an error before the check (reading the state or the live manifest,
+      # say) also exits 1, and writes none.
       - name: Check the sample
         id: check
         continue-on-error: true
@@ -152,7 +165,7 @@ jobs:
           code=$?
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           tail -c 3000 "$RUNNER_TEMP/check.err" >&2
-          [ "$code" -le 2 ]
+          [ "$code" -le 2 ] && jq -e 'type == "object" and (has("checked") or has("skipped"))' "$RUNNER_TEMP/check.json" > /dev/null
 
       - name: Report to o11y
         continue-on-error: true
@@ -162,10 +175,6 @@ jobs:
           CHECK_EXIT: ${{ steps.check.outputs.exit_code }}
         run: |
           args=(sample --report "$RUNNER_TEMP/check.json" --exit "$CHECK_EXIT" --stderr "$RUNNER_TEMP/check.err")
-          if [ "$GITHUB_REF" != refs/heads/main ]; then
-            python3 deployment/scripts/tiles_sync_report.py "${args[@]}" --dry-run
-            exit 0
-          fi
           if ! token=$(op read "op://tf_prod/O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD/password"); then
             echo "::warning::Could not read the o11y token from 1Password; reporting nothing"
             exit 0
