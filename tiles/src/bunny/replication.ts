@@ -3,7 +3,7 @@
  * main region is elsewhere. Each stored file reports its SHA-256 and the replica regions holding it.
  */
 import { setTimeout as sleep } from 'node:timers/promises';
-import { BunnyStorage, StorageObject } from './storage';
+import { BunnyStorage, StorageError, StorageObject } from './storage';
 import { tileIdZoom } from './tile-id';
 
 /** The tiles zone's replica regions (the main region, DE, is not listed in ReplicatedZones). */
@@ -51,7 +51,10 @@ export function classify(
   return { state: missingRegions.length === 0 ? 'replicated' : 'partial', missingRegions };
 }
 
-/** Runs `fn` over every item with at most `concurrency` at once, pulling lazily from the source. */
+/**
+ * Runs `fn` over every item with at most `concurrency` at once, pulling lazily from the source. The first error
+ * stops taking items and is thrown once the calls in flight are done.
+ */
 export async function forEachLimit<T>(
   source: AsyncIterable<T> | Iterable<T>,
   concurrency: number,
@@ -60,17 +63,30 @@ export async function forEachLimit<T>(
 ): Promise<void> {
   const iterator =
     Symbol.asyncIterator in source ? source[Symbol.asyncIterator]() : (source as Iterable<T>)[Symbol.iterator]();
+  let failed = false;
   const runner = async () => {
-    while (!signal?.aborted) {
+    while (!failed && !signal?.aborted) {
       const next = await iterator.next();
       if (next.done) {
         return;
       }
-      await fn(next.value);
+      try {
+        await fn(next.value);
+      } catch (error) {
+        failed = true;
+        throw error;
+      }
     }
   };
-  await Promise.all(Array.from({ length: Math.max(1, concurrency) }, runner));
+  const results = await Promise.allSettled(Array.from({ length: Math.max(1, concurrency) }, runner));
+  const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+  if (rejected) {
+    throw rejected.reason;
+  }
 }
+
+/** Errors no retry or later pass can get past: a refused password or zone, or a stopped or closed client. */
+const isFinal = (error: unknown) => error instanceof StorageError && (error.fatal || error.stopped);
 
 export interface ReplicationResult {
   /** Every file is stored with the expected bytes and held by every region. */
@@ -109,7 +125,8 @@ export interface WaitOptions {
 /**
  * The replication gate: DESCRIBEs every file, then again only the files some region still lacks, until every region
  * holds every file or the timeout passes. A missing or mismatched file fails the gate at once (it would never
- * replicate the expected bytes) but the others are still followed, for the per-region wait times.
+ * replicate the expected bytes) but the others are still followed, for the per-region wait times. A DESCRIBE that
+ * fails after its retries leaves its file pending; a refused password ends the gate with that error at once.
  */
 export async function waitForReplication(
   storage: BunnyStorage,
@@ -140,7 +157,10 @@ export async function waitForReplication(
         let object: StorageObject | null;
         try {
           object = await storage.describe(item.path);
-        } catch {
+        } catch (error) {
+          if (isFinal(error)) {
+            throw error;
+          }
           errors++;
           return;
         }
@@ -258,7 +278,10 @@ export async function checkReplication(
       let object: StorageObject | null;
       try {
         object = await storage.describe(item.path);
-      } catch {
+      } catch (error) {
+        if (isFinal(error)) {
+          throw error;
+        }
         tallies.forEach((tally) => (tally.checked++, tally.errors++));
         note(report.errorPaths, item.path);
         return;

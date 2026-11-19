@@ -175,4 +175,117 @@ describe('BunnyStorage', () => {
     expect(fake.maxInFlight).toBeLessThanOrEqual(8);
     expect([...fake.hostHeaders]).toEqual([`storage.example.test:${fake.port}`]);
   });
+
+  // undici's headers timeout ticks at about 1 s, so the 150 ms timeout fires within 0.15-1.5 s, before the late commit.
+  it('treats a commit that lands after a timeout as stored when it settles first', async () => {
+    const { fake, storage } = await setup(
+      { fault: failFirst('late-store'), lateStoreMs: 2_000 },
+      { timeoutMs: 150, retry: { ...fast, settleMs: 500 } },
+    );
+    await storage.put('a.mvt', bytes('a'), sha256Hex(bytes('a')));
+    expect(fake.requests).toEqual({ PUT: 1, DESCRIBE: 1 });
+    expect(storage.counters.ambiguousStored).toBe(1);
+    expect(fake.identicalReputs).toEqual([]);
+  });
+
+  it('without a settle wait, a late commit turns the retry into an identical re-PUT (the hazard settleMs guards)', async () => {
+    const { fake, storage } = await setup(
+      { fault: failFirst('late-store'), lateStoreMs: 2_000 },
+      { timeoutMs: 150, retry: { ...fast, settleMs: 0 } },
+    );
+    await storage.put('a.mvt', bytes('a'), sha256Hex(bytes('a')));
+    await new Promise((resolve) => setTimeout(resolve, 2_500));
+    expect(fake.identicalReputs).toEqual(['a.mvt']);
+  });
+
+  describe('with one bad storage address', () => {
+    const many = (count: number) => Array.from({ length: count }, (_, i) => [`f${i}.mvt`, bytes(`file ${i}`)] as const);
+
+    async function badAddress(fakeOptions: FakeStorageOptions, listen: string[], pinned: string[]) {
+      const fake = await FakeStorage.start({ addresses: listen, latencyMs: 20, ...fakeOptions });
+      fakes.push(fake);
+      const storage = new BunnyStorage({
+        zone: fake.zone,
+        password: fake.password,
+        host: `http://127.0.0.1:${fake.port}`,
+        addresses: pinned,
+        concurrency: 30,
+        timeoutMs: 2_000,
+        retry: { ...fast, maxAttempts: 4 },
+      });
+      clients.push(storage);
+      const results = await Promise.allSettled(
+        many(600).map(([path, body]) => storage.put(path, body, sha256Hex(body))),
+      );
+      const failed = results.filter((result) => result.status === 'rejected');
+      return { fake, storage, failed };
+    }
+
+    it('stops sending to an address that refuses connections, and never DESCRIBEs for a request it did not send', async () => {
+      const { fake, storage, failed } = await badAddress(
+        {},
+        ['127.0.0.1', '127.0.0.2'],
+        ['127.0.0.1', '127.0.0.2', '127.0.0.3'],
+      );
+      expect(failed).toEqual([]);
+      expect(fake.files.size).toBe(600);
+      expect(storage.counters.networkErrors / storage.counters.requests).toBeLessThan(0.1);
+      expect(fake.requests.DESCRIBE ?? 0).toBe(0);
+      expect(fake.identicalReputs).toEqual([]);
+    });
+
+    it.each<Fault>(['server-error', 'rate-limit'])(
+      'stops sending to an address that answers %s at once',
+      async (fault) => {
+        const { fake, failed } = await badAddress(
+          { fault: ({ address }) => (address === '127.0.0.3' ? fault : undefined) },
+          ['127.0.0.1', '127.0.0.2', '127.0.0.3'],
+          ['127.0.0.1', '127.0.0.2', '127.0.0.3'],
+        );
+        expect(failed).toEqual([]);
+        expect(fake.files.size).toBe(600);
+        const total = [...fake.requestsByAddress.values()].reduce((a, b) => a + b);
+        expect(fake.requestsByAddress.get('127.0.0.3')! / total).toBeLessThan(0.15);
+        expect(fake.identicalReputs).toEqual([]);
+      },
+    );
+
+    it('DESCRIBEs after an ambiguous failure through another address', async () => {
+      const seen: string[] = [];
+      const fake = await FakeStorage.start({
+        addresses: ['127.0.0.1', '127.0.0.2'],
+        fault: failFirst('stored-server-error'),
+        onRequest: ({ method, address }) => seen.push(`${method} ${address}`),
+      });
+      fakes.push(fake);
+      const storage = new BunnyStorage({
+        zone: fake.zone,
+        password: fake.password,
+        host: fake.url,
+        addresses: ['127.0.0.1', '127.0.0.2'],
+        retry: fast,
+      });
+      clients.push(storage);
+      await storage.put('a.mvt', bytes('a'), sha256Hex(bytes('a')));
+      expect(seen).toHaveLength(2);
+      expect(seen[1].split(' ')[1]).not.toBe(seen[0].split(' ')[1]);
+    });
+  });
+
+  it('stops backing off when its signal aborts', async () => {
+    const controller = new AbortController();
+    const { storage } = await setup(
+      { fault: failFirst('rate-limit', 1_000) },
+      {
+        signal: controller.signal,
+        retry: { ...fast, baseDelayMs: 5_000, maxDelayMs: 5_000, maxRateLimitWaitMs: 60_000 },
+      },
+    );
+    const started = performance.now();
+    setTimeout(() => controller.abort(), 50);
+    const error = await storage.put('a.mvt', bytes('a'), sha256Hex(bytes('a'))).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(StorageError);
+    expect((error as StorageError).stopped).toBe(true);
+    expect(performance.now() - started).toBeLessThan(1_000);
+  });
 });

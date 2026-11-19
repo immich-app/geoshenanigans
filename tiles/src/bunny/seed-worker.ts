@@ -1,7 +1,8 @@
 /**
  * Seed worker thread: takes chunk descriptors from the main thread, reads each run's tile bytes from the archive with
  * pread (once per run, small repeated tiles such as the ocean once per worker), and uploads every position of the
- * run through its own storage client. Reports a chunk done only when every position in it is stored.
+ * run through its own storage client. Reports when every position of a chunk was handed out (so the main thread
+ * sends the next one even while a few slow files of it are in flight) and when every position in it is stored.
  */
 import { closeSync, openSync, readSync } from 'node:fs';
 import { parentPort, workerData } from 'node:worker_threads';
@@ -125,12 +126,14 @@ async function* items(): AsyncGenerator<SeedItem> {
       }
     }
     state.emittedAll = true;
+    post({ type: 'chunk-emitted', chunkId: chunk.chunkId });
     finish(state);
   }
 }
 
 async function main() {
-  const storage = new BunnyStorage(config.storage);
+  // The stop also ends retry back-offs, so a stop is not held up by a file waiting out 429s.
+  const storage = new BunnyStorage({ ...config.storage, signal: stop.signal });
   const stats = newUploadStats();
   const snapshot = (): { stats: typeof stats; counters: StorageCounters } => ({
     stats: { ...stats, failures: [] },

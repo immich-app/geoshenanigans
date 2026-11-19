@@ -4,16 +4,17 @@
  * mismatches, with the expected SHA-256 recomputed from the archive.
  *
  *   npm run bunny:replication -- --archive <path> [--prefix v1] [--min-zoom Z --max-zoom Z | --from-id N --to-id M]
- *     [--sample N [--per-zoom] [--seed S]] [--regions UK,SE,...] [--concurrency 256]
+ *     [--sample N [--per-zoom] [--seed S]] [--regions UK,SE,...] [--concurrency 256] [--addresses ip,ip,...]
  *     [--wait [--timeout-min 120] [--interval-s 30]] [--json <path>] [--list 100]
  *
  * Without --sample every position of the range is checked, streamed (zooms default to the archive's). --per-zoom takes
  * N positions from each zoom instead of N overall. --wait polls until every region holds every file (the replication
  * gate) instead of checking once; it keeps the file list in memory, so use it for samples or small ranges.
  * Needs BUNNY_STORAGE_ZONE and BUNNY_STORAGE_PASSWORD (and BUNNY_STORAGE_HOST unless it is storage.bunnycdn.com).
+ * --addresses (or BUNNY_STORAGE_ADDRESSES) pins the storage IPs instead of resolving the host.
  * The report goes to stdout as JSON (and to --json), a summary to stderr.
  * Exit codes: 0 everything stored and on every region, 2 stored but not yet on every region, 1 missing or
- * mismatched files or DESCRIBE errors, 3 bad arguments.
+ * mismatched files, DESCRIBE errors (on the last pass with --wait) or a refused password, 3 bad arguments.
  */
 import { writeFile } from 'node:fs/promises';
 import { parseArgs } from 'node:util';
@@ -26,7 +27,7 @@ import {
   ReplicationResult,
   waitForReplication,
 } from '../replication';
-import { BunnyStorage, storageOptionsFromEnv } from '../storage';
+import { BunnyStorage, parseAddresses, storageOptionsFromEnv } from '../storage';
 import { DEFAULT_PREFIX, tileIdZoom, tilePath, zoomEnd, zoomRange, zoomStart } from '../tile-id';
 import { sha256Hex } from '../upload';
 
@@ -182,6 +183,7 @@ async function main(): Promise<number> {
       'interval-s': { type: 'string' },
       json: { type: 'string' },
       list: { type: 'string' },
+      addresses: { type: 'string' },
     },
     strict: true,
   });
@@ -198,8 +200,16 @@ async function main(): Promise<number> {
   const concurrency = Math.max(1, integer('concurrency', values.concurrency, 256));
   const prefix = values.prefix.replace(/^\/+|\/+$/g, '');
 
+  const storageOptions = { ...storageOptionsFromEnv(), concurrency };
+  if (values.addresses !== undefined) {
+    try {
+      storageOptions.addresses = parseAddresses(values.addresses);
+    } catch (error) {
+      throw new UsageError((error as Error).message);
+    }
+  }
   const ranges = await ArchiveRanges.open(values.archive);
-  const storage = new BunnyStorage({ ...storageOptionsFromEnv(), concurrency });
+  const storage = new BunnyStorage(storageOptions);
   try {
     const { header } = ranges.archive;
     const { from, to } = byId
@@ -251,7 +261,7 @@ async function main(): Promise<number> {
               `everywhere; missing per region: ${regions.map((region) => `${region} ${n(missingByRegion[region])}`).join(' ')}\n`,
           ),
       });
-      code = result.missing.length + result.mismatched.length > 0 ? 1 : result.complete ? 0 : 2;
+      code = result.missing.length + result.mismatched.length + result.errors > 0 ? 1 : result.complete ? 0 : 2;
       output = { ...scope, files: items.length, ...result };
       process.stderr.write(
         `${result.complete ? 'Replicated' : 'Not replicated'} after ${Math.round(result.waitedMs / 1000)} s: ` +

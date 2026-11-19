@@ -42,7 +42,10 @@ describe('purgePullZone', () => {
 
   it('fails at once on other errors without leaking the key', async () => {
     const { requests, baseUrl } = await api([401]);
-    const error = await purgePullZone('secret-key', 1, { baseUrl, baseDelayMs: 1 }).catch((e: Error) => e);
+    const error = await purgePullZone('secret-key', 1, { baseUrl, baseDelayMs: 1 }).then(
+      () => new Error('resolved'),
+      (e: Error) => e,
+    );
     expect(error.message).toMatch(/HTTP 401/);
     expect(error.message).not.toContain('secret-key');
     expect(requests).toHaveLength(1);

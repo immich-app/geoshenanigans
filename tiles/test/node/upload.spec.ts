@@ -92,6 +92,40 @@ describe('uploadTiles', () => {
     expect(fake.requests).toEqual({ DESCRIBE: 2, PUT: 4 });
   });
 
+  it('verifies every item when told to, even items that say verify: false', async () => {
+    const { fake, storage } = await setup();
+    const all = items(4).map((item) => ({ ...item, verify: false }));
+    fake.seed(tilePath('v1', 0), all[0].bytes);
+    const stats = await uploadTiles(storage, all, { verify: true });
+    expect(stats).toMatchObject({ uploaded: 3, skippedExisting: 1 });
+    expect(fake.identicalReputs).toEqual([]);
+  });
+
+  it('does not count a file the storage client stopped on as failed', async () => {
+    const controller = new AbortController();
+    const fake = await FakeStorage.start({ fault: ({ method }) => (method === 'PUT' ? 'rate-limit' : undefined) });
+    const storage = new BunnyStorage({
+      zone: fake.zone,
+      password: fake.password,
+      host: fake.url,
+      retry: { ...fast, baseDelayMs: 5_000, maxDelayMs: 5_000, maxRateLimitWaitMs: 60_000 },
+      signal: controller.signal,
+    });
+    cleanup.push(
+      () => fake.close(),
+      () => storage.close(),
+    );
+    setTimeout(() => controller.abort(), 50);
+    const settled: string[] = [];
+    const stats = await uploadTiles(storage, items(10), {
+      concurrency: 4,
+      signal: controller.signal,
+      onSettled: (item, outcome) => settled.push(`${item.tileId}:${outcome}`),
+    });
+    expect(stats).toMatchObject({ uploaded: 0, failed: 0, stopped: true });
+    expect(settled).toEqual([]);
+  });
+
   it('records a file that keeps failing and carries on with the rest', async () => {
     const { fake, storage } = await setup({
       fault: ({ method, path }) => (method === 'PUT' && path === tilePath('v1', 3) ? 'server-error' : undefined),
@@ -155,7 +189,15 @@ describe('uploadTiles', () => {
 });
 
 describe('Checkpoint', () => {
-  const params: SeedParams = { prefix: 'v1', from: 0, to: 100, chunkSize: 10, archive: { size: 1, fingerprint: 'f' } };
+  const params: SeedParams = {
+    zone: 'zone-a',
+    host: 'https://storage.example.test',
+    prefix: 'v1',
+    from: 0,
+    to: 100,
+    chunkSize: 10,
+    archive: { size: 1, fingerprint: 'f' },
+  };
   let dir: string;
   beforeEach(async () => {
     const scratch = await scratchDir();
@@ -209,6 +251,20 @@ describe('Checkpoint', () => {
     );
     await writeFile(join(dir, 'checkpoint.log'), 'start 1\nbogus\n');
     await expect(Checkpoint.open(dir, params)).rejects.toThrow(/unreadable line/);
+  });
+
+  it('refuses a state dir of the same seed into another zone or storage host', async () => {
+    const first = await Checkpoint.open(dir, params);
+    await first.markStarted([0]);
+    await first.markDone(0);
+    await first.close();
+    await expect(Checkpoint.open(dir, { ...params, zone: 'zone-b' })).rejects.toThrow(/zone differ/);
+    await expect(Checkpoint.open(dir, { ...params, host: 'http://127.0.0.1:9' })).rejects.toThrow(/host differ/);
+  });
+
+  it('refuses a checkpoint log without the seed.json that says what it is for', async () => {
+    await writeFile(join(dir, 'checkpoint.log'), 'start 0\ndone 0\n');
+    await expect(Checkpoint.open(dir, params)).rejects.toThrow(/seed\.json is missing/);
   });
 });
 

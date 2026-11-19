@@ -100,6 +100,90 @@ describe('runSeed', () => {
     expect(fake.maxInFlight).toBeGreaterThan(10);
   });
 
+  it('keeps total PUTs in flight within --concurrency when it is below --workers', async () => {
+    const { fake, options } = await setup(1_365, { latencyMs: 1 });
+    const { status } = await runSeed(options({ workers: 6, concurrency: 2 }));
+    expect(status.state).toBe('complete');
+    expect(fake.maxInFlight).toBeLessThanOrEqual(2);
+  });
+
+  it('keeps connections per storage address within the per-address cap', async () => {
+    const addresses = ['127.0.0.1', '127.0.0.2'];
+    const { fake, options } = await setup(1_365, { latencyMs: 1, addresses });
+    const { status } = await runSeed(
+      options({
+        workers: 3,
+        concurrency: 100,
+        maxConnectionsPerAddress: 4,
+        // No preflight client: its connections would overlap the workers' on the server side.
+        verifyExisting: true,
+        storage: { ...options().storage, addresses },
+      }),
+    );
+    expect(status.state).toBe('complete');
+    expect(status.concurrency).toBe(8);
+    for (const address of addresses) {
+      expect(fake.maxOpenByAddress.get(address)).toBeLessThanOrEqual(4);
+    }
+    expect(fake.maxInFlight).toBeLessThanOrEqual(8);
+  });
+
+  it('refuses to resume a state dir into another zone', async () => {
+    const { options } = await setup(1_365);
+    await runSeed(options());
+    const other = await FakeStorage.start({ zone: 'other-zone' });
+    cleanup.push(() => other.close());
+    await expect(
+      runSeed(options({ storage: { zone: other.zone, password: other.password, host: other.url, retry: fast } })),
+    ).rejects.toThrow(/zone, host differ/);
+    expect(other.files.size).toBe(0);
+  });
+
+  it('refuses a fresh state dir when an earlier run stored a narrow slice of the range', async () => {
+    const { fake, options, dir } = await setup(5_461);
+    // Between the ids an evenly spaced sample of 48 would look at.
+    await runSeed(options({ from: 3_000, to: 3_100, stateDir: join(dir, 'slice') }));
+    const puts = fake.requests.PUT;
+    await expect(runSeed(options())).rejects.toThrow(/already stored under itest/);
+    expect(fake.requests.PUT).toBe(puts);
+    expect(fake.identicalReputs).toEqual([]);
+  });
+
+  it('keeps a worker busy while two of its chunks wait on one slow file each', async () => {
+    const slow = new Set([
+      tilePath('itest', 10),
+      tilePath('itest', 70),
+      tilePath('itest', 130),
+      tilePath('itest', 190),
+    ]);
+    // The slow files are held until 2,000 others went out; with the workers stalled that never happens, and a
+    // fallback releases them after 8 s instead.
+    let releasedBy: string | undefined;
+    let resolve!: () => void;
+    const released = new Promise<void>((done) => (resolve = done));
+    const release = (by: string) => {
+      releasedBy ??= by;
+      resolve();
+    };
+    let others = 0;
+    const fallback = setTimeout(() => release('timeout'), 8_000);
+    cleanup.push(() => clearTimeout(fallback));
+    const { fake, fixture, options } = await setup(5_461, {
+      hold: ({ method, path }) => (method === 'PUT' && slow.has(path) ? released : undefined),
+      onRequest: ({ method, path }) => {
+        if (method === 'PUT' && !slow.has(path) && ++others === 2_000) {
+          release('progress');
+        }
+      },
+    });
+    const { status } = await runSeed(
+      options({ chunkSize: 60, workers: 2, concurrency: 16, storage: { ...options().storage, timeoutMs: 20_000 } }),
+    );
+    expect(status.state).toBe('complete');
+    expect(releasedBy).toBe('progress');
+    expectStored(fake, fixture, 0, 5_461);
+  });
+
   it('uploads only the requested id range', async () => {
     const { fixture, fake, options } = await setup(5_461);
     const { status } = await runSeed(options({ from: 1_000, to: 3_333, chunkSize: 700 }));
@@ -236,6 +320,8 @@ describe('bunny:seed CLI', () => {
       '1',
       '--retry-base-ms',
       '5',
+      '--settle-ms',
+      '20',
       '--progress-interval-s',
       '1',
     ];
@@ -283,6 +369,52 @@ describe('bunny:seed CLI', () => {
     expectStored(fake, fixture, 0, 21_845);
     expect(fake.identicalReputs).toEqual([]);
   }, 60_000);
+
+  it('keeps the settle wait when --retry-base-ms is given, so a late commit is not PUT again', async () => {
+    const scratch = await scratchDir();
+    cleanup.push(scratch.remove);
+    const fixture = await writeFixtureArchive(scratch.dir, 85, 5, 50);
+    const late = tilePath('itest', 3);
+    const lateStoreMs = 3_000;
+    let arrived = 0;
+    // Stored 3 s after it arrived: after the 1 s timeout (which fires within 1-1.5 s) plus a short back-off, but well
+    // before the 10 s settle wait that follows a timeout.
+    const fake = await FakeStorage.start({
+      lateStoreMs,
+      fault: ({ method, path, attempt }) => {
+        if (method === 'PUT' && path === late && attempt === 1) {
+          arrived = Date.now();
+          return 'late-store';
+        }
+        return undefined;
+      },
+    });
+    cleanup.push(() => fake.close());
+    const result = await startSeed(fake, [
+      '--archive',
+      fixture.path,
+      '--prefix',
+      'itest',
+      '--max-zoom',
+      '3',
+      '--state-dir',
+      join(scratch.dir, 'state'),
+      '--request-timeout-s',
+      '1',
+      '--retry-base-ms',
+      '500',
+      '--workers',
+      '1',
+      '--concurrency',
+      '8',
+    ]).done;
+    expect(result.code, result.stderr).toBe(0);
+    // A second PUT would be seen as an identical re-PUT only once the late commit lands.
+    await new Promise((done) => setTimeout(done, Math.max(0, arrived + lateStoreMs + 300 - Date.now())));
+    expect(fake.putsByPath.get(late)).toBe(1);
+    expect(fake.identicalReputs).toEqual([]);
+    expectStored(fake, fixture, 0, 85);
+  }, 40_000);
 
   it('rejects bad arguments with exit code 2', async () => {
     const fake = await FakeStorage.start();

@@ -90,6 +90,18 @@ describe('waitForReplication', () => {
     expect(result.missingByRegion).toEqual({ UK: 2, NY: 2, SYD: 2 });
   });
 
+  it('fails at once on a fatal DESCRIBE error instead of waiting out the timeout', async () => {
+    const { fake } = await setup();
+    const storage = new BunnyStorage({ zone: fake.zone, password: 'rotated', host: fake.url, retry: fast });
+    cleanup.push(() => storage.close());
+    const started = performance.now();
+    await expect(
+      waitForReplication(storage, [{ path: 'r/0.mvt', sha256: 'AA' }], REGIONS, { timeoutMs: 20_000, intervalMs: 20 }),
+    ).rejects.toThrow(/HTTP 401/);
+    expect(performance.now() - started).toBeLessThan(5_000);
+    await expect(checkReplication(storage, [{ path: 'r/0.mvt', sha256: 'AA' }], REGIONS)).rejects.toThrow(/HTTP 401/);
+  });
+
   it('times out on a file whose replication an identical re-PUT cleared', async () => {
     const { fake, storage } = await setup();
     const items = await upload(storage, 3);
@@ -133,7 +145,7 @@ describe('checkReplication', () => {
 });
 
 describe('bunny:replication CLI', () => {
-  function run(fake: FakeStorage, args: string[]) {
+  function run(fake: FakeStorage, args: string[], env: Record<string, string> = {}) {
     const child = spawn(process.execPath, ['--import=tsx', 'src/bunny/cli/replication.ts', ...args], {
       cwd: TILES_DIR,
       env: {
@@ -141,6 +153,7 @@ describe('bunny:replication CLI', () => {
         BUNNY_STORAGE_ZONE: fake.zone,
         BUNNY_STORAGE_PASSWORD: fake.password,
         BUNNY_STORAGE_HOST: fake.url,
+        ...env,
       },
     });
     let stdout = '';
@@ -200,4 +213,15 @@ describe('bunny:replication CLI', () => {
     expect(waited.code, waited.stderr).toBe(1);
     expect(waited.report).toMatchObject({ complete: false, files: 21, missing: [tilePath('itest', 9)] });
   }, 60_000);
+
+  it('with --wait exits 1 at once when the zone refuses the password', async () => {
+    const scratch = await scratchDir();
+    cleanup.push(scratch.remove);
+    const fixture = await writeFixtureArchive(scratch.dir, 21, 3, 10);
+    const { fake } = await setup();
+    const args = ['--archive', fixture.path, '--from-id', '0', '--to-id', '5', '--wait', '--timeout-min', '1'];
+    const result = await run(fake, args, { BUNNY_STORAGE_PASSWORD: 'rotated' });
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/HTTP 401/);
+  }, 20_000);
 });

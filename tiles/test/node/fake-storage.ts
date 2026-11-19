@@ -24,7 +24,9 @@ export type Fault =
   /** Stored, never answered: the client times out. */
   | 'stored-hang'
   /** Never stored, never answered. */
-  | 'hang';
+  | 'hang'
+  /** Never answered; the body is stored `lateStoreMs` after it arrived, as when the server commits after the client gave up. */
+  | 'late-store';
 
 export interface RequestInfo {
   method: string;
@@ -32,6 +34,8 @@ export interface RequestInfo {
   path: string;
   /** How many requests with this method and path arrived so far, this one included. */
   attempt: number;
+  /** The listening address the request came in on. */
+  address: string;
 }
 
 export interface FakeStorageOptions {
@@ -45,6 +49,10 @@ export interface FakeStorageOptions {
   replicationDelayMs?: Record<string, number>;
   fault?: (request: RequestInfo) => Fault | undefined;
   onRequest?: (request: RequestInfo) => void;
+  /** Awaited before a request is answered (after onRequest), to hold chosen requests back. */
+  hold?: (request: RequestInfo) => Promise<void> | undefined;
+  /** How long after arriving a 'late-store' PUT is stored (default 500 ms). */
+  lateStoreMs?: number;
 }
 
 interface StoredFile {
@@ -88,11 +96,15 @@ export class FakeStorage {
   readonly requests: Record<string, number> = {};
   readonly faultsInjected: Partial<Record<Fault, number>> = {};
   readonly connectionsByAddress = new Map<string, number>();
+  /** The most connections open at once on each address. */
+  readonly maxOpenByAddress = new Map<string, number>();
+  readonly requestsByAddress = new Map<string, number>();
   readonly hostHeaders = new Set<string>();
   inFlight = 0;
   maxInFlight = 0;
   options: FakeStorageOptions;
   private attempts = new Map<string, number>();
+  private openByAddress = new Map<string, number>();
   private sockets = new Set<Socket>();
   private timers = new Set<NodeJS.Timeout>();
   private servers: Server[] = [];
@@ -174,7 +186,13 @@ export class FakeStorage {
     this.sockets.add(socket);
     const address = socket.localAddress ?? '';
     this.connectionsByAddress.set(address, (this.connectionsByAddress.get(address) ?? 0) + 1);
-    socket.on('close', () => this.sockets.delete(socket));
+    const open = (this.openByAddress.get(address) ?? 0) + 1;
+    this.openByAddress.set(address, open);
+    this.maxOpenByAddress.set(address, Math.max(open, this.maxOpenByAddress.get(address) ?? 0));
+    socket.on('close', () => {
+      this.sockets.delete(socket);
+      this.openByAddress.set(address, (this.openByAddress.get(address) ?? 1) - 1);
+    });
     socket.on('error', () => {});
     let buffer: Buffer = Buffer.alloc(0);
     let busy = false;
@@ -190,7 +208,7 @@ export class FakeStorage {
         }
         buffer = buffer.subarray(parsed.consumed);
         busy = true;
-        const keep = await this.handle(parsed.request, socket);
+        const keep = await this.handle(parsed.request, socket, address);
         busy = false;
         if (!keep) {
           dead = true;
@@ -205,19 +223,20 @@ export class FakeStorage {
   }
 
   /** Answers one request; false when the connection is gone (dropped or hung). */
-  private async handle(request: ParsedRequest, socket: Socket): Promise<boolean> {
+  private async handle(request: ParsedRequest, socket: Socket, address: string): Promise<boolean> {
     this.inFlight++;
     this.maxInFlight = Math.max(this.maxInFlight, this.inFlight);
     try {
-      return await this.respond(request, socket);
+      return await this.respond(request, socket, address);
     } finally {
       this.inFlight--;
     }
   }
 
-  private async respond(request: ParsedRequest, socket: Socket): Promise<boolean> {
+  private async respond(request: ParsedRequest, socket: Socket, address: string): Promise<boolean> {
     const { method, headers } = request;
     this.requests[method] = (this.requests[method] ?? 0) + 1;
+    this.requestsByAddress.set(address, (this.requestsByAddress.get(address) ?? 0) + 1);
     if (headers.host) {
       this.hostHeaders.add(headers.host);
     }
@@ -228,8 +247,9 @@ export class FakeStorage {
     const key = `${method} ${path}`;
     const attempt = (this.attempts.get(key) ?? 0) + 1;
     this.attempts.set(key, attempt);
-    const info = { method, path, attempt };
+    const info = { method, path, attempt, address };
     this.options.onRequest?.(info);
+    await this.options.hold?.(info);
 
     if (zone !== this.zone || headers.accesskey !== this.password) {
       return this.send(socket, 401, JSON.stringify({ HttpCode: 401, Message: 'Unauthorized' }));
@@ -259,6 +279,14 @@ export class FakeStorage {
       const actual = sha256Hex(request.body);
       if (checksum && checksum !== actual) {
         return this.send(socket, 400, JSON.stringify({ HttpCode: 400, Message: 'Checksum mismatch' }));
+      }
+      if (fault === 'late-store') {
+        const timer = setTimeout(() => {
+          this.timers.delete(timer);
+          this.store(path, request.body, actual);
+        }, this.options.lateStoreMs ?? 500);
+        this.timers.add(timer);
+        return false;
       }
       this.store(path, request.body, actual);
       status = 201;

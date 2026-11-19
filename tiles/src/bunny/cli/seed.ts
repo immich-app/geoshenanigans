@@ -6,17 +6,24 @@
  *   npm run bunny:seed -- --archive <path> [--prefix v1] [--min-zoom 0 --max-zoom 15 | --from-id N --to-id M]
  *     [--concurrency 1200] [--workers 16] [--chunk-size 65536] [--state-dir <dir>] [--verify-existing]
  *     [--max-failures 1000] [--request-timeout-s 60] [--progress-interval-s 10] [--retry-base-ms 500]
+ *     [--max-connections-per-address 240] [--addresses ip,ip,...] [--settle-ms 2000]
  *
- * --to-id is exclusive. Zooms default to the archive's. The state dir defaults to ./bunny-seed-<prefix>-<from>-<to>.
+ * --to-id is exclusive. Zooms default to the archive's. The state dir defaults to
+ * ./bunny-seed-<zone>-<prefix>-<from>-<to>. --concurrency is lowered to the storage addresses times
+ * --max-connections-per-address (Bunny allows 250 per zone per storage server). --addresses (or
+ * BUNNY_STORAGE_ADDRESSES) pins the storage IPs instead of resolving the host, e.g. to leave out a failing server.
+ * --settle-ms is the least wait before DESCRIBEing a file whose PUT failed ambiguously (five times that after a
+ * timeout); it is for tests: below the default, a PUT the server finishes late can be sent again with the same bytes,
+ * which clears the file's replication.
  * Needs BUNNY_STORAGE_ZONE and BUNNY_STORAGE_PASSWORD, and BUNNY_STORAGE_HOST unless it is storage.bunnycdn.com.
  * Progress goes to stderr every 10 s and to <state dir>/status.json; the final status is printed to stdout as JSON.
  * Exit codes: 0 complete, 1 failed (rerun to repair), 2 bad arguments, 130 stopped by SIGINT/SIGTERM.
  */
 import { parseArgs } from 'node:util';
 import { ArchiveRanges } from '../archive-walk';
-import { storageOptionsFromEnv } from '../storage';
+import { parseAddresses, RetryOptions, storageOptionsFromEnv } from '../storage';
 import { DEFAULT_PREFIX, zoomRange } from '../tile-id';
-import { formatDuration, runSeed } from '../upload';
+import { DEFAULT_MAX_CONNECTIONS_PER_ADDRESS, formatDuration, runSeed } from '../upload';
 
 class UsageError extends Error {}
 
@@ -52,6 +59,9 @@ async function main(): Promise<number> {
       'request-timeout-s': { type: 'string' },
       'progress-interval-s': { type: 'string' },
       'retry-base-ms': { type: 'string' },
+      'settle-ms': { type: 'string' },
+      'max-connections-per-address': { type: 'string' },
+      addresses: { type: 'string' },
     },
     strict: true,
   });
@@ -79,8 +89,22 @@ async function main(): Promise<number> {
   }
   const prefix = values.prefix.replace(/^\/+|\/+$/g, '');
   const storage = storageOptionsFromEnv();
-  const retryBase = values['retry-base-ms'];
+  if (values.addresses !== undefined) {
+    try {
+      storage.addresses = parseAddresses(values.addresses);
+    } catch (error) {
+      throw new UsageError((error as Error).message);
+    }
+  }
+  const retry: Partial<RetryOptions> = {};
+  if (values['retry-base-ms'] !== undefined) {
+    retry.baseDelayMs = integer('retry-base-ms', values['retry-base-ms']);
+  }
+  if (values['settle-ms'] !== undefined) {
+    retry.settleMs = integer('settle-ms', values['settle-ms']);
+  }
   const timeoutSeconds = integer('request-timeout-s', values['request-timeout-s'], 60);
+  const safeName = (text: string) => text.replace(/[^\w.-]+/g, '_');
 
   const controller = new AbortController();
   let signals = 0;
@@ -105,13 +129,17 @@ async function main(): Promise<number> {
     chunkSize: Math.max(1, integer('chunk-size', values['chunk-size'], 65_536)),
     workers: Math.max(1, integer('workers', values.workers, 16)),
     concurrency: Math.max(1, integer('concurrency', values.concurrency, 1_200)),
-    stateDir: values['state-dir'] ?? `bunny-seed-${prefix.replace(/[^\w.-]+/g, '_') || 'root'}-${from}-${to}`,
+    stateDir: values['state-dir'] ?? `bunny-seed-${safeName(storage.zone)}-${safeName(prefix) || 'root'}-${from}-${to}`,
     verifyExisting: values['verify-existing'],
-    storage: {
-      ...storage,
-      timeoutMs: timeoutSeconds * 1000,
-      retry: retryBase === undefined ? undefined : { baseDelayMs: integer('retry-base-ms', retryBase), settleMs: 0 },
-    },
+    storage: { ...storage, timeoutMs: timeoutSeconds * 1000, retry },
+    maxConnectionsPerAddress: Math.max(
+      1,
+      integer(
+        'max-connections-per-address',
+        values['max-connections-per-address'],
+        DEFAULT_MAX_CONNECTIONS_PER_ADDRESS,
+      ),
+    ),
     maxFailures: Math.max(1, integer('max-failures', values['max-failures'], 1_000)),
     progressIntervalMs: Math.max(1, integer('progress-interval-s', values['progress-interval-s'], 10)) * 1000,
     signal: controller.signal,

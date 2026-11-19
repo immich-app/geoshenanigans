@@ -3,8 +3,11 @@
  * connections pinned to each address of the storage host (Bunny allows 250 connections per zone per storage server).
  *
  * Re-PUTting a file with identical bytes clears its ReplicatedZones for good, so put() never sends a file twice
- * unless it knows the first copy was not stored: a 429 means it was not; after any other failure (network error,
- * timeout, 5xx) it asks DESCRIBE first and only PUTs again if the file is missing or holds other bytes.
+ * unless it knows the first copy was not stored: a 429 or a failed connect means it was not; after any other failure
+ * (network error, timeout, 5xx) it asks DESCRIBE first and only PUTs again if the file is missing or holds other bytes.
+ *
+ * A storage address that keeps failing is set aside for a while (doubling up to a minute) and probed one request at
+ * a time: otherwise a server that fails fast would look the least busy and draw most requests and their retries.
  */
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
@@ -58,11 +61,18 @@ export interface BunnyStorageOptions {
   concurrency?: number;
   /** Addresses to pin connections to instead of resolving the host (default: every IPv4 address of the host). */
   addresses?: string[];
+  /** Connections to each address at most (default: concurrency spread over the addresses, rounded up). */
+  connectionsPerAddress?: number;
   /** Per request: time to response headers and between body reads (default 60 s). */
   timeoutMs?: number;
   retry?: Partial<RetryOptions>;
   /** Counters to add to; pass one object to several clients to sum them. */
   counters?: StorageCounters;
+  /**
+   * Ends back-off waits (429, ambiguous failures) at once with a StorageError whose `stopped` is set. Requests already
+   * sent still finish or time out.
+   */
+  signal?: AbortSignal;
 }
 
 export interface StorageCounters {
@@ -79,6 +89,8 @@ export interface StorageCounters {
   ambiguousStored: number;
   /** Ambiguous PUT failures where DESCRIBE showed the file missing or different, so it was PUT again. */
   ambiguousResent: number;
+  /** Times a storage address was set aside after failing repeatedly. */
+  addressTrips: number;
   /** Time spent in requests that got an answer, summed (divide by requests for the average). */
   requestMs: number;
 }
@@ -94,6 +106,7 @@ export const newCounters = (): StorageCounters => ({
   timeouts: 0,
   ambiguousStored: 0,
   ambiguousResent: 0,
+  addressTrips: 0,
   requestMs: 0,
 });
 
@@ -110,20 +123,45 @@ export class StorageError extends Error {
     readonly status?: number,
     /** Wrong password or zone: every other request will fail the same way. */
     readonly fatal = false,
+    /** The client's signal ended a back-off: the file's state is unknown (it may be stored). */
+    readonly stopped = false,
   ) {
     super(message);
     this.name = 'StorageError';
   }
 }
 
-/** Reads BUNNY_STORAGE_ZONE, BUNNY_STORAGE_PASSWORD and BUNNY_STORAGE_HOST. */
+/**
+ * Reads BUNNY_STORAGE_ZONE, BUNNY_STORAGE_PASSWORD, BUNNY_STORAGE_HOST and the optional BUNNY_STORAGE_ADDRESSES
+ * (comma-separated IPs to use instead of resolving the host, e.g. to leave out a failing storage server).
+ */
 export function storageOptionsFromEnv(env = process.env): BunnyStorageOptions {
   const zone = env.BUNNY_STORAGE_ZONE;
   const password = env.BUNNY_STORAGE_PASSWORD;
   if (!zone || !password) {
     throw new Error('BUNNY_STORAGE_ZONE and BUNNY_STORAGE_PASSWORD must be set');
   }
-  return { zone, password, host: env.BUNNY_STORAGE_HOST || DEFAULT_STORAGE_HOST };
+  const addresses = env.BUNNY_STORAGE_ADDRESSES ? parseAddresses(env.BUNNY_STORAGE_ADDRESSES) : undefined;
+  return { zone, password, host: env.BUNNY_STORAGE_HOST || DEFAULT_STORAGE_HOST, ...(addresses && { addresses }) };
+}
+
+/** A comma-separated list of IP addresses. */
+export function parseAddresses(list: string): string[] {
+  const addresses = list
+    .split(',')
+    .map((address) => address.trim())
+    .filter(Boolean);
+  const bad = addresses.filter((address) => !isIP(address));
+  if (addresses.length === 0 || bad.length > 0) {
+    throw new Error(`Storage addresses must be IP addresses, got ${JSON.stringify(list)}`);
+  }
+  return addresses;
+}
+
+/** The storage host as one canonical origin, so `storage.bunnycdn.com` and `https://storage.bunnycdn.com` compare equal. */
+export function storageOrigin(host = DEFAULT_STORAGE_HOST): string {
+  const { protocol, hostHeader } = parseHost(host);
+  return `${protocol}//${hostHeader.toLowerCase()}`;
 }
 
 interface Endpoint {
@@ -154,14 +192,29 @@ export async function resolveStorageAddresses(host = DEFAULT_STORAGE_HOST): Prom
   return [...new Set(found.map((entry) => entry.address))].sort();
 }
 
-type Outcome = { status: number; body: Buffer } | { error: Error; kind: 'network' | 'timeout' };
+/** `unsent`: the request never left (lookup or connect failed), so it was certainly not stored. */
+type Outcome = ({ status: number; body: Buffer } | { error: Error; kind: 'network' | 'timeout' | 'unsent' }) & {
+  pool?: PinnedPool;
+};
 
-const TIMEOUT_CODES = new Set([
-  'UND_ERR_HEADERS_TIMEOUT',
-  'UND_ERR_BODY_TIMEOUT',
+const TIMEOUT_CODES = new Set(['UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'ETIMEDOUT']);
+// undici writes a request only once its connection is up, so these mean nothing was sent.
+const CONNECT_CODES = new Set([
+  'ECONNREFUSED',
   'UND_ERR_CONNECT_TIMEOUT',
-  'ETIMEDOUT',
+  'ENOTFOUND',
+  'EAI_AGAIN',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ENETDOWN',
+  'EHOSTDOWN',
+  'EADDRNOTAVAIL',
 ]);
+
+/** Failures in a row after which an address is set aside. */
+const TRIP_AFTER_FAILURES = 5;
+const TRIP_BASE_MS = 1_000;
+const TRIP_MAX_MS = 60_000;
 
 class Semaphore {
   private waiting: (() => void)[] = [];
@@ -184,6 +237,12 @@ class Semaphore {
 interface PinnedPool {
   pool: Pool;
   active: number;
+  /** Failures in a row (connect and network errors, timeouts, 408, 429, 5xx) since the last good answer. */
+  failures: number;
+  /** Times set aside since the last good answer; each doubles the pause. */
+  trips: number;
+  /** While set aside, not chosen before this time (performance.now()); then one probe at a time. */
+  downUntil: number;
 }
 
 export class BunnyStorage {
@@ -222,9 +281,12 @@ export class BunnyStorage {
     let failures = 0;
     let rateLimitedFor = 0;
     let rateLimitedTimes = 0;
+    // The address that failed last: the retry and the DESCRIBE go elsewhere if another is usable.
+    let avoid: PinnedPool | undefined;
     for (;;) {
       this.counters.puts++;
-      const outcome = await this.send('PUT', path, { body, headers });
+      const outcome = await this.send('PUT', path, { body, headers }, avoid);
+      avoid = outcome.pool;
       if ('status' in outcome && outcome.status >= 200 && outcome.status < 300) {
         return;
       }
@@ -236,13 +298,23 @@ export class BunnyStorage {
       if ('status' in outcome && outcome.status < 500 && outcome.status !== 408) {
         throw this.httpError('PUT', path, outcome);
       }
-      // Ambiguous: the server may have stored the body before the failure reached us. After a timeout it may still
-      // be working on it, so give it longer before asking.
       failures++;
       const reason = describeOutcome(outcome);
+      if ('kind' in outcome && outcome.kind === 'unsent') {
+        if (failures >= this.retry.maxAttempts) {
+          throw new StorageError(`PUT ${path} failed ${failures} times, last: ${reason}`);
+        }
+        await this.pause(this.backoff(failures));
+        this.counters.retries++;
+        continue;
+      }
+      // Ambiguous: the server may have stored the body before the failure reached us. After a timeout it may still
+      // be working on it, so give it longer before asking.
       const settle = 'kind' in outcome && outcome.kind === 'timeout' ? this.retry.settleMs * 5 : this.retry.settleMs;
-      await sleep(Math.max(settle, this.backoff(failures)));
-      const stored = await this.describe(path);
+      await this.pause(Math.max(settle, this.backoff(failures)));
+      this.counters.describes++;
+      const described = await this.idempotent('DESCRIBE', path, [200, 404], avoid);
+      const stored = described.status === 404 ? null : parseObject(described.body);
       if (stored?.checksum.toUpperCase() === checksum) {
         this.counters.ambiguousStored++;
         return;
@@ -259,10 +331,7 @@ export class BunnyStorage {
   async describe(path: string): Promise<StorageObject | null> {
     this.counters.describes++;
     const response = await this.idempotent('DESCRIBE', path, [200, 404]);
-    if (response.status === 404) {
-      return null;
-    }
-    return toStorageObject(JSON.parse(response.body.toString('utf8')));
+    return response.status === 404 ? null : parseObject(response.body);
   }
 
   async get(path: string): Promise<Uint8Array | null> {
@@ -301,12 +370,18 @@ export class BunnyStorage {
     await Promise.all((pools ?? []).map(({ pool }) => pool.close()));
   }
 
-  private async idempotent(method: string, path: string, accept: number[]): Promise<{ status: number; body: Buffer }> {
+  private async idempotent(
+    method: string,
+    path: string,
+    accept: number[],
+    avoid?: PinnedPool,
+  ): Promise<{ status: number; body: Buffer }> {
     let failures = 0;
     let rateLimitedFor = 0;
     let rateLimitedTimes = 0;
     for (;;) {
-      const outcome = await this.send(method, path, {});
+      const outcome = await this.send(method, path, {}, avoid);
+      avoid = outcome.pool;
       if ('status' in outcome && accept.includes(outcome.status)) {
         return outcome;
       }
@@ -322,7 +397,7 @@ export class BunnyStorage {
       if (failures >= this.retry.maxAttempts) {
         throw new StorageError(`${method} ${path} failed ${failures} times, last: ${describeOutcome(outcome)}`);
       }
-      await sleep(this.backoff(failures));
+      await this.pause(this.backoff(failures));
       this.counters.retries++;
     }
   }
@@ -333,8 +408,16 @@ export class BunnyStorage {
     if (waitedMs + delay > this.retry.maxRateLimitWaitMs) {
       throw new StorageError(`${what} still rate limited after ${Math.round(waitedMs / 1000)} s`, 429);
     }
-    await sleep(delay);
+    await this.pause(delay);
     return delay;
+  }
+
+  private async pause(ms: number): Promise<void> {
+    try {
+      await sleep(ms, undefined, { signal: this.options.signal });
+    } catch {
+      throw new StorageError('Stopped while waiting to retry', undefined, false, true);
+    }
   }
 
   private backoff(attempt: number): number {
@@ -352,18 +435,23 @@ export class BunnyStorage {
     method: string,
     path: string,
     { body, headers }: { body?: Uint8Array; headers?: Record<string, string> },
+    avoid?: PinnedPool,
   ): Promise<Outcome> {
     if (this.closed) {
-      throw new StorageError('Storage client is closed');
+      throw new StorageError('Storage client is closed', undefined, true);
     }
-    const pools = await this.connect();
-    await this.slots.acquire();
-    let pinned = pools[0];
-    for (const candidate of pools) {
-      if (candidate.active < pinned.active) {
-        pinned = candidate;
+    let pools: PinnedPool[];
+    try {
+      pools = await this.connect();
+    } catch (error) {
+      if (error instanceof StorageError && error.fatal) {
+        throw error;
       }
+      this.counters.networkErrors++;
+      return { error: error instanceof Error ? error : new Error(String(error)), kind: 'unsent' };
     }
+    await this.slots.acquire();
+    const pinned = choosePool(pools, avoid);
     pinned.active++;
     this.counters.requests++;
     const started = performance.now();
@@ -378,28 +466,51 @@ export class BunnyStorage {
       });
       const bytes = Buffer.from(await response.body.arrayBuffer());
       this.counters.requestMs += performance.now() - started;
-      if (response.statusCode >= 500) {
+      const status = response.statusCode;
+      if (status >= 500) {
         this.counters.serverErrors++;
       }
-      return { status: response.statusCode, body: bytes };
+      this.health(pinned, status < 500 && status !== 429 && status !== 408);
+      return { status, body: bytes, pool: pinned };
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
       const code = (err as { code?: string }).code ?? '';
-      const kind = TIMEOUT_CODES.has(code) ? 'timeout' : 'network';
+      const kind = CONNECT_CODES.has(code) ? 'unsent' : TIMEOUT_CODES.has(code) ? 'timeout' : 'network';
       if (kind === 'timeout') {
         this.counters.timeouts++;
       } else {
         this.counters.networkErrors++;
       }
-      return { error: err, kind };
+      this.health(pinned, false);
+      return { error: err, kind, pool: pinned };
     } finally {
       pinned.active--;
       this.slots.release();
     }
   }
 
+  private health(pinned: PinnedPool, ok: boolean) {
+    if (ok) {
+      pinned.failures = 0;
+      pinned.trips = 0;
+      pinned.downUntil = 0;
+      return;
+    }
+    pinned.failures++;
+    const now = performance.now();
+    // Failures of requests sent before the address was set aside do not lengthen the pause; a failed probe does.
+    if (pinned.failures >= TRIP_AFTER_FAILURES && pinned.downUntil <= now) {
+      pinned.trips++;
+      this.counters.addressTrips++;
+      pinned.downUntil = now + Math.min(TRIP_MAX_MS, TRIP_BASE_MS * 2 ** (pinned.trips - 1));
+    }
+  }
+
   private connect(): Promise<PinnedPool[]> {
-    this.pools ??= (async () => {
+    if (this.pools) {
+      return this.pools;
+    }
+    const pools = (async () => {
       const addresses = this.options.addresses?.length
         ? this.options.addresses
         : await resolveStorageAddresses(this.options.host ?? DEFAULT_STORAGE_HOST);
@@ -407,7 +518,7 @@ export class BunnyStorage {
         throw new StorageError(`${this.endpoint.hostname} has no addresses`, undefined, true);
       }
       const { protocol, port, hostname } = this.endpoint;
-      const perPool = Math.ceil(this.concurrency / addresses.length);
+      const perPool = Math.max(1, this.options.connectionsPerAddress ?? Math.ceil(this.concurrency / addresses.length));
       return addresses.map((address) => {
         const ip = isIP(address) === 6 ? `[${address}]` : address;
         const pool = new Pool(`${protocol}//${ip}:${port}`, {
@@ -423,11 +534,41 @@ export class BunnyStorage {
             ...(protocol === 'https:' && !isIP(hostname) ? { servername: hostname } : {}),
           },
         });
-        return { pool, active: 0 };
+        return { pool, active: 0, failures: 0, trips: 0, downUntil: 0 };
       });
     })();
-    return this.pools;
+    // A failed lookup is not kept: the next request resolves again.
+    this.pools = pools;
+    pools.catch(() => {
+      if (this.pools === pools) {
+        this.pools = undefined;
+      }
+    });
+    return pools;
   }
+}
+
+/**
+ * The least busy usable pool: one not set aside (or due a probe, with nothing in flight) and not `avoid`, else any
+ * usable one, else the least busy of all, so requests still go somewhere when every address is failing.
+ */
+function choosePool(pools: PinnedPool[], avoid?: PinnedPool): PinnedPool {
+  const now = performance.now();
+  const usable = (pool: PinnedPool) =>
+    pool.failures < TRIP_AFTER_FAILURES || (pool.downUntil <= now && pool.active === 0);
+  const tiers = [(pool: PinnedPool) => pool !== avoid && usable(pool), usable, () => true];
+  for (const tier of tiers) {
+    let best: PinnedPool | undefined;
+    for (const pool of pools) {
+      if (tier(pool) && (!best || pool.active < best.active)) {
+        best = pool;
+      }
+    }
+    if (best) {
+      return best;
+    }
+  }
+  return pools[0];
 }
 
 interface BunnyObject {
@@ -437,6 +578,10 @@ interface BunnyObject {
   ReplicatedZones: string | null;
   LastChanged: string;
   IsDirectory?: boolean;
+}
+
+function parseObject(body: Buffer): StorageObject {
+  return toStorageObject(JSON.parse(body.toString('utf8')) as BunnyObject);
 }
 
 function toStorageObject(row: BunnyObject): StorageObject {

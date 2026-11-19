@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import { ArchiveRanges } from './archive-walk';
+import { forEachLimit } from './replication';
 import {
   addCounters,
   BunnyStorage,
@@ -17,6 +18,7 @@ import {
   resolveStorageAddresses,
   StorageCounters,
   StorageError,
+  storageOrigin,
 } from './storage';
 import { DEFAULT_PREFIX, tileIdZoom, tilePath } from './tile-id';
 
@@ -45,7 +47,10 @@ export interface UploadStats {
   seconds: number;
   /** The first MAX_REPORTED_FAILURES failures. */
   failures: UploadFailure[];
-  /** The source was not exhausted: stopped by the signal, a fatal error or too many failures. */
+  /**
+   * Not every item was settled: stopped by the signal (including items the storage client's signal stopped mid-retry,
+   * which are neither uploaded nor failed), a fatal error or too many failures.
+   */
   stopped: boolean;
   /** Why the upload stopped early, if it did on its own. */
   error?: string;
@@ -57,7 +62,7 @@ export interface UploadOptions<T extends UploadItem> {
   prefix?: string;
   /** Files in flight at most (default 64). */
   concurrency?: number;
-  /** DESCRIBE every file before its PUT (items can also ask for it one by one). */
+  /** DESCRIBE every file before its PUT; items can ask for it one by one, but cannot opt out of this. */
   verify?: boolean;
   /** Stop taking new items; the ones in flight finish. */
   signal?: AbortSignal;
@@ -102,12 +107,13 @@ export async function uploadTiles<T extends UploadItem>(
     Symbol.asyncIterator in source ? source[Symbol.asyncIterator]() : (source as Iterable<T>)[Symbol.iterator]();
   let exhausted = false;
   let halted = false;
+  let unsettled = 0;
   const stopping = () => halted || options.signal?.aborted === true;
 
   const uploadOne = async (item: T) => {
     const path = tilePath(prefix, item.tileId);
     try {
-      if (item.verify ?? options.verify) {
+      if (options.verify || item.verify) {
         const stored = await storage.describe(path);
         if (stored?.checksum === item.sha256.toUpperCase()) {
           stats.skippedExisting++;
@@ -120,6 +126,11 @@ export async function uploadTiles<T extends UploadItem>(
       stats.bytes += item.bytes.length;
       options.onSettled?.(item, 'uploaded');
     } catch (error) {
+      if (error instanceof StorageError && error.stopped) {
+        // Maybe stored, maybe not: the caller verifies it next time.
+        unsettled++;
+        return;
+      }
       const message = error instanceof Error ? error.message : String(error);
       const failure = { tileId: item.tileId, path, error: message };
       stats.failed++;
@@ -151,7 +162,7 @@ export async function uploadTiles<T extends UploadItem>(
   stats.seconds = (performance.now() - startedAt) / 1000;
   stats.retries += storage.counters.retries - before.retries;
   stats.rateLimited += storage.counters.rateLimited - before.rateLimited;
-  stats.stopped = !exhausted;
+  stats.stopped = !exhausted || unsettled > 0;
   const failure = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
   if (failure) {
     throw failure.reason;
@@ -162,6 +173,9 @@ export async function uploadTiles<T extends UploadItem>(
 // --- Checkpoint -------------------------------------------------------------------------------------------------
 
 export interface SeedParams {
+  /** Storage zone and canonical storage origin: a checkpoint says nothing about what another zone holds. */
+  zone: string;
+  host: string;
   prefix: string;
   from: number;
   to: number;
@@ -205,12 +219,22 @@ export class Checkpoint {
 
   private static async read(dir: string, params: SeedParams, lockPath: string): Promise<Checkpoint> {
     const paramsPath = join(dir, 'seed.json');
+    const logPath = join(dir, 'checkpoint.log');
     const existing = await readIfExists(paramsPath);
+    const text = (await readIfExists(logPath)) ?? '';
     if (existing === undefined) {
+      if (text.trim() !== '') {
+        throw new Error(
+          `${logPath} has entries but seed.json is missing, so nothing says which seed they belong to; ` +
+            'use another --state-dir',
+        );
+      }
       await writeAtomic(paramsPath, JSON.stringify(params, null, 2) + '\n', true);
     } else {
       const previous = JSON.parse(existing) as SeedParams;
-      const mismatch = (['prefix', 'from', 'to', 'chunkSize'] as const).filter((key) => previous[key] !== params[key]);
+      const mismatch = (['zone', 'host', 'prefix', 'from', 'to', 'chunkSize'] as const).filter(
+        (key) => previous[key] !== params[key],
+      );
       if (previous.archive?.fingerprint !== params.archive.fingerprint) {
         mismatch.push('archive' as never);
       }
@@ -221,8 +245,6 @@ export class Checkpoint {
       }
     }
 
-    const logPath = join(dir, 'checkpoint.log');
-    const text = (await readIfExists(logPath)) ?? '';
     // A torn last line (killed mid-write) never reached its fsync, so its chunk was never dispatched or never done.
     const complete = text.slice(0, text.lastIndexOf('\n') + 1);
     const done = new Set<number>();
@@ -381,7 +403,9 @@ export interface SeedOptions {
   stateDir: string;
   /** DESCRIBE before every PUT, not just in chunks a previous run left unfinished. */
   verifyExisting: boolean;
-  storage: Omit<BunnyStorageOptions, 'counters' | 'concurrency'>;
+  storage: Omit<BunnyStorageOptions, 'counters' | 'concurrency' | 'connectionsPerAddress' | 'signal'>;
+  /** Connections to one storage address across all workers (default 240); caps the total in flight too. */
+  maxConnectionsPerAddress?: number;
   maxFailures?: number;
   progressIntervalMs?: number;
   signal?: AbortSignal;
@@ -399,6 +423,7 @@ export interface SeedStatus {
   range: { from: number; to: number };
   chunkSize: number;
   workers: number;
+  /** Requests in flight at most: --concurrency, lowered to what the addresses' connection cap allows. */
   concurrency: number;
   chunks: { total: number; done: number; previouslyDone: number; active: number; failed: number };
   files: {
@@ -437,6 +462,8 @@ export interface WorkerConfig {
 
 export type WorkerMessage =
   | { type: 'progress'; stats: UploadStats; counters: StorageCounters; inFlight: number }
+  /** Every position of the chunk was handed to the uploader; some may still be in flight. */
+  | { type: 'chunk-emitted'; chunkId: number }
   | { type: 'chunk-done'; chunkId: number; failures: UploadFailure[] }
   | { type: 'chunk-stopped'; chunkId: number }
   | { type: 'fatal'; error: string }
@@ -444,13 +471,24 @@ export type WorkerMessage =
 
 export type MainMessage = { type: 'chunk'; chunk: ChunkDescriptor } | { type: 'end' } | { type: 'stop' };
 
-/** Chunks queued per worker beyond the one it is on, so a chunk's tail overlaps the next one's start. */
+/**
+ * Chunks a worker holds that still have positions to hand out: the one it is on and one queued, so the next starts
+ * while the last positions of this one are in flight.
+ */
 const PREFETCH = 2;
-const PREFLIGHT_SAMPLES = 48;
+/** Chunks a worker holds at most, counting those waiting only on a few slow files, so stragglers do not idle it. */
+const MAX_OUTSTANDING = 8;
+/** Bunny allows 250 connections per zone per storage server. */
+export const DEFAULT_MAX_CONNECTIONS_PER_ADDRESS = 240;
+const PREFLIGHT_HEAD = 24;
+const PREFLIGHT_MAX_SAMPLES = 16_384;
+const PREFLIGHT_MAX_CHUNK_STARTS = 65_536;
+const PREFLIGHT_CONCURRENCY = 128;
 
 interface WorkerSlot {
   worker: Worker;
   outstanding: Set<number>;
+  emitting: Set<number>;
   stats: UploadStats;
   counters: StorageCounters;
   inFlight: number;
@@ -473,6 +511,8 @@ export async function runSeed(options: SeedOptions): Promise<SeedResult> {
   let checkpoint: Checkpoint | undefined;
   try {
     checkpoint = await Checkpoint.open(stateDir, {
+      zone: options.storage.zone,
+      host: storageOrigin(options.storage.host),
       prefix,
       from,
       to,
@@ -483,8 +523,16 @@ export async function runSeed(options: SeedOptions): Promise<SeedResult> {
       ? options.storage.addresses
       : await resolveStorageAddresses(options.storage.host);
     const storageOptions = { ...options.storage, addresses };
+    const perAddress = Math.max(1, options.maxConnectionsPerAddress ?? DEFAULT_MAX_CONNECTIONS_PER_ADDRESS);
     if (checkpoint.fresh && !options.verifyExisting) {
-      await preflight(ranges, storageOptions, prefix, from, to);
+      const ids = preflightIds(from, to, chunkSize);
+      log(`Fresh state dir: checking that none of ${ids.length} positions spread over the range is stored already`);
+      const concurrency = Math.max(
+        1,
+        Math.min(PREFLIGHT_CONCURRENCY, options.concurrency, addresses.length * perAddress),
+      );
+      const connectionsPerAddress = Math.min(perAddress, Math.ceil(concurrency / addresses.length));
+      await preflight(ranges, { ...storageOptions, concurrency, connectionsPerAddress }, prefix, ids);
     }
     return await new SeedRun(options, ranges, checkpoint, storageOptions, log).run();
   } finally {
@@ -494,43 +542,69 @@ export async function runSeed(options: SeedOptions): Promise<SeedResult> {
 }
 
 /**
- * A fresh state dir over files that are already stored would PUT identical bytes and clear their replication, so
- * a sample of the range is checked first. It also proves the credentials before any worker starts.
+ * The positions a fresh seed checks before it starts: the first few of the range, the first position of every chunk
+ * (an earlier run with this chunk size uploaded each chunk it started from there), and about 16k spread evenly, for
+ * earlier runs over other chunk sizes or id ranges: any stretch of the range they stored at least that spacing long
+ * holds one of them.
  */
-async function preflight(
-  ranges: ArchiveRanges,
-  storageOptions: BunnyStorageOptions,
-  prefix: string,
-  from: number,
-  to: number,
-) {
-  const count = Math.min(PREFLIGHT_SAMPLES, to - from);
+export function preflightIds(from: number, to: number, chunkSize: number): number[] {
   const ids = new Set<number>();
-  for (let i = 0; i < count; i++) {
-    ids.add(i < count / 2 ? from + i : from + Math.floor(((to - from - 1) * (i - count / 2 + 1)) / (count / 2)));
+  for (let id = from; id < Math.min(to, from + PREFLIGHT_HEAD); id++) {
+    ids.add(id);
   }
-  const storage = new BunnyStorage({ ...storageOptions, concurrency: 16 });
+  if ((to - from) / chunkSize <= PREFLIGHT_MAX_CHUNK_STARTS) {
+    for (let id = Math.ceil(from / chunkSize) * chunkSize; id < to; id += chunkSize) {
+      ids.add(id);
+    }
+  }
+  const stride = Math.max(1, Math.ceil((to - from) / PREFLIGHT_MAX_SAMPLES));
+  for (let id = from; id < to; id += stride) {
+    ids.add(id);
+  }
+  ids.add(to - 1);
+  return [...ids].sort((a, b) => a - b);
+}
+
+/**
+ * A fresh state dir over files that are already stored would PUT identical bytes and clear their replication, so
+ * positions spread over the range are checked first. It also proves the credentials before any worker starts.
+ */
+async function preflight(ranges: ArchiveRanges, storageOptions: BunnyStorageOptions, prefix: string, ids: number[]) {
+  const storage = new BunnyStorage(storageOptions);
+  const found = new AbortController();
+  const hashes = new Map<number, string>();
+  let existing: string | undefined;
   try {
-    const found = await Promise.all(
-      [...ids].map(async (id) => {
+    await forEachLimit(
+      ids,
+      storageOptions.concurrency ?? PREFLIGHT_CONCURRENCY,
+      async (id) => {
         const run = await ranges.find(id);
         if (!run) {
-          return false;
+          return;
         }
-        const sha = sha256Hex(new Uint8Array(await ranges.archive.readTileData(run.offset, run.length)));
-        return (await storage.describe(tilePath(prefix, id)))?.checksum === sha;
-      }),
+        let sha = hashes.get(run.offset);
+        if (sha === undefined) {
+          sha = sha256Hex(new Uint8Array(await ranges.archive.readTileData(run.offset, run.length)));
+          hashes.set(run.offset, sha);
+        }
+        const path = tilePath(prefix, id);
+        if ((await storage.describe(path))?.checksum === sha) {
+          existing ??= path;
+          found.abort();
+        }
+      },
+      found.signal,
     );
-    const existing = found.filter(Boolean).length;
-    if (existing > 0) {
-      throw new Error(
-        `${existing} of ${ids.size} sampled positions are already stored under ${prefix}/ with the same bytes. ` +
-          'PUTting identical bytes again clears their replication: resume with the --state-dir that uploaded them, ' +
-          'or pass --verify-existing to DESCRIBE before every PUT.',
-      );
-    }
   } finally {
     await storage.close();
+  }
+  if (existing) {
+    throw new Error(
+      `${existing} is already stored under ${prefix}/ with the same bytes, so an earlier run uploaded part of this ` +
+        'range. PUTting identical bytes again clears their replication: resume with the --state-dir that uploaded ' +
+        'them, or pass --verify-existing to DESCRIBE before every PUT.',
+    );
   }
 }
 
@@ -564,6 +638,7 @@ class SeedRun {
   private wakeFeeder?: () => void;
   private failuresFile: string;
   private totalFailed = 0;
+  private concurrency: number;
 
   constructor(
     private options: SeedOptions,
@@ -583,22 +658,33 @@ class SeedRun {
       }
     }
     this.failuresFile = join(options.stateDir, 'failures.jsonl');
+    this.concurrency = options.concurrency;
   }
 
   async run(): Promise<SeedResult> {
     const { options } = this;
     const remaining = this.totalChunks - this.previouslyDone;
-    const workers = Math.max(1, Math.min(options.workers, remaining));
-    const perWorker = Math.max(1, Math.floor(options.concurrency / workers));
+    const addresses = this.storageOptions.addresses?.length ?? 1;
+    const perAddress = Math.max(1, options.maxConnectionsPerAddress ?? DEFAULT_MAX_CONNECTIONS_PER_ADDRESS);
+    const total = Math.max(1, Math.min(options.concurrency, addresses * perAddress));
+    // Every worker needs a connection to each address, and at least one request of the total.
+    const workers = Math.max(1, Math.min(options.workers, remaining, total, perAddress));
+    this.concurrency = total;
     const onAbort = () => this.stop('interrupted');
     options.signal?.addEventListener('abort', onAbort);
     if (options.signal?.aborted) {
       this.stop('interrupted');
     }
+    if (total < options.concurrency) {
+      this.log(
+        `Concurrency lowered from ${options.concurrency} to ${total}: ${addresses} storage addresses x ` +
+          `${perAddress} connections each`,
+      );
+    }
     this.log(
       `Seeding ${options.archivePath} [${options.from}, ${options.to}) to ${options.storage.zone}/${options.prefix}/: ` +
-        `${this.totalChunks} chunks (${this.previouslyDone} done before), ${workers} workers x ${perWorker} in flight, ` +
-        `${this.storageOptions.addresses?.length} storage addresses`,
+        `${this.totalChunks} chunks (${this.previouslyDone} done before), ${workers} workers, ${total} in flight, ` +
+        `${addresses} storage addresses`,
     );
 
     const progressTimer = setInterval(() => void this.report('running'), options.progressIntervalMs ?? 10_000);
@@ -607,7 +693,10 @@ class SeedRun {
       if (remaining > 0 && !this.stopping) {
         const { path, execArgv } = workerEntry();
         for (let i = 0; i < workers; i++) {
-          this.slots.push(this.spawn(path, execArgv, perWorker));
+          // Shares that add up to exactly the total in flight and to at most perAddress connections per address.
+          const concurrency = share(total, workers, i);
+          const connections = Math.max(1, Math.min(Math.ceil(concurrency / addresses), share(perAddress, workers, i)));
+          this.slots.push(this.spawn(path, execArgv, concurrency, connections));
         }
         await this.feed().catch((error: Error) => {
           // Without its start line on disk no further chunk may go out; the workers finish what they have.
@@ -632,19 +721,20 @@ class SeedRun {
     return { status, failures: this.failures };
   }
 
-  private spawn(path: string, execArgv: string[], concurrency: number): WorkerSlot {
+  private spawn(path: string, execArgv: string[], concurrency: number, connectionsPerAddress: number): WorkerSlot {
     const config: WorkerConfig = {
       archivePath: this.options.archivePath,
       tileDataOffset: this.ranges.tileDataOffset,
       prefix: this.options.prefix,
       concurrency,
-      storage: { ...this.storageOptions, concurrency },
+      storage: { ...this.storageOptions, concurrency, connectionsPerAddress },
       maxFailures: this.options.maxFailures ?? 1000,
     };
     const worker = new Worker(path, { workerData: config, execArgv });
     const slot: WorkerSlot = {
       worker,
       outstanding: new Set(),
+      emitting: new Set(),
       stats: newUploadStats(),
       counters: newCounters(),
       inFlight: 0,
@@ -664,6 +754,7 @@ class SeedRun {
         this.stop('failed');
       }
       slot.outstanding.clear();
+      slot.emitting.clear();
       this.wakeFeeder?.();
     });
     return slot;
@@ -677,8 +768,13 @@ class SeedRun {
         slot.counters = message.counters;
         slot.inFlight = message.type === 'progress' ? message.inFlight : 0;
         return;
+      case 'chunk-emitted':
+        slot.emitting.delete(message.chunkId);
+        this.wakeFeeder?.();
+        return;
       case 'chunk-done':
         slot.outstanding.delete(message.chunkId);
+        slot.emitting.delete(message.chunkId);
         this.chunkStarts.delete(message.chunkId);
         if (message.failures.length === 0) {
           this.doneThisRun++;
@@ -694,6 +790,7 @@ class SeedRun {
         return;
       case 'chunk-stopped':
         slot.outstanding.delete(message.chunkId);
+        slot.emitting.delete(message.chunkId);
         this.chunkStarts.delete(message.chunkId);
         this.wakeFeeder?.();
         return;
@@ -759,6 +856,7 @@ class SeedRun {
       };
       await this.checkpoint.markStarted([chunk.chunkId]);
       slot.outstanding.add(chunk.chunkId);
+      slot.emitting.add(chunk.chunkId);
       this.chunkStarts.set(chunk.chunkId, chunk.start);
       slot.worker.postMessage({ type: 'chunk', chunk } satisfies MainMessage, [chunk.runs.buffer as ArrayBuffer]);
     }
@@ -774,7 +872,14 @@ class SeedRun {
   private idleSlot(): WorkerSlot | undefined {
     let best: WorkerSlot | undefined;
     for (const slot of this.slots) {
-      if (!slot.dead && slot.outstanding.size < PREFETCH && (!best || slot.outstanding.size < best.outstanding.size)) {
+      if (slot.dead || slot.emitting.size >= PREFETCH || slot.outstanding.size >= MAX_OUTSTANDING) {
+        continue;
+      }
+      if (
+        !best ||
+        slot.emitting.size < best.emitting.size ||
+        (slot.emitting.size === best.emitting.size && slot.outstanding.size < best.outstanding.size)
+      ) {
         best = slot;
       }
     }
@@ -827,7 +932,7 @@ class SeedRun {
       range: { from: options.from, to: options.to },
       chunkSize: options.chunkSize,
       workers: this.slots.length,
-      concurrency: options.concurrency,
+      concurrency: this.concurrency,
       chunks: {
         total: this.totalChunks,
         done: this.previouslyDone + this.doneThisRun,
@@ -863,6 +968,9 @@ class SeedRun {
     return status;
   }
 }
+
+/** Part `i` of `n` split into `parts` near-equal whole shares. */
+const share = (n: number, parts: number, i: number) => Math.floor(n / parts) + (i < n % parts ? 1 : 0);
 
 const number = (value: number) => Math.round(value).toLocaleString('en-US');
 
