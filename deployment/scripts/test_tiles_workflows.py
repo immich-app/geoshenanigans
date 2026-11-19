@@ -225,14 +225,16 @@ class BunnyKeyTest(unittest.TestCase):
     def test_the_exposure_through_the_cloudflare_token_is_written_down_and_in_the_go_live_checklist(self):
         """The worker's Bunny key and Globalping token are out of every state, but a pull request's plan reads the
         Cloudflare account token, which can deploy code that reads Worker secrets: the README says so, the go-live
-        step that puts the key on the worker asks for it to be closed or accepted, and no comment claims otherwise."""
+        step that puts the key on the worker points at the maintainers' recorded acceptance, and no comment claims
+        otherwise."""
         readme = read(os.path.join(ROOT, "deployment", "modules", "bunny", "tiles", "README.md"))
         section = readme.split("### What this doesn't cover\n", 1)[1].split("\n#", 1)[0]
         self.assertIn("prod_cloudflare_api_keys", section)
         self.assertIn("`BUNNY_API_KEY` and `GLOBALPING_TOKEN`", section)
         checklist = readme.split("## Go-live checklist\n", 1)[1]
         step_3 = re.search(r"\n3\. \*\*Copy `pull_zone_id`\*\*.*?(?=\n4\. )", checklist, re.S).group(0)
-        self.assertIn("closes the exposure in What this doesn't cover", step_3)
+        self.assertIn("The maintainers accepted this exposure", section)
+        self.assertIn("The maintainers accepted that exposure (What this doesn't cover, above)", step_3)
         self.assertNotIn("neither value is in any state", readme)
         for path in (os.path.join(WORKFLOWS, "tiles-worker.yml"), os.path.join(ROOT, "deployment", ".env"),
                      os.path.join(ROOT, "deployment", "tiles-worker-bunny.env")):
