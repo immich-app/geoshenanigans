@@ -18,6 +18,26 @@ use std::rc::Rc;
 pub struct Searcher<'a, 'g> {
     pub idx: &'a SearchIndex<'g>,
     lev: [LevenshteinAutomatonBuilder; 2],
+    limits: Limits,
+}
+
+/// How much a search holds and does: the constants', but for tests that make them small.
+#[derive(Clone, Copy, Debug)]
+struct Limits {
+    /// CANDIDATE_POOL
+    pool: usize,
+    /// MAX_CONTEXT_CHECKS
+    context_checks: usize,
+    /// MAX_PENDING_CANDIDATES
+    pending: usize,
+    /// AREA_CHECK_TOP
+    area_top: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Limits { pool: CANDIDATE_POOL, context_checks: MAX_CONTEXT_CHECKS, pending: MAX_PENDING_CANDIDATES, area_top: AREA_CHECK_TOP }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -246,20 +266,22 @@ impl Context<'_> {
 
 struct Pool {
     best: HashMap<u32, Hit>,
-    /// (current score, entity) of the best `CANDIDATE_POOL` distinct entities offered: an
-    /// entity's improved score replaces its old one, so each counts once in both bounds
+    /// (current score, entity) of the best `size` distinct entities offered: an entity's
+    /// improved score replaces its old one, so each counts once in both bounds
     scores: BTreeSet<(Ord32, u32)>,
+    /// CANDIDATE_POOL
+    size: usize,
     /// results the context cut-off keeps reachable (limit * CONTEXT_CUTOFF_FACTOR)
     top_k: usize,
 }
 
 impl Pool {
-    fn new(top_k: usize) -> Self {
-        Pool { best: HashMap::new(), scores: BTreeSet::new(), top_k }
+    fn new(size: usize, top_k: usize) -> Self {
+        Pool { best: HashMap::new(), scores: BTreeSet::new(), size, top_k }
     }
 
     fn threshold(&self) -> f32 {
-        if self.scores.len() < CANDIDATE_POOL {
+        if self.scores.len() < self.size {
             0.0
         } else {
             self.scores.first().map(|s| s.0 .0).unwrap_or(0.0)
@@ -277,7 +299,7 @@ impl Pool {
             self.scores.remove(&(Ord32(old.score), h.entity));
         }
         self.scores.insert((Ord32(h.score), h.entity));
-        if self.scores.len() > CANDIDATE_POOL {
+        if self.scores.len() > self.size {
             if let Some((_, evicted)) = self.scores.pop_first() {
                 self.best.remove(&evicted);
             }
@@ -314,7 +336,7 @@ struct Cand {
 
 impl<'a, 'g> Searcher<'a, 'g> {
     pub fn new(idx: &'a SearchIndex<'g>) -> Self {
-        Searcher { idx, lev: [LevenshteinAutomatonBuilder::new(1, true), LevenshteinAutomatonBuilder::new(2, true)] }
+        Searcher { idx, lev: [LevenshteinAutomatonBuilder::new(1, true), LevenshteinAutomatonBuilder::new(2, true)], limits: Limits::default() }
     }
 
     /// Display context of a point: the geocoder's admin lookup (country, state, county).
@@ -503,7 +525,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
             }
             if has_ctx {
                 cands.push(Cand { entity, ord, class, text, potential });
-                if cands.len() > MAX_PENDING_CANDIDATES && !Self::cut_back::<READ_FIRST>(ents, &mut cands, &mut read) {
+                if cands.len() > self.limits.pending && !Self::cut_back::<READ_FIRST>(ents, &mut cands, &mut read, self.limits.pending / 2) {
                     return false;
                 }
             } else {
@@ -579,7 +601,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
             }
             let ok = match checked.get(&c.entity) {
                 Some(&ok) => ok,
-                None if st.stats.context_checks >= MAX_CONTEXT_CHECKS => false,
+                None if st.stats.context_checks >= self.limits.context_checks => false,
                 None => {
                     let Some(at) = ents.point(c.entity) else {
                         if READ_FIRST {
@@ -599,21 +621,22 @@ impl<'a, 'g> Searcher<'a, 'g> {
         true
     }
 
-    /// Cuts the pending candidates back to the half that could score best; the first `read` of
-    /// them are known to read. Without `READ_FIRST` it first reads the others: false, before
-    /// any cut-back, when one is nowhere (`search`). Kept, such a one could push out a candidate
-    /// that, checked, would score above it (a cut-back ranks by the score a candidate could
-    /// reach, not the one it gets); dropped, it brings the cut-back on before a search without
-    /// it cuts back, which keeps what this one drops. Out of line, so that the closure that
-    /// queues the candidates stays inlined in the loop over the postings.
+    /// Cuts the pending candidates back to the `keep` that could score best (half as many as
+    /// may wait); the first `read` of them are known to read. Without `READ_FIRST` it first
+    /// reads the others: false, before any cut-back, when one is nowhere (`search`). Kept, such
+    /// a one could push out a candidate that, checked, would score above it (a cut-back ranks
+    /// by the score a candidate could reach, not the one it gets); dropped, it brings the
+    /// cut-back on before a search without it cuts back, which keeps what this one drops. Out
+    /// of line, so that the closure that queues the candidates stays inlined in the loop over
+    /// the postings.
     #[cold]
     #[inline(never)]
-    fn cut_back<const READ_FIRST: bool>(ents: &Entities, cands: &mut Vec<Cand>, read: &mut usize) -> bool {
+    fn cut_back<const READ_FIRST: bool>(ents: &Entities, cands: &mut Vec<Cand>, read: &mut usize, keep: usize) -> bool {
         if !READ_FIRST && cands[*read..].iter().any(|c| ents.point(c.entity).is_none()) {
             return false;
         }
         cands.sort_by(|a, b| b.potential.total_cmp(&a.potential).then(a.entity.cmp(&b.entity)));
-        cands.truncate(MAX_PENDING_CANDIDATES / 2);
+        cands.truncate(keep);
         *read = cands.len();
         true
     }
@@ -646,7 +669,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
     /// `search`'s results; None, without `READ_FIRST`, for a search that met an entity that is
     /// nowhere (`score_split`).
     fn search_once<const READ_FIRST: bool>(&self, st: &mut State<'g>, q: &str, limit: usize) -> Option<Vec<Found<'g>>> {
-        let mut pool = Pool::new(limit * CONTEXT_CUTOFF_FACTOR);
+        let mut pool = Pool::new(self.limits.pool, limit * CONTEXT_CUTOFF_FACTOR);
         let mut phrases: Vec<String> = Vec::new();
         if let Some((name, rest)) = q.split_once(',') {
             let name = tokens(name);
@@ -706,7 +729,8 @@ impl<'a, 'g> Searcher<'a, 'g> {
         let ents = &self.idx.ents;
         let label = |h: &Hit| normalize(&ents.base_name(h.entity));
         let mut changed = false;
-        let top = hits.len().min(AREA_CHECK_TOP);
+        let area_top = self.limits.area_top;
+        let top = hits.len().min(area_top);
         for i in 0..top {
             let e = hits[i].entity;
             // Only a boundary moves: of the others, whether they are somewhere.
@@ -726,7 +750,7 @@ impl<'a, 'g> Searcher<'a, 'g> {
             }
             let area_label = label(&hits[i]);
             let mut found = None;
-            for (j, h) in hits.iter().enumerate().take(i + 1 + AREA_CHECK_TOP).skip(i + 1) {
+            for (j, h) in hits.iter().enumerate().take(i + 1 + area_top).skip(i + 1) {
                 // A POI is no settlement.
                 if Entities::is_poi(h.entity) {
                     if ents.point(h.entity).is_none() {
@@ -808,7 +832,7 @@ mod tests {
 
     #[test]
     fn zero_limit_has_no_reachable_candidate() {
-        let mut pool = Pool::new(0);
+        let mut pool = Pool::new(CANDIDATE_POOL, 0);
         assert_eq!(pool.cutoff(), f32::INFINITY);
         pool.offer(hit(1, 1.0));
         assert_eq!(pool.cutoff(), f32::INFINITY);
@@ -818,7 +842,7 @@ mod tests {
     fn pool_counts_each_entity_once() {
         // One entity improving 0.8 -> 0.9 is one candidate: with top_k 2 a context candidate at
         // 0.7 can still reach the results until a second entity is in.
-        let mut pool = Pool::new(2);
+        let mut pool = Pool::new(CANDIDATE_POOL, 2);
         pool.offer(hit(1, 0.8));
         pool.offer(hit(1, 0.9));
         assert_eq!(pool.cutoff(), 0.0);
@@ -826,7 +850,7 @@ mod tests {
         assert_eq!(pool.cutoff(), 0.7);
         assert_eq!(pool.best.len(), 2);
         // CANDIDATE_POOL improvements of one entity leave the pool open to everyone else.
-        let mut pool = Pool::new(2);
+        let mut pool = Pool::new(CANDIDATE_POOL, 2);
         for k in 0..CANDIDATE_POOL {
             pool.offer(hit(1, 0.1 + k as f32 / 1000.0));
         }
@@ -841,7 +865,7 @@ mod tests {
 
     #[test]
     fn pool_keeps_only_the_best_candidates() {
-        let mut pool = Pool::new(2);
+        let mut pool = Pool::new(CANDIDATE_POOL, 2);
         let n = CANDIDATE_POOL as u32 + 50;
         for e in 0..n {
             pool.offer(hit(e, 0.1 + e as f32 / 1000.0));
