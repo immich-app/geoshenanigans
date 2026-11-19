@@ -834,6 +834,84 @@ spec:
                 reducer:
                   type: last
                   params: []
+    # The sample job reports a result every day it runs: ok, error, or skipped
+    # while a build is pending. -sample-failing reads the errors; a job that
+    # never reaches its report step (a runner that died, a timeout, a schedule
+    # dropped, a broken job) sends nothing, which reads as OK to every sample
+    # rule. Fires on 26h (a day of runs plus slack) without a result of any kind,
+    # only while the watchdog's report job, in the same workflow, read a live
+    # build in the past 5h and 26-31h ago: a whole workflow that stops is
+    # geoshenanigans-tiles-watchdog-silent's, and a build that went live within
+    # the day has had no sample run to miss. `for` outlasts a late scheduled run.
+    - uid: geoshenanigans-tiles-sample-silent
+      title: Tiles sample check stopped reporting
+      condition: B
+      for: 1h
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The daily sample check of the live Bunny tiles has reported nothing for over 26 hours.
+        description: >-
+          No tiles_sync_sample_runs sample (ok, error or skipped) for 26h, while tiles-sync-watchdog.yml's
+          report job keeps reading a live build: the daily sample job did not reach its report step. Until it
+          does, nothing checks the live build for missing, wrong or unreplicated files, and
+          geoshenanigans-tiles-sample-wrong, -sample-unreplicated and -sample-failing stay quiet. Check the
+          workflow's runs for the 04:53 UTC schedule: a job that timed out or whose runner died (the run shows
+          it as cancelled or lost), a scheduled run GitHub dropped, or a "Report to o11y" step that could not
+          read the o11y token from 1Password (it warns and reports nothing) or failed to push to
+          vmauth.futostatus.com. Dispatch Tiles Sync Watchdog from main to run the check now.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 111600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              absent_over_time(tiles_sync_sample_runs{project="geoshenanigans", cluster="tiles", env="prod"}[26h])
+              and on () (count(last_over_time(tiles_sync_live_build_age_hours{project="geoshenanigans", cluster="tiles", env="prod"}[5h])) > 0)
+              and on () (count(last_over_time(tiles_sync_live_build_age_hours{project="geoshenanigans", cluster="tiles", env="prod"}[5h] offset 26h)) > 0)
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 111600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
     # The latest sync job's first step to its last (step="total"), pushed with
     # the steps. A warning: a slow sync still switches over consistently.
     - uid: geoshenanigans-tiles-sync-slow
@@ -1139,10 +1217,12 @@ spec:
           No tiles_bunny_log_rows sample for 15 minutes, while the worker's heartbeat still arrives, so the
           Bunny request metrics (the Tiles dashboard's Bunny CDN panels) have stopped. The Logging API key
           (BUNNY_API_KEY) or pull zone id may be wrong or rotated, or the Logging API may be failing (the
-          reader's tiles_bunny_log_reader_runs{result="error"} and its error lines in the Logs panel say
-          which). The reader keeps no cursor: each cron run reads the minutes 3 and 4 behind it, so minutes
-          missed while it failed are never read, though the Logging API keeps them 3 days; the request
-          panels have a gap there. Serving is not affected.
+          reader's tiles_bunny_log_reader_runs{result="error"}, which geoshenanigans-tiles-bunny-logs-failing
+          reads, and its error lines in the Logs panel say which; result="skipped" means its settings are gone
+          from the worker, and no run result at all that its runs end before their push). The reader keeps no
+          cursor: each cron run reads the minutes 3 and 4 behind it, so minutes missed while it failed are never
+          read, though the Logging API keeps them 3 days; the request panels have a gap there. Serving is not
+          affected.
       execErrState: Error
       noDataState: OK
       data:
@@ -1170,6 +1250,86 @@ spec:
           queryType: ''
           relativeTimeRange:
             from: 604800
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # Every log reader run pushes tiles_bunny_log_reader_runs{result} at its
+    # newer minute's end: error when either read failed or was truncated (more
+    # rows than MAX_PAGES reach), skipped without its settings. A truncated read
+    # still pushes the rows it counted, and a key refused from the first run
+    # pushes no rows at all, so -bunny-logs-silent, which wants a week of rows
+    # and then none, sees neither. Fires on errors in most of the runs with a
+    # result other than skipped in 15 minutes (15 runs), at least 5 of them:
+    # the re-read a minute later makes up for a lone failed read, and the floor
+    # keeps the first runs after the settings arrive from firing on a couple.
+    # Gated on nothing else: a run result is itself proof the cron runs.
+    - uid: geoshenanigans-tiles-bunny-logs-failing
+      title: Bunny log reader runs are failing
+      condition: B
+      for: 10m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: Most Bunny log reader runs failed or were truncated, so the Bunny request metrics are missing or low.
+        description: >-
+          Over half of the Bunny log reader's runs in the past 15 minutes, and at least 5, ended with
+          result="error": a read of the Logging API failed after its retries, or a minute held more rows than
+          the reader's page limit (30 pages of 10,000) and its counts are low. The Tiles dashboard's Bunny CDN
+          panels undercount or have gaps meanwhile; serving is not affected. Its error lines in the Logs panel
+          (project:="geoshenanigans" cluster:="tiles" level:="error" job:="bunny_logs") say which: "Bunny log
+          reader failed" answering 401 or 403 is the BUNNY_API_KEY worker secret (wrong, rotated, or never
+          right since the reader was turned on) or a wrong BUNNY_PULL_ZONE_ID, a 429 or 5xx the Logging API
+          itself (check status.bunny.net), and "Bunny log window truncated" traffic beyond what one run reads
+          (raise MAX_PAGES in tiles/src/bunny-logs/log-reader.ts). Minutes the reader failed on are never read
+          again.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 900
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              (sum(sum_over_time(tiles_bunny_log_reader_runs{project="geoshenanigans", cluster="tiles", env="prod", result="error"}[15m])) >= 5)
+                / sum(sum_over_time(tiles_bunny_log_reader_runs{project="geoshenanigans", cluster="tiles", env="prod", result!="skipped"}[15m])) > 0.5
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 900
             to: 0
           model:
             refId: B
@@ -1461,6 +1621,7 @@ spec:
     # result="skipped". Fires when the pull zone serves requests (the log reader
     # counts rows) while every probe run in the past hour was skipped: the probe
     # was left off, so -probe-errors, -probe-slow and -probe-failing are blind.
+    # No run result at all, skipped included, is -probe-silent's.
     - uid: geoshenanigans-tiles-bunny-probe-off
       title: Bunny synthetic probe is off while the pull zone serves requests
       condition: B
@@ -1476,6 +1637,7 @@ spec:
           deployment/modules/cloudflare/tiles-worker/tiles.prod.tfvars.json to the hostname that serves the zone
           (the test hostname before the DNS cutover, https://tiles.immich.cloud after; the same as tiles-sync.yml's
           BUNNY_PUBLIC_URL) and check GLOBALPING_TOKEN in tf_prod, then run the Tiles Worker workflow on main.
+          Probe runs that report nothing at all are geoshenanigans-tiles-bunny-probe-silent's.
       execErrState: Error
       noDataState: OK
       data:
@@ -1494,6 +1656,87 @@ spec:
               (sum(sum_over_time(tiles_bunny_probe_runs{project="geoshenanigans", cluster="tiles", env="prod", result="skipped"}[1h])) > 0)
                 unless on () (sum(sum_over_time(tiles_bunny_probe_runs{project="geoshenanigans", cluster="tiles", env="prod", result!="skipped"}[1h])) > 0)
                 and on () (sum(sum_over_time(tiles_bunny_log_rows{project="geoshenanigans", cluster="tiles", env="prod"}[1h])) > 0)
+            instant: true
+            range: false
+            intervalMs: 1000
+            maxDataPoints: 43200
+        - refId: B
+          datasourceUid: __expr__
+          queryType: ''
+          relativeTimeRange:
+            from: 3600
+            to: 0
+          model:
+            refId: B
+            type: threshold
+            datasource:
+              type: __expr__
+              uid: __expr__
+            expression: A
+            intervalMs: 1000
+            maxDataPoints: 43200
+            conditions:
+              - type: query
+                evaluator:
+                  type: gt
+                  params:
+                    - 0
+                operator:
+                  type: and
+                query:
+                  params:
+                    - A
+                reducer:
+                  type: last
+                  params: []
+    # Every probe run pushes tiles_bunny_probe_runs{result} at its end, skipped
+    # included. A run that ends before that push sends nothing: runProbe
+    # rejecting (the cron's guard logs "Bunny cron job failed"), the scheduled
+    # handler killed at a CPU, subrequest or wall time limit, the push refused,
+    # or a BUNNY_PROBE_INTERVAL_MINUTES so long the hour holds no run. Then no
+    # probe rule fires: -probe-off wants skipped runs, the others measurements
+    # or errors. Fires on an hour without a run result of any kind, while the
+    # pull zone serves requests (as -probe-off) and the log reader, in the
+    # same cron, reported in the past 15 minutes: a cron that stops entirely is
+    # -bunny-logs-silent's or -heartbeat's. The hour holds two runs plus the
+    # 45s measurement deadline at an interval of up to 29 minutes (six at the
+    # default 10).
+    - uid: geoshenanigans-tiles-bunny-probe-silent
+      title: Bunny synthetic probe stopped reporting
+      condition: B
+      for: 15m
+      labels:
+        project: geoshenanigans
+        severity: warning
+      annotations:
+        summary: The synthetic probe has reported no run for an hour while the Bunny pull zone serves requests.
+        description: >-
+          No tiles_bunny_probe_runs sample of any result (ok, error or skipped) for an hour, while the Bunny log
+          reader, in the same cron, counts requests to the pull zone: probe runs end before they report, so
+          geoshenanigans-tiles-bunny-probe-errors, -probe-slow, -probe-failing and -probe-off are all blind. Look
+          for the worker's "Bunny cron job failed" line with job:="bunny_probe" in the Logs panel (runProbe
+          threw), and for tiles-prod's cron events in the Cloudflare dashboard that ended exceeding CPU,
+          subrequest or wall time limits. Check that BUNNY_PROBE_INTERVAL_MINUTES (tiles-worker's
+          bunny_probe_interval_minutes) is 29 or less, so the hour holds two runs. Skipped runs mean the probe
+          is not configured (geoshenanigans-tiles-bunny-probe-off), not this.
+      execErrState: Error
+      noDataState: OK
+      data:
+        - refId: A
+          datasourceUid: VictoriaMetricsFleet
+          queryType: ''
+          relativeTimeRange:
+            from: 3600
+            to: 0
+          model:
+            refId: A
+            datasource:
+              type: prometheus
+              uid: VictoriaMetricsFleet
+            expr: >-
+              absent_over_time(tiles_bunny_probe_runs{project="geoshenanigans", cluster="tiles", env="prod"}[1h])
+                and on () (sum(sum_over_time(tiles_bunny_log_rows{project="geoshenanigans", cluster="tiles", env="prod"}[1h])) > 0)
+                and on () (count(last_over_time(tiles_bunny_log_rows{project="geoshenanigans", cluster="tiles", env="prod"}[15m])) > 0)
             instant: true
             range: false
             intervalMs: 1000

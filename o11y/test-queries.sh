@@ -7,8 +7,11 @@
 #
 # Each case writes its samples in an hour of its own, a day back (inside the
 # default 1-month retention), and evaluates at that hour's end, so cases never
-# share a window. The store dedups at 20s as o11y's does, and a series' samples
-# within 20s of each other collapse into one: cases space theirs further apart.
+# share a window. Cases for rules that look back a day or more take negative
+# numbers, 48 hours apart and before every other case, so none reaches into
+# another's lookback (31h at most). The store dedups at 20s as o11y's does, and
+# a series' samples within 20s of each other collapse into one: cases space
+# theirs further apart.
 # ALERTS and DASHBOARD point it at other files.
 set -euo pipefail
 
@@ -156,6 +159,39 @@ sample 5 5 tiles_bunny_tile_requests 'zoom="5",cache="MISS"' 40
 sample 5 5 tiles_bunny_tile_requests 'zoom="7",cache="HIT"' 30
 sample 5 5 tiles_bunny_tile_requests 'zoom="7",cache="MISS"' 10
 
+# --- geoshenanigans-tiles-bunny-logs-failing -------------------------------
+# The reader runs every minute; each run's result is one sample at its minute.
+# Case 7: every read truncated (more rows than its page limit): each run still
+# pushes the rows it counted, and is an error.
+for m in $(seq 14 -1 1); do
+  sample 7 "$m" tiles_bunny_log_reader_runs 'result="error"' 1
+  sample 7 "$m" tiles_bunny_log_rows '' 300000
+done
+# Case 8: the reader just turned on with a key the Logging API refuses: skipped
+# runs, then errors and never a row. Skipped runs are not in the ratio (7 of 7,
+# not 7 of 14).
+for m in $(seq 14 -1 8); do sample 8 "$m" tiles_bunny_log_reader_runs 'result="skipped"' 1; done
+for m in $(seq 7 -1 1); do sample 8 "$m" tiles_bunny_log_reader_runs 'result="error"' 1; done
+# Case 9: a blip of three failed runs among good ones: no.
+for m in $(seq 14 -1 4); do sample 9 "$m" tiles_bunny_log_reader_runs 'result="ok"' 1; done
+for m in 3 2 1; do sample 9 "$m" tiles_bunny_log_reader_runs 'result="error"' 1; done
+# Case 10: the first four runs after the settings arrive all fail: under the
+# floor of 5 yet.
+for m in $(seq 14 -1 5); do sample 10 "$m" tiles_bunny_log_reader_runs 'result="skipped"' 1; done
+for m in 4 3 2 1; do sample 10 "$m" tiles_bunny_log_reader_runs 'result="error"' 1; done
+
+# --- geoshenanigans-tiles-bunny-probe-silent -------------------------------
+# Case 11: the zone serves requests and the reader reports, but no probe run
+# reported anything for the hour: fires.
+for m in 55 45 35 25 15 5; do sample 11 "$m" tiles_bunny_log_rows '' 100; done
+# Case 12: the same with every probe run skipped: -probe-off's, not this.
+for m in 55 45 35 25 15 5; do sample 12 "$m" tiles_bunny_log_rows '' 100; done
+for m in 50 40 30 20 10; do sample 12 "$m" tiles_bunny_probe_runs 'result="skipped"' 1; done
+# Case 13: no requests in the hour (rows all 0): no.
+for m in 55 45 35 25 15 5; do sample 13 "$m" tiles_bunny_log_rows '' 0; done
+# Case 14: the reader stopped 20 minutes ago too (the whole cron): no.
+for m in 55 45 35 25; do sample 14 "$m" tiles_bunny_log_rows '' 100; done
+
 # --- "Probe first byte, misses" and "hits" (panels 53 and 54) -------------
 # Case 15: per continent, every response weighs the same, whichever target it
 # came from. EU misses: the random tile in three runs, the popular one once
@@ -169,6 +205,26 @@ sample 15 25 tiles_bunny_probe_ttfb_ms 'continent="EU",kind="hit",target="hit"' 
 sample 15 15 tiles_bunny_probe_ttfb_ms 'continent="EU",kind="hit",target="hit"' 30
 sample 15 5 tiles_bunny_probe_ttfb_ms 'continent="EU",kind="hit",target="hit"' 40
 sample 15 15 tiles_bunny_probe_ttfb_ms 'continent="EU",kind="hit",target="miss"' 200
+
+# --- geoshenanigans-tiles-sample-silent ------------------------------------
+# The watchdog reports the live build's age every 2 hours, the sample job its
+# result once a day. Minutes before the case's end: 60 is an hour, 1680 28h.
+# Case -48: a build live for over a day, and the last sample result 27h old:
+# fires.
+sample -48 1680 tiles_sync_live_build_age_hours '' 20
+sample -48 60 tiles_sync_live_build_age_hours '' 5
+sample -48 1620 tiles_sync_sample_runs 'result="ok"' 1
+# Case -96: the same with a check skipped (a build pending) 20h ago: a report.
+sample -96 1680 tiles_sync_live_build_age_hours '' 20
+sample -96 60 tiles_sync_live_build_age_hours '' 5
+sample -96 1200 tiles_sync_sample_runs 'result="skipped"' 1
+# Case -144: the first build went live 3 hours ago, before any sample job ran
+# against it: no.
+sample -144 180 tiles_sync_live_build_age_hours '' 3
+sample -144 60 tiles_sync_live_build_age_hours '' 5
+# Case -192: the watchdog's report job stopped too (no age for 5h): that is
+# geoshenanigans-tiles-watchdog-silent's.
+sample -192 1680 tiles_sync_live_build_age_hours '' 20
 
 curl -fsS -X POST --data-binary @"$work/samples.prom" "$vm/api/v1/import/prometheus"
 curl -fsS "$vm/internal/force_flush" >/dev/null
@@ -186,8 +242,27 @@ check 'probe-slow: slow misses in two runs, not one, nor one outlier' 4 "$slow" 
 check 'cache hits by zoom: zero for misses only, gap for no requests' 5 "$(panel_expr 50 A 10m)" \
   "$(printf '%s\n' 'zoom=5 0' 'zoom=7 0.75')"
 
+logs_failing=$(rule_expr geoshenanigans-tiles-bunny-logs-failing)
+check 'logs-failing: truncated reads that still push rows' 7 "$logs_failing" ' 1'
+check 'logs-failing: a refused key from the first run, skipped runs left out' 8 "$logs_failing" ' 1'
+check 'logs-failing: a blip of three failed runs' 9 "$logs_failing" ''
+check 'logs-failing: four failed runs, under the floor' 10 "$logs_failing" ''
+
+probe_silent=$(rule_expr geoshenanigans-tiles-bunny-probe-silent)
+silent='cluster=tiles,env=prod,project=geoshenanigans 1'
+check 'probe-silent: requests, no probe result for an hour' 11 "$probe_silent" "$silent"
+check 'probe-silent: skipped runs are reports' 12 "$probe_silent" ''
+check 'probe-silent: no requests' 13 "$probe_silent" ''
+check 'probe-silent: the whole cron stopped' 14 "$probe_silent" ''
+
 check 'first byte, misses: weighted by responses, not by target' 15 "$(panel_expr 53 A 30m)" 'continent=EU 400'
 check 'first byte, hits: weighted by responses, not by target' 15 "$(panel_expr 54 A 30m)" 'continent=EU 72.5'
+
+sample_silent=$(rule_expr geoshenanigans-tiles-sample-silent)
+check 'sample-silent: no result for 26h while a build is live' -48 "$sample_silent" "$silent"
+check 'sample-silent: a skipped check is a report' -96 "$sample_silent" ''
+check 'sample-silent: a build live for under a day' -144 "$sample_silent" ''
+check 'sample-silent: the watchdog stopped too' -192 "$sample_silent" ''
 
 if [ "$failures" -gt 0 ]; then
   echo "$failures check(s) failed" >&2
