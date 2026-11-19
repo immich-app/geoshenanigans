@@ -523,10 +523,10 @@ export interface BunnyStateStoreOptions {
 }
 
 /**
- * Small requests fail fast, so `bunny:status` gives up within about a minute (5 x 10 s plus backoff) when the zone
- * hangs, well inside the watchdog's job limit. Transfers have no fixed length limit short of an hour, only an idle
- * one: a 1.3 GB planet manifest took 14-18 s each way from a well-connected server, and Bunny answered its PUT half
- * a second after the last byte.
+ * Small requests fail fast, so `bunny:status` gives up within about a minute when the zone hangs (requestBudgetMs: 5
+ * tries of 10 s and at most 11.25 s of backoff between them), well inside the watchdog's job limit. Transfers have no
+ * fixed length limit short of an hour, only an idle one: a 1.3 GB planet manifest took 14-18 s each way from a
+ * well-connected server, and Bunny answered its PUT half a second after the last byte.
  */
 export const STATE_STORE_DEFAULTS = {
   attempts: 5,
@@ -546,7 +546,26 @@ class HttpError extends Error {
 
 const retryable = (error: unknown) => !(error instanceof HttpError) || error.status === 429 || error.status >= 500;
 
-const backoffMs = (attempt: number) => Math.min(15_000, 500 * 2 ** (attempt - 1)) * (0.5 + Math.random());
+/**
+ * The wait before try `attempt + 1`: doubling from 500 ms up to 15 s, jittered (`random` in [0, 1)) to between half
+ * and 1.5 times that.
+ */
+const backoffMs = (attempt: number, random = Math.random()) =>
+  Math.min(15_000, 500 * 2 ** (attempt - 1)) * (0.5 + random);
+
+/**
+ * The longest a small request (state.json, a DESCRIBE) takes to fail when the zone never answers: every try runs out
+ * its requestTimeoutMs, with the longest backoff (the most jitter) between them.
+ */
+export function requestBudgetMs(settings: Pick<BunnyStateStoreOptions, 'attempts' | 'requestTimeoutMs'> = {}): number {
+  const attempts = settings.attempts ?? STATE_STORE_DEFAULTS.attempts;
+  const requestTimeoutMs = settings.requestTimeoutMs ?? STATE_STORE_DEFAULTS.requestTimeoutMs;
+  let total = attempts * requestTimeoutMs;
+  for (let attempt = 1; attempt < attempts; attempt++) {
+    total += backoffMs(attempt, 1);
+  }
+  return total;
+}
 
 /** A small Bunny storage client for the state zone: a few objects, the large ones streamed. */
 export class BunnyStateStore implements ObjectStore {

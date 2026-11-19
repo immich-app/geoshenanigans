@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { readFile, writeFile } from 'node:fs/promises';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { writeManifest } from '../../src/bunny/manifest';
 import {
   beginBuild,
@@ -13,6 +13,7 @@ import {
   pruneManifests,
   publishBuild,
   readState,
+  requestBudgetMs,
   STATE_STORE_DEFAULTS,
   statePath,
   SyncState,
@@ -559,18 +560,33 @@ describe('BunnyStateStore', () => {
     await expect(store().put('x.json', new Uint8Array([1, 2, 3]), 'AB'.repeat(32))).rejects.toThrow(/400/);
   });
 
-  it('gives up on a zone that takes requests and never answers, within its per-try limit', async () => {
+  it('gives up on a zone that takes requests and never answers within its budget, backoff included', async () => {
     server.faults.stallNext = 10;
-    const hung = new BunnyStateStore({ ...options, attempts: 2, requestTimeoutMs: 300 });
-    const started = performance.now();
-    await expect(hung.get('state.json')).rejects.toThrow();
-    expect(performance.now() - started).toBeLessThan(3000);
-    expect(server.requests.filter((request) => request.endsWith('(stalled)'))).toHaveLength(2);
-    await hung.close();
+    const settings = { attempts: 3, requestTimeoutMs: 200 };
+    // Every try times out and every backoff takes its most jitter: the request takes its whole budget.
+    const random = vi.spyOn(Math, 'random').mockReturnValue(1 - Number.EPSILON);
+    const hung = new BunnyStateStore({ ...options, ...settings });
+    try {
+      const budget = requestBudgetMs(settings);
+      // 3 tries of 200 ms, and backoffs of 750 and 1500 ms between them.
+      expect(budget).toBe(2_850);
+      const started = performance.now();
+      await expect(hung.get('state.json')).rejects.toThrow();
+      const elapsed = performance.now() - started;
+      expect(elapsed).toBeGreaterThanOrEqual(budget - 20);
+      expect(elapsed).toBeLessThan(budget + 1_500);
+      expect(server.requests.filter((request) => request.endsWith('(stalled)'))).toHaveLength(3);
+    } finally {
+      random.mockRestore();
+      await hung.close();
+    }
   });
 
-  it('keeps a hung status check to about a minute by default, inside the watchdog job', () => {
-    expect(STATE_STORE_DEFAULTS.attempts * STATE_STORE_DEFAULTS.requestTimeoutMs).toBeLessThanOrEqual(60_000);
+  it('keeps a hung status check to about a minute by default, backoff included, inside the watchdog job', () => {
+    // 5 tries of 10 s, and at most 0.75 + 1.5 + 3 + 6 s of backoff between them; the watchdog's job has 10 minutes.
+    expect(requestBudgetMs()).toBe(61_250);
+    expect(requestBudgetMs(STATE_STORE_DEFAULTS)).toBe(requestBudgetMs());
+    expect(requestBudgetMs()).toBeLessThanOrEqual(65_000);
   });
 
   it('streams a manifest over a slow link without timing out while bytes move', async () => {
