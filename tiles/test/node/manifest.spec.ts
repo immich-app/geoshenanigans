@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
-import { readdir, readFile, writeFile } from 'node:fs/promises';
+import { link, readdir, readFile, symlink, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
+import { gzipSync } from 'node:zlib';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   buildManifest,
@@ -17,6 +18,8 @@ import { openArchiveFile } from '../../src/deploy/archive-file';
 import {
   BIG_CONTENT,
   Build,
+  contentBytes,
+  contentHash,
   expectedEntries,
   randomBuild,
   rng,
@@ -33,6 +36,42 @@ const collect = async (path: string) => {
   }
   return entries;
 };
+
+/** A gzipped PMTiles v3 directory: count, tile ID deltas, run lengths, lengths, offsets + 1. */
+function directoryBytes(entries: { tileId: number; runLength: number; offset: number; length: number }[]): Buffer {
+  const out: number[] = [];
+  const varint = (value: number) => {
+    for (; value >= 0x80; value = Math.floor(value / 0x80)) {
+      out.push((value % 0x80) | 0x80);
+    }
+    out.push(value);
+  };
+  varint(entries.length);
+  entries.forEach((entry, i) => varint(entry.tileId - (i > 0 ? entries[i - 1].tileId : 0)));
+  entries.forEach((entry) => varint(entry.runLength));
+  entries.forEach((entry) => varint(entry.length));
+  entries.forEach((entry) => varint(entry.offset + 1));
+  return gzipSync(Buffer.from(out));
+}
+
+/** A clustered archive holding one tile over `runLength` positions from tile ID 0, in the root or in a leaf. */
+function longRunArchive(tile: Uint8Array, runLength: number, inLeaf: boolean): Buffer {
+  const entry = { tileId: 0, runLength, offset: 0, length: tile.length };
+  const leaf = inLeaf ? directoryBytes([entry]) : Buffer.alloc(0);
+  const root = directoryBytes([inLeaf ? { tileId: 0, runLength: 0, offset: 0, length: leaf.length } : entry]);
+  const metadata = gzipSync(Buffer.from('{}'));
+  const header = Buffer.alloc(127);
+  header.write('PMTiles', 0, 'latin1');
+  header[7] = 3;
+  const metadataOffset = 127 + root.length;
+  const leafOffset = metadataOffset + metadata.length;
+  const fields = [127, root.length, metadataOffset, metadata.length, leafOffset, leaf.length];
+  [...fields, leafOffset + leaf.length, tile.length, runLength, 1, 1].forEach((value, i) =>
+    header.writeBigUInt64LE(BigInt(value), 8 + i * 8),
+  );
+  header.set([1, 2, 2, 1, 0, 16], 96); // clustered, gzip directories and tiles, MVT, zooms 0-16
+  return Buffer.concat([header, root, metadata, leaf, tile]);
+}
 
 let scratch: Awaited<ReturnType<typeof scratchDir>>;
 beforeEach(async () => {
@@ -177,6 +216,41 @@ describe('buildManifest', () => {
     expect(await readdir(scratch.dir)).toEqual(['a.pmtiles']);
   });
 
+  it.each([
+    { runLength: 2 ** 32, inLeaf: false },
+    { runLength: 2 ** 32 + 1, inLeaf: false },
+    { runLength: 2 ** 32, inLeaf: true },
+    { runLength: 2 ** 32 + 1, inLeaf: true },
+  ])('keeps a run of $runLength positions whole (in a leaf: $inLeaf)', async ({ runLength, inLeaf }) => {
+    const archivePath = scratch.path('long.pmtiles');
+    await writeFile(archivePath, longRunArchive(contentBytes(1), runLength, inLeaf));
+    const out = scratch.path('long.tman.zst');
+    const stats = await buildManifest(archivePath, { out, buildKey: '20261118', threads: 1 });
+    expect(await collect(out)).toEqual([{ tileId: 0, runLength, hash: contentHash(1) }]);
+    expect(stats.header).toMatchObject({ entries: 1, positions: runLength });
+  });
+
+  it('refuses to write the manifest over its own archive', async () => {
+    const archivePath = scratch.path('a.pmtiles');
+    const archive = await writeArchiveFile(archivePath, randomBuild(rng(6), 500), rng(6));
+    const hardLink = scratch.path('hard.pmtiles');
+    const softLink = scratch.path('soft.pmtiles');
+    await link(archivePath, hardLink);
+    await symlink(archivePath, softLink);
+    for (const out of [archivePath, hardLink, softLink]) {
+      await expect(buildManifest(archivePath, { out, buildKey: '20261118', threads: 1 }), out).rejects.toThrow(
+        /is the archive/,
+      );
+    }
+    expect((await readFile(archivePath)).equals(archive.bytes)).toBe(true);
+    expect((await readdir(scratch.dir)).sort()).toEqual(['a.pmtiles', 'hard.pmtiles', 'soft.pmtiles']);
+    // Replacing an earlier manifest of it is fine.
+    const out = scratch.path('a.tman.zst');
+    await writeFile(out, 'stale');
+    await buildManifest(archivePath, { out, buildKey: '20261118', threads: 1 });
+    expect((await readManifestHeader(out)).buildKey).toBe('20261118');
+  });
+
   it('rejects a build key that is not a date', async () => {
     await expect(buildManifest(ASSET, { out: scratch.path('a.tman.zst'), buildKey: '../x' })).rejects.toThrow(
       /YYYYMMDD/,
@@ -232,6 +306,25 @@ describe('manifest file', () => {
     expect(await readdir(scratch.dir)).toEqual([]);
   });
 
+  it('gives each writer of the same file its own partial file', async () => {
+    const out = scratch.path('m.tman.zst');
+    const first = await ManifestWriter.create(out, { buildKey: '20261117' });
+    const second = await ManifestWriter.create(out, { buildKey: '20261118' });
+    first.add(0, 3, 1, 2);
+    second.add(0, 5, 3, 4);
+    second.add(7, 1, 5, 6);
+    await first.drain();
+    await second.drain();
+    await first.abort();
+    const header = await second.finish();
+    expect(header).toMatchObject({ buildKey: '20261118', entries: 2, positions: 6 });
+    expect(await collect(out)).toEqual([
+      { tileId: 0, runLength: 5, hash: hash(0x300000004) },
+      { tileId: 7, runLength: 1, hash: hash(0x500000006) },
+    ]);
+    expect(await readdir(scratch.dir)).toEqual(['m.tman.zst']);
+  });
+
   it('detects truncation, corruption and unfinished files', async () => {
     const out = scratch.path('m.tman.zst');
     const r = rng(4);
@@ -274,6 +367,12 @@ describe('manifest file', () => {
 });
 
 describe('decodeDirectory', () => {
+  it('decodes run lengths beyond 32 bits', () => {
+    // 1 entry: id 0, run 2^32 + 1 (5-byte varint), length 7, offset 0 (+1 encoded).
+    const directory = decodeDirectory(new Uint8Array([1, 0, 0x81, 0x80, 0x80, 0x80, 0x10, 7, 1]));
+    expect([...directory.runLengths]).toEqual([2 ** 32 + 1]);
+  });
+
   it('decodes offsets that continue from the previous entry', () => {
     // 2 entries: ids 5, 7; runs 1, 3; lengths 10, 20; offsets 0 (+1 encoded) then "right after".
     const directory = decodeDirectory(new Uint8Array([2, 5, 2, 1, 3, 10, 20, 1, 0]));

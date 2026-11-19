@@ -52,7 +52,7 @@ import {
 } from '../replication';
 import { BunnyStateStore, downloadManifest, readState, SyncState } from '../state';
 import { BunnyStorage, parseAddresses, resolveStorageAddresses, sha256Hex, storageOptionsFromEnv } from '../storage';
-import { DEFAULT_PREFIX, tileIdZoom, tilePath, zoomEnd, zoomRange, zoomStart } from '../tile-id';
+import { DEFAULT_PREFIX, MAX_SAFE_ZOOM, tileIdZoom, tilePath, zoomEnd, zoomRange, zoomStart } from '../tile-id';
 
 class UsageError extends Error {}
 
@@ -382,6 +382,20 @@ async function main(): Promise<number> {
   if (byId && (values['min-zoom'] !== undefined || values['max-zoom'] !== undefined)) {
     throw new UsageError('Give either --min-zoom/--max-zoom or --from-id/--to-id, not both');
   }
+  // --listing's zooms, checked before anything is read: a reversed range lists no column and would pass.
+  let listing: { minZoom: number; maxZoom: number } | undefined;
+  if (values.listing) {
+    const minZoom = integer('min-zoom', values['min-zoom'], 0);
+    const maxZoom = integer('max-zoom', values['max-zoom'], 15);
+    if (maxZoom < minZoom) {
+      const defaulted = values['max-zoom'] === undefined ? ' (the default)' : '';
+      throw new UsageError(`--max-zoom ${maxZoom}${defaulted} is below --min-zoom ${minZoom}`);
+    }
+    if (maxZoom > MAX_SAFE_ZOOM) {
+      throw new UsageError(`--max-zoom must be at most ${MAX_SAFE_ZOOM}, got ${maxZoom}`);
+    }
+    listing = { minZoom, maxZoom };
+  }
   const regions = values.regions
     ? values.regions.split(',').map((region) => region.trim().toUpperCase())
     : REPLICATION_REGIONS;
@@ -418,7 +432,7 @@ async function main(): Promise<number> {
     return code;
   };
 
-  if (values.listing) {
+  if (listing) {
     if (values.prefix === undefined) {
       const store = BunnyStateStore.fromEnv();
       const state = await readState(store, values['state-prefix']).finally(() => store.close());
@@ -429,12 +443,11 @@ async function main(): Promise<number> {
     }
     const storage = new BunnyStorage(storageOptions);
     try {
-      const minZoom = integer('min-zoom', values['min-zoom'], 0);
       const report = await checkListings(
         storage,
         prefix,
-        minZoom,
-        integer('max-zoom', values['max-zoom'], 15),
+        listing.minZoom,
+        listing.maxZoom,
         regions,
         integer('list', values.list, 100),
       );

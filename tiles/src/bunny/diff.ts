@@ -5,6 +5,7 @@
  */
 import { Entry } from '../pmtiles/types';
 import { ManifestBatch, manifestBatches, ManifestHeader, readManifestHeader } from './manifest';
+import { MAX_SAFE_ZOOM, tileIdZoom, zoomEnd } from './tile-id';
 
 /**
  * Consecutive positions of one kind: `changed` holds other bytes in the new build, `added` exists only in the new
@@ -38,32 +39,32 @@ export interface DiffTotals {
   byZoom: ZoomCounts[];
 }
 
-// First tile ID of each zoom (the PMTiles Hilbert numbering), up to zoom 26.
-const ZOOM_STARTS: number[] = [];
-for (let z = 0, start = 0; z <= 27; z++) {
-  ZOOM_STARTS.push(start);
-  start += 4 ** z;
+/** The zoom of a tile ID; throws for an ID past zoom MAX_SAFE_ZOOM (26). */
+export function zoomOf(tileId: number): number {
+  return tileIdZoom(tileId);
 }
 
-export function zoomOf(tileId: number): number {
-  let z = 0;
-  while (z < 26 && ZOOM_STARTS[z + 1] <= tileId) {
-    z++;
-  }
-  return z;
-}
+/** One past the highest tile ID a manifest can describe: the end of zoom MAX_SAFE_ZOOM. */
+const TILE_ID_END = zoomEnd(MAX_SAFE_ZOOM);
 
 function countByZoom(byZoom: ZoomCounts[], kind: DiffKind, start: number, count: number) {
-  let position = start;
   const end = start + count;
+  // Past the last zoom there is no next zoom to step to: refuse such a range instead of looping on it for ever.
+  if (end > TILE_ID_END) {
+    throw new Error(
+      `${kind} positions ${start}..${end - 1} go past zoom ${MAX_SAFE_ZOOM} (tile IDs end at ${TILE_ID_END}); ` +
+        'a manifest cannot describe them',
+    );
+  }
+  let position = start;
   while (position < end) {
-    const z = zoomOf(position);
-    const zoomEnd = Math.min(end, ZOOM_STARTS[z + 1]);
+    const z = tileIdZoom(position);
+    const stop = Math.min(end, zoomEnd(z));
     while (byZoom.length <= z) {
       byZoom.push({ changed: 0, added: 0, removed: 0 });
     }
-    byZoom[z][kind] += zoomEnd - position;
-    position = zoomEnd;
+    byZoom[z][kind] += stop - position;
+    position = stop;
   }
 }
 

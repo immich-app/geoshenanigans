@@ -11,7 +11,7 @@
  *   bytes are merged, so the manifest depends only on what each position holds, not on how the archive was laid out;
  * - an end marker (gap 0, run length 0), so a truncated file never reads as a shorter build.
  */
-import { hash } from 'node:crypto';
+import { hash, randomBytes } from 'node:crypto';
 import { once } from 'node:events';
 import { closeSync, createReadStream, createWriteStream, openSync, readSync } from 'node:fs';
 import { open, rename, rm, stat } from 'node:fs/promises';
@@ -184,10 +184,18 @@ export class ManifestWriter {
 
   static async create(path: string, meta: ManifestMeta, level = 3): Promise<ManifestWriter> {
     parseDeploymentKey('buildKey', meta.buildKey);
-    const partial = `${path}.partial`;
+    // Its own partial file beside the destination, created exclusively: two writers of the same manifest (two
+    // runs for the same date) never share one, so neither truncates, overwrites or removes the other's.
+    const partial = `${path}.${process.pid}-${randomBytes(6).toString('hex')}.partial`;
     // A zeroed header slot: the file only becomes a manifest when finish() writes the header.
-    const handle = await open(partial, 'w');
-    await handle.write(Buffer.alloc(MANIFEST_BODY_OFFSET), 0, MANIFEST_BODY_OFFSET, 0);
+    const handle = await open(partial, 'wx');
+    try {
+      await handle.write(Buffer.alloc(MANIFEST_BODY_OFFSET), 0, MANIFEST_BODY_OFFSET, 0);
+    } catch (error) {
+      await handle.close();
+      await rm(partial, { force: true });
+      throw error;
+    }
     await handle.close();
     const zstd = createZstdCompress({
       params: { [constants.ZSTD_c_compressionLevel]: level, [constants.ZSTD_c_checksumFlag]: 1 },
@@ -700,9 +708,24 @@ class BackReferences {
   }
 }
 
+/** Throws when `out` names the archive itself (the same path, a hard link or a symlink to it). */
+async function refuseArchiveAsOutput(archivePath: string, out: string): Promise<void> {
+  const archive = await stat(archivePath);
+  const existing = await stat(out).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') {
+      return undefined;
+    }
+    throw error;
+  });
+  if (existing && existing.dev === archive.dev && existing.ino === archive.ino) {
+    throw new Error(`${out} is the archive ${archivePath}: writing the manifest there would replace the archive`);
+  }
+}
+
 /** Builds the manifest of a local PMTiles archive, hashing its tiles on every core. */
 export async function buildManifest(archivePath: string, options: BuildManifestOptions): Promise<ManifestBuildStats> {
   const started = performance.now();
+  await refuseArchiveAsOutput(archivePath, options.out);
   const { archive, close } = await openArchiveFile(archivePath);
   const { header, metadata } = archive;
   await close();

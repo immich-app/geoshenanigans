@@ -145,10 +145,12 @@ describe('publishBuild', () => {
       'put manifests/20261118.tman.zst',
       'put state.json',
     ]);
-    // Read back before the state switches.
-    expect(
-      store.log.indexOf('describe manifests/20261118.tman.zst', store.log.indexOf('put manifests/20261118.tman.zst')),
-    ).toBeLessThan(store.log.indexOf('put state.json'));
+    // Read back after the upload and before the state switches.
+    const manifestPut = store.log.indexOf('put manifests/20261118.tman.zst');
+    const verified = store.log.indexOf('describe manifests/20261118.tman.zst', manifestPut + 1);
+    expect(manifestPut).toBeGreaterThanOrEqual(0);
+    expect(verified).toBeGreaterThan(manifestPut);
+    expect(verified).toBeLessThan(store.log.indexOf('put state.json'));
     expect(await readState(store)).toEqual(state);
     expect(store.objects.get('manifests/20261118.tman.zst')).toEqual(new Uint8Array(await readFile(file)));
   });

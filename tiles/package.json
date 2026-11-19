@@ -9,7 +9,7 @@
     "build": "wrangler deploy --dry-run --outdir=dist",
     "test": "vitest",
     "test:cov": "vitest --coverage",
-    "test:node": "vitest run --config vitest.node.config.mts --passWithNoTests",
+    "test:node": "vitest run --config vitest.node.config.mts",
     "cf-typegen": "wrangler types",
     "lint": "eslint \"src/**/*.ts\" \"test/**/*.ts\" --max-warnings 0",
     "lint:fix": "npm run lint -- --fix",

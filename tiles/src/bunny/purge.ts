@@ -48,10 +48,13 @@ export async function purgePullZone(
         headers: { AccessKey: apiKey, Accept: 'application/json' },
         signal: AbortSignal.timeout(options.timeoutMs ?? 30_000),
       });
-      const text = (await response.text()).slice(0, 200);
       if (response.ok) {
+        // The status is the answer: the purge is done whatever happens to the body, so a body that stalls or
+        // breaks off must not turn it into a retry (or a failed sync).
+        void response.body?.cancel().catch(() => {});
         return { status: response.status, attempts: attempt, ms: Math.round(performance.now() - started) };
       }
+      const text = (await response.text()).slice(0, 200);
       last = `HTTP ${response.status} ${text}`.trim();
       if (response.status !== 429 && response.status < 500) {
         throw new PurgeError(`Purge of pull zone ${id} failed: ${last}`);

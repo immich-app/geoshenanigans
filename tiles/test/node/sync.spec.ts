@@ -778,7 +778,10 @@ describe('runSync', () => {
     expect(tileJson.tiles).toEqual(['https://tiles.example/v1/e2/{z}/{x}/{y}.mvt']);
     expect(w.tiles.files.has('v1/e2.json')).toBe(false);
     const put = w.events.indexOf('tiles PUT v1.json');
-    expect(w.events.indexOf('tiles DESCRIBE v1.json', put + 1)).toBeLessThan(w.events.indexOf('purge'));
+    const gated = w.events.indexOf('tiles DESCRIBE v1.json', put + 1);
+    expect(put).toBeGreaterThanOrEqual(0);
+    expect(gated).toBeGreaterThan(put);
+    expect(gated).toBeLessThan(w.events.indexOf('purge'));
 
     // A daily sync follows the live prefix without being told.
     const back = await runSync(w.options('20261117'), w.deps());
