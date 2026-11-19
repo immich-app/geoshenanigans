@@ -49,8 +49,12 @@ describe('liveStatus', () => {
 });
 
 describe('bunny:status', () => {
-  // The CLI measures ages from the real clock, so its live build is yesterday's (UTC): 24 to 48 hours old.
-  const liveBuild = new Date(Date.now() - 86_400_000).toISOString().slice(0, 10).replaceAll('-', '');
+  // The CLI measures ages from the real clock, so its live build is yesterday's (UTC): 24 to 48 hours old. A pending
+  // build is today's, from the same reading of the clock, so the two never name one date (state.json refuses that).
+  const now = Date.now();
+  const buildOf = (time: number) => new Date(time).toISOString().slice(0, 10).replaceAll('-', '');
+  const liveBuild = buildOf(now - 86_400_000);
+  const pendingBuild = buildOf(now);
   const live: SyncState = { ...state, liveBuild, manifest: `manifests/${liveBuild}.tman.zst` };
   // Bunny settings in the caller's environment (a state host of their own, say) must not reach the CLI.
   const inherited = Object.fromEntries(Object.entries(process.env).filter(([name]) => !name.startsWith('BUNNY_')));
@@ -118,14 +122,14 @@ describe('bunny:status', () => {
   });
 
   it('names builds a sync started and did not finish, in the JSON too (the workflow reverts them)', async () => {
-    const pending = [
-      { build: '20261119', manifest: 'manifests/20261119.tman.zst', positions: 1, startedAt: '2026-11-19T10:00:00Z' },
-    ];
+    const startedAt = new Date(now).toISOString();
+    const pending = [{ build: pendingBuild, manifest: `manifests/${pendingBuild}.tman.zst`, positions: 1, startedAt }];
+    expect(pendingBuild).not.toBe(liveBuild);
     await write({ ...live, pending });
     const human = await status('--state-prefix', 'itest-b-1');
-    expect(human.stdout).toMatch(/^pending 20261119 since 2026-11-19T10:00:00Z/m);
+    expect(human.stdout).toMatch(new RegExp(`^pending ${pendingBuild} since ${startedAt.replaceAll('.', '\\.')}`, 'm'));
     const { stdout } = await status('--json', '--state-prefix', 'itest-b-1');
-    expect(JSON.parse(stdout)).toMatchObject({ liveBuild, pending: ['20261119'] });
+    expect(JSON.parse(stdout)).toMatchObject({ liveBuild, pending: [pendingBuild] });
   });
 
   it('exits 1 with nulls when nothing has been synced', async () => {
