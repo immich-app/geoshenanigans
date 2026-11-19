@@ -185,6 +185,11 @@ export interface ReplicationResult {
    * before the timeout (when a pass outlasts it, a DESCRIBE keeps failing, or the timeout cancelled one mid-retry).
    */
   incomplete: number;
+  /**
+   * Of the incomplete files, those no DESCRIBE answered for at all: nothing is known of them, not even that they are
+   * stored. The rest were last shown stored with the expected bytes, just not yet in every region.
+   */
+  unchecked: number;
   /** The first of those (up to `stragglerLimit`) and the regions each lacked, so a stuck file can be named. */
   stragglers: Array<{ path: string; regions: string[] }>;
   /** When each region first held every file, from the start of the wait; null if it never did. */
@@ -372,6 +377,7 @@ export async function waitForReplication(
   const stragglerLimit = options.stragglerLimit ?? 20;
   const stragglers: ReplicationResult['stragglers'] = [];
   let incomplete = 0;
+  let unchecked = 0;
   let errors = 0;
   for (const index of pending) {
     errors += (failed[index >>> 3] >> (index & 7)) & 1;
@@ -379,6 +385,9 @@ export async function waitForReplication(
       continue;
     }
     incomplete++;
+    if (lacking[index] >= UNCHECKED) {
+      unchecked++;
+    }
     if (stragglers.length < stragglerLimit) {
       const mask = lacking[index];
       stragglers.push({ path: items.path(index), regions: regions.filter((_, i) => mask & (2 ** i)) });
@@ -391,11 +400,24 @@ export async function waitForReplication(
     mismatched: paths('mismatched'),
     missing: paths('missing'),
     incomplete,
+    unchecked,
     stragglers,
     regionWaitMs,
     passes,
     errors,
   };
+}
+
+/**
+ * What a gate's result means as bunny:replication --wait's exit code: 0 every file stored with the expected bytes in
+ * every region; 2 every file known to be stored with them, some not yet in every region; 1 a file missing or
+ * mismatched, a last DESCRIBE that failed, or a file no DESCRIBE answered for (not known to be stored at all).
+ */
+export function gateExitCode(result: ReplicationResult): 0 | 1 | 2 {
+  if (result.missing.length + result.mismatched.length + result.errors + result.unchecked > 0) {
+    return 1;
+  }
+  return result.complete ? 0 : 2;
 }
 
 interface Tally {

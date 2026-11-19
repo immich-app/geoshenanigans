@@ -14,7 +14,8 @@
  *
  * --live takes the prefix and zooms of the live build and needs --sample; while state.json lists pending builds the
  * zone may hold their bytes where they differ, so it then checks nothing and reports why (exit 0), before it reads the
- * manifest or the tiles zone.
+ * manifest or the tiles zone or its settings. The zooms are the manifest header's (the archive's, or the zooms a
+ * sync was limited to), or for a header without them the zooms of the manifest's first and last positions.
  * --listing walks every `<prefix>/<z>/<x>/` folder of the zooms with directory listings (Bunny serves 5 at once per
  * zone; this takes 4): one listing returns the replica regions of up to 32,768 files in about 1.6 s, so it checks that
  * every position of a planet first load is stored and in every region in hours, where DESCRIBEs would take weeks. It
@@ -31,24 +32,27 @@
  * to 240 per address, so this check takes 8 per address by default (about 40 in flight over 5 addresses). Raise
  * --max-connections-per-address only while nothing else uploads to the zone; --concurrency is lowered to the
  * addresses times that.
- * Needs BUNNY_STORAGE_ZONE and BUNNY_STORAGE_PASSWORD (and BUNNY_STORAGE_HOST unless it is storage.bunnycdn.com).
+ * Needs BUNNY_STORAGE_ZONE and BUNNY_STORAGE_PASSWORD (and BUNNY_STORAGE_HOST unless it is storage.bunnycdn.com),
+ * read once there is something to check: a --live skip for pending builds needs none of them.
  * --addresses (or BUNNY_STORAGE_ADDRESSES) pins the storage IPs instead of resolving the host.
  * The report goes to stdout as JSON (and to --json), a summary to stderr.
  * --live and --listing need BUNNY_STATE_ZONE and BUNNY_STATE_PASSWORD too (--listing only when --prefix is not given).
  * Exit codes: 0 everything stored and on every region, 2 stored but not yet on every region, 1 missing or
- * mismatched files, DESCRIBE errors (with --wait, files whose last DESCRIBE failed), a refused password or no file to
- * check (a range or sample with no position in the archive or build), 3 bad arguments.
+ * mismatched files, DESCRIBE errors (with --wait, files whose last DESCRIBE failed, and files no DESCRIBE answered for
+ * before the timeout: not known to be stored), a refused password or no file to check (a range or sample with no
+ * position in the archive or build), 3 bad arguments.
  */
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import { ArchiveRanges, TileRun } from '../archive-walk';
-import { hashHex, manifestBatches, readManifestHeader } from '../manifest';
+import { hashHex, manifestBatches, manifestZoomBounds } from '../manifest';
 import {
   checkReplication,
   CoverageReport,
   forEachLimit,
+  gateExitCode,
   normalizeRegions,
   REPLICATION_REGIONS,
   ReplicationItem,
@@ -427,16 +431,22 @@ async function main(): Promise<number> {
   const seed = integer('seed', values.seed, Math.floor(Math.random() * 2 ** 31));
   const mode = values.sample !== undefined ? (values['per-zoom'] ? 'sample-per-zoom' : 'sample') : 'range';
 
-  const storageOptions = storageOptionsFromEnv();
+  // An argument, checked before anything is read like the others, so a skip for pending builds cannot hide it.
+  let addresses: string[] | undefined;
   if (values.addresses !== undefined) {
     try {
-      storageOptions.addresses = parseAddresses(values.addresses);
+      addresses = parseAddresses(values.addresses);
     } catch (error) {
       throw new UsageError((error as Error).message);
     }
   }
-  /** The tiles zone's client, its addresses resolved only once something is to be checked. */
+  /**
+   * The tiles zone's client, its settings read from the environment and its addresses resolved only once something
+   * is to be checked: a skip for pending builds needs neither.
+   */
   const tileStorage = async () => {
+    const storageOptions = storageOptionsFromEnv();
+    storageOptions.addresses = addresses ?? storageOptions.addresses;
     storageOptions.addresses ??= await resolveStorageAddresses(storageOptions.host);
     const concurrency = Math.max(1, Math.min(requestedConcurrency, storageOptions.addresses.length * perAddress));
     const storage = new BunnyStorage({ ...storageOptions, concurrency, connectionsPerAddress: perAddress });
@@ -514,13 +524,10 @@ async function main(): Promise<number> {
     const opened = await tileStorage();
     storage = opened.storage;
     const { concurrency } = opened;
-    const bounds = live
-      ? await readManifestHeader(live.manifest).then((header) => ({
-          minZoom: header.minZoom ?? 0,
-          // Every position of [0, positions) is in the build (D1b); a clipped manifest says so by its positions.
-          maxZoom: tileIdZoom(Math.max(0, header.positions - 1)),
-        }))
-      : ranges!.archive.header;
+    const bounds = live ? await manifestZoomBounds(live.manifest) : ranges!.archive.header;
+    if (!bounds) {
+      throw new Error(`No file to check: the live build ${live!.state.liveBuild}'s manifest holds no position`);
+    }
     const { from, to } =
       idRange ??
       zoomRange(
@@ -587,11 +594,12 @@ async function main(): Promise<number> {
               `everywhere; missing per region: ${regions.map((region) => `${region} ${n(missingByRegion[region])}`).join(' ')}\n`,
           ),
       });
-      code = waited.missing.length + waited.mismatched.length + waited.errors > 0 ? 1 : waited.complete ? 0 : 2;
+      code = gateExitCode(waited);
       result = { ...scope, files: items.length, ...waited };
       process.stderr.write(
         `${waited.complete ? 'Replicated' : 'Not replicated'} after ${Math.round(waited.waitedMs / 1000)} s: ` +
-          `${waited.missing.length} missing, ${waited.mismatched.length} mismatched, ${n(waited.incomplete)} incomplete; ` +
+          `${waited.missing.length} missing, ${waited.mismatched.length} mismatched, ${n(waited.incomplete)} incomplete ` +
+          `(${n(waited.unchecked)} never answered), ${n(waited.errors)} errors; ` +
           `region done at (s): ${regions.map((region) => `${region} ${waited.regionWaitMs[region] === null ? '-' : Math.round(waited.regionWaitMs[region]! / 1000)}`).join(' ')}\n`,
       );
     } else {
