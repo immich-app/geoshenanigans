@@ -1,9 +1,10 @@
 name: Tiles Sync Watchdog
 
 # Reports the live Bunny tiles build to FUTO o11y every 2 hours, independently of Tiles Sync: its age and its OSM
-# data's, which geoshenanigans-tiles-osm-old reads, with a heartbeat for geoshenanigans-tiles-watchdog-silent. A
-# watchdog that cannot read the live state (state.json in the immich-tiles-state zone) sends no heartbeat, so that
-# alert pages for it too (o11y/alerts/geoshenanigans-tiles.yaml).
+# data's, which geoshenanigans-tiles-osm-old and -sync-stale read, with a heartbeat for
+# geoshenanigans-tiles-watchdog-silent. A watchdog that cannot read the live state (state.json in the
+# immich-tiles-state zone) sends no heartbeat, so that alert pages for it too; before the first load (no state.json
+# yet) it sends the heartbeat alone (o11y/alerts/geoshenanigans-tiles.yaml).
 
 on:
   schedule:
@@ -46,7 +47,9 @@ jobs:
       - name: Install 1Password CLI
         uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
 
-      # Its failure is reported (no heartbeat) before the job fails below.
+      # Its failure is reported (no heartbeat) before the job fails below. bunny:status exits 1 both before the
+      # first load (it then prints nulls) and when it can't read the zone (no JSON); live-state fails only for the
+      # second.
       - name: Read the live build
         id: status
         continue-on-error: true
@@ -59,9 +62,11 @@ jobs:
           set +e
           op run -- npm run --silent bunny:status -- --json > "$RUNNER_TEMP/status.json" 2> "$RUNNER_TEMP/status.err"
           code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           cat "$RUNNER_TEMP/status.json"
           tail -c 2000 "$RUNNER_TEMP/status.err" >&2
-          exit "$code"
+          python3 ../deployment/scripts/tiles_sync_report.py live-state --status "$RUNNER_TEMP/status.json" \
+            --status-exit "$code" --status-stderr "$RUNNER_TEMP/status.err"
 
       # Reporting never fails the run; a branch's dispatch only prints what it would send. The token is read here
       # and handed to the report alone.
@@ -70,8 +75,9 @@ jobs:
         timeout-minutes: 5
         env:
           OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          STATUS_EXIT: ${{ steps.status.outputs.exit_code }}
         run: |
-          args=(watchdog --status "$RUNNER_TEMP/status.json" --stderr "$RUNNER_TEMP/status.err")
+          args=(watchdog --status "$RUNNER_TEMP/status.json" --status-exit "$STATUS_EXIT" --stderr "$RUNNER_TEMP/status.err")
           if [ "$GITHUB_REF" != refs/heads/main ]; then
             python3 deployment/scripts/tiles_sync_report.py "${args[@]}" --dry-run
             exit 0
