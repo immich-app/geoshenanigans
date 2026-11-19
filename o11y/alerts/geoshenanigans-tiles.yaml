@@ -1184,13 +1184,17 @@ spec:
     # for a good one) and tiles_bunny_probe_runs{result} once, all stamped at
     # the run's minute. kind is the cache status the edge reported and target
     # the tile tested, so after a purge the popular tile's miss is a miss
-    # beside the random tile's: the rule adds up over target. Fires per
-    # continent and kind when over half the verdicts in 30 minutes were errors
-    # (at least 2); tests without a verdict count in neither, so runs that saw
-    # nothing of a continent and kind do not dilute it. The window must hold
-    # two runs at all times: 30m does at a BUNNY_PROBE_INTERVAL_MINUTES of up
-    # to 14 (10 by default; 15m never fired at 10, as a window held two runs
-    # only half the time and `for` restarted). `continent`, not `region`:
+    # beside the random tile's: the ratio adds up over target. Fires per
+    # continent and kind when over half the verdicts in 30 minutes were errors;
+    # tests without a verdict count in neither, so runs that saw nothing of a
+    # continent and kind do not dilute it. The gate takes errors in two runs:
+    # one probe per continent tests each target once a run, so a target's
+    # series holds one sample per run, and the largest of its sums is at least
+    # 2 only when two runs failed. Summed over target, one run after a purge
+    # (both tiles a miss, both failing) would be 2 already. The window must
+    # hold two runs at all times: 30m does at a BUNNY_PROBE_INTERVAL_MINUTES of
+    # up to 14 (10 by default; 15m never fired at 10, as a window held two
+    # runs only half the time and `for` restarted). `continent`, not `region`:
     # region is an o11y identity label (world). Runs that failed at Globalping
     # itself say nothing about Bunny: geoshenanigans-tiles-bunny-probe-failing.
     - uid: geoshenanigans-tiles-bunny-probe-errors
@@ -1203,8 +1207,9 @@ spec:
       annotations:
         summary: The synthetic probe gets errors from the Bunny pull zone.
         description: >-
-          At least 2, and over half, of the synthetic probe's tests with a verdict in the past 30 minutes got a
-          failed or wrong response from its probe in the alert's continent, for tiles of the alert's kind: the
+          Over half of the synthetic probe's tests with a verdict in the past 30 minutes got a failed or wrong
+          response from its probe in the alert's continent, for tiles of the alert's kind, and one tile failed in
+          at least two runs (one run after a purge, when both tiles miss, is not enough). The kind is the
           cache status the edge reported (hit: from the edge's cache, normally the popular tile; miss: from
           storage, normally the random z15 position, and the popular tile after a purge; a test without a
           CDN-Cache header counts as the tile it tested). Try the URLs from the probe's lines (the dashboard's
@@ -1228,8 +1233,16 @@ spec:
               type: prometheus
               uid: VictoriaMetricsFleet
             expr: >-
-              (sum by (continent, kind) (sum_over_time(tiles_bunny_probe_errors{project="geoshenanigans", cluster="tiles", env="prod"}[30m])) >= 2)
-                / sum by (continent, kind) (count_over_time(tiles_bunny_probe_errors{project="geoshenanigans", cluster="tiles", env="prod"}[30m])) > 0.5
+              (
+                sum by (continent, kind) (sum_over_time(tiles_bunny_probe_errors{project="geoshenanigans", cluster="tiles", env="prod"}[30m]))
+                  / sum by (continent, kind) (count_over_time(tiles_bunny_probe_errors{project="geoshenanigans", cluster="tiles", env="prod"}[30m]))
+                > 0.5
+              )
+              and on (continent, kind)
+              (
+                max by (continent, kind) (sum_over_time(tiles_bunny_probe_errors{project="geoshenanigans", cluster="tiles", env="prod"}[30m]))
+                >= 2
+              )
             instant: true
             range: false
             intervalMs: 1000
@@ -1347,10 +1360,11 @@ spec:
     # stays under it and is geoshenanigans-tiles-sample-unreplicated's to find.
     # Per continent over 30 minutes (three runs at the default 10-minute
     # interval), adding up over target (the tile tested): the misses' average,
-    # only while at least two of them took over 1 s, so neither a lone result
-    # (the only sample when the next run is skipped) nor one outlier among
-    # fast ones starts the timer. A warning: slow misses degrade the map
-    # without breaking it.
+    # only while one target took over 1 s in at least two runs (its series
+    # holds one sample per run), so neither a lone run (the only one when the
+    # next run is skipped, though both tiles miss in it after a purge) nor one
+    # outlier among fast ones starts the timer. A warning: slow misses degrade
+    # the map without breaking it.
     - uid: geoshenanigans-tiles-bunny-probe-slow
       title: Bunny synthetic probe sees slow misses
       condition: B
@@ -1362,9 +1376,9 @@ spec:
         summary: The synthetic probe's uncached tiles take over 1 second to first byte.
         description: >-
           The synthetic probe's average time to first byte for tiles the edge read from storage (cache misses)
-          from the alert's continent has been above 1s for 15 minutes, over 30-minute windows in which at least
-          two misses took over 1s. The Tiles dashboard's "Probe first byte, misses" shows whether
-          it is one continent (Bunny routing that continent to far PoPs, or its storage region down) or all
+          from the alert's continent has been above 1s for 15 minutes, over 30-minute windows in which one tile
+          took over 1s to miss in at least two runs. The Tiles dashboard's "Probe first byte, misses" shows
+          whether it is one continent (Bunny routing that continent to far PoPs, or its storage region down) or all
           of them (the storage zone or the middleware script; check status.bunny.net). A region merely lacking
           files is slower (350-530 ms, from Frankfurt) but under this threshold:
           geoshenanigans-tiles-sample-unreplicated reports that.
@@ -1390,7 +1404,7 @@ spec:
               )
               and on (continent, kind)
               (
-                sum by (continent, kind) (count_gt_over_time(tiles_bunny_probe_ttfb_ms{project="geoshenanigans", cluster="tiles", env="prod", kind="miss"}[30m], 1000))
+                max by (continent, kind) (count_gt_over_time(tiles_bunny_probe_ttfb_ms{project="geoshenanigans", cluster="tiles", env="prod", kind="miss"}[30m], 1000))
                 >= 2
               )
             instant: true

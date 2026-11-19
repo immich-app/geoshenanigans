@@ -92,11 +92,24 @@ runs 1 20 15 10 5
 sample 1 20 tiles_bunny_probe_errors 'continent="EU",kind="miss"' 1
 sample 1 15 tiles_bunny_probe_errors 'continent="EU",kind="miss"' 1
 for m in 20 15 10 5; do sample 1 "$m" tiles_bunny_probe_errors 'continent="NA",kind="miss"' 0; done
-# Case 2: one run after a purge: the popular tile is a miss too and both targets
-# fail in EU. Two errors of two verdicts, in two series that differ in target.
-runs 2 5
+# Case 2: one run after a purge, when the popular tile is a miss too, fails for
+# both targets: two errors, but of one run. EU: that run alone (2 of 2). SA: the
+# next run's tests are fine, the popular tile a hit again (2 of 3 misses).
+runs 2 15 5
 sample 2 5 tiles_bunny_probe_errors 'continent="EU",kind="miss",target="hit"' 1
 sample 2 5 tiles_bunny_probe_errors 'continent="EU",kind="miss",target="miss"' 1
+sample 2 15 tiles_bunny_probe_errors 'continent="SA",kind="miss",target="hit"' 1
+sample 2 15 tiles_bunny_probe_errors 'continent="SA",kind="miss",target="miss"' 1
+sample 2 5 tiles_bunny_probe_errors 'continent="SA",kind="hit",target="hit"' 0
+sample 2 5 tiles_bunny_probe_errors 'continent="SA",kind="miss",target="miss"' 0
+# Case 6: two failing runs. After a purge both targets miss and fail in EU; the
+# next run, the popular tile still a miss is fine and the random one fails again.
+# The ratio adds up over target: 3 errors of 4 verdicts.
+runs 6 15 5
+sample 6 15 tiles_bunny_probe_errors 'continent="EU",kind="miss",target="hit"' 1
+sample 6 15 tiles_bunny_probe_errors 'continent="EU",kind="miss",target="miss"' 1
+sample 6 5 tiles_bunny_probe_errors 'continent="EU",kind="miss",target="hit"' 0
+sample 6 5 tiles_bunny_probe_errors 'continent="EU",kind="miss",target="miss"' 1
 # Case 3: nothing to fire on: one error in three verdicts (EU), a lone error (AF),
 # and exactly half of four verdicts (NA, needs over half).
 runs 3 20 15 10 5
@@ -121,13 +134,17 @@ sample 4 5 tiles_bunny_probe_ttfb_ms 'continent="AF",kind="miss"' 1500
 sample 4 25 tiles_bunny_probe_ttfb_ms 'continent="NA",kind="miss"' 50
 sample 4 15 tiles_bunny_probe_ttfb_ms 'continent="NA",kind="miss"' 5000
 sample 4 5 tiles_bunny_probe_ttfb_ms 'continent="NA",kind="miss"' 100
-# OC: after a purge both targets miss, all slow, in series that differ in target;
-# its slow hits don't count.
+# OC: after a purge both targets miss, all slow, in series that differ in target,
+# the random tile in two runs; its slow hits don't count.
 sample 4 15 tiles_bunny_probe_ttfb_ms 'continent="OC",kind="miss",target="hit"' 1100
 sample 4 15 tiles_bunny_probe_ttfb_ms 'continent="OC",kind="miss",target="miss"' 1500
 sample 4 5 tiles_bunny_probe_ttfb_ms 'continent="OC",kind="miss",target="miss"' 1300
 sample 4 5 tiles_bunny_probe_ttfb_ms 'continent="OC",kind="hit",target="hit"' 3000
 sample 4 15 tiles_bunny_probe_ttfb_ms 'continent="OC",kind="hit",target="hit"' 3000
+# AS: one run after a purge, both targets slow misses, and the next run skipped:
+# two slow misses, but of one run: no.
+sample 4 5 tiles_bunny_probe_ttfb_ms 'continent="AS",kind="miss",target="hit"' 1500
+sample 4 5 tiles_bunny_probe_ttfb_ms 'continent="AS",kind="miss",target="miss"' 1500
 # SA: misses slow before the window: no.
 sample 4 50 tiles_bunny_probe_ttfb_ms 'continent="SA",kind="miss"' 1500
 sample 4 40 tiles_bunny_probe_ttfb_ms 'continent="SA",kind="miss"' 1500
@@ -144,11 +161,12 @@ curl -fsS "$vm/internal/force_flush" >/dev/null
 
 errors=$(rule_expr geoshenanigans-tiles-bunny-probe-errors)
 check 'probe-errors: errors over verdicts, not runs' 1 "$errors" 'continent=EU,kind=miss 1'
-check 'probe-errors: adds up over target' 2 "$errors" 'continent=EU,kind=miss 1'
+check 'probe-errors: one run after a purge, both targets failing' 2 "$errors" ''
+check 'probe-errors: two failing runs, adding up over target' 6 "$errors" 'continent=EU,kind=miss 0.75'
 check 'probe-errors: one error, a lone error, exactly half' 3 "$errors" ''
 
 slow=$(rule_expr geoshenanigans-tiles-bunny-probe-slow)
-check 'probe-slow: two slow misses, not one, nor one outlier' 4 "$slow" \
+check 'probe-slow: slow misses in two runs, not one, nor one outlier' 4 "$slow" \
   "$(printf '%s\n' 'continent=EU,kind=miss 1400' 'continent=OC,kind=miss 1300')"
 
 check 'cache hits by zoom: zero for misses only, gap for no requests' 5 "$(panel_expr 50 A 10m)" \
