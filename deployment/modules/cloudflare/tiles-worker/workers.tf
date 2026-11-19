@@ -107,7 +107,8 @@ resource "cloudflare_workers_script" "tiles" {
 # command's environment. Every upload drops them: provider 4.52.10 uploads only the configured bindings, and its
 # refresh records the secrets it doesn't manage, without their values, so every prod plan updates the script to remove
 # them. Hence this puts them after every upload, and on every apply anyway (plantimestamp), which also sends out a
-# rotated value.
+# rotated value. When one can't be put, the script deploys the version that served before the upload again, secrets
+# and all, and fails the apply: a failed put doesn't leave the worker without secrets it had before the apply.
 resource "terraform_data" "bunny_secrets" {
   count = length(local.bunny_secret_names) > 0 ? 1 : 0
 
