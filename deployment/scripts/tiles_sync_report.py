@@ -19,7 +19,8 @@ Usage:
 build-info prints the tiles schema version and the OSM replication time of a
 Protomaps build as JSON ({"version", "osmDate"}, null when the archive's
 metadata has none), read from the archive's header and metadata with two range
-requests, before the 140 GB download.
+requests (each answer's Content-Range must be the bytes asked for), before the
+140 GB download.
 
 decide is the resolve job's choice: the build (the newest in builds.json, or
 the requested one), the live build from `npm run bunny:status -- --json` (its
@@ -45,7 +46,8 @@ sync job's first step to its last.
 sample reports the daily sample check of the live build in every storage
 region (`npm run bunny:replication -- --live --sample N --per-zoom --json
 FILE`): positions missing, holding other bytes than the live manifest, or not
-yet in a region, as tiles_sync_sample_*.
+yet in a region, as tiles_sync_sample_*. A check whose DESCRIBEs failed for
+some positions is result=error (incomplete), with the counts of the rest.
 
 watchdog reports the live build from `npm run bunny:status -- --json`, with a
 heartbeat. A watchdog that cannot read the live state sends no heartbeat, so
@@ -163,6 +165,9 @@ COMPRESSION_NONE = 1
 COMPRESSION_GZIP = 2
 MAX_METADATA_BYTES = 16 << 20
 OSM_TIME_KEY = "planetiler:osm:osmosisreplicationtime"
+# A 206's Content-Range (RFC 9110 14.4): first and last byte, then the
+# archive's size or * when unknown.
+CONTENT_RANGE = re.compile(r"bytes ([0-9]+)-([0-9]+)/([0-9]+|\*)", re.IGNORECASE)
 
 
 def number(value):
@@ -226,12 +231,18 @@ class Log:
 def range_reader(url):
     """read(offset, length) of url by HTTP range requests, failing on anything but exactly those bytes."""
     def read(offset, length):
-        request = urllib.request.Request(url, headers={"Range": f"bytes={offset}-{offset + length - 1}",
-                                                       "User-Agent": USER_AGENT})
+        last = offset + length - 1
+        request = urllib.request.Request(url, headers={"Range": f"bytes={offset}-{last}", "User-Agent": USER_AGENT})
         with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
             # A server that ignores Range answers 200 with the whole archive.
             if response.status != 206:
                 raise ValueError(f"expected a 206 range response, got {response.status}")
+            # The body's length doesn't say where in the archive it starts: only Content-Range does.
+            served = " ".join((response.headers.get("Content-Range") or "").split())
+            match = CONTENT_RANGE.fullmatch(served)
+            if (not match or (int(match[1]), int(match[2])) != (offset, last)
+                    or (match[3] != "*" and int(match[3]) <= last)):
+                raise ValueError(f"expected Content-Range bytes {offset}-{last}/<size>, got {served or 'none'}")
             data = response.read(length + 1)
         if len(data) != length:
             raise ValueError(f"expected {length} bytes at {offset}, got {len(data)}")
@@ -586,7 +597,9 @@ def watchdog(opts, now):
 
 def sample(opts, now):
     """The sample check's samples and log line. An unreadable or absent report is result=error, a check skipped
-    while builds are pending result=skipped; both send no counts."""
+    while builds are pending result=skipped; both send no counts. A report with DESCRIBE errors is result=error
+    too, as those positions went unchecked (all of them when the tiles zone stops answering), but it keeps its
+    counts: what it did find missing, mismatched or unreplicated still alerts."""
     log = Log(app=SAMPLE_APP)
     report = read_json(opts.report)
     if report is not None and isinstance(report.get("skipped"), str):
@@ -597,8 +610,9 @@ def sample(opts, now):
         detail = read_tail(opts.stderr) or "no output"
         log.add(f"tiles sample check could not run (exit {opts.exit}): {detail}", level="error")
         return [("tiles_sync_sample_runs", {"result": "error"}, 1)], log
-    samples = [("tiles_sync_sample_runs", {"result": "ok"}, 1), ("tiles_sync_sample_checked", {}, checked)]
     counts = {field: number(report.get(field)) or 0 for field in ("missing", "mismatched", "errors")}
+    result = "error" if counts["errors"] else "ok"
+    samples = [("tiles_sync_sample_runs", {"result": result}, 1), ("tiles_sync_sample_checked", {}, checked)]
     for field, value in counts.items():
         samples.append((f"tiles_sync_sample_{field}", {}, value))
     lacking = numbers(report.get("lacking"))
@@ -612,7 +626,12 @@ def sample(opts, now):
             f" bytes, {counts['errors']:,.0f} DESCRIBE errors; not yet in a region: {short or 'none'}")
     if examples:
         what += f"; e.g. {', '.join(examples)}"
-    level = "error" if counts["missing"] or counts["mismatched"] else "warn" if short or counts["errors"] else "info"
+    if counts["errors"]:
+        unchecked = [p for p in (report.get("errorPaths") or [])[:3] if isinstance(p, str)]
+        what += (f"; incomplete: {counts['errors']:,.0f} of the {checked:,.0f} positions went unchecked, their"
+                 " DESCRIBE failing after its retries" + (f" (e.g. {', '.join(unchecked)})" if unchecked else ""))
+    level = ("error" if counts["missing"] or counts["mismatched"] or counts["errors"]
+             else "warn" if short else "info")
     log.add(what, level=level)
     return samples, log
 

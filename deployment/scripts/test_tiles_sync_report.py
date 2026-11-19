@@ -374,6 +374,37 @@ class SampleTest(WithTempDir):
         _, log = self.run_sample(json.dumps({**self.CHECK, "missing": 0, "missingPaths": [], "lacking": {}}), "0")
         self.assertEqual(log.records[0]["level"], "info")
 
+    def test_a_check_whose_describes_all_failed_is_an_error_not_a_clean_sample(self):
+        # Bunny storage down: every position counted as checked and as an error, none missing or mismatched.
+        report = {**self.CHECK, "missing": 0, "missingPaths": [], "errors": 1616, "lacking": {"UK": 0, "SYD": 0},
+                  "errorPaths": ["v1/0/0/0.mvt", "v1/1/0/0.mvt", "v1/1/0/1.mvt", "v1/1/1/0.mvt"]}
+        samples, log = self.run_sample(json.dumps(report), exit_code="1")
+
+        self.assertEqual(by_name(samples), {
+            "tiles_sync_sample_runs": {(("result", "error"),): 1},
+            "tiles_sync_sample_checked": {(): 1616},
+            "tiles_sync_sample_missing": {(): 0},
+            "tiles_sync_sample_mismatched": {(): 0},
+            "tiles_sync_sample_errors": {(): 1616},
+            "tiles_sync_sample_lacking": {(("storage_region", "SYD"),): 0, (("storage_region", "UK"),): 0},
+        })
+        self.assertEqual([(r["level"], r["_msg"]) for r in log.records], [
+            ("error", "tiles sample check of 20261118 under v1/: 1,616 positions, 0 missing, 0 with other bytes,"
+                      " 1,616 DESCRIBE errors; not yet in a region: none; incomplete: 1,616 of the 1,616 positions"
+                      " went unchecked, their DESCRIBE failing after its retries (e.g. v1/0/0/0.mvt, v1/1/0/0.mvt,"
+                      " v1/1/0/1.mvt)")])
+
+    def test_a_check_with_some_describe_errors_is_an_error_that_keeps_what_it_found(self):
+        samples, log = self.run_sample(json.dumps({**self.CHECK, "errors": 2}), exit_code="1")
+
+        found = by_name(samples)
+        self.assertEqual(found["tiles_sync_sample_runs"], {(("result", "error"),): 1})
+        self.assertEqual(found["tiles_sync_sample_missing"], {(): 1})
+        self.assertEqual(found["tiles_sync_sample_errors"], {(): 2})
+        self.assertEqual(found["tiles_sync_sample_lacking"][(("storage_region", "SYD"),)], 12)
+        self.assertEqual(log.records[0]["level"], "error")
+        self.assertIn("incomplete: 2 of the 1,616 positions went unchecked", log.records[0]["_msg"])
+
     def test_a_check_skipped_while_builds_are_pending_sends_no_counts(self):
         samples, log = self.run_sample(json.dumps({"skipped": "pending builds 20261119: a sync has to finish first"}),
                                        exit_code="0")
@@ -639,9 +670,13 @@ class BuildInfoTest(unittest.TestCase):
 
 
 class RangeServer(http.server.BaseHTTPRequestHandler):
-    """Serves DATA with byte ranges, or ignores them (a 200 with everything) when IGNORE_RANGE is set."""
+    """Serves DATA with byte ranges and their Content-Range, or ignores them (a 200 with everything) when
+    IGNORE_RANGE is set. SHIFT serves as many bytes from that much further on, and says so; CONTENT_RANGE, when not
+    None, is sent instead of the true one ("" sends none)."""
     DATA = b""
     IGNORE_RANGE = False
+    SHIFT = 0
+    CONTENT_RANGE = None
     USER_AGENTS = []
 
     def do_GET(self):
@@ -652,9 +687,14 @@ class RangeServer(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(self.DATA)
             return
-        start, end = (int(n) for n in self.headers["Range"].removeprefix("bytes=").split("-"))
+        start, end = (int(n) + self.SHIFT for n in self.headers["Range"].removeprefix("bytes=").split("-"))
         part = self.DATA[start:end + 1]
+        content_range = self.CONTENT_RANGE
+        if content_range is None:
+            content_range = f"bytes {start}-{start + len(part) - 1}/{len(self.DATA)}"
         self.send_response(206)
+        if content_range:
+            self.send_header("Content-Range", content_range)
         self.send_header("Content-Length", str(len(part)))
         self.end_headers()
         self.wfile.write(part)
@@ -670,6 +710,8 @@ class RangeReaderTest(unittest.TestCase):
         self.url = f"http://127.0.0.1:{self.server.server_address[1]}/20261118.pmtiles"
         RangeServer.DATA = pmtiles(BuildInfoTest.METADATA)
         RangeServer.IGNORE_RANGE = False
+        RangeServer.SHIFT = 0
+        RangeServer.CONTENT_RANGE = None
         RangeServer.USER_AGENTS = []
 
     def tearDown(self):
@@ -689,6 +731,27 @@ class RangeReaderTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "expected a 206"):
             sut.range_reader(self.url)(0, sut.PMTILES_HEADER_BYTES)
+
+    def test_bytes_of_the_right_length_from_elsewhere_in_the_archive_are_an_error(self):
+        RangeServer.SHIFT = 10
+        self.assertGreaterEqual(len(RangeServer.DATA), sut.PMTILES_HEADER_BYTES + 10)
+
+        with self.assertRaisesRegex(ValueError, r"expected Content-Range bytes 0-126/<size>, got bytes 10-136/"):
+            sut.range_reader(self.url)(0, sut.PMTILES_HEADER_BYTES)
+
+    def test_the_content_range_must_be_the_requested_bytes(self):
+        read = sut.range_reader(self.url)
+        expected = RangeServer.DATA[:sut.PMTILES_HEADER_BYTES]
+        for header in ("bytes 0-126/*", "Bytes 0-126/5000", f"bytes 0-126/{len(RangeServer.DATA)}"):
+            with self.subTest(accepted=header):
+                RangeServer.CONTENT_RANGE = header
+                self.assertEqual(read(0, sut.PMTILES_HEADER_BYTES), expected)
+        for header in ("", "bytes 1-127/5000", "bytes 0-125/5000", "bytes 0-127/5000", "bytes 0-126/126",
+                       "bytes */5000", "bytes 0-126", "items 0-126/5000"):
+            with self.subTest(rejected=header):
+                RangeServer.CONTENT_RANGE = header
+                with self.assertRaisesRegex(ValueError, "expected Content-Range"):
+                    read(0, sut.PMTILES_HEADER_BYTES)
 
 
 class MainTest(WithTempDir):
