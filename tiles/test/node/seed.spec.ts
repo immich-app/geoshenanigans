@@ -225,17 +225,34 @@ describe('runSeed', () => {
     const { fixture, fake, options, dir } = await setup(5_461, {
       hold: ({ method }) => (method === 'PUT' ? held : undefined),
     });
-    const first = runSeed(options({ stateDir: join(dir, 'a') }));
-    await until(() => (fake.requests.PUT ?? 0) > 0);
-
-    await expect(runSeed(options({ from: 3_000, stateDir: join(dir, 'b') }))).rejects.toThrow(
-      /is seeding \[0, 5461\) of test-zone\/itest\/, which overlaps/,
-    );
-    // Another prefix does not overlap.
-    const other = runSeed(options({ prefix: 'other', to: 100, stateDir: join(dir, 'c') }));
-    release();
+    // Every seed started here is released and run out before the fake storage closes, whatever fails below.
+    const started: Promise<unknown>[] = [];
+    const seed = (overrides: Partial<SeedOptions>) => {
+      const run = runSeed(options(overrides));
+      started.push(run.catch(() => {}));
+      return run;
+    };
+    const first = seed({ stateDir: join(dir, 'a') });
+    let other: ReturnType<typeof runSeed> | undefined;
+    let deadline: NodeJS.Timeout | undefined;
+    try {
+      await until(() => (fake.requests.PUT ?? 0) > 0);
+      // Refused before any request. A seed that ran instead would wait on the held PUTs: 10 s, then it counts as not
+      // refused.
+      const overlapping = seed({ from: 3_000, stateDir: join(dir, 'b') });
+      const stillRunning = new Promise((resolve) => (deadline = setTimeout(() => resolve('still running'), 10_000)));
+      await expect(Promise.race([overlapping, stillRunning])).rejects.toThrow(
+        /is seeding \[0, 5461\) of test-zone\/itest\/, which overlaps/,
+      );
+      // Another prefix does not overlap.
+      other = seed({ prefix: 'other', to: 100, stateDir: join(dir, 'c') });
+    } finally {
+      clearTimeout(deadline);
+      release();
+      await Promise.all(started);
+    }
     expect((await first).status.state).toBe('complete');
-    expect((await other).status.state).toBe('complete');
+    expect((await other!).status.state).toBe('complete');
     expect(fake.files.size).toBe(5_461 + 100);
     for (let id = 0; id < 5_461; id++) {
       expect(fake.checksum(tilePath('itest', id))).toBe(fixture.sha256(id));
