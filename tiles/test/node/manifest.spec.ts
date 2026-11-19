@@ -272,16 +272,25 @@ describe('buildManifest', () => {
     );
 
     // Written to while it is read: the path no longer names the file as it was. Its modification time moves a minute
-    // back, which no filesystem's clock granularity hides (a time set to now could land in the same tick).
+    // back, which no filesystem's clock granularity hides (a time set to now could land in the same tick). It moves
+    // once the last job is merged: every thread has opened the file by then (each had jobs), so only the check after
+    // the read can catch it. Moved any earlier, a thread still starting up could catch it first, with its own message.
     const moved = new Date(Number(before.mtimeMs) - 60_000);
+    let movedAt: { jobs: number; jobsTotal: number } | undefined;
     await expect(
       buildManifest(archivePath, {
         ...options,
         out: scratch.path('written.tman.zst'),
         source,
-        onProgress: () => utimesSync(archivePath, moved, moved),
+        onProgress: ({ jobs, jobsTotal }) => {
+          if (jobs === jobsTotal) {
+            movedAt = { jobs, jobsTotal };
+            utimesSync(archivePath, moved, moved);
+          }
+        },
       }),
     ).rejects.toThrow(/replaced or written to while its manifest was built/);
+    expect(movedAt?.jobsTotal).toBeGreaterThan(options.threads);
     expect((await stat(archivePath)).mtime).toEqual(moved);
     // Another file put at the path: the same bytes, but not the file the snapshot is of.
     const copy = scratch.path('copy.pmtiles');
