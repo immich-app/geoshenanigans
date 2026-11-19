@@ -10,9 +10,11 @@
  *
  * Without state.json it refuses unless --adopt (record a build bunny:seed uploaded, writing no tiles: every
  * --seed-state dir must say its seed completed, for this archive, zone and prefix, together over every position, and
- * --adopt-samples random positions must hold the build) or --force-full (write every position, each DESCRIBEd first;
- * for repairs and small zoom ranges). --adopt --replace switches a live zone to a build seeded under another --prefix
- * (a full rewrite): the same checks, the sample also in every region, then the TileJSON points at the new prefix.
+ * --adopt-samples random positions must hold the build) or --force-full (write every position, each DESCRIBEd first,
+ * and delete those the live or a pending build has and this one doesn't; for repairs and small zoom ranges). Under
+ * the live build's key a run (a repair, a revert) refuses an archive whose tiles differ from the live manifest.
+ * --adopt --replace switches a live zone to a build seeded under another --prefix (a full rewrite): the same checks,
+ * the sample also in every region, then the TileJSON points at the new prefix.
  * Every run that writes first hashes the whole archive (its identity, archive-identity.ts), which state.json records
  * and --adopt compares with each seed's. A seed state dir an older bunny:seed left records only a v1 fingerprint
  * (header, root directory and size): --adopt takes it only with --archive-md5, the build's md5sum from builds.json

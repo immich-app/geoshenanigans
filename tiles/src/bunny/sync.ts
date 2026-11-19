@@ -29,7 +29,10 @@
  * Either way the TileJSON and styles go through the replication gate before the purge, in the regions given: before
  * the domain points at a freshly seeded zone, `--regions none` (storage only) spares waiting out its backlog.
  * --force-full writes every position of the build, each DESCRIBEd first, so it suits a repair or a small zoom range
- * (a planet first load is a seed and then --adopt). It keeps to the live build's prefix, as a diff does.
+ * (a planet first load is a seed and then --adopt). It keeps to the live build's prefix, as a diff does, and deletes
+ * what a diff would: the positions the live build or a pending one has and this build doesn't (above --max-zoom too).
+ * Under the live build's own key a run (a --force-full repair, or a revert) needs the very tiles of the live manifest:
+ * no pending entry is made for a build that is live already, so nothing would record where it wrote others.
  *
  * The TileJSON and styles stay at the static prefix (`v1.json`, `v1/style/*`) whatever the tile prefix, so a switch
  * to another tile prefix only changes the TileJSON's tile template. After a run makes a build live, manifests in the
@@ -360,13 +363,17 @@ export async function* planItems(
   }
 }
 
-/** Every position of a manifest as one range per entry, each DESCRIBEd first (--force-full). */
-async function* fullPlan(manifest: string): AsyncGenerator<SyncRange> {
+/**
+ * --force-full: every position of a manifest as one range per entry, each DESCRIBEd first, then the `removed` ranges
+ * of the plan against the live and pending builds (positions they have and the build doesn't), to delete.
+ */
+async function* fullPlan(manifest: string, removed: Iterable<SyncRange> = []): AsyncGenerator<SyncRange> {
   for await (const batch of manifestBatches(manifest)) {
     for (let i = 0; i < batch.count; i++) {
       yield { start: batch.tileIds[i], count: batch.runLengths[i], kind: 'changed', verify: true };
     }
   }
+  yield* removed;
 }
 
 /** `count` positions in [0, positions) of a manifest, as tile IDs in order, picked at random. */
@@ -556,7 +563,7 @@ class SyncRun {
     report.positionsTotal = header.positions;
     report.osmDate = o.osmDate ?? header.osmDate;
 
-    // The plan.
+    // The plan (for --force-full only its removed ranges: every position of the build is written).
     let ranges: RangeList | undefined;
     let totals: DiffTotals | undefined;
     if (!adopting) {
@@ -595,6 +602,7 @@ class SyncRun {
     } else {
       if (state && state.liveBuild !== o.build) {
         // Before the first PUT: a run that dies part-way leaves a state saying which positions may hold this build.
+        // A run under the live key writes only the live build's own bytes (plan() makes sure), so needs no such record.
         await this.step('state', () =>
           beginBuild(this.deps.state, state, { buildKey: o.build, manifestFile: manifest, statePrefix: o.statePrefix }),
         );
@@ -606,7 +614,7 @@ class SyncRun {
       // repairs and small zoom ranges it is for.
       const gateSkipped = mode !== 'force-full' || !state || state.pending.length > 0 || state.liveBuild === o.build;
       const written = await this.step('upload', () =>
-        this.upload(tiles, mode === 'force-full' ? fullPlan(manifest) : ranges!, gateSkipped),
+        this.upload(tiles, mode === 'force-full' ? fullPlan(manifest, ranges) : ranges!, gateSkipped),
       );
       await this.step('replication', () => this.gate(tiles, written));
     }
@@ -684,40 +692,43 @@ class SyncRun {
     return { manifest: clipped, header };
   }
 
-  /** Downloads the live and pending manifests and plans the sync, keeping the ranges unless over the guard rail. */
+  /**
+   * Downloads the live and pending manifests and plans the sync, keeping the ranges unless over the guard rail. For
+   * --force-full, which writes every position of the build anyway, it keeps only the removed ranges.
+   */
   private async plan(state: SyncState | null, manifest: string, header: ManifestHeader) {
     const { o, report } = this;
-    let live: string | undefined;
+    if (!state) {
+      // Nothing to plan against: --force-full writes every position (a diff without a state was refused).
+      return { ranges: undefined, totals: undefined };
+    }
+    const live = await this.scratch(`live-${state.liveBuild}.tman.zst`);
+    await downloadManifest(this.deps.state, state, live, o.statePrefix);
     const pending: string[] = [];
-    if (state) {
-      live = await this.scratch(`live-${state.liveBuild}.tman.zst`);
-      await downloadManifest(this.deps.state, state, live, o.statePrefix);
-      for (const build of state.pending) {
-        pending.push(await this.pendingManifest(state, build, manifest));
-      }
+    for (const build of state.pending) {
+      pending.push(await this.pendingManifest(state, build, manifest));
     }
-    if (report.mode === 'force-full') {
-      // Every position is written (verified first); the diff against the live build is only reported.
-      if (!live) {
-        return { ranges: undefined, totals: undefined };
-      }
-      const diff = await diffManifests(live, manifest);
-      for await (const range of diff) {
-        void range;
-      }
-      return { ranges: undefined, totals: diff.totals };
-    }
-    const plan = await planSync(live!, manifest, pending);
+    const force = report.mode === 'force-full';
+    const plan = await planSync(live, manifest, pending);
     const ranges = new RangeList();
     for await (const range of plan) {
-      // Past the guard rail the run stops before writing, so the ranges are only counted.
-      if (changedShare(plan.totals.diff, header.positions) <= o.maxChangedFraction) {
+      if (force) {
+        // Every position of the build is written (each DESCRIBEd first); what the live and pending builds have and
+        // it doesn't is deleted, as a diff would.
+        if (range.kind === 'removed') {
+          ranges.push(range);
+        }
+      } else if (changedShare(plan.totals.diff, header.positions) <= o.maxChangedFraction) {
         ranges.push(range);
       } else {
+        // Past the guard rail the run stops before writing, so the ranges are only counted.
         ranges.complete = false;
       }
     }
     report.positionsPending = plan.totals.verify;
+    if (state.liveBuild === o.build) {
+      this.refuseOtherLiveTiles(plan.totals.diff);
+    }
     if (plan.totals.verify > 0) {
       this.log(
         `pending builds ${plan.totals.pendingBuilds.join(', ')}: ${plan.totals.verify} positions are checked before ` +
@@ -725,6 +736,29 @@ class SyncRun {
       );
     }
     return { ranges, totals: plan.totals.diff };
+  }
+
+  /**
+   * A run under the live build's key (a --force-full repair, or the revert of a pending build) only puts back the live
+   * build's own bytes: the archive must hold the very tiles of the live manifest. Such a run records no pending build
+   * (the build is live already) and publishes its manifest over the live one, so tiles of other bytes, or positions
+   * added or left out (another --max-zoom), would be written with nothing to say where: a run that died part-way would
+   * leave them for later diffs to miss. Thrown before anything is written.
+   */
+  private refuseOtherLiveTiles(diff: DiffTotals) {
+    const { o } = this;
+    const differing = diff.changed + diff.added + diff.removed;
+    if (differing === 0) {
+      return;
+    }
+    const zoom = diff.byZoom.findIndex((counts) => counts.changed + counts.added + counts.removed > 0);
+    throw new Error(
+      `${o.build} is the live build, and ${o.archive} has other tiles than its manifest at ${differing} positions ` +
+        `from zoom ${zoom} (${diff.changed} changed, ${diff.added} added, ${diff.removed} removed` +
+        `${o.maxZoom === undefined ? '' : `, with --max-zoom ${o.maxZoom}`}): a sync under the live key only puts ` +
+        "back the live build's own bytes, as it records no pending build to say where it wrote. Sync other tiles " +
+        'under a build key of their own',
+    );
   }
 
   /**

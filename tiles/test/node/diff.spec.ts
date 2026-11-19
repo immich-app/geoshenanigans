@@ -586,10 +586,24 @@ describe('bunny:diff', () => {
     expect(await ndjson(ranges)).toEqual(bruteForce(live, next).ranges);
     expect(await readdir(scratch.path('out'))).toEqual(['ranges.ndjson']);
 
-    const pendingPath = await manifestOf(mutateBuild(rng(22), live, 0.02), '20261119');
+    // With a pending build the file is the plan, verify flags and all, including ranges only the pending build put
+    // there (positions where the live and new builds agree).
+    const pending = mutateBuild(rng(22), live, 0.02);
+    const pendingPath = await manifestOf(pending, '20261119');
+    const expected = bruteForcePlan(live, next, [pending]);
+    const positions = (range: DiffRange) => Array.from({ length: range.count }, (_, i) => range.start + i);
+    const listed = new Set(bruteForce(live, next).ranges.flatMap(positions));
+    expect(expected.ranges.some((range) => range.verify && positions(range).every((id) => !listed.has(id)))).toBe(true);
+    expect(expected.ranges.some((range) => !range.verify)).toBe(true);
     const planned = await cli('--old', livePath, '--new', newPath, '--pending', pendingPath, '--ranges', ranges);
     expect(planned).toMatchObject({ code: 0 });
-    expect((await ndjson(ranges)).every((range) => typeof range.verify === 'boolean')).toBe(true);
+    expect(JSON.parse(planned.stdout)).toMatchObject({
+      pendingBuilds: ['20261119'],
+      verify: expected.verify,
+      verifyOnly: expected.verifyOnly,
+      planRanges: expected.ranges.length,
+    });
+    expect(await ndjson(ranges)).toEqual(expected.ranges);
   });
 
   it('refuses a ranges file that is one of the manifests, also through a link', async () => {
