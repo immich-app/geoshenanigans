@@ -591,13 +591,42 @@ describe('runSync', () => {
     const lastTileEvent = lastIndex(w.events, (event) => event.startsWith('tiles '));
     expect(purge).toBeGreaterThan(lastTileEvent);
     expect(lastStatePut).toBeGreaterThan(purge);
-    // The manifest went up before the pending record and the switch.
+    // The manifest went up before the pending record and the switch, and the pending record before any tile.
     const manifestPut = w.events.indexOf('state PUT manifests/20261118.tman.zst');
     expect(manifestPut).toBeGreaterThanOrEqual(0);
     expect(manifestPut).toBeLessThan(w.events.indexOf('state PUT state.json'));
-    expect(manifestPut).toBeLessThan(
+    expect(w.events.indexOf('state PUT state.json')).toBeLessThan(
       w.events.findIndex((event) => event.startsWith('tiles PUT ') && event.endsWith('.mvt')),
     );
+    expect(w.events.indexOf('state PUT state.json')).toBeLessThan(lastStatePut);
+  });
+
+  it('keeps the build pending when the purge fails, and the retry purges without writing again', async () => {
+    const w = await world();
+    await adopted(w);
+    const changed = changedPositions(w, '20261117', '20261118');
+    const failing = {
+      ...w.deps(),
+      purge: async () => {
+        w.events.push('purge failed');
+        throw new Error('purge: 500 from the API');
+      },
+    };
+    const first = await runSync(w.options('20261118'), failing);
+    expect(first).toMatchObject({ status: 'failed', filesUploaded: changed.length, purged: false });
+    expect(first.error).toMatch(/purge: 500 from the API/);
+    expect(w.events).toContain('purge failed');
+    // The live build stays live, the new one pending: nothing said the PoPs dropped the old bytes.
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', pending: [{ build: '20261118' }] });
+
+    const second = await runSync(w.options('20261118'), w.deps());
+    expect(second.error).toBeNull();
+    expect(second).toMatchObject({ status: 'success', filesUploaded: 0, filesSkipped: changed.length, purged: true });
+    expect(w.purges).toBe(1);
+    expect(tilePuts(w)).toHaveLength(changed.length);
+    expect(tilePuts(w).every(([, count]) => count === 1)).toBe(true);
+    expect(w.tiles.identicalReputs).toEqual([]);
+    expect(await readState(w.state)).toMatchObject({ liveBuild: '20261118', pending: [] });
   });
 
   it('PUTs without DESCRIBEing first with plainPuts, where no pending build wrote', async () => {
@@ -701,7 +730,8 @@ describe('runSync', () => {
     expect(pending.liveBuild).toBe('20261117');
     expect(pending.pending.map((p) => p.build)).toEqual(['20261118']);
 
-    const second = await runSync(w.options('20261118'), w.deps());
+    // With plainPuts too: the positions the pending build may have written are DESCRIBEd all the same.
+    const second = await runSync(w.options('20261118', { plainPuts: true }), w.deps());
     expect(second.error).toBeNull();
     expect(second.status).toBe('success');
     expect(second.positionsVerified).toBe(changed.length);
@@ -756,6 +786,14 @@ describe('runSync', () => {
     expect(first.error).toContain(`e.g. ${first.replicationStragglers[0].path} (not in SYD)`);
     expect(w.purges).toBe(0);
     expect(await readState(w.state)).toMatchObject({ liveBuild: '20261117', pending: [{ build: '20261118' }] });
+
+    // A retry while SYD still lacks them writes nothing, but gates the files it finds stored: no purge yet.
+    const retry = await runSync(w.options('20261118', { replicationTimeoutMs: 300 }), w.deps());
+    expect(retry).toMatchObject({ status: 'failed', filesUploaded: 0, filesSkipped: changed.length });
+    expect(retry).toMatchObject({ replicationComplete: false, replicationIncomplete: changed.length, purged: false });
+    expect(retry.error).toMatch(/Replication of the tiles incomplete.*SYD/);
+    expect(w.purges).toBe(0);
+    expect(tilePuts(w)).toHaveLength(changed.length);
 
     w.tiles.replicate();
     const second = await runSync(w.options('20261118'), w.deps());
@@ -1229,6 +1267,8 @@ function startSync(w: World, args: string[], env: Record<string, string> = {}) {
     cwd: TILES_DIR,
     env: {
       ...process.env,
+      // The fake listens on loopback: storage addresses pinned in the developer's environment must not apply.
+      BUNNY_STORAGE_ADDRESSES: '127.0.0.1',
       BUNNY_STORAGE_ZONE: w.tiles.zone,
       BUNNY_STORAGE_PASSWORD: w.tiles.password,
       BUNNY_STORAGE_HOST: w.tiles.url,
@@ -1246,7 +1286,11 @@ function startSync(w: World, args: string[], env: Record<string, string> = {}) {
   let stderr = '';
   child.stdout!.on('data', (chunk) => (stdout += chunk));
   child.stderr!.on('data', (chunk) => (stderr += chunk));
-  const done = new Promise<ChildResult>((resolve) => child.once('exit', (code) => resolve({ code, stdout, stderr })));
+  // 'close' comes once the output pipes are drained too, unlike 'exit'.
+  const done = new Promise<ChildResult>((resolve, reject) => {
+    child.once('error', reject);
+    child.once('close', (code) => resolve({ code, stdout, stderr }));
+  });
   cleanup.push(() => {
     child.kill('SIGKILL');
   });
