@@ -6,9 +6,11 @@ import { LOGGING_API } from '../src/bunny-logs/log-reader';
 import {
   GLOBALPING_API,
   HIT_TILE,
+  hitTile,
   missTile,
   PROBE_CONTINENTS,
   probeDue,
+  probeTiles,
   runProbe,
   TILEJSON_LABELS,
   tileUrl,
@@ -51,8 +53,8 @@ const measurement = (id: string, status: string, results: unknown[]) =>
   json({ id, type: 'http', status, target: 'tiles.example.com', probesCount: results.length, results });
 
 const TILEJSON_URL = 'https://tiles.example.com/v1.json';
-const tileJsonOf = (template: string) =>
-  json({ tilejson: '3.0.0', name: 'OpenMapTiles', tiles: [template], minzoom: 0, maxzoom: 15 });
+const tileJsonOf = (template: string, fields: object = {}) =>
+  json({ tilejson: '3.0.0', name: 'OpenMapTiles', tiles: [template], minzoom: 0, maxzoom: 15, ...fields });
 
 type Routes = {
   create?: (call: Call, index: number) => Response;
@@ -149,6 +151,27 @@ describe('probe settings', () => {
     expect(missTile(() => 0)).toBe('15/0/0');
     expect(missTile(() => 0.9999999999)).toBe('15/32767/32767');
     expect(missTile(() => 0.5)).toBe('15/16384/16384');
+    expect(missTile(() => 0.9999999999, 12)).toBe('12/4095/4095');
+  });
+
+  it('takes the hit tile, or the one that holds it or its centre, at any zoom', () => {
+    expect(hitTile(2)).toBe(HIT_TILE);
+    expect(hitTile(1)).toBe('1/1/0');
+    expect(hitTile(0)).toBe('0/0/0');
+    // HIT_TILE's centre is at x 2.5, y 1.5 of z2's grid.
+    expect(hitTile(3)).toBe('3/5/3');
+    expect(hitTile(5)).toBe('5/20/12');
+  });
+
+  it("keeps both tiles within the TileJSON's zoom range", () => {
+    const half = () => 0.5;
+    expect(probeTiles({ minZoom: 0, maxZoom: 15 }, half)).toEqual({ hit: HIT_TILE, miss: '15/16384/16384' });
+    expect(probeTiles({ minZoom: 0, maxZoom: 30 }, half)).toEqual({ hit: HIT_TILE, miss: '15/16384/16384' });
+    // A staged or clipped build that stops at z12, and one that starts at z4.
+    expect(probeTiles({ minZoom: 0, maxZoom: 12 }, half)).toEqual({ hit: HIT_TILE, miss: '12/2048/2048' });
+    expect(probeTiles({ minZoom: 4, maxZoom: 15 }, half)).toEqual({ hit: '4/10/6', miss: '15/16384/16384' });
+    expect(probeTiles({ minZoom: 0, maxZoom: 1 }, half)).toEqual({ hit: '1/1/0', miss: '1/1/1' });
+    expect(probeTiles({ minZoom: 16, maxZoom: 18 }, half)).toEqual({ hit: '16/40960/24576', miss: '16/32768/32768' });
   });
 });
 
@@ -617,6 +640,30 @@ describe('runProbe', () => {
     );
   });
 
+  it("probes tiles within a clipped build's zoom range", async () => {
+    // A staged build that stops at z12 and starts at z4: no z15 file, nor a z2 one, for the probe to find.
+    const { result, calls } = await probe({
+      tileJson: () => tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt', { minzoom: 4, maxzoom: 12 }),
+      get: (id) => measurement(id, 'finished', everywhere([])),
+    });
+    expect(result).toBe('ok');
+    expect(creates(calls).map(({ body }) => JSON.parse(body).measurementOptions.request.path)).toEqual([
+      '/v1/4/10/6.mvt',
+      '/v1/12/1024/1024.mvt',
+    ]);
+  });
+
+  it('measures the planet build at z2 and z15 when its TileJSON gives no zoom range', async () => {
+    const { calls } = await probe({
+      tileJson: () => json({ tilejson: '3.0.0', tiles: ['https://tiles.example.com/v1/{z}/{x}/{y}.mvt'] }),
+      get: (id) => measurement(id, 'finished', everywhere([])),
+    });
+    expect(creates(calls).map(({ body }) => JSON.parse(body).measurementOptions.request.path)).toEqual([
+      `/v1/${HIT_TILE}.mvt`,
+      '/v1/15/8192/8192.mvt',
+    ]);
+  });
+
   it.each([
     ['is not found', () => new Response('not found', { status: 404 })],
     ['answers 503, as in a CDN outage', () => new Response('Domain suspended or not configured', { status: 503 })],
@@ -629,6 +676,16 @@ describe('runProbe', () => {
     ['is no JSON', () => new Response('<html>', { status: 200 })],
     ['has no tile template', () => json({ tilejson: '3.0.0', tiles: [] })],
     ['names tiles with a query', () => tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt?v=20261118')],
+    [
+      'has a minzoom above its maxzoom',
+      () => tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt', { minzoom: 9, maxzoom: 4 }),
+    ],
+    [
+      'has a maxzoom that is no zoom',
+      () => tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt', { maxzoom: 14.5 }),
+    ],
+    ['has a maxzoom beyond 30', () => tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt', { maxzoom: 31 })],
+    ['has a minzoom that is text', () => tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt', { minzoom: '0' })],
   ])(
     'pushes a failed TileJSON test the critical alert counts, measuring no tile, when the TileJSON %s',
     async (_, tileJson) => {

@@ -3,7 +3,8 @@
  * nearly every edge) and a random z15 position (nearly always a miss, so it measures the trip to storage) from the
  * Bunny-served origin, and the time to first byte goes to o11y as tiles_bunny_probe_*. The tile URLs come from the
  * origin's TileJSON (`/v1.json`), as they do for clients, so after a full rewrite moves the tiles to another prefix
- * (`v1/e2`) the probe measures the new prefix, not the retired one.
+ * (`v1/e2`) the probe measures the new prefix, not the retired one. Both tiles are within the TileJSON's minzoom and
+ * maxzoom (probeTiles): a build that stops below z15 or starts above z2 has no tile there to find.
  *
  * The run waits for its own measurements (a few seconds, never much more than RESULT_DEADLINE_MS, against the 15 minutes
  * a cron run may take) instead of reading them on a later run: the worker has nowhere to keep a measurement id between
@@ -30,6 +31,8 @@ export const GLOBALPING_API = 'https://api.globalping.io/v1/measurements';
 export const PROBE_CONTINENTS = ['EU', 'NA', 'SA', 'AS', 'OC', 'AF'] as const;
 // Most of Europe, where most requests come from, at a zoom every world and continent view loads.
 export const HIT_TILE = '2/2/1';
+// TileJSON 3.0.0's zoom limits, and its minzoom and maxzoom when it gives none.
+const TILEJSON_ZOOMS = { min: 0, max: 30 };
 // The TileJSON Immich loads (static-files.ts' STATIC_PREFIX), whose tile template says where the live tiles are.
 export const TILEJSON_PATH = '/v1.json';
 // The labels of the Worker's TileJSON read's verdict: a vantage point and a kind of their own, never a probe's.
@@ -46,6 +49,9 @@ const REQUEST_TIMEOUT_MS = 15_000;
 export type ProbeKind = 'hit' | 'miss';
 
 type Target = { kind: ProbeKind; path: string };
+
+/** What the public origin's TileJSON advertises: its first tile template and its zoom range. */
+export type LiveTiles = { template: string; minZoom: number; maxZoom: number };
 
 type TestResult = {
   status?: unknown;
@@ -68,11 +74,33 @@ export function probeDue(scheduledTime: number, intervalMinutes: number): boolea
   return Math.floor(scheduledTime / 60_000) % intervalMinutes === 0;
 }
 
-/** A random z15 tile path, z/x/y. */
-export function missTile(random: () => number): string {
-  const size = 2 ** MISS_ZOOM;
+/** A random tile path at zoom (z15 unless told otherwise), z/x/y. */
+export function missTile(random: () => number, zoom = MISS_ZOOM): string {
+  const size = 2 ** zoom;
   const coordinate = () => Math.min(size - 1, Math.floor(random() * size));
-  return `${MISS_ZOOM}/${coordinate()}/${coordinate()}`;
+  return `${zoom}/${coordinate()}/${coordinate()}`;
+}
+
+/** HIT_TILE at zoom: itself, the tile above it that holds it, or the tile below it that holds its centre. */
+export function hitTile(zoom: number): string {
+  const [z, x, y] = HIT_TILE.split('/').map(Number);
+  if (zoom <= z) {
+    const shift = 2 ** (z - zoom);
+    return `${zoom}/${Math.floor(x / shift)}/${Math.floor(y / shift)}`;
+  }
+  const scale = 2 ** (zoom - z);
+  return `${zoom}/${x * scale + scale / 2}/${y * scale + scale / 2}`;
+}
+
+/**
+ * The hit and miss tiles within the TileJSON's zoom range: HIT_TILE and a random z15 position for the planet build
+ * (z0-15), else each at the zoom in the range nearest its own. A staged or clipped build that stops below z15 has no
+ * z15 file, nor one that starts above z2 a z2 file: probing them would page on 404s that no client gets.
+ */
+export function probeTiles(live: Pick<LiveTiles, 'minZoom' | 'maxZoom'>, random: () => number) {
+  const within = (zoom: number) => Math.min(Math.max(zoom, live.minZoom), live.maxZoom);
+  const hitZoom = Number(HIT_TILE.split('/')[0]);
+  return { hit: hitTile(within(hitZoom)), miss: missTile(random, within(MISS_ZOOM)) };
 }
 
 // The public origin's path, without a trailing slash: '' for https://tiles.immich.cloud.
@@ -111,10 +139,12 @@ export function tileUrl(publicUrl: URL, template: string, tile: string): URL {
 }
 
 /**
- * The tile template the public origin's TileJSON advertises now (its first), which clients follow: a full rewrite
- * moves it to another prefix. Throws when the TileJSON can't be read or has no tile template.
+ * The tile template the public origin's TileJSON advertises now (its first), which clients follow (a full rewrite
+ * moves it to another prefix), and its zoom range. Throws when the TileJSON can't be read, has no tile template, or
+ * has a minzoom or maxzoom that isn't a whole zoom from 0 to 30 or a minzoom above its maxzoom (TileJSON 3.0.0; either
+ * left out is its default, 0 and 30).
  */
-export async function liveTileTemplate(publicUrl: URL): Promise<string> {
+export async function liveTiles(publicUrl: URL): Promise<LiveTiles> {
   const url = `${publicUrl.origin}${basePath(publicUrl)}${TILEJSON_PATH}`;
   const response = await fetch(url, {
     headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
@@ -124,12 +154,32 @@ export async function liveTileTemplate(publicUrl: URL): Promise<string> {
     await response.body?.cancel();
     throw new Error(`${url} answered ${response.status}`);
   }
-  const body = (await response.json()) as { tiles?: unknown } | null;
+  const body = (await response.json()) as { tiles?: unknown; minzoom?: unknown; maxzoom?: unknown } | null;
   const template = Array.isArray(body?.tiles) ? body.tiles[0] : undefined;
   if (typeof template !== 'string') {
     throw new Error(`${url} has no tile template`);
   }
-  return template;
+  const zoom = (name: 'minzoom' | 'maxzoom', fallback: number) => {
+    const value = body?.[name];
+    if (value === undefined) {
+      return fallback;
+    }
+    if (
+      typeof value !== 'number' ||
+      !Number.isInteger(value) ||
+      value < TILEJSON_ZOOMS.min ||
+      value > TILEJSON_ZOOMS.max
+    ) {
+      throw new Error(`${url} has ${name} ${JSON.stringify(value)?.slice(0, 40)}, not a zoom from 0 to 30`);
+    }
+    return value;
+  };
+  const minZoom = zoom('minzoom', TILEJSON_ZOOMS.min);
+  const maxZoom = zoom('maxzoom', TILEJSON_ZOOMS.max);
+  if (minZoom > maxZoom) {
+    throw new Error(`${url} has minzoom ${minZoom} above its maxzoom ${maxZoom}`);
+  }
+  return { template, minZoom, maxZoom };
 }
 
 /** The Globalping HTTP measurement of path on the public origin, from locations (or a measurement's probes). */
@@ -353,11 +403,12 @@ export async function runProbe(
   const fields = { job: 'bunny_probe', run_minute: new Date(minute).toISOString() };
   let targets: Target[];
   try {
-    const template = await liveTileTemplate(config.publicUrl);
-    const hit = tileUrl(config.publicUrl, template, HIT_TILE);
+    const live = await liveTiles(config.publicUrl);
+    const tiles = probeTiles(live, deps.random);
+    const hit = tileUrl(config.publicUrl, live.template, tiles.hit);
     targets = [
       { kind: 'hit', path: hit.pathname },
-      { kind: 'miss', path: tileUrl(config.publicUrl, template, missTile(deps.random)).pathname },
+      { kind: 'miss', path: tileUrl(config.publicUrl, live.template, tiles.miss).pathname },
     ];
     if (hit.origin !== config.publicUrl.origin) {
       // Expected from a DNS cutover until the next sync rewrites the TileJSON (see tileUrl); anything else is worth a
