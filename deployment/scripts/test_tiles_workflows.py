@@ -115,7 +115,7 @@ exit "$FAKE_EXIT"
 
 
 class SampleCheckStepTest(unittest.TestCase):
-    """The watchdog's "Check the sample" step: the job's last step fails it unless the CLI ran the check."""
+    """The watchdog's "Check the sample" step: the job's last step fails it unless the CLI ran the whole check."""
 
     def run_step(self, exit_code, report=None):
         step = next(s for s in load("tiles-sync-watchdog.yml")["jobs"]["sample"]["steps"] if s.get("id") == "check")
@@ -150,6 +150,13 @@ class SampleCheckStepTest(unittest.TestCase):
     def test_findings_with_their_report_pass_to_the_reporter(self):
         self.assertEqual(self.run_step(1, '{"checked": 1800, "missing": 2, "mismatched": 0, "errors": 0}'), 0)
         self.assertEqual(self.run_step(2, '{"checked": 1800, "partial": 40, "lacking": {"SYD": 40}}'), 0)
+
+    def test_an_incomplete_check_fails_the_step(self):
+        # DESCRIBE failed after its retries for some positions: the CLI exits 1 with a report, which the reporter
+        # pushes as result=error (tiles_sync_report.sample), and the job fails like a check that could not run.
+        self.assertNotEqual(self.run_step(1, '{"checked": 1800, "missing": 0, "mismatched": 0, "errors": 3}'), 0)
+        self.assertNotEqual(self.run_step(1, '{"checked": 1800, "missing": 1800, "errors": 1800}'), 0)
+        self.assertNotEqual(self.run_step(1, '{"checked": 1800, "missing": 2, "mismatched": 0, "errors": 1}'), 0)
 
     def test_a_clean_check_and_a_skipped_one_pass(self):
         self.assertEqual(self.run_step(0, '{"checked": 1800, "missing": 0}'), 0)
