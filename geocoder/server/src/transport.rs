@@ -381,7 +381,7 @@ fn install_lock(_dir: &Path) -> io::Result<Option<File>> {
 
 /// Whether `e`, an error taking a lock, says the file system has no locks.
 #[cfg(unix)]
-fn no_locks_here(e: &io::Error) -> bool {
+pub(crate) fn no_locks_here(e: &io::Error) -> bool {
     e.kind() == io::ErrorKind::Unsupported || e.raw_os_error() == Some(libc::ENOLCK)
 }
 

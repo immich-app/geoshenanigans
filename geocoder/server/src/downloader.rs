@@ -11,7 +11,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
-use query_server::{lower_hex, BUILD_STAMP, FILE_LEDGER};
+use query_server::{lower_hex, take_download_lock, LockFor, BUILD_STAMP, DOWNLOAD_LOCK, FILE_LEDGER};
 use query_server::transport::{self, ChunkReader, Expected, TRANSPORT_VERSION};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -566,38 +566,18 @@ impl Ledger {
     }
 }
 
-/// The file in a region dir that a download holds an exclusive flock on
-/// from start to end (on unix, where the file system has locks), so that
-/// downloads into the dir go one at a time, those of other processes too:
-/// they share the dir's temp names, ledger and stamp. Not the dir itself,
-/// which its transport decodes lock (the install lock).
-const DOWNLOAD_LOCK: &str = ".download.lock";
-
-/// Takes the download lock of the region dir `dir` (DOWNLOAD_LOCK), waiting
-/// while another download holds it. None on a file system without locks.
-#[cfg(unix)]
+/// Takes the download lock of the region dir `dir` for a download
+/// (DOWNLOAD_LOCK, exclusive), waiting while another download holds it, or
+/// a server loads the dir: downloads into the dir go one at a time, those of
+/// other processes too, as they share the dir's temp names, ledger and
+/// stamp. None on a file system without locks.
 async fn download_lock(dir: &Path) -> Result<Option<std::fs::File>, DownloadError> {
-    let path = dir.join(DOWNLOAD_LOCK);
-    let at = path.clone();
-    let taken = tokio::task::spawn_blocking(move || -> std::io::Result<Option<std::fs::File>> {
-        let file = std::fs::File::options().write(true).create(true).truncate(false).open(&path)?;
-        loop {
-            match file.lock() {
-                Ok(()) => return Ok(Some(file)),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) if e.kind() == std::io::ErrorKind::Unsupported || e.raw_os_error() == Some(libc::ENOLCK) => return Ok(None),
-                Err(e) => return Err(e),
-            }
-        }
-    })
-    .await
-    .map_err(|e| DownloadError::Io(format!("lock task: {}", e)))?;
-    taken.map_err(|e| DownloadError::Io(format!("lock {}: {}", at.display(), e)))
-}
-
-#[cfg(not(unix))]
-async fn download_lock(_dir: &Path) -> Result<Option<std::fs::File>, DownloadError> {
-    Ok(None)
+    let at = dir.join(DOWNLOAD_LOCK);
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || take_download_lock(&dir, LockFor::Download))
+        .await
+        .map_err(|e| DownloadError::Io(format!("lock task: {}", e)))?
+        .map_err(|e| DownloadError::Io(format!("lock {}: {}", at.display(), e)))
 }
 
 /// Writes `bytes` to `path` as one: under a temp name beside it, then
@@ -639,7 +619,8 @@ thread_local! {
 /// before it writes anything else, and puts it in once the last fetch is
 /// in, the ledger rewritten with a line a file of the selection; one that
 /// has nothing to fetch or remove in a dir stamped with its build writes
-/// nothing. Downloads into the dir go one at a time, across processes too
+/// nothing. Downloads into the dir go one at a time, across processes too,
+/// and a server starting loads the dir only while none runs
 /// (DOWNLOAD_LOCK). A unit's files land together, so a download needs the
 /// largest unit's files' size free beside the region.
 ///

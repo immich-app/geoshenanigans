@@ -3441,6 +3441,59 @@ pub const BUILD_STAMP: &str = ".build_date";
 /// builds' or selections' files.
 pub const FILE_LEDGER: &str = ".file_sha256";
 
+/// The file in a continent dir the server's downloader fills whose flock(2) lock (on unix, where
+/// the file system has locks) keeps a download into the dir and the loads of the dir apart,
+/// those of other processes too (servers sharing a data dir). A download holds an exclusive lock
+/// on it from start to end, and makes it; a server starting holds a shared one from before it
+/// checks the dir's BUILD_STAMP until it has loaded the dir, and never makes it. Downloads go
+/// one at a time, and no server loads a dir while a download changes its files. Not the dir
+/// itself, which its transport decodes lock (the install lock).
+pub const DOWNLOAD_LOCK: &str = ".download.lock";
+
+/// What takes a continent dir's DOWNLOAD_LOCK.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockFor {
+    /// A download, which writes the dir: an exclusive lock, the file made where it isn't there.
+    Download,
+    /// A load, which reads the dir: a shared lock, and only where the file is. A dir without it
+    /// (laid out by hand, say) loads without a lock.
+    Load,
+}
+
+/// Takes the download lock of the continent dir `dir` (DOWNLOAD_LOCK) for `what`, waiting while
+/// another holds it where they can't share it. None where no lock is taken: on a file system
+/// without locks, on platforms other than unix, and for a load where the file isn't there. The
+/// lock is held until the file returned is dropped.
+#[cfg(unix)]
+pub fn take_download_lock(dir: &std::path::Path, what: LockFor) -> std::io::Result<Option<File>> {
+    let path = dir.join(DOWNLOAD_LOCK);
+    let file = match what {
+        LockFor::Download => File::options().write(true).create(true).truncate(false).open(&path)?,
+        LockFor::Load => match File::open(&path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        },
+    };
+    loop {
+        let taken = match what {
+            LockFor::Download => file.lock(),
+            LockFor::Load => file.lock_shared(),
+        };
+        match taken {
+            Ok(()) => return Ok(Some(file)),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if transport::no_locks_here(&e) => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn take_download_lock(_dir: &std::path::Path, _what: LockFor) -> std::io::Result<Option<File>> {
+    Ok(None)
+}
+
 /// Why the continent dir `dir` is left unloaded, if it is: it holds
 /// FILE_LEDGER but not BUILD_STAMP, a download that did not finish, or
 /// either can't be checked. A dir holding neither was laid out by other
@@ -3459,6 +3512,13 @@ fn unfinished_download(dir: &str) -> Option<String> {
         (Ok(false), Ok(true)) => Some(format!("it holds {} but no {}: a download that did not finish", FILE_LEDGER, BUILD_STAMP)),
         _ => None,
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test: told each continent dir MultiIndex::load on this
+    /// thread loads, once its stamp is checked, before Index::load.
+    static BEFORE_INDEX_LOAD: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> = const { std::cell::RefCell::new(None) };
 }
 
 pub struct ContinentSlot {
@@ -3509,27 +3569,45 @@ impl MultiIndex {
         let mut slots = Vec::with_capacity(continents().len());
         for continent in continents() {
             let dir = format!("{}/{}", root, continent.name);
-            let arc_opt = if !std::path::Path::new(&format!("{}/admin_cells.bin", dir)).exists() {
-                None
-            } else if let Some(why) = unfinished_download(&dir) {
-                // A download that broke off can leave files of a build or
-                // selection beside those of the one before, which
-                // Index::load can't tell apart. The slot stays empty so the
-                // downloader finishes the download first.
-                eprintln!("skipping continent {}: {}", continent.name, why);
-                None
-            } else {
-                // An interrupted or failed download leaves a dir that has
-                // admin_cells.bin but can't load. It must not take down the
-                // continents that did load; the slot stays empty so the
-                // downloader can complete it later.
-                match Index::load(&dir, street_cell_level, admin_cell_level, search_distance) {
-                    Ok(idx) => Some(Arc::new(idx)),
-                    Err(e) => {
-                        eprintln!("skipping continent {}: {}", continent.name, e);
-                        None
-                    }
+            // A download into the dir (another server's, on the same data
+            // dir) may be removing its stamp and replacing its files for
+            // another selection: the dir is checked and loaded under a
+            // shared download lock, which waits for that download to end and
+            // keeps the next from starting until the load returned. The
+            // files stay mapped after.
+            let arc_opt = match take_download_lock(std::path::Path::new(&dir), LockFor::Load) {
+                Err(e) => {
+                    eprintln!("skipping continent {}: can't lock {}/{}: {}", continent.name, dir, DOWNLOAD_LOCK, e);
+                    None
                 }
+                Ok(_lock) => if !std::path::Path::new(&format!("{}/admin_cells.bin", dir)).exists() {
+                    None
+                } else if let Some(why) = unfinished_download(&dir) {
+                    // A download that broke off can leave files of a build or
+                    // selection beside those of the one before, which
+                    // Index::load can't tell apart. The slot stays empty so the
+                    // downloader finishes the download first.
+                    eprintln!("skipping continent {}: {}", continent.name, why);
+                    None
+                } else {
+                    // An interrupted or failed download leaves a dir that has
+                    // admin_cells.bin but can't load. It must not take down the
+                    // continents that did load; the slot stays empty so the
+                    // downloader can complete it later.
+                    #[cfg(test)]
+                    BEFORE_INDEX_LOAD.with_borrow_mut(|told| {
+                        if let Some(tell) = told {
+                            tell(&dir);
+                        }
+                    });
+                    match Index::load(&dir, street_cell_level, admin_cell_level, search_distance) {
+                        Ok(idx) => Some(Arc::new(idx)),
+                        Err(e) => {
+                            eprintln!("skipping continent {}: {}", continent.name, e);
+                            None
+                        }
+                    }
+                },
             };
             slots.push(ContinentSlot {
                 name: continent.name,
@@ -6865,6 +6943,91 @@ mod query_path_tests {
 
             assert_eq!(loaded_continents(root.path()), ["asia"], "{name}");
         }
+    }
+
+    /// The names of the continents MultiIndex::load loads under `root`, on a
+    /// thread of its own: none while it is still loading after `wait`, else
+    /// those it loaded; then those it loads once `meanwhile` has run.
+    fn loaded_continents_meanwhile(root: &std::path::Path, wait: std::time::Duration, meanwhile: impl FnOnce()) -> (Option<Vec<&'static str>>, Option<Vec<&'static str>>) {
+        let (done, loaded) = std::sync::mpsc::channel();
+        let root = root.to_path_buf();
+        let starting = std::thread::spawn(move || done.send(loaded_continents(&root)).unwrap());
+        let early = loaded.recv_timeout(wait).ok();
+        meanwhile();
+        let late = loaded.recv().ok();
+        starting.join().unwrap();
+        (early, late)
+    }
+
+    // A download into a continent dir (another server's, on the same data
+    // dir) holds the dir's download lock while it removes the stamp and
+    // replaces the files for another selection. A server starting meanwhile
+    // reads the dir only once the download let go of the lock, and finds
+    // what it left: here, the download stopped, its stamp gone, and the
+    // continent stays unloaded. A dir without the lock file loads without a
+    // lock, and is left without one.
+    #[cfg(unix)]
+    #[test]
+    fn a_server_starting_reads_a_continent_dir_only_once_a_download_into_it_let_go_of_its_lock() {
+        let root = two_continents();
+        let europe = root.path().join("europe");
+        std::fs::write(europe.join(FILE_LEDGER), "admin_cells.bin -\n").unwrap();
+        std::fs::write(europe.join(BUILD_STAMP), "2026-01-01").unwrap();
+        let download = File::create(europe.join(DOWNLOAD_LOCK)).unwrap();
+        download.lock().unwrap();
+
+        let (early, late) = loaded_continents_meanwhile(root.path(), std::time::Duration::from_millis(500), || {
+            std::fs::remove_file(europe.join(BUILD_STAMP)).unwrap();
+            drop(download);
+        });
+
+        assert_eq!(early, None, "loaded while the download held the lock");
+        assert_eq!(late, Some(vec!["asia"]));
+        assert!(!root.path().join("asia").join(DOWNLOAD_LOCK).exists());
+    }
+
+    // A server starting holds the lock until it has loaded the dir, and
+    // lets go of it then: a try at it from another open fails while the dir
+    // loads, and takes it after.
+    #[cfg(unix)]
+    #[test]
+    fn a_server_starting_holds_a_continent_dirs_download_lock_until_it_loaded_the_dir() {
+        let root = two_continents();
+        let europe = root.path().join("europe");
+        std::fs::write(europe.join(FILE_LEDGER), "admin_cells.bin -\n").unwrap();
+        std::fs::write(europe.join(BUILD_STAMP), "2026-01-01").unwrap();
+        File::create(europe.join(DOWNLOAD_LOCK)).unwrap();
+        let free = |dir: &std::path::Path| File::open(dir.join(DOWNLOAD_LOCK)).unwrap().try_lock().is_ok();
+        let told = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let telling = told.clone();
+        BEFORE_INDEX_LOAD.set(Some(Box::new(move |dir: &str| {
+            let dir = std::path::Path::new(dir);
+            telling.borrow_mut().push((dir.file_name().unwrap().to_str().unwrap().to_string(), dir.join(DOWNLOAD_LOCK).exists().then(|| free(dir))));
+        })));
+
+        let loaded = loaded_continents(root.path());
+
+        BEFORE_INDEX_LOAD.set(None);
+        assert_eq!(loaded, ["asia", "europe"]);
+        assert_eq!(*told.borrow(), [("asia".to_string(), None), ("europe".to_string(), Some(false))]);
+        assert!(free(&europe));
+    }
+
+    // Servers starting on one data dir load a continent dir at once: the
+    // lock a load holds is shared.
+    #[cfg(unix)]
+    #[test]
+    fn servers_starting_load_a_continent_dir_at_once() {
+        let root = two_continents();
+        let europe = root.path().join("europe");
+        std::fs::write(europe.join(FILE_LEDGER), "admin_cells.bin -\n").unwrap();
+        std::fs::write(europe.join(BUILD_STAMP), "2026-01-01").unwrap();
+        let other = File::create(europe.join(DOWNLOAD_LOCK)).unwrap();
+        other.lock_shared().unwrap();
+
+        let (early, _) = loaded_continents_meanwhile(root.path(), std::time::Duration::from_secs(10), || drop(other));
+
+        assert_eq!(early, Some(vec!["asia", "europe"]));
     }
 
     #[test]
