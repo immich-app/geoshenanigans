@@ -466,6 +466,31 @@ describe('runLogReader', () => {
     expect(sampleValue(pushedSamples(calls), 'tiles_bunny_log_rows')).toBeUndefined();
   });
 
+  it('fails a read whose empty page still claims more rows rather than push part of the minute', async () => {
+    const { result, calls } = await run([() => page([row()], true), () => page([], true)], {
+      reread: [() => page([row({ requestId: 'x' })], true), () => page([], true)],
+    });
+    expect(result).toBe('error');
+    // One request per page: the empty page isn't retried, and nothing is read past it.
+    expect(calls.filter((call) => isWindowQuery(call))).toHaveLength(2);
+    expect(calls.filter(isRereadQuery)).toHaveLength(2);
+    const samples = pushedSamples(calls);
+    expect(samples.filter(({ name }) => name !== 'tiles_bunny_log_reader_runs')).toEqual([]);
+    expect(sampleValue(samples, 'tiles_bunny_log_reader_runs', { result: 'error' })).toBe(1);
+    expect(pushedLogs(calls)).toEqual(
+      expect.arrayContaining(
+        ['first', 'reread'].map((read) =>
+          expect.objectContaining({
+            _msg: 'Bunny log reader failed',
+            read,
+            rows: 1,
+            error: expect.stringContaining('empty page with hasMore (offset 1)'),
+          }),
+        ),
+      ),
+    );
+  });
+
   it(`stops after ${MAX_PAGES} pages and reports the run as an error, with the counts so far`, async () => {
     const { result, calls } = await run([() => page([row(), row()], true)]);
     expect(result).toBe('error');
