@@ -24,6 +24,21 @@ import {
   writeArchiveFile,
 } from './manifest-fixtures';
 
+/**
+ * The oracle's zoom of a tile ID, worked out on its own rather than with tileIdZoom (which diffManifests counts with):
+ * zoom z holds 4^z positions, so add up the zoom sizes, exactly in BigInt, until they pass the ID.
+ */
+function oracleZoom(tileId: number): number {
+  const id = BigInt(tileId);
+  let z = 0;
+  let end = 1n;
+  while (id >= end) {
+    z++;
+    end += 4n ** BigInt(z);
+  }
+  return z;
+}
+
 /** The diff by brute force: every position compared on its own, then grouped into ranges. */
 function bruteForce(oldBuild: Build, newBuild: Build) {
   const hashAt = (build: Build, tileId: number) => {
@@ -53,7 +68,7 @@ function bruteForce(oldBuild: Build, newBuild: Build) {
       continue;
     }
     counts[kind]++;
-    const z = zoomOf(tileId);
+    const z = oracleZoom(tileId);
     byZoom[z] ??= { changed: 0, added: 0, removed: 0 };
     byZoom[z][kind]++;
     const previous = ranges[ranges.length - 1];
@@ -264,6 +279,20 @@ describe('diffManifests', () => {
   });
 });
 
+describe('oracleZoom', () => {
+  it('puts the first and last ID of each zoom in it', () => {
+    // Each zoom's first ID written out: the sums 1, 1 + 4, 1 + 4 + 16, ...
+    const starts = [
+      0, 1, 5, 21, 85, 341, 1365, 5461, 21_845, 87_381, 349_525, 1_398_101, 5_592_405, 22_369_621, 89_478_485,
+      357_913_941, 1_431_655_765,
+    ];
+    starts.forEach((start, z) => {
+      expect(oracleZoom(start), String(start)).toBe(z);
+      expect(oracleZoom(start + 4 ** z - 1), String(start + 4 ** z - 1)).toBe(z);
+    });
+  });
+});
+
 describe('zoomOf', () => {
   it('matches the Hilbert tile numbering', () => {
     for (const [z, x, y] of [
@@ -279,6 +308,15 @@ describe('zoomOf', () => {
       expect(zoomOf(tileId)).toBe(z);
     }
     expect(zoomOf(zxyToTileId(15, 0, 0) - 1)).toBe(14);
+    // Around every zoom boundary up to MAX_SAFE_ZOOM, as the oracle works it out.
+    let start = 0;
+    for (let z = 0; z <= MAX_SAFE_ZOOM; z++) {
+      for (const tileId of [start - 1, start, start + 1].filter((id) => id >= 0)) {
+        expect(zoomOf(tileId), String(tileId)).toBe(oracleZoom(tileId));
+      }
+      start += 4 ** z;
+    }
+    expect(zoomOf(start - 1)).toBe(MAX_SAFE_ZOOM);
   });
 });
 

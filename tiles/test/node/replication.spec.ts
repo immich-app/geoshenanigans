@@ -2,11 +2,12 @@ import { execFile, ExecFileException } from 'node:child_process';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { buildManifest } from '../../src/bunny/manifest';
+import { buildManifest, writeManifest } from '../../src/bunny/manifest';
 import {
   checkReplication,
   checksumMatches,
   classify,
+  gateExitCode,
   normalizeRegions,
   ReplicationItem,
   TileGateList,
@@ -14,7 +15,7 @@ import {
 } from '../../src/bunny/replication';
 import { BunnyStateStore, publishBuild, writeState } from '../../src/bunny/state';
 import { BunnyStorage, DEFAULT_RETRY, StorageObject } from '../../src/bunny/storage';
-import { tilePath, zoomEnd } from '../../src/bunny/tile-id';
+import { tilePath, zoomEnd, zoomStart } from '../../src/bunny/tile-id';
 import { runSeed } from '../../src/bunny/upload';
 import { FakeStorage, FakeStorageOptions, sha256Hex } from './fake-storage';
 import { startStateServer } from './state-server';
@@ -181,7 +182,15 @@ describe('waitForReplication', () => {
       },
     });
 
-    expect(result).toMatchObject({ complete: true, missing: [], mismatched: [], incomplete: 0, passes: 4 });
+    expect(result).toMatchObject({
+      complete: true,
+      missing: [],
+      mismatched: [],
+      incomplete: 0,
+      unchecked: 0,
+      passes: 4,
+    });
+    expect(gateExitCode(result)).toBe(0);
     expect(result.missingByRegion).toEqual({ UK: 0, NY: 0, SYD: 0 });
     // Every file once, then only the 40 that some region still lacked.
     expect(passes).toEqual([
@@ -238,6 +247,9 @@ describe('waitForReplication', () => {
       // Unchecked files are not taken as replicated, even when no region is followed (storage only).
       expect(result).toMatchObject({ complete: false, missing: [], mismatched: [], errors: 0 });
       expect(result.incomplete).toBe(items.length - describes.length);
+      // None of those was ever answered for: not known to be stored, so the CLI exits 1, not 2.
+      expect(result.unchecked).toBe(items.length - describes.length);
+      expect(gateExitCode(result)).toBe(1);
       expect(result.stragglers[0]).toEqual({ path: `r/${describes.length}.mvt`, regions });
     }
   });
@@ -257,11 +269,14 @@ describe('waitForReplication', () => {
       expect(result).toMatchObject({
         complete: false,
         incomplete: 1,
+        unchecked: 1,
         errors: 0,
         missing: [],
         mismatched: [],
         passes: 1,
       });
+      // The timeout came before the first answer: no error, but nothing says the file is stored either.
+      expect(gateExitCode(result)).toBe(1);
       expect(result.stragglers).toEqual([{ path: 'r/0.mvt', regions: REGIONS }]);
       // Nothing is sent after the timeout.
       await new Promise((resolve) => setTimeout(resolve, 50));
@@ -277,7 +292,14 @@ describe('waitForReplication', () => {
       timeoutMs: 300,
       intervalMs: 20,
     });
-    expect(shown).toMatchObject({ complete: false, missing: ['r/0.mvt'], incomplete: 0, errors: 0, passes: 2 });
+    expect(shown).toMatchObject({
+      complete: false,
+      missing: ['r/0.mvt'],
+      incomplete: 0,
+      unchecked: 0,
+      errors: 0,
+      passes: 2,
+    });
     expect(missing.fake.requests.DESCRIBE).toBe(2);
 
     // Failed on the first pass (one attempt, so no back-off), then rate limited until the timeout: still an error.
@@ -286,7 +308,7 @@ describe('waitForReplication', () => {
       timeoutMs: 300,
       intervalMs: 20,
     });
-    expect(failed).toMatchObject({ complete: false, missing: [], incomplete: 1, errors: 1, passes: 2 });
+    expect(failed).toMatchObject({ complete: false, missing: [], incomplete: 1, unchecked: 1, errors: 1, passes: 2 });
     expect(failing.fake.faultsInjected).toEqual({ 'server-error': 1, 'rate-limit': 1 });
   });
 
@@ -390,6 +412,9 @@ describe('waitForReplication', () => {
 
     const result = await waitForReplication(storage, items, REGIONS, { timeoutMs: 150, intervalMs: 20 });
     expect(result).toMatchObject({ complete: false, incomplete: 1, missingByRegion: { UK: 1, NY: 1, SYD: 1 } });
+    // Shown stored with its bytes, just in no region: stored but not replicated, the CLI's exit 2.
+    expect(result.unchecked).toBe(0);
+    expect(gateExitCode(result)).toBe(2);
     expect(result.regionWaitMs).toEqual({ UK: null, NY: null, SYD: null });
     // The stuck file is named, with the regions it lacks.
     expect(result.stragglers).toEqual([{ path: items[1].path, regions: REGIONS }]);
@@ -595,7 +620,8 @@ describe('bunny:replication CLI', () => {
       BUNNY_STATE_PASSWORD: 'state-password',
       BUNNY_STATE_HOST: server.host,
     };
-    const args = ['--live', '--regions', 'UK,SYD', '--sample', '30', '--per-zoom', '--seed', '3'];
+    // The fixture's header says zooms 0-15, as every archive buildArchive writes does; it holds zooms 0-5.
+    const args = ['--live', '--regions', 'UK,SYD', '--sample', '30', '--per-zoom', '--seed', '3', '--max-zoom', '5'];
 
     fake.replicate('', ['UK']);
     const partial = await run(fake, args, env);
@@ -635,10 +661,78 @@ describe('bunny:replication CLI', () => {
     expect(skipped.code, skipped.stderr).toBe(0);
     expect(skipped.report).toMatchObject({ prefix: 'itest', build: '20261118', mode: 'sample-per-zoom', seed: 3 });
     expect(skipped.report.skipped).toMatch(/pending builds 20261119/);
+    // Nor the tiles zone's credentials: a job holding only the state zone's still gets its report.
+    const noTileCredentials = { ...env, BUNNY_STORAGE_ZONE: '', BUNNY_STORAGE_PASSWORD: '' };
+    const withoutCredentials = await run(fake, args, noTileCredentials);
+    expect(withoutCredentials.code, withoutCredentials.stderr).toBe(0);
+    expect(withoutCredentials.report.skipped).toMatch(/pending builds 20261119/);
+    // A bad argument is still refused first, pending builds or not.
+    const badAddresses = await run(fake, [...args, '--addresses', 'not-an-ip'], noTileCredentials);
+    expect(badAddresses.code).toBe(3);
+    expect(badAddresses.stderr).toMatch(/Storage addresses must be IP addresses/);
+    // Once there is something to check, they are needed.
+    await writeState(store, live);
+    const unchecked = await run(fake, args, noTileCredentials);
+    expect(unchecked.code).toBe(1);
+    expect(unchecked.stderr).toMatch(/BUNNY_STORAGE_ZONE and BUNNY_STORAGE_PASSWORD must be set/);
+    expect(unchecked.report).toEqual({});
 
     const usage = await run(fake, ['--live'], env);
     expect(usage.code).toBe(3);
     expect(usage.stderr).toMatch(/give --sample/);
+  }, 60_000);
+
+  it("--live samples the zooms the manifest's header or its positions give, not its position count", async () => {
+    // A sparse build of zooms 3-5 only: every seventh position, far fewer positions than its last tile ID.
+    const ids: number[] = [];
+    for (let tileId = zoomStart(3); tileId < zoomEnd(5); tileId++) {
+      if (tileId % 7 === 0) {
+        ids.push(tileId);
+      }
+    }
+    const { fake } = await setup({ regions: ['UK'] });
+    const entries = ids.map((tileId) => {
+      const bytes = new TextEncoder().encode(`sparse ${tileId}`);
+      fake.seed(tilePath('sparse', tileId), bytes, ['UK']);
+      return { tileId, runLength: 1, hash: sha256Hex(bytes).slice(0, 16) };
+    });
+    const scratch = await scratchDir();
+    const server = await startStateServer('state-zone', 'state-password');
+    const store = new BunnyStateStore({ zone: 'state-zone', password: 'state-password', host: server.host });
+    cleanup.push(scratch.remove, server.close, () => store.close());
+    const env = {
+      BUNNY_STATE_ZONE: 'state-zone',
+      BUNNY_STATE_PASSWORD: 'state-password',
+      BUNNY_STATE_HOST: server.host,
+    };
+    const args = ['--live', '--regions', 'UK', '--sample', '2000', '--per-zoom', '--seed', '1'];
+    // 2,000 per zoom takes every position of zooms 3-5: each one the build has is checked, the rest are not in it.
+    const perZoom = (z: number) => ids.filter((tileId) => tileId >= zoomStart(z) && tileId < zoomEnd(z)).length;
+
+    // With the zooms in the header (as the manifest CLI writes them), and without (only the positions say).
+    for (const zooms of [{ minZoom: 3, maxZoom: 5 }, {}]) {
+      const manifest = join(scratch.dir, `sparse-${Object.keys(zooms).length}.tman.zst`);
+      await writeManifest(manifest, { buildKey: '20261118', ...zooms }, entries);
+      await publishBuild(store, { buildKey: '20261118', manifestFile: manifest, prefix: 'sparse' });
+      const result = await run(fake, args, env);
+      expect(result.code, result.stderr).toBe(0);
+      expect(result.report).toMatchObject({
+        range: { from: zoomStart(3), to: zoomEnd(5) },
+        checked: ids.length,
+        replicated: ids.length,
+        notInArchive: zoomEnd(5) - zoomStart(3) - ids.length,
+      });
+      expect(Object.keys(result.report.byZoom)).toEqual(['3', '4', '5']);
+      expect(result.report.byZoom['5'].checked).toBe(perZoom(5));
+    }
+
+    // A manifest without zooms over no position says nothing to check.
+    const empty = join(scratch.dir, 'empty.tman.zst');
+    await writeManifest(empty, { buildKey: '20261118' }, []);
+    await publishBuild(store, { buildKey: '20261118', manifestFile: empty, prefix: 'sparse' });
+    const nothing = await run(fake, args, env);
+    expect(nothing.code, nothing.stderr).toBe(1);
+    expect(nothing.stderr).toMatch(/No file to check: the live build 20261118's manifest holds no position/);
   }, 60_000);
 
   it('refuses a --listing zoom range that would list nothing', async () => {

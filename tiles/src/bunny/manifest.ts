@@ -39,7 +39,7 @@ import {
   WorkerReply,
   WorkerRequest,
 } from './manifest-worker';
-import { MAX_SAFE_ZOOM, zoomEnd } from './tile-id';
+import { MAX_SAFE_ZOOM, tileIdZoom, zoomEnd } from './tile-id';
 
 const SKIPPABLE_FRAME_MAGIC = 0x184d2a5b;
 const HEADER_SLOT_BYTES = 1024;
@@ -448,6 +448,35 @@ export async function* manifestBatches(path: string): AsyncGenerator<ManifestBat
       `${path}: ${entries} entries covering ${positions} positions, header says ${header.entries} and ${header.positions}`,
     );
   }
+}
+
+/**
+ * The zooms a manifest's build spans: its header's (the archive's, or the zooms a sync was limited to), and for a
+ * header without them (a manifest written without zooms) the zooms of its first and last positions, read from the
+ * entries. Not its position count: a build that is sparse or starts above zoom 0 holds fewer positions than the
+ * tile IDs it reaches. Null for a header without zooms over no position; throws for zooms no tile ID has, or reversed.
+ */
+export async function manifestZoomBounds(path: string): Promise<{ minZoom: number; maxZoom: number } | null> {
+  const header = await readManifestHeader(path);
+  let { minZoom, maxZoom } = header;
+  if (minZoom === null || maxZoom === null) {
+    let first: number | undefined;
+    let end = 0;
+    for await (const batch of manifestBatches(path)) {
+      first ??= batch.tileIds[0];
+      end = batch.tileIds[batch.count - 1] + batch.runLengths[batch.count - 1];
+    }
+    if (first === undefined) {
+      return null;
+    }
+    minZoom ??= tileIdZoom(first);
+    maxZoom ??= tileIdZoom(end - 1);
+  }
+  const zoom = (z: number) => Number.isInteger(z) && z >= 0 && z <= MAX_SAFE_ZOOM;
+  if (!zoom(minZoom) || !zoom(maxZoom) || minZoom > maxZoom) {
+    throw new Error(`${path}: its zooms, ${minZoom} to ${maxZoom}, are no range of tile zooms`);
+  }
+  return { minZoom, maxZoom };
 }
 
 /**
