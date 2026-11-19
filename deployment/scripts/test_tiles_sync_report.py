@@ -374,6 +374,37 @@ class SampleTest(WithTempDir):
         _, log = self.run_sample(json.dumps({**self.CHECK, "missing": 0, "missingPaths": [], "lacking": {}}), "0")
         self.assertEqual(log.records[0]["level"], "info")
 
+    def test_a_check_whose_describes_all_failed_is_an_error_not_a_clean_sample(self):
+        # Bunny storage down: every position counted as checked and as an error, none missing or mismatched.
+        report = {**self.CHECK, "missing": 0, "missingPaths": [], "errors": 1616, "lacking": {"UK": 0, "SYD": 0},
+                  "errorPaths": ["v1/0/0/0.mvt", "v1/1/0/0.mvt", "v1/1/0/1.mvt", "v1/1/1/0.mvt"]}
+        samples, log = self.run_sample(json.dumps(report), exit_code="1")
+
+        self.assertEqual(by_name(samples), {
+            "tiles_sync_sample_runs": {(("result", "error"),): 1},
+            "tiles_sync_sample_checked": {(): 1616},
+            "tiles_sync_sample_missing": {(): 0},
+            "tiles_sync_sample_mismatched": {(): 0},
+            "tiles_sync_sample_errors": {(): 1616},
+            "tiles_sync_sample_lacking": {(("storage_region", "SYD"),): 0, (("storage_region", "UK"),): 0},
+        })
+        self.assertEqual([(r["level"], r["_msg"]) for r in log.records], [
+            ("error", "tiles sample check of 20261118 under v1/: 1,616 positions, 0 missing, 0 with other bytes,"
+                      " 1,616 DESCRIBE errors; not yet in a region: none; incomplete: 1,616 of the 1,616 positions"
+                      " went unchecked, their DESCRIBE failing after its retries (e.g. v1/0/0/0.mvt, v1/1/0/0.mvt,"
+                      " v1/1/0/1.mvt)")])
+
+    def test_a_check_with_some_describe_errors_is_an_error_that_keeps_what_it_found(self):
+        samples, log = self.run_sample(json.dumps({**self.CHECK, "errors": 2}), exit_code="1")
+
+        found = by_name(samples)
+        self.assertEqual(found["tiles_sync_sample_runs"], {(("result", "error"),): 1})
+        self.assertEqual(found["tiles_sync_sample_missing"], {(): 1})
+        self.assertEqual(found["tiles_sync_sample_errors"], {(): 2})
+        self.assertEqual(found["tiles_sync_sample_lacking"][(("storage_region", "SYD"),)], 12)
+        self.assertEqual(log.records[0]["level"], "error")
+        self.assertIn("incomplete: 2 of the 1,616 positions went unchecked", log.records[0]["_msg"])
+
     def test_a_check_skipped_while_builds_are_pending_sends_no_counts(self):
         samples, log = self.run_sample(json.dumps({"skipped": "pending builds 20261119: a sync has to finish first"}),
                                        exit_code="0")

@@ -46,7 +46,8 @@ sync job's first step to its last.
 sample reports the daily sample check of the live build in every storage
 region (`npm run bunny:replication -- --live --sample N --per-zoom --json
 FILE`): positions missing, holding other bytes than the live manifest, or not
-yet in a region, as tiles_sync_sample_*.
+yet in a region, as tiles_sync_sample_*. A check whose DESCRIBEs failed for
+some positions is result=error (incomplete), with the counts of the rest.
 
 watchdog reports the live build from `npm run bunny:status -- --json`, with a
 heartbeat. A watchdog that cannot read the live state sends no heartbeat, so
@@ -596,7 +597,9 @@ def watchdog(opts, now):
 
 def sample(opts, now):
     """The sample check's samples and log line. An unreadable or absent report is result=error, a check skipped
-    while builds are pending result=skipped; both send no counts."""
+    while builds are pending result=skipped; both send no counts. A report with DESCRIBE errors is result=error
+    too, as those positions went unchecked (all of them when the tiles zone stops answering), but it keeps its
+    counts: what it did find missing, mismatched or unreplicated still alerts."""
     log = Log(app=SAMPLE_APP)
     report = read_json(opts.report)
     if report is not None and isinstance(report.get("skipped"), str):
@@ -607,8 +610,9 @@ def sample(opts, now):
         detail = read_tail(opts.stderr) or "no output"
         log.add(f"tiles sample check could not run (exit {opts.exit}): {detail}", level="error")
         return [("tiles_sync_sample_runs", {"result": "error"}, 1)], log
-    samples = [("tiles_sync_sample_runs", {"result": "ok"}, 1), ("tiles_sync_sample_checked", {}, checked)]
     counts = {field: number(report.get(field)) or 0 for field in ("missing", "mismatched", "errors")}
+    result = "error" if counts["errors"] else "ok"
+    samples = [("tiles_sync_sample_runs", {"result": result}, 1), ("tiles_sync_sample_checked", {}, checked)]
     for field, value in counts.items():
         samples.append((f"tiles_sync_sample_{field}", {}, value))
     lacking = numbers(report.get("lacking"))
@@ -622,7 +626,12 @@ def sample(opts, now):
             f" bytes, {counts['errors']:,.0f} DESCRIBE errors; not yet in a region: {short or 'none'}")
     if examples:
         what += f"; e.g. {', '.join(examples)}"
-    level = "error" if counts["missing"] or counts["mismatched"] else "warn" if short or counts["errors"] else "info"
+    if counts["errors"]:
+        unchecked = [p for p in (report.get("errorPaths") or [])[:3] if isinstance(p, str)]
+        what += (f"; incomplete: {counts['errors']:,.0f} of the {checked:,.0f} positions went unchecked, their"
+                 " DESCRIBE failing after its retries" + (f" (e.g. {', '.join(unchecked)})" if unchecked else ""))
+    level = ("error" if counts["missing"] or counts["mismatched"] or counts["errors"]
+             else "warn" if short else "info")
     log.add(what, level=level)
     return samples, log
 

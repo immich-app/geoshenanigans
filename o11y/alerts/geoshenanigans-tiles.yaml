@@ -753,7 +753,8 @@ spec:
                   params: []
     # The sample job pushes tiles_sync_sample_runs{result} once a day: error when
     # bunny:replication could not run (state zone, tiles zone or manifest
-    # unreadable). Fires when the latest run in 26h is an error.
+    # unreadable), or when DESCRIBE failed for some positions (an incomplete
+    # check, which keeps its counts). Fires when the latest run in 26h is an error.
     - uid: geoshenanigans-tiles-sample-failing
       title: Tiles sample check could not run
       condition: B
@@ -762,12 +763,16 @@ spec:
         project: geoshenanigans
         severity: warning
       annotations:
-        summary: The daily sample check of the live Bunny tiles could not run.
+        summary: The daily sample check of the live Bunny tiles could not run, or left sampled positions unchecked.
         description: >-
-          The latest run of tiles-sync-watchdog.yml's sample job could not check the live build: bunny:replication
-          failed before checking (a wrong BUNNY_STORAGE_PASSWORD or BUNNY_STATE_PASSWORD, the live manifest
-          unreadable, Bunny storage down). Its error line (app:="tiles-sample-check") and the job's log say which.
-          Until it runs, geoshenanigans-tiles-sample-wrong and -sample-unreplicated are blind.
+          The latest run of tiles-sync-watchdog.yml's sample job did not check every sampled position of the live
+          build. Either bunny:replication failed before checking (a wrong BUNNY_STORAGE_PASSWORD or
+          BUNNY_STATE_PASSWORD, the live manifest unreadable, Bunny storage down), or it ran but the check is
+          incomplete: DESCRIBE failed after its retries for some positions (tiles_sync_sample_errors; all of them
+          when the tiles zone stops answering), and those went unchecked. Its error line
+          (app:="tiles-sample-check") and the job's log say which, with the unchecked count and example paths.
+          Until a check completes, geoshenanigans-tiles-sample-wrong and -sample-unreplicated see only the
+          positions that were checked, or none: zero missing then does not mean the zone is whole.
       execErrState: Error
       noDataState: OK
       data:
