@@ -30,22 +30,32 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# A random port, and another when it is taken (the store then exits at once).
-start() {
-  local port=$((20000 + RANDOM % 20000))
-  vm=http://127.0.0.1:$port
-  victoria-metrics -storageDataPath="$work/data" -httpListenAddr="127.0.0.1:$port" \
-    -dedup.minScrapeInterval=20s -search.disableCache -loggerLevel=ERROR >"$work/vm.log" 2>&1 &
-  pid=$!
-  for _ in $(seq 150); do
-    curl -fsS "$vm/health" >/dev/null 2>&1 && return 0
-    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; pid=; return 1; }
-    sleep 0.2
-  done
-  return 1
-}
-for _ in 1 2 3 4 5; do start && break; done
-curl -fsS "$vm/health" >/dev/null || { cat "$work/vm.log" >&2; exit 1; }
+# The store listens on a port the OS picks, free when bound and held by this
+# store alone, and logs it ("started server at http://127.0.0.1:PORT/", at the
+# default info level): it is probed only once the store has said where it is,
+# never a port another store might already answer on. Its /metrics then has to
+# name this run's data directory before any sample goes in (read whole into a
+# file first: grep -q quitting mid-pipe would fail curl under pipefail).
+victoria-metrics -storageDataPath="$work/data" -httpListenAddr=127.0.0.1:0 \
+  -dedup.minScrapeInterval=20s -search.disableCache >"$work/vm.log" 2>&1 &
+pid=$!
+vm=
+for _ in $(seq 150); do
+  kill -0 "$pid" 2>/dev/null || break
+  if [ -z "$vm" ]; then
+    vm=$(grep -m 1 -o 'started server at http://127\.0\.0\.1:[0-9][0-9]*/' "$work/vm.log" || true)
+    vm=${vm#started server at }
+    vm=${vm%/}
+  fi
+  [ -n "$vm" ] && curl -fsS "$vm/health" >/dev/null 2>&1 && break
+  sleep 0.2
+done
+if [ -z "$vm" ] || ! kill -0 "$pid" 2>/dev/null || ! curl -fsS -o "$work/metrics" "$vm/metrics" ||
+  ! grep -qxF "flag{name=\"storageDataPath\", value=\"$work/data\", is_set=\"true\"} 1" "$work/metrics"; then
+  echo "the VictoriaMetrics started for this run is not answering at ${vm:-(no address logged)}" >&2
+  cat "$work/vm.log" >&2
+  exit 1
+fi
 
 # The hour case N evaluates at: whole hours, N hours after a day ago.
 base=$(($(date +%s) / 3600 * 3600 - 86400))
@@ -205,6 +215,20 @@ for m in 55 45 35 25 15 5; do sample 13 "$m" tiles_bunny_log_rows '' 0; done
 # Case 14: the reader stopped 20 minutes ago too (the whole cron): no.
 for m in 55 45 35 25; do sample 14 "$m" tiles_bunny_log_rows '' 100; done
 
+# --- geoshenanigans-tiles-bunny-probe-off ----------------------------------
+# Case 12 above (requests, every probe run skipped) fires it, at the 5 skipped
+# runs. Case 18: the probe left off before the cutover, the reader running but
+# the zone serving nothing (rows all 0): no.
+for m in 55 45 35 25 15 5; do sample 18 "$m" tiles_bunny_log_rows '' 0; done
+for m in 50 40 30 20 10; do sample 18 "$m" tiles_bunny_probe_runs 'result="skipped"' 1; done
+# Case 19: the probe and the log reader both left off (no rows at all): no.
+for m in 50 40 30 20 10; do sample 19 "$m" tiles_bunny_probe_runs 'result="skipped"' 1; done
+# Case 20: requests, and the probe turned on half an hour ago: runs skipped,
+# then runs with results: no.
+for m in 55 45 35 25 15 5; do sample 20 "$m" tiles_bunny_log_rows '' 100; done
+for m in 50 40 30; do sample 20 "$m" tiles_bunny_probe_runs 'result="skipped"' 1; done
+runs 20 20 10
+
 # --- "Probe first byte, misses" and "hits" (panels 53 and 54) -------------
 # Case 15: per continent, every response weighs the same, whichever target it
 # came from. EU misses: the random tile in three runs, the popular one once
@@ -270,6 +294,12 @@ check 'probe-silent: requests, no probe result for an hour' 11 "$probe_silent" "
 check 'probe-silent: skipped runs are reports' 12 "$probe_silent" ''
 check 'probe-silent: no requests' 13 "$probe_silent" ''
 check 'probe-silent: the whole cron stopped' 14 "$probe_silent" ''
+
+probe_off=$(rule_expr geoshenanigans-tiles-bunny-probe-off)
+check 'probe-off: requests, every probe run skipped' 12 "$probe_off" ' 5'
+check 'probe-off: skipped runs, the zone serving nothing' 18 "$probe_off" ''
+check 'probe-off: skipped runs, no log reader either' 19 "$probe_off" ''
+check 'probe-off: requests, the probe turned on within the hour' 20 "$probe_off" ''
 
 check 'first byte, misses: weighted by responses, not by target' 15 "$(panel_expr 53 A 30m)" 'continent=EU 400'
 check 'first byte, hits: weighted by responses, not by target' 15 "$(panel_expr 54 A 30m)" 'continent=EU 72.5'

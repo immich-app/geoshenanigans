@@ -17,7 +17,7 @@ MISE_ENV=o11y mise run o11y:render
 MISE_ENV=o11y mise run o11y:test-queries
 ```
 
-`test-queries.sh` takes the expressions from the rule and dashboard files themselves, so a rule or panel it covers that changes shape must still pass its cases; add a case when a query divides sparse series, adds up over a label a pusher sets, or gates an absence on other series. Cases for rules that look back a day or more take negative case numbers, 48 hours apart.
+`test-queries.sh` takes the expressions from the rule and dashboard files themselves, so a rule or panel it covers that changes shape must still pass its cases; add a case when a query divides sparse series, adds up over a label a pusher sets, or gates an absence on other series, and bracket a query that mixes `and`, `unless` and `or` rather than lean on their precedence. Cases for rules that look back a day or more take negative case numbers, 48 hours apart.
 
 The tools (jq, yq, kustomize, kubeconform, flux2, cosign, victoria-metrics) and the `o11y:render` and `o11y:test-queries` tasks are in `.mise/config.o11y.toml`, locked in `.mise/mise.o11y.lock`. After changing a version there, re-lock with `MISE_ENV=o11y mise lock`, using the mise version `o11y.yml` pins (or bump that pin in the same change): a lock written by a newer mise fails CI's `--locked` install.
 

@@ -10,6 +10,7 @@ import struct
 import sys
 import tempfile
 import threading
+import tracemalloc
 import unittest
 from unittest import mock
 
@@ -687,6 +688,41 @@ class BuildInfoTest(unittest.TestCase):
             with self.subTest(name):
                 with self.assertRaisesRegex(ValueError, "is not a whole gzip member"):
                     sut.build_info(reader(archive(body)))
+
+    def test_gzip_metadata_may_decompress_to_the_limit_and_no_further(self):
+        limit = 4096
+        # Padding compresses to a few bytes: both members are well under the limit as stored.
+        at_limit = json.dumps({**self.METADATA, "pad": ""}).encode()
+        at_limit = json.dumps({**self.METADATA, "pad": " " * (limit - len(at_limit))}).encode()
+        self.assertEqual(len(at_limit), limit)
+        with mock.patch.object(sut, "MAX_METADATA_BYTES", limit):
+            self.assertEqual(sut.build_info(reader(archive(gzip.compress(at_limit)))),
+                             {"version": "4.15.2", "osmDate": "2026-11-18T04:00:00Z"})
+
+            over = gzip.compress(at_limit[:-1] + b" }")
+            self.assertLess(len(over), limit)
+            with self.assertRaisesRegex(ValueError, rf"^metadata at 127 \({len(over)} bytes\) decompresses to more "
+                                                    rf"than {limit} bytes$"):
+                sut.build_info(reader(archive(over)))
+
+    def test_a_gzip_bomb_is_rejected_without_decompressing_it_whole(self):
+        # 256 MiB of zeros in ~250 KiB of gzip: gzip.decompress would hold all of it (and more while growing).
+        stored = io.BytesIO()
+        with gzip.GzipFile(fileobj=stored, mode="wb", mtime=0) as member:
+            chunk = bytes(1 << 20)
+            for _ in range(256):
+                member.write(chunk)
+        bomb = archive(stored.getvalue())
+        tracemalloc.start()
+        try:
+            with self.assertRaisesRegex(ValueError, "decompresses to more than"):
+                sut.build_info(reader(bomb))
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+
+        # The limit (16 MiB) plus one chunk of it being decompressed, nowhere near the 256 MiB.
+        self.assertLess(peak, 3 * sut.MAX_METADATA_BYTES)
 
 
 class RangeServer(http.server.BaseHTTPRequestHandler):
