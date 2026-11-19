@@ -5,6 +5,7 @@ import { purgePullZone } from '../../src/bunny/purge';
 let server: Server | undefined;
 
 afterEach(async () => {
+  server?.closeAllConnections();
   await new Promise((resolve) => (server ? server.close(resolve) : resolve(undefined)));
   server = undefined;
 });
@@ -38,6 +39,26 @@ describe('purgePullZone', () => {
     const result = await purgePullZone('k', '42', { baseUrl, baseDelayMs: 1 });
     expect(result).toMatchObject({ status: 200, attempts: 3 });
     expect(requests).toHaveLength(3);
+  });
+
+  it('takes a 2xx as done even when its body stalls, without retrying', async () => {
+    let requests = 0;
+    server = createServer((_request, response) => {
+      requests++;
+      // The status and part of the body arrive, the rest never does.
+      response.writeHead(200, { 'content-type': 'application/json', 'content-length': '100' });
+      response.write('{"Message":');
+    });
+    await new Promise<void>((resolve) => server!.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address() as { port: number };
+    const result = await purgePullZone('k', 7, {
+      baseUrl: `http://127.0.0.1:${port}`,
+      attempts: 3,
+      baseDelayMs: 1,
+      timeoutMs: 1_000,
+    });
+    expect(result).toMatchObject({ status: 200, attempts: 1 });
+    expect(requests).toBe(1);
   });
 
   it('fails at once on other errors without leaking the key', async () => {
