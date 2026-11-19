@@ -9,7 +9,8 @@ import {
   SyncRange,
   zoomOf,
 } from '../../src/bunny/diff';
-import { buildManifest, writeManifest } from '../../src/bunny/manifest';
+import { buildManifest, ManifestEntry, writeManifest } from '../../src/bunny/manifest';
+import { MAX_SAFE_ZOOM, zoomEnd } from '../../src/bunny/tile-id';
 import { openArchiveFile } from '../../src/deploy/archive-file';
 import { zxyToTileId } from '../../src/pmtiles/utils';
 import {
@@ -215,6 +216,35 @@ describe('diffManifests', () => {
       { start: 150, count: 1, kind: 'changed' },
     ]);
     expect(totals).toMatchObject({ oldBuild: '20261117', newBuild: '20261118', changed: 11, unchanged: 189 });
+  });
+
+  it('rejects changed, added and removed positions past zoom 26 instead of hanging', async () => {
+    const end = zoomEnd(MAX_SAFE_ZOOM);
+    const cases: [ManifestEntry[], ManifestEntry[]][] = [
+      // A changed run crossing into zoom 27, one changed position at its first ID, one added, one removed.
+      [
+        [{ tileId: end - 1, runLength: 2, hash: 'A'.repeat(16) }],
+        [{ tileId: end - 1, runLength: 2, hash: 'B'.repeat(16) }],
+      ],
+      [[{ tileId: end, runLength: 1, hash: 'A'.repeat(16) }], [{ tileId: end, runLength: 1, hash: 'B'.repeat(16) }]],
+      [[], [{ tileId: end + 5, runLength: 1, hash: 'A'.repeat(16) }]],
+      [[{ tileId: end + 5, runLength: 1, hash: 'A'.repeat(16) }], []],
+    ];
+    for (const [i, [before, after]] of cases.entries()) {
+      const oldPath = scratch.path(`old-${i}.tman.zst`);
+      const newPath = scratch.path(`new-${i}.tman.zst`);
+      await writeManifest(oldPath, { buildKey: '20261117' }, before);
+      await writeManifest(newPath, { buildKey: '20261118' }, after);
+      await expect(runDiff(oldPath, newPath), `case ${i}`).rejects.toThrow(/past zoom 26/);
+    }
+    // The last position of zoom 26 still counts.
+    const oldPath = scratch.path('old-last.tman.zst');
+    const newPath = scratch.path('new-last.tman.zst');
+    await writeManifest(oldPath, { buildKey: '20261117' }, [{ tileId: end - 1, runLength: 1, hash: 'A'.repeat(16) }]);
+    await writeManifest(newPath, { buildKey: '20261118' }, [{ tileId: end - 1, runLength: 1, hash: 'B'.repeat(16) }]);
+    const { ranges, totals } = await runDiff(oldPath, newPath);
+    expect(ranges).toEqual([{ start: end - 1, count: 1, kind: 'changed' }]);
+    expect(totals.byZoom[26]).toEqual({ changed: 1, added: 0, removed: 0 });
   });
 
   it('can only be iterated once', async () => {
