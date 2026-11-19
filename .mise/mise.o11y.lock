@@ -244,6 +244,46 @@ checksum_source = "mise-versions"
 url = "https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize/v5.8.3/kustomize_v5.8.3_windows_amd64.zip"
 url_api = "https://api.github.com/repos/kubernetes-sigs/kustomize/releases/assets/621661357"
 
+[[tools.victoria-metrics]]
+version = "1.153.0"
+backend = "aqua:VictoriaMetrics/VictoriaMetrics/victoria-metrics"
+specifiers = ["1.153.0"]
+
+[tools.victoria-metrics."platforms.linux-arm64"]
+checksum = "sha256:3d5f965b7a75f713742a7f37195c1d845f47d9dc9d096a2cce29e693f08fd641"
+url = "https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v1.153.0/victoria-metrics-linux-arm64-v1.153.0.tar.gz"
+url_api = "https://api.github.com/repos/VictoriaMetrics/VictoriaMetrics/releases/assets/588646449"
+
+[tools.victoria-metrics."platforms.linux-arm64-musl"]
+checksum = "sha256:3d5f965b7a75f713742a7f37195c1d845f47d9dc9d096a2cce29e693f08fd641"
+url = "https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v1.153.0/victoria-metrics-linux-arm64-v1.153.0.tar.gz"
+url_api = "https://api.github.com/repos/VictoriaMetrics/VictoriaMetrics/releases/assets/588646449"
+
+[tools.victoria-metrics."platforms.linux-x64"]
+checksum = "sha256:1b495bde563825cf83dc7c0425a9d8fa03e7214858e0949f9177efc6bb1f8bfc"
+url = "https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v1.153.0/victoria-metrics-linux-amd64-v1.153.0.tar.gz"
+url_api = "https://api.github.com/repos/VictoriaMetrics/VictoriaMetrics/releases/assets/588646109"
+
+[tools.victoria-metrics."platforms.linux-x64-musl"]
+checksum = "sha256:1b495bde563825cf83dc7c0425a9d8fa03e7214858e0949f9177efc6bb1f8bfc"
+url = "https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v1.153.0/victoria-metrics-linux-amd64-v1.153.0.tar.gz"
+url_api = "https://api.github.com/repos/VictoriaMetrics/VictoriaMetrics/releases/assets/588646109"
+
+[tools.victoria-metrics."platforms.macos-arm64"]
+checksum = "sha256:e2092b103d3f874d8d52fecb42ee35c0d73a3b27ee6cc5b73892d3b18e8e26ce"
+url = "https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v1.153.0/victoria-metrics-darwin-arm64-v1.153.0.tar.gz"
+url_api = "https://api.github.com/repos/VictoriaMetrics/VictoriaMetrics/releases/assets/588645574"
+
+[tools.victoria-metrics."platforms.macos-x64"]
+checksum = "sha256:d75fea2853e22839fe86bc8e0ff6d1073c8d04ab4ce2a39c9cd401586467c8f9"
+url = "https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v1.153.0/victoria-metrics-darwin-amd64-v1.153.0.tar.gz"
+url_api = "https://api.github.com/repos/VictoriaMetrics/VictoriaMetrics/releases/assets/588645391"
+
+[tools.victoria-metrics."platforms.windows-x64"]
+checksum = "sha256:c26e8ea7d8e26b68a959f82cb5254b1ea793c441251ad8511e4687dfd887f7f6"
+url = "https://github.com/VictoriaMetrics/VictoriaMetrics/releases/download/v1.153.0/victoria-metrics-windows-amd64-v1.153.0.zip"
+url_api = "https://api.github.com/repos/VictoriaMetrics/VictoriaMetrics/releases/assets/588644844"
+
 [[tools.yq]]
 version = "4.54.3"
 backend = "aqua:mikefarah/yq"

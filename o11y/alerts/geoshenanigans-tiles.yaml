@@ -625,10 +625,14 @@ spec:
           or with a file whose checksum is not the live manifest's. Its log line (app:="tiles-sample-check", in
           the dashboard's "Sync and watchdog logs") gives the counts and example paths. Missing files serve 404s;
           other bytes serve another build's tile (a seed run over the live prefix with an older archive, or a
-          file written by hand). Check the whole zone with `npm run bunny:replication -- --listing` (presence and
-          regions), then repair the affected zooms from the live build's archive with `npm run bunny:seed --
-          --archive <live build>.pmtiles --min-zoom Z --max-zoom Z --verify-existing`: it DESCRIBEs every file,
-          writes only missing or wrong ones, and refuses any archive but the live build's
+          file written by hand). `npm run bunny:status` names the live build, its prefix and any pending builds:
+          revert pending builds first (dispatch Tiles Sync with the live build as `build`). Check the whole zone
+          with `npm run bunny:replication -- --listing` (the live prefix; presence and regions), then repair the
+          affected zooms from the live build's archive, under the live prefix and with a new checkpoint
+          directory: `npm run bunny:seed -- --archive <live build>.pmtiles --prefix <live prefix> --min-zoom Z
+          --max-zoom Z --verify-existing --state-dir <new dir>`. It DESCRIBEs every file, writes only missing or
+          wrong ones, and refuses any archive but the live build's. Without --prefix it writes under v1, which
+          is no longer live after a full rewrite, and a reused state dir skips the chunks it completed before
           (deployment/modules/bunny/tiles/README.md, "Repairs").
       execErrState: Error
       noDataState: OK
@@ -1175,16 +1179,20 @@ spec:
                 reducer:
                   type: last
                   params: []
-    # Each probe run pushes tiles_bunny_probe_errors{continent,kind} per
-    # Globalping probe that tested (1 for a failed or wrong response, 0 for a
-    # good one) and tiles_bunny_probe_runs{result} once, all stamped at the
-    # run's minute. Fires per continent and kind when over half the runs in
-    # 30 minutes saw an error there (at least 2). The window must hold two runs
-    # at all times: 30m does at a BUNNY_PROBE_INTERVAL_MINUTES of up to 14 (10
-    # by default; 15m never fired at 10, as a window held two runs only half
-    # the time and `for` restarted). `continent`, not `region`: region is an
-    # o11y identity label (world). Runs that failed at Globalping itself say
-    # nothing about Bunny: geoshenanigans-tiles-bunny-probe-failing.
+    # Each probe run pushes tiles_bunny_probe_errors{continent,kind,target} for
+    # every Globalping test with a verdict (1 for a failed or wrong response, 0
+    # for a good one) and tiles_bunny_probe_runs{result} once, all stamped at
+    # the run's minute. kind is the cache status the edge reported and target
+    # the tile tested, so after a purge the popular tile's miss is a miss
+    # beside the random tile's: the rule adds up over target. Fires per
+    # continent and kind when over half the verdicts in 30 minutes were errors
+    # (at least 2); tests without a verdict count in neither, so runs that saw
+    # nothing of a continent and kind do not dilute it. The window must hold
+    # two runs at all times: 30m does at a BUNNY_PROBE_INTERVAL_MINUTES of up
+    # to 14 (10 by default; 15m never fired at 10, as a window held two runs
+    # only half the time and `for` restarted). `continent`, not `region`:
+    # region is an o11y identity label (world). Runs that failed at Globalping
+    # itself say nothing about Bunny: geoshenanigans-tiles-bunny-probe-failing.
     - uid: geoshenanigans-tiles-bunny-probe-errors
       title: Bunny synthetic probe sees errors
       condition: B
@@ -1195,10 +1203,12 @@ spec:
       annotations:
         summary: The synthetic probe gets errors from the Bunny pull zone.
         description: >-
-          Over half of the synthetic probe's runs in the past 30 minutes got a failed, unfinished or wrong
-          response for the tile of the alert's kind (hit: a popular tile; miss: a random z15 position) from
-          its probe in the alert's continent. Try the URLs from the probe's lines (the dashboard's "Probe
-          tests" panel: project:="geoshenanigans" cluster:="tiles" kind:="probe", with the PoP that answered)
+          At least 2, and over half, of the synthetic probe's tests with a verdict in the past 30 minutes got a
+          failed or wrong response from its probe in the alert's continent, for tiles of the alert's kind: the
+          cache status the edge reported (hit: from the edge's cache, normally the popular tile; miss: from
+          storage, normally the random z15 position, and the popular tile after a purge; a test without a
+          CDN-Cache header counts as the tile it tested). Try the URLs from the probe's lines (the dashboard's
+          "Probe tests" panel: project:="geoshenanigans" cluster:="tiles" kind:="probe", with the PoP that answered)
           and check status.bunny.net. A 404 for a tile means a missing file in the
           storage zone (every position is uploaded, so none should be); corrupt or empty bodies in a few PoPs
           are the gzip edge rule bug the middleware script works around. The Tiles dashboard's "Probe errors"
@@ -1218,8 +1228,8 @@ spec:
               type: prometheus
               uid: VictoriaMetricsFleet
             expr: >-
-              (sum_over_time(tiles_bunny_probe_errors{project="geoshenanigans", cluster="tiles", env="prod"}[30m]) >= 2)
-                / on () group_left () sum(sum_over_time(tiles_bunny_probe_runs{project="geoshenanigans", cluster="tiles", env="prod"}[30m])) > 0.5
+              (sum by (continent, kind) (sum_over_time(tiles_bunny_probe_errors{project="geoshenanigans", cluster="tiles", env="prod"}[30m])) >= 2)
+                / sum by (continent, kind) (count_over_time(tiles_bunny_probe_errors{project="geoshenanigans", cluster="tiles", env="prod"}[30m])) > 0.5
             instant: true
             range: false
             intervalMs: 1000
@@ -1329,13 +1339,18 @@ spec:
                 reducer:
                   type: last
                   params: []
-    # A miss is a never-requested tile read from the nearest storage replica:
+    # A miss is a tile the edge read from the nearest storage replica (a
+    # CDN-Cache other than HIT or STALE; normally the random z15 position):
     # 18-78 ms per continent when measured, 350-530 ms when the replica lacks
     # it and Frankfurt serves it. This fires at 1 s, for outages of the storage
     # zone or the middleware script; a replica that lacks files (350-530 ms)
     # stays under it and is geoshenanigans-tiles-sample-unreplicated's to find.
-    # Averaged per continent over 15 minutes, so one slow request does not
-    # fire. A warning: slow misses degrade the map without breaking it.
+    # Per continent over 30 minutes (three runs at the default 10-minute
+    # interval), adding up over target (the tile tested): the misses' average,
+    # only while at least two of them took over 1 s, so neither a lone result
+    # (the only sample when the next run is skipped) nor one outlier among
+    # fast ones starts the timer. A warning: slow misses degrade the map
+    # without breaking it.
     - uid: geoshenanigans-tiles-bunny-probe-slow
       title: Bunny synthetic probe sees slow misses
       condition: B
@@ -1346,8 +1361,9 @@ spec:
       annotations:
         summary: The synthetic probe's uncached tiles take over 1 second to first byte.
         description: >-
-          The synthetic probe's average time to first byte for never-requested tiles has been above 1s for 15
-          minutes from the alert's continent. The Tiles dashboard's "Probe first byte, misses" shows whether
+          The synthetic probe's average time to first byte for tiles the edge read from storage (cache misses)
+          from the alert's continent has been above 1s for 15 minutes, over 30-minute windows in which at least
+          two misses took over 1s. The Tiles dashboard's "Probe first byte, misses" shows whether
           it is one continent (Bunny routing that continent to far PoPs, or its storage region down) or all
           of them (the storage zone or the middleware script; check status.bunny.net). A region merely lacking
           files is slower (350-530 ms, from Frankfurt) but under this threshold:
@@ -1359,7 +1375,7 @@ spec:
           datasourceUid: VictoriaMetricsFleet
           queryType: ''
           relativeTimeRange:
-            from: 900
+            from: 1800
             to: 0
           model:
             refId: A
@@ -1367,7 +1383,16 @@ spec:
               type: prometheus
               uid: VictoriaMetricsFleet
             expr: >-
-              avg_over_time(tiles_bunny_probe_ttfb_ms{project="geoshenanigans", cluster="tiles", env="prod", kind="miss"}[15m]) > 1000
+              (
+                sum by (continent, kind) (sum_over_time(tiles_bunny_probe_ttfb_ms{project="geoshenanigans", cluster="tiles", env="prod", kind="miss"}[30m]))
+                  / sum by (continent, kind) (count_over_time(tiles_bunny_probe_ttfb_ms{project="geoshenanigans", cluster="tiles", env="prod", kind="miss"}[30m]))
+                > 1000
+              )
+              and on (continent, kind)
+              (
+                sum by (continent, kind) (count_gt_over_time(tiles_bunny_probe_ttfb_ms{project="geoshenanigans", cluster="tiles", env="prod", kind="miss"}[30m], 1000))
+                >= 2
+              )
             instant: true
             range: false
             intervalMs: 1000
@@ -1376,7 +1401,7 @@ spec:
           datasourceUid: __expr__
           queryType: ''
           relativeTimeRange:
-            from: 900
+            from: 1800
             to: 0
           model:
             refId: B

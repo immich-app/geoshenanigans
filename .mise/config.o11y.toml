@@ -2,6 +2,7 @@
 # .github/workflows/o11y.yml), loaded only with MISE_ENV=o11y and locked in
 # mise.o11y.lock.
 #   MISE_ENV=o11y mise run o11y:render
+#   MISE_ENV=o11y mise run o11y:test-queries
 #   MISE_ENV=o11y mise lock   # after changing a version here
 [tools]
 jq = "1.8.2"
@@ -11,6 +12,8 @@ kubeconform = "0.8.0"
 flux2 = "2.9.5"
 # github backend: the aqua backend fails to verify cosign v3's sigstore bundles.
 "github:sigstore/cosign" = "v3.1.4"
+# o11y/test-queries.sh runs queries on a throwaway store.
+victoria-metrics = "1.153.0"
 
 [tasks."o11y:render"]
 description = "Render the o11y bundle into build/o11y, check it assembles under kustomize and validate it against the CRD schemas"
@@ -30,3 +33,7 @@ kubeconform -strict -summary \
   -schema-location '{% raw %}https://k8s-schemas.home-operations.com/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json{% endraw %}' \
   build/o11y
 """
+
+[tasks."o11y:test-queries"]
+description = "Run the tiles alert and dashboard queries o11y/test-queries.sh covers against a throwaway VictoriaMetrics"
+run = "bash o11y/test-queries.sh"
