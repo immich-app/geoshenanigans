@@ -631,6 +631,11 @@ def pmtiles(metadata, compression=sut.COMPRESSION_GZIP):
     body = json.dumps(metadata).encode()
     if compression == sut.COMPRESSION_GZIP:
         body = gzip.compress(body)
+    return archive(body, compression)
+
+
+def archive(body, compression=sut.COMPRESSION_GZIP):
+    """A PMTiles v3 header whose metadata is body as stored (its length advertised), the rest left out."""
     header = bytearray(sut.PMTILES_HEADER_BYTES)
     header[:8] = b"PMTiles\x03"
     struct.pack_into("<QQ", header, 24, sut.PMTILES_HEADER_BYTES, len(body))
@@ -667,6 +672,21 @@ class BuildInfoTest(unittest.TestCase):
             with self.subTest(name):
                 with self.assertRaises(ValueError):
                     sut.build_info(reader(data))
+
+    def test_metadata_that_is_not_a_whole_gzip_member_is_a_value_error(self):
+        member = gzip.compress(json.dumps(self.METADATA).encode())
+        cases = {
+            # The header advertises the bytes served: the range checks pass, the member ends early.
+            "truncated": member[:-8],
+            "cut in half": member[:len(member) // 2],
+            "corrupt deflate": member[:10] + b"\xff" * 20,  # zlib.error
+            "bad crc": member[:-8] + bytes(8),  # BadGzipFile
+            "not gzip": b"{}" + member[2:],
+        }
+        for name, body in cases.items():
+            with self.subTest(name):
+                with self.assertRaisesRegex(ValueError, "is not a whole gzip member"):
+                    sut.build_info(reader(archive(body)))
 
 
 class RangeServer(http.server.BaseHTTPRequestHandler):
@@ -725,6 +745,21 @@ class RangeReaderTest(unittest.TestCase):
 
         self.assertEqual(json.loads(out.getvalue()), {"version": "4.15.2", "osmDate": "2026-11-18T04:00:00Z"})
         self.assertEqual(RangeServer.USER_AGENTS, [sut.USER_AGENT, sut.USER_AGENT])
+
+    def test_truncated_gzip_metadata_is_retried_then_reported(self):
+        member = gzip.compress(json.dumps(BuildInfoTest.METADATA).encode())
+        RangeServer.DATA = archive(member[:-8])
+        err = io.StringIO()
+        with mock.patch.object(sut.time, "sleep") as sleep, contextlib.redirect_stderr(err), \
+                self.assertRaises(SystemExit) as raised:
+            sut.main(["build-info", "--url", self.url])
+
+        self.assertEqual(raised.exception.code, 1)
+        # Every attempt reads the header and the metadata again.
+        self.assertEqual(len(RangeServer.USER_AGENTS), 2 * (sut.HTTP_RETRIES + 1))
+        self.assertEqual(sleep.call_count, sut.HTTP_RETRIES)
+        self.assertRegex(err.getvalue(), rf"^could not read {self.url}: metadata at 127 \(\d+ bytes\) is not a whole "
+                                         r"gzip member: Compressed file ended")
 
     def test_a_server_that_ignores_the_range_is_an_error(self):
         RangeServer.IGNORE_RANGE = True
