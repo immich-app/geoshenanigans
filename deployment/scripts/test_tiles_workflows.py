@@ -237,7 +237,8 @@ class BunnyKeyTest(unittest.TestCase):
         self.assertIn("The maintainers accepted that exposure (What this doesn't cover, above)", step_3)
         self.assertNotIn("neither value is in any state", readme)
         for path in (os.path.join(WORKFLOWS, "tiles-worker.yml"), os.path.join(ROOT, "deployment", ".env"),
-                     os.path.join(ROOT, "deployment", "tiles-worker-bunny.env")):
+                     os.path.join(ROOT, "deployment", "tiles-worker-bunny.env"),
+                     os.path.join(ROOT, "deployment", "modules", "cloudflare", "tiles-worker", "workers.tf")):
             with self.subTest(path=os.path.relpath(path, ROOT)):
                 text = read(path)
                 self.assertNotIn("never gets the Bunny account key", text)
@@ -446,9 +447,13 @@ GIT_ENV = {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_NOSYSTEM": "1", "GIT_AUT
            "GIT_AUTHOR_EMAIL": "t@example.invalid", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.invalid"}
 
 
-class ApplyFreshnessStepTest(unittest.TestCase):
-    """The apply job's check that the run's commit still has main's configuration: a re-run of an older main run, or
-    one delayed behind a newer commit's, must not put the older configuration back."""
+class MainCheckoutTest(unittest.TestCase):
+    """A repository whose main gets commits, and a run's checkout of one of them, for the apply jobs' checks that the
+    run's commit still has main's configuration. Subclasses give initial_files()."""
+
+    def initial_files(self):
+        """{path: text} of main's first commits."""
+        raise NotImplementedError
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -459,8 +464,8 @@ class ApplyFreshnessStepTest(unittest.TestCase):
         self.git(self.tmp.name, "init", "--quiet", "--bare", "--initial-branch=main", self.origin)
         self.git(self.tmp.name, "init", "--quiet", "--initial-branch=main", self.main)
         self.git(self.main, "remote", "add", "origin", self.origin)
-        for path in self.trigger_files() + ["tiles/src/index.ts", "deployment/modules/cloudflare/tiles-worker/a.tf"]:
-            self.commit(path, "first")
+        for path, text in self.initial_files().items():
+            self.commit(path, text)
 
     def git(self, cwd, *args):
         return subprocess.run(["git", *args], cwd=cwd, env=self.env, check=True, capture_output=True,
@@ -476,30 +481,46 @@ class ApplyFreshnessStepTest(unittest.TestCase):
         self.git(self.main, "push", "--quiet", "origin", "main")
         return self.git(self.main, "rev-parse", "HEAD")
 
-    def trigger_files(self):
-        """A file under each path that triggers the workflow on main."""
-        paths = load(BUNNY_INFRA)[True]["push"]["paths"]
-        return [path.removesuffix("/**") + "/tiles/main.tf" if path.endswith("/**") else path for path in paths]
-
     def checkout(self, sha):
         """The run's checkout: actions/checkout fetches the one commit, with origin pointing at the repository."""
-        workspace = os.path.join(self.tmp.name, f"workspace-{sha[:7]}")
+        workspace = tempfile.mkdtemp(prefix=f"workspace-{sha[:7]}-", dir=self.tmp.name)
         self.git(self.tmp.name, "init", "--quiet", workspace)
         self.git(workspace, "remote", "add", "origin", "file://" + self.origin)
         self.git(workspace, "fetch", "--quiet", "--depth=1", "origin", sha)
         self.git(workspace, "checkout", "--quiet", "--detach", sha)
         return workspace
 
-    def run_step(self, sha):
-        check = step(load(BUNNY_INFRA)["jobs"]["apply"], "Check this commit has main's configuration")
+    def run_check(self, check, sha, **env):
+        """Runs a check step's script in the checkout of sha: what it wrote to GITHUB_OUTPUT, and its stdout."""
         workspace = self.checkout(sha)
         output = os.path.join(self.tmp.name, "github_output")
         with open(output, "w"):
             pass
-        result = run_bash(check["run"], workspace, dict(self.env, GITHUB_OUTPUT=output, GITHUB_SHA=sha))
+        result = run_bash(check["run"], workspace, dict(self.env, GITHUB_OUTPUT=output, GITHUB_SHA=sha, **env))
         self.assertEqual(result.returncode, 0, result.stderr)
         with open(output) as f:
             return f.read(), result.stdout
+
+    def head(self):
+        return self.git(self.main, "rev-parse", "HEAD")
+
+
+class ApplyFreshnessStepTest(MainCheckoutTest):
+    """The Bunny unit's apply job's check that the run's commit still has main's configuration: a re-run of an older
+    main run, or one delayed behind a newer commit's, must not put the older configuration back."""
+
+    def initial_files(self):
+        paths = self.trigger_files() + ["tiles/src/index.ts", "deployment/modules/cloudflare/tiles-worker/a.tf"]
+        return {path: "first" for path in paths}
+
+    def trigger_files(self):
+        """A file under each path that triggers the workflow on main."""
+        paths = load(BUNNY_INFRA)[True]["push"]["paths"]
+        return [path.removesuffix("/**") + "/tiles/main.tf" if path.endswith("/**") else path for path in paths]
+
+    def run_step(self, sha):
+        return self.run_check(step(load(BUNNY_INFRA)["jobs"]["apply"], "Check this commit has main's configuration"),
+                              sha)
 
     def test_main_itself_applies(self):
         head = self.git(self.main, "rev-parse", "HEAD")
@@ -524,6 +545,89 @@ class ApplyFreshnessStepTest(unittest.TestCase):
         triggers = load(BUNNY_INFRA)[True]
         self.assertEqual(triggers["pull_request"]["paths"], triggers["push"]["paths"])
         self.assertIn("deployment/modules/bunny/tiles/main.tf", self.trigger_files())
+
+
+WORKER_TFVARS = "deployment/modules/cloudflare/tiles-worker/tiles.{}.tfvars.json"
+
+
+def worker_tfvars(key="20261101", **settings):
+    return json.dumps({"pmtiles_deployment_key": key, "storage_prefix": "", **settings})
+
+
+class WorkerApplyFreshnessTest(MainCheckoutTest):
+    """Tiles Worker's apply jobs' check that the run's commit still has main's configuration: a re-run of an older
+    main run, or one delayed behind a newer commit's, must not put an older deployment key, worker code or Bunny
+    setting back, even with main's deployment key."""
+
+    # A file of each kind of input the apply on main reads.
+    INPUTS = ("tiles/src/index.ts", "tiles/package-lock.json", "deployment/modules/cloudflare/tiles-worker/workers.tf",
+              "deployment/tiles-worker-bunny.env", "deployment/root.hcl", ".mise/config.toml", ".mise/mise.lock",
+              ".github/workflows/tiles-worker.yml")
+    OTHERS = ("README.md", "geocoder/src/main.cpp", "o11y/alerts/geoshenanigans-tiles.yaml")
+
+    # Each file's text is a comment, which a mise config (that the step's tools may read) takes too.
+    def initial_files(self):
+        files = {path: "# first" for path in self.INPUTS + self.OTHERS}
+        files.update({WORKER_TFVARS.format(env): worker_tfvars() for env in ("prod", "dev")})
+        return files
+
+    def check(self, job):
+        return step(load("tiles-worker.yml")["jobs"][job], "Check this commit has main's configuration")
+
+    def run_job(self, job, sha, ref="refs/heads/main", environment="prod"):
+        return self.run_check(self.check(job), sha, GITHUB_REF=ref, ENVIRONMENT=environment)
+
+    def test_the_steps_that_apply_wait_for_the_check(self):
+        jobs = load("tiles-worker.yml")["jobs"]
+        for job, name in (("deploy-terragrunt", "Deploy All"), ("deploy-dev-worker", "Deploy dev worker")):
+            with self.subTest(job=job):
+                self.assertEqual(self.check(job)["id"], "current")
+                for each in ("Get build artifact", name):
+                    self.assertEqual(step(jobs[job], each)["if"], "steps.current.outputs.current == 'true'")
+
+    def test_main_itself_applies(self):
+        for job, environment in (("deploy-terragrunt", "prod"), ("deploy-dev-worker", "dev")):
+            with self.subTest(job=job):
+                self.assertEqual(self.run_job(job, self.head(), environment=environment)[0], "current=true\n")
+
+    def test_an_older_commit_applies_when_main_changed_only_other_files(self):
+        old = self.head()
+        for path in self.OTHERS:
+            self.commit(path, "# newer")
+        for job, environment in (("deploy-terragrunt", "prod"), ("deploy-dev-worker", "dev")):
+            with self.subTest(job=job):
+                self.assertEqual(self.run_job(job, old, environment=environment)[0], "current=true\n")
+
+    def test_an_older_commit_skips_when_main_changed_a_bunny_setting_with_the_same_key(self):
+        old = self.head()
+        for settings in ({"bunny_pull_zone_id": "12345"}, {"bunny_pull_zone_id": "12345",
+                                                           "bunny_public_url": "https://tiles-bunny.example.com"}):
+            head = self.commit(WORKER_TFVARS.format("prod"), worker_tfvars(**settings))
+            for job, environment in (("deploy-terragrunt", "prod"), ("deploy-dev-worker", "dev")):
+                with self.subTest(job=job, settings=settings):
+                    output, stdout = self.run_job(job, old, environment=environment)
+                    self.assertEqual(output, "current=false\n")
+                    self.assertIn(f"::warning::main ({head}) deploys other {environment} inputs than {old}", stdout)
+
+    def test_an_older_commit_skips_when_main_changed_any_input(self):
+        for path in self.INPUTS + (WORKER_TFVARS.format("prod"), WORKER_TFVARS.format("dev")):
+            old = self.head()
+            self.commit(path, f"# newer {path}" if path not in (WORKER_TFVARS.format("prod"), WORKER_TFVARS.format("dev"))
+                        else worker_tfvars(storage_prefix="newer/"))
+            for job, environment in (("deploy-terragrunt", "prod"), ("deploy-dev-worker", "dev")):
+                with self.subTest(path=path, job=job):
+                    self.assertEqual(self.run_job(job, old, environment=environment)[0], "current=false\n")
+
+    def test_a_dispatch_from_a_branch_deploys_its_own_code_to_dev_unless_main_moved_the_key(self):
+        branch = self.commit("tiles/src/index.ts", "# a branch's code")
+        self.git(self.main, "reset", "--quiet", "--hard", "HEAD~1")
+        self.git(self.main, "push", "--quiet", "--force", "origin", "main")
+        self.commit("deployment/modules/cloudflare/tiles-worker/workers.tf", "# main moved on")
+        self.assertEqual(self.run_job("deploy-terragrunt", branch, "refs/heads/feature", "dev")[0], "current=true\n")
+        self.commit(WORKER_TFVARS.format("dev"), worker_tfvars("20261118"))
+        output, stdout = self.run_job("deploy-terragrunt", branch, "refs/heads/feature", "dev")
+        self.assertEqual(output, "current=false\n")
+        self.assertIn("This commit deploys dev tiles 20261101 but main now has 20261118", stdout)
 
 
 FAKE_OP = """#!/bin/sh
@@ -715,85 +819,235 @@ class WatchdogConcurrencyTest(unittest.TestCase):
 
 
 FAKE_CURL_SECRETS = """#!/bin/bash
-# curl ... -H @FILE ... --data-binary @- URL: logs its arguments, the header files' lines and the body to $FAKE_LOG as
-# JSON lines, and prints $FAKE_RESPONSE.
+# curl ... [-X METHOD] [-H @FILE | -H HEADER]... [--data-binary @-] URL: logs the call to $FAKE_LOG as a JSON line (its
+# key, "METHOD PATH" with PATH after $FAKE_PREFIX and / ? = and spaces as _, the arguments, header lines and body),
+# prints the answer in $FAKE_DIR/KEY.TURN (TURN 2 for the second call with that key) or else $FAKE_DIR/KEY, and exits
+# with the number in that file's .exit, if any.
 args=("$@")
+method=GET
+body=""
 headers=()
 for ((i = 0; i < ${#args[@]}; i++)); do
-  if [ "${args[i]}" = -H ] && [[ "${args[i+1]}" == @* ]]; then headers+=("$(cat "${args[i+1]#@}")"); fi
+  case "${args[i]}" in
+    -X) method=${args[i+1]} ;;
+    -H) if [[ "${args[i+1]}" == @* ]]; then headers+=("$(cat "${args[i+1]#@}")"); else headers+=("${args[i+1]}"); fi ;;
+    --data-binary) if [ "${args[i+1]}" = @- ]; then body=$(cat); fi ;;
+  esac
 done
-body=$(cat)
-jq -cn --args '{args: $ARGS.positional}' -- "$@" >> "$FAKE_LOG"
-jq -cn --arg body "$body" '{body: $body}' >> "$FAKE_LOG"
-for header in "${headers[@]}"; do jq -cn --arg header "$header" '{header: $header}' >> "$FAKE_LOG"; done
-printf '%s' "$FAKE_RESPONSE"
+url=${args[-1]}
+key=$(printf '%s %s' "$method" "${url#"$FAKE_PREFIX"}" | tr '/?= ' '____')
+turn=$(($(jq -r --arg key "$key" 'select(.key == $key) | .key' "$FAKE_LOG" 2>/dev/null | wc -l) + 1))
+jq -cn --arg key "$key" --arg method "$method" --arg url "$url" --arg body "$body" \\
+  --argjson headers "$(jq -cn '$ARGS.positional' --args -- ${headers[@]+"${headers[@]}"})" \\
+  '{key: $key, method: $method, url: $url, body: $body, headers: $headers, args: $ARGS.positional}' --args -- "$@" \\
+  >> "$FAKE_LOG"
+for answer in "$FAKE_DIR/$key.$turn" "$FAKE_DIR/$key"; do
+  if [ -f "$answer" ]; then
+    cat "$answer"
+    if [ -f "$answer.exit" ]; then exit "$(cat "$answer.exit")"; fi
+    exit 0
+  fi
+done
+printf '%s' '{"success": false, "errors": [{"code": 7003, "message": "No route for that URI"}]}'
 """
 
 PUT_SECRETS = os.path.join(ROOT, "deployment", "modules", "cloudflare", "tiles-worker", "put-worker-secrets.sh")
+SCRIPT_API = "https://api.cloudflare.com/client/v4/accounts/account/workers/scripts/tiles-prod"
+
+
+def cloudflare(result=None, success=True, errors=()):
+    return json.dumps({"success": success, "errors": list(errors), "messages": [], "result": result})
+
+
+def deployments(*versions):
+    """The script's deployments, the latest (serving) first, each of one version."""
+    return cloudflare({"deployments": [{"id": f"d-{version}", "strategy": "percentage",
+                                        "versions": [{"version_id": version, "percentage": 100}]}
+                                       for version in versions]})
+
+
+def version(version_id, secrets):
+    """A version whose bindings are a plain text one, O11Y_TOKEN and the given secrets."""
+    bindings = [{"name": "DEPLOYMENT_KEY", "type": "plain_text", "text": "20261101"},
+                {"name": "O11Y_TOKEN", "type": "secret_text"}]
+    bindings += [{"name": name, "type": "secret_text"} for name in secrets]
+    return cloudflare({"id": version_id, "number": 7, "resources": {"bindings": bindings}})
+
+
+# As after a prod apply's upload: the latest deployment, v-upload, has neither Bunny secret; v-before, which served
+# before it, has both.
+AFTER_UPLOAD = {
+    "GET /deployments": deployments("v-upload", "v-before", "v-older"),
+    "GET /versions/v-upload": version("v-upload", []),
+    "GET /versions/v-before": version("v-before", ["BUNNY_API_KEY", "GLOBALPING_TOKEN"]),
+    "PUT /secrets": cloudflare({"name": "x", "type": "secret_text"}),
+    "POST /deployments?force=true": cloudflare({"id": "d-restored"}),
+}
+REFUSED = cloudflare(success=False, errors=[{"code": 10000, "message": "Authentication error"}])
+
+
+def fake_key(call):
+    """FAKE_CURL_SECRETS' key for "METHOD PATH"."""
+    return re.sub(r"[/?= ]", "_", call)
 
 
 class PutWorkerSecretsTest(unittest.TestCase):
     """put-worker-secrets.sh, which puts the worker's Bunny secrets through Cloudflare's API after every apply, so
-    that OpenTofu's state never holds them (workers.tf, terraform_data.bunny_secrets)."""
+    that OpenTofu's state never holds them (workers.tf, terraform_data.bunny_secrets), and puts back the version that
+    served before the apply's upload when it can't."""
 
-    def run_script(self, response='{"success": true, "errors": [], "result": {"name": "x", "type": "secret_text"}}',
-                   **overrides):
+    def run_script(self, answers=None, **overrides):
+        """Runs the script against the fake API's answers ({"METHOD PATH": answer, or a list of them by turn, an
+        answer a body or (body, curl's exit status)}): its result and the calls it made."""
         with tempfile.TemporaryDirectory() as tmp:
             install(os.path.join(tmp, "bin"), {"curl": FAKE_CURL_SECRETS})
+            answer_dir = os.path.join(tmp, "answers")
+            os.makedirs(answer_dir)
+            for key, answer in (AFTER_UPLOAD if answers is None else answers).items():
+                name = fake_key(key)
+                turns = answer if isinstance(answer, list) else [answer]
+                for turn, each in enumerate(turns, 1):
+                    body, status = each if isinstance(each, tuple) else (each, 0)
+                    path = os.path.join(answer_dir, f"{name}.{turn}" if isinstance(answer, list) else name)
+                    with open(path, "w") as f:
+                        f.write(body)
+                    if status:
+                        with open(path + ".exit", "w") as f:
+                            f.write(str(status))
             log = os.path.join(tmp, "log")
             env = dict(os.environ, PATH=os.path.join(tmp, "bin") + os.pathsep + os.environ["PATH"], FAKE_LOG=log,
-                       FAKE_RESPONSE=response, ACCOUNT_ID="account", SCRIPT="tiles-prod",
+                       FAKE_DIR=answer_dir, FAKE_PREFIX=SCRIPT_API, ACCOUNT_ID="account", SCRIPT="tiles-prod",
                        SECRETS="BUNNY_API_KEY GLOBALPING_TOKEN", CLOUDFLARE_API_TOKEN="cf-token-1",
                        BUNNY_API_KEY="bunny key 2", GLOBALPING_TOKEN='globalping "3"')
             env.update(overrides)
             result = subprocess.run(["bash", PUT_SECRETS], env=env, cwd=tmp, capture_output=True, text=True,
                                     check=False)
-            entries = []
+            calls = []
             if os.path.exists(log):
                 with open(log) as f:
-                    entries = [json.loads(line) for line in f]
-            return result, entries
+                    calls = [json.loads(line) for line in f]
+            return result, calls
+
+    def assert_nothing_leaks(self, result, calls):
+        """Neither the token nor a value is on curl's command line, which other processes can read, or in the output;
+        every call carries the token in its header file."""
+        for call in calls:
+            self.assertIn("Authorization: Bearer cf-token-1", call["headers"])
+            self.assertTrue(call["url"].startswith(SCRIPT_API + "/"), call["url"])
+            for secret in ("cf-token-1", "bunny key 2", 'globalping "3"'):
+                self.assertNotIn(secret, " ".join(call["args"]))
+        for secret in ("cf-token-1", "bunny key 2", 'globalping "3"'):
+            self.assertNotIn(secret, result.stdout + result.stderr)
+
+    def restores(self, calls):
+        return [json.loads(call["body"]) for call in calls if call["key"] == fake_key("POST /deployments?force=true")]
 
     def test_puts_each_secret_from_its_variable(self):
-        result, entries = self.run_script()
+        result, calls = self.run_script()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "Put BUNNY_API_KEY on tiles-prod\nPut GLOBALPING_TOKEN on tiles-prod\n")
-        calls = [entries[i:i + 3] for i in range(0, len(entries), 3)]
-        self.assertEqual(len(calls), 2)
-        for (args, body, header), name, value in zip(calls, ("BUNNY_API_KEY", "GLOBALPING_TOKEN"),
-                                                       ("bunny key 2", 'globalping "3"')):
+        self.assertEqual(result.stdout, "Should a secret not go on, tiles-prod goes back to version v-before, which "
+                                        "served before this apply's upload\nPut BUNNY_API_KEY on tiles-prod\n"
+                                        "Put GLOBALPING_TOKEN on tiles-prod\n")
+        puts = [call for call in calls if call["method"] == "PUT"]
+        self.assertEqual(len(puts), 2)
+        for put, name, value in zip(puts, ("BUNNY_API_KEY", "GLOBALPING_TOKEN"), ("bunny key 2", 'globalping "3"')):
             with self.subTest(secret=name):
-                self.assertEqual(args["args"][-1],
-                                 "https://api.cloudflare.com/client/v4/accounts/account/workers/scripts/tiles-prod/secrets")
-                self.assertIn("PUT", args["args"])
-                self.assertEqual(json.loads(body["body"]), {"name": name, "text": value, "type": "secret_text"})
-                self.assertEqual(header["header"], "Authorization: Bearer cf-token-1")
-                # Neither the token nor a value is on curl's command line, which other processes can read.
-                for secret in ("cf-token-1", "bunny key 2", 'globalping "3"'):
-                    self.assertNotIn(secret, " ".join(args["args"]))
+                self.assertEqual(put["url"], SCRIPT_API + "/secrets")
+                self.assertEqual(json.loads(put["body"]), {"name": name, "text": value, "type": "secret_text"})
+        self.assertEqual(self.restores(calls), [])
+        self.assert_nothing_leaks(result, calls)
 
-    def test_an_empty_secret_stops_before_any_request(self):
-        result, entries = self.run_script(GLOBALPING_TOKEN="")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("GLOBALPING_TOKEN is empty", result.stderr)
-        self.assertEqual(len(entries), 3)  # BUNNY_API_KEY went first
-        result, entries = self.run_script(SECRETS="BUNNY_API_KEY", BUNNY_API_KEY="")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(entries, [])
+    def test_an_empty_secret_or_an_odd_name_stops_before_any_request(self):
+        for overrides, message in (({"GLOBALPING_TOKEN": ""}, "GLOBALPING_TOKEN is empty"),
+                                   ({"SECRETS": "BUNNY_API_KEY", "BUNNY_API_KEY": ""}, "BUNNY_API_KEY is empty"),
+                                   ({"SECRETS": "BUNNY_API_KEY bunny-api-key"}, "Not a secret name: bunny-api-key")):
+            with self.subTest(**overrides):
+                result, calls = self.run_script(**overrides)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
+                self.assertEqual(calls, [])
 
-    def test_a_refused_put_fails_without_printing_the_secret(self):
-        result, _ = self.run_script(
-            response='{"success": false, "errors": [{"code": 10000, "message": "Authentication error"}]}')
+    def test_a_refused_put_puts_back_the_version_that_served_before_the_upload(self):
+        result, calls = self.run_script(dict(AFTER_UPLOAD, **{"PUT /secrets": REFUSED}))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Could not put BUNNY_API_KEY on tiles-prod", result.stderr)
         self.assertIn("Authentication error", result.stderr)
-        self.assertNotIn("bunny key 2", result.stderr + result.stdout)
-        result, _ = self.run_script(response="<html>bad gateway</html>")
-        self.assertNotEqual(result.returncode, 0)
+        # No second secret goes on after the first failed, and the worker goes back to v-before at once, forced past
+        # Cloudflare's check that its secrets changed since.
+        self.assertEqual([call["key"] for call in calls][-2:],
+                         [fake_key("PUT /secrets"), fake_key("POST /deployments?force=true")])
+        self.assertEqual(len([call for call in calls if call["method"] == "PUT"]), 1)
+        restore = self.restores(calls)
+        self.assertEqual(len(restore), 1)
+        self.assertEqual(restore[0]["strategy"], "percentage")
+        self.assertEqual(restore[0]["versions"], [{"version_id": "v-before", "percentage": 100}])
+        self.assertIn("BUNNY_API_KEY", restore[0]["annotations"]["workers/message"])
+        self.assertIn("Deployed version v-before of tiles-prod again", result.stderr)
+        self.assert_nothing_leaks(result, calls)
+
+    def test_a_put_that_fails_halfway_or_gets_no_answer_puts_it_back_too(self):
+        for name, put in (("second refused", [AFTER_UPLOAD["PUT /secrets"], REFUSED]),
+                          ("not json", "<html>bad gateway</html>"),
+                          ("curl failed", ("", 7))):
+            with self.subTest(name):
+                result, calls = self.run_script(dict(AFTER_UPLOAD, **{"PUT /secrets": put}))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual([body["versions"][0]["version_id"] for body in self.restores(calls)], ["v-before"])
+                self.assertIn("Deployed version v-before of tiles-prod again", result.stderr)
         self.assertIn("no API response", result.stderr)
 
-    def test_odd_names_and_missing_settings_fail(self):
-        self.assertNotEqual(self.run_script(SECRETS="bunny-api-key")[0].returncode, 0)
+    def test_a_put_that_fails_when_the_upload_dropped_nothing_changes_nothing(self):
+        # No upload this apply: the serving version still has both secrets, so a failed PUT leaves it as it is.
+        answers = dict(AFTER_UPLOAD, **{"GET /versions/v-upload": version("v-upload", ["BUNNY_API_KEY",
+                                                                                     "GLOBALPING_TOKEN"]),
+                                        "PUT /secrets": REFUSED})
+        result, calls = self.run_script(answers)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.restores(calls), [])
+        self.assertNotIn("goes back", result.stdout)
+
+    def test_nothing_is_put_back_that_had_none_of_the_secrets(self):
+        # The first apply with the secrets: the version before had neither, so going back turns nothing on.
+        answers = dict(AFTER_UPLOAD, **{"GET /versions/v-before": version("v-before", []), "PUT /secrets": REFUSED})
+        result, calls = self.run_script(answers)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.restores(calls), [])
+        self.assertIn("Nothing to go back to", result.stderr)
+
+    def test_the_version_before_counts_if_it_had_any_secret_the_upload_dropped(self):
+        # Prod's pull zone id came with this apply: only the probe's token was on before, and going back keeps it on.
+        answers = dict(AFTER_UPLOAD, **{"GET /versions/v-before": version("v-before", ["GLOBALPING_TOKEN"]),
+                                        "PUT /secrets": REFUSED})
+        _, calls = self.run_script(answers)
+        self.assertEqual([body["versions"][0]["version_id"] for body in self.restores(calls)], ["v-before"])
+
+    def test_without_the_deployments_the_secrets_still_go_on_and_nothing_is_put_back(self):
+        for name, answers in (
+                ("deployments unread", {"GET /deployments": REFUSED}),
+                ("deployments not json", {"GET /deployments": ("", 7)}),
+                ("one deployment", {"GET /deployments": deployments("v-upload")}),
+                ("split traffic", {"GET /deployments": cloudflare({"deployments": [
+                    {"id": "d-split", "versions": [{"version_id": "v-upload", "percentage": 50},
+                                                   {"version_id": "v-before", "percentage": 50}]},
+                    {"id": "d-before", "versions": [{"version_id": "v-before", "percentage": 100}]}]})}),
+                ("version unread", {"GET /versions/v-before": REFUSED})):
+            with self.subTest(name):
+                result, calls = self.run_script(dict(AFTER_UPLOAD, **answers))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len([call for call in calls if call["method"] == "PUT"]), 2)
+                result, calls = self.run_script(dict(AFTER_UPLOAD, **answers, **{"PUT /secrets": REFUSED}))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.restores(calls), [])
+
+    def test_a_refused_restore_says_the_worker_runs_without_them(self):
+        answers = dict(AFTER_UPLOAD, **{"PUT /secrets": REFUSED, "POST /deployments?force=true": REFUSED})
+        result, calls = self.run_script(answers)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.restores(calls)), 1)
+        self.assertIn("Could not deploy version v-before of tiles-prod again", result.stderr)
+        self.assertIn("runs without the secrets not put", result.stderr)
+
+    def test_missing_settings_fail(self):
         self.assertNotEqual(self.run_script(CLOUDFLARE_API_TOKEN="")[0].returncode, 0)
         self.assertNotEqual(self.run_script(SECRETS="")[0].returncode, 0)
 

@@ -1,14 +1,16 @@
 import { createExecutionContext, createScheduledController, env, waitOnExecutionContext } from 'cloudflare:test';
 import worker from '../src';
 import { runBunnyCron } from '../src/bunny-logs';
-import { MAX_PROBE_INTERVAL_MINUTES, probeConfig, probeIntervalMinutes } from '../src/bunny-logs/config';
+import { MAX_PROBE_INTERVAL_MINUTES, ProbeConfig, probeConfig, probeIntervalMinutes } from '../src/bunny-logs/config';
 import { LOGGING_API } from '../src/bunny-logs/log-reader';
 import {
   GLOBALPING_API,
   HIT_TILE,
+  hitTile,
   missTile,
   PROBE_CONTINENTS,
   probeDue,
+  probeTiles,
   runProbe,
   TILEJSON_LABELS,
   tileUrl,
@@ -51,8 +53,8 @@ const measurement = (id: string, status: string, results: unknown[]) =>
   json({ id, type: 'http', status, target: 'tiles.example.com', probesCount: results.length, results });
 
 const TILEJSON_URL = 'https://tiles.example.com/v1.json';
-const tileJsonOf = (template: string) =>
-  json({ tilejson: '3.0.0', name: 'OpenMapTiles', tiles: [template], minzoom: 0, maxzoom: 15 });
+const tileJsonOf = (template: string, fields: object = {}) =>
+  json({ tilejson: '3.0.0', name: 'OpenMapTiles', tiles: [template], minzoom: 0, maxzoom: 15, ...fields });
 
 type Routes = {
   create?: (call: Call, index: number) => Response;
@@ -69,7 +71,8 @@ function globalping({ create, get, tileJson }: Routes) {
       return tileJson?.() ?? tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt');
     }
     if (call.url === GLOBALPING_API && call.method === 'POST') {
-      return create?.(call, creates++) ?? json({ id: `m${creates}`, probesCount: 6 }, 202);
+      const index = creates++;
+      return create?.(call, index) ?? json({ id: `m${index + 1}`, probesCount: 6 }, 202);
     }
     if (call.url.startsWith(`${GLOBALPING_API}/`) && call.method === 'GET') {
       const id = decodeURIComponent(call.url.slice(GLOBALPING_API.length + 1));
@@ -82,7 +85,7 @@ function globalping({ create, get, tileJson }: Routes) {
 }
 
 // null: no settings.
-async function probe(routes: Routes, probeSettings: typeof config | null = config) {
+async function probe(routes: Routes, probeSettings: ProbeConfig | null = config) {
   const fetchMock = mockFetch(globalping(routes));
   const deps = testDeps(scheduled + 3000, () => 0.25);
   const logger = new O11yLogger(o11y);
@@ -126,6 +129,33 @@ describe('probe settings', () => {
     );
   });
 
+  it('takes a cutover origin only when it is an http(s) origin alone', () => {
+    const settings = (origin: string) =>
+      probeConfig({
+        GLOBALPING_TOKEN: 'gp-token',
+        BUNNY_PUBLIC_URL: 'https://tiles.example.com',
+        BUNNY_PROBE_CUTOVER_ORIGIN: origin,
+      });
+    expect(settings('https://tiles-test.example.com')).toEqual({
+      ...config,
+      cutoverOrigin: 'https://tiles-test.example.com',
+    });
+    expect(settings(' https://Tiles-Test.example.com:443/ ')?.cutoverOrigin).toBe('https://tiles-test.example.com');
+    expect(settings('http://tiles-test.example.com:8080')?.cutoverOrigin).toBe('http://tiles-test.example.com:8080');
+    for (const origin of [
+      '',
+      'tiles-test.example.com',
+      'ftp://tiles-test.example.com',
+      'https://tiles-test.example.com/v1',
+      'https://tiles-test.example.com/?v=1',
+      'https://user:pass@tiles-test.example.com',
+    ]) {
+      // The probe still runs; only the public origin is allowed.
+      expect(settings(origin)).toEqual(config);
+      expect(settings(origin)).not.toHaveProperty('cutoverOrigin');
+    }
+  });
+
   it('runs every 10 minutes unless told otherwise, never more often than every 5 nor less than every 14', () => {
     expect(probeIntervalMinutes(undefined)).toBe(10);
     expect(probeIntervalMinutes('')).toBe(10);
@@ -148,6 +178,27 @@ describe('probe settings', () => {
     expect(missTile(() => 0)).toBe('15/0/0');
     expect(missTile(() => 0.9999999999)).toBe('15/32767/32767');
     expect(missTile(() => 0.5)).toBe('15/16384/16384');
+    expect(missTile(() => 0.9999999999, 12)).toBe('12/4095/4095');
+  });
+
+  it('takes the hit tile, or the one that holds it or its centre, at any zoom', () => {
+    expect(hitTile(2)).toBe(HIT_TILE);
+    expect(hitTile(1)).toBe('1/1/0');
+    expect(hitTile(0)).toBe('0/0/0');
+    // HIT_TILE's centre is at x 2.5, y 1.5 of z2's grid.
+    expect(hitTile(3)).toBe('3/5/3');
+    expect(hitTile(5)).toBe('5/20/12');
+  });
+
+  it("keeps both tiles within the TileJSON's zoom range", () => {
+    const half = () => 0.5;
+    expect(probeTiles({ minZoom: 0, maxZoom: 15 }, half)).toEqual({ hit: HIT_TILE, miss: '15/16384/16384' });
+    expect(probeTiles({ minZoom: 0, maxZoom: 30 }, half)).toEqual({ hit: HIT_TILE, miss: '15/16384/16384' });
+    // A staged or clipped build that stops at z12, and one that starts at z4.
+    expect(probeTiles({ minZoom: 0, maxZoom: 12 }, half)).toEqual({ hit: HIT_TILE, miss: '12/2048/2048' });
+    expect(probeTiles({ minZoom: 4, maxZoom: 15 }, half)).toEqual({ hit: '4/10/6', miss: '15/16384/16384' });
+    expect(probeTiles({ minZoom: 0, maxZoom: 1 }, half)).toEqual({ hit: '1/1/0', miss: '1/1/1' });
+    expect(probeTiles({ minZoom: 16, maxZoom: 18 }, half)).toEqual({ hit: '16/40960/24576', miss: '16/32768/32768' });
   });
 });
 
@@ -281,7 +332,13 @@ describe('runProbe', () => {
           everywhere([{ probe: { continent: 'NA' }, result: { status: 'offline', rawOutput: '' } }]),
         ),
     });
-    expect(calls.filter(({ url, method }) => url.startsWith(`${GLOBALPING_API}/`) && method === 'GET')).toHaveLength(2);
+    // One poll of each measurement: the hit one and the miss one, by the ids the fake gives them by default.
+    expect(
+      calls
+        .filter(({ url, method }) => url.startsWith(`${GLOBALPING_API}/`) && method === 'GET')
+        .map(({ url }) => url.slice(GLOBALPING_API.length + 1)),
+    ).toEqual(['m1', 'm2']);
+    expect(JSON.parse(creates(calls)[1].body).locations).toBe('m1');
     expect(metrics(calls).filter(({ labels }) => labels.continent === 'NA')).toEqual([]);
     // Its continent went unmeasured, which the run reports.
     expect(result).toBe('error');
@@ -580,12 +637,15 @@ describe('runProbe', () => {
     });
   });
 
-  it("probes the TileJSON's path on the public origin when the TileJSON names another hostname", async () => {
+  it("probes the TileJSON's path on the public origin when the TileJSON names the cutover origin", async () => {
     // From a DNS cutover until the next sync, the TileJSON on the public hostname still names the test one.
-    const { result, calls } = await probe({
-      tileJson: () => tileJsonOf('https://tiles-test.example.com/v1/e2/{z}/{x}/{y}.mvt'),
-      get: (id) => measurement(id, 'finished', everywhere([])),
-    });
+    const { result, calls } = await probe(
+      {
+        tileJson: () => tileJsonOf('https://tiles-test.example.com/v1/e2/{z}/{x}/{y}.mvt'),
+        get: (id) => measurement(id, 'finished', everywhere([])),
+      },
+      { ...config, cutoverOrigin: 'https://tiles-test.example.com' },
+    );
     expect(result).toBe('ok');
     expect(creates(calls).map(({ body }) => JSON.parse(body))).toEqual([
       expect.objectContaining({
@@ -602,12 +662,58 @@ describe('runProbe', () => {
     expect(pushedLogs(calls)).toEqual(
       expect.arrayContaining([
         expect.objectContaining({
-          _msg: 'Probe TileJSON names tiles on another origin',
+          _msg: 'Probe TileJSON names tiles on the cutover origin',
           level: 'warn',
           tile_origin: 'https://tiles-test.example.com',
         }),
       ]),
     );
+    expect(metrics(calls)).toContainEqual(tileJsonRead(0));
+  });
+
+  it('fails the TileJSON test, measuring nothing, when it names another origin than the cutover one', async () => {
+    // Clients would load the tiles from there, even if the same paths work on the public origin.
+    const { result, calls } = await probe(
+      { tileJson: () => tileJsonOf('https://tiles-old.example.com/v1/{z}/{x}/{y}.mvt') },
+      { ...config, cutoverOrigin: 'https://tiles-test.example.com' },
+    );
+    expect(result).toBe('error');
+    expect(calls.filter(({ url }) => url.startsWith(GLOBALPING_API))).toEqual([]);
+    expect(metrics(calls)).toEqual([
+      tileJsonRead(1),
+      { name: 'tiles_bunny_probe_runs', labels: { result: 'error' }, value: 1 },
+    ]);
+    expect(pushedLogs(calls)).toEqual([
+      expect.objectContaining({
+        _msg: 'Probe tile URLs unknown',
+        level: 'error',
+        error: expect.stringContaining('https://tiles-old.example.com'),
+      }),
+    ]);
+  });
+
+  it("probes tiles within a clipped build's zoom range", async () => {
+    // A staged build that stops at z12 and starts at z4: no z15 file, nor a z2 one, for the probe to find.
+    const { result, calls } = await probe({
+      tileJson: () => tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt', { minzoom: 4, maxzoom: 12 }),
+      get: (id) => measurement(id, 'finished', everywhere([])),
+    });
+    expect(result).toBe('ok');
+    expect(creates(calls).map(({ body }) => JSON.parse(body).measurementOptions.request.path)).toEqual([
+      '/v1/4/10/6.mvt',
+      '/v1/12/1024/1024.mvt',
+    ]);
+  });
+
+  it('measures the planet build at z2 and z15 when its TileJSON gives no zoom range', async () => {
+    const { calls } = await probe({
+      tileJson: () => json({ tilejson: '3.0.0', tiles: ['https://tiles.example.com/v1/{z}/{x}/{y}.mvt'] }),
+      get: (id) => measurement(id, 'finished', everywhere([])),
+    });
+    expect(creates(calls).map(({ body }) => JSON.parse(body).measurementOptions.request.path)).toEqual([
+      `/v1/${HIT_TILE}.mvt`,
+      '/v1/15/8192/8192.mvt',
+    ]);
   });
 
   it.each([
@@ -622,6 +728,18 @@ describe('runProbe', () => {
     ['is no JSON', () => new Response('<html>', { status: 200 })],
     ['has no tile template', () => json({ tilejson: '3.0.0', tiles: [] })],
     ['names tiles with a query', () => tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt?v=20261118')],
+    // Clients follow it there; without a cutover origin configured only the public one is allowed.
+    ['names tiles on another origin', () => tileJsonOf('https://tiles-test.example.com/v1/{z}/{x}/{y}.mvt')],
+    [
+      'has a minzoom above its maxzoom',
+      () => tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt', { minzoom: 9, maxzoom: 4 }),
+    ],
+    [
+      'has a maxzoom that is no zoom',
+      () => tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt', { maxzoom: 14.5 }),
+    ],
+    ['has a maxzoom beyond 30', () => tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt', { maxzoom: 31 })],
+    ['has a minzoom that is text', () => tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt', { minzoom: '0' })],
   ])(
     'pushes a failed TileJSON test the critical alert counts, measuring no tile, when the TileJSON %s',
     async (_, tileJson) => {

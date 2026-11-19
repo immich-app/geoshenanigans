@@ -56,10 +56,31 @@ variable "bunny_pull_zone_id" {
 }
 
 # The Bunny-served origin the probe requests tiles from, e.g. https://tiles.immich.cloud once DNS points there (a test
-# hostname before). Set it in tiles.<env>.tfvars.json.
+# hostname before). Set it in tiles.<env>.tfvars.json. Empty turns the probe off; anything else must be a URL the
+# worker takes (tiles/src/bunny-logs/config.ts), or it would get the Globalping token and skip the probe.
 variable "bunny_public_url" {
   type    = string
   default = ""
+
+  validation {
+    condition     = var.bunny_public_url == "" || can(regex("^https?://[A-Za-z0-9][A-Za-z0-9.-]*(/[^?#[:space:]]*)?$", var.bunny_public_url))
+    error_message = "bunny_public_url must be empty (no probe) or an absolute http(s) URL with a hostname and no port, query or fragment, e.g. https://tiles.immich.cloud."
+  }
+}
+
+# Only while bunny_public_url changes (the DNS cutover, a rollback): the origin the TileJSON on bunny_public_url still
+# names tiles on until the next sync that uploads a build rewrites it, e.g. https://tiles-bunny.immich.cloud at the
+# cutover (deployment/modules/bunny/tiles/README.md, The cutover). The probe fails its TileJSON test on any origin but
+# bunny_public_url's and this one, as clients load the tiles from there: set it in the change that moves
+# bunny_public_url and remove it once a sync has rewritten the TileJSON.
+variable "bunny_probe_cutover_origin" {
+  type    = string
+  default = ""
+
+  validation {
+    condition     = var.bunny_probe_cutover_origin == "" || can(regex("^https?://[A-Za-z0-9][A-Za-z0-9.-]*/?$", var.bunny_probe_cutover_origin))
+    error_message = "bunny_probe_cutover_origin must be empty or an http(s) origin alone, without a port, path, query or fragment, e.g. https://tiles-bunny.immich.cloud."
+  }
 }
 
 # Each probe run is 12 Globalping tests; every 10 minutes is 72 of the 500 free an hour. From 5 (144 an hour) to 14: the

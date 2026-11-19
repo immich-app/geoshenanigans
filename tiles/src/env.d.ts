@@ -19,6 +19,10 @@ interface WorkerEnv extends Omit<Env, 'ENVIRONMENT' | 'DEPLOYMENT_KEY'> {
   BUNNY_PUBLIC_URL?: string;
   GLOBALPING_TOKEN?: string;
   BUNNY_PROBE_INTERVAL_MINUTES?: string;
+  // An origin the TileJSON may name tiles on besides BUNNY_PUBLIC_URL's: the one before BUNNY_PUBLIC_URL moved (e.g.
+  // https://tiles-bunny.immich.cloud from the DNS cutover), until a sync rewrites the TileJSON. Any other origin fails
+  // the probe's TileJSON test.
+  BUNNY_PROBE_CUTOVER_ORIGIN?: string;
   WORKER_TYPE: string | undefined;
   TIGRIS_KEY_ID: string;
   TIGRIS_ACCESS_KEY: string;

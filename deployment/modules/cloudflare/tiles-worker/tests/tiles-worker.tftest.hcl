@@ -193,3 +193,92 @@ run "pull_zone_id_not_a_number" {
 
   expect_failures = [var.bunny_pull_zone_id]
 }
+
+# The worker takes an absolute http(s) URL (tiles/src/bunny-logs/config.ts) and skips the probe on anything else, after
+# the Globalping token has gone on: such a value stops the plan instead.
+run "public_url_bare_hostname" {
+  command = plan
+
+  variables {
+    bunny_public_url = "tiles.example.com"
+  }
+
+  expect_failures = [var.bunny_public_url]
+}
+
+run "public_url_not_http" {
+  command = plan
+
+  variables {
+    bunny_public_url = "ftp://tiles.example.com"
+  }
+
+  expect_failures = [var.bunny_public_url]
+}
+
+run "public_url_with_a_query" {
+  command = plan
+
+  variables {
+    bunny_public_url = "https://tiles.example.com/?v=1"
+  }
+
+  expect_failures = [var.bunny_public_url]
+}
+
+run "public_url_under_a_path" {
+  command = plan
+
+  variables {
+    bunny_public_url = "https://cdn.example.com/tiles"
+  }
+
+  assert {
+    condition     = contains([for binding in cloudflare_workers_script.tiles.plain_text_binding : "${binding.name}=${binding.text}"], "BUNNY_PUBLIC_URL=https://cdn.example.com/tiles")
+    error_message = "A URL with a path is the probe's public URL."
+  }
+}
+
+# The DNS cutover's origin: the TileJSON may name tiles there too until the next sync rewrites it; any other origin
+# fails the probe's TileJSON test (tiles/src/bunny-logs/probe.ts).
+run "probe_cutover_origin" {
+  command = plan
+
+  variables {
+    bunny_probe_cutover_origin = "https://tiles-test.example.com"
+  }
+
+  assert {
+    condition     = contains([for binding in cloudflare_workers_script.tiles.plain_text_binding : "${binding.name}=${binding.text}"], "BUNNY_PROBE_CUTOVER_ORIGIN=https://tiles-test.example.com")
+    error_message = "The worker gets the cutover origin."
+  }
+}
+
+run "probe_without_a_cutover_origin" {
+  command = plan
+
+  assert {
+    condition     = length([for binding in cloudflare_workers_script.tiles.plain_text_binding : binding if binding.name == "BUNNY_PROBE_CUTOVER_ORIGIN"]) == 0
+    error_message = "Without a cutover origin the TileJSON may name the public origin only."
+  }
+}
+
+run "probe_cutover_origin_with_a_path" {
+  command = plan
+
+  variables {
+    bunny_probe_cutover_origin = "https://tiles-test.example.com/v1"
+  }
+
+  expect_failures = [var.bunny_probe_cutover_origin]
+}
+
+run "probe_cutover_origin_bare_hostname" {
+  command = plan
+
+  variables {
+    bunny_probe_cutover_origin = "tiles-test.example.com"
+  }
+
+  expect_failures = [var.bunny_probe_cutover_origin]
+}

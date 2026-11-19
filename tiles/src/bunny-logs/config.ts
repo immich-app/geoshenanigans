@@ -1,10 +1,20 @@
 export type LogReaderConfig = { apiKey: string; pullZoneId: string };
 
-export type ProbeConfig = { token: string; publicUrl: URL; intervalMinutes: number };
+/**
+ * cutoverOrigin: an origin the TileJSON may name tiles on besides the public URL's, while the public URL moves (the
+ * test hostname's from the DNS cutover until a sync rewrites the TileJSON); undefined when unset. Any other fails the
+ * probe's TileJSON test (probe.ts).
+ */
+export type ProbeConfig = { token: string; publicUrl: URL; intervalMinutes: number; cutoverOrigin?: string };
 
 type BunnyEnv = Pick<
   WorkerEnv,
-  'BUNNY_API_KEY' | 'BUNNY_PULL_ZONE_ID' | 'BUNNY_PUBLIC_URL' | 'GLOBALPING_TOKEN' | 'BUNNY_PROBE_INTERVAL_MINUTES'
+  | 'BUNNY_API_KEY'
+  | 'BUNNY_PULL_ZONE_ID'
+  | 'BUNNY_PUBLIC_URL'
+  | 'GLOBALPING_TOKEN'
+  | 'BUNNY_PROBE_INTERVAL_MINUTES'
+  | 'BUNNY_PROBE_CUTOVER_ORIGIN'
 >;
 
 export const DEFAULT_PROBE_INTERVAL_MINUTES = 10;
@@ -25,23 +35,42 @@ export function logReaderConfig(env: BunnyEnv): LogReaderConfig | undefined {
   return { apiKey, pullZoneId };
 }
 
-/** The probe's settings, or undefined (it is skipped) without the Globalping token and an http(s) public URL. */
+/** An http(s) URL, or undefined. */
+function httpUrl(value: string): URL | undefined {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return undefined;
+  }
+  return url.protocol === 'https:' || url.protocol === 'http:' ? url : undefined;
+}
+
+/**
+ * The probe's settings, or undefined (it is skipped) without the Globalping token and an http(s) public URL. A
+ * BUNNY_PROBE_CUTOVER_ORIGIN that isn't an http(s) origin alone (no path, query or credentials) is left out, so the
+ * TileJSON may name the public origin only (tiles-worker's variables refuse such a value before it gets here).
+ */
 export function probeConfig(env: BunnyEnv): ProbeConfig | undefined {
   const token = env.GLOBALPING_TOKEN?.trim();
   const url = env.BUNNY_PUBLIC_URL?.trim();
   if (!token || !url) {
     return undefined;
   }
-  let publicUrl: URL;
-  try {
-    publicUrl = new URL(url);
-  } catch {
+  const publicUrl = httpUrl(url);
+  if (!publicUrl) {
     return undefined;
   }
-  if (publicUrl.protocol !== 'https:' && publicUrl.protocol !== 'http:') {
-    return undefined;
-  }
-  return { token, publicUrl, intervalMinutes: probeIntervalMinutes(env.BUNNY_PROBE_INTERVAL_MINUTES) };
+  const cutover = env.BUNNY_PROBE_CUTOVER_ORIGIN?.trim();
+  const cutoverUrl = cutover ? httpUrl(cutover) : undefined;
+  // An origin alone: its href is the origin and a slash (a path, query, fragment or credentials would show there).
+  const cutoverOrigin = cutoverUrl?.href === `${cutoverUrl?.origin}/` ? cutoverUrl.origin : undefined;
+  return {
+    token,
+    publicUrl,
+    intervalMinutes: probeIntervalMinutes(env.BUNNY_PROBE_INTERVAL_MINUTES),
+    ...(cutoverOrigin && { cutoverOrigin }),
+  };
 }
 
 /**

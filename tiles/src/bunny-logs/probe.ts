@@ -3,7 +3,8 @@
  * nearly every edge) and a random z15 position (nearly always a miss, so it measures the trip to storage) from the
  * Bunny-served origin, and the time to first byte goes to o11y as tiles_bunny_probe_*. The tile URLs come from the
  * origin's TileJSON (`/v1.json`), as they do for clients, so after a full rewrite moves the tiles to another prefix
- * (`v1/e2`) the probe measures the new prefix, not the retired one.
+ * (`v1/e2`) the probe measures the new prefix, not the retired one. Both tiles are within the TileJSON's minzoom and
+ * maxzoom (probeTiles): a build that stops below z15 or starts above z2 has no tile there to find.
  *
  * The run waits for its own measurements (a few seconds, never much more than RESULT_DEADLINE_MS, against the 15 minutes
  * a cron run may take) instead of reading them on a later run: the worker has nowhere to keep a measurement id between
@@ -30,6 +31,8 @@ export const GLOBALPING_API = 'https://api.globalping.io/v1/measurements';
 export const PROBE_CONTINENTS = ['EU', 'NA', 'SA', 'AS', 'OC', 'AF'] as const;
 // Most of Europe, where most requests come from, at a zoom every world and continent view loads.
 export const HIT_TILE = '2/2/1';
+// TileJSON 3.0.0's zoom limits, and its minzoom and maxzoom when it gives none.
+const TILEJSON_ZOOMS = { min: 0, max: 30 };
 // The TileJSON Immich loads (static-files.ts' STATIC_PREFIX), whose tile template says where the live tiles are.
 export const TILEJSON_PATH = '/v1.json';
 // The labels of the Worker's TileJSON read's verdict: a vantage point and a kind of their own, never a probe's.
@@ -46,6 +49,9 @@ const REQUEST_TIMEOUT_MS = 15_000;
 export type ProbeKind = 'hit' | 'miss';
 
 type Target = { kind: ProbeKind; path: string };
+
+/** What the public origin's TileJSON advertises: its first tile template and its zoom range. */
+export type LiveTiles = { template: string; minZoom: number; maxZoom: number };
 
 type TestResult = {
   status?: unknown;
@@ -68,11 +74,33 @@ export function probeDue(scheduledTime: number, intervalMinutes: number): boolea
   return Math.floor(scheduledTime / 60_000) % intervalMinutes === 0;
 }
 
-/** A random z15 tile path, z/x/y. */
-export function missTile(random: () => number): string {
-  const size = 2 ** MISS_ZOOM;
+/** A random tile path at zoom (z15 unless told otherwise), z/x/y. */
+export function missTile(random: () => number, zoom = MISS_ZOOM): string {
+  const size = 2 ** zoom;
   const coordinate = () => Math.min(size - 1, Math.floor(random() * size));
-  return `${MISS_ZOOM}/${coordinate()}/${coordinate()}`;
+  return `${zoom}/${coordinate()}/${coordinate()}`;
+}
+
+/** HIT_TILE at zoom: itself, the tile above it that holds it, or the tile below it that holds its centre. */
+export function hitTile(zoom: number): string {
+  const [z, x, y] = HIT_TILE.split('/').map(Number);
+  if (zoom <= z) {
+    const shift = 2 ** (z - zoom);
+    return `${zoom}/${Math.floor(x / shift)}/${Math.floor(y / shift)}`;
+  }
+  const scale = 2 ** (zoom - z);
+  return `${zoom}/${x * scale + scale / 2}/${y * scale + scale / 2}`;
+}
+
+/**
+ * The hit and miss tiles within the TileJSON's zoom range: HIT_TILE and a random z15 position for the planet build
+ * (z0-15), else each at the zoom in the range nearest its own. A staged or clipped build that stops below z15 has no
+ * z15 file, nor one that starts above z2 a z2 file: probing them would page on 404s that no client gets.
+ */
+export function probeTiles(live: Pick<LiveTiles, 'minZoom' | 'maxZoom'>, random: () => number) {
+  const within = (zoom: number) => Math.min(Math.max(zoom, live.minZoom), live.maxZoom);
+  const hitZoom = Number(HIT_TILE.split('/')[0]);
+  return { hit: hitTile(within(hitZoom)), miss: missTile(random, within(MISS_ZOOM)) };
 }
 
 // The public origin's path, without a trailing slash: '' for https://tiles.immich.cloud.
@@ -80,10 +108,9 @@ const basePath = (publicUrl: URL) => publicUrl.pathname.replace(/\/+$/, '');
 
 /**
  * Tile z/x/y's URL from the TileJSON's tile template. Throws unless the template is an absolute http(s) URL under the
- * public URL's path, without a query or fragment, with one each of {z}, {x} and {y}. Its origin can be another of the
- * pull zone's hostnames: from the DNS cutover until the next sync rewrites v1.json, the TileJSON on the public hostname
- * still names the test one (deployment/modules/bunny/tiles/README.md). The probe requests the path from the public
- * origin either way, so a TileJSON never sends Globalping to another host.
+ * public URL's path, without a query or fragment, with one each of {z}, {x} and {y}. Its origin isn't checked here:
+ * runProbe accepts the public URL's and the configured cutover origin (ProbeConfig), and requests the path from the
+ * public origin either way, so a TileJSON never sends Globalping to another host.
  */
 export function tileUrl(publicUrl: URL, template: string, tile: string): URL {
   const shown = JSON.stringify(template.slice(0, 200));
@@ -111,10 +138,12 @@ export function tileUrl(publicUrl: URL, template: string, tile: string): URL {
 }
 
 /**
- * The tile template the public origin's TileJSON advertises now (its first), which clients follow: a full rewrite
- * moves it to another prefix. Throws when the TileJSON can't be read or has no tile template.
+ * The tile template the public origin's TileJSON advertises now (its first), which clients follow (a full rewrite
+ * moves it to another prefix), and its zoom range. Throws when the TileJSON can't be read, has no tile template, or
+ * has a minzoom or maxzoom that isn't a whole zoom from 0 to 30 or a minzoom above its maxzoom (TileJSON 3.0.0; either
+ * left out is its default, 0 and 30).
  */
-export async function liveTileTemplate(publicUrl: URL): Promise<string> {
+export async function liveTiles(publicUrl: URL): Promise<LiveTiles> {
   const url = `${publicUrl.origin}${basePath(publicUrl)}${TILEJSON_PATH}`;
   const response = await fetch(url, {
     headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
@@ -124,12 +153,32 @@ export async function liveTileTemplate(publicUrl: URL): Promise<string> {
     await response.body?.cancel();
     throw new Error(`${url} answered ${response.status}`);
   }
-  const body = (await response.json()) as { tiles?: unknown } | null;
+  const body = (await response.json()) as { tiles?: unknown; minzoom?: unknown; maxzoom?: unknown } | null;
   const template = Array.isArray(body?.tiles) ? body.tiles[0] : undefined;
   if (typeof template !== 'string') {
     throw new Error(`${url} has no tile template`);
   }
-  return template;
+  const zoom = (name: 'minzoom' | 'maxzoom', fallback: number) => {
+    const value = body?.[name];
+    if (value === undefined) {
+      return fallback;
+    }
+    if (
+      typeof value !== 'number' ||
+      !Number.isInteger(value) ||
+      value < TILEJSON_ZOOMS.min ||
+      value > TILEJSON_ZOOMS.max
+    ) {
+      throw new Error(`${url} has ${name} ${JSON.stringify(value)?.slice(0, 40)}, not a zoom from 0 to 30`);
+    }
+    return value;
+  };
+  const minZoom = zoom('minzoom', TILEJSON_ZOOMS.min);
+  const maxZoom = zoom('maxzoom', TILEJSON_ZOOMS.max);
+  if (minZoom > maxZoom) {
+    throw new Error(`${url} has minzoom ${minZoom} above its maxzoom ${maxZoom}`);
+  }
+  return { template, minZoom, maxZoom };
 }
 
 /** The Globalping HTTP measurement of path on the public origin, from locations (or a measurement's probes). */
@@ -332,9 +381,10 @@ export function measurementSamples(
  * Probes the hit and miss tiles, at the URLs the TileJSON advertises, from one probe per continent (the miss
  * measurement reuses the hit one's probes, so the two compare like for like), waits for the results and pushes them
  * with the TileJSON read's verdict (TILEJSON_LABELS) and the run's result at the scheduled minute. The run is an error
- * when the TileJSON gives no tile URL (its verdict then a 1, for the critical alert), Globalping refuses or doesn't
- * finish a measurement, or a measurement has no verdict from some continent (no probe there, or its test failed on
- * Globalping's side): that continent's tiles went unmeasured. Never rejects. Without config it pushes only
+ * when the TileJSON gives no tile URL or names tiles on an origin that is neither the public URL's nor the configured
+ * cutover origin (its verdict then a 1, for the critical alert: clients load the tiles from there), Globalping refuses
+ * or doesn't finish a measurement, or a measurement has no verdict from some continent (no probe there, or its test
+ * failed on Globalping's side): that continent's tiles went unmeasured. Never rejects. Without config it pushes only
  * result="skipped".
  */
 export async function runProbe(
@@ -353,16 +403,26 @@ export async function runProbe(
   const fields = { job: 'bunny_probe', run_minute: new Date(minute).toISOString() };
   let targets: Target[];
   try {
-    const template = await liveTileTemplate(config.publicUrl);
-    const hit = tileUrl(config.publicUrl, template, HIT_TILE);
+    const live = await liveTiles(config.publicUrl);
+    const tiles = probeTiles(live, deps.random);
+    const hit = tileUrl(config.publicUrl, live.template, tiles.hit);
     targets = [
       { kind: 'hit', path: hit.pathname },
-      { kind: 'miss', path: tileUrl(config.publicUrl, template, missTile(deps.random)).pathname },
+      { kind: 'miss', path: tileUrl(config.publicUrl, live.template, tiles.miss).pathname },
     ];
     if (hit.origin !== config.publicUrl.origin) {
-      // Expected from a DNS cutover until the next sync rewrites the TileJSON (see tileUrl); anything else is worth a
-      // look, as clients load the tiles from there.
-      logger.warn('Probe TileJSON names tiles on another origin', { ...fields, tile_origin: hit.origin.slice(0, 200) });
+      // Clients load the tiles from the origin the TileJSON names, not from the one probed. From a DNS cutover until a
+      // sync rewrites the TileJSON it still names the test hostname, which serves the same zone: that is the cutover
+      // origin, allowed while it is configured, and still logged. Any other origin fails the TileJSON test.
+      if (hit.origin !== config.cutoverOrigin) {
+        throw new Error(
+          `TileJSON names tiles on ${hit.origin.slice(0, 200)}, neither ${config.publicUrl.origin} nor the cutover origin`,
+        );
+      }
+      logger.warn('Probe TileJSON names tiles on the cutover origin', {
+        ...fields,
+        tile_origin: hit.origin.slice(0, 200),
+      });
     }
   } catch (error) {
     // Not the old prefix instead: after a full rewrite that is the retired build, deleted a week later. Clients can't

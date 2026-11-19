@@ -70,10 +70,13 @@ resource "cloudflare_workers_script" "tiles" {
   }
 
   dynamic "plain_text_binding" {
-    for_each = local.bunny_probe ? {
-      BUNNY_PUBLIC_URL             = var.bunny_public_url
-      BUNNY_PROBE_INTERVAL_MINUTES = tostring(var.bunny_probe_interval_minutes)
-    } : {}
+    for_each = local.bunny_probe ? merge(
+      {
+        BUNNY_PUBLIC_URL             = var.bunny_public_url
+        BUNNY_PROBE_INTERVAL_MINUTES = tostring(var.bunny_probe_interval_minutes)
+      },
+      var.bunny_probe_cutover_origin == "" ? {} : { BUNNY_PROBE_CUTOVER_ORIGIN = var.bunny_probe_cutover_origin },
+    ) : {}
     content {
       name = plain_text_binding.key
       text = plain_text_binding.value
@@ -104,7 +107,11 @@ resource "cloudflare_workers_script" "tiles" {
 # command's environment. Every upload drops them: provider 4.52.10 uploads only the configured bindings, and its
 # refresh records the secrets it doesn't manage, without their values, so every prod plan updates the script to remove
 # them. Hence this puts them after every upload, and on every apply anyway (plantimestamp), which also sends out a
-# rotated value.
+# rotated value. When one can't be put, the script deploys the version that served before the upload again, secrets
+# and all, and fails the apply: a failed put doesn't leave the worker without secrets it had before the apply.
+# Out of the state isn't out of pull requests' reach: their plans read the Cloudflare account token, which can deploy
+# code that reads the Worker's secrets. The maintainers accepted that exposure on 2026-11-19, as every unit of
+# deployment/ has it, to be closed repo-wide (deployment/modules/bunny/tiles/README.md, What this doesn't cover).
 resource "terraform_data" "bunny_secrets" {
   count = length(local.bunny_secret_names) > 0 ? 1 : 0
 
