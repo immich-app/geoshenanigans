@@ -1,5 +1,5 @@
 import { createServer } from 'node:net';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BunnyStorage, BunnyStorageOptions, StorageError } from '../../src/bunny/storage';
 import { FakeStorage, FakeStorageOptions, Fault, sha256Hex } from './fake-storage';
 
@@ -427,6 +427,99 @@ describe('BunnyStorage', () => {
     expect(error).toBeInstanceOf(StorageError);
     expect((error as StorageError).stopped).toBe(true);
     expect(performance.now() - started).toBeLessThan(1_000);
+  });
+
+  describe("describe() with the call's own signal", () => {
+    /** Back-offs and request timeouts far longer than any test, and the default half-hour budget for 429s. */
+    const slow = { retry: { ...fast, baseDelayMs: 10_000, maxDelayMs: 10_000, maxRateLimitWaitMs: 30 * 60_000 } };
+
+    it('sends nothing once the signal has aborted', async () => {
+      const { fake, storage } = await setup();
+      const error = await storage.describe('a.mvt', { signal: AbortSignal.abort() }).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(StorageError);
+      expect(error).toMatchObject({ cancelled: true, stopped: false, fatal: false });
+      expect(fake.requests.DESCRIBE ?? 0).toBe(0);
+    });
+
+    it('ends a back-off at once and sends no retry, after a 429 or a server error', async () => {
+      for (const fault of ['rate-limit', 'server-error'] as const) {
+        const { fake, storage } = await setup(
+          { fault: ({ method }) => (method === 'DESCRIBE' ? fault : undefined) },
+          { ...slow, timeoutMs: 60_000 },
+        );
+        const controller = new AbortController();
+        const call = storage.describe('a.mvt', { signal: controller.signal }).catch((e: unknown) => e);
+        // Abort only once the client has its answer and is backing off.
+        await vi.waitFor(() => expect(storage.counters.rateLimited + storage.counters.serverErrors).toBe(1));
+        const aborted = performance.now();
+        controller.abort();
+        const error = await call;
+        expect(performance.now() - aborted).toBeLessThan(1_000);
+        expect(error).toBeInstanceOf(StorageError);
+        expect(error).toMatchObject({ cancelled: true, stopped: false, fatal: false });
+        expect(fake.faultsInjected[fault]).toBe(1);
+        expect(fake.requests.DESCRIBE).toBe(1);
+        expect(storage.counters.retries).toBe(0);
+      }
+    });
+
+    it('lets the client signal win: a stop is reported as stopped, not cancelled', async () => {
+      const stop = new AbortController();
+      const { storage } = await setup(
+        { fault: ({ method }) => (method === 'DESCRIBE' ? 'rate-limit' : undefined) },
+        { ...slow, signal: stop.signal },
+      );
+      const controller = new AbortController();
+      const call = storage.describe('a.mvt', { signal: controller.signal }).catch((e: unknown) => e);
+      await vi.waitFor(() => expect(storage.counters.rateLimited).toBe(1));
+      stop.abort();
+      controller.abort();
+      expect(await call).toMatchObject({ stopped: true, cancelled: false });
+    });
+
+    it('abandons a request in flight without holding it against the address', async () => {
+      const { fake, storage } = await setup(
+        { fault: ({ method, attempt }) => (method === 'DESCRIBE' && attempt === 1 ? 'hang' : undefined) },
+        { ...slow, timeoutMs: 60_000 },
+      );
+      const controller = new AbortController();
+      const call = storage.describe('a.mvt', { signal: controller.signal }).catch((e: unknown) => e);
+      await vi.waitFor(() => expect(fake.requests.DESCRIBE).toBe(1));
+      const aborted = performance.now();
+      controller.abort();
+      expect(await call).toMatchObject({ cancelled: true });
+      expect(performance.now() - aborted).toBeLessThan(1_000);
+      expect(storage.inFlight).toBe(0);
+      expect(storage.counters).toMatchObject({ timeouts: 0, networkErrors: 0, retries: 0 });
+      // The client carries on as before.
+      expect(await storage.describe('a.mvt')).toBeNull();
+      expect(fake.requests.DESCRIBE).toBe(2);
+    });
+
+    it('stops waiting for a request slot, and leaves the slot to the next caller in line', async () => {
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => (release = resolve));
+      const { fake, storage } = await setup(
+        { hold: ({ path }) => (path === 'first.mvt' ? held : undefined) },
+        { ...slow, timeoutMs: 60_000, concurrency: 1 },
+      );
+      const first = storage.describe('first.mvt');
+      await vi.waitFor(() => expect(fake.requests.DESCRIBE).toBe(1));
+      const controller = new AbortController();
+      const second = storage.describe('second.mvt', { signal: controller.signal }).catch((e: unknown) => e);
+      const third = storage.describe('third.mvt');
+      // Both are queued for the one slot by now.
+      await new Promise((resolve) => setImmediate(resolve));
+      controller.abort();
+      expect(await second).toMatchObject({ cancelled: true });
+      expect(storage.inFlight).toBe(1);
+      release();
+      expect(await first).toBeNull();
+      // The slot goes to the third call, not to the second's abandoned place in the queue.
+      expect(await third).toBeNull();
+      expect(fake.requests.DESCRIBE).toBe(2);
+      expect(storage.inFlight).toBe(0);
+    });
   });
 });
 

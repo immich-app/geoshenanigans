@@ -36,8 +36,8 @@
  * The report goes to stdout as JSON (and to --json), a summary to stderr.
  * --live and --listing need BUNNY_STATE_ZONE and BUNNY_STATE_PASSWORD too (--listing only when --prefix is not given).
  * Exit codes: 0 everything stored and on every region, 2 stored but not yet on every region, 1 missing or
- * mismatched files, DESCRIBE errors (on the last pass with --wait), a refused password or no file to check (a range or
- * sample with no position in the archive or build), 3 bad arguments.
+ * mismatched files, DESCRIBE errors (with --wait, files whose last DESCRIBE failed), a refused password or no file to
+ * check (a range or sample with no position in the archive or build), 3 bad arguments.
  */
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';

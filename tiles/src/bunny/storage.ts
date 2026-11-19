@@ -98,6 +98,17 @@ export interface BunnyStorageOptions {
   signal?: AbortSignal;
 }
 
+/** Options for one read-only call (describe()). */
+export interface CallOptions {
+  /**
+   * Ends this call when it aborts: no request is sent or sent again after that, a wait for a request slot or a back-off
+   * (429 included) ends at once, and a request in flight is abandoned. The call then fails with a StorageError whose
+   * `cancelled` is set, so a caller with a deadline does not wait out the client's own retry budget
+   * (maxRateLimitWaitMs) past it.
+   */
+  signal?: AbortSignal;
+}
+
 export interface StorageCounters {
   requests: number;
   puts: number;
@@ -151,6 +162,8 @@ export class StorageError extends Error {
     readonly fatal = false,
     /** The client's signal ended a back-off: the file's state is unknown (it may be stored). */
     readonly stopped = false,
+    /** The call's own signal (CallOptions) ended it before an answer: nothing was learnt about the file. */
+    readonly cancelled = false,
   ) {
     super(message);
     this.name = 'StorageError';
@@ -249,11 +262,35 @@ class Semaphore {
   active = 0;
   constructor(private limit: number) {}
 
-  async acquire() {
+  /** Takes a slot, waiting for one if need be; false, with no slot taken, if `signal` aborts while it waits. */
+  async acquire(signal?: AbortSignal): Promise<boolean> {
     if (this.active >= this.limit) {
-      await new Promise<void>((resolve) => this.waiting.push(resolve));
+      if (signal?.aborted) {
+        // An abort listener added now would never fire.
+        return false;
+      }
+      const woken = await new Promise<boolean>((resolve) => {
+        const wake = () => {
+          signal?.removeEventListener('abort', leave);
+          resolve(true);
+        };
+        // Out of the queue, so no release() hands this caller a slot it will not use.
+        const leave = () => {
+          const at = this.waiting.indexOf(wake);
+          if (at !== -1) {
+            this.waiting.splice(at, 1);
+            resolve(false);
+          }
+        };
+        this.waiting.push(wake);
+        signal?.addEventListener('abort', leave, { once: true });
+      });
+      if (!woken) {
+        return false;
+      }
     }
     this.active++;
+    return true;
   }
 
   release() {
@@ -371,10 +408,13 @@ export class BunnyStorage {
     }
   }
 
-  /** The stored file's checksum, size and replica regions, or null if there is none. */
-  async describe(path: string): Promise<StorageObject | null> {
+  /**
+   * The stored file's checksum, size and replica regions, or null if there is none. `signal` cancels the call, retries
+   * and back-offs included (see CallOptions).
+   */
+  async describe(path: string, { signal }: CallOptions = {}): Promise<StorageObject | null> {
     this.counters.describes++;
-    const response = await this.idempotent('DESCRIBE', path, [200, 404]);
+    const response = await this.idempotent('DESCRIBE', path, [200, 404], { signal });
     return response.status === 404 ? null : parseObject(response.body);
   }
 
@@ -393,14 +433,14 @@ export class BunnyStorage {
 
   private async storedAs(path: string, checksum: string, avoid?: PinnedPool): Promise<boolean> {
     this.counters.describes++;
-    const described = await this.idempotent('DESCRIBE', path, [200, 404], avoid);
+    const described = await this.idempotent('DESCRIBE', path, [200, 404], { avoid });
     if (described.status === 404) {
       return false;
     }
     if (parseObject(described.body).checksum === checksum) {
       return true;
     }
-    const fetched = await this.idempotent('GET', path, [200, 404], avoid);
+    const fetched = await this.idempotent('GET', path, [200, 404], { avoid });
     const same = fetched.status === 200 && sha256Hex(fetched.body) === checksum;
     if (same) {
       this.counters.staleDescribes++;
@@ -468,20 +508,21 @@ export class BunnyStorage {
     method: string,
     path: string,
     accept: number[],
-    avoid?: PinnedPool,
+    { avoid, signal }: { avoid?: PinnedPool; signal?: AbortSignal } = {},
   ): Promise<{ status: number; body: Buffer }> {
+    const what = `${method} ${path}`;
     let failures = 0;
     let rateLimitedSince: number | undefined;
     let rateLimitedTimes = 0;
     for (;;) {
-      const outcome = await this.send(method, path, {}, avoid);
+      const outcome = await this.send(method, path, { signal }, avoid);
       avoid = outcome.pool;
       if ('status' in outcome && accept.includes(outcome.status)) {
         return outcome;
       }
       if ('status' in outcome && outcome.status === 429) {
         rateLimitedSince ??= performance.now();
-        await this.rateLimitPause(++rateLimitedTimes, rateLimitedSince, `${method} ${path}`);
+        await this.rateLimitPause(++rateLimitedTimes, rateLimitedSince, what, signal);
         this.counters.retries++;
         continue;
       }
@@ -490,29 +531,34 @@ export class BunnyStorage {
       }
       failures++;
       if (failures >= this.retry.maxAttempts) {
-        throw new StorageError(`${method} ${path} failed ${failures} times, last: ${describeOutcome(outcome)}`);
+        throw new StorageError(`${what} failed ${failures} times, last: ${describeOutcome(outcome)}`);
       }
-      await this.pause(this.backoff(failures));
+      await this.pause(this.backoff(failures), signal, what);
       this.counters.retries++;
     }
   }
 
   /** Backs off after a 429, or fails once the 429s that started at `since` would outlast maxRateLimitWaitMs. */
-  private async rateLimitPause(times: number, since: number, what: string): Promise<void> {
+  private async rateLimitPause(times: number, since: number, what: string, signal?: AbortSignal): Promise<void> {
     this.counters.rateLimited++;
     const delay = this.backoff(times);
     const waited = performance.now() - since;
     if (waited + delay > this.retry.maxRateLimitWaitMs) {
       throw new StorageError(`${what} still rate limited after ${Math.round(waited / 1000)} s`, 429);
     }
-    await this.pause(delay);
+    await this.pause(delay, signal, what);
   }
 
-  private async pause(ms: number): Promise<void> {
+  /** Waits `ms`, ended early by the client's signal (a stopped error, which wins) or the call's (a cancelled one). */
+  private async pause(ms: number, signal?: AbortSignal, what = 'request'): Promise<void> {
+    const stop = this.options.signal;
     try {
-      await sleep(ms, undefined, { signal: this.options.signal });
+      await sleep(ms, undefined, { signal: stop && signal ? AbortSignal.any([stop, signal]) : (stop ?? signal) });
     } catch {
-      throw new StorageError('Stopped while waiting to retry', undefined, false, true);
+      if (stop?.aborted || !signal?.aborted) {
+        throw new StorageError('Stopped while waiting to retry', undefined, false, true);
+      }
+      throw cancelled(what);
     }
   }
 
@@ -527,14 +573,21 @@ export class BunnyStorage {
     return new StorageError(`${method} ${path}: HTTP ${outcome.status} ${text}`, outcome.status, fatal);
   }
 
+  /**
+   * One request. `signal` (read-only calls only) keeps it from being sent once aborted, ends its wait for a slot, and
+   * abandons it in flight: each way it throws a cancelled StorageError, and the address is not held to blame.
+   */
   private async send(
     method: string,
     path: string,
-    { body, headers }: { body?: Uint8Array; headers?: Record<string, string> },
+    { body, headers, signal }: { body?: Uint8Array; headers?: Record<string, string>; signal?: AbortSignal },
     avoid?: PinnedPool,
   ): Promise<Outcome> {
     if (this.closed) {
       throw new StorageError('Storage client is closed', undefined, true);
+    }
+    if (signal?.aborted) {
+      throw cancelled(`${method} ${path}`);
     }
     try {
       await this.connect();
@@ -545,7 +598,15 @@ export class BunnyStorage {
       this.counters.networkErrors++;
       return { error: error instanceof Error ? error : new Error(String(error)), kind: 'unsent' };
     }
-    await this.slots.acquire();
+    if (!(await this.slots.acquire(signal))) {
+      // Aborted while waiting for a slot: it left the queue without one.
+      throw cancelled(`${method} ${path}`);
+    }
+    if (signal?.aborted) {
+      // Aborted as a slot came free: hand it on unused.
+      this.slots.release();
+      throw cancelled(`${method} ${path}`);
+    }
     // Chosen from the current set and dispatched in the same tick, so a pool setAddresses() drops gets no more.
     const pinned = choosePool(this.pools!, avoid);
     pinned.active++;
@@ -559,6 +620,7 @@ export class BunnyStorage {
         body,
         headersTimeout: this.timeoutMs,
         bodyTimeout: this.timeoutMs,
+        ...(signal && { signal }),
       });
       const bytes = Buffer.from(await response.body.arrayBuffer());
       this.counters.requestMs += performance.now() - started;
@@ -569,6 +631,10 @@ export class BunnyStorage {
       this.health(pinned, status < 500 && status !== 429 && status !== 408);
       return { status, body: bytes, pool: pinned };
     } catch (error) {
+      if (signal?.aborted) {
+        // Abandoned by the caller, not failed: no error to count against the address.
+        throw cancelled(`${method} ${path}`);
+      }
       const err = error instanceof Error ? error : new Error(String(error));
       const code = (err as { code?: string }).code ?? '';
       const kind = CONNECT_CODES.has(code) ? 'unsent' : TIMEOUT_CODES.has(code) ? 'timeout' : 'network';
@@ -675,6 +741,11 @@ function choosePool(pools: PinnedPool[], avoid?: PinnedPool): PinnedPool {
     }
   }
   return pools[0];
+}
+
+/** A call its own signal ended (CallOptions). */
+function cancelled(what: string): StorageError {
+  return new StorageError(`${what} cancelled`, undefined, false, false, true);
 }
 
 interface BunnyObject {

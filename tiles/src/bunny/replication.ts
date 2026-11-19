@@ -131,7 +131,8 @@ export function classify(
 
 /**
  * Runs `fn` over every item with at most `concurrency` at once, pulling lazily from the source. The first error
- * stops taking items and is thrown once the calls in flight are done.
+ * stops taking items and is thrown once the calls in flight are done. `signal` only stops taking items: pass it on to
+ * `fn`'s calls too, or a call in flight runs to its own end.
  */
 export async function forEachLimit<T>(
   source: AsyncIterable<T> | Iterable<T>,
@@ -166,6 +167,9 @@ export async function forEachLimit<T>(
 /** Errors no retry or later pass can get past: a refused password or zone, or a stopped or closed client. */
 const isFinal = (error: unknown) => error instanceof StorageError && (error.fatal || error.stopped);
 
+/** A DESCRIBE the caller's signal ended (StorageError.cancelled): no answer, so neither a result nor a failure. */
+const isCancelled = (error: unknown) => error instanceof StorageError && error.cancelled;
+
 export interface ReplicationResult {
   /** Every file is stored with the expected bytes and held by every region. */
   complete: boolean;
@@ -178,7 +182,7 @@ export interface ReplicationResult {
   missing: string[];
   /**
    * Files not shown missing or mismatched whose replication did not finish in time, or that no DESCRIBE answered for
-   * before the timeout (when a pass outlasts it, or a DESCRIBE keeps failing).
+   * before the timeout (when a pass outlasts it, a DESCRIBE keeps failing, or the timeout cancelled one mid-retry).
    */
   incomplete: number;
   /** The first of those (up to `stragglerLimit`) and the regions each lacked, so a stuck file can be named. */
@@ -186,7 +190,10 @@ export interface ReplicationResult {
   /** When each region first held every file, from the start of the wait; null if it never did. */
   regionWaitMs: Record<string, number | null>;
   passes: number;
-  /** DESCRIBE failures (after retries) on the last pass; those files stay pending. */
+  /**
+   * Files whose last DESCRIBE failed after its retries; they stay pending. A DESCRIBE the timeout or `signal` cancelled
+   * is no answer, so it neither adds to these nor clears its file's earlier failure.
+   */
   errors: number;
 }
 
@@ -225,13 +232,15 @@ const UNCHECKED = 2 ** MAX_GATE_REGIONS;
 /**
  * The replication gate: DESCRIBEs every file, then again only the files some region still lacks, until one answer
  * shows a file in every region (a replica can drop out, e.g. after an identical re-PUT) or the timeout passes. The
- * timeout bounds the whole wait: no DESCRIBE starts after it, and the files a pass did not reach stay pending. A file
- * DESCRIBE shows missing or with other bytes counts as lacking from every region and is asked about again on every
- * pass (DESCRIBE can lag an overwrite); once only such files are left and each has shown so for `mismatchGraceMs`,
- * the gate fails without waiting out the timeout. A DESCRIBE that fails after its retries leaves its file pending; a
- * refused password ends the gate with that error at once. `regions` are normalised (normalizeRegions).
- * What it keeps per file is a region bitmask and an index (8 bytes), so `items` sets the memory: pass a TileGateList
- * for large sets.
+ * timeout bounds the whole wait: no DESCRIBE starts after it, one in flight or backing off (a 429 the client would
+ * otherwise retry for maxRateLimitWaitMs) is cancelled, and the files left unanswered stay pending; `signal` does the
+ * same. A file DESCRIBE shows missing or with other bytes counts as lacking from every region and is asked about
+ * again on every pass (DESCRIBE can lag an overwrite); once only such files are left and each has shown so for
+ * `mismatchGraceMs`, the gate fails without waiting out the timeout. A DESCRIBE that fails after its retries leaves
+ * its file pending and counted in `errors` until one answers; a refused password ends the gate with that error at
+ * once. `regions` are normalised (normalizeRegions).
+ * What it keeps per file is a region bitmask, an index and a failure bit (just over 8 bytes), so `items` sets the
+ * memory: pass a TileGateList for large sets.
  */
 export async function waitForReplication(
   storage: BunnyStorage,
@@ -251,8 +260,14 @@ export async function waitForReplication(
   const bit = new Map(regions.map((region, i) => [region, 2 ** i]));
   /** The regions each file lacked on its last answer, as bits, and UNCHECKED until it has one. */
   const lacking = new Uint32Array(items.length).fill(all + UNCHECKED);
-  // No DESCRIBE starts once the timeout has passed, even in the middle of a pass (a timer takes whole milliseconds,
-  // at most TIMER_MAX_MS).
+  /** One bit per file, set while its last DESCRIBE failed after its retries. */
+  const failed = new Uint8Array(Math.ceil(items.length / 8));
+  const markFailed = (index: number, on: boolean) => {
+    const flag = 1 << (index & 7);
+    failed[index >>> 3] = on ? failed[index >>> 3] | flag : failed[index >>> 3] & ~flag;
+  };
+  // No DESCRIBE starts, retries or keeps waiting once the timeout has passed, even in the middle of a pass (a timer
+  // takes whole milliseconds, at most TIMER_MAX_MS).
   const deadline = AbortSignal.timeout(Math.min(TIMER_MAX_MS, Math.max(0, Math.ceil(options.timeoutMs))));
   const signal = options.signal ? AbortSignal.any([deadline, options.signal]) : deadline;
   /** Files whose last answer was missing or mismatched, and since when (elapsed ms) they have answered so. */
@@ -263,27 +278,30 @@ export async function waitForReplication(
     pending[index] = index;
   }
   let passes = 0;
-  let errors = 0;
   let missingByRegion: Record<string, number>;
 
   for (;;) {
     const passStarted = performance.now();
     passes++;
-    errors = 0;
     await forEachLimit(
       pending,
       options.concurrency ?? 256,
       async (index) => {
         let object: StorageObject | null;
         try {
-          object = await storage.describe(items.path(index));
+          object = await storage.describe(items.path(index), { signal });
         } catch (error) {
           if (isFinal(error)) {
             throw error;
           }
-          errors++;
+          // Cut off by the timeout or the caller: no answer, so the file keeps its last state (pending), a failure
+          // included.
+          if (!isCancelled(error)) {
+            markFailed(index, true);
+          }
           return;
         }
+        markFailed(index, false);
         if (!object || !checksumMatches(object.checksum, items.sha256(index))) {
           const since = wrong.get(index)?.since ?? elapsed();
           wrong.set(index, { state: object ? 'mismatched' : 'missing', since });
@@ -343,7 +361,7 @@ export async function waitForReplication(
     if (wait > 0) {
       await sleep(Math.min(wait, remaining), undefined, { signal }).catch(() => {});
     }
-    // A pass begun after the timeout would ask about nothing, and wipe the last pass's errors.
+    // A pass begun after the timeout would ask about nothing.
     if (signal.aborted || elapsed() >= options.timeoutMs) {
       break;
     }
@@ -354,7 +372,9 @@ export async function waitForReplication(
   const stragglerLimit = options.stragglerLimit ?? 20;
   const stragglers: ReplicationResult['stragglers'] = [];
   let incomplete = 0;
+  let errors = 0;
   for (const index of pending) {
+    errors += (failed[index >>> 3] >> (index & 7)) & 1;
     if (wrong.has(index)) {
       continue;
     }
@@ -411,7 +431,8 @@ const newTally = (regions: string[]): Tally => ({
 
 /**
  * One DESCRIBE per file of a (possibly huge, streamed) source: per-region coverage, overall and per zoom. `regions`
- * are normalised (normalizeRegions).
+ * are normalised (normalizeRegions). `signal` stops taking files and cancels the DESCRIBEs in flight, which are left
+ * out of the report (not checked).
  */
 export async function checkReplication(
   storage: BunnyStorage,
@@ -436,18 +457,25 @@ export async function checkReplication(
     items,
     options.concurrency ?? 256,
     async (item) => {
+      /** Undefined when the DESCRIBE failed after its retries. */
+      let object: StorageObject | null | undefined;
+      try {
+        object = await storage.describe(item.path, { signal: options.signal });
+      } catch (error) {
+        if (isFinal(error)) {
+          throw error;
+        }
+        if (isCancelled(error)) {
+          return;
+        }
+      }
+      // Only once the file has an answer or a failure, so a cancelled DESCRIBE leaves no trace (not even its zoom).
       const tallies = [total];
       if (item.tileId !== undefined) {
         const zoom = String(tileIdZoom(item.tileId));
         tallies.push((byZoom[zoom] ??= newTally(regions)));
       }
-      let object: StorageObject | null;
-      try {
-        object = await storage.describe(item.path);
-      } catch (error) {
-        if (isFinal(error)) {
-          throw error;
-        }
+      if (object === undefined) {
         tallies.forEach((tally) => (tally.checked++, tally.errors++));
         note(report.errorPaths, item.path);
         return;
