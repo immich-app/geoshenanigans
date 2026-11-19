@@ -396,6 +396,25 @@ describe('bunny:replication CLI', () => {
     expect(usage.stderr).toMatch(/give --sample/);
   }, 60_000);
 
+  it('refuses a --listing zoom range that would list nothing', async () => {
+    const { fake } = await setup();
+    for (const [args, message] of [
+      // The maximum defaults to 15.
+      [['--min-zoom', '16'], /--max-zoom 15 \(the default\) is below --min-zoom 16/],
+      [['--min-zoom', '5', '--max-zoom', '3'], /--max-zoom 3 is below --min-zoom 5/],
+      [['--max-zoom', '27'], /at most 26/],
+    ] as const) {
+      // With and without --prefix: the zooms are checked before state.json is read.
+      for (const prefix of [['--prefix', 'itest'], []]) {
+        const result = await run(fake, ['--listing', ...prefix, ...args]);
+        expect(result.code, result.stderr).toBe(3);
+        expect(result.stderr).toMatch(message);
+        expect(result.report).toEqual({});
+      }
+    }
+    expect(fake.requests).toEqual({});
+  }, 30_000);
+
   it('with --wait exits 1 at once when the zone refuses the password', async () => {
     const scratch = await scratchDir();
     cleanup.push(scratch.remove);
