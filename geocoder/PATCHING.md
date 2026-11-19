@@ -129,8 +129,13 @@ the largest unit's files' size free beside the dataset (planet `poi/all`:
 zstd window (8 MiB) and one chunk of the unit's columns (1 MiB, more only for
 a single polygon or arc larger than that).
 
-A decode that stops before it can clean up (its process killed, the machine
-off) leaves its dir behind, perhaps part way through moving files into place.
+A decode that stops before it can clean up (its process killed, say) leaves
+its dir behind, perhaps part way through moving files into place. What follows
+holds for a process that stops, not for a machine that does: a decode syncs
+nothing to disk, so after a power cut a file it moved in may hold bytes that
+never reached the disk, and the file it replaced be gone. Check the dataset's
+files against their `sha256` then.
+
 On unix decodes take two locks, both exclusive flock(2) locks: the install
 lock, on the dataset dir, and each decode's own lock, on its own dir. A
 decode:
