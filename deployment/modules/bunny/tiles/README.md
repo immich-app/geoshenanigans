@@ -20,19 +20,30 @@ op run --env-file=bunny.env -- terragrunt plan
 op run --env-file=bunny.env -- terragrunt apply
 ```
 
-`bunny.env` holds this unit's 1Password references, apart from `deployment/.env`: its key lives in `tf_prod` only, and the tiles workflows also resolve `.env` for dev.
+`bunny.env` holds this unit's 1Password references, apart from `deployment/.env`, which every pull request's plan resolves.
 
 | Variable | 1Password | Notes |
 | --- | --- | --- |
-| `TF_VAR_bunny_api_key` | `op://tf_prod/BUNNY_API_KEY/password` | The Bunny account API key (Account settings, API). The purge and the log reader use the same key. |
+| `TF_VAR_bunny_api_key` | `op://tf_bunny/BUNNY_API_KEY/password` | The Bunny account API key (Account settings, API). The purge and the log reader use the same key. |
 | `TF_VAR_tf_state_postgres_conn_str` | `op://tf/tf_state/postgres_conn_str` | The state backend, as in `deployment/.env`. |
 
 The sync, the watchdog and the worker read more items: every one is in the go-live checklist below, and they must exist before the branch merges.
 
+## Who gets the Bunny account key
+
+The account key can do anything on the Bunny account, so it sits in a vault of its own, `tf_bunny` (with the Globalping token), which neither `OP_TF_PROD_ENV` nor `OP_TF_DEV_ENV` reads. Its service account, `OP_TF_BUNNY_ENV` below, reads `tf_bunny`, `tf_prod` and `tf` (the jobs that use it resolve those items too), and its token is a secret of two GitHub environments only, never of the repository. A job gets an environment's secrets only by naming that environment and passing its protection rules, so a branch whose workflow drops or renames the environment gets no token:
+
+- `tiles-bunny-plan`: this unit's pull request plans. Required reviewers approve each run.
+- `tiles-bunny`: deployment branches limited to `main`, so a job on any other branch that names it is refused. This unit's apply, the Tiles Worker workflow's apply on `main` and Tiles Deploy's prod activation (which bind the key and the token in the worker, from `deployment/tiles-worker-bunny.env`, beside `.env`), and Tiles Sync's sync job (its purge; a dry run purges nothing and doesn't use it).
+
+Pull requests' Tiles Worker plans pass stand-ins for the two (the worker's bindings plan as they are, with a value the plan hides). A prod plan or apply of tiles-worker that resolved `.env` alone stops at a precondition instead of unbinding them; locally, add `--env-file=deployment/tiles-worker-bunny.env` for prod.
+
+What this doesn't cover: once applied, tiles-worker's prod state holds both values (OpenTofu keeps a secret binding's value in the state, as for the worker's other secrets), and the state backend's connection string is in `tf`, which those plans resolve. Closing that takes a state backend credential per unit, or the worker's secrets kept out of OpenTofu.
+
 ## The workflow
 
-- **Pull requests and branch dispatches** run the checks (formatting, `tofu validate`, and `tofu test` against a mocked provider) with no credentials. Their plan reads the production token and runs the branch's Terragrunt configuration, so it runs in the `tiles-bunny-plan` environment and waits until one of its required reviewers approves the run, which runs that one commit. Create the environment once in the repository's settings (Environments): required reviewers (the maintainers who review this module, with self-review prevented when more than one can approve), deployment branches and tags left at "No restriction" so that every branch's plan can run, and no secrets of its own. GitHub creates an environment a job names without any protection, so until it has a reviewer the plan job stops at its first step, before anything reads a secret.
-- **`main`** applies after the merge. A run whose commit no longer has main's configuration (this directory, `deployment/root.hcl`, the tool versions in `.mise/` or the workflow, as on main now) skips the apply with a warning: that is a re-run of an older run, or one queued behind a newer commit, and putting its configuration back would undo the newer one (a hostname it attached, say). The newer commit's own run applies. Applies never overlap (concurrency group `tiles-bunny-apply`).
+- **Pull requests and branch dispatches** run the checks (formatting, `tofu validate`, and `tofu test` against a mocked provider) with no credentials. Their plan runs the branch's Terragrunt configuration with the Bunny token, so it runs in the `tiles-bunny-plan` environment, which holds that token (`OP_TF_BUNNY_ENV`) as its own secret: GitHub releases it once one of the environment's required reviewers approves the run, which runs that one commit. Create the environment once in the repository's settings (Environments): required reviewers (the maintainers who review this module, with self-review prevented when more than one can approve), deployment branches and tags left at "No restriction" so that every branch's plan can run, and the secret `OP_TF_BUNNY_ENV`. GitHub creates an environment a job names without any protection, so until it has a reviewer the plan job stops at its first step, before anything reads a secret.
+- **`main`** applies after the merge, in the `tiles-bunny` environment (deployment branches: `main` only), which holds its own copy of `OP_TF_BUNNY_ENV`. A run whose commit no longer has main's configuration (this directory, `deployment/root.hcl`, the tool versions in `.mise/` or the workflow, as on main now) skips the apply with a warning: that is a re-run of an older run, or one queued behind a newer commit, and putting its configuration back would undo the newer one (a hostname it attached, say). The newer commit's own run applies. Applies never overlap (concurrency group `tiles-bunny-apply`).
 
 ## First run: import the existing zones
 
@@ -106,18 +117,19 @@ The provider doesn't mark the script's `deployment_key` sensitive, and anyone wi
 
 Work through it in order; the first item comes before the branch merges.
 
-1. **Create the 1Password items** and check that each resolves (`op read <ref> > /dev/null`) with the service account that reads its vault. Without them the next scheduled Tiles Sync fails at `op run` and pages (geoshenanigans-tiles-sync-failed), the watchdog sends no heartbeat (geoshenanigans-tiles-watchdog-silent), and every `op run --env-file=.env` in deployment (the Tiles Worker workflow's fmt check and plans on every PR, its apply on `main`, Tiles Deploy's activation) fails, as `deployment/.env` names the first two items in both vaults.
+1. **Create the vault, its service account, the environments and the 1Password items** (Who gets the Bunny account key, above), and check that each item resolves (`op read <ref> > /dev/null`) with each service account that reads its vault. Without them the next scheduled Tiles Sync fails at `op run` and pages (geoshenanigans-tiles-sync-failed), the watchdog sends no heartbeat (geoshenanigans-tiles-watchdog-silent), and the Tiles Worker workflow's apply on `main` and Tiles Deploy's prod activation fail, as prod's tiles-worker needs the first two items.
+   - The vault `tf_bunny`, and a 1Password service account that reads `tf_bunny`, `tf_prod` and `tf`, and nothing else is given access to `tf_bunny`.
+   - The environments `tiles-bunny-plan` (required reviewers, The workflow above) and `tiles-bunny` (deployment branches and tags: selected, the branch `main` only), each with the secret `OP_TF_BUNNY_ENV`, that service account's token. No repository secret holds it.
 
    | Vault | Item (field `password`) | Value | Read by |
    | --- | --- | --- | --- |
-   | `tf_prod` | `BUNNY_API_KEY` | the Bunny account API key | this unit (`bunny.env`), the sync's purge, the worker's log reader (`deployment/.env`) |
-   | `tf_prod` | `GLOBALPING_TOKEN` | a Globalping API token | the worker's synthetic probe (`deployment/.env`) |
-   | `tf_dev` | `BUNNY_API_KEY`, `GLOBALPING_TOKEN` | any placeholder | `deployment/.env` in dev runs (dev binds neither) |
+   | `tf_bunny` | `BUNNY_API_KEY` | the Bunny account API key | this unit (`bunny.env`), the sync's purge, the worker's log reader (`deployment/tiles-worker-bunny.env`) |
+   | `tf_bunny` | `GLOBALPING_TOKEN` | a Globalping API token | the worker's synthetic probe (`deployment/tiles-worker-bunny.env`) |
    | `tf_prod` | `BUNNY_STORAGE_PASSWORD` | `immich-tiles`' password (read-write) | Tiles Sync, the watchdog's sample check |
    | `tf_prod` | `BUNNY_STATE_PASSWORD` | `immich-tiles-state`'s password | Tiles Sync, the watchdog |
    | `tf_prod` | `BUNNY_PULL_ZONE_ID` | the `pull_zone_id` output (step 3) | Tiles Sync's purge |
 
-   `BUNNY_PULL_ZONE_ID` is copied by hand rather than read from this unit's state: the sync job writes production and has no access to the OpenTofu state backend. The worker reads it from the state. `O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD` (`tf_prod`) and `tf_state` (`tf`) exist already.
+   `BUNNY_PULL_ZONE_ID` is copied by hand rather than read from this unit's state: the sync job writes production and doesn't run OpenTofu or read its state backend. The worker reads it from the state. `O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD` (`tf_prod`) and `tf_state` (`tf`) exist already.
 2. **Apply this unit**: import the zones (First run, above), plan, apply. That creates the pull zone, its edge rules, the middleware script and the test hostname.
 3. **Copy `pull_zone_id`** into `tf_prod/BUNNY_PULL_ZONE_ID`. The next Tiles Worker apply on `main` starts the log reader.
 4. **Test hostname**: a DNS-only CNAME `tiles-bunny.immich.cloud` → the `cdn_domain` output, then add the name to `tls_hostnames` and apply again (Hostnames and the cutover, above).

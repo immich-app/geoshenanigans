@@ -4,17 +4,23 @@
 
 Needs PyYAML (python3-yaml, on GitHub's Ubuntu runners), bash, git and jq.
 """
+import glob
 import json
 import os
+import re
 import subprocess
 import tempfile
 import unittest
 
 import yaml
 
-WORKFLOWS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".github", "workflows")
+ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+WORKFLOWS = os.path.join(ROOT, ".github", "workflows")
 MAIN = "github.ref == 'refs/heads/main'"
 PROD_TOKEN = "secrets.OP_TF_PROD_ENV"
+# The service account that reads the tf_bunny vault (the Bunny account key, the Globalping token): a secret of the
+# tiles-bunny-plan and tiles-bunny environments only (deployment/modules/bunny/tiles/README.md).
+BUNNY_TOKEN = "secrets.OP_TF_BUNNY_ENV"
 # Every job of these that resolves production 1Password items runs main's code only, dry runs and dispatches
 # included: a branch could otherwise run its own code with the production service account.
 CREDENTIALED_JOBS = {
@@ -99,6 +105,128 @@ class ProductionCredentialsTest(unittest.TestCase):
 
 BUNNY_INFRA = "tiles-bunny-infra.yml"
 PLAN_ENVIRONMENT = "tiles-bunny-plan"
+# Deploys main only (its branch policy), with the Bunny token for main's jobs.
+MAIN_ENVIRONMENT = "tiles-bunny"
+BUNNY_SECRETS = ("BUNNY_API_KEY", "GLOBALPING_TOKEN")
+# An environment expression that names tiles-bunny on one condition and no environment otherwise.
+CONDITIONAL_ENVIRONMENT = re.compile(r"^\$\{\{ (.+) && 'tiles-bunny' \|\| '' \}\}$")
+
+
+def workflows():
+    names = (os.path.basename(path) for path in glob.glob(os.path.join(WORKFLOWS, "*.yml")))
+    return {name: load(name) for name in names}
+
+
+def env_files_named(job):
+    """The files a job's `op run --env-file=...` resolves, as repository paths (an env file's name is unique)."""
+    names = set()
+    for item in job.get("steps", []):
+        for match in re.finditer(r"--env-file=\"?([^\"\s)]+)\"?", item.get("run", "")):
+            names.add(os.path.basename(match.group(1)))
+    paths = {}
+    for name in names:
+        found = [path for path in glob.glob(os.path.join(ROOT, "deployment", "**", name), recursive=True)
+                 if os.path.isfile(path)]
+        assert len(found) == 1, (name, found)
+        paths[name] = found[0]
+    return paths
+
+
+def read(path):
+    with open(path) as f:
+        return f.read()
+
+
+def names_bunny_secrets(text):
+    return "tf_bunny" in text or any(secret in text for secret in BUNNY_SECRETS)
+
+
+class BunnyKeyTest(unittest.TestCase):
+    """The Bunny account key and the Globalping token: only jobs that pass an environment holding the token that reads
+    them (reviewers, or main only) get either; pull requests' plans get stand-ins."""
+
+    def test_the_env_file_every_plan_resolves_names_neither(self):
+        self.assertFalse(names_bunny_secrets(read(os.path.join(ROOT, "deployment", ".env"))))
+        worker = read(os.path.join(ROOT, "deployment", "tiles-worker-bunny.env"))
+        for secret in BUNNY_SECRETS:
+            self.assertIn(f"op://tf_bunny/{secret}/password", worker)
+
+    def test_the_bunny_secrets_live_in_tf_bunny_only(self):
+        files = [os.path.join(WORKFLOWS, name) for name in workflows()]
+        files += glob.glob(os.path.join(ROOT, "deployment", "**", "*.env"), recursive=True)
+        files.append(os.path.join(ROOT, "deployment", ".env"))
+        for path in files:
+            for ref in re.findall(r"op://([^/\s'\"]+)/([^/\s'\"]+)", read(path)):
+                if ref[1] in BUNNY_SECRETS:
+                    with self.subTest(path=path, ref=ref):
+                        self.assertEqual(ref[0], "tf_bunny")
+
+    def test_only_jobs_in_a_bunny_environment_reach_the_bunny_secrets(self):
+        reaching = set()
+        for name, workflow in workflows().items():
+            self.assertNotIn("tf_bunny", yaml.safe_dump(workflow.get("env", {})), name)
+            self.assertNotIn(BUNNY_TOKEN, yaml.safe_dump(workflow.get("env", {})), name)
+            for job_name, job in workflow["jobs"].items():
+                text = yaml.safe_dump(job)
+                files = env_files_named(job)
+                bunny_files = sorted(file for file, path in files.items() if names_bunny_secrets(read(path)))
+                if not (BUNNY_TOKEN in text or "tf_bunny" in text or bunny_files):
+                    continue
+                reaching.add((name, job_name))
+                with self.subTest(workflow=name, job=job_name):
+                    environment = job.get("environment")
+                    self.assertIn(BUNNY_TOKEN, text)
+                    if environment == PLAN_ENVIRONMENT:
+                        self.assertEqual((name, job_name), (BUNNY_INFRA, "plan"))
+                        continue
+                    if environment == MAIN_ENVIRONMENT:
+                        self.assertTrue(requires_main(job.get("if")), job.get("if"))
+                        continue
+                    # Only on the condition that names the environment: its token, and the env file and items it reads.
+                    match = CONDITIONAL_ENVIRONMENT.match(str(environment))
+                    self.assertIsNotNone(match, environment)
+                    conditions = re.findall(r"\$\{\{ (.+?) && " + re.escape(BUNNY_TOKEN), text)
+                    self.assertEqual(conditions, [match.group(1)] * text.count(BUNNY_TOKEN))
+        self.assertEqual(reaching, {
+            (BUNNY_INFRA, "plan"),
+            (BUNNY_INFRA, "apply"),
+            ("tiles-worker.yml", "deploy-terragrunt"),
+            ("tiles-deploy.yml", "activate"),
+            ("tiles-sync.yml", "sync"),
+        })
+
+    def test_the_main_jobs_resolve_the_bunny_secrets_only_in_prod(self):
+        worker = load("tiles-worker.yml")["jobs"]["deploy-terragrunt"]
+        self.assertEqual(worker["env"]["ENVIRONMENT"], "${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}")
+        self.assertEqual(worker["environment"], "${{ github.ref == 'refs/heads/main' && 'tiles-bunny' || '' }}")
+        activate = load("tiles-deploy.yml")["jobs"]["activate"]
+        self.assertEqual(activate["environment"], "${{ inputs.environment == 'prod' && 'tiles-bunny' || '' }}")
+        for job, name in ((worker, "Deploy All"), (activate, "Apply tiles worker")):
+            with self.subTest(step=name):
+                script = step(job, name)["run"]
+                self.assertIn('if [ "$ENVIRONMENT" = prod ]; then', script)
+                self.assertIn("tiles-worker-bunny.env", script.split('if [ "$ENVIRONMENT" = prod ]; then')[1])
+        sync = load("tiles-sync.yml")["jobs"]["sync"]
+        self.assertEqual(sync["environment"], "${{ !inputs.dry_run && 'tiles-bunny' || '' }}")
+        self.assertEqual(step(sync, "Sync")["env"]["BUNNY_API_KEY"],
+                         "${{ !inputs.dry_run && 'op://tf_bunny/BUNNY_API_KEY/password' || '' }}")
+
+    def test_pull_request_plans_get_stand_ins(self):
+        workflow = load("tiles-worker.yml")
+        self.assertIn("pull_request", workflow[True])
+        plan = workflow["jobs"]["plan-terragrunt"]
+        self.assertNotIn("environment", plan)
+        self.assertEqual(set(env_files_named(plan)), {".env"})
+        env = step(plan, "Plan All")["env"]
+        for secret in BUNNY_SECRETS:
+            self.assertEqual(env[f"TF_VAR_{secret.lower()}"], "plan-stand-in")
+
+    def test_the_check_accepts_only_what_it_should(self):
+        self.assertIsNotNone(CONDITIONAL_ENVIRONMENT.match("${{ inputs.x == 'prod' && 'tiles-bunny' || '' }}"))
+        self.assertIsNone(CONDITIONAL_ENVIRONMENT.match("${{ inputs.x && 'tiles-bunny-plan' || '' }}"))
+        self.assertIsNone(CONDITIONAL_ENVIRONMENT.match("${{ inputs.x && 'tiles-bunny' || 'other' }}"))
+        self.assertTrue(names_bunny_secrets('export TF_VAR_bunny_api_key="op://tf_prod/BUNNY_API_KEY/password"'))
+        self.assertFalse(names_bunny_secrets('export TF_VAR_env=$ENVIRONMENT'))
 
 
 def install(bin_dir, tools):
@@ -135,10 +263,16 @@ class BunnyInfraCredentialsTest(unittest.TestCase):
         self.jobs = self.workflow["jobs"]
 
     def test_only_the_plan_and_main_apply_read_production_credentials(self):
-        credentialed = {job for job, body in self.jobs.items() if PROD_TOKEN in yaml.safe_dump(body)}
+        credentialed = {job for job, body in self.jobs.items() if BUNNY_TOKEN in yaml.safe_dump(body)}
         self.assertEqual(credentialed, {"plan", "apply"})
         self.assertNotIn("secrets.OP_", yaml.safe_dump(self.jobs["check"]))
         self.assertTrue(requires_main(self.jobs["apply"]["if"]))
+        # Each reads its token inside its environment, which holds it: none comes from a repository secret, so a branch
+        # whose workflow drops the environment gets nothing.
+        self.assertEqual(self.jobs["plan"]["environment"], PLAN_ENVIRONMENT)
+        self.assertEqual(self.jobs["apply"]["environment"], MAIN_ENVIRONMENT)
+        self.assertNotIn(PROD_TOKEN, yaml.safe_dump(self.workflow))
+        self.assertNotIn("secrets.", yaml.safe_dump(self.workflow.get("env", {})))
         # pull_request runs a fork's code without the repository's secrets; pull_request_target would give them.
         self.assertEqual(set(self.workflow[True]), {"workflow_dispatch", "pull_request", "push"})
 

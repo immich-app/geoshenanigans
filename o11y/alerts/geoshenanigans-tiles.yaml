@@ -1641,7 +1641,8 @@ spec:
           was skipped: the worker has no BUNNY_PUBLIC_URL or GLOBALPING_TOKEN binding. Set bunny_public_url in
           deployment/modules/cloudflare/tiles-worker/tiles.prod.tfvars.json to the hostname that serves the zone
           (the test hostname before the DNS cutover, https://tiles.immich.cloud after; the same as tiles-sync.yml's
-          BUNNY_PUBLIC_URL) and check GLOBALPING_TOKEN in tf_prod, then run the Tiles Worker workflow on main.
+          BUNNY_PUBLIC_URL) and check GLOBALPING_TOKEN in the tf_bunny vault, then run the Tiles Worker workflow
+          on main.
           Probe runs that report nothing at all are geoshenanigans-tiles-bunny-probe-silent's.
       execErrState: Error
       noDataState: OK

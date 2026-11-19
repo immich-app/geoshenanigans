@@ -100,6 +100,15 @@ resource "cloudflare_workers_script" "tiles" {
 
   compatibility_date  = "2024-07-29"
   compatibility_flags = ["nodejs_compat"]
+
+  lifecycle {
+    # Prod gets these from deployment/tiles-worker-bunny.env, which .env no longer names: a prod run that resolved .env
+    # alone would otherwise turn the log reader and the probe off.
+    precondition {
+      condition     = var.env != "prod" || nonsensitive(var.bunny_api_key != "" && var.globalping_token != "")
+      error_message = "Prod needs bunny_api_key and globalping_token: resolve deployment/tiles-worker-bunny.env too (op run --env-file=.env --env-file=tiles-worker-bunny.env)."
+    }
+  }
 }
 
 # Every minute the worker's scheduled handler sends o11y its heartbeat, which the bundle's

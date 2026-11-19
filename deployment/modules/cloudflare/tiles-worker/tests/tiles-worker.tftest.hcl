@@ -86,3 +86,55 @@ run "probe_interval_fraction" {
 
   expect_failures = [var.bunny_probe_interval_minutes]
 }
+
+# Prod's secrets are in tiles-worker-bunny.env, not .env: an apply that resolved .env alone stops instead of unbinding
+# the log reader and the probe. Dev binds neither and needs neither.
+run "prod_without_the_bunny_secrets" {
+  command = plan
+
+  variables {
+    bunny_api_key    = ""
+    globalping_token = ""
+  }
+
+  expect_failures = [cloudflare_workers_script.tiles]
+}
+
+run "prod_without_the_globalping_token" {
+  command = plan
+
+  variables {
+    globalping_token = ""
+  }
+
+  expect_failures = [cloudflare_workers_script.tiles]
+}
+
+run "dev_without_the_bunny_secrets" {
+  command = plan
+
+  variables {
+    env              = "dev"
+    bunny_api_key    = ""
+    globalping_token = ""
+  }
+
+  assert {
+    condition     = length([for binding in cloudflare_workers_script.tiles.secret_text_binding : binding if binding.name == "BUNNY_API_KEY" || binding.name == "GLOBALPING_TOKEN"]) == 0
+    error_message = "Dev binds no Bunny secret."
+  }
+}
+
+run "prod_with_plan_stand_ins" {
+  command = plan
+
+  variables {
+    bunny_api_key    = "plan-stand-in"
+    globalping_token = "plan-stand-in"
+  }
+
+  assert {
+    condition     = length([for binding in cloudflare_workers_script.tiles.secret_text_binding : binding if binding.name == "BUNNY_API_KEY" || binding.name == "GLOBALPING_TOKEN"]) == 2
+    error_message = "A pull request's prod plan keeps both Bunny bindings, with stand-ins for their values."
+  }
+}

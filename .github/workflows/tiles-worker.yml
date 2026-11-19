@@ -165,12 +165,18 @@ jobs:
           name: tiles-build-output
           path: "${{ github.workspace }}/dist"
 
+      # Every pull request runs this with the branch's Terragrunt code, unapproved: it never gets the Bunny account key
+      # or the Globalping token. Those live in the tf_bunny vault, which only the tiles-bunny environments' service
+      # account reads (deployment/modules/bunny/tiles/README.md), and .env doesn't name them: prod plans stand-ins, so
+      # the worker's bindings plan as they are, with a value the plan hides.
       - name: Plan All
         working-directory: ${{ github.workspace }}/deployment
         env:
           ENVIRONMENT: ${{ matrix.environment }}
           OP_SERVICE_ACCOUNT_TOKEN: ${{ matrix.environment == 'prod' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
           TF_VAR_tiles_build_dir: "${{ github.workspace }}/dist"
+          TF_VAR_bunny_api_key: plan-stand-in
+          TF_VAR_globalping_token: plan-stand-in
         run: op run --env-file=".env" -- terragrunt run --all plan
 
   deploy-terragrunt:
@@ -178,6 +184,9 @@ jobs:
     name: Deploy Terragrunt
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    # Prod's apply binds the Bunny account key and the Globalping token (tiles-worker-bunny.env), which only the
+    # tiles-bunny environment's service account reads: that environment deploys main only. Dev needs neither.
+    environment: ${{ github.ref == 'refs/heads/main' && 'tiles-bunny' || '' }}
     # Shared with the activate job in tiles-deploy.yml so the two never apply the same state at once.
     concurrency:
       group: tiles-apply-${{ github.ref == 'refs/heads/main' && 'prod' || 'dev' }}
@@ -224,13 +233,20 @@ jobs:
           name: tiles-build-output
           path: "${{ github.workspace }}/dist"
 
+      # The tiles-bunny service account reads tf and tf_prod too, so it resolves both files in prod.
       - name: Deploy All
         if: steps.key.outputs.current == 'true'
         working-directory: ${{ github.workspace }}/deployment
         env:
-          OP_SERVICE_ACCOUNT_TOKEN: ${{ github.ref == 'refs/heads/main' && secrets.OP_TF_PROD_ENV || secrets.OP_TF_DEV_ENV }}
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ github.ref == 'refs/heads/main' && secrets.OP_TF_BUNNY_ENV || secrets.OP_TF_DEV_ENV }}
           TF_VAR_tiles_build_dir: "${{ github.workspace }}/dist"
-        run: op run --env-file=".env" -- terragrunt run --all apply --non-interactive
+        run: |
+          set -euo pipefail
+          env_files=(--env-file=.env)
+          if [ "$ENVIRONMENT" = prod ]; then
+            env_files+=(--env-file=tiles-worker-bunny.env)
+          fi
+          op run "${env_files[@]}" -- terragrunt run --all apply --non-interactive
 
   # Dev runs the same worker as prod with its own deployment key, so main rolls it out too. The job above has
   # already applied the module both environments share, so this one applies only dev's worker.

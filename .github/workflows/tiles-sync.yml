@@ -206,6 +206,9 @@ jobs:
     needs: resolve
     if: github.ref == 'refs/heads/main' && needs.resolve.outputs.action == 'sync'
     runs-on: ${{ inputs.runner || 'pokedex-huge' }}
+    # The purge needs the Bunny account key, in the tf_bunny vault, which only the tiles-bunny environment's service
+    # account reads (deployment/modules/bunny/tiles/README.md). A dry run purges nothing and needs neither.
+    environment: ${{ !inputs.dry_run && 'tiles-bunny' || '' }}
     # The budget Decide picked: long enough for the largest diff its guard rail lets through (tiles_sync_report.py).
     timeout-minutes: ${{ fromJSON(needs.resolve.outputs.job_timeout_min) }}
     permissions:
@@ -327,12 +330,13 @@ jobs:
           DRY_RUN: ${{ inputs.dry_run }}
           # The gate's file list lives outside the JS heap; this is headroom for the rest of a forced run.
           NODE_OPTIONS: --max-old-space-size=8192
-          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          # The tiles-bunny service account reads tf_prod too.
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ !inputs.dry_run && secrets.OP_TF_BUNNY_ENV || secrets.OP_TF_PROD_ENV }}
           BUNNY_STATE_PASSWORD: op://tf_prod/BUNNY_STATE_PASSWORD/password
           # A dry run reads the state zone only: no tiles zone password, purge key or pull zone, so a dry run that
           # isn't one cannot write or purge production.
           BUNNY_STORAGE_PASSWORD: ${{ !inputs.dry_run && 'op://tf_prod/BUNNY_STORAGE_PASSWORD/password' || '' }}
-          BUNNY_API_KEY: ${{ !inputs.dry_run && 'op://tf_prod/BUNNY_API_KEY/password' || '' }}
+          BUNNY_API_KEY: ${{ !inputs.dry_run && 'op://tf_bunny/BUNNY_API_KEY/password' || '' }}
           BUNNY_PULL_ZONE_ID: ${{ !inputs.dry_run && 'op://tf_prod/BUNNY_PULL_ZONE_ID/password' || '' }}
         run: |
           set -euo pipefail

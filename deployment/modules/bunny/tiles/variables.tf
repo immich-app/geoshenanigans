@@ -1,4 +1,4 @@
-# The Bunny account API key (1Password tf_prod/BUNNY_API_KEY, see bunny.env). Only OpenTofu, the daily purge and the log
+# The Bunny account API key (1Password tf_bunny/BUNNY_API_KEY, see bunny.env). Only OpenTofu, the daily purge and the log
 # reader use it; uploads use the storage zone's own password.
 variable "bunny_api_key" {
   type      = string

@@ -1,7 +1,9 @@
 name: Tiles Bunny Infra
 # OpenTofu for the Bunny tiles zone (deployment/modules/bunny/tiles/README.md). The Bunny account is production only, so
 # pull requests plan prod, once a reviewer approves the run, and main applies it. The unit is left out of
-# tiles-worker.yml's `terragrunt run --all`.
+# tiles-worker.yml's `terragrunt run --all`. Its token (OP_TF_BUNNY_ENV, the service account that reads the tf_bunny
+# vault with the Bunny account key) is a secret of the tiles-bunny-plan and tiles-bunny environments only, never of the
+# repository: a run whose workflow drops the environment gets no token at all.
 on:
   workflow_dispatch:
   pull_request:
@@ -66,9 +68,9 @@ jobs:
           tofu validate
           tofu test
 
-  # The plan runs the branch's Terragrunt configuration with the production token, so no branch run gets it by itself:
-  # the job waits in the tiles-bunny-plan environment until one of its required reviewers approves the run, and with
-  # it the run's commit. The check job above needs no credentials.
+  # The plan runs the branch's Terragrunt configuration with the Bunny token, so no branch run gets it by itself: the
+  # token is the tiles-bunny-plan environment's own secret, which GitHub releases once one of the environment's required
+  # reviewers approves the run, and with it the run's commit. The check job above needs no credentials.
   plan:
     name: Plan
     needs: check
@@ -94,7 +96,7 @@ jobs:
           environment=$(gh api "repos/$GITHUB_REPOSITORY/environments/$PLAN_ENVIRONMENT")
           reviewers=$(jq '[.protection_rules[]? | select(.type == "required_reviewers") | (.reviewers // []) | length] | add // 0' <<<"$environment")
           if [ "$reviewers" -lt 1 ]; then
-            echo "::error::The $PLAN_ENVIRONMENT environment has no required reviewers, so this plan would run with the production token unapproved: add them (deployment/modules/bunny/tiles/README.md)"
+            echo "::error::The $PLAN_ENVIRONMENT environment has no required reviewers, so this plan would run with the Bunny token unapproved: add them (deployment/modules/bunny/tiles/README.md)"
             exit 1
           fi
 
@@ -119,7 +121,7 @@ jobs:
       # the script prints it (as does any later error showing it): masked for the rest of the job.
       - name: Mask the middleware script's deployment key
         env:
-          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_BUNNY_ENV }}
         run: |
           set -euo pipefail
           state=$(op run --env-file=bunny.env -- terragrunt run --non-interactive --tf-forward-stdout -- state pull)
@@ -130,14 +132,17 @@ jobs:
 
       - name: Plan
         env:
-          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_BUNNY_ENV }}
         run: op run --env-file=bunny.env -- terragrunt run --non-interactive -- plan
 
+  # The tiles-bunny environment holds the token for main's applies (and the other jobs that read the Bunny account
+  # key): it deploys main only, so no branch's job can name it to get the token.
   apply:
     name: Apply
     needs: check
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    environment: tiles-bunny
     permissions:
       contents: read
     # Applies of this state never overlap, whatever ran them.
@@ -169,7 +174,7 @@ jobs:
       # whose names are taken. They are imported by hand once (README.md).
       - name: Check the storage zones are imported
         env:
-          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_BUNNY_ENV }}
         run: |
           set -euo pipefail
           state=$(op run --env-file=bunny.env -- terragrunt run --non-interactive --tf-forward-stdout -- state list)
@@ -184,7 +189,7 @@ jobs:
       # the script prints it (as does any later error showing it): masked for the rest of the job.
       - name: Mask the middleware script's deployment key
         env:
-          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_BUNNY_ENV }}
         run: |
           set -euo pipefail
           state=$(op run --env-file=bunny.env -- terragrunt run --non-interactive --tf-forward-stdout -- state pull)
@@ -214,5 +219,5 @@ jobs:
       - name: Apply
         if: steps.current.outputs.current == 'true'
         env:
-          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_BUNNY_ENV }}
         run: op run --env-file=bunny.env -- terragrunt run --non-interactive -- apply -auto-approve
