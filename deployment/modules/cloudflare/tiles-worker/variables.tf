@@ -47,9 +47,15 @@ variable "bunny_public_url" {
   default = ""
 }
 
-# Each probe run is 12 Globalping tests; every 10 minutes is 72 of the 500 free an hour. The worker never probes more
-# often than every 5.
+# Each probe run is 12 Globalping tests; every 10 minutes is 72 of the 500 free an hour. From 5 (144 an hour) to 14: the
+# probe alerts' 30-minute windows need two runs at all times (o11y/alerts/geoshenanigans-tiles.yaml), and the worker
+# brings any other value into the same range (tiles/src/bunny-logs/config.ts).
 variable "bunny_probe_interval_minutes" {
   type    = number
   default = 10
+
+  validation {
+    condition     = floor(var.bunny_probe_interval_minutes) == var.bunny_probe_interval_minutes && var.bunny_probe_interval_minutes >= 5 && var.bunny_probe_interval_minutes <= 14
+    error_message = "bunny_probe_interval_minutes must be a whole number of minutes from 5 to 14."
+  }
 }

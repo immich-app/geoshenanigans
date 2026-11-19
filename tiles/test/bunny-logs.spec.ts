@@ -165,6 +165,20 @@ describe('classifyPath', () => {
     expect(classifyPath('/v1/1/1/1.png')).toEqual({ kind: 'other' });
     expect(classifyPath(undefined)).toEqual({ kind: 'other' });
   });
+
+  it("follows the tiles to a full rewrite's nested prefix, keeping the TileJSON and styles apart", () => {
+    // bunny:sync --adopt --replace --prefix v1/e2: the tiles move, the TileJSON and styles stay at v1.
+    expect(classifyPath('/v1/e2/15/17000/11000.mvt')).toEqual({ kind: 'tile', zoom: '15' });
+    expect(classifyPath('/v1/e2/0/0/0.mvt?v=20261118')).toEqual({ kind: 'tile', zoom: '0' });
+    expect(classifyPath('/v1/e2/16/1/1.mvt')).toEqual({ kind: 'tile', zoom: 'other' });
+    expect(classifyPath('/v1/e3/x/7/80/50.mvt')).toEqual({ kind: 'tile', zoom: '7' });
+    expect(classifyPath('/v1/e2/1/1/1.png')).toEqual({ kind: 'other' });
+    expect(classifyPath('/v1/e2/1/1.mvt')).toEqual({ kind: 'other' });
+    expect(classifyPath('/1/1/1.mvt')).toEqual({ kind: 'other' });
+    expect(classifyPath('/v1.json')).toEqual({ kind: 'tilejson' });
+    expect(classifyPath('/v1/style/dark.json')).toEqual({ kind: 'style' });
+    expect(classifyPath('/v1/style/dark')).toEqual({ kind: 'style' });
+  });
 });
 
 describe('logReaderConfig', () => {
@@ -283,6 +297,82 @@ describe('runLogReader', () => {
     const lagSeconds = sampleValue(samples, 'tiles_bunny_log_lag_seconds');
     expect(lagSeconds).toBeGreaterThanOrEqual(2.5);
     expect(lagSeconds).toBeLessThanOrEqual(2.5 + (2 * REQUEST_SPACING_MS) / 1000);
+  });
+
+  it("counts the tiles under a full rewrite's nested prefix by zoom", async () => {
+    const { result, calls } = await run([
+      () =>
+        page([
+          row({ requestId: 'a', path: '/v1/e2/15/17000/11000.mvt', cacheStatus: 'MISS' }),
+          row({ requestId: 'b', path: '/v1/e2/2/2/1.mvt' }),
+          row({ requestId: 'c', path: '/v1.json' }),
+        ]),
+    ]);
+    expect(result).toBe('ok');
+    const samples = pushedSamples(calls);
+    expect(sampleValue(samples, 'tiles_bunny_tile_requests', { zoom: '15', cache: 'MISS' })).toBe(1);
+    expect(sampleValue(samples, 'tiles_bunny_tile_requests', { zoom: '2', cache: 'HIT' })).toBe(1);
+    expect(sampleValue(samples, 'tiles_bunny_bytes', { kind: 'tile', edge_location: 'UK' })).toBe(2000);
+    expect(sampleValue(samples, 'tiles_bunny_bytes', { kind: 'tilejson', edge_location: 'UK' })).toBe(1000);
+    expect(samples.filter(({ labels }) => labels.kind === 'other')).toEqual([]);
+  });
+
+  it("takes the API's null data on a last page as no rows, but not on a page that claims more", async () => {
+    // A quiet minute: the API answers data null, for both minutes and the lag query.
+    const quiet = () => json({ data: null, pagination: { hasMore: false } });
+    const fetchMock = mockFetch((call) => (isLogQuery(call) ? quiet() : undefined));
+    const logger = new O11yLogger(o11y);
+    expect(await runLogReader(config, o11y, logger, scheduled, '0', testDeps(runAt))).toBe('ok');
+    await logger.flush();
+    expect(pushedSamples(fetchMock.calls)).toEqual([
+      { name: 'tiles_bunny_log_rows', labels: {}, value: 0, timestamp: windowStart },
+      { name: 'tiles_bunny_log_rows', labels: {}, value: 0, timestamp: windowEnd },
+      { name: 'tiles_bunny_log_reader_runs', labels: { result: 'ok' }, value: 1, timestamp: windowEnd },
+    ]);
+    // No warning: a quiet zone has no lag to report.
+    expect(pushedLogs(fetchMock.calls)).toEqual([]);
+
+    // null data with more to come, or no data at all, is a body that can't be read: retried, then the read fails.
+    const more = await run([() => json({ data: null, pagination: { hasMore: true } })]);
+    expect(more.result).toBe('error');
+    expect(more.calls.filter((call) => isWindowQuery(call))).toHaveLength(3);
+    expect(sampleValue(pushedSamples(more.calls), 'tiles_bunny_log_rows')).toBeUndefined();
+    const missing = await run([() => json({ pagination: { hasMore: false } })]);
+    expect(missing.result).toBe('error');
+    expect(pushedLogs(missing.calls)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          read: 'first',
+          error: expect.stringContaining('without data and pagination.hasMore'),
+        }),
+      ]),
+    );
+  });
+
+  it("doesn't follow a redirect, which would carry the account key along", async () => {
+    const elsewhere = 'https://logs.elsewhere.example/v2/pullzones/12345/logs';
+    const redirect = () => new Response(null, { status: 302, headers: { Location: elsewhere } });
+    const { result, calls, deps } = await run([redirect], { reread: [redirect] });
+    expect(result).toBe('error');
+    const apiCalls = calls.filter((call) => call.url.startsWith(LOGGING_API));
+    expect(apiCalls.length).toBeGreaterThan(0);
+    for (const call of apiCalls) {
+      expect(call.redirect).toBe('manual');
+    }
+    // Not retried, and nothing asked of the redirect's target.
+    expect(calls.filter((call) => isWindowQuery(call))).toHaveLength(1);
+    expect(calls.filter(isRereadQuery)).toHaveLength(1);
+    expect(retryWaits(deps.sleeps)).toEqual([]);
+    expect(calls.filter(({ url }) => url.startsWith('https://logs.elsewhere.example/'))).toEqual([]);
+    expect(pushedLogs(calls)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          _msg: 'Bunny log reader failed',
+          read: 'first',
+          error: expect.stringContaining('302'),
+        }),
+      ]),
+    );
   });
 
   it('pushes a zero row count for an empty minute, and no lag without a recent row', async () => {

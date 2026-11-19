@@ -1,9 +1,17 @@
 import { createExecutionContext, createScheduledController, env, waitOnExecutionContext } from 'cloudflare:test';
 import worker from '../src';
 import { runBunnyCron } from '../src/bunny-logs';
-import { probeConfig, probeIntervalMinutes } from '../src/bunny-logs/config';
+import { MAX_PROBE_INTERVAL_MINUTES, probeConfig, probeIntervalMinutes } from '../src/bunny-logs/config';
 import { LOGGING_API } from '../src/bunny-logs/log-reader';
-import { GLOBALPING_API, HIT_TILE, missTile, PROBE_CONTINENTS, probeDue, runProbe } from '../src/bunny-logs/probe';
+import {
+  GLOBALPING_API,
+  HIT_TILE,
+  missTile,
+  PROBE_CONTINENTS,
+  probeDue,
+  runProbe,
+  tileUrl,
+} from '../src/bunny-logs/probe';
 import { O11yLogger } from '../src/o11y';
 import { Call, json, mockFetch, o11y, pushedLogs, pushedSamples, testDeps } from './bunny-helpers';
 
@@ -30,18 +38,35 @@ const finished = (continent: string, firstByte: number, fields: object = {}) => 
   },
 });
 
+/** The tests given, plus a finished one from each continent they lack: every continent has a verdict. */
+const everywhere = (results: { probe: { continent: string } }[], fields: object = {}) => [
+  ...results,
+  ...PROBE_CONTINENTS.filter((continent) => !results.some(({ probe }) => probe.continent === continent)).map(
+    (continent) => finished(continent, 50, fields),
+  ),
+];
+
 const measurement = (id: string, status: string, results: unknown[]) =>
   json({ id, type: 'http', status, target: 'tiles.example.com', probesCount: results.length, results });
+
+const TILEJSON_URL = 'https://tiles.example.com/v1.json';
+const tileJsonOf = (template: string) =>
+  json({ tilejson: '3.0.0', name: 'OpenMapTiles', tiles: [template], minzoom: 0, maxzoom: 15 });
 
 type Routes = {
   create?: (call: Call, index: number) => Response;
   get?: (id: string, poll: number) => Response;
+  // The public origin's TileJSON: the tiles at v1 unless told otherwise.
+  tileJson?: () => Response;
 };
 
-function globalping({ create, get }: Routes) {
+function globalping({ create, get, tileJson }: Routes) {
   let creates = 0;
   const polls = new Map<string, number>();
   return (call: Call) => {
+    if (call.url === TILEJSON_URL && call.method === 'GET') {
+      return tileJson?.() ?? tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt');
+    }
     if (call.url === GLOBALPING_API && call.method === 'POST') {
       return create?.(call, creates++) ?? json({ id: `m${creates}`, probesCount: 6 }, 202);
     }
@@ -65,12 +90,14 @@ async function probe(routes: Routes, probeSettings: typeof config | null = confi
   return { result, deps, ...fetchMock };
 }
 
-// Measurement ids hit-1 and miss-1, and the miss measurement's answer: one miss in EU.
+// Measurement ids hit-1 and miss-1, and the miss measurement's answer: a miss from every continent.
 const hitAndMiss = (hitResults: unknown[]): Routes => ({
   create: (_call, index) => json({ id: index === 0 ? 'hit-1' : 'miss-1', probesCount: hitResults.length }, 202),
   get: (id) =>
-    measurement(id, 'finished', id === 'hit-1' ? hitResults : [finished('EU', 50, { headers: tileHeaders('MISS') })]),
+    measurement(id, 'finished', id === 'hit-1' ? hitResults : everywhere([], { headers: tileHeaders('MISS') })),
 });
+
+const NO_VERDICT_FROM = 'Globalping measurement has no verdict from some continents';
 
 const creates = (calls: Call[]) => calls.filter(({ url, method }) => url === GLOBALPING_API && method === 'POST');
 const metrics = (calls: Call[]) => pushedSamples(calls).map(({ name, labels, value }) => ({ name, labels, value }));
@@ -96,14 +123,18 @@ describe('probe settings', () => {
     );
   });
 
-  it('runs every 10 minutes unless told otherwise, and never more often than every 5', () => {
+  it('runs every 10 minutes unless told otherwise, never more often than every 5 nor less than every 14', () => {
     expect(probeIntervalMinutes(undefined)).toBe(10);
     expect(probeIntervalMinutes('')).toBe(10);
     expect(probeIntervalMinutes('often')).toBe(10);
     expect(probeIntervalMinutes('0')).toBe(10);
     expect(probeIntervalMinutes('2.5')).toBe(10);
     expect(probeIntervalMinutes('1')).toBe(5);
-    expect(probeIntervalMinutes('15')).toBe(15);
+    expect(probeIntervalMinutes('14')).toBe(14);
+    // The probe alerts' 30-minute windows need two runs: 15 or 30 minutes apart they would hold one at times.
+    expect(MAX_PROBE_INTERVAL_MINUTES).toBe(14);
+    expect(probeIntervalMinutes('15')).toBe(14);
+    expect(probeIntervalMinutes('30')).toBe(14);
     expect(probeDue(scheduled, 10)).toBe(true);
     expect(probeDue(scheduled + 59_000, 10)).toBe(true);
     expect(probeDue(scheduled + 60_000, 10)).toBe(false);
@@ -114,6 +145,42 @@ describe('probe settings', () => {
     expect(missTile(() => 0)).toBe('15/0/0');
     expect(missTile(() => 0.9999999999)).toBe('15/32767/32767');
     expect(missTile(() => 0.5)).toBe('15/16384/16384');
+  });
+});
+
+describe('tileUrl', () => {
+  const origin = new URL('https://tiles.example.com');
+  const path = (template: string, tile = HIT_TILE, publicUrl = origin) => tileUrl(publicUrl, template, tile).pathname;
+
+  it("puts the tile in the TileJSON's template, under whatever prefix that names", () => {
+    expect(path('https://tiles.example.com/v1/{z}/{x}/{y}.mvt')).toBe('/v1/2/2/1.mvt');
+    expect(path('https://tiles.example.com/v1/e2/{z}/{x}/{y}.mvt', '15/1/2')).toBe('/v1/e2/15/1/2.mvt');
+    const underPath = new URL('https://cdn.example.com/tiles/');
+    expect(path('https://cdn.example.com/tiles/v1/{z}/{x}/{y}.mvt', '0/0/0', underPath)).toBe('/tiles/v1/0/0/0.mvt');
+  });
+
+  it("keeps another of the zone's hostnames, as the TileJSON names the test one after a DNS cutover", () => {
+    const url = tileUrl(origin, 'https://tiles-test.example.com/v1/e2/{z}/{x}/{y}.mvt', HIT_TILE);
+    expect(url.origin).toBe('https://tiles-test.example.com');
+    expect(url.pathname).toBe('/v1/e2/2/2/1.mvt');
+  });
+
+  it.each([
+    'https://tiles.example.com/v1/{z}/{x}/{y}.mvt?v=20261118',
+    'https://tiles.example.com/v1/{z}/{x}/{y}.mvt#tile',
+    'https://tiles.example.com/v1/{z}/{x}.mvt',
+    'https://tiles.example.com/v1/{z}/{z}/{x}/{y}.mvt',
+    'ftp://tiles.example.com/v1/{z}/{x}/{y}.mvt',
+    '/v1/{z}/{x}/{y}.mvt',
+  ])('refuses %s, which is no tile URL to probe', (template) => {
+    expect(() => tileUrl(origin, template, HIT_TILE)).toThrow(/Tile template/);
+  });
+
+  it("refuses a template outside the public URL's path", () => {
+    const underPath = new URL('https://cdn.example.com/tiles');
+    expect(() => tileUrl(underPath, 'https://cdn.example.com/other/v1/{z}/{x}/{y}.mvt', HIT_TILE)).toThrow(
+      /isn't an http\(s\) tile URL under \/tiles/,
+    );
   });
 });
 
@@ -203,14 +270,44 @@ describe('runProbe', () => {
   it("doesn't count a probe that went offline, and takes any status but in-progress as final", async () => {
     const { result, calls } = await probe({
       get: (id) =>
-        measurement(id, 'done-somehow', [
-          finished('EU', 30),
-          { probe: { continent: 'NA' }, result: { status: 'offline', rawOutput: '' } },
-        ]),
+        measurement(
+          id,
+          'done-somehow',
+          everywhere([{ probe: { continent: 'NA' }, result: { status: 'offline', rawOutput: '' } }]),
+        ),
     });
-    expect(result).toBe('ok');
-    expect(calls.filter(({ method }) => method === 'GET')).toHaveLength(2);
+    expect(calls.filter(({ url, method }) => url.startsWith(`${GLOBALPING_API}/`) && method === 'GET')).toHaveLength(2);
     expect(metrics(calls).filter(({ labels }) => labels.continent === 'NA')).toEqual([]);
+    // Its continent went unmeasured, which the run reports.
+    expect(result).toBe('error');
+    expect(pushedLogs(calls).filter(({ _msg }) => _msg === NO_VERDICT_FROM)).toEqual([
+      expect.objectContaining({ target: 'hit', missing: 'NA' }),
+      expect.objectContaining({ target: 'miss', missing: 'NA' }),
+    ]);
+  });
+
+  it('reports a continent without a verdict, keeping the samples of the others', async () => {
+    // Globalping had no probe in AF (its router leaves the location out), and NA's failed at its DNS resolver.
+    const results = [
+      finished('EU', 20),
+      { probe: { continent: 'NA' }, result: { status: 'failed', failureSource: 'resolver', rawOutput: '' } },
+      finished('SA', 30),
+      finished('AS', 40),
+      finished('OC', 50),
+    ];
+    const { result, calls } = await probe({
+      create: (_call, index) => json({ id: index === 0 ? 'hit-1' : 'miss-1', probesCount: 5 }, 202),
+      get: (id) => measurement(id, 'finished', results),
+    });
+    expect(result).toBe('error');
+    const samples = metrics(calls);
+    expect(samples.filter(({ name }) => name === 'tiles_bunny_probe_ttfb_ms')).toHaveLength(8);
+    expect(samples.filter(({ labels }) => labels.continent === 'NA' || labels.continent === 'AF')).toEqual([]);
+    expect(samples).toContainEqual({ name: 'tiles_bunny_probe_runs', labels: { result: 'error' }, value: 1 });
+    expect(pushedLogs(calls).filter(({ _msg }) => _msg === NO_VERDICT_FROM)).toEqual([
+      expect.objectContaining({ level: 'error', target: 'hit', measurement_id: 'hit-1', tests: 5, missing: 'NA,AF' }),
+      expect.objectContaining({ level: 'error', target: 'miss', measurement_id: 'miss-1', tests: 5, missing: 'NA,AF' }),
+    ]);
   });
 
   it('counts a non-200 answer as an error, not a TTFB', async () => {
@@ -228,14 +325,18 @@ describe('runProbe', () => {
 
   it('counts a 200 without Content-Encoding: gzip as an error, as no map can decode it', async () => {
     const { result, calls } = await probe(
-      hitAndMiss([
-        finished('EU', 30, { headers: { 'cdn-cache': 'HIT', 'content-type': 'application/octet-stream' } }),
-        finished('NA', 30, { headers: { ...tileHeaders(), 'content-encoding': 'br' } }),
-        finished('AS', 30, { headers: { 'CDN-Cache': 'HIT', 'Content-Encoding': 'GZIP' } }),
-      ]),
+      hitAndMiss(
+        everywhere([
+          finished('EU', 30, { headers: { 'cdn-cache': 'HIT', 'content-type': 'application/octet-stream' } }),
+          finished('NA', 30, { headers: { ...tileHeaders(), 'content-encoding': 'br' } }),
+          finished('AS', 30, { headers: { 'CDN-Cache': 'HIT', 'Content-Encoding': 'GZIP' } }),
+        ]),
+      ),
     );
     expect(result).toBe('ok');
-    const kept = metrics(calls).filter(({ labels }) => labels.kind === 'hit');
+    const kept = metrics(calls).filter(
+      ({ labels }) => labels.kind === 'hit' && ['EU', 'NA', 'AS'].includes(labels.continent),
+    );
     expect(kept).toEqual(
       expect.arrayContaining([
         { name: 'tiles_bunny_probe_errors', labels: { continent: 'EU', kind: 'hit', target: 'hit' }, value: 1 },
@@ -287,22 +388,29 @@ describe('runProbe', () => {
   });
 
   it('keeps both targets apart when they report the same kind from one continent, as after a purge', async () => {
-    // The purge left the hit tile cold in EU, so both targets answer MISS there; in NA both fail as misses.
+    // The purge left the hit tile cold in EU, so both targets answer MISS there; in NA both fail as misses. The other
+    // continents both see a hit.
     const cold = { headers: tileHeaders('MISS') };
     const { result, calls } = await probe({
-      create: (_call, index) => json({ id: index === 0 ? 'hit-1' : 'miss-1', probesCount: 2 }, 202),
+      create: (_call, index) => json({ id: index === 0 ? 'hit-1' : 'miss-1', probesCount: 6 }, 202),
       get: (id) =>
-        measurement(id, 'finished', [
-          finished('EU', id === 'hit-1' ? 300 : 120, cold),
-          finished('NA', 40, { ...cold, statusCode: 404 }),
-        ]),
+        measurement(
+          id,
+          'finished',
+          everywhere([
+            finished('EU', id === 'hit-1' ? 300 : 120, cold),
+            finished('NA', 40, { ...cold, statusCode: 404 }),
+          ]),
+        ),
     });
     expect(result).toBe('ok');
     const samples = pushedSamples(calls);
     // No two samples share a series and a timestamp, so o11y's dedup (the biggest of them) drops none of them.
     const series = samples.map(({ name, labels, timestamp }) => `${name}${JSON.stringify(labels)}@${timestamp}`);
     expect(new Set(series).size).toBe(series.length);
-    expect(metrics(calls)).toEqual([
+    expect(
+      metrics(calls).filter(({ labels }) => labels.continent === undefined || ['EU', 'NA'].includes(labels.continent)),
+    ).toEqual([
       { name: 'tiles_bunny_probe_ttfb_ms', labels: { continent: 'EU', kind: 'miss', target: 'hit' }, value: 300 },
       { name: 'tiles_bunny_probe_errors', labels: { continent: 'EU', kind: 'miss', target: 'hit' }, value: 0 },
       { name: 'tiles_bunny_probe_errors', labels: { continent: 'NA', kind: 'miss', target: 'hit' }, value: 1 },
@@ -325,9 +433,9 @@ describe('runProbe', () => {
         failed('SA', 'target', 'Request timed out while waiting for the first response byte.'),
         failed('AS', undefined, 'incorrect header check'),
         finished('OC', 40),
+        finished('AF', 45),
       ]),
     );
-    expect(result).toBe('ok');
     const errors = metrics(calls).filter(
       ({ name, labels }) => name === 'tiles_bunny_probe_errors' && labels.kind === 'hit',
     );
@@ -335,6 +443,12 @@ describe('runProbe', () => {
       { name: 'tiles_bunny_probe_errors', labels: { continent: 'SA', kind: 'hit', target: 'hit' }, value: 1 },
       { name: 'tiles_bunny_probe_errors', labels: { continent: 'AS', kind: 'hit', target: 'hit' }, value: 1 },
       { name: 'tiles_bunny_probe_errors', labels: { continent: 'OC', kind: 'hit', target: 'hit' }, value: 0 },
+      { name: 'tiles_bunny_probe_errors', labels: { continent: 'AF', kind: 'hit', target: 'hit' }, value: 0 },
+    ]);
+    // Uncounted, yet EU and NA went unmeasured: the run says so.
+    expect(result).toBe('error');
+    expect(pushedLogs(calls).filter(({ _msg }) => _msg === NO_VERDICT_FROM)).toEqual([
+      expect.objectContaining({ target: 'hit', missing: 'EU,NA' }),
     ]);
     expect(pushedLogs(calls).filter(({ kind, target }) => kind === 'probe' && target === 'hit')).toEqual(
       expect.arrayContaining([
@@ -396,7 +510,7 @@ describe('runProbe', () => {
   it('pushes only the run when no measurement could be created', async () => {
     const { result, calls } = await probe({ create: () => new Response('down', { status: 503 }) });
     expect(result).toBe('error');
-    expect(calls.filter(({ method }) => method === 'GET')).toHaveLength(0);
+    expect(calls.filter(({ url, method }) => url.startsWith(GLOBALPING_API) && method === 'GET')).toHaveLength(0);
     expect(metrics(calls)).toEqual([{ name: 'tiles_bunny_probe_runs', labels: { result: 'error' }, value: 1 }]);
   });
 
@@ -424,7 +538,7 @@ describe('runProbe', () => {
   it('keeps polling through a failed read of the results', async () => {
     const { result, calls } = await probe({
       get: (id, poll) =>
-        poll === 0 ? new Response('busy', { status: 429 }) : measurement(id, 'finished', [finished('EU', 40)]),
+        poll === 0 ? new Response('busy', { status: 429 }) : measurement(id, 'finished', everywhere([])),
     });
     expect(result).toBe('ok');
     expect(metrics(calls)).toEqual(
@@ -432,10 +546,97 @@ describe('runProbe', () => {
     );
   });
 
+  it('probes the tile URLs the TileJSON advertises, as after a full rewrite to v1/e2', async () => {
+    const { result, calls } = await probe({
+      tileJson: () => tileJsonOf('https://tiles.example.com/v1/e2/{z}/{x}/{y}.mvt'),
+      get: (id) => measurement(id, 'finished', everywhere([])),
+    });
+    expect(result).toBe('ok');
+    const tileJsonCalls = calls.filter(({ url }) => url === TILEJSON_URL);
+    expect(tileJsonCalls).toHaveLength(1);
+    expect(tileJsonCalls[0].method).toBe('GET');
+    const posts = creates(calls);
+    expect(calls.indexOf(tileJsonCalls[0])).toBeLessThan(calls.indexOf(posts[0]));
+    expect(posts.map(({ body }) => JSON.parse(body).measurementOptions.request.path)).toEqual([
+      `/v1/e2/${HIT_TILE}.mvt`,
+      '/v1/e2/15/8192/8192.mvt',
+    ]);
+    expect(pushedLogs(calls).filter(({ kind }) => kind === 'probe')[0]).toMatchObject({
+      path: `/v1/e2/${HIT_TILE}.mvt`,
+    });
+  });
+
+  it("probes the TileJSON's path on the public origin when the TileJSON names another hostname", async () => {
+    // From a DNS cutover until the next sync, the TileJSON on the public hostname still names the test one.
+    const { result, calls } = await probe({
+      tileJson: () => tileJsonOf('https://tiles-test.example.com/v1/e2/{z}/{x}/{y}.mvt'),
+      get: (id) => measurement(id, 'finished', everywhere([])),
+    });
+    expect(result).toBe('ok');
+    expect(creates(calls).map(({ body }) => JSON.parse(body))).toEqual([
+      expect.objectContaining({
+        target: 'tiles.example.com',
+        measurementOptions: expect.objectContaining({ request: expect.objectContaining({ path: '/v1/e2/2/2/1.mvt' }) }),
+      }),
+      expect.objectContaining({
+        target: 'tiles.example.com',
+        measurementOptions: expect.objectContaining({
+          request: expect.objectContaining({ path: '/v1/e2/15/8192/8192.mvt' }),
+        }),
+      }),
+    ]);
+    expect(pushedLogs(calls)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          _msg: 'Probe TileJSON names tiles on another origin',
+          level: 'warn',
+          tile_origin: 'https://tiles-test.example.com',
+        }),
+      ]),
+    );
+  });
+
+  it.each([
+    ['is unreadable', () => new Response('not found', { status: 404 })],
+    ['has no tile template', () => json({ tilejson: '3.0.0', tiles: [] })],
+    ['names tiles with a query', () => tileJsonOf('https://tiles.example.com/v1/{z}/{x}/{y}.mvt?v=20261118')],
+  ])(
+    'reports an error, measuring nothing, when the TileJSON %s rather than probe the old prefix',
+    async (_, tileJson) => {
+      const { result, calls } = await probe({ tileJson });
+      expect(result).toBe('error');
+      expect(calls.filter(({ url }) => url.startsWith(GLOBALPING_API))).toEqual([]);
+      expect(metrics(calls)).toEqual([{ name: 'tiles_bunny_probe_runs', labels: { result: 'error' }, value: 1 }]);
+      expect(pushedLogs(calls)).toEqual([
+        expect.objectContaining({ _msg: 'Probe tile URLs unknown', level: 'error', job: 'bunny_probe' }),
+      ]);
+    },
+  );
+
+  it("doesn't follow a redirect from Globalping, which would carry the token along", async () => {
+    const elsewhere = 'https://api.elsewhere.example/v1/measurements';
+    const { result, calls } = await probe({
+      create: () => new Response(null, { status: 307, headers: { Location: elsewhere } }),
+    });
+    expect(result).toBe('error');
+    const posts = creates(calls);
+    expect(posts).toHaveLength(2);
+    for (const post of posts) {
+      expect(post.redirect).toBe('manual');
+    }
+    expect(calls.filter(({ url }) => url.startsWith('https://api.elsewhere.example/'))).toEqual([]);
+    expect(pushedLogs(calls)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ _msg: 'Globalping measurement not created', error: expect.stringContaining('307') }),
+      ]),
+    );
+  });
+
   it('is skipped, calling nothing but o11y, without its settings', async () => {
     const { result, calls } = await probe({}, null);
     expect(result).toBe('skipped');
     expect(calls.filter(({ url }) => url.startsWith(GLOBALPING_API))).toHaveLength(0);
+    expect(calls.filter(({ url }) => url === TILEJSON_URL)).toHaveLength(0);
     expect(pushedSamples(calls)).toEqual([
       { name: 'tiles_bunny_probe_runs', labels: { result: 'skipped' }, value: 1, timestamp: scheduled },
     ]);
@@ -460,7 +661,7 @@ describe('the Bunny cron', () => {
   });
 
   it('reads the logs and probes with the settings from the environment', async () => {
-    const routes = globalping({ get: (id) => measurement(id, 'finished', [finished('EU', 10)]) });
+    const routes = globalping({ get: (id) => measurement(id, 'finished', everywhere([finished('EU', 10)])) });
     const { calls } = mockFetch((call) => (call.url.startsWith(LOGGING_API) ? page() : routes(call)));
     const bunnyEnv = {
       ...env,

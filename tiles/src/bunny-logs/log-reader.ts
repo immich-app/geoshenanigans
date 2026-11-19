@@ -78,7 +78,9 @@ export function logWindow(scheduledTime: number, lagMinutes = LAG_MINUTES): Wind
 
 export type RequestKind = 'tile' | 'tilejson' | 'style' | 'other';
 
-const TILE_PATH = /^\/v\d+\/(\d+)\/\d+\/\d+\.mvt$/;
+// Tiles sit under the zone's tile prefix, `v1` or, after a full rewrite, a nested one such as `v1/e2` (bunny:sync
+// --adopt --replace): any prefix of one or more folders, then z/x/y.mvt.
+const TILE_PATH = /^\/(?:[^/]+\/)+(\d+)\/\d+\/\d+\.mvt$/;
 const TILEJSON_PATH = /^\/v\d+\.json$/;
 const STYLE_PATH = /^\/v\d+\/style\//;
 
@@ -256,7 +258,7 @@ function rateLimitWaitMs(retryAfter: string | null): number {
 
 /**
  * One page, retried on 429 (until the deadline), 5xx, timeouts and unreadable bodies (ATTEMPTS tries); anything else
- * (a bad key, a bad query) throws.
+ * (a bad key, a bad query, a redirect) throws.
  */
 async function getLogPage(config: LogReaderConfig, query: PageQuery, deps: Deps, pacer: Pacer): Promise<LogPage> {
   const params = new URLSearchParams({
@@ -279,12 +281,18 @@ async function getLogPage(config: LogReaderConfig, query: PageQuery, deps: Deps,
     try {
       const response = await fetch(url, {
         headers: { AccessKey: config.apiKey, Accept: 'application/json' },
+        // A redirect would carry the account key to wherever it points: it fails the read instead.
+        redirect: 'manual',
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
       if (response.ok) {
-        const body = (await response.json()) as { data?: unknown; pagination?: { hasMore?: unknown } };
-        if (Array.isArray(body?.data) && typeof body.pagination?.hasMore === 'boolean') {
-          return { data: body.data as LogRow[], hasMore: body.pagination.hasMore };
+        const body = (await response.json()) as { data?: unknown; pagination?: { hasMore?: unknown } } | null;
+        const hasMore = body?.pagination?.hasMore;
+        // data is nullable in the API: null on a last page without rows is an empty page. Missing, or null on a page
+        // that claims more rows, is a body that can't be trusted.
+        const data = body?.data === null && hasMore === false ? [] : body?.data;
+        if (Array.isArray(data) && typeof hasMore === 'boolean') {
+          return { data: data as LogRow[], hasMore };
         }
         reason = 'a body without data and pagination.hasMore';
       } else {

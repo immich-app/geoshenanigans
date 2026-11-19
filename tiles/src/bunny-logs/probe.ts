@@ -1,7 +1,9 @@
 /**
  * The synthetic probe: every few minutes, one Globalping probe per continent requests a popular tile (a cache hit at
  * nearly every edge) and a random z15 position (nearly always a miss, so it measures the trip to storage) from the
- * Bunny-served origin, and the time to first byte goes to o11y as tiles_bunny_probe_*.
+ * Bunny-served origin, and the time to first byte goes to o11y as tiles_bunny_probe_*. The tile URLs come from the
+ * origin's TileJSON (`/v1.json`), as they do for clients, so after a full rewrite moves the tiles to another prefix
+ * (`v1/e2`) the probe measures the new prefix, not the retired one.
  *
  * The run waits for its own measurements (a few seconds, never much more than RESULT_DEADLINE_MS, against the 15 minutes
  * a cron run may take) instead of reading them on a later run: the worker has nowhere to keep a measurement id between
@@ -22,6 +24,8 @@ export const GLOBALPING_API = 'https://api.globalping.io/v1/measurements';
 export const PROBE_CONTINENTS = ['EU', 'NA', 'SA', 'AS', 'OC', 'AF'] as const;
 // Most of Europe, where most requests come from, at a zoom every world and continent view loads.
 export const HIT_TILE = '2/2/1';
+// The TileJSON Immich loads (static-files.ts' STATIC_PREFIX), whose tile template says where the live tiles are.
+export const TILEJSON_PATH = '/v1.json';
 const MISS_ZOOM = 15;
 const USER_AGENT = 'immich-tiles-probe/1.0 (+https://github.com/immich-app/geoshenanigans)';
 // A test may take up to 30s on the probe and the API asks clients to allow 10s more; then the run gives up.
@@ -63,8 +67,61 @@ export function missTile(random: () => number): string {
   return `${MISS_ZOOM}/${coordinate()}/${coordinate()}`;
 }
 
-function tilePath(publicUrl: URL, tile: string): string {
-  return `${publicUrl.pathname.replace(/\/+$/, '')}/v1/${tile}.mvt`;
+// The public origin's path, without a trailing slash: '' for https://tiles.immich.cloud.
+const basePath = (publicUrl: URL) => publicUrl.pathname.replace(/\/+$/, '');
+
+/**
+ * Tile z/x/y's URL from the TileJSON's tile template. Throws unless the template is an absolute http(s) URL under the
+ * public URL's path, without a query or fragment, with one each of {z}, {x} and {y}. Its origin can be another of the
+ * pull zone's hostnames: from the DNS cutover until the next sync rewrites v1.json, the TileJSON on the public hostname
+ * still names the test one (deployment/modules/bunny/tiles/README.md). The probe requests the path from the public
+ * origin either way, so a TileJSON never sends Globalping to another host.
+ */
+export function tileUrl(publicUrl: URL, template: string, tile: string): URL {
+  const shown = JSON.stringify(template.slice(0, 200));
+  if (!['{z}', '{x}', '{y}'].every((placeholder) => template.split(placeholder).length === 2)) {
+    throw new Error(`Tile template ${shown} doesn't have one each of {z}, {x} and {y}`);
+  }
+  const [z, x, y] = tile.split('/');
+  let url: URL | undefined;
+  try {
+    url = new URL(template.replace('{z}', z).replace('{x}', x).replace('{y}', y));
+  } catch {
+    url = undefined;
+  }
+  const base = basePath(publicUrl);
+  if (
+    !url ||
+    (url.protocol !== 'https:' && url.protocol !== 'http:') ||
+    url.search !== '' ||
+    url.hash !== '' ||
+    !url.pathname.startsWith(`${base}/`)
+  ) {
+    throw new Error(`Tile template ${shown} isn't an http(s) tile URL under ${base || '/'}`);
+  }
+  return url;
+}
+
+/**
+ * The tile template the public origin's TileJSON advertises now (its first), which clients follow: a full rewrite
+ * moves it to another prefix. Throws when the TileJSON can't be read or has no tile template.
+ */
+export async function liveTileTemplate(publicUrl: URL): Promise<string> {
+  const url = `${publicUrl.origin}${basePath(publicUrl)}${TILEJSON_PATH}`;
+  const response = await fetch(url, {
+    headers: { Accept: 'application/json', 'User-Agent': USER_AGENT },
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  });
+  if (!response.ok) {
+    await response.body?.cancel();
+    throw new Error(`${url} answered ${response.status}`);
+  }
+  const body = (await response.json()) as { tiles?: unknown } | null;
+  const template = Array.isArray(body?.tiles) ? body.tiles[0] : undefined;
+  if (typeof template !== 'string') {
+    throw new Error(`${url} has no tile template`);
+  }
+  return template;
 }
 
 /** The Globalping HTTP measurement of path on the public origin, from locations (or a measurement's probes). */
@@ -91,6 +148,8 @@ async function createMeasurement(config: ProbeConfig, body: unknown): Promise<st
       'User-Agent': USER_AGENT,
     },
     body: JSON.stringify(body),
+    // A redirect would carry the token to wherever it points: it fails like any answer but 202.
+    redirect: 'manual',
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
   if (response.status !== 202) {
@@ -201,14 +260,15 @@ export function measuredKind(target: Target, result: TestResult | undefined): Pr
 
 /**
  * The samples and log lines of a measurement's tests: a TTFB and a 0 for each test that got the tile, a 1 for each
- * other test with a verdict (testHasVerdict), and how many tests had one.
+ * other test with a verdict (testHasVerdict), how many tests had one, and the probe continents they came from.
  */
 export function measurementSamples(
   target: Target,
   measurement: Measurement | undefined,
-): { samples: Sample[]; lines: LogFields[]; tests: number; verdicts: number } {
+): { samples: Sample[]; lines: LogFields[]; tests: number; verdicts: number; continents: Set<string> } {
   const samples: Sample[] = [];
   const lines: LogFields[] = [];
+  const continents = new Set<string>();
   let verdicts = 0;
   const results = measurement?.results ?? [];
   for (const { probe, result } of results) {
@@ -225,6 +285,7 @@ export function measurementSamples(
     const verdict = testHasVerdict(result);
     if (verdict) {
       verdicts++;
+      continents.add(labels.continent);
       samples.push({ name: 'tiles_bunny_probe_errors', labels, value: ttfb === undefined ? 1 : 0 });
     }
     lines.push({
@@ -256,13 +317,16 @@ export function measurementSamples(
       }),
     });
   }
-  return { samples, lines, tests: results.length, verdicts };
+  return { samples, lines, tests: results.length, verdicts, continents };
 }
 
 /**
- * Probes the hit and miss tiles from one probe per continent (the miss measurement reuses the hit one's probes, so the
- * two compare like for like), waits for the results and pushes them with the run's result at the scheduled minute.
- * Never rejects. Without config it pushes only result="skipped".
+ * Probes the hit and miss tiles, at the URLs the TileJSON advertises, from one probe per continent (the miss
+ * measurement reuses the hit one's probes, so the two compare like for like), waits for the results and pushes them
+ * with the run's result at the scheduled minute. The run is an error when the TileJSON gives no tile URL, Globalping
+ * refuses or doesn't finish a measurement, or a measurement has no verdict from some continent (no probe there, or its
+ * test failed on Globalping's side): that continent's tiles went unmeasured. Never rejects. Without config it pushes
+ * only result="skipped".
  */
 export async function runProbe(
   config: ProbeConfig | undefined,
@@ -278,10 +342,25 @@ export async function runProbe(
     return 'skipped';
   }
   const fields = { job: 'bunny_probe', run_minute: new Date(minute).toISOString() };
-  const targets: Target[] = [
-    { kind: 'hit', path: tilePath(config.publicUrl, HIT_TILE) },
-    { kind: 'miss', path: tilePath(config.publicUrl, missTile(deps.random)) },
-  ];
+  let targets: Target[];
+  try {
+    const template = await liveTileTemplate(config.publicUrl);
+    const hit = tileUrl(config.publicUrl, template, HIT_TILE);
+    targets = [
+      { kind: 'hit', path: hit.pathname },
+      { kind: 'miss', path: tileUrl(config.publicUrl, template, missTile(deps.random)).pathname },
+    ];
+    if (hit.origin !== config.publicUrl.origin) {
+      // Expected from a DNS cutover until the next sync rewrites the TileJSON (see tileUrl); anything else is worth a
+      // look, as clients load the tiles from there.
+      logger.warn('Probe TileJSON names tiles on another origin', { ...fields, tile_origin: hit.origin.slice(0, 200) });
+    }
+  } catch (error) {
+    // Not the old prefix instead: after a full rewrite that is the retired build, deleted a week later.
+    logger.error('Probe tile URLs unknown', error, fields);
+    await pushSamples(o11y, [runs('error')], minute);
+    return 'error';
+  }
   const continents = PROBE_CONTINENTS.map((continent) => ({ continent, limit: 1 }));
   const ids = new Map<ProbeKind, string>();
   let result: RunResult = 'ok';
@@ -315,6 +394,7 @@ export async function runProbe(
         });
       }
       const measured = measurementSamples(target, measurement);
+      const missing = PROBE_CONTINENTS.filter((continent) => !measured.continents.has(continent));
       if (settled(measurement) && measured.verdicts === 0) {
         // Every test failed on Globalping's side or its probes went offline: nothing about the tiles was measured.
         result = 'error';
@@ -323,6 +403,17 @@ export async function runProbe(
           target: target.kind,
           measurement_id: id,
           tests: measured.tests,
+        });
+      } else if (settled(measurement) && missing.length > 0) {
+        // Globalping had no probe there, or its test went offline or failed on Globalping's side: the samples that
+        // came are kept, but those continents' tiles went unmeasured.
+        result = 'error';
+        logger.error('Globalping measurement has no verdict from some continents', undefined, {
+          ...fields,
+          target: target.kind,
+          measurement_id: id,
+          tests: measured.tests,
+          missing: missing.join(','),
         });
       }
       samples.push(...measured.samples);
