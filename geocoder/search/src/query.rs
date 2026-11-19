@@ -1291,6 +1291,299 @@ mod tests {
         assert_eq!(got, read_first);
     }
 
+    /// A xorshift64* generator: the cases of the search against one that reads first, from a seed.
+    struct Rng(u64);
+
+    impl Rng {
+        fn new(seed: u64) -> Self {
+            Rng(seed.wrapping_add(1).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+        }
+
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        /// Below `n`, which is at least 1.
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn one_in(&mut self, n: usize) -> bool {
+            self.below(n) == 0
+        }
+
+        fn pick<'x, T>(&mut self, xs: &'x [T]) -> &'x T {
+            &xs[self.below(xs.len())]
+        }
+
+        /// In [lo, hi).
+        fn at(&mut self, lo: f32, hi: f32) -> f32 {
+            lo + (hi - lo) * self.below(4096) as f32 / 4096.0
+        }
+    }
+
+    /// The words of the random names: one, two and three letters (no edit, the prefix table),
+    /// longer ones a typo or two apart, and the trailing words of longer names.
+    const WORDS: [&str; 12] = ["a", "b", "c", "ab", "bay", "old", "mill", "olde", "mills", "north", "norths", "market"];
+
+    /// A random index, small enough that its names crowd a search's small limits. Its names are
+    /// those of a few phrases of a few of the words, and each phrase's leading words: a query of
+    /// a phrase then has hits in each of its splits. Over two degrees: rectangular boundaries
+    /// named by the trailing words of the phrases (a split's context), overlapping, some
+    /// labelled by a node; place nodes, some inside a boundary and named as it is; POIs in
+    /// groups of one name, of one importance or a few (hits that tie), close together (a
+    /// result's duplicates) or apart, inside a boundary or not; extra names for some; and now
+    /// and then a crowd (`crowd`). Returns it with the extra-names rows, the phrases, the
+    /// boundaries' names and the crowd's rows.
+    fn random_geo(rng: &mut Rng) -> (crate::fixture::Geo, String, Vec<String>, Vec<String>, Vec<u32>) {
+        let mut g = crate::fixture::Geo::default();
+        let mut words: Vec<&str> = WORDS.to_vec();
+        for k in (1..words.len()).rev() {
+            words.swap(k, rng.below(k + 1));
+        }
+        words.truncate(3 + rng.below(4));
+        let name = |rng: &mut Rng, n: usize| (0..n).map(|_| *rng.pick(&words)).collect::<Vec<_>>().join(" ");
+        let phrases: Vec<String> = (0..1 + rng.below(3)).map(|_| {
+            let n = 1 + rng.below(3);
+            name(rng, n)
+        }).collect();
+        let (mut areas, mut rects, mut extras) = (Vec::new(), Vec::new(), String::new());
+        for _ in 0..1 + rng.below(5) {
+            let n = if rng.one_in(4) {
+                let n = 1 + rng.below(2);
+                name(rng, n)
+            } else {
+                let w: Vec<&str> = rng.pick(&phrases).split(' ').collect();
+                w[w.len() - 1 - rng.below(w.len().min(2))..].join(" ")
+            };
+            let rect = match rects.last() {
+                Some(&r) if rng.one_in(2) => r,
+                _ => {
+                    let (s, w) = (rng.at(10.0, 11.6), rng.at(20.0, 21.6));
+                    let (h, x) = (rng.at(0.1, 0.8), rng.at(0.1, 0.8));
+                    [s, w, s + h, w + x]
+                }
+            };
+            let poly = g.boundary(&n, *rng.pick(&[2, 4, 6, 8, 8]), rect);
+            if rng.one_in(3) {
+                let node = g.place(if rng.one_in(2) { n.as_str() } else { *rng.pick(&words) }, rng.below(7) as u8, (rect[0] + rect[2]) / 2.0, (rect[1] + rect[3]) / 2.0);
+                g.claim(poly, node);
+            }
+            if rng.one_in(4) {
+                extras += &format!("b\t{poly}\t0\talt_name\t{}\n", name(rng, 1));
+            }
+            areas.push(n);
+            rects.push(rect);
+        }
+        let inside = |rng: &mut Rng| {
+            let [s, w, n, e] = *rng.pick(&rects);
+            (rng.at(s, n), rng.at(w, e))
+        };
+        let anywhere = |rng: &mut Rng| (rng.at(9.8, 12.2), rng.at(19.8, 22.2));
+        // Each phrase's leading words, and now and then another name.
+        let mut names: Vec<String> = Vec::new();
+        for p in &phrases {
+            let w: Vec<&str> = p.split(' ').collect();
+            names.extend((1..=w.len()).map(|k| w[..k].join(" ")));
+        }
+        for _ in 0..rng.below(3) {
+            let n = 1 + rng.below(2);
+            names.push(name(rng, n));
+        }
+        for _ in 0..rng.below(8) {
+            let n = if rng.one_in(2) { rng.pick(&areas).clone() } else { rng.pick(&names).clone() };
+            let (lat, lng) = if rng.one_in(2) { inside(rng) } else { anywhere(rng) };
+            let node = g.place(&n, rng.below(7) as u8, lat, lng);
+            if rng.one_in(5) {
+                extras += &format!("p\t{node}\t0\tname:de\t{}\n", name(rng, 1));
+            }
+        }
+        let imps = [0u8, 1, 3, 15, 63, 127, 255];
+        let mut pois = 0;
+        for _ in 0..2 + rng.below(8) {
+            let n = rng.pick(&names).clone();
+            let imp = *rng.pick(&imps);
+            let (near, spread) = (rng.one_in(2), *rng.pick(&[0.01, 0.1, 1.0]));
+            let (lat, lng) = if near { inside(rng) } else { anywhere(rng) };
+            for _ in 0..1 + rng.below(12) {
+                let (lat, lng) = if near || rng.one_in(2) { (lat + rng.at(-spread, spread), lng + rng.at(-spread, spread)) } else { anywhere(rng) };
+                g.poi(&n, lat, lng, if rng.one_in(3) { *rng.pick(&imps) } else { imp });
+                if rng.one_in(8) {
+                    extras += &format!("o\t{pois}\t0\t{}\t{}\n", rng.pick(&["name:de", "alt_name", "old_name"]), name(rng, 1));
+                }
+                pois += 1;
+            }
+        }
+        let mut phrases = phrases;
+        let crowd = if rng.one_in(2) { crowd(rng, &mut g, &words, &mut phrases) } else { Vec::new() };
+        (g, extras, phrases, areas, crowd)
+    }
+
+    /// A crowd: a word's POIs, more than a small pool holds, all of one low importance (hits
+    /// that tie at its threshold), above them one of the most, and one of the most named by the
+    /// word and a letter more, which the word as a prefix reads after them. Returns the rows of
+    /// the many; the word is a phrase.
+    fn crowd(rng: &mut Rng, g: &mut crate::fixture::Geo, words: &[&str], phrases: &mut Vec<String>) -> Vec<u32> {
+        let w = words.iter().copied().filter(|w| w.len() >= 3).max_by_key(|_| rng.next()).unwrap_or("market");
+        let at = |rng: &mut Rng| (rng.at(9.8, 12.2), rng.at(19.8, 22.2));
+        let (lat, lng) = at(rng);
+        g.poi(w, lat, lng, 255);
+        let imp = *rng.pick(&[0u8, 1, 3]);
+        let many = (0..3 + rng.below(12)).map(|_| {
+            let (lat, lng) = at(rng);
+            g.poi(w, lat, lng, imp)
+        }).collect();
+        let (lat, lng) = at(rng);
+        g.poi(&format!("{w}s"), lat, lng, 255);
+        phrases.push(w.to_string());
+        many
+    }
+
+    /// A random query of one of the `phrases` and the boundaries' names `areas`: a phrase as it
+    /// is, or maybe cut short or with a letter changed, maybe without its first or last words,
+    /// then maybe context words, after a comma or not.
+    fn random_query(rng: &mut Rng, phrases: &[String], areas: &[String]) -> String {
+        let mut words: Vec<String> = rng.pick(phrases).split(' ').map(str::to_string).collect();
+        if rng.one_in(3) {
+            return words.join(" ");
+        }
+        if words.len() > 1 && rng.one_in(5) {
+            words.remove(if rng.one_in(2) { 0 } else { words.len() - 1 });
+        }
+        let last = words.len() - 1;
+        if words[last].len() > 2 && rng.one_in(4) {
+            let keep = 1 + rng.below(words[last].len() - 1);
+            words[last].truncate(keep);
+        }
+        let k = rng.below(words.len());
+        if words[k].len() >= 4 && rng.one_in(5) {
+            let at = 1 + rng.below(words[k].len() - 1);
+            words[k].replace_range(at..at + 1, if rng.one_in(2) { "x" } else { "" });
+        }
+        let ctx: Vec<String> = (0..rng.below(3)).map(|_| rng.pick(areas).split(' ').next().unwrap().to_string()).collect();
+        match rng.below(3) {
+            0 if !ctx.is_empty() => format!("{}, {}", words.join(" "), ctx.join(" ")),
+            1 if rng.one_in(4) => format!("{},", words.join(" ")),
+            _ => words.into_iter().chain(ctx).collect::<Vec<_>>().join(" "),
+        }
+    }
+
+    /// `bnd` (a places.bnd) with the slots `damage` picks made to read as no slot: a labelled
+    /// one labelled by no node, an unlabelled one's point off the globe.
+    fn with_unreadable_slots(bnd: &[u8], mut damage: impl FnMut() -> bool) -> (Vec<u8>, usize) {
+        use crate::entities::{BOUNDARY_FOOTER_BYTES, LABELLED_SLOT_BYTES, UNLABELLED_SLOT_BYTES};
+        let mut out = bnd.to_vec();
+        let slots = out.len() - BOUNDARY_FOOTER_BYTES;
+        let labelled = u32::from_le_bytes(out[slots..].try_into().unwrap()) as usize;
+        let mut n = 0;
+        for k in 0..labelled {
+            if damage() {
+                let at = k * LABELLED_SLOT_BYTES + 4;
+                out[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+                n += 1;
+            }
+        }
+        for at in (labelled * LABELLED_SLOT_BYTES..slots).step_by(UNLABELLED_SLOT_BYTES) {
+            if damage() {
+                out[at + 4..at + 8].copy_from_slice(&f32::NAN.to_le_bytes());
+                n += 1;
+            }
+        }
+        (out, n)
+    }
+
+    #[test]
+    fn a_search_answers_as_one_that_reads_every_entity_first() {
+        use crate::fixture::{build_search, TempDir};
+        use query_server::{DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL};
+        // Random indexes, each searched with random limits of the pool, the context checks, the
+        // pending candidates and the area order, small enough that its hits fill them, once a
+        // random part of its POI rows and boundary slots does not read: the answers as a search
+        // that reads first has them, and, by a search that runs once, the context checks made
+        // (the postings read can be fewer, where the pool turns hits away for an entity that is
+        // nowhere, which it holds unread and below every hit taken). PLACE_SEARCH_SEEDS indexes
+        // (from PLACE_SEARCH_FIRST_SEED) for a longer run.
+        let env = |k: &str, d: u64| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let (first, seeds) = (env("PLACE_SEARCH_FIRST_SEED", 0), env("PLACE_SEARCH_SEEDS", 40));
+        let (mut cases, mut damaged, mut again, mut failed, mut counted) = (0usize, 0usize, 0usize, Vec::new(), Vec::new());
+        for seed in first..first + seeds {
+            let mut rng = Rng::new(seed);
+            let (g, extras, phrases, areas, crowd) = random_geo(&mut rng);
+            let dir = TempDir::new("same-answers");
+            let (tsv, bin) = (dir.0.join("extra_names.tsv"), dir.0.join("extra_names.bin"));
+            std::fs::write(&tsv, extras + "o\t0\t0\tname:de\tolde\n").unwrap();
+            crate::extras::pack(tsv.to_str().unwrap(), bin.to_str().unwrap()).unwrap();
+            let set = dir.0.join("geo");
+            let geo = g.load(&set);
+            let out = dir.0.join("idx");
+            build_search(&geo, &out, Some(&bin));
+            let rows = geo.poi_records.as_ref().unwrap().len() as usize;
+            // Mapped before the damage, which writes new files.
+            let built = SearchIndex::open(&geo, &out, Some(bin.to_str().unwrap()), None).unwrap();
+            let records = std::fs::read(set.join("poi_records.bin")).unwrap();
+            let bnd = std::fs::read(out.join(BOUNDARY_FILE)).unwrap();
+            for damage in 0..4 {
+                // One POI row, of the crowd as often as not; a boundary slot now and then; a
+                // tenth of the rows and a quarter of the slots; up to a third of the rows and most
+                // slots.
+                let share = [0, 0, 1, 1 + rng.below(6)][damage];
+                let one = if !crowd.is_empty() && rng.one_in(2) { *rng.pick(&crowd) as usize } else { rng.below(rows) };
+                let mut recs = records.clone();
+                let mut n = 0;
+                for (i, at) in (0..rows).map(|i| (i, i * 27 + 25)) {
+                    if (damage == 0 && i == one) || (damage >= 2 && rng.below(20) <= share) {
+                        recs[at..at + 2].copy_from_slice(&0xFFFEu16.to_le_bytes());
+                        n += 1;
+                    }
+                }
+                let (slots, m) = with_unreadable_slots(&bnd, || damage >= 1 && rng.below(4 * (4 - damage)) <= share);
+                if n + m == 0 {
+                    continue;
+                }
+                for (name, bytes, at) in [("poi_records.bin", &recs, &set), (BOUNDARY_FILE, &slots, &out)] {
+                    std::fs::write(at.join(format!("{name}.new")), bytes).unwrap();
+                    std::fs::rename(at.join(format!("{name}.new")), at.join(name)).unwrap();
+                }
+                let geo = Index::load(set.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).unwrap();
+                let idx = SearchIndex::open(&geo, &out, Some(bin.to_str().unwrap()), None).unwrap();
+                for _ in 0..4 {
+                    let limits = if rng.one_in(8) {
+                        Limits::default()
+                    } else {
+                        Limits { pool: 1 + rng.below(10), context_checks: rng.below(10), pending: 2 + rng.below(14), area_top: 1 + rng.below(5) }
+                    };
+                    let (s, as_built) = (Searcher { limits, ..Searcher::new(&idx) }, Searcher { limits, ..Searcher::new(&built) });
+                    for _ in 0..16 {
+                        let q = random_query(&mut rng, &phrases, &areas);
+                        for limit in [1 + rng.below(2), 3 + rng.below(6)] {
+                            let got = answer(&s.search(&q, limit).0);
+                            let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
+                            let read_first = answer(&s.search_once::<true>(&mut st, &q, limit).unwrap());
+                            let mut once = State { ctx: HashMap::new(), stats: QueryStats::default() };
+                            let ran_once = s.search_once::<false>(&mut once, &q, limit).is_some();
+                            cases += 1;
+                            again += !ran_once as usize;
+                            damaged += (got != answer(&as_built.search(&q, limit).0)) as usize;
+                            let case = format!("seed {seed} damage {damage} ({n} rows, {m} slots) {limits:?} {q:?} limit {limit}");
+                            if got != read_first {
+                                failed.push(format!("{case}:\n  {got:?}\n  {read_first:?}"));
+                            } else if ran_once && once.stats.context_checks != st.stats.context_checks {
+                                counted.push(format!("{case}: {:?}, {:?}", once.stats, st.stats));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("{cases} cases, {damaged} answered otherwise than before the damage, {again} searched again");
+        assert!(failed.is_empty(), "{} of {cases} cases answered otherwise; the first:\n{}", failed.len(), failed[..failed.len().min(5)].join("\n"));
+        assert!(counted.is_empty(), "{} of {cases} cases made other context checks; the first:\n{}", counted.len(), counted[..counted.len().min(5)].join("\n"));
+        assert!(cases >= seeds as usize * 50 && damaged >= cases / 20);
+    }
+
     #[test]
     fn context_masks_distinguish_country_and_state_codes() {
         let mut names = HashMap::new();
