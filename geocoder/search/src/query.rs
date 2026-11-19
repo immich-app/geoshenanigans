@@ -970,9 +970,10 @@ mod tests {
     }
 
     /// The results of "old mill, b" (two of them) over `g`, whose POIs `three_named` are also
-    /// "Old Mil" and "Old Mills": as built, and once the rows of its POIs `unreadable` do not
-    /// read. Each of those names is one edit from "old mill".
-    fn old_mill_in_b(g: &crate::fixture::Geo, three_named: &[u32], unreadable: &[u32]) -> [Vec<u32>; 2] {
+    /// "Old Mil" and "Old Mills" (each of those names is one edit from "old mill"): as built;
+    /// then, once the rows of its POIs `unreadable` do not read, those of the search and of one
+    /// that reads every entity as it is offered.
+    fn old_mill_in_b(g: &crate::fixture::Geo, three_named: &[u32], unreadable: &[u32]) -> [Vec<u32>; 3] {
         use crate::fixture::{build_search, TempDir};
         let dir = TempDir::new("crowded-split");
         let (tsv, bin) = (dir.0.join("extra_names.tsv"), dir.0.join("extra_names.bin"));
@@ -983,12 +984,20 @@ mod tests {
         let geo = g.load(&set);
         let out = dir.0.join("idx");
         build_search(&geo, &out, Some(&bin));
-        let found = |geo: &Index| {
+        let found = |geo: &Index, read_first: bool| {
             let idx = SearchIndex::open(geo, &out, Some(bin.to_str().unwrap()), None).unwrap();
-            let (found, _) = Searcher::new(&idx).search("old mill, b", 2);
+            let s = Searcher::new(&idx);
+            let found = if read_first {
+                let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
+                s.search_once::<true>(&mut st, "old mill, b", 2).unwrap()
+            } else {
+                s.search("old mill, b", 2).0
+            };
             found.iter().map(|f| f.hit.entity).collect::<Vec<_>>()
         };
-        [found(&geo), found(&with_unreadable_pois(&set, unreadable))]
+        let built = found(&geo, false);
+        let damaged = with_unreadable_pois(&set, unreadable);
+        [built, found(&damaged, false), found(&damaged, true)]
     }
 
     #[test]
@@ -1011,12 +1020,13 @@ mod tests {
             .map(|k| g.poi("Old Milk", -1.5 - (k / 50) as f32 * 2.0, -175.0 + (k % 50) as f32 * 7.0, 127))
             .collect();
 
-        let [built, damaged] = old_mill_in_b(&g, &three_named, &many);
+        let [built, damaged, read_first] = old_mill_in_b(&g, &three_named, &many);
 
         // While the many read, they keep the one in "B" from its context check: every result
         // misses the context.
         assert_eq!(built, [lead, three_named[0] | POI_BIT]);
         assert_eq!(damaged, [inside, lead]);
+        assert_eq!(damaged, read_first);
     }
 
     #[test]
@@ -1038,12 +1048,55 @@ mod tests {
             .collect();
         let inside = g.poi("Olde Mill", 10.1, 20.1, 3) | POI_BIT;
 
-        let [built, damaged] = old_mill_in_b(&g, &three_named, &many);
+        let [built, damaged, read_first] = old_mill_in_b(&g, &three_named, &many);
 
         // While the many read, the one in "B" is pushed out with them, so it gets no context
         // check: every result misses the context. Without them there is no cut-back.
         assert_eq!(built, [three_named[0] | POI_BIT, three_named[1] | POI_BIT]);
         assert_eq!(damaged, [inside, three_named[0] | POI_BIT]);
+        assert_eq!(damaged, read_first);
+    }
+
+    #[test]
+    fn records_that_do_not_read_kept_by_a_cut_back_hide_no_context_match() {
+        let mut g = crate::fixture::Geo::default();
+        // Under "olde mill", best first: one POI of the most importance; half as many as the
+        // context checks ("the next"); then the rest of the pending candidates and one more, the
+        // first half of them of more importance than the second. The cut-back the last of them
+        // brings on keeps the one, the next and some of the first half, and drops the second.
+        // Then under "old mil", "old milk" and "old mills" POIs of three names each, every name of
+        // which scores above the next, as many names as half the pending candidates less one: no
+        // cut-back follows. Last, under "old mila", one in the boundary "B" of the least
+        // importance. The rows of the first half are made not to read.
+        g.boundary("B", 8, [10.0, 20.0, 10.2, 20.2]);
+        let lead = g.poi("Olde Mill", -30.0, -60.0, 255) | POI_BIT;
+        let at = |k: usize| (-1.0 - (k / 100) as f32, -170.0 + (k % 100) as f32 * 3.4);
+        let (n_next, half) = (MAX_CONTEXT_CHECKS / 2, (MAX_PENDING_CANDIDATES - MAX_CONTEXT_CHECKS / 2) / 2);
+        let next: Vec<u32> = (0..n_next).map(|k| g.poi("Olde Mill", at(k).0, at(k).1, 31)).collect();
+        let first_half: Vec<u32> = (n_next..n_next + half).map(|k| g.poi("Olde Mill", at(k).0, at(k).1, 15)).collect();
+        for k in n_next + half..n_next + 2 * half {
+            g.poi("Olde Mill", at(k).0, at(k).1, 7);
+        }
+        let three_named: Vec<u32> = (0..(MAX_PENDING_CANDIDATES as u32 / 2 - 1) / 3)
+            .map(|k| g.poi("Old Milk", -1.5 - (k / 50) as f32 * 2.0, -175.0 + (k % 50) as f32 * 7.0, 127))
+            .collect();
+        let inside = g.poi("Old Mila", 10.1, 20.1, 3) | POI_BIT;
+        let names = three_named.len() * 3;
+        assert!(1 + next.len() + 2 * half == MAX_PENDING_CANDIDATES + 1 && 1 + next.len() < MAX_PENDING_CANDIDATES / 2);
+        assert!(MAX_PENDING_CANDIDATES / 2 + names + 1 <= MAX_PENDING_CANDIDATES);
+        // The one, the three-named and the next are more than the context checks. A search
+        // that leaves the first half out cuts back once it has read as many names of the
+        // three-named as that half has POIs, and keeps fewer of the next than the checks have left.
+        assert!(1 + three_named.len() + next.len() > MAX_CONTEXT_CHECKS);
+        assert!(half < names && 1 + three_named.len() + (MAX_PENDING_CANDIDATES / 2 - 1 - half) < MAX_CONTEXT_CHECKS);
+
+        let [built, damaged, read_first] = old_mill_in_b(&g, &three_named, &first_half);
+
+        // While the first half reads, the context checks run out among the next: every result
+        // misses the context.
+        assert_eq!(built, [lead, three_named[0] | POI_BIT]);
+        assert_eq!(damaged, [inside, lead]);
+        assert_eq!(damaged, read_first);
     }
 
     #[test]
