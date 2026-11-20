@@ -3430,16 +3430,18 @@ impl Index {
 /// the build it holds a complete selection of, and no other file the
 /// downloader put there nor of a name a file of the build has. The
 /// downloader removes it before it writes or removes anything else in the
-/// dir and puts it back once the last of the selection is in and the files
-/// of others are gone.
+/// dir but FILE_LEDGER, and puts it back once the last of the selection is
+/// in and the files of others are gone.
 pub const BUILD_STAMP: &str = ".build_date";
 
 /// The ledger the server's downloader keeps in a continent dir of what each
 /// file there holds: lines `<name> <sha256>`, or `<name> -` where it is
 /// unknown, the last line of a name the one that counts. It names every
-/// file a download put there until one removes the file. A dir holding it
-/// but no BUILD_STAMP is one whose download did not finish, and may mix two
-/// builds' or selections' files.
+/// file a download put there until one removes the file. A download makes
+/// it, where the dir has none, before it removes BUILD_STAMP or any file:
+/// a dir holding it but no BUILD_STAMP is one whose download did not
+/// finish, and may mix two builds' or selections' files; one holding
+/// neither was laid out by other means.
 pub const FILE_LEDGER: &str = ".file_sha256";
 
 /// The file in a continent dir the server's downloader fills whose flock(2) lock (on unix, where

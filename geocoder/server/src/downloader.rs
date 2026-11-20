@@ -568,6 +568,16 @@ impl Ledger {
         Ok(())
     }
 
+    /// Makes its file where it isn't there, empty; one that is there stays
+    /// as it is. A dir holding it but no stamp is one a server leaves
+    /// unloaded (a download that did not finish), and one holding neither
+    /// one it loads (laid out by hand).
+    async fn make(&self) -> Result<(), DownloadError> {
+        tokio::fs::OpenOptions::new().create(true).append(true).open(&self.path).await
+            .map(drop)
+            .map_err(|e| DownloadError::Io(format!("write {}: {}", self.path.display(), e)))
+    }
+
     /// Rewrites it with only the last line of each name.
     async fn compact(&self) -> Result<(), DownloadError> {
         let lines: String = self.held.iter().map(|(name, sha256)| format!("{} {}\n", name, sha256.as_deref().unwrap_or("-"))).collect();
@@ -642,10 +652,12 @@ thread_local! {
 /// stays. Their lines go when the ledger is rewritten. The dir's stamp
 /// (BUILD_STAMP) says it holds a complete selection of the build it names
 /// and none of those files: a download that fetches or removes anything
-/// removes the stamp before it writes anything else, and puts it in once
-/// the last fetch is in, the ledger rewritten with a line a file of the
-/// selection; one that has nothing to fetch or remove in a dir stamped with
-/// its build writes nothing. Downloads into the dir go one at a time,
+/// makes the ledger where the dir has none, then removes the stamp, before
+/// it writes anything else (a server leaves a dir holding the ledger but no
+/// stamp unloaded, and loads one holding neither), and puts the stamp in
+/// once the last fetch is in, the ledger rewritten with a line a file of
+/// the selection; one that has nothing to fetch or remove in a dir stamped
+/// with its build writes nothing. Downloads into the dir go one at a time,
 /// across processes too, and a server loads the dir only while none runs
 /// (DOWNLOAD_LOCK). Before it reads the dir a download finishes what a
 /// decode killed part way left there (finish_leftovers), or fails, writing
@@ -719,6 +731,11 @@ pub async fn download_region(
     let changes = to_fetch || !others.is_empty();
     let stamped = tokio::fs::read_to_string(&stamp).await.is_ok_and(|s| s.trim() == cfg.build.date);
     if changes {
+        // The ledger first, where the dir has none (the first download into
+        // a dir laid out by hand): killed once the stamp or a file went, the
+        // download leaves a dir a server doesn't load, not one it takes for
+        // laid out by hand.
+        ledger.make().await?;
         match tokio::fs::remove_file(&stamp).await {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
                 return Err(DownloadError::Io(format!("remove {}: {}", stamp.display(), e)));
@@ -1392,25 +1409,31 @@ mod tests {
         assert!(!dir.join(BUILD_STAMP).exists());
     }
 
-    // The stamp goes before anything else is written: a download that can't
-    // write its ledger (a link in its place to a dir that isn't there) fails
-    // having removed the stamp, and fetched nothing.
+    // The ledger is made before the stamp or any file goes: a download that
+    // can't make its ledger (a link in its place to a dir that isn't there)
+    // fails having fetched nothing, the dir stamped with its build still and
+    // holding the files its selection doesn't take. A switch from poi tier
+    // major to none, over an older build's files.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_download_that_cant_write_its_ledger_has_removed_the_stamp_and_fetched_nothing() {
-        let s = sel("europe", "admin", "simplified", "major");
+    async fn a_download_that_cant_make_its_ledger_fails_before_it_removes_the_stamp_or_a_file() {
+        let (before, after) = (sel("europe", "admin", "simplified", "major"), sel("europe", "admin", "simplified", "none"));
         let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (theirs, _) = not_taken(&bucket, &before, &after);
         let root = ScratchDir::new();
-        older_build(&bucket, &s, root.path());
-        let ledger = root.path().join("europe").join(FILE_LEDGER);
+        older_build(&bucket, &before, root.path());
+        let dir = root.path().join("europe");
+        let ledger = dir.join(FILE_LEDGER);
         std::fs::remove_file(&ledger).unwrap();
         std::os::unix::fs::symlink("missing/ledger", &ledger).unwrap();
 
-        let failed = download(&bucket, &s, root.path()).await.map_err(|e| e.to_string());
+        let failed = download(&bucket, &after, root.path()).await.map_err(|e| e.to_string());
 
         assert!(failed.as_ref().is_err_and(|e| e.starts_with(&format!("I/O error: write {}: ", ledger.display()))), "{failed:?}");
         assert_eq!(bucket.files_served(), 0);
-        assert!(!root.path().join("europe").join(BUILD_STAMP).exists());
+        let left: Vec<&String> = theirs.iter().filter(|n| dir.join(n).exists()).collect();
+        let stamp = std::fs::read_to_string(dir.join(BUILD_STAMP)).ok();
+        assert_eq!((stamp.as_deref(), left), (Some("2025-12-01"), theirs.iter().collect()));
     }
 
     // A download into a dir that holds all of the selection, stamped with
@@ -1637,9 +1660,10 @@ mod tests {
     // A download removes the stamp, then the files the ledger names that its
     // selection doesn't take, before it fetches anything: stopped there, as a
     // kill would, it leaves the dir with no stamp, none of those files and
-    // nothing fetched; retried, it finishes. A switch from poi tier major to
-    // none, in a mode whose dir the switch fetches, and in one whose it
-    // doesn't.
+    // nothing fetched, and the ledger as it was (made only where there is
+    // none, it is never truncated); retried, it finishes. A switch from poi
+    // tier major to none, in a mode whose dir the switch fetches, and in one
+    // whose it doesn't.
     #[tokio::test]
     async fn a_download_removes_the_stamp_then_the_files_its_selection_doesnt_take_before_it_fetches() {
         let bucket = test_bucket::serve(test_bucket::template_components()).await;
@@ -1649,17 +1673,18 @@ mod tests {
             let dir = root.path().join("europe");
             download(&bucket, &before, root.path()).await.unwrap();
             let theirs: Vec<String> = files_of(&bucket, &before).into_keys().filter(|n| !files_of(&bucket, &after).contains_key(n)).collect();
-            let served = bucket.files_served();
+            let (served, ledger) = (bucket.files_served(), std::fs::read_to_string(dir.join(FILE_LEDGER)).unwrap());
             STOP_ONCE_REMOVED.set(true);
 
             let stopped = download(&bucket, &after, root.path()).await.map_err(|e| e.to_string());
             let left: Vec<&String> = theirs.iter().filter(|n| dir.join(n).exists()).collect();
             let (stamped, fetched) = (dir.join(BUILD_STAMP).exists(), bucket.files_served() - served);
+            let kept = std::fs::read_to_string(dir.join(FILE_LEDGER)).unwrap() == ledger;
             download(&bucket, &after, root.path()).await.unwrap();
 
             assert!(theirs.len() > 1 && theirs.iter().all(|n| n.starts_with("poi_") || n.starts_with("strings_poi")), "{mode}: {theirs:?}");
             assert_eq!(stopped, Err("I/O error: stopped once the files the selection doesn't take were removed".to_string()), "{mode}");
-            assert_eq!((left, stamped, fetched), (Vec::<&String>::new(), false, 0), "{mode}");
+            assert_eq!((left, stamped, fetched, kept), (Vec::<&String>::new(), false, 0, true), "{mode}");
             assert_eq!(differing(&held(&dir), &files_of(&bucket, &after)), Vec::<String>::new(), "{mode}");
         }
     }
@@ -1739,6 +1764,46 @@ mod tests {
         let mut want = files_of(&bucket, &after);
         want.extend(unknown);
         assert_eq!(differing(&held(&dir), &want), Vec::<String>::new());
+    }
+
+    /// Why a server leaves the continent dir of `region` under the data dir
+    /// `root` unloaded, if it does: the error of a hot-add of it, which checks
+    /// and loads the dir as a server starting does (load_continent).
+    fn left_unloaded(root: &Path, region: &str) -> Option<String> {
+        let mi = query_server::MultiIndex::load(root.to_str().unwrap(), query_server::DEFAULT_STREET_CELL_LEVEL, query_server::DEFAULT_ADMIN_CELL_LEVEL, query_server::DEFAULT_SEARCH_DISTANCE).unwrap();
+        mi.install_region(region).err()
+    }
+
+    // The first download into a dir without a ledger (laid out by hand, as
+    // the test portal lays dirs out: no stamp nor ledger, and a server loads
+    // it) makes the ledger before it removes the stamp or any file. Stopped
+    // once it removed the files its selection doesn't take, as a kill would,
+    // it leaves the ledger and no stamp, and a server leaves the continent
+    // unloaded as one whose download did not finish, before it maps a file,
+    // rather than load the dir half switched (here without its POI files, a
+    // group Index::load takes as absent). Retried, it finishes.
+    #[tokio::test]
+    async fn a_first_download_into_a_dir_without_a_ledger_makes_it_before_it_removes_a_file() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (before, after) = (sel("europe", "admin", "simplified", "major"), sel("europe", "admin", "simplified", "none"));
+        let (theirs, _) = not_taken(&bucket, &before, &after);
+        let root = ScratchDir::new();
+        let dir = root.path().join("europe");
+        download(&bucket, &before, root.path()).await.unwrap();
+        std::fs::remove_file(dir.join(FILE_LEDGER)).unwrap();
+        std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap();
+        STOP_ONCE_REMOVED.set(true);
+
+        let stopped = download(&bucket, &after, root.path()).await.map_err(|e| e.to_string());
+        let left: Vec<&String> = theirs.iter().filter(|n| dir.join(n).exists()).collect();
+        let (ledger, stamped) = (dir.join(FILE_LEDGER).exists(), dir.join(BUILD_STAMP).exists());
+        let why = left_unloaded(root.path(), "europe");
+        download(&bucket, &after, root.path()).await.unwrap();
+
+        let unfinished = format!("it holds {FILE_LEDGER} but no {BUILD_STAMP}: a download that did not finish");
+        assert_eq!(stopped, Err("I/O error: stopped once the files the selection doesn't take were removed".to_string()));
+        assert_eq!((left, ledger, stamped, why), (Vec::<&String>::new(), true, false, Some(unfinished)), "a server takes the dir for one laid out by hand");
+        assert_eq!(differing(&held(&dir), &files_of(&bucket, &after)), Vec::<String>::new());
     }
 
     /// The dir of a decode into a region dir (transport::decode_into_dir) of

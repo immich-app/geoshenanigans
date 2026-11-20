@@ -84,10 +84,12 @@ selection doesn't take (another selection's or build's) that the ledger names,
 or whose names files of the build have, the ledger naming them or not; files of
 other names stay. The dir names its build in `.build_date` once a whole
 selection of it is in and those are gone; a download that fetches or removes
-anything removes it first. Before it reads the dir a download finishes what a
-transport decode killed part way left there (PATCHING.md), which would
-otherwise put back the files the decode replaced once the download had listed
-the files to remove; one it can't finish fails the download.
+anything removes it first, once it has made the ledger where the dir has none
+(a dir holding neither was laid out by hand, and a server loads it). Before it
+reads the dir a download finishes what a transport decode killed part way left
+there (PATCHING.md), which would otherwise put back the files the decode
+replaced once the download had listed the files to remove; one it can't finish
+fails the download.
 Downloads into a dir go one at a time, those of other servers on the data dir
 too: each holds a lock on the dir's `.download.lock`. A server checks and
 loads a dir, when it starts and once its own download into the dir is in,
