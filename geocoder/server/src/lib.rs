@@ -3461,7 +3461,8 @@ pub const DOWNLOAD_LOCK: &str = ".download.lock";
 /// What takes a continent dir's DOWNLOAD_LOCK.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockFor {
-    /// A download, which writes the dir: an exclusive lock.
+    /// A download, which writes the dir: an exclusive lock, on the file open to write or, where
+    /// this process can't write it, open to read (take_download_lock).
     Download,
     /// A load, which reads the dir: a shared lock. Where the file isn't there and can't be made,
     /// as the dir is read-only or not writable to this process, the dir loads without a lock: no
@@ -3473,18 +3474,30 @@ pub enum LockFor {
 /// Takes the download lock of the continent dir `dir` (DOWNLOAD_LOCK) for `what`, the file made
 /// where it isn't there, waiting while another holds it where they can't share it. None where
 /// no lock is taken: on a file system without locks, on platforms other than unix, and for a load
-/// where the file isn't there and can't be made (cant_make_files_in). The lock is held until the
-/// file returned is dropped.
+/// where the file isn't there and can't be made (cant_write). A download opens the file to read
+/// and write; where it can't write it (a lock file a load of another user's server made, of mode
+/// 0644 under umask 022, or one on a read-only mount), it opens it to read and takes the lock on
+/// that, which a local file system allows. One whose file system takes an exclusive lock only on
+/// a file open to write (NFS) then fails, saying so. The lock is held until the file returned is
+/// dropped.
 #[cfg(unix)]
 pub fn take_download_lock(dir: &std::path::Path, what: LockFor) -> std::io::Result<Option<File>> {
     let path = dir.join(DOWNLOAD_LOCK);
-    let file = match what {
-        LockFor::Download => File::options().write(true).create(true).truncate(false).open(&path)?,
+    let (file, read_only) = match what {
+        LockFor::Download => match File::options().read(true).write(true).create(true).truncate(false).open(&path) {
+            Ok(file) => (file, false),
+            Err(e) if cant_write(&e) => match File::open(&path) {
+                Ok(file) => (file, true),
+                Err(n) if n.kind() == std::io::ErrorKind::NotFound => return Err(e),
+                Err(n) => return Err(n),
+            },
+            Err(e) => return Err(e),
+        },
         LockFor::Load => match open_or_make(&path) {
-            Ok(file) => file,
+            Ok(file) => (file, true),
             // Another process may have made it meanwhile.
-            Err(e) if cant_make_files_in(&e) => match File::open(&path) {
-                Ok(file) => file,
+            Err(e) if cant_write(&e) => match File::open(&path) {
+                Ok(file) => (file, true),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(e) => return Err(e),
             },
@@ -3493,16 +3506,33 @@ pub fn take_download_lock(dir: &std::path::Path, what: LockFor) -> std::io::Resu
     };
     loop {
         let taken = match what {
-            LockFor::Download => file.lock(),
+            LockFor::Download => lock_exclusive(&file),
             LockFor::Load => file.lock_shared(),
         };
         match taken {
             Ok(()) => return Ok(Some(file)),
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e) if transport::no_locks_here(&e) => return Ok(None),
+            // Where flock(2) is a lock of a byte range (NFS), an exclusive one needs the file
+            // open to write.
+            Err(e) if what == LockFor::Download && read_only && e.raw_os_error() == Some(libc::EBADF) => {
+                return Err(std::io::Error::new(e.kind(), format!(
+                    "the lock file isn't writable to this server, and this file system takes an exclusive lock only on a file open to write ({}): make it writable to every server that downloads into the dir",
+                    e)));
+            }
             Err(e) => return Err(e),
         }
     }
+}
+
+/// Takes an exclusive flock on `file`, waiting while another holds a lock on it.
+#[cfg(unix)]
+fn lock_exclusive(file: &File) -> std::io::Result<()> {
+    #[cfg(test)]
+    if let Some(errno) = DOWNLOAD_LOCK_FAULT.take() {
+        return Err(std::io::Error::from_raw_os_error(errno));
+    }
+    file.lock()
 }
 
 #[cfg(not(unix))]
@@ -3525,10 +3555,10 @@ fn open_or_make(path: &std::path::Path) -> std::io::Result<File> {
     File::options().read(true).custom_flags(libc::O_CREAT).open(path)
 }
 
-/// Whether `e`, an error making a file, says its dir is read-only (EROFS) or not writable to
-/// this process (EACCES, EPERM).
+/// Whether `e`, an error making a file or opening one to write, says the file system is
+/// read-only (EROFS) or the dir or the file isn't writable to this process (EACCES, EPERM).
 #[cfg(unix)]
-fn cant_make_files_in(e: &std::io::Error) -> bool {
+fn cant_write(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::EROFS | libc::EACCES | libc::EPERM))
 }
 
@@ -3584,6 +3614,9 @@ thread_local! {
     /// make a dir's DOWNLOAD_LOCK where it isn't there, as it would in a dir
     /// that is read-only or not writable to it.
     static LOCK_FILE_UNMADE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    /// Set by a test: the errno with which the next exclusive lock a download
+    /// on this thread takes on a dir's DOWNLOAD_LOCK fails, once.
+    static DOWNLOAD_LOCK_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
 /// The index in the continent dir `dir`, for a server starting
@@ -7325,6 +7358,72 @@ mod query_path_tests {
         let (early, _) = loaded_continents_meanwhile(root.path(), std::time::Duration::from_secs(10), || drop(other));
 
         assert_eq!(early, Some(vec!["asia", "europe"]));
+    }
+
+    // A load makes the lock file where it isn't there, of mode 0644 under
+    // umask 022, and a server of another user can't open it to write,
+    // though the dir is writable to both (here through its group). Its
+    // download opens the file to read and takes the exclusive lock on that,
+    // which a local file system allows: a try at the lock from another open
+    // fails while the download holds it, and takes it after; the file stays
+    // as it was. Where the file system takes an exclusive lock only on a
+    // file open to write (NFS), the download fails, saying the lock file is
+    // to be writable to every server that downloads into the dir: that
+    // error is the seam's (DOWNLOAD_LOCK_FAULT). Run as root, the dir and
+    // the lock file are another user's and the lock is taken on a thread
+    // whose file system uid is nobody's and gid the dir's group, which
+    // takes root's power over modes away; else the lock file is this
+    // user's, of mode 0444.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_download_takes_its_lock_on_a_lock_file_it_cant_write() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        const OTHER: u32 = 65533;
+        const NOBODY: u32 = 65534;
+        const NOGROUP: u32 = 65534;
+        let dir = ScratchDir::new();
+        let lock = dir.path().join(DOWNLOAD_LOCK);
+        File::create(&lock).unwrap();
+        let as_root = unsafe { libc::geteuid() } == 0;
+        if as_root {
+            for (path, mode) in [(&lock, 0o644), (&dir.path().to_path_buf(), 0o775)] {
+                std::os::unix::fs::chown(path, Some(OTHER), Some(NOGROUP)).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+        } else {
+            std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+        let was = std::fs::metadata(&lock).unwrap();
+        let free = || File::open(&lock).unwrap().try_lock_shared().is_ok();
+
+        let (can, took, free_while, nfs) = std::thread::scope(|s| {
+            s.spawn(|| {
+                if as_root {
+                    // Each returns the id it had: the second call tells the first took.
+                    unsafe { libc::syscall(libc::SYS_setfsgid, NOGROUP) };
+                    assert_eq!(unsafe { libc::syscall(libc::SYS_setfsgid, NOGROUP) }, NOGROUP as libc::c_long);
+                    unsafe { libc::syscall(libc::SYS_setfsuid, NOBODY) };
+                    assert_eq!(unsafe { libc::syscall(libc::SYS_setfsuid, NOBODY) }, NOBODY as libc::c_long);
+                }
+                // It makes files in the dir, and can't write the lock file.
+                let can = (File::create(dir.path().join("made")).is_ok(), File::options().write(true).open(&lock).is_ok());
+                let taken = take_download_lock(dir.path(), LockFor::Download);
+                let free_while = free();
+                let took = taken.map(|file| file.is_some()).map_err(|e| e.to_string());
+                DOWNLOAD_LOCK_FAULT.set(Some(libc::EBADF));
+                let nfs = take_download_lock(dir.path(), LockFor::Download).map(|file| file.is_some()).map_err(|e| e.to_string());
+                DOWNLOAD_LOCK_FAULT.set(None);
+                (can, took, free_while, nfs)
+            })
+            .join()
+            .unwrap()
+        });
+
+        assert_eq!((can, took, free_while), ((true, false), Ok(true), false));
+        assert!(free());
+        let now = std::fs::metadata(&lock).unwrap();
+        assert_eq!((now.ino(), now.uid(), now.mode(), now.len()), (was.ino(), was.uid(), was.mode(), 0));
+        assert_eq!(nfs, Err("the lock file isn't writable to this server, and this file system takes an exclusive lock only on a file open to write (Bad file descriptor (os error 9)): make it writable to every server that downloads into the dir".to_string()));
     }
 
     /// A MultiIndex of two_continents() whose europe isn't loaded, as a
