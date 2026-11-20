@@ -30,7 +30,7 @@ tokio-stream = "0.1"
 memmap2 = "0.9"
 libc = "0.2"
 rustls-acme = { version = "0.15", features = ["axum"] }
-axum-server = "0.8"
+axum-server = "0.9"
 bcrypt = "0.19"
 getrandom = "0.4"
 arc-swap = "1"
