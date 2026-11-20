@@ -646,11 +646,11 @@ impl Staging {
 
     /// Takes the install lock on `dir` again, waiting while another decode holds it, and finishes
     /// what decodes that are gone left (finish_leftovers), before its members go in place: a
-    /// decode killed while it put its members in is undone before any later decode puts its own
-    /// in, never after. A lock that fails fails it, whatever the error (install_lock_again): no
-    /// member goes in. So does a leftover it can't finish that would put back a file over one of
-    /// `members` once finished (or of which it can't tell), or a `dir` it can't read. The lock is
-    /// held until this is dropped. Nothing where decodes take no locks.
+    /// decode killed while it put its members in is finished before any later decode puts its
+    /// own in, never after. A lock that fails fails it, whatever the error (install_lock_again):
+    /// no member goes in. So does a leftover it can't finish that would put back a file over one
+    /// of `members` once finished (or of which it can't tell), or a `dir` it can't read. The lock
+    /// is held until this is dropped. Nothing where decodes take no locks.
     fn install(&mut self, dir: &Path, members: &[Member]) -> io::Result<()> {
         if !self.locks {
             return Ok(());

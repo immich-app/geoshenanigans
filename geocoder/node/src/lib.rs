@@ -189,11 +189,14 @@ const QUEUED_CHUNKS: usize = 8;
 /// unit decoded and every file is of its sha256, it moves them all into place and `finish`
 /// resolves. On unix a decoder takes the dir's install lock before it starts and again before it
 /// moves its files in, each time first finishing what decoders killed in the dir left, so that
-/// decoders move their files in one at a time and one killed part way is undone before any later
-/// one moves its files in; meanwhile it decodes as others do. A unit that fails (cut short,
-/// refused, a file of another sha256, one that can't go in place, a killed decoder's dir that
-/// can't be finished and would put a file back over one of its files) leaves the dir as it was
-/// once those were finished; a download that broke off should still `finish`, which then
+/// decoders move their files in one at a time and one killed part way is finished before any
+/// later one moves its files in; meanwhile it decodes as others do. Finishing one killed while it
+/// moved its files in puts back each file it replaced, but a file it moved in that replaced none
+/// stays, complete and of its sha256: the dir then holds some of that unit's files without the
+/// rest, until the unit is decoded into it again or those files are removed. A unit that fails
+/// (cut short, refused, a file of another sha256, one that can't go in place, a killed decoder's
+/// dir that can't be finished and would put a file back over one of its files) leaves the dir as
+/// it was once those were finished; a download that broke off should still `finish`, which then
 /// rejects.
 /// Decoders of one unit into a dir at once on one machine each put complete files in place, the
 /// later's standing. On a file system without locks decoders take none, and finish nothing; a
