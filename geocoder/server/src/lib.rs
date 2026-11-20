@@ -3664,6 +3664,8 @@ impl MultiIndex {
     /// once this server's download let go of the dir, and the dir is read
     /// once that one ended, and loaded only where it finished. Else, or
     /// where the dir holds no admin_cells.bin, an error, the slot as it was.
+    /// It blocks as long as that download runs: an async caller runs it on a
+    /// thread of its own (spawn_blocking), not on one of the runtime's.
     pub fn install_region(&self, name: &str) -> Result<(), String> {
         let slot = self.continents.iter().find(|c| c.name == name)
             .ok_or_else(|| format!("unknown continent: {}", name))?;

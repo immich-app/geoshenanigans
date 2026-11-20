@@ -34,6 +34,13 @@ use query_server::MultiIndex;
 /// never re-resolved would 404 on every new download from day 4.
 const CONFIGURATIONS_TTL: Duration = Duration::from_secs(3600);
 
+#[cfg(test)]
+thread_local! {
+    /// Set by a test: run by the next ensure_loaded on this thread once its
+    /// download is in, before it loads the region dir, which it is given.
+    static ONCE_DOWNLOADED: std::cell::Cell<Option<Box<dyn FnOnce(&std::path::Path)>>> = const { std::cell::Cell::new(None) };
+}
+
 /// The selection a server downloads. A mode, quality or poi_tier its build
 /// has no component for fails each download, naming the values the build
 /// offers; a PUT naming one is refused when the build's manifest is at hand.
@@ -248,9 +255,18 @@ impl RegionState {
             },
         ).await?;
 
+        #[cfg(test)]
+        if let Some(meanwhile) = ONCE_DOWNLOADED.take() {
+            meanwhile(&self.root_dir.join(region));
+        }
         // Another server's download into the dir may begin once this one let
-        // go of it: the dir loads once that one ended, where it finished.
-        self.multi_index.install_region(region)
+        // go of it: the dir loads once that one ended, where it finished. The
+        // load waits for it on a thread of its own, not on one of the
+        // runtime's, which answer the queries meanwhile.
+        let (multi_index, name) = (self.multi_index.clone(), region.to_string());
+        tokio::task::spawn_blocking(move || multi_index.install_region(&name))
+            .await
+            .map_err(|e| DownloadError::Io(format!("load task: {}", e)))?
             .map_err(DownloadError::UnknownRegion)?;
         Ok(())
     }
@@ -261,6 +277,7 @@ mod tests {
     use super::*;
     use crate::scratch_dir::ScratchDir;
     use crate::test_bucket;
+    use query_server::DOWNLOAD_LOCK;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct FakeBucket {
@@ -396,5 +413,43 @@ mod tests {
         let fine = Configuration { quality: "fine".into(), ..state.get_configuration().await };
         state.set_configuration(fine).await.unwrap();
         assert_eq!(state.get_configuration().await.quality, "fine");
+    }
+
+    // Once its download is in, a server loads the region dir under a shared
+    // lock on its DOWNLOAD_LOCK, which waits while a download of another
+    // server on the data dir holds the lock. It waits on a thread of its
+    // own, and the runtime's threads go on with other tasks meanwhile. Here
+    // another open takes the lock as the download let go of it and keeps it
+    // a second, on a runtime of one thread: a task due in 100 ms runs while
+    // the lock is held, and the load returns once it was let go of.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_load_waiting_for_another_servers_download_leaves_the_runtime_free() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (_root, state) = state_for(bucket.url.clone(), Duration::from_secs(3600)).await;
+        let meanwhile = Arc::new(std::sync::Mutex::new(None));
+        let started = meanwhile.clone();
+        ONCE_DOWNLOADED.set(Some(Box::new(move |dir: &std::path::Path| {
+            let other = std::fs::File::open(dir.join(DOWNLOAD_LOCK)).unwrap();
+            other.lock().unwrap();
+            let let_go = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(1));
+                let at = Instant::now();
+                drop(other);
+                at
+            });
+            let ticked = tokio::spawn(async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                Instant::now()
+            });
+            *started.lock().unwrap() = Some((let_go, ticked));
+        })));
+
+        let got = state.ensure_loaded("europe").await.map_err(|e| e.to_string());
+        let returned = Instant::now();
+
+        let (let_go, ticked) = meanwhile.lock().unwrap().take().expect("the download is in");
+        let (let_go, ticked) = (let_go.join().unwrap(), ticked.await.unwrap());
+        assert_eq!((ticked < let_go, let_go < returned), (true, true), "{got:?}");
     }
 }
