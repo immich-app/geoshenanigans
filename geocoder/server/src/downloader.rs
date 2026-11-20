@@ -704,6 +704,10 @@ pub async fn download_region(
         .map_err(|e| DownloadError::Io(format!("mkdir {}: {}", region_dir.display(), e)))?;
     // Held until the download returns.
     let _lock = download_lock(&region_dir).await?;
+    // The only change to the dir's files before the ledger is made and the
+    // stamp removed: the leftovers are those of decodes a download ran once
+    // it had done both, in a dir that holds the ledger and no stamp since,
+    // which no server loads.
     finish_leftovers(&region_dir).await?;
 
     let stamp = region_dir.join(BUILD_STAMP);
@@ -734,7 +738,10 @@ pub async fn download_region(
         // The ledger first, where the dir has none (the first download into
         // a dir laid out by hand): killed once the stamp or a file went, the
         // download leaves a dir a server doesn't load, not one it takes for
-        // laid out by hand.
+        // laid out by hand. Both before any file changes: a server that
+        // loads the dir without its lock (one that can't make the lock file)
+        // tells by the ledger made or the stamp gone that a download ran
+        // while it loaded (DirMarks in lib.rs).
         ledger.make().await?;
         match tokio::fs::remove_file(&stamp).await {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
@@ -792,6 +799,10 @@ pub async fn download_region(
 
     if changes || !stamped {
         ledger.compact().await?;
+        // A new file renamed into place, never the one there written again:
+        // a server loading the dir without its lock tells it from the stamp
+        // it found by its inode, should the download run all through while
+        // it loaded.
         write_whole(&stamp, cfg.build.date.as_bytes()).await?;
     }
     Ok(())

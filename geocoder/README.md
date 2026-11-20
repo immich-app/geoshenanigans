@@ -98,7 +98,12 @@ that it waits for a download into the dir (another server's) to end and loads
 what it left, and the first download into a dir waits for it; after its own
 download it waits on a thread of its own, and answers queries meanwhile. A
 dir it can't make the file in (read-only, or not writable to it) loads
-without a lock. A server that finds a ledger but no stamp in a dir leaves that
+without a lock. A download changes the dir's `.build_date` or `.file_sha256`
+before any other file, and writes them by appending or by renaming a new file
+into place: a server notes both (device, inode, size and modification time)
+before it checks a dir and again once it loaded it, and where they differ, a
+download ran meanwhile, it drops what it loaded and says so, the continent
+left unloaded. A server that finds a ledger but no stamp in a dir leaves that
 continent unloaded until a query or a preload finishes its download. Queries
 need an API key from the dashboard (see Authentication below).
 

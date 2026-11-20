@@ -3431,7 +3431,8 @@ impl Index {
 /// downloader put there nor of a name a file of the build has. The
 /// downloader removes it before it writes or removes anything else in the
 /// dir but FILE_LEDGER, and puts it back once the last of the selection is
-/// in and the files of others are gone.
+/// in and the files of others are gone, a new file renamed into place: a
+/// load that takes no lock tells by it that a download ran (DirMarks).
 pub const BUILD_STAMP: &str = ".build_date";
 
 /// The ledger the server's downloader keeps in a continent dir of what each
@@ -3441,7 +3442,8 @@ pub const BUILD_STAMP: &str = ".build_date";
 /// it, where the dir has none, before it removes BUILD_STAMP or any file:
 /// a dir holding it but no BUILD_STAMP is one whose download did not
 /// finish, and may mix two builds' or selections' files; one holding
-/// neither was laid out by other means.
+/// neither was laid out by other means. A download appends to it or renames
+/// a new one over it, and never writes it in place.
 pub const FILE_LEDGER: &str = ".file_sha256";
 
 /// The file in a continent dir the server's downloader fills whose flock(2) lock (on unix, where
@@ -3451,8 +3453,9 @@ pub const FILE_LEDGER: &str = ".file_sha256";
 /// holds a shared one from before it checks the dir's BUILD_STAMP until it has loaded the dir.
 /// Each makes it where it isn't there, and never truncates it, so that a load and the first
 /// download into a dir lock the same file. Downloads go one at a time, and no server loads a dir
-/// while a download changes its files. Not the dir itself, which its transport decodes lock
-/// (the install lock).
+/// while a download changes its files (one that can't make the file loads without a lock, and
+/// drops what it loaded where a download ran meanwhile: LockFor::Load). Not the dir itself,
+/// which its transport decodes lock (the install lock).
 pub const DOWNLOAD_LOCK: &str = ".download.lock";
 
 /// What takes a continent dir's DOWNLOAD_LOCK.
@@ -3462,7 +3465,8 @@ pub enum LockFor {
     Download,
     /// A load, which reads the dir: a shared lock. Where the file isn't there and can't be made,
     /// as the dir is read-only or not writable to this process, the dir loads without a lock: no
-    /// download of this process can write there either.
+    /// download of this process can write there either. A download of another process that can
+    /// may run meanwhile, which the load tells by the dir's stamp and ledger (DirMarks).
     Load,
 }
 
@@ -3528,23 +3532,46 @@ fn cant_make_files_in(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::EROFS | libc::EACCES | libc::EPERM))
 }
 
-/// Why the continent dir `dir` is left unloaded, if it is: it holds
-/// FILE_LEDGER but not BUILD_STAMP, a download that did not finish, or
-/// either can't be checked. A dir holding neither was laid out by other
-/// means (by hand, by the test portal) and loads.
-fn unfinished_download(dir: &str) -> Option<String> {
-    let there = |name: &str| {
-        let path = format!("{}/{}", dir, name);
-        match std::fs::metadata(&path) {
-            Ok(_) => Ok(true),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(e) => Err(format!("can't check {}: {}", path, e)),
+/// A continent dir's BUILD_STAMP and FILE_LEDGER as a load finds them: each
+/// None where it isn't there, else its device and FileStamp (inode, size,
+/// modification time). A download that changes a file in the dir changes
+/// one of them first: it makes the ledger where the dir has none, and
+/// removes the stamp. It appends to the ledger or renames a new one over
+/// it, and writes the stamp only under a temp name renamed into place, a
+/// new inode. So a load that finds them the same before it checks the dir
+/// and once it loaded it knows no download changed the dir meanwhile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirMarks {
+    stamp: Option<(u64, FileStamp)>,
+    ledger: Option<(u64, FileStamp)>,
+}
+
+impl DirMarks {
+    /// Those of the continent dir `dir`, or why either can't be checked.
+    fn of(dir: &str) -> Result<DirMarks, String> {
+        let mark = |name: &str| {
+            let path = format!("{}/{}", dir, name);
+            match std::fs::metadata(&path) {
+                #[cfg(unix)]
+                Ok(m) => Ok(Some((std::os::unix::fs::MetadataExt::dev(&m), FileStamp::of(&m)))),
+                #[cfg(not(unix))]
+                Ok(m) => Ok(Some((0, FileStamp::of(&m)))),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(format!("can't check {}: {}", path, e)),
+            }
+        };
+        Ok(DirMarks { stamp: mark(BUILD_STAMP)?, ledger: mark(FILE_LEDGER)? })
+    }
+
+    /// Why a dir of these is left unloaded, if it is: it holds FILE_LEDGER
+    /// but not BUILD_STAMP, a download that did not finish. A dir holding
+    /// neither was laid out by other means (by hand, by the test portal) and
+    /// loads.
+    fn unfinished_download(&self) -> Option<String> {
+        match (self.stamp, self.ledger) {
+            (None, Some(_)) => Some(format!("it holds {} but no {}: a download that did not finish", FILE_LEDGER, BUILD_STAMP)),
+            _ => None,
         }
-    };
-    match (there(BUILD_STAMP), there(FILE_LEDGER)) {
-        (Err(why), _) | (_, Err(why)) => Some(why),
-        (Ok(false), Ok(true)) => Some(format!("it holds {} but no {}: a download that did not finish", FILE_LEDGER, BUILD_STAMP)),
-        _ => None,
     }
 }
 
@@ -3568,12 +3595,19 @@ thread_local! {
 /// read and held until Index::load returned, which waits for that download
 /// to end and keeps the next from starting until the load returned. The
 /// lock file is made where it isn't there, so that the first download into
-/// a dir waits for a load too. The files stay mapped after. None for a dir
-/// that isn't there or holds no admin_cells.bin. An
-/// error, why the dir doesn't load, for a lock that can't be taken, a
-/// download that broke off (unfinished_download): it can leave files of a
-/// build or selection beside those of the one before, which Index::load
-/// can't tell apart; and for a dir Index::load refuses.
+/// a dir waits for a load too. Where no lock is taken (the lock file can't
+/// be made, the file system has no locks) such a download may run all the
+/// same: the dir's stamp and ledger (DirMarks) are found before it is
+/// checked and again once Index::load returned, and a load that finds them
+/// changed is dropped. That holds where the lock is taken too: a download
+/// on a file system whose locks don't reach other machines may not see it,
+/// and the check costs a few stats. The files stay mapped after. None for
+/// a dir that isn't there or holds no admin_cells.bin. An error, why the
+/// dir doesn't load, for a lock that can't be taken, a download that broke
+/// off (unfinished_download): it can leave files of a build or selection
+/// beside those of the one before, which Index::load can't tell apart; for
+/// a dir Index::load refuses; and for one a download changed while it
+/// loaded.
 fn load_continent(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Option<Index>, String> {
     // A dir that isn't there holds nothing to load, and gets no lock file.
     if !std::path::Path::new(dir).is_dir() {
@@ -3584,7 +3618,8 @@ fn load_continent(dir: &str, street_cell_level: u64, admin_cell_level: u64, sear
     if !std::path::Path::new(&format!("{}/admin_cells.bin", dir)).exists() {
         return Ok(None);
     }
-    if let Some(why) = unfinished_download(dir) {
+    let marks = DirMarks::of(dir)?;
+    if let Some(why) = marks.unfinished_download() {
         return Err(why);
     }
     #[cfg(test)]
@@ -3593,7 +3628,13 @@ fn load_continent(dir: &str, street_cell_level: u64, admin_cell_level: u64, sear
             tell(dir);
         }
     });
-    Index::load(dir, street_cell_level, admin_cell_level, search_distance).map(Some)
+    let index = Index::load(dir, street_cell_level, admin_cell_level, search_distance)?;
+    // Dropped here, unmapped, where a download changed the dir meanwhile:
+    // its files may be of two selections.
+    if DirMarks::of(dir)? != marks {
+        return Err(format!("a download into it ran while it loaded ({} or {} changed): it may mix two selections' files", BUILD_STAMP, FILE_LEDGER));
+    }
+    Ok(Some(index))
 }
 
 pub struct ContinentSlot {
@@ -7145,6 +7186,128 @@ mod query_path_tests {
             std::fs::set_permissions(&europe, std::fs::Permissions::from_mode(0o755)).unwrap();
             assert_eq!((loaded, europe.join(DOWNLOAD_LOCK).exists()), (both, false));
         }
+    }
+
+    /// Whether load_continent loads europe of two_continents(), stamped with
+    /// its ledger beside as a finished download leaves it (or holding neither,
+    /// laid out by hand, where `by_hand`), or why not, when `meanwhile` runs
+    /// on the dir once its stamp and ledger were checked, before Index::load:
+    /// as a download into it of another server on the data dir would, that
+    /// the load doesn't keep out. Where `lock_free` the dir's lock file isn't
+    /// there and can't be made (EROFS, the seam's: LOCK_FILE_UNMADE), and the
+    /// load takes no lock; else it holds the lock, and `meanwhile` is a
+    /// download that doesn't see it.
+    #[cfg(unix)]
+    fn europe_loads_while(by_hand: bool, lock_free: bool, meanwhile: impl FnOnce(&std::path::Path) + 'static) -> Result<bool, String> {
+        let root = two_continents();
+        let europe = root.path().join("europe");
+        if !by_hand {
+            std::fs::write(europe.join(FILE_LEDGER), "admin_cells.bin -\n").unwrap();
+            std::fs::write(europe.join(BUILD_STAMP), "2026-01-01").unwrap();
+        }
+        let mut meanwhile = Some(meanwhile);
+        BEFORE_INDEX_LOAD.set(Some(Box::new(move |dir: &str| {
+            if let Some(run) = meanwhile.take() {
+                run(std::path::Path::new(dir));
+            }
+        })));
+        LOCK_FILE_UNMADE.set(lock_free.then_some(libc::EROFS));
+        let got = load_continent(europe.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE).map(|idx| idx.is_some());
+        LOCK_FILE_UNMADE.set(None);
+        BEFORE_INDEX_LOAD.set(None);
+        assert_eq!(europe.join(DOWNLOAD_LOCK).exists(), !lock_free);
+        got
+    }
+
+    /// Writes the files of another selection into `dir` as a download puts
+    /// them in place: each a new file renamed over the one before.
+    #[cfg(unix)]
+    fn another_selection(dir: &std::path::Path) {
+        let mut moved = TestIndex::new();
+        moved.place("Newtown", 2, -20_000.0, 0.0);
+        moved.write(dir);
+    }
+
+    /// Why load_continent leaves a dir unloaded that a download changed while
+    /// it loaded.
+    #[cfg(unix)]
+    fn changed_while_it_loaded() -> String {
+        format!("a download into it ran while it loaded ({BUILD_STAMP} or {FILE_LEDGER} changed): it may mix two selections' files")
+    }
+
+    // A server that can't make a continent dir's lock file (a read-only
+    // dir, or one not writable to it) loads the dir without a lock, and a
+    // download into it of another server on the data dir, which can write
+    // there, may make the lock file, remove the stamp and replace the files
+    // while it maps them. Such a download makes the ledger where the dir has
+    // none, and removes the stamp, before it changes a file: a load that
+    // finds either changed once Index::load returned drops what it loaded,
+    // and the continent stays unloaded, for a later load. One that finds
+    // both as they were keeps it.
+    #[cfg(unix)]
+    #[test]
+    fn a_continent_dir_a_download_changed_while_it_loaded_without_a_lock_is_left_unloaded() {
+        let got = [
+            ("nothing changed", europe_loads_while(false, true, |_| {})),
+            ("nothing changed, laid out by hand", europe_loads_while(true, true, |_| {})),
+            ("the stamp removed, the files replaced", europe_loads_while(false, true, |dir| {
+                std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap();
+                another_selection(dir);
+            })),
+            ("the ledger made, laid out by hand", europe_loads_while(true, true, |dir| {
+                std::fs::write(dir.join(FILE_LEDGER), "").unwrap();
+                another_selection(dir);
+            })),
+        ];
+
+        let changed = changed_while_it_loaded();
+        assert_eq!(got, [
+            ("nothing changed", Ok(true)),
+            ("nothing changed, laid out by hand", Ok(true)),
+            ("the stamp removed, the files replaced", Err(changed.clone())),
+            ("the ledger made, laid out by hand", Err(changed)),
+        ]);
+    }
+
+    // A server starting tells the stamp it found from one a download wrote
+    // since by more than its being there: a download that ran all through
+    // while the dir loaded removed it and wrote it again, by rename, a new
+    // inode, though of the same bytes. Here of the same modification time
+    // too.
+    #[cfg(unix)]
+    #[test]
+    fn a_continent_dir_whose_stamp_was_written_again_while_it_loaded_is_left_unloaded() {
+        use std::os::unix::fs::MetadataExt;
+        let got = europe_loads_while(false, true, |dir| {
+            let stamp = dir.join(BUILD_STAMP);
+            let was = std::fs::metadata(&stamp).unwrap();
+            // Made while the old one is there: another inode.
+            let tmp = dir.join(format!("{BUILD_STAMP}.tmp"));
+            std::fs::write(&tmp, std::fs::read(&stamp).unwrap()).unwrap();
+            std::fs::remove_file(&stamp).unwrap();
+            another_selection(dir);
+            File::options().write(true).open(&tmp).unwrap().set_modified(was.modified().unwrap()).unwrap();
+            std::fs::rename(&tmp, &stamp).unwrap();
+            let now = std::fs::metadata(&stamp).unwrap();
+            assert!(now.ino() != was.ino() && (now.dev(), now.len(), now.modified().unwrap()) == (was.dev(), was.len(), was.modified().unwrap()));
+        });
+
+        assert_eq!(got, Err(changed_while_it_loaded()));
+    }
+
+    // A load that holds the lock checks the stamp and ledger again too: a
+    // download that doesn't see its lock (on a file system whose locks don't
+    // reach other machines, or one without locks, where none is taken) may
+    // run all the same.
+    #[cfg(unix)]
+    #[test]
+    fn a_continent_dir_a_download_changed_while_it_loaded_under_its_lock_is_left_unloaded() {
+        let got = europe_loads_while(false, false, |dir| {
+            std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap();
+            another_selection(dir);
+        });
+
+        assert_eq!(got, Err(changed_while_it_loaded()));
     }
 
     // Servers starting on one data dir load a continent dir at once: the
