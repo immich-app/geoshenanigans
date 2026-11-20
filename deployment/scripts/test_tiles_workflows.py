@@ -1274,5 +1274,26 @@ class WorkerHostnameTest(unittest.TestCase):
             self.assertEqual(read(summary), "- https://tiles.prod.immich.cloud now serves 20261118\n")
 
 
+class CutoverTlsTest(unittest.TestCase):
+    """The pull zone turns on TLS (and force_ssl) only for the names in tls_hostnames, and Bunny requests a managed
+    certificate over HTTP, which fails until the name resolves to the zone: the cutover's switch lists
+    tiles.immich.cloud in tls_hostnames after its CNAME, and checks HTTPS before the pull request that points the
+    sync and the probe at it."""
+
+    def test_the_switch_gets_the_public_hostname_its_certificate_after_the_dns_change(self):
+        module = os.path.join(ROOT, "deployment", "modules", "bunny", "tiles")
+        pullzone = read(os.path.join(module, "pullzone.tf"))
+        self.assertIn("tls_enabled = contains(var.tls_hostnames, each.value)", pullzone)
+        readme = read(os.path.join(module, "README.md"))
+        cutover = readme.split("### The cutover\n", 1)[1].split("\n### ", 1)[0]
+        switch = re.search(r"\n2\. \*\*Switch\*\*.*", cutover, re.S).group(0)
+        cname = switch.index("add a DNS-only (not proxied) CNAME `tiles` at `cdn_domain`")
+        tls = switch.find("`tiles.immich.cloud` to `tls_hostnames`")
+        self.assertGreater(tls, cname, "the switch never lists tiles.immich.cloud in tls_hostnames after its CNAME")
+        public_url = switch.index("`BUNNY_PUBLIC_URL`")
+        self.assertLess(tls, public_url)
+        self.assertIn("curl -fsSI https://tiles.immich.cloud/v1.json", switch[tls:public_url])
+
+
 if __name__ == "__main__":
     unittest.main()
