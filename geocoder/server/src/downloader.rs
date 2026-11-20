@@ -662,7 +662,10 @@ thread_local! {
 /// (DOWNLOAD_LOCK). Before it reads the dir a download finishes what a
 /// decode killed part way left there (finish_leftovers), or fails, writing
 /// nothing. A unit's files land together, so a download needs the largest
-/// unit's files' size free beside the region.
+/// unit's files' size free beside the region. It is to run to its end
+/// (ensure_loaded runs it in a task of its own): dropped part way, it lets
+/// go of the lock while a decode or a file's writer it started goes on
+/// writing the dir on a thread of its own.
 ///
 /// `progress` fires after each file or unit completes with the running
 /// total; the caller logs it.

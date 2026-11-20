@@ -91,7 +91,8 @@ there (PATCHING.md), which would otherwise put back the files the decode
 replaced once the download had listed the files to remove; one it can't finish
 fails the download.
 Downloads into a dir go one at a time, those of other servers on the data dir
-too: each holds a lock on the dir's `.download.lock`. A server checks and
+too: each holds a lock on the dir's `.download.lock` to its end, and runs to
+its end though the query that started it gave up. A server checks and
 loads a dir, when it starts and once its own download into the dir is in,
 under a shared lock on that file, which it makes where it isn't there, so
 that it waits for a download into the dir (another server's) to end and loads

@@ -14,7 +14,9 @@
 //    until the download finishes.
 //
 // Per-region mutex serialises concurrent ensure_loaded calls so each
-// region is downloaded at most once even under request fan-in.
+// region is downloaded at most once even under request fan-in. A download
+// runs in a task of its own, which holds the mutex to its end: a request
+// that gives up leaves it to run on.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -212,7 +214,14 @@ impl RegionState {
     /// isn't already, downloads its files (single-flighted), then
     /// installs the new Index. Subsequent calls for the same region
     /// after a successful download return immediately.
-    pub async fn ensure_loaded(&self, region: &str) -> Result<(), DownloadError> {
+    ///
+    /// The download and the install run in a task of their own, which
+    /// holds the region's mutex until they end: a caller that gives up (a
+    /// request whose client went, its future dropped) leaves them to run
+    /// on. Dropped part way, a download would let go of the dir's lock
+    /// while what it started on threads of their own (a unit's decode, a
+    /// file's writer) went on writing the dir.
+    pub async fn ensure_loaded(self: &Arc<Self>, region: &str) -> Result<(), DownloadError> {
         // Per-region serialisation. Acquire the inner mutex so only
         // one concurrent request runs the download below; the rest
         // wait, find the region already installed, and return.
@@ -222,7 +231,7 @@ impl RegionState {
                 .or_insert_with(|| Arc::new(Mutex::new(())))
                 .clone()
         };
-        let _guard = inner.lock().await;
+        let guard = inner.lock_owned().await;
 
         // Re-check after acquiring the lock: an earlier waiter may
         // have just finished the download.
@@ -236,6 +245,17 @@ impl RegionState {
             return Err(DownloadError::UnknownRegion(region.to_string()));
         }
 
+        let (state, region) = (self.clone(), region.to_string());
+        tokio::spawn(async move {
+            let _guard = guard;
+            state.download_and_install(&region).await
+        })
+        .await
+        .map_err(|e| DownloadError::Io(format!("download task: {}", e)))?
+    }
+
+    /// Downloads `region` and installs it: the task of ensure_loaded.
+    async fn download_and_install(&self, region: &str) -> Result<(), DownloadError> {
         let configurations = self.ensure_configurations().await?;
         let cfg = self.config.lock().await.clone();
         let sel = cfg.selection(region);
@@ -350,7 +370,7 @@ mod tests {
         let persisted = Configuration { base_url: bucket.url.clone(), quality: "q2.5".into(), ..Configuration::default() };
         std::fs::write(root.path().join("configuration.json"), serde_json::to_string(&persisted).unwrap()).unwrap();
         let mi = MultiIndex::load(root.path().to_str().unwrap(), 17, 10, 660.0).unwrap();
-        let state = RegionState::new(Arc::new(mi), root.path().to_path_buf());
+        let state = Arc::new(RegionState::new(Arc::new(mi), root.path().to_path_buf()));
 
         let got = state.ensure_loaded("europe").await.map_err(|e| e.to_string());
 
@@ -427,6 +447,7 @@ mod tests {
     async fn a_load_waiting_for_another_servers_download_leaves_the_runtime_free() {
         let bucket = test_bucket::serve(test_bucket::template_components()).await;
         let (_root, state) = state_for(bucket.url.clone(), Duration::from_secs(3600)).await;
+        let state = Arc::new(state);
         let meanwhile = Arc::new(std::sync::Mutex::new(None));
         let started = meanwhile.clone();
         ONCE_DOWNLOADED.set(Some(Box::new(move |dir: &std::path::Path| {
@@ -451,5 +472,54 @@ mod tests {
         let (let_go, ticked) = meanwhile.lock().unwrap().take().expect("the download is in");
         let (let_go, ticked) = (let_go.join().unwrap(), ticked.await.unwrap());
         assert_eq!((ticked < let_go, let_go < returned), (true, true), "{got:?}");
+    }
+
+    /// The names in a dir and their bytes.
+    fn tree(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir).unwrap()
+            .map(|e| e.unwrap())
+            .map(|e| (e.file_name().into_string().unwrap(), std::fs::read(e.path()).unwrap()))
+            .collect()
+    }
+
+    // A request that gives up, its future dropped (as the server drops a
+    // handler's once its client went), leaves the download it started to
+    // run to its end. Dropped part way, a download lets go of the dir's
+    // lock and the region's mutex while what it started on threads of their
+    // own (a unit's decode, a file's writer) goes on writing the dir, and a
+    // download after it may mix their files with its own. Here the bucket
+    // holds a unit's body back half way and the request gives up meanwhile:
+    // the lock and the mutex stay held; once the bucket sends the rest, the
+    // download ends, the dir as a download of the selection leaves it, each
+    // object fetched once.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_request_that_gives_up_leaves_its_download_to_run_to_its_end() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (root, state) = state_for(bucket.url.clone(), Duration::from_secs(3600)).await;
+        let state = Arc::new(state);
+        let sel = state.get_configuration().await.selection("europe");
+        let whole = ScratchDir::new();
+        download_region(&state.http, &bucket.url, &bucket.manifest, &sel, whole.path(), |_| {}).await.unwrap();
+        let (want, all) = (tree(&whole.path().join("europe")), bucket.files_served());
+        let unit = crate::downloader::resolve_files(&bucket.manifest, &sel).unwrap().paths.iter()
+            .find_map(|p| bucket.manifest.files.get(p)?.unit.clone())
+            .expect("the selection takes a unit");
+        let holding = bucket.hold(&unit);
+
+        tokio::select! {
+            got = state.ensure_loaded("europe") => panic!("done while the bucket held {unit} back: {got:?}"),
+            () = holding.reached() => {}
+        }
+        let dir = root.path().join("europe");
+        let lock_free = std::fs::File::open(dir.join(DOWNLOAD_LOCK)).unwrap().try_lock().is_ok();
+        let mutex = state.region_locks.lock().await["europe"].clone();
+        let mutex_free = mutex.try_lock().is_ok();
+        drop(holding);
+        let ended = tokio::time::timeout(Duration::from_secs(60), mutex.lock()).await.is_ok();
+
+        assert_eq!((lock_free, mutex_free, ended), (false, false, true));
+        assert!(tree(&dir) == want, "{:?}", tree(&dir).keys().collect::<Vec<_>>());
+        assert_eq!(bucket.files_served(), 2 * all);
     }
 }
