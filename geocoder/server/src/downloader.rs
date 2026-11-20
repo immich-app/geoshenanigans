@@ -1752,7 +1752,12 @@ mod tests {
     // files to remove would stay, under the stamp. Poi tier all, then a
     // download of major killed once its poi_records.bin went in over all's;
     // then a switch to no POIs in admin-minimal, which decodes units, and in
-    // admin, which fetches nothing. Each leaves its selection only.
+    // admin, which fetches nothing. Then the switch to admin once more, the
+    // kill come before major's file went in and the ledger lost since: no
+    // poi_records.bin is in the dir but the one the decode's dir holds, and
+    // the download lists only the files in the dir under the build's names.
+    // Each leaves its selection only.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_download_finishes_what_a_killed_decode_left_before_it_lists_the_files_to_remove() {
         let bucket = test_bucket::serve(test_bucket::template_components()).await;
@@ -1760,29 +1765,34 @@ mod tests {
         let ours = files_of(&bucket, &major)["poi_records.bin"].clone();
         assert_ne!(files_of(&bucket, &all)["poi_records.bin"], ours);
         let mut got = Vec::new();
-        for mode in ["admin-minimal", "admin"] {
+        for (mode, lost) in [("admin-minimal", false), ("admin", false), ("admin", true)] {
             let after = sel("europe", mode, "simplified", "none");
             let root = ScratchDir::new();
             let dir = root.path().join("europe");
             download(&bucket, &all, root.path()).await.unwrap();
             // What the download of major left: the ledger naming the pois
             // unit's files unknown, no stamp, and the decode's dir holding
-            // all's poi_records.bin, major's in its place.
+            // all's poi_records.bin, major's in its place; or none in its
+            // place, the ledger lost.
             let ledger = std::fs::read_to_string(dir.join(FILE_LEDGER)).unwrap();
             std::fs::write(dir.join(FILE_LEDGER), format!("{ledger}poi_records.bin -\npoi_vertices.bin -\n")).unwrap();
             std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap();
             std::fs::create_dir(dir.join(KILLED_DECODES_DIR)).unwrap();
             std::fs::rename(dir.join("poi_records.bin"), dir.join(KILLED_DECODES_DIR).join(".earlier.poi_records.bin")).unwrap();
-            std::fs::write(dir.join("poi_records.bin"), &ours).unwrap();
+            if lost {
+                std::fs::remove_file(dir.join(FILE_LEDGER)).unwrap();
+            } else {
+                std::fs::write(dir.join("poi_records.bin"), &ours).unwrap();
+            }
             let served = bucket.files_served();
 
             download(&bucket, &after, root.path()).await.unwrap();
 
             let left = dir.join(KILLED_DECODES_DIR).exists();
             let differ = if left { Vec::new() } else { differing(&held(&dir), &files_of(&bucket, &after)) };
-            got.push((mode, bucket.files_served() > served, left, differ));
+            got.push((mode, lost, bucket.files_served() > served, left, differ));
         }
-        assert_eq!(got, [("admin-minimal", true, false, Vec::new()), ("admin", false, false, Vec::new())]);
+        assert_eq!(got, [("admin-minimal", false, true, false, Vec::new()), ("admin", false, false, false, Vec::new()), ("admin", true, true, false, Vec::new())]);
     }
 
     // A killed decode's dir that can't be finished, which would put a file
