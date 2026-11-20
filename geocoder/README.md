@@ -90,11 +90,13 @@ otherwise put back the files the decode replaced once the download had listed
 the files to remove; one it can't finish fails the download.
 Downloads into a dir go one at a time, those of other servers on the data dir
 too: each holds a lock on the dir's `.download.lock`. A server checks and
-loads a dir that holds that file, when it starts and once its own download
-into the dir is in, under a shared lock on it, so that it waits for a
-download into the dir (another server's) to end and loads what it left; after
-its own download it waits on a thread of its own, and answers queries
-meanwhile. A server that finds a ledger but no stamp in a dir leaves that
+loads a dir, when it starts and once its own download into the dir is in,
+under a shared lock on that file, which it makes where it isn't there, so
+that it waits for a download into the dir (another server's) to end and loads
+what it left, and the first download into a dir waits for it; after its own
+download it waits on a thread of its own, and answers queries meanwhile. A
+dir it can't make the file in (read-only, or not writable to it) loads
+without a lock. A server that finds a ledger but no stamp in a dir leaves that
 continent unloaded until a query or a preload finishes its download. Queries
 need an API key from the dashboard (see Authentication below).
 

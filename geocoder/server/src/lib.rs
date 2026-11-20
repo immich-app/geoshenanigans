@@ -3445,9 +3445,10 @@ pub const FILE_LEDGER: &str = ".file_sha256";
 /// The file in a continent dir the server's downloader fills whose flock(2) lock (on unix, where
 /// the file system has locks) keeps a download into the dir and the loads of the dir apart,
 /// those of other processes too (servers sharing a data dir). A download holds an exclusive lock
-/// on it from start to end, and makes it; a load (a server starting, or a hot-add once its
-/// download is in) holds a shared one from before it checks the dir's BUILD_STAMP until it has
-/// loaded the dir, and never makes it. Downloads go one at a time, and no server loads a dir
+/// on it from start to end; a load (a server starting, or a hot-add once its download is in)
+/// holds a shared one from before it checks the dir's BUILD_STAMP until it has loaded the dir.
+/// Each makes it where it isn't there, and never truncates it, so that a load and the first
+/// download into a dir lock the same file. Downloads go one at a time, and no server loads a dir
 /// while a download changes its files. Not the dir itself, which its transport decodes lock
 /// (the install lock).
 pub const DOWNLOAD_LOCK: &str = ".download.lock";
@@ -3455,25 +3456,32 @@ pub const DOWNLOAD_LOCK: &str = ".download.lock";
 /// What takes a continent dir's DOWNLOAD_LOCK.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockFor {
-    /// A download, which writes the dir: an exclusive lock, the file made where it isn't there.
+    /// A download, which writes the dir: an exclusive lock.
     Download,
-    /// A load, which reads the dir: a shared lock, and only where the file is. A dir without it
-    /// (laid out by hand, say) loads without a lock.
+    /// A load, which reads the dir: a shared lock. Where the file isn't there and can't be made,
+    /// as the dir is read-only or not writable to this process, the dir loads without a lock: no
+    /// download of this process can write there either.
     Load,
 }
 
-/// Takes the download lock of the continent dir `dir` (DOWNLOAD_LOCK) for `what`, waiting while
-/// another holds it where they can't share it. None where no lock is taken: on a file system
-/// without locks, on platforms other than unix, and for a load where the file isn't there. The
-/// lock is held until the file returned is dropped.
+/// Takes the download lock of the continent dir `dir` (DOWNLOAD_LOCK) for `what`, the file made
+/// where it isn't there, waiting while another holds it where they can't share it. None where
+/// no lock is taken: on a file system without locks, on platforms other than unix, and for a load
+/// where the file isn't there and can't be made (cant_make_files_in). The lock is held until the
+/// file returned is dropped.
 #[cfg(unix)]
 pub fn take_download_lock(dir: &std::path::Path, what: LockFor) -> std::io::Result<Option<File>> {
     let path = dir.join(DOWNLOAD_LOCK);
     let file = match what {
         LockFor::Download => File::options().write(true).create(true).truncate(false).open(&path)?,
-        LockFor::Load => match File::open(&path) {
+        LockFor::Load => match open_or_make(&path) {
             Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            // Another process may have made it meanwhile.
+            Err(e) if cant_make_files_in(&e) => match File::open(&path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => return Err(e),
+            },
             Err(e) => return Err(e),
         },
     };
@@ -3494,6 +3502,28 @@ pub fn take_download_lock(dir: &std::path::Path, what: LockFor) -> std::io::Resu
 #[cfg(not(unix))]
 pub fn take_download_lock(_dir: &std::path::Path, _what: LockFor) -> std::io::Result<Option<File>> {
     Ok(None)
+}
+
+/// The file at `path`, opened to read, made empty where it isn't there: open(2) with O_CREAT and
+/// without O_TRUNC. Not opened to write, which a lock doesn't need: a lock file another user's
+/// server made, that this process can't write, still opens.
+#[cfg(unix)]
+fn open_or_make(path: &std::path::Path) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(test)]
+    if let Some(errno) = LOCK_FILE_UNMADE.get() {
+        if !path.exists() {
+            return Err(std::io::Error::from_raw_os_error(errno));
+        }
+    }
+    File::options().read(true).custom_flags(libc::O_CREAT).open(path)
+}
+
+/// Whether `e`, an error making a file, says its dir is read-only (EROFS) or not writable to
+/// this process (EACCES, EPERM).
+#[cfg(unix)]
+fn cant_make_files_in(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EROFS | libc::EACCES | libc::EPERM))
 }
 
 /// Why the continent dir `dir` is left unloaded, if it is: it holds
@@ -3521,6 +3551,10 @@ thread_local! {
     /// Set by a test: told each continent dir load_continent on this thread
     /// loads, once its stamp is checked, before Index::load.
     static BEFORE_INDEX_LOAD: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> = const { std::cell::RefCell::new(None) };
+    /// Set by a test: the errno with which a load on this thread fails to
+    /// make a dir's DOWNLOAD_LOCK where it isn't there, as it would in a dir
+    /// that is read-only or not writable to it.
+    static LOCK_FILE_UNMADE: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
 }
 
 /// The index in the continent dir `dir`, for a server starting
@@ -3531,12 +3565,18 @@ thread_local! {
 /// shared download lock (LockFor::Load), taken before anything in it is
 /// read and held until Index::load returned, which waits for that download
 /// to end and keeps the next from starting until the load returned. The
-/// files stay mapped after. None for a dir without admin_cells.bin. An
+/// lock file is made where it isn't there, so that the first download into
+/// a dir waits for a load too. The files stay mapped after. None for a dir
+/// that isn't there or holds no admin_cells.bin. An
 /// error, why the dir doesn't load, for a lock that can't be taken, a
 /// download that broke off (unfinished_download): it can leave files of a
 /// build or selection beside those of the one before, which Index::load
 /// can't tell apart; and for a dir Index::load refuses.
 fn load_continent(dir: &str, street_cell_level: u64, admin_cell_level: u64, search_distance: f64) -> Result<Option<Index>, String> {
+    // A dir that isn't there holds nothing to load, and gets no lock file.
+    if !std::path::Path::new(dir).is_dir() {
+        return Ok(None);
+    }
     let _lock = take_download_lock(std::path::Path::new(dir), LockFor::Load)
         .map_err(|e| format!("can't lock {}/{}: {}", dir, DOWNLOAD_LOCK, e))?;
     if !std::path::Path::new(&format!("{}/admin_cells.bin", dir)).exists() {
@@ -6975,8 +7015,7 @@ mod query_path_tests {
     // replaces the files for another selection. A server starting meanwhile
     // reads the dir only once the download let go of the lock, and finds
     // what it left: here, the download stopped, its stamp gone, and the
-    // continent stays unloaded. A dir without the lock file loads without a
-    // lock, and is left without one.
+    // continent stays unloaded.
     #[cfg(unix)]
     #[test]
     fn a_server_starting_reads_a_continent_dir_only_once_a_download_into_it_let_go_of_its_lock() {
@@ -6994,12 +7033,12 @@ mod query_path_tests {
 
         assert_eq!(early, None, "loaded while the download held the lock");
         assert_eq!(late, Some(vec!["asia"]));
-        assert!(!root.path().join("asia").join(DOWNLOAD_LOCK).exists());
     }
 
     // A server starting holds the lock until it has loaded the dir, and
     // lets go of it then: a try at it from another open fails while the dir
-    // loads, and takes it after.
+    // loads, and takes it after. A dir without the lock file (asia here)
+    // gets it from the load.
     #[cfg(unix)]
     #[test]
     fn a_server_starting_holds_a_continent_dirs_download_lock_until_it_loaded_the_dir() {
@@ -7020,8 +7059,90 @@ mod query_path_tests {
 
         BEFORE_INDEX_LOAD.set(None);
         assert_eq!(loaded, ["asia", "europe"]);
-        assert_eq!(*told.borrow(), [("asia".to_string(), None), ("europe".to_string(), Some(false))]);
+        assert_eq!(*told.borrow(), [("asia".to_string(), Some(false)), ("europe".to_string(), Some(false))]);
         assert!(free(&europe));
+    }
+
+    // A dir without the lock file (laid out by hand, or never downloaded
+    // into by a server) gets it from a server starting, as from a download,
+    // and the load holds a shared lock on it. The first download into the
+    // dir (another server's, on the same data dir) that comes while the dir
+    // loads waits for the load to end, and takes the lock after: else it
+    // would make the file and take the lock at once, and replace the files
+    // the load maps.
+    #[cfg(unix)]
+    #[test]
+    fn a_first_download_into_a_continent_dir_without_the_lock_file_waits_for_a_server_loading_it() {
+        let root = two_continents();
+        let europe = root.path().join("europe");
+        assert!(!europe.join(DOWNLOAD_LOCK).exists());
+        let (taken, took) = std::sync::mpsc::channel();
+        let (took, waiting) = (std::rc::Rc::new(took), std::rc::Rc::new(std::cell::RefCell::new(None)));
+        let (taking, early) = (took.clone(), waiting.clone());
+        // The download comes once the dir's stamp is checked, before it is
+        // mapped, and runs on a thread of its own, as another process's would.
+        BEFORE_INDEX_LOAD.set(Some(Box::new(move |dir: &str| {
+            if !dir.ends_with("/europe") {
+                return;
+            }
+            let (dir, taken) = (std::path::PathBuf::from(dir), taken.clone());
+            let download = std::thread::spawn(move || taken.send(take_download_lock(&dir, LockFor::Download).unwrap().is_some()).unwrap());
+            *early.borrow_mut() = Some((taking.recv_timeout(std::time::Duration::from_millis(500)).ok(), download));
+        })));
+
+        let loaded = loaded_continents(root.path());
+
+        BEFORE_INDEX_LOAD.set(None);
+        let (early, download) = waiting.borrow_mut().take().expect("europe loads");
+        let late = took.recv_timeout(std::time::Duration::from_secs(10)).ok();
+        download.join().unwrap();
+        assert_eq!((early, late), (None, Some(true)), "the download took the lock while the dir loaded, or never");
+        assert_eq!(loaded, ["asia", "europe"]);
+        assert!(europe.join(DOWNLOAD_LOCK).exists() && root.path().join("asia").join(DOWNLOAD_LOCK).exists());
+    }
+
+    // A continent dir that isn't there loads nothing, and is no error: a
+    // server starting passes it by without a word, and makes no lock file.
+    #[test]
+    fn a_continent_dir_that_isnt_there_loads_nothing_and_is_no_error() {
+        let root = two_continents();
+        let africa = root.path().join("africa");
+
+        let got = load_continent(africa.to_str().unwrap(), DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE);
+
+        assert_eq!(got.map(|idx| idx.is_some()), Ok(false));
+        assert!(!africa.exists());
+    }
+
+    // A dir the lock file isn't in and can't be made in, as it is read-only
+    // (a read-only mount) or not writable to this process (a dir of another
+    // user), loads without a lock, as no download of this process can write
+    // there. Any other error making it leaves the dir unloaded. The errors
+    // are the seam's (LOCK_FILE_UNMADE), as root's writes aren't stopped by
+    // a dir's modes; where this process isn't root, a dir of mode 0555 is
+    // one it can't write too.
+    #[cfg(unix)]
+    #[test]
+    fn a_continent_dir_the_lock_file_cant_be_made_in_loads_without_a_lock_only_where_it_cant_be_written() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut got = Vec::new();
+        for (errno, what) in [(libc::EROFS, "EROFS"), (libc::EACCES, "EACCES"), (libc::EPERM, "EPERM"), (libc::EIO, "EIO")] {
+            let root = two_continents();
+            LOCK_FILE_UNMADE.set(Some(errno));
+            let loaded = loaded_continents(root.path());
+            LOCK_FILE_UNMADE.set(None);
+            got.push((what, loaded, root.path().join("europe").join(DOWNLOAD_LOCK).exists()));
+        }
+        let both = vec!["asia", "europe"];
+        assert_eq!(got, [("EROFS", both.clone(), false), ("EACCES", both.clone(), false), ("EPERM", both.clone(), false), ("EIO", vec![], false)]);
+        if unsafe { libc::geteuid() } != 0 {
+            let root = two_continents();
+            let europe = root.path().join("europe");
+            std::fs::set_permissions(&europe, std::fs::Permissions::from_mode(0o555)).unwrap();
+            let loaded = loaded_continents(root.path());
+            std::fs::set_permissions(&europe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!((loaded, europe.join(DOWNLOAD_LOCK).exists()), (both, false));
+        }
     }
 
     // Servers starting on one data dir load a continent dir at once: the
