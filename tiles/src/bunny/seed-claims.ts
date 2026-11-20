@@ -13,6 +13,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 
 export interface SeedClaim {
   pid: number;
@@ -49,6 +50,14 @@ export function defaultClaimsDir(env = process.env): string {
   return join(env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'bunny-seed');
 }
 
+/** Locked while a seed reads and writes claims. Not a .json: seeds read those as claims. */
+const LOCK_FILE = 'claims.lock.db';
+/** SQLITE_BUSY: another connection holds the lock. */
+const SQLITE_BUSY = 5;
+/** How long a seed waits for the others on this machine to be done with the claims (each takes milliseconds). */
+const LOCK_WAIT_MS = 60_000;
+const LOCK_RETRY_MS = 20;
+
 export function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -63,6 +72,7 @@ export function isAlive(pid: number): boolean {
  * `settleBy(stateDir)` reads when the PUTs of the seed that used a state dir may last be committed (its status.json),
  * undefined if it can't. A dead process's claim is removed once that time has passed or when it can't be read (then
  * only the seeds that see the claim wait); until then it stays, and those over an overlapping range are `stopped`.
+ * All of it happens with the claims dir locked.
  */
 export async function claimRange(
   dir: string,
@@ -120,16 +130,55 @@ export async function claimRange(
         `or seed a range that does not overlap (its claim: ${file})`,
     );
 
-  const before = await conflict();
-  if (before) {
-    throw refuse(before);
+  return withClaimsLocked(dir, async () => {
+    const before = await conflict();
+    if (before) {
+      throw refuse(before);
+    }
+    await writeFile(own, JSON.stringify({ ...claim, pid: process.pid, startedAt: new Date().toISOString() }) + '\n');
+    // An older bunny:seed doesn't take the lock: if it started at the same moment, both see the other here, and both
+    // stop.
+    const after = await conflict();
+    if (after) {
+      await rm(own, { force: true });
+      throw refuse(after);
+    }
+    return { release: () => rm(own, { force: true }), stopped: [...stopped.values()] };
+  });
+}
+
+/**
+ * Runs `body` with the claims dir locked: an exclusive SQLite transaction on LOCK_FILE, which the OS drops when the
+ * process dies. Without it, a seed that read a dead seed's claim and removed it once it had read that seed's settleBy
+ * could remove the claim a seed resumed under the dead seed's state dir wrote in between, and both would seed.
+ */
+async function withClaimsLocked<T>(dir: string, body: () => Promise<T>): Promise<T> {
+  const { DatabaseSync } = await import('node:sqlite');
+  const path = join(dir, LOCK_FILE);
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    const db = new DatabaseSync(path, { timeout: 0 });
+    try {
+      db.exec('BEGIN EXCLUSIVE');
+    } catch (error) {
+      db.close();
+      if ((error as { errcode?: number }).errcode !== SQLITE_BUSY) {
+        throw new Error(`Could not lock ${path}: ${(error as Error).message}`, { cause: error });
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `Could not lock ${path}: another bunny:seed on this machine has held it for ${LOCK_WAIT_MS / 1000} s ` +
+            '(fuser names it)',
+          { cause: error },
+        );
+      }
+      await sleep(LOCK_RETRY_MS);
+      continue;
+    }
+    try {
+      return await body();
+    } finally {
+      db.close();
+    }
   }
-  await writeFile(own, JSON.stringify({ ...claim, pid: process.pid, startedAt: new Date().toISOString() }) + '\n');
-  // Two seeds that started at the same moment both see the other here, and both stop.
-  const after = await conflict();
-  if (after) {
-    await rm(own, { force: true });
-    throw refuse(after);
-  }
-  return { release: () => rm(own, { force: true }), stopped: [...stopped.values()] };
 }
