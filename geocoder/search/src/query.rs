@@ -374,6 +374,12 @@ struct Cand {
     potential: f32,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The pending candidates the cut-backs of the thread have looked at (`Searcher::cut_back`).
+    static CUT_BACK_LOOKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl<'a, 'g> Searcher<'a, 'g> {
     pub fn new(idx: &'a SearchIndex<'g>) -> Self {
         Searcher { idx, lev: [LevenshteinAutomatonBuilder::new(1, true), LevenshteinAutomatonBuilder::new(2, true)], limits: Limits::default() }
@@ -670,16 +676,25 @@ impl<'a, 'g> Searcher<'a, 'g> {
     /// left: kept, such a one could push out a candidate that, checked, would score above it
     /// (a cut-back ranks by the score a candidate could reach, not the one it gets); counted,
     /// it brings the cut-back on before a search without it cuts back, which keeps what this
-    /// one drops. Out of line, so that the closure that queues the candidates stays inlined in
-    /// the loop over the postings.
+    /// one drops. It looks at the others alone: once the candidates are full, each one queued
+    /// that does not read brings on a cut-back that cuts nothing back and keeps all before it.
+    /// Out of line, so that the closure that queues the candidates stays inlined in the loop
+    /// over the postings.
     #[cold]
     #[inline(never)]
     fn cut_back(ents: &Entities, cands: &mut Vec<Cand>, read: &mut usize, max: usize) {
-        let mut at = 0;
-        cands.retain(|c| {
-            at += 1;
-            at <= *read || ents.point(c.entity).is_some()
-        });
+        // Those that read move up over those that are nowhere, in their order.
+        let mut kept = *read;
+        for at in *read..cands.len() {
+            let c = cands[at];
+            #[cfg(test)]
+            CUT_BACK_LOOKS.set(CUT_BACK_LOOKS.get() + 1);
+            if ents.point(c.entity).is_some() {
+                cands[kept] = c;
+                kept += 1;
+            }
+        }
+        cands.truncate(kept);
         if cands.len() > max {
             cands.sort_by(|a, b| b.potential.total_cmp(&a.potential).then(a.entity.cmp(&b.entity)));
             cands.truncate(max / 2);
@@ -1205,6 +1220,63 @@ mod tests {
         assert_eq!(built, [lead, three_named[0] | POI_BIT]);
         assert_eq!(damaged, [inside, lead]);
         assert_eq!(damaged, read_first);
+    }
+
+    #[test]
+    fn cut_backs_look_at_each_pending_candidate_once_at_most() {
+        use crate::fixture::{build_search, Geo, TempDir};
+        let mut g = Geo::default();
+        // Under "olde mill", best first: as many POIs as fill the pending candidates; then many
+        // of less importance, made not to read, each of which a search that does not read first
+        // queues, bringing on a cut-back that leaves it out and cuts nothing back; then as many
+        // of the least, the first of which brings on a cut-back that cuts back, reading first or
+        // not. All far apart.
+        let many = MAX_PENDING_CANDIDATES / 4;
+        let n = MAX_PENDING_CANDIDATES + 2 * many;
+        let at = |k: usize| (-78.0 + (k / 100) as f32 * 1.3, -170.0 + (k % 100) as f32 * 3.4);
+        let mut unreadable = Vec::new();
+        for k in 0..n {
+            let imp = if k < MAX_PENDING_CANDIDATES {
+                15
+            } else if k < MAX_PENDING_CANDIDATES + many {
+                7
+            } else {
+                3
+            };
+            let row = g.poi("Olde Mill", at(k).0, at(k).1, imp);
+            if imp == 7 {
+                unreadable.push(row);
+            }
+        }
+        assert_eq!(unreadable.len(), many);
+        let dir = TempDir::new("cut-back-looks");
+        let set = dir.0.join("geo");
+        let geo = g.load(&set);
+        let out = dir.0.join("idx");
+        build_search(&geo, &out, None);
+        let damaged = with_unreadable_pois(&set, &unreadable);
+        let idx = SearchIndex::open(&damaged, &out, None, None).unwrap();
+        let s = Searcher::new(&idx);
+        // The answer of a search that runs once (false) or reads first (true), and how many
+        // pending candidates its cut-backs looked at.
+        let looked = |read_first: bool| {
+            CUT_BACK_LOOKS.set(0);
+            let mut st = State { ctx: HashMap::new(), stats: QueryStats::default() };
+            let found = if read_first {
+                s.search_once::<true>(&mut st, "olde mill, b", DEFAULT_LIMIT)
+            } else {
+                s.search_once::<false>(&mut st, "olde mill, b", DEFAULT_LIMIT)
+            };
+            (answer(&found.unwrap()), CUT_BACK_LOOKS.get())
+        };
+
+        let [(got, once), (read_first, first)] = [false, true].map(looked);
+
+        // Each candidate queued is looked at by one cut-back at most, the first that weighs it:
+        // reading first, none that does not read is queued.
+        assert!(once > MAX_PENDING_CANDIDATES && once <= n, "{once} looks at {n} candidates");
+        assert!(first > MAX_PENDING_CANDIDATES && first <= n - many, "{first} looks at {} candidates", n - many);
+        assert_eq!(got, read_first);
     }
 
     /// A result as the tests compare it: the hit, the name and the point.
