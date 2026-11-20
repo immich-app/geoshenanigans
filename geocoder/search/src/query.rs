@@ -274,13 +274,17 @@ struct Pool {
     /// results the context cut-off keeps reachable (limit * CONTEXT_CUTOFF_FACTOR)
     top_k: usize,
     /// Entities taken in unread, held or evicted since, until the pool reads them
-    /// (`read_later`).
+    /// (`read_held`).
     unread: Vec<u32>,
+    /// Of those, the ones it had evicted when it read the ones it held, unread still, and its
+    /// threshold then (`read_held`).
+    set_aside: Vec<u32>,
+    set_aside_at: f32,
 }
 
 impl Pool {
     fn new(size: usize, top_k: usize) -> Self {
-        Pool { best: HashMap::new(), scores: BTreeSet::new(), size, top_k, unread: Vec::new() }
+        Pool { best: HashMap::new(), scores: BTreeSet::new(), size, top_k, unread: Vec::new(), set_aside: Vec::new(), set_aside_at: 0.0 }
     }
 
     fn threshold(&self) -> f32 {
@@ -293,7 +297,7 @@ impl Pool {
 
     /// Takes `h` in if it scores above the threshold and above its entity's hit, if any. An
     /// entity the pool does not hold enters only if `reads` says it is somewhere (one that is
-    /// nowhere is left out), or, with `LATER`, unread (`read_later`).
+    /// nowhere is left out), or, with `LATER`, unread (`read_held`).
     fn offer<const LATER: bool>(&mut self, h: Hit, reads: impl FnOnce(u32) -> bool) {
         if h.score <= self.threshold() {
             return;
@@ -316,13 +320,31 @@ impl Pool {
         self.best.insert(h.entity, h);
     }
 
-    /// Reads the entities it took in unread, held or evicted since: false when one is nowhere
-    /// (`Searcher::search`); true, and the pool is one that read each as it took it in. Until
-    /// then such an entity decides nothing while the pool has room, as nothing is turned away
-    /// or evicted, and once it is full only which hits at or below its threshold the pool
-    /// holds: above it, the pool holds the hits of one that reads first, and those entities.
-    fn read_later(&mut self, reads: impl FnMut(u32) -> bool) -> bool {
-        self.unread.drain(..).all(reads)
+    /// Reads the entities it took in unread that it holds: false when one is nowhere
+    /// (`Searcher::search`). Until then such an entity decides nothing while the pool has room,
+    /// as nothing is turned away or evicted, and once it is full only which hits at or below its
+    /// threshold the pool holds: above it, the pool holds the hits of one that reads first, and
+    /// those entities. Once those it holds read, its scores are those of a pool that reads
+    /// first, and so are its hits but for which ones take the places at its threshold: one it
+    /// evicted, if nowhere, could have turned away a hit that ties there and then been evicted
+    /// in the place of another. It sets those aside unread, with that threshold, until a hit at
+    /// or below it is taken (`Searcher::search_once`). Meanwhile the scores alone decide which
+    /// candidates a split with context words weighs and checks, and its hits keep the
+    /// difference to those places: one that takes such a place from its entity's hit in one
+    /// pool evicts another hit there in the other.
+    fn read_held(&mut self, mut reads: impl FnMut(u32) -> bool) -> bool {
+        let at = self.threshold();
+        for e in std::mem::take(&mut self.unread) {
+            if !self.best.contains_key(&e) {
+                if self.set_aside.is_empty() {
+                    self.set_aside_at = at;
+                }
+                self.set_aside.push(e);
+            } else if !reads(e) {
+                return false;
+            }
+        }
+        true
     }
 
     /// No candidate scoring at most this can reach the results: the `top_k`-th best distinct
@@ -515,9 +537,9 @@ impl<'a, 'g> Searcher<'a, 'g> {
     /// Scores one query split into `pool`. An entity whose point does not read is left out
     /// where the split reads it: as the pool takes it in, at its context check, and by a
     /// cut-back of the pending candidates that weighs it; with `READ_FIRST` also as it is
-    /// queued, so that none is pending. Without, a split without context words has the pool
-    /// take its hits in unread, and a split with them first has the pool read those: false
-    /// when one is nowhere (`search`).
+    /// queued, so that none is pending. Without, a split without context words (a search's
+    /// first) has the pool take its hits in unread, and a split with them first has the pool
+    /// read those it holds: false when one is nowhere (`search`).
     fn score_split<const READ_FIRST: bool>(&self, st: &mut State<'g>, split: u8, name: &[Token], ctx_words: &[String], prefix: bool, pool: &mut Pool) -> bool {
         let phrase = join(name);
         let ctx = Context { words: ctx_words, phrase: ctx_words.join(" ") };
@@ -526,8 +548,9 @@ impl<'a, 'g> Searcher<'a, 'g> {
         if phrase.is_empty() {
             return true;
         }
-        // The split weighs its candidates against all the pool's scores.
-        if has_ctx && !pool.read_later(|e| ents.point(e).is_some()) {
+        // The split weighs its candidates against all the pool's scores, and its hits take
+        // places from the pool's entities.
+        if has_ctx && !pool.read_held(|e| ents.point(e).is_some()) {
             return false;
         }
         let chars = phrase.chars().count();
@@ -678,12 +701,14 @@ impl<'a, 'g> Searcher<'a, 'g> {
         // it, and before the pool takes it in as a miss, and each of those reads leaves out one
         // that is nowhere, where a search that reads first has already left it out; one that
         // gets to none of them decides nothing. A split without context words, most of whose
-        // hits never reach the results, has the pool take them in unread (`Pool::read_later`):
-        // it reads them before a split with context words weighs candidates against its scores
-        // and, once it is full, before the area order or the results take a hit at or below
-        // its threshold; the area order and the results read the hits they take. A search
-        // that meets one of those entities nowhere runs again, reading first, with its own
-        // budget of context checks.
+        // hits never reach the results, has the pool take them in unread: before a split with
+        // context words weighs candidates against its scores, the pool reads those it holds and
+        // sets aside those it has evicted, which can have decided only which entities' hits take
+        // the places at its threshold (`Pool::read_held`); the area order and the results read
+        // the hits they take, and a full pool reads the entities still unread before either
+        // takes a hit at or below its threshold (the one it had when it set them aside, if it
+        // did). A search that meets one of those entities nowhere runs again, reading first,
+        // with its own budget of context checks.
         let found = match self.search_once::<false>(&mut st, q, limit) {
             Some(found) => found,
             None => {
@@ -725,23 +750,26 @@ impl<'a, 'g> Searcher<'a, 'g> {
         // The pool holds unread entities only after a lone split without context words, and then
         // only those: the hits taken are read, and a full pool, which has turned hits away for
         // them, reads them all before a hit at or below its threshold is taken. Else every hit
-        // is somewhere.
+        // is somewhere, and the hits are those of a pool that reads first but for which take the
+        // places at the threshold at which the pool set entities aside, if it did; it reads
+        // those before a hit at or below that threshold is taken (`Pool::read_held`).
         let ents = &self.idx.ents;
         let unread = std::mem::take(&mut pool.unread);
         let lazy = !unread.is_empty();
-        let threshold = pool.threshold();
-        let mut later = Some(unread).filter(|u| !u.is_empty() && pool.scores.len() >= pool.size);
-        let mut ready = |h: &Hit| h.score > threshold || later.take().is_none_or(|u| u.into_iter().all(|e| ents.point(e).is_some()));
+        let (level, later) = if lazy { (pool.threshold(), unread) } else { (pool.set_aside_at, std::mem::take(&mut pool.set_aside)) };
+        let check = !later.is_empty();
+        let mut later = Some(later).filter(|u| !u.is_empty() && pool.scores.len() >= pool.size);
+        let mut ready = |h: &Hit| h.score > level || later.take().is_none_or(|u| u.into_iter().all(|e| ents.point(e).is_some()));
         let mut hits: Vec<Hit> = pool.best.into_values().collect();
         hits.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.entity.cmp(&b.entity)));
-        if !self.place_before_its_area(&mut hits, lazy.then_some(&mut ready)) {
+        if !self.place_before_its_area(&mut hits, check.then_some(&mut ready)) {
             return None;
         }
         let mut out: Vec<Found<'g>> = Vec::new();
         let mut kept: Vec<(String, (f32, f32))> = Vec::new();
         for h in hits {
             let Some(at) = ents.point(h.entity).filter(|_| ready(&h)) else {
-                if lazy {
+                if check {
                     return None;
                 }
                 continue;
@@ -763,9 +791,9 @@ impl<'a, 'g> Searcher<'a, 'g> {
     }
 
     /// "Dubai" the city before "Dubai" the emirate: an area (other than a country) drops just
-    /// below a settlement of the same name that lies inside it. With `ready`, of hits the pool
-    /// took in unread: false as soon as a hit it looks at is of an entity that is nowhere, or
-    /// `ready` is false for it (`search_once`).
+    /// below a settlement of the same name that lies inside it. With `ready`, of a pool that
+    /// took entities in unread: false as soon as a hit it looks at is of an entity that is
+    /// nowhere, or `ready` is false for it (`search_once`).
     fn place_before_its_area(&self, hits: &mut [Hit], mut ready: Option<&mut impl FnMut(&Hit) -> bool>) -> bool {
         let ents = &self.idx.ents;
         let label = |h: &Hit| normalize(&ents.base_name(h.entity));
