@@ -107,6 +107,21 @@ left unloaded. A server that finds a ledger but no stamp in a dir leaves that
 continent unloaded until a query or a preload finishes its download. Queries
 need an API key from the dashboard (see Authentication below).
 
+Servers can share a data dir. Those that run as one user are safe side by
+side: their downloads into a dir go one at a time and their loads wait for
+them, by the lock on `.download.lock`. A server that can't write the data dir
+(a read-only mount, or a dir of another user) is safe beside one that
+downloads into it: it takes the lock where `.download.lock` is there, else
+loads the dir without it and drops what it loaded where a download ran
+meanwhile, by the check of `.build_date` and `.file_sha256` above. Servers of
+several users that each download into a dir writable to all of them (through
+its group, say) lock the same `.download.lock`, made by whichever came first,
+of mode 0644 under umask 022: one that can't write it takes its lock on it
+open to read, which a local file system allows. On NFS an exclusive lock needs
+the file open to write, so there `.download.lock` must be writable to every
+server that downloads into the dir (a umask of 002, or `chmod g+w`); a
+download that can't take its lock fails, saying so.
+
 The test portal is a map page for checking answers, served by every query
 server at `/test`. Its compose file runs two servers on the latest published
 index, a full one and a minimal one, side by side:
