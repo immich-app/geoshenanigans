@@ -1197,13 +1197,14 @@ mod tests {
     fn a_record_that_does_not_read_turns_away_no_hit_that_ties_with_it() {
         use crate::fixture::{build_search, Geo, TempDir};
         let mut g = Geo::default();
-        // A "Mill" of the most importance; as many of less as the pool holds, all of one
-        // importance, the first of them made not to read; then a "Mills" that scores between
-        // them, which the prefix "mill" reads after the "Mill". All far apart.
+        // An "Old Mill" of the most importance; as many of less as the pool holds, all of one
+        // importance, the first of them made not to read; then an "Old Mills" that scores
+        // between them, which the prefix "old mill" reads after the "Old Mill" and which evicts
+        // the first. All far apart.
         let at = |k: u32| (-60.0 + (k / 20) as f32 * 6.0, -170.0 + (k % 20) as f32 * 17.0);
-        let top = g.poi("Mill", at(0).0, at(0).1, 255) | POI_BIT;
-        let tied: Vec<u32> = (1..=CANDIDATE_POOL as u32).map(|k| g.poi("Mill", at(k).0, at(k).1, 3) | POI_BIT).collect();
-        let mills = g.poi("Mills", 70.0, 0.0, 255) | POI_BIT;
+        let top = g.poi("Old Mill", at(0).0, at(0).1, 255) | POI_BIT;
+        let tied: Vec<u32> = (1..=CANDIDATE_POOL as u32).map(|k| g.poi("Old Mill", at(k).0, at(k).1, 3) | POI_BIT).collect();
+        let mills = g.poi("Old Mills", 70.0, 0.0, 255) | POI_BIT;
         let dir = TempDir::new("tied-hits");
         let set = dir.0.join("geo");
         let geo = g.load(&set);
@@ -1211,14 +1212,19 @@ mod tests {
         build_search(&geo, &out, None);
         let damaged = with_unreadable_pois(&set, &[tied[0] & !POI_BIT]);
         let idx = SearchIndex::open(&damaged, &out, None, None).unwrap();
+        let s = Searcher::new(&idx);
 
-        let [got, read_first] = both_answers(&Searcher::new(&idx), "mill", DEFAULT_LIMIT);
+        // "old mill" as a search's only split, and as its first, before a split with the
+        // context word "mill".
+        let answers = ["old mill,", "old mill"].map(|q| both_answers(&s, q, DEFAULT_LIMIT));
 
-        // Without the first, the pool has room for the last of them, and the "Mills" evicts the
-        // second: the results go on from the third.
+        // Without the first, the pool has room for the last of them, and the "Old Mills" evicts
+        // the second: the results go on from the third.
         let want: Vec<u32> = [top, mills].into_iter().chain(tied[2..DEFAULT_LIMIT].iter().copied()).collect();
-        assert_eq!(got.iter().map(|r| r.0).collect::<Vec<_>>(), want);
-        assert_eq!(got, read_first);
+        for [got, read_first] in answers {
+            assert_eq!(got.iter().map(|r| r.0).collect::<Vec<_>>(), want);
+            assert_eq!(got, read_first);
+        }
     }
 
     #[test]
@@ -1422,12 +1428,15 @@ mod tests {
         (g, extras, phrases, areas, crowd)
     }
 
-    /// A crowd: a word's POIs, more than a small pool holds, all of one low importance (hits
+    /// A crowd: a name's POIs, more than a small pool holds, all of one low importance (hits
     /// that tie at its threshold), above them one of the most, and one of the most named by the
-    /// word and a letter more, which the word as a prefix reads after them. Returns the rows of
-    /// the many; the word is a phrase.
+    /// name and a letter more, which the name as a prefix reads after them. The name is a word
+    /// or, now and then, two: searched as they are, a split without context words then comes
+    /// before one with them. Returns the rows of the many; the name is a phrase.
     fn crowd(rng: &mut Rng, g: &mut crate::fixture::Geo, words: &[&str], phrases: &mut Vec<String>) -> Vec<u32> {
         let w = words.iter().copied().filter(|w| w.len() >= 3).max_by_key(|_| rng.next()).unwrap_or("market");
+        let w = if rng.one_in(3) { format!("{w} {}", rng.pick(words)) } else { w.to_string() };
+        let w = w.as_str();
         let at = |rng: &mut Rng| (rng.at(9.8, 12.2), rng.at(19.8, 22.2));
         let (lat, lng) = at(rng);
         g.poi(w, lat, lng, 255);
