@@ -1,0 +1,197 @@
+name: Tiles Sync Watchdog
+
+# Reports the live Bunny tiles build to FUTO o11y every 2 hours, independently of Tiles Sync: its age and its OSM
+# data's, which geoshenanigans-tiles-osm-old and -sync-stale read, with a heartbeat for
+# geoshenanigans-tiles-watchdog-silent. A watchdog that cannot read the live state (state.json in the
+# immich-tiles-state zone) sends no heartbeat, so that alert pages for it too; before the first load (no state.json
+# yet) it sends the heartbeat alone (o11y/alerts/geoshenanigans-tiles.yaml).
+#
+# Once a day it also checks random positions of the live build in every storage region (plan section 9): the
+# gate only sees the files a sync changed, so a file lost, overwritten or never replicated elsewhere is found here.
+# bunny:replication --live DESCRIBEs a sample per zoom and compares each Checksum with the live manifest's hash;
+# geoshenanigans-tiles-sample-wrong and -sample-unreplicated read what it reports.
+#
+# Both jobs resolve production credentials, so they run main's code only: the schedule, and dispatches from main. A
+# dispatch from another branch fails at once. They only read, with the zones' read-only passwords (tf_prod): the
+# read-write ones are in tf_bunny, which only Tiles Sync's sync job reads (deployment/modules/bunny/tiles/README.md).
+
+on:
+  schedule:
+    - cron: '37 */2 * * *'
+    # The sample check.
+    - cron: '53 4 * * *'
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  main-only:
+    name: Refuse another branch
+    if: github.ref != 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Refuse
+        run: |
+          echo "::error::Tiles Sync Watchdog reads production credentials and runs from main only"
+          exit 1
+
+  # Each job has its own concurrency group, in which a newer run's job replaces an older one's still running (a
+  # scheduled report a dispatch's, say): a report never cancels a sample check, and the other way round. The refusal
+  # above is in no group, so a dispatch from another branch cancels nothing on main. A run_id off main keeps even a
+  # skipped job out of main's groups.
+  report:
+    name: Report the live build
+    if: github.ref == 'refs/heads/main' && github.event.schedule != '53 4 * * *'
+    concurrency:
+      group: tiles-sync-watchdog-report-${{ github.ref == 'refs/heads/main' && 'main' || github.run_id }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      BUNNY_STATE_ZONE: immich-tiles-state
+      # FUTO o11y's public gateway (geocoder-build.yml's O11Y_URL).
+      O11Y_URL: https://vmauth.futostatus.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: './tiles/.nvmrc'
+
+      - name: Install tiles dependencies
+        working-directory: ./tiles
+        run: npm ci
+
+      - name: Install 1Password CLI
+        uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
+
+      # Its failure is reported (no heartbeat) before the job fails below. bunny:status exits 1 both before the
+      # first load (it then prints nulls) and when it can't read the zone (no JSON); live-state fails only for the
+      # second.
+      - name: Read the live build
+        id: status
+        continue-on-error: true
+        working-directory: ./tiles
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          BUNNY_STATE_PASSWORD: op://tf_prod/BUNNY_STATE_READONLY_PASSWORD/password
+        run: |
+          # The default shell stops at the first failure; this step reports it instead.
+          set +e
+          op run -- npm run --silent bunny:status -- --json > "$RUNNER_TEMP/status.json" 2> "$RUNNER_TEMP/status.err"
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          cat "$RUNNER_TEMP/status.json"
+          tail -c 2000 "$RUNNER_TEMP/status.err" >&2
+          python3 ../deployment/scripts/tiles_sync_report.py live-state --status "$RUNNER_TEMP/status.json" \
+            --status-exit "$code" --status-stderr "$RUNNER_TEMP/status.err"
+
+      # Reporting never fails the run. The token is read here and handed to the report alone.
+      - name: Report to o11y
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          STATUS_EXIT: ${{ steps.status.outputs.exit_code }}
+        run: |
+          args=(watchdog --status "$RUNNER_TEMP/status.json" --status-exit "$STATUS_EXIT" --stderr "$RUNNER_TEMP/status.err")
+          if ! token=$(op read "op://tf_prod/O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD/password"); then
+            echo "::warning::Could not read the o11y token from 1Password; reporting nothing"
+            exit 0
+          fi
+          echo "::add-mask::$token"
+          O11Y_TOKEN="$token" python3 deployment/scripts/tiles_sync_report.py "${args[@]}" --base-url "$O11Y_URL"
+
+      - name: Fail on an unreadable live state
+        if: steps.status.outcome == 'failure'
+        run: |
+          echo "::error::bunny:status could not read the live tiles state; see Read the live build"
+          exit 1
+
+  sample:
+    name: Check a sample in every region
+    if: github.ref == 'refs/heads/main' && (github.event.schedule == '53 4 * * *' || github.event_name == 'workflow_dispatch')
+    concurrency:
+      group: tiles-sync-watchdog-sample-${{ github.ref == 'refs/heads/main' && 'main' || github.run_id }}
+      cancel-in-progress: true
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      BUNNY_STATE_ZONE: immich-tiles-state
+      BUNNY_STORAGE_ZONE: immich-tiles
+      O11Y_URL: https://vmauth.futostatus.com
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: './tiles/.nvmrc'
+
+      - name: Install tiles dependencies
+        working-directory: ./tiles
+        run: npm ci
+
+      - name: Install 1Password CLI
+        uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
+
+      # 100 random positions of each zoom (every position of zooms 0-3), DESCRIBEd at 8 connections per storage
+      # address, beside a sync or seed. The live manifest (~1.3 GB) goes to the runner's temporary directory. Exit 1
+      # (missing or other bytes) and 2 (not yet in every region) are findings, reported below like a clean 0, but
+      # only with the report that says so: an error before the check (reading the state or the live manifest,
+      # say) also exits 1, and writes none. A report with DESCRIBE errors (exit 1 too) is an incomplete check: it is
+      # still reported below (result=error, with what it did find), and the job fails as for one that could not run.
+      - name: Check the sample
+        id: check
+        continue-on-error: true
+        working-directory: ./tiles
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          # Read-only passwords: Bunny answers DESCRIBE (Checksum and ReplicatedZones), GET and listings with them, and
+          # refuses PUT and DELETE.
+          BUNNY_STATE_PASSWORD: op://tf_prod/BUNNY_STATE_READONLY_PASSWORD/password
+          BUNNY_STORAGE_PASSWORD: op://tf_prod/BUNNY_STORAGE_READONLY_PASSWORD/password
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          set +e
+          op run -- npm run --silent bunny:replication -- --live --sample 100 --per-zoom \
+            --json "$RUNNER_TEMP/check.json" > /dev/null 2> "$RUNNER_TEMP/check.err"
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          tail -c 3000 "$RUNNER_TEMP/check.err" >&2
+          [ "$code" -le 2 ] && jq -e 'type == "object" and (has("checked") or has("skipped")) and (.errors // 0) == 0' \
+            "$RUNNER_TEMP/check.json" > /dev/null
+
+      - name: Report to o11y
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          CHECK_EXIT: ${{ steps.check.outputs.exit_code }}
+        run: |
+          args=(sample --report "$RUNNER_TEMP/check.json" --exit "$CHECK_EXIT" --stderr "$RUNNER_TEMP/check.err")
+          if ! token=$(op read "op://tf_prod/O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD/password"); then
+            echo "::warning::Could not read the o11y token from 1Password; reporting nothing"
+            exit 0
+          fi
+          echo "::add-mask::$token"
+          O11Y_TOKEN="$token" python3 deployment/scripts/tiles_sync_report.py "${args[@]}" --base-url "$O11Y_URL"
+
+      - name: Fail when the check could not run or is incomplete
+        if: steps.check.outcome == 'failure'
+        run: |
+          echo "::error::bunny:replication could not check the sample, or left positions unchecked; see Check the sample"
+          exit 1

@@ -3,14 +3,13 @@
 # its TileJSON. Git records what should be live; this is what is.
 #
 #   tiles-served-key.sh <dev|prod>
+#
+# It asks the worker's own hostname, tiles.<env>.immich.cloud, which always points at the worker. Prod's public one,
+# tiles.immich.cloud, moves to Bunny at the cutover, which sends no deployment key (deployment/modules/bunny/tiles).
 set -euo pipefail
 
 env="${1:?usage: $0 <dev|prod>}"
-if [ "$env" = prod ]; then
-  host=tiles.immich.cloud
-else
-  host="tiles.$env.immich.cloud"
-fi
+host="tiles.$env.immich.cloud"
 
 headers=$(curl -fsS --retry 3 -D - -o /dev/null "https://$host/v1.json")
 key=$(tr -d '\r' <<<"$headers" | awk -F': ' 'tolower($1) == "pmtiles-deployment-key" { print $2 }')

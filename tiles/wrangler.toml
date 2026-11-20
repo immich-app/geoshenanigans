@@ -4,6 +4,11 @@ main = "src/index.ts"
 compatibility_date = "2024-07-29"
 compatibility_flags = ["nodejs_compat"]
 
+# Every minute: the o11y heartbeat and the Bunny CDN's request logs and probe (src/bunny-logs). Terraform's tiles-worker
+# module (cloudflare_workers_cron_trigger.tiles) sets the deployed workers' schedule; this keeps wrangler in step with it.
+[triggers]
+crons = ["* * * * *"]
+
 [[d1_databases]]
 binding = "D1_GLOBAL"
 database_name = "tiles"
