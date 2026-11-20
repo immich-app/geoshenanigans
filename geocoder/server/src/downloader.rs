@@ -2029,6 +2029,101 @@ mod tests {
         assert!(free.len() > 2 && !free.contains(&true), "{free:?}");
     }
 
+    /// Runs `f` as a server of the user of uid `uid` and group `gid`, of the
+    /// group `shared` too, would under `umask`: on a thread whose file
+    /// system ids, groups and umask are those (its own, unshared), given a
+    /// runtime whose threads, started by it, take them too. As root only.
+    #[cfg(target_os = "linux")]
+    fn as_user<T: Send>(uid: u32, gid: u32, shared: u32, umask: libc::mode_t, f: impl FnOnce(&tokio::runtime::Runtime) -> T + Send) -> T {
+        let become_user = move || unsafe {
+            let groups = [shared];
+            assert_eq!(libc::syscall(libc::SYS_setgroups, 1, groups.as_ptr()), 0);
+            libc::syscall(libc::SYS_setfsgid, gid);
+            libc::syscall(libc::SYS_setfsuid, uid);
+            // Each returns the id it had: the second call tells the first took.
+            assert_eq!((libc::syscall(libc::SYS_setfsgid, gid), libc::syscall(libc::SYS_setfsuid, uid)), (gid as libc::c_long, uid as libc::c_long));
+        };
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                assert_eq!(unsafe { libc::unshare(libc::CLONE_FS) }, 0);
+                unsafe { libc::umask(umask) };
+                become_user();
+                let rt = tokio::runtime::Builder::new_current_thread().enable_all().on_thread_start(become_user).build().unwrap();
+                f(&rt)
+            })
+            .join()
+            .unwrap()
+        })
+    }
+
+    // Servers of several users can each download into one data dir where
+    // each can write every file and dir the others' downloads make in it
+    // (README). Two users, each of a group of their own and both of a third,
+    // take turns in a data dir of that group with the setgid bit: A
+    // downloads a selection, B switches the dir to another, A back to the
+    // first, and B to the other again once kills of A's downloads left a
+    // decode's dir and the temp files of the ledger and the stamp. Each has
+    // a umask of 002: each download goes through, and the dir ends as B's
+    // selection leaves it. Under a umask of 022, the region's dir made
+    // group-writable by hand, B can't append to the ledger A made, nor
+    // finish A's decode, and its downloads fail, naming the file and the
+    // dir. Run as root, the downloads run as the users (as_user); else the
+    // test can't be another user, and ends.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn downloads_of_two_users_into_one_dir_go_through_where_each_has_umask_002() {
+        use std::os::unix::fs::PermissionsExt;
+        const SHARED: u32 = 65530;
+        const A: (u32, u32) = (65531, 65531);
+        const B: (u32, u32) = (65532, 65532);
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let bucket = rt.block_on(test_bucket::serve(test_bucket::template_components()));
+        let (major, none) = (sel("europe", "admin", "simplified", "major"), sel("europe", "admin", "simplified", "none"));
+        let mut got = Vec::new();
+        for umask in [0o022, 0o002] {
+            let root = ScratchDir::new();
+            let dir = root.path().join("europe");
+            std::os::unix::fs::chown(root.path(), None, Some(SHARED)).unwrap();
+            std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o2775)).unwrap();
+            if umask == 0o022 {
+                std::fs::create_dir(&dir).unwrap();
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o2775)).unwrap();
+            }
+            let run = |(uid, gid): (u32, u32), s: &RegionSelection| {
+                let got = as_user(uid, gid, SHARED, umask, |rt| rt.block_on(download(&bucket, s, root.path())));
+                got.map_err(|e| e.to_string().replace(&dir.display().to_string(), "<dir>"))
+            };
+            let mut turns = vec![run(A, &major), run(B, &none), run(A, &major)];
+            // A's download of major killed once its pois decode put
+            // poi_records.bin in (a_download_finishes_what_a_killed_decode_left_before_it_lists_the_files_to_remove),
+            // and kills of others as they wrote the ledger and the stamp.
+            as_user(A.0, A.1, SHARED, umask, |_| {
+                let mut ledger = std::fs::OpenOptions::new().append(true).open(dir.join(FILE_LEDGER)).unwrap();
+                std::io::Write::write_all(&mut ledger, b"poi_records.bin -\npoi_vertices.bin -\n").unwrap();
+                std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap();
+                std::fs::create_dir(dir.join(KILLED_DECODES_DIR)).unwrap();
+                std::fs::rename(dir.join("poi_records.bin"), dir.join(KILLED_DECODES_DIR).join(".earlier.poi_records.bin")).unwrap();
+                std::fs::write(dir.join("poi_records.bin"), b"a member").unwrap();
+                for name in [FILE_LEDGER, BUILD_STAMP] {
+                    std::fs::write(dir.join(format!("{name}.tmp")), b"cut short").unwrap();
+                }
+            });
+            turns.push(run(B, &none));
+            let differ = if turns.iter().all(Result::is_ok) { differing(&held(&dir), &files_of(&bucket, &none)) } else { Vec::new() };
+            got.push((umask, turns, differ));
+        }
+        let refused = vec![
+            Ok(()),
+            Err("I/O error: write <dir>/.file_sha256: Permission denied (os error 13)".to_string()),
+            Ok(()),
+            Err("I/O error: <dir>/.transport.9.0 can't be finished (Permission denied (os error 13)): it would put back poi_records.bin".to_string()),
+        ];
+        assert_eq!(got, [(0o022, refused, Vec::new()), (0o002, vec![Ok(()), Ok(()), Ok(()), Ok(())], Vec::new())]);
+    }
+
     // Before a byte is fetched: a unit of another transport version, or one
     // holding a file the selection doesn't take, which its decode would
     // write beside the selection's.

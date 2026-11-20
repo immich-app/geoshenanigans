@@ -115,13 +115,18 @@ them, by the lock on `.download.lock`. A server that can't write the data dir
 downloads into it: it takes the lock where `.download.lock` is there, else
 loads the dir without it and drops what it loaded where a download ran
 meanwhile, by the check of `.build_date` and `.file_sha256` above. Servers of
-several users that each download into a dir writable to all of them (through
-its group, say) lock the same `.download.lock`, made by whichever came first,
-of mode 0644 under umask 022: one that can't write it takes its lock on it
-open to read, which a local file system allows. On NFS an exclusive lock needs
-the file open to write, so there `.download.lock` must be writable to every
-server that downloads into the dir (a umask of 002, or `chmod g+w`); a
-download that can't take its lock fails, saying so.
+several users can each download into the data dir only where each can write
+every file and dir the others' downloads make in it: the ledger, the temp
+files of a fetch, of the ledger and of the stamp, and the dir of a decode
+killed part way, which the next download finishes. Give the servers a group of
+their own and, before their first download, make the data dir that group's
+with group write and the setgid bit (`chgrp`, then `chmod g+ws`), so that what
+is made in it is that group's too; and run each server with a umask of 002.
+Under a umask of 022 a server's download into a dir whose ledger another
+server made fails, naming the file. A download that can't write
+`.download.lock` (one a server of umask 022 made) takes its lock on it open to
+read, which a local file system allows; on NFS an exclusive lock needs the
+file open to write, so there it fails, saying so.
 
 The test portal is a map page for checking answers, served by every query
 server at `/test`. Its compose file runs two servers on the latest published
