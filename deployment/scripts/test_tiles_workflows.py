@@ -820,36 +820,60 @@ class WatchdogConcurrencyTest(unittest.TestCase):
 
 
 FAKE_CURL_SECRETS = """#!/bin/bash
-# curl ... [-X METHOD] [-H @FILE | -H HEADER]... [--data-binary @-] URL: logs the call to $FAKE_LOG as a JSON line (its
-# key, "METHOD PATH" with PATH after $FAKE_PREFIX and / ? = and spaces as _, the arguments, header lines and body),
-# prints the answer in $FAKE_DIR/KEY.TURN (TURN 2 for the second call with that key) or else $FAKE_DIR/KEY, and exits
-# with the number in that file's .exit, if any.
+# curl ... [-X METHOD] [-H @FILE | -H HEADER]... [--data-binary @-] [--retry N] [--write-out FORMAT] URL: logs the call
+# to $FAKE_LOG as a JSON line (its key, "METHOD PATH" with PATH after $FAKE_PREFIX and / ? = and spaces as _, the
+# arguments, header lines and body), prints the answer in $FAKE_DIR/KEY.TURN (TURN 2 for the second call with that key)
+# or else $FAKE_DIR/KEY, and exits with the number in that file's .exit, if any. The answer's HTTP status is the number
+# in its .status, else 200 (000, no answer, with an .exit); FORMAT's %{http_code} prints it after the answer. As curl
+# does, --retry N calls again, up to N times, while curl timed out or found no address (exit 28, 6 or 5) or the status
+# is 408, 429, 500, 502, 503 or 504, each answer printed after the one before.
 args=("$@")
 method=GET
 body=""
 headers=()
+retries=0
+write_out=""
 for ((i = 0; i < ${#args[@]}; i++)); do
   case "${args[i]}" in
     -X) method=${args[i+1]} ;;
     -H) if [[ "${args[i+1]}" == @* ]]; then headers+=("$(cat "${args[i+1]#@}")"); else headers+=("${args[i+1]}"); fi ;;
     --data-binary) if [ "${args[i+1]}" = @- ]; then body=$(cat); fi ;;
+    --retry) retries=${args[i+1]} ;;
+    -w | --write-out) write_out=${args[i+1]} ;;
   esac
 done
 url=${args[-1]}
 key=$(printf '%s %s' "$method" "${url#"$FAKE_PREFIX"}" | tr '/?= ' '____')
-turn=$(($(jq -r --arg key "$key" 'select(.key == $key) | .key' "$FAKE_LOG" 2>/dev/null | wc -l) + 1))
-jq -cn --arg key "$key" --arg method "$method" --arg url "$url" --arg body "$body" \\
-  --argjson headers "$(jq -cn '$ARGS.positional' --args -- ${headers[@]+"${headers[@]}"})" \\
-  '{key: $key, method: $method, url: $url, body: $body, headers: $headers, args: $ARGS.positional}' --args -- "$@" \\
-  >> "$FAKE_LOG"
-for answer in "$FAKE_DIR/$key.$turn" "$FAKE_DIR/$key"; do
-  if [ -f "$answer" ]; then
+http_code='%{http_code}'
+while :; do
+  turn=$(($(jq -r --arg key "$key" 'select(.key == $key) | .key' "$FAKE_LOG" 2>/dev/null | wc -l) + 1))
+  jq -cn --arg key "$key" --arg method "$method" --arg url "$url" --arg body "$body" \\
+    --argjson headers "$(jq -cn '$ARGS.positional' --args -- ${headers[@]+"${headers[@]}"})" \\
+    '{key: $key, method: $method, url: $url, body: $body, headers: $headers, args: $ARGS.positional}' --args -- "$@" \\
+    >> "$FAKE_LOG"
+  code=0
+  status=200
+  answer=""
+  for each in "$FAKE_DIR/$key.$turn" "$FAKE_DIR/$key"; do
+    if [ -f "$each" ]; then answer=$each; break; fi
+  done
+  if [ -n "$answer" ]; then
     cat "$answer"
-    if [ -f "$answer.exit" ]; then exit "$(cat "$answer.exit")"; fi
-    exit 0
+    if [ -f "$answer.exit" ]; then code=$(cat "$answer.exit"); status=000; fi
+    if [ -f "$answer.status" ]; then status=$(cat "$answer.status"); fi
+  else
+    printf '%s' '{"success": false, "errors": [{"code": 7003, "message": "No route for that URI"}]}'
   fi
+  case "$code $status" in
+    "0 408" | "0 429" | "0 50"[0234] | "5 "* | "6 "* | "28 "*)
+      if [ "$retries" -gt 0 ]; then
+        retries=$((retries - 1))
+        continue
+      fi ;;
+  esac
+  printf '%s' "${write_out//"$http_code"/$status}"
+  exit "$code"
 done
-printf '%s' '{"success": false, "errors": [{"code": 7003, "message": "No route for that URI"}]}'
 """
 
 PUT_SECRETS = os.path.join(ROOT, "deployment", "modules", "cloudflare", "tiles-worker", "put-worker-secrets.sh")
@@ -908,22 +932,26 @@ class PutWorkerSecretsTest(unittest.TestCase):
 
     def run_script(self, answers=None, **overrides):
         """Runs the script against the fake API's answers ({"METHOD PATH": answer, or a list of them by turn, an
-        answer a body or (body, curl's exit status)}): its result and the calls it made."""
+        answer a body, (body, curl's exit status) or (body, curl's exit status, HTTP status)}): its result and the
+        calls it made. Its waits between tries take no time."""
         with tempfile.TemporaryDirectory() as tmp:
-            install(os.path.join(tmp, "bin"), {"curl": FAKE_CURL_SECRETS})
+            install(os.path.join(tmp, "bin"), {"curl": FAKE_CURL_SECRETS, "sleep": "#!/bin/sh\n"})
             answer_dir = os.path.join(tmp, "answers")
             os.makedirs(answer_dir)
             for key, answer in (AFTER_UPLOAD if answers is None else answers).items():
                 name = fake_key(key)
                 turns = answer if isinstance(answer, list) else [answer]
                 for turn, each in enumerate(turns, 1):
-                    body, status = each if isinstance(each, tuple) else (each, 0)
+                    body, status, http_status = (each + (None,))[:3] if isinstance(each, tuple) else (each, 0, None)
                     path = os.path.join(answer_dir, f"{name}.{turn}" if isinstance(answer, list) else name)
                     with open(path, "w") as f:
                         f.write(body)
                     if status:
                         with open(path + ".exit", "w") as f:
                             f.write(str(status))
+                    if http_status:
+                        with open(path + ".status", "w") as f:
+                            f.write(str(http_status))
             log = os.path.join(tmp, "log")
             env = dict(os.environ, PATH=os.path.join(tmp, "bin") + os.pathsep + os.environ["PATH"], FAKE_LOG=log,
                        FAKE_DIR=answer_dir, FAKE_PREFIX=SCRIPT_API, ACCOUNT_ID="account", SCRIPT="tiles-prod",
@@ -1005,6 +1033,32 @@ class PutWorkerSecretsTest(unittest.TestCase):
                 self.assertEqual([body["versions"][0]["version_id"] for body in self.restores(calls)], ["v-before"])
                 self.assertIn("Deployed version v-before of tiles-prod again", result.stderr)
         self.assertIn("no API response", result.stderr)
+
+    def test_a_put_that_goes_on_when_tried_again_puts_nothing_back(self):
+        """What curl's --retry tries again is tried again, and only the last try's answer counts: with --retry, curl
+        writes each try's answer after the one before, so a 502's page or a timed out answer's start, then the JSON
+        of a PUT that went on, would read as no answer and put back the version before."""
+        put = AFTER_UPLOAD["PUT /secrets"]
+        for name, transient in (("bad gateway", ("<html>502 Bad Gateway</html>", 0, 502)),
+                                ("timed out", ('{"success": tr', 28))):
+            with self.subTest(name):
+                result, calls = self.run_script(dict(AFTER_UPLOAD, **{"PUT /secrets": [transient, put, put]}))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.restores(calls), [])
+                self.assertIn("Put BUNNY_API_KEY on tiles-prod\nPut GLOBALPING_TOKEN on tiles-prod\n", result.stdout)
+                puts = [call for call in calls if call["method"] == "PUT"]
+                self.assertEqual([json.loads(call["body"])["name"] for call in puts],
+                                 ["BUNNY_API_KEY", "BUNNY_API_KEY", "GLOBALPING_TOKEN"])
+                self.assertEqual(puts[0]["body"], puts[1]["body"])
+                self.assert_nothing_leaks(result, calls)
+
+    def test_a_put_that_keeps_failing_is_tried_four_times_then_put_back(self):
+        result, calls = self.run_script(
+            dict(AFTER_UPLOAD, **{"PUT /secrets": ("<html>503 Service Unavailable</html>", 0, 503)}))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len([call for call in calls if call["method"] == "PUT"]), 4)
+        self.assertEqual([body["versions"][0]["version_id"] for body in self.restores(calls)], ["v-before"])
+        self.assertIn("Could not put BUNNY_API_KEY on tiles-prod: no API response", result.stderr)
 
     def test_a_put_that_fails_when_the_upload_dropped_nothing_changes_nothing(self):
         # No upload this apply: the serving version still has both secrets, so a failed PUT leaves it as it is.
