@@ -143,7 +143,8 @@ decode:
 1. takes the install lock, waiting while another decode holds it;
 2. finishes the leftovers: it tries the lock of each `.transport.<pid>.<n>`
    dir there; one held is a running decode's, decoding into it, and stays;
-   one it takes is a dead decode's, and is finished (below);
+   one it takes is a dead decode's, and is finished (below), unless it is
+   gone by then: its decode removed it, empty, before it let go of the lock;
 3. makes its own dir and takes its lock, held until after the dir is
    removed, then lets go of the install lock;
 4. decodes the unit's files, as other decodes do theirs at the same time;

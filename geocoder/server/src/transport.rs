@@ -430,9 +430,10 @@ struct Unfinished {
 /// the install lock held. A decode's dir whose lock it takes is one whose decode is gone (a
 /// running decode holds its dir's lock from just after it made it until after it removed it):
 /// it is finished, the lock held meanwhile. One whose lock is held (WouldBlock) is a running
-/// decode's, decoding into it, and stays; one gone meanwhile (NotFound) is skipped. Returns the
-/// dirs it couldn't finish, one that can't be opened or locked among them, which stay. An error
-/// reading `dir` is an error.
+/// decode's, decoding into it, and stays; one gone before it is opened (NotFound) is skipped, and
+/// one gone after, once its decode removed it and let go of its lock, holds nothing to finish
+/// (finish_leftover). Returns the dirs it couldn't finish, one that can't be opened or locked
+/// among them, which stay. An error reading `dir` is an error.
 #[cfg(unix)]
 fn finish_leftovers(dir: &Path) -> io::Result<Vec<Unfinished>> {
     let mut unfinished = Vec::new();
@@ -451,6 +452,7 @@ fn finish_leftovers(dir: &Path) -> io::Result<Vec<Unfinished>> {
                 continue;
             }
         };
+        seam(Step::Opened);
         match lock.try_lock() {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => continue,
@@ -497,7 +499,10 @@ pub fn finish_leftovers_in(dir: &Path) -> io::Result<()> {
 /// into the place left empty; a member that replaced no file stays, complete and checked. Then
 /// the dir goes, with what else it holds. An error reading it, or a file that can't go back,
 /// keeps the dir, and the files still in it, for a later decode to finish: the error, with the
-/// names of the files still to go back (None where it couldn't read the dir).
+/// names of the files still to go back (None where it couldn't read the dir). Called with the
+/// lock of `leftover` held, taken once a sweep opened it: a `leftover` gone by then was removed
+/// by its decode, which removes its dir only once it is empty, and before it lets go of its
+/// lock. Nothing of it is left to finish.
 #[cfg(unix)]
 fn finish_leftover(dir: &Path, leftover: &Path) -> Result<(), (io::Error, Option<Vec<std::ffi::OsString>>)> {
     use std::os::unix::ffi::OsStrExt;
@@ -506,7 +511,11 @@ fn finish_leftover(dir: &Path, leftover: &Path) -> Result<(), (io::Error, Option
         Err(e) if e.kind() == io::ErrorKind::NotFound => false,
         Err(e) => return Err((e, None)),
     };
-    let entries = std::fs::read_dir(leftover).and_then(|d| d.collect::<io::Result<Vec<_>>>()).map_err(|e| (e, None))?;
+    let entries = match std::fs::read_dir(leftover).and_then(|d| d.collect::<io::Result<Vec<_>>>()) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err((e, None)),
+    };
     let mut kept = Ok(());
     let mut to_go_back = Vec::new();
     for e in entries {
@@ -525,9 +534,12 @@ fn finish_leftover(dir: &Path, leftover: &Path) -> Result<(), (io::Error, Option
     std::fs::remove_dir_all(leftover).map_err(|why| (why, Some(Vec::new())))
 }
 
-/// Where a decode into a dir is, as it tells the tests' seam (which outside tests does nothing).
+/// Where a decode into a dir, or a sweep of the dir (finish_leftovers), is, as it tells the
+/// tests' seam (which outside tests does nothing).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
+    /// A decode's dir opened by a sweep, before the sweep tries its lock.
+    Opened,
     /// Its own dir made, the install lock held, before it locks the dir.
     Made,
     /// Its members decoded, before it takes the install lock to put them in place.
@@ -551,13 +563,13 @@ fn install_lock_fault() -> Option<io::Error> {
     None
 }
 
-/// What a test has the decodes on this thread do at each Step.
+/// What a test has the decodes and sweeps on this thread do at each Step.
 #[cfg(test)]
 #[derive(Default)]
 struct Seam {
     /// Where each step is told, with whose decode it is.
     tell: Option<(&'static str, mpsc::Sender<(&'static str, Step)>)>,
-    /// The step at which the next decode waits for a word, once.
+    /// The step at which the next decode, or sweep, waits for a word, once.
     hold: Option<(Step, mpsc::Receiver<()>)>,
     /// The step at which the next decode stops, as one killed there would: it panics, and its
     /// dir stays with what it holds but the members it still made there.

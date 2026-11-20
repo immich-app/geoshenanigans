@@ -1676,6 +1676,53 @@ fn a_decode_puts_its_members_in_only_once_another_let_go_of_the_install_lock() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn a_sweep_finds_nothing_to_finish_in_a_decodes_dir_removed_once_it_opened_it() {
+    // A decode of the places unit cut short is held at the unit's end, its dir made and locked,
+    // while a sweep of the dir opens that dir and is held before it tries its lock: the
+    // downloader's (finish_leftovers_in), or a decode's before its install, its own dir
+    // elsewhere. The cut decode then fails: it removes its dir, and only then lets go of its
+    // lock. The sweep takes that lock, of a dir no longer there, which holds nothing to finish:
+    // it goes on, and the dir is as it was.
+    let (unit, members, dir) = published_places();
+    let (path, expect) = (dir.path(), &expected(&members));
+    let before = tree(path);
+    let elsewhere = ScratchDir::new();
+    let sweeps: [(&str, &(dyn Fn() -> io::Result<()> + Sync)); 2] =
+        [("the downloader's", &|| finish_leftovers_in(path)), ("a decode's", &|| Staging::new_in(elsewhere.path())?.install(path, &[]))];
+
+    let mut got = Vec::new();
+    for (whose, sweep) in sweeps {
+        let (tell, told) = mpsc::channel();
+        let mut seen = Vec::new();
+        let (cut, swept) = std::thread::scope(|s| {
+            let (at_end, held) = mpsc::channel();
+            let (go_cut, wait_cut) = mpsc::channel();
+            let cut_unit = HeldAtEnd { bytes: unit[..unit.len() - 9].to_vec(), at: 0, at_end: Some(at_end), go: wait_cut };
+            let cut = s.spawn(move || decode_into_dir(cut_unit, path, Some(expect)).map(|_| ()).map_err(|e| e.to_string()));
+            held.recv().unwrap();
+            let (go_sweep, wait_sweep) = mpsc::channel();
+            let swept = s.spawn(move || {
+                SEAM.with_borrow_mut(|s| {
+                    s.tell = Some(("sweep", tell));
+                    s.hold = Some((Step::Opened, wait_sweep));
+                });
+                sweep().map_err(|e| e.to_string())
+            });
+            told_up_to(&told, &mut seen, ("sweep", Step::Opened));
+            go_cut.send(()).unwrap();
+            let cut = cut.join().unwrap();
+            go_sweep.send(()).unwrap();
+            (cut, swept.join().unwrap())
+        });
+        assert!(cut.as_ref().is_err_and(|e| e.contains("ends early") || e.contains("incomplete")), "{whose}: {cut:?}");
+        got.push((whose, swept, tree(path) == before));
+    }
+
+    assert_eq!(got, [("the downloader's", Ok(()), true), ("a decode's", Ok(()), true)]);
+}
+
 #[test]
 fn a_chunk_reader_reads_a_channels_chunks_as_one_stream() {
     let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
