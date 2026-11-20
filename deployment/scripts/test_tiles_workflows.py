@@ -2,9 +2,10 @@
 """Tests for the tiles sync and Bunny infra workflows' own logic. Run: python3 -m unittest discover -s deployment/scripts
 -p 'test_*.py'
 
-Needs PyYAML (python3-yaml, on GitHub's Ubuntu runners), bash, git and jq.
+Needs PyYAML (python3-yaml, on GitHub's Ubuntu runners), bash, git, jq and curl.
 """
 import glob
+import http.server
 import json
 import os
 import re
@@ -12,6 +13,8 @@ import shutil
 import subprocess
 import tempfile
 import textwrap
+import threading
+import time
 import unittest
 
 import yaml
@@ -820,31 +823,31 @@ class WatchdogConcurrencyTest(unittest.TestCase):
 
 
 FAKE_CURL_SECRETS = """#!/bin/bash
-# curl ... [-X METHOD] [-H @FILE | -H HEADER]... [--data-binary @-] [--retry N] [--write-out FORMAT] URL: logs the call
-# to $FAKE_LOG as a JSON line (its key, "METHOD PATH" with PATH after $FAKE_PREFIX and / ? = and spaces as _, the
+# curl ... [-X METHOD] [-H @FILE | -H HEADER]... [--data-binary @-] [--retry N] [--output FILE] URL: logs the call to
+# $FAKE_LOG as a JSON line (its key, "METHOD PATH" with PATH after $FAKE_PREFIX and / ? = and spaces as _, the
 # arguments, header lines and body), prints the answer in $FAKE_DIR/KEY.TURN (TURN 2 for the second call with that key)
-# or else $FAKE_DIR/KEY, and exits with the number in that file's .exit, if any. The answer's HTTP status is the number
-# in its .status, else 200 (000, no answer, with an .exit); FORMAT's %{http_code} prints it after the answer. As curl
-# does, --retry N calls again, up to N times, while curl timed out or found no address (exit 28, 6 or 5) or the status
-# is 408, 429, 500, 502, 503 or 504, each answer printed after the one before.
+# or else $FAKE_DIR/KEY, to FILE if given (an empty answer leaves FILE as it was), and exits with the number in that
+# file's .exit, if any. The answer's HTTP status is the number in its .status, else 200 (000, no answer, with an .exit).
+# As curl does, --retry N calls again, up to N times, while curl timed out or found no address (exit 28, 6 or 5) or the
+# status is 408, 429, 500, 502, 503 or 504: on stdout each answer after the one before, while FILE is emptied of what a
+# try wrote before the next.
 args=("$@")
 method=GET
 body=""
 headers=()
 retries=0
-write_out=""
+output=""
 for ((i = 0; i < ${#args[@]}; i++)); do
   case "${args[i]}" in
     -X) method=${args[i+1]} ;;
     -H) if [[ "${args[i+1]}" == @* ]]; then headers+=("$(cat "${args[i+1]#@}")"); else headers+=("${args[i+1]}"); fi ;;
     --data-binary) if [ "${args[i+1]}" = @- ]; then body=$(cat); fi ;;
     --retry) retries=${args[i+1]} ;;
-    -w | --write-out) write_out=${args[i+1]} ;;
+    -o | --output) output=${args[i+1]} ;;
   esac
 done
 url=${args[-1]}
 key=$(printf '%s %s' "$method" "${url#"$FAKE_PREFIX"}" | tr '/?= ' '____')
-http_code='%{http_code}'
 while :; do
   turn=$(($(jq -r --arg key "$key" 'select(.key == $key) | .key' "$FAKE_LOG" 2>/dev/null | wc -l) + 1))
   jq -cn --arg key "$key" --arg method "$method" --arg url "$url" --arg body "$body" \\
@@ -858,22 +861,34 @@ while :; do
     if [ -f "$each" ]; then answer=$each; break; fi
   done
   if [ -n "$answer" ]; then
-    cat "$answer"
+    text=$(cat "$answer")
     if [ -f "$answer.exit" ]; then code=$(cat "$answer.exit"); status=000; fi
     if [ -f "$answer.status" ]; then status=$(cat "$answer.status"); fi
   else
-    printf '%s' '{"success": false, "errors": [{"code": 7003, "message": "No route for that URI"}]}'
+    text='{"success": false, "errors": [{"code": 7003, "message": "No route for that URI"}]}'
+  fi
+  if [ -z "$output" ]; then
+    printf '%s' "$text"
+  elif [ -n "$text" ]; then
+    printf '%s' "$text" > "$output"
   fi
   case "$code $status" in
     "0 408" | "0 429" | "0 50"[0234] | "5 "* | "6 "* | "28 "*)
       if [ "$retries" -gt 0 ]; then
         retries=$((retries - 1))
+        if [ -n "$output" ] && [ -n "$text" ]; then : > "$output"; fi
         continue
       fi ;;
   esac
-  printf '%s' "${write_out//"$http_code"/$status}"
   exit "$code"
 done
+"""
+
+# curl ... URL: the real curl ($REAL_CURL), with URL's $FAKE_PREFIX swapped for $LOCAL_API, a stand-in for the API.
+LOCAL_CURL = """#!/bin/bash
+args=("$@")
+url=${args[-1]}
+exec "$REAL_CURL" "${args[@]:0:${#args[@]}-1}" "$LOCAL_API${url#"$FAKE_PREFIX"}"
 """
 
 PUT_SECRETS = os.path.join(ROOT, "deployment", "modules", "cloudflare", "tiles-worker", "put-worker-secrets.sh")
@@ -925,17 +940,49 @@ def fake_key(call):
     return re.sub(r"[/?= ]", "_", call)
 
 
+class LocalApi(http.server.BaseHTTPRequestHandler):
+    """Cloudflare's API on a local port, for LOCAL_CURL: AFTER_UPLOAD's answers, but PUT /secrets answers with
+    PUTS(the PUT's number, from 1, and seconds since the first) as (HTTP status, headers, body). CALLS holds each
+    call's "METHOD PATH", body and time."""
+    PUTS = None
+    CALLS = []
+
+    def answer(self):
+        key = f"{self.command} {self.path}"
+        body = self.rfile.read(int(self.headers.get("Content-Length") or 0)).decode()
+        LocalApi.CALLS.append((key, body, time.monotonic()))
+        if key == "PUT /secrets":
+            puts = [at for each, _, at in LocalApi.CALLS if each == key]
+            status, headers, body = LocalApi.PUTS(len(puts), puts[-1] - puts[0])
+        else:
+            status, headers, body = 200, {}, AFTER_UPLOAD[key]
+        data = body.encode()
+        self.send_response(status)
+        for name, value in headers.items():
+            self.send_header(name, value)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    do_GET = do_PUT = do_POST = answer
+
+    def log_message(self, *args):
+        pass
+
+
 class PutWorkerSecretsTest(unittest.TestCase):
     """put-worker-secrets.sh, which puts the worker's Bunny secrets through Cloudflare's API after every apply, so
     that OpenTofu's state never holds them (workers.tf, terraform_data.bunny_secrets), and puts back the version that
     served before the apply's upload when it can't."""
 
-    def run_script(self, answers=None, **overrides):
+    def run_script(self, answers=None, curl=FAKE_CURL_SECRETS, **overrides):
         """Runs the script against the fake API's answers ({"METHOD PATH": answer, or a list of them by turn, an
-        answer a body, (body, curl's exit status) or (body, curl's exit status, HTTP status)}): its result and the
-        calls it made. Its waits between tries take no time."""
+        answer a body, (body, curl's exit status) or (body, curl's exit status, HTTP status)}), or with another curl:
+        its result and the calls it made. A sleep of its own takes no time. It leaves no file in its TMPDIR."""
         with tempfile.TemporaryDirectory() as tmp:
-            install(os.path.join(tmp, "bin"), {"curl": FAKE_CURL_SECRETS, "sleep": "#!/bin/sh\n"})
+            install(os.path.join(tmp, "bin"), {"curl": curl, "sleep": "#!/bin/sh\n"})
+            script_tmp = os.path.join(tmp, "tmp")
+            os.makedirs(script_tmp)
             answer_dir = os.path.join(tmp, "answers")
             os.makedirs(answer_dir)
             for key, answer in (AFTER_UPLOAD if answers is None else answers).items():
@@ -956,10 +1003,12 @@ class PutWorkerSecretsTest(unittest.TestCase):
             env = dict(os.environ, PATH=os.path.join(tmp, "bin") + os.pathsep + os.environ["PATH"], FAKE_LOG=log,
                        FAKE_DIR=answer_dir, FAKE_PREFIX=SCRIPT_API, ACCOUNT_ID="account", SCRIPT="tiles-prod",
                        SECRETS="BUNNY_API_KEY GLOBALPING_TOKEN", CLOUDFLARE_API_TOKEN="cf-token-1",
-                       PLANNED_AT=PLANNED_AT, BUNNY_API_KEY="bunny key 2", GLOBALPING_TOKEN='globalping "3"')
+                       PLANNED_AT=PLANNED_AT, BUNNY_API_KEY="bunny key 2", GLOBALPING_TOKEN='globalping "3"',
+                       TMPDIR=script_tmp)
             env.update(overrides)
             result = subprocess.run(["bash", PUT_SECRETS], env=env, cwd=tmp, capture_output=True, text=True,
                                     check=False)
+            self.assertEqual(os.listdir(script_tmp), [], result.stderr)
             calls = []
             if os.path.exists(log):
                 with open(log) as f:
@@ -1026,7 +1075,9 @@ class PutWorkerSecretsTest(unittest.TestCase):
     def test_a_put_that_fails_halfway_or_gets_no_answer_puts_it_back_too(self):
         for name, put in (("second refused", [AFTER_UPLOAD["PUT /secrets"], REFUSED]),
                           ("not json", "<html>bad gateway</html>"),
-                          ("curl failed", ("", 7))):
+                          ("curl failed", ("", 7)),
+                          # Not the answer of the request before, which went through.
+                          ("empty answers", ("", 0, 503))):
             with self.subTest(name):
                 result, calls = self.run_script(dict(AFTER_UPLOAD, **{"PUT /secrets": put}))
                 self.assertNotEqual(result.returncode, 0)
@@ -1035,9 +1086,10 @@ class PutWorkerSecretsTest(unittest.TestCase):
         self.assertIn("no API response", result.stderr)
 
     def test_a_put_that_goes_on_when_tried_again_puts_nothing_back(self):
-        """What curl's --retry tries again is tried again, and only the last try's answer counts: with --retry, curl
+        """What curl's --retry tries again is tried again, and only the last try's answer counts: on stdout, curl
         writes each try's answer after the one before, so a 502's page or a timed out answer's start, then the JSON
-        of a PUT that went on, would read as no answer and put back the version before."""
+        of a PUT that went on, would read as no answer and put back the version before; its --output file it empties
+        before each try again."""
         put = AFTER_UPLOAD["PUT /secrets"]
         for name, transient in (("bad gateway", ("<html>502 Bad Gateway</html>", 0, 502)),
                                 ("timed out", ('{"success": tr', 28))):
@@ -1059,6 +1111,37 @@ class PutWorkerSecretsTest(unittest.TestCase):
         self.assertEqual(len([call for call in calls if call["method"] == "PUT"]), 4)
         self.assertEqual([body["versions"][0]["version_id"] for body in self.restores(calls)], ["v-before"])
         self.assertIn("Could not put BUNNY_API_KEY on tiles-prod: no API response", result.stderr)
+
+    def test_on_the_real_curl_a_rate_limited_or_bad_gateway_put_goes_on_once_tried_again(self):
+        """On the real curl, against a stand-in for the API: a 429 is tried again no sooner than its Retry-After says,
+        and a 502's page is not read with the answer of the try after it. Here a sleep of the script's own takes no
+        time, as 1, 2 then 4 s of its own would not outlast a 60 s Retry-After: only curl's wait outlasts the limit."""
+        real_curl = shutil.which("curl")
+        self.assertIsNotNone(real_curl, "needs curl")
+        put = (200, {}, AFTER_UPLOAD["PUT /secrets"])
+        # The limit ends 1.5 s after the first PUT: a try 2 s later, as the Retry-After asks, goes through; one after
+        # curl's own first wait, 1 s, would not.
+        rate_limited = (429, {"Retry-After": "2"}, cloudflare(success=False, errors=[
+            {"code": 971, "message": "Please wait and consider throttling your request speed"}]))
+        bad_gateway = (502, {"Content-Type": "text/html"}, "<html>502 Bad Gateway</html>")
+        for name, answers in (("rate limited", lambda _, since: rate_limited if since < 1.5 else put),
+                              ("bad gateway", lambda number, _: bad_gateway if number == 1 else put)):
+            with self.subTest(name):
+                LocalApi.PUTS = answers
+                LocalApi.CALLS = []
+                server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), LocalApi)
+                threading.Thread(target=server.serve_forever, daemon=True).start()
+                try:
+                    result, _ = self.run_script(curl=LOCAL_CURL, REAL_CURL=real_curl,
+                                                LOCAL_API=f"http://127.0.0.1:{server.server_address[1]}")
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Put BUNNY_API_KEY on tiles-prod\nPut GLOBALPING_TOKEN on tiles-prod\n", result.stdout)
+                self.assertNotIn("POST /deployments?force=true", [key for key, _, _ in LocalApi.CALLS])
+                puts = [json.loads(body)["name"] for key, body, _ in LocalApi.CALLS if key == "PUT /secrets"]
+                self.assertEqual(puts, ["BUNNY_API_KEY", "BUNNY_API_KEY", "GLOBALPING_TOKEN"])
 
     def test_a_put_that_fails_when_the_upload_dropped_nothing_changes_nothing(self):
         # No upload this apply: the serving version still has both secrets, so a failed PUT leaves it as it is.

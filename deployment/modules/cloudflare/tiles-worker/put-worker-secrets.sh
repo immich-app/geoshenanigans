@@ -40,36 +40,26 @@ for name in $SECRETS; do
   fi
 done
 
-# cloudflare METHOD PATH: Cloudflare's answer for the script's PATH, the body on stdin for anything but GET. What curl's
-# --retry 3 would try again (no answer in time, no address, a 408, 429, 500, 502, 503 or 504) is tried again up to 3
-# times, 1, 2 then 4 seconds later, and only the last try's answer counts: --retry writes each try's answer after the
-# one before, so a 502's page and the JSON of the try that went through would read as no answer.
+# Each request's answer goes to this file, which only this user can read, removed however the script ends.
+answer_file=$(mktemp)
+trap 'rm -f "$answer_file"' EXIT
+
+# cloudflare METHOD PATH: Cloudflare's answer for the script's PATH, the body on stdin for anything but GET. curl tries
+# again what may go through on another try (--retry 3), no sooner than a Retry-After says, and empties its --output
+# file of a try's answer before the next, so only the last try's answer counts: on stdout, a 502's page and then the
+# JSON of the try that went through would read as no answer.
 cloudflare() {
-  local body=() data="" answer code tries=0
+  local body=() code=0
   if [ "$1" != GET ]; then
     body=(-H 'Content-Type: application/json' --data-binary @-)
-    data=$(cat)
   fi
-  while :; do
-    code=0
-    # The answer, then its HTTP status in 3 digits (000 for none). printf is a builtin: the body (a secret's value)
-    # goes on no command line. ${body[@]+...}: bash before 4.4 calls an empty array unset.
-    answer=$(printf '%s' "$data" | curl --silent --show-error --write-out '%{http_code}' -X "$1" \
-      -H @<(printf 'Authorization: Bearer %s\n' "$CLOUDFLARE_API_TOKEN") ${body[@]+"${body[@]}"} "$api$2") || code=$?
-    case "$code ${answer: -3}" in
-      "0 408" | "0 429" | "0 50"[0234] | "5 "* | "6 "* | "28 "*) ;;
-      *) break ;;
-    esac
-    if [ "$tries" -eq 3 ]; then
-      break
-    fi
-    sleep $((1 << tries))
-    tries=$((tries + 1))
-  done
-  if [ "$code" -ne 0 ]; then
-    return "$code"
-  fi
-  printf '%s' "${answer%???}"
+  # A request that gets no answer has none, not the one before's.
+  : > "$answer_file"
+  # ${body[@]+...}: bash before 4.4 calls an empty array unset.
+  curl --silent --show-error --retry 3 --output "$answer_file" -X "$1" \
+    -H @<(printf 'Authorization: Bearer %s\n' "$CLOUDFLARE_API_TOKEN") ${body[@]+"${body[@]}"} "$api$2" || code=$?
+  cat "$answer_file"
+  return "$code"
 }
 
 succeeded() {
