@@ -5,7 +5,10 @@
 //! geocoder-transport decode <unit.tt.zst | -> <dir>
 //!   decodes a unit (zstd-compressed; - reads it from stdin) into its members in <dir>, each
 //!   written in a hidden dir of the decode's own there and all moved into place once the whole
-//!   unit has decoded; on an error <dir> is as it was (transport::decode_into_dir).
+//!   unit has decoded. On unix it holds <dir>'s install lock while it makes that dir and again
+//!   while it moves the members in, each time first finishing what decodes killed there left:
+//!   decodes into one dir move their members in one at a time. On an error <dir> is as it was
+//!   once those were finished (transport::decode_into_dir).
 //! geocoder-transport verify <unit.tt.zst | -> <dir>
 //!   decodes a unit and compares each member with the file of its name in <dir>, writing nothing
 //!   there (a places unit's block table goes to a scratch file in the temp dir while it runs).

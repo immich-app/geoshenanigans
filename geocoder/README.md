@@ -76,8 +76,57 @@ lands in it: `admin` mode, `simplified` boundaries and no POIs unless an admin s
 another selection with `PUT /admin/configuration` (a JSON body of `base_url`,
 `mode`, `quality`, `poi_tier` and the regions to `preload`). A value the build
 doesn't offer fails each download, naming those it does, and the PUT is refused
-with them (400) when the server has the build's manifest at hand. Queries need an
-API key from the dashboard (see Authentication below).
+with them (400) when the server has the build's manifest at hand. A continent
+dir keeps a ledger of what each of its files holds, `.file_sha256` (a line
+`<name> <sha256>` each, `-` while unknown), and a download skips a file only
+where the ledger names the build's sha256 for it. It removes the files its
+selection doesn't take (another selection's or build's) that the ledger names,
+or whose names files of the build have, the ledger naming them or not; files of
+other names stay. The dir names its build in `.build_date` once a whole
+selection of it is in and those are gone; a download that fetches or removes
+anything removes it first, once it has made the ledger where the dir has none
+(a dir holding neither was laid out by hand, and a server loads it). Before it
+reads the dir a download finishes what a transport decode killed part way left
+there (PATCHING.md), which would otherwise put back the files the decode
+replaced once the download had listed the files to remove; one it can't finish
+fails the download.
+Downloads into a dir go one at a time, those of other servers on the data dir
+too: each holds a lock on the dir's `.download.lock` to its end, and runs to
+its end though the query that started it gave up. A server checks and
+loads a dir, when it starts and once its own download into the dir is in,
+under a shared lock on that file, which it makes where it isn't there, so
+that it waits for a download into the dir (another server's) to end and loads
+what it left, and the first download into a dir waits for it; after its own
+download it waits on a thread of its own, and answers queries meanwhile. A
+dir it can't make the file in (read-only, or not writable to it) loads
+without a lock. A download changes the dir's `.build_date` or `.file_sha256`
+before any other file, and writes them by appending or by renaming a new file
+into place: a server notes both (device, inode, size and modification time)
+before it checks a dir and again once it loaded it, and where they differ, a
+download ran meanwhile, it drops what it loaded and says so, the continent
+left unloaded. A server that finds a ledger but no stamp in a dir leaves that
+continent unloaded until a query or a preload finishes its download. Queries
+need an API key from the dashboard (see Authentication below).
+
+Servers can share a data dir. Those that run as one user are safe side by
+side: their downloads into a dir go one at a time and their loads wait for
+them, by the lock on `.download.lock`. A server that can't write the data dir
+(a read-only mount, or a dir of another user) is safe beside one that
+downloads into it: it takes the lock where `.download.lock` is there, else
+loads the dir without it and drops what it loaded where a download ran
+meanwhile, by the check of `.build_date` and `.file_sha256` above. Servers of
+several users can each download into the data dir only where each can write
+every file and dir the others' downloads make in it: the ledger, the temp
+files of a fetch, of the ledger and of the stamp, and the dir of a decode
+killed part way, which the next download finishes. Give the servers a group of
+their own and, before their first download, make the data dir that group's
+with group write and the setgid bit (`chgrp`, then `chmod g+ws`), so that what
+is made in it is that group's too; and run each server with a umask of 002.
+Under a umask of 022 a server's download into a dir whose ledger another
+server made fails, naming the file. A download that can't write
+`.download.lock` (one a server of umask 022 made) takes its lock on it open to
+read, which a local file system allows; on NFS an exclusive lock needs the
+file open to write, so there it fails, saying so.
 
 The test portal is a map page for checking answers, served by every query
 server at `/test`. Its compose file runs two servers on the latest published

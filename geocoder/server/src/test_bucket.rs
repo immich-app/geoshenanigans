@@ -6,11 +6,12 @@
 //! dir (the library's fixture encoders), the others made up, a region's JSON
 //! files alike as a build's are. A dir holding all the files of one of the
 //! template's transport units publishes the unit, the only form of them;
-//! every other file goes as its .zst.
+//! every other file goes as its .zst. A test can have it hold an object's
+//! body back half way (TestBucket::hold).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -35,12 +36,43 @@ pub struct TestBucket {
     pub manifest: Configurations,
     file_requests: Arc<AtomicUsize>,
     files: BTreeMap<String, Vec<u8>>,
+    hold: Arc<Mutex<Option<Hold>>>,
+}
+
+/// An object whose body the bucket holds back half way (TestBucket::hold).
+struct Hold {
+    path: String,
+    reached: Arc<tokio::sync::Notify>,
+    go: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Held by a test while the bucket holds an object's body back: the rest
+/// goes once it is dropped.
+pub struct Holding {
+    reached: Arc<tokio::sync::Notify>,
+    _go: tokio::sync::oneshot::Sender<()>,
+}
+
+impl Holding {
+    /// Returns once the bucket sent the first half of the body.
+    pub async fn reached(&self) {
+        self.reached.notified().await
+    }
 }
 
 impl TestBucket {
     /// How many objects (a file's .zst or a unit) it has served.
     pub fn files_served(&self) -> usize {
         self.file_requests.load(Ordering::SeqCst)
+    }
+
+    /// Holds back the body of the object at `path` (a unit, or a file's
+    /// .zst) the next time it is fetched: it sends the first half, and the
+    /// rest once the Holding returned is dropped.
+    pub fn hold(&self, path: &str) -> Holding {
+        let (reached, (go_tx, go)) = (Arc::new(tokio::sync::Notify::new()), tokio::sync::oneshot::channel());
+        *self.hold.lock().unwrap() = Some(Hold { path: path.to_string(), reached: reached.clone(), go });
+        Holding { reached, _go: go_tx }
     }
 
     /// The bytes of the file at `path`, as its manifest entry gives them.
@@ -58,6 +90,7 @@ struct Served {
     manifest: String,
     objects: HashMap<String, Vec<u8>>,
     file_requests: Arc<AtomicUsize>,
+    hold: Arc<Mutex<Option<Hold>>>,
 }
 
 async fn get(State(s): State<Arc<Served>>, Path(path): Path<String>) -> Response {
@@ -67,8 +100,20 @@ async fn get(State(s): State<Arc<Served>>, Path(path): Path<String>) -> Response
     if path == format!("{DATE}/configurations.json") {
         return s.manifest.clone().into_response();
     }
-    if let Some(body) = path.strip_prefix(&format!("{DATE}/")).and_then(|p| s.objects.get(p)) {
+    if let Some((object, body)) = path.strip_prefix(&format!("{DATE}/")).and_then(|p| s.objects.get_key_value(p)) {
         s.file_requests.fetch_add(1, Ordering::SeqCst);
+        let held = s.hold.lock().unwrap().take_if(|h| h.path == *object);
+        if let Some(Hold { reached, go, .. }) = held {
+            use futures_util::StreamExt;
+            let (first, rest) = body.split_at(body.len() / 2);
+            let (first, rest) = (bytes::Bytes::copy_from_slice(first), bytes::Bytes::copy_from_slice(rest));
+            let rest = futures_util::stream::once(async move {
+                reached.notify_one();
+                let _ = go.await;
+                Ok::<_, std::io::Error>(rest)
+            });
+            return axum::body::Body::from_stream(futures_util::stream::iter([Ok(first)]).chain(rest)).into_response();
+        }
         return body.clone().into_response();
     }
     StatusCode::NOT_FOUND.into_response()
@@ -249,11 +294,11 @@ pub async fn serve_tampered(components: serde_json::Value, tamper: impl Fn(&str,
     }
     let manifest = serde_json::json!({ "build": { "date": DATE }, "components": components, "files": entries, "units": units });
 
-    let file_requests = Arc::new(AtomicUsize::new(0));
-    let served = Arc::new(Served { manifest: manifest.to_string(), objects, file_requests: file_requests.clone() });
+    let (file_requests, hold) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(None)));
+    let served = Arc::new(Served { manifest: manifest.to_string(), objects, file_requests: file_requests.clone(), hold: hold.clone() });
     let app = axum::Router::new().route("/builds/{*path}", axum::routing::get(get)).with_state(served);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    TestBucket { url: format!("http://{addr}"), manifest: serde_json::from_value(manifest).unwrap(), file_requests, files }
+    TestBucket { url: format!("http://{addr}"), manifest: serde_json::from_value(manifest).unwrap(), file_requests, files, hold }
 }
