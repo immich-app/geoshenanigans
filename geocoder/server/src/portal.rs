@@ -4,8 +4,9 @@
 // constraints allow (catalog.rs) as a dataset: /reverse and /polygons with
 // dataset=<id> answer what a query-server answers from that selection's
 // files (handlers.rs), /datasets lists the datasets and the combinations
-// the constraints exclude, /health tells the build served and how the sync
-// goes, and /test is the page. Without a build to serve it starts all the
+// the constraints exclude, /health tells the build served (by its
+// publication ID, sync::publication_id) and how the sync goes, and /test
+// is the page. Without a build to serve it starts all the
 // same: those routes answer 503 with the reason while it syncs.
 
 pub mod catalog;
@@ -111,7 +112,11 @@ pub fn free_space(dir: &Path) -> std::io::Result<u64> {
 
 /// A build the portal serves: its datasets, loaded.
 pub struct Served {
-    /// Its dir under builds/ (`<date>-<n>`).
+    /// Its publication ID (sync::publication_id): of the build as it was
+    /// published, the same on every volume that holds it.
+    pub id: String,
+    /// Its dir under builds/ (`<date>-<n>`), the volume's: on another volume
+    /// that dir may hold another publication of its date.
     pub dir: String,
     /// The sha256 of its configurations.json (sync::manifest_sha256).
     pub manifest_sha256: String,
@@ -282,7 +287,7 @@ async fn health(State(app): State<Arc<App>>) -> Response {
     match served {
         Some(served) => json(StatusCode::OK, serde_json::json!({
             "status": "ok",
-            "build": { "date": served.plan.date, "version": served.plan.version, "dir": served.dir },
+            "build": { "date": served.plan.date, "version": served.plan.version, "id": served.id, "dir": served.dir },
             "datasets": served.plan.datasets.len(),
             "sync": sync,
         }).to_string()),
@@ -351,9 +356,10 @@ impl axum::body::HttpBody for Holding {
 /// Config::lookups_at_once run. A lookup holds its place until its answer's
 /// body is sent or dropped (Holding), and until the lookup ends where its
 /// client has gone before. Named by the headers X-Geocoder-Build (the
-/// build's date), X-Geocoder-Build-Dir (its dir, as /health and /datasets
-/// name it: a build published again under its date is another) and
-/// X-Geocoder-Dataset.
+/// build's date), X-Geocoder-Build-Id (its publication ID, as /health and
+/// /datasets name it: a build published again under its date is another,
+/// whatever dir it is in), X-Geocoder-Build-Dir (its dir on this volume)
+/// and X-Geocoder-Dataset.
 pub async fn lookup(portal: &Portal, served: Arc<Served>, at: usize, answer: impl FnOnce(&MultiIndex) -> Response + Send + 'static) -> Response {
     let Ok(place) = portal.lookups.clone().acquire_owned().await else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "the lookups are closed").into_response();
@@ -371,13 +377,16 @@ pub async fn lookup(portal: &Portal, served: Arc<Served>, at: usize, answer: imp
     if let Ok(build) = axum::http::HeaderValue::from_str(&served.plan.date) {
         h.insert("x-geocoder-build", build);
     }
+    if let Ok(id) = axum::http::HeaderValue::from_str(&served.id) {
+        h.insert("x-geocoder-build-id", id);
+    }
     if let Ok(dir) = axum::http::HeaderValue::from_str(&served.dir) {
         h.insert("x-geocoder-build-dir", dir);
     }
     if let Ok(dataset) = axum::http::HeaderValue::from_str(&served.plan.datasets[at].id) {
         h.insert("x-geocoder-dataset", dataset);
     }
-    h.insert("access-control-expose-headers", "x-geocoder-build, x-geocoder-build-dir, x-geocoder-dataset".parse().unwrap());
+    h.insert("access-control-expose-headers", "x-geocoder-build, x-geocoder-build-id, x-geocoder-build-dir, x-geocoder-dataset".parse().unwrap());
     resp
 }
 

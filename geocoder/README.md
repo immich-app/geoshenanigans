@@ -134,11 +134,11 @@ server at `/test`, where it asks that server. Its compose file runs
 the latest published planet build: each selection of a mode, a boundary
 precision and a POI tier the manifest's constraints allow (28). Its page
 compares up to 4 of them side by side, each a preset or a pick by axis, and
-its URL holds the columns, the point and the build (`b=`, the portal's dir
-of it, `<date>-<n>`), which it flags when another build is served, one
-published again under its date among them. The `<n>` is the volume's: on a
-new volume the same dir can be another publication of its date, which the
-page doesn't tell apart. To run it:
+its URL holds the columns, the point and the build (`b=`, its publication
+ID: `<date>-<the first 12 hex digits of its manifest's sha256>`, the same on
+every volume), which it flags when another build is served, one published
+again under its date among them; a `b=` of a date alone stands for any
+build of its date. To run it:
 
 ```bash
 cd test-portal && docker compose up --build --remove-orphans
@@ -150,13 +150,15 @@ Its `/reverse` and `/polygons` take `dataset=`: a preset's id (`smallest`)
 or `<mode>.<quality>.<poi_tier>` (`admin.simplified.major`), and
 `with-addresses` without one. They answer what a query-server serving that
 selection's files answers, and name the dataset and build that answered in
-`X-Geocoder-Dataset`, `X-Geocoder-Build` (its date) and
-`X-Geocoder-Build-Dir` (its dir, as `/health` and `/datasets` name it).
+`X-Geocoder-Dataset`, `X-Geocoder-Build` (its date), `X-Geocoder-Build-Id`
+(its publication ID, as `/health` and `/datasets` name it) and
+`X-Geocoder-Build-Dir` (the dir the volume holds it in, `<date>-<n>`, the
+volume's alone).
 `/datasets` lists the datasets with their labels and sizes, and the
 combinations the constraints exclude with their messages; `/health` gives
 the build served and how its sync goes. The page asks `/datasets` anew
-once `/health` names another dir, and cancels a polygon request once a
-newer one or a clear supersedes it.
+once `/health` names another publication ID, and cancels a polygon
+request once a newer one or a clear supersedes it.
 The test key the page sends allows 200 requests a second and 5,000,000 a
 day (UTC), shared by every visitor. The page keeps 8 in flight and asks a
 429 of `/reverse` again after a pause, 8 tries in all, after which the 429

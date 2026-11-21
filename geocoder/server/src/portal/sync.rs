@@ -26,6 +26,8 @@
 // A build is the one of a date as its configurations.json was published: a
 // rerun of the nightly that publishes a date's build again makes another,
 // which the sync fetches into a new dir though it serves the one before.
+// The portal names a build by its publication ID (publication_id), of its
+// manifest's sha256: its dir is only where this volume holds it.
 // A build whose manifest is of another build version, or whose datasets
 // don't all load from files that check out, is refused: never switched to,
 // and recorded in REFUSED with why and its manifest's sha256, so that it is
@@ -144,6 +146,16 @@ fn gib(bytes: u64) -> String {
 /// the one published before it under its date.
 pub fn manifest_sha256(bytes: &[u8]) -> String {
     lower_hex(&Sha256::digest(bytes))
+}
+
+/// The publication ID of the build of `date` whose configurations.json is of
+/// sha256 `manifest_sha256`: `<date>-<the first 12 hex digits of that
+/// sha256>`. It names the build as it was published, the same on every
+/// volume, where its dir (`<date>-<n>`) is where a volume holds it: a
+/// publication of a date fills the dir `<date>-1` of a new volume, whichever
+/// of the date's it is.
+pub fn publication_id(date: &str, manifest_sha256: &str) -> String {
+    format!("{date}-{}", &manifest_sha256[..12])
 }
 
 /// The downloader's and the portal's reading of a configurations.json.
@@ -569,8 +581,8 @@ impl Portal {
     }
 
     /// Every dataset of the build dir `name`, whose configurations.json is of
-    /// sha256 `manifest_sha256`, loaded; or the first that doesn't load, and
-    /// why.
+    /// sha256 `manifest_sha256`, loaded, named by its publication ID
+    /// (publication_id); or the first that doesn't load, and why.
     async fn load(&self, name: &str, plan: Plan, manifest_sha256: String) -> Result<Served, String> {
         let (sets, load, dir) = (self.builds().join(name).join(SETS), self.config.load.clone(), name.to_string());
         tokio::task::spawn_blocking(move || {
@@ -579,8 +591,9 @@ impl Portal {
                 let index = load(&sets.join(&dataset.id)).map_err(|e| format!("dataset {}: {e}", dataset.id))?;
                 indexes.push(Arc::new(index));
             }
-            let datasets_json = plan.json(&dir).to_string();
-            Ok(Served { dir, manifest_sha256, plan, indexes, datasets_json })
+            let id = publication_id(&plan.date, &manifest_sha256);
+            let datasets_json = plan.json(&id, &dir).to_string();
+            Ok(Served { id, dir, manifest_sha256, plan, indexes, datasets_json })
         })
         .await
         .map_err(|e| format!("load task: {e}"))?

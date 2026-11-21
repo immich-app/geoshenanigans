@@ -503,33 +503,37 @@ function onGlobe(lat, lng) {
 }
 
 // -- Builds --
-// A build as the page names it: the portal's dir of it, <date>-<n> (the
-// build of a date as it was published: a rerun of the nightly that
-// publishes the date again makes another), or a date alone (a link's b=,
-// or an answer saved, before builds were named by their dir), which stands
-// for any build of its date.
+// A build as the page names it: its publication ID, <date>-<the first 12
+// hex digits of its manifest's sha256> (the build of a date as it was
+// published: a rerun of the nightly that publishes the date again makes
+// another), the same on every portal's volume, whatever the dir it fills
+// there; or a date alone (a link's b= of a date), which stands for any build
+// of its date.
 function buildParts(build) {
-  const m = /^(\d{4}-\d{2}-\d{2})(?:-(\d+))?$/.exec(String(build));
-  return m ? { date: m[1], n: m[2] === undefined ? null : Number(m[2]) } : { date: String(build), n: null };
+  const m = /^(\d{4}-\d{2}-\d{2})(?:-([0-9a-f]+))?$/.exec(String(build));
+  return m ? { date: m[1], id: m[2] ?? null } : { date: String(build), id: null };
 }
 
 // Whether `a` and `b` name one build.
 function sameBuild(a, b) {
   const [x, y] = [buildParts(a), buildParts(b)];
-  return x.date === y.date && (x.n === null || y.n === null || x.n === y.n);
+  return x.date === y.date && (x.id === null || y.id === null || x.id === y.id);
 }
 
-// The order of builds: by date, then dir (a date alone first).
+// The order of builds: by date, then ID (a date alone first). Which of two
+// publications of a date came first their IDs don't tell.
 function buildOrder(a, b) {
   const [x, y] = [buildParts(a), buildParts(b)];
   if (x.date !== y.date) return x.date < y.date ? -1 : 1;
-  return (x.n ?? -1) - (y.n ?? -1);
+  if (x.id === y.id) return 0;
+  if (x.id === null || y.id === null) return x.id === null ? -1 : 1;
+  return x.id < y.id ? -1 : 1;
 }
 
 // -- The link --
 // ?d=<dataset> for each column (a preset's id, or <mode>.<quality>.<poi_tier>),
 // at=<lat>,<lon> for each point to look up, and b=<build>, the build the
-// answers came from (its dir; a date alone still opens).
+// answers came from (its publication ID; a date alone still opens).
 function parseLink(search) {
   const q = new URLSearchParams(search);
   const points = [];
@@ -570,13 +574,14 @@ function catalogMode(status, json) {
 }
 
 // Whether /health's `health` names a build served other than the one the
-// page's datasets (`catalog`, in `mode`) are of, a build published again
-// under its date among them, or one at all while the page waits for one:
-// the page then asks /datasets anew.
+// page's datasets (`catalog`, in `mode`) are of, by its publication ID (a
+// build published again under its date among them, in a dir of the name of
+// the one before), or one at all while the page waits for one: the page
+// then asks /datasets anew.
 function catalogStale(health, mode, catalog) {
-  const dir = health && health.build ? health.build.dir : null;
-  if (!dir) return false;
-  return mode === 'waiting' || (mode === 'catalog' && dir !== catalog.build.dir);
+  const id = health && health.build ? health.build.id : null;
+  if (!id) return false;
+  return mode === 'waiting' || (mode === 'catalog' && id !== catalog.build.id);
 }
 
 // -- Columns --
@@ -674,10 +679,10 @@ function selectionLabel(catalog, selection) {
 // -- Answers --
 // An answer as the page keeps it, from a response of the server: its JSON
 // (data) or why there is none (error), the build and the dataset that
-// answered (X-Geocoder-Build-Dir, the portal's dir of the build, and
+// answered (X-Geocoder-Build-Id, the build's publication ID, and
 // X-Geocoder-Dataset), and the ms it took.
 function answerOf(status, header, body, ms) {
-  const build = header('x-geocoder-build-dir');
+  const build = header('x-geocoder-build-id');
   const dataset = header('x-geocoder-dataset');
   if (status !== 200) return { error: `HTTP ${status}${body ? `: ${body.slice(0, 300)}` : ''}`, build, dataset, ms };
   try {
@@ -1042,12 +1047,16 @@ function storedResult(r) {
 }
 
 // The status line from the portal's /health: the build served (by its
-// dir, or why none), how the sync goes, and the builds it refused.
+// publication ID and its dir on the portal's volume, or why none), how the
+// sync goes, and the builds it refused.
 function statusHtml(health) {
   if (!health || typeof health !== 'object' || !health.sync) return '';
   const s = health.sync;
   const parts = [];
-  if (health.build) parts.push(`build ${esc(health.build.dir)} (v${esc(health.build.version)}) · ${esc(health.datasets)} datasets`);
+  if (health.build) {
+    const b = health.build;
+    parts.push(`build ${esc(b.id)} (v${esc(b.version)}, dir ${esc(b.dir)}) · ${esc(health.datasets)} datasets`);
+  }
   else if (health.reason) parts.push(`<span class="warn">${esc(health.reason)}</span>`);
   if (s.running) {
     let running = `sync: ${esc(s.running)}`;
@@ -1220,10 +1229,10 @@ const pacer = new Pacer({ fetch: (url, signal) => fetch(url, { signal }), now: (
 // Nominatim's public API is asked one request at a time.
 const nominatimPacer = new Pacer({ limit: 1, fetch: (url, signal) => fetch(url, { signal }), now: () => performance.now() });
 
-// The build served, by its dir: a build published again under its date is
-// another.
+// The build served, by its publication ID: a build published again under
+// its date is another.
 function servedBuild() {
-  return catalog ? catalog.build.dir : null;
+  return catalog ? catalog.build.id : null;
 }
 
 function columnLabel(col) {

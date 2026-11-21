@@ -1471,7 +1471,9 @@ async fn datasets_lists_the_28_offered_and_the_combinations_the_constraints_excl
     let t = template();
     let (cfg, _) = manifest_of(&bucket).await;
 
-    assert_eq!(json["build"], serde_json::json!({ "date": DATE, "version": BUILD_VERSION, "dir": format!("{DATE}-1") }));
+    assert_eq!(json["build"], serde_json::json!({
+        "date": DATE, "version": BUILD_VERSION, "id": publication_of(&bucket, DATE).await, "dir": format!("{DATE}-1"),
+    }));
     assert_eq!(json["default"], "full.simplified.all");
     let datasets = json["datasets"].as_array().unwrap();
     assert_eq!(datasets.iter().map(|d| d["id"].as_str().unwrap()).collect::<Vec<_>>(), template_ids());
@@ -1676,34 +1678,83 @@ async fn a_reverse_the_portal_cant_answer_takes_nothing_of_the_keys_allowance() 
     assert_eq!(fetch(&reverse("")).await.status, 429);
 }
 
-// A lookup's headers name the build that answered by its date and by its
-// dir, which /health (its build and its sync's) and /datasets name too: a
-// build published again under its date is another, in a dir of its own,
-// and they name that once it is served.
+/// The publication ID of the build the bucket publishes now under `date`:
+/// the date and the first 12 hex digits of its manifest's sha256.
+async fn publication_of(bucket: &TestBucket, date: &str) -> String {
+    let manifest = reqwest::get(format!("{}/builds/{date}/{MANIFEST}", bucket.url)).await.unwrap().bytes().await.unwrap();
+    format!("{date}-{}", &sync::manifest_sha256(&manifest)[..12])
+}
+
+/// Whether the lookups' headers, /health and /datasets of the portal at
+/// `url` name the build served by the publication ID `id` and the dir `dir`.
+async fn names_the_build(url: &str, id: &str, dir: &str) {
+    for route in ["reverse", "polygons"] {
+        let got = fetch(&format!("{url}/{route}?lat=10.5&lon=20.5&key=test")).await;
+        assert_eq!((got.header("x-geocoder-build"), got.header("x-geocoder-build-id"), got.header("x-geocoder-build-dir")),
+                   (Some(DATE), Some(id), Some(dir)), "{route}");
+        let exposed: Vec<String> = got.header("access-control-expose-headers").unwrap_or_default().split(", ").map(str::to_string).collect();
+        for header in ["x-geocoder-build", "x-geocoder-build-id", "x-geocoder-build-dir", "x-geocoder-dataset"] {
+            assert!(exposed.iter().any(|h| h == header), "{route}: {exposed:?}");
+        }
+    }
+    let health = fetch(&format!("{url}/health")).await.json();
+    assert_eq!((&health["build"]["id"], &health["build"]["dir"], &health["sync"]["served"]),
+               (&serde_json::Value::from(id), &serde_json::Value::from(dir), &serde_json::Value::from(dir)));
+    let datasets = fetch(&format!("{url}/datasets")).await.json();
+    assert_eq!((&datasets["build"]["id"], &datasets["build"]["dir"]), (&serde_json::Value::from(id), &serde_json::Value::from(dir)));
+}
+
+// A lookup's headers name the build that answered by its date, its
+// publication ID and its dir, which /health (its build and its sync's) and
+// /datasets name too: a build published again under its date is another,
+// in a dir of its own, and they name that once it is served.
 #[tokio::test]
-async fn the_headers_health_and_datasets_name_the_build_served_by_its_dir() {
+async fn the_headers_health_and_datasets_name_the_build_served_by_its_publication_and_its_dir() {
     let bucket = test_bucket::serve(test_bucket::template_components()).await;
     let data = ScratchDir::new();
     let (_fixtures, load) = fixtures();
     let p = portal(data.path(), config(&bucket, load));
     p.round(true).await.unwrap();
     let url = serve(router(p.clone(), db())).await;
+    let first = publication_of(&bucket, DATE).await;
+    names_the_build(&url, &first, &format!("{DATE}-1")).await;
 
-    for dir in [format!("{DATE}-1"), format!("{DATE}-2")] {
-        if dir.ends_with("-2") {
-            bucket.edit_build(DATE, |m| m["presets"][2]["label"] = "With street addresses, corrected".into());
-            assert_eq!(p.round(false).await, Ok(format!("build {DATE} is served ({dir})")));
-        }
-        for route in ["reverse", "polygons"] {
-            let got = fetch(&format!("{url}/{route}?lat=10.5&lon=20.5&key=test")).await;
-            assert_eq!((got.header("x-geocoder-build"), got.header("x-geocoder-build-dir")), (Some(DATE), Some(dir.as_str())), "{route}");
-            let exposed = got.header("access-control-expose-headers").unwrap_or_default();
-            assert!(exposed.split(", ").any(|h| h == "x-geocoder-build-dir"), "{route}: {exposed}");
-        }
-        let (health, want) = (fetch(&format!("{url}/health")).await.json(), serde_json::Value::from(dir.as_str()));
-        assert_eq!((&health["build"]["dir"], &health["sync"]["served"]), (&want, &want));
-        assert_eq!(fetch(&format!("{url}/datasets")).await.json()["build"]["dir"], dir);
-    }
+    bucket.edit_build(DATE, |m| m["presets"][2]["label"] = "With street addresses, corrected".into());
+    assert_eq!(p.round(false).await, Ok(format!("build {DATE} is served ({DATE}-2)")));
+
+    let again = publication_of(&bucket, DATE).await;
+    assert_ne!(again, first);
+    names_the_build(&url, &again, &format!("{DATE}-2")).await;
+}
+
+// The publication ID names a build as it was published, the dir only where
+// a volume holds it: two publications of a date, each fetched into a volume
+// of its own, both fill <date>-1, and each is named by an ID of its own.
+// So does a portal started afresh on the volume, serving the build it holds.
+#[tokio::test]
+async fn two_publications_of_a_date_in_one_dir_of_two_volumes_have_ids_of_their_own() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let (before, after) = (ScratchDir::new(), ScratchDir::new());
+    let (_fixtures, load) = fixtures();
+    let first = portal(before.path(), config(&bucket, load.clone()));
+    first.round(true).await.unwrap();
+    let first_id = publication_of(&bucket, DATE).await;
+    bucket.edit_build(DATE, |m| m["presets"][2]["label"] = "With street addresses, corrected".into());
+    let second = portal(after.path(), config(&bucket, load.clone()));
+    assert_eq!(second.round(true).await, Ok(format!("build {DATE} is served ({DATE}-1)")));
+    let second_id = publication_of(&bucket, DATE).await;
+
+    assert_ne!(first_id, second_id);
+    assert_eq!((first.served().unwrap().dir.clone(), second.served().unwrap().dir.clone()), (format!("{DATE}-1"), format!("{DATE}-1")));
+    names_the_build(&serve(router(first, db())).await, &first_id, &format!("{DATE}-1")).await;
+    names_the_build(&serve(router(second, db())).await, &second_id, &format!("{DATE}-1")).await;
+
+    // The first volume's build, served from its dir at start, the bucket's
+    // publication now another.
+    std::fs::write(before.path().join(sync::LATEST_OVERRIDE), "tomorrow\n").unwrap();
+    let restarted = portal(before.path(), config(&bucket, load));
+    assert!(restarted.round(true).await.is_err());
+    names_the_build(&serve(router(restarted, db())).await, &first_id, &format!("{DATE}-1")).await;
 }
 
 // An object whose fetch fails is fetched again after each pause, each try

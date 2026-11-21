@@ -424,9 +424,9 @@ impl Plan {
         ))
     }
 
-    /// What /datasets answers while the build is served from its dir
-    /// `dir`.
-    pub fn json(&self, dir: &str) -> serde_json::Value {
+    /// What /datasets answers while the build of the publication ID `id`
+    /// (sync::publication_id) is served from its dir `dir`.
+    pub fn json(&self, id: &str, dir: &str) -> serde_json::Value {
         let selection = |s: &RegionSelection| {
             serde_json::json!({ "region": s.region, "mode": s.mode, "quality": s.quality, "poi_tier": s.poi_tier })
         };
@@ -441,7 +441,7 @@ impl Plan {
             })
         }).collect();
         serde_json::json!({
-            "build": { "date": self.date, "version": self.version, "dir": dir },
+            "build": { "date": self.date, "version": self.version, "id": id, "dir": dir },
             "default": self.datasets[self.default].id,
             "axes": axes,
             "presets": self.presets.iter().map(|(p, at)| serde_json::json!({
