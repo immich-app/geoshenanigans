@@ -68,6 +68,7 @@ until the job's timeout.
 import argparse
 import hashlib
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -297,13 +298,16 @@ def encode_unit(ticket, transport, out, unit, threads):
                 if enc.poll() is None:
                     enc.kill()
                 enc.wait()
-    # The verify runs on one thread.
+    # The verify runs on one thread. A places unit's decoder keeps a scratch file in its temp dir that only its own
+    # end removes: it gets a dir of its own, removed with whatever a verify killed left in it.
     ticket.give(threads - 1)
     if why is None:
-        try:
-            status, verify_err = run_logged([transport, "verify", path, d], stdout=subprocess.DEVNULL, timeout=limit)
-        except subprocess.TimeoutExpired:
-            status, verify_err = None, stalled
+        with tempfile.TemporaryDirectory() as scratch:
+            try:
+                status, verify_err = run_logged([transport, "verify", path, d], stdout=subprocess.DEVNULL,
+                                                timeout=limit, env={**os.environ, "TMPDIR": scratch})
+            except subprocess.TimeoutExpired:
+                status, verify_err = None, stalled
         if status != 0:
             why = f"verify: {verify_err or f'exit status {status}'}"
     if why is not None and os.path.exists(path):
@@ -337,6 +341,14 @@ class Uploader:
             print("Warning: some streamed uploads failed; the caller re-uploads them", flush=True)
 
 
+def seconds(text):
+    """A wait in seconds: finite and 0 or more, since no time is past nan or inf."""
+    value = float(text)
+    if not math.isfinite(value) or value < 0:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a finite number of seconds, 0 or more")
+    return value
+
+
 def main():
     args = argparse.ArgumentParser()
     args.add_argument("out")
@@ -344,7 +356,7 @@ def main():
     args.add_argument("--upload", default="")
     args.add_argument("--upload-cmd", default="s5cmd run")
     args.add_argument("--late-search", default="", help="the place search job's status file: its files come late")
-    args.add_argument("--late-search-timeout", type=float, default=3600)
+    args.add_argument("--late-search-timeout", type=seconds, default=3600)
     args.add_argument("--late-search-taken", default="", help="gets the status the place search files were taken on")
     opts = args.parse_args()
     out = opts.out

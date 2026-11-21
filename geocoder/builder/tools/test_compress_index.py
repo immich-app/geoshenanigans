@@ -68,9 +68,10 @@ sys.exit(sut.main())
 # (a JSON line), then the members' bytes; verify decodes that (through zstd) against the dir's
 # files and fails for a unit whose path ends with one of $FAKE_VERIFY_FAILS (":"-separated). Each
 # call is logged to $FAKE_TRANSPORT_LOG. A call $FAKE_TRANSPORT_STALL names ("<verb>:<end of its
-# first argument>") stalls: it appends its pid to $FAKE_STALLED and sleeps, its output left open.
+# first argument>") stalls: it appends its pid to $FAKE_STALLED and sleeps, its output left open; a
+# verify leaves a scratch file in its temp dir too, as a places unit's decoder does until it ends.
 FAKE_TRANSPORT = r'''#!{python}
-import json, os, subprocess, sys
+import json, os, subprocess, sys, tempfile
 MEMBERS = {{"places": ["place_cells.bin", "place_nodes.bin", "place_hidden.bin"],
            "pois": ["poi_records.bin", "poi_vertices.bin"], "arcs": ["arc_index.bin", "arc_vertices.bin"]}}
 with open(os.environ["FAKE_TRANSPORT_LOG"], "a") as f:
@@ -79,6 +80,8 @@ verb, _, end = os.environ.get("FAKE_TRANSPORT_STALL", "").partition(":")
 if sys.argv[1] == verb and sys.argv[2].endswith(end):
     with open(os.environ["FAKE_STALLED"], "a") as f:
         f.write(f"{{os.getpid()}}\n")
+    if verb == "verify":
+        open(os.path.join(tempfile.gettempdir(), f".place_nodes.bin.table.{{os.getpid()}}.0"), "w").close()
     os.execvp("sleep", ["sleep", "300"])
 if sys.argv[1] == "encode":
     kind, d, names = sys.argv[2], sys.argv[3], sys.argv[4:] or MEMBERS[sys.argv[2]]
@@ -442,8 +445,9 @@ sut.run_logged = run_logged
 
     def stalled_run(self, env):
         """A child run whose children stall as `env` asks (FAKE_TRANSPORT_STALL, ZSTD_STALL), a child's limit 5 s
-        whatever its bytes: the run, the configurations.json it left, the pids of the children that stalled, and
-        those of them and of the zstds it ran that still run once it ended (each ended then)."""
+        whatever its bytes: the run, the configurations.json it left, the pids of the children that stalled, those
+        of them and of the zstds it ran that still run once it ended (each ended then), and what is left in its
+        temp dir."""
         bin_dir = os.path.join(self.tmp.name, "stalling-bin")
         os.makedirs(bin_dir, exist_ok=True)
         with open(os.path.join(bin_dir, "zstd"), "w") as f:
@@ -452,6 +456,9 @@ sut.run_logged = run_logged
         stalled, zstds = os.path.join(self.tmp.name, "stalled"), os.path.join(self.tmp.name, "zstd-pids")
         for path in (stalled, zstds):
             open(path, "w").close()
+        scratch = os.path.join(self.tmp.name, "child-tmp")
+        shutil.rmtree(scratch, ignore_errors=True)
+        os.makedirs(scratch)
 
         def pids(path):
             with open(path) as f:
@@ -461,7 +468,7 @@ sut.run_logged = run_logged
         try:
             done = self.child_run(plant, {"PATH": f"{bin_dir}:{os.environ['PATH']}", "REAL_ZSTD": shutil.which("zstd"),
                                           "FAKE_STALLED": stalled, "ZSTD_PIDS": zstds, "ZSTD_STALL": "",
-                                          "FAKE_TRANSPORT_STALL": "", **env})
+                                          "FAKE_TRANSPORT_STALL": "", "TMPDIR": scratch, **env})
             running = [p for p in pids(stalled) + pids(zstds) if alive(p)]
         finally:
             for pid in pids(stalled):
@@ -469,26 +476,28 @@ sut.run_logged = run_logged
                     os.kill(pid, 9)
         with open(self.path("configurations.json")) as f:
             cfg = json.load(f)
-        return done, cfg, pids(stalled), running
+        return done, cfg, pids(stalled), running, os.listdir(scratch)
 
     # A zstd that stalls, neither ending nor failing, is killed past its limit and the run ends with the error, for
     # the caller to compress again: it must not hold its threads, and every job queued behind them, for good.
     def test_a_zstd_that_stalls_is_killed_and_fails_the_run(self):
-        done, _, stalled, running = self.stalled_run({"ZSTD_STALL": "planet/full/addr_points.bin"})
+        done, _, stalled, running, left = self.stalled_run({"ZSTD_STALL": "planet/full/addr_points.bin"})
 
         self.assertNotEqual(done.returncode, 0, done.stdout)
         self.assertRegex(done.stderr, r"TimeoutExpired: Command .*'zstd'.*planet/full/addr_points\.bin'\]' timed out")
         self.assertEqual(len(stalled), 1)
         self.assertEqual(running, [])
+        self.assertEqual(left, [])
 
     # A unit whose encode, zstd or verify stalls fails, and its encode and zstd end with it: its files go as .zst.
+    # A verify killed so leaves no scratch behind, though only its own end removes it.
     def test_a_unit_whose_encode_zstd_or_verify_stalls_fails_and_ends_them(self):
         unit = "planet/poi/major/pois.tt.zst"
         for env, why in [({"FAKE_TRANSPORT_STALL": "encode:pois"}, "encode and zstd"),
                          ({"ZSTD_STALL": unit}, "encode and zstd"),
                          ({"FAKE_TRANSPORT_STALL": f"verify:{unit}"}, "verify")]:
             with self.subTest(env=env):
-                done, cfg, stalled, running = self.stalled_run(env)
+                done, cfg, stalled, running, left = self.stalled_run(env)
 
                 self.assertEqual(done.returncode, sut.UNIT_FAILED, done.stdout + done.stderr)
                 self.assertIn(f"  {unit}: {why}: still running after 5s, killed; its files go as .zst\n", done.stdout)
@@ -497,6 +506,7 @@ sut.run_logged = run_logged
                     self.assertEqual(unzstd(self.path(m) + ".zst"), self.files[m], m)
                 self.assertEqual(len(stalled), 1)
                 self.assertEqual(running, [])
+                self.assertEqual(left, [])
 
     SEARCH = ("planet/search/full/simplified/all/places.fst", "planet/search/full/simplified/all/search_meta.json")
 
@@ -613,6 +623,23 @@ sut.run_logged = run_logged
         self.assertIn("no place search status", result["printed"])
         with open(taken) as f:
             self.assertEqual(f.read(), "none\n")
+
+    # A wait that never ends (nan, inf: no time is past them) or makes no sense (under 0) is refused before
+    # anything is compressed, rather than holding the run up on a status that never comes.
+    def test_a_late_search_timeout_must_be_a_finite_number_of_seconds(self):
+        status = os.path.join(self.tmp.name, "place-search.status")
+        with open(status, "w") as f:
+            f.write("0\n")
+        for value in ("nan", "inf", "-1", "-0.5"):
+            with self.subTest(value=value):
+                printed = io.StringIO()
+                with self.assertRaises(SystemExit) as refused, contextlib.redirect_stderr(printed):
+                    self.run_main("--late-search", status, "--late-search-timeout", value)
+
+                self.assertEqual(refused.exception.code, 2)
+                self.assertIn(f"--late-search-timeout: {value!r} is not a finite number of seconds, 0 or more",
+                              printed.getvalue())
+                self.assertEqual(self.zst_files(), {})
 
 
 # The zstd command line before the shared thread budget: level 18 and a thread per 256 MiB, at least one and at most
