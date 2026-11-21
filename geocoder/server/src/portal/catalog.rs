@@ -2,15 +2,18 @@
 // each selection of a region it serves (REGIONS) that the manifest's
 // constraints allow, the files of each as a client downloads them
 // (downloader::resolve_files), the objects one sync fetches for all of them,
-// and what /datasets says of them. The constraints are read here only:
-// /datasets lists the combinations they exclude, with each one's message and
-// what it requires, for the page to grey out.
+// the groups of datasets whose place search is one index (Group), and what
+// /datasets says of them. The constraints are read here only: /datasets
+// lists the combinations they exclude, with each one's message and what it
+// requires, for the page to grey out.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::Deserialize;
 
 use crate::downloader::{self, basename, Configurations, RegionSelection};
+use place_search::dataset::DATASET_FILES;
+use query_server::ADMIN_GEOMETRY_FILES;
 
 /// The regions whose selections the portal serves.
 pub const REGIONS: [&str; 1] = ["planet"];
@@ -30,6 +33,24 @@ pub struct Manifest {
     pub constraints: Vec<Constraint>,
     #[serde(default)]
     pub presets: Vec<Preset>,
+    /// The place search indexes the build publishes (SearchIndex), as it
+    /// is: one that doesn't read as such is taken for none, as the portal
+    /// builds every index itself and only compares those with these.
+    #[serde(default)]
+    pub search_index: Option<serde_json::Value>,
+}
+
+/// The manifest's search_index: the dir of a selection's index (its axes'
+/// values in braces), its files, and the selections whose index it
+/// publishes there.
+#[derive(Deserialize, Debug, Clone)]
+pub struct SearchIndex {
+    pub dir: String,
+    pub files: Vec<String>,
+    #[serde(default)]
+    pub optional_files: Vec<String>,
+    #[serde(default)]
+    pub shipped: Vec<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -114,6 +135,40 @@ pub struct Dataset {
     /// The bytes a client downloads for it: its files' .zst and transport
     /// units, each unit once.
     pub size_download: u64,
+    /// Its group (Plan::groups): the datasets its place search shares an
+    /// index with.
+    pub group: usize,
+}
+
+/// The datasets whose place search is one index: those whose dirs hold the
+/// files an index is made of (place_search::dataset::DATASET_FILES) of the
+/// same bytes each, by the manifest's sha256, and lack the same of them. An
+/// index answers right only beside the files it was built from, so each
+/// dataset of a group searches its index with its own geocoder index, whose
+/// admin files give the context.
+#[derive(Debug, Clone)]
+pub struct Group {
+    /// Its index's dir in the build's search dir: the id of its first
+    /// dataset.
+    pub name: String,
+    /// Its datasets, in the plan's order.
+    pub datasets: Vec<usize>,
+    /// What building its index costs, to build the longest first: the bytes
+    /// of the files of its records and their names, then of its boundaries'
+    /// geometry (query_server::ADMIN_GEOMETRY_FILES), which costs less.
+    pub cost: (u64, u64),
+    /// The index the build publishes of a selection of it (search_index's
+    /// shipped), if any: the first of them.
+    pub shipped: Option<Shipped>,
+}
+
+/// An index a build publishes: its dir in the build, and each of its files
+/// but its search_meta.json (build times) by name, with the sha256 the
+/// manifest gives it, none for a file the manifest lacks.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Shipped {
+    pub dir: String,
+    pub files: Vec<(String, Option<String>)>,
 }
 
 /// A selection the manifest's constraints rule out.
@@ -166,6 +221,9 @@ pub struct Plan {
     pub presets: Vec<(Preset, usize)>,
     /// The dataset a request without dataset= answers (DEFAULT_PRESET's).
     pub default: usize,
+    /// The groups of datasets whose place search is one index, in the order
+    /// of their first datasets.
+    pub groups: Vec<Group>,
 }
 
 /// The values of an axis of `manifest`, in their order (by key where two
@@ -325,6 +383,7 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
                         size_disk: 0,
                         size_download: fetches.iter().map(|f| f.size()).sum(),
                         files: files.into_iter().cloned().collect(),
+                        group: 0,
                     };
                     dataset.size_disk = dataset.links().values().map(|p| cfg.files[p].size_raw).sum();
                     datasets.push(dataset);
@@ -366,6 +425,8 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
     let default = presets.iter().find(|(p, _)| p.id == DEFAULT_PRESET).map(|(_, at)| *at)
         .ok_or_else(|| format!("the manifest has no preset {DEFAULT_PRESET}, which the portal answers without dataset="))?;
 
+    let groups = groups(cfg, manifest, &mut datasets);
+
     // An object whose every file some object before it holds byte for byte
     // is linked to those, not fetched (the build's dirs share files: the
     // place files of each mode, its core strings, ...).
@@ -393,7 +454,47 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
         axes,
         presets,
         default,
+        groups,
     })
+}
+
+/// The groups of `datasets` (Group), each dataset given its own; the
+/// index `manifest`'s search_index publishes of a selection given to its
+/// group.
+fn groups(cfg: &Configurations, manifest: &Manifest, datasets: &mut [Dataset]) -> Vec<Group> {
+    let mut groups: Vec<Group> = Vec::new();
+    let mut by_files: HashMap<Vec<Option<String>>, usize> = HashMap::new();
+    for (at, dataset) in datasets.iter_mut().enumerate() {
+        let links = dataset.links();
+        let file = |name: &str| links.get(name).map(|path| &cfg.files[path]);
+        let sha256: Vec<Option<String>> = DATASET_FILES.iter().map(|name| file(name).map(|f| f.sha256.clone())).collect();
+        let size = |geometry: bool| -> u64 {
+            DATASET_FILES.iter().filter(|name| ADMIN_GEOMETRY_FILES.contains(*name) == geometry).filter_map(|name| file(name)).map(|f| f.size_raw).sum()
+        };
+        dataset.group = *by_files.entry(sha256).or_insert_with(|| {
+            groups.push(Group { name: dataset.id.clone(), datasets: Vec::new(), cost: (size(false), size(true)), shipped: None });
+            groups.len() - 1
+        });
+        groups[dataset.group].datasets.push(at);
+    }
+    let Some(spec) = manifest.search_index.clone().and_then(|v| serde_json::from_value::<SearchIndex>(v).ok()) else {
+        return groups;
+    };
+    for selection in &spec.shipped {
+        let of = |d: &&Dataset| selection.iter().all(|(axis, value)| d.selection.axis(axis) == Some(value.as_str()));
+        for dataset in datasets.iter().filter(of) {
+            let mut dir = spec.dir.clone();
+            for axis in std::iter::once("region").chain(AXES) {
+                dir = dir.replace(&format!("{{{axis}}}"), dataset.selection.axis(axis).unwrap_or_default());
+            }
+            let files = spec.files.iter().chain(&spec.optional_files)
+                .filter(|name| name.as_str() != place_search::constants::META_FILE)
+                .map(|name| (name.clone(), cfg.files.get(&format!("{dir}/{name}")).map(|f| f.sha256.clone())))
+                .collect();
+            groups[dataset.group].shipped.get_or_insert(Shipped { dir, files });
+        }
+    }
+    groups
 }
 
 impl Plan {
@@ -455,6 +556,7 @@ impl Plan {
                 "selection": selection(&d.selection),
                 "size_disk": d.size_disk,
                 "size_download": d.size_download,
+                "search": { "index": self.groups[d.group].name, "shipped": self.groups[d.group].shipped.is_some() },
             })).collect::<Vec<_>>(),
             "excluded": self.excluded.iter().map(|x| serde_json::json!({
                 "id": x.id,

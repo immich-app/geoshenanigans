@@ -1,19 +1,22 @@
 // The test portal's server (the query-portal binary, a bin of place-search:
-// search/src/portal_main.rs). It
-// keeps the whole planet build in <data>/builds, synced from the bucket by
-// itself (sync.rs), and serves each selection of it the manifest's
-// constraints allow (catalog.rs) as a dataset: /reverse and /polygons with
-// dataset=<id> answer what a query-server answers from that selection's
-// files (handlers.rs), /datasets lists the datasets and the combinations
-// the constraints exclude, /health tells the build served (by its
-// publication ID, sync::publication_id) and how the sync goes, and /test
-// is the page. Without a build to serve it starts all the
-// same: those routes answer 503 with the reason while it syncs.
+// search/src/portal_main.rs). It keeps the whole planet build in
+// <data>/builds, synced from the bucket by itself (sync.rs), and serves each
+// selection of it the manifest's constraints allow (catalog.rs) as a
+// dataset: /reverse and /polygons with dataset=<id> answer what a
+// query-server answers from that selection's files (handlers.rs), /search
+// with dataset=<id> what the node binding's searchPlaces answers from them
+// (search.rs), /datasets lists the datasets and the combinations the
+// constraints exclude, /health tells the build served (by its publication
+// ID, sync::publication_id), how the sync goes and how each place search
+// index does, and /test is the page. Without a build to serve it starts all
+// the same: those routes answer 503 with the reason while it syncs.
 
 // By path: query-portal, a bin of place-search, takes this file in by
 // #[path], from which a plain `mod` would look beside it.
 #[path = "portal/catalog.rs"]
 pub mod catalog;
+#[path = "portal/search.rs"]
+pub mod search;
 #[path = "portal/sync.rs"]
 pub mod sync;
 
@@ -49,6 +52,23 @@ pub const BASE_URL: &str = "https://geoshenanigans-reverse-geocoding.t3.tigrisfi
 /// country, so the lookups are capped, not only the page's requests.
 pub const LOOKUPS_AT_ONCE: usize = 8;
 
+/// The searches the portal runs at once (Config::searches_at_once), beside
+/// the lookups: a few /polygons of exact boundaries, seconds each, can hold
+/// every lookup's place, and a search as one types must not wait on them.
+/// A search takes 1-35 ms warm.
+pub const SEARCHES_AT_ONCE: usize = 4;
+
+/// The place search indexes a sync builds at once (PORTAL_SEARCH_JOBS),
+/// each on one thread: 4 build the planet build's 12 in ~156 s, the
+/// longest alone ~135 s.
+pub const SEARCH_JOBS: usize = 4;
+
+/// The most results a /search answers (limit=); DEFAULT_LIMIT without one.
+pub const SEARCH_LIMIT_MAX: usize = 50;
+
+/// The most bytes of a /search's q, its spaces at either end left out.
+pub const SEARCH_QUERY_MAX: usize = 256;
+
 /// How a dataset's dir loads: into a MultiIndex of one slot.
 pub type Loader = Arc<dyn Fn(&Path) -> Result<MultiIndex, String> + Send + Sync>;
 
@@ -68,17 +88,27 @@ pub struct Config {
     /// How many lookups (/reverse, /polygons) run at once, over every
     /// client: the others wait their turn.
     pub lookups_at_once: usize,
+    /// How many searches (/search) run at once, over every client, beside
+    /// the lookups.
+    pub searches_at_once: usize,
     /// How a dataset's dir loads (load_dataset).
     pub load: Loader,
+    /// How a dataset's place search opens over the index of its group
+    /// (search::open_search).
+    pub open_search: search::Opener,
+    /// How many place search indexes a sync builds at once.
+    pub search_jobs: usize,
     /// The bytes free to this process in the file system of a dir.
     pub free_space: fn(&Path) -> std::io::Result<u64>,
 }
 
 impl Config {
     /// The portal's: the bucket of PORTAL_BASE_URL (BASE_URL by default), a
-    /// round every PORTAL_SYNC_SECONDS (3600 by default).
+    /// round every PORTAL_SYNC_SECONDS (3600 by default), PORTAL_SEARCH_JOBS
+    /// index builds at once (search_jobs).
     pub fn from_env() -> Config {
         let seconds = std::env::var("PORTAL_SYNC_SECONDS").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&s| s > 0).unwrap_or(3600);
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get());
         Config {
             base_url: std::env::var("PORTAL_BASE_URL").unwrap_or_else(|_| BASE_URL.to_string()),
             interval: Duration::from_secs(seconds),
@@ -86,10 +116,22 @@ impl Config {
             retry_delays: [5, 30, 120].map(Duration::from_secs).to_vec(),
             fetches_at_once: 8,
             lookups_at_once: LOOKUPS_AT_ONCE,
+            searches_at_once: SEARCHES_AT_ONCE,
             load: Arc::new(load_dataset),
+            open_search: Arc::new(search::open_search),
+            search_jobs: search_jobs(std::env::var("PORTAL_SEARCH_JOBS").ok().as_deref(), cpus),
             free_space,
         }
     }
+}
+
+/// The index builds a sync runs at once: `wanted` (PORTAL_SEARCH_JOBS),
+/// SEARCH_JOBS where it is none or no count above 0, and no more than the
+/// `cpus` this process may run on (its CPU affinity and its cgroup's
+/// quota, std::thread::available_parallelism).
+pub fn search_jobs(wanted: Option<&str>, cpus: usize) -> usize {
+    let wanted = wanted.and_then(|v| v.trim().parse::<usize>().ok()).filter(|&n| n > 0).unwrap_or(SEARCH_JOBS);
+    wanted.min(cpus.max(1))
 }
 
 /// The dataset in the dir `dir` (the links to one selection's files), as a
@@ -130,6 +172,8 @@ pub struct Served {
     pub indexes: Vec<Arc<MultiIndex>>,
     /// What /datasets answers.
     pub datasets_json: String,
+    /// Each dataset's place search.
+    pub search: Arc<search::Searches>,
 }
 
 /// What the sync rounds have done, for /health and the page.
@@ -193,6 +237,9 @@ pub struct Portal {
     /// A place for each lookup that may run (Config::lookups_at_once),
     /// held until its answer's body is sent or dropped (lookup).
     pub lookups: Arc<tokio::sync::Semaphore>,
+    /// A place for each search that may run (Config::searches_at_once),
+    /// held as a lookup's is.
+    pub searches: Arc<tokio::sync::Semaphore>,
     http: reqwest::Client,
 }
 
@@ -201,6 +248,7 @@ impl Portal {
         Portal {
             data,
             lookups: Arc::new(tokio::sync::Semaphore::new(config.lookups_at_once.max(1))),
+            searches: Arc::new(tokio::sync::Semaphore::new(config.searches_at_once.max(1))),
             config,
             served: arc_swap::ArcSwapOption::empty(),
             status: Mutex::new(Status::default()),
@@ -265,14 +313,15 @@ struct App {
     limiter: auth::RateLimiter,
 }
 
-/// The portal's routes: /health, /datasets, /reverse, /polygons and /test,
-/// keys checked against `db`.
+/// The portal's routes: /health, /datasets, /reverse, /polygons, /search
+/// and /test, keys checked against `db`.
 pub fn router(portal: Arc<Portal>, db: Arc<RwLock<auth::Db>>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/datasets", get(datasets))
         .route("/reverse", get(reverse))
         .route("/polygons", get(polygons))
+        .route("/search", get(search_places))
         .route("/test", get(handlers::test_portal))
         .layer(axum::middleware::from_fn(handlers::cors_middleware))
         .with_state(Arc::new(App { portal, db, limiter: auth::RateLimiter::default() }))
@@ -282,10 +331,10 @@ fn json(status: StatusCode, body: String) -> Response {
     (status, [(axum::http::header::CONTENT_TYPE, "application/json")], body).into_response()
 }
 
-/// 200 with the build served, its dataset count and the sync's status; 503
-/// with the reason and the sync's status while there is none. The status's
-/// build served is the one this answer names, though a switch came between
-/// the two reads.
+/// 200 with the build served, its dataset count, how its place search
+/// does (search::Searches::json) and the sync's status; 503 with the reason
+/// and the sync's status while there is none. The status's build served is
+/// the one this answer names, though a switch came between the two reads.
 async fn health(State(app): State<Arc<App>>) -> Response {
     let (mut sync, served) = (app.portal.status(), app.portal.served());
     sync.served = served.as_ref().map(|s| s.dir.clone());
@@ -294,6 +343,7 @@ async fn health(State(app): State<Arc<App>>) -> Response {
             "status": "ok",
             "build": { "date": served.plan.date, "version": served.plan.version, "id": served.id, "dir": served.dir },
             "datasets": served.plan.datasets.len(),
+            "search": served.search.json(),
             "sync": sync,
         }).to_string()),
         None => json(StatusCode::SERVICE_UNAVAILABLE, serde_json::json!({
@@ -366,11 +416,17 @@ impl axum::body::HttpBody for Holding {
 /// whatever dir it is in), X-Geocoder-Build-Dir (its dir on this volume)
 /// and X-Geocoder-Dataset.
 pub async fn lookup(portal: &Portal, served: Arc<Served>, at: usize, answer: impl FnOnce(&MultiIndex) -> Response + Send + 'static) -> Response {
-    let Ok(place) = portal.lookups.clone().acquire_owned().await else {
+    let index = served.indexes[at].clone();
+    held(&portal.lookups, &served, at, move || answer(&index)).await
+}
+
+/// The answer `answer` makes of the dataset `at` of `served`, as lookup
+/// makes one, once a place of `places` is free.
+async fn held(places: &Arc<tokio::sync::Semaphore>, served: &Served, at: usize, answer: impl FnOnce() -> Response + Send + 'static) -> Response {
+    let Ok(place) = places.clone().acquire_owned().await else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "the lookups are closed").into_response();
     };
-    let index = served.indexes[at].clone();
-    let answered = tokio::task::spawn_blocking(move || (answer(&index), place)).await;
+    let answered = tokio::task::spawn_blocking(move || (answer(), place)).await;
     let mut resp = match answered {
         Ok((resp, place)) => {
             let (parts, body) = resp.into_parts();
@@ -420,6 +476,98 @@ async fn polygons(State(app): State<Arc<App>>, Query(p): Query<Params>) -> Respo
         return resp;
     }
     lookup(&app.portal, served, at, move |index| handlers::polygons_answer(index, p.lat, p.lon)).await
+}
+
+#[derive(Deserialize)]
+struct SearchParams {
+    q: Option<String>,
+    limit: Option<usize>,
+    key: Option<String>,
+    debug: Option<String>,
+    dataset: Option<String>,
+}
+
+/// /search of a dataset: the places and POIs whose names match q, best
+/// first, at most limit (1 to SEARCH_LIMIT_MAX, DEFAULT_LIMIT without one),
+/// as the node binding's searchPlaces answers them (query::results_json),
+/// or with debug=1 as `place-search query` prints them, with what the
+/// search did and how long it took (query::debug_line). q goes to the
+/// search as given; with its spaces at either end left out it is 1 to
+/// SEARCH_QUERY_MAX bytes. A search runs as a lookup does, on a place of
+/// the portal's searches (Portal::searches), and is named by the headers a
+/// lookup's are, and X-Geocoder-Search-Index (its dataset's group, which
+/// datasets of the same index share). The dataset and its place search are
+/// found first: a search the portal can't answer (no build served, a
+/// dataset it doesn't offer, one whose index isn't open: 503 with its
+/// state, as /health tells it) takes nothing of its key's rate; then the
+/// key (401), the query (400) and the key's rate, /reverse's (429).
+async fn search_places(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, Query(p): Query<SearchParams>) -> Response {
+    let (served, at) = match app.portal.dataset(p.dataset.as_deref()) {
+        Ok(found) => found,
+        Err(resp) => return resp,
+    };
+    let (id, index) = (served.plan.datasets[at].id.clone(), served.search.index_of(at).to_string());
+    let searcher = match served.search.search(at) {
+        Ok(searcher) => searcher,
+        Err(unready) => {
+            let (status, since, reason) = match unready {
+                search::Unready::Building { since } => ("building", since, None),
+                search::Unready::Failed { since, reason } => ("failed", since, Some(reason)),
+            };
+            let mut body = serde_json::json!({ "status": status, "dataset": id, "index": index, "since": since });
+            if let Some(reason) = reason {
+                body["reason"] = reason.into();
+            }
+            let mut resp = json(StatusCode::SERVICE_UNAVAILABLE, body.to_string());
+            if status == "building" {
+                resp.headers_mut().insert(axum::http::header::RETRY_AFTER, axum::http::HeaderValue::from_static("5"));
+            }
+            return resp;
+        }
+    };
+    let (login, rps, rpd, by_ip) = match handlers::require_valid_key(&app.db, p.key.as_deref()) {
+        Ok(key) => key,
+        Err(resp) => return resp,
+    };
+    let Some(q) = p.q.filter(|q| !q.trim().is_empty()) else {
+        return (StatusCode::BAD_REQUEST, "q must name what to search for").into_response();
+    };
+    if q.trim().len() > SEARCH_QUERY_MAX {
+        return (StatusCode::BAD_REQUEST, format!("q must be at most {SEARCH_QUERY_MAX} bytes")).into_response();
+    }
+    let limit = p.limit.unwrap_or(place_search::constants::DEFAULT_LIMIT);
+    if !(1..=SEARCH_LIMIT_MAX).contains(&limit) {
+        return (StatusCode::BAD_REQUEST, format!("limit must be 1 to {SEARCH_LIMIT_MAX}")).into_response();
+    }
+    let debug = match p.debug.as_deref() {
+        None => false,
+        Some("1") => true,
+        Some(_) => return (StatusCode::BAD_REQUEST, "debug must be 1").into_response(),
+    };
+    let rate_key = if by_ip { format!("{login}:{}", peer.ip()) } else { login };
+    if let Err(msg) = auth::check_rate(&app.limiter, &rate_key, rps, rpd) {
+        return (StatusCode::TOO_MANY_REQUESTS, msg).into_response();
+    }
+    let mut resp = held(&app.portal.searches, &served, at, move || {
+        let started = std::time::Instant::now();
+        let (found, stats) = searcher.search(&q, limit);
+        let body = if debug {
+            place_search::query::debug_line(&q, started.elapsed().as_secs_f64() * 1e6, &found, &stats).to_string()
+        } else {
+            place_search::query::results_json(&found)
+        };
+        json(StatusCode::OK, body)
+    })
+    .await;
+    let h = resp.headers_mut();
+    if let Ok(index) = axum::http::HeaderValue::from_str(&index) {
+        h.insert("x-geocoder-search-index", index);
+    }
+    h.insert(
+        "access-control-expose-headers",
+        "x-geocoder-build, x-geocoder-build-id, x-geocoder-build-dir, x-geocoder-dataset, x-geocoder-search-index".parse().unwrap(),
+    );
+    resp
 }
 
 /// query-portal <data dir> [<bind address>]: serves at once (0.0.0.0:3000

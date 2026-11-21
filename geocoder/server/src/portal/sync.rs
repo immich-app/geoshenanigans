@@ -43,6 +43,13 @@
 // back to it) once it checks out, not fetched. The prune keeps the build
 // served, the one served before it and the dir of the latest build a sync
 // left part way.
+//
+// A build's place search (search.rs) opens over the indexes in its dir's
+// search/: a build a sync fetched, or serves again, opens it once it loads,
+// before it is switched to, and the build served at start opens it once it
+// is served. A group of datasets whose index fails to open refuses
+// nothing: a later round tries it again. The room a sync wants counts the
+// indexes' as they build (SEARCH_ROOM).
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -54,6 +61,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::catalog::{self, Plan};
+use super::search::{Loaded, Searches};
 use super::{Latest, Portal, Progress, Served, BUILD_VERSION};
 use crate::downloader::{self, Configurations, DownloadError, FileEntry};
 use query_server::lower_hex;
@@ -64,6 +72,9 @@ pub const BUILDS: &str = "builds";
 pub const MANIFEST: &str = "configurations.json";
 /// The dir of a build's datasets, in its dir.
 pub const SETS: &str = "sets";
+/// The dir of a build's place search indexes, in its dir: one dir a group
+/// of its datasets (catalog::Group), by the group's name.
+pub const SEARCH: &str = "search";
 /// The ledger of a build dir: the path of each object in place, one a
 /// line, appended once its files are.
 pub const FETCHED: &str = ".fetched";
@@ -82,6 +93,10 @@ pub const REFUSED: &str = "refused.json";
 pub const LATEST_OVERRIDE: &str = "latest.override";
 /// The room a sync wants free beyond its files'.
 pub const FREE_MARGIN: u64 = 2 << 30;
+/// The room a build's place search indexes take as they are built: the
+/// indexes and the sort runs they spill, 6.6 GiB at the peak for the
+/// planet build's 12, 4 or 6 at once (0.9 GiB once built and linked).
+pub const SEARCH_ROOM: u64 = 7 << 30;
 
 /// A build refused by a server of build version `version`: the build of
 /// `date` as it was published, its configurations.json of sha256
@@ -292,7 +307,7 @@ fn in_place(root: &Path, cfg: &Configurations, plan: &Plan) -> Result<(), String
 }
 
 /// The sha256 of the file at `path`, in lowercase hex.
-fn sha256_of(path: &Path) -> std::io::Result<String> {
+pub fn sha256_of(path: &Path) -> std::io::Result<String> {
     use std::io::Read;
     let (mut file, mut hasher, mut buf) = (std::fs::File::open(path)?, Sha256::new(), vec![0u8; 1 << 20]);
     loop {
@@ -494,19 +509,41 @@ impl Portal {
     }
 
     /// One round, under the lock: the start, on the `first` of a process
-    /// (start), then the sync, then the prune. What it did, or why it
-    /// failed. A start that can't list the builds fails the round before
-    /// the sync and the prune, and is the next round's to run again: a prune
-    /// with no build served would remove the one the start would serve.
+    /// (start), then the sync, then the prune, then the place search of the
+    /// build served since an earlier round, whose groups that failed to
+    /// open there are tried again (a build served in this round had its
+    /// groups opened as it was). What it did, or why it failed. A start
+    /// that can't list the builds fails the round before the sync and the
+    /// prune, and is the next round's to run again: a prune with no build
+    /// served would remove the one the start would serve.
     pub async fn round(&self, first: bool) -> Result<String, String> {
         let _lock = self.lock().await?;
+        let before = self.served();
         if first {
             self.start().await?;
             self.started.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         let synced = self.sync().await;
         self.prune().await;
+        if let Some(served) = self.served().filter(|now| before.as_ref().is_some_and(|b| Arc::ptr_eq(b, now))) {
+            self.open_search(&served).await;
+        }
         synced
+    }
+
+    /// Opens the place search of the build `served` (Searches::step), on a
+    /// blocking thread: every group of its datasets not open, built where
+    /// it must be, Config::search_jobs at once.
+    async fn open_search(&self, served: &Arc<Served>) {
+        if served.search.all_ready() {
+            return;
+        }
+        self.running(format!("opening the place search of build {}", served.dir));
+        let (search, open, jobs) = (served.search.clone(), self.config.open_search.clone(), self.config.search_jobs);
+        match tokio::task::spawn_blocking(move || search.step(&open, jobs)).await {
+            Ok(done) => eprintln!("portal search: build {}: {done}", served.dir),
+            Err(e) => eprintln!("portal search: build {}: its step failed: {e}", served.dir),
+        }
     }
 
     /// Takes the lock every round holds, waiting while another holds it
@@ -537,7 +574,9 @@ impl Portal {
             let name = dir.name();
             match self.open(&name).await {
                 Ok(served) => {
-                    self.serve(served);
+                    let served = Arc::new(served);
+                    self.serve(served.clone());
+                    self.open_search(&served).await;
                     break;
                 }
                 Err(why) => {
@@ -582,28 +621,36 @@ impl Portal {
 
     /// Every dataset of the build dir `name`, whose configurations.json is of
     /// sha256 `manifest_sha256`, loaded, named by its publication ID
-    /// (publication_id); or the first that doesn't load, and why.
+    /// (publication_id); or the first that doesn't load, and why. Each
+    /// keeps the stamps of the files it loaded from
+    /// (place_search::dataset::load), which its place search opens over;
+    /// one whose files changed while it loaded doesn't load.
     async fn load(&self, name: &str, plan: Plan, manifest_sha256: String) -> Result<Served, String> {
-        let (sets, load, dir) = (self.builds().join(name).join(SETS), self.config.load.clone(), name.to_string());
+        let root = self.builds().join(name);
+        let (sets, load, dir) = (root.join(SETS), self.config.load.clone(), name.to_string());
         tokio::task::spawn_blocking(move || {
-            let mut indexes = Vec::with_capacity(plan.datasets.len());
+            let (mut indexes, mut loaded) = (Vec::with_capacity(plan.datasets.len()), Vec::with_capacity(plan.datasets.len()));
             for dataset in &plan.datasets {
-                let index = load(&sets.join(&dataset.id)).map_err(|e| format!("dataset {}: {e}", dataset.id))?;
-                indexes.push(Arc::new(index));
+                let set = sets.join(&dataset.id);
+                let (index, stamps) = place_search::dataset::load(&set, || load(&set)).map_err(|e| format!("dataset {}: {e}", dataset.id))?;
+                let index = Arc::new(index);
+                indexes.push(index.clone());
+                loaded.push(Loaded { id: dataset.id.clone(), index, stamps, dir: set });
             }
             let id = publication_id(&plan.date, &manifest_sha256);
             let datasets_json = plan.json(&id, &dir).to_string();
-            Ok(Served { id, dir, manifest_sha256, plan, indexes, datasets_json })
+            let search = Arc::new(Searches::new(root.join(SEARCH), &plan, loaded));
+            Ok(Served { id, dir, manifest_sha256, plan, indexes, datasets_json, search })
         })
         .await
         .map_err(|e| format!("load task: {e}"))?
     }
 
     /// Serves `served` from now on; the build served before, if any.
-    fn serve(&self, served: Served) -> Option<Arc<Served>> {
+    fn serve(&self, served: Arc<Served>) -> Option<Arc<Served>> {
         let dir = served.dir.clone();
         eprintln!("portal: serving build {dir}");
-        let before = self.served.swap(Some(Arc::new(served)));
+        let before = self.served.swap(Some(served));
         self.set_status(|s| {
             s.served = Some(dir);
             s.not_served.clear();
@@ -785,6 +832,8 @@ impl Portal {
             }
             match self.open(&name).await {
                 Ok(served) => {
+                    let served = Arc::new(served);
+                    self.open_search(&served).await;
                     if let Some(before) = self.serve(served) {
                         eprintln!("portal sync: build {name} is served again in place of {}", before.dir);
                     }
@@ -861,13 +910,14 @@ impl Portal {
             }
         }
 
-        // The room of what is still to fetch, beside what the ledger names.
+        // The room of what is still to fetch, beside what the ledger names,
+        // and of the place search indexes built once it is in.
         let need: u64 = todo.iter().flat_map(|o| &o.files).map(|f| cfg.files[f].size_raw).sum();
         let free = (self.config.free_space)(&self.data).map_err(|e| format!("free space in {}: {e}", self.data.display()))?;
-        if free < need + FREE_MARGIN {
+        if free < need + SEARCH_ROOM + FREE_MARGIN {
             return Err(format!(
-                "{} free in {}, {} needed to fetch build {date}: its files' {} and a margin of {}",
-                gib(free), self.data.display(), gib(need + FREE_MARGIN), gib(need), gib(FREE_MARGIN)
+                "{} free in {}, {} needed to fetch build {date}: its files' {}, its place search indexes' {} and a margin of {}",
+                gib(free), self.data.display(), gib(need + SEARCH_ROOM + FREE_MARGIN), gib(need), gib(SEARCH_ROOM), gib(FREE_MARGIN)
             ));
         }
         if resume.is_none() {
@@ -891,6 +941,8 @@ impl Portal {
         self.running(format!("loading build {name}"));
         match self.load(&name, plan, sha256.clone()).await {
             Ok(loaded) => {
+                let loaded = Arc::new(loaded);
+                self.open_search(&loaded).await;
                 if let Some(before) = self.serve(loaded) {
                     eprintln!("portal sync: build {name} is served in place of {}", before.dir);
                 }
