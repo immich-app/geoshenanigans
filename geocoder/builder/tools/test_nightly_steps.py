@@ -162,9 +162,9 @@ class DownloadTest(unittest.TestCase):
 
 
 # The download step's tools as the step runs them. s5cmd lists the keys of $FAKE_CACHED (":"-separated, under the
-# cache bucket) and copies any to a local path, the PBF in $FAKE_PBF_SECONDS by the step's clock (date); curl answers the wikidata and TIGER lookups and downloads, and the
-# day's diff as $FAKE_DIFF says: "ok" (a gzip), or "stall" (it writes its pid to $FAKE_DIFF_PID and never ends);
-# aria2c (the mirror) writes the PBF. Each call goes to $FAKE_CALLS.
+# cache bucket) and copies any to a local path, the PBF in $FAKE_PBF_SECONDS by the step's clock (date); curl answers
+# the wikidata and TIGER lookups and downloads, and the day's diff as $FAKE_DIFF says: "ok" (a gzip), or "stall" (it
+# writes its pid to $FAKE_DIFF_PID and never ends); aria2c (the mirror) writes the PBF. Each call goes to $FAKE_CALLS.
 FAKE_S5CMD = r"""#!{python}
 import os, sys
 args = sys.argv[1:]
