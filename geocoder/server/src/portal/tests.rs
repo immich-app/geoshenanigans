@@ -747,6 +747,95 @@ async fn a_round_that_cant_learn_the_latest_build_keeps_the_sync_left_part_way()
     assert_eq!(bucket.requests().len() - before, order.len() - 3);
 }
 
+/// What fetches left in the build dir `root`: a download's temporary files
+/// and decodes' dirs, by path.
+fn leftovers(root: &Path) -> Vec<String> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if name.ends_with(".tmp") || name.starts_with(".transport.") {
+                out.push(entry.path().strip_prefix(root).unwrap().display().to_string());
+            } else if entry.file_type().unwrap().is_dir() {
+                walk(root, &entry.path(), out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out
+}
+
+// A round whose ledger can't take an object's line starts no other fetch,
+// and ends only once the fetches it started have: none goes on writing in
+// its dir once the round, and its lock, are over.
+#[tokio::test]
+async fn a_round_whose_ledger_fails_ends_only_once_the_fetches_it_started_have() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let mut two_at_a_time = config(&bucket, load);
+    two_at_a_time.fetches_at_once = 2;
+    let p = portal(data.path(), two_at_a_time);
+    let mut order = fetched(&bucket).await;
+    order.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+    // A dir of the build to resume whose ledger is a dir: no line goes in.
+    let root = data.path().join(BUILDS).join(format!("{DATE}-1"));
+    std::fs::create_dir_all(root.join(sync::FETCHED)).unwrap();
+    let manifest = reqwest::get(format!("{}/builds/{DATE}/{MANIFEST}", bucket.url)).await.unwrap().bytes().await.unwrap();
+    std::fs::write(root.join(MANIFEST), &manifest).unwrap();
+    let holding = bucket.hold(&object_url(&order[0]));
+
+    let round = tokio::spawn({
+        let p = p.clone();
+        async move { p.round(true).await }
+    });
+    holding.reached().await;
+    let second = format!("{DATE}/{}", object_url(&order[1]));
+    until("the second object's fetch", || bucket.requests().contains(&second)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!round.is_finished());
+    drop(holding);
+
+    let failed = round.await.unwrap().unwrap_err();
+    assert!(failed.starts_with(&format!("write {}: ", root.join(sync::FETCHED).display())), "{failed}");
+    let mut requests = bucket.requests();
+    requests.sort();
+    let mut want: Vec<String> = order[..2].iter().map(|o| format!("{DATE}/{}", object_url(o))).collect();
+    want.sort();
+    assert_eq!(requests, want);
+    for f in order[..2].iter().flat_map(|o| &o.files) {
+        assert!(std::fs::read(root.join(f)).unwrap() == bucket.file(f), "{f}");
+    }
+    assert_eq!(leftovers(&root), Vec::<String>::new());
+}
+
+// Two tries at one file at once (one a round left running, one of the
+// next) each write a file of their own, and each puts it in place.
+#[tokio::test]
+async fn two_tries_at_one_file_at_once_each_write_a_file_of_their_own() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let root = ScratchDir::new();
+    let object = fetched(&bucket).await.into_iter().find(|o| !o.unit).unwrap();
+    let dir = root.path().join(object.path.rsplit_once('/').unwrap().0);
+    let client = reqwest::Client::new();
+    let temporary = || std::fs::read_dir(&dir).map_or(0, |d| d.filter(|e| e.as_ref().unwrap().file_name().to_str().unwrap().ends_with(".tmp")).count());
+    let holding = bucket.hold(&object_url(&object));
+
+    let first = tokio::spawn({
+        let (client, url, cfg, object, root) = (client.clone(), bucket.url.clone(), bucket.manifest.clone(), object.clone(), root.path().to_path_buf());
+        async move { sync::try_object(&client, &url, DATE, &cfg, &object, &root).await }
+    });
+    holding.reached().await;
+    until("the first try's file", || temporary() == 1).await;
+    sync::try_object(&client, &bucket.url, DATE, &bucket.manifest, &object, root.path()).await.unwrap();
+    drop(holding);
+
+    first.await.unwrap().unwrap();
+    assert!(std::fs::read(root.path().join(&object.path)).unwrap() == bucket.file(&object.path));
+    assert_eq!(temporary(), 0);
+}
+
 // A build the volume holds whose files no longer hold their manifest's
 // bytes is not served at start: it is fetched again, into a new dir, and
 // served from there; the damaged one goes.

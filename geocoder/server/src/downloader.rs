@@ -276,7 +276,9 @@ pub async fn get(client: &reqwest::Client, url: &str) -> Result<reqwest::Respons
 
 /// Fetch `{base_url}/builds/{date}/{path}.zst`, a file published as its own
 /// .zst, decompress, verify sha256 against `expected.sha256`, write
-/// atomically to `dest`.
+/// atomically to `dest`, through `<dest>.tmp`: a download into a dir runs
+/// under its download lock, and one killed leaves that file for the next to
+/// write over.
 pub async fn download_file(
     client: &reqwest::Client,
     base_url: &str,
@@ -284,6 +286,24 @@ pub async fn download_file(
     path: &str,
     expected: &FileEntry,
     dest: &Path,
+) -> Result<(), DownloadError> {
+    let tmp = dest.with_extension(format!(
+        "{}.tmp", dest.extension().and_then(|s| s.to_str()).unwrap_or("")
+    ));
+    download_file_through(client, base_url, date, path, expected, dest, &tmp).await
+}
+
+/// download_file through the temporary file `tmp`, beside `dest`, which the
+/// caller names: a name no other download writes, where two may write one
+/// file at once.
+pub async fn download_file_through(
+    client: &reqwest::Client,
+    base_url: &str,
+    date: &str,
+    path: &str,
+    expected: &FileEntry,
+    dest: &Path,
+    tmp: &Path,
 ) -> Result<(), DownloadError> {
     let url = format!("{}/builds/{}/{}.zst", base_url.trim_end_matches('/'), date, path);
     let resp = get(client, &url).await?;
@@ -294,9 +314,7 @@ pub async fn download_file(
     // network chunks plus the zstd window, regardless of file size.
     // Decode + hash + write run on a blocking thread fed through a
     // bounded channel so the async executor never blocks on disk I/O.
-    let tmp = dest.with_extension(format!(
-        "{}.tmp", dest.extension().and_then(|s| s.to_str()).unwrap_or("")
-    ));
+    let tmp = tmp.to_path_buf();
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(8);
     let tmp_for_writer = tmp.clone();

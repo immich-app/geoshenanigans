@@ -282,6 +282,29 @@ pub fn hold_volume(data: &Path) -> Result<std::fs::File, String> {
     }
 }
 
+/// How many tries at a file this process has made, for the names of their
+/// temporary files.
+static TRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One try at `object` of the build of `date` at `base_url`
+/// (downloader::download_file_through or download_unit), its files'
+/// entries those of `cfg`, into the build dir `root`. A file's try writes
+/// a temporary file of its own beside it, `<file>.<pid>.<n>.tmp`, as a
+/// unit's decode writes a dir of its own: a try whose round has gone may
+/// still be writing its file while the next try writes another.
+pub async fn try_object(http: &reqwest::Client, base_url: &str, date: &str, cfg: &Configurations, object: &catalog::Object, root: &Path) -> Result<(), DownloadError> {
+    let files: Vec<(&str, &FileEntry)> = object.files.iter().map(|f| (f.as_str(), &cfg.files[f])).collect();
+    let dir = root.join(Path::new(&object.path).parent().unwrap_or(Path::new("")));
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| DownloadError::Io(format!("mkdir {}: {e}", dir.display())))?;
+    if object.unit {
+        return downloader::download_unit(http, base_url, date, &object.path, &files, &dir).await;
+    }
+    let dest = root.join(&object.path);
+    let mut tmp = dest.as_os_str().to_owned();
+    tmp.push(format!(".{}.{}.tmp", std::process::id(), TRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)));
+    downloader::download_file_through(http, base_url, date, &object.path, files[0].1, &dest, Path::new(&tmp)).await
+}
+
 #[derive(Deserialize)]
 struct LatestJson {
     latest: String,
@@ -696,7 +719,11 @@ impl Portal {
     /// Fetches `todo` into the build dir `root`, the largest first, a few
     /// at once: each object into the dir its path names, its line added to
     /// the ledger once its files are in. Every object is tried; an error
-    /// names those that failed.
+    /// names those that failed. A line that can't go into the ledger stops
+    /// it: it starts no other fetch, and returns that error once every
+    /// fetch it started has ended (a fetch's decode, on a blocking thread,
+    /// writes into `root` until its fetch ends), so that nothing of the
+    /// round writes in the dir once the round, and its lock, are over.
     async fn fetch(&self, root: &Path, cfg: &Configurations, date: &str, mut todo: Vec<&catalog::Object>) -> Result<(), String> {
         todo.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
         let mut progress = Progress {
@@ -707,9 +734,9 @@ impl Portal {
         self.running(format!("fetching build {date}: {} objects, {}", progress.objects_total, gib(progress.bytes_total)));
         self.set_status(|s| s.progress = Some(progress.clone()));
         let (mut todo, mut fetching) = (todo.into_iter(), futures_util::stream::FuturesUnordered::new());
-        let mut failed = Vec::new();
+        let (mut failed, mut stopped) = (Vec::new(), None);
         loop {
-            while fetching.len() < self.config.fetches_at_once.max(1) {
+            while stopped.is_none() && fetching.len() < self.config.fetches_at_once.max(1) {
                 let Some(object) = todo.next() else { break };
                 fetching.push(self.fetch_object(root, cfg, date, object));
             }
@@ -718,14 +745,23 @@ impl Portal {
                 failed.push(format!("{}: {e}", object.path));
                 continue;
             }
+            if stopped.is_some() {
+                continue;
+            }
             use std::io::Write;
             let line = format!("{}\n", object.path);
-            std::fs::OpenOptions::new().create(true).append(true).open(root.join(FETCHED))
-                .and_then(|mut f| f.write_all(line.as_bytes()))
-                .map_err(|e| format!("write {}: {e}", root.join(FETCHED).display()))?;
+            let noted = std::fs::OpenOptions::new().create(true).append(true).open(root.join(FETCHED))
+                .and_then(|mut f| f.write_all(line.as_bytes()));
+            if let Err(e) = noted {
+                stopped = Some(format!("write {}: {e}", root.join(FETCHED).display()));
+                continue;
+            }
             progress.objects_done += 1;
             progress.bytes_done += object.size;
             self.set_status(|s| s.progress = Some(progress.clone()));
+        }
+        if let Some(why) = stopped {
+            return Err(why);
         }
         if failed.is_empty() {
             Ok(())
@@ -743,16 +779,9 @@ impl Portal {
 
     /// fetch_object's tries.
     async fn fetch_attempts(&self, root: &Path, cfg: &Configurations, date: &str, object: &catalog::Object) -> Result<(), DownloadError> {
-        let files: Vec<(&str, &FileEntry)> = object.files.iter().map(|f| (f.as_str(), &cfg.files[f])).collect();
-        let dir = root.join(Path::new(&object.path).parent().unwrap_or(Path::new("")));
-        tokio::fs::create_dir_all(&dir).await.map_err(|e| DownloadError::Io(format!("mkdir {}: {e}", dir.display())))?;
         let mut delays = self.config.retry_delays.iter();
         loop {
-            let got = if object.unit {
-                downloader::download_unit(&self.http, &self.config.base_url, date, &object.path, &files, &dir).await
-            } else {
-                downloader::download_file(&self.http, &self.config.base_url, date, &object.path, files[0].1, &root.join(&object.path)).await
-            };
+            let got = try_object(&self.http, &self.config.base_url, date, cfg, object, root).await;
             match (got, delays.next()) {
                 (Ok(()), _) => return Ok(()),
                 (Err(e), Some(delay)) => {
