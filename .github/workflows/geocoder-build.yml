@@ -1320,6 +1320,50 @@ jobs:
           fi
           rm -f "$WORKDIR/planet.osm.pbf"
 
+      # For Report to o11y's token. A failed install doesn't fail the run:
+      # the report then warns and sends nothing.
+      - name: Install 1Password CLI
+        if: always() && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
+
+      # What only this runner has, to FUTO o11y, whatever the outcome (see
+      # geocoder/README.md, Monitoring): build phases, memory, verify counts,
+      # patch and index sizes and the logs. The run's outcome comes from the
+      # watchdog, which also sees runs whose runner died before this step.
+      # Reporting never fails the run. Only main's runs (the schedule and
+      # the watchdog's retries): a test dispatch from another branch isn't
+      # the nightly. The token is read here and handed to the report alone,
+      # so no other step can see it. Everything it reads is final once
+      # Finalize ends, so it runs beside the cleanups and the artifacts after
+      # it, detached so it outlives this step; Wait for the o11y report, the
+      # job's last step, collects it.
+      - name: Report to o11y
+        if: always() && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        timeout-minutes: 5
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
+          BUILD_DATE: ${{ steps.setup.outputs.today }}
+          DATA_TIMESTAMP: ${{ steps.setup.outputs.data_timestamp }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          if ! token=$(op read "op://tf_prod/O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD/password"); then
+            echo "::warning::Could not read the o11y token from 1Password; reporting nothing"
+            exit 0
+          fi
+          echo "::add-mask::$token"
+          # The inner script expands its own arguments ($0 is the status file).
+          # shellcheck disable=SC2016
+          O11Y_TOKEN="$token" setsid nohup bash -c '"$@"; echo $? > "$0"' "$RUNNER_TEMP/o11y.status" \
+            timeout 240 python3 geocoder/builder/tools/o11y_report.py nightly --base-url "$O11Y_URL" \
+            --build-log "$WORKDIR/build.log" --memwatch-log "$WORKDIR/memwatch.log" \
+            --results-dir "$WORKDIR/results" --output-dir "$WORKDIR/output" \
+            --build-date "$BUILD_DATE" --data-timestamp "$DATA_TIMESTAMP" \
+            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            > "$RUNNER_TEMP/o11y.log" 2>&1 < /dev/null &
+
       # ── Cleanup old Tigris builds ──────────────────────────────────────
       # Retention policy:
       #   - Full builds (every .bin.zst, etc.): keep 3 days
@@ -1506,38 +1550,18 @@ jobs:
           echo "::error::A transport unit failed; its files were published as .zst — see Compress index files (or compress.log of Generate patches and verify)"
           exit 1
 
-      # For Report to o11y's token. A failed install doesn't fail the run:
-      # the report then warns and sends nothing.
-      - name: Install 1Password CLI
-        if: always() && github.ref == 'refs/heads/main'
-        continue-on-error: true
-        uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
-
-      # What only this runner has, to FUTO o11y, whatever the outcome (see
-      # geocoder/README.md, Monitoring): build phases, memory, verify counts,
-      # patch and index sizes and the logs. The run's outcome comes from the
-      # watchdog, which also sees runs whose runner died before this step.
-      # Reporting never fails the run. Only main's runs (the schedule and
-      # the watchdog's retries): a test dispatch from another branch isn't
-      # the nightly. The token is read here and handed to the report alone,
-      # so no other step can see it.
-      - name: Report to o11y
+      # The report Report to o11y started beside the steps since: the runner
+      # ends what a job leaves running, so the job's last step waits for it.
+      - name: Wait for the o11y report
         if: always() && github.ref == 'refs/heads/main'
         continue-on-error: true
         timeout-minutes: 5
         env:
-          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_TF_PROD_ENV }}
-          WORKDIR: ${{ steps.setup.outputs.workdir }}
-          BUILD_DATE: ${{ steps.setup.outputs.today }}
-          DATA_TIMESTAMP: ${{ steps.setup.outputs.data_timestamp }}
+          RUNNER_TEMP: ${{ runner.temp }}
         run: |
-          if ! token=$(op read "op://tf_prod/O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD/password"); then
-            echo "::warning::Could not read the o11y token from 1Password; reporting nothing"
-            exit 0
-          fi
-          echo "::add-mask::$token"
-          O11Y_TOKEN="$token" python3 geocoder/builder/tools/o11y_report.py nightly --base-url "$O11Y_URL" \
-            --build-log "$WORKDIR/build.log" --memwatch-log "$WORKDIR/memwatch.log" \
-            --results-dir "$WORKDIR/results" --output-dir "$WORKDIR/output" \
-            --build-date "$BUILD_DATE" --data-timestamp "$DATA_TIMESTAMP" \
-            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+          # None started: Report to o11y had no token.
+          [ -f "$RUNNER_TEMP/o11y.log" ] || exit 0
+          WAIT_START=$(date +%s)
+          until [ -s "$RUNNER_TEMP/o11y.status" ] || [ $(( $(date +%s) - WAIT_START )) -gt 270 ]; do sleep 1; done
+          echo "Waited $(( $(date +%s) - WAIT_START ))s for the o11y report (exit status $(cat "$RUNNER_TEMP/o11y.status" 2> /dev/null || echo none))"
+          cat "$RUNNER_TEMP/o11y.log"

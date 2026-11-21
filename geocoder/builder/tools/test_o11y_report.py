@@ -374,6 +374,39 @@ class StepSlugsTest(unittest.TestCase):
         self.assertLessEqual(set(sut.STEP_SLUGS), names)
 
 
+def nightly_steps():
+    """The nightly's steps in order: (name, its lines)."""
+    with open(WORKFLOW) as f:
+        return re.findall(r"^      - name: (.+)\n((?:(?: {8}.*)?\n)*)", f.read(), re.M)
+
+
+class NightlyReportTest(unittest.TestCase):
+    """The report runs beside the cleanups and artifacts once Finalize is done, and the job's last step waits
+    for it; the cleanups keep their steps, names and conditions, and so their step metrics."""
+
+    def test_the_report_starts_after_finalize_and_the_last_step_waits_for_it(self):
+        names = [name for name, _ in nightly_steps()]
+        body = dict(nightly_steps())
+        self.assertEqual(names[names.index("Finalize upload and configurations.json") + 1:][:4],
+                         ["Install 1Password CLI", "Report to o11y", "Cleanup old Tigris builds", "Cleanup old cache bucket"])
+        self.assertEqual(names[-1], "Wait for the o11y report")
+        for name in ("Install 1Password CLI", "Report to o11y", "Wait for the o11y report"):
+            self.assertIn("if: always() && github.ref == 'refs/heads/main'", body[name], name)
+        for name in ("Report to o11y", "Wait for the o11y report"):
+            self.assertIn("continue-on-error: true", body[name], name)
+        self.assertIn("if: env.PATCH_VERIFY_FAILED != '1' && env.TRANSPORT_UNIT_FAILED != '1'", body["Cleanup old Tigris builds"])
+        self.assertIn("if: ${{ !cancelled() && steps.setup.outputs.cache_bucket != '' }}", body["Cleanup old cache bucket"])
+
+    def test_the_report_runs_detached_with_the_token_its_alone(self):
+        body = dict(nightly_steps())["Report to o11y"]
+        self.assertIn("O11Y_TOKEN=\"$token\" setsid nohup bash -c '\"$@\"; echo $? > \"$0\"' \"$RUNNER_TEMP/o11y.status\" \\\n", body)
+        self.assertIn("timeout 240 python3 geocoder/builder/tools/o11y_report.py nightly", body)
+        self.assertEqual(len(re.findall(r"O11Y_TOKEN=", body)), 1)
+        wait = dict(nightly_steps())["Wait for the o11y report"]
+        self.assertIn('[ -s "$RUNNER_TEMP/o11y.status" ]', wait)
+        self.assertIn('cat "$RUNNER_TEMP/o11y.log"', wait)
+
+
 LATEST = {"latest": "2026-10-12", "updated_at": "2026-10-12T06:45:24Z"}
 # The latest finished nightly, as the GitHub API returns its run and its job:
 # its runner was lost during the build.
