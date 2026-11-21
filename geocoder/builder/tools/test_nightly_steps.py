@@ -147,7 +147,9 @@ class DownloadTest(unittest.TestCase):
 
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual([c.split()[0] for c in calls], ["timeout", "curl", "gzip", "pbf-apply"])
-        self.assertEqual(calls[0].split()[1:3], ["600", "curl"])
+        self.assertEqual(calls[0].split()[1], "600")
+        self.assertIn(" curl ", calls[0])
+        self.assertIn(" gzip -t ", calls[0])
         self.assertIn("/replication/day/000/004/710.osc.gz", calls[1])
         self.assertEqual(calls[2].split()[1], "-t")
 
@@ -421,6 +423,35 @@ class FetchDayDiffTest(unittest.TestCase):
         self.assertEqual(self.files(), [])
         with open(self.pid) as f:
             self.assertFalse(alive(int(f.read())))
+
+    # The check of the diff is within the limit too, ended with it.
+    def test_a_check_that_hangs_is_given_up_on_at_the_limit(self):
+        gzip_pid = os.path.join(self.root, "gzip.pid")
+        with open(os.path.join(self.bin, "gzip"), "w") as f:
+            f.write(f"#!/bin/sh\necho $$ > {gzip_pid}\nexec /usr/bin/sleep 300\n")
+        os.chmod(os.path.join(self.bin, "gzip"), 0o755)
+
+        try:
+            done, took = self.fetch("open(out, 'wb').write(gzip.compress(b'<osmChange/>'))\n", limit=2)
+        except subprocess.TimeoutExpired:
+            self.fail("the check of the diff held the fetch past its limit")
+
+        self.assertNotEqual(done.returncode, 0)
+        self.assertLess(took, 30)
+        self.assertEqual(self.files(), [])
+        with open(gzip_pid) as f:
+            self.assertFalse(alive(int(f.read())))
+
+    # A diff that passed its check but can't take its name is no diff: the fetch fails and leaves nothing.
+    def test_a_diff_that_cannot_be_moved_into_place_fails_the_fetch(self):
+        os.makedirs(os.path.join(self.out, "x"))
+
+        done, _ = self.fetch("open(out, 'wb').write(gzip.compress(b'<osmChange/>'))\n")
+
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(self.files(), ["diff-today.osc.gz"])
+        self.assertEqual(os.listdir(self.out), ["x"])
+        self.assertIn("::warning::[diff] Could not move the diff of seq 4710 into place", done.stdout)
 
 
 class RustToolchainTest(unittest.TestCase):
