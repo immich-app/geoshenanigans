@@ -17,6 +17,8 @@ set -euo pipefail
 mode=$1
 out=$2
 cpus=$("$(dirname "$0")/cpu_budget.sh")
+# all's zst checksums, read before the cd below: their path may be relative.
+if [ "$mode" = all ]; then zst=$(cat "$3"); fi
 cd "$out"
 
 # The sha256sum lines of the files find selects (its tests in "$@"), hashed on
@@ -30,7 +32,6 @@ case $mode in
     hash_files -name "*.zst"
     ;;
   all)
-    zst=$(cat "$3")
     if ! diff <(sed 's/^[0-9a-f]\{64\}  //' <<< "$zst" | sed '/^$/d' | sort) <(find . -type f -name "*.zst" | sort) >&2; then
       echo "checksums.sh: the .zst checksums of $3 do not name the .zst files of $out (above: < theirs, > the files)" >&2
       exit 1

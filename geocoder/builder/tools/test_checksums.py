@@ -76,6 +76,16 @@ class ChecksumsTest(unittest.TestCase):
                          sorted(line.split("  ", 1)[1] for line in self.one_go().splitlines() if line.endswith(".zst")))
         self.assertTrue(all(line.endswith(".zst") for line in zst.splitlines()))
 
+    # The paths may be relative to where it runs, the .zst checksums' too.
+    def test_relative_paths_name_what_they_name_where_it_runs(self):
+        self.hash_zst()
+
+        done = subprocess.run(["bash", SCRIPT, "all", "output", "zst.sha256"], cwd=self.root, capture_output=True,
+                              text=True)
+
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, self.one_go())
+
     # A .zst written after the early hash (a compression run again) has no line, or a stale one: the merge
     # refuses, rather than publish a checksum that is not the file's.
     def test_a_zst_set_that_changed_after_its_hash_is_refused(self):
