@@ -136,9 +136,9 @@ class Night:
         for day in (self.old_root, self.new_root):
             self.scenario["logical"][os.path.join(day, variant)] = [mapped_kib * 1024, scratch_kib * 1024]
 
-    def run(self, **env):
-        """Runs the script with env set over this process's (None: unset). The free scratch is ample unless
-        given, so no test depends on the space of the volume it runs on."""
+    def run(self, check=True, **env):
+        """Runs the script with env set over this process's (None: unset); with check, it must exit 0. The free
+        scratch is ample unless given, so no test depends on the space of the volume it runs on."""
         scenario = os.path.join(self.root, "scenario.json")
         with open(scenario, "w") as f:
             json.dump(self.scenario, f)
@@ -152,8 +152,8 @@ class Night:
             else:
                 env[name] = str(value)
         done = subprocess.run(["bash", os.path.join(HERE, "generate_patches.sh"), self.old_root, self.new_root,
-                               self.results, self.logs], env=env, check=True, capture_output=True, text=True)
-        self.stdout, self.stderr = done.stdout, done.stderr
+                               self.results, self.logs], env=env, check=check, capture_output=True, text=True)
+        self.returncode, self.stdout, self.stderr = done.returncode, done.stdout, done.stderr
         self.events = {}
         if os.path.exists(self.scenario["events"]):
             for line in read(self.scenario["events"]).splitlines():
@@ -388,6 +388,21 @@ class GeneratePatchesTest(unittest.TestCase):
         self.assertEqual(night.mismatches("r/a"),
                          "the verify needs %d KiB of scratch, more than the %d KiB free less the reserve of 0 KiB\n"
                          % (1 + PATCHER_SCRATCH_KIB, GIB // 2))
+
+    # Without a dir in scratch for the estimates no variant can be sized:
+    # the script fails, sizing and diffing nothing, rather than leave every
+    # variant without a result.
+    def test_no_dir_for_the_estimates_fails_the_script(self):
+        night = Night(self, ["r/full"])
+        os.rmdir(night.scratch)
+
+        night.run(check=False)
+
+        self.assertEqual(night.returncode, 1)
+        self.assertIn("estimates-XXXXXX", night.stderr)
+        self.assertFalse(os.path.exists(night.scenario["sized"]))
+        self.assertEqual(night.events, {})
+        self.assertEqual(os.listdir(night.results), [])
 
     # A dir the diff cannot size is not diffed: its variant fails with the
     # diff's last line, and the others go on.

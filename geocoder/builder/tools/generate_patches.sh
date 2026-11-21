@@ -244,9 +244,11 @@ estimate_variant() {
 }
 
 # Every variant sized at once, max_jobs at a time, then read in in order.
+# Without a dir for the estimates none could be sized: the script fails
+# (mktemp says why) rather than leave every variant without a result.
 declare -A weight=() diff_scratch=() verify_scratch=()
 variants=($(cd "$new_root" && find . -name '*.bin' -printf '%h\n' | sed 's|^\./||' | sort -u))
-estimates=$(mktemp -d "$scratch_root/estimates-XXXXXX")
+estimates=$(mktemp -d "$scratch_root/estimates-XXXXXX") || exit 1
 sizing=0
 for variant in "${variants[@]}"; do
   if [ "$sizing" -ge "$max_jobs" ]; then
