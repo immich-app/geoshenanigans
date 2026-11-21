@@ -82,6 +82,19 @@ jobs:
         with:
           persist-credentials: false
 
+      # The job's CPU, memory and work-volume IO, every 30 s from here to its
+      # end (job_sampler.sh), detached so it outlives this step; the runner
+      # stops it with the job. Its log goes up with the job's other logs
+      # (Upload job logs); its first line, here, gives the CPUs and the quota.
+      - name: Start the job sampler
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          setsid nohup "$GITHUB_WORKSPACE/geocoder/builder/tools/job_sampler.sh" "$RUNNER_TEMP/jobstat.log" "$RUNNER_TEMP" 30 \
+            > /dev/null 2>&1 < /dev/null &
+          sleep 1
+          head -1 "$RUNNER_TEMP/jobstat.log" || true
+
       # ── Setup ──────────────────────────────────────────────────────
       # libzstd-dev: geocoder-patch, which verifies the night's patches, links
       # the distro's libzstd (its static library), not a build of the zstd
@@ -653,7 +666,7 @@ jobs:
           #   generation, which waits for them; its transport units decode
           #   once geocoder-transport is built (Build place search).
           if [ "$PBF_SOURCE" != "today" ]; then
-            echo "Caching today's PBF in background..."
+            echo "Caching today's PBF in background from $(date -u +%H:%M:%S)..."
             # The inner script expands its own arguments ($0 is the status file).
             # shellcheck disable=SC2016
             setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/pbf-cache.status" \
@@ -1137,6 +1150,7 @@ jobs:
           # starts from it): let it finish before the job frees the disk.
           if [ -f "$WORKDIR/pbf-cache.log" ]; then
             until [ -s "$WORKDIR/pbf-cache.status" ]; do sleep 10; done
+            echo "Caching today's PBF ended at $(date -u -r "$WORKDIR/pbf-cache.status" +%H:%M:%S)"
             if [ "$(cat "$WORKDIR/pbf-cache.status")" != 0 ]; then
               echo "::warning::Caching today's PBF failed; tomorrow downloads it from a mirror"
               cat "$WORKDIR/pbf-cache.log"
@@ -1271,6 +1285,23 @@ jobs:
         with:
           name: diff-logs
           path: ${{ steps.setup.outputs.workdir }}/diff-logs/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      # The job sampler's samples and the background jobs' logs: the tools
+      # and their unit tests, the place search build and indexes, and
+      # compression, one line an item.
+      - name: Upload job logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: job-logs
+          path: |
+            ${{ runner.temp }}/jobstat.log
+            ${{ runner.temp }}/tools.log
+            ${{ runner.temp }}/search.log
+            ${{ runner.temp }}/geocoder/place-search.log
+            ${{ runner.temp }}/geocoder/compress.log
           if-no-files-found: ignore
           retention-days: 7
 
