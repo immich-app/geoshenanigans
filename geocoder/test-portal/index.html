@@ -304,6 +304,91 @@
   }
   @keyframes spin { to { transform: rotate(360deg); } }
 
+  /* Dataset columns */
+  .datasets-section { max-height: 42vh; overflow-y: auto; }
+  .columns { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }
+  .columns-note { font-size: 12px; color: var(--text-dim); }
+  .picker {
+    flex: 1 1 200px;
+    min-width: 0;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 12px;
+  }
+  .picker select {
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 4px;
+    font-size: 12px;
+    min-width: 0;
+  }
+  .picker-row { display: flex; gap: 4px; align-items: center; }
+  .picker-row select { flex: 1; }
+  .picker-remove, .add-column, .tool {
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    padding: 3px 8px;
+    font-size: 12px;
+  }
+  .add-column { border-style: dashed; align-self: center; }
+  .tool { padding: 4px 12px; }
+  .picker-axes { display: flex; flex-direction: column; gap: 3px; margin-top: 5px; }
+  .picker-axes label { display: flex; gap: 6px; align-items: center; justify-content: space-between; }
+  .picker-axes label span { color: var(--text-dim); white-space: nowrap; }
+  .picker-axes select { flex: 1; max-width: 62%; }
+  .picker-axes option:disabled { color: var(--text-dim); }
+  .picker-name { font-weight: 500; margin-top: 5px; }
+  .picker-meta, .picker-desc, .picker-constraint { color: var(--text-dim); font-size: 11px; margin-top: 2px; }
+  .picker-constraint { font-style: italic; }
+  .picker-note { color: var(--orange); font-size: 11px; margin-top: 3px; }
+  .picker-error { color: var(--red); font-size: 11px; margin-top: 3px; }
+  .warn { color: var(--red); }
+  .status-line { font-size: 11px; color: var(--text-dim); margin-top: 6px; }
+  .banner {
+    font-size: 12px;
+    color: var(--orange);
+    border: 1px solid var(--orange);
+    border-radius: 4px;
+    padding: 6px 8px;
+    margin-bottom: 8px;
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+  }
+  .banner:empty { display: none; }
+  .banner button { margin-left: auto; background: transparent; color: var(--orange); padding: 0 4px; }
+  .tag {
+    display: inline-block;
+    font-size: 10px;
+    padding: 0 5px;
+    border-radius: 3px;
+    border: 1px solid var(--orange);
+    color: var(--orange);
+    margin-left: 6px;
+    vertical-align: middle;
+  }
+
+  /* Answers side by side */
+  .answer-head { border-top: 2px solid var(--accent); padding-top: 4px; min-width: 0; }
+  .answer-label { font-size: 11px; text-transform: uppercase; margin-bottom: 2px; }
+  .answer-meta { font-size: 11px; color: var(--text-dim); overflow-wrap: anywhere; }
+  .answer-name { font-size: 13px; color: var(--text-dim); margin-top: 4px; overflow-wrap: anywhere; }
+  .fields { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .fields tr { border-bottom: 1px solid var(--border); }
+  .fields th { text-align: left; padding: 4px 8px; }
+  .fields td { padding: 4px 8px; overflow-wrap: anywhere; }
+  .fields td.field { color: var(--text-dim); width: 140px; }
+  .fields tr.differs, .fields tr.missing { background: rgba(217, 74, 74, 0.06); }
+  .fields tr.differs td.value { color: var(--red); }
+  .fields td.empty { color: var(--orange); }
+  .detail-places tr.unshared td { color: var(--orange); }
+
   @media (max-width: 800px) {
     .layout { flex-direction: column; }
     .map-panel { flex: 0 0 45vh; }
@@ -317,6 +402,13 @@
     <div id="map"></div>
   </div>
   <div class="side-panel">
+    <section class="datasets-section">
+      <h3>Datasets</h3>
+      <div class="banner" id="banner"></div>
+      <div class="columns" id="columns"></div>
+      <div class="status-line" id="status"></div>
+    </section>
+
     <section>
       <h3>Coordinates</h3>
       <div class="coord-row">
@@ -338,9 +430,9 @@
     <div class="results-section">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:6px;flex-wrap:wrap;">
         <h3 style="margin:0;flex:1">Results <span id="resultCount"></span></h3>
-        <button id="minimalBtn" onclick="toggleMinimal()" style="padding:4px 12px;font-size:12px;background:var(--surface2);color:#fff;border:1px solid var(--border);border-radius:4px;cursor:pointer;" title="Query the minimal-dataset server (port 3001) side-by-side. Shows what the smallest admin-only deployable would resolve.">Minimal: Off</button>
-        <button id="nominatimBtn" onclick="toggleNominatim()" style="padding:4px 12px;font-size:12px;background:var(--surface2);color:#fff;border:1px solid var(--border);border-radius:4px;cursor:pointer;" title="Query Nominatim's public API for side-by-side comparison. Off by default — each query hits api.openstreetmap.org so leave off unless you need the comparison.">Nominatim: Off</button>
-        <button id="polygonsBtn" onclick="togglePolygons()" style="padding:4px 12px;font-size:12px;background:var(--surface2);color:#fff;border:1px solid var(--border);border-radius:4px;cursor:pointer;" title="Cycle the polygon overlay: Off → Full (port 3002) → Minimal (port 3001) → Off. Use to compare which admin levels disappear in the minimal dataset.">Polygons: Off</button>
+        <button id="nominatimBtn" class="tool" onclick="toggleNominatim()" title="Query Nominatim's public API for side-by-side comparison. Off by default — each query hits nominatim.openstreetmap.org so leave off unless you need the comparison.">Nominatim: Off</button>
+        <button id="polygonsBtn" class="tool" onclick="togglePolygons()" title="Cycle the polygon overlay: Off, then the admin polygons of each column's dataset in turn. Use to compare which admin levels a smaller dataset drops.">Polygons: Off</button>
+        <button id="linkBtn" class="tool" onclick="copyLink(this)" title="Copy a link to these columns, the selected point and the build that answered">Copy link</button>
         <button id="retestBtn" onclick="retestAllResults()" style="padding:4px 12px;font-size:12px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;">Re-test</button>
         <button onclick="clearResults()" style="padding:4px 12px;font-size:12px;background:var(--red);color:#fff;border:none;border-radius:4px;cursor:pointer;">Clear</button>
       </div>
@@ -354,6 +446,501 @@
   </div>
 </div>
 
+<script id="core">
+// The page's logic that reads no DOM: the link, the columns and the datasets
+// they name (the server's /datasets), the pacing of requests, the comparison
+// of answers and the HTML of each part. page.test.mjs runs it in node.
+
+// At most this many dataset columns.
+const MAX_COLUMNS = 4;
+// The columns a link without d= opens with: the dataset with street
+// addresses beside the smallest.
+const OPENING_PRESETS = ['with-addresses', 'smallest'];
+// The requests to the server in flight at once, over every column and
+// result: every visitor of the page shares the test key's rate.
+const IN_FLIGHT = 8;
+// Each column's colour, by its place, and Nominatim's.
+const COLUMN_COLORS = ['#6c8cff', '#d9944a', '#c77dff', '#4ac9d9'];
+const NOMINATIM_COLOR = '#4caf80';
+// The order of the common address hierarchy in the field table. Other
+// fields (landmark classes etc.) follow by name, so that any field the
+// answers gain shows without a change here.
+const PREFERRED_ORDER = [
+  'landmark',
+  'house_number', 'road', 'city_block', 'neighbourhood', 'quarter',
+  'suburb', 'borough', 'city_district', 'city', 'town', 'village',
+  'hamlet', 'municipality', 'district', 'county', 'state_district',
+  'region', 'province', 'state', 'postcode', 'country', 'country_code',
+];
+
+// `s` as HTML text, in an element or a quoted attribute.
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
+
+function formatSize(bytes) {
+  return `${(Number(bytes) / 2 ** 30).toFixed(2)} GiB`;
+}
+
+// A time of the server (ISO 8601, UTC) as the page shows it.
+function shortTime(iso) {
+  return iso ? String(iso).replace('T', ' ').replace(/Z$/, ' UTC') : '—';
+}
+
+function onGlobe(lat, lng) {
+  return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
+}
+
+// -- The link --
+// ?d=<dataset> for each column (a preset's id, or <mode>.<quality>.<poi_tier>),
+// at=<lat>,<lon> for each point to look up, and b=<date>, the build the
+// answers came from.
+function parseLink(search) {
+  const q = new URLSearchParams(search);
+  const points = [];
+  for (const at of q.getAll('at')) {
+    const parts = at.split(',');
+    if (parts.length !== 2 || parts.some((p) => p.trim() === '')) continue;
+    const [lat, lng] = parts.map(Number);
+    if (onGlobe(lat, lng)) points.push({ lat, lng });
+  }
+  return { datasets: q.getAll('d').filter((d) => d).slice(0, MAX_COLUMNS), points, build: q.get('b') || null };
+}
+
+function linkSearch({ datasets = [], point = null, build = null }) {
+  const parts = datasets.map((d) => `d=${encodeURIComponent(d).replace(/%2F/g, '/')}`);
+  if (point) parts.push(`at=${point.lat},${point.lng}`);
+  if (build) parts.push(`b=${encodeURIComponent(build)}`);
+  return parts.length ? `?${parts.join('&')}` : '';
+}
+
+// How the page answers, by /datasets' status and JSON: in columns of the
+// datasets it lists ('catalog'); in one column, a server of one dataset
+// having no /datasets ('single'); or not yet, while the portal has no build
+// to serve or can't be reached ('waiting', asked again).
+function catalogMode(status, json) {
+  if (status === 200) return json && Array.isArray(json.datasets) && Array.isArray(json.axes) ? 'catalog' : 'single';
+  return status === 404 || status === 405 ? 'single' : 'waiting';
+}
+
+// -- Columns --
+function openingTokens(catalog) {
+  const tokens = OPENING_PRESETS.filter((id) => catalog.presets.some((p) => p.id === id));
+  return tokens.length ? tokens : [catalog.default];
+}
+
+// The token of a column added beside `columns`: the first preset whose
+// dataset none of them shows, else the first such dataset.
+function addedToken(catalog, columns) {
+  const shown = new Set(columns.map((c) => c.dataset && c.dataset.id));
+  const preset = catalog.presets.find((p) => !shown.has(p.dataset));
+  if (preset) return preset.id;
+  const dataset = catalog.datasets.find((d) => !shown.has(d.id));
+  return dataset ? dataset.id : catalog.default;
+}
+
+function sameSelection(catalog, a, b) {
+  return catalog.axes.every((axis) => a[axis.id] === b[axis.id]);
+}
+
+function datasetOf(catalog, selection) {
+  return catalog.datasets.find((d) => sameSelection(catalog, d.selection, selection)) || null;
+}
+
+function excludedOf(catalog, selection) {
+  return catalog.excluded.find((x) => sameSelection(catalog, x.selection, selection)) || null;
+}
+
+function defaultDataset(catalog) {
+  return catalog.datasets.find((d) => d.id === catalog.default) || catalog.datasets[0];
+}
+
+// The column `token` picks: its dataset, whether it is a custom pick (no
+// preset's id), the selection its axes show, and why it has no dataset.
+function resolveColumn(catalog, token) {
+  const preset = catalog.presets.find((p) => p.id === token);
+  const dataset = catalog.datasets.find((d) => d.id === (preset ? preset.dataset : token)) || null;
+  const excluded = catalog.excluded.find((x) => x.id === token) || null;
+  let error = null;
+  if (!dataset) {
+    error = excluded ? `dataset ${token} is not offered: ${excluded.message}` : `unknown dataset "${token}": pick one`;
+  }
+  const selection = { ...(dataset || excluded || defaultDataset(catalog)).selection };
+  return { token, dataset, custom: !preset, selection, error, note: null };
+}
+
+// The values of the axis `axisId` as a custom pick of `selection`'s other
+// values offers them: 'offered'; 'moves' where a constraint requires other
+// values of the others, which the pick then takes; or 'excluded' where the
+// constraints rule the value out whatever the others. Each with the
+// selection it makes and the constraint's message.
+function axisChoices(catalog, selection, axisId) {
+  const axis = catalog.axes.find((a) => a.id === axisId);
+  return axis.values.map((value) => {
+    const picked = { ...selection, [axisId]: value.id };
+    if (datasetOf(catalog, picked)) return { ...value, state: 'offered', selection: picked, message: null };
+    const excluded = excludedOf(catalog, picked);
+    const moved = excluded ? { ...picked, ...excluded.requires } : null;
+    if (moved && moved[axisId] === value.id && datasetOf(catalog, moved)) {
+      return { ...value, state: 'moves', selection: moved, message: excluded.message };
+    }
+    return { ...value, state: 'excluded', selection: null, message: excluded ? excluded.message : 'not in this build' };
+  });
+}
+
+function valueLabel(axis, id) {
+  const value = axis.values.find((v) => v.id === id);
+  return value ? value.label : id;
+}
+
+// What a custom pick of `selection` becomes when its axis `axisId` takes
+// `valueId`: the selection, its dataset, and a note of the axes that move
+// for a constraint, with its message. None for a value the constraints
+// rule out.
+function pick(catalog, selection, axisId, valueId) {
+  const choice = axisChoices(catalog, selection, axisId).find((c) => c.id === valueId);
+  if (!choice || choice.state === 'excluded') return null;
+  let note = null;
+  if (choice.state === 'moves') {
+    const moved = catalog.axes
+      .filter((a) => a.id !== axisId && choice.selection[a.id] !== selection[a.id])
+      .map((a) => `${a.label} moves to ${valueLabel(a, choice.selection[a.id])}`);
+    note = `${moved.join(', ')}: ${choice.message}`;
+  }
+  return { selection: choice.selection, dataset: datasetOf(catalog, choice.selection), note };
+}
+
+// A selection by the labels of its values, on the axes that offer a choice.
+function selectionLabel(catalog, selection) {
+  return catalog.axes.filter((a) => a.values.length > 1).map((a) => valueLabel(a, selection[a.id])).join(' · ');
+}
+
+// -- Answers --
+// An answer as the page keeps it, from a response of the server: its JSON
+// (data) or why there is none (error), the build and the dataset that
+// answered (X-Geocoder-Build and X-Geocoder-Dataset, which the portal
+// sends), and the ms it took.
+function answerOf(status, header, body, ms) {
+  const build = header('x-geocoder-build');
+  const dataset = header('x-geocoder-dataset');
+  if (status !== 200) return { error: `HTTP ${status}${body ? `: ${body.slice(0, 300)}` : ''}`, build, dataset, ms };
+  try {
+    return { data: JSON.parse(body), build, dataset, ms };
+  } catch (e) {
+    return { error: `not JSON: ${body.slice(0, 300)}`, build, dataset, ms };
+  }
+}
+
+// The field table's rows: each address field of any of `addresses` (null
+// for a column without an answer, which lacks no field), in PREFERRED_ORDER
+// then by name, with each one's value ('' for none), whether two values
+// disagree, and whether an answer lacks the field.
+function fieldRows(addresses) {
+  const fields = [...new Set(addresses.flatMap((a) => Object.keys(a || {})))];
+  const rank = (f) => (PREFERRED_ORDER.includes(f) ? PREFERRED_ORDER.indexOf(f) : PREFERRED_ORDER.length);
+  fields.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+  return fields
+    .map((field) => {
+      const values = addresses.map((a) => (a && a[field] != null && a[field] !== '' ? String(a[field]) : ''));
+      const present = values.filter((v) => v);
+      const lacking = values.filter((v, i) => !v && addresses[i]);
+      return { field, values, differs: present.some((v) => v !== present[0]), missing: present.length > 0 && lacking.length > 0 };
+    })
+    .filter((row) => row.values.some((v) => v));
+}
+
+function placeKey(p) {
+  return `${p.name}\u0000${p.category}`;
+}
+
+// Whether the answers `datas` (null for a column without one) disagree on
+// what the page shows: the display name, an address field or the places.
+function answersDiffer(datas) {
+  const answered = datas.filter((d) => d);
+  if (answered.length < 2) return false;
+  const name = (d) => d.display_name || '';
+  const places = (d) => (d.places || []).map(placeKey).join('\u0001');
+  return answered.some((d) => name(d) !== name(answered[0]) || places(d) !== places(answered[0]))
+    || fieldRows(answered.map((d) => d.address || {})).some((row) => row.differs || row.missing);
+}
+
+// -- Requests --
+// Asks the server, `limit` requests in flight at most over the whole page.
+// A 429 (the test key's rate, which every visitor shares) is asked again
+// after a pause that every request waits out: `firstPause` ms, doubled by
+// each 429 of a request started after the last pause began (those in flight
+// together make one) up to `maxPause`, and back to none after an answer.
+// After `tries` asks a 429 is the answer. request(url) gives the status, the
+// headers (header(name)), the body and the ms the request took, its wait in
+// line not counted.
+class Pacer {
+  constructor({ limit = IN_FLIGHT, fetch, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), now = () => Date.now(),
+                tries = 8, firstPause = 500, maxPause = 8000 }) {
+    Object.assign(this, { limit, send: fetch, sleep, now, tries, firstPause, maxPause });
+    this.active = 0;
+    this.waiting = [];
+    this.pause = 0;
+    this.pausedAt = -Infinity;
+    this.pausedUntil = -Infinity;
+  }
+
+  async request(url) {
+    for (let tries = 1; ; tries++) {
+      await this.acquire();
+      let got;
+      let started;
+      try {
+        for (let wait; (wait = this.pausedUntil - this.now()) > 0;) await this.sleep(wait);
+        started = this.now();
+        const response = await this.send(url);
+        const body = await response.text();
+        got = { status: response.status, header: (name) => response.headers.get(name), body, ms: this.now() - started };
+      } finally {
+        this.release();
+      }
+      if (got.status !== 429) {
+        this.pause = 0;
+        return got;
+      }
+      if (tries >= this.tries) return got;
+      if (started > this.pausedAt) {
+        this.pause = Math.min(this.maxPause, this.pause ? this.pause * 2 : this.firstPause);
+        this.pausedAt = this.now();
+        this.pausedUntil = this.pausedAt + this.pause;
+      }
+    }
+  }
+
+  acquire() {
+    if (this.active < this.limit) {
+      this.active++;
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => this.waiting.push(resolve));
+  }
+
+  // Hands the place of a request that is done to the next in line.
+  release() {
+    const next = this.waiting.shift();
+    if (next) next();
+    else this.active--;
+  }
+}
+
+// -- HTML --
+// The picker of the column `col`, the `index`th of `count`: a preset or a
+// custom pick by axis (a value the constraints rule out greyed, with their
+// message), then its dataset's name, values, sizes and description.
+function pickerHtml(catalog, col, index, count) {
+  const color = COLUMN_COLORS[index % COLUMN_COLORS.length];
+  let html = `<div class="picker" style="border-left-color:${color}">`;
+  html += `<div class="picker-row"><select data-col="${index}" data-role="preset" title="A preset of the build, or a custom pick by axis">`;
+  for (const p of catalog.presets) {
+    const d = catalog.datasets.find((x) => x.id === p.dataset);
+    const size = d ? ` · ${formatSize(d.size_disk)}` : '';
+    html += `<option value="${esc(p.id)}"${!col.custom && col.token === p.id ? ' selected' : ''} title="${esc(p.description)}">${esc(p.label)}${size}</option>`;
+  }
+  html += `<option value=""${col.custom ? ' selected' : ''}>Custom…</option></select>`;
+  if (count > 1) html += `<button class="picker-remove" data-col="${index}" data-action="remove" title="Remove this column">×</button>`;
+  html += '</div>';
+  if (col.custom) {
+    const constraints = [];
+    html += '<div class="picker-axes">';
+    for (const axis of catalog.axes) {
+      if (axis.values.length < 2) continue;
+      html += `<label title="${esc(axis.description)}"><span>${esc(axis.label)}</span><select data-col="${index}" data-axis="${esc(axis.id)}">`;
+      for (const c of axisChoices(catalog, col.selection, axis.id)) {
+        const mark = c.state === 'excluded' ? ' (not offered)' : c.state === 'moves' ? ' *' : '';
+        html += `<option value="${esc(c.id)}"${c.id === col.selection[axis.id] ? ' selected' : ''}${c.state === 'excluded' ? ' disabled' : ''}`
+          + ` title="${esc(c.message || c.description)}">${esc(c.label)}${mark}</option>`;
+        if (c.message) constraints.push(`${c.label}: ${c.message}`);
+      }
+      html += '</select></label>';
+    }
+    html += '</div>';
+    for (const line of constraints) html += `<div class="picker-constraint">${esc(line)}</div>`;
+  }
+  const d = col.dataset;
+  if (d) {
+    html += `<div class="picker-name">${esc(d.label)}</div>`;
+    html += `<div class="picker-meta">${esc(selectionLabel(catalog, d.selection))} · ${esc(d.id)}</div>`;
+    html += `<div class="picker-meta">${formatSize(d.size_disk)} on disk · ${formatSize(d.size_download)} download</div>`;
+    if (d.description) html += `<div class="picker-desc">${esc(d.description)}</div>`;
+  }
+  if (col.note) html += `<div class="picker-note">${esc(col.note)}</div>`;
+  if (col.error) html += `<div class="picker-error">${esc(col.error)}</div>`;
+  return `${html}</div>`;
+}
+
+// The detail of a result, from `views`: one a column ({label, color,
+// dataset, answer}), and Nominatim's. Per answer its name, dataset, build,
+// time and sizes, flagged where a build other than the one `served`
+// answered; the address fields side by side, those the answers disagree on
+// or lack marked; the places, those not in every answer marked; the JSON.
+function detailHtml(views, served) {
+  const grid = `display:grid;grid-template-columns:repeat(${views.length},minmax(0,1fr));gap:12px`;
+  let html = `<div style="${grid};margin-bottom:12px">`;
+  for (const v of views) {
+    const a = v.answer || {};
+    html += `<div class="answer-head" style="border-top-color:${v.color}"><div class="answer-label" style="color:${v.color}">${esc(v.label)}</div>`;
+    const meta = [];
+    if (v.dataset) meta.push(esc(v.dataset.id));
+    if (a.build) meta.push(`build ${esc(a.build)}`);
+    if (Number.isFinite(a.ms)) meta.push(`${Math.round(a.ms)} ms`);
+    if (meta.length) html += `<div class="answer-meta">${meta.join(' · ')}</div>`;
+    if (v.dataset) html += `<div class="answer-meta">${formatSize(v.dataset.size_disk)} on disk · ${formatSize(v.dataset.size_download)} download</div>`;
+    if (a.build && served && a.build !== served) {
+      html += `<span class="tag stale" title="The server serves build ${esc(served)} now: Re-test asks it again">build ${esc(a.build)}, not ${esc(served)}</span>`;
+    }
+    if (a.loading) html += '<div class="answer-name"><span class="loading-spinner"></span>Loading…</div>';
+    else if (a.error) html += `<div class="result-error">${esc(a.error)}</div>`;
+    else if (a.data) html += `<div class="answer-name">${a.data.display_name ? esc(a.data.display_name) : '—'}</div>`;
+    else html += '<div class="answer-meta">not asked yet</div>';
+    html += '</div>';
+  }
+  html += '</div>';
+
+  const datas = views.map((v) => (v.answer && v.answer.data) || null);
+  const rows = fieldRows(datas.map((d) => (d ? d.address || {} : null)));
+  if (rows.length) {
+    html += '<table class="fields"><tr><th style="color:var(--text-dim);width:140px">Field</th>';
+    for (const v of views) html += `<th style="color:${v.color}">${esc(v.label)}</th>`;
+    html += '</tr>';
+    for (const row of rows) {
+      html += `<tr class="${row.differs ? 'differs' : row.missing ? 'missing' : ''}"><td class="field">${esc(row.field)}</td>`;
+      row.values.forEach((value, i) => {
+        html += value ? `<td class="value">${esc(value)}</td>` : `<td class="empty">${datas[i] ? '—' : ''}</td>`;
+      });
+      html += '</tr>';
+    }
+    html += '</table>';
+  }
+
+  if (datas.some((d) => d && d.places && d.places.length)) {
+    const keys = datas.map((d) => (d ? new Set((d.places || []).map(placeKey)) : null));
+    html += `<div class="detail-places"><h3 style="margin:10px 0 6px">Places</h3><div style="${grid}">`;
+    views.forEach((v, i) => {
+      const places = (datas[i] && datas[i].places) || [];
+      html += `<div><div class="answer-label" style="color:${v.color}">${esc(v.label)}</div>`;
+      if (!datas[i]) {
+        html += '<div class="answer-meta">—</div>';
+      } else if (!places.length) {
+        html += '<div class="answer-meta">— no places —</div>';
+      } else {
+        html += '<table><tr><th>Name</th><th>Category</th><th>Dist</th></tr>';
+        for (const p of places) {
+          const shared = keys.every((k) => !k || k.has(placeKey(p)));
+          html += `<tr${shared ? '' : ' class="unshared"'}><td>${esc(p.name)}</td><td>${esc(p.category)}</td><td>${esc(p.distance_m)}m</td></tr>`;
+        }
+        html += '</table>';
+      }
+      html += '</div>';
+    });
+    html += '</div></div>';
+  }
+
+  for (const v of views) {
+    if (!v.answer || !v.answer.data) continue;
+    html += `<details style="margin-top:6px"><summary style="cursor:pointer;color:${v.color}">${esc(v.label)}: response JSON</summary>`
+      + `<div class="json-block">${syntaxHighlight(v.answer.data)}</div></details>`;
+  }
+  return html;
+}
+
+// A result's card: its point, the first column's answer and whether the
+// columns' answers differ, the columns' errors, and where the point came
+// from.
+function cardHtml(entry, views, selected) {
+  const answers = views.map((v) => v.answer || {});
+  const first = answers[0] || {};
+  const loading = answers.some((a) => a.loading);
+  const failed = views.filter((v) => v.answer && v.answer.error);
+  const classes = ['result-card'];
+  if (loading) classes.push('loading');
+  if (failed.length) classes.push('error');
+  if (selected) classes.push('selected');
+  // The coordinates with a copy button, whose `data-copy` the list's click
+  // handler copies.
+  const coords = `${Number(entry.lat).toFixed(5)}, ${Number(entry.lng).toFixed(5)}`;
+  let html = `<div class="${classes.join(' ')}" data-id="${esc(entry.id)}">`;
+  html += `<div class="result-coords">${coords}<button class="result-copy" data-copy="${coords}" title="Copy coordinates">⧉</button></div>`;
+  if (first.data) {
+    html += `<div class="result-name">${esc(first.data.display_name || 'Unknown location')}`;
+    if (answersDiffer(answers.map((a) => a.data || null))) html += '<span class="tag" title="The columns answer differently">differs</span>';
+    html += '</div>';
+    const places = first.data.places || [];
+    if (places.length) {
+      const extra = places.length > 3 ? ` +${places.length - 3} more` : '';
+      html += `<div class="result-places">${esc(places.slice(0, 3).map((p) => p.name).join(', '))}${extra}</div>`;
+    }
+  } else if (loading) {
+    html += '<div class="result-name"><span class="loading-spinner"></span>Loading...</div>';
+  } else if (!first.error) {
+    html += '<div class="result-source">not asked yet: select it or Re-test</div>';
+  }
+  for (const v of failed) html += `<div class="result-error">${esc(v.label)}: ${esc(v.answer.error)}</div>`;
+  if (entry.source) html += `<div class="result-source">${esc(entry.source)}</div>`;
+  return `${html}</div>`;
+}
+
+// The status line from the portal's /health: the build served (or why
+// none), how the sync goes, and the builds it refused or found damaged.
+function statusHtml(health) {
+  if (!health || typeof health !== 'object' || !health.sync) return '';
+  const s = health.sync;
+  const parts = [];
+  if (health.build) parts.push(`build ${esc(health.build.date)} (v${esc(health.build.version)}) · ${esc(health.datasets)} datasets`);
+  else if (health.reason) parts.push(`<span class="warn">${esc(health.reason)}</span>`);
+  if (s.running) {
+    let running = `sync: ${esc(s.running)}`;
+    if (s.progress) {
+      const p = s.progress;
+      running += ` (${esc(p.objects_done)}/${esc(p.objects_total)} objects, ${formatSize(p.bytes_done)} of ${formatSize(p.bytes_total)})`;
+    }
+    parts.push(running);
+  } else {
+    if (s.last_result) parts.push(`last sync ${esc(shortTime(s.last_finished))}: ${esc(s.last_result)}`);
+    if (s.next_round) parts.push(`next ${esc(shortTime(s.next_round))}`);
+  }
+  if (s.latest && (!health.build || s.latest.date !== health.build.date)) parts.push(`latest ${esc(s.latest.date)}`);
+  for (const r of s.refused || []) parts.push(`<span class="warn">refused ${esc(r.date)} (v${esc(r.version)}): ${esc(r.reason)}</span>`);
+  if (s.damaged) parts.push(`<span class="warn">damaged: ${esc(s.damaged)}</span>`);
+  return parts.join(' · ');
+}
+
+// The flag of a link made on a build (b=) other than the one served.
+function mismatchHtml(linkBuild, served) {
+  if (!linkBuild || !served || linkBuild === served) return '';
+  return `This link was made on build ${esc(linkBuild)}; the server serves build ${esc(served)} now, whose answers may differ.`;
+}
+
+// The polygon overlay's next state: off, then each of `count` columns in
+// turn, then off.
+function nextPolygons(current, count) {
+  const next = current === 'off' ? 0 : current + 1;
+  return next < count ? next : 'off';
+}
+
+// `obj` as JSON, escaped, its keys, strings, numbers and literals marked for
+// their colours.
+function syntaxHighlight(obj) {
+  const json = JSON.stringify(obj, null, 2).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return json.replace(/("(\\u[\da-fA-F]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,
+    function(match) {
+      let cls = 'json-number';
+      if (/^"/.test(match)) {
+        cls = /:$/.test(match) ? 'json-key' : 'json-string';
+      } else if (/true|false/.test(match)) {
+        cls = 'json-bool';
+      } else if (/null/.test(match)) {
+        cls = 'json-null';
+      }
+      return `<span class="${cls}">${match}</span>`;
+    }
+  );
+}
+</script>
+
 <script>
 // -- Map setup --
 const map = new maplibregl.Map({
@@ -365,186 +952,7 @@ const map = new maplibregl.Map({
   // through by default, so detail only appeared once the zoom settled.
   cancelPendingTileRequestsWhileZooming: false
 });
-
-const markers = new Map(); // id -> {marker, popup}
-const results = [];        // {id, lat, lng, data, error, loading, source}
-let selectedId = null;
-
-// -- LocalStorage persistence --
-const STORAGE_KEY = 'geocoder_test_results';
-
-function saveResults() {
-  const serializable = results.filter(r => !r.loading).map(r => ({
-    id: r.id, lat: r.lat, lng: r.lng, data: r.data,
-    nominatim: r.nominatim || null,
-    minimal: r.minimal || null,
-    error: r.error, source: r.source
-  }));
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(serializable)); } catch(e) {}
-}
-
-// Base URL for the minimal-dataset server. The full server embeds
-// this page; the minimal server runs on the same host at :3001
-// (see docker-compose.yml). Override with ?minimal_url=... to point
-// at a different host (e.g. a remote test instance).
-const MINIMAL_BASE_URL = (() => {
-  const params = new URLSearchParams(location.search);
-  const override = params.get('minimal_url');
-  if (override) return override.replace(/\/$/, '');
-  return `${location.protocol}//${location.hostname}:3001`;
-})();
-
-function loadResults() {
-  try {
-    const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-    for (const r of stored) {
-      r.loading = false;
-      results.push(r);
-      const hasPlaces = r.data && r.data.places && r.data.places.length > 0;
-      const color = r.error ? MARKER_COLORS.red : (hasPlaces ? MARKER_COLORS.green : MARKER_COLORS.blue);
-      const marker = new maplibregl.Marker({ color })
-        .setLngLat([r.lng, r.lat])
-        .addTo(map);
-      if (r.data) {
-        const label = r.data.display_name || `${r.lat.toFixed(4)}, ${r.lng.toFixed(4)}`;
-        marker.setPopup(new maplibregl.Popup({ offset: 25 }).setHTML(
-          `<b>${label}</b>${hasPlaces ? '<br>' + r.data.places.length + ' place(s)' : ''}`
-        ));
-      }
-      marker.getElement().addEventListener('click', (e) => {
-        e.stopPropagation();
-        selectResult(r.id);
-      });
-      markers.set(r.id, { marker, popup: null });
-    }
-    renderResults();
-  } catch(e) {}
-}
-
-function clearResults() {
-  results.length = 0;
-  selectedId = null;
-  markers.forEach(m => m.marker.remove());
-  markers.clear();
-  localStorage.removeItem(STORAGE_KEY);
-  renderResults();
-  document.getElementById('detailPanel').classList.remove('visible');
-}
-
-// Re-run every stored result against OUR reverse geocoder (Nominatim's
-// results won't have changed between server rebuilds, so we keep the
-// cached Nominatim comparison in place and only refresh our own data).
-// Useful after rebuilding the server to re-check saved test cases.
-function retestAllResults() {
-  if (results.length === 0) return;
-  const btn = document.getElementById('retestBtn');
-  const originalLabel = btn.textContent;
-  btn.disabled = true;
-  btn.textContent = `Re-testing… 0/${results.length}`;
-
-  // Take a snapshot before iterating: reverseGeocode() adds new entries
-  // to the front, which would clobber the counter and re-test order.
-  const toRetest = results.slice();
-  let completed = 0;
-
-  // Reset existing markers to loading state. Preserve the cached
-  // Nominatim response so we can still render the diff after re-test.
-  for (const r of toRetest) {
-    r.loading = true;
-    r.data = null;
-    r.error = null;
-    const m = markers.get(r.id);
-    if (m) {
-      m.marker.remove();
-      const newMarker = new maplibregl.Marker({ color: MARKER_COLORS.gray })
-        .setLngLat([r.lng, r.lat])
-        .addTo(map);
-      newMarker.getElement().addEventListener('click', (e) => {
-        e.stopPropagation();
-        selectResult(r.id);
-      });
-      m.marker = newMarker;
-      m.popup = null;
-    }
-  }
-  renderResults();
-
-  const runOne = (entry) => new Promise((resolve) => {
-    const fullFetch = fetch(`/reverse?lat=${entry.lat}&lon=${entry.lng}&key=test`)
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
-    // Re-query minimal too (its build can change with full server
-    // rebuilds — same source data). Nominatim is held over from the
-    // original fetch since the public API isn't tied to our build.
-    const minFetch = minimalEnabled
-      ? fetch(`${MINIMAL_BASE_URL}/reverse?lat=${entry.lat}&lon=${entry.lng}&key=test`)
-          .then(r => r.ok ? r.json() : null).catch(() => null)
-      : Promise.resolve(entry.minimal || null);
-    Promise.all([fullFetch, minFetch])
-      .then(([data, min]) => {
-        entry.data = data;
-        entry.minimal = min;
-        entry.loading = false;
-        const hasPlaces = data.places && data.places.length > 0;
-        const m = markers.get(entry.id);
-        if (m) {
-          m.marker.remove();
-          const newMarker = new maplibregl.Marker({ color: hasPlaces ? MARKER_COLORS.green : MARKER_COLORS.blue })
-            .setLngLat([entry.lng, entry.lat])
-            .addTo(map);
-          const label = data.display_name || `${entry.lat.toFixed(4)}, ${entry.lng.toFixed(4)}`;
-          const popup = new maplibregl.Popup({ offset: 25 })
-            .setHTML(`<b>${label}</b>${hasPlaces ? '<br>' + data.places.length + ' place(s)' : ''}`);
-          newMarker.setPopup(popup);
-          newMarker.getElement().addEventListener('click', (e) => {
-            e.stopPropagation();
-            selectResult(entry.id);
-          });
-          m.marker = newMarker;
-          m.popup = popup;
-        }
-      })
-      .catch(err => {
-        entry.error = err.message;
-        entry.loading = false;
-        const m = markers.get(entry.id);
-        if (m) {
-          m.marker.remove();
-          const newMarker = new maplibregl.Marker({ color: MARKER_COLORS.red })
-            .setLngLat([entry.lng, entry.lat])
-            .addTo(map);
-          newMarker.getElement().addEventListener('click', (e) => {
-            e.stopPropagation();
-            selectResult(entry.id);
-          });
-          m.marker = newMarker;
-        }
-      })
-      .finally(() => {
-        completed++;
-        btn.textContent = `Re-testing… ${completed}/${toRetest.length}`;
-        renderResults();
-        saveResults();
-        if (selectedId === entry.id) showDetail(entry.id);
-        resolve();
-      });
-  });
-
-  // Run up to 5 in flight at once, matching reverseGeocode()'s rate limit.
-  const CONCURRENCY = 5;
-  let idx = 0;
-  const workers = Array.from({length: Math.min(CONCURRENCY, toRetest.length)}, () => {
-    return (async function loop() {
-      while (idx < toRetest.length) {
-        const my = idx++;
-        await runOne(toRetest[my]);
-      }
-    })();
-  });
-  Promise.all(workers).then(() => {
-    btn.disabled = false;
-    btn.textContent = originalLabel;
-  });
-}
+const mapLoaded = new Promise((resolve) => map.on('load', resolve));
 
 // Marker color map
 const MARKER_COLORS = {
@@ -554,17 +962,277 @@ const MARKER_COLORS = {
   red: '#d94a4a'
 };
 
+const markers = new Map(); // id -> {marker, color, label}
+const results = [];        // {id, lat, lng, source, answers: {column key: answer}, nominatim}
+let selectedId = null;
+
+// -- Datasets and columns --
+// How the page answers (catalogMode), the server's /datasets (catalog) and
+// the columns, each a resolveColumn(). A server of one dataset, or a portal
+// waiting for its build, has the one column SINGLE.
+const SINGLE = { single: true, token: null, dataset: null, custom: false, selection: null, error: null, note: null };
+const link = parseLink(location.search);
+let mode = 'waiting';
+let catalog = null;
+let columns = [SINGLE];
+// The columns' tokens as the link or the pickers last named them, kept while
+// the portal waits for a build.
+let wanted = link.datasets.slice();
+let waitingFor = '';
+let mismatchDismissed = false;
+
+const pacer = new Pacer({ fetch: (url) => fetch(url), now: () => performance.now() });
+// Nominatim's public API is asked one request at a time.
+const nominatimPacer = new Pacer({ limit: 1, fetch: (url) => fetch(url), now: () => performance.now() });
+
+function servedBuild() {
+  return catalog ? catalog.build.date : null;
+}
+
+// The key a column's answers are kept by: its dataset's id ('' for the one
+// dataset of a server without /datasets); none for a column without one.
+function columnKey(col) {
+  if (col.single) return '';
+  return col.dataset ? col.dataset.id : null;
+}
+
+function columnLabel(col) {
+  if (col.single) return 'This server';
+  return col.dataset ? col.dataset.label : col.token;
+}
+
+// Each column's view of `entry`'s answers (detailHtml, cardHtml).
+function columnViews(entry) {
+  return columns.map((col, i) => {
+    const key = columnKey(col);
+    const answer = key === null ? { error: col.error } : entry.answers[key] || null;
+    return { label: columnLabel(col), color: COLUMN_COLORS[i], dataset: col.dataset, answer };
+  });
+}
+
+let catalogRetry = null;
+
+// Asks /datasets how the page answers, and lays out its columns: as they
+// were named (the link's or the pickers'), else OPENING_PRESETS. While the
+// portal waits for a build, it asks again every 30 s.
+async function loadCatalog() {
+  clearTimeout(catalogRetry);
+  let status = 0;
+  let json = null;
+  let body = '';
+  try {
+    const resp = await fetch('/datasets');
+    status = resp.status;
+    body = await resp.text();
+    json = JSON.parse(body);
+  } catch (e) {
+    if (!status) body = e.message;
+  }
+  mode = catalogMode(status, json);
+  if (mode === 'catalog') {
+    catalog = json;
+    columns = (wanted.length ? wanted : openingTokens(catalog)).map((token) => resolveColumn(catalog, token));
+    wanted = columns.map((c) => c.token);
+  } else {
+    catalog = null;
+    columns = [SINGLE];
+    waitingFor = body.slice(0, 300);
+    if (mode === 'waiting') catalogRetry = setTimeout(loadCatalog, 30000);
+  }
+  if (polygonsColumn !== 'off' && polygonsColumn >= columns.length) polygonsColumn = 'off';
+  renderColumns();
+  renderBanner();
+  updatePolygonsBtn();
+  updateLink();
+  results.forEach(placeMarker);
+  renderResults();
+  const entry = selectedEntry();
+  if (entry) {
+    askColumns(entry);
+    showDetail(entry.id);
+  }
+}
+
+function renderColumns() {
+  const el = document.getElementById('columns');
+  if (mode !== 'catalog') {
+    el.innerHTML = `<div class="columns-note">${mode === 'single'
+      ? 'This server serves one dataset: it has no /datasets to choose from.'
+      : 'One column, from the server as it is, until its build is in.'}</div>`;
+    return;
+  }
+  let html = columns.map((col, i) => pickerHtml(catalog, col, i, columns.length)).join('');
+  if (columns.length < MAX_COLUMNS) html += '<button class="add-column" data-action="add" title="Compare another dataset">+ Column</button>';
+  el.innerHTML = html;
+}
+
+function renderBanner() {
+  const el = document.getElementById('banner');
+  if (mode === 'waiting') {
+    el.innerHTML = `<span>Waiting for the portal's build (asked again every 30 s): ${esc(waitingFor || 'no answer')}</span>`;
+    return;
+  }
+  const flag = mismatchDismissed ? '' : mismatchHtml(link.build, servedBuild());
+  el.innerHTML = flag ? `<span>${flag}</span><button onclick="dismissMismatch()" title="Dismiss">×</button>` : '';
+}
+
+function dismissMismatch() {
+  mismatchDismissed = true;
+  renderBanner();
+}
+
+// A column picked anew: the link, the polygon button, the markers (coloured
+// by the first column), the cards, and the selected result's answers.
+function columnsChanged() {
+  wanted = columns.map((c) => c.token);
+  renderColumns();
+  updatePolygonsBtn();
+  updateLink();
+  results.forEach(placeMarker);
+  const entry = selectedEntry();
+  if (entry) {
+    askColumns(entry);
+    showDetail(entry.id);
+    if (polygonsColumn !== 'off') updatePolygonLayer(entry.id);
+  }
+  renderResults();
+  saveResults();
+}
+
+function setColumn(i, col) {
+  columns[i] = col;
+  columnsChanged();
+}
+
+const columnsEl = document.getElementById('columns');
+columnsEl.addEventListener('change', (e) => {
+  const el = e.target;
+  const i = Number(el.dataset.col);
+  if (mode !== 'catalog' || !columns[i]) return;
+  if (el.dataset.role === 'preset') {
+    if (el.value) {
+      setColumn(i, resolveColumn(catalog, el.value));
+    } else {
+      // Custom: the axes of the dataset the column had.
+      const from = columns[i].dataset || datasetOf(catalog, columns[i].selection) || defaultDataset(catalog);
+      setColumn(i, resolveColumn(catalog, from.id));
+    }
+  } else if (el.dataset.axis) {
+    const picked = pick(catalog, columns[i].selection, el.dataset.axis, el.value);
+    if (picked) setColumn(i, { ...resolveColumn(catalog, picked.dataset.id), note: picked.note });
+    else renderColumns();
+  }
+});
+columnsEl.addEventListener('click', (e) => {
+  const el = e.target.closest('[data-action]');
+  if (!el || mode !== 'catalog') return;
+  if (el.dataset.action === 'add' && columns.length < MAX_COLUMNS) {
+    columns.push(resolveColumn(catalog, addedToken(catalog, columns)));
+    columnsChanged();
+  } else if (el.dataset.action === 'remove' && columns.length > 1) {
+    const i = Number(el.dataset.col);
+    columns.splice(i, 1);
+    if (polygonsColumn === i) {
+      polygonsColumn = 'off';
+      clearPolygonLayer();
+    } else if (polygonsColumn !== 'off' && polygonsColumn > i) {
+      polygonsColumn--;
+    }
+    localStorage.setItem('polygons_column', String(polygonsColumn));
+    columnsChanged();
+  }
+});
+
+// The page's URL: the columns, the selected point and the build served, so
+// that a copy of it opens the same columns on the same point.
+function updateLink() {
+  const entry = selectedEntry();
+  const search = linkSearch({
+    datasets: mode === 'single' ? [] : wanted,
+    point: entry ? { lat: entry.lat, lng: entry.lng } : null,
+    build: servedBuild() || (mode === 'waiting' ? link.build : null),
+  });
+  history.replaceState(null, '', location.pathname + search + location.hash);
+}
+
+function copyLink(btn) {
+  updateLink();
+  copyToClipboard(location.href, btn);
+}
+
+// -- Status --
+// The portal's /health, every minute (every 5 s while a sync runs): the
+// status line, and the datasets anew once another build is served.
+async function pollHealth() {
+  let health = null;
+  try {
+    health = await (await fetch('/health')).json();
+  } catch (e) {}
+  document.getElementById('status').innerHTML = statusHtml(health);
+  const build = health && health.build ? health.build.date : null;
+  if (build && (mode === 'waiting' || (mode === 'catalog' && build !== catalog.build.date))) await loadCatalog();
+  setTimeout(pollHealth, health && health.sync && health.sync.running ? 5000 : 60000);
+}
+
+// -- LocalStorage persistence --
+const STORAGE_KEY = 'geocoder_test_results';
+
+// The results with their answers of the columns shown (any, while there is
+// no catalog), Nominatim's and where each point came from.
+function saveResults() {
+  const keep = mode === 'catalog' ? new Set(columns.map(columnKey)) : null;
+  const stored = results.map((r) => ({
+    id: r.id, lat: r.lat, lng: r.lng, source: r.source, nominatim: r.nominatim || null,
+    answers: Object.fromEntries(Object.entries(r.answers).filter(([key, a]) => a && !a.loading && (!keep || keep.has(key)))),
+  }));
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(stored)); } catch(e) {}
+}
+
+function loadResults() {
+  let stored = [];
+  try { stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch(e) {}
+  for (const r of Array.isArray(stored) ? stored : []) {
+    if (!r || !onGlobe(r.lat, r.lng)) continue;
+    const entry = { id: r.id, lat: r.lat, lng: r.lng, source: r.source || null, answers: r.answers || {}, nominatim: r.nominatim || null };
+    results.push(entry);
+    placeMarker(entry);
+  }
+  renderResults();
+}
+
+function clearResults() {
+  results.length = 0;
+  selectedId = null;
+  markers.forEach(m => m.marker.remove());
+  markers.clear();
+  localStorage.removeItem(STORAGE_KEY);
+  clearPolygonLayer();
+  renderResults();
+  updateLink();
+  document.getElementById('detailPanel').classList.remove('visible');
+}
+
+// Asks every column again for every stored result, after the server's
+// build changed. Nominatim's answers stay: they don't change with ours.
+function retestAllResults() {
+  if (results.length === 0) return;
+  const btn = document.getElementById('retestBtn');
+  const all = results.slice();
+  let done = 0;
+  btn.disabled = true;
+  btn.textContent = `Re-testing… 0/${all.length}`;
+  Promise.all(all.map((entry) => askColumns(entry, true).then(() => {
+    done++;
+    btn.textContent = `Re-testing… ${done}/${all.length}`;
+  }))).then(() => {
+    btn.disabled = false;
+    btn.textContent = 'Re-test';
+  });
+}
+
 // -- Click map to geocode --
 map.on('click', function(e) {
   reverseGeocode(e.lngLat.lat, e.lngLat.lng, 'map click');
-});
-map.on('load', function() {
-  loadResults();
-  const btn = document.getElementById('polygonsBtn');
-  if (polygonsSource !== 'off') {
-    ensurePolygonLayer();
-    if (selectedId !== null) updatePolygonLayer(selectedId);
-  }
 });
 
 // -- Coordinate lookup --
@@ -607,174 +1275,180 @@ async function handleFiles(files) {
   for (const file of files) {
     const item = document.createElement('div');
     item.className = 'photo-item';
-    item.innerHTML = `<span>${file.name}</span><span>extracting...</span>`;
+    const name = `<span>${esc(file.name)}</span>`;
+    item.innerHTML = `${name}<span>extracting...</span>`;
     photoList.appendChild(item);
 
     try {
       const exif = await exifr.gps(file);
       if (exif && isFinite(exif.latitude) && isFinite(exif.longitude)) {
-        item.innerHTML = `<span>${file.name}</span><span class="coords">${exif.latitude.toFixed(5)}, ${exif.longitude.toFixed(5)}</span>`;
+        item.innerHTML = `${name}<span class="coords">${exif.latitude.toFixed(5)}, ${exif.longitude.toFixed(5)}</span>`;
         reverseGeocode(exif.latitude, exif.longitude, file.name);
       } else {
-        item.innerHTML = `<span>${file.name}</span><span class="no-gps">No GPS data</span>`;
+        item.innerHTML = `${name}<span class="no-gps">No GPS data</span>`;
       }
     } catch (err) {
-      item.innerHTML = `<span>${file.name}</span><span class="no-gps">EXIF error</span>`;
+      item.innerHTML = `${name}<span class="no-gps">EXIF error</span>`;
     }
   }
   photoList.scrollTop = photoList.scrollHeight;
 }
 
-// -- Reverse geocode with throttling --
-let activeRequests = 0;
-const queue = [];
+// -- Reverse geocode --
+function newId() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
 
+function selectedEntry() {
+  return results.find((r) => r.id === selectedId) || null;
+}
+
+// A new result at (lat, lng): every column is asked, and Nominatim if on.
 function reverseGeocode(lat, lng, source) {
-  const id = Date.now() + Math.random();
-  const entry = { id, lat, lng, data: null, error: null, loading: true, source };
+  const entry = { id: newId(), lat, lng, source, answers: {}, nominatim: null };
   results.unshift(entry);
-
-  // Fly to the location
   map.flyTo({ center: [lng, lat], zoom: Math.max(map.getZoom(), 10) });
+  placeMarker(entry);
+  selectResult(entry.id);
+  askNominatim(entry);
+}
 
-  // Add a gray marker immediately
-  const marker = new maplibregl.Marker({ color: MARKER_COLORS.gray })
-    .setLngLat([lng, lat])
+// The link's points: each asked afresh in every column (a stored result of
+// the point is asked again), the link's first ending selected.
+function lookupLinkPoints() {
+  for (const p of link.points.slice().reverse()) {
+    const entry = results.find((r) => r.lat === p.lat && r.lng === p.lng);
+    if (!entry) {
+      reverseGeocode(p.lat, p.lng, 'link');
+      continue;
+    }
+    results.splice(results.indexOf(entry), 1);
+    results.unshift(entry);
+    askColumns(entry, true);
+    selectResult(entry.id);
+    map.flyTo({ center: [entry.lng, entry.lat], zoom: Math.max(map.getZoom(), 10) });
+  }
+}
+
+// Asks each column without an answer for `entry` for one (with `again`,
+// each column not being asked already). Columns of one dataset are asked
+// once.
+function askColumns(entry, again = false) {
+  const keys = new Map();
+  for (const col of columns) {
+    const key = columnKey(col);
+    if (key !== null && !keys.has(key)) keys.set(key, col);
+  }
+  const asks = [];
+  for (const [key, col] of keys) {
+    const have = entry.answers[key];
+    if (have && (have.loading || !again)) continue;
+    asks.push(ask(entry, key, col));
+  }
+  return Promise.all(asks);
+}
+
+async function ask(entry, key, col) {
+  entry.answers[key] = { loading: true };
+  answered(entry);
+  let answer;
+  try {
+    const dataset = col.dataset ? `&dataset=${encodeURIComponent(col.dataset.id)}` : '';
+    const got = await pacer.request(`/reverse?lat=${entry.lat}&lon=${entry.lng}&key=test${dataset}`);
+    answer = answerOf(got.status, got.header, got.body, got.ms);
+  } catch (e) {
+    answer = { error: e.message };
+  }
+  entry.answers[key] = answer;
+  answered(entry);
+}
+
+async function askNominatim(entry) {
+  if (!nominatimEnabled || entry.nominatim || entry.nominatimLoading) return;
+  entry.nominatimLoading = true;
+  answered(entry);
+  try {
+    const got = await nominatimPacer.request(`https://nominatim.openstreetmap.org/reverse?lat=${entry.lat}&lon=${entry.lng}&format=jsonv2`);
+    entry.nominatim = got.status === 200 ? JSON.parse(got.body) : null;
+  } catch (e) {
+    entry.nominatim = null;
+  }
+  entry.nominatimLoading = false;
+  answered(entry);
+}
+
+// After an answer of `entry` came in or went out: its marker now, and the
+// list, the detail and the saved results once for the answers of 50 ms.
+let renderQueued = false;
+let detailDirty = false;
+function answered(entry) {
+  if (!results.includes(entry)) return;
+  placeMarker(entry);
+  if (entry.id === selectedId) detailDirty = true;
+  if (renderQueued) return;
+  renderQueued = true;
+  setTimeout(() => {
+    renderQueued = false;
+    renderResults();
+    if (detailDirty) {
+      detailDirty = false;
+      showDetail(selectedId);
+    }
+    saveResults();
+  }, 50);
+}
+
+// The marker of `entry`, coloured by the first column's answer: gray until
+// it is in, red for an error, green with places, else blue.
+function placeMarker(entry) {
+  const key = columns.length ? columnKey(columns[0]) : null;
+  const a = key === null ? null : entry.answers[key];
+  const color = !a || a.loading ? MARKER_COLORS.gray
+    : a.error ? MARKER_COLORS.red
+    : a.data && a.data.places && a.data.places.length ? MARKER_COLORS.green
+    : MARKER_COLORS.blue;
+  const label = a && a.data ? a.data.display_name || `${entry.lat.toFixed(4)}, ${entry.lng.toFixed(4)}` : null;
+  const m = markers.get(entry.id);
+  if (m && m.color === color && m.label === label) return;
+  if (m) m.marker.remove();
+  const marker = new maplibregl.Marker({ color })
+    .setLngLat([entry.lng, entry.lat])
     .addTo(map);
+  if (label) {
+    const places = (a.data.places || []).length;
+    marker.setPopup(new maplibregl.Popup({ offset: 25 }).setHTML(
+      `<b>${esc(label)}</b>${places ? `<br>${places} place(s)` : ''}`
+    ));
+  }
   marker.getElement().addEventListener('click', (e) => {
     e.stopPropagation();
-    selectResult(id);
+    selectResult(entry.id);
   });
-  markers.set(id, { marker, popup: null });
-
-  selectResult(id);
-
-  const doFetch = () => {
-    activeRequests++;
-
-    // Fetch from full + minimal + Nominatim in parallel. Minimal and
-    // Nominatim are both opt-in (toggles in the results header); when
-    // off we resolve null for that comparison leg.
-    const ourFetch = fetch(`/reverse?lat=${lat}&lon=${lng}&key=test`)
-      .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); });
-    const minFetch = minimalEnabled
-      ? fetch(`${MINIMAL_BASE_URL}/reverse?lat=${lat}&lon=${lng}&key=test`)
-          .then(r => r.ok ? r.json() : null).catch(() => null)
-      : Promise.resolve(null);
-    const nomFetch = nominatimEnabled
-      ? fetch(`https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=jsonv2`, {headers: {'User-Agent': 'geoshenanigans-test'}})
-          .then(r => r.ok ? r.json() : null).catch(() => null)
-      : Promise.resolve(null);
-
-    Promise.all([ourFetch, minFetch, nomFetch])
-      .then(([data, min, nom]) => {
-        entry.data = data;
-        entry.minimal = min;
-        entry.nominatim = nom;
-        entry.loading = false;
-        const hasPlaces = data.places && data.places.length > 0;
-        const m = markers.get(id);
-        m.marker.remove();
-        const newMarker = new maplibregl.Marker({ color: hasPlaces ? MARKER_COLORS.green : MARKER_COLORS.blue })
-          .setLngLat([lng, lat])
-          .addTo(map);
-        const label = data.display_name || `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
-        const popup = new maplibregl.Popup({ offset: 25 })
-          .setHTML(`<b>${label}</b>${hasPlaces ? '<br>' + data.places.length + ' place(s)' : ''}`);
-        newMarker.setPopup(popup);
-        newMarker.getElement().addEventListener('click', (e) => {
-          e.stopPropagation();
-          selectResult(id);
-        });
-        m.marker = newMarker;
-        m.popup = popup;
-      })
-      .catch(err => {
-        entry.error = err.message;
-        entry.loading = false;
-        const m = markers.get(id);
-        m.marker.remove();
-        const newMarker = new maplibregl.Marker({ color: MARKER_COLORS.red })
-          .setLngLat([lng, lat])
-          .addTo(map);
-        newMarker.getElement().addEventListener('click', (e) => {
-          e.stopPropagation();
-          selectResult(id);
-        });
-        m.marker = newMarker;
-      })
-      .finally(() => {
-        activeRequests--;
-        renderResults();
-        saveResults();
-        if (selectedId === id) showDetail(id);
-        if (queue.length > 0) queue.shift()();
-      });
-  };
-
-  if (activeRequests < 5) {
-    doFetch();
-  } else {
-    queue.push(doFetch);
-  }
+  markers.set(entry.id, { marker, color, label });
 }
 
 // -- Render results list --
 function renderResults() {
-  const list = document.getElementById('resultsList');
-  const countEl = document.getElementById('resultCount');
-  countEl.textContent = `(${results.length})`;
-
-  list.innerHTML = '';
-  for (const r of results) {
-    const card = document.createElement('div');
-    card.className = 'result-card' +
-      (r.loading ? ' loading' : '') +
-      (r.error ? ' error' : '') +
-      (r.id === selectedId ? ' selected' : '');
-
-    const coordsText = `${r.lat.toFixed(5)}, ${r.lng.toFixed(5)}`;
-    // Coords line + inline copy button. `data-copy` on the button
-    // holds the exact text so the click handler (delegated below)
-    // can reach it without a closure per card — the results list
-    // can grow large and re-rendering every card should stay cheap.
-    let inner = `<div class="result-coords">${coordsText}` +
-      `<button class="result-copy" data-copy="${coordsText}" title="Copy coordinates">⧉</button>` +
-      `</div>`;
-
-    if (r.loading) {
-      inner += `<div class="result-name"><span class="loading-spinner"></span>Loading...</div>`;
-    } else if (r.error) {
-      inner += `<div class="result-error">${r.error}</div>`;
-    } else {
-      const name = r.data.display_name || 'Unknown location';
-      inner += `<div class="result-name">${escHtml(name)}</div>`;
-      if (r.data.places && r.data.places.length > 0) {
-        const names = r.data.places.slice(0, 3).map(p => p.name).join(', ');
-        const extra = r.data.places.length > 3 ? ` +${r.data.places.length - 3} more` : '';
-        inner += `<div class="result-places">${escHtml(names)}${extra}</div>`;
-      }
-    }
-    if (r.source) {
-      inner += `<div class="result-source">${escHtml(r.source)}</div>`;
-    }
-
-    card.innerHTML = inner;
-    card.addEventListener('click', (ev) => {
-      // Copy button intercept — skip the card's open-detail action
-      // when the click actually landed on the copy button.
-      if (ev.target.classList && ev.target.classList.contains('result-copy')) {
-        ev.stopPropagation();
-        const text = ev.target.getAttribute('data-copy') || '';
-        copyToClipboard(text, ev.target);
-        return;
-      }
-      selectResult(r.id);
-      map.flyTo({ center: [r.lng, r.lat], zoom: Math.max(map.getZoom(), 13) });
-    });
-    list.appendChild(card);
-  }
+  document.getElementById('resultCount').textContent = `(${results.length})`;
+  document.getElementById('resultsList').innerHTML = results.map((r) => cardHtml(r, columnViews(r), r.id === selectedId)).join('');
 }
+
+// One handler for every card: the copy button copies its coordinates, a
+// click elsewhere selects the result. The list can grow large and is drawn
+// anew on each answer, so its cards hold no handlers of their own.
+document.getElementById('resultsList').addEventListener('click', (ev) => {
+  const copy = ev.target.closest('.result-copy');
+  if (copy) {
+    ev.stopPropagation();
+    copyToClipboard(copy.getAttribute('data-copy') || '', copy);
+    return;
+  }
+  const card = ev.target.closest('.result-card');
+  const entry = card && results.find((r) => String(r.id) === card.dataset.id);
+  if (!entry) return;
+  selectResult(entry.id);
+  map.flyTo({ center: [entry.lng, entry.lat], zoom: Math.max(map.getZoom(), 13) });
+});
 
 function copyToClipboard(text, btn) {
   const finish = () => {
@@ -808,11 +1482,16 @@ function legacyCopy(text, cb) {
   cb && cb();
 }
 
+// Selects a result: its card, its detail (any column it has no answer of
+// asked), its polygons and the link.
 function selectResult(id) {
   selectedId = id;
+  const entry = selectedEntry();
+  if (entry) askColumns(entry);
   renderResults();
   showDetail(id);
-  if (polygonsSource !== 'off') updatePolygonLayer(id);
+  if (polygonsColumn !== 'off') updatePolygonLayer(id);
+  updateLink();
 }
 
 // -- Polygon overlay --
@@ -821,22 +1500,13 @@ const POLY_LABEL_SOURCE = 'debug-polygon-labels';
 const POLY_FILL = 'debug-polygons-fill';
 const POLY_LINE = 'debug-polygons-line';
 const POLY_LABELS = 'debug-polygons-labels';
-// Polygon overlay source — three-state cycle:
-//   "off"     no overlay
-//   "full"    fetch /polygons from the page's origin (full server, port 3002)
-//   "minimal" fetch from MINIMAL_BASE_URL (minimal server, port 3001)
-// Use to A/B the L9/L10/L11/L15 polygons that admin-minimal drops.
-const POLY_STATES = ['off', 'full', 'minimal'];
-let polygonsSource = (() => {
-  const saved = localStorage.getItem('polygons_source');
-  // Migrate the old boolean key — "1" → "full", "0" → "off".
-  if (saved === null) {
-    const legacy = localStorage.getItem('polygons_enabled');
-    if (legacy === '1') return 'full';
-    return 'off';
-  }
-  return POLY_STATES.includes(saved) ? saved : 'off';
+// The overlay: 'off', or the place of the column whose dataset's /polygons
+// it shows. Use to A/B the polygons a smaller dataset drops.
+let polygonsColumn = (() => {
+  const saved = localStorage.getItem('polygons_column');
+  return saved !== null && /^\d+$/.test(saved) ? Number(saved) : 'off';
 })();
+let polygonsAsked = 0;
 
 // Nominatim side-by-side lookup is opt-in — every query goes out to
 // nominatim.openstreetmap.org so we don't want to hit it unsolicited.
@@ -846,59 +1516,18 @@ function toggleNominatim() {
   nominatimEnabled = !nominatimEnabled;
   localStorage.setItem('nominatim_enabled', nominatimEnabled ? '1' : '0');
   updateNominatimBtn();
-  // Re-render the currently-open detail so the comparison panel
-  // shows/hides immediately without needing a new query.
-  if (selectedId) showDetail(selectedId);
+  // The selected result gets its comparison at once, without a new query.
+  const entry = selectedEntry();
+  if (entry) {
+    askNominatim(entry);
+    showDetail(entry.id);
+  }
 }
 function updateNominatimBtn() {
   const btn = document.getElementById('nominatimBtn');
-  if (!btn) return;
   btn.textContent = 'Nominatim: ' + (nominatimEnabled ? 'On' : 'Off');
   btn.style.background = nominatimEnabled ? 'var(--green)' : 'var(--surface2)';
 }
-
-// Minimal-dataset side-by-side lookup — queries the second server
-// on port 3001 (no postcodes, no POIs, admin + streets + addresses
-// + place nodes only).  Off by default to avoid CORS noise when the
-// minimal server isn't running.
-let minimalEnabled = localStorage.getItem('minimal_enabled') === '1';
-function toggleMinimal() {
-  minimalEnabled = !minimalEnabled;
-  localStorage.setItem('minimal_enabled', minimalEnabled ? '1' : '0');
-  updateMinimalBtn();
-  // When turning Minimal ON, fetch missing minimal data for any
-  // results that don't have it yet (cached from before the toggle
-  // existed, or fetched while toggle was off).  Without this the
-  // user has to manually click Re-test to populate minimal data.
-  if (minimalEnabled) {
-    const missing = results.filter(r => !r.loading && !r.error && (r.minimal === undefined || r.minimal === null));
-    if (missing.length > 0) {
-      const fillOne = (entry) => fetch(`${MINIMAL_BASE_URL}/reverse?lat=${entry.lat}&lon=${entry.lng}&key=test`)
-        .then(r => r.ok ? r.json() : null)
-        .catch(() => null)
-        .then(min => {
-          entry.minimal = min;
-          if (selectedId === entry.id) showDetail(entry.id);
-        });
-      // Fire all in parallel — minimal endpoint is local and rate
-      // limits are generous (100/s).
-      Promise.all(missing.map(fillOne)).then(() => { saveResults(); renderResults(); });
-    }
-  }
-  if (selectedId) showDetail(selectedId);
-}
-function updateMinimalBtn() {
-  const btn = document.getElementById('minimalBtn');
-  if (!btn) return;
-  btn.textContent = 'Minimal: ' + (minimalEnabled ? 'On' : 'Off');
-  btn.style.background = minimalEnabled ? 'var(--blue)' : 'var(--surface2)';
-}
-// Run once on initial load so buttons reflect saved state.
-document.addEventListener('DOMContentLoaded', () => {
-  updateNominatimBtn();
-  updateMinimalBtn();
-  updatePolygonsBtn();
-});
 
 // Shoelace-weighted centroid of a closed lng/lat ring
 function polygonCentroid(ring) {
@@ -970,7 +1599,7 @@ function ensurePolygonLayer() {
     const p = e.features[0].properties;
     new maplibregl.Popup({ closeButton: true })
       .setLngLat(e.lngLat)
-      .setHTML(`<b>${escHtml(p.name)}</b><br>admin_level ${p.admin_level}<br>kind: ${p.kind}<br>area: ${Number(p.area).toExponential(2)}`)
+      .setHTML(`<b>${esc(p.name)}</b><br>admin_level ${esc(p.admin_level)}<br>kind: ${esc(p.kind)}<br>area: ${Number(p.area).toExponential(2)}`)
       .addTo(map);
   });
 }
@@ -983,16 +1612,17 @@ function clearPolygonLayer() {
 }
 
 function updatePolygonLayer(id) {
-  if (polygonsSource === 'off') return;
-  ensurePolygonLayer();
+  const col = polygonsColumn === 'off' ? null : columns[polygonsColumn];
   const r = results.find(x => x.id === id);
-  if (!r) { clearPolygonLayer(); return; }
-  // Pick the source server: full = same-origin, minimal = cross-origin
-  // to MINIMAL_BASE_URL. Same /polygons endpoint shape on both.
-  const base = polygonsSource === 'minimal' ? MINIMAL_BASE_URL : '';
-  fetch(`${base}/polygons?lat=${r.lat}&lon=${r.lng}&key=test`)
-    .then(res => { if (!res.ok) throw new Error(`HTTP ${res.status}`); return res.json(); })
+  if (!col || columnKey(col) === null || !r) { clearPolygonLayer(); return; }
+  ensurePolygonLayer();
+  // The answer of the last selection only, of those in flight.
+  const asked = ++polygonsAsked;
+  const dataset = col.dataset ? `&dataset=${encodeURIComponent(col.dataset.id)}` : '';
+  pacer.request(`/polygons?lat=${r.lat}&lon=${r.lng}&key=test${dataset}`)
+    .then(got => { if (got.status !== 200) throw new Error(`HTTP ${got.status}: ${got.body}`); return JSON.parse(got.body); })
     .then(fc => {
+      if (asked !== polygonsAsked) return;
       // Sort largest-first so smaller polygons render on top
       if (fc.features) {
         fc.features.sort((a, b) => (b.properties.area || 0) - (a.properties.area || 0));
@@ -1015,12 +1645,10 @@ function updatePolygonLayer(id) {
 }
 
 function togglePolygons() {
-  // Cycle: off → full → minimal → off
-  const next = (POLY_STATES.indexOf(polygonsSource) + 1) % POLY_STATES.length;
-  polygonsSource = POLY_STATES[next];
-  localStorage.setItem('polygons_source', polygonsSource);
+  polygonsColumn = nextPolygons(polygonsColumn, columns.length);
+  localStorage.setItem('polygons_column', String(polygonsColumn));
   updatePolygonsBtn();
-  if (polygonsSource === 'off') {
+  if (polygonsColumn === 'off') {
     clearPolygonLayer();
   } else {
     ensurePolygonLayer();
@@ -1029,188 +1657,42 @@ function togglePolygons() {
 }
 function updatePolygonsBtn() {
   const btn = document.getElementById('polygonsBtn');
-  if (!btn) return;
-  const label = polygonsSource === 'off' ? 'Off'
-    : polygonsSource === 'full' ? 'Full'
-    : 'Minimal';
-  btn.textContent = `Polygons: ${label}`;
-  btn.style.background = polygonsSource === 'off'    ? 'var(--surface2)'
-                       : polygonsSource === 'full'   ? 'var(--accent)'
-                       : 'var(--blue)';
+  const col = polygonsColumn === 'off' ? null : columns[polygonsColumn];
+  btn.textContent = `Polygons: ${col ? columnLabel(col) : 'Off'}`;
+  btn.style.background = col ? COLUMN_COLORS[polygonsColumn] : 'var(--surface2)';
 }
 
 // -- Detail panel --
+let detailShown = null;
 function showDetail(id) {
   const panel = document.getElementById('detailPanel');
   const content = document.getElementById('detailContent');
-  const r = results.find(x => x.id === id);
-  if (!r || r.loading) { panel.classList.remove('visible'); return; }
-
+  const entry = results.find(x => x.id === id);
+  if (!entry) { panel.classList.remove('visible'); detailShown = null; return; }
   panel.classList.add('visible');
-
-  if (r.error) {
-    content.innerHTML = `<div style="color:var(--red)">Error: ${escHtml(r.error)}</div>`;
-    return;
+  const views = columnViews(entry);
+  if (nominatimEnabled) {
+    const answer = entry.nominatimLoading ? { loading: true } : entry.nominatim ? { data: entry.nominatim } : null;
+    views.push({ label: 'Nominatim', color: NOMINATIM_COLOR, dataset: null, answer });
   }
-
-  const d = r.data;
-  const min = r.minimal;
-  const nom = r.nominatim;
-  const showMin = minimalEnabled && min;
-  const showNom = nominatimEnabled && nom;
-
-  // Build column descriptors so the table render is a single loop
-  // regardless of which comparison legs are enabled.  Full is always
-  // present; minimal/nominatim toggle in via their state flags.
-  const cols = [
-    { label: 'Full',      color: 'var(--accent)', data: d,   addr: d.address || {} },
-  ];
-  if (showMin) cols.push({ label: 'Minimal',   color: 'var(--blue)',   data: min, addr: min.address || {} });
-  if (showNom) cols.push({ label: 'Nominatim', color: 'var(--green)',  data: nom, addr: nom.address || {} });
-
-  let html = '';
-
-  // Display names — one block per active column.
-  if (cols.length > 1) {
-    html += `<div style="display:grid;grid-template-columns:repeat(${cols.length},1fr);gap:16px;margin-bottom:12px">`;
-    for (const c of cols) {
-      const dn = (c.data && c.data.display_name) ? escHtml(c.data.display_name) : '—';
-      html += `<div><div style="font-size:11px;text-transform:uppercase;color:${c.color};margin-bottom:4px">${c.label}</div><div style="font-size:13px;color:var(--text-dim)">${dn}</div></div>`;
-    }
-    html += '</div>';
-  } else {
-    html += `<div style="margin-bottom:12px"><div style="font-size:11px;text-transform:uppercase;color:var(--accent);margin-bottom:4px">Display name</div><div style="font-size:13px;color:var(--text-dim)">${d.display_name ? escHtml(d.display_name) : '—'}</div></div>`;
-  }
-
-  // Aligned field breakdown table. Row set = every key present on
-  // ANY active column, not a hand-picked allow-list. That way any
-  // field we add to the response (new landmark class, shop, etc.)
-  // automatically appears in the UI without touching the test tool.
-  const rowKeys = Array.from(new Set(cols.flatMap(c => Object.keys(c.addr))));
-  // Preferred ordering for the common address hierarchy. Unknown
-  // fields (landmark classes etc.) fall through to alphabetical at
-  // the end so they're still shown, just less prominently.
-  const preferredOrder = [
-    'landmark',
-    'house_number', 'road', 'city_block', 'neighbourhood', 'quarter',
-    'suburb', 'borough', 'city_district', 'city', 'town', 'village',
-    'hamlet', 'municipality', 'district', 'county', 'state_district',
-    'region', 'province', 'state', 'postcode', 'country', 'country_code',
-  ];
-  rowKeys.sort((a, b) => {
-    const ia = preferredOrder.indexOf(a);
-    const ib = preferredOrder.indexOf(b);
-    if (ia !== -1 && ib !== -1) return ia - ib;
-    if (ia !== -1) return -1;
-    if (ib !== -1) return 1;
-    return a.localeCompare(b);
-  });
-
-  html += '<table style="width:100%;border-collapse:collapse;font-size:13px">';
-  html += '<tr style="border-bottom:1px solid var(--border)"><th style="text-align:left;padding:4px 8px;color:var(--text-dim);width:140px">Field</th>';
-  for (const c of cols) {
-    html += `<th style="text-align:left;padding:4px 8px;color:${c.color}">${c.label}</th>`;
-  }
-  html += '</tr>';
-  for (const f of rowKeys) {
-    const vals = cols.map(c => c.addr[f] || '');
-    if (vals.every(v => !v)) continue;
-    // Mismatch = at least two non-empty values disagree. Highlight the
-    // whole row faintly red if any disagreement, and color individual
-    // cells: red for cells participating in a disagreement, orange for
-    // empty cells in a row where another column has a value.
-    const present = vals.filter(v => v);
-    const allAgree = present.every(v => v === present[0]);
-    const anyMismatch = !allAgree;
-    const someEmpty = vals.some(v => !v) && present.length > 0;
-    const rowBg = (anyMismatch || someEmpty) ? 'background:rgba(217,74,74,0.06)' : '';
-    html += `<tr style="border-bottom:1px solid var(--border);${rowBg}">`;
-    html += `<td style="padding:4px 8px;color:var(--text-dim)">${escHtml(f)}</td>`;
-    for (const v of vals) {
-      let style = '';
-      let cellHtml;
-      if (!v) {
-        cellHtml = '<span style="color:var(--orange)">—</span>';
-      } else if (anyMismatch) {
-        style = 'color:var(--red)';
-        cellHtml = escHtml(v);
-      } else {
-        cellHtml = escHtml(v);
-      }
-      html += `<td style="padding:4px 8px;${style}">${cellHtml}</td>`;
-    }
-    html += '</tr>';
-  }
-  html += '</table>';
-
-  // Places — show one section per column when there's a comparison,
-  // otherwise the original single-table view. Minimal mode usually
-  // returns no places (POI data is omitted) so its column will be
-  // empty by design.
-  const haveAnyPlaces = cols.some(c => c.data && c.data.places && c.data.places.length > 0);
-  if (haveAnyPlaces) {
-    if (cols.length > 1) {
-      html += `<div class="detail-places"><h3 style="margin:10px 0 6px">Places</h3>`;
-      html += `<div style="display:grid;grid-template-columns:repeat(${cols.length},1fr);gap:12px">`;
-      for (const c of cols) {
-        const places = (c.data && c.data.places) || [];
-        html += `<div><div style="font-size:11px;text-transform:uppercase;color:${c.color};margin-bottom:4px">${c.label}</div>`;
-        if (places.length === 0) {
-          html += '<div style="font-size:12px;color:var(--text-dim)">— no places —</div>';
-        } else {
-          html += '<table style="width:100%;font-size:12px"><tr><th style="text-align:left;color:var(--text-dim)">Name</th><th style="text-align:left;color:var(--text-dim)">Category</th><th style="text-align:left;color:var(--text-dim)">Dist</th></tr>';
-          for (const p of places) {
-            html += `<tr><td>${escHtml(p.name)}</td><td>${escHtml(p.category)}</td><td>${p.distance_m}m</td></tr>`;
-          }
-          html += '</table>';
-        }
-        html += '</div>';
-      }
-      html += '</div></div>';
-    } else if (d.places && d.places.length > 0) {
-      html += '<div class="detail-places"><h3 style="margin:10px 0 6px">Places</h3><table><tr><th>Name</th><th>Category</th><th>Distance</th></tr>';
-      for (const p of d.places) {
-        html += `<tr><td>${escHtml(p.name)}</td><td>${escHtml(p.category)}</td><td>${p.distance_m}m</td></tr>`;
-      }
-      html += '</table></div>';
-    }
-  }
-
-  // Raw JSON for each active column (collapsible).
-  html += `<details style="margin-top:10px"><summary style="cursor:pointer;color:var(--accent)">Full response JSON</summary><div class="json-block">${syntaxHighlight(d)}</div></details>`;
-  if (showMin) {
-    html += `<details style="margin-top:6px"><summary style="cursor:pointer;color:var(--blue)">Minimal response JSON</summary><div class="json-block">${syntaxHighlight(min)}</div></details>`;
-  }
-  if (showNom) {
-    html += `<details style="margin-top:6px"><summary style="cursor:pointer;color:var(--green)">Nominatim response JSON</summary><div class="json-block">${syntaxHighlight(nom)}</div></details>`;
-  }
-
-  content.innerHTML = html;
+  // An answer coming in keeps the JSON blocks of the result open.
+  const open = detailShown === id ? [...content.querySelectorAll('details')].map((d) => d.open) : [];
+  content.innerHTML = detailHtml(views, servedBuild());
+  content.querySelectorAll('details').forEach((d, i) => { if (open[i]) d.open = true; });
+  detailShown = id;
 }
 
-// -- Helpers --
-function escHtml(s) {
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
-
-function syntaxHighlight(obj) {
-  const json = JSON.stringify(obj, null, 2);
-  return json.replace(/("(\\u[\da-fA-F]{4}|\\[^u]|[^\\"])*"(\s*:)?|\b(true|false|null)\b|-?\d+(?:\.\d*)?(?:[eE][+\-]?\d+)?)/g,
-    function(match) {
-      let cls = 'json-number';
-      if (/^"/.test(match)) {
-        cls = /:$/.test(match) ? 'json-key' : 'json-string';
-      } else if (/true|false/.test(match)) {
-        cls = 'json-bool';
-      } else if (/null/.test(match)) {
-        cls = 'json-null';
-      }
-      return `<span class="${cls}">${match}</span>`;
-    }
-  );
-}
+// -- Start --
+updateNominatimBtn();
+updatePolygonsBtn();
+(async () => {
+  await loadCatalog();
+  if (mode !== 'single') pollHealth();
+  await mapLoaded;
+  loadResults();
+  if (polygonsColumn !== 'off') ensurePolygonLayer();
+  lookupLinkPoints();
+})();
 </script>
 </body>
 </html>
