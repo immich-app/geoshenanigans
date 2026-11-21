@@ -157,6 +157,8 @@
     letter-spacing: 0.08em;
     color: var(--text-dim);
   }
+  /* Why the results were not saved, as the browser says it. */
+  .results-section h3 .warn { text-transform: none; letter-spacing: normal; }
 
   .results-list {
     flex: 1;
@@ -444,7 +446,7 @@
 
     <div class="results-section">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;gap:6px;flex-wrap:wrap;">
-        <h3 style="margin:0;flex:1">Results <span id="resultCount"></span></h3>
+        <h3 style="margin:0;flex:1">Results <span id="resultCount"></span> <span id="saveError" class="warn"></span></h3>
         <button id="nominatimBtn" class="tool" onclick="toggleNominatim()" title="Query Nominatim's public API for side-by-side comparison. Off by default — each query hits nominatim.openstreetmap.org so leave off unless you need the comparison.">Nominatim: Off</button>
         <button id="polygonsBtn" class="tool" onclick="togglePolygons()" title="Cycle the polygon overlay: Off, then the admin polygons of each column's dataset in turn. Use to compare which admin levels a smaller dataset drops.">Polygons: Off</button>
         <button id="linkBtn" class="tool" onclick="copyLink(this)" title="Copy a link to these columns, the selected point and the build that answered">Copy link</button>
@@ -1057,6 +1059,18 @@ function storedResult(r) {
   return { id: r.id, lat: r.lat, lng: r.lng, source: r.source || null, answers, nominatim: r.nominatim || null };
 }
 
+// Writes `value` into `storage` at `key`: '' once it is in, else why not
+// (a storage full, or off, throws), which the page shows beside the
+// results' count until a save goes in. What the storage held stays.
+function keep(storage, key, value) {
+  try {
+    storage.setItem(key, value);
+    return '';
+  } catch (e) {
+    return `not saved: ${e.message}`;
+  }
+}
+
 // The status line from the portal's /health: the build served (by its
 // publication ID and its dir on the portal's volume, or why none), how the
 // sync goes, and the builds it refused.
@@ -1461,9 +1475,10 @@ async function pollHealth() {
 // -- LocalStorage persistence --
 const STORAGE_KEY = 'geocoder_test_results';
 
-// The results, each as savedResult saves it. Clear empties them.
+// The results, each as savedResult saves it, and why not beside their
+// count where the storage refuses them. Clear empties them.
 function saveResults() {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(results.map(savedResult))); } catch(e) {}
+  document.getElementById('saveError').textContent = keep(localStorage, STORAGE_KEY, JSON.stringify(results.map(savedResult)));
 }
 
 function loadResults() {
@@ -1484,6 +1499,7 @@ function clearResults() {
   markers.forEach(m => m.marker.remove());
   markers.clear();
   localStorage.removeItem(STORAGE_KEY);
+  document.getElementById('saveError').textContent = '';
   clearPolygonLayer();
   renderResults();
   updateLink();

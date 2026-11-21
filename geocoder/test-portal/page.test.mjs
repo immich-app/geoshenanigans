@@ -803,6 +803,20 @@ test('a result is saved with every answer it has but those being asked, and read
   assert.deepEqual(plain(storedResult(saved)), saved);
 });
 
+// A save the browser's storage refuses (full, or off) says why, which the
+// page shows beside the results' count until a save goes in: the results
+// saved before stay as they were.
+test('a save the storage refuses says why', () => {
+  const { keep } = core();
+  const kept = new Map();
+  const storage = { setItem: (key, value) => kept.set(key, value) };
+  assert.equal(keep(storage, 'results', '[1]'), '');
+  assert.equal(kept.get('results'), '[1]');
+  const full = { setItem: () => { throw new Error("Failed to execute 'setItem' on 'Storage': exceeded the quota."); } };
+  assert.equal(keep(full, 'results', '[1,2]'), "not saved: Failed to execute 'setItem' on 'Storage': exceeded the quota.");
+  assert.ok(html.includes('<span id="saveError" class="warn"></span>'));
+});
+
 test('the polygon overlay cycles off, each column, off', () => {
   const { nextPolygons } = core();
   assert.deepEqual([nextPolygons('off', 2), nextPolygons(0, 2), nextPolygons(1, 2)], [0, 1, 'off']);
