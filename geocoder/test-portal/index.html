@@ -902,6 +902,22 @@ function nominatimView(entry) {
   return { label: 'Nominatim', color: NOMINATIM_COLOR, dataset: null, answer };
 }
 
+// A result as saveResults saved it, as the page keeps it; none for a point
+// off the globe. The page before the dataset columns saved the answer of its
+// server as `data` and that of the minimal one as `minimal`: they are those
+// of with-addresses and smallest. Its errors are not kept: those columns
+// are asked again.
+function storedResult(r) {
+  if (!r || !onGlobe(r.lat, r.lng)) return null;
+  let answers = r.answers;
+  if (!answers || typeof answers !== 'object') {
+    answers = {};
+    if (r.data) answers['full.simplified.all'] = { data: r.data };
+    if (r.minimal) answers['admin-minimal.simplified.none'] = { data: r.minimal };
+  }
+  return { id: r.id, lat: r.lat, lng: r.lng, source: r.source || null, answers, nominatim: r.nominatim || null };
+}
+
 // The status line from the portal's /health: the build served (or why
 // none), how the sync goes, and the builds it refused or found damaged.
 function statusHtml(health) {
@@ -1215,8 +1231,8 @@ function loadResults() {
   let stored = [];
   try { stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]'); } catch(e) {}
   for (const r of Array.isArray(stored) ? stored : []) {
-    if (!r || !onGlobe(r.lat, r.lng)) continue;
-    const entry = { id: r.id, lat: r.lat, lng: r.lng, source: r.source || null, answers: r.answers || {}, nominatim: r.nominatim || null };
+    const entry = storedResult(r);
+    if (!entry) continue;
     results.push(entry);
     placeMarker(entry);
   }

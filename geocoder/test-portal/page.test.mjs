@@ -499,6 +499,25 @@ test("Nominatim's column shows its answer, its request in flight, or why it fail
   assert.ok(out.includes('<div class="result-error">HTTP 429: Too Many Requests</div>') && !out.includes('not asked yet'), out);
 });
 
+// The page before the dataset columns saved a result's answer of its server
+// as data (or error) and that of the minimal one as minimal: they are those
+// of with-addresses and smallest. A failed one is asked again.
+test('a saved result keeps its answers, those the page saved before the dataset columns too', () => {
+  const { storedResult } = core();
+  const now = { id: 'a', lat: 1, lng: 2, source: 'map click', nominatim: null,
+    answers: { 'admin.simplified.major': { data: { display_name: 'Paris' }, build: '2026-11-20', dataset: 'admin.simplified.major', ms: 3 } } };
+  assert.deepEqual(plain(storedResult(now)), now);
+  const before = { id: 1763600000000, lat: 48.85, lng: 2.29, data: { display_name: 'Paris' }, nominatim: { display_name: 'Paris, France' },
+    minimal: { display_name: 'France' }, source: 'IMG_1.jpg' };
+  assert.deepEqual(plain(storedResult(before)), {
+    id: 1763600000000, lat: 48.85, lng: 2.29, source: 'IMG_1.jpg', nominatim: { display_name: 'Paris, France' },
+    answers: { 'full.simplified.all': { data: { display_name: 'Paris' } }, 'admin-minimal.simplified.none': { data: { display_name: 'France' } } },
+  });
+  assert.deepEqual(plain(storedResult({ id: 2, lat: 1, lng: 2, data: null, minimal: null, error: 'HTTP 503' }).answers), {});
+  assert.equal(storedResult({ id: 3, lat: 91, lng: 0, answers: {} }), null);
+  assert.equal(storedResult(null), null);
+});
+
 test('the polygon overlay cycles off, each column, off', () => {
   const { nextPolygons } = core();
   assert.deepEqual([nextPolygons('off', 2), nextPolygons(0, 2), nextPolygons(1, 2)], [0, 1, 'off']);
