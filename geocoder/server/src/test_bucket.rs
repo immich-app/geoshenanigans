@@ -36,7 +36,9 @@ const TEMPLATE: &str = include_str!("../../builder/configurations.template.json"
 pub struct TestBucket {
     /// The base_url a configuration names the bucket by.
     pub url: String,
-    /// What it serves as builds/<DATE>/configurations.json.
+    /// The manifest of DATE as it first serves it, at
+    /// builds/<DATE>/configurations.json: a publication of DATE again
+    /// (edit_build) changes what it serves, not this.
     pub manifest: Configurations,
     file_requests: Arc<AtomicUsize>,
     files: BTreeMap<String, Vec<u8>>,
@@ -54,19 +56,24 @@ struct Hold {
 /// Held by a test while the bucket holds an object's body back: the rest
 /// goes once it is dropped.
 pub struct Holding {
+    path: String,
     reached: Arc<tokio::sync::Notify>,
     _go: tokio::sync::oneshot::Sender<()>,
 }
 
 impl Holding {
-    /// Returns once the bucket sent the first half of the body.
+    /// Returns once the bucket sent the first half of the body; panics,
+    /// naming the object, once it has waited a minute for it.
     pub async fn reached(&self) {
-        self.reached.notified().await
+        if tokio::time::timeout(std::time::Duration::from_secs(60), self.reached.notified()).await.is_err() {
+            panic!("waited a minute for the bucket to send half of {}", self.path);
+        }
     }
 }
 
 impl TestBucket {
-    /// How many objects (a file's .zst or a unit) it has served.
+    /// How many fetches of an object (a file's .zst or a unit) it has had,
+    /// those it failed (fail) among them.
     pub fn files_served(&self) -> usize {
         self.file_requests.load(Ordering::SeqCst)
     }
@@ -77,7 +84,7 @@ impl TestBucket {
     pub fn hold(&self, path: &str) -> Holding {
         let (reached, (go_tx, go)) = (Arc::new(tokio::sync::Notify::new()), tokio::sync::oneshot::channel());
         *self.hold.lock().unwrap() = Some(Hold { path: path.to_string(), reached: reached.clone(), go });
-        Holding { reached, _go: go_tx }
+        Holding { path: path.to_string(), reached, _go: go_tx }
     }
 
     /// The bytes of the file at `path`, as its manifest entry gives them.
@@ -108,8 +115,8 @@ impl TestBucket {
         *self.served.latest.lock().unwrap() = latest_json(date, version);
     }
 
-    /// Each object it has served (a file's .zst or a unit) so far, in order:
-    /// `<date>/<path>`.
+    /// Each fetch of an object (a file's .zst or a unit) it has had so far,
+    /// in order, those it failed (fail) among them: `<date>/<path>`.
     pub fn requests(&self) -> Vec<String> {
         self.served.requests.lock().unwrap().clone()
     }

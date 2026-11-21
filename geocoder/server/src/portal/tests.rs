@@ -82,12 +82,12 @@ fn write_dataset(dir: &Path, country: &str) {
 /// The datasets an injected loader loads (fixtures).
 struct Fixtures {
     dir: ScratchDir,
-    /// The dates of the builds whose datasets fail to load.
-    failing: Mutex<BTreeSet<String>>,
+    /// The datasets that fail to load, each by its build's date and its id.
+    failing: Mutex<BTreeSet<(String, String)>>,
 }
 
 /// Loads each dataset dir (<build>/sets/<id>) as a dataset of its own, its
-/// country named by its id; fails for those of the builds `fixtures` names.
+/// country named by its id; fails for those `fixtures` names.
 fn fixtures() -> (Arc<Fixtures>, Loader) {
     let fixtures = Arc::new(Fixtures { dir: ScratchDir::new(), failing: Mutex::new(BTreeSet::new()) });
     let loaded = fixtures.clone();
@@ -96,7 +96,7 @@ fn fixtures() -> (Arc<Fixtures>, Loader) {
         let build = set.parent().unwrap().parent().unwrap().file_name().unwrap().to_str().unwrap();
         let date = BuildDir::parse(build).unwrap().date;
         let failing = loaded.failing.lock().unwrap();
-        if failing.contains(&date) {
+        if failing.contains(&(date.clone(), id.clone())) {
             return Err(format!("it holds no admin_cells.bin of build {date}"));
         }
         let dir = loaded.dir.path().join(&id);
@@ -358,18 +358,22 @@ async fn a_dataset_answers_byte_for_byte_what_query_server_answers_from_its_file
         }
     }
     queries.extend(["lat=95&lon=0&key=test", "lat=10.5&lon=20.5", "lat=10.5&lon=20.5&key=nope", "lon=20.5&key=test", "lat=north&lon=20.5&key=test"].map(String::from));
-    let mut found = 0;
+    let mut found = BTreeMap::new();
     for route in ["reverse", "polygons"] {
         for q in &queries {
             let want = fetch(&format!("{theirs}/{route}?{q}")).await;
-            found += usize::from(want.body.contains("Testland"));
+            *found.entry(route).or_insert(0) += usize::from(want.status == 200 && want.body.contains("Testland"));
             for dataset in ["", "&dataset=with-addresses", "&dataset=full.simplified.all"] {
                 let got = fetch(&format!("{ours}/{route}?{q}{dataset}")).await;
                 assert_eq!((got.status, &got.content_type, &got.body), (want.status, &want.content_type, &want.body), "/{route}?{q}{dataset}");
             }
         }
     }
-    assert!(found >= 6, "{found} answers name the country");
+    // Each route answers with the dataset's country at the points in it,
+    // not only with what both would answer of none.
+    for route in ["reverse", "polygons"] {
+        assert!(found.get(route).is_some_and(|&n| n >= 3), "/{route}: {found:?} answers name the country");
+    }
 }
 
 // The objects of a build are each one the selections the portal serves take,
@@ -383,7 +387,14 @@ async fn a_builds_objects_cover_every_selection_it_serves_and_its_sync_fetches_e
     let bucket = test_bucket::serve(test_bucket::template_components()).await;
     let (cfg, manifest) = manifest_of(&bucket).await;
     let plan = catalog::plan(&cfg, &manifest).unwrap();
-    let held: BTreeMap<&str, &Object> = plan.objects.iter().flat_map(|o| o.files.iter().map(move |f| (f.as_str(), o))).collect();
+    let mut held: BTreeMap<&str, &Object> = BTreeMap::new();
+    for o in &plan.objects {
+        for f in &o.files {
+            if let Some(other) = held.insert(f.as_str(), o) {
+                panic!("{f} is a file of {} and of {}", other.path, o.path);
+            }
+        }
+    }
     let (mut units, mut taken) = (BTreeSet::new(), BTreeSet::new());
     let allowed: Vec<RegionSelection> = template_selections().into_iter().filter(|(_, allowed)| *allowed).map(|(s, _)| s).collect();
     assert_eq!(allowed.len(), 28);
@@ -473,22 +484,24 @@ async fn a_build_of_another_version_is_never_switched_to_and_is_recorded() {
     assert_eq!(build_dirs(data.path()), [format!("{DATE}-1")]);
 }
 
-// A build whose datasets don't all load is refused: the build served stays,
-// the refused one's dir goes, and the refusal is on record, so that neither
-// this server nor one started afresh on the data dir fetches it again.
+// A build whose datasets don't all load is refused, though all but its
+// last do: the build served stays, the refused one's dir goes, and the
+// refusal is on record, so that neither this server nor one started afresh
+// on the data dir fetches it again.
 #[tokio::test]
 async fn a_build_that_doesnt_load_is_never_switched_to_is_recorded_and_not_fetched_again() {
     let bucket = test_bucket::serve(test_bucket::template_components()).await;
     let data = ScratchDir::new();
     let (fixtures, load) = fixtures();
-    fixtures.failing.lock().unwrap().insert(NEXT.to_string());
+    let last = template_ids().pop().unwrap();
+    fixtures.failing.lock().unwrap().insert((NEXT.to_string(), last.clone()));
     let p = portal(data.path(), config(&bucket, load.clone()));
     p.round(true).await.unwrap();
 
     bucket.add_build(NEXT, BUILD_VERSION);
     bucket.set_latest(NEXT, Some(BUILD_VERSION));
     let done = p.round(false).await.unwrap();
-    let why = format!("it doesn't load: dataset {}: it holds no admin_cells.bin of build {NEXT}", template_ids()[0]);
+    let why = format!("it doesn't load: dataset {last}: it holds no admin_cells.bin of build {NEXT}");
     assert_eq!(done, format!("refused build {NEXT}: {why}"));
     assert_eq!(p.served().unwrap().dir, format!("{DATE}-1"));
     assert_eq!(build_dirs(data.path()), [format!("{DATE}-1")]);
@@ -664,7 +677,10 @@ async fn a_start_without_a_usable_build_answers_503_with_the_reason_and_keeps_sy
     let reason = health.json()["reason"].as_str().unwrap().to_string();
     let waiting = format!("no build to serve: waiting for a build of version {BUILD_VERSION}");
     assert!(reason.starts_with(&waiting), "{reason}");
-    assert!(reason.contains(&format!("refused build {NEXT}: it is of build version {}", BUILD_VERSION + 1)), "{reason}");
+    let refused = health.json()["sync"]["refused"].clone();
+    let why = format!("it is of build version {}; this server reads build version {BUILD_VERSION}", BUILD_VERSION + 1);
+    assert_eq!(refused.as_array().map(Vec::len), Some(1), "{refused}");
+    assert_eq!((refused[0]["date"].as_str(), refused[0]["reason"].as_str()), (Some(NEXT), Some(why.as_str())), "{refused}");
     assert_eq!(health.json()["sync"]["latest"]["date"], NEXT);
     for route in ["datasets", "reverse?lat=10.5&lon=20.5&key=test", "polygons?lat=10.5&lon=20.5&key=test"] {
         let got = fetch(&format!("{url}/{route}")).await;
@@ -714,23 +730,49 @@ async fn a_start_on_a_build_it_cant_serve_says_why_in_its_503() {
 #[tokio::test]
 async fn a_start_serves_no_build_before_its_files_check_out() {
     let bucket = test_bucket::serve(test_bucket::template_components()).await;
-    let data = ScratchDir::new();
+    let source = ScratchDir::new();
     let (_fixtures, load) = fixtures();
-    portal(data.path(), config(&bucket, load.clone())).round(true).await.unwrap();
-    let builds = data.path().join(BUILDS);
-    copy_build(&builds.join(format!("{DATE}-1")), &builds.join(format!("{NEXT}-1")), NEXT, BUILD_VERSION);
+    portal(source.path(), config(&bucket, load.clone())).round(true).await.unwrap();
+    let made = source.path().join(BUILDS).join(format!("{DATE}-1"));
+    let (cfg, manifest) = manifest_of(&bucket).await;
+    let plan = catalog::plan(&cfg, &manifest).unwrap();
     let damaged = "planet/full/admin_cells.bin";
-    // A byte of the file flipped, in a copy of its own (the build's dirs
-    // share it by hard links).
-    let damage = |dir: &str| {
-        let at = builds.join(dir).join(damaged);
+    // A copy of the build as NEXT's, a byte of the file flipped in a copy
+    // of its own (the build's dirs share it by hard links), which its
+    // datasets' dirs link: it is in place, and its bytes alone are amiss.
+    let damaged_next = |builds: &Path| {
+        let root = builds.join(format!("{NEXT}-1"));
+        copy_build(&made, &root, NEXT, BUILD_VERSION);
+        let at = root.join(damaged);
         let mut bytes = std::fs::read(&at).unwrap();
         bytes[0] ^= 1;
         std::fs::remove_file(&at).unwrap();
         std::fs::write(&at, &bytes).unwrap();
+        for d in &plan.datasets {
+            for (name, _) in d.links().into_iter().filter(|(_, path)| path == damaged) {
+                let link = root.join(SETS).join(&d.id).join(name);
+                std::fs::remove_file(&link).unwrap();
+                std::fs::hard_link(&at, &link).unwrap();
+            }
+        }
     };
-    damage(&format!("{NEXT}-1"));
+    let skipped = |dir: &str| format!("build {dir} here can't be served: {damaged} holds bytes of sha256 ");
+
+    // Alone on a volume, the copy is not served, for its file's bytes.
+    let alone = ScratchDir::new();
+    damaged_next(&alone.path().join(BUILDS));
     // No round gets past the start: the latest build stays unknown.
+    std::fs::write(alone.path().join(sync::LATEST_OVERRIDE), "tomorrow\n").unwrap();
+    let none = portal(alone.path(), config(&bucket, load.clone()));
+    assert!(none.round(true).await.is_err());
+    assert!(none.served().is_none());
+    assert!(none.unavailable().contains(&skipped(&format!("{NEXT}-1"))), "{}", none.unavailable());
+
+    // Beside the build it is a copy of, that one is served.
+    let data = ScratchDir::new();
+    let builds = data.path().join(BUILDS);
+    copy_build(&made, &builds.join(format!("{DATE}-1")), DATE, BUILD_VERSION);
+    damaged_next(&builds);
     std::fs::write(data.path().join(sync::LATEST_OVERRIDE), "tomorrow\n").unwrap();
     let loaded = Arc::new(Mutex::new(BTreeSet::new()));
     let recording: Loader = {
@@ -754,8 +796,7 @@ async fn a_start_serves_no_build_before_its_files_check_out() {
     let none = portal(data.path(), config(&bucket, recording));
     assert!(none.round(true).await.is_err());
     assert!(none.served().is_none());
-    let skipped = format!("build {DATE}-1 here can't be served: {damaged} holds bytes of sha256 ");
-    assert!(none.unavailable().contains(&skipped), "{}", none.unavailable());
+    assert!(none.unavailable().contains(&skipped(&format!("{DATE}-1"))), "{}", none.unavailable());
 }
 
 // A dataset loads from its dir of links, so a build is served only where
@@ -936,10 +977,13 @@ async fn a_round_whose_ledger_fails_ends_only_once_the_fetches_it_started_have()
         async move { p.round(true).await }
     });
     holding.reached().await;
-    let second = format!("{DATE}/{}", object_url(&order[1]));
-    until("the second object's fetch", || bucket.requests().contains(&second)).await;
+    // The second object's files in place: adding its line, which fails, is
+    // what the round does next, while the first's fetch is held.
+    let in_place = |o: &Object| o.files.iter().all(|f| std::fs::read(root.join(f)).is_ok_and(|b| b == bucket.file(f)));
+    until("the second object's files", || in_place(&order[1])).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!round.is_finished());
+    assert_eq!(bucket.requests().len(), 2);
     drop(holding);
 
     let failed = round.await.unwrap().unwrap_err();
@@ -1589,9 +1633,9 @@ async fn the_headers_health_and_datasets_name_the_build_served_by_its_dir() {
     }
 }
 
-// An object whose fetch fails is fetched again after each pause; one that
-// fails each time fails the round, which leaves its dir to the next to
-// resume.
+// An object whose fetch fails is fetched again after each pause, each try
+// once its pause is over; one that fails each time fails the round, which
+// leaves its dir to the next to resume.
 #[tokio::test]
 async fn an_object_whose_fetch_fails_is_tried_again_after_a_pause() {
     let bucket = test_bucket::serve(test_bucket::template_components()).await;
@@ -1600,12 +1644,15 @@ async fn an_object_whose_fetch_fails_is_tried_again_after_a_pause() {
     let objects = fetched(&bucket).await;
     let (flaky, failing) = (object_url(&objects[0]), object_url(&objects[1]));
     let mut retrying = config(&bucket, load.clone());
-    retrying.retry_delays = vec![Duration::from_millis(10); 2];
+    retrying.retry_delays = vec![Duration::from_millis(100); 2];
     bucket.fail(&flaky, 2);
     bucket.fail(&failing, 3);
     let p = portal(data.path(), retrying);
+    let started = std::time::Instant::now();
 
     let failed = p.round(true).await.unwrap_err();
+
+    assert!(started.elapsed() >= Duration::from_millis(200), "{:?}", started.elapsed());
     assert!(failed.starts_with(&format!("1 of build {DATE}'s objects did not come down: {}: HTTP error: ", objects[1].path)), "{failed}");
     let count = |path: &str| bucket.requests().iter().filter(|r| **r == format!("{DATE}/{path}")).count();
     assert_eq!((count(&flaky), count(&failing)), (3, 3));
