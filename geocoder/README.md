@@ -129,13 +129,91 @@ read, which a local file system allows; on NFS an exclusive lock needs the
 file open to write, so there it fails, saying so.
 
 The test portal is a map page for checking answers, served by every query
-server at `/test`. Its compose file runs two servers on the latest published
-index, a full one and a minimal one, side by side:
+server at `/test`, where it asks that server. Its compose file runs
+`query-portal`, a binary of the server crate, which serves every dataset of
+the latest published planet build: each selection of a mode, a boundary
+precision and a POI tier the manifest's constraints allow (28). Its page
+compares up to 4 of them side by side, each a preset or a pick by axis, and
+its URL holds the columns, the point and the build (`b=`, its publication
+ID: `<date>-<the first 12 hex digits of its manifest's sha256>`, the same on
+every volume), which it flags when another build is served, one published
+again under its date among them; a `b=` of a date alone stands for any
+build of its date. To run it:
 
 ```bash
-cd test-portal && docker compose up --build
+cd test-portal && docker compose up --build --remove-orphans
 # open http://localhost:3002/test
+# or http://localhost:3002/test?d=with-addresses&d=smallest&at=48.8584,2.2945
 ```
+
+Its volume, `geocoder-portal-data`, is not the old services' volumes: at its
+first start the portal makes the test account in `geocoder.json` on it. To
+keep the accounts of the old `geocoder-data-full` volume, copy that volume's
+`index/geocoder.json` to `geocoder.json` on the new one once, before the
+first start.
+
+Its `/reverse` and `/polygons` take `dataset=`: a preset's id (`smallest`)
+or `<mode>.<quality>.<poi_tier>` (`admin.simplified.major`), and
+`with-addresses` without one. They answer what a query-server serving that
+selection's files answers, and name the dataset and build that answered in
+`X-Geocoder-Dataset`, `X-Geocoder-Build` (its date), `X-Geocoder-Build-Id`
+(its publication ID, as `/health` and `/datasets` name it) and
+`X-Geocoder-Build-Dir` (the dir the volume holds it in, `<date>-<n>`, the
+volume's alone).
+`/datasets` lists the datasets with their labels and sizes, and the
+combinations the constraints exclude with their messages; `/health` gives
+the build served and how its sync goes. The page asks `/datasets` anew
+once `/health` names another publication ID, and cancels a polygon
+request once a newer one or a clear supersedes it.
+The test key the page sends allows 200 requests a second and 5,000,000 a
+day (UTC), shared by every visitor. The page keeps 8 in flight and asks a
+429 of `/reverse` again after a pause, 8 tries in all, after which the 429
+is its answer; once the day's 5,000,000 are spent, `/reverse` answers 429
+until the UTC day turns. Its `/polygons` (of no rate limit) don't wait out
+those pauses, and the portal runs 8 lookups at once, the others waiting
+their turn.
+
+`query-portal` checks the bucket for a new build itself, every hour
+(`PORTAL_SYNC_SECONDS`), and 10 minutes after a round that failed (or
+`PORTAL_SYNC_SECONDS`, where that is less). A round that finds latest.json
+and the build's manifest naming the build it serves fetches nothing else.
+It fetches a new build into a dir of its own in the volume, each file
+checked against the build's manifest (~11.2 GiB a build, ~9 GiB to
+download): each dataset's dir holds hard links of the build's files, files
+the build holds twice byte for byte are fetched once and hard-linked, and
+no file is shared between the dirs of two builds. It fetches only with room
+free for the files still to fetch and 2 GiB besides, so a volume that holds
+the build served and the one before needs ~13 GiB more free to fetch a
+third, ~36 GiB in all. A sync killed part way resumes in its dir: it reads
+the files of the objects its ledger names against their sha256 and removes
+those that fail and the files the ledger doesn't name before it weighs the
+room. It switches to a build only once every file of it holds its
+manifest's bytes, each read against its sha256 again, each dataset's dir
+holds hard links of the build's files and nothing else, and every dataset
+loads. A build whose files fail that check is fetched again, into a new
+dir, not refused; one whose files check out but whose datasets don't load
+is refused, as is one whose manifest is of another build version than it
+reads, each saying so on `/health`. While latest.json gives another build
+version than the manifest, the sync fails and retries, refusing nothing. A
+build published again under its date (a rerun of the nightly) is another
+build: it fetches that one too, and a refusal of the build as first
+published doesn't hold against it. At start it serves the newest build the
+volume holds whose files all hold their manifest's bytes, each read against
+its sha256 before the build is served (~3 s for a planet build on an NVMe
+disk, cold or warm), and fetches one that doesn't again. Until it has a
+build to serve, `/health`, `/datasets`, `/reverse` and `/polygons` answer
+503 with the reason, `/reverse` and `/polygons` whatever key they are sent.
+Besides the build it serves, it keeps the newest complete build it holds of
+another date (the one it served before, but where that was of the same
+date: a build published again under its date takes the place of the one
+first published), and an incomplete one of the latest build, to resume.
+Once latest.json names a build it keeps again, as published then (its
+manifest the same byte for byte), it serves that one again once its files
+check out and its datasets load, fetching only its manifest. A date in
+`<data>/latest.override` stands in for the bucket's latest.json. One
+`query-portal` serves a volume: it holds `<data>/portal.lock` for as long
+as it runs, and a second one started on the same volume exits at once,
+saying so.
 
 ## API
 
@@ -188,7 +266,7 @@ The project consists of four components:
 - **Builder** (`builder/`, C++) - `build-index` parses OSM PBF files and creates a compact binary index using S2 geometry cells for spatial lookup. `geocoder-diff` and `geocoder-patch` make and apply the daily patches ([builder/PATCHING.md](builder/PATCHING.md)), and `pbf-apply` applies OSM replication diffs to a PBF.
 - **Server** (`server/`, Rust) - Memory-maps the index files and serves queries via HTTP/HTTPS with sub-millisecond latency. It is also the `query_server` library the binding wraps.
 - **Node binding** (`node/`) - The native module Immich uses to geocode in-process: `Geocoder.load(dir)`, then `reverseGeocode(lat, lng)` resolves to the response JSON as a string. `openPlaceSearch()` opens the place search index of the dataset (shipped with the bigger packs, else built on the device; see [builder/PATCHING.md](builder/PATCHING.md#place-search-index)), then `searchPlaces(query)` resolves to the results as a JSON string. `createTransportDecoder(dir, files)` decodes a downloading transport unit into the dataset dir ([PATCHING.md](PATCHING.md#transport-units)).
-- **Test portal** (`test-portal/`) - The map page served at `/test`, and a compose file that runs it on the published index.
+- **Test portal** (`test-portal/`) - The map page served at `/test`, and the image and compose file of `query-portal`, which serves every dataset of the published planet build for the page to compare side by side.
 
 ### Index Structure
 

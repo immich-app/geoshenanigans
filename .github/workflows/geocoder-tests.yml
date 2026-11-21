@@ -145,6 +145,12 @@ jobs:
         run: |
           cd geocoder/server
           cargo test --release
+      # The test portal's server, as its image builds it: its tests run in
+      # query-server's, so the step above doesn't build it.
+      - name: Build query-portal
+        run: |
+          cd geocoder/server
+          cargo build --release --bin query-portal
 
   search-tests:
     name: Place search unit tests
@@ -181,11 +187,16 @@ jobs:
           node --test test/*.test.mjs
 
   test-portal-tests:
-    name: Test portal entrypoint tests
+    name: Test portal tests
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - name: Test
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: geocoder/node/.nvmrc
+      - name: Entrypoint
         run: geocoder/test-portal/entrypoint.test.sh
+      - name: Page
+        run: node --test geocoder/test-portal/page.test.mjs

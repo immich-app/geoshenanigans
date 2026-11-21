@@ -15,6 +15,7 @@ import build_search_indexes as sut  # noqa: E402
 
 TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "configurations.template.json")
 PORTAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "test-portal")
+SERVER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "server")
 # The files a dir's admin geometry is read from (server/src/admin_geometry.rs, ADMIN_GEOMETRY_FILES).
 ADMIN_GEOMETRY = ["admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc_vertices.bin"]
 
@@ -187,83 +188,39 @@ class TemplateTest(unittest.TestCase):
 
 
 class TestPortalTest(unittest.TestCase):
-    """The test portal's servers download the files of the selection they name, from the dirs a
-    client takes them from."""
+    """The test portal's image runs query-portal (server/src/portal.rs), which syncs the whole planet
+    build, decoding its transport units in-process, and serves every selection of it."""
 
-    def portal_files(self, env):
-        """The "<dir> <file>" lines entrypoint.sh --list-files gives under `env`, as planet paths. It runs
-        with no curl, zstd or query-server on its PATH, so it can't download or serve."""
-        with tempfile.TemporaryDirectory() as tmp:
-            run = subprocess.run(["sh", os.path.join(PORTAL, "entrypoint.sh"), "--list-files"],
-                                 env={"PATH": tmp, "DATA_DIR": tmp, **env}, capture_output=True, text=True,
-                                 executable="/bin/sh", timeout=60)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        return [f"planet/{d}/{f}" for d, f in (line.split() for line in run.stdout.splitlines())]
+    # The portal syncs and serves only builds of the version whose files it reads: the template's.
+    def test_the_build_version_it_syncs_is_the_templates(self):
+        with open(os.path.join(SERVER, "src", "portal.rs")) as f:
+            versions = re.findall(r"^pub const BUILD_VERSION: u32 = (\d+);$", f.read(), re.M)
+        self.assertEqual(versions, [str(load_template()["build"]["version"])])
 
-    def compose_environments(self):
-        """Each docker-compose.yml service's environment (its `KEY: value` lines)."""
-        with open(os.path.join(PORTAL, "docker-compose.yml")) as f:
-            text = f.read()
-        blocks = re.findall(r"^    environment:\n((?:      \w+: .+\n)+)", text, re.M)
-        return [{k: v.strip('"') for k, v in re.findall(r"^      (\w+): (.+)$", block, re.M)} for block in blocks]
-
-    def selection_of(self, env):
-        if env.get("MINIMAL") == "1":
-            return {"region": "planet", "mode": "admin-minimal", "quality": env["QUALITY"], "poi_tier": "none"}
-        return {"region": "planet", "mode": "full", "quality": env["QUALITY"], "poi_tier": env["POI_TIER"]}
-
-    def test_each_server_downloads_its_selections_files_from_their_dirs(self):
-        cfg = load_template()
-        envs = self.compose_environments()
-        self.assertEqual(sorted(e.get("MINIMAL") for e in envs), ["0", "1"])
-        tiers = [dict(e, QUALITY=q) for e in envs for q in cfg["axes"]["quality"]["values"]]
-        for env in envs + tiers:
-            sel = self.selection_of(env)
-            if not allowed(cfg, sel):
-                continue
-            listed = self.portal_files(env)
-
-            self.assertEqual(len(listed), len(set(map(os.path.basename, listed))), env)
-            self.assertEqual(flat(listed), flat(sut.resolve(cfg, sel)[0]), env)
-
-    def test_the_defaults_are_the_compose_files(self):
-        envs = {e["MINIMAL"]: e for e in self.compose_environments()}
-
-        self.assertEqual(self.portal_files({}), self.portal_files(envs["0"]))
-        self.assertEqual(self.portal_files({"MINIMAL": "1"}), self.portal_files(envs["1"]))
-
-    # A server downloads only a build of the version whose files it reads: the template's.
-    def test_the_build_version_it_downloads_is_the_templates(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            run = subprocess.run(["sh", os.path.join(PORTAL, "entrypoint.sh"), "--build-version"],
-                                 env={"PATH": tmp, "DATA_DIR": tmp}, capture_output=True, text=True,
-                                 executable="/bin/sh", timeout=60)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        self.assertEqual(run.stdout.strip(), str(load_template()["build"]["version"]))
-
-    def unit_of(self, name):
-        """The transport unit entrypoint.sh --unit-of fetches a file through, or ""."""
-        with tempfile.TemporaryDirectory() as tmp:
-            run = subprocess.run(["sh", os.path.join(PORTAL, "entrypoint.sh"), "--unit-of", name],
-                                 env={"PATH": tmp, "DATA_DIR": tmp}, capture_output=True, text=True,
-                                 executable="/bin/sh", timeout=60)
-        self.assertEqual(run.returncode, 0, run.stderr)
-        return run.stdout.strip()
-
-    # The bucket holds a unit's files only in the unit: the servers fetch each
-    # through the unit the template puts it in, and decode it with the CLI the
-    # image ships.
-    def test_each_file_comes_through_the_unit_the_template_puts_it_in(self):
-        cfg = load_template()
-        units = {f: u["unit"] for u in cfg["transport"]["units"] for f in u["files"]}
-        names = {os.path.basename(p) for env in ({}, {"MINIMAL": "1"}, {"QUALITY": "exact"}) for p in self.portal_files(env)}
-        self.assertTrue(names & set(units))
-        for name in sorted(names):
-            self.assertEqual(self.unit_of(name), units.get(name, ""), name)
+    # The bucket holds a unit's files only in the unit, which the portal fetches and decodes itself:
+    # the image builds and ships it, and starts its entrypoint, which runs it.
+    def test_the_image_runs_query_portal(self):
         with open(os.path.join(PORTAL, "Dockerfile")) as f:
             image = f.read()
-        self.assertIn("cargo build --release --locked --manifest-path search/Cargo.toml --bin geocoder-transport", image)
-        self.assertIn("COPY --from=builder /src/search/target/release/geocoder-transport /usr/local/bin/", image)
+        self.assertIn("RUN cargo build --release --manifest-path server/Cargo.toml --bin query-portal\n", image)
+        self.assertIn("COPY --from=builder /src/server/target/release/query-portal /usr/local/bin/\n", image)
+        self.assertIn("COPY test-portal/entrypoint.sh /usr/local/bin/entrypoint.sh\n", image)
+        self.assertEqual(re.findall(r"(?m)^(?:ENTRYPOINT|CMD)\b.*$", image), ['ENTRYPOINT ["entrypoint.sh"]'])
+        with open(os.path.join(PORTAL, "entrypoint.sh")) as f:
+            self.assertRegex(f.read(), r'(?m)^exec query-portal "\$DATA_DIR" 0\.0\.0\.0:3000$')
+
+    # One service serves every dataset on :3002 (the minimal server of :3001 is a column of the page), init
+    # passing query-portal the stop signal, set only by what query-portal and the entrypoint read: its
+    # environment as a mapping (NAME: value) or a list (- NAME=value, - NAME).
+    def test_compose_runs_one_portal_on_3002(self):
+        with open(os.path.join(PORTAL, "docker-compose.yml")) as f:
+            services = f.read().split("\nvolumes:\n")[0]
+        self.assertEqual(re.findall(r"(?m)^  ([\w-]+):$", services), ["geocoder-portal"])
+        self.assertEqual(re.findall(r'(?m)^      - "(\d+):3000"$', services), ["3002"])
+        self.assertRegex(services, r"(?m)^    init: true$")
+        mapped = re.findall(r"(?m)^      ([A-Z][A-Z_]*):", services)
+        listed = re.findall(r'(?m)^      - "?([A-Z][A-Z_]*)(?:=|"?$)', services)
+        self.assertLessEqual(set(mapped + listed), {"DATA_DIR", "PORTAL_BASE_URL", "PORTAL_SYNC_SECONDS"})
 
 
 class ResolveTest(unittest.TestCase):

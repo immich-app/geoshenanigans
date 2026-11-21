@@ -1,0 +1,1046 @@
+// The test page's logic: index.html's <script id="core">, which reads no DOM
+// (the link, the columns and their datasets, the pacing of requests, the
+// comparison of answers and the HTML of each part), run in a context of its
+// own as the page runs it. The page's other scripts, which wire it to the DOM
+// and the map, are checked to parse, and its style for the layout of the side
+// panel. /datasets is that of a build of the template, as the portal lists
+// it (server/src/portal/catalog.rs).
+//
+//   node --test geocoder/test-portal/page.test.mjs
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import { test } from 'node:test';
+import vm from 'node:vm';
+
+const html = readFileSync(new URL('./index.html', import.meta.url), 'utf8');
+const template = JSON.parse(readFileSync(new URL('../builder/configurations.template.json', import.meta.url), 'utf8'));
+
+// The inline scripts of the page, by id.
+const scripts = [...html.matchAll(/<script(?:\s+id="([\w-]+)")?>([\s\S]*?)<\/script>/g)].map((m) => ({ id: m[1], body: m[2] }));
+
+// The declarations of the page's first style rule for `selector` (those of
+// @media come after), by property.
+function style(selector) {
+  const css = html.match(/<style>([\s\S]*?)<\/style>/)[1].replace(/\/\*[\s\S]*?\*\//g, '');
+  const rule = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].find((m) => m[1].split(',').map((s) => s.trim()).includes(selector));
+  assert.ok(rule, `index.html has no style for ${selector}`);
+  return Object.fromEntries(rule[2].split(';').filter((d) => d.includes(':'))
+    .map((d) => [d.slice(0, d.indexOf(':')).trim(), d.slice(d.indexOf(':') + 1).trim()]));
+}
+
+// The core script's top-level bindings, by name.
+function core() {
+  const found = scripts.find((s) => s.id === 'core');
+  assert.ok(found, 'index.html has no <script id="core">');
+  const context = vm.createContext({ URLSearchParams, setTimeout, clearTimeout, AbortController });
+  vm.runInContext(found.body, context, { filename: 'index.html#core' });
+  return new Proxy({}, { get: (_, name) => vm.runInContext(String(name), context) });
+}
+
+// What /datasets answers for a build of the template as `edit` changes it:
+// the axes (of region, planet only) and their values in order, the presets,
+// each planet selection the constraints allow as a dataset (the preset's
+// label and description for a preset's, of size its place in GiB on disk and
+// half that to download) and those they rule out.
+function catalog(edit = () => {}) {
+  const t = structuredClone(template);
+  edit(t);
+  const values = (axis) => Object.entries(t.axes[axis].values).sort((a, b) => a[1].order - b[1].order || a[0].localeCompare(b[0]));
+  const axes = ['region', 'mode', 'quality', 'poi_tier'].map((id) => ({
+    id,
+    label: t.axes[id].label,
+    description: t.axes[id].description ?? null,
+    values: values(id).filter(([v]) => id !== 'region' || v === 'planet').map(([v, x]) => ({ id: v, label: x.label, description: x.description ?? null })),
+  }));
+  const datasets = [];
+  const excluded = [];
+  for (const [mode, m] of values('mode')) {
+    for (const [quality, q] of values('quality')) {
+      for (const [poi_tier, p] of values('poi_tier')) {
+        const selection = { region: 'planet', mode, quality, poi_tier };
+        const id = `${mode}.${quality}.${poi_tier}`;
+        const has = (o) => Object.entries(o).every(([axis, v]) => selection[axis] === v);
+        const broken = t.constraints.find((c) => has(c.when) && !has(c.requires));
+        if (broken) {
+          excluded.push({ id, selection, constraint: broken.id, message: broken.message, requires: broken.requires });
+          continue;
+        }
+        const preset = t.presets.find((x) => has(x.selections));
+        const n = datasets.length + 1;
+        datasets.push({
+          id,
+          label: preset ? preset.label : [m, q, p].map((v) => v.label).join(' · '),
+          description: preset ? preset.description : null,
+          preset: preset ? preset.id : null,
+          selection,
+          size_disk: n * 2 ** 30,
+          size_download: n * 2 ** 29,
+        });
+      }
+    }
+  }
+  const presets = t.presets.map((p) => ({
+    id: p.id, label: p.label, description: p.description, dataset: `${p.selections.mode}.${p.selections.quality}.${p.selections.poi_tier}`,
+  }));
+  return { build: { date: '2026-11-20', version: 24, id: ID, dir: '2026-11-20-1' }, default: 'full.simplified.all', axes, presets, datasets, excluded };
+}
+
+// The publication IDs of two builds of 2026-11-20, the second published
+// again under its date (a rerun of the nightly): the date and the first 12
+// hex digits of its manifest's sha256. Each fills the dir 2026-11-20-1 of a
+// volume of its own.
+const ID = '2026-11-20-9bc04e7d1a25';
+const AGAIN = '2026-11-20-3fa2b1c4d5e6';
+
+const MESSAGE = template.constraints[0].message;
+const ADMIN_MINIMAL = { region: 'planet', mode: 'admin-minimal', quality: 'simplified', poi_tier: 'none' };
+const FULL_EXACT = { region: 'planet', mode: 'full', quality: 'exact', poi_tier: 'all' };
+
+// A template whose every string the page shows is markup: labels,
+// descriptions and the constraint's message, a preset's id, and a value's
+// id, which the ids of its datasets take.
+function hostile(t) {
+  t.presets[0].label = '<img src=x onerror=alert(1)>';
+  t.presets[0].description = '"><script>alert(2)</script>';
+  t.presets[1].id = '"><img src=x onerror=alert(4)>';
+  t.axes.mode.label = '<u>mode</u>';
+  t.axes.mode.description = '" onmouseover="alert(3)';
+  t.axes.mode.values.full.label = '<b>Full</b>';
+  t.axes.quality.values.exact.description = '<i>every point</i>';
+  t.axes.poi_tier.values[MAJOR] = t.axes.poi_tier.values.major;
+  delete t.axes.poi_tier.values.major;
+  for (const p of t.presets.filter((x) => x.selections.poi_tier === 'major')) p.selections.poi_tier = MAJOR;
+  t.constraints[0].message = '<em>no</em> & "quotes"';
+}
+const MAJOR = 'major"><u>';
+
+// `c` with the id of its axis `from` made `to`, in the axes and in each
+// selection.
+function renameAxis(c, from, to) {
+  c.axes.find((a) => a.id === from).id = to;
+  for (const x of [...c.datasets, ...c.excluded]) {
+    x.selection = Object.fromEntries(Object.entries(x.selection).map(([axis, value]) => [axis === from ? to : axis, value]));
+  }
+  return c;
+}
+
+// No markup of `hostile` comes through, and its text does, escaped.
+function assertEscaped(out) {
+  for (const tag of ['<img', '<script', '<u>', '<b>', '<i>', '<em>', '" onmouseover']) {
+    assert.ok(!out.includes(tag), `${tag} came through: ${out}`);
+  }
+}
+
+// A value of the page's context as a plain value of this one (deepEqual
+// holds objects of two contexts unequal by their prototypes).
+const plain = (x) => JSON.parse(JSON.stringify(x));
+
+// A /reverse answer of a dataset.
+function reply(status, body, headers = {}) {
+  return { status, headers: { get: (name) => headers[name.toLowerCase()] ?? null }, text: async () => body };
+}
+
+// Lets the page's promises that can go on go on.
+async function settle() {
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+}
+
+// A clock that moves only when the test moves it: now() is `t`, and a sleep
+// lasts until wake() moves `t` to its end.
+function handClock() {
+  const clock = {
+    t: 0,
+    sleeping: [],
+    now: () => clock.t,
+    sleep: (ms) => new Promise((resolve) => clock.sleeping.push({ ms, until: clock.t + ms, resolve })),
+    // The lengths of the sleeps not over, in the order they began.
+    lengths: () => clock.sleeping.map((s) => s.ms),
+    // Moves `t` to the end of every sleep not over, and ends them.
+    wake() {
+      clock.t = Math.max(clock.t, ...clock.sleeping.map((s) => s.until));
+      for (const s of clock.sleeping.splice(0)) s.resolve();
+    },
+  };
+  return clock;
+}
+
+// A Pacer of the page's on `clock`, its first pause 100 ms (and `options`
+// besides), whose requests are answered when the test answers them: each in
+// `sent` once it goes, with its URL, the time it went, the signal it was
+// given and answer(status).
+function handPacer(Pacer, clock, options = {}) {
+  const sent = [];
+  const pacer = new Pacer({
+    firstPause: 100,
+    now: clock.now,
+    sleep: clock.sleep,
+    fetch: (url, signal) => new Promise((resolve) => sent.push({ url, at: clock.t, signal, answer: (status) => resolve(reply(status, url)) })),
+    ...options,
+  });
+  return { pacer, sent };
+}
+
+// The URL of each of `sent` and the time it went.
+const went = (sent) => sent.map((s) => [s.url, s.at]);
+
+test('the link names a dataset per column, the points and the build', () => {
+  const { parseLink, linkSearch } = core();
+  const link = parseLink('?d=with-addresses&d=admin.simplified.major&at=48.8584,2.2945&at=-33.85,151.2&b=2026-11-19');
+  assert.deepEqual(plain(link), {
+    datasets: ['with-addresses', 'admin.simplified.major'],
+    points: [{ lat: 48.8584, lng: 2.2945 }, { lat: -33.85, lng: 151.2 }],
+    build: '2026-11-19',
+  });
+  assert.equal(
+    linkSearch({ datasets: ['with-addresses', 'europe/full.simplified.all'], point: { lat: 48.8584, lng: 2.2945 }, build: '2026-11-20' }),
+    '?d=with-addresses&d=europe/full.simplified.all&at=48.8584,2.2945&b=2026-11-20',
+  );
+  assert.deepEqual(plain(parseLink(linkSearch({ datasets: ['smallest'], point: { lat: 1.000000123, lng: -2.5 }, build: null }))),
+    { datasets: ['smallest'], points: [{ lat: 1.000000123, lng: -2.5 }], build: null });
+  assert.equal(linkSearch({ datasets: [], point: null, build: null }), '');
+  assert.equal(parseLink(`?d=smallest&b=${AGAIN}`).build, AGAIN);
+  assert.equal(linkSearch({ datasets: ['smallest'], point: null, build: AGAIN }), `?d=smallest&b=${AGAIN}`);
+});
+
+test('a link keeps 4 columns and the points on the globe', () => {
+  const { parseLink } = core();
+  const link = parseLink('?d=a&d=b&d=c&d=d&d=e&d=&at=91,0&at=0,181&at=x,1&at=1&at=,&at=0,0');
+  assert.deepEqual(plain(link.datasets), ['a', 'b', 'c', 'd']);
+  assert.deepEqual(plain(link.points), [{ lat: 0, lng: 0 }]);
+});
+
+test('a bare link opens with with-addresses and smallest', () => {
+  const { openingTokens } = core();
+  assert.deepEqual(plain(openingTokens(catalog())), ['with-addresses', 'smallest']);
+  assert.deepEqual(plain(openingTokens(catalog((t) => { t.presets = t.presets.filter((p) => p.id !== 'smallest'); }))), ['with-addresses']);
+  const bare = catalog();
+  bare.presets = [];
+  assert.deepEqual(plain(openingTokens(bare)), ['full.simplified.all']);
+});
+
+test('a column added shows a preset whose dataset no column shows', () => {
+  const { addedToken, resolveColumn } = core();
+  const c = catalog();
+  const columns = (tokens) => tokens.map((token) => resolveColumn(c, token));
+  assert.equal(addedToken(c, columns(['with-addresses', 'admin-minimal.simplified.none'])), 'immich-recommended');
+  assert.equal(addedToken(c, columns(['smallest', 'admin.simplified.major', 'full.simplified.all'])), 'max-quality');
+  assert.equal(addedToken(c, columns(['smallest', 'immich-recommended', 'with-addresses', 'max-quality'])), 'full.exact.none');
+  assert.equal(addedToken(c, columns(['everything'])), 'smallest');
+});
+
+test('/datasets decides how the page answers: in columns, in one, or waiting for the build', () => {
+  const { catalogMode } = core();
+  assert.equal(catalogMode(200, catalog()), 'catalog');
+  assert.equal(catalogMode(404, null), 'single');
+  assert.equal(catalogMode(405, null), 'single');
+  assert.equal(catalogMode(200, null), 'single');
+  assert.equal(catalogMode(200, { status: 'ok' }), 'single');
+  assert.equal(catalogMode(503, null), 'waiting');
+  assert.equal(catalogMode(0, null), 'waiting');
+});
+
+test('a column names its dataset by a preset id or its own, and says why it has none', () => {
+  const { resolveColumn } = core();
+  const c = catalog();
+  const preset = resolveColumn(c, 'with-addresses');
+  assert.equal(preset.dataset.id, 'full.simplified.all');
+  assert.equal(preset.custom, false);
+  assert.equal(preset.error, null);
+  const custom = resolveColumn(c, 'admin.simplified.major');
+  assert.equal(custom.dataset.id, 'admin.simplified.major');
+  assert.equal(custom.dataset.label, 'Immich recommended');
+  assert.equal(custom.custom, true);
+  const excluded = resolveColumn(c, 'admin-minimal.exact.none');
+  assert.equal(excluded.dataset, null);
+  assert.equal(excluded.error, `dataset admin-minimal.exact.none is not offered: ${MESSAGE}`);
+  assert.equal(excluded.selection.quality, 'exact');
+  const unknown = resolveColumn(c, 'everything');
+  assert.equal(unknown.dataset, null);
+  assert.match(unknown.error, /^unknown dataset "everything"/);
+  assert.deepEqual(plain(unknown.selection), { region: 'planet', mode: 'full', quality: 'simplified', poi_tier: 'all' });
+});
+
+test('a custom pick greys out a value the constraints exclude, with its message', () => {
+  const { axisChoices } = core();
+  const c = catalog();
+  const quality = axisChoices(c, ADMIN_MINIMAL, 'quality');
+  assert.deepEqual(plain(quality.map((v) => [v.id, v.state, v.message])), [['exact', 'excluded', MESSAGE], ['simplified', 'offered', null]]);
+  const mode = axisChoices(c, FULL_EXACT, 'mode');
+  assert.deepEqual(plain(mode.map((v) => [v.id, v.state])), [['full', 'offered'], ['no-addresses', 'offered'], ['admin', 'offered'], ['admin-minimal', 'moves']]);
+  assert.equal(mode[3].message, MESSAGE);
+  assert.equal(mode[3].selection.quality, 'simplified');
+});
+
+test('a value whose constraint requires another moves that axis and says why', () => {
+  const { pick } = core();
+  const c = catalog();
+  const moved = pick(c, FULL_EXACT, 'mode', 'admin-minimal');
+  assert.equal(moved.dataset.id, 'admin-minimal.simplified.all');
+  assert.equal(moved.note, `Boundary precision moves to Simplified: ${MESSAGE}`);
+  const plain = pick(c, FULL_EXACT, 'poi_tier', 'none');
+  assert.equal(plain.dataset.id, 'full.exact.none');
+  assert.equal(plain.note, null);
+  assert.equal(pick(c, ADMIN_MINIMAL, 'quality', 'exact'), null);
+});
+
+test('the picker offers the presets with their sizes, and the axes of a custom pick', () => {
+  const { pickerHtml, resolveColumn } = core();
+  const c = catalog();
+  const preset = pickerHtml(c, resolveColumn(c, 'smallest'), 0, 2);
+  for (const p of c.presets) {
+    const size = (c.datasets.find((d) => d.id === p.dataset).size_disk / 2 ** 30).toFixed(2);
+    assert.match(preset, new RegExp(`<option value="${p.id}"[^>]*>${p.label} · ${size} GiB</option>`), p.id);
+  }
+  assert.match(preset, /<option value="smallest" selected[^>]*>Smallest useful/);
+  assert.ok(preset.includes('25.00 GiB on disk · 12.50 GiB download'), preset);
+  assert.ok(preset.includes('data-action="remove"'));
+  assert.ok(!preset.includes('data-axis='));
+  assert.ok(!pickerHtml(c, resolveColumn(c, 'smallest'), 0, 1).includes('data-action="remove"'));
+
+  const custom = pickerHtml(c, resolveColumn(c, 'admin-minimal.simplified.all'), 1, 2);
+  assert.match(custom, /<option value="" selected>Custom/);
+  for (const axis of ['mode', 'quality', 'poi_tier']) {
+    assert.ok(custom.includes(`data-axis="${axis}"`), axis);
+  }
+  assert.ok(!custom.includes('data-axis="region"'), 'a region axis of one value is not offered');
+  assert.match(custom, /<option value="exact" disabled title="[^"]*">Exact \(not offered\)<\/option>/);
+  assert.ok(custom.includes(`Exact: ${MESSAGE}`), custom);
+});
+
+// The pickers are drawn anew on each change: the control that had the focus
+// gets it back by its key (of the data-* attributes of its element), which
+// each control of the pickers has of its own.
+test('each control of the pickers has a key of its own, which finds it once they are drawn anew', () => {
+  const { pickerHtml, resolveColumn, controlKey } = core();
+  const c = catalog();
+  const columns = [resolveColumn(c, 'smallest'), resolveColumn(c, 'admin.exact.major')];
+  const controls = (html) => [...html.matchAll(/<(?:select|button)\b([^>]*)>/g)]
+    .map((m) => Object.fromEntries([...m[1].matchAll(/data-(\w+)="([^"]*)"/g)].map((a) => [a[1], a[2]])));
+  const keys = (cols) => controls(cols.map((col, i) => pickerHtml(c, col, i, cols.length)).join('')).map((data) => controlKey(data));
+  const drawn = keys(columns);
+  assert.equal(drawn.length, 7, 'a preset and a remove button each, and three axes of the custom pick');
+  assert.ok(drawn.every((key) => key !== null));
+  assert.equal(new Set(drawn).size, drawn.length);
+  // The second column's mode moved to admin-minimal: its controls keep their keys.
+  const moved = keys([columns[0], resolveColumn(c, 'admin-minimal.simplified.major')]);
+  assert.deepEqual(moved, drawn);
+  assert.equal(controlKey({}), null);
+});
+
+// A column of a link's dataset the build doesn't offer is labelled by the
+// link's token, as the page labels it (columnLabel).
+test('every string and id of the manifest, and a link\'s dataset, is escaped where the page shows it', () => {
+  const { pickerHtml, resolveColumn, pick, detailHtml, cardHtml, statusHtml } = core();
+  const c = renameAxis(catalog(hostile), 'poi_tier', 'poi"><b>');
+  const moved = pick(c, c.datasets.find((d) => d.id === 'full.exact.all').selection, 'mode', 'admin-minimal');
+  assert.ok(moved.note.includes('<em>no</em>'), moved.note);
+  const linked = resolveColumn(c, '<script>alert(5)</script>');
+  const columns = [resolveColumn(c, 'smallest'), resolveColumn(c, 'admin-minimal.exact.none'), resolveColumn(c, 'full.exact.all'),
+    { ...resolveColumn(c, moved.dataset.id), note: moved.note }, resolveColumn(c, `admin.simplified.${MAJOR}`), linked];
+  const picker = columns.map((col, i) => pickerHtml(c, col, i, columns.length)).join('');
+  assertEscaped(picker);
+  assert.ok(picker.includes('&lt;img src=x onerror=alert(1)&gt;'));
+  assert.ok(picker.includes('&lt;em&gt;no&lt;/em&gt; &amp; &quot;quotes&quot;'));
+  assert.ok(picker.includes('<div class="picker-note">Boundary precision moves to Simplified: &lt;em&gt;no&lt;/em&gt;'), 'the note of a pick');
+  assert.ok(picker.includes('<option value="&quot;&gt;&lt;img src=x onerror=alert(4)&gt;"'), 'a preset id');
+  assert.ok(picker.includes('data-axis="poi&quot;&gt;&lt;b&gt;"'), 'an axis id');
+  assert.ok(picker.includes('<option value="major&quot;&gt;&lt;u&gt;"'), 'a value id');
+  assert.ok(picker.includes(' · admin.simplified.major&quot;&gt;&lt;u&gt;</div>'), 'a dataset id');
+  assert.ok(picker.includes('unknown dataset &quot;&lt;script&gt;alert(5)&lt;/script&gt;&quot;'), "a link's dataset");
+
+  const dataset = c.datasets.find((d) => d.id === 'admin-minimal.simplified.none');
+  const answer = { data: { display_name: '<img src=y>', address: { road: '<b>x</b>' }, places: [{ name: '<i>p</i>', category: '<u>c</u>', distance_m: 3 }] }, build: '<s>', ms: 3 };
+  const views = [{ label: dataset.label, color: '#fff', dataset, answer }, { label: linked.token, color: '#000', dataset: null, answer: { error: linked.error } }];
+  const detail = detailHtml(views, '2026-11-20');
+  const card = cardHtml({ id: 1, lat: 1, lng: 2, source: '<img src=s>' }, views, false);
+  for (const out of [detail, card]) {
+    assertEscaped(out);
+    assert.ok(!out.includes('<s>'));
+  }
+  assert.ok(card.includes('<div class="result-error">&lt;script&gt;alert(5)&lt;/script&gt;: unknown dataset'), card);
+  assertEscaped(statusHtml({ status: 'unavailable', reason: '<img src=r>', sync: { running: '<b>r</b>', refused: [{ date: '<i>', version: 1, reason: '<script>', at: '' }], last_result: null } }));
+});
+
+// The build is its publication ID (X-Geocoder-Build-Id), which tells a build
+// published again under its date from the one before, on any volume; not
+// the portal's dir of it (X-Geocoder-Build-Dir), which is its volume's.
+test('an answer keeps the dataset and build that answered and the time it took', () => {
+  const { answerOf } = core();
+  const headers = { 'x-geocoder-build': '2026-11-20', 'x-geocoder-build-id': AGAIN, 'x-geocoder-build-dir': '2026-11-20-1', 'x-geocoder-dataset': 'full.simplified.all' };
+  const header = (name) => headers[name.toLowerCase()] ?? null;
+  assert.deepEqual(plain(answerOf(200, header, '{"display_name":"Paris"}', 12.4)),
+    { data: { display_name: 'Paris' }, build: AGAIN, dataset: 'full.simplified.all', ms: 12.4 });
+  const refused = answerOf(400, () => null, 'dataset admin-minimal.exact.none is not offered: x', 2);
+  assert.equal(refused.error, 'HTTP 400: dataset admin-minimal.exact.none is not offered: x');
+  assert.equal(refused.data, undefined);
+  assert.equal(answerOf(200, () => null, 'not json', 1).error, 'not JSON: not json');
+});
+
+// A column without an answer (null) lacks no field.
+test('the field table marks the fields the answers disagree on or lack', () => {
+  const { fieldRows } = core();
+  const rows = fieldRows([{ city: 'Paris', road: 'Rue A', zzz: '1', landmark: 'Tower' }, { city: 'Paris', road: 'Rue B' }, null]);
+  assert.deepEqual(plain(rows), [
+    { field: 'landmark', values: ['Tower', '', ''], differs: false, missing: true },
+    { field: 'road', values: ['Rue A', 'Rue B', ''], differs: true, missing: false },
+    { field: 'city', values: ['Paris', 'Paris', ''], differs: false, missing: false },
+    { field: 'zzz', values: ['1', '', ''], differs: false, missing: true },
+  ]);
+  assert.deepEqual(plain(fieldRows([{ city: 'Paris' }, { city: 'Paris' }])), [{ field: 'city', values: ['Paris', 'Paris'], differs: false, missing: false }]);
+});
+
+test('answers differ by display name, a field, or the places and their distances', () => {
+  const { answersDiffer } = core();
+  const paris = { display_name: 'Paris', address: { city: 'Paris' }, places: [{ name: 'Louvre', category: 'museum', distance_m: 12 }] };
+  assert.equal(answersDiffer([paris, structuredClone(paris)]), false);
+  assert.equal(answersDiffer([paris, null]), false);
+  assert.equal(answersDiffer([paris, { ...paris, display_name: 'Paris 1er' }]), true);
+  assert.equal(answersDiffer([paris, { ...paris, address: { city: 'Paris', postcode: '75001' } }]), true);
+  assert.equal(answersDiffer([paris, { ...paris, places: [] }]), true);
+  assert.equal(answersDiffer([paris, { ...paris, places: [{ name: 'Louvre', category: 'museum', distance_m: 40 }] }]), true);
+});
+
+test('the detail shows per answer its dataset, build, sizes and time, and flags another build', () => {
+  const { detailHtml } = core();
+  const c = catalog();
+  const dataset = c.datasets.find((d) => d.id === 'full.simplified.all');
+  const answer = (city, build) => ({ data: { display_name: city, address: { city } }, build, ms: 12.4 });
+  const views = [
+    { label: dataset.label, color: '#111', dataset, answer: answer('Paris', '2026-11-20') },
+    { label: 'other', color: '#222', dataset, answer: answer('Lyon', '2026-11-19') },
+    { label: 'loading', color: '#333', dataset, answer: { loading: true } },
+  ];
+  const out = detailHtml(views, '2026-11-20');
+  assert.ok(out.includes('full.simplified.all · build 2026-11-20 · 12 ms'), out);
+  assert.ok(out.includes(`${(dataset.size_disk / 2 ** 30).toFixed(2)} GiB on disk · ${(dataset.size_download / 2 ** 30).toFixed(2)} GiB download`));
+  // The sizes are those of the build served: an answer of another build goes
+  // without them.
+  assert.equal(out.match(/ GiB on disk · /g).length, 2, out);
+  assert.ok(!detailHtml([views[1]], '2026-11-20').includes('on disk'));
+  assert.match(out, /class="tag stale"[^>]*>build 2026-11-19/);
+  assert.equal(out.match(/class="tag stale"/g).length, 1);
+  assert.match(out, /<tr class="differs">\s*<td[^>]*>city<\/td>/);
+  assert.ok(out.includes('loading-spinner'));
+
+  // Of the builds of one date, the one published before is another; a date
+  // alone (a link's b= of a date) is any.
+  const republished = detailHtml([
+    { label: 'before', color: '#111', dataset, answer: answer('Paris', ID) },
+    { label: 'now', color: '#222', dataset, answer: answer('Paris', AGAIN) },
+    { label: 'saved', color: '#333', dataset, answer: answer('Paris', '2026-11-20') },
+  ], AGAIN);
+  assert.match(republished, new RegExp(`class="tag stale"[^>]*>build ${ID}, not ${AGAIN}`));
+  assert.equal(republished.match(/class="tag stale"/g).length, 1, republished);
+});
+
+// The detail keeps a result's open JSON panels open as its answers come in:
+// each is named by the place of its view, whatever views before it have no
+// answer yet.
+test('each JSON panel of the detail is named by the place of its view', () => {
+  const { detailHtml } = core();
+  const view = (label, answer) => ({ label, color: '#111', dataset: null, answer });
+  const out = detailHtml([view('a', { loading: true }), view('b', { data: { display_name: 'B' } }), view('c', null), view('d', { data: { display_name: 'D' } })], null);
+  assert.deepEqual([...out.matchAll(/<details data-view="(\d+)"/g)].map((m) => m[1]), ['1', '3']);
+  assert.equal(out.match(/<details/g).length, 2);
+});
+
+test('a card names the first answer and says when the columns differ', () => {
+  const { cardHtml } = core();
+  const view = (city) => ({ label: city, color: '#111', dataset: null, answer: { data: { display_name: city, address: { city } } } });
+  const same = cardHtml({ id: 7, lat: 48.85, lng: 2.29, source: 'map click' }, [view('Paris'), view('Paris')], true);
+  assert.match(same, /^<div class="result-card selected" data-id="7">/);
+  assert.ok(same.includes('Paris') && !same.includes('differs'));
+  assert.ok(cardHtml({ id: 7, lat: 48.85, lng: 2.29 }, [view('Paris'), view('Lyon')], false).includes('differs'));
+  const failed = cardHtml({ id: 8, lat: 1, lng: 2 }, [view('Paris'), { label: 'Smallest', color: '#222', dataset: null, answer: { error: 'HTTP 503: no build' } }], false);
+  assert.ok(failed.includes('Smallest: HTTP 503: no build'), failed);
+});
+
+// The columns' answers of a result may come from builds other than the one
+// served now (saved, or asked before the build changed): its link names the
+// oldest of those, so that a link to answers the server no longer gives is
+// flagged. Where the portal went back to an older build, an answer of the
+// newer one is such an answer. Of two publications of one date, which came
+// first their IDs don't tell: they go by ID.
+test('a link to a result names the oldest build other than the one served that answered it in the columns', () => {
+  const { linkBuild } = core();
+  const answers = {
+    'full.simplified.all': { data: {}, build: '2026-11-20' },
+    'admin-minimal.simplified.none': { data: {}, build: '2026-11-19' },
+    'admin.simplified.major': { loading: true },
+    'full.exact.all': { data: {}, build: '2026-11-18' },
+  };
+  assert.equal(linkBuild(answers, ['full.simplified.all', 'admin-minimal.simplified.none', 'admin.simplified.major'], '2026-11-21'), '2026-11-19');
+  assert.equal(linkBuild(answers, ['full.simplified.all'], '2026-11-21'), '2026-11-20');
+  assert.equal(linkBuild(answers, ['admin.simplified.major', 'no-addresses.exact.none'], '2026-11-21'), '2026-11-21');
+  assert.equal(linkBuild({ '': { data: {} } }, [''], null), null);
+  const NEXT = '2026-11-21-0d1e2f3a4b5c';
+  const republished = {
+    a: { data: {}, build: ID },
+    b: { data: {}, build: AGAIN },
+    c: { data: {}, build: NEXT },
+  };
+  assert.equal(linkBuild(republished, ['a', 'b', 'c'], NEXT), AGAIN);
+  assert.equal(linkBuild(republished, ['a', 'c'], NEXT), ID);
+  // Served again after NEXT: that build's answer saved beside a fresh one.
+  assert.equal(linkBuild(republished, ['a', 'c'], ID), NEXT);
+  assert.equal(linkBuild(republished, ['b', 'a', 'c'], ID), AGAIN);
+  assert.equal(linkBuild(republished, ['a'], ID), ID);
+  assert.equal(linkBuild({ a: { data: {}, build: '2026-11-20' } }, ['a'], AGAIN), '2026-11-20');
+});
+
+test('a link of another build than the one served is flagged', () => {
+  const { mismatchHtml } = core();
+  const flagged = mismatchHtml('2026-11-19', '2026-11-20');
+  assert.ok(flagged.includes('2026-11-19') && flagged.includes('2026-11-20'), flagged);
+  assert.equal(mismatchHtml('2026-11-20', '2026-11-20'), '');
+  assert.equal(mismatchHtml(null, '2026-11-20'), '');
+  assert.equal(mismatchHtml('2026-11-19', null), '');
+  assertEscaped(mismatchHtml('<img src=x>', '2026-11-20'));
+  // A link of one publication of a date, opened where the other is served
+  // (both in the dir 2026-11-20-1 of their volumes), is flagged; one of the
+  // date alone opens as of either.
+  const republished = mismatchHtml(ID, AGAIN);
+  assert.ok(republished.includes(`build ${ID}`) && republished.includes(`build ${AGAIN}`), republished);
+  assert.equal(mismatchHtml(AGAIN, AGAIN), '');
+  assert.equal(mismatchHtml('2026-11-20', AGAIN), '');
+  assert.ok(mismatchHtml('2026-11-19', AGAIN).includes('2026-11-19'));
+});
+
+// /health names the build served by its publication ID: once that is
+// another than the one the columns are of (a build published again under its
+// date among them, in a dir of the name of the one before), or one is served
+// while the page waits for a build, the page loads /datasets anew.
+test('the page loads the datasets anew once /health names another build', () => {
+  const { catalogStale } = core();
+  const c = catalog();
+  const health = (id, dir) => ({ status: 'ok', build: { date: id.slice(0, 10), version: 24, id, dir }, datasets: 28, sync: {} });
+  assert.equal(catalogStale(health(ID, '2026-11-20-1'), 'catalog', c), false);
+  assert.equal(catalogStale(health(AGAIN, '2026-11-20-2'), 'catalog', c), true);
+  assert.equal(catalogStale(health(AGAIN, '2026-11-20-1'), 'catalog', c), true);
+  assert.equal(catalogStale(health('2026-11-21-0d1e2f3a4b5c', '2026-11-21-1'), 'catalog', c), true);
+  assert.equal(catalogStale(health(ID, '2026-11-20-1'), 'waiting', null), true);
+  assert.equal(catalogStale({ status: 'unavailable', reason: 'no build to serve', sync: {} }, 'waiting', null), false);
+  assert.equal(catalogStale(null, 'catalog', c), false);
+  assert.equal(catalogStale(health(AGAIN, '2026-11-20-1'), 'single', null), false);
+});
+
+test('the status line tells the build served and how the sync goes', () => {
+  const { statusHtml } = core();
+  const sync = {
+    running: null, progress: null, last_started: '2026-11-20T07:10:00Z', last_finished: '2026-11-20T07:12:03Z', next_round: '2026-11-20T08:12:03Z',
+    last_result: 'ok: serving 2026-11-20-1', latest: { date: '2026-11-21', build_version: 25 }, served: '2026-11-20-1',
+    refused: [{ date: '2026-11-21', version: 25, reason: 'build version 25, not 24', at: '2026-11-21T07:00:00Z' }],
+  };
+  const ok = statusHtml({ status: 'ok', build: { date: '2026-11-20', version: 24, id: ID, dir: '2026-11-20-1' }, datasets: 28, sync });
+  for (const text of [`build ${ID} (v24, dir 2026-11-20-1) · 28 datasets`, 'last sync 2026-11-20 07:12:03 UTC: ok: serving 2026-11-20-1', 'next 2026-11-20 08:12:03 UTC',
+    'latest 2026-11-21', 'refused 2026-11-21 (v25): build version 25, not 24']) {
+    assert.ok(ok.includes(text), `${text}: ${ok}`);
+  }
+  const running = statusHtml({ status: 'unavailable', reason: 'no build to serve: waiting for a build of version 24', sync: {
+    ...sync, refused: [], running: 'fetching 2026-11-21', progress: { objects_done: 3, objects_total: 88, bytes_done: 2 ** 30, bytes_total: 9 * 2 ** 30 } } });
+  assert.ok(running.includes('no build to serve: waiting for a build of version 24'), running);
+  assert.ok(running.includes('sync: fetching 2026-11-21 (3/88 objects, 1.00 GiB of 9.00 GiB)'), running);
+  assert.equal(statusHtml(null), '');
+  assert.equal(statusHtml({ status: 'ok' }), '');
+});
+
+// A request holds its place until its body is in: the headers of 8 hold
+// every place while their bodies come, and each body in lets one more go.
+test('the requests in flight are at most 8, over every column, each until its body is in', async () => {
+  const { Pacer } = core();
+  const started = [];
+  const pacer = new Pacer({
+    fetch: async (url) => {
+      let deliver;
+      const body = new Promise((resolve) => { deliver = resolve; });
+      started.push({ url, deliver });
+      return { status: 200, headers: { get: () => null }, text: () => body };
+    },
+  });
+  const requests = Array.from({ length: 40 }, (_, i) => pacer.request(`/reverse?n=${i}`));
+  await settle();
+  assert.equal(started.length, 8);
+  for (let delivered = 0; delivered < 40; delivered++) {
+    started[delivered].deliver('{}');
+    await settle();
+    assert.equal(started.length, Math.min(40, delivered + 9), `${delivered + 1} bodies in`);
+  }
+  const got = await Promise.all(requests);
+  assert.ok(got.every((g) => g.status === 200 && g.body === '{}' && g.ms >= 0));
+  assert.deepEqual(started.map((s) => s.url), Array.from({ length: 40 }, (_, i) => `/reverse?n=${i}`));
+  assert.deepEqual([pacer.active, pacer.waiting.length], [0, 0]);
+});
+
+test('a 429 is asked again after a pause, which every request waits out', async () => {
+  const { Pacer } = core();
+  const clock = handClock();
+  const { pacer, sent } = handPacer(Pacer, clock);
+  const a = pacer.request('a');
+  await settle();
+  sent[0].answer(429);
+  await settle();
+  // b, asked within the pause, waits it out with a's second ask.
+  const b = pacer.request('b');
+  await settle();
+  assert.deepEqual(went(sent), [['a', 0]]);
+  assert.deepEqual(clock.lengths(), [100, 100]);
+  clock.wake();
+  await settle();
+  assert.deepEqual(went(sent.slice(1)).sort(), [['a', 100], ['b', 100]]);
+  for (const s of sent.slice(1)) s.answer(200);
+  assert.deepEqual([(await a).status, (await b).status], [200, 200]);
+});
+
+// Each pause is twice the one before, up to the longest; after the last of
+// its tries a 429 is the answer, with no pause after it.
+test('the pause doubles with each 429 in a row, and the last of its tries is the answer', async () => {
+  const { Pacer } = core();
+  for (const [maxPause, pauses] of [[8000, [20, 40, 80]], [50, [20, 40, 50]]]) {
+    const clock = handClock();
+    const { pacer, sent } = handPacer(Pacer, clock, { firstPause: 20, tries: 4, maxPause });
+    const got = pacer.request('x');
+    for (const pause of pauses) {
+      await settle();
+      sent.at(-1).answer(429);
+      await settle();
+      assert.deepEqual(clock.lengths(), [pause], `the pause after ${sent.length} 429s, of at most ${maxPause} ms`);
+      clock.wake();
+    }
+    await settle();
+    assert.equal(sent.length, 4);
+    sent[3].answer(429);
+    const last = await got;
+    assert.deepEqual([last.status, last.body], [429, 'x']);
+    assert.deepEqual(clock.lengths(), []);
+    assert.equal(pacer.active, 0);
+  }
+});
+
+test('the 429s of requests in flight together make one pause', async () => {
+  const { Pacer } = core();
+  let calls = 0;
+  let open;
+  const gate = new Promise((resolve) => { open = resolve; });
+  const pauses = [];
+  const pacer = new Pacer({
+    firstPause: 30,
+    fetch: async () => {
+      calls++;
+      if (calls <= 8) {
+        if (calls === 8) open();
+        await gate;
+        return reply(429, 'Rate limit exceeded');
+      }
+      pauses.push(pacer.scope('reverse').pause);
+      return reply(200, '{}');
+    },
+  });
+  const got = await Promise.all(Array.from({ length: 8 }, (_, i) => pacer.request(`/reverse?n=${i}`)));
+  assert.ok(got.every((g) => g.status === 200));
+  assert.equal(pauses.length, 8);
+  assert.equal(Math.max(...pauses), 30);
+});
+
+test('a /polygons request goes while the reverse lookups wait out a pause, which holds no place', async () => {
+  const { Pacer } = core();
+  const clock = handClock();
+  const { pacer, sent } = handPacer(Pacer, clock);
+  const lookups = Array.from({ length: 12 }, (_, i) => pacer.request(`/reverse?n=${i}`, 'reverse'));
+  await settle();
+  assert.equal(sent.length, 8);
+  for (const s of sent) s.answer(429);
+  await settle();
+
+  const polygons = pacer.request('/polygons?n=1', 'polygons');
+  await settle();
+  assert.deepEqual(went(sent.slice(8)), [['/polygons?n=1', 0]]);
+  sent[8].answer(200);
+  assert.equal((await polygons).status, 200);
+  // Once the pause is over every lookup goes again, 8 at a time.
+  clock.wake();
+  await settle();
+  assert.equal(sent.length, 17);
+  for (const s of sent.slice(9)) s.answer(200);
+  await settle();
+  assert.equal(sent.length, 21);
+  for (const s of sent.slice(17)) s.answer(200);
+  assert.ok((await Promise.all(lookups)).every((g) => g.status === 200));
+  assert.deepEqual(sent.slice(9).map((s) => s.url).sort(), Array.from({ length: 12 }, (_, i) => `/reverse?n=${i}`).sort());
+  assert.ok(sent.slice(9).every((s) => s.at === 100));
+});
+
+test('a /polygons answer leaves the pause of the reverse lookups as it was', async () => {
+  const { Pacer } = core();
+  const clock = handClock();
+  const { pacer, sent } = handPacer(Pacer, clock);
+  const lookup = pacer.request('/reverse?n=1', 'reverse');
+  await settle();
+  sent[0].answer(429);
+  await settle();
+  assert.deepEqual(clock.lengths(), [100]);
+  clock.wake();
+  await settle();
+  const polygons = pacer.request('/polygons?n=1', 'polygons');
+  await settle();
+  assert.deepEqual(went(sent), [['/reverse?n=1', 0], ['/reverse?n=1', 100], ['/polygons?n=1', 100]]);
+  sent[2].answer(200);
+  assert.equal((await polygons).status, 200);
+
+  // The lookup asked again after the pause began: its 429 doubles it.
+  sent[1].answer(429);
+  await settle();
+  assert.deepEqual(clock.lengths(), [200]);
+  clock.wake();
+  await settle();
+  sent[3].answer(200);
+  assert.equal((await lookup).status, 200);
+});
+
+test('the pause of the reverse lookups ends only with a success of one started after it began', async () => {
+  const { Pacer } = core();
+  const clock = handClock();
+  const { pacer, sent } = handPacer(Pacer, clock);
+  const a = pacer.request('/reverse?a', 'reverse');
+  const b = pacer.request('/reverse?b', 'reverse');
+  await settle();
+  clock.t = 10;
+  sent[0].answer(429);
+  await settle();
+  assert.deepEqual(clock.lengths(), [100]);
+  // b went before the pause began: its success ends nothing.
+  sent[1].answer(200);
+  assert.equal((await b).status, 200);
+  clock.wake();
+  await settle();
+  sent[2].answer(429);
+  await settle();
+  assert.deepEqual(clock.lengths(), [200]);
+
+  // c goes after the pause began, but its answer is no success.
+  const c = pacer.request('/reverse?c', 'reverse');
+  await settle();
+  clock.wake();
+  await settle();
+  assert.deepEqual(went(sent.slice(3)).sort(), [['/reverse?a', 310], ['/reverse?c', 310]]);
+  const [askedA, askedC] = ['/reverse?a', '/reverse?c'].map((url) => sent.slice(3).find((s) => s.url === url));
+  askedC.answer(503);
+  assert.equal((await c).status, 503);
+  askedA.answer(429);
+  await settle();
+  assert.deepEqual(clock.lengths(), [400]);
+
+  // a's success, of a request that went after the pause began, ends it:
+  // the next 429 pauses anew.
+  clock.wake();
+  await settle();
+  sent[5].answer(200);
+  assert.equal((await a).status, 200);
+  const d = pacer.request('/reverse?d', 'reverse');
+  await settle();
+  sent[6].answer(429);
+  await settle();
+  assert.deepEqual(clock.lengths(), [100]);
+  clock.wake();
+  await settle();
+  sent[7].answer(200);
+  assert.equal((await d).status, 200);
+});
+
+test('a request that fails frees its place', async () => {
+  const { Pacer } = core();
+  let calls = 0;
+  const pacer = new Pacer({ limit: 1, fetch: async () => { calls++; if (calls === 1) throw new Error('offline'); return reply(200, 'ok'); } });
+  await assert.rejects(pacer.request('a'), /offline/);
+  assert.equal((await pacer.request('b')).body, 'ok');
+});
+
+test("Nominatim's column shows its answer, its request in flight, or why it failed", () => {
+  const { nominatimView, detailHtml } = core();
+  assert.deepEqual(plain(nominatimView({ nominatim: { display_name: 'Paris' } }).answer), { data: { display_name: 'Paris' } });
+  assert.deepEqual(plain(nominatimView({ nominatim: null, nominatimLoading: true }).answer), { loading: true });
+  const failed = nominatimView({ nominatim: null, nominatimError: 'HTTP 429: Too Many Requests' });
+  assert.deepEqual(plain(failed.answer), { error: 'HTTP 429: Too Many Requests' });
+  const out = detailHtml([failed], '2026-11-20');
+  assert.ok(out.includes('<div class="result-error">HTTP 429: Too Many Requests</div>') && !out.includes('not asked yet'), out);
+});
+
+// The page before the dataset columns saved a result's answer of its server
+// as data (or error) and that of the minimal one as minimal, of datasets it
+// did not record: they go, and the columns are asked again. The point and
+// Nominatim's answer stay.
+test('a saved result keeps its answers; one the page saved before the dataset columns keeps its point', () => {
+  const { storedResult } = core();
+  const now = { id: 'a', lat: 1, lng: 2, source: 'map click', nominatim: null,
+    answers: { 'admin.simplified.major': { data: { display_name: 'Paris' }, build: '2026-11-20', dataset: 'admin.simplified.major', ms: 3 } } };
+  assert.deepEqual(plain(storedResult(now)), now);
+  const before = { id: 1763600000000, lat: 48.85, lng: 2.29, data: { display_name: 'Paris' }, nominatim: { display_name: 'Paris, France' },
+    minimal: { display_name: 'France' }, source: 'IMG_1.jpg' };
+  assert.deepEqual(plain(storedResult(before)), {
+    id: 1763600000000, lat: 48.85, lng: 2.29, source: 'IMG_1.jpg', nominatim: { display_name: 'Paris, France' }, answers: {},
+  });
+  assert.deepEqual(plain(storedResult({ id: 2, lat: 1, lng: 2, data: null, minimal: null, error: 'HTTP 503' }).answers), {});
+  assert.equal(storedResult({ id: 3, lat: 91, lng: 0, answers: {} }), null);
+  assert.equal(storedResult(null), null);
+});
+
+// The answers of a column no longer shown are saved too: each keeps the
+// build that gave it, which a link to the result names and the detail
+// flags. One being asked is not.
+test('a result is saved with every answer it has but those being asked, and read back as it was', () => {
+  const { savedResult, storedResult } = core();
+  const entry = { id: 'a', lat: 1, lng: 2, source: 'map click', nominatim: { display_name: 'Paris, France' }, nominatimLoading: false, nominatimError: null,
+    answers: {
+      'full.simplified.all': { data: { display_name: 'Paris' }, build: '2026-11-20-1', dataset: 'full.simplified.all', ms: 3 },
+      'admin.simplified.major': { data: { display_name: 'Paris' }, build: '2026-11-19-1', dataset: 'admin.simplified.major', ms: 4 },
+      'admin-minimal.simplified.none': { error: 'HTTP 502: Bad Gateway', build: null, dataset: null, ms: 1 },
+      'no-addresses.exact.none': { loading: true, pending: Promise.resolve() },
+    } };
+  const saved = JSON.parse(JSON.stringify(savedResult(entry)));
+  assert.deepEqual(saved, {
+    id: 'a', lat: 1, lng: 2, source: 'map click', nominatim: { display_name: 'Paris, France' },
+    answers: Object.fromEntries(Object.entries(entry.answers).filter(([key]) => key !== 'no-addresses.exact.none')),
+  });
+  assert.deepEqual(plain(storedResult(saved)), saved);
+});
+
+// A save the browser's storage refuses (full, or off) says why, which the
+// page shows beside the results' count until a save goes in: the results
+// saved before stay as they were.
+test('a save the storage refuses says why', () => {
+  const { keep } = core();
+  const kept = new Map();
+  const storage = { setItem: (key, value) => kept.set(key, value) };
+  assert.equal(keep(storage, 'results', '[1]'), '');
+  assert.equal(kept.get('results'), '[1]');
+  const full = { setItem: () => { throw new Error("Failed to execute 'setItem' on 'Storage': exceeded the quota."); } };
+  assert.equal(keep(full, 'results', '[1,2]'), "not saved: Failed to execute 'setItem' on 'Storage': exceeded the quota.");
+  assert.ok(html.includes('<span id="saveError" class="warn"></span>'));
+});
+
+test('the polygon overlay cycles off, each column, off', () => {
+  const { nextPolygons } = core();
+  assert.deepEqual([nextPolygons('off', 2), nextPolygons(0, 2), nextPolygons(1, 2)], [0, 1, 'off']);
+  assert.equal(nextPolygons('off', 0), 'off');
+  assert.equal(nextPolygons(3, 2), 'off');
+});
+
+test('polygons are drawn only while no clear came after their request and its result and column are still shown', async () => {
+  const { PolygonOverlay } = core();
+  const asked = [];
+  const drawn = [];
+  const KEY = 'full.simplified.all';
+  let shown = { id: 'a', key: KEY };
+  const overlay = new PolygonOverlay({
+    // What the pacer gives.
+    request: () => new Promise((resolve) => asked.push((n) => resolve({ status: 200, header: () => null, body: JSON.stringify({ type: 'FeatureCollection', features: [], n }), ms: 1 }))),
+    draw: (fc) => drawn.push(fc.n),
+    erase: () => drawn.push('erased'),
+    shown: () => shown,
+  });
+  // A clear (the overlay's column removed, the results cleared) leaves
+  // nothing drawn, whatever comes in after it.
+  const cleared = overlay.show('a', KEY, '/polygons?n=1');
+  overlay.clear();
+  asked[0](1);
+  assert.equal(await cleared, false);
+  assert.deepEqual(drawn, ['erased']);
+  // Nor while another column or result is shown.
+  const otherColumn = overlay.show('a', KEY, '/polygons?n=2');
+  shown = { id: 'a', key: 'admin.simplified.none' };
+  asked[1](2);
+  assert.equal(await otherColumn, false);
+  shown = { id: 'a', key: KEY };
+  const otherResult = overlay.show('a', KEY, '/polygons?n=3');
+  shown = { id: 'b', key: KEY };
+  asked[2](3);
+  assert.equal(await otherResult, false);
+  // Of two in flight, the last asked.
+  const earlier = overlay.show('b', KEY, '/polygons?n=4');
+  const later = overlay.show('b', KEY, '/polygons?n=5');
+  asked[4](5);
+  asked[3](4);
+  assert.deepEqual([await later, await earlier], [true, false]);
+  assert.deepEqual(drawn, ['erased', 5]);
+  await settle();
+  assert.deepEqual(drawn, ['erased', 5]);
+});
+
+// A reload of /datasets or a picker may give the overlay's column another
+// dataset, the columns another build, or leave the overlay no column: what
+// it showed is then of none of them, and goes. A point selected while the
+// portal waited for its build was asked of the one column of the server as
+// it was.
+test('a reload of the datasets or a picker moves the polygon overlay where its dataset or build is another, or it is off', () => {
+  const { overlayTarget, overlayMoved, resolveColumn } = core();
+  const c = catalog();
+  const columns = (tokens) => tokens.map((token) => resolveColumn(c, token));
+  const shown = overlayTarget(0, columns(['with-addresses', 'smallest']), '2026-11-20-1');
+  assert.deepEqual(plain(shown), { key: 'full.simplified.all', build: '2026-11-20-1' });
+  assert.equal(overlayMoved(shown, overlayTarget(0, columns(['with-addresses', 'smallest']), '2026-11-20-1')), false);
+  assert.equal(overlayMoved(shown, overlayTarget(0, columns(['with-addresses', 'smallest']), '2026-11-20-2')), true);
+  assert.equal(overlayMoved(shown, overlayTarget(0, columns(['smallest', 'with-addresses']), '2026-11-20-1')), true);
+  assert.equal(overlayTarget('off', columns(['with-addresses']), '2026-11-20-1'), null);
+  assert.equal(overlayTarget(1, columns(['with-addresses']), '2026-11-20-1'), null);
+  assert.equal(overlayTarget(0, columns(['everything']), '2026-11-20-1'), null);
+  assert.equal(overlayMoved(shown, null), true);
+  assert.equal(overlayMoved(null, null), false);
+  const waiting = overlayTarget(0, [{ single: true }], null);
+  assert.deepEqual(plain(waiting), { key: '', build: null });
+  assert.equal(overlayMoved(waiting, shown), true);
+  // The picker of the overlay's column moves it to another dataset; that of
+  // another column, or a column removed before it (its place shifts, its
+  // dataset stays), leaves it where it was.
+  assert.equal(overlayMoved(shown, overlayTarget(0, columns(['max-quality', 'smallest']), '2026-11-20-1')), true);
+  assert.equal(overlayMoved(shown, overlayTarget(0, columns(['with-addresses', 'max-quality']), '2026-11-20-1')), false);
+  assert.equal(overlayMoved(overlayTarget(1, columns(['smallest', 'with-addresses']), '2026-11-20-1'),
+    overlayTarget(0, columns(['with-addresses']), '2026-11-20-1')), false);
+});
+
+test('a polygon request is cancelled once another show or a clear comes after it', { timeout: 5000 }, async () => {
+  const { PolygonOverlay } = core();
+  const signals = [];
+  const overlay = new PolygonOverlay({
+    request: (url, signal) => {
+      signals.push(signal);
+      return new Promise((resolve, reject) => { if (signal) signal.addEventListener('abort', () => reject(signal.reason)); });
+    },
+    draw: () => assert.fail('nothing is drawn'),
+    erase: () => {},
+    shown: () => ({ id: 'b', key: 'full.simplified.all' }),
+  });
+  const first = overlay.show('a', 'full.simplified.all', '/polygons?n=1');
+  const second = overlay.show('b', 'full.simplified.all', '/polygons?n=2');
+  assert.deepEqual(signals.map((s) => Boolean(s && s.aborted)), [true, false]);
+  assert.equal(await first, false);
+  overlay.clear();
+  assert.equal(signals[1].aborted, true);
+  assert.equal(await second, false);
+});
+
+test('a request cancelled while it waits for a place is never sent, and the next in line goes', { timeout: 5000 }, async () => {
+  const { Pacer } = core();
+  const clock = handClock();
+  const { pacer, sent } = handPacer(Pacer, clock, { limit: 1 });
+  const cancel = new AbortController();
+  const first = pacer.request('/polygons?n=1', 'polygons');
+  const cancelled = assert.rejects(pacer.request('/polygons?n=2', 'polygons', cancel.signal), { name: 'AbortError' });
+  const next = pacer.request('/polygons?n=3', 'polygons');
+  await settle();
+  cancel.abort();
+  await settle();
+  sent[0].answer(200);
+  await settle();
+  assert.deepEqual(sent.map((s) => s.url), ['/polygons?n=1', '/polygons?n=3']);
+  sent[1].answer(200);
+  assert.deepEqual([(await first).status, (await next).status], [200, 200]);
+  await cancelled;
+  assert.deepEqual([pacer.active, pacer.waiting.length], [0, 0]);
+});
+
+// The request gives up at once, while the clock stands within its pause.
+test('a request cancelled during its pause is not asked again', { timeout: 5000 }, async () => {
+  const { Pacer } = core();
+  const clock = handClock();
+  const { pacer, sent } = handPacer(Pacer, clock);
+  const cancel = new AbortController();
+  const cancelled = assert.rejects(pacer.request('/polygons?n=1', 'polygons', cancel.signal), { name: 'AbortError' });
+  await settle();
+  sent[0].answer(429);
+  await settle();
+  assert.deepEqual(clock.lengths(), [100]);
+  cancel.abort();
+  await cancelled;
+  assert.equal(clock.t, 0);
+  clock.wake();
+  await settle();
+  assert.deepEqual(went(sent), [['/polygons?n=1', 0]]);
+  assert.equal(pacer.active, 0);
+});
+
+test('a request cancelled while its body comes stops reading it and frees its place', { timeout: 5000 }, async () => {
+  const { Pacer } = core();
+  const given = [];
+  const pacer = new Pacer({
+    limit: 1,
+    fetch: async (url, signal) => {
+      given.push(signal);
+      return url === 'slow' ? { status: 200, headers: { get: () => null }, text: () => new Promise(() => {}) } : reply(200, 'ok');
+    },
+  });
+  const cancel = new AbortController();
+  const cancelled = assert.rejects(pacer.request('slow', 'polygons', cancel.signal), { name: 'AbortError' });
+  await settle();
+  assert.equal(given[0], cancel.signal, 'the fetch has the signal, which ends its download');
+  cancel.abort();
+  await cancelled;
+  assert.equal(pacer.active, 0);
+  assert.equal((await pacer.request('next', 'polygons')).body, 'ok');
+});
+
+test('the JSON of an answer is shown highlighted and escaped', () => {
+  const { syntaxHighlight } = core();
+  const out = syntaxHighlight({ name: '<img src=x>', n: 1, ok: true, none: null });
+  assert.ok(!out.includes('<img'));
+  assert.ok(out.includes('<span class="json-string">"&lt;img src=x&gt;"</span>'), out);
+  assert.ok(out.includes('<span class="json-key">"name":</span>'));
+  assert.ok(out.includes('<span class="json-number">1</span>'));
+});
+
+// The side panel stacks the datasets, the coordinates, the photo upload, the
+// results and, once one is selected, its detail. Four columns of datasets
+// and the detail of a result fill a window of 1000 px without the results,
+// whose toolbar and cards would go: they keep a height of their own, the
+// datasets and the detail scroll within what is left, down to a least
+// height of theirs, and a window too short for those scrolls the panel
+// rather than cutting off its foot. The results' section hides what
+// overflows it: its list of cards scrolls.
+test('the results keep room for their toolbar and cards however tall the datasets and the detail grow', () => {
+  const height = /\b[1-9]\d*(px|%|vh)/;
+  assert.match(style('.results-section')['min-height'] ?? 'none', height);
+  for (const giving of ['.datasets-section', '.detail-panel']) {
+    assert.equal(style(giving)['overflow-y'], 'auto', giving);
+    assert.match(style(giving)['min-height'] ?? 'none', height, giving);
+  }
+  assert.equal(style('.side-panel')['overflow-y'], 'auto');
+  assert.equal(style('.results-section').overflow, 'hidden');
+  assert.equal(style('.results-list')['overflow-y'], 'auto');
+});
+
+// Four columns and Nominatim share the detail's width: a column's places
+// table breaks a long word (place_of_worship) within its own column rather
+// than running into the next one.
+test("each column's places table wraps its words within the column", () => {
+  for (const cell of ['.detail-places th', '.detail-places td']) {
+    assert.equal(style(cell)['overflow-wrap'], 'anywhere', cell);
+  }
+});
+
+// However narrow the detail (a phone's width, or a page zoomed in), each
+// column's places table keeps a width it reads at, under its column's
+// label: the places scroll sideways in a box of their own rather than one
+// table running into the next, and the rest of the detail stays put.
+test("the places tables keep a readable width, scrolling within a box of their own", () => {
+  const { detailHtml } = core();
+  const places = [{ name: 'Basilique du Sacré-Cœur', category: 'place_of_worship', distance_m: 120 }];
+  const views = [1, 2, 3, 4, 5].map((n) => ({ label: `column ${n}`, color: '#111', dataset: null, answer: { data: { display_name: 'Paris', places } } }));
+  const out = detailHtml(views, null);
+  const box = out.match(/<div class="places-scroll"><div class="places-grid" style="grid-template-columns:repeat\(5,minmax\((\d+)px,1fr\)\)">([\s\S]*?)<\/div><\/div><\/div>/);
+  assert.ok(box, out);
+  assert.ok(Number(box[1]) >= 160, box[1]);
+  assert.deepEqual([...box[2].matchAll(/<div class="answer-label"[^>]*>([^<]*)<\/div><table>/g)].map((m) => m[1]), views.map((v) => v.label));
+  assert.equal(style('.places-scroll')['overflow-x'], 'auto');
+  assert.equal(style('.places-grid').display, 'grid');
+});
+
+test("the page's other scripts parse", () => {
+  const others = scripts.filter((s) => s.id !== 'core');
+  assert.ok(others.length > 0);
+  for (const s of others) {
+    assert.doesNotThrow(() => new vm.Script(s.body, { filename: 'index.html' }));
+  }
+});
+
+test('the page asks its own server only: no :3001 and no minimal_url', () => {
+  assert.ok(!html.includes(':3001'));
+  assert.ok(!html.includes('minimal_url'));
+});

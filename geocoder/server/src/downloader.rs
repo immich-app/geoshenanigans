@@ -33,6 +33,13 @@ pub enum DownloadError {
     /// A transport unit that can't be taken or failed to decode into its
     /// files: the unit's path and why.
     Transport(String),
+    /// A file whose bytes run past, or end short of, the size its manifest
+    /// entry gives: why.
+    Size(String),
+    /// A file that failed to go into place, whose temporary file can't be
+    /// removed either: why. Its bytes stay on the disk, beside those of each
+    /// try again.
+    Leftover(String),
 }
 
 impl std::fmt::Display for DownloadError {
@@ -54,6 +61,8 @@ impl std::fmt::Display for DownloadError {
                 write!(f, "the manifest names component \"{id}\" but does not define it")
             }
             DownloadError::Transport(s) => write!(f, "transport unit {}", s),
+            DownloadError::Size(s) => write!(f, "wrong size: {}", s),
+            DownloadError::Leftover(s) => write!(f, "temporary file left: {}", s),
         }
     }
 }
@@ -265,7 +274,7 @@ async fn send_body(resp: reqwest::Response, tx: &std::sync::mpsc::SyncSender<byt
     None
 }
 
-async fn get(client: &reqwest::Client, url: &str) -> Result<reqwest::Response, DownloadError> {
+pub async fn get(client: &reqwest::Client, url: &str) -> Result<reqwest::Response, DownloadError> {
     let resp = client.get(url).send().await
         .map_err(|e| DownloadError::Http(format!("{}: {}", url, e)))?;
     if !resp.status().is_success() {
@@ -275,15 +284,37 @@ async fn get(client: &reqwest::Client, url: &str) -> Result<reqwest::Response, D
 }
 
 /// Fetch `{base_url}/builds/{date}/{path}.zst`, a file published as its own
-/// .zst, decompress, verify sha256 against `expected.sha256`, write
-/// atomically to `dest`.
-async fn download_file(
+/// .zst, decompress, verify its size against `expected.size_raw` (no byte
+/// past it is written) and its sha256 against `expected.sha256`, write
+/// atomically to `dest`, through `<dest>.tmp`: a download into a dir runs
+/// under its download lock, and one killed leaves that file for the next to
+/// write over.
+pub async fn download_file(
     client: &reqwest::Client,
     base_url: &str,
     date: &str,
     path: &str,
     expected: &FileEntry,
     dest: &Path,
+) -> Result<(), DownloadError> {
+    let tmp = dest.with_extension(format!(
+        "{}.tmp", dest.extension().and_then(|s| s.to_str()).unwrap_or("")
+    ));
+    download_file_through(client, base_url, date, path, expected, dest, &tmp).await
+}
+
+/// download_file through the temporary file `tmp`, beside `dest`, which the
+/// caller names: a name no other download writes, where two may write one
+/// file at once. A download that fails removes it; one whose file can't go
+/// into place and can't remove it either fails with Leftover.
+pub async fn download_file_through(
+    client: &reqwest::Client,
+    base_url: &str,
+    date: &str,
+    path: &str,
+    expected: &FileEntry,
+    dest: &Path,
+    tmp: &Path,
 ) -> Result<(), DownloadError> {
     let url = format!("{}/builds/{}/{}.zst", base_url.trim_end_matches('/'), date, path);
     let resp = get(client, &url).await?;
@@ -294,15 +325,14 @@ async fn download_file(
     // network chunks plus the zstd window, regardless of file size.
     // Decode + hash + write run on a blocking thread fed through a
     // bounded channel so the async executor never blocks on disk I/O.
-    let tmp = dest.with_extension(format!(
-        "{}.tmp", dest.extension().and_then(|s| s.to_str()).unwrap_or("")
-    ));
+    let tmp = tmp.to_path_buf();
 
     let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(8);
     let tmp_for_writer = tmp.clone();
     let path_owned = path.to_string();
+    let size = expected.size_raw;
     let writer = tokio::task::spawn_blocking(move || {
-        decode_hash_write(rx, &tmp_for_writer, &path_owned)
+        decode_hash_write(rx, &tmp_for_writer, &path_owned, size)
     });
 
     let stream_err = send_body(resp, &tx, &url).await;
@@ -326,8 +356,17 @@ async fn download_file(
         });
     }
 
-    tokio::fs::rename(&tmp, dest).await
-        .map_err(|e| DownloadError::Io(format!("rename {}→{}: {}", tmp.display(), dest.display(), e)))?;
+    if let Err(e) = tokio::fs::rename(&tmp, dest).await {
+        // The file that didn't go into place goes: a try again writes a
+        // temporary file of its own.
+        let failed = format!("rename {}→{}: {}", tmp.display(), dest.display(), e);
+        return Err(match tokio::fs::remove_file(&tmp).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                DownloadError::Leftover(format!("{failed}, and remove {}: {e}", tmp.display()))
+            }
+            _ => DownloadError::Io(failed),
+        });
+    }
     Ok(())
 }
 
@@ -335,21 +374,32 @@ async fn download_file(
 /// from `rx`, zstd-decode them, write the decompressed bytes to `tmp`
 /// and hash them incrementally. Returns the sha256 hex of the
 /// decompressed content. RAM use is bounded by the channel depth plus
-/// the zstd window regardless of file size.
+/// the zstd window regardless of file size, and the disk's by `size`, the
+/// file's bytes: a byte past it fails the decode before it is written, and
+/// a file that ends short of it fails at its end.
 fn decode_hash_write(
     rx: std::sync::mpsc::Receiver<bytes::Bytes>,
     tmp: &Path,
     label: &str,
+    size: u64,
 ) -> Result<String, DownloadError> {
     use std::io::Write;
     struct HashWriter {
         file: std::io::BufWriter<std::fs::File>,
         hasher: Sha256,
+        written: u64,
+        size: u64,
+        past: bool,
     }
     impl std::io::Write for HashWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if buf.len() as u64 > self.size - self.written {
+                self.past = true;
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "past the file's size"));
+            }
             self.hasher.update(buf);
             self.file.write_all(buf)?;
+            self.written += buf.len() as u64;
             Ok(buf.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
@@ -358,18 +408,30 @@ fn decode_hash_write(
     }
     let file = std::fs::File::create(tmp)
         .map_err(|e| DownloadError::Io(format!("create {}: {}", tmp.display(), e)))?;
-    let hw = HashWriter { file: std::io::BufWriter::new(file), hasher: Sha256::new() };
+    let hw = HashWriter { file: std::io::BufWriter::new(file), hasher: Sha256::new(), written: 0, size, past: false };
     let mut dec = zstd::stream::write::Decoder::new(hw)
         .map_err(|e| DownloadError::Decompress(format!("{}: {}", label, e)))?;
+    let failed = |dec: &zstd::stream::write::Decoder<'_, HashWriter>, e: std::io::Error| {
+        if dec.get_ref().past {
+            DownloadError::Size(format!("{label} runs past its {size} bytes"))
+        } else {
+            DownloadError::Decompress(format!("{}: {}", label, e))
+        }
+    };
     while let Ok(chunk) = rx.recv() {
-        dec.write_all(&chunk)
-            .map_err(|e| DownloadError::Decompress(format!("{}: {}", label, e)))?;
+        if let Err(e) = dec.write_all(&chunk) {
+            return Err(failed(&dec, e));
+        }
     }
-    dec.flush()
-        .map_err(|e| DownloadError::Decompress(format!("{}: {}", label, e)))?;
+    if let Err(e) = dec.flush() {
+        return Err(failed(&dec, e));
+    }
     let mut hw = dec.into_inner();
     hw.flush()
         .map_err(|e| DownloadError::Io(format!("flush {}: {}", tmp.display(), e)))?;
+    if hw.written != size {
+        return Err(DownloadError::Size(format!("{label} is {} bytes, its manifest gives {size}", hw.written)));
+    }
     Ok(lower_hex(&hw.hasher.finalize()))
 }
 
@@ -381,7 +443,7 @@ fn decode_hash_write(
 /// as they come, must be `files` with their sizes and sha256, and are
 /// renamed into place together once all are; on an error none is. RAM use
 /// is the channel, the zstd window and one chunk of the unit's columns.
-async fn download_unit(
+pub async fn download_unit(
     client: &reqwest::Client,
     base_url: &str,
     date: &str,
@@ -409,7 +471,7 @@ async fn download_unit(
     decoded.map_err(|e| DownloadError::Transport(format!("{}: {}", unit, e)))
 }
 
-fn basename(path: &str) -> &str {
+pub fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
@@ -424,7 +486,7 @@ pub struct DownloadProgress {
 }
 
 /// One object a region's download fetches.
-enum Fetch<'a> {
+pub enum Fetch<'a> {
     /// A file, through its own .zst of `size` bytes.
     File { path: &'a str, entry: &'a FileEntry, size: u64 },
     /// A transport unit of `size` bytes, for its files.
@@ -432,21 +494,21 @@ enum Fetch<'a> {
 }
 
 impl<'a> Fetch<'a> {
-    fn path(&self) -> &'a str {
+    pub fn path(&self) -> &'a str {
         match self {
             Fetch::File { path, .. } | Fetch::Unit { path, .. } => path,
         }
     }
 
     /// The files it puts in place, by path, with their entries.
-    fn files(&self) -> Vec<(&'a str, &'a FileEntry)> {
+    pub fn files(&self) -> Vec<(&'a str, &'a FileEntry)> {
         match self {
             Fetch::File { path, entry, .. } => vec![(*path, *entry)],
             Fetch::Unit { files, .. } => files.clone(),
         }
     }
 
-    fn size(&self) -> u64 {
+    pub fn size(&self) -> u64 {
         match self {
             Fetch::File { size, .. } | Fetch::Unit { size, .. } => *size,
         }
@@ -457,7 +519,7 @@ impl<'a> Fetch<'a> {
 /// its transport unit, once for all the files it holds. A unit must be of
 /// this build's transport version, and the selection must take all of its
 /// files: decoding it writes every one.
-fn fetches<'a>(cfg: &'a Configurations, paths: &[&'a String]) -> Result<Vec<Fetch<'a>>, DownloadError> {
+pub fn fetches<'a>(cfg: &'a Configurations, paths: &[&'a String]) -> Result<Vec<Fetch<'a>>, DownloadError> {
     let taken: HashSet<&str> = paths.iter().map(|p| p.as_str()).collect();
     let mut units = HashSet::new();
     let mut out = Vec::new();
@@ -838,13 +900,77 @@ mod tests {
                 tx.send(bytes::Bytes::copy_from_slice(chunk)).unwrap();
             }
         });
-        let got = decode_hash_write(rx, &tmp, "test").unwrap();
+        let got = decode_hash_write(rx, &tmp, "test", raw.len() as u64).unwrap();
         feeder.join().unwrap();
 
         let mut hasher = Sha256::new();
         hasher.update(&raw);
         assert_eq!(got, lower_hex(&hasher.finalize()));
         assert_eq!(std::fs::read(&tmp).unwrap(), raw);
+    }
+
+    // A file's decode holds it to its manifest size: bytes past it fail the
+    // decode before any of them is written, and a file that ends short of
+    // it fails at its end.
+    #[test]
+    fn a_streaming_decode_writes_nothing_past_the_files_size() {
+        let raw: Vec<u8> = (0..3 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+        let compressed = zstd::encode_all(&raw[..], 3).unwrap();
+        let n = raw.len() as u64;
+        for (size, why) in [(n - 1, format!("test runs past its {} bytes", n - 1)), (n + 1, format!("test is {n} bytes, its manifest gives {}", n + 1))] {
+            let dir = ScratchDir::new();
+            let tmp = dir.path().join("out.bin.tmp");
+            let (tx, rx) = std::sync::mpsc::sync_channel::<bytes::Bytes>(8);
+            let chunks = compressed.clone();
+            let feeder = std::thread::spawn(move || {
+                for chunk in chunks.chunks(64 * 1024) {
+                    if tx.send(bytes::Bytes::copy_from_slice(chunk)).is_err() {
+                        break;
+                    }
+                }
+            });
+
+            let got = decode_hash_write(rx, &tmp, "test", size).map_err(|e| e.to_string());
+
+            feeder.join().unwrap();
+            assert_eq!(got, Err(format!("wrong size: {why}")), "{size}");
+            assert!(std::fs::metadata(&tmp).unwrap().len() <= size, "{size}");
+        }
+    }
+
+    // A file whose bytes run past the size its manifest entry gives fails
+    // its download, leaving neither it nor its temporary file.
+    #[tokio::test]
+    async fn a_file_past_its_manifest_size_fails_its_download_and_leaves_nothing() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (path, entry) = bucket.manifest.files.iter().find(|(_, e)| e.unit.is_none()).unwrap();
+        let smaller = FileEntry { size_raw: entry.size_raw - 1, ..entry.clone() };
+        let root = ScratchDir::new();
+        let (dest, tmp) = (root.path().join("file.bin"), root.path().join("file.bin.1.tmp"));
+
+        let got = download_file_through(&reqwest::Client::new(), &bucket.url, test_bucket::DATE, path, &smaller, &dest, &tmp).await;
+
+        assert_eq!(got.map_err(|e| e.to_string()), Err(format!("wrong size: {path} runs past its {} bytes", smaller.size_raw)));
+        assert!(!dest.exists() && !tmp.exists());
+    }
+
+    // A file that can't be renamed into place (a dir at its path) fails its
+    // download, and its temporary file goes: a try again writes one of its
+    // own.
+    #[tokio::test]
+    async fn a_file_that_cant_go_into_place_fails_its_download_and_leaves_no_temporary_file() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (path, entry) = bucket.manifest.files.iter().find(|(_, e)| e.unit.is_none()).unwrap();
+        let root = ScratchDir::new();
+        let (dest, tmp) = (root.path().join("file.bin"), root.path().join("file.bin.1.tmp"));
+        std::fs::create_dir(&dest).unwrap();
+
+        let got = download_file_through(&reqwest::Client::new(), &bucket.url, test_bucket::DATE, path, entry, &dest, &tmp).await;
+
+        let failed = got.unwrap_err().to_string();
+        assert!(failed.starts_with(&format!("I/O error: rename {}→{}: ", tmp.display(), dest.display())), "{failed}");
+        assert!(!tmp.exists());
+        assert!(dest.is_dir());
     }
 
     fn component(files: &[&str], replaces: &[&str], extends: Option<&str>) -> Component {
@@ -2207,6 +2333,10 @@ mod tests {
         assert_eq!(
             DownloadError::Transport("europe/admin/places.tt.zst: transport: the unit ends early, past byte 12".into()).to_string(),
             "transport unit europe/admin/places.tt.zst: transport: the unit ends early, past byte 12"
+        );
+        assert_eq!(
+            DownloadError::Size("europe/admin_cells.bin runs past its 12 bytes".into()).to_string(),
+            "wrong size: europe/admin_cells.bin runs past its 12 bytes"
         );
     }
 }
