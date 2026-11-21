@@ -522,11 +522,22 @@ def nightly_patch_step():
     return reserve.group(1), call.group(1).replace("\\\n", " ").split()
 
 
-def nightly_place_search_reserves():
-    """The patch step's lines that add what the place search beside it holds to the reserves, as bash."""
+def nightly_reserves():
+    """The patch step's lines that set the reserves it gives generate_patches.sh (RESERVE_KIB and MEM_RESERVE_KIB),
+    from what $WORKDIR holds, as bash."""
     text = read(os.path.join(WORKFLOWS, "geocoder-build.yml"))
-    block = re.search(r"^( *)MEM_RESERVE_KIB=0\n(?:\1.*\n)*?\1fi\n", text, re.M)
-    return "".join(line.strip() + "\n" for line in block.group(0).splitlines()) if block else None
+    block = re.search(r"^ *VARIANTS=.*\n((?:.*\n)*?) *# Per variant: diff", text, re.M)
+    return "".join(line.strip() + "\n" for line in block.group(1).splitlines()) if block else None
+
+
+def reserves(workdir, path=None):
+    """The reserves the patch step gives generate_patches.sh for what `workdir` holds, with `path` first on PATH."""
+    env = dict(os.environ, WORKDIR=workdir)
+    if path:
+        env["PATH"] = f"{path}:{env['PATH']}"
+    printed = subprocess.run(["bash", "-e", "-c", nightly_reserves() + 'echo "$RESERVE_KIB $MEM_RESERVE_KIB"'], env=env,
+                             check=True, capture_output=True, text=True).stdout
+    return tuple(int(n) for n in printed.split())
 
 
 class NightlyReserveTest(unittest.TestCase):
@@ -560,17 +571,32 @@ class NightlyReserveTest(unittest.TestCase):
     # indexes, their scratch and their .zst may still land on the volume (~16 GB of writes on a planet night,
     # scratch included), and its builds hold a few GiB of memory.
     def test_while_the_place_search_runs_the_reserves_hold_what_it_may_write_and_use(self):
-        script = nightly_place_search_reserves()
-        self.assertIsNotNone(script)
+        self.assertIsNotNone(nightly_reserves())
         for status, scratch, memory in (("", 16 * GIB, 6 * GIB), ("0\n", 0, 0), ("1\n", 0, 0)):
             with tempfile.TemporaryDirectory() as workdir:
+                write_file(os.path.join(workdir, "output", "planet", "full", "street_ways.bin"), 7 * 1024)
                 if status:
                     with open(os.path.join(workdir, "place-search.status"), "w") as f:
                         f.write(status)
-                printed = subprocess.run(["bash", "-c", 'RESERVE_KIB=7\n' + script + 'echo "$RESERVE_KIB $MEM_RESERVE_KIB"'],
-                                         env=dict(os.environ, WORKDIR=workdir), check=True, capture_output=True,
-                                         text=True).stdout
-            self.assertEqual(printed, "%d %d\n" % (7 + scratch, memory), status)
+
+                self.assertEqual(reserves(workdir), (7 + scratch, memory), status)
+
+    # One that ends while the files are counted leaves files the count missed: its status is read before the count,
+    # so that the reserves still hold what it may write and use.
+    def test_a_place_search_that_ends_during_the_count_keeps_its_reserves(self):
+        with tempfile.TemporaryDirectory() as workdir:
+            write_file(os.path.join(workdir, "output", "planet", "full", "street_ways.bin"), 7 * 1024)
+            bin_dir = os.path.join(workdir, "bin")
+            os.makedirs(bin_dir)
+            # find counts what is there; then the place search writes an index of 10 MiB and its status.
+            with open(os.path.join(bin_dir, "find"), "w") as f:
+                f.write(f"#!/bin/sh\n{shutil.which('find')} \"$@\"\nfound=$?\n"
+                        'mkdir -p "$WORKDIR/output/planet/search"\n'
+                        'head -c 10485760 /dev/zero > "$WORKDIR/output/planet/search/places.fst"\n'
+                        'echo 0 > "$WORKDIR/place-search.status"\nexit $found\n')
+            os.chmod(os.path.join(bin_dir, "find"), 0o755)
+
+            self.assertEqual(reserves(workdir, path=bin_dir), (7 + 16 * GIB, 6 * GIB))
 
 
 if __name__ == "__main__":

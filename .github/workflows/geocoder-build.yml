@@ -1040,23 +1040,28 @@ jobs:
           RESULTS_DIR="$WORKDIR/results"
           VARIANTS=$(cd "$WORKDIR/output" && find . -name "*.bin" -exec dirname {} \; | sort -u | sed 's|^\./||')
 
-          # The compressor writes into the volume the diffs and verifies use
-          # for scratch: at most the bytes of the files it compresses (every
-          # .bin, the load sidecars, the search indexes). The patch jobs leave
-          # that much of the free space alone.
-          RESERVE_KIB=$(find "$WORKDIR/output" -type f \
-            \( -name '*.bin' -o -name strings_layout.json -o -name poi_meta.json -o -path '*/search/*' \) \
-            ! -name '*.zst' -printf '%s\n' | awk '{s += $1} END {printf "%d", (s + 1023) / 1024}')
           # Until its status is written the place search runs beside the patch
           # jobs: its indexes, their scratch and (through the compressor) their
           # .zst may still land on the volume, ~16 GB of writes on a planet
           # night scratch included, and its builds hold a few GiB of memory
-          # (72 GiB of diff estimates then admit 66).
+          # (72 GiB of diff estimates then admit 66). The status is read before
+          # the files below are counted: one written during the count would
+          # leave files it missed.
+          SEARCH_RESERVE_KIB=0
           MEM_RESERVE_KIB=0
           if ! [ -s "$WORKDIR/place-search.status" ]; then
-            RESERVE_KIB=$((RESERVE_KIB + 16 * 1024 * 1024))
+            SEARCH_RESERVE_KIB=$((16 * 1024 * 1024))
             MEM_RESERVE_KIB=$((6 * 1024 * 1024))
           fi
+          # The compressor writes into the volume the diffs and verifies use
+          # for scratch: at most the bytes of the files it compresses (every
+          # .bin, the load sidecars, the search indexes). The patch jobs leave
+          # that much of the free space alone, with what the place search may
+          # still write.
+          RESERVE_KIB=$(find "$WORKDIR/output" -type f \
+            \( -name '*.bin' -o -name strings_layout.json -o -name poi_meta.json -o -path '*/search/*' \) \
+            ! -name '*.zst' -printf '%s\n' | awk '{s += $1} END {printf "%d", (s + 1023) / 1024}')
+          RESERVE_KIB=$((RESERVE_KIB + SEARCH_RESERVE_KIB))
 
           # Per variant: diff, apply to a scratch copy, verify the whole client
           # file set (JSON included, no extra files). Jobs are admitted by
