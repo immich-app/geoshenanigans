@@ -78,15 +78,32 @@ const MESSAGE = template.constraints[0].message;
 const ADMIN_MINIMAL = { region: 'planet', mode: 'admin-minimal', quality: 'simplified', poi_tier: 'none' };
 const FULL_EXACT = { region: 'planet', mode: 'full', quality: 'exact', poi_tier: 'all' };
 
-// A template whose every string the page shows is markup.
+// A template whose every string the page shows is markup: labels,
+// descriptions and the constraint's message, a preset's id, and a value's
+// id, which the ids of its datasets take.
 function hostile(t) {
   t.presets[0].label = '<img src=x onerror=alert(1)>';
   t.presets[0].description = '"><script>alert(2)</script>';
+  t.presets[1].id = '"><img src=x onerror=alert(4)>';
   t.axes.mode.label = '<u>mode</u>';
   t.axes.mode.description = '" onmouseover="alert(3)';
   t.axes.mode.values.full.label = '<b>Full</b>';
   t.axes.quality.values.exact.description = '<i>every point</i>';
+  t.axes.poi_tier.values[MAJOR] = t.axes.poi_tier.values.major;
+  delete t.axes.poi_tier.values.major;
+  for (const p of t.presets.filter((x) => x.selections.poi_tier === 'major')) p.selections.poi_tier = MAJOR;
   t.constraints[0].message = '<em>no</em> & "quotes"';
+}
+const MAJOR = 'major"><u>';
+
+// `c` with the id of its axis `from` made `to`, in the axes and in each
+// selection.
+function renameAxis(c, from, to) {
+  c.axes.find((a) => a.id === from).id = to;
+  for (const x of [...c.datasets, ...c.excluded]) {
+    x.selection = Object.fromEntries(Object.entries(x.selection).map(([axis, value]) => [axis === from ? to : axis, value]));
+  }
+  return c;
 }
 
 // No markup of `hostile` comes through, and its text does, escaped.
@@ -208,7 +225,8 @@ test('the picker offers the presets with their sizes, and the axes of a custom p
   const c = catalog();
   const preset = pickerHtml(c, resolveColumn(c, 'smallest'), 0, 2);
   for (const p of c.presets) {
-    assert.ok(preset.includes(`<option value="${p.id}"`), p.id);
+    const size = (c.datasets.find((d) => d.id === p.dataset).size_disk / 2 ** 30).toFixed(2);
+    assert.match(preset, new RegExp(`<option value="${p.id}"[^>]*>${p.label} · ${size} GiB</option>`), p.id);
   }
   assert.match(preset, /<option value="smallest" selected[^>]*>Smallest useful/);
   assert.ok(preset.includes('25.00 GiB on disk · 12.50 GiB download'), preset);
@@ -226,24 +244,37 @@ test('the picker offers the presets with their sizes, and the axes of a custom p
   assert.ok(custom.includes(`Exact: ${MESSAGE}`), custom);
 });
 
-test('every string of the manifest is escaped where the page shows it', () => {
-  const { pickerHtml, resolveColumn, detailHtml, cardHtml, statusHtml } = core();
-  const c = catalog(hostile);
-  const picker = pickerHtml(c, resolveColumn(c, 'smallest'), 0, 2) + pickerHtml(c, resolveColumn(c, 'admin-minimal.exact.none'), 1, 2)
-    + pickerHtml(c, resolveColumn(c, 'full.exact.all'), 2, 3);
+// A column of a link's dataset the build doesn't offer is labelled by the
+// link's token, as the page labels it (columnLabel).
+test('every string and id of the manifest, and a link\'s dataset, is escaped where the page shows it', () => {
+  const { pickerHtml, resolveColumn, pick, detailHtml, cardHtml, statusHtml } = core();
+  const c = renameAxis(catalog(hostile), 'poi_tier', 'poi"><b>');
+  const moved = pick(c, c.datasets.find((d) => d.id === 'full.exact.all').selection, 'mode', 'admin-minimal');
+  assert.ok(moved.note.includes('<em>no</em>'), moved.note);
+  const linked = resolveColumn(c, '<script>alert(5)</script>');
+  const columns = [resolveColumn(c, 'smallest'), resolveColumn(c, 'admin-minimal.exact.none'), resolveColumn(c, 'full.exact.all'),
+    { ...resolveColumn(c, moved.dataset.id), note: moved.note }, resolveColumn(c, `admin.simplified.${MAJOR}`), linked];
+  const picker = columns.map((col, i) => pickerHtml(c, col, i, columns.length)).join('');
   assertEscaped(picker);
   assert.ok(picker.includes('&lt;img src=x onerror=alert(1)&gt;'));
   assert.ok(picker.includes('&lt;em&gt;no&lt;/em&gt; &amp; &quot;quotes&quot;'));
+  assert.ok(picker.includes('<div class="picker-note">Boundary precision moves to Simplified: &lt;em&gt;no&lt;/em&gt;'), 'the note of a pick');
+  assert.ok(picker.includes('<option value="&quot;&gt;&lt;img src=x onerror=alert(4)&gt;"'), 'a preset id');
+  assert.ok(picker.includes('data-axis="poi&quot;&gt;&lt;b&gt;"'), 'an axis id');
+  assert.ok(picker.includes('<option value="major&quot;&gt;&lt;u&gt;"'), 'a value id');
+  assert.ok(picker.includes(' · admin.simplified.major&quot;&gt;&lt;u&gt;</div>'), 'a dataset id');
+  assert.ok(picker.includes('unknown dataset &quot;&lt;script&gt;alert(5)&lt;/script&gt;&quot;'), "a link's dataset");
 
   const dataset = c.datasets.find((d) => d.id === 'admin-minimal.simplified.none');
   const answer = { data: { display_name: '<img src=y>', address: { road: '<b>x</b>' }, places: [{ name: '<i>p</i>', category: '<u>c</u>', distance_m: 3 }] }, build: '<s>', ms: 3 };
-  const views = [{ label: dataset.label, color: '#fff', dataset, answer }, { label: 'x', color: '#000', dataset: null, answer: { error: '<script>e</script>' } }];
+  const views = [{ label: dataset.label, color: '#fff', dataset, answer }, { label: linked.token, color: '#000', dataset: null, answer: { error: linked.error } }];
   const detail = detailHtml(views, '2026-11-20');
   const card = cardHtml({ id: 1, lat: 1, lng: 2, source: '<img src=s>' }, views, false);
   for (const out of [detail, card]) {
     assertEscaped(out);
     assert.ok(!out.includes('<s>'));
   }
+  assert.ok(card.includes('<div class="result-error">&lt;script&gt;alert(5)&lt;/script&gt;: unknown dataset'), card);
   assertEscaped(statusHtml({ status: 'unavailable', reason: '<img src=r>', sync: { running: '<b>r</b>', refused: [{ date: '<i>', version: 1, reason: '<script>', at: '' }], damaged: '<u>d</u>', last_result: null } }));
 });
 
@@ -372,9 +403,16 @@ test('the requests in flight are at most 8, over every column', async () => {
       return reply(200, '{}');
     },
   });
-  const got = await Promise.all(Array.from({ length: 40 }, (_, i) => pacer.request(`/reverse?n=${i}`)));
+  const batch = () => Promise.all(Array.from({ length: 40 }, (_, i) => pacer.request(`/reverse?n=${i}`)));
+  const got = await batch();
   assert.equal(most, 8);
   assert.ok(got.every((g) => g.status === 200 && g.body === '{}' && g.ms >= 0));
+  // Every place is free once they are answered, and the next ones are held
+  // to 8 as well.
+  assert.deepEqual([pacer.active, pacer.waiting.length], [0, 0]);
+  most = 0;
+  await batch();
+  assert.equal(most, 8);
 });
 
 test('a 429 is asked again after a pause, which every request waits out', async () => {
