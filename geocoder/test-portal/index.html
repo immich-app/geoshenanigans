@@ -704,12 +704,13 @@ function placeKey(p) {
 }
 
 // Whether the answers `datas` (null for a column without one) disagree on
-// what the page shows: the display name, an address field or the places.
+// what the page shows: the display name, an address field or the places,
+// each with its distance.
 function answersDiffer(datas) {
   const answered = datas.filter((d) => d);
   if (answered.length < 2) return false;
   const name = (d) => d.display_name || '';
-  const places = (d) => (d.places || []).map(placeKey).join('\u0001');
+  const places = (d) => (d.places || []).map((p) => `${placeKey(p)}\u0000${p.distance_m}`).join('\u0001');
   return answered.some((d) => name(d) !== name(answered[0]) || places(d) !== places(answered[0]))
     || fieldRows(answered.map((d) => d.address || {})).some((row) => row.differs || row.missing);
 }
@@ -881,11 +882,13 @@ function pickerHtml(catalog, col, index, count) {
 }
 
 // The detail of a result, from `views`: one a column ({label, color,
-// dataset, answer}), and Nominatim's. Per answer its name, dataset, build,
-// time and sizes, flagged where a build other than the one `served`
-// answered (sameBuild: one published before it under its date among them);
-// the address fields side by side, those the answers disagree on or lack
-// marked; the places, those not in every answer marked; the JSON.
+// dataset, answer}), and Nominatim's. Per answer its name, dataset, build
+// and time, flagged where a build other than the one `served` answered
+// (sameBuild: one published before it under its date among them), and the
+// sizes of its dataset in the build served, where that answered; the
+// address fields side by side, those the answers disagree on or lack
+// marked; the places, those not in every answer marked; the JSON, each
+// panel named by the place of its view (data-view).
 function detailHtml(views, served) {
   const grid = `display:grid;grid-template-columns:repeat(${views.length},minmax(0,1fr));gap:12px`;
   let html = `<div style="${grid};margin-bottom:12px">`;
@@ -897,8 +900,9 @@ function detailHtml(views, served) {
     if (a.build) meta.push(`build ${esc(a.build)}`);
     if (Number.isFinite(a.ms)) meta.push(`${Math.round(a.ms)} ms`);
     if (meta.length) html += `<div class="answer-meta">${meta.join(' · ')}</div>`;
-    if (v.dataset) html += `<div class="answer-meta">${formatSize(v.dataset.size_disk)} on disk · ${formatSize(v.dataset.size_download)} download</div>`;
-    if (a.build && served && !sameBuild(a.build, served)) {
+    const stale = a.build && served && !sameBuild(a.build, served);
+    if (v.dataset && !stale) html += `<div class="answer-meta">${formatSize(v.dataset.size_disk)} on disk · ${formatSize(v.dataset.size_download)} download</div>`;
+    if (stale) {
       html += `<span class="tag stale" title="The server serves build ${esc(served)} now: Re-test asks it again">build ${esc(a.build)}, not ${esc(served)}</span>`;
     }
     if (a.loading) html += '<div class="answer-name"><span class="loading-spinner"></span>Loading…</div>';
@@ -948,11 +952,11 @@ function detailHtml(views, served) {
     html += '</div></div>';
   }
 
-  for (const v of views) {
-    if (!v.answer || !v.answer.data) continue;
-    html += `<details style="margin-top:6px"><summary style="cursor:pointer;color:${v.color}">${esc(v.label)}: response JSON</summary>`
+  views.forEach((v, i) => {
+    if (!v.answer || !v.answer.data) return;
+    html += `<details data-view="${i}" style="margin-top:6px"><summary style="cursor:pointer;color:${v.color}">${esc(v.label)}: response JSON</summary>`
       + `<div class="json-block">${syntaxHighlight(v.answer.data)}</div></details>`;
-  }
+  });
   return html;
 }
 
@@ -1914,10 +1918,11 @@ function showDetail(id) {
   panel.classList.add('visible');
   const views = columnViews(entry);
   if (nominatimEnabled) views.push(nominatimView(entry));
-  // An answer coming in keeps the JSON blocks of the result open.
-  const open = detailShown === id ? [...content.querySelectorAll('details')].map((d) => d.open) : [];
+  // An answer coming in keeps the JSON blocks of the result open, each by
+  // the place of its view.
+  const open = detailShown === id ? [...content.querySelectorAll('details')].filter((d) => d.open).map((d) => d.dataset.view) : [];
   content.innerHTML = detailHtml(views, servedBuild());
-  content.querySelectorAll('details').forEach((d, i) => { if (open[i]) d.open = true; });
+  content.querySelectorAll('details').forEach((d) => { if (open.includes(d.dataset.view)) d.open = true; });
   detailShown = id;
 }
 

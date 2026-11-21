@@ -361,14 +361,15 @@ test('the field table marks the fields the answers disagree on or lack', () => {
   assert.deepEqual(plain(fieldRows([{ city: 'Paris' }, { city: 'Paris' }])), [{ field: 'city', values: ['Paris', 'Paris'], differs: false, missing: false }]);
 });
 
-test('answers differ by display name, a field or the places', () => {
+test('answers differ by display name, a field, or the places and their distances', () => {
   const { answersDiffer } = core();
-  const paris = { display_name: 'Paris', address: { city: 'Paris' }, places: [{ name: 'Louvre', category: 'museum' }] };
+  const paris = { display_name: 'Paris', address: { city: 'Paris' }, places: [{ name: 'Louvre', category: 'museum', distance_m: 12 }] };
   assert.equal(answersDiffer([paris, structuredClone(paris)]), false);
   assert.equal(answersDiffer([paris, null]), false);
   assert.equal(answersDiffer([paris, { ...paris, display_name: 'Paris 1er' }]), true);
   assert.equal(answersDiffer([paris, { ...paris, address: { city: 'Paris', postcode: '75001' } }]), true);
   assert.equal(answersDiffer([paris, { ...paris, places: [] }]), true);
+  assert.equal(answersDiffer([paris, { ...paris, places: [{ name: 'Louvre', category: 'museum', distance_m: 40 }] }]), true);
 });
 
 test('the detail shows per answer its dataset, build, sizes and time, and flags another build', () => {
@@ -384,6 +385,10 @@ test('the detail shows per answer its dataset, build, sizes and time, and flags 
   const out = detailHtml(views, '2026-11-20');
   assert.ok(out.includes('full.simplified.all · build 2026-11-20 · 12 ms'), out);
   assert.ok(out.includes(`${(dataset.size_disk / 2 ** 30).toFixed(2)} GiB on disk · ${(dataset.size_download / 2 ** 30).toFixed(2)} GiB download`));
+  // The sizes are those of the build served: an answer of another build goes
+  // without them.
+  assert.equal(out.match(/ GiB on disk · /g).length, 2, out);
+  assert.ok(!detailHtml([views[1]], '2026-11-20').includes('on disk'));
   assert.match(out, /class="tag stale"[^>]*>build 2026-11-19/);
   assert.equal(out.match(/class="tag stale"/g).length, 1);
   assert.match(out, /<tr class="differs">\s*<td[^>]*>city<\/td>/);
@@ -398,6 +403,17 @@ test('the detail shows per answer its dataset, build, sizes and time, and flags 
   ], '2026-11-20-2');
   assert.match(republished, /class="tag stale"[^>]*>build 2026-11-20-1, not 2026-11-20-2/);
   assert.equal(republished.match(/class="tag stale"/g).length, 1, republished);
+});
+
+// The detail keeps a result's open JSON panels open as its answers come in:
+// each is named by the place of its view, whatever views before it have no
+// answer yet.
+test('each JSON panel of the detail is named by the place of its view', () => {
+  const { detailHtml } = core();
+  const view = (label, answer) => ({ label, color: '#111', dataset: null, answer });
+  const out = detailHtml([view('a', { loading: true }), view('b', { data: { display_name: 'B' } }), view('c', null), view('d', { data: { display_name: 'D' } })], null);
+  assert.deepEqual([...out.matchAll(/<details data-view="(\d+)"/g)].map((m) => m[1]), ['1', '3']);
+  assert.equal(out.match(/<details/g).length, 2);
 });
 
 test('a card names the first answer and says when the columns differ', () => {
