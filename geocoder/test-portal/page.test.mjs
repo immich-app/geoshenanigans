@@ -909,7 +909,8 @@ test('the JSON of an answer is shown highlighted and escaped', () => {
 // whose toolbar and cards would go: they keep a height of their own, the
 // datasets and the detail scroll within what is left, down to a least
 // height of theirs, and a window too short for those scrolls the panel
-// rather than cutting off its foot.
+// rather than cutting off its foot. The results' section hides what
+// overflows it: its list of cards scrolls.
 test('the results keep room for their toolbar and cards however tall the datasets and the detail grow', () => {
   const height = /\b[1-9]\d*(px|%|vh)/;
   assert.match(style('.results-section')['min-height'] ?? 'none', height);
@@ -918,6 +919,17 @@ test('the results keep room for their toolbar and cards however tall the dataset
     assert.match(style(giving)['min-height'] ?? 'none', height, giving);
   }
   assert.equal(style('.side-panel')['overflow-y'], 'auto');
+  assert.equal(style('.results-section').overflow, 'hidden');
+  assert.equal(style('.results-list')['overflow-y'], 'auto');
+});
+
+// Four columns and Nominatim share the detail's width: a column's places
+// table breaks a long word (place_of_worship) within its own column rather
+// than running into the next one.
+test("each column's places table wraps its words within the column", () => {
+  for (const cell of ['.detail-places th', '.detail-places td']) {
+    assert.equal(style(cell)['overflow-wrap'], 'anywhere', cell);
+  }
 });
 
 test("the page's other scripts parse", () => {

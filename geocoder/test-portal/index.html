@@ -268,15 +268,19 @@
     font-size: 12px;
     border-collapse: collapse;
   }
+  /* The columns' tables share the detail's width: a long word breaks
+     within its own column rather than running into the next. */
   .detail-places th {
     text-align: left;
     color: var(--text-dim);
     font-weight: 500;
     padding: 3px 8px 3px 0;
     border-bottom: 1px solid var(--border);
+    overflow-wrap: anywhere;
   }
   .detail-places td {
     padding: 3px 8px 3px 0;
+    overflow-wrap: anywhere;
   }
 
   .json-block {
