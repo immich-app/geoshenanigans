@@ -20,7 +20,7 @@ use query_server::{
 
 use crate::portal::catalog::{self, Object};
 use crate::portal::sync::{self, BuildDir, BUILDS, COMPLETE, MANIFEST, REFUSED, SETS};
-use crate::portal::{load_dataset, router, Config, Loader, Portal, BUILD_VERSION, LOOKUPS_AT_ONCE};
+use crate::portal::{load_dataset, lookup, router, Config, Loader, Portal, BUILD_VERSION, LOOKUPS_AT_ONCE};
 use crate::downloader::{basename, resolve_files, Configurations, RegionSelection};
 use crate::scratch_dir::ScratchDir;
 use crate::test_bucket::{self, TestBucket, DATE};
@@ -1573,6 +1573,50 @@ async fn a_lookup_waits_its_turn_while_the_lookups_at_once_run() {
     }
     assert_eq!(p.lookups.available_permits(), 2);
     assert_eq!(Config::from_env().lookups_at_once, LOOKUPS_AT_ONCE);
+}
+
+// A lookup holds its place until its answer's body is sent or dropped, not
+// only until the answer is made: the answer's bytes are in memory until
+// then. The next lookup waits while a body is held, and goes once it is
+// sent; a body dropped unsent frees its place too.
+#[tokio::test]
+async fn a_lookup_holds_its_place_until_its_answers_body_is_released() {
+    use axum::body::Body;
+    use axum::response::IntoResponse;
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let mut one = config(&bucket, load);
+    one.lookups_at_once = 1;
+    let p = portal(data.path(), one);
+    p.round(true).await.unwrap();
+    let served = p.served().unwrap();
+    // An answer whose body comes once `send` sends it.
+    let held = || {
+        let (send, body) = tokio::sync::oneshot::channel::<&'static str>();
+        let stream = futures_util::stream::once(async move { body.await.map(bytes::Bytes::from).map_err(std::io::Error::other) });
+        (send, move |_: &query_server::MultiIndex| Body::from_stream(stream).into_response())
+    };
+
+    let (send, answer) = held();
+    let first = lookup(&p, served.clone(), 0, answer).await;
+    assert_eq!(p.lookups.available_permits(), 0);
+    let next = tokio::spawn({
+        let (p, served) = (p.clone(), served.clone());
+        async move { lookup(&p, served, 0, |_| "next".into_response()).await.status() }
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!next.is_finished());
+    send.send("first").unwrap();
+    assert_eq!(axum::body::to_bytes(first.into_body(), usize::MAX).await.unwrap(), "first");
+    assert_eq!(next.await.unwrap(), 200);
+    assert_eq!(p.lookups.available_permits(), 1);
+
+    let (_send, answer) = held();
+    let unsent = lookup(&p, served, 0, answer).await;
+    assert_eq!(p.lookups.available_permits(), 0);
+    drop(unsent);
+    assert_eq!(p.lookups.available_permits(), 1);
 }
 
 // A /reverse or /polygons without dataset= answers from with-addresses, as

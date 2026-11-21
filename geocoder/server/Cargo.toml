@@ -51,6 +51,9 @@ zstd = "0.14"
 sha2 = "0.11"
 futures-util = "0.3"
 bytes = "1"
+# The body of a lookup's answer, which holds its place until it is sent
+# (portal.rs).
+http-body = "1"
 
 # The binary's tests (the download tests' bucket) build their datasets with the library's
 # fixture encoders.

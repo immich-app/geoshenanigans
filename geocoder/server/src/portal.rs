@@ -312,26 +312,59 @@ struct Params {
     dataset: Option<String>,
 }
 
+/// A lookup's answer's body, which holds the lookup's place (Portal::lookups)
+/// until it is sent or dropped: the answer is in memory until then, the
+/// JSON of a /polygons of exact boundaries hundreds of MB.
+struct Holding {
+    body: axum::body::Body,
+    place: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl axum::body::HttpBody for Holding {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        let polled = axum::body::HttpBody::poll_frame(std::pin::Pin::new(&mut this.body), cx);
+        if let std::task::Poll::Ready(None | Some(Err(_))) = polled {
+            this.place = None;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        axum::body::HttpBody::is_end_stream(&self.body)
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        axum::body::HttpBody::size_hint(&self.body)
+    }
+}
+
 /// The answer of `answer` from the dataset `at` of `served`, on a blocking
 /// thread once a place of the portal's lookups is free (Portal::lookups):
 /// a lookup that waits on cold pages holds up no other request, and at most
-/// Config::lookups_at_once run. A lookup holds its place until it ends, even
-/// once its client has gone. Named by the headers X-Geocoder-Build (the
+/// Config::lookups_at_once run. A lookup holds its place until its answer's
+/// body is sent or dropped (Holding), and until the lookup ends where its
+/// client has gone before. Named by the headers X-Geocoder-Build (the
 /// build's date), X-Geocoder-Build-Dir (its dir, as /health and /datasets
 /// name it: a build published again under its date is another) and
 /// X-Geocoder-Dataset.
-async fn lookup(portal: &Portal, served: Arc<Served>, at: usize, answer: impl FnOnce(&MultiIndex) -> Response + Send + 'static) -> Response {
+pub async fn lookup(portal: &Portal, served: Arc<Served>, at: usize, answer: impl FnOnce(&MultiIndex) -> Response + Send + 'static) -> Response {
     let Ok(place) = portal.lookups.clone().acquire_owned().await else {
         return (StatusCode::INTERNAL_SERVER_ERROR, "the lookups are closed").into_response();
     };
     let index = served.indexes[at].clone();
-    let answered = tokio::task::spawn_blocking(move || {
-        let _place = place;
-        answer(&index)
-    })
-    .await;
+    let answered = tokio::task::spawn_blocking(move || (answer(&index), place)).await;
     let mut resp = match answered {
-        Ok(resp) => resp,
+        Ok((resp, place)) => {
+            let (parts, body) = resp.into_parts();
+            Response::from_parts(parts, axum::body::Body::new(Holding { body, place: Some(place) }))
+        }
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("the lookup failed: {e}")).into_response(),
     };
     let h = resp.headers_mut();
