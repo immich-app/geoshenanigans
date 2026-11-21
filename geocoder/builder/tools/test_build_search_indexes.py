@@ -221,7 +221,7 @@ class TestPortalTest(unittest.TestCase):
         self.assertRegex(services, r"(?m)^    init: true$")
         mapped = re.findall(r"(?m)^      ([A-Z][A-Z_]*):", services)
         listed = re.findall(r'(?m)^      - "?([A-Z][A-Z_]*)(?:=|"?$)', services)
-        self.assertLessEqual(set(mapped + listed), {"DATA_DIR", "PORTAL_BASE_URL", "PORTAL_SYNC_SECONDS"})
+        self.assertLessEqual(set(mapped + listed), {"DATA_DIR", "PORTAL_BASE_URL", "PORTAL_SYNC_SECONDS", "PORTAL_SEARCH_JOBS"})
 
 
 class ResolveTest(unittest.TestCase):

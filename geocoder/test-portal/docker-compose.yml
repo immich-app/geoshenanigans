@@ -2,12 +2,14 @@ services:
   # The test portal. query-portal syncs the whole planet build (every mode,
   # boundary precision and POI tier) from the bucket into the volume by
   # itself, each file checked against the build's manifest, and serves each
-  # of its 28 datasets; the page at /test compares up to 4 side by side. A
-  # build is ~11.2 GiB on disk (its identical files hard-linked) and ~9 GiB
-  # to download, once a day; the volume keeps the build served, the one
-  # served before it and one being fetched, ~34 GiB of files at most. A
-  # fetch starts only with its files' size and 2 GiB more free, so allow
-  # ~36 GiB.
+  # of its 28 datasets, their place search among it; the page at /test
+  # compares up to 4 side by side. A build is ~11.2 GiB on disk (its
+  # identical files hard-linked) and ~9 GiB to download, once a day, and
+  # ~0.9 GiB more of place search indexes it builds itself (~7 GiB at the
+  # peak while they build); the volume keeps the build served, the one
+  # served before it and one being fetched, ~37 GiB of files at most. A
+  # fetch starts only with its files' size, 7 GiB for the indexes and 2 GiB
+  # more free, so allow ~45 GiB.
   geocoder-portal:
     build:
       context: ..
@@ -28,6 +30,7 @@ services:
     #
     # environment:
     #   PORTAL_SYNC_SECONDS: "3600"  # between two sync rounds (a failed one: 600 at most)
+    #   PORTAL_SEARCH_JOBS: "4"      # place search indexes built at once (at most the CPUs)
     #   PORTAL_BASE_URL: ...         # another bucket than the published builds
     volumes:
       - geocoder-portal-data:/data

@@ -130,7 +130,8 @@ file open to write, so there it fails, saying so.
 
 The test portal is a map page for checking answers, served by every query
 server at `/test`, where it asks that server. Its compose file runs
-`query-portal`, a binary of the server crate, which serves every dataset of
+`query-portal`, a binary of the search crate whose sources are the server
+crate's, which serves every dataset of
 the latest published planet build: each selection of a mode, a boundary
 precision and a POI tier the manifest's constraints allow (28). Its page
 compares up to 4 of them side by side, each a preset or a pick by axis, and
@@ -165,6 +166,30 @@ combinations the constraints exclude with their messages; `/health` gives
 the build served and how its sync goes. The page asks `/datasets` anew
 once `/health` names another publication ID, and cancels a polygon
 request once a newer one or a clear supersedes it.
+Its `/search` takes `dataset=` too, `q=` (what to search for, 1 to 256
+bytes but the spaces at its ends, given to the search as it is), `limit=`
+(1 to 50, 20 without one), `key=` and `debug=1`. It answers what the node
+binding's `searchPlaces` answers from that selection's files, byte for byte:
+a JSON array of `{name, latitude, longitude, admin1name, admin2name, country,
+country_code, type}`, best first; with `debug=1` the line `place-search
+query` prints instead (the query, `us` the time it took, what it read, and
+each result with how it was found). It names the dataset and build as the
+lookups do, and the index it searched in `X-Geocoder-Search-Index`.
+Datasets whose dirs hold the files an index is made of alike share one, a
+group named by its first dataset (12 for the 28: `admin`, `full` and
+`no-addresses` of a precision and a POI tier share one); `/datasets` names
+each dataset's (`search.index`, and `search.shipped` where the build
+publishes it), and `/health`'s `search` tells each group's datasets, its
+state (`queued`, `building`, `ready` or `failed` with its `reason`) and
+`since` when, and once ready whether it was `built` or found built from its
+files (`current`), and for an index the build publishes how it compares
+with the published files (`shipped`: `same`, the files that `differ` and
+those `unpublished`). Until a dataset's index is ready its `/search` answers
+503 with JSON `{status: "building", dataset, index, since}` and
+`Retry-After: 5`, or `{status: "failed", dataset, index, since, reason}`.
+Searches run 4 at once beside the 8 lookups, so a few `/polygons` of
+exact boundaries can't hold one up, and count against the key's rate as
+`/reverse` does.
 The test key the page sends allows 200 requests a second and 5,000,000 a
 day (UTC), shared by every visitor. The page keeps 8 in flight and asks a
 429 of `/reverse` again after a pause, 8 tries in all, after which the 429
@@ -181,10 +206,22 @@ It fetches a new build into a dir of its own in the volume, each file
 checked against the build's manifest (~11.2 GiB a build, ~9 GiB to
 download): each dataset's dir holds hard links of the build's files, files
 the build holds twice byte for byte are fetched once and hard-linked, and
-no file is shared between the dirs of two builds. It fetches only with room
-free for the files still to fetch and 2 GiB besides, so a volume that holds
-the build served and the one before needs ~13 GiB more free to fetch a
-third, ~36 GiB in all. A sync killed part way resumes in its dir: it reads
+no file is shared between the dirs of two builds. Once the build loads, and
+before it switches to it, it builds the build's 12 place search indexes in
+the build's dir, as a device builds its own (`search/<group>/`, ~0.9 GiB
+once the files they hold alike are hard-linked, ~7 GiB at the peak while
+they build): 4 at once (`PORTAL_SEARCH_JOBS`, at most the CPUs it may run
+on), each on one thread at the lowest priority, the costliest first, ~156 s
+and ~10 CPU-minutes for the planet build. A group that fails doesn't hold
+the build back: it is switched to all the same, and the next round tries
+the group again. At start it serves the build at once and opens its
+indexes after, building those its dir lacks. An index is used again while
+its search_meta.json names the files beside it and the index format the
+image builds: an image of another index builder of the same format keeps
+the indexes the build holds until the next build. It fetches only with room
+free for the files still to fetch, 7 GiB for the indexes and 2 GiB besides,
+so a volume that holds the build served and the one before needs ~20 GiB
+more free to fetch a third, ~45 GiB in all. A sync killed part way resumes in its dir: it reads
 the files of the objects its ledger names against their sha256 and removes
 those that fail and the files the ledger doesn't name before it weighs the
 room. It switches to a build only once every file of it holds its
