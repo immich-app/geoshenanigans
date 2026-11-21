@@ -210,7 +210,8 @@ jobs:
       # Setup and the downloads like the tools, detached so it outlives this
       # step, after the stable toolchain it installs first (rust_toolchain.sh:
       # a fresh pod downloads it, ~15 s no step waits for). search.status is
-      # written once both are built.
+      # written once both are built; rust-toolchain.status, the install's
+      # alone, for Check the Rust toolchain.
       - name: Build place search
         env:
           RUNNER_TEMP: ${{ runner.temp }}
@@ -218,10 +219,10 @@ jobs:
           CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}
           export CARGO_HOME CARGO_INCREMENTAL=0 PATH="$CARGO_HOME/bin:$PATH"
           # The inner script expands its own arguments ($0 is the status file,
-          # $1 the toolchain's install, then the build).
+          # $1 the toolchain's install and $2 its status file, then the build).
           # shellcheck disable=SC2016
-          setsid nohup bash -c '"$1" && shift && "$@"; echo $? > "$0"' "$RUNNER_TEMP/search.status" \
-            geocoder/builder/tools/rust_toolchain.sh \
+          setsid nohup bash -c '"$1" "$2" && shift 2 && "$@"; echo $? > "$0"' "$RUNNER_TEMP/search.status" \
+            geocoder/builder/tools/rust_toolchain.sh "$RUNNER_TEMP/rust-toolchain.status" \
             cargo build --release --locked --manifest-path geocoder/search/Cargo.toml \
             > "$RUNNER_TEMP/search.log" 2>&1 < /dev/null &
 
@@ -597,6 +598,26 @@ jobs:
           fi
           wait $EXTRAS_PID
           echo "All downloads complete in $(($(date +%s) - STEP_START))s"
+
+      # A failed install of the Rust toolchain (Build place search), a
+      # release server down, is worth a retry: it fails the run here, early,
+      # in a step the watchdog retries. Left to itself it would leave no
+      # place-search, and fail the run at its end in Fail run on place
+      # search index failure, which the watchdog doesn't retry: a failed
+      # place-search build fails alike on every rerun.
+      - name: Check the Rust toolchain
+        env:
+          RUNNER_TEMP: ${{ runner.temp }}
+        run: |
+          for _ in $(seq 180); do
+            [ -s "$RUNNER_TEMP/rust-toolchain.status" ] && break
+            sleep 5
+          done
+          if [ "$(cat "$RUNNER_TEMP/rust-toolchain.status" 2> /dev/null)" != 0 ]; then
+            tail -40 "$RUNNER_TEMP/search.log"
+            echo "::error::Installing the Rust toolchain failed or did not end within 15 min"
+            exit 1
+          fi
 
       - name: Run builder tests
         env:

@@ -309,27 +309,108 @@ class FetchDayDiffTest(unittest.TestCase):
 
 
 class RustToolchainTest(unittest.TestCase):
-    # A fresh pod downloads the toolchain (~15 s): inside the detached build of place-search, not a step of its own.
+    """The stable toolchain installs inside the detached build of place-search (a fresh pod downloads it, ~15 s), and
+    says how that went in a status of its own: a failed install, a release server down, is worth a retry and fails
+    the run in a step the watchdog retries, where the place search index failure it leads to would not be retried."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root)
+        self.calls = os.path.join(self.root, "calls")
+
+    def fakes(self, rustup_status):
+        """A bin dir with a rustup that logs its calls and exits `rustup_status`, a cargo that logs its own, and a
+        sleep that doesn't (the install's retries wait 30 s)."""
+        bin_dir = os.path.join(self.root, "cargo", "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        for tool, body in {"rustup": f'echo "rustup $*" >> {self.calls}\nexit {rustup_status}\n',
+                           "cargo": f'echo "cargo $*" >> {self.calls}\n', "sleep": "exit 0\n"}.items():
+            with open(os.path.join(bin_dir, tool), "w") as f:
+                f.write("#!/bin/sh\n" + body)
+            os.chmod(os.path.join(bin_dir, tool), 0o755)
+        return bin_dir
+
+    def logged(self):
+        if not os.path.exists(self.calls):
+            return []
+        with open(self.calls) as f:
+            return f.read().splitlines()
+
+    def read(self, name):
+        with open(os.path.join(self.root, name)) as f:
+            return f.read().strip()
+
+    def test_the_toolchain_script_installs_a_minimal_stable_toolchain_and_writes_its_status(self):
+        bin_dir = self.fakes(0)
+        status = os.path.join(self.root, "rust-toolchain.status")
+        subprocess.run(["bash", os.path.join(HERE, "rust_toolchain.sh"), status], check=True, capture_output=True,
+                       env={"PATH": f"{bin_dir}:{os.environ['PATH']}"})
+        self.assertEqual(self.logged(), ["rustup toolchain install stable --profile minimal --no-self-update",
+                                         "rustup default stable"])
+        self.assertEqual(self.read("rust-toolchain.status"), "0")
+
+    def test_a_failed_install_is_retried_then_written_as_failed(self):
+        bin_dir = self.fakes(1)
+        status = os.path.join(self.root, "rust-toolchain.status")
+        done = subprocess.run(["bash", os.path.join(HERE, "rust_toolchain.sh"), status], capture_output=True, text=True,
+                              env={"PATH": f"{bin_dir}:{os.environ['PATH']}"})
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(len(self.logged()), 5)
+        self.assertEqual(self.read("rust-toolchain.status"), "1")
+
+    def build_place_search(self, rustup_status):
+        """Runs Build place search with the fakes; returns once both statuses are written."""
+        env = {"PATH": os.environ["PATH"], "CARGO_HOME": os.path.dirname(self.fakes(rustup_status)),
+               "RUNNER_TEMP": self.root, "HOME": self.root}
+        start = time.time()
+        subprocess.run(["bash", "-e", "-c", step_script("Build place search")], env=env, cwd=os.path.join(HERE, "..", "..", ".."),
+                       check=True, capture_output=True, timeout=60)
+        self.assertLess(time.time() - start, 10)
+        deadline = time.time() + 30
+        while time.time() < deadline and not all(os.path.exists(os.path.join(self.root, n)) and self.read(n)
+                                                 for n in ("rust-toolchain.status", "search.status")):
+            time.sleep(0.05)
+        return self.read("rust-toolchain.status"), self.read("search.status")
+
     def test_the_toolchain_installs_in_the_background_before_the_place_search_build(self):
         self.assertNotIn("dtolnay/rust-toolchain", nightly())
-        script = step_script("Build place search")
-        self.assertRegex(script, r"setsid nohup bash -c '\"\$1\" && shift && \"\$@\"; echo \$\? > \"\$0\"' "
-                                 r"\"\$RUNNER_TEMP/search\.status\" \\\n +geocoder/builder/tools/rust_toolchain\.sh \\\n"
-                                 r" +cargo build --release --locked --manifest-path geocoder/search/Cargo\.toml")
-        self.assertIn('PATH="$CARGO_HOME/bin:$PATH"', script)
 
-    def test_the_toolchain_script_installs_a_minimal_stable_toolchain(self):
-        root = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, root)
-        calls = os.path.join(root, "calls")
-        with open(os.path.join(root, "rustup"), "w") as f:
-            f.write(f'#!/bin/sh\necho "rustup $*" >> {calls}\n')
-        os.chmod(os.path.join(root, "rustup"), 0o755)
-        subprocess.run(["bash", os.path.join(HERE, "rust_toolchain.sh")], check=True, capture_output=True,
-                       env={"PATH": f"{root}:{os.environ['PATH']}"})
-        with open(calls) as f:
-            self.assertEqual(f.read().splitlines(), ["rustup toolchain install stable --profile minimal --no-self-update",
-                                                     "rustup default stable"])
+        statuses = self.build_place_search(0)
+
+        self.assertEqual(statuses, ("0", "0"))
+        self.assertEqual([c.split()[0] for c in self.logged()], ["rustup", "rustup", "cargo"])
+        self.assertEqual(self.logged()[-1], "cargo build --release --locked --manifest-path geocoder/search/Cargo.toml")
+
+    def test_a_failed_install_builds_nothing_and_says_so_in_both_statuses(self):
+        toolchain, search = self.build_place_search(1)
+
+        self.assertNotEqual(toolchain, "0")
+        self.assertNotEqual(search, "0")
+        self.assertNotIn("cargo", [c.split()[0] for c in self.logged()])
+
+    def check(self, status):
+        """Check the Rust toolchain with the toolchain's status `status` (None: never written)."""
+        if status is not None:
+            with open(os.path.join(self.root, "rust-toolchain.status"), "w") as f:
+                f.write(status + "\n")
+        with open(os.path.join(self.root, "search.log"), "w") as f:
+            f.write("error: could not download the toolchain\n")
+        env = {"PATH": f"{self.fakes(0)}:{os.environ['PATH']}", "RUNNER_TEMP": self.root}
+        return subprocess.run(["bash", "-e", "-c", step_script("Check the Rust toolchain")], env=env, capture_output=True,
+                              text=True, timeout=60)
+
+    def test_the_check_fails_the_run_on_a_failed_or_missing_install(self):
+        self.assertEqual(self.check("0").returncode, 0)
+        for status in ("1", None):
+            with self.subTest(status=status):
+                done = self.check(status)
+
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn("could not download the toolchain", done.stdout)
+
+    # Early, before the hours of the build: the toolchain is long installed once the downloads are done.
+    def test_the_check_follows_the_downloads(self):
+        self.assertEqual(index_of("Check the Rust toolchain"), index_of("Download PBF and previous indexes") + 1)
 
 
 class PostBuildTest(unittest.TestCase):
@@ -507,6 +588,7 @@ class WatchdogTest(unittest.TestCase):
             (passed[:2] + [("Compress index files", "cancelled")], False),
             (passed[:2] + [("Fail run on patch verify failure", "failure")], False),
             (passed[:2] + [("Fail run on place search index failure", "failure")], False),
+            (passed[:2] + [("Check the Rust toolchain", "failure")], True),
             ([], True),
         ]:
             with self.subTest(steps=steps):

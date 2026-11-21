@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Usage: rust_toolchain.sh
+# Usage: rust_toolchain.sh [<status file>]
 #
 # The stable Rust toolchain for the nightly's place-search build, installed as
 # dtolnay/rust-toolchain installs it (rustup first if the runner lacks it,
@@ -7,7 +7,14 @@
 # but inside the detached job that builds place-search: a fresh runner pod
 # spends ~15 s downloading it, which no step need wait for. Rustup goes in
 # $CARGO_HOME/bin (default ~/.cargo/bin), which the caller puts on PATH.
+# The exit status goes to <status file> too, written last: the nightly's
+# Check the Rust toolchain reads it.
 set -euo pipefail
+
+if [ $# -gt 0 ]; then
+  status_file=$1
+  trap 'echo $? > "$status_file"' EXIT
+fi
 
 if ! command -v rustup > /dev/null; then
   curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused --location --silent --show-error --fail \
