@@ -1636,6 +1636,43 @@ async fn a_first_round_that_cant_take_its_lock_leaves_the_start_to_the_next() {
     assert_eq!(build_dirs(data.path()), [format!("{DATE}-1")]);
 }
 
+// An interval longer than the clock can count past now leaves the sync
+// running: the time of the next round goes untold, and the sync waits.
+#[tokio::test]
+async fn an_interval_past_the_clocks_reach_leaves_the_sync_running() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let mut forever = config(&bucket, load);
+    forever.interval = Duration::MAX;
+    let p = portal(data.path(), forever);
+
+    let running = tokio::spawn(p.clone().run());
+    until("a round", || p.status().last_result.is_some()).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(!running.is_finished());
+    assert_eq!(p.status().last_result, Some(format!("ok: build {DATE} is served ({DATE}-1)")));
+    assert_eq!(p.status().next_round, None);
+}
+
+// A latest.override the round can't read fails the round, saying why: it
+// is not taken for none, with latest.json's build fetched instead.
+#[tokio::test]
+async fn a_latest_override_that_cant_be_read_fails_the_round() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let path = data.path().join(sync::LATEST_OVERRIDE);
+    std::fs::write(&path, b"\xff2026-01-02\n").unwrap();
+    let (_fixtures, load) = fixtures();
+
+    let failed = portal(data.path(), config(&bucket, load)).round(true).await.unwrap_err();
+
+    assert!(failed.starts_with(&format!("read {}: ", path.display())), "{failed}");
+    assert_eq!(bucket.requests().len(), 0);
+    assert!(!data.path().join(BUILDS).exists());
+}
+
 // A date in the data dir's LATEST_OVERRIDE stands for latest.json's, so
 // that a gate can have the portal fetch the builds it names.
 #[tokio::test]

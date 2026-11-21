@@ -474,7 +474,8 @@ impl Portal {
                 s.progress = None;
                 s.last_finished = Some(iso(SystemTime::now()));
                 s.last_result = Some(result);
-                s.next_round = Some(iso(SystemTime::now() + wait));
+                // None for a wait past what the clock can count.
+                s.next_round = SystemTime::now().checked_add(wait).map(iso);
             });
             tokio::time::sleep(wait).await;
         }
@@ -662,16 +663,22 @@ impl Portal {
     }
 
     /// The latest build: the date in LATEST_OVERRIDE, where the data dir
-    /// holds one, else the one latest.json names.
+    /// holds one, else the one latest.json names. An override that can't be
+    /// read fails the round: it is never taken for none.
     async fn latest(&self) -> Result<Latest, String> {
-        if let Ok(text) = std::fs::read_to_string(self.data.join(LATEST_OVERRIDE)) {
-            let date = text.trim();
-            if !date.is_empty() {
-                if !is_date(date) {
-                    return Err(format!("{LATEST_OVERRIDE} holds {date:?}, no date"));
+        let path = self.data.join(LATEST_OVERRIDE);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let date = text.trim();
+                if !date.is_empty() {
+                    if !is_date(date) {
+                        return Err(format!("{LATEST_OVERRIDE} holds {date:?}, no date"));
+                    }
+                    return Ok(Latest { date: date.to_string(), build_version: None, manifest_sha256: None });
                 }
-                return Ok(Latest { date: date.to_string(), build_version: None, manifest_sha256: None });
             }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("read {}: {e}", path.display())),
         }
         let url = format!("{}/builds/latest.json", self.config.base_url.trim_end_matches('/'));
         let bytes = self.fetch_bytes(&url).await?;
