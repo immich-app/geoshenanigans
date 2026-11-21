@@ -142,6 +142,9 @@ pub struct Status {
     /// Why the files of the build served are not those of its manifest: the
     /// sync fetches it again into a new dir.
     pub damaged: Option<String>,
+    /// The builds the volume held at start that can't be served, each with
+    /// why ("<dir> here can't be served: <why>"); none once one is served.
+    pub not_served: Vec<String>,
 }
 
 #[derive(Serialize, Clone, Default, Debug)]
@@ -210,6 +213,9 @@ impl Portal {
     pub fn unavailable(&self) -> String {
         let status = self.status();
         let mut why = format!("no build to serve: waiting for a build of version {BUILD_VERSION}");
+        for skipped in &status.not_served {
+            why.push_str(&format!("; build {skipped}"));
+        }
         if let Some(running) = &status.running {
             why.push_str(&format!("; the sync is {running}"));
         }

@@ -362,6 +362,7 @@ impl Portal {
                 Err(why) => {
                     eprintln!("portal start: build {name} can't be served: {why}");
                     self.set_unusable(&name);
+                    self.set_status(|s| s.not_served.push(format!("{name} here can't be served: {why}")));
                 }
             }
         }
@@ -432,6 +433,7 @@ impl Portal {
         self.set_status(|s| {
             s.served = Some(dir);
             s.damaged = None;
+            s.not_served.clear();
         });
         before
     }

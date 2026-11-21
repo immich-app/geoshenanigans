@@ -342,7 +342,7 @@ impl Plan {
             })
             .collect();
         Err(format!(
-            "unknown dataset \"{wanted}\": this build offers the presets {} and <mode>.<quality>.<poi_tier> of {}, but the combinations /datasets lists as excluded",
+            "unknown dataset \"{wanted}\": this build offers the presets {} and <mode>.<quality>.<poi_tier> of {}, except the combinations /datasets lists as excluded",
             presets.join(", "), axes.join("; ")
         ))
     }

@@ -489,6 +489,32 @@ async fn a_start_without_a_usable_build_answers_503_with_the_reason_and_keeps_sy
     assert_eq!(fetch(&format!("{url}/reverse?lat=10.5&lon=20.5&key=test")).await.status, 200);
 }
 
+// A portal started on a volume whose only build it can't serve says which
+// build it skipped and why in the reason it answers 503 with.
+#[tokio::test]
+async fn a_start_on_a_build_it_cant_serve_says_why_in_its_503() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let made = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    portal(made.path(), config(&bucket, load.clone())).round(true).await.unwrap();
+    let data = ScratchDir::new();
+    let older = BUILD_VERSION - 1;
+    copy_build(&made.path().join(BUILDS).join(format!("{DATE}-1")), &data.path().join(BUILDS).join(format!("{DATE}-1")), DATE, older);
+    bucket.add_build(NEXT, BUILD_VERSION + 1);
+    bucket.set_latest(NEXT, Some(BUILD_VERSION + 1));
+    let p = portal(data.path(), config(&bucket, load));
+    tokio::spawn(p.clone().run());
+    let url = serve(router(p.clone(), db())).await;
+    until("a round", || p.status().last_result.is_some()).await;
+
+    let health = fetch(&format!("{url}/health")).await;
+    assert_eq!(health.status, 503);
+    let reason = health.json()["reason"].as_str().unwrap().to_string();
+    let skipped = format!("build {DATE}-1 here can't be served: it is of build version {older}; this server reads build version {BUILD_VERSION}");
+    assert!(reason.contains(&skipped), "{reason}");
+    assert!(fetch(&format!("{url}/datasets")).await.body.contains(&skipped));
+}
+
 // A sync killed part way leaves its dir incomplete, its ledger naming the
 // objects in place; the next, of a server started afresh, resumes in that
 // dir and fetches only the others.
