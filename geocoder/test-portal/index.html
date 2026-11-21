@@ -887,6 +887,15 @@ function pickerHtml(catalog, col, index, count) {
   return `${html}</div>`;
 }
 
+// The key of the control of the pickers whose element's data-* attributes
+// are `data` (its dataset): its column, and its role, axis or action, which
+// name it again once the pickers are drawn anew; none for an element of
+// none.
+function controlKey(data) {
+  if (data.col === undefined && data.action === undefined) return null;
+  return [data.col, data.role, data.axis, data.action].map((v) => v ?? '').join('\u0000');
+}
+
 // The detail of a result, from `views`: one a column ({label, color,
 // dataset, answer}), and Nominatim's. Per answer its name, dataset, build
 // and time, flagged where a build other than the one `served` answered
@@ -1232,16 +1241,20 @@ function columnViews(entry) {
 }
 
 let catalogRetry = null;
+// The loads of /datasets begun (the retry timer's and the health poll's
+// may overlap): one that a later one began after changes nothing.
+let catalogLoads = 0;
 
 // Asks /datasets how the page answers, and lays out its columns: as they
 // were named (the link's or the pickers'), else OPENING_PRESETS. While the
-// portal waits for a build, it asks again every 30 s. Where that moves the
-// polygon overlay (another dataset at its column, another build, or no
+// portal waits for a build, it asks again every 30 s; once the build is in,
+// the points looked up meanwhile are asked in the columns. Where that moves
+// the polygon overlay (another dataset at its column, another build, or no
 // column), what it drew goes, and the selected result's polygons are asked
 // anew where its column still has a dataset.
 async function loadCatalog() {
+  const load = ++catalogLoads;
   clearTimeout(catalogRetry);
-  const shown = overlayTarget(polygonsColumn, columns, servedBuild());
   let status = 0;
   let json = null;
   let body = '';
@@ -1253,6 +1266,9 @@ async function loadCatalog() {
   } catch (e) {
     if (!status) body = e.message;
   }
+  if (load !== catalogLoads) return;
+  const shown = overlayTarget(polygonsColumn, columns, servedBuild());
+  const waited = mode === 'waiting';
   mode = catalogMode(status, json);
   if (mode === 'catalog') {
     catalog = json;
@@ -1276,6 +1292,9 @@ async function loadCatalog() {
     askColumns(entry);
     showDetail(entry.id);
   }
+  // A point looked up while the portal waited was asked of the server as it
+  // was (the key '').
+  if (waited && mode === 'catalog') results.filter((r) => '' in r.answers).forEach((r) => askColumns(r));
   if (overlayMoved(shown, overlayTarget(polygonsColumn, columns, servedBuild()))) {
     clearPolygonLayer();
     if (polygonsColumn !== 'off' && entry) updatePolygonLayer(entry.id);
@@ -1292,7 +1311,12 @@ function renderColumns() {
   }
   let html = columns.map((col, i) => pickerHtml(catalog, col, i, columns.length)).join('');
   if (columns.length < MAX_COLUMNS) html += '<button class="add-column" data-action="add" title="Compare another dataset">+ Column</button>';
+  // The control that had the focus (a select arrowed through from the
+  // keyboard changes on each step) gets it back once drawn anew.
+  const focused = el.contains(document.activeElement) ? controlKey(document.activeElement.dataset) : null;
   el.innerHTML = html;
+  const again = focused === null ? null : [...el.querySelectorAll('select, button')].find((c) => controlKey(c.dataset) === focused);
+  if (again) again.focus();
 }
 
 function renderBanner() {
@@ -1310,9 +1334,14 @@ function dismissMismatch() {
   renderBanner();
 }
 
-// A column picked anew: the link, the polygon button, the markers (coloured
-// by the first column), the cards, and the selected result's answers.
-function columnsChanged() {
+// A column picked anew, added or removed by `change`: the link, the polygon
+// button, the markers (coloured by the first column), the cards, and the
+// selected result's answers. Where that moves the polygon overlay (another
+// dataset at its column, or no column), what it drew goes at once, and the
+// selected result's polygons are asked anew where its column has a dataset.
+function changeColumns(change) {
+  const shown = overlayTarget(polygonsColumn, columns, servedBuild());
+  change();
   wanted = columns.map((c) => c.token);
   renderColumns();
   updatePolygonsBtn();
@@ -1322,15 +1351,17 @@ function columnsChanged() {
   if (entry) {
     askColumns(entry);
     showDetail(entry.id);
-    if (polygonsColumn !== 'off') updatePolygonLayer(entry.id);
+  }
+  if (overlayMoved(shown, overlayTarget(polygonsColumn, columns, servedBuild()))) {
+    clearPolygonLayer();
+    if (polygonsColumn !== 'off' && entry) updatePolygonLayer(entry.id);
   }
   renderResults();
   saveResults();
 }
 
 function setColumn(i, col) {
-  columns[i] = col;
-  columnsChanged();
+  changeColumns(() => { columns[i] = col; });
 }
 
 const columnsEl = document.getElementById('columns');
@@ -1356,19 +1387,15 @@ columnsEl.addEventListener('click', (e) => {
   const el = e.target.closest('[data-action]');
   if (!el || mode !== 'catalog') return;
   if (el.dataset.action === 'add' && columns.length < MAX_COLUMNS) {
-    columns.push(resolveColumn(catalog, addedToken(catalog, columns)));
-    columnsChanged();
+    changeColumns(() => columns.push(resolveColumn(catalog, addedToken(catalog, columns))));
   } else if (el.dataset.action === 'remove' && columns.length > 1) {
     const i = Number(el.dataset.col);
-    columns.splice(i, 1);
-    if (polygonsColumn === i) {
-      polygonsColumn = 'off';
-      clearPolygonLayer();
-    } else if (polygonsColumn !== 'off' && polygonsColumn > i) {
-      polygonsColumn--;
-    }
-    localStorage.setItem('polygons_column', String(polygonsColumn));
-    columnsChanged();
+    changeColumns(() => {
+      columns.splice(i, 1);
+      if (polygonsColumn === i) polygonsColumn = 'off';
+      else if (polygonsColumn !== 'off' && polygonsColumn > i) polygonsColumn--;
+      localStorage.setItem('polygons_column', String(polygonsColumn));
+    });
   }
 });
 

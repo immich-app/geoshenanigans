@@ -300,6 +300,26 @@ test('the picker offers the presets with their sizes, and the axes of a custom p
   assert.ok(custom.includes(`Exact: ${MESSAGE}`), custom);
 });
 
+// The pickers are drawn anew on each change: the control that had the focus
+// gets it back by its key (of the data-* attributes of its element), which
+// each control of the pickers has of its own.
+test('each control of the pickers has a key of its own, which finds it once they are drawn anew', () => {
+  const { pickerHtml, resolveColumn, controlKey } = core();
+  const c = catalog();
+  const columns = [resolveColumn(c, 'smallest'), resolveColumn(c, 'admin.exact.major')];
+  const controls = (html) => [...html.matchAll(/<(?:select|button)\b([^>]*)>/g)]
+    .map((m) => Object.fromEntries([...m[1].matchAll(/data-(\w+)="([^"]*)"/g)].map((a) => [a[1], a[2]])));
+  const keys = (cols) => controls(cols.map((col, i) => pickerHtml(c, col, i, cols.length)).join('')).map((data) => controlKey(data));
+  const drawn = keys(columns);
+  assert.equal(drawn.length, 7, 'a preset and a remove button each, and three axes of the custom pick');
+  assert.ok(drawn.every((key) => key !== null));
+  assert.equal(new Set(drawn).size, drawn.length);
+  // The second column's mode moved to admin-minimal: its controls keep their keys.
+  const moved = keys([columns[0], resolveColumn(c, 'admin-minimal.simplified.major')]);
+  assert.deepEqual(moved, drawn);
+  assert.equal(controlKey({}), null);
+});
+
 // A column of a link's dataset the build doesn't offer is labelled by the
 // link's token, as the page labels it (columnLabel).
 test('every string and id of the manifest, and a link\'s dataset, is escaped where the page shows it', () => {
@@ -818,11 +838,12 @@ test('polygons are drawn only while no clear came after their request and its re
   assert.deepEqual(drawn, ['erased', 5]);
 });
 
-// A reload of /datasets may give the overlay's column another dataset, the
-// columns another build, or leave the overlay no column: what it showed is
-// then of none of them, and goes. A point selected while the portal waited
-// for its build was asked of the one column of the server as it was.
-test('a reload of the datasets moves the polygon overlay where its dataset or build is another, or it is off', () => {
+// A reload of /datasets or a picker may give the overlay's column another
+// dataset, the columns another build, or leave the overlay no column: what
+// it showed is then of none of them, and goes. A point selected while the
+// portal waited for its build was asked of the one column of the server as
+// it was.
+test('a reload of the datasets or a picker moves the polygon overlay where its dataset or build is another, or it is off', () => {
   const { overlayTarget, overlayMoved, resolveColumn } = core();
   const c = catalog();
   const columns = (tokens) => tokens.map((token) => resolveColumn(c, token));
@@ -839,6 +860,13 @@ test('a reload of the datasets moves the polygon overlay where its dataset or bu
   const waiting = overlayTarget(0, [{ single: true }], null);
   assert.deepEqual(plain(waiting), { key: '', build: null });
   assert.equal(overlayMoved(waiting, shown), true);
+  // The picker of the overlay's column moves it to another dataset; that of
+  // another column, or a column removed before it (its place shifts, its
+  // dataset stays), leaves it where it was.
+  assert.equal(overlayMoved(shown, overlayTarget(0, columns(['max-quality', 'smallest']), '2026-11-20-1')), true);
+  assert.equal(overlayMoved(shown, overlayTarget(0, columns(['with-addresses', 'max-quality']), '2026-11-20-1')), false);
+  assert.equal(overlayMoved(overlayTarget(1, columns(['smallest', 'with-addresses']), '2026-11-20-1'),
+    overlayTarget(0, columns(['with-addresses']), '2026-11-20-1')), false);
 });
 
 test('a polygon request is cancelled once another show or a clear comes after it', { timeout: 5000 }, async () => {
