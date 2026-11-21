@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "captured_stderr.h"
 #include "pbf_test_objects.h"
 #include "scratch_dir.h"
 #include "test_framework.h"
@@ -533,10 +534,12 @@ TEST(apply_drops_the_input_while_it_writes_and_changes_no_byte_of_the_output) {
     };
     opt.verbose = true;
     opt.input_drop_log_bytes = 2 * MiB;
-    std::ostringstream logged;
-    std::streambuf* cerr = std::cerr.rdbuf(logged.rdbuf());
-    apply_changes(opt);
-    std::cerr.rdbuf(cerr);
+    std::string logged;
+    {
+        gctest::CapturedStderr captured;
+        apply_changes(opt);
+        logged = captured.str();
+    }
     close(fd);
 
     CHECK(file_bytes(opt.output) == file_bytes(dir.path() + "/reference.osm.pbf"));
@@ -556,7 +559,7 @@ TEST(apply_drops_the_input_while_it_writes_and_changes_no_byte_of_the_output) {
     // A line each 2 MiB more of the input dropped, at a drop's end, with the
     // output written then, which is past it: this input and its output
     // differ by a blob or two.
-    std::istringstream lines(logged.str());
+    std::istringstream lines(logged);
     std::set<uint64_t> ends;
     for (size_t i = 0; i + 1 < drops.size(); i++) ends.insert((drops[i].first + drops[i].second) >> 20);
     uint64_t previous = 0;
