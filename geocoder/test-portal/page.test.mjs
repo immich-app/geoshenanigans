@@ -1,10 +1,11 @@
 // The test page's logic: index.html's <script id="core">, which reads no DOM
 // (the link, the columns and their datasets, the pacing of requests, the
-// comparison of answers and the HTML of each part), run in a context of its
-// own as the page runs it. The page's other scripts, which wire it to the DOM
-// and the map, are checked to parse, and its style for the layout of the side
-// panel. /datasets is that of a build of the template, as the portal lists
-// it (server/src/portal/catalog.rs).
+// comparison of answers, the place search and its matrix, and the HTML of
+// each part), run in a context of its own as the page runs it. The page's
+// other scripts, which wire it to the DOM and the map, are checked to parse,
+// and its style for the layout of the side panel. /datasets is that of a
+// build of the template, as the portal lists it
+// (server/src/portal/catalog.rs).
 //
 //   node --test geocoder/test-portal/page.test.mjs
 import assert from 'node:assert/strict';
@@ -190,13 +191,14 @@ test('the link names a dataset per column, the points and the build', () => {
     datasets: ['with-addresses', 'admin.simplified.major'],
     points: [{ lat: 48.8584, lng: 2.2945 }, { lat: -33.85, lng: 151.2 }],
     build: '2026-11-19',
+    q: '',
   });
   assert.equal(
     linkSearch({ datasets: ['with-addresses', 'europe/full.simplified.all'], point: { lat: 48.8584, lng: 2.2945 }, build: '2026-11-20' }),
     '?d=with-addresses&d=europe/full.simplified.all&at=48.8584,2.2945&b=2026-11-20',
   );
   assert.deepEqual(plain(parseLink(linkSearch({ datasets: ['smallest'], point: { lat: 1.000000123, lng: -2.5 }, build: null }))),
-    { datasets: ['smallest'], points: [{ lat: 1.000000123, lng: -2.5 }], build: null });
+    { datasets: ['smallest'], points: [{ lat: 1.000000123, lng: -2.5 }], build: null, q: '' });
   assert.equal(linkSearch({ datasets: [], point: null, build: null }), '');
   assert.equal(parseLink(`?d=smallest&b=${AGAIN}`).build, AGAIN);
   assert.equal(linkSearch({ datasets: ['smallest'], point: null, build: AGAIN }), `?d=smallest&b=${AGAIN}`);
@@ -207,6 +209,26 @@ test('a link keeps 4 columns and the points on the globe', () => {
   const link = parseLink('?d=a&d=b&d=c&d=d&d=e&d=&at=91,0&at=0,181&at=x,1&at=1&at=,&at=0,0');
   assert.deepEqual(plain(link.datasets), ['a', 'b', 'c', 'd']);
   assert.deepEqual(plain(link.points), [{ lat: 0, lng: 0 }]);
+});
+
+// q= is the search box's text as it was typed: its spaces, commas and
+// marks come back as they went, whatever URLSearchParams makes of a + or a #
+// left bare.
+test('the link carries the search box\'s text, which comes back as it went', () => {
+  const { parseLink, linkSearch } = core();
+  for (const q of ['paris, texas', 'a&b=c', 'rue #5', 'x+y', '50% off', 'Zürich', '東京タワー', '  spaced  ', 'd=smallest&at=0,0']) {
+    const search = linkSearch({ datasets: ['with-addresses'], point: { lat: 1, lng: 2 }, build: ID, q });
+    assert.ok(search.startsWith(`?d=with-addresses&at=1,2&b=${ID}&q=`), search);
+    assert.equal((search.match(/&/g) || []).length, 3, `the text is one parameter: ${search}`);
+    const link = parseLink(search);
+    assert.equal(link.q, q);
+    assert.deepEqual(plain(link.datasets), ['with-addresses']);
+    assert.deepEqual(plain(link.points), [{ lat: 1, lng: 2 }]);
+  }
+  assert.equal(linkSearch({ datasets: [], point: null, build: null, q: 'eiffel' }), '?q=eiffel');
+  assert.equal(linkSearch({ datasets: ['smallest'], point: null, build: null, q: '' }), '?d=smallest');
+  assert.equal(parseLink('?q=paris+texas').q, 'paris texas');
+  assert.equal(parseLink('?d=smallest').q, '');
 });
 
 test('a bare link opens with with-addresses and smallest', () => {
@@ -986,18 +1008,503 @@ test('the JSON of an answer is shown highlighted and escaped', () => {
   assert.ok(out.includes('<span class="json-number">1</span>'));
 });
 
-// The side panel stacks the datasets, the coordinates, the photo upload, the
-// results and, once one is selected, its detail. Four columns of datasets
-// and the detail of a result fill a window of 1000 px without the results,
-// whose toolbar and cards would go: they keep a height of their own, the
-// datasets and the detail scroll within what is left, down to a least
-// height of theirs, and a window too short for those scrolls the panel
-// rather than cutting off its foot. The results' section hides what
-// overflows it: its list of cards scrolls.
-test('the results keep room for their toolbar and cards however tall the datasets and the detail grow', () => {
+// -- Place search --
+
+// A result of /search?debug=1: the binding's fields, then how it was found.
+// A place of Paris unless `extra` says otherwise.
+function hit(name, latitude, longitude, extra = {}) {
+  return {
+    admin1name: 'Île-de-France', admin2name: 'Paris', country: 'France', country_code: 'FR', latitude, longitude, name, type: 'city',
+    class: 0, context: false, entity: 1, kind: 'P', score: 0.5, text: 1, ...extra,
+  };
+}
+
+// A /search?debug=1 body of `results`.
+const debugBody = (results, us = 1104.5) => JSON.stringify({ context_checks: 1, keys: 2, postings: 3, q: 'paris', results, reverse_lookups: 4, us });
+
+// Each column's view of the search: its label, colour, dataset and answer.
+function searchView(label, color, answer, dataset = null, error = null) {
+  return { label, color, dataset, error, answer };
+}
+
+// The rows of a matrix's HTML: each one's classes, its rank cells (class
+// and text) and the rest.
+function matrixRows(out) {
+  return [...out.matchAll(/<tr class="([^"]*)" data-row="(\d+)">([\s\S]*?)<\/tr>/g)].map((m) => ({
+    classes: m[1], n: Number(m[2]),
+    ranks: [...m[3].matchAll(/<td class="(rank[^"]*)"[^>]*>([^<]*)<\/td>/g)].map((r) => [r[1], r[2]]),
+    rest: m[3],
+  }));
+}
+
+// Timers that fire only when the test moves the clock: set and clear as
+// setTimeout and clearTimeout, advance(ms) firing those due by then in
+// order, and the ms each one pending is still to wait.
+function handTimers() {
+  const timers = {
+    t: 0,
+    ids: 0,
+    due: new Map(),
+    set: (fn, ms) => {
+      timers.due.set(++timers.ids, { fn, at: timers.t + ms });
+      return timers.ids;
+    },
+    clear: (id) => { timers.due.delete(id); },
+    advance(ms) {
+      const end = timers.t + ms;
+      for (;;) {
+        const next = [...timers.due].filter(([, d]) => d.at <= end).sort((a, b) => a[1].at - b[1].at || a[0] - b[0])[0];
+        if (!next) break;
+        timers.due.delete(next[0]);
+        timers.t = next[1].at;
+        next[1].fn();
+      }
+      timers.t = end;
+    },
+    pending: () => [...timers.due.values()].map((d) => d.at - timers.t),
+  };
+  return timers;
+}
+
+// A PlaceSearch of the page's on `timers`, of the datasets `datasets()`,
+// whose requests the test answers: each in `sent` once it goes, with its URL,
+// q and dataset, its signal and answer(status, body, headers).
+function handSearch(PlaceSearch, timers, datasets) {
+  const sent = [];
+  let changes = 0;
+  const search = new PlaceSearch({
+    setTimer: timers.set,
+    clearTimer: timers.clear,
+    datasets,
+    changed: () => { changes++; },
+    request: (url, signal) => new Promise((resolve, reject) => {
+      const params = new URL(url, 'http://portal').searchParams;
+      sent.push({
+        url, q: params.get('q'), dataset: params.get('dataset'), signal,
+        answer: (status, body, headers = {}) => resolve({ status, header: (name) => headers[name.toLowerCase()] ?? null, body, ms: 7.5 }),
+      });
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    }),
+  });
+  return { search, sent, changes: () => changes };
+}
+
+test('the search is offered where /datasets names each dataset\'s index', () => {
+  const { searchOffered } = core();
+  const searching = catalog();
+  for (const d of searching.datasets) d.search = { index: d.id, shipped: false };
+  assert.equal(searchOffered('catalog', searching), true);
+  assert.equal(searchOffered('catalog', catalog()), false, 'a portal without /search');
+  assert.equal(searchOffered('single', null), false, 'a production server');
+  assert.equal(searchOffered('waiting', null), false);
+});
+
+test('a search asks /search for 10 results of a dataset, with how each was found', () => {
+  const { searchUrl } = core();
+  const url = searchUrl('paris, texas & #5', 'full.simplified.all');
+  assert.equal(url, '/search?q=paris%2C%20texas%20%26%20%235&dataset=full.simplified.all&limit=10&key=test&debug=1');
+  assert.equal(new URL(url, 'http://portal').searchParams.get('q'), 'paris, texas & #5');
+  assert.equal(searchUrl('x', 'a"b'), '/search?q=x&dataset=a%22b&limit=10&key=test&debug=1');
+});
+
+test('a search answer keeps its results and timings, or the state of the index, or why it has none', () => {
+  const { searchAnswerOf } = core();
+  const headers = { 'x-geocoder-build-id': ID, 'x-geocoder-dataset': 'full.simplified.all', 'x-geocoder-search-index': 'full.simplified.all', 'retry-after': '5' };
+  const header = (name) => headers[name.toLowerCase()] ?? null;
+  const paris = hit('Paris', 48.8566, 2.3522);
+  assert.deepEqual(plain(searchAnswerOf(200, header, debugBody([paris]), 12.4)),
+    { results: [paris], us: 1104.5, index: 'full.simplified.all', build: ID, dataset: 'full.simplified.all', ms: 12.4 });
+  const building = searchAnswerOf(503, header, '{"dataset":"smallest","index":"admin-minimal.simplified.none","since":"2026-11-21T18:57:07Z","status":"building"}', 1);
+  assert.deepEqual(plain(building), { building: { index: 'admin-minimal.simplified.none', since: '2026-11-21T18:57:07Z' }, retry: 5, dataset: 'smallest', ms: 1 });
+  assert.equal(searchAnswerOf(503, () => null, '{"dataset":"x","index":"x","since":"t","status":"building"}', 1).retry, 5, 'Retry-After or 5 s');
+  const failed = searchAnswerOf(503, () => null, '{"dataset":"x","index":"full.exact.all","reason":"dataset x: no room","since":"2026-11-21T19:00:00Z","status":"failed"}', 1);
+  assert.deepEqual(plain(failed), { failed: { index: 'full.exact.all', since: '2026-11-21T19:00:00Z', reason: 'dataset x: no room' }, dataset: 'x', ms: 1 });
+  assert.equal(searchAnswerOf(503, () => null, 'no build to serve: waiting for a build of version 24', 1).error,
+    'HTTP 503: no build to serve: waiting for a build of version 24');
+  assert.equal(searchAnswerOf(400, () => null, 'q must be at most 256 bytes', 1).error, 'HTTP 400: q must be at most 256 bytes');
+  assert.equal(searchAnswerOf(429, () => null, 'Rate limit exceeded', 1).error, 'HTTP 429: Rate limit exceeded');
+  assert.equal(searchAnswerOf(200, () => null, 'not json', 1).error, 'not a search answer: not json');
+  assert.equal(searchAnswerOf(200, () => null, '[]', 1).error, 'not a search answer: []');
+});
+
+// One degree of latitude is 111,195 m: 0.004 degrees 445 m, 0.01 degrees
+// 1,112 m.
+test('results of the columns are one row where their names are equal and their points within a kilometre', () => {
+  const { searchRows } = core();
+  const paris = hit('Paris', 48.8566, 2.3522);
+  const texas = hit('Paris', 33.6609, -95.5555, { admin1name: 'Texas', admin2name: 'Lamar County', country: 'United States', country_code: 'US' });
+  const rows = searchRows([
+    [paris, texas],
+    [texas, hit('Paris', 48.8606, 2.3522), hit('Parys', 48.8566, 2.3522)],
+    [hit('Paris', 48.8666, 2.3522)],
+    null,
+  ]);
+  const shape = (row) => [row.name, row.lat, row.lng, row.cells.map((c) => (c ? c.rank : null)), row.best, row.missing, row.ranksDiffer, Math.round(row.moved)];
+  assert.deepEqual(plain(rows.map(shape)), [
+    ['Paris', 48.8566, 2.3522, [1, 2, null, null], 1, true, true, 445],
+    ['Paris', 33.6609, -95.5555, [2, 1, null, null], 1, true, true, 0],
+    ['Paris', 48.8666, 2.3522, [null, null, 1, null], 1, true, false, 0],
+    ['Parys', 48.8566, 2.3522, [null, 3, null, null], 3, true, false, 0],
+  ]);
+  assert.equal(Math.round(rows[0].cells[1].metres), 445);
+  // A column with no answer (null) lacks nothing.
+  const one = searchRows([[paris], null, [paris]]);
+  assert.deepEqual(plain(one.map(shape)), [['Paris', 48.8566, 2.3522, [1, null, 1], 1, false, false, 0]]);
+  assert.deepEqual(plain(searchRows([null, null])), []);
+  assert.deepEqual(plain(searchRows([[], []])), []);
+});
+
+// A chain's shops of one name, 334 m apart: each pairs with the nearest
+// of the other column's, whatever their ranks, and a column's own two
+// results never share a row.
+test('results of one name near each other pair with the nearest, each once', () => {
+  const { searchRows } = core();
+  const shop = (lat) => hit('Starbucks', lat, -73.99, { kind: 'O', type: 'cafe' });
+  const rows = searchRows([[shop(40.75), shop(40.753)], [shop(40.7531), shop(40.75)]]);
+  assert.deepEqual(plain(rows.map((r) => [r.lat, r.cells.map((c) => c.rank), Math.round(r.moved)])), [[40.75, [1, 2], 0], [40.753, [2, 1], 11]]);
+  const twice = searchRows([[shop(40.75), shop(40.75)], [shop(40.75)]]);
+  assert.deepEqual(plain(twice.map((r) => r.cells.map((c) => (c ? c.rank : null)))), [[1, 1], [2, null]]);
+});
+
+// A boundary without a label node is put at a point on its ring's surface,
+// which moves with the boundary's precision: it matches within 20 km.
+test('a boundary without a label matches within 20 km, a place only within 1 km', () => {
+  const { searchRows } = core();
+  const area = (lat) => hit('Bayern', lat, 11.4, { kind: 'A', type: 'administrative' });
+  const rows = searchRows([[area(48.9)], [area(49.0)]]);
+  assert.equal(rows.length, 1);
+  assert.equal(Math.round(rows[0].moved), 11120);
+  assert.equal(searchRows([[area(48.9)], [area(49.07)]]).length, 1);
+  assert.equal(searchRows([[area(48.9)], [area(49.1)]]).length, 2);
+  assert.equal(searchRows([[area(48.9)], [area(49.2)]]).length, 2);
+  const place = (lat) => hit('Bayern', lat, 11.4);
+  assert.equal(searchRows([[place(48.9)], [place(49.0)]]).length, 2);
+  // A boundary labelled in one dataset and not in another.
+  assert.equal(searchRows([[place(48.9)], [area(49.0)]]).length, 1);
+});
+
+test('a row tells the context its columns give, and the parts they disagree on', () => {
+  const { searchRows } = core();
+  const [row] = searchRows([
+    [hit('Paris', 48.8566, 2.3522)],
+    [hit('Paris', 48.8566, 2.3522, { admin1name: 'Ile-de-France', type: 'town' })],
+    null,
+    [hit('Paris', 48.8566, 2.3522, { admin2name: '' })],
+  ]);
+  assert.deepEqual(plain(row.context), [
+    { part: 'admin2name', value: 'Paris', values: ['Paris', 'Paris', null, ''], differs: true },
+    { part: 'admin1name', value: 'Île-de-France', values: ['Île-de-France', 'Ile-de-France', null, 'Île-de-France'], differs: true },
+    { part: 'country', value: 'France', values: ['France', 'France', null, 'France'], differs: false },
+  ]);
+  assert.equal(row.typeDiffers, true);
+  const [same] = searchRows([[hit('Paris', 48.8566, 2.3522)], [hit('Paris', 48.8566, 2.3522)]]);
+  assert.ok(same.context.every((p) => !p.differs));
+  assert.equal(same.typeDiffers, false);
+});
+
+// Rows go by their best rank in any column; of rows of one best rank,
+// those of the columns before first, each column's in its order.
+test('the rows go by their best rank', () => {
+  const { searchRows } = core();
+  const at = (name, lat) => hit(name, lat, 0);
+  const [a, b, c, d] = [at('A', 1), at('B', 2), at('C', 3), at('D', 4)];
+  const rows = searchRows([[a, b, c], [d, a, b]]);
+  assert.deepEqual(plain(rows.map((r) => [r.name, r.best, r.cells.map((x) => (x ? x.rank : null))])),
+    [['A', 1, [1, 2]], ['D', 1, [null, 1]], ['B', 2, [2, 3]], ['C', 3, [3, null]]]);
+});
+
+test('the matrix gives each row its rank in each column, marking what a column lacks, what moved and the context they disagree on', () => {
+  const { searchRows, searchMatrixHtml } = core();
+  const paris = hit('Paris', 48.8566, 2.3522, { score: 0.21, text: 1, context: true });
+  const texas = hit('Paris', 33.6609, -95.5555, { admin1name: 'Texas', admin2name: 'Lamar County', country: 'United States', type: 'town' });
+  const lists = [[paris, texas], [texas, hit('Paris', 48.8606, 2.3522, { admin1name: 'Ile-de-France' })], null];
+  const views = [
+    searchView('With addresses', '#6c8cff', { results: lists[0] }),
+    searchView('Smallest', '#d9944a', { results: lists[1] }),
+    searchView('Max quality', '#c77dff', { building: { since: '2026-11-21T18:57:07Z', index: 'full.exact.all' } }),
+  ];
+  const out = searchMatrixHtml(searchRows(lists), views, false);
+  assert.ok(out.includes('<th class="rank" style="color:#6c8cff" title="With addresses">1</th>'), out);
+  assert.ok(out.includes('<th class="rank" style="color:#c77dff" title="Max quality">3</th>'), out);
+  const rows = matrixRows(out);
+  assert.deepEqual(plain(rows.map((r) => [r.n, r.classes, r.ranks])), [
+    [0, 'search-hit', [['rank', '1'], ['rank shifted', '2'], ['rank unanswered', '·']]],
+    [1, 'search-hit', [['rank shifted', '2'], ['rank', '1'], ['rank unanswered', '·']]],
+  ]);
+  assert.match(rows[0].rest, /<td class="rank" style="color:#6c8cff" title="With addresses: #1 · score 0\.210 · text 1\.000 · its context matched">1<\/td>/);
+  assert.ok(rows[0].rest.includes('<span class="tag" title="The farthest of its points from the first column\'s">moved 445 m</span>'), rows[0].rest);
+  assert.ok(!rows[1].rest.includes('moved'), rows[1].rest);
+  assert.ok(rows[0].rest.includes('<span class="differs" title="With addresses: Île-de-France · Smallest: Ile-de-France">Île-de-France</span>'), rows[0].rest);
+  assert.ok(rows[0].rest.includes('<div class="hit-context">Paris · <span class="differs"'), rows[0].rest);
+  assert.ok(rows[0].rest.includes('· France</div>'), rows[0].rest);
+  assert.ok(rows[1].rest.includes('<div class="hit-context">Lamar County · Texas · United States</div>'), rows[1].rest);
+  assert.ok(rows[1].rest.includes('<span class="hit-kind" title="a place node of a settlement">place</span><span class="hit-type">town</span>'), rows[1].rest);
+
+  // A row a column lacks among its answers.
+  const lacking = matrixRows(searchMatrixHtml(searchRows([[paris], []]), views.slice(0, 2), false));
+  assert.deepEqual(plain(lacking.map((r) => [r.classes, r.ranks])), [['search-hit missing', [['rank', '1'], ['rank absent', '–']]]]);
+  assert.match(lacking[0].rest, /<td class="rank absent" title="Smallest: not among its results">–<\/td>/);
+});
+
+test('the matrix shows 5 rows, and every row once asked', () => {
+  const { searchRows, searchMatrixHtml } = core();
+  const list = Array.from({ length: 7 }, (_, i) => hit(`P${i}`, i, 0));
+  const views = [searchView('With addresses', '#6c8cff', { results: list })];
+  const rows = searchRows([list]);
+  const few = searchMatrixHtml(rows, views, false);
+  assert.deepEqual(matrixRows(few).map((r) => r.n), [0, 1, 2, 3, 4]);
+  assert.ok(few.includes('<button class="tool search-more" data-action="more">Show 2 more</button>'), few);
+  const all = searchMatrixHtml(rows, views, true);
+  assert.deepEqual(matrixRows(all).map((r) => r.n), [0, 1, 2, 3, 4, 5, 6]);
+  assert.ok(all.includes('<button class="tool search-more" data-action="more">Show the first 5</button>'), all);
+  assert.ok(!searchMatrixHtml(rows.slice(0, 5), views, false).includes('search-more'));
+  assert.equal(searchMatrixHtml([], [searchView('With addresses', '#6c8cff', { results: [] })], false), '<div class="search-none">No results</div>');
+  assert.equal(searchMatrixHtml([], [searchView('With addresses', '#6c8cff', { loading: true })], false), '');
+});
+
+test('each column\'s head tells its search: its time and index, or its index building or failed, or why it has no answer', () => {
+  const { searchHeadsHtml } = core();
+  const health = { search: { ready: 6, datasets: 28, groups: [
+    { index: 'full.simplified.all', state: 'ready' }, { index: 'full.exact.all', state: 'building', since: '2026-11-21T18:57:07Z' },
+    { index: 'admin-minimal.simplified.none', state: 'queued', since: '2026-11-21T18:57:00Z' }, { index: 'full.exact.none', state: 'failed' },
+  ] } };
+  const results = { results: [hit('Paris', 1, 2), hit('Paris', 3, 4)], us: 1104.5, ms: 12.4, index: 'full.simplified.all' };
+  const out = searchHeadsHtml([
+    searchView('With addresses', '#6c8cff', results),
+    searchView('No addresses', '#d9944a', { ...results, results: [hit('Paris', 1, 2)] }),
+    searchView('Max quality', '#c77dff', { building: { since: '2026-11-21T18:57:07Z', index: 'full.exact.all' } }),
+    searchView('Smallest', '#4ac9d9', { building: { since: '2026-11-21T18:57:00Z', index: 'admin-minimal.simplified.none' } }),
+  ], health);
+  const heads = [...out.matchAll(/<div class="search-head" style="border-left-color:([^"]+)">([\s\S]*?)<\/div>/g)].map((m) => [m[1], m[2]]);
+  assert.equal(heads.length, 4, out);
+  assert.equal(heads[0][1], '<span style="color:#6c8cff">1</span> With addresses: 2 results · 12 ms, 1.10 ms in the search · index full.simplified.all');
+  assert.equal(heads[1][1], '<span style="color:#d9944a">2</span> No addresses: 1 result · 12 ms, 1.10 ms in the search · index full.simplified.all, as 1\'s');
+  assert.equal(heads[2][1], '<span style="color:#c77dff">3</span> Max quality: <span class="loading-spinner"></span>index full.exact.all building since 2026-11-21 18:57:07 UTC · 1 of 4 indexes ready');
+  assert.equal(heads[3][1], '<span style="color:#4ac9d9">4</span> Smallest: <span class="loading-spinner"></span>index admin-minimal.simplified.none queued since 2026-11-21 18:57:00 UTC · 1 of 4 indexes ready');
+
+  const others = searchHeadsHtml([
+    searchView('Max quality', '#6c8cff', { failed: { since: '2026-11-21T19:00:00Z', index: 'full.exact.all', reason: 'dataset full.exact.all: no room' } }),
+    searchView('Smallest', '#d9944a', { error: 'HTTP 429: Rate limit exceeded' }),
+    searchView('Mine', '#c77dff', { loading: true }),
+    searchView('everything', '#4ac9d9', null, null, 'unknown dataset "everything": pick one'),
+  ], null);
+  assert.ok(others.includes('Max quality: <span class="warn">search unavailable: dataset full.exact.all: no room</span> · index full.exact.all, failed 2026-11-21 19:00:00 UTC; the next sync round tries it again'), others);
+  assert.ok(others.includes('Smallest: <span class="warn">HTTP 429: Rate limit exceeded</span>'), others);
+  assert.ok(others.includes('Mine: <span class="loading-spinner"></span>searching…'), others);
+  assert.ok(others.includes('everything: <span class="warn">unknown dataset &quot;everything&quot;: pick one</span>'), others);
+  // Without /health's groups, a building index says so without its progress.
+  assert.ok(searchHeadsHtml([searchView('Max quality', '#6c8cff', { building: { since: '2026-11-21T18:57:07Z', index: 'full.exact.all' } })], null)
+    .endsWith('index full.exact.all building since 2026-11-21 18:57:07 UTC</div></div>'));
+});
+
+test('every string of a search answer and of its index is escaped where the page shows it', () => {
+  const { searchRows, searchMatrixHtml, searchHeadsHtml, searchHtml } = core();
+  const evil = hit('<img src=x onerror=alert(1)>', 1, 2, { type: '<b>t</b>', kind: '<i>k</i>', admin1name: '<em>a1</em>', admin2name: '" onmouseover="alert(3)', country: '<script>c</script>' });
+  const other = { ...evil, admin1name: '<u>other</u>', type: '<b>u</b>' };
+  const views = [
+    searchView('<b>label</b>', '#111', { results: [evil], us: 1, ms: 1, index: '<script>i</script>' }),
+    searchView('<i>two</i>', '#222', { results: [other], us: 1, ms: 1, index: '<script>i</script>' }),
+    searchView('<u>three</u>', '#333', { failed: { since: '<b>', index: '<i>', reason: '<img src=r>' } }),
+    searchView('<em>four</em>', '#444', { building: { since: '<b>', index: '<script>' } }),
+  ];
+  const health = { search: { groups: [{ index: '<script>', state: '<b>queued</b>' }] } };
+  const rows = searchRows(views.map((v) => (v.answer.results || null)));
+  for (const out of [searchMatrixHtml(rows, views, true), searchHeadsHtml(views, health), searchHtml(views, health, rows, true)]) {
+    assertEscaped(out);
+    assert.ok(!out.includes('<script'), out);
+  }
+  assert.ok(searchMatrixHtml(rows, views, true).includes('&lt;img src=x onerror=alert(1)&gt;'));
+});
+
+test('the search shows the heads, then the matrix', () => {
+  const { searchRows, searchHtml } = core();
+  const views = [searchView('With addresses', '#6c8cff', { results: [hit('Paris', 1, 2)], us: 1, ms: 1, index: 'full.simplified.all' })];
+  const rows = searchRows([views[0].answer.results]);
+  const out = searchHtml(views, null, rows, false);
+  assert.match(out, /^<div class="search-heads">[\s\S]*<\/div><table class="search-matrix">/);
+});
+
+// One dot a row, of a slice a column: the column's colour where it has the
+// result, grey where it lacks it or has no answer.
+test('a row\'s dot on the map is coloured by the columns that have it', () => {
+  const { searchRows, dotBackground, dotTitle } = core();
+  const colors = ['#6c8cff', '#d9944a', '#c77dff'];
+  const paris = hit('Paris', 48.8566, 2.3522);
+  const [row] = searchRows([[paris], [], [paris]]);
+  assert.equal(dotBackground(row, colors), 'conic-gradient(#6c8cff 0% 33.33%, #555566 33.33% 66.67%, #c77dff 66.67% 100%)');
+  assert.equal(dotBackground(searchRows([[paris]])[0], colors), '#6c8cff');
+  assert.equal(dotBackground(searchRows([[paris], [paris]])[0], colors), 'conic-gradient(#6c8cff 0% 50%, #d9944a 50% 100%)');
+  assert.equal(dotTitle(row, ['With addresses', 'Smallest', 'Max quality']), 'Paris (city): #1 in With addresses, #1 in Max quality');
+});
+
+test('a result picked from the matrix is looked up as a search of its best column', () => {
+  const { searchRows, searchSource } = core();
+  const rows = searchRows([[hit('Louvre', 1, 1), hit('Eiffel Tower', 48.8584, 2.2945)], [hit('Eiffel Tower', 48.8584, 2.2945)]]);
+  const eiffel = rows.find((r) => r.name === 'Eiffel Tower');
+  assert.equal(searchSource('eiffel', eiffel, ['With addresses', 'Smallest']), 'search "eiffel": Eiffel Tower, #1 in Smallest');
+});
+
+test('a search waits for 250 ms of quiet in the box, and Enter searches at once', () => {
+  const { PlaceSearch } = core();
+  const timers = handTimers();
+  const { search, sent } = handSearch(PlaceSearch, timers, () => ['full.simplified.all', 'admin-minimal.simplified.none']);
+  search.typed('p');
+  timers.advance(100);
+  search.typed('pa');
+  timers.advance(200);
+  search.typed('par');
+  timers.advance(249);
+  assert.deepEqual(sent, []);
+  assert.equal(search.q, '');
+  timers.advance(1);
+  assert.deepEqual(sent.map((s) => [s.q, s.dataset]), [['par', 'full.simplified.all'], ['par', 'admin-minimal.simplified.none']]);
+  assert.equal(search.q, 'par');
+  assert.equal(sent[0].url, '/search?q=par&dataset=full.simplified.all&limit=10&key=test&debug=1');
+
+  // Text typed back to the search shown asks nothing again; Enter asks it
+  // again at once, and the pause typed before it is dropped.
+  search.typed('pari');
+  search.typed('par');
+  timers.advance(250);
+  assert.equal(sent.length, 2);
+  search.typed('paris');
+  search.submit('paris');
+  assert.deepEqual(sent.slice(2).map((s) => s.q), ['paris', 'paris']);
+  timers.advance(1000);
+  assert.equal(sent.length, 4);
+  assert.deepEqual(timers.pending(), []);
+  search.submit('paris');
+  assert.equal(sent.length, 6);
+});
+
+test('a newer search cancels the requests of the one before, whose answers are dropped', async () => {
+  const { PlaceSearch } = core();
+  const timers = handTimers();
+  const { search, sent } = handSearch(PlaceSearch, timers, () => ['a', 'b']);
+  search.submit('pa');
+  search.submit('par');
+  assert.deepEqual(sent.map((s) => [s.q, s.signal.aborted]), [['pa', true], ['pa', true], ['par', false], ['par', false]]);
+  sent[0].answer(200, debugBody([hit('Pa', 1, 1)]));
+  sent[2].answer(200, debugBody([hit('Paris', 1, 1)]));
+  await settle();
+  assert.deepEqual(Object.keys(search.answers).sort(), ['a', 'b']);
+  assert.equal(search.answers.a.results[0].name, 'Paris');
+  assert.deepEqual(plain(search.answers.b), { loading: true });
+  sent[3].answer(200, debugBody([]));
+  await settle();
+  assert.deepEqual(plain(search.answers.b.results), []);
+});
+
+test('an empty box ends the search at once', async () => {
+  const { PlaceSearch } = core();
+  const timers = handTimers();
+  const { search, sent } = handSearch(PlaceSearch, timers, () => ['a']);
+  search.submit('paris');
+  search.typed('pari');
+  search.typed('   ');
+  assert.equal(sent[0].signal.aborted, true);
+  assert.equal(search.q, '');
+  assert.deepEqual(plain(search.answers), {});
+  assert.deepEqual(timers.pending(), []);
+  sent[0].answer(200, debugBody([hit('Paris', 1, 1)]));
+  await settle();
+  assert.deepEqual(plain(search.answers), {});
+  search.typed('');
+  search.submit('');
+  assert.equal(sent.length, 1);
+});
+
+// Columns of one dataset ask it once; a column added (or another dataset
+// picked) asks its dataset, and a reload of the datasets asks them all
+// again.
+test('a search asks each dataset of the columns once, a dataset picked since, and all again for a new build', async () => {
+  const { PlaceSearch } = core();
+  const timers = handTimers();
+  let datasets = ['a', 'a', 'b'];
+  const { search, sent } = handSearch(PlaceSearch, timers, () => datasets);
+  search.ask();
+  assert.equal(sent.length, 0, 'no search shown');
+  search.submit('paris');
+  assert.deepEqual(sent.map((s) => s.dataset), ['a', 'b']);
+  for (const s of sent) s.answer(200, debugBody([]));
+  await settle();
+  datasets = ['a', 'c'];
+  search.ask();
+  assert.deepEqual(sent.slice(2).map((s) => [s.q, s.dataset]), [['paris', 'c']]);
+  search.again();
+  assert.deepEqual(sent.slice(3).map((s) => [s.q, s.dataset]), [['paris', 'a'], ['paris', 'c']]);
+});
+
+test('a column whose index is building is asked again after Retry-After, showing it building meanwhile; a failed one is not', async () => {
+  const { PlaceSearch } = core();
+  const timers = handTimers();
+  const { search, sent } = handSearch(PlaceSearch, timers, () => ['a', 'b']);
+  search.submit('paris');
+  sent[0].answer(503, '{"dataset":"a","index":"full.exact.all","since":"2026-11-21T18:57:07Z","status":"building"}', { 'retry-after': '5' });
+  sent[1].answer(503, '{"dataset":"b","index":"full.exact.none","reason":"no room","since":"2026-11-21T19:00:00Z","status":"failed"}');
+  await settle();
+  assert.deepEqual(plain(search.answers.a.building), { index: 'full.exact.all', since: '2026-11-21T18:57:07Z' });
+  assert.equal(search.answers.b.failed.reason, 'no room');
+  assert.deepEqual(timers.pending(), [5000]);
+  timers.advance(5000);
+  assert.deepEqual(sent.slice(2).map((s) => [s.q, s.dataset]), [['paris', 'a']]);
+  assert.ok(search.answers.a.building, 'still shown building while it is asked again');
+  sent[2].answer(200, debugBody([hit('Paris', 1, 1)]));
+  await settle();
+  assert.equal(search.answers.a.results.length, 1);
+  assert.deepEqual(timers.pending(), []);
+
+  // A newer search drops the retry of the one before.
+  search.submit('lyon');
+  sent[3].answer(503, '{"dataset":"a","index":"full.exact.all","since":"2026-11-21T18:57:07Z","status":"building"}', { 'retry-after': '5' });
+  await settle();
+  assert.deepEqual(timers.pending(), [5000]);
+  search.submit('nice');
+  assert.deepEqual(timers.pending(), []);
+});
+
+test('a search request that fails says why, in its column', async () => {
+  const { PlaceSearch } = core();
+  const timers = handTimers();
+  const search = new PlaceSearch({ setTimer: timers.set, clearTimer: timers.clear, datasets: () => ['a'], request: async () => { throw new Error('offline'); } });
+  search.submit('paris');
+  await settle();
+  assert.deepEqual(plain(search.answers.a), { error: 'offline' });
+});
+
+test('a search\'s 429 pause leaves the reverse lookups going', async () => {
+  const { Pacer } = core();
+  const clock = handClock();
+  const { pacer, sent } = handPacer(Pacer, clock);
+  const searching = pacer.request('/search?q=a', 'search');
+  await settle();
+  sent[0].answer(429);
+  await settle();
+  assert.deepEqual(clock.lengths(), [100]);
+  const lookup = pacer.request('/reverse?n=1', 'reverse');
+  await settle();
+  assert.deepEqual(went(sent), [['/search?q=a', 0], ['/reverse?n=1', 0]]);
+  sent[1].answer(200);
+  assert.equal((await lookup).status, 200);
+  assert.equal(pacer.scope('reverse').pause, 0);
+  clock.wake();
+  await settle();
+  sent[2].answer(200);
+  assert.equal((await searching).status, 200);
+});
+
+// The side panel stacks the datasets, the search, the coordinates, the photo
+// upload, the results and, once one is selected, its detail. Four columns of
+// datasets, every row of a search and the detail of a result fill a window
+// of 1000 px without the results, whose toolbar and cards would go: they
+// keep a height of their own, the datasets, the search and the detail scroll
+// within what is left, down to a least height of theirs, and a window too
+// short for those scrolls the panel rather than cutting off its foot. The
+// results' section hides what overflows it: its list of cards scrolls.
+test('the results keep room for their toolbar and cards however tall the datasets, the search and the detail grow', () => {
   const height = /\b[1-9]\d*(px|%|vh)/;
   assert.match(style('.results-section')['min-height'] ?? 'none', height);
-  for (const giving of ['.datasets-section', '.detail-panel']) {
+  for (const giving of ['.datasets-section', '.search-section', '.detail-panel']) {
     assert.equal(style(giving)['overflow-y'], 'auto', giving);
     assert.match(style(giving)['min-height'] ?? 'none', height, giving);
   }

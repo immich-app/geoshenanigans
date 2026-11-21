@@ -406,6 +406,44 @@
   .fields td.empty { color: var(--orange); }
   .detail-places tr.unshared td { color: var(--orange); }
 
+  /* The search: its box, each column's head and the matrix of their
+     results, which scrolls within a height of its own. */
+  .search-section { max-height: 45vh; min-height: 70px; overflow-y: auto; }
+  .search-input {
+    width: 100%;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text);
+    padding: 7px 8px;
+    font-size: 13px;
+  }
+  .search-input:focus { outline: 1px solid var(--accent); border-color: var(--accent); }
+  .search-heads { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; font-size: 11px; color: var(--text-dim); }
+  .search-head { border-left: 3px solid var(--accent); padding-left: 6px; overflow-wrap: anywhere; }
+  .search-none { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
+  .search-matrix { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 6px; }
+  .search-matrix th { text-align: left; color: var(--text-dim); font-weight: 500; padding: 2px 4px; border-bottom: 1px solid var(--border); }
+  .search-matrix td { padding: 3px 4px; vertical-align: top; border-bottom: 1px solid var(--border); }
+  .search-matrix .rank { width: 24px; text-align: center; font-family: "SF Mono", "Fira Code", "Consolas", monospace; }
+  .search-matrix td.shifted { text-decoration: underline dotted; }
+  .search-matrix td.absent { color: var(--red); }
+  .search-matrix td.unanswered { color: var(--text-dim); }
+  .search-matrix tr.search-hit { cursor: pointer; }
+  .search-matrix tr.missing { background: rgba(217, 74, 74, 0.06); }
+  .search-matrix tr.search-hit:hover, .search-matrix tr.search-hit.hover { background: var(--surface2); }
+  .hit { overflow-wrap: anywhere; }
+  .hit-name { font-weight: 500; }
+  .hit-kind, .hit-type { font-size: 10px; color: var(--text-dim); margin-left: 6px; }
+  .hit-context { font-size: 11px; color: var(--text-dim); }
+  .hit-context .differs { color: var(--red); }
+  .search-more { margin-top: 6px; }
+  /* A dot of the search on the map: MapLibre places the outer element by
+     its transform, so the fill is what grows on hover. */
+  .search-dot { width: 14px; height: 14px; cursor: pointer; }
+  .search-dot-fill { width: 100%; height: 100%; border-radius: 50%; border: 1px solid rgba(0, 0, 0, 0.8); transition: transform 0.1s; }
+  .search-dot.hover .search-dot-fill { transform: scale(1.7); border-color: #fff; }
+
   @media (max-width: 800px) {
     .layout { flex-direction: column; }
     .map-panel { flex: 0 0 45vh; }
@@ -424,6 +462,12 @@
       <div class="banner" id="banner"></div>
       <div class="columns" id="columns"></div>
       <div class="status-line" id="status"></div>
+    </section>
+
+    <section class="search-section" id="searchSection" hidden>
+      <h3>Search</h3>
+      <input id="searchInput" class="search-input" type="search" placeholder="A place or a POI: searched as you type, Enter searches at once" autocomplete="off" spellcheck="false" />
+      <div id="searchOut"></div>
     </section>
 
     <section>
@@ -466,7 +510,8 @@
 <script id="core">
 // The page's logic that reads no DOM: the link, the columns and the datasets
 // they name (the server's /datasets), the pacing of requests, the comparison
-// of answers and the HTML of each part. page.test.mjs runs it in node.
+// of answers, the place search and its matrix, and the HTML of each part.
+// page.test.mjs runs it in node.
 
 // At most this many dataset columns.
 const MAX_COLUMNS = 4;
@@ -538,18 +583,19 @@ function buildOrder(a, b) {
 
 // -- The link --
 // ?d=<dataset> for each column (a preset's id, or <mode>.<quality>.<poi_tier>),
-// at=<lat>,<lon> for each point to look up, and b=<build>, the build the
-// answers came from (its publication ID; a date alone still opens).
+// at=<lat>,<lon> for each point to look up, b=<build>, the build the
+// answers came from (its publication ID; a date alone still opens), and
+// q=<text>, the search box's text as it was typed.
 function parseLink(search) {
-  const q = new URLSearchParams(search);
+  const params = new URLSearchParams(search);
   const points = [];
-  for (const at of q.getAll('at')) {
+  for (const at of params.getAll('at')) {
     const parts = at.split(',');
     if (parts.length !== 2 || parts.some((p) => p.trim() === '')) continue;
     const [lat, lng] = parts.map(Number);
     if (onGlobe(lat, lng)) points.push({ lat, lng });
   }
-  return { datasets: q.getAll('d').filter((d) => d).slice(0, MAX_COLUMNS), points, build: q.get('b') || null };
+  return { datasets: params.getAll('d').filter((d) => d).slice(0, MAX_COLUMNS), points, build: params.get('b') || null, q: params.get('q') || '' };
 }
 
 // The build a link to a result names (b=): the oldest that answered it in
@@ -563,10 +609,11 @@ function linkBuild(answers, keys, served) {
   return builds.find((build) => !served || !sameBuild(build, served)) || builds[0] || served;
 }
 
-function linkSearch({ datasets = [], point = null, build = null }) {
+function linkSearch({ datasets = [], point = null, build = null, q = '' }) {
   const parts = datasets.map((d) => `d=${encodeURIComponent(d).replace(/%2F/g, '/')}`);
   if (point) parts.push(`at=${point.lat},${point.lng}`);
   if (build) parts.push(`b=${encodeURIComponent(build)}`);
+  if (q) parts.push(`q=${encodeURIComponent(q)}`);
   return parts.length ? `?${parts.join('&')}` : '';
 }
 
@@ -851,6 +898,362 @@ function abortable(promise, signal) {
       reject(e);
     });
   });
+}
+
+// -- Place search --
+// The search box's search of each column's dataset (/search, the portal's),
+// whose results go into one matrix: a row for each result, those of the
+// columns that name one place one row.
+
+// The results each column is asked for.
+const SEARCH_LIMIT = 10;
+// The quiet in the box, in ms, before its text is searched.
+const SEARCH_DEBOUNCE = 250;
+// The rows of the matrix shown until every one is asked for.
+const SEARCH_ROWS = 5;
+// The results of two columns are one where their names are equal and their
+// points at most this many metres apart; within AREA_MATCH_METRES where one
+// is a boundary without a label node, whose point is one on its ring's
+// surface, which moves with the boundary's precision.
+const MATCH_METRES = 1000;
+const AREA_MATCH_METRES = 20000;
+// The parts of a result's context, the smallest first.
+const SEARCH_CONTEXT = ['admin2name', 'admin1name', 'country'];
+// A result's kind (its letter in /search?debug=1) as the matrix names it.
+const SEARCH_KINDS = {
+  P: { label: 'place', title: 'a place node of a settlement' },
+  M: { label: 'place', title: 'a place node of a suburb, quarter or neighbourhood' },
+  B: { label: 'boundary', title: 'a boundary, at its label node' },
+  A: { label: 'boundary', title: 'a boundary without a label node, at a point on its surface' },
+  O: { label: 'POI', title: 'a point of interest' },
+};
+// A dot's slice of a column that lacks its result or has no answer.
+const DOT_ABSENT = '#555566';
+
+// Whether the server searches: a portal whose /datasets names each
+// dataset's index. A production server has no /datasets.
+function searchOffered(mode, catalog) {
+  return mode === 'catalog' && Boolean(catalog) && catalog.datasets.length > 0
+    && catalog.datasets.every((d) => d.search && d.search.index);
+}
+
+// The search of `q` in `dataset`, its results with how each was found.
+function searchUrl(q, dataset, limit = SEARCH_LIMIT) {
+  return `/search?q=${encodeURIComponent(q)}&dataset=${encodeURIComponent(dataset)}&limit=${limit}&key=test&debug=1`;
+}
+
+// A search answer as the page keeps it, from a response of the server: its
+// results (best first) with the µs the search took in the server, the index
+// it searched (X-Geocoder-Search-Index), the build and the dataset; the
+// state of an index not open, building (asked again after `retry` s, its
+// Retry-After) or failed and why; or why there is none. With the ms it
+// took.
+function searchAnswerOf(status, header, body, ms) {
+  let json = null;
+  try {
+    json = JSON.parse(body);
+  } catch (e) {}
+  if (status === 200) {
+    if (!json || typeof json !== 'object' || !Array.isArray(json.results)) return { error: `not a search answer: ${body.slice(0, 300)}`, ms };
+    return { results: json.results, us: json.us, index: header('x-geocoder-search-index'), build: header('x-geocoder-build-id'), dataset: header('x-geocoder-dataset'), ms };
+  }
+  if (status === 503 && json && json.status === 'building') {
+    return { building: { index: json.index, since: json.since }, retry: Number(header('retry-after')) || 5, dataset: json.dataset, ms };
+  }
+  if (status === 503 && json && json.status === 'failed') {
+    return { failed: { index: json.index, since: json.since, reason: json.reason }, dataset: json.dataset, ms };
+  }
+  return { error: `HTTP ${status}${body ? `: ${body.slice(0, 300)}` : ''}`, ms };
+}
+
+// The metres between two points, along the globe.
+function metres(lat1, lng1, lat2, lng2) {
+  const rad = Math.PI / 180;
+  const h = Math.sin(((lat2 - lat1) * rad) / 2) ** 2
+    + Math.cos(lat1 * rad) * Math.cos(lat2 * rad) * Math.sin(((lng2 - lng1) * rad) / 2) ** 2;
+  return 2 * 6371008.8 * Math.asin(Math.min(1, Math.sqrt(h)));
+}
+
+function formatMetres(m) {
+  return m < 1000 ? `${Math.round(m)} m` : `${(m / 1000).toFixed(1)} km`;
+}
+
+// The matrix's rows from each column's results (`lists`: null for a column
+// without an answer, which lacks none). A result joins the row of an earlier
+// column's result of its name within MATCH_METRES of it, the closest pairs
+// first, each row and each result once; else it makes a row of its own. A
+// column's own results never share one. Each row has the name, kind, type
+// and point of its first result; its cell of each column (the rank, the
+// result and its metres from that point; null where the column has none);
+// its best rank; whether a column that answered lacks it; whether the ranks
+// differ; the most it moved; whether the columns give another type or kind;
+// and its context, each part with the first result's value, each column's
+// (null where it has no cell) and whether they disagree. By best rank: of
+// rows of one, those of the earlier columns first.
+function searchRows(lists) {
+  const rows = [];
+  lists.forEach((list, c) => {
+    if (!list) return;
+    const before = rows.slice();
+    const pairs = [];
+    list.forEach((r, i) => before.forEach((row, n) => {
+      if (row.name !== r.name) return;
+      const m = metres(row.lat, row.lng, r.latitude, r.longitude);
+      if (m <= (row.kind === 'A' || r.kind === 'A' ? AREA_MATCH_METRES : MATCH_METRES)) pairs.push({ m, i, n });
+    }));
+    pairs.sort((a, b) => a.m - b.m || a.i - b.i || a.n - b.n);
+    const placed = new Set();
+    for (const { m, i, n } of pairs) {
+      if (placed.has(i) || before[n].cells[c]) continue;
+      before[n].cells[c] = { rank: i + 1, result: list[i], metres: m };
+      placed.add(i);
+    }
+    list.forEach((r, i) => {
+      if (placed.has(i)) return;
+      const cells = lists.map(() => null);
+      cells[c] = { rank: i + 1, result: r, metres: 0 };
+      rows.push({ name: r.name, kind: r.kind, type: r.type, lat: r.latitude, lng: r.longitude, cells });
+    });
+  });
+  for (const row of rows) {
+    const cells = row.cells.filter(Boolean);
+    row.best = Math.min(...cells.map((x) => x.rank));
+    row.missing = lists.some((list, c) => list && !row.cells[c]);
+    row.ranksDiffer = cells.some((x) => x.rank !== row.best);
+    row.moved = Math.max(...cells.map((x) => x.metres));
+    row.typeDiffers = cells.some((x) => x.result.type !== row.type || x.result.kind !== row.kind);
+    row.context = SEARCH_CONTEXT.map((part) => {
+      const values = row.cells.map((x) => (x ? String(x.result[part] ?? '') : null));
+      const given = values.filter((v) => v !== null);
+      return { part, value: given[0], values, differs: given.some((v) => v !== given[0]) };
+    });
+  }
+  return rows.sort((a, b) => a.best - b.best);
+}
+
+// The background of a row's dot: a slice of each column, in the column's
+// colour where it has the result, else DOT_ABSENT; of one column, its
+// colour.
+function dotBackground(row, colors) {
+  const n = row.cells.length;
+  const color = (c) => (row.cells[c] ? colors[c] : DOT_ABSENT);
+  if (n === 1) return color(0);
+  const at = (k) => `${Number(((k * 100) / n).toFixed(2))}%`;
+  return `conic-gradient(${row.cells.map((_, c) => `${color(c)} ${at(c)} ${at(c + 1)}`).join(', ')})`;
+}
+
+// A row's dot's tooltip, as text: its name and type, and its rank in each
+// column (`labels`) that has it.
+function dotTitle(row, labels) {
+  const ranks = row.cells.map((x, c) => (x ? `#${x.rank} in ${labels[c]}` : null)).filter(Boolean);
+  return `${row.name} (${row.type}): ${ranks.join(', ')}`;
+}
+
+// Where a result picked from the matrix of the search `q` came from, as its
+// card says: its name, and its best rank in the first column of it.
+function searchSource(q, row, labels) {
+  const c = row.cells.findIndex((x) => x && x.rank === row.best);
+  return `search "${q}": ${row.name}, #${row.best} in ${labels[c]}`;
+}
+
+// The search box's search (the page's other script wires it to the box):
+// the text searched (q; '' for none) and each dataset's answer to it
+// (answers, by its id; { loading: true } while it is asked). typed(text)
+// searches the text once the box has kept it for `debounce` ms, but not the
+// search shown again; submit(text) (Enter) searches it at once; text of
+// spaces alone ends the search at once. A search asks each dataset of
+// `datasets()` (the columns') once, and cancels the requests of the one
+// before, whose answers it drops. ask() asks those datasets that have no
+// answer of the search shown (a column added, or another dataset picked),
+// again() searches every one anew (another build). A dataset whose index is
+// building is asked again after its Retry-After, its state shown meanwhile.
+// request(url, signal) asks the server (the pacer), changed() follows each
+// change, setTimer(fn, ms) and clearTimer(id) as setTimeout and
+// clearTimeout.
+class PlaceSearch {
+  constructor({ request, datasets, changed = () => {}, setTimer = (fn, ms) => setTimeout(fn, ms), clearTimer = (id) => clearTimeout(id),
+                debounce = SEARCH_DEBOUNCE, limit = SEARCH_LIMIT }) {
+    Object.assign(this, { request, datasets, changed, setTimer, clearTimer, debounce, limit });
+    this.q = '';
+    this.answers = {};
+    this.timer = null;
+    this.retries = new Map();
+    this.cancelling = null;
+  }
+
+  typed(text) {
+    this.clearTimer(this.timer);
+    this.timer = null;
+    if (!text.trim()) {
+      this.run('');
+      return;
+    }
+    this.timer = this.setTimer(() => {
+      this.timer = null;
+      if (text !== this.q) this.run(text);
+    }, this.debounce);
+  }
+
+  submit(text) {
+    this.clearTimer(this.timer);
+    this.timer = null;
+    this.run(text);
+  }
+
+  clear() {
+    this.submit('');
+  }
+
+  again() {
+    if (this.q) this.run(this.q);
+  }
+
+  // A new search of `text` ('' ends the search): the one before cancelled,
+  // its answers and its retries dropped.
+  run(text) {
+    if (this.cancelling) this.cancelling.abort();
+    for (const id of this.retries.values()) this.clearTimer(id);
+    this.retries.clear();
+    this.answers = {};
+    this.q = text.trim() ? text : '';
+    this.cancelling = this.q ? new AbortController() : null;
+    this.ask();
+    this.changed();
+  }
+
+  ask() {
+    if (!this.q) return;
+    for (const dataset of new Set(this.datasets())) {
+      if (!Object.hasOwn(this.answers, dataset)) this.askOne(dataset);
+    }
+  }
+
+  // Asks `dataset`, unless the search is cancelled before its answer comes;
+  // one asked again while its index builds keeps that state meanwhile.
+  async askOne(dataset) {
+    const { cancelling } = this;
+    if (!(this.answers[dataset] && this.answers[dataset].building)) {
+      this.answers[dataset] = { loading: true };
+      this.changed();
+    }
+    let answer;
+    try {
+      const got = await this.request(searchUrl(this.q, dataset, this.limit), cancelling.signal);
+      answer = searchAnswerOf(got.status, got.header, got.body, got.ms);
+    } catch (e) {
+      if (cancelling.signal.aborted) return;
+      answer = { error: e.message };
+    }
+    if (cancelling !== this.cancelling) return;
+    this.answers[dataset] = answer;
+    if (answer.building) {
+      this.retries.set(dataset, this.setTimer(() => {
+        this.retries.delete(dataset);
+        if (cancelling === this.cancelling) this.askOne(dataset);
+      }, answer.retry * 1000));
+    }
+    this.changed();
+  }
+}
+
+// The heads of the columns' searches (`views`: each column's label, colour,
+// dataset, error and answer to the search shown): its results' count, the ms
+// its request took and the time of the search in the server, and its index,
+// noted where an earlier column's is the same; its index queued or building
+// since when, with how many of the build's indexes /health (`health`) gives
+// ready; its index failed, and why; or why it has no answer.
+function searchHeadsHtml(views, health) {
+  const groups = health && health.search && Array.isArray(health.search.groups) ? health.search.groups : null;
+  let html = '<div class="search-heads">';
+  views.forEach((v, c) => {
+    const a = v.answer;
+    let state = '';
+    if (!a) {
+      if (v.error) state = `<span class="warn">${esc(v.error)}</span>`;
+    } else if (a.loading) {
+      state = '<span class="loading-spinner"></span>searching…';
+    } else if (a.building) {
+      const group = groups ? groups.find((g) => g.index === a.building.index) : null;
+      state = `<span class="loading-spinner"></span>index ${esc(a.building.index)} ${group && group.state === 'queued' ? 'queued' : 'building'}`
+        + ` since ${esc(shortTime(a.building.since))}`;
+      if (groups) state += ` · ${groups.filter((g) => g.state === 'ready').length} of ${groups.length} indexes ready`;
+    } else if (a.failed) {
+      state = `<span class="warn">search unavailable: ${esc(a.failed.reason)}</span> · index ${esc(a.failed.index)},`
+        + ` failed ${esc(shortTime(a.failed.since))}; the next sync round tries it again`;
+    } else if (a.error) {
+      state = `<span class="warn">${esc(a.error)}</span>`;
+    } else if (a.results) {
+      const n = a.results.length;
+      const index = a.index || (v.dataset && v.dataset.search ? v.dataset.search.index : '');
+      const parts = [`${n} result${n === 1 ? '' : 's'}`];
+      if (Number.isFinite(a.ms)) parts.push(`${Math.round(a.ms)} ms${Number.isFinite(a.us) ? `, ${(a.us / 1000).toFixed(2)} ms in the search` : ''}`);
+      parts.push(`index ${esc(index)}`);
+      state = parts.join(' · ');
+      const same = views.findIndex((w, d) => d < c && w.answer && w.answer.results && w.answer.index === a.index);
+      if (same >= 0) state += `, as ${same + 1}'s`;
+    }
+    html += `<div class="search-head" style="border-left-color:${v.color}"><span style="color:${v.color}">${c + 1}</span> ${esc(v.label)}${state ? `: ${state}` : ''}</div>`;
+  });
+  return `${html}</div>`;
+}
+
+// The matrix of a search's `rows`: a column of ranks for each of `views`, in
+// its colour ('–' where it answered without the row's result, '·' where it
+// has no answer; a rank below the row's best marked), then the result: its
+// name, kind and type, how far it moved between the columns and whether
+// they give it another type, and its context, each part they disagree on
+// marked with each one's value. The first SEARCH_ROWS rows, or every one
+// where `expanded`, and the button that shows the others or hides them;
+// none until a column answers.
+function searchMatrixHtml(rows, views, expanded) {
+  const answered = views.map((v) => Boolean(v.answer && v.answer.results));
+  if (!answered.some(Boolean)) return '';
+  if (!rows.length) return '<div class="search-none">No results</div>';
+  let html = '<table class="search-matrix"><tr>';
+  views.forEach((v, c) => { html += `<th class="rank" style="color:${v.color}" title="${esc(v.label)}">${c + 1}</th>`; });
+  html += '<th>Result</th></tr>';
+  (expanded ? rows : rows.slice(0, SEARCH_ROWS)).forEach((row, n) => {
+    html += `<tr class="search-hit${row.missing ? ' missing' : ''}" data-row="${n}">`;
+    row.cells.forEach((cell, c) => {
+      const v = views[c];
+      if (cell) {
+        const r = cell.result;
+        const how = [`${v.label}: #${cell.rank}`];
+        if (Number.isFinite(r.score)) how.push(`score ${r.score.toFixed(3)}`);
+        if (Number.isFinite(r.text)) how.push(`text ${r.text.toFixed(3)}`);
+        if (r.context) how.push('its context matched');
+        html += `<td class="rank${cell.rank > row.best ? ' shifted' : ''}" style="color:${v.color}" title="${esc(how.join(' · '))}">${cell.rank}</td>`;
+      } else if (answered[c]) {
+        html += `<td class="rank absent" title="${esc(`${v.label}: not among its results`)}">–</td>`;
+      } else {
+        html += `<td class="rank unanswered" title="${esc(`${v.label}: no answer`)}">·</td>`;
+      }
+    });
+    const kind = Object.hasOwn(SEARCH_KINDS, row.kind) ? SEARCH_KINDS[row.kind] : { label: row.kind, title: row.kind };
+    html += `<td class="hit"><div><span class="hit-name">${esc(row.name)}</span>`
+      + `<span class="hit-kind" title="${esc(kind.title)}">${esc(kind.label)}</span><span class="hit-type">${esc(row.type)}</span>`;
+    if (row.moved >= 1) html += `<span class="tag" title="The farthest of its points from the first column's">moved ${formatMetres(row.moved)}</span>`;
+    if (row.typeDiffers) {
+      const types = row.cells.map((x, c) => (x ? `${views[c].label}: ${x.result.type} (${x.result.kind})` : null)).filter(Boolean);
+      html += `<span class="tag" title="${esc(types.join(' · '))}">type differs</span>`;
+    }
+    const parts = row.context.filter((p) => p.value || p.differs).map((p) => {
+      if (!p.differs) return esc(p.value);
+      const each = p.values.map((value, c) => (value === null ? null : `${views[c].label}: ${value || '—'}`)).filter(Boolean);
+      return `<span class="differs" title="${esc(each.join(' · '))}">${esc(p.value || '—')}</span>`;
+    });
+    html += `</div><div class="hit-context">${parts.join(' · ')}</div></td></tr>`;
+  });
+  html += '</table>';
+  if (rows.length > SEARCH_ROWS) {
+    html += `<button class="tool search-more" data-action="more">${expanded ? `Show the first ${SEARCH_ROWS}` : `Show ${rows.length - SEARCH_ROWS} more`}</button>`;
+  }
+  return html;
+}
+
+// The search's part of the page: the columns' heads, then the matrix.
+function searchHtml(views, health, rows, expanded) {
+  return searchHeadsHtml(views, health) + searchMatrixHtml(rows, views, expanded);
 }
 
 // -- HTML --
@@ -1278,12 +1681,13 @@ let catalogRetry = null;
 let catalogLoads = 0;
 
 // Asks /datasets how the page answers, and lays out its columns: as they
-// were named (the link's or the pickers'), else OPENING_PRESETS. While the
-// portal waits for a build, it asks again every 30 s; once the build is in,
-// the points looked up meanwhile are asked in the columns. Where that moves
-// the polygon overlay (another dataset at its column, another build, or no
-// column), what it drew goes, and the selected result's polygons are asked
-// anew where its column still has a dataset.
+// were named (the link's or the pickers'), else OPENING_PRESETS, and the
+// search (updateSearch). While the portal waits for a build, it asks again
+// every 30 s; once the build is in, the points looked up meanwhile are asked
+// in the columns. Where that moves the polygon overlay (another dataset at
+// its column, another build, or no column), what it drew goes, and the
+// selected result's polygons are asked anew where its column still has a
+// dataset.
 async function loadCatalog() {
   const load = ++catalogLoads;
   clearTimeout(catalogRetry);
@@ -1317,6 +1721,7 @@ async function loadCatalog() {
   renderBanner();
   updatePolygonsBtn();
   updateLink();
+  updateSearch();
   results.forEach(placeMarker);
   renderResults();
   const entry = selectedEntry();
@@ -1367,10 +1772,11 @@ function dismissMismatch() {
 }
 
 // A column picked anew, added or removed by `change`: the link, the polygon
-// button, the markers (coloured by the first column), the cards, and the
-// selected result's answers. Where that moves the polygon overlay (another
-// dataset at its column, or no column), what it drew goes at once, and the
-// selected result's polygons are asked anew where its column has a dataset.
+// button, the markers (coloured by the first column), the cards, the
+// selected result's answers, and the search (a dataset picked anew asked).
+// Where that moves the polygon overlay (another dataset at its column, or no
+// column), what it drew goes at once, and the selected result's polygons are
+// asked anew where its column has a dataset.
 function changeColumns(change) {
   const shown = overlayTarget(polygonsColumn, columns, servedBuild());
   change();
@@ -1390,6 +1796,8 @@ function changeColumns(change) {
   }
   renderResults();
   saveResults();
+  placeSearch.ask();
+  renderSearch();
 }
 
 function setColumn(i, col) {
@@ -1432,11 +1840,11 @@ columnsEl.addEventListener('click', (e) => {
 });
 
 // The page's URL: the columns, the selected point and the build that
-// answered it (linkBuild; the build served without one), so that a copy of
-// it opens the same columns on the same point, flagged where another build
-// answers it then. Until the link's points are looked up (once the map is
-// in) it stays the link the page opened, so that a reload meanwhile opens
-// them still.
+// answered it (linkBuild; the build served without one), and the search
+// box's text while it has any, so that a copy of it opens the same columns
+// on the same point and search, flagged where another build answers it
+// then. Until the link's points are looked up (once the map is in) it stays
+// the link the page opened, so that a reload meanwhile opens them still.
 let linkRestored = false;
 function updateLink() {
   if (!linkRestored) return;
@@ -1447,6 +1855,7 @@ function updateLink() {
     datasets: mode === 'single' ? [] : wanted,
     point: entry ? { lat: entry.lat, lng: entry.lng } : null,
     build: entry ? linkBuild(entry.answers, keys, served) : served,
+    q: mode === 'single' || !searchBox.value.trim() ? '' : searchBox.value,
   });
   history.replaceState(null, '', location.pathname + search + location.hash);
 }
@@ -1456,16 +1865,151 @@ function copyLink(btn) {
   copyToClipboard(location.href, btn);
 }
 
+// -- Place search --
+// On a portal whose /datasets names the datasets' indexes, the search box
+// searches each column's dataset as one types (PlaceSearch), its requests
+// in a rate-limit scope of their own ('search'). Its results go into one
+// matrix, and on the map as a dot for each of its rows, coloured by the
+// columns that have it, until the next search or the box is emptied. A
+// click on a row or a dot looks up its point in every column, as a click on
+// the map does; hovering a row marks its dot, and hovering a dot its row.
+const searchSection = document.getElementById('searchSection');
+const searchBox = document.getElementById('searchInput');
+const searchOut = document.getElementById('searchOut');
+const placeSearch = new PlaceSearch({
+  request: (url, signal) => pacer.request(url, 'search', signal),
+  datasets: () => columns.filter((c) => c.dataset).map((c) => c.dataset.id),
+  changed: searchChanged,
+});
+searchBox.value = link.q;
+// The rows of the matrix (by data-row); the search whose matrix shows every
+// row; the dots on the map, and what they show; the row hovered; /health as
+// last asked; the search the link last carried; and whether the map is in.
+let searchShown = [];
+let searchExpanded = null;
+let searchDots = [];
+let dotsDrawn = '';
+let searchHovered = null;
+let lastHealth = null;
+let searchLinked = '';
+let mapReady = false;
+
+function searchViews() {
+  return columns.map((col, i) => ({
+    label: columnLabel(col),
+    color: COLUMN_COLORS[i],
+    dataset: col.dataset,
+    error: col.error,
+    answer: col.dataset ? placeSearch.answers[col.dataset.id] || null : null,
+  }));
+}
+
+function searchChanged() {
+  renderSearch();
+  if (placeSearch.q !== searchLinked) {
+    searchLinked = placeSearch.q;
+    updateLink();
+  }
+}
+
+function renderSearch() {
+  const views = searchViews();
+  searchShown = placeSearch.q ? searchRows(views.map((v) => (v.answer && v.answer.results) || null)) : [];
+  searchOut.innerHTML = placeSearch.q ? searchHtml(views, lastHealth, searchShown, searchExpanded === placeSearch.q) : '';
+  drawSearchDots(views);
+  // The row under the pointer, drawn anew, keeps its mark, and its dot.
+  const hovered = searchHovered;
+  searchHovered = undefined;
+  hoverSearchRow(hovered);
+}
+
+// Once /datasets is in: the search where the server offers it, of the box's
+// text (the link's q= at first), the search shown asked anew (of another
+// build); none where it doesn't offer it.
+function updateSearch() {
+  const offered = searchOffered(mode, catalog);
+  searchSection.hidden = !offered;
+  if (!offered) placeSearch.clear();
+  else if (placeSearch.q) placeSearch.again();
+  else if (searchBox.value.trim()) placeSearch.submit(searchBox.value);
+}
+
+// A dot for each row of the matrix, drawn anew only where they change.
+function drawSearchDots(views) {
+  if (!mapReady) return;
+  const colors = views.map((v) => v.color);
+  const labels = views.map((v) => v.label);
+  const dots = searchShown.map((row) => ({ row, background: dotBackground(row, colors), title: dotTitle(row, labels) }));
+  const drawn = JSON.stringify(dots.map((d) => [d.row.lat, d.row.lng, d.background, d.title]));
+  if (drawn === dotsDrawn) return;
+  dotsDrawn = drawn;
+  for (const dot of searchDots) dot.remove();
+  searchDots = dots.map((d, n) => {
+    const el = document.createElement('div');
+    el.className = 'search-dot';
+    el.title = d.title;
+    const fill = document.createElement('div');
+    fill.className = 'search-dot-fill';
+    fill.style.background = d.background;
+    el.appendChild(fill);
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      pickSearchRow(n);
+    });
+    el.addEventListener('mouseenter', () => hoverSearchRow(n));
+    el.addEventListener('mouseleave', () => hoverSearchRow(null));
+    return new maplibregl.Marker({ element: el }).setLngLat([d.row.lng, d.row.lat]).addTo(map);
+  });
+}
+
+// Marks the row `n` of the matrix and its dot (none: null).
+function hoverSearchRow(n) {
+  if (n === searchHovered) return;
+  searchHovered = n;
+  searchDots.forEach((dot, i) => dot.getElement().classList.toggle('hover', i === n));
+  searchOut.querySelectorAll('tr[data-row]').forEach((tr) => tr.classList.toggle('hover', Number(tr.dataset.row) === n));
+}
+
+// The row `n`'s point, looked up in every column.
+function pickSearchRow(n) {
+  const row = searchShown[n];
+  if (row) reverseGeocode(row.lat, row.lng, searchSource(placeSearch.q, row, columns.map(columnLabel)));
+}
+
+searchBox.addEventListener('input', () => placeSearch.typed(searchBox.value));
+searchBox.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    placeSearch.submit(searchBox.value);
+  }
+});
+searchOut.addEventListener('click', (e) => {
+  if (e.target.closest('[data-action="more"]')) {
+    searchExpanded = searchExpanded === placeSearch.q ? null : placeSearch.q;
+    renderSearch();
+    return;
+  }
+  const tr = e.target.closest('tr[data-row]');
+  if (tr) pickSearchRow(Number(tr.dataset.row));
+});
+searchOut.addEventListener('mouseover', (e) => {
+  const tr = e.target.closest('tr[data-row]');
+  hoverSearchRow(tr ? Number(tr.dataset.row) : null);
+});
+searchOut.addEventListener('mouseleave', () => hoverSearchRow(null));
+
 // -- Status --
 // The portal's /health, every minute (every 5 s while a sync runs): the
-// status line, and the datasets anew once another build is served
-// (catalogStale).
+// status line, the progress of the indexes a column of the search waits
+// for, and the datasets anew once another build is served (catalogStale).
 async function pollHealth() {
   let health = null;
   try {
     health = await (await fetch('/health')).json();
   } catch (e) {}
   document.getElementById('status').innerHTML = statusHtml(health);
+  lastHealth = health;
+  if (Object.values(placeSearch.answers).some((a) => a && a.building)) renderSearch();
   if (catalogStale(health, mode, catalog)) await loadCatalog();
   setTimeout(pollHealth, health && health.sync && health.sync.running ? 5000 : 60000);
 }
@@ -2019,6 +2563,8 @@ updatePolygonsBtn();
   await loadCatalog();
   if (mode !== 'single') pollHealth();
   await mapLoaded;
+  mapReady = true;
+  drawSearchDots(searchViews());
   loadResults();
   if (polygonsColumn !== 'off') ensurePolygonLayer();
   linkRestored = true;
