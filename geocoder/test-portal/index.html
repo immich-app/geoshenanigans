@@ -1010,11 +1010,36 @@ function mismatchHtml(linkBuild, served) {
   return `This link was made on build ${esc(linkBuild)}; the server serves build ${esc(served)} now, whose answers may differ.`;
 }
 
+// The key a column's answers are kept by: its dataset's id ('' for the one
+// dataset of a server without /datasets, or of the portal while it waits
+// for a build); none for a column without one.
+function columnKey(col) {
+  if (col.single) return '';
+  return col.dataset ? col.dataset.id : null;
+}
+
 // The polygon overlay's next state: off, then each of `count` columns in
 // turn, then off.
 function nextPolygons(current, count) {
   const next = current === 'off' ? 0 : current + 1;
   return next < count ? next : 'off';
+}
+
+// What the polygon overlay on the column `column` ('off', or a place in
+// `columns`) shows of a result: the dataset of that column (its key) in the
+// build `build`; none while it is off or its column has no dataset.
+function overlayTarget(column, columns, build) {
+  const col = column === 'off' ? null : columns[column];
+  const key = col ? columnKey(col) : null;
+  return key === null ? null : { key, build };
+}
+
+// Whether the overlay shows another thing (overlayTarget) as `after` than
+// as `before`: another dataset, another build, or none where it showed one
+// or the other way round. What it drew of `before` is then of neither.
+function overlayMoved(before, after) {
+  if (!before || !after) return before !== after;
+  return before.key !== after.key || before.build !== after.build;
 }
 
 // The polygon overlay's requests (the page's other script draws them):
@@ -1118,13 +1143,6 @@ function servedBuild() {
   return catalog ? catalog.build.dir : null;
 }
 
-// The key a column's answers are kept by: its dataset's id ('' for the one
-// dataset of a server without /datasets); none for a column without one.
-function columnKey(col) {
-  if (col.single) return '';
-  return col.dataset ? col.dataset.id : null;
-}
-
 function columnLabel(col) {
   if (col.single) return 'This server';
   return col.dataset ? col.dataset.label : col.token;
@@ -1143,9 +1161,13 @@ let catalogRetry = null;
 
 // Asks /datasets how the page answers, and lays out its columns: as they
 // were named (the link's or the pickers'), else OPENING_PRESETS. While the
-// portal waits for a build, it asks again every 30 s.
+// portal waits for a build, it asks again every 30 s. Where that moves the
+// polygon overlay (another dataset at its column, another build, or no
+// column), what it drew goes, and the selected result's polygons are asked
+// anew where its column still has a dataset.
 async function loadCatalog() {
   clearTimeout(catalogRetry);
+  const shown = overlayTarget(polygonsColumn, columns, servedBuild());
   let status = 0;
   let json = null;
   let body = '';
@@ -1179,6 +1201,10 @@ async function loadCatalog() {
   if (entry) {
     askColumns(entry);
     showDetail(entry.id);
+  }
+  if (overlayMoved(shown, overlayTarget(polygonsColumn, columns, servedBuild()))) {
+    clearPolygonLayer();
+    if (polygonsColumn !== 'off' && entry) updatePolygonLayer(entry.id);
   }
 }
 

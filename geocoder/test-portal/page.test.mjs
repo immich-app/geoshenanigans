@@ -766,6 +766,29 @@ test('polygons are drawn only while no clear came after their request and its re
   assert.deepEqual(drawn, ['erased', 5]);
 });
 
+// A reload of /datasets may give the overlay's column another dataset, the
+// columns another build, or leave the overlay no column: what it showed is
+// then of none of them, and goes. A point selected while the portal waited
+// for its build was asked of the one column of the server as it was.
+test('a reload of the datasets moves the polygon overlay where its dataset or build is another, or it is off', () => {
+  const { overlayTarget, overlayMoved, resolveColumn } = core();
+  const c = catalog();
+  const columns = (tokens) => tokens.map((token) => resolveColumn(c, token));
+  const shown = overlayTarget(0, columns(['with-addresses', 'smallest']), '2026-11-20-1');
+  assert.deepEqual(plain(shown), { key: 'full.simplified.all', build: '2026-11-20-1' });
+  assert.equal(overlayMoved(shown, overlayTarget(0, columns(['with-addresses', 'smallest']), '2026-11-20-1')), false);
+  assert.equal(overlayMoved(shown, overlayTarget(0, columns(['with-addresses', 'smallest']), '2026-11-20-2')), true);
+  assert.equal(overlayMoved(shown, overlayTarget(0, columns(['smallest', 'with-addresses']), '2026-11-20-1')), true);
+  assert.equal(overlayTarget('off', columns(['with-addresses']), '2026-11-20-1'), null);
+  assert.equal(overlayTarget(1, columns(['with-addresses']), '2026-11-20-1'), null);
+  assert.equal(overlayTarget(0, columns(['everything']), '2026-11-20-1'), null);
+  assert.equal(overlayMoved(shown, null), true);
+  assert.equal(overlayMoved(null, null), false);
+  const waiting = overlayTarget(0, [{ single: true }], null);
+  assert.deepEqual(plain(waiting), { key: '', build: null });
+  assert.equal(overlayMoved(waiting, shown), true);
+});
+
 test('the JSON of an answer is shown highlighted and escaped', () => {
   const { syntaxHighlight } = core();
   const out = syntaxHighlight({ name: '<img src=x>', n: 1, ok: true, none: null });
