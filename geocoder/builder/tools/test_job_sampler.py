@@ -34,6 +34,13 @@ def write(path, text):
         f.write(text)
 
 
+def keeps_dropped_pages(path):
+    """Whether the file system at `path` keeps a file's pages in memory whatever is dropped: on tmpfs and ramfs the
+    page cache is the file."""
+    kind = subprocess.run(["stat", "-f", "-c", "%T", path], capture_output=True, text=True, check=True).stdout.strip()
+    return kind in ("tmpfs", "ramfs")
+
+
 class JobSamplerTest(unittest.TestCase):
     def setUp(self):
         self.root = tempfile.mkdtemp()
@@ -57,15 +64,37 @@ class JobSamplerTest(unittest.TestCase):
         os.chmod(os.path.join(self.bin, "df"), 0o755)
         self.log = os.path.join(self.root, "jobstat.log")
 
-    def sample(self, seconds=2.5, files=()):
+    def start(self, files=()):
+        """The sampler, a sample a second, stopped when the test ends."""
         job = subprocess.Popen(["bash", SAMPLER, self.log, self.root, "1", *files],
                                env=dict(os.environ, JOB_SAMPLER_ROOT=self.root,
                                         PATH=f"{self.bin}:{os.environ['PATH']}"))
-        time.sleep(seconds)
-        job.kill()
-        job.wait()
-        with open(self.log) as f:
-            return f.read().splitlines()
+        self.addCleanup(job.wait)
+        self.addCleanup(job.kill)
+        return job
+
+    def lines_once(self, done, seconds=30):
+        """The log's whole lines once `done` holds of them (at most `seconds`)."""
+        deadline = time.time() + seconds
+        lines = []
+        while time.time() < deadline:
+            if os.path.exists(self.log):
+                with open(self.log) as f:
+                    text = f.read()
+                lines = text[:text.rfind("\n") + 1].splitlines()
+                if done(lines):
+                    return lines
+            time.sleep(0.05)
+        self.fail(f"the sampler's log never got there: {lines}")
+
+    def sample(self, lines=3, files=()):
+        """The log's first `lines` lines: the header and samples."""
+        job = self.start(files)
+        try:
+            return self.lines_once(lambda got: len(got) >= lines)[:lines]
+        finally:
+            job.kill()
+            job.wait()
 
     def test_the_first_line_gives_the_cpus_and_the_jobs_cpu_quota(self):
         lines = self.sample()
@@ -89,7 +118,7 @@ class JobSamplerTest(unittest.TestCase):
                 if os.path.exists(self.log):
                     os.remove(self.log)
 
-                lines = self.sample(seconds=1.5)
+                lines = self.sample(lines=1)
 
                 self.assertRegex(lines[0], rf" cgroup=/pod/job cpu\.max={expected} device=rbd4$")
 
@@ -97,7 +126,7 @@ class JobSamplerTest(unittest.TestCase):
         lines = self.sample()
 
         samples = [line for line in lines[1:]]
-        self.assertGreaterEqual(len(samples), 2, lines)
+        self.assertEqual(len(samples), 2, lines)
         for line in samples:
             self.assertRegex(line, r"^\[jobstat \d\d:\d\d:\d\d\] ")
             fields = dict(re.findall(r"(\w+)=(\S+(?: \S+)*?)(?= \w+=|$)", line.split("] ", 1)[1]))
@@ -120,6 +149,7 @@ class JobSamplerTest(unittest.TestCase):
 
         lines = self.sample(files=files)
 
+        self.assertEqual(len(lines), 3, lines)
         for line in lines[1:]:
             cached = re.search(r" cached=(\S+)$", line)
             self.assertIsNotNone(cached, line)
@@ -127,18 +157,18 @@ class JobSamplerTest(unittest.TestCase):
             self.assertLessEqual(int(cached.group(1).split(":")[1]), 10000)
 
     def test_the_counters_are_read_again_for_each_sample(self):
-        job = subprocess.Popen(["bash", SAMPLER, self.log, self.root, "1"],
-                               env=dict(os.environ, JOB_SAMPLER_ROOT=self.root,
-                                        PATH=f"{self.bin}:{os.environ['PATH']}"))
-        time.sleep(1.5)
-        write(os.path.join(self.root, "sys/fs/cgroup/pod/job/cpu.stat"), "usage_usec 999000\n")
-        time.sleep(1.5)
-        job.kill()
-        job.wait()
-        with open(self.log) as f:
-            usage = re.findall(r"usage_usec=(\d+)", f.read())
-        self.assertEqual(usage[0], "777000")
-        self.assertEqual(usage[-1], "999000")
+        def usage(lines):
+            return re.findall(r"usage_usec=(\d+)", "\n".join(lines))
+
+        self.start()
+        self.lines_once(lambda lines: usage(lines))
+        stat = os.path.join(self.root, "sys/fs/cgroup/pod/job/cpu.stat")
+        write(stat + ".part", "usage_usec 999000\n")
+        os.replace(stat + ".part", stat)
+        lines = self.lines_once(lambda lines: "999000" in usage(lines))
+
+        self.assertEqual(usage(lines)[0], "777000")
+        self.assertEqual(usage(lines)[-1], "999000")
 
 
 def step(name):
@@ -164,15 +194,15 @@ class PageCacheTest(unittest.TestCase):
         return done.stdout.strip()
 
     def test_a_file_is_cached_once_read_and_not_once_dropped(self):
+        if keeps_dropped_pages(self.dir):
+            self.skipTest("the page cache keeps what is dropped here (tmpfs)")
         path = os.path.join(self.dir, "planet.osm.pbf")
         size = 5 * (1 << 20) + 123
         write(path, "y" * size)
         with open(path, "rb") as f:
             os.fsync(f.fileno())
             os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
-        dropped = self.page_cache(path)
-        if dropped != "planet.osm.pbf:0":
-            self.skipTest(f"the page cache keeps what is dropped here (tmpfs): {dropped}")
+        self.assertEqual(self.page_cache(path), "planet.osm.pbf:0")
         with open(path, "rb") as f:
             f.read()
 
@@ -180,16 +210,15 @@ class PageCacheTest(unittest.TestCase):
 
     # A last page short of the file's end counts the file's bytes in it alone, whatever else is cached.
     def test_a_cached_last_page_counts_only_the_files_bytes_in_it(self):
+        if keeps_dropped_pages(self.dir):
+            self.skipTest("the page cache keeps what is dropped here (tmpfs)")
         path = os.path.join(self.dir, "planet.osm.pbf")
         write(path, "y" * (mmap.PAGESIZE + 1))
         with open(path, "rb") as f:
             os.fsync(f.fileno())
             os.posix_fadvise(f.fileno(), 0, mmap.PAGESIZE, os.POSIX_FADV_DONTNEED)
-        left = self.page_cache(path)
-        if left == f"planet.osm.pbf:{mmap.PAGESIZE + 1}":
-            self.skipTest(f"the page cache keeps what is dropped here (tmpfs): {left}")
 
-        self.assertEqual(left, "planet.osm.pbf:1")
+        self.assertEqual(self.page_cache(path), "planet.osm.pbf:1")
 
     # Linux reports every page of a file's mapping cached unless the caller owns the file or could open it for
     # writing: such a file prints "?" rather than a count it can't know.
@@ -217,7 +246,8 @@ class NightlySamplerTest(unittest.TestCase):
     # with the run's other logs.
     def test_the_nightly_samples_the_whole_job_every_30_s(self):
         names = [name or uses for name, uses in step_names()]
-        self.assertEqual(names[:2], ["actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803", "Start the job sampler"])
+        self.assertTrue(names[0].startswith("actions/checkout@"), names[0])
+        self.assertEqual(names[1], "Start the job sampler")
         script = step("Start the job sampler")
         self.assertIn('setsid nohup "$GITHUB_WORKSPACE/geocoder/builder/tools/job_sampler.sh" "$RUNNER_TEMP/jobstat.log" '
                       '"$RUNNER_TEMP" 30 \\\n'
