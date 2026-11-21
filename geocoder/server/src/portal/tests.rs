@@ -1533,10 +1533,36 @@ async fn a_request_without_a_dataset_answers_with_addresses() {
     assert!(unknown.body.starts_with("unknown dataset \"everything\": this build offers the presets smallest, immich-recommended, with-addresses, max-quality and "), "{}", unknown.body);
 }
 
+// A /reverse the portal can't answer (no build served yet, a dataset it
+// doesn't offer) takes nothing of its key's daily allowance: a key allowed
+// one lookup a day has it answered after those.
+#[tokio::test]
+async fn a_reverse_the_portal_cant_answer_takes_nothing_of_the_keys_allowance() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let p = portal(data.path(), config(&bucket, load));
+    let db = serde_json::json!({
+        "users": { "daily": { "password_hash": "", "admin": false, "rate_per_second": 0, "rate_per_day": 1, "rate_by_ip": false } },
+        "tokens": { "daily": "daily" },
+    });
+    let url = serve(router(p.clone(), Arc::new(RwLock::new(serde_json::from_value(db).unwrap())))).await;
+    let reverse = |dataset: &str| format!("{url}/reverse?lat=10.5&lon=20.5&key=daily{dataset}");
+
+    assert_eq!(fetch(&reverse("")).await.status, 503);
+    p.round(true).await.unwrap();
+    for dataset in ["&dataset=everything", "&dataset=admin-minimal.exact.none"] {
+        assert_eq!(fetch(&reverse(dataset)).await.status, 400, "{dataset}");
+    }
+
+    assert_eq!(fetch(&reverse("")).await.status, 200);
+    assert_eq!(fetch(&reverse("")).await.status, 429);
+}
+
 // A lookup's headers name the build that answered by its date and by its
-// dir, which /health and /datasets name too: a build published again under
-// its date is another, in a dir of its own, and they name that once it is
-// served.
+// dir, which /health (its build and its sync's) and /datasets name too: a
+// build published again under its date is another, in a dir of its own,
+// and they name that once it is served.
 #[tokio::test]
 async fn the_headers_health_and_datasets_name_the_build_served_by_its_dir() {
     let bucket = test_bucket::serve(test_bucket::template_components()).await;
@@ -1557,7 +1583,8 @@ async fn the_headers_health_and_datasets_name_the_build_served_by_its_dir() {
             let exposed = got.header("access-control-expose-headers").unwrap_or_default();
             assert!(exposed.split(", ").any(|h| h == "x-geocoder-build-dir"), "{route}: {exposed}");
         }
-        assert_eq!(fetch(&format!("{url}/health")).await.json()["build"]["dir"], dir);
+        let (health, want) = (fetch(&format!("{url}/health")).await.json(), serde_json::Value::from(dir.as_str()));
+        assert_eq!((&health["build"]["dir"], &health["sync"]["served"]), (&want, &want));
         assert_eq!(fetch(&format!("{url}/datasets")).await.json()["build"]["dir"], dir);
     }
 }

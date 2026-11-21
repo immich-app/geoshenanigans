@@ -272,10 +272,13 @@ fn json(status: StatusCode, body: String) -> Response {
 }
 
 /// 200 with the build served, its dataset count and the sync's status; 503
-/// with the reason and the sync's status while there is none.
+/// with the reason and the sync's status while there is none. The status's
+/// build served is the one this answer names, though a switch came between
+/// the two reads.
 async fn health(State(app): State<Arc<App>>) -> Response {
-    let sync = app.portal.status();
-    match app.portal.served() {
+    let (mut sync, served) = (app.portal.status(), app.portal.served());
+    sync.served = served.as_ref().map(|s| s.dir.clone());
+    match served {
         Some(served) => json(StatusCode::OK, serde_json::json!({
             "status": "ok",
             "build": { "date": served.plan.date, "version": served.plan.version, "dir": served.dir },
@@ -345,27 +348,29 @@ async fn lookup(portal: &Portal, served: Arc<Served>, at: usize, answer: impl Fn
 }
 
 /// /reverse of a dataset, checked as query-server checks it, answered as a
-/// lookup.
+/// lookup. The dataset is found first: a request the portal can't answer
+/// (no build served, a dataset it doesn't offer) takes nothing of its key's
+/// rate, and tells nothing /datasets doesn't.
 async fn reverse(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, Query(p): Query<Params>) -> Response {
-    if let Err(resp) = handlers::check_reverse(&app.db, &app.limiter, p.key.as_deref(), p.lat, p.lon, peer.ip()) {
-        return resp;
-    }
     let (served, at) = match app.portal.dataset(p.dataset.as_deref()) {
         Ok(found) => found,
         Err(resp) => return resp,
     };
+    if let Err(resp) = handlers::check_reverse(&app.db, &app.limiter, p.key.as_deref(), p.lat, p.lon, peer.ip()) {
+        return resp;
+    }
     lookup(&app.portal, served, at, move |index| handlers::reverse_answer(index, p.lat, p.lon, p.debug.as_deref())).await
 }
 
 /// /polygons of a dataset, as reverse.
 async fn polygons(State(app): State<Arc<App>>, Query(p): Query<Params>) -> Response {
-    if let Err(resp) = handlers::check_polygons(&app.db, p.key.as_deref(), p.lat, p.lon) {
-        return resp;
-    }
     let (served, at) = match app.portal.dataset(p.dataset.as_deref()) {
         Ok(found) => found,
         Err(resp) => return resp,
     };
+    if let Err(resp) = handlers::check_polygons(&app.db, p.key.as_deref(), p.lat, p.lon) {
+        return resp;
+    }
     lookup(&app.portal, served, at, move |index| handlers::polygons_answer(index, p.lat, p.lon)).await
 }
 
