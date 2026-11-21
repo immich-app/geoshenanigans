@@ -186,7 +186,7 @@ pub struct Portal {
     /// has not.
     started: std::sync::atomic::AtomicBool,
     /// A place for each lookup that may run (Config::lookups_at_once),
-    /// held until the lookup ends.
+    /// held until its answer's body is sent or dropped (lookup).
     pub lookups: Arc<tokio::sync::Semaphore>,
     http: reqwest::Client,
 }
