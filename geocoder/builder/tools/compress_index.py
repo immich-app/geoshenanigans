@@ -54,6 +54,11 @@ build-24 planet tree (64 CPUs) this took 310 s against 417 s for a thread
 per 256 MiB on one worker a CPU, whose tail was one 427 MB file on one
 thread, with half the memory; and every output byte was the same. Each item
 prints its start and end, in seconds from the run's start, and its threads.
+
+A child that stalls (CHILD_SECONDS) is killed and fails its item: a unit's
+goes as .zst, and a file's ends the run with the error, for the caller to
+compress again, rather than holding its threads, and every item behind them,
+until the job's timeout.
 """
 import argparse
 import hashlib
@@ -71,6 +76,13 @@ from itertools import count
 LEVEL = "-18"
 BYTES_PER_THREAD = 32 << 20
 MAX_THREADS_PER_FILE = 8
+
+# A child (a file's zstd, a unit's encode and its zstd, its verify) still running past CHILD_SECONDS and a second
+# per CHILD_BYTES_PER_SECOND of its item has stalled: it is killed and waited for, and its item fails. Far past a
+# slow night's: at nice 10 beside the patch jobs a zstd thread can get a tenth of a core, a few hundred KB/s at
+# -18, and an item has a thread per 32 MiB, up to 8.
+CHILD_SECONDS = 900
+CHILD_BYTES_PER_SECOND = 1 << 20
 
 # The exit status when a transport unit failed and its files went as .zst.
 UNIT_FAILED = 3
@@ -183,9 +195,16 @@ def job(ticket, fn, *args):
         ticket.close()
 
 
+def child_seconds(size):
+    """How long a child working through an item of `size` bytes runs before it counts as stalled."""
+    return CHILD_SECONDS + size / CHILD_BYTES_PER_SECOND
+
+
 def compress(ticket, path, threads):
     ticket.take(threads)
-    subprocess.run(["zstd", LEVEL, f"-T{threads}", "-f", "--quiet", path], check=True)
+    # A zstd past its time is killed and waited for, and this raises: the run fails, for the caller to run again.
+    subprocess.run(["zstd", LEVEL, f"-T{threads}", "-f", "--quiet", path], check=True,
+                   timeout=child_seconds(os.path.getsize(path)))
 
 
 class Unit:
@@ -209,7 +228,8 @@ def units_of(cfg, rels):
 
 
 def run_logged(cmd, **kw):
-    """cmd's exit status and what it wrote to stderr, or the reason it couldn't start."""
+    """cmd's exit status and what it wrote to stderr, or the reason it couldn't start. Past a `timeout` it is killed
+    and waited for, and subprocess.TimeoutExpired raised."""
     with tempfile.TemporaryFile() as err:
         try:
             status = subprocess.run(cmd, stderr=err, **kw).returncode
@@ -221,10 +241,14 @@ def run_logged(cmd, **kw):
 
 def encode_unit(ticket, transport, out, unit, threads):
     """Writes the unit: the stream `geocoder-transport encode` gives of its files, through zstd,
-    then checks it decodes to them. What failed, or None; a unit that failed is removed."""
+    then checks it decodes to them. What failed, or None; a unit that failed is removed. The
+    encode and its zstd, then the verify, have child_seconds of the unit's bytes: past it they
+    are killed, and the unit fails. However this ends, neither outlives it."""
     path = os.path.join(out, unit.path)
     d = os.path.dirname(path)
     cmd = [transport, "encode", unit.kind, d] + ([os.path.basename(unit.files[0])] if unit.kind == "cols" else [])
+    limit = child_seconds(sum(os.path.getsize(os.path.join(out, f)) for f in unit.files))
+    stalled = f"still running after {limit:.0f}s, killed"
     why = None
     ticket.take(threads)
     with tempfile.TemporaryFile() as err:
@@ -233,17 +257,40 @@ def encode_unit(ticket, transport, out, unit, threads):
         except OSError as e:
             why = f"encode: {e}"
         else:
-            zstd, zstd_err = run_logged(["zstd", LEVEL, f"-T{threads}", "-f", "--quiet", "-o", path], stdin=enc.stdout)
-            enc.stdout.close()
-            if enc.wait() != 0:
-                err.seek(0)
-                why = f"encode: {err.read().decode(errors='replace').strip() or f'exit status {enc.returncode}'}"
-            elif zstd != 0:
-                why = f"zstd: {zstd_err or f'exit status {zstd}'}"
+            try:
+                end = time.monotonic() + limit
+                try:
+                    zstd, zstd_err = run_logged(["zstd", LEVEL, f"-T{threads}", "-f", "--quiet", "-o", path],
+                                                stdin=enc.stdout, timeout=limit)
+                except subprocess.TimeoutExpired:
+                    zstd = None
+                # The pipe's read end is zstd's alone now: an encode still writing to it gets EPIPE.
+                enc.stdout.close()
+                try:
+                    enc.wait(timeout=max(0.0, end - time.monotonic()))
+                except subprocess.TimeoutExpired:
+                    pass
+                if zstd is None:
+                    why = f"encode and zstd: {stalled}"
+                elif enc.returncode is None:
+                    why = f"encode: {stalled}"
+                elif enc.returncode != 0:
+                    err.seek(0)
+                    why = f"encode: {err.read().decode(errors='replace').strip() or f'exit status {enc.returncode}'}"
+                elif zstd != 0:
+                    why = f"zstd: {zstd_err or f'exit status {zstd}'}"
+            finally:
+                enc.stdout.close()
+                if enc.poll() is None:
+                    enc.kill()
+                enc.wait()
     # The verify runs on one thread.
     ticket.give(threads - 1)
     if why is None:
-        status, verify_err = run_logged([transport, "verify", path, d], stdout=subprocess.DEVNULL)
+        try:
+            status, verify_err = run_logged([transport, "verify", path, d], stdout=subprocess.DEVNULL, timeout=limit)
+        except subprocess.TimeoutExpired:
+            status, verify_err = None, stalled
         if status != 0:
             why = f"verify: {verify_err or f'exit status {status}'}"
     if why is not None and os.path.exists(path):

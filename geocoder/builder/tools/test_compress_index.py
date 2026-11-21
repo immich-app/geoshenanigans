@@ -38,6 +38,18 @@ if threads:
 sys.exit(status)
 '''
 
+# zstd as a run that stalls one runs it: each call appends its pid to $ZSTD_PIDS, and one whose last argument (the
+# file it compresses, or the unit it writes) ends with $ZSTD_STALL appends it to $FAKE_STALLED too and sleeps; the
+# others are $REAL_ZSTD's.
+STALLING_ZSTD = r'''#!/bin/sh
+echo $$ >> "$ZSTD_PIDS"
+for last; do :; done
+if [ -n "$ZSTD_STALL" ]; then
+  case "$last" in *"$ZSTD_STALL") echo $$ >> "$FAKE_STALLED"; exec sleep 300 ;; esac
+fi
+exec "$REAL_ZSTD" "$@"
+'''
+
 # A compress_index.py run in a child process (a run that hangs is killed at its timeout rather than holding up
 # the tests): 4 CPUs, a zstd thread per 64 KiB, and the change `plant` makes to the script first.
 CHILD_RUN = r'''
@@ -54,13 +66,19 @@ sys.exit(sut.main())
 # geocoder-transport as the script runs it. encode writes the kind, the members' names and sizes
 # (a JSON line), then the members' bytes; verify decodes that (through zstd) against the dir's
 # files and fails for a unit whose path ends with one of $FAKE_VERIFY_FAILS (":"-separated). Each
-# call is logged to $FAKE_TRANSPORT_LOG.
+# call is logged to $FAKE_TRANSPORT_LOG. A call $FAKE_TRANSPORT_STALL names ("<verb>:<end of its
+# first argument>") stalls: it appends its pid to $FAKE_STALLED and sleeps, its output left open.
 FAKE_TRANSPORT = r'''#!{python}
 import json, os, subprocess, sys
 MEMBERS = {{"places": ["place_cells.bin", "place_nodes.bin", "place_hidden.bin"],
            "pois": ["poi_records.bin", "poi_vertices.bin"], "arcs": ["arc_index.bin", "arc_vertices.bin"]}}
 with open(os.environ["FAKE_TRANSPORT_LOG"], "a") as f:
     f.write(" ".join(sys.argv[1:]) + "\n")
+verb, _, end = os.environ.get("FAKE_TRANSPORT_STALL", "").partition(":")
+if sys.argv[1] == verb and sys.argv[2].endswith(end):
+    with open(os.environ["FAKE_STALLED"], "a") as f:
+        f.write(f"{{os.getpid()}}\n")
+    os.execvp("sleep", ["sleep", "300"])
 if sys.argv[1] == "encode":
     kind, d, names = sys.argv[2], sys.argv[3], sys.argv[4:] or MEMBERS[sys.argv[2]]
     head = {{"kind": kind, "members": [[n, os.path.getsize(os.path.join(d, n))] for n in names]}}
@@ -82,6 +100,15 @@ for name, size in head["members"]:
     body = body[size:]
 print("verified " + head["kind"] + " unit")
 '''
+
+
+def alive(pid):
+    """Whether process `pid` runs (a zombie counts as ended)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except FileNotFoundError:
+        return False
 
 
 def write(path, data):
@@ -390,13 +417,75 @@ sut.run_logged = run_logged
         self.assert_child_run_fails(plant, "planted failure holding the unit's threads")
 
     def assert_child_run_fails(self, plant, error):
-        script = CHILD_RUN.format(here=HERE, plant=plant, out=self.out, transport=self.transport)
-        try:
-            done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
-        except subprocess.TimeoutExpired:
-            self.fail("the run hung")
+        done = self.child_run(plant)
         self.assertNotEqual(done.returncode, 0, done.stdout)
         self.assertIn(error, done.stderr)
+
+    def child_run(self, plant, env=None):
+        script = CHILD_RUN.format(here=HERE, plant=plant, out=self.out, transport=self.transport)
+        try:
+            return subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60,
+                                  env={**os.environ, **(env or {})})
+        except subprocess.TimeoutExpired:
+            self.fail("the run hung")
+
+    def stalled_run(self, env):
+        """A child run whose children stall as `env` asks (FAKE_TRANSPORT_STALL, ZSTD_STALL), a child's limit 5 s
+        whatever its bytes: the run, the configurations.json it left, the pids of the children that stalled, and
+        those of them and of the zstds it ran that still run once it ended (each ended then)."""
+        bin_dir = os.path.join(self.tmp.name, "stalling-bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        with open(os.path.join(bin_dir, "zstd"), "w") as f:
+            f.write(STALLING_ZSTD)
+        os.chmod(os.path.join(bin_dir, "zstd"), 0o755)
+        stalled, zstds = os.path.join(self.tmp.name, "stalled"), os.path.join(self.tmp.name, "zstd-pids")
+        for path in (stalled, zstds):
+            open(path, "w").close()
+
+        def pids(path):
+            with open(path) as f:
+                return [int(p) for p in f.read().split()]
+
+        plant = "sut.CHILD_SECONDS = 5\nsut.CHILD_BYTES_PER_SECOND = 1 << 40"
+        try:
+            done = self.child_run(plant, {"PATH": f"{bin_dir}:{os.environ['PATH']}", "REAL_ZSTD": shutil.which("zstd"),
+                                          "FAKE_STALLED": stalled, "ZSTD_PIDS": zstds, "ZSTD_STALL": "",
+                                          "FAKE_TRANSPORT_STALL": "", **env})
+            running = [p for p in pids(stalled) + pids(zstds) if alive(p)]
+        finally:
+            for pid in pids(stalled):
+                if alive(pid):
+                    os.kill(pid, 9)
+        with open(self.path("configurations.json")) as f:
+            cfg = json.load(f)
+        return done, cfg, pids(stalled), running
+
+    # A zstd that stalls, neither ending nor failing, is killed past its limit and the run ends with the error, for
+    # the caller to compress again: it must not hold its threads, and every job queued behind them, for good.
+    def test_a_zstd_that_stalls_is_killed_and_fails_the_run(self):
+        done, _, stalled, running = self.stalled_run({"ZSTD_STALL": "planet/full/addr_points.bin"})
+
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertRegex(done.stderr, r"TimeoutExpired: Command .*'zstd'.*planet/full/addr_points\.bin'\]' timed out")
+        self.assertEqual(len(stalled), 1)
+        self.assertEqual(running, [])
+
+    # A unit whose encode, zstd or verify stalls fails, and its encode and zstd end with it: its files go as .zst.
+    def test_a_unit_whose_encode_zstd_or_verify_stalls_fails_and_ends_them(self):
+        unit = "planet/poi/major/pois.tt.zst"
+        for env, why in [({"FAKE_TRANSPORT_STALL": "encode:pois"}, "encode and zstd"),
+                         ({"ZSTD_STALL": unit}, "encode and zstd"),
+                         ({"FAKE_TRANSPORT_STALL": f"verify:{unit}"}, "verify")]:
+            with self.subTest(env=env):
+                done, cfg, stalled, running = self.stalled_run(env)
+
+                self.assertEqual(done.returncode, sut.UNIT_FAILED, done.stdout + done.stderr)
+                self.assertIn(f"  {unit}: {why}: still running after 5s, killed; its files go as .zst\n", done.stdout)
+                self.assertNotIn(unit, cfg["units"])
+                for m in self.units[unit][1]:
+                    self.assertEqual(unzstd(self.path(m) + ".zst"), self.files[m], m)
+                self.assertEqual(len(stalled), 1)
+                self.assertEqual(running, [])
 
     SEARCH = ("planet/search/full/simplified/all/places.fst", "planet/search/full/simplified/all/search_meta.json")
 
