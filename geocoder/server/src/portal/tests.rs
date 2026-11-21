@@ -1068,6 +1068,32 @@ async fn a_round_reads_the_builds_files_before_it_switches_and_fetches_again_one
     assert!(std::fs::read(&changed).unwrap() == bucket.file(&order[0].files[0]));
 }
 
+// A ledger whose last line a kill cut short is mended before the resumed
+// sync adds a line: each object it fetches is a line of its own, none
+// joined to what the kill left.
+#[tokio::test]
+async fn a_resumed_sync_mends_a_ledger_line_a_kill_cut_short_before_it_adds_one() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let (order, root) = killed_part_way(&bucket, data.path(), load.clone()).await;
+    {
+        use std::io::Write;
+        let mut ledger = std::fs::OpenOptions::new().append(true).open(root.join(sync::FETCHED)).unwrap();
+        ledger.write_all(&order[3].path.as_bytes()[..8]).unwrap();
+    }
+
+    assert_eq!(portal(data.path(), config(&bucket, load)).round(true).await, Ok(format!("build {DATE} is served ({DATE}-1)")));
+
+    let text = std::fs::read_to_string(root.join(sync::FETCHED)).unwrap();
+    assert!(text.ends_with('\n'), "{text:?}");
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.sort();
+    let mut want: Vec<&str> = order.iter().map(|o| o.path.as_str()).collect();
+    want.sort();
+    assert_eq!(lines, want);
+}
+
 // Two tries at one file at once (one a round left running, one of the
 // next) each write a file of their own, and each puts it in place.
 #[tokio::test]

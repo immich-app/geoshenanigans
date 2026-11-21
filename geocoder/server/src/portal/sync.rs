@@ -12,16 +12,16 @@
 // dir of its own, named anew, which no server maps until it is complete: a
 // sync never writes into the dir of the build served, and a build found
 // damaged is fetched again into a new dir. A sync killed part way resumes
-// in its dir: it reads the files of the objects its ledger names against
-// their sha256, removes what its ledger doesn't name and those that don't
-// hold their bytes (an object in place before its line went in, a try's
-// temporary file), then weighs the room it needs for the objects still to
-// fetch, and fetches only those. Files of the same bytes within a build are
-// fetched once and hard-linked (catalog::Object::link). No switch to a
-// build, at start or after a sync, comes before every file of it is read
-// against its manifest's sha256 and each dataset's dir is found to hold the
-// build's files themselves (Portal::checked); a build that fails that is
-// fetched again, not refused.
+// in its dir: it cuts a ledger line the kill cut short, reads the files of
+// the objects its ledger names against their sha256, removes what its
+// ledger doesn't name and those that don't hold their bytes (an object in
+// place before its line went in, a try's temporary file), then weighs the
+// room it needs for the objects still to fetch, and fetches only those.
+// Files of the same bytes within a build are fetched once and hard-linked
+// (catalog::Object::link). No switch to a build, at start or after a sync,
+// comes before every file of it is read against its manifest's sha256 and
+// each dataset's dir is found to hold the build's files themselves
+// (Portal::checked); a build that fails that is fetched again, not refused.
 //
 // A build is the one of a date as its configurations.json was published: a
 // rerun of the nightly that publishes a date's build again makes another,
@@ -344,6 +344,19 @@ fn verify(root: &Path, cfg: &Configurations, plan: &Plan) -> Result<(), String> 
 fn check(root: &Path, cfg: &Configurations, plan: &Plan) -> Result<(), String> {
     in_place(root, cfg, plan)?;
     verify(root, cfg, plan)
+}
+
+/// Cuts from the ledger of the build dir `root` a last line a kill cut
+/// short, so that the next line added is one of its own. A ledger that
+/// can't be read stays as it is: adding a line to it fails, saying why.
+fn mend_ledger(root: &Path) -> std::io::Result<()> {
+    let path = root.join(FETCHED);
+    let Ok(text) = std::fs::read(&path) else { return Ok(()) };
+    if text.last().is_none_or(|&b| b == b'\n') {
+        return Ok(());
+    }
+    let whole = text.iter().rposition(|&b| b == b'\n').map_or(0, |at| at + 1);
+    std::fs::OpenOptions::new().write(true).open(&path)?.set_len(whole as u64)
 }
 
 /// The lock of the data dir `data` (VOLUME_LOCK), held until the file
@@ -773,6 +786,9 @@ impl Portal {
                 .await
                 .map_err(|e| format!("leftovers task: {e}"))?
                 .map_err(|e| format!("build {name}: {e}"))?;
+            // A last ledger line a kill cut short goes before a line is
+            // added.
+            mend_ledger(&root).map_err(|e| format!("mend {}: {e}", root.join(FETCHED).display()))?;
         }
         let done = ledger(&root);
         let (mut held, mut todo): (Vec<&catalog::Object>, Vec<&catalog::Object>) = plan.objects.iter()
