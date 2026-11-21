@@ -451,6 +451,22 @@ TEST(apply_drops_the_input_behind_the_written_output) {
     sut.finish();  // length 0: to the end of the file
     CHECK(drops.back() == std::make_pair(20 * MiB, uint64_t(0)));
     CHECK_EQ(drops.size(), size_t(3));
+
+    // A step of 0 drops whatever the input read gained, and nothing while it
+    // stays put: an empty range would be posix_fadvise's "to the end".
+    drops.clear();
+    InputPageDropper each([&](uint64_t offset, uint64_t length) { drops.emplace_back(offset, length); }, 0);
+    each.written(0);
+    CHECK(drops.empty());
+    each.appended(2 * MiB, MiB + 100);
+    each.written(2 * MiB);
+    each.written(2 * MiB);  // nothing more read
+    each.appended(3 * MiB, MiB + 200);
+    each.written(3 * MiB);  // still within the first MiB past the drop
+    each.appended(4 * MiB, 2 * MiB);
+    each.written(4 * MiB);
+    CHECK(drops == (std::vector<std::pair<uint64_t, uint64_t>>{{0, MiB}, {MiB, MiB}}));
+    CHECK_EQ(each.dropped(), 2 * MiB);
 }
 
 // The point of the drops: after a run the output, which build-index reads
@@ -556,9 +572,9 @@ TEST(apply_drops_the_input_while_it_writes_and_changes_no_byte_of_the_output) {
     CHECK(dropped <= input_bytes);
     CHECK(dropped + 3 * MiB >= input_bytes);
     CHECK(drops.back() == std::make_pair(dropped, uint64_t(0)));
-    // A line each 2 MiB more of the input dropped, at a drop's end, with the
-    // output written then, which is past it: this input and its output
-    // differ by a blob or two.
+    // A line each 2 MiB more of the input asked out of the page cache, at a
+    // drop's end, with the output written then, which is past it: this input
+    // and its output differ by a blob or two.
     std::istringstream lines(logged);
     std::set<uint64_t> ends;
     for (size_t i = 0; i + 1 < drops.size(); i++) ends.insert((drops[i].first + drops[i].second) >> 20);
@@ -566,7 +582,7 @@ TEST(apply_drops_the_input_while_it_writes_and_changes_no_byte_of_the_output) {
     int seen = 0;
     for (std::string line; std::getline(lines, line);) {
         unsigned long long to = 0, written = 0;
-        if (std::sscanf(line.c_str(), "[pbf-apply] input dropped from the page cache to %llu MiB, %llu MiB of the output written",
+        if (std::sscanf(line.c_str(), "[pbf-apply] input asked out of the page cache up to %llu MiB, %llu MiB of the output written",
                         &to, &written) != 2)
             continue;
         seen++;

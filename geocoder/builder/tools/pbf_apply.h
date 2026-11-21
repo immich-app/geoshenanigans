@@ -71,9 +71,10 @@ constexpr size_t kPeekPrefetchBlobs = 256;
 // bytes, cut at kInputDropAlignBytes (see InputPageDropper).
 constexpr uint64_t kInputDropStepBytes = uint64_t(64) << 20;
 constexpr uint64_t kInputDropAlignBytes = uint64_t(1) << 20;
-// A log line each time this many more bytes of the input have been dropped,
-// with the output written then: the run's log shows where the drops ran
-// against the writer.
+// A log line each time this many more bytes of the input have been asked
+// out of the page cache (posix_fadvise's DONTNEED, a request: whether the
+// pages went is not known), with the output written then: the run's log
+// shows where the drops ran against the writer.
 constexpr uint64_t kInputDropLogBytes = uint64_t(16) << 30;
 
 // Drops the input's pages from the page cache behind the writer, so that
@@ -114,7 +115,8 @@ public:
             items_.pop_front();
         }
         const uint64_t end = read_ / kInputDropAlignBytes * kInputDropAlignBytes;
-        if (end >= dropped_ + step_) {
+        // Never an empty range, which would be the rest of the file.
+        if (end > dropped_ && end - dropped_ >= step_) {
             drop_(dropped_, end - dropped_);
             dropped_ = end;
         }
@@ -126,7 +128,8 @@ public:
         items_.clear();
     }
 
-    // The bytes from the input's start dropped so far (finish() aside).
+    // The bytes from the input's start asked out of the page cache so far
+    // (finish() aside), not those known to have left it.
     uint64_t dropped() const { return dropped_; }
 
 private:
@@ -282,7 +285,8 @@ struct ApplyOptions {
     // at least input_drop_step_bytes apart: posix_fadvise when unset.
     InputPageDropper::Drop drop_input_pages;
     uint64_t input_drop_step_bytes = kInputDropStepBytes;
-    // A log line each time this many more bytes of the input are dropped.
+    // A log line each time this many more bytes of the input are asked out
+    // of the page cache.
     uint64_t input_drop_log_bytes = kInputDropLogBytes;
 };
 
@@ -614,8 +618,8 @@ inline ApplyStats apply_changes(const ApplyOptions& opt) {
                          dropper.written(written);
                          if (dropper.dropped() >= drop_logged + opt.input_drop_log_bytes) {
                              drop_logged = dropper.dropped();
-                             log("input dropped from the page cache to " + std::to_string(drop_logged >> 20) + " MiB, " +
-                                 std::to_string(written >> 20) + " MiB of the output written");
+                             log("input asked out of the page cache up to " + std::to_string(drop_logged >> 20) +
+                                 " MiB, " + std::to_string(written >> 20) + " MiB of the output written");
                          }
                      },
                      threads, kWritesAheadPerThread * threads);
