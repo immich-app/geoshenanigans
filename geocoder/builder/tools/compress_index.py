@@ -51,12 +51,14 @@ Scheduling: zstd -18 cuts a file into 32 MiB jobs (4 x its 8 MiB window)
 that its threads take in turn, and its output is the same at any -T >= 1, a
 unit's stream through the pipe included. So each file gets a thread per job,
 at most 8 (more leave most of a big file's threads idle on its last jobs),
-and the files share a budget of one thread per CPU: they take their threads
-in submission order, largest first, each once its threads are free. On the
-build-24 planet tree (64 CPUs) this took 310 s against 417 s for a thread
-per 256 MiB on one worker a CPU, whose tail was one 427 MB file on one
-thread, with half the memory; and every output byte was the same. Each item
-prints its start and end, in seconds from the run's start, and its threads.
+and the files share a budget of one thread per CPU (cpu_budget.sh: the
+CPUs this process may run on, or fewer under its cgroup's CPU quota, the
+runner's 64 of its 88): they take their threads in submission order,
+largest first, each once its threads are free. On the build-24 planet tree
+(64 CPUs) this took 310 s against 417 s for a thread per 256 MiB on one
+worker a CPU, whose tail was one 427 MB file on one thread, with half the
+memory; and every output byte was the same. Each item prints its start and
+end, in seconds from the run's start, and its threads.
 
 A child that stalls (CHILD_SECONDS) is killed and fails its item: a unit's
 goes as .zst, and a file's ends the run with the error, for the caller to
@@ -89,6 +91,9 @@ CHILD_BYTES_PER_SECOND = 1 << 20
 
 # The exit status when a transport unit failed and its files went as .zst.
 UNIT_FAILED = 3
+
+# Prints the CPUs the nightly's tools size their threads by.
+CPU_BUDGET = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cpu_budget.sh")
 
 # JSON sidecars the server's Index::load reads alongside the .bin files. They
 # go into configurations.files like any index file so the region downloader
@@ -128,8 +133,13 @@ def sha256(path):
     return sha.hexdigest()
 
 
-def threads_for(size):
-    return max(1, min(MAX_THREADS_PER_FILE, -(-size // BYTES_PER_THREAD), os.cpu_count()))
+def cpu_budget():
+    """The CPUs the zstd processes share (cpu_budget.sh)."""
+    return int(subprocess.run([CPU_BUDGET], check=True, capture_output=True, text=True).stdout)
+
+
+def threads_for(size, cpus):
+    return max(1, min(MAX_THREADS_PER_FILE, -(-size // BYTES_PER_THREAD), cpus))
 
 
 class Cpus:
@@ -343,7 +353,8 @@ def main():
         cfg = json.load(f)
     at = lambda rel: os.path.join(out, rel)  # noqa: E731
     start = time.monotonic()
-    cpus = Cpus(os.cpu_count())
+    budget = cpu_budget()
+    cpus = Cpus(budget)
 
     # Everything compressed or linked, as files come in: the files and their hashes, the units and the key a unit
     # of files alike shares, each content's and each unit key's first file or unit.
@@ -353,12 +364,12 @@ def main():
 
     def submit(ex, fn, rel, unit, size, *fn_args):
         ticket = cpus.ticket()
-        running[ex.submit(job, ticket, fn, *fn_args, threads_for(size))] = (rel, unit, ticket)
+        running[ex.submit(job, ticket, fn, *fn_args, threads_for(size, budget))] = (rel, unit, ticket)
 
     def add(ex, new_rels, what):
         """Takes in new_rels: hashes them, then submits each content and each unit not compressed yet, largest
         first, as later tickets than any before."""
-        with ThreadPoolExecutor(max_workers=os.cpu_count()) as hasher:
+        with ThreadPoolExecutor(max_workers=budget) as hasher:
             hashes.update(zip(new_rels, hasher.map(sha256, map(at, new_rels))))
         rels.extend(new_rels)
         new_units = units_of(cfg, new_rels)
@@ -377,7 +388,7 @@ def main():
         compressed.update(distinct)
         distinct_units = [u for u in new_units if first_unit[key[u.path]] is u]
         print(f"Compressing {len(distinct)} distinct of {len(new_plain)} {what} and {len(distinct_units)} distinct of "
-              f"{len(new_units)} transport units with zstd {LEVEL} on {os.cpu_count()} threads...", flush=True)
+              f"{len(new_units)} transport units with zstd {LEVEL} on {budget} threads...", flush=True)
         work = [(os.path.getsize(at(r)), r, None) for r in distinct]
         work += [(sum(os.path.getsize(at(f)) for f in u.files), u.path, u) for u in distinct_units]
         work.sort(key=lambda w: -w[0])
@@ -402,7 +413,7 @@ def main():
 
     uploader = Uploader(out, opts.upload, opts.upload_cmd)
     try:
-        with ThreadPoolExecutor(max_workers=os.cpu_count()) as ex:
+        with ThreadPoolExecutor(max_workers=budget) as ex:
             late = opts.late_search
             add(ex, [os.path.relpath(p, out) for p in index_files(out, search=False if late else None)], "files")
             deadline = time.monotonic() + opts.late_search_timeout

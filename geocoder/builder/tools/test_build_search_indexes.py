@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Tests for build_search_indexes.py. Run: python3 -m unittest discover -s geocoder/builder/tools"""
+import contextlib
+import io
 import itertools
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,6 +16,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import build_search_indexes as sut  # noqa: E402
+from test_cpu_budget import fake_cpus  # noqa: E402
 
 TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "configurations.template.json")
 PORTAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "test-portal")
@@ -73,6 +77,21 @@ class BuildSearchIndexesTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as exit_:
                 sut.main()
         return exit_.exception.code
+
+    # The CPUs of the budget (cpu_budget.sh), a cgroup's quota under the CPUs the process may run on, over the
+    # threads a build.
+    def test_by_default_as_many_build_at_once_as_the_cpu_budget_has_threads_for(self):
+        self.write_output(["planet"])
+        for cpus, quotas, expected in ((8, None, 4), (8, {"/job": "400000 100000"}, 2), (1, None, 1)):
+            argv = ["build_search_indexes.py", self.out, self.binary, "--threads", "2"]
+            printed = io.StringIO()
+            with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(printed), \
+                    mock.patch.dict(os.environ, {"TMPDIR": self.tmp.name, **fake_cpus(self, cpus, "/job", quotas)}):
+                with self.assertRaises(SystemExit) as exit_:
+                    sut.main()
+            self.assertEqual(exit_.exception.code, 0)
+            self.assertRegex(printed.getvalue(), rf"place search indexes, {expected} at once\.\.\.", (cpus, quotas))
+            shutil.rmtree(os.path.join(self.out, "planet", "search"), ignore_errors=True)
 
     def call(self, region, sel):
         index_dir = os.path.join(self.out, sut.substitute(self.cfg["search_index"]["dir"], dict(sel, region=region)))

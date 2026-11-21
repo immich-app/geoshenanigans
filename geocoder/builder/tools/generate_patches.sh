@@ -15,9 +15,10 @@
 # plus <name>.mismatches on failure. Diff and patch logs go to <log-dir>,
 # each variant's estimates, a line a variant, to stdout, and each job's start
 # (with what it holds and what the running jobs hold) and end, timestamped,
-# to stderr. The estimates are made for every variant at once, nproc at a
-# time: two --logical-size reads a variant, ~20 s one after another on a
-# planet night.
+# to stderr. The estimates are made for every variant at once, as many at a
+# time as there are CPUs in the budget (cpu_budget.sh: those this process
+# may run on, or fewer under its cgroup's CPU quota): two --logical-size
+# reads a variant, ~20 s one after another on a planet night.
 #
 # Jobs start largest first and only while their estimated peak memory fits:
 # 9/8 × the bytes a diff maps for its old + new record files, plus 4 × the
@@ -34,7 +35,8 @@
 # at start, or of the job's cgroup limit if lower. A variant holds its
 # estimate only while its diff runs: the patch + verify after it stream in
 # about 10 MiB, so they run alongside later diffs. A diff bigger than the
-# whole budget still runs, alone. At most nproc jobs run at once.
+# whole budget still runs, alone. At most a job a CPU of the budget runs at
+# once.
 #
 # Jobs also start only while what they write to scratch fits $TMPDIR's volume.
 # A diff holds, from its start to its end, the second number of geocoder-diff
@@ -154,7 +156,7 @@ else
   budget_kib=$(( budget_kib * 3 / 4 ))
 fi
 budget_kib=$(( budget_kib - ${GEOCODER_PATCH_MEM_RESERVE_KIB:-0} ))
-max_jobs=$(nproc)
+max_jobs=$("$tools/cpu_budget.sh")
 
 # The scratch volume's free space at this moment, in KiB.
 scratch_free_kib() {
@@ -241,7 +243,7 @@ estimate_variant() {
     "$(( $(kib_of "$(client_bytes "$new_dir")") + patcher_scratch_kib ))" > "$to"
 }
 
-# Every variant sized at once, nproc at a time, then read in in order.
+# Every variant sized at once, max_jobs at a time, then read in in order.
 declare -A weight=() diff_scratch=() verify_scratch=()
 variants=($(cd "$new_root" && find . -name '*.bin' -printf '%h\n' | sed 's|^\./||' | sort -u))
 estimates=$(mktemp -d "$scratch_root/estimates-XXXXXX")

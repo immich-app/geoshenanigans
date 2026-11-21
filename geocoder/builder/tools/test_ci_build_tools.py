@@ -13,6 +13,8 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKFLOWS = os.path.join(HERE, "..", "..", "..", ".github", "workflows")
+sys.path.insert(0, HERE)
+from test_cpu_budget import fake_cpus  # noqa: E402
 
 # geocoder-tests as the script runs it: a registry of $FAKE_TESTS tests (t0, t1, ...), --count printing
 # $FAKE_COUNT (default: its size), GEOCODER_TEST_SHARD=i/n running those whose index is i mod n, as
@@ -39,10 +41,11 @@ sys.exit(1 if fails else 0)
 
 
 class ShardedTestsRun:
-    """One run of ci_build_tools.sh on cached tools whose geocoder-tests is the fake above. A compile (the
-    cached tools failing their tests) runs a cmake that only records it ran and fails."""
+    """One run of ci_build_tools.sh on cached tools whose geocoder-tests is the fake above, on `cpus` CPUs under
+    the cgroup quotas `quotas` (test_cpu_budget.fake_cpus). A compile (the cached tools failing their tests) runs
+    a cmake that only records it ran and fails."""
 
-    def __init__(self, test, tests, **env):
+    def __init__(self, test, tests, cpus=88, quotas=None, **env):
         root = tempfile.mkdtemp()
         test.addCleanup(shutil.rmtree, root)
         cache, bin_dir = os.path.join(root, "cache"), os.path.join(root, "bin")
@@ -61,8 +64,9 @@ class ShardedTestsRun:
             f.write(f"#!/bin/sh\necho cmake >> {self.compiles}\nexit 1\n")
         os.chmod(os.path.join(bin_dir, "cmake"), 0o755)
         self.shard_log = os.path.join(root, "shards")
-        run_env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", TMPDIR=root, FAKE_TESTS=str(tests),
-                       FAKE_SHARD_LOG=self.shard_log)
+        budget = fake_cpus(test, cpus, "/job", quotas)
+        run_env = dict(os.environ, CPU_BUDGET_ROOT=budget["CPU_BUDGET_ROOT"], PATH=f"{bin_dir}:{budget['PATH']}",
+                       TMPDIR=root, FAKE_TESTS=str(tests), FAKE_SHARD_LOG=self.shard_log)
         run_env.update({k: str(v) for k, v in env.items()})
         done = subprocess.run(["bash", os.path.join(HERE, "ci_build_tools.sh"), os.path.join(root, "build"), cache,
                                os.path.join(root, "s2")], env=run_env, capture_output=True, text=True, timeout=120)
@@ -190,6 +194,16 @@ class ShardedUnitTestsTest(unittest.TestCase):
         self.assertEqual(sorted(run.shards()), sorted(self.SHARDS))
         self.assertEqual(run.out.strip().splitlines()[-1], "100/100 tests passed")
         self.assertFalse(run.compiled())
+
+    # Fewer CPUs in the budget than 16 (a cgroup's quota, or the CPUs the process may run on): a shard a CPU.
+    def test_a_budget_of_fewer_than_sixteen_cpus_runs_a_shard_a_cpu(self):
+        for cpus, quotas in ((88, {"/job": "400000 100000"}), (4, None)):
+            run = ShardedTestsRun(self, 100, cpus, quotas)
+
+            self.assertEqual(run.status, 0, run.out)
+            self.assertEqual(sorted(run.shards()), [f"{i}/4" for i in range(4)])
+            self.assertIn("unit tests: 100 in 4 shards", run.out)
+            self.assertEqual(run.out.strip().splitlines()[-1], "100/100 tests passed")
 
     def test_a_failing_test_fails_its_shard_by_name_and_the_cached_tools_get_one_fresh_build(self):
         run = ShardedTestsRun(self, 100, FAKE_FAILS="t37")

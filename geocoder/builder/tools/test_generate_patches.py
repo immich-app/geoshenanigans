@@ -14,6 +14,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WORKFLOWS = os.path.join(HERE, "..", "..", "..", ".github", "workflows")
 sys.path.insert(0, HERE)
 import compress_index  # noqa: E402
+from test_cpu_budget import fake_cpus  # noqa: E402
 
 MIB = 1 << 10  # in KiB
 GIB = 1 << 20
@@ -172,7 +173,7 @@ class Night:
 
 
 def at_least_two_jobs_at_once():
-    return len(os.sched_getaffinity(0)) >= 2
+    return compress_index.cpu_budget() >= 2
 
 
 class GeneratePatchesTest(unittest.TestCase):
@@ -246,6 +247,24 @@ class GeneratePatchesTest(unittest.TestCase):
         self.assertTrue(night.events["diff:r/a"]["met"] or night.events["diff:r/b"]["met"])
         for variant in ("r/a", "r/b"):
             self.assertEqual(night.result(variant)[0], "PASS")
+
+    # A job a CPU of the budget: on 8 CPUs the two diffs above run side by side, under a quota of one CPU they take
+    # turns.
+    def test_at_most_a_job_a_cpu_of_the_cgroups_quota_runs_at_once(self):
+        night = self.two_diffs_of_600_mib()
+        night.scenario["meet"] = {"diff:r/a": "diff:r/b", "diff:r/b": "diff:r/a"}
+        night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=AMPLE_MEMORY_KIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=2 * GIB + 300 * MIB,
+                  **fake_cpus(self, 8, "/job", {"/job": "max 100000"}))
+        self.assertTrue(night.events["diff:r/a"]["met"] or night.events["diff:r/b"]["met"])
+
+        night = self.two_diffs_of_600_mib()
+        night.scenario["hold"] = {"diff:r/a": 0.3, "diff:r/b": 0.3}
+        night.scenario["size_hold"] = 0.2
+        night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=AMPLE_MEMORY_KIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=2 * GIB + 300 * MIB,
+                  **fake_cpus(self, 8, "/job", {"/job": "100000 100000"}))
+        self.assert_the_diffs_took_turns(night)
+        sized = [json.loads(line) for line in read(night.scenario["sized"]).splitlines()]
+        self.assertFalse(any(a[1] < b[2] and b[1] < a[2] for i, a in enumerate(sized) for b in sized[i + 1:]), sized)
 
     # The free space of the test above, where the two run side by side.
     def test_the_reserve_comes_off_the_free_space(self):

@@ -19,6 +19,7 @@ from unittest import mock
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import compress_index as sut  # noqa: E402
+from test_cpu_budget import fake_cpus  # noqa: E402
 
 TEMPLATE = os.path.join(HERE, "..", "configurations.template.json")
 NIGHTLY = os.path.join(HERE, "..", "..", "..", ".github", "workflows", "geocoder-build.yml")
@@ -56,7 +57,7 @@ CHILD_RUN = r'''
 import os, sys
 sys.path.insert(0, {here!r})
 import compress_index as sut
-os.cpu_count = lambda: 4
+sut.cpu_budget = lambda: 4
 sut.BYTES_PER_THREAD = 64 << 10
 {plant}
 sys.argv = ["compress_index.py", {out!r}, "--transport-bin", {transport!r}]
@@ -333,9 +334,9 @@ class CompressIndexTest(unittest.TestCase):
         expected = [f"cp {self.path(rel)} s3://bucket/day/{rel}" for rel in sent_rel]
         self.assertEqual(sorted(sent), sorted(expected))
 
-    def counted_run(self, *args, cpus=4):
-        """run_main with `cpus` CPUs, a zstd thread per 64 KiB and a zstd that logs each call; returns the calls as
-        (start, end, threads, output) and what the run printed."""
+    def counted_run(self, *args, cpus=4, budget_env=None):
+        """run_main with `cpus` CPUs (None: cpu_budget.sh's, under `budget_env`), a zstd thread per 64 KiB and a zstd
+        that logs each call; returns the calls as (start, end, threads, output) and what the run printed."""
         calls = os.path.join(self.tmp.name, "zstd-calls")
         bin_dir = os.path.join(self.tmp.name, "counting-bin")
         os.makedirs(bin_dir, exist_ok=True)
@@ -343,9 +344,11 @@ class CompressIndexTest(unittest.TestCase):
             f.write(COUNTING_ZSTD.format(python=sys.executable))
         os.chmod(os.path.join(bin_dir, "zstd"), 0o755)
         printed = io.StringIO()
-        env = {"REAL_ZSTD": shutil.which("zstd"), "ZSTD_CALLS": calls, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
-        with mock.patch.dict(os.environ, env), mock.patch.object(sut.os, "cpu_count", return_value=cpus), \
-                mock.patch.object(sut, "BYTES_PER_THREAD", 64 << 10), contextlib.redirect_stdout(printed):
+        env = dict(budget_env or {}, REAL_ZSTD=shutil.which("zstd"), ZSTD_CALLS=calls)
+        env["PATH"] = f"{bin_dir}:{env.get('PATH', os.environ['PATH'])}"
+        budget = mock.patch.object(sut, "cpu_budget", return_value=cpus) if cpus else contextlib.nullcontext()
+        with mock.patch.dict(os.environ, env), budget, mock.patch.object(sut, "BYTES_PER_THREAD", 64 << 10), \
+                contextlib.redirect_stdout(printed):
             cfg = self.run_main(*args)
         with open(calls) as f:
             rows = [line.split() for line in f.read().splitlines()]
@@ -354,11 +357,9 @@ class CompressIndexTest(unittest.TestCase):
     # zstd -18 cuts a file into 32 MiB jobs, so a thread per job, up to 8, keeps a big file from finishing alone
     # long after the rest; never more threads than CPUs.
     def test_each_file_gets_a_zstd_thread_per_job_up_to_eight_and_the_cpus(self):
-        with mock.patch.object(sut.os, "cpu_count", return_value=88):
-            self.assertEqual([sut.threads_for(s) for s in (0, 1, 32 << 20, (32 << 20) + 1, 427_000_000, 1 << 40)],
-                             [1, 1, 1, 2, 8, 8])
-        with mock.patch.object(sut.os, "cpu_count", return_value=4):
-            self.assertEqual(sut.threads_for(427_000_000), 4)
+        self.assertEqual([sut.threads_for(s, 88) for s in (0, 1, 32 << 20, (32 << 20) + 1, 427_000_000, 1 << 40)],
+                         [1, 1, 1, 2, 8, 8])
+        self.assertEqual(sut.threads_for(427_000_000, 4), 4)
 
         calls, _, _ = self.counted_run(cpus=4)
 
@@ -378,6 +379,16 @@ class CompressIndexTest(unittest.TestCase):
         for start, _, _, _ in calls:
             at_once = sum(t for s, e, t, _ in calls if s <= start < e)
             self.assertLessEqual(at_once, 4, calls)
+
+    # The runner's job may run on 88 CPUs under a quota of 64: the budget is the quota's, here 2 of 8.
+    def test_the_threads_follow_the_cgroups_cpu_quota(self):
+        calls, printed, _ = self.counted_run(cpus=None, budget_env=fake_cpus(self, 8, "/job", {"/job": "200000 100000"}))
+
+        self.assertEqual(self.status, 0)
+        self.assertIn(f"with zstd {sut.LEVEL} on 2 threads...", printed)
+        self.assertEqual({output: t for _, _, t, output in calls}["planet/full/geo_cells.bin.zst"], 2)
+        for start, _, _, _ in calls:
+            self.assertLessEqual(sum(t for s, e, t, _ in calls if s <= start < e), 2, calls)
 
     def test_prints_each_compressed_item_with_its_start_end_and_threads(self):
         calls, printed, _ = self.counted_run(cpus=4)
@@ -668,7 +679,7 @@ class PreviousScheduleTest(unittest.TestCase):
     def test_a_file_and_a_unit_of_several_jobs_keep_their_bytes(self):
         argv = ["compress_index.py", self.out, "--transport-bin", self.transport]
         printed = io.StringIO()
-        with mock.patch.object(sys, "argv", argv), mock.patch.object(sut.os, "cpu_count", return_value=4), \
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(sut, "cpu_budget", return_value=4), \
                 contextlib.redirect_stdout(printed):
             self.assertEqual(sut.main(), 0)
 

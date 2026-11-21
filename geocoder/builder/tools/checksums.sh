@@ -16,12 +16,13 @@ set -euo pipefail
 
 mode=$1
 out=$2
+cpus=$("$(dirname "$0")/cpu_budget.sh")
 cd "$out"
 
 # The sha256sum lines of the files find selects (its tests in "$@"), hashed on
-# every core.
+# every CPU of the budget (cpu_budget.sh).
 hash_files() {
-  find . -type f \( "$@" \) -print0 | xargs -0 -r -P "$(nproc)" -n 8 sha256sum
+  find . -type f \( "$@" \) -print0 | xargs -0 -r -P "$cpus" -n 8 sha256sum
 }
 
 case $mode in

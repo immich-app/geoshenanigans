@@ -8,21 +8,24 @@
 # libraries moved) get one fresh build before they count.
 #
 # The unit tests run as 16 shards at once (GEOCODER_TEST_SHARD=i/16, see
-# tests/test_main.cpp): on one core the suite took ~430 s of the runner's
-# time, 16 shards 25 s on the test box. Every shard must pass and run at
-# least one test, and the shards' counts must add up to the registry's size
-# (geocoder-tests --count): a shard index past the count, or a geocoder-tests
-# that ignored its shard, would otherwise pass on fewer tests. The total
-# printed ("N/N tests passed") is the registry's. Each phase starts with a
-# "[tools HH:MM:SS]" line.
+# tests/test_main.cpp), or a shard a CPU when the CPU budget is smaller
+# (cpu_budget.sh: the CPUs this process may run on, or fewer under its
+# cgroup's CPU quota; it sizes the compile too): on one core the suite took
+# ~430 s of the runner's time, 16 shards 25 s on the test box. Every shard
+# must pass and run at least one test, and the shards' counts must add up to
+# the registry's size (geocoder-tests --count): a shard index past the count,
+# or a geocoder-tests that ignored its shard, would otherwise pass on fewer
+# tests. The total printed ("N/N tests passed") is the registry's. Each
+# phase starts with a "[tools HH:MM:SS]" line.
 set -euo pipefail
 
 build=$(realpath -m "$1")
 cache=$(realpath -m "$2")
 s2_prefix=$3
 tools=(build-index geocoder-diff geocoder-patch pbf-apply heap-peak-shim heap-peak-probe geocoder-tests)
-shards=16
 source_dir=$(cd "$(dirname "$0")/.." && pwd)
+cpus=$("$source_dir/tools/cpu_budget.sh")
+shards=$((cpus < 16 ? cpus : 16))
 
 phase() { echo "[tools $(date -u +%H:%M:%S)] $*"; }
 
@@ -30,7 +33,7 @@ compile() {
   phase "compiling"
   local start=$SECONDS
   cmake -S "$source_dir" -B "$build" -DCMAKE_BUILD_TYPE=Release -DGEOCODER_S2_PREFIX="$s2_prefix"
-  make -C "$build" -j"$(nproc)" "${tools[@]}"
+  make -C "$build" -j"$cpus" "${tools[@]}"
   rm -rf "$cache"
   mkdir -p "$cache/bin"
   (cd "$build" && cp "${tools[@]}" "$cache/bin/")
