@@ -538,8 +538,9 @@ sut.run_logged = run_logged
         for rel in self.SEARCH:
             os.remove(self.path(rel))
         status = os.path.join(self.tmp.name, "place-search.status")
+        taken = os.path.join(self.tmp.name, "place-search.taken")
 
-        thread, result = self.start_late_run("--late-search", status)
+        thread, result = self.start_late_run("--late-search", status, "--late-search-taken", taken)
         deadline = time.time() + 60
         early = ["planet/full/geo_cells.bin.zst", "planet/full/addr_points.bin.zst", "planet/full/street_ways.tt.zst",
                  "planet/poi/major/pois.tt.zst"]
@@ -562,6 +563,8 @@ sut.run_logged = run_logged
         self.assertEqual(self.zst_files(), expected_zst)
         for rel in self.SEARCH:
             self.assertEqual(unzstd(self.path(rel) + ".zst"), self.files[rel])
+        with open(taken) as f:
+            self.assertEqual(f.read(), "0\n")
 
     # A place search that failed still leaves the indexes it built, published as they are today.
     def test_a_late_search_that_failed_publishes_the_indexes_it_left(self):
@@ -569,19 +572,27 @@ sut.run_logged = run_logged
         status = os.path.join(self.tmp.name, "place-search.status")
         with open(status, "w") as f:
             f.write("1\n")
+        taken = os.path.join(self.tmp.name, "place-search.taken")
 
-        cfg = self.run_main("--late-search", status)
+        cfg = self.run_main("--late-search", status, "--late-search-taken", taken)
 
         self.assertEqual(self.status, 0)
         self.assertEqual(cfg, expected_cfg)
+        with open(taken) as f:
+            self.assertEqual(f.read(), "1\n")
 
     # A place search whose status never comes (its job killed with nothing written) must not hold compression up:
-    # past the wait, the rest is published without its files, which the run reports as failed.
+    # past the wait, the rest is published without its files, which the run reports as failed. What it took them
+    # on says so: "none", which a status written after the wait, too late, leaves as it is.
     def test_a_late_search_that_never_ends_is_left_out_after_the_wait(self):
         status = os.path.join(self.tmp.name, "place-search.status")
+        taken = os.path.join(self.tmp.name, "place-search.taken")
 
-        thread, result = self.start_late_run("--late-search", status, "--late-search-timeout", "1")
+        thread, result = self.start_late_run("--late-search", status, "--late-search-timeout", "1",
+                                             "--late-search-taken", taken)
         thread.join(60)
+        with open(status, "w") as f:
+            f.write("0\n")
 
         self.assertFalse(thread.is_alive())
         self.assertEqual(self.status, 0)
@@ -589,6 +600,8 @@ sut.run_logged = run_logged
         for rel in self.SEARCH:
             self.assertFalse(os.path.exists(self.path(rel) + ".zst"), rel)
         self.assertIn("no place search status", result["printed"])
+        with open(taken) as f:
+            self.assertEqual(f.read(), "none\n")
 
 
 # The zstd command line before the shared thread budget: level 18 and a thread per 256 MiB, at least one and at most
@@ -751,6 +764,7 @@ class NightlyCompressTest(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         for prefix, args in calls:
             self.assertIn('--late-search "$WORKDIR/place-search.status"', args)
+            self.assertIn('--late-search-taken "$WORKDIR/place-search.taken"', args)
             self.assertEqual(prefix.split(), ["nice", "-n", "10"])
 
 

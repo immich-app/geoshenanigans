@@ -966,7 +966,7 @@ jobs:
             COMPRESS_RC=0
             nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
               --transport-bin "$GITHUB_WORKSPACE/geocoder/search/target/release/geocoder-transport" \
-              --late-search "$WORKDIR/place-search.status" \
+              --late-search "$WORKDIR/place-search.status" --late-search-taken "$WORKDIR/place-search.taken" \
               --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE" \
               --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" || COMPRESS_RC=$?
             if [ "$COMPRESS_RC" = 0 ] || [ "$COMPRESS_RC" = 3 ]; then
@@ -1125,12 +1125,13 @@ jobs:
             # geocoder-transport, which encodes the units, comes from the place
             # search build.
             until [ -s "$RUNNER_TEMP/search.status" ] || [ $(( $(date +%s) - COMPRESS_START )) -gt 1800 ]; do sleep 5; done
-            # A compression run again rewrites the .zst: their checksums too.
-            rm -f "$WORKDIR/zst.sha256"
+            # A compression run again rewrites the .zst: their checksums too, and
+            # what it takes the place search's files on.
+            rm -f "$WORKDIR/zst.sha256" "$WORKDIR/place-search.taken"
             COMPRESS_RC=0
             nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
               --transport-bin "$GITHUB_WORKSPACE/geocoder/search/target/release/geocoder-transport" \
-              --late-search "$WORKDIR/place-search.status" \
+              --late-search "$WORKDIR/place-search.status" --late-search-taken "$WORKDIR/place-search.taken" \
               --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE" \
               --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" || COMPRESS_RC=$?
             # 3: done, but a transport unit failed and its files went as .zst.
@@ -1147,17 +1148,26 @@ jobs:
           fi
           # The place search ran beside compression, which waited for its
           # status: a failed or stopped build left no index, and fails the run
-          # at its end (Fail run on place search index failure).
+          # at its end (Fail run on place search index failure). What counts is
+          # the status compression took its files on (place-search.taken),
+          # "none" when it stopped waiting and left them out: a status written
+          # since came too late for them.
           cat "$WORKDIR/place-search.log" 2> /dev/null || true
-          SEARCH_STATUS=$(cat "$WORKDIR/place-search.status" 2> /dev/null || true)
+          SEARCH_STATUS=$(cat "$WORKDIR/place-search.taken" 2> /dev/null || true)
           if [ "$SEARCH_STATUS" != 0 ]; then
-            if [ -z "$SEARCH_STATUS" ]; then
-              # Compression stopped waiting for it and left its files out: what
-              # it still runs ends here, and its indexes go.
-              pkill -KILL -s "$(cat "$WORKDIR/place-search.pid" 2> /dev/null)" 2> /dev/null || true
+            if [ -z "$SEARCH_STATUS" ] || [ "$SEARCH_STATUS" = none ]; then
+              # Its files were left out: what it still runs ends here, and is
+              # gone (a zombie aside) before its indexes go.
+              SESSION=$(cat "$WORKDIR/place-search.pid" 2> /dev/null || true)
+              if [ -n "$SESSION" ]; then
+                pkill -KILL -s "$SESSION" 2> /dev/null || true
+                WAIT_START=$(date +%s)
+                while ps -o stat= -s "$SESSION" | grep -q '^[^Z]' && [ $(( $(date +%s) - WAIT_START )) -lt 60 ]; do sleep 1; done
+              fi
               rm -rf "$WORKDIR"/output/*/search
+              SEARCH_STATUS=none
             fi
-            echo "::error::The place search indexes failed (status ${SEARCH_STATUS:-none}): no index of a failed one is published"
+            echo "::error::The place search indexes failed (status $SEARCH_STATUS): no index of a failed one is published"
             echo "SEARCH_INDEX_FAILED=1" >> "$GITHUB_ENV"
           fi
           find "$WORKDIR/output" -name "*.bin" -delete

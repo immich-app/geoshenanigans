@@ -2,7 +2,7 @@
 """Compresses a build's index files for publishing.
 
 Usage: compress_index.py <output dir> --transport-bin PATH [--upload DEST --upload-cmd CMD]
-           [--late-search STATUS [--late-search-timeout SECONDS]]
+           [--late-search STATUS [--late-search-timeout SECONDS] [--late-search-taken FILE]]
 
 Writes <file>.zst next to every .bin file and load sidecar under the output
 dir (files with identical content share one .zst through hard links) and
@@ -36,6 +36,9 @@ leaves no files. A status that never comes within --late-search-timeout
 seconds leaves the search files out, with a warning. configurations.json is
 written last either way, so the place search reads it as the build left it,
 and its tables are those of a run that had every file from the start.
+--late-search-taken FILE gets the status the search files were taken on, or
+"none" when they were left out: the caller goes by it, since a status the
+place search writes after the wait came too late for its files.
 
 zstd level 18 compresses our structured binary data to within 0.3% of
 level 19 (itself within ~2% of --ultra -22) at 21% less CPU. Level 17 costs
@@ -332,6 +335,7 @@ def main():
     args.add_argument("--upload-cmd", default="s5cmd run")
     args.add_argument("--late-search", default="", help="the place search job's status file: its files come late")
     args.add_argument("--late-search-timeout", type=float, default=3600)
+    args.add_argument("--late-search-taken", default="", help="gets the status the place search files were taken on")
     opts = args.parse_args()
     out = opts.out
     cpath = os.path.join(out, "configurations.json")
@@ -410,8 +414,13 @@ def main():
                         print(f"Place search ended (status {status}): compressing its files", flush=True)
                         add(ex, [os.path.relpath(p, out) for p in index_files(out, search=True)], "place search files")
                     else:
+                        status = "none"
                         print(f"Warning: no place search status in {late} after {opts.late_search_timeout:.0f}s; "
                               "its files are left out", flush=True)
+                    if opts.late_search_taken:
+                        with open(opts.late_search_taken + ".part", "w") as f:
+                            f.write(status + "\n")
+                        os.replace(opts.late_search_taken + ".part", opts.late_search_taken)
                     late = ""
                 if not running:
                     time.sleep(LATE_SEARCH_POLL_SECONDS)

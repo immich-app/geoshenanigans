@@ -88,23 +88,48 @@ FINALIZE = "Finalize upload and configurations.json"
 CLEANUP = "Cleanup old Tigris builds"
 
 # compress_index.py for a step run: one line in its log as a failed unit's, the status it is given.
+# What it took the place search's files on is the job's status, or none (none written, as past
+# its wait); a status in $LATE_SEARCH_STATUS is then written as the job's, too late.
 FAKE_COMPRESS = """\
 import os, sys
 print("planet/full/places.tt.zst: verify: place_nodes.bin differs; its files go as .zst")
+args = sys.argv[1:]
+status = args[args.index("--late-search") + 1]
+if "--late-search-taken" in args:
+    with open(args[args.index("--late-search-taken") + 1], "w") as f:
+        f.write((open(status).read().strip() if os.path.exists(status) else "none") + "\\n")
+if os.environ.get("LATE_SEARCH_STATUS"):
+    with open(status, "w") as f:
+        f.write(os.environ["LATE_SEARCH_STATUS"])
 sys.exit(int(os.environ["COMPRESS_STATUS"]))
 """
 
+SEARCH_FILES = ("planet/search/full/simplified/all/places.fst", "planet/search/full/simplified/all/search_meta.json")
 
-def env_after(name, compress_status, search_status="0\n"):
+
+def env_after(name, compress_status, search_status="0\n", late_status="", job=None):
     """What the step `name` puts in GITHUB_ENV (a dict) when compress_index.py exits `compress_status`,
     run as Actions runs it, on a night of no variants, with s5cmd, compress_index.py and
     generate_patches.sh that do nothing else, place-search built and the place search job's status
-    `search_status` (None: none written)."""
+    `search_status` (None: none written), then `late_status` written as its status once compression
+    has taken it. With `job` (a dict) the place search job still runs, a process in a session of
+    its own, and `job` gets whether it still runs after the step and the search files it left."""
     with tempfile.TemporaryDirectory() as tmp:
         ws, work, bin_dir = (os.path.join(tmp, d) for d in ("ws", "work", "bin"))
         tools = os.path.join(ws, "geocoder", "builder", "tools")
         for d in (tools, os.path.join(work, "output"), bin_dir):
             os.makedirs(d)
+        for rel in SEARCH_FILES:
+            os.makedirs(os.path.dirname(os.path.join(work, "output", rel)), exist_ok=True)
+            with open(os.path.join(work, "output", rel), "w") as f:
+                f.write("{}")
+        if job is not None:
+            # Its session's leader exits at once, as the job's process outlives it.
+            pid = os.path.join(tmp, "job.pid")
+            subprocess.run(["setsid", "sh", "-c", f"sleep 300 > /dev/null 2>&1 & echo $! > {pid}; "
+                                                  f"echo $$ > {os.path.join(work, 'place-search.pid')}"], check=True)
+            with open(pid) as f:
+                job["pid"] = int(f.read())
         fakes = {os.path.join(tools, "compress_index.py"): FAKE_COMPRESS,
                  os.path.join(tools, "generate_patches.sh"): "#!/bin/sh\nexit 0\n",
                  os.path.join(bin_dir, "s5cmd"): "#!/bin/sh\nexit 0\n",
@@ -126,13 +151,29 @@ def env_after(name, compress_status, search_status="0\n"):
                "GITHUB_ENV": github_env, "GITHUB_STEP_SUMMARY": os.path.join(tmp, "summary"),
                "COMPRESS_STATUS": str(compress_status), "NEW_DATE": "2026-11-17", "OLD_DATE": "2026-11-16",
                "S3_ENDPOINT": "https://s3.invalid", "S3_BUCKET": "bucket", "S3_PREFIX": "geocoder",
-               "TMPDIR": tmp, "RUNNER_TEMP": tmp}
-        r = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", script], env=env, capture_output=True,
-                           text=True)
+               "TMPDIR": tmp, "RUNNER_TEMP": tmp, "LATE_SEARCH_STATUS": late_status}
+        try:
+            r = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", script], env=env, capture_output=True,
+                               text=True, timeout=120)
+            if job is not None:
+                job["running"] = alive(job["pid"])
+                job["search"] = sorted(rel for rel in SEARCH_FILES if os.path.exists(os.path.join(work, "output", rel)))
+        finally:
+            if job is not None and alive(job["pid"]):
+                os.kill(job["pid"], 9)
         if r.returncode != 0:
             raise AssertionError(f"{name} exited {r.returncode}: {r.stdout}{r.stderr}")
         with open(github_env) as f:
             return dict(line.rstrip("\n").split("=", 1) for line in f if "=" in line)
+
+
+def alive(pid):
+    """Whether process `pid` runs (a zombie counts as ended)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except FileNotFoundError:
+        return False
 
 
 class NightlyTransportTest(unittest.TestCase):
@@ -190,6 +231,22 @@ class NightlyTransportTest(unittest.TestCase):
             self.assertEqual(env.get("SEARCH_INDEX_FAILED") == "1", failed, f"{status!r}: {env}")
             self.assertEqual(runs("Fail run on place search index failure", env), failed, status)
             self.assertEqual(advances_latest_json(env), True, status)
+
+    # Compression stopped waiting for a place search that then succeeded: its files are not in
+    # configurations.json, so the run fails as for one that never ended, though its status now says
+    # 0, and its indexes go with the job, which is ended first. One whose status compression took
+    # keeps them, and its job is left alone.
+    def test_a_place_search_compression_left_out_fails_the_run_whatever_its_status_says_since(self):
+        for search_status, late_status, failed in ((None, "0\n", True), (None, "", True), ("0\n", "", False)):
+            with self.subTest(search_status=search_status, late_status=late_status):
+                job = {}
+                env = env_after(COMPRESS_STEP, 0, search_status=search_status, late_status=late_status, job=job)
+
+                self.assertEqual(env.get("SEARCH_INDEX_FAILED") == "1", failed, env)
+                self.assertEqual(runs("Fail run on place search index failure", env), failed)
+                self.assertEqual(job["running"], not failed)
+                # The index files go once compressed, but for search_meta.json, which stays beside its .zst.
+                self.assertEqual(job["search"], [] if failed else [SEARCH_FILES[1]])
 
     def test_latest_json_and_the_cleanup_wait_for_a_night_of_no_failed_patch_or_unit(self):
         self.assertIsNotNone(latest_json_guard())
