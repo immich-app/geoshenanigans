@@ -135,16 +135,17 @@ crate's, which serves every dataset of
 the latest published planet build: each selection of a mode, a boundary
 precision and a POI tier the manifest's constraints allow (28). Its page
 compares up to 4 of them side by side, each a preset or a pick by axis, and
-its URL holds the columns, the point and the build (`b=`, its publication
+its URL holds the columns, the point, the build (`b=`, its publication
 ID: `<date>-<the first 12 hex digits of its manifest's sha256>`, the same on
 every volume), which it flags when another build is served, one published
-again under its date among them; a `b=` of a date alone stands for any
-build of its date. To run it:
+again under its date among them, and the search box's text (`q=`); a `b=`
+of a date alone stands for any build of its date. To run it:
 
 ```bash
 cd test-portal && docker compose up --build --remove-orphans
 # open http://localhost:3002/test
 # or http://localhost:3002/test?d=with-addresses&d=smallest&at=48.8584,2.2945
+# or http://localhost:3002/test?d=with-addresses&d=smallest&q=eiffel
 ```
 
 Its volume, `geocoder-portal-data`, is not the old services' volumes: at its
@@ -190,11 +191,31 @@ those `unpublished`). Until a dataset's index is ready its `/search` answers
 Searches run 4 at once beside the 8 lookups, so a few `/polygons` of
 exact boundaries can't hold one up, and count against the key's rate as
 `/reverse` does.
+
+The page's search box searches each column's dataset as one types, once
+the text has stood 250 ms (Enter searches at once), 10 results a column. A
+newer search cancels the requests of the one before. The results go into
+one matrix: a row a result, its rank in each column (`–` where a column
+that answered lacks it, `·` where one has no answer yet), its name, kind,
+type and context (admin2 · admin1 · country). Results of two columns are
+one row where their names are equal and their points at most 1 km apart,
+20 km where one is a boundary without a label node, whose point moves with
+the boundary's precision. A row marks the columns that lack it, a rank
+below its best, how far its points are apart, another type, and each part
+of the context the columns disagree on. Each row is a dot on the map,
+coloured by the columns that have it, and a click on a row or a dot looks
+up its point in every column, as a click on the map does. A column whose
+index is queued or building says so, with how many of the build's indexes
+are ready, and is asked again after the `Retry-After`; one whose index
+failed says why. A server without `/datasets`, or whose `/datasets` names
+no indexes, shows no search.
+
 The test key the page sends allows 200 requests a second and 5,000,000 a
 day (UTC), shared by every visitor. The page keeps 8 in flight and asks a
-429 of `/reverse` again after a pause, 8 tries in all, after which the 429
-is its answer; once the day's 5,000,000 are spent, `/reverse` answers 429
-until the UTC day turns. Its `/polygons` (of no rate limit) don't wait out
+429 of `/reverse` or `/search` again after a pause (a search's 429 pauses
+the searches alone), 8 tries in all, after which the 429 is its answer;
+once the day's 5,000,000 are spent, `/reverse` and `/search` answer 429 until
+the UTC day turns. Its `/polygons` (of no rate limit) don't wait out
 those pauses, and the portal runs 8 lookups at once, the others waiting
 their turn.
 
