@@ -32,8 +32,10 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <fcntl.h>
+#include <functional>
 #include <iostream>
 #include <memory>
 #include <optional>
@@ -41,6 +43,7 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #include "direct_file_writer.h"
@@ -64,6 +67,63 @@ constexpr size_t kWritesAheadPerThread = 1024;
 // scan 9.6 s, 8.0 s with these). More peek threads did as well, but took
 // the cores from the thread inflating the change file when it is cached.
 constexpr size_t kPeekPrefetchBlobs = 256;
+// The input's pages leave the page cache in ranges of at least this many
+// bytes, cut at kInputDropAlignBytes (see InputPageDropper).
+constexpr uint64_t kInputDropStepBytes = uint64_t(64) << 20;
+constexpr uint64_t kInputDropAlignBytes = uint64_t(1) << 20;
+
+// Drops the input's pages from the page cache behind the writer, so that
+// the output, which build-index reads next, stays cached in their place:
+// the nightly's 96 GiB job holds about one of the two 95 GB files, and it
+// deletes the input once the output is complete. The writer reads a copied
+// span only when its block is filled, after the item is handed over, so the
+// input of an item goes once the output up to its end is written
+// (DirectFileWriter::written()), which also covers every item before it;
+// the rest of the file when the output is finished. Dropping changes no
+// byte of the output, only what a later read finds cached.
+class InputPageDropper {
+public:
+    // Drops `length` bytes of the input's pages from `offset`, to its end
+    // when `length` is 0 (posix_fadvise's ranges).
+    using Drop = std::function<void(uint64_t offset, uint64_t length)>;
+
+    explicit InputPageDropper(Drop drop, uint64_t step = kInputDropStepBytes) : drop_(std::move(drop)), step_(step) {}
+
+    // The item just appended ends at byte `output_end` of the output and
+    // has read the input up to `input_end` (0: none, a tail).
+    void appended(uint64_t output_end, uint64_t input_end) {
+        if (input_end) items_.push_back({output_end, input_end});
+    }
+
+    // The output's first `written` bytes are on disk.
+    void written(uint64_t written) {
+        while (!items_.empty() && items_.front().output_end <= written) {
+            read_ = std::max(read_, items_.front().input_end);
+            items_.pop_front();
+        }
+        const uint64_t end = read_ / kInputDropAlignBytes * kInputDropAlignBytes;
+        if (end >= dropped_ + step_) {
+            drop_(dropped_, end - dropped_);
+            dropped_ = end;
+        }
+    }
+
+    // The output is finished: every byte of the input has been read.
+    void finish() {
+        drop_(dropped_, 0);
+        items_.clear();
+    }
+
+private:
+    struct Item {
+        uint64_t output_end, input_end;
+    };
+    Drop drop_;
+    uint64_t step_;
+    std::deque<Item> items_;  // appended, their output not all written yet
+    uint64_t read_ = 0;       // the input read by every item written
+    uint64_t dropped_ = 0;
+};
 
 // osmium's object_order_type_id_reverse_version on two objects of one type
 // and id: whether a sorts before b, newest first. Timestamps count only
@@ -504,15 +564,30 @@ inline ApplyStats apply_changes(const ApplyOptions& opt) {
         append_blob(bytes, "OSMHeader", encode_header_block(output_header(header, opt)));
         output.append(std::move(bytes));
     }
+    InputPageDropper dropper([fd = input.get()](uint64_t offset, uint64_t length) {
+        posix_fadvise(fd, static_cast<off_t>(offset), static_cast<off_t>(length), POSIX_FADV_DONTNEED);
+    });
     std::atomic<size_t> encoded{0};
     parallel_ordered(items.size(), [&](size_t k) { return produce_item(items[k], input.get(), in, winners, opt, encoded); },
                      [&](size_t k, std::string bytes) {
                          const OutputItem& it = items[k];
-                         if (it.kind == OutputItem::Copy) output.append_from(input.get(), it.offset, it.size, opt.input);
-                         else output.append(std::move(bytes));
+                         uint64_t input_end = 0;
+                         if (it.kind == OutputItem::Copy) {
+                             output.append_from(input.get(), it.offset, it.size, opt.input);
+                             input_end = it.offset + it.size;
+                         } else {
+                             output.append(std::move(bytes));
+                             if (it.kind == OutputItem::Merge) {
+                                 const BlobInfo& b = in.blobs[it.blob];
+                                 input_end = b.offset + 4 + b.header_size + b.data_size;
+                             }
+                         }
+                         dropper.appended(output.appended(), input_end);
+                         dropper.written(output.written());
                      },
                      threads, kWritesAheadPerThread * threads);
     stats.output_bytes = output.finish();
+    dropper.finish();
     stats.encoded_blobs = encoded.load();
     log("wrote " + std::to_string(stats.output_bytes >> 20) + " MiB (" + std::to_string(stats.encoded_blobs) +
         " blobs encoded) in " + std::to_string(seconds_since(t_write)) + " s; total " +

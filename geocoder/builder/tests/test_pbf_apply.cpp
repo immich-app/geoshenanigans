@@ -6,9 +6,14 @@
 #include <algorithm>
 #include <cstdio>
 #include <iterator>
+#include <linux/magic.h>
 #include <set>
 #include <string>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/statfs.h>
 #include <tuple>
+#include <utility>
 #include <vector>
 
 #include "pbf_test_objects.h"
@@ -375,4 +380,99 @@ TEST(apply_writes_the_header_the_options_ask_for) {
     write_test_pbf(opt.input, {node(1, 1)}, 5, in);
     CHECK_EQ(refusal_of([&] { apply_changes(opt); }),
              std::string("input PBF requires unsupported feature HistoricalInformation (history files are not supported)"));
+}
+
+namespace {
+
+// The share of a file's pages in the page cache, or a negative number where
+// that can't be seen: a tmpfs keeps every page.
+double resident_share(const std::string& path) {
+    struct statfs fs;
+    if (statfs(path.c_str(), &fs) != 0 || fs.f_type == TMPFS_MAGIC) return -1;
+    int fd = open(path.c_str(), O_RDONLY);
+    struct stat st;
+    if (fd < 0 || fstat(fd, &st) != 0 || st.st_size == 0) {
+        if (fd >= 0) close(fd);
+        return -1;
+    }
+    const size_t size = size_t(st.st_size), page = size_t(sysconf(_SC_PAGESIZE));
+    void* map = mmap(nullptr, size, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (map == MAP_FAILED) return -1;
+    std::vector<unsigned char> pages((size + page - 1) / page);
+    double share = -1;
+    if (mincore(map, size, pages.data()) == 0)
+        share = double(std::count_if(pages.begin(), pages.end(), [](unsigned char p) { return p & 1; })) / double(pages.size());
+    munmap(map, size);
+    return share;
+}
+
+}  // namespace
+
+// The writer drops the input's pages once the output after them is written:
+// ranges from the start, in order, cut at 1 MiB and at least a step apart,
+// never past the input of the first item whose output is not yet written;
+// the rest of the file when the output is finished.
+TEST(apply_drops_the_input_behind_the_written_output) {
+    constexpr uint64_t MiB = 1 << 20;
+    std::vector<std::pair<uint64_t, uint64_t>> drops;
+    InputPageDropper sut([&](uint64_t offset, uint64_t length) { drops.emplace_back(offset, length); }, 4 * MiB);
+
+    sut.appended(3 * MiB, 3 * MiB);        // a copy: output and input to 3 MiB
+    sut.appended(6 * MiB, 7 * MiB + 100);  // a merge: its blob ends past 7 MiB
+    sut.written(0);
+    CHECK(drops.empty());
+    sut.written(4 * MiB);  // the copy's output is written: 3 MiB of input, under the step
+    CHECK(drops.empty());
+    sut.appended(8 * MiB, 0);  // a tail, which reads no input
+    sut.written(5 * MiB);      // the merge's output is not all written
+    CHECK(drops.empty());
+    sut.written(8 * MiB);
+    CHECK(drops == (std::vector<std::pair<uint64_t, uint64_t>>{{0, 7 * MiB}}));
+    sut.appended(9 * MiB, 9 * MiB);
+    sut.written(9 * MiB);  // 2 MiB more: under the step
+    CHECK_EQ(drops.size(), size_t(1));
+    sut.appended(20 * MiB, 20 * MiB);
+    sut.written(20 * MiB);
+    CHECK(drops.back() == std::make_pair(7 * MiB, 13 * MiB));
+    sut.finish();  // length 0: to the end of the file
+    CHECK(drops.back() == std::make_pair(20 * MiB, uint64_t(0)));
+    CHECK_EQ(drops.size(), size_t(3));
+}
+
+// The point of the drops: after a run the output, which build-index reads
+// next, is in the page cache and the input, which the nightly then deletes,
+// is not.
+TEST(apply_leaves_the_output_in_the_page_cache_in_place_of_the_input) {
+    ScratchDir dir("pbf-apply-test");
+    ApplyOptions opt;
+    opt.input = dir.path() + "/in.osm.pbf";
+    opt.output = dir.path() + "/out.osm.pbf";
+    std::vector<TestObject> input;
+    for (int64_t id = 1; id <= 20000; id++) input.push_back(node(id, 1, T0, "value " + std::to_string(id * 7919 % 10007)));
+    write_test_pbf(opt.input, input, 100);
+    int fd = open(opt.input.c_str(), O_RDONLY);
+    REQUIRE(fd >= 0);
+    fsync(fd);
+    close(fd);
+    double before = resident_share(opt.input);
+    if (before <= 0) {
+        std::printf("    SKIP apply_leaves_the_output_in_the_page_cache_in_place_of_the_input: page cache not visible here\n");
+        return;
+    }
+    std::string change = dir.path() + "/c.osc";
+    std::string text = to_osc({{'m', node(5, 2, T0, "changed")}, {'c', node(30000, 1)}});
+    std::FILE* fp = std::fopen(change.c_str(), "wb");
+    std::fwrite(text.data(), 1, text.size(), fp);
+    std::fclose(fp);
+    opt.changes = {change};
+    opt.verbose = false;
+    opt.threads = 3;
+
+    apply_changes(opt);
+
+    CHECK_EQ(resident_share(opt.input), 0.0);
+    CHECK(resident_share(opt.output) > 0.9);
+    CHECK(describe(read_test_pbf(opt.output)) == describe(osmium_apply(input, {{{'m', node(5, 2, T0, "changed")},
+                                                                                 {'c', node(30000, 1)}}})));
 }

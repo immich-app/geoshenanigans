@@ -148,3 +148,35 @@ TEST(direct_writer_reports_a_span_past_the_end_of_its_file) {
                  "Unexpected end of " + source.path);
     }
 }
+
+// What a reader of the output may rely on, and pbf-apply drops its input's
+// pages behind: the bytes written() names are filled from their sources and
+// on disk, whole blocks from the start; appended() counts what is laid out.
+TEST(direct_writer_written_names_whole_blocks_already_on_disk) {
+    SourceFile source;
+    for (bool direct : {false, true}) {
+        ScratchDir dir("direct-writer-test");
+        std::string path = dir.path() + "/out.bin";
+        DirectFileWriter sut(path, direct, 4096, 2);
+        std::string expected;
+        uint64_t last = 0;
+        for (size_t from = 0; from + 1500 <= source.bytes.size(); from += 1500) {
+            sut.append_from(source.fd, from, 1500, source.path);
+            expected += source.bytes.substr(from, 1500);
+            CHECK_EQ(sut.appended(), uint64_t(expected.size()));
+            uint64_t written = sut.written();
+            CHECK_EQ(written % 4096, uint64_t(0));
+            CHECK(written >= last);
+            CHECK(written <= sut.appended());
+            CHECK(read_file(path).substr(0, written) == expected.substr(0, written));
+            last = written;
+        }
+        // 30,000 bytes laid out: with at most 2 blocks in flight, at least 5 of
+        // the 7 whole blocks are written, and the rest follow without more appends.
+        CHECK(last >= 5 * 4096);
+        for (int i = 0; i < 2000 && sut.written() < 7 * 4096; i++) usleep(1000);
+        CHECK_EQ(sut.written(), uint64_t(7 * 4096));
+        CHECK(read_file(path).substr(0, 7 * 4096) == expected.substr(0, 7 * 4096));
+        CHECK_EQ(sut.finish(), uint64_t(expected.size()));
+    }
+}
