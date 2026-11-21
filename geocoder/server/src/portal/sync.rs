@@ -1,37 +1,44 @@
 // The portal's sync: it keeps the latest build the bucket names in
 // <data>/builds/<date>-<n>, fetched with the downloader's own fetches of a
 // file or a transport unit (each checked against the manifest's sha256 as
-// it comes), and switches to it only once every dataset of it loads.
+// it comes), and switches to it only once it checks out and every dataset
+// of it loads.
 //
 // A build dir holds configurations.json, the build's files as it lays them
 // out (<region>/<dir>/<name>), a dir of links per dataset (sets/<id>/, hard
 // links of the build's files, each by its name, as a client's flat download
 // holds them), the ledger of the objects in place (FETCHED) and, once all
-// are, COMPLETE. Each sync of a build goes into a dir of its own, named
-// anew, which no server maps until it is complete: a sync never writes into
-// the dir of the build served, and a build found damaged is fetched again
-// into a new dir. A sync killed part way resumes in its dir: it removes
-// what its ledger doesn't name (an object in place before its line went
-// in, a try's temporary file), then weighs the room it needs for the
-// objects still to fetch, and fetches only those. Files of the same bytes
-// within a build are fetched once and hard-linked (catalog::Object::link).
+// are and the build checks out, COMPLETE. Each sync of a build goes into a
+// dir of its own, named anew, which no server maps until it is complete: a
+// sync never writes into the dir of the build served, and a build found
+// damaged is fetched again into a new dir. A sync killed part way resumes
+// in its dir: it reads the files of the objects its ledger names against
+// their sha256, removes what its ledger doesn't name and those that don't
+// hold their bytes (an object in place before its line went in, a try's
+// temporary file), then weighs the room it needs for the objects still to
+// fetch, and fetches only those. Files of the same bytes within a build are
+// fetched once and hard-linked (catalog::Object::link). No switch to a
+// build, at start or after a sync, comes before every file of it is read
+// against its manifest's sha256 and each dataset's dir is found to hold the
+// build's files themselves (Portal::checked); a build that fails that is
+// fetched again, not refused.
 //
 // A build is the one of a date as its configurations.json was published: a
 // rerun of the nightly that publishes a date's build again makes another,
 // which the sync fetches into a new dir though it serves the one before.
-// A build of another build version, or one whose datasets don't all load,
-// is refused: never switched to, and recorded in REFUSED with why and its
-// manifest's sha256, so that it is not fetched again while latest.json
-// names it and the bucket holds it as it was refused. A query-portal holds
-// the data dir's lock (VOLUME_LOCK) for as long as it runs, so that no
-// other process prunes its builds, and every round runs under one lock
-// (LOCK); the first of a process serves the newest local build whose files
-// hold their manifest's bytes (each read against its sha256) and that
-// loads, before it asks the bucket anything: none is served before its
-// files check out. A build the data dir holds complete is served again
-// from its dir (latest.json moved back to it) once its files check out,
-// not fetched. The prune keeps the build served, the one served before it
-// and the dir of the latest build a sync left part way.
+// A build of another build version, or one whose datasets don't all load
+// from files that check out, is refused: never switched to, and recorded in
+// REFUSED with why and its manifest's sha256, so that it is not fetched
+// again while latest.json names it and the bucket holds it as it was
+// refused. A query-portal holds the data dir's lock (VOLUME_LOCK) for as
+// long as it runs, so that no other process prunes its builds, and every
+// round runs under one lock (LOCK); the first of a process serves the
+// newest local build that checks out and loads, before it asks the bucket
+// anything: none is served before its files check out. A build the data
+// dir holds complete is served again from its dir (latest.json moved back
+// to it) once it checks out, not fetched. The prune keeps the build
+// served, the one served before it and the dir of the latest build a sync
+// left part way.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -57,7 +64,7 @@ pub const SETS: &str = "sets";
 /// line, appended once its files are.
 pub const FETCHED: &str = ".fetched";
 /// Put in a build dir once every file of the build and every dataset's
-/// links are: the build's date.
+/// links are, and the build checks out (Portal::checked): the build's date.
 pub const COMPLETE: &str = ".complete";
 /// The lock every round holds (flock), in the data dir.
 pub const LOCK: &str = "sync.lock";
@@ -270,47 +277,71 @@ fn in_place(root: &Path, cfg: &Configurations, plan: &Plan) -> Result<(), String
     Ok(())
 }
 
-/// Whether every file of the build dir `root` holds the bytes of its
-/// manifest sha256 (each inode read once, a few at a time); else the first
-/// found that doesn't.
-fn verify(root: &Path, cfg: &Configurations, plan: &Plan) -> Result<(), String> {
-    use std::os::unix::fs::MetadataExt;
-    let mut seen = HashSet::new();
-    let mut files = Vec::new();
-    for f in plan.objects.iter().flat_map(|o| &o.files) {
-        let m = std::fs::metadata(root.join(f)).map_err(|e| format!("{f}: {e}"))?;
-        if seen.insert((m.dev(), m.ino())) {
-            files.push(f);
+/// The sha256 of the file at `path`, in lowercase hex.
+fn sha256_of(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let (mut file, mut hasher, mut buf) = (std::fs::File::open(path)?, Sha256::new(), vec![0u8; 1 << 20]);
+    loop {
+        match file.read(&mut buf)? {
+            0 => return Ok(lower_hex(&hasher.finalize())),
+            n => hasher.update(&buf[..n]),
         }
     }
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let failed = std::sync::Mutex::new(None);
+}
+
+/// The files of `files` in the build dir `root` that don't hold the bytes
+/// of their manifest sha256, each with why: a file under paths of one
+/// sha256 (hard links of it) read once, a few at a time; with `first`, the
+/// reads stop at the first found.
+fn unverified(root: &Path, cfg: &Configurations, files: &[&String], first: bool) -> Vec<(String, String)> {
+    use std::os::unix::fs::MetadataExt;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (mut seen, mut read, mut failed) = (HashSet::new(), Vec::new(), Vec::new());
+    for f in files {
+        match std::fs::metadata(root.join(f)) {
+            Ok(m) if seen.insert((m.dev(), m.ino(), cfg.files[*f].sha256.as_str())) => read.push(*f),
+            Ok(_) => {}
+            Err(e) => failed.push(((*f).clone(), format!("{f}: {e}"))),
+        }
+    }
+    if first && !failed.is_empty() {
+        failed.truncate(1);
+        return failed;
+    }
+    let (next, stop, failed) = (AtomicUsize::new(0), AtomicBool::new(false), std::sync::Mutex::new(failed));
     std::thread::scope(|scope| {
         for _ in 0..4 {
-            scope.spawn(|| loop {
-                let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let Some(f) = files.get(at) else { break };
-                let got = (|| {
-                    use std::io::Read;
-                    let (mut file, mut hasher, mut buf) = (std::fs::File::open(root.join(f))?, Sha256::new(), vec![0u8; 1 << 20]);
-                    loop {
-                        match file.read(&mut buf)? {
-                            0 => return Ok::<_, std::io::Error>(lower_hex(&hasher.finalize())),
-                            n => hasher.update(&buf[..n]),
-                        }
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let Some(f) = read.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
+                    let why = match sha256_of(&root.join(f)) {
+                        Ok(sha256) if sha256 == cfg.files[*f].sha256 => continue,
+                        Ok(sha256) => format!("{f} holds bytes of sha256 {sha256}, not the manifest's {}", cfg.files[*f].sha256),
+                        Err(e) => format!("{f}: {e}"),
+                    };
+                    failed.lock().unwrap().push(((*f).clone(), why));
+                    if first {
+                        stop.store(true, Ordering::Relaxed);
                     }
-                })();
-                let why = match got {
-                    Ok(sha256) if sha256 == cfg.files[*f].sha256 => continue,
-                    Ok(sha256) => format!("{f} holds bytes of sha256 {sha256}, not the manifest's {}", cfg.files[*f].sha256),
-                    Err(e) => format!("{f}: {e}"),
-                };
-                failed.lock().unwrap().get_or_insert(why);
-                break;
+                }
             });
         }
     });
-    failed.into_inner().unwrap().map_or(Ok(()), Err)
+    failed.into_inner().unwrap()
+}
+
+/// Whether every file of the build dir `root` holds the bytes of its
+/// manifest sha256 (unverified); else the first found that doesn't.
+fn verify(root: &Path, cfg: &Configurations, plan: &Plan) -> Result<(), String> {
+    let files: Vec<&String> = plan.objects.iter().flat_map(|o| &o.files).collect();
+    unverified(root, cfg, &files, true).into_iter().next().map_or(Ok(()), |(_, why)| Err(why))
+}
+
+/// Whether the build dir `root` can be served as it is: in_place, then
+/// verify; else why not.
+fn check(root: &Path, cfg: &Configurations, plan: &Plan) -> Result<(), String> {
+    in_place(root, cfg, plan)?;
+    verify(root, cfg, plan)
 }
 
 /// The lock of the data dir `data` (VOLUME_LOCK), held until the file
@@ -458,11 +489,10 @@ impl Portal {
     }
 
     /// Serves the newest complete build dir that opens (open: of
-    /// BUILD_VERSION, not refused, every file of it there and holding the
-    /// bytes of its manifest's sha256, and every dataset loading), if any,
-    /// trying each from the newest down: none is served before its files
-    /// check out. A dir that can't be served, a damaged one among them, is
-    /// left to the prune, and its build fetched again (sync).
+    /// BUILD_VERSION, not refused, checking out and every dataset loading),
+    /// if any, trying each from the newest down: none is served before its
+    /// files check out. A dir that can't be served, a damaged one among
+    /// them, is left to the prune, and its build fetched again (sync).
     async fn start(&self) {
         let dirs = match self.list() {
             Ok(dirs) => dirs,
@@ -485,9 +515,7 @@ impl Portal {
     }
 
     /// The complete build dir `name`, checked and loaded; or why it can't
-    /// be served. Its files are each read against their manifest's sha256
-    /// (verify), which also brings them into the page cache, before any
-    /// dataset of it loads.
+    /// be served. It is checked (checked) before any dataset of it loads.
     async fn open(&self, name: &str) -> Result<Served, String> {
         let root = self.builds().join(name);
         let bytes = std::fs::read(root.join(MANIFEST)).map_err(|e| format!("{MANIFEST}: {e}"))?;
@@ -500,13 +528,20 @@ impl Portal {
             return Err(format!("it was refused: {}", refused.reason));
         }
         let plan = catalog::plan(&cfg, &manifest)?;
-        self.running(format!("checking the files of build {name}"));
-        let (at, checked) = (root.clone(), plan.clone());
-        tokio::task::spawn_blocking(move || in_place(&at, &cfg, &checked).and_then(|()| verify(&at, &cfg, &checked)))
-            .await
-            .map_err(|e| format!("check task: {e}"))??;
+        self.checked(name, &cfg, &plan).await?;
         self.running(format!("loading build {name}"));
         self.load(name, plan, sha256).await
+    }
+
+    /// Whether the build dir `name`, of the manifest `cfg` and the plan
+    /// `plan`, can be served as it is (check: every file of it read against
+    /// its manifest's sha256, which also brings it into the page cache, and
+    /// each dataset's dir holding the build's files themselves); else why
+    /// not. Each switch to a build waits on it.
+    async fn checked(&self, name: &str, cfg: &Configurations, plan: &Plan) -> Result<(), String> {
+        self.running(format!("checking the files of build {name}"));
+        let (root, cfg, plan) = (self.builds().join(name), cfg.clone(), plan.clone());
+        tokio::task::spawn_blocking(move || check(&root, &cfg, &plan)).await.map_err(|e| format!("check task: {e}"))?
     }
 
     /// Every dataset of the build dir `name`, whose configurations.json is of
@@ -626,13 +661,15 @@ impl Portal {
     }
 
     /// Fetches the latest build into a dir of its own and serves it once
-    /// all its datasets load; what it did, or why it failed. The latest
-    /// build is the one of the date latest.json names as its
-    /// configurations.json is now: one published again under its date (a
-    /// rerun of the nightly) is another build. A build of another build
-    /// version, or that can't be served, is refused; one refused is not
-    /// fetched again while it is the latest. With the latest served it does
-    /// nothing; with it complete in a dir, it serves it from there.
+    /// its files check out (checked) and all its datasets load; what it did,
+    /// or why it failed. The latest build is the one of the date latest.json
+    /// names as its configurations.json is now: one published again under
+    /// its date (a rerun of the nightly) is another build. A build of
+    /// another build version, or whose datasets don't load from files that
+    /// check out, is refused; one refused is not fetched again while it is
+    /// the latest. One whose files don't check out is fetched again, into a
+    /// new dir. With the latest served it does nothing; with it complete in
+    /// a dir, it serves it from there.
     async fn sync(&self) -> Result<String, String> {
         self.running("reading the latest build".to_string());
         let mut latest = self.latest().await?;
@@ -727,9 +764,28 @@ impl Portal {
                 .map_err(|e| format!("build {name}: {e}"))?;
         }
         let done = ledger(&root);
-        let (held, todo): (Vec<&catalog::Object>, Vec<&catalog::Object>) = plan.objects.iter()
+        let (mut held, mut todo): (Vec<&catalog::Object>, Vec<&catalog::Object>) = plan.objects.iter()
             .filter(|o| o.link.is_none())
             .partition(|o| done.contains(&o.path) && sized(&root, &cfg, &o.files));
+        if resume.is_some() && !held.is_empty() {
+            // The files of the objects the ledger names are read against
+            // their sha256 before those objects are taken as in place: one
+            // whose files don't hold their bytes is fetched again with the
+            // rest, and its room counted.
+            self.running(format!("checking the files build {name} holds"));
+            let (at, c, files) = (root.clone(), cfg.clone(), held.iter().flat_map(|o| o.files.iter().cloned()).collect::<Vec<_>>());
+            let failed = tokio::task::spawn_blocking(move || unverified(&at, &c, &files.iter().collect::<Vec<_>>(), false))
+                .await
+                .map_err(|e| format!("check task: {e}"))?;
+            for (_, why) in &failed {
+                eprintln!("portal sync: build {name}: {why}; fetching it again");
+            }
+            let failed: HashSet<String> = failed.into_iter().map(|(f, _)| f).collect();
+            let (good, again): (Vec<&catalog::Object>, Vec<&catalog::Object>) =
+                held.into_iter().partition(|o| !o.files.iter().any(|f| failed.contains(f)));
+            held = good;
+            todo.extend(again);
+        }
         if resume.is_some() {
             // What the ledger doesn't name goes before the room is weighed:
             // it would take room the build's files need, and the files of
@@ -762,12 +818,15 @@ impl Portal {
         self.fetch(&root, &cfg, &date, todo).await?;
         self.running(format!("linking build {name}"));
         let (at, linked) = (root.clone(), plan.clone());
-        tokio::task::spawn_blocking(move || {
-            link(&at, &linked)?;
-            write_whole(&at.join(COMPLETE), linked.date.as_bytes()).map_err(|e| format!("write {}: {e}", at.join(COMPLETE).display()))
-        })
-        .await
-        .map_err(|e| format!("link task: {e}"))??;
+        tokio::task::spawn_blocking(move || link(&at, &linked)).await.map_err(|e| format!("link task: {e}"))??;
+        // The build as it lies in its dir, each file read against its
+        // sha256 again: one whose files don't check out is no publication's
+        // fault, and is fetched again into a new dir, not refused.
+        if let Err(why) = self.checked(&name, &cfg, &plan).await {
+            self.set_unusable(&name);
+            return Err(format!("build {name}'s files don't check out: {why}; it is fetched again"));
+        }
+        write_whole(&root.join(COMPLETE), plan.date.as_bytes()).map_err(|e| format!("write {}: {e}", root.join(COMPLETE).display()))?;
 
         self.running(format!("loading build {name}"));
         match self.load(&name, plan, sha256.clone()).await {

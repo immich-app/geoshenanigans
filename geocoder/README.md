@@ -159,11 +159,15 @@ the portal runs 8 lookups at once, the others waiting their turn.
 (`PORTAL_SYNC_SECONDS`), into a dir of its own in the volume, each file
 checked against the build's manifest and the files two dirs share
 hard-linked (~11.2 GiB a build, ~9 GiB to download). A sync killed part
-way resumes in its dir: it removes the files its ledger of the objects in
-place doesn't name, then wants room for the files still to fetch and 2 GiB
-besides. It switches to a build
-only once every dataset of it loads, and refuses one of another build
-version than it reads, saying so on `/health`. A build published again
+way resumes in its dir: it reads the files of the objects its ledger names
+against their sha256 and removes those that fail and the files the ledger
+doesn't name, then wants room for the files still to fetch and 2 GiB
+besides. It switches to a build only once every file of it holds its
+manifest's bytes, each read against its sha256 again, each dataset's dir
+holds hard links of the build's files and nothing else, and every dataset
+loads; a build whose files fail that is fetched again, not refused. It
+refuses one of another build version than it reads, saying so on
+`/health`. A build published again
 under its date (a rerun of the nightly) is another build: it fetches that
 one too, and a refusal of the build as first published doesn't hold
 against it. At start it serves the newest build the volume holds whose

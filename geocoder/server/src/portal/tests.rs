@@ -277,6 +277,47 @@ fn flip(path: &Path) {
     std::fs::OpenOptions::new().write(true).open(path).unwrap().write_all(&bytes).unwrap();
 }
 
+/// `load`, once each file of the dataset dir it loads holds the bytes of
+/// the bucket's file it links: else an error naming the first that
+/// doesn't, as a real load of damaged files may fail.
+async fn checking(bucket: &TestBucket, load: Loader) -> Loader {
+    let (cfg, manifest) = manifest_of(bucket).await;
+    let links: BTreeMap<String, BTreeMap<String, String>> =
+        catalog::plan(&cfg, &manifest).unwrap().datasets.into_iter().map(|d| (d.id.clone(), d.links())).collect();
+    let bytes: BTreeMap<String, Vec<u8>> = cfg.files.keys().map(|f| (f.clone(), bucket.file(f).to_vec())).collect();
+    Arc::new(move |set: &Path| {
+        let id = set.file_name().unwrap().to_str().unwrap();
+        for (name, path) in &links[id] {
+            if std::fs::read(set.join(name)).ok().as_ref() != Some(&bytes[path]) {
+                return Err(format!("{name} doesn't hold the bytes of {path}"));
+            }
+        }
+        load(set)
+    })
+}
+
+/// A sync of the bucket's build into `data`, an object at a time, killed
+/// while it fetches the fourth largest: its objects, largest first, and the
+/// build dir it left part way, its ledger naming the first three.
+async fn killed_part_way(bucket: &TestBucket, data: &Path, load: Loader) -> (Vec<Object>, std::path::PathBuf) {
+    let mut one_at_a_time = config(bucket, load);
+    one_at_a_time.fetches_at_once = 1;
+    let p = portal(data, one_at_a_time);
+    let mut order = fetched(bucket).await;
+    order.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+    let holding = bucket.hold(&object_url(&order[3]));
+    let round = tokio::spawn(async move { p.round(true).await });
+    holding.reached().await;
+    round.abort();
+    assert!(round.await.unwrap_err().is_cancelled());
+    // The decode the kill left on its thread sees its stream end.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(holding);
+    let root = data.join(BUILDS).join(format!("{DATE}-1"));
+    assert_eq!(sync::ledger(&root), order[..3].iter().map(|o| o.path.clone()).collect::<BTreeSet<_>>());
+    (order, root)
+}
+
 // The image reads builds of the template's version, and syncs only those.
 #[test]
 fn the_build_version_it_serves_is_the_templates() {
@@ -889,6 +930,13 @@ fn free_on_volume(data: &Path) -> std::io::Result<u64> {
     Ok(VOLUME.load(std::sync::atomic::Ordering::SeqCst).saturating_sub(bytes_under(data)))
 }
 
+/// The bytes free that `room` tells of, whatever the volume holds.
+static ROOM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn room(_: &Path) -> std::io::Result<u64> {
+    Ok(ROOM.load(std::sync::atomic::Ordering::SeqCst))
+}
+
 // A sync killed part way leaves files its ledger doesn't name: an object in
 // place whose line hadn't gone in, a try's temporary file. The next, on a
 // volume with room for the whole build and the margin besides, removes them
@@ -937,6 +985,82 @@ async fn a_resumed_sync_removes_what_its_ledger_doesnt_name_before_it_weighs_the
     assert_eq!(resumed, want);
     assert!(!abandoned.exists());
     assert_eq!(leftovers(&root), Vec::<String>::new());
+}
+
+// A resumed sync reads the files of the objects its ledger names against
+// their sha256 before it takes those objects as in place: one whose bytes
+// changed at their size goes, counts in the room the sync wants, and is
+// fetched again, and the build is served, not refused.
+#[tokio::test]
+async fn a_resumed_sync_fetches_again_an_object_its_ledger_names_whose_bytes_changed() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let (order, root) = killed_part_way(&bucket, data.path(), load.clone()).await;
+    let changed = &order[0];
+    flip(&root.join(&changed.files[0]));
+    let size = |objects: &[Object]| -> u64 { objects.iter().flat_map(|o| &o.files).map(|f| bucket.manifest.files[f].size_raw).sum() };
+    let load = checking(&bucket, load).await;
+    let mut tight = config(&bucket, load.clone());
+    tight.free_space = room;
+    // Room for the objects the ledger doesn't name, but not for the one
+    // whose bytes changed besides.
+    ROOM.store(sync::FREE_MARGIN + size(&order[3..]), std::sync::atomic::Ordering::SeqCst);
+
+    let failed = portal(data.path(), tight).round(true).await.unwrap_err();
+
+    assert!(failed.contains(&format!("needed to fetch build {DATE}: ")), "{failed}");
+    ROOM.store(sync::FREE_MARGIN + size(&order[3..]) + size(std::slice::from_ref(changed)), std::sync::atomic::Ordering::SeqCst);
+    let mut roomy = config(&bucket, load);
+    roomy.free_space = room;
+    let before = bucket.requests().len();
+    assert_eq!(portal(data.path(), roomy).round(true).await, Ok(format!("build {DATE} is served ({DATE}-1)")));
+    let mut again = bucket.requests()[before..].to_vec();
+    again.sort();
+    let mut want: Vec<String> = std::iter::once(changed).chain(&order[3..]).map(|o| format!("{DATE}/{}", object_url(o))).collect();
+    want.sort();
+    assert_eq!(again, want);
+    for f in &changed.files {
+        assert!(std::fs::read(root.join(f)).unwrap() == bucket.file(f), "{f}");
+    }
+}
+
+// A round reads every file of the build against its sha256 before it
+// switches to it, not only as each comes down: where one's bytes changed in
+// its dir since, the round fails and its dir goes, the build not refused,
+// and the next round fetches the build again, into a dir made anew.
+#[tokio::test]
+async fn a_round_reads_the_builds_files_before_it_switches_and_fetches_again_one_whose_bytes_changed() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let mut one_at_a_time = config(&bucket, checking(&bucket, load).await);
+    one_at_a_time.fetches_at_once = 1;
+    let p = portal(data.path(), one_at_a_time);
+    let mut order = fetched(&bucket).await;
+    order.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+    let holding = bucket.hold(&object_url(&order[3]));
+    let round = tokio::spawn({
+        let p = p.clone();
+        async move { p.round(true).await }
+    });
+    holding.reached().await;
+    let changed = data.path().join(BUILDS).join(format!("{DATE}-1")).join(&order[0].files[0]);
+    flip(&changed);
+    drop(holding);
+
+    let failed = round.await.unwrap().unwrap_err();
+
+    assert!(failed.starts_with(&format!("build {DATE}-1's files don't check out: ")), "{failed}");
+    assert!(failed.contains(" holds bytes of sha256 "), "{failed}");
+    assert!(p.served().is_none());
+    assert!(p.status().refused.is_empty(), "{:?}", p.status().refused);
+    assert!(!data.path().join(REFUSED).exists());
+    assert_eq!(build_dirs(data.path()), Vec::<String>::new());
+    let before = bucket.requests().len();
+    assert_eq!(p.round(false).await, Ok(format!("build {DATE} is served ({DATE}-1)")));
+    assert_eq!(bucket.requests().len() - before, order.len());
+    assert!(std::fs::read(&changed).unwrap() == bucket.file(&order[0].files[0]));
 }
 
 // Two tries at one file at once (one a round left running, one of the
