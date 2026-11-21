@@ -207,6 +207,17 @@ class TestPortalTest(unittest.TestCase):
         with open(os.path.join(PORTAL, "entrypoint.sh")) as f:
             self.assertRegex(f.read(), r'(?m)^exec query-portal "\$DATA_DIR" 0\.0\.0\.0:3000$')
 
+    # One service serves every dataset on :3002 (the minimal server of :3001 is a column of the page), init
+    # passing query-portal the stop signal, set only by what query-portal and the entrypoint read.
+    def test_compose_runs_one_portal_on_3002(self):
+        with open(os.path.join(PORTAL, "docker-compose.yml")) as f:
+            services = f.read().split("\nvolumes:\n")[0]
+        self.assertEqual(re.findall(r"(?m)^  ([\w-]+):$", services), ["geocoder-portal"])
+        self.assertEqual(re.findall(r'(?m)^      - "(\d+):3000"$', services), ["3002"])
+        self.assertRegex(services, r"(?m)^    init: true$")
+        self.assertLessEqual(set(re.findall(r"(?m)^      ([A-Z][A-Z_]*):", services)),
+                             {"DATA_DIR", "PORTAL_BASE_URL", "PORTAL_SYNC_SECONDS"})
+
 
 class ResolveTest(unittest.TestCase):
     CFG = {"components": {

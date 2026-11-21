@@ -1,40 +1,31 @@
 services:
-  # Full dataset — simplified boundaries (postcode areas among them) + all
-  # POIs + postcodes.  Hosts the test portal HTML and acts as the "Ours" leg
-  # in the side-by-side comparison.
-  geocoder-full:
+  # The test portal. query-portal syncs the whole planet build (every mode,
+  # boundary precision and POI tier) from the bucket into the volume by
+  # itself, each file checked against the build's manifest, and serves each
+  # of its 28 datasets; the page at /test compares up to 4 side by side. A
+  # build is ~11.2 GiB on disk (its identical files hard-linked) and ~9 GiB
+  # to download, once a day; the volume keeps the build served, the one
+  # before it and one being fetched, ~34 GiB at most.
+  geocoder-portal:
     build:
       context: ..
       dockerfile: test-portal/Dockerfile
     ports:
       # 3002 because :3000 is normally claimed by `immich_web` in the
-      # local dev stack.  The test portal is served from this port; it
-      # cross-fetches the minimal server on :3001 for side-by-side.
+      # local dev stack.
       - "3002:3000"
-    environment:
-      QUALITY: simplified
-      POI_TIER: all
-      MINIMAL: "0"
+    # query-portal runs as PID 1, which ignores SIGTERM: init passes it on.
+    init: true
+    restart: unless-stopped
+    # No memory limit: the heap of all 28 datasets is ~30 MiB, the rest is
+    # page cache of the build, which a limit only evicts sooner (each sync
+    # writes a whole build).
+    #
+    # environment:
+    #   PORTAL_SYNC_SECONDS: "3600"  # between two sync rounds (a failed one: 600 at most)
+    #   PORTAL_BASE_URL: ...         # another bucket than the published builds
     volumes:
-      - geocoder-data-full:/data
-
-  # Minimal dataset — simplified admin boundaries of levels 2-8 + place
-  # nodes only.  No streets, addresses, postcodes or POIs.  Smallest
-  # deployable that still resolves admin + cities/towns/villages/hamlets at
-  # GeoNames cities500-equivalent detail.  The test portal queries this
-  # server at http://localhost:3001 for the side-by-side comparison.
-  geocoder-minimal:
-    build:
-      context: ..
-      dockerfile: test-portal/Dockerfile
-    ports:
-      - "3001:3000"
-    environment:
-      QUALITY: simplified
-      MINIMAL: "1"
-    volumes:
-      - geocoder-data-minimal:/data
+      - geocoder-portal-data:/data
 
 volumes:
-  geocoder-data-full:
-  geocoder-data-minimal:
+  geocoder-portal-data:
