@@ -867,8 +867,9 @@ def watchdog_script(name):
 
 # gh as the watchdog runs it, answering from the JSON in $FAKE_GH_DATA: the repo's default branch, the build's runs
 # (`run list` newest first, on its --branch and from its --created date, at most its --limit, each with only the
-# fields asked for), each run's jobs, and the REST API's runs (a page of per_page) and jobs; --jq filters go through
-# jq. `workflow run` appends its arguments to $FAKE_GH_CALLS.
+# fields asked for), each run's jobs, and the REST API's runs (a page of per_page) and each run attempt's jobs (by
+# their route, runs/<id>/attempts/<n>/jobs; another is not found); --jq filters go through jq. `workflow run` appends
+# its arguments to $FAKE_GH_CALLS.
 FAKE_GH = r'''#!{python}
 import json, os, re, subprocess, sys
 args = sys.argv[1:]
@@ -906,10 +907,15 @@ elif args[:2] == ["run", "view"]:
 elif args[:2] == ["workflow", "run"]:
     with open(os.environ["FAKE_GH_CALLS"], "a") as f:
         f.write(" ".join(args) + "\n")
+elif args[0] == "api" and args[1].endswith("/jobs"):
+    route = args[1].split("/actions/", 1)[1]
+    if route not in data["api_jobs"]:
+        sys.exit("gh: Not Found (HTTP 404)")
+    answer({{"jobs": data["api_jobs"][route]}})
 elif args[0] == "api":
     page = re.search(r"[?&]per_page=([0-9]+)", args[1])
     per_page = int(page.group(1)) if page else 30
-    answer({{"jobs": data["api_jobs"]}} if args[1].endswith("/jobs") else {{"workflow_runs": data["api_runs"][:per_page]}})
+    answer({{"workflow_runs": data["api_runs"][:per_page]}})
 else:
     sys.exit("fake gh: " + " ".join(args))
 '''
@@ -936,7 +942,12 @@ class WatchdogTest(unittest.TestCase):
             f.write(FAKE_GH.format(python=sys.executable))
         os.chmod(os.path.join(self.bin, "gh"), 0o755)
         self.calls = os.path.join(self.root, "calls")
-        self.today = time.strftime("%Y-%m-%d", time.gmtime())
+        # The day the script takes for today, whatever the clock says (a run that straddled midnight UTC would
+        # otherwise date the fixtures and the script apart).
+        self.today = "2026-11-21"
+        with open(os.path.join(self.bin, "date"), "w") as f:
+            f.write(f'#!/bin/sh\nif [ "$*" = "-u +%Y-%m-%d" ]; then echo {self.today}; else exec {shutil.which("date")} "$@"; fi\n')
+        os.chmod(os.path.join(self.bin, "date"), 0o755)
         self.runs, self.jobs = [], {}
 
     def run_at(self, hhmm, title, conclusion, steps=(), run_id=None, branch="main"):
@@ -1053,11 +1064,14 @@ class WatchdogTest(unittest.TestCase):
                 self.assertEqual(self.watchdog()[1], self.retry() if retried else [])
 
     def report(self, api_runs):
-        """Runs the report step against the REST API's runs `api_runs`, newest first; returns the run it took."""
+        """Runs the report step against the REST API's runs `api_runs`, newest first, each with a job of its own;
+        returns the run it took, once it has checked that the job it took is that run's."""
         data = os.path.join(self.root, "data.json")
         with open(data, "w") as f:
             json.dump({"default_branch": "main", "runs": [], "jobs": {}, "api_runs": api_runs,
-                       "api_jobs": [{"steps": []}]}, f)
+                       "api_jobs": {f"runs/{run['id']}/attempts/{run['run_attempt']}/jobs": [{"id": 1000 + run["id"],
+                                                                                              "steps": []}]
+                                    for run in api_runs}}, f)
         for tool, body in {"op": "echo token\n", "python3": "exit 0\n"}.items():
             with open(os.path.join(self.bin, tool), "w") as f:
                 f.write("#!/bin/sh\n" + body)
@@ -1071,7 +1085,10 @@ class WatchdogTest(unittest.TestCase):
 
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         with open(os.path.join(self.root, "o11y-run.json")) as f:
-            return json.load(f)
+            run = json.load(f)
+        with open(os.path.join(self.root, "o11y-job.json")) as f:
+            self.assertEqual(json.load(f), {"id": 1000 + run["id"], "steps": []})
+        return run
 
     # The report's latest finished nightly is the live one's, a scratch run after it notwithstanding, or a dispatch
     # under the live prefix in other case.
