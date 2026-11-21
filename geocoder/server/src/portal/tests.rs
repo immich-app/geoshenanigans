@@ -110,8 +110,13 @@ fn fixtures() -> (Arc<Fixtures>, Loader) {
 }
 
 fn config(bucket: &TestBucket, load: Loader) -> Config {
+    config_at(&bucket.url, load)
+}
+
+/// The portal's config of these tests, of the bucket at `url`.
+fn config_at(url: &str, load: Loader) -> Config {
     Config {
-        base_url: bucket.url.clone(),
+        base_url: url.to_string(),
         interval: Duration::from_millis(20),
         retry_after: Duration::from_millis(20),
         retry_delays: Vec::new(),
@@ -2075,3 +2080,7 @@ fn times_are_iso_8601_in_utc() {
 // The place search's tests, beside these, whose helpers they take.
 #[path = "search_tests.rs"]
 mod search_tests;
+
+// The feedback's tests, as the place search's.
+#[path = "feedback_tests.rs"]
+mod feedback_tests;

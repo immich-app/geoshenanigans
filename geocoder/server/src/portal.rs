@@ -8,13 +8,17 @@
 // (search.rs), /datasets lists the datasets and the combinations the
 // constraints exclude, /health tells the build served (by its publication
 // ID, sync::publication_id), how the sync goes and how each place search
-// index does, and /test is the page. Without a build to serve it starts all
-// the same: those routes answer 503 with the reason while it syncs.
+// index does, POST /feedback keeps the reports of those who disagree with
+// an answer (feedback.rs), and /test is the page. Without a build to serve
+// it starts all the same: those routes answer 503 with the reason while it
+// syncs; /feedback takes reports all the same.
 
 // By path: query-portal, a bin of place-search, takes this file in by
 // #[path], from which a plain `mod` would look beside it.
 #[path = "portal/catalog.rs"]
 pub mod catalog;
+#[path = "portal/feedback.rs"]
+pub mod feedback;
 #[path = "portal/search.rs"]
 pub mod search;
 #[path = "portal/sync.rs"]
@@ -28,7 +32,7 @@ use std::time::Duration;
 use axum::extract::{ConnectInfo, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use serde::{Deserialize, Serialize};
 
@@ -311,20 +315,25 @@ struct App {
     portal: Arc<Portal>,
     db: Arc<RwLock<auth::Db>>,
     limiter: auth::RateLimiter,
+    /// The reports of <data>/feedback.
+    feedback: Arc<feedback::Feedback>,
 }
 
-/// The portal's routes: /health, /datasets, /reverse, /polygons, /search
-/// and /test, keys checked against `db`.
+/// The portal's routes: /health, /datasets, /reverse, /polygons, /search,
+/// /feedback and /test, keys checked against `db`.
 pub fn router(portal: Arc<Portal>, db: Arc<RwLock<auth::Db>>) -> Router {
+    let feedback = Arc::new(feedback::Feedback::new(portal.data.join(feedback::DIR)));
     Router::new()
         .route("/health", get(health))
         .route("/datasets", get(datasets))
         .route("/reverse", get(reverse))
         .route("/polygons", get(polygons))
         .route("/search", get(search_places))
+        .route("/feedback", post(feedback::submit))
+        .route("/feedback/count", get(feedback::count))
         .route("/test", get(handlers::test_portal))
         .layer(axum::middleware::from_fn(handlers::cors_middleware))
-        .with_state(Arc::new(App { portal, db, limiter: auth::RateLimiter::default() }))
+        .with_state(Arc::new(App { portal, db, limiter: auth::RateLimiter::default(), feedback }))
 }
 
 fn json(status: StatusCode, body: String) -> Response {
