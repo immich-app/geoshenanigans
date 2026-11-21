@@ -1588,8 +1588,9 @@ function lookupLinkPoints() {
 }
 
 // Asks each column without an answer for `entry` for one (with `again`,
-// each column not being asked already). Columns of one dataset are asked
-// once.
+// each column, one being asked already waited for rather than asked
+// again), and gives when those answers are in. Columns of one dataset are
+// asked once. An answer being asked keeps the promise of its ask (pending).
 function askColumns(entry, again = false) {
   const keys = new Map();
   for (const col of columns) {
@@ -1599,8 +1600,14 @@ function askColumns(entry, again = false) {
   const asks = [];
   for (const [key, col] of keys) {
     const have = entry.answers[key];
-    if (have && (have.loading || !again)) continue;
-    asks.push(ask(entry, key, col));
+    if (have && have.loading) {
+      if (again) asks.push(have.pending);
+      continue;
+    }
+    if (have && !again) continue;
+    const asking = ask(entry, key, col);
+    entry.answers[key].pending = asking;
+    asks.push(asking);
   }
   return Promise.all(asks);
 }
@@ -1621,19 +1628,22 @@ async function ask(entry, key, col) {
 }
 
 // Asks Nominatim, where it is on, for `entry`, unless it has its answer or
-// is being asked; a request that failed is asked again.
+// is being asked; a request that failed is asked again. One cancelled by
+// turning Nominatim off (nominatimCancel) leaves neither an answer nor an
+// error: it is asked again once Nominatim is on.
 async function askNominatim(entry) {
   if (!nominatimEnabled || entry.nominatim || entry.nominatimLoading) return;
+  const { signal } = nominatimCancel;
   entry.nominatimLoading = true;
   entry.nominatimError = null;
   answered(entry);
   try {
-    const got = await nominatimPacer.request(`https://nominatim.openstreetmap.org/reverse?lat=${entry.lat}&lon=${entry.lng}&format=jsonv2`);
+    const got = await nominatimPacer.request(`https://nominatim.openstreetmap.org/reverse?lat=${entry.lat}&lon=${entry.lng}&format=jsonv2`, 'reverse', signal);
     const answer = answerOf(got.status, () => null, got.body, got.ms);
     entry.nominatim = answer.data || null;
     entry.nominatimError = answer.error || null;
   } catch (e) {
-    entry.nominatimError = e.message;
+    if (!signal.aborted) entry.nominatimError = e.message;
   }
   entry.nominatimLoading = false;
   answered(entry);
@@ -1790,9 +1800,16 @@ const polygonOverlay = new PolygonOverlay({
 // nominatim.openstreetmap.org so we don't want to hit it unsolicited.
 // Default off; toggle button persists choice in localStorage.
 let nominatimEnabled = localStorage.getItem('nominatim_enabled') === '1';
+// Cancels Nominatim's requests, those queued and the one in flight, once it
+// is turned off: none goes after.
+let nominatimCancel = new AbortController();
 function toggleNominatim() {
   nominatimEnabled = !nominatimEnabled;
   localStorage.setItem('nominatim_enabled', nominatimEnabled ? '1' : '0');
+  if (!nominatimEnabled) {
+    nominatimCancel.abort();
+    nominatimCancel = new AbortController();
+  }
   updateNominatimBtn();
   // The selected result gets its comparison at once, without a new query.
   const entry = selectedEntry();
