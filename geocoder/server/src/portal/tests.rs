@@ -1819,6 +1819,44 @@ async fn a_first_round_that_cant_take_its_lock_leaves_the_start_to_the_next() {
     assert_eq!(build_dirs(data.path()), [format!("{DATE}-1")]);
 }
 
+// A first round that can't list the volume's builds fails, asking the bucket
+// nothing and pruning nothing, and leaves the start to the next: once the
+// builds can be listed, that one serves the volume's build though the bucket
+// is out of reach, and its prune keeps it.
+#[tokio::test]
+async fn a_first_round_that_cant_list_the_builds_leaves_the_start_to_the_next() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    portal(data.path(), config(&bucket, load.clone())).round(true).await.unwrap();
+    // The builds' dir, a link to a file until the builds are linked back.
+    let (builds, kept, file) = (data.path().join(BUILDS), data.path().join("builds.kept"), data.path().join("no-dir"));
+    std::fs::rename(&builds, &kept).unwrap();
+    std::fs::write(&file, "").unwrap();
+    std::os::unix::fs::symlink(&file, &builds).unwrap();
+    // No round gets past the latest build.
+    std::fs::write(data.path().join(sync::LATEST_OVERRIDE), "tomorrow\n").unwrap();
+    let p = portal(data.path(), config(&bucket, load));
+    let before = bucket.requests().len();
+
+    let failed = p.round(true).await.unwrap_err();
+
+    assert!(failed.starts_with(&format!("read {}: ", builds.display())), "{failed}");
+    assert_eq!(bucket.requests().len(), before);
+    tokio::spawn(p.clone().run());
+    let result = || p.status().last_result.unwrap_or_default();
+    until("a round that can't list the builds", || result().starts_with("failed: read ")).await;
+    // The builds linked back at once, by a link renamed over the other.
+    std::os::unix::fs::symlink(&kept, data.path().join("builds.back")).unwrap();
+    std::fs::rename(data.path().join("builds.back"), &builds).unwrap();
+    let complete = kept.join(format!("{DATE}-1")).join(COMPLETE);
+    until("the volume's build served, or removed", || p.served().is_some() || !complete.exists()).await;
+    until("a round past the start", || result().contains(sync::LATEST_OVERRIDE)).await;
+
+    assert_eq!(p.served().map(|s| s.dir.clone()), Some(format!("{DATE}-1")));
+    assert_eq!(build_dirs(data.path()), [format!("{DATE}-1")]);
+}
+
 // An interval longer than the clock can count past now leaves the sync
 // running: the time of the next round goes untold, and the sync waits.
 #[tokio::test]

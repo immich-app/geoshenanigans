@@ -453,7 +453,7 @@ impl Portal {
     /// Runs the rounds for good, a round every interval (retry_after once
     /// one failed). A round that panics is a round that failed. Each round
     /// is the first (round) until one has run the start: one that failed on
-    /// its lock has not.
+    /// its lock, or on the list of the builds at its start, has not.
     pub async fn run(self: Arc<Self>) {
         loop {
             self.set_status(|s| {
@@ -483,11 +483,13 @@ impl Portal {
 
     /// One round, under the lock: the start, on the `first` of a process
     /// (start), then the sync, then the prune. What it did, or why it
-    /// failed.
+    /// failed. A start that can't list the builds fails the round before
+    /// the sync and the prune, and is the next round's to run again: a prune
+    /// with no build served would remove the one the start would serve.
     pub async fn round(&self, first: bool) -> Result<String, String> {
         let _lock = self.lock().await?;
         if first {
-            self.start().await;
+            self.start().await?;
             self.started.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         let synced = self.sync().await;
@@ -515,12 +517,10 @@ impl Portal {
     /// BUILD_VERSION, not refused, checking out and every dataset loading),
     /// if any, trying each from the newest down: none is served before its
     /// files check out. A dir that can't be served, a damaged one among
-    /// them, is left to the prune, and its build fetched again (sync).
-    async fn start(&self) {
-        let dirs = match self.list() {
-            Ok(dirs) => dirs,
-            Err(why) => return eprintln!("portal start: {why}"),
-        };
+    /// them, is left to the prune, and its build fetched again (sync). An
+    /// error where the build dirs can't be listed.
+    async fn start(&self) -> Result<(), String> {
+        let dirs = self.list()?;
         for (dir, _) in dirs.iter().rev().filter(|(_, complete)| *complete) {
             let name = dir.name();
             match self.open(&name).await {
@@ -535,6 +535,7 @@ impl Portal {
                 }
             }
         }
+        Ok(())
     }
 
     /// The complete build dir `name`, checked and loaded; or why it can't

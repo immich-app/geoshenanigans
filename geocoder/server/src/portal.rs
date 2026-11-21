@@ -177,7 +177,8 @@ pub struct Portal {
     /// forgets each it removes.
     unusable: Mutex<std::collections::BTreeSet<String>>,
     /// Whether a round of this process has run the start (sync.rs): one
-    /// that failed before it, on its lock, has not.
+    /// that failed on its lock, or on the list of the builds at its start,
+    /// has not.
     started: std::sync::atomic::AtomicBool,
     /// A place for each lookup that may run (Config::lookups_at_once),
     /// held until the lookup ends.
