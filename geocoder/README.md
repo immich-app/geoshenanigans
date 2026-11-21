@@ -162,10 +162,13 @@ only once every dataset of it loads, and refuses one of another build
 version than it reads, saying so on `/health`. A build published again
 under its date (a rerun of the nightly) is another build: it fetches that
 one too, and a refusal of the build as first published doesn't hold
-against it. Until it has a build to
-serve, `/reverse`, `/polygons` and `/datasets` answer 503 with the reason. It
-keeps the build it serves and the one it served before, and serves a build it
-holds again, without a fetch, once latest.json names it again. A date in
+against it. At start it serves the newest build the volume holds whose
+files all hold their manifest's bytes, each read against its sha256 before
+the build is served (~3 s for a planet build on an NVMe disk, cold or
+warm), and fetches one that doesn't again. Until it has a build to serve,
+`/reverse`, `/polygons` and `/datasets` answer 503 with the reason. It
+keeps the build it serves and the one it served before, and serves a build
+it holds again, without a fetch, once latest.json names it again. A date in
 `<data>/latest.override` stands in for the bucket's latest.json. One
 `query-portal` serves a volume: it holds `<data>/portal.lock` for as long
 as it runs, and a second one started on the same volume exits at once,

@@ -23,12 +23,13 @@
 // names it and the bucket holds it as it was refused. A query-portal holds
 // the data dir's lock (VOLUME_LOCK) for as long as it runs, so that no
 // other process prunes its builds, and every round runs under one lock
-// (LOCK); the first of a process serves the newest local build that loads
-// before it asks the bucket anything, and checks its files against their
-// sha256. A build the data dir holds complete is served again from its dir
-// (latest.json moved back to it) once its files check out, not fetched.
-// The prune keeps the build served, the one served before it and the dir
-// of the latest build a sync left part way.
+// (LOCK); the first of a process serves the newest local build whose files
+// hold their manifest's bytes (each read against its sha256) and that
+// loads, before it asks the bucket anything: none is served before its
+// files check out. A build the data dir holds complete is served again
+// from its dir (latest.json moved back to it) once its files check out,
+// not fetched. The prune keeps the build served, the one served before it
+// and the dir of the latest build a sync left part way.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -380,11 +381,12 @@ impl Portal {
         .map_err(|e| format!("lock {}: {e}", at.display()))
     }
 
-    /// Serves the newest complete build dir that is of BUILD_VERSION, not
-    /// refused, holds all its files and loads, if any; then reads every file
-    /// of it against its sha256, which also brings it into the page cache.
-    /// A dir that can't be served is left to the prune, and one served whose
-    /// files are damaged is fetched again (sync).
+    /// Serves the newest complete build dir that opens (open: of
+    /// BUILD_VERSION, not refused, every file of it there and holding the
+    /// bytes of its manifest's sha256, and every dataset loading), if any,
+    /// trying each from the newest down: none is served before its files
+    /// check out. A dir that can't be served, a damaged one among them, is
+    /// left to the prune, and its build fetched again (sync).
     async fn start(&self) {
         let dirs = match self.list() {
             Ok(dirs) => dirs,
@@ -392,7 +394,6 @@ impl Portal {
         };
         for (dir, _) in dirs.iter().rev().filter(|(_, complete)| *complete) {
             let name = dir.name();
-            self.running(format!("loading build {name}"));
             match self.open(&name).await {
                 Ok(served) => {
                     self.serve(served);
@@ -405,30 +406,12 @@ impl Portal {
                 }
             }
         }
-        let Some(served) = self.served() else { return };
-        if let Err(why) = self.check(&served.dir, &served.plan).await {
-            let dir = served.dir.clone();
-            eprintln!("portal start: build {dir} is damaged: {why}");
-            self.set_unusable(&dir);
-            self.set_status(|s| s.damaged = Some(format!("{dir}: {why}")));
-        }
     }
 
-    /// Whether every file of the build dir `name`, of `plan`, holds the
-    /// bytes of its manifest's sha256 (verify); else the first that
-    /// doesn't.
-    async fn check(&self, name: &str, plan: &Plan) -> Result<(), String> {
-        self.running(format!("checking the files of build {name}"));
-        let (root, plan) = (self.builds().join(name), plan.clone());
-        tokio::task::spawn_blocking(move || {
-            let (cfg, _) = parse_manifest(&std::fs::read(root.join(MANIFEST)).map_err(|e| e.to_string())?)?;
-            verify(&root, &cfg, &plan)
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("check task: {e}")))
-    }
-
-    /// The complete build dir `name`, loaded; or why it can't be served.
+    /// The complete build dir `name`, checked and loaded; or why it can't
+    /// be served. Its files are each read against their manifest's sha256
+    /// (verify), which also brings them into the page cache, before any
+    /// dataset of it loads.
     async fn open(&self, name: &str) -> Result<Served, String> {
         let root = self.builds().join(name);
         let bytes = std::fs::read(root.join(MANIFEST)).map_err(|e| format!("{MANIFEST}: {e}"))?;
@@ -441,10 +424,12 @@ impl Portal {
             return Err(format!("it was refused: {}", refused.reason));
         }
         let plan = catalog::plan(&cfg, &manifest)?;
+        self.running(format!("checking the files of build {name}"));
         let (at, checked) = (root.clone(), plan.clone());
-        tokio::task::spawn_blocking(move || in_place(&at, &cfg, &checked))
+        tokio::task::spawn_blocking(move || in_place(&at, &cfg, &checked).and_then(|()| verify(&at, &cfg, &checked)))
             .await
             .map_err(|e| format!("check task: {e}"))??;
+        self.running(format!("loading build {name}"));
         self.load(name, plan, sha256).await
     }
 
@@ -473,7 +458,6 @@ impl Portal {
         let before = self.served.swap(Some(Arc::new(served)));
         self.set_status(|s| {
             s.served = Some(dir);
-            s.damaged = None;
             s.not_served.clear();
         });
         before
@@ -572,8 +556,7 @@ impl Portal {
     /// rerun of the nightly) is another build. A build of another build
     /// version, or that can't be served, is refused; one refused is not
     /// fetched again while it is the latest. With the latest served it does
-    /// nothing, unless the build served is damaged; with it complete in a
-    /// dir, it serves it from there.
+    /// nothing; with it complete in a dir, it serves it from there.
     async fn sync(&self) -> Result<String, String> {
         self.running("reading the latest build".to_string());
         let mut latest = self.latest().await?;
@@ -601,7 +584,7 @@ impl Portal {
             return Ok(format!("build {date} was refused: {}", refused.reason));
         }
         let served = self.served();
-        if let Some(served) = served.as_ref().filter(|s| s.plan.date == date && s.manifest_sha256 == sha256 && !self.unusable(&s.dir)) {
+        if let Some(served) = served.as_ref().filter(|s| s.plan.date == date && s.manifest_sha256 == sha256) {
             return Ok(format!("build {date} is served ({})", served.dir));
         }
 
@@ -622,20 +605,15 @@ impl Portal {
 
         // A complete dir of this build, of its manifest, which this process
         // didn't find unusable (the build served before, latest.json moved
-        // back to it): served again once it loads and its files hold their
-        // manifest's bytes, nothing fetched.
+        // back to it): served again once its files hold their manifest's
+        // bytes and it loads (open), nothing fetched.
         let dirs = self.list()?;
         for (d, _) in dirs.iter().rev().filter(|(d, complete)| *complete && d.date == date) {
             let name = d.name();
             if self.unusable(&name) || !std::fs::read(self.builds().join(&name).join(MANIFEST)).is_ok_and(|m| m == bytes) {
                 continue;
             }
-            self.running(format!("loading build {name}"));
-            let opened = match self.open(&name).await {
-                Ok(served) => self.check(&name, &served.plan).await.map(|()| served),
-                Err(why) => Err(why),
-            };
-            match opened {
+            match self.open(&name).await {
                 Ok(served) => {
                     if let Some(before) = self.serve(served) {
                         eprintln!("portal sync: build {name} is served again in place of {}", before.dir);

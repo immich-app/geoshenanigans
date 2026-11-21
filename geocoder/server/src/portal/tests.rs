@@ -614,6 +614,55 @@ async fn a_start_on_a_build_it_cant_serve_says_why_in_its_503() {
     assert!(fetch(&format!("{url}/datasets")).await.body.contains(&skipped));
 }
 
+// At start a build's files are checked before it is served: one whose
+// files don't hold their manifest's bytes is never loaded, so never served,
+// and the next older one is, once its own check out; with none that does,
+// none is served, and the 503 says why.
+#[tokio::test]
+async fn a_start_serves_no_build_before_its_files_check_out() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    portal(data.path(), config(&bucket, load.clone())).round(true).await.unwrap();
+    let builds = data.path().join(BUILDS);
+    copy_build(&builds.join(format!("{DATE}-1")), &builds.join(format!("{NEXT}-1")), NEXT, BUILD_VERSION);
+    let damaged = "planet/full/admin_cells.bin";
+    // A byte of the file flipped, in a copy of its own (the build's dirs
+    // share it by hard links).
+    let damage = |dir: &str| {
+        let at = builds.join(dir).join(damaged);
+        let mut bytes = std::fs::read(&at).unwrap();
+        bytes[0] ^= 1;
+        std::fs::remove_file(&at).unwrap();
+        std::fs::write(&at, &bytes).unwrap();
+    };
+    damage(&format!("{NEXT}-1"));
+    // No round gets past the start: the latest build stays unknown.
+    std::fs::write(data.path().join(sync::LATEST_OVERRIDE), "tomorrow\n").unwrap();
+    let loaded = Arc::new(Mutex::new(BTreeSet::new()));
+    let recording: Loader = {
+        let (loaded, load) = (loaded.clone(), load.clone());
+        Arc::new(move |set: &Path| {
+            loaded.lock().unwrap().insert(set.parent().unwrap().parent().unwrap().file_name().unwrap().to_str().unwrap().to_string());
+            load(set)
+        })
+    };
+
+    let p = portal(data.path(), config(&bucket, recording.clone()));
+    assert!(p.round(true).await.is_err());
+
+    assert_eq!(p.served().unwrap().dir, format!("{DATE}-1"));
+    assert_eq!(*loaded.lock().unwrap(), BTreeSet::from([format!("{DATE}-1")]));
+    assert_eq!(build_dirs(data.path()), [format!("{DATE}-1")]);
+
+    damage(&format!("{DATE}-1"));
+    let none = portal(data.path(), config(&bucket, recording));
+    assert!(none.round(true).await.is_err());
+    assert!(none.served().is_none());
+    let skipped = format!("build {DATE}-1 here can't be served: {damaged} holds bytes of sha256 ");
+    assert!(none.unavailable().contains(&skipped), "{}", none.unavailable());
+}
+
 // A sync killed part way leaves its dir incomplete, its ledger naming the
 // objects in place; the next, of a server started afresh, resumes in that
 // dir and fetches only the others.
@@ -698,9 +747,9 @@ async fn a_round_that_cant_learn_the_latest_build_keeps_the_sync_left_part_way()
     assert_eq!(bucket.requests().len() - before, order.len() - 3);
 }
 
-// A build served whose files no longer hold their manifest's bytes is
-// fetched again, into a new dir, and served from there; the damaged one
-// goes.
+// A build the volume holds whose files no longer hold their manifest's
+// bytes is not served at start: it is fetched again, into a new dir, and
+// served from there; the damaged one goes.
 #[tokio::test]
 async fn a_damaged_build_is_fetched_again_into_a_new_dir() {
     let bucket = test_bucket::serve(test_bucket::template_components()).await;
@@ -723,7 +772,6 @@ async fn a_damaged_build_is_fetched_again_into_a_new_dir() {
     assert_eq!(build_dirs(data.path()), [format!("{DATE}-2")]);
     assert_eq!(bucket.requests().len() - before, fetched(&bucket).await.len());
     assert!(std::fs::read(data.path().join(BUILDS).join(format!("{DATE}-2")).join(damaged)).unwrap() == bucket.file(damaged));
-    assert_eq!(p.status().damaged, None);
 }
 
 // The prune keeps the build served and the complete one before it, never a

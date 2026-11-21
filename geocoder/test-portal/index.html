@@ -926,7 +926,7 @@ function storedResult(r) {
 }
 
 // The status line from the portal's /health: the build served (or why
-// none), how the sync goes, and the builds it refused or found damaged.
+// none), how the sync goes, and the builds it refused.
 function statusHtml(health) {
   if (!health || typeof health !== 'object' || !health.sync) return '';
   const s = health.sync;
@@ -946,7 +946,6 @@ function statusHtml(health) {
   }
   if (s.latest && (!health.build || s.latest.date !== health.build.date)) parts.push(`latest ${esc(s.latest.date)}`);
   for (const r of s.refused || []) parts.push(`<span class="warn">refused ${esc(r.date)} (v${esc(r.version)}): ${esc(r.reason)}</span>`);
-  if (s.damaged) parts.push(`<span class="warn">damaged: ${esc(s.damaged)}</span>`);
   return parts.join(' · ');
 }
 

@@ -141,11 +141,9 @@ pub struct Status {
     /// The builds refused (sync::Refusal), not fetched again while latest.json
     /// names them.
     pub refused: Vec<sync::Refusal>,
-    /// Why the files of the build served are not those of its manifest: the
-    /// sync fetches it again into a new dir.
-    pub damaged: Option<String>,
     /// The builds the volume held at start that can't be served, each with
-    /// why ("<dir> here can't be served: <why>"); none once one is served.
+    /// why ("<dir> here can't be served: <why>"), one whose files don't hold
+    /// their manifest's bytes among them; none once one is served.
     pub not_served: Vec<String>,
 }
 

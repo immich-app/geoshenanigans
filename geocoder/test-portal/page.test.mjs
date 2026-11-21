@@ -286,7 +286,7 @@ test('every string and id of the manifest, and a link\'s dataset, is escaped whe
     assert.ok(!out.includes('<s>'));
   }
   assert.ok(card.includes('<div class="result-error">&lt;script&gt;alert(5)&lt;/script&gt;: unknown dataset'), card);
-  assertEscaped(statusHtml({ status: 'unavailable', reason: '<img src=r>', sync: { running: '<b>r</b>', refused: [{ date: '<i>', version: 1, reason: '<script>', at: '' }], damaged: '<u>d</u>', last_result: null } }));
+  assertEscaped(statusHtml({ status: 'unavailable', reason: '<img src=r>', sync: { running: '<b>r</b>', refused: [{ date: '<i>', version: 1, reason: '<script>', at: '' }], last_result: null } }));
 });
 
 test('an answer keeps the dataset and build that answered and the time it took', () => {
@@ -386,7 +386,7 @@ test('the status line tells the build served and how the sync goes', () => {
   const sync = {
     running: null, progress: null, last_started: '2026-11-20T07:10:00Z', last_finished: '2026-11-20T07:12:03Z', next_round: '2026-11-20T08:12:03Z',
     last_result: 'ok: serving 2026-11-20-1', latest: { date: '2026-11-21', build_version: 25 }, served: '2026-11-20-1',
-    refused: [{ date: '2026-11-21', version: 25, reason: 'build version 25, not 24', at: '2026-11-21T07:00:00Z' }], damaged: null,
+    refused: [{ date: '2026-11-21', version: 25, reason: 'build version 25, not 24', at: '2026-11-21T07:00:00Z' }],
   };
   const ok = statusHtml({ status: 'ok', build: { date: '2026-11-20', version: 24, dir: '2026-11-20-1' }, datasets: 28, sync });
   for (const text of ['build 2026-11-20 (v24) · 28 datasets', 'last sync 2026-11-20 07:12:03 UTC: ok: serving 2026-11-20-1', 'next 2026-11-20 08:12:03 UTC',
