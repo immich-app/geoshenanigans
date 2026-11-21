@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Tests for what runs beside what in the nightly's first steps: the day's diff and today's PBF in the
-download, and the Rust toolchain in the background.
+"""Tests for the order of the nightly's steps and what runs beside what: the day's diff and today's PBF in the
+download, the Rust toolchain in the background, and the place search beside compression and the patches from
+build-index's exit.
 Run: python3 -m unittest discover -s geocoder/builder/tools"""
 import gzip
 import os
@@ -12,6 +13,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NIGHTLY = os.path.join(HERE, "..", "..", "..", ".github", "workflows", "geocoder-build.yml")
+WATCHDOG = os.path.join(HERE, "..", "..", "..", ".github", "workflows", "geocoder-build-watchdog.yml")
 
 
 def nightly():
@@ -32,6 +34,10 @@ def step(name):
 def step_script(name):
     run = re.search(r"^        run: \|\n((?:(?: {10}.*)?\n)*)", step(name), re.M)
     return "".join(line[10:] + "\n" for line in run.group(1).splitlines())
+
+
+def index_of(name):
+    return [n for n, _ in steps()].index(name)
 
 
 class DownloadTest(unittest.TestCase):
@@ -118,6 +124,28 @@ class RustToolchainTest(unittest.TestCase):
         with open(calls) as f:
             self.assertEqual(f.read().splitlines(), ["rustup toolchain install stable --profile minimal --no-self-update",
                                                      "rustup default stable"])
+
+
+class PostBuildTest(unittest.TestCase):
+    # The place search starts in the background when build-index exits, and the steps after it start at once.
+    def test_the_place_search_runs_in_the_background_from_build_index_s_exit(self):
+        self.assertEqual(index_of("Build place search indexes"), index_of("Build geocoder index") + 1)
+        self.assertEqual(index_of("Generate patches and verify"), index_of("Build place search indexes") + 1)
+        self.assertEqual(index_of("Compress index files"), index_of("Generate patches and verify") + 1)
+        script = step_script("Build place search indexes")
+        self.assertRegex(script, r"setsid nohup bash -c '\"\$@\"; echo \$\? > \"\$0\"' \"\$WORKDIR/place-search\.status\" \\\n"
+                                 r" +nice -n 5 \"\$GITHUB_WORKSPACE/geocoder/builder/tools/place_search_indexes\.sh\" "
+                                 r"\"\$WORKDIR/output\" \\\n +\"\$GITHUB_WORKSPACE/geocoder/search/target/release/place-search\" "
+                                 r"\"\$RUNNER_TEMP/search\.status\" 1800 \\\n")
+        self.assertNotIn("build_search_indexes.py", script)
+
+    # The watchdog tells a retry from a failure a rerun repeats by these steps' names.
+    def test_every_step_the_watchdog_names_is_a_step_of_the_nightly(self):
+        with open(WATCHDOG) as f:
+            named = set(re.findall(r'\.name == "([^"]+)"', f.read()))
+        self.assertEqual(named, {"Build tools", "Run builder tests", "Fail run on patch verify failure",
+                                 "Fail run on place search index failure"})
+        self.assertLessEqual(named, {n for n, _ in steps()})
 
 
 if __name__ == "__main__":

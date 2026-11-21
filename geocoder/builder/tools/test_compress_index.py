@@ -20,6 +20,7 @@ sys.path.insert(0, HERE)
 import compress_index as sut  # noqa: E402
 
 TEMPLATE = os.path.join(HERE, "..", "configurations.template.json")
+NIGHTLY = os.path.join(HERE, "..", "..", "..", ".github", "workflows", "geocoder-build.yml")
 
 # zstd for a run whose threads are counted: each compression appends "<start> <end> <-T> <output>" to $ZSTD_CALLS;
 # the work is the zstd's it stands in for ($REAL_ZSTD), stdin and all, a decompression's too.
@@ -565,6 +566,22 @@ class SchedulerTest(unittest.TestCase):
 
         self.assertIsInstance(errors[0], RuntimeError)
         self.assertEqual(errors[1:], [None, None])
+
+
+# The nightly's compress commands: both start when build-index exits, beside the place search.
+def nightly_compress_calls():
+    with open(NIGHTLY) as f:
+        return re.findall(r'^ *(.*)python3 "\$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index\.py" "\$WORKDIR/output" \\\n'
+                          r'((?: +.*\\\n)* +.*)', f.read(), re.M)
+
+
+class NightlyCompressTest(unittest.TestCase):
+    def test_both_compress_calls_take_the_place_search_files_late_at_a_lower_priority(self):
+        calls = nightly_compress_calls()
+        self.assertEqual(len(calls), 2)
+        for prefix, args in calls:
+            self.assertIn('--late-search "$WORKDIR/place-search.status"', args)
+            self.assertEqual(prefix.split(), ["nice", "-n", "10"])
 
 
 if __name__ == "__main__":

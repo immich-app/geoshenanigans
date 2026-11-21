@@ -837,28 +837,30 @@ jobs:
 
       # ── Place search indexes ──────────────────────────────────────
       # The selections configurations.json ships them for (search_index), in
-      # every region, from the .bin files just built; compression publishes
-      # them with the rest. A failed one is left out (its clients build theirs
-      # on the device) and fails the run once the data is up.
+      # every region, from the .bin files just built, in the background from
+      # here (place_search_indexes.sh, detached so it outlives this step):
+      # compression and the patches start beside them at once, and
+      # compression takes their files once place-search.status is written
+      # (compress_index.py --late-search). nice 5: below the patch jobs (the
+      # night's longest chain), above compression (nice 10). Past 30 minutes
+      # the build is stopped. A failed one is left out (its clients build
+      # theirs on the device) and fails the run once the data is up: Compress
+      # index files reads the status.
       - name: Build place search indexes
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
-          WAIT_START=$(date +%s)
-          until [ -s "$RUNNER_TEMP/search.status" ] || [ $(( $(date +%s) - WAIT_START )) -gt 1800 ]; do
-            sleep 5
-          done
-          START=$(date +%s)
-          if [ "$(cat "$RUNNER_TEMP/search.status" 2> /dev/null)" != 0 ]; then
-            tail -40 "$RUNNER_TEMP/search.log"
-            echo "::error::Building place-search failed; no place search indexes"
-            echo "SEARCH_INDEX_FAILED=1" >> "$GITHUB_ENV"
-          elif ! python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/build_search_indexes.py" "$WORKDIR/output" \
-              "$GITHUB_WORKSPACE/geocoder/search/target/release/place-search"; then
-            echo "SEARCH_INDEX_FAILED=1" >> "$GITHUB_ENV"
-          fi
-          echo "Place search indexes done in $(($(date +%s) - START))s"
+          # The inner script expands its own arguments ($0 is the status file).
+          # shellcheck disable=SC2016
+          setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/place-search.status" \
+            nice -n 5 "$GITHUB_WORKSPACE/geocoder/builder/tools/place_search_indexes.sh" "$WORKDIR/output" \
+            "$GITHUB_WORKSPACE/geocoder/search/target/release/place-search" "$RUNNER_TEMP/search.status" 1800 \
+            > "$WORKDIR/place-search.log" 2>&1 < /dev/null &
+          # Its session, for Compress index files to end should compression
+          # stop waiting for it.
+          echo "$!" > "$WORKDIR/place-search.pid"
+          echo "Place search indexes building in the background from $(date -u +%H:%M:%S)"
 
       # ── Generate patches + verify ─────────────────────────────────
       - name: Generate patches and verify
@@ -867,6 +869,7 @@ jobs:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           OLD_DATE: ${{ steps.setup.outputs.yesterday }}
           NEW_DATE: ${{ steps.setup.outputs.today }}
+          RUNNER_TEMP: ${{ runner.temp }}
         run: |
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
 
@@ -890,15 +893,21 @@ jobs:
           df -h "$WORKDIR"
 
           # Compress the new index alongside the diffs, whose long tail
-          # (planet/full) leaves most cores idle. It keeps the .bin files the
-          # diffs and verifies read; the compress step removes them. Each
+          # (planet/full) leaves most cores idle, and the place search, whose
+          # files it takes once its status is written. It keeps the .bin files
+          # the diffs and verifies read; the compress step removes them. Each
           # .zst and transport unit streams to this date's (cleared) Tigris
           # prefix as soon as it exists: the upload is network-bound, so it
           # hides behind the compression. Finalize uploads whatever is still
           # missing.
           $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
+          # geocoder-transport, which encodes the units, comes from the place
+          # search build (done long before, on a normal night).
+          WAIT_START=$(date +%s)
+          until [ -s "$RUNNER_TEMP/search.status" ] || [ $(( $(date +%s) - WAIT_START )) -gt 1800 ]; do sleep 5; done
           nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
             --transport-bin "$GITHUB_WORKSPACE/geocoder/search/target/release/geocoder-transport" \
+            --late-search "$WORKDIR/place-search.status" \
             --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE" \
             --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" \
             > "$WORKDIR/compress.log" 2>&1 < /dev/null &
@@ -924,6 +933,16 @@ jobs:
           RESERVE_KIB=$(find "$WORKDIR/output" -type f \
             \( -name '*.bin' -o -name strings_layout.json -o -name poi_meta.json -o -path '*/search/*' \) \
             ! -name '*.zst' -printf '%s\n' | awk '{s += $1} END {printf "%d", (s + 1023) / 1024}')
+          # Until its status is written the place search runs beside the patch
+          # jobs: its indexes, their scratch and (through the compressor) their
+          # .zst may still land on the volume, ~16 GB of writes on a planet
+          # night scratch included, and its builds hold a few GiB of memory
+          # (72 GiB of diff estimates then admit 66).
+          MEM_RESERVE_KIB=0
+          if ! [ -s "$WORKDIR/place-search.status" ]; then
+            RESERVE_KIB=$((RESERVE_KIB + 16 * 1024 * 1024))
+            MEM_RESERVE_KIB=$((6 * 1024 * 1024))
+          fi
 
           # Per variant: diff, apply to a scratch copy, verify the whole client
           # file set (JSON included, no extra files). Jobs are admitted by
@@ -932,6 +951,7 @@ jobs:
           # A script abort leaves variants without results; the collector
           # counts those as CRASH, so patches are dropped but data still uploads.
           GEOCODER_PATCH_SCRATCH_RESERVE_KIB="$RESERVE_KIB" \
+          GEOCODER_PATCH_MEM_RESERVE_KIB="$MEM_RESERVE_KIB" \
             "$GITHUB_WORKSPACE/geocoder/builder/tools/generate_patches.sh" \
             "$WORKDIR/old-output" "$WORKDIR/output" "$RESULTS_DIR" "$WORKDIR/diff-logs" \
             || echo "::error::generate_patches.sh exited $?"
@@ -1014,18 +1034,24 @@ jobs:
         env:
           WORKDIR: ${{ steps.setup.outputs.workdir }}
           NEW_DATE: ${{ steps.setup.outputs.today }}
+          RUNNER_TEMP: ${{ runner.temp }}
         run: |
           # Patch generation compresses alongside its diffs; a fresh build
           # (or a failed background run) compresses here, streaming the
-          # upload the same way.
+          # upload the same way: on a fresh night from build-index's exit
+          # too, beside the place search (this step follows it at once).
           if [ -f "$WORKDIR/compress.done" ]; then
             echo "Compressed during patch generation"
           else
             COMPRESS_START=$(date +%s)
             s5cmd --endpoint-url "$S3_ENDPOINT" --numworkers 32 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
+            # geocoder-transport, which encodes the units, comes from the place
+            # search build.
+            until [ -s "$RUNNER_TEMP/search.status" ] || [ $(( $(date +%s) - COMPRESS_START )) -gt 1800 ]; do sleep 5; done
             COMPRESS_RC=0
-            python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
+            nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
               --transport-bin "$GITHUB_WORKSPACE/geocoder/search/target/release/geocoder-transport" \
+              --late-search "$WORKDIR/place-search.status" \
               --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE" \
               --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" || COMPRESS_RC=$?
             # 3: done, but a transport unit failed and its files went as .zst.
@@ -1036,6 +1062,21 @@ jobs:
               exit "$COMPRESS_RC"
             fi
             echo "Compression done in $(($(date +%s) - COMPRESS_START))s"
+          fi
+          # The place search ran beside compression, which waited for its
+          # status: a failed or stopped build left no index, and fails the run
+          # at its end (Fail run on place search index failure).
+          cat "$WORKDIR/place-search.log" 2> /dev/null || true
+          SEARCH_STATUS=$(cat "$WORKDIR/place-search.status" 2> /dev/null || true)
+          if [ "$SEARCH_STATUS" != 0 ]; then
+            if [ -z "$SEARCH_STATUS" ]; then
+              # Compression stopped waiting for it and left its files out: what
+              # it still runs ends here, and its indexes go.
+              pkill -KILL -s "$(cat "$WORKDIR/place-search.pid" 2> /dev/null)" 2> /dev/null || true
+              rm -rf "$WORKDIR"/output/*/search
+            fi
+            echo "::error::The place search indexes failed (status ${SEARCH_STATUS:-none}): no index of a failed one is published"
+            echo "SEARCH_INDEX_FAILED=1" >> "$GITHUB_ENV"
           fi
           find "$WORKDIR/output" -name "*.bin" -delete
           # The place search index files, but for search_meta.json, which
@@ -1393,7 +1434,7 @@ jobs:
       - name: Fail run on place search index failure
         if: env.SEARCH_INDEX_FAILED == '1'
         run: |
-          echo "::error::Place search indexes failed — see Build place search indexes"
+          echo "::error::Place search indexes failed — see place-search.log in Compress index files"
           exit 1
 
       - name: Fail run on patch verify failure

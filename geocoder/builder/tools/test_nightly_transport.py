@@ -95,10 +95,11 @@ sys.exit(int(os.environ["COMPRESS_STATUS"]))
 """
 
 
-def env_after(name, compress_status):
+def env_after(name, compress_status, search_status="0\n"):
     """What the step `name` puts in GITHUB_ENV (a dict) when compress_index.py exits `compress_status`,
     run as Actions runs it, on a night of no variants, with s5cmd, compress_index.py and
-    generate_patches.sh that do nothing else."""
+    generate_patches.sh that do nothing else, place-search built and the place search job's status
+    `search_status` (None: none written)."""
     with tempfile.TemporaryDirectory() as tmp:
         ws, work, bin_dir = (os.path.join(tmp, d) for d in ("ws", "work", "bin"))
         tools = os.path.join(ws, "geocoder", "builder", "tools")
@@ -108,7 +109,10 @@ def env_after(name, compress_status):
                  os.path.join(tools, "generate_patches.sh"): "#!/bin/sh\nexit 0\n",
                  os.path.join(bin_dir, "s5cmd"): "#!/bin/sh\nexit 0\n",
                  os.path.join(work, "old-output.status"): "0\n",
-                 os.path.join(work, "old-output.log"): ""}
+                 os.path.join(work, "old-output.log"): "",
+                 os.path.join(tmp, "search.status"): "0\n"}
+        if search_status is not None:
+            fakes[os.path.join(work, "place-search.status")] = search_status
         for path, text in fakes.items():
             with open(path, "w") as f:
                 f.write(text)
@@ -122,7 +126,7 @@ def env_after(name, compress_status):
                "GITHUB_ENV": github_env, "GITHUB_STEP_SUMMARY": os.path.join(tmp, "summary"),
                "COMPRESS_STATUS": str(compress_status), "NEW_DATE": "2026-11-17", "OLD_DATE": "2026-11-16",
                "S3_ENDPOINT": "https://s3.invalid", "S3_BUCKET": "bucket", "S3_PREFIX": "geocoder",
-               "TMPDIR": tmp}
+               "TMPDIR": tmp, "RUNNER_TEMP": tmp}
         r = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", script], env=env, capture_output=True,
                            text=True)
         if r.returncode != 0:
@@ -177,6 +181,15 @@ class NightlyTransportTest(unittest.TestCase):
                 self.assertEqual(advances_latest_json(env), not failed, f"{name}, {status}")
                 self.assertEqual(runs(CLEANUP, env), not failed, f"{name}, {status}")
                 self.assertEqual(runs("Fail run on transport unit failure", env), failed, f"{name}, {status}")
+
+    # The place search runs in the background beside compression, which waits for its status: the compress
+    # step, which always follows, fails the run at its end for a failed, stopped or missing one.
+    def test_the_compress_step_fails_the_run_for_a_place_search_that_did_not_succeed(self):
+        for status, failed in (("0\n", False), ("1\n", True), ("124\n", True), (None, True)):
+            env = env_after(COMPRESS_STEP, 0, search_status=status)
+            self.assertEqual(env.get("SEARCH_INDEX_FAILED") == "1", failed, f"{status!r}: {env}")
+            self.assertEqual(runs("Fail run on place search index failure", env), failed, status)
+            self.assertEqual(advances_latest_json(env), True, status)
 
     def test_latest_json_and_the_cleanup_wait_for_a_night_of_no_failed_patch_or_unit(self):
         self.assertIsNotNone(latest_json_guard())

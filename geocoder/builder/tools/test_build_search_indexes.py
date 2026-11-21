@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -32,7 +33,11 @@ for name in {files}:
     open(os.path.join(out, name), "w").close()
 if os.environ.get("FAIL_SET") and os.environ["FAIL_SET"] in set_dir:
     sys.exit(3)
+if os.environ.get("HANG_SET") and os.environ["HANG_SET"] in set_dir:
+    import time
+    time.sleep(600)
 """
+JOB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "place_search_indexes.sh")
 
 
 class BuildSearchIndexesTest(unittest.TestCase):
@@ -110,6 +115,77 @@ class BuildSearchIndexesTest(unittest.TestCase):
         os.remove(os.path.join(self.out, "planet", "poi", "all", "strings_poi.bin"))
 
         self.assertEqual(self.run_main(), 1)
+
+
+class PlaceSearchJobTest(unittest.TestCase):
+    """place_search_indexes.sh, which the nightly runs in the background from build-index's exit: compression
+    waits for its exit status, so it must end, whatever place-search's build or the indexes do."""
+
+    setUp = BuildSearchIndexesTest.setUp
+    write_output = BuildSearchIndexesTest.write_output
+    call = BuildSearchIndexesTest.call
+
+    def run_job(self, build_status, limit=600, env=None, write_status_after=None):
+        status = os.path.join(self.tmp.name, "search.status")
+        if build_status is not None and write_status_after is None:
+            with open(status, "w") as f:
+                f.write(build_status)
+        job = subprocess.Popen(["bash", JOB, self.out, self.binary, status, str(limit)],
+                               env={**os.environ, "TMPDIR": self.tmp.name, **(env or {})},
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if write_status_after is not None:
+            time.sleep(write_status_after)
+            with open(status, "w") as f:
+                f.write(build_status)
+        start = time.time()
+        out, _ = job.communicate(timeout=120)
+        return job.returncode, out, time.time() - start
+
+    def index_dir(self, region, sel):
+        return os.path.join(self.out, sut.substitute(self.cfg["search_index"]["dir"], dict(sel, region=region)))
+
+    def test_builds_the_indexes_once_place_search_is_built(self):
+        self.write_output(["planet", "europe"])
+
+        code, out, _ = self.run_job("0\n", write_status_after=1.5)
+
+        self.assertEqual(code, 0, out)
+        for region in ("planet", "europe"):
+            for sel in self.cfg["search_index"]["shipped"]:
+                self.assertEqual(self.call(region, sel)["cmd"], "build")
+        self.assertRegex(out, r"Place search indexes done in \d+s")
+
+    def test_without_place_search_it_builds_nothing_and_fails(self):
+        self.write_output(["planet"])
+
+        code, out, _ = self.run_job("101\n")
+
+        self.assertEqual(code, 1)
+        self.assertIn("Building place-search failed", out)
+        self.assertFalse(os.path.exists(os.path.join(self.out, "planet", "search")))
+
+    def test_a_failed_index_fails_it_and_leaves_the_others(self):
+        self.write_output(["planet", "europe"])
+
+        code, _, _ = self.run_job("0\n", env={"FAIL_SET": "/europe/"})
+
+        self.assertEqual(code, 1)
+        for sel in self.cfg["search_index"]["shipped"]:
+            self.assertTrue(os.path.isdir(self.index_dir("planet", sel)))
+            self.assertFalse(os.path.exists(self.index_dir("europe", sel)))
+
+    # A build that hangs is stopped at the limit, and the indexes it may have left half-written go with it: their
+    # clients build theirs on the device.
+    def test_a_build_past_the_limit_is_stopped_and_leaves_no_index(self):
+        self.write_output(["planet", "europe"])
+
+        code, out, took = self.run_job("0\n", limit=2, env={"HANG_SET": "/europe/"})
+
+        self.assertEqual(code, 124, out)
+        self.assertLess(took, 60)
+        self.assertIn("were stopped", out)
+        for region in ("planet", "europe"):
+            self.assertFalse(os.path.exists(os.path.join(self.out, region, "search")), region)
 
 
 def load_template():

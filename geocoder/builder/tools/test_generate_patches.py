@@ -474,6 +474,13 @@ def nightly_patch_step():
     return reserve.group(1), call.group(1).replace("\\\n", " ").split()
 
 
+def nightly_place_search_reserves():
+    """The patch step's lines that add what the place search beside it holds to the reserves, as bash."""
+    text = read(os.path.join(WORKFLOWS, "geocoder-build.yml"))
+    block = re.search(r"^( *)MEM_RESERVE_KIB=0\n(?:\1.*\n)*?\1fi\n", text, re.M)
+    return "".join(line.strip() + "\n" for line in block.group(0).splitlines()) if block else None
+
+
 class NightlyReserveTest(unittest.TestCase):
     # The compressor runs beside the patch jobs and writes a .zst beside each
     # file it compresses: at most those files' bytes, which the patch jobs
@@ -498,7 +505,24 @@ class NightlyReserveTest(unittest.TestCase):
 
         self.assertEqual(compressed, 300 * 1024 + 700 + 900 + 5000 + 40 * 1024 + 1 + 3000)
         self.assertEqual(printed, "%d\n" % -(-compressed // 1024))
-        self.assertEqual(assignments, ['GEOCODER_PATCH_SCRATCH_RESERVE_KIB="$RESERVE_KIB"'])
+        self.assertEqual(assignments, ['GEOCODER_PATCH_SCRATCH_RESERVE_KIB="$RESERVE_KIB"',
+                                       'GEOCODER_PATCH_MEM_RESERVE_KIB="$MEM_RESERVE_KIB"'])
+
+    # The patch step starts when build-index exits, beside the place search: until its status is written, the
+    # indexes, their scratch and their .zst may still land on the volume (~16 GB of writes on a planet night,
+    # scratch included), and its builds hold a few GiB of memory.
+    def test_while_the_place_search_runs_the_reserves_hold_what_it_may_write_and_use(self):
+        script = nightly_place_search_reserves()
+        self.assertIsNotNone(script)
+        for status, scratch, memory in (("", 16 * GIB, 6 * GIB), ("0\n", 0, 0), ("1\n", 0, 0)):
+            with tempfile.TemporaryDirectory() as workdir:
+                if status:
+                    with open(os.path.join(workdir, "place-search.status"), "w") as f:
+                        f.write(status)
+                printed = subprocess.run(["bash", "-c", 'RESERVE_KIB=7\n' + script + 'echo "$RESERVE_KIB $MEM_RESERVE_KIB"'],
+                                         env=dict(os.environ, WORKDIR=workdir), check=True, capture_output=True,
+                                         text=True).stdout
+            self.assertEqual(printed, "%d %d\n" % (7 + scratch, memory), status)
 
 
 if __name__ == "__main__":
