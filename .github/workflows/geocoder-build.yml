@@ -171,9 +171,13 @@ jobs:
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           echo "$GITHUB_WORKSPACE/geocoder/builder/build" >> "$GITHUB_PATH"
+          # The unit tests' scratch (mkdtemp under TMPDIR) goes on the work
+          # volume, not the container's /tmp: this starts before Setup sets
+          # TMPDIR.
+          mkdir -p "$RUNNER_TEMP/tools-tmp"
           # The inner script expands its own arguments ($0 is the status file).
           # shellcheck disable=SC2016
-          setsid nohup bash -c '"$@"; echo $? > "$0"' "$RUNNER_TEMP/tools.status" \
+          TMPDIR="$RUNNER_TEMP/tools-tmp" setsid nohup bash -c '"$@"; echo $? > "$0"' "$RUNNER_TEMP/tools.status" \
             geocoder/builder/tools/ci_build_tools.sh geocoder/builder/build .tools-cache "$GITHUB_WORKSPACE/.s2-prefix" \
             > "$RUNNER_TEMP/tools.log" 2>&1 < /dev/null &
 
@@ -538,7 +542,7 @@ jobs:
             tail -20 "$RUNNER_TEMP/tools.log"
             echo "::error::The tool build or its unit tests failed"; exit 1
           fi
-          grep -E "Tools from the cache|afresh|tests passed" "$RUNNER_TEMP/tools.log"
+          grep -E "^\[tools |afresh|tests passed" "$RUNNER_TEMP/tools.log"
 
       # ── Apply replication diffs ───────────────────────────────────
       # Skipped when PBF source is already today's data.

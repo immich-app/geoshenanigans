@@ -1,12 +1,79 @@
 #!/usr/bin/env python3
-"""Tests for ci_build_tools.sh: its tools cache, and the packages the nightly builds the tools with.
+"""Tests for ci_build_tools.sh: its tools cache, its sharded unit tests, and the packages the nightly builds the
+tools with.
 Run: python3 -m unittest discover -s geocoder/builder/tools"""
+import hashlib
 import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 WORKFLOWS = os.path.join(HERE, "..", "..", "..", ".github", "workflows")
+
+# geocoder-tests as the script runs it: a registry of $FAKE_TESTS tests (t0, t1, ...), --count printing
+# $FAKE_COUNT (default: its size), GEOCODER_TEST_SHARD=i/n running those whose index is i mod n, as
+# tests/test_main.cpp does, but every test when the shard is $FAKE_IGNORES_SHARD. The tests named in $FAKE_FAILS
+# fail. Each run appends its shard to $FAKE_SHARD_LOG.
+FAKE_TESTS = r'''#!{python}
+import os, sys
+n = int(os.environ["FAKE_TESTS"])
+if sys.argv[1:] == ["--count"]:
+    print(os.environ.get("FAKE_COUNT", n))
+    sys.exit(0)
+shard = os.environ.get("GEOCODER_TEST_SHARD", "0/1")
+with open(os.environ["FAKE_SHARD_LOG"], "a") as f:
+    f.write(shard + "\n")
+i, count = map(int, shard.split("/"))
+ran = [t for t in range(n) if t % count == i or shard == os.environ.get("FAKE_IGNORES_SHARD")]
+fails = [t for t in ran if f"t{{t}}" in os.environ.get("FAKE_FAILS", "").split()]
+for t in fails:
+    print(f"    FAIL test_x.cpp:1  CHECK(t{{t}})")
+    print(f"FAILED  t{{t}}")
+print(f"\n{{len(ran) - len(fails)}}/{{len(ran)}} tests passed  ({{len(ran)}} checks, {{len(fails)}} failures)")
+sys.exit(1 if fails else 0)
+'''
+
+
+class ShardedTestsRun:
+    """One run of ci_build_tools.sh on cached tools whose geocoder-tests is the fake above. A compile (the
+    cached tools failing their tests) runs a cmake that only records it ran and fails."""
+
+    def __init__(self, test, tests, **env):
+        root = tempfile.mkdtemp()
+        test.addCleanup(shutil.rmtree, root)
+        cache, bin_dir = os.path.join(root, "cache"), os.path.join(root, "bin")
+        os.makedirs(os.path.join(cache, "bin"))
+        os.makedirs(bin_dir)
+        for tool in cached_tools():
+            with open(os.path.join(cache, "bin", tool), "w") as f:
+                f.write(FAKE_TESTS.format(python=sys.executable) if tool == "geocoder-tests" else "#!/bin/sh\n")
+            os.chmod(os.path.join(cache, "bin", tool), 0o755)
+        with open(os.path.join(cache, "SHA256SUMS"), "w") as f:
+            for tool in sorted(cached_tools()):
+                with open(os.path.join(cache, "bin", tool), "rb") as b:
+                    f.write(f"{hashlib.sha256(b.read()).hexdigest()}  bin/{tool}\n")
+        self.compiles = os.path.join(root, "compiles")
+        with open(os.path.join(bin_dir, "cmake"), "w") as f:
+            f.write(f"#!/bin/sh\necho cmake >> {self.compiles}\nexit 1\n")
+        os.chmod(os.path.join(bin_dir, "cmake"), 0o755)
+        self.shard_log = os.path.join(root, "shards")
+        run_env = dict(os.environ, PATH=f"{bin_dir}:{os.environ['PATH']}", TMPDIR=root, FAKE_TESTS=str(tests),
+                       FAKE_SHARD_LOG=self.shard_log)
+        run_env.update({k: str(v) for k, v in env.items()})
+        done = subprocess.run(["bash", os.path.join(HERE, "ci_build_tools.sh"), os.path.join(root, "build"), cache,
+                               os.path.join(root, "s2")], env=run_env, capture_output=True, text=True, timeout=120)
+        self.status, self.out = done.returncode, done.stdout + done.stderr
+
+    def shards(self):
+        with open(self.shard_log) as f:
+            return f.read().split()
+
+    def compiled(self):
+        return os.path.exists(self.compiles)
 
 
 def cached_tools():
@@ -111,6 +178,69 @@ class ToolsCacheTest(unittest.TestCase):
             'target_compile_definitions(geocoder-tests PRIVATE C="$<TARGET_FILE:after-the-block>")',
         ])
         self.assertEqual(tools_the_unit_tests_run(cmake), {"geocoder-diff", "geocoder-patch", "after-the-block"})
+
+
+class ShardedUnitTestsTest(unittest.TestCase):
+    SHARDS = [f"{i}/16" for i in range(16)]
+
+    def test_the_unit_tests_run_as_sixteen_shards_whose_total_is_the_registrys(self):
+        run = ShardedTestsRun(self, 100)
+
+        self.assertEqual(run.status, 0, run.out)
+        self.assertEqual(sorted(run.shards()), sorted(self.SHARDS))
+        self.assertEqual(run.out.strip().splitlines()[-1], "100/100 tests passed")
+        self.assertFalse(run.compiled())
+
+    def test_a_failing_test_fails_its_shard_by_name_and_the_cached_tools_get_one_fresh_build(self):
+        run = ShardedTestsRun(self, 100, FAKE_FAILS="t37")
+
+        self.assertNotEqual(run.status, 0)
+        self.assertIn("FAILED  t37", run.out)
+        self.assertIn("Unit tests failed on the cached tools; building them afresh", run.out)
+        self.assertTrue(run.compiled())
+
+    # A shard index past the count, or a test_main that ignored the shard, would pass on fewer tests than the
+    # registry holds: the run counts what each shard ran.
+    def test_a_shard_that_runs_no_test_fails_the_run(self):
+        run = ShardedTestsRun(self, 10)
+
+        self.assertNotEqual(run.status, 0)
+        self.assertRegex(run.out, r"shard 1[0-5]/16 ran no test")
+        self.assertNotIn("10/10 tests passed", run.out)
+
+    def test_shards_that_run_more_or_fewer_tests_than_the_registry_holds_fail_the_run(self):
+        for env, ran in ((dict(FAKE_IGNORES_SHARD="3/16"), 193), (dict(FAKE_COUNT=101), 100)):
+            run = ShardedTestsRun(self, 100, **env)
+
+            self.assertNotEqual(run.status, 0, env)
+            self.assertIn(f"the shards ran {ran} tests; the registry holds", run.out, env)
+            self.assertNotRegex(run.out, r"(?m)^\d+/\d+ tests passed$", env)
+
+    def test_each_phase_is_logged_with_its_time(self):
+        run = ShardedTestsRun(self, 100)
+
+        phases = re.findall(r"(?m)^\[tools \d\d:\d\d:\d\d\] (.*)$", run.out)
+        self.assertEqual(len(phases), 3, run.out)
+        self.assertEqual(phases[:2], ["Tools from the cache", "unit tests: 100 in 16 shards"])
+        self.assertRegex(phases[2], r"^unit tests done in \d+s$")
+
+    # The nightly greps the tools' log for the lines above: the phases, the total and a failure's lines.
+    def test_the_nightly_shows_the_phases_the_total_and_a_failures_lines(self):
+        with open(os.path.join(WORKFLOWS, "geocoder-build.yml")) as f:
+            text = f.read()
+        shown = re.search(r'grep -E "([^"]*)" "\$RUNNER_TEMP/tools\.log"$', text, re.M)
+        self.assertIsNotNone(shown)
+        for line in ("[tools 06:30:53] Tools from the cache", "[tools 06:30:53] unit tests: 1116 in 16 shards",
+                     "Unit tests failed on the cached tools; building them afresh", "1116/1116 tests passed"):
+            self.assertRegex(line, shown.group(1))
+
+    # The tests' scratch (mkdtemp under TMPDIR) goes on the runner's work volume, not the container's /tmp, which
+    # the tools job would otherwise use: it starts before Setup sets TMPDIR.
+    def test_the_nightly_gives_the_tools_job_its_own_scratch_dir(self):
+        with open(os.path.join(WORKFLOWS, "geocoder-build.yml")) as f:
+            step = re.search(r"^      - name: Build tools\n((?: {8}.*\n|\n)*)", f.read(), re.M).group(1)
+        self.assertIn('TMPDIR="$RUNNER_TEMP/tools-tmp"', step)
+        self.assertIn('mkdir -p "$RUNNER_TEMP/tools-tmp"', step)
 
 
 class NightlyPackagesTest(unittest.TestCase):
