@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -499,6 +500,86 @@ sut.run_logged = run_logged
         for rel in self.SEARCH:
             self.assertFalse(os.path.exists(self.path(rel) + ".zst"), rel)
         self.assertIn("no place search status", result["printed"])
+
+
+# The zstd command line before the shared thread budget: level 18 and a thread per 256 MiB, at least one and at most
+# 16, whatever the CPUs.
+PREVIOUS_LEVEL = "-18"
+
+
+def previous_threads(size):
+    return max(1, min(16, size // (256 << 20)))
+
+
+def several_jobs(seed, size=48 << 20):
+    """`size` bytes that zstd -18 cuts into several 32 MiB jobs, and compresses fast: a 256 KiB block of random
+    nibbles repeated, a few bytes of each copy changed."""
+    rng = random.Random(seed)
+    block = rng.randbytes(256 << 10).translate(bytes(b & 15 for b in range(256)))
+    out = bytearray()
+    while len(out) < size:
+        copy = bytearray(block)
+        for _ in range(64):
+            copy[rng.randrange(len(copy))] = rng.randrange(256)
+        out += copy
+    return bytes(out[:size])
+
+
+class PreviousScheduleTest(unittest.TestCase):
+    """The schedule changes no published byte: a file and a unit big enough for several zstd jobs come out as the
+    previous command line compressed them, with the same zstd, though they now get other thread counts."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.out = os.path.join(self.tmp.name, "output")
+        self.dir = os.path.join(self.out, "planet", "full")
+        os.makedirs(self.dir)
+        with open(os.path.join(self.out, "configurations.json"), "w") as f:
+            json.dump({"version": 1, "transport": load_template()["transport"]}, f)
+        self.transport = os.path.join(self.tmp.name, "geocoder-transport")
+        with open(self.transport, "w") as f:
+            f.write(FAKE_TRANSPORT.format(python=sys.executable))
+        os.chmod(self.transport, 0o755)
+        env = mock.patch.dict(os.environ, {"FAKE_TRANSPORT_LOG": os.path.join(self.tmp.name, "transport.log"),
+                                           "FAKE_VERIFY_FAILS": ""})
+        env.start()
+        self.addCleanup(env.stop)
+        write(os.path.join(self.dir, "geo_cells.bin"), several_jobs(1))
+        write(os.path.join(self.dir, "street_ways.bin"), several_jobs(2))
+
+    def previous(self, name, stdin=None):
+        """The previous command line's .zst of the file `name` (or of `stdin`, a command's output, piped)."""
+        path = os.path.join(self.tmp.name, name + ".previous.zst")
+        size = os.path.getsize(os.path.join(self.dir, name))
+        cmd = ["zstd", PREVIOUS_LEVEL, f"-T{previous_threads(size)}", "-f", "--quiet", "-o", path]
+        if stdin is None:
+            subprocess.run(cmd + [os.path.join(self.dir, name)], check=True)
+        else:
+            enc = subprocess.Popen(stdin, stdout=subprocess.PIPE)
+            subprocess.run(cmd, stdin=enc.stdout, check=True)
+            enc.stdout.close()
+            self.assertEqual(enc.wait(), 0)
+        with open(path, "rb") as f:
+            return f.read()
+
+    def test_a_file_and_a_unit_of_several_jobs_keep_their_bytes(self):
+        argv = ["compress_index.py", self.out, "--transport-bin", self.transport]
+        printed = io.StringIO()
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(sut.os, "cpu_count", return_value=4), \
+                contextlib.redirect_stdout(printed):
+            self.assertEqual(sut.main(), 0)
+
+        # 48 MiB: two threads now, one before.
+        self.assertRegex(printed.getvalue(), r"-T2\] planet/full/geo_cells\.bin\n")
+        self.assertRegex(printed.getvalue(), r"-T2\] planet/full/street_ways\.tt\.zst\n")
+        self.assertEqual(previous_threads(48 << 20), 1)
+        with open(os.path.join(self.dir, "geo_cells.bin.zst"), "rb") as f:
+            self.assertTrue(f.read() == self.previous("geo_cells.bin"), "geo_cells.bin.zst")
+        with open(os.path.join(self.dir, "street_ways.tt.zst"), "rb") as f:
+            unit = f.read()
+        self.assertTrue(unit == self.previous("street_ways.bin", [self.transport, "encode", "cols", self.dir, "street_ways.bin"]),
+                        "street_ways.tt.zst")
 
 
 class SchedulerTest(unittest.TestCase):
