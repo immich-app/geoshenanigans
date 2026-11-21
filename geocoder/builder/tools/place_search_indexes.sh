@@ -8,13 +8,17 @@
 # Compression waits for this script's own status before it takes their files
 # (compress_index.py --late-search), so a build that hangs must end; one
 # stopped, or ended by a signal, may have left an index half-written, so every
-# index goes with it (their clients build theirs on the device). Their
-# scratch (the selections' file sets and place-search's spills) goes in a dir
-# of this script's own under $TMPDIR, removed however the build ends: a
-# stopped build_search_indexes.py removes none of its own. The exit status is
-# build_search_indexes.py's, 124 past <seconds>, 128 + the signal that ended
-# it, or 1 when place-search was not built or the scratch dir could not be
-# made.
+# index goes with it (their clients build theirs on the device). Whatever ends
+# the build, what it started ends first, and is gone (a zombie aside): timeout
+# signals its process group only when <seconds> pass, and a
+# build_search_indexes.py that ended by itself (a signal, an OOM kill) leaves
+# its place-search builds running, which could write an index after the
+# removal. Their scratch (the selections' file sets and place-search's spills)
+# goes in a dir of this script's own under $TMPDIR, removed however the build
+# ends: a stopped build_search_indexes.py removes none of its own. The exit
+# status is build_search_indexes.py's, 124 past <seconds>, 128 + the signal
+# that ended it, or 1 when place-search was not built or the scratch dir could
+# not be made.
 set -uo pipefail
 
 out=$1
@@ -42,7 +46,15 @@ if ! scratch=$(mktemp -d "${TMPDIR:-/tmp}/place-search-indexes-XXXXXX"); then
   exit 1
 fi
 status=0
-TMPDIR=$scratch timeout -k 60 "$limit" python3 "$(dirname "$0")/build_search_indexes.py" "$out" "$binary" || status=$?
+# timeout leads a process group of its own: its pid.
+TMPDIR=$scratch timeout -k 60 "$limit" python3 "$(dirname "$0")/build_search_indexes.py" "$out" "$binary" &
+group=$!
+wait "$group" || status=$?
+kill -KILL -- "-$group" 2> /dev/null || true
+for _ in $(seq 600); do
+  ps -e -o pgid= -o stat= | awk -v g="$group" '$1 == g && $2 !~ /^Z/ { found = 1 } END { exit !found }' || break
+  sleep 0.1
+done
 rm -rf "$scratch"
 if [ "$status" = 124 ] || [ "$status" = 137 ]; then
   status=124

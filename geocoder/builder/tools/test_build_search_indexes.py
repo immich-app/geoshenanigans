@@ -26,11 +26,17 @@ ADMIN_GEOMETRY = ["admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc
 # Stands in for place-search: `build <set> <out> ...` records its arguments and what the set dir
 # held (name -> link target) and writes the index files, then fails for a set path containing
 # $FAIL_SET, hangs for one containing $HANG_SET, and for one containing $KILL_SET kills the
-# build_search_indexes.py that runs it (SIGTERM, half a second in).
+# build_search_indexes.py that runs it (SIGTERM, half a second in). For a set path containing
+# $LATE_SET it first waits for that build_search_indexes.py to end, and a second more.
 FAKE = """#!{python}
 import json, os, sys
 supervisor = os.getppid()
 _, cmd, set_dir, out, *rest = sys.argv
+if os.environ.get("LATE_SET") and os.environ["LATE_SET"] in set_dir:
+    import time
+    while os.getppid() == supervisor:
+        time.sleep(0.05)
+    time.sleep(1)
 os.makedirs(out)
 held = {{n: os.readlink(os.path.join(set_dir, n)) for n in os.listdir(set_dir)}}
 with open(os.path.join(out, "call.json"), "w") as f:
@@ -241,6 +247,21 @@ class PlaceSearchJobTest(unittest.TestCase):
 
         self.assertEqual(code, 128 + 15, out)
         self.assertIn("ended by signal 15", out)
+        for region in ("planet", "europe"):
+            self.assertFalse(os.path.exists(os.path.join(self.out, region, "search")), region)
+        self.assertEqual(self.scratch_left(), [])
+
+    # Nor does one of two builds at once that outlives it: timeout signals its process group only when its own
+    # limit passes, and a build_search_indexes.py that ended by itself leaves the place-search builds it started
+    # running. The second here writes its index a second after the first's signal ended the script.
+    def test_a_build_that_outlives_a_signal_ended_script_leaves_no_index(self):
+        self.write_output(["planet", "europe"])
+
+        code, out, _ = self.run_job("0\n", env={**fake_cpus(self, 8), "KILL_SET": "/planet/full/simplified/",
+                                               "LATE_SET": "/planet/full/exact/"})
+        time.sleep(2)
+
+        self.assertEqual(code, 128 + 15, out)
         for region in ("planet", "europe"):
             self.assertFalse(os.path.exists(os.path.join(self.out, region, "search")), region)
         self.assertEqual(self.scratch_left(), [])
