@@ -159,22 +159,7 @@ fn cmd_query(args: &[String]) {
     answer_lines(std::io::stdin().lock(), &mut out, |q| {
         let t = Instant::now();
         let (found, st) = s.search(q, limit);
-        let us = t.elapsed().as_secs_f64() * 1e6;
-        let results: Vec<_> = found
-            .iter()
-            .map(|f| {
-                let mut r = f.to_json();
-                r["kind"] = json!(f.kind.letter().to_string());
-                r["score"] = json!(f.hit.score);
-                r["text"] = json!(f.hit.text);
-                r["context"] = json!(f.hit.context);
-                r["class"] = json!(f.hit.class);
-                r["entity"] = json!(f.hit.entity);
-                r
-            })
-            .collect();
-        json!({"q": q, "us": us, "reverse_lookups": st.reverse_lookups, "context_checks": st.context_checks,
-               "keys": st.keys_matched, "postings": st.postings_read, "results": results})
+        place_search::query::debug_line(q, t.elapsed().as_secs_f64() * 1e6, &found, &st)
     }).expect("query input/output");
     eprintln!("after queries: memory {}", mem_json());
 }
