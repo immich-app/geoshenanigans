@@ -812,6 +812,76 @@ class PostBuildTest(unittest.TestCase):
                 self.assertEqual(upload.wait(timeout=10), -9)
                 self.assertIn("::warning::", done.stdout)
 
+    def run_patch_step(self, compress):
+        """Runs Generate patches and verify as Actions runs it, on a night of no variants, with geocoder-transport
+        built and the place search done, an s5cmd, generate_patches.sh and checksums.sh that do nothing else, sleeps
+        of 10 ms, a clock that runs the seconds in $WORKDIR/clock ahead, and `compress` (Python, its argv
+        compress_index.py's) as compress_index.py; yesterday's fetch writes no status of its own. Returns the run,
+        None when the step still waited after 30 s, and the work dir."""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        ws, work, bin_dir = (os.path.join(root, d) for d in ("ws", "work", "bin"))
+        tools = os.path.join(ws, "geocoder", "builder", "tools")
+        for d in (tools, os.path.join(work, "output"), bin_dir):
+            os.makedirs(d)
+        fakes = {os.path.join(tools, "compress_index.py"): compress,
+                 os.path.join(tools, "generate_patches.sh"): "#!/bin/sh\nexit 0\n",
+                 os.path.join(tools, "checksums.sh"): "#!/bin/sh\nexit 0\n",
+                 os.path.join(bin_dir, "s5cmd"): "#!/bin/sh\nexit 0\n",
+                 os.path.join(bin_dir, "sleep"): "#!/bin/sh\nexec /usr/bin/sleep 0.01\n",
+                 os.path.join(bin_dir, "date"): FAKE_DATE.format(date=shutil.which("date")),
+                 os.path.join(work, "old-output.log"): "",
+                 os.path.join(work, "place-search.status"): "0\n",
+                 os.path.join(root, "search.status"): "0\n"}
+        for path, text in fakes.items():
+            with open(path, "w") as f:
+                f.write(text)
+            os.chmod(path, 0o755)
+        os.symlink(sys.executable, os.path.join(bin_dir, "python3"))
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_WORKSPACE": ws, "WORKDIR": work,
+               "GITHUB_ENV": os.path.join(root, "github_env"), "GITHUB_STEP_SUMMARY": os.path.join(root, "summary"),
+               "NEW_DATE": "2026-11-21", "OLD_DATE": "2026-11-20", "S3_ENDPOINT": "https://s3.invalid",
+               "S3_BUCKET": "bucket", "S3_PREFIX": "geocoder", "TMPDIR": root, "RUNNER_TEMP": root,
+               "FAKE_CLOCK": os.path.join(work, "clock")}
+        try:
+            done = subprocess.run(["bash", "--noprofile", "--norc", "-e", "-c", step_script("Generate patches and verify")],
+                                  env=env, capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            done = None
+        return done, work
+
+    # Compression reads today's files alone: it starts from build-index's exit, before the step waits for
+    # yesterday's (fetch_previous_index.sh, beside the build), which a night whose fetch outlasts build-index would
+    # otherwise spend idle. Here compression itself ends that fetch.
+    def test_compression_starts_before_the_wait_for_yesterdays_files(self):
+        done, work = self.run_patch_step(
+            "import os, sys\nwork = os.path.dirname(sys.argv[1])\n"
+            "with open(os.path.join(work, 'old-output.status'), 'w') as f:\n    f.write('0\\n')\n")
+
+        self.assertIsNotNone(done, "the step waited for yesterday's files before it started compression")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertTrue(os.path.exists(os.path.join(work, "compress.done")))
+
+    # A fetch that failed, or did not end within the hour, fails the step, and the compression already running ends
+    # first, its session and all (its uploads with it), and is gone.
+    def test_a_fetch_of_yesterdays_files_that_failed_or_timed_out_stops_compression(self):
+        for how, ends in (("failed", "with open(os.path.join(work, 'old-output.status'), 'w') as f:\n    f.write('1\\n')\n"),
+                          ("timed out", "with open(os.path.join(work, 'clock'), 'w') as f:\n    f.write('4000')\n")):
+            with self.subTest(how=how):
+                done, work = self.run_patch_step(
+                    "import os, sys, time\nwork = os.path.dirname(sys.argv[1])\n"
+                    "with open(os.path.join(work, 'compress.pid'), 'w') as f:\n    f.write(str(os.getpid()))\n"
+                    + ends + "time.sleep(300)\n")
+
+                self.assertIsNotNone(done, "the step waited for yesterday's files before it started compression")
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn("::error::", done.stdout)
+                with open(os.path.join(work, "compress.pid")) as f:
+                    compress = int(f.read())
+                if alive(compress):
+                    os.kill(compress, 9)
+                    self.fail("compression still ran after the step")
+
     # The watchdog tells a retry from a failure a rerun repeats by these steps' names.
     def test_every_step_the_watchdog_names_is_a_step_of_the_nightly(self):
         with open(WATCHDOG) as f:

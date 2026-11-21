@@ -955,32 +955,17 @@ jobs:
           echo "Disk at start of patch step:"
           df -h "$WORKDIR"
 
-          # Yesterday's client files came down and decompressed beside the
-          # build (fetch_previous_index.sh, started by the build step).
-          WAIT_START=$(date +%s)
-          until [ -s "$WORKDIR/old-output.status" ]; do
-            if [ $(( $(date +%s) - WAIT_START )) -gt 3600 ]; then
-              echo "::error::Yesterday's index fetch did not finish within an hour"; exit 1
-            fi
-            sleep 10
-          done
-          cat "$WORKDIR/old-output.log"
-          echo "[old-output] Waited $(( $(date +%s) - WAIT_START ))s for it"
-          if [ "$(cat "$WORKDIR/old-output.status")" != 0 ]; then
-            echo "::error::Fetching yesterday's index failed"; exit 1
-          fi
-          df -h "$WORKDIR"
-
           # Compress the new index alongside the diffs, whose long tail
           # (planet/full) leaves most cores idle, and the place search, whose
-          # files it takes once its status is written. It keeps the .bin files
-          # the diffs and verifies read; the compress step removes them. Each
-          # .zst and transport unit streams to this date's (cleared) Tigris
-          # prefix as soon as it exists: the upload is network-bound, so it
-          # hides behind the compression. Finalize uploads whatever is still
-          # missing. The .zst are final once it ends: their checksums
-          # (checksums.sh zst) are taken then, beside the patches, for
-          # Finalize's checksums.sha256.
+          # files it takes once its status is written; from build-index's exit,
+          # as it reads none of yesterday's files, which the diffs wait for
+          # below. It keeps the .bin files the diffs and verifies read; the
+          # compress step removes them. Each .zst and transport unit streams to
+          # this date's (cleared) Tigris prefix as soon as it exists: the upload
+          # is network-bound, so it hides behind the compression. Finalize
+          # uploads whatever is still missing. The .zst are final once it ends:
+          # their checksums (checksums.sh zst) are taken then, beside the
+          # patches, for Finalize's checksums.sha256.
           $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
           # The strategy-2 sidecars (*.osm_ids, tomorrow's --prev-output) are
           # final since build-index exited: up now, rather than in Finalize's
@@ -998,7 +983,11 @@ jobs:
           # search build (done long before, on a normal night).
           WAIT_START=$(date +%s)
           until [ -s "$RUNNER_TEMP/search.status" ] || [ $(( $(date +%s) - WAIT_START )) -gt 1800 ]; do sleep 5; done
-          (
+          # In a session of its own, which the wait below ends should
+          # yesterday's files not come. The inner script expands its own
+          # variables (the step's env).
+          # shellcheck disable=SC2016
+          setsid bash -e -c '
             COMPRESS_RC=0
             nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
               --transport-bin "$GITHUB_WORKSPACE/geocoder/search/target/release/geocoder-transport" \
@@ -1010,8 +999,33 @@ jobs:
                 && mv "$WORKDIR/zst.sha256.part" "$WORKDIR/zst.sha256"
             fi
             exit "$COMPRESS_RC"
-          ) > "$WORKDIR/compress.log" 2>&1 < /dev/null &
+          ' > "$WORKDIR/compress.log" 2>&1 < /dev/null &
           COMPRESS_PID=$!
+
+          # Yesterday's client files came down and decompressed beside the
+          # build (fetch_previous_index.sh, started by the build step). Without
+          # them there are no patches and the run fails: compression ends
+          # first, its session and all (its uploads too), and is gone (a
+          # zombie aside).
+          stop_compression() {
+            pkill -KILL -s "$COMPRESS_PID" 2> /dev/null || true
+            local start
+            start=$(date +%s)
+            while ps -o stat= -s "$COMPRESS_PID" | grep -q '^[^Z]' && [ $(( $(date +%s) - start )) -lt 60 ]; do sleep 1; done
+          }
+          WAIT_START=$(date +%s)
+          until [ -s "$WORKDIR/old-output.status" ]; do
+            if [ $(( $(date +%s) - WAIT_START )) -gt 3600 ]; then
+              echo "::error::Yesterday's index fetch did not finish within an hour"; stop_compression; exit 1
+            fi
+            sleep 10
+          done
+          cat "$WORKDIR/old-output.log"
+          echo "[old-output] Waited $(( $(date +%s) - WAIT_START ))s for it"
+          if [ "$(cat "$WORKDIR/old-output.status")" != 0 ]; then
+            echo "::error::Fetching yesterday's index failed"; stop_compression; exit 1
+          fi
+          df -h "$WORKDIR"
 
           # Patch generation runs against uncompressed .bin files (old was
           # decompressed as it came down, new was just built).
