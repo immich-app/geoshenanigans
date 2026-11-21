@@ -899,18 +899,36 @@ jobs:
           # .zst and transport unit streams to this date's (cleared) Tigris
           # prefix as soon as it exists: the upload is network-bound, so it
           # hides behind the compression. Finalize uploads whatever is still
-          # missing.
+          # missing. The .zst are final once it ends: their checksums
+          # (checksums.sh zst) are taken then, beside the patches, for
+          # Finalize's checksums.sha256.
           $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
+          # The strategy-2 sidecars (*.osm_ids, tomorrow's --prev-output) are
+          # final since build-index exited: up now, rather than in Finalize's
+          # first pass, which waits for sidecars.status.
+          find "$WORKDIR/output" -name '*.osm_ids' -printf "cp %p s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/%P\n" > "$WORKDIR/sidecars.run"
+          # The inner script expands its own arguments ($0 is the status file).
+          # shellcheck disable=SC2016
+          setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/sidecars.status" \
+            s5cmd --endpoint-url "$S3_ENDPOINT" --retry-count 10 --numworkers 16 run "$WORKDIR/sidecars.run" \
+            > "$WORKDIR/sidecars.log" 2>&1 < /dev/null &
           # geocoder-transport, which encodes the units, comes from the place
           # search build (done long before, on a normal night).
           WAIT_START=$(date +%s)
           until [ -s "$RUNNER_TEMP/search.status" ] || [ $(( $(date +%s) - WAIT_START )) -gt 1800 ]; do sleep 5; done
-          nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
-            --transport-bin "$GITHUB_WORKSPACE/geocoder/search/target/release/geocoder-transport" \
-            --late-search "$WORKDIR/place-search.status" \
-            --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE" \
-            --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" \
-            > "$WORKDIR/compress.log" 2>&1 < /dev/null &
+          (
+            COMPRESS_RC=0
+            nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
+              --transport-bin "$GITHUB_WORKSPACE/geocoder/search/target/release/geocoder-transport" \
+              --late-search "$WORKDIR/place-search.status" \
+              --upload "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE" \
+              --upload-cmd "s5cmd --endpoint-url $S3_ENDPOINT --retry-count 10 --numworkers 16 run" || COMPRESS_RC=$?
+            if [ "$COMPRESS_RC" = 0 ] || [ "$COMPRESS_RC" = 3 ]; then
+              nice -n 10 "$GITHUB_WORKSPACE/geocoder/builder/tools/checksums.sh" zst "$WORKDIR/output" > "$WORKDIR/zst.sha256.part" \
+                && mv "$WORKDIR/zst.sha256.part" "$WORKDIR/zst.sha256"
+            fi
+            exit "$COMPRESS_RC"
+          ) > "$WORKDIR/compress.log" 2>&1 < /dev/null &
           COMPRESS_PID=$!
 
           # Patch generation runs against uncompressed .bin files (old was
@@ -1044,10 +1062,25 @@ jobs:
             echo "Compressed during patch generation"
           else
             COMPRESS_START=$(date +%s)
+            # After a failed background run, the sidecars' upload it started
+            # ends before the prefix is cleared, then starts again.
+            if [ -f "$WORKDIR/sidecars.run" ]; then
+              until [ -s "$WORKDIR/sidecars.status" ] || [ $(( $(date +%s) - COMPRESS_START )) -gt 900 ]; do sleep 2; done
+            fi
             s5cmd --endpoint-url "$S3_ENDPOINT" --numworkers 32 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
+            # The strategy-2 sidecars, as the patch step uploads them.
+            rm -f "$WORKDIR/sidecars.status"
+            find "$WORKDIR/output" -name '*.osm_ids' -printf "cp %p s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/%P\n" > "$WORKDIR/sidecars.run"
+            # The inner script expands its own arguments ($0 is the status file).
+            # shellcheck disable=SC2016
+            setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/sidecars.status" \
+              s5cmd --endpoint-url "$S3_ENDPOINT" --retry-count 10 --numworkers 16 run "$WORKDIR/sidecars.run" \
+              > "$WORKDIR/sidecars.log" 2>&1 < /dev/null &
             # geocoder-transport, which encodes the units, comes from the place
             # search build.
             until [ -s "$RUNNER_TEMP/search.status" ] || [ $(( $(date +%s) - COMPRESS_START )) -gt 1800 ]; do sleep 5; done
+            # A compression run again rewrites the .zst: their checksums too.
+            rm -f "$WORKDIR/zst.sha256"
             COMPRESS_RC=0
             nice -n 10 python3 "$GITHUB_WORKSPACE/geocoder/builder/tools/compress_index.py" "$WORKDIR/output" \
               --transport-bin "$GITHUB_WORKSPACE/geocoder/search/target/release/geocoder-transport" \
@@ -1062,6 +1095,9 @@ jobs:
               exit "$COMPRESS_RC"
             fi
             echo "Compression done in $(($(date +%s) - COMPRESS_START))s"
+            # The .zst are final: their checksums for Finalize.
+            "$GITHUB_WORKSPACE/geocoder/builder/tools/checksums.sh" zst "$WORKDIR/output" > "$WORKDIR/zst.sha256.part" \
+              && mv "$WORKDIR/zst.sha256.part" "$WORKDIR/zst.sha256"
           fi
           # The place search ran beside compression, which waited for its
           # status: a failed or stopped build left no index, and fails the run
@@ -1108,7 +1144,15 @@ jobs:
           # mapping that the next build's IdAllocator reads as
           # --prev-output. Clients never read them. The cleanup step
           # further down ages them out at the same rate as full builds
-          # (3 days).
+          # (3 days). They went up beside compression (sidecars.status);
+          # the pass below sends them only if that failed.
+          if [ -f "$WORKDIR/sidecars.run" ]; then
+            until [ -s "$WORKDIR/sidecars.status" ] || [ $(( $(date +%s) - UPLOAD_START )) -gt 900 ]; do sleep 2; done
+            if [ "$(cat "$WORKDIR/sidecars.status" 2> /dev/null)" != 0 ]; then
+              echo "::warning::The sidecars' upload beside compression failed or is still running; the pass below sends them"
+              tail -20 "$WORKDIR/sidecars.log" || true
+            fi
+          fi
           # The .zst files streamed up during compression (the prefix was
           # cleared then): only what is missing or differs in size goes now.
           # The runner's ~1 Gbit/s link caps the rate; 16 workers reach it.
@@ -1137,9 +1181,19 @@ jobs:
           # hashes for server-side verification after decompression, while
           # this checksums.sha256 holds the on-wire hashes (compressed).
           echo "Generating checksums..."
-          # Hashed on every core (~35 GB), listed in path order.
-          (cd "$WORKDIR/output" && find . -type f \( -name "*.zst" -o -name "*.gcpatch" -o -name "*.json" \) -print0 \
-            | xargs -0 -P "$(nproc)" -n 8 sha256sum | sort -k2) > "$WORKDIR/output/checksums.sha256"
+          # The .zst were hashed when compression ended ($WORKDIR/zst.sha256,
+          # hashed here when missing); the patches and JSON now, configurations.json
+          # after the splice above. checksums.sh refuses .zst lines that don't
+          # name the .zst files there, and a configurations.json line that
+          # isn't its hash; the .zst are then hashed again.
+          if ! [ -s "$WORKDIR/zst.sha256" ]; then
+            "$GITHUB_WORKSPACE/geocoder/builder/tools/checksums.sh" zst "$WORKDIR/output" > "$WORKDIR/zst.sha256"
+          fi
+          if ! "$GITHUB_WORKSPACE/geocoder/builder/tools/checksums.sh" all "$WORKDIR/output" "$WORKDIR/zst.sha256" > "$WORKDIR/output/checksums.sha256"; then
+            echo "::warning::The .zst checksums taken when compression ended don't hold; hashing the .zst again"
+            "$GITHUB_WORKSPACE/geocoder/builder/tools/checksums.sh" zst "$WORKDIR/output" > "$WORKDIR/zst.sha256"
+            "$GITHUB_WORKSPACE/geocoder/builder/tools/checksums.sh" all "$WORKDIR/output" "$WORKDIR/zst.sha256" > "$WORKDIR/output/checksums.sha256"
+          fi
           echo "$(wc -l < "$WORKDIR/output/checksums.sha256") file checksums generated"
 
           # Upload configurations.json + checksums (index files + patches

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Tests for the order of the nightly's steps and what runs beside what: the day's diff and today's PBF in the
-download, the Rust toolchain in the background, and the place search beside compression and the patches from
-build-index's exit.
+download, the Rust toolchain in the background, the place search beside compression and the patches from
+build-index's exit, and the sidecars' upload beside them.
 Run: python3 -m unittest discover -s geocoder/builder/tools"""
 import gzip
 import os
@@ -138,6 +138,27 @@ class PostBuildTest(unittest.TestCase):
                                  r"\"\$WORKDIR/output\" \\\n +\"\$GITHUB_WORKSPACE/geocoder/search/target/release/place-search\" "
                                  r"\"\$RUNNER_TEMP/search\.status\" 1800 \\\n")
         self.assertNotIn("build_search_indexes.py", script)
+
+    # Both steps that compress start compression with geocoder-transport built, the sidecars' upload after the
+    # prefix is cleared.
+    def test_compression_waits_for_geocoder_transport_and_the_sidecars_go_up_after_the_prefix_is_cleared(self):
+        for name in ("Generate patches and verify", "Compress index files"):
+            script = step_script(name)
+            clear = script.index("rm \"s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*\"")
+            sidecars = script.index("run \"$WORKDIR/sidecars.run\"")
+            wait = script.index('[ -s "$RUNNER_TEMP/search.status" ]')
+            compress = script.index("compress_index.py")
+            self.assertLess(clear, sidecars, name)
+            self.assertLess(sidecars, compress, name)
+            self.assertLess(wait, compress, name)
+            self.assertIn("RUNNER_TEMP: ${{ runner.temp }}", step(name), name)
+        retry = step_script("Compress index files")
+        self.assertLess(retry.index('[ -s "$WORKDIR/sidecars.status" ]'), retry.index("rm \"s3://$S3_BUCKET/$S3_PREFIX"))
+
+    def test_finalize_waits_for_the_sidecars_before_its_first_pass(self):
+        script = step_script("Finalize upload and configurations.json")
+        self.assertLess(script.index('[ -s "$WORKDIR/sidecars.status" ]'), script.index("cp --if-size-differ"))
+        self.assertIn("Caching today's PBF ended at $(date -u -r \"$WORKDIR/pbf-cache.status\" +%H:%M:%S)", script)
 
     # The watchdog tells a retry from a failure a rerun repeats by these steps' names.
     def test_every_step_the_watchdog_names_is_a_step_of_the_nightly(self):
