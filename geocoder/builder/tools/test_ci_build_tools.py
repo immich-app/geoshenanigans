@@ -77,7 +77,11 @@ class ShardedTestsRun:
             return f.read().split()
 
     def compiled(self):
-        return os.path.exists(self.compiles)
+        """The fresh builds' cmake calls, a line each: none when the cached tools passed their tests."""
+        if not os.path.exists(self.compiles):
+            return []
+        with open(self.compiles) as f:
+            return f.read().splitlines()
 
 
 def cached_tools():
@@ -154,6 +158,15 @@ def paths_that_run_the_tests():
     return set(re.findall(r'^      - "([^"]+)"$', paths.group(1), re.M))
 
 
+# The words of the apt-get install command of the geocoder-tests.yml job that runs these tests.
+def tool_test_packages():
+    with open(os.path.join(WORKFLOWS, "geocoder-tests.yml")) as f:
+        jobs = f.read().split("\njobs:\n", 1)[1]
+    [job] = [job for job in re.split(r"^(?=  [\w-]+:\n)", jobs, flags=re.M) if "unittest discover" in job]
+    install = re.search(r"apt-get install((?:.*\\\n)*.*)", job)
+    return set(install.group(1).replace("\\\n", " ").split())
+
+
 class ToolsCacheTest(unittest.TestCase):
     # A cache hit restores only the cached binaries, so a tool the unit tests
     # run that the cache lacks fails them, and the night compiles afresh.
@@ -211,7 +224,7 @@ class ShardedUnitTestsTest(unittest.TestCase):
         self.assertNotEqual(run.status, 0)
         self.assertIn("FAILED  t37", run.out)
         self.assertIn("Unit tests failed on the cached tools; building them afresh", run.out)
-        self.assertTrue(run.compiled())
+        self.assertEqual(run.compiled(), ["cmake"])
 
     # A shard index past the count, or a test_main that ignored the shard, would pass on fewer tests than the
     # registry holds: the run counts what each shard ran.
@@ -268,6 +281,20 @@ class NightlyPackagesTest(unittest.TestCase):
     # only that workflow, dropping libzstd-dev say, must run it.
     def test_a_change_to_the_nightly_runs_these_tests(self):
         self.assertIn(".github/workflows/geocoder-build.yml", paths_that_run_the_tests())
+
+
+class ToolTestsJobTest(unittest.TestCase):
+    # test_nightly_steps.py runs the watchdog's retry and report scripts and
+    # reads its titles, and the nightly never runs these tests: a pull request
+    # changing only the watchdog must.
+    def test_a_change_to_the_watchdog_runs_these_tests(self):
+        self.assertIn(".github/workflows/geocoder-build-watchdog.yml", paths_that_run_the_tests())
+
+    # The tests that read the workflows as GitHub does parse them with PyYAML,
+    # which the standard library lacks: the job installs it for the system
+    # python3 that runs them, rather than count on the runner image.
+    def test_the_job_that_runs_these_tests_installs_pyyaml(self):
+        self.assertIn("python3-yaml", tool_test_packages())
 
 
 class Past4GibCasesTest(unittest.TestCase):

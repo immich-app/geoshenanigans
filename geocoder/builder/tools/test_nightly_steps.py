@@ -2,7 +2,8 @@
 """Tests for the order of the nightly's steps and what runs beside what: the day's diff and today's PBF in the
 download, the Rust toolchain in the background, the place search beside compression and the patches from
 build-index's exit, and the sidecars' upload beside them; and which runs the watchdog retries.
-Run: python3 -m unittest discover -s geocoder/builder/tools"""
+Run: python3 -m unittest discover -s geocoder/builder/tools (the tests that parse a workflow need PyYAML, Debian's
+python3-yaml, which geocoder-tests.yml installs)."""
 import gzip
 import json
 import os
