@@ -4,17 +4,17 @@
 // it comes), and switches to it only once every dataset of it loads.
 //
 // A build dir holds configurations.json, the build's files as it lays them
-// out (<region>/<dir>/<name>), a dir of links per dataset (sets/<id>/, each
-// file by its name, as a client's flat download holds them), the ledger of
-// the objects in place (FETCHED) and, once all are, COMPLETE. Each sync of a
-// build goes into a dir of its own, named anew, which no server maps until
-// it is complete: a sync never writes into the dir of the build served,
-// and a build found damaged is fetched again into a new dir. A sync killed
-// part way resumes in its dir: it removes what its ledger doesn't name (an
-// object in place before its line went in, a try's temporary file), then
-// weighs the room it needs for the objects still to fetch, and fetches only
-// those. Files of the same bytes within a build are fetched once and
-// hard-linked (catalog::Object::link).
+// out (<region>/<dir>/<name>), a dir of links per dataset (sets/<id>/, hard
+// links of the build's files, each by its name, as a client's flat download
+// holds them), the ledger of the objects in place (FETCHED) and, once all
+// are, COMPLETE. Each sync of a build goes into a dir of its own, named
+// anew, which no server maps until it is complete: a sync never writes into
+// the dir of the build served, and a build found damaged is fetched again
+// into a new dir. A sync killed part way resumes in its dir: it removes
+// what its ledger doesn't name (an object in place before its line went
+// in, a try's temporary file), then weighs the room it needs for the
+// objects still to fetch, and fetches only those. Files of the same bytes
+// within a build are fetched once and hard-linked (catalog::Object::link).
 //
 // A build is the one of a date as its configurations.json was published: a
 // rerun of the nightly that publishes a date's build again makes another,
@@ -238,19 +238,32 @@ fn link(root: &Path, plan: &Plan) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether every file of the complete build dir `root`, and each dataset's
-/// link to one, is there at its size; else the first that isn't.
+/// Whether every file of the complete build dir `root` is there at its
+/// size, and each dataset's dir holds its dataset's files and nothing else,
+/// each the build's file itself (a hard link of it: of its device and
+/// inode), so that a dataset loads no bytes but those verify reads; else
+/// the first that isn't.
 fn in_place(root: &Path, cfg: &Configurations, plan: &Plan) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
     for f in plan.objects.iter().flat_map(|o| &o.files) {
         if !sized(root, cfg, std::slice::from_ref(f)) {
             return Err(format!("{f} is not there at its size"));
         }
     }
+    // A regular file's device and inode, not a symlink's or its target's.
+    let file = |at: &str| std::fs::symlink_metadata(root.join(at)).ok().filter(|m| m.is_file()).map(|m| (m.dev(), m.ino()));
     for dataset in &plan.datasets {
-        for (name, path) in dataset.links() {
-            let at = root.join(SETS).join(&dataset.id).join(&name);
-            if !std::fs::metadata(&at).is_ok_and(|m| m.len() == cfg.files[&path].size_raw) {
-                return Err(format!("{} is not there at its size", at.display()));
+        let (dir, links) = (format!("{SETS}/{}", dataset.id), dataset.links());
+        for entry in std::fs::read_dir(root.join(&dir)).map_err(|e| format!("{dir}: {e}"))? {
+            let name = entry.map_err(|e| format!("{dir}: {e}"))?.file_name().to_string_lossy().into_owned();
+            if !links.contains_key(&name) {
+                return Err(format!("{dir}/{name} is none of its dataset's files"));
+            }
+        }
+        for (name, path) in &links {
+            let linked = file(&format!("{dir}/{name}"));
+            if linked.is_none() || linked != file(path) {
+                return Err(format!("{dir}/{name} is no hard link of {path}"));
             }
         }
     }

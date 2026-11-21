@@ -269,6 +269,14 @@ fn copy_build(from: &Path, to: &Path, date: &str, version: u32) {
     std::fs::write(to.join(MANIFEST), manifest.to_string()).unwrap();
 }
 
+/// Flips a bit of the first byte of the file at `path`, in place.
+fn flip(path: &Path) {
+    use std::io::Write;
+    let mut bytes = std::fs::read(path).unwrap();
+    bytes[0] ^= 1;
+    std::fs::OpenOptions::new().write(true).open(path).unwrap().write_all(&bytes).unwrap();
+}
+
 // The image reads builds of the template's version, and syncs only those.
 #[test]
 fn the_build_version_it_serves_is_the_templates() {
@@ -655,12 +663,64 @@ async fn a_start_serves_no_build_before_its_files_check_out() {
     assert_eq!(*loaded.lock().unwrap(), BTreeSet::from([format!("{DATE}-1")]));
     assert_eq!(build_dirs(data.path()), [format!("{DATE}-1")]);
 
-    damage(&format!("{DATE}-1"));
+    // The build alone holds its files now: a byte flipped in place, which
+    // its datasets' links see too.
+    flip(&builds.join(format!("{DATE}-1")).join(damaged));
     let none = portal(data.path(), config(&bucket, recording));
     assert!(none.round(true).await.is_err());
     assert!(none.served().is_none());
     let skipped = format!("build {DATE}-1 here can't be served: {damaged} holds bytes of sha256 ");
     assert!(none.unavailable().contains(&skipped), "{}", none.unavailable());
+}
+
+// A dataset loads from its dir of links, so a build is served only where
+// each such dir holds its dataset's files and nothing else, each the
+// build's file itself (a hard link of it), whose bytes the start reads: not
+// a copy of its own, damaged or not, nor a symlink, nor a file besides.
+#[tokio::test]
+async fn a_start_serves_no_build_whose_dataset_dirs_hold_other_than_its_files() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let made = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    portal(made.path(), config(&bucket, load.clone())).round(true).await.unwrap();
+    let (cfg, manifest) = manifest_of(&bucket).await;
+    let dataset = catalog::plan(&cfg, &manifest).unwrap().datasets.remove(0);
+    let (name, path) = dataset.links().into_iter().next().unwrap();
+    let entry = format!("{SETS}/{}/{name}", dataset.id);
+    let stray = format!("{SETS}/{}/stray.bin", dataset.id);
+    let not_it = format!("{entry} is no hard link of {path}");
+    let besides = format!("{stray} is none of its dataset's files");
+
+    for (case, why) in [("a damaged copy", &not_it), ("a copy", &not_it), ("a symlink", &not_it), ("a file besides", &besides)] {
+        let data = ScratchDir::new();
+        let root = data.path().join(BUILDS).join(format!("{DATE}-1"));
+        copy_build(&made.path().join(BUILDS).join(format!("{DATE}-1")), &root, DATE, BUILD_VERSION);
+        let at = root.join(&entry);
+        match case {
+            "a damaged copy" | "a copy" => {
+                let mut bytes = std::fs::read(&at).unwrap();
+                if case == "a damaged copy" {
+                    bytes[0] ^= 1;
+                }
+                std::fs::remove_file(&at).unwrap();
+                std::fs::write(&at, bytes).unwrap();
+            }
+            "a symlink" => {
+                std::fs::remove_file(&at).unwrap();
+                std::os::unix::fs::symlink(root.join(&path), &at).unwrap();
+            }
+            _ => std::fs::write(root.join(&stray), b"stray").unwrap(),
+        }
+        // No round gets past the start.
+        std::fs::write(data.path().join(sync::LATEST_OVERRIDE), "tomorrow\n").unwrap();
+
+        let p = portal(data.path(), config(&bucket, load.clone()));
+        assert!(p.round(true).await.is_err(), "{case}");
+
+        assert!(p.served().is_none(), "{case}: build {} served", p.served().unwrap().dir);
+        let skipped = format!("build {DATE}-1 here can't be served: {why}");
+        assert!(p.unavailable().contains(&skipped), "{case}: {}", p.unavailable());
+    }
 }
 
 // A sync killed part way leaves its dir incomplete, its ledger naming the
