@@ -1,6 +1,14 @@
 mod auth;
 mod downloader;
 mod handlers;
+// The test portal (the query-portal binary, portal_main.rs), whose tests run
+// here beside the routes its answers are compared with.
+#[cfg(test)]
+#[allow(dead_code)]
+mod portal;
+#[cfg(test)]
+#[path = "portal/tests.rs"]
+mod portal_tests;
 mod region_state;
 #[cfg(test)]
 mod scratch_dir;

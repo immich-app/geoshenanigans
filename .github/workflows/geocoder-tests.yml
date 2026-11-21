@@ -145,6 +145,12 @@ jobs:
         run: |
           cd geocoder/server
           cargo test --release
+      # The test portal's server, as its image builds it: its tests run in
+      # query-server's, so the step above doesn't build it.
+      - name: Build query-portal
+        run: |
+          cd geocoder/server
+          cargo build --release --bin query-portal
 
   search-tests:
     name: Place search unit tests

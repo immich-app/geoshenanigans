@@ -265,7 +265,7 @@ async fn send_body(resp: reqwest::Response, tx: &std::sync::mpsc::SyncSender<byt
     None
 }
 
-async fn get(client: &reqwest::Client, url: &str) -> Result<reqwest::Response, DownloadError> {
+pub async fn get(client: &reqwest::Client, url: &str) -> Result<reqwest::Response, DownloadError> {
     let resp = client.get(url).send().await
         .map_err(|e| DownloadError::Http(format!("{}: {}", url, e)))?;
     if !resp.status().is_success() {
@@ -277,7 +277,7 @@ async fn get(client: &reqwest::Client, url: &str) -> Result<reqwest::Response, D
 /// Fetch `{base_url}/builds/{date}/{path}.zst`, a file published as its own
 /// .zst, decompress, verify sha256 against `expected.sha256`, write
 /// atomically to `dest`.
-async fn download_file(
+pub async fn download_file(
     client: &reqwest::Client,
     base_url: &str,
     date: &str,
@@ -381,7 +381,7 @@ fn decode_hash_write(
 /// as they come, must be `files` with their sizes and sha256, and are
 /// renamed into place together once all are; on an error none is. RAM use
 /// is the channel, the zstd window and one chunk of the unit's columns.
-async fn download_unit(
+pub async fn download_unit(
     client: &reqwest::Client,
     base_url: &str,
     date: &str,
@@ -409,7 +409,7 @@ async fn download_unit(
     decoded.map_err(|e| DownloadError::Transport(format!("{}: {}", unit, e)))
 }
 
-fn basename(path: &str) -> &str {
+pub fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
@@ -424,7 +424,7 @@ pub struct DownloadProgress {
 }
 
 /// One object a region's download fetches.
-enum Fetch<'a> {
+pub enum Fetch<'a> {
     /// A file, through its own .zst of `size` bytes.
     File { path: &'a str, entry: &'a FileEntry, size: u64 },
     /// A transport unit of `size` bytes, for its files.
@@ -432,21 +432,21 @@ enum Fetch<'a> {
 }
 
 impl<'a> Fetch<'a> {
-    fn path(&self) -> &'a str {
+    pub fn path(&self) -> &'a str {
         match self {
             Fetch::File { path, .. } | Fetch::Unit { path, .. } => path,
         }
     }
 
     /// The files it puts in place, by path, with their entries.
-    fn files(&self) -> Vec<(&'a str, &'a FileEntry)> {
+    pub fn files(&self) -> Vec<(&'a str, &'a FileEntry)> {
         match self {
             Fetch::File { path, entry, .. } => vec![(*path, *entry)],
             Fetch::Unit { files, .. } => files.clone(),
         }
     }
 
-    fn size(&self) -> u64 {
+    pub fn size(&self) -> u64 {
         match self {
             Fetch::File { size, .. } | Fetch::Unit { size, .. } => *size,
         }
@@ -457,7 +457,7 @@ impl<'a> Fetch<'a> {
 /// its transport unit, once for all the files it holds. A unit must be of
 /// this build's transport version, and the selection must take all of its
 /// files: decoding it writes every one.
-fn fetches<'a>(cfg: &'a Configurations, paths: &[&'a String]) -> Result<Vec<Fetch<'a>>, DownloadError> {
+pub fn fetches<'a>(cfg: &'a Configurations, paths: &[&'a String]) -> Result<Vec<Fetch<'a>>, DownloadError> {
     let taken: HashSet<&str> = paths.iter().map(|p| p.as_str()).collect();
     let mut units = HashSet::new();
     let mut out = Vec::new();

@@ -16,6 +16,15 @@ path = "src/lib.rs"
 name = "query-server"
 path = "src/main.rs"
 
+# Binary: the test portal's server, which syncs the whole planet build and
+# serves each selection of it (src/portal.rs). Its tests run in
+# query-server's (src/portal/tests.rs), beside the routes it answers as, so
+# it has no test target of its own; CI builds it as the image does.
+[[bin]]
+name = "query-portal"
+path = "src/portal_main.rs"
+test = false
+
 [features]
 # The arc fixture writer (src/arc_fixture.rs), for the tests of crates that read the arc files.
 fixtures = []
