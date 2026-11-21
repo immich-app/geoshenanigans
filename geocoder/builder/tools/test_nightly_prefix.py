@@ -2,6 +2,7 @@
 """Tests for the nightly's s3_prefix dispatch input: a test run from a branch publishes under a scratch prefix,
 a scheduled night under the live one, and the Setup step refuses a prefix the cleanup could reach out of.
 Run: python3 -m unittest discover -s geocoder/builder/tools"""
+import json
 import os
 import re
 import shutil
@@ -12,6 +13,7 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 NIGHTLY = os.path.join(HERE, "..", "..", "..", ".github", "workflows", "geocoder-build.yml")
+TEMPLATE = os.path.join(HERE, "..", "configurations.template.json")
 
 
 def nightly():
@@ -50,7 +52,8 @@ class S3PrefixTest(unittest.TestCase):
         paths = re.findall(r"s3://\$S3_BUCKET/([^\"\s]*)", nightly())
         self.assertTrue(paths)
         self.assertEqual([p for p in paths if not p.startswith("$S3_PREFIX/")], ["geocoder/builds/$PREV_DATE"])
-        self.assertEqual(re.findall(r'(\w+) "\$SEED_FROM', nightly()), ["ls", "cp", "ls"])
+        self.assertEqual(re.findall(r'(\w+) "\$SEED_FROM', nightly()), ["ls", "patch_base_versions", "cp", "ls"])
+        self.assertRegex(nightly(), r'(?m)^ *PREV_CFG=\$\(s5cmd --endpoint-url \$S3_ENDPOINT cat "\$1/configurations\.json"')
 
     def test_the_setup_refuses_a_prefix_that_is_not_one_segment(self):
         script = prefix_check()
@@ -195,7 +198,8 @@ class ScratchPbfCacheTest(unittest.TestCase):
 
 
 # s5cmd over a bucket of files under $FAKE_BUCKET (s3://<bucket>/<key> is $FAKE_BUCKET/<bucket>/<key>): ls, cp and
-# rm of a prefix's every object (<prefix>/*, or <prefix>/<dir>/*<suffix> for ls), each call logged to $FAKE_CALLS. A
+# rm of a prefix's every object (<prefix>/*, or <prefix>/<dir>/*<suffix> for ls), and cat of an object, each call
+# logged to $FAKE_CALLS. A
 # copy fails at its object number $FAKE_COPY_FAILS_AFTER, or passes over the key $FAKE_COPY_DROPS and says nothing;
 # with $FAKE_LIST_FAILS_AFTER_COPY set, every ls after a copy fails.
 FAKE_BUCKET_S5CMD = r"""#!{python}
@@ -205,7 +209,7 @@ with open(os.environ["FAKE_CALLS"]) as f:
     copied = any(" cp " in line for line in f)
 with open(os.environ["FAKE_CALLS"], "a") as f:
     f.write("s5cmd " + " ".join(args) + "\n")
-verb = next(a for a in args if a in ("ls", "cp", "rm"))
+verb = next(a for a in args if a in ("ls", "cp", "rm", "cat"))
 urls = args[args.index(verb) + 1:]
 def local(url):
     return os.path.join(os.environ["FAKE_BUCKET"], url[len("s3://"):].rsplit("*", 1)[0])
@@ -224,6 +228,11 @@ if verb == "ls":
 elif verb == "rm":
     for k in keys(urls[0]):
         os.remove(os.path.join(local(urls[0]), k))
+elif verb == "cat":
+    if not os.path.isfile(local(urls[0])):
+        sys.exit("ERROR no object found")
+    with open(local(urls[0]), "rb") as f:
+        sys.stdout.buffer.write(f.read())
 else:
     for i, k in enumerate(keys(urls[0])):
         if i == int(os.environ.get("FAKE_COPY_FAILS_AFTER", "-1")):
@@ -233,7 +242,20 @@ else:
             shutil.copyfile(os.path.join(local(urls[0]), k), os.path.join(local(urls[1]), k))
 """
 
-LIVE = {"configurations.json": b'{"build": {"date": "2026-11-20"}}', "planet/full/places.tt.zst": b"unit",
+def template_versions():
+    """The build version and the transport version this run builds (configurations.template.json)."""
+    with open(TEMPLATE) as f:
+        template = json.load(f)
+    return template["build"]["version"], template["transport"]["version"]
+
+
+def live_config(build, transport):
+    """A live build's configurations.json, of `build` version, its one unit of `transport` version (None: no unit)."""
+    units = {} if transport is None else {"planet/full/places.tt.zst": {"kind": "places", "transport_version": transport}}
+    return json.dumps({"build": {"date": "2026-11-20", "version": build}, "units": units}).encode()
+
+
+LIVE = {"configurations.json": live_config(*template_versions()), "planet/full/places.tt.zst": b"unit",
         "planet/full/geo_cells.bin.zst": b"cells", "planet/full/ways.osm_ids": b"ids" * 10}
 
 
@@ -270,10 +292,15 @@ class SeedPreviousTest(unittest.TestCase):
         return found
 
     def run_seed(self, prefix, seed, **fake):
+        """Setup's seed, after its lines that read a patch base's versions, which it checks the seed's against."""
+        versions = re.search(r"^EXPECTED_BUILD_VERSION=.*\n(?:.*\n)*?\}\n", step_script("Setup"), re.M)
         script = block_from(step_script("Setup"), 'if [ "$SEED_PREVIOUS" = true ]; then')
+        self.assertIsNotNone(versions)
         self.assertIsNotNone(script)
+        script = versions.group(0) + script
         env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "S3_PREFIX": prefix, "SEED_PREVIOUS": seed,
                "S3_BUCKET": "bucket", "S3_ENDPOINT": "https://s3.invalid", "PREV_DATE": "2026-11-20",
+               "GITHUB_WORKSPACE": os.path.join(HERE, "..", "..", ".."),
                "FAKE_BUCKET": self.bucket, "FAKE_CALLS": self.calls, **fake}
         open(self.calls, "a").close()
         # As GitHub runs a step that names no shell: bash -e, without pipefail.
@@ -348,6 +375,30 @@ class SeedPreviousTest(unittest.TestCase):
         self.assertIn("no full index", done.stdout)
         self.assertEqual(self.objects("nightly-speed-1121/builds/2026-11-20"), earlier)
         self.assertEqual([c for c in calls if " rm " in c or " cp " in c], [])
+
+    # Nor is one of other versions than this run's: a branch that bumps build.version, a unit of another transport
+    # version (the fetch decodes the units with tonight's geocoder-transport), no unit, or no configurations.json to
+    # say. The run would build fresh from it, not patch: Setup fails before it deletes the scratch prefix's date.
+    def test_a_live_build_of_other_versions_is_no_seed(self):
+        build, transport = template_versions()
+        for name, config in (("build version", live_config(build + 1, transport)),
+                             ("transport version", live_config(build, transport + 1)),
+                             ("no unit", live_config(build, None)), ("no configurations.json", None)):
+            with self.subTest(name):
+                shutil.rmtree(os.path.join(self.bucket, "bucket"))
+                self.put("geocoder/builds/2026-11-20", {k: v for k, v in dict(LIVE, **{"configurations.json": config}).items()
+                                                        if v is not None})
+                earlier = {"planet/full/geo_cells.bin.zst": b"earlier", "configurations.json": b'{"build": {"date": "old"}}'}
+                self.put("nightly-speed-1121/builds/2026-11-20", earlier)
+                if os.path.exists(self.calls):
+                    os.remove(self.calls)
+
+                done, calls = self.run_seed("nightly-speed-1121", "true")
+
+                self.assertNotEqual(done.returncode, 0)
+                self.assertIn("::error::", done.stdout)
+                self.assertEqual(self.objects("nightly-speed-1121/builds/2026-11-20"), earlier)
+                self.assertEqual([c for c in calls if " rm " in c or " cp " in c], [])
 
     def test_it_refuses_the_live_prefix_and_does_nothing_unasked(self):
         done, calls = self.run_seed("geocoder", "true")

@@ -311,6 +311,20 @@ jobs:
           echo "Previous:   $PREV_DATE"
           echo "Server:     $CURRENT_DATE (seq $CURRENT_SEQ, offset: -${DAYS_OFFSET}d)"
 
+          # A patch base's versions, read from the configurations.json of the
+          # build at $1 into PREV_VERSION (its build version) and
+          # PREV_TRANSPORT (its units' transport version): the run patches only
+          # from a build of this one's, the fetch decoding its units with
+          # tonight's geocoder-transport.
+          EXPECTED_BUILD_VERSION=$(jq -r .build.version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
+          EXPECTED_TRANSPORT_VERSION=$(jq -r .transport.version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
+          patch_base_versions() {
+            PREV_CFG=$(s5cmd --endpoint-url $S3_ENDPOINT cat "$1/configurations.json" 2>/dev/null || echo "")
+            PREV_VERSION=$(echo "$PREV_CFG" | jq -r '.build.version // 0' 2>/dev/null || echo 0)
+            # Every unit's transport version, one or none ("" for a build of no units).
+            PREV_TRANSPORT=$(echo "$PREV_CFG" | jq -r '[.units // {} | .[].transport_version] | unique | map(tostring) | join(",")' 2>/dev/null || echo "")
+          }
+
           # A scratch prefix's patch night: the live build of the day before,
           # copied in server side (~30 GB, its sidecars too) for the run to
           # patch from. Never into the live prefix. The date's whole object
@@ -334,6 +348,13 @@ jobs:
               echo "::error::The live build of $PREV_DATE has no full index (planet/full/*.bin.zst) to seed $S3_PREFIX/builds/$PREV_DATE with"
               exit 1
             fi
+            # Nor would one of other versions than this run's (a branch that
+            # bumps build.version, say) be patched from.
+            patch_base_versions "$SEED_FROM"
+            if [ "$PREV_VERSION" != "$EXPECTED_BUILD_VERSION" ] || [ "$PREV_TRANSPORT" != "$EXPECTED_TRANSPORT_VERSION" ]; then
+              echo "::error::The live build of $PREV_DATE is of build_version=$PREV_VERSION, transport_version=${PREV_TRANSPORT:-none} (this run's are $EXPECTED_BUILD_VERSION, $EXPECTED_TRANSPORT_VERSION): no patch base to seed $S3_PREFIX/builds/$PREV_DATE with"
+              exit 1
+            fi
             $SEED_S5 rm "$SEED_TO/*" > /dev/null 2>&1 || true
             $SEED_S5 cp "$SEED_FROM/*" "$SEED_TO/"
             # Each listing whole, or the check fails: two failed ones would
@@ -350,23 +371,15 @@ jobs:
             fi
           fi
 
-          # Check if previous build exists on Tigris with compatible build_version.
+          # Check if previous build exists on Tigris with compatible versions.
           # Look for an index file, not just the directory: dates past the
           # full-index window keep configurations.json beside their patches.
-          # Its transport units must be of this build's transport version too:
-          # the fetch decodes them with tonight's geocoder-transport.
-          EXPECTED_BUILD_VERSION=$(jq -r .build.version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
-          EXPECTED_TRANSPORT_VERSION=$(jq -r .transport.version "$GITHUB_WORKSPACE/geocoder/builder/configurations.template.json")
           PREV_BUILD="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE"
           if [ "$FORCE_FRESH" = "true" ]; then
             echo "has_previous=false" >> "$GITHUB_OUTPUT"
             echo "force_fresh=true requested — building fresh (ignoring $PREV_DATE)"
           elif [ -n "$(s5cmd --endpoint-url $S3_ENDPOINT ls "$PREV_BUILD/planet/full/*.bin.zst" 2>/dev/null)" ]; then
-            # Check build_version in previous configurations.json.
-            PREV_CFG=$(s5cmd --endpoint-url $S3_ENDPOINT cat "$PREV_BUILD/configurations.json" 2>/dev/null || echo "")
-            PREV_VERSION=$(echo "$PREV_CFG" | jq -r '.build.version // 0' 2>/dev/null || echo 0)
-            # Every unit's transport version, one or none ("" for a build of no units).
-            PREV_TRANSPORT=$(echo "$PREV_CFG" | jq -r '[.units // {} | .[].transport_version] | unique | map(tostring) | join(",")' 2>/dev/null || echo "")
+            patch_base_versions "$PREV_BUILD"
             if [ "$PREV_VERSION" = "$EXPECTED_BUILD_VERSION" ] && [ "$PREV_TRANSPORT" = "$EXPECTED_TRANSPORT_VERSION" ]; then
               echo "has_previous=true" >> "$GITHUB_OUTPUT"
               echo "Previous build ($PREV_DATE) found, build_version=$PREV_VERSION, transport_version=$PREV_TRANSPORT — compatible"
