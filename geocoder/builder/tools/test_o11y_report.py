@@ -425,24 +425,38 @@ class NightlyReportTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, root)
         bin_dir = os.path.join(root, "bin")
         os.makedirs(bin_dir)
-        # The report takes 1.5 s, then says what it got.
+        release, slept = os.path.join(root, "release"), os.path.join(root, "slept")
+        # The report runs until it is released (at most 20 s, or until the test's dir is gone), then says what it
+        # got. The wait's sleep marks that it waited and releases it.
         fakes = {"op": "echo s3cret\n",
-                 "python3": '/usr/bin/sleep 1.5\necho "reported $2 with token $O11Y_TOKEN"\n'}
+                 "python3": f'n=0\nuntil [ -e {release} ] || ! [ -d {root} ] || [ $n -ge 400 ]; do '
+                            f'/usr/bin/sleep 0.05; n=$((n + 1)); done\n'
+                            'echo "reported $2 with token $O11Y_TOKEN"\n',
+                 "sleep": f"echo slept >> {slept}\n: > {release}\nexec /usr/bin/sleep 0.05\n"}
         for tool, body in fakes.items():
             with open(os.path.join(bin_dir, tool), "w") as f:
                 f.write("#!/bin/sh\n" + body)
             os.chmod(os.path.join(bin_dir, tool), 0o755)
+        # However the test ends, the report ends before the test's dir goes.
+        status = os.path.join(root, "o11y.status")
+
+        def end_report():
+            open(release, "w").close()
+            deadline = time.time() + 10
+            while time.time() < deadline and not os.path.exists(status):
+                time.sleep(0.05)
+        self.addCleanup(end_report)
         env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "RUNNER_TEMP": root, "WORKDIR": root, "S3_PREFIX": "geocoder",
                "BUILD_DATE": "2026-10-12", "DATA_TIMESTAMP": "2026-10-12T00:00:00Z", "O11Y_URL": "https://o11y.invalid",
                "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1", "OP_SERVICE_ACCOUNT_TOKEN": "t"}
 
-        took, _ = self.run_step("Report to o11y", root, env)
+        self.run_step("Report to o11y", root, env)
 
-        self.assertLess(took, 1.0)
-        self.assertFalse(os.path.exists(os.path.join(root, "o11y.status")))
-        took, out = self.run_step("Wait for the o11y report", root, env)
+        self.assertFalse(os.path.exists(status))
+        self.assertFalse(os.path.exists(slept))
+        _, out = self.run_step("Wait for the o11y report", root, env)
 
-        self.assertGreater(took, 0.3)
+        self.assertTrue(os.path.exists(slept))
         self.assertIn("(exit status 0)", out)
         self.assertIn("reported nightly with token s3cret", out)
 

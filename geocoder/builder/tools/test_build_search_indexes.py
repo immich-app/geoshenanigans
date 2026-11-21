@@ -158,15 +158,22 @@ class PlaceSearchJobTest(unittest.TestCase):
         if build_status is not None and write_status_after is None:
             with open(status, "w") as f:
                 f.write(build_status)
+        # In a session of its own, so that a job past the test's wait ends whole, timeout's process group and
+        # place-search's too, before the test's dir goes.
         job = subprocess.Popen(["bash", JOB, self.out, self.binary, status, str(limit)],
                                env={**os.environ, "TMPDIR": self.tmp.name, **(env or {})},
-                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
         if write_status_after is not None:
             time.sleep(write_status_after)
             with open(status, "w") as f:
                 f.write(build_status)
         start = time.time()
-        out, _ = job.communicate(timeout=120)
+        try:
+            out, _ = job.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            subprocess.run(["pkill", "-KILL", "-s", str(job.pid)])
+            out, _ = job.communicate()
+            self.fail(f"the job ran past 120 s and was ended: {out}")
         return job.returncode, out, time.time() - start
 
     def index_dir(self, region, sel):

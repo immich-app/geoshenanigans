@@ -245,6 +245,16 @@ echo pbf > "$d/$o"
 """
 
 
+def written(path):
+    """The line in the status file at `path` once written whole (`echo $? > path`), else ""."""
+    try:
+        with open(path) as f:
+            text = f.read()
+    except FileNotFoundError:
+        return ""
+    return text if text.endswith("\n") else ""
+
+
 def alive(pid):
     """Whether process `pid` runs (a zombie counts as ended)."""
     try:
@@ -489,15 +499,18 @@ class RustToolchainTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root)
         self.calls = os.path.join(self.root, "calls")
 
-    def fakes(self, rustup_status):
+    def fakes(self, rustup_status, hold=None):
         """A bin dir with a rustup that logs its calls (and, in self.copy_rename, its RUSTUP_PERMIT_COPY_RENAME) and
-        exits `rustup_status`, a cargo that logs its own, and a sleep that doesn't (the install's retries wait 30 s)."""
+        exits `rustup_status`, with `hold` (a path) once that file exists (or the test's dir is gone, at most 30 s);
+        a cargo that logs its own, and a sleep that doesn't (the install's retries wait 30 s)."""
         bin_dir = os.path.join(self.root, "cargo", "bin")
         os.makedirs(bin_dir, exist_ok=True)
         self.copy_rename = os.path.join(self.root, "copy_rename")
+        wait = (f'n=0\nuntil [ -e {hold} ] || ! [ -d {self.root} ] || [ $n -ge 600 ]; do /usr/bin/sleep 0.05; '
+                f'n=$((n + 1)); done\n' if hold else "")
         for tool, body in {"rustup": f'echo "rustup $*" >> {self.calls}\n'
                                      f'echo "$*: ${{RUSTUP_PERMIT_COPY_RENAME-unset}}" >> {self.copy_rename}\n'
-                                     f'exit {rustup_status}\n',
+                                     + wait + f'exit {rustup_status}\n',
                            "cargo": f'echo "cargo $*" >> {self.calls}\n', "sleep": "exit 0\n"}.items():
             with open(os.path.join(bin_dir, tool), "w") as f:
                 f.write("#!/bin/sh\n" + body)
@@ -541,18 +554,37 @@ class RustToolchainTest(unittest.TestCase):
         self.assertEqual(len(self.logged()), 5)
         self.assertEqual(self.read("rust-toolchain.status"), "1")
 
-    def build_place_search(self, rustup_status):
-        """Runs Build place search with the fakes; returns once both statuses are written."""
-        env = {"PATH": os.environ["PATH"], "CARGO_HOME": os.path.dirname(self.fakes(rustup_status)),
-               "RUNNER_TEMP": self.root, "HOME": self.root}
-        start = time.time()
-        subprocess.run(["bash", "-e", "-c", step_script("Build place search")], env=env, cwd=os.path.join(HERE, "..", "..", ".."),
-                       check=True, capture_output=True, timeout=60)
-        self.assertLess(time.time() - start, 10)
-        deadline = time.time() + 30
-        while time.time() < deadline and not all(os.path.exists(os.path.join(self.root, n)) and self.read(n)
-                                                 for n in ("rust-toolchain.status", "search.status")):
+    def statuses_written(self, seconds=30):
+        """Whether both statuses are written within `seconds`."""
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if all(os.path.exists(os.path.join(self.root, n)) and self.read(n)
+                   for n in ("rust-toolchain.status", "search.status")):
+                return True
             time.sleep(0.05)
+        return False
+
+    def build_place_search(self, rustup_status):
+        """Runs Build place search with the fakes, rustup held until the step has returned with the install under
+        way and nothing built; returns once both statuses are written."""
+        release = os.path.join(self.root, "release")
+        # However the test ends, the job ends before the test's dir goes.
+        self.addCleanup(lambda: (open(release, "w").close(), self.statuses_written()))
+        env = {"PATH": os.environ["PATH"], "CARGO_HOME": os.path.dirname(self.fakes(rustup_status, hold=release)),
+               "RUNNER_TEMP": self.root, "HOME": self.root}
+        try:
+            subprocess.run(["bash", "-e", "-c", step_script("Build place search")], env=env,
+                           cwd=os.path.join(HERE, "..", "..", ".."), check=True, capture_output=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail("the step waited for the toolchain's install")
+        deadline = time.time() + 10
+        while time.time() < deadline and not any(c.startswith("rustup toolchain install") for c in self.logged()):
+            time.sleep(0.05)
+        self.assertEqual(self.logged(), ["rustup toolchain install stable --profile minimal --no-self-update"])
+        self.assertFalse(os.path.exists(os.path.join(self.root, "rust-toolchain.status")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "search.status")))
+        open(release, "w").close()
+        self.assertTrue(self.statuses_written())
         return self.read("rust-toolchain.status"), self.read("search.status")
 
     def test_the_toolchain_installs_in_the_background_before_the_place_search_build(self):
@@ -662,7 +694,18 @@ class PostBuildTest(unittest.TestCase):
         os.makedirs(tools)
         os.makedirs(work)
         release = os.path.join(root, "release")
-        self.addCleanup(lambda: open(release, "w").close())
+        status = os.path.join(work, "place-search.status")
+
+        # Registered after the dir's removal, so run before it: the job is released, and ended if it doesn't end.
+        def end_job():
+            open(release, "w").close()
+            deadline = time.time() + 10
+            while time.time() < deadline and not os.path.exists(status):
+                time.sleep(0.05)
+            if not os.path.exists(status) and os.path.exists(os.path.join(work, "place-search.pid")):
+                with open(os.path.join(work, "place-search.pid")) as f:
+                    subprocess.run(["pkill", "-KILL", "-s", f.read().strip()])
+        self.addCleanup(end_job)
         with open(os.path.join(tools, "place_search_indexes.sh"), "w") as f:
             f.write(f'#!/bin/sh\necho "$@" > {root}/args\nuntil [ -e {release} ]; do /usr/bin/sleep 0.05; done\nexit 3\n')
         os.chmod(os.path.join(tools, "place_search_indexes.sh"), 0o755)
@@ -677,15 +720,17 @@ class PostBuildTest(unittest.TestCase):
 
         with open(os.path.join(work, "place-search.pid")) as f:
             session = f.read().strip()
+        # The job is in its session once the script it runs has started.
+        deadline = time.time() + 10
+        while time.time() < deadline and not os.path.exists(os.path.join(root, "args")):
+            time.sleep(0.05)
         self.assertEqual(subprocess.run(["pgrep", "-s", session], capture_output=True).returncode, 0)
-        self.assertFalse(os.path.exists(os.path.join(work, "place-search.status")))
+        self.assertFalse(os.path.exists(status))
         open(release, "w").close()
         deadline = time.time() + 10
-        while time.time() < deadline and not os.path.exists(os.path.join(work, "place-search.status")):
+        while time.time() < deadline and not written(status):
             time.sleep(0.05)
-        time.sleep(0.1)
-        with open(os.path.join(work, "place-search.status")) as f:
-            self.assertEqual(f.read().strip(), "3")
+        self.assertEqual(written(status), "3\n")
         with open(os.path.join(root, "args")) as f:
             self.assertEqual(f.read().split(), [os.path.join(work, "output"),
                                                 os.path.join(root, "ws", "geocoder/search/target/release/place-search"),
