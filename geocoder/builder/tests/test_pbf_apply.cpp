@@ -483,10 +483,22 @@ TEST(apply_leaves_the_output_in_the_page_cache_in_place_of_the_input) {
     int fd = open(opt.input.c_str(), O_RDONLY);
     REQUIRE(fd >= 0);
     fsync(fd);
+    // A file system that keeps what is dropped (an overlay on a tmpfs, say,
+    // which resident_share can't tell from a disk) keeps the input cached
+    // whatever the run asks: the test asks first, and skips there. The input
+    // is then read back into the cache, for the run to drop.
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
     close(fd);
+    const double dropped = resident_share(opt.input);
+    file_bytes(opt.input);
     double before = resident_share(opt.input);
     if (before <= 0) {
         std::printf("    SKIP apply_leaves_the_output_in_the_page_cache_in_place_of_the_input: page cache not visible here\n");
+        return;
+    }
+    if (dropped != 0.0) {
+        std::printf("    SKIP apply_leaves_the_output_in_the_page_cache_in_place_of_the_input: the page cache keeps what is "
+                    "dropped here\n");
         return;
     }
     std::string change = dir.path() + "/c.osc";
