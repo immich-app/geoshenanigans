@@ -608,6 +608,25 @@ class PostBuildTest(unittest.TestCase):
         self.assertLess(script.index('[ -s "$WORKDIR/sidecars.status" ]'), script.index("cp --if-size-differ"))
         self.assertIn("Caching today's PBF ended at $(date -u -r \"$WORKDIR/pbf-cache.status\" +%H:%M:%S)", script)
 
+    # On a live run Finalize lets today's PBF reach the cache (tomorrow's run starts from it) before it frees the
+    # disk. A scratch run's, under its own key, it leaves to Cleanup old cache bucket, which waits for it a bounded
+    # time and then stops it: a wait without end here would hold the job to its timeout, and skip that cleanup.
+    def test_finalize_waits_for_a_live_runs_pbf_upload_alone(self):
+        name = "Finalize upload and configurations.json"
+        self.assertIn("PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}", step(name))
+        block = block_at(step_script(name), 'if [ -f "$WORKDIR/pbf-cache.log" ] && [ "$PBF_CACHE" = geocoder-cache ]; then')
+        for pbf_cache, waits in (("geocoder-cache", True), ("geocoder-scratch/nightly-speed-1121", False)):
+            with self.subTest(pbf_cache=pbf_cache):
+                took, out = self.wait_for(': > "$WORKDIR/pbf-cache.log"\n' + block, "pbf-cache.status",
+                                          env={"PBF_CACHE": pbf_cache})
+
+                if waits:
+                    self.assertGreaterEqual(took, 0.9)
+                    self.assertIn("Caching today's PBF ended at", out)
+                else:
+                    self.assertLess(took, 0.9)
+                    self.assertNotIn("Caching today's PBF", out)
+
     # The step only starts the job: it returns while the job runs, leaves the job's session for Compress index
     # files, and the job's exit status comes once it ends.
     def test_the_place_search_step_returns_while_its_job_runs(self):

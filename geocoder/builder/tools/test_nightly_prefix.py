@@ -104,6 +104,10 @@ class FakeS5cmd:
             return f.read().splitlines()
 
 
+# The cache bucket's multipart uploads left over a day aborted, as Cleanup old cache bucket asks.
+ABORT = "python3 /ws/geocoder/builder/tools/abort_stale_uploads.py http://cache.invalid cache us-east-1"
+
+
 class ScratchPbfCacheTest(unittest.TestCase):
     """A scratch prefix's run keeps off the PBF cache the nightly reads: it never takes today's PBF from there (so
     it applies the diff, and can run after the nightly), writes its own PBF under a key of its own and deletes it
@@ -155,25 +159,29 @@ class ScratchPbfCacheTest(unittest.TestCase):
         self.output = done.stdout
         return s5.logged()
 
+    # It deletes its own key and prunes no shared PBF. The bucket's multipart uploads past a day go (no run lasts
+    # one), so that a stopped upload's parts are reclaimed though no live run cleans that bucket.
     def test_a_scratch_run_deletes_its_own_key_and_nothing_else(self):
         calls = self.run_cleanup("geocoder-scratch/nightly-speed-1121")
 
         self.assertEqual(calls, ["s5cmd --endpoint-url http://cache.invalid --retry-count 5 --numworkers 15 "
-                                 "rm s3://cache/geocoder-scratch/nightly-speed-1121/*"])
+                                 "rm s3://cache/geocoder-scratch/nightly-speed-1121/*", ABORT])
 
     # Its PBF upload ends first: a copy that finished after the delete would put the PBF back.
     def test_a_scratch_run_deletes_its_own_key_once_its_upload_ended(self):
         calls = self.run_cleanup("geocoder-scratch/nightly-speed-1121", upload_seconds=0.5)
 
         self.assertEqual(calls, ["s5cmd --endpoint-url http://cache.invalid --retry-count 5 --numworkers 15 "
-                                 "rm s3://cache/geocoder-scratch/nightly-speed-1121/*", "  upload ended"])
+                                 "rm s3://cache/geocoder-scratch/nightly-speed-1121/*", "  upload ended",
+                                 ABORT, "  upload ended"])
 
-    # An upload past the wait is stopped, and gone, before the delete.
+    # An upload past the wait is stopped, and gone, before the delete; its parts go with the stale uploads.
     def test_a_scratch_run_stops_an_upload_that_outlasts_the_wait_before_the_delete(self):
         calls = self.run_cleanup("geocoder-scratch/nightly-speed-1121", upload_seconds=300)
 
         self.assertEqual(calls, ["s5cmd --endpoint-url http://cache.invalid --retry-count 5 --numworkers 15 "
-                                 "rm s3://cache/geocoder-scratch/nightly-speed-1121/*", "  upload ended"])
+                                 "rm s3://cache/geocoder-scratch/nightly-speed-1121/*", "  upload ended",
+                                 ABORT, "  upload ended"])
         self.assertIn("stopping it", self.output)
 
     def test_a_live_run_prunes_the_shared_key_and_aborts_its_stale_uploads(self):
@@ -181,7 +189,7 @@ class ScratchPbfCacheTest(unittest.TestCase):
 
         self.assertIn("s5cmd --endpoint-url http://cache.invalid --retry-count 5 --numworkers 15 "
                       "ls s3://cache/geocoder-cache/planet-*.osm.pbf", calls)
-        self.assertTrue([c for c in calls if c.startswith("python3 /ws/geocoder/builder/tools/abort_stale_uploads.py")])
+        self.assertEqual(calls[-1], ABORT)
 
 
 # s5cmd over a bucket of files under $FAKE_BUCKET (s3://<bucket>/<key> is $FAKE_BUCKET/<bucket>/<key>): ls, cp and
