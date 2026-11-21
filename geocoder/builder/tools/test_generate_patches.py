@@ -62,6 +62,10 @@ FAKE_DIFF = FAKE_JOB + """\
 if args[0] == "--logical-size":
     if args[1] not in scenario["logical"]:
         sys.exit("no footer in " + args[1])
+    start = time.time()
+    time.sleep(scenario.get("size_hold", 0))
+    with open(scenario["sized"], "a") as f:
+        f.write(json.dumps([args[1], start, time.time()]) + "\\n")
     print(*scenario["logical"][args[1]])
     sys.exit(0)
 variant = os.path.relpath(args[1], scenario["new_root"])
@@ -105,6 +109,7 @@ class Night:
         # What the fake tools read: where they leave their marks and events, what --logical-size answers for
         # each dir, which job waits to meet which, how long each holds, and how long one waits to meet another.
         self.scenario = {"marks": self.root, "events": os.path.join(self.root, "events.jsonl"),
+                         "sized": os.path.join(self.root, "sized.jsonl"),
                          "new_root": self.new_root, "logical": {}, "raw": {}, "meet": {}, "hold": {}, "patience": 10}
         for d in ("started", "ended", "scratch"):
             os.makedirs(os.path.join(self.root, d))
@@ -147,7 +152,7 @@ class Night:
                 env[name] = str(value)
         done = subprocess.run(["bash", os.path.join(HERE, "generate_patches.sh"), self.old_root, self.new_root,
                                self.results, self.logs], env=env, check=True, capture_output=True, text=True)
-        self.stdout = done.stdout
+        self.stdout, self.stderr = done.stdout, done.stderr
         self.events = {}
         if os.path.exists(self.scenario["events"]):
             for line in read(self.scenario["events"]).splitlines():
@@ -377,6 +382,75 @@ class GeneratePatchesTest(unittest.TestCase):
         self.assertEqual(night.mismatches("r/bad"), "geocoder-diff --logical-size failed: no footer in %s\n" % night.new("r/bad"))
         self.assertNotIn("diff:r/bad", night.events)
         self.assertEqual(night.result("r/good")[0], "PASS")
+
+    # Each job's start, with what it holds and what the running jobs hold, and its end, timestamped on stderr:
+    # the order the last variants end in is in the step's log.
+    def test_each_job_logs_its_start_and_end(self):
+        night = Night(self, ["r/a", "r/b"])
+        night.sizes("r/a", 1, 1)
+        night.sizes("r/b", 2, 1)
+
+        night.run()
+
+        lines = re.findall(r"(?m)^\[\d\d:\d\d:\d\d\] (start|end) (diff|verify) (\S+?):? (.*)$", night.stderr)
+        events = [(what, stage, variant) for what, stage, variant, _ in lines]
+        for variant in ("r/a", "r/b"):
+            for stage in ("diff", "verify"):
+                self.assertEqual(events.count(("start", stage, variant)), 1, night.stderr)
+                self.assertEqual(events.count(("end", stage, variant)), 1, night.stderr)
+                self.assertLess(events.index(("start", stage, variant)), events.index(("end", stage, variant)))
+            self.assertLess(events.index(("end", "diff", variant)), events.index(("start", "verify", variant)))
+        weight = re.search(r"(?m)^r/b: diff (\d+) KiB of memory and (\d+) KiB of scratch", night.stdout)
+        for what, stage, variant, rest in lines:
+            if what == "end":
+                self.assertRegex(rest, r"^after \d+s$")
+            elif stage == "diff":
+                self.assertRegex(rest, r"^\d+ KiB of memory and \d+ KiB of scratch \(running: \d+ jobs?, "
+                                       r"\d+ KiB of memory, \d+ KiB of scratch\)$")
+            else:
+                self.assertRegex(rest, r"^\d+ KiB of scratch \(running: \d+ jobs?, \d+ KiB of memory, \d+ KiB of scratch\)$")
+        start_b = next(rest for what, stage, variant, rest in lines if (what, stage, variant) == ("start", "diff", "r/b"))
+        self.assertTrue(start_b.startswith(f"{weight[1]} KiB of memory and {weight[2]} KiB of scratch"), start_b)
+
+    # The estimates (two geocoder-diff --logical-size a variant, ~0.1 s each on a planet night) run side by side,
+    # and still print a line a variant, in order.
+    @unittest.skipUnless(at_least_two_jobs_at_once(), "the script runs one job a core")
+    def test_the_variants_are_sized_side_by_side(self):
+        night = Night(self, ["r/a", "r/b", "r/c", "r/d"])
+        night.scenario["size_hold"] = 0.5
+
+        night.run()
+
+        sized = [json.loads(line) for line in read(night.scenario["sized"]).splitlines()]
+        self.assertEqual(len(sized), 8)
+        self.assertTrue(any(a[1] < b[2] and b[1] < a[2] for i, a in enumerate(sized) for b in sized[i + 1:]), sized)
+        self.assertEqual([line.split(":")[0] for line in night.stdout.splitlines()], ["r/a", "r/b", "r/c", "r/d"])
+        for variant in ("r/a", "r/b", "r/c", "r/d"):
+            self.assertEqual(night.result(variant)[0], "PASS")
+
+    # What the caller's other jobs hold beside the patches comes off the budget: two diffs of 129 MiB that run
+    # side by side in 300 MiB take turns when 150 MiB of it is held elsewhere.
+    def test_the_memory_reserve_comes_off_the_budget(self):
+        night = Night(self, ["r/a", "r/b"])
+        night.sizes("r/a", 512, 1)
+        night.sizes("r/b", 512, 1)
+        night.scenario["hold"] = {"diff:r/a": 0.3, "diff:r/b": 0.3}
+
+        night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=300 * MIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=8 * GIB,
+                  GEOCODER_PATCH_MEM_RESERVE_KIB=150 * MIB)
+
+        self.assert_the_diffs_took_turns(night)
+
+    @unittest.skipUnless(at_least_two_jobs_at_once(), "the script runs one job a core")
+    def test_without_the_memory_reserve_the_same_diffs_run_side_by_side(self):
+        night = Night(self, ["r/a", "r/b"])
+        night.sizes("r/a", 512, 1)
+        night.sizes("r/b", 512, 1)
+        night.scenario["meet"] = {"diff:r/a": "diff:r/b", "diff:r/b": "diff:r/a"}
+
+        night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=300 * MIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=8 * GIB)
+
+        self.assertTrue(night.events["diff:r/a"]["met"] or night.events["diff:r/b"]["met"])
 
     # A fresh build has no old day: nothing is sized, diffed or verified.
     def test_a_variant_without_an_old_day_is_skipped_unsized(self):

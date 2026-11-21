@@ -12,8 +12,12 @@
 # byte (verify_patch.sh). Writes one result file per variant to
 # <results-dir>/<variant with / as _>:
 #   SKIP | PASS <files> <patch KiB> | FAIL <problems> <files> <patch KiB>
-# plus <name>.mismatches on failure. Diff and patch logs go to <log-dir>, and
-# each variant's estimates, a line a variant, to stdout.
+# plus <name>.mismatches on failure. Diff and patch logs go to <log-dir>,
+# each variant's estimates, a line a variant, to stdout, and each job's start
+# (with what it holds and what the running jobs hold) and end, timestamped,
+# to stderr. The estimates are made for every variant at once, nproc at a
+# time: two --logical-size reads a variant, ~20 s one after another on a
+# planet night.
 #
 # Jobs start largest first and only while their estimated peak memory fits:
 # 9/8 × the bytes a diff maps for its old + new record files, plus 4 × the
@@ -49,6 +53,8 @@
 # Env: GEOCODER_DIFF, GEOCODER_PATCH (default: on PATH).
 #   GEOCODER_PATCH_MEM_BUDGET_KIB: the memory budget, in place of the 3/4 of
 #     what is available.
+#   GEOCODER_PATCH_MEM_RESERVE_KIB: memory the caller's other jobs hold
+#     beside these, taken off the budget (default 0).
 #   GEOCODER_PATCH_SCRATCH_FREE_KIB: the scratch volume's free space, in
 #     place of reading it: the jobs' needs are then counted against this
 #     figure alone.
@@ -147,6 +153,7 @@ else
   if [ -n "$cgroup_kib" ] && [ "$cgroup_kib" -lt "$budget_kib" ]; then budget_kib=$cgroup_kib; fi
   budget_kib=$(( budget_kib * 3 / 4 ))
 fi
+budget_kib=$(( budget_kib - ${GEOCODER_PATCH_MEM_RESERVE_KIB:-0} ))
 max_jobs=$(nproc)
 
 # The scratch volume's free space at this moment, in KiB.
@@ -209,31 +216,55 @@ verify_variant() {
   rm -rf "$work"
 }
 
-# Each variant's estimates, in KiB: weight, its diff's peak memory;
-# diff_scratch and verify_scratch, what its diff and its verify write to
-# scratch.
-declare -A weight=() diff_scratch=() verify_scratch=()
-for variant in $(cd "$new_root" && find . -name '*.bin' -printf '%h\n' | sed 's|^\./||' | sort -u); do
-  new_dir="$new_root/$variant" old_dir="$old_root/$variant"
-  log="$log_dir/${variant//\//_}.log"
+# A variant's estimates, in KiB, written to $2 as "weight diff_scratch
+# verify_scratch": weight, its diff's peak memory; diff_scratch and
+# verify_scratch, what its diff and its verify write to scratch. Nothing for a
+# variant that skips or can't be sized, whose result it writes.
+estimate_variant() {
+  local variant=$1 to=$2 old_sizes new_sizes old_mapped old_scratch new_mapped new_scratch
+  local new_dir="$new_root/$variant" old_dir="$old_root/$variant"
+  local log="$log_dir/${variant//\//_}.log"
   # Only a fresh build (no previous output at all) skips. A file-count change
   # with a previous build present is a real diff the tools must reproduce.
   if [ "$(bin_count "$new_dir")" -lt 2 ] || [ "$(bin_count "$old_dir")" -eq 0 ]; then
     echo "SKIP" > "$results_dir/${variant//\//_}"
-    continue
+    return
   fi
   if ! old_sizes=$(logical_sizes "$old_dir" 2> "$log") || ! new_sizes=$(logical_sizes "$new_dir" 2>> "$log"); then
     fail_variant "$variant" 0 "geocoder-diff --logical-size failed: $(tail -1 "$log")"
-    continue
+    return
   fi
   read -r old_mapped old_scratch <<< "$old_sizes"
   read -r new_mapped new_scratch <<< "$new_sizes"
-  weight[$variant]=$(( $(side_weight_kib "$old_dir" "$old_mapped") + $(side_weight_kib "$new_dir" "$new_mapped") ))
-  diff_scratch[$variant]=$(( $(kib_of "$old_scratch") + $(kib_of "$new_scratch") ))
-  verify_scratch[$variant]=$(( $(kib_of "$(client_bytes "$new_dir")") + patcher_scratch_kib ))
+  echo "$(( $(side_weight_kib "$old_dir" "$old_mapped") + $(side_weight_kib "$new_dir" "$new_mapped") ))" \
+    "$(( $(kib_of "$old_scratch") + $(kib_of "$new_scratch") ))" \
+    "$(( $(kib_of "$(client_bytes "$new_dir")") + patcher_scratch_kib ))" > "$to"
+}
+
+# Every variant sized at once, nproc at a time, then read in in order.
+declare -A weight=() diff_scratch=() verify_scratch=()
+variants=($(cd "$new_root" && find . -name '*.bin' -printf '%h\n' | sed 's|^\./||' | sort -u))
+estimates=$(mktemp -d "$scratch_root/estimates-XXXXXX")
+sizing=0
+for variant in "${variants[@]}"; do
+  if [ "$sizing" -ge "$max_jobs" ]; then
+    wait -n
+    sizing=$((sizing - 1))
+  fi
+  estimate_variant "$variant" "$estimates/${variant//\//_}" &
+  sizing=$((sizing + 1))
+done
+wait
+for variant in "${variants[@]}"; do
+  [ -s "$estimates/${variant//\//_}" ] || continue
+  read -r "weight[$variant]" "diff_scratch[$variant]" "verify_scratch[$variant]" < "$estimates/${variant//\//_}"
   echo "$variant: diff ${weight[$variant]} KiB of memory and ${diff_scratch[$variant]} KiB of scratch," \
     "verify ${verify_scratch[$variant]} KiB of scratch"
 done
+rm -rf "$estimates"
+
+# A job's start or end, timestamped, on stderr.
+log_job() { echo "[$(date -u +%H:%M:%S)] $*" >&2; }
 
 # Queues the verify of a variant whose diff ended, its scratch need raised by
 # the decompressed patch: the "Uncompressed patch: N bytes" line of the diff's
@@ -246,9 +277,9 @@ queue_verify() {
 }
 
 # running: pid -> memory weight held (verifies hold none); held: pid ->
-# scratch held; stage/name: what it runs. A diff that ends queues its
-# variant's verify.
-declare -A running=() held=() stage=() name=()
+# scratch held; stage/name: what it runs; began: when. A diff that ends
+# queues its variant's verify.
+declare -A running=() held=() stage=() name=() began=()
 running_kib=0
 held_kib=0
 
@@ -281,8 +312,10 @@ while [ $next -lt ${#pending[@]} ] || [ ${#verifies[@]} -gt 0 ] || [ ${#running[
         continue
         ;;
     esac
+    log_job "start verify $variant: ${verify_scratch[$variant]} KiB of scratch" \
+      "(running: ${#running[@]} jobs, $running_kib KiB of memory, $held_kib KiB of scratch)"
     verify_variant "$variant" &
-    running[$!]=0; held[$!]=${verify_scratch[$variant]}; stage[$!]=verify; name[$!]=$variant
+    running[$!]=0; held[$!]=${verify_scratch[$variant]}; stage[$!]=verify; name[$!]=$variant; began[$!]=$SECONDS
     held_kib=$((held_kib + verify_scratch[$variant]))
     verifies=("${verifies[@]:1}")
   done
@@ -300,8 +333,10 @@ while [ $next -lt ${#pending[@]} ] || [ ${#verifies[@]} -gt 0 ] || [ ${#running[
         continue
         ;;
     esac
+    log_job "start diff $variant: $w KiB of memory and ${diff_scratch[$variant]} KiB of scratch" \
+      "(running: ${#running[@]} jobs, $running_kib KiB of memory, $held_kib KiB of scratch)"
     diff_variant "$variant" &
-    running[$!]=$w; held[$!]=${diff_scratch[$variant]}; stage[$!]=diff; name[$!]=$variant
+    running[$!]=$w; held[$!]=${diff_scratch[$variant]}; stage[$!]=diff; name[$!]=$variant; began[$!]=$SECONDS
     running_kib=$((running_kib + w))
     held_kib=$((held_kib + diff_scratch[$variant]))
     next=$((next + 1))
@@ -316,15 +351,17 @@ while [ $next -lt ${#pending[@]} ] || [ ${#verifies[@]} -gt 0 ] || [ ${#running[
     # the budgets.
     wait "${!running[@]}"
     for pid in "${!running[@]}"; do
+      log_job "end ${stage[$pid]} ${name[$pid]} after $((SECONDS - began[$pid]))s"
       [ "${stage[$pid]}" = diff ] && queue_verify "${name[$pid]}"
     done
-    running=(); held=(); stage=(); name=()
+    running=(); held=(); stage=(); name=(); began=()
     running_kib=0
     held_kib=0
     continue
   fi
+  log_job "end ${stage[$finished]} ${name[$finished]} after $((SECONDS - began[$finished]))s"
   running_kib=$((running_kib - running[$finished]))
   held_kib=$((held_kib - held[$finished]))
   [ "${stage[$finished]}" = diff ] && queue_verify "${name[$finished]}"
-  unset "running[$finished]" "held[$finished]" "stage[$finished]" "name[$finished]"
+  unset "running[$finished]" "held[$finished]" "stage[$finished]" "name[$finished]" "began[$finished]"
 done
