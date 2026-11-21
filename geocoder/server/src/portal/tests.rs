@@ -576,6 +576,45 @@ async fn a_manifest_naming_a_path_or_a_name_the_sync_cant_keep_in_its_build_dir_
     assert_eq!(got, Err(format!("the dataset id {id:?} is not a plain name")));
 }
 
+// A manifest whose constraint names an axis or a value its axes don't
+// have (which would rule out nothing, or everything it is meant to
+// allow), or whose preset has another preset's id or a selection's (which
+// dataset= would take for another dataset than it names), can't be
+// planned, and says why.
+#[tokio::test]
+async fn a_manifest_whose_constraints_or_presets_name_what_it_lacks_or_shares_cant_be_planned() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let constraint = template()["constraints"][0]["id"].as_str().unwrap().to_string();
+    for (key, axis, value, why) in [
+        ("when", "mode", "admin-minimum", "the mode value \"admin-minimum\", which the manifest's mode axis doesn't have"),
+        ("when", "modes", "admin-minimal", "the axis \"modes\", which the manifest doesn't have"),
+        ("requires", "quality", "simple", "the quality value \"simple\", which the manifest's quality axis doesn't have"),
+        ("requires", "qualities", "simplified", "the axis \"qualities\", which the manifest doesn't have"),
+    ] {
+        let got = plan_edited(&bucket, |m| {
+            let mut values = serde_json::Map::new();
+            values.insert(axis.to_string(), value.into());
+            m["constraints"][0][key] = values.into();
+        })
+        .await
+        .map(|_| ());
+        assert_eq!(got, Err(format!("constraint {constraint} names {why}")), "{key} {axis} {value}");
+    }
+
+    let twice = plan_edited(&bucket, |m| {
+        let mut again = m["presets"][0].clone();
+        again["selections"]["mode"] = "full".into();
+        m["presets"].as_array_mut().unwrap().push(again);
+    })
+    .await
+    .map(|_| ());
+    assert_eq!(twice, Err("two presets have the id smallest".to_string()));
+    for id in ["full.exact.none", "admin.simplified.major", "admin-minimal.exact.none"] {
+        let got = plan_edited(&bucket, |m| m["presets"][1]["id"] = id.into()).await.map(|_| ());
+        assert_eq!(got, Err(format!("preset {id} has the id of a selection, which dataset= names as such")), "{id}");
+    }
+}
+
 // A build whose manifest names a path out of its build dir is refused,
 // with why: nothing of it is fetched or written, and the build served
 // stays.

@@ -6,7 +6,7 @@
 // /datasets lists the combinations they exclude, with each one's message and
 // what it requires, for the page to grey out.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::Deserialize;
 
@@ -227,9 +227,11 @@ fn broken<'a>(manifest: &'a Manifest, sel: &RegionSelection) -> Option<&'a Const
 /// the dataset's dir), one it serves doesn't resolve
 /// (downloader::resolve_files), lacks a file the manifest must have or
 /// takes a file, a unit or a unit's member at a path the sync can't keep in
-/// a build dir (check_path), a preset of a region served names a selection
-/// it doesn't serve, or no preset is DEFAULT_PRESET: the build can't be
-/// served as the portal serves one.
+/// a build dir (check_path), a constraint names an axis or a value the
+/// manifest's axes don't have, a preset of a region served names a
+/// selection it doesn't serve or has another such preset's id or a
+/// selection's, or no preset is DEFAULT_PRESET: the build can't be served
+/// as the portal serves one.
 pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
     let mut axes = Vec::new();
     for name in std::iter::once("region").chain(AXES) {
@@ -249,6 +251,19 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
     for (axis, values) in AXES.iter().zip([&modes, &qualities, &tiers]) {
         if let Some((value, _)) = values.iter().find(|(value, _)| !plain_value(value)) {
             return Err(format!("the manifest's {axis} value {value:?} is not a plain name (letters, digits, '-' and '_')"));
+        }
+    }
+    // A constraint names the manifest's axes and their values alone: one
+    // of another name would never match, and rule out what it shouldn't,
+    // or nothing.
+    for c in &manifest.constraints {
+        for (axis, value) in c.when.iter().chain(&c.requires) {
+            let Some(of) = manifest.axes.get(axis) else {
+                return Err(format!("constraint {} names the axis {axis:?}, which the manifest doesn't have", c.id));
+            };
+            if !of.values.contains_key(value) {
+                return Err(format!("constraint {} names the {axis} value {value:?}, which the manifest's {axis} axis doesn't have", c.id));
+            }
         }
     }
     let (mut datasets, mut excluded) = (Vec::new(), Vec::new());
@@ -336,6 +351,17 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
             d.description = preset.description.clone();
         }
         presets.push((preset.clone(), at));
+    }
+    // A preset's id names it alone (Plan::find takes a preset's before a
+    // selection's): no other preset's, and no selection's.
+    let mut ids = BTreeSet::new();
+    for (preset, _) in &presets {
+        if !ids.insert(preset.id.as_str()) {
+            return Err(format!("two presets have the id {}", preset.id));
+        }
+        if datasets.iter().any(|d| d.id == preset.id) || excluded.iter().any(|x| x.id == preset.id) {
+            return Err(format!("preset {} has the id of a selection, which dataset= names as such", preset.id));
+        }
     }
     let default = presets.iter().find(|(p, _)| p.id == DEFAULT_PRESET).map(|(_, at)| *at)
         .ok_or_else(|| format!("the manifest has no preset {DEFAULT_PRESET}, which the portal answers without dataset="))?;
