@@ -34,11 +34,11 @@
 // round in which it disagrees with the manifest's fails, to be tried
 // again. A query-portal holds the data dir's lock (VOLUME_LOCK) for as long
 // as it runs, so that no other process prunes its builds, and every round
-// runs under one lock (LOCK); the first of a process serves the newest
-// local build that checks out and loads, before it asks the bucket
-// anything: none is served before its files check out. A build the data
-// dir holds complete is served again from its dir (latest.json moved back
-// to it) once it checks out, not fetched. The prune keeps the build
+// runs under one lock (LOCK); the first of a process to take it serves
+// the newest local build that checks out and loads, before it asks the
+// bucket anything: none is served before its files check out. A build the
+// data dir holds complete is served again from its dir (latest.json moved
+// back to it) once it checks out, not fetched. The prune keeps the build
 // served, the one served before it and the dir of the latest build a sync
 // left part way.
 
@@ -439,22 +439,29 @@ impl Portal {
         self.unusable.lock().unwrap_or_else(|e| e.into_inner()).insert(dir.to_string());
     }
 
+    /// Forgets that the build dir `dir` can't be served, once it is gone: a
+    /// dir made anew under its name is another.
+    fn forget_unusable(&self, dir: &str) {
+        self.unusable.lock().unwrap_or_else(|e| e.into_inner()).remove(dir);
+    }
+
     fn running(&self, what: String) {
         eprintln!("portal sync: {what}");
         self.set_status(|s| s.running = Some(what));
     }
 
     /// Runs the rounds for good, a round every interval (retry_after once
-    /// one failed). A round that panics is a round that failed.
+    /// one failed). A round that panics is a round that failed. Each round
+    /// is the first (round) until one has run the start: one that failed on
+    /// its lock has not.
     pub async fn run(self: Arc<Self>) {
-        let mut first = true;
         loop {
             self.set_status(|s| {
                 s.running = Some("starting".to_string());
                 s.last_started = Some(iso(SystemTime::now()));
                 s.next_round = None;
             });
-            let me = self.clone();
+            let (me, first) = (self.clone(), !self.started.load(std::sync::atomic::Ordering::SeqCst));
             let outcome = tokio::spawn(async move { me.round(first).await }).await;
             let (result, wait) = match outcome {
                 Ok(Ok(done)) => (format!("ok: {done}"), self.config.interval),
@@ -469,7 +476,6 @@ impl Portal {
                 s.last_result = Some(result);
                 s.next_round = Some(iso(SystemTime::now() + wait));
             });
-            first = false;
             tokio::time::sleep(wait).await;
         }
     }
@@ -481,6 +487,7 @@ impl Portal {
         let _lock = self.lock().await?;
         if first {
             self.start().await;
+            self.started.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         let synced = self.sync().await;
         self.prune().await;
@@ -955,7 +962,7 @@ impl Portal {
     /// the round fetched its configurations.json, of that manifest, not one
     /// of the build published before it under its date; or of any while the
     /// latest build is not known (a first round that couldn't ask the
-    /// bucket).
+    /// bucket). Each dir it removes it forgets it found unusable.
     async fn prune(&self) {
         let dirs = match self.list() {
             Ok(dirs) => dirs,
@@ -991,7 +998,7 @@ impl Portal {
             let path = self.builds().join(&name);
             eprintln!("portal prune: removing build {name}");
             match tokio::task::spawn_blocking(move || std::fs::remove_dir_all(path)).await {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => self.forget_unusable(&name),
                 Ok(Err(e)) => eprintln!("portal prune: {name}: {e}"),
                 Err(e) => eprintln!("portal prune: {name}: {e}"),
             }

@@ -1066,6 +1066,14 @@ async fn a_round_reads_the_builds_files_before_it_switches_and_fetches_again_one
     assert_eq!(p.round(false).await, Ok(format!("build {DATE} is served ({DATE}-1)")));
     assert_eq!(bucket.requests().len() - before, order.len());
     assert!(std::fs::read(&changed).unwrap() == bucket.file(&order[0].files[0]));
+
+    // The dir made anew under the name of the one that went is a build's
+    // like any other: once the next build is served, the prune keeps it as
+    // the one served before.
+    bucket.add_build(NEXT, BUILD_VERSION);
+    bucket.set_latest(NEXT, Some(BUILD_VERSION));
+    assert_eq!(p.round(false).await, Ok(format!("build {NEXT} is served ({NEXT}-1)")));
+    assert_eq!(build_dirs(data.path()), [format!("{DATE}-1"), format!("{NEXT}-1")]);
 }
 
 // A ledger whose last line a kill cut short is mended before the resumed
@@ -1599,6 +1607,33 @@ fn a_second_portal_on_a_volume_fails_to_start_while_the_first_runs() {
     ));
     drop(first);
     sync::hold_volume(data.path()).unwrap();
+}
+
+// A first round that can't take its lock has not started: the next one
+// serves the volume's build before it asks the bucket anything, and its
+// prune keeps that build though the latest build stays unknown.
+#[tokio::test]
+async fn a_first_round_that_cant_take_its_lock_leaves_the_start_to_the_next() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    portal(data.path(), config(&bucket, load.clone())).round(true).await.unwrap();
+    // A dir where the lock goes: it can't be opened.
+    let lock = data.path().join(sync::LOCK);
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::create_dir(&lock).unwrap();
+    // No round gets past the start.
+    std::fs::write(data.path().join(sync::LATEST_OVERRIDE), "tomorrow\n").unwrap();
+    let p = portal(data.path(), config(&bucket, load));
+    tokio::spawn(p.clone().run());
+    let result = || p.status().last_result.unwrap_or_default();
+    until("a round that can't take its lock", || result().starts_with("failed: lock ")).await;
+
+    std::fs::remove_dir(&lock).unwrap();
+    until("a round past the lock", || result().contains(sync::LATEST_OVERRIDE)).await;
+
+    assert_eq!(p.served().map(|s| s.dir.clone()), Some(format!("{DATE}-1")));
+    assert_eq!(build_dirs(data.path()), [format!("{DATE}-1")]);
 }
 
 // A date in the data dir's LATEST_OVERRIDE stands for latest.json's, so

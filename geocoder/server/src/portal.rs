@@ -173,8 +173,12 @@ pub struct Portal {
     served: arc_swap::ArcSwapOption<Served>,
     status: Mutex<Status>,
     /// The build dirs this process found it can't serve (another build
-    /// version, damaged, not loading): the prune keeps none of them.
+    /// version, damaged, not loading): the prune keeps none of them, and
+    /// forgets each it removes.
     unusable: Mutex<std::collections::BTreeSet<String>>,
+    /// Whether a round of this process has run the start (sync.rs): one
+    /// that failed before it, on its lock, has not.
+    started: std::sync::atomic::AtomicBool,
     /// A place for each lookup that may run (Config::lookups_at_once),
     /// held until the lookup ends.
     pub lookups: Arc<tokio::sync::Semaphore>,
@@ -190,6 +194,7 @@ impl Portal {
             served: arc_swap::ArcSwapOption::empty(),
             status: Mutex::new(Status::default()),
             unusable: Mutex::new(Default::default()),
+            started: Default::default(),
             http: reqwest::Client::builder()
                 .user_agent("geocoder-portal/0.1")
                 .connect_timeout(Duration::from_secs(30))
