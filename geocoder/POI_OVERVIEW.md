@@ -190,7 +190,7 @@ A web-based test tool is included for validating results:
 Run with Docker:
 ```bash
 cd geocoder/test-portal
-docker compose up --build
+docker compose up --build --remove-orphans
 # Open http://localhost:3002/test (with street addresses beside the smallest
 # dataset; ?d=<dataset> per column picks others, e.g. ?d=with-addresses&d=immich-recommended)
 ```

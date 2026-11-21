@@ -139,7 +139,7 @@ of it, `<date>-<n>`), which it flags when another build is served, one
 published again under its date among them:
 
 ```bash
-cd test-portal && docker compose up --build
+cd test-portal && docker compose up --build --remove-orphans
 # open http://localhost:3002/test
 # or http://localhost:3002/test?d=with-addresses&d=smallest&at=48.8584,2.2945
 ```

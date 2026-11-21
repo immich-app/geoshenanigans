@@ -16,7 +16,7 @@ RUN cargo build --release --manifest-path server/Cargo.toml --bin query-portal
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /src/server/target/release/query-portal /usr/local/bin/
