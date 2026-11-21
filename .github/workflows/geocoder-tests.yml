@@ -145,12 +145,6 @@ jobs:
         run: |
           cd geocoder/server
           cargo test --release
-      # The test portal's server, as its image builds it: its tests run in
-      # query-server's, so the step above doesn't build it.
-      - name: Build query-portal
-        run: |
-          cd geocoder/server
-          cargo build --release --bin query-portal
 
   search-tests:
     name: Place search unit tests
@@ -162,10 +156,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: stable
+      # query-portal, a bin of this crate, is built with this crate's
+      # lockfile, but its sources are tested in query-server's tests, with
+      # that crate's: every package this one holds is in that one alike.
+      - name: Lockfiles agree
+        run: python3 geocoder/builder/tools/check_cargo_locks.py geocoder/server/Cargo.lock geocoder/search/Cargo.lock
       - name: Test
         run: |
           cd geocoder/search
           cargo test --release --locked
+      # The test portal's server, a bin of this crate, as its image builds
+      # it: its tests run in query-server's, and it builds with the feature
+      # portal alone, so the step above doesn't build it.
+      - name: Build query-portal
+        run: |
+          cd geocoder/search
+          cargo build --release --locked --features portal --bin query-portal
 
   node-tests:
     name: Node binding tests

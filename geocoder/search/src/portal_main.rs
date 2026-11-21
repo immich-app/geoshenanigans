@@ -1,23 +1,30 @@
-// query-portal: the test portal's server (portal.rs). It syncs the whole
-// planet build from the bucket by itself and serves each selection of it.
-// Its tests run in query-server's (portal/tests.rs), beside the routes whose
-// answers they compare its own with. It runs on Unix alone (the inodes its
-// builds' links are checked by, the free space it weighs): elsewhere it
-// says so and exits.
+// query-portal: the test portal's server (server/src/portal.rs). It syncs
+// the whole planet build from the bucket by itself and serves each
+// selection of it. It is a bin of this crate, so that it can search places,
+// but its sources are query-server's: they stay in server/src, beside the
+// routes whose answers its tests (run in query-server's, portal/tests.rs)
+// compare its own with. It builds with the feature portal alone, which
+// brings in the dependencies of its server. It runs on Unix alone (the
+// inodes its builds' links are checked by, the free space it weighs):
+// elsewhere it says so and exits.
 
 // The portal checks keys and rates; the dashboard and its logins are
 // query-server's.
 #[cfg(unix)]
 #[allow(dead_code)]
+#[path = "../../server/src/auth.rs"]
 mod auth;
 // The portal takes the downloader's resolve_files and its fetches of a file
 // or a transport unit, not its region downloads.
 #[cfg(unix)]
 #[allow(dead_code)]
+#[path = "../../server/src/downloader.rs"]
 mod downloader;
 #[cfg(unix)]
+#[path = "../../server/src/handlers.rs"]
 mod handlers;
 #[cfg(unix)]
+#[path = "../../server/src/portal.rs"]
 mod portal;
 
 #[cfg(not(unix))]

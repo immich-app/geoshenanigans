@@ -1,4 +1,5 @@
-// The test portal's server (the query-portal binary, portal_main.rs). It
+// The test portal's server (the query-portal binary, a bin of place-search:
+// search/src/portal_main.rs). It
 // keeps the whole planet build in <data>/builds, synced from the bucket by
 // itself (sync.rs), and serves each selection of it the manifest's
 // constraints allow (catalog.rs) as a dataset: /reverse and /polygons with
@@ -9,7 +10,11 @@
 // is the page. Without a build to serve it starts all the
 // same: those routes answer 503 with the reason while it syncs.
 
+// By path: query-portal, a bin of place-search, takes this file in by
+// #[path], from which a plain `mod` would look beside it.
+#[path = "portal/catalog.rs"]
 pub mod catalog;
+#[path = "portal/sync.rs"]
 pub mod sync;
 
 use std::net::SocketAddr;

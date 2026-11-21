@@ -202,8 +202,9 @@ class TestPortalTest(unittest.TestCase):
     def test_the_image_runs_query_portal(self):
         with open(os.path.join(PORTAL, "Dockerfile")) as f:
             image = f.read()
-        self.assertIn("RUN cargo build --release --manifest-path server/Cargo.toml --bin query-portal\n", image)
-        self.assertIn("COPY --from=builder /src/server/target/release/query-portal /usr/local/bin/\n", image)
+        self.assertIn("COPY server/ server/\nCOPY search/ search/\n", image)
+        self.assertIn("RUN cargo build --release --locked --manifest-path search/Cargo.toml --features portal --bin query-portal\n", image)
+        self.assertIn("COPY --from=builder /src/search/target/release/query-portal /usr/local/bin/\n", image)
         self.assertIn("COPY test-portal/entrypoint.sh /usr/local/bin/entrypoint.sh\n", image)
         self.assertEqual(re.findall(r"(?m)^(?:ENTRYPOINT|CMD)\b.*$", image), ['ENTRYPOINT ["entrypoint.sh"]'])
         with open(os.path.join(PORTAL, "entrypoint.sh")) as f:
