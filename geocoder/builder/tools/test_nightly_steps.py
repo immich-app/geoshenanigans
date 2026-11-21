@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Tests for the order of the nightly's steps and what runs beside what: the day's diff and today's PBF in the
 download, the Rust toolchain in the background, the place search beside compression and the patches from
-build-index's exit, and the sidecars' upload beside them.
+build-index's exit, and the sidecars' upload beside them; and which runs the watchdog retries.
 Run: python3 -m unittest discover -s geocoder/builder/tools"""
 import gzip
+import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -167,6 +170,177 @@ class PostBuildTest(unittest.TestCase):
         self.assertEqual(named, {"Build tools", "Run builder tests", "Fail run on patch verify failure",
                                  "Fail run on place search index failure"})
         self.assertLessEqual(named, {n for n, _ in steps()})
+
+
+def watchdog_script(name):
+    """The `run:` script of the watchdog's step `name`, unindented."""
+    with open(WATCHDOG) as f:
+        text = f.read()
+    body = re.search(rf"^      - name: {re.escape(name)}\n((?:(?: {{8}}.*)?\n)*)", text, re.M).group(1)
+    run = re.search(r"^        run: \|\n((?:(?: {10}.*)?\n)*)", body, re.M)
+    return "".join(line[10:] + "\n" for line in run.group(1).splitlines())
+
+
+# gh as the watchdog runs it, answering from the JSON in $FAKE_GH_DATA: the repo's default branch, the build's runs
+# (each `run list` one with only the fields asked for), each run's jobs, and the REST API's runs and jobs; --jq
+# filters go through jq. `workflow run` appends its arguments to $FAKE_GH_CALLS.
+FAKE_GH = r'''#!{python}
+import json, os, subprocess, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_GH_DATA"]) as f:
+    data = json.load(f)
+def opt(name):
+    return args[args.index(name) + 1] if name in args else None
+def answer(value):
+    if opt("--jq") is None:
+        print(json.dumps(value))
+    else:
+        sys.stdout.write(subprocess.run(["jq", "-r", opt("--jq")], input=json.dumps(value), capture_output=True,
+                                        text=True, check=True).stdout)
+if args[:2] == ["repo", "view"]:
+    answer({{"defaultBranchRef": {{"name": data["default_branch"]}}}})
+elif args[:2] == ["run", "list"]:
+    fields = opt("--json").split(",")
+    answer([{{k: run[k] for k in fields if k in run}} for run in data["runs"]])
+elif args[:2] == ["run", "view"]:
+    answer({{"jobs": data["jobs"].get(args[2], [])}})
+elif args[:2] == ["workflow", "run"]:
+    with open(os.environ["FAKE_GH_CALLS"], "a") as f:
+        f.write(" ".join(args) + "\n")
+elif args[0] == "api":
+    answer({{"jobs": data["api_jobs"]}} if args[1].endswith("/jobs") else {{"workflow_runs": data["api_runs"]}})
+else:
+    sys.exit("fake gh: " + " ".join(args))
+'''
+
+LIVE_TITLE = "Build Geocoder Index"
+SCRATCH_TITLE = "Build Geocoder Index [scratch: nightly-speed-1121]"
+
+
+class WatchdogTest(unittest.TestCase):
+    """The watchdog's retry of today's nightly, run with a gh that answers from fixtures: it counts the live
+    nightly's runs alone (a dispatch under a scratch s3_prefix is a test, its title says so), and retries what a
+    rerun may cure."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root)
+        self.bin = os.path.join(self.root, "bin")
+        os.makedirs(self.bin)
+        with open(os.path.join(self.bin, "gh"), "w") as f:
+            f.write(FAKE_GH.format(python=sys.executable))
+        os.chmod(os.path.join(self.bin, "gh"), 0o755)
+        self.calls = os.path.join(self.root, "calls")
+        self.today = time.strftime("%Y-%m-%d", time.gmtime())
+        self.runs, self.jobs = [], {}
+
+    def run_at(self, hhmm, title, conclusion, steps=(), run_id=None):
+        """A run of the build created today at hhmm, with its title, conclusion and steps ((name, conclusion)...)."""
+        run_id = run_id or f"{len(self.runs) + 1}"
+        self.runs.append({"databaseId": int(run_id), "conclusion": conclusion, "status": "completed",
+                          "createdAt": f"{self.today}T{hhmm}:00Z", "event": "workflow_dispatch", "headBranch": "main",
+                          "displayTitle": title})
+        self.jobs[run_id] = [{"steps": [{"name": n, "conclusion": c} for n, c in steps]}]
+
+    def watchdog(self):
+        """Runs the retry step against self.runs and self.jobs; returns its output and the dispatches it made."""
+        data = os.path.join(self.root, "data.json")
+        with open(data, "w") as f:
+            json.dump({"default_branch": "main", "runs": self.runs, "jobs": self.jobs}, f)
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_GH_DATA": data, "FAKE_GH_CALLS": self.calls,
+               "GH_TOKEN": "t", "GH_REPO": "immich-app/geoshenanigans", "MAX_RETRIES": "5"}
+        done = subprocess.run(["bash", "-e", "-c", watchdog_script("Check and maybe retry today's build")], env=env,
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        dispatched = []
+        if os.path.exists(self.calls):
+            with open(self.calls) as f:
+                dispatched = f.read().splitlines()
+            os.remove(self.calls)
+        return done.stdout, dispatched
+
+    def retry(self):
+        return [f"workflow run geocoder-build.yml --ref main -f build_date={self.today}"]
+
+    def test_a_live_run_lost_mid_build_is_retried(self):
+        self.run_at("06:17", LIVE_TITLE, "failure", [("Setup", "success"), ("Build geocoder index", "failure")])
+
+        self.assertEqual(self.watchdog()[1], self.retry())
+
+    # A scratch dispatch on the default branch that failed is no reason to start the live build.
+    def test_a_failed_scratch_run_starts_no_live_build(self):
+        self.run_at("03:00", SCRATCH_TITLE, "failure", [("Setup", "failure")])
+
+        out, dispatched = self.watchdog()
+
+        self.assertEqual(dispatched, [])
+        self.assertIn("total=0", out)
+
+    # Nor is a scratch run that succeeded the night's success: the live run lost mid-build is retried.
+    def test_a_scratch_run_that_succeeded_does_not_stand_for_the_live_one(self):
+        self.run_at("06:17", LIVE_TITLE, "failure", [("Setup", "success"), ("Build geocoder index", "failure")])
+        self.run_at("09:00", SCRATCH_TITLE, "success", [("Setup", "success")])
+
+        out, dispatched = self.watchdog()
+
+        self.assertEqual(dispatched, self.retry())
+        self.assertIn("total=1  succeeded=0", out)
+
+    def test_a_live_run_that_succeeded_leaves_the_day_alone(self):
+        self.run_at("06:17", LIVE_TITLE, "success", [("Setup", "success")])
+        self.run_at("09:00", SCRATCH_TITLE, "failure", [("Setup", "failure")])
+
+        self.assertEqual(self.watchdog()[1], [])
+
+    # What a rerun repeats is not retried: a cancelled step (a timeout or a hand), or a failure of a step that fails
+    # alike on every rerun. A failure elsewhere is, the steps of those names that passed notwithstanding.
+    def test_retries_what_a_rerun_may_cure_and_nothing_else(self):
+        passed = [("Build tools", "success"), ("Run builder tests", "success"),
+                  ("Fail run on patch verify failure", "skipped"), ("Fail run on place search index failure", "skipped")]
+        for steps, retried in [
+            (passed + [("Build geocoder index", "failure")], True),
+            ([("Build tools", "success"), ("Run builder tests", "failure")], False),
+            ([("Build tools", "failure")], False),
+            (passed[:2] + [("Compress index files", "cancelled")], False),
+            (passed[:2] + [("Fail run on patch verify failure", "failure")], False),
+            (passed[:2] + [("Fail run on place search index failure", "failure")], False),
+            ([], True),
+        ]:
+            with self.subTest(steps=steps):
+                self.runs, self.jobs = [], {}
+                self.run_at("06:17", LIVE_TITLE, "failure", steps)
+
+                self.assertEqual(self.watchdog()[1], self.retry() if retried else [])
+
+    # The report's latest finished nightly is the live one's, a scratch run after it notwithstanding.
+    def test_the_report_takes_the_latest_live_run(self):
+        live = {"id": 7, "run_attempt": 1, "display_title": LIVE_TITLE, "conclusion": "failure"}
+        scratch = {"id": 8, "run_attempt": 1, "display_title": SCRATCH_TITLE, "conclusion": "success"}
+        data = os.path.join(self.root, "data.json")
+        with open(data, "w") as f:
+            json.dump({"default_branch": "main", "runs": [], "jobs": {}, "api_runs": [scratch, live],
+                       "api_jobs": [{"steps": []}]}, f)
+        for tool, body in {"op": "echo token\n", "python3": "exit 0\n"}.items():
+            with open(os.path.join(self.bin, tool), "w") as f:
+                f.write("#!/bin/sh\n" + body)
+            os.chmod(os.path.join(self.bin, tool), 0o755)
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "FAKE_GH_DATA": data, "FAKE_GH_CALLS": self.calls,
+               "GITHUB_REPOSITORY": "immich-app/geoshenanigans", "RUNNER_TEMP": self.root, "O11Y_URL": "https://o.invalid",
+               "LATEST_JSON_URL": "https://l.invalid/latest.json"}
+        script = watchdog_script("Report the published build and the latest nightly")
+        self.assertIn('--run "$RUN_JSON"', script)
+        done = subprocess.run(["bash", "-e", "-c", script], env=env, capture_output=True, text=True, timeout=60)
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        with open(os.path.join(self.root, "o11y-run.json")) as f:
+            self.assertEqual(json.load(f), live)
+
+    # The nightly's own title says which runs are tests, as the watchdog reads it.
+    def test_the_nightly_names_a_scratch_run_in_its_title(self):
+        run_name = re.search(r"(?m)^run-name: (.*)$", nightly())
+        self.assertIsNotNone(run_name)
+        self.assertEqual(run_name.group(1), "${{ (inputs.s3_prefix || 'geocoder') == 'geocoder' && 'Build Geocoder Index' "
+                                            "|| format('Build Geocoder Index [scratch: {0}]', inputs.s3_prefix) }}")
 
 
 if __name__ == "__main__":

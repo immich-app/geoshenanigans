@@ -390,8 +390,9 @@ class NightlyReportTest(unittest.TestCase):
         self.assertEqual(names[names.index("Finalize upload and configurations.json") + 1:][:4],
                          ["Install 1Password CLI", "Report to o11y", "Cleanup old Tigris builds", "Cleanup old cache bucket"])
         self.assertEqual(names[-1], "Wait for the o11y report")
+        # The live nightly's alone: a run under a scratch s3_prefix is a test, on main too.
         for name in ("Install 1Password CLI", "Report to o11y", "Wait for the o11y report"):
-            self.assertIn("if: always() && github.ref == 'refs/heads/main'", body[name], name)
+            self.assertIn("if: always() && github.ref == 'refs/heads/main' && env.S3_PREFIX == 'geocoder'\n", body[name], name)
         for name in ("Report to o11y", "Wait for the o11y report"):
             self.assertIn("continue-on-error: true", body[name], name)
         self.assertIn("if: env.PATCH_VERIFY_FAILED != '1' && env.TRANSPORT_UNIT_FAILED != '1'", body["Cleanup old Tigris builds"])

@@ -1,4 +1,8 @@
 name: Build Geocoder Index
+# A dispatch under a scratch s3_prefix is a test run, and its title says so:
+# the watchdog counts only the live nightly's runs, as today's success, as a
+# failure to retry, or as the nightly it reports.
+run-name: ${{ (inputs.s3_prefix || 'geocoder') == 'geocoder' && 'Build Geocoder Index' || format('Build Geocoder Index [scratch: {0}]', inputs.s3_prefix) }}
 
 concurrency:
   group: geocoder-build
@@ -1323,7 +1327,7 @@ jobs:
       # For Report to o11y's token. A failed install doesn't fail the run:
       # the report then warns and sends nothing.
       - name: Install 1Password CLI
-        if: always() && github.ref == 'refs/heads/main'
+        if: always() && github.ref == 'refs/heads/main' && env.S3_PREFIX == 'geocoder'
         continue-on-error: true
         uses: 1password/install-cli-action@8d006a0d0a4fd505af7f7ce589e7f768385ff5e4 # v3.0.0
 
@@ -1331,15 +1335,15 @@ jobs:
       # geocoder/README.md, Monitoring): build phases, memory, verify counts,
       # patch and index sizes and the logs. The run's outcome comes from the
       # watchdog, which also sees runs whose runner died before this step.
-      # Reporting never fails the run. Only main's runs (the schedule and
-      # the watchdog's retries): a test dispatch from another branch isn't
-      # the nightly. The token is read here and handed to the report alone,
-      # so no other step can see it. Everything it reads is final once
-      # Finalize ends, so it runs beside the cleanups and the artifacts after
-      # it, detached so it outlives this step; Wait for the o11y report, the
-      # job's last step, collects it.
+      # Reporting never fails the run. Only main's live runs (the schedule
+      # and the watchdog's retries): a test dispatch from another branch, or
+      # under a scratch s3_prefix, isn't the nightly. The token is read here
+      # and handed to the report alone, so no other step can see it.
+      # Everything it reads is final once Finalize ends, so it runs beside
+      # the cleanups and the artifacts after it, detached so it outlives this
+      # step; Wait for the o11y report, the job's last step, collects it.
       - name: Report to o11y
-        if: always() && github.ref == 'refs/heads/main'
+        if: always() && github.ref == 'refs/heads/main' && env.S3_PREFIX == 'geocoder'
         continue-on-error: true
         timeout-minutes: 5
         env:
@@ -1553,7 +1557,7 @@ jobs:
       # The report Report to o11y started beside the steps since: the runner
       # ends what a job leaves running, so the job's last step waits for it.
       - name: Wait for the o11y report
-        if: always() && github.ref == 'refs/heads/main'
+        if: always() && github.ref == 'refs/heads/main' && env.S3_PREFIX == 'geocoder'
         continue-on-error: true
         timeout-minutes: 5
         env:

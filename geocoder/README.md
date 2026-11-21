@@ -26,8 +26,9 @@ quality, POI tier) and how a client downloads and patches them.
 ## Monitoring
 
 The nightly reports every run on `main` to FUTO o11y (project
-`geoshenanigans`), whatever its outcome; test dispatches from other branches
-don't report. Its report, `builder/tools/o11y_report.py nightly`, started once
+`geoshenanigans`), whatever its outcome; test dispatches, from other branches
+or under a scratch `s3_prefix` (whose run title ends `[scratch: <prefix>]`),
+don't report, and the watchdog passes them over. Its report, `builder/tools/o11y_report.py nightly`, started once
 the data is up and waited for by its last step, pushes
 what only its runner has: each build phase's duration, peak memory, the patch
 verify counts, each patch's size, the index size, the data's age and the
