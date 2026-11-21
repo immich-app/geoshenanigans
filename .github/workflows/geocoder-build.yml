@@ -970,13 +970,16 @@ jobs:
           $S5 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
           # The strategy-2 sidecars (*.osm_ids, tomorrow's --prev-output) are
           # final since build-index exited: up now, rather than in Finalize's
-          # first pass, which waits for sidecars.status.
+          # first pass, which waits for sidecars.status. Its session, for
+          # Compress index files or Finalize to end should it outlast their
+          # wait for it.
           find "$WORKDIR/output" -name '*.osm_ids' -printf "cp %p s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/%P\n" > "$WORKDIR/sidecars.run"
           # The inner script expands its own arguments ($0 is the status file).
           # shellcheck disable=SC2016
           setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/sidecars.status" \
             s5cmd --endpoint-url "$S3_ENDPOINT" --retry-count 10 --numworkers 16 run "$WORKDIR/sidecars.run" \
             > "$WORKDIR/sidecars.log" 2>&1 < /dev/null &
+          echo "$!" > "$WORKDIR/sidecars.pid"
           # geocoder-transport, which encodes the units, comes from the place
           # search build (done long before, on a normal night).
           WAIT_START=$(date +%s)
@@ -1128,9 +1131,19 @@ jobs:
           else
             COMPRESS_START=$(date +%s)
             # After a failed background run, the sidecars' upload it started
-            # ends before the prefix is cleared, then starts again.
+            # ends before the prefix is cleared, then starts again. One still
+            # running after 15 minutes is stopped, its session and all, and
+            # gone (a zombie aside) first: it would otherwise write its status
+            # over the new upload's.
             if [ -f "$WORKDIR/sidecars.run" ]; then
               until [ -s "$WORKDIR/sidecars.status" ] || [ $(( $(date +%s) - COMPRESS_START )) -gt 900 ]; do sleep 2; done
+              SESSION=$(cat "$WORKDIR/sidecars.pid" 2> /dev/null || true)
+              if ! [ -s "$WORKDIR/sidecars.status" ] && [ -n "$SESSION" ]; then
+                echo "::warning::The sidecars' upload is still running after 15 minutes; stopping it"
+                pkill -KILL -s "$SESSION" 2> /dev/null || true
+                WAIT_START=$(date +%s)
+                while ps -o stat= -s "$SESSION" | grep -q '^[^Z]' && [ $(( $(date +%s) - WAIT_START )) -lt 60 ]; do sleep 1; done
+              fi
             fi
             s5cmd --endpoint-url "$S3_ENDPOINT" --numworkers 32 rm "s3://$S3_BUCKET/$S3_PREFIX/builds/$NEW_DATE/*" 2>/dev/null || true
             # The strategy-2 sidecars, as the patch step uploads them.
@@ -1141,6 +1154,7 @@ jobs:
             setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/sidecars.status" \
               s5cmd --endpoint-url "$S3_ENDPOINT" --retry-count 10 --numworkers 16 run "$WORKDIR/sidecars.run" \
               > "$WORKDIR/sidecars.log" 2>&1 < /dev/null &
+            echo "$!" > "$WORKDIR/sidecars.pid"
             # geocoder-transport, which encodes the units, comes from the place
             # search build.
             until [ -s "$RUNNER_TEMP/search.status" ] || [ $(( $(date +%s) - COMPRESS_START )) -gt 1800 ]; do sleep 5; done
@@ -1220,11 +1234,19 @@ jobs:
           # --prev-output. Clients never read them. The cleanup step
           # further down ages them out at the same rate as full builds
           # (3 days). They went up beside compression (sidecars.status);
-          # the pass below sends them only if that failed.
+          # the pass below sends them only if that failed. One still running
+          # after 15 minutes is stopped, its session and all, and gone (a
+          # zombie aside) before the pass below sends the same keys.
           if [ -f "$WORKDIR/sidecars.run" ]; then
             until [ -s "$WORKDIR/sidecars.status" ] || [ $(( $(date +%s) - UPLOAD_START )) -gt 900 ]; do sleep 2; done
+            SESSION=$(cat "$WORKDIR/sidecars.pid" 2> /dev/null || true)
+            if ! [ -s "$WORKDIR/sidecars.status" ] && [ -n "$SESSION" ]; then
+              pkill -KILL -s "$SESSION" 2> /dev/null || true
+              WAIT_START=$(date +%s)
+              while ps -o stat= -s "$SESSION" | grep -q '^[^Z]' && [ $(( $(date +%s) - WAIT_START )) -lt 60 ]; do sleep 1; done
+            fi
             if [ "$(cat "$WORKDIR/sidecars.status" 2> /dev/null)" != 0 ]; then
-              echo "::warning::The sidecars' upload beside compression failed or is still running; the pass below sends them"
+              echo "::warning::The sidecars' upload beside compression failed or was still running after 15 minutes (stopped); the pass below sends them"
               tail -20 "$WORKDIR/sidecars.log" || true
             fi
           fi

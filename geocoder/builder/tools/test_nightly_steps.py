@@ -593,8 +593,11 @@ class PostBuildTest(unittest.TestCase):
             sidecars = script.index("run \"$WORKDIR/sidecars.run\"")
             wait = script.index('[ -s "$RUNNER_TEMP/search.status" ]')
             compress = script.index("compress_index.py")
+            # Its session, for a later step to end should it outlast the wait for it.
+            pid = script.index('echo "$!" > "$WORKDIR/sidecars.pid"')
             self.assertLess(clear, sidecars, name)
-            self.assertLess(sidecars, compress, name)
+            self.assertLess(sidecars, pid, name)
+            self.assertLess(pid, compress, name)
             self.assertLess(wait, compress, name)
             self.assertIn("RUNNER_TEMP: ${{ runner.temp }}", step(name), name)
         retry = step_script("Compress index files")
@@ -693,6 +696,32 @@ class PostBuildTest(unittest.TestCase):
 
                 self.assertGreaterEqual(took, 0.9)
                 self.assertNotIn("::warning::", out)
+
+    # An upload still running when the wait for it ends is stopped, its session and all, and gone, before the
+    # prefix is cleared again (it would write the status of the upload started after it) and before Finalize's
+    # first pass sends the same keys.
+    def test_a_sidecars_upload_past_the_wait_is_stopped_before_the_prefix_is_cleared_again_and_before_finalize(self):
+        for name in ("Compress index files", "Finalize upload and configurations.json"):
+            with self.subTest(name=name):
+                root = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, root)
+                open(os.path.join(root, "sidecars.run"), "w").close()
+                upload = subprocess.Popen(["/usr/bin/sleep", "300"], start_new_session=True)
+                self.addCleanup(upload.kill)
+                with open(os.path.join(root, "sidecars.pid"), "w") as f:
+                    f.write(f"{upload.pid}\n")
+                block = block_at(step_script(name), 'if [ -f "$WORKDIR/sidecars.run" ]; then')
+                start = time.time()
+
+                done = subprocess.run(["bash", "-e", "-c", "COMPRESS_START=$(( $(date +%s) - 901 ))\n"
+                                       "UPLOAD_START=$COMPRESS_START\n" + block],
+                                      env={"PATH": os.environ["PATH"], "WORKDIR": root}, capture_output=True, text=True,
+                                      timeout=90)
+
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertLess(time.time() - start, 30)
+                self.assertEqual(upload.wait(timeout=10), -9)
+                self.assertIn("::warning::", done.stdout)
 
     # The watchdog tells a retry from a failure a rerun repeats by these steps' names.
     def test_every_step_the_watchdog_names_is_a_step_of_the_nightly(self):
