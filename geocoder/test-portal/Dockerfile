@@ -1,4 +1,5 @@
-# Build Rust server (includes embedded test portal HTML)
+# Build the test portal's server, query-portal (includes the test page's
+# HTML), which fetches and decodes the build itself
 FROM rust:bookworm@sha256:ade39a710ef85f3506cffcfec3e8a24ba090badef1dff2fb798f71d878833fea AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -7,23 +8,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /src
 COPY server/ server/
-COPY search/ search/
 COPY test-portal/index.html test-portal/index.html
 COPY builder/data/ builder/data/
-RUN cargo build --release --manifest-path server/Cargo.toml
-# geocoder-transport, which decodes the transport units the download fetches:
-# a bin of the place search crate.
-RUN cargo build --release --locked --manifest-path search/Cargo.toml --bin geocoder-transport
+RUN cargo build --release --manifest-path server/Cargo.toml --bin query-portal
 
 # Runtime
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates zstd \
+    curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /src/server/target/release/query-server /usr/local/bin/
-COPY --from=builder /src/search/target/release/geocoder-transport /usr/local/bin/
+COPY --from=builder /src/server/target/release/query-portal /usr/local/bin/
 COPY test-portal/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
