@@ -98,11 +98,11 @@ class DownloadTest(unittest.TestCase):
                        for s in job.get("steps", []) if s.get("name") == name)
         self.assertIn(f"\nSTEP_SECONDS={minutes * 60}\n", step_script(name))
 
-    def run_apply(self, diff, server="ok"):
+    def run_apply(self, diff, server="ok", pbf_date=None):
         """Apply replication diffs from yesterday's PBF, with a diff from the download (bytes, or None), and a curl,
         pbf-apply, gzip -t and timeout that log their calls; curl gets the diff when `server` is "ok", and stalls when
-        it is "stall", in which case the timeout gives it 1 s whatever it is asked. Returns the step's run and the
-        calls."""
+        it is "stall", in which case the timeout gives it 1 s whatever it is asked. With `pbf_date` the PBF is the
+        mirror's, its header's replication timestamp that ("": none). Returns the step's run and the calls."""
         root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, root)
         work, bin_dir = os.path.join(root, "work"), os.path.join(root, "bin")
@@ -118,7 +118,8 @@ class DownloadTest(unittest.TestCase):
                  "gzip": f'[ "$1" = -t ] && echo "gzip $*" >> {calls}\nexec {shutil.which("gzip")} "$@"\n',
                  "timeout": f'echo "timeout $*" >> {calls}\n'
                             + ('shift\nexec ' + timeout + ' 1 "$@"\n' if server == "stall" else f'exec {timeout} "$@"\n'),
-                 "df": "exit 0\n"}
+                 "df": "exit 0\n",
+                 "osmium": f'echo "osmium $*" >> {calls}\necho "{pbf_date or ""}"\n'}
         for tool, body in fakes.items():
             with open(os.path.join(bin_dir, tool), "w") as f:
                 f.write("#!/bin/sh\n" + body)
@@ -128,12 +129,15 @@ class DownloadTest(unittest.TestCase):
             with open(os.path.join(work, "diff-today.osc.gz"), "wb") as f:
                 f.write(diff)
         env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "WORKDIR": work, "TODAY": "2026-11-21", "TODAY_SEQ": "4710",
-               "PBF_SOURCE": "yesterday", "GITHUB_WORKSPACE": os.path.join(HERE, "..", "..", "..")}
+               "PBF_SOURCE": "yesterday" if pbf_date is None else "mirror",
+               "GITHUB_WORKSPACE": os.path.join(HERE, "..", "..", "..")}
         try:
             done = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step_script("Apply replication diffs")],
                                   env=env, capture_output=True, text=True, timeout=60)
         except subprocess.TimeoutExpired:
             self.fail("the apply hung")
+        if not os.path.exists(calls):
+            return done, []
         with open(calls) as f:
             return done, f.read().splitlines()
 
@@ -162,6 +166,29 @@ class DownloadTest(unittest.TestCase):
         self.assertIn("/replication/day/000/004/710.osc.gz", calls[1])
         self.assertEqual(calls[2].split()[1], "-t")
         self.assert_the_diff_was_applied(calls[3])
+
+    # The mirror's PBF, planet-latest, is a few days behind the build's date: the days' diffs come down and are
+    # applied to it in order.
+    def test_a_mirror_pbf_takes_the_diffs_of_the_days_since_it(self):
+        done, calls = self.run_apply(None, pbf_date="2026-11-19T00:00:00Z")
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual([c.split()[0] for c in calls], ["osmium", "curl", "gzip", "curl", "gzip", "pbf-apply"])
+        self.assertIn("/replication/day/000/004/709.osc.gz", calls[1])
+        self.assertIn("/replication/day/000/004/710.osc.gz", calls[3])
+        self.assertEqual(calls[5].split()[2:4], [f"{self.work}/diff-4709.osc.gz", f"{self.work}/diff-4710.osc.gz"])
+
+    # It can't be wound back: one of a later date than the build's (a dispatch of a past date, once the cache has
+    # dropped that day's PBF) fails the step rather than build the later data under the earlier date, as does one
+    # whose date can't be read.
+    def test_a_mirror_pbf_newer_than_the_build_or_of_no_date_fails_the_step(self):
+        for pbf_date in ("2026-11-22T00:00:00Z", ""):
+            with self.subTest(pbf_date=pbf_date):
+                done, calls = self.run_apply(None, pbf_date=pbf_date)
+
+                self.assertNotEqual(done.returncode, 0, done.stdout + done.stderr)
+                self.assertIn("::error::", done.stdout)
+                self.assertEqual([c.split()[0] for c in calls], ["osmium"])
 
     # A server that stalls fails the step at the fetch's limit, a failure the watchdog retries, where a fetch without
     # one would hold the step to its 120-minute timeout, a cancelled step it doesn't.

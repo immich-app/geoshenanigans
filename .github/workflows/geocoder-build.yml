@@ -767,9 +767,19 @@ jobs:
             # come down here, the download step's diff of the day with them.
             rm -f "$WORKDIR/diff-today.osc.gz"
             PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" 2>/dev/null | cut -dT -f1)
+            if ! [[ "$PBF_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+              echo "::error::The mirror's PBF has no replication timestamp to take diffs from (read '$PBF_DATE')"
+              exit 1
+            fi
             DAYS_NEEDED=$(( ($(date -u -d "$TODAY" +%s) - $(date -u -d "$PBF_DATE" +%s)) / 86400 ))
             PBF_SEQ=$((TODAY_SEQ - DAYS_NEEDED))
             echo "PBF date=$PBF_DATE seq=$PBF_SEQ, need $DAYS_NEEDED diffs"
+            # A PBF of a later date than the build's (planet-latest, for a
+            # dispatch of a past date) can't be wound back to it.
+            if [ "$DAYS_NEEDED" -lt 0 ]; then
+              echo "::error::The mirror's PBF ($PBF_DATE) is newer than the build date $TODAY"
+              exit 1
+            fi
 
             if [ $DAYS_NEEDED -gt 0 ]; then
               DIFFS=""
