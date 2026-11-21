@@ -1,18 +1,53 @@
 #!/usr/bin/env python3
 """Tests for compress_index.py. Run: python3 -m unittest discover -s geocoder/builder/tools"""
+import contextlib
 import hashlib
+import io
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
 import compress_index as sut  # noqa: E402
 
-TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "configurations.template.json")
+TEMPLATE = os.path.join(HERE, "..", "configurations.template.json")
+
+# zstd for a run whose threads are counted: each compression appends "<start> <end> <-T> <output>" to $ZSTD_CALLS;
+# the work is the zstd's it stands in for ($REAL_ZSTD), stdin and all, a decompression's too.
+COUNTING_ZSTD = r'''#!{python}
+import os, subprocess, sys, time
+args = sys.argv[1:]
+start = time.time()
+status = subprocess.run([os.environ["REAL_ZSTD"]] + args).returncode
+threads = next((a for a in args if a.startswith("-T")), None)
+if threads:
+    output = args[args.index("-o") + 1] if "-o" in args else args[-1] + ".zst"
+    with open(os.environ["ZSTD_CALLS"], "a") as f:
+        f.write(f"{{start}} {{time.time()}} {{threads}} {{output}}\n")
+sys.exit(status)
+'''
+
+# A compress_index.py run in a child process (a run that hangs is killed at its timeout rather than holding up
+# the tests): 4 CPUs, a zstd thread per 64 KiB, and the change `plant` makes to the script first.
+CHILD_RUN = r'''
+import os, sys
+sys.path.insert(0, {here!r})
+import compress_index as sut
+os.cpu_count = lambda: 4
+sut.BYTES_PER_THREAD = 64 << 10
+{plant}
+sys.argv = ["compress_index.py", {out!r}, "--transport-bin", {transport!r}]
+sys.exit(sut.main())
+'''
 
 # geocoder-transport as the script runs it. encode writes the kind, the members' names and sizes
 # (a JSON line), then the members' bytes; verify decodes that (through zstd) against the dir's
@@ -268,6 +303,268 @@ class CompressIndexTest(unittest.TestCase):
         sent_rel = [f"{rel}.zst" for rel in self.files if rel not in self.members] + list(self.units)
         expected = [f"cp {self.path(rel)} s3://bucket/day/{rel}" for rel in sent_rel]
         self.assertEqual(sorted(sent), sorted(expected))
+
+    def counted_run(self, *args, cpus=4):
+        """run_main with `cpus` CPUs, a zstd thread per 64 KiB and a zstd that logs each call; returns the calls as
+        (start, end, threads, output) and what the run printed."""
+        calls = os.path.join(self.tmp.name, "zstd-calls")
+        bin_dir = os.path.join(self.tmp.name, "counting-bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        with open(os.path.join(bin_dir, "zstd"), "w") as f:
+            f.write(COUNTING_ZSTD.format(python=sys.executable))
+        os.chmod(os.path.join(bin_dir, "zstd"), 0o755)
+        printed = io.StringIO()
+        env = {"REAL_ZSTD": shutil.which("zstd"), "ZSTD_CALLS": calls, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(sut.os, "cpu_count", return_value=cpus), \
+                mock.patch.object(sut, "BYTES_PER_THREAD", 64 << 10), contextlib.redirect_stdout(printed):
+            cfg = self.run_main(*args)
+        with open(calls) as f:
+            rows = [line.split() for line in f.read().splitlines()]
+        return [(float(a), float(b), int(t[2:]), os.path.relpath(o, self.out)) for a, b, t, o in rows], printed.getvalue(), cfg
+
+    # zstd -18 cuts a file into 32 MiB jobs, so a thread per job, up to 8, keeps a big file from finishing alone
+    # long after the rest; never more threads than CPUs.
+    def test_each_file_gets_a_zstd_thread_per_job_up_to_eight_and_the_cpus(self):
+        with mock.patch.object(sut.os, "cpu_count", return_value=88):
+            self.assertEqual([sut.threads_for(s) for s in (0, 1, 32 << 20, (32 << 20) + 1, 427_000_000, 1 << 40)],
+                             [1, 1, 1, 2, 8, 8])
+        with mock.patch.object(sut.os, "cpu_count", return_value=4):
+            self.assertEqual(sut.threads_for(427_000_000), 4)
+
+        calls, _, _ = self.counted_run(cpus=4)
+
+        threads = {output: t for _, _, t, output in calls}
+        # 200,000 bytes over 64 KiB a thread: 4; a unit counts its files' bytes.
+        self.assertEqual(threads["planet/full/geo_cells.bin.zst"], 4)
+        self.assertEqual(threads["planet/full/strings_layout.json.zst"], 1)
+        self.assertEqual(threads["planet/admin/postcode_centroids.bin.zst"], 1)
+        self.assertEqual(threads["planet/full/places.tt.zst"] if "planet/full/places.tt.zst" in threads
+                         else threads["planet/admin/places.tt.zst"], 4)
+
+    def test_no_more_zstd_threads_run_at_once_than_there_are_cpus(self):
+        calls, _, cfg = self.counted_run(cpus=4)
+
+        self.assertEqual(self.status, 0)
+        self.assertEqual(sorted(cfg["files"]), sorted(self.files))
+        for start, _, _, _ in calls:
+            at_once = sum(t for s, e, t, _ in calls if s <= start < e)
+            self.assertLessEqual(at_once, 4, calls)
+
+    def test_prints_each_compressed_item_with_its_start_end_and_threads(self):
+        calls, printed, _ = self.counted_run(cpus=4)
+
+        items = re.findall(r"(?m)^  \[ *(\d+\.\d)s -> *(\d+\.\d)s -T(\d+)\] (\S+)$", printed)
+        # A unit is named by its path, a file by its own.
+        compressed = {output if output.endswith(".tt.zst") else output[:-len(".zst")] for _, _, _, output in calls}
+        self.assertEqual(sorted(path for _, _, _, path in items), sorted(compressed))
+        for start, end, threads, path in items:
+            self.assertLessEqual(float(start), float(end), path)
+        by_path = {path: int(t) for _, _, t, path in items}
+        self.assertEqual(by_path["planet/full/geo_cells.bin"], 4)
+
+    # A job that fails before it takes its threads (say a file it can't read) must still pass its turn on: the
+    # jobs behind it in the queue wait for that turn, and the run must end with the error, not hang.
+    def test_a_job_that_fails_before_its_turn_ends_the_run_with_its_error(self):
+        plant = """
+real = sut.compress
+def compress(ticket, path, threads):
+    if path.endswith("planet/full/addr_points.bin"):
+        raise OSError("planted failure before the job's turn")
+    return real(ticket, path, threads)
+sut.compress = compress
+"""
+        self.assert_child_run_fails(plant, "planted failure before the job's turn")
+
+    # A unit whose zstd raises holds its threads: they must go back, or every job queued behind it waits forever.
+    def test_a_unit_that_raises_while_it_holds_its_threads_ends_the_run_with_its_error(self):
+        plant = """
+real = sut.run_logged
+def run_logged(cmd, **kw):
+    if cmd[0] == "zstd" and cmd[-1].endswith("planet/poi/major/pois.tt.zst"):
+        raise RuntimeError("planted failure holding the unit's threads")
+    return real(cmd, **kw)
+sut.run_logged = run_logged
+"""
+        self.assert_child_run_fails(plant, "planted failure holding the unit's threads")
+
+    def assert_child_run_fails(self, plant, error):
+        script = CHILD_RUN.format(here=HERE, plant=plant, out=self.out, transport=self.transport)
+        try:
+            done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            self.fail("the run hung")
+        self.assertNotEqual(done.returncode, 0, done.stdout)
+        self.assertIn(error, done.stderr)
+
+    SEARCH = ("planet/search/full/simplified/all/places.fst", "planet/search/full/simplified/all/search_meta.json")
+
+    def compressed_copy(self):
+        """The tables and .zst bytes of the same tree compressed in one go, in a copy."""
+        copy = os.path.join(self.tmp.name, "copy")
+        shutil.copytree(self.out, copy)
+        argv = ["compress_index.py", copy, "--transport-bin", self.transport]
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sut.main(), 0)
+        with open(os.path.join(copy, "configurations.json")) as f:
+            cfg = json.load(f)
+        zst = {}
+        for root, _, names in os.walk(copy):
+            for name in names:
+                if name.endswith(".zst"):
+                    with open(os.path.join(root, name), "rb") as f:
+                        zst[os.path.relpath(os.path.join(root, name), copy)] = f.read()
+        return cfg, zst
+
+    def zst_files(self):
+        found = {}
+        for root, _, names in os.walk(self.out):
+            for name in names:
+                if name.endswith(".zst"):
+                    with open(os.path.join(root, name), "rb") as f:
+                        found[os.path.relpath(os.path.join(root, name), self.out)] = f.read()
+        return found
+
+    def start_late_run(self, *args):
+        """run_main on a thread, as the nightly runs it beside the place search; returns the thread and what it
+        will leave in `result` (the configurations.json it wrote, what it printed)."""
+        result = {}
+
+        def run():
+            printed = io.StringIO()
+            with contextlib.redirect_stdout(printed):
+                result["cfg"] = self.run_main(*args)
+            result["printed"] = printed.getvalue()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread, result
+
+    # The nightly starts compression when build-index exits, beside the place search: everything else is
+    # compressed while it runs, its files once its status is written, and the tables and bytes are those of a
+    # run that had them all from the start.
+    def test_a_late_search_is_compressed_once_its_status_is_written_into_the_same_tables(self):
+        expected_cfg, expected_zst = self.compressed_copy()
+        for rel in self.SEARCH:
+            os.remove(self.path(rel))
+        status = os.path.join(self.tmp.name, "place-search.status")
+
+        thread, result = self.start_late_run("--late-search", status)
+        deadline = time.time() + 60
+        early = ["planet/full/geo_cells.bin.zst", "planet/full/addr_points.bin.zst", "planet/full/street_ways.tt.zst",
+                 "planet/poi/major/pois.tt.zst"]
+        while time.time() < deadline and not all(os.path.exists(self.path(r)) for r in early):
+            time.sleep(0.05)
+        time.sleep(0.5)
+        self.assertTrue(thread.is_alive())
+        self.assertEqual([r for r in early if not os.path.exists(self.path(r))], [])
+        with open(self.path("configurations.json")) as f:
+            self.assertNotIn("files", json.load(f))
+        for rel in self.SEARCH:
+            write(self.path(rel), self.files[rel])
+        with open(status, "w") as f:
+            f.write("0\n")
+        thread.join(60)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self.status, 0)
+        self.assertEqual(result["cfg"], expected_cfg)
+        self.assertEqual(self.zst_files(), expected_zst)
+        for rel in self.SEARCH:
+            self.assertEqual(unzstd(self.path(rel) + ".zst"), self.files[rel])
+
+    # A place search that failed still leaves the indexes it built, published as they are today.
+    def test_a_late_search_that_failed_publishes_the_indexes_it_left(self):
+        expected_cfg, _ = self.compressed_copy()
+        status = os.path.join(self.tmp.name, "place-search.status")
+        with open(status, "w") as f:
+            f.write("1\n")
+
+        cfg = self.run_main("--late-search", status)
+
+        self.assertEqual(self.status, 0)
+        self.assertEqual(cfg, expected_cfg)
+
+    # A place search whose status never comes (its job killed with nothing written) must not hold compression up:
+    # past the wait, the rest is published without its files, which the run reports as failed.
+    def test_a_late_search_that_never_ends_is_left_out_after_the_wait(self):
+        status = os.path.join(self.tmp.name, "place-search.status")
+
+        thread, result = self.start_late_run("--late-search", status, "--late-search-timeout", "1")
+        thread.join(60)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(self.status, 0)
+        self.assertEqual(sorted(result["cfg"]["files"]), sorted(r for r in self.files if r not in self.SEARCH))
+        for rel in self.SEARCH:
+            self.assertFalse(os.path.exists(self.path(rel) + ".zst"), rel)
+        self.assertIn("no place search status", result["printed"])
+
+
+class SchedulerTest(unittest.TestCase):
+    def run_jobs(self, cpus, jobs):
+        """Runs sut.job(ticket, fn) for each fn of `jobs` on its own thread, the last submitted started first;
+        returns each one's exception (None when it returned) once all ended, or fails the test on a hang."""
+        tickets = [cpus.ticket() for _ in jobs]
+        errors = [None] * len(jobs)
+
+        def run(i):
+            try:
+                sut.job(tickets[i], jobs[i])
+            except Exception as e:  # noqa: BLE001
+                errors[i] = e
+
+        threads = [threading.Thread(target=run, args=(i,), daemon=True) for i in range(len(jobs))]
+        for t in reversed(threads):
+            t.start()
+            time.sleep(0.01)
+        for t in threads:
+            t.join(10)
+        self.assertFalse(any(t.is_alive() for t in threads), "the jobs hung")
+        return errors
+
+    def test_jobs_take_their_threads_in_the_order_they_were_submitted(self):
+        order = []
+
+        def takes(i):
+            def fn(ticket):
+                ticket.take(1)
+                order.append(i)
+            return fn
+
+        self.run_jobs(sut.Cpus(1), [takes(i) for i in range(5)])
+
+        self.assertEqual(order, [0, 1, 2, 3, 4])
+
+    def test_a_job_that_fails_before_its_turn_passes_the_turn_on(self):
+        order = []
+
+        def fails(ticket):
+            raise OSError("planted")
+
+        def takes(i):
+            def fn(ticket):
+                ticket.take(2)
+                order.append(i)
+            return fn
+
+        errors = self.run_jobs(sut.Cpus(2), [takes(0), fails, takes(2), takes(3)])
+
+        self.assertIsInstance(errors[1], OSError)
+        self.assertEqual([errors[0], errors[2], errors[3]], [None, None, None])
+        self.assertEqual(order, [0, 2, 3])
+
+    def test_a_job_that_raises_gives_back_the_threads_it_held(self):
+        def holds(ticket):
+            ticket.take(2)
+            raise RuntimeError("planted")
+
+        def takes(ticket):
+            ticket.take(2)
+
+        errors = self.run_jobs(sut.Cpus(2), [holds, takes, takes])
+
+        self.assertIsInstance(errors[0], RuntimeError)
+        self.assertEqual(errors[1:], [None, None])
 
 
 if __name__ == "__main__":
