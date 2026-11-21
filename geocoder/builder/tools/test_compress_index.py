@@ -587,9 +587,9 @@ sut.run_logged = run_logged
         with open(taken) as f:
             self.assertEqual(f.read(), "0\n")
 
-    # A place search that failed still leaves the indexes it built, published as they are today.
+    # A place search that failed still leaves the indexes it built, published as they are today, in the same bytes.
     def test_a_late_search_that_failed_publishes_the_indexes_it_left(self):
-        expected_cfg, _ = self.compressed_copy()
+        expected_cfg, expected_zst = self.compressed_copy()
         status = os.path.join(self.tmp.name, "place-search.status")
         with open(status, "w") as f:
             f.write("1\n")
@@ -599,6 +599,7 @@ sut.run_logged = run_logged
 
         self.assertEqual(self.status, 0)
         self.assertEqual(cfg, expected_cfg)
+        self.assertEqual(self.zst_files(), expected_zst)
         with open(taken) as f:
             self.assertEqual(f.read(), "1\n")
 

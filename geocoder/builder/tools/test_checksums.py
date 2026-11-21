@@ -4,6 +4,7 @@ ends, the rest in Finalize, configurations.json after its splice. And how the ni
 Run: python3 -m unittest discover -s geocoder/builder/tools"""
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -86,8 +87,10 @@ class ChecksumsTest(unittest.TestCase):
         self.assertEqual(done.returncode, 0, done.stderr)
         self.assertEqual(done.stdout, self.one_go())
 
-    # A .zst written after the early hash (a compression run again) has no line, or a stale one: the merge
-    # refuses, rather than publish a checksum that is not the file's.
+    # The merge checks that the .zst lines name the .zst files there, no more and no fewer, not that each hash is
+    # still its file's: a .zst written after the early hash, which has no line, is refused. One rewritten at a path
+    # that has a line would pass, which is why the compress step drops the early hash before it compresses again
+    # (test_a_compression_run_again_drops_the_earlier_hash).
     def test_a_zst_set_that_changed_after_its_hash_is_refused(self):
         self.hash_zst()
         write(os.path.join(self.out, "planet/full/late.bin.zst"), b"late")
@@ -122,10 +125,10 @@ class ChecksumsTest(unittest.TestCase):
         once = os.path.join(self.root, "change-once")
         open(once, "w").close()
         with open(os.path.join(bin_dir, "sha256sum"), "w") as f:
-            f.write(f'#!/bin/sh\n{shutil.which("sha256sum")} "$@"\n'
+            f.write(f'#!/bin/sh\n{shlex.quote(shutil.which("sha256sum"))} "$@"\n'
                     f'for a in "$@"; do\n'
-                    f'  if [ "$a" = ./configurations.json ] && [ -e {once} ]; then\n'
-                    f'    rm {once}\n    printf \'{{"build": {{"date": "2026-11-21"}}}}\' > ./configurations.json\n'
+                    f'  if [ "$a" = ./configurations.json ] && [ -e {shlex.quote(once)} ]; then\n'
+                    f'    rm {shlex.quote(once)}\n    printf \'{{"build": {{"date": "2026-11-21"}}}}\' > ./configurations.json\n'
                     f'  fi\ndone\n')
         os.chmod(os.path.join(bin_dir, "sha256sum"), 0o755)
 

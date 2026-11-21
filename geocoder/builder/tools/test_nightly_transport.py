@@ -5,6 +5,7 @@ Setup patches only from a build whose units are of this transport version, and a
 unit failed (its files went as .zst) is published but neither named by latest.json nor followed
 by a cleanup of the builds before it.
 Run: python3 -m unittest discover -s geocoder/builder/tools"""
+import contextlib
 import json
 import os
 import re
@@ -106,14 +107,23 @@ sys.exit(int(os.environ["COMPRESS_STATUS"]))
 
 SEARCH_FILES = ("planet/search/full/simplified/all/places.fst", "planet/search/full/simplified/all/search_meta.json")
 
+# checksums.sh zst for a step run: one line, for the step's output dir alone.
+ZST_LINE = "0" * 64 + "  ./planet/full/geo_cells.bin.zst"
+FAKE_CHECKSUMS = f"""#!/bin/sh
+[ "$1" = zst ] && [ "$2" = "$WORKDIR/output" ] || exit 2
+echo "{ZST_LINE}"
+"""
 
-def env_after(name, compress_status, search_status="0\n", late_status="", job=None):
+
+def env_after(name, compress_status, search_status="0\n", late_status="", job=None, left=None):
     """What the step `name` puts in GITHUB_ENV (a dict) when compress_index.py exits `compress_status`,
-    run as Actions runs it, on a night of no variants, with s5cmd, compress_index.py and
-    generate_patches.sh that do nothing else, place-search built and the place search job's status
-    `search_status` (None: none written), then `late_status` written as its status once compression
-    has taken it. With `job` (a dict) the place search job still runs, a process in a session of
-    its own, and `job` gets whether it still runs after the step and the search files it left."""
+    run as Actions runs it, on a night of no variants, with s5cmd, compress_index.py,
+    generate_patches.sh and checksums.sh that do nothing else, place-search built and the place
+    search job's status `search_status` (None: none written), then `late_status` written as its
+    status once compression has taken it. With `job` (a dict) the place search job still runs, a
+    process in a session of its own, and `job` gets whether it still runs after the step and the
+    search files it left. With `left` (a dict), it gets the .zst checksums the step left for
+    Finalize (zst.sha256, None for none) and whether their .part is left too."""
     with tempfile.TemporaryDirectory() as tmp:
         ws, work, bin_dir = (os.path.join(tmp, d) for d in ("ws", "work", "bin"))
         tools = os.path.join(ws, "geocoder", "builder", "tools")
@@ -132,6 +142,7 @@ def env_after(name, compress_status, search_status="0\n", late_status="", job=No
                 job["pid"] = int(f.read())
         fakes = {os.path.join(tools, "compress_index.py"): FAKE_COMPRESS,
                  os.path.join(tools, "generate_patches.sh"): "#!/bin/sh\nexit 0\n",
+                 os.path.join(tools, "checksums.sh"): FAKE_CHECKSUMS,
                  os.path.join(bin_dir, "s5cmd"): "#!/bin/sh\nexit 0\n",
                  os.path.join(work, "old-output.status"): "0\n",
                  os.path.join(work, "old-output.log"): "",
@@ -158,6 +169,12 @@ def env_after(name, compress_status, search_status="0\n", late_status="", job=No
             if job is not None:
                 job["running"] = alive(job["pid"])
                 job["search"] = sorted(rel for rel in SEARCH_FILES if os.path.exists(os.path.join(work, "output", rel)))
+            if left is not None:
+                zst = os.path.join(work, "zst.sha256")
+                with contextlib.suppress(FileNotFoundError), open(zst) as f:
+                    left["zst.sha256"] = f.read()
+                left.setdefault("zst.sha256", None)
+                left["part"] = os.path.exists(zst + ".part")
         finally:
             if job is not None and alive(job["pid"]):
                 os.kill(job["pid"], 9)
@@ -222,6 +239,17 @@ class NightlyTransportTest(unittest.TestCase):
                 self.assertEqual(advances_latest_json(env), not failed, f"{name}, {status}")
                 self.assertEqual(runs(CLEANUP, env), not failed, f"{name}, {status}")
                 self.assertEqual(runs("Fail run on transport unit failure", env), failed, f"{name}, {status}")
+
+    # Compression done, a failed unit's files gone as .zst included, both steps leave the .zst checksums for
+    # Finalize, which otherwise hashes the .zst again itself.
+    def test_both_compress_steps_leave_the_zst_checksums_for_finalize(self):
+        for name in (PATCH_STEP, COMPRESS_STEP):
+            for status in (0, 3):
+                with self.subTest(name=name, status=status):
+                    left = {}
+                    env_after(name, status, left=left)
+
+                    self.assertEqual(left, {"zst.sha256": ZST_LINE + "\n", "part": False})
 
     # The place search runs in the background beside compression, which waits for its status: the compress
     # step, which always follows, fails the run at its end for a failed, stopped or missing one.
