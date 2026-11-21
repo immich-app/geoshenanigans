@@ -6,11 +6,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake \
     && rm -rf /var/lib/apt/lists/*
 
+# query-portal is a bin of place-search, its sources query-server's
 WORKDIR /src
 COPY server/ server/
+COPY search/ search/
 COPY test-portal/index.html test-portal/index.html
 COPY builder/data/ builder/data/
-RUN cargo build --release --manifest-path server/Cargo.toml --bin query-portal
+RUN cargo build --release --locked --manifest-path search/Cargo.toml --features portal --bin query-portal
 
 # Runtime
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
@@ -19,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /src/server/target/release/query-portal /usr/local/bin/
+COPY --from=builder /src/search/target/release/query-portal /usr/local/bin/
 COPY test-portal/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
