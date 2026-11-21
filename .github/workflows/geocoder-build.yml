@@ -92,14 +92,17 @@ jobs:
           persist-credentials: false
 
       # The job's CPU, memory and work-volume IO, every 30 s from here to its
-      # end (job_sampler.sh), detached so it outlives this step; the runner
-      # stops it with the job. Its log goes up with the job's other logs
-      # (Upload job logs); its first line, here, gives the CPUs and the quota.
+      # end (job_sampler.sh), and what of the PBF pbf-apply reads and the one
+      # it writes, which build-index reads, is in the page cache; detached so
+      # it outlives this step; the runner stops it with the job. Its log goes
+      # up with the job's other logs (Upload job logs); its first line, here,
+      # gives the CPUs and the quota.
       - name: Start the job sampler
         env:
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           setsid nohup "$GITHUB_WORKSPACE/geocoder/builder/tools/job_sampler.sh" "$RUNNER_TEMP/jobstat.log" "$RUNNER_TEMP" 30 \
+            "$RUNNER_TEMP/geocoder/planet.osm.pbf" "$RUNNER_TEMP/geocoder/planet-tmp.osm.pbf" \
             > /dev/null 2>&1 < /dev/null &
           sleep 1
           head -1 "$RUNNER_TEMP/jobstat.log" || true
