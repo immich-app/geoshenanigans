@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -41,6 +42,23 @@ def step_script(name):
 
 def index_of(name):
     return [n for n, _ in steps()].index(name)
+
+
+def loop_of(script, first):
+    """The lines of `script` from the first that starts with `first` (indentation aside) to its loop's `done`."""
+    lines = script.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.lstrip().startswith(first))
+    end = next(i for i in range(at, len(lines)) if re.search(r"(^|; )done$", lines[i].strip()))
+    return "\n".join(line.strip() for line in lines[at:end + 1]) + "\n"
+
+
+def block_at(script, first):
+    """The lines of `script` from the first that is `first` (indentation aside) to the `fi` that closes it."""
+    lines = script.splitlines()
+    at = next(i for i, line in enumerate(lines) if line.strip() == first)
+    indent = lines[at][:len(lines[at]) - len(lines[at].lstrip())]
+    end = next(i for i in range(at + 1, len(lines)) if lines[i] == indent + "fi")
+    return "\n".join(line[len(indent):] for line in lines[at:end + 1]) + "\n"
 
 
 class DownloadTest(unittest.TestCase):
@@ -458,6 +476,95 @@ class PostBuildTest(unittest.TestCase):
         script = step_script("Finalize upload and configurations.json")
         self.assertLess(script.index('[ -s "$WORKDIR/sidecars.status" ]'), script.index("cp --if-size-differ"))
         self.assertIn("Caching today's PBF ended at $(date -u -r \"$WORKDIR/pbf-cache.status\" +%H:%M:%S)", script)
+
+    # The step only starts the job: it returns while the job runs, leaves the job's session for Compress index
+    # files, and the job's exit status comes once it ends.
+    def test_the_place_search_step_returns_while_its_job_runs(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        tools = os.path.join(root, "ws", "geocoder", "builder", "tools")
+        work = os.path.join(root, "work")
+        os.makedirs(tools)
+        os.makedirs(work)
+        release = os.path.join(root, "release")
+        self.addCleanup(lambda: open(release, "w").close())
+        with open(os.path.join(tools, "place_search_indexes.sh"), "w") as f:
+            f.write(f'#!/bin/sh\necho "$@" > {root}/args\nuntil [ -e {release} ]; do /usr/bin/sleep 0.05; done\nexit 3\n')
+        os.chmod(os.path.join(tools, "place_search_indexes.sh"), 0o755)
+        env = {"PATH": os.environ["PATH"], "WORKDIR": work, "RUNNER_TEMP": root, "GITHUB_WORKSPACE": os.path.join(root, "ws")}
+        start = time.time()
+        try:
+            subprocess.run(["bash", "-e", "-c", step_script("Build place search indexes")], env=env, check=True,
+                           capture_output=True, timeout=20)
+        except subprocess.TimeoutExpired:
+            self.fail("the step waited for the place search")
+        self.assertLess(time.time() - start, 10)
+
+        with open(os.path.join(work, "place-search.pid")) as f:
+            session = f.read().strip()
+        self.assertEqual(subprocess.run(["pgrep", "-s", session], capture_output=True).returncode, 0)
+        self.assertFalse(os.path.exists(os.path.join(work, "place-search.status")))
+        open(release, "w").close()
+        deadline = time.time() + 10
+        while time.time() < deadline and not os.path.exists(os.path.join(work, "place-search.status")):
+            time.sleep(0.05)
+        time.sleep(0.1)
+        with open(os.path.join(work, "place-search.status")) as f:
+            self.assertEqual(f.read().strip(), "3")
+        with open(os.path.join(root, "args")) as f:
+            self.assertEqual(f.read().split(), [os.path.join(work, "output"),
+                                                os.path.join(root, "ws", "geocoder/search/target/release/place-search"),
+                                                os.path.join(root, "search.status"), "1800"])
+
+    def wait_for(self, script, status, env=None):
+        """Runs `script` with a sleep of 10 ms; `status` (a file under the run's dir) is written "0" a second in.
+        Returns how long it took and what it printed."""
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        bin_dir = os.path.join(root, "bin")
+        os.makedirs(bin_dir)
+        with open(os.path.join(bin_dir, "sleep"), "w") as f:
+            f.write("#!/bin/sh\nexec /usr/bin/sleep 0.01\n")
+        os.chmod(os.path.join(bin_dir, "sleep"), 0o755)
+        open(os.path.join(root, "sidecars.run"), "w").close()
+
+        def write_status():
+            with open(os.path.join(root, status + ".part"), "w") as f:
+                f.write("0\n")
+            os.rename(os.path.join(root, status + ".part"), os.path.join(root, status))
+
+        timer = threading.Timer(1.0, write_status)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        start = time.time()
+        done = subprocess.run(["bash", "-e", "-c", script], capture_output=True, text=True, timeout=30,
+                              env={"PATH": f"{bin_dir}:{os.environ['PATH']}", "WORKDIR": root, "RUNNER_TEMP": root,
+                                   **(env or {})})
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        return time.time() - start, done.stdout
+
+    # Both steps that compress wait, before they start it, for geocoder-transport's build (its status).
+    def test_compression_waits_for_geocoder_transport(self):
+        for name in ("Generate patches and verify", "Compress index files"):
+            with self.subTest(name=name):
+                loop = loop_of(step_script(name), 'until [ -s "$RUNNER_TEMP/search.status" ]')
+
+                took, _ = self.wait_for("WAIT_START=$(date +%s)\nCOMPRESS_START=$WAIT_START\n" + loop, "search.status")
+
+                self.assertGreaterEqual(took, 0.9)
+
+    # The compress step after a failed background run lets the sidecars' upload that run started end before it
+    # clears the prefix; Finalize lets it end before its first pass.
+    def test_the_sidecars_upload_ends_before_the_prefix_is_cleared_again_and_before_finalize(self):
+        for name in ("Compress index files", "Finalize upload and configurations.json"):
+            with self.subTest(name=name):
+                block = block_at(step_script(name), 'if [ -f "$WORKDIR/sidecars.run" ]; then')
+
+                took, out = self.wait_for("COMPRESS_START=$(date +%s)\nUPLOAD_START=$COMPRESS_START\n" + block,
+                                          "sidecars.status")
+
+                self.assertGreaterEqual(took, 0.9)
+                self.assertNotIn("::warning::", out)
 
     # The watchdog tells a retry from a failure a rerun repeats by these steps' names.
     def test_every_step_the_watchdog_names_is_a_step_of_the_nightly(self):
