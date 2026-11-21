@@ -210,6 +210,42 @@ are ready, and is asked again after the `Retry-After`; one whose index
 failed says why. A server without `/datasets`, or whose `/datasets` names
 no indexes, shows no search.
 
+Someone who disagrees with an answer can tell us what they expected. Each
+column's answer in the detail and each column's search has a "Disagree?"
+button, and the toolbar's Feedback sends a general report. Its form sends
+the column's dataset, the build that answered and the answer the page
+showed, what they expected (in words; by name, road, house number, city,
+postcode and country; or that the answer should be empty), a comment and
+the link's state to `POST /feedback?key=`, a JSON body of at most 16 KiB
+(413 past it; the page cuts an answer of over 8 KiB to the start of its
+JSON). A client IP sends 20 reports a minute (429 past them), a body that
+isn't a report is a 400, and one kept a 201. `GET /feedback/count`, of no
+key, gives `{"today": <n>, "total": <n>}`, which the page thanks with. The
+portal appends each report as one JSON line to
+`<data>/feedback/<YYYY-MM-DD>.jsonl` of the UTC day it came: on the box,
+`/ssd/test-portal/data-portal/feedback/`, the volume of the portal on
+`:3002`. A report keeps only its own fields: nothing of who sent it, no IP
+and no email, as the form says. A line (one line in the file):
+
+```json
+{"received": "2026-11-21T20:41:07Z", "kind": "reverse", "lat": 48.8584, "lon": 2.2945,
+ "q": null, "result_index": null, "dataset": "admin-minimal.simplified.none",
+ "build": "2026-11-21-9bc04e7d1a25", "answer": {"display_name": "Paris, France", "address": {}},
+ "answer_trimmed": false,
+ "expected": {"text": "the Eiffel Tower", "name": null, "road": "Avenue Gustave Eiffel",
+              "house_number": null, "city": null, "postcode": null, "country": null, "empty": false},
+ "comment": "the tower is right there",
+ "page": {"columns": ["with-addresses", "smallest"], "point": {"lat": 48.8584, "lon": 2.2945}, "q": null}}
+```
+
+`kind` is `reverse` (at `lat`, `lon`), `search` (of `q`, and of its
+result at `result_index`, from 0, at that result's point; `null` for the
+results as a whole) or `general` (at the selected point, if any, of no
+dataset). `answer` is the JSON the page showed, a reverse lookup's answer
+or a search's results, or the start of it as a string where
+`answer_trimmed` is true. `page` is the link's `d=` (the columns), `at=`
+and `q=`.
+
 The test key the page sends allows 200 requests a second and 5,000,000 a
 day (UTC), shared by every visitor. The page keeps 8 in flight and asks a
 429 of `/reverse` or `/search` again after a pause (a search's 429 pauses
