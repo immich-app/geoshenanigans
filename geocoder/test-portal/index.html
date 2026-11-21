@@ -892,6 +892,16 @@ function cardHtml(entry, views, selected) {
   return `${html}</div>`;
 }
 
+// Nominatim's view of a result (detailHtml): its answer, its request in
+// flight, or why it has none.
+function nominatimView(entry) {
+  const answer = entry.nominatimLoading ? { loading: true }
+    : entry.nominatim ? { data: entry.nominatim }
+    : entry.nominatimError ? { error: entry.nominatimError }
+    : null;
+  return { label: 'Nominatim', color: NOMINATIM_COLOR, dataset: null, answer };
+}
+
 // The status line from the portal's /health: the build served (or why
 // none), how the sync goes, and the builds it refused or found damaged.
 function statusHtml(health) {
@@ -1323,7 +1333,6 @@ function reverseGeocode(lat, lng, source) {
   map.flyTo({ center: [lng, lat], zoom: Math.max(map.getZoom(), 10) });
   placeMarker(entry);
   selectResult(entry.id);
-  askNominatim(entry);
 }
 
 // The link's points: each asked afresh in every column (a stored result of
@@ -1376,15 +1385,20 @@ async function ask(entry, key, col) {
   answered(entry);
 }
 
+// Asks Nominatim, where it is on, for `entry`, unless it has its answer or
+// is being asked; a request that failed is asked again.
 async function askNominatim(entry) {
   if (!nominatimEnabled || entry.nominatim || entry.nominatimLoading) return;
   entry.nominatimLoading = true;
+  entry.nominatimError = null;
   answered(entry);
   try {
     const got = await nominatimPacer.request(`https://nominatim.openstreetmap.org/reverse?lat=${entry.lat}&lon=${entry.lng}&format=jsonv2`);
-    entry.nominatim = got.status === 200 ? JSON.parse(got.body) : null;
+    const answer = answerOf(got.status, () => null, got.body, got.ms);
+    entry.nominatim = answer.data || null;
+    entry.nominatimError = answer.error || null;
   } catch (e) {
-    entry.nominatim = null;
+    entry.nominatimError = e.message;
   }
   entry.nominatimLoading = false;
   answered(entry);
@@ -1498,11 +1512,14 @@ function legacyCopy(text, cb) {
 }
 
 // Selects a result: its card, its detail (any column it has no answer of
-// asked), its polygons and the link.
+// asked, and Nominatim where it is on), its polygons and the link.
 function selectResult(id) {
   selectedId = id;
   const entry = selectedEntry();
-  if (entry) askColumns(entry);
+  if (entry) {
+    askColumns(entry);
+    askNominatim(entry);
+  }
   renderResults();
   showDetail(id);
   if (polygonsColumn !== 'off') updatePolygonLayer(id);
@@ -1686,10 +1703,7 @@ function showDetail(id) {
   if (!entry) { panel.classList.remove('visible'); detailShown = null; return; }
   panel.classList.add('visible');
   const views = columnViews(entry);
-  if (nominatimEnabled) {
-    const answer = entry.nominatimLoading ? { loading: true } : entry.nominatim ? { data: entry.nominatim } : null;
-    views.push({ label: 'Nominatim', color: NOMINATIM_COLOR, dataset: null, answer });
-  }
+  if (nominatimEnabled) views.push(nominatimView(entry));
   // An answer coming in keeps the JSON blocks of the result open.
   const open = detailShown === id ? [...content.querySelectorAll('details')].map((d) => d.open) : [];
   content.innerHTML = detailHtml(views, servedBuild());

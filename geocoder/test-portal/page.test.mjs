@@ -489,6 +489,16 @@ test('a request that fails frees its place', async () => {
   assert.equal((await pacer.request('b')).body, 'ok');
 });
 
+test("Nominatim's column shows its answer, its request in flight, or why it failed", () => {
+  const { nominatimView, detailHtml } = core();
+  assert.deepEqual(plain(nominatimView({ nominatim: { display_name: 'Paris' } }).answer), { data: { display_name: 'Paris' } });
+  assert.deepEqual(plain(nominatimView({ nominatim: null, nominatimLoading: true }).answer), { loading: true });
+  const failed = nominatimView({ nominatim: null, nominatimError: 'HTTP 429: Too Many Requests' });
+  assert.deepEqual(plain(failed.answer), { error: 'HTTP 429: Too Many Requests' });
+  const out = detailHtml([failed], '2026-11-20');
+  assert.ok(out.includes('<div class="result-error">HTTP 429: Too Many Requests</div>') && !out.includes('not asked yet'), out);
+});
+
 test('the polygon overlay cycles off, each column, off', () => {
   const { nextPolygons } = core();
   assert.deepEqual([nextPolygons('off', 2), nextPolygons(0, 2), nextPolygons(1, 2)], [0, 1, 'off']);
