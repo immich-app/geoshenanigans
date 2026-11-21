@@ -4,7 +4,9 @@ a scheduled night under the live one, and the Setup step refuses a prefix the cl
 Run: python3 -m unittest discover -s geocoder/builder/tools"""
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -42,10 +44,13 @@ class S3PrefixTest(unittest.TestCase):
         self.assertRegex(nightly(), r"(?m)^  S3_PREFIX: \$\{\{ inputs\.s3_prefix \|\| 'geocoder' \}\}$")
 
     def test_every_bucket_path_goes_under_the_prefix(self):
-        # The builds, latest.json and memwatch keys all sit under it, so a scratch run touches nothing live.
+        # The builds, latest.json and memwatch keys all sit under it, so a scratch run touches nothing live; the
+        # one live path is the build a scratch run's seed copies from.
         paths = re.findall(r"s3://\$S3_BUCKET/([^\"\s]*)", nightly())
         self.assertTrue(paths)
-        self.assertEqual([p for p in paths if not p.startswith("$S3_PREFIX/")], [])
+        self.assertEqual([p for p in paths if not p.startswith("$S3_PREFIX/")], ["geocoder/builds/$PREV_DATE/*"])
+        self.assertEqual(len(re.findall(r'cp "s3://\$S3_BUCKET/geocoder/builds/\$PREV_DATE/\*" '
+                                        r'"s3://\$S3_BUCKET/\$S3_PREFIX/builds/\$PREV_DATE/"', nightly())), 1)
 
     def test_the_setup_refuses_a_prefix_that_is_not_one_segment(self):
         script = prefix_check()
@@ -56,6 +61,132 @@ class S3PrefixTest(unittest.TestCase):
             r = subprocess.run(["bash", "-c", script], env={"S3_PREFIX": prefix, "PATH": os.environ["PATH"]},
                                capture_output=True, text=True)
             self.assertEqual(r.returncode == 0, ok, f"{prefix!r}: {r.stdout}{r.stderr}")
+
+
+def step(name):
+    """The lines of the nightly's step `name`, but for its `- name:` line."""
+    block = re.search(rf"^      - name: {re.escape(name)}\n((?:(?: {{8}}.*)?\n)*)", nightly(), re.M)
+    return block.group(1) if block else None
+
+
+def step_script(name):
+    """The `run:` script of the step `name`, unindented."""
+    run = re.search(r"^        run: \|\n((?:(?: {10}.*)?\n)*)", step(name), re.M)
+    return "".join(line[10:] + "\n" for line in run.group(1).splitlines()) if run else None
+
+
+def block_from(script, first_line):
+    """The lines of `script` from the one that starts with `first_line` to the `fi` that closes it."""
+    found = re.search(rf"^{re.escape(first_line)}.*\n(?:.*\n)*?fi\n", script, re.M)
+    return found.group(0) if found else None
+
+
+class FakeS5cmd:
+    """An s5cmd on PATH that logs its arguments, a line a call, and does nothing else."""
+
+    def __init__(self, test):
+        self.root = tempfile.mkdtemp()
+        test.addCleanup(shutil.rmtree, self.root)
+        self.calls = os.path.join(self.root, "calls")
+        for tool in ("s5cmd", "python3"):
+            with open(os.path.join(self.root, tool), "w") as f:
+                f.write(f'#!/bin/sh\necho "{tool} $*" >> "{self.calls}"\n')
+            os.chmod(os.path.join(self.root, tool), 0o755)
+        self.path = f"{self.root}:{os.environ['PATH']}"
+
+    def logged(self):
+        if not os.path.exists(self.calls):
+            return []
+        with open(self.calls) as f:
+            return f.read().splitlines()
+
+
+class ScratchPbfCacheTest(unittest.TestCase):
+    """A scratch prefix's run keeps off the PBF cache the nightly reads: it never takes today's PBF from there (so
+    it applies the diff, and can run after the nightly), writes its own PBF under a key of its own and deletes it
+    afterwards, and prunes nothing shared."""
+
+    def pbf_cache(self, prefix):
+        script = block_from(step_script("Setup"), 'if [ "$S3_PREFIX" = geocoder ]; then')
+        self.assertIsNotNone(script)
+        return subprocess.run(["bash", "-c", script + 'echo "$PBF_CACHE"'], env={"S3_PREFIX": prefix, "PATH": os.environ["PATH"]},
+                              check=True, capture_output=True, text=True).stdout.strip()
+
+    def test_a_live_run_uses_the_shared_key_and_a_scratch_run_one_of_its_own(self):
+        self.assertEqual(self.pbf_cache("geocoder"), "geocoder-cache")
+        self.assertEqual(self.pbf_cache("nightly-speed-1121"), "geocoder-scratch/nightly-speed-1121")
+        self.assertIn('echo "pbf_cache=$PBF_CACHE" >> "$GITHUB_OUTPUT"', step_script("Setup"))
+
+    def test_only_yesterdays_pbf_is_read_from_the_shared_key_whatever_the_prefix(self):
+        paths = re.findall(r"s3://\$CACHE_BUCKET/([^\"\s]*)", nightly())
+        self.assertTrue(paths)
+        self.assertEqual([p for p in paths if not p.startswith("$PBF_CACHE/")],
+                         ["geocoder-cache/planet-${YESTERDAY}.osm.pbf"] * 2)
+        for name in ("Download PBF and previous indexes", "Build geocoder index", "Cleanup old cache bucket"):
+            self.assertIn("PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}", step(name), name)
+
+    def run_cleanup(self, pbf_cache):
+        s5 = FakeS5cmd(self)
+        work = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, work)
+        script = step_script("Cleanup old cache bucket")
+        env = {"PATH": s5.path, "PBF_CACHE": pbf_cache, "CACHE_BUCKET": "cache", "CACHE_ENDPOINT": "http://cache.invalid",
+               "CACHE_AWS_KEY": "k", "CACHE_AWS_SECRET": "s", "NEW_DATE": "2026-11-21", "KEEP_CACHE_PBF_DAYS": "2",
+               "WORKDIR": work, "GITHUB_WORKSPACE": "/ws"}
+        subprocess.run(["bash", "-e", "-c", script], env=env, check=True, capture_output=True, text=True)
+        return s5.logged()
+
+    def test_a_scratch_run_deletes_its_own_key_and_nothing_else(self):
+        calls = self.run_cleanup("geocoder-scratch/nightly-speed-1121")
+
+        self.assertEqual(calls, ["s5cmd --endpoint-url http://cache.invalid --retry-count 5 --numworkers 15 "
+                                 "rm s3://cache/geocoder-scratch/nightly-speed-1121/*"])
+
+    def test_a_live_run_prunes_the_shared_key_and_aborts_its_stale_uploads(self):
+        calls = self.run_cleanup("geocoder-cache")
+
+        self.assertIn("s5cmd --endpoint-url http://cache.invalid --retry-count 5 --numworkers 15 "
+                      "ls s3://cache/geocoder-cache/planet-*.osm.pbf", calls)
+        self.assertTrue([c for c in calls if c.startswith("python3 /ws/geocoder/builder/tools/abort_stale_uploads.py")])
+
+
+class SeedPreviousTest(unittest.TestCase):
+    """seed_previous copies the live build of the day before into a scratch prefix, for a test run's patch night."""
+
+    def run_seed(self, prefix, seed):
+        s5 = FakeS5cmd(self)
+        script = block_from(step_script("Setup"), 'if [ "$SEED_PREVIOUS" = true ]; then')
+        self.assertIsNotNone(script)
+        done = subprocess.run(["bash", "-e", "-c", script], capture_output=True, text=True,
+                              env={"PATH": s5.path, "S3_PREFIX": prefix, "SEED_PREVIOUS": seed, "S3_BUCKET": "bucket",
+                                   "S3_ENDPOINT": "https://s3.invalid", "PREV_DATE": "2026-11-20"})
+        return done.returncode, s5.logged()
+
+    def test_a_dispatch_may_ask_for_it_and_a_scheduled_night_does_not(self):
+        spec = dispatch_input("seed_previous")
+        self.assertIsNotNone(spec)
+        self.assertEqual((spec.get("type"), spec.get("default")), ("boolean", "false"))
+        self.assertIn("SEED_PREVIOUS: ${{ inputs.seed_previous }}", step("Setup"))
+
+    def test_it_copies_the_live_build_into_the_scratch_prefix(self):
+        status, calls = self.run_seed("nightly-speed-1121", "true")
+
+        self.assertEqual(status, 0)
+        self.assertEqual(calls, ["s5cmd --endpoint-url https://s3.invalid --retry-count 5 --numworkers 32 "
+                                 "cp s3://bucket/geocoder/builds/2026-11-20/* s3://bucket/nightly-speed-1121/builds/2026-11-20/"])
+
+    def test_it_refuses_the_live_prefix_and_does_nothing_unasked(self):
+        status, calls = self.run_seed("geocoder", "true")
+        self.assertNotEqual(status, 0)
+        self.assertEqual(calls, [])
+        for seed in ("false", ""):
+            status, calls = self.run_seed("nightly-speed-1121", seed)
+            self.assertEqual((status, calls), (0, []))
+
+    # The seed lands before Setup looks for the previous build, which the run then patches from.
+    def test_it_lands_before_the_previous_build_is_looked_for(self):
+        script = step_script("Setup")
+        self.assertLess(script.index('if [ "$SEED_PREVIOUS" = true ]; then'), script.index('PREV_BUILD="s3://'))
 
 
 if __name__ == "__main__":

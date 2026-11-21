@@ -34,6 +34,11 @@ on:
         required: false
         type: string
         default: 'geocoder'
+      seed_previous:
+        description: 'With a scratch s3_prefix: first copy the live build of the day before into it, for a patch night'
+        required: false
+        type: boolean
+        default: false
 
 env:
   S3_BUCKET: geoshenanigans-reverse-geocoding
@@ -219,6 +224,7 @@ jobs:
         env:
           BUILD_DATE: ${{ inputs.build_date }}
           FORCE_FRESH: ${{ inputs.force_fresh }}
+          SEED_PREVIOUS: ${{ inputs.seed_previous }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           # The cleanup steps delete under builds/ of the prefix: one segment,
@@ -245,6 +251,18 @@ jobs:
           fi
           echo "cache_endpoint=http://${BUCKET_HOST}:${BUCKET_PORT}" >> "$GITHUB_OUTPUT"
           echo "cache_bucket=$BUCKET_NAME" >> "$GITHUB_OUTPUT"
+          # The PBF cache key the run looks for today's PBF under and writes it
+          # to: the shared one on a live run; on a scratch prefix's its own,
+          # which Cleanup old cache bucket deletes, so a test run neither takes
+          # the nightly's PBF of the day (it applies the diff) nor writes or
+          # prunes the shared ones. Yesterday's comes from the shared key, read
+          # only, either way.
+          if [ "$S3_PREFIX" = geocoder ]; then
+            PBF_CACHE=geocoder-cache
+          else
+            PBF_CACHE=geocoder-scratch/$S3_PREFIX
+          fi
+          echo "pbf_cache=$PBF_CACHE" >> "$GITHUB_OUTPUT"
 
           # Determine target date + sequence
           SERVER="https://planet.openstreetmap.org/replication/day"
@@ -278,6 +296,19 @@ jobs:
           echo "Build date: $TARGET_DATE (seq $TARGET_SEQ)"
           echo "Previous:   $PREV_DATE"
           echo "Server:     $CURRENT_DATE (seq $CURRENT_SEQ, offset: -${DAYS_OFFSET}d)"
+
+          # A scratch prefix's patch night: the live build of the day before,
+          # copied in server side (~30 GB, its sidecars too) for the run to
+          # patch from. Never into the live prefix.
+          if [ "$SEED_PREVIOUS" = true ]; then
+            if [ "$S3_PREFIX" = geocoder ]; then
+              echo "::error::seed_previous copies the live build into a scratch s3_prefix; this run publishes the live builds"
+              exit 1
+            fi
+            echo "Seeding $S3_PREFIX/builds/$PREV_DATE with the live build of $PREV_DATE"
+            s5cmd --endpoint-url "$S3_ENDPOINT" --retry-count 5 --numworkers 32 \
+              cp "s3://$S3_BUCKET/geocoder/builds/$PREV_DATE/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE/"
+          fi
 
           # Check if previous build exists on Tigris with compatible build_version.
           # Look for an index file, not just the directory: dates past the
@@ -323,6 +354,7 @@ jobs:
           YESTERDAY: ${{ steps.setup.outputs.yesterday }}
           TODAY: ${{ steps.setup.outputs.today }}
           HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
+          PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}
         run: |
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
@@ -492,9 +524,9 @@ jobs:
             return 1
           }
 
-          if cache_exists "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" "planet-"; then
+          if cache_exists "s3://$CACHE_BUCKET/$PBF_CACHE/planet-${TODAY}.osm.pbf" "planet-"; then
             if download_pbf_from_cache \
-                "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" \
+                "s3://$CACHE_BUCKET/$PBF_CACHE/planet-${TODAY}.osm.pbf" \
                 "$WORKDIR/planet.osm.pbf" "today's PBF ($TODAY)"; then
               echo "pbf_source=today" >> "$GITHUB_OUTPUT"
             else
@@ -653,6 +685,7 @@ jobs:
           WIKIDATA_DATE: ${{ steps.download.outputs.wikidata_date }}
           TIGER_FILE: ${{ steps.download.outputs.tiger_data }}
           GEONAMES_FILE: ${{ steps.download.outputs.postcode_centroids_external }}
+          PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
@@ -661,7 +694,8 @@ jobs:
           # Two transfers run beside the build, detached so they outlive this
           # step; each writes its exit status last for the step that needs it.
           # - Today's PBF goes to the cache for tomorrow's run (skipped if it
-          #   came from there); Finalize waits for it, then frees the disk.
+          #   came from there), under the run's own key on a scratch prefix;
+          #   Finalize waits for it, then frees the disk.
           # - Yesterday's client files come down and decompress for patch
           #   generation, which waits for them; its transport units decode
           #   once geocoder-transport is built (Build place search).
@@ -670,7 +704,7 @@ jobs:
             # The inner script expands its own arguments ($0 is the status file).
             # shellcheck disable=SC2016
             setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/pbf-cache.status" \
-              $CACHE cp --concurrency 16 "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/geocoder-cache/planet-${TODAY}.osm.pbf" \
+              $CACHE cp --concurrency 16 "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/$PBF_CACHE/planet-${TODAY}.osm.pbf" \
               > "$WORKDIR/pbf-cache.log" 2>&1 < /dev/null &
           fi
           if [ "$HAS_PREVIOUS" = "true" ]; then
@@ -1240,28 +1274,42 @@ jobs:
       # (geocoder-cache/planet-<DATE>.osm.pbf); the download step only ever
       # reads today's and yesterday's. Pruning goes by date alone, so it runs
       # after a failed build too: a run that fails once it has cached its
-      # PBF would otherwise leave ~99 GB behind each day.
+      # PBF would otherwise leave ~99 GB behind each day. A scratch prefix's
+      # run deletes its own key instead (Setup's pbf_cache), once its upload
+      # has ended, and leaves the shared PBFs and uploads as they are.
       - name: Cleanup old cache bucket
         if: ${{ !cancelled() && steps.setup.outputs.cache_bucket != '' }}
         env:
           CACHE_ENDPOINT: ${{ steps.setup.outputs.cache_endpoint }}
           CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
           NEW_DATE: ${{ steps.setup.outputs.today }}
+          PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}
+          WORKDIR: ${{ steps.setup.outputs.workdir }}
         run: |
           set -eu
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
+
+          if [ "$PBF_CACHE" != geocoder-cache ]; then
+            if [ -f "$WORKDIR/pbf-cache.log" ]; then
+              WAIT_START=$(date +%s)
+              until [ -s "$WORKDIR/pbf-cache.status" ] || [ $(( $(date +%s) - WAIT_START )) -gt 1800 ]; do sleep 10; done
+            fi
+            echo "Scratch PBF cache: deleting $PBF_CACHE"
+            $CACHE rm "s3://$CACHE_BUCKET/$PBF_CACHE/*" > /dev/null 2>&1 || true
+            exit 0
+          fi
 
           # Every planet-*.osm.pbf not dated from the cutoff on goes, an
           # undated name too.
           PBF_CUTOFF=$(date -u -d "$NEW_DATE -${KEEP_CACHE_PBF_DAYS} days +1 day" +%Y-%m-%d)
           echo "Cache PBFs: keep ≥ $PBF_CUTOFF"
-          for name in $($CACHE ls "s3://$CACHE_BUCKET/geocoder-cache/planet-*.osm.pbf" 2>/dev/null | awk '{print $NF}'); do
+          for name in $($CACHE ls "s3://$CACHE_BUCKET/$PBF_CACHE/planet-*.osm.pbf" 2>/dev/null | awk '{print $NF}'); do
             d=$(echo "$name" | sed -n -E 's/^planet-([0-9]{4}-[0-9]{2}-[0-9]{2})\.osm\.pbf$/\1/p')
             if [ -n "$d" ] && { [ "$d" \> "$PBF_CUTOFF" ] || [ "$d" = "$PBF_CUTOFF" ]; }; then
               echo "  $name: KEEP"
             else
               echo "  $name: DELETE"
-              $CACHE rm "s3://$CACHE_BUCKET/geocoder-cache/$name" >/dev/null 2>&1 || true
+              $CACHE rm "s3://$CACHE_BUCKET/$PBF_CACHE/$name" >/dev/null 2>&1 || true
             fi
           done
 
