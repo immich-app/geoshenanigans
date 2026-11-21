@@ -10,8 +10,10 @@
 // build goes into a dir of its own, named anew, which no server maps until
 // it is complete: a sync never writes into the dir of the build served,
 // and a build found damaged is fetched again into a new dir. A sync killed
-// part way resumes in its dir, fetching only the objects its ledger
-// doesn't name. Files of the same bytes within a build are fetched once and
+// part way resumes in its dir: it removes what its ledger doesn't name (an
+// object in place before its line went in, a try's temporary file), then
+// weighs the room it needs for the objects still to fetch, and fetches only
+// those. Files of the same bytes within a build are fetched once and
 // hard-linked (catalog::Object::link).
 //
 // A build is the one of a date as its configurations.json was published: a
@@ -155,6 +157,43 @@ fn sized(root: &Path, cfg: &Configurations, files: &[String]) -> bool {
     files.iter().all(|f| std::fs::metadata(root.join(f)).is_ok_and(|m| m.is_file() && m.len() == cfg.files[f].size_raw))
 }
 
+/// Removes from the build dir `root`, of a sync left part way, every file
+/// its ledger doesn't account for: all but its manifest, its ledger and
+/// `keep` (the files of the objects the ledger names, there at their
+/// sizes). So go an object a kill left in place before its line went in,
+/// the files of one the ledger names that aren't whole, a try's temporary
+/// file and the links made before a kill. A decode's dir
+/// (`.transport.<pid>.<n>`) stays: finish_leftovers_in finished each whose
+/// decode is gone. The files removed, and the bytes that frees.
+fn reconcile(root: &Path, keep: &HashSet<String>) -> std::io::Result<(usize, u64)> {
+    fn walk(dir: &Path, at: &str, keep: &HashSet<String>, removed: &mut (usize, u64)) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let err = |path: &Path, e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", path.display()));
+        for entry in std::fs::read_dir(dir).map_err(|e| err(dir, e))? {
+            let entry = entry.map_err(|e| err(dir, e))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if at.is_empty() && (name == MANIFEST || name == FETCHED) {
+                continue;
+            }
+            let path = if at.is_empty() { name.clone() } else { format!("{at}/{name}") };
+            let meta = entry.metadata().map_err(|e| err(&entry.path(), e))?;
+            if meta.is_dir() {
+                if !name.starts_with(".transport.") {
+                    walk(&entry.path(), &path, keep, removed)?;
+                }
+            } else if !keep.contains(&path) {
+                std::fs::remove_file(entry.path()).map_err(|e| err(&entry.path(), e))?;
+                removed.0 += 1;
+                removed.1 += if meta.nlink() == 1 { meta.len() } else { 0 };
+            }
+        }
+        Ok(())
+    }
+    let mut removed = (0, 0);
+    walk(root, "", keep, &mut removed)?;
+    Ok(removed)
+}
+
 /// Writes `bytes` to `path` as one: under a temp name beside it, then
 /// renamed over it.
 fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
@@ -291,7 +330,8 @@ static TRIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0
 /// entries those of `cfg`, into the build dir `root`. A file's try writes
 /// a temporary file of its own beside it, `<file>.<pid>.<n>.tmp`, as a
 /// unit's decode writes a dir of its own: a try whose round has gone may
-/// still be writing its file while the next try writes another.
+/// still be writing its file while the next try writes another. What a
+/// killed try leaves, the next sync of the dir removes (reconcile).
 pub async fn try_object(http: &reqwest::Client, base_url: &str, date: &str, cfg: &Configurations, object: &catalog::Object, root: &Path) -> Result<(), DownloadError> {
     let files: Vec<(&str, &FileEntry)> = object.files.iter().map(|f| (f.as_str(), &cfg.files[f])).collect();
     let dir = root.join(Path::new(&object.path).parent().unwrap_or(Path::new("")));
@@ -674,10 +714,25 @@ impl Portal {
                 .map_err(|e| format!("build {name}: {e}"))?;
         }
         let done = ledger(&root);
-        let todo: Vec<&catalog::Object> = plan.objects.iter()
-            .filter(|o| o.link.is_none() && !(done.contains(&o.path) && sized(&root, &cfg, &o.files)))
-            .collect();
+        let (held, todo): (Vec<&catalog::Object>, Vec<&catalog::Object>) = plan.objects.iter()
+            .filter(|o| o.link.is_none())
+            .partition(|o| done.contains(&o.path) && sized(&root, &cfg, &o.files));
+        if resume.is_some() {
+            // What the ledger doesn't name goes before the room is weighed:
+            // it would take room the build's files need, and the files of
+            // objects still to fetch are fetched again.
+            let keep: HashSet<String> = held.iter().flat_map(|o| o.files.iter().cloned()).collect();
+            let at = root.clone();
+            let (files, bytes) = tokio::task::spawn_blocking(move || reconcile(&at, &keep))
+                .await
+                .map_err(|e| format!("reconcile task: {e}"))?
+                .map_err(|e| format!("build {name}: {e}"))?;
+            if files > 0 {
+                eprintln!("portal sync: build {name}: removed {files} files its ledger doesn't name ({})", gib(bytes));
+            }
+        }
 
+        // The room of what is still to fetch, beside what the ledger names.
         let need: u64 = todo.iter().flat_map(|o| &o.files).map(|f| cfg.files[f].size_raw).sum();
         let free = (self.config.free_space)(&self.data).map_err(|e| format!("free space in {}: {e}", self.data.display()))?;
         if free < need + FREE_MARGIN {

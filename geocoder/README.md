@@ -157,7 +157,10 @@ the portal runs 8 lookups at once, the others waiting their turn.
 `query-portal` fetches a new build itself, every hour
 (`PORTAL_SYNC_SECONDS`), into a dir of its own in the volume, each file
 checked against the build's manifest and the files two dirs share
-hard-linked (~11.2 GiB a build, ~9 GiB to download). It switches to a build
+hard-linked (~11.2 GiB a build, ~9 GiB to download). A sync killed part
+way resumes in its dir: it removes the files its ledger of the objects in
+place doesn't name, then wants room for the files still to fetch and 2 GiB
+besides. It switches to a build
 only once every dataset of it loads, and refuses one of another build
 version than it reads, saying so on `/health`. A build published again
 under its date (a rerun of the nightly) is another build: it fetches that

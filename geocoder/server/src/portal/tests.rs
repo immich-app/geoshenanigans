@@ -810,6 +810,75 @@ async fn a_round_whose_ledger_fails_ends_only_once_the_fetches_it_started_have()
     assert_eq!(leftovers(&root), Vec::<String>::new());
 }
 
+/// The bytes of a volume `free_on_volume` tells the room of.
+static VOLUME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The bytes of the regular files under `dir`.
+fn bytes_under(dir: &Path) -> u64 {
+    std::fs::read_dir(dir).map_or(0, |entries| {
+        entries.map(|e| e.unwrap()).map(|e| {
+            let kind = e.file_type().unwrap();
+            if kind.is_dir() { bytes_under(&e.path()) } else if kind.is_file() { e.metadata().unwrap().len() } else { 0 }
+        }).sum()
+    })
+}
+
+/// The room on a volume of VOLUME bytes that holds the data dir `data` and
+/// nothing else.
+fn free_on_volume(data: &Path) -> std::io::Result<u64> {
+    Ok(VOLUME.load(std::sync::atomic::Ordering::SeqCst).saturating_sub(bytes_under(data)))
+}
+
+// A sync killed part way leaves files its ledger doesn't name: an object in
+// place whose line hadn't gone in, a try's temporary file. The next, on a
+// volume with room for the whole build and the margin besides, removes them
+// before it weighs the room it needs, counts only what is still to fetch,
+// and resumes.
+#[tokio::test]
+async fn a_resumed_sync_removes_what_its_ledger_doesnt_name_before_it_weighs_the_room() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let mut one_at_a_time = config(&bucket, load.clone());
+    one_at_a_time.fetches_at_once = 1;
+    let p = portal(data.path(), one_at_a_time);
+    let mut order = fetched(&bucket).await;
+    order.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+    let holding = bucket.hold(&object_url(&order[3]));
+    let round = tokio::spawn({
+        let p = p.clone();
+        async move { p.round(true).await }
+    });
+    holding.reached().await;
+    round.abort();
+    assert!(round.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(holding);
+    let root = data.path().join(BUILDS).join(format!("{DATE}-1"));
+    for f in &order[4].files {
+        std::fs::create_dir_all(root.join(f).parent().unwrap()).unwrap();
+        std::fs::write(root.join(f), bucket.file(f)).unwrap();
+    }
+    let abandoned = root.join(format!("{}.4242.7.tmp", order[4].files[0]));
+    std::fs::File::create(&abandoned).unwrap().set_len(1 << 20).unwrap();
+    let build: u64 = order.iter().flat_map(|o| &o.files).map(|f| bucket.manifest.files[f].size_raw).sum();
+    let manifest = std::fs::metadata(root.join(MANIFEST)).unwrap().len();
+    VOLUME.store(sync::FREE_MARGIN + build + manifest + (64 << 10), std::sync::atomic::Ordering::SeqCst);
+    let mut roomy = config(&bucket, load);
+    roomy.free_space = free_on_volume;
+    let before = bucket.requests().len();
+
+    assert_eq!(portal(data.path(), roomy).round(true).await, Ok(format!("build {DATE} is served ({DATE}-1)")));
+
+    let mut resumed = bucket.requests()[before..].to_vec();
+    resumed.sort();
+    let mut want: Vec<String> = order[3..].iter().map(|o| format!("{DATE}/{}", object_url(o))).collect();
+    want.sort();
+    assert_eq!(resumed, want);
+    assert!(!abandoned.exists());
+    assert_eq!(leftovers(&root), Vec::<String>::new());
+}
+
 // Two tries at one file at once (one a round left running, one of the
 // next) each write a file of their own, and each puts it in place.
 #[tokio::test]
