@@ -66,6 +66,26 @@ class JobSamplerTest(unittest.TestCase):
         self.assertRegex(lines[0], r"^\[jobstat \d\d:\d\d:\d\d\] cpus=\d+ cgroup=/pod/job "
                                    r"cpu\.max=6400000 100000 \(/pod\) device=rbd4$")
 
+    # The quota is the tightest from this process's cgroup up, as cpu_budget.sh takes it, the tools sizing by it: one
+    # below the job's memory-limited cgroup, or one tighter above the first that is set, quota over period.
+    def test_the_quota_is_the_tightest_from_the_process_up(self):
+        cgroup = os.path.join(self.root, "sys/fs/cgroup")
+        for at, quotas, expected in (
+                ("/pod/job/step", {"pod/job/step": "200000 50000"}, r"200000 50000 \(/pod/job/step\)"),
+                ("/pod/job", {"pod/job": "6400000 100000", "pod": "300000 100000", "": "800000 100000"},
+                 r"300000 100000 \(/pod\)"),
+                ("/pod/job", {"pod/job": "450000 150000", "pod": "400000 100000"}, r"450000 150000 \(/pod/job\)")):
+            with self.subTest(at=at, quotas=quotas):
+                write(os.path.join(self.root, "proc/self/cgroup"), f"0::{at}\n")
+                for path in ("", "pod", "pod/job", "pod/job/step"):
+                    write(os.path.join(cgroup, path, "cpu.max"), quotas.get(path, "max 100000") + "\n")
+                if os.path.exists(self.log):
+                    os.remove(self.log)
+
+                lines = self.sample(seconds=1.5)
+
+                self.assertRegex(lines[0], rf" cgroup=/pod/job cpu\.max={expected} device=rbd4$")
+
     def test_each_sample_holds_the_raw_counters_of_cpu_memory_and_the_work_volume(self):
         lines = self.sample()
 

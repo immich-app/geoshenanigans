@@ -14,7 +14,8 @@
 # and whether pages that leave do so by reclaim. The job cgroup is the
 # nearest one up from this process's with a memory limit, as memwatch takes
 # it. The first line gives the CPU count, that cgroup, the CPU quota (the
-# first cpu.max up from it that isn't "max", with where it is set: the runner
+# tightest cpu.max from this process's cgroup up, quota over period, with
+# where it is set: the one cpu_budget.sh sizes the tools by; the runner
 # reports 88 CPUs, but its phases never pass ~64 cores) and the device. Runs
 # until killed.
 #
@@ -37,11 +38,12 @@ until [ -z "$job" ] || { [ -r "$root/sys/fs/cgroup$job/memory.max" ] && [ "$(cat
 done
 cgroup=$root/sys/fs/cgroup$job
 quota=max
-at=$job
+at=$path
 while :; do
-  if [ -r "$root/sys/fs/cgroup$at/cpu.max" ] && [ "$(cut -d' ' -f1 "$root/sys/fs/cgroup$at/cpu.max")" != max ]; then
-    quota="$(cat "$root/sys/fs/cgroup$at/cpu.max") (${at:-/})"
-    break
+  q="" p=""
+  [ -r "$root/sys/fs/cgroup$at/cpu.max" ] && read -r q p < "$root/sys/fs/cgroup$at/cpu.max"
+  if [[ "$q" =~ ^[0-9]+$ && "$p" =~ ^[1-9][0-9]*$ ]] && { [ "$quota" = max ] || [ $((q * tight_p)) -lt $((tight_q * p)) ]; }; then
+    quota="$q $p (${at:-/})" tight_q=$q tight_p=$p
   fi
   [ -z "$at" ] && break
   at=${at%/*}
