@@ -198,25 +198,29 @@ class TestPortalTest(unittest.TestCase):
         self.assertEqual(versions, [str(load_template()["build"]["version"])])
 
     # The bucket holds a unit's files only in the unit, which the portal fetches and decodes itself:
-    # the image builds and ships it, and its entrypoint runs it.
+    # the image builds and ships it, and starts its entrypoint, which runs it.
     def test_the_image_runs_query_portal(self):
         with open(os.path.join(PORTAL, "Dockerfile")) as f:
             image = f.read()
         self.assertIn("RUN cargo build --release --manifest-path server/Cargo.toml --bin query-portal\n", image)
         self.assertIn("COPY --from=builder /src/server/target/release/query-portal /usr/local/bin/\n", image)
+        self.assertIn("COPY test-portal/entrypoint.sh /usr/local/bin/entrypoint.sh\n", image)
+        self.assertEqual(re.findall(r"(?m)^(?:ENTRYPOINT|CMD)\b.*$", image), ['ENTRYPOINT ["entrypoint.sh"]'])
         with open(os.path.join(PORTAL, "entrypoint.sh")) as f:
             self.assertRegex(f.read(), r'(?m)^exec query-portal "\$DATA_DIR" 0\.0\.0\.0:3000$')
 
     # One service serves every dataset on :3002 (the minimal server of :3001 is a column of the page), init
-    # passing query-portal the stop signal, set only by what query-portal and the entrypoint read.
+    # passing query-portal the stop signal, set only by what query-portal and the entrypoint read: its
+    # environment as a mapping (NAME: value) or a list (- NAME=value, - NAME).
     def test_compose_runs_one_portal_on_3002(self):
         with open(os.path.join(PORTAL, "docker-compose.yml")) as f:
             services = f.read().split("\nvolumes:\n")[0]
         self.assertEqual(re.findall(r"(?m)^  ([\w-]+):$", services), ["geocoder-portal"])
         self.assertEqual(re.findall(r'(?m)^      - "(\d+):3000"$', services), ["3002"])
         self.assertRegex(services, r"(?m)^    init: true$")
-        self.assertLessEqual(set(re.findall(r"(?m)^      ([A-Z][A-Z_]*):", services)),
-                             {"DATA_DIR", "PORTAL_BASE_URL", "PORTAL_SYNC_SECONDS"})
+        mapped = re.findall(r"(?m)^      ([A-Z][A-Z_]*):", services)
+        listed = re.findall(r'(?m)^      - "?([A-Z][A-Z_]*)(?:=|"?$)', services)
+        self.assertLessEqual(set(mapped + listed), {"DATA_DIR", "PORTAL_BASE_URL", "PORTAL_SYNC_SECONDS"})
 
 
 class ResolveTest(unittest.TestCase):

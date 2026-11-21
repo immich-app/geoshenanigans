@@ -2,7 +2,8 @@
 # Tests entrypoint.sh: a fresh volume gets the test account the page uses, a
 # volume's own accounts stay, and the container is query-portal serving the
 # data dir, its exit status the container's. query-portal is stubbed out: it
-# prints its arguments and exits with $PORTAL_STATUS.
+# prints its arguments and exits with $PORTAL_STATUS. node reads the account's
+# JSON.
 #
 #   geocoder/test-portal/entrypoint.test.sh
 set -euo pipefail
@@ -45,13 +46,24 @@ check() {
 
 serves() { [ "$status" = 0 ] && [ "$(tail -n1 "$work/out")" = "query-portal $1 0.0.0.0:3000" ]; }
 
+# test_account <file>: whether the file parses as JSON and is the test account
+# alone: its key "test", no admin, 200 requests a second and 5000000 a day,
+# not rated by IP.
+test_account() {
+  node -e '
+    const db = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+    require("assert").deepStrictEqual(db, {
+      users: { test: { password_hash: "", admin: false, rate_per_second: 200, rate_per_day: 5000000, rate_by_ip: false } },
+      tokens: { test: "test" },
+    });
+  ' "$1"
+}
+
 # A fresh volume gets the test account and is served.
 d="$work/fresh"
 start "$d"
 check "a fresh volume is served" serves "$d"
-check "a fresh volume gets the test key" grep -q '"test": "test"' "$d/geocoder.json"
-check "the test account allows 200 requests a second" grep -q '"rate_per_second": 200,' "$d/geocoder.json"
-check "the test account is not rated by IP" grep -q '"rate_by_ip": false' "$d/geocoder.json"
+check "a fresh volume gets the test account" test_account "$d/geocoder.json"
 
 # A volume's own accounts stay as they are.
 d="$work/accounts"
