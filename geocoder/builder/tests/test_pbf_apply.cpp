@@ -5,9 +5,11 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <fstream>
 #include <iterator>
 #include <linux/magic.h>
 #include <set>
+#include <sstream>
 #include <string>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -372,6 +374,7 @@ TEST(apply_writes_the_header_the_options_ask_for) {
     CHECK(out.required_features == std::vector<std::string>({"OsmSchema-V0.6", "DenseNodes"}));
     CHECK(out.optional_features == std::vector<std::string>({"Sort.Type_then_ID"}));
     CHECK_EQ(out.source, std::string("test source"));
+    CHECK_EQ(out.writingprogram, std::string("pbf-apply"));
     CHECK(out.replication_timestamp == std::optional<int64_t>(T0));
     CHECK(!out.replication_sequence.has_value());
     CHECK_EQ(out.replication_base_url, in.replication_base_url);
@@ -405,6 +408,13 @@ double resident_share(const std::string& path) {
         share = double(std::count_if(pages.begin(), pages.end(), [](unsigned char p) { return p & 1; })) / double(pages.size());
     munmap(map, size);
     return share;
+}
+
+std::string file_bytes(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    std::stringstream s;
+    s << f.rdbuf();
+    return s.str();
 }
 
 }  // namespace
@@ -475,4 +485,65 @@ TEST(apply_leaves_the_output_in_the_page_cache_in_place_of_the_input) {
     CHECK(resident_share(opt.output) > 0.9);
     CHECK(describe(read_test_pbf(opt.output)) == describe(osmium_apply(input, {{{'m', node(5, 2, T0, "changed")},
                                                                                  {'c', node(30000, 1)}}})));
+}
+
+// In a run, not only at its end: the input leaves the page cache in ranges
+// from its start, in order, as the output after them is written, the rest
+// once the output is finished. And the drops change no byte of the output:
+// it is the bytes of a run that drops nothing.
+TEST(apply_drops_the_input_while_it_writes_and_changes_no_byte_of_the_output) {
+    constexpr uint64_t MiB = 1 << 20;
+    ScratchDir dir("pbf-apply-test");
+    ApplyOptions opt;
+    opt.input = dir.path() + "/in.osm.pbf";
+    // ~5 MiB of blobs, their tags too random to compress away.
+    std::vector<TestObject> input;
+    Lcg lcg{7};
+    for (int64_t id = 1; id <= 250000; id++) {
+        std::string tag;
+        for (int i = 0; i < 32; i++) tag += char('a' + lcg.next(26));
+        input.push_back(node(id, 1, T0, tag));
+    }
+    write_test_pbf(opt.input, input, 100);
+    const uint64_t input_bytes = file_bytes(opt.input).size();
+    REQUIRE(input_bytes > 4 * MiB);
+    std::string change = dir.path() + "/c.osc";
+    std::string text = to_osc({{'m', node(100000, 2, T0, "changed")}, {'c', node(300000, 1)}});
+    std::FILE* fp = std::fopen(change.c_str(), "wb");
+    std::fwrite(text.data(), 1, text.size(), fp);
+    std::fclose(fp);
+    opt.changes = {change};
+    opt.verbose = false;
+    opt.threads = 3;
+    opt.write_block_bytes = 64 << 10;
+    opt.input_drop_step_bytes = MiB;
+
+    opt.output = dir.path() + "/reference.osm.pbf";
+    opt.drop_input_pages = [](uint64_t, uint64_t) {};
+    apply_changes(opt);
+    std::vector<std::pair<uint64_t, uint64_t>> drops;
+    int fd = open(opt.input.c_str(), O_RDONLY);
+    REQUIRE(fd >= 0);
+    opt.output = dir.path() + "/out.osm.pbf";
+    opt.drop_input_pages = [&](uint64_t offset, uint64_t length) {
+        drops.emplace_back(offset, length);
+        posix_fadvise(fd, static_cast<off_t>(offset), static_cast<off_t>(length), POSIX_FADV_DONTNEED);
+    };
+    apply_changes(opt);
+    close(fd);
+
+    CHECK(file_bytes(opt.output) == file_bytes(dir.path() + "/reference.osm.pbf"));
+    REQUIRE(drops.size() >= 3);
+    uint64_t dropped = 0;
+    for (size_t i = 0; i + 1 < drops.size(); i++) {
+        CHECK_EQ(drops[i].first, dropped);
+        CHECK(drops[i].second >= MiB);
+        CHECK_EQ((drops[i].first + drops[i].second) % MiB, uint64_t(0));
+        dropped += drops[i].second;
+    }
+    // Most of the input went while the output was written: at most the
+    // writer's blocks in flight, and the step, are left for the end.
+    CHECK(dropped <= input_bytes);
+    CHECK(dropped + 3 * MiB >= input_bytes);
+    CHECK(drops.back() == std::make_pair(dropped, uint64_t(0)));
 }

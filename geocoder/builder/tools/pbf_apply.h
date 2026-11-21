@@ -261,6 +261,12 @@ struct ApplyOptions {
     // Writes the output around the page cache: faster on a fast disk, but
     // the output's next reader finds none of it cached.
     bool direct_io = false;
+    // The output's write blocks (DirectFileWriter).
+    size_t write_block_bytes = kDirectWriteBlockBytes;
+    // Drops the input's pages behind the writer (InputPageDropper), its ranges
+    // at least input_drop_step_bytes apart: posix_fadvise when unset.
+    InputPageDropper::Drop drop_input_pages;
+    uint64_t input_drop_step_bytes = kInputDropStepBytes;
 };
 
 struct ApplyStats {
@@ -557,16 +563,19 @@ inline ApplyStats apply_changes(const ApplyOptions& opt) {
 
     auto t_write = clock::now();
     FileDescriptor input(opt.input);
-    DirectFileWriter output(opt.output, opt.direct_io);
+    DirectFileWriter output(opt.output, opt.direct_io, opt.write_block_bytes);
     {
         PbfHeader header = decode_header_block(read_and_decompress_blob(input.get(), in.blobs[0]));
         std::string bytes;
         append_blob(bytes, "OSMHeader", encode_header_block(output_header(header, opt)));
         output.append(std::move(bytes));
     }
-    InputPageDropper dropper([fd = input.get()](uint64_t offset, uint64_t length) {
-        posix_fadvise(fd, static_cast<off_t>(offset), static_cast<off_t>(length), POSIX_FADV_DONTNEED);
-    });
+    InputPageDropper::Drop drop = opt.drop_input_pages;
+    if (!drop)
+        drop = [fd = input.get()](uint64_t offset, uint64_t length) {
+            posix_fadvise(fd, static_cast<off_t>(offset), static_cast<off_t>(length), POSIX_FADV_DONTNEED);
+        };
+    InputPageDropper dropper(std::move(drop), opt.input_drop_step_bytes);
     std::atomic<size_t> encoded{0};
     parallel_ordered(items.size(), [&](size_t k) { return produce_item(items[k], input.get(), in, winners, opt, encoded); },
                      [&](size_t k, std::string bytes) {
