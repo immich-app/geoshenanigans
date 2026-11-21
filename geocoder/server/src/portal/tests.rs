@@ -1662,6 +1662,76 @@ async fn an_object_whose_fetch_fails_is_tried_again_after_a_pause() {
     assert_eq!(bucket.requests()[before..], [format!("{DATE}/{failing}")]);
 }
 
+/// A dir of the bucket's build for a sync to resume, `<DATE>-1`, holding its
+/// manifest alone: its root.
+async fn to_resume(bucket: &TestBucket, data: &Path) -> std::path::PathBuf {
+    let root = data.join(BUILDS).join(format!("{DATE}-1"));
+    std::fs::create_dir_all(&root).unwrap();
+    let manifest = reqwest::get(format!("{}/builds/{DATE}/{MANIFEST}", bucket.url)).await.unwrap().bytes().await.unwrap();
+    std::fs::write(root.join(MANIFEST), &manifest).unwrap();
+    root
+}
+
+// A file whose try can't put it in place (a dir at its path) is tried again
+// after each pause, and each try removes its temporary file: the tries
+// leave none, where each would leave a whole file's bytes.
+#[tokio::test]
+async fn a_file_that_cant_go_into_place_is_tried_again_and_its_tries_leave_no_temporary_file() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let object = fetched(&bucket).await.into_iter().find(|o| !o.unit).unwrap();
+    let root = to_resume(&bucket, data.path()).await;
+    std::fs::create_dir_all(root.join(&object.path)).unwrap();
+    let mut retrying = config(&bucket, load);
+    retrying.retry_delays = vec![Duration::ZERO; 2];
+
+    let failed = portal(data.path(), retrying).round(true).await.unwrap_err();
+
+    assert!(failed.starts_with(&format!("1 of build {DATE}'s objects did not come down: {}: I/O error: rename ", object.path)), "{failed}");
+    let count = bucket.requests().iter().filter(|r| **r == format!("{DATE}/{}", object_url(&object))).count();
+    assert_eq!(count, 3);
+    assert_eq!(leftovers(&root), Vec::<String>::new());
+}
+
+// A try that can't remove its temporary file once the file failed to go
+// into place is not made again: what it left stays on the disk, and each try
+// again would leave a file of its own beside it.
+#[tokio::test]
+async fn a_try_that_leaves_a_temporary_file_it_cant_remove_is_not_made_again() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let object = fetched(&bucket).await.into_iter().find(|o| !o.unit).unwrap();
+    let root = to_resume(&bucket, data.path()).await;
+    // A dir at the file's path that no dir renames over: it holds one.
+    let dest = root.join(&object.path);
+    std::fs::create_dir_all(dest.join("held")).unwrap();
+    let (dir, name) = (dest.parent().unwrap().to_path_buf(), dest.file_name().unwrap().to_str().unwrap().to_string());
+    let temporary = move || std::fs::read_dir(&dir).unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.file_name().unwrap().to_str().unwrap().starts_with(&format!("{name}.")) && p.extension().is_some_and(|x| x == "tmp"));
+    let mut retrying = config(&bucket, load);
+    retrying.retry_delays = vec![Duration::ZERO; 2];
+    let p = portal(data.path(), retrying);
+    let holding = bucket.hold(&object_url(&object));
+
+    let round = tokio::spawn(async move { p.round(true).await });
+    holding.reached().await;
+    until("the try's temporary file", || temporary().is_some()).await;
+    // Its temporary file, a dir by the time it goes into place: a dir it
+    // can't rename over its file's, nor remove as a file.
+    let tmp = temporary().unwrap();
+    std::fs::remove_file(&tmp).unwrap();
+    std::fs::create_dir(&tmp).unwrap();
+    drop(holding);
+
+    let failed = round.await.unwrap().unwrap_err();
+    assert!(failed.contains(&format!("and remove {}: ", tmp.display())), "{failed}");
+    let count = bucket.requests().iter().filter(|r| **r == format!("{DATE}/{}", object_url(&object))).count();
+    assert_eq!(count, 1);
+}
+
 // A sync that hasn't the room for a build's files and a margin beside them
 // fetches nothing and says how much it needs.
 #[tokio::test]

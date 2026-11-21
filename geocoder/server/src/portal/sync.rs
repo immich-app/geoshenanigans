@@ -945,13 +945,16 @@ impl Portal {
         (object, self.fetch_attempts(root, cfg, date, object).await)
     }
 
-    /// fetch_object's tries.
+    /// fetch_object's tries. A try that left its temporary file
+    /// (DownloadError::Leftover) is the last: each try writes a file of its
+    /// own, and the room was weighed for one.
     async fn fetch_attempts(&self, root: &Path, cfg: &Configurations, date: &str, object: &catalog::Object) -> Result<(), DownloadError> {
         let mut delays = self.config.retry_delays.iter();
         loop {
             let got = try_object(&self.http, &self.config.base_url, date, cfg, object, root).await;
             match (got, delays.next()) {
                 (Ok(()), _) => return Ok(()),
+                (Err(e @ DownloadError::Leftover(_)), _) => return Err(e),
                 (Err(e), Some(delay)) => {
                     eprintln!("portal sync: {}: {e}; trying again in {delay:?}", object.path);
                     tokio::time::sleep(*delay).await;

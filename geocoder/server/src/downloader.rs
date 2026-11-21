@@ -36,6 +36,10 @@ pub enum DownloadError {
     /// A file whose bytes run past, or end short of, the size its manifest
     /// entry gives: why.
     Size(String),
+    /// A file that failed to go into place, whose temporary file can't be
+    /// removed either: why. Its bytes stay on the disk, beside those of each
+    /// try again.
+    Leftover(String),
 }
 
 impl std::fmt::Display for DownloadError {
@@ -58,6 +62,7 @@ impl std::fmt::Display for DownloadError {
             }
             DownloadError::Transport(s) => write!(f, "transport unit {}", s),
             DownloadError::Size(s) => write!(f, "wrong size: {}", s),
+            DownloadError::Leftover(s) => write!(f, "temporary file left: {}", s),
         }
     }
 }
@@ -300,7 +305,8 @@ pub async fn download_file(
 
 /// download_file through the temporary file `tmp`, beside `dest`, which the
 /// caller names: a name no other download writes, where two may write one
-/// file at once.
+/// file at once. A download that fails removes it; one whose file can't go
+/// into place and can't remove it either fails with Leftover.
 pub async fn download_file_through(
     client: &reqwest::Client,
     base_url: &str,
@@ -350,8 +356,17 @@ pub async fn download_file_through(
         });
     }
 
-    tokio::fs::rename(&tmp, dest).await
-        .map_err(|e| DownloadError::Io(format!("rename {}→{}: {}", tmp.display(), dest.display(), e)))?;
+    if let Err(e) = tokio::fs::rename(&tmp, dest).await {
+        // The file that didn't go into place goes: a try again writes a
+        // temporary file of its own.
+        let failed = format!("rename {}→{}: {}", tmp.display(), dest.display(), e);
+        return Err(match tokio::fs::remove_file(&tmp).await {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                DownloadError::Leftover(format!("{failed}, and remove {}: {e}", tmp.display()))
+            }
+            _ => DownloadError::Io(failed),
+        });
+    }
     Ok(())
 }
 
@@ -937,6 +952,25 @@ mod tests {
 
         assert_eq!(got.map_err(|e| e.to_string()), Err(format!("wrong size: {path} runs past its {} bytes", smaller.size_raw)));
         assert!(!dest.exists() && !tmp.exists());
+    }
+
+    // A file that can't be renamed into place (a dir at its path) fails its
+    // download, and its temporary file goes: a try again writes one of its
+    // own.
+    #[tokio::test]
+    async fn a_file_that_cant_go_into_place_fails_its_download_and_leaves_no_temporary_file() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let (path, entry) = bucket.manifest.files.iter().find(|(_, e)| e.unit.is_none()).unwrap();
+        let root = ScratchDir::new();
+        let (dest, tmp) = (root.path().join("file.bin"), root.path().join("file.bin.1.tmp"));
+        std::fs::create_dir(&dest).unwrap();
+
+        let got = download_file_through(&reqwest::Client::new(), &bucket.url, test_bucket::DATE, path, entry, &dest, &tmp).await;
+
+        let failed = got.unwrap_err().to_string();
+        assert!(failed.starts_with(&format!("I/O error: rename {}→{}: ", tmp.display(), dest.display())), "{failed}");
+        assert!(!tmp.exists());
+        assert!(dest.is_dir());
     }
 
     fn component(files: &[&str], replaces: &[&str], extends: Option<&str>) -> Component {
