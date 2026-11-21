@@ -54,28 +54,8 @@ int main(int argc, char** argv) {
         return 2;
     }
     pass_sanitizer_options_to_tools();
-    int passed = 0;
-    size_t ran = 0;
-    for (size_t i = 0; i < reg.size(); i++) {
-        if (!shard.runs(i)) continue;
-        ran++;
-        auto& t = reg[i];
-        int before = gctest::failures();
-        try {
-            t.fn();
-        } catch (const gctest::RequireFailed&) {
-            // failure already recorded by REQUIRE
-        } catch (const std::exception& e) {
-            std::printf("    FAIL %s: uncaught exception: %s\n", t.name, e.what());
-            gctest::failures()++;
-        }
-        if (gctest::failures() == before) {
-            passed++;
-        } else {
-            std::printf("FAILED  %s\n", t.name);
-        }
-    }
-    std::printf("\n%d/%zu tests passed  (%d checks, %d failures)\n", passed, ran, gctest::checks(),
+    const gctest::ShardRun run = gctest::run_shard(reg, shard);
+    std::printf("\n%d/%zu tests passed  (%d checks, %d failures)\n", run.passed, run.ran, gctest::checks(),
                 gctest::failures());
     return gctest::failures() == 0 ? 0 : 1;
 }

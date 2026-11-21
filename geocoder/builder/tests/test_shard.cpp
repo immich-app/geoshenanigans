@@ -1,9 +1,10 @@
-// Unit tests for the share of the registry a geocoder-tests run takes
-// (tests/test_shard.h), and for geocoder-tests' own answers to a shard it
-// refuses and to --count, which the nightly's sharded run checks its shards
-// against (tools/ci_build_tools.sh).
+// Unit tests for the share of the registry a geocoder-tests run takes and
+// the runner that runs it (tests/test_shard.h), and for geocoder-tests' own
+// answers to a shard it refuses and to --count, which the nightly's sharded
+// run checks its shards against (tools/ci_build_tools.sh).
 #include "test_shard.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fcntl.h>
@@ -11,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <unistd.h>
+#include <vector>
 
 #include "child_process.h"
 #include "scratch_dir.h"
@@ -92,4 +94,32 @@ TEST(geocoder_tests_count_prints_the_size_of_the_registry) {
     // Whatever shard the run was given: --count speaks for the registry.
     CHECK_EQ(rerun_self("--count", "3/16", out), 0);
     CHECK_EQ(read_text(out), std::to_string(gctest::registry().size()) + "\n");
+}
+
+// geocoder-tests' runner (main() runs its shard with it): across the shards
+// of a count, every test of the registry runs once, in the shard its index
+// names, and each shard's counts are of the tests it ran.
+TEST(the_runner_runs_every_test_once_across_a_counts_shards) {
+    for (size_t count : {size_t(1), size_t(2), size_t(3), size_t(16), size_t(40)}) {
+        std::vector<std::vector<size_t>> ran_in(37);  // each test's shards
+        size_t shard = 0;
+        std::vector<gctest::Test> tests;
+        for (size_t i = 0; i < ran_in.size(); i++)
+            tests.push_back({"registered", [&, i] { ran_in[i].push_back(shard); }});
+        size_t ran = 0;
+        for (shard = 0; shard < count; shard++) {
+            const gctest::ShardRun run = gctest::run_shard(tests, {shard, count});
+            size_t its = 0;
+            for (const auto& shards : ran_in) its += size_t(std::count(shards.begin(), shards.end(), shard));
+            CHECK_EQ(run.ran, its);
+            CHECK_EQ(run.passed, int(run.ran));
+            ran += run.ran;
+        }
+        CHECK_EQ(ran, ran_in.size());
+        for (size_t i = 0; i < ran_in.size(); i++) {
+            if (ran_in[i] != std::vector<size_t>{i % count})
+                std::printf("    test %zu of %zu shards ran %zu times\n", i, count, ran_in[i].size());
+            CHECK(ran_in[i] == std::vector<size_t>{i % count});
+        }
+    }
 }
