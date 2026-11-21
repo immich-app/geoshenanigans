@@ -532,6 +532,46 @@ async fn a_sync_killed_part_way_resumes_in_its_dir_fetching_only_what_had_not_co
     }
 }
 
+// A sync killed part way, then a start that can't learn the latest build
+// (the bucket out of reach, or a latest.override of no date): its round
+// fails before it knows which build to resume, and keeps the dir the kill
+// left, which the next round resumes, fetching only what had not come down.
+#[tokio::test]
+async fn a_round_that_cant_learn_the_latest_build_keeps_the_sync_left_part_way() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let mut one_at_a_time = config(&bucket, load.clone());
+    one_at_a_time.fetches_at_once = 1;
+    let p = portal(data.path(), one_at_a_time);
+    let mut order = fetched(&bucket).await;
+    order.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+    let holding = bucket.hold(&object_url(&order[3]));
+    let round = tokio::spawn({
+        let p = p.clone();
+        async move { p.round(true).await }
+    });
+    holding.reached().await;
+    round.abort();
+    assert!(round.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(holding);
+    let root = data.path().join(BUILDS).join(format!("{DATE}-1"));
+    let kept = sync::ledger(&root);
+    assert_eq!(kept.len(), 3);
+
+    std::fs::write(data.path().join(sync::LATEST_OVERRIDE), "tomorrow\n").unwrap();
+    let failed = portal(data.path(), config(&bucket, load.clone())).round(true).await.unwrap_err();
+    assert_eq!(failed, format!("{} holds \"tomorrow\", no date", sync::LATEST_OVERRIDE));
+    assert_eq!(build_dirs(data.path()), [format!("{DATE}-1")]);
+    assert_eq!(sync::ledger(&root), kept);
+
+    std::fs::remove_file(data.path().join(sync::LATEST_OVERRIDE)).unwrap();
+    let before = bucket.requests().len();
+    assert_eq!(portal(data.path(), config(&bucket, load)).round(true).await, Ok(format!("build {DATE} is served ({DATE}-1)")));
+    assert_eq!(bucket.requests().len() - before, order.len() - 3);
+}
+
 // A build served whose files no longer hold their manifest's bytes is
 // fetched again, into a new dir, and served from there; the damaged one
 // goes.

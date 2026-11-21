@@ -693,7 +693,9 @@ impl Portal {
 
     /// Removes every build dir but the one served, the newest complete one
     /// before it that this process didn't find unusable, and the newest
-    /// incomplete one of the latest build (to resume).
+    /// incomplete one of the latest build (to resume), or of any while the
+    /// latest build is not known (a first round that couldn't ask the
+    /// bucket).
     async fn prune(&self) {
         let dirs = match self.list() {
             Ok(dirs) => dirs,
@@ -709,11 +711,11 @@ impl Portal {
                 keep.insert(d.name());
             }
         }
-        if let Some(latest) = self.status().latest {
-            let staging = dirs.iter().rev().find(|(d, complete)| !complete && d.date == latest.date && !self.unusable(&d.name()));
-            if let Some((d, _)) = staging {
-                keep.insert(d.name());
-            }
+        let latest = self.status().latest.map(|l| l.date);
+        let staging = dirs.iter().rev()
+            .find(|(d, complete)| !complete && latest.as_ref().is_none_or(|l| *l == d.date) && !self.unusable(&d.name()));
+        if let Some((d, _)) = staging {
+            keep.insert(d.name());
         }
         for (d, _) in dirs {
             let name = d.name();
