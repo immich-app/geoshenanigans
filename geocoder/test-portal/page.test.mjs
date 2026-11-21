@@ -2,8 +2,9 @@
 // (the link, the columns and their datasets, the pacing of requests, the
 // comparison of answers and the HTML of each part), run in a context of its
 // own as the page runs it. The page's other scripts, which wire it to the DOM
-// and the map, are checked to parse. /datasets is that of a build of the
-// template, as the portal lists it (server/src/portal/catalog.rs).
+// and the map, are checked to parse, and its style for the layout of the side
+// panel. /datasets is that of a build of the template, as the portal lists
+// it (server/src/portal/catalog.rs).
 //
 //   node --test geocoder/test-portal/page.test.mjs
 import assert from 'node:assert/strict';
@@ -16,6 +17,16 @@ const template = JSON.parse(readFileSync(new URL('../builder/configurations.temp
 
 // The inline scripts of the page, by id.
 const scripts = [...html.matchAll(/<script(?:\s+id="([\w-]+)")?>([\s\S]*?)<\/script>/g)].map((m) => ({ id: m[1], body: m[2] }));
+
+// The declarations of the page's first style rule for `selector` (those of
+// @media come after), by property.
+function style(selector) {
+  const css = html.match(/<style>([\s\S]*?)<\/style>/)[1].replace(/\/\*[\s\S]*?\*\//g, '');
+  const rule = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].find((m) => m[1].split(',').map((s) => s.trim()).includes(selector));
+  assert.ok(rule, `index.html has no style for ${selector}`);
+  return Object.fromEntries(rule[2].split(';').filter((d) => d.includes(':'))
+    .map((d) => [d.slice(0, d.indexOf(':')).trim(), d.slice(d.indexOf(':') + 1).trim()]));
+}
 
 // The core script's top-level bindings, by name.
 function core() {
@@ -532,6 +543,23 @@ test('the JSON of an answer is shown highlighted and escaped', () => {
   assert.ok(out.includes('<span class="json-string">"&lt;img src=x&gt;"</span>'), out);
   assert.ok(out.includes('<span class="json-key">"name":</span>'));
   assert.ok(out.includes('<span class="json-number">1</span>'));
+});
+
+// The side panel stacks the datasets, the coordinates, the photo upload, the
+// results and, once one is selected, its detail. Four columns of datasets
+// and the detail of a result fill a window of 1000 px without the results,
+// whose toolbar and cards would go: they keep a height of their own, the
+// datasets and the detail scroll within what is left, down to a least
+// height of theirs, and a window too short for those scrolls the panel
+// rather than cutting off its foot.
+test('the results keep room for their toolbar and cards however tall the datasets and the detail grow', () => {
+  const height = /\b[1-9]\d*(px|%|vh)/;
+  assert.match(style('.results-section')['min-height'] ?? 'none', height);
+  for (const giving of ['.datasets-section', '.detail-panel']) {
+    assert.equal(style(giving)['overflow-y'], 'auto', giving);
+    assert.match(style(giving)['min-height'] ?? 'none', height, giving);
+  }
+  assert.equal(style('.side-panel')['overflow-y'], 'auto');
 });
 
 test("the page's other scripts parse", () => {
