@@ -1362,6 +1362,35 @@ async fn a_latest_json_version_other_than_its_manifests_fails_the_round_and_refu
     assert_eq!(p.round(false).await, Ok(format!("build {DATE} is served ({DATE}-2)")));
 }
 
+// A build version latest.json gives that the manifest of the build served,
+// or of the one refused, doesn't fails the round as well, to be tried again
+// soon: the manifest fetched may be of the publication before the one
+// latest.json names, as the nightly publishes a date's build again.
+#[tokio::test]
+async fn a_latest_json_version_other_than_the_served_or_refused_manifests_fails_the_round() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let p = portal(data.path(), config(&bucket, load));
+    p.round(true).await.unwrap();
+    let disagree = |date: &str, latest: u32, manifest: u32| format!(
+        "latest.json gives build {date} build version {latest}, its {MANIFEST} build version {manifest}: nothing is refused while they disagree"
+    );
+
+    bucket.set_latest(DATE, Some(BUILD_VERSION + 1));
+    assert_eq!(p.round(false).await, Err(disagree(DATE, BUILD_VERSION + 1, BUILD_VERSION)));
+    assert_eq!(p.served().unwrap().dir, format!("{DATE}-1"));
+
+    bucket.add_build(NEXT, BUILD_VERSION + 1);
+    bucket.set_latest(NEXT, None);
+    let why = format!("it is of build version {}; this server reads build version {BUILD_VERSION}", BUILD_VERSION + 1);
+    assert_eq!(p.round(false).await, Ok(format!("refused build {NEXT}: {why}")));
+    bucket.set_latest(NEXT, Some(BUILD_VERSION));
+    assert_eq!(p.round(false).await, Err(disagree(NEXT, BUILD_VERSION, BUILD_VERSION + 1)));
+    bucket.set_latest(NEXT, Some(BUILD_VERSION + 1));
+    assert_eq!(p.round(false).await, Ok(format!("build {NEXT} was refused: {why}")));
+}
+
 // A sync left part way of a build since published again under its date is
 // not resumed: the build as published now goes into a new dir, and the dir
 // left part way goes.

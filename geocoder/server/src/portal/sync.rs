@@ -699,9 +699,9 @@ impl Portal {
     /// from files that check out, is refused; one refused is not fetched
     /// again while it is the latest. One whose files don't check out is
     /// fetched again, into a new dir, and a build version latest.json gives
-    /// that the manifest doesn't fails the round, refusing nothing. With the
-    /// latest served it does nothing; with it complete in a dir, it serves
-    /// it from there.
+    /// that the manifest doesn't fails the round, refusing nothing, the
+    /// build served or refused among them. With the latest served it does
+    /// nothing; with it complete in a dir, it serves it from there.
     async fn sync(&self) -> Result<String, String> {
         self.running("reading the latest build".to_string());
         let mut latest = self.latest().await?;
@@ -722,6 +722,24 @@ impl Portal {
         } else {
             self.set_status(|s| s.refused = current.into_iter().filter(|r| r.version == BUILD_VERSION).collect());
         }
+        // The build version latest.json gives may be of another publication
+        // of the date than the manifest fetched (a rerun of the nightly
+        // between the two), the build served or the one refused among them:
+        // a refusal is of the manifest's alone, and while the two disagree
+        // the round fails, to be tried again, before the build is taken for
+        // served or refused.
+        let parsed = parse_manifest(&bytes);
+        if let Ok((_, manifest)) = &parsed {
+            if manifest.build.date != date {
+                return Err(format!("build {date}'s {MANIFEST} is build {}'s", manifest.build.date));
+            }
+            if let Some(hint) = latest.build_version.filter(|&v| v != manifest.build.version) {
+                return Err(format!(
+                    "latest.json gives build {date} build version {hint}, its {MANIFEST} build version {}: nothing is refused while they disagree",
+                    manifest.build.version
+                ));
+            }
+        }
         if let Some(refused) = self.refusal(&date, &sha256) {
             return Ok(format!("build {date} was refused: {}", refused.reason));
         }
@@ -730,23 +748,10 @@ impl Portal {
             return Ok(format!("build {date} is served ({})", served.dir));
         }
 
-        let (cfg, manifest) = match parse_manifest(&bytes) {
+        let (cfg, manifest) = match parsed {
             Ok(parsed) => parsed,
             Err(why) => return self.refuse(&date, &sha256, &format!("its {MANIFEST} doesn't parse: {why}")),
         };
-        if manifest.build.date != date {
-            return Err(format!("build {date}'s {MANIFEST} is build {}'s", manifest.build.date));
-        }
-        // The build version latest.json gives may be of another publication
-        // of the date than the manifest fetched (a rerun of the nightly
-        // between the two): a refusal is of the manifest's alone, and while
-        // the two disagree the round fails, to be tried again.
-        if let Some(hint) = latest.build_version.filter(|&v| v != manifest.build.version) {
-            return Err(format!(
-                "latest.json gives build {date} build version {hint}, its {MANIFEST} build version {}: nothing is refused while they disagree",
-                manifest.build.version
-            ));
-        }
         if manifest.build.version != BUILD_VERSION {
             return self.refuse(&date, &sha256, &format!("it is of build version {}; this server reads build version {BUILD_VERSION}", manifest.build.version));
         }
