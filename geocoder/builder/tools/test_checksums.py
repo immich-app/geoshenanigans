@@ -88,20 +88,44 @@ class ChecksumsTest(unittest.TestCase):
         self.assertEqual(done.stdout, "")
         self.assertIn("planet/full/late.bin.zst", done.stderr)
 
-    # configurations.json must be hashed as it is published, after its splice: a line from before it is refused.
-    def test_a_stale_configurations_json_line_is_refused(self):
-        stale = self.run_script("zst", self.out).stdout
-        stale += subprocess.run(["sha256sum", "./configurations.json"], cwd=self.out, capture_output=True, text=True,
+    # The .zst checksums name .zst files alone: a line for another file (configurations.json's, say) is refused.
+    def test_a_zst_checksum_line_for_another_file_is_refused(self):
+        lines = self.run_script("zst", self.out).stdout
+        lines += subprocess.run(["sha256sum", "./configurations.json"], cwd=self.out, capture_output=True, text=True,
                                 check=True).stdout
         with open(self.zst, "w") as f:
-            f.write(stale)
-        write(os.path.join(self.out, "configurations.json"), b'{"build": {"date": "2026-11-21"}}')
+            f.write(lines)
 
         done = self.run_script("all", self.out, self.zst)
 
         self.assertNotEqual(done.returncode, 0)
         self.assertEqual(done.stdout, "")
-        self.assertIn("configurations.json", done.stderr)
+        self.assertIn("do not name the .zst files", done.stderr)
+
+    # configurations.json must be hashed as it is published, after its splice: one that changes after it was hashed
+    # (a splice that lands late) is refused, rather than published beside a checksum that is not its own.
+    def test_a_configurations_json_that_changed_after_its_hash_is_refused(self):
+        self.hash_zst()
+        # A sha256sum that, once, rewrites configurations.json right after hashing it.
+        bin_dir = os.path.join(self.root, "bin")
+        os.makedirs(bin_dir)
+        once = os.path.join(self.root, "change-once")
+        open(once, "w").close()
+        with open(os.path.join(bin_dir, "sha256sum"), "w") as f:
+            f.write(f'#!/bin/sh\n{shutil.which("sha256sum")} "$@"\n'
+                    f'for a in "$@"; do\n'
+                    f'  if [ "$a" = ./configurations.json ] && [ -e {once} ]; then\n'
+                    f'    rm {once}\n    printf \'{{"build": {{"date": "2026-11-21"}}}}\' > ./configurations.json\n'
+                    f'  fi\ndone\n')
+        os.chmod(os.path.join(bin_dir, "sha256sum"), 0o755)
+
+        done = subprocess.run(["bash", SCRIPT, "all", self.out, self.zst], capture_output=True, text=True,
+                              env={"PATH": f"{bin_dir}:{os.environ['PATH']}"})
+
+        self.assertFalse(os.path.exists(once))
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual(done.stdout, "")
+        self.assertIn("the line for configurations.json is not its sha256 now", done.stderr)
 
 
 def step_script(name):
