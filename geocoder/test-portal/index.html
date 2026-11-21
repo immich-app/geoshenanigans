@@ -682,11 +682,16 @@ function answersDiffer(datas) {
 
 // -- Requests --
 // Asks the server, `limit` requests in flight at most over the whole page.
-// A 429 (the test key's rate, which every visitor shares) is asked again
-// after a pause that every request waits out: `firstPause` ms, doubled by
-// each 429 of a request started after the last pause began (those in flight
-// together make one) up to `maxPause`, and back to none after an answer.
-// After `tries` asks a 429 is the answer. request(url) gives the status, the
+// Each request counts against a rate-limit scope: 'reverse' (the default),
+// /reverse's (the test key's rate, which every visitor shares), or
+// 'polygons', /polygons' (none). A 429 is asked again after a pause of its
+// scope, which begins before the 429's place goes to the next in line and
+// which the scope's requests wait out without a place, so that those of
+// another scope go meanwhile: `firstPause` ms, doubled by each 429 of a
+// request started after the scope's last pause began (those in flight
+// together make one) up to `maxPause`, and back to none after a success
+// (2xx) of a request of the scope started after it began. After `tries`
+// asks a 429 is the answer. request(url, scope) gives the status, the
 // headers (header(name)), the body and the ms the request took, its wait in
 // line not counted.
 class Pacer {
@@ -695,35 +700,49 @@ class Pacer {
     Object.assign(this, { limit, send: fetch, sleep, now, tries, firstPause, maxPause });
     this.active = 0;
     this.waiting = [];
-    this.pause = 0;
-    this.pausedAt = -Infinity;
-    this.pausedUntil = -Infinity;
+    this.scopes = new Map();
   }
 
-  async request(url) {
+  // The pause of the scope `name`: its length, when it began and when it
+  // ends.
+  scope(name) {
+    if (!this.scopes.has(name)) this.scopes.set(name, { pause: 0, pausedAt: -Infinity, pausedUntil: -Infinity });
+    return this.scopes.get(name);
+  }
+
+  async request(url, scope = 'reverse') {
+    const s = this.scope(scope);
     for (let tries = 1; ; tries++) {
-      await this.acquire();
+      await this.turn(s);
       let got;
-      let started;
       try {
-        for (let wait; (wait = this.pausedUntil - this.now()) > 0;) await this.sleep(wait);
-        started = this.now();
+        const started = this.now();
         const response = await this.send(url);
         const body = await response.text();
         got = { status: response.status, header: (name) => response.headers.get(name), body, ms: this.now() - started };
+        if (got.status === 429 && started > s.pausedAt) {
+          s.pause = Math.min(this.maxPause, s.pause ? s.pause * 2 : this.firstPause);
+          s.pausedAt = this.now();
+          s.pausedUntil = s.pausedAt + s.pause;
+        } else if (got.status >= 200 && got.status < 300 && started > s.pausedAt) {
+          s.pause = 0;
+        }
       } finally {
         this.release();
       }
-      if (got.status !== 429) {
-        this.pause = 0;
-        return got;
-      }
-      if (tries >= this.tries) return got;
-      if (started > this.pausedAt) {
-        this.pause = Math.min(this.maxPause, this.pause ? this.pause * 2 : this.firstPause);
-        this.pausedAt = this.now();
-        this.pausedUntil = this.pausedAt + this.pause;
-      }
+      if (got.status !== 429 || tries >= this.tries) return got;
+    }
+  }
+
+  // A place in line once the pause of the scope `s` is over. A pause that
+  // began while it waited in line it waits out without one, its place
+  // going to the next in line.
+  async turn(s) {
+    for (;;) {
+      for (let wait; (wait = s.pausedUntil - this.now()) > 0;) await this.sleep(wait);
+      await this.acquire();
+      if (s.pausedUntil <= this.now()) return;
+      this.release();
     }
   }
 
@@ -1429,7 +1448,7 @@ async function ask(entry, key, col) {
   let answer;
   try {
     const dataset = col.dataset ? `&dataset=${encodeURIComponent(col.dataset.id)}` : '';
-    const got = await pacer.request(`/reverse?lat=${entry.lat}&lon=${entry.lng}&key=test${dataset}`);
+    const got = await pacer.request(`/reverse?lat=${entry.lat}&lon=${entry.lng}&key=test${dataset}`, 'reverse');
     answer = answerOf(got.status, got.header, got.body, got.ms);
   } catch (e) {
     answer = { error: e.message };
@@ -1594,7 +1613,7 @@ let polygonsColumn = (() => {
 // The overlay's requests: the polygons of the selected result in the
 // overlay's column's dataset, while it is on.
 const polygonOverlay = new PolygonOverlay({
-  request: (url) => pacer.request(url),
+  request: (url) => pacer.request(url, 'polygons'),
   draw: drawPolygons,
   erase: erasePolygons,
   shown: () => {

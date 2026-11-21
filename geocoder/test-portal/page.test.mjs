@@ -133,6 +133,47 @@ function reply(status, body, headers = {}) {
   return { status, headers: { get: (name) => headers[name.toLowerCase()] ?? null }, text: async () => body };
 }
 
+// Lets the page's promises that can go on go on.
+async function settle() {
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+}
+
+// A clock that moves only when the test moves it: now() is `t`, and a sleep
+// lasts until wake() moves `t` to its end.
+function handClock() {
+  const clock = {
+    t: 0,
+    sleeping: [],
+    now: () => clock.t,
+    sleep: (ms) => new Promise((resolve) => clock.sleeping.push({ ms, until: clock.t + ms, resolve })),
+    // The lengths of the sleeps not over, in the order they began.
+    lengths: () => clock.sleeping.map((s) => s.ms),
+    // Moves `t` to the end of every sleep not over, and ends them.
+    wake() {
+      clock.t = Math.max(clock.t, ...clock.sleeping.map((s) => s.until));
+      for (const s of clock.sleeping.splice(0)) s.resolve();
+    },
+  };
+  return clock;
+}
+
+// A Pacer of the page's on `clock`, its first pause 100 ms, whose requests
+// are answered when the test answers them: each in `sent` once it goes,
+// with its URL, the time it went and answer(status).
+function handPacer(Pacer, clock) {
+  const sent = [];
+  const pacer = new Pacer({
+    firstPause: 100,
+    now: clock.now,
+    sleep: clock.sleep,
+    fetch: (url) => new Promise((resolve) => sent.push({ url, at: clock.t, answer: (status) => resolve(reply(status, url)) })),
+  });
+  return { pacer, sent };
+}
+
+// The URL of each of `sent` and the time it went.
+const went = (sent) => sent.map((s) => [s.url, s.at]);
+
 test('the link names a dataset per column, the points and the build', () => {
   const { parseLink, linkSearch } = core();
   const link = parseLink('?d=with-addresses&d=admin.simplified.major&at=48.8584,2.2945&at=-33.85,151.2&b=2026-11-19');
@@ -482,7 +523,7 @@ test('the 429s of requests in flight together make one pause', async () => {
         await gate;
         return reply(429, 'Rate limit exceeded');
       }
-      pauses.push(pacer.pause);
+      pauses.push(pacer.scope('reverse').pause);
       return reply(200, '{}');
     },
   });
@@ -490,6 +531,111 @@ test('the 429s of requests in flight together make one pause', async () => {
   assert.ok(got.every((g) => g.status === 200));
   assert.equal(pauses.length, 8);
   assert.equal(Math.max(...pauses), 30);
+});
+
+test('a /polygons request goes while the reverse lookups wait out a pause, which holds no place', async () => {
+  const { Pacer } = core();
+  const clock = handClock();
+  const { pacer, sent } = handPacer(Pacer, clock);
+  const lookups = Array.from({ length: 12 }, (_, i) => pacer.request(`/reverse?n=${i}`, 'reverse'));
+  await settle();
+  assert.equal(sent.length, 8);
+  for (const s of sent) s.answer(429);
+  await settle();
+
+  const polygons = pacer.request('/polygons?n=1', 'polygons');
+  await settle();
+  assert.deepEqual(went(sent.slice(8)), [['/polygons?n=1', 0]]);
+  sent[8].answer(200);
+  assert.equal((await polygons).status, 200);
+  // Once the pause is over every lookup goes again, 8 at a time.
+  clock.wake();
+  await settle();
+  assert.equal(sent.length, 17);
+  for (const s of sent.slice(9)) s.answer(200);
+  await settle();
+  assert.equal(sent.length, 21);
+  for (const s of sent.slice(17)) s.answer(200);
+  assert.ok((await Promise.all(lookups)).every((g) => g.status === 200));
+  assert.deepEqual(sent.slice(9).map((s) => s.url).sort(), Array.from({ length: 12 }, (_, i) => `/reverse?n=${i}`).sort());
+  assert.ok(sent.slice(9).every((s) => s.at === 100));
+});
+
+test('a /polygons answer leaves the pause of the reverse lookups as it was', async () => {
+  const { Pacer } = core();
+  const clock = handClock();
+  const { pacer, sent } = handPacer(Pacer, clock);
+  const lookup = pacer.request('/reverse?n=1', 'reverse');
+  await settle();
+  sent[0].answer(429);
+  await settle();
+  assert.deepEqual(clock.lengths(), [100]);
+  clock.wake();
+  await settle();
+  const polygons = pacer.request('/polygons?n=1', 'polygons');
+  await settle();
+  assert.deepEqual(went(sent), [['/reverse?n=1', 0], ['/reverse?n=1', 100], ['/polygons?n=1', 100]]);
+  sent[2].answer(200);
+  assert.equal((await polygons).status, 200);
+
+  // The lookup asked again after the pause began: its 429 doubles it.
+  sent[1].answer(429);
+  await settle();
+  assert.deepEqual(clock.lengths(), [200]);
+  clock.wake();
+  await settle();
+  sent[3].answer(200);
+  assert.equal((await lookup).status, 200);
+});
+
+test('the pause of the reverse lookups ends only with a success of one started after it began', async () => {
+  const { Pacer } = core();
+  const clock = handClock();
+  const { pacer, sent } = handPacer(Pacer, clock);
+  const a = pacer.request('/reverse?a', 'reverse');
+  const b = pacer.request('/reverse?b', 'reverse');
+  await settle();
+  clock.t = 10;
+  sent[0].answer(429);
+  await settle();
+  assert.deepEqual(clock.lengths(), [100]);
+  // b went before the pause began: its success ends nothing.
+  sent[1].answer(200);
+  assert.equal((await b).status, 200);
+  clock.wake();
+  await settle();
+  sent[2].answer(429);
+  await settle();
+  assert.deepEqual(clock.lengths(), [200]);
+
+  // c goes after the pause began, but its answer is no success.
+  const c = pacer.request('/reverse?c', 'reverse');
+  await settle();
+  clock.wake();
+  await settle();
+  assert.deepEqual(went(sent.slice(3)).sort(), [['/reverse?a', 310], ['/reverse?c', 310]]);
+  const [askedA, askedC] = ['/reverse?a', '/reverse?c'].map((url) => sent.slice(3).find((s) => s.url === url));
+  askedC.answer(503);
+  assert.equal((await c).status, 503);
+  askedA.answer(429);
+  await settle();
+  assert.deepEqual(clock.lengths(), [400]);
+
+  // a's success, of a request that went after the pause began, ends it:
+  // the next 429 pauses anew.
+  clock.wake();
+  await settle();
+  sent[5].answer(200);
+  assert.equal((await a).status, 200);
+  const d = pacer.request('/reverse?d', 'reverse');
+  await settle();
+  sent[6].answer(429);
+  await settle();
+  assert.deepEqual(clock.lengths(), [100]);
+  clock.wake();
+  await settle();
+  sent[7].answer(200);
+  assert.equal((await d).status, 200);
 });
 
 test('a request that fails frees its place', async () => {
@@ -535,11 +681,6 @@ test('the polygon overlay cycles off, each column, off', () => {
   assert.equal(nextPolygons('off', 0), 'off');
   assert.equal(nextPolygons(3, 2), 'off');
 });
-
-// Lets the page's promises that can go on go on.
-async function settle() {
-  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
-}
 
 test('polygons are drawn only while no clear came after their request and its result and column are still shown', async () => {
   const { PolygonOverlay } = core();

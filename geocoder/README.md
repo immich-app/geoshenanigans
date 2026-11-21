@@ -151,7 +151,8 @@ selection's files answers, and name the dataset and build that answered in
 with their labels and sizes, and the combinations the constraints exclude
 with their messages; `/health` gives the build served and how its sync goes.
 The test key the page sends allows 200 requests a second, shared by every
-visitor; the page keeps 8 in flight and asks a 429 again after a pause, and
+visitor; the page keeps 8 in flight and asks a 429 of `/reverse` again
+after a pause, which its `/polygons` (of no rate limit) don't wait out, and
 the portal runs 8 lookups at once, the others waiting their turn.
 
 `query-portal` fetches a new build itself, every hour
