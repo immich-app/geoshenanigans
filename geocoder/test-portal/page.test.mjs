@@ -487,70 +487,76 @@ test('the status line tells the build served and how the sync goes', () => {
   assert.equal(statusHtml({ status: 'ok' }), '');
 });
 
-test('the requests in flight are at most 8, over every column', async () => {
+// A request holds its place until its body is in: the headers of 8 hold
+// every place while their bodies come, and each body in lets one more go.
+test('the requests in flight are at most 8, over every column, each until its body is in', async () => {
   const { Pacer } = core();
-  let now = 0;
-  let most = 0;
+  const started = [];
   const pacer = new Pacer({
-    fetch: async () => {
-      now++;
-      most = Math.max(most, now);
-      await new Promise((r) => setTimeout(r, 2));
-      now--;
-      return reply(200, '{}');
+    fetch: async (url) => {
+      let deliver;
+      const body = new Promise((resolve) => { deliver = resolve; });
+      started.push({ url, deliver });
+      return { status: 200, headers: { get: () => null }, text: () => body };
     },
   });
-  const batch = () => Promise.all(Array.from({ length: 40 }, (_, i) => pacer.request(`/reverse?n=${i}`)));
-  const got = await batch();
-  assert.equal(most, 8);
+  const requests = Array.from({ length: 40 }, (_, i) => pacer.request(`/reverse?n=${i}`));
+  await settle();
+  assert.equal(started.length, 8);
+  for (let delivered = 0; delivered < 40; delivered++) {
+    started[delivered].deliver('{}');
+    await settle();
+    assert.equal(started.length, Math.min(40, delivered + 9), `${delivered + 1} bodies in`);
+  }
+  const got = await Promise.all(requests);
   assert.ok(got.every((g) => g.status === 200 && g.body === '{}' && g.ms >= 0));
-  // Every place is free once they are answered, and the next ones are held
-  // to 8 as well.
+  assert.deepEqual(started.map((s) => s.url), Array.from({ length: 40 }, (_, i) => `/reverse?n=${i}`));
   assert.deepEqual([pacer.active, pacer.waiting.length], [0, 0]);
-  most = 0;
-  await batch();
-  assert.equal(most, 8);
 });
 
 test('a 429 is asked again after a pause, which every request waits out', async () => {
   const { Pacer } = core();
-  const started = [];
-  let first = true;
-  const t0 = Date.now();
-  const pacer = new Pacer({
-    firstPause: 60,
-    fetch: async (url) => {
-      started.push([url, Date.now() - t0]);
-      if (first) {
-        first = false;
-        return reply(429, 'Rate limit exceeded');
-      }
-      return reply(200, url);
-    },
-  });
+  const clock = handClock();
+  const { pacer, sent } = handPacer(Pacer, clock);
   const a = pacer.request('a');
-  await new Promise((r) => setTimeout(r, 5));
-  const b = await pacer.request('b');
-  assert.equal((await a).status, 200);
-  assert.equal(b.status, 200);
-  assert.deepEqual(started.map(([url]) => url).sort(), ['a', 'a', 'b']);
-  const [, bAt] = started.find(([url]) => url === 'b');
-  const [, againAt] = started.filter(([url]) => url === 'a')[1];
-  assert.ok(bAt >= 55, `b started ${bAt} ms in, within the pause`);
-  assert.ok(againAt >= 55, `a was asked again ${againAt} ms in, within the pause`);
+  await settle();
+  sent[0].answer(429);
+  await settle();
+  // b, asked within the pause, waits it out with a's second ask.
+  const b = pacer.request('b');
+  await settle();
+  assert.deepEqual(went(sent), [['a', 0]]);
+  assert.deepEqual(clock.lengths(), [100, 100]);
+  clock.wake();
+  await settle();
+  assert.deepEqual(went(sent.slice(1)).sort(), [['a', 100], ['b', 100]]);
+  for (const s of sent.slice(1)) s.answer(200);
+  assert.deepEqual([(await a).status, (await b).status], [200, 200]);
 });
 
+// Each pause is twice the one before, up to the longest; after the last of
+// its tries a 429 is the answer, with no pause after it.
 test('the pause doubles with each 429 in a row, and the last of its tries is the answer', async () => {
   const { Pacer } = core();
-  const at = [];
-  const t0 = Date.now();
-  const pacer = new Pacer({ firstPause: 20, tries: 4, fetch: async () => { at.push(Date.now() - t0); return reply(429, 'Rate limit exceeded'); } });
-  const got = await pacer.request('x');
-  assert.equal(got.status, 429);
-  assert.equal(got.body, 'Rate limit exceeded');
-  assert.equal(at.length, 4);
-  const gaps = at.slice(1).map((t, i) => t - at[i]);
-  assert.ok(gaps[0] >= 18 && gaps[1] >= 38 && gaps[2] >= 78, `gaps ${gaps}`);
+  for (const [maxPause, pauses] of [[8000, [20, 40, 80]], [50, [20, 40, 50]]]) {
+    const clock = handClock();
+    const { pacer, sent } = handPacer(Pacer, clock, { firstPause: 20, tries: 4, maxPause });
+    const got = pacer.request('x');
+    for (const pause of pauses) {
+      await settle();
+      sent.at(-1).answer(429);
+      await settle();
+      assert.deepEqual(clock.lengths(), [pause], `the pause after ${sent.length} 429s, of at most ${maxPause} ms`);
+      clock.wake();
+    }
+    await settle();
+    assert.equal(sent.length, 4);
+    sent[3].answer(429);
+    const last = await got;
+    assert.deepEqual([last.status, last.body], [429, 'x']);
+    assert.deepEqual(clock.lengths(), []);
+    assert.equal(pacer.active, 0);
+  }
 });
 
 test('the 429s of requests in flight together make one pause', async () => {
@@ -832,6 +838,7 @@ test('a request cancelled while it waits for a place is never sent, and the next
   assert.deepEqual([pacer.active, pacer.waiting.length], [0, 0]);
 });
 
+// The request gives up at once, while the clock stands within its pause.
 test('a request cancelled during its pause is not asked again', { timeout: 5000 }, async () => {
   const { Pacer } = core();
   const clock = handClock();
@@ -843,10 +850,11 @@ test('a request cancelled during its pause is not asked again', { timeout: 5000 
   await settle();
   assert.deepEqual(clock.lengths(), [100]);
   cancel.abort();
+  await cancelled;
+  assert.equal(clock.t, 0);
   clock.wake();
   await settle();
   assert.deepEqual(went(sent), [['/polygons?n=1', 0]]);
-  await cancelled;
   assert.equal(pacer.active, 0);
 });
 
