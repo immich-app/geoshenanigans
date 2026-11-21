@@ -1664,6 +1664,10 @@ const FEEDBACK_FIELDS = [['name', 'Name'], ['road', 'Road'], ['house_number', 'H
 // The most characters of the form's texts and of each field.
 const FEEDBACK_TEXT_MAX = 2000;
 const FEEDBACK_FIELD_MAX = 200;
+// The name or contact a report may carry (the portal's CONTACT_MAX), and
+// where this browser remembers it for the next report.
+const FEEDBACK_CONTACT_MAX = 200;
+const FEEDBACK_CONTACT_KEY = 'geocoder_feedback_contact';
 
 // The start of `s` of at most `max` bytes of UTF-8, or where `escaped` of
 // its JSON string, its quotes left out: cut between characters.
@@ -1746,6 +1750,7 @@ function feedbackReport(target, form, page) {
     answer_trimmed: trimmed,
     expected,
     comment: text(form.comment),
+    ...(text(form.contact) ? { contact: text(form.contact) } : {}),
     page: { columns: page.columns.slice(), point: page.point ? { lat: page.point.lat, lon: page.point.lng } : null, q: page.q || null },
   };
 }
@@ -1760,7 +1765,7 @@ function feedbackSays(report) {
 // The form of a report of `target`: what it is of, the answer it sends, a
 // search's results to name one of, what was expected, a comment, and what
 // is kept of it.
-function feedbackFormHtml(target) {
+function feedbackFormHtml(target, contact = '') {
   const about = [esc(target.label)];
   if (target.dataset) about.push(esc(target.dataset));
   if (target.build) about.push(`build ${esc(target.build)}`);
@@ -1785,8 +1790,9 @@ function feedbackFormHtml(target) {
   }
   html += '</div><label class="feedback-check"><input type="checkbox" name="empty"> The answer should be empty</label>';
   html += `<label class="feedback-row"><span>Comment</span><textarea name="comment" rows="2" maxlength="${FEEDBACK_TEXT_MAX}"></textarea></label>`;
+  html += `<label class="feedback-row"><span>Your name or contact (optional, so we can ask you more about it)</span><input name="contact" maxlength="${FEEDBACK_CONTACT_MAX}" value="${esc(contact)}" autocomplete="on"></label>`;
   html += '<div class="feedback-note">We keep what you write here with the answer, its dataset and build, and the page\'s link.'
-    + ' No IP address and no email are kept: leave out anything personal.</div>';
+    + ' A name or contact you give is kept with your report, and this browser remembers it for your next one; no IP address is kept.</div>';
   html += '<div class="feedback-actions"><button type="submit">Send</button><button type="button" class="tool" data-action="feedback-close">Cancel</button></div>';
   return `${html}<div class="feedback-status" role="status"></div>`;
 }
@@ -2790,7 +2796,9 @@ let feedbackTarget = null;
 
 function openFeedback(target) {
   feedbackTarget = target;
-  feedbackForm.innerHTML = feedbackFormHtml(target);
+  let contact = '';
+  try { contact = localStorage.getItem(FEEDBACK_CONTACT_KEY) || ''; } catch (err) {}
+  feedbackForm.innerHTML = feedbackFormHtml(target, contact);
   feedbackDialog.showModal();
 }
 
@@ -2844,6 +2852,10 @@ feedbackForm.addEventListener('submit', async (e) => {
     send.disabled = false;
     return;
   }
+  try {
+    if (report.contact) localStorage.setItem(FEEDBACK_CONTACT_KEY, report.contact);
+    else localStorage.removeItem(FEEDBACK_CONTACT_KEY);
+  } catch (err) {}
   let count = null;
   try {
     count = await (await fetch('/feedback/count')).json();

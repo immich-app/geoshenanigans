@@ -31,6 +31,9 @@ pub const BODY_MAX: usize = 16 << 10;
 pub const RATE_PER_WINDOW: u32 = 20;
 pub const RATE_WINDOW: Duration = Duration::from_secs(60);
 
+/// The most characters of the contact a report may carry.
+pub const CONTACT_MAX: usize = 200;
+
 /// The IPs the rate keeps before it forgets those whose window is over.
 const RATE_KEPT: usize = 10_000;
 
@@ -106,6 +109,9 @@ struct Report {
     #[serde(default)]
     expected: Expected,
     comment: Option<String>,
+    /// How to reach the person who sent it, if they gave a name or contact
+    /// (the page remembers it in their browser): to ask them more later.
+    contact: Option<String>,
     page: Option<Page>,
 }
 
@@ -132,6 +138,9 @@ fn check(r: &Report) -> Result<(), String> {
     }
     if r.kind != Kind::Search && r.result_index.is_some() {
         return Err("result_index is a search report's".to_string());
+    }
+    if r.contact.as_deref().is_some_and(|c| c.chars().count() > CONTACT_MAX) {
+        return Err(format!("contact must be at most {CONTACT_MAX} characters"));
     }
     let e = &r.expected;
     if !(e.empty || [&e.text, &e.name, &e.road, &e.house_number, &e.city, &e.postcode, &e.country, &r.comment].into_iter().any(said)) {

@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::time::{Instant, SystemTime};
 
 use super::*;
-use crate::portal::feedback::{PerIp, BODY_MAX, DIR, RATE_PER_WINDOW, RATE_WINDOW};
+use crate::portal::feedback::{PerIp, BODY_MAX, CONTACT_MAX, DIR, RATE_PER_WINDOW, RATE_WINDOW};
 
 /// A portal of the data dir `data`, serving no build, at its base URL.
 async fn serving(data: &Path) -> String {
@@ -97,9 +97,30 @@ async fn a_report_is_a_line_of_its_days_file_with_when_it_came_and_nothing_of_wh
         "expected": { "text": "the tower itself", "name": "Tour Eiffel", "road": null, "house_number": "5", "city": null, "postcode": null,
                       "country": null, "empty": false },
         "comment": "the tower is right there",
+        "contact": null,
         "page": { "columns": ["with-addresses", "smallest"], "point": { "lat": 48.8584, "lon": 2.2945 }, "q": "eiffel" },
     }));
     assert_eq!(lines[0].split("\",\"").next().unwrap(), format!("{{\"received\":\"{received}"), "received comes first");
+}
+
+// A report keeps the name or contact its sender gave, to ask them more
+// later; one past CONTACT_MAX characters is 400 and writes nothing.
+#[tokio::test]
+async fn a_report_keeps_the_contact_its_sender_gave() {
+    let data = ScratchDir::new();
+    let url = serving(data.path()).await;
+    let mut with = report();
+    with["contact"] = serde_json::json!("ana@example.org");
+    let mut long = report();
+    long["contact"] = serde_json::json!("x".repeat(CONTACT_MAX + 1));
+
+    assert_eq!(post(&url, Some("test"), long.to_string()).await.status, 400);
+    assert!(lines(data.path()).is_empty());
+    let got = post(&url, Some("test"), with.to_string()).await;
+
+    assert_eq!(got.status, 201, "{}", got.body);
+    let line: serde_json::Value = serde_json::from_str(&lines(data.path()).into_values().next().unwrap()[0]).unwrap();
+    assert_eq!(line["contact"], "ana@example.org");
 }
 
 // Reports sent at once are each a whole line of their own.

@@ -1593,6 +1593,19 @@ test("a report of a column's reverse answer names its dataset, build, point and 
   assert.equal(feedbackSays(report), true);
 });
 
+// A name or contact given goes with the report, trimmed; none is left out.
+// The form shows the one this browser remembers, escaped.
+test("a report carries the contact its sender gave, and the form shows the remembered one", () => {
+  const { generalTarget, feedbackReport, feedbackFormHtml } = core();
+  const bare = { columns: [], point: null, q: '' };
+  const target = generalTarget(null, ID);
+
+  assert.equal(plain(feedbackReport(target, { comment: 'hi', contact: '  ana@example.org ' }, bare)).contact, 'ana@example.org');
+  assert.equal('contact' in plain(feedbackReport(target, { comment: 'hi', contact: '  ' }, bare)), false);
+  const html = feedbackFormHtml(target, 'Ana <a@b>');
+  assert.match(html, /name="contact"[^>]*value="Ana &lt;a@b&gt;"/);
+});
+
 // A search's report carries the column's results; the form names one of
 // them (by its index, its point the report's) or none, for the results as a
 // whole.
@@ -1675,8 +1688,8 @@ test('the form and its buttons escape every string they show, and only answers o
 
   for (const out of [reverse, search, general]) {
     assertEscaped(out);
-    for (const name of ['text', 'name', 'road', 'house_number', 'city', 'postcode', 'country', 'empty', 'comment']) assert.ok(out.includes(`name="${name}"`), name);
-    assert.ok(out.includes('No IP address and no email'), out);
+    for (const name of ['text', 'name', 'road', 'house_number', 'city', 'postcode', 'country', 'empty', 'comment', 'contact']) assert.ok(out.includes(`name="${name}"`), name);
+    assert.ok(out.includes('no IP address is kept'), out);
   }
   assert.ok(reverse.includes('&quot;&gt;&lt;img src=x onerror=alert(1)&gt; · build &lt;u&gt;build&lt;/u&gt; · 1.00000, 2.00000'), reverse);
   assert.ok(search.includes('<option value="0">#1 &lt;em&gt;Paris&lt;/em&gt; (&lt;b&gt;t&lt;/b&gt;)</option>'), search);
