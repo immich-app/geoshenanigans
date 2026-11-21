@@ -370,20 +370,11 @@ jobs:
           # ── Background: the day's diff ──
           # What Apply replication diffs applies to yesterday's PBF (it fetches
           # it itself if this failed): ~140 MiB, beside the PBF rather than
-          # after it.
-          (
-            START=$(date +%s)
-            DIFF_PATH=$(printf "%03d/%03d/%03d" $((TODAY_SEQ / 1000000)) $(((TODAY_SEQ / 1000) % 1000)) $((TODAY_SEQ % 1000)))
-            if curl -sL --fail --retry 5 --retry-delay 30 --retry-all-errors -o "$WORKDIR/diff-today.osc.gz.part" \
-                 "https://planet.openstreetmap.org/replication/day/$DIFF_PATH.osc.gz" \
-               && gzip -t "$WORKDIR/diff-today.osc.gz.part"; then
-              mv "$WORKDIR/diff-today.osc.gz.part" "$WORKDIR/diff-today.osc.gz"
-              echo "[diff] seq $TODAY_SEQ: $(( $(stat -c%s "$WORKDIR/diff-today.osc.gz") / 1024 / 1024 )) MiB in $(($(date +%s) - START))s"
-            else
-              rm -f "$WORKDIR/diff-today.osc.gz.part"
-              echo "::warning::[diff] Fetching the diff of seq $TODAY_SEQ failed; Apply replication diffs fetches it"
-            fi
-          ) &
+          # after it, at most 10 minutes (fetch_day_diff.sh). In a session of
+          # its own, its output in a file: only yesterday's PBF waits for it
+          # below, and any other ends it, curl and all.
+          setsid "$GITHUB_WORKSPACE/geocoder/builder/tools/fetch_day_diff.sh" "$TODAY_SEQ" "$WORKDIR/diff-today.osc.gz" 600 \
+            > "$WORKDIR/diff-today.log" 2>&1 < /dev/null &
           DIFF_PID=$!
 
           # Retry wrapper: retries a command up to N times with backoff
@@ -557,7 +548,7 @@ jobs:
             if download_pbf_from_cache \
                 "s3://$CACHE_BUCKET/$PBF_CACHE/planet-${TODAY}.osm.pbf" \
                 "$WORKDIR/planet.osm.pbf" "today's PBF ($TODAY)"; then
-              echo "pbf_source=today" >> "$GITHUB_OUTPUT"
+              PBF_SOURCE=today
             else
               echo "[pbf] Falling back to yesterday's PBF..."
               # Fall through to next check
@@ -570,7 +561,7 @@ jobs:
             if download_pbf_from_cache \
                 "s3://$CACHE_BUCKET/geocoder-cache/planet-${YESTERDAY}.osm.pbf" \
                 "$WORKDIR/planet.osm.pbf" "yesterday's PBF ($YESTERDAY)"; then
-              echo "pbf_source=yesterday" >> "$GITHUB_OUTPUT"
+              PBF_SOURCE=yesterday
             fi
           fi
 
@@ -582,7 +573,20 @@ jobs:
               || true
             SIZE=$(stat -c%s "$WORKDIR/planet.osm.pbf")
             echo "[pbf] Done: $((SIZE/1024/1024)) MiB"
-            echo "pbf_source=mirror" >> "$GITHUB_OUTPUT"
+            PBF_SOURCE=mirror
+          fi
+          echo "pbf_source=$PBF_SOURCE" >> "$GITHUB_OUTPUT"
+
+          # The day's diff: yesterday's PBF takes it (a fetch that failed or
+          # ran out of time leaves Apply replication diffs to fetch it);
+          # today's needs none and the mirror's fetches its diffs there.
+          if [ "$PBF_SOURCE" = yesterday ]; then
+            wait $DIFF_PID || true
+            cat "$WORKDIR/diff-today.log"
+          else
+            pkill -TERM -s "$DIFF_PID" 2> /dev/null || true
+            wait $DIFF_PID 2> /dev/null || true
+            rm -f "$WORKDIR/diff-today.osc.gz" "$WORKDIR/diff-today.osc.gz.part"
           fi
 
           # Wait for the sidecars and the small downloads (wikidata or TIGER
@@ -592,7 +596,6 @@ jobs:
             wait $IDX_PID
           fi
           wait $EXTRAS_PID
-          wait $DIFF_PID || true
           echo "All downloads complete in $(($(date +%s) - STEP_START))s"
 
       - name: Run builder tests
