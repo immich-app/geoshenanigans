@@ -937,9 +937,10 @@ def watchdog_script(name):
 
 # gh as the watchdog runs it, answering from the JSON in $FAKE_GH_DATA: the repo's default branch, the build's runs
 # (`run list` newest first, on its --branch and from its --created date, at most its --limit, each with only the
-# fields asked for), each run's jobs, and the REST API's runs (a page of per_page) and each run attempt's jobs (by
-# their route, runs/<id>/attempts/<n>/jobs; another is not found); --jq filters go through jq. `workflow run` appends
-# its arguments to $FAKE_GH_CALLS.
+# fields asked for), each run's jobs, and the REST API's runs (from the date of a created=>= filter, a run without a
+# created_at counting as today's; a page of per_page, every page with --paginate) and each run attempt's jobs (by
+# their route, runs/<id>/attempts/<n>/jobs; another is not found); --jq filters go through jq, a page at a time.
+# `workflow run` appends its arguments to $FAKE_GH_CALLS, and a request for the REST API's runs its route.
 FAKE_GH = r'''#!{python}
 import json, os, re, subprocess, sys
 args = sys.argv[1:]
@@ -952,6 +953,8 @@ def opt(name):
         if arg.startswith(name + "="):
             return arg[len(name) + 1:]
     return None
+def api_path():
+    return next(arg for arg in args[1:] if not arg.startswith("-"))
 def answer(value):
     if opt("--jq") is None:
         print(json.dumps(value))
@@ -977,15 +980,22 @@ elif args[:2] == ["run", "view"]:
 elif args[:2] == ["workflow", "run"]:
     with open(os.environ["FAKE_GH_CALLS"], "a") as f:
         f.write(" ".join(args) + "\n")
-elif args[0] == "api" and args[1].endswith("/jobs"):
-    route = args[1].split("/actions/", 1)[1]
+elif args[0] == "api" and api_path().endswith("/jobs"):
+    route = api_path().split("/actions/", 1)[1]
     if route not in data["api_jobs"]:
         sys.exit("gh: Not Found (HTTP 404)")
     answer({{"jobs": data["api_jobs"][route]}})
 elif args[0] == "api":
-    page = re.search(r"[?&]per_page=([0-9]+)", args[1])
+    with open(os.environ["FAKE_GH_CALLS"], "a") as f:
+        f.write("api " + api_path() + "\n")
+    page = re.search(r"[?&]per_page=([0-9]+)", api_path())
     per_page = int(page.group(1)) if page else 30
-    answer({{"workflow_runs": data["api_runs"][:per_page]}})
+    created = re.search(r"[?&]created=(?:>=|%3E%3D)([0-9-]+)", api_path())
+    runs = [run for run in data["api_runs"]
+            if not created or run.get("created_at", data["today"])[:10] >= created.group(1)]
+    pages = [runs[i:i + per_page] for i in range(0, len(runs), per_page)] or [[]]
+    for runs in pages if "--paginate" in args else pages[:1]:
+        answer({{"workflow_runs": runs}})
 else:
     sys.exit("fake gh: " + " ".join(args))
 '''
@@ -1093,12 +1103,13 @@ class WatchdogTest(unittest.TestCase):
         self.assertEqual(dispatched, self.retry())
         self.assertIn("total=2", out)
 
-    # Runs on other branches and scratch runs of the day, however many, don't push the live run out of the list.
+    # Runs on other branches and scratch runs of the day, however many (more than gh's page of 100 on the default
+    # branch alone), don't push the live run out of the list.
     def test_the_days_other_runs_do_not_crowd_out_its_live_run(self):
         self.run_at("00:30", LIVE_TITLE, "failure", [("Setup", "success"), ("Build geocoder index", "failure")])
         for i in range(40):
             self.run_at(f"{1 + i // 60:02d}:{i % 60:02d}", SCRATCH_TITLE, "success", branch="perf/nightly-speed")
-        for i in range(10):
+        for i in range(150):
             self.run_at(f"{3 + i // 60:02d}:{i % 60:02d}", SCRATCH_TITLE, "success")
 
         out, dispatched = self.watchdog()
@@ -1138,7 +1149,7 @@ class WatchdogTest(unittest.TestCase):
         returns the run it took, once it has checked that the job it took is that run's."""
         data = os.path.join(self.root, "data.json")
         with open(data, "w") as f:
-            json.dump({"default_branch": "main", "runs": [], "jobs": {}, "api_runs": api_runs,
+            json.dump({"default_branch": "main", "today": self.today, "runs": [], "jobs": {}, "api_runs": api_runs,
                        "api_jobs": {f"runs/{run['id']}/attempts/{run['run_attempt']}/jobs": [{"id": 1000 + run["id"],
                                                                                               "steps": []}]
                                     for run in api_runs}}, f)
@@ -1151,11 +1162,15 @@ class WatchdogTest(unittest.TestCase):
                "LATEST_JSON_URL": "https://l.invalid/latest.json"}
         script = watchdog_script("Report the published build and the latest nightly")
         self.assertIn('--run "$RUN_JSON"', script)
+        for name in ("o11y-run.json", "o11y-job.json", "calls"):
+            if os.path.exists(os.path.join(self.root, name)):
+                os.remove(os.path.join(self.root, name))
         done = subprocess.run(["bash", "-e", "-c", script], env=env, capture_output=True, text=True, timeout=60)
 
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         with open(os.path.join(self.root, "o11y-run.json")) as f:
             run = json.load(f)
+        self.assertNotEqual(run, {}, "the report took no run: " + done.stdout)
         with open(os.path.join(self.root, "o11y-job.json")) as f:
             self.assertEqual(json.load(f), {"id": 1000 + run["id"], "steps": []})
         return run
@@ -1175,13 +1190,31 @@ class WatchdogTest(unittest.TestCase):
 
         self.assertEqual(self.report([retry, live]), retry)
 
-    # Past a page of the API's default size of scratch runs since it.
+    # Past a page of the API's default size of scratch runs since it, and past a page of its largest.
     def test_the_report_finds_the_live_run_past_a_page_of_scratch_runs(self):
-        live = {"id": 7, "run_attempt": 1, "display_title": LIVE_TITLE, "conclusion": "failure"}
-        scratch = [{"id": 100 + i, "run_attempt": 1, "display_title": SCRATCH_TITLE, "conclusion": "success"}
-                   for i in range(40)]
+        for scratch_runs in (40, 150):
+            with self.subTest(scratch_runs=scratch_runs):
+                live = {"id": 7, "run_attempt": 1, "display_title": LIVE_TITLE, "conclusion": "failure"}
+                scratch = [{"id": 100 + i, "run_attempt": 1, "display_title": SCRATCH_TITLE, "conclusion": "success"}
+                           for i in range(scratch_runs)]
 
-        self.assertEqual(self.report(scratch + [live]), live)
+                self.assertEqual(self.report(scratch + [live]), live)
+
+    # The pages are the week's runs alone, so that the walk past scratch runs has an end: a live run of eight days
+    # ago is none of them.
+    def test_the_report_pages_through_the_weeks_runs_alone(self):
+        week = {"id": 7, "run_attempt": 1, "display_title": LIVE_TITLE, "conclusion": "success",
+                "created_at": "2026-11-14T06:17:00Z"}
+        older = {"id": 6, "run_attempt": 1, "display_title": LIVE_TITLE, "conclusion": "failure",
+                 "created_at": "2026-11-13T06:17:00Z"}
+        scratch = [{"id": 100 + i, "run_attempt": 1, "display_title": SCRATCH_TITLE, "conclusion": "success"}
+                   for i in range(150)]
+
+        self.assertEqual(self.report(scratch + [week, older]), week)
+        with open(self.calls) as f:
+            requests = [line for line in f.read().splitlines() if line.startswith("api ")]
+        self.assertEqual(len(requests), 1, requests)
+        self.assertRegex(requests[0], r"[?&]created=(>=|%3E%3D)2026-11-14(&|$)")
 
     # The nightly's own title says which runs are tests, as the watchdog reads it: a scheduled run's is the workflow's
     # name, and a dispatch's names its prefix as given, which the watchdog matches byte for byte (an expression's ==
