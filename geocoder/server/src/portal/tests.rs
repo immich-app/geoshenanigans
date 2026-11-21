@@ -20,7 +20,7 @@ use query_server::{
 
 use crate::portal::catalog::{self, Object};
 use crate::portal::sync::{self, BuildDir, BUILDS, COMPLETE, MANIFEST, REFUSED, SETS};
-use crate::portal::{load_dataset, router, Config, Loader, Portal, BUILD_VERSION};
+use crate::portal::{load_dataset, router, Config, Loader, Portal, BUILD_VERSION, LOOKUPS_AT_ONCE};
 use crate::downloader::{resolve_files, Configurations, RegionSelection};
 use crate::scratch_dir::ScratchDir;
 use crate::test_bucket::{self, TestBucket, DATE};
@@ -115,6 +115,7 @@ fn config(bucket: &TestBucket, load: Loader) -> Config {
         retry_after: Duration::from_millis(20),
         retry_delays: Vec::new(),
         fetches_at_once: 8,
+        lookups_at_once: LOOKUPS_AT_ONCE,
         load,
         free_space: |_| Ok(u64::MAX),
     }
@@ -693,6 +694,40 @@ async fn datasets_lists_the_28_offered_and_the_combinations_the_constraints_excl
                       ("quality", values("quality").iter().map(String::as_str).collect()),
                       ("poi_tier", values("poi_tier").iter().map(String::as_str).collect())]);
     assert_eq!(json["axes"][1]["values"][0]["label"], t["axes"]["mode"]["values"]["full"]["label"]);
+}
+
+// The lookups run a few at once over every client, each on a blocking
+// thread: one waits its turn while the others hold every place, /health
+// answers meanwhile, and it is answered once a place is free.
+#[tokio::test]
+async fn a_lookup_waits_its_turn_while_the_lookups_at_once_run() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let mut two = config(&bucket, load);
+    two.lookups_at_once = 2;
+    let p = portal(data.path(), two);
+    p.round(true).await.unwrap();
+    let url = serve(router(p.clone(), db())).await;
+    assert_eq!(p.lookups.available_permits(), 2);
+
+    let taken = p.lookups.clone().try_acquire_many_owned(2).unwrap();
+    let waiting: Vec<_> = ["reverse", "polygons"].into_iter()
+        .map(|route| {
+            let at = format!("{url}/{route}?lat=10.5&lon=20.5&key=test");
+            tokio::spawn(async move { fetch(&at).await.status })
+        })
+        .collect();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(waiting.iter().all(|w| !w.is_finished()));
+    assert_eq!(fetch(&format!("{url}/health")).await.status, 200);
+
+    drop(taken);
+    for w in waiting {
+        assert_eq!(w.await.unwrap(), 200);
+    }
+    assert_eq!(p.lookups.available_permits(), 2);
+    assert_eq!(Config::from_env().lookups_at_once, LOOKUPS_AT_ONCE);
 }
 
 // A /reverse or /polygons without dataset= answers from with-addresses, as

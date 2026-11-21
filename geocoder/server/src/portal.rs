@@ -36,6 +36,13 @@ pub const BUILD_VERSION: u32 = 24;
 /// under builds/.
 pub const BASE_URL: &str = "https://geoshenanigans-reverse-geocoding.t3.tigrisfiles.io/geocoder";
 
+/// The lookups the portal runs at once (Config::lookups_at_once): as many
+/// as a query-server on a host of 8 cores or more answers at once, one a
+/// worker. A /polygons of a dataset of exact boundaries builds the JSON of
+/// every vertex of the rings around its point, hundreds of MB in a big
+/// country, so the lookups are capped, not only the page's requests.
+pub const LOOKUPS_AT_ONCE: usize = 8;
+
 /// How a dataset's dir loads: into a MultiIndex of one slot.
 pub type Loader = Arc<dyn Fn(&Path) -> Result<MultiIndex, String> + Send + Sync>;
 
@@ -52,6 +59,9 @@ pub struct Config {
     pub retry_delays: Vec<Duration>,
     /// How many objects a sync fetches at once.
     pub fetches_at_once: usize,
+    /// How many lookups (/reverse, /polygons) run at once, over every
+    /// client: the others wait their turn.
+    pub lookups_at_once: usize,
     /// How a dataset's dir loads (load_dataset).
     pub load: Loader,
     /// The bytes free to this process in the file system of a dir.
@@ -69,6 +79,7 @@ impl Config {
             retry_after: Duration::from_secs(seconds.min(600)),
             retry_delays: [5, 30, 120].map(Duration::from_secs).to_vec(),
             fetches_at_once: 8,
+            lookups_at_once: LOOKUPS_AT_ONCE,
             load: Arc::new(load_dataset),
             free_space,
         }
@@ -157,6 +168,9 @@ pub struct Portal {
     /// The build dirs this process found it can't serve (another build
     /// version, damaged, not loading): the prune keeps none of them.
     unusable: Mutex<std::collections::BTreeSet<String>>,
+    /// A place for each lookup that may run (Config::lookups_at_once),
+    /// held until the lookup ends.
+    pub lookups: Arc<tokio::sync::Semaphore>,
     http: reqwest::Client,
 }
 
@@ -164,6 +178,7 @@ impl Portal {
     pub fn new(data: PathBuf, config: Config) -> Portal {
         Portal {
             data,
+            lookups: Arc::new(tokio::sync::Semaphore::new(config.lookups_at_once.max(1))),
             config,
             served: arc_swap::ArcSwapOption::empty(),
             status: Mutex::new(Status::default()),
@@ -278,10 +293,22 @@ struct Params {
     dataset: Option<String>,
 }
 
-/// An answer of the dataset `at` of `served`, which a blocking thread gave
-/// (`answered`), named by the headers X-Geocoder-Build and
+/// The answer of `answer` from the dataset `at` of `served`, on a blocking
+/// thread once a place of the portal's lookups is free (Portal::lookups):
+/// a lookup that waits on cold pages holds up no other request, and at most
+/// Config::lookups_at_once run. A lookup holds its place until it ends, even
+/// once its client has gone. Named by the headers X-Geocoder-Build and
 /// X-Geocoder-Dataset.
-fn tagged(served: &Served, at: usize, answered: Result<Response, tokio::task::JoinError>) -> Response {
+async fn lookup(portal: &Portal, served: Arc<Served>, at: usize, answer: impl FnOnce(&MultiIndex) -> Response + Send + 'static) -> Response {
+    let Ok(place) = portal.lookups.clone().acquire_owned().await else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "the lookups are closed").into_response();
+    };
+    let index = served.indexes[at].clone();
+    let answered = tokio::task::spawn_blocking(move || {
+        let _place = place;
+        answer(&index)
+    })
+    .await;
     let mut resp = match answered {
         Ok(resp) => resp,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("the lookup failed: {e}")).into_response(),
@@ -297,8 +324,8 @@ fn tagged(served: &Served, at: usize, answered: Result<Response, tokio::task::Jo
     resp
 }
 
-/// /reverse of a dataset, checked as query-server checks it, answered on a
-/// blocking thread: a lookup that waits on cold pages holds up no other.
+/// /reverse of a dataset, checked as query-server checks it, answered as a
+/// lookup.
 async fn reverse(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<SocketAddr>, Query(p): Query<Params>) -> Response {
     if let Err(resp) = handlers::check_reverse(&app.db, &app.limiter, p.key.as_deref(), p.lat, p.lon, peer.ip()) {
         return resp;
@@ -307,9 +334,7 @@ async fn reverse(State(app): State<Arc<App>>, ConnectInfo(peer): ConnectInfo<Soc
         Ok(found) => found,
         Err(resp) => return resp,
     };
-    let index = served.indexes[at].clone();
-    let answered = tokio::task::spawn_blocking(move || handlers::reverse_answer(&index, p.lat, p.lon, p.debug.as_deref())).await;
-    tagged(&served, at, answered)
+    lookup(&app.portal, served, at, move |index| handlers::reverse_answer(index, p.lat, p.lon, p.debug.as_deref())).await
 }
 
 /// /polygons of a dataset, as reverse.
@@ -321,9 +346,7 @@ async fn polygons(State(app): State<Arc<App>>, Query(p): Query<Params>) -> Respo
         Ok(found) => found,
         Err(resp) => return resp,
     };
-    let index = served.indexes[at].clone();
-    let answered = tokio::task::spawn_blocking(move || handlers::polygons_answer(&index, p.lat, p.lon)).await;
-    tagged(&served, at, answered)
+    lookup(&app.portal, served, at, move |index| handlers::polygons_answer(index, p.lat, p.lon)).await
 }
 
 /// query-portal <data dir> [<bind address>]: serves at once (0.0.0.0:3000
