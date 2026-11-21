@@ -32,7 +32,7 @@ function style(selector) {
 function core() {
   const found = scripts.find((s) => s.id === 'core');
   assert.ok(found, 'index.html has no <script id="core">');
-  const context = vm.createContext({ URLSearchParams, setTimeout, clearTimeout });
+  const context = vm.createContext({ URLSearchParams, setTimeout, clearTimeout, AbortController });
   vm.runInContext(found.body, context, { filename: 'index.html#core' });
   return new Proxy({}, { get: (_, name) => vm.runInContext(String(name), context) });
 }
@@ -157,16 +157,18 @@ function handClock() {
   return clock;
 }
 
-// A Pacer of the page's on `clock`, its first pause 100 ms, whose requests
-// are answered when the test answers them: each in `sent` once it goes,
-// with its URL, the time it went and answer(status).
-function handPacer(Pacer, clock) {
+// A Pacer of the page's on `clock`, its first pause 100 ms (and `options`
+// besides), whose requests are answered when the test answers them: each in
+// `sent` once it goes, with its URL, the time it went, the signal it was
+// given and answer(status).
+function handPacer(Pacer, clock, options = {}) {
   const sent = [];
   const pacer = new Pacer({
     firstPause: 100,
     now: clock.now,
     sleep: clock.sleep,
-    fetch: (url) => new Promise((resolve) => sent.push({ url, at: clock.t, answer: (status) => resolve(reply(status, url)) })),
+    fetch: (url, signal) => new Promise((resolve) => sent.push({ url, at: clock.t, signal, answer: (status) => resolve(reply(status, url)) })),
+    ...options,
   });
   return { pacer, sent };
 }
@@ -787,6 +789,85 @@ test('a reload of the datasets moves the polygon overlay where its dataset or bu
   const waiting = overlayTarget(0, [{ single: true }], null);
   assert.deepEqual(plain(waiting), { key: '', build: null });
   assert.equal(overlayMoved(waiting, shown), true);
+});
+
+test('a polygon request is cancelled once another show or a clear comes after it', { timeout: 5000 }, async () => {
+  const { PolygonOverlay } = core();
+  const signals = [];
+  const overlay = new PolygonOverlay({
+    request: (url, signal) => {
+      signals.push(signal);
+      return new Promise((resolve, reject) => { if (signal) signal.addEventListener('abort', () => reject(signal.reason)); });
+    },
+    draw: () => assert.fail('nothing is drawn'),
+    erase: () => {},
+    shown: () => ({ id: 'b', key: 'full.simplified.all' }),
+  });
+  const first = overlay.show('a', 'full.simplified.all', '/polygons?n=1');
+  const second = overlay.show('b', 'full.simplified.all', '/polygons?n=2');
+  assert.deepEqual(signals.map((s) => Boolean(s && s.aborted)), [true, false]);
+  assert.equal(await first, false);
+  overlay.clear();
+  assert.equal(signals[1].aborted, true);
+  assert.equal(await second, false);
+});
+
+test('a request cancelled while it waits for a place is never sent, and the next in line goes', { timeout: 5000 }, async () => {
+  const { Pacer } = core();
+  const clock = handClock();
+  const { pacer, sent } = handPacer(Pacer, clock, { limit: 1 });
+  const cancel = new AbortController();
+  const first = pacer.request('/polygons?n=1', 'polygons');
+  const cancelled = assert.rejects(pacer.request('/polygons?n=2', 'polygons', cancel.signal), { name: 'AbortError' });
+  const next = pacer.request('/polygons?n=3', 'polygons');
+  await settle();
+  cancel.abort();
+  await settle();
+  sent[0].answer(200);
+  await settle();
+  assert.deepEqual(sent.map((s) => s.url), ['/polygons?n=1', '/polygons?n=3']);
+  sent[1].answer(200);
+  assert.deepEqual([(await first).status, (await next).status], [200, 200]);
+  await cancelled;
+  assert.deepEqual([pacer.active, pacer.waiting.length], [0, 0]);
+});
+
+test('a request cancelled during its pause is not asked again', { timeout: 5000 }, async () => {
+  const { Pacer } = core();
+  const clock = handClock();
+  const { pacer, sent } = handPacer(Pacer, clock);
+  const cancel = new AbortController();
+  const cancelled = assert.rejects(pacer.request('/polygons?n=1', 'polygons', cancel.signal), { name: 'AbortError' });
+  await settle();
+  sent[0].answer(429);
+  await settle();
+  assert.deepEqual(clock.lengths(), [100]);
+  cancel.abort();
+  clock.wake();
+  await settle();
+  assert.deepEqual(went(sent), [['/polygons?n=1', 0]]);
+  await cancelled;
+  assert.equal(pacer.active, 0);
+});
+
+test('a request cancelled while its body comes stops reading it and frees its place', { timeout: 5000 }, async () => {
+  const { Pacer } = core();
+  const given = [];
+  const pacer = new Pacer({
+    limit: 1,
+    fetch: async (url, signal) => {
+      given.push(signal);
+      return url === 'slow' ? { status: 200, headers: { get: () => null }, text: () => new Promise(() => {}) } : reply(200, 'ok');
+    },
+  });
+  const cancel = new AbortController();
+  const cancelled = assert.rejects(pacer.request('slow', 'polygons', cancel.signal), { name: 'AbortError' });
+  await settle();
+  assert.equal(given[0], cancel.signal, 'the fetch has the signal, which ends its download');
+  cancel.abort();
+  await cancelled;
+  assert.equal(pacer.active, 0);
+  assert.equal((await pacer.request('next', 'polygons')).body, 'ok');
 });
 
 test('the JSON of an answer is shown highlighted and escaped', () => {

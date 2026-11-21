@@ -153,7 +153,8 @@ selection's files answers, and name the dataset and build that answered in
 `/datasets` lists the datasets with their labels and sizes, and the
 combinations the constraints exclude with their messages; `/health` gives
 the build served and how its sync goes. The page asks `/datasets` anew
-once `/health` names another dir.
+once `/health` names another dir, and cancels a polygon request once a
+newer one or a clear supersedes it.
 The test key the page sends allows 200 requests a second, shared by every
 visitor; the page keeps 8 in flight and asks a 429 of `/reverse` again
 after a pause, which its `/polygons` (of no rate limit) don't wait out, and

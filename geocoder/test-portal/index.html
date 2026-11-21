@@ -725,9 +725,13 @@ function answersDiffer(datas) {
 // request started after the scope's last pause began (those in flight
 // together make one) up to `maxPause`, and back to none after a success
 // (2xx) of a request of the scope started after it began. After `tries`
-// asks a 429 is the answer. request(url, scope) gives the status, the
-// headers (header(name)), the body and the ms the request took, its wait in
-// line not counted.
+// asks a 429 is the answer. request(url, scope, signal) gives the status,
+// the headers (header(name)), the body and the ms the request took, its
+// wait in line not counted. A request whose `signal` (an AbortController's)
+// aborts stops where it is, its promise rejected with the abort's reason:
+// one waiting in line or out a pause gives up its turn and is never sent
+// or asked again, and one in flight frees its place at once, its fetch,
+// given the signal, ending its download.
 class Pacer {
   constructor({ limit = IN_FLIGHT, fetch, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), now = () => Date.now(),
                 tries = 8, firstPause = 500, maxPause = 8000 }) {
@@ -744,15 +748,15 @@ class Pacer {
     return this.scopes.get(name);
   }
 
-  async request(url, scope = 'reverse') {
+  async request(url, scope = 'reverse', signal = null) {
     const s = this.scope(scope);
     for (let tries = 1; ; tries++) {
-      await this.turn(s);
+      await this.turn(s, signal);
       let got;
       try {
         const started = this.now();
-        const response = await this.send(url);
-        const body = await response.text();
+        const response = await abortable(this.send(url, signal), signal);
+        const body = await abortable(response.text(), signal);
         got = { status: response.status, header: (name) => response.headers.get(name), body, ms: this.now() - started };
         if (got.status === 429 && started > s.pausedAt) {
           s.pause = Math.min(this.maxPause, s.pause ? s.pause * 2 : this.firstPause);
@@ -770,22 +774,40 @@ class Pacer {
 
   // A place in line once the pause of the scope `s` is over. A pause that
   // began while it waited in line it waits out without one, its place
-  // going to the next in line.
-  async turn(s) {
+  // going to the next in line. None once `signal` aborts.
+  async turn(s, signal) {
     for (;;) {
-      for (let wait; (wait = s.pausedUntil - this.now()) > 0;) await this.sleep(wait);
-      await this.acquire();
+      for (let wait; (wait = s.pausedUntil - this.now()) > 0;) await abortable(this.sleep(wait), signal);
+      await this.acquire(signal);
+      if (signal && signal.aborted) {
+        this.release();
+        throw signal.reason;
+      }
       if (s.pausedUntil <= this.now()) return;
       this.release();
     }
   }
 
-  acquire() {
+  // A place, once one is free; a request whose `signal` aborts while it
+  // waits for one leaves the line.
+  acquire(signal) {
+    if (signal && signal.aborted) return Promise.reject(signal.reason);
     if (this.active < this.limit) {
       this.active++;
       return Promise.resolve();
     }
-    return new Promise((resolve) => this.waiting.push(resolve));
+    return new Promise((resolve, reject) => {
+      const leave = () => {
+        this.waiting.splice(this.waiting.indexOf(go), 1);
+        reject(signal.reason);
+      };
+      const go = () => {
+        if (signal) signal.removeEventListener('abort', leave);
+        resolve();
+      };
+      this.waiting.push(go);
+      if (signal) signal.addEventListener('abort', leave, { once: true });
+    });
   }
 
   // Hands the place of a request that is done to the next in line.
@@ -794,6 +816,23 @@ class Pacer {
     if (next) next();
     else this.active--;
   }
+}
+
+// `promise`, or the abort of `signal` (none: never), whichever comes first.
+function abortable(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(signal.reason);
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    promise.then((value) => {
+      signal.removeEventListener('abort', abort);
+      resolve(value);
+    }, (e) => {
+      signal.removeEventListener('abort', abort);
+      reject(e);
+    });
+  });
 }
 
 // -- HTML --
@@ -1047,18 +1086,31 @@ function overlayMoved(before, after) {
 // result `id` in the dataset of column key `key`, and draws them only if,
 // when they come, no other show and no clear came after it and the overlay
 // still shows that result in that dataset (shown(): { id, key }, or null
-// while it shows none). request(url) asks the server (the pacer), draw(fc)
-// and erase() the map.
+// while it shows none). A show or a clear cancels the request of the show
+// before it. request(url, signal) asks the server (the pacer), the request
+// cancelled once `signal` aborts; draw(fc) and erase() the map.
 class PolygonOverlay {
   constructor({ request, draw, erase, shown }) {
     Object.assign(this, { request, draw, erase, shown });
     this.asked = 0;
+    this.cancelling = null;
   }
 
   // Whether the polygons came and were drawn.
   async show(id, key, url) {
     const asked = ++this.asked;
-    const got = await this.request(url);
+    this.cancel();
+    const cancelling = new AbortController();
+    this.cancelling = cancelling;
+    let got;
+    try {
+      got = await this.request(url, cancelling.signal);
+    } catch (e) {
+      if (cancelling.signal.aborted) return false;
+      throw e;
+    } finally {
+      if (this.cancelling === cancelling) this.cancelling = null;
+    }
     const now = this.shown();
     if (asked !== this.asked || !now || now.id !== id || now.key !== key) return false;
     if (got.status !== 200) throw new Error(`HTTP ${got.status}: ${got.body}`);
@@ -1066,10 +1118,18 @@ class PolygonOverlay {
     return true;
   }
 
-  // Erases what is drawn; no answer still to come is drawn.
+  // Erases what is drawn; the request in flight is cancelled, and no answer
+  // still to come is drawn.
   clear() {
     this.asked++;
+    this.cancel();
     this.erase();
+  }
+
+  // Cancels the request of the last show, if it is in flight.
+  cancel() {
+    if (this.cancelling) this.cancelling.abort();
+    this.cancelling = null;
   }
 }
 
@@ -1133,9 +1193,9 @@ let wanted = link.datasets.slice();
 let waitingFor = '';
 let mismatchDismissed = false;
 
-const pacer = new Pacer({ fetch: (url) => fetch(url), now: () => performance.now() });
+const pacer = new Pacer({ fetch: (url, signal) => fetch(url, { signal }), now: () => performance.now() });
 // Nominatim's public API is asked one request at a time.
-const nominatimPacer = new Pacer({ limit: 1, fetch: (url) => fetch(url), now: () => performance.now() });
+const nominatimPacer = new Pacer({ limit: 1, fetch: (url, signal) => fetch(url, { signal }), now: () => performance.now() });
 
 // The build served, by its dir: a build published again under its date is
 // another.
@@ -1677,7 +1737,7 @@ let polygonsColumn = (() => {
 // The overlay's requests: the polygons of the selected result in the
 // overlay's column's dataset, while it is on.
 const polygonOverlay = new PolygonOverlay({
-  request: (url) => pacer.request(url, 'polygons'),
+  request: (url, signal) => pacer.request(url, 'polygons', signal),
   draw: drawPolygons,
   erase: erasePolygons,
   shown: () => {
