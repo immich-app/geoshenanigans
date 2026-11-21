@@ -3,6 +3,8 @@ name = "query-server"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.89"
+# `cargo run` starts the query-server, as before the portal had a binary.
+default-run = "query-server"
 
 # Library: pure geocoding logic, used by both the HTTP binary and the
 # napi binding (geocoder/node). Lives in src/lib.rs.
@@ -19,7 +21,8 @@ path = "src/main.rs"
 # Binary: the test portal's server, which syncs the whole planet build and
 # serves each selection of it (src/portal.rs). Its tests run in
 # query-server's (src/portal/tests.rs), beside the routes it answers as, so
-# it has no test target of its own; CI builds it as the image does.
+# it has no test target of its own; CI builds it as the image does. It runs
+# on Unix alone: elsewhere it builds to a binary that says so and exits.
 [[bin]]
 name = "query-portal"
 path = "src/portal_main.rs"

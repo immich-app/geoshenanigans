@@ -2,11 +2,12 @@ mod auth;
 mod downloader;
 mod handlers;
 // The test portal (the query-portal binary, portal_main.rs), whose tests run
-// here beside the routes its answers are compared with.
-#[cfg(test)]
+// here beside the routes its answers are compared with: on Unix alone, as
+// the portal does.
+#[cfg(all(test, unix))]
 #[allow(dead_code)]
 mod portal;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "portal/tests.rs"]
 mod portal_tests;
 mod region_state;
