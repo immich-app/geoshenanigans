@@ -57,16 +57,29 @@ def run_job(me, seen):
 args = sys.argv[1:]
 """
 
-# --logical-size DIR answers from the scenario's table (no row: it fails, with a line on stderr). A diff records its
-# command line and what the scratch dir holds as it starts, says a line on stderr, then writes an empty patch.
+# --logical-size DIR answers from the scenario's table (no row: it fails, with a line on stderr), once it has waited
+# for the sizing of the dir the scenario has it meet (if any) to be running too and held for the scenario's size_hold;
+# it records its start and end and whether it met that sizing. A diff records its command line and what the scratch
+# dir holds as it starts, says a line on stderr, then writes an empty patch.
 FAKE_DIFF = FAKE_JOB + """\
+def sizing(kind, path):
+    return os.path.join(scenario["marks"], "sizing", kind + path.replace("/", "_"))
 if args[0] == "--logical-size":
     if args[1] not in scenario["logical"]:
         sys.exit("no footer in " + args[1])
     start = time.time()
+    open(sizing("started", args[1]), "w").close()
+    partner, met = scenario.get("size_meet", {}).get(args[1]), False
+    deadline = time.time() + scenario["patience"]
+    while partner and time.time() < deadline and not os.path.exists(sizing("ended", partner)):
+        if os.path.exists(sizing("started", partner)):
+            met = True
+            break
+        time.sleep(0.01)
     time.sleep(scenario.get("size_hold", 0))
     with open(scenario["sized"], "a") as f:
-        f.write(json.dumps([args[1], start, time.time()]) + "\\n")
+        f.write(json.dumps([args[1], start, time.time(), met]) + "\\n")
+    open(sizing("ended", args[1]), "w").close()
     print(*scenario["logical"][args[1]])
     sys.exit(0)
 variant = os.path.relpath(args[1], scenario["new_root"])
@@ -112,7 +125,7 @@ class Night:
         self.scenario = {"marks": self.root, "events": os.path.join(self.root, "events.jsonl"),
                          "sized": os.path.join(self.root, "sized.jsonl"),
                          "new_root": self.new_root, "logical": {}, "raw": {}, "meet": {}, "hold": {}, "patience": 10}
-        for d in ("started", "ended", "scratch"):
+        for d in ("started", "ended", "scratch", "sizing"):
             os.makedirs(os.path.join(self.root, d))
         # Two record files a day: 48 bytes of client files, which a verify counts as 1 KiB.
         for variant in variants:
@@ -172,10 +185,6 @@ class Night:
         return [other.replace("_", "/") for other in self.events[job]["beside"]]
 
 
-def at_least_two_jobs_at_once():
-    return compress_index.cpu_budget() >= 2
-
-
 class GeneratePatchesTest(unittest.TestCase):
     # The diff takes the keys from the records of both days' dirs: the script
     # passes it no sidecar dir and makes none in scratch.
@@ -226,30 +235,33 @@ class GeneratePatchesTest(unittest.TestCase):
             self.assertEqual(night.result(variant)[0], "PASS")
 
     # 600 MiB a diff in 1.1 GiB: the second starts when the first has ended,
-    # and each verify (1 GiB) runs alone too.
+    # and each verify (1 GiB) runs alone too. The budget has two CPUs, so
+    # that the scratch, not a job a CPU, keeps them apart, as in the tests
+    # below.
     def test_two_diffs_that_fit_the_memory_budget_and_not_the_scratch_run_one_after_the_other(self):
         night = self.two_diffs_of_600_mib()
         night.scenario["hold"] = {"diff:r/a": 0.3, "diff:r/b": 0.3}
 
-        night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=AMPLE_MEMORY_KIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=GIB + 100 * MIB)
+        night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=AMPLE_MEMORY_KIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=GIB + 100 * MIB,
+                  **fake_cpus(self, 2))
 
         self.assert_the_diffs_took_turns(night)
         for job in ("diff:r/a", "diff:r/b", "verify:r/a", "verify:r/b"):
             self.assertEqual(night.beside(job), [])
 
-    @unittest.skipUnless(at_least_two_jobs_at_once(), "the script runs one job a core")
     def test_two_diffs_that_fit_both_budgets_run_side_by_side(self):
         night = self.two_diffs_of_600_mib()
         night.scenario["meet"] = {"diff:r/a": "diff:r/b", "diff:r/b": "diff:r/a"}
 
-        night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=AMPLE_MEMORY_KIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=2 * GIB + 300 * MIB)
+        night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=AMPLE_MEMORY_KIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=2 * GIB + 300 * MIB,
+                  **fake_cpus(self, 2))
 
         self.assertTrue(night.events["diff:r/a"]["met"] or night.events["diff:r/b"]["met"])
         for variant in ("r/a", "r/b"):
             self.assertEqual(night.result(variant)[0], "PASS")
 
     # A job a CPU of the budget: on 8 CPUs the two diffs above run side by side, under a quota of one CPU they take
-    # turns.
+    # turns, and so do their verifies, though the scratch would fit a verify beside the other diff.
     def test_at_most_a_job_a_cpu_of_the_cgroups_quota_runs_at_once(self):
         night = self.two_diffs_of_600_mib()
         night.scenario["meet"] = {"diff:r/a": "diff:r/b", "diff:r/b": "diff:r/a"}
@@ -263,6 +275,8 @@ class GeneratePatchesTest(unittest.TestCase):
         night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=AMPLE_MEMORY_KIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=2 * GIB + 300 * MIB,
                   **fake_cpus(self, 8, "/job", {"/job": "100000 100000"}))
         self.assert_the_diffs_took_turns(night)
+        for job in ("diff:r/a", "diff:r/b", "verify:r/a", "verify:r/b"):
+            self.assertEqual(night.beside(job), [], job)
         sized = [json.loads(line) for line in read(night.scenario["sized"]).splitlines()]
         self.assertFalse(any(a[1] < b[2] and b[1] < a[2] for i, a in enumerate(sized) for b in sized[i + 1:]), sized)
 
@@ -272,7 +286,7 @@ class GeneratePatchesTest(unittest.TestCase):
         night.scenario["hold"] = {"diff:r/a": 0.3, "diff:r/b": 0.3}
 
         night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=AMPLE_MEMORY_KIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=2 * GIB + 300 * MIB,
-                  GEOCODER_PATCH_SCRATCH_RESERVE_KIB=GIB + 200 * MIB)
+                  GEOCODER_PATCH_SCRATCH_RESERVE_KIB=GIB + 200 * MIB, **fake_cpus(self, 2))
 
         self.assert_the_diffs_took_turns(night)
 
@@ -286,14 +300,13 @@ class GeneratePatchesTest(unittest.TestCase):
                 night.sizes("r/b", 512, 1)
                 night.scenario["hold"] = {"diff:r/a": 0.3, "diff:r/b": 0.3}
 
-                night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=budget, GEOCODER_PATCH_SCRATCH_FREE_KIB=8 * GIB)
+                night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=budget, GEOCODER_PATCH_SCRATCH_FREE_KIB=8 * GIB, **fake_cpus(self, 2))
 
                 self.assert_the_diffs_took_turns(night)
 
     # The two diffs (100 and 200 MiB) run side by side in 1 GiB + 150 MiB.
     # r/a's ends first, and its verify (1 GiB) starts only when r/b's diff
     # has given its 200 MiB back.
-    @unittest.skipUnless(at_least_two_jobs_at_once(), "the script runs one job a core")
     def test_a_verify_waits_for_scratch_a_running_diff_holds(self):
         night = Night(self, ["r/a", "r/b"])
         night.sizes("r/a", 1, 50 * MIB)
@@ -301,7 +314,8 @@ class GeneratePatchesTest(unittest.TestCase):
         night.scenario["meet"] = {"diff:r/a": "diff:r/b", "diff:r/b": "diff:r/a"}
         night.scenario["hold"] = {"diff:r/b": 1.0}
 
-        night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=AMPLE_MEMORY_KIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=GIB + 150 * MIB)
+        night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=AMPLE_MEMORY_KIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=GIB + 150 * MIB,
+                  **fake_cpus(self, 2))
 
         self.assertTrue(night.events["diff:r/a"]["met"] or night.events["diff:r/b"]["met"])
         self.assertEqual(night.beside("verify:r/a"), [])
@@ -447,17 +461,17 @@ class GeneratePatchesTest(unittest.TestCase):
         self.assertTrue(start_b.startswith(f"{weight[1]} KiB of memory and {weight[2]} KiB of scratch"), start_b)
 
     # The estimates (two geocoder-diff --logical-size a variant, ~0.1 s each on a planet night) run side by side,
-    # and still print a line a variant, in order.
-    @unittest.skipUnless(at_least_two_jobs_at_once(), "the script runs one job a core")
+    # and still print a line a variant, in order: on two CPUs, the first two variants' sizings of the old day meet.
     def test_the_variants_are_sized_side_by_side(self):
         night = Night(self, ["r/a", "r/b", "r/c", "r/d"])
-        night.scenario["size_hold"] = 0.5
+        night.scenario["size_meet"] = {night.old("r/a"): night.old("r/b"), night.old("r/b"): night.old("r/a")}
 
-        night.run()
+        night.run(**fake_cpus(self, 2))
 
         sized = [json.loads(line) for line in read(night.scenario["sized"]).splitlines()]
         self.assertEqual(len(sized), 8)
-        self.assertTrue(any(a[1] < b[2] and b[1] < a[2] for i, a in enumerate(sized) for b in sized[i + 1:]), sized)
+        met = {path: met for path, _, _, met in sized}
+        self.assertTrue(met[night.old("r/a")] or met[night.old("r/b")], sized)
         self.assertEqual([line.split(":")[0] for line in night.stdout.splitlines()], ["r/a", "r/b", "r/c", "r/d"])
         for variant in ("r/a", "r/b", "r/c", "r/d"):
             self.assertEqual(night.result(variant)[0], "PASS")
@@ -471,18 +485,18 @@ class GeneratePatchesTest(unittest.TestCase):
         night.scenario["hold"] = {"diff:r/a": 0.3, "diff:r/b": 0.3}
 
         night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=300 * MIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=8 * GIB,
-                  GEOCODER_PATCH_MEM_RESERVE_KIB=150 * MIB)
+                  GEOCODER_PATCH_MEM_RESERVE_KIB=150 * MIB, **fake_cpus(self, 2))
 
         self.assert_the_diffs_took_turns(night)
 
-    @unittest.skipUnless(at_least_two_jobs_at_once(), "the script runs one job a core")
+    # On the same two CPUs.
     def test_without_the_memory_reserve_the_same_diffs_run_side_by_side(self):
         night = Night(self, ["r/a", "r/b"])
         night.sizes("r/a", 512, 1)
         night.sizes("r/b", 512, 1)
         night.scenario["meet"] = {"diff:r/a": "diff:r/b", "diff:r/b": "diff:r/a"}
 
-        night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=300 * MIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=8 * GIB)
+        night.run(GEOCODER_PATCH_MEM_BUDGET_KIB=300 * MIB, GEOCODER_PATCH_SCRATCH_FREE_KIB=8 * GIB, **fake_cpus(self, 2))
 
         self.assertTrue(night.events["diff:r/a"]["met"] or night.events["diff:r/b"]["met"])
 

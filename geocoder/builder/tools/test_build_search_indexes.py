@@ -95,11 +95,14 @@ class BuildSearchIndexesTest(unittest.TestCase):
             argv = ["build_search_indexes.py", self.out, self.binary, "--threads", "2"]
             printed = io.StringIO()
             with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(printed), \
-                    mock.patch.dict(os.environ, {"TMPDIR": self.tmp.name, **fake_cpus(self, cpus, "/job", quotas)}):
+                    mock.patch.dict(os.environ, {"TMPDIR": self.tmp.name, **fake_cpus(self, cpus, "/job", quotas)}), \
+                    mock.patch.object(sut, "ThreadPoolExecutor", wraps=sut.ThreadPoolExecutor) as pool:
                 with self.assertRaises(SystemExit) as exit_:
                     sut.main()
             self.assertEqual(exit_.exception.code, 0)
             self.assertRegex(printed.getvalue(), rf"place search indexes, {expected} at once\.\.\.", (cpus, quotas))
+            # The builds run on that many workers, not only say so.
+            self.assertEqual([call.kwargs["max_workers"] for call in pool.call_args_list], [expected], (cpus, quotas))
             shutil.rmtree(os.path.join(self.out, "planet", "search"), ignore_errors=True)
 
     def call(self, region, sel):

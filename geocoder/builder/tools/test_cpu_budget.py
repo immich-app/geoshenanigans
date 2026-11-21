@@ -149,6 +149,28 @@ class BudgetUsersTest(unittest.TestCase):
             with open(os.path.join(HERE, name)) as f:
                 self.assertIn("cpu_budget.sh", f.read(), name)
 
+    # checksums.sh hashes on a worker a CPU of the budget: 2 under a quota of 2 of 8 CPUs. (The other tools' own
+    # tests run them under such quotas.)
+    def test_the_checksums_hash_on_a_worker_a_cpu_of_the_budget(self):
+        out, bin_dir = tempfile.mkdtemp(), tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, out)
+        self.addCleanup(shutil.rmtree, bin_dir)
+        write(os.path.join(out, "planet/full/geo_cells.bin.zst"), "cells")
+        calls = os.path.join(bin_dir, "calls")
+        write(os.path.join(bin_dir, "xargs"), f'#!/bin/sh\necho "$*" >> {calls}\nexec {shutil.which("xargs")} "$@"\n')
+        os.chmod(os.path.join(bin_dir, "xargs"), 0o755)
+        env = fake_cpus(self, 8, "/job", {"/job": "200000 100000"})
+
+        done = subprocess.run(["bash", os.path.join(HERE, "checksums.sh"), "zst", out],
+                              env=dict(os.environ, CPU_BUDGET_ROOT=env["CPU_BUDGET_ROOT"], PATH=f"{bin_dir}:{env['PATH']}"),
+                              capture_output=True, text=True, timeout=30)
+
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(done.stdout.endswith("  ./planet/full/geo_cells.bin.zst\n"), done.stdout)
+        with open(calls) as f:
+            [args] = [line.split() for line in f.read().splitlines()]
+        self.assertEqual(args[args.index("-P") + 1], "2")
+
 
 if __name__ == "__main__":
     unittest.main()
