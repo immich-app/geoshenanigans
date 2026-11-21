@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Tests for job_sampler.sh, the nightly's CPU and disk samples over the whole job, and how the nightly runs it.
 Run: python3 -m unittest discover -s geocoder/builder/tools"""
+import contextlib
+import io
+import mmap
 import os
 import re
 import shutil
@@ -9,8 +12,12 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import page_cache  # noqa: E402
+
 SAMPLER = os.path.join(HERE, "job_sampler.sh")
 PAGE_CACHE = os.path.join(HERE, "page_cache.py")
 NIGHTLY = os.path.join(HERE, "..", "..", "..", ".github", "workflows", "geocoder-build.yml")
@@ -170,6 +177,32 @@ class PageCacheTest(unittest.TestCase):
             f.read()
 
         self.assertEqual(self.page_cache(path), f"planet.osm.pbf:{size}")
+
+    # A last page short of the file's end counts the file's bytes in it alone, whatever else is cached.
+    def test_a_cached_last_page_counts_only_the_files_bytes_in_it(self):
+        path = os.path.join(self.dir, "planet.osm.pbf")
+        write(path, "y" * (mmap.PAGESIZE + 1))
+        with open(path, "rb") as f:
+            os.fsync(f.fileno())
+            os.posix_fadvise(f.fileno(), 0, mmap.PAGESIZE, os.POSIX_FADV_DONTNEED)
+        left = self.page_cache(path)
+        if left == f"planet.osm.pbf:{mmap.PAGESIZE + 1}":
+            self.skipTest(f"the page cache keeps what is dropped here (tmpfs): {left}")
+
+        self.assertEqual(left, "planet.osm.pbf:1")
+
+    # Linux reports every page of a file's mapping cached unless the caller owns the file or could open it for
+    # writing: such a file prints "?" rather than a count it can't know.
+    def test_a_file_mincore_cannot_see_into_prints_a_question_mark(self):
+        path = os.path.join(self.dir, "planet.osm.pbf")
+        write(path, "y" * 10000)
+        printed = io.StringIO()
+        with mock.patch.object(os, "geteuid", return_value=os.stat(path).st_uid + 1), \
+                mock.patch.object(os, "access", return_value=False), \
+                mock.patch.object(sys, "argv", ["page_cache.py", path]), contextlib.redirect_stdout(printed):
+            page_cache.main()
+
+        self.assertEqual(printed.getvalue(), "planet.osm.pbf:?\n")
 
     def test_files_that_do_not_exist_are_left_out(self):
         path = os.path.join(self.dir, "a.pbf")
