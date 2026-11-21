@@ -306,15 +306,27 @@ jobs:
 
           # A scratch prefix's patch night: the live build of the day before,
           # copied in server side (~30 GB, its sidecars too) for the run to
-          # patch from. Never into the live prefix.
+          # patch from. Never into the live prefix. The date's whole object
+          # set becomes the live build's: what an earlier run left there goes
+          # first (the patch base would otherwise mix two builds, a unit and
+          # the standalone files it replaced, say), and the copy must then
+          # hold the live build's keys and sizes, no more and no fewer.
           if [ "$SEED_PREVIOUS" = true ]; then
             if [ "$S3_PREFIX" = geocoder ]; then
               echo "::error::seed_previous copies the live build into a scratch s3_prefix; this run publishes the live builds"
               exit 1
             fi
+            SEED_FROM="s3://$S3_BUCKET/geocoder/builds/$PREV_DATE"
+            SEED_TO="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE"
+            SEED_S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
             echo "Seeding $S3_PREFIX/builds/$PREV_DATE with the live build of $PREV_DATE"
-            s5cmd --endpoint-url "$S3_ENDPOINT" --retry-count 5 --numworkers 32 \
-              cp "s3://$S3_BUCKET/geocoder/builds/$PREV_DATE/*" "s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE/"
+            $SEED_S5 rm "$SEED_TO/*" > /dev/null 2>&1 || true
+            $SEED_S5 cp "$SEED_FROM/*" "$SEED_TO/"
+            if ! diff <($SEED_S5 ls "$SEED_FROM/*" | awk '{print $(NF-1), $NF}' | sort) \
+                      <($SEED_S5 ls "$SEED_TO/*" | awk '{print $(NF-1), $NF}' | sort); then
+              echo "::error::The seed of $S3_PREFIX/builds/$PREV_DATE does not hold the live build of $PREV_DATE (above: < live, > seed)"
+              exit 1
+            fi
           fi
 
           # Check if previous build exists on Tigris with compatible build_version.

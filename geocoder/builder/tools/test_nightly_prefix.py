@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -45,12 +46,11 @@ class S3PrefixTest(unittest.TestCase):
 
     def test_every_bucket_path_goes_under_the_prefix(self):
         # The builds, latest.json and memwatch keys all sit under it, so a scratch run touches nothing live; the
-        # one live path is the build a scratch run's seed copies from.
+        # one live path is the build a scratch run's seed copies from, which it only reads.
         paths = re.findall(r"s3://\$S3_BUCKET/([^\"\s]*)", nightly())
         self.assertTrue(paths)
-        self.assertEqual([p for p in paths if not p.startswith("$S3_PREFIX/")], ["geocoder/builds/$PREV_DATE/*"])
-        self.assertEqual(len(re.findall(r'cp "s3://\$S3_BUCKET/geocoder/builds/\$PREV_DATE/\*" '
-                                        r'"s3://\$S3_BUCKET/\$S3_PREFIX/builds/\$PREV_DATE/"', nightly())), 1)
+        self.assertEqual([p for p in paths if not p.startswith("$S3_PREFIX/")], ["geocoder/builds/$PREV_DATE"])
+        self.assertEqual(re.findall(r'(\w+) "\$SEED_FROM', nightly()), ["cp", "ls"])
 
     def test_the_setup_refuses_a_prefix_that_is_not_one_segment(self):
         script = prefix_check()
@@ -150,17 +150,87 @@ class ScratchPbfCacheTest(unittest.TestCase):
         self.assertTrue([c for c in calls if c.startswith("python3 /ws/geocoder/builder/tools/abort_stale_uploads.py")])
 
 
-class SeedPreviousTest(unittest.TestCase):
-    """seed_previous copies the live build of the day before into a scratch prefix, for a test run's patch night."""
+# s5cmd over a bucket of files under $FAKE_BUCKET (s3://<bucket>/<key> is $FAKE_BUCKET/<bucket>/<key>): ls, cp and
+# rm of a prefix's every object (<prefix>/*), each call logged to $FAKE_CALLS. A copy fails at its object number
+# $FAKE_COPY_FAILS_AFTER, or passes over the key $FAKE_COPY_DROPS and says nothing.
+FAKE_BUCKET_S5CMD = r"""#!{python}
+import os, shutil, sys
+args = sys.argv[1:]
+with open(os.environ["FAKE_CALLS"], "a") as f:
+    f.write("s5cmd " + " ".join(args) + "\n")
+verb = next(a for a in args if a in ("ls", "cp", "rm"))
+urls = args[args.index(verb) + 1:]
+def local(url):
+    return os.path.join(os.environ["FAKE_BUCKET"], url[len("s3://"):].rstrip("*"))
+def keys(url):
+    base = local(url)
+    found = sorted(os.path.relpath(os.path.join(d, n), base) for d, _, names in os.walk(base) for n in names)
+    if not found:
+        sys.exit("ERROR no object found")
+    return found
+if verb == "ls":
+    for k in keys(urls[0]):
+        print(f"2026/11/20 06:45:24 {{os.path.getsize(os.path.join(local(urls[0]), k)):>15}}  {{k}}")
+elif verb == "rm":
+    for k in keys(urls[0]):
+        os.remove(os.path.join(local(urls[0]), k))
+else:
+    for i, k in enumerate(keys(urls[0])):
+        if i == int(os.environ.get("FAKE_COPY_FAILS_AFTER", "-1")):
+            sys.exit("ERROR copy failed")
+        if k != os.environ.get("FAKE_COPY_DROPS"):
+            os.makedirs(os.path.dirname(os.path.join(local(urls[1]), k)), exist_ok=True)
+            shutil.copyfile(os.path.join(local(urls[0]), k), os.path.join(local(urls[1]), k))
+"""
 
-    def run_seed(self, prefix, seed):
-        s5 = FakeS5cmd(self)
+LIVE = {"configurations.json": b'{"build": {"date": "2026-11-20"}}', "planet/full/places.tt.zst": b"unit",
+        "planet/full/geo_cells.bin.zst": b"cells", "planet/full/ways.osm_ids": b"ids" * 10}
+
+
+class SeedPreviousTest(unittest.TestCase):
+    """seed_previous makes a scratch prefix's date the live build of the day before, for a test run's patch night:
+    that build's object set alone, whatever an earlier run left there."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root)
+        self.bucket = os.path.join(self.root, "bucket")
+        self.bin = os.path.join(self.root, "bin")
+        os.makedirs(self.bin)
+        with open(os.path.join(self.bin, "s5cmd"), "w") as f:
+            f.write(FAKE_BUCKET_S5CMD.format(python=sys.executable))
+        os.chmod(os.path.join(self.bin, "s5cmd"), 0o755)
+        self.calls = os.path.join(self.root, "calls")
+        self.put("geocoder/builds/2026-11-20", LIVE)
+
+    def put(self, prefix, objects):
+        for key, data in objects.items():
+            path = os.path.join(self.bucket, "bucket", prefix, key)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(data)
+
+    def objects(self, prefix):
+        base = os.path.join(self.bucket, "bucket", prefix)
+        found = {}
+        for d, _, names in os.walk(base):
+            for n in names:
+                with open(os.path.join(d, n), "rb") as f:
+                    found[os.path.relpath(os.path.join(d, n), base)] = f.read()
+        return found
+
+    def run_seed(self, prefix, seed, **fake):
         script = block_from(step_script("Setup"), 'if [ "$SEED_PREVIOUS" = true ]; then')
         self.assertIsNotNone(script)
-        done = subprocess.run(["bash", "-e", "-c", script], capture_output=True, text=True,
-                              env={"PATH": s5.path, "S3_PREFIX": prefix, "SEED_PREVIOUS": seed, "S3_BUCKET": "bucket",
-                                   "S3_ENDPOINT": "https://s3.invalid", "PREV_DATE": "2026-11-20"})
-        return done.returncode, s5.logged()
+        env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "S3_PREFIX": prefix, "SEED_PREVIOUS": seed,
+               "S3_BUCKET": "bucket", "S3_ENDPOINT": "https://s3.invalid", "PREV_DATE": "2026-11-20",
+               "FAKE_BUCKET": self.bucket, "FAKE_CALLS": self.calls, **fake}
+        done = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], capture_output=True, text=True, env=env)
+        calls = []
+        if os.path.exists(self.calls):
+            with open(self.calls) as f:
+                calls = f.read().splitlines()
+        return done, calls
 
     def test_a_dispatch_may_ask_for_it_and_a_scheduled_night_does_not(self):
         spec = dispatch_input("seed_previous")
@@ -169,19 +239,46 @@ class SeedPreviousTest(unittest.TestCase):
         self.assertIn("SEED_PREVIOUS: ${{ inputs.seed_previous }}", step("Setup"))
 
     def test_it_copies_the_live_build_into_the_scratch_prefix(self):
-        status, calls = self.run_seed("nightly-speed-1121", "true")
+        done, _ = self.run_seed("nightly-speed-1121", "true")
 
-        self.assertEqual(status, 0)
-        self.assertEqual(calls, ["s5cmd --endpoint-url https://s3.invalid --retry-count 5 --numworkers 32 "
-                                 "cp s3://bucket/geocoder/builds/2026-11-20/* s3://bucket/nightly-speed-1121/builds/2026-11-20/"])
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(self.objects("nightly-speed-1121/builds/2026-11-20"), LIVE)
+        self.assertEqual(self.objects("geocoder/builds/2026-11-20"), LIVE)
+
+    # An earlier run's build of that date, its standalone .zst where the live build has a unit or a configuration
+    # of its own, would otherwise stay beside the copy, and the run patch from a mix of the two.
+    def test_what_an_earlier_run_left_at_that_date_goes(self):
+        self.put("nightly-speed-1121/builds/2026-11-20", {"planet/full/place_nodes.bin.zst": b"standalone",
+                                                          "configurations.json": b'{"build": {"date": "old"}}',
+                                                          "planet/full/patch.gcpatch": b"old patch"})
+        self.put("nightly-speed-1121/builds/2026-11-19", {"configurations.json": b"{}"})
+
+        done, _ = self.run_seed("nightly-speed-1121", "true")
+
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual(self.objects("nightly-speed-1121/builds/2026-11-20"), LIVE)
+        self.assertEqual(self.objects("nightly-speed-1121/builds/2026-11-19"), {"configurations.json": b"{}"})
+
+    def test_a_copy_that_failed_fails_the_setup(self):
+        done, _ = self.run_seed("nightly-speed-1121", "true", FAKE_COPY_FAILS_AFTER="2")
+
+        self.assertNotEqual(done.returncode, 0)
+
+    # A copy that says it is done but left an object out is caught by the check of the copy against the live build.
+    def test_a_copy_that_left_an_object_out_fails_the_setup(self):
+        done, _ = self.run_seed("nightly-speed-1121", "true", FAKE_COPY_DROPS="planet/full/places.tt.zst")
+
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("planet/full/places.tt.zst", done.stdout + done.stderr)
 
     def test_it_refuses_the_live_prefix_and_does_nothing_unasked(self):
-        status, calls = self.run_seed("geocoder", "true")
-        self.assertNotEqual(status, 0)
+        done, calls = self.run_seed("geocoder", "true")
+        self.assertNotEqual(done.returncode, 0)
         self.assertEqual(calls, [])
         for seed in ("false", ""):
-            status, calls = self.run_seed("nightly-speed-1121", seed)
-            self.assertEqual((status, calls), (0, []))
+            done, calls = self.run_seed("nightly-speed-1121", seed)
+            self.assertEqual((done.returncode, calls), (0, []))
+        self.assertEqual(self.objects("geocoder/builds/2026-11-20"), LIVE)
 
     # The seed lands before Setup looks for the previous build, which the run then patches from.
     def test_it_lands_before_the_previous_build_is_looked_for(self):
