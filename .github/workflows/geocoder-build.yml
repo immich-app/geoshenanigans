@@ -327,10 +327,24 @@ jobs:
             SEED_TO="s3://$S3_BUCKET/$S3_PREFIX/builds/$PREV_DATE"
             SEED_S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
             echo "Seeding $S3_PREFIX/builds/$PREV_DATE with the live build of $PREV_DATE"
+            # A live build past the full-index window (KEEP_FULL_DAYS) keeps
+            # its patches and configurations.json alone: the run would build
+            # fresh from such a seed, not patch.
+            if [ -z "$($SEED_S5 ls "$SEED_FROM/planet/full/*.bin.zst" 2> /dev/null)" ]; then
+              echo "::error::The live build of $PREV_DATE has no full index (planet/full/*.bin.zst) to seed $S3_PREFIX/builds/$PREV_DATE with"
+              exit 1
+            fi
             $SEED_S5 rm "$SEED_TO/*" > /dev/null 2>&1 || true
             $SEED_S5 cp "$SEED_FROM/*" "$SEED_TO/"
-            if ! diff <($SEED_S5 ls "$SEED_FROM/*" | awk '{print $(NF-1), $NF}' | sort) \
-                      <($SEED_S5 ls "$SEED_TO/*" | awk '{print $(NF-1), $NF}' | sort); then
+            # Each listing whole, or the check fails: two failed ones would
+            # compare as the same empty set.
+            if ! LIVE_KEYS=$(set -o pipefail; $SEED_S5 ls "$SEED_FROM/*" | awk '{print $(NF-1), $NF}' | sort) \
+               || ! SEED_KEYS=$(set -o pipefail; $SEED_S5 ls "$SEED_TO/*" | awk '{print $(NF-1), $NF}' | sort) \
+               || [ -z "$LIVE_KEYS" ] || [ -z "$SEED_KEYS" ]; then
+              echo "::error::Could not list the live build of $PREV_DATE and its seed in $S3_PREFIX/builds/$PREV_DATE"
+              exit 1
+            fi
+            if ! diff <(echo "$LIVE_KEYS") <(echo "$SEED_KEYS"); then
               echo "::error::The seed of $S3_PREFIX/builds/$PREV_DATE does not hold the live build of $PREV_DATE (above: < live, > seed)"
               exit 1
             fi

@@ -50,7 +50,7 @@ class S3PrefixTest(unittest.TestCase):
         paths = re.findall(r"s3://\$S3_BUCKET/([^\"\s]*)", nightly())
         self.assertTrue(paths)
         self.assertEqual([p for p in paths if not p.startswith("$S3_PREFIX/")], ["geocoder/builds/$PREV_DATE"])
-        self.assertEqual(re.findall(r'(\w+) "\$SEED_FROM', nightly()), ["cp", "ls"])
+        self.assertEqual(re.findall(r'(\w+) "\$SEED_FROM', nightly()), ["ls", "cp", "ls"])
 
     def test_the_setup_refuses_a_prefix_that_is_not_one_segment(self):
         script = prefix_check()
@@ -193,24 +193,30 @@ class ScratchPbfCacheTest(unittest.TestCase):
 
 
 # s5cmd over a bucket of files under $FAKE_BUCKET (s3://<bucket>/<key> is $FAKE_BUCKET/<bucket>/<key>): ls, cp and
-# rm of a prefix's every object (<prefix>/*), each call logged to $FAKE_CALLS. A copy fails at its object number
-# $FAKE_COPY_FAILS_AFTER, or passes over the key $FAKE_COPY_DROPS and says nothing.
+# rm of a prefix's every object (<prefix>/*, or <prefix>/<dir>/*<suffix> for ls), each call logged to $FAKE_CALLS. A
+# copy fails at its object number $FAKE_COPY_FAILS_AFTER, or passes over the key $FAKE_COPY_DROPS and says nothing;
+# with $FAKE_LIST_FAILS_AFTER_COPY set, every ls after a copy fails.
 FAKE_BUCKET_S5CMD = r"""#!{python}
 import os, shutil, sys
 args = sys.argv[1:]
+with open(os.environ["FAKE_CALLS"]) as f:
+    copied = any(" cp " in line for line in f)
 with open(os.environ["FAKE_CALLS"], "a") as f:
     f.write("s5cmd " + " ".join(args) + "\n")
 verb = next(a for a in args if a in ("ls", "cp", "rm"))
 urls = args[args.index(verb) + 1:]
 def local(url):
-    return os.path.join(os.environ["FAKE_BUCKET"], url[len("s3://"):].rstrip("*"))
+    return os.path.join(os.environ["FAKE_BUCKET"], url[len("s3://"):].rsplit("*", 1)[0])
 def keys(url):
-    base = local(url)
-    found = sorted(os.path.relpath(os.path.join(d, n), base) for d, _, names in os.walk(base) for n in names)
+    base, suffix = local(url), url.rsplit("*", 1)[1]
+    found = sorted(os.path.relpath(os.path.join(d, n), base) for d, _, names in os.walk(base) for n in names
+                   if n.endswith(suffix))
     if not found:
         sys.exit("ERROR no object found")
     return found
 if verb == "ls":
+    if copied and os.environ.get("FAKE_LIST_FAILS_AFTER_COPY"):
+        sys.exit("ERROR listing failed")
     for k in keys(urls[0]):
         print(f"2026/11/20 06:45:24 {{os.path.getsize(os.path.join(local(urls[0]), k)):>15}}  {{k}}")
 elif verb == "rm":
@@ -267,7 +273,9 @@ class SeedPreviousTest(unittest.TestCase):
         env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "S3_PREFIX": prefix, "SEED_PREVIOUS": seed,
                "S3_BUCKET": "bucket", "S3_ENDPOINT": "https://s3.invalid", "PREV_DATE": "2026-11-20",
                "FAKE_BUCKET": self.bucket, "FAKE_CALLS": self.calls, **fake}
-        done = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], capture_output=True, text=True, env=env)
+        open(self.calls, "a").close()
+        # As GitHub runs a step that names no shell: bash -e, without pipefail.
+        done = subprocess.run(["bash", "-e", "-c", script], capture_output=True, text=True, env=env)
         calls = []
         if os.path.exists(self.calls):
             with open(self.calls) as f:
@@ -312,6 +320,29 @@ class SeedPreviousTest(unittest.TestCase):
 
         self.assertNotEqual(done.returncode, 0)
         self.assertIn("planet/full/places.tt.zst", done.stdout + done.stderr)
+
+    # Listings that failed after the copy compare as two empty ones: the check fails instead.
+    def test_a_listing_that_failed_fails_the_setup(self):
+        done, _ = self.run_seed("nightly-speed-1121", "true", FAKE_LIST_FAILS_AFTER_COPY="1")
+
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("::error::", done.stdout)
+
+    # A live build past the full-index window keeps its patches and configurations.json alone: the test would
+    # build fresh from it, not patch. Setup fails before it deletes what the scratch prefix holds at that date.
+    def test_a_live_build_without_its_full_index_is_no_seed(self):
+        shutil.rmtree(os.path.join(self.bucket, "bucket", "geocoder/builds/2026-11-20"))
+        aged = {"configurations.json": b"{}", "planet/full/patch.gcpatch": b"patch"}
+        self.put("geocoder/builds/2026-11-20", aged)
+        earlier = {"planet/full/geo_cells.bin.zst": b"earlier", "configurations.json": b'{"build": {"date": "old"}}'}
+        self.put("nightly-speed-1121/builds/2026-11-20", earlier)
+
+        done, calls = self.run_seed("nightly-speed-1121", "true")
+
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("no full index", done.stdout)
+        self.assertEqual(self.objects("nightly-speed-1121/builds/2026-11-20"), earlier)
+        self.assertEqual([c for c in calls if " rm " in c or " cp " in c], [])
 
     def test_it_refuses_the_live_prefix_and_does_nothing_unasked(self):
         done, calls = self.run_seed("geocoder", "true")
