@@ -703,6 +703,41 @@ class PostBuildTest(unittest.TestCase):
         self.assertLessEqual(named, {n for n, _ in steps()})
 
 
+class O11yReportStepTest(unittest.TestCase):
+    # Report to o11y's `if:` compares without case, so a dispatch under Geocoder (which Setup refuses) passes it:
+    # the step reads no token for it and reports nothing. The live prefix's run reports.
+    def test_the_report_is_the_live_prefixs_alone(self):
+        for prefix, reported in (("geocoder", True), ("Geocoder", False)):
+            with self.subTest(prefix=prefix):
+                root = tempfile.mkdtemp()
+                self.addCleanup(shutil.rmtree, root)
+                bin_dir = os.path.join(root, "bin")
+                os.makedirs(bin_dir)
+                calls = os.path.join(root, "calls")
+                for tool, body in {"op": "echo s3cret\n", "python3": "exit 0\n"}.items():
+                    with open(os.path.join(bin_dir, tool), "w") as f:
+                        f.write(f'#!/bin/sh\necho "{tool}" >> {calls}\n{body}')
+                    os.chmod(os.path.join(bin_dir, tool), 0o755)
+                env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "RUNNER_TEMP": root, "WORKDIR": root,
+                       "S3_PREFIX": prefix, "BUILD_DATE": "2026-11-21", "DATA_TIMESTAMP": "2026-11-21T00:00:00Z",
+                       "O11Y_URL": "https://o11y.invalid", "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1",
+                       "OP_SERVICE_ACCOUNT_TOKEN": "t"}
+
+                done = subprocess.run(["bash", "-e", "-c", step_script("Report to o11y")], env=env, cwd=root,
+                                      capture_output=True, text=True, timeout=60)
+
+                self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+                if reported:
+                    deadline = time.time() + 10
+                    while time.time() < deadline and not os.path.exists(os.path.join(root, "o11y.status")):
+                        time.sleep(0.05)
+                    with open(calls) as f:
+                        self.assertEqual(f.read().split(), ["op", "python3"])
+                else:
+                    self.assertFalse(os.path.exists(calls))
+                    self.assertFalse(os.path.exists(os.path.join(root, "o11y.log")))
+
+
 def watchdog_script(name):
     """The `run:` script of the watchdog's step `name`, unindented."""
     with open(WATCHDOG) as f:
@@ -713,15 +748,21 @@ def watchdog_script(name):
 
 
 # gh as the watchdog runs it, answering from the JSON in $FAKE_GH_DATA: the repo's default branch, the build's runs
-# (each `run list` one with only the fields asked for), each run's jobs, and the REST API's runs and jobs; --jq
-# filters go through jq. `workflow run` appends its arguments to $FAKE_GH_CALLS.
+# (`run list` newest first, on its --branch and from its --created date, at most its --limit, each with only the
+# fields asked for), each run's jobs, and the REST API's runs (a page of per_page) and jobs; --jq filters go through
+# jq. `workflow run` appends its arguments to $FAKE_GH_CALLS.
 FAKE_GH = r'''#!{python}
-import json, os, subprocess, sys
+import json, os, re, subprocess, sys
 args = sys.argv[1:]
 with open(os.environ["FAKE_GH_DATA"]) as f:
     data = json.load(f)
 def opt(name):
-    return args[args.index(name) + 1] if name in args else None
+    for i, arg in enumerate(args):
+        if arg == name:
+            return args[i + 1]
+        if arg.startswith(name + "="):
+            return arg[len(name) + 1:]
+    return None
 def answer(value):
     if opt("--jq") is None:
         print(json.dumps(value))
@@ -732,20 +773,35 @@ if args[:2] == ["repo", "view"]:
     answer({{"defaultBranchRef": {{"name": data["default_branch"]}}}})
 elif args[:2] == ["run", "list"]:
     fields = opt("--json").split(",")
-    answer([{{k: run[k] for k in fields if k in run}} for run in data["runs"]])
+    runs = sorted(data["runs"], key=lambda run: run["createdAt"], reverse=True)
+    if opt("--branch"):
+        runs = [run for run in runs if run["headBranch"] == opt("--branch")]
+    created = opt("--created") or ""
+    if created.startswith(">="):
+        runs = [run for run in runs if run["createdAt"][:10] >= created[2:]]
+    elif created:
+        runs = [run for run in runs if run["createdAt"][:10] == created]
+    runs = runs[:int(opt("--limit") or 20)]
+    answer([{{k: run[k] for k in fields if k in run}} for run in runs])
 elif args[:2] == ["run", "view"]:
     answer({{"jobs": data["jobs"].get(args[2], [])}})
 elif args[:2] == ["workflow", "run"]:
     with open(os.environ["FAKE_GH_CALLS"], "a") as f:
         f.write(" ".join(args) + "\n")
 elif args[0] == "api":
-    answer({{"jobs": data["api_jobs"]}} if args[1].endswith("/jobs") else {{"workflow_runs": data["api_runs"]}})
+    page = re.search(r"[?&]per_page=([0-9]+)", args[1])
+    per_page = int(page.group(1)) if page else 30
+    answer({{"jobs": data["api_jobs"]}} if args[1].endswith("/jobs") else {{"workflow_runs": data["api_runs"][:per_page]}})
 else:
     sys.exit("fake gh: " + " ".join(args))
 '''
 
 LIVE_TITLE = "Build Geocoder Index"
+# A dispatch's under the live prefix: the watchdog's retries.
+LIVE_DISPATCH_TITLE = "Build Geocoder Index [geocoder]"
 SCRATCH_TITLE = "Build Geocoder Index [scratch: nightly-speed-1121]"
+# A dispatch's under the live prefix in other case, which Setup refuses (an expression's == is blind to case).
+MIXED_CASE_TITLE = "Build Geocoder Index [Geocoder]"
 
 
 class WatchdogTest(unittest.TestCase):
@@ -765,11 +821,12 @@ class WatchdogTest(unittest.TestCase):
         self.today = time.strftime("%Y-%m-%d", time.gmtime())
         self.runs, self.jobs = [], {}
 
-    def run_at(self, hhmm, title, conclusion, steps=(), run_id=None):
-        """A run of the build created today at hhmm, with its title, conclusion and steps ((name, conclusion)...)."""
+    def run_at(self, hhmm, title, conclusion, steps=(), run_id=None, branch="main"):
+        """A run of the build on `branch` created today at hhmm, with its title, conclusion and steps
+        ((name, conclusion)...)."""
         run_id = run_id or f"{len(self.runs) + 1}"
         self.runs.append({"databaseId": int(run_id), "conclusion": conclusion, "status": "completed",
-                          "createdAt": f"{self.today}T{hhmm}:00Z", "event": "workflow_dispatch", "headBranch": "main",
+                          "createdAt": f"{self.today}T{hhmm}:00Z", "event": "workflow_dispatch", "headBranch": branch,
                           "displayTitle": title})
         self.jobs[run_id] = [{"steps": [{"name": n, "conclusion": c} for n, c in steps]}]
 
@@ -817,6 +874,39 @@ class WatchdogTest(unittest.TestCase):
         self.assertEqual(dispatched, self.retry())
         self.assertIn("total=1  succeeded=0", out)
 
+    # Nor is one under the live prefix in other case, which Setup refuses: it is no attempt of the live build's.
+    def test_a_dispatch_under_the_live_prefix_in_other_case_is_no_live_run(self):
+        self.run_at("03:00", MIXED_CASE_TITLE, "failure", [("Setup", "failure")])
+
+        out, dispatched = self.watchdog()
+
+        self.assertEqual(dispatched, [])
+        self.assertIn("total=0", out)
+
+    # The watchdog's own retries, dispatches under the live prefix, are attempts of the live build.
+    def test_a_retry_counts_as_an_attempt_of_the_live_build(self):
+        lost = [("Setup", "success"), ("Build geocoder index", "failure")]
+        self.run_at("06:17", LIVE_TITLE, "failure", lost)
+        self.run_at("08:15", LIVE_DISPATCH_TITLE, "failure", lost)
+
+        out, dispatched = self.watchdog()
+
+        self.assertEqual(dispatched, self.retry())
+        self.assertIn("total=2", out)
+
+    # Runs on other branches and scratch runs of the day, however many, don't push the live run out of the list.
+    def test_the_days_other_runs_do_not_crowd_out_its_live_run(self):
+        self.run_at("00:30", LIVE_TITLE, "failure", [("Setup", "success"), ("Build geocoder index", "failure")])
+        for i in range(40):
+            self.run_at(f"{1 + i // 60:02d}:{i % 60:02d}", SCRATCH_TITLE, "success", branch="perf/nightly-speed")
+        for i in range(10):
+            self.run_at(f"{3 + i // 60:02d}:{i % 60:02d}", SCRATCH_TITLE, "success")
+
+        out, dispatched = self.watchdog()
+
+        self.assertEqual(dispatched, self.retry())
+        self.assertIn("total=1  succeeded=0", out)
+
     def test_a_live_run_that_succeeded_leaves_the_day_alone(self):
         self.run_at("06:17", LIVE_TITLE, "success", [("Setup", "success")])
         self.run_at("09:00", SCRATCH_TITLE, "failure", [("Setup", "failure")])
@@ -844,13 +934,11 @@ class WatchdogTest(unittest.TestCase):
 
                 self.assertEqual(self.watchdog()[1], self.retry() if retried else [])
 
-    # The report's latest finished nightly is the live one's, a scratch run after it notwithstanding.
-    def test_the_report_takes_the_latest_live_run(self):
-        live = {"id": 7, "run_attempt": 1, "display_title": LIVE_TITLE, "conclusion": "failure"}
-        scratch = {"id": 8, "run_attempt": 1, "display_title": SCRATCH_TITLE, "conclusion": "success"}
+    def report(self, api_runs):
+        """Runs the report step against the REST API's runs `api_runs`, newest first; returns the run it took."""
         data = os.path.join(self.root, "data.json")
         with open(data, "w") as f:
-            json.dump({"default_branch": "main", "runs": [], "jobs": {}, "api_runs": [scratch, live],
+            json.dump({"default_branch": "main", "runs": [], "jobs": {}, "api_runs": api_runs,
                        "api_jobs": [{"steps": []}]}, f)
         for tool, body in {"op": "echo token\n", "python3": "exit 0\n"}.items():
             with open(os.path.join(self.bin, tool), "w") as f:
@@ -865,13 +953,44 @@ class WatchdogTest(unittest.TestCase):
 
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         with open(os.path.join(self.root, "o11y-run.json")) as f:
-            self.assertEqual(json.load(f), live)
+            return json.load(f)
 
-    # The nightly's own title says which runs are tests, as the watchdog reads it.
+    # The report's latest finished nightly is the live one's, a scratch run after it notwithstanding, or a dispatch
+    # under the live prefix in other case.
+    def test_the_report_takes_the_latest_live_run(self):
+        live = {"id": 7, "run_attempt": 1, "display_title": LIVE_TITLE, "conclusion": "failure"}
+        scratch = {"id": 8, "run_attempt": 1, "display_title": SCRATCH_TITLE, "conclusion": "success"}
+        mixed = {"id": 9, "run_attempt": 1, "display_title": MIXED_CASE_TITLE, "conclusion": "failure"}
+
+        self.assertEqual(self.report([mixed, scratch, live]), live)
+
+    def test_the_report_takes_a_retry_as_a_live_run(self):
+        retry = {"id": 8, "run_attempt": 1, "display_title": LIVE_DISPATCH_TITLE, "conclusion": "success"}
+        live = {"id": 7, "run_attempt": 1, "display_title": LIVE_TITLE, "conclusion": "failure"}
+
+        self.assertEqual(self.report([retry, live]), retry)
+
+    # Past a page of the API's default size of scratch runs since it.
+    def test_the_report_finds_the_live_run_past_a_page_of_scratch_runs(self):
+        live = {"id": 7, "run_attempt": 1, "display_title": LIVE_TITLE, "conclusion": "failure"}
+        scratch = [{"id": 100 + i, "run_attempt": 1, "display_title": SCRATCH_TITLE, "conclusion": "success"}
+                   for i in range(40)]
+
+        self.assertEqual(self.report(scratch + [live]), live)
+
+    # The nightly's own title says which runs are tests, as the watchdog reads it: a scheduled run's is the workflow's
+    # name, and a dispatch's names its prefix as given, which the watchdog matches byte for byte (an expression's ==
+    # is blind to case).
     def test_the_nightly_names_a_scratch_run_in_its_title(self):
         self.assertEqual(workflow_yaml(NIGHTLY)["run-name"],
-                         "${{ (inputs.s3_prefix || 'geocoder') == 'geocoder' && 'Build Geocoder Index' "
-                         "|| format('Build Geocoder Index [scratch: {0}]', inputs.s3_prefix) }}")
+                         "${{ (inputs.s3_prefix || 'geocoder') != 'geocoder' "
+                         "&& format('Build Geocoder Index [scratch: {0}]', inputs.s3_prefix) "
+                         "|| inputs.s3_prefix && format('Build Geocoder Index [{0}]', inputs.s3_prefix) "
+                         "|| 'Build Geocoder Index' }}")
+        with open(WATCHDOG) as f:
+            watchdog = f.read()
+        self.assertEqual(len(re.findall(rf'== "{re.escape(LIVE_TITLE)}" or \.\w+ == "{re.escape(LIVE_DISPATCH_TITLE)}"',
+                                        watchdog)), 2)
 
     # GitHub runs no workflow it can't parse: a scheduled nightly whose file
     # isn't YAML never starts, and a dispatch of it is refused.

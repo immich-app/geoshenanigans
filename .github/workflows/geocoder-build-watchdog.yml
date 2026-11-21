@@ -57,25 +57,33 @@ jobs:
           # the repo from a checkout this job doesn't have.
           BUILD_REF=$(gh repo view "$GH_REPO" --json defaultBranchRef --jq .defaultBranchRef.name)
 
-          # Fetch the last 30 runs of the build workflow and filter to
-          # today's runs ON THE DEFAULT BRANCH. The headBranch filter
-          # excludes feature-branch test runs that would otherwise skew
-          # the retry count. We intentionally do NOT filter by event:
-          # both the scheduled run and our own workflow_dispatch retries
-          # must count toward MAX_RETRIES. A dispatch under a scratch
-          # s3_prefix is a test run whatever its branch, which its title
-          # says (geocoder-build.yml's run-name): it is neither today's
-          # success nor a failure to retry. (gh prints UTC ISO timestamps,
-          # so startswith($t) is a valid same-day check.)
+          # Fetch the build workflow's runs ON THE DEFAULT BRANCH since
+          # yesterday (whatever zone the server reads a bare date in, that
+          # lists all of today's) and filter to today's. The branch filter
+          # excludes feature-branch test runs that would otherwise skew the
+          # retry count, and leaves none of them to push today's runs out of
+          # the list. We intentionally do NOT filter by event: both the
+          # scheduled run and our own workflow_dispatch retries must count
+          # toward MAX_RETRIES. A dispatch under any prefix but the live one
+          # is a test run whatever its branch, which its title says
+          # (geocoder-build.yml's run-name): it is neither today's success
+          # nor a failure to retry. The live nightly's runs are those of the
+          # two titles run-name gives it, a scheduled run's and a dispatch's
+          # under s3_prefix geocoder, matched byte for byte: a dispatch under
+          # Geocoder, which Setup refuses, is titled "Build Geocoder Index
+          # [Geocoder]" (an expression's == is blind to case). (gh prints UTC
+          # ISO timestamps, so startswith($t) is a valid same-day check.)
           RUNS_JSON=$(gh run list \
             --workflow="$WORKFLOW" \
-            --limit=30 \
+            --branch="$BUILD_REF" \
+            --created=">=$(date -u -d "$TODAY - 1 day" +%Y-%m-%d)" \
+            --limit=100 \
             --json databaseId,conclusion,status,createdAt,event,headBranch,displayTitle)
 
           TODAY_RUNS=$(echo "$RUNS_JSON" \
             | jq --arg t "$TODAY" --arg ref "$BUILD_REF" \
                  '[.[] | select(.createdAt | startswith($t)) | select(.headBranch == $ref)
-                       | select(.displayTitle | contains("[scratch: ") | not)]')
+                       | select(.displayTitle == "Build Geocoder Index" or .displayTitle == "Build Geocoder Index [geocoder]")]')
 
           TOTAL=$(echo "$TODAY_RUNS" | jq 'length')
           SUCCEEDED=$(echo "$TODAY_RUNS" | jq '[.[] | select(.conclusion == "success")] | length')
@@ -162,8 +170,9 @@ jobs:
       # geocoder-build.yml's Report to o11y.
       # The latest finished nightly on main, whatever ended it: a run whose
       # runner died or that timed out never reaches its own report step. A
-      # scratch s3_prefix's run, a test, is passed over as the retry passes
-      # it over.
+      # run under any prefix but the live one, a test, is passed over as the
+      # retry passes it over, by the same titles; the page is the API's
+      # largest, so that a run of tests since the nightly doesn't hide it.
       - name: Report the published build and the latest nightly
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -176,8 +185,8 @@ jobs:
           echo "::add-mask::$token"
           RUN_JSON="$RUNNER_TEMP/o11y-run.json"
           JOB_JSON="$RUNNER_TEMP/o11y-job.json"
-          if gh api "repos/$GITHUB_REPOSITORY/actions/workflows/geocoder-build.yml/runs?branch=main&status=completed&per_page=30" \
-               --jq '[.workflow_runs[] | select(.display_title | contains("[scratch: ") | not)][0] // {}' > "$RUN_JSON" \
+          if gh api "repos/$GITHUB_REPOSITORY/actions/workflows/geocoder-build.yml/runs?branch=main&status=completed&per_page=100" \
+               --jq '[.workflow_runs[] | select(.display_title == "Build Geocoder Index" or .display_title == "Build Geocoder Index [geocoder]")][0] // {}' > "$RUN_JSON" \
              && run_id=$(jq -r '.id // empty' "$RUN_JSON") && [ -n "$run_id" ]; then
             gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id/attempts/$(jq -r .run_attempt "$RUN_JSON")/jobs" \
               --jq '.jobs[0] // {}' > "$JOB_JSON" || echo "::warning::Could not read the nightly's job"

@@ -1,8 +1,12 @@
 name: Build Geocoder Index
 # A dispatch under a scratch s3_prefix is a test run, and its title says so:
 # the watchdog counts only the live nightly's runs, as today's success, as a
-# failure to retry, or as the nightly it reports.
-run-name: "${{ (inputs.s3_prefix || 'geocoder') == 'geocoder' && 'Build Geocoder Index' || format('Build Geocoder Index [scratch: {0}]', inputs.s3_prefix) }}"
+# failure to retry, or as the nightly it reports. Those are titled "Build
+# Geocoder Index" (scheduled) and "Build Geocoder Index [geocoder]" (a
+# dispatch, the watchdog's retries among them), which it matches byte for
+# byte: an expression's == is blind to case, so a dispatch's title names its
+# prefix as given, and one under Geocoder (Setup refuses it) is no live run.
+run-name: "${{ (inputs.s3_prefix || 'geocoder') != 'geocoder' && format('Build Geocoder Index [scratch: {0}]', inputs.s3_prefix) || inputs.s3_prefix && format('Build Geocoder Index [{0}]', inputs.s3_prefix) || 'Build Geocoder Index' }}"
 
 concurrency:
   group: geocoder-build
@@ -1420,6 +1424,9 @@ jobs:
           DATA_TIMESTAMP: ${{ steps.setup.outputs.data_timestamp }}
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
+          # The `if:` compares without case: a dispatch under Geocoder, which
+          # Setup refuses, passes it too.
+          [ "$S3_PREFIX" = geocoder ] || exit 0
           if ! token=$(op read "op://tf_prod/O11Y_VICTORIAMETRICS_VMAUTH_PASSWORD/password"); then
             echo "::warning::Could not read the o11y token from 1Password; reporting nothing"
             exit 0

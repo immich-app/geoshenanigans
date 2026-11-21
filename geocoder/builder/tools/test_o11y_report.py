@@ -432,9 +432,9 @@ class NightlyReportTest(unittest.TestCase):
             with open(os.path.join(bin_dir, tool), "w") as f:
                 f.write("#!/bin/sh\n" + body)
             os.chmod(os.path.join(bin_dir, tool), 0o755)
-        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "RUNNER_TEMP": root, "WORKDIR": root, "BUILD_DATE": "2026-10-12",
-               "DATA_TIMESTAMP": "2026-10-12T00:00:00Z", "O11Y_URL": "https://o11y.invalid", "GITHUB_RUN_ID": "1",
-               "GITHUB_RUN_ATTEMPT": "1", "OP_SERVICE_ACCOUNT_TOKEN": "t"}
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "RUNNER_TEMP": root, "WORKDIR": root, "S3_PREFIX": "geocoder",
+               "BUILD_DATE": "2026-10-12", "DATA_TIMESTAMP": "2026-10-12T00:00:00Z", "O11Y_URL": "https://o11y.invalid",
+               "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1", "OP_SERVICE_ACCOUNT_TOKEN": "t"}
 
         took, _ = self.run_step("Report to o11y", root, env)
 
