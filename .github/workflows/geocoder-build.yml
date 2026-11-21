@@ -2,7 +2,7 @@ name: Build Geocoder Index
 # A dispatch under a scratch s3_prefix is a test run, and its title says so:
 # the watchdog counts only the live nightly's runs, as today's success, as a
 # failure to retry, or as the nightly it reports.
-run-name: ${{ (inputs.s3_prefix || 'geocoder') == 'geocoder' && 'Build Geocoder Index' || format('Build Geocoder Index [scratch: {0}]', inputs.s3_prefix) }}
+run-name: "${{ (inputs.s3_prefix || 'geocoder') == 'geocoder' && 'Build Geocoder Index' || format('Build Geocoder Index [scratch: {0}]', inputs.s3_prefix) }}"
 
 concurrency:
   group: geocoder-build

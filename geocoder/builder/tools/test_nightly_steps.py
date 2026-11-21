@@ -25,6 +25,16 @@ def nightly():
         return f.read()
 
 
+WORKFLOWS = os.path.dirname(NIGHTLY)
+
+
+def workflow_yaml(path):
+    """The workflow at path as GitHub reads it: parsed YAML."""
+    import yaml
+    with open(path) as f:
+        return yaml.safe_load(f)
+
+
 def steps():
     """The nightly's steps in order, each its name (or its action) and its lines."""
     found = re.findall(r"^      - (?:name: (.+)|uses: (\S+).*)\n((?:(?: {8}.*)?\n)*)", nightly(), re.M)
@@ -741,10 +751,20 @@ class WatchdogTest(unittest.TestCase):
 
     # The nightly's own title says which runs are tests, as the watchdog reads it.
     def test_the_nightly_names_a_scratch_run_in_its_title(self):
-        run_name = re.search(r"(?m)^run-name: (.*)$", nightly())
-        self.assertIsNotNone(run_name)
-        self.assertEqual(run_name.group(1), "${{ (inputs.s3_prefix || 'geocoder') == 'geocoder' && 'Build Geocoder Index' "
-                                            "|| format('Build Geocoder Index [scratch: {0}]', inputs.s3_prefix) }}")
+        self.assertEqual(workflow_yaml(NIGHTLY)["run-name"],
+                         "${{ (inputs.s3_prefix || 'geocoder') == 'geocoder' && 'Build Geocoder Index' "
+                         "|| format('Build Geocoder Index [scratch: {0}]', inputs.s3_prefix) }}")
+
+    # GitHub runs no workflow it can't parse: a scheduled nightly whose file
+    # isn't YAML never starts, and a dispatch of it is refused.
+    def test_every_workflow_is_yaml_github_can_read(self):
+        names = sorted(n for n in os.listdir(WORKFLOWS) if n.endswith((".yml", ".yaml")))
+        self.assertIn(os.path.basename(NIGHTLY), names)
+        for name in names:
+            with self.subTest(name):
+                doc = workflow_yaml(os.path.join(WORKFLOWS, name))
+                self.assertIsInstance(doc, dict)
+                self.assertIn("jobs", doc)
 
 
 if __name__ == "__main__":
