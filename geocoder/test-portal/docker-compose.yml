@@ -5,7 +5,7 @@ services:
   # of its 28 datasets; the page at /test compares up to 4 side by side. A
   # build is ~11.2 GiB on disk (its identical files hard-linked) and ~9 GiB
   # to download, once a day; the volume keeps the build served, the one
-  # before it and one being fetched, ~34 GiB at most.
+  # served before it and one being fetched, ~34 GiB at most.
   geocoder-portal:
     build:
       context: ..

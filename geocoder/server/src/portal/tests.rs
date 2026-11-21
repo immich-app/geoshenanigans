@@ -629,6 +629,59 @@ async fn the_prune_keeps_the_build_served_and_the_one_before_it() {
     assert!(before.indexes[before.plan.default].query_json(POINT.0, POINT.1).contains("full.simplified.all"));
 }
 
+// A build the volume holds complete is served again from its dir once
+// latest.json names it again (moved back to it), nothing fetched; the prune
+// keeps the build served before it, of another date, and never a second
+// dir of one build.
+#[tokio::test]
+async fn a_build_the_volume_holds_is_served_again_without_a_fetch() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let p = portal(data.path(), config(&bucket, load));
+    p.round(true).await.unwrap();
+    bucket.add_build(NEXT, BUILD_VERSION);
+    bucket.set_latest(NEXT, Some(BUILD_VERSION));
+    assert_eq!(p.round(false).await, Ok(format!("build {NEXT} is served ({NEXT}-1)")));
+    let fetched = bucket.requests().len();
+
+    bucket.set_latest(DATE, Some(BUILD_VERSION));
+    assert_eq!(p.round(false).await, Ok(format!("build {DATE} is served ({DATE}-1)")));
+    assert_eq!(build_dirs(data.path()), [format!("{DATE}-1"), format!("{NEXT}-1")]);
+    bucket.set_latest(NEXT, Some(BUILD_VERSION));
+    assert_eq!(p.round(false).await, Ok(format!("build {NEXT} is served ({NEXT}-1)")));
+    assert_eq!(build_dirs(data.path()), [format!("{DATE}-1"), format!("{NEXT}-1")]);
+    assert_eq!(bucket.requests().len(), fetched);
+}
+
+// A build the volume holds whose files no longer hold their manifest's
+// bytes is not served again: it is fetched anew into a new dir, and the
+// damaged one goes.
+#[tokio::test]
+async fn a_build_the_volume_holds_damaged_is_fetched_again_before_it_is_served_again() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let p = portal(data.path(), config(&bucket, load));
+    p.round(true).await.unwrap();
+    bucket.add_build(NEXT, BUILD_VERSION);
+    bucket.set_latest(NEXT, Some(BUILD_VERSION));
+    p.round(false).await.unwrap();
+    let at = data.path().join(BUILDS).join(format!("{DATE}-1")).join("planet/full/admin_cells.bin");
+    let mut bytes = std::fs::read(&at).unwrap();
+    bytes[0] ^= 1;
+    {
+        use std::io::Write;
+        std::fs::OpenOptions::new().write(true).open(&at).unwrap().write_all(&bytes).unwrap();
+    }
+    let before = bucket.requests().len();
+
+    bucket.set_latest(DATE, Some(BUILD_VERSION));
+    assert_eq!(p.round(false).await, Ok(format!("build {DATE} is served ({DATE}-2)")));
+    assert_eq!(bucket.requests().len() - before, fetched(&bucket).await.len());
+    assert_eq!(build_dirs(data.path()), [format!("{DATE}-2"), format!("{NEXT}-1")]);
+}
+
 // /datasets lists the 28 planet selections the constraints allow, in the
 // axes' order, each with its label, description, preset, values and sizes
 // (the manifest's sums), the presets with theirs, and the 4 combinations

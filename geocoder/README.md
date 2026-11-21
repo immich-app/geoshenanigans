@@ -161,7 +161,8 @@ hard-linked (~11.2 GiB a build, ~9 GiB to download). It switches to a build
 only once every dataset of it loads, and refuses one of another build
 version than it reads, saying so on `/health`. Until it has a build to
 serve, `/reverse`, `/polygons` and `/datasets` answer 503 with the reason. It
-keeps the build it serves and the one before it. A date in
+keeps the build it serves and the one it served before, and serves a build it
+holds again, without a fetch, once latest.json names it again. A date in
 `<data>/latest.override` stands in for the bucket's latest.json.
 
 ## API

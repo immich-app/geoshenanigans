@@ -19,8 +19,10 @@
 // it is not fetched again while latest.json names it. Every round runs
 // under one lock (LOCK); the first of a process serves the newest local
 // build that loads before it asks the bucket anything, and checks its
-// files against their sha256. The prune keeps the build served and the one
-// before it.
+// files against their sha256. A build the data dir holds complete is
+// served again from its dir (latest.json moved back to it) once its files
+// check out, not fetched. The prune keeps the build served, the one served
+// before it and the dir of the latest build a sync left part way.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -364,20 +366,26 @@ impl Portal {
             }
         }
         let Some(served) = self.served() else { return };
-        self.running(format!("checking the files of build {}", served.dir));
-        let root = self.builds().join(&served.dir);
-        let checked = tokio::task::spawn_blocking(move || {
-            let (cfg, _) = parse_manifest(&std::fs::read(root.join(MANIFEST)).map_err(|e| e.to_string())?)?;
-            verify(&root, &cfg, &served.plan)
-        })
-        .await
-        .unwrap_or_else(|e| Err(format!("check task: {e}")));
-        if let Err(why) = checked {
-            let dir = self.served().map(|s| s.dir.clone()).unwrap_or_default();
+        if let Err(why) = self.check(&served.dir, &served.plan).await {
+            let dir = served.dir.clone();
             eprintln!("portal start: build {dir} is damaged: {why}");
             self.set_unusable(&dir);
             self.set_status(|s| s.damaged = Some(format!("{dir}: {why}")));
         }
+    }
+
+    /// Whether every file of the build dir `name`, of `plan`, holds the
+    /// bytes of its manifest's sha256 (verify); else the first that
+    /// doesn't.
+    async fn check(&self, name: &str, plan: &Plan) -> Result<(), String> {
+        self.running(format!("checking the files of build {name}"));
+        let (root, plan) = (self.builds().join(name), plan.clone());
+        tokio::task::spawn_blocking(move || {
+            let (cfg, _) = parse_manifest(&std::fs::read(root.join(MANIFEST)).map_err(|e| e.to_string())?)?;
+            verify(&root, &cfg, &plan)
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("check task: {e}")))
     }
 
     /// The complete build dir `name`, loaded; or why it can't be served.
@@ -510,7 +518,8 @@ impl Portal {
     /// all its datasets load; what it did, or why it failed. A build of
     /// another build version, or that can't be served, is refused; one
     /// refused is not fetched again while it is the latest. With the latest
-    /// served it does nothing, unless the build served is damaged.
+    /// served it does nothing, unless the build served is damaged; with it
+    /// complete in a dir, it serves it from there.
     async fn sync(&self) -> Result<String, String> {
         self.running("reading the latest build".to_string());
         let latest = self.latest().await?;
@@ -553,9 +562,37 @@ impl Portal {
             Err(why) => return self.refuse(&date, &why),
         };
 
+        // A complete dir of this build, of its manifest, which this process
+        // didn't find unusable (the build served before, latest.json moved
+        // back to it): served again once it loads and its files hold their
+        // manifest's bytes, nothing fetched.
+        let dirs = self.list()?;
+        for (d, _) in dirs.iter().rev().filter(|(d, complete)| *complete && d.date == date) {
+            let name = d.name();
+            if self.unusable(&name) || !std::fs::read(self.builds().join(&name).join(MANIFEST)).is_ok_and(|m| m == bytes) {
+                continue;
+            }
+            self.running(format!("loading build {name}"));
+            let opened = match self.open(&name).await {
+                Ok(served) => self.check(&name, &served.plan).await.map(|()| served),
+                Err(why) => Err(why),
+            };
+            match opened {
+                Ok(served) => {
+                    if let Some(before) = self.serve(served) {
+                        eprintln!("portal sync: build {name} is served again in place of {}", before.dir);
+                    }
+                    return Ok(format!("build {date} is served ({name})"));
+                }
+                Err(why) => {
+                    eprintln!("portal sync: build {name} can't be served again: {why}");
+                    self.set_unusable(&name);
+                }
+            }
+        }
+
         // A dir of this build a sync left incomplete, to resume, or a new
         // one.
-        let dirs = self.list()?;
         let resume = dirs.iter().rev()
             .find(|(d, complete)| d.date == date && !complete)
             .map(|(d, _)| d.name())
@@ -691,8 +728,10 @@ impl Portal {
         }
     }
 
-    /// Removes every build dir but the one served, the newest complete one
-    /// before it that this process didn't find unusable, and the newest
+    /// Removes every build dir but the one served; the newest complete one
+    /// of another date that this process didn't find unusable (the one
+    /// served before it: the one before it, or after latest.json moved back
+    /// to an older build, the newer one it served); and the newest
     /// incomplete one of the latest build (to resume), or of any while the
     /// latest build is not known (a first round that couldn't ask the
     /// bucket).
@@ -704,9 +743,9 @@ impl Portal {
         let mut keep = BTreeSet::new();
         if let Some(served) = self.served() {
             keep.insert(served.dir.clone());
-            let at = BuildDir::parse(&served.dir);
+            let date = BuildDir::parse(&served.dir).map(|d| d.date);
             let before = dirs.iter().rev()
-                .find(|(d, complete)| *complete && Some(d) < at.as_ref() && !self.unusable(&d.name()));
+                .find(|(d, complete)| *complete && Some(&d.date) != date.as_ref() && !self.unusable(&d.name()));
             if let Some((d, _)) = before {
                 keep.insert(d.name());
             }
