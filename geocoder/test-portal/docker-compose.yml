@@ -5,7 +5,9 @@ services:
   # of its 28 datasets; the page at /test compares up to 4 side by side. A
   # build is ~11.2 GiB on disk (its identical files hard-linked) and ~9 GiB
   # to download, once a day; the volume keeps the build served, the one
-  # served before it and one being fetched, ~34 GiB at most.
+  # served before it and one being fetched, ~34 GiB of files at most. A
+  # fetch starts only with its files' size and 2 GiB more free, so allow
+  # ~36 GiB.
   geocoder-portal:
     build:
       context: ..
@@ -14,12 +16,15 @@ services:
       # 3002 because :3000 is normally claimed by `immich_web` in the
       # local dev stack.
       - "3002:3000"
-    # query-portal runs as PID 1, which ignores SIGTERM: init passes it on.
+    # init runs as PID 1 and passes SIGTERM on to query-portal, which stops
+    # at it (as PID 1 itself, it would ignore it).
     init: true
     restart: unless-stopped
     # No memory limit: the heap of all 28 datasets is ~30 MiB, the rest is
     # page cache of the build, which a limit only evicts sooner (each sync
-    # writes a whole build).
+    # writes a whole build). A /polygons of a dataset of exact boundaries
+    # takes heap for its answer while it runs, hundreds of MB in a big
+    # country, with 8 lookups at most at once.
     #
     # environment:
     #   PORTAL_SYNC_SECONDS: "3600"  # between two sync rounds (a failed one: 600 at most)
