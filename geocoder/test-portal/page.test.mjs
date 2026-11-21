@@ -1183,6 +1183,19 @@ test('a boundary without a label matches within 20 km, a place only within 1 km'
   assert.equal(searchRows([[place(48.9)], [area(49.0)]]).length, 1);
 });
 
+// A dataset without POIs gives the town of a name where another gives a
+// memorial of that name 311 m from it: they are two rows.
+test('a POI is one row with a POI only, however near a place of its name', () => {
+  const { searchRows } = core();
+  const memorial = hit('Paris', 33.6609, -95.5555, { kind: 'O', type: 'memorial' });
+  const town = hit('Paris', 33.6637, -95.5555, { type: 'town' });
+  const ranks = (rows) => plain(rows.map((r) => [r.kind, r.cells.map((c) => (c ? c.rank : null))]));
+  assert.deepEqual(ranks(searchRows([[memorial], [town]])), [['O', [1, null]], ['P', [null, 1]]]);
+  assert.deepEqual(ranks(searchRows([[town], [memorial]])), [['P', [1, null]], ['O', [null, 1]]]);
+  assert.deepEqual(ranks(searchRows([[memorial, town], [town]])), [['O', [1, null]], ['P', [2, 1]]]);
+  assert.deepEqual(ranks(searchRows([[memorial], [hit('Paris', 33.6637, -95.5555, { kind: 'O', type: 'museum' })]])), [['O', [1, 1]]]);
+});
+
 test('a row tells the context its columns give, and the parts they disagree on', () => {
   const { searchRows } = core();
   const [row] = searchRows([

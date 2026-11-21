@@ -911,10 +911,11 @@ const SEARCH_LIMIT = 10;
 const SEARCH_DEBOUNCE = 250;
 // The rows of the matrix shown until every one is asked for.
 const SEARCH_ROWS = 5;
-// The results of two columns are one where their names are equal and their
-// points at most this many metres apart; within AREA_MATCH_METRES where one
-// is a boundary without a label node, whose point is one on its ring's
-// surface, which moves with the boundary's precision.
+// The results of two columns are one where their names are equal, both or
+// neither is a POI (poiOrNot), and their points at most this many metres
+// apart; within AREA_MATCH_METRES where one is a boundary without a label
+// node, whose point is one on its ring's surface, which moves with the
+// boundary's precision.
 const MATCH_METRES = 1000;
 const AREA_MATCH_METRES = 20000;
 // The parts of a result's context, the smallest first.
@@ -929,6 +930,15 @@ const SEARCH_KINDS = {
 };
 // A dot's slice of a column that lacks its result or has no answer.
 const DOT_ABSENT = '#555566';
+
+// Whether results of the kinds `a` and `b` can be one: a POI with a POI
+// only, however near a place or boundary of its name (a dataset without
+// POIs gives the town where another gives a memorial of the town's name).
+// A place and a boundary can: a dataset gives a place node where another
+// gives the boundary it labels.
+function poiOrNot(a, b) {
+  return (a === 'O') === (b === 'O');
+}
 
 // Whether the server searches: a portal whose /datasets names each
 // dataset's index. A production server has no /datasets.
@@ -980,9 +990,10 @@ function formatMetres(m) {
 
 // The matrix's rows from each column's results (`lists`: null for a column
 // without an answer, which lacks none). A result joins the row of an earlier
-// column's result of its name within MATCH_METRES of it, the closest pairs
-// first, each row and each result once; else it makes a row of its own. A
-// column's own results never share one. Each row has the name, kind, type
+// column's result of its name and a kind it can be one with (poiOrNot)
+// within MATCH_METRES of it, the closest pairs first, each row and each
+// result once; else it makes a row of its own. A column's own results
+// never share one. Each row has the name, kind, type
 // and point of its first result; its cell of each column (the rank, the
 // result and its metres from that point; null where the column has none);
 // its best rank; whether a column that answered lacks it; whether the ranks
@@ -997,7 +1008,7 @@ function searchRows(lists) {
     const before = rows.slice();
     const pairs = [];
     list.forEach((r, i) => before.forEach((row, n) => {
-      if (row.name !== r.name) return;
+      if (row.name !== r.name || !poiOrNot(row.kind, r.kind)) return;
       const m = metres(row.lat, row.lng, r.latitude, r.longitude);
       if (m <= (row.kind === 'A' || r.kind === 'A' ? AREA_MATCH_METRES : MATCH_METRES)) pairs.push({ m, i, n });
     }));

@@ -198,9 +198,9 @@ newer search cancels the requests of the one before. The results go into
 one matrix: a row a result, its rank in each column (`–` where a column
 that answered lacks it, `·` where one has no answer yet), its name, kind,
 type and context (admin2 · admin1 · country). Results of two columns are
-one row where their names are equal and their points at most 1 km apart,
-20 km where one is a boundary without a label node, whose point moves with
-the boundary's precision. A row marks the columns that lack it, a rank
+one row where their names are equal, both or neither is a POI, and their
+points are at most 1 km apart, 20 km where one is a boundary without a
+label node, whose point moves with the boundary's precision. A row marks the columns that lack it, a rank
 below its best, how far its points are apart, another type, and each part
 of the context the columns disagree on. Each row is a dot on the map,
 coloured by the columns that have it, and a click on a row or a dot looks
