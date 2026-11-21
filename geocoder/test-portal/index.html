@@ -543,12 +543,14 @@ function parseLink(search) {
 }
 
 // The build a link to a result names (b=): the oldest that answered it in
-// the columns `keys` (`answers`, by key), which may be older than the build
-// `served` (answers saved, or asked before the build changed), so that a
-// link to answers the server no longer gives is flagged; else `served`.
+// the columns `keys` (`answers`, by key) other than the build `served`
+// (answers saved, or asked before the build changed: older, or newer where
+// the portal went back to an older build), so that a link to answers the
+// server no longer gives is flagged; else the oldest that answered it;
+// else `served`.
 function linkBuild(answers, keys, served) {
   const builds = keys.map((key) => answers[key] && answers[key].build).filter(Boolean).sort(buildOrder);
-  return builds.length ? builds[0] : served;
+  return builds.find((build) => !served || !sameBuild(build, served)) || builds[0] || served;
 }
 
 function linkSearch({ datasets = [], point = null, build = null }) {
@@ -1369,8 +1371,12 @@ columnsEl.addEventListener('click', (e) => {
 // The page's URL: the columns, the selected point and the build that
 // answered it (linkBuild; the build served without one), so that a copy of
 // it opens the same columns on the same point, flagged where another build
-// answers it then.
+// answers it then. Until the link's points are looked up (once the map is
+// in) it stays the link the page opened, so that a reload meanwhile opens
+// them still.
+let linkRestored = false;
 function updateLink() {
+  if (!linkRestored) return;
   const entry = selectedEntry();
   const served = servedBuild() || (mode === 'waiting' ? link.build : null);
   const keys = columns.map(columnKey).filter((key) => key !== null);
@@ -1939,7 +1945,9 @@ updatePolygonsBtn();
   await mapLoaded;
   loadResults();
   if (polygonsColumn !== 'off') ensurePolygonLayer();
+  linkRestored = true;
   lookupLinkPoints();
+  updateLink();
 })();
 </script>
 </body>

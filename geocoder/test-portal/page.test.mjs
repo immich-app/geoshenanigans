@@ -427,10 +427,12 @@ test('a card names the first answer and says when the columns differ', () => {
   assert.ok(failed.includes('Smallest: HTTP 503: no build'), failed);
 });
 
-// The columns' answers of a result may come from builds older than the one
+// The columns' answers of a result may come from builds other than the one
 // served now (saved, or asked before the build changed): its link names the
-// oldest, so that a link to answers the server no longer gives is flagged.
-test('a link to a result names the oldest build that answered it in the columns', () => {
+// oldest of those, so that a link to answers the server no longer gives is
+// flagged. Where the portal went back to an older build, an answer of the
+// newer one is such an answer.
+test('a link to a result names the oldest build other than the one served that answered it in the columns', () => {
   const { linkBuild } = core();
   const answers = {
     'full.simplified.all': { data: {}, build: '2026-11-20' },
@@ -449,6 +451,12 @@ test('a link to a result names the oldest build that answered it in the columns'
   };
   assert.equal(linkBuild(republished, ['a', 'b', 'c'], '2026-11-21-1'), '2026-11-20-9');
   assert.equal(linkBuild(republished, ['a', 'c'], '2026-11-21-1'), '2026-11-20-10');
+  // Served again after 2026-11-21-1: that build's answer saved beside a
+  // fresh one.
+  assert.equal(linkBuild(republished, ['a', 'c'], '2026-11-20-10'), '2026-11-21-1');
+  assert.equal(linkBuild(republished, ['b', 'a', 'c'], '2026-11-20-10'), '2026-11-20-9');
+  assert.equal(linkBuild(republished, ['a'], '2026-11-20-10'), '2026-11-20-10');
+  assert.equal(linkBuild({ a: { data: {}, build: '2026-11-20' } }, ['a'], '2026-11-20-2'), '2026-11-20');
 });
 
 test('a link of another build than the one served is flagged', () => {
