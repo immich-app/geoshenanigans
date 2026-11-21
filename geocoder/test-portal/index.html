@@ -507,6 +507,15 @@ function parseLink(search) {
   return { datasets: q.getAll('d').filter((d) => d).slice(0, MAX_COLUMNS), points, build: q.get('b') || null };
 }
 
+// The build a link to a result names (b=): the oldest that answered it in
+// the columns `keys` (`answers`, by key), which may be older than the build
+// `served` (answers saved, or asked before the build changed), so that a
+// link to answers the server no longer gives is flagged; else `served`.
+function linkBuild(answers, keys, served) {
+  const builds = keys.map((key) => answers[key] && answers[key].build).filter(Boolean).sort();
+  return builds.length ? builds[0] : served;
+}
+
 function linkSearch({ datasets = [], point = null, build = null }) {
   const parts = datasets.map((d) => `d=${encodeURIComponent(d).replace(/%2F/g, '/')}`);
   if (point) parts.push(`at=${point.lat},${point.lng}`);
@@ -1143,14 +1152,18 @@ columnsEl.addEventListener('click', (e) => {
   }
 });
 
-// The page's URL: the columns, the selected point and the build served, so
-// that a copy of it opens the same columns on the same point.
+// The page's URL: the columns, the selected point and the build that
+// answered it (linkBuild; the build served without one), so that a copy of
+// it opens the same columns on the same point, flagged where another build
+// answers it then.
 function updateLink() {
   const entry = selectedEntry();
+  const served = servedBuild() || (mode === 'waiting' ? link.build : null);
+  const keys = columns.map(columnKey).filter((key) => key !== null);
   const search = linkSearch({
     datasets: mode === 'single' ? [] : wanted,
     point: entry ? { lat: entry.lat, lng: entry.lng } : null,
-    build: servedBuild() || (mode === 'waiting' ? link.build : null),
+    build: entry ? linkBuild(entry.answers, keys, served) : served,
   });
   history.replaceState(null, '', location.pathname + search + location.hash);
 }
@@ -1378,7 +1391,8 @@ async function askNominatim(entry) {
 }
 
 // After an answer of `entry` came in or went out: its marker now, and the
-// list, the detail and the saved results once for the answers of 50 ms.
+// list, the detail and the link (of the selected result) and the saved
+// results once for the answers of 50 ms.
 let renderQueued = false;
 let detailDirty = false;
 function answered(entry) {
@@ -1393,6 +1407,7 @@ function answered(entry) {
     if (detailDirty) {
       detailDirty = false;
       showDetail(selectedId);
+      updateLink();
     }
     saveResults();
   }, 50);

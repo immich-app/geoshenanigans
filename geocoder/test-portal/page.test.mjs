@@ -312,6 +312,23 @@ test('a card names the first answer and says when the columns differ', () => {
   assert.ok(failed.includes('Smallest: HTTP 503: no build'), failed);
 });
 
+// The columns' answers of a result may come from builds older than the one
+// served now (saved, or asked before the build changed): its link names the
+// oldest, so that a link to answers the server no longer gives is flagged.
+test('a link to a result names the oldest build that answered it in the columns', () => {
+  const { linkBuild } = core();
+  const answers = {
+    'full.simplified.all': { data: {}, build: '2026-11-20' },
+    'admin-minimal.simplified.none': { data: {}, build: '2026-11-19' },
+    'admin.simplified.major': { loading: true },
+    'full.exact.all': { data: {}, build: '2026-11-18' },
+  };
+  assert.equal(linkBuild(answers, ['full.simplified.all', 'admin-minimal.simplified.none', 'admin.simplified.major'], '2026-11-21'), '2026-11-19');
+  assert.equal(linkBuild(answers, ['full.simplified.all'], '2026-11-21'), '2026-11-20');
+  assert.equal(linkBuild(answers, ['admin.simplified.major', 'no-addresses.exact.none'], '2026-11-21'), '2026-11-21');
+  assert.equal(linkBuild({ '': { data: {} } }, [''], null), null);
+});
+
 test('a link of another build than the one served is flagged', () => {
   const { mismatchHtml } = core();
   const flagged = mismatchHtml('2026-11-19', '2026-11-20');
