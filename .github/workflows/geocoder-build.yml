@@ -258,12 +258,12 @@ jobs:
           fi
           echo "cache_endpoint=http://${BUCKET_HOST}:${BUCKET_PORT}" >> "$GITHUB_OUTPUT"
           echo "cache_bucket=$BUCKET_NAME" >> "$GITHUB_OUTPUT"
-          # The PBF cache key the run looks for today's PBF under and writes it
-          # to: the shared one on a live run; on a scratch prefix's its own,
-          # which Cleanup old cache bucket deletes, so a test run neither takes
-          # the nightly's PBF of the day (it applies the diff) nor writes or
-          # prunes the shared ones. Yesterday's comes from the shared key, read
-          # only, either way.
+          # The PBF cache key the run writes today's PBF to: the shared one on
+          # a live run, which a retry of the day takes it from; on a scratch
+          # prefix's its own, which Cleanup old cache bucket deletes, so a test
+          # run neither takes a PBF of the day (it applies the diff) nor writes
+          # or prunes the shared ones. Yesterday's comes from the shared key,
+          # read only, either way.
           if [ "$S3_PREFIX" = geocoder ]; then
             PBF_CACHE=geocoder-cache
           else
@@ -556,8 +556,11 @@ jobs:
           }
 
           # Today's PBF is there only when a run of the day applied the diff
-          # already: one look, with no retries, as a miss costs nothing.
-          if $CACHE ls "s3://$CACHE_BUCKET/$PBF_CACHE/planet-${TODAY}.osm.pbf" 2> /dev/null | grep -q "planet-"; then
+          # already: one look, with no retries, as a miss costs nothing. A
+          # scratch prefix's run never takes it: it is there to apply the diff,
+          # and its key may hold an earlier test run's PBF of the day.
+          if [ "$PBF_CACHE" = geocoder-cache ] \
+             && $CACHE ls "s3://$CACHE_BUCKET/$PBF_CACHE/planet-${TODAY}.osm.pbf" 2> /dev/null | grep -q "planet-"; then
             if download_pbf_from_cache \
                 "s3://$CACHE_BUCKET/$PBF_CACHE/planet-${TODAY}.osm.pbf" \
                 "$WORKDIR/planet.osm.pbf" "today's PBF ($TODAY)"; then
@@ -779,6 +782,9 @@ jobs:
             setsid nohup bash -c '"$@"; echo $? > "$0"' "$WORKDIR/pbf-cache.status" \
               $CACHE cp --concurrency 16 "$WORKDIR/planet.osm.pbf" "s3://$CACHE_BUCKET/$PBF_CACHE/planet-${TODAY}.osm.pbf" \
               > "$WORKDIR/pbf-cache.log" 2>&1 < /dev/null &
+            # Its session, for a scratch run's Cleanup old cache bucket to end
+            # before it deletes the key.
+            echo "$!" > "$WORKDIR/pbf-cache.pid"
           fi
           if [ "$HAS_PREVIOUS" = "true" ]; then
             echo "Fetching yesterday's index in background..."
@@ -1488,7 +1494,9 @@ jobs:
       # after a failed build too: a run that fails once it has cached its
       # PBF would otherwise leave ~99 GB behind each day. A scratch prefix's
       # run deletes its own key instead (Setup's pbf_cache), once its upload
-      # has ended, and leaves the shared PBFs and uploads as they are.
+      # has ended or been stopped, and leaves the shared PBFs and uploads as
+      # they are. A run cancelled before here leaves its key to the prefix's
+      # next run, which reads nothing from it.
       - name: Cleanup old cache bucket
         if: ${{ !cancelled() && steps.setup.outputs.cache_bucket != '' }}
         env:
@@ -1502,9 +1510,23 @@ jobs:
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
 
           if [ "$PBF_CACHE" != geocoder-cache ]; then
+            # The PBF's upload ends first, or a copy that finished after the
+            # delete would put the PBF back: up to 30 minutes, then it is
+            # stopped, its session and all, and gone before the delete.
             if [ -f "$WORKDIR/pbf-cache.log" ]; then
-              WAIT_START=$(date +%s)
-              until [ -s "$WORKDIR/pbf-cache.status" ] || [ $(( $(date +%s) - WAIT_START )) -gt 1800 ]; do sleep 10; done
+              for _ in $(seq 180); do
+                [ -s "$WORKDIR/pbf-cache.status" ] && break
+                sleep 10
+              done
+              UPLOAD=$(cat "$WORKDIR/pbf-cache.pid" 2> /dev/null || true)
+              if ! [ -s "$WORKDIR/pbf-cache.status" ] && [ -n "$UPLOAD" ]; then
+                echo "::warning::The scratch PBF's upload is still running after 30 minutes; stopping it"
+                pkill -KILL -s "$UPLOAD" 2> /dev/null || true
+                for _ in $(seq 60); do
+                  pgrep -s "$UPLOAD" > /dev/null || break
+                  sleep 1
+                done
+              fi
             fi
             echo "Scratch PBF cache: deleting $PBF_CACHE"
             $CACHE rm "s3://$CACHE_BUCKET/$PBF_CACHE/*" > /dev/null 2>&1 || true

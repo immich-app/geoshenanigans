@@ -82,7 +82,8 @@ def block_from(script, first_line):
 
 
 class FakeS5cmd:
-    """An s5cmd on PATH that logs its arguments, a line a call, and does nothing else."""
+    """An s5cmd on PATH that logs its arguments, a line a call, and does nothing else; with $UPLOAD_PID set (a pid
+    file), each call says whether that process still ran."""
 
     def __init__(self, test):
         self.root = tempfile.mkdtemp()
@@ -90,7 +91,9 @@ class FakeS5cmd:
         self.calls = os.path.join(self.root, "calls")
         for tool in ("s5cmd", "python3"):
             with open(os.path.join(self.root, tool), "w") as f:
-                f.write(f'#!/bin/sh\necho "{tool} $*" >> "{self.calls}"\n')
+                f.write(f'#!/bin/sh\necho "{tool} $*" >> "{self.calls}"\n'
+                        f'[ -z "$UPLOAD_PID" ] || {{ kill -0 "$(cat "$UPLOAD_PID")" 2> /dev/null && echo "  upload running" '
+                        f'|| echo "  upload ended"; }} >> "{self.calls}"\n')
             os.chmod(os.path.join(self.root, tool), 0o755)
         self.path = f"{self.root}:{os.environ['PATH']}"
 
@@ -125,15 +128,31 @@ class ScratchPbfCacheTest(unittest.TestCase):
         for name in ("Download PBF and previous indexes", "Build geocoder index", "Cleanup old cache bucket"):
             self.assertIn("PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}", step(name), name)
 
-    def run_cleanup(self, pbf_cache):
+    def run_cleanup(self, pbf_cache, upload_seconds=None):
+        """Runs the cleanup step; with upload_seconds, after starting Build geocoder index's PBF upload as that step
+        does (detached, in a session of its own) with a copy that takes that long. Its sleeps take 10 ms."""
         s5 = FakeS5cmd(self)
+        with open(os.path.join(s5.root, "sleep"), "w") as f:
+            f.write("#!/bin/sh\nexec /usr/bin/sleep 0.01\n")
+        os.chmod(os.path.join(s5.root, "sleep"), 0o755)
         work = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, work)
-        script = step_script("Cleanup old cache bucket")
         env = {"PATH": s5.path, "PBF_CACHE": pbf_cache, "CACHE_BUCKET": "cache", "CACHE_ENDPOINT": "http://cache.invalid",
                "CACHE_AWS_KEY": "k", "CACHE_AWS_SECRET": "s", "NEW_DATE": "2026-11-21", "KEEP_CACHE_PBF_DAYS": "2",
                "WORKDIR": work, "GITHUB_WORKSPACE": "/ws"}
-        subprocess.run(["bash", "-e", "-c", script], env=env, check=True, capture_output=True, text=True)
+        if upload_seconds is not None:
+            upload = block_from(step_script("Build geocoder index"), 'if [ "$PBF_SOURCE" != "today" ]; then')
+            self.assertIsNotNone(upload)
+            upload, copies = re.subn(r"\$CACHE cp --concurrency 16 .* \\\n", f"/usr/bin/sleep {upload_seconds} \\\n", upload)
+            self.assertEqual(copies, 1)
+            subprocess.run(["bash", "-e", "-c", upload], env={**env, "PBF_SOURCE": "yesterday", "TODAY": "2026-11-21"},
+                           check=True, capture_output=True, timeout=10)
+            env["UPLOAD_PID"] = os.path.join(work, "pbf-cache.pid")
+            self.addCleanup(subprocess.run, ["pkill", "-KILL", "-s", open(env["UPLOAD_PID"]).read().strip()])
+        done = subprocess.run(["bash", "-e", "-c", step_script("Cleanup old cache bucket")], env=env, capture_output=True,
+                              text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.output = done.stdout
         return s5.logged()
 
     def test_a_scratch_run_deletes_its_own_key_and_nothing_else(self):
@@ -141,6 +160,21 @@ class ScratchPbfCacheTest(unittest.TestCase):
 
         self.assertEqual(calls, ["s5cmd --endpoint-url http://cache.invalid --retry-count 5 --numworkers 15 "
                                  "rm s3://cache/geocoder-scratch/nightly-speed-1121/*"])
+
+    # Its PBF upload ends first: a copy that finished after the delete would put the PBF back.
+    def test_a_scratch_run_deletes_its_own_key_once_its_upload_ended(self):
+        calls = self.run_cleanup("geocoder-scratch/nightly-speed-1121", upload_seconds=0.5)
+
+        self.assertEqual(calls, ["s5cmd --endpoint-url http://cache.invalid --retry-count 5 --numworkers 15 "
+                                 "rm s3://cache/geocoder-scratch/nightly-speed-1121/*", "  upload ended"])
+
+    # An upload past the wait is stopped, and gone, before the delete.
+    def test_a_scratch_run_stops_an_upload_that_outlasts_the_wait_before_the_delete(self):
+        calls = self.run_cleanup("geocoder-scratch/nightly-speed-1121", upload_seconds=300)
+
+        self.assertEqual(calls, ["s5cmd --endpoint-url http://cache.invalid --retry-count 5 --numworkers 15 "
+                                 "rm s3://cache/geocoder-scratch/nightly-speed-1121/*", "  upload ended"])
+        self.assertIn("stopping it", self.output)
 
     def test_a_live_run_prunes_the_shared_key_and_aborts_its_stale_uploads(self):
         calls = self.run_cleanup("geocoder-cache")

@@ -249,6 +249,18 @@ class DownloadStepTest(unittest.TestCase):
         self.assertTrue(self.stalled_fetch_ended())
         self.assertEqual(self.diff_files(), [])
 
+    # A scratch prefix's run applies the diff whatever the cache holds: its own key may keep an earlier test run's
+    # PBF of the day (one whose upload outlived its cleanup), and the shared one is the nightly's.
+    def test_a_scratch_run_never_takes_a_cached_pbf_of_today(self):
+        cached = ["geocoder-scratch/nightly-speed-1121/planet-2026-11-21.osm.pbf", "geocoder-cache/planet-2026-11-21.osm.pbf",
+                  "geocoder-cache/planet-2026-11-20.osm.pbf"]
+
+        outputs, _, _ = self.download(cached, "ok", pbf_cache="geocoder-scratch/nightly-speed-1121")
+
+        self.assertEqual(outputs["pbf_source"], "yesterday")
+        with open(self.calls) as f:
+            self.assertNotIn("planet-2026-11-21", f.read())
+
     def test_yesterdays_pbf_waits_for_the_diff_it_takes(self):
         outputs, out, _ = self.download(["geocoder-cache/planet-2026-11-20.osm.pbf"], "ok")
 
