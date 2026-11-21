@@ -108,7 +108,8 @@ pub struct Dataset {
     /// the manifest has, in path order: of two of one name, the later is the
     /// one it reads, as a client's flat download keeps it.
     pub files: Vec<String>,
-    /// The bytes of its files.
+    /// The bytes of the files its dir holds (links): one of each name, as a
+    /// client's flat download keeps them.
     pub size_disk: u64,
     /// The bytes a client downloads for it: its files' .zst and transport
     /// units, each unit once.
@@ -249,16 +250,18 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
                             link: None,
                         });
                     }
-                    datasets.push(Dataset {
+                    let mut dataset = Dataset {
                         id,
                         selection: sel,
                         label: [mode_value, quality_value, tier_value].map(|v| v.label.as_str()).join(" · "),
                         description: None,
                         preset: None,
-                        size_disk: files.iter().map(|p| cfg.files[*p].size_raw).sum(),
+                        size_disk: 0,
                         size_download: fetches.iter().map(|f| f.size()).sum(),
                         files: files.into_iter().cloned().collect(),
-                    });
+                    };
+                    dataset.size_disk = dataset.links().values().map(|p| cfg.files[p].size_raw).sum();
+                    datasets.push(dataset);
                 }
             }
         }

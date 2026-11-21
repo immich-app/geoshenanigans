@@ -21,7 +21,7 @@ use query_server::{
 use crate::portal::catalog::{self, Object};
 use crate::portal::sync::{self, BuildDir, BUILDS, COMPLETE, MANIFEST, REFUSED, SETS};
 use crate::portal::{load_dataset, router, Config, Loader, Portal, BUILD_VERSION, LOOKUPS_AT_ONCE};
-use crate::downloader::{resolve_files, Configurations, RegionSelection};
+use crate::downloader::{basename, resolve_files, Configurations, RegionSelection};
 use crate::scratch_dir::ScratchDir;
 use crate::test_bucket::{self, TestBucket, DATE};
 use crate::{auth, handlers};
@@ -681,10 +681,11 @@ async fn a_build_the_volume_holds_damaged_is_fetched_again_before_it_is_served_a
 
 // /datasets lists the 28 planet selections the constraints allow, in the
 // axes' order, each with its label, description, preset, values and sizes
-// (the manifest's sums), the presets with their labels and descriptions,
-// the axes and their values with theirs, and the 4 combinations the
-// constraint excludes, each with the constraint's message and what it
-// requires.
+// (the bytes of its dir, which holds one file of each name as a client's
+// download does, and the manifest's sum of what a client downloads), the
+// presets with their labels and descriptions, the axes and their values
+// with theirs, and the 4 combinations the constraint excludes, each with
+// the constraint's message and what it requires.
 #[tokio::test]
 async fn datasets_lists_the_28_offered_and_the_combinations_the_constraints_exclude() {
     let bucket = test_bucket::serve(test_bucket::template_components()).await;
@@ -719,14 +720,21 @@ async fn datasets_lists_the_28_offered_and_the_combinations_the_constraints_excl
     assert_eq!(dataset("admin.exact.notable")["preset"], serde_json::Value::Null);
     assert_eq!(dataset("admin.exact.notable")["selection"],
                serde_json::json!({ "region": "planet", "mode": "admin", "quality": "exact", "poi_tier": "notable" }));
+    let sets = data.path().join(BUILDS).join(format!("{DATE}-1")).join(SETS);
+    let mut sharing_a_name = 0;
     for (s, _) in template_selections().into_iter().filter(|(_, allowed)| *allowed) {
         let files: Vec<String> = resolve_files(&cfg, &s).unwrap().paths.into_iter().filter(|p| cfg.files.contains_key(p)).collect();
+        if files.iter().map(|f| basename(f)).collect::<BTreeSet<_>>().len() < files.len() {
+            sharing_a_name += 1;
+        }
         let units: BTreeSet<&String> = files.iter().filter_map(|f| cfg.files[f].unit.as_ref()).collect();
-        let disk: u64 = files.iter().map(|f| cfg.files[f].size_raw).sum();
+        let id = catalog::dataset_id(&s);
+        let disk: u64 = std::fs::read_dir(sets.join(&id)).unwrap().map(|e| std::fs::metadata(e.unwrap().path()).unwrap().len()).sum();
         let download: u64 = files.iter().filter_map(|f| cfg.files[f].size_zst).sum::<u64>() + units.iter().map(|u| cfg.units[*u].size).sum::<u64>();
-        let d = dataset(&catalog::dataset_id(&s));
+        let d = dataset(&id);
         assert_eq!((d["size_disk"].as_u64(), d["size_download"].as_u64()), (Some(disk), Some(download)), "{s:?}");
     }
+    assert!(sharing_a_name > 0, "no selection has two files of one name");
 
     let constraint = &t["constraints"][0];
     let excluded: Vec<serde_json::Value> = template_selections().into_iter().filter(|(_, allowed)| !*allowed)
