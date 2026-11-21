@@ -1001,6 +1001,23 @@ test("each column's places table wraps its words within the column", () => {
   }
 });
 
+// However narrow the detail (a phone's width, or a page zoomed in), each
+// column's places table keeps a width it reads at, under its column's
+// label: the places scroll sideways in a box of their own rather than one
+// table running into the next, and the rest of the detail stays put.
+test("the places tables keep a readable width, scrolling within a box of their own", () => {
+  const { detailHtml } = core();
+  const places = [{ name: 'Basilique du Sacré-Cœur', category: 'place_of_worship', distance_m: 120 }];
+  const views = [1, 2, 3, 4, 5].map((n) => ({ label: `column ${n}`, color: '#111', dataset: null, answer: { data: { display_name: 'Paris', places } } }));
+  const out = detailHtml(views, null);
+  const box = out.match(/<div class="places-scroll"><div class="places-grid" style="grid-template-columns:repeat\(5,minmax\((\d+)px,1fr\)\)">([\s\S]*?)<\/div><\/div><\/div>/);
+  assert.ok(box, out);
+  assert.ok(Number(box[1]) >= 160, box[1]);
+  assert.deepEqual([...box[2].matchAll(/<div class="answer-label"[^>]*>([^<]*)<\/div><table>/g)].map((m) => m[1]), views.map((v) => v.label));
+  assert.equal(style('.places-scroll')['overflow-x'], 'auto');
+  assert.equal(style('.places-grid').display, 'grid');
+});
+
 test("the page's other scripts parse", () => {
   const others = scripts.filter((s) => s.id !== 'core');
   assert.ok(others.length > 0);

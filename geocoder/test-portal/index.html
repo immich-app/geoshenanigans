@@ -263,6 +263,10 @@
   .detail-places {
     margin-bottom: 10px;
   }
+  /* The columns' places tables, side by side, each of a least width it
+     reads at: a detail narrower than they are scrolls them sideways. */
+  .places-scroll { overflow-x: auto; }
+  .places-grid { display: grid; gap: 12px; }
   .detail-places table {
     width: 100%;
     font-size: 12px;
@@ -901,6 +905,10 @@ function controlKey(data) {
   return [data.col, data.role, data.axis, data.action].map((v) => v ?? '').join('\u0000');
 }
 
+// The least width of a column's places table in the detail, in px: its
+// three columns' padding and a few letters of each.
+const PLACES_WIDTH = 160;
+
 // The detail of a result, from `views`: one a column ({label, color,
 // dataset, answer}), and Nominatim's. Per answer its name, dataset, build
 // and time, flagged where a build other than the one `served` answered
@@ -951,7 +959,10 @@ function detailHtml(views, served) {
 
   if (datas.some((d) => d && d.places && d.places.length)) {
     const keys = datas.map((d) => (d ? new Set((d.places || []).map(placeKey)) : null));
-    html += `<div class="detail-places"><h3 style="margin:10px 0 6px">Places</h3><div style="${grid}">`;
+    // Each column's table keeps a width it reads at: the places scroll
+    // sideways in a box of their own where the detail is narrower.
+    html += '<div class="detail-places"><h3 style="margin:10px 0 6px">Places</h3><div class="places-scroll">'
+      + `<div class="places-grid" style="grid-template-columns:repeat(${views.length},minmax(${PLACES_WIDTH}px,1fr))">`;
     views.forEach((v, i) => {
       const places = (datas[i] && datas[i].places) || [];
       html += `<div><div class="answer-label" style="color:${v.color}">${esc(v.label)}</div>`;
@@ -969,7 +980,7 @@ function detailHtml(views, served) {
       }
       html += '</div>';
     });
-    html += '</div></div>';
+    html += '</div></div></div>';
   }
 
   views.forEach((v, i) => {
