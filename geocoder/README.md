@@ -134,8 +134,9 @@ server at `/test`, where it asks that server. Its compose file runs
 the latest published planet build: each selection of a mode, a boundary
 precision and a POI tier the manifest's constraints allow (28). Its page
 compares up to 4 of them side by side, each a preset or a pick by axis, and
-its URL holds the columns, the point and the build (`b=`), which it flags
-when another build is served:
+its URL holds the columns, the point and the build (`b=`, the portal's dir
+of it, `<date>-<n>`), which it flags when another build is served, one
+published again under its date among them:
 
 ```bash
 cd test-portal && docker compose up --build
@@ -147,9 +148,12 @@ Its `/reverse` and `/polygons` take `dataset=`: a preset's id (`smallest`)
 or `<mode>.<quality>.<poi_tier>` (`admin.simplified.major`), and
 `with-addresses` without one. They answer what a query-server serving that
 selection's files answers, and name the dataset and build that answered in
-`X-Geocoder-Dataset` and `X-Geocoder-Build`. `/datasets` lists the datasets
-with their labels and sizes, and the combinations the constraints exclude
-with their messages; `/health` gives the build served and how its sync goes.
+`X-Geocoder-Dataset`, `X-Geocoder-Build` (its date) and
+`X-Geocoder-Build-Dir` (its dir, as `/health` and `/datasets` name it).
+`/datasets` lists the datasets with their labels and sizes, and the
+combinations the constraints exclude with their messages; `/health` gives
+the build served and how its sync goes. The page asks `/datasets` anew
+once `/health` names another dir.
 The test key the page sends allows 200 requests a second, shared by every
 visitor; the page keeps 8 in flight and asks a 429 of `/reverse` again
 after a pause, which its `/polygons` (of no rate limit) don't wait out, and

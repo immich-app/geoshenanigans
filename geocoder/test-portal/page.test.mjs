@@ -189,6 +189,8 @@ test('the link names a dataset per column, the points and the build', () => {
   assert.deepEqual(plain(parseLink(linkSearch({ datasets: ['smallest'], point: { lat: 1.000000123, lng: -2.5 }, build: null }))),
     { datasets: ['smallest'], points: [{ lat: 1.000000123, lng: -2.5 }], build: null });
   assert.equal(linkSearch({ datasets: [], point: null, build: null }), '');
+  assert.equal(parseLink('?d=smallest&b=2026-11-20-2').build, '2026-11-20-2');
+  assert.equal(linkSearch({ datasets: ['smallest'], point: null, build: '2026-11-20-2' }), '?d=smallest&b=2026-11-20-2');
 });
 
 test('a link keeps 4 columns and the points on the globe', () => {
@@ -330,12 +332,14 @@ test('every string and id of the manifest, and a link\'s dataset, is escaped whe
   assertEscaped(statusHtml({ status: 'unavailable', reason: '<img src=r>', sync: { running: '<b>r</b>', refused: [{ date: '<i>', version: 1, reason: '<script>', at: '' }], last_result: null } }));
 });
 
+// The build is the portal's dir of it (X-Geocoder-Build-Dir), which tells a
+// build published again under its date from the one before.
 test('an answer keeps the dataset and build that answered and the time it took', () => {
   const { answerOf } = core();
-  const headers = { 'x-geocoder-build': '2026-11-20', 'x-geocoder-dataset': 'full.simplified.all' };
+  const headers = { 'x-geocoder-build': '2026-11-20', 'x-geocoder-build-dir': '2026-11-20-2', 'x-geocoder-dataset': 'full.simplified.all' };
   const header = (name) => headers[name.toLowerCase()] ?? null;
   assert.deepEqual(plain(answerOf(200, header, '{"display_name":"Paris"}', 12.4)),
-    { data: { display_name: 'Paris' }, build: '2026-11-20', dataset: 'full.simplified.all', ms: 12.4 });
+    { data: { display_name: 'Paris' }, build: '2026-11-20-2', dataset: 'full.simplified.all', ms: 12.4 });
   const refused = answerOf(400, () => null, 'dataset admin-minimal.exact.none is not offered: x', 2);
   assert.equal(refused.error, 'HTTP 400: dataset admin-minimal.exact.none is not offered: x');
   assert.equal(refused.data, undefined);
@@ -382,6 +386,16 @@ test('the detail shows per answer its dataset, build, sizes and time, and flags 
   assert.equal(out.match(/class="tag stale"/g).length, 1);
   assert.match(out, /<tr class="differs">\s*<td[^>]*>city<\/td>/);
   assert.ok(out.includes('loading-spinner'));
+
+  // Of the builds of one date, the one published before is another; a date
+  // alone (an answer saved before builds were named by their dir) is any.
+  const republished = detailHtml([
+    { label: 'before', color: '#111', dataset, answer: answer('Paris', '2026-11-20-1') },
+    { label: 'now', color: '#222', dataset, answer: answer('Paris', '2026-11-20-2') },
+    { label: 'saved', color: '#333', dataset, answer: answer('Paris', '2026-11-20') },
+  ], '2026-11-20-2');
+  assert.match(republished, /class="tag stale"[^>]*>build 2026-11-20-1, not 2026-11-20-2/);
+  assert.equal(republished.match(/class="tag stale"/g).length, 1, republished);
 });
 
 test('a card names the first answer and says when the columns differ', () => {
@@ -410,6 +424,13 @@ test('a link to a result names the oldest build that answered it in the columns'
   assert.equal(linkBuild(answers, ['full.simplified.all'], '2026-11-21'), '2026-11-20');
   assert.equal(linkBuild(answers, ['admin.simplified.major', 'no-addresses.exact.none'], '2026-11-21'), '2026-11-21');
   assert.equal(linkBuild({ '': { data: {} } }, [''], null), null);
+  const republished = {
+    a: { data: {}, build: '2026-11-20-10' },
+    b: { data: {}, build: '2026-11-20-9' },
+    c: { data: {}, build: '2026-11-21-1' },
+  };
+  assert.equal(linkBuild(republished, ['a', 'b', 'c'], '2026-11-21-1'), '2026-11-20-9');
+  assert.equal(linkBuild(republished, ['a', 'c'], '2026-11-21-1'), '2026-11-20-10');
 });
 
 test('a link of another build than the one served is flagged', () => {
@@ -420,6 +441,28 @@ test('a link of another build than the one served is flagged', () => {
   assert.equal(mismatchHtml(null, '2026-11-20'), '');
   assert.equal(mismatchHtml('2026-11-19', null), '');
   assertEscaped(mismatchHtml('<img src=x>', '2026-11-20'));
+  const republished = mismatchHtml('2026-11-20-1', '2026-11-20-2');
+  assert.ok(republished.includes('build 2026-11-20-1') && republished.includes('build 2026-11-20-2'), republished);
+  assert.equal(mismatchHtml('2026-11-20-2', '2026-11-20-2'), '');
+  assert.equal(mismatchHtml('2026-11-20', '2026-11-20-2'), '');
+  assert.ok(mismatchHtml('2026-11-19', '2026-11-20-2').includes('2026-11-19'));
+});
+
+// /health names the build served by its dir: once that is another than the
+// one the columns are of (a build published again under its date among
+// them), or one is served while the page waits for a build, the page loads
+// /datasets anew.
+test('the page loads the datasets anew once /health names another build', () => {
+  const { catalogStale } = core();
+  const c = catalog();
+  const health = (dir) => ({ status: 'ok', build: { date: dir.slice(0, 10), version: 24, dir }, datasets: 28, sync: {} });
+  assert.equal(catalogStale(health('2026-11-20-1'), 'catalog', c), false);
+  assert.equal(catalogStale(health('2026-11-20-2'), 'catalog', c), true);
+  assert.equal(catalogStale(health('2026-11-21-1'), 'catalog', c), true);
+  assert.equal(catalogStale(health('2026-11-20-1'), 'waiting', null), true);
+  assert.equal(catalogStale({ status: 'unavailable', reason: 'no build to serve', sync: {} }, 'waiting', null), false);
+  assert.equal(catalogStale(null, 'catalog', c), false);
+  assert.equal(catalogStale(health('2026-11-20-2'), 'single', null), false);
 });
 
 test('the status line tells the build served and how the sync goes', () => {
@@ -430,7 +473,7 @@ test('the status line tells the build served and how the sync goes', () => {
     refused: [{ date: '2026-11-21', version: 25, reason: 'build version 25, not 24', at: '2026-11-21T07:00:00Z' }],
   };
   const ok = statusHtml({ status: 'ok', build: { date: '2026-11-20', version: 24, dir: '2026-11-20-1' }, datasets: 28, sync });
-  for (const text of ['build 2026-11-20 (v24) · 28 datasets', 'last sync 2026-11-20 07:12:03 UTC: ok: serving 2026-11-20-1', 'next 2026-11-20 08:12:03 UTC',
+  for (const text of ['build 2026-11-20-1 (v24) · 28 datasets', 'last sync 2026-11-20 07:12:03 UTC: ok: serving 2026-11-20-1', 'next 2026-11-20 08:12:03 UTC',
     'latest 2026-11-21', 'refused 2026-11-21 (v25): build version 25, not 24']) {
     assert.ok(ok.includes(text), `${text}: ${ok}`);
   }

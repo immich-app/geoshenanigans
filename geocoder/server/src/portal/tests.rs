@@ -1486,6 +1486,35 @@ async fn a_request_without_a_dataset_answers_with_addresses() {
     assert!(unknown.body.starts_with("unknown dataset \"everything\": this build offers the presets smallest, immich-recommended, with-addresses, max-quality and "), "{}", unknown.body);
 }
 
+// A lookup's headers name the build that answered by its date and by its
+// dir, which /health and /datasets name too: a build published again under
+// its date is another, in a dir of its own, and they name that once it is
+// served.
+#[tokio::test]
+async fn the_headers_health_and_datasets_name_the_build_served_by_its_dir() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let p = portal(data.path(), config(&bucket, load));
+    p.round(true).await.unwrap();
+    let url = serve(router(p.clone(), db())).await;
+
+    for dir in [format!("{DATE}-1"), format!("{DATE}-2")] {
+        if dir.ends_with("-2") {
+            bucket.edit_build(DATE, |m| m["presets"][2]["label"] = "With street addresses, corrected".into());
+            assert_eq!(p.round(false).await, Ok(format!("build {DATE} is served ({dir})")));
+        }
+        for route in ["reverse", "polygons"] {
+            let got = fetch(&format!("{url}/{route}?lat=10.5&lon=20.5&key=test")).await;
+            assert_eq!((got.header("x-geocoder-build"), got.header("x-geocoder-build-dir")), (Some(DATE), Some(dir.as_str())), "{route}");
+            let exposed = got.header("access-control-expose-headers").unwrap_or_default();
+            assert!(exposed.split(", ").any(|h| h == "x-geocoder-build-dir"), "{route}: {exposed}");
+        }
+        assert_eq!(fetch(&format!("{url}/health")).await.json()["build"]["dir"], dir);
+        assert_eq!(fetch(&format!("{url}/datasets")).await.json()["build"]["dir"], dir);
+    }
+}
+
 // An object whose fetch fails is fetched again after each pause; one that
 // fails each time fails the round, which leaves its dir to the next to
 // resume.

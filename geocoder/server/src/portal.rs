@@ -307,7 +307,9 @@ struct Params {
 /// thread once a place of the portal's lookups is free (Portal::lookups):
 /// a lookup that waits on cold pages holds up no other request, and at most
 /// Config::lookups_at_once run. A lookup holds its place until it ends, even
-/// once its client has gone. Named by the headers X-Geocoder-Build and
+/// once its client has gone. Named by the headers X-Geocoder-Build (the
+/// build's date), X-Geocoder-Build-Dir (its dir, as /health and /datasets
+/// name it: a build published again under its date is another) and
 /// X-Geocoder-Dataset.
 async fn lookup(portal: &Portal, served: Arc<Served>, at: usize, answer: impl FnOnce(&MultiIndex) -> Response + Send + 'static) -> Response {
     let Ok(place) = portal.lookups.clone().acquire_owned().await else {
@@ -327,10 +329,13 @@ async fn lookup(portal: &Portal, served: Arc<Served>, at: usize, answer: impl Fn
     if let Ok(build) = axum::http::HeaderValue::from_str(&served.plan.date) {
         h.insert("x-geocoder-build", build);
     }
+    if let Ok(dir) = axum::http::HeaderValue::from_str(&served.dir) {
+        h.insert("x-geocoder-build-dir", dir);
+    }
     if let Ok(dataset) = axum::http::HeaderValue::from_str(&served.plan.datasets[at].id) {
         h.insert("x-geocoder-dataset", dataset);
     }
-    h.insert("access-control-expose-headers", "x-geocoder-build, x-geocoder-dataset".parse().unwrap());
+    h.insert("access-control-expose-headers", "x-geocoder-build, x-geocoder-build-dir, x-geocoder-dataset".parse().unwrap());
     resp
 }
 

@@ -498,10 +498,34 @@ function onGlobe(lat, lng) {
   return Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180;
 }
 
+// -- Builds --
+// A build as the page names it: the portal's dir of it, <date>-<n> (the
+// build of a date as it was published: a rerun of the nightly that
+// publishes the date again makes another), or a date alone (a link's b=,
+// or an answer saved, before builds were named by their dir), which stands
+// for any build of its date.
+function buildParts(build) {
+  const m = /^(\d{4}-\d{2}-\d{2})(?:-(\d+))?$/.exec(String(build));
+  return m ? { date: m[1], n: m[2] === undefined ? null : Number(m[2]) } : { date: String(build), n: null };
+}
+
+// Whether `a` and `b` name one build.
+function sameBuild(a, b) {
+  const [x, y] = [buildParts(a), buildParts(b)];
+  return x.date === y.date && (x.n === null || y.n === null || x.n === y.n);
+}
+
+// The order of builds: by date, then dir (a date alone first).
+function buildOrder(a, b) {
+  const [x, y] = [buildParts(a), buildParts(b)];
+  if (x.date !== y.date) return x.date < y.date ? -1 : 1;
+  return (x.n ?? -1) - (y.n ?? -1);
+}
+
 // -- The link --
 // ?d=<dataset> for each column (a preset's id, or <mode>.<quality>.<poi_tier>),
-// at=<lat>,<lon> for each point to look up, and b=<date>, the build the
-// answers came from.
+// at=<lat>,<lon> for each point to look up, and b=<build>, the build the
+// answers came from (its dir; a date alone still opens).
 function parseLink(search) {
   const q = new URLSearchParams(search);
   const points = [];
@@ -519,7 +543,7 @@ function parseLink(search) {
 // `served` (answers saved, or asked before the build changed), so that a
 // link to answers the server no longer gives is flagged; else `served`.
 function linkBuild(answers, keys, served) {
-  const builds = keys.map((key) => answers[key] && answers[key].build).filter(Boolean).sort();
+  const builds = keys.map((key) => answers[key] && answers[key].build).filter(Boolean).sort(buildOrder);
   return builds.length ? builds[0] : served;
 }
 
@@ -537,6 +561,16 @@ function linkSearch({ datasets = [], point = null, build = null }) {
 function catalogMode(status, json) {
   if (status === 200) return json && Array.isArray(json.datasets) && Array.isArray(json.axes) ? 'catalog' : 'single';
   return status === 404 || status === 405 ? 'single' : 'waiting';
+}
+
+// Whether /health's `health` names a build served other than the one the
+// page's datasets (`catalog`, in `mode`) are of, a build published again
+// under its date among them, or one at all while the page waits for one:
+// the page then asks /datasets anew.
+function catalogStale(health, mode, catalog) {
+  const dir = health && health.build ? health.build.dir : null;
+  if (!dir) return false;
+  return mode === 'waiting' || (mode === 'catalog' && dir !== catalog.build.dir);
 }
 
 // -- Columns --
@@ -634,10 +668,10 @@ function selectionLabel(catalog, selection) {
 // -- Answers --
 // An answer as the page keeps it, from a response of the server: its JSON
 // (data) or why there is none (error), the build and the dataset that
-// answered (X-Geocoder-Build and X-Geocoder-Dataset, which the portal
-// sends), and the ms it took.
+// answered (X-Geocoder-Build-Dir, the portal's dir of the build, and
+// X-Geocoder-Dataset), and the ms it took.
 function answerOf(status, header, body, ms) {
-  const build = header('x-geocoder-build');
+  const build = header('x-geocoder-build-dir');
   const dataset = header('x-geocoder-dataset');
   if (status !== 200) return { error: `HTTP ${status}${body ? `: ${body.slice(0, 300)}` : ''}`, build, dataset, ms };
   try {
@@ -810,8 +844,9 @@ function pickerHtml(catalog, col, index, count) {
 // The detail of a result, from `views`: one a column ({label, color,
 // dataset, answer}), and Nominatim's. Per answer its name, dataset, build,
 // time and sizes, flagged where a build other than the one `served`
-// answered; the address fields side by side, those the answers disagree on
-// or lack marked; the places, those not in every answer marked; the JSON.
+// answered (sameBuild: one published before it under its date among them);
+// the address fields side by side, those the answers disagree on or lack
+// marked; the places, those not in every answer marked; the JSON.
 function detailHtml(views, served) {
   const grid = `display:grid;grid-template-columns:repeat(${views.length},minmax(0,1fr));gap:12px`;
   let html = `<div style="${grid};margin-bottom:12px">`;
@@ -824,7 +859,7 @@ function detailHtml(views, served) {
     if (Number.isFinite(a.ms)) meta.push(`${Math.round(a.ms)} ms`);
     if (meta.length) html += `<div class="answer-meta">${meta.join(' · ')}</div>`;
     if (v.dataset) html += `<div class="answer-meta">${formatSize(v.dataset.size_disk)} on disk · ${formatSize(v.dataset.size_download)} download</div>`;
-    if (a.build && served && a.build !== served) {
+    if (a.build && served && !sameBuild(a.build, served)) {
       html += `<span class="tag stale" title="The server serves build ${esc(served)} now: Re-test asks it again">build ${esc(a.build)}, not ${esc(served)}</span>`;
     }
     if (a.loading) html += '<div class="answer-name"><span class="loading-spinner"></span>Loading…</div>';
@@ -944,13 +979,13 @@ function storedResult(r) {
   return { id: r.id, lat: r.lat, lng: r.lng, source: r.source || null, answers, nominatim: r.nominatim || null };
 }
 
-// The status line from the portal's /health: the build served (or why
-// none), how the sync goes, and the builds it refused.
+// The status line from the portal's /health: the build served (by its
+// dir, or why none), how the sync goes, and the builds it refused.
 function statusHtml(health) {
   if (!health || typeof health !== 'object' || !health.sync) return '';
   const s = health.sync;
   const parts = [];
-  if (health.build) parts.push(`build ${esc(health.build.date)} (v${esc(health.build.version)}) · ${esc(health.datasets)} datasets`);
+  if (health.build) parts.push(`build ${esc(health.build.dir)} (v${esc(health.build.version)}) · ${esc(health.datasets)} datasets`);
   else if (health.reason) parts.push(`<span class="warn">${esc(health.reason)}</span>`);
   if (s.running) {
     let running = `sync: ${esc(s.running)}`;
@@ -968,9 +1003,10 @@ function statusHtml(health) {
   return parts.join(' · ');
 }
 
-// The flag of a link made on a build (b=) other than the one served.
+// The flag of a link made on a build (b=) other than the one served
+// (sameBuild).
 function mismatchHtml(linkBuild, served) {
-  if (!linkBuild || !served || linkBuild === served) return '';
+  if (!linkBuild || !served || sameBuild(linkBuild, served)) return '';
   return `This link was made on build ${esc(linkBuild)}; the server serves build ${esc(served)} now, whose answers may differ.`;
 }
 
@@ -1076,8 +1112,10 @@ const pacer = new Pacer({ fetch: (url) => fetch(url), now: () => performance.now
 // Nominatim's public API is asked one request at a time.
 const nominatimPacer = new Pacer({ limit: 1, fetch: (url) => fetch(url), now: () => performance.now() });
 
+// The build served, by its dir: a build published again under its date is
+// another.
 function servedBuild() {
-  return catalog ? catalog.build.date : null;
+  return catalog ? catalog.build.dir : null;
 }
 
 // The key a column's answers are kept by: its dataset's id ('' for the one
@@ -1257,15 +1295,15 @@ function copyLink(btn) {
 
 // -- Status --
 // The portal's /health, every minute (every 5 s while a sync runs): the
-// status line, and the datasets anew once another build is served.
+// status line, and the datasets anew once another build is served
+// (catalogStale).
 async function pollHealth() {
   let health = null;
   try {
     health = await (await fetch('/health')).json();
   } catch (e) {}
   document.getElementById('status').innerHTML = statusHtml(health);
-  const build = health && health.build ? health.build.date : null;
-  if (build && (mode === 'waiting' || (mode === 'catalog' && build !== catalog.build.date))) await loadCatalog();
+  if (catalogStale(health, mode, catalog)) await loadCatalog();
   setTimeout(pollHealth, health && health.sync && health.sync.running ? 5000 : 60000);
 }
 
