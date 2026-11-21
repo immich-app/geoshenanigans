@@ -732,9 +732,10 @@ test("Nominatim's column shows its answer, its request in flight, or why it fail
 });
 
 // The page before the dataset columns saved a result's answer of its server
-// as data (or error) and that of the minimal one as minimal: they are those
-// of with-addresses and smallest. A failed one is asked again.
-test('a saved result keeps its answers, those the page saved before the dataset columns too', () => {
+// as data (or error) and that of the minimal one as minimal, of datasets it
+// did not record: they go, and the columns are asked again. The point and
+// Nominatim's answer stay.
+test('a saved result keeps its answers; one the page saved before the dataset columns keeps its point', () => {
   const { storedResult } = core();
   const now = { id: 'a', lat: 1, lng: 2, source: 'map click', nominatim: null,
     answers: { 'admin.simplified.major': { data: { display_name: 'Paris' }, build: '2026-11-20', dataset: 'admin.simplified.major', ms: 3 } } };
@@ -742,12 +743,31 @@ test('a saved result keeps its answers, those the page saved before the dataset 
   const before = { id: 1763600000000, lat: 48.85, lng: 2.29, data: { display_name: 'Paris' }, nominatim: { display_name: 'Paris, France' },
     minimal: { display_name: 'France' }, source: 'IMG_1.jpg' };
   assert.deepEqual(plain(storedResult(before)), {
-    id: 1763600000000, lat: 48.85, lng: 2.29, source: 'IMG_1.jpg', nominatim: { display_name: 'Paris, France' },
-    answers: { 'full.simplified.all': { data: { display_name: 'Paris' } }, 'admin-minimal.simplified.none': { data: { display_name: 'France' } } },
+    id: 1763600000000, lat: 48.85, lng: 2.29, source: 'IMG_1.jpg', nominatim: { display_name: 'Paris, France' }, answers: {},
   });
   assert.deepEqual(plain(storedResult({ id: 2, lat: 1, lng: 2, data: null, minimal: null, error: 'HTTP 503' }).answers), {});
   assert.equal(storedResult({ id: 3, lat: 91, lng: 0, answers: {} }), null);
   assert.equal(storedResult(null), null);
+});
+
+// The answers of a column no longer shown are saved too: each keeps the
+// build that gave it, which a link to the result names and the detail
+// flags. One being asked is not.
+test('a result is saved with every answer it has but those being asked, and read back as it was', () => {
+  const { savedResult, storedResult } = core();
+  const entry = { id: 'a', lat: 1, lng: 2, source: 'map click', nominatim: { display_name: 'Paris, France' }, nominatimLoading: false, nominatimError: null,
+    answers: {
+      'full.simplified.all': { data: { display_name: 'Paris' }, build: '2026-11-20-1', dataset: 'full.simplified.all', ms: 3 },
+      'admin.simplified.major': { data: { display_name: 'Paris' }, build: '2026-11-19-1', dataset: 'admin.simplified.major', ms: 4 },
+      'admin-minimal.simplified.none': { error: 'HTTP 502: Bad Gateway', build: null, dataset: null, ms: 1 },
+      'no-addresses.exact.none': { loading: true, pending: Promise.resolve() },
+    } };
+  const saved = JSON.parse(JSON.stringify(savedResult(entry)));
+  assert.deepEqual(saved, {
+    id: 'a', lat: 1, lng: 2, source: 'map click', nominatim: { display_name: 'Paris, France' },
+    answers: Object.fromEntries(Object.entries(entry.answers).filter(([key]) => key !== 'no-addresses.exact.none')),
+  });
+  assert.deepEqual(plain(storedResult(saved)), saved);
 });
 
 test('the polygon overlay cycles off, each column, off', () => {

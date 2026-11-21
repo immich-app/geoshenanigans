@@ -1012,19 +1012,23 @@ function nominatimView(entry) {
   return { label: 'Nominatim', color: NOMINATIM_COLOR, dataset: null, answer };
 }
 
-// A result as saveResults saved it, as the page keeps it; none for a point
+// A result as the page saves it: its point, where it came from, Nominatim's
+// answer and every answer of the columns, those of a column no longer shown
+// too (each keeps the build that gave it), but none being asked.
+function savedResult(r) {
+  return {
+    id: r.id, lat: r.lat, lng: r.lng, source: r.source, nominatim: r.nominatim || null,
+    answers: Object.fromEntries(Object.entries(r.answers).filter(([, a]) => a && !a.loading)),
+  };
+}
+
+// A result as savedResult saved it, as the page keeps it; none for a point
 // off the globe. The page before the dataset columns saved the answer of its
-// server as `data` and that of the minimal one as `minimal`: they are those
-// of with-addresses and smallest. Its errors are not kept: those columns
-// are asked again.
+// server as `data` and that of the minimal one as `minimal`, of datasets it
+// did not record: those go, and the columns are asked again.
 function storedResult(r) {
   if (!r || !onGlobe(r.lat, r.lng)) return null;
-  let answers = r.answers;
-  if (!answers || typeof answers !== 'object') {
-    answers = {};
-    if (r.data) answers['full.simplified.all'] = { data: r.data };
-    if (r.minimal) answers['admin-minimal.simplified.none'] = { data: r.minimal };
-  }
+  const answers = r.answers && typeof r.answers === 'object' ? r.answers : {};
   return { id: r.id, lat: r.lat, lng: r.lng, source: r.source || null, answers, nominatim: r.nominatim || null };
 }
 
@@ -1410,15 +1414,9 @@ async function pollHealth() {
 // -- LocalStorage persistence --
 const STORAGE_KEY = 'geocoder_test_results';
 
-// The results with their answers of the columns shown (any, while there is
-// no catalog), Nominatim's and where each point came from.
+// The results, each as savedResult saves it. Clear empties them.
 function saveResults() {
-  const keep = mode === 'catalog' ? new Set(columns.map(columnKey)) : null;
-  const stored = results.map((r) => ({
-    id: r.id, lat: r.lat, lng: r.lng, source: r.source, nominatim: r.nominatim || null,
-    answers: Object.fromEntries(Object.entries(r.answers).filter(([key, a]) => a && !a.loading && (!keep || keep.has(key)))),
-  }));
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(stored)); } catch(e) {}
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(results.map(savedResult))); } catch(e) {}
 }
 
 function loadResults() {
