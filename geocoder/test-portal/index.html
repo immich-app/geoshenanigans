@@ -1078,10 +1078,8 @@ function statusHtml(health) {
   if (!health || typeof health !== 'object' || !health.sync) return '';
   const s = health.sync;
   const parts = [];
-  if (health.build) {
-    const b = health.build;
-    parts.push(`build ${esc(b.id)} (v${esc(b.version)}, dir ${esc(b.dir)}) · ${esc(health.datasets)} datasets`);
-  }
+  const b = health.build;
+  if (b) parts.push(`build ${esc(b.id)} (v${esc(b.version)}, dir ${esc(b.dir)}) · ${esc(health.datasets)} datasets`);
   else if (health.reason) parts.push(`<span class="warn">${esc(health.reason)}</span>`);
   if (s.running) {
     let running = `sync: ${esc(s.running)}`;
