@@ -25,9 +25,11 @@ ADMIN_GEOMETRY = ["admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc
 
 # Stands in for place-search: `build <set> <out> ...` records its arguments and what the set dir
 # held (name -> link target) and writes the index files, then fails for a set path containing
-# $FAIL_SET.
+# $FAIL_SET, hangs for one containing $HANG_SET, and for one containing $KILL_SET kills the
+# build_search_indexes.py that runs it (SIGTERM, half a second in).
 FAKE = """#!{python}
 import json, os, sys
+supervisor = os.getppid()
 _, cmd, set_dir, out, *rest = sys.argv
 os.makedirs(out)
 held = {{n: os.readlink(os.path.join(set_dir, n)) for n in os.listdir(set_dir)}}
@@ -40,6 +42,13 @@ if os.environ.get("FAIL_SET") and os.environ["FAIL_SET"] in set_dir:
 if os.environ.get("HANG_SET") and os.environ["HANG_SET"] in set_dir:
     import time
     time.sleep(600)
+if os.environ.get("KILL_SET") and os.environ["KILL_SET"] in set_dir and supervisor > 1:
+    import signal, time
+    time.sleep(0.5)
+    try:
+        os.kill(supervisor, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
 """
 JOB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "place_search_indexes.sh")
 
@@ -163,6 +172,10 @@ class PlaceSearchJobTest(unittest.TestCase):
     def index_dir(self, region, sel):
         return os.path.join(self.out, sut.substitute(self.cfg["search_index"]["dir"], dict(sel, region=region)))
 
+    def scratch_left(self):
+        """What the job left in its TMPDIR beside the test's own files."""
+        return sorted(set(os.listdir(self.tmp.name)) - {"output", "place-search", "search.status"})
+
     def test_builds_the_indexes_once_place_search_is_built(self):
         self.write_output(["planet", "europe"])
 
@@ -173,6 +186,7 @@ class PlaceSearchJobTest(unittest.TestCase):
             for sel in self.cfg["search_index"]["shipped"]:
                 self.assertEqual(self.call(region, sel)["cmd"], "build")
         self.assertRegex(out, r"Place search indexes done in \d+s")
+        self.assertEqual(self.scratch_left(), [])
 
     def test_without_place_search_it_builds_nothing_and_fails(self):
         self.write_output(["planet"])
@@ -194,7 +208,8 @@ class PlaceSearchJobTest(unittest.TestCase):
             self.assertFalse(os.path.exists(self.index_dir("europe", sel)))
 
     # A build that hangs is stopped at the limit, and the indexes it may have left half-written go with it: their
-    # clients build theirs on the device.
+    # clients build theirs on the device. Its scratch goes too, though the stopped build_search_indexes.py removes
+    # none: the patch jobs beside it start only in the free space it would hold.
     def test_a_build_past_the_limit_is_stopped_and_leaves_no_index(self):
         self.write_output(["planet", "europe"])
 
@@ -205,6 +220,20 @@ class PlaceSearchJobTest(unittest.TestCase):
         self.assertIn("were stopped", out)
         for region in ("planet", "europe"):
             self.assertFalse(os.path.exists(os.path.join(self.out, region, "search")), region)
+        self.assertEqual(self.scratch_left(), [])
+
+    # So does one a signal ended within the limit: compression takes whatever search files there are on any status.
+    # One build at a time (a CPU), so that none runs on once the signal has ended the rest.
+    def test_a_build_a_signal_ended_leaves_no_index(self):
+        self.write_output(["planet", "europe"])
+
+        code, out, _ = self.run_job("0\n", env={**fake_cpus(self, 1), "KILL_SET": "/europe/"})
+
+        self.assertEqual(code, 128 + 15, out)
+        self.assertIn("ended by signal 15", out)
+        for region in ("planet", "europe"):
+            self.assertFalse(os.path.exists(os.path.join(self.out, region, "search")), region)
+        self.assertEqual(self.scratch_left(), [])
 
 
 def load_template():
