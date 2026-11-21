@@ -681,8 +681,9 @@ async fn a_build_the_volume_holds_damaged_is_fetched_again_before_it_is_served_a
 
 // /datasets lists the 28 planet selections the constraints allow, in the
 // axes' order, each with its label, description, preset, values and sizes
-// (the manifest's sums), the presets with theirs, and the 4 combinations
-// the constraint excludes, each with the constraint's message and what it
+// (the manifest's sums), the presets with their labels and descriptions,
+// the axes and their values with theirs, and the 4 combinations the
+// constraint excludes, each with the constraint's message and what it
 // requires.
 #[tokio::test]
 async fn datasets_lists_the_28_offered_and_the_combinations_the_constraints_exclude() {
@@ -705,6 +706,10 @@ async fn datasets_lists_the_28_offered_and_the_combinations_the_constraints_excl
     let presets: Vec<(&str, &str)> = json["presets"].as_array().unwrap().iter().map(|p| (p["id"].as_str().unwrap(), p["dataset"].as_str().unwrap())).collect();
     assert_eq!(presets, [("smallest", "admin-minimal.simplified.none"), ("immich-recommended", "admin.simplified.major"),
                          ("with-addresses", "full.simplified.all"), ("max-quality", "full.exact.all")]);
+    for (got, want) in json["presets"].as_array().unwrap().iter().zip(t["presets"].as_array().unwrap()) {
+        assert_eq!((&got["label"], &got["description"]), (&want["label"], &want["description"]), "preset {}", want["id"]);
+        assert!(want["label"].is_string() && want["description"].is_string(), "preset {}", want["id"]);
+    }
     let dataset = |id: &str| datasets.iter().find(|d| d["id"] == id).unwrap().clone();
     let with_addresses = &t["presets"].as_array().unwrap()[2];
     assert_eq!(dataset("full.simplified.all")["label"], with_addresses["label"]);
@@ -743,7 +748,17 @@ async fn datasets_lists_the_28_offered_and_the_combinations_the_constraints_excl
     assert_eq!(axes, [("region", vec!["planet"]), ("mode", values("mode").iter().map(String::as_str).collect()),
                       ("quality", values("quality").iter().map(String::as_str).collect()),
                       ("poi_tier", values("poi_tier").iter().map(String::as_str).collect())]);
-    assert_eq!(json["axes"][1]["values"][0]["label"], t["axes"]["mode"]["values"]["full"]["label"]);
+    for axis in json["axes"].as_array().unwrap() {
+        let want = &t["axes"][axis["id"].as_str().unwrap()];
+        assert_eq!((&axis["label"], &axis["description"]), (&want["label"], &want["description"]), "axis {}", axis["id"]);
+        assert!(want["label"].is_string() && want["description"].is_string(), "axis {}", axis["id"]);
+        for value in axis["values"].as_array().unwrap() {
+            let of = &want["values"][value["id"].as_str().unwrap()];
+            assert_eq!((&value["label"], &value["description"]), (&of["label"], &of["description"]), "{} {}", axis["id"], value["id"]);
+            assert!(of["label"].is_string(), "{} {}", axis["id"], value["id"]);
+        }
+    }
+    assert!(t["axes"]["mode"]["values"]["full"]["description"].is_string());
 }
 
 // The lookups run a few at once over every client, each on a blocking
