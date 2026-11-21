@@ -177,6 +177,42 @@ fn values<'a>(manifest: &'a Manifest, axis: &str) -> Result<Vec<(&'a String, &'a
     Ok(values)
 }
 
+/// Whether `name` is a plain name: ASCII letters, digits, '.', '-' and
+/// '_', starting with none of '.' and not ending in ".tmp". A part of a
+/// path that is one is no '.' or '..', none of the hidden names the sync
+/// and the decoder keep of their own in a build dir (.fetched, .complete,
+/// .transport.<pid>.<n>), and no temporary file's (a download's, or
+/// write_whole's).
+pub fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.ends_with(".tmp")
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
+/// Whether `value` can be an axis value of a dataset's id, whose values the
+/// id joins with '.': ASCII letters, digits, '-' and '_'.
+fn plain_value(value: &str) -> bool {
+    !value.is_empty() && value.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+}
+
+/// Whether the sync can keep a file, or decode a unit, at `path` in a build
+/// dir for a dataset of `region`: the region's dir, then one or more plain
+/// names. Such a path stays in the build dir, under the region's dir, so
+/// that it meets none of the build dir's own names (its manifest, sets/,
+/// the ledger); else why not.
+fn check_path(path: &str, region: &str) -> Result<(), String> {
+    let Some(rest) = path.strip_prefix(region).and_then(|r| r.strip_prefix('/')) else {
+        return Err(format!("the path {path:?} is not under {region}/"));
+    };
+    match rest.split('/').find(|part| !plain_name(part)) {
+        Some(part) => Err(format!(
+            "the path {path:?} has the part {part:?}, which is not a plain name (letters, digits, '.', '-' and '_', starting with none of '.' and not ending in .tmp)"
+        )),
+        None => Ok(()),
+    }
+}
+
 /// The first constraint of `manifest` that `sel` breaks: it has every value
 /// the constraint's `when` names and lacks one its `requires` names.
 fn broken<'a>(manifest: &'a Manifest, sel: &RegionSelection) -> Option<&'a Constraint> {
@@ -187,10 +223,13 @@ fn broken<'a>(manifest: &'a Manifest, sel: &RegionSelection) -> Option<&'a Const
 /// The plan of the build `cfg` and `manifest` describe (one
 /// configurations.json): every selection of REGIONS, each axis's values in
 /// their order, the constraints rule out or the portal serves. An error,
-/// why, where one it serves doesn't resolve (downloader::resolve_files) or
-/// lacks a file the manifest must have, a preset of a region served names a
-/// selection it doesn't serve, or no preset is DEFAULT_PRESET: the build
-/// can't be served as the portal serves one.
+/// why, where an axis value or a dataset's id is no plain name (the id names
+/// the dataset's dir), one it serves doesn't resolve
+/// (downloader::resolve_files), lacks a file the manifest must have or
+/// takes a file, a unit or a unit's member at a path the sync can't keep in
+/// a build dir (check_path), a preset of a region served names a selection
+/// it doesn't serve, or no preset is DEFAULT_PRESET: the build can't be
+/// served as the portal serves one.
 pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
     let mut axes = Vec::new();
     for name in std::iter::once("region").chain(AXES) {
@@ -207,6 +246,11 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
     }
 
     let (modes, qualities, tiers) = (values(manifest, "mode")?, values(manifest, "quality")?, values(manifest, "poi_tier")?);
+    for (axis, values) in AXES.iter().zip([&modes, &qualities, &tiers]) {
+        if let Some((value, _)) = values.iter().find(|(value, _)| !plain_value(value)) {
+            return Err(format!("the manifest's {axis} value {value:?} is not a plain name (letters, digits, '-' and '_')"));
+        }
+    }
     let (mut datasets, mut excluded) = (Vec::new(), Vec::new());
     let mut objects: BTreeMap<String, Object> = BTreeMap::new();
     for region in REGIONS {
@@ -220,6 +264,9 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
                         poi_tier: tier.to_string(),
                     };
                     let id = dataset_id(&sel);
+                    if !plain_name(&id) {
+                        return Err(format!("the dataset id {id:?} is not a plain name"));
+                    }
                     if let Some(c) = broken(manifest, &sel) {
                         excluded.push(Excluded {
                             id, selection: sel, constraint: c.id.clone(), message: c.message.clone(), requires: c.requires.clone(),
@@ -230,6 +277,7 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
                     let mut files = Vec::new();
                     for path in &resolved.paths {
                         if cfg.files.contains_key(path) {
+                            check_path(path, region).map_err(|why| format!("{id}: {why}"))?;
                             files.push(path);
                         } else if !resolved.optional.contains(path) {
                             return Err(format!("{id}: {path} is not in the manifest"));
@@ -237,6 +285,9 @@ pub fn plan(cfg: &Configurations, manifest: &Manifest) -> Result<Plan, String> {
                     }
                     let fetches = downloader::fetches(cfg, &files).map_err(|e| format!("{id}: {e}"))?;
                     for fetch in &fetches {
+                        for path in std::iter::once(fetch.path()).chain(fetch.files().into_iter().map(|(path, _)| path)) {
+                            check_path(path, region).map_err(|why| format!("{id}: {why}"))?;
+                        }
                         // A unit decodes into its own dir.
                         let dir = |path: &str| path.rsplit_once('/').map(|(dir, _)| dir.to_string());
                         if fetch.files().iter().any(|(path, _)| dir(path) != dir(fetch.path())) {

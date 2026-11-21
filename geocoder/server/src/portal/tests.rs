@@ -452,6 +452,105 @@ fn template_ids() -> Vec<String> {
     template_selections().into_iter().filter(|(_, allowed)| *allowed).map(|(s, _)| catalog::dataset_id(&s)).collect()
 }
 
+/// Gives the manifest `m` the file `path`, as its own .zst, which mode
+/// full's component names as `listed`.
+fn add_file(m: &mut serde_json::Value, listed: &str, path: &str) {
+    m["components"]["mode.full"]["files"].as_array_mut().unwrap().push(listed.into());
+    m["files"][path] = serde_json::json!({ "size_zst": 10, "size_raw": 10, "sha256": "00" });
+}
+
+/// The plan of the bucket's build with its manifest as `edit` changes it.
+async fn plan_edited(bucket: &TestBucket, edit: impl FnOnce(&mut serde_json::Value)) -> Result<catalog::Plan, String> {
+    let bytes = reqwest::get(format!("{}/builds/{DATE}/{MANIFEST}", bucket.url)).await.unwrap().bytes().await.unwrap();
+    let mut m: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    edit(&mut m);
+    let (cfg, manifest) = sync::parse_manifest(m.to_string().as_bytes()).unwrap();
+    catalog::plan(&cfg, &manifest)
+}
+
+// The sync writes only in a build dir, at names of the build's own: a
+// manifest whose datasets take a file, a unit or a member whose path is not
+// the region's dir and then plain names (none absolute, empty, '.', '..',
+// hidden as the sync's and the decoder's own names are, a temporary file's
+// or of other characters), or whose axis value or dataset id is not one
+// plain name, can't be planned, and says why.
+#[tokio::test]
+async fn a_manifest_naming_a_path_or_a_name_the_sync_cant_keep_in_its_build_dir_cant_be_planned() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let plan = plan_edited(&bucket, |_| {}).await.unwrap();
+    let full = template_ids().into_iter().find(|id| id.starts_with("full.")).unwrap();
+    let plain = "which is not a plain name (letters, digits, '.', '-' and '_', starting with none of '.' and not ending in .tmp)";
+
+    for (listed, path, why) in [
+        ("{region}/../escape.bin", "planet/../escape.bin", format!("has the part \"..\", {plain}")),
+        ("{region}/./escape.bin", "planet/./escape.bin", format!("has the part \".\", {plain}")),
+        ("{region}//escape.bin", "planet//escape.bin", format!("has the part \"\", {plain}")),
+        ("/{region}/escape.bin", "/planet/escape.bin", "is not under planet/".to_string()),
+        ("europe/escape.bin", "europe/escape.bin", "is not under planet/".to_string()),
+        ("configurations.json", "configurations.json", "is not under planet/".to_string()),
+        ("{region}/full/.fetched", "planet/full/.fetched", format!("has the part \".fetched\", {plain}")),
+        ("{region}/full/.transport.1.1", "planet/full/.transport.1.1", format!("has the part \".transport.1.1\", {plain}")),
+        ("{region}/full/escape.bin.tmp", "planet/full/escape.bin.tmp", format!("has the part \"escape.bin.tmp\", {plain}")),
+        ("{region}/full/line\nbreak.bin", "planet/full/line\nbreak.bin", format!("has the part \"line\\nbreak.bin\", {plain}")),
+    ] {
+        let got = plan_edited(&bucket, |m| add_file(m, listed, path)).await.map(|_| ());
+        assert_eq!(got, Err(format!("{full}: the path {path:?} {why}")), "{path:?}");
+    }
+
+    // A unit of the first dataset, under a hidden name.
+    let first = &plan.datasets[0];
+    let unit = plan.objects.iter().find(|o| o.unit && first.files.contains(&o.files[0])).unwrap();
+    let hidden = unit.path.rsplit_once('/').map(|(dir, name)| format!("{dir}/.{name}")).unwrap();
+    let got = plan_edited(&bucket, |m| {
+        let entry = m["units"].as_object_mut().unwrap().remove(&unit.path).unwrap();
+        for f in &unit.files {
+            m["files"][f]["unit"] = hidden.clone().into();
+        }
+        m["units"][&hidden] = entry;
+    })
+    .await
+    .map(|_| ());
+    let part = hidden.rsplit('/').next().unwrap();
+    assert_eq!(got, Err(format!("{}: the path {hidden:?} has the part {part:?}, {plain}", first.id)));
+
+    for (axis, value) in [("mode", "../up"), ("mode", "a/b"), ("quality", "a.b"), ("poi_tier", "")] {
+        let got = plan_edited(&bucket, |m| m["axes"][axis]["values"][value] = serde_json::json!({ "label": "x", "order": 99 })).await.map(|_| ());
+        assert_eq!(got, Err(format!("the manifest's {axis} value {value:?} is not a plain name (letters, digits, '-' and '_')")), "{axis} {value:?}");
+    }
+    let got = plan_edited(&bucket, |m| m["axes"]["poi_tier"]["values"]["tmp"] = serde_json::json!({ "label": "x", "order": 99 })).await.map(|_| ());
+    let id = format!("{}.{}.tmp", template_values("mode")[0], template_values("quality")[0]);
+    assert_eq!(got, Err(format!("the dataset id {id:?} is not a plain name")));
+}
+
+// A build whose manifest names a path out of its build dir is refused,
+// with why: nothing of it is fetched or written, and the build served
+// stays.
+#[tokio::test]
+async fn a_build_naming_a_path_out_of_its_dir_is_refused_and_nothing_of_it_is_written() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let p = portal(data.path(), config(&bucket, load));
+    p.round(true).await.unwrap();
+    let fetched = bucket.requests().len();
+    let path = "planet/../../../escape.bin";
+    bucket.add_build(NEXT, BUILD_VERSION);
+    bucket.edit_build(NEXT, |m| add_file(m, "{region}/../../../escape.bin", path));
+    bucket.set_latest(NEXT, Some(BUILD_VERSION));
+
+    let done = p.round(false).await.unwrap();
+
+    let full = template_ids().into_iter().find(|id| id.starts_with("full.")).unwrap();
+    let why = format!("{full}: the path {path:?} has the part \"..\", which is not a plain name");
+    assert!(done.starts_with(&format!("refused build {NEXT}: {why}")), "{done}");
+    assert_eq!(p.status().refused.len(), 1);
+    assert!(p.status().refused[0].reason.starts_with(&why), "{:?}", p.status().refused);
+    assert_eq!(p.served().unwrap().dir, format!("{DATE}-1"));
+    assert_eq!(bucket.requests().len(), fetched);
+    assert_eq!(build_dirs(data.path()), [format!("{DATE}-1")]);
+    assert!(!data.path().join("escape.bin").exists());
+}
+
 // A portal with no build it can serve starts all the same: /health,
 // /datasets, /reverse and /polygons answer 503 with the reason, while its
 // rounds go on; once the bucket has a build of its version, it serves it.

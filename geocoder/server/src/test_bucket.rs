@@ -1,7 +1,8 @@
 //! A bucket of one build for the download tests, served on localhost:
 //! builds/latest.json, builds/<DATE>/configurations.json and every file as
 //! compress_index.py publishes it. A test can add builds of other dates and
-//! versions, of the same files (TestBucket::add_build), and move latest.json
+//! versions, of the same files (TestBucket::add_build), publish one again
+//! with its manifest changed (TestBucket::edit_build), and move latest.json
 //! to one (TestBucket::set_latest). The manifest's files table lists every
 //! path its components name, in each region of the template, each of bytes
 //! of its own: a dir's place, POI and arc files are a small dataset of that
@@ -90,6 +91,15 @@ impl TestBucket {
         let mut manifest: serde_json::Value = serde_json::from_str(&self.served.builds.lock().unwrap()[DATE]).unwrap();
         manifest["build"] = serde_json::json!({ "date": date, "version": version });
         self.served.builds.lock().unwrap().insert(date.to_string(), manifest.to_string());
+    }
+
+    /// Publishes the build of `date` again, its manifest as `edit` changes
+    /// it (a rerun of the nightly over a date's build).
+    pub fn edit_build(&self, date: &str, edit: impl FnOnce(&mut serde_json::Value)) {
+        let mut builds = self.served.builds.lock().unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_str(&builds[date]).unwrap();
+        edit(&mut manifest);
+        builds.insert(date.to_string(), manifest.to_string());
     }
 
     /// Has latest.json name the build of `date`, of build version
