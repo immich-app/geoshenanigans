@@ -444,6 +444,42 @@
   .search-dot-fill { width: 100%; height: 100%; border-radius: 50%; border: 1px solid rgba(0, 0, 0, 0.8); transition: transform 0.1s; }
   .search-dot.hover .search-dot-fill { transform: scale(1.7); border-color: #fff; }
 
+  /* The form of a report, in a dialog over the page. */
+  .feedback-dialog {
+    margin: auto;
+    width: min(520px, 94vw);
+    max-height: 90vh;
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 14px 16px;
+    font-size: 13px;
+  }
+  .feedback-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }
+  .feedback-dialog h3 { font-size: 13px; margin-bottom: 4px; }
+  .feedback-about { font-size: 11px; color: var(--text-dim); overflow-wrap: anywhere; margin-bottom: 8px; }
+  .feedback-dialog details { margin-bottom: 8px; font-size: 12px; }
+  .feedback-dialog .json-block { max-height: 200px; overflow-y: auto; }
+  .feedback-row { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }
+  .feedback-row span, .feedback-fields span { font-size: 11px; color: var(--text-dim); }
+  .feedback-fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px 10px; margin-bottom: 8px; }
+  .feedback-fields label { display: flex; flex-direction: column; gap: 2px; }
+  .feedback-dialog textarea, .feedback-dialog input:not([type]), .feedback-dialog select {
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 5px 6px;
+    font: inherit;
+  }
+  .feedback-dialog textarea { resize: vertical; }
+  .feedback-check { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+  .feedback-note { font-size: 11px; color: var(--text-dim); margin-bottom: 10px; }
+  .feedback-actions { display: flex; gap: 8px; }
+  .feedback-status { margin-top: 8px; font-size: 12px; }
+  .feedback-btn { margin-top: 4px; padding: 1px 8px; font-size: 11px; }
+
   @media (max-width: 800px) {
     .layout { flex-direction: column; }
     .map-panel { flex: 0 0 45vh; }
@@ -494,6 +530,7 @@
         <button id="nominatimBtn" class="tool" onclick="toggleNominatim()" title="Query Nominatim's public API for side-by-side comparison. Off by default — each query hits nominatim.openstreetmap.org so leave off unless you need the comparison.">Nominatim: Off</button>
         <button id="polygonsBtn" class="tool" onclick="togglePolygons()" title="Cycle the polygon overlay: Off, then the admin polygons of each column's dataset in turn. Use to compare which admin levels a smaller dataset drops.">Polygons: Off</button>
         <button id="linkBtn" class="tool" onclick="copyLink(this)" title="Copy a link to these columns, the selected point and the build that answered">Copy link</button>
+        <button id="feedbackBtn" class="tool" onclick="openGeneralFeedback()" title="Tell us what you think of the answers or the page" hidden>Feedback</button>
         <button id="retestBtn" onclick="retestAllResults()" style="padding:4px 12px;font-size:12px;background:var(--accent);color:#fff;border:none;border-radius:4px;cursor:pointer;">Re-test</button>
         <button onclick="clearResults()" style="padding:4px 12px;font-size:12px;background:var(--red);color:#fff;border:none;border-radius:4px;cursor:pointer;">Clear</button>
       </div>
@@ -507,10 +544,13 @@
   </div>
 </div>
 
+<dialog id="feedbackDialog" class="feedback-dialog"><form id="feedbackForm"></form></dialog>
+
 <script id="core">
 // The page's logic that reads no DOM: the link, the columns and the datasets
 // they name (the server's /datasets), the pacing of requests, the comparison
-// of answers, the place search and its matrix, and the HTML of each part.
+// of answers, the place search and its matrix, the reports of those who
+// disagree with an answer, and the HTML of each part.
 // page.test.mjs runs it in node.
 
 // At most this many dataset columns.
@@ -1172,7 +1212,8 @@ class PlaceSearch {
 // its request took and the time of the search in the server, and its index,
 // noted where an earlier column's is the same; its index queued or building
 // since when, with how many of the build's indexes /health (`health`) gives
-// ready; its index failed, and why; or why it has no answer.
+// ready; its index failed, and why; or why it has no answer. A dataset's
+// answer has a "Disagree?" button, named by its column (data-feedback-search).
 function searchHeadsHtml(views, health) {
   const groups = health && health.search && Array.isArray(health.search.groups) ? health.search.groups : null;
   let html = '<div class="search-heads">';
@@ -1203,7 +1244,9 @@ function searchHeadsHtml(views, health) {
       const same = views.findIndex((w, d) => d < c && w.answer && w.answer.results && w.answer.index === a.index);
       if (same >= 0) state += `, as ${same + 1}'s`;
     }
-    html += `<div class="search-head" style="border-left-color:${v.color}"><span style="color:${v.color}">${c + 1}</span> ${esc(v.label)}${state ? `: ${state}` : ''}</div>`;
+    const disagree = a && a.results && v.dataset
+      ? ` <button class="tool feedback-btn" data-feedback-search="${c}" title="Tell us what you expected this search to find">Disagree?</button>` : '';
+    html += `<div class="search-head" style="border-left-color:${v.color}"><span style="color:${v.color}">${c + 1}</span> ${esc(v.label)}${state ? `: ${state}` : ''}${disagree}</div>`;
   });
   return `${html}</div>`;
 }
@@ -1332,11 +1375,12 @@ const PLACES_WIDTH = 160;
 // sizes of its dataset in the build served, where that answered; the
 // address fields side by side, those the answers disagree on or lack
 // marked; the places, those not in every answer marked; the JSON, each
-// panel named by the place of its view (data-view).
+// panel named by the place of its view (data-view). An answer of a dataset
+// has a "Disagree?" button, named by the place of its view (data-feedback).
 function detailHtml(views, served) {
   const grid = `display:grid;grid-template-columns:repeat(${views.length},minmax(0,1fr));gap:12px`;
   let html = `<div style="${grid};margin-bottom:12px">`;
-  for (const v of views) {
+  for (const [i, v] of views.entries()) {
     const a = v.answer || {};
     html += `<div class="answer-head" style="border-top-color:${v.color}"><div class="answer-label" style="color:${v.color}">${esc(v.label)}</div>`;
     const meta = [];
@@ -1353,6 +1397,7 @@ function detailHtml(views, served) {
     else if (a.error) html += `<div class="result-error">${esc(a.error)}</div>`;
     else if (a.data) html += `<div class="answer-name">${a.data.display_name ? esc(a.data.display_name) : '—'}</div>`;
     else html += '<div class="answer-meta">not asked yet</div>';
+    if (v.dataset && a.data) html += `<button class="tool feedback-btn" data-feedback="${i}" title="Tell us what you expected here">Disagree?</button>`;
     html += '</div>';
   }
   html += '</div>';
@@ -1602,6 +1647,165 @@ class PolygonOverlay {
   }
 }
 
+// -- Feedback --
+// A report of someone who disagrees with an answer, as the portal's POST
+// /feedback takes it: what it is of (its target: a column's reverse answer,
+// its search's results, or the page), what they expected and their
+// comment, and the page's link as it was. The page's other script opens the
+// form in a dialog and sends it.
+
+// The most bytes of the answer in a report's JSON: a longer one goes as the
+// start of its JSON, a string, flagged answer_trimmed, so that a report
+// keeps within the portal's 16 KiB.
+const FEEDBACK_ANSWER_MAX = 8192;
+// The fields of an address a report can say it expected, by name, and their
+// labels.
+const FEEDBACK_FIELDS = [['name', 'Name'], ['road', 'Road'], ['house_number', 'House number'], ['city', 'City'], ['postcode', 'Postcode'], ['country', 'Country']];
+// The most characters of the form's texts and of each field.
+const FEEDBACK_TEXT_MAX = 2000;
+const FEEDBACK_FIELD_MAX = 200;
+
+// The start of `s` of at most `max` bytes of UTF-8, or where `escaped` of
+// its JSON string, its quotes left out: cut between characters.
+function byteStart(s, max, escaped) {
+  let bytes = 0;
+  let end = 0;
+  for (const ch of s) {
+    const c = ch.codePointAt(0);
+    const n = escaped && (ch === '"' || ch === '\\' || '\b\f\n\r\t'.includes(ch)) ? 2
+      : escaped && (c < 0x20 || (c >= 0xd800 && c <= 0xdfff)) ? 6
+      : c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+    if (bytes + n > max) break;
+    bytes += n;
+    end += ch.length;
+  }
+  return s.slice(0, end);
+}
+
+// What a report of a column's reverse answer (`view`, of the result
+// `entry`) is of: the column, the dataset and build that answered, the
+// point, and the JSON the detail shows.
+function reverseTarget(view, entry) {
+  const a = view.answer;
+  return {
+    kind: 'reverse', label: view.label, dataset: a.dataset || (view.dataset && view.dataset.id) || null, build: a.build || null,
+    point: { lat: entry.lat, lng: entry.lng }, q: null, results: null, answer: a.data,
+  };
+}
+
+// What a report of a column's search answer (`view`) to `q` is of: the
+// column, the dataset and build that answered, the search and its results,
+// one of which the form may name.
+function searchTarget(view, q) {
+  const a = view.answer;
+  return {
+    kind: 'search', label: view.label, dataset: a.dataset || (view.dataset && view.dataset.id) || null, build: a.build || null,
+    point: null, q, results: a.results, answer: a.results,
+  };
+}
+
+// What a general report is of: the page as the build `served` answers it,
+// at the selected result `entry`'s point where there is one.
+function generalTarget(entry, served) {
+  return {
+    kind: 'general', label: 'The page', dataset: null, build: served || null,
+    point: entry ? { lat: entry.lat, lng: entry.lng } : null, q: null, results: null, answer: null,
+  };
+}
+
+// The report of `target` from the form's values (`form`, by name: text, the
+// FEEDBACK_FIELDS, empty, comment, and a search's result: '' for its
+// results as a whole, else the index of one) and the page's link as it is
+// (`page`: the columns' tokens, the selected point and the search box's
+// text). Each text goes trimmed, one left empty as null; a search's report
+// is at the point of the result it names.
+function feedbackReport(target, form, page) {
+  const text = (v) => String(v ?? '').trim() || null;
+  const expected = { text: text(form.text) };
+  for (const [field] of FEEDBACK_FIELDS) expected[field] = text(form[field]);
+  expected.empty = Boolean(form.empty);
+  const index = target.kind === 'search' && form.result != null && form.result !== '' ? Number(form.result) : null;
+  const result = index === null ? null : target.results[index];
+  const point = result ? { lat: result.latitude, lng: result.longitude } : target.point;
+  let answer = target.answer ?? null;
+  let trimmed = false;
+  const json = JSON.stringify(answer);
+  if (byteStart(json, FEEDBACK_ANSWER_MAX, false) !== json) {
+    answer = byteStart(json, FEEDBACK_ANSWER_MAX, true);
+    trimmed = true;
+  }
+  return {
+    kind: target.kind,
+    lat: point ? point.lat : null,
+    lon: point ? point.lng : null,
+    q: target.q,
+    result_index: index,
+    dataset: target.dataset,
+    build: target.build,
+    answer,
+    answer_trimmed: trimmed,
+    expected,
+    comment: text(form.comment),
+    page: { columns: page.columns.slice(), point: page.point ? { lat: page.point.lat, lon: page.point.lng } : null, q: page.q || null },
+  };
+}
+
+// Whether `report` says what was expected (in words, a field, or that the
+// answer should be empty) or comments: the portal takes none that doesn't.
+function feedbackSays(report) {
+  const e = report.expected;
+  return e.empty || Boolean(e.text || report.comment) || FEEDBACK_FIELDS.some(([field]) => e[field]);
+}
+
+// The form of a report of `target`: what it is of, the answer it sends, a
+// search's results to name one of, what was expected, a comment, and what
+// is kept of it.
+function feedbackFormHtml(target) {
+  const about = [esc(target.label)];
+  if (target.dataset) about.push(esc(target.dataset));
+  if (target.build) about.push(`build ${esc(target.build)}`);
+  if (target.kind === 'search') about.push(`search “${esc(target.q)}”`);
+  else if (target.point) about.push(`${Number(target.point.lat).toFixed(5)}, ${Number(target.point.lng).toFixed(5)}`);
+  let html = `<h3>${target.kind === 'general' ? 'Feedback' : 'Disagree? Tell us what you expected'}</h3>`;
+  html += `<div class="feedback-about">${about.join(' · ')}</div>`;
+  if (target.answer != null) {
+    html += `<details><summary>The answer sent with it</summary><div class="json-block">${syntaxHighlight(target.answer)}</div></details>`;
+  }
+  if (target.kind === 'search') {
+    html += '<label class="feedback-row"><span>Which result</span><select name="result"><option value="">The results as a whole</option>';
+    (target.results || []).forEach((r, i) => {
+      html += `<option value="${i}">#${i + 1} ${esc(r.name)}${r.type ? ` (${esc(r.type)})` : ''}</option>`;
+    });
+    html += '</select></label>';
+  }
+  html += `<label class="feedback-row"><span>What did you expect?</span><textarea name="text" rows="2" maxlength="${FEEDBACK_TEXT_MAX}"></textarea></label>`;
+  html += '<div class="feedback-fields">';
+  for (const [field, label] of FEEDBACK_FIELDS) {
+    html += `<label><span>${label}</span><input name="${field}" maxlength="${FEEDBACK_FIELD_MAX}" autocomplete="off"></label>`;
+  }
+  html += '</div><label class="feedback-check"><input type="checkbox" name="empty"> The answer should be empty</label>';
+  html += `<label class="feedback-row"><span>Comment</span><textarea name="comment" rows="2" maxlength="${FEEDBACK_TEXT_MAX}"></textarea></label>`;
+  html += '<div class="feedback-note">We keep what you write here with the answer, its dataset and build, and the page\'s link.'
+    + ' No IP address and no email are kept: leave out anything personal.</div>';
+  html += '<div class="feedback-actions"><button type="submit">Send</button><button type="button" class="tool" data-action="feedback-close">Cancel</button></div>';
+  return `${html}<div class="feedback-status" role="status"></div>`;
+}
+
+// The thanks once the portal has a report, with the reports of the day and
+// in all where /feedback/count told them (`count`; none where it didn't).
+function feedbackThanks(count) {
+  if (!count || !Number.isFinite(count.today) || !Number.isFinite(count.total)) return 'Thank you! We have your report.';
+  return `Thank you! That makes ${count.today} report${count.today === 1 ? '' : 's'} today, ${count.total} in all.`;
+}
+
+// Why a report wasn't taken, from the portal's answer: what to do about a
+// 413 or a 429, else its status and why.
+function feedbackError(status, body) {
+  if (status === 413) return 'Too long to send: shorten what you wrote.';
+  if (status === 429) return 'Too many reports from here just now: try again in a minute.';
+  return `Not sent: HTTP ${status}${body ? `: ${String(body).slice(0, 300)}` : ''}`;
+}
+
 // `obj` as JSON, escaped, its keys, strings, numbers and literals marked for
 // their colours.
 function syntaxHighlight(obj) {
@@ -1728,6 +1932,7 @@ async function loadCatalog() {
     if (mode === 'waiting') catalogRetry = setTimeout(loadCatalog, 30000);
   }
   if (polygonsColumn !== 'off' && polygonsColumn >= columns.length) polygonsColumn = 'off';
+  document.getElementById('feedbackBtn').hidden = mode !== 'catalog';
   renderColumns();
   renderBanner();
   updatePolygonsBtn();
@@ -1995,6 +2200,12 @@ searchBox.addEventListener('keydown', (e) => {
   }
 });
 searchOut.addEventListener('click', (e) => {
+  const disagree = e.target.closest('[data-feedback-search]');
+  if (disagree) {
+    const view = searchViews()[Number(disagree.dataset.feedbackSearch)];
+    if (view && view.answer && view.answer.results) openFeedback(searchTarget(view, placeSearch.q));
+    return;
+  }
   if (e.target.closest('[data-action="more"]')) {
     searchExpanded = searchExpanded === placeSearch.q ? null : placeSearch.q;
     renderSearch();
@@ -2566,6 +2777,80 @@ function showDetail(id) {
   content.querySelectorAll('details').forEach((d) => { if (open.includes(d.dataset.view)) d.open = true; });
   detailShown = id;
 }
+
+// -- Feedback --
+// A column's "Disagree?" button, in the detail or the search, opens the
+// form of a report of its answer (feedbackFormHtml) in a dialog, and the
+// toolbar's Feedback one of the page; the portal only, which has /feedback.
+// Send posts the report and thanks, with /feedback/count, or says why the
+// portal didn't take it; Cancel or Escape closes the dialog.
+const feedbackDialog = document.getElementById('feedbackDialog');
+const feedbackForm = document.getElementById('feedbackForm');
+let feedbackTarget = null;
+
+function openFeedback(target) {
+  feedbackTarget = target;
+  feedbackForm.innerHTML = feedbackFormHtml(target);
+  feedbackDialog.showModal();
+}
+
+function openGeneralFeedback() {
+  openFeedback(generalTarget(selectedEntry(), servedBuild()));
+}
+
+// The link's state as updateLink writes it: the columns, the selected
+// point and the search box's text.
+function feedbackPage() {
+  const entry = selectedEntry();
+  return {
+    columns: mode === 'single' ? [] : wanted,
+    point: entry ? { lat: entry.lat, lng: entry.lng } : null,
+    q: mode === 'single' || !searchBox.value.trim() ? '' : searchBox.value,
+  };
+}
+
+document.getElementById('detailContent').addEventListener('click', (e) => {
+  const disagree = e.target.closest('[data-feedback]');
+  const entry = selectedEntry();
+  if (!disagree || !entry) return;
+  const view = columnViews(entry)[Number(disagree.dataset.feedback)];
+  if (view && view.dataset && view.answer && view.answer.data) openFeedback(reverseTarget(view, entry));
+});
+
+feedbackForm.addEventListener('click', (e) => {
+  if (e.target.closest('[data-action="feedback-close"]')) feedbackDialog.close();
+});
+
+feedbackForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const status = feedbackForm.querySelector('.feedback-status');
+  const send = feedbackForm.querySelector('button[type="submit"]');
+  const report = feedbackReport(feedbackTarget, Object.fromEntries(new FormData(feedbackForm)), feedbackPage());
+  if (!feedbackSays(report)) {
+    status.innerHTML = '<span class="warn">Say what you expected, or add a comment.</span>';
+    return;
+  }
+  send.disabled = true;
+  status.textContent = 'Sending…';
+  let failed = null;
+  try {
+    const resp = await fetch('/feedback?key=test', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(report) });
+    if (resp.status !== 201) failed = feedbackError(resp.status, await resp.text());
+  } catch (err) {
+    failed = `Not sent: ${err.message}`;
+  }
+  if (failed) {
+    status.innerHTML = `<span class="warn">${esc(failed)}</span>`;
+    send.disabled = false;
+    return;
+  }
+  let count = null;
+  try {
+    count = await (await fetch('/feedback/count')).json();
+  } catch (err) {}
+  feedbackForm.innerHTML = `<p class="feedback-note">${esc(feedbackThanks(count))}</p>`
+    + '<div class="feedback-actions"><button type="button" data-action="feedback-close">Close</button></div>';
+});
 
 // -- Start --
 updateNominatimBtn();

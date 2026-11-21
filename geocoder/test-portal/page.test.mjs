@@ -1564,3 +1564,140 @@ test('the page asks its own server only: no :3001 and no minimal_url', () => {
   assert.ok(!html.includes(':3001'));
   assert.ok(!html.includes('minimal_url'));
 });
+
+// -- Feedback --
+
+// The link's state as the page has it: its columns, its selected point and
+// the search box's text.
+const PAGE = { columns: ['with-addresses', 'smallest'], point: { lat: 48.8584, lng: 2.2945 }, q: 'eiffel' };
+
+// What a report of nothing expected says: no field of it.
+const NOTHING = { text: null, name: null, road: null, house_number: null, city: null, postcode: null, country: null, empty: false };
+
+test("a report of a column's reverse answer names its dataset, build, point and answer, what was expected, and the link", () => {
+  const { reverseTarget, feedbackReport, feedbackSays } = core();
+  const dataset = catalog().datasets.find((d) => d.id === 'full.simplified.all');
+  const data = { display_name: 'Avenue Anatole France, Paris', address: { road: 'Avenue Anatole France', city: 'Paris' } };
+  const view = { label: dataset.label, color: '#111', dataset, answer: { data, build: ID, dataset: 'full.simplified.all', ms: 3 } };
+  const form = { text: ' the tower itself ', name: 'Tour Eiffel', road: '', house_number: ' 5 ', city: '', postcode: '', country: '', comment: 'right there' };
+
+  const report = plain(feedbackReport(reverseTarget(view, { id: 'r1', lat: 48.8584, lng: 2.2945 }), form, PAGE));
+
+  assert.deepEqual(report, {
+    kind: 'reverse', lat: 48.8584, lon: 2.2945, q: null, result_index: null, dataset: 'full.simplified.all', build: ID,
+    answer: data, answer_trimmed: false,
+    expected: { ...NOTHING, text: 'the tower itself', name: 'Tour Eiffel', house_number: '5' },
+    comment: 'right there',
+    page: { columns: ['with-addresses', 'smallest'], point: { lat: 48.8584, lon: 2.2945 }, q: 'eiffel' },
+  });
+  assert.equal(feedbackSays(report), true);
+});
+
+// A search's report carries the column's results; the form names one of
+// them (by its index, its point the report's) or none, for the results as a
+// whole.
+test("a report of a column's search names the query, and the result picked with its point", () => {
+  const { searchTarget, feedbackReport } = core();
+  const results = [hit('Paris', 48.8566, 2.3522), hit('Paris', 33.6609, -95.5555, { admin1name: 'Texas' })];
+  const answer = { results, build: ID, dataset: 'full.simplified.all', index: 'full.simplified.all', ms: 7 };
+  const target = searchTarget(searchView('With addresses', '#111', answer, { id: 'full.simplified.all' }), 'paris');
+  const page = { columns: ['with-addresses'], point: null, q: 'paris' };
+
+  const picked = plain(feedbackReport(target, { result: '1', text: 'Paris, Texas first' }, page));
+  const whole = plain(feedbackReport(target, { result: '', empty: 'on' }, page));
+
+  assert.deepEqual([picked.kind, picked.q, picked.result_index, picked.lat, picked.lon, picked.dataset, picked.build],
+    ['search', 'paris', 1, 33.6609, -95.5555, 'full.simplified.all', ID]);
+  assert.deepEqual(picked.answer, plain(results));
+  assert.deepEqual(picked.page, { columns: ['with-addresses'], point: null, q: 'paris' });
+  assert.deepEqual([whole.result_index, whole.lat, whole.lon, whole.expected], [null, null, null, { ...NOTHING, empty: true }]);
+});
+
+// A general report is of no answer: the build served, and the selected
+// result's point where there is one. A report says what was expected (in
+// words, a field, or that the answer should be empty) or comments, or the
+// form doesn't send it.
+test('a general report is of the page, at the selected point where there is one, and says something', () => {
+  const { generalTarget, feedbackReport, feedbackSays } = core();
+  const bare = { columns: [], point: null, q: '' };
+
+  const none = plain(feedbackReport(generalTarget(null, ID), { comment: '  ' }, bare));
+  const at = plain(feedbackReport(generalTarget({ lat: 1.5, lng: 2.5 }, ID), { comment: 'slow at night' }, bare));
+
+  assert.deepEqual(none, {
+    kind: 'general', lat: null, lon: null, q: null, result_index: null, dataset: null, build: ID, answer: null, answer_trimmed: false,
+    expected: NOTHING, comment: null, page: { columns: [], point: null, q: null },
+  });
+  assert.equal(feedbackSays(none), false);
+  assert.deepEqual([at.lat, at.lon, at.comment], [1.5, 2.5, 'slow at night']);
+  for (const form of [{ comment: 'x' }, { text: 'x' }, { city: 'Paris' }, { empty: 'on' }]) {
+    assert.equal(feedbackSays(feedbackReport(generalTarget(null, ID), form, bare)), true, JSON.stringify(form));
+  }
+});
+
+// The portal takes a report of 16 KiB at most: the answer's JSON goes as it
+// is up to 8 KiB, else the start of it as a string, of at most 8 KiB in the
+// report's JSON, cut between characters.
+test('an answer too long for a report goes as the start of its JSON, of at most 8 KiB, flagged', () => {
+  const { reverseTarget, feedbackReport, FEEDBACK_ANSWER_MAX } = core();
+  const places = Array.from({ length: 400 }, (_, i) => ({ name: `Café "☕" 東京 ${i}`, category: 'cafe', distance_m: i }));
+  const data = { display_name: 'Tōkyō', places };
+  const view = (d) => ({ label: 'x', color: '#111', dataset: { id: 'full.exact.all' }, answer: { data: d, build: ID, dataset: 'full.exact.all' } });
+  const entry = { lat: 35.68, lng: 139.76 };
+
+  const long = feedbackReport(reverseTarget(view(data), entry), { comment: 'x' }, PAGE);
+  const short = feedbackReport(reverseTarget(view({ display_name: 'Tōkyō' }), entry), { comment: 'x' }, PAGE);
+
+  assert.equal(FEEDBACK_ANSWER_MAX, 8192);
+  assert.equal(long.answer_trimmed, true);
+  assert.equal(typeof long.answer, 'string');
+  assert.ok(JSON.stringify(data).startsWith(long.answer));
+  const bytes = Buffer.byteLength(JSON.stringify(long.answer)) - 2;
+  assert.ok(bytes <= 8192 && bytes > 8192 - 6, bytes);
+  assert.ok(Buffer.byteLength(JSON.stringify(long)) < 16384);
+  assert.deepEqual([plain(short.answer), short.answer_trimmed], [{ display_name: 'Tōkyō' }, false]);
+});
+
+// The form shows what the report is of, the answer it sends, a search's
+// results to pick from, the fields of what was expected and what is kept,
+// each string escaped. A column's answer of the portal (of a dataset, a
+// reverse lookup's or a search's) has a "Disagree?" button; Nominatim's,
+// and one not in, have none.
+test('the form and its buttons escape every string they show, and only answers of a dataset have one', () => {
+  const { feedbackFormHtml, reverseTarget, searchTarget, generalTarget, detailHtml, searchHeadsHtml } = core();
+  const dataset = { id: '"><img src=x onerror=alert(1)>', label: '<b>label</b>', size_disk: 1, size_download: 1 };
+  const view = { label: '<i>col</i>', color: '#111', dataset, answer: { data: { display_name: '<img src=y>', address: { road: '<script>r</script>' } }, build: '<u>build</u>' } };
+  const results = [hit('<em>Paris</em>', 1, 2, { type: '<b>t</b>' })];
+
+  const reverse = feedbackFormHtml(reverseTarget(view, { lat: 1, lng: 2 }));
+  const search = feedbackFormHtml(searchTarget({ ...view, answer: { results, build: '<u>b</u>' } }, '<script>q</script>'));
+  const general = feedbackFormHtml(generalTarget(null, '<u>b</u>'));
+
+  for (const out of [reverse, search, general]) {
+    assertEscaped(out);
+    for (const name of ['text', 'name', 'road', 'house_number', 'city', 'postcode', 'country', 'empty', 'comment']) assert.ok(out.includes(`name="${name}"`), name);
+    assert.ok(out.includes('No IP address and no email'), out);
+  }
+  assert.ok(reverse.includes('&quot;&gt;&lt;img src=x onerror=alert(1)&gt; · build &lt;u&gt;build&lt;/u&gt; · 1.00000, 2.00000'), reverse);
+  assert.ok(search.includes('<option value="0">#1 &lt;em&gt;Paris&lt;/em&gt; (&lt;b&gt;t&lt;/b&gt;)</option>'), search);
+  assert.ok(!reverse.includes('name="result"') && !general.includes('<details'));
+
+  const nominatim = { label: 'Nominatim', color: '#222', dataset: null, answer: { data: { display_name: 'N' } } };
+  const detail = detailHtml([view, nominatim, { ...view, answer: { loading: true } }, { ...view, answer: { error: 'HTTP 503' } }], null);
+  const heads = searchHeadsHtml([searchView('a', '#111', { results }, dataset), searchView('b', '#222', { results: [] }, dataset),
+    searchView('c', '#333', { loading: true }, dataset), searchView('d', '#444', { results }, null)], null);
+  assert.deepEqual([...detail.matchAll(/data-feedback="(\d+)"/g)].map((m) => m[1]), ['0']);
+  assert.deepEqual([...heads.matchAll(/data-feedback-search="(\d+)"/g)].map((m) => m[1]), ['0', '1']);
+  assertEscaped(detail);
+  assertEscaped(heads);
+});
+
+test('the form thanks with the counts of the reports, or says why a send failed', () => {
+  const { feedbackThanks, feedbackError } = core();
+  assert.equal(feedbackThanks({ today: 3, total: 12 }), 'Thank you! That makes 3 reports today, 12 in all.');
+  assert.equal(feedbackThanks({ today: 1, total: 1 }), 'Thank you! That makes 1 report today, 1 in all.');
+  assert.equal(feedbackThanks(null), 'Thank you! We have your report.');
+  assert.equal(feedbackError(413, 'a report is at most 16384 bytes'), 'Too long to send: shorten what you wrote.');
+  assert.equal(feedbackError(429, 'at most 20 reports a minute'), 'Too many reports from here just now: try again in a minute.');
+  assert.equal(feedbackError(400, 'a report says what was expected or comments'), 'Not sent: HTTP 400: a report says what was expected or comments');
+});
