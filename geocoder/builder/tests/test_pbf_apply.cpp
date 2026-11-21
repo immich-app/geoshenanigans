@@ -432,6 +432,7 @@ TEST(apply_drops_the_input_behind_the_written_output) {
     sut.appended(6 * MiB, 7 * MiB + 100);  // a merge: its blob ends past 7 MiB
     sut.written(0);
     CHECK(drops.empty());
+    CHECK_EQ(sut.dropped(), uint64_t(0));
     sut.written(4 * MiB);  // the copy's output is written: 3 MiB of input, under the step
     CHECK(drops.empty());
     sut.appended(8 * MiB, 0);  // a tail, which reads no input
@@ -439,6 +440,7 @@ TEST(apply_drops_the_input_behind_the_written_output) {
     CHECK(drops.empty());
     sut.written(8 * MiB);
     CHECK(drops == (std::vector<std::pair<uint64_t, uint64_t>>{{0, 7 * MiB}}));
+    CHECK_EQ(sut.dropped(), 7 * MiB);
     sut.appended(9 * MiB, 9 * MiB);
     sut.written(9 * MiB);  // 2 MiB more: under the step
     CHECK_EQ(drops.size(), size_t(1));
@@ -529,7 +531,12 @@ TEST(apply_drops_the_input_while_it_writes_and_changes_no_byte_of_the_output) {
         drops.emplace_back(offset, length);
         posix_fadvise(fd, static_cast<off_t>(offset), static_cast<off_t>(length), POSIX_FADV_DONTNEED);
     };
+    opt.verbose = true;
+    opt.input_drop_log_bytes = 2 * MiB;
+    std::ostringstream logged;
+    std::streambuf* cerr = std::cerr.rdbuf(logged.rdbuf());
     apply_changes(opt);
+    std::cerr.rdbuf(cerr);
     close(fd);
 
     CHECK(file_bytes(opt.output) == file_bytes(dir.path() + "/reference.osm.pbf"));
@@ -546,4 +553,24 @@ TEST(apply_drops_the_input_while_it_writes_and_changes_no_byte_of_the_output) {
     CHECK(dropped <= input_bytes);
     CHECK(dropped + 3 * MiB >= input_bytes);
     CHECK(drops.back() == std::make_pair(dropped, uint64_t(0)));
+    // A line each 2 MiB more of the input dropped, at a drop's end, with the
+    // output written then, which is past it: this input and its output
+    // differ by a blob or two.
+    std::istringstream lines(logged.str());
+    std::set<uint64_t> ends;
+    for (size_t i = 0; i + 1 < drops.size(); i++) ends.insert((drops[i].first + drops[i].second) >> 20);
+    uint64_t previous = 0;
+    int seen = 0;
+    for (std::string line; std::getline(lines, line);) {
+        unsigned long long to = 0, written = 0;
+        if (std::sscanf(line.c_str(), "[pbf-apply] input dropped from the page cache to %llu MiB, %llu MiB of the output written",
+                        &to, &written) != 2)
+            continue;
+        seen++;
+        CHECK(to >= previous + 2);
+        CHECK(ends.count(to) == 1);
+        CHECK(written + 1 >= to);
+        previous = to;
+    }
+    CHECK(seen >= 2);
 }

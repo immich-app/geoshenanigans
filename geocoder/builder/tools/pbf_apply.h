@@ -71,6 +71,10 @@ constexpr size_t kPeekPrefetchBlobs = 256;
 // bytes, cut at kInputDropAlignBytes (see InputPageDropper).
 constexpr uint64_t kInputDropStepBytes = uint64_t(64) << 20;
 constexpr uint64_t kInputDropAlignBytes = uint64_t(1) << 20;
+// A log line each time this many more bytes of the input have been dropped,
+// with the output written then: the run's log shows where the drops ran
+// against the writer.
+constexpr uint64_t kInputDropLogBytes = uint64_t(16) << 30;
 
 // Drops the input's pages from the page cache behind the writer, so that
 // the output, which build-index reads next, stays cached in their place:
@@ -80,7 +84,15 @@ constexpr uint64_t kInputDropAlignBytes = uint64_t(1) << 20;
 // input of an item goes once the output up to its end is written
 // (DirectFileWriter::written()), which also covers every item before it;
 // the rest of the file when the output is finished. Dropping changes no
-// byte of the output, only what a later read finds cached.
+// byte of the output, only what a later read finds cached. On the test box,
+// a planet day in a 96 GiB cgroup left 80 to 83 GiB of the 92 GiB output
+// cached, against 40 without the drops. The kernel still makes room for
+// the output by reclaiming the input just ahead of the writer, the oldest
+// pages the job holds, which the writer then reads again (75 to 78 GiB of
+// it, 81 to 83 without the drops); keeping 1 GiB of the job's memory free
+// by dropping the input's end instead cut that to 5 GiB, but the output
+// then grew into the room the end needs when it is read, and 62 GiB of it
+// were left cached.
 class InputPageDropper {
 public:
     // Drops `length` bytes of the input's pages from `offset`, to its end
@@ -113,6 +125,9 @@ public:
         drop_(dropped_, 0);
         items_.clear();
     }
+
+    // The bytes from the input's start dropped so far (finish() aside).
+    uint64_t dropped() const { return dropped_; }
 
 private:
     struct Item {
@@ -267,6 +282,8 @@ struct ApplyOptions {
     // at least input_drop_step_bytes apart: posix_fadvise when unset.
     InputPageDropper::Drop drop_input_pages;
     uint64_t input_drop_step_bytes = kInputDropStepBytes;
+    // A log line each time this many more bytes of the input are dropped.
+    uint64_t input_drop_log_bytes = kInputDropLogBytes;
 };
 
 struct ApplyStats {
@@ -576,6 +593,7 @@ inline ApplyStats apply_changes(const ApplyOptions& opt) {
             posix_fadvise(fd, static_cast<off_t>(offset), static_cast<off_t>(length), POSIX_FADV_DONTNEED);
         };
     InputPageDropper dropper(std::move(drop), opt.input_drop_step_bytes);
+    uint64_t drop_logged = 0;
     std::atomic<size_t> encoded{0};
     parallel_ordered(items.size(), [&](size_t k) { return produce_item(items[k], input.get(), in, winners, opt, encoded); },
                      [&](size_t k, std::string bytes) {
@@ -592,7 +610,13 @@ inline ApplyStats apply_changes(const ApplyOptions& opt) {
                              }
                          }
                          dropper.appended(output.appended(), input_end);
-                         dropper.written(output.written());
+                         const uint64_t written = output.written();
+                         dropper.written(written);
+                         if (dropper.dropped() >= drop_logged + opt.input_drop_log_bytes) {
+                             drop_logged = dropper.dropped();
+                             log("input dropped from the page cache to " + std::to_string(drop_logged >> 20) + " MiB, " +
+                                 std::to_string(written >> 20) + " MiB of the output written");
+                         }
                      },
                      threads, kWritesAheadPerThread * threads);
     stats.output_bytes = output.finish();
