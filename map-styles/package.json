@@ -12,6 +12,7 @@
     "dev:tunnel": "concurrently \"npm run watch\" \"npm run serve:tunnel\""
   },
   "devDependencies": {
+    "@maplibre/maplibre-gl-style-spec": "23.3.0",
     "@protomaps/basemaps": "5.7.2",
     "@types/node": "^26.6.6",
     "concurrently": "^10.0.0",
