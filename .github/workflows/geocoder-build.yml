@@ -380,16 +380,6 @@ jobs:
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
           STEP_START=$(date +%s)
 
-          # ── Background: the day's diff ──
-          # What Apply replication diffs applies to yesterday's PBF (it fetches
-          # it itself if this failed): ~140 MiB, beside the PBF rather than
-          # after it, at most 10 minutes (fetch_day_diff.sh). In a session of
-          # its own, its output in a file: only yesterday's PBF waits for it
-          # below, and any other ends it, curl and all.
-          setsid "$GITHUB_WORKSPACE/geocoder/builder/tools/fetch_day_diff.sh" "$TODAY_SEQ" "$WORKDIR/diff-today.osc.gz" 600 \
-            > "$WORKDIR/diff-today.log" 2>&1 < /dev/null &
-          DIFF_PID=$!
-
           # Retry wrapper: retries a command up to N times with backoff
           retry() {
             local max_attempts=${1:-3}; shift
@@ -593,25 +583,32 @@ jobs:
           fi
           echo "pbf_source=$PBF_SOURCE" >> "$GITHUB_OUTPUT"
 
-          # The day's diff: yesterday's PBF takes it (a fetch that failed or
-          # ran out of time leaves Apply replication diffs to fetch it);
-          # today's needs none and the mirror's fetches its diffs there.
+          # ── Background: the day's diff ──
+          # What Apply replication diffs applies to yesterday's PBF (it fetches
+          # it itself if this failed or ran out of time): ~130 MiB, at most 10
+          # minutes (fetch_day_diff.sh), once the PBF is down. Beside the PBF
+          # it took 140 to 179 s on the runner and ended 20 to 25 s after it,
+          # the PBF's download taking the bandwidth; alone it takes 12 to 14 s,
+          # beside the waits below and the tool build's. Today's PBF needs no
+          # diff, and the mirror's fetches its diffs in Apply replication
+          # diffs.
           if [ "$PBF_SOURCE" = yesterday ]; then
-            wait $DIFF_PID || true
-            cat "$WORKDIR/diff-today.log"
-          else
-            pkill -TERM -s "$DIFF_PID" 2> /dev/null || true
-            wait $DIFF_PID 2> /dev/null || true
-            rm -f "$WORKDIR/diff-today.osc.gz" "$WORKDIR/diff-today.osc.gz.part"
+            "$GITHUB_WORKSPACE/geocoder/builder/tools/fetch_day_diff.sh" "$TODAY_SEQ" "$WORKDIR/diff-today.osc.gz" 600 \
+              > "$WORKDIR/diff-today.log" 2>&1 < /dev/null &
+            DIFF_PID=$!
           fi
 
           # Wait for the sidecars and the small downloads (wikidata or TIGER
-          # fails the step)
+          # fails the step), then the diff.
           if [ "$HAS_PREVIOUS" = "true" ]; then
             echo "Waiting for the sidecar download..."
             wait $IDX_PID
           fi
           wait $EXTRAS_PID
+          if [ -n "${DIFF_PID:-}" ]; then
+            wait "$DIFF_PID" || true
+            cat "$WORKDIR/diff-today.log"
+          fi
           echo "All downloads complete in $(($(date +%s) - STEP_START))s"
 
       # A failed install of the Rust toolchain (Build place search), a
@@ -693,8 +690,10 @@ jobs:
           }
 
           if [ "$PBF_SOURCE" = "yesterday" ]; then
-            # The download step fetched it beside the PBF; this is its fallback.
-            if [ -s "$WORKDIR/diff-today.osc.gz" ] && gzip -t "$WORKDIR/diff-today.osc.gz"; then
+            # The download step fetched it once the PBF was down; this is its
+            # fallback. fetch_day_diff.sh leaves the diff only once gzip -t
+            # has passed, so it isn't tested again (~6 s on the runner).
+            if [ -s "$WORKDIR/diff-today.osc.gz" ]; then
               echo "Replication diff (seq $TODAY_SEQ) fetched during the download"
             else
               DIR1=$(printf "%03d" $((TODAY_SEQ / 1000000)))
