@@ -9,8 +9,10 @@ on:
       - "geocoder/server/**"
       - "geocoder/test-portal/**"
       - ".github/workflows/geocoder-tests.yml"
-      # The tool tests read the nightly's package list.
+      # The tool tests read the nightly's package list, and run the nightly's
+      # steps and its watchdog's scripts.
       - ".github/workflows/geocoder-build.yml"
+      - ".github/workflows/geocoder-build-watchdog.yml"
 
 permissions:
   contents: read
@@ -23,12 +25,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      # python3-yaml: the tool tests parse the workflows as GitHub does.
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake zlib1g-dev libprotozero-dev \
-            libbz2-dev libdeflate-dev libexpat1-dev libzstd-dev zstd
+            libbz2-dev libdeflate-dev libexpat1-dev libzstd-dev python3-yaml zstd
       # The patcher's too-small-TMPDIR cases mount a tmpfs in a private user
       # namespace (unshare), which the image's AppArmor policy forbids; here
       # they must run (GEOCODER_TESTS_NEED_PRIVATE_TMPFS fails them if not).

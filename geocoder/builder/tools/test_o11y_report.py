@@ -5,9 +5,12 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -374,6 +377,90 @@ class StepSlugsTest(unittest.TestCase):
         self.assertLessEqual(set(sut.STEP_SLUGS), names)
 
 
+def nightly_steps():
+    """The nightly's steps in order: (name, its lines)."""
+    with open(WORKFLOW) as f:
+        return re.findall(r"^      - name: (.+)\n((?:(?: {8}.*)?\n)*)", f.read(), re.M)
+
+
+class NightlyReportTest(unittest.TestCase):
+    """The report runs beside the cleanups and artifacts once Finalize is done, and the job's last step waits
+    for it; the cleanups keep their steps, names and conditions, and so their step metrics."""
+
+    def test_the_report_starts_after_finalize_and_the_last_step_waits_for_it(self):
+        names = [name for name, _ in nightly_steps()]
+        body = dict(nightly_steps())
+        self.assertEqual(names[names.index("Finalize upload and configurations.json") + 1:][:4],
+                         ["Install 1Password CLI", "Report to o11y", "Cleanup old Tigris builds", "Cleanup old cache bucket"])
+        self.assertEqual(names[-1], "Wait for the o11y report")
+        # The live nightly's alone: a run under a scratch s3_prefix is a test, on main too.
+        for name in ("Install 1Password CLI", "Report to o11y", "Wait for the o11y report"):
+            self.assertIn("if: always() && github.ref == 'refs/heads/main' && env.S3_PREFIX == 'geocoder'\n", body[name], name)
+        for name in ("Report to o11y", "Wait for the o11y report"):
+            self.assertIn("continue-on-error: true", body[name], name)
+        self.assertIn("if: env.PATCH_VERIFY_FAILED != '1' && env.TRANSPORT_UNIT_FAILED != '1'", body["Cleanup old Tigris builds"])
+        self.assertIn("if: ${{ !cancelled() && steps.setup.outputs.cache_bucket != '' }}", body["Cleanup old cache bucket"])
+
+    def test_the_report_runs_detached_with_the_token_its_alone(self):
+        body = dict(nightly_steps())["Report to o11y"]
+        self.assertIn("O11Y_TOKEN=\"$token\" setsid nohup bash -c '\"$@\"; echo $? > \"$0\"' \"$RUNNER_TEMP/o11y.status\" \\\n", body)
+        self.assertIn("timeout 240 python3 geocoder/builder/tools/o11y_report.py nightly", body)
+        self.assertEqual(len(re.findall(r"O11Y_TOKEN=", body)), 1)
+        wait = dict(nightly_steps())["Wait for the o11y report"]
+        self.assertIn('[ -s "$RUNNER_TEMP/o11y.status" ]', wait)
+        self.assertIn('cat "$RUNNER_TEMP/o11y.log"', wait)
+
+    def run_step(self, name, root, env):
+        script = re.search(r"^        run: \|\n((?:(?: {10}.*)?\n)*)", dict(nightly_steps())[name], re.M).group(1)
+        script = "".join(line[10:] + "\n" for line in script.splitlines())
+        start = time.time()
+        done = subprocess.run(["bash", "-e", "-c", script], env=env, cwd=root, capture_output=True, text=True, timeout=60)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        return time.time() - start, done.stdout
+
+    # Report to o11y starts the report and returns while it runs, the steps after it running beside it; the job's
+    # last step waits for it to end and shows what it printed.
+    def test_the_report_runs_beside_the_steps_after_it_and_the_last_step_waits_for_it(self):
+        root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, root)
+        bin_dir = os.path.join(root, "bin")
+        os.makedirs(bin_dir)
+        release, slept = os.path.join(root, "release"), os.path.join(root, "slept")
+        # The report runs until it is released (at most 20 s, or until the test's dir is gone), then says what it
+        # got. The wait's sleep marks that it waited and releases it.
+        fakes = {"op": "echo s3cret\n",
+                 "python3": f'n=0\nuntil [ -e {release} ] || ! [ -d {root} ] || [ $n -ge 400 ]; do '
+                            f'/usr/bin/sleep 0.05; n=$((n + 1)); done\n'
+                            'echo "reported $2 with token $O11Y_TOKEN"\n',
+                 "sleep": f"echo slept >> {slept}\n: > {release}\nexec /usr/bin/sleep 0.05\n"}
+        for tool, body in fakes.items():
+            with open(os.path.join(bin_dir, tool), "w") as f:
+                f.write("#!/bin/sh\n" + body)
+            os.chmod(os.path.join(bin_dir, tool), 0o755)
+        # However the test ends, the report ends before the test's dir goes.
+        status = os.path.join(root, "o11y.status")
+
+        def end_report():
+            open(release, "w").close()
+            deadline = time.time() + 10
+            while time.time() < deadline and not os.path.exists(status):
+                time.sleep(0.05)
+        self.addCleanup(end_report)
+        env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "RUNNER_TEMP": root, "WORKDIR": root, "S3_PREFIX": "geocoder",
+               "BUILD_DATE": "2026-10-12", "DATA_TIMESTAMP": "2026-10-12T00:00:00Z", "O11Y_URL": "https://o11y.invalid",
+               "GITHUB_RUN_ID": "1", "GITHUB_RUN_ATTEMPT": "1", "OP_SERVICE_ACCOUNT_TOKEN": "t"}
+
+        self.run_step("Report to o11y", root, env)
+
+        self.assertFalse(os.path.exists(status))
+        self.assertFalse(os.path.exists(slept))
+        _, out = self.run_step("Wait for the o11y report", root, env)
+
+        self.assertTrue(os.path.exists(slept))
+        self.assertIn("(exit status 0)", out)
+        self.assertIn("reported nightly with token s3cret", out)
+
+
 LATEST = {"latest": "2026-10-12", "updated_at": "2026-10-12T06:45:24Z"}
 # The latest finished nightly, as the GitHub API returns its run and its job:
 # its runner was lost during the build.
@@ -471,6 +558,19 @@ class WatchdogTest(WorkDirTest):
 
         self.assertIn("geocoder_build_success", {name for name, *_ in samples})
         self.assertEqual([r["app"] for r in log.records], ["geocoder-watchdog"])
+
+    # The cleanups' steps report under their slugs like the others.
+    def test_reports_the_cleanup_steps(self):
+        job = {**JOB, "steps": JOB["steps"] + [
+            step("Cleanup old Tigris builds", "success", "2026-10-12T06:50:00Z", "2026-10-12T06:50:30Z"),
+            step("Cleanup old cache bucket", "failure", "2026-10-12T06:50:30Z", "2026-10-12T06:50:42Z")]}
+
+        samples, _ = self.run_sut([json.dumps(LATEST).encode()], RUN, job)
+
+        durations = by_name(samples, "geocoder_build_step_duration_seconds")
+        outcomes = by_name(samples, "geocoder_build_step_success")
+        self.assertEqual((durations[(("step", "cleanup-tigris"),)], outcomes[(("step", "cleanup-tigris"),)]), (30, 1))
+        self.assertEqual((durations[(("step", "cleanup-cache"),)], outcomes[(("step", "cleanup-cache"),)]), (12, 0))
 
     def test_a_run_without_a_conclusion_or_no_run_reports_no_outcome(self):
         for run in ({}, {**RUN, "conclusion": None}):

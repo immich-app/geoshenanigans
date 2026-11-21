@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """Tests for build_search_indexes.py. Run: python3 -m unittest discover -s geocoder/builder/tools"""
+import contextlib
+import io
 import itertools
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import build_search_indexes as sut  # noqa: E402
+from test_cpu_budget import fake_cpus  # noqa: E402
 
 TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "configurations.template.json")
 PORTAL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "test-portal")
@@ -20,9 +25,11 @@ ADMIN_GEOMETRY = ["admin_polygons.bin", "admin_rings.bin", "arc_index.bin", "arc
 
 # Stands in for place-search: `build <set> <out> ...` records its arguments and what the set dir
 # held (name -> link target) and writes the index files, then fails for a set path containing
-# $FAIL_SET.
+# $FAIL_SET, hangs for one containing $HANG_SET, and for one containing $KILL_SET kills the
+# build_search_indexes.py that runs it (SIGTERM, half a second in).
 FAKE = """#!{python}
 import json, os, sys
+supervisor = os.getppid()
 _, cmd, set_dir, out, *rest = sys.argv
 os.makedirs(out)
 held = {{n: os.readlink(os.path.join(set_dir, n)) for n in os.listdir(set_dir)}}
@@ -32,7 +39,18 @@ for name in {files}:
     open(os.path.join(out, name), "w").close()
 if os.environ.get("FAIL_SET") and os.environ["FAIL_SET"] in set_dir:
     sys.exit(3)
+if os.environ.get("HANG_SET") and os.environ["HANG_SET"] in set_dir:
+    import time
+    time.sleep(600)
+if os.environ.get("KILL_SET") and os.environ["KILL_SET"] in set_dir and supervisor > 1:
+    import signal, time
+    time.sleep(0.5)
+    try:
+        os.kill(supervisor, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
 """
+JOB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "place_search_indexes.sh")
 
 
 class BuildSearchIndexesTest(unittest.TestCase):
@@ -68,6 +86,24 @@ class BuildSearchIndexesTest(unittest.TestCase):
             with self.assertRaises(SystemExit) as exit_:
                 sut.main()
         return exit_.exception.code
+
+    # The CPUs of the budget (cpu_budget.sh), a cgroup's quota under the CPUs the process may run on, over the
+    # threads a build.
+    def test_by_default_as_many_build_at_once_as_the_cpu_budget_has_threads_for(self):
+        self.write_output(["planet"])
+        for cpus, quotas, expected in ((8, None, 4), (8, {"/job": "400000 100000"}, 2), (1, None, 1)):
+            argv = ["build_search_indexes.py", self.out, self.binary, "--threads", "2"]
+            printed = io.StringIO()
+            with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(printed), \
+                    mock.patch.dict(os.environ, {"TMPDIR": self.tmp.name, **fake_cpus(self, cpus, "/job", quotas)}), \
+                    mock.patch.object(sut, "ThreadPoolExecutor", wraps=sut.ThreadPoolExecutor) as pool:
+                with self.assertRaises(SystemExit) as exit_:
+                    sut.main()
+            self.assertEqual(exit_.exception.code, 0)
+            self.assertRegex(printed.getvalue(), rf"place search indexes, {expected} at once\.\.\.", (cpus, quotas))
+            # The builds run on that many workers, not only say so.
+            self.assertEqual([call.kwargs["max_workers"] for call in pool.call_args_list], [expected], (cpus, quotas))
+            shutil.rmtree(os.path.join(self.out, "planet", "search"), ignore_errors=True)
 
     def call(self, region, sel):
         index_dir = os.path.join(self.out, sut.substitute(self.cfg["search_index"]["dir"], dict(sel, region=region)))
@@ -110,6 +146,104 @@ class BuildSearchIndexesTest(unittest.TestCase):
         os.remove(os.path.join(self.out, "planet", "poi", "all", "strings_poi.bin"))
 
         self.assertEqual(self.run_main(), 1)
+
+
+class PlaceSearchJobTest(unittest.TestCase):
+    """place_search_indexes.sh, which the nightly runs in the background from build-index's exit: compression
+    waits for its exit status, so it must end, whatever place-search's build or the indexes do."""
+
+    setUp = BuildSearchIndexesTest.setUp
+    write_output = BuildSearchIndexesTest.write_output
+    call = BuildSearchIndexesTest.call
+
+    def run_job(self, build_status, limit=600, env=None, write_status_after=None):
+        status = os.path.join(self.tmp.name, "search.status")
+        if build_status is not None and write_status_after is None:
+            with open(status, "w") as f:
+                f.write(build_status)
+        # In a session of its own, so that a job past the test's wait ends whole, timeout's process group and
+        # place-search's too, before the test's dir goes.
+        job = subprocess.Popen(["bash", JOB, self.out, self.binary, status, str(limit)],
+                               env={**os.environ, "TMPDIR": self.tmp.name, **(env or {})},
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        if write_status_after is not None:
+            time.sleep(write_status_after)
+            with open(status, "w") as f:
+                f.write(build_status)
+        start = time.time()
+        try:
+            out, _ = job.communicate(timeout=120)
+        except subprocess.TimeoutExpired:
+            subprocess.run(["pkill", "-KILL", "-s", str(job.pid)])
+            out, _ = job.communicate()
+            self.fail(f"the job ran past 120 s and was ended: {out}")
+        return job.returncode, out, time.time() - start
+
+    def index_dir(self, region, sel):
+        return os.path.join(self.out, sut.substitute(self.cfg["search_index"]["dir"], dict(sel, region=region)))
+
+    def scratch_left(self):
+        """What the job left in its TMPDIR beside the test's own files."""
+        return sorted(set(os.listdir(self.tmp.name)) - {"output", "place-search", "search.status"})
+
+    def test_builds_the_indexes_once_place_search_is_built(self):
+        self.write_output(["planet", "europe"])
+
+        code, out, _ = self.run_job("0\n", write_status_after=1.5)
+
+        self.assertEqual(code, 0, out)
+        for region in ("planet", "europe"):
+            for sel in self.cfg["search_index"]["shipped"]:
+                self.assertEqual(self.call(region, sel)["cmd"], "build")
+        self.assertRegex(out, r"Place search indexes done in \d+s")
+        self.assertEqual(self.scratch_left(), [])
+
+    def test_without_place_search_it_builds_nothing_and_fails(self):
+        self.write_output(["planet"])
+
+        code, out, _ = self.run_job("101\n")
+
+        self.assertEqual(code, 1)
+        self.assertIn("Building place-search failed", out)
+        self.assertFalse(os.path.exists(os.path.join(self.out, "planet", "search")))
+
+    def test_a_failed_index_fails_it_and_leaves_the_others(self):
+        self.write_output(["planet", "europe"])
+
+        code, _, _ = self.run_job("0\n", env={"FAIL_SET": "/europe/"})
+
+        self.assertEqual(code, 1)
+        for sel in self.cfg["search_index"]["shipped"]:
+            self.assertTrue(os.path.isdir(self.index_dir("planet", sel)))
+            self.assertFalse(os.path.exists(self.index_dir("europe", sel)))
+
+    # A build that hangs is stopped at the limit, and the indexes it may have left half-written go with it: their
+    # clients build theirs on the device. Its scratch goes too, though the stopped build_search_indexes.py removes
+    # none: the patch jobs beside it start only in the free space it would hold.
+    def test_a_build_past_the_limit_is_stopped_and_leaves_no_index(self):
+        self.write_output(["planet", "europe"])
+
+        code, out, took = self.run_job("0\n", limit=2, env={"HANG_SET": "/europe/"})
+
+        self.assertEqual(code, 124, out)
+        self.assertLess(took, 60)
+        self.assertIn("were stopped", out)
+        for region in ("planet", "europe"):
+            self.assertFalse(os.path.exists(os.path.join(self.out, region, "search")), region)
+        self.assertEqual(self.scratch_left(), [])
+
+    # So does one a signal ended within the limit: compression takes whatever search files there are on any status.
+    # One build at a time (a CPU), so that none runs on once the signal has ended the rest.
+    def test_a_build_a_signal_ended_leaves_no_index(self):
+        self.write_output(["planet", "europe"])
+
+        code, out, _ = self.run_job("0\n", env={**fake_cpus(self, 1), "KILL_SET": "/europe/"})
+
+        self.assertEqual(code, 128 + 15, out)
+        self.assertIn("ended by signal 15", out)
+        for region in ("planet", "europe"):
+            self.assertFalse(os.path.exists(os.path.join(self.out, region, "search")), region)
+        self.assertEqual(self.scratch_left(), [])
 
 
 def load_template():

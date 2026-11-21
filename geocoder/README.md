@@ -26,18 +26,23 @@ quality, POI tier) and how a client downloads and patches them.
 ## Monitoring
 
 The nightly reports every run on `main` to FUTO o11y (project
-`geoshenanigans`), whatever its outcome; test dispatches from other branches
-don't report. Its last step, `builder/tools/o11y_report.py nightly`, pushes
-what only its runner has: each build phase's duration, peak memory, the patch
-verify counts, each patch's size, the index size, the data's age and the
-bytes of planet/full's address footprint stream beside the limit they may not
-pass, and logs build.log, the memwatch samples and each variant's verify
-result. Every 2 hours the watchdog's `report` job (`o11y_report.py watchdog`,
-on a GitHub-hosted runner) pushes the dates in the published `latest.json`
-with a heartbeat (none when it can't read `latest.json`), and the latest
-finished nightly's outcome, duration and step durations from the GitHub API,
-logging that run's steps once. A run whose runner died or that timed out never
-reaches its own last step, so its outcome comes from the watchdog.
+`geoshenanigans`), whatever its outcome; test dispatches, from other branches
+or under a scratch `s3_prefix` (whose run title ends `[scratch: <prefix>]`),
+don't report, and the watchdog passes them over. Its report,
+`builder/tools/o11y_report.py nightly`, starts after Finalize whatever the
+steps before it did (a failed or skipped Setup or upload included), runs
+beside the cleanups and artifact uploads, and is waited for by the job's last
+step. It pushes what only its runner has: each build phase's duration, peak
+memory, the patch verify counts, each patch's size, the index size, the
+data's age and the bytes of planet/full's address footprint stream beside the
+limit they may not pass, and logs build.log, the memwatch samples and each
+variant's verify result. Every 2 hours the watchdog's `report` job
+(`o11y_report.py watchdog`, on a GitHub-hosted runner) pushes the dates in
+the published `latest.json` with a heartbeat (none when it can't read
+`latest.json`), and the latest finished nightly's outcome, duration and step
+durations from the GitHub API, logging that run's steps once. A run whose
+runner died or that timed out never reaches its own report, so its outcome
+comes from the watchdog.
 
 Both push straight to o11y's public gateway (`O11Y_URL` in the workflows,
 `https://vmauth.futostatus.com`), metrics to VictoriaMetrics and logs to
