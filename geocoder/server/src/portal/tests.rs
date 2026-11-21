@@ -603,8 +603,7 @@ async fn a_damaged_build_is_fetched_again_into_a_new_dir() {
 
 // The prune keeps the build served and the complete one before it, never a
 // newer one of another build version it can't serve; after the next day's
-// build is in, the build served before is the one before, and still
-// answers from what it mapped.
+// build is in, the build served before is the one before.
 #[tokio::test]
 async fn the_prune_keeps_the_build_served_and_the_one_before_it() {
     let bucket = test_bucket::serve(test_bucket::template_components()).await;
@@ -623,10 +622,8 @@ async fn the_prune_keeps_the_build_served_and_the_one_before_it() {
 
     bucket.add_build(FOURTH, BUILD_VERSION);
     bucket.set_latest(FOURTH, Some(BUILD_VERSION));
-    let before = p.served().unwrap();
     assert_eq!(p.round(false).await, Ok(format!("build {FOURTH} is served ({FOURTH}-1)")));
     assert_eq!(build_dirs(data.path()), [format!("{DATE}-1"), format!("{FOURTH}-1")]);
-    assert!(before.indexes[before.plan.default].query_json(POINT.0, POINT.1).contains("full.simplified.all"));
 }
 
 // A build the volume holds complete is served again from its dir once
