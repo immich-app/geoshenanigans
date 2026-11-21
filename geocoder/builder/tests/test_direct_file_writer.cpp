@@ -25,6 +25,19 @@ std::string read_file(const std::string& path) {
     return out;
 }
 
+// The file's first `n` bytes (fewer when it is shorter), and none past them:
+// the writer allocates the file 1 GiB ahead of its blocks until finish().
+std::string read_prefix(const std::string& path, size_t n) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return "<missing>";
+    std::string out(n, '\0');
+    size_t got = 0;
+    for (ssize_t k; got < n && (k = pread(fd, &out[got], n - got, static_cast<off_t>(got))) > 0;) got += size_t(k);
+    close(fd);
+    out.resize(got);
+    return out;
+}
+
 std::string numbered_bytes(size_t n, size_t seed) {
     std::string s(n, '\0');
     for (size_t i = 0; i < n; i++) s[i] = char((seed + i) * 7 + (seed + i) / 251);
@@ -168,7 +181,7 @@ TEST(direct_writer_written_names_whole_blocks_already_on_disk) {
             CHECK_EQ(written % 4096, uint64_t(0));
             CHECK(written >= last);
             CHECK(written <= sut.appended());
-            CHECK(read_file(path).substr(0, written) == expected.substr(0, written));
+            CHECK(read_prefix(path, written) == expected.substr(0, written));
             last = written;
         }
         // 30,000 bytes laid out: with at most 2 blocks in flight, at least 5 of
@@ -176,7 +189,7 @@ TEST(direct_writer_written_names_whole_blocks_already_on_disk) {
         CHECK(last >= 5 * 4096);
         for (int i = 0; i < 2000 && sut.written() < 7 * 4096; i++) usleep(1000);
         CHECK_EQ(sut.written(), uint64_t(7 * 4096));
-        CHECK(read_file(path).substr(0, 7 * 4096) == expected.substr(0, 7 * 4096));
+        CHECK(read_prefix(path, 7 * 4096) == expected.substr(0, 7 * 4096));
         CHECK_EQ(sut.finish(), uint64_t(expected.size()));
     }
 }
