@@ -83,7 +83,7 @@ def block_from(script, first_line):
 
 class FakeS5cmd:
     """An s5cmd on PATH that logs its arguments, a line a call, and does nothing else; with $UPLOAD_PID set (a pid
-    file), each call says whether that process still ran."""
+    file), each call says whether that process still ran (a zombie, which writes nothing, counts as ended)."""
 
     def __init__(self, test):
         self.root = tempfile.mkdtemp()
@@ -92,8 +92,9 @@ class FakeS5cmd:
         for tool in ("s5cmd", "python3"):
             with open(os.path.join(self.root, tool), "w") as f:
                 f.write(f'#!/bin/sh\necho "{tool} $*" >> "{self.calls}"\n'
-                        f'[ -z "$UPLOAD_PID" ] || {{ kill -0 "$(cat "$UPLOAD_PID")" 2> /dev/null && echo "  upload running" '
-                        f'|| echo "  upload ended"; }} >> "{self.calls}"\n')
+                        f'[ -z "$UPLOAD_PID" ] || {{ case $(sed "s/.*) //" "/proc/$(cat "$UPLOAD_PID")/stat" 2> /dev/null '
+                        f'| cut -c1) in ""|Z|X) echo "  upload ended" ;; *) echo "  upload running" ;; esac; }} '
+                        f'>> "{self.calls}"\n')
             os.chmod(os.path.join(self.root, tool), 0o755)
         self.path = f"{self.root}:{os.environ['PATH']}"
 
@@ -152,7 +153,8 @@ class ScratchPbfCacheTest(unittest.TestCase):
             subprocess.run(["bash", "-e", "-c", upload], env={**env, "PBF_SOURCE": "yesterday", "TODAY": "2026-11-21"},
                            check=True, capture_output=True, timeout=10)
             env["UPLOAD_PID"] = os.path.join(work, "pbf-cache.pid")
-            self.addCleanup(subprocess.run, ["pkill", "-KILL", "-s", open(env["UPLOAD_PID"]).read().strip()])
+            with open(env["UPLOAD_PID"]) as f:
+                self.addCleanup(subprocess.run, ["pkill", "-KILL", "-s", f.read().strip()])
         done = subprocess.run(["bash", "-e", "-c", step_script("Cleanup old cache bucket")], env=env, capture_output=True,
                               text=True, timeout=60)
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
@@ -309,10 +311,13 @@ class SeedPreviousTest(unittest.TestCase):
         self.assertEqual(self.objects("nightly-speed-1121/builds/2026-11-20"), LIVE)
         self.assertEqual(self.objects("nightly-speed-1121/builds/2026-11-19"), {"configurations.json": b"{}"})
 
+    # At the copy: the check of the listings after it would fail the setup too, but no listing comes.
     def test_a_copy_that_failed_fails_the_setup(self):
-        done, _ = self.run_seed("nightly-speed-1121", "true", FAKE_COPY_FAILS_AFTER="2")
+        done, calls = self.run_seed("nightly-speed-1121", "true", FAKE_COPY_FAILS_AFTER="2")
 
         self.assertNotEqual(done.returncode, 0)
+        copy = next(i for i, c in enumerate(calls) if " cp " in c)
+        self.assertEqual([c for c in calls[copy + 1:] if " ls " in c], [])
 
     # A copy that says it is done but left an object out is caught by the check of the copy against the live build.
     def test_a_copy_that_left_an_object_out_fails_the_setup(self):

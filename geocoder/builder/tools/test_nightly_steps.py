@@ -74,6 +74,7 @@ def block_at(script, first):
 
 class DownloadTest(unittest.TestCase):
     # On a normal night today's PBF isn't in the cache: one look, with no retries and their sleeps (15 s a night).
+    # DownloadStepTest counts the looks of a run.
     def test_todays_pbf_is_looked_for_once(self):
         script = step_script("Download PBF and previous indexes")
         looks = re.findall(r".*planet-\$\{TODAY\}\.osm\.pbf.*", script)
@@ -105,6 +106,7 @@ class DownloadTest(unittest.TestCase):
         root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, root)
         work, bin_dir = os.path.join(root, "work"), os.path.join(root, "bin")
+        self.work = work
         os.makedirs(work)
         os.makedirs(bin_dir)
         calls = os.path.join(root, "calls")
@@ -135,12 +137,18 @@ class DownloadTest(unittest.TestCase):
         with open(calls) as f:
             return done, f.read().splitlines()
 
+    def assert_the_diff_was_applied(self, call):
+        """`call`, pbf-apply's, applies the day's diff to yesterday's PBF."""
+        self.assertEqual(call.split()[:5], ["pbf-apply", f"{self.work}/planet.osm.pbf", f"{self.work}/diff-today.osc.gz",
+                                            "-o", f"{self.work}/planet-tmp.osm.pbf"])
+
     # fetch_day_diff.sh leaves the diff only once gzip -t has passed (FetchDayDiffTest): the apply takes it as it is.
     def test_the_apply_takes_the_downloads_diff_untested(self):
         done, calls = self.run_apply(gzip.compress(b"<osmChange/>"))
 
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual([c.split()[0] for c in calls], ["pbf-apply"])
+        self.assert_the_diff_was_applied(calls[0])
 
     # Through fetch_day_diff.sh, within its 10 minutes, retries included.
     def test_the_apply_fetches_and_tests_the_diff_itself_when_the_download_left_none(self):
@@ -153,6 +161,7 @@ class DownloadTest(unittest.TestCase):
         self.assertIn(" gzip -t ", calls[0])
         self.assertIn("/replication/day/000/004/710.osc.gz", calls[1])
         self.assertEqual(calls[2].split()[1], "-t")
+        self.assert_the_diff_was_applied(calls[3])
 
     # A server that stalls fails the step at the fetch's limit, a failure the watchdog retries, where a fetch without
     # one would hold the step to its 120-minute timeout, a cancelled step it doesn't.
@@ -165,11 +174,12 @@ class DownloadTest(unittest.TestCase):
 
 
 # The download step's tools as the step runs them. s5cmd lists the keys of $FAKE_CACHED (":"-separated, under the
-# cache bucket) and copies any to a local path, the PBF in $FAKE_PBF_SECONDS by the step's clock (date); curl answers
-# the wikidata and TIGER lookups and downloads, and the day's diff as $FAKE_DIFF says: "ok" (a gzip), or "stall" (it
-# writes its pid to $FAKE_DIFF_PID and never ends); aria2c (the mirror) writes the PBF. Each call goes to $FAKE_CALLS.
+# cache bucket) and copies any to a local path, the PBF in $FAKE_PBF_SECONDS by the step's clock (date), and a fifth of
+# a second by the wall's, after which it logs "copied <path>"; curl answers the wikidata and TIGER lookups and
+# downloads, and the day's diff as $FAKE_DIFF says: "ok" (a gzip), or "stall" (it writes its pid to $FAKE_DIFF_PID and
+# never ends); aria2c (the mirror) writes the PBF. Each call goes to $FAKE_CALLS.
 FAKE_S5CMD = r"""#!{python}
-import os, sys
+import os, sys, time
 args = sys.argv[1:]
 with open(os.environ["FAKE_CALLS"], "a") as f:
     f.write("s5cmd " + " ".join(args) + "\n")
@@ -181,11 +191,15 @@ if verb == "ls":
         sys.exit("ERROR no object found")
     print("2026/11/21 06:00:00          99 " + os.path.basename(key))
 elif verb == "cp" and not rest[1].startswith("s3://"):
+    if rest[1].endswith("/planet.osm.pbf"):
+        time.sleep(0.2)
     with open(rest[1], "wb") as f:
         f.write(b"pbf")
     if rest[1].endswith("/planet.osm.pbf"):
         with open(os.environ["FAKE_CLOCK"], "w") as f:
             f.write(os.environ["FAKE_PBF_SECONDS"])
+        with open(os.environ["FAKE_CALLS"], "a") as f:
+            f.write("copied " + rest[1] + "\n")
 """
 
 # date +%s is the time plus the seconds in $FAKE_CLOCK, which the PBF's copy writes: the PBF took that long.
@@ -296,6 +310,12 @@ class DownloadStepTest(unittest.TestCase):
     def diff_files(self):
         return sorted(n for n in os.listdir(self.work) if n.startswith("diff-today.osc"))
 
+    def looks(self, key):
+        """The step's listings of `key` in the cache bucket."""
+        with open(self.calls) as f:
+            return [line for line in f.read().splitlines()
+                    if line.startswith("s5cmd ") and line.endswith(f" ls s3://cache/{key}")]
+
     def diff_fetches(self):
         with open(self.calls) as f:
             return [line for line in f.read().splitlines() if line.startswith("curl ") and "/replication/day/" in line]
@@ -316,7 +336,8 @@ class DownloadStepTest(unittest.TestCase):
         self.assertEqual(self.diff_fetches(), [])
         self.assertEqual(self.diff_files(), [])
 
-    # The mirror's PBF takes its diffs in Apply replication diffs.
+    # The mirror's PBF takes its diffs in Apply replication diffs. Today's PBF, which the cache didn't have, was
+    # looked for once.
     def test_a_mirror_pbf_fetches_no_diff(self):
         outputs, _, took = self.download([], "stall")
 
@@ -324,6 +345,7 @@ class DownloadStepTest(unittest.TestCase):
         self.assertLess(took, 30)
         self.assertEqual(self.diff_fetches(), [])
         self.assertEqual(self.diff_files(), [])
+        self.assertEqual(len(self.looks("geocoder-cache/planet-2026-11-21.osm.pbf")), 1)
 
     # A scratch prefix's run applies the diff whatever the cache holds: its own key may keep an earlier test run's
     # PBF of the day (one whose upload outlived its cleanup), and the shared one is the nightly's.
@@ -345,8 +367,10 @@ class DownloadStepTest(unittest.TestCase):
             calls = f.read().splitlines()
         pbf = next(i for i, line in enumerate(calls) if line.startswith("s5cmd") and " cp " in line
                    and "planet-2026-11-20.osm.pbf" in line)
+        down = calls.index(f"copied {self.work}/planet.osm.pbf")
+        self.assertLess(pbf, down)
         self.assertEqual(len(self.diff_fetches()), 1)
-        self.assertGreater(calls.index(self.diff_fetches()[0]), pbf)
+        self.assertGreater(calls.index(self.diff_fetches()[0]), down)
         self.assertEqual(self.diff_limits(), [600])
         self.assertEqual(self.diff_files(), ["diff-today.osc.gz"])
         with gzip.open(os.path.join(self.work, "diff-today.osc.gz")) as f:
