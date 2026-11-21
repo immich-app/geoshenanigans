@@ -16,10 +16,12 @@
 //
 // A build of another build version, or one whose datasets don't all load,
 // is refused: never switched to, and recorded in REFUSED with why, so that
-// it is not fetched again while latest.json names it. Every round runs
-// under one lock (LOCK); the first of a process serves the newest local
-// build that loads before it asks the bucket anything, and checks its
-// files against their sha256. A build the data dir holds complete is
+// it is not fetched again while latest.json names it. A query-portal holds
+// the data dir's lock (VOLUME_LOCK) for as long as it runs, so that no
+// other process prunes its builds, and every round runs under one lock
+// (LOCK); the first of a process serves the newest local build that loads
+// before it asks the bucket anything, and checks its files against their
+// sha256. A build the data dir holds complete is
 // served again from its dir (latest.json moved back to it) once its files
 // check out, not fetched. The prune keeps the build served, the one served
 // before it and the dir of the latest build a sync left part way.
@@ -52,6 +54,9 @@ pub const FETCHED: &str = ".fetched";
 pub const COMPLETE: &str = ".complete";
 /// The lock every round holds (flock), in the data dir.
 pub const LOCK: &str = "sync.lock";
+/// The lock a query-portal holds for as long as it runs (flock), in the
+/// data dir: one process a volume.
+pub const VOLUME_LOCK: &str = "portal.lock";
 /// The record of the builds refused, in the data dir.
 pub const REFUSED: &str = "refused.json";
 /// A date in this file in the data dir stands for latest.json's: the sync
@@ -240,6 +245,27 @@ fn verify(root: &Path, cfg: &Configurations, plan: &Plan) -> Result<(), String> 
         }
     });
     failed.into_inner().unwrap().map_or(Ok(()), Err)
+}
+
+/// The lock of the data dir `data` (VOLUME_LOCK), held until the file
+/// returned is dropped: a query-portal takes it at start and holds it for
+/// good. While another process holds it, an error saying so at once: the
+/// second process exits rather than waits, so that two services on one
+/// volume (two rounds on it would prune each other's builds) show as one
+/// that fails to start, with why, never as one that hangs before it serves.
+pub fn hold_volume(data: &Path) -> Result<std::fs::File, String> {
+    let path = data.join(VOLUME_LOCK);
+    std::fs::create_dir_all(data).map_err(|e| format!("mkdir {}: {e}", data.display()))?;
+    let file = std::fs::File::options().read(true).write(true).create(true).truncate(false).open(&path)
+        .map_err(|e| format!("lock {}: {e}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(format!(
+            "another query-portal runs on {}: it holds {}, and two on one volume would prune each other's builds",
+            data.display(), path.display()
+        )),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("lock {}: {e}", path.display())),
+    }
 }
 
 #[derive(Deserialize)]

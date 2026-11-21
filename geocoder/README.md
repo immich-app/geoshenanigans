@@ -163,7 +163,10 @@ version than it reads, saying so on `/health`. Until it has a build to
 serve, `/reverse`, `/polygons` and `/datasets` answer 503 with the reason. It
 keeps the build it serves and the one it served before, and serves a build it
 holds again, without a fetch, once latest.json names it again. A date in
-`<data>/latest.override` stands in for the bucket's latest.json.
+`<data>/latest.override` stands in for the bucket's latest.json. One
+`query-portal` serves a volume: it holds `<data>/portal.lock` for as long
+as it runs, and a second one started on the same volume exits at once,
+saying so.
 
 ## API
 

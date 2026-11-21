@@ -927,6 +927,25 @@ async fn a_round_waits_while_another_holds_the_sync_lock() {
     assert_eq!(round.await.unwrap(), Ok(format!("build {DATE} is served ({DATE}-1)")));
 }
 
+// One query-portal a volume: while one holds the data dir's lock, another
+// on that dir fails to start, saying why; once the first is gone, one
+// starts again.
+#[test]
+fn a_second_portal_on_a_volume_fails_to_start_while_the_first_runs() {
+    let data = ScratchDir::new();
+    let first = sync::hold_volume(data.path()).unwrap();
+    assert!(data.path().join(sync::VOLUME_LOCK).is_file());
+
+    let second = sync::hold_volume(data.path()).unwrap_err();
+
+    assert_eq!(second, format!(
+        "another query-portal runs on {}: it holds {}, and two on one volume would prune each other's builds",
+        data.path().display(), data.path().join(sync::VOLUME_LOCK).display()
+    ));
+    drop(first);
+    sync::hold_volume(data.path()).unwrap();
+}
+
 // A date in the data dir's LATEST_OVERRIDE stands for latest.json's, so
 // that a gate can have the portal fetch the builds it names.
 #[tokio::test]

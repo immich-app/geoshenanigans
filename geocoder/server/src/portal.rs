@@ -163,7 +163,8 @@ pub struct Latest {
 }
 
 pub struct Portal {
-    /// The data dir: geocoder.json, builds/, the sync's lock and records.
+    /// The data dir: geocoder.json, builds/, the locks and the sync's
+    /// records.
     pub data: PathBuf,
     pub config: Config,
     served: arc_swap::ArcSwapOption<Served>,
@@ -357,11 +358,20 @@ async fn polygons(State(app): State<Arc<App>>, Query(p): Query<Params>) -> Respo
 
 /// query-portal <data dir> [<bind address>]: serves at once (0.0.0.0:3000
 /// by default), the keys of <data dir>/geocoder.json, and syncs in the
-/// background for good.
+/// background for good. It holds the data dir's lock (sync::hold_volume)
+/// for as long as it runs, and exits at start while another holds it.
 pub async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let data = PathBuf::from(args.get(1).map(String::as_str).unwrap_or("/data"));
     let bind = args.get(2).map(String::as_str).unwrap_or("0.0.0.0:3000");
+
+    let _volume = match sync::hold_volume(&data) {
+        Ok(lock) => lock,
+        Err(why) => {
+            eprintln!("Error: {why}");
+            std::process::exit(1);
+        }
+    };
 
     let db_path = data.join("geocoder.json");
     let db = match auth::Db::load(&db_path.to_string_lossy()) {
