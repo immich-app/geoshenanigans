@@ -382,6 +382,8 @@ jobs:
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
           STEP_START=$(date +%s)
+          # This step's timeout-minutes, in seconds.
+          STEP_SECONDS=3600
 
           # Retry wrapper: retries a command up to N times with backoff
           retry() {
@@ -595,10 +597,20 @@ jobs:
           # beside the waits below and the tool build's. Today's PBF needs no
           # diff, and the mirror's fetches its diffs in Apply replication
           # diffs.
+          # It has at most the time the step has left, less 2 minutes, and
+          # none under 30 s: a PBF that took most of the hour must not leave
+          # the step past its timeout, a cancelled step the watchdog doesn't
+          # retry, for a diff Apply replication diffs can fetch.
           if [ "$PBF_SOURCE" = yesterday ]; then
-            "$GITHUB_WORKSPACE/geocoder/builder/tools/fetch_day_diff.sh" "$TODAY_SEQ" "$WORKDIR/diff-today.osc.gz" 600 \
-              > "$WORKDIR/diff-today.log" 2>&1 < /dev/null &
-            DIFF_PID=$!
+            DIFF_SECONDS=$((STEP_START + STEP_SECONDS - 120 - $(date +%s)))
+            [ "$DIFF_SECONDS" -le 600 ] || DIFF_SECONDS=600
+            if [ "$DIFF_SECONDS" -ge 30 ]; then
+              { "$GITHUB_WORKSPACE/geocoder/builder/tools/fetch_day_diff.sh" "$TODAY_SEQ" "$WORKDIR/diff-today.osc.gz" "$DIFF_SECONDS" \
+                  || echo "[diff] Apply replication diffs fetches it"; } > "$WORKDIR/diff-today.log" 2>&1 < /dev/null &
+              DIFF_PID=$!
+            else
+              echo "[diff] ${DIFF_SECONDS}s left in the step; Apply replication diffs fetches it"
+            fi
           fi
 
           # Wait for the sidecars and the small downloads (wikidata or TIGER
@@ -695,17 +707,18 @@ jobs:
           if [ "$PBF_SOURCE" = "yesterday" ]; then
             # The download step fetched it once the PBF was down; this is its
             # fallback. fetch_day_diff.sh leaves the diff only once gzip -t
-            # has passed, so it isn't tested again (~6 s on the runner).
+            # has passed, so it isn't tested again (~6 s on the runner). The
+            # fallback has 10 minutes too: a server that stalls fails the
+            # step, which the watchdog retries, where it would otherwise hold
+            # it to its timeout, a cancelled step it doesn't.
             if [ -s "$WORKDIR/diff-today.osc.gz" ]; then
               echo "Replication diff (seq $TODAY_SEQ) fetched during the download"
             else
-              DIR1=$(printf "%03d" $((TODAY_SEQ / 1000000)))
-              DIR2=$(printf "%03d" $(((TODAY_SEQ / 1000) % 1000)))
-              FILE=$(printf "%03d" $((TODAY_SEQ % 1000)))
               echo "Downloading replication diff (seq $TODAY_SEQ)..."
-              curl -sL --fail --retry 5 --retry-delay 30 --retry-all-errors \
-                -o "$WORKDIR/diff-today.osc.gz" "$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
-              gzip -t "$WORKDIR/diff-today.osc.gz"
+              if ! "$GITHUB_WORKSPACE/geocoder/builder/tools/fetch_day_diff.sh" "$TODAY_SEQ" "$WORKDIR/diff-today.osc.gz" 600; then
+                echo "::error::No replication diff (seq $TODAY_SEQ) to apply to yesterday's PBF"
+                exit 1
+              fi
             fi
             DIFF_SIZE=$(stat -c%s "$WORKDIR/diff-today.osc.gz")
             echo "Diff: $((DIFF_SIZE/1024/1024)) MiB"

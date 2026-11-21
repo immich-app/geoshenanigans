@@ -85,24 +85,36 @@ class DownloadTest(unittest.TestCase):
     def test_the_days_diff_comes_down_once_the_pbf_is_down(self):
         script = step_script("Download PBF and previous indexes")
         self.assertIn("TODAY_SEQ: ${{ steps.setup.outputs.today_seq }}", step("Download PBF and previous indexes"))
-        fetch = script.index('fetch_day_diff.sh" "$TODAY_SEQ" "$WORKDIR/diff-today.osc.gz" 600 \\\n')
+        fetch = script.index('fetch_day_diff.sh" "$TODAY_SEQ" "$WORKDIR/diff-today.osc.gz" "$DIFF_SECONDS" \\\n')
         self.assertGreater(fetch, script.index('echo "pbf_source=$PBF_SOURCE" >> "$GITHUB_OUTPUT"'))
         self.assertGreater(script.index('wait "$DIFF_PID"'), script.index("wait $EXTRAS_PID"))
 
-    def run_apply(self, diff):
+    # The fetch's time comes from the step's timeout (DownloadStepTest), which the script can't read: it says it.
+    def test_the_step_knows_its_timeout(self):
+        name = "Download PBF and previous indexes"
+        minutes = next(s["timeout-minutes"] for job in workflow_yaml(NIGHTLY)["jobs"].values()
+                       for s in job.get("steps", []) if s.get("name") == name)
+        self.assertIn(f"\nSTEP_SECONDS={minutes * 60}\n", step_script(name))
+
+    def run_apply(self, diff, server="ok"):
         """Apply replication diffs from yesterday's PBF, with a diff from the download (bytes, or None), and a curl,
-        pbf-apply and df that log their calls; returns the calls."""
+        pbf-apply, gzip -t and timeout that log their calls; curl gets the diff when `server` is "ok", and stalls when
+        it is "stall", in which case the timeout gives it 1 s whatever it is asked. Returns the step's run and the
+        calls."""
         root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, root)
         work, bin_dir = os.path.join(root, "work"), os.path.join(root, "bin")
         os.makedirs(work)
         os.makedirs(bin_dir)
         calls = os.path.join(root, "calls")
+        fetch = 'echo "<osmChange/>" | gzip -c > "$out"\n' if server == "ok" else 'echo x > "$out"\nexec sleep 300\n'
+        timeout = shutil.which("timeout")
         fakes = {"curl": f'echo "curl $*" >> {calls}\nout=""\n'
-                         'while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done\n'
-                         'echo "<osmChange/>" | gzip -c > "$out"\n',
+                         'while [ $# -gt 0 ]; do [ "$1" = -o ] && out=$2; shift; done\n' + fetch,
                  "pbf-apply": f'echo "pbf-apply $*" >> {calls}\n: > "{work}/planet-tmp.osm.pbf"\n',
                  "gzip": f'[ "$1" = -t ] && echo "gzip $*" >> {calls}\nexec {shutil.which("gzip")} "$@"\n',
+                 "timeout": f'echo "timeout $*" >> {calls}\n'
+                            + ('shift\nexec ' + timeout + ' 1 "$@"\n' if server == "stall" else f'exec {timeout} "$@"\n'),
                  "df": "exit 0\n"}
         for tool, body in fakes.items():
             with open(os.path.join(bin_dir, tool), "w") as f:
@@ -113,29 +125,44 @@ class DownloadTest(unittest.TestCase):
             with open(os.path.join(work, "diff-today.osc.gz"), "wb") as f:
                 f.write(diff)
         env = {"PATH": f"{bin_dir}:{os.environ['PATH']}", "WORKDIR": work, "TODAY": "2026-11-21", "TODAY_SEQ": "4710",
-               "PBF_SOURCE": "yesterday"}
-        done = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step_script("Apply replication diffs")], env=env,
-                              capture_output=True, text=True)
-        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+               "PBF_SOURCE": "yesterday", "GITHUB_WORKSPACE": os.path.join(HERE, "..", "..", "..")}
+        try:
+            done = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step_script("Apply replication diffs")],
+                                  env=env, capture_output=True, text=True, timeout=60)
+        except subprocess.TimeoutExpired:
+            self.fail("the apply hung")
         with open(calls) as f:
-            return f.read().splitlines()
+            return done, f.read().splitlines()
 
     # fetch_day_diff.sh leaves the diff only once gzip -t has passed (FetchDayDiffTest): the apply takes it as it is.
     def test_the_apply_takes_the_downloads_diff_untested(self):
-        calls = self.run_apply(gzip.compress(b"<osmChange/>"))
+        done, calls = self.run_apply(gzip.compress(b"<osmChange/>"))
 
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertEqual([c.split()[0] for c in calls], ["pbf-apply"])
 
+    # Through fetch_day_diff.sh, within its 10 minutes, retries included.
     def test_the_apply_fetches_and_tests_the_diff_itself_when_the_download_left_none(self):
-        calls = self.run_apply(None)
+        done, calls = self.run_apply(None)
 
-        self.assertEqual([c.split()[0] for c in calls], ["curl", "gzip", "pbf-apply"])
-        self.assertIn("/replication/day/000/004/710.osc.gz", calls[0])
-        self.assertEqual(calls[1].split()[1], "-t")
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertEqual([c.split()[0] for c in calls], ["timeout", "curl", "gzip", "pbf-apply"])
+        self.assertEqual(calls[0].split()[1:3], ["600", "curl"])
+        self.assertIn("/replication/day/000/004/710.osc.gz", calls[1])
+        self.assertEqual(calls[2].split()[1], "-t")
+
+    # A server that stalls fails the step at the fetch's limit, a failure the watchdog retries, where a fetch without
+    # one would hold the step to its 120-minute timeout, a cancelled step it doesn't.
+    def test_a_stalled_server_fails_the_apply_at_the_fetchs_limit(self):
+        done, calls = self.run_apply(None, server="stall")
+
+        self.assertNotEqual(done.returncode, 0)
+        self.assertEqual([c.split()[0] for c in calls], ["timeout", "curl"])
+        self.assertIn("::error::", done.stdout)
 
 
 # The download step's tools as the step runs them. s5cmd lists the keys of $FAKE_CACHED (":"-separated, under the
-# cache bucket) and copies any to a local path; curl answers the wikidata and TIGER lookups and downloads, and the
+# cache bucket) and copies any to a local path, the PBF in $FAKE_PBF_SECONDS by the step's clock (date); curl answers the wikidata and TIGER lookups and downloads, and the
 # day's diff as $FAKE_DIFF says: "ok" (a gzip), or "stall" (it writes its pid to $FAKE_DIFF_PID and never ends);
 # aria2c (the mirror) writes the PBF. Each call goes to $FAKE_CALLS.
 FAKE_S5CMD = r"""#!{python}
@@ -153,6 +180,19 @@ if verb == "ls":
 elif verb == "cp" and not rest[1].startswith("s3://"):
     with open(rest[1], "wb") as f:
         f.write(b"pbf")
+    if rest[1].endswith("/planet.osm.pbf"):
+        with open(os.environ["FAKE_CLOCK"], "w") as f:
+            f.write(os.environ["FAKE_PBF_SECONDS"])
+"""
+
+# date +%s is the time plus the seconds in $FAKE_CLOCK, which the PBF's copy writes: the PBF took that long.
+FAKE_DATE = """#!/bin/sh
+if [ "$1" = +%s ]; then echo $(( $({date} +%s) + $(cat "$FAKE_CLOCK" 2> /dev/null || echo 0) )); else exec {date} "$@"; fi
+"""
+
+FAKE_TIMEOUT = """#!/bin/sh
+echo "timeout $*" >> "$FAKE_CALLS"
+exec {timeout} "$@"
 """
 
 FAKE_CURL = r"""#!{python}
@@ -209,7 +249,8 @@ class DownloadStepTest(unittest.TestCase):
         os.makedirs(self.bin)
         # python3 is the GeoNames download's, and sleep the retries' waits.
         fakes = {"s5cmd": FAKE_S5CMD, "curl": FAKE_CURL, "aria2c": FAKE_ARIA2C, "python3": "#!/bin/sh\nexit 0\n",
-                 "sleep": "#!/bin/sh\nexit 0\n"}
+                 "sleep": "#!/bin/sh\nexit 0\n", "date": FAKE_DATE.format(date=shutil.which("date")),
+                 "timeout": FAKE_TIMEOUT.format(timeout=shutil.which("timeout"))}
         for tool, body in fakes.items():
             with open(os.path.join(self.bin, tool), "w") as f:
                 f.write(body.format(python=sys.executable) if body.startswith("#!{") else body)
@@ -225,9 +266,9 @@ class DownloadStepTest(unittest.TestCase):
             if alive(pid):
                 os.kill(pid, 9)
 
-    def download(self, cached, diff, pbf_cache="geocoder-cache"):
-        """Runs the step with the cache holding `cached` (keys) and the day's diff `diff`; returns its outputs, its
-        output lines and how long it took."""
+    def download(self, cached, diff, pbf_cache="geocoder-cache", pbf_seconds=0):
+        """Runs the step with the cache holding `cached` (keys), the day's diff `diff` and a PBF that takes
+        `pbf_seconds` by the step's clock; returns its outputs, its output lines and how long it took."""
         output = os.path.join(self.root, "output")
         env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "WORKDIR": self.work, "CACHE_ENDPOINT": "http://cache.invalid",
                "CACHE_BUCKET": "cache", "CACHE_AWS_KEY": "k", "CACHE_AWS_SECRET": "s", "YESTERDAY": "2026-11-20",
@@ -235,7 +276,8 @@ class DownloadStepTest(unittest.TestCase):
                "S3_ENDPOINT": "https://s3.invalid", "S3_BUCKET": "bucket", "S3_PREFIX": "geocoder",
                "S3_PUBLIC_URL": "https://public.invalid", "GITHUB_OUTPUT": output,
                "GITHUB_WORKSPACE": os.path.join(HERE, "..", "..", ".."), "FAKE_CALLS": self.calls,
-               "FAKE_CACHED": ":".join(cached), "FAKE_DIFF": diff, "FAKE_DIFF_PID": self.diff_pid}
+               "FAKE_CACHED": ":".join(cached), "FAKE_DIFF": diff, "FAKE_DIFF_PID": self.diff_pid,
+               "FAKE_CLOCK": os.path.join(self.root, "clock"), "FAKE_PBF_SECONDS": str(pbf_seconds)}
         start = time.time()
         try:
             done = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", step_script("Download PBF and previous indexes")],
@@ -253,7 +295,13 @@ class DownloadStepTest(unittest.TestCase):
 
     def diff_fetches(self):
         with open(self.calls) as f:
-            return [line for line in f.read().splitlines() if "/replication/day/" in line]
+            return [line for line in f.read().splitlines() if line.startswith("curl ") and "/replication/day/" in line]
+
+    def diff_limits(self):
+        """The seconds each fetch of the diff was given."""
+        with open(self.calls) as f:
+            return [int(line.split()[1]) for line in f.read().splitlines()
+                    if line.startswith("timeout ") and "/replication/day/" in line]
 
     # A run that has today's PBF from the cache needs no diff, and a stalled server can't hold its step (up to its
     # 60-minute timeout, a cancelled step the watchdog doesn't retry): it never asks for one.
@@ -296,10 +344,34 @@ class DownloadStepTest(unittest.TestCase):
                    and "planet-2026-11-20.osm.pbf" in line)
         self.assertEqual(len(self.diff_fetches()), 1)
         self.assertGreater(calls.index(self.diff_fetches()[0]), pbf)
+        self.assertEqual(self.diff_limits(), [600])
         self.assertEqual(self.diff_files(), ["diff-today.osc.gz"])
         with gzip.open(os.path.join(self.work, "diff-today.osc.gz")) as f:
             self.assertEqual(f.read(), b"<osmChange/>")
         self.assertIn("[diff] seq 4710", out)
+
+    # The fetch has the time the step has left to its 60-minute timeout, less 2 minutes, and at most its 10: a PBF
+    # that came down in 52 minutes leaves it 6, where 10 would hold the step past its timeout, a cancelled step the
+    # watchdog doesn't retry.
+    def test_the_diff_has_at_most_the_time_left_in_the_step(self):
+        outputs, _, _ = self.download(["geocoder-cache/planet-2026-11-20.osm.pbf"], "ok", pbf_seconds=52 * 60)
+
+        self.assertEqual(outputs["pbf_source"], "yesterday")
+        [limit] = self.diff_limits()
+        self.assertLessEqual(limit, 360)
+        self.assertGreater(limit, 330)
+        self.assertEqual(self.diff_files(), ["diff-today.osc.gz"])
+
+    # With under 30 s of that left the step asks for no diff: Apply replication diffs fetches it.
+    def test_a_pbf_that_took_the_step_leaves_the_diff_to_the_apply(self):
+        outputs, out, took = self.download(["geocoder-cache/planet-2026-11-20.osm.pbf"], "stall",
+                                           pbf_seconds=60 * 60 - 120 - 20)
+
+        self.assertEqual(outputs["pbf_source"], "yesterday")
+        self.assertLess(took, 30)
+        self.assertEqual(self.diff_fetches(), [])
+        self.assertEqual(self.diff_files(), [])
+        self.assertIn("Apply replication diffs fetches it", out)
 
 
 class FetchDayDiffTest(unittest.TestCase):
@@ -338,7 +410,7 @@ class FetchDayDiffTest(unittest.TestCase):
 
         self.assertNotEqual(done.returncode, 0)
         self.assertEqual(self.files(), [])
-        self.assertIn("Apply replication diffs fetches it", done.stdout)
+        self.assertIn("Fetching the diff of seq 4710 failed or took over 60s", done.stdout)
 
     # A server that accepts the connection and then sends nothing is given up on at the limit, curl ended with it.
     def test_a_stalled_server_is_given_up_on_at_the_limit(self):
