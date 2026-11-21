@@ -536,6 +536,52 @@ test('the polygon overlay cycles off, each column, off', () => {
   assert.equal(nextPolygons(3, 2), 'off');
 });
 
+// Lets the page's promises that can go on go on.
+async function settle() {
+  for (let i = 0; i < 5; i++) await new Promise((resolve) => setImmediate(resolve));
+}
+
+test('polygons are drawn only while no clear came after their request and its result and column are still shown', async () => {
+  const { PolygonOverlay } = core();
+  const asked = [];
+  const drawn = [];
+  const KEY = 'full.simplified.all';
+  let shown = { id: 'a', key: KEY };
+  const overlay = new PolygonOverlay({
+    // What the pacer gives.
+    request: () => new Promise((resolve) => asked.push((n) => resolve({ status: 200, header: () => null, body: JSON.stringify({ type: 'FeatureCollection', features: [], n }), ms: 1 }))),
+    draw: (fc) => drawn.push(fc.n),
+    erase: () => drawn.push('erased'),
+    shown: () => shown,
+  });
+  // A clear (the overlay's column removed, the results cleared) leaves
+  // nothing drawn, whatever comes in after it.
+  const cleared = overlay.show('a', KEY, '/polygons?n=1');
+  overlay.clear();
+  asked[0](1);
+  assert.equal(await cleared, false);
+  assert.deepEqual(drawn, ['erased']);
+  // Nor while another column or result is shown.
+  const otherColumn = overlay.show('a', KEY, '/polygons?n=2');
+  shown = { id: 'a', key: 'admin.simplified.none' };
+  asked[1](2);
+  assert.equal(await otherColumn, false);
+  shown = { id: 'a', key: KEY };
+  const otherResult = overlay.show('a', KEY, '/polygons?n=3');
+  shown = { id: 'b', key: KEY };
+  asked[2](3);
+  assert.equal(await otherResult, false);
+  // Of two in flight, the last asked.
+  const earlier = overlay.show('b', KEY, '/polygons?n=4');
+  const later = overlay.show('b', KEY, '/polygons?n=5');
+  asked[4](5);
+  asked[3](4);
+  assert.deepEqual([await later, await earlier], [true, false]);
+  assert.deepEqual(drawn, ['erased', 5]);
+  await settle();
+  assert.deepEqual(drawn, ['erased', 5]);
+});
+
 test('the JSON of an answer is shown highlighted and escaped', () => {
   const { syntaxHighlight } = core();
   const out = syntaxHighlight({ name: '<img src=x>', n: 1, ok: true, none: null });

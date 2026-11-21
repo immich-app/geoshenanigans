@@ -962,6 +962,37 @@ function nextPolygons(current, count) {
   return next < count ? next : 'off';
 }
 
+// The polygon overlay's requests (the page's other script draws them):
+// show(id, key, url) asks `url` for the polygons around the point of the
+// result `id` in the dataset of column key `key`, and draws them only if,
+// when they come, no other show and no clear came after it and the overlay
+// still shows that result in that dataset (shown(): { id, key }, or null
+// while it shows none). request(url) asks the server (the pacer), draw(fc)
+// and erase() the map.
+class PolygonOverlay {
+  constructor({ request, draw, erase, shown }) {
+    Object.assign(this, { request, draw, erase, shown });
+    this.asked = 0;
+  }
+
+  // Whether the polygons came and were drawn.
+  async show(id, key, url) {
+    const asked = ++this.asked;
+    const got = await this.request(url);
+    const now = this.shown();
+    if (asked !== this.asked || !now || now.id !== id || now.key !== key) return false;
+    if (got.status !== 200) throw new Error(`HTTP ${got.status}: ${got.body}`);
+    this.draw(JSON.parse(got.body));
+    return true;
+  }
+
+  // Erases what is drawn; no answer still to come is drawn.
+  clear() {
+    this.asked++;
+    this.erase();
+  }
+}
+
 // `obj` as JSON, escaped, its keys, strings, numbers and literals marked for
 // their colours.
 function syntaxHighlight(obj) {
@@ -1560,7 +1591,18 @@ let polygonsColumn = (() => {
   const saved = localStorage.getItem('polygons_column');
   return saved !== null && /^\d+$/.test(saved) ? Number(saved) : 'off';
 })();
-let polygonsAsked = 0;
+// The overlay's requests: the polygons of the selected result in the
+// overlay's column's dataset, while it is on.
+const polygonOverlay = new PolygonOverlay({
+  request: (url) => pacer.request(url),
+  draw: drawPolygons,
+  erase: erasePolygons,
+  shown: () => {
+    const col = polygonsColumn === 'off' ? null : columns[polygonsColumn];
+    const key = col ? columnKey(col) : null;
+    return key === null || selectedId === null ? null : { id: selectedId, key };
+  },
+});
 
 // Nominatim side-by-side lookup is opt-in — every query goes out to
 // nominatim.openstreetmap.org so we don't want to hit it unsolicited.
@@ -1658,11 +1700,37 @@ function ensurePolygonLayer() {
   });
 }
 
+// Erases the polygons drawn, and every answer still to come goes unused
+// (the overlay off, its column removed, the results cleared).
 function clearPolygonLayer() {
+  polygonOverlay.clear();
+}
+
+function erasePolygons() {
   const src = map.getSource(POLY_SOURCE);
   if (src) src.setData({ type: 'FeatureCollection', features: [] });
   const lsrc = map.getSource(POLY_LABEL_SOURCE);
   if (lsrc) lsrc.setData({ type: 'FeatureCollection', features: [] });
+}
+
+function drawPolygons(fc) {
+  // Sort largest-first so smaller polygons render on top
+  if (fc.features) {
+    fc.features.sort((a, b) => (b.properties.area || 0) - (a.properties.area || 0));
+  }
+  const src = map.getSource(POLY_SOURCE);
+  if (src) src.setData(fc);
+  // Build a parallel point FeatureCollection for label placement at centroids
+  const labelFc = {
+    type: 'FeatureCollection',
+    features: (fc.features || []).map(f => ({
+      type: 'Feature',
+      geometry: { type: 'Point', coordinates: polygonCentroid(f.geometry.coordinates[0]) },
+      properties: f.properties,
+    })),
+  };
+  const lsrc = map.getSource(POLY_LABEL_SOURCE);
+  if (lsrc) lsrc.setData(labelFc);
 }
 
 function updatePolygonLayer(id) {
@@ -1670,31 +1738,8 @@ function updatePolygonLayer(id) {
   const r = results.find(x => x.id === id);
   if (!col || columnKey(col) === null || !r) { clearPolygonLayer(); return; }
   ensurePolygonLayer();
-  // The answer of the last selection only, of those in flight.
-  const asked = ++polygonsAsked;
   const dataset = col.dataset ? `&dataset=${encodeURIComponent(col.dataset.id)}` : '';
-  pacer.request(`/polygons?lat=${r.lat}&lon=${r.lng}&key=test${dataset}`)
-    .then(got => { if (got.status !== 200) throw new Error(`HTTP ${got.status}: ${got.body}`); return JSON.parse(got.body); })
-    .then(fc => {
-      if (asked !== polygonsAsked) return;
-      // Sort largest-first so smaller polygons render on top
-      if (fc.features) {
-        fc.features.sort((a, b) => (b.properties.area || 0) - (a.properties.area || 0));
-      }
-      const src = map.getSource(POLY_SOURCE);
-      if (src) src.setData(fc);
-      // Build a parallel point FeatureCollection for label placement at centroids
-      const labelFc = {
-        type: 'FeatureCollection',
-        features: (fc.features || []).map(f => ({
-          type: 'Feature',
-          geometry: { type: 'Point', coordinates: polygonCentroid(f.geometry.coordinates[0]) },
-          properties: f.properties,
-        })),
-      };
-      const lsrc = map.getSource(POLY_LABEL_SOURCE);
-      if (lsrc) lsrc.setData(labelFc);
-    })
+  polygonOverlay.show(id, columnKey(col), `/polygons?lat=${r.lat}&lon=${r.lng}&key=test${dataset}`)
     .catch(err => console.warn('polygons fetch failed:', err));
 }
 
