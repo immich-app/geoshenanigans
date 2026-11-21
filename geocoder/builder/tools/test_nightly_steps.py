@@ -434,11 +434,14 @@ class RustToolchainTest(unittest.TestCase):
         self.calls = os.path.join(self.root, "calls")
 
     def fakes(self, rustup_status):
-        """A bin dir with a rustup that logs its calls and exits `rustup_status`, a cargo that logs its own, and a
-        sleep that doesn't (the install's retries wait 30 s)."""
+        """A bin dir with a rustup that logs its calls (and, in self.copy_rename, its RUSTUP_PERMIT_COPY_RENAME) and
+        exits `rustup_status`, a cargo that logs its own, and a sleep that doesn't (the install's retries wait 30 s)."""
         bin_dir = os.path.join(self.root, "cargo", "bin")
         os.makedirs(bin_dir, exist_ok=True)
-        for tool, body in {"rustup": f'echo "rustup $*" >> {self.calls}\nexit {rustup_status}\n',
+        self.copy_rename = os.path.join(self.root, "copy_rename")
+        for tool, body in {"rustup": f'echo "rustup $*" >> {self.calls}\n'
+                                     f'echo "$*: ${{RUSTUP_PERMIT_COPY_RENAME-unset}}" >> {self.copy_rename}\n'
+                                     f'exit {rustup_status}\n',
                            "cargo": f'echo "cargo $*" >> {self.calls}\n', "sleep": "exit 0\n"}.items():
             with open(os.path.join(bin_dir, tool), "w") as f:
                 f.write("#!/bin/sh\n" + body)
@@ -463,6 +466,15 @@ class RustToolchainTest(unittest.TestCase):
         self.assertEqual(self.logged(), ["rustup toolchain install stable --profile minimal --no-self-update",
                                          "rustup default stable"])
         self.assertEqual(self.read("rust-toolchain.status"), "0")
+
+    # A runner image that bakes a toolchain into a lower overlay layer can't rename across it (EXDEV): the install
+    # may copy instead, as dtolnay/rust-toolchain lets it.
+    def test_the_install_may_copy_where_it_cannot_rename(self):
+        bin_dir = self.fakes(0)
+        subprocess.run(["bash", os.path.join(HERE, "rust_toolchain.sh"), os.path.join(self.root, "rust-toolchain.status")],
+                       check=True, capture_output=True, env={"PATH": f"{bin_dir}:{os.environ['PATH']}"})
+        with open(self.copy_rename) as f:
+            self.assertIn("toolchain install stable --profile minimal --no-self-update: 1", f.read().splitlines())
 
     def test_a_failed_install_is_retried_then_written_as_failed(self):
         bin_dir = self.fakes(1)
