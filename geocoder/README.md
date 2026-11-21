@@ -146,6 +146,12 @@ cd test-portal && docker compose up --build --remove-orphans
 # or http://localhost:3002/test?d=with-addresses&d=smallest&at=48.8584,2.2945
 ```
 
+Its volume, `geocoder-portal-data`, is not the old services' volumes: at its
+first start the portal makes the test account in `geocoder.json` on it. To
+keep the accounts of the old `geocoder-data-full` volume, copy that volume's
+`index/geocoder.json` to `geocoder.json` on the new one once, before the
+first start.
+
 Its `/reverse` and `/polygons` take `dataset=`: a preset's id (`smallest`)
 or `<mode>.<quality>.<poi_tier>` (`admin.simplified.major`), and
 `with-addresses` without one. They answer what a query-server serving that
