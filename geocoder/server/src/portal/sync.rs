@@ -26,14 +26,16 @@
 // A build is the one of a date as its configurations.json was published: a
 // rerun of the nightly that publishes a date's build again makes another,
 // which the sync fetches into a new dir though it serves the one before.
-// A build of another build version, or one whose datasets don't all load
-// from files that check out, is refused: never switched to, and recorded in
-// REFUSED with why and its manifest's sha256, so that it is not fetched
-// again while latest.json names it and the bucket holds it as it was
-// refused. A query-portal holds the data dir's lock (VOLUME_LOCK) for as
-// long as it runs, so that no other process prunes its builds, and every
-// round runs under one lock (LOCK); the first of a process serves the
-// newest local build that checks out and loads, before it asks the bucket
+// A build whose manifest is of another build version, or whose datasets
+// don't all load from files that check out, is refused: never switched to,
+// and recorded in REFUSED with why and its manifest's sha256, so that it is
+// not fetched again while latest.json names it and the bucket holds it as
+// it was refused. The build version latest.json gives refuses nothing: a
+// round in which it disagrees with the manifest's fails, to be tried
+// again. A query-portal holds the data dir's lock (VOLUME_LOCK) for as long
+// as it runs, so that no other process prunes its builds, and every round
+// runs under one lock (LOCK); the first of a process serves the newest
+// local build that checks out and loads, before it asks the bucket
 // anything: none is served before its files check out. A build the data
 // dir holds complete is served again from its dir (latest.json moved back
 // to it) once it checks out, not fetched. The prune keeps the build
@@ -664,12 +666,14 @@ impl Portal {
     /// its files check out (checked) and all its datasets load; what it did,
     /// or why it failed. The latest build is the one of the date latest.json
     /// names as its configurations.json is now: one published again under
-    /// its date (a rerun of the nightly) is another build. A build of
-    /// another build version, or whose datasets don't load from files that
-    /// check out, is refused; one refused is not fetched again while it is
-    /// the latest. One whose files don't check out is fetched again, into a
-    /// new dir. With the latest served it does nothing; with it complete in
-    /// a dir, it serves it from there.
+    /// its date (a rerun of the nightly) is another build. A build whose
+    /// manifest is of another build version, or whose datasets don't load
+    /// from files that check out, is refused; one refused is not fetched
+    /// again while it is the latest. One whose files don't check out is
+    /// fetched again, into a new dir, and a build version latest.json gives
+    /// that the manifest doesn't fails the round, refusing nothing. With the
+    /// latest served it does nothing; with it complete in a dir, it serves
+    /// it from there.
     async fn sync(&self) -> Result<String, String> {
         self.running("reading the latest build".to_string());
         let mut latest = self.latest().await?;
@@ -690,9 +694,6 @@ impl Portal {
         } else {
             self.set_status(|s| s.refused = current.into_iter().filter(|r| r.version == BUILD_VERSION).collect());
         }
-        if let Some(version) = latest.build_version.filter(|&v| v != BUILD_VERSION) {
-            return self.refuse(&date, &sha256, &format!("it is of build version {version}; this server reads build version {BUILD_VERSION}"));
-        }
         if let Some(refused) = self.refusal(&date, &sha256) {
             return Ok(format!("build {date} was refused: {}", refused.reason));
         }
@@ -707,6 +708,16 @@ impl Portal {
         };
         if manifest.build.date != date {
             return Err(format!("build {date}'s {MANIFEST} is build {}'s", manifest.build.date));
+        }
+        // The build version latest.json gives may be of another publication
+        // of the date than the manifest fetched (a rerun of the nightly
+        // between the two): a refusal is of the manifest's alone, and while
+        // the two disagree the round fails, to be tried again.
+        if let Some(hint) = latest.build_version.filter(|&v| v != manifest.build.version) {
+            return Err(format!(
+                "latest.json gives build {date} build version {hint}, its {MANIFEST} build version {}: nothing is refused while they disagree",
+                manifest.build.version
+            ));
         }
         if manifest.build.version != BUILD_VERSION {
             return self.refuse(&date, &sha256, &format!("it is of build version {}; this server reads build version {BUILD_VERSION}", manifest.build.version));

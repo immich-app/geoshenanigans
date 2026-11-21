@@ -166,14 +166,16 @@ besides. It switches to a build only once every file of it holds its
 manifest's bytes, each read against its sha256 again, each dataset's dir
 holds hard links of the build's files and nothing else, and every dataset
 loads; a build whose files fail that is fetched again, not refused. It
-refuses one of another build version than it reads, saying so on
-`/health`. A build published again
-under its date (a rerun of the nightly) is another build: it fetches that
-one too, and a refusal of the build as first published doesn't hold
-against it. At start it serves the newest build the volume holds whose
-files all hold their manifest's bytes, each read against its sha256 before
-the build is served (~3 s for a planet build on an NVMe disk, cold or
-warm), and fetches one that doesn't again. Until it has a build to serve,
+refuses one whose manifest is of another build version than it reads,
+saying so on `/health`; while latest.json gives another build version than
+the manifest, the sync fails and retries, refusing nothing. A build
+published again under its date (a rerun of the nightly) is another build:
+it fetches that one too, and a refusal of the build as first published
+doesn't hold against it. At start it serves the newest build the volume
+holds whose files all hold their manifest's bytes, each read against its
+sha256 before the build is served (~3 s for a planet build on an NVMe
+disk, cold or warm), and fetches one that doesn't again. Until it has a
+build to serve,
 `/reverse`, `/polygons` and `/datasets` answer 503 with the reason. It
 keeps the build it serves and the one it served before, and serves a build
 it holds again, without a fetch, once latest.json names it again. A date in

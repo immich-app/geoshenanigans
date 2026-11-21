@@ -433,10 +433,11 @@ async fn a_builds_objects_cover_every_selection_it_serves_and_its_sync_fetches_e
     }
 }
 
-// A build of another build version is refused, whether latest.json says so
-// or only its manifest does: nothing of it is fetched, the build served
-// stays, and the refusal is on record, with why, as long as latest.json
-// names that build.
+// A build of another build version is refused once its manifest says so,
+// latest.json giving that version or none: nothing of it is fetched, the
+// build served stays, and the refusal is on record, with why, as long as
+// latest.json names that build. While latest.json gives another version
+// than the manifest, the round fails and refuses nothing.
 #[tokio::test]
 async fn a_build_of_another_version_is_never_switched_to_and_is_recorded() {
     let bucket = test_bucket::serve(test_bucket::template_components()).await;
@@ -458,6 +459,10 @@ async fn a_build_of_another_version_is_never_switched_to_and_is_recorded() {
 
     bucket.add_build(THIRD, BUILD_VERSION + 1);
     bucket.set_latest(THIRD, Some(BUILD_VERSION));
+    let failed = p.round(false).await.unwrap_err();
+    assert!(failed.starts_with(&format!("latest.json gives build {THIRD} build version {BUILD_VERSION}, ")), "{failed}");
+    assert!(refused().is_empty(), "{:?}", refused());
+    bucket.set_latest(THIRD, None);
     assert_eq!(p.round(false).await, Ok(format!("refused build {THIRD}: {why}")));
     assert_eq!(refused(), [(THIRD.to_string(), BUILD_VERSION, why.clone())]);
     assert_eq!(p.round(false).await, Ok(format!("build {THIRD} was refused: {why}")));
@@ -1200,7 +1205,7 @@ async fn a_refusal_doesnt_hold_against_the_build_published_again_under_its_date(
     let p = portal(data.path(), config(&bucket, load.clone()));
     p.round(true).await.unwrap();
     bucket.add_build(NEXT, BUILD_VERSION + 1);
-    bucket.set_latest(NEXT, Some(BUILD_VERSION));
+    bucket.set_latest(NEXT, None);
     let why = format!("it is of build version {}; this server reads build version {BUILD_VERSION}", BUILD_VERSION + 1);
     assert_eq!(p.round(false).await, Ok(format!("refused build {NEXT}: {why}")));
     assert_eq!(p.round(false).await, Ok(format!("build {NEXT} was refused: {why}")));
@@ -1211,6 +1216,33 @@ async fn a_refusal_doesnt_hold_against_the_build_published_again_under_its_date(
     assert!(p.status().refused.is_empty(), "{:?}", p.status().refused);
     let again = portal(data.path(), config(&bucket, load));
     assert_eq!(again.round(true).await, Ok(format!("build {NEXT} is served ({NEXT}-1)")));
+}
+
+// A build version latest.json gives that its build's manifest doesn't (the
+// nightly published a date's build again, and latest.json is not yet, or
+// no longer, of it) refuses nothing: the round fails, to be tried again,
+// saying why, and once the two agree the build is fetched and served.
+#[tokio::test]
+async fn a_latest_json_version_other_than_its_manifests_fails_the_round_and_refuses_nothing() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let p = portal(data.path(), config(&bucket, load));
+    p.round(true).await.unwrap();
+    bucket.edit_build(DATE, |m| m["presets"][2]["label"] = "With street addresses, corrected".into());
+    bucket.set_latest(DATE, Some(BUILD_VERSION + 1));
+
+    let failed = p.round(false).await.unwrap_err();
+
+    assert_eq!(failed, format!(
+        "latest.json gives build {DATE} build version {}, its {MANIFEST} build version {BUILD_VERSION}: nothing is refused while they disagree",
+        BUILD_VERSION + 1
+    ));
+    assert!(p.status().refused.is_empty(), "{:?}", p.status().refused);
+    assert!(!data.path().join(REFUSED).exists());
+    assert_eq!(p.served().unwrap().dir, format!("{DATE}-1"));
+    bucket.set_latest(DATE, Some(BUILD_VERSION));
+    assert_eq!(p.round(false).await, Ok(format!("build {DATE} is served ({DATE}-2)")));
 }
 
 // A sync left part way of a build since published again under its date is
