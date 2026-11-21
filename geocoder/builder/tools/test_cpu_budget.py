@@ -19,19 +19,37 @@ def write(path, text):
         f.write(text)
 
 
-def fake_cpus(test, cpus, cgroup="/", quotas=None):
-    """What a process's env sets for cpu_budget.sh to see it may run on `cpus` CPUs (nproc says so), in `cgroup`,
-    with the cpu.max file of each cgroup `quotas` names (a path under /sys/fs/cgroup, "" for its root, to the file's
-    line): CPU_BUDGET_ROOT, a dir of those files, and PATH, nproc first."""
+def fake_host(test, cpus, cgroups, files):
+    """What a process's env sets for cpu_budget.sh to see it may run on `cpus` CPUs (nproc says so), with the lines
+    `cgroups` in /proc/self/cgroup (None: no such file) and each of `files` (a path under /, to its line):
+    CPU_BUDGET_ROOT, a dir of those files, and PATH, nproc first."""
     root = tempfile.mkdtemp()
     test.addCleanup(shutil.rmtree, root)
-    if cgroup is not None:
-        write(os.path.join(root, "proc/self/cgroup"), f"0::{cgroup}\n")
-    for at, line in (quotas or {}).items():
-        write(os.path.join(root, "sys/fs/cgroup" + at, "cpu.max"), line + "\n")
+    if cgroups is not None:
+        write(os.path.join(root, "proc/self/cgroup"), cgroups)
+    for path, line in files.items():
+        write(os.path.join(root, path), line + "\n")
     write(os.path.join(root, "bin/nproc"), f"#!/bin/sh\necho {cpus}\n")
     os.chmod(os.path.join(root, "bin/nproc"), 0o755)
     return {"CPU_BUDGET_ROOT": root, "PATH": f"{root}/bin:{os.environ['PATH']}"}
+
+
+def fake_cpus(test, cpus, cgroup="/", quotas=None):
+    """fake_host in cgroup v2's `cgroup` (None: no /proc/self/cgroup), with the cpu.max file of each cgroup `quotas`
+    names (a path under /sys/fs/cgroup, "" for its root, to the file's line)."""
+    return fake_host(test, cpus, None if cgroup is None else f"0::{cgroup}\n",
+                     {f"sys/fs/cgroup{at}/cpu.max": line for at, line in (quotas or {}).items()})
+
+
+def fake_v1_cpus(test, cpus, cgroups, quotas, controllers="cpu,cpuacct"):
+    """fake_host with the lines `cgroups` in /proc/self/cgroup, under a cgroup v1 hierarchy mounted at
+    /sys/fs/cgroup/<controllers>: the cpu.cfs_quota_us and cpu.cfs_period_us of each cgroup `quotas` names (a path
+    under that dir, "" for its root, to the two files' values)."""
+    files = {}
+    for at, (quota, period) in quotas.items():
+        files[f"sys/fs/cgroup/{controllers}{at}/cpu.cfs_quota_us"] = quota
+        files[f"sys/fs/cgroup/{controllers}{at}/cpu.cfs_period_us"] = period
+    return fake_host(test, cpus, cgroups, files)
 
 
 def budget(env):
@@ -67,6 +85,35 @@ class CpuBudgetTest(unittest.TestCase):
     def test_a_cpu_max_it_cannot_read_as_a_quota_is_left_out(self):
         for line in ("", "max", "64 cpus", "6400000 0", "-1 100000"):
             self.assertEqual(budget(fake_cpus(self, 88, "/job", {"": line, "/job": "3200000 100000"})), 32, line)
+
+    # A host on cgroup v1, or a hybrid one, whose v2 hierarchy has no controllers: the quota is the CPU controller's,
+    # cpu.cfs_quota_us over cpu.cfs_period_us, the tightest from the cgroup up, and -1 is none.
+    def test_a_cgroup_v1_quota_under_the_cpu_count_is_the_budget(self):
+        hybrid = "12:pids:/pod/job\n4:cpu,cpuacct:/pod/job\n1:name=systemd:/pod/job\n0::/pod/job\n"
+        self.assertEqual(budget(fake_v1_cpus(self, 88, hybrid, {"/pod/job": ("6400000", "100000")})), 64)
+        self.assertEqual(budget(fake_v1_cpus(self, 88, "3:cpu:/job\n", {"/job": ("200000", "100000")},
+                                             controllers="cpu")), 2)
+
+    def test_the_tightest_cgroup_v1_quota_from_the_cgroup_up_holds(self):
+        for quotas, expected in (({"/pod": ("800000", "100000"), "/pod/job": ("-1", "100000")}, 8),
+                                 ({"": ("400000", "100000"), "/pod": ("-1", "100000"),
+                                   "/pod/job": ("1600000", "100000")}, 4),
+                                 ({"": ("-1", "100000"), "/pod": ("-1", "100000"), "/pod/job": ("-1", "100000")}, 88)):
+            self.assertEqual(budget(fake_v1_cpus(self, 88, "4:cpu,cpuacct:/pod/job\n", quotas)), expected, quotas)
+
+    # A container without a cgroup namespace: /proc/self/cgroup names its cgroup on the host, and the hierarchy's
+    # mount is that cgroup, its quota at the mount's root.
+    def test_a_containers_cgroup_v1_quota_at_its_mounts_root_holds(self):
+        self.assertEqual(budget(fake_v1_cpus(self, 88, "4:cpu,cpuacct:/docker/abc\n", {"": ("400000", "100000")})), 4)
+
+    def test_a_cgroup_v1_quota_counts_whole_cpus_and_at_least_one(self):
+        for quota, expected in (("250000", 2), ("50000", 1)):
+            self.assertEqual(budget(fake_v1_cpus(self, 88, "4:cpu,cpuacct:/\n", {"": (quota, "100000")})), expected,
+                             quota)
+
+    def test_a_cgroup_v1_hierarchy_without_the_cpu_controller_sets_no_quota(self):
+        self.assertEqual(budget(fake_v1_cpus(self, 88, "5:cpuset:/job\n6:cpuacct:/job\n", {"/job": ("200000", "100000")},
+                                             controllers="cpuset")), 88)
 
     # This host's own /proc and /sys, quota or none.
     def test_on_this_host_the_budget_is_a_count_of_cpus(self):
