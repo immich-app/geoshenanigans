@@ -776,6 +776,85 @@ async fn a_build_the_volume_holds_is_served_again_without_a_fetch() {
     assert_eq!(bucket.requests().len(), fetched);
 }
 
+// A build published again under its date (a rerun of the nightly) is
+// another build: the sync fetches it into a new dir and serves it, though
+// the build served is of that date, and the dir of the build it replaces
+// goes.
+#[tokio::test]
+async fn a_build_published_again_under_its_date_is_fetched_into_a_new_dir_and_served() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let p = portal(data.path(), config(&bucket, load));
+    p.round(true).await.unwrap();
+    let before = bucket.requests().len();
+
+    bucket.edit_build(DATE, |m| m["presets"][2]["label"] = "With street addresses, corrected".into());
+
+    assert_eq!(p.round(false).await, Ok(format!("build {DATE} is served ({DATE}-2)")));
+    assert_eq!(p.served().unwrap().plan.datasets[p.served().unwrap().plan.default].label, "With street addresses, corrected");
+    assert_eq!(bucket.requests().len() - before, fetched(&bucket).await.len());
+    assert_eq!(build_dirs(data.path()), [format!("{DATE}-2")]);
+    assert_eq!(p.round(false).await, Ok(format!("build {DATE} is served ({DATE}-2)")));
+    assert_eq!(bucket.requests().len() - before, fetched(&bucket).await.len());
+}
+
+// A refusal is of the build as it was published: once the build of its
+// date is published again, corrected, the sync fetches and serves it, and
+// so does a portal started afresh on the volume.
+#[tokio::test]
+async fn a_refusal_doesnt_hold_against_the_build_published_again_under_its_date() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let p = portal(data.path(), config(&bucket, load.clone()));
+    p.round(true).await.unwrap();
+    bucket.add_build(NEXT, BUILD_VERSION + 1);
+    bucket.set_latest(NEXT, Some(BUILD_VERSION));
+    let why = format!("it is of build version {}; this server reads build version {BUILD_VERSION}", BUILD_VERSION + 1);
+    assert_eq!(p.round(false).await, Ok(format!("refused build {NEXT}: {why}")));
+    assert_eq!(p.round(false).await, Ok(format!("build {NEXT} was refused: {why}")));
+
+    bucket.add_build(NEXT, BUILD_VERSION);
+
+    assert_eq!(p.round(false).await, Ok(format!("build {NEXT} is served ({NEXT}-1)")));
+    assert!(p.status().refused.is_empty(), "{:?}", p.status().refused);
+    let again = portal(data.path(), config(&bucket, load));
+    assert_eq!(again.round(true).await, Ok(format!("build {NEXT} is served ({NEXT}-1)")));
+}
+
+// A sync left part way of a build since published again under its date is
+// not resumed: the build as published now goes into a new dir, and the dir
+// left part way goes.
+#[tokio::test]
+async fn a_sync_left_part_way_of_a_build_published_again_since_is_not_resumed() {
+    let bucket = test_bucket::serve(test_bucket::template_components()).await;
+    let data = ScratchDir::new();
+    let (_fixtures, load) = fixtures();
+    let mut one_at_a_time = config(&bucket, load.clone());
+    one_at_a_time.fetches_at_once = 1;
+    let p = portal(data.path(), one_at_a_time);
+    let mut order = fetched(&bucket).await;
+    order.sort_by(|a, b| b.size.cmp(&a.size).then_with(|| a.path.cmp(&b.path)));
+    let holding = bucket.hold(&object_url(&order[3]));
+    let round = tokio::spawn({
+        let p = p.clone();
+        async move { p.round(true).await }
+    });
+    holding.reached().await;
+    round.abort();
+    assert!(round.await.unwrap_err().is_cancelled());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(holding);
+
+    bucket.edit_build(DATE, |m| m["presets"][2]["label"] = "With street addresses, corrected".into());
+    let before = bucket.requests().len();
+
+    assert_eq!(portal(data.path(), config(&bucket, load)).round(true).await, Ok(format!("build {DATE} is served ({DATE}-2)")));
+    assert_eq!(bucket.requests().len() - before, order.len());
+    assert_eq!(build_dirs(data.path()), [format!("{DATE}-2")]);
+}
+
 // A build the volume holds whose files no longer hold their manifest's
 // bytes is not served again: it is fetched anew into a new dir, and the
 // damaged one goes.

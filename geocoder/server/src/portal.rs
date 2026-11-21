@@ -113,6 +113,8 @@ pub fn free_space(dir: &Path) -> std::io::Result<u64> {
 pub struct Served {
     /// Its dir under builds/ (`<date>-<n>`).
     pub dir: String,
+    /// The sha256 of its configurations.json (sync::manifest_sha256).
+    pub manifest_sha256: String,
     pub plan: catalog::Plan,
     /// Each dataset's index, as plan.datasets orders them.
     pub indexes: Vec<Arc<MultiIndex>>,
@@ -160,6 +162,9 @@ pub struct Latest {
     pub date: String,
     /// Its build version, where latest.json names one.
     pub build_version: Option<u32>,
+    /// The sha256 of its configurations.json, once the round fetched it:
+    /// a build published again under its date is another.
+    pub manifest_sha256: Option<String>,
 }
 
 pub struct Portal {

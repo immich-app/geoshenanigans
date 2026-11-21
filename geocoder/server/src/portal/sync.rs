@@ -14,17 +14,21 @@
 // doesn't name. Files of the same bytes within a build are fetched once and
 // hard-linked (catalog::Object::link).
 //
+// A build is the one of a date as its configurations.json was published: a
+// rerun of the nightly that publishes a date's build again makes another,
+// which the sync fetches into a new dir though it serves the one before.
 // A build of another build version, or one whose datasets don't all load,
-// is refused: never switched to, and recorded in REFUSED with why, so that
-// it is not fetched again while latest.json names it. A query-portal holds
+// is refused: never switched to, and recorded in REFUSED with why and its
+// manifest's sha256, so that it is not fetched again while latest.json
+// names it and the bucket holds it as it was refused. A query-portal holds
 // the data dir's lock (VOLUME_LOCK) for as long as it runs, so that no
 // other process prunes its builds, and every round runs under one lock
 // (LOCK); the first of a process serves the newest local build that loads
 // before it asks the bucket anything, and checks its files against their
-// sha256. A build the data dir holds complete is
-// served again from its dir (latest.json moved back to it) once its files
-// check out, not fetched. The prune keeps the build served, the one served
-// before it and the dir of the latest build a sync left part way.
+// sha256. A build the data dir holds complete is served again from its dir
+// (latest.json moved back to it) once its files check out, not fetched.
+// The prune keeps the build served, the one served before it and the dir
+// of the latest build a sync left part way.
 
 use std::collections::{BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -65,10 +69,13 @@ pub const LATEST_OVERRIDE: &str = "latest.override";
 /// The room a sync wants free beyond its files'.
 pub const FREE_MARGIN: u64 = 2 << 30;
 
-/// A build refused by a server of build version `version`.
+/// A build refused by a server of build version `version`: the build of
+/// `date` as it was published, its configurations.json of sha256
+/// `manifest_sha256` (a build published again under its date is another).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Refusal {
     pub date: String,
+    pub manifest_sha256: String,
     pub version: u32,
     pub reason: String,
     pub at: String,
@@ -119,6 +126,12 @@ pub fn iso(t: SystemTime) -> String {
 
 fn gib(bytes: u64) -> String {
     format!("{:.2} GiB", bytes as f64 / (1u64 << 30) as f64)
+}
+
+/// The sha256 of a configurations.json's bytes, which tells a build from
+/// the one published before it under its date.
+pub fn manifest_sha256(bytes: &[u8]) -> String {
+    lower_hex(&Sha256::digest(bytes))
 }
 
 /// The downloader's and the portal's reading of a configurations.json.
@@ -423,7 +436,8 @@ impl Portal {
         if manifest.build.version != BUILD_VERSION {
             return Err(format!("it is of build version {}; this server reads build version {BUILD_VERSION}", manifest.build.version));
         }
-        if let Some(refused) = self.refusal(&manifest.build.date) {
+        let sha256 = manifest_sha256(&bytes);
+        if let Some(refused) = self.refusal(&manifest.build.date, &sha256) {
             return Err(format!("it was refused: {}", refused.reason));
         }
         let plan = catalog::plan(&cfg, &manifest)?;
@@ -431,12 +445,13 @@ impl Portal {
         tokio::task::spawn_blocking(move || in_place(&at, &cfg, &checked))
             .await
             .map_err(|e| format!("check task: {e}"))??;
-        self.load(name, plan).await
+        self.load(name, plan, sha256).await
     }
 
-    /// Every dataset of the build dir `name`, loaded; or the first that
-    /// doesn't load, and why.
-    async fn load(&self, name: &str, plan: Plan) -> Result<Served, String> {
+    /// Every dataset of the build dir `name`, whose configurations.json is of
+    /// sha256 `manifest_sha256`, loaded; or the first that doesn't load, and
+    /// why.
+    async fn load(&self, name: &str, plan: Plan, manifest_sha256: String) -> Result<Served, String> {
         let (sets, load, dir) = (self.builds().join(name).join(SETS), self.config.load.clone(), name.to_string());
         tokio::task::spawn_blocking(move || {
             let mut indexes = Vec::with_capacity(plan.datasets.len());
@@ -445,7 +460,7 @@ impl Portal {
                 indexes.push(Arc::new(index));
             }
             let datasets_json = plan.json(&dir).to_string();
-            Ok(Served { dir, plan, indexes, datasets_json })
+            Ok(Served { dir, manifest_sha256, plan, indexes, datasets_json })
         })
         .await
         .map_err(|e| format!("load task: {e}"))?
@@ -484,18 +499,26 @@ impl Portal {
         Ok(())
     }
 
-    /// This server's refusal of the build of `date`, if it refused it.
-    fn refusal(&self, date: &str) -> Option<Refusal> {
-        self.refusals().into_iter().find(|r| r.date == date && r.version == BUILD_VERSION)
+    /// This server's refusal of the build of `date` whose configurations.json
+    /// is of sha256 `sha256`, if it refused it.
+    fn refusal(&self, date: &str, sha256: &str) -> Option<Refusal> {
+        self.refusals().into_iter().find(|r| r.date == date && r.manifest_sha256 == sha256 && r.version == BUILD_VERSION)
     }
 
-    /// Records that this server refuses the build of `date`, and why: what
-    /// the round did.
-    fn refuse(&self, date: &str, why: &str) -> Result<String, String> {
+    /// Records that this server refuses the build of `date` whose
+    /// configurations.json is of sha256 `sha256`, and why: what the round
+    /// did.
+    fn refuse(&self, date: &str, sha256: &str, why: &str) -> Result<String, String> {
         eprintln!("portal sync: refusing build {date}: {why}");
         let mut refusals = self.refusals();
-        refusals.retain(|r| !(r.date == date && r.version == BUILD_VERSION));
-        refusals.push(Refusal { date: date.to_string(), version: BUILD_VERSION, reason: why.to_string(), at: iso(SystemTime::now()) });
+        refusals.retain(|r| !(r.date == date && r.manifest_sha256 == sha256 && r.version == BUILD_VERSION));
+        refusals.push(Refusal {
+            date: date.to_string(),
+            manifest_sha256: sha256.to_string(),
+            version: BUILD_VERSION,
+            reason: why.to_string(),
+            at: iso(SystemTime::now()),
+        });
         self.keep_refusals(refusals)?;
         Ok(format!("refused build {date}: {why}"))
     }
@@ -530,7 +553,7 @@ impl Portal {
                 if !is_date(date) {
                     return Err(format!("{LATEST_OVERRIDE} holds {date:?}, no date"));
                 }
-                return Ok(Latest { date: date.to_string(), build_version: None });
+                return Ok(Latest { date: date.to_string(), build_version: None, manifest_sha256: None });
             }
         }
         let url = format!("{}/builds/latest.json", self.config.base_url.trim_end_matches('/'));
@@ -539,55 +562,62 @@ impl Portal {
         if !is_date(&latest.latest) {
             return Err(format!("{url} names {:?}, no date", latest.latest));
         }
-        Ok(Latest { date: latest.latest, build_version: latest.build_version })
+        Ok(Latest { date: latest.latest, build_version: latest.build_version, manifest_sha256: None })
     }
 
     /// Fetches the latest build into a dir of its own and serves it once
-    /// all its datasets load; what it did, or why it failed. A build of
-    /// another build version, or that can't be served, is refused; one
-    /// refused is not fetched again while it is the latest. With the latest
-    /// served it does nothing, unless the build served is damaged; with it
-    /// complete in a dir, it serves it from there.
+    /// all its datasets load; what it did, or why it failed. The latest
+    /// build is the one of the date latest.json names as its
+    /// configurations.json is now: one published again under its date (a
+    /// rerun of the nightly) is another build. A build of another build
+    /// version, or that can't be served, is refused; one refused is not
+    /// fetched again while it is the latest. With the latest served it does
+    /// nothing, unless the build served is damaged; with it complete in a
+    /// dir, it serves it from there.
     async fn sync(&self) -> Result<String, String> {
         self.running("reading the latest build".to_string());
-        let latest = self.latest().await?;
+        let mut latest = self.latest().await?;
         let date = latest.date.clone();
         self.set_status(|s| s.latest = Some(latest.clone()));
-        // A refusal counts while latest.json names its build.
+        self.running(format!("fetching build {date}'s {MANIFEST}"));
+        let base = self.config.base_url.trim_end_matches('/').to_string();
+        let bytes = self.fetch_bytes(&format!("{base}/builds/{date}/{MANIFEST}")).await?;
+        let sha256 = manifest_sha256(&bytes);
+        latest.manifest_sha256 = Some(sha256.clone());
+        self.set_status(|s| s.latest = Some(latest.clone()));
+        // A refusal counts while latest.json names its build, as published
+        // then.
         let refusals = self.refusals();
-        let current: Vec<Refusal> = refusals.iter().filter(|r| r.date == date).cloned().collect();
+        let current: Vec<Refusal> = refusals.iter().filter(|r| r.date == date && r.manifest_sha256 == sha256).cloned().collect();
         if current.len() != refusals.len() {
             self.keep_refusals(current)?;
         } else {
             self.set_status(|s| s.refused = current.into_iter().filter(|r| r.version == BUILD_VERSION).collect());
         }
         if let Some(version) = latest.build_version.filter(|&v| v != BUILD_VERSION) {
-            return self.refuse(&date, &format!("it is of build version {version}; this server reads build version {BUILD_VERSION}"));
+            return self.refuse(&date, &sha256, &format!("it is of build version {version}; this server reads build version {BUILD_VERSION}"));
         }
-        if let Some(refused) = self.refusal(&date) {
+        if let Some(refused) = self.refusal(&date, &sha256) {
             return Ok(format!("build {date} was refused: {}", refused.reason));
         }
         let served = self.served();
-        if let Some(served) = served.as_ref().filter(|s| s.plan.date == date && !self.unusable(&s.dir)) {
+        if let Some(served) = served.as_ref().filter(|s| s.plan.date == date && s.manifest_sha256 == sha256 && !self.unusable(&s.dir)) {
             return Ok(format!("build {date} is served ({})", served.dir));
         }
 
-        self.running(format!("fetching build {date}'s {MANIFEST}"));
-        let base = self.config.base_url.trim_end_matches('/').to_string();
-        let bytes = self.fetch_bytes(&format!("{base}/builds/{date}/{MANIFEST}")).await?;
         let (cfg, manifest) = match parse_manifest(&bytes) {
             Ok(parsed) => parsed,
-            Err(why) => return self.refuse(&date, &format!("its {MANIFEST} doesn't parse: {why}")),
+            Err(why) => return self.refuse(&date, &sha256, &format!("its {MANIFEST} doesn't parse: {why}")),
         };
         if manifest.build.date != date {
             return Err(format!("build {date}'s {MANIFEST} is build {}'s", manifest.build.date));
         }
         if manifest.build.version != BUILD_VERSION {
-            return self.refuse(&date, &format!("it is of build version {}; this server reads build version {BUILD_VERSION}", manifest.build.version));
+            return self.refuse(&date, &sha256, &format!("it is of build version {}; this server reads build version {BUILD_VERSION}", manifest.build.version));
         }
         let plan = match catalog::plan(&cfg, &manifest) {
             Ok(plan) => plan,
-            Err(why) => return self.refuse(&date, &why),
+            Err(why) => return self.refuse(&date, &sha256, &why),
         };
 
         // A complete dir of this build, of its manifest, which this process
@@ -671,7 +701,7 @@ impl Portal {
         .map_err(|e| format!("link task: {e}"))??;
 
         self.running(format!("loading build {name}"));
-        match self.load(&name, plan).await {
+        match self.load(&name, plan, sha256.clone()).await {
             Ok(loaded) => {
                 if let Some(before) = self.serve(loaded) {
                     eprintln!("portal sync: build {name} is served in place of {}", before.dir);
@@ -680,7 +710,7 @@ impl Portal {
             }
             Err(why) => {
                 self.set_unusable(&name);
-                self.refuse(&date, &format!("it doesn't load: {why}"))
+                self.refuse(&date, &sha256, &format!("it doesn't load: {why}"))
             }
         }
     }
@@ -760,7 +790,9 @@ impl Portal {
     /// of another date that this process didn't find unusable (the one
     /// served before it: the one before it, or after latest.json moved back
     /// to an older build, the newer one it served); and the newest
-    /// incomplete one of the latest build (to resume), or of any while the
+    /// incomplete one of the latest build (to resume): of its date and, once
+    /// the round fetched its configurations.json, of that manifest, not one
+    /// of the build published before it under its date; or of any while the
     /// latest build is not known (a first round that couldn't ask the
     /// bucket).
     async fn prune(&self) {
@@ -778,9 +810,15 @@ impl Portal {
                 keep.insert(d.name());
             }
         }
-        let latest = self.status().latest.map(|l| l.date);
+        let latest = self.status().latest;
+        let of_latest = |d: &BuildDir| match &latest {
+            None => true,
+            Some(l) => l.date == d.date && l.manifest_sha256.as_ref().is_none_or(|sha256| {
+                std::fs::read(self.builds().join(d.name()).join(MANIFEST)).is_ok_and(|m| manifest_sha256(&m) == *sha256)
+            }),
+        };
         let staging = dirs.iter().rev()
-            .find(|(d, complete)| !complete && latest.as_ref().is_none_or(|l| *l == d.date) && !self.unusable(&d.name()));
+            .find(|(d, complete)| !complete && of_latest(d) && !self.unusable(&d.name()));
         if let Some((d, _)) = staging {
             keep.insert(d.name());
         }

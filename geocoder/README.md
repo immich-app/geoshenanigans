@@ -159,7 +159,10 @@ the portal runs 8 lookups at once, the others waiting their turn.
 checked against the build's manifest and the files two dirs share
 hard-linked (~11.2 GiB a build, ~9 GiB to download). It switches to a build
 only once every dataset of it loads, and refuses one of another build
-version than it reads, saying so on `/health`. Until it has a build to
+version than it reads, saying so on `/health`. A build published again
+under its date (a rerun of the nightly) is another build: it fetches that
+one too, and a refusal of the build as first published doesn't hold
+against it. Until it has a build to
 serve, `/reverse`, `/polygons` and `/datasets` answer 503 with the reason. It
 keeps the build it serves and the one it served before, and serves a build it
 holds again, without a fetch, once latest.json names it again. A date in
