@@ -204,18 +204,20 @@ jobs:
       # same crate, which encodes the transport units (Compress index files)
       # and decodes yesterday's (fetch_previous_index.sh): compiled beside
       # Setup and the downloads like the tools, detached so it outlives this
-      # step. search.status is written once both are built.
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
-        with:
-          toolchain: stable
-
+      # step, after the stable toolchain it installs first (rust_toolchain.sh:
+      # a fresh pod downloads it, ~15 s no step waits for). search.status is
+      # written once both are built.
       - name: Build place search
         env:
           RUNNER_TEMP: ${{ runner.temp }}
         run: |
-          # The inner script expands its own arguments ($0 is the status file).
+          CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}
+          export CARGO_HOME CARGO_INCREMENTAL=0 PATH="$CARGO_HOME/bin:$PATH"
+          # The inner script expands its own arguments ($0 is the status file,
+          # $1 the toolchain's install, then the build).
           # shellcheck disable=SC2016
-          setsid nohup bash -c '"$@"; echo $? > "$0"' "$RUNNER_TEMP/search.status" \
+          setsid nohup bash -c '"$1" && shift && "$@"; echo $? > "$0"' "$RUNNER_TEMP/search.status" \
+            geocoder/builder/tools/rust_toolchain.sh \
             cargo build --release --locked --manifest-path geocoder/search/Cargo.toml \
             > "$RUNNER_TEMP/search.log" 2>&1 < /dev/null &
 
@@ -353,12 +355,32 @@ jobs:
           CACHE_BUCKET: ${{ steps.setup.outputs.cache_bucket }}
           YESTERDAY: ${{ steps.setup.outputs.yesterday }}
           TODAY: ${{ steps.setup.outputs.today }}
+          TODAY_SEQ: ${{ steps.setup.outputs.today_seq }}
           HAS_PREVIOUS: ${{ steps.setup.outputs.has_previous }}
           PBF_CACHE: ${{ steps.setup.outputs.pbf_cache }}
         run: |
           CACHE="env AWS_ACCESS_KEY_ID=$CACHE_AWS_KEY AWS_SECRET_ACCESS_KEY=$CACHE_AWS_SECRET s5cmd --endpoint-url $CACHE_ENDPOINT --retry-count 5 --numworkers 15"
           S5="s5cmd --endpoint-url $S3_ENDPOINT --retry-count 5 --numworkers 32"
           STEP_START=$(date +%s)
+
+          # ── Background: the day's diff ──
+          # What Apply replication diffs applies to yesterday's PBF (it fetches
+          # it itself if this failed): ~140 MiB, beside the PBF rather than
+          # after it.
+          (
+            START=$(date +%s)
+            DIFF_PATH=$(printf "%03d/%03d/%03d" $((TODAY_SEQ / 1000000)) $(((TODAY_SEQ / 1000) % 1000)) $((TODAY_SEQ % 1000)))
+            if curl -sL --fail --retry 5 --retry-delay 30 --retry-all-errors -o "$WORKDIR/diff-today.osc.gz.part" \
+                 "https://planet.openstreetmap.org/replication/day/$DIFF_PATH.osc.gz" \
+               && gzip -t "$WORKDIR/diff-today.osc.gz.part"; then
+              mv "$WORKDIR/diff-today.osc.gz.part" "$WORKDIR/diff-today.osc.gz"
+              echo "[diff] seq $TODAY_SEQ: $(( $(stat -c%s "$WORKDIR/diff-today.osc.gz") / 1024 / 1024 )) MiB in $(($(date +%s) - START))s"
+            else
+              rm -f "$WORKDIR/diff-today.osc.gz.part"
+              echo "::warning::[diff] Fetching the diff of seq $TODAY_SEQ failed; Apply replication diffs fetches it"
+            fi
+          ) &
+          DIFF_PID=$!
 
           # Retry wrapper: retries a command up to N times with backoff
           retry() {
@@ -374,7 +396,8 @@ jobs:
             return 1
           }
 
-          # Cache check: returns 0 if path exists, with retries for transient failures
+          # Cache check: returns 0 if path exists, with retries for transient
+          # failures (yesterday's PBF: a miss means the mirror)
           cache_exists() {
             local pattern="$1"
             local check="$2"
@@ -524,7 +547,9 @@ jobs:
             return 1
           }
 
-          if cache_exists "s3://$CACHE_BUCKET/$PBF_CACHE/planet-${TODAY}.osm.pbf" "planet-"; then
+          # Today's PBF is there only when a run of the day applied the diff
+          # already: one look, with no retries, as a miss costs nothing.
+          if $CACHE ls "s3://$CACHE_BUCKET/$PBF_CACHE/planet-${TODAY}.osm.pbf" 2> /dev/null | grep -q "planet-"; then
             if download_pbf_from_cache \
                 "s3://$CACHE_BUCKET/$PBF_CACHE/planet-${TODAY}.osm.pbf" \
                 "$WORKDIR/planet.osm.pbf" "today's PBF ($TODAY)"; then
@@ -563,6 +588,7 @@ jobs:
             wait $IDX_PID
           fi
           wait $EXTRAS_PID
+          wait $DIFF_PID || true
           echo "All downloads complete in $(($(date +%s) - STEP_START))s"
 
       - name: Run builder tests
@@ -624,13 +650,18 @@ jobs:
           }
 
           if [ "$PBF_SOURCE" = "yesterday" ]; then
-            DIR1=$(printf "%03d" $((TODAY_SEQ / 1000000)))
-            DIR2=$(printf "%03d" $(((TODAY_SEQ / 1000) % 1000)))
-            FILE=$(printf "%03d" $((TODAY_SEQ % 1000)))
-            echo "Downloading replication diff (seq $TODAY_SEQ)..."
-            curl -sL --fail --retry 5 --retry-delay 30 --retry-all-errors \
-              -o "$WORKDIR/diff-today.osc.gz" "$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
-            gzip -t "$WORKDIR/diff-today.osc.gz"
+            # The download step fetched it beside the PBF; this is its fallback.
+            if [ -s "$WORKDIR/diff-today.osc.gz" ] && gzip -t "$WORKDIR/diff-today.osc.gz"; then
+              echo "Replication diff (seq $TODAY_SEQ) fetched during the download"
+            else
+              DIR1=$(printf "%03d" $((TODAY_SEQ / 1000000)))
+              DIR2=$(printf "%03d" $(((TODAY_SEQ / 1000) % 1000)))
+              FILE=$(printf "%03d" $((TODAY_SEQ % 1000)))
+              echo "Downloading replication diff (seq $TODAY_SEQ)..."
+              curl -sL --fail --retry 5 --retry-delay 30 --retry-all-errors \
+                -o "$WORKDIR/diff-today.osc.gz" "$SERVER/$DIR1/$DIR2/${FILE}.osc.gz"
+              gzip -t "$WORKDIR/diff-today.osc.gz"
+            fi
             DIFF_SIZE=$(stat -c%s "$WORKDIR/diff-today.osc.gz")
             echo "Diff: $((DIFF_SIZE/1024/1024)) MiB"
 
@@ -643,7 +674,9 @@ jobs:
             echo "Disk after apply-diffs:"
             df -h "$WORKDIR"
           else
-            # Mirror path — PBF may be a few days behind
+            # Mirror path — PBF may be a few days behind; the diffs it needs
+            # come down here, the download step's diff of the day with them.
+            rm -f "$WORKDIR/diff-today.osc.gz"
             PBF_DATE=$(osmium fileinfo -g header.option.osmosis_replication_timestamp "$WORKDIR/planet.osm.pbf" 2>/dev/null | cut -dT -f1)
             DAYS_NEEDED=$(( ($(date -u -d "$TODAY" +%s) - $(date -u -d "$PBF_DATE" +%s)) / 86400 ))
             PBF_SEQ=$((TODAY_SEQ - DAYS_NEEDED))
