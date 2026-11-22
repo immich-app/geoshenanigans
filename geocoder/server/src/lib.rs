@@ -3807,10 +3807,12 @@ impl MultiIndex {
     /// match and this is just a pass-through.
     ///
     /// The water doesn't count towards the pick, so it never moves an
-    /// address to another continent. Where the picked answer has none, it
-    /// takes the water of the first other matching continent that has
-    /// some: a continent's water dirs hold only the water its region
-    /// takes in.
+    /// address to another continent. It is the one of all the matching
+    /// continents' that answers first in a water dir's order (water.rs),
+    /// the picked answer's where they tie: a continent's water dirs hold
+    /// only the water its region takes in, and continents downloaded on
+    /// other days, or of other water tiers, can hold other water at the
+    /// point.
     ///
     /// The answers borrow their strings from the continents' indexes,
     /// whose Arcs are held here until the chosen one is serialized.
@@ -3826,9 +3828,10 @@ impl MultiIndex {
         }
         let Some((_, chosen)) = best else { return "{}".to_string() };
         let mut answer = answers.remove(chosen);
-        if answer.water.is_none() {
-            answer.water = answers.into_iter().find_map(|r| r.water);
-        }
+        answer.water = std::iter::once(answer.water.take())
+            .chain(answers.into_iter().map(|r| r.water))
+            .flatten()
+            .min_by(WaterDetail::order);
         serde_json::to_string(&answer).unwrap_or_default()
     }
 }
@@ -4148,36 +4151,47 @@ mod query_tests {
     }
 
     // Where continents overlap (the Sinai: africa and asia), the answer is the continent's with the
-    // fuller address, as without water, the first of those that tie; where its continent's water
-    // dir has no water at the point, the water is that of the first other continent with some.
+    // fuller address, as without water, the first of those that tie; its water is the one of all
+    // theirs that answers first in a water dir's order (water.rs), the address's continent's or
+    // another's: continents downloaded on other days, or of other water tiers, can hold other
+    // water at the point.
     #[test]
-    fn the_answers_continent_takes_another_continents_water_where_its_own_has_none() {
+    fn the_water_of_overlapping_continents_answers_in_a_water_dirs_order() {
         use crate::water::fixture::{WaterFixture, BAY, SEA};
-        // South Sinai, a state, is listed in the cell of its centre, where the point is.
+        // South Sinai, a state, is listed in the cell of its centre, where the point is; the Gulf
+        // of Suez lies in the Red Sea around it.
         let (lat, lng) = (28.5, 33.6);
         let egypt = ("South Sinai", 4, [27.5, 32.6, 29.5, 34.6]);
-        let water = |name: &str, code: u16| Some(WaterFixture::new().area(name, code, (28.0, 33.0, 29.0, 34.0), &[]).layer());
+        let (gulf, sea) = ((28.0, 33.0, 29.0, 34.0), (27.0, 32.0, 30.0, 35.0));
+        let water = |name: &str, code: u16, span| Some(WaterFixture::new().area(name, code, span, &[]).layer());
         let with = |mut idx: Index, w: Option<WaterLayer>| {
             idx.water = w;
             idx
         };
         let json = |slots: Vec<(&'static str, Index)>| serde_json::from_str::<serde_json::Value>(&multi(slots).query_json(lat, lng)).unwrap();
         let named = |name: &str, class: &str, r#type: &str| serde_json::json!({"name": name, "class": class, "type": r#type});
+        let both_orders = |africa: &dyn Fn() -> Index, asia: &dyn Fn() -> Index| {
+            [json(vec![("africa", africa()), ("asia", asia())]), json(vec![("asia", asia()), ("africa", africa())])]
+        };
 
         // Africa's answer, Asia's water, whichever comes first.
         let mut want = serde_json::to_value(index(&[egypt], &[]).query(lat, lng)).unwrap();
         assert_eq!(want["address"], serde_json::json!({"state": "South Sinai"}));
         want["water"] = named("Gulf of Suez", "natural", "bay");
-        for africa_first in [true, false] {
-            let (africa, asia) = (("africa", index(&[egypt], &[])), ("asia", with(index(&[], &[]), water("Gulf of Suez", BAY))));
-            assert_eq!(json(if africa_first { vec![africa, asia] } else { vec![asia, africa] }), want);
+        assert_eq!(both_orders(&|| index(&[egypt], &[]), &|| with(index(&[], &[]), water("Gulf of Suez", BAY, gulf))), [want.clone(), want.clone()]);
+        // The smaller body, Africa's or Asia's, beside Africa's address.
+        let gulf_in_asia = both_orders(&|| with(index(&[egypt], &[]), water("Red Sea", SEA, sea)), &|| with(index(&[], &[]), water("Gulf of Suez", BAY, gulf)));
+        assert_eq!(gulf_in_asia, [want.clone(), want.clone()]);
+        let gulf_in_africa = both_orders(&|| with(index(&[egypt], &[]), water("Gulf of Suez", BAY, gulf)), &|| with(index(&[], &[]), water("Red Sea", SEA, sea)));
+        assert_eq!(gulf_in_africa, [want.clone(), want.clone()]);
+        // Bodies of one area, rank and type code: the smaller name, Africa's or Asia's.
+        for (africa, asia) in [("Gulf of Suez", "Gulf of Aqaba"), ("Gulf of Aqaba", "Gulf of Suez")] {
+            let got = both_orders(&|| with(index(&[egypt], &[]), water(africa, BAY, gulf)), &|| with(index(&[], &[]), water(asia, BAY, gulf)));
+            assert_eq!(got.map(|g| g["water"].clone()), [named("Gulf of Aqaba", "natural", "bay"), named("Gulf of Aqaba", "natural", "bay")]);
         }
-        // Its own water where it has some.
-        let got = json(vec![("asia", with(index(&[], &[]), water("Gulf of Suez", BAY))), ("africa", with(index(&[egypt], &[]), water("Red Sea", SEA)))]);
-        assert_eq!(got["water"], named("Red Sea", "place", "sea"));
         // Water counts for nothing in the pick: of two empty addresses the first answers, with
         // the water of the second.
-        let got = json(vec![("africa", index(&[], &[])), ("asia", with(index(&[], &[]), water("Gulf of Suez", BAY)))]);
+        let got = json(vec![("africa", index(&[], &[])), ("asia", with(index(&[], &[]), water("Gulf of Suez", BAY, gulf)))]);
         assert_eq!(got, serde_json::json!({"address": {}, "water": named("Gulf of Suez", "natural", "bay")}));
         assert_eq!(json(vec![("africa", index(&[], &[])), ("asia", index(&[], &[]))]), serde_json::json!({"address": {}}));
     }

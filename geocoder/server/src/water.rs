@@ -85,7 +85,47 @@ pub struct WaterDetail<'a> {
     pub name: Cow<'a, str>,
     pub class: &'a str,
     pub r#type: &'a str,
+    /// Where its object comes in the order in which water answers, which no answer shows.
+    #[serde(skip)]
+    precedence: Precedence,
 }
+
+impl WaterDetail<'_> {
+    /// The order in which water answers, of one water dir or of several (the continents that
+    /// hold a point): by Precedence, then the smaller name.
+    pub(crate) fn order(&self, other: &Self) -> Ordering {
+        self.precedence.cmp(&other.precedence).then_with(|| self.name.cmp(&other.name))
+    }
+}
+
+/// An object's place in the order in which water answers, but for its name: the smaller area,
+/// then the higher rank, then the lower type code.
+#[derive(Debug, Clone, Copy)]
+struct Precedence {
+    area: f32,
+    rank: u8,
+    code: u16,
+}
+
+impl Ord for Precedence {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.area.total_cmp(&other.area).then(other.rank.cmp(&self.rank)).then(self.code.cmp(&other.code))
+    }
+}
+
+impl PartialOrd for Precedence {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Precedence {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Precedence {}
 
 /// A polygon of the point's cell that may hold it, with its kind.
 struct Candidate<'a> {
@@ -95,12 +135,14 @@ struct Candidate<'a> {
 }
 
 impl Candidate<'_> {
-    /// The order in which candidates answer, but for the name: the smaller area, then the higher
-    /// rank, then the lower type code.
+    /// Its object's place in the order in which water answers.
+    fn precedence(&self) -> Precedence {
+        Precedence { area: self.poly.area, rank: self.kind.rank, code: self.poly.country_code }
+    }
+
+    /// The order in which candidates answer, but for the name.
     fn order(&self, other: &Self) -> Ordering {
-        self.poly.area.total_cmp(&other.poly.area)
-            .then(other.kind.rank.cmp(&self.kind.rank))
-            .then(self.poly.country_code.cmp(&other.poly.country_code))
+        self.precedence().cmp(&other.precedence())
     }
 }
 
@@ -211,7 +253,7 @@ impl WaterLayer {
                 _ => Some(c),
             };
         }
-        best.map(|b| WaterDetail { name: self.strings.get(b.poly.name_id), class: &b.kind.class, r#type: &b.kind.r#type })
+        best.map(|b| WaterDetail { name: self.strings.get(b.poly.name_id), class: &b.kind.class, r#type: &b.kind.r#type, precedence: b.precedence() })
     }
 }
 
