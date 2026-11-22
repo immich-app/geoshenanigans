@@ -644,12 +644,18 @@ async fn on_disk(dir: &Path, file: &Placed<'_>) -> bool {
 struct Ledger {
     path: std::path::PathBuf,
     held: BTreeMap<String, Option<String>>,
-    /// The name on a last line a kill cut short (no newline after it).
-    torn: Option<String>,
+    /// What the next note writes before its lines where a kill cut the last
+    /// line short (no newline after it): a newline ending that line, and an
+    /// unknown line for its file where the cut left all of its name.
+    mend: String,
 }
 
 impl Ledger {
-    /// The ledger in `dir`, empty when there is none.
+    /// The ledger in `dir`, empty when there is none. A line without a space
+    /// is one a kill cut short before the space after its name, which a later
+    /// note ended: it may hold a part of a name only, so it names no file,
+    /// and makes the one of that exact name unknown where an earlier line
+    /// names it.
     async fn read(dir: &Path) -> Result<Ledger, DownloadError> {
         let path = dir.join(FILE_LEDGER);
         let text = match tokio::fs::read(&path).await {
@@ -658,17 +664,34 @@ impl Ledger {
             Err(e) => return Err(DownloadError::Io(format!("read {}: {}", path.display(), e))),
         };
         let (lines, cut) = text.rsplit_once('\n').unwrap_or(("", text.as_str()));
+        fn unknown_if_named(held: &mut BTreeMap<String, Option<String>>, name: &str) {
+            if let Some(sha256) = held.get_mut(name) {
+                *sha256 = None;
+            }
+        }
         let mut held = BTreeMap::new();
         for line in lines.split('\n').filter(|l| !l.is_empty()) {
-            let (name, sha256) = line.split_once(' ').unwrap_or((line, "-"));
-            held.insert(name.to_string(), (sha256 != "-").then(|| sha256.to_string()));
+            match line.split_once(' ') {
+                Some((name, sha256)) => {
+                    held.insert(name.to_string(), (sha256 != "-").then(|| sha256.to_string()));
+                }
+                None => unknown_if_named(&mut held, line),
+            }
         }
-        // A line cut short says nothing of its file's bytes, whatever it holds.
-        let torn = (!cut.is_empty()).then(|| cut.split_once(' ').map_or(cut, |(name, _)| name).to_string());
-        if let Some(name) = &torn {
-            held.insert(name.clone(), None);
-        }
-        Ok(Ledger { path, held, torn })
+        // A line cut short says nothing of its file's bytes, whatever it
+        // holds; cut before the space after its name, it is one as above.
+        let mend = match cut.split_once(' ') {
+            _ if cut.is_empty() => String::new(),
+            Some((name, _)) => {
+                held.insert(name.to_string(), None);
+                format!("\n{} -\n", name)
+            }
+            None => {
+                unknown_if_named(&mut held, cut);
+                "\n".to_string()
+            }
+        };
+        Ok(Ledger { path, held, mend })
     }
 
     /// Whether it says `file` holds the bytes of its entry.
@@ -679,10 +702,10 @@ impl Ledger {
     /// Adds a line for each of `files`: its sha256 once it is `in_place`,
     /// else unknown. One write: a kill cuts short at most its last line. A
     /// line cut short before goes on a line of its own, and an unknown line
-    /// for its name after it.
+    /// for its name after it where the cut left all of the name.
     async fn note(&mut self, files: &[Placed<'_>], in_place: bool) -> Result<(), DownloadError> {
         use tokio::io::AsyncWriteExt;
-        let mut lines = self.torn.as_ref().map_or(String::new(), |name| format!("\n{} -\n", name));
+        let mut lines = self.mend.clone();
         for f in files {
             lines.push_str(&format!("{} {}\n", f.dest, if in_place { f.entry.sha256.as_str() } else { "-" }));
         }
@@ -690,7 +713,7 @@ impl Ledger {
         let mut f = tokio::fs::OpenOptions::new().create(true).append(true).open(&self.path).await.map_err(err)?;
         f.write_all(lines.as_bytes()).await.map_err(err)?;
         f.flush().await.map_err(err)?;
-        self.torn = None;
+        self.mend.clear();
         for f in files {
             self.held.insert(f.dest.to_string(), in_place.then(|| f.entry.sha256.clone()));
         }
@@ -913,18 +936,16 @@ pub async fn download_region(
     // Before the fetches, so that their room is free, each with the temp
     // file a fetch of it a kill cut short left. Their lines go only when the
     // ledger is rewritten: a download killed before then leaves them, and
-    // the next finds their files gone. A name at which a dir is names no
-    // file: a last line a kill cut short at a sub-dir's name.
+    // the next finds their files gone. A dir at a file's place fails the
+    // download, which leaves the dir unstamped.
     for name in &others {
         let path = region_dir.join(name);
-        if !tokio::fs::symlink_metadata(&path).await.is_ok_and(|m| m.is_dir()) {
-            for path in [tmp_of(&path), path] {
-                match tokio::fs::remove_file(&path).await {
-                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                        return Err(DownloadError::Io(format!("remove {}: {}", path.display(), e)));
-                    }
-                    _ => {}
+        for path in [tmp_of(&path), path] {
+            match tokio::fs::remove_file(&path).await {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(DownloadError::Io(format!("remove {}: {}", path.display(), e)));
                 }
+                _ => {}
             }
         }
         ledger.held.remove(name);
@@ -2388,29 +2409,68 @@ mod tests {
         assert!(held(&dir) == files_of(&bucket, &s));
     }
 
-    // A last line a kill cut short at the water dir's name, or just past its
-    // slash, names no file: a retry, and a switch to no water, go through,
-    // the water dir left a dir, and the line goes with the ledger's rewrite.
-    // Cut inside a file's name, it names none either.
+    // A last line a kill cut short before the space after its name (at the
+    // water dir's name, just past its slash, inside a file's name or at its
+    // end) may hold a part of a name only, and names no file: a retry, and a
+    // switch to no water, go through, the water dir left a dir and a file of
+    // another's at the cut's name kept, and the line goes with the ledger's
+    // rewrite. A download stopped once it wrote lines after the cut one
+    // leaves it naming none either.
     #[tokio::test]
     async fn a_ledgers_last_line_cut_short_at_the_water_dirs_name_names_no_file() {
         use std::io::Write;
         let bucket = test_bucket::serve(test_bucket::template_components()).await;
         let water_all = wet("europe", "admin", "simplified", "none", "all");
         for after in [water_all.clone(), sel("europe", "admin", "simplified", "none")] {
-            for cut in ["water", "water/", "water/arc_"] {
+            for cut in ["water", "water/", "water/arc_", "water/arc_index.bin"] {
                 let root = ScratchDir::new();
                 let dir = root.path().join("europe");
                 download(&bucket, &water_all, root.path()).await.unwrap();
                 std::fs::remove_file(dir.join(BUILD_STAMP)).unwrap();
                 write!(std::fs::OpenOptions::new().append(true).open(dir.join(FILE_LEDGER)).unwrap(), "{cut}").unwrap();
+                std::fs::write(dir.join("water/arc_"), "an operator's notes").unwrap();
+                std::fs::remove_file(dir.join("admin_cells.bin")).unwrap();
+                STOP_ONCE_FETCHED.set(Some("europe/admin/admin_cells.bin"));
 
+                let stopped = download(&bucket, &after, root.path()).await.map_err(|e| e.to_string());
+                let kept = std::fs::read_to_string(dir.join("water/arc_")).ok();
                 let got = download(&bucket, &after, root.path()).await.map_err(|e| e.to_string());
 
                 let case = format!("water {}, cut at {cut:?}", after.water);
-                assert_eq!(got, Ok(()), "{case}");
-                assert_eq!(differing(&held(&dir), &files_of(&bucket, &after)), Vec::<String>::new(), "{case}");
+                assert_eq!(stopped, Err("I/O error: stopped once europe/admin/admin_cells.bin was in place".to_string()), "{case}");
+                assert_eq!((kept.as_deref(), got), (Some("an operator's notes"), Ok(())), "{case}");
+                let mut want = files_of(&bucket, &after);
+                want.insert("water/arc_".into(), b"an operator's notes".to_vec());
+                assert_eq!(differing(&held(&dir), &want), Vec::<String>::new(), "{case}");
             }
+        }
+    }
+
+    // A file the selection doesn't take that is a dir, not a file, can't be
+    // removed: the download fails naming it, and leaves no stamp, so that no
+    // server loads a dir the water layer's open would refuse. Here a dir at
+    // water/admin_cells.bin, named by the ledger, and the same where the dir
+    // has no ledger (laid out by hand), on a switch to no water.
+    #[tokio::test]
+    async fn a_dir_at_the_place_of_a_file_the_selection_doesnt_take_fails_the_download() {
+        let bucket = test_bucket::serve(test_bucket::template_components()).await;
+        let none = sel("europe", "admin", "simplified", "none");
+        for ledger in [true, false] {
+            let root = ScratchDir::new();
+            let dir = root.path().join("europe");
+            download(&bucket, &wet("europe", "admin", "simplified", "none", "all"), root.path()).await.unwrap();
+            if !ledger {
+                std::fs::remove_file(dir.join(FILE_LEDGER)).unwrap();
+            }
+            std::fs::remove_file(dir.join("water/admin_cells.bin")).unwrap();
+            std::fs::create_dir(dir.join("water/admin_cells.bin")).unwrap();
+
+            let got = download(&bucket, &none, root.path()).await.map_err(|e| e.to_string());
+
+            let at = dir.join("water/admin_cells.bin");
+            assert_eq!(got, Err(format!("I/O error: remove {}: Is a directory (os error 21)", at.display())), "ledger {ledger}");
+            assert!(!dir.join(BUILD_STAMP).exists(), "ledger {ledger}");
+            assert!(at.is_dir(), "ledger {ledger}");
         }
     }
 
