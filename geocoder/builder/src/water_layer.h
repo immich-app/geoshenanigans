@@ -216,7 +216,9 @@ struct Build {
 // geometry as admin relations are: one polygon per outer ring with the holes
 // in it) and closed way into polygons, but a closed way an assembled
 // relation of its kind and names (name and local name) takes whole as an
-// outer ring: one body tagged twice, whose islands the relation leaves out. Then takes
+// outer ring, that ring the way's own: one body tagged twice, whose islands
+// the relation leaves out, and whose wikidata item (the lowest of such ways')
+// the relation takes where it has none of its own. Then takes
 // the marine areas' as they are, in object order (ways by id, relations by
 // id, then marine areas by id; of an object or line two inputs hold, the
 // first input's copy alone), each ring rotated as canonicalize_ring_rotation

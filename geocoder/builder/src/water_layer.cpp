@@ -281,9 +281,10 @@ Build assemble(Collected& c, unsigned threads) {
     free_storage(c.member_geometries.coords);
     free_storage(c.member_geometries.ways);
 
-    // The closed ways an assembled relation takes whole as an outer ring
-    // (every way run of the ring theirs), by way: the relations' indices.
-    std::unordered_map<int64_t, std::vector<uint32_t>> outer_of;
+    // The outer rings of assembled relations that are one closed way's
+    // (every way run of the ring theirs), by way: the relation's index and
+    // the polygon's.
+    std::unordered_map<int64_t, std::vector<std::pair<uint32_t, uint32_t>>> outer_of;
     for (uint32_t i = 0; i < c.relations.size(); i++) {
         const Assembled& a = assembled[i];
         if (a.missing) continue;
@@ -293,22 +294,39 @@ Build assemble(Collected& c, unsigned threads) {
             const int64_t way = runs[0].way;
             bool whole = true;
             for (const WayRun& r : runs) whole &= r.way == way;
-            if (whole) outer_of[way].push_back(i);
+            if (whole) outer_of[way].push_back({i, static_cast<uint32_t>(k)});
         }
     }
-    // Whether closed way w is such an outer ring of a relation of its kind
+    // The lowest wikidata item of the closed ways left to each relation, by
+    // relation index (0 for none).
+    std::vector<uint32_t> twin_qid(c.relations.size(), 0);
+    // Whether closed way w is the whole outer ring of a relation of its kind
     // and names: one body tagged twice, which the relation gives, its
-    // islands left out.
+    // islands left out. Its ring as the assembly reads it (each run of
+    // vertices at one place one vertex) must be that outer ring, from any
+    // vertex and either way round: an outer ring the assembly cut a stretch
+    // of the way out of is less than the way. Notes w's wikidata item for
+    // each such relation.
     auto twin = [&](const ClosedWayArea& w) {
         auto it = outer_of.find(w.way);
         if (it == outer_of.end()) return false;
-        for (uint32_t i : it->second) {
+        std::vector<PackedLocation> ring;
+        ring.reserve(w.vertices.size());
+        for (const PackedLocation& p : w.vertices)
+            if (ring.empty() || ring.back() != p) ring.push_back(p);
+        bool found = false;
+        for (const auto& [i, k] : it->second) {
             const ObjectTags& t = c.relations[i].tags;
-            if (t.code == w.tags.code && t.verbatim == w.tags.verbatim && t.name == w.tags.name &&
-                t.local_name == w.tags.local_name)
-                return true;
+            const std::vector<PackedLocation>& outer = assembled[i].polygons[k].outer;
+            if (t.code != w.tags.code || t.verbatim != w.tags.verbatim || t.name != w.tags.name ||
+                t.local_name != w.tags.local_name ||
+                !same_closed_ring(outer.data(), static_cast<uint32_t>(outer.size()), ring.data(),
+                                  static_cast<uint32_t>(ring.size())))
+                continue;
+            found = true;
+            if (w.tags.qid && (!twin_qid[i] || w.tags.qid < twin_qid[i])) twin_qid[i] = w.tags.qid;
         }
-        return false;
+        return found;
     };
 
     auto add_object = [&](ObjectType type, int64_t id, ObjectTags&& tags) {
@@ -348,7 +366,13 @@ Build assemble(Collected& c, unsigned threads) {
         for (size_t k = 0; k < a.polygons.size(); k++) {
             NestedPolygon<PackedLocation>& p = a.polygons[k];
             if (p.outer.size() < 4) continue;
-            if (object == UINT32_MAX) object = add_object(ObjectType::OSM_RELATION, c.relations[i].id, std::move(c.relations[i].tags));
+            if (object == UINT32_MAX) {
+                // A relation of no wikidata item of its own takes that of
+                // the ways left to it.
+                ObjectTags& t = c.relations[i].tags;
+                if (!t.qid) t.qid = twin_qid[i];
+                object = add_object(ObjectType::OSM_RELATION, c.relations[i].id, std::move(t));
+            }
             std::vector<std::vector<WayRun>> runs;
             runs.push_back(std::move(a.runs[k].outer));
             for (auto& h : a.runs[k].holes) runs.push_back(std::move(h));

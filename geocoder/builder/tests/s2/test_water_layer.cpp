@@ -1270,6 +1270,66 @@ TEST(a_way_tagged_as_the_multipolygon_whose_outer_ring_it_is_leaves_the_island_o
     CHECK_EQ(twins, size_t(1));
 }
 
+TEST(a_way_its_relation_takes_only_one_lobe_of_stays_beside_the_relation) {
+    Collected c = fixture();
+    const int32_t lat = kLat - 7000000;
+    // A lake way of two squares meeting at a corner, x, and a way round the
+    // west one again: the relation of both, of the lake's tags, cancels the
+    // west square and keeps the east one, all of it the lake way's.
+    const PackedLocation x = pt(lat, kLng + 100000);
+    const Ring west = {x, pt(lat + 100000, kLng + 100000), pt(lat + 100000, kLng), pt(lat, kLng), x};
+    Ring eight = west;
+    for (const PackedLocation p :
+         {pt(lat, kLng + 200000), pt(lat - 100000, kLng + 200000), pt(lat - 100000, kLng + 100000), x})
+        eight.push_back(p);
+    add_geometry(c, 2900, eight);
+    add_geometry(c, 2901, west);
+    c.closed_ways.push_back({2900, tags(code::kLake, "Eight Lake"), eight});
+    CollectedArea rel;
+    rel.id = 2950;
+    rel.tags = tags(code::kLake, "Eight Lake");
+    rel.members = {{2900, "outer"}, {2901, "outer"}};
+    c.relations.push_back(rel);
+    const Layer layer = build(c);
+    CHECK(ways_held(layer, {2900}).first == std::set<int64_t>({2900}));
+    size_t east = 0;
+    for (size_t p = 0; p < layer.size(); p++) east += layer.fallbacks[p] == relation_ring_fallback(2950, 0);
+    CHECK_EQ(east, size_t(1));
+}
+
+TEST(a_way_left_to_its_relation_gives_it_its_wikidata_item_where_the_relation_has_none) {
+    // A river area of about 7.6 km2 tagged on a relation without wikidata
+    // and on its outer way with Q5: the relation takes Q5, so the major
+    // tier's rule for wikidata rivers holds it.
+    Collected c = fixture();
+    const Ring river = square(kLat - 8000000, kLng, 300000);
+    add_geometry(c, 2910, river);
+    c.closed_ways.push_back({2910, tags(code::kRiver, "Twin River", true, 5), river});
+    CollectedArea rel;
+    rel.id = 2960;
+    rel.tags = tags(code::kRiver, "Twin River", true);
+    rel.members = {{2910, "outer"}};
+    c.relations.push_back(rel);
+    // The same without the way's item: out of the major tier.
+    const Ring plain = square(kLat - 9000000, kLng, 300000);
+    add_geometry(c, 2911, plain);
+    c.closed_ways.push_back({2911, tags(code::kRiver, "Plain Twin", true), plain});
+    CollectedArea bare;
+    bare.id = 2961;
+    bare.tags = tags(code::kRiver, "Plain Twin", true);
+    bare.members = {{2911, "outer"}};
+    c.relations.push_back(bare);
+    const Layer layer = build(c);
+    CHECK(ways_held(layer, {2910, 2911}).first.empty());
+    std::map<std::string, bool> major;
+    for (size_t p = 0; p < layer.size(); p++) {
+        const std::string name = name_of(layer, p);
+        if (name == "Twin River" || name == "Plain Twin") major[name] = layer.major[p];
+    }
+    const std::map<std::string, bool> want = {{"Twin River", true}, {"Plain Twin", false}};
+    CHECK(major == want);
+}
+
 TEST(the_lines_are_keyed_by_the_waterway_relations_of_every_input_once_all_are_read) {
     // Two copies of a river way, the first read before the input that holds
     // its waterway relation: both are the relation's.
