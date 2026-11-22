@@ -285,6 +285,11 @@ struct ArcTier {
     // rings use (its outer ring and its holes, a ring with itself): areas
     // that may overlap, whose borders cross one another where they lie.
     bool crossings_within_polygons = false;
+    // Whether a ring valid as OSM has it that the tier's grid collapses with
+    // every vertex kept (under 3 vertices or of no area: a pond within a
+    // step or two of the grid) keeps its arcs, and their junctions, on the e7
+    // grid: areas small enough to fit between the grid's points.
+    bool collapsing_rings_on_e7 = false;
     bool simplifies() const { return tolerance_m > 0; }
     bool coarsens() const { return grid_e7 > fine_grid_e7; }
 };
@@ -299,10 +304,11 @@ inline constexpr size_t kArcTierCount = sizeof(kArcTiers) / sizeof(kArcTiers[0])
 // The water layer's tiers (water_layer.h), under a region's dir: the
 // boundary tiers' tolerance, cap and grid, and every raw vertex. Water areas
 // overlap (a lake in a wetland, a river in a bay), so the repair counts the
-// crossings of each polygon's own rings only.
+// crossings of each polygon's own rings only; a pond the grid would collapse
+// keeps its shore on the e7 grid.
 inline constexpr ArcTier kWaterArcTiers[] = {
     {ArcSet::Full, "water/all/simplified", kArcSimplifyToleranceM, kArcCapFactor, kSimplifiedGridE7, kSimplifiedGridE7,
-     true},
+     true, true},
     {ArcSet::Full, "water/all/exact", 0, 0, 1, 1, true},
 };
 inline constexpr size_t kWaterArcTierCount = sizeof(kWaterArcTiers) / sizeof(kWaterArcTiers[0]);

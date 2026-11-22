@@ -500,7 +500,10 @@ The simplified tier's crossing repair counts only crossings between rings of
 one polygon (`ArcTier::crossings_within_polygons`): water areas overlap
 legitimately (a lake in a wetland, a river in a bay), and repairing their
 crossings would give back vertices that buy nothing and tie one area's
-simplified arcs to its neighbours' edits.
+simplified arcs to its neighbours' edits. A ring its 1.1 m grid would
+collapse with every vertex kept, a pond within a step or two of it, keeps its
+arcs and their junctions on the e7 grid (`ArcTier::collapsing_rings_on_e7`),
+so the tier answers there too.
 
 The sidecars (`*.osm_ids`) sit in `water/all/exact/` for the all set and in
 `water/major/simplified/` for the major tier. They are not client files. The

@@ -300,6 +300,7 @@ struct ArcTierCounts {
     size_t nesting_restored = 0;  // vertices given back to polygons whose rings stopped nesting
     int e7_grid_rounds = 0;
     size_t e7_grid_arcs = 0;  // arcs stored on OSM's own grid (arc_grid), some vertices only
+    size_t e7_collapsing_rings = 0;  // ArcTier::collapsing_rings_on_e7: rings the grid collapses, on the e7 grid
     size_t crossings_left = 0;
     size_t unrepairable_segments = 0;  // in a crossing left, with no dropped vertex
     size_t raw_crossings = 0;  // segment pairs meeting whose raw spans already meet
@@ -525,7 +526,12 @@ std::vector<bool> exact_rings_nest(const AdminExactRings& store, unsigned thread
 // and the vertices Douglas-Peucker keeps at the tier's tolerance in degrees at
 // the arc's first latitude (meters_to_degrees), capped at cap_factor times
 // the square root of the smallest area of a ring of the set that uses the
-// arc; an arc whose ends meet keeps at least 4. It then gives vertices back:
+// arc; an arc whose ends meet keeps at least 4. On a tier that takes
+// collapsing rings to the e7 grid (ArcTier::collapsing_rings_on_e7), a ring
+// valid as OSM has it that the tier's grid leaves with under 3 vertices or
+// no area with every vertex kept has its arcs, and every arc's end at one
+// of their junctions, on the e7 grid from the start, where giving vertices
+// back can hold it. It then gives vertices back:
 // to a ring of under 3 vertices or of no area once snapped, the farthest
 // dropped one of its arc that strays most, for up to kArcValidityRounds
 // rounds; and for up to kArcRepairRounds rounds, where two snapped segments

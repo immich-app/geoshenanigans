@@ -469,6 +469,22 @@ public:
         }, threads_);
     }
 
+    // Puts the arcs of every ring of the set valid as OSM has it that the
+    // tier's grid collapses with every vertex kept (collapses_whole) on the
+    // e7 grid, with their junctions (keep_arcs_on_e7_grid). Returns how many
+    // rings.
+    size_t keep_collapsing_rings_on_e7_grid() {
+        const std::vector<uint32_t> collapsing = collect_in_order<uint32_t, Scratch>(rings_.size(),
+            [&](size_t k, std::vector<uint32_t>& out, Scratch& s) {
+                if (collapses_whole(rings_[k], s)) out.push_back(rings_[k]);
+            }, threads_);
+        std::vector<uint32_t> whole;
+        for (uint32_t r : collapsing)
+            for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) whole.push_back(set_.refs()[k].arc);
+        keep_arcs_on_e7_grid(std::move(whole));
+        return collapsing.size();
+    }
+
     // Gives a ring that is degenerate once snapped (under 3 vertices, or no
     // area) the farthest dropped vertex of its arc that strays most, round
     // after round, every ring checked first and then those a round touched.
@@ -906,6 +922,13 @@ private:
             for (uint32_t r = poly.first_ring; r < poly.first_ring + poly.ring_count; r++)
                 for (uint32_t k = set_.ring_refs()[r]; k < set_.ring_refs()[r + 1]; k++) whole.push_back(set_.refs()[k].arc);
         }
+        return keep_arcs_on_e7_grid(std::move(whole));
+    }
+
+    // Puts `whole` (arcs) wholly on the e7 grid, and the end of every other
+    // arc of the set at one of their junctions; returns the arcs it changed,
+    // ascending.
+    std::vector<uint32_t> keep_arcs_on_e7_grid(std::vector<uint32_t> whole) {
         sort_unique(whole, threads_);
         std::vector<uint64_t> junctions;
         for (uint32_t a : whole) {
@@ -1065,6 +1088,23 @@ private:
     bool stored_ring_valid(uint32_t r, Scratch& s) const {
         stored_ring(r, s);
         return valid(s.ring);
+    }
+    // Whether ring r is valid as OSM has it, under 3 vertices or of no area
+    // on the tier's grid with every vertex kept, each once where its
+    // neighbour repeats it.
+    bool collapses_whole(uint32_t r, Scratch& s) const {
+        const RingSpan& span = store_.rings[r];
+        const PackedLocation* v = store_.vertices.data() + span.begin;
+        s.ring.assign(v, v + span.count);
+        if (s.ring.size() >= 2 && s.ring.front() == s.ring.back()) s.ring.pop_back();
+        if (!valid(s.ring)) return false;
+        s.ring.clear();
+        for (uint32_t i = 0; i < span.count; i++) {
+            const PackedLocation p = snapped(v[i], tier_.grid_e7);
+            if (s.ring.empty() || s.ring.back() != p) s.ring.push_back(p);
+        }
+        if (s.ring.size() >= 2 && s.ring.front() == s.ring.back()) s.ring.pop_back();
+        return !valid(s.ring);
     }
     // Whether ring r, as s.ring holds it on the tier's grid (stored_ring),
     // folds where the fine build's doesn't: it winds the other way, or
@@ -1398,6 +1438,10 @@ ArcTierState build_arc_tier(const AdminArcs& arcs, const AdminExactRings& store,
     TierBuilder builder(arcs, store, tier, threads);
     builder.simplify();
     done("simplify");
+    if (tier.collapsing_rings_on_e7) {
+        state.counts.e7_collapsing_rings = builder.keep_collapsing_rings_on_e7_grid();
+        done("collapsing rings on the e7 grid");
+    }
     builder.restore_degenerate_rings(state.counts);
     done("validity");
     builder.build_grid();

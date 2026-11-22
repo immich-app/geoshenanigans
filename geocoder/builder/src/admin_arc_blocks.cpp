@@ -513,6 +513,7 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
                  << " e7_grid_rounds=" << tc.e7_grid_rounds << " e7_grid_arcs=" << tc.e7_grid_arcs
                  << " crossings_left=" << tc.crossings_left << " unrepairable_segments=" << tc.unrepairable_segments
                  << " raw_crossings=" << tc.raw_crossings << " rings_nest_introduced=" << tc.rings_nest_introduced;
+        if (tier.collapsing_rings_on_e7) line << " e7_collapsing_rings=" << tc.e7_collapsing_rings;
         if (tier.coarsens())
             line << " fine_degenerate_rings=" << tc.fine_degenerate_rings << " fine_crossings_left=" << tc.fine_crossings_left
                  << " crossings_coarse=" << tc.crossings_coarse << " coarse_rounds=" << tc.coarse_rounds

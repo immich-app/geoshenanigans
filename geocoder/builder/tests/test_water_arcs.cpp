@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "exact_pip.h"
 #include "parsed_data.h"
 #include "scratch_dir.h"
 #include "test_framework.h"
@@ -200,4 +201,39 @@ TEST(the_water_stage_builds_and_encodes_its_two_tiers_with_no_minimal_set) {
     CHECK(arc_sidecar_path(dir.path(), ArcSet::Full, kWaterArcStage) ==
           dir.path() + "/water/all/exact/arc_index.osm_ids");
     CHECK(arc_sidecar_path(dir.path(), ArcSet::Full) == dir.path() + "/quality/exact/arc_index.osm_ids");
+}
+
+TEST(a_pond_within_one_step_of_the_simplified_grid_keeps_its_shore_on_the_e7_grid) {
+    // A pond 30 e7 units a side, every vertex of which snaps to one point of
+    // the 100 grid; a strip 30 wide, which the grid flattens to a line; and
+    // a lake, whose shore the grid holds.
+    const int32_t lat = 470000000, lng = 80000000;
+    AdminExactRings store;
+    store.append(closed({pt(lat + 10, lng + 10), pt(lat + 10, lng + 40), pt(lat + 40, lng + 40), pt(lat + 40, lng + 10)}), {});
+    store.append(closed({pt(lat + 1010, lng + 10), pt(lat + 1010, lng + 5010), pt(lat + 1040, lng + 5010),
+                         pt(lat + 1040, lng + 10)}),
+                 {});
+    store.append(closed({pt(lat + 10000, lng), pt(lat + 10000, lng + 50000), pt(lat + 60000, lng + 50000),
+                         pt(lat + 60000, lng)}),
+                 {});
+    const AdminArcs arcs = build_arc_topology(store, 1, {}, ArcCuts::JunctionsAndWayEnds);
+    const std::vector<bool> nests = exact_rings_nest(store, 1);
+    const ArcTierState water = build_arc_tier(arcs, store, water_simplified(), nests, 1);
+    CHECK_EQ(water.counts.degenerate_rings, size_t(0));
+    CHECK_EQ(water.counts.e7_grid_arcs, size_t(2));
+    // Each holds water: the pond and the lake their middles, the strip a
+    // shore of raw vertices round an area.
+    std::vector<PackedLocation> ring, raw;
+    std::vector<StoredVertex> stored;
+    tier_ring(arcs, store, water_simplified(), water, 0, ring, raw, stored);
+    CHECK(exact_ring_contains(ring.data(), static_cast<uint32_t>(ring.size()), pt(lat + 25, lng + 25)));
+    tier_ring(arcs, store, water_simplified(), water, 1, ring, raw, stored);
+    CHECK(exact_ring_area2(ring.data(), static_cast<uint32_t>(ring.size())) != 0);
+    for (const PackedLocation& v : ring) CHECK(v.lat_e7 == lat + 1010 || v.lat_e7 == lat + 1040);
+    tier_ring(arcs, store, water_simplified(), water, 2, ring, raw, stored);
+    CHECK(exact_ring_contains(ring.data(), static_cast<uint32_t>(ring.size()), pt(lat + 35000, lng + 25000)));
+    // The lake's shore stays on the grid.
+    for (const PackedLocation& v : ring) CHECK(v.lat_e7 % 100 == 0 && v.lon_e7 % 100 == 0);
+    // The boundary tiers' grid is as it was.
+    CHECK_EQ(build_arc_tier(arcs, store, kArcTiers[0], nests, 1).counts.degenerate_rings, size_t(2));
 }

@@ -1135,6 +1135,7 @@ std::string tier_summary(const ArcStage& stage, const ArcTier& tier, const ArcTi
          << " to polygons not nesting, " << c.crossings_left << " crossings left, "
          << c.unrepairable_segments << " unrepairable segments, " << c.raw_crossings
          << " raw crossings; rings_nest: " << c.rings_nest_introduced << " polygons introduced";
+    if (tier.collapsing_rings_on_e7) line << "; " << c.e7_collapsing_rings << " rings the grid collapses on the e7 grid";
     if (tier.coarsens())
         line << "; coarsened from the " << tier.fine_grid_e7 << " to the " << tier.grid_e7 << " e7 grid: "
              << c.fine_degenerate_rings << " rings degenerate and " << c.fine_crossings_left
