@@ -43,13 +43,14 @@ compile() {
 
 # The unit tests in the build dir, as $shards shards at once; fails, saying
 # why, unless every shard passed having run a test and the shards ran the
-# registry's tests between them.
+# registry's tests between them. Without a dir for the shards' logs it runs
+# none and ends the script: a fresh build would fail alike.
 unit_tests() {
   local total logs i status line shard_passed shard_ran ran=0 passed=0 failed=0 start=$SECONDS
   local -a pids=()
   total=$(./geocoder-tests --count)
   phase "unit tests: $total in $shards shards"
-  logs=$(mktemp -d)
+  logs=$(mktemp -d) || { echo "Unit tests: no dir for the shards' logs; none ran"; exit 1; }
   for ((i = 0; i < shards; i++)); do
     GEOCODER_TEST_SHARD="$i/$shards" ./geocoder-tests > "$logs/$i.log" 2>&1 &
     pids+=($!)

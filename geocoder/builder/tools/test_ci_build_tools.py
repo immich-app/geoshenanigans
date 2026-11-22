@@ -243,6 +243,16 @@ class ShardedUnitTestsTest(unittest.TestCase):
             self.assertIn(f"the shards ran {ran} tests; the registry holds", run.out, env)
             self.assertNotRegex(run.out, r"(?m)^\d+/\d+ tests passed$", env)
 
+    # Without a dir for the shards' logs none runs (each would write its log under the root dir), and the script
+    # stops there, the cached tools unbuilt: a fresh build would fail alike. One CPU: a shard.
+    def test_no_dir_for_the_shards_logs_runs_no_shard_and_fails_the_run(self):
+        run = ShardedTestsRun(self, 100, cpus=1, TMPDIR="/nonexistent-tools-tmp")
+
+        self.assertNotEqual(run.status, 0, run.out)
+        self.assertFalse(os.path.exists(run.shard_log), "a shard ran")
+        self.assertFalse(run.compiled())
+        self.assertIn("no dir for the shards' logs", run.out)
+
     def test_each_phase_is_logged_with_its_time(self):
         run = ShardedTestsRun(self, 100)
 
