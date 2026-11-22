@@ -749,13 +749,14 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
     // (Nominatim's clean_postcodes sanitizer), in cell order. They were
     // summed once on the full data (collect_postcode_centroids); continents
     // carry the ones whose centroid lies inside them. A region with postcodes
-    // of which none passes gets the files of no centroid. `postcode_sources`
-    // gathers the sources of the centroids written (attribution.h).
-    uint8_t postcode_sources = 0;
+    // of which none passes gets the files of no centroid. The task gives the
+    // sources of the centroids it writes (attribution.h).
+    std::future<uint8_t> postcode_sources;
     if (!data.postcode_accum.empty()) {
-        write_futures.push_back(std::async(std::launch::async, [&] {
+        postcode_sources = std::async(std::launch::async, [&] {
             auto _pt = std::chrono::steady_clock::now();
             auto _pc = CpuTicks::now();
+            uint8_t sources = 0;
             std::vector<postcode_files::LogicalCentroid> centroids;
             centroids.reserve(data.postcode_accum.size());
             uint32_t rejected = 0;
@@ -768,7 +769,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
                     rejected++;
                     continue;
                 }
-                postcode_sources |= acc.source;
+                sources |= acc.source;
                 postcode_files::LogicalCentroid c;
                 c.lat = static_cast<float>(acc.lat());
                 c.lng = static_cast<float>(acc.lng());
@@ -792,7 +793,8 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
             const size_t cells = write_postcode_files(output_dir, centroids);
             std::cerr << "postcode centroids: " << centroids.size() << " in " << cells << " cells" << std::endl;
             log_phase((label + "postcode centroids").c_str(), _pt, _pc);
-        }));
+            return sources;
+        });
     }
 
     // The geo index goes last, beside the files above.
@@ -812,6 +814,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
 
     admin_future.get();
     for (auto& f : write_futures) f.get();
+    const uint8_t centroid_sources = postcode_sources.valid() ? postcode_sources.get() : 0;
 
     // The credit of the data written here: OpenStreetMap's, its postcode
     // centroids' sources, and TIGER's where an interpolation written came
@@ -820,7 +823,7 @@ void write_index(const ParsedData& data, const std::string& output_dir, IndexMod
         std::any_of(data.interp_osm_ids.begin(), data.interp_osm_ids.end(), [](uint64_t id) {
             return id >> 56 == static_cast<uint64_t>(gc::id_alloc::ObjectType::SYNTHETIC);
         });
-    write_attribution(output_dir, ATTRIBUTION_OSM | postcode_sources | (tiger_interps ? ATTRIBUTION_TIGER : 0));
+    write_attribution(output_dir, ATTRIBUTION_OSM | centroid_sources | (tiger_interps ? ATTRIBUTION_TIGER : 0));
     log_phase((label + "total").c_str(), _total_t, _total_c);
 }
 
