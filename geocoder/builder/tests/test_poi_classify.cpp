@@ -296,18 +296,20 @@ TEST(poi_classify_a_water_object_keeps_its_category_beside_a_tag_of_no_rank_30) 
 
 TEST(poi_classify_a_water_object_beside_a_main_tag_of_a_lower_address_rank_keeps_its_category) {
     // Nominatim ranks an object by the lowest positive address rank of its
-    // main tags (ranking.sql compute_place_rank): place=locality (25) and
-    // place=suburb (20) anywhere, and on an area landuse=residential (24),
-    // highway=footway (27) and highway=residential (26), rank such an object
-    // below 30, whatever POI main tag it carries too, so it stays water. A
-    // landuse or highway node ranks 30 (ranking.sql:175-180): beside those, a
-    // water node is a rank-30 POI of its shop.
+    // main tags (ranking.sql compute_place_rank): place=locality (25),
+    // place=plot (25), place=suburb (20) and place=subdistrict (14) anywhere,
+    // and on an area landuse=residential (24), highway=footway (27) and
+    // highway=residential (26), rank such an object below 30, whatever POI
+    // main tag it carries too, so it stays water. A landuse or highway node
+    // ranks 30 (ranking.sql:175-180): beside those, a water node is a rank-30
+    // POI of its shop.
     struct Lower {
         const char* key;
         const char* value;
         bool on_a_node;
     };
-    const Lower lower[] = {{"place", "locality", true},      {"place", "suburb", true},
+    const Lower lower[] = {{"place", "locality", true},      {"place", "plot", true},
+                           {"place", "suburb", true},        {"place", "subdistrict", true},
                            {"landuse", "residential", false}, {"highway", "footway", false},
                            {"highway", "residential", false}};
     for (const WaterKind& kind : kWaterKinds)

@@ -28,7 +28,7 @@ inline bool poi_tag_is(const char* v, std::initializer_list<const char*> values)
 
 // Whether leisure=`v` is a POI main tag of rank 30 in Nominatim
 // (presets.lua:221-226): park, nature_reserve, garden and common rank 24 and
-// 25 (address-levels.json:60-65), and the import drops leisure=no.
+// 25 (address-levels.json:63-68), and the import drops leisure=no.
 inline bool poi_leisure_ranks_30(const char* v) {
     return !poi_tag_is(v, {"no", "park", "nature_reserve", "garden", "common"});
 }
@@ -64,7 +64,7 @@ inline bool has_poi_main_tag(const char* t_amenity, const char* t_leisure, const
     // presets.lua:255-259 (tourism=attraction, a fallback tag, ranks 30 too).
     if (t_tourism && !poi_tag_is(t_tourism, {"no", "yes"})) return true;
     // presets.lua:211-213, a fallback tag; historic=neighbourhood ranks 22
-    // (address-levels.json:124-126).
+    // (address-levels.json:130-132).
     if (t_historic && !poi_tag_is(t_historic, {"no", "yes", "neighbourhood"})) return true;
     // presets.lua:253-254, 190-191, 241-242, 176-177.
     for (const char* v : {t_shop, t_craft, t_office, t_aeroway})
@@ -77,21 +77,23 @@ inline bool has_poi_main_tag(const char* t_amenity, const char* t_leisure, const
 }
 
 // Whether an object carries a main tag of a positive address rank below 30
-// (settings/address-levels.json), which then ranks it whatever POI main tag
-// it carries too (ranking.sql compute_place_rank takes the lowest positive
-// address rank): place=* of an address rank (:3-35; every place value is a
-// main tag, presets.lua MAIN_TAGS.all_boundaries) and, on an `area` (a
-// polygon, not a node), landuse=residential and the other landuse kinds of an
-// address rank (:50-59; a landuse node ranks 30, ranking.sql:178-180) and the
-// highway kinds of rank 26 and 27 (:95-120; a highway node ranks 30,
-// ranking.sql:175-177). boundary=administrative ranks by an admin_level the
-// classifier doesn't read, and the country tables (place=county in ca and de,
-// ...) by a country: both are left out.
+// (settings/address-levels.json, as of Nominatim's 5348a803), which then
+// ranks it whatever POI main tag it carries too (ranking.sql
+// compute_place_rank takes the lowest positive address rank): place=* of an
+// address rank (:3-38, place=subdistrict 14 and place=plot 25 among them;
+// every place value is a main tag, plot a named one, presets.lua
+// MAIN_TAGS.all_boundaries, and square a street's, MAIN_TAGS_STREETS) and, on
+// an `area` (a polygon, not a node), landuse=residential and the other landuse
+// kinds of an address rank (:53-62; a landuse node ranks 30,
+// ranking.sql:178-180) and the highway kinds of rank 26 and 27 (:101-126; a
+// highway node ranks 30, ranking.sql:175-177). boundary=administrative ranks
+// by an admin_level the classifier doesn't read, and the country tables
+// (place=county in ca and de, ...) by a country: both are left out.
 inline bool has_lower_rank_main_tag(const char* t_place, const char* t_landuse, const char* t_highway, bool area) {
     if (t_place && poi_tag_is(t_place, {"county", "district", "municipality", "city", "town", "borough", "village",
-                                        "suburb", "hamlet", "croft", "subdivision", "allotments", "neighbourhood",
-                                        "quarter", "isolated_dwelling", "farm", "city_block", "mountain_pass", "square",
-                                        "locality"}))
+                                        "suburb", "hamlet", "croft", "subdivision", "subdistrict", "allotments",
+                                        "neighbourhood", "quarter", "isolated_dwelling", "farm", "city_block",
+                                        "mountain_pass", "locality", "plot", "square"}))
         return true;
     if (!area) return false;
     if (t_landuse && poi_tag_is(t_landuse, {"residential", "farm", "farmyard", "industrial", "commercial", "allotments",
@@ -112,8 +114,8 @@ inline bool has_lower_rank_main_tag(const char* t_place, const char* t_landuse, 
 // which call it identically.
 //
 // The water kinds (natural=water, wetland, bay and glacier, landuse=
-// reservoir and basin) rank below 30 in Nominatim (address-levels.json:66-79
-// and 50-59), whose POI lane takes rank 30 alone; the server keeps them out of
+// reservoir and basin) rank below 30 in Nominatim (address-levels.json:69-82
+// and 53-62), whose POI lane takes rank 30 alone; the server keeps them out of
 // the primary slot. An object that also carries a POI main tag
 // (has_poi_main_tag) is a rank-30 POI there, unless a main tag of a lower
 // positive rank ranks it (has_lower_rank_main_tag): it takes no water
@@ -144,7 +146,7 @@ inline std::optional<PoiClassification> classify_poi(
         if (!yields) return kind;
         if (yielded == PoiCategory::UNKNOWN) yielded = kind;
         if (t_leisure && !poi_leisure_ranks_30(t_leisure)) t_leisure = nullptr;
-        // address-levels.json:66-79.
+        // address-levels.json:69-82.
         if (t_natural && !poi_tag_is(t_natural, {"tree", "spring", "cave_entrance", "geyser", "hot_spring", "rock", "stone"}))
             t_natural = nullptr;
         if (t_man_made && !poi_man_made_is_main(t_man_made)) t_man_made = nullptr;

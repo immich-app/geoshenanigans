@@ -157,14 +157,16 @@ categories (`init.lua` `process_tags`, lines 734-878): its class and type are
 its alphabetically first main tag that is no fallback tag, else its first
 fallback tag. Its ranks are those of the category with the lowest positive
 address rank, else the lowest search rank (`ranking.sql`
-`compute_place_rank`, lines 132-233). `address-levels.json` ranks:
+`compute_place_rank`, lines 132-233). `address-levels.json` ranks (lines as
+of master 5348a803, 2026-11-21):
 
 | Main tag | rank_search, rank_address | Lines |
 |---|---|---|
-| `natural=*` other than peak, volcano and mountain_range (18, 0), sea (4, 0) and tree, spring, cave_entrance, geyser, hot_spring, rock and stone (30, 30) | 22, 0 | 66-79 |
-| `water=*` (with `natural=water`) | 20 to 24, 0 | 80-87 |
-| `waterway=*` | 19 to 22, 0 | 88-94 |
-| `landuse=*` on an area | 24, 0 (residential and the other admin ones 24, 24) | 50-59 |
+| `place=*` of an address rank: `county` 12, ..., `subdistrict` 14, ..., `locality` and `plot` 25, `square` 26 | as listed | 3-38 |
+| `natural=*` other than peak, volcano and mountain_range (18, 0), sea (4, 0) and tree, spring, cave_entrance, geyser, hot_spring, rock and stone (30, 30) | 22, 0 | 69-82 |
+| `water=*` (with `natural=water`) | 20 to 24, 0 | 83-90 |
+| `waterway=*` other than boatyard, lock_gate and access_point (30, 30) | 19 to 22, 0 | 91-100 |
+| `landuse=*` on an area | 24, 0 (residential and the other admin ones 24, 24) | 53-62 |
 | `landuse=*` on a node or line | 30, 30 (`ranking.sql:178-180`) | |
 | a key it doesn't list: `amenity`, `shop`, `tourism`, `emergency`, most `leisure`, ... | 30, 30 (`ranking.sql:195-198`) | |
 
@@ -182,10 +184,10 @@ lane: `amenity=fountain` and `leisure=swimming_area` (class `amenity`,
 `leisure`, alphabetically before `natural`), `emergency=fire_water_pond`,
 `shop=*`, `man_made=pier`, and so on. A main tag of a lower positive address
 rank beside it ranks the object instead, out of the lane: `place=*` of an
-address rank (`locality` 25, `suburb` 20, ...), and on an area
-`landuse=residential` and the other admin landuse kinds (24) and the
-`highway=*` kinds (26, 27); a landuse or highway node ranks 30. Such an object
-stays water (`poi_classify.h` `has_lower_rank_main_tag`). The builder
+address rank (`locality` and `plot` 25, `suburb` 20, `subdistrict` 14, ...),
+and on an area `landuse=residential` and the other admin landuse kinds (24)
+and the `highway=*` kinds (26, 27); a landuse or highway node ranks 30. Such
+an object stays water (`poi_classify.h` `has_lower_rank_main_tag`). The builder
 classifies a rank-30 one by its rank-30 tags (`has_poi_main_tag`): `FOUNTAIN`,
 `SWIMMING_AREA`, `FIRE_WATER_POND`, `PIER`, ..., or `GENERIC_RANK30` where they
 have no category of their own; a tag of a lower rank or of no main tag after
@@ -206,7 +208,10 @@ the lane takes no class `building`.
 **Not matched.**
 - The builder reads no `club`, `military`, `healthcare` or `aerialway` key,
   nor a node's `highway`: a water object whose only other main tag is one of
-  those keeps its water category, though it ranks 30 in Nominatim. A
+  those keeps its water category, though it ranks 30 in Nominatim. So does
+  one beside `waterway=boatyard`, `lock_gate` or `access_point`, which rank
+  30 (`address-levels.json:96-98`) where the builder takes no `waterway=*`
+  for a POI main tag. A
   multipolygon bay or glacier keeps its category whatever it carries.
 - A water object of a generic rank-30 tag without a wiki tag stays water,
   out of the primary slot, where Nominatim's lane holds it as a POI.
