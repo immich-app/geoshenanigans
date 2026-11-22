@@ -12,8 +12,8 @@
 
 // The record kinds a region holds; the continent split shares out each one
 // by its cell pairs.
-enum class RecordKind { Ways, Addrs, Interps, Pois, Places, Admins };
-constexpr size_t RECORD_KIND_COUNT = 6;
+enum class RecordKind { Ways, Addrs, Interps, Pois, Places, Admins, Waters };
+constexpr size_t RECORD_KIND_COUNT = 7;
 
 // Per record kind: bytes held (sizes, not capacities: room a vector never
 // filled costs no memory) or records.
@@ -55,6 +55,8 @@ inline KindValues record_bytes(const ParsedData& d) {
         + vector_bytes(d.admin_sidecar_blob) + vector_bytes(d.admin_parent_ids) + vector_bytes(d.admin_index_cells)
         + vector_bytes(d.admin_minimal_index_cells) + map_bytes_approx(d.postcode_accum) + strings
         + d.admin_arcs.bytes();
+    // The water layer: its records, names, encoded arcs and cells.
+    at(b, RecordKind::Waters) = d.water.bytes();
     return b;
 }
 
@@ -69,7 +71,9 @@ inline KindValues record_counts(const ParsedData& d) {
     return n;
 }
 
-// The cell pairs of each kind a region's records sit in (admins have none).
+// The cell pairs of each kind a region's records sit in (admins and waters
+// have none). The strategy-2 passes and the ordering steps never see water
+// records: record_counts leaves them out.
 inline KindValues pair_counts(const ParsedData& d) {
     KindValues n{};
     at(n, RecordKind::Ways) = d.sorted_way_cells.size();
@@ -125,6 +129,12 @@ constexpr uint64_t kModeBytes = uint64_t(256) << 20;
 constexpr uint64_t kAdminTierAdminDivisor = 16;
 constexpr uint64_t kAdminMinimalAdminDivisor = 3;
 constexpr uint64_t kPoiTierPoiTenths = 4;
+
+// The water stage's working set against the layer it reads: the records in
+// their slots for each set, the cells renumbered to them, the names a set
+// uses, and the major tier's share of the arcs and ring blocks, its slots
+// and the sidecars (planet 261020: about half of it).
+constexpr uint64_t kWaterStageWaterTenths = 6;
 
 // What write_place_files holds beside the nodes it is given, as a multiple
 // of their bytes (20 a node): each node's cell key, the order and the sort's
@@ -200,10 +210,10 @@ inline uint64_t filter_cost(const KindValues& planet_counts, const KindValues& c
 // runs, the boundary tiers and both admin-minimal dirs (which write the arc
 // geometry) among them.
 struct StageCosts {
-    uint64_t modes = 0, admin_tiers = 0, places = 0, admin_minimal = 0, poi_tiers = 0;
+    uint64_t modes = 0, admin_tiers = 0, places = 0, admin_minimal = 0, poi_tiers = 0, water = 0;
 
-    uint64_t total() const { return modes + admin_tiers + places + admin_minimal + poi_tiers; }
-    uint64_t largest() const { return std::max({modes, admin_tiers, places, admin_minimal, poi_tiers}); }
+    uint64_t total() const { return modes + admin_tiers + places + admin_minimal + poi_tiers + water; }
+    uint64_t largest() const { return std::max({modes, admin_tiers, places, admin_minimal, poi_tiers, water}); }
 };
 
 // The place stage writes its dirs one after another, each through the place
@@ -217,6 +227,7 @@ inline StageCosts stage_costs(const KindValues& bytes) {
     c.places = places * kPlaceWriterTimes;
     c.admin_minimal = admins / kAdminMinimalAdminDivisor + places * (1 + kPlaceWriterTimes);
     c.poi_tiers = at(bytes, RecordKind::Pois) * kPoiTierPoiTenths / 10;
+    c.water = at(bytes, RecordKind::Waters) * kWaterStageWaterTenths / 10;
     return c;
 }
 
@@ -246,8 +257,8 @@ inline RegionCost continent_cost(const KindValues& bytes, const KindValues& coun
 }
 
 // A continent's share of the planet's values, kind by kind, from its share
-// of each kind's cell pairs, with kShareMarginPercent. Admins have no pairs:
-// they take the share the other kinds' values add up to.
+// of each kind's cell pairs, with kShareMarginPercent. Admins and waters have
+// no pairs: they take the share the other kinds' values add up to.
 inline KindValues continent_share(const KindValues& planet, const KindValues& planet_pairs,
                                   const KindValues& continent_pairs) {
     KindValues out{};
@@ -260,7 +271,7 @@ inline KindValues continent_share(const KindValues& planet, const KindValues& pl
         out[k] = static_cast<uint64_t>(static_cast<double>(planet[k]) * share * kShareMarginPercent / 100);
     }
     const double admin_share = total > 0 ? shared / total : 0;
-    at(out, RecordKind::Admins) = static_cast<uint64_t>(
-        static_cast<double>(at(planet, RecordKind::Admins)) * admin_share * kShareMarginPercent / 100);
+    for (RecordKind kind : {RecordKind::Admins, RecordKind::Waters})
+        at(out, kind) = static_cast<uint64_t>(static_cast<double>(at(planet, kind)) * admin_share * kShareMarginPercent / 100);
     return out;
 }

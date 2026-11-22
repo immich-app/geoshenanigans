@@ -88,6 +88,8 @@ add_executable(build-index
     src/continent_boundaries.cpp
     src/cell_index.cpp
     src/interpolation.cpp
+    src/water_layer.cpp
+    src/water_names_s2.cpp
 )
 
 # Patch tools (no S2 dependency)
@@ -232,6 +234,9 @@ add_executable(geocoder-s2-tests
     src/admin_links.cpp
     src/cell_index.cpp
     src/s2_helpers.cpp
+    src/ring_assembly.cpp
+    src/water_layer.cpp
+    src/water_names_s2.cpp
 )
 target_include_directories(geocoder-s2-tests PRIVATE src tools tests)
 # tests/s2/test_admin_dirs_build.cpp runs build-index on a PBF it writes.

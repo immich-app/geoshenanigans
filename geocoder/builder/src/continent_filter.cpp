@@ -6,6 +6,7 @@
 #include "ranked_bits.h"
 #include "string_subset.h"
 #include "subset_copy.h"
+#include "water_layer.h"
 
 #include <algorithm>
 #include <atomic>
@@ -266,6 +267,20 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         drop(full.admin_polygons, full.admin_osm_ids);
     };
 
+    // Water: the polygons the continent's cells of the water cell index list,
+    // or the ring of cells around them, whole, with their arcs.
+    auto copy_water = [&]() {
+        const IndexCells cells = routed_cells(full.water.cells);
+        std::vector<uint8_t> kept(full.water.cells.size(), 0);
+        parallel_for(cells.starts.size(), [&](size_t begin, size_t end, unsigned) {
+            for (size_t c = begin; c < end; c++)
+                if (cells.kept[c])
+                    for (size_t i = cells.starts[c]; i < cells.end(full.water.cells, c); i++) kept[i] = 1;
+        });
+        out.water = water::subset_layer(full.water, kept);
+        if (consume) full.water = water::Layer();
+    };
+
     // POIs — coord polygon refinement, preserve vertex arrays for polygon POIs
     // A point POI's vertex_offset also moves to the current end of the
     // vertex array, as it always has.
@@ -309,6 +324,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         // copies grow.
         copy_interps();
         copy_admins();
+        copy_water();
         copy_places();
         copy_ways();
         copy_pois();
@@ -317,7 +333,8 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
         std::future<void> copies[] = {
             std::async(std::launch::async, copy_ways), std::async(std::launch::async, copy_addrs),
             std::async(std::launch::async, copy_interps), std::async(std::launch::async, copy_admins),
-            std::async(std::launch::async, copy_pois), std::async(std::launch::async, copy_places)};
+            std::async(std::launch::async, copy_pois), std::async(std::launch::async, copy_places),
+            std::async(std::launch::async, copy_water)};
         for (auto& f : copies) f.get();
     }
     log_phase(("      " + std::string(bbox.name) + " filter: data remap (masked)").c_str(), _ft, _fc);
@@ -549,6 +566,7 @@ ParsedData filter_by_bbox_masked(ParsedData& full, const ContinentBBox& bbox,
               << " pois=" << out.poi_records.size()
               << " places=" << out.place_nodes.size()
               << " admins=" << out.admin_polygons.size()
+              << " waters=" << out.water.size()
               << " postcodes=" << out.postcode_accum.size()
               << std::endl;
 

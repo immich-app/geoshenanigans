@@ -44,6 +44,12 @@ AdminTierCells admin_tier_cells(const AdminArcs& arcs, const AdminExactRings& st
 // polygons' share of the exact tier's, which the builder's links read too.
 void compute_admin_index_cells(ParsedData& data, const AdminArcs& arcs, unsigned threads = 0);
 
+// The water layer's cell index (water_layer.h) from its arc stage's tiers
+// (`arcs` of `store`, kWaterArcStage): each polygon's cells over both tiers,
+// interior only where interior in both, in canonical order.
+std::vector<CellItemPair> compute_water_index_cells(const AdminArcs& arcs, const AdminExactRings& store,
+                                                    unsigned threads = 0);
+
 // strings_layout.json: each tier's [start, end) in the dir's string-offset
 // space, tier t at [bases[t], bases[t + 1]): the build's
 // (data.strings_tier_bases) in every dir that resolves the shared strings.
