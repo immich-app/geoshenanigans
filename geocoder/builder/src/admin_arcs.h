@@ -437,11 +437,19 @@ private:
 // `threads` threads, with the same result on any number and in any ring
 // order. Aborts (std::logic_error) unless each ring with way runs has them
 // over all of its edges. `phase_done` is told as each step ends. With
-// ArcCuts::JunctionsAndWayEnds, the first vertex of each way run of every
-// ring of more than one is a junction too, in every ring through it.
+// ArcCuts::JunctionsAndWayEnds, a vertex where a ring's way changes (the
+// first of a way run whose run before it, round the ring, is of another
+// way) is a junction too, in every ring through it: a ring that starts
+// partway along one way, its first and last runs that way's, is not cut at
+// its start.
 AdminArcs build_arc_topology(const AdminExactRings& store, unsigned threads,
                              const std::function<void(const char*)>& phase_done = {},
                              ArcCuts cuts = ArcCuts::Junctions);
+
+// Whether a lookup finds nothing at `path`: a sidecar not there starts its
+// slots cold. One the lookup can't make says nothing, and the read that
+// follows refuses it.
+bool path_absent(const std::string& path);
 
 struct ArcSlots {
     std::vector<uint32_t> slots;  // by presentation order
@@ -793,10 +801,13 @@ void check_lossless(const AdminArcs& arcs, const AdminArcBlocks& blocks, const A
 std::vector<uint32_t> arc_at_slot(const ArcSetBlocks& set);
 
 // A continent's share of the planet's encoded arcs: those its polygons
-// (`polygons`, planet ids ascending) use, in the planet's order, their
-// blocks, boxes, keys, fallback keys and planet slots copied, and its polygons' rings'
-// refs. It has no slots or ring blocks until assign_region_arc_slots.
-AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector<uint32_t>& polygons, unsigned threads);
+// (`polygons`, planet ids ascending) use in each set of its stage, in the
+// planet's order, their blocks in the tiers `tiers` marks (bit t for tier t,
+// every tier by default; the others' empty), boxes, keys, fallback keys and
+// planet slots copied, and its polygons' rings' refs. It has no slots or ring
+// blocks until assign_region_arc_slots.
+AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector<uint32_t>& polygons, unsigned threads,
+                                 uint32_t tiers = UINT32_MAX);
 
 // A continent's own slots for each set of its stage, against its previous
 // build's sidecars under `prev_region_dir` (none when empty), its arcs

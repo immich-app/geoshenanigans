@@ -288,7 +288,9 @@ struct ArcTier {
     // Whether a ring valid as OSM has it that the tier's grid collapses with
     // every vertex kept (under 3 vertices or of no area: a pond within a
     // step or two of the grid) keeps its arcs, and their junctions, on the e7
-    // grid: areas small enough to fit between the grid's points.
+    // grid: areas small enough to fit between the grid's points. So does a
+    // ring that such a junction, on the e7 grid among its vertices on the
+    // tier's, collapses in turn.
     bool collapsing_rings_on_e7 = false;
     bool simplifies() const { return tolerance_m > 0; }
     bool coarsens() const { return grid_e7 > fine_grid_e7; }
@@ -314,9 +316,9 @@ inline constexpr ArcTier kWaterArcTiers[] = {
 inline constexpr size_t kWaterArcTierCount = sizeof(kWaterArcTiers) / sizeof(kWaterArcTiers[0]);
 
 // Where the arc stage cuts its rings into arcs: at their junctions, or at
-// those and at the ends of their member ways too (the first vertex of each
-// way run of a ring of more than one), so that an edit to one way changes
-// only the arcs along it.
+// those and at the ends of their member ways too (each vertex where a
+// ring's way changes), so that an edit to one way changes only the arcs
+// along it.
 enum class ArcCuts : uint8_t { Junctions, JunctionsAndWayEnds };
 
 // One run of the arc stage: the tiers it builds (the minimal set only when

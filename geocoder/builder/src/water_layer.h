@@ -10,8 +10,10 @@
 //                                         holes, summed, square degrees)
 //   arc_index.bin + arc_vertices.bin      the tier's arcs (kWaterArcStage:
 //                                         rings cut at member way ends)
-//   admin_cells.bin + admin_entries.bin   the L10 cell index, interior where
-//                                         both tiers' rings hold the cell
+//   admin_cells.bin + admin_entries.bin   the cell index at the admin cell
+//                                         level (--admin-level, L10 by
+//                                         default), interior where both
+//                                         tiers' rings hold the cell
 //   strings_core.bin + strings_layout.json  its own names, alphabetical
 //   water_meta.json                       each type code it uses: class,
 //                                         type and Nominatim rank
@@ -29,7 +31,9 @@
 // points into one of these.
 #pragma once
 
+#include <charconv>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <string>
@@ -61,10 +65,15 @@ struct ObjectTags {
     uint32_t qid = 0;
 };
 
-// The Q number of a wikidata tag ("Q123" -> 123), 0 for none.
+// The Q number of a wikidata tag ("Q123" -> 123), 0 for none and for a tag
+// that is more than a Q and the digits of a 32-bit number: two items, a
+// number past 32 bits, a sign or a space.
 inline uint32_t qid_of(const char* wikidata) {
     if (!wikidata || wikidata[0] != 'Q') return 0;
-    return static_cast<uint32_t>(std::strtoul(wikidata + 1, nullptr, 10));
+    const char* end = wikidata + std::strlen(wikidata);
+    uint32_t q = 0;
+    const auto [at, error] = std::from_chars(wikidata + 1, end, q);
+    return error == std::errc() && at == end ? q : 0;
 }
 
 // The tags of an object in scope, or none (code 0, no verbatim).
@@ -161,9 +170,10 @@ void index_collected(Collected& c);
 
 // The key and display name of a waterway=river or canal way, given its
 // tags: its waterway relation's id and name (a member of one), else its
-// local name and its name:en (else name); false for neither. A member of a
-// relation of a local name alone keeps its own name:en (LineIn::way_en),
-// which assemble may show in the relation's place.
+// local name and its name:en (else name); false for neither. Its wikidata
+// item is its relation's, else its own. A member of a relation of a local
+// name alone keeps its own name:en (LineIn::way_en), which assemble may show
+// in the relation's place.
 bool line_key(const Collected& c, int64_t way, const char* name, const char* name_en, uint32_t way_qid, LineIn& line);
 
 // Keys every line by its way's tags (line_key) against the waterway
@@ -205,8 +215,8 @@ struct Build {
 // Assembles every collected relation (assemble_area_rings, nested by
 // geometry as admin relations are: one polygon per outer ring with the holes
 // in it) and closed way into polygons, but a closed way an assembled
-// relation of its names (name and local name) takes whole as an outer ring:
-// one body tagged twice, whose islands the relation leaves out. Then takes
+// relation of its kind and names (name and local name) takes whole as an
+// outer ring: one body tagged twice, whose islands the relation leaves out. Then takes
 // the marine areas' as they are, in object order (ways by id, relations by
 // id, then marine areas by id; of an object or line two inputs hold, the
 // first input's copy alone), each ring rotated as canonicalize_ring_rotation
@@ -248,21 +258,36 @@ void split_polygons(Build& b, unsigned threads);
 // build (std::runtime_error), as the codes its records carry would move.
 std::shared_ptr<TypeTable> type_table(const Build& b, const std::string& prev_planet_dir);
 
-// The major tier of the planet (water_classify.h): each object by its own
-// area, and each river object by its river's, the river objects grouped by
-// their waterway relation (a naming key of one), by wikidata item (theirs,
-// or that of a line of their key in them) and by local name along river
-// polygons that share an arc. An object or river whose polygon the previous
-// planet build's major tier held keeps it at kMajorKeepPercent: the polygon
-// matched to a slot of the sidecars under water/major/simplified/ of
-// prev_planet_dir as that dir's slots match it, by identity, else by its
-// fallback key. Logs how many it holds.
-std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const std::string& prev_planet_dir);
+// Each polygon's slot identity and fallback key, by polygon: a way's by its
+// id; a relation's outer ring, or a marine area's, by the object and the
+// ring's smallest vertex (and its cut), with a fallback key by the object
+// and the ring's place. Two polygons that still share an identity (rings
+// alike at their corners) are told apart by their fallback keys, which no
+// two share: the one of the smaller keeps it, the other takes one of its own
+// key mixed in, the same from day to day; `told_apart` counts those.
+struct PolygonIdentities {
+    std::vector<uint64_t> ids, fallbacks;
+    size_t told_apart = 0;
+};
+PolygonIdentities polygon_identities(const Build& b);
+
+// The major tier of the planet (water_classify.h): every marine area, each
+// other object by its own area, and each river object by its river's, the
+// river objects grouped by their waterway relation (a naming key of one), by
+// wikidata item (theirs, or that of a line of their key in them) and by
+// local name along river polygons that share an arc. An object or river
+// whose polygon the previous planet build's major tier held keeps it at
+// kMajorKeepPercent: the polygon (its `identities`) matched to a slot of the
+// sidecars under water/major/simplified/ of prev_planet_dir as that dir's
+// slots match it, by identity, else by its fallback key. Logs how many it
+// holds.
+std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const PolygonIdentities& identities,
+                                    const std::string& prev_planet_dir);
 
 // The records, identities and names of the planet's layer (Layer), its
-// arcs and cells moved in.
+// identities, arcs and cells moved in.
 Layer planet_layer(const Build& b, std::shared_ptr<const TypeTable> types, std::vector<uint8_t> major,
-                   AdminArcBlocks arcs, std::vector<CellItemPair> cells);
+                   PolygonIdentities identities, AdminArcBlocks arcs, std::vector<CellItemPair> cells);
 
 // A region's share of the planet's layer: the polygons listed in the cells
 // `kept` marks (parallel to planet.cells), whole, with their arcs
@@ -279,16 +304,18 @@ std::string sitelinks_rows(const Build& b, const Layer& planet, const std::vecto
 // Writes a region's water dirs under region_dir/water (Layer, the region's
 // arc slots assigned): the all set's two tiers and the major tier, each
 // polygon in its slot against the previous build's sidecars under
-// region_prev (none when empty), a tombstone in each slot freed. `region`
-// labels the log lines. Returns the bytes written by dir.
+// region_prev (none when empty; one there that can't be read is refused), a
+// tombstone in each slot freed. Returns its log lines, labelled `region`:
+// one for water/all and one for water/major, each with its polygons and
+// slots, ring and arc bytes, cells and entries, name bytes and types.
 std::string write_water_dirs(const Layer& layer, const std::string& region_dir, const std::string& region_prev,
                              const std::string& region);
 
 // The planet's layer from what the passes collected, step by step: the
 // assembly, the naming join (water_names_s2.h) and the names, the arc stage
 // (kWaterArcStage) against the previous planet build's sidecars under
-// prev_planet_dir (none when empty), its encoding, the cells, the major tier
-// and the records. `sitelinks` gives a wikidata item's sitelink count (0 for
+// prev_planet_dir (none when empty; a polygon sidecar there that can't be
+// read is refused), its encoding, the cells, the major tier and the records. `sitelinks` gives a wikidata item's sitelink count (0 for
 // none) for the fame rule's rows (sitelinks_rows). Logs each step and its
 // counts. Uses up `c`.
 Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::function<uint32_t(uint32_t)>& sitelinks,

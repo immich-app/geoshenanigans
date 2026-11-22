@@ -9,8 +9,10 @@
 // side, so a cut stays where it is while the polygon's box stays round it.
 // Where a ring crosses a line it gains a vertex there (OSM's edge rounded to
 // the e7 grid at the line), and the cut runs along the line from one such
-// vertex to the next as a way of its own (a negative id of the line), so
-// each stretch of cut is one arc of the two pieces beside it.
+// vertex to the next as a way of its own (a negative id of the line). A
+// later cut of one side meets the line at a vertex of that side's, which the
+// piece beside it takes too, so each stretch of cut is one arc of the two
+// pieces beside it.
 //
 // The rings count even-odd, as every reader of them does, so they needn't be
 // valid: a hole may cross its outer ring or another hole. split_polygon
@@ -288,6 +290,132 @@ inline __int128 polygon_area2(const SplitPolygon& poly) {
     return a;
 }
 
+// Whether p lies on the segment a-b, at an end or between them.
+inline bool on_segment(PackedLocation a, PackedLocation b, PackedLocation p) {
+    const __int128 cross = static_cast<__int128>(int64_t(b.lat_e7) - a.lat_e7) * (int64_t(p.lon_e7) - a.lon_e7) -
+                           static_cast<__int128>(int64_t(b.lon_e7) - a.lon_e7) * (int64_t(p.lat_e7) - a.lat_e7);
+    return cross == 0 && std::min(a.lat_e7, b.lat_e7) <= p.lat_e7 && p.lat_e7 <= std::max(a.lat_e7, b.lat_e7) &&
+           std::min(a.lon_e7, b.lon_e7) <= p.lon_e7 && p.lon_e7 <= std::max(a.lon_e7, b.lon_e7);
+}
+
+// Calls visit on every ring of `pieces`, outer rings and holes.
+template <class Pieces, class Visit>
+void each_ring(Pieces& pieces, Visit visit) {
+    for (auto& q : pieces) {
+        visit(q.outer);
+        for (auto& h : q.holes) visit(h);
+    }
+}
+
+// Gives every edge of `pieces` along a cut (a way of `cut_ways`, ascending)
+// the vertices the pieces' edges of that cut end at between its ends: a side
+// cut again gains a vertex along the earlier cut where the later one meets
+// it, and the side beside it, cut no more, takes it too, so that both walk
+// the same vertices there and share its arcs. A cut's vertices lie on its
+// line, ordered there by latitude, then longitude.
+inline void node_cuts(std::vector<SplitPolygon>& pieces, const std::vector<int64_t>& cut_ways) {
+    auto is_cut = [&](int64_t way) { return std::binary_search(cut_ways.begin(), cut_ways.end(), way); };
+    auto before = [](PackedLocation a, PackedLocation b) {
+        return a.lat_e7 != b.lat_e7 ? a.lat_e7 < b.lat_e7 : a.lon_e7 < b.lon_e7;
+    };
+    struct End {
+        int64_t way;
+        PackedLocation at;
+    };
+    std::vector<End> ends;
+    each_ring(pieces, [&](const SplitRing& r) {
+        for (size_t i = 0, n = r.v.size(); i < n; i++)
+            if (is_cut(r.way[i])) {
+                ends.push_back({r.way[i], r.v[i]});
+                ends.push_back({r.way[i], r.v[(i + 1) % n]});
+            }
+    });
+    auto end_less = [&](const End& a, const End& b) { return a.way != b.way ? a.way < b.way : before(a.at, b.at); };
+    std::sort(ends.begin(), ends.end(), end_less);
+    ends.erase(std::unique(ends.begin(), ends.end(), [](const End& a, const End& b) {
+        return a.way == b.way && a.at == b.at;
+    }), ends.end());
+    each_ring(pieces, [&](SplitRing& r) {
+        const size_t n = r.v.size();
+        SplitRing out;
+        for (size_t i = 0; i < n; i++) {
+            const PackedLocation a = r.v[i], b = r.v[(i + 1) % n];
+            out.v.push_back(a);
+            out.way.push_back(r.way[i]);
+            if (!is_cut(r.way[i])) continue;
+            const bool up = before(a, b);
+            const End lo{r.way[i], up ? a : b}, hi{r.way[i], up ? b : a};
+            auto first = std::upper_bound(ends.begin(), ends.end(), lo, end_less);
+            auto last = std::lower_bound(first, ends.end(), hi, end_less);
+            const size_t at = out.v.size();
+            for (auto e = first; e < last; ++e)
+                if (on_segment(a, b, e->at)) {
+                    out.v.push_back(e->at);
+                    out.way.push_back(r.way[i]);
+                }
+            if (!up) {
+                std::reverse(out.v.begin() + static_cast<std::ptrdiff_t>(at), out.v.end());
+                std::reverse(out.way.begin() + static_cast<std::ptrdiff_t>(at), out.way.end());
+            }
+        }
+        if (out.v.size() != n) r = std::move(out);
+    });
+}
+
+// Whether p lies on an edge of `pieces` along a cut (a way of `cut_ways`,
+// ascending), at an end or between them.
+inline bool on_cut(const std::vector<SplitPolygon>& pieces, const std::vector<int64_t>& cut_ways, PackedLocation p) {
+    bool on = false;
+    each_ring(pieces, [&](const SplitRing& r) {
+        for (size_t i = 0, n = r.v.size(); i < n && !on; i++)
+            on = std::binary_search(cut_ways.begin(), cut_ways.end(), r.way[i]) && on_segment(r.v[i], r.v[(i + 1) % n], p);
+    });
+    return on;
+}
+
+// The check of a split into `pieces` along `cut_ways` (its cuts' ways): at
+// sample points over the polygon's box exactly the pieces the polygon holds
+// hold the point, one, but on a cut, which both pieces beside it may hold or
+// neither.
+inline bool pieces_hold(const SplitPolygon& polygon, const std::vector<SplitPolygon>& pieces,
+                        std::vector<int64_t> cut_ways) {
+    std::sort(cut_ways.begin(), cut_ways.end());
+    Box box;
+    for (PackedLocation p : polygon.outer.v) box.add(p);
+    std::vector<Box> boxes(pieces.size());
+    for (size_t k = 0; k < pieces.size(); k++)
+        for (PackedLocation p : pieces[k].outer.v) boxes[k].add(p);
+    // The polygon's own test, its outer ring's edges indexed and each hole
+    // behind its box.
+    const ExactRingEdgeIndex outer_index(polygon.outer.v.data(), static_cast<uint32_t>(polygon.outer.v.size()));
+    std::vector<ExactRingBox> hole_boxes;
+    for (const SplitRing& h : polygon.holes) hole_boxes.push_back(exact_ring_box(h.v.data(), static_cast<uint32_t>(h.v.size())));
+    auto whole_contains = [&](PackedLocation p) {
+        bool in = outer_index.contains(p);
+        for (size_t h = 0; h < polygon.holes.size(); h++)
+            if (!exact_ring_box_excludes(hole_boxes[h], p)) in = in != ring_contains(polygon.holes[h], p);
+        return in;
+    };
+    uint64_t state = mix64(static_cast<uint64_t>(box.lat_lo) * 31 + static_cast<uint64_t>(box.lon_lo));
+    auto next = [&](int64_t lo, int64_t hi) {
+        state = mix64(state + 0x9e3779b97f4a7c15ull);
+        return lo + static_cast<int64_t>(state % static_cast<uint64_t>(hi - lo + 1));
+    };
+    for (int k = 0; k < 1024; k++) {
+        const PackedLocation p{static_cast<int32_t>(next(box.lat_lo, box.lat_hi)),
+                               static_cast<int32_t>(next(box.lon_lo, box.lon_hi))};
+        const bool in = whole_contains(p);
+        int held = 0;
+        for (size_t q = 0; q < pieces.size(); q++) {
+            const Box& b = boxes[q];
+            if (p.lat_e7 < b.lat_lo || p.lat_e7 > b.lat_hi || p.lon_e7 < b.lon_lo || p.lon_e7 > b.lon_hi) continue;
+            held += polygon_contains(pieces[q], p);
+        }
+        if (held != (in ? 1 : 0) && !on_cut(pieces, cut_ways, p)) return false;
+    }
+    return true;
+}
+
 }  // namespace split_detail
 
 // Why split_polygon left a polygon whole.
@@ -306,9 +434,10 @@ inline const char* refusal_name(SplitRefusal r) {
 }
 
 // The pieces of the polygon (its rings and their edges' ways), each with at
-// most max_holes holes or as small as the grid goes; the polygon alone, key
-// 0, when it has no more than max_holes or its pieces fail the check, and
-// why in `refused`. `cut_lines` counts the lines it cut along.
+// most max_holes holes or as small as the grid goes, their edges along each
+// cut noded alike (node_cuts); the polygon alone, key 0, when it has no more
+// than max_holes or its pieces fail the check (pieces_hold), and why in
+// `refused`. `cut_lines` counts the lines it cut along.
 inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint32_t max_holes = kSplitMaxHoles,
                                                size_t* cut_lines = nullptr, SplitRefusal* refused = nullptr) {
     auto refuse = [&](SplitRefusal why) {
@@ -320,6 +449,7 @@ inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint
     std::vector<SplitPolygon> done, todo = {polygon};
     todo[0].key = 0;
     size_t lines = 0;
+    std::vector<int64_t> cut_ways;
     while (!todo.empty()) {
         SplitPolygon piece = std::move(todo.back());
         todo.pop_back();
@@ -353,8 +483,10 @@ inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint
         add(piece.outer);
         for (const SplitRing& h : piece.holes) add(h);
         std::vector<FrameRing> sides[2];
-        if (!cut(rings, L, cut_way_of(line, meridian), sides)) return refuse(SplitRefusal::Cut);
+        const int64_t cut_way = cut_way_of(line, meridian);
+        if (!cut(rings, L, cut_way, sides)) return refuse(SplitRefusal::Cut);
         lines++;
+        cut_ways.push_back(cut_way);
         for (int s = 0; s < 2; s++) {
             // The side's rings nested by geometry, as a relation's are: each
             // ring at even depth an outer ring with the holes in it.
@@ -391,49 +523,9 @@ inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint
 
     if (done.size() == 1) return refuse(SplitRefusal::Uncut);
 
-    // The check: at sample points over its box exactly the pieces the
-    // polygon holds hold the point, one.
-    Box box;
-    for (PackedLocation p : polygon.outer.v) box.add(p);
-    std::vector<Box> boxes(done.size());
-    for (size_t k = 0; k < done.size(); k++)
-        for (PackedLocation p : done[k].outer.v) boxes[k].add(p);
-    // The polygon's own test, its outer ring's edges indexed and each hole
-    // behind its box.
-    const ExactRingEdgeIndex outer_index(polygon.outer.v.data(), static_cast<uint32_t>(polygon.outer.v.size()));
-    std::vector<ExactRingBox> hole_boxes;
-    for (const SplitRing& h : polygon.holes) hole_boxes.push_back(exact_ring_box(h.v.data(), static_cast<uint32_t>(h.v.size())));
-    auto whole_contains = [&](PackedLocation p) {
-        bool in = outer_index.contains(p);
-        for (size_t h = 0; h < polygon.holes.size(); h++)
-            if (!exact_ring_box_excludes(hole_boxes[h], p)) in = in != ring_contains(polygon.holes[h], p);
-        return in;
-    };
-    uint64_t state = mix64(static_cast<uint64_t>(box.lat_lo) * 31 + static_cast<uint64_t>(box.lon_lo));
-    auto next = [&](int64_t lo, int64_t hi) {
-        state = mix64(state + 0x9e3779b97f4a7c15ull);
-        return lo + static_cast<int64_t>(state % static_cast<uint64_t>(hi - lo + 1));
-    };
-    for (int k = 0; k < 1024; k++) {
-        const PackedLocation p{static_cast<int32_t>(next(box.lat_lo, box.lat_hi)),
-                               static_cast<int32_t>(next(box.lon_lo, box.lon_hi))};
-        const bool in = whole_contains(p);
-        int held = 0;
-        for (size_t q = 0; q < done.size(); q++) {
-            const Box& b = boxes[q];
-            if (p.lat_e7 < b.lat_lo || p.lat_e7 > b.lat_hi || p.lon_e7 < b.lon_lo || p.lon_e7 > b.lon_hi) continue;
-            held += polygon_contains(done[q], p);
-        }
-        // A point on a cut line may be held by both pieces or neither.
-        if (held != (in ? 1 : 0)) {
-            bool on_cut = false;
-            for (size_t q = 0; q < done.size() && !on_cut; q++)
-                for (size_t i = 0; i < done[q].outer.v.size() && !on_cut; i++)
-                    on_cut = done[q].outer.way[i] < 0 &&
-                             (done[q].outer.v[i].lat_e7 == p.lat_e7 || done[q].outer.v[i].lon_e7 == p.lon_e7);
-            if (!on_cut) return refuse(SplitRefusal::Sample);
-        }
-    }
+    std::sort(cut_ways.begin(), cut_ways.end());
+    node_cuts(done, cut_ways);
+    if (!pieces_hold(polygon, done, cut_ways)) return refuse(SplitRefusal::Sample);
     if (cut_lines) *cut_lines += lines;
     if (refused) *refused = SplitRefusal::None;
     return done;

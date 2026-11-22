@@ -126,6 +126,14 @@ TEST(water_meta_json_round_trips_quotes_and_controls_and_refuses_what_it_did_not
     CHECK(parse_meta_json(meta_json(table, {}))->empty());
     CHECK(!parse_meta_json("").has_value());
     CHECK(!parse_meta_json("{\"types\": [{\"code\": 2}]}").has_value());
+    // Of a string, the writer's escapes alone: \", \\ and \u00xx below 0x20,
+    // and no control byte as it is.
+    auto with_type = [](const std::string& type) {
+        return "{\"types\": [\n  {\"code\": 32769, \"class\": \"water\", \"type\": \"" + type + "\", \"rank\": 22}\n]}\n";
+    };
+    CHECK(parse_meta_json(with_type("a\\\"b\\\\c\\u001f")).has_value());
+    for (const char* other : {"a\\nb", "a\\/b", "a\\tb", "a\\xb", "a\nb", "a\x01" "b"})
+        CHECK(!parse_meta_json(with_type(other)).has_value());
 }
 
 TEST(the_major_tier_takes_100_km2_and_wikidata_rivers_of_5_and_keeps_its_own_at_90_percent) {

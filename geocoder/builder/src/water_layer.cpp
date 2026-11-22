@@ -112,6 +112,14 @@ std::vector<uint64_t> read_fallback_sidecar(const std::string& path, size_t slot
     throw std::runtime_error(path + " is no fallback sidecar of " + std::to_string(slots) + " slots");
 }
 
+// Loads the previous build's polygon sidecar at `path`: false for none
+// there; one there that can't be read is refused.
+bool load_polygon_sidecar(IdAllocator& alloc, const std::string& path) {
+    if (path_absent(path)) return false;
+    if (!alloc.load_previous(path)) throw std::runtime_error("unreadable water polygon sidecar " + path);
+    return true;
+}
+
 // Slots for `ids` (polygons of the layer, ascending) against the previous
 // build's sidecars at `prev` (none when empty), written to `dir`; each id's
 // slot, and the slot count.
@@ -124,7 +132,7 @@ struct PolygonSlots {
 PolygonSlots polygon_slots(const Layer& layer, const std::vector<uint32_t>& ids, const std::string& prev_dir,
                            const std::string& dir) {
     IdAllocator alloc;
-    const bool had = !prev_dir.empty() && alloc.load_previous(prev_dir + "/admin_polygons.osm_ids");
+    const bool had = !prev_dir.empty() && load_polygon_sidecar(alloc, prev_dir + "/admin_polygons.osm_ids");
     const std::vector<uint64_t> prev_fallback =
         had ? read_fallback_sidecar(prev_dir + "/admin_polygons.fallback.osm_ids", alloc.total_slots())
             : std::vector<uint64_t>();
@@ -195,7 +203,7 @@ bool line_key(const Collected& c, int64_t way, const char* name, const char* nam
         line.key = "r" + std::to_string(w.id);
         line.local = w.local_name;
         line.display = w.name;
-        line.qid = w.qid;
+        line.qid = w.qid ? w.qid : way_qid;
         if (!w.english && name_en) line.way_en = name_en;
         return true;
     }
@@ -279,14 +287,17 @@ Build assemble(Collected& c, unsigned threads) {
             if (whole) outer_of[way].push_back(i);
         }
     }
-    // Whether closed way w is such an outer ring of a relation of its names:
-    // one body tagged twice, which the relation gives, its islands left out.
+    // Whether closed way w is such an outer ring of a relation of its kind
+    // and names: one body tagged twice, which the relation gives, its
+    // islands left out.
     auto twin = [&](const ClosedWayArea& w) {
         auto it = outer_of.find(w.way);
         if (it == outer_of.end()) return false;
         for (uint32_t i : it->second) {
             const ObjectTags& t = c.relations[i].tags;
-            if (t.name == w.tags.name && t.local_name == w.tags.local_name) return true;
+            if (t.code == w.tags.code && t.verbatim == w.tags.verbatim && t.name == w.tags.name &&
+                t.local_name == w.tags.local_name)
+                return true;
         }
         return false;
     };
@@ -462,15 +473,18 @@ void keep_objects(Build& b, const std::vector<uint8_t>& keep) {
         for (uint32_t k = 0; k < poly.ring_count; k++) {
             const uint32_t ring = poly.first_ring + k;
             const RingSpan span = r.rings[ring];
-            std::copy(r.vertices.begin() + span.begin, r.vertices.begin() + span.begin + span.count,
-                      r.vertices.begin() + static_cast<std::ptrdiff_t>(vertices));
+            // A ring in its place stays; one further on moves down to it.
+            if (span.begin != vertices)
+                std::copy(r.vertices.begin() + span.begin, r.vertices.begin() + span.begin + span.count,
+                          r.vertices.begin() + static_cast<std::ptrdiff_t>(vertices));
             if (with_runs) {
                 const auto [first, last] = r.runs_of_ring(ring);
                 const size_t n = static_cast<size_t>(last - first);
                 const size_t from = static_cast<size_t>(first - r.runs.data());
-                std::copy(r.runs.begin() + static_cast<std::ptrdiff_t>(from),
-                          r.runs.begin() + static_cast<std::ptrdiff_t>(from + n),
-                          r.runs.begin() + static_cast<std::ptrdiff_t>(runs));
+                if (from != runs)
+                    std::copy(r.runs.begin() + static_cast<std::ptrdiff_t>(from),
+                              r.runs.begin() + static_cast<std::ptrdiff_t>(from + n),
+                              r.runs.begin() + static_cast<std::ptrdiff_t>(runs));
                 r.first_run[rings] = static_cast<uint32_t>(runs);
                 runs += n;
             }
@@ -865,14 +879,14 @@ struct Groups {
 // Which of the polygons of `ids` and `fallbacks` (their slot identities
 // and fallback keys) held a live slot of the dir's previous slots: matched
 // as polygon_slots matches them, by identity, else by a fallback key one
-// unclaimed slot alone shares. None without the dir's sidecar; `live`
-// counts its live slots.
+// unclaimed slot alone shares. None without the dir's sidecar (one there
+// that can't be read is refused); `live` counts its live slots.
 std::vector<uint8_t> held_before(const std::vector<uint64_t>& ids, const std::vector<uint64_t>& fallbacks,
                                  const std::string& dir, size_t& live) {
     std::vector<uint8_t> out(ids.size(), 0);
     live = 0;
     IdAllocator alloc;
-    if (dir.empty() || !alloc.load_previous(dir + "/admin_polygons.osm_ids")) return out;
+    if (dir.empty() || !load_polygon_sidecar(alloc, dir + "/admin_polygons.osm_ids")) return out;
     std::vector<uint8_t> was_live(alloc.total_slots());
     for (size_t s = 0; s < was_live.size(); s++) live += was_live[s] = gc::id_alloc::is_reclaimable(alloc.slots()[s]);
     const std::vector<uint64_t> prev_fallback = read_fallback_sidecar(dir + "/admin_polygons.fallback.osm_ids", was_live.size());
@@ -885,12 +899,12 @@ std::vector<uint8_t> held_before(const std::vector<uint64_t>& ids, const std::ve
     return out;
 }
 
-// Each polygon's slot identity and fallback key. Two polygons that still
-// share an identity (rings alike at their corners) are told apart by their
-// fallback keys, which no two share: the one of the smaller keeps it, the
-// other takes one of its own key mixed in, the same from day to day. Returns
-// how many took one so.
-size_t identities_of(const Build& b, std::vector<uint64_t>& ids, std::vector<uint64_t>& fallbacks) {
+}  // namespace
+
+PolygonIdentities polygon_identities(const Build& b) {
+    PolygonIdentities out;
+    std::vector<uint64_t>& ids = out.ids;
+    std::vector<uint64_t>& fallbacks = out.fallbacks;
     const size_t n = b.rings.polygons.size();
     ids.resize(n);
     fallbacks.resize(n);
@@ -919,29 +933,25 @@ size_t identities_of(const Build& b, std::vector<uint64_t>& ids, std::vector<uin
     parallel_sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) {
         return ids[x] != ids[y] ? ids[x] < ids[y] : fallbacks[x] < fallbacks[y];
     });
-    size_t told_apart = 0;
     uint64_t before = 0;
     for (size_t k = 0; k < n; k++) {
         const uint32_t p = order[k];
         const uint64_t id = ids[p];
         if (k > 0 && id == before) {
             ids[p] = gc::id_alloc::make_key(ObjectType::SYNTHETIC, mix64(id ^ mix64(fallbacks[p] + 1)));
-            told_apart++;
+            out.told_apart++;
         }
         before = id;
     }
-    return told_apart;
+    return out;
 }
 
-}  // namespace
-
-std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const std::string& prev_planet_dir) {
+std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const PolygonIdentities& identities,
+                                    const std::string& prev_planet_dir) {
     const size_t n_objects = b.objects.size(), n_polygons = b.rings.polygons.size();
-    std::vector<uint64_t> ids, fallbacks;
-    identities_of(b, ids, fallbacks);
     size_t previous = 0;
-    const std::vector<uint8_t> held =
-        held_before(ids, fallbacks, prev_planet_dir.empty() ? "" : prev_planet_dir + "/water/major/simplified", previous);
+    const std::vector<uint8_t> held = held_before(identities.ids, identities.fallbacks,
+        prev_planet_dir.empty() ? "" : prev_planet_dir + "/water/major/simplified", previous);
     std::vector<uint8_t> was_major(n_objects, 0);
     for (size_t p = 0; p < n_polygons; p++)
         if (held[p]) was_major[b.object_of[p]] = 1;
@@ -1005,6 +1015,7 @@ std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const
     for (uint32_t o = 0; o < n_objects; o++) {
         const Object& obj = b.objects[o];
         auto keeps = [&](bool margin) {
+            if (obj.type == ObjectType::SYNTHETIC) return true;
             if (water_major_keeps(obj.km2, false, false, margin && was_major[o])) return true;
             if (!obj.tags.river_area) return false;
             const uint32_t g = groups.find(o);
@@ -1028,7 +1039,7 @@ std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const
 }
 
 Layer planet_layer(const Build& b, std::shared_ptr<const TypeTable> types, std::vector<uint8_t> major,
-                   AdminArcBlocks arcs, std::vector<CellItemPair> cells) {
+                   PolygonIdentities identities, AdminArcBlocks arcs, std::vector<CellItemPair> cells) {
     Layer out;
     out.types = std::move(types);
     const size_t n = b.rings.polygons.size();
@@ -1045,10 +1056,11 @@ Layer planet_layer(const Build& b, std::shared_ptr<const TypeTable> types, std::
         out.names.push_back('\0');
     }
     if (out.names.size() >= NO_DATA) throw std::length_error("water names past 4 GiB");
-    const size_t told_apart = identities_of(b, out.identities, out.fallbacks);
-    if (told_apart)
-        std::cerr << "  Water identities: " << told_apart << " polygons that shared one told apart by their fallback keys"
-                  << std::endl;
+    if (identities.told_apart)
+        std::cerr << "  Water identities: " << identities.told_apart
+                  << " polygons that shared one told apart by their fallback keys" << std::endl;
+    out.identities = std::move(identities.ids);
+    out.fallbacks = std::move(identities.fallbacks);
     out.records.resize(n);
     for (size_t p = 0; p < n; p++) {
         const Object& o = b.objects[b.object_of[p]];
@@ -1256,7 +1268,8 @@ std::string write_water_dirs(const Layer& layer, const std::string& region_dir, 
     std::vector<uint32_t> major;
     for (uint32_t p = 0; p < layer.size(); p++)
         if (layer.major[p]) major.push_back(p);
-    AdminArcBlocks major_arcs = subset_admin_arcs(layer.arcs, major, 0);
+    // Its arcs in the simplified tier alone, the one it writes.
+    AdminArcBlocks major_arcs = subset_admin_arcs(layer.arcs, major, 0, 1u << 0);
     std::cerr << assign_full_set_slots(major_arcs, prev_major.empty() ? "" : prev_major + "/arc_index.osm_ids",
                                        prev_major.empty() ? "" : prev_major + "/arc_index.fallback.osm_ids",
                                        region, "dir=major", 0);
@@ -1322,8 +1335,9 @@ Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::f
     log_phase("      Water: arcs", t, cpu);
     std::vector<CellItemPair> cells = compute_water_index_cells(arcs, b.rings, threads);
     log_phase("      Water: cells", t, cpu);
-    std::vector<uint8_t> major = major_polygons(b, arcs, prev_planet_dir);
-    Layer layer = planet_layer(b, types, std::move(major), std::move(blocks), std::move(cells));
+    PolygonIdentities identities = polygon_identities(b);
+    std::vector<uint8_t> major = major_polygons(b, arcs, identities, prev_planet_dir);
+    Layer layer = planet_layer(b, types, std::move(major), std::move(identities), std::move(blocks), std::move(cells));
     std::cerr << sitelinks_rows(b, layer, {10, 20, 40}, sitelinks);
     std::map<uint16_t, size_t> by_code;
     for (const AdminPolygon& r : layer.records) by_code[r.country_code]++;

@@ -99,8 +99,8 @@ POI files: `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.
 
 | Water | Files | Description |
 |-------|-------|-------------|
-| `water/major/simplified/` | 10 files | The seas and oceans; lakes, bays, straits, wetlands and glaciers of 100 km² or more; whole rivers and canals whose areas sum to 100 km² (5 km² with a Wikidata item). Shores within 37.5 m |
-| `water/all/simplified/` | 10 files | Every named water area, every river or canal area its waterway names, and the seas and oceans. Shores within 37.5 m |
+| `water/major/simplified/` | 10 files | The seas and oceans, in builds that pin the marine areas; lakes, bays, straits, wetlands and glaciers of 100 km² or more; whole rivers and canals whose areas sum to 100 km² (5 km² with a Wikidata item). Those are the thresholds to enter: one in the previous build's tier stays down to 90 km² (4.5 km²). Shores within 37.5 m |
+| `water/all/simplified/` | 10 files | Every named water area, every river or canal area its waterway names, and the seas and oceans in builds that pin the marine areas. Shores within 37.5 m |
 | `water/all/exact/` | 10 files | The same with every OSM point of every shore |
 
 Water files: `admin_polygons.bin`, `admin_rings.bin`, `arc_index.bin`,
@@ -312,7 +312,8 @@ every axis it lists (a variant without `when` takes any selection). Its
 `replaces` and all.
 `strings_layout.json`, `poi_meta.json`, `water_meta.json` and
 `attribution.json` are listed and compressed like the `.bin` files: the
-server reads the first three to load a region, and the credit travels with
+server reads `strings_layout.json` and `poi_meta.json` to load a region,
+`water_meta.json` gives a water dir's kinds, and the credit travels with
 the data.
 
 A component's `dir` names the sub-dir of the dataset its files go in: the
@@ -327,8 +328,10 @@ it `applies_to` (shell patterns of component ids). Each water dir's
 Marine Regions' where it holds a sea or ocean.
 
 `component_sizes` gives, per region, each component's bytes: `raw` its files
-on disk, `wire` what downloading them costs (each unit once, every other file
-as its `.zst`). A component counts the files the region has.
+on disk, `wire` what downloading them costs (a unit's size once, or its share
+by its files' raw bytes when the component holds only some of them; every
+other file as its `.zst`). A component counts its own files, not its
+variants', and only those the region has.
 
 ## Client Decision Tree
 
@@ -353,8 +356,9 @@ as its `.zst`). A component counts the files the region has.
    - builds/{date}/europe/poi/notable/…         (7 files, optional)
    - builds/{date}/europe/water/all/simplified/… (10 files, optional), into <dataset>/water/
    The JSON files (strings_layout.json, poi_meta.json, water_meta.json,
-   attribution.json) are part of the set: the server reads the first three
-   to load a region, and the credit travels with the data.
+   attribution.json) are part of the set: the server reads
+   strings_layout.json and poi_meta.json to load a region, water_meta.json
+   gives a water dir's kinds, and the credit travels with the data.
 6. Store build_version, patch_version, and date locally
 ```
 

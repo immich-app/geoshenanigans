@@ -528,7 +528,8 @@ AdminArcBlocks encode_admin_arcs(const AdminArcs& arcs, const AdminExactRings& s
     return out;
 }
 
-AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector<uint32_t>& polygons, unsigned threads) {
+AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector<uint32_t>& polygons, unsigned threads,
+                                 uint32_t tiers) {
     if (threads == 0) threads = parallel_threads();
     const ArcStage& stage = *planet.stage;
     AdminArcBlocks out;
@@ -542,7 +543,7 @@ AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector
         for (uint32_t r = 0; r < p.ring_count; r++) planet_ring.push_back(p.first_ring + r);
     }
     std::vector<uint32_t> kept_arcs[2];
-    for (ArcSet set : {ArcSet::Full, ArcSet::Minimal}) {
+    for (ArcSet set : stage_sets(stage)) {
         const ArcSetBlocks& from = planet.set(set);
         ArcSetBlocks& to = out.set(set);
         std::vector<std::atomic<uint64_t>> used(from.arcs() / 64 + 1);
@@ -575,6 +576,7 @@ AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector
         }, threads);
     }
     for (size_t t = 0; t < stage.tier_count; t++) {
+        if (!(tiers >> t & 1)) continue;
         const std::vector<uint32_t>& arcs = kept_arcs[set_index(stage.tiers[t].set)];
         const ArcBlocks& from = planet.tiers[t];
         lay_out_blocks(arcs.size(), out.tiers[t].bytes, out.tiers[t].at,

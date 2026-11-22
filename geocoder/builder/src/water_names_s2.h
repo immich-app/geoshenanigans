@@ -10,7 +10,7 @@
 namespace water {
 
 struct NamingCounts {
-    size_t cover_entries = 0;      // the river areas' L10 entries
+    size_t cover_entries = 0;      // the river areas' entries at the admin cell level
     size_t segments_in_cover = 0;  // candidate segments whose midpoint's cell they list
     size_t probes = 0;             // (polygon, segment) pairs a boundary cell left to the ray cast
     size_t probes_inside = 0;
@@ -22,8 +22,9 @@ struct NamingCounts {
 // areas: each segment whose midpoint (segment_midpoint) such a polygon's
 // rings hold (even-odd, holes honoured) credits its length (segment_mm) to
 // the polygon's object, under its line's key and display; consecutive ones
-// of one line summed. The midpoint's L10 cell gives the polygons: an
-// interior entry of the covering holds it, any other is the exact ray cast.
+// of one line summed. The midpoint's cell at the admin cell level
+// (kAdminCellLevel) gives the polygons: an interior entry of the covering
+// holds it, any other is the exact ray cast.
 std::vector<Credit> credit_naming_lines(const AdminExactRings& rings, const std::vector<uint32_t>& polygons,
                                         const std::vector<uint32_t>& object_of, const NamingLines& lines,
                                         NamingCounts& counts, unsigned threads = 0);

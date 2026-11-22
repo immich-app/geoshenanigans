@@ -4,9 +4,14 @@ python3 -m unittest discover -s geocoder/builder/tools"""
 import fnmatch
 import json
 import os
+import re
 import unittest
 
-TEMPLATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "configurations.template.json")
+HERE = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE = os.path.join(HERE, "..", "configurations.template.json")
+# The major tier's thresholds (water_classify.h) and the client's guide to the water dirs.
+WATER_CLASSIFY = os.path.join(HERE, "..", "src", "water_classify.h")
+PATCHING = os.path.join(HERE, "..", "..", "PATCHING.md")
 
 # The client files of a water dir, as the builder writes them (water_layer.h).
 WATER_DIR_FILES = ["admin_cells.bin", "admin_entries.bin", "admin_polygons.bin", "admin_rings.bin", "arc_index.bin",
@@ -49,6 +54,31 @@ class WaterAxisTest(unittest.TestCase):
         self.assertIn("water/", description)
         self.assertIn("answered in a `water` field beside the address", description)
         self.assertNotIn("yet", description)
+
+    def test_the_seas_and_oceans_are_offered_as_in_builds_that_pin_the_marine_areas(self):
+        axis = load_template()["axes"]["water"]
+        with open(PATCHING) as f:
+            rows = [line for line in f if line.startswith(("| `water/major/", "| `water/all/simplified/"))]
+        self.assertEqual(len(rows), 2)
+        for text in [axis["description"], axis["values"]["major"]["description"],
+                     axis["values"]["all"]["description"]] + rows:
+            self.assertIn("seas and oceans", text.lower(), text)
+            self.assertIn("in builds that pin the marine areas", text, text)
+
+    def test_the_major_value_gives_the_thresholds_to_enter_it_and_to_stay_in_it(self):
+        with open(WATER_CLASSIFY) as f:
+            header = f.read()
+
+        def constant(name):
+            return float(re.search(rf"inline constexpr double {name} = ([0-9.]+);", header).group(1))
+
+        keep = constant("kMajorKeepPercent") / 100
+        km2 = [constant("kMajorAreaKm2"), constant("kMajorWikidataRiverKm2")]
+        with open(PATCHING) as f:
+            row = next(line for line in f if line.startswith("| `water/major/"))
+        for text in (load_template()["axes"]["water"]["values"]["major"]["description"], row):
+            for v in km2 + [k * keep for k in km2]:
+                self.assertIn(f"{v:g} km²", text, text)
 
     def test_the_water_values_say_how_precise_their_shores_are(self):
         values = load_template()["axes"]["water"]["values"]

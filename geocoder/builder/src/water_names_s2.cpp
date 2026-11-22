@@ -1,6 +1,7 @@
 // The naming join (water_names.h) over the river and canal areas' exact
-// rings: their L10 covering, the admin index's (admin_polygon_cells, with
-// interior flags), then each candidate segment's midpoint in it.
+// rings: their covering at the admin cell level, the admin index's
+// (admin_polygon_cells, with interior flags), then each candidate segment's
+// midpoint in it.
 #include "water_names_s2.h"
 
 #include <algorithm>
@@ -43,8 +44,10 @@ struct Probe {
 #pragma pack(pop)
 
 // Adds a credit, onto the last one where that is of the same object, key,
-// display and wikidata item (a line's segments in a row).
+// display and wikidata item (a line's segments in a row); none of no
+// length, which would lend its line's wikidata item for nothing.
 void credit(std::vector<Credit>& out, uint32_t object, const NamingLine& line, uint64_t mm) {
+    if (mm == 0) return;
     if (!out.empty() && out.back().object == object && out.back().key == line.key && out.back().display == line.display &&
         out.back().qid == line.qid) {
         out.back().mm += mm;

@@ -457,9 +457,10 @@ class WaterDirPatchTest(unittest.TestCase):
         self.assertIn("arc_index.bin: unchanged", log)
         arcs = re.search(r"arc_vertices\.bin: .* recs m/i/d/r=(\d+)/(\d+)/(\d+)/(\d+)", log)
         self.assertIsNotNone(arcs, log)
-        kept, inserted, deleted, _ = map(int, arcs.groups())
+        kept, inserted, deleted, replaced = map(int, arcs.groups())
         self.assertEqual(inserted, deleted)
         self.assertTrue(0 < inserted <= 8, log)
+        self.assertEqual(replaced, 0, log)
         self.assertGreater(kept, 100)
 
 

@@ -187,10 +187,20 @@ _LAND_TREE = None
 _SEA_TILES = None
 
 
+def _polygon_parts(geoms):
+    """The polygons of any area in a geometry or an array of them, collections in collections (as GEOS'
+    repair gives: a multipolygon beside the lines it cut off) taken apart to the last."""
+    import shapely
+    parts = shapely.get_parts(geoms)
+    while (shapely.get_type_id(parts) >= 4).any():
+        parts = shapely.get_parts(parts)
+    return [p for p in parts if shapely.get_type_id(p) == 3 and p.area > 0]
+
+
 def _polygons_of(geom):
     """The polygons of an overlay's result, as one (Multi)Polygon, or None for none of any area."""
     import shapely
-    parts = [p for p in shapely.get_parts(geom) if shapely.get_type_id(p) == 3 and p.area > 0]
+    parts = _polygon_parts(geom)
     if not parts:
         return None
     return parts[0] if len(parts) == 1 else shapely.MultiPolygon(parts)
@@ -291,8 +301,7 @@ def _tile_job(key):
     found = _LAND_TREE.query(tile, predicate="intersects")
     water = tile
     # The land polygons' areas in the tile (a polygon touching it along an edge gives a line).
-    land = [p for p in shapely.get_parts(shapely.intersection(_LAND[found], tile, grid_size=GRID))
-            if shapely.get_type_id(p) == 3 and p.area > 0]
+    land = _polygon_parts(shapely.intersection(_LAND[found], tile, grid_size=GRID))
     if land:
         land = shapely.union_all(land, grid_size=GRID)
         water = _polygons_of(shapely.difference(tile, land, grid_size=GRID))
@@ -320,8 +329,7 @@ def _tile_job(key):
             step = 1 / GAP_CELL_DIVISIONS
             cells = [shapely.box(x + i * step, y + j * step, x + (i + 1) * step, y + (j + 1) * step)
                      for j in range(GAP_CELL_DIVISIONS) for i in range(GAP_CELL_DIVISIONS)]
-            bits = [b for b in shapely.get_parts(shapely.intersection(gap, cells, grid_size=GRID))
-                    if shapely.get_type_id(b) == 3 and b.area > 0]
+            bits = _polygon_parts(shapely.intersection(gap, cells, grid_size=GRID))
             pieces = [p for m in sorted(near) for p in near[m]]
             owner = [m for m in sorted(near) for _ in near[m]]
             # Each bit's nearest pieces, every one at that distance.
@@ -329,14 +337,18 @@ def _tile_job(key):
             tied = {}
             for i, j, d in zip(pairs[0], pairs[1], dist):
                 tied.setdefault(int(i), (d, set()))[1].add(owner[j])
+            # Each sea area's border round its pieces together, so a stretch two of them share counts once.
+            borders = {}
             for i, bit in enumerate(bits):
                 d, owners = tied[i]
                 owners = sorted(owners)
                 best = owners[0]
                 if len(owners) > 1 and d == 0:
                     edge = shapely.boundary(bit)
-                    shared = [sum(shapely.length(shapely.intersection(edge, shapely.boundary(p), grid_size=GRID))
-                                  for p in near[m]) for m in owners]
+                    for m in owners:
+                        if m not in borders:
+                            borders[m] = shapely.boundary(shapely.union_all(near[m], grid_size=GRID))
+                    shared = [shapely.length(shapely.intersection(edge, borders[m], grid_size=GRID)) for m in owners]
                     best = owners[int(np.argmax(shared))]
                 taken.setdefault(best, []).append(bit)
                 counts["gap_bits"] += 1
@@ -344,9 +356,7 @@ def _tile_job(key):
         taken = {m: shapely.union_all(g, grid_size=GRID) for m, g in taken.items()}
     out = []
     for m, g in taken.items():
-        for poly in shapely.get_parts(g):
-            if shapely.get_type_id(poly) != 3 or poly.area <= 0:
-                continue
+        for poly in _polygon_parts(g):
             rings = _rings_e7(poly)
             if rings is not None:
                 out.append((m, key, _smallest_vertex(rings), rings))
@@ -364,9 +374,11 @@ def _valid_parts(item):
 def _read_seas(path, pool):
     """The sea areas: each MRGID's name, and its parts as (mrgid, wkb), valid and on the e7 grid."""
     import pyogrio
-    _, _, geoms, fields = pyogrio.raw.read(path, columns=["iho_mrgid", "iho_sea"])
+    # The fields come in the source's order, whatever the order asked for: each is taken by its name.
+    meta, _, geoms, fields = pyogrio.raw.read(path, columns=["iho_mrgid", "iho_sea"])
+    field = dict(zip(meta["fields"], fields))
     names, features = {}, []
-    for wkb, mrgid, name in zip(geoms, fields[0], fields[1]):
+    for wkb, mrgid, name in zip(geoms, field["iho_mrgid"], field["iho_sea"]):
         if wkb is None or not name:
             continue
         mrgid = int(mrgid)
@@ -402,16 +414,16 @@ def build(opts):
     def log(message):
         print(f"[{time.time() - started:7.1f}s] {message}", flush=True)
 
+    if opts.stats and os.path.realpath(opts.stats) == os.path.realpath(opts.output):
+        raise ValueError(f"--stats {opts.stats} is the output, -o {opts.output}")
     bbox = tuple(float(v) for v in opts.bbox.split(",")) if opts.bbox else None
     ctx = multiprocessing.get_context("fork")
     tiles = {}
     with ctx.Pool(opts.workers) as pool:
         names, parts = _read_seas(opts.eez_iho, pool)
         log(f"{len(names)} sea areas in {len(parts)} parts")
-        if bbox:
-            box = shapely.box(bbox[0] - 1, bbox[1] - 1, bbox[2] + 1, bbox[3] + 1)
-            parts = [(m, w) for m, w in parts if shapely.intersects(shapely.from_wkb(w), box)]
-        # The costliest parts first, so the last one doesn't run alone.
+        # Every part, --bbox or not: a tile's water goes by the sea areas in the tiles around it, across the
+        # antimeridian too. The costliest first, so the last one doesn't run alone.
         order = sorted(parts, key=lambda p: -len(p[1]))
         for pieces in pool.imap_unordered(_split_into_tiles, order):
             for key, mrgid, wkb in pieces:

@@ -299,10 +299,12 @@ inline std::optional<std::vector<MetaType>> parse_meta_json(const std::string& t
                     at += 6;
                     continue;
                 }
+                if (e != '"' && e != '\\') return false;
                 v += e;
                 at += 2;
                 continue;
             }
+            if (static_cast<unsigned char>(text[at]) < 0x20) return false;
             v += text[at++];
         }
         if (at >= text.size()) return false;
