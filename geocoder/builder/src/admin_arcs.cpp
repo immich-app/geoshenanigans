@@ -1193,7 +1193,6 @@ AdminArcs build_arc_stage(const ArcStage& stage, const AdminExactRings& store, c
     } else {
         free_storage(arcs.way_at);
         free_storage(arcs.ways);
-        minimal.ring_refs.assign(store.rings.size() + 1, 0);
     }
 
     const std::vector<bool> nests_exact = exact_rings_nest(store, threads);

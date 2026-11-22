@@ -1256,7 +1256,8 @@ std::string write_water_dirs(const Layer& layer, const std::string& region_dir, 
     std::vector<uint32_t> major;
     for (uint32_t p = 0; p < layer.size(); p++)
         if (layer.major[p]) major.push_back(p);
-    AdminArcBlocks major_arcs = subset_admin_arcs(layer.arcs, major, 0);
+    // Its arcs in the simplified tier alone, the one it writes.
+    AdminArcBlocks major_arcs = subset_admin_arcs(layer.arcs, major, 0, 1u << 0);
     std::cerr << assign_full_set_slots(major_arcs, prev_major.empty() ? "" : prev_major + "/arc_index.osm_ids",
                                        prev_major.empty() ? "" : prev_major + "/arc_index.fallback.osm_ids",
                                        region, "dir=major", 0);

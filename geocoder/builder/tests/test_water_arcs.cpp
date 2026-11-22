@@ -167,7 +167,7 @@ TEST(the_water_stage_builds_and_encodes_its_two_tiers_with_no_minimal_set) {
     CHECK(blocks.stage == &kWaterArcStage);
     CHECK_EQ(arcs.tiers.size(), kWaterArcTierCount);
     CHECK(arcs.minimal.arcs.empty());
-    CHECK_EQ(arcs.minimal.ring_refs.size(), store.rings.size() + 1);
+    CHECK(arcs.minimal.ring_refs.empty());
     CHECK_EQ(arcs.arcs.size(), size_t(4));
     CHECK(blocks.set(ArcSet::Minimal).ring_blocks.empty());
     for (const AdminArcPolygon& p : blocks.polygons) {
@@ -191,6 +191,15 @@ TEST(the_water_stage_builds_and_encodes_its_two_tiers_with_no_minimal_set) {
     const ScratchDir dir("water-arcs");
     AdminArcBlocks one = subset_admin_arcs(blocks, {1}, 1);
     CHECK(one.stage == &kWaterArcStage);
+    CHECK(one.set(ArcSet::Minimal).ring_refs.empty());
+    CHECK(!one.tiers[1].bytes.empty());
+    // One of the simplified tier alone (water's major tier) copies no other
+    // tier's blocks.
+    const AdminArcBlocks simplified = subset_admin_arcs(blocks, {1}, 1, 1u << 0);
+    CHECK(simplified.tiers[0].bytes == one.tiers[0].bytes);
+    CHECK(simplified.tiers[0].at == one.tiers[0].at);
+    CHECK(simplified.tiers[1].bytes.empty());
+    CHECK(simplified.tiers[1].at.empty());
     captured.str("");
     was = std::cerr.rdbuf(captured.rdbuf());
     assign_region_arc_slots(one, "", "oceania", 1);

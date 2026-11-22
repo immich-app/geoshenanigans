@@ -793,10 +793,13 @@ void check_lossless(const AdminArcs& arcs, const AdminArcBlocks& blocks, const A
 std::vector<uint32_t> arc_at_slot(const ArcSetBlocks& set);
 
 // A continent's share of the planet's encoded arcs: those its polygons
-// (`polygons`, planet ids ascending) use, in the planet's order, their
-// blocks, boxes, keys, fallback keys and planet slots copied, and its polygons' rings'
-// refs. It has no slots or ring blocks until assign_region_arc_slots.
-AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector<uint32_t>& polygons, unsigned threads);
+// (`polygons`, planet ids ascending) use in each set of its stage, in the
+// planet's order, their blocks in the tiers `tiers` marks (bit t for tier t,
+// every tier by default; the others' empty), boxes, keys, fallback keys and
+// planet slots copied, and its polygons' rings' refs. It has no slots or ring
+// blocks until assign_region_arc_slots.
+AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector<uint32_t>& polygons, unsigned threads,
+                                 uint32_t tiers = UINT32_MAX);
 
 // A continent's own slots for each set of its stage, against its previous
 // build's sidecars under `prev_region_dir` (none when empty), its arcs
