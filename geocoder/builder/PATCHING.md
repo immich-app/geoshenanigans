@@ -484,9 +484,14 @@ What keeps a day's patch small:
   way of a lake with many islands resends the stretch of its ring block
   between the first and the last ref that changed. Polygons of more than
   `kSplitMaxHoles` holes are cut into pieces along a fixed grid
-  (`src/water_split.h`), so no block holds more than that many holes; each
-  piece carries the object's name, type and area, and keeps its slot by the
-  relation, the outer ring's place and the piece's cut.
+  (`src/water_split.h`), each of at most that many holes or as small as the
+  grid goes; each piece carries the object's name, type and area, and keeps
+  its slot by the relation, the outer ring's place and the piece's cut. A
+  polygon the grid can't cut cleanly (its way runs don't cover its rings, a
+  ring's crossings of a line don't pair up, no cut leaves more than one
+  piece, or the pieces disagree with it at a sample point) stays whole, all
+  its holes in one block, and the build logs it as `Water split: <object>
+  (<name>, <n> holes) kept whole: <reason>`.
 - **Type codes** of `water=*` values outside the fixed table
   (`src/water_types.h`) are allocated against the previous build's
   `water_meta.json`, so a new rare value never renumbers another. A build on
