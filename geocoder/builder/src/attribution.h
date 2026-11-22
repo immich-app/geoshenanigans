@@ -36,7 +36,11 @@ struct AttributionEntry {
 
 // GeoNames's notices are the lines of the readme of its postal code files
 // (download.geonames.org/export/zip/readme.txt, also in GB.zip) that cover
-// GB_full.csv.zip, verbatim. Code-Point Open's are the attribution
+// GB_full.csv.zip, verbatim, then the changes CC BY 4.0 asks a distributor to
+// indicate (section 3(a)(1)(B)): the nightly keeps each GB row's postcode and
+// coordinates (geocoder-build.yml), and the build those of a valid form
+// (validate_postcode_for_country) whose pair OSM has no centroid for
+// (load_external_postcodes, write_index). Code-Point Open's are the attribution
 // statements of its licence.txt (Doc/licence.txt in its download), verbatim
 // but for the year, 2022, the one of GeoNames's Royal Mail notice, of the
 // release GB_full came from; its licence there,
@@ -49,7 +53,10 @@ inline constexpr AttributionEntry kAttribution[] = {
     {ATTRIBUTION_GEONAMES, "geonames", "GeoNames", "https://www.geonames.org/", "CC BY 4.0",
      "https://creativecommons.org/licenses/by/4.0/",
      {"UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.",
-      "The Data is provided \"as is\" without warranty or any representation of accuracy, timeliness or completeness."}},
+      "The Data is provided \"as is\" without warranty or any representation of accuracy, timeliness or completeness.",
+      "Changes: this dataset holds the coordinates of the GB postcodes of GB_full.csv.zip that are of a valid form and "
+      "that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the file's "
+      "other fields."}},
     {ATTRIBUTION_GEONAMES, "codepoint-open", "Ordnance Survey Code-Point Open",
      "https://www.ordnancesurvey.co.uk/products/code-point-open", "OGL v3.0",
      "https://www.nationalarchives.gov.uk/doc/open-government-licence/version/3/",

@@ -50,6 +50,23 @@ TEST(attribution_lists_its_sources_in_the_templates_order) {
     CHECK(some.find("\"id\": \"tiger\"") != std::string::npos);
 }
 
+TEST(attribution_of_geonames_says_how_the_dataset_changed_its_data) {
+    // CC BY 4.0 asks a distributor to say how it modified the material
+    // (section 3(a)(1)(B)): the GeoNames entry says what the dataset holds of
+    // GB_full, after the readme's two notices.
+    const std::string geonames = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES);
+    const size_t at = geonames.find("\"id\": \"geonames\"");
+    REQUIRE(at != std::string::npos);
+    const std::string entry = geonames.substr(at, geonames.find('}', at) - at);
+    const size_t warranty = entry.find("The Data is provided");
+    const size_t changes = entry.find(
+        R"("Changes: this dataset holds the coordinates of the GB postcodes of GB_full.csv.zip that are of a valid )"
+        R"(form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none )"
+        R"(of the file's other fields.")");
+    REQUIRE(warranty != std::string::npos);
+    CHECK(changes != std::string::npos && warranty < changes);
+}
+
 TEST(attribution_of_geonames_carries_the_credit_of_code_point_open) {
     // GeoNames's GB_full is derived from Ordnance Survey's Code-Point Open,
     // whose entry, under the Open Government Licence, travels with it: the

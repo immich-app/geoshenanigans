@@ -29,7 +29,8 @@
       "licence_url": "https://creativecommons.org/licenses/by/4.0/",
       "notices": [
         "UK (GB_full.csv.zip): Contains Royal Mail data Royal Mail copyright and database right 2022.",
-        "The Data is provided \"as is\" without warranty or any representation of accuracy, timeliness or completeness."
+        "The Data is provided \"as is\" without warranty or any representation of accuracy, timeliness or completeness.",
+        "Changes: this dataset holds the coordinates of the GB postcodes of GB_full.csv.zip that are of a valid form and that OpenStreetMap gives no centroid for, as their centroids, in its own format; it holds none of the file's other fields."
       ],
       "applies_to": [
         "mode.full",

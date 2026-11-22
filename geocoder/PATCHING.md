@@ -296,7 +296,7 @@ The data is owed credit, and the dataset carries it in two places:
   | `id` | Source | Licence | In |
   |---|---|---|---|
   | `osm` | OpenStreetMap: the dataset is a derivative database of it | ODbL 1.0 | every dir |
-  | `geonames` | GeoNames: postcode centroids where OSM has none (GB_full, which the nightly loads), with the Royal Mail notice of its readme | CC BY 4.0 | the dirs of `full`, `no-addresses` and `admin`, the ones holding postcode centroids |
+  | `geonames` | GeoNames: postcode centroids where OSM has none (GB_full, which the nightly loads), with the Royal Mail notice of its readme and the changes the dataset made (CC BY 4.0 section 3(a)(1)(B)) | CC BY 4.0 | the dirs of `full`, `no-addresses` and `admin`, the ones holding postcode centroids |
   | `codepoint-open` | Ordnance Survey Code-Point Open, which GB_full is derived from, with the Ordnance Survey, Royal Mail and National Statistics statements of its licence | OGL v3.0 | the same, always beside `geonames` |
   | `tiger` | US Census Bureau TIGER/Line: US address ranges and ZIPs, and postcode centroids where OSM has none | Public domain, credited as a courtesy | the same |
 
