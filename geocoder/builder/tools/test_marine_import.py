@@ -92,6 +92,14 @@ def square(x0, y0, x1, y1):
     return [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]
 
 
+def geometry(polygons):
+    """An object's polygons, as the file holds them, as one shapely geometry in degrees."""
+    import shapely
+    return shapely.union_all([shapely.Polygon([(lon / 1e7, lat / 1e7) for lat, lon in rings[0]],
+                                              [[(lon / 1e7, lat / 1e7) for lat, lon in h] for h in rings[1:]])
+                              for rings in polygons])
+
+
 @unittest.skipUnless(HAS_GEOMETRY, "needs shapely, numpy and pyogrio")
 class BuildTest(unittest.TestCase):
     """A world of land but for the water of 10-12 east by 50-50.8 north, two tiles of it, with an island; two
@@ -125,17 +133,25 @@ class BuildTest(unittest.TestCase):
     def tearDown(self):
         self.dir.cleanup()
 
-    def build(self, name, workers=2):
-        out = os.path.join(self.dir.name, name)
-        stats = out + ".json"
+    def write(self, name, features):
+        path = os.path.join(self.dir.name, name)
+        with open(path, "w") as f:
+            json.dump({"type": "FeatureCollection", "features": features}, f)
+        return path
+
+    def run_build(self, out, stats, workers=2, seas=None, land=None, more=()):
         with open(os.devnull, "w") as quiet:
             saved, sys.stdout = sys.stdout, quiet
             try:
-                rc = marine_import.main(["build", "--eez-iho", self.seas, "--land", self.land, "-o", out,
-                                         "--stats", stats, "--workers", str(workers)])
+                return marine_import.main(["build", "--eez-iho", seas or self.seas, "--land", land or self.land,
+                                           "-o", out, "--stats", stats, "--workers", str(workers), *more])
             finally:
                 sys.stdout = saved
-        self.assertEqual(rc, 0)
+
+    def build(self, name, workers=2, seas=None, land=None, more=()):
+        out = os.path.join(self.dir.name, name)
+        stats = out + ".json"
+        self.assertEqual(self.run_build(out, stats, workers, seas, land, more), 0)
         with open(stats) as f:
             return out, json.load(f)
 
@@ -146,11 +162,6 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(sorted(objects), [1902, 2350])
         self.assertEqual(objects[2350][1:3], (marine_import.KIND_SEA, "North Sea"))
         self.assertEqual(objects[1902][1:3], (marine_import.KIND_OCEAN, "North Atlantic Ocean"))
-
-        def geometry(polygons):
-            return shapely.union_all([shapely.Polygon([(lon / 1e7, lat / 1e7) for lat, lon in rings[0]],
-                                                      [[(lon / 1e7, lat / 1e7) for lat, lon in h] for h in rings[1:]])
-                                      for rings in polygons])
 
         west, east = geometry(objects[2350][3]), geometry(objects[1902][3])
         land = shapely.union_all([shapely.difference(shapely.box(5, 45, 15, 55), shapely.box(10, 50, 12, 50.8)),
@@ -190,6 +201,38 @@ class BuildTest(unittest.TestCase):
         many, _ = self.build("many.bin", workers=3)
         with open(one, "rb") as a, open(many, "rb") as b:
             self.assertEqual(a.read(), b.read())
+
+    def test_a_repaired_feature_keeps_the_polygons_its_repair_nests(self):
+        import shapely
+        # A bowtie with a spike: GEOS repairs it into a collection of the bowtie's two triangles, as one
+        # multipolygon, and the spike's line.
+        bowtie = shapely.from_wkt("POLYGON ((10 50, 10.2 50.2, 10.2 50, 10 50.2, 10 50, 9.9 49.9, 10 50))")
+        self.assertEqual(shapely.get_type_id(shapely.get_parts(shapely.make_valid(bowtie))).tolist(), [6, 1])
+        parts = marine_import._valid_parts((2350, shapely.to_wkb(bowtie)))
+        self.assertEqual([m for m, _ in parts], [2350, 2350])
+        polygons = [shapely.from_wkb(w) for _, w in parts]
+        self.assertEqual([p.geom_type for p in polygons], ["Polygon", "Polygon"])
+        self.assertAlmostEqual(sum(p.area for p in polygons), 0.02, places=12)
+
+    def test_a_gap_bit_counts_the_border_it_shares_with_a_sea_area_once(self):
+        import shapely
+        # One tile of water. Sea 1 is two pieces that overlap along x = 10.42; sea 2 is the rest of the tile
+        # but for a notch, 10.42-10.46 x 50.0-50.06, that no sea area covers. The notch shares 0.06 of its
+        # border with sea 1 (once, though both its pieces run along it) and 0.10 with sea 2.
+        seas = self.write("notch.geojson", [
+            feature({"iho_mrgid": 1, "iho_sea": "West Sea"}, [square(10.0, 50.0, 10.42, 51.0)]),
+            feature({"iho_mrgid": 1, "iho_sea": "West Sea"}, [square(10.3, 50.0, 10.42, 50.5)]),
+            feature({"iho_mrgid": 2, "iho_sea": "East Sea"},
+                    [[[10.42, 50.06], [10.46, 50.06], [10.46, 50.0], [11.0, 50.0], [11.0, 51.0], [10.42, 51.0],
+                      [10.42, 50.06]]]),
+        ])
+        land = self.write("tile.geojson",
+                          [feature({}, [square(5.0, 45.0, 15.0, 55.0), square(10.0, 50.0, 11.0, 51.0)])])
+        path, _ = self.build("notch.bin", seas=seas, land=land)
+        objects = {o[0]: geometry(o[3]) for o in marine_import.read_marine(path)}
+        notch = shapely.Point(10.44, 50.03)
+        self.assertTrue(objects[2].contains(notch))
+        self.assertFalse(objects[1].intersects(notch))
 
 
 if __name__ == "__main__":
