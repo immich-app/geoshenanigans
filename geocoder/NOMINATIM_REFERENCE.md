@@ -199,42 +199,50 @@ Where Nominatim's rank adjustment matters:
 
 - **A field of its own.** Where the dataset has a water dir, the answer carries
   `water: {name, class, type}` last; `display_name`, `address` and `places` are
-  Nominatim's default answer, as without water, and the field is absent where no
-  water holds the point. `class` and `type` are the category and type Nominatim
-  gives the feature, `type` the key its `layer=natural` address names it by.
+  this geocoder's answer without water, unchanged, and the field is absent
+  where no water holds the point. `class` and `type` are the category and type
+  Nominatim gives the feature, `type` the key its `layer=natural` address names
+  it by.
 - **The rule.** Of the water areas whose rings hold the point (holes honoured: a
   point on an island mapped as a hole of its lake is not in the lake), the
   smallest OSM object answers, its area that of all its outer rings with their
-  holes taken off (the water it holds), then the higher `rank_search`, the
-  lower type code and the smaller name. The order is
-  the object's, so every polygon of a multipolygon, and every piece of one the
-  builder cut, answers alike.
+  holes taken off (the water it holds), in square degrees (not the km² of the
+  `major` tier's rule), then the higher `rank_search`, the lower type code and
+  the smaller name. The order is the object's, so every polygon of a
+  multipolygon, and every piece of one the builder cut, answers alike. Where
+  continents overlap (Sinai, the Urals) and two loaded continents hold the
+  point, the order runs over the water of both, the address's continent's
+  winning a whole tie; the address is picked as without water.
 - **Where it differs from `layer=natural`.** Only where a larger area of higher
   rank holds a smaller one of lower rank: a lake or reservoir (20) inside a
   wetland, glacier, bay or strait (22) answers the lake, where Nominatim gives
   the larger area. An area always beats no area: lines are never answers, and
   no bounding box stands in for a shape. Ties of one size and rank go to the
-  smaller name, not to database order.
+  lower type code, then the smaller name, not to database order.
 - **Seas and oceans** are Marine Regions' IHO sea areas (EEZ∩IHO v5, CC BY 4.0),
-  cut to OpenStreetMap's land, as `place/sea` and `place/ocean`: a sea is never
-  named on land. A point at sea that no address reaches answers
-  `{"address": {}, "water": {...}}`, where Nominatim answers `Unable to geocode`.
-  Only a dataset whose region covers the open sea answers there: the planet's;
-  a continent's dirs hold the coastal seas its region takes in.
+  cut to OpenStreetMap's land, as `place/sea` and `place/ocean`. `major` and
+  `all` keep that shore only within 37.5 m (Precision, below), so a point that
+  close to it can fall on either side. A point at sea that no address reaches
+  answers `{"address": {}, "water": {...}}`, where Nominatim answers
+  `Unable to geocode`. Only a dataset whose region covers the open sea answers
+  there: the planet's; a continent's dirs hold the coastal seas its region
+  takes in.
 - **River naming.** River and canal areas are answers, as `waterway/river` and
-  `waterway/canal` whether named by themselves or not. An unnamed one takes the
-  river whose waterway has the most length inside it, summed in whole
-  millimetres: a way of a `type=waterway` relation counts for that relation,
-  any other for its own local `name`, so one river under several `name:en` stays
-  one. Its name follows the dataset's name rule, `name:en` else `name`: the
-  relation's own `name:en`; else, where its river ways that carry a `name:en`
+  `waterway/canal`, named by themselves or by a waterway; an unnamed one that no
+  waterway names is left out. An unnamed one takes the river whose waterway has
+  the most length in it: the whole length of each of its segments whose midpoint
+  falls inside the area, in whole millimetres, summed. A way of a
+  `type=waterway` relation counts for that relation, any other for its own
+  local `name`, so one river under several `name:en` stays one. Its name
+  follows the dataset's name rule, `name:en` else `name`: the relation's own
+  `name:en`; else, where its river ways that carry a `name:en`
   hold more than half of its river length (whole millimetres, none counted
   across a missing node), the `name:en` of the most length among them, a tie
   going to the smaller name; else the relation's `name`. So neither one way's
   `name:en` nor a reach's local name renames the river. A river mapped only as
   a line has no area and gets no `water`.
 - **Kinds out of scope**, as in Nominatim: unnamed water (but river and canal
-  areas, above), `water=stream|ditch|drain|fish_pass`, `water=*` without
+  areas a waterway names, above), `water=stream|ditch|drain|fish_pass`, `water=*` without
   `natural=water`, `natural=coastline`. Left out for the Marine Regions areas:
   OSM's `place=sea` areas, and its bays and straits that a Marine Regions area
   of the same name overlaps.

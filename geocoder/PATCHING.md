@@ -119,9 +119,10 @@ The query server and the node binding load `<dataset>/water/` with the
 dataset, a dir of all its files but `attribution.json` or of none (some
 without the rest fail the load), and answer the water holding a point in a
 `water` field beside the address, which it never changes (README.md,
-NOMINATIM_REFERENCE.md). Nothing else reads the dir: place search's index
-derives nothing from it, so a water dir added, switched or patched leaves a
-shipped search index current.
+NOMINATIM_REFERENCE.md). Place search's build loads the dataset, its water dir
+with it (one some of whose files are missing fails that load too), but does
+not derive its index from the water files, so adding, switching or patching
+just that layer does not invalidate a shipped search index.
 
 ## Transport units
 
