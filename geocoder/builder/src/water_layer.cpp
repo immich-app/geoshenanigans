@@ -3,10 +3,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <numeric>
 #include <set>
 #include <sstream>
@@ -14,6 +16,7 @@
 
 #include "cell_index.h"
 #include "cell_index_io.h"
+#include "exact_pip.h"
 #include "parallel.h"
 #include "ranked_bits.h"
 #include "ring_assembly.h"
@@ -323,33 +326,11 @@ Build assemble(Collected& c, unsigned threads) {
     return b;
 }
 
-size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
-    size_t named = 0;
-    std::vector<uint8_t> keep(b.objects.size(), 0);
-    for (size_t o = 0; o < b.objects.size(); o++) {
-        Object& obj = b.objects[o];
-        if (o < choices.size() && choices[o].named()) {
-            obj.name_key = choices[o].key;
-            // The key's wikidata item: a line of it inside carries it.
-            if (obj.tags.name.empty()) {
-                obj.tags.name = b.lines.displays[choices[o].display];
-                obj.tags.local_name = b.lines.key_local[choices[o].key];
-                named++;
-            }
-        }
-        keep[o] = !obj.tags.name.empty();
-    }
-    // The key's wikidata items, from its lines (the lowest one).
-    {
-        std::vector<uint32_t> key_qid(b.lines.keys.size(), 0);
-        for (const NamingLine& l : b.lines.lines)
-            if (l.qid && (!key_qid[l.key] || l.qid < key_qid[l.key])) key_qid[l.key] = l.qid;
-        for (Object& obj : b.objects)
-            if (obj.name_key != UINT32_MAX) obj.key_qid = key_qid[obj.name_key];
-    }
+namespace {
 
-    // Compacts the polygons of the kept objects in place: their rings, way
-    // runs and vertices move down, in order.
+// Keeps the objects `keep` marks and their polygons, in place and in order:
+// their rings, way runs and vertices move down.
+void keep_objects(Build& b, const std::vector<uint8_t>& keep) {
     AdminExactRings& r = b.rings;
     std::vector<uint32_t> new_object(b.objects.size(), UINT32_MAX);
     size_t objects = 0;
@@ -406,9 +387,149 @@ size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
     r.vertices.shrink_to_fit();
     r.runs.shrink_to_fit();
     r.first_run.shrink_to_fit();
+}
 
+// A name as namesakes compare: ASCII letters in lower case, each run of
+// ASCII characters that are neither letters nor digits one space (none at
+// either end), every other byte as it is.
+std::string namesake_key(const std::string& name) {
+    std::string out;
+    bool gap = false;
+    for (const char ch : name) {
+        const unsigned char c = static_cast<unsigned char>(ch);
+        if (c < 0x80 && !std::isalnum(c)) {
+            gap = true;
+            continue;
+        }
+        if (gap && !out.empty()) out += ' ';
+        gap = false;
+        out += c < 0x80 ? static_cast<char>(std::tolower(c)) : ch;
+    }
+    return out;
+}
+
+// Whether polygon p holds a point, even-odd over its rings, each big ring's
+// edges indexed (ExactRingEdgeIndex).
+class PolygonHold {
+public:
+    PolygonHold(const AdminExactRings& rings, uint32_t p) : v_(rings.vertices.data()), spans_(rings.rings_of(p)) {
+        const uint32_t n = rings.polygons[p].ring_count;
+        boxes_.resize(n);
+        index_.resize(n);
+        for (uint32_t q = 0; q < n; q++) {
+            boxes_[q] = exact_ring_box(v_ + spans_[q].begin, spans_[q].count);
+            if (spans_[q].count > 256) index_[q] = std::make_unique<ExactRingEdgeIndex>(v_ + spans_[q].begin, spans_[q].count);
+        }
+    }
+
+    bool holds(PackedLocation pt) const {
+        bool inside = false;
+        for (size_t q = 0; q < boxes_.size(); q++) {
+            if (exact_ring_box_excludes(boxes_[q], pt)) continue;
+            inside ^= index_[q] ? index_[q]->contains(pt) : exact_ring_contains(v_ + spans_[q].begin, spans_[q].count, pt);
+        }
+        return inside;
+    }
+
+private:
+    const PackedLocation* v_;
+    const RingSpan* spans_;
+    std::vector<ExactRingBox> boxes_;
+    std::vector<std::unique_ptr<ExactRingEdgeIndex>> index_;
+};
+
+bool boxes_meet(const ExactRingBox& a, const ExactRingBox& b) {
+    return a.lat_lo <= b.lat_hi && b.lat_lo <= a.lat_hi && a.lng_lo <= b.lng_hi && b.lng_lo <= a.lng_hi;
+}
+
+// Whether polygons a and b overlap: a vertex of either's outer ring lies in
+// the other.
+bool polygons_overlap(const AdminExactRings& rings, uint32_t a, uint32_t b) {
+    const RingSpan &outer_a = rings.rings_of(a)[0], &outer_b = rings.rings_of(b)[0];
+    if (!boxes_meet(exact_ring_box(rings.vertices.data() + outer_a.begin, outer_a.count),
+                    exact_ring_box(rings.vertices.data() + outer_b.begin, outer_b.count)))
+        return false;
+    const PolygonHold in_a(rings, a), in_b(rings, b);
+    auto any_in = [&](uint32_t p, const PolygonHold& other) {
+        const RingSpan outer = rings.rings_of(p)[0];
+        for (uint32_t k = 0; k < outer.count; k++)
+            if (other.holds(rings.vertices[outer.begin + k])) return true;
+        return false;
+    };
+    return any_in(a, in_b) || any_in(b, in_a);
+}
+
+}  // namespace
+
+size_t drop_marine_namesakes(Build& b) {
+    // The marine areas by their names' keys, and each object's polygons.
+    std::map<std::string, std::vector<uint32_t>> marine;
+    for (uint32_t o = 0; o < b.objects.size(); o++)
+        if (b.objects[o].type == ObjectType::SYNTHETIC) marine[namesake_key(b.objects[o].tags.name)].push_back(o);
+    if (marine.empty()) return 0;
+    std::vector<uint32_t> first(b.objects.size() + 1, 0);
+    for (uint32_t o : b.object_of) first[o + 1]++;
+    std::partial_sum(first.begin(), first.end(), first.begin());
+    auto overlap = [&](uint32_t x, uint32_t y) {
+        for (uint32_t p = first[x]; p < first[x + 1]; p++)
+            for (uint32_t q = first[y]; q < first[y + 1]; q++)
+                if (polygons_overlap(b.rings, p, q)) return true;
+        return false;
+    };
+    std::vector<uint8_t> keep(b.objects.size(), 1);
+    std::ostringstream log;
+    size_t dropped = 0;
+    for (uint32_t o = 0; o < b.objects.size(); o++) {
+        const Object& obj = b.objects[o];
+        if (obj.type == ObjectType::SYNTHETIC || (obj.tags.code != code::kNaturalBay && obj.tags.code != code::kNaturalStrait))
+            continue;
+        std::set<uint32_t> namesakes;
+        for (const std::string* name : {&obj.tags.name, &obj.tags.local_name}) {
+            auto it = marine.find(namesake_key(*name));
+            if (it != marine.end()) namesakes.insert(it->second.begin(), it->second.end());
+        }
+        for (uint32_t m : namesakes)
+            if (overlap(o, m)) {
+                keep[o] = 0;
+                dropped++;
+                log << "  Water: " << object_ref(obj) << " (" << obj.tags.name << ") left out as the namesake of marine area "
+                    << object_ref(b.objects[m]) << "\n";
+                break;
+            }
+    }
+    if (dropped) keep_objects(b, keep);
+    std::cerr << log.str();
+    return dropped;
+}
+
+size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
+    size_t named = 0;
+    std::vector<uint8_t> keep(b.objects.size(), 0);
+    for (size_t o = 0; o < b.objects.size(); o++) {
+        Object& obj = b.objects[o];
+        if (o < choices.size() && choices[o].named()) {
+            obj.name_key = choices[o].key;
+            // The key's wikidata item: a line of it inside carries it.
+            if (obj.tags.name.empty()) {
+                obj.tags.name = b.lines.displays[choices[o].display];
+                obj.tags.local_name = b.lines.key_local[choices[o].key];
+                named++;
+            }
+        }
+        keep[o] = !obj.tags.name.empty();
+    }
+    // The key's wikidata items, from its lines (the lowest one).
+    {
+        std::vector<uint32_t> key_qid(b.lines.keys.size(), 0);
+        for (const NamingLine& l : b.lines.lines)
+            if (l.qid && (!key_qid[l.key] || l.qid < key_qid[l.key])) key_qid[l.key] = l.qid;
+        for (Object& obj : b.objects)
+            if (obj.name_key != UINT32_MAX) obj.key_qid = key_qid[obj.name_key];
+    }
+    keep_objects(b, keep);
+    AdminExactRings& r = b.rings;
     for (Object& obj : b.objects) obj.area_deg2 = obj.km2 = 0;
-    for (size_t p = 0; p < polygons; p++) {
+    for (size_t p = 0; p < r.polygons.size(); p++) {
         Object& obj = b.objects[b.object_of[p]];
         obj.area_deg2 += r.area(static_cast<uint32_t>(p));
         obj.km2 += polygon_km2(r, static_cast<uint32_t>(p));
@@ -973,6 +1094,8 @@ Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::f
               << b.lines.vertices.size() << " vertices, " << b.lines.keys.size() << " keys, " << waterways
               << " waterway relations)" << std::endl;
     log_phase("      Water: assembly", t, cpu);
+    const size_t namesakes = drop_marine_namesakes(b);
+    std::cerr << "  Water: " << namesakes << " OSM bays and straits left out as marine areas' namesakes" << std::endl;
 
     // The naming join over the river and canal areas.
     std::vector<uint32_t> river_polygons;

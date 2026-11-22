@@ -528,6 +528,19 @@ ObjectTags tags_from(const std::map<std::string, std::string>& kv) {
     });
 }
 
+// The ways of `ids` whose polygons the layer holds, and those of them in its
+// major tier.
+std::pair<std::set<int64_t>, std::set<int64_t>> ways_held(const Layer& layer, const std::vector<int64_t>& ids) {
+    std::set<int64_t> held, major;
+    for (size_t p = 0; p < layer.size(); p++)
+        for (int64_t id : ids)
+            if (layer.identities[p] == way_identity(id)) {
+                held.insert(id);
+                if (layer.major[p]) major.insert(id);
+            }
+    return {held, major};
+}
+
 }  // namespace
 
 TEST(an_osm_sea_is_no_water_area_as_the_marine_areas_hold_the_seas) {
@@ -537,6 +550,41 @@ TEST(an_osm_sea_is_no_water_area_as_the_marine_areas_hold_the_seas) {
     CHECK_EQ(tags_from({{"natural", "water"}, {"water", "lake"}, {"place", "sea"}, {"name", "Caspian Sea"}}).code,
              code::kLake);
     CHECK_EQ(tags_from({{"natural", "bay"}, {"place", "sea"}, {"name", "Bay of Biscay"}}).code, code::kNaturalBay);
+}
+
+TEST(an_osm_bay_or_strait_of_a_marine_areas_name_that_it_overlaps_is_left_out) {
+    Collected c = with_marine();
+    // The North Sea is the square at lat .. lat + 0.2, kLng + 0.2 .. 0.4.
+    const int32_t lat = kLat - 20000000, lng = kLng + 2000000;
+    auto add_way = [&](int64_t way, uint16_t code, const std::string& name, const std::string& local, const Ring& ring) {
+        ObjectTags t = tags(code, name);
+        t.local_name = local;
+        c.closed_ways.push_back({way, t, ring});
+    };
+    // Its namesakes in it: by name:en, and by a local name of other case and
+    // spacing.
+    add_way(2001, code::kNaturalBay, "North Sea", "Nordsee", square(lat + 500000, lng + 500000, 300000));
+    add_way(2002, code::kNaturalStrait, "Strait of Dover", "NORTH  SEA", square(lat + 1000000, lng + 500000, 300000));
+    // Kept: a namesake far from it, a lake of its name in it, and a bay of
+    // another name in it.
+    add_way(2003, code::kNaturalBay, "North Sea", "North Sea", square(kLat + 800000, kLng, 1000));
+    add_way(2004, code::kLake, "North Sea", "North Sea", square(lat + 1500000, lng + 500000, 100000));
+    add_way(2005, code::kNaturalBay, "German Bight", "Deutsche Bucht", square(lat + 200000, lng + 1500000, 200000));
+    // A bay relation round the whole of it: none of the bay's vertices are
+    // in the sea, the sea's are in the bay.
+    add_geometry(c, 2500, square(lat - 100000, lng - 100000, 2200000));
+    CollectedArea around;
+    around.id = 2600;
+    around.tags = tags(code::kNaturalBay, "North Sea");
+    around.members = {{2500, "outer"}};
+    c.relations.push_back(around);
+    const Layer layer = build(c);
+    CHECK(ways_held(layer, {2001, 2002, 2003, 2004, 2005}).first == std::set<int64_t>({2003, 2004, 2005}));
+    for (size_t p = 0; p < layer.size(); p++) CHECK(layer.fallbacks[p] != relation_ring_fallback(2600, 0));
+    // The marine areas stay whole.
+    size_t marine = 0;
+    for (size_t p = 0; p < layer.size(); p++) marine += layer.marine[p];
+    CHECK_EQ(marine, size_t(3));
 }
 
 // geocoder/testdata/water_dir: the client files of a water dir on two days,

@@ -514,7 +514,10 @@ land polygons (OpenStreetMap's coastline, ODbL) and along a 1-degree grid by
 and dirs as OSM's water, and win nowhere a smaller area holds the point: a
 bay, harbour or lake inside a sea answers there, the sea out in open water.
 OSM's own `place=sea` areas stay out of the layer: the marine areas hold the
-seas, and Nominatim answers no `place=sea`.
+seas, and Nominatim answers no `place=sea`. So does an OSM `natural=bay` or
+`strait` of a marine area's name (its `name` or `name:en`, ASCII case,
+spaces and punctuation aside) that overlaps that area, such as the Gulf of
+Oman (`drop_marine_namesakes`); every other OSM bay and strait stays.
 
 - **They don't change from day to day.** The nightly never runs the tool: it
   downloads the version `data/marine.json` pins (a run of Update Marine
