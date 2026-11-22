@@ -1724,6 +1724,9 @@ const IMMICH = {
   label: 'Immich today (GeoNames cities500)',
   description: 'What Immich v3.4.2 stores for a photo here: the nearest GeoNames cities500 place in a box of 25 km about the point, else the Natural Earth country, else nothing.',
   immich: { release: 'v3.4.2', commit: 'b6b4b80df113656bfa4872cab31c7319e89438a9', geodata_date: '2026-10-29T14:18:17+00:00', max_distance_m: 25000 },
+  // countryInfo.txt's names, a few of them: Immich's, not i18n-iso-countries'
+  // ('United States', not 'United States of America').
+  country_names: { FR: 'France', US: 'United States', PR: 'Puerto Rico', DE: 'Germany', TW: 'Taiwan', GB: 'United Kingdom' },
   search: null,
 };
 
@@ -1868,4 +1871,154 @@ test('every string of the Immich column is escaped where the page shows it', () 
   for (const d of [data, ne]) {
     assertEscaped(detailHtml([{ label: hostileImmich.label, color: '#222', dataset: hostileImmich, answer: { data: d } }], ID));
   }
+});
+
+// -- The address shown whole --
+// The field table's first two rows: the full address (display_name; the
+// Immich column's stored values joined as Immich joins them) and what a
+// photo there would show in Immich (immichShown of what Immich stores, or
+// of what our integration would store from the answer: mapGeocoderAddress).
+const NAMES = IMMICH.country_names;
+
+// The rows of `datas`' answers shown whole, by field.
+function shownRows(datas, names = NAMES) {
+  const { displayRows } = core();
+  return Object.fromEntries(plain(displayRows(datas, names)).map((r) => [r.field, r]));
+}
+
+// Answers of our datasets at the Eiffel Tower and Paris, as with-addresses
+// and smallest give them.
+const EIFFEL = {
+  display_name: 'Eiffel Tower, Avenue Gustave Eiffel 5, Quartier du Gros-Caillou, 7th Arrondissement, Paris, Ile-de-France, Metropolitan France, 75007, France',
+  address: { landmark: 'Eiffel Tower', house_number: '5', road: 'Avenue Gustave Eiffel', city: 'Paris', state: 'Ile-de-France', region: 'Metropolitan France',
+    suburb: '7th Arrondissement', quarter: 'Quartier du Gros-Caillou', city_district: 'Paris', postcode: '75007', country: 'France', country_code: 'FR' },
+};
+const PARIS_SMALLEST = {
+  display_name: 'Paris, Ile-de-France, Metropolitan France, France',
+  address: { city: 'Paris', state: 'Ile-de-France', region: 'Metropolitan France', city_district: 'Paris', country: 'France', country_code: 'FR' },
+};
+
+test("the field table shows each answer whole: its full address and what Immich would show, a landmark first", () => {
+  const passy = immichData('cities500', { city: 'Paris 16 Passy', state: 'Île-de-France', country: 'France' }, { place: PARIS, in_box: 459 });
+  const rows = shownRows([EIFFEL, PARIS_SMALLEST, passy]);
+  assert.deepEqual(rows['Full address'], {
+    field: 'Full address',
+    values: [EIFFEL.display_name, PARIS_SMALLEST.display_name, 'Paris 16 Passy, Île-de-France, France'],
+    differs: true, missing: false,
+  });
+  assert.deepEqual(rows['In Immich'], {
+    field: 'In Immich',
+    values: ['Eiffel Tower, Paris, Ile-de-France, France', 'Paris, Ile-de-France, France', 'Paris 16 Passy, Île-de-France, France'],
+    differs: true, missing: false, fallback: [false, false, false],
+  });
+  // Two answers Immich would show alike are no difference there, though
+  // their full addresses differ.
+  const alike = shownRows([PARIS_SMALLEST, { display_name: 'Paris, France', address: { city: 'Paris', state: 'Ile-de-France', country_code: 'fr' } }]);
+  assert.equal(alike['Full address'].differs, true);
+  assert.deepEqual([alike['In Immich'].values[1], alike['In Immich'].differs], ['Paris, Ile-de-France, France', false]);
+
+  const { detailHtml, resolveColumn } = core();
+  const c = withImmich();
+  const geocoder = resolveColumn(c, 'with-addresses').dataset;
+  const smallest = resolveColumn(c, 'smallest').dataset;
+  const out = detailHtml([
+    { label: geocoder.label, color: '#111', dataset: geocoder, answer: { data: EIFFEL, build: ID } },
+    { label: smallest.label, color: '#222', dataset: smallest, answer: { data: PARIS_SMALLEST, build: ID } },
+    { label: IMMICH.label, color: '#333', dataset: IMMICH, answer: { data: passy, dataset: IMMICH.id } },
+  ], ID, NAMES);
+  // The heading line stays the display name.
+  assert.ok(out.includes(`<div class="answer-name">${EIFFEL.display_name}</div>`), out);
+  // The two rows come first, before the address's fields, marked where
+  // the columns differ.
+  const names = [...out.matchAll(/<tr[^>]*>\s*<td class="field"[^>]*>([^<]+)<\/td>/g)].map((m) => m[1]);
+  assert.deepEqual(names.slice(0, 3), ['Full address', 'In Immich', 'landmark']);
+  assert.match(out, /<tr class="differs shown"><td class="field" title="[^"]*display_name[^"]*">Full address<\/td>/);
+  assert.ok(out.includes('<td class="value">Eiffel Tower, Paris, Ile-de-France, France</td><td class="value">Paris, Ile-de-France, France</td>'
+    + '<td class="value">Paris 16 Passy, Île-de-France, France</td>'), out);
+  assert.ok(!out.includes('GeoNames fallback'), out);
+});
+
+test("what Immich would show is what our integration's mapping stores, as the branch writes it", () => {
+  const shown = (address, names = NAMES) => shownRows([{ display_name: 'x', address }], names)['In Immich'].values[0];
+  // A village is the city; its county the state where it has no state.
+  assert.equal(shown({ village: 'Giverny', county: 'Eure', country: 'France', country_code: 'fr' }), 'Giverny, Eure, France');
+  assert.equal(shown({ hamlet: 'Le Hameau', municipality: 'Commune', state: 'Normandie', country_code: 'FR' }), 'Le Hameau, Normandie, France');
+  // The city stands in for the state of a city-state.
+  assert.equal(shown({ city: 'Taipei', country: 'Taiwan', country_code: 'tw' }), 'Taipei, Taipei, Taiwan');
+  // The country is Immich's name of the code, not the answer's: not
+  // i18n-iso-countries' 'United States of America' of the branch, which
+  // differs from Immich's only by its library.
+  assert.equal(shown({ city: 'Austin', state: 'Texas', country: 'United States of America', country_code: 'us' }), 'Austin, Texas, United States');
+  assert.equal(shown({ city: 'Berlin', state: 'Berlin', country: 'Deutschland', country_code: 'de' }), 'Berlin, Berlin, Germany');
+  // A dependent territory mapped as a state of its sovereign is its own
+  // country, folded as the branch folds names.
+  assert.equal(shown({ city: 'San Juan', state: 'Puerto Rico', country: 'United States', country_code: 'us' }), 'San Juan, Puerto Rico, Puerto Rico');
+  assert.equal(shown({ city: 'Gustavia', state: 'Saint-Barthélemy', country: 'France', country_code: 'fr' }, { ...NAMES, BL: 'Saint Barthelemy' }),
+    'Gustavia, Saint-Barthélemy, Saint Barthelemy');
+  // A code Immich names no country by: the answer's country.
+  assert.equal(shown({ town: 'Ushuaia', state: 'Tierra del Fuego', country: 'Argentina', country_code: 'ar' }), 'Ushuaia, Tierra del Fuego, Argentina');
+  assert.equal(shown({ city: 'Paris', country: 'France', country_code: 'FR' }, {}), 'Paris, Paris, France');
+  // No country at all: none stored (the integration falls back).
+  assert.equal(shown({ city: 'X', country_code: 'zz' }, {}), '');
+});
+
+test("Immich shows nothing of a place without a country, and the full address joins what it stores", () => {
+  // A cities500 place whose code countryInfo.txt doesn't name: Immich
+  // stores its city and state, and its detail panel shows nothing.
+  const nameless = immichData('cities500', { city: 'Pristina', state: 'Pristina', country: null }, { place: PARIS, in_box: 3 });
+  const rows = shownRows([nameless]);
+  assert.deepEqual([rows['Full address'].values, rows['In Immich'].values], [['Pristina, Pristina'], ['']]);
+  // A Natural Earth country alone.
+  const ne = immichData('natural_earth', { city: null, state: null, country: 'France' });
+  assert.deepEqual(plain(shownRows([ne])['In Immich'].values), ['France']);
+});
+
+test('an empty answer at sea shows no address, and falls back to what Immich stores as the integration does', () => {
+  const { detailHtml, resolveColumn } = core();
+  const c = withImmich();
+  const geocoder = resolveColumn(c, 'with-addresses').dataset;
+  const sea = immichData('nothing', { city: null, state: null, country: null });
+  const views = [
+    { label: geocoder.label, color: '#111', dataset: geocoder, answer: { data: { address: {} }, build: ID } },
+    { label: IMMICH.label, color: '#222', dataset: IMMICH, answer: { data: sea, dataset: IMMICH.id } },
+  ];
+  const rows = shownRows(views.map((v) => v.answer.data));
+  assert.deepEqual(rows['Full address'], { field: 'Full address', values: ['', ''], differs: false, missing: false });
+  assert.deepEqual(rows['In Immich'], { field: 'In Immich', values: ['', ''], differs: false, missing: false, fallback: [true, false] });
+  const out = detailHtml(views, ID, NAMES);
+  // The two rows show though no field does, each answer's '—'.
+  assert.match(out, /<tr class="shown"><td class="field"[^>]*>Full address<\/td><td class="empty">—<\/td><td class="empty">—<\/td><\/tr>/);
+  assert.match(out, /<tr class="shown"><td class="field"[^>]*>In Immich<\/td><td class="empty">— <span class="tag" title="No country in this answer: [^"]*the Immich column's">GeoNames fallback<\/span><\/td><td class="empty">—<\/td><\/tr>/);
+
+  // Off a coast our datasets name nothing at, Immich's lookup may find a
+  // place: the integration stores that, as the Immich column shows it.
+  const shore = immichData('cities500', { city: 'Saint-Malo', state: 'Brittany', country: 'France' }, { place: PARIS, in_box: 2 });
+  const near = shownRows([{ address: {} }, shore]);
+  assert.deepEqual([near['In Immich'].values, near['In Immich'].differs], [['Saint-Malo, Brittany, France', 'Saint-Malo, Brittany, France'], false]);
+  assert.deepEqual(near['Full address'].values, ['', 'Saint-Malo, Brittany, France']);
+  assert.equal(near['Full address'].missing, true);
+  // Without the Immich column it is unknown here, and says so.
+  const alone = detailHtml([views[0]], ID, NAMES);
+  assert.match(alone, /<td class="empty">— <span class="tag" title="[^"]*as the Immich column shows it">GeoNames fallback<\/span><\/td>/);
+  // A column without an answer shows none.
+  const unanswered = detailHtml([views[0], { ...views[1], answer: { loading: true } }], ID, NAMES);
+  assert.match(unanswered, /<td class="field"[^>]*>Full address<\/td><td class="empty">—<\/td><td class="empty"><\/td>/);
+  assert.ok(!detailHtml([{ ...views[0], answer: { loading: true } }], ID, NAMES).includes('Full address'));
+});
+
+test("the page names our answers' countries by the Immich column's names, none without it", () => {
+  const { immichCountryNames } = core();
+  assert.deepEqual(plain(immichCountryNames(withImmich())), NAMES);
+  assert.deepEqual(plain(immichCountryNames(catalog())), {});
+  assert.deepEqual(plain(immichCountryNames(null)), {});
+});
+
+test('the address shown whole is escaped', () => {
+  const { detailHtml, resolveColumn } = core();
+  const c = withImmich();
+  const geocoder = resolveColumn(c, 'with-addresses').dataset;
+  const data = { display_name: '<img src=x onerror=alert(1)>', address: { landmark: '<b>L</b>', city: '<i>c</i>', country_code: 'xx' } };
+  const out = detailHtml([{ label: 'x', color: '#111', dataset: geocoder, answer: { data } }], ID, { XX: '<em>X</em>' });
+  assertEscaped(out);
+  assert.ok(out.includes('&lt;b&gt;L&lt;/b&gt;, &lt;i&gt;c&lt;/i&gt;, &lt;i&gt;c&lt;/i&gt;, &lt;em&gt;X&lt;/em&gt;'), out);
 });

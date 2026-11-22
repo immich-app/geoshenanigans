@@ -406,6 +406,8 @@
   .fields tr.differs, .fields tr.missing { background: rgba(217, 74, 74, 0.06); }
   .fields tr.differs td.value { color: var(--red); }
   .fields td.empty { color: var(--orange); }
+  .fields tr.shown td.field { color: var(--text); }
+  .fields tr.shown + tr:not(.shown) { border-top: 2px solid var(--border); }
   .detail-places tr.unshared td { color: var(--orange); }
 
   /* The search: its box, each column's head and the matrix of their
@@ -819,13 +821,214 @@ function fieldRows(addresses) {
   const rank = (f) => (PREFERRED_ORDER.includes(f) ? PREFERRED_ORDER.indexOf(f) : PREFERRED_ORDER.length);
   fields.sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
   return fields
-    .map((field) => {
-      const values = addresses.map((a) => (a && a[field] != null && a[field] !== '' ? String(a[field]) : ''));
-      const present = values.filter((v) => v);
-      const lacking = values.filter((v, i) => !v && addresses[i]);
-      return { field, values, differs: present.some((v) => v !== present[0]), missing: present.length > 0 && lacking.length > 0 };
-    })
+    .map((field) => compared(field, addresses.map((a) => (a && a[field] != null && a[field] !== '' ? String(a[field]) : '')), addresses))
     .filter((row) => row.values.some((v) => v));
+}
+
+// A row of the field table: `field`, its `values` ('' for none) by column,
+// whether two values disagree, and whether a column that answered (of
+// `answers`, null where it didn't) lacks one.
+function compared(field, values, answers) {
+  const present = values.filter((v) => v);
+  const lacking = values.filter((v, i) => !v && answers[i]);
+  return { field, values, differs: present.some((v) => v !== present[0]), missing: present.length > 0 && lacking.length > 0 };
+}
+
+// -- How Immich shows a place --
+// The location Immich's asset viewer shows of a photo, from what it stores
+// (city, state, country; landmark, of our integration):
+// web/src/lib/components/asset-viewer/DetailPanelLocation.svelte of
+// v3.4.2 shows nothing without a country (:33) and else the city, the state
+// and the country, each it has, in that order (:45-57), each on a line of
+// its own; that of our integration (immich-app/immich branch
+// feat/geoshenanigans-geocoder, :51-78) the landmark before them. One line
+// here, joined as Immich joins the same fields on one line, those it has by
+// ', ' (asset-viewer/SlideshowMetadataOverlay.svelte:27-29,
+// utils/duplicate-utils.ts:127).
+function immichShown({ landmark = null, city = null, state = null, country = null }) {
+  return country ? [landmark, city, state, country].filter(Boolean).join(', ') : '';
+}
+
+// Immich's city, state and country as it joins them on one line (as
+// immichShown, but whatever the country).
+function immichJoined({ city = null, state = null, country = null }) {
+  return [city, state, country].filter(Boolean).join(', ');
+}
+
+// What our Immich integration stores from an answer of ours, ported as
+// written from server/src/repositories/geocoding.repository.ts of branch
+// feat/geoshenanigans-geocoder (e0b6fe2ed): foldName (:64-69), the
+// dependent territories (DEPENDENT_TERRITORIES, server/src/constants.ts:
+// 67-147, and :71-75), getCountryCode (:82-96) and mapGeocoderAddress
+// (:105-128). Where the branch names the country with i18n-iso-countries'
+// getName(code, 'en') (:107), the names here are those Immich v3.4.2 stores
+// by the code (countryInfo.txt's, map.repository.ts:177), which /datasets
+// lists with the Immich column (`countryNames`, by ISO alpha-2 code); the
+// answer's own country where they have none, as the branch falls back.
+// None where there is no country: the integration then stores what
+// Immich's own lookup does (server/src/services/metadata.service.ts:
+// 264-266, the Immich column's).
+const DEPENDENT_TERRITORIES = {
+  AI: { sovereign: 'GB', names: ['Anguilla'] },
+  AS: { sovereign: 'US', names: ['American Samoa'] },
+  AW: { sovereign: 'NL', names: ['Aruba'] },
+  AX: { sovereign: 'FI', names: ['Åland', 'Åland Islands'] },
+  BL: { sovereign: 'FR', names: ['Saint Barthélemy', 'Saint-Barthélemy'] },
+  BM: { sovereign: 'GB', names: ['Bermuda', 'The Bermudas or Somers Isles'] },
+  CK: { sovereign: 'NZ', names: ['Cook Is.', 'Cook Islands'] },
+  CW: { sovereign: 'NL', names: ['Curaçao'] },
+  FK: { sovereign: 'GB', names: ['Falkland Is.', 'Falkland Islands', 'Falkland Islands / Malvinas', 'Islas Malvinas'] },
+  FO: { sovereign: 'DK', names: ['Faeroe Is.', 'Faeroe Islands', 'Faroe Islands', 'Føroyar Is. (Faeroe Is.)'] },
+  GG: { sovereign: 'GB', names: ['Bailiwick of Guernsey', 'Guernsey'] },
+  GI: { sovereign: 'GB', names: ['Gibraltar'] },
+  GL: { sovereign: 'DK', names: ['Greenland'] },
+  GS: {
+    sovereign: 'GB',
+    names: ['S. Geo. and the Is.', 'South Georgia and the Islands', 'South Georgia and the South Sandwich Islands'],
+  },
+  GU: { sovereign: 'US', names: ['Guam', 'Territory of Guam'] },
+  HK: {
+    sovereign: 'CN',
+    names: ['Hong Kong', 'Hong Kong S.A.R.', 'Hong Kong SAR, China', 'Hong Kong Special Administrative Region, PRC'],
+  },
+  HM: {
+    sovereign: 'AU',
+    names: [
+      'Heard I. and McDonald Is.',
+      'Heard I. and McDonald Islands',
+      'Heard Island and McDonald Islands',
+      'Territory of Heard Island and McDonald Islands',
+    ],
+  },
+  IM: { sovereign: 'GB', names: ['Isle of Man'] },
+  IO: { sovereign: 'GB', names: ['Br. Indian Ocean Ter.', 'British Indian Ocean Territory'] },
+  JE: { sovereign: 'GB', names: ['Bailiwick of Jersey', 'Jersey'] },
+  KY: { sovereign: 'GB', names: ['Cayman Is.', 'Cayman Islands'] },
+  MF: {
+    sovereign: 'FR',
+    names: ['Saint Martin', 'Saint-Martin', 'Saint-Martin (French part)', 'St. Martin (French part)'],
+  },
+  MO: {
+    sovereign: 'CN',
+    names: ['Macao', 'Macao S.A.R', 'Macao SAR, China', 'Macao Special Administrative Region, PRC', 'Macau'],
+  },
+  MP: {
+    sovereign: 'US',
+    names: ['Commonwealth of the Northern Mariana Islands', 'N. Mariana Is.', 'Northern Mariana Islands'],
+  },
+  MS: { sovereign: 'GB', names: ['Montserrat'] },
+  NC: { sovereign: 'FR', names: ['New Caledonia'] },
+  NF: { sovereign: 'AU', names: ['Norfolk Island', 'Territory of Norfolk Island'] },
+  NU: { sovereign: 'NZ', names: ['Niue'] },
+  PF: { sovereign: 'FR', names: ['Fr. Polynesia', 'French Polynesia'] },
+  PM: { sovereign: 'FR', names: ['Saint Pierre and Miquelon'] },
+  PN: { sovereign: 'GB', names: ['Pitcairn Is.', 'Pitcairn Islands', 'Pitcairn, Henderson, Ducie and Oeno Islands'] },
+  PR: { sovereign: 'US', names: ['Commonwealth of Puerto Rico', 'Puerto Rico'] },
+  SH: { sovereign: 'GB', names: ['Saint Helena'] },
+  SX: { sovereign: 'NL', names: ['Sint Maarten', 'Sint Maarten (Dutch part)', 'St. Maarten (Dutch part)'] },
+  TC: { sovereign: 'GB', names: ['Turks and Caicos Is.', 'Turks and Caicos Islands'] },
+  TF: {
+    sovereign: 'FR',
+    names: [
+      'Fr. S. Antarctic Lands',
+      'Fr. S. and Antarctic Lands',
+      'French Southern and Antarctic Lands',
+      'Territory of the French Southern and Antarctic Lands',
+    ],
+  },
+  UM: { sovereign: 'US', names: ['U.S. Minor Outlying Is.', 'United States Minor Outlying Islands'] },
+  VG: { sovereign: 'GB', names: ['British Virgin Is.', 'British Virgin Islands'] },
+  VI: {
+    sovereign: 'US',
+    names: [
+      'U.S. Virgin Is.',
+      'United States Virgin Islands',
+      'Virgin Islands (U.S.)',
+      'Virgin Islands of the United States',
+    ],
+  },
+  WF: { sovereign: 'FR', names: ['Wallis and Futuna', 'Wallis and Futuna Is.', 'Wallis and Futuna Islands'] },
+};
+
+// accents, case and the Saint/St. spelling are ignored, so OpenStreetMap's
+// 'Curacao' matches Natural Earth's 'Curaçao'
+function foldName(name) {
+  return name
+    .normalize('NFD')
+    .replaceAll(/\p{M}/gu, '')
+    .toLowerCase()
+    .replaceAll(/(^|[^\p{L}\p{N}])(?:saint|st\.?)(?=$|[^\p{L}\p{N}])/gu, '$1st');
+}
+
+const DEPENDENT_TERRITORY_CODES = new Map(
+  Object.entries(DEPENDENT_TERRITORIES).flatMap(([code, { sovereign, names }]) =>
+    names.map((name) => [`${sovereign}:${foldName(name)}`, code]),
+  ),
+);
+
+// A dependent territory that OpenStreetMap maps as a state or region of
+// its sovereign (Puerto Rico under the United States) reports its own
+// country code, as it does on the GeoNames path.
+function immichCountryCode({ country_code, state, region, province }) {
+  const countryCode = country_code?.toUpperCase();
+  if (!countryCode) {
+    return;
+  }
+  for (const name of [state, region, province]) {
+    const territoryCode = name && DEPENDENT_TERRITORY_CODES.get(`${countryCode}:${foldName(name)}`);
+    if (territoryCode) {
+      return territoryCode;
+    }
+  }
+  return countryCode;
+}
+
+function mapGeocoderAddress(address, countryNames = {}) {
+  const countryCode = immichCountryCode(address);
+  const named = countryCode && Object.hasOwn(countryNames, countryCode) ? countryNames[countryCode] : null;
+  const country = named || address.country || null;
+  if (!country) {
+    return null;
+  }
+  return {
+    country,
+    state: address.state ?? address.province ?? address.region ?? address.county ?? address.municipality ?? address.city ?? null,
+    city: address.city ?? address.town ?? address.village ?? address.hamlet ?? address.municipality ?? null,
+    landmark: address.landmark ?? null,
+  };
+}
+
+// The country names Immich stores by ISO alpha-2 code, as /datasets lists
+// them with the Immich column: none where the portal has no Immich geodata.
+function immichCountryNames(catalog) {
+  const immich = ((catalog && catalog.others) || []).find((o) => o.kind === 'immich');
+  return (immich && immich.country_names) || {};
+}
+
+// The field table's first rows, of each answer shown whole (`datas`, null
+// for a column without an answer): "Full address", the answer's
+// display_name (Nominatim's concatenation of its address), the Immich
+// column's what it stores joined as Immich joins it (immichJoined); and "In
+// Immich", the location a photo here would show in Immich (immichShown):
+// the Immich column's from what it stores, another's from what our
+// integration would store from the answer (mapGeocoderAddress), or, where
+// that is none, what Immich's own lookup stores, which the integration
+// falls back to: the Immich column's where it answered. Rows as fieldRows
+// gives them, "In Immich" with `fallback`, by column, true where it fell
+// back.
+function displayRows(datas, countryNames = {}) {
+  const immich = datas.find((d) => d && d.immich);
+  const fallback = datas.map(() => false);
+  const full = datas.map((d) => (!d ? '' : d.immich ? immichJoined(d.immich.stored || {}) : String(d.display_name || '')));
+  const shown = datas.map((d, i) => {
+    if (!d) return '';
+    if (d.immich) return immichShown(d.immich.stored || {});
+    const stored = mapGeocoderAddress(d.address || {}, countryNames);
+    if (stored) return immichShown(stored);
+    fallback[i] = true;
+    return immich ? immichShown(immich.immich.stored || {}) : '';
+  });
+  return [compared('Full address', full, datas), { ...compared('In Immich', shown, datas), fallback }];
 }
 
 function placeKey(p) {
@@ -1438,6 +1641,14 @@ function controlKey(data) {
   return [data.col, data.role, data.axis, data.action].map((v) => v ?? '').join('\u0000');
 }
 
+// What the field table's rows of the address shown whole (displayRows)
+// are, as their names' titles say it.
+const SHOWN_TITLES = {
+  'Full address': "The answer's display_name: Nominatim's concatenation of its address. The Immich column's: what it stores, joined as Immich joins it",
+  'In Immich': "What Immich's asset viewer would show of a photo here: the landmark, city, state and country our Immich integration stores"
+    + " from the answer (the Immich column's: what Immich stores today), only with a country",
+};
+
 // The least width of a column's places table in the detail, in px: its
 // three columns' padding and a few letters of each.
 const PLACES_WIDTH = 160;
@@ -1447,11 +1658,13 @@ const PLACES_WIDTH = 160;
 // and time, flagged where a build other than the one `served` answered
 // (sameBuild: one published before it under its date among them), and the
 // sizes of its dataset in the build served, where that answered; the
-// address fields side by side, those the answers disagree on or lack
-// marked; the places, those not in every answer marked; the JSON, each
-// panel named by the place of its view (data-view). An answer of a dataset
-// has a "Disagree?" button, named by the place of its view (data-feedback).
-function detailHtml(views, served) {
+// address shown whole (displayRows: the full address, and what Immich
+// would show, the country named by `countryNames`, immichCountryNames) and
+// its fields side by side, those the answers disagree on or lack marked;
+// the places, those not in every answer marked; the JSON, each panel named
+// by the place of its view (data-view). An answer of a dataset has a
+// "Disagree?" button, named by the place of its view (data-feedback).
+function detailHtml(views, served, countryNames = {}) {
   const grid = `display:grid;grid-template-columns:repeat(${views.length},minmax(0,1fr));gap:12px`;
   let html = `<div style="${grid};margin-bottom:12px">`;
   for (const [i, v] of views.entries()) {
@@ -1480,15 +1693,22 @@ function detailHtml(views, served) {
   html += '</div>';
 
   const datas = views.map((v) => (v.answer && v.answer.data) || null);
+  const shown = datas.some((d) => d) ? displayRows(datas, countryNames) : [];
   const rows = fieldRows(datas.map((d) => (d ? d.address || {} : null)));
-  if (rows.length) {
+  if (shown.length || rows.length) {
     html += '<table class="fields"><tr><th style="color:var(--text-dim);width:140px">Field</th>';
     for (const v of views) html += `<th style="color:${v.color}">${esc(v.label)}</th>`;
     html += '</tr>';
-    for (const row of rows) {
-      html += `<tr class="${row.differs ? 'differs' : row.missing ? 'missing' : ''}"><td class="field">${esc(row.field)}</td>`;
+    const fellBack = ` <span class="tag" title="No country in this answer: our Immich integration stores what Immich's own lookup does, ${
+      datas.some((d) => d && d.immich) ? "the Immich column's" : 'as the Immich column shows it'}">GeoNames fallback</span>`;
+    for (const row of [...shown, ...rows]) {
+      const mark = row.differs ? 'differs' : row.missing ? 'missing' : '';
+      const display = shown.includes(row);
+      html += `<tr class="${[mark, display ? 'shown' : ''].filter(Boolean).join(' ')}">`
+        + `<td class="field"${display ? ` title="${esc(SHOWN_TITLES[row.field])}"` : ''}>${esc(row.field)}</td>`;
       row.values.forEach((value, i) => {
-        html += value ? `<td class="value">${esc(value)}</td>` : `<td class="empty">${datas[i] ? '—' : ''}</td>`;
+        const note = row.fallback && row.fallback[i] ? fellBack : '';
+        html += value ? `<td class="value">${esc(value)}${note}</td>` : `<td class="empty">${datas[i] ? '—' : ''}${note}</td>`;
       });
       html += '</tr>';
     }
@@ -2865,7 +3085,7 @@ function showDetail(id) {
   // An answer coming in keeps the JSON blocks of the result open, each by
   // the place of its view.
   const open = detailShown === id ? [...content.querySelectorAll('details')].filter((d) => d.open).map((d) => d.dataset.view) : [];
-  content.innerHTML = detailHtml(views, servedBuild());
+  content.innerHTML = detailHtml(views, servedBuild(), immichCountryNames(catalog));
   content.querySelectorAll('details').forEach((d) => { if (open.includes(d.dataset.view)) d.open = true; });
   detailShown = id;
 }
