@@ -5,6 +5,7 @@ Run: python3 -m unittest discover -s geocoder/builder/tools"""
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -61,7 +62,7 @@ class ShardedTestsRun:
                     f.write(f"{hashlib.sha256(b.read()).hexdigest()}  bin/{tool}\n")
         self.compiles = os.path.join(root, "compiles")
         with open(os.path.join(bin_dir, "cmake"), "w") as f:
-            f.write(f"#!/bin/sh\necho cmake >> {self.compiles}\nexit 1\n")
+            f.write(f"#!/bin/sh\necho cmake >> {shlex.quote(self.compiles)}\nexit 1\n")
         os.chmod(os.path.join(bin_dir, "cmake"), 0o755)
         self.shard_log = os.path.join(root, "shards")
         budget = fake_cpus(test, cpus, "/job", quotas)
