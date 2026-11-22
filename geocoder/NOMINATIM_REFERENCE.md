@@ -161,7 +161,7 @@ address rank, else the lowest search rank (`ranking.sql`
 
 | Main tag | rank_search, rank_address | Lines |
 |---|---|---|
-| `natural=*` but peak, volcano, mountain_range and sea, and the rank-30 tree, spring, cave_entrance, geyser, hot_spring, rock, stone | 22, 0 | 66-79 |
+| `natural=*` other than peak, volcano and mountain_range (18, 0), sea (4, 0) and tree, spring, cave_entrance, geyser, hot_spring, rock and stone (30, 30) | 22, 0 | 66-79 |
 | `water=*` (with `natural=water`) | 20 to 24, 0 | 80-87 |
 | `waterway=*` | 19 to 22, 0 | 88-94 |
 | `landuse=*` on an area | 24, 0 (residential and the other admin ones 24, 24) | 50-59 |
@@ -204,8 +204,8 @@ fallback tag, and the lane takes no class `building`.
   take the primary slot only where no other POI is near. Nominatim ranks many
   of them below 30 (peak and volcano 18, beach and cape 22, island 17 or 22,
   park and nature_reserve 24, garden 25, protected areas 25) and holds the
-  others in the lane like any POI. Bays and glaciers were in that lane; they
-  now never take the slot.
+  others in the lane like any POI. Bays and glaciers are not in it: as water
+  kinds, they never take the slot.
 - River and canal areas (`natural=water` with `water=river`, `canal`, ...)
   are POIs here, though Nominatim imports none (`presets.lua:157-163` gives
   them no category). As water they never take the primary slot; they can be

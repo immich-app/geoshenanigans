@@ -55,11 +55,12 @@ The POI nearest the point can be the answer's primary feature, as Nominatim's
 rank-30 POIs are: it then gives the address its `road` (its parent street)
 and its `postcode`. Water never does, as Nominatim ranks every water kind
 below 30: lakes, ponds and other `natural=water`, wetlands, bays and
-glaciers, and reservoirs and basins mapped as areas. They still show as the
-`landmark` and in `places`. A water object that is also a POI of another main
-tag (a fountain, a swimming area, a fire pond, a pier, a shop, ...) is
-classified as that POI, as Nominatim ranks it 30 by that tag; it takes the
-primary slot like any POI. [NOMINATIM_REFERENCE.md](NOMINATIM_REFERENCE.md#the-primary-poi-nominatims-rank-30-lane)
+glaciers, and reservoirs and basins mapped as areas. They still show in
+`places`, and all but bays as the `landmark`. A water object that is also a
+POI of another main tag (a fountain, a swimming area, a fire pond, a pier, a
+shop, ...) is classified as that POI, as Nominatim ranks it 30 by that tag;
+it takes the primary slot like any POI.
+[NOMINATIM_REFERENCE.md](NOMINATIM_REFERENCE.md#the-primary-poi-nominatims-rank-30-lane)
 traces both to Nominatim's source.
 
 ## Three Tier Levels
