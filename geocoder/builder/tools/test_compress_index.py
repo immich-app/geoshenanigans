@@ -297,7 +297,7 @@ class ComponentSizesTest(OutputTest):
         "mode.full": {"files": ["{region}/full/geo_cells.bin", "{region}/full/street_ways.bin", "{region}/full/place_cells.bin",
                                 "{region}/full/place_nodes.bin", "{region}/full/place_hidden.bin",
                                 "{region}/full/strings_layout.json"],
-                      "optional_files": ["{region}/full/interp_postcodes.bin"]},
+                      "optional_files": ["{region}/full/interp_postcodes.bin", "{region}/full/addr_postcodes.bin"]},
         "quality.simplified": {"files": ["{region}/quality/simplified/admin_polygons.bin",
                                          "{region}/quality/simplified/admin_rings.bin",
                                          "{region}/quality/simplified/arc_index.bin",
@@ -315,6 +315,8 @@ class ComponentSizesTest(OutputTest):
         cfg["components"] = self.COMPONENTS
         with open(self.path("configurations.json"), "w") as f:
             json.dump(cfg, f)
+        # One of mode.full's optional files the build has; its other one it hasn't.
+        write(self.path("planet/full/interp_postcodes.bin"), content(17))
 
     def test_each_component_counts_its_files_raw_and_each_unit_once_on_the_wire(self):
         cfg = self.run_main()
@@ -322,10 +324,12 @@ class ComponentSizesTest(OutputTest):
         files, units = cfg["files"], cfg["units"]
 
         full = [f"planet/full/{n}" for n in ("geo_cells.bin", "street_ways.bin", "place_cells.bin", "place_nodes.bin",
-                                             "place_hidden.bin", "strings_layout.json")]
+                                             "place_hidden.bin", "strings_layout.json", "interp_postcodes.bin")]
+        self.assertNotIn("planet/full/addr_postcodes.bin", files)
         self.assertEqual(sizes["mode.full"], {
             "raw": sum(files[f]["size_raw"] for f in full),
             "wire": files["planet/full/geo_cells.bin"]["size_zst"] + files["planet/full/strings_layout.json"]["size_zst"]
+            + files["planet/full/interp_postcodes.bin"]["size_zst"]
             + units["planet/full/street_ways.tt.zst"]["size"] + units["planet/full/places.tt.zst"]["size"]})
         # The files the build has (no admin_rings.bin here), the arcs unit once for its two files.
         simplified = [f"planet/quality/simplified/{n}" for n in ("admin_polygons.bin", "arc_index.bin", "arc_vertices.bin")]

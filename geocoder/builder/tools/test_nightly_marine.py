@@ -61,6 +61,15 @@ def marine_block():
     return block.group(0) if block else None
 
 
+def marine_wait():
+    """The Download step's wait for the fetch of the marine areas, a line of the step's own after the fetch
+    starts (not inside another block), which fails the step with the fetch."""
+    text = script(read(NIGHTLY), "Download PBF and previous indexes")
+    started = text.find("MARINE_PID=$!\n")
+    wait = re.compile(r'^wait "?\$MARINE_PID"?\n', re.M).search(text, started) if started >= 0 else None
+    return wait.group(0) if wait else None
+
+
 # s5cmd as the blocks run it: `cp SRC DST` serves $FAKE_S3/<SRC past s3://> (a SRC ending in *.osm_ids copies
 # every sidecar under its prefix, by its path past the prefix, into the DST dir) and fails for an object in
 # $FAKE_S3_FAIL; `cp FILE DST`, of a local FILE, puts it at $FAKE_S3/<DST past s3://> and adds that path to
@@ -202,10 +211,12 @@ class NightlyTest(unittest.TestCase):
             json.dump(doc, f)
 
     def run_block(self):
+        block, wait = marine_block(), marine_wait()
+        self.assertIsNotNone(block)
+        self.assertIsNotNone(wait, "the Download step doesn't wait for the marine areas")
         env = {"PATH": f"{self.bin}:{os.environ['PATH']}", "WORKDIR": self.work, "GITHUB_WORKSPACE": self.repo,
                "GITHUB_OUTPUT": self.output, "S3_PUBLIC_URL": "https://bucket.example", "FAKE_CURL_DIR": self.served}
-        run = subprocess.run(["bash", "-e", "-c", marine_block() + 'wait "$MARINE_PID"\n'], env=env, capture_output=True,
-                             text=True, timeout=60)
+        run = subprocess.run(["bash", "-e", "-c", block + wait], env=env, capture_output=True, text=True, timeout=60)
         return run, read(self.output)
 
     def test_the_pinned_file_is_downloaded_checked_and_given_to_the_build(self):
@@ -396,12 +407,29 @@ class MarineWorkflowTest(unittest.TestCase):
         self.assertIn("::error::", run.stdout)
         self.assertEqual(env, "")
 
+    def run_tests_step(self, said, status=0):
+        """The Test the tool step with a python that writes `said` and exits with `status`."""
+        with tempfile.TemporaryDirectory() as t:
+            os.makedirs(os.path.join(t, "venv", "bin"))
+            with open(os.path.join(t, "venv", "bin", "python"), "w") as f:
+                f.write(f"#!/bin/sh\nprintf '%s\\n' '{said}' >&2\nexit {status}\n")
+            os.chmod(os.path.join(t, "venv", "bin", "python"), 0o755)
+            return subprocess.run(["bash", "-e", "-c", script(read(MARINE_WORKFLOW), "Test the tool")], cwd=t,
+                                  env={"PATH": os.environ["PATH"], "RUNNER_TEMP": t}, capture_output=True, text=True,
+                                  timeout=60)
+
     def test_the_tool_is_tested_before_it_builds_with_the_geometry_tests_run(self):
         text = read(MARINE_WORKFLOW)
-        tests = script(text, "Test the tool")
-        self.assertIn("test_marine_import", tests)
-        self.assertIn("skipped", tests)
+        self.assertIn("test_marine_import", script(text, "Test the tool"))
         self.assertLess(text.index("- name: Test the tool"), text.index("- name: Build the marine areas"))
+        run = self.run_tests_step("OK")
+        self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+        # Tests that pass with some skipped, as the geometry tests are without their modules, fail the step.
+        run = self.run_tests_step("OK (skipped=3)")
+        self.assertNotEqual(run.returncode, 0)
+        self.assertIn("::error::", run.stdout)
+        run = self.run_tests_step("FAILED (failures=1)", status=1)
+        self.assertNotEqual(run.returncode, 0)
 
     def run_build(self, summary):
         """The Build step with the tool's summary `summary`: the run, and whether it compressed the file."""
