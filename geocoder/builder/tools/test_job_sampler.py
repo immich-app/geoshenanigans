@@ -168,6 +168,20 @@ class JobSamplerTest(unittest.TestCase):
             self.assertRegex(cached.group(1), r"^planet\.osm\.pbf:\d+$")
             self.assertLessEqual(int(cached.group(1).split(":")[1]), 10000)
 
+    # A dm or LVM volume's source, /dev/mapper/<name>, is a link to its kernel name (dm-N), which /sys/class/block
+    # knows it by.
+    def test_a_mapped_volumes_counters_are_its_kernel_names(self):
+        write(os.path.join(self.bin, "df"), "#!/bin/sh\necho Filesystem\necho /dev/mapper/work\n")
+        write(os.path.join(self.root, "dev/dm-3"), "")
+        os.makedirs(os.path.join(self.root, "dev/mapper"))
+        os.symlink("../dm-3", os.path.join(self.root, "dev/mapper/work"))
+        write(os.path.join(self.root, "sys/class/block/dm-3/stat"), RBD_STAT)
+
+        lines = self.sample(lines=2)
+
+        self.assertTrue(lines[0].endswith(" device=dm-3"), lines[0])
+        self.assertIn(f" dm-3={' '.join(RBD_STAT.split())}", lines[1])
+
     def test_the_counters_are_read_again_for_each_sample(self):
         def usage(lines):
             return re.findall(r"usage_usec=(\d+)", "\n".join(lines))

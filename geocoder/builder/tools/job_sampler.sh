@@ -54,6 +54,9 @@ while :; do
   at=${at%/*}
 done
 device=$(df --output=source "$work_dir" 2> /dev/null | tail -1)
+# A dm or LVM volume's source (/dev/mapper/<name>) is a link to its kernel
+# name (dm-N), which /sys/class/block knows it by.
+if [[ "$device" == /* ]] && resolved=$(readlink -e "$root$device"); then device=$resolved; fi
 device=${device##*/}
 echo "[jobstat $(stamp)] cpus=$(nproc) cgroup=${job:-/} cpu.max=$quota device=$device" >> "$log"
 
