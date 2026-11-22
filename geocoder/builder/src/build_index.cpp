@@ -1943,6 +1943,8 @@ static int run(int argc, char* argv[]) {
         std::cerr << "  --tiger-data <path>          Load TIGER address data (tar.gz or directory of CSVs)" << std::endl;
         std::cerr << "  --external-postcodes <path>  Load GeoNames postcode centroids (CSV or .csv.gz)" << std::endl;
         std::cerr << "  --wikidata-sitelinks <path>  Load QID→sitelinks binary for POI importance" << std::endl;
+        std::cerr << "  --marine <path>              Load the seas and oceans (tools/marine_import.py) into the water layer"
+                  << std::endl;
         return 1;
     }
 
@@ -1951,6 +1953,7 @@ static int run(int argc, char* argv[]) {
     std::string wikidata_sitelinks_path;
     std::string tiger_data_path;
     std::string external_postcodes_path;
+    std::string marine_path;
     // strategy-2: previous build's output root, used to read
     // <prev_dir>/<region>/<variant>/*.osm_ids sidecars and assign
     // the same dense IDs to records carried over from the previous
@@ -1998,6 +2001,8 @@ static int run(int argc, char* argv[]) {
             tiger_data_path = argv[++i];
         } else if (arg == "--external-postcodes" && i + 1 < argc) {
             external_postcodes_path = argv[++i];
+        } else if (arg == "--marine" && i + 1 < argc) {
+            marine_path = argv[++i];
         } else if (arg == "--prev-output" && i + 1 < argc) {
             prev_output_dir = argv[++i];
         } else {
@@ -2014,6 +2019,7 @@ static int run(int argc, char* argv[]) {
         return 1;
     }
     require_new_or_empty_output_dir(output_dir);
+    if (!marine_path.empty()) marine::check_file(marine_path);
 
     ParsedData data;
     auto _pt = std::chrono::steady_clock::now();
@@ -4321,6 +4327,21 @@ static int run(int argc, char* argv[]) {
                                            [](const QidSitelinks& s, uint32_t q) { return s.qid < q; });
                 return it != sitelinks_data.end() && it->qid == qid ? it->count : 0;
             };
+            if (!marine_path.empty()) {
+                auto _mt = std::chrono::steady_clock::now();
+                auto _mc = CpuTicks::now();
+                water_collected.marine = marine::read_areas(marine_path);
+                size_t polygons = 0, rings = 0, vertices = 0;
+                for (const marine::Area& a : water_collected.marine)
+                    for (const auto& p : a.polygons) {
+                        polygons++;
+                        rings += p.size();
+                        for (const auto& r : p) vertices += r.size() - 1;
+                    }
+                std::cerr << "  Marine: " << water_collected.marine.size() << " areas, " << polygons << " polygons, "
+                          << rings << " rings, " << vertices << " vertices from " << marine_path << std::endl;
+                log_phase("    Water: marine areas", _mt, _mc);
+            }
             data.water = water::build_layer(water_collected, cfg.prev_output_dir.empty() ? "" : cfg.prev_output_dir + "/planet",
                                             sitelinks_of, num_threads);
             log_phase("    Water: layer", _pt, _cpu);

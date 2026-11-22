@@ -348,3 +348,170 @@ TEST(the_water_dirs_hold_every_file_and_keep_each_polygons_slot_the_next_day) {
     std::memcpy(&pond, records.data(), sizeof pond);
     CHECK_EQ(pond.name_id, NO_DATA);
 }
+
+namespace {
+
+// A marine area as marine::read_areas gives it: each ring closed.
+marine::Area marine_area(uint64_t id, uint8_t kind, const std::string& name,
+                         std::vector<std::vector<Ring>> polygons) {
+    marine::Area a;
+    a.id = id;
+    a.kind = kind;
+    a.name = name;
+    a.polygons = std::move(polygons);
+    return a;
+}
+
+// The fixture and two marine areas south of it: an ocean of two squares, one
+// with an island, and a sea of a square beside it, sharing its east side.
+Collected with_marine() {
+    Collected c = fixture();
+    const int32_t lat = kLat - 20000000;
+    c.marine.push_back(marine_area(1902, marine::kOcean, "North Atlantic Ocean",
+                                   {{square(lat, kLng, 2000000, 40), square(lat + 500000, kLng + 500000, 100000, 3)},
+                                    {square(lat + 5000000, kLng, 1000000, 5)}}));
+    c.marine.push_back(marine_area(2350, marine::kSea, "North Sea", {{square(lat, kLng + 2000000, 2000000, 40)}}));
+    return c;
+}
+
+std::string text_of(const std::vector<char>& bytes) { return std::string(bytes.begin(), bytes.end()); }
+
+}  // namespace
+
+TEST(marine_areas_are_objects_of_their_own_as_seas_and_oceans) {
+    const Layer layer = build(with_marine());
+    // After the OSM objects, by id: the ocean's two polygons, then the sea.
+    REQUIRE(layer.size() == 7u);
+    CHECK(name_of(layer, 4) == "North Atlantic Ocean");
+    CHECK(name_of(layer, 5) == "North Atlantic Ocean");
+    CHECK(name_of(layer, 6) == "North Sea");
+    CHECK_EQ(layer.records[4].country_code, code::kPlaceOcean);
+    CHECK_EQ(layer.records[6].country_code, code::kPlaceSea);
+    for (size_t p = 0; p < layer.size(); p++) CHECK_EQ(int(layer.marine[p]), int(p >= 4));
+    // The object's area: both its squares less the island.
+    CHECK(std::abs(layer.records[4].area - float(0.04 - 0.0001 + 0.01)) < 1e-6f);
+    CHECK_EQ(layer.records[5].area, layer.records[4].area);
+    CHECK_EQ(layer.arcs.polygons[4].ring_count, 2u);
+    // Keyed in an id space of their own: the area and the outer ring's
+    // corner, with a fallback by the area and the polygon's place.
+    const Ring first = square(kLat - 20000000, kLng, 2000000, 40);
+    const uint64_t corner = ring_corner(first.data(), static_cast<uint32_t>(first.size()), 0);
+    CHECK_EQ(layer.identities[4], marine_identity(1902, corner));
+    CHECK_EQ(layer.fallbacks[4], marine_fallback(1902, 0));
+    CHECK_EQ(layer.fallbacks[5], marine_fallback(1902, 1));
+    CHECK(layer.identities[4] != relation_ring_identity(1902, corner));
+    std::set<uint64_t> ids(layer.identities.begin(), layer.identities.end());
+    CHECK_EQ(ids.size(), layer.size());
+    // Every one is in the cell index and in the major tier.
+    std::set<uint32_t> listed;
+    for (const CellItemPair& cell : layer.cells) listed.insert(cell.item_id & ID_MASK);
+    for (uint32_t p = 4; p < 7; p++) {
+        CHECK(listed.count(p));
+        CHECK(layer.major[p]);
+    }
+    // The ocean's square and the sea's share their side: an arc of both.
+    auto slots_of = [&](size_t p) {
+        const AdminArcPolygon& poly = layer.arcs.polygons[p];
+        std::vector<std::vector<arc_blocks::SlotRef>> rings;
+        REQUIRE(arc_blocks::decode_rings(layer.arcs.set(ArcSet::Full).ring_blocks.data() + poly.blocks[0].offset,
+                                         poly.blocks[0].size, rings));
+        std::set<uint32_t> slots;
+        for (const auto& ring : rings)
+            for (const arc_blocks::SlotRef& r : ring) slots.insert(r.slot);
+        return slots;
+    };
+    const std::set<uint32_t> ocean = slots_of(4), sea = slots_of(6);
+    size_t shared = 0;
+    for (uint32_t slot : sea) shared += ocean.count(slot);
+    CHECK(shared >= 1);
+}
+
+TEST(a_water_dir_holding_a_marine_area_credits_marine_regions) {
+    const ScratchDir root("water-marine");
+    write(build(with_marine()), root.path() + "/with");
+    write(build(fixture()), root.path() + "/without");
+    for (const char* dir : {"water/all/simplified", "water/all/exact", "water/major/simplified"}) {
+        const std::string with = text_of(bytes_of(root.path() + "/with/" + dir + "/attribution.json"));
+        const std::string without = text_of(bytes_of(root.path() + "/without/" + dir + "/attribution.json"));
+        CHECK(with.find("\"id\": \"osm\"") != std::string::npos);
+        CHECK(with.find("\"id\": \"marine-regions\"") != std::string::npos);
+        CHECK(with.find("https://doi.org/10.14284/699") != std::string::npos);
+        CHECK(with.find("\"licence\": \"CC BY 4.0\"") != std::string::npos);
+        CHECK(without.find("\"id\": \"osm\"") != std::string::npos);
+        CHECK(without.find("marine-regions") == std::string::npos);
+        CHECK(with.rfind("[\n  {\n    \"id\": \"osm\",\n", 0) == 0);
+        CHECK(with.size() > 6 && with.compare(with.size() - 6, 6, "  }\n]\n") == 0);
+    }
+    // A region whose share holds no marine area credits OSM alone.
+    const Layer planet = build(with_marine());
+    std::vector<uint8_t> kept(planet.cells.size(), 0);
+    for (size_t i = 0; i < planet.cells.size(); i++) kept[i] = (planet.cells[i].item_id & ID_MASK) == 3;
+    Layer lake = subset_layer(planet, kept, 2);
+    REQUIRE(lake.size() == 1u);
+    CHECK_EQ(int(lake.marine[0]), 0);
+    {
+        std::ostringstream log;
+        std::streambuf* was = std::cerr.rdbuf(log.rdbuf());
+        assign_region_arc_slots(lake.arcs, "", "test", 0);
+        std::cerr.rdbuf(was);
+    }
+    write(lake, root.path() + "/lake");
+    CHECK(text_of(bytes_of(root.path() + "/lake/water/all/exact/attribution.json")).find("marine-regions") ==
+          std::string::npos);
+}
+
+TEST(marine_areas_keep_their_slots_from_one_day_to_the_next) {
+    const ScratchDir root("water-marine-days");
+    const std::string one = root.path() + "/one", two = root.path() + "/two";
+    const Layer day1 = build(with_marine());
+    write(day1, one);
+    // The next day, the ocean's first square's smallest vertex moved: the
+    // polygon keeps its slot by its fallback key.
+    Collected c = with_marine();
+    c.marine[0].polygons[0][0].front().lat_e7 -= 10;
+    c.marine[0].polygons[0][0].back() = c.marine[0].polygons[0][0].front();
+    const Layer day2 = build(c, one);
+    CHECK(day2.identities[4] != day1.identities[4]);
+    const std::string summary = write(day2, two, one);
+    CHECK(summary.find("7 polygons in 7 slots (7 kept, 1 by fallback)") != std::string::npos);
+    const auto a = tree(one), b = tree(two);
+    CHECK(a.at("water/all/exact/admin_polygons.bin") == b.at("water/all/exact/admin_polygons.bin"));
+}
+
+TEST(polygons_of_one_object_meeting_at_their_smallest_vertex_keep_slots_of_their_own) {
+    // Two triangles of one marine area that touch at their south-west corner,
+    // the smallest vertex of both, and two outer rings of a lake relation
+    // that do the same.
+    Collected c = fixture();
+    const int32_t lat = kLat - 30000000;
+    auto triangles = [](int32_t at_lat, int32_t at_lng) {
+        const PackedLocation p = pt(at_lat, at_lng);
+        return std::pair<Ring, Ring>{{p, pt(at_lat, at_lng + 1000), pt(at_lat + 500, at_lng + 1000), p},
+                                     {p, pt(at_lat + 1000, at_lng + 500), pt(at_lat + 1000, at_lng), p}};
+    };
+    const auto [a, b] = triangles(lat, kLng);
+    c.marine.push_back(marine_area(3000, marine::kSea, "Pinched Sea", {{a}, {b}}));
+    // And an area of one polygon twice, alike at every vertex: told apart by
+    // their fallback keys.
+    const Ring twice = triangles(lat + 200000, kLng).first;
+    c.marine.push_back(marine_area(3001, marine::kSea, "Twice Sea", {{twice}, {twice}}));
+    const auto [x, y] = triangles(lat + 100000, kLng);
+    add_geometry(c, 80, x);
+    add_geometry(c, 81, y);
+    CollectedArea pinched;
+    pinched.id = 700;
+    pinched.tags = tags(code::kLake, "Pinched Lake");
+    pinched.members = {{80, "outer"}, {81, "outer"}};
+    c.relations.push_back(pinched);
+    const Layer day1 = build(c);
+    std::set<uint64_t> ids(day1.identities.begin(), day1.identities.end());
+    CHECK_EQ(ids.size(), day1.size());
+    // The next day, the same data: every polygon in its slot, no slot more.
+    const ScratchDir root("water-pinched");
+    const std::string one = root.path() + "/one", two = root.path() + "/two";
+    write(day1, one);
+    const std::string summary = write(build(c, one), two, one);
+    const std::string all = std::to_string(day1.size());
+    CHECK(summary.find(all + " polygons in " + all + " slots (" + all + " kept, 0 by fallback)") != std::string::npos);
+    CHECK(tree(one) == tree(two));
+}

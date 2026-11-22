@@ -14,7 +14,12 @@
 //   strings_core.bin + strings_layout.json  its own names, alphabetical
 //   water_meta.json                       each type code it uses: class,
 //                                         type and Nominatim rank
-//   attribution.json                      the credit its data needs
+//   attribution.json                      the credit its data needs: OSM's,
+//                                         and Marine Regions' where it holds
+//                                         a marine area
+// Beside OSM's water areas the layer holds the marine areas (marine.h), the
+// seas and oceans of --marine, as objects of their own (place/sea and
+// place/ocean).
 // water/all/exact/ and water/major/simplified/ hold their set's sidecars
 // too: admin_polygons.osm_ids (a polygon's slot by its OSM identity) and
 // admin_polygons.fallback.osm_ids (the key that keeps a relation's outer
@@ -32,6 +37,7 @@
 
 #include "admin_arcs.h"
 #include "id_allocator.h"
+#include "marine.h"
 #include "parsed_data.h"
 #include "water_classify.h"
 #include "water_layer_data.h"
@@ -132,6 +138,8 @@ struct Collected {
     std::vector<LineIn> lines;
     // The relations' member ways' coordinates (ring assembly).
     WayGeometries member_geometries;
+    // The marine areas (--marine), by id.
+    std::vector<marine::Area> marine;
 };
 
 // Sorts the relations and waterways by id and indexes the waterways' member
@@ -145,8 +153,9 @@ bool line_key(const Collected& c, int64_t way, const char* name, const char* nam
 
 // --- The layer ---
 
-// One OSM object the layer holds: its identity and tags, its area summed
-// over its outer rings, and the name its waterway gave it.
+// One object the layer holds: its identity and tags, its area summed over
+// its outer rings, and the name its waterway gave it. An OSM way's or
+// relation's, or a marine area's (type SYNTHETIC, id its MRGID).
 struct Object {
     gc::id_alloc::ObjectType type = gc::id_alloc::ObjectType::NONE;
     int64_t id = 0;
@@ -167,16 +176,18 @@ struct Build {
     std::vector<uint32_t> outer_rank;  // by polygon: its place among its object's outer rings
     std::vector<uint64_t> piece_key;   // by polygon: its cut (water_split.h), 0 for an outer ring whole
     NamingLines lines;
-    size_t relations_missing_ways = 0, relations_without_rings = 0;
+    size_t relations_missing_ways = 0, relations_without_rings = 0, marine_objects = 0;
 };
 
 // Assembles every collected relation (assemble_area_rings, nested by
 // geometry as admin relations are: one polygon per outer ring with the holes
-// in it) and closed way into polygons, in object order (ways by id, then
-// relations by id), each ring rotated as canonicalize_ring_rotation puts it,
-// with its way runs. A relation with a member way the passes didn't find is
-// left out. Uses up the collected areas and geometries; moves the lines into
-// the build's NamingLines, keys and names sorted.
+// in it) and closed way into polygons, then takes the marine areas' as they
+// are, in object order (ways by id, relations by id, then marine areas by
+// id), each ring rotated as canonicalize_ring_rotation puts it, with its way
+// runs (a marine ring's marine::ring_runs). A relation with a member way the
+// passes didn't find is left out. Uses up the collected areas and
+// geometries; moves the lines into the build's NamingLines, keys and names
+// sorted.
 Build assemble(Collected& c, unsigned threads);
 
 // Names each unnamed river or canal object by `choices` (pick_names, by
@@ -242,7 +253,8 @@ Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::f
 // region's dir), as water/ beside its mode's files.
 void write_water_exact(const Layer& layer, const std::string& dir);
 
-// attribution.json of a water dir.
-std::string attribution_json();
+// attribution.json of a water dir, with Marine Regions' entry when it holds
+// a marine area: a JSON array of the entries, as the mode dirs' are.
+std::string attribution_json(bool marine);
 
 }  // namespace water

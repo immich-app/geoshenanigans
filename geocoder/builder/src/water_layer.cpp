@@ -54,6 +54,12 @@ double polygon_km2(const AdminExactRings& rings, uint32_t p) {
     return std::max(0.0, km2);
 }
 
+// How the log names an object: w<id>, r<id> or m<MRGID>.
+std::string object_ref(const Object& o) {
+    const char* kind = o.type == ObjectType::OSM_WAY ? "w" : o.type == ObjectType::OSM_RELATION ? "r" : "m";
+    return kind + std::to_string(o.id);
+}
+
 std::string read_text(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) return "";
@@ -262,6 +268,29 @@ Build assemble(Collected& c, unsigned threads) {
     }
     free_storage(assembled);
     free_storage(c.relations);
+    // The marine areas, each polygon as the file gives it, each ring's runs
+    // its stretches.
+    for (marine::Area& area : c.marine) {
+        if (area.polygons.empty()) continue;
+        ObjectTags t;
+        t.code = area.kind == marine::kOcean ? code::kPlaceOcean : code::kPlaceSea;
+        t.name = t.local_name = area.name;
+        const uint32_t object = add_object(ObjectType::SYNTHETIC, static_cast<int64_t>(area.id), std::move(t));
+        uint32_t rank = 0;
+        for (auto& rings : area.polygons) {
+            std::vector<std::vector<WayRun>> runs;
+            for (auto& ring : rings) {
+                runs.push_back(marine::ring_runs(ring));
+                canonicalize_ring_rotation(ring, runs.back());
+            }
+            const std::vector<std::vector<PackedLocation>> holes(std::make_move_iterator(rings.begin() + 1),
+                                                                 std::make_move_iterator(rings.end()));
+            add_polygon(object, rank++, rings[0], holes, runs);
+            std::vector<std::vector<PackedLocation>>().swap(rings);
+        }
+        b.marine_objects++;
+    }
+    free_storage(c.marine);
 
     // The candidate lines, by way, their keys and names as sorted indices.
     std::sort(c.lines.begin(), c.lines.end(), [](const LineIn& x, const LineIn& y) { return x.way < y.way; });
@@ -500,8 +529,8 @@ void split_polygons(Build& b, unsigned threads) {
     std::ostringstream whole;
     for (size_t h = 0; h < heavy.size(); h++)
         if (refusals[h] != SplitRefusal::None)
-            whole << "  Water split: " << (b.objects[heavy_object[h]].type == ObjectType::OSM_WAY ? "w" : "r")
-                  << b.objects[heavy_object[h]].id << " (" << b.objects[heavy_object[h]].tags.name << ", "
+            whole << "  Water split: " << object_ref(b.objects[heavy_object[h]]) << " ("
+                  << b.objects[heavy_object[h]].tags.name << ", "
                   << heavy_rings[h] - 1 << " holes) kept whole: " << refusal_name(refusals[h]) << "\n";
     std::cerr << whole.str() << "  Water split: " << heavy.size() << " polygons of more than " << kSplitMaxHoles
               << " holes; " << cut << " cut along " << cut_lines << " lines into " << made << " pieces, " << kept_whole
@@ -548,8 +577,12 @@ std::set<uint64_t> sidecar_identities(const std::string& path) {
     return out;
 }
 
-// Each polygon's slot identity and fallback key.
-void identities_of(const Build& b, std::vector<uint64_t>& ids, std::vector<uint64_t>& fallbacks) {
+// Each polygon's slot identity and fallback key. Two polygons that still
+// share an identity (rings alike at their corners) are told apart by their
+// fallback keys, which no two share: the one of the smaller keeps it, the
+// other takes one of its own key mixed in, the same from day to day. Returns
+// how many took one so.
+size_t identities_of(const Build& b, std::vector<uint64_t>& ids, std::vector<uint64_t>& fallbacks) {
     const size_t n = b.rings.polygons.size();
     ids.resize(n);
     fallbacks.resize(n);
@@ -562,14 +595,34 @@ void identities_of(const Build& b, std::vector<uint64_t>& ids, std::vector<uint6
                 continue;
             }
             const RingSpan& outer = b.rings.rings_of(static_cast<uint32_t>(p))[0];
-            uint64_t smallest = UINT64_MAX;
-            for (uint32_t i = 0; i < outer.count; i++)
-                smallest = std::min(smallest, vertex_key(b.rings.vertices[outer.begin + i]));
-            ids[p] = relation_ring_identity(o.id, smallest);
-            fallbacks[p] = piece_fallback(relation_ring_fallback(o.id, b.outer_rank[p]),
-                                          b.piece_key.empty() ? 0 : b.piece_key[p]);
+            const uint64_t piece = b.piece_key.empty() ? 0 : b.piece_key[p];
+            const uint64_t corner = ring_corner(b.rings.vertices.data() + outer.begin, outer.count, piece);
+            if (o.type == ObjectType::SYNTHETIC) {
+                ids[p] = marine_identity(static_cast<uint64_t>(o.id), corner);
+                fallbacks[p] = piece_fallback(marine_fallback(static_cast<uint64_t>(o.id), b.outer_rank[p]), piece);
+                continue;
+            }
+            ids[p] = relation_ring_identity(o.id, corner);
+            fallbacks[p] = piece_fallback(relation_ring_fallback(o.id, b.outer_rank[p]), piece);
         }
     });
+    std::vector<uint32_t> order(n);
+    std::iota(order.begin(), order.end(), 0u);
+    parallel_sort(order.begin(), order.end(), [&](uint32_t x, uint32_t y) {
+        return ids[x] != ids[y] ? ids[x] < ids[y] : fallbacks[x] < fallbacks[y];
+    });
+    size_t told_apart = 0;
+    uint64_t before = 0;
+    for (size_t k = 0; k < n; k++) {
+        const uint32_t p = order[k];
+        const uint64_t id = ids[p];
+        if (k > 0 && id == before) {
+            ids[p] = gc::id_alloc::make_key(ObjectType::SYNTHETIC, mix64(id ^ mix64(fallbacks[p] + 1)));
+            told_apart++;
+        }
+        before = id;
+    }
+    return told_apart;
 }
 
 }  // namespace
@@ -682,7 +735,10 @@ Layer planet_layer(const Build& b, std::shared_ptr<const TypeTable> types, std::
         out.names.push_back('\0');
     }
     if (out.names.size() >= NO_DATA) throw std::length_error("water names past 4 GiB");
-    identities_of(b, out.identities, out.fallbacks);
+    const size_t told_apart = identities_of(b, out.identities, out.fallbacks);
+    if (told_apart)
+        std::cerr << "  Water identities: " << told_apart << " polygons that shared one told apart by their fallback keys"
+                  << std::endl;
     out.records.resize(n);
     for (size_t p = 0; p < n; p++) {
         const Object& o = b.objects[b.object_of[p]];
@@ -695,6 +751,8 @@ Layer planet_layer(const Build& b, std::shared_ptr<const TypeTable> types, std::
         out.records[p] = rec;
     }
     out.major = std::move(major);
+    out.marine.resize(n);
+    for (size_t p = 0; p < n; p++) out.marine[p] = b.objects[b.object_of[p]].type == ObjectType::SYNTHETIC;
     out.arcs = std::move(arcs);
     out.cells = std::move(cells);
     if (out.major.size() != n || out.arcs.polygons.size() != n)
@@ -721,6 +779,7 @@ Layer subset_layer(const Layer& planet, const std::vector<uint8_t>& kept, unsign
         out.identities.push_back(planet.identities[id]);
         out.fallbacks.push_back(planet.fallbacks[id]);
         out.major.push_back(planet.major[id]);
+        out.marine.push_back(planet.marine[id]);
         mark_bit(name_used, planet.records[id].name_id);
     }
     const StringSubset names(planet.names, name_used);
@@ -773,13 +832,37 @@ std::string sitelinks_rows(const Build& b, const Layer& planet, const std::vecto
     return out.str();
 }
 
-std::string attribution_json() {
-    return "{\"attribution\": [\n"
-           "  {\"id\": \"osm\", \"text\": \"\xC2\xA9 OpenStreetMap contributors\", \"licence\": \"ODbL 1.0\", "
-           "\"licence_url\": \"https://opendatacommons.org/licenses/odbl/1-0/\", "
-           "\"url\": \"https://www.openstreetmap.org/copyright\", "
-           "\"notice\": \"This dataset is a derivative database of OpenStreetMap, available under the ODbL.\"}\n"
-           "]}\n";
+std::string attribution_json(bool marine) {
+    std::string out =
+        "[\n"
+        "  {\n"
+        "    \"id\": \"osm\",\n"
+        "    \"text\": \"\xC2\xA9 OpenStreetMap contributors\",\n"
+        "    \"url\": \"https://www.openstreetmap.org/copyright\",\n"
+        "    \"licence\": \"ODbL 1.0\",\n"
+        "    \"licence_url\": \"https://opendatacommons.org/licenses/odbl/1-0/\",\n"
+        "    \"notices\": [\n"
+        "      \"This dataset is a derivative database of OpenStreetMap, available under the ODbL 1.0.\"\n"
+        "    ]\n"
+        "  }";
+    if (marine)
+        out +=
+            ",\n"
+            "  {\n"
+            "    \"id\": \"marine-regions\",\n"
+            "    \"text\": \"Flanders Marine Institute (2024). The intersect of the Exclusive Economic Zones and IHO "
+            "sea areas, version 5. Available online at https://www.marineregions.org/. "
+            "https://doi.org/10.14284/699\",\n"
+            "    \"url\": \"https://www.marineregions.org/\",\n"
+            "    \"licence\": \"CC BY 4.0\",\n"
+            "    \"licence_url\": \"https://creativecommons.org/licenses/by/4.0/\",\n"
+            "    \"notices\": [\n"
+            "      \"Changes: each IHO sea area's parts in every EEZ dissolved into one, cut to the water off "
+            "OpenStreetMap's land polygons and along a 1-degree grid, and simplified in the simplified tiers. Cut "
+            "to OpenStreetMap's land, the areas are part of this dataset's ODbL derivative database.\"\n"
+            "    ]\n"
+            "  }";
+    return out + "\n]\n";
 }
 
 namespace {
@@ -818,7 +901,9 @@ std::string write_set(const Layer& layer, const std::vector<uint32_t>& ids, cons
             if (slot != NO_DATA) out.push_back({c.cell_id, slot | (c.item_id & INTERIOR_FLAG)});
         });
     parallel_sort(cells.begin(), cells.end(), cell_item_less);
-    const std::string meta = meta_json(*layer.types, codes), credit = attribution_json();
+    bool marine = false;
+    for (uint32_t id : ids) marine |= layer.marine[id] != 0;
+    const std::string meta = meta_json(*layer.types, codes), credit = attribution_json(marine);
     std::array<uint32_t, STR_TIER_COUNT + 1> bases;
     bases.fill(static_cast<uint32_t>(names.bytes().size()));
     bases[0] = 0;
@@ -882,7 +967,8 @@ Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::f
     Build b = assemble(c, threads);
     std::cerr << "  Water: " << b.objects.size() << " objects (" << closed_ways << " closed ways, " << relations
               << " relations, " << b.relations_missing_ways << " missing member ways, " << b.relations_without_rings
-              << " without rings), " << b.rings.polygons.size() << " polygons, " << b.rings.rings.size() << " rings, "
+              << " without rings, " << b.marine_objects << " marine areas), " << b.rings.polygons.size()
+              << " polygons, " << b.rings.rings.size() << " rings, "
               << b.rings.vertices.size() << " vertices; " << b.lines.lines.size() << " naming lines ("
               << b.lines.vertices.size() << " vertices, " << b.lines.keys.size() << " keys, " << waterways
               << " waterway relations)" << std::endl;
