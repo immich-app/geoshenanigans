@@ -660,7 +660,7 @@ TEST(a_wikidata_tag_names_an_item_only_as_one_whole_q_number) {
         CHECK_EQ(qid(other), 0u);
 }
 
-TEST(an_osm_bay_or_strait_of_a_marine_areas_name_that_it_overlaps_is_left_out) {
+TEST(an_osm_bay_or_strait_of_a_marine_areas_name_that_it_holds_all_of_is_left_out) {
     Collected c = with_marine();
     // The North Sea is the square at lat .. lat + 0.2, kLng + 0.2 .. 0.4.
     const int32_t lat = kLat - 20000000, lng = kLng + 2000000;
@@ -678,17 +678,29 @@ TEST(an_osm_bay_or_strait_of_a_marine_areas_name_that_it_overlaps_is_left_out) {
     add_way(2003, code::kNaturalBay, "North Sea", "North Sea", square(kLat + 800000, kLng, 1000));
     add_way(2004, code::kLake, "North Sea", "North Sea", square(lat + 1500000, lng + 500000, 100000));
     add_way(2005, code::kNaturalBay, "German Bight", "Deutsche Bucht", square(lat + 200000, lng + 1500000, 200000));
-    // A bay relation round the whole of it: none of the bay's vertices are
-    // in the sea, the sea's are in the bay.
+    // Kept as well, holding water the sea doesn't: a bay relation round the
+    // whole of it, one of its name reaching out of it, and one of two
+    // polygons, one in the sea and one far from it.
     add_geometry(c, 2500, square(lat - 100000, lng - 100000, 2200000));
     CollectedArea around;
     around.id = 2600;
     around.tags = tags(code::kNaturalBay, "North Sea");
     around.members = {{2500, "outer"}};
     c.relations.push_back(around);
+    add_way(2006, code::kNaturalBay, "North Sea", "North Sea", square(lat + 1800000, lng + 1800000, 300000));
+    add_geometry(c, 2501, square(lat + 500000, lng + 1000000, 100000));
+    add_geometry(c, 2502, square(lat + 500000, lng + 5000000, 100000));
+    CollectedArea apart;
+    apart.id = 2601;
+    apart.tags = tags(code::kNaturalBay, "North Sea");
+    apart.members = {{2501, "outer"}, {2502, "outer"}};
+    c.relations.push_back(apart);
     const Layer layer = build(c);
-    CHECK(ways_held(layer, {2001, 2002, 2003, 2004, 2005}).first == std::set<int64_t>({2003, 2004, 2005}));
-    for (size_t p = 0; p < layer.size(); p++) CHECK(layer.fallbacks[p] != relation_ring_fallback(2600, 0));
+    CHECK(ways_held(layer, {2001, 2002, 2003, 2004, 2005, 2006}).first == std::set<int64_t>({2003, 2004, 2005, 2006}));
+    std::map<uint64_t, size_t> rings;
+    for (size_t p = 0; p < layer.size(); p++) rings[layer.fallbacks[p]]++;
+    CHECK_EQ(rings[relation_ring_fallback(2600, 0)], size_t(1));
+    CHECK_EQ(rings[relation_ring_fallback(2601, 0)] + rings[relation_ring_fallback(2601, 1)], size_t(2));
     // The marine areas stay whole.
     size_t marine = 0;
     for (size_t p = 0; p < layer.size(); p++) marine += layer.marine[p];
@@ -1400,7 +1412,7 @@ TEST(the_lines_are_keyed_by_the_waterway_relations_of_every_input_once_all_are_r
     CHECK_EQ(c.lines[2].qid, 9u);
 }
 
-TEST(a_namesake_touching_a_marine_area_stays_and_one_crossing_it_with_no_vertex_in_it_goes) {
+TEST(a_namesake_inside_a_marine_area_along_its_side_goes_and_one_touching_or_crossing_it_stays) {
     Collected c = with_marine();
     // The North Sea: lat .. lat + 0.2 by lng .. lng + 0.2, a vertex each
     // 0.005 along its sides.
@@ -1410,16 +1422,58 @@ TEST(a_namesake_touching_a_marine_area_stays_and_one_crossing_it_with_no_vertex_
                     pt(south, west)};
     };
     // A bay of its name south of it, its north side along the sea's south
-    // side: they hold no water together.
+    // side: none of its water is the sea's.
     c.closed_ways.push_back({3001, tags(code::kNaturalBay, "North Sea"), rect(lat - 300000, lng + 500000, 300000, 300000)});
     // A strait of its name across it from south to north between two of the
-    // sea's vertices: neither holds a vertex of the other.
+    // sea's vertices: much of it in the sea, its ends out.
     c.closed_ways.push_back({3002, tags(code::kNaturalStrait, "North Sea"), rect(lat - 300000, lng + 910000, 2600000, 30000)});
+    // Inside it: a bay along its south side from a vertex of the sea's to a
+    // point between two, and a strait from its south side to its north,
+    // its corners between the sea's vertices.
+    c.closed_ways.push_back({3007, tags(code::kNaturalBay, "North Sea"), rect(lat, lng + 500000, 300000, 320000)});
+    c.closed_ways.push_back({3008, tags(code::kNaturalStrait, "North Sea"), rect(lat, lng + 1210000, 2000000, 30000)});
     const Layer layer = build(c);
-    CHECK(ways_held(layer, {3001, 3002}).first == std::set<int64_t>({3001}));
+    CHECK(ways_held(layer, {3001, 3002, 3007, 3008}).first == std::set<int64_t>({3001, 3002}));
 }
 
-TEST(a_namesake_cutting_a_marine_areas_corner_goes_and_one_meeting_it_along_a_side_or_at_a_point_stays) {
+TEST(a_namesake_the_marine_areas_of_its_name_hold_together_goes_and_one_over_their_island_stays) {
+    Collected c = with_marine();
+    // The Irish Sea: two squares sharing a side, one with a vertex each
+    // 0.005 along it, the other each 0.04.
+    const int32_t lat = kLat - 23000000;
+    c.marine.push_back(marine_area(2360, marine::kSea, "Irish Sea",
+                                   {{square(lat, kLng, 2000000, 40)}, {square(lat, kLng + 2000000, 2000000, 5)}}));
+    // A bay over both, across the side they share, and one reaching past
+    // them.
+    c.closed_ways.push_back({3010, tags(code::kNaturalBay, "Irish Sea"), square(lat + 500000, kLng + 1500000, 1000000)});
+    c.closed_ways.push_back({3011, tags(code::kNaturalBay, "Irish Sea"), square(lat + 1500000, kLng + 3500000, 1000000)});
+    // Bays of the ocean's name round its island (lat .. + 0.2: the island
+    // lat + 0.05 .. 0.06, west + 0.05 .. 0.06): one over it, one whose hole
+    // is the island, another whose hole is larger.
+    const int32_t ocean = kLat - 20000000;
+    const Ring island = square(ocean + 500000, kLng + 500000, 100000, 3);
+    c.closed_ways.push_back({3012, tags(code::kNaturalBay, "North Atlantic Ocean"), square(ocean + 400000, kLng + 400000, 300000)});
+    add_geometry(c, 3013, square(ocean + 400000, kLng + 400000, 300000));
+    add_geometry(c, 3014, island);
+    add_geometry(c, 3015, square(ocean + 450000, kLng + 450000, 200000));
+    CollectedArea holed;
+    holed.id = 3020;
+    holed.tags = tags(code::kNaturalBay, "North Atlantic Ocean");
+    holed.members = {{3013, "outer"}, {3014, "inner"}};
+    c.relations.push_back(holed);
+    CollectedArea wider = holed;
+    wider.id = 3021;
+    wider.members = {{3013, "outer"}, {3015, "inner"}};
+    c.relations.push_back(wider);
+    const Layer layer = build(c);
+    CHECK(ways_held(layer, {3010, 3011, 3012}).first == std::set<int64_t>({3011, 3012}));
+    std::map<uint64_t, size_t> rings;
+    for (size_t p = 0; p < layer.size(); p++) rings[layer.fallbacks[p]]++;
+    CHECK_EQ(rings[relation_ring_fallback(3020, 0)], size_t(0));
+    CHECK_EQ(rings[relation_ring_fallback(3021, 0)], size_t(0));
+}
+
+TEST(a_namesake_cutting_a_marine_areas_corner_or_meeting_it_along_a_side_or_at_a_point_stays) {
     Collected c = with_marine();
     // The North Sea, as above: its east side at east, a vertex each 0.005
     // along it.
@@ -1428,7 +1482,7 @@ TEST(a_namesake_cutting_a_marine_areas_corner_goes_and_one_meeting_it_along_a_si
     // from south of it to east of it: neither holds a vertex of the other,
     // and the parallel halfway up the latitudes the two share passes east
     // of the sea, so only the strait's edges crossing the sea's east side
-    // show the water they share.
+    // show the water of the strait the sea doesn't hold.
     c.closed_ways.push_back({3003, tags(code::kNaturalStrait, "North Sea"),
                              Ring{pt(lat - 30000, east - 40000), pt(lat + 40000, east + 30000), pt(lat + 38000, east + 30000),
                                   pt(lat - 30000, east - 38000), pt(lat - 30000, east - 40000)}});
@@ -1446,5 +1500,5 @@ TEST(a_namesake_cutting_a_marine_areas_corner_goes_and_one_meeting_it_along_a_si
                              Ring{pt(lat + 1800000, east), pt(lat + 1750000, east + 50000), pt(lat + 1800000, east + 100000),
                                   pt(lat + 1850000, east + 50000), pt(lat + 1800000, east)}});
     const Layer layer = build(c);
-    CHECK(ways_held(layer, {3003, 3004, 3005, 3006}).first == std::set<int64_t>({3004, 3005, 3006}));
+    CHECK(ways_held(layer, {3003, 3004, 3005, 3006}).first == std::set<int64_t>({3003, 3004, 3005, 3006}));
 }
