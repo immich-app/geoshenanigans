@@ -219,10 +219,10 @@ Build assemble(Collected& c, unsigned threads);
 
 // Leaves out each OSM natural=bay or strait that is a marine area's
 // namesake, in place: its name or local name (name:en or name) is the
-// marine area's, ASCII case, spaces and punctuation aside, and a vertex of
-// an outer ring of one lies in a polygon of the other. The marine area holds
-// that water; every other bay and strait stays. Logs each it leaves out and
-// returns how many.
+// marine area's, ASCII case, spaces and punctuation aside, and they hold
+// water together (a polygon of each, rings even-odd, share an area, not a
+// side or a point alone). The marine area holds that water; every other bay
+// and strait stays. Logs each it leaves out and returns how many.
 size_t drop_marine_namesakes(Build& b);
 
 // Names each unnamed river or canal object by `choices` (pick_names, by

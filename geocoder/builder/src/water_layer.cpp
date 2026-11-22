@@ -488,55 +488,100 @@ std::string namesake_key(const std::string& name) {
     return out;
 }
 
-// Whether polygon p holds a point, even-odd over its rings, each big ring's
-// edges indexed (ExactRingEdgeIndex).
-class PolygonHold {
-public:
-    PolygonHold(const AdminExactRings& rings, uint32_t p) : v_(rings.vertices.data()), spans_(rings.rings_of(p)) {
-        const uint32_t n = rings.polygons[p].ring_count;
-        boxes_.resize(n);
-        index_.resize(n);
-        for (uint32_t q = 0; q < n; q++) {
-            boxes_[q] = exact_ring_box(v_ + spans_[q].begin, spans_[q].count);
-            if (spans_[q].count > 256) index_[q] = std::make_unique<ExactRingEdgeIndex>(v_ + spans_[q].begin, spans_[q].count);
-        }
-    }
-
-    bool holds(PackedLocation pt) const {
-        bool inside = false;
-        for (size_t q = 0; q < boxes_.size(); q++) {
-            if (exact_ring_box_excludes(boxes_[q], pt)) continue;
-            inside ^= index_[q] ? index_[q]->contains(pt) : exact_ring_contains(v_ + spans_[q].begin, spans_[q].count, pt);
-        }
-        return inside;
-    }
-
-private:
-    const PackedLocation* v_;
-    const RingSpan* spans_;
-    std::vector<ExactRingBox> boxes_;
-    std::vector<std::unique_ptr<ExactRingEdgeIndex>> index_;
+// A longitude along an edge at some latitude, num / den (den > 0).
+struct Frac {
+    __int128 num, den;
 };
 
-bool boxes_meet(const ExactRingBox& a, const ExactRingBox& b) {
-    return a.lat_lo <= b.lat_hi && b.lat_lo <= a.lat_hi && a.lng_lo <= b.lng_hi && b.lng_lo <= a.lng_hi;
-}
+bool frac_less(const Frac& a, const Frac& b) { return a.num * b.den < b.num * a.den; }
 
-// Whether polygons a and b overlap: a vertex of either's outer ring lies in
-// the other.
+// Whether polygons a and b, their rings counted even-odd, hold water
+// together: an open stretch of a parallel that both hold. Between two
+// latitudes a vertex of either lies on, each edge spans the band or misses
+// it. An edge of one that crosses an edge of the other inside a band (the
+// two in one order at its foot, the other at its top) has water of both
+// beside it; with none, the edges keep their order across the band, which
+// holds water of both just where its middle parallel does. A shared side
+// or a vertex on the other's side holds none. Every value is exact: a
+// longitude's numerator is under 2^65, its denominator 2^32.
 bool polygons_overlap(const AdminExactRings& rings, uint32_t a, uint32_t b) {
-    const RingSpan &outer_a = rings.rings_of(a)[0], &outer_b = rings.rings_of(b)[0];
-    if (!boxes_meet(exact_ring_box(rings.vertices.data() + outer_a.begin, outer_a.count),
-                    exact_ring_box(rings.vertices.data() + outer_b.begin, outer_b.count)))
-        return false;
-    const PolygonHold in_a(rings, a), in_b(rings, b);
-    auto any_in = [&](uint32_t p, const PolygonHold& other) {
-        const RingSpan outer = rings.rings_of(p)[0];
-        for (uint32_t k = 0; k < outer.count; k++)
-            if (other.holds(rings.vertices[outer.begin + k])) return true;
-        return false;
+    struct Edge {
+        int64_t lat0, lat1, lng0, lng1;  // lat0 < lat1
+        int of;                          // 0 for a, 1 for b
     };
-    return any_in(a, in_b) || any_in(b, in_a);
+    std::vector<Edge> edges;
+    std::vector<int64_t> lats;
+    int64_t lo[2] = {INT64_MAX, INT64_MAX}, hi[2] = {INT64_MIN, INT64_MIN};
+    for (int of = 0; of < 2; of++) {
+        const uint32_t p = of ? b : a;
+        const RingSpan* span = rings.rings_of(p);
+        for (uint32_t k = 0; k < rings.polygons[p].ring_count; k++) {
+            const PackedLocation* v = rings.vertices.data() + span[k].begin;
+            for (uint32_t i = 0; i + 1 < span[k].count; i++) {
+                const PackedLocation s = v[i], t = v[i + 1];
+                lats.push_back(s.lat_e7);
+                lo[of] = std::min<int64_t>(lo[of], s.lat_e7);
+                hi[of] = std::max<int64_t>(hi[of], s.lat_e7);
+                if (s.lat_e7 < t.lat_e7) edges.push_back({s.lat_e7, t.lat_e7, s.lon_e7, t.lon_e7, of});
+                if (t.lat_e7 < s.lat_e7) edges.push_back({t.lat_e7, s.lat_e7, t.lon_e7, s.lon_e7, of});
+            }
+        }
+    }
+    const int64_t lat_lo = std::max(lo[0], lo[1]), lat_hi = std::min(hi[0], hi[1]);
+    if (lat_lo >= lat_hi) return false;
+    std::sort(lats.begin(), lats.end());
+    lats.erase(std::unique(lats.begin(), lats.end()), lats.end());
+    std::sort(edges.begin(), edges.end(), [](const Edge& x, const Edge& y) { return x.lat0 < y.lat0; });
+    // An edge's longitude at latitude lat2 / scale.
+    auto at = [](const Edge& e, int64_t lat2, int64_t scale) -> Frac {
+        const int64_t d = e.lat1 - e.lat0;
+        return {static_cast<__int128>(e.lng0) * d * scale + static_cast<__int128>(e.lng1 - e.lng0) * (lat2 - e.lat0 * scale),
+                static_cast<__int128>(d) * scale};
+    };
+    struct Ends {
+        Frac foot, top;
+        int of;
+    };
+    std::vector<uint32_t> active;
+    std::vector<Ends> band;
+    std::vector<Frac> middle[2];
+    size_t next = 0;
+    for (size_t k = 0; k + 1 < lats.size() && lats[k] < lat_hi; k++) {
+        const int64_t foot = lats[k], top = lats[k + 1];
+        while (next < edges.size() && edges[next].lat0 <= foot) active.push_back(static_cast<uint32_t>(next++));
+        active.erase(std::remove_if(active.begin(), active.end(), [&](uint32_t e) { return edges[e].lat1 <= foot; }),
+                     active.end());
+        if (top <= lat_lo) continue;
+        band.clear();
+        bool has[2] = {false, false};
+        for (uint32_t e : active) {
+            band.push_back({at(edges[e], foot, 1), at(edges[e], top, 1), edges[e].of});
+            has[edges[e].of] = true;
+        }
+        if (!has[0] || !has[1]) continue;
+        std::sort(band.begin(), band.end(), [](const Ends& x, const Ends& y) {
+            if (frac_less(x.foot, y.foot)) return true;
+            if (frac_less(y.foot, x.foot)) return false;
+            return frac_less(x.top, y.top);
+        });
+        int highest[2] = {-1, -1};  // of each, the edge so far of the highest top
+        for (size_t j = 0; j < band.size(); j++) {
+            const int other = highest[1 - band[j].of];
+            if (other >= 0 && frac_less(band[j].top, band[other].top)) return true;
+            int& mine = highest[band[j].of];
+            if (mine < 0 || frac_less(band[mine].top, band[j].top)) mine = static_cast<int>(j);
+        }
+        for (auto& m : middle) m.clear();
+        for (uint32_t e : active) middle[edges[e].of].push_back(at(edges[e], foot + top, 2));
+        for (auto& m : middle) std::sort(m.begin(), m.end(), frac_less);
+        for (size_t i = 0, j = 0; i + 1 < middle[0].size() && j + 1 < middle[1].size();) {
+            const Frac &a0 = middle[0][i], &a1 = middle[0][i + 1], &b0 = middle[1][j], &b1 = middle[1][j + 1];
+            if (frac_less(a0, a1) && frac_less(b0, b1) && frac_less(a0, b1) && frac_less(b0, a1)) return true;
+            if (frac_less(a1, b1)) i += 2;
+            else j += 2;
+        }
+    }
+    return false;
 }
 
 }  // namespace
@@ -550,10 +595,21 @@ size_t drop_marine_namesakes(Build& b) {
     std::vector<uint32_t> first(b.objects.size() + 1, 0);
     for (uint32_t o : b.object_of) first[o + 1]++;
     std::partial_sum(first.begin(), first.end(), first.begin());
+    // Each polygon's box, its outer ring's, as asked for.
+    std::unordered_map<uint32_t, ExactRingBox> boxes;
+    auto box_of = [&](uint32_t p) {
+        auto it = boxes.find(p);
+        if (it != boxes.end()) return it->second;
+        const RingSpan& outer = b.rings.rings_of(p)[0];
+        return boxes[p] = exact_ring_box(b.rings.vertices.data() + outer.begin, outer.count);
+    };
+    auto boxes_meet = [](const ExactRingBox& x, const ExactRingBox& y) {
+        return x.lat_lo <= y.lat_hi && y.lat_lo <= x.lat_hi && x.lng_lo <= y.lng_hi && y.lng_lo <= x.lng_hi;
+    };
     auto overlap = [&](uint32_t x, uint32_t y) {
         for (uint32_t p = first[x]; p < first[x + 1]; p++)
             for (uint32_t q = first[y]; q < first[y + 1]; q++)
-                if (polygons_overlap(b.rings, p, q)) return true;
+                if (boxes_meet(box_of(p), box_of(q)) && polygons_overlap(b.rings, p, q)) return true;
         return false;
     };
     std::vector<uint8_t> keep(b.objects.size(), 1);

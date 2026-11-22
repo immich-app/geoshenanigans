@@ -524,8 +524,9 @@ bay, harbour or lake inside a sea answers there, the sea out in open water.
 OSM's own `place=sea` areas stay out of the layer: the marine areas hold the
 seas, and Nominatim answers no `place=sea`. So does an OSM `natural=bay` or
 `strait` of a marine area's name (its `name` or `name:en`, ASCII case,
-spaces and punctuation aside) that overlaps that area, such as the Gulf of
-Oman (`drop_marine_namesakes`); every other OSM bay and strait stays.
+spaces and punctuation aside) that holds water together with that area (a
+shared shore or point alone doesn't count), such as the Gulf of Oman
+(`drop_marine_namesakes`); every other OSM bay and strait stays.
 
 - **They don't change from day to day.** The nightly never runs the tool: it
   downloads the version `data/marine.json` pins (a run of Update Marine

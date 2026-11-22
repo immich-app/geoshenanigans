@@ -950,3 +950,22 @@ TEST(the_lines_are_keyed_by_the_waterway_relations_of_every_input_once_all_are_r
     CHECK(c.lines[2].key == "nSihl" && c.lines[2].display == "Sihl River" && c.lines[2].local == "Sihl");
     CHECK_EQ(c.lines[2].qid, 9u);
 }
+
+TEST(a_namesake_touching_a_marine_area_stays_and_one_crossing_it_with_no_vertex_in_it_goes) {
+    Collected c = with_marine();
+    // The North Sea: lat .. lat + 0.2 by lng .. lng + 0.2, a vertex each
+    // 0.005 along its sides.
+    const int32_t lat = kLat - 20000000, lng = kLng + 2000000;
+    auto rect = [](int32_t south, int32_t west, int32_t height, int32_t width) {
+        return Ring{pt(south, west), pt(south, west + width), pt(south + height, west + width), pt(south + height, west),
+                    pt(south, west)};
+    };
+    // A bay of its name south of it, its north side along the sea's south
+    // side: they hold no water together.
+    c.closed_ways.push_back({3001, tags(code::kNaturalBay, "North Sea"), rect(lat - 300000, lng + 500000, 300000, 300000)});
+    // A strait of its name across it from south to north between two of the
+    // sea's vertices: neither holds a vertex of the other.
+    c.closed_ways.push_back({3002, tags(code::kNaturalStrait, "North Sea"), rect(lat - 300000, lng + 910000, 2600000, 30000)});
+    const Layer layer = build(c);
+    CHECK(ways_held(layer, {3001, 3002}).first == std::set<int64_t>({3001}));
+}
