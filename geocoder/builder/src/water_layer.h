@@ -254,7 +254,8 @@ Layer build_layer(Collected& c, const std::string& prev_planet_dir, const std::f
 void write_water_exact(const Layer& layer, const std::string& dir);
 
 // attribution.json of a water dir, with Marine Regions' entry when it holds
-// a marine area: a JSON array of the entries, as the mode dirs' are.
+// a marine area: a JSON array of the entries as configurations.template.json's
+// attribution list gives them, without their applies_to.
 std::string attribution_json(bool marine);
 
 }  // namespace water

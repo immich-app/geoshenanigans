@@ -21,6 +21,13 @@ hard-linked. A unit that fails (its encode, its zstd or its verify) is not
 published: its files go as .zst like any other, and the script exits
 UNIT_FAILED once all else is done, for the caller to fail the run at its end.
 
+configurations.json["component_sizes"] gives, per region, each component's
+bytes, so a client can weigh a selection without summing files: "raw", its
+files on disk, and "wire", what downloading them costs (a unit's size once,
+or its share by its files' raw bytes when the component holds only some of
+them; each other file's .zst). A component counts only the files the region
+has, and a region lists only the components it has a file of.
+
 --upload streams each .zst and unit to DEST/<path> as soon as it exists,
 through one long-running CMD (an `s5cmd ... run` reading cp commands on
 stdin): the upload is network-bound and compression CPU-bound, so they
@@ -59,11 +66,12 @@ MAX_THREADS_PER_FILE = 16
 # The exit status when a transport unit failed and its files went as .zst.
 UNIT_FAILED = 3
 
-# JSON sidecars the server's Index::load reads alongside the .bin files. They
-# go into configurations.files like any index file so the region downloader
-# can fetch them; the raw copy stays for clients that read it directly
-# (test-portal).
-LOAD_SIDECARS = {"strings_layout.json", "poi_meta.json"}
+# The JSON files a dataset holds beside its .bin files: the sidecars the
+# server's Index::load reads, a water dir's kinds, and each dir's credit of
+# its data. They go into configurations.files like any index file so the
+# region downloader can fetch them; the raw copy stays for clients that read
+# it directly (test-portal).
+JSON_FILES = {"strings_layout.json", "poi_meta.json", "water_meta.json", "attribution.json"}
 
 # Every file under a region's search/ dir is a place search index file
 # (build_search_indexes.py), published like the .bin files.
@@ -77,7 +85,7 @@ def index_files(out):
         for name in names:
             # Strategy-2 sidecars (*.osm_ids) stay uncompressed: they're cached
             # only and the next build's IdAllocator reads them directly.
-            if name.endswith(".bin") or name in LOAD_SIDECARS or (in_search and not name.endswith(".zst")):
+            if name.endswith(".bin") or name in JSON_FILES or (in_search and not name.endswith(".zst")):
                 found.append(os.path.join(root, name))
     return sorted(found, key=lambda p: (-os.path.getsize(p), p))
 
@@ -116,6 +124,29 @@ def units_of(cfg, rels):
             if all(f in held for f in files):
                 units.append(Unit(os.path.join(d, u["unit"]), u["kind"], files))
     return units
+
+
+def component_sizes(cfg, files, units):
+    """Per region, each component's raw and wire bytes (the module's doc), from configurations.json's
+    axes and components and the build's `files` and `units` tables."""
+    out = {}
+    for region in cfg.get("axes", {}).get("region", {}).get("values", {}):
+        sizes = {}
+        for cid, component in cfg.get("components", {}).items():
+            paths = [p.replace("{region}", region) for p in component.get("files", []) + component.get("optional_files", [])]
+            held = [p for p in dict.fromkeys(paths) if p in files]
+            if not held:
+                continue
+            raw = sum(files[p]["size_raw"] for p in held)
+            wire = sum(files[p]["size_zst"] for p in held if "unit" not in files[p])
+            for u in dict.fromkeys(files[p]["unit"] for p in held if "unit" in files[p]):
+                mine = sum(files[p]["size_raw"] for p in held if files[p].get("unit") == u)
+                whole = sum(files[p]["size_raw"] for p in units[u]["files"])
+                wire += units[u]["size"] if mine == whole else round(units[u]["size"] * mine / whole)
+            sizes[cid] = {"raw": raw, "wire": wire}
+        if sizes:
+            out[region] = dict(sorted(sizes.items()))
+    return out
 
 
 def run_logged(cmd, **kw):
@@ -290,6 +321,7 @@ def main():
     # Stable ordering for deterministic diffs.
     cfg["files"] = dict(sorted(files.items()))
     cfg["units"] = dict(sorted(table.items()))
+    cfg["component_sizes"] = component_sizes(cfg, cfg["files"], cfg["units"])
     with open(cpath, "w") as f:
         json.dump(cfg, f, indent=2)
 
