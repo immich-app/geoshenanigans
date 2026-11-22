@@ -323,6 +323,25 @@
 
   /* Dataset columns */
   .datasets-section { max-height: 42vh; min-height: 100px; overflow-y: auto; }
+  .datasets-head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+  .datasets-head h3 { margin: 0; }
+  .water-toggle { display: flex; align-items: center; gap: 0; font-size: 12px; }
+  .water-label { color: var(--text-dim); margin-right: 6px; }
+  .water-btn {
+    background: var(--surface2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-left-width: 0;
+    padding: 3px 8px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .water-btn:first-of-type { border-left-width: 1px; border-radius: 4px 0 0 4px; }
+  .water-btn:last-of-type { border-radius: 0 4px 4px 0; }
+  .water-btn.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .answer-water { font-size: 12px; margin-top: 3px; }
+  .answer-water .water-kind, .result-water { color: var(--text-dim); }
+  .result-water { font-size: 11px; }
   .columns { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-start; }
   .columns-note { font-size: 12px; color: var(--text-dim); }
   .picker {
@@ -538,7 +557,7 @@
   </div>
   <div class="side-panel">
     <section class="datasets-section">
-      <h3>Datasets</h3>
+      <div class="datasets-head"><h3>Datasets</h3><div id="waterToggle"></div></div>
       <div class="banner" id="banner"></div>
       <div class="columns" id="columns"></div>
       <div class="status-line" id="status"></div>
@@ -677,8 +696,9 @@ function buildOrder(a, b) {
 // ?d=<dataset> for each column (a preset's id, <mode>.<quality>.<poi_tier>,
 // or the id of one of /datasets' others, immich-cities500),
 // at=<lat>,<lon> for each point to look up, b=<build>, the build the
-// answers came from (its publication ID; a date alone still opens), and
-// q=<text>, the search box's text as it was typed.
+// answers came from (its publication ID; a date alone still opens),
+// q=<text>, the search box's text as it was typed, and w=<water>, the water
+// the columns answer with where it is not the build's default.
 function parseLink(search) {
   const params = new URLSearchParams(search);
   const points = [];
@@ -688,7 +708,10 @@ function parseLink(search) {
     const [lat, lng] = parts.map(Number);
     if (onGlobe(lat, lng)) points.push({ lat, lng });
   }
-  return { datasets: params.getAll('d').filter((d) => d).slice(0, MAX_COLUMNS), points, build: params.get('b') || null, q: params.get('q') || '' };
+  return {
+    datasets: params.getAll('d').filter((d) => d).slice(0, MAX_COLUMNS), points, build: params.get('b') || null, q: params.get('q') || '',
+    water: params.get('w') || null,
+  };
 }
 
 // The build a link to a result names (b=): the oldest that answered it in
@@ -702,8 +725,9 @@ function linkBuild(answers, keys, served) {
   return builds.find((build) => !served || !sameBuild(build, served)) || builds[0] || served;
 }
 
-function linkSearch({ datasets = [], point = null, build = null, q = '' }) {
+function linkSearch({ datasets = [], point = null, build = null, q = '', water = null }) {
   const parts = datasets.map((d) => `d=${encodeURIComponent(d).replace(/%2F/g, '/')}`);
+  if (water) parts.push(`w=${encodeURIComponent(water)}`);
   if (point) parts.push(`at=${point.lat},${point.lng}`);
   if (build) parts.push(`b=${encodeURIComponent(build)}`);
   if (q) parts.push(`q=${encodeURIComponent(q)}`);
@@ -848,15 +872,18 @@ function selectionLabel(catalog, selection) {
 // An answer as the page keeps it, from a response of the server: its JSON
 // (data) or why there is none (error), the build and the dataset that
 // answered (X-Geocoder-Build-Id, the build's publication ID, and
-// X-Geocoder-Dataset), and the ms it took.
+// X-Geocoder-Dataset), the water it answered with where it names one
+// (X-Geocoder-Water), and the ms it took.
 function answerOf(status, header, body, ms) {
   const build = header('x-geocoder-build-id');
   const dataset = header('x-geocoder-dataset');
-  if (status !== 200) return { error: `HTTP ${status}${body ? `: ${body.slice(0, 300)}` : ''}`, build, dataset, ms };
+  const water = header('x-geocoder-water');
+  const named = water ? { water } : {};
+  if (status !== 200) return { error: `HTTP ${status}${body ? `: ${body.slice(0, 300)}` : ''}`, build, dataset, ...named, ms };
   try {
-    return { data: JSON.parse(body), build, dataset, ms };
+    return { data: JSON.parse(body), build, dataset, ...named, ms };
   } catch (e) {
-    return { error: `not JSON: ${body.slice(0, 300)}`, build, dataset, ms };
+    return { error: `not JSON: ${body.slice(0, 300)}`, build, dataset, ...named, ms };
   }
 }
 
@@ -886,6 +913,94 @@ function compared(field, values, answers) {
   const present = values.filter((v) => v);
   const lacking = values.filter((v, i) => !v && answers[i]);
   return { field, values, differs: present.some((v) => v !== present[0]), missing: present.length > 0 && lacking.length > 0 };
+}
+
+// -- Water --
+// The water the answers carry: /datasets' water lists the build's water
+// dirs (none first, then each the build has), which the portal answers
+// beside any dataset's address (water=, its default all where the build has
+// it). The toggle in the datasets' header picks one for every column but
+// the Immich column, which has no water.
+
+// The short names of the toggle's buttons, by water value; a value of
+// another id shows its label.
+const WATER_SHORT = { none: 'None', major: 'Major', all: 'All', 'all-exact': 'All, exact' };
+
+// The water values `catalog` offers, in order; none for a build without
+// water.
+function waterValues(catalog) {
+  return catalog && catalog.water && Array.isArray(catalog.water.values) ? catalog.water.values : [];
+}
+
+// The water the columns ask with: `wanted` where the build offers it, else
+// the build's default; null for a build without water, whose columns ask
+// without water=.
+function waterOf(catalog, wanted) {
+  const values = waterValues(catalog);
+  if (!values.length) return null;
+  if (values.some((v) => v.id === wanted)) return wanted;
+  return values.some((v) => v.id === catalog.water.default) ? catalog.water.default : values[0].id;
+}
+
+// Whether the column `col` answers with water: one of the build's
+// datasets, not the Immich column (nor the one column of a server without
+// /datasets).
+function takesWater(col) {
+  return Boolean(col && !col.single && col.dataset && !pointsOnly(col.dataset));
+}
+
+// The key a column's answers are kept by, asked with the water `water`
+// (waterOf): its columnKey, with the water for a column that takes it, so
+// that the answers of each water are kept apart and a water picked again
+// shows its answers at once.
+function answerKey(col, water) {
+  const key = columnKey(col);
+  return key === null || !water || !takesWater(col) ? key : `${key}~${water}`;
+}
+
+// The /reverse of the point (lat, lng) for the column `col` with the water
+// `water`: of its dataset, and with water= for a column that takes water.
+function reverseUrl(lat, lng, col, water) {
+  const dataset = col.dataset ? `&dataset=${encodeURIComponent(col.dataset.id)}` : '';
+  const w = water && takesWater(col) ? `&water=${encodeURIComponent(water)}` : '';
+  return `/reverse?lat=${lat}&lon=${lng}&key=test${dataset}${w}`;
+}
+
+// An answer's water field as the page shows it: its name, then its class
+// and type.
+function waterText(w) {
+  return `${w.name} (${w.class}/${w.type})`;
+}
+
+// The field table's row of the water field of `views`' answers, compared
+// across the views that take water: the Immich column and Nominatim's
+// (water: false) take no part, and show nothing. None where no answer has
+// water.
+function waterRow(views) {
+  const part = views.map((v) => !pointsOnly(v.dataset) && v.water !== false);
+  const datas = views.map((v, i) => (part[i] && v.answer && v.answer.data) || null);
+  const values = datas.map((d) => (d && d.water && d.water.name != null ? waterText(d.water) : ''));
+  if (!values.some((v) => v)) return null;
+  return { ...compared('Water', values, datas), skipped: part.map((p) => !p) };
+}
+
+// The water toggle of the datasets' header: a button a water value of
+// `catalog`, each titled with its label, description and sizes, that of
+// `water` pressed; none for a build without water.
+function waterToggleHtml(catalog, water) {
+  const values = waterValues(catalog);
+  if (!values.length) return '';
+  const about = [catalog.water.label, catalog.water.description].filter(Boolean).join(': ');
+  let html = `<div class="water-toggle" role="group" aria-label="${esc(catalog.water.label || 'Water')}">`
+    + `<span class="water-label" title="${esc(about)}">Water</span>`;
+  for (const v of values) {
+    const sizes = Number.isFinite(v.size_disk) ? ` (${formatSize(v.size_disk)} on disk, ${formatSize(v.size_download)} download)` : '';
+    const title = `${v.label}${v.description ? `: ${v.description}` : ''}${sizes}`;
+    const on = v.id === water;
+    html += `<button type="button" class="water-btn${on ? ' on' : ''}" data-water="${esc(v.id)}" aria-pressed="${on}" title="${esc(title)}">`
+      + `${esc(WATER_SHORT[v.id] || v.label)}</button>`;
+  }
+  return `${html}</div>`;
 }
 
 // -- How Immich shows a place --
@@ -1703,6 +1818,10 @@ const SHOWN_TITLES = {
     + " from the answer (the Immich column's: what Immich stores today), only with a country",
 };
 
+// What the field table's water row is, as its name's title says it.
+const WATER_TITLE = "The answer's water field: the body of water holding the point (its name, then its class/type), of the water dir"
+  + ' the toggle above the columns picks; the Immich column has none';
+
 // The least width of a column's places table in the detail, in px: its
 // three columns' padding and a few letters of each.
 const PLACES_WIDTH = 160;
@@ -1726,6 +1845,7 @@ function detailHtml(views, served, countryNames = {}) {
     html += `<div class="answer-head" style="border-top-color:${v.color}"><div class="answer-label" style="color:${v.color}">${esc(v.label)}</div>`;
     const meta = [];
     if (v.dataset) meta.push(esc(v.dataset.id));
+    if (a.water) meta.push(`water ${esc(a.water)}`);
     if (a.build) meta.push(`build ${esc(a.build)}`);
     if (Number.isFinite(a.ms)) meta.push(`${Math.round(a.ms)} ms`);
     if (meta.length) html += `<div class="answer-meta">${meta.join(' · ')}</div>`;
@@ -1740,6 +1860,10 @@ function detailHtml(views, served, countryNames = {}) {
     else if (a.error) html += `<div class="result-error">${esc(a.error)}</div>`;
     else if (a.data) html += `<div class="answer-name">${a.data.display_name ? esc(a.data.display_name) : '—'}</div>`;
     else html += '<div class="answer-meta">not asked yet</div>';
+    const wet = a.data && !pointsOnly(v.dataset) && a.data.water;
+    if (wet) {
+      html += `<div class="answer-water">Water: <strong>${esc(wet.name)}</strong> <span class="water-kind">${esc(wet.class)}/${esc(wet.type)}</span></div>`;
+    }
     if (pointsOnly(v.dataset) && a.data) html += immichHtml(a.data);
     if (v.dataset && a.data) html += `<button class="tool feedback-btn" data-feedback="${i}" title="Tell us what you expected here">Disagree?</button>`;
     html += '</div>';
@@ -1748,7 +1872,8 @@ function detailHtml(views, served, countryNames = {}) {
 
   const datas = views.map((v) => (v.answer && v.answer.data) || null);
   const shown = datas.some((d) => d) ? displayRows(datas, countryNames) : [];
-  const rows = fieldRows(datas.map((d) => (d ? d.address || {} : null)), views.map((v) => Boolean(v.nominatim)));
+  const water = waterRow(views);
+  const rows = [...(water ? [water] : []), ...fieldRows(datas.map((d) => (d ? d.address || {} : null)), views.map((v) => Boolean(v.nominatim)))];
   if (shown.length || rows.length) {
     html += '<table class="fields"><tr><th style="color:var(--text-dim);width:140px">Field</th>';
     for (const v of views) html += `<th style="color:${v.color}">${esc(v.label)}</th>`;
@@ -1758,14 +1883,16 @@ function detailHtml(views, served, countryNames = {}) {
     for (const row of [...shown, ...rows]) {
       const mark = row.differs ? 'differs' : row.missing ? 'missing' : '';
       const display = shown.includes(row);
-      html += `<tr class="${[mark, display ? 'shown' : ''].filter(Boolean).join(' ')}">`
-        + `<td class="field"${display ? ` title="${esc(SHOWN_TITLES[row.field])}"` : ''}>${esc(row.field)}</td>`;
+      const title = display ? SHOWN_TITLES[row.field] : row === water ? WATER_TITLE : null;
+      html += `<tr class="${[mark, display ? 'shown' : '', row === water ? 'water' : ''].filter(Boolean).join(' ')}">`
+        + `<td class="field"${title ? ` title="${esc(title)}"` : ''}>${esc(row.field)}</td>`;
       row.values.forEach((value, i) => {
         const note = row.fallback && row.fallback[i] ? fellBack : '';
         const outside = !value && datas[i] && views[i].nominatim && EXTENSION_FIELDS.has(row.field);
+        const none = datas[i] && !(row.skipped && row.skipped[i]) ? '—' : '';
         html += value ? `<td class="value">${esc(value)}${note}</td>`
           : outside ? '<td class="empty" title="Not a Nominatim field">n/a</td>'
-          : `<td class="empty">${datas[i] ? '—' : ''}${note}</td>`;
+          : `<td class="empty">${none}${note}</td>`;
       });
       html += '</tr>';
     }
@@ -1832,6 +1959,7 @@ function cardHtml(entry, views, selected) {
       const extra = places.length > 3 ? ` +${places.length - 3} more` : '';
       html += `<div class="result-places">${esc(places.slice(0, 3).map((p) => p.name).join(', '))}${extra}</div>`;
     }
+    if (first.data.water && !pointsOnly(views[0].dataset)) html += `<div class="result-water">Water: ${esc(waterText(first.data.water))}</div>`;
   } else if (loading) {
     html += '<div class="result-name"><span class="loading-spinner"></span>Loading...</div>';
   } else if (!first.error) {
@@ -1849,7 +1977,7 @@ function nominatimView(entry) {
     : entry.nominatim ? { data: entry.nominatim }
     : entry.nominatimError ? { error: entry.nominatimError }
     : null;
-  return { label: 'Nominatim', color: NOMINATIM_COLOR, dataset: null, nominatim: true, answer };
+  return { label: 'Nominatim', color: NOMINATIM_COLOR, dataset: null, nominatim: true, water: false, answer };
 }
 
 // A result as the page saves it: its point, where it came from, Nominatim's
@@ -2179,8 +2307,8 @@ function feedbackError(status, body) {
 // /datasets passes on; the builds before it have none): its sources as
 // configurations.template.json lists them, and builder/src/attribution.h
 // writes them into each dataset's attribution.json, but for the datasets
-// each applies to, and but those of the water alone (ofWaterAlone), which
-// the portal serves none of.
+// each applies to, and but those of the water alone (ofWaterAlone): the
+// builds without a credit of their own have no water dirs.
 const DATA_CREDITS = [
   {
     id: 'osm',
@@ -2313,9 +2441,10 @@ function namesId(pattern, id) {
 // Whether a credit of the build applies to its water alone: of the build's
 // components (their ids, as /datasets lists them), those its applies_to
 // names (shell patterns of their ids, namesId) are some, and each one of
-// water.*. The portal serves the selections without water
-// (server/src/portal/catalog.rs's WATER), so such a source is none of the
-// answers'.
+// water.*. The portal's datasets are the selections without water
+// (server/src/portal/catalog.rs's NO_WATER), the water dirs beside them, so
+// such a source is the answers' only while the columns ask with a water it
+// names (namesWater).
 function ofWaterAlone(entry, components) {
   const to = entry.applies_to;
   if (!Array.isArray(to) || !to.every((p) => typeof p === 'string')) return false;
@@ -2323,17 +2452,24 @@ function ofWaterAlone(entry, components) {
   return named.length > 0 && named.every((id) => id.startsWith('water.'));
 }
 
+// Whether a credit of the water alone names `water`, the water the columns
+// ask with (null or none for no water): its component water.<water>.
+function namesWater(entry, water) {
+  return Boolean(water) && water !== 'none' && entry.applies_to.some((p) => namesId(p, `water.${water}`));
+}
+
 // The credit of the build served: where /datasets' attribution is a list of
 // entries each of a text, its entries but those of the water alone (of the
-// components /datasets lists, none where it lists none), then the page's
-// (DATA_CREDITS) of the sources it lists none of, by id, in the page's
-// order; else, or where none is left, DATA_CREDITS.
-function dataCredits(catalog) {
+// components /datasets lists, none where it lists none) that name another
+// water than `water`, the columns', then the page's (DATA_CREDITS) of the
+// sources it lists none of, by id, in the page's order; else, or where none
+// is left, DATA_CREDITS.
+function dataCredits(catalog, water = null) {
   const listed = catalog ? catalog.attribution : null;
   const reads = Array.isArray(listed) && listed.length > 0
     && listed.every((e) => e && typeof e === 'object' && typeof e.text === 'string' && e.text !== '');
   const components = (catalog && Array.isArray(catalog.components) ? catalog.components : []).filter((c) => typeof c === 'string');
-  const own = reads ? listed.filter((e) => !ofWaterAlone(e, components)) : [];
+  const own = reads ? listed.filter((e) => !ofWaterAlone(e, components) || namesWater(e, water)) : [];
   if (!own.length) return DATA_CREDITS;
   const ids = new Set(own.map((e) => e.id));
   return [...own, ...DATA_CREDITS.filter((e) => !ids.has(e.id))];
@@ -2357,11 +2493,11 @@ function creditHtml(entry) {
 }
 
 // The sources in full, as the page's disclosure holds them: the build's
-// (dataCredits; data-from says whether the build's own, the page's of the
-// sources it lists none of after them, or the page's alone), then the
-// Immich column's where /datasets lists it.
-function creditsHtml(catalog) {
-  const credits = dataCredits(catalog);
+// with `water`, the columns' water (dataCredits; data-from says whether the
+// build's own, the page's of the sources it lists none of after them, or the
+// page's alone), then the Immich column's where /datasets lists it.
+function creditsHtml(catalog, water = null) {
+  const credits = dataCredits(catalog, water);
   let html = `<div class="credit-group" data-from="${credits === DATA_CREDITS ? 'page' : 'build'}">`
     + `<div class="credit-head">The datasets' answers</div>${credits.map(creditHtml).join('')}</div>`;
   if (((catalog && catalog.others) || []).some((o) => o && o.kind === 'immich')) {
@@ -2427,6 +2563,11 @@ let columns = [SINGLE];
 // The columns' tokens as the link or the pickers last named them, kept while
 // the portal waits for a build.
 let wanted = link.datasets.slice();
+// The water the toggle picked (the link's, else the one picked last), and
+// the water the columns ask with (waterOf): null while the build has none.
+const WATER_KEY = 'geocoder_water';
+let wantedWater = link.water || (() => { try { return localStorage.getItem(WATER_KEY); } catch (e) { return null; } })();
+let water = null;
 let waitingFor = '';
 let mismatchDismissed = false;
 
@@ -2448,7 +2589,7 @@ function columnLabel(col) {
 // Each column's view of `entry`'s answers (detailHtml, cardHtml).
 function columnViews(entry) {
   return columns.map((col, i) => {
-    const key = columnKey(col);
+    const key = answerKey(col, water);
     const answer = key === null ? { error: col.error } : entry.answers[key] || null;
     return { label: columnLabel(col), color: COLUMN_COLORS[i], dataset: col.dataset, answer };
   });
@@ -2489,14 +2630,17 @@ async function loadCatalog() {
     catalog = json;
     columns = (wanted.length ? wanted : openingTokens(catalog)).map((token) => resolveColumn(catalog, token));
     wanted = columns.map((c) => c.token);
+    water = waterOf(catalog, wantedWater);
   } else {
     catalog = null;
+    water = null;
     columns = [SINGLE];
     waitingFor = body.slice(0, 300);
     if (mode === 'waiting') catalogRetry = setTimeout(loadCatalog, 30000);
   }
   if (polygonsColumn !== 'off' && polygonsColumn >= columns.length) polygonsColumn = 'off';
   document.getElementById('feedbackBtn').hidden = mode !== 'catalog';
+  renderWater();
   renderColumns();
   renderBanner();
   renderCredits();
@@ -2536,6 +2680,36 @@ function renderColumns() {
   const again = focused === null ? null : [...el.querySelectorAll('select, button')].find((c) => controlKey(c.dataset) === focused);
   if (again) again.focus();
 }
+
+function renderWater() {
+  document.getElementById('waterToggle').innerHTML = mode === 'catalog' ? waterToggleHtml(catalog, water) : '';
+}
+
+// The water picked anew by the toggle: the link, the markers and the cards
+// (of the first column's answer with it), and the selected result's answers
+// with it, asked where it has none yet.
+function setWater(value) {
+  if (mode !== 'catalog' || value === water) return;
+  wantedWater = value;
+  try { localStorage.setItem(WATER_KEY, value); } catch (e) {}
+  water = waterOf(catalog, value);
+  renderWater();
+  renderCredits();
+  updateLink();
+  results.forEach(placeMarker);
+  const entry = selectedEntry();
+  if (entry) {
+    askColumns(entry);
+    showDetail(entry.id);
+  }
+  renderResults();
+  saveResults();
+}
+
+document.getElementById('waterToggle').addEventListener('click', (e) => {
+  const el = e.target.closest('[data-water]');
+  if (el) setWater(el.dataset.water);
+});
 
 function renderBanner() {
   const el = document.getElementById('banner');
@@ -2633,9 +2807,10 @@ function updateLink() {
   if (!linkRestored) return;
   const entry = selectedEntry();
   const served = servedBuild() || (mode === 'waiting' ? link.build : null);
-  const keys = columns.map(columnKey).filter((key) => key !== null);
+  const keys = columns.map((c) => answerKey(c, water)).filter((key) => key !== null);
   const search = linkSearch({
     datasets: mode === 'single' ? [] : wanted,
+    water: catalog && water && catalog.water && water !== catalog.water.default ? water : null,
     point: entry ? { lat: entry.lat, lng: entry.lng } : null,
     build: entry ? linkBuild(entry.answers, keys, served) : served,
     q: mode === 'single' || !searchBox.value.trim() ? '' : searchBox.value,
@@ -2961,7 +3136,7 @@ function lookupLinkPoints() {
 function askColumns(entry, again = false) {
   const keys = new Map();
   for (const col of columns) {
-    const key = columnKey(col);
+    const key = answerKey(col, water);
     if (key !== null && !keys.has(key)) keys.set(key, col);
   }
   const asks = [];
@@ -2984,8 +3159,7 @@ async function ask(entry, key, col) {
   answered(entry);
   let answer;
   try {
-    const dataset = col.dataset ? `&dataset=${encodeURIComponent(col.dataset.id)}` : '';
-    const got = await pacer.request(`/reverse?lat=${entry.lat}&lon=${entry.lng}&key=test${dataset}`, 'reverse');
+    const got = await pacer.request(reverseUrl(entry.lat, entry.lng, col, water), 'reverse');
     answer = answerOf(got.status, got.header, got.body, got.ms);
   } catch (e) {
     answer = { error: e.message };
@@ -3042,7 +3216,7 @@ function answered(entry) {
 // The marker of `entry`, coloured by the first column's answer: gray until
 // it is in, red for an error, green with places, else blue.
 function placeMarker(entry) {
-  const key = columns.length ? columnKey(columns[0]) : null;
+  const key = columns.length ? answerKey(columns[0], water) : null;
   const a = key === null ? null : entry.answers[key];
   const color = !a || a.loading ? MARKER_COLORS.gray
     : a.error ? MARKER_COLORS.red
@@ -3429,9 +3603,10 @@ feedbackForm.addEventListener('submit', async (e) => {
 // -- Credits --
 const creditMore = document.getElementById('creditMore');
 
-// The sources in full of the build served, or the page's while it has none.
+// The sources in full of the build served with the columns' water, or the
+// page's while it has none.
 function renderCredits() {
-  document.getElementById('creditBody').innerHTML = creditsHtml(catalog);
+  document.getElementById('creditBody').innerHTML = creditsHtml(catalog, water);
 }
 
 // Opened, the sources take their place at the end of the panel: it scrolls
