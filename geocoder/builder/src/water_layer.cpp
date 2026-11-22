@@ -196,7 +196,7 @@ bool line_key(const Collected& c, int64_t way, const char* name, const char* nam
         line.local = w.local_name;
         line.display = w.name;
         line.qid = w.qid;
-        if (!w.english) line.way_display = name_en ? name_en : name ? name : w.name;
+        if (!w.english && name_en) line.way_en = name_en;
         return true;
     }
     if (!name && !name_en) return false;
@@ -366,16 +366,33 @@ Build assemble(Collected& c, unsigned threads) {
     // The candidate lines, by way (the first input's copy), their keys and
     // names as sorted indices.
     first_of_each_id(c.lines, [](const LineIn& l) { return l.way; });
-    // A waterway relation of a local name alone shows the name its river
-    // ways show over the most length, the smaller of a tie.
+    // A waterway relation of a local name alone shows the name:en its river
+    // ways carry over the most length, the smaller of a tie, where the ways
+    // of one hold more than half of its river ways' length.
     {
-        std::map<std::string, std::map<std::string, uint64_t>> votes;  // key -> name -> millimetres
+        struct Lengths {
+            std::map<std::string, uint64_t> en;  // name:en -> millimetres
+            uint64_t en_mm = 0, all_mm = 0;      // the ways of a name:en, all its ways
+        };
+        std::map<std::string, Lengths> lengths;  // the keys a way's name:en is kept for
         for (const LineIn& l : c.lines)
-            if (!l.way_display.empty()) votes[l.key][l.way_display] += line_mm(l);
+            if (!l.way_en.empty()) lengths[l.key];
+        for (const LineIn& l : c.lines) {
+            auto it = lengths.find(l.key);
+            if (it == lengths.end()) continue;
+            const uint64_t mm = line_mm(l);
+            Lengths& k = it->second;
+            k.all_mm += mm;
+            if (!l.way_en.empty()) {
+                k.en[l.way_en] += mm;
+                k.en_mm += mm;
+            }
+        }
         std::map<std::string, std::string> shown;
-        for (const auto& [key, names] : votes) {
+        for (const auto& [key, k] : lengths) {
+            if (k.en_mm <= k.all_mm - k.en_mm) continue;  // half of it or less
             uint64_t most = 0;
-            for (const auto& [name, mm] : names)
+            for (const auto& [name, mm] : k.en)
                 if (mm > most) {
                     most = mm;
                     shown[key] = name;

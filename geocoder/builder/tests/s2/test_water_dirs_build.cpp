@@ -255,9 +255,9 @@ TEST(a_build_without_multi_output_writes_the_exact_water_tier_beside_its_modes_f
 
 TEST(a_river_area_shows_its_waterway_relations_name_as_the_datasets_names_go) {
     // name:en, else name, as admin, place and POI names go. A relation of a
-    // local name alone shows the name its river ways show over the most
-    // length (each its name:en, else its name, else the relation's); one
-    // with a name:en of its own shows that.
+    // local name alone shows the name:en its river ways carry over the most
+    // length where the ways of one hold more than half of the length, else
+    // its own name; one with a name:en of its own shows that.
     const int32_t lat0 = 350000000, lng0 = 1380000000;
     std::vector<TestObject> objects;
     int64_t next = 1;
@@ -292,9 +292,16 @@ TEST(a_river_area_shows_its_waterway_relations_name_as_the_datasets_names_go) {
     objects.push_back(way(122, {at(lat0 + 250000, lng0), at(lat0 + 256000, lng0)}, {{"waterway", "river"}, {"name", "Spree"}}));
     objects.push_back(way(123, {at(lat0 + 260000, lng0), at(lat0 + 263000, lng0)}, {{"waterway", "river"}}));
     objects.push_back(relation(952, {{"type", "waterway"}, {"waterway", "river"}, {"name", "Spree"}}, {{121, ""}, {122, ""}, {123, ""}}));
+    // The Havel: the river way through its area, and most of its length,
+    // carry the name of a reach, Schnelle Havel, and none a name:en.
+    objects.push_back(way(130, square(lat0 + 300000, lng0, 10000), {{"natural", "water"}, {"water", "river"}}));
+    objects.push_back(way(131, {at(lat0 + 302000, lng0 + 2000), at(lat0 + 306000, lng0 + 6000)},
+                          {{"waterway", "river"}, {"name", "Schnelle Havel"}}));
+    objects.push_back(way(132, {at(lat0 + 350000, lng0), at(lat0 + 352000, lng0)}, {{"waterway", "river"}, {"name", "Havel"}}));
+    objects.push_back(relation(953, {{"type", "waterway"}, {"waterway", "river"}, {"name", "Havel"}}, {{131, ""}, {132, ""}}));
     const ScratchDir root("water-river-names");
     const std::vector<std::string> names = planet_water_names(objects, root.path() + "/out");
-    CHECK(names == std::vector<std::string>({"Danube", "Koshibu River", "Spree"}));
+    CHECK(names == std::vector<std::string>({"Danube", "Havel", "Koshibu River", "Spree"}));
 }
 
 TEST(a_node_the_input_lacks_leaves_a_gap_that_no_water_ring_or_line_crosses) {

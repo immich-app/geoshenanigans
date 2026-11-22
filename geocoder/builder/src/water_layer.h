@@ -132,10 +132,9 @@ struct LineIn {
     // Its vertices' runs between nodes the input lacks, their counts in
     // order, each a line of its own; empty for one run of them all.
     std::vector<uint32_t> runs;
-    // The name the way shows by the dataset's rule (its name:en, else its
-    // name, else its relation's), kept for a member of a waterway relation
-    // of a local name alone (CollectedWaterway::english false); else empty.
-    std::string way_display;
+    // The way's own name:en, kept for a member of a waterway relation of a
+    // local name alone (CollectedWaterway::english false); else empty.
+    std::string way_en;
 };
 
 // Everything the passes collect for the layer, over every input: each
@@ -163,8 +162,8 @@ void index_collected(Collected& c);
 // The key and display name of a waterway=river or canal way, given its
 // tags: its waterway relation's id and name (a member of one), else its
 // local name and its name:en (else name); false for neither. A member of a
-// relation of a local name alone keeps the name it shows itself
-// (LineIn::way_display): assemble shows the one the most length shows.
+// relation of a local name alone keeps its own name:en (LineIn::way_en),
+// which assemble may show in the relation's place.
 bool line_key(const Collected& c, int64_t way, const char* name, const char* name_en, uint32_t way_qid, LineIn& line);
 
 // Keys every line by its way's tags (line_key) against the waterway
@@ -215,11 +214,12 @@ struct Build {
 // with a member way the passes didn't find is left out. Uses up the
 // collected areas and geometries; moves the lines (keyed, key_lines) into
 // the build's NamingLines, keys and names sorted. The names follow the
-// dataset's (name:en, else name): the lines of a waterway relation of a
-// local name alone show the name its river ways show (LineIn::way_display)
-// over the most length, in whole millimetres (the smaller of a tie), and
-// the relation's name where none is any length; a relation with a name:en
-// of its own shows that.
+// dataset's (name:en, else name): a relation with a name:en of its own
+// shows that; the lines of a waterway relation of a local name alone show
+// the name:en its river ways carry (LineIn::way_en) over the most length
+// (the smaller of a tie) where the ways of one hold more than half of its
+// river ways' length, else the relation's name. Lengths are in whole
+// millimetres, none across a node the input lacks.
 Build assemble(Collected& c, unsigned threads);
 
 // Leaves out each OSM natural=bay or strait that is a marine area's
