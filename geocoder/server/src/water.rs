@@ -4,7 +4,8 @@
 //! formats but are a set of their own, pointing into nothing else:
 //! - admin_polygons.bin and admin_rings.bin: a record per polygon, an OSM object's outer ring
 //!   with its holes or a piece of it cut along a grid, carrying the object's name, its type code
-//!   in the country code's place and its area, all its outer rings' in square degrees;
+//!   in the country code's place and its area: that of all its outer rings, their holes taken
+//!   off, in square degrees;
 //! - arc_index.bin and arc_vertices.bin: the arcs of those rings;
 //! - admin_cells.bin and admin_entries.bin: each L10 cell's polygons, flagged interior where
 //!   their rings hold the whole cell;
