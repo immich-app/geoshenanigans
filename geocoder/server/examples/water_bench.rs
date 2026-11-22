@@ -1,20 +1,22 @@
-// Times a water lookup (a water dir of the builder's water layer, read with the admin readers:
-// one cell read, then the ring test of each entry not flagged interior) against the same point's
-// answer without water, at the cells whose non-interior entries carry the most rings: the lakes
-// and bays with thousands of islands, whose holes a ring test visits one by one.
+// Times the server's water lookup (WaterLayer::at on a water dir of the builder's water layer:
+// one cell read, then the ring tests of its entries in answering order, up to the first that
+// holds the point) against the same point's answer without water, at the cells whose
+// non-interior entries carry the most rings: the lakes and bays with thousands of islands, whose
+// holes a ring test visits one by one, and the cells of many small polygons.
 //
 //   cargo build --release --example water_bench
 //   ./target/release/examples/water_bench <dataset dir> <water dir> [cells] [rounds] > report.txt
 //
-// <dataset dir> is a flat dir grid_query loads (a mode's files beside a boundary tier); <water
-// dir> is one of {region}/water/{all,major}/{simplified,exact}. The cells: of the polygons with
+// <dataset dir> is a flat dir grid_query loads (a mode's files beside a boundary tier), without
+// a water dir; <water dir> is one of {region}/water/{all,major}/{simplified,exact}. The cells: of
+// the polygons with
 // the largest ring blocks (200), the L10 cells they reach where their entry is not interior, scored
 // by the rings of every non-interior entry there; the `cells` best (default 40), each sampled at
 // 5 x 5 points. Each point is answered `rounds` times (default 200) warm, by each path, and its
 // median kept. Prints each cell, then p50 and p99 over the points of both paths, of the two
 // together, and of the two together against the answer alone, point by point and as quantiles.
 use query_server::{
-    cell_id_at_level, cell_pairs, mmap_file, AdminGeometry, AdminPoint, AdminPolygon, CellPairs, MultiIndex, PipMemo,
+    cell_id_at_level, cell_pairs, mmap_file, AdminGeometry, AdminPolygon, CellPairs, MultiIndex, WaterLayer,
     ADMIN_POLYGON_RECORD_BYTES, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE, DEFAULT_STREET_CELL_LEVEL, ID_MASK,
     INTERIOR_FLAG,
 };
@@ -24,6 +26,7 @@ use s2::latlng::LatLng;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
+/// The water dir's records, cells and rings, which pick the cells timed.
 struct Water {
     records: Vec<AdminPolygon>,
     index: CellPairs,
@@ -56,31 +59,6 @@ impl Water {
         .expect("water cell index");
         Water { records, index, geometry }
     }
-
-    /// The water holding the point: the smallest area, then the lower type code (the record
-    /// order's last word), as the layer's answer picks it; the polygon id.
-    fn at(&self, lat: f64, lng: f64) -> Option<u32> {
-        let point = AdminPoint::new(lat, lng);
-        let (lat, lng) = point.degrees();
-        let mut memo = PipMemo::new();
-        let mut best: Option<(f32, u16, u32)> = None;
-        self.index.with_ids(cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL), |ids| {
-            for &id in ids {
-                let poly = &self.records[(id & ID_MASK) as usize];
-                if poly.ring_bytes == 0 {
-                    continue;
-                }
-                let key = (poly.area, poly.country_code, id & ID_MASK);
-                if best.is_some_and(|b| (b.0, b.1, b.2) <= key) {
-                    continue;
-                }
-                if id & INTERIOR_FLAG != 0 || self.geometry.contains(poly, point, &mut memo) {
-                    best = Some(key);
-                }
-            }
-        });
-        best.map(|b| b.2)
-    }
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -100,6 +78,7 @@ fn main() {
     let cells: usize = args.get(3).map_or(40, |a| a.parse().unwrap());
     let rounds: usize = args.get(4).map_or(200, |a| a.parse().unwrap());
     let water = Water::load(water_dir);
+    let layer = WaterLayer::open(water_dir, DEFAULT_ADMIN_CELL_LEVEL).expect("water dir").expect("a water dir's files");
     let index = MultiIndex::load(dataset, DEFAULT_STREET_CELL_LEVEL, DEFAULT_ADMIN_CELL_LEVEL, DEFAULT_SEARCH_DISTANCE)
         .expect("dataset");
 
@@ -172,12 +151,12 @@ fn main() {
                 if cell_id_at_level(lat, lng, DEFAULT_ADMIN_CELL_LEVEL) != cell {
                     continue;
                 }
-                held += usize::from(water.at(lat, lng).is_some());
+                held += usize::from(layer.at(lat, lng).is_some());
                 let mut w = Vec::new();
                 let mut a = Vec::new();
                 for _ in 0..rounds {
                     let t = Instant::now();
-                    std::hint::black_box(water.at(lat, lng));
+                    std::hint::black_box(layer.at(lat, lng));
                     w.push(t.elapsed().as_secs_f64() * 1e6);
                     let t = Instant::now();
                     std::hint::black_box(index.query_json(lat, lng));
