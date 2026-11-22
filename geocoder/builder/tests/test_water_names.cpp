@@ -60,14 +60,20 @@ TEST(an_area_takes_the_key_of_most_length_and_that_keys_display_of_most_length) 
 }
 
 TEST(the_choice_is_the_same_whatever_order_the_credits_arrive_in) {
+    // Enough credits that eight threads sort them in chunks and merge those
+    // (parallel_sort), where one sorts them whole.
     std::vector<Credit> credits;
-    for (uint32_t i = 0; i < 2000; i++) credits.push_back({i % 7, (i * 13) % 5, (i * 7) % 3, uint64_t(i % 11) * 17});
+    for (uint32_t i = 0; i < 200000; i++)
+        credits.push_back({i % 7, (i * 13) % 5, (i * 7) % 3, uint64_t(i % 11) * 17, (i * 3) % 13});
     std::vector<Credit> reversed(credits.rbegin(), credits.rend());
     const std::vector<NameChoice> a = pick_names(credits, 7, 1), b = pick_names(reversed, 7, 8);
     for (size_t o = 0; o < 7; o++) {
+        CHECK(a[o].named());
         CHECK_EQ(a[o].key, b[o].key);
         CHECK_EQ(a[o].display, b[o].display);
         CHECK_EQ(a[o].mm, b[o].mm);
+        CHECK_EQ(a[o].runner_up_mm, b[o].runner_up_mm);
+        CHECK_EQ(a[o].qid, b[o].qid);
     }
 }
 

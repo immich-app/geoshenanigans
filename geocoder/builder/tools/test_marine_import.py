@@ -19,7 +19,7 @@ import marine_import  # noqa: E402
 HAS_GEOMETRY = all(importlib.util.find_spec(m) for m in ("shapely", "numpy", "pyogrio"))
 
 # Two areas, by id: the ocean 1902 of two polygons (a triangle; a square with a triangular hole) and the sea
-# 2350 of one triangle. The builder's tests/test_marine.cpp reads the same bytes.
+# 2350 of one triangle. The builder's tests read the same bytes (tests/marine_test_file.h).
 TWO_AREAS = [
     (1902, marine_import.KIND_OCEAN, "North Atlantic Ocean", [
         [[(0, -300000000), (0, -200000000), (100000000, -250000000)]],

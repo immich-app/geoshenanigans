@@ -2,6 +2,8 @@
 // few holes each, which hold what it holds, each point once.
 #include "water_split.h"
 
+#include <algorithm>
+#include <cmath>
 #include <map>
 #include <random>
 #include <set>
@@ -58,6 +60,32 @@ int holders(const std::vector<SplitPolygon>& pieces, PackedLocation p) {
     int n = 0;
     for (const SplitPolygon& q : pieces) n += split_detail::polygon_contains(q, p);
     return n;
+}
+
+// The ways of the edges of p's rings that the segment a-b lies along: both
+// its ends within a unit of the edge (a cut's vertex is rounded to the e7
+// grid).
+std::set<int64_t> ways_along(const SplitPolygon& p, PackedLocation a, PackedLocation b) {
+    auto near = [](PackedLocation u, PackedLocation v, PackedLocation x) {
+        const double dx = double(v.lon_e7) - u.lon_e7, dy = double(v.lat_e7) - u.lat_e7;
+        const double px = double(x.lon_e7) - u.lon_e7, py = double(x.lat_e7) - u.lat_e7;
+        const double len2 = dx * dx + dy * dy, len = std::sqrt(len2), along = px * dx + py * dy, off = px * dy - py * dx;
+        return along >= -len && along <= len2 + len && off * off <= len2;
+    };
+    std::set<int64_t> out;
+    std::vector<const SplitRing*> rings = {&p.outer};
+    for (const SplitRing& h : p.holes) rings.push_back(&h);
+    for (const SplitRing* r : rings)
+        for (size_t i = 0, n = r->v.size(); i < n; i++)
+            if (near(r->v[i], r->v[(i + 1) % n], a) && near(r->v[i], r->v[(i + 1) % n], b)) out.insert(r->way[i]);
+    return out;
+}
+
+// The pieces' keys.
+std::multiset<uint64_t> keys_of(const std::vector<SplitPolygon>& pieces) {
+    std::multiset<uint64_t> out;
+    for (const SplitPolygon& q : pieces) out.insert(q.key);
+    return out;
 }
 
 }  // namespace
@@ -119,8 +147,9 @@ TEST(an_island_a_cut_crosses_is_cut_with_its_lake_and_each_stretch_of_cut_is_sha
         const PackedLocation q = pt(lat(rng), lng(rng));
         CHECK_EQ(holders(pieces, q), split_detail::polygon_contains(p, q) ? 1 : 0);
     }
-    // Each edge keeps its way or is a cut (a negative way), and every cut
-    // edge of one piece is a cut edge of another.
+    // Each edge keeps the way of the lake's edge it lies along or is a cut
+    // (a negative way), and every cut edge of one piece is a cut edge of
+    // another.
     std::map<std::pair<uint64_t, uint64_t>, int> cut_edges;
     auto key = [](PackedLocation a) { return uint64_t(uint32_t(a.lat_e7)) << 32 | uint32_t(a.lon_e7); };
     for (const SplitPolygon& q : pieces)
@@ -132,7 +161,7 @@ TEST(an_island_a_cut_crosses_is_cut_with_its_lake_and_each_stretch_of_cut_is_sha
             REQUIRE(r->v.size() == r->way.size());
             for (size_t i = 0; i < r->v.size(); i++) {
                 const int64_t w = r->way[i];
-                CHECK(w < 0 || (w >= 1000 && w <= 1003) || w >= 10);
+                if (w >= 0) CHECK(ways_along(p, r->v[i], r->v[(i + 1) % r->v.size()]).count(w));
                 if (w < 0) cut_edges[std::minmax(key(r->v[i]), key(r->v[(i + 1) % r->v.size()]))]++;
             }
         }
@@ -161,15 +190,23 @@ TEST(rings_that_cross_or_run_either_way_are_cut_by_what_they_hold_even_odd) {
 }
 
 TEST(the_same_polygon_cuts_the_same_way_whatever_its_rings_start_and_run) {
-    SplitPolygon p = lake(20, 100000), q = p;
+    SplitPolygon p = lake(20, 100000), q = p, r = p;
     std::rotate(q.outer.v.begin(), q.outer.v.begin() + 17, q.outer.v.end());
     std::rotate(q.outer.way.begin(), q.outer.way.begin() + 17, q.outer.way.end());
-    const std::vector<SplitPolygon> a = split_polygon(p, 64), b = split_polygon(q, 64);
+    // Every ring the other way round, each edge with its way.
+    auto turn = [](SplitRing& ring) {
+        std::reverse(ring.v.begin(), ring.v.end());
+        std::reverse(ring.way.begin(), ring.way.end());
+        std::rotate(ring.way.begin(), ring.way.begin() + 1, ring.way.end());
+    };
+    turn(r.outer);
+    for (SplitRing& h : r.holes) turn(h);
+    const std::vector<SplitPolygon> a = split_polygon(p, 64), b = split_polygon(q, 64), c = split_polygon(r, 64);
+    REQUIRE(a.size() > 1);
     REQUIRE(a.size() == b.size());
-    std::multiset<uint64_t> ka, kb;
-    for (const SplitPolygon& x : a) ka.insert(x.key);
-    for (const SplitPolygon& x : b) kb.insert(x.key);
-    CHECK(ka == kb);
+    REQUIRE(a.size() == c.size());
+    CHECK(keys_of(a) == keys_of(b));
+    CHECK(keys_of(a) == keys_of(c));
 }
 
 TEST(a_cut_puts_its_vertex_where_it_does_with_the_edge_run_the_other_way) {

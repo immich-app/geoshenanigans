@@ -119,17 +119,30 @@ TEST(the_water_tier_repairs_crossings_of_a_polygons_own_rings_and_none_between_p
     const Ring lake2 = {pt(0, at), pt(0, 40000 + at), pt(-3000, 45000 + at), pt(-3000, 55000 + at), pt(0, 60000 + at),
                         pt(0, s + at), pt(s, s + at), pt(s, at)};
     const Ring hole2 = {pt(-2000, 48000 + at), pt(-2000, 52000 + at), pt(-1000, 52000 + at), pt(-1000, 48000 + at)};
-    AdminExactRings store;
+    // A third lake, `2 * at` east, bows its shore out the same way round a
+    // hole of its own that reaches past the straight line: straightened,
+    // the shore crosses its hole.
+    const int32_t at3 = 2 * at;
+    const Ring lake3 = {pt(0, at3), pt(0, 40000 + at3), pt(-3000, 45000 + at3), pt(-3000, 55000 + at3), pt(0, 60000 + at3),
+                        pt(0, s + at3), pt(s, s + at3), pt(s, at3)};
+    const Ring hole3 = {pt(-2000, 48000 + at3), pt(-2000, 52000 + at3), pt(1000, 52000 + at3), pt(1000, 48000 + at3)};
+    AdminExactRings store, own;
     store.append(closed(lake), {});
     store.append(isle, {});
     store.append(closed(lake2), {closed(hole2)});
+    store.append(closed(lake3), {closed(hole3)});
+    own.append(closed(lake3), {closed(hole3)});
     const AdminArcs arcs = build_arc_topology(store, 1, {}, ArcCuts::JunctionsAndWayEnds);
     const std::vector<bool> nests = exact_rings_nest(store, 1);
     const ArcTierState admin = build_arc_tier(arcs, store, kArcTiers[0], nests, 1);
     const ArcTierState water = build_arc_tier(arcs, store, water_simplified(), nests, 1);
-    // The admin tier repairs the shore against the island; water leaves it.
+    // The admin tier repairs the shore against the island; water leaves it,
+    // and counts the crossings of the third lake's rings alone.
     CHECK(admin.counts.crossings_simplified >= 1);
-    CHECK_EQ(water.counts.crossings_simplified, size_t(0));
+    const AdminArcs own_arcs = build_arc_topology(own, 1, {}, ArcCuts::JunctionsAndWayEnds);
+    const ArcTierState own_water = build_arc_tier(own_arcs, own, water_simplified(), exact_rings_nest(own, 1), 1);
+    CHECK(own_water.counts.crossings_simplified >= 1);
+    CHECK_EQ(water.counts.crossings_simplified, own_water.counts.crossings_simplified);
     CHECK_EQ(water.counts.crossings_left, size_t(0));
     // The second lake's own hole: its shore gets the bow back.
     CHECK(water.counts.nesting_restored >= 1);
@@ -150,6 +163,7 @@ TEST(the_water_tier_repairs_crossings_of_a_polygons_own_rings_and_none_between_p
     CHECK(keeps_bow(admin, 3000, 0));
     CHECK(!keeps_bow(water, 3000, 0));
     CHECK(keeps_bow(water, -3000, at));
+    CHECK(keeps_bow(water, -3000, at3));
 }
 
 TEST(the_water_stage_builds_and_encodes_its_two_tiers_with_no_minimal_set) {
