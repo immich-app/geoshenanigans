@@ -1038,6 +1038,17 @@ void add_rectangle(std::vector<TestObject>& objects, int64_t id, int64_t first_n
     objects.push_back(way(id, {first_node, first_node + 1, first_node + 2, first_node + 3, first_node}, std::move(tags)));
 }
 
+// A multipolygon relation `id` of one outer way.
+TestObject multipolygon(int64_t id, int64_t outer, std::vector<std::pair<std::string, std::string>> tags) {
+    TestObject o;
+    o.type = OsmType::Relation;
+    o.id = id;
+    o.tags = std::move(tags);
+    o.tags.push_back({"type", "multipolygon"});
+    o.members.emplace_back(OsmType::Way, outer, "outer");
+    return o;
+}
+
 // The fixture with `extra` objects, written to `pbf` in PBF order.
 void write_fixture_with(const std::string& pbf, std::vector<TestObject> extra) {
     std::vector<TestObject> objects = fixture();
@@ -1069,6 +1080,17 @@ std::vector<int> categories_of(const std::vector<PoiRecord>& records) {
     for (const PoiRecord& pr : records) out.push_back(pr.category);
     std::sort(out.begin(), out.end());
     return out;
+}
+
+// The dataset of a client of POI tier `tier` of a build's whole dir `out`:
+// the planet dir's files and poi/<tier>'s beside them, at `at`.
+std::string poi_dataset(const std::string& out, const std::string& tier, const std::string& at) {
+    fs::create_directories(at);
+    for (const std::string dir : {std::string("planet"), "planet/poi/" + tier})
+        for (const auto& e : fs::directory_iterator(out + "/" + dir))
+            if (e.is_regular_file())
+                fs::copy_file(e.path(), at + "/" + e.path().filename().string(), fs::copy_options::overwrite_existing);
+    return at;
 }
 
 }  // namespace
@@ -1176,6 +1198,44 @@ TEST(a_bay_that_is_a_pier_is_a_pier_where_piers_ship_and_a_bay_where_only_bays_d
         REQUIRE(alloc.slots().size() == 1);
         CHECK_EQ(int(alloc.slots()[0].tier), wiki ? 1 : 2);
     }
+}
+
+// A named multipolygon of water that is also a rank-30 POI, natural=bay or
+// natural=water with leisure=swimming_area, is that POI in Nominatim, which
+// imports a multipolygon as a closed way: the build writes both as
+// SWIMMING_AREA, and the server answers the bay at a point inside, on its
+// parent street. A plain multipolygon bay stays a BAY, which never takes the
+// primary slot nor gives the road.
+TEST(a_water_multipolygon_that_is_a_rank_30_poi_is_written_as_that_poi_and_answered) {
+    const ScratchDir root("water-relation-build");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    // 22 m by 60 m each, 33 m north of Teststrasse.
+    const int32_t lat0 = 470000000, lng0 = 80000000, south = lat0 + 1403000, north = lat0 + 1405000;
+    std::vector<TestObject> water;
+    add_rectangle(water, 4040, 990, south, lng0 + 1420000, north, lng0 + 1428000);
+    add_rectangle(water, 4041, 994, south, lng0 + 1435000, north, lng0 + 1443000);
+    add_rectangle(water, 4042, 998, south, lng0 + 1450000, north, lng0 + 1458000);
+    water.push_back(multipolygon(5040, 4040, {{"leisure", "swimming_area"}, {"name", "Badebucht Testdorf"}, {"natural", "bay"}}));
+    water.push_back(multipolygon(5041, 4041, {{"leisure", "swimming_area"}, {"name", "Badesee Testdorf"}, {"natural", "water"}}));
+    water.push_back(multipolygon(5042, 4042, {{"name", "Bucht Testdorf"}, {"natural", "bay"}}));
+    write_fixture_with(pbf, water);
+    const std::string out = root.path() + "/single";
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, out, pbf}, log));
+
+    const std::vector<PoiRecord> pois = poi_records_in(tree(out), "planet/poi/all");
+    const std::vector<int> want = {int(PoiCategory::BAY), int(PoiCategory::SWIMMING_AREA), int(PoiCategory::SWIMMING_AREA)};
+    CHECK(categories_of(pois) == want);
+    for (const PoiRecord& pr : pois) CHECK(pr.parent_street_id != NO_DATA);
+
+    const std::string dataset = poi_dataset(out, "all", root.path() + "/dataset");
+    const std::vector<std::string> answers =
+        server_answers(dataset, {{47.1404, 8.1424}, {47.1404, 8.1454}}, root.path() + "/q", log);
+    REQUIRE(answers.size() == 2);
+    CHECK(answer_string(answers[0], {"display_name"}).value_or("").rfind("Badebucht Testdorf, ", 0) == 0);
+    CHECK(answer_string(answers[0], {"address", "road"}) == std::optional<std::string>("Teststrasse"));
+    CHECK(answer_string(answers[1], {"display_name"}).value_or("").rfind("Bucht Testdorf", 0) == std::string::npos);
+    CHECK(answer_string(answers[1], {"address", "road"}) == std::optional<std::string>("Teststrasse"));
+    if (!says(answers[0], "Badebucht Testdorf")) std::printf("    %s\n", answers[0].c_str());
 }
 
 // A build logs, for each dir it writes with addresses and for each POI tier,

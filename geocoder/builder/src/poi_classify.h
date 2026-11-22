@@ -531,5 +531,5 @@ inline std::optional<PoiClassification> classify_poi(
     }
     if (tier > POI_MAX_SHIPPED_TIER) return std::optional<PoiClassification>{};
 
-    return PoiClassification{cat, tier, flags};
+    return PoiClassification{cat, tier, flags, yielded};
 }

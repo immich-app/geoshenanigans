@@ -2216,8 +2216,35 @@ static int run(int argc, char* argv[]) {
                         const char* r_office   = rel.tag("office");
 
                         PoiCategory poi_cat = PoiCategory::UNKNOWN;
+                        // A water multipolygon (poi_water_kind) that is a
+                        // rank-30 POI of another main tag in Nominatim, which
+                        // imports a multipolygon as it does a closed way, is
+                        // classified as a closed way is (classify_poi). Of the
+                        // water kinds, the scan takes bays and glaciers alone,
+                        // as below: a lake, a wetland or a reservoir is no POI
+                        // as its water kind in any tier.
+                        std::optional<PoiClassification> water_poi;
+                        const char* r_landuse = rel.tag("landuse");
+                        if (area_type && poi_water_kind(r_natural, r_landuse) != PoiCategory::UNKNOWN) {
+                            auto cls = classify_poi(r_tourism, rel.tag("historic"), r_boundary, rel.tag("amenity"),
+                                                    r_leisure, r_natural, rel.tag("railway"), r_aeroway,
+                                                    rel.tag("man_made"), rel.tag("building"), rel.tag("craft"),
+                                                    rel.tag("power"), r_place, rel.tag("waterway"), r_office,
+                                                    rel.tag("wikipedia"), rel.tag("wikidata"), rel.tag("highway"),
+                                                    rel.tag("shop"), r_landuse, rel.tag("emergency"), /*area=*/true);
+                            if (cls && cls->water != PoiCategory::UNKNOWN) {
+                                auto taken = [](PoiCategory c) {
+                                    return c == PoiCategory::BAY || c == PoiCategory::GLACIER;
+                                };
+                                if (cls->category == cls->water && !taken(cls->water)) continue;
+                                if (!taken(poi_water_of(cls->flags)))
+                                    cls->flags &= static_cast<uint8_t>(~POI_FLAG_WATER_MASK);
+                                water_poi = cls;
+                                poi_cat = cls->category;
+                            }
+                        }
                         // boundary
-                        if (r_boundary) {
+                        if (poi_cat == PoiCategory::UNKNOWN && r_boundary) {
                             if (std::strcmp(r_boundary, "national_park") == 0) poi_cat = PoiCategory::NATIONAL_PARK;
                             else if (std::strcmp(r_boundary, "protected_area") == 0) poi_cat = PoiCategory::PROTECTED_AREA;
                         }
@@ -2293,6 +2320,10 @@ static int run(int argc, char* argv[]) {
                                 }
                                 uint8_t tier = poi_get_default_tier(poi_cat);
                                 if ((flags & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA)) && tier > 1) tier--;
+                                if (water_poi) {
+                                    tier = water_poi->tier;
+                                    flags = water_poi->flags;
+                                }
 
                                 CollectedPoiRelation cpr;
                                 cpr.id = rel.id;

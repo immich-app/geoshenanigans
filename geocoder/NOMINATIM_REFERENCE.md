@@ -216,8 +216,14 @@ the lane takes no class `building`.
   those keeps its water category, though it ranks 30 in Nominatim. So does
   one beside `waterway=boatyard`, `lock_gate` or `access_point`, which rank
   30 (`address-levels.json:96-98`) where the builder takes no `waterway=*`
-  for a POI main tag. A
-  multipolygon bay or glacier keeps its category whatever it carries.
+  for a POI main tag.
+- Multipolygons: Nominatim imports one as it does a closed way, and the
+  builder classifies a water multipolygon that is a rank-30 POI of another
+  main tag as it does a closed way (a bay or a lake that is a swimming area
+  is a `SWIMMING_AREA`). Otherwise its relation scan takes only some keys,
+  and of the water kinds bays and glaciers alone: a multipolygon lake,
+  wetland or reservoir is no POI as its water kind, nor in the tiers that
+  don't ship the POI it is.
 - A water object of a generic rank-30 tag without a wiki tag stays water,
   out of the primary slot, where Nominatim's lane holds it as a POI.
 - The lower rank leaves out `boundary=administrative`, which ranks by an

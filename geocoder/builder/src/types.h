@@ -1036,6 +1036,10 @@ struct PoiClassification {
     PoiCategory category;
     uint8_t tier;
     uint8_t flags;
+    // The water kind of a water object that takes its category from a
+    // rank-30 tag instead (poi_classify.h classify_poi), UNKNOWN for any
+    // other.
+    PoiCategory water = PoiCategory::UNKNOWN;
 };
 
 struct PoiRecord {

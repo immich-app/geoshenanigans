@@ -321,6 +321,29 @@ TEST(poi_classify_a_water_object_that_yields_carries_its_kind_where_it_ships_in_
         }
 }
 
+TEST(poi_classify_names_the_water_kind_an_object_yields) {
+    // The relation scan classifies a water multipolygon by classify_poi
+    // where it yields, and keeps its own categories otherwise.
+    for (const WaterKind& kind : kWaterKinds) {
+        const auto pier = classify(with(water(kind), "man_made", "pier"));
+        REQUIRE(pier.has_value());
+        CHECK_EQ(uint8_t(pier->water), uint8_t(kind.category));
+        // Of a generic rank-30 tag without a wiki tag: the kind, as its category too.
+        const auto generic = classify(with(water(kind), "emergency", "suction_point"));
+        REQUIRE(generic.has_value());
+        CHECK_EQ(uint8_t(generic->water), uint8_t(kind.category));
+        CHECK_EQ(uint8_t(generic->category), uint8_t(kind.category));
+        for (const Tags& t : {water(kind), with(with(water(kind), "man_made", "pier"), "place", "locality")}) {
+            const auto plain = classify(t);
+            REQUIRE(plain.has_value());
+            CHECK_EQ(uint8_t(plain->water), uint8_t(PoiCategory::UNKNOWN));
+            CHECK_EQ(uint8_t(plain->category), uint8_t(kind.category));
+        }
+    }
+    Tags fountain; fountain.amenity = "fountain";
+    CHECK_EQ(uint8_t(classify(fountain)->water), uint8_t(PoiCategory::UNKNOWN));
+}
+
 TEST(poi_classify_a_water_object_keeps_its_category_beside_a_tag_of_no_rank_30) {
     // Values Nominatim's import drops (presets.lua), tags that are no main tag
     // there (power, man_made=dam), and ones whose rank is below 30 as well
