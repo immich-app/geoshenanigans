@@ -220,17 +220,18 @@ function writeFiles(dir, files) {
 
 // A water dir as the builder writes one (builder/src/water_layer.h), the admin files of a set of
 // their own: Testsee, a lake (type code 2, water_meta.json's water/lake) around (10.5, 20.5),
-// listed in the admin cell of COUNTRY_CELL, not interior. Its record carries its type code where
-// a boundary's carries a country code.
+// listed in the admin cell of COUNTRY_CELL (about 10.47 to 10.56 by 20.43 to 20.52), not
+// interior: the cell holds points outside it, as (10.5, 20.45). Its record carries its type code
+// where a boundary's carries a country code.
 function writeWater(dir) {
   mkdirSync(dir, { recursive: true });
   const [strings, [lake], size] = pool(['Testsee']);
   const [cells, entries] = adminIndex(COUNTRY_CELL, 0);
   writeFiles(dir, {
-    'admin_polygons.bin': Buffer.concat([u32(0), u32(lake), f32(0.04), u16(2), Buffer.from([0, 0])]),
+    'admin_polygons.bin': Buffer.concat([u32(0), u32(lake), f32(0.0004), u16(2), Buffer.from([0, 0])]),
     'admin_rings.bin': Buffer.from([(1 << 2) | 1, 0]),
     'arc_index.bin': u32(0),
-    'arc_vertices.bin': arcOf([[10.4, 20.4], [10.4, 20.6], [10.6, 20.6], [10.6, 20.4], [10.4, 20.4]]),
+    'arc_vertices.bin': arcOf([[10.49, 20.49], [10.49, 20.51], [10.51, 20.51], [10.51, 20.49], [10.49, 20.49]]),
     'admin_cells.bin': cells,
     'admin_entries.bin': entries,
     'strings_core.bin': fcc2(strings),
@@ -261,7 +262,8 @@ test('reverse geocoding inside the country finds it by its arcs', async () => {
 
 test('reverse geocoding finds the water of the dataset\'s water dir, last in the answer', async () => {
   const dir = dataset(['Testville', 'Otherton']);
-  const dry = await Geocoder.load(dir).reverseGeocode(10.5, 20.5);
+  const without = Geocoder.load(dir);
+  const [dry, dryBeside] = [await without.reverseGeocode(10.5, 20.5), await without.reverseGeocode(10.5, 20.45)];
   writeWater(join(dir, 'water'));
   const geocoder = Geocoder.load(dir);
 
@@ -269,7 +271,8 @@ test('reverse geocoding finds the water of the dataset\'s water dir, last in the
 
   assert.equal(wet, `${dry.slice(0, -1)},"water":{"name":"Testsee","class":"water","type":"lake"}}`);
   assert.equal(JSON.parse(wet).address.country, 'Testland');
-  assert.equal(await geocoder.reverseGeocode(10.3, 20.5), await Geocoder.load(dataset(['Testville', 'Otherton'])).reverseGeocode(10.3, 20.5));
+  // Beside the lake in the cell that lists it: the answer without water, byte for byte.
+  assert.equal(await geocoder.reverseGeocode(10.5, 20.45), dryBeside);
 });
 
 test('reverse geocoding off the globe finds nothing', async () => {
