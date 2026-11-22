@@ -191,12 +191,13 @@ Nominatim has THREE sources for postcodes, combined into the `location_postcodes
 - OSM `boundary=postal_code` relations with admin_level=11
 - These have actual polygon geometry
 - Stored with `osm_id IS NOT NULL` in location_postcodes
-- **We use these at build time**: a street (way_postcodes.bin) and a POI (`parent_postcode_id`) inherit the postcode of the postal boundary containing them. Like Nominatim, which reads the stored `placex.postcode`, the server does no point-in-polygon on postal boundaries
+- **We use these at build time**: a street (way_postcodes.bin) and a POI (`parent_postcode_id`) inherit the postcode of the postal boundary containing them. They are admin polygons of level 11, so the server also finds the smallest one holding the query point, for `get_nearest_postcode()` below
 
 ### Source 2: addr:postcode tags on places (`placex` table)
 - Any OSM object with an `address->'postcode'` hstore entry
 - Nominatim collects `(country_code, postcode, centroid)` from ALL objects in placex that have addr:postcode
 - These create **artificial postcode centroids** — computed as the average position of all objects sharing that postcode
+- Each one covers a box around its centroid (`expand_by_meters(centroid, extent)`, postcodes.py), the `extent` of its country's postcode pattern in `country_settings.yaml`: US 25,000 m, GB and IM 700 m, NL 800 m, CH, EE and JP 3,000 m, GG, LU and PT 1,000 m, LI 4,000 m, RO 2,500 m, IE 50 m, Nigeria's lettered pattern 1 m, and 5,000 m elsewhere
 - Stored with `osm_id IS NULL` in location_postcodes
 - Only used for areas NOT already covered by postcode boundary polygons (line 342: `NOT EXISTS(SELECT * FROM _global_postcode_area ...)`)
 - **We implement this**: the builder keeps each address point's addr:postcode (addr_postcodes.bin) and averages the address points of each (country, postcode) into postcode_centroids.bin
@@ -209,9 +210,9 @@ Nominatim has THREE sources for postcodes, combined into the `location_postcodes
 
 ### How postcodes are resolved at query time
 
-`get_nearest_postcode()` in `utils.sql`:
+`get_nearest_postcode()` in `utils.sql` (5.3 and master), which `placex_update` calls at index time for a feature that has no postcode of its own, from its parent street or from its address areas:
 1. For polygon results: find postcode whose centroid is inside the polygon (must be exactly 1)
-2. For point results: find postcode whose coverage area contains the point, ordered by distance to centroid
+2. For point results: the postcodes of the country whose geometry covers the point, `ORDER BY osm_id is null, ST_Distance(p.centroid, geom)`: a postal area first, then the artificial postcodes' boxes, each by the distance to its centroid in plain degrees (geometry 4326)
 
 The postcode is also populated from the `place_addressline` chain — if a street/building has addr:postcode, it appears in the address rows directly.
 
@@ -221,4 +222,6 @@ The postcode is also populated from the `place_addressline` chain — if a stree
 
 0. An address point's own addr:postcode (addr_postcodes.bin)
 1. A street's or POI's postcode inherited from its postal boundary at build time (way_postcodes.bin, `parent_postcode_id`); for a US street, the ZIP of a TIGER line of that street within ~100 m (interp_postcodes.bin)
-2. The nearest postcode centroid of the same country within 0.05° (postcode_centroids.bin, as `get_nearest_postcode()`)
+2. `get_nearest_postcode()` for a point, at the query point: the postcode of the smallest postal area holding it (Nominatim takes the covering area whose centroid is nearest); else the postcode centroid of the same country nearest it in plain degrees among those whose box holds it (postcode_centroids.bin). A centroid of no country stands for one of the point's, and where the point has no country every centroid counts, each with its own country's box
+
+Nominatim keeps only postal areas whose postcode matches the country's pattern (`_update_postcode_areas`); the builder keeps every `boundary=postal_code` relation with a postcode.
