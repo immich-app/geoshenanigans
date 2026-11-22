@@ -326,3 +326,15 @@ TEST(a_node_the_input_lacks_leaves_a_gap_that_no_water_ring_or_line_crosses) {
     const std::vector<std::string> names = planet_water_names(objects, root.path() + "/out");
     CHECK(names == std::vector<std::string>({"Run River", "Whole Lake"}));
 }
+
+TEST(two_inputs_that_hold_the_same_objects_write_the_water_dirs_one_does) {
+    const ScratchDir root("water-two-inputs");
+    const std::string pbf = root.path() + "/water.osm.pbf", log = root.path() + "/build.log";
+    write_test_pbf(pbf, fixture(), 1000);
+    const std::string one = root.path() + "/one", two = root.path() + "/two";
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, one, pbf, "--multi-output", "--multi-quality"}, log));
+    REQUIRE(gctest::run({GEOCODER_BUILD_INDEX_BIN, two, pbf, pbf, "--multi-output", "--multi-quality"}, log));
+    const auto a = tree(one + "/planet/water"), b = tree(two + "/planet/water");
+    REQUIRE(a.size() > 10);
+    CHECK(a == b);
+}

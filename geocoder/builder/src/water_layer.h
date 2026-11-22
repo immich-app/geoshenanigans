@@ -133,7 +133,9 @@ struct LineIn {
     std::string way_en;
 };
 
-// Everything the passes collect for the layer.
+// Everything the passes collect for the layer, over every input: each
+// input's objects after the last one's, so of an object two inputs hold
+// the first input's copy comes first (and its way geometry is the one kept).
 struct Collected {
     std::vector<CollectedArea> relations;
     std::vector<CollectedWaterway> waterways;
@@ -148,8 +150,9 @@ struct Collected {
     std::vector<marine::Area> marine;
 };
 
-// Sorts the relations and waterways by id and indexes the waterways' member
-// ways (Collected::waterway_of_way).
+// Sorts the relations and waterways by id, each once (of copies, the first
+// input's), and indexes the waterways' member ways
+// (Collected::waterway_of_way).
 void index_collected(Collected& c);
 
 // The key and display name of a waterway=river or canal way, given its
@@ -191,7 +194,8 @@ struct Build {
 // geometry as admin relations are: one polygon per outer ring with the holes
 // in it) and closed way into polygons, then takes the marine areas' as they
 // are, in object order (ways by id, relations by id, then marine areas by
-// id), each ring rotated as canonicalize_ring_rotation puts it, with its way
+// id; of an object or line two inputs hold, the first input's copy alone),
+// each ring rotated as canonicalize_ring_rotation puts it, with its way
 // runs (a marine ring's marine::ring_runs). A relation with a member way the
 // passes didn't find is left out. Uses up the collected areas and
 // geometries; moves the lines into the build's NamingLines, keys and names

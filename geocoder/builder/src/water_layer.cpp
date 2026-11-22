@@ -150,13 +150,18 @@ PolygonSlots polygon_slots(const Layer& layer, const std::vector<uint32_t>& ids,
 
 const std::vector<uint64_t> kNone;
 
+// Sorts `v` by id (`id_of`), each id once: of copies, the first in `v`.
+template <class T, class Id>
+void first_of_each_id(std::vector<T>& v, Id id_of) {
+    std::stable_sort(v.begin(), v.end(), [&](const T& a, const T& b) { return id_of(a) < id_of(b); });
+    v.erase(std::unique(v.begin(), v.end(), [&](const T& a, const T& b) { return id_of(a) == id_of(b); }), v.end());
+}
+
 }  // namespace
 
 void index_collected(Collected& c) {
-    std::sort(c.relations.begin(), c.relations.end(),
-              [](const CollectedArea& a, const CollectedArea& b) { return a.id < b.id; });
-    std::sort(c.waterways.begin(), c.waterways.end(),
-              [](const CollectedWaterway& a, const CollectedWaterway& b) { return a.id < b.id; });
+    first_of_each_id(c.relations, [](const CollectedArea& a) { return a.id; });
+    first_of_each_id(c.waterways, [](const CollectedWaterway& w) { return w.id; });
     c.waterway_of_way.clear();
     for (uint32_t i = 0; i < c.waterways.size(); i++)
         for (int64_t way : c.waterways[i].ways) c.waterway_of_way.emplace(way, i);
@@ -188,12 +193,10 @@ Build assemble(Collected& c, unsigned threads) {
     if (threads == 0) threads = parallel_threads();
     Build b;
 
-    // The objects: closed ways by id, then relations by id.
-    std::sort(c.closed_ways.begin(), c.closed_ways.end(),
-              [](const ClosedWayArea& x, const ClosedWayArea& y) { return x.way < y.way; });
-    c.closed_ways.erase(std::unique(c.closed_ways.begin(), c.closed_ways.end(),
-                                    [](const ClosedWayArea& x, const ClosedWayArea& y) { return x.way == y.way; }),
-                        c.closed_ways.end());
+    // The objects: closed ways by id, then relations by id; of an object two
+    // inputs hold, the first input's copy.
+    first_of_each_id(c.closed_ways, [](const ClosedWayArea& w) { return w.way; });
+    first_of_each_id(c.relations, [](const CollectedArea& a) { return a.id; });
 
     // Each relation's polygons, assembled on every core.
     struct Assembled {
@@ -296,10 +299,9 @@ Build assemble(Collected& c, unsigned threads) {
     }
     free_storage(c.marine);
 
-    // The candidate lines, by way, their keys and names as sorted indices.
-    std::sort(c.lines.begin(), c.lines.end(), [](const LineIn& x, const LineIn& y) { return x.way < y.way; });
-    c.lines.erase(std::unique(c.lines.begin(), c.lines.end(), [](const LineIn& x, const LineIn& y) { return x.way == y.way; }),
-                  c.lines.end());
+    // The candidate lines, by way (the first input's copy), their keys and
+    // names as sorted indices.
+    first_of_each_id(c.lines, [](const LineIn& l) { return l.way; });
     // A waterway relation of a local name alone shows the name:en most of its
     // river ways carry, the smaller of a tie.
     {

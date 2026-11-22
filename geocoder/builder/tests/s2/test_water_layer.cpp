@@ -650,6 +650,29 @@ TEST(a_lake_the_major_tier_held_stays_in_it_at_95_km2_once_its_smallest_vertex_m
     CHECK(!lake_major(build(with_lake(105700))));
 }
 
+TEST(an_object_two_inputs_hold_is_one_object_as_the_first_input_gives_it) {
+    // The fixture as two inputs give it: the second input's copies of the
+    // lake relation, the pond and the main line come after the first
+    // input's, with other names.
+    Collected c = fixture();
+    CollectedArea lake = c.relations[0];
+    lake.tags.name = lake.tags.local_name = "Other Lake";
+    c.relations.push_back(lake);
+    ClosedWayArea pond = c.closed_ways[0];
+    pond.tags.name = pond.tags.local_name = "Other Pond";
+    c.closed_ways.push_back(pond);
+    LineIn main = c.lines[0];
+    main.display = "Other River";
+    c.lines.push_back(main);
+    const Layer twice = build(c), once = build(fixture());
+    REQUIRE(twice.size() == once.size());
+    for (size_t p = 0; p < once.size(); p++) {
+        CHECK(name_of(twice, p) == name_of(once, p));
+        CHECK_EQ(twice.identities[p], once.identities[p]);
+        CHECK_EQ(twice.records[p].area, once.records[p].area);
+    }
+}
+
 TEST(a_waterway_relation_of_a_local_name_alone_shows_the_name_en_most_of_its_river_ways_carry) {
     Collected c = fixture();
     CollectedWaterway local, english;
