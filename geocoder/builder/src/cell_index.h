@@ -16,8 +16,8 @@
 
 void write_index(const ParsedData& data, const std::string& output_dir, IndexMode mode);
 
-// Tier t's covering of its set's polygons (kArcTiers[t], of `arcs` over the
-// store), per arc: each arc's boundary cells once (admin_arc_cells over the
+// Tier t's covering of its set's polygons (the stage's tier t, of `arcs` over
+// the store), per arc: each arc's boundary cells once (admin_arc_cells over the
 // vertices the tier stores of it), each polygon's the merge of its rings'
 // arcs' (merge_cell_lists), classified over its rings as the tier stores
 // them, the store's own for the exact tier (admin_polygon_cells, at

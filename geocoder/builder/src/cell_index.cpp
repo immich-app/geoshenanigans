@@ -826,7 +826,7 @@ struct ArcCells {
 };
 
 ArcCells tier_arc_cells(const AdminArcs& arcs, const AdminExactRings& store, size_t t, unsigned threads) {
-    const ArcTier& tier = kArcTiers[t];
+    const ArcTier& tier = arcs.stage->tiers[t];
     const size_t n = tier.set == ArcSet::Full ? arcs.arcs.size() : arcs.minimal.arcs.size();
     // Longest first, a few at a time: started last, a long arc would leave
     // one core working alone.
@@ -878,7 +878,7 @@ ArcCells tier_arc_cells(const AdminArcs& arcs, const AdminExactRings& store, siz
 AdminTierCells admin_tier_cells(const AdminArcs& arcs, const AdminExactRings& store, size_t t, unsigned threads,
                                 const std::function<void(const char*)>& phase_done) {
     if (threads == 0) threads = parallel_threads();
-    const ArcTier& tier = kArcTiers[t];
+    const ArcTier& tier = arcs.stage->tiers[t];
     // The exact tier's rings are the store's own: the same cycles its arcs chain.
     const bool exact = tier.set == ArcSet::Full && !tier.simplifies();
     const std::vector<uint32_t>& ring_refs = tier.set == ArcSet::Full ? arcs.ring_refs : arcs.minimal.ring_refs;

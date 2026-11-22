@@ -180,6 +180,7 @@ struct AdminArcCounts {
     size_t arcs_without_ways = 0;  // of rings with no way runs: no way-set key
     size_t shared_way_sets = 0;    // arcs whose way-set key an earlier one has
     size_t shared_ends = 0;        // arcs whose ends key an earlier one has
+    size_t way_ends = 0;           // ArcCuts::JunctionsAndWayEnds: vertices where a ring's member ways meet
 };
 
 struct AdminArcSlotCounts {
@@ -365,8 +366,10 @@ struct ArcTierState {
 };
 
 // The arcs of every admin polygon's rings (the full set), and the minimal
-// set over them.
+// set over them; or, for another stage (ArcStage), the arcs of its store's
+// rings and its tiers.
 struct AdminArcs {
+    const ArcStage* stage = &kAdminArcStage;
     // In presentation order; their views read the exact ring store, so only
     // while it lives.
     std::vector<Arc> arcs;
@@ -384,7 +387,7 @@ struct AdminArcs {
     AdminArcCounts counts;
     AdminArcSlotCounts slot_counts;
     MinimalArcs minimal;
-    // Parallel to kArcTiers.
+    // Parallel to the stage's tiers.
     std::vector<ArcTierState> tiers;
     size_t rings_nest_raw = 0;  // polygons whose exact rings don't nest (rings_nest)
 };
@@ -432,9 +435,12 @@ private:
 // way runs along it in every ring, and every ring's refs. On at most
 // `threads` threads, with the same result on any number and in any ring
 // order. Aborts (std::logic_error) unless each ring with way runs has them
-// over all of its edges. `phase_done` is told as each step ends.
+// over all of its edges. `phase_done` is told as each step ends. With
+// ArcCuts::JunctionsAndWayEnds, the first vertex of each way run of every
+// ring of more than one is a junction too, in every ring through it.
 AdminArcs build_arc_topology(const AdminExactRings& store, unsigned threads,
-                             const std::function<void(const char*)>& phase_done = {});
+                             const std::function<void(const char*)>& phase_done = {},
+                             ArcCuts cuts = ArcCuts::Junctions);
 
 struct ArcSlots {
     std::vector<uint32_t> slots;  // by presentation order
@@ -468,13 +474,17 @@ ArcSlots allocate_arc_slots(const std::vector<uint64_t>& keys, const std::string
 // passes' too.
 std::string arc_slot_start_lines(const std::string& region, ArcSet set, const std::string& prev_sidecar,
                                  const AdminArcSlotCounts& counts);
+// The same for a set its lines call `set_word` (set=water).
+std::string arc_slot_start_lines(const std::string& region, const char* set_word, const std::string& prev_sidecar,
+                                 const AdminArcSlotCounts& counts);
 
-// Where a region's arc sidecars sit under its dir: the full set's with the
-// exact tier, the minimal set's with admin-minimal. arc_index.osm_ids holds
-// the slots (IdAllocator's), arc_index.fallback.osm_ids their arcs' fallback
-// keys.
-std::string arc_sidecar_path(const std::string& region_dir, ArcSet set);
-std::string arc_fallback_sidecar_path(const std::string& region_dir, ArcSet set);
+// Where a region's arc sidecars sit under its dir: the full set's in the
+// stage's sidecar dir (the exact tier's), the minimal set's with
+// admin-minimal. arc_index.osm_ids holds the slots (IdAllocator's),
+// arc_index.fallback.osm_ids their arcs' fallback keys.
+std::string arc_sidecar_path(const std::string& region_dir, ArcSet set, const ArcStage& stage = kAdminArcStage);
+std::string arc_fallback_sidecar_path(const std::string& region_dir, ArcSet set,
+                                      const ArcStage& stage = kAdminArcStage);
 
 // arc_index.fallback.osm_ids: a header of u32 magic, u32 version and u32
 // slot count, then each slot's ArcFallbackKeys (16 B) in slot order,
@@ -613,6 +623,12 @@ void tier_ring(const AdminArcs& arcs, const AdminExactRings& store, const ArcTie
 AdminArcs build_admin_arcs(const AdminExactRings& store, const std::vector<bool>& in_minimal,
                            const std::string& prev_planet_dir, unsigned threads);
 
+// The same for `stage`: its cuts and its tiers; a stage with no tier of the
+// minimal set has none (no slots, every ring without minimal refs), and
+// `in_minimal` is then unread.
+AdminArcs build_arc_stage(const ArcStage& stage, const AdminExactRings& store, const std::vector<bool>& in_minimal,
+                          const std::string& prev_planet_dir, unsigned threads);
+
 // Ring `ring` of the store as set `set`'s refs chain its arcs: each arc
 // walked as its ref says, a junction two arcs share once, ending where it
 // starts. A ring of no minimal polygon has no minimal refs and no vertices.
@@ -676,10 +692,12 @@ struct ArcSetBlocks {
     bool has_ring(uint32_t r) const { return ring_refs[r + 1] > ring_refs[r]; }
 };
 
-// A region's encoded arcs: the sets, each tier's arc blocks (parallel to
-// kArcTiers, over its set's arcs), and every polygon's place in them
-// (parallel to ParsedData::admin_polygons). Empty unless the arc stage ran.
+// A region's encoded arcs: the sets, each tier's arc blocks (parallel to the
+// stage's tiers, over its set's arcs), and every polygon's place in them
+// (parallel to ParsedData::admin_polygons, or to the stage's records). Empty
+// unless the arc stage ran.
 struct AdminArcBlocks {
+    const ArcStage* stage = &kAdminArcStage;
     std::vector<AdminArcPolygon> polygons;
     ArcSetBlocks sets[2];  // by ArcSet
     ArcBlocks tiers[kArcTierCount];
@@ -774,11 +792,21 @@ std::vector<uint32_t> arc_at_slot(const ArcSetBlocks& set);
 // refs. It has no slots or ring blocks until assign_region_arc_slots.
 AdminArcBlocks subset_admin_arcs(const AdminArcBlocks& planet, const std::vector<uint32_t>& polygons, unsigned threads);
 
-// A continent's own slots for each set, against its previous build's
-// sidecars under `prev_region_dir` (none when empty), its arcs presented in
-// the planet's order; then its ring blocks with them. Logs the slots.
+// A continent's own slots for each set of its stage, against its previous
+// build's sidecars under `prev_region_dir` (none when empty), its arcs
+// presented in the planet's order; then its ring blocks with them. Logs the
+// slots.
 void assign_region_arc_slots(AdminArcBlocks& blocks, const std::string& prev_region_dir, const std::string& region,
                              unsigned threads);
+
+// The full set's own slots against the sidecars at `prev_sidecar` and
+// `prev_fallback_sidecar` (none when empty), then its ring blocks: a subset
+// of a region's arcs with sidecars of its own (water's major tier). Its log
+// lines name `region`, the stage's set_word and the words `labels` (as
+// "dir=major"). Returns them.
+std::string assign_full_set_slots(AdminArcBlocks& blocks, const std::string& prev_sidecar,
+                                  const std::string& prev_fallback_sidecar, const std::string& region,
+                                  const std::string& labels, unsigned threads);
 
 // A tier dir's arc files: arc_index.bin (each slot's block offset in
 // arc_vertices.bin, a u32) and arc_vertices.bin (the blocks in slot order, a
