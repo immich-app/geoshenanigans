@@ -192,3 +192,65 @@ TEST(a_cut_puts_its_vertex_where_it_does_with_the_edge_run_the_other_way) {
     CHECK_EQ(both({0, 0}, {10, 3}, 1), int64_t(3));
     CHECK_EQ(both({0, 0}, {-10, 3}, 2), int64_t(-7));
 }
+
+TEST(each_stretch_of_cut_is_one_edge_of_both_pieces_beside_it_when_one_side_is_cut_again) {
+    // A lake of 1.6 x 1.6 degrees whose 20 islands all lie west of its first
+    // cut, a meridian: the west side is cut again along a parallel, the east
+    // side not, and the east side's edge along the meridian takes the
+    // vertex where the parallel meets it.
+    SplitPolygon p;
+    p.outer = box_ring(470000000, 80000000, 16000000, 16000000, 1000);
+    for (int i = 0; i < 10; i++)
+        for (int j = 0; j < 2; j++) {
+            SplitRing h = box_ring(470500000 + i * 1500000, 80500000 + j * 1500000, 100000, 100000, 10 * (i * 2 + j) + 10);
+            std::reverse(h.v.begin(), h.v.end());
+            p.holes.push_back(h);
+        }
+    size_t lines = 0;
+    const std::vector<SplitPolygon> pieces = split_polygon(p, 12, &lines);
+    REQUIRE(pieces.size() == 3u);
+    CHECK_EQ(lines, size_t(2));
+    std::map<std::pair<uint64_t, uint64_t>, int> cut_edges;
+    auto key = [](PackedLocation a) { return uint64_t(uint32_t(a.lat_e7)) << 32 | uint32_t(a.lon_e7); };
+    for (const SplitPolygon& q : pieces) {
+        REQUIRE(q.outer.v.size() == q.outer.way.size());
+        for (size_t i = 0; i < q.outer.v.size(); i++)
+            if (q.outer.way[i] < 0) cut_edges[std::minmax(key(q.outer.v[i]), key(q.outer.v[(i + 1) % q.outer.v.size()]))]++;
+    }
+    CHECK_EQ(cut_edges.size(), size_t(3));
+    for (const auto& [edge, n] : cut_edges) CHECK_EQ(n, 2);
+    std::mt19937 rng(14);
+    std::uniform_int_distribution<int32_t> lat(469000000, 487000000), lng(79000000, 97000000);
+    for (int k = 0; k < 20000; k++) {
+        const PackedLocation q = pt(lat(rng), lng(rng));
+        CHECK_EQ(holders(pieces, q), split_detail::polygon_contains(p, q) ? 1 : 0);
+    }
+}
+
+TEST(pieces_that_hold_other_points_pass_the_check_only_where_those_lie_on_a_cut) {
+    // A square of 8 e7 units a side, every unit a vertex, its edges a way of
+    // a marine coast's (negative, as cuts are).
+    auto square = [](int32_t lat, int32_t lat_hi, int64_t south, int64_t north) {
+        SplitRing r;
+        for (int32_t g = 0; g < 8; g++) r.v.push_back(pt(lat, g)), r.way.push_back(south);
+        for (int32_t a = lat; a < lat_hi; a++) r.v.push_back(pt(a, 8)), r.way.push_back(-7);
+        for (int32_t g = 8; g > 0; g--) r.v.push_back(pt(lat_hi, g)), r.way.push_back(north);
+        for (int32_t a = lat_hi; a > lat; a--) r.v.push_back(pt(a, 0)), r.way.push_back(-7);
+        return r;
+    };
+    SplitPolygon whole, south, north;
+    whole.outer = square(0, 8, -7, -7);
+    // Its south half alone: the points north of it are the polygon's and no
+    // piece's, though each shares its longitude with a vertex of the piece.
+    south.outer = square(0, 4, -7, -7);
+    CHECK(!split_detail::pieces_hold(whole, {south}, {}));
+    // Pieces that both hold latitude 4, the north one's cut along it: only
+    // the points there are held twice, and they lie on the cut.
+    const int64_t cut = split_detail::cut_way_of(4, false);
+    south.outer = square(0, 5, -7, -7);
+    north.outer = square(4, 8, cut, -7);
+    CHECK(split_detail::pieces_hold(whole, {south, north}, {cut}));
+    // The same pieces, the cut another line's: the points held twice are on
+    // none of this split's cuts.
+    CHECK(!split_detail::pieces_hold(whole, {south, north}, {split_detail::cut_way_of(5, false)}));
+}
