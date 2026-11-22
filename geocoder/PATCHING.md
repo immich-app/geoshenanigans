@@ -415,11 +415,14 @@ Quality changes don't require patching — just download the new quality files:
 ### Switching Water
 
 The water dir is a set of its own, so a switch downloads the new value's
-files into `<dataset>/water/` (or removes that dir, for `none`), as a fresh
-install does, with no patch. The server's downloader does so when a
-configuration's `water` changes: it removes the files of `water/` the new
+files into `<dataset>/water/` (or removes the water layer's files, for
+`none`), as a fresh install does, with no patch. On the server, a
+`PUT /admin/configuration` whose `water` (or another axis) changes downloads
+each loaded region again: the download removes the files of `water/` the new
 value doesn't take and fetches the ones it does, its ledger naming each
-`water/<name>`.
+`water/<name>`, and the region loads again once that is in, answering from the
+files it had until then (and where the download fails). Other names in
+`water/` stay, and a dir holding none of the water files has no water.
 
 ### Switching Region
 
