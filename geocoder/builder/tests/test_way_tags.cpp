@@ -49,7 +49,9 @@ TEST(way_tags_parse_picks_known_keys) {
     CHECK(t.landuse == nullptr);
     CHECK(t.emergency == nullptr);
 
-    const WayTags pond = TagBlock({{"natural", "water"}, {"emergency", "fire_water_pond"}, {"ele", "412"}}).parse();
+    // WayTags points into the block's strings, which outlive it here.
+    const TagBlock pond_tags({{"natural", "water"}, {"emergency", "fire_water_pond"}, {"ele", "412"}});
+    const WayTags pond = pond_tags.parse();
     REQUIRE(pond.emergency && pond.natural && pond.ele);
     CHECK_EQ(std::string(pond.emergency), "fire_water_pond");
     CHECK_EQ(std::string(pond.ele), "412");
