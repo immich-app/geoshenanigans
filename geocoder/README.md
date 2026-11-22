@@ -210,6 +210,35 @@ are ready, and is asked again after the `Retry-After`; one whose index
 failed says why. A server without `/datasets`, or whose `/datasets` names
 no indexes, shows no search.
 
+A column can also show what a photo at the point gets in Immich today:
+"Immich today (GeoNames cities500)", `dataset=immich-cities500`, which
+`/datasets` lists under `others` (`kind: "immich"`, with the release and
+the date of its geodata). The portal's image copies the geodata of
+`ghcr.io/immich-app/immich-server:release` as it is when the image is built
+(its `/build/geodata`: GeoNames' `cities500.txt`, `admin1CodesASCII.txt`,
+`admin2Codes.txt` and `countryInfo.txt`, Natural Earth's
+`ne_10m_admin_0_countries.geojson`, `geodata-date.txt`) and the release's
+tag and commit, and `/reverse` answers as that release's
+`MapRepository.reverseGeocode` does (`server/src/portal/immich.rs`): the
+cities500 place, but the PPLX outside Australia and the PPLH, nearest by
+`earth_distance` among those in `earth_box` of 25 km about the point (a
+cube on earthdistance's sphere of 6378168 m, so a place in its corner up to
+~43 km away counts), its name the city, its admin1 name the state and its
+country code's `countryInfo.txt` name the country; with none in the box,
+the first Natural Earth polygon whose outer ring holds the point (Postgres'
+`polygon @> point`, its edge too; holes are not read), its `ADM0_A3`'s
+name the country (24 codes, Kosovo's `KOS` among them, have none); else
+nothing, and at 0, 0 nothing, which Immich takes for no GPS. Of places at
+one distance the first in the file wins. The answer, JSON of no build
+(`X-Geocoder-Dataset` alone), gives what Immich stores as
+`immich.stored` (`city`, `state`, `country`) and as `address` and
+`display_name` for the page's field table, and how it found it:
+`immich.how` (`cities500`, `natural_earth`, `nothing` or `no_gps`), the
+place (`geonameid`, name, point, codes, `distance_m`,
+`beyond_max_distance`) and `in_box`, or the Natural Earth row. The column
+has no search and no polygons (`/search` and `/polygons` of it are a 400),
+and its search head says so; feedback of it carries its dataset id.
+
 Someone who disagrees with an answer can tell us what they expected. Each
 column's answer in the detail and each column's search has a "Disagree?"
 button, and the toolbar's Feedback sends a general report. Its form sends

@@ -127,6 +127,7 @@ fn config_at(url: &str, load: Loader) -> Config {
         open_search: Arc::new(search::open_search),
         search_jobs: 4,
         free_space: |_| Ok(u64::MAX),
+        immich: None,
     }
 }
 
@@ -2084,3 +2085,7 @@ mod search_tests;
 // The feedback's tests, as the place search's.
 #[path = "feedback_tests.rs"]
 mod feedback_tests;
+
+// The Immich column's tests, as the place search's.
+#[path = "immich_tests.rs"]
+mod immich_tests;

@@ -36,8 +36,9 @@ required-features = ["portal"]
 
 [features]
 # query-portal's server: the dependencies of query-server's own that its sources take.
+# float_roundtrip: the Immich column reads Natural Earth's GeoJSON to the bit, as JSON.parse does.
 portal = ["dep:axum", "dep:tokio", "dep:reqwest", "dep:arc-swap", "dep:bcrypt", "dep:getrandom", "dep:http-body", "dep:libc",
-          "dep:serde", "dep:futures-util", "dep:bytes"]
+          "dep:serde", "dep:futures-util", "dep:bytes", "serde_json/float_roundtrip"]
 
 [dependencies]
 fst = "0.4"
