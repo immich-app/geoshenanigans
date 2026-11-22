@@ -290,7 +290,7 @@ inline __int128 polygon_area2(const SplitPolygon& poly) {
 }  // namespace split_detail
 
 // Why split_polygon left a polygon whole.
-enum class SplitRefusal : uint8_t { None, FewHoles, Cut, Sample, WayRuns };
+enum class SplitRefusal : uint8_t { None, FewHoles, Cut, Sample, WayRuns, Uncut };
 
 inline const char* refusal_name(SplitRefusal r) {
     switch (r) {
@@ -299,6 +299,7 @@ inline const char* refusal_name(SplitRefusal r) {
         case SplitRefusal::Cut: return "crossings that don't pair up";
         case SplitRefusal::Sample: return "pieces holding other points";
         case SplitRefusal::WayRuns: return "way runs that don't cover its rings";
+        case SplitRefusal::Uncut: return "no cut leaves it in more than one piece";
     }
     return "";
 }
@@ -386,6 +387,8 @@ inline std::vector<SplitPolygon> split_polygon(const SplitPolygon& polygon, uint
             }
         }
     }
+
+    if (done.size() == 1) return refuse(SplitRefusal::Uncut);
 
     // The check: at sample points over its box exactly the pieces the
     // polygon holds hold the point, one.
