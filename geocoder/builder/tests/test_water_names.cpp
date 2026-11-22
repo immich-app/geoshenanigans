@@ -58,3 +58,15 @@ TEST(the_choice_is_the_same_whatever_order_the_credits_arrive_in) {
         CHECK_EQ(a[o].mm, b[o].mm);
     }
 }
+
+TEST(a_choice_carries_the_lowest_wikidata_item_of_its_keys_lines_in_the_object) {
+    // Object 0 takes key 1, whose lines in it carry Q9 and Q4 (and none);
+    // key 0's Q2 is another river's. Object 1's key has no item.
+    std::vector<Credit> credits = {
+        {0, 1, 3, 300, 9}, {0, 1, 2, 400, 4}, {0, 1, 3, 200, 0}, {0, 0, 1, 800, 2}, {1, 5, 7, 100, 0},
+    };
+    const std::vector<NameChoice> choices = pick_names(credits, 2, 1);
+    CHECK_EQ(choices[0].key, 1u);
+    CHECK_EQ(choices[0].qid, 4u);
+    CHECK_EQ(choices[1].qid, 0u);
+}

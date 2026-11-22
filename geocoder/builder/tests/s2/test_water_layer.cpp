@@ -587,6 +587,37 @@ TEST(an_osm_bay_or_strait_of_a_marine_areas_name_that_it_overlaps_is_left_out) {
     CHECK_EQ(marine, size_t(3));
 }
 
+TEST(namesakes_apart_are_rivers_of_their_own_and_a_line_lends_its_wikidata_item_only_where_it_runs) {
+    Collected c = fixture();
+    // Four unnamed river areas far apart, each with a line of a local name
+    // alone, Mill Creek, in it: two of about 61 km2 (123 together), one of
+    // about 6.7 km2 whose line has a wikidata item, and one of that size
+    // whose line has none.
+    struct Reach {
+        int64_t way;
+        int32_t lat, side;
+        uint32_t qid;
+    };
+    const std::vector<Reach> reaches = {{2101, kLat - 3000000, 850000, 0},
+                                        {2102, kLat - 4000000, 850000, 0},
+                                        {2103, kLat - 5000000, 280000, 5},
+                                        {2104, kLat - 6000000, 280000, 0}};
+    for (const Reach& r : reaches) {
+        c.closed_ways.push_back({r.way, tags(code::kRiver, "", true), square(r.lat, kLng, r.side)});
+        LineIn line;
+        line.way = r.way + 1000;
+        line.key = "nMill Creek";
+        line.local = line.display = "Mill Creek";
+        line.qid = r.qid;
+        line.vertices = {pt(r.lat + r.side / 2, kLng + r.side / 10), pt(r.lat + r.side / 2, kLng + r.side * 9 / 10)};
+        c.lines.push_back(line);
+    }
+    const Layer layer = build(c);
+    const auto [held, major] = ways_held(layer, {2101, 2102, 2103, 2104});
+    CHECK(held == std::set<int64_t>({2101, 2102, 2103, 2104}));
+    CHECK(major == std::set<int64_t>({2103}));
+}
+
 TEST(a_waterway_relation_of_a_local_name_alone_shows_the_name_en_most_of_its_river_ways_carry) {
     Collected c = fixture();
     CollectedWaterway local, english;

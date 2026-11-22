@@ -171,7 +171,7 @@ struct Object {
     double area_deg2 = 0;  // its polygons' exact areas, square degrees
     double km2 = 0;
     uint32_t name_key = UINT32_MAX;  // the naming key it took (NamingLines::keys), UINT32_MAX for none
-    uint32_t key_qid = 0;            // that key's wikidata item, 0 for none
+    uint32_t key_qid = 0;            // the lowest wikidata item of that key's lines in it, 0 for none
 };
 
 // The layer's build over the planet's objects, step by step (build_index.cpp
@@ -226,8 +226,9 @@ std::shared_ptr<TypeTable> type_table(const Build& b, const std::string& prev_pl
 
 // The major tier of the planet (water_classify.h): each object by its own
 // area, and each river object by its river's, the river objects grouped by
-// their naming key (a waterway relation or a local name), by wikidata item
-// and by local name along river polygons that share an arc; an object or
+// their waterway relation (a naming key of one), by wikidata item (theirs,
+// or that of a line of their key in them) and by local name along river
+// polygons that share an arc; an object or
 // river whose polygon the previous planet build's major tier held (its
 // sidecar, water/major/simplified/admin_polygons.osm_ids under
 // prev_planet_dir) keeps it at kMajorKeepPercent. Logs how many it holds.

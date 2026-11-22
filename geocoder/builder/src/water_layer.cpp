@@ -537,7 +537,7 @@ size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
         Object& obj = b.objects[o];
         if (o < choices.size() && choices[o].named()) {
             obj.name_key = choices[o].key;
-            // The key's wikidata item: a line of it inside carries it.
+            obj.key_qid = choices[o].qid;
             if (obj.tags.name.empty()) {
                 obj.tags.name = b.lines.displays[choices[o].display];
                 obj.tags.local_name = b.lines.key_local[choices[o].key];
@@ -545,14 +545,6 @@ size_t apply_names(Build& b, const std::vector<NameChoice>& choices) {
             }
         }
         keep[o] = !obj.tags.name.empty();
-    }
-    // The key's wikidata items, from its lines (the lowest one).
-    {
-        std::vector<uint32_t> key_qid(b.lines.keys.size(), 0);
-        for (const NamingLine& l : b.lines.lines)
-            if (l.qid && (!key_qid[l.key] || l.qid < key_qid[l.key])) key_qid[l.key] = l.qid;
-        for (Object& obj : b.objects)
-            if (obj.name_key != UINT32_MAX) obj.key_qid = key_qid[obj.name_key];
     }
     keep_objects(b, keep);
     AdminExactRings& r = b.rings;
@@ -787,14 +779,16 @@ std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const
     for (size_t p = 0; p < n_polygons; p++)
         if (previous.count(ids[p])) was_major[b.object_of[p]] = 1;
 
-    // The rivers: river objects joined by key, by wikidata item, and by
-    // local name across a shared arc.
+    // The rivers: river objects joined by waterway relation, by wikidata
+    // item, and by local name across a shared arc. A key of a local name
+    // alone joins nothing by itself: rivers of one name far apart are
+    // rivers of their own.
     Groups groups(n_objects);
     std::map<uint32_t, uint32_t> by_key, by_qid;
     for (uint32_t o = 0; o < n_objects; o++) {
         const Object& obj = b.objects[o];
         if (!obj.tags.river_area) continue;
-        if (obj.name_key != UINT32_MAX) {
+        if (obj.name_key != UINT32_MAX && b.lines.keys[obj.name_key][0] == 'r') {
             auto [it, fresh] = by_key.emplace(obj.name_key, o);
             if (!fresh) groups.join(it->second, o);
         }

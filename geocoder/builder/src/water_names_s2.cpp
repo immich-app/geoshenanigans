@@ -42,14 +42,15 @@ struct Probe {
 };
 #pragma pack(pop)
 
-// Adds a credit, onto the last one where that is of the same object, key
-// and display (a line's segments in a row).
+// Adds a credit, onto the last one where that is of the same object, key,
+// display and wikidata item (a line's segments in a row).
 void credit(std::vector<Credit>& out, uint32_t object, const NamingLine& line, uint64_t mm) {
-    if (!out.empty() && out.back().object == object && out.back().key == line.key && out.back().display == line.display) {
+    if (!out.empty() && out.back().object == object && out.back().key == line.key && out.back().display == line.display &&
+        out.back().qid == line.qid) {
         out.back().mm += mm;
         return;
     }
-    out.push_back({object, line.key, line.display, mm});
+    out.push_back({object, line.key, line.display, mm, line.qid});
 }
 
 }  // namespace

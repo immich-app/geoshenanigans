@@ -9,8 +9,9 @@
 // outer rings together). The object takes the key of the largest total, a
 // tie going to the smaller key; its name is then the display name (name:en,
 // else name) with the most length among that key's lines inside it, a tie
-// going to the smaller name. Integer sums and total orders: the same answer
-// on any number of threads.
+// going to the smaller name, and its wikidata item the lowest of the key's
+// lines that credit it. Integer sums and total orders: the same answer on
+// any number of threads.
 #pragma once
 
 #include <algorithm>
@@ -64,22 +65,26 @@ inline PackedLocation segment_midpoint(PackedLocation a, PackedLocation b) {
             static_cast<int32_t>((int64_t(a.lon_e7) + b.lon_e7) >> 1)};
 }
 
-// A line's length inside an area object: `mm` of line `line`'s key and
-// display credited to `object`.
+// A line's length inside an area object: `mm` of a line of `key` and
+// `display`, whose wikidata item is `qid` (0 for none), credited to
+// `object`.
 struct Credit {
     uint32_t object;
     uint32_t key;
     uint32_t display;
     uint64_t mm;
+    uint32_t qid = 0;
 };
 
 // The name an object takes: its winning key and display, the key's total
-// and the runner-up key's (0 for none).
+// and the runner-up key's (0 for none), and the lowest wikidata item of the
+// key's lines that credit it (0 for none).
 struct NameChoice {
     uint32_t key = UINT32_MAX;
     uint32_t display = UINT32_MAX;
     uint64_t mm = 0;
     uint64_t runner_up_mm = 0;
+    uint32_t qid = 0;
 
     bool named() const { return key != UINT32_MAX; }
 };
@@ -100,13 +105,15 @@ inline std::vector<NameChoice> pick_names(std::vector<Credit>& credits, size_t o
         while (i < credits.size() && credits[i].object == object) {
             const uint32_t key = credits[i].key;
             uint64_t total = 0, top_mm = 0;
-            uint32_t top_display = UINT32_MAX;
+            uint32_t top_display = UINT32_MAX, qid = 0;
             while (i < credits.size() && credits[i].object == object && credits[i].key == key) {
                 const uint32_t display = credits[i].display;
                 uint64_t display_mm = 0;
                 while (i < credits.size() && credits[i].object == object && credits[i].key == key &&
-                       credits[i].display == display)
+                       credits[i].display == display) {
+                    if (credits[i].qid && (!qid || credits[i].qid < qid)) qid = credits[i].qid;
                     display_mm += credits[i++].mm;
+                }
                 total += display_mm;
                 if (display_mm > top_mm) {
                     top_mm = display_mm;
@@ -117,7 +124,7 @@ inline std::vector<NameChoice> pick_names(std::vector<Credit>& credits, size_t o
             // Keys arrive ascending: a later one wins only with more.
             if (total > best.mm) {
                 best.runner_up_mm = best.mm;
-                best = {key, top_display, total, best.runner_up_mm};
+                best = {key, top_display, total, best.runner_up_mm, qid};
             } else if (total > best.runner_up_mm) {
                 best.runner_up_mm = total;
             }
