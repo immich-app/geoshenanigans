@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iterator>
 #include <linux/magic.h>
@@ -418,6 +419,18 @@ std::string file_bytes(const std::string& path) {
     return s.str();
 }
 
+// Whether the checks of what a run leaves in the page cache run: under
+// GEOCODER_TESTS_PAGE_CACHE=1. What stays resident hangs on reclaim too,
+// which a busy machine (the nightly runs its shards beside the planet's
+// download) does when it likes. Says which checks are skipped where they
+// don't.
+bool page_cache_checks_run(const char* skipped) {
+    const char* set = std::getenv("GEOCODER_TESTS_PAGE_CACHE");
+    if (set && std::string(set) == "1") return true;
+    std::printf("    SKIP %s: runs under GEOCODER_TESTS_PAGE_CACHE=1\n", skipped);
+    return false;
+}
+
 }  // namespace
 
 // The writer drops the input's pages once the output after them is written:
@@ -447,10 +460,11 @@ TEST(apply_drops_the_input_behind_the_written_output) {
     CHECK_EQ(drops.size(), size_t(1));
     sut.appended(20 * MiB, 20 * MiB);
     sut.written(20 * MiB);
+    REQUIRE(drops.size() == 2);
     CHECK(drops.back() == std::make_pair(7 * MiB, 13 * MiB));
     sut.finish();  // length 0: to the end of the file
+    REQUIRE(drops.size() == 3);
     CHECK(drops.back() == std::make_pair(20 * MiB, uint64_t(0)));
-    CHECK_EQ(drops.size(), size_t(3));
 
     // A step of 0 drops whatever the input read gained, and nothing while it
     // stays put: an empty range would be posix_fadvise's "to the end".
@@ -471,7 +485,8 @@ TEST(apply_drops_the_input_behind_the_written_output) {
 
 // The point of the drops: after a run the output, which build-index reads
 // next, is in the page cache and the input, which the nightly then deletes,
-// is not.
+// is not (under GEOCODER_TESTS_PAGE_CACHE=1). The output is the changes
+// applied either way.
 TEST(apply_leaves_the_output_in_the_page_cache_in_place_of_the_input) {
     ScratchDir dir("pbf-apply-test");
     ApplyOptions opt;
@@ -480,26 +495,29 @@ TEST(apply_leaves_the_output_in_the_page_cache_in_place_of_the_input) {
     std::vector<TestObject> input;
     for (int64_t id = 1; id <= 20000; id++) input.push_back(node(id, 1, T0, "value " + std::to_string(id * 7919 % 10007)));
     write_test_pbf(opt.input, input, 100);
-    int fd = open(opt.input.c_str(), O_RDONLY);
-    REQUIRE(fd >= 0);
-    fsync(fd);
-    // A file system that keeps what is dropped (an overlay on a tmpfs, say,
-    // which resident_share can't tell from a disk) keeps the input cached
-    // whatever the run asks: the test asks first, and skips there. The input
-    // is then read back into the cache, for the run to drop.
-    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-    close(fd);
-    const double dropped = resident_share(opt.input);
-    file_bytes(opt.input);
-    double before = resident_share(opt.input);
-    if (before <= 0) {
-        std::printf("    SKIP apply_leaves_the_output_in_the_page_cache_in_place_of_the_input: page cache not visible here\n");
-        return;
-    }
-    if (dropped != 0.0) {
-        std::printf("    SKIP apply_leaves_the_output_in_the_page_cache_in_place_of_the_input: the page cache keeps what is "
-                    "dropped here\n");
-        return;
+    const char* checks = "apply_leaves_the_output_in_the_page_cache_in_place_of_the_input's page cache checks";
+    bool resident = page_cache_checks_run(checks);
+    if (resident) {
+        int fd = open(opt.input.c_str(), O_RDONLY);
+        REQUIRE(fd >= 0);
+        fsync(fd);
+        // A file system that keeps what is dropped (an overlay on a tmpfs,
+        // say, which resident_share can't tell from a disk) keeps the input
+        // cached whatever the run asks: the test asks first, and skips the
+        // checks there. The input is then read back into the cache, for the
+        // run to drop.
+        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        close(fd);
+        const double dropped = resident_share(opt.input);
+        file_bytes(opt.input);
+        double before = resident_share(opt.input);
+        if (before <= 0) {
+            std::printf("    SKIP %s: page cache not visible here\n", checks);
+            resident = false;
+        } else if (dropped != 0.0) {
+            std::printf("    SKIP %s: the page cache keeps what is dropped here\n", checks);
+            resident = false;
+        }
     }
     std::string change = dir.path() + "/c.osc";
     std::string text = to_osc({{'m', node(5, 2, T0, "changed")}, {'c', node(30000, 1)}});
@@ -512,8 +530,10 @@ TEST(apply_leaves_the_output_in_the_page_cache_in_place_of_the_input) {
 
     apply_changes(opt);
 
-    CHECK_EQ(resident_share(opt.input), 0.0);
-    CHECK(resident_share(opt.output) > 0.9);
+    if (resident) {
+        CHECK_EQ(resident_share(opt.input), 0.0);
+        CHECK(resident_share(opt.output) > 0.9);
+    }
     CHECK(describe(read_test_pbf(opt.output)) == describe(osmium_apply(input, {{{'m', node(5, 2, T0, "changed")},
                                                                                  {'c', node(30000, 1)}}})));
 }

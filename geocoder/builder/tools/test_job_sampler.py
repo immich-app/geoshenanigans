@@ -2,6 +2,7 @@
 """Tests for job_sampler.sh, the nightly's CPU and disk samples over the whole job, and how the nightly runs it.
 Run: python3 -m unittest discover -s geocoder/builder/tools"""
 import contextlib
+import ctypes
 import io
 import mmap
 import os
@@ -34,11 +35,42 @@ def write(path, text):
         f.write(text)
 
 
+LIBC = ctypes.CDLL(None, use_errno=True)
+LIBC.mmap.restype = ctypes.c_void_p
+LIBC.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+LIBC.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+LIBC.mincore.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p]
+
+
+def resident_pages(path):
+    """How many of the pages of the file at `path` are in the page cache (mincore over a mapping of it)."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        addr = LIBC.mmap(None, size, mmap.PROT_READ, mmap.MAP_SHARED, f.fileno(), 0)
+        if addr in (None, ctypes.c_void_p(-1).value):
+            raise OSError(ctypes.get_errno(), f"mmap {path}")
+        try:
+            vec = (ctypes.c_ubyte * ((size + mmap.PAGESIZE - 1) // mmap.PAGESIZE))()
+            if LIBC.mincore(addr, size, vec) != 0:
+                raise OSError(ctypes.get_errno(), f"mincore {path}")
+        finally:
+            LIBC.munmap(addr, size)
+    return sum(page & 1 for page in vec)
+
+
 def keeps_dropped_pages(path):
-    """Whether the file system at `path` keeps a file's pages in memory whatever is dropped: on tmpfs and ramfs the
-    page cache is the file."""
-    kind = subprocess.run(["stat", "-f", "-c", "%T", path], capture_output=True, text=True, check=True).stdout.strip()
-    return kind in ("tmpfs", "ramfs")
+    """Whether the file system at `path` keeps a file's pages in memory whatever is dropped (tmpfs and ramfs, whose
+    page cache is the file, or an overlay on one): a probe file there, synced and dropped, keeps a page cached."""
+    probe = os.path.join(path, "drop-probe")
+    with open(probe, "wb") as f:
+        f.write(b"p" * (16 * mmap.PAGESIZE))
+        f.flush()
+        os.fsync(f.fileno())
+        os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+    try:
+        return resident_pages(probe) != 0
+    finally:
+        os.remove(probe)
 
 
 class JobSamplerTest(unittest.TestCase):
@@ -221,7 +253,7 @@ class PageCacheTest(unittest.TestCase):
 
     def test_a_file_is_cached_once_read_and_not_once_dropped(self):
         if keeps_dropped_pages(self.dir):
-            self.skipTest("the page cache keeps what is dropped here (tmpfs)")
+            self.skipTest("the page cache keeps what is dropped here")
         path = os.path.join(self.dir, "planet.osm.pbf")
         size = 5 * (1 << 20) + 123
         write(path, "y" * size)
@@ -237,7 +269,7 @@ class PageCacheTest(unittest.TestCase):
     # A last page short of the file's end counts the file's bytes in it alone, whatever else is cached.
     def test_a_cached_last_page_counts_only_the_files_bytes_in_it(self):
         if keeps_dropped_pages(self.dir):
-            self.skipTest("the page cache keeps what is dropped here (tmpfs)")
+            self.skipTest("the page cache keeps what is dropped here")
         path = os.path.join(self.dir, "planet.osm.pbf")
         write(path, "y" * (mmap.PAGESIZE + 1))
         with open(path, "rb") as f:
@@ -277,7 +309,8 @@ class NightlySamplerTest(unittest.TestCase):
         script = step("Start the job sampler")
         self.assertIn('setsid nohup "$GITHUB_WORKSPACE/geocoder/builder/tools/job_sampler.sh" "$RUNNER_TEMP/jobstat.log" '
                       '"$RUNNER_TEMP" 30 \\\n'
-                      '            "$RUNNER_TEMP/geocoder/planet.osm.pbf" "$RUNNER_TEMP/geocoder/planet-tmp.osm.pbf" \\\n',
+                      '            "$RUNNER_TEMP/geocoder/planet.osm.pbf" "$RUNNER_TEMP/geocoder/planet-tmp.osm.pbf" \\\n'
+                      '            > /dev/null 2>&1 < /dev/null &\n',
                       script)
         # The PBFs are where Setup's work dir puts them.
         self.assertIn('WORKDIR="$RUNNER_TEMP/geocoder"', step("Setup"))
