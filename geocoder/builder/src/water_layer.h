@@ -228,10 +228,11 @@ std::shared_ptr<TypeTable> type_table(const Build& b, const std::string& prev_pl
 // area, and each river object by its river's, the river objects grouped by
 // their waterway relation (a naming key of one), by wikidata item (theirs,
 // or that of a line of their key in them) and by local name along river
-// polygons that share an arc; an object or
-// river whose polygon the previous planet build's major tier held (its
-// sidecar, water/major/simplified/admin_polygons.osm_ids under
-// prev_planet_dir) keeps it at kMajorKeepPercent. Logs how many it holds.
+// polygons that share an arc. An object or river whose polygon the previous
+// planet build's major tier held keeps it at kMajorKeepPercent: the polygon
+// matched to a slot of the sidecars under water/major/simplified/ of
+// prev_planet_dir as that dir's slots match it, by identity, else by its
+// fallback key. Logs how many it holds.
 std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const std::string& prev_planet_dir);
 
 // The records, identities and names of the planet's layer (Layer), its

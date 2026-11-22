@@ -618,6 +618,38 @@ TEST(namesakes_apart_are_rivers_of_their_own_and_a_line_lends_its_wikidata_item_
     CHECK(major == std::set<int64_t>({2103}));
 }
 
+TEST(a_lake_the_major_tier_held_stays_in_it_at_95_km2_once_its_smallest_vertex_moves) {
+    // A lake relation of one way round a square of about 105 km2; the next
+    // day its south-west corner, the smallest vertex, moves in, and it holds
+    // about 95: under 100 and over the margin's 90.
+    const int32_t lat = kLat - 6000000, side = 1110000;
+    auto with_lake = [&](int32_t corner_in) {
+        Collected c = fixture();
+        Ring ring = square(lat, kLng, side);
+        ring.front() = ring.back() = pt(lat + corner_in, kLng + corner_in);
+        add_geometry(c, 2200, ring);
+        CollectedArea lake;
+        lake.id = 2300;
+        lake.tags = tags(code::kLake, "Margin Lake");
+        lake.members = {{2200, "outer"}};
+        c.relations.push_back(lake);
+        return c;
+    };
+    auto lake_major = [](const Layer& layer) {
+        for (size_t p = 0; p < layer.size(); p++)
+            if (layer.fallbacks[p] == relation_ring_fallback(2300, 0)) return layer.major[p] != 0;
+        return false;
+    };
+    const ScratchDir root("water-margin");
+    const std::string one = root.path() + "/one";
+    const Layer day1 = build(with_lake(0));
+    REQUIRE(lake_major(day1));
+    write(day1, one);
+    const Layer day2 = build(with_lake(105700), one);
+    CHECK(lake_major(day2));
+    CHECK(!lake_major(build(with_lake(105700))));
+}
+
 TEST(a_waterway_relation_of_a_local_name_alone_shows_the_name_en_most_of_its_river_ways_carry) {
     Collected c = fixture();
     CollectedWaterway local, english;

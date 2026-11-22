@@ -707,14 +707,26 @@ struct Groups {
     std::vector<uint32_t> parent;
 };
 
-// The live slot identities of a sidecar; none for a missing one.
-std::set<uint64_t> sidecar_identities(const std::string& path) {
-    std::set<uint64_t> out;
+// Which of the polygons of `ids` and `fallbacks` (their slot identities
+// and fallback keys) held a live slot of the dir's previous slots: matched
+// as polygon_slots matches them, by identity, else by a fallback key one
+// unclaimed slot alone shares. None without the dir's sidecar; `live`
+// counts its live slots.
+std::vector<uint8_t> held_before(const std::vector<uint64_t>& ids, const std::vector<uint64_t>& fallbacks,
+                                 const std::string& dir, size_t& live) {
+    std::vector<uint8_t> out(ids.size(), 0);
+    live = 0;
     IdAllocator alloc;
-    if (!alloc.load_previous(path)) return out;
-    for (const SidecarSlot& s : alloc.slots())
-        if (gc::id_alloc::is_reclaimable(s))
-            out.insert(gc::id_alloc::make_key(static_cast<ObjectType>(s.object_type), s.stable_id));
+    if (dir.empty() || !alloc.load_previous(dir + "/admin_polygons.osm_ids")) return out;
+    std::vector<uint8_t> was_live(alloc.total_slots());
+    for (size_t s = 0; s < was_live.size(); s++) live += was_live[s] = gc::id_alloc::is_reclaimable(alloc.slots()[s]);
+    const std::vector<uint64_t> prev_fallback = read_fallback_sidecar(dir + "/admin_polygons.fallback.osm_ids", was_live.size());
+    std::vector<gc::id_alloc::FallbackPass> passes;
+    passes.push_back({[&](size_t k) { return fallbacks[k]; }, [&](uint32_t s) { return prev_fallback[s]; }});
+    const std::vector<uint32_t> slots = alloc.allocate_all(ids.size(), [&](size_t k) {
+        return gc::id_alloc::SlotIdentity{static_cast<ObjectType>(ids[k] >> 56), ids[k] & 0x00FFFFFFFFFFFFFFull, 0};
+    }, gc::id_alloc::kRecordsPerMatchPass, passes);
+    for (size_t k = 0; k < ids.size(); k++) out[k] = slots[k] < was_live.size() && was_live[slots[k]];
     return out;
 }
 
@@ -772,12 +784,12 @@ std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const
     const size_t n_objects = b.objects.size(), n_polygons = b.rings.polygons.size();
     std::vector<uint64_t> ids, fallbacks;
     identities_of(b, ids, fallbacks);
-    const std::set<uint64_t> previous =
-        prev_planet_dir.empty() ? std::set<uint64_t>()
-                                : sidecar_identities(prev_planet_dir + "/water/major/simplified/admin_polygons.osm_ids");
+    size_t previous = 0;
+    const std::vector<uint8_t> held =
+        held_before(ids, fallbacks, prev_planet_dir.empty() ? "" : prev_planet_dir + "/water/major/simplified", previous);
     std::vector<uint8_t> was_major(n_objects, 0);
     for (size_t p = 0; p < n_polygons; p++)
-        if (previous.count(ids[p])) was_major[b.object_of[p]] = 1;
+        if (held[p]) was_major[b.object_of[p]] = 1;
 
     // The rivers: river objects joined by waterway relation, by wikidata
     // item, and by local name across a shared arc. A key of a local name
@@ -855,7 +867,7 @@ std::vector<uint8_t> major_polygons(const Build& b, const AdminArcs& arcs, const
     for (size_t p = 0; p < n_polygons; p++) polygons += out[p] = object_major[b.object_of[p]];
     std::cerr << "  Water major tier: " << objects << " objects of " << n_objects << " (" << rivers
               << " river and canal areas of " << river_groups.size() << " rivers), " << polygons << " polygons of "
-              << n_polygons << "; " << kept_by_margin << " kept by the margin, " << previous.size()
+              << n_polygons << "; " << kept_by_margin << " kept by the margin, " << previous
               << " polygons in the previous build's" << std::endl;
     return out;
 }
