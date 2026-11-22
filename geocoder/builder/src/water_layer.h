@@ -5,8 +5,9 @@
 //   admin_polygons.bin + admin_rings.bin  one record per outer ring of an OSM
 //                                         object, with its holes, carrying
 //                                         the object's name, type code (in
-//                                         country_code) and area (all its
-//                                         outer rings', square degrees)
+//                                         country_code) and area (its
+//                                         polygons' exact areas less their
+//                                         holes, summed, square degrees)
 //   arc_index.bin + arc_vertices.bin      the tier's arcs (kWaterArcStage:
 //                                         rings cut at member way ends)
 //   admin_cells.bin + admin_entries.bin   the L10 cell index, interior where
@@ -174,14 +175,15 @@ void key_lines(Collected& c);
 
 // --- The layer ---
 
-// One object the layer holds: its identity and tags, its area summed over
-// its outer rings, and the name its waterway gave it. An OSM way's or
-// relation's, or a marine area's (type SYNTHETIC, id its MRGID).
+// One object the layer holds: its identity and tags, its area (each of its
+// polygons' exact area less its holes, summed over the object), and the
+// name its waterway gave it. An OSM way's or relation's, or a marine
+// area's (type SYNTHETIC, id its MRGID).
 struct Object {
     gc::id_alloc::ObjectType type = gc::id_alloc::ObjectType::NONE;
     int64_t id = 0;
     ObjectTags tags;
-    double area_deg2 = 0;  // its polygons' exact areas, square degrees
+    double area_deg2 = 0;  // its polygons' exact areas less their holes, square degrees
     double km2 = 0;
     uint32_t name_key = UINT32_MAX;  // the naming key it took (NamingLines::keys), UINT32_MAX for none
     uint32_t key_qid = 0;            // the lowest wikidata item of that key's lines in it, 0 for none

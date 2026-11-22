@@ -448,8 +448,9 @@ file id, GCPATCH or transport version changes:
   (an outer ring of an OSM object, with the holes inside it), its name in the
   dir's own `strings_core.bin`, its type code in the `country_code` field
   (`water_meta.json` gives each code's class, type and Nominatim rank) and
-  the object's area, all its outer rings', in the `area` field. Merged by
-  slot (`ADMIN_SLOT_FAMILIES`), as the boundary tiers are.
+  the object's area, its polygons' exact areas less their holes, summed, in
+  the `area` field. Merged by slot (`ADMIN_SLOT_FAMILIES`), as the boundary
+  tiers are.
 - `arc_index.bin` and `arc_vertices.bin`: the tier's arcs, merged by slot.
 - `admin_cells.bin` and `admin_entries.bin`: the L10 cell index, interior
   where both tiers' rings hold the whole cell; the admin cell-index delta.
