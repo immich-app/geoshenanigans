@@ -1029,12 +1029,17 @@ jobs:
           # build (fetch_previous_index.sh, started by the build step). Without
           # them there are no patches and the run fails: compression ends
           # first, its session and all (its uploads too), and is gone (a
-          # zombie aside).
+          # zombie aside). Its launch is killed too, as a fetch that failed
+          # before build-index exited stops it before it has made its session.
+          compressing() { ps -o stat= -s "$COMPRESS_PID" | grep -q '^[^Z]'; }
           stop_compression() {
-            pkill -KILL -s "$COMPRESS_PID" 2> /dev/null || true
             local start
             start=$(date +%s)
-            while ps -o stat= -s "$COMPRESS_PID" | grep -q '^[^Z]' && [ $(( $(date +%s) - start )) -lt 60 ]; do sleep 1; done
+            kill -KILL "$COMPRESS_PID" 2> /dev/null || true
+            while compressing && [ $(( $(date +%s) - start )) -lt 60 ]; do
+              pkill -KILL -s "$COMPRESS_PID" 2> /dev/null || true
+              sleep 1
+            done
           }
           WAIT_START=$(date +%s)
           until [ -s "$WORKDIR/old-output.status" ]; do
@@ -1078,12 +1083,16 @@ jobs:
           fi
           # The compressor writes into the volume the diffs and verifies use
           # for scratch: at most the bytes of the files it compresses (every
-          # .bin, the load sidecars, the search indexes). The patch jobs leave
-          # that much of the free space alone, with what the place search may
-          # still write.
-          RESERVE_KIB=$(find "$WORKDIR/output" -type f \
-            \( -name '*.bin' -o -name strings_layout.json -o -name poi_meta.json -o -path '*/search/*' \) \
-            ! -name '*.zst' -printf '%s\n' | awk '{s += $1} END {printf "%d", (s + 1023) / 1024}')
+          # .bin, the load sidecars, the search indexes), none once it has
+          # ended (what it wrote has left the free space then). The patch jobs
+          # leave that much of the free space alone, with what the place search
+          # may still write.
+          RESERVE_KIB=0
+          if compressing; then
+            RESERVE_KIB=$(find "$WORKDIR/output" -type f \
+              \( -name '*.bin' -o -name strings_layout.json -o -name poi_meta.json -o -path '*/search/*' \) \
+              ! -name '*.zst' -printf '%s\n' | awk '{s += $1} END {printf "%d", (s + 1023) / 1024}')
+          fi
           RESERVE_KIB=$((RESERVE_KIB + SEARCH_RESERVE_KIB))
 
           # Per variant: diff, apply to a scratch copy, verify the whole client

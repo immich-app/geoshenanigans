@@ -839,12 +839,13 @@ class PostBuildTest(unittest.TestCase):
                 self.assertEqual(upload.wait(timeout=10), -9)
                 self.assertIn("::warning::", done.stdout)
 
-    def run_patch_step(self, compress):
+    def run_patch_step(self, compress, fetch_status=None, slow_setsid=False):
         """Runs Generate patches and verify as Actions runs it, on a night of no variants, with geocoder-transport
         built and the place search done, an s5cmd, generate_patches.sh and checksums.sh that do nothing else, sleeps
         of 10 ms, a clock that runs the seconds in $WORKDIR/clock ahead, and `compress` (Python, its argv
-        compress_index.py's) as compress_index.py; yesterday's fetch writes no status of its own. Returns the run,
-        None when the step still waited after 30 s, and the work dir."""
+        compress_index.py's) as compress_index.py; yesterday's fetch has ended with `fetch_status` (None: not yet,
+        it writes none of its own). With slow_setsid, setsid takes half a second to start. Returns the run, None when
+        the step still waited after 30 s, and the work dir."""
         root = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, root)
         ws, work, bin_dir = (os.path.join(root, d) for d in ("ws", "work", "bin"))
@@ -860,6 +861,10 @@ class PostBuildTest(unittest.TestCase):
                  os.path.join(work, "old-output.log"): "",
                  os.path.join(work, "place-search.status"): "0\n",
                  os.path.join(root, "search.status"): "0\n"}
+        if fetch_status is not None:
+            fakes[os.path.join(work, "old-output.status")] = fetch_status
+        if slow_setsid:
+            fakes[os.path.join(bin_dir, "setsid")] = f'#!/bin/sh\n/usr/bin/sleep 0.5\nexec {shutil.which("setsid")} "$@"\n'
         for path, text in fakes.items():
             with open(path, "w") as f:
                 f.write(text)
@@ -908,6 +913,24 @@ class PostBuildTest(unittest.TestCase):
                 if alive(compress):
                     os.kill(compress, 9)
                     self.fail("compression still ran after the step")
+
+    # So does one whose fetch failed before build-index exited: the step stops compression as it starts, its
+    # session not made yet (setsid slow to start here), and none of it starts after the step.
+    def test_a_fetch_that_failed_first_stops_compression_still_starting(self):
+        done, work = self.run_patch_step("import os, sys, time\nwork = os.path.dirname(sys.argv[1])\n"
+                                         "with open(os.path.join(work, 'compress.pid'), 'w') as f:\n"
+                                         "    f.write(str(os.getpid()))\ntime.sleep(300)\n",
+                                         fetch_status="1\n", slow_setsid=True)
+
+        self.assertIsNotNone(done)
+        self.assertNotEqual(done.returncode, 0)
+        time.sleep(2)
+        if os.path.exists(os.path.join(work, "compress.pid")):
+            with open(os.path.join(work, "compress.pid")) as f:
+                compress = int(f.read())
+            if alive(compress):
+                os.kill(compress, 9)
+                self.fail("compression started after the step")
 
     # The watchdog tells a retry from a failure a rerun repeats by these steps' names.
     def test_every_step_the_watchdog_names_is_a_step_of_the_nightly(self):

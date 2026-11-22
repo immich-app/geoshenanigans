@@ -571,12 +571,14 @@ def nightly_reserves():
     return "".join(line.strip() + "\n" for line in block.group(1).splitlines()) if block else None
 
 
-def reserves(workdir, path=None):
-    """The reserves the patch step gives generate_patches.sh for what `workdir` holds, with `path` first on PATH."""
+def reserves(workdir, path=None, compressing=True):
+    """The reserves the patch step gives generate_patches.sh for what `workdir` holds, with `path` first on PATH,
+    while compression runs or once it has ended."""
     env = dict(os.environ, WORKDIR=workdir)
     if path:
         env["PATH"] = f"{path}:{env['PATH']}"
-    printed = subprocess.run(["bash", "-e", "-c", nightly_reserves() + 'echo "$RESERVE_KIB $MEM_RESERVE_KIB"'], env=env,
+    script = f"compressing() {{ {'true' if compressing else 'false'}; }}\n" + nightly_reserves()
+    printed = subprocess.run(["bash", "-e", "-c", script + 'echo "$RESERVE_KIB $MEM_RESERVE_KIB"'], env=env,
                              check=True, capture_output=True, text=True).stdout
     return tuple(int(n) for n in printed.split())
 
@@ -621,6 +623,19 @@ class NightlyReserveTest(unittest.TestCase):
                         f.write(status)
 
                 self.assertEqual(reserves(workdir), (7 + scratch, memory), status)
+
+    # Compression starts before the step waits for yesterday's files, and may have ended by then: what it wrote has
+    # left the free space already, and it writes no more, so the patch jobs hold back only what the place search may
+    # still write.
+    def test_a_compression_that_has_ended_holds_no_reserve(self):
+        for status, scratch, memory in (("", 16 * GIB, 6 * GIB), ("0\n", 0, 0)):
+            with tempfile.TemporaryDirectory() as workdir:
+                write_file(os.path.join(workdir, "output", "planet", "full", "street_ways.bin"), 7 * 1024)
+                if status:
+                    with open(os.path.join(workdir, "place-search.status"), "w") as f:
+                        f.write(status)
+
+                self.assertEqual(reserves(workdir, compressing=False), (scratch, memory), status)
 
     # One that ends while the files are counted leaves files the count missed: its status is read before the count,
     # so that the reserves still hold what it may write and use.
