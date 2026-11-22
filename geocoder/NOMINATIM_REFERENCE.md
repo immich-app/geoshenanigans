@@ -180,22 +180,39 @@ the import's POI list (`presets.lua` `MAIN_TAGS_POIS`, lines 170-262) with a
 category ranked 30 has a positive address rank, so it ranks 30 and is in the
 lane: `amenity=fountain` and `leisure=swimming_area` (class `amenity`,
 `leisure`, alphabetically before `natural`), `emergency=fire_water_pond`,
-`shop=*`, `man_made=pier`, and so on. The builder classifies such an object
-by that tag (`poi_classify.h` `has_poi_main_tag`): `FOUNTAIN`,
-`SWIMMING_AREA`, `FIRE_WATER_POND`, `PIER`, ..., or `GENERIC_RANK30` where the
-tag has no category of its own, which ships only with a wiki tag as every
-generic rank-30 feature does. Values the import drops (`amenity=parking_space`,
-`emergency=fire_hydrant`, `tourism=yes`, ...) and tags of a rank below 30
-(`leisure=park`, `historic=neighbourhood`, `place=*`, `waterway=*`) leave the
-water category. `building=*`, a fallback tag, ranks 30 beside `natural=*`
-(the class stays `natural`) but is the class beside `landuse=*`, also a
-fallback tag, and the lane takes no class `building`.
+`shop=*`, `man_made=pier`, and so on. A main tag of a lower positive address
+rank beside it ranks the object instead, out of the lane: `place=*` of an
+address rank (`locality` 25, `suburb` 20, ...), and on an area
+`landuse=residential` and the other admin landuse kinds (24) and the
+`highway=*` kinds (26, 27); a landuse or highway node ranks 30. Such an object
+stays water (`poi_classify.h` `has_lower_rank_main_tag`). The builder
+classifies a rank-30 one by its rank-30 tags (`has_poi_main_tag`): `FOUNTAIN`,
+`SWIMMING_AREA`, `FIRE_WATER_POND`, `PIER`, ..., or `GENERIC_RANK30` where they
+have no category of their own; a tag of a lower rank or of no main tag after
+the water kind (`leisure=park`, `natural=wood`, `place=island`,
+`waterway=waterfall`, `man_made=dam`, `power=*`) gives it none. A generic
+rank-30 feature ships only with a wiki tag, as every one does; without one, the
+object stays water, so its name stays in `places` and as the `landmark`, out
+of the primary slot. The way pass resolves a named `landuse=reservoir|basin`
+way with a POI main tag though `emergency=*` and `shop=*` make no POI way
+alone (`way_tags.h` `has_poi_tags`). Values the import drops
+(`amenity=parking_space`, `emergency=fire_hydrant`, `tourism=yes`, ...) and
+tags of a rank below 30 and no address rank (`leisure=park`,
+`historic=neighbourhood`, `place=island`, `waterway=*`) leave the water
+category. `building=*`, a fallback tag, ranks 30 beside `natural=*` (the class
+stays `natural`) but is the class beside `landuse=*`, also a fallback tag, and
+the lane takes no class `building`.
 
 **Not matched.**
 - The builder reads no `club`, `military`, `healthcare` or `aerialway` key,
   nor a node's `highway`: a water object whose only other main tag is one of
   those keeps its water category, though it ranks 30 in Nominatim. A
   multipolygon bay or glacier keeps its category whatever it carries.
+- A water object of a generic rank-30 tag without a wiki tag stays water,
+  out of the primary slot, where Nominatim's lane holds it as a POI.
+- The lower rank leaves out `boundary=administrative`, which ranks by an
+  admin_level the classifier doesn't read, and the country tables of
+  `address-levels.json` (`place=county` in ca and de, ...).
 - The area-label lane: peaks, volcanoes, beaches, capes, islands, parks,
   nature reserves, stadiums, gardens, water parks, golf courses, national
   parks, protected areas, campuses (university, college, hospital),
