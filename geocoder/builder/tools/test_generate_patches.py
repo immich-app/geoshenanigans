@@ -513,6 +513,47 @@ class GeneratePatchesTest(unittest.TestCase):
         self.assertEqual(night.events, {})
 
 
+def sizing_loop():
+    """generate_patches.sh's lines that start the estimates and wait for them, as bash: from the one after the
+    estimates dir is made to the wait."""
+    loop = re.search(r"^estimates=\$\(mktemp .*\n((?:.*\n)*?)^wait\n", read(os.path.join(HERE, "generate_patches.sh")), re.M)
+    return loop.group(1) + "wait\n" if loop else None
+
+
+class SizingLoopTest(unittest.TestCase):
+    # An estimate a signal ended frees its slot. bash before 5.3 has its bare wait -n pass over a job it has
+    # reported, which it does of one a signal ended once a wait -n returns another; the shell reaps what ends while
+    # it is busy launching (a fork of a big shell takes a while), here slowed by a DEBUG trap. On three CPUs r/a's
+    # estimate ends and r/b's is killed as r/c's starts: r/d's then takes a slot, and r/e's the other, while r/c's and
+    # r/d's still run (3 s each).
+    def test_an_estimate_a_signal_ended_frees_its_slot(self):
+        loop = sizing_loop()
+        self.assertIsNotNone(loop)
+        with tempfile.TemporaryDirectory() as tmp:
+            script = f"""set -uo pipefail
+mkfifo {tmp}/slow
+exec {{slow}}<> {tmp}/slow
+max_jobs=3
+variants=(r/a r/b r/c r/d r/e)
+estimates={tmp}
+estimate_variant() {{
+  case $1 in
+    r/b) kill -KILL $BASHPID ;;
+    r/c) /usr/bin/sleep 3; echo "$EPOCHREALTIME" > {tmp}/c-ended ;;
+    r/d) /usr/bin/sleep 3 ;;
+    r/e) echo "$EPOCHREALTIME" > {tmp}/e-started ;;
+  esac
+}}
+trap 'read -t 0.1 -u "$slow" || :' DEBUG
+{loop}trap - DEBUG
+"""
+            done = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=60)
+
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertLess(float(read(os.path.join(tmp, "e-started"))), float(read(os.path.join(tmp, "c-ended"))),
+                            "r/e's estimate started once r/c's had ended, not beside it")
+
+
 # The nightly's patch step (geocoder-build.yml): its reserve, as a shell
 # command over $WORKDIR/output, and how it starts generate_patches.sh.
 def nightly_patch_step():

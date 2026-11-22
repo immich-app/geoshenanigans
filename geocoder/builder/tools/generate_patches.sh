@@ -245,18 +245,17 @@ estimate_variant() {
 
 # Every variant sized at once, max_jobs at a time, then read in in order.
 # Without a dir for the estimates none could be sized: the script fails
-# (mktemp says why) rather than leave every variant without a result.
+# (mktemp says why) rather than leave every variant without a result. The
+# running estimates are counted before each wait: bash before 5.3 has a bare
+# wait -n pass over a job it has reported, as it does one a signal ended once
+# a wait -n returns another, so a count of the launches could hold a free
+# slot until another estimate ends.
 declare -A weight=() diff_scratch=() verify_scratch=()
 variants=($(cd "$new_root" && find . -name '*.bin' -printf '%h\n' | sed 's|^\./||' | sort -u))
 estimates=$(mktemp -d "$scratch_root/estimates-XXXXXX") || exit 1
-sizing=0
 for variant in "${variants[@]}"; do
-  if [ "$sizing" -ge "$max_jobs" ]; then
-    wait -n
-    sizing=$((sizing - 1))
-  fi
+  while [ "$(jobs -pr | wc -l)" -ge "$max_jobs" ]; do wait -n; done
   estimate_variant "$variant" "$estimates/${variant//\//_}" &
-  sizing=$((sizing + 1))
 done
 wait
 for variant in "${variants[@]}"; do
