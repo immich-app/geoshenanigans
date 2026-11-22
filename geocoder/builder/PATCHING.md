@@ -437,6 +437,68 @@ Dirs patched on different days don't fit together: the server combines a
 mode dir with a quality or poi dir by global string offsets, so the selected
 dirs must all be patched to the same date and swapped in together.
 
+### The water dirs
+
+The water layer (`src/water_layer.h`) writes three dirs under each region:
+`water/all/simplified/`, `water/all/exact/` and `water/major/simplified/`.
+Each is made of file names the patch format already has a section for, so no
+file id, GCPATCH or transport version changes:
+
+- `admin_polygons.bin` and `admin_rings.bin`: one 16-byte record per polygon
+  (an outer ring of an OSM object, with the holes inside it), its name in the
+  dir's own `strings_core.bin`, its type code in the `country_code` field
+  (`water_meta.json` gives each code's class, type and Nominatim rank) and
+  the object's area, all its outer rings', in the `area` field. Merged by
+  slot (`ADMIN_SLOT_FAMILIES`), as the boundary tiers are.
+- `arc_index.bin` and `arc_vertices.bin`: the tier's arcs, merged by slot.
+- `admin_cells.bin` and `admin_entries.bin`: the L10 cell index, interior
+  where both tiers' rings hold the whole cell; the admin cell-index delta.
+- `strings_core.bin` and a `strings_layout.json` of that core alone, as
+  `admin-minimal/` has: the dir resolves no other dir's strings and no other
+  dir resolves its. The diff looks for the other tiers beside the dir, then
+  in `../full` and `../../full`; three levels down there are none, so they
+  are empty pools.
+- `water_meta.json` and `attribution.json`: small JSON, carried inline.
+
+The two `all` dirs hold the same records, rings, cells and strings, byte for
+byte; only their arcs differ. `major/simplified/` is a subset with slots of
+its own.
+
+What keeps a day's patch small:
+
+- **Polygon slots** come from strategy 2 (`IdAllocator`), keyed by OSM
+  identity, not by name: a closed way by its way id, a relation's outer ring
+  by the relation and the smallest vertex of the ring. A ring whose smallest
+  vertex moves keeps its slot by its fallback key, the relation and the
+  ring's place among the relation's outer rings
+  (`admin_polygons.fallback.osm_ids`). A renamed lake changes one record and
+  the strings.
+- **Arcs are cut at OSM way ends** as well as at junctions
+  (`ArcCuts::JunctionsAndWayEnds`): an arc lies within one way, so an edit to
+  a way changes only the arcs along it, and every other arc keeps its slot
+  (`arc_index.osm_ids`, with the way-set and ends fallbacks of
+  `arc_index.fallback.osm_ids`). One arc per ring would resend a whole lake
+  shore for a one-node edit.
+- **Ring blocks** are still a polygon's whole: an edit that adds or splits a
+  way of a lake with many islands resends the stretch of its ring block
+  between the first and the last ref that changed. Polygons of more than
+  `kSplitMaxHoles` holes are cut into pieces along a fixed grid
+  (`src/water_split.h`), so no block holds more than that many holes; each
+  piece carries the object's name, type and area, and keeps its slot by the
+  relation, the outer ring's place and the piece's cut.
+- **Type codes** of `water=*` values outside the fixed table
+  (`src/water_types.h`) are allocated against the previous build's
+  `water_meta.json`, so a new rare value never renumbers another.
+
+The simplified tier's crossing repair counts only crossings between rings of
+one polygon (`ArcTier::crossings_within_polygons`): water areas overlap
+legitimately (a lake in a wetland, a river in a bay), and repairing their
+crossings would give back vertices that buy nothing and tie one area's
+simplified arcs to its neighbours' edits.
+
+The sidecars (`*.osm_ids`) sit in `water/all/exact/` for the all set and in
+`water/major/simplified/` for the major tier. They are not client files.
+
 ## Place search index
 
 The place search index (`geocoder/search`) points into a selection's own
