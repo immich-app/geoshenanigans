@@ -770,3 +770,25 @@ TEST(the_water_dir_fixture_of_the_patch_tests_is_what_the_layer_writes) {
     CHECK(text_of(days["day3"]["water_meta.json"]).find("\"type\": \"salt_pond\"") != std::string::npos);
     CHECK(text_of(days["day3"]["attribution.json"]).find("marine-regions") != std::string::npos);
 }
+
+TEST(an_unnamed_riverbank_tagged_natural_water_too_takes_its_waterways_name) {
+    Collected c = fixture();
+    const ObjectTags bank = tags_from({{"natural", "water"}, {"waterway", "riverbank"}});
+    CHECK(bank.river_area);
+    CHECK_EQ(bank.code, code::kRiver);
+    c.closed_ways.push_back({2400, bank, square(kLat + 900000, kLng, 10000)});
+    LineIn aare;
+    aare.way = 2401;
+    aare.key = "nAare";
+    aare.local = aare.display = "Aare";
+    aare.vertices = {pt(kLat + 902000, kLng + 2000), pt(kLat + 906000, kLng + 6000)};
+    c.lines.push_back(aare);
+    const Layer layer = build(c);
+    std::vector<std::string> names;
+    for (size_t p = 0; p < layer.size(); p++)
+        if (layer.identities[p] == way_identity(2400)) {
+            names.push_back(name_of(layer, p));
+            CHECK_EQ(layer.records[p].country_code, code::kRiver);
+        }
+    CHECK(names == std::vector<std::string>({"Aare"}));
+}

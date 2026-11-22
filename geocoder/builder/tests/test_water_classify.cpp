@@ -135,3 +135,18 @@ TEST(the_major_tier_takes_100_km2_and_wikidata_rivers_of_5_and_keeps_its_own_at_
     CHECK(!water_major_keeps(89.9, false, false, true));
     CHECK(water_major_keeps(4.5, true, true, true));
 }
+
+TEST(a_riverbank_tagged_natural_water_too_is_a_river_area) {
+    // waterway=riverbank comes before a bare natural=water, so that an
+    // unnamed one can take its waterway's name; a water=* of its own still
+    // decides.
+    TypeTable table;
+    for (const char* water_tag : {static_cast<const char*>(nullptr), "yes", "intermittent", "tidal"}) {
+        const Class bank = of("water", water_tag, "riverbank");
+        CHECK(bank.river_area);
+        CHECK(kind_of(bank, table) == "waterway/river 19");
+        CHECK(in_scope(bank, false));
+    }
+    CHECK(kind_of(of("water", "lake", "riverbank"), table) == "water/lake 20");
+    CHECK(!of("water", "stream", "riverbank").any());
+}

@@ -9,11 +9,12 @@
 // natural=coastline, and place=sea: the marine areas (marine.h) hold the
 // seas, and Nominatim answers no place=sea.
 //
-//   natural=water + water=river, or waterway=riverbank   waterway/river (a river area)
+//   natural=water + water=river                           waterway/river (a river area)
 //   natural=water + water=canal                           waterway/canal (a canal area)
 //   natural=water + water=stream|ditch|drain|fish_pass    none
 //   natural=water + water=<a fixed type>                  water/<type>
 //   natural=water + water=<other>                         water/<value>, verbatim
+//   waterway=riverbank                                    waterway/river (a river area)
 //   natural=water (water= absent, yes, intermittent, tidal)  natural/water
 //   landuse=reservoir                                     landuse/reservoir
 //   landuse=basin                                         landuse/basin
@@ -63,7 +64,10 @@ inline Class classify(const Tags& t) {
         if (is(w, "river")) return {code::kRiver, nullptr, true};
         if (is(w, "canal")) return {code::kCanal, nullptr, true};
         if (is(w, "stream") || is(w, "ditch") || is(w, "drain") || is(w, "fish_pass")) return c;
-        if (!w || !*w || is(w, "yes") || is(w, "intermittent") || is(w, "tidal")) return {code::kNaturalWater, nullptr, false};
+        if (!w || !*w || is(w, "yes") || is(w, "intermittent") || is(w, "tidal")) {
+            if (is(t.waterway, "riverbank")) return {code::kRiver, nullptr, true};
+            return {code::kNaturalWater, nullptr, false};
+        }
         if (const uint16_t fixed = fixed_code("water", w)) return {fixed, nullptr, false};
         return {0, w, false};
     }
