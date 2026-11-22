@@ -528,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tombstone_or_a_code_without_a_kind_answers_nothing() {
+    fn a_code_without_a_kind_answers_nothing() {
         let meta = r#"{"types": [{"code": 2, "class": "water", "type": "lake", "rank": 20}]}"#;
         let layer = WaterFixture::new()
             .area("Unlisted", POND, (0.0, 0.0, 0.5, 0.5), &[])
@@ -541,13 +541,16 @@ mod tests {
 
     #[test]
     fn a_lookup_tests_no_larger_area_once_a_smaller_one_holds_the_point() {
-        // A lake in a sea, neither interior at the point: the sea's arc is never read there.
-        let fixture = |sea: bool| {
+        // A lake in a sea, neither interior in the cell of (0.15, 0.15), which the sea's east
+        // edge crosses: the sea alone is tested against its arc there, beside the lake never.
+        let fixture = |sea: bool, lake: bool| {
             let mut f = WaterFixture::new();
             if sea {
-                f.area("Sea", SEA, (0.0, 0.0, 0.3, 0.3), &[]);
+                f.area("Sea", SEA, (0.0, 0.0, 0.3, 0.21), &[]);
             }
-            f.area("Lake", LAKE, (0.1, 0.1, 0.2, 0.2), &[]);
+            if lake {
+                f.area("Lake", LAKE, (0.1, 0.1, 0.2, 0.2), &[]);
+            }
             f.layer()
         };
         let arcs_read = |layer: &WaterLayer, lat: f64, lng: f64| {
@@ -556,9 +559,11 @@ mod tests {
             (got, memo.arcs_read())
         };
 
-        assert_eq!(arcs_read(&fixture(true), 0.15, 0.15), arcs_read(&fixture(false), 0.15, 0.15));
-        assert_eq!(arcs_read(&fixture(true), 0.15, 0.15).0.as_deref(), Some("Lake"));
-        assert_eq!(arcs_read(&fixture(true), 0.25, 0.25).0.as_deref(), Some("Sea"));
+        let sea_alone = arcs_read(&fixture(true, false), 0.15, 0.15);
+        assert!(sea_alone.0.as_deref() == Some("Sea") && sea_alone.1 > 0, "{sea_alone:?}");
+        assert_eq!(arcs_read(&fixture(true, true), 0.15, 0.15), arcs_read(&fixture(false, true), 0.15, 0.15));
+        assert_eq!(arcs_read(&fixture(true, true), 0.15, 0.15).0.as_deref(), Some("Lake"));
+        assert_eq!(arcs_read(&fixture(true, true), 0.25, 0.18).0.as_deref(), Some("Sea"));
     }
 
     // geocoder/testdata/water_dir holds the files the builder's water layer writes on three days
