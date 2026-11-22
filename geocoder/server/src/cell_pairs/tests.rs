@@ -440,7 +440,9 @@ fn vm_flags(bytes: &FileBytes) -> String {
 // The open checks the whole cells file, in order: a mapped one is read ahead meanwhile, not
 // faulted in a page at a time (on a slow disk a read a page, ~800 for a planet water dir's), and
 // mapped for random reads again once open, as for the lookups. Where the file's pages can't be
-// dropped from the cache (a temp dir in memory) there is nothing to see.
+// dropped from the cache (a temp dir in memory) there is nothing to see. The file, of every level
+// 5 parent (about 1 MiB), is too few pages of 16 KiB or more for its faults to tell a read ahead
+// from a read a page: there the test sees the mapping's advice and a lookup only.
 #[cfg(target_os = "linux")]
 #[test]
 fn a_mapped_cells_file_is_read_ahead_while_its_open_checks_it() {
@@ -465,7 +467,11 @@ fn a_mapped_cells_file_is_read_ahead_while_its_open_checks_it() {
     let index = CellPairs::open(mapped, FileBytes::Owned(entries), ADMIN, DEFAULT_ADMIN_CELL_LEVEL).unwrap();
     let faults = major_faults() - before;
 
-    assert!(pages > 200 && faults * 4 < pages as i64, "{faults} faults read pages of its {pages} ({held} in the cache before)");
+    if pages > 200 {
+        assert!(faults * 4 < pages as i64, "{faults} faults read pages of its {pages} ({held} in the cache before)");
+    } else {
+        eprintln!("{}: {pages} pages of {} bytes, too few to count its faults", path.display(), page_size());
+    }
     let flags = vm_flags(&index.cells);
     assert!(flags.contains(" rr") && !flags.contains(" sr"), "{flags}");
     assert_eq!(index.with_ids(cell(6143 << 10 | 63 * 16), |ids| ids.to_vec()), [6143]);
