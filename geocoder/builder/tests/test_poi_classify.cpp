@@ -232,21 +232,21 @@ TEST(poi_classify_a_swimming_area_and_a_fire_pond_alone_by_their_tags) {
     CHECK_EQ(std::string(poi_category_label(PoiCategory::FIRE_WATER_POND)), "fire_water_pond");
 }
 
-TEST(poi_classify_a_water_object_with_a_poi_main_tag_of_no_category_is_a_generic_feature) {
+TEST(poi_classify_a_water_object_with_a_poi_main_tag_of_no_category_is_a_generic_feature_or_stays_water) {
     // A rank-30 POI in Nominatim whose tag takes no category here: a generic
-    // rank-30 feature, which ships only with a wiki tag.
+    // rank-30 feature with a wiki tag. Without one, no POI dir ships a
+    // generic feature, and the object stays the water it is, of its tier,
+    // which keeps its name in the tiers and out of the primary slot.
     const std::pair<const char*, const char*> tags[] = {
         {"emergency", "suction_point"}, {"leisure", "swimming"}, {"amenity", "watering_place"},
         {"tourism", "wilderness"}, {"historic", "aqueduct"}};
     for (const WaterKind& kind : kWaterKinds)
         for (const auto& [key, value] : tags) {
-            Tags t = water(kind);
-            if (!std::strcmp(key, "emergency")) t.emergency = value;
-            else if (!std::strcmp(key, "leisure")) t.leisure = value;
-            else if (!std::strcmp(key, "amenity")) t.amenity = value;
-            else if (!std::strcmp(key, "tourism")) t.tourism = value;
-            else t.historic = value;
-            CHECK(!classify(t).has_value());
+            Tags t = with(water(kind), key, value);
+            const auto plain = classify(t);
+            REQUIRE(plain.has_value());
+            CHECK_EQ(uint8_t(plain->category), uint8_t(kind.category));
+            CHECK_EQ(int(plain->tier), int(poi_get_default_tier(kind.category)));
             t.wikidata = "Q1";
             CHECK_EQ(uint8_t(category_of(t)), uint8_t(PoiCategory::GENERIC_RANK30));
         }
@@ -255,8 +255,8 @@ TEST(poi_classify_a_water_object_with_a_poi_main_tag_of_no_category_is_a_generic
     // a fallback, building is its class (the alphabetically first), which
     // Nominatim's POI lane leaves out, so it stays a reservoir.
     for (const WaterKind& kind : kWaterKinds) {
-        Tags t = water(kind);
-        t.building = "yes";
+        Tags t = with(water(kind), "building", "yes");
+        CHECK_EQ(uint8_t(category_of(t)), uint8_t(kind.category));
         t.wikidata = "Q1";
         CHECK_EQ(uint8_t(category_of(t)), uint8_t(kind.natural ? PoiCategory::GENERIC_RANK30 : kind.category));
     }

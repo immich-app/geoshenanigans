@@ -118,7 +118,8 @@ inline bool has_lower_rank_main_tag(const char* t_place, const char* t_landuse, 
 // (has_poi_main_tag) is a rank-30 POI there, unless a main tag of a lower
 // positive rank ranks it (has_lower_rank_main_tag): it takes no water
 // category, and is classified by its rank-30 tags, or as a generic rank-30
-// feature where they have no category of their own.
+// feature where they have no category of their own. Where no POI dir ships
+// that, it stays water.
 inline std::optional<PoiClassification> classify_poi(
     const char* t_tourism, const char* t_historic, const char* t_boundary,
     const char* t_amenity, const char* t_leisure, const char* t_natural,
@@ -134,14 +135,14 @@ inline std::optional<PoiClassification> classify_poi(
     // then leaves the category to the object's rank-30 main tags, so that the
     // tags after it of a lower rank or of no main tag in Nominatim
     // (leisure=park, natural=wood, place=island, waterway=waterfall,
-    // man_made=dam, power=*) give none. `water_yielded` notes that one did.
+    // man_made=dam, power=*) give none. `yielded` is the first kind that did.
     const bool ranks_30 = !has_lower_rank_main_tag(t_place, t_landuse, t_highway, area);
     const bool poi_main = ranks_30 && has_poi_main_tag(t_amenity, t_leisure, t_emergency, t_tourism, t_historic,
                                                        t_shop, t_craft, t_office, t_aeroway, t_railway, t_man_made);
-    bool water_yielded = false;
+    PoiCategory yielded = PoiCategory::UNKNOWN;
     auto water = [&](PoiCategory kind, bool yields) {
         if (!yields) return kind;
-        water_yielded = true;
+        if (yielded == PoiCategory::UNKNOWN) yielded = kind;
         if (t_leisure && !poi_leisure_ranks_30(t_leisure)) t_leisure = nullptr;
         // address-levels.json:66-79.
         if (t_natural && !poi_tag_is(t_natural, {"tree", "spring", "cave_entrance", "geyser", "hot_spring", "rock", "stone"}))
@@ -462,7 +463,7 @@ inline std::optional<PoiClassification> classify_poi(
     // A water object a POI main tag of no category of its own makes a
     // rank-30 POI is one too.
     if (cat == PoiCategory::UNKNOWN) {
-        if (water_yielded || t_amenity || t_tourism || t_historic || t_leisure ||
+        if (yielded != PoiCategory::UNKNOWN || t_amenity || t_tourism || t_historic || t_leisure ||
             t_man_made || t_craft || t_office || t_waterway ||
             t_natural || t_aeroway || t_railway || t_power ||
             t_shop) {
@@ -490,6 +491,13 @@ inline std::optional<PoiClassification> classify_poi(
         flags |= POI_FLAG_HIGHWAY;
     }
     if ((flags & (POI_FLAG_WIKIPEDIA | POI_FLAG_WIKIDATA)) && tier > 1) tier--;
+    // A water object whose rank-30 tags give a category no POI dir ships (a
+    // generic rank-30 feature without a wiki tag) stays the water it is: its
+    // name stays in the POI tiers, and out of the primary slot.
+    if (tier > POI_MAX_SHIPPED_TIER && yielded != PoiCategory::UNKNOWN) {
+        cat = yielded;
+        tier = poi_get_default_tier(cat);
+    }
     if (tier > POI_MAX_SHIPPED_TIER) return std::optional<PoiClassification>{};
 
     return PoiClassification{cat, tier, flags};
