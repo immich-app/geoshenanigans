@@ -388,3 +388,51 @@ TEST(a_river_way_is_its_waterway_relations_whichever_input_holds_the_relation) {
               std::vector<std::string>({"Limmat River"}));
     }
 }
+
+TEST(a_way_is_read_for_the_water_relations_of_every_input_whichever_input_holds_them) {
+    // The first input holds a river area, an unnamed river way through it
+    // and an untagged way round a lake; the second, the waterway relation
+    // the river way is a member of and the lake relation of the untagged
+    // way, which nothing in the first asks the water layer to read.
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    std::vector<TestObject> first, second;
+    const int32_t corners[4][2] = {{0, 0}, {0, 10000}, {10000, 10000}, {10000, 0}};
+    for (int k = 0; k < 4; k++) {
+        first.push_back(node(k + 1, lat0 + corners[k][0], lng0 + corners[k][1]));
+        first.push_back(node(k + 11, lat0 + 100000 + corners[k][0], lng0 + corners[k][1]));
+    }
+    first.push_back(way(120, {1, 2, 3, 4, 1}, {{"natural", "water"}, {"water", "river"}}));
+    first.push_back(node(5, lat0 + 2000, lng0 + 2000));
+    first.push_back(node(6, lat0 + 6000, lng0 + 6000));
+    first.push_back(way(121, {5, 6}, {{"waterway", "river"}}));
+    first.push_back(way(130, {11, 12, 13, 14, 11}));
+    second.push_back(relation(900, {{"type", "waterway"}, {"waterway", "river"}, {"name", "Limmat"}}, {{121, ""}}));
+    second.push_back(relation(500, {{"type", "multipolygon"}, {"natural", "water"}, {"water", "lake"}, {"name", "Testsee"}},
+                              {{130, "outer"}}));
+    const ScratchDir root("water-inputs-relations");
+    const std::string a = root.path() + "/first.osm.pbf", b = root.path() + "/second.osm.pbf";
+    write_test_pbf(a, sorted(first), 1000);
+    write_test_pbf(b, sorted(second), 1000);
+    for (const auto& [name, inputs] : std::vector<std::pair<std::string, std::vector<std::string>>>{
+             {"ab", {a, b}}, {"ba", {b, a}}}) {
+        const std::string out = root.path() + "/" + name;
+        std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out};
+        words.insert(words.end(), inputs.begin(), inputs.end());
+        words.insert(words.end(), {"--multi-output", "--multi-quality"});
+        REQUIRE(gctest::run(words, out + ".log"));
+        CHECK(names_in(bytes_of(out + "/planet/water/all/exact/strings_core.bin")) ==
+              std::vector<std::string>({"Limmat", "Testsee"}));
+    }
+}
+
+TEST(a_water_relations_member_way_of_an_id_past_two_billion_is_read) {
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    std::vector<TestObject> objects;
+    const int32_t corners[4][2] = {{0, 0}, {0, 10000}, {10000, 10000}, {10000, 0}};
+    for (int k = 0; k < 4; k++) objects.push_back(node(k + 1, lat0 + corners[k][0], lng0 + corners[k][1]));
+    objects.push_back(way(2000000130, {1, 2, 3, 4, 1}));
+    objects.push_back(relation(500, {{"type", "multipolygon"}, {"natural", "water"}, {"water", "lake"}, {"name", "Hochsee"}},
+                               {{2000000130, "outer"}}));
+    const ScratchDir root("water-high-way-id");
+    CHECK(planet_water_names(objects, root.path() + "/out") == std::vector<std::string>({"Hochsee"}));
+}

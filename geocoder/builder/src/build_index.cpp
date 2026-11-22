@@ -1888,8 +1888,6 @@ static std::pair<size_t, std::future<void>> grow_beside(std::vector<T>& out, con
     return {out.size(), std::async(std::launch::async, [&out, n] { grow_by(out, n); })};
 }
 
-// Whether an argument reads as the scale list --multi-quality once took
-// (0,0.2,0.5): digits, dots and commas.
 // A way's tags as the water layer reads them (water::object_tags).
 static water::ObjectTags water_way_tags(const WayTags& t) {
     return water::object_tags([&](const char* key) -> const char* {
@@ -1917,6 +1915,44 @@ static bool water_way_wanted(const WayTags& t, bool member, bool in_waterway, Cl
     return (t.natural || t.landuse || t.waterway) && closed() && water::in_scope(water_way_tags(t));
 }
 
+// The water layer's relations of a block: the areas in scope, and the named
+// waterway=river or canal relations, which name river areas, with their
+// member ways.
+static void collect_water_relations(const PbfBlock& block, std::vector<water::CollectedArea>& areas,
+                                    std::vector<water::CollectedWaterway>& waterways) {
+    for (const auto& rel : block.relations) {
+        const char* w_type = rel.tag("type");
+        auto tag = [&](const char* key) { return rel.tag(key); };
+        if (is_area_relation_type(w_type)) {
+            water::ObjectTags tags = water::object_tags(tag);
+            if (!water::in_scope(tags)) continue;
+            water::CollectedArea area;
+            area.id = rel.id;
+            area.tags = std::move(tags);
+            for (size_t mi = 0; mi < rel.members.size(); mi++)
+                if (rel.members[mi].type == 'w') area.members.emplace_back(rel.members[mi].ref, rel.member_role(mi));
+            if (!area.members.empty()) areas.push_back(std::move(area));
+        } else if (w_type && std::strcmp(w_type, "waterway") == 0 && water::is_naming_waterway(rel.tag("waterway"))) {
+            const char* w_name = rel.tag("name");
+            const char* w_name_en = rel.tag("name:en");
+            if (w_name && !*w_name) w_name = nullptr;
+            if (w_name_en && !*w_name_en) w_name_en = nullptr;
+            if (!w_name && !w_name_en) continue;
+            water::CollectedWaterway way;
+            way.id = rel.id;
+            way.name = w_name_en ? w_name_en : w_name;
+            way.local_name = w_name ? w_name : w_name_en;
+            way.english = w_name_en != nullptr;
+            way.qid = water::qid_of(rel.tag("wikidata"));
+            for (const auto& m : rel.members)
+                if (m.type == 'w') way.ways.push_back(m.ref);
+            if (!way.ways.empty()) waterways.push_back(std::move(way));
+        }
+    }
+}
+
+// Whether an argument reads as the scale list --multi-quality once took
+// (0,0.2,0.5): digits, dots and commas.
 static bool is_scale_list(const char* arg) {
     if (!*arg) return false;
     for (const char* c = arg; *c; c++)
@@ -2080,6 +2116,31 @@ static int run(int argc, char* argv[]) {
         WayGeometries spent_geometries;
         // What the passes collect for the water layer, over every input.
         water::Collected water_collected;
+        // Of several inputs, the water relations of all of them, in input
+        // order, before any input's ways: a way the layer reads for a
+        // relation (an area's member, a river way of no name of its own)
+        // is read whichever input holds the relation.
+        const bool water_relations_read = input_files.size() > 1;
+        if (water_relations_read) {
+            auto _wt = std::chrono::steady_clock::now();
+            auto _wc = CpuTicks::now();
+            for (const auto& input_file : input_files) {
+                PbfFile pbf(input_file, num_threads);
+                std::vector<std::pair<std::vector<water::CollectedArea>, std::vector<water::CollectedWaterway>>> found(
+                    pbf.thread_count());
+                pbf.read_blocks([&](PbfBlock& block, unsigned thread) {
+                    collect_water_relations(block, found[thread].first, found[thread].second);
+                });
+                for (auto& [areas, waterways] : found) {
+                    std::move(areas.begin(), areas.end(), std::back_inserter(water_collected.relations));
+                    std::move(waterways.begin(), waterways.end(), std::back_inserter(water_collected.waterways));
+                }
+            }
+            std::cerr << "  Water: " << water_collected.relations.size() << " area relations and "
+                      << water_collected.waterways.size() << " waterway relations over " << input_files.size()
+                      << " inputs" << std::endl;
+            log_phase("Water relations of every input", _wt, _wc);
+        }
         for (const auto& input_file : input_files) {
             std::cerr << "Processing " << input_file << "..." << std::endl;
 
@@ -2375,38 +2436,9 @@ static int run(int argc, char* argv[]) {
                             }
                         }
                     }
-                    // --- Water relations (same pass): areas, and the
-                    // waterways that name river areas ---
-                    for (auto& rel : block.relations) {
-                        const char* w_type = rel.tag("type");
-                        auto tag = [&](const char* key) { return rel.tag(key); };
-                        if (is_area_relation_type(w_type)) {
-                            water::ObjectTags tags = water::object_tags(tag);
-                            if (!water::in_scope(tags)) continue;
-                            water::CollectedArea area;
-                            area.id = rel.id;
-                            area.tags = std::move(tags);
-                            for (size_t mi = 0; mi < rel.members.size(); mi++)
-                                if (rel.members[mi].type == 'w') area.members.emplace_back(rel.members[mi].ref, rel.member_role(mi));
-                            if (!area.members.empty()) mine.water_areas.push_back(std::move(area));
-                        } else if (w_type && std::strcmp(w_type, "waterway") == 0 &&
-                                   water::is_naming_waterway(rel.tag("waterway"))) {
-                            const char* w_name = rel.tag("name");
-                            const char* w_name_en = rel.tag("name:en");
-                            if (w_name && !*w_name) w_name = nullptr;
-                            if (w_name_en && !*w_name_en) w_name_en = nullptr;
-                            if (!w_name && !w_name_en) continue;
-                            water::CollectedWaterway way;
-                            way.id = rel.id;
-                            way.name = w_name_en ? w_name_en : w_name;
-                            way.local_name = w_name ? w_name : w_name_en;
-                            way.english = w_name_en != nullptr;
-                            way.qid = water::qid_of(rel.tag("wikidata"));
-                            for (const auto& m : rel.members)
-                                if (m.type == 'w') way.ways.push_back(m.ref);
-                            if (!way.ways.empty()) mine.waterways.push_back(std::move(way));
-                        }
-                    }
+                    // --- Water relations (same pass), unless every input's
+                    // were read before the first input's ways ---
+                    if (!water_relations_read) collect_water_relations(block, mine.water_areas, mine.waterways);
                 });
                 // Which thread read a block is down to timing, so this join
                 // order is as arbitrary as the shared lock's was.
@@ -2483,17 +2515,20 @@ static int run(int argc, char* argv[]) {
             // waterways' are in water_collected.waterway_of_way).
             water::index_collected(water_collected);
             std::vector<uint8_t> water_way_bits(MAX_WAY_ID / 8 + 1, 0);
+            // The member ways of ids the bits don't reach.
+            std::unordered_set<int64_t> water_ways_past;
             size_t water_way_count = 0;
             auto mark_water_way = [&](int64_t way_id) {
-                if (way_id > 0 && static_cast<size_t>(way_id) < MAX_WAY_ID) {
+                if (way_id > 0 && static_cast<size_t>(way_id) < MAX_WAY_ID)
                     water_way_bits[way_id / 8] |= (1 << (way_id % 8));
-                    water_way_count++;
-                }
+                else
+                    water_ways_past.insert(way_id);
+                water_way_count++;
             };
             for (const auto& rel : water_collected.relations)
                 for (const auto& [way_id, role] : rel.members) mark_water_way(way_id);
             auto is_water_way = [&](int64_t id) -> bool {
-                if (id <= 0 || static_cast<size_t>(id) >= MAX_WAY_ID) return false;
+                if (id <= 0 || static_cast<size_t>(id) >= MAX_WAY_ID) return water_ways_past.count(id) > 0;
                 return water_way_bits[id / 8] & (1 << (id % 8));
             };
             auto in_waterway = [&](const WayTags& t, int64_t id) {
@@ -3619,10 +3654,12 @@ static int run(int argc, char* argv[]) {
                     auto& wg = water_collected.member_geometries;
                     for (auto& local : tld) {
                         for (auto& g : local.water_way_geoms) {
+                            // A way an earlier input held keeps that input's geometry.
+                            if (wg.ways.count(g.way_id)) continue;
                             const size_t at = wg.coords.size();
                             wg.coords.insert(wg.coords.end(), g.locs.begin(), g.locs.end());
-                            wg.ways.try_emplace(g.way_id, WayGeometries::Way{at, static_cast<uint32_t>(g.locs.size()),
-                                                                             g.first_node_id, g.last_node_id});
+                            wg.ways.emplace(g.way_id, WayGeometries::Way{at, static_cast<uint32_t>(g.locs.size()),
+                                                                         g.first_node_id, g.last_node_id});
                         }
                         free_storage(local.water_way_geoms);
                         std::move(local.water_closed.begin(), local.water_closed.end(),
