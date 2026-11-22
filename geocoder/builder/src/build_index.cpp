@@ -63,6 +63,7 @@
 #include "tiger.h"
 #include "way_tags.h"
 #include "node_index.h"
+#include "paged_bits.h"
 #include "string_dict.h"
 #include "vertex_pack.h"
 #include "memory_limit.h"
@@ -2532,13 +2533,15 @@ static int run(int argc, char* argv[]) {
             // The water layer's relation member ways: the areas' (the
             // waterways' are in water_collected.waterway_of_way).
             water::index_collected(water_collected);
-            std::vector<uint8_t> water_way_bits(MAX_WAY_ID / 8 + 1, 0);
+            // In pages, which only the member ways' ids allocate: an extract
+            // without water relations holds none.
+            PagedBits water_way_bits(MAX_WAY_ID);
             // The member ways of ids the bits don't reach.
             std::unordered_set<int64_t> water_ways_past;
             size_t water_way_count = 0;
             auto mark_water_way = [&](int64_t way_id) {
                 if (way_id > 0 && static_cast<size_t>(way_id) < MAX_WAY_ID)
-                    water_way_bits[way_id / 8] |= (1 << (way_id % 8));
+                    water_way_bits.set(static_cast<uint64_t>(way_id));
                 else
                     water_ways_past.insert(way_id);
                 water_way_count++;
@@ -2547,7 +2550,7 @@ static int run(int argc, char* argv[]) {
                 for (const auto& [way_id, role] : rel.members) mark_water_way(way_id);
             auto is_water_way = [&](int64_t id) -> bool {
                 if (id <= 0 || static_cast<size_t>(id) >= MAX_WAY_ID) return water_ways_past.count(id) > 0;
-                return water_way_bits[id / 8] & (1 << (id % 8));
+                return water_way_bits.test(static_cast<uint64_t>(id));
             };
             auto in_waterway = [&](const WayTags& t, int64_t id) {
                 return water::is_naming_waterway(t.waterway) && water_collected.waterway_of_way.count(id) > 0;
