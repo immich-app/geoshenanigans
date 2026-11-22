@@ -209,6 +209,57 @@ TEST(the_same_polygon_cuts_the_same_way_whatever_its_rings_start_and_run) {
     CHECK(keys_of(a) == keys_of(c));
 }
 
+TEST(each_lobe_a_cut_leaves_on_one_side_keeps_its_own_key_whatever_its_rings_start_and_run) {
+    // A lake shaped as a C open to the east, from (47, 8) to (48.6, 9.6), its
+    // bay from 47.6 to 48 north and from 8.2 east: the first cut, along the
+    // meridian of 8.388608, leaves two arms east of it. Islands in rows over
+    // both arms and the back.
+    SplitPolygon p;
+    const int32_t s = 470000000, w = 80000000;
+    p.outer.v = {pt(s, w), pt(s, w + 16000000), pt(s + 6000000, w + 16000000), pt(s + 6000000, w + 2000000),
+                 pt(s + 10000000, w + 2000000), pt(s + 10000000, w + 16000000), pt(s + 16000000, w + 16000000),
+                 pt(s + 16000000, w)};
+    for (int64_t e = 0; e < 8; e++) p.outer.way.push_back(100 + e);
+    for (int i = 0; i < 16; i++)
+        for (int j = 0; j < 16; j++) {
+            const int32_t lat = s + 200000 + i * 1000000, lng = w + 200000 + j * 1000000;
+            if (lat + 100000 > s + 5900000 && lat < s + 10100000 && lng + 100000 > w + 1900000) continue;
+            SplitRing h = box_ring(lat, lng, 100000, 100000, 1000 + 10 * (i * 16 + j));
+            std::reverse(h.v.begin(), h.v.end());
+            p.holes.push_back(h);
+        }
+    // Each piece's key, and the smallest vertex of its outer ring.
+    auto corners = [](const std::vector<SplitPolygon>& pieces) {
+        std::map<uint64_t, std::pair<int32_t, int32_t>> out;
+        for (const SplitPolygon& q : pieces) {
+            std::pair<int32_t, int32_t> least = {INT32_MAX, INT32_MAX};
+            for (const PackedLocation& v : q.outer.v) least = std::min(least, std::make_pair(v.lat_e7, v.lon_e7));
+            CHECK(out.emplace(q.key, least).second);
+        }
+        return out;
+    };
+    auto turn = [](SplitRing& ring) {
+        std::reverse(ring.v.begin(), ring.v.end());
+        std::reverse(ring.way.begin(), ring.way.end());
+        std::rotate(ring.way.begin(), ring.way.begin() + 1, ring.way.end());
+    };
+    const std::vector<SplitPolygon> a = split_polygon(p, 64);
+    REQUIRE(a.size() > 2);
+    const auto want = corners(a);
+    for (int variant = 0; variant < 4; variant++) {
+        SplitPolygon q = p;
+        if (variant & 1) {
+            turn(q.outer);
+            for (SplitRing& h : q.holes) turn(h);
+        }
+        if (variant & 2) {
+            std::rotate(q.outer.v.begin(), q.outer.v.begin() + 3, q.outer.v.end());
+            std::rotate(q.outer.way.begin(), q.outer.way.begin() + 3, q.outer.way.end());
+        }
+        CHECK(corners(split_polygon(q, 64)) == want);
+    }
+}
+
 TEST(a_cut_puts_its_vertex_where_it_does_with_the_edge_run_the_other_way) {
     // Half way between two units it rounds away from zero, whichever end
     // the edge starts at and on either side of zero.
