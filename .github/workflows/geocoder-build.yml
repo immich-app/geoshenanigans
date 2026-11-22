@@ -839,7 +839,7 @@ jobs:
           # that much of the free space alone.
           RESERVE_KIB=$(find "$WORKDIR/output" -type f \
             \( -name '*.bin' -o -name strings_layout.json -o -name poi_meta.json -o -name attribution.json \
-            -o -path '*/search/*' \) \
+            -o -name poi_attribution.json -o -path '*/search/*' \) \
             ! -name '*.zst' -printf '%s\n' | awk '{s += $1} END {printf "%d", (s + 1023) / 1024}')
 
           # Per variant: diff, apply to a scratch copy, verify the whole client

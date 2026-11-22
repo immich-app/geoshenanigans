@@ -3,7 +3,10 @@
 // attribution.json: the entries of the sources its data came from, as
 // configurations.template.json's top-level `attribution` list gives them
 // (without their `applies_to`), in its order. Every dataset takes one mode
-// dir, so every dataset holds its credit.
+// dir, so every dataset holds its credit. A POI tier dir holds
+// poi_attribution.json where Wikidata's sitelinks ranked its POIs: Wikidata's
+// entry, beside the mode dir's credit of the OpenStreetMap data, by a name of
+// its own, as a dataset's files land in one dir by name.
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
@@ -13,7 +16,7 @@
 
 // The sources, as bits of a set.
 enum AttributionSource : uint8_t {
-    // Everything but the two below.
+    // Everything but the three below.
     ATTRIBUTION_OSM = 1 << 0,
     // Postcode centroids where OSM has none (--external-postcodes):
     // GeoNames's GB_full, derived from Ordnance Survey's Code-Point Open,
@@ -22,6 +25,9 @@ enum AttributionSource : uint8_t {
     // US address ranges, their ZIPs, and postcode centroids where OSM has
     // none (--tiger-data).
     ATTRIBUTION_TIGER = 1 << 2,
+    // The sitelink counts of the POIs' Wikidata items, which their
+    // importance takes (--wikidata-sitelinks).
+    ATTRIBUTION_WIKIDATA = 1 << 3,
 };
 
 struct AttributionEntry {
@@ -68,6 +74,10 @@ inline constexpr AttributionEntry kAttribution[] = {
      "https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html", "Public domain", nullptr,
      {"Address ranges and ZIP codes in the United States from the US Census Bureau's TIGER/Line files, which are in "
       "the public domain."}},
+    {ATTRIBUTION_WIKIDATA, "wikidata", "Wikidata", "https://www.wikidata.org/", "CC0 1.0",
+     "https://creativecommons.org/publicdomain/zero/1.0/",
+     {"POI importance from the sitelink counts of the POIs' Wikidata items; Wikidata's structured data is available "
+      "under CC0 1.0."}},
 };
 
 // `s` as a JSON string: quotes and backslashes escaped, control characters
@@ -113,8 +123,11 @@ inline std::string attribution_json(uint8_t sources) {
     return out + "\n]\n";
 }
 
-inline void write_attribution(const std::string& dir, uint8_t sources) {
-    const std::string path = dir + "/attribution.json";
+inline constexpr const char* ATTRIBUTION_FILE = "attribution.json";
+inline constexpr const char* POI_ATTRIBUTION_FILE = "poi_attribution.json";
+
+inline void write_attribution(const std::string& dir, uint8_t sources, const char* name = ATTRIBUTION_FILE) {
+    const std::string path = dir + "/" + name;
     std::ofstream f(path, std::ios::binary);
     f << attribution_json(sources);
     f.flush();

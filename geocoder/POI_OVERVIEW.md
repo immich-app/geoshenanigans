@@ -198,8 +198,11 @@ POI data is patched independently — each tier directory gets its own patch fil
 | `strings_layout.json` | — | String tier layout |
 | `poi_meta.json` | — | Category names, scoring parameters |
 
-The mode dir beside a POI tier credits the data in its `attribution.json`;
-the POI dirs hold OpenStreetMap data only, which that covers.
+The mode dir beside a POI tier credits the data in its `attribution.json`.
+A POI tier dir of a build ranked by Wikidata's sitelinks (the nightly's)
+holds `poi_attribution.json`, crediting Wikidata (CC0) for the importance it
+takes; the rest of the POI data is OpenStreetMap's, which the mode dir's
+covers.
 
 ## Test Portal
 

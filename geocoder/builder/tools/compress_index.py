@@ -60,11 +60,12 @@ MAX_THREADS_PER_FILE = 16
 UNIT_FAILED = 3
 
 # The JSON files a dataset holds beside its .bin files: the sidecars the
-# server's Index::load reads, and each mode dir's credit of its data. They go
+# server's Index::load reads, each mode dir's credit of its data, and a POI
+# tier dir's credit of the Wikidata sitelinks that rank its POIs. They go
 # into configurations.files like any index file so the region downloader can
 # fetch them; the raw copy stays for clients that read it directly
 # (test-portal).
-JSON_FILES = {"strings_layout.json", "poi_meta.json", "attribution.json"}
+JSON_FILES = {"strings_layout.json", "poi_meta.json", "attribution.json", "poi_attribution.json"}
 
 # Every file under a region's search/ dir is a place search index file
 # (build_search_indexes.py), published like the .bin files.

@@ -90,6 +90,25 @@ TEST(attribution_of_geonames_carries_the_credit_of_code_point_open) {
     }
 }
 
+TEST(attribution_of_wikidata_is_its_cc0_entry_alone) {
+    // A POI tier ranked by Wikidata's sitelinks credits them in its own
+    // poi_attribution.json; its OpenStreetMap data is the mode dir's to
+    // credit.
+    const std::string wikidata = attribution_json(ATTRIBUTION_WIKIDATA);
+    CHECK(wikidata.find("\"id\": \"osm\"") == std::string::npos);
+    for (const char* line : {
+             R"("id": "wikidata")", R"("text": "Wikidata")", R"("url": "https://www.wikidata.org/")",
+             R"("licence": "CC0 1.0")", R"("licence_url": "https://creativecommons.org/publicdomain/zero/1.0/")",
+             R"("POI importance from the sitelink counts of the POIs' Wikidata items; Wikidata's structured data is )"
+             R"(available under CC0 1.0.")"}) {
+        if (wikidata.find(line) == std::string::npos) std::printf("    %s\n", line);
+        CHECK(wikidata.find(line) != std::string::npos);
+    }
+    const std::string every =
+        attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES | ATTRIBUTION_TIGER | ATTRIBUTION_WIKIDATA);
+    CHECK(every.find("\"id\": \"tiger\"") < every.find("\"id\": \"wikidata\""));
+}
+
 namespace {
 
 // The UTF-8 of code point `c`.
@@ -200,7 +219,8 @@ TEST(attribution_entries_are_the_templates) {
     const std::string key = "\"attribution\": [";
     const size_t at = json.find(key);
     REQUIRE(at != std::string::npos && json.find(key, at + 1) == std::string::npos);
-    const std::string all = attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES | ATTRIBUTION_TIGER);
+    const std::string all =
+        attribution_json(ATTRIBUTION_OSM | ATTRIBUTION_GEONAMES | ATTRIBUTION_TIGER | ATTRIBUTION_WIKIDATA);
     const std::string templates = canonical(json, at + key.size() - 1, "applies_to"), written = canonical(all);
     if (templates != written) std::printf("    template: %s\n    written:  %s\n", templates.c_str(), written.c_str());
     CHECK(templates == written);

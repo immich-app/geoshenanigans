@@ -1107,17 +1107,27 @@ mod tests {
     // PoiMeta::load reads poi_meta.json; a selection that resolves without
     // them downloads GiBs into a dir that can never load. Every selection
     // takes one mode dir, and with it that dir's attribution.json, the credit
-    // of the data the dataset holds.
+    // of the data the dataset holds; one with a POI tier takes the tier dir's
+    // poi_attribution.json too where the build wrote one (an optional file),
+    // the credit of the sitelinks that rank its POIs, by a name of its own,
+    // as downloads land flat by name.
     #[test]
     fn template_selections_include_load_sidecars() {
         let (v, c) = template();
         for s in template_selections(&v) {
-            let paths = resolve_files(&c, &s).unwrap().paths;
+            let resolved = resolve_files(&c, &s).unwrap();
+            let paths = resolved.paths;
             let has = |name: &str| paths.iter().any(|p| basename(p) == name);
             assert!(has("strings_layout.json"), "{:?} lacks strings_layout.json", s);
             assert!(has("admin_cells.bin"), "{:?} lacks admin_cells.bin", s);
             assert_eq!(has("poi_meta.json"), s.poi_tier != "none", "{:?} poi_meta.json", s);
-            assert_eq!(paths.iter().filter(|p| basename(p) == "attribution.json").count(), 1, "{:?} attribution.json", s);
+            let credits: Vec<&String> = paths.iter().filter(|p| basename(p) == "attribution.json").collect();
+            assert_eq!(credits.len(), 1, "{:?} attribution.json", s);
+            assert!(!resolved.optional.contains(credits[0].as_str()), "{:?}", s);
+            let poi_credits: Vec<&String> = paths.iter().filter(|p| basename(p) == "poi_attribution.json").collect();
+            let poi_credit = format!("{}/poi/{}/poi_attribution.json", s.region, s.poi_tier);
+            assert_eq!(poi_credits, if s.poi_tier == "none" { vec![] } else { vec![&poi_credit] }, "{:?}", s);
+            assert!(poi_credits.iter().all(|p| resolved.optional.contains(p.as_str())), "{:?}", s);
         }
     }
 

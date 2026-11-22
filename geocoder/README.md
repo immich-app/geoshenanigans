@@ -224,6 +224,7 @@ to the same files ([builder/PATCHING.md](builder/PATCHING.md#transport-units)).
 | `strings_layout.json` | Start and end of each string tier, which place every string offset |
 | `poi_meta.json` | POI category names and scoring parameters |
 | `attribution.json` | In each mode dir: the credit of the data it holds, one entry per source ([PATCHING.md](PATCHING.md#attribution)) |
+| `poi_attribution.json` | In a POI tier dir: Wikidata's credit, where its sitelinks ranked the POIs ([PATCHING.md](PATCHING.md#attribution)) |
 
 ## Building from Source
 
@@ -328,12 +329,14 @@ The indexes are a derivative database of [OpenStreetMap](https://www.openstreetm
 (© OpenStreetMap contributors, ODbL 1.0), with GB postcode centroids from
 [GeoNames](https://www.geonames.org/) (CC BY 4.0), derived from Ordnance
 Survey's Code-Point Open (OGL v3.0; contains OS, Royal Mail and National
-Statistics data), and US address ranges and ZIP codes from the US Census Bureau's TIGER/Line
-files (public domain). The `attribution` list of each build's
-configurations.json gives every source's credit and licence, and each mode
-dir's `attribution.json` the ones of the data it holds
-([PATCHING.md](PATCHING.md#attribution)); show those wherever the data is
-shown. The licence below is the code's.
+Statistics data), US address ranges and ZIP codes from the US Census
+Bureau's TIGER/Line files (public domain), and POI importance from
+[Wikidata](https://www.wikidata.org/)'s sitelink counts (CC0). The
+`attribution` list of each build's configurations.json gives every source's
+credit and licence, and each mode dir's `attribution.json` and POI tier dir's
+`poi_attribution.json` the ones of the data it holds
+([PATCHING.md](PATCHING.md#attribution));
+show those wherever the data is shown. The licence below is the code's.
 
 ## License
 

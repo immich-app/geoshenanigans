@@ -58,9 +58,10 @@ selection_files() {
         echo "quality/$QUALITY $f"
     done
     # The POI tier's records and strings; its string layout is the one every
-    # dir sharing the strings holds.
+    # dir sharing the strings holds; the credit of the sitelinks that rank its
+    # POIs.
     for f in poi_records.bin poi_vertices.bin poi_cells.bin poi_entries.bin strings_poi.bin \
-             strings_layout.json poi_meta.json; do
+             strings_layout.json poi_meta.json poi_attribution.json; do
         echo "poi/$POI_TIER $f"
     done
 }
@@ -133,10 +134,11 @@ fetch_unit() {
 }
 
 # Files a region may lack (interp_postcodes.bin outside TIGER regions, the
-# postcode centroids): the template's optional files of mode full.
+# postcode centroids, the credit of sitelinks a build ranked no POIs by): the
+# template's optional files of mode full and the POI tiers.
 optional_file() {
     case "$1" in
-        interp_postcodes.bin|postcode_centroids.bin|postcode_centroid_cells.bin)
+        interp_postcodes.bin|postcode_centroids.bin|postcode_centroid_cells.bin|poi_attribution.json)
             return 0 ;;
     esac
     return 1

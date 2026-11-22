@@ -1621,3 +1621,41 @@ TEST(each_mode_dir_credits_the_sources_of_its_data) {
         }
     }
 }
+
+// A build that ranks its POIs by Wikidata's sitelinks (--wikidata-sitelinks)
+// credits Wikidata in each POI tier dir's poi_attribution.json, beside the
+// mode dir's credit of the OpenStreetMap data; one without them writes none
+// there. Downloads land flat by name, so no POI tier dir holds an
+// attribution.json, which would take the place of the mode dir's.
+TEST(poi_tiers_ranked_by_wikidata_sitelinks_credit_wikidata) {
+    const ScratchDir root("wikidata-credit-build");
+    const std::string pbf = root.path() + "/fixture.osm.pbf", log = root.path() + "/build.log";
+    const int32_t lat0 = 470000000, lng0 = 80000000;
+    write_fixture_with(pbf, {node(990, lat0 + 1404000, lng0 + 1424000,
+                                  {{"name", "Museum Testdorf"}, {"tourism", "museum"}, {"wikidata", "Q4242"}})});
+    // Q4242 of 9 sitelinks, packed as extract_wikidata_sitelinks.py packs
+    // them ('<IH').
+    const std::string sitelinks = root.path() + "/qid_sitelinks.bin";
+    {
+        const uint8_t entry[6] = {0x92, 0x10, 0, 0, 9, 0};
+        std::ofstream f(sitelinks, std::ios::binary);
+        f.write(reinterpret_cast<const char*>(entry), sizeof entry);
+        REQUIRE(f.good());
+    }
+    using Ids = std::vector<std::string>;
+    for (const bool ranked : {true, false}) {
+        const std::string out = root.path() + (ranked ? "/ranked" : "/plain");
+        std::vector<std::string> words = {GEOCODER_BUILD_INDEX_BIN, out, pbf};
+        if (ranked) words.insert(words.end(), {"--wikidata-sitelinks", sitelinks});
+        REQUIRE(gctest::run(words, log));
+        const auto files = tree(out);
+        for (const char* tier : {"major", "notable", "all"}) {
+            const std::string dir = std::string("planet/poi/") + tier + "/", at = dir + "poi_attribution.json";
+            REQUIRE(files.count(dir + "poi_records.bin"));
+            if (credited(files, at) != (ranked ? Ids{"wikidata"} : Ids{"none"})) std::printf("    %s\n", at.c_str());
+            CHECK(credited(files, at) == (ranked ? Ids{"wikidata"} : Ids{"none"}));
+            CHECK(!files.count(dir + "attribution.json"));
+        }
+        CHECK(credited(files, "planet/attribution.json") == Ids{"osm"});
+    }
+}

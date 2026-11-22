@@ -600,8 +600,8 @@ Client Files: marker 0xFFFFFFF2 (u32) + n (u32)
   Every file the new variant dir holds except *.osm_ids, *.gcpatch, *.zst and
   dotfiles, sorted by name, each once: at most 1024 files (MAX_CLIENT_FILES)
   of names at most 255 bytes long; the diff refuses a new dir it cannot list
-  so. JSON files (strings_layout.json, poi_meta.json, a mode dir's
-  attribution.json) are inline and written verbatim. The patcher builds
+  so. JSON files (strings_layout.json, poi_meta.json, attribution.json,
+  poi_attribution.json) are inline and written verbatim. The patcher builds
   anything not listed in its scratch dir, and every listed file must exist
   at its listed size.
 

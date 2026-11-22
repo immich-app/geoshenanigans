@@ -69,6 +69,21 @@
         "mode.no-addresses",
         "mode.admin"
       ]
+    },
+    {
+      "id": "wikidata",
+      "text": "Wikidata",
+      "url": "https://www.wikidata.org/",
+      "licence": "CC0 1.0",
+      "licence_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+      "notices": [
+        "POI importance from the sitelink counts of the POIs' Wikidata items; Wikidata's structured data is available under CC0 1.0."
+      ],
+      "applies_to": [
+        "poi_tier.major",
+        "poi_tier.notable",
+        "poi_tier.all"
+      ]
     }
   ],
   "axes": {
@@ -364,6 +379,9 @@
         "{region}/poi/major/strings_poi.bin",
         "{region}/poi/major/strings_layout.json",
         "{region}/poi/major/poi_meta.json"
+      ],
+      "optional_files": [
+        "{region}/poi/major/poi_attribution.json"
       ]
     },
     "poi_tier.notable": {
@@ -375,6 +393,9 @@
         "{region}/poi/notable/strings_poi.bin",
         "{region}/poi/notable/strings_layout.json",
         "{region}/poi/notable/poi_meta.json"
+      ],
+      "optional_files": [
+        "{region}/poi/notable/poi_attribution.json"
       ]
     },
     "poi_tier.all": {
@@ -386,6 +407,9 @@
         "{region}/poi/all/strings_poi.bin",
         "{region}/poi/all/strings_layout.json",
         "{region}/poi/all/poi_meta.json"
+      ],
+      "optional_files": [
+        "{region}/poi/all/poi_attribution.json"
       ]
     }
   },

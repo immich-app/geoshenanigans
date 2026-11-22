@@ -159,7 +159,7 @@ class TemplateTest(unittest.TestCase):
 
     def test_every_selection_takes_each_admin_geometry_file_once_from_its_dir(self):
         # Downloads land flat by name: a second copy of an admin geometry file, or a .bin name twice,
-        # would mix two sets of arcs.
+        # would mix two sets of arcs, and a sidecar name twice would keep one dir's sidecar alone.
         cfg = load_template()
         presets = [p["selections"] for p in cfg["presets"]]
         for sel in selections(cfg) + presets:
@@ -174,6 +174,9 @@ class TemplateTest(unittest.TestCase):
                 self.assertEqual([p for p in paths if os.path.basename(p) == name], [f"{dir_}/{name}"], sel)
             bins = [n for n in names if n.endswith(".bin")]
             self.assertEqual(len(bins), len(set(bins)), sel)
+            # Every dir holds the same strings_layout.json; any other JSON name is one file's.
+            sidecars = [n for n in names if n.endswith(".json") and n != "strings_layout.json"]
+            self.assertEqual(len(sidecars), len(set(sidecars)), sel)
             self.assertEqual([n for n in names if n == "admin_vertices.bin" or n.startswith("postal_")], [], sel)
 
     def test_presets_take_their_boundaries_from_the_tier_they_name(self):
@@ -241,10 +244,10 @@ class TestPortalTest(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertEqual(run.stdout.strip(), str(load_template()["build"]["version"]))
 
-    # The page shows the answers of the planet's full dataset, whose attribution.json lists every
-    # source of the template, so its credit names each, in the template's order, with its licence
-    # and every notice of it: the GeoNames readme's warranty line too, a disclaimer CC BY 4.0
-    # keeps a notice of.
+    # The page shows the answers of the planet's full dataset and its POI tier, whose attribution.json
+    # and poi_attribution.json list every source of the template, so its credit names each, in the
+    # template's order, with its licence and every notice of it: the GeoNames readme's warranty line
+    # too, a disclaimer CC BY 4.0 keeps a notice of.
     def test_the_page_credits_every_source_of_the_template_with_its_notices(self):
         with open(os.path.join(PORTAL, "index.html"), encoding="utf-8") as f:
             page = f.read()

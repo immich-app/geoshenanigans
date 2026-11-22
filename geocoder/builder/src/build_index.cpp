@@ -362,6 +362,9 @@ struct BuildConfig {
     bool multi_quality = false;
     std::string output_dir;
     std::string prev_output_dir;
+    // The POIs' importance takes Wikidata's sitelink counts
+    // (--wikidata-sitelinks), which each POI tier dir credits.
+    bool poi_sitelinks = false;
 };
 
 // Shared nearest-named-street sweep used by the addr backfill and the POI
@@ -1396,6 +1399,9 @@ static void write_all_index_files(ParsedData& data, const BuildConfig& cfg, bool
                                                  names.size());
                     }
                     write_strings_layout(poi_dir, d.strings_tier_bases);
+                    // Wikidata's credit, where its sitelinks ranked the POIs;
+                    // the mode dir credits the rest.
+                    if (cfg.poi_sitelinks) write_attribution(poi_dir, ATTRIBUTION_WIKIDATA, POI_ATTRIBUTION_FILE);
 
                     // Write poi_meta.json (category metadata for the server)
                     {
@@ -2017,7 +2023,7 @@ static int run(int argc, char* argv[]) {
     }
 
     unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency() - 1);
-    BuildConfig cfg{num_threads, mode, multi_output, multi_quality, output_dir, prev_output_dir};
+    BuildConfig cfg{num_threads, mode, multi_output, multi_quality, output_dir, prev_output_dir, !sitelinks_data.empty()};
     {
         // Parse PBF files (always collect everything)
         if (input_files.empty()) {

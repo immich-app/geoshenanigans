@@ -24,7 +24,7 @@ builds/
       poi/
         major/         poi_cells.bin.zst + poi_entries.bin.zst + strings_poi.bin.zst
                        + pois.tt.zst + strings_layout.json(.zst) + poi_meta.json(.zst)
-                       + patch.gcpatch
+                       + poi_attribution.json(.zst) + patch.gcpatch
         notable/       ...
         all/           ...
     europe/
@@ -66,7 +66,8 @@ as they are.
 
 Every mode dir holds `attribution.json`, the credit of the data it holds
 (Attribution, below). A selection takes one mode dir, so every dataset holds
-its credit at `<dataset>/attribution.json`.
+its credit at `<dataset>/attribution.json`, and a dataset with a POI tier
+the tier's `poi_attribution.json` beside it where the build has one.
 
 ### Quality directory (pick one)
 
@@ -89,7 +90,7 @@ stored once; those two files are what the tiers differ in.
 | `poi/notable/` | 7 files | Major + notable POIs (museums, castles, stadiums, beaches, etc.) |
 | `poi/all/` | 7 files | All POIs including minor ones (picnic sites, small galleries, etc.) |
 
-POI files: `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin`, `strings_poi.bin`, `strings_layout.json`, `poi_meta.json`. POIs with Wikipedia/Wikidata tags are promoted one tier.
+POI files: `poi_records.bin`, `poi_vertices.bin`, `poi_cells.bin`, `poi_entries.bin`, `strings_poi.bin`, `strings_layout.json`, `poi_meta.json`, and `poi_attribution.json` (optional: Wikidata's credit, where its sitelinks ranked the POIs; Attribution, below). POIs with Wikipedia/Wikidata tags are promoted one tier.
 
 ## Transport units
 
@@ -279,9 +280,10 @@ selection: the first variant whose `when` names the selection's value on
 every axis it lists (a variant without `when` takes any selection). Its
 `component` is resolved like an axis component, `files`, `optional_files`,
 `replaces` and all.
-`strings_layout.json`, `poi_meta.json` and `attribution.json` are listed
-and compressed like the `.bin` files: the server can't load a region without
-the first two, and the last is the credit the data is owed.
+`strings_layout.json`, `poi_meta.json`, `attribution.json` and
+`poi_attribution.json` are listed and compressed like the `.bin` files: the
+server can't load a region without the first two, and the last two are the
+credit the data is owed.
 
 ## Attribution
 
@@ -299,6 +301,7 @@ The data is owed credit, and the dataset carries it in two places:
   | `geonames` | GeoNames: postcode centroids where OSM has none (GB_full, which the nightly loads), with the Royal Mail notice of its readme and the changes the dataset made (CC BY 4.0 section 3(a)(1)(B)) | CC BY 4.0 | the dirs of `full`, `no-addresses` and `admin`, the ones holding postcode centroids |
   | `codepoint-open` | Ordnance Survey Code-Point Open, which GB_full is derived from, with the Ordnance Survey, Royal Mail and National Statistics statements of its licence | OGL v3.0 | the same, always beside `geonames` |
   | `tiger` | US Census Bureau TIGER/Line: US address ranges and ZIPs, and postcode centroids where OSM has none | Public domain, credited as a courtesy | the same |
+  | `wikidata` | Wikidata: the sitelink counts of the POIs' items, which their importance takes (`--wikidata-sitelinks`, which the nightly passes) | CC0 1.0 | the POI tier dirs of a build ranked by them |
 
 - **`attribution.json`** in every mode dir (`full/`, `no-addresses/`,
   `admin/`, `admin-minimal/`, `admin-minimal-poi/`): a JSON array of the
@@ -308,11 +311,18 @@ The data is owed credit, and the dataset carries it in two places:
   GeoNames, TIGER's where it holds an interpolation or a centroid that did
   (so `europe/admin/` credits GeoNames and Code-Point Open,
   `north-america/full/` TIGER, and the admin-minimal dirs, which hold no
-  postcodes, OSM alone). The quality and POI dirs hold OpenStreetMap data
-  only, which the mode dir's OSM entry covers.
+  postcodes, OSM alone). The quality dirs hold OpenStreetMap data only,
+  which the mode dir's OSM entry covers.
+- **`poi_attribution.json`** in each POI tier dir (`poi/major/`,
+  `poi/notable/`, `poi/all/`) of a build whose POIs Wikidata's sitelinks
+  ranked: Wikidata's entry alone, in the same form. Their other data is
+  OpenStreetMap's, which the mode dir's OSM entry covers, so a dataset with a
+  POI tier credits the union of the two files. It has a name of its own as a
+  dataset's files land in one dir by name. The template lists it among the
+  tier's `optional_files`.
 
-A client shows the entries of the `attribution.json` it holds wherever it
-credits map data. Every reverse answer also carries Nominatim's `licence`
+A client shows the entries of the `attribution.json` and
+`poi_attribution.json` it holds wherever it credits map data. Every reverse answer also carries Nominatim's `licence`
 string (README.md).
 
 ## Client Decision Tree
@@ -334,10 +344,11 @@ string (README.md).
    - any other: as <path>.zst, decompressed and checked against its sha256
    - builds/{date}/europe/full/…                (24 files + up to 3 optional)
    - builds/{date}/europe/quality/simplified/…  (4 files)
-   - builds/{date}/europe/poi/notable/…         (7 files, optional)
-   The JSON files (strings_layout.json, poi_meta.json, attribution.json)
-   are part of the set: the server can't load a region without the first
-   two, and the last is the dataset's credit (Attribution, above).
+   - builds/{date}/europe/poi/notable/…         (7 files + 1 optional, with a POI tier)
+   The JSON files (strings_layout.json, poi_meta.json, attribution.json,
+   poi_attribution.json) are part of the set: the server can't load a region
+   without the first two, and the last two are the dataset's credit
+   (Attribution, above).
 6. Store build_version, patch_version, and date locally
 ```
 
