@@ -202,13 +202,15 @@ pub struct ResolvedFiles {
     pub paths: Vec<String>,
     /// Paths that may legitimately be missing from the manifest.
     pub optional: HashSet<String>,
-    /// Where each path goes in the region dir: its name, under the `dir` of
-    /// the first component listing it that has one (`water/arc_index.bin`).
+    /// Where each path a component with a `dir` lists goes in the region dir:
+    /// its name, under the `dir` of the first such component listing it
+    /// (`water/arc_index.bin`).
     pub dest: BTreeMap<String, String>,
 }
 
 impl ResolvedFiles {
-    /// Where the file at `path`, one of `paths`, goes in the region dir.
+    /// Where the file at `path`, one of `paths`, goes in the region dir: as
+    /// `dest` places it, else in the region dir itself by its name.
     pub fn dest<'a>(&'a self, path: &'a str) -> &'a str {
         self.dest.get(path).map_or_else(|| basename(path), String::as_str)
     }
@@ -315,8 +317,8 @@ pub fn resolve_files(cfg: &Configurations, sel: &RegionSelection) -> Result<Reso
         }
         for (f, is_optional) in c.files.iter().map(|f| (f, false)).chain(c.optional_files.iter().map(|f| (f, true))) {
             let path = substitute(f, sel);
-            if !dest.contains_key(&path) {
-                dest.insert(path.clone(), placed(id, c, basename(&path))?);
+            if let Some(dir) = dir_of_component(id, c)? {
+                dest.entry(path.clone()).or_insert_with(|| format!("{dir}/{}", basename(&path)));
             }
             if is_optional {
                 optional.insert(path.clone());
@@ -1294,6 +1296,31 @@ mod tests {
         let placed: Vec<(&str, &str)> = got.paths.iter().map(|p| (p.as_str(), got.dest(p))).collect();
         assert_eq!(placed, [("eu/full/admin_cells.bin", "admin_cells.bin"), ("eu/water/all/x/admin_cells.bin", "water/admin_cells.bin"),
                             ("eu/water/all/x/extra.bin", "water/extra.bin")]);
+    }
+
+    // A path components with and without a `dir` both list goes under the
+    // dir of the first listing it that has one, whichever lists it first:
+    // here the mode, without one, before the water value, then two water
+    // values' dirs, the first kept.
+    #[test]
+    fn resolve_files_places_a_path_in_the_dir_of_the_first_component_listing_it_with_one() {
+        let mut water = component(&["{region}/shared/admin_cells.bin"], &[], None);
+        water.dir = Some("water".into());
+        let mut extra = water.clone();
+        extra.dir = Some("extra".into());
+        water.variants = vec![Variant { when: BTreeMap::new(), component: "water.extra".into() }];
+        let c = cfg(vec![
+            ("mode.full", component(&["{region}/shared/admin_cells.bin"], &[], None)),
+            ("quality.simplified", component(&[], &[], None)),
+            ("poi_tier.none", component(&[], &[], None)),
+            ("water.all", water),
+            ("water.extra", extra),
+        ]);
+
+        let got = resolve_files(&c, &wet("eu", "full", "simplified", "none", "all")).unwrap();
+
+        let placed: Vec<(&str, &str)> = got.paths.iter().map(|p| (p.as_str(), got.dest(p))).collect();
+        assert_eq!(placed, [("eu/shared/admin_cells.bin", "water/admin_cells.bin")]);
     }
 
     /// The template, as JSON and as the downloader reads it.
