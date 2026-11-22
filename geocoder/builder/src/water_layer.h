@@ -2,12 +2,16 @@
 // their own, in dirs of their own under each region,
 // {region}/water/{all,major}/simplified/ and water/all/exact/, made of the
 // admin geometry's file names. Each holds:
-//   admin_polygons.bin + admin_rings.bin  one record per outer ring of an OSM
-//                                         object, with its holes, carrying
-//                                         the object's name, type code (in
-//                                         country_code) and area (its
+//   admin_polygons.bin + admin_rings.bin  one record per polygon it holds
+//                                         (an OSM object's outer ring, a
+//                                         marine area's polygon, or a grid
+//                                         piece of either, water_split.h),
+//                                         with its holes, carrying the
+//                                         object's name, type code (in
+//                                         country_code) and whole area (its
 //                                         polygons' exact areas less their
-//                                         holes, summed, square degrees)
+//                                         holes, summed, square degrees), so
+//                                         records' areas don't add up
 //   arc_index.bin + arc_vertices.bin      the tier's arcs (kWaterArcStage:
 //                                         rings cut at member way ends)
 //   admin_cells.bin + admin_entries.bin   the cell index at the admin cell

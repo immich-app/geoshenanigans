@@ -1983,8 +1983,9 @@ static int run(int argc, char* argv[]) {
     if (argc < 2) {
         std::cerr << "Usage: build-index <output-dir> <input.osm.pbf> [options]" << std::endl;
         std::cerr << "  <output-dir> must be new or empty" << std::endl;
-        std::cerr << "  Without --multi-output each region's dir is one whole index: the mode's files" << std::endl;
-        std::cerr << "  and the admin geometry at the exact tier" << std::endl;
+        std::cerr << "  Without --multi-output each region's dir is one whole index: the mode's files," << std::endl;
+        std::cerr << "  the admin geometry at the exact tier and <region>/water/ (the water layer's exact tier)"
+                  << std::endl;
         std::cerr << std::endl;
         std::cerr << "Options:" << std::endl;
         std::cerr << "  --street-level N       S2 cell level for streets (default: 17)" << std::endl;
