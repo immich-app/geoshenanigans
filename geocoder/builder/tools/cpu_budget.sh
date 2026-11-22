@@ -8,7 +8,10 @@
 # controller is cgroup v1's, cpu.cfs_quota_us over cpu.cfs_period_us (a quota
 # of -1 is none) under /sys/fs/cgroup/<its controllers>. The runner reports 88
 # CPUs to a job whose quota is 64 (cpu.max 6400000 100000): threads sized by
-# the 88 outnumber the CPUs the quota lets run, and are throttled.
+# the 88 outnumber the CPUs the quota lets run, and are throttled. A cgroup's
+# path is from its hierarchy's root, which the mount there may hold a subtree
+# of alone (a container's without a cgroup namespace): it goes from the
+# mount's root, the 4th field of the mount's /proc/self/mountinfo line.
 #
 # Env: CPU_BUDGET_ROOT, a dir that stands in for / (tests).
 set -u
@@ -21,6 +24,10 @@ while IFS=: read -r _ controllers at; do
   if [ -z "$controllers" ]; then dir=$root/sys/fs/cgroup
   elif [[ ",$controllers," == *,cpu,* ]]; then dir=$root/sys/fs/cgroup/$controllers
   else continue
+  fi
+  mount_root=$(awk -v at="${dir#"$root"}" '$5 == at {r = $4} END {print r}' "$root/proc/self/mountinfo" 2> /dev/null)
+  if [ -n "$mount_root" ] && [ "$mount_root" != / ]; then
+    case $at in "$mount_root" | "$mount_root"/*) at=${at#"$mount_root"} ;; esac
   fi
   at=${at%/}
   while :; do

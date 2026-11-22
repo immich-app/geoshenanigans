@@ -16,7 +16,8 @@
 # it. The first line gives the CPU count, that cgroup, the CPU quota (the
 # tightest cpu.max from this process's cgroup up, quota over period, with
 # where it is set: the one cpu_budget.sh sizes the tools by; the runner
-# reports 88 CPUs, but its phases never pass ~64 cores) and the device. Runs
+# reports 88 CPUs, but its phases never pass ~64 cores) and the device. The
+# cgroup's path goes from the mount's root, as cpu_budget.sh takes it. Runs
 # until killed.
 #
 # Env: JOB_SAMPLER_ROOT, a dir that stands in for / (tests).
@@ -31,6 +32,10 @@ tools=$(dirname "$(readlink -f "$0")")
 stamp() { date -u +%H:%M:%S; }
 
 path=$(sed -n 's/^0:://p' "$root/proc/self/cgroup")
+mount_root=$(awk '$5 == "/sys/fs/cgroup" {r = $4} END {print r}' "$root/proc/self/mountinfo" 2> /dev/null)
+if [ -n "$mount_root" ] && [ "$mount_root" != / ]; then
+  case $path in "$mount_root" | "$mount_root"/*) path=${path#"$mount_root"} ;; esac
+fi
 path=${path%/}
 job=$path
 until [ -z "$job" ] || { [ -r "$root/sys/fs/cgroup$job/memory.max" ] && [ "$(cat "$root/sys/fs/cgroup$job/memory.max")" != max ]; }; do

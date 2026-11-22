@@ -106,6 +106,21 @@ class CpuBudgetTest(unittest.TestCase):
     def test_a_containers_cgroup_v1_quota_at_its_mounts_root_holds(self):
         self.assertEqual(budget(fake_v1_cpus(self, 88, "4:cpu,cpuacct:/docker/abc\n", {"": ("400000", "100000")})), 4)
 
+    # And of one in a cgroup below that mount's root, on cgroup v1 or v2: the path goes from the mount's root (the 4th
+    # field of its /proc/self/mountinfo line), so that the tighter quota there holds too.
+    def test_a_containers_tighter_quota_below_its_mounts_root_holds(self):
+        mount = "1013 1007 0:31 /docker/abc {} ro,nosuid,nodev,noexec,relatime master:16 - {} {} rw"
+        v1 = fake_host(self, 88, "4:cpu,cpuacct:/docker/abc/job\n", {
+            "proc/self/mountinfo": mount.format("/sys/fs/cgroup/cpu,cpuacct", "cgroup", "cgroup") + ",cpu,cpuacct",
+            "sys/fs/cgroup/cpu,cpuacct/cpu.cfs_quota_us": "800000", "sys/fs/cgroup/cpu,cpuacct/cpu.cfs_period_us": "100000",
+            "sys/fs/cgroup/cpu,cpuacct/job/cpu.cfs_quota_us": "200000",
+            "sys/fs/cgroup/cpu,cpuacct/job/cpu.cfs_period_us": "100000"})
+        v2 = fake_host(self, 88, "0::/docker/abc/job\n", {
+            "proc/self/mountinfo": mount.format("/sys/fs/cgroup", "cgroup2", "cgroup2"),
+            "sys/fs/cgroup/cpu.max": "800000 100000", "sys/fs/cgroup/job/cpu.max": "200000 100000"})
+        for name, env in (("v1", v1), ("v2", v2)):
+            self.assertEqual(budget(env), 2, name)
+
     def test_a_cgroup_v1_quota_counts_whole_cpus_and_at_least_one(self):
         for quota, expected in (("250000", 2), ("50000", 1)):
             self.assertEqual(budget(fake_v1_cpus(self, 88, "4:cpu,cpuacct:/\n", {"": (quota, "100000")})), expected,

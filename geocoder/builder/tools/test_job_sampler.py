@@ -122,6 +122,18 @@ class JobSamplerTest(unittest.TestCase):
 
                 self.assertRegex(lines[0], rf" cgroup=/pod/job cpu\.max={expected} device=rbd4$")
 
+    # In a container without a cgroup namespace /proc/self/cgroup names the cgroup on the host, of which the mount
+    # holds a subtree (the 4th field of its /proc/self/mountinfo line): the path goes from the mount's root.
+    def test_the_cgroup_path_goes_from_its_mounts_root(self):
+        write(os.path.join(self.root, "proc/self/cgroup"), "0::/kubepods/pod/job\n")
+        write(os.path.join(self.root, "proc/self/mountinfo"),
+              "30 25 0:26 /kubepods /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:4 - cgroup2 cgroup2 rw\n")
+
+        lines = self.sample(lines=2)
+
+        self.assertRegex(lines[0], r" cgroup=/pod/job cpu\.max=6400000 100000 \(/pod\) device=rbd4$")
+        self.assertIn(" usage_usec=777000 ", lines[1])
+
     def test_each_sample_holds_the_raw_counters_of_cpu_memory_and_the_work_volume(self):
         lines = self.sample()
 
