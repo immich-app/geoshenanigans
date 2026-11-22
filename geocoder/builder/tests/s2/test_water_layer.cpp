@@ -12,11 +12,11 @@
 #include <map>
 #include <optional>
 #include <set>
-#include <sstream>
 #include <string>
 #include <vector>
 
 #include "arc_blocks.h"
+#include "captured_stderr.h"
 #include "scratch_dir.h"
 #include "test_framework.h"
 #include "water_names_s2.h"
@@ -114,11 +114,8 @@ Collected fixture() {
 }
 
 Layer build(Collected c, const std::string& prev = "", unsigned threads = 2) {
-    std::ostringstream log;
-    std::streambuf* was = std::cerr.rdbuf(log.rdbuf());
-    Layer layer = build_layer(c, prev, [](uint32_t qid) { return qid == 42 ? 50u : 0u; }, threads);
-    std::cerr.rdbuf(was);
-    return layer;
+    const gctest::CapturedStderr log;
+    return build_layer(c, prev, [](uint32_t qid) { return qid == 42 ? 50u : 0u; }, threads);
 }
 
 std::string name_of(const Layer& layer, size_t p) { return layer.names.data() + layer.records[p].name_id; }
@@ -136,10 +133,8 @@ std::map<std::string, std::vector<char>> tree(const std::string& dir) {
 }
 
 std::string write(const Layer& layer, const std::string& dir, const std::string& prev = "") {
-    std::ostringstream log;
-    std::streambuf* was = std::cerr.rdbuf(log.rdbuf());
+    const gctest::CapturedStderr log;
     const std::string summary = write_water_dirs(layer, dir, prev, "test");
-    std::cerr.rdbuf(was);
     return summary + log.str();
 }
 
@@ -501,10 +496,8 @@ TEST(a_water_dir_holding_a_marine_area_credits_marine_regions) {
     REQUIRE(lake.size() == 1u);
     CHECK_EQ(int(lake.marine[0]), 0);
     {
-        std::ostringstream log;
-        std::streambuf* was = std::cerr.rdbuf(log.rdbuf());
+        const gctest::CapturedStderr log;
         assign_region_arc_slots(lake.arcs, "", "test", 0);
-        std::cerr.rdbuf(was);
     }
     write(lake, root.path() + "/lake");
     CHECK(text_of(bytes_of(root.path() + "/lake/water/all/exact/attribution.json")).find("marine-regions") ==
@@ -1069,13 +1062,10 @@ Collected with_kinds(const std::vector<std::string>& values) {
 // Why the layer's build over the previous build at `prev` stops, empty for
 // a build that doesn't.
 std::string refusal(Collected c, const std::string& prev) {
-    std::ostringstream log;
-    std::streambuf* was = std::cerr.rdbuf(log.rdbuf());
-    const std::string why = gctest::refusal_of<std::runtime_error>([&] {
+    const gctest::CapturedStderr log;
+    return gctest::refusal_of<std::runtime_error>([&] {
         build_layer(c, prev, [](uint32_t) { return 0u; }, 2);
     });
-    std::cerr.rdbuf(was);
-    return why;
 }
 
 }  // namespace
@@ -1132,11 +1122,11 @@ TEST(a_previous_water_build_whose_polygon_sidecar_cant_be_read_stops_the_build) 
     const std::string all = one + "/water/all/exact/admin_polygons.osm_ids";
     cut(all);
     const Layer day2 = build(fixture(), one);
-    std::ostringstream log;
-    std::streambuf* was = std::cerr.rdbuf(log.rdbuf());
-    const std::string why =
-        gctest::refusal_of<std::runtime_error>([&] { write_water_dirs(day2, two, one, "test"); });
-    std::cerr.rdbuf(was);
+    std::string why;
+    {
+        const gctest::CapturedStderr log;
+        why = gctest::refusal_of<std::runtime_error>([&] { write_water_dirs(day2, two, one, "test"); });
+    }
     CHECK(why.find(all) != std::string::npos);
     // Gone, they start the slots afresh.
     fs::remove(major);

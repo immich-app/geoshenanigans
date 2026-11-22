@@ -5,10 +5,10 @@
 #include "admin_arcs.h"
 
 #include <algorithm>
-#include <sstream>
 #include <string>
 #include <vector>
 
+#include "captured_stderr.h"
 #include "exact_pip.h"
 #include "parsed_data.h"
 #include "scratch_dir.h"
@@ -158,11 +158,15 @@ TEST(the_water_stage_builds_and_encodes_its_two_tiers_with_no_minimal_set) {
     store.append(square.ring, {}, square.runs);
     store.append(closed({pt(0, 200), pt(0, 300), pt(100, 300), pt(100, 200)}),
                  {closed({pt(20, 220), pt(20, 280), pt(80, 280), pt(80, 220)})}, {{{31, 4}}, {{32, 4}}});
-    std::ostringstream captured;
-    std::streambuf* was = std::cerr.rdbuf(captured.rdbuf());
-    AdminArcs arcs = build_arc_stage(kWaterArcStage, store, {}, "", 2);
-    AdminArcBlocks blocks = encode_admin_arcs(arcs, store, 2);
-    std::cerr.rdbuf(was);
+    AdminArcs arcs;
+    AdminArcBlocks blocks;
+    std::string log;
+    {
+        const gctest::CapturedStderr captured;
+        arcs = build_arc_stage(kWaterArcStage, store, {}, "", 2);
+        blocks = encode_admin_arcs(arcs, store, 2);
+        log = captured.str();
+    }
     CHECK(arcs.stage == &kWaterArcStage);
     CHECK(blocks.stage == &kWaterArcStage);
     CHECK_EQ(arcs.tiers.size(), kWaterArcTierCount);
@@ -178,7 +182,6 @@ TEST(the_water_stage_builds_and_encodes_its_two_tiers_with_no_minimal_set) {
     size_t raw = 0;
     for (const Arc& a : arcs.arcs) raw += a.view.count;
     CHECK_EQ(arcs.tiers[1].counts.stored_vertices, raw);
-    const std::string log = captured.str();
     CHECK(log.find("ARC_CHECK set=water junctions=") != std::string::npos);
     CHECK(log.find(" way_ends=2 ") != std::string::npos);
     CHECK(log.find("ARC_CHECK tier=water/all/simplified set=water ") != std::string::npos);
@@ -200,13 +203,14 @@ TEST(the_water_stage_builds_and_encodes_its_two_tiers_with_no_minimal_set) {
     CHECK(simplified.tiers[0].at == one.tiers[0].at);
     CHECK(simplified.tiers[1].bytes.empty());
     CHECK(simplified.tiers[1].at.empty());
-    captured.str("");
-    was = std::cerr.rdbuf(captured.rdbuf());
-    assign_region_arc_slots(one, "", "oceania", 1);
-    std::cerr.rdbuf(was);
+    {
+        const gctest::CapturedStderr captured;
+        assign_region_arc_slots(one, "", "oceania", 1);
+        log = captured.str();
+    }
     CHECK_EQ(one.set(ArcSet::Full).arcs(), size_t(2));
     CHECK(one.polygons[0].blocks[0].size > 0);
-    CHECK(captured.str().find("minimal") == std::string::npos);
+    CHECK(log.find("minimal") == std::string::npos);
     CHECK(arc_sidecar_path(dir.path(), ArcSet::Full, kWaterArcStage) ==
           dir.path() + "/water/all/exact/arc_index.osm_ids");
     CHECK(arc_sidecar_path(dir.path(), ArcSet::Full) == dir.path() + "/quality/exact/arc_index.osm_ids");
