@@ -675,12 +675,60 @@ TEST(an_object_two_inputs_hold_is_one_object_as_the_first_input_gives_it) {
     }
 }
 
-TEST(a_waterway_relation_of_a_local_name_alone_shows_the_name_en_most_of_its_river_ways_carry) {
+namespace {
+
+// A member river way of a waterway relation: its name and name:en (nullptr
+// for none) and its length, e7 units along a parallel.
+struct Reach {
+    int64_t way;
+    const char* name;
+    const char* name_en;
+    int32_t length;
+};
+
+// What the passes collect of waterway relation 910, of the name `name` and
+// the name:en `name_en` (nullptr for none), and its member river ways
+// `reaches`, keyed by their tags (line_key), end to end along one parallel.
+Collected river(const char* name, const char* name_en, const std::vector<Reach>& reaches) {
+    Collected c;
+    CollectedWaterway w;
+    w.id = 910;
+    w.local_name = name;
+    w.name = name_en ? name_en : name;
+    w.english = name_en != nullptr;
+    for (const Reach& r : reaches) w.ways.push_back(r.way);
+    c.waterways.push_back(w);
+    index_collected(c);
+    int32_t lng = kLng;
+    for (const Reach& r : reaches) {
+        LineIn line;
+        REQUIRE(line_key(c, r.way, r.name, r.name_en, 0, line));
+        line.vertices = {pt(kLat, lng), pt(kLat, lng + r.length)};
+        lng += r.length;
+        c.lines.push_back(std::move(line));
+    }
+    return c;
+}
+
+// The names the assembled lines of relation 910 show.
+std::set<std::string> shown(Collected c) {
+    const Build b = assemble(c, 1);
+    std::set<std::string> out;
+    for (const NamingLine& l : b.lines.lines)
+        if (b.lines.keys[l.key] == "r910") out.insert(b.lines.displays[l.display]);
+    return out;
+}
+
+using Names = std::set<std::string>;
+
+}  // namespace
+
+TEST(a_member_of_a_waterway_relation_of_a_local_name_alone_keeps_the_name_it_shows_by_the_datasets_rule) {
     Collected c = fixture();
     CollectedWaterway local, english;
     local.id = 901;
     local.name = local.local_name = "小渋川";
-    local.ways = {51, 52, 53, 54};
+    local.ways = {51, 52, 53};
     english.id = 902;
     english.name = "Danube";
     english.local_name = "Donau";
@@ -688,41 +736,106 @@ TEST(a_waterway_relation_of_a_local_name_alone_shows_the_name_en_most_of_its_riv
     english.ways = {61};
     c.waterways = {local, english};
     index_collected(c);
-    // A member of a relation of a local name alone keeps its own name:en;
-    // one of a relation with a name:en of its own, and a way of none, don't.
+    // Its name:en, else its name, else its relation's; a member of a
+    // relation with a name:en of its own, and a way of none, keep none.
     auto keyed = [&](int64_t way, const char* name, const char* name_en) {
         LineIn line;
         CHECK(line_key(c, way, name, name_en, 0, line));
-        line.vertices = {pt(kLat + 700000, kLng + int32_t(way) * 1000), pt(kLat + 701000, kLng + int32_t(way) * 1000)};
         return line;
     };
-    const LineIn a = keyed(51, "小渋川", "Koshibu River"), danube = keyed(61, "Donau", "Danube River"),
+    const LineIn en = keyed(51, "小渋川", "Koshibu River"), local_only = keyed(52, "小渋川", nullptr),
+                 none = keyed(53, nullptr, nullptr), danube = keyed(61, "Donau", "Danube River"),
                  brook = keyed(70, "Bach", "Brook");
-    CHECK(a.key == "r901" && a.display == "小渋川" && a.way_en == "Koshibu River");
-    CHECK(danube.key == "r902" && danube.display == "Danube" && danube.way_en.empty());
-    CHECK(brook.key == "nBach" && brook.display == "Brook" && brook.way_en.empty());
-    c.lines.push_back(a);
-    c.lines.push_back(keyed(52, "小渋川", "Koshibu River"));
-    c.lines.push_back(keyed(53, "小渋川", "Koshibu-gawa"));
-    c.lines.push_back(keyed(54, "小渋川", nullptr));
-    c.lines.push_back(danube);
-    // A tie goes to the smaller name.
-    for (const auto& [way, en] : std::vector<std::pair<int64_t, std::string>>{{80, "Zeta River"}, {81, "Alpha River"}}) {
-        LineIn line;
-        line.way = way;
-        line.key = "r903";
-        line.local = line.display = "Χείμαρρος";
-        line.way_en = en;
-        line.vertices = {pt(kLat + 800000, kLng + int32_t(way) * 1000), pt(kLat + 801000, kLng + int32_t(way) * 1000)};
-        c.lines.push_back(line);
-    }
+    CHECK(en.key == "r901" && en.display == "小渋川" && en.way_display == "Koshibu River");
+    CHECK(local_only.key == "r901" && local_only.way_display == "小渋川");
+    CHECK(none.key == "r901" && none.display == "小渋川" && none.way_display == "小渋川");
+    CHECK(danube.key == "r902" && danube.display == "Danube" && danube.way_display.empty());
+    CHECK(brook.key == "nBach" && brook.display == "Brook" && brook.way_display.empty());
+}
+
+TEST(a_waterway_relation_of_a_local_name_alone_shows_the_name_its_river_ways_show_over_the_most_length) {
+    // The Koshibu River: its relation is 小渋川 alone and its river ways
+    // carry the name:en Koshibu River, but for one of Koshibu-gawa, longer
+    // than any other way and shorter than them all.
+    CHECK(shown(river("小渋川", nullptr,
+                      {{51, "小渋川", "Koshibu River", 2000},
+                       {52, "小渋川", "Koshibu River", 3000},
+                       {53, "小渋川", "Koshibu-gawa", 4000}})) == Names({"Koshibu River"}));
+    // A relation's own name:en is its name, whatever its ways carry.
+    CHECK(shown(river("Donau", "Danube", {{61, "Donau", "Danube River", 3000}, {62, "Donau", nullptr, 2000}})) ==
+          Names({"Danube"}));
+    // Of names over equal length, the smaller.
+    CHECK(shown(river("Χείμαρρος", nullptr,
+                      {{80, "Χείμαρρος", "Zeta River", 2000}, {81, "Χείμαρρος", "Alpha River", 2000}})) ==
+          Names({"Alpha River"}));
+    // A relation none of whose ways is any length shows its own name.
+    CHECK(shown(river("Χείμαρρος", nullptr, {{82, "Χείμαρρος", "Alpha River", 0}})) == Names({"Χείμαρρος"}));
+    // Another key's lines keep their names.
+    Collected c = fixture();
     const Build b = assemble(c, 1);
-    std::map<std::string, std::set<std::string>> shown;
-    for (const NamingLine& l : b.lines.lines) shown[b.lines.keys[l.key]].insert(b.lines.displays[l.display]);
-    CHECK(shown["r901"] == std::set<std::string>({"Koshibu River"}));
-    CHECK(shown["r902"] == std::set<std::string>({"Danube"}));
-    CHECK(shown["r903"] == std::set<std::string>({"Alpha River"}));
-    CHECK(shown["r900"] == std::set<std::string>({"Test River"}));
+    Names others;
+    for (const NamingLine& l : b.lines.lines)
+        if (b.lines.keys[l.key] == "r900") others.insert(b.lines.displays[l.display]);
+    CHECK(others == Names({"Test River"}));
+}
+
+TEST(one_river_way_of_a_name_en_of_its_own_doesnt_rename_its_river) {
+    // The Spree: its relation and most of its river ways carry the name
+    // Spree alone, a few none, a few the names of their reaches, and one
+    // the name:en Sprewa (Sorbian).
+    CHECK(shown(river("Spree", nullptr,
+                      {{1, "Spree", nullptr, 3000},
+                       {2, "Spree", "Sprewa", 4000},
+                       {3, nullptr, nullptr, 1000},
+                       {4, "Hauptspree", nullptr, 1500},
+                       {5, "Spree", nullptr, 2500}})) == Names({"Spree"}));
+}
+
+TEST(a_branchs_name_en_doesnt_rename_its_river) {
+    // The Hunter River: its relation and most of its river ways carry the
+    // name Hunter River alone; its two arms carry their own, one of them
+    // as its name:en too.
+    CHECK(shown(river("Hunter River", nullptr,
+                      {{1, "Hunter River", nullptr, 4000},
+                       {2, "Hunter River South Arm", "Hunter River South Arm", 1500},
+                       {3, "Hunter River North Arm", nullptr, 1700},
+                       {4, "Hunter River", nullptr, 4000}})) == Names({"Hunter River"}));
+}
+
+TEST(the_name_en_of_a_bridge_on_a_canal_way_doesnt_rename_the_canal) {
+    // The Birmingham and Fazeley Canal: one way of its name carries a
+    // bridge's name as its name:en, and the tunnel's way the tunnel's name.
+    CHECK(shown(river("Birmingham and Fazeley Canal", nullptr,
+                      {{1, "Birmingham and Fazeley Canal", nullptr, 3000},
+                       {2, "Birmingham and Fazeley Canal", "Erdington Hall Bridge", 500},
+                       {3, "Curdworth Tunnel", nullptr, 400},
+                       {4, "Birmingham and Fazeley Canal", nullptr, 3000}})) ==
+          Names({"Birmingham and Fazeley Canal"}));
+}
+
+TEST(a_rivers_name_goes_by_the_length_its_ways_show_it_over_not_by_how_many_ways_do) {
+    // The Drava: its relation is Drava alone. Its upper reach is many short
+    // ways of the name Drau, its lower reaches fewer and longer ways of the
+    // name Drava; as many of its ways carry the name:en Drau as Drava.
+    CHECK(shown(river("Drava", nullptr,
+                      {{1, "Drau", nullptr, 1000},
+                       {2, "Drau", nullptr, 1000},
+                       {3, "Drau", nullptr, 1000},
+                       {4, "Drau", nullptr, 1000},
+                       {5, "Drau", nullptr, 1000},
+                       {6, "Drava", "Drau", 1000},
+                       {7, "Drava", "Drava", 1000},
+                       {8, "Drava", nullptr, 3000},
+                       {9, "Drava", nullptr, 3000}})) == Names({"Drava"}));
+    // A way's length is its runs', not the gap between them where the
+    // input lacks a node: the Drau way of two short runs far apart is
+    // shorter than the Drava way.
+    Collected c = river("Drava", nullptr, {{1, "Drau", nullptr, 1000}, {2, "Drava", nullptr, 3000}});
+    LineIn& drau = c.lines[0];
+    drau.vertices = {pt(kLat + 10000, kLng), pt(kLat + 10000, kLng + 1000), pt(kLat + 10000, kLng + 50000),
+                     pt(kLat + 10000, kLng + 51000)};
+    drau.runs = {2, 2};
+    CHECK(shown(c) == Names({"Drava"}));
 }
 
 // geocoder/testdata/water_dir: the client files of a water dir on three

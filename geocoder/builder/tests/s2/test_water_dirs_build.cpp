@@ -255,8 +255,9 @@ TEST(a_build_without_multi_output_writes_the_exact_water_tier_beside_its_modes_f
 
 TEST(a_river_area_shows_its_waterway_relations_name_as_the_datasets_names_go) {
     // name:en, else name, as admin, place and POI names go. A relation of a
-    // local name alone shows its river ways' most common name:en; one with a
-    // name:en of its own shows that.
+    // local name alone shows the name its river ways show over the most
+    // length (each its name:en, else its name, else the relation's); one
+    // with a name:en of its own shows that.
     const int32_t lat0 = 350000000, lng0 = 1380000000;
     std::vector<TestObject> objects;
     int64_t next = 1;
@@ -283,9 +284,17 @@ TEST(a_river_area_shows_its_waterway_relations_name_as_the_datasets_names_go) {
                           {{"waterway", "river"}, {"name", "Donau"}, {"name:en", "Danube River"}}));
     objects.push_back(relation(951, {{"type", "waterway"}, {"waterway", "river"}, {"name", "Donau"}, {"name:en", "Danube"}},
                                {{111, ""}}));
+    // The Spree: one of its river ways carries the name:en Sprewa, and the
+    // longer rest the name Spree alone, or no name.
+    objects.push_back(way(120, square(lat0 + 200000, lng0, 10000), {{"natural", "water"}, {"water", "river"}}));
+    objects.push_back(way(121, {at(lat0 + 202000, lng0 + 2000), at(lat0 + 206000, lng0 + 6000)},
+                          {{"waterway", "river"}, {"name", "Spree"}, {"name:en", "Sprewa"}}));
+    objects.push_back(way(122, {at(lat0 + 250000, lng0), at(lat0 + 256000, lng0)}, {{"waterway", "river"}, {"name", "Spree"}}));
+    objects.push_back(way(123, {at(lat0 + 260000, lng0), at(lat0 + 263000, lng0)}, {{"waterway", "river"}}));
+    objects.push_back(relation(952, {{"type", "waterway"}, {"waterway", "river"}, {"name", "Spree"}}, {{121, ""}, {122, ""}, {123, ""}}));
     const ScratchDir root("water-river-names");
     const std::vector<std::string> names = planet_water_names(objects, root.path() + "/out");
-    CHECK(names == std::vector<std::string>({"Danube", "Koshibu River"}));
+    CHECK(names == std::vector<std::string>({"Danube", "Koshibu River", "Spree"}));
 }
 
 TEST(a_node_the_input_lacks_leaves_a_gap_that_no_water_ring_or_line_crosses) {

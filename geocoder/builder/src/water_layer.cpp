@@ -154,6 +154,20 @@ PolygonSlots polygon_slots(const Layer& layer, const std::vector<uint32_t>& ids,
 
 const std::vector<uint64_t> kNone;
 
+// A line's length in whole millimetres: its runs' segments (segment_mm),
+// none across the gap between two runs.
+uint64_t line_mm(const LineIn& l) {
+    uint64_t mm = 0;
+    size_t at = 0;
+    auto run_mm = [&](size_t count) {
+        for (size_t i = at + 1; i < at + count; i++) mm += segment_mm(l.vertices[i - 1], l.vertices[i]);
+        at += count;
+    };
+    if (l.runs.empty()) run_mm(l.vertices.size());
+    for (const uint32_t run : l.runs) run_mm(run);
+    return mm;
+}
+
 // Sorts `v` by id (`id_of`), each id once: of copies, the first in `v`.
 template <class T, class Id>
 void first_of_each_id(std::vector<T>& v, Id id_of) {
@@ -182,7 +196,7 @@ bool line_key(const Collected& c, int64_t way, const char* name, const char* nam
         line.local = w.local_name;
         line.display = w.name;
         line.qid = w.qid;
-        if (!w.english && name_en) line.way_en = name_en;
+        if (!w.english) line.way_display = name_en ? name_en : name ? name : w.name;
         return true;
     }
     if (!name && !name_en) return false;
@@ -352,18 +366,18 @@ Build assemble(Collected& c, unsigned threads) {
     // The candidate lines, by way (the first input's copy), their keys and
     // names as sorted indices.
     first_of_each_id(c.lines, [](const LineIn& l) { return l.way; });
-    // A waterway relation of a local name alone shows the name:en most of its
-    // river ways carry, the smaller of a tie.
+    // A waterway relation of a local name alone shows the name its river
+    // ways show over the most length, the smaller of a tie.
     {
-        std::map<std::string, std::map<std::string, size_t>> votes;  // key -> name:en -> ways
+        std::map<std::string, std::map<std::string, uint64_t>> votes;  // key -> name -> millimetres
         for (const LineIn& l : c.lines)
-            if (!l.way_en.empty()) votes[l.key][l.way_en]++;
+            if (!l.way_display.empty()) votes[l.key][l.way_display] += line_mm(l);
         std::map<std::string, std::string> shown;
         for (const auto& [key, names] : votes) {
-            size_t most = 0;
-            for (const auto& [name, ways] : names)
-                if (ways > most) {
-                    most = ways;
+            uint64_t most = 0;
+            for (const auto& [name, mm] : names)
+                if (mm > most) {
+                    most = mm;
                     shown[key] = name;
                 }
         }
