@@ -117,9 +117,12 @@ struct ClosedWayArea {
     std::vector<PackedLocation> vertices;
 };
 
-// A candidate line as the way pass finds it.
+// A candidate line as the way pass finds it: its way's own name, name:en
+// and wikidata item, then its key and names once key_lines has keyed it.
 struct LineIn {
     int64_t way = 0;
+    std::string name, name_en;  // the way's tags, empty for none; cleared by key_lines
+    uint32_t way_qid = 0;
     std::string key;
     std::string local;  // the key's local name
     std::string display;
@@ -162,6 +165,12 @@ void index_collected(Collected& c);
 // which assemble shows in the relation's place.
 bool line_key(const Collected& c, int64_t way, const char* name, const char* name_en, uint32_t way_qid, LineIn& line);
 
+// Keys every line by its way's tags (line_key) against the waterway
+// relations of every input (index_collected), once all are read, so that a
+// way's key doesn't hang on which input holds its relation; drops a line
+// that names nothing.
+void key_lines(Collected& c);
+
 // --- The layer ---
 
 // One object the layer holds: its identity and tags, its area summed over
@@ -201,11 +210,11 @@ struct Build {
 // first input's copy alone), each ring rotated as canonicalize_ring_rotation
 // puts it, with its way runs (a marine ring's marine::ring_runs). A relation
 // with a member way the passes didn't find is left out. Uses up the
-// collected areas and geometries; moves the lines into the build's
-// NamingLines, keys and names sorted. The names follow the dataset's
-// (name:en, else name): the lines of a waterway relation of a local name
-// alone show the name:en most of its river ways that have one carry (the
-// smaller of a tie), else the relation's name.
+// collected areas and geometries; moves the lines (keyed, key_lines) into
+// the build's NamingLines, keys and names sorted. The names follow the
+// dataset's (name:en, else name): the lines of a waterway relation of a
+// local name alone show the name:en most of its river ways that have one
+// carry (the smaller of a tie), else the relation's name.
 Build assemble(Collected& c, unsigned threads);
 
 // Leaves out each OSM natural=bay or strait that is a marine area's

@@ -193,6 +193,21 @@ bool line_key(const Collected& c, int64_t way, const char* name, const char* nam
     return true;
 }
 
+void key_lines(Collected& c) {
+    index_collected(c);
+    size_t kept = 0;
+    for (LineIn& l : c.lines) {
+        const bool keyed = line_key(c, l.way, l.name.empty() ? nullptr : l.name.c_str(),
+                                    l.name_en.empty() ? nullptr : l.name_en.c_str(), l.way_qid, l);
+        std::string().swap(l.name);
+        std::string().swap(l.name_en);
+        if (!keyed) continue;
+        if (&c.lines[kept] != &l) c.lines[kept] = std::move(l);
+        kept++;
+    }
+    c.lines.resize(kept);
+}
+
 Build assemble(Collected& c, unsigned threads) {
     if (threads == 0) threads = parallel_threads();
     Build b;

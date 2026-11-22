@@ -908,3 +908,45 @@ TEST(a_way_tagged_as_the_multipolygon_whose_outer_ring_it_is_leaves_the_island_o
         }
     CHECK_EQ(twins, size_t(1));
 }
+
+TEST(the_lines_are_keyed_by_the_waterway_relations_of_every_input_once_all_are_read) {
+    // Two copies of a river way, the first read before the input that holds
+    // its waterway relation: both are the relation's.
+    Collected c;
+    LineIn early;
+    early.way = 4001;
+    early.name = "Limmat";
+    early.vertices = {pt(kLat, kLng), pt(kLat + 1000, kLng)};
+    c.lines.push_back(early);
+    CollectedWaterway river;
+    river.id = 4100;
+    river.name = "Limmat River";
+    river.local_name = "Limmat";
+    river.english = true;
+    river.qid = 72;
+    river.ways = {4001};
+    c.waterways.push_back(river);
+    c.lines.push_back(early);
+    // A way of a name and a name:en of its own, and an unnamed one of no
+    // relation, which names nothing.
+    LineIn sihl = early;
+    sihl.way = 4002;
+    sihl.name = "Sihl";
+    sihl.name_en = "Sihl River";
+    sihl.way_qid = 9;
+    c.lines.push_back(sihl);
+    LineIn unnamed = early;
+    unnamed.way = 4003;
+    unnamed.name.clear();
+    c.lines.push_back(unnamed);
+    key_lines(c);
+    REQUIRE(c.lines.size() == 3u);
+    for (size_t k = 0; k < 2; k++) {
+        CHECK(c.lines[k].key == "r4100");
+        CHECK(c.lines[k].display == "Limmat River");
+        CHECK(c.lines[k].local == "Limmat");
+        CHECK_EQ(c.lines[k].qid, 72u);
+    }
+    CHECK(c.lines[2].key == "nSihl" && c.lines[2].display == "Sihl River" && c.lines[2].local == "Sihl");
+    CHECK_EQ(c.lines[2].qid, 9u);
+}

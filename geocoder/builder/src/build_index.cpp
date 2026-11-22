@@ -3090,22 +3090,26 @@ static int run(int argc, char* argv[]) {
                                 local.water_closed.push_back({way_id, std::move(wtags),
                                                               std::vector<PackedLocation>(resolved_locs.begin(), resolved_locs.end())});
                         }
+                        // A line's way tags; key_lines keys it once every
+                        // input's waterway relations are in.
                         if (water::is_naming_waterway(t.waterway)) {
                             water::LineIn line;
-                            if (water::line_key(water_collected, way_id, t.name, t.name_en, water::qid_of(t.wikidata), line)) {
-                                uint32_t run = 0, longest = 0;
-                                for (const auto& loc : resolved_locs) {
-                                    if (loc.valid()) {
-                                        line.vertices.push_back(loc);
-                                        longest = std::max(longest, ++run);
-                                    } else if (run) {
-                                        line.runs.push_back(run);
-                                        run = 0;
-                                    }
+                            line.way = way_id;
+                            if (t.name) line.name = t.name;
+                            if (t.name_en) line.name_en = t.name_en;
+                            line.way_qid = water::qid_of(t.wikidata);
+                            uint32_t run = 0, longest = 0;
+                            for (const auto& loc : resolved_locs) {
+                                if (loc.valid()) {
+                                    line.vertices.push_back(loc);
+                                    longest = std::max(longest, ++run);
+                                } else if (run) {
+                                    line.runs.push_back(run);
+                                    run = 0;
                                 }
-                                if (run && !line.runs.empty()) line.runs.push_back(run);
-                                if (longest >= 2) local.water_lines.push_back(std::move(line));
                             }
+                            if (run && !line.runs.empty()) line.runs.push_back(run);
+                            if (longest >= 2) local.water_lines.push_back(std::move(line));
                         }
                     }
                     if (!other_layers) return;
@@ -4345,6 +4349,7 @@ static int run(int argc, char* argv[]) {
                           << rings << " rings, " << vertices << " vertices from " << marine_path << std::endl;
                 log_phase("    Water: marine areas", _mt, _mc);
             }
+            water::key_lines(water_collected);
             data.water = water::build_layer(water_collected, cfg.prev_output_dir.empty() ? "" : cfg.prev_output_dir + "/planet",
                                             sitelinks_of, num_threads);
             log_phase("    Water: layer", _pt, _cpu);
