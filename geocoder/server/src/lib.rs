@@ -543,6 +543,38 @@ pub fn rank_to_field(rank: u8) -> Option<&'static str> {
     }
 }
 
+/// The address fields a polygon fills (AdminResult's), each in a slot of its own.
+pub const ADMIN_FIELDS: [&str; 18] = [
+    "country", "state", "province", "region", "state_district", "county", "district", "municipality", "city", "town",
+    "village", "hamlet", "city_district", "borough", "suburb", "quarter", "neighbourhood", "city_block",
+];
+
+/// The slot of an address field in ADMIN_FIELDS.
+pub fn admin_field_index(field: &str) -> Option<usize> {
+    ADMIN_FIELDS.iter().position(|f| *f == field)
+}
+
+/// The address fields a place node fills, by PlaceNode type.
+pub const PLACE_NODE_FIELDS: [&str; 7] = ["city", "town", "village", "suburb", "hamlet", "neighbourhood", "quarter"];
+
+/// The rank_address of the polygon or the place node behind each field of an
+/// address (ADMIN_FIELDS), 0 where none is known: display_name lists the
+/// place parts by it, as Nominatim lists its address rows.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FieldRanks([u8; ADMIN_FIELDS.len()]);
+
+impl FieldRanks {
+    pub fn get(&self, field: &str) -> u8 {
+        admin_field_index(field).map_or(0, |i| self.0[i])
+    }
+
+    pub fn set(&mut self, field: &str, rank: u8) {
+        if let Some(i) = admin_field_index(field) {
+            self.0[i] = rank;
+        }
+    }
+}
+
 /// Whether a place area (class=place polygon) only repeats an address entry
 /// already found: a polygon of the same name and rank_address, no larger.
 /// Nominatim keeps one entry per rank (address_havelevel); a namesake of
@@ -1993,37 +2025,10 @@ impl Index {
             area: f32,
             name: Cow<'b, str>,
             country_code: u16,
+            rank: u8,
         }
-        let mut best_by_field: [Option<FieldCandidate<'_>>; 19] = Default::default();
-        // 0 country 1 state 2 province 3 region 4 state_district
-        // 5 county 6 district 7 municipality
-        // 8 city 9 town 10 village 11 hamlet
-        // 12 city_district 13 borough 14 suburb 15 quarter 16 neighbourhood
-        // 17 city_block
-
-        let field_index = |field: &str| -> Option<usize> {
-            match field {
-                "country" => Some(0),
-                "state" => Some(1),
-                "province" => Some(2),
-                "region" => Some(3),
-                "state_district" => Some(4),
-                "county" => Some(5),
-                "district" => Some(6),
-                "municipality" => Some(7),
-                "city" => Some(8),
-                "town" => Some(9),
-                "village" => Some(10),
-                "hamlet" => Some(11),
-                "city_district" => Some(12),
-                "borough" => Some(13),
-                "suburb" => Some(14),
-                "quarter" => Some(15),
-                "neighbourhood" => Some(16),
-                "city_block" => Some(17),
-                _ => None,
-            }
-        };
+        // A slot per field of ADMIN_FIELDS.
+        let mut best_by_field: [Option<FieldCandidate<'_>>; ADMIN_FIELDS.len()] = Default::default();
 
         // Collect polygons at this point with their initial rank_address;
         // promote_nested_ranks then gives them their effective one.
@@ -2096,13 +2101,13 @@ impl Index {
             }
         };
         let candidate = |r: &RankedPoly| FieldCandidate {
-            area: r.poly.area, name: self.get_string(r.poly.name_id), country_code: r.poly.country_code
+            area: r.poly.area, name: self.get_string(r.poly.name_id), country_code: r.poly.country_code, rank: r.rank_address,
         };
 
         for r in &ranked {
             if r.poly.admin_level == 15 { continue; } // skip place-area in first pass
             if let Some(field) = field_for(r) {
-                if let Some(idx) = field_index(field) {
+                if let Some(idx) = admin_field_index(field) {
                     if let Some(ref existing) = best_by_field[idx] {
                         if r.poly.area >= existing.area { continue; }
                     }
@@ -2114,7 +2119,7 @@ impl Index {
         for r in &ranked {
             if r.poly.admin_level != 15 { continue; }
             if let Some(field) = field_for(r) {
-                if let Some(idx) = field_index(field) {
+                if let Some(idx) = admin_field_index(field) {
                     if best_by_field[idx].is_none() {
                         best_by_field[idx] = Some(candidate(r));
                     }
@@ -2123,6 +2128,9 @@ impl Index {
         }
 
         // Fill result
+        for (field, c) in ADMIN_FIELDS.iter().zip(&best_by_field) {
+            if let Some(c) = c { result.ranks.set(field, c.rank); }
+        }
         if let Some(c) = best_by_field[0].take() {
             result.country = Some(c.name);
             if c.country_code != 0 {
@@ -2256,6 +2264,7 @@ impl Index {
                            &mut result.hamlet, &mut result.neighbourhood, &mut result.quarter].into_iter().enumerate() {
             if let Some(k) = accepted[pt] {
                 *slot = Some(self.get_string(candidates[k].0.name_id));
+                result.ranks.set(PLACE_NODE_FIELDS[pt], nodes[k].1);
             }
         }
 
@@ -2653,20 +2662,9 @@ impl Index {
         ranked.retain(|r| ADDRESS_AREA_RANKS.contains(&r.rank_address));
         result.boundary_ranks = rank_bits(&ranked);
 
-        // Map to fields
-        struct FC<'b> { area: f32, name: Cow<'b, str>, country_code: u16 }
-        let mut best_by_field: [Option<FC<'_>>; 19] = Default::default();
-        let field_index = |field: &str| -> Option<usize> {
-            match field {
-                "country" => Some(0), "state" => Some(1), "province" => Some(2),
-                "region" => Some(3), "state_district" => Some(4), "county" => Some(5),
-                "district" => Some(6), "municipality" => Some(7), "city" => Some(8),
-                "town" => Some(9), "village" => Some(10), "hamlet" => Some(11),
-                "city_district" => Some(12), "borough" => Some(13), "suburb" => Some(14),
-                "quarter" => Some(15), "neighbourhood" => Some(16), "city_block" => Some(17),
-                _ => None,
-            }
-        };
+        // Map to fields, a slot per field of ADMIN_FIELDS.
+        struct FC<'b> { area: f32, name: Cow<'b, str>, country_code: u16, rank: u8 }
+        let mut best_by_field: [Option<FC<'_>>; ADMIN_FIELDS.len()] = Default::default();
 
         for r in &ranked {
             if let Some(field) = if r.poly.place_type_override > 0 {
@@ -2674,15 +2672,18 @@ impl Index {
             } else {
                 rank_to_field(r.rank_address)
             } {
-                if let Some(idx) = field_index(field) {
+                if let Some(idx) = admin_field_index(field) {
                     if let Some(ref existing) = best_by_field[idx] {
                         if r.poly.area >= existing.area { continue; }
                     }
-                    best_by_field[idx] = Some(FC { area: r.poly.area, name: self.get_string(r.poly.name_id), country_code: r.poly.country_code });
+                    best_by_field[idx] = Some(FC { area: r.poly.area, name: self.get_string(r.poly.name_id), country_code: r.poly.country_code, rank: r.rank_address });
                 }
             }
         }
 
+        for (field, c) in ADMIN_FIELDS.iter().zip(&best_by_field) {
+            if let Some(c) = c { result.ranks.set(field, c.rank); }
+        }
         if let Some(c) = best_by_field[0].take() {
             result.country = Some(c.name);
             if c.country_code != 0 {
@@ -2878,6 +2879,7 @@ impl Index {
         // along the Bern-Valais ridge is Kandersteg's in Nominatim, but
         // its point nearest Leukerbad answers Valais.
         let admin_chain = admin_chain.map(|chain| {
+            let mut street_ranks = None;
             let [state, region, province] = coarse_fields(
                 [chain.state, chain.region, chain.province],
                 [admin_pip.state.clone(), admin_pip.region.clone(), admin_pip.province.clone()],
@@ -2885,13 +2887,30 @@ impl Index {
                     let (_, _, way_idx) = street?;
                     let (plat, plng) = self.closest_point_on_way(*way_idx, lat, lng)?;
                     let at = self.find_admin(plat, plng);
+                    street_ranks = Some(at.ranks);
                     Some([at.state, at.region, at.province])
                 },
             );
-            AdminResult { state, region, province, ..chain }
+            // A field the street's point names has the rank it has there.
+            let mut ranks = chain.ranks;
+            if let Some(at) = street_ranks {
+                for field in ["state", "region", "province"] {
+                    if at.get(field) != 0 { ranks.set(field, at.get(field)); }
+                }
+            }
+            AdminResult { state, region, province, ranks, ..chain }
         });
         match admin_chain {
             Some(chain) => AdminResult {
+                // Each field's rank is that of the polygon it came from.
+                ranks: {
+                    let mut ranks = admin_pip.ranks;
+                    for (field, named) in [("country", chain.country.is_some()), ("state", chain.state.is_some()),
+                                           ("province", chain.province.is_some()), ("region", chain.region.is_some())] {
+                        if named { ranks.set(field, chain.ranks.get(field)); }
+                    }
+                    ranks
+                },
                 // Only country/state/region/province replace PIP from
                 // chain — at those ranks PIP false-positives are rare
                 // and chain walk rarely drifts vs query. For finer
@@ -3370,7 +3389,32 @@ impl Index {
         // for Beijing "Donghuamen" vs "Donghuamen Subdistrict".
         // NYC still resolves as before because admin.suburb=Manhattan
         // and place.suburb=Manhattan carry the same name.
+        // Each field's rank_address is that of the polygon or the place node it
+        // came from.
+        let mut ranks = admin.ranks;
+        for (field, from_node) in [
+            ("city", admin.city.is_none() && place.city.is_some()),
+            ("town", admin.town.is_none() && place.town.is_some()),
+            ("village", admin.village.is_none() && place.village.is_some()),
+            ("hamlet", admin.hamlet.is_none() && place.hamlet.is_some()),
+            ("suburb", admin.suburb.is_none() && place.suburb.is_some()),
+            ("quarter", allow_place_quarter && admin.quarter.is_none() && place.quarter.is_some()),
+            ("neighbourhood", allow_place_neighbourhood && admin.neighbourhood.is_none() && place.neighbourhood.is_some()),
+        ] {
+            if from_node { ranks.set(field, place.ranks.get(field)); }
+        }
+        // Same-name suppression, observed Nominatim behaviour: the Kingdom
+        // of the Netherlands (AL2) and the constituent country (AL3) are both
+        // named "Nederland"; Nominatim's address keeps one row per label and
+        // drops the duplicate, which would be region=Netherlands here. Its
+        // display_name joins every row, the region's too.
+        let (region, country_region) = match (admin.region, &admin.country) {
+            (Some(r), Some(c)) if r == *c => (None, Some((ranks.get("region"), r))),
+            (r, _) => (r, None),
+        };
         let address = AddressDetails {
+            ranks,
+            unlabelled: country_region.into_iter().collect(),
             landmark: landmark_name,
             // A string in a tier this mode doesn't ship (admin mode has no
             // street or addr strings) resolves to "" — omit the field.
@@ -3383,14 +3427,7 @@ impl Index {
             municipality: admin.municipality,
             state: admin.state,
             province: admin.province,
-            // Same-name suppression, observed Nominatim behaviour: the
-            // Kingdom of the Netherlands (AL2) and the constituent country
-            // (AL3) are both named "Nederland"; Nominatim's addressline
-            // drops the duplicate, we surfaced it as region=Netherlands.
-            region: match (admin.region, &admin.country) {
-                (Some(r), Some(c)) if r == *c => None,
-                (r, _) => r,
-            },
+            region,
             state_district: admin.state_district,
             county: admin.county,
             district: admin.district,
@@ -5257,6 +5294,8 @@ pub struct PlaceResult<'a> {
     pub suburb: Option<Cow<'a, str>>,
     pub quarter: Option<Cow<'a, str>>,
     pub neighbourhood: Option<Cow<'a, str>>,
+    /// The rank_address of the node behind each field.
+    pub ranks: FieldRanks,
 }
 
 impl PlaceResult<'_> {
@@ -5291,6 +5330,8 @@ pub struct AdminResult<'a> {
     /// rank_address of the boundaries in the address, a bit per rank: the
     /// ranks they take before any place node (address_havelevel).
     pub boundary_ranks: u32,
+    /// The rank_address of the polygon behind each field.
+    pub ranks: FieldRanks,
 }
 
 impl AdminResult<'_> {
@@ -5312,6 +5353,15 @@ pub fn rank_bits(ranked: &[RankedPoly]) -> u32 {
 
 #[derive(Serialize, Default)]
 pub struct AddressDetails<'a> {
+    /// The rank_address of the polygon or the place node behind each place
+    /// field, which display_name lists the parts by.
+    #[serde(skip)]
+    pub ranks: FieldRanks,
+    /// Parts of display_name that fill no field, with their rank_address: a
+    /// region of the country's own name (Nominatim's address keeps one row
+    /// per label, its display_name every row).
+    #[serde(skip)]
+    pub unlabelled: Vec<(u8, Cow<'a, str>)>,
     // Landmark field: set to the name of the smallest-area
     // polygon POI that contains the query point. Category details
     // (specific type, distance, …) live in places[], so a single
@@ -5401,28 +5451,28 @@ pub fn format_rules(country_code: Option<&str>) -> (bool, bool, bool) {
 }
 
 // Build display_name matching Nominatim's `BaseResult.display_name`
-// (`src/nominatim_api/results.py`): iterate address_rows sorted by
-// rank_address descending (fine → coarse), filtering by isaddress flag,
-// and dedup *consecutively* — only skip a row whose display_name matches
-// the previous pushed entry, not globally. Country and postcode are
-// appended at the end as pseudo-entries in Nominatim's _finalize_entry.
+// (`src/nominatim_api/results.py`): the address rows sorted by rank_address
+// descending (fine → coarse), joined, and a row left out only where its name
+// repeats the part just before it. The landmark (the result's own name)
+// leads, then the house number and road; the postcode (rank 5) and the
+// country (rank 4) close it, as _finalize_entry adds them.
 //
-// Iteration order below uses rank_address values read verbatim from
-// Nominatim's `settings/address-levels.json` — any future divergence
-// should only happen if Nominatim's upstream file changes.
+// A place part's rank is the rank_address of the polygon or the place node
+// behind its field (AddressDetails::ranks): a village node inside a township
+// of its own rank is promoted to 18 and comes before the township's 16. A
+// field without a known rank takes that of its label in Nominatim's
+// settings/address-levels.json, and parts of one rank keep this order:
 //
-//   30 = house_number, road
 //   25 = city_block
 //   24 = neighbourhood
 //   22 = quarter
 //   20 = hamlet, suburb
 //   18 = borough
-//   16 = city, town, village
+//   16 = city, city_district, town, village
 //   14 = municipality
-//   12 = county, district
-//    8 = state  (from boundary=administrative4, not place=state)
-//    5 = postcode
-//    4 = country
+//   12 = district, county
+//    8 = state
+//    6 = state_district, region, province
 //
 // Notes:
 // - place=state/province/region all have rank_address=0 in Nominatim
@@ -5430,11 +5480,8 @@ pub fn format_rules(country_code: Option<&str>) -> (bool, bool, bool) {
 //   comes from boundary=administrative4, which is rank 8.
 // - Our AddressDetails fields `region`, `province`, `state_district`
 //   are populated by our rank_to_field fallback for admin levels that
-//   don't map to a canonical Nominatim field. We place them between
-//   state and country — Nominatim's equivalent is admin_level=3 at
-//   rank 6, so between state (8) and country (4).
-// - `city_district` is not a Nominatim place-tag. We emit it at rank 16
-//   (next to city) as a practical fallback for our builder's output.
+//   don't map to a canonical Nominatim field; without a rank they sit
+//   between state and country, as Nominatim's admin_level=3 (rank 6).
 pub fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
     let has_locality = addr.city.is_some() || addr.town.is_some()
         || addr.village.is_some() || addr.municipality.is_some()
@@ -5446,97 +5493,52 @@ pub fn format_address(addr: &AddressDetails<'_>) -> Option<String> {
 
     let (number_after, _, _) = format_rules(addr.country_code.as_deref());
 
-    // Collect (rank_address, value) tuples for every populated field.
-    // We emit in rank-descending order (fine → coarse) but dedupe by
-    // value, keeping only the COARSEST-rank occurrence of each string.
-    // This matches cases like NYC where city="New York" and state="New
-    // York" share a value — Nominatim's output retains the state slot
-    // and drops the duplicate city.
-    let mut entries: Vec<(u8, String)> = Vec::new();
+    // The house number and the road, one part.
+    let road = addr.road.as_ref().map(|road| match &addr.house_number {
+        Some(hn) if number_after => format!("{} {}", road, hn),
+        Some(hn) => format!("{} {}", hn, road),
+        None => road.to_string(),
+    });
 
-    // Rank 32: landmark name. Higher than road so the landmark
-    // leads the display line — "Eiffel Tower, 5 Avenue Gustave
-    // Eiffel, Paris, France" reads better than the road alone.
-    // The category / OSM type is carried on places[0] for clients
-    // that need it, so a single field here is enough.
-    if let Some(s) = &addr.landmark { entries.push((32, s.to_string())); }
+    // The place parts, finest first: a stable sort keeps the order above
+    // among parts of one rank.
+    let fields: [(&str, &Option<Cow<'_, str>>, u8); 17] = [
+        ("city_block", &addr.city_block, 25),
+        ("neighbourhood", &addr.neighbourhood, 24),
+        ("quarter", &addr.quarter, 22),
+        ("hamlet", &addr.hamlet, 20),
+        ("suburb", &addr.suburb, 20),
+        ("borough", &addr.borough, 18),
+        ("city", &addr.city, 16),
+        ("city_district", &addr.city_district, 16),
+        ("town", &addr.town, 16),
+        ("village", &addr.village, 16),
+        ("municipality", &addr.municipality, 14),
+        ("district", &addr.district, 12),
+        ("county", &addr.county, 12),
+        ("state", &addr.state, 8),
+        ("state_district", &addr.state_district, 6),
+        ("region", &addr.region, 6),
+        ("province", &addr.province, 6),
+    ];
+    let mut places: Vec<(u8, &str)> = fields.iter()
+        .filter_map(|&(field, value, label_rank)| {
+            let rank = match addr.ranks.get(field) { 0 => label_rank, rank => rank };
+            value.as_deref().map(|v| (rank, v))
+        })
+        .chain(addr.unlabelled.iter().map(|(rank, v)| (*rank, &**v)))
+        .collect();
+    places.sort_by(|a, b| b.0.cmp(&a.0));
 
-    // Rank 30: house_number + road
-    if let Some(road) = &addr.road {
-        let s = if let Some(ref hn) = addr.house_number {
-            if number_after {
-                format!("{} {}", road, hn)
-            } else {
-                format!("{} {}", hn, road)
-            }
-        } else {
-            road.to_string()
-        };
-        entries.push((30, s));
-    }
-
-    // Rank 25: city_block
-    if let Some(s) = &addr.city_block { entries.push((25, s.to_string())); }
-    // Rank 24: neighbourhood
-    if let Some(s) = &addr.neighbourhood { entries.push((24, s.to_string())); }
-    // Rank 22: quarter
-    if let Some(s) = &addr.quarter { entries.push((22, s.to_string())); }
-    // Rank 20: hamlet, suburb
-    if let Some(s) = &addr.hamlet { entries.push((20, s.to_string())); }
-    if let Some(s) = &addr.suburb { entries.push((20, s.to_string())); }
-    // Rank 18: borough
-    if let Some(s) = &addr.borough { entries.push((18, s.to_string())); }
-    // Rank 16: city, town, village, city_district
-    if let Some(s) = &addr.city { entries.push((16, s.to_string())); }
-    if let Some(s) = &addr.city_district { entries.push((16, s.to_string())); }
-    if let Some(s) = &addr.town { entries.push((16, s.to_string())); }
-    if let Some(s) = &addr.village { entries.push((16, s.to_string())); }
-    // Rank 14: municipality
-    if let Some(s) = &addr.municipality { entries.push((14, s.to_string())); }
-    // Rank 12: county, district
-    if let Some(s) = &addr.district { entries.push((12, s.to_string())); }
-    if let Some(s) = &addr.county { entries.push((12, s.to_string())); }
-    // Rank 8: state + fallbacks (state_district, region, province come
-    // from admin polygons via rank_to_field — grouped with state here,
-    // but iterated in a coarser-than-state order below)
-    if let Some(s) = &addr.state { entries.push((8, s.to_string())); }
-    // state_district / region / province slot in between state and
-    // country at rank 6 (corresponds to boundary=administrative3 in
-    // Nominatim, which is rank_address=6).
-    if let Some(s) = &addr.state_district { entries.push((6, s.to_string())); }
-    if let Some(s) = &addr.region { entries.push((6, s.to_string())); }
-    if let Some(s) = &addr.province { entries.push((6, s.to_string())); }
-    // Rank 5: postcode
-    if let Some(ref pc) = addr.postcode { entries.push((5, pc.to_string())); }
-    // Rank 4: country
-    if let Some(s) = &addr.country { entries.push((4, s.to_string())); }
-
-    // Global value dedup: for each unique value, find the COARSEST
-    // (lowest rank) occurrence. Drop finer-rank duplicates. This mirrors
-    // Nominatim's behaviour of preferring the state/county "authority"
-    // over a finer duplicate like city=New York vs state=New York.
-    let mut coarsest: std::collections::HashMap<String, u8> =
-        std::collections::HashMap::new();
-    for (rank, val) in &entries {
-        coarsest
-            .entry(val.clone())
-            .and_modify(|r| if *rank < *r { *r = *rank })
-            .or_insert(*rank);
-    }
-
-    // Emit in rank-descending (fine → coarse) order, keeping only
-    // entries whose rank matches the coarsest rank for their value.
-    // Consecutive dedup is implicit — if two different entries at the
-    // same rank have different values, both are kept.
-    let mut parts: Vec<String> = Vec::new();
-    let mut emitted: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    for (rank, val) in &entries {
-        if val.is_empty() { continue; }
-        if coarsest[val] != *rank { continue; }
-        if !emitted.insert(val.clone()) { continue; }
-        parts.push(val.clone());
-        let _ = rank; // silence unused-binding warning
+    let mut parts: Vec<&str> = Vec::new();
+    let line = addr.landmark.as_deref().into_iter()
+        .chain(road.as_deref())
+        .chain(places.iter().map(|&(_, v)| v))
+        .chain(addr.postcode.as_deref())
+        .chain(addr.country.as_deref());
+    for part in line {
+        if part.is_empty() || parts.last() == Some(&part) { continue; }
+        parts.push(part);
     }
 
     if parts.is_empty() { None } else { Some(parts.join(", ")) }
@@ -6622,6 +6624,7 @@ mod query_path_tests {
     use crate::scratch_dir::ScratchDir;
     use std::collections::BTreeMap;
 
+    mod display_name;
     mod ranks;
 
     /// The fixtures' origin unless one is given: everything sits metres

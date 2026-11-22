@@ -1,0 +1,159 @@
+//! display_name: an answer's place parts finest first by rank_address, as Nominatim's results.py
+//! sorts the address rows it joins, and a name left out only where it repeats the part just before
+//! it.
+
+use super::*;
+
+impl TestIndex {
+    /// `name`, a country (rank 4) 100 km across around the origin, under the country code `code`.
+    fn country(name: &str, code: &[u8; 2]) -> Self {
+        let mut index = Self { origin: ORIGIN, ..Self::default() };
+        index.boundary(name, 2, 0, (-50_000.0, -50_000.0, 50_000.0, 50_000.0));
+        index.polygons[0].0.country_code = u16::from_be_bytes(*code);
+        index
+    }
+}
+
+/// The display_name of the answer `north_m` north and `east_m` east of the origin.
+fn display_at(index: &Index, north_m: f64, east_m: f64) -> String {
+    let p = at(north_m, east_m);
+    let answer = serde_json::to_value(index.query(p.lat as f64, p.lng as f64)).unwrap();
+    answer["display_name"].as_str().unwrap_or_default().to_owned()
+}
+
+#[test]
+fn a_village_node_inside_a_township_of_its_rank_comes_before_the_township() {
+    // Delaware County, Pennsylvania: Garrettford and Central Square are place=village nodes (rank
+    // 16) inside Upper Darby and Newtown Township (admin_level 8, rank 16), so Nominatim ranks
+    // them 18 (placex_triggers.sql:951-971) and lists them before the township. Addingham, a
+    // hamlet (20), comes first.
+    let index = TestIndex::country("United States", b"US")
+        .boundary("Pennsylvania", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("Delaware County", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Upper Darby", 8, 0, (-4000.0, -4000.0, 4000.0, 4000.0))
+        .place("Garrettford", 2, 600.0, 900.0)
+        .place("Addingham", 4, 300.0, -200.0)
+        .street("Whalens Court", &[(0.0, -200.0), (0.0, 200.0)])
+        .address("2", 10.0, 0.0)
+        .addr_postcode("19026")
+        .load();
+    assert_eq!(display_at(&index, 10.0, 0.0),
+               "2 Whalens Court, Addingham, Garrettford, Upper Darby, Delaware County, Pennsylvania, 19026, United States");
+
+    let index = TestIndex::country("United States", b"US")
+        .boundary("Pennsylvania", 4, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("Delaware County", 6, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Newtown Township", 8, 0, (-4000.0, -4000.0, 4000.0, 4000.0))
+        .place("Central Square", 2, -700.0, 400.0)
+        .street("Roberts Road", &[(0.0, -200.0), (0.0, 200.0)])
+        .address("13", 10.0, 0.0)
+        .addr_postcode("19073")
+        .load();
+    assert_eq!(display_at(&index, 10.0, 0.0),
+               "13 Roberts Road, Central Square, Newtown Township, Delaware County, Pennsylvania, 19073, United States");
+}
+
+#[test]
+fn a_district_inside_its_city_comes_before_the_city() {
+    // Bratislava: the okres Bratislava I (R388234, admin_level 6, place=district) lies inside the
+    // city (R1702499, admin_level 5, linked city: 16), so it ranks 18 and comes before the city;
+    // Staré Mesto (9, place=suburb) ranks 20. The place=suburb area of the city's name
+    // (W293814124, 20) names no field: Staré Mesto is the suburb.
+    let index = TestIndex::country("Slovakia", b"SK")
+        .boundary("Region of Bratislava", 4, 9, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Bratislava", 5, 1, (-10_000.0, -10_000.0, 10_000.0, 10_000.0))
+        .boundary("District of Bratislava I", 6, 11, (-2000.0, -2000.0, 2000.0, 2000.0))
+        .boundary("Bratislava-Staré Mesto", 9, 4, (-2000.0, -2000.0, 2000.0, 2000.0))
+        .boundary("Bratislava", 15, 4, (-6000.0, -6000.0, 6000.0, 6000.0))
+        .place("Tivoli", 5, 100.0, 100.0)
+        .street("Hodžovo námestie", &[(0.0, -200.0), (0.0, 200.0)])
+        .load();
+    assert_eq!(display_at(&index, 0.0, 0.0),
+               "Hodžovo námestie, Tivoli, Bratislava-Staré Mesto, District of Bratislava I, Bratislava, Region of Bratislava, Slovakia");
+}
+
+#[test]
+fn a_city_area_of_the_country_s_name_is_listed_apart_from_the_country() {
+    // Singapore: R17140517 is a place=city area with the country's name and outline (rank 16),
+    // round Central Region (admin_level 5, place=borough: 18), River Valley (6, place=suburb:
+    // 20) and One Tree Hill (7, place=neighbourhood: 24). The city comes after the borough and
+    // the country after the postcode, so the two Singapores are not next to each other and both
+    // stay.
+    let index = TestIndex::country("Singapore", b"SG")
+        .boundary("Singapore", 15, 1, (-50_000.0, -50_000.0, 50_000.0, 50_000.0))
+        .boundary("Central Region", 5, 12, (-10_000.0, -10_000.0, 10_000.0, 10_000.0))
+        .boundary("River Valley", 6, 4, (-2000.0, -2000.0, 2000.0, 2000.0))
+        .boundary("One Tree Hill", 7, 5, (-500.0, -500.0, 500.0, 500.0))
+        .street("Jalan Tupai", &[(0.0, -100.0), (0.0, 100.0)])
+        .centroid("247856", 50.0, 0.0)
+        .load();
+    assert_eq!(display_at(&index, 0.0, 0.0),
+               "Jalan Tupai, One Tree Hill, River Valley, Central Region, Singapore, 247856, Singapore");
+}
+
+#[test]
+fn a_suburb_area_comes_between_the_neighbourhood_and_the_city() {
+    // Brussels: the Pentagon (R13729034, boundary=place, place=suburb) ranks 20 whatever the
+    // boundaries round the point, so it comes after Quays Quarter (admin_level 10 linked to a
+    // neighbourhood: 24) and before Brussels (8, linked city: 16). Brussels-Capital, the region
+    // (4: rank 6) and the arrondissement (7: rank 12), is named once: the two are next to each
+    // other.
+    let index = TestIndex::country("Belgium", b"BE")
+        .boundary("Brussels-Capital", 4, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Brussels-Capital", 7, 0, (-20_000.0, -20_000.0, 20_000.0, 20_000.0))
+        .boundary("Brussels", 8, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Bruxelles - Brussel", 9, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .boundary("Quays Quarter", 10, 5, (-300.0, -300.0, 300.0, 300.0))
+        .boundary("Pentagon", 15, 4, (-1500.0, -1500.0, 1500.0, 1500.0))
+        .street("Rue Melsens - Melsensstraat", &[(0.0, -100.0), (0.0, 100.0)])
+        .load();
+    assert_eq!(display_at(&index, 0.0, 0.0),
+               "Rue Melsens - Melsensstraat, Quays Quarter, Pentagon, Brussels, Brussels-Capital, Belgium");
+}
+
+#[test]
+fn a_county_area_round_a_city_comes_after_the_city() {
+    // Belfast: County Antrim (R1119534, boundary=historic, place=county) is a place area of rank
+    // 12 round Belfast City District (admin_level 7 linked to the city: 16), and Nominatim keeps
+    // it at 12, after the city.
+    let index = TestIndex::country("United Kingdom", b"GB")
+        .boundary("Northern Ireland", 4, 7, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("County Antrim", 15, 10, (-30_000.0, -30_000.0, 30_000.0, 30_000.0))
+        .boundary("Belfast City District", 7, 1, (-5000.0, -5000.0, 5000.0, 5000.0))
+        .place("Smithfield", 5, 100.0, 0.0)
+        .street("Donegall Square North", &[(0.0, -100.0), (0.0, 100.0)])
+        .load();
+    assert_eq!(display_at(&index, 0.0, 0.0),
+               "Donegall Square North, Smithfield, Belfast City District, County Antrim, Northern Ireland, United Kingdom");
+}
+
+#[test]
+fn a_name_is_left_out_only_where_it_repeats_the_part_before_it() {
+    // Trabzon: the city node (place=city, 18 inside Ortahisar, a town at 16) and the province
+    // (admin_level 4, place=province: 8) share the name with Ortahisar between them, and
+    // Nominatim shows both (results.py display_name).
+    let index = TestIndex::country("Turkey", b"TR")
+        .boundary("Black Sea Region", 3, 0, (-40_000.0, -40_000.0, 40_000.0, 40_000.0))
+        .boundary("Trabzon", 4, 8, (-30_000.0, -30_000.0, 30_000.0, 30_000.0))
+        .boundary("Ortahisar", 6, 2, (-8000.0, -8000.0, 8000.0, 8000.0))
+        .boundary("Cumhuriyet Mahallesi", 8, 4, (-300.0, -300.0, 300.0, 300.0))
+        .place("Trabzon", 0, 1500.0, 1500.0)
+        .street("Kasım Sokak", &[(0.0, -100.0), (0.0, 100.0)])
+        .load();
+    assert_eq!(display_at(&index, 0.0, 0.0),
+               "Kasım Sokak, Cumhuriyet Mahallesi, Trabzon, Ortahisar, Trabzon, Black Sea Region, Turkey");
+
+    // The Netherlands: the constituent country (admin_level 3, rank 6) has the kingdom's name.
+    // The address names it once, as the country; display_name has both, the postcode between.
+    let index = TestIndex::country("Netherlands", b"NL")
+        .boundary("Netherlands", 3, 0, (-50_000.0, -50_000.0, 50_000.0, 50_000.0))
+        .boundary("Drenthe", 4, 7, (-30_000.0, -30_000.0, 30_000.0, 30_000.0))
+        .boundary("Hoogeveen", 8, 0, (-8000.0, -8000.0, 8000.0, 8000.0))
+        .boundary("Alteveer", 10, 3, (-1000.0, -1000.0, 1000.0, 1000.0))
+        .street("Hendrikus Zomerweg", &[(0.0, -100.0), (0.0, 100.0)])
+        .centroid("7915 AB", 50.0, 0.0)
+        .load();
+    assert_eq!(display_at(&index, 0.0, 0.0),
+               "Hendrikus Zomerweg, Alteveer, Hoogeveen, Drenthe, Netherlands, 7915 AB, Netherlands");
+    assert_eq!(address_at(&index, 0.0, 0.0).get("region"), None);
+}
